@@ -221,8 +221,9 @@ test "B2 comparisons: binary with binary works, with a text or a number is BadEx
         try testing.expectError(error.BadExpr, mutate(a, f, .{ .binary = .{ .op = op, .l = int_lit, .r = b } }));
         try testing.expectError(error.BadExpr, mutate(a, f, .{ .binary = .{ .op = op, .l = b, .r = s } }));
     }
-    // arithmetic, boolean logic and concatenation over binary are refused
-    inline for (.{ ex.Binary.add, .sub, .mul, .div, .concat, .contains, .starts_with, .@"and", .bit_and }) |op| {
+    // arithmetic, boolean logic and `concat` over binary are refused
+    // (`add` of two binaries concatenates since Z3, polars `a + b`: `parity_z1_test.zig`)
+    inline for (.{ ex.Binary.sub, .mul, .div, .concat, .contains, .starts_with, .@"and", .bit_and }) |op| {
         try testing.expectError(error.BadExpr, mutate(a, f, .{ .binary = .{ .op = op, .l = b, .r = try blit(a, "x") } }));
     }
     // filtering by a binary comparison keeps the rows

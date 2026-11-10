@@ -799,6 +799,9 @@ const Inst = union(enum) {
     bin: bf.BinOp,
     /// A `.binary` cell cast to text: the bytes when valid UTF-8, else null.
     bin_to_text,
+    /// `binary + binary` (polars concatenates the bytes; a text operand counts as its bytes):
+    /// null when either side is, `error.TooLarge` past `max_text_result`.
+    bin_concat,
     concat_list: u32,
     field: []const u8,
     /// The field names; pops one value per name.
@@ -1024,6 +1027,7 @@ const Compiler = struct {
         try c.go(l, depth + 1);
         try c.go(r, depth + 1);
         try c.timeArithmetic(op, l, r);
+        if (op == .add and binAddOk(c.f, l, r)) return c.push(.bin_concat, 2);
         if (widthBinaryType(c.f, op, l, r)) |ty| return c.push(.{ .binary_w = .{ .op = op, .ty = ty } }, 2);
         try c.push(.{ .binary = op }, 2);
     }
@@ -2370,6 +2374,15 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
                 const v = stack[sp - 1];
                 if (v == .text and !std.unicode.utf8ValidateSlice(v.text)) stack[sp - 1] = .null;
             },
+            .bin_concat => {
+                const l = stack[sp - 2];
+                const r = stack[sp - 1];
+                stack[sp - 2] = if (l == .text and r == .text) blk: {
+                    if (l.text.len > fnx.max_text_result -| r.text.len) return error.TooLarge;
+                    break :blk .{ .text = try std.mem.concat(a, u8, &.{ l.text, r.text }) };
+                } else .null;
+                sp -= 1;
+            },
             .concat_list => |n| {
                 const base = sp - n;
                 stack[base] = try lf.concatList(a, stack[base..sp]);
@@ -2841,10 +2854,37 @@ fn binTypeB(f: Frame, e: *const Expr, steps: *usize) BinKind {
         },
         .binary => |b| switch (b.op) {
             .min, .max => binJoin(binTypeB(f, b.l, steps), binTypeB(f, b.r, steps)),
+            .add => if (binAddOkB(f, b.l, b.r, steps)) .yes else .unknown,
             else => .unknown,
         },
         else => .unknown,
     };
+}
+
+/// A value polars concatenates to a binary one with `+`: a text (its bytes) or a null.
+fn binAddOperand(f: Frame, e: *const Expr) bool {
+    return switch (e.*) {
+        .col => |name| if (f.columnType(name)) |t| t == .text else false,
+        .lit => |v| v == .text or v == .null,
+        .cast => |c| c.to == .text,
+        else => false,
+    };
+}
+
+/// `l + r` is a binary concatenation: one side statically binary, the other binary, a text
+/// or a null literal (polars: `bin + bin`, `bin + str`, `str + bin` are Binary; `bin + int`
+/// is a SchemaError).
+fn binAddOk(f: Frame, l: *const Expr, r: *const Expr) bool {
+    var steps: usize = 0;
+    return binAddOkB(f, l, r, &steps);
+}
+
+/// `binAddOk` sharing the walk's step budget (`x + x` towers must stay linear, not 2^n).
+fn binAddOkB(f: Frame, l: *const Expr, r: *const Expr, steps: *usize) bool {
+    const lk = binTypeB(f, l, steps);
+    const rk = binTypeB(f, r, steps);
+    if (lk == .yes and (rk == .yes or binAddOperand(f, r))) return true;
+    return rk == .yes and binAddOperand(f, l);
 }
 
 /// The operand of a text-only operation (the `str.*` family and the text-valued casts of one):
@@ -2863,6 +2903,7 @@ fn refuseBinaryOperand(f: Frame, e: *const Expr) Error!void {
             const l = binTypeOf(f, b.l);
             const r = binTypeOf(f, b.r);
             if (l != .yes and r != .yes) return;
+            if (b.op == .add and binAddOk(f, b.l, b.r)) return;
             switch (b.op) {
                 // A binary beside a text, a number or a bool is polars' SchemaError.
                 .eq, .ne, .lt, .le, .gt, .ge, .eq_missing, .ne_missing, .min, .max => if (l == .no or r == .no) return error.BadExpr,

@@ -534,3 +534,164 @@ test "toLatex: hostile column_format, caption and position never panic (Z2)" {
         try testing.expect(e.len > 20);
     };
 }
+
+// ── Z3: binary + binary ─────────────────────────────────────────────────────
+
+const ex = @import("expr.zig");
+const fm = @import("frame.zig");
+const Expr = ex.Expr;
+
+/// polars: `pl.DataFrame({"a": [b"ab", b"", None, b"\xff\x00", b"x"], "b": [b"cd", b"zz", b"q", None, b""],
+/// "s": ["1", "2", "3", "4", "5"], "n": [1, 2, 3, 4, 5]}, schema={"a": Binary, "b": Binary, ...})`.
+fn binFixture(a: std.mem.Allocator) !Frame {
+    const cols = try a.dupe(Column, &.{
+        .{ .name = "a", .type = .binary },
+        .{ .name = "b", .type = .binary },
+        .{ .name = "s", .type = .text },
+        .{ .name = "n", .type = .int },
+    });
+    var fb = try fm.FrameBuilder.init(a, cols, 5);
+    const av = [_]Value{ .{ .text = "ab" }, .{ .text = "" }, .null, .{ .text = "\xff\x00" }, .{ .text = "x" } };
+    const bv = [_]Value{ .{ .text = "cd" }, .{ .text = "zz" }, .{ .text = "q" }, .null, .{ .text = "" } };
+    const sv = [_][]const u8{ "1", "2", "3", "4", "5" };
+    for (0..5) |i| try fb.appendRow(&.{ av[i], bv[i], .{ .text = sv[i] }, .{ .int = @intCast(i + 1) } });
+    return fb.toOwned();
+}
+
+fn bx(a: std.mem.Allocator, e: Expr) !*const Expr {
+    const p = try a.create(Expr);
+    p.* = e;
+    return p;
+}
+
+fn bcol(a: std.mem.Allocator, n: []const u8) !*const Expr {
+    return bx(a, .{ .col = n });
+}
+
+fn blit(a: std.mem.Allocator, s: []const u8) !*const Expr {
+    return bx(a, .{ .cast = .{ .x = try bx(a, .{ .lit = .{ .text = s } }), .to = .binary } });
+}
+
+fn badd(a: std.mem.Allocator, l: *const Expr, r: *const Expr) !*const Expr {
+    return bx(a, .{ .binary = .{ .op = .add, .l = l, .r = r } });
+}
+
+fn expectBin(a: std.mem.Allocator, f: Frame, e: *const Expr, want: []const ?[]const u8) !void {
+    const out = try ex.mutate(a, f, &.{.{ .out = "o", .expr = e.* }});
+    try testing.expectEqual(df.ColumnType.binary, out.columnType("o").?);
+    for (want, 0..) |w, i| {
+        const cell = out.cell(i, "o").?;
+        if (w) |bytes| {
+            try testing.expect(cell == .text);
+            try testing.expectEqualSlices(u8, bytes, cell.text);
+        } else try testing.expect(cell == .null);
+    }
+}
+
+test "binary + binary concatenates the bytes, null propagates (polars, Z3)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try binFixture(a);
+    const ca = try bcol(a, "a");
+    const cb = try bcol(a, "b");
+    // polars: a + b -> [b'abcd', b'zz', None, None, b'x']
+    try expectBin(a, f, try badd(a, ca, cb), &.{ "abcd", "zz", null, null, "x" });
+    // polars: a + a -> [b'abab', b'', None, b'\xff\x00\xff\x00', b'xx']
+    try expectBin(a, f, try badd(a, ca, ca), &.{ "abab", "", null, "\xff\x00\xff\x00", "xx" });
+    // polars: a + pl.lit(b"-") and pl.lit(b"-") + a
+    try expectBin(a, f, try badd(a, ca, try blit(a, "-")), &.{ "ab-", "-", null, "\xff\x00-", "x-" });
+    try expectBin(a, f, try badd(a, try blit(a, "-"), ca), &.{ "-ab", "-", null, "-\xff\x00", "-x" });
+    // polars: a + b + a -> [b'abcdab', b'zz', None, None, b'xx']
+    try expectBin(a, f, try badd(a, try badd(a, ca, cb), ca), &.{ "abcdab", "zz", null, null, "xx" });
+    // polars: a + pl.lit(None) (and the other way) -> all null, still Binary
+    const nl = try bx(a, .{ .lit = .null });
+    try expectBin(a, f, try badd(a, ca, nl), &.{ null, null, null, null, null });
+    try expectBin(a, f, try badd(a, nl, ca), &.{ null, null, null, null, null });
+    try expectBin(a, f, try badd(a, try badd(a, ca, ca), nl), &.{ null, null, null, null, null });
+    // polars: a + s (String) and s + a are Binary: the text is its bytes; a text literal too
+    const cs = try bcol(a, "s");
+    try expectBin(a, f, try badd(a, ca, cs), &.{ "ab1", "2", null, "\xff\x004", "x5" });
+    try expectBin(a, f, try badd(a, cs, ca), &.{ "1ab", "2", null, "4\xff\x00", "5x" });
+    try expectBin(a, f, try badd(a, ca, try bx(a, .{ .lit = .{ .text = "-" } })), &.{ "ab-", "-", null, "\xff\x00-", "x-" });
+    try expectBin(a, f, try badd(a, try bx(a, .{ .lit = .{ .text = "-" } }), ca), &.{ "-ab", "-", null, "-\xff\x00", "-x" });
+    // polars: a + s.cast(Binary)
+    try expectBin(a, f, try badd(a, ca, try bx(a, .{ .cast = .{ .x = cs, .to = .binary } })), &.{ "ab1", "2", null, "\xff\x004", "x5" });
+    // polars: (a + b).bin.size() -> [4, 2, None, None, 1] (UInt32)
+    const sz = try ex.mutate(a, f, &.{.{ .out = "o", .expr = .{ .bin = .{ .x = try badd(a, ca, cb), .op = .{ .size = .b } } } }});
+    try testing.expectEqual(@as(i64, 4), sz.cell(0, "o").?.int);
+    try testing.expect(sz.cell(2, "o").? == .null);
+    try testing.expectEqual(@as(i64, 1), sz.cell(4, "o").?.int);
+    // polars: when(n > 2).then(a + b).otherwise(a) -> [b'ab', b'', None, None, b'x']
+    const gt = try bx(a, .{ .binary = .{ .op = .gt, .l = try bcol(a, "n"), .r = try bx(a, .{ .lit = .{ .int = 2 } }) } });
+    try expectBin(a, f, try bx(a, .{ .if_else = .{ .cond = gt, .then = try badd(a, ca, cb), .otherwise = ca } }), &.{ "ab", "", null, null, "x" });
+}
+
+test "binary + a number and the other arithmetic stay BadExpr (polars SchemaError / InvalidOperationError, Z3)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try binFixture(a);
+    const ca = try bcol(a, "a");
+    const cb = try bcol(a, "b");
+    // polars: a + n -> "failed to determine supertype of binary and i64"; a + pl.lit(1) likewise
+    try testing.expectError(error.BadExpr, ex.mutate(a, f, &.{.{ .out = "o", .expr = (try badd(a, ca, try bcol(a, "n"))).* }}));
+    try testing.expectError(error.BadExpr, ex.mutate(a, f, &.{.{ .out = "o", .expr = (try badd(a, try bx(a, .{ .lit = .{ .int = 1 } }), ca)).* }}));
+    // polars: a - b, a * b, a / b, a // b, a % b: operation not supported for binary
+    inline for (.{ ex.Binary.sub, .mul, .div, .floordiv, .mod }) |op| {
+        try testing.expectError(error.BadExpr, ex.mutate(a, f, &.{.{ .out = "o", .expr = .{ .binary = .{ .op = op, .l = ca, .r = cb } } }}));
+    }
+    // text + text is untouched: a number-style `add` of two texts is null, as before
+    const ss = try ex.mutate(a, f, &.{.{ .out = "o", .expr = (try badd(a, try bcol(a, "s"), try bcol(a, "s"))).* }});
+    try testing.expect(ss.cell(0, "o").? == .null);
+}
+
+test "binary + binary: the result is capped at max_text_result, empty and all-null columns work (Z3)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cap = df.max_text_result;
+    const l = try a.alloc(u8, cap / 2);
+    @memset(l, 0xAB);
+    const r1 = try a.alloc(u8, cap - l.len);
+    @memset(r1, 0xCD);
+    const r2 = try a.alloc(u8, cap - l.len + 1);
+    @memset(r2, 0xCD);
+    const cols = try a.dupe(Column, &.{ .{ .name = "a", .type = .binary }, .{ .name = "b", .type = .binary } });
+    var fb = try fm.FrameBuilder.init(a, cols, 1);
+    try fb.appendRow(&.{ .{ .text = l }, .{ .text = r1 } });
+    const f1 = try fb.toOwned();
+    const sum = try ex.mutate(a, f1, &.{.{ .out = "o", .expr = (try badd(a, try bcol(a, "a"), try bcol(a, "b"))).* }});
+    try testing.expectEqual(cap, sum.cell(0, "o").?.text.len);
+    var fb2 = try fm.FrameBuilder.init(a, cols, 1);
+    try fb2.appendRow(&.{ .{ .text = l }, .{ .text = r2 } });
+    const f2 = try fb2.toOwned();
+    try testing.expectError(error.TooLarge, ex.mutate(a, f2, &.{.{ .out = "o", .expr = (try badd(a, try bcol(a, "a"), try bcol(a, "b"))).* }}));
+    // polars: an empty Binary column and an all-null one give Binary columns of the same length
+    var fb3 = try fm.FrameBuilder.init(a, cols, 0);
+    const f3 = try fb3.toOwned();
+    try expectBin(a, f3, try badd(a, try bcol(a, "a"), try bcol(a, "b")), &.{});
+    var fb4 = try fm.FrameBuilder.init(a, cols, 2);
+    try fb4.appendRow(&.{ .null, .null });
+    try fb4.appendRow(&.{ .null, .null });
+    try expectBin(a, try fb4.toOwned(), try badd(a, try bcol(a, "a"), try bcol(a, "b")), &.{ null, null });
+    // a long chain of additions does not blow the compiler or the stack
+    var e = try bcol(a, "a");
+    for (0..200) |_| e = try badd(a, e, try bcol(a, "b"));
+    _ = ex.mutate(a, f1, &.{.{ .out = "o", .expr = e.* }}) catch |err| try testing.expect(err == error.TooLarge or err == error.ExprTooLarge);
+}
+
+test "binary + binary: an x + x tower is walked in linear time (Z3 regression)" {
+    // `cur + cur` 40 deep is a DAG of 2^40 paths; the static binary check once re-walked it
+    // with a fresh step budget per node and hung the suite. It must be refused or computed,
+    // quickly (without the shared budget in `binAddOkB` this never returns).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try binFixture(a);
+    var e = try bcol(a, "a");
+    for (0..40) |_| e = try badd(a, e, e);
+    _ = ex.mutate(a, f, &.{.{ .out = "o", .expr = e.* }}) catch |err| {
+        try testing.expect(err == error.TooLarge or err == error.ExprTooLarge or err == error.BadExpr);
+    };
+}
