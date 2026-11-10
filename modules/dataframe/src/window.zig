@@ -24,6 +24,7 @@ const ex = @import("expr.zig");
 const verbs = @import("verbs.zig");
 const core = @import("core.zig");
 const corr = @import("corr.zig");
+const dtype = @import("dtype.zig");
 const Frame = fm.Frame;
 const ColumnData = fm.ColumnData;
 const Column = ds.Column;
@@ -331,7 +332,86 @@ pub const WindowSpec = struct {
 
 const missing = keys.isMissing;
 
+/// The type an aggregate of a column of the width type `st` has (W11), where it is not the
+/// plain `aggOutType`'s: polars' table. `sum` of Int8, Int16, UInt8, UInt16 is Int64 and of
+/// Int32, UInt32, UInt64, Float32 keeps the type (an overflow is null here, polars wraps);
+/// `prod` of an integer is Int64 (UInt64 keeps); Float32 stays Float32 for `sum`, `prod`,
+/// `mean`, `median`, `std`, `var`, `quantile`, `sem`, `skew`, `kurt` (computed in f64,
+/// rounded once, so it may differ from polars by an f32 ulp). The rest (`min`, `max`,
+/// `first`, `last`, `mode` keep the type; `mean` of an integer is Float64; the counts are
+/// Int64, where polars says UInt32) is `aggOutType`'s: null here.
+pub fn aggWidthType(st: ColumnType, func: t0.AggFn) ?ColumnType {
+    if (st == .float32) return switch (func) {
+        .sum, .prod, .mean, .median, .std, .@"var", .quantile, .sem, .skew, .kurt => .float32,
+        else => null,
+    };
+    if (!dtype.isWidth(st) or !dtype.isInteger(st)) return null;
+    return switch (func) {
+        .sum => switch (st) {
+            .int8, .int16, .uint8, .uint16 => .int,
+            else => st,
+        },
+        .prod => if (st == .uint64) .uint64 else .int,
+        else => null,
+    };
+}
+
+/// A running type for `cum_sum`/`cum_prod`/`diff` of the width type `st` (W11), polars'
+/// table: `cum_sum` and `cum_prod` as the aggregates, `cum_min`/`cum_max` keep the type,
+/// `diff` keeps a signed type and makes an unsigned one the next wider signed (UInt64: Int64).
+fn widthWindowType(st: ColumnType, op: WindowOp) ?ColumnType {
+    if (!dtype.isWidth(st)) return null;
+    const is_f32 = st == .float32;
+    return switch (op) {
+        .cum_sum => aggWidthType(st, .sum),
+        .cum_prod => aggWidthType(st, .prod),
+        .cum_min, .cum_max => st,
+        .diff => switch (st) {
+            .uint8 => .int16,
+            .uint16 => .int32,
+            .uint32, .uint64 => .int,
+            else => st,
+        },
+        .transform => |t| aggWidthType(st, t.func),
+        // polars keeps Float32 through the arithmetic of a window; the rest is a float.
+        .pct_change, .rolling, .rolling_time, .expanding, .ewm, .ewm_by, .interpolate => if (is_f32) .float32 else null,
+        else => null,
+    };
+}
+
+/// Fix the cells `aggregate` made for `ty` = `aggWidthType` (W11): an integer `sum`/`prod`
+/// is recomputed exactly in an `i128` (the f64 the accumulator keeps is exact only to 2^53)
+/// and fitted to `ty` (out of range: null; a missing cell adds nothing), a Float32 result is
+/// rounded to f32. Other results are left as they are.
+pub fn fixWidthAgg(a: std.mem.Allocator, st: ColumnType, func: t0.AggFn, ty: ColumnType, col: ColumnData, ids: []const u32, skip: bool, cells: []Value) std.mem.Allocator.Error!void {
+    _ = skip;
+    if (ty == .float32) {
+        for (cells) |*c| if (c.* == .float) {
+            c.* = .{ .float = dtype.roundF32(c.float) };
+        };
+        return;
+    }
+    if (!dtype.isInteger(ty) or !dtype.isWidth(st) or (func != .sum and func != .prod)) return;
+    const n = cells.len;
+    const acc = try a.alloc(i128, n);
+    defer a.free(acc);
+    @memset(acc, if (func == .prod) 1 else 0);
+    const dead = try a.alloc(bool, n);
+    defer a.free(dead);
+    @memset(dead, false);
+    for (ids, 0..) |g, ri| {
+        if (dead[g]) continue;
+        const x = dtype.exactI128(col.get(ri)) orelse continue;
+        acc[g] = (if (func == .sum) std.math.add(i128, acc[g], x) else std.math.mul(i128, acc[g], x)) catch {
+            dead[g] = true;
+            continue;
+        };
+    }
+    for (cells, acc, dead) |*c, x, d| c.* = if (d) .null else (dtype.fitInt(x, ty) orelse .null);
+}
+
 fn outType(f: Frame, vi: usize, op: WindowOp) ColumnType {
+    if (widthWindowType(f.columns[vi].type, op)) |t| return t;
     return switch (op) {
         .shift, .ffill, .bfill => f.columns[vi].type,
         .cum_count, .row_number => .int,
@@ -399,6 +479,8 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
         }
         break :blk true;
     };
+    // A column of an integer width (W11): the exact cell verbs run in an i128 and the result type is polars'.
+    const wint = dtype.isWidth(f.columns[vi].type) and dtype.isInteger(f.columns[vi].type);
     var out_type = outType(f, vi, spec.op);
     switch (spec.op) {
         .cum_sum, .cum_prod, .cum_min, .cum_max, .diff => if (int_col) {
@@ -416,13 +498,16 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
         const same = try castFill(a, fill, out_type);
         if (same) |c| {
             op.shift.fill = c;
-        } else if (out_type == .int and fill == .float) {
+        } else if (out_type == .float32 and fill.asFloat() != null) {
+            // polars: a literal fill is weak beside a Float32 column, cast to f32.
+            op.shift.fill = .{ .float = dtype.roundF32(fill.asFloat().?) };
+        } else if (dtype.isInteger(out_type) and fill == .float) {
             out_type = .float;
             promote = true;
         } else return error.BadFill;
     }
 
-    if (typed and !promote and plain_layout) {
+    if (typed and !promote and plain_layout and !dtype.isWidth(f.columns[vi].type)) {
         if (try windowTyped(a, f, vi, pidx, op, int_col)) |col| {
             return withColumn(a, f, .{ .name = spec.out, .type = out_type, .time_zone = Column.zoneFor(f.columns[vi], out_type) }, col);
         }
@@ -491,23 +576,27 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
                 .times = if (time_ci != null) times[0..idx.len] else &.{},
                 .others = if (other_ci != null) others[0..idx.len] else &.{},
                 .weights = win_weights,
+                .out_ty = out_type,
             };
-            try computeOne(a, cells[0..idx.len], ctx, op, int_col, &time_work, res[0..idx.len]);
+            try computeOne(a, cells[0..idx.len], ctx, op, int_col or wint, &time_work, res[0..idx.len]);
             for (idx, res[0..idx.len]) |ri, v| out[ri] = v;
         }
         // The int cells of a promoted column become floats on every mapping path.
         if (promote) {
             for (out) |*v| {
-                if (v.* == .int) {
-                    const x: f64 = @floatFromInt(v.int);
+                if (v.* == .int or v.* == .uint) {
+                    // Read before the write (result location: the tag is written first).
+                    const x = v.asFloat().?;
                     v.* = .{ .float = x };
                 }
             }
         }
+        if (out_type == .float32) roundCells(out);
         if (spec.mapping != .group_to_rows) return mapped(a, f, spec, fac, mem, oidx, out_type, Column.zoneFor(f.columns[vi], out_type), out);
     }
+    if (out_type == .float32) roundCells(out);
 
-    return withColumn(a, f, .{ .name = spec.out, .type = out_type, .time_zone = Column.zoneFor(f.columns[vi], out_type) }, try fm.columnFromCells(a, out));
+    return withColumn(a, f, .{ .name = spec.out, .type = out_type, .time_zone = Column.zoneFor(f.columns[vi], out_type) }, try fm.conform(a, try fm.columnFromCells(a, out), out_type, f.len));
 }
 
 /// The sort of `order_by`: a missing cell first (polars), then `Value.order`; descending
@@ -555,7 +644,7 @@ fn mapped(a: std.mem.Allocator, f: Frame, spec: WindowSpec, fac: keys.Factors, m
         }
         k += idx.len;
     }
-    const data = try fm.columnFromCells(a, out);
+    const data = try fm.conform(a, try fm.columnFromCells(a, out), out_type, f.len);
     const col: Column = .{ .name = spec.out, .type = out_type, .time_zone = zone };
     if (spec.mapping == .explode) {
         const whole = try withColumn(a, f, col, data);
@@ -1071,38 +1160,52 @@ fn transformIntSum(a: std.mem.Allocator, vcol: ColumnData, fac: keys.Factors, ou
     for (fac.ids, out) |g, *o| o.* = if (over[g]) .null else .{ .int = sums[g] };
 }
 
-/// `cum_*` over an all-int partition. An overflow nulls that row and all after it: no
-/// later total can be right. Missing rows are null and do not move the total.
-fn cumInt(cells: []const Value, op: WindowOp, out: []Value) void {
-    var acc: ?i64 = null;
+/// Float32 results (W11): each float cell rounded to the nearest f32, the f64 that holds it.
+fn roundCells(cells: []Value) void {
+    for (cells) |*c| if (c.* == .float) {
+        c.* = .{ .float = dtype.roundF32(c.float) };
+    };
+}
+
+/// `cum_*` over an all-int partition of the type `ty` (Int64, or an integer width whose
+/// result type is `ty`). An overflow of `ty` nulls that row and all after it: no later total
+/// can be right (both engines wrap). Missing rows are null and do not move the total.
+fn cumInt(cells: []const Value, op: WindowOp, ty: ColumnType, out: []Value) void {
+    var acc: ?i128 = null;
     var dead = false;
     for (cells, out) |c, *o| {
-        if (c != .int or dead) {
+        const x: i128 = switch (c) {
+            .int => |i| i,
+            .uint => |u| u,
+            else => {
+                o.* = .null;
+                continue;
+            },
+        };
+        if (dead) {
             o.* = .null;
             continue;
         }
-        const x = c.int;
-        if (acc) |v| {
-            const next = switch (op) {
-                .cum_sum => std.math.add(i64, v, x) catch null,
-                .cum_prod => std.math.mul(i64, v, x) catch null,
-                .cum_min => @min(v, x),
-                else => @max(v, x),
-            };
-            if (next == null) {
-                dead = true;
-                o.* = .null;
-                continue;
-            }
-            acc = next;
-        } else acc = x;
-        o.* = .{ .int = acc.? };
+        const next: ?i128 = if (acc) |v| switch (op) {
+            .cum_sum => std.math.add(i128, v, x) catch null,
+            .cum_prod => std.math.mul(i128, v, x) catch null,
+            .cum_min => @min(v, x),
+            else => @max(v, x),
+        } else x;
+        const cell = if (next) |nx| dtype.fitInt(nx, ty) else null;
+        if (cell == null) {
+            dead = true;
+            o.* = .null;
+            continue;
+        }
+        acc = next;
+        o.* = cell.?;
     }
 }
 
 /// Per-partition inputs besides the value cells: the time column's instants
 /// (`rolling_time`) and the second column's cells (`rolling_corr`, `rolling_cov`).
-const Extra = struct { times: []const ?i64 = &.{}, others: []const Value = &.{}, weights: ?[]const f64 = null };
+const Extra = struct { times: []const ?i64 = &.{}, others: []const Value = &.{}, weights: ?[]const f64 = null, out_ty: ColumnType = .int };
 
 fn computeOne(a: std.mem.Allocator, cells: []const Value, extra: Extra, op: WindowOp, int_col: bool, time_work: *usize, out: []Value) Error!void {
     const n = cells.len;
@@ -1118,9 +1221,10 @@ fn computeOne(a: std.mem.Allocator, cells: []const Value, extra: Extra, op: Wind
                 o.* = .null;
                 const k = offset(i, p, n) orelse continue;
                 if (int_col and op == .diff) {
-                    if (cells[i] != .int or cells[k] != .int) continue;
-                    const dv = std.math.sub(i64, cells[i].int, cells[k].int) catch continue;
-                    o.* = .{ .int = dv };
+                    const x = dtype.exactI128(cells[i]) orelse continue;
+                    const y = dtype.exactI128(cells[k]) orelse continue;
+                    // i128 holds the difference of any two cells; the type's range decides.
+                    o.* = dtype.fitInt(x - y, extra.out_ty) orelse .null;
                     continue;
                 }
                 const x = numOrNull(cells[i]) orelse continue;
@@ -1129,7 +1233,7 @@ fn computeOne(a: std.mem.Allocator, cells: []const Value, extra: Extra, op: Wind
             }
         },
         .cum_sum, .cum_prod, .cum_min, .cum_max => {
-            if (int_col) return cumInt(cells, op, out);
+            if (int_col) return cumInt(cells, op, extra.out_ty, out);
             var acc: ?f64 = null;
             for (cells, out) |c, *o| {
                 const x = numOrNull(c) orelse {

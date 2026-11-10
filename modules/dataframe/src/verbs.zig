@@ -604,7 +604,8 @@ fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: 
     const cols = try a.alloc(Column, gidx.len + spec.aggs.len);
     for (gidx, 0..) |ci, i| cols[i] = f.columns[ci];
     for (spec.aggs, 0..) |ag, i| {
-        const ty = if (spec.temporal_results)
+        // A width source (W11) has its own result types (`win.aggWidthType`).
+        const ty = (if (rate_idx == null) win.aggWidthType(f.columns[sidx[i]].type, ag.func) else null) orelse if (spec.temporal_results)
             core.aggOutTypeTemporal(f.columns, sidx[i], ag.func, rate_idx != null)
         else
             core.aggOutType(f.columns, sidx[i], ag.func, rate_idx != null);
@@ -635,6 +636,8 @@ fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: 
             const rows = try keyRows(a, f, &.{ci});
             try core.accumulate(a, rows, fac.ids, n, 0, null, ag.func, opts, spec.skip_na, sink);
         }
+        const out_ty = cols[gidx.len + ai].type;
+        if (rate_idx == null) try win.fixWidthAgg(a, f.columns[ci].type, ag.func, out_ty, colOf(f, ci), fac.ids, spec.skip_na, cells);
         if (ag.min_count > 0 and (ag.func == .sum or ag.func == .prod)) {
             const present = try a.alloc(usize, n);
             defer a.free(present);
@@ -649,11 +652,10 @@ fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: 
             }
         }
         // A time-valued result is whole microseconds, not the float the accumulator made.
-        const out_ty = cols[gidx.len + ai].type;
         if (out_ty == .duration or out_ty == .timestamp) for (cells) |*c| {
             if (c.* == .float) c.* = c.cast(out_ty) orelse .null;
         };
-        d.* = try fm.columnFromCells(a, cells);
+        d.* = try fm.conform(a, try fm.columnFromCells(a, cells), out_ty, n);
     }
 
     var out: Frame = .{ .columns = cols, .data = data, .len = n };
