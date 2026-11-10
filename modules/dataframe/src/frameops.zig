@@ -18,6 +18,7 @@ const ex = @import("expr.zig");
 const dtf = @import("dtfn.zig");
 const tz = @import("tz");
 const rs = @import("reshape.zig");
+const ip = @import("interpfn.zig");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -326,8 +327,13 @@ pub const InterpolateSpec = struct {
     /// the earlier, as scipy's `nearest`). `slinear` (scipy's linear spline) is the
     /// same line between the known points; `zero` holds the previous known value
     /// (scipy's zeroth-order spline). pandas runs the last three through SciPy; neither
-    /// engine's oracle here has it (see SPEC).
-    method: enum { linear, nearest, slinear, zero } = .linear,
+    /// engine's oracle here has it (see SPEC). `quadratic` and `cubic` are SciPy's
+    /// `interp1d` splines (at least 3 / 4 present points; no value outside the first and
+    /// last present x), `pchip` Fritsch-Carlson's monotone cubic (extrapolates with the
+    /// end cubic where `limit_direction` lets it) and `akima` Akima's (no extrapolation);
+    /// pandas hands them to SciPy. Too few points, a repeated x, or for `pchip` / `akima`
+    /// an unsorted x or a non-finite y is `error.BadArgument` (pandas raises `ValueError`).
+    method: enum { linear, nearest, slinear, zero, quadratic, cubic, pchip, akima } = .linear,
     /// The x of each row: a numeric or temporal column; null = the row position.
     by: ?[]const u8 = null,
     /// The output column; null replaces `col`.
@@ -382,6 +388,44 @@ pub fn interpolate(a: std.mem.Allocator, f: Frame, spec: InterpolateSpec) Error!
         const x = if (bi) |b| xOf(f.columnAt(b).get(ri)) orelse continue else @as(f64, @floatFromInt(ri));
         try pts.append(a, .{ .x = x, .y = y });
     }
+    const smooth: ?ip.Kind = switch (spec.method) {
+        .quadratic => .quadratic,
+        .cubic => .cubic,
+        .pchip => .pchip,
+        .akima => .akima,
+        else => null,
+    };
+    var sfit: ?ip.Fit = null;
+    defer if (sfit) |*sf| sf.deinit(a);
+    if (smooth) |kind| {
+        // SciPy sorts for the spline kinds; PCHIP / Akima take the x as it comes, and
+        // pandas wants a PCHIP index monotonic whether or not there is a gap.
+        if (kind == .pchip) if (bi) |b| {
+            var prev_x: ?f64 = null;
+            for (0..f.len) |ri| {
+                const x = xOf(f.columnAt(b).get(ri)) orelse continue;
+                if (prev_x) |px| if (x < px) return error.BadArgument;
+                prev_x = x;
+            }
+        };
+        var gap = false;
+        for (0..f.len) |ri| gap = gap or !isPresentNum(ys.get(ri));
+        if (kind == .quadratic or kind == .cubic) std.mem.sort(Pt, pts.items, {}, ptLess);
+        if (gap and pts.items.len > 0) {
+            const xs = try a.alloc(f64, pts.items.len * 2);
+            defer a.free(xs);
+            const yv = xs[pts.items.len..];
+            const xv = xs[0..pts.items.len];
+            for (pts.items, xv, yv) |pt, *xo, *yo| {
+                xo.* = pt.x;
+                yo.* = pt.y;
+            }
+            sfit = ip.fit(a, kind, xv, yv) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadArgument => return error.BadArgument,
+            };
+        }
+    }
     std.mem.sort(Pt, pts.items, {}, ptLess);
     // The nearest present row before / after each row, for `limit*`.
     const none = std.math.maxInt(usize);
@@ -430,6 +474,10 @@ pub fn interpolate(a: std.mem.Allocator, f: Frame, spec: InterpolateSpec) Error!
             .both => from_prev or from_next,
         } else in_range and (!has_prev or from_prev);
         if (!ok) continue;
+        if (sfit) |sf| {
+            if (sf.eval(x)) |sv| o.* = .{ .float = sv };
+            continue;
+        }
         if (!in_range) {
             // Beyond the known points: repeat the nearest one.
             o.* = .{ .float = if (x < p[0].x) p[0].y else p[p.len - 1].y };
@@ -448,11 +496,15 @@ pub fn interpolate(a: std.mem.Allocator, f: Frame, spec: InterpolateSpec) Error!
         }
         const l = p[lo - 1];
         const r = p[lo];
-        o.* = .{ .float = switch (spec.method) {
-            .linear, .slinear => l.y + (r.y - l.y) * (x - l.x) / (r.x - l.x),
-            .nearest => if (x - l.x <= r.x - x) l.y else r.y,
-            .zero => l.y,
-        } };
+        o.* = .{
+            .float = switch (spec.method) {
+                .linear, .slinear => l.y + (r.y - l.y) * (x - l.x) / (r.x - l.x),
+                .nearest => if (x - l.x <= r.x - x) l.y else r.y,
+                .zero => l.y,
+                // Handled above through `sfit`, which exists whenever a gap and a point do.
+                .quadratic, .cubic, .pchip, .akima => l.y,
+            },
+        };
     }
     const name = spec.out orelse spec.col;
     // A Float32 column stays Float32 (polars); every other numeric type interpolates to Float64.
