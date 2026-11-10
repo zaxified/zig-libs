@@ -27,7 +27,6 @@ const known = [_]Known{
     .{ .id = "key-join-u64-f64", .why = "as key-join-i32-f64: polars refuses UInt64 with Float64, this module joins by exact value" },
     .{ .id = "key-join-i64-f64", .why = "as key-join-i32-f64: polars refuses Int64 with Float64, this module joins by exact value" },
     .{ .id = "key-concat-unique-u64-i64", .why = "polars stacks UInt64 and Int64 into Int128, which this module does not have: they meet in Float64 (D5), the values the same (2^63 is exact in a double)" },
-    .{ .id = "group_by-sum-float-cell", .why = "`aggregate`'s `sum` of an Int64 column is a float cell (exact below 2^53); polars sums to Int64. `sum_exact` is the integer sum (a decimal). Part A's D7 (sum keeps the integer type) removes this" },
     .{ .id = "repr-str", .why = "the dtype row of `format` (`show_dtypes`) names a text column by its type tag, `text`; polars writes `str`. The tag names of Int64 and Float64 (`int`, `float`) stay as before W11; the widths read `i8`..`u64`, `f32`" },
     .{ .id = "repr-bool", .why = "this module renders a bool as `True`/`False` (pandas' form, its `format` rule before W11); polars prints `true`/`false`" },
 };
@@ -239,11 +238,6 @@ fn replayGroupBy(a: std.mem.Allocator, c: J, t: *Tally) !void {
         const tys = [3]ColumnType{ kt, .int, .int };
         for (rows, got, tys, 0..) |wv, gv, ty, k| {
             if (same(wv, gv, ty, null)) continue;
-            // The sum of an Int64 column is a float cell here (`aggregate`, part A's D7).
-            if (k == 1 and gv == .float and gv.float == jcell(wv, .int).asFloat().?) {
-                t.miss("group_by-sum-float-cell", "group {d}", .{i});
-                continue;
-            }
             t.miss(id, "group {d} cell {d}: want {s}, got {any}", .{ i, k, cellText(a, wv), gv });
         }
     }

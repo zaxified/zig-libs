@@ -141,11 +141,13 @@ fn appended(a: std.mem.Allocator, f: Frame, col: Column, data: ColumnData) Error
     cols[w] = col;
     const out = try a.alloc(ColumnData, w + 1);
     for (out[0..w], 0..) |*d, ci| d.* = colOf(f, ci);
-    out[w] = data;
+    // A caller-declared width holds its own array (W11): a cell it does not hold is null.
+    out[w] = try fm.conform(a, data, col.type, f.len);
     return .{ .columns = cols, .data = out, .len = f.len };
 }
 
-/// `out = lhs op rhs` appended as a float column (`MapSpec`).
+/// `out = lhs op rhs` appended as a float column (`MapSpec`); a width `out_type` holds the
+/// whole results that fit it and null for the rest (W11, `frame.conform`).
 pub fn map(a: std.mem.Allocator, f: Frame, spec: sp.MapSpec) Error!Frame {
     const unary = spec.op == .abs or spec.op == .sqrt;
     const lhs = try readOperand(a, f, spec.lhs);

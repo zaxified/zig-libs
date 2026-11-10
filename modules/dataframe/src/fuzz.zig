@@ -262,14 +262,11 @@ fn expectWidths(what: []const u8, f: Frame) !void {
     return error.WidthsDoNotConform;
 }
 
-/// The verbs whose result's widths the harness checks: those of dataframe part B (`verbs.zig`
-/// moves, `reshape`, `structure`, `nestverbs`, `frameops`, `callback`). The part A verbs
-/// (`expr`, `window`, `analysis`, `more`, the aggregates) join this list as they conform theirs.
+/// The verbs whose result's widths the harness checks: every one (W11: a verb that passes a
+/// width column on keeps its array, one that computes a width result conforms it).
 fn widthChecked(v: Verb) bool {
-    return switch (v) {
-        .filter, .sort, .distinct, .join, .pivot, .unpivot, .select, .drop, .rename, .fillna, .dropna, .take, .explode, .unnest, .transpose, .dummies, .map_elements, .map_rows, .map_groups, .filter_groups, .rolling_map => true,
-        else => false,
-    };
+    _ = v;
+    return true;
 }
 
 /// Whether the frame a verb was handed held its widths (a verb that passes a column on cannot
