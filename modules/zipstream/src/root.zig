@@ -1626,10 +1626,7 @@ pub const ArchiveWriter = struct {
             if (self.entries.items.len >= std.math.maxInt(u16)) return Error.ZipWriteTooLarge;
         }
         const ut: ?u32 = if (options.mtime) |t|
-            // zig 0.17.0 miscompile: not `std.math.cast(u32, t)` with t: i64 --
-            // it lowers to `trunc nsw`, making mtimes 2038..2106 (2^31..2^32-1)
-            // poison; narrow non-negative i64 → u64 → u32 (`trunc nuw`).
-            (if (t < 0) null else std.math.cast(u32, @as(u64, @bitCast(t))))
+            std.math.cast(u32, t)
         else
             null;
         const real: std.zip.CompressionMethod = switch (method) {

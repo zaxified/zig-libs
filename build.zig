@@ -11,6 +11,21 @@ const builtin = @import("builtin");
 // importable module named <name>. `deps` lists sibling modules it imports.
 // See CONVENTIONS.md for naming + the `meta` tag vocabulary.
 
+// ⛔ ZIG 0.17.1 OR NEWER, ENFORCED HERE (2026-11-10). `minimum_zig_version` in
+// build.zig.zon is advisory: Zig reads it nowhere, and 0.17.0 builds a package
+// that declares "0.17.1" without a word (measured 2026-11-07). 0.17.0 lowers a
+// signed -> narrower-unsigned `@intCast`/`std.math.cast` as LLVM `trunc nsw`
+// (ziglang/zig#37131), so ReleaseSafe/ReleaseFast may delete range checks on
+// the upper half of the destination type; the collection dropped its 0.17.0
+// workarounds (snmp, jwe, zipstream, falcon, bzip2, framing, mlkem #37110) and
+// ~190 more such casts were never worked around. A consumer's `zig build`
+// compiles this file, so one check here covers every module. Tag 2026-11-10
+// is the last one for 0.17.0.
+comptime {
+    if (builtin.zig_version.order(.{ .major = 0, .minor = 17, .patch = 1 }) == .lt)
+        @compileError("zig-libs needs Zig 0.17.1 or newer: 0.17.0 miscompiles signed -> narrower-unsigned casts (ziglang/zig#37131); pin tag 2026-11-10 to stay on 0.17.0");
+}
+
 pub const Module = struct {
     name: []const u8,
     deps: []const []const u8 = &.{},

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-10** — **NO CONSUMER-VISIBLE CHANGE** (Zig 0.17.1 migration): `Poly.v` loses its explicit `align(32)`, the workaround for Zig 0.17.0 dropping the error of an error union whose payload held a 32-byte vector on aarch64 (ziglang/zig#37110, fixed in 0.17.1; `build.zig` now refuses older compilers). The bad-key `SecretKey.fromBytes` tests stay as its regression guard; the CI arm64 lane runs them.
 - **2026-11-01** — Fix: on aarch64 `SecretKey.fromBytes` accepted every
   decapsulation key that fails the FIPS 203 §7.3 checks — the caller of an
   error union whose payload holds a 32-byte vector and whose size is not a

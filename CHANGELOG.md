@@ -26,6 +26,12 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
+- **Zig 0.17.1 or newer is required (2026-11-10) — BREAKING for consumers still on 0.17.0.** Zig 0.17.0
+  lowers a signed → narrower-unsigned `@intCast`/`std.math.cast` as LLVM `trunc nsw`
+  (ziglang/zig#37131), which lets ReleaseSafe/ReleaseFast delete range checks on the upper half of
+  the destination type; 0.17.1 fixes it, and the collection's 0.17.0 workarounds are gone. Since
+  `minimum_zig_version` is advisory (Zig reads it nowhere), `build.zig` refuses an older compiler
+  with a compile error. Tag `2026-11-10` is the last one built for 0.17.0.
 - **`dataset` and `tabular` are removed (2026-11-08) — BREAKING for their consumers.** They are
   replaced by the columnar [`dataframe`](modules/dataframe) (pandas/polars eager API); `jsonshape`'s
   `shape` returns a `dataframe.Frame`, and `finstats` works over plain slices (its `Dataset` functions

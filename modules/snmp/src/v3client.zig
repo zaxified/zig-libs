@@ -1005,8 +1005,6 @@ pub const FakeAgent = struct {
     /// Build (and sign/encrypt) a reply datagram into `a.out`.
     fn frame(a: *FakeAgent, msg_id_in: i32, pdu: message.EncodePdu, authed: bool, encrypted: bool) ![]const u8 {
         const msg_id = a.force_msg_id orelse msg_id_in;
-        // zig 0.17.0 miscompile: not a direct i64 → u32 `@intCast` (`trunc nsw`)
-        // -- see ber.toUnsigned.
         const skewed: u32 = ber.toUnsigned(u32, @max(0, @as(i64, a.time) + a.time_skew)).?;
         const zeros = @as([usm.max_digest_len]u8, @splat(0));
         const auth_ph: []const u8 = if (authed) zeros[0..a.user.auth_protocol.digestLen()] else &.{};

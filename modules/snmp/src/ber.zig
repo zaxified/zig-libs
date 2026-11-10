@@ -160,28 +160,20 @@ pub fn parseInteger(content: []const u8) DecodeError!i64 {
 /// `std.math.cast(T, v)` / `@intCast(v)` for every signed → narrower-unsigned
 /// conversion in this module.
 ///
-/// zig 0.17.0 miscompile: `@intCast` from a signed integer to a NARROWER
-/// unsigned one (i64 → u32, i64 → u8, …; `std.math.cast` lowers to the same
-/// `@intCast`) is emitted as LLVM `trunc nsw` -- the no-signed-wrap flag is
-/// picked from the SOURCE signedness, where an unsigned destination needs
-/// `nuw` (0.16 emitted a plain `trunc`). `nsw` asserts the value fits the
-/// destination width as a SIGNED number, so every value in
-/// [2^(N-1), 2^N) -- e.g. 0xFFFFFFFF for u32 -- becomes poison, and LLVM then
-/// folds a following `v > maxInt(i32)` to false: USM accepted
-/// engineBoots = 0xFFFFFFFF in ReleaseSafe/ReleaseFast on amd64 and arm64.
-/// The workaround keeps the narrowing unsigned → unsigned (`trunc nuw`,
-/// correct): reinterpret the non-negative i64 as u64 first.
+/// History: Zig 0.17.0 lowered this signed → narrower-unsigned cast as LLVM
+/// `trunc nsw` (#37131), which made [2^(N-1), 2^N) poison -- USM accepted
+/// engineBoots = 0xFFFFFFFF in ReleaseSafe/ReleaseFast -- so the body went
+/// through u64. Zig 0.17.1 fixed it and `build.zig` refuses older compilers,
+/// so this is the plain cast again. The regression tests below stay: they are
+/// what fails if a compiler reintroduces the bug.
 ///
-/// `inline` on purpose: whether LLVM exploits the poison depends on the
-/// surrounding code, and with the narrowing inlined into `usm.parse` (the
-/// original shape) the usm range tests DO fail when this body is reverted to
-/// `std.math.cast(T, v)` (measured 2026-10-19); as a separate call they did
-/// not, which would leave a regression silently latent.
+/// `inline` on purpose: whether LLVM exploits such poison depends on the
+/// surrounding code, and only with the narrowing inlined into `usm.parse`
+/// (the original shape) did the usm range tests fail on 0.17.0 (measured
+/// 2026-10-19); as a separate call the regression would stay latent.
 pub inline fn toUnsigned(comptime T: type, v: i64) ?T {
     comptime std.debug.assert(@typeInfo(T).int.signedness == .unsigned);
-    if (v < 0) return null;
-    const u: u64 = @bitCast(v);
-    return std.math.cast(T, u);
+    return std.math.cast(T, v);
 }
 
 /// Non-negative INTEGER content → u64 (Counter64 & friends: up to 9 content

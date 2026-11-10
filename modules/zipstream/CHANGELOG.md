@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-10** — **NO CONSUMER-VISIBLE CHANGE** (Zig 0.17.1 migration): the mtime narrowing is `std.math.cast(u32, t)` again; the i64 → u64 → u32 detour was the Zig 0.17.0 `trunc nsw` workaround (ziglang/zig#37131, fixed in 0.17.1; `build.zig` now refuses older compilers).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private civil-calendar helpers (`daysFromCivil`, `civilFromDays`, `daysInMonth`, `isLeap`) are gone; `DosDateTime` uses `datefmt` (new dependency).
 - **2026-11-02** — **New build option** `-Dzipstream-builtin-decoders` (default `true`; `-Dprofile=small` picks `false`): `false` leaves `Archive` with Store and Deflate and saves 315 KB in a read-only binary; other methods are refused with `UnsupportedCompressionMethod` unless plugged in through `Options.codecs`. Request from bxp.
 - **2026-11-02** — **Fixed** (size): reading no longer links any compressor. `Archive`'s fallback table named `zstd_codec` & co., whose `open_writer` pulled in the whole zstd, bzip2 and LZMA encoders; a read-only probe drops from 1.27 to 0.51 MB in ReleaseSmall and from 15.6 to 5.5 MB in ReleaseSafe. No API change. Request from bxp.

@@ -249,9 +249,6 @@ fn parseFields(content: []const u8) DecodeError!PduFields {
 
 fn parseBasic(content: []const u8) DecodeError!BasicPdu {
     const f = try parseFields(content);
-    // zig 0.17.0 miscompile: signed → narrower unsigned goes through
-    // `ber.toUnsigned`, never `@intCast`/`std.math.cast` (`trunc nsw` makes
-    // 128..255 / 2^31..2^32-1 poison) -- see ber.toUnsigned.
     const status = ber.toUnsigned(u8, f.f1) orelse return error.InvalidValue;
     return .{
         .request_id = f.request_id,
@@ -273,7 +270,6 @@ fn parseBulk(content: []const u8) DecodeError!BulkPdu {
 
 fn clampToU32(v: i64) u32 {
     if (v < 0) return 0;
-    // zig 0.17.0 miscompile: not std.math.cast(u32, i64) -- see ber.toUnsigned.
     return ber.toUnsigned(u32, v) orelse std.math.maxInt(u32);
 }
 
@@ -282,7 +278,6 @@ fn parseTrapV1(content: []const u8) DecodeError!TrapV1Pdu {
     const enterprise = try ber.parseOid(try d.expect(ber.tag.object_identifier));
     const addr = try d.expect(ber.tag.ip_address);
     if (addr.len != 4) return error.InvalidValue;
-    // zig 0.17.0 miscompile: not @intCast(i64 → u8) -- see ber.toUnsigned.
     const generic = ber.toUnsigned(u8, try ber.parseInteger(try d.expect(ber.tag.integer))) orelse
         return error.InvalidValue;
     const specific = try ber.parseInteger(try d.expect(ber.tag.integer));

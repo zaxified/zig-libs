@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-10** — **NO CONSUMER-VISIBLE CHANGE** (Zig 0.17.1 migration): the `ntru` shift `scl` is a direct `@intCast(@rem(scale_k, 31))` again; the detour through u32 was the Zig 0.17.0 `trunc nsw` workaround (ziglang/zig#37131, fixed in 0.17.1; `build.zig` now refuses older compilers).
 - **2026-10-19** — **Fix (Zig 0.17.0 optimized builds only):** `ntru` key-generation shift `scl: u5 = @intCast(@rem(scale_k, 31))` (i32 source) lowered to `trunc nsw` under zig 0.17.0, poison for 16..30; now narrowed through same-width u32. Same keys as before (KATs unchanged).
 - **2026-10-10** — tests: deterministic fuzz driver `FALCON_FUZZ` for Falcon-512 and -1024 (`falcon-{512,1024}-{verify,open,pubkey,seckey}`, new `src/fuzz_test.zig`): the genuine NIST-KAT signature field / signed-message envelope is accepted and every other octet string (real encoding with 0-3 octets damaged or truncated, wild bytes behind the right header) refused; a flipped message or nonce octet is refused; a decoded public key re-encodes to the same octets; a decoded secret key never panics in `publicKey()` and the pristine one reproduces the KAT public key. No change in `src/` outside tests.
 - **2026-10-09** — **Fix: the small dead-stack burns left up to 63 bytes unzeroed.** With 32-byte

@@ -194,7 +194,6 @@ fn decodeHeader(content: []const u8) DecodeError!HeaderData {
         .msg_id = std.math.cast(i32, msg_id) orelse return error.IntegerTooLarge,
         .msg_max_size = std.math.cast(i32, max_size) orelse return error.IntegerTooLarge,
         .flags = MsgFlags.fromByte(flags_os[0]),
-        // zig 0.17.0 miscompile: not std.math.cast(u32, i64) -- see ber.toUnsigned.
         .security_model = ber.toUnsigned(u32, security_model) orelse return error.IntegerTooLarge,
     };
 }

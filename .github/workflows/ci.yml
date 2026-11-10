@@ -714,6 +714,10 @@ jobs:
           # known), at random, in blobmsg's RV-BM-1 on 2 of the last runs. NEON,
           # atomics, alignment and the asm dispatch are what this lane is for;
           # SVE is none of them. A pinned CPU also lets a stamp hold across hosts.
+          # 2026-11-10, Zig 0.17.1: SVE is back (`neoverse_n2`, no `-sve`). The
+          # lost predicate was std's syscall wrapper not declaring the SVE
+          # predicates clobbered across `svc` (ziglang/zig#37321, fixed in
+          # 0.17.1), not the host. The CPU stays pinned for the stamps.
           # ONE arm64 pair, not three. What a second architecture buys is
           # portability coverage -- alignment and endianness assumptions,
           # atomics, and the asm-vs-fallback dispatch -- and none of that varies
@@ -735,9 +739,9 @@ jobs:
           # its own tests on that host anyway. "Our client interoperates with
           # open62541" is not an architecture-dependent claim, and amd64 makes
           # it in a minute. The skip prints a line every time it happens.
-          lanes+=('{"name":"modules ReleaseSafe arm64 [crypto]","base":"modules ReleaseSafe arm64","args":"-Dcpu=neoverse_n2-sve -Doptimize=ReleaseSafe -Dgroup=crypto","cmd":"modules","cachekey":"mod-relsafe-crypto","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":90,"skip_live":"opcua"}')
-          lanes+=('{"name":"modules ReleaseSafe arm64 [net]","base":"modules ReleaseSafe arm64","args":"-Dcpu=neoverse_n2-sve -Doptimize=ReleaseSafe -Dgroup=net","cmd":"modules","cachekey":"mod-relsafe-net","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":true,"timeout":90,"skip_live":"opcua"}')
-          lanes+=('{"name":"modules ReleaseSafe arm64 [rest]","base":"modules ReleaseSafe arm64","args":"-Dcpu=neoverse_n2-sve -Doptimize=ReleaseSafe -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"modules","cachekey":"mod-relsafe-rest","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":90,"skip_live":"opcua"}')
+          lanes+=('{"name":"modules ReleaseSafe arm64 [crypto]","base":"modules ReleaseSafe arm64","args":"-Dcpu=neoverse_n2 -Doptimize=ReleaseSafe -Dgroup=crypto","cmd":"modules","cachekey":"mod-relsafe-crypto","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":90,"skip_live":"opcua"}')
+          lanes+=('{"name":"modules ReleaseSafe arm64 [net]","base":"modules ReleaseSafe arm64","args":"-Dcpu=neoverse_n2 -Doptimize=ReleaseSafe -Dgroup=net","cmd":"modules","cachekey":"mod-relsafe-net","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":true,"timeout":90,"skip_live":"opcua"}')
+          lanes+=('{"name":"modules ReleaseSafe arm64 [rest]","base":"modules ReleaseSafe arm64","args":"-Dcpu=neoverse_n2 -Doptimize=ReleaseSafe -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"modules","cachekey":"mod-relsafe-rest","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":90,"skip_live":"opcua"}')
           # BOTH release modes run the examples, and that is deliberate: the two
           # catch different classes and both are documented here. ReleaseFast is
           # where `qrscan`'s uninitialised perspective terms showed (Debug and
@@ -783,7 +787,7 @@ jobs:
           lanes+=('{"name":"examples ReleaseFast amd64 [crypto]","base":"examples ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=crypto","cmd":"examples","cachekey":"ex-relfast-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
           lanes+=('{"name":"examples ReleaseFast amd64 [net]","base":"examples ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=net","cmd":"examples","cachekey":"ex-relfast-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
           lanes+=('{"name":"examples ReleaseFast amd64 [rest]","base":"examples ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"examples","cachekey":"ex-relfast-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
-          lanes+=('{"name":"examples ReleaseSafe arm64","args":"-Dcpu=neoverse_n2-sve -Doptimize=ReleaseSafe","cmd":"examples","cachekey":"ex-relsafe-all","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseSafe arm64","args":"-Dcpu=neoverse_n2 -Doptimize=ReleaseSafe","cmd":"examples","cachekey":"ex-relsafe-all","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
           # ⭐ THE ONE LANE THAT RE-TAKES THE ANCHORS, added 2026-09-06 —
           # and until it existed, NOTHING anywhere ran `zig build interop-<m>`.
           # The migration that day moved six interop programs out of the modules

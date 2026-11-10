@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-10** — **NO CONSUMER-VISIBLE CHANGE** (Zig 0.17.1 migration): the coding-table length narrowing is a direct `@intCast(curr)` again; the detour through u32 guarded against the Zig 0.17.0 `trunc nsw` miscompile (ziglang/zig#37131, fixed in 0.17.1; `build.zig` now refuses older compilers).
 - **2026-10-30** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GU). `Options.max_output` defaults to 256 MiB (`decoder_default_max_output`, a decompression-bomb guard like brotli's; `null` = unbounded, an explicit opt-out) — a stream that decodes to more now ends in `error.OutputTooLarge`. Fixes: `StreamWriter.finish` is idempotent and its error path no longer `@errorCast`s an out-of-set error (a second `finish` was an invalid cast = UB in ReleaseFast); `Encoder` latches its first error (a retry no longer re-emits a header/CRC); `Decoder.read` with an empty `dest` returns 0; a zero-capacity `in` buffer works (read via `readVec`, 64 consecutive empty reads = `ReadFailed`); the stream counter and `compressBound` saturate. Tests: `src/sweep_test.zig`.
 - **2026-10-23** — **Fix (performance):** `DecompressReader` refills its buffer on small reads. Zig 0.17's `defaultReadVec` streams straight into the caller's slice once the buffer has been filled to its end, so every later small `readSlice*` re-entered the decoder for that many octets. Regression test with a negative control. No API change.
 

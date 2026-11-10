@@ -138,13 +138,10 @@ fn readUint(bytes: []const u8, endian: std.builtin.Endian) u64 {
     }
 }
 
-/// `x` as a u64 when it is in range. Explicit range test, then a bit
-/// reinterpretation: never `@intCast`/`std.math.cast` from a signed type to a
-/// narrower unsigned one (Zig 0.17 miscompile #37131 poisons the upper half in
-/// optimized builds, and these values come from a hostile length field).
+/// `x` as a u64 when it is in range (these values come from a hostile length
+/// field; `sweep_test.zig`'s #37131 test guards the upper half).
 fn toU64(x: i128) ?u64 {
-    if (x < 0 or x > std.math.maxInt(u64)) return null;
-    return @truncate(@as(u128, @bitCast(x)));
+    return std.math.cast(u64, x);
 }
 
 fn varintLen(v: u64) usize {

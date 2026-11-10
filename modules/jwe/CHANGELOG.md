@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-10** — **NO CONSUMER-VISIBLE CHANGE** (Zig 0.17.1 migration): the `p2c` header narrowing is `std.math.cast(u32, i)` again; the i64 → u64 → u32 detour was the Zig 0.17.0 `trunc nsw` workaround (ziglang/zig#37131, fixed in 0.17.1; `build.zig` now refuses older compilers).
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** A128GCM/A256GCM and A128GCMKW/A256GCMKW now runs on the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (std AES-GCM is 2.6x slower on Zig 0.17, #36256). Same bytes on the wire; new dependency `aesgcm` in `meta.deps`. Bulk path not re-measured yet.

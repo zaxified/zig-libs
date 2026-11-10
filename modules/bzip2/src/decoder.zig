@@ -348,8 +348,7 @@ pub const Decoder = struct {
         // Coding tables.
         for (0..ng) |t| {
             // Signed (it walks up and down) but range-checked before every
-            // narrowing; the u8 cast below goes through u32 so it can never
-            // become the signed→narrower-unsigned `trunc nsw` of #37131.
+            // narrowing.
             var curr: i32 = @intCast(try d.bits(5));
             for (0..alpha_size) |i| {
                 while (true) {
@@ -357,7 +356,7 @@ pub const Decoder = struct {
                     if ((try d.bit()) == 0) break;
                     if ((try d.bit()) == 0) curr += 1 else curr -= 1;
                 }
-                w.len[t][i] = @intCast(@as(u32, @intCast(curr)));
+                w.len[t][i] = @intCast(curr);
             }
             w.tables[t].init(&w.len[t], alpha_size);
         }

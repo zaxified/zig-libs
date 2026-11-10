@@ -72,9 +72,8 @@ pub fn parse(bytes: []const u8) DecodeError!UsmSecurityParameters {
     // discovery Report carrying `boots = 0xFFFFFFFF` then seeds the client's
     // clock and every genuine reply after it is `NotInTimeWindow` -- a
     // permanent denial from one unauthenticated datagram. Audit 2026-09-02.
-    // `ber.toUnsigned`, not `std.math.cast(u32, …)`: zig 0.17.0 miscompile
-    // (signed → narrower unsigned `@intCast` emitted as `trunc nsw`) made the
-    // range check below dead in optimized builds -- see `ber.toUnsigned`.
+    // Zig 0.17.0 (#37131) made the range check below dead in optimized
+    // builds; the usm range tests are its regression guard (ber.toUnsigned).
     const eb = try ber.parseInteger(try d.expect(ber.tag.integer));
     const engine_boots = ber.toUnsigned(u32, eb) orelse return error.IntegerTooLarge;
     if (engine_boots > std.math.maxInt(i32)) return error.InvalidValue;
