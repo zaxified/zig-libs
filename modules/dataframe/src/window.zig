@@ -529,7 +529,7 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
 
     if (typed and !promote and plain_layout and !dtype.isWidth(f.columns[vi].type) and f.columns[vi].type != .time) {
         if (try windowTyped(a, f, vi, pidx, op, int_col)) |col| {
-            return withColumn(a, f, .{ .name = spec.out, .type = out_type, .time_zone = Column.zoneFor(f.columns[vi], out_type) }, col);
+            return withColumn(a, f, Column.withShape(.{ .name = spec.out, .type = out_type, .time_zone = Column.zoneFor(f.columns[vi], out_type) }, f.columns[vi]), col);
         }
     }
 
@@ -613,12 +613,12 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
         }
         if (out_type == .float32) roundCells(out);
         fitTimeCells(f.columns[vi].type, out_type, out);
-        if (spec.mapping != .group_to_rows) return mapped(a, f, spec, fac, mem, oidx, out_type, Column.zoneFor(f.columns[vi], out_type), out);
+        if (spec.mapping != .group_to_rows) return mapped(a, f, spec, fac, mem, oidx, out_type, f.columns[vi], out);
     }
     if (out_type == .float32) roundCells(out);
     fitTimeCells(f.columns[vi].type, out_type, out);
 
-    return withColumn(a, f, .{ .name = spec.out, .type = out_type, .time_zone = Column.zoneFor(f.columns[vi], out_type) }, try fm.conform(a, try fm.columnFromCells(a, out), out_type, f.len));
+    return withColumn(a, f, Column.withShape(.{ .name = spec.out, .type = out_type, .time_zone = Column.zoneFor(f.columns[vi], out_type) }, f.columns[vi]), try fm.conform(a, try fm.columnFromCells(a, out), out_type, f.len));
 }
 
 /// The sort of `order_by`: a missing cell first (polars), then `Value.order`; descending
@@ -649,7 +649,8 @@ const OrderCtx = struct {
 
 /// The columns `spec.mapping` is not `group_to_rows`: `join` puts each partition's results
 /// in a list on every row of it, `explode` reorders the rows partition by partition.
-fn mapped(a: std.mem.Allocator, f: Frame, spec: WindowSpec, fac: keys.Factors, mem: keys.Members, oidx: []const usize, out_type: ColumnType, zone: ?[]const u8, out: []const Value) Error!Frame {
+fn mapped(a: std.mem.Allocator, f: Frame, spec: WindowSpec, fac: keys.Factors, mem: keys.Members, oidx: []const usize, out_type: ColumnType, src: Column, out: []const Value) Error!Frame {
+    const zone = Column.zoneFor(src, out_type);
     // The rows in the order the partitions were computed in (first-seen partition, then
     // its sorted order); `reverse` is not applied: the list / the rows read in the
     // `order_by` order.
@@ -667,7 +668,7 @@ fn mapped(a: std.mem.Allocator, f: Frame, spec: WindowSpec, fac: keys.Factors, m
         k += idx.len;
     }
     const data = try fm.conform(a, try fm.columnFromCells(a, out), out_type, f.len);
-    const col: Column = .{ .name = spec.out, .type = out_type, .time_zone = zone };
+    const col: Column = Column.withShape(.{ .name = spec.out, .type = out_type, .time_zone = zone }, src);
     if (spec.mapping == .explode) {
         const whole = try withColumn(a, f, col, data);
         return verbs.takeRows(a, whole, perm);
@@ -682,7 +683,7 @@ fn mapped(a: std.mem.Allocator, f: Frame, spec: WindowSpec, fac: keys.Factors, m
         id.* = fac.ids[ri];
     }
     const vals = try fm.columnFromCells(a, sorted_cells);
-    const one: Frame = .{ .columns = &.{.{ .name = "v", .type = out_type, .time_zone = zone }}, .data = &.{vals}, .len = f.len };
+    const one: Frame = .{ .columns = &.{Column.withShape(.{ .name = "v", .type = out_type, .time_zone = zone }, src)}, .data = &.{vals}, .len = f.len };
     const cells = try a.alloc(Value, f.len);
     defer a.free(cells);
     try transform(a, one, 0, sorted_ids, fac.groups(), .implode, 0.5, cells);
@@ -1146,7 +1147,7 @@ fn transform(a: std.mem.Allocator, f: Frame, vi: usize, ids: []const u32, ng: us
     }
     // The partition keys are already ids: aggregate over a two-column frame of them and
     // the value column, which is shared, not copied.
-    const cols = [_]Column{ .{ .name = "g", .type = .int }, .{ .name = "v", .type = f.columns[vi].type, .time_zone = f.columns[vi].time_zone } };
+    const cols = [_]Column{ .{ .name = "g", .type = .int }, Column.withShape(.{ .name = "v", .type = f.columns[vi].type, .time_zone = f.columns[vi].time_zone }, f.columns[vi]) };
     const gs = try a.alloc(i64, f.len);
     defer a.free(gs);
     for (gs, ids) |*x, g| x.* = g;

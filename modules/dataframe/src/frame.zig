@@ -249,6 +249,63 @@ pub fn conform(a: std.mem.Allocator, col: ColumnData, ty: ColumnType, len: usize
     };
 }
 
+/// `conform` for a declared array column: every row holds exactly `array_width` elements; a
+/// cell that is no list of that length (a literal a verb put in, a row of another length) is
+/// null, as a number out of its width's range is. Storage that already conforms comes back as
+/// it is, and any other type goes to `conform`.
+pub fn conformArray(a: std.mem.Allocator, col: ColumnData, c: Column, len: usize) std.mem.Allocator.Error!ColumnData {
+    if (c.type != .array) return conform(a, col, c.type, len);
+    switch (col) {
+        .nulls => return col,
+        .list => |l| {
+            var ok = true;
+            for (0..len) |ri| {
+                if (l.at(ri)) |v| if (v.len() != c.array_width) {
+                    ok = false;
+                    break;
+                };
+            }
+            if (ok) return col;
+        },
+        else => {},
+    }
+    const cells = try a.alloc(Value, len);
+    defer a.free(cells);
+    for (cells, 0..) |*o, ri| {
+        const v = col.get(ri);
+        o.* = if (v == .list and v.list.len() == c.array_width) v else .null;
+    }
+    return columnFromCells(a, cells);
+}
+
+/// `conformArray` for the verbs that put values of the caller or another column into a
+/// declared column: also a `.time` column holds only times of day (a text, or an int outside
+/// the day, becomes null: the cast's rule), so a `fillna` with a text leaves the cell null.
+pub fn conformColumn(a: std.mem.Allocator, col: ColumnData, c: Column, len: usize) std.mem.Allocator.Error!ColumnData {
+    if (c.type != .time) return conformArray(a, col, c, len);
+    switch (col) {
+        .nulls => return col,
+        .int => |x| {
+            var ok = true;
+            for (0..len) |ri| {
+                if (x.isValid(ri) and !vm.isTimeOfDay(x.values[ri])) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) return col;
+        },
+        else => {},
+    }
+    const cells = try a.alloc(Value, len);
+    defer a.free(cells);
+    for (cells, 0..) |*o, ri| {
+        const v = col.get(ri);
+        o.* = if (v == .int and vm.isTimeOfDay(v.int)) v else .null;
+    }
+    return columnFromCells(a, cells);
+}
+
 /// Whether every column declared with a width type holds that width's array (or no
 /// storage): what `conform` makes true. For tests and the fuzz harness.
 pub fn widthsConform(f: Frame) bool {
@@ -257,6 +314,24 @@ pub fn widthsConform(f: Frame) bool {
         const d = f.columnAt(ci);
         if (d == .nulls) continue;
         if (!std.mem.eql(u8, @tagName(std.meta.activeTag(d)), @tagName(c.type))) return false;
+    }
+    return true;
+}
+
+/// Whether every `.array` column holds, in each valid row, exactly its `array_width`
+/// elements (`ColumnType.array`'s invariant). For tests and the fuzz harness.
+pub fn arraysConform(f: Frame) bool {
+    for (f.columns, 0..) |c, ci| {
+        if (c.type != .array) continue;
+        const d = f.columnAt(ci);
+        switch (d) {
+            .nulls => {},
+            .list => |l| for (0..f.len) |ri| {
+                const v = l.at(ri) orelse continue;
+                if (v.len() != c.array_width) return false;
+            },
+            else => return false,
+        }
     }
     return true;
 }
@@ -368,13 +443,13 @@ pub fn encodeCategorical(a: std.mem.Allocator, col: ColumnData, len: usize) erro
 /// column, then store it as text) and every width column in its own array (`conform`). The frame's arrays are reused, its `data` replaced.
 pub fn encodeDeclared(a: std.mem.Allocator, f: Frame) error{ OutOfMemory, TooLarge }!Frame {
     var any = false;
-    for (f.columns) |c| any = any or c.type == .categorical or dtype.isWidth(c.type);
+    for (f.columns) |c| any = any or c.type == .categorical or c.type == .array or dtype.isWidth(c.type);
     if (!any) return f;
     const data = try a.alloc(ColumnData, f.columns.len);
     for (data, f.columns, 0..) |*d, c, ci| {
         d.* = f.columnAt(ci);
         if (c.type == .categorical) d.* = try encodeCategorical(a, d.*, f.len);
-        d.* = try conform(a, d.*, c.type, f.len);
+        d.* = try conformArray(a, d.*, c, f.len);
     }
     return .{ .columns = f.columns, .data = data, .len = f.len };
 }
@@ -584,7 +659,7 @@ pub const Frame = struct {
     /// One column as a `Series`, or null if there is no such column.
     pub fn series(self: Frame, name: []const u8) ?Series {
         const i = self.columnIndex(name) orelse return null;
-        return .{ .name = self.columns[i].name, .type = self.columns[i].type, .data = self.columnAt(i), .len = self.len, .time_zone = self.columns[i].time_zone };
+        return .{ .name = self.columns[i].name, .type = self.columns[i].type, .data = self.columnAt(i), .len = self.len, .time_zone = self.columns[i].time_zone, .array_width = self.columns[i].array_width };
     }
 
     /// A numeric column as `[]f64`, non-numeric and null read as 0. **Borrows the frame's array when every cell
@@ -903,7 +978,7 @@ pub const FrameBuilder = struct {
     pub fn toOwned(self: *const FrameBuilder) std.mem.Allocator.Error!Frame {
         if (self.failed) return error.OutOfMemory;
         const data = try self.a.alloc(ColumnData, self.cols.len);
-        for (data, self.cols, self.columns) |*d, *c, col| d.* = try conform(self.a, c.finish(), col.type, self.len);
+        for (data, self.cols, self.columns) |*d, *c, col| d.* = try conformArray(self.a, c.finish(), col, self.len);
         return .{ .columns = self.columns, .data = data, .len = self.len };
     }
 };
@@ -917,6 +992,8 @@ pub const Series = struct {
     len: usize,
     /// The column's `time_zone` (null: naive, or not a timestamp).
     time_zone: ?[]const u8 = null,
+    /// The column's `array_width` (0 unless it is an `.array`).
+    array_width: u32 = 0,
 
     /// Cell `row`; past `len` (or past a short hand-built array) it is `.null`.
     pub fn get(self: Series, row: usize) Value {

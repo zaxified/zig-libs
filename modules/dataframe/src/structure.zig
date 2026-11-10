@@ -70,7 +70,7 @@ pub fn clone(a: std.mem.Allocator, f: Frame) Error!Frame {
         for (cells, 0..) |*c, ri| c.* = col.get(ri);
         // `columnFromCells` copies text; the boxed path copies it as well. A width column
         // gets its own array again.
-        d.* = try fm.conform(a, try fm.columnFromCells(a, cells), f.columns[ci].type, f.len);
+        d.* = try fm.conformColumn(a, try fm.columnFromCells(a, cells), f.columns[ci], f.len);
     }
     return .{ .columns = cols, .data = data, .len = f.len };
 }
@@ -85,6 +85,7 @@ fn cloneSchema(a: std.mem.Allocator, cols: []const Column) Error![]Column {
         .type = src.type,
         .inner = if (src.inner.len == 0) &.{} else try cloneSchema(a, src.inner),
         .time_zone = if (src.time_zone) |z| try a.dupe(u8, z) else null,
+        .array_width = src.array_width,
     };
     return out;
 }
@@ -160,7 +161,7 @@ pub fn insertColumn(a: std.mem.Allocator, f: Frame, at: usize, s: Series) Error!
     var k: usize = 0;
     for (0..w + 1) |i| {
         if (i == at) {
-            cols[i] = .{ .name = s.name, .type = s.type, .time_zone = s.time_zone };
+            cols[i] = .{ .name = s.name, .type = s.type, .time_zone = s.time_zone, .array_width = s.array_width };
             data[i] = s.data;
             continue;
         }
@@ -186,7 +187,7 @@ pub fn hstack(a: std.mem.Allocator, f: Frame, series: []const Series) Error!Fram
     @memcpy(cols[0..f.columns.len], f.columns);
     for (0..f.columns.len) |i| data[i] = f.columnAt(i);
     for (series, f.columns.len..) |s, i| {
-        cols[i] = .{ .name = s.name, .type = s.type, .time_zone = s.time_zone };
+        cols[i] = .{ .name = s.name, .type = s.type, .time_zone = s.time_zone, .array_width = s.array_width };
         data[i] = s.data;
     }
     try checkUniqueHashed(a, cols);
@@ -201,7 +202,7 @@ pub fn replaceColumn(a: std.mem.Allocator, f: Frame, at: usize, s: Series) Error
     if (s.len != f.len) return error.LengthMismatch;
     if (f.columnIndex(s.name)) |ci| if (ci != at) return error.DuplicateColumn;
     const cols = try a.dupe(Column, f.columns);
-    cols[at] = .{ .name = s.name, .type = s.type, .time_zone = s.time_zone };
+    cols[at] = .{ .name = s.name, .type = s.type, .time_zone = s.time_zone, .array_width = s.array_width };
     const data = try a.alloc(ColumnData, f.columns.len);
     for (data, 0..) |*d, ci| d.* = f.columnAt(ci);
     data[at] = s.data;
@@ -360,7 +361,7 @@ fn matches(f: Frame, ci: usize, s: Selector, depth: usize, budget: *usize, pats:
         .alpha => nameAll(c.name, nameAlpha),
         .alphanumeric => nameAll(c.name, nameAlnum),
         .digit => nameAll(c.name, ut.isDecimalCp),
-        .nested => c.type == .list or c.type == .@"struct",
+        .nested => c.type == .list or c.type == .array or c.type == .@"struct",
         .not => |inner| !try matches(f, ci, inner.*, depth + 1, budget, pats),
         .any_of => |xs| blk: {
             for (xs) |x| if (try matches(f, ci, x, depth + 1, budget, pats)) break :blk true;
@@ -621,7 +622,17 @@ pub fn transpose(a: std.mem.Allocator, f: Frame, spec: TransposeSpec) Error!Fram
         }
         meet = acc orelse .float;
     }
-    const out_ty: ColumnType = if (!mixed) (ty orelse .float) else if (all_num) meet else .text;
+    var out_ty: ColumnType = if (!mixed) (ty orelse .float) else if (all_num) meet else .text;
+    // Arrays of one width stay an array column; of several widths they are lists.
+    var arr_src: ?Column = null;
+    if (out_ty == .array and src.items.len > 0) {
+        arr_src = f.columns[src.items[0]];
+        for (src.items[1..]) |ci| if (f.columns[ci].array_width != arr_src.?.array_width) {
+            out_ty = .list;
+            arr_src = null;
+            break;
+        };
+    }
     // Timestamps in one zone stay in it; in several, the instants stay and the zone goes.
     var out_zone: ?[]const u8 = null;
     if (out_ty == .timestamp and src.items.len > 0) {
@@ -664,6 +675,7 @@ pub fn transpose(a: std.mem.Allocator, f: Frame, spec: TransposeSpec) Error!Fram
             c.* = if (to_float and v != .null) (if (v.asFloat()) |x| .{ .float = x } else v) else v;
         }
         cols[k + ri] = .{ .name = name, .type = out_ty, .time_zone = out_zone };
+        if (arr_src) |s| cols[k + ri] = Column.withShape(cols[k + ri], s);
         data[k + ri] = try fm.conform(a, try fm.columnFromCells(a, cells), out_ty, m);
     }
     try checkUniqueHashed(a, cols);

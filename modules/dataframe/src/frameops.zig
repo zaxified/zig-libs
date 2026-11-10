@@ -185,7 +185,7 @@ pub fn arith(a: std.mem.Allocator, f: Frame, g: Frame, op: ex.Binary, spec: Arit
         }
         const want: ?ColumnType = if (fi != null and gi != null) operandMeet(op, f.columns[fi.?].type, g.columns[gi.?].type) else null;
         c.* = .{ .name = n, .type = declared(resultType(cells), want) };
-        d.* = try fm.conform(a, try fm.columnFromCells(a, cells), c.type, rows);
+        d.* = try fm.conformColumn(a, try fm.columnFromCells(a, cells), c.*, rows);
     }
     return .{ .columns = cols, .data = data, .len = rows };
 }
@@ -218,7 +218,7 @@ pub fn arithScalar(a: std.mem.Allocator, f: Frame, op: ex.Binary, value: Value, 
         }
         cols[ci].type = declared(resultType(cells), literalMeet(op, f.columns[ci].type, value));
         if (cols[ci].type != .timestamp) cols[ci].time_zone = null;
-        d.* = try fm.conform(a, try fm.columnFromCells(a, cells), cols[ci].type, f.len);
+        d.* = try fm.conformColumn(a, try fm.columnFromCells(a, cells), cols[ci], f.len);
     }
     return .{ .columns = cols, .data = data, .len = f.len };
 }
@@ -272,8 +272,8 @@ pub fn compare(a: std.mem.Allocator, f: Frame, g: Frame) Error!Frame {
                 const y = g.columnAt(ci).get(r);
                 o.* = if (sameCell(x, y)) .null else if (side == 0) x else y;
             }
-            try cols.append(a, .{ .name = try std.mem.concat(a, u8, &.{ c.name, suffix }), .type = c.type, .time_zone = c.time_zone });
-            try data.append(a, try fm.conform(a, try fm.columnFromCells(a, cells), c.type, cells.len));
+            try cols.append(a, .{ .name = try std.mem.concat(a, u8, &.{ c.name, suffix }), .type = c.type, .time_zone = c.time_zone, .inner = c.inner, .array_width = c.array_width });
+            try data.append(a, try fm.conformColumn(a, try fm.columnFromCells(a, cells), c, cells.len));
         }
     }
     try keys.uniqueNames(a, cols.items);
@@ -737,7 +737,7 @@ fn groupByDynamicGeneral(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Erro
         const v = f.columnAt(ii).get(ri);
         c.* = if (isMissing(v)) .null else try dtf.toLocal(a, v, zone);
     }
-    data[ii] = try fm.conform(a, try fm.columnFromCells(a, wall), f.columns[ii].type, f.len);
+    data[ii] = try fm.conformColumn(a, try fm.columnFromCells(a, wall), f.columns[ii], f.len);
     const out = try groupByDynamicNaive(a, .{ .columns = cols, .data = data, .len = f.len }, spec);
     const ocols = try a.dupe(Column, out.columns);
     const odata = try a.alloc(ColumnData, out.columns.len);
@@ -762,7 +762,7 @@ fn groupByDynamicGeneral(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Erro
             const v = d.get(ri);
             b.* = if (isMissing(v)) .null else try dtf.fromLocal(a, v, zone, .compatible);
         }
-        d.* = try fm.conform(a, try fm.columnFromCells(a, back), c.type, out.len);
+        d.* = try fm.conformColumn(a, try fm.columnFromCells(a, back), c.*, out.len);
         c.time_zone = zn;
     }
     return .{ .columns = ocols, .data = odata, .len = out.len };
@@ -1033,10 +1033,10 @@ pub fn groupByDynamic(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!F
     const w = f.columns.len;
     const cols = try a.alloc(Column, w + 1);
     @memcpy(cols[0..w], f.columns);
-    cols[w] = .{ .name = win_name, .type = f.columns[ii].type, .time_zone = f.columns[ii].time_zone };
+    cols[w] = Column.withShape(.{ .name = win_name, .type = f.columns[ii].type, .time_zone = f.columns[ii].time_zone }, f.columns[ii]);
     const data = try a.alloc(ColumnData, w + 1);
     for (data[0..w], 0..) |*x, i| x.* = f.columnAt(i);
-    data[w] = try fm.conform(a, try fm.columnFromCells(a, cells), f.columns[ii].type, f.len);
+    data[w] = try fm.conformColumn(a, try fm.columnFromCells(a, cells), f.columns[ii], f.len);
     var with: Frame = .{ .columns = cols, .data = data, .len = f.len };
     with = try verbs.dropna(a, with, .{ .subset = &.{win_name} });
     const gb = try a.alloc([]const u8, spec.by.len + 1);
@@ -1099,7 +1099,7 @@ pub fn upsample(a: std.mem.Allocator, f: Frame, spec: UpsampleSpec) Error!Frame 
     }
     const gcols = try a.dupe(Column, &.{f.columns[ti]});
     const gdata = try a.alloc(ColumnData, 1);
-    gdata[0] = try fm.conform(a, try fm.columnFromCells(a, grid.items), f.columns[ti].type, grid.items.len);
+    gdata[0] = try fm.conformColumn(a, try fm.columnFromCells(a, grid.items), f.columns[ti], grid.items.len);
     const g: Frame = .{ .columns = gcols, .data = gdata, .len = grid.items.len };
     // Rename the right key so the join keeps the left (grid) one.
     const rcols = try a.dupe(Column, f.columns);

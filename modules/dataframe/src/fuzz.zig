@@ -263,6 +263,15 @@ fn expectWidths(what: []const u8, f: Frame) !void {
     return error.WidthsDoNotConform;
 }
 
+/// Every `.array` column of `f` holds, in each valid row, exactly its width of elements
+/// (`frame.arraysConform`): what a verb that passes an array column on must keep.
+fn expectArrays(what: []const u8, f: Frame) !void {
+    if (oom_mode or fm.arraysConform(f)) return;
+    std.debug.print("{s}: an array column holds a row of another width (len={d})\n", .{ what, f.len });
+    for (f.columns, 0..) |c, i| std.debug.print("  column {d} {s} {t} width {d} storage {t}\n", .{ i, c.name, c.type, c.array_width, f.columnAt(i) });
+    return error.ArraysDoNotConform;
+}
+
 /// Every `.time` column of `f` holds only a time of day (an int in `[0, us_per_day)`) or null:
 /// whatever a verb does with one, the cell never leaves the day.
 fn expectTimes(what: []const u8, f: Frame) !void {
@@ -289,6 +298,9 @@ fn widthChecked(v: Verb) bool {
 /// Whether the frame a verb was handed held its widths (a verb that passes a column on cannot
 /// give back more than it got).
 var input_conforms = true;
+
+/// Whether the frame a verb was handed held its arrays' widths.
+var input_arrays_conform = true;
 
 /// Results checked by `expectWidths` that held at least one width column (reach of the check).
 var width_checks: u64 = 0;
@@ -371,9 +383,9 @@ fn genValue(src: anytype, a: Allocator) Value {
 
 /// `int8`..`float32` are the fixed-width numbers (wave W11): a column of one of them holds its
 /// own array (`frame.conform`), its cells drawn from the width's edges.
-const Kind = enum { int, float, bool, decimal, text, date, timestamp, time, boxed, nulls, list, record, int8, int16, int32, uint8, uint16, uint32, uint64, float32 };
+const Kind = enum { int, float, bool, decimal, text, date, timestamp, time, boxed, nulls, list, record, int8, int16, int32, uint8, uint16, uint32, uint64, float32, array };
 
-const base_kinds = [_]Kind{ .int, .float, .bool, .decimal, .text, .date, .timestamp, .time, .boxed, .nulls, .list, .record };
+const base_kinds = [_]Kind{ .int, .float, .bool, .decimal, .text, .date, .timestamp, .time, .boxed, .nulls, .list, .record, .array };
 const width_kinds = [_]Kind{ .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 };
 
 /// One column in four or so is a width.
@@ -456,6 +468,17 @@ fn genList(src: anytype, a: Allocator, depth: u8) Value {
     return .{ .list = .{ .items = items, .start = 0, .end = @intCast(n) } };
 }
 
+/// An array cell of `w` ints or nulls, in storage of its own.
+fn genArray(src: anytype, a: Allocator, w: u32) Value {
+    const cells = a.alloc(Value, w) catch return .null;
+    for (cells) |*c| c.* = if (chance(src, 15)) .null else .{ .int = range(src, i64, -3, 3) };
+    const items = a.create(ColumnData) catch return .null;
+    items.* = df.columnFromCells(a, cells) catch return .null;
+    return .{ .list = .{ .items = items, .start = 0, .end = w } };
+}
+
+const int_items = [_]Column{.{ .name = "", .type = .int }};
+
 const record_names = [_][]const u8{ "x", "y" };
 
 /// A record `{x: small int, y: text}` (either may be null; `y` a list one time in ten).
@@ -483,6 +506,7 @@ fn kindType(k: Kind, src: anytype) ColumnType {
         .boxed => if (chance(src, 50)) .text else .float,
         .nulls => pickEnum(src, ColumnType),
         .list => .list,
+        .array => .array,
         .record => .@"struct",
         .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => widthOf(k).?,
     };
@@ -506,15 +530,16 @@ fn genCell(src: anytype, a: Allocator, k: Kind) Value {
         .boxed => genValue(src, a),
         .nulls => .null,
         .list => genList(src, a, 0),
+        .array => genArray(src, a, 0),
         .record => genRecord(src, a),
         .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => genWidthValue(src, widthOf(k).?, false),
     };
 }
 
-fn genColumn(src: anytype, a: Allocator, k: Kind, n: usize) !ColumnData {
+fn genColumn(src: anytype, a: Allocator, k: Kind, n: usize, array_width: u32) !ColumnData {
     const null_pct: usize = pickOf(src, usize, &.{ 0, 0, 10, 50, 100 });
     const cells = try a.alloc(Value, n);
-    for (cells) |*c| c.* = if (chance(src, null_pct)) .null else genCell(src, a, k);
+    for (cells) |*c| c.* = if (chance(src, null_pct)) .null else if (k == .array) genArray(src, a, array_width) else genCell(src, a, k);
     const col = try df.columnFromCells(a, cells);
     // A width column holds its own array, whatever the cells made.
     if (widthOf(k)) |ty| return fm.conform(a, col, ty, n);
@@ -541,7 +566,12 @@ fn genFrame(src: anytype, a: Allocator, first: usize, n_rows: usize) !Frame {
         // A timestamp column carries a zone one time in three (dataframe S2 wave W7).
         const zone: ?[]const u8 = if (ty == .timestamp and chance(src, 33)) pickOf(src, []const u8, &.{ "Europe/Prague", "America/New_York", "Asia/Kolkata", "UTC" }) else null;
         c.* = .{ .name = name_pool[(first + i) % name_pool.len], .type = ty, .time_zone = zone };
-        d.* = try genColumn(src, a, k, n_rows);
+        // An array column: a width of 0 to 4 and ints, as its declared element.
+        if (k == .array) {
+            c.array_width = @intCast(below(src, 5));
+            c.inner = &int_items;
+        }
+        d.* = try genColumn(src, a, k, n_rows, c.array_width);
     }
     return .{ .columns = cols, .data = data, .len = n_rows };
 }
@@ -566,6 +596,7 @@ fn kindOfType(t: ColumnType) Kind {
         .time => .time,
         .categorical => .text,
         .list => .list,
+        .array => .array,
         .@"struct" => .record,
     };
 }
@@ -574,9 +605,10 @@ fn kindOfType(t: ColumnType) Kind {
 fn genFrameLike(src: anytype, a: Allocator, like: Frame, n_rows: usize) !Frame {
     const data = try a.alloc(ColumnData, like.columns.len);
     for (like.columns, data) |c, *d| {
-        const k: Kind = if (chance(src, 8)) .boxed else kindOfType(c.type);
+        // An array column keeps its width: no mixed draw.
+        const k: Kind = if (c.type != .array and chance(src, 8)) .boxed else kindOfType(c.type);
         // A declared width keeps its array even when the draw was a mixed column.
-        d.* = try fm.conform(a, try genColumn(src, a, k, n_rows), c.type, n_rows);
+        d.* = try fm.conform(a, try genColumn(src, a, k, n_rows, c.array_width), c.type, n_rows);
     }
     return .{ .columns = like.columns, .data = data, .len = n_rows };
 }
@@ -852,7 +884,7 @@ fn pickStructCol(src: anytype, f: Frame) []const u8 {
 }
 
 fn genExprS2(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Expr) Allocator.Error!df.Expr {
-    return switch (below(src, 46)) {
+    return switch (below(src, 52)) {
         0 => .{ .round_sig_figs = .{ .x = x, .digits = pickOf(src, u32, &.{ 0, 1, 3, 15, 17, 400, std.math.maxInt(u32) }) } },
         1 => .{ .is_close = .{
             .l = x,
@@ -975,8 +1007,33 @@ fn genExprS2(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Ex
             expr_emitted[@backingInt(std.meta.activeTag(xc.*))] += 1;
             break :blk xc;
         } else x } },
+        // Fixed-size arrays: an operand that is one (a column, a cast, a `concat_arr`) or not.
+        46 => .{ .arr = .{ .x = try genArrOperand(src, a, f, depth, x), .op = genListOp(src, a) } },
+        47 => .{ .arr_to_struct = .{ .x = try genArrOperand(src, a, f, depth, x), .names = if (chance(src, 60)) null else pickOf(src, []const []const u8, &.{ &.{ "p", "q" }, &.{"p"}, &.{ "p", "p" }, &.{}, &.{ "a", "b", "c", "d" } }) } },
+        48 => .{ .arr_dot = .{ .l = try genArrOperand(src, a, f, depth, x), .r = try genArrOperand(src, a, f, depth, x) } },
+        49 => .{ .list_dot = .{ .l = x, .r = try subExpr(src, a, f, depth, x) } },
+        50 => .{ .concat_arr = try subList(src, a, f, depth, x, 3) },
+        51 => .{ .cast = .{ .x = x, .to = .array, .array_width = @intCast(below(src, 5)) } },
         else => .{ .strftime = .{ .x = x, .format = pickOf(src, []const u8, &.{ "%Y-%m-%dT%H:%M:%S%.f", "%j %U %w", "%e %p %I", "%s %%", "%G-%V" }) } },
     };
+}
+
+/// An array-valued operand for the `arr` arms: a column of one (when the frame has any), a
+/// cast of `x` to an array, a `concat_arr`, or `x` itself (the error path).
+fn genArrOperand(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Expr) Allocator.Error!*const df.Expr {
+    const e = try a.create(df.Expr);
+    var arr_col: ?[]const u8 = null;
+    for (f.columns) |c| if (c.type == .array and arr_col == null) {
+        arr_col = c.name;
+    };
+    e.* = switch (below(src, 6)) {
+        0, 1, 2 => if (arr_col) |n| .{ .col = n } else .{ .cast = .{ .x = x, .to = .array, .array_width = @intCast(below(src, 5)) } },
+        3 => .{ .cast = .{ .x = x, .to = .array, .array_width = @intCast(below(src, 5)) } },
+        4 => .{ .concat_arr = try subList(src, a, f, depth, x, 3) },
+        else => return x,
+    };
+    expr_emitted[@backingInt(std.meta.activeTag(e.*))] += 1;
+    return e;
 }
 
 /// The window module's `Closed` (`df.Closed` is the `is_between` one).
@@ -1208,6 +1265,7 @@ fn settle(comptime v: Verb, typed: anytype, cells: anytype) !?Frame {
         record(v, true);
         try expectWellFormed(@tagName(v), f);
         if (!oom_mode) try expectTimes(@tagName(v), f);
+        if (input_arrays_conform) try expectArrays(@tagName(v), f);
         if (input_conforms and widthChecked(v)) {
             try expectWidths(@tagName(v), f);
             for (f.columns) |c| if (dtype.isWidth(c.type)) {
@@ -1232,6 +1290,7 @@ fn runVerb(src: anytype, a: Allocator, cur: Frame, v: Verb) !Frame {
     };
     const f = cur;
     input_conforms = fm.widthsConform(cur);
+    input_arrays_conform = fm.arraysConform(cur);
     const next: ?Frame = switch (v) {
         .filter => blk: {
             const preds = try a.alloc(df.Predicate, range(src, usize, 0, 3));
@@ -1987,7 +2046,7 @@ fn csvChunked(src: anytype, a: Allocator, bytes: []const u8, o: csvio.CsvReadOpt
         }
         for (0..ch.len) |ri| {
             for (0..f.columns.len) |ci| {
-                if (f.columns[ci].type == .list or f.columns[ci].type == .@"struct") continue;
+                if (f.columns[ci].type == .list or f.columns[ci].type == .array or f.columns[ci].type == .@"struct") continue;
                 if (!chunkCellSame(f.columnAt(ci).get(row), ch.columnAt(ci).get(ri))) {
                     std.debug.print("csv chunked: row {d} column {d}: whole {any}, chunked {any}\n", .{ row, ci, f.columnAt(ci).get(row), ch.columnAt(ci).get(ri) });
                     return error.ChunkedDisagrees;

@@ -432,7 +432,11 @@ pub const Expr = union(enum) {
     /// `cast(Datetime("us", time_zone=zone))`: the cells are the same UTC instants, only the
     /// column's zone changes (a naive column is read as UTC, as polars does; pandas' `astype`
     /// refuses a naive-to-aware cast and asks for `tz_localize`, which is `replace_time_zone`).
-    cast: struct { x: *const Expr, to: ColumnType, zone: ?[]const u8 = null },
+    /// With `to = .array`: `array_width` is the length every row must have (polars
+    /// `cast(pl.Array(inner, n))`: a row of another length is null here, where polars raises
+    /// even with `strict=False`; an array of another width is `error.BadExpr`, polars'
+    /// `InvalidOperationError`). The cells of a list or an array are kept as they are.
+    cast: struct { x: *const Expr, to: ColumnType, zone: ?[]const u8 = null, array_width: u32 = 0 },
     /// Literal text replacement, all occurrences.
     replace: struct { x: *const Expr, from: []const u8, to: []const u8 },
     // ── added after the move ──
@@ -538,6 +542,26 @@ pub const Expr = union(enum) {
     /// polars `concat_list`: the parts' elements in order, a non-list part one element,
     /// a null part a null result. No parts is `error.BadExpr`.
     concat_list: []const Expr,
+    // ── fixed-size arrays (`ColumnType.array`) ──
+    /// A polars `arr.*` function of an array cell: the `list` function of the same name over
+    /// the cells. `x` must be an array (a column of type `.array`, or an expression that keeps
+    /// one: `error.BadExpr` for a list or a scalar, polars' `InvalidOperationError`); the result
+    /// of `reverse`, `sort` and `shift` is an array of the same width, the others a list or a
+    /// scalar as in polars. polars' `arr` has no `slice`, `head`, `tail`, `drop_nulls`,
+    /// `gather_every`, `diff` or `item`: those are `error.BadExpr` here. `to_list` is `cast`.
+    arr: struct { x: *const Expr, op: lf.ListOp },
+    /// polars `arr.to_struct(fields)`: a record of the array's elements. `names` null is
+    /// polars' `field_0`, `field_1`, ...; a count that is not the array's width is `error.BadExpr`.
+    arr_to_struct: struct { x: *const Expr, names: ?[]const []const u8 = null },
+    /// polars `arr.dot(other)`: two arrays of one width (else `error.BadExpr`); see `listfn.dot`.
+    arr_dot: struct { l: *const Expr, r: *const Expr },
+    /// `list.dot`: as `arr_dot` over lists (polars has none); cells of unequal length give null.
+    list_dot: struct { l: *const Expr, r: *const Expr },
+    /// polars `concat_arr`: one array of the summed width from arrays and scalars in order
+    /// (a scalar is one element). No parts, a list part (polars' `SchemaError`), or an array
+    /// whose width the schema does not say is `error.BadExpr`. Elements of other types than the
+    /// first part's are not refused (polars' dtype `SchemaError`): the cells keep their kinds.
+    concat_arr: []const Expr,
     /// polars `struct.field(name)`: a record's field, null where the cell has none. Over a
     /// column whose declared fields lack `name`: `error.BadExpr` (polars'
     /// `StructFieldNotFoundError`).
@@ -787,6 +811,11 @@ const Inst = union(enum) {
     from_local: struct { zone: *const tz.Zone, policy: dtf.TzPolicy },
     list: lf.ListOp,
     concat_list: u32,
+    /// `cast` to an array of this width: a list of another length is null.
+    cast_array: u32,
+    dot,
+    /// Pops one value per entry of `is_array`.
+    concat_arr: []const bool,
     field: []const u8,
     /// The field names; pops one value per name.
     struct_of: []const []const u8,
@@ -1097,8 +1126,15 @@ const Compiler = struct {
             },
             .cast => |k| {
                 if (k.zone) |zn| if (k.to != .timestamp or tz.find(zn) == null) return error.BadExpr;
-                try c.go(k.x, depth + 1);
-                try c.push(.{ .cast = k.to }, 1);
+                if (k.to == .array) {
+                    try c.go(k.x, depth + 1);
+                    // `go` first: its budget bounds the schema walk over a shared subtree.
+                    if (shapeOf(c.f, k.x).width) |w| if (w != k.array_width) return error.BadExpr;
+                    try c.push(.{ .cast_array = k.array_width }, 1);
+                } else {
+                    try c.go(k.x, depth + 1);
+                    try c.push(.{ .cast = k.to }, 1);
+                }
             },
             .replace => |r| {
                 if (r.from.len == 0) return error.BadExpr;
@@ -1288,6 +1324,65 @@ const Compiler = struct {
                 if (xs.len > max_nodes) return error.ExprTooLarge;
                 for (xs) |*x| try c.go(x, depth + 1);
                 try c.push(.{ .concat_list = @intCast(xs.len) }, xs.len);
+            },
+            .arr => |r| {
+                switch (r.op) {
+                    .slice, .head, .tail, .drop_nulls, .gather_every, .diff, .item => return error.BadExpr,
+                    else => {},
+                }
+                try c.go(r.x, depth + 1);
+                _ = shapeOf(c.f, r.x).width orelse return error.BadExpr;
+                try c.push(.{ .list = r.op }, 1);
+            },
+            .arr_to_struct => |r| {
+                try c.go(r.x, depth + 1);
+                const w = shapeOf(c.f, r.x).width orelse return error.BadExpr;
+                if (w > nv.max_unnest_fields) return error.TooLarge;
+                const names: []const []const u8 = if (r.names) |ns| blk: {
+                    if (ns.len != w) return error.BadExpr;
+                    try noDuplicateNames(c.a, ns);
+                    break :blk ns;
+                } else blk: {
+                    const gen = try c.a.alloc([]const u8, w);
+                    for (gen, 0..) |*g, i| g.* = try std.fmt.allocPrint(c.a, "field_{d}", .{i});
+                    break :blk gen;
+                };
+                try c.push(.{ .list_to_struct = names }, 1);
+            },
+            .arr_dot => |r| {
+                try c.go(r.l, depth + 1);
+                try c.go(r.r, depth + 1);
+                const wl = shapeOf(c.f, r.l).width orelse return error.BadExpr;
+                const wr = shapeOf(c.f, r.r).width orelse return error.BadExpr;
+                if (wl != wr) return error.BadExpr;
+                try c.push(.dot, 2);
+            },
+            .list_dot => |r| {
+                try c.go(r.l, depth + 1);
+                try c.go(r.r, depth + 1);
+                try c.push(.dot, 2);
+            },
+            .concat_arr => |xs| {
+                if (xs.len == 0) return error.BadExpr;
+                if (xs.len > max_nodes) return error.ExprTooLarge;
+                for (xs) |*x| try c.go(x, depth + 1);
+                const is_array = try c.a.alloc(bool, xs.len);
+                var total: usize = 0;
+                for (xs, is_array) |*x, *ia| {
+                    const sh = shapeOf(c.f, x);
+                    if (sh.width) |w| {
+                        ia.* = true;
+                        total += w;
+                    } else {
+                        // A list is no scalar (polars refuses it too); a literal one is known.
+                        if (sh.typed) return error.BadExpr;
+                        if (x.* == .lit and x.lit == .list) return error.BadExpr;
+                        ia.* = false;
+                        total += 1;
+                    }
+                }
+                if (total > nv.max_unnest_fields or total > std.math.maxInt(u32)) return error.TooLarge;
+                try c.push(.{ .concat_arr = is_array }, xs.len);
             },
             .field => |r| {
                 // A column that declares its fields and lacks this one: the name is wrong.
@@ -2333,6 +2428,16 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
                 };
             },
             .list => |op| stack[sp - 1] = try lf.listCell(a, stack[sp - 1], op),
+            .cast_array => |w| stack[sp - 1] = if (stack[sp - 1] == .list and stack[sp - 1].list.len() == w) stack[sp - 1] else .null,
+            .dot => {
+                stack[sp - 2] = lf.dot(stack[sp - 2], stack[sp - 1]);
+                sp -= 1;
+            },
+            .concat_arr => |is_array| {
+                const base = sp - is_array.len;
+                stack[base] = try lf.concatArr(a, stack[base..sp], is_array);
+                sp = base + 1;
+            },
             .concat_list => |n| {
                 const base = sp - n;
                 stack[base] = try lf.concatList(a, stack[base..sp]);
@@ -2547,7 +2652,40 @@ pub const Assign = struct {
 /// element, a struct's fields) and whether it is known to give a list. One walk answers
 /// both, so a chain of `list.first` over `list.first` costs one step per node (two walks that
 /// called each other doubled at every level: 2^depth, sweep A-1).
-const Shape = struct { inner: []const Column = &.{}, typed: bool = false };
+const Shape = struct {
+    inner: []const Column = &.{},
+    typed: bool = false,
+    /// Set when the expression is an array (`ColumnType.array`) of this width: the schema
+    /// says so, as it does for a column's `array_width`.
+    width: ?u32 = null,
+};
+
+/// One-element schemas of a scalar of each type: the `inner` of a `concat_arr` whose first
+/// part is a column of that type.
+const scalar_items = blk: {
+    const tags = std.enums.values(ColumnType);
+    var out: [tags.len]Column = undefined;
+    for (tags, 0..) |t, i| out[i] = .{ .name = "", .type = t };
+    break :blk out;
+};
+
+fn scalarItem(t: ColumnType) []const Column {
+    return scalar_items[@backingInt(t)..][0..1];
+}
+
+/// `s` as the result of a `list` function over `s`'s operand: a list of the same elements,
+/// never an array.
+fn asList(s: Shape) Shape {
+    var r = s;
+    r.width = null;
+    return r;
+}
+
+/// The element of the array or list `s` names as a shape of its own.
+fn elementShape(s: Shape) Shape {
+    const el = elementOfShape(s) orelse return .{};
+    return .{ .inner = el.inner, .typed = el.type == .list or el.type == .array, .width = if (el.type == .array) el.array_width else null };
+}
 
 /// The inner columns a nested result declares: the source column's when the expression
 /// is that column (or a cast or branch of it), else none (read by the storage alone).
@@ -2571,30 +2709,76 @@ fn shapeOf(f: Frame, e: *const Expr) Shape {
         if (test_hooks.shape_steps > test_hooks.shape_limit) return .{};
     }
     return switch (e.*) {
-        .col => |name| .{
-            .inner = if (f.columnIndex(name)) |ci| f.columns[ci].inner else &.{},
-            .typed = f.columnType(name) == .list,
+        .col => |name| blk: {
+            const ci = f.columnIndex(name) orelse break :blk .{};
+            const c = f.columns[ci];
+            break :blk .{
+                .inner = c.inner,
+                .typed = c.type == .list or c.type == .array,
+                .width = if (c.type == .array) c.array_width else null,
+            };
         },
-        .cast => |c| .{ .inner = shapeOf(f, c.x).inner, .typed = c.to == .list },
+        // The element of a `list_eval` body is column 0 of its one-column scope.
+        .element => if (f.columns.len == 1 and f.columns[0].type == .array) .{ .width = f.columns[0].array_width } else .{},
+        .cast => |c| blk: {
+            const x = shapeOf(f, c.x);
+            break :blk .{
+                .inner = x.inner,
+                .typed = c.to == .list or c.to == .array,
+                .width = if (c.to == .array) c.array_width else null,
+            };
+        },
         .if_else => |b| blk: {
-            const t = shapeOf(f, b.then).inner;
-            break :blk .{ .inner = if (t.len > 0) t else shapeOf(f, b.otherwise).inner };
+            const t = shapeOf(f, b.then);
+            const o = shapeOf(f, b.otherwise);
+            break :blk .{ .inner = if (t.inner.len > 0) t.inner else o.inner, .width = t.width orelse o.width };
+        },
+        .coalesce => |xs| blk: {
+            for (xs) |*x| {
+                const sh = shapeOf(f, x);
+                if (sh.width != null) break :blk .{ .inner = sh.inner, .typed = true, .width = sh.width };
+            }
+            break :blk .{};
         },
         .list => |l| switch (l.op) {
             // A list of the same elements.
-            .reverse, .sort, .unique, .drop_nulls, .slice, .head, .tail, .gather_every, .shift => shapeOf(f, l.x),
+            .reverse, .sort, .unique, .drop_nulls, .slice, .head, .tail, .gather_every, .shift => asList(shapeOf(f, l.x)),
             // One element: a nested element declares its own inner columns.
-            .get, .first, .last, .min, .max, .item => blk: {
-                const el = elementOfShape(shapeOf(f, l.x)) orelse break :blk .{};
-                break :blk .{ .inner = el.inner, .typed = el.type == .list };
-            },
+            .get, .first, .last, .min, .max, .item => elementShape(shapeOf(f, l.x)),
             else => .{},
         },
-        .list_set => |r| shapeOf(f, r.x),
-        .list_gather => |r| shapeOf(f, r.x),
-        .list_sample => |r| shapeOf(f, r.x),
-        .list_filter => |r| shapeOf(f, r.x),
-        .field => |r| if (fieldColumn(f, r.x, r.name)) |c| .{ .inner = c.inner, .typed = c.type == .list } else .{},
+        .arr => |l| switch (l.op) {
+            // The width kept (polars `Array` in, `Array` out).
+            .reverse, .sort, .shift => shapeOf(f, l.x),
+            .unique => asList(shapeOf(f, l.x)),
+            .get, .first, .last, .min, .max => elementShape(shapeOf(f, l.x)),
+            else => .{},
+        },
+        .concat_arr => |xs| blk: {
+            var total: u64 = 0;
+            var inner: []const Column = &.{};
+            for (xs, 0..) |*x, i| {
+                const sh = shapeOf(f, x);
+                total += sh.width orelse 1;
+                if (i == 0) inner = if (sh.width != null) sh.inner else switch (x.*) {
+                    .col => |n| if (f.columnType(n)) |t| scalarItem(t) else &.{},
+                    .lit => |v| switch (v) {
+                        .int => scalarItem(.int),
+                        .float => scalarItem(.float),
+                        .text => scalarItem(.text),
+                        .bool => scalarItem(.bool),
+                        else => &.{},
+                    },
+                    else => &.{},
+                };
+            }
+            break :blk .{ .inner = inner, .typed = true, .width = std.math.cast(u32, total) };
+        },
+        .list_set => |r| asList(shapeOf(f, r.x)),
+        .list_gather => |r| asList(shapeOf(f, r.x)),
+        .list_sample => |r| asList(shapeOf(f, r.x)),
+        .list_filter => |r| asList(shapeOf(f, r.x)),
+        .field => |r| if (fieldColumn(f, r.x, r.name)) |c| .{ .inner = c.inner, .typed = c.type == .list or c.type == .array, .width = if (c.type == .array) c.array_width else null } else .{},
         .concat_list => |xs| .{
             .inner = for (xs) |*x| {
                 const t = shapeOf(f, x).inner;
@@ -3223,10 +3407,21 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
     }
     const kinds = @as(u8, @intFromBool(any_int)) + @intFromBool(any_float) + @intFromBool(any_decimal) + @intFromBool(any_text) + @intFromBool(any_bool) + @intFromBool(any_list) + @intFromBool(any_record);
     if (kinds > 1 and (any_text or any_bool or any_list or any_record)) return error.BadExpr;
-    if (any_list or any_record or (as.type != null and (as.type.? == .list or as.type.? == .@"struct"))) {
+    // An expression the schema says is an array (a column of one, `arr.sort`, `concat_arr`, a
+    // cast to one) is an array column of that width, and every cell is a list of it.
+    const arr_shape: ?Shape = if (as.type == null or as.type.? == .array) blk: {
+        const sh = shapeOf(f, &as.expr);
+        break :blk if (sh.width != null) sh else null;
+    } else null;
+    if (as.type != null and as.type.? == .array and arr_shape == null) return error.BadExpr;
+    if (arr_shape) |sh| for (vals) |v| {
+        if (keys.isMissing(v)) continue;
+        if (v != .list or v.list.len() != sh.width.?) return error.BadExpr;
+    };
+    if (any_list or any_record or arr_shape != null or (as.type != null and (as.type.? == .list or as.type.? == .@"struct"))) {
         // Nested cells, carried over (a column, a branch of `if_else`): the column is
         // their kind, its declared inner columns the source's where the expression names one.
-        cols[at] = .{ .name = as.out, .type = as.type orelse if (any_list) .list else .@"struct", .inner = nestedInner(f, &as.expr) };
+        cols[at] = .{ .name = as.out, .type = as.type orelse if (arr_shape != null) .array else if (any_list) .list else .@"struct", .inner = nestedInner(f, &as.expr), .array_width = if (arr_shape) |sh| sh.width.? else 0 };
         const data = try a.alloc(ColumnData, width);
         for (data[0..f.columns.len], 0..) |*d, ci| d.* = f.columnAt(ci);
         data[at] = try fm.columnFromCells(a, vals);
@@ -3311,6 +3506,11 @@ pub fn where(a: std.mem.Allocator, f: Frame, e: *const Expr) Error!Frame {
 pub const CastSpec = struct {
     col: []const u8,
     to: ColumnType,
+    /// With `to = .array`: the length every row must have; a row of another length is null
+    /// (`on_error = .fail`: `error.CastFailed`, polars' `ComputeError`), and an array column
+    /// of another width is `error.BadExpr` (polars `InvalidOperationError`). With any other
+    /// `to` it is ignored.
+    array_width: u32 = 0,
     /// `.null`: an unconvertible cell becomes null (pandas' `errors="coerce"`,
     /// polars' `strict=False`). `.fail`: `error.CastFailed` (their strict default).
     /// `.wrap`: to an integer type, a number out of its range wraps (polars
@@ -3362,7 +3562,12 @@ pub fn cast(a: std.mem.Allocator, f: Frame, spec: CastSpec) CastError!Frame {
     const ci = f.columnIndex(spec.col) orelse return error.NoSuchColumn;
     const cols = try a.dupe(Column, f.columns);
     cols[ci].type = spec.to;
-    if (spec.to != f.columns[ci].type) cols[ci].inner = &.{};
+    // A list and an array hold the same elements: the declared element column stays.
+    const list_like = spec.to == .list or spec.to == .array;
+    const from_list_like = f.columns[ci].type == .list or f.columns[ci].type == .array;
+    if (spec.to != f.columns[ci].type and !(list_like and from_list_like)) cols[ci].inner = &.{};
+    cols[ci].array_width = if (spec.to == .array) spec.array_width else 0;
+    if (spec.to == .array and f.columns[ci].type == .array and f.columns[ci].array_width != spec.array_width) return error.BadExpr;
     // A zone names the column's instants: a cast to a timestamp sets it (null: naive), any
     // other target has none.
     if (spec.zone) |zn| if (spec.to != .timestamp or tz.find(zn) == null) return error.BadExpr;
@@ -3392,7 +3597,7 @@ pub fn cast(a: std.mem.Allocator, f: Frame, spec: CastSpec) CastError!Frame {
             defer out.deinit();
             jsonio.writeValue(&out.writer, src, f.columns[ci], 0) catch return error.OutOfMemory; // an Allocating writer fails only so
             break :blk Value{ .text = try out.toOwnedSlice() };
-        } else try castValue(a, src, spec.to);
+        } else if (spec.to == .array) (if (src == .list and src.list.len() == spec.array_width) src else Value.null) else try castValue(a, src, spec.to);
         if (spec.on_error == .fail and v == .null and !keys.isMissing(src)) return error.CastFailed;
         o.* = if (spec.on_error == .wrap and v == .null and dtype.isInteger(spec.to)) wrapCell(src, spec.to) else v;
     }
