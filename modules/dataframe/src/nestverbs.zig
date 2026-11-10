@@ -51,7 +51,7 @@ pub fn explode(a: std.mem.Allocator, f: Frame, cols: []const []const u8) NestErr
         ci.* = f.columnIndex(name) orelse return error.NoSuchColumn;
         for (idx[0..i]) |prev| if (prev == ci.*) return error.DuplicateColumn;
         const d = f.columnAt(ci.*);
-        const declared = f.columns[ci.*].type == .list;
+        const declared = f.columns[ci.*].type == .list or f.columns[ci.*].type == .array;
         if (!(d == .list or (declared and (d == .nulls or d == .boxed)))) return error.NotNested;
     }
     // Rows out: one per element, at least one per row.
@@ -95,11 +95,11 @@ pub fn explode(a: std.mem.Allocator, f: Frame, cols: []const []const u8) NestErr
         d.* = try explodeColumn(a, f.columnAt(ci), f.len, rows);
         const src = f.columns[ci];
         out_cols[ci] = if (src.inner.len == 1)
-            .{ .name = src.name, .type = src.inner[0].type, .inner = src.inner[0].inner, .time_zone = src.inner[0].time_zone }
+            .{ .name = src.name, .type = src.inner[0].type, .inner = src.inner[0].inner, .time_zone = src.inner[0].time_zone, .array_width = src.inner[0].array_width }
         else
             .{ .name = src.name, .type = storageType(d.*) };
         // The element type declared a width: the elements' array is that width's.
-        d.* = try fm.conform(a, d.*, out_cols[ci].type, rows);
+        d.* = try fm.conformColumn(a, d.*, out_cols[ci], rows);
     }
     return .{ .columns = out_cols, .data = data, .len = rows };
 }
@@ -112,7 +112,7 @@ pub fn explodeAll(a: std.mem.Allocator, f: Frame) NestError!Frame {
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(a);
     for (f.columns, 0..) |c, ci| {
-        if (c.type == .list or f.columnAt(ci) == .list) try names.append(a, c.name);
+        if (c.type == .list or c.type == .array or f.columnAt(ci) == .list) try names.append(a, c.name);
     }
     return explode(a, f, names.items);
 }
@@ -127,7 +127,7 @@ pub fn flattenList(a: std.mem.Allocator, f: Frame, col: []const u8) NestError!Fr
     const ci = f.columnIndex(col) orelse return error.NoSuchColumn;
     const d = f.columnAt(ci);
     if (d != .list) {
-        if (f.columns[ci].type != .list or d != .nulls) return error.NotNested;
+        if ((f.columns[ci].type != .list and f.columns[ci].type != .array) or d != .nulls) return error.NotNested;
         const cols = try a.alloc(Column, 1);
         cols[0] = elementColumn(f.columns[ci], .nulls);
         const data = try a.alloc(ColumnData, 1);
@@ -150,14 +150,14 @@ pub fn flattenList(a: std.mem.Allocator, f: Frame, col: []const u8) NestError!Fr
     const cols = try a.alloc(Column, 1);
     cols[0] = elementColumn(f.columns[ci], items);
     const data = try a.alloc(ColumnData, 1);
-    data[0] = try fm.conform(a, items, cols[0].type, total);
+    data[0] = try fm.conformColumn(a, items, cols[0], total);
     return .{ .columns = cols, .data = data, .len = total };
 }
 
 /// The column a list column's elements make: the declared `inner[0]` named like the list,
 /// else the storage's kind.
 fn elementColumn(src: Column, items: ColumnData) Column {
-    if (src.inner.len == 1) return .{ .name = src.name, .type = src.inner[0].type, .inner = src.inner[0].inner, .time_zone = src.inner[0].time_zone };
+    if (src.inner.len == 1) return .{ .name = src.name, .type = src.inner[0].type, .inner = src.inner[0].inner, .time_zone = src.inner[0].time_zone, .array_width = src.inner[0].array_width };
     return .{ .name = src.name, .type = storageType(items) };
 }
 
@@ -306,11 +306,11 @@ pub fn unnest(a: std.mem.Allocator, f: Frame, spec: UnnestSpec) NestError!Frame 
         for (fields.names, fields.data) |fname, fd| {
             const out_name = if (spec.separator) |sep| try std.mem.concat(a, u8, &.{ c.name, sep, fname }) else fname;
             const out_col: Column = if (decl.get(fname)) |dc|
-                .{ .name = out_name, .type = dc.type, .inner = dc.inner, .time_zone = dc.time_zone }
+                .{ .name = out_name, .type = dc.type, .inner = dc.inner, .time_zone = dc.time_zone, .array_width = dc.array_width }
             else
                 .{ .name = out_name, .type = storageType(fd) };
             try cols.append(a, out_col);
-            try data.append(a, try fm.conform(a, fd, out_col.type, f.len));
+            try data.append(a, try fm.conformColumn(a, fd, out_col, f.len));
         }
     }
     var seen: std.StringHashMapUnmanaged(void) = .empty;

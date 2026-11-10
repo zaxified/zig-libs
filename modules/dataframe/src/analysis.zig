@@ -433,7 +433,7 @@ fn fillNullImpl(a: std.mem.Allocator, f: Frame, spec: FillNullSpec, typed: bool)
                 }
             },
         }
-        data[ci] = try fm.conform(a, try fm.columnFromCells(a, cells), cols[ci].type, f.len);
+        data[ci] = try fm.conformColumn(a, try fm.columnFromCells(a, cells), cols[ci], f.len);
     }
     return .{ .columns = cols, .data = data, .len = f.len };
 }
@@ -473,7 +473,7 @@ fn fillAcross(a: std.mem.Allocator, f: Frame, idxs: []const usize, spec: FillNul
     const data = try a.alloc(ColumnData, f.columns.len);
     for (data, 0..) |*d, ci| d.* = f.columnAt(ci);
     for (idxs, 0..) |ci, j| {
-        if (changed[j]) data[ci] = try fm.conform(a, try fm.columnFromCells(a, cells[j * f.len ..][0..f.len]), f.columns[ci].type, f.len);
+        if (changed[j]) data[ci] = try fm.conformColumn(a, try fm.columnFromCells(a, cells[j * f.len ..][0..f.len]), f.columns[ci], f.len);
     }
     return .{ .columns = f.columns, .data = data, .len = f.len };
 }
@@ -608,7 +608,7 @@ pub fn replaceStrict(a: std.mem.Allocator, f: Frame, spec: ReplaceStrictSpec) Er
     const data = try a.alloc(ColumnData, f.columns.len);
     for (data, 0..) |*d, i| d.* = f.columnAt(i);
     // A mapped value may not fit a declared width: `conform` makes the storage agree with it (D4).
-    data[ci] = try fm.conform(a, try fm.columnFromCells(a, cells), cols[ci].type, f.len);
+    data[ci] = try fm.conformColumn(a, try fm.columnFromCells(a, cells), cols[ci], f.len);
     return .{ .columns = cols, .data = data, .len = f.len };
 }
 

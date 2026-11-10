@@ -265,7 +265,7 @@ fn fillGaps(a: std.mem.Allocator, f: Frame, left: Frame, on: []const []const u8)
             if (mark.get(row) != .null) last = f.columnAt(ci).get(row);
             x.* = last;
         }
-        data[ci] = try fm.conform(a, try fm.columnFromCells(a, cells), c.type, f.len);
+        data[ci] = try fm.conformColumn(a, try fm.columnFromCells(a, cells), c, f.len);
     }
     return verbs.select(a, .{ .columns = f.columns, .data = data, .len = f.len }, keep);
 }
@@ -529,14 +529,14 @@ pub fn combineFirst(a: std.mem.Allocator, f: Frame, g: Frame) Error!Frame {
             o.* = if (!isMissing(v)) v else if (other) |gi| (if (ri < g.len) g.columnAt(gi).get(ri) else .null) else v;
         }
         try cols.append(a, c);
-        try data.append(a, try fm.conform(a, try fm.columnFromCells(a, cells), c.type, rows));
+        try data.append(a, try fm.conformColumn(a, try fm.columnFromCells(a, cells), c, rows));
     }
     for (g.columns, 0..) |c, gi| {
         if (f_names.get(c.name) != null) continue;
         const gc = g.columnAt(gi);
         for (cells, 0..) |*o, ri| o.* = if (ri < g.len) gc.get(ri) else .null;
         try cols.append(a, c);
-        try data.append(a, try fm.conform(a, try fm.columnFromCells(a, cells), c.type, rows));
+        try data.append(a, try fm.conformColumn(a, try fm.columnFromCells(a, cells), c, rows));
     }
     return .{ .columns = cols.items, .data = data.items, .len = rows };
 }
@@ -559,7 +559,7 @@ pub fn update(a: std.mem.Allocator, f: Frame, g: Frame) Error!Frame {
             const v: Value = if (ri < g.len) gc.get(ri) else .null;
             o.* = if (!isMissing(v)) v else fc.get(ri);
         }
-        data[ci] = try fm.conform(a, try fm.columnFromCells(a, cells), c.type, f.len);
+        data[ci] = try fm.conformColumn(a, try fm.columnFromCells(a, cells), c, f.len);
     }
     return .{ .columns = f.columns, .data = data, .len = f.len };
 }
@@ -642,7 +642,7 @@ pub fn scatter(a: std.mem.Allocator, f: Frame, spec: ScatterSpec) Error!Frame {
         cells[@intCast(r)] = v;
     }
     const data = try shared(a, f);
-    data[ci] = try fm.conform(a, try fm.columnFromCells(a, cells), f.columns[ci].type, f.len);
+    data[ci] = try fm.conformColumn(a, try fm.columnFromCells(a, cells), f.columns[ci], f.len);
     return .{ .columns = f.columns, .data = data, .len = f.len };
 }
 
@@ -697,11 +697,13 @@ pub fn matchToSchema(a: std.mem.Allocator, f: Frame, schema: []const Column, spe
         // A timestamp column of another zone is another type (polars `SchemaError`): `cast` retags it.
         const same_zone = c.type != .timestamp or (((f.columns[ci].time_zone == null) == (c.time_zone == null)) and
             (c.time_zone == null or std.mem.eql(u8, c.time_zone.?, f.columns[ci].time_zone.?)));
-        if (f.columns[ci].type == c.type and same_zone) continue;
+        // An array of another width is another type (polars: `cast` refuses it, so does this).
+        const same_width = c.type != .array or f.columns[ci].array_width == c.array_width;
+        if (f.columns[ci].type == c.type and same_zone and same_width) continue;
         if (!spec.cast) return error.SchemaMismatch;
         const one_data = [1]ColumnData{f.columnAt(ci)};
         const one: Frame = .{ .columns = f.columns[ci..][0..1], .data = &one_data, .len = f.len };
-        const r = ex.cast(a, one, .{ .col = c.name, .to = c.type, .zone = c.time_zone, .on_error = .fail }) catch |e| return switch (e) {
+        const r = ex.cast(a, one, .{ .col = c.name, .to = c.type, .zone = c.time_zone, .array_width = c.array_width, .on_error = .fail }) catch |e| return switch (e) {
             error.CastFailed => error.CastFailed,
             error.OutOfMemory => error.OutOfMemory,
             else => error.SchemaMismatch,
@@ -910,7 +912,7 @@ pub fn unstack(a: std.mem.Allocator, f: Frame, spec: UnstackSpec) Error!Frame {
                 const from = if (vertical) j * spec.step + r else r * spec.step + j;
                 c.* = if (from < f.len) src.get(from) else fill;
             }
-            data[at] = try fm.conform(a, try fm.columnFromCells(a, cells), f.columns[ci].type, rows);
+            data[at] = try fm.conformColumn(a, try fm.columnFromCells(a, cells), f.columns[ci], rows);
             at += 1;
         }
     }

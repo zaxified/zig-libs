@@ -490,6 +490,78 @@ pub fn concatList(a: std.mem.Allocator, parts: []const Value) Error!Value {
     return .{ .list = .{ .items = items, .start = 0, .end = @intCast(total) } };
 }
 
+/// polars `arr.dot(other)`: the sum of the element products of two cells of equal length. A
+/// pair with a missing element is left out (polars counts it as 0), so an empty cell and an
+/// all-missing one are 0; a cell that is null, not a list, or of another length than its
+/// partner gives null (`list.dot` has no polars equivalent: unequal lengths are null here,
+/// where a width mismatch of two arrays is refused when the expression is compiled). Int by
+/// int stays int and is null on overflow (polars wraps), any float makes the result float, a
+/// non-number element gives null.
+pub fn dot(x: Value, y: Value) Value {
+    if (x != .list or y != .list) return .null;
+    const xl = x.list;
+    const yl = y.list;
+    const n = xl.len();
+    if (n != yl.len()) return .null;
+    var any_float = false;
+    for (0..n) |i| {
+        const p = xl.get(i);
+        const q = yl.get(i);
+        if (isMissing(p) or isMissing(q)) continue;
+        if (p == .text or q == .text or p == .bool or q == .bool or p == .list or q == .list or p == .record or q == .record) return .null;
+        if (!(p == .int and q == .int)) any_float = true;
+    }
+    var isum: i64 = 0;
+    var fsum: f64 = 0;
+    for (0..n) |i| {
+        const p = xl.get(i);
+        const q = yl.get(i);
+        if (isMissing(p) or isMissing(q)) continue;
+        if (any_float) {
+            fsum += (p.asFloat() orelse return .null) * (q.asFloat() orelse return .null);
+        } else {
+            const m = std.math.mul(i64, p.int, q.int) catch return .null;
+            isum = std.math.add(i64, isum, m) catch return .null;
+        }
+    }
+    return if (any_float) .{ .float = fsum } else .{ .int = isum };
+}
+
+/// polars `concat_arr`: the elements of each part in order, a part that is not a list one
+/// element. `is_array[i]` says which parts are arrays: a null array part makes the result
+/// null (polars), a null scalar is a null element. The result is one list of the summed
+/// width; the compiler has checked the widths, a part that breaks its width is the part's
+/// own length here.
+pub fn concatArr(a: std.mem.Allocator, parts: []const Value, is_array: []const bool) Error!Value {
+    std.debug.assert(parts.len == is_array.len);
+    var total: usize = 0;
+    for (parts, is_array) |p, arr| {
+        if (arr) {
+            if (p != .list) return .null;
+            total += p.list.len();
+        } else total += 1;
+    }
+    if (total > max_list_result) return error.TooLarge;
+    var text: usize = 0;
+    for (parts) |p| switch (p) {
+        .text => |t| text +|= t.len,
+        .list => |l| for (0..l.len()) |i| {
+            const e = l.get(i);
+            if (e == .text) text +|= e.text.len;
+        },
+        else => {},
+    };
+    var b: fm.ColBuilder = .{ .a = a, .hint = total, .depth = 1, .text_cap = text };
+    for (parts, is_array) |p, arr| {
+        if (arr) {
+            for (0..p.list.len()) |i| try b.append(p.list.get(i));
+        } else try b.append(p);
+    }
+    const items = try a.create(fm.ColumnData);
+    items.* = b.finish();
+    return .{ .list = .{ .items = items, .start = 0, .end = @intCast(total) } };
+}
+
 /// A record cell with fields `names` holding `vals` (copied). `names` is borrowed.
 pub fn makeRecord(a: std.mem.Allocator, names: []const []const u8, vals: []const Value) Error!Value {
     const children = try a.alloc(fm.ColumnData, vals.len);

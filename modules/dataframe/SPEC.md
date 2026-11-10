@@ -1295,3 +1295,17 @@ the reason).
   refuses these four on `Time`; the module answers a superset, as for timestamps). `strftime` with
   `%.f`, `strptime` to a time (`ParseTo.time`), `timeRange`/`timeRanges` (`pl.time_range(s)`), the
   `temporal` selector.
+- *Binary* (`ColumnType.binary`, polars `Binary`; owner's decision 2026-11-10): raw bytes in text
+  storage, the cell a `Value.text` with no UTF-8 promise (the column tag carries the intent, as for
+  dates, so no `switch` over `Value` grows an arm). Order, equality, join and group keys, min/max are
+  bytewise. `Expr.bin`: contains, starts_with, ends_with, size (with polars' units), get, head, tail,
+  slice, encode (hex, base64), reinterpret (to the integer and float widths, either endianness);
+  `str.decode` gives binary (it gave text until 2026-11-10). `binary + binary` concatenates. A binary
+  beside text or a number in a comparison, other arithmetic, and every `str.*` operation over a binary
+  are `error.BadExpr` (polars refuses them). Casts: text to binary is its UTF-8 bytes; binary to text
+  only valid UTF-8 (else null, `CastFailed` under `.fail`); to a number null (polars raises). Display is
+  polars' `b"\x00ab"` (bytes 0x21–0x7e as they are, every other `\xNN`), `glimpse` Python's
+  `repr(bytes)`. CSV and JSON carry base64 (RFC 4648, padded — Go's `encoding/json` and protobuf's JSON
+  form; polars refuses binary in CSV and cannot write it to JSON), read back with `types`; bad base64
+  is `error.BadValue`. `jsonshape` reads a `.binary` column the same way. Kept difference: `bin.get`
+  past the end is null as `list.get` (polars raises unless `null_on_oob`).

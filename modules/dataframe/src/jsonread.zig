@@ -1287,9 +1287,15 @@ fn read(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions, shape: S
         roots[oi] = infer.roots.items[ci];
         types[oi] = infer.nodes.items[roots[oi]].ty(opts.parse_dates);
     };
+    // An array is read as a list, then checked against its width.
+    const arr_w = try a.alloc(?u32, nsel);
+    @memset(arr_w, null);
     for (opts.types) |t| {
         const ci = w.map.get(t.name) orelse return error.NoSuchColumn;
-        if (out[ci]) |oi| types[oi] = t.type;
+        if (out[ci]) |oi| {
+            types[oi] = if (t.type == .array) .list else t.type;
+            arr_w[oi] = if (t.type == .array) t.array_width else null;
+        }
     }
     // Every cell the frame will hold, nested levels included, against `max_cells`.
     var cells: usize = 0;
@@ -1299,6 +1305,10 @@ fn read(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions, shape: S
     const cols = try a.alloc(Column, nsel);
     for (out, 0..) |o, ci| if (o) |oi| {
         cols[oi] = try infer.schema(roots[oi], w.names.items[ci], types[oi]);
+        if (arr_w[oi]) |aw| {
+            cols[oi].type = .array;
+            cols[oi].array_width = aw;
+        }
     };
 
     const text_cap = if (nsel == 0) 0 else bytes.len / nsel + 1;
@@ -1320,5 +1330,11 @@ fn read(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions, shape: S
         while (fill.b[r].rows() < rows) try fill.appendNull(r);
         d.* = try fill.finish(r);
     }
+    for (arr_w, data) |maybe, d| if (maybe) |aw| switch (d) {
+        .list => |lc| for (0..rows) |ri| {
+            if (lc.at(ri)) |l| if (l.len() != aw) return error.BadValue;
+        },
+        else => {},
+    };
     return .{ .columns = cols, .data = data, .len = rows };
 }

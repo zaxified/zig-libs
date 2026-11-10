@@ -121,7 +121,7 @@ pub fn topN(a: std.mem.Allocator, f: Frame, spec: TopNSpec) Error!Frame {
         if (ci == label_idx) cells[keep] = .{ .text = t.label };
         if (ci == value_idx) cells[keep] = .{ .float = tail_sum };
         // The tail's sum is an f64 and its label text: a width column holds neither as they are (D4).
-        d.* = try fm.conform(a, try fm.columnFromCells(a, cells), f.columns[ci].type, keep + 1);
+        d.* = try fm.conformColumn(a, try fm.columnFromCells(a, cells), f.columns[ci], keep + 1);
     }
     return .{ .columns = f.columns, .data = data, .len = keep + 1 };
 }
@@ -207,6 +207,13 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
                 // (polars `vertical_relaxed`, pandas `concat`; Int64 with UInt64 is Float64 here,
                 // W11 D5). Int64 with Float64 keeps the first frame's type, as before W11.
                 gop.value_ptr.type = dtype.supertype(gop.value_ptr.type, c.type).?;
+            } else if (c.type == .array and gop.value_ptr.type == .array) {
+                // polars: `SchemaError` ("array widths differ"); the pieces are not one column.
+                if (c.array_width != gop.value_ptr.array_width) return error.SchemaMismatch;
+            } else if ((c.type == .array and gop.value_ptr.type == .list) or (c.type == .list and gop.value_ptr.type == .array)) {
+                // `vertical_relaxed` gives a List; the cells stay what they are.
+                gop.value_ptr.type = .list;
+                gop.value_ptr.array_width = 0;
             } else if (c.type == .timestamp and gop.value_ptr.type == .timestamp) {
                 const z0 = gop.value_ptr.time_zone;
                 if ((z0 == null) != (c.time_zone == null) or (z0 != null and !std.mem.eql(u8, z0.?, c.time_zone.?))) return error.SchemaMismatch;
@@ -217,7 +224,7 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
     const n_cells = std.math.mul(usize, total, width) catch return error.TooLarge;
     if (n_cells > sp.max_aggregate_cells) return error.TooLarge;
     const cols = try a.alloc(Column, width);
-    for (cols, names.keys(), names.values()) |*c, n, first| c.* = .{ .name = n, .type = first.type, .inner = first.inner, .time_zone = first.time_zone };
+    for (cols, names.keys(), names.values()) |*c, n, first| c.* = .{ .name = n, .type = first.type, .inner = first.inner, .time_zone = first.time_zone, .array_width = first.array_width };
     const data = try a.alloc(ColumnData, width);
     var cells: []Value = &.{};
     defer if (cells.len > 0) a.free(cells);
@@ -234,7 +241,7 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
                 if (c.type == .categorical) d.* = try fm.encodeCategorical(a, d.*, total);
                 // A width declared over Int64/Float64 pieces (a hand-built frame) holds its
                 // own array, as the cell path's result does (found by the fuzz driver, seed 6715).
-                d.* = try fm.conform(a, d.*, c.type, total);
+                d.* = try fm.conformColumn(a, d.*, c, total);
                 continue;
             }
         }
@@ -257,7 +264,7 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
         }
         d.* = try fm.columnFromCells(a, cells);
         if (c.type == .categorical) d.* = try fm.encodeCategorical(a, d.*, total);
-        d.* = try fm.conform(a, d.*, c.type, total);
+        d.* = try fm.conformColumn(a, d.*, c, total);
     }
     return .{ .columns = cols, .data = data, .len = total };
 }

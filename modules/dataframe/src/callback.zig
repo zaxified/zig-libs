@@ -68,6 +68,8 @@ pub const OutColumn = struct {
     type: ?ColumnType = null,
     /// `Column.inner` of a list or struct result.
     inner: []const Column = &.{},
+    /// `Column.array_width` of an `.array` result: every non-null cell must have this length.
+    array_width: u32 = 0,
 };
 
 pub const MapElementsSpec = struct {
@@ -85,6 +87,7 @@ pub const MapRowsSpec = struct {
     /// As `OutColumn.type` and `OutColumn.inner`.
     type: ?ColumnType = null,
     inner: []const Column = &.{},
+    array_width: u32 = 0,
 };
 
 /// A row of a frame, handed to a `mapRows` callback: a view, nothing copied.
@@ -144,7 +147,7 @@ fn fit(v: Value, ty: ColumnType) ?Value {
         .text, .date, .categorical, .binary => if (v == .text) v else null,
         .bool => if (v == .bool) v else null,
         .decimal => if (v == .decimal) v else null,
-        .list => if (v == .list) v else null,
+        .list, .array => if (v == .list) v else null,
         .@"struct" => if (v == .record) v else null,
     };
 }
@@ -167,6 +170,8 @@ fn inferred(d: ColumnData) ColumnType {
 fn checked(v: Value, out: OutColumn) CallbackError!Value {
     if (!viewsOk(v, 0)) return error.WrongOutputType;
     const ty = out.type orelse return v;
+    // An array result has exactly the declared width.
+    if (ty == .array and v == .list and v.list.len() != out.array_width) return error.WrongOutputType;
     return fit(v, ty) orelse error.WrongOutputType;
 }
 
@@ -197,7 +202,7 @@ fn finishColumn(a: std.mem.Allocator, data: ColumnData, len: usize, name: []cons
     const ty = out.type orelse inferred(data);
     // A declared width gets its own array (`fit` already refused a cell it does not hold).
     const d = if (ty == .categorical) try fm.encodeCategorical(a, data, len) else try fm.conform(a, data, ty, len);
-    return .{ .{ .name = name, .type = ty, .inner = out.inner }, d };
+    return .{ .{ .name = name, .type = ty, .inner = out.inner, .array_width = if (ty == .array) out.array_width else 0 }, d };
 }
 
 /// `f` with `col` in place of the column of its name, or appended.
@@ -247,7 +252,7 @@ pub fn mapElements(a: std.mem.Allocator, f: Frame, spec: MapElementsSpec, ctx: a
 pub fn mapRows(a: std.mem.Allocator, f: Frame, spec: MapRowsSpec, ctx: anytype, comptime func: anytype) ErrorOf(func)!Frame {
     const E = ErrorOf(func);
     try core.checkRowsU32(f.len);
-    const out: OutColumn = .{ .name = spec.out, .type = spec.type, .inner = spec.inner };
+    const out: OutColumn = .{ .name = spec.out, .type = spec.type, .inner = spec.inner, .array_width = spec.array_width };
     var b: fm.ColBuilder = .{ .a = a, .hint = @min(f.len, fm.max_row_hint) };
     for (0..f.len) |ri| {
         const r = try @as(E!Value, func(ctx, a, Row{ .frame = f, .index = ri }));
@@ -447,6 +452,7 @@ fn dupeColumnsAt(a: std.mem.Allocator, cols: []const Column, depth: u8) Callback
             .name = try a.dupe(u8, c.name),
             .type = c.type,
             .time_zone = if (c.time_zone) |z| try a.dupe(u8, z) else null,
+            .array_width = c.array_width,
             .inner = if (depth + 1 >= vm.max_nesting_depth) &.{} else try dupeColumnsAt(a, c.inner, depth + 1),
         };
     }

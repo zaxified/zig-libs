@@ -104,6 +104,9 @@ pub const TypeOverride = struct {
     /// for that). Another `type` with a zone, or an unknown zone, is `error.BadOptions`
     /// (`error.BadValue` in `readJson`).
     time_zone: ?[]const u8 = null,
+    /// With `type = .array` (`readJson` only; `readCsv` has no nesting): the length every row
+    /// must have, else `error.BadValue`. polars cannot read an array from JSON at all.
+    array_width: u32 = 0,
 };
 
 /// `f` with the zone of every `types` entry that names one set on its (timestamp) column; the
@@ -609,7 +612,7 @@ pub fn parseAs(ty: ColumnType, s: []const u8) ?Value {
         .decimal => return .{ .decimal = textio.parseDecimalToken(textio.trimBlank(s)) orelse return null },
         // CSV has no nesting, and a JSON text is not parsed here (polars refuses a nested
         // type in `read_csv` too): only a null cell reads as one.
-        .list, .@"struct" => return null,
+        .list, .array, .@"struct" => return null,
         // Base64 decodes into fresh bytes: `parseBinary`, which every reader calls first.
         .binary => return null,
     }
@@ -1172,7 +1175,7 @@ const Acc = struct {
                 @memset(s.offsets, 0);
                 try s.bytes.ensureTotalCapacity(a, @min(s.text_cap, first_len *| n));
             },
-            .list, .@"struct" => unreachable, // `putFixed` refuses every cell of these first
+            .list, .array, .@"struct" => unreachable, // `putFixed` refuses every cell of these first
         }
         s.valid = try a.alloc(u64, n / 64 + 1);
         @memset(s.valid, 0);
@@ -1253,7 +1256,7 @@ const Acc = struct {
                 if (!s.ready) try s.setReady(a, x.text.len);
                 try s.bytes.appendSlice(a, x.text);
             },
-            .list, .@"struct" => return error.BadValue, // `parseAs`'s rule
+            .list, .array, .@"struct" => return error.BadValue, // `parseAs`'s rule
         }
         s.mark(ri);
     }
@@ -1325,7 +1328,7 @@ const Acc = struct {
             .bool => .{ .bool = .{ .values = s.bools[0..rows], .valid = valid } },
             .decimal => .{ .decimal = .{ .values = s.decs[0..rows], .valid = valid } },
             .text, .date, .categorical, .binary => .{ .text = .{ .offsets = s.offsets[0 .. rows + 1], .bytes = s.bytes.items, .valid = valid } },
-            .list, .@"struct" => .nulls, // no cell was stored (`putFixed`)
+            .list, .array, .@"struct" => .nulls, // no cell was stored (`putFixed`)
         };
     }
 };

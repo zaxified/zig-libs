@@ -142,7 +142,7 @@ fn appended(a: std.mem.Allocator, f: Frame, col: Column, data: ColumnData) Error
     const out = try a.alloc(ColumnData, w + 1);
     for (out[0..w], 0..) |*d, ci| d.* = colOf(f, ci);
     // A caller-declared width holds its own array (W11): a cell it does not hold is null.
-    out[w] = try fm.conform(a, data, col.type, f.len);
+    out[w] = try fm.conformColumn(a, data, col, f.len);
     return .{ .columns = cols, .data = out, .len = f.len };
 }
 
@@ -514,7 +514,7 @@ fn countFromIds(col: ColumnData, ids: []const u32, size: bool, skip: bool, cells
 /// The element column of `implode`'s list: the source column, unnamed.
 fn implodedInner(a: std.mem.Allocator, src: Column) Error![]const Column {
     const inner = try a.alloc(Column, 1);
-    inner[0] = .{ .name = "", .type = src.type, .inner = src.inner, .time_zone = src.time_zone };
+    inner[0] = .{ .name = "", .type = src.type, .inner = src.inner, .time_zone = src.time_zone, .array_width = src.array_width };
     return inner;
 }
 
@@ -624,7 +624,7 @@ fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: 
         // `first`, `min`, `mode`… of a nested column keep its declared inner columns.
         cols[gidx.len + i] = .{ .name = ag.out, .type = ty, .time_zone = Column.zoneFor(f.columns[sidx[i]], ty), .inner = if (ag.func == .implode)
             try implodedInner(a, f.columns[sidx[i]])
-        else if (ty == f.columns[sidx[i]].type) f.columns[sidx[i]].inner else &.{} };
+        else if (ty == f.columns[sidx[i]].type) f.columns[sidx[i]].inner else &.{}, .array_width = if (ag.func != .implode and ty == .array and f.columns[sidx[i]].type == .array) f.columns[sidx[i]].array_width else 0 };
     }
     try keys.uniqueNames(a, cols);
 
@@ -817,11 +817,22 @@ fn unpivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec, typed: bool
         }
     }
     const vals = val_idxs.items;
-    const value_type = meltedType(f, vals);
+    var value_type = meltedType(f, vals);
+    // Arrays of one width melt into an array column; of several widths into a list.
+    var arr_first: ?Column = null;
+    if (value_type == .array) {
+        arr_first = f.columns[vals[0]];
+        for (vals[1..]) |vi| if (f.columns[vi].type != .array or f.columns[vi].array_width != arr_first.?.array_width) {
+            value_type = .list;
+            arr_first = null;
+            break;
+        };
+    }
     const cols = try a.alloc(Column, id_idxs.len + 2);
     for (id_idxs, 0..) |ii, i| cols[i] = f.columns[ii];
     cols[id_idxs.len] = .{ .name = spec.out_key, .type = .text };
     cols[id_idxs.len + 1] = .{ .name = spec.out_value, .type = value_type, .time_zone = if (vals.len > 0) f.columns[vals[0]].time_zone else null };
+    if (arr_first) |c| cols[id_idxs.len + 1] = Column.withShape(cols[id_idxs.len + 1], c);
     try keys.uniqueNames(a, cols);
 
     const total = std.math.mul(usize, f.len, vals.len) catch return error.TooLarge;
@@ -1303,7 +1314,7 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec_in: sp.JoinSpe
                     }
                 }
             }
-            data[l] = try fm.conform(a, try fm.columnFromCells(a, out), cols[l].type, pairs.left.len);
+            data[l] = try fm.conformColumn(a, try fm.columnFromCells(a, out), cols[l], pairs.left.len);
             // A categorical key stays categorical (its declared type is the left's): the union of
             // two different dictionaries is encoded again, lexically, as `concat` does.
             if (cols[l].type == .categorical) data[l] = try fm.encodeCategorical(a, data[l], pairs.left.len);
@@ -1844,9 +1855,9 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
         else => {},
     }
     const cols = try a.alloc(Column, 1 + nc + @intFromBool(spec.margins));
-    cols[0] = .{ .name = spec.row_key, .type = f.columns[rki].type, .time_zone = f.columns[rki].time_zone };
+    cols[0] = Column.withShape(.{ .name = spec.row_key, .type = f.columns[rki].type, .time_zone = f.columns[rki].time_zone }, f.columns[rki]);
     const cell_zone = Column.zoneFor(f.columns[vi], cell_type);
-    for (cks, 0..) |ck, i| cols[1 + i] = .{ .name = ck.name, .type = cell_type, .time_zone = cell_zone };
+    for (cks, 0..) |ck, i| cols[1 + i] = Column.withShape(.{ .name = ck.name, .type = cell_type, .time_zone = cell_zone }, f.columns[vi]);
     if (spec.margins) cols[1 + nc] = .{ .name = spec.margins_name, .type = cell_type, .time_zone = cell_zone };
     // Int 1 and text "1" are two keys that print alike; a key may print as `row_key`.
     try keys.uniqueNames(a, cols);
@@ -2026,10 +2037,10 @@ pub fn fillna(a: std.mem.Allocator, f: Frame, spec: sp.FillNaSpec) Error!Frame {
         defer lk.deinit(a);
         for (spec.per_column) |pc| {
             const ci = try lk.of(pc.col);
-            data[ci] = try fillColumn(a, data[ci], f.columns[ci].type, f.len, pc.value, spec.limit);
+            data[ci] = try fillColumn(a, data[ci], f.columns[ci], f.len, pc.value, spec.limit);
         }
     } else {
-        for (try subsetIdxs(a, f, spec.subset)) |ci| data[ci] = try fillColumn(a, data[ci], f.columns[ci].type, f.len, spec.value, spec.limit);
+        for (try subsetIdxs(a, f, spec.subset)) |ci| data[ci] = try fillColumn(a, data[ci], f.columns[ci], f.len, spec.value, spec.limit);
     }
     return .{ .columns = f.columns, .data = data, .len = f.len };
 }
@@ -2037,7 +2048,7 @@ pub fn fillna(a: std.mem.Allocator, f: Frame, spec: sp.FillNaSpec) Error!Frame {
 /// `col` with its first `limit` missing cells replaced by `value`; shared when none is. A
 /// column declared with a width keeps its array (`fm.conform`): a `value` that is no value of
 /// the width leaves the cell null.
-fn fillColumn(a: std.mem.Allocator, col: ColumnData, ty: ColumnType, rows: usize, value: Value, limit: ?usize) Error!ColumnData {
+fn fillColumn(a: std.mem.Allocator, col: ColumnData, decl: Column, rows: usize, value: Value, limit: ?usize) Error!ColumnData {
     var any = false;
     for (0..rows) |ri| {
         if (keys.isMissing(col.get(ri))) {
@@ -2056,7 +2067,7 @@ fn fillColumn(a: std.mem.Allocator, col: ColumnData, ty: ColumnType, rows: usize
             left -= 1;
         } else c.* = v;
     }
-    return fm.conform(a, try fm.columnFromCells(a, cells), ty, rows);
+    return fm.conformColumn(a, try fm.columnFromCells(a, cells), decl, rows);
 }
 
 test "allValid sets no bit past rows (fuzz note: validity bits past len)" {

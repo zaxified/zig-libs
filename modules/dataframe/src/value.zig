@@ -74,6 +74,11 @@ pub const ColumnType = enum {
     /// reuse `.text`: the column tag carries the intent); the storage is the text storage.
     /// Order, equality, keys: bytewise. Text in and out: base64 (CSV, JSON), `bin_encode`.
     binary,
+    /// A fixed-size array per row (polars `Array(inner, n)`, Arrow `fixed_size_list`). It
+    /// is a `.list` column with a declared width: the cell value is `Value.list`, the
+    /// storage `ColumnData.list`, `Column.inner[0]` the element column and
+    /// `Column.array_width` the length every valid row has (`frame.arraysConform`).
+    array,
 };
 
 pub const Column = struct {
@@ -91,6 +96,9 @@ pub const Column = struct {
     /// the name is one `tz.find` knows. Read by the `dt` fields, `truncate`, `strftime`,
     /// `resample` and the writers, which show the zone's wall clock.
     time_zone: ?[]const u8 = null,
+    /// The length every valid row of an `.array` column has (polars `Array(inner, width)`);
+    /// 0 is a legal width (`[[], []]`). Meaningless for every other type, where it stays 0.
+    array_width: u32 = 0,
 
     /// `error.BadArgument` when `time_zone` is set on a column that is not a `.timestamp`, is
     /// empty or names no zone `tz` knows; checked down the declared inner columns too. Every
@@ -114,10 +122,22 @@ pub const Column = struct {
         return if (ty == .timestamp and src.type == .timestamp) src.time_zone else null;
     }
 
+    /// `self` with the element column and width of `src` when both are `.array` columns: the
+    /// shape a verb that keeps an array column's type keeps with it (`array_width` is part of
+    /// the type, as `time_zone` is a timestamp's).
+    pub fn withShape(self: Column, src: Column) Column {
+        var c = self;
+        if (self.type == .array and src.type == .array) {
+            c.inner = src.inner;
+            c.array_width = src.array_width;
+        }
+        return c;
+    }
+
     /// The declared element column of a `.list`, or the field `i` of a `.struct` named
     /// `name`; null when the schema does not say.
     pub fn innerAt(self: Column, i: usize, name: []const u8) ?Column {
-        if (self.type == .list) return if (self.inner.len > 0) self.inner[0] else null;
+        if (self.type == .list or self.type == .array) return if (self.inner.len > 0) self.inner[0] else null;
         if (i < self.inner.len and std.mem.eql(u8, self.inner[i].name, name)) return self.inner[i];
         for (self.inner) |c| if (std.mem.eql(u8, c.name, name)) return c;
         return null;
@@ -556,7 +576,7 @@ pub const Value = union(enum) {
             // A text cell is its UTF-8 bytes (polars `cast(Binary)`); a number is refused.
             .binary => if (self == .text) self else null,
             // A nested cell keeps its kind; nothing else becomes one.
-            .list => if (self == .list) self else null,
+            .list, .array => if (self == .list) self else null,
             .@"struct" => if (self == .record) self else null,
         };
     }

@@ -255,7 +255,7 @@ fn tableType(t: ColumnType) []const u8 {
         .timestamp => "datetime",
         .duration => "duration",
         .time => "time",
-        .list => "array",
+        .list, .array => "array",
         .@"struct" => "object",
     };
 }

@@ -117,6 +117,24 @@ fn typeLabel(ty: ColumnType) []const u8 {
     return if (dtype.isWidth(ty)) dtype.name(ty) else @tagName(ty);
 }
 
+/// polars' element label inside `array[..., n]`: its short dtype names (`i64`, `f64`,
+/// `str`, and the widths'), this module's tag name for the rest (the dtype line itself says
+/// `int` for Int64).
+fn elementLabel(ty: ColumnType) []const u8 {
+    return switch (ty) {
+        .text => "str",
+        .array, .list => "list",
+        else => dtype.name(ty),
+    };
+}
+
+/// `array[i64, 3]` (polars' repr) of an `.array` column, `typeLabel` of any other.
+fn columnLabel(a: std.mem.Allocator, c: value.Column) std.mem.Allocator.Error![]const u8 {
+    if (c.type != .array) return typeLabel(c.type);
+    const el: []const u8 = if (c.inner.len > 0) elementLabel(c.inner[0].type) else "?";
+    return std.fmt.allocPrint(a, "array[{s}, {d}]", .{ el, c.array_width });
+}
+
 fn pad(w: *std.Io.Writer, n: usize) std.Io.Writer.Error!void {
     for (0..n) |_| try w.writeByte(' ');
 }
@@ -162,7 +180,7 @@ pub fn formatTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: FormatO
     @memset(widths, 0);
     for (cols.items, 0..) |maybe, j| {
         grid[j] = if (maybe) |ci| try cellText(al, .{ .text = f.columns[ci].name }, text_col, "", opts.max_cell_chars, false) else marker;
-        if (opts.show_dtypes) grid[nc + j] = if (maybe) |ci| typeLabel(f.columns[ci].type) else marker;
+        if (opts.show_dtypes) grid[nc + j] = if (maybe) |ci| try columnLabel(al, f.columns[ci]) else marker;
         for (rows.items, 0..) |mr, i| {
             const idx = (i + extra) * nc + j;
             grid[idx] = if (maybe == null or mr == null) marker else blk: {
@@ -467,7 +485,7 @@ pub const GlimpseOptions = struct {
     max_cell_chars: usize = std.math.maxInt(usize),
 };
 
-fn glimpseType(t: value.Column) []const u8 {
+fn glimpseType(a: std.mem.Allocator, t: value.Column) std.mem.Allocator.Error![]const u8 {
     return switch (t.type) {
         .int => "<i64>",
         .float => "<f64>",
@@ -481,6 +499,7 @@ fn glimpseType(t: value.Column) []const u8 {
         .time => "<time>",
         .binary => "<binary>",
         .list => "<list>",
+        .array => try std.fmt.allocPrint(a, "<{s}>", .{try columnLabel(a, t)}),
         .@"struct" => "<struct>",
         .int8 => "<i8>",
         .int16 => "<i16>",
@@ -508,7 +527,7 @@ pub fn glimpseTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: Glimps
     for (f.columns, names) |c, *n| {
         n.* = try cellText(al, .{ .text = c.name }, text_col, "", opts.max_name_chars, false);
         name_w = @max(name_w, cpLen(n.*));
-        type_w = @max(type_w, cpLen(glimpseType(c)));
+        type_w = @max(type_w, cpLen(try glimpseType(al, c)));
     }
     for (f.columns, names, 0..) |c, n, ci| {
         var line: std.ArrayList(u8) = .empty;
@@ -516,7 +535,7 @@ pub fn glimpseTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: Glimps
         try line.appendSlice(al, n);
         for (0..name_w - cpLen(n)) |_| try line.append(al, ' ');
         try line.append(al, ' ');
-        const ty = glimpseType(c);
+        const ty = try glimpseType(al, c);
         for (0..type_w - cpLen(ty)) |_| try line.append(al, ' ');
         try line.appendSlice(al, ty);
         try line.append(al, ' ');

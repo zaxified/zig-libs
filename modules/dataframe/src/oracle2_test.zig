@@ -654,7 +654,7 @@ fn kindName(ty: ColumnType) []const u8 {
         .text, .date, .categorical, .binary => "text",
         .bool => "bool",
         .decimal => "decimal",
-        .list => "list",
+        .list, .array => "list",
         .@"struct" => "struct",
     };
 }

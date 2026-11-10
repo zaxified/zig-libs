@@ -407,7 +407,7 @@ fn kindName(ty: ColumnType) []const u8 {
         .text, .date, .categorical, .binary => "text",
         .bool => "bool",
         .decimal => "decimal",
-        .list => "list",
+        .list, .array => "list",
         .@"struct" => "struct",
     };
 }
@@ -420,7 +420,7 @@ fn cellFits(ty: ColumnType, v: Value) bool {
         .text, .date, .categorical, .binary => v == .text,
         .bool => v == .bool,
         .decimal => v == .decimal,
-        .list => v == .list,
+        .list, .array => v == .list,
         .@"struct" => v == .record,
     };
 }
