@@ -68,6 +68,8 @@ fn cellText(a: std.mem.Allocator, v: Value, col: value.Column, null_text: []cons
             textio.formatStampZoned(&sb, i, if (textio.hasFraction(i)) 6 else 0, textio.zoneOf(col.time_zone))
         else if (ty == .duration)
             value.formatDuration(&ub, i)
+        else if (ty == .time)
+            value.formatTimeOfDay(ub[0..value.max_time_len], i) orelse "null"
         else
             std.fmt.bufPrint(&nb, "{d}", .{i}) catch unreachable,
         .float => |x| if (std.math.isNan(x)) "NaN" else if (std.math.isInf(x)) (if (x > 0) "inf" else "-inf") else if (ty == .float32) textio.formatFloat32(nb[0..textio.max_float_len], @floatCast(x)) else textio.formatFloat(nb[0..textio.max_float_len], x),
@@ -356,6 +358,7 @@ fn glimpseType(t: value.Column) []const u8 {
         .timestamp => "<datetime[μs]>",
         .categorical => "<cat>",
         .duration => "<duration[μs]>",
+        .time => "<time>",
         .list => "<list>",
         .@"struct" => "<struct>",
         .int8 => "<i8>",

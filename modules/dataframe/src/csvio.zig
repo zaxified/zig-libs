@@ -411,6 +411,9 @@ const k_float: u8 = 2;
 const k_bool: u8 = 4;
 const k_date: u8 = 8;
 const k_stamp: u8 = 16;
+/// `HH:MM:SS[.F]` under `parse_dates` (polars `try_parse_dates` infers `Time` from it; a
+/// bare `HH:MM` stays text there, so here too).
+const k_time: u8 = 32;
 
 fn isNullCell(opts: *const CsvReadOptions, s: []const u8) bool {
     for (opts.null_values) |n| if (n.len == s.len and std.mem.eql(u8, n, s)) return true;
@@ -508,7 +511,7 @@ fn kindsOf(s: []const u8, parse_dates: bool) u8 {
     }
     if (parseBoolToken(s) != null) m |= k_bool;
     if (parse_dates) {
-        if (isIsoDate(s)) m |= k_date else if (value.parseIsoTimestamp(s) != null) m |= k_stamp;
+        if (isIsoDate(s)) m |= k_date else if (value.parseIsoTimestamp(s) != null) m |= k_stamp else if (t.len >= 8 and value.parseTimeOfDay(t) != null) m |= k_time;
     }
     return m;
 }
@@ -577,6 +580,7 @@ fn typeOfMask(seen: bool, mask: u8) ColumnType {
     if (mask & k_bool != 0) return .bool;
     if (mask & k_date != 0) return .date;
     if (mask & k_stamp != 0) return .timestamp;
+    if (mask & k_time != 0) return .time;
     return .text;
 }
 
@@ -599,6 +603,7 @@ pub fn parseAs(ty: ColumnType, s: []const u8) ?Value {
         .date => return if (isIsoDate(s)) .{ .text = s } else null,
         .timestamp => return .{ .int = value.parseIsoTimestamp(s) orelse return null },
         .duration => return .{ .int = value.parseDurationCell(textio.trimBlank(s)) orelse return null },
+        .time => return .{ .int = value.parseTimeOfDay(textio.trimBlank(s)) orelse return null },
         .decimal => return .{ .decimal = textio.parseDecimalToken(textio.trimBlank(s)) orelse return null },
         // CSV has no nesting, and a JSON text is not parsed here (polars refuses a nested
         // type in `read_csv` too): only a null cell reads as one.
@@ -1126,7 +1131,7 @@ const Acc = struct {
         switch (s.ty) {
             // A width is stored as Int64 or (UInt64) its bit pattern, Float32 as f64; the
             // reader's `encodeDeclared` narrows them (`frame.conform`).
-            .int, .timestamp, .duration, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => {
+            .int, .timestamp, .duration, .time, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => {
                 s.ints = try a.alloc(i64, n);
                 @memset(s.ints, 0);
             },
@@ -1207,6 +1212,11 @@ const Acc = struct {
                 if (!s.ready) try s.setReady(a, 0);
                 s.ints[ri] = x;
             },
+            .time => {
+                const x = value.parseTimeOfDay(textio.trimBlank(c)) orelse return error.BadValue;
+                if (!s.ready) try s.setReady(a, 0);
+                s.ints[ri] = x;
+            },
             .decimal => {
                 const x = textio.parseDecimalToken(textio.trimBlank(c)) orelse return error.BadValue;
                 if (!s.ready) try s.setReady(a, 0);
@@ -1283,7 +1293,7 @@ const Acc = struct {
         if (s.nonnull == 0) return .nulls;
         const valid: ?[]const u64 = if (s.nonnull == rows) null else s.valid[0 .. rows / 64 + 1];
         return switch (s.ty) {
-            .int, .timestamp, .duration, .int8, .int16, .int32, .uint8, .uint16, .uint32 => .{ .int = .{ .values = s.ints[0..rows], .valid = valid } },
+            .int, .timestamp, .duration, .time, .int8, .int16, .int32, .uint8, .uint16, .uint32 => .{ .int = .{ .values = s.ints[0..rows], .valid = valid } },
             .uint64 => .{ .uint64 = .{ .values = @ptrCast(s.ints[0..rows]), .valid = valid } },
             .float, .float32 => .{ .float = .{ .values = s.floats[0..rows], .valid = valid } },
             .bool => .{ .bool = .{ .values = s.bools[0..rows], .valid = valid } },
@@ -1524,6 +1534,14 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
                     // ISO 8601 is the form `readCsv` reads back (and both engines' JSON).
                     text_like = true;
                     break :blk value.formatIsoDuration(&ub, i);
+                } else if (c.type == .time) blk: {
+                    // polars writes nine digits (its nanoseconds), pandas `str(time)`;
+                    // this is polars' display and JSON form, which `readCsv` reads back.
+                    text_like = true;
+                    var tb: [value.max_time_len]u8 = undefined;
+                    const t = value.formatTimeOfDay(&tb, i) orelse break :blk opts.null_text;
+                    @memcpy(ub[0..t.len], t);
+                    break :blk ub[0..t.len];
                 } else std.fmt.bufPrint(&nb, "{d}", .{i}) catch unreachable,
                 .float => |x| if (std.math.isNan(x))
                     opts.null_text

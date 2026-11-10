@@ -135,6 +135,7 @@ fn fit(v: Value, ty: ColumnType) ?Value {
     if (v == .null) return v;
     return switch (ty) {
         .timestamp, .duration => if (v == .int) v else null,
+        .time => if (v == .int and vm.isTimeOfDay(v.int)) v else null,
         .int, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => if (v == .int or v == .uint) dtype.fitInt(dtype.exactI128(v).?, ty) else null,
         .float, .float32 => switch (v) {
             .float, .int, .uint => .{ .float = if (ty == .float32) dtype.roundF32(v.asFloat().?) else v.asFloat().? },

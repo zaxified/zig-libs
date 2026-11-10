@@ -252,6 +252,7 @@ fn tableType(t: ColumnType) []const u8 {
         .date => "date",
         .timestamp => "datetime",
         .duration => "duration",
+        .time => "time",
         .list => "array",
         .@"struct" => "object",
     };
@@ -329,6 +330,10 @@ fn writeValueO(w: *std.Io.Writer, v0: Value, col: ?value.Column, depth: u8, o: *
         } else if (ty == .duration) {
             var ub: [value.max_duration_len]u8 = undefined;
             try writeStringA(w, value.formatIsoDuration(&ub, i), o.force_ascii);
+        } else if (ty == .time) {
+            // polars' and pandas' JSON: the time's text (`"01:02:03"`), null outside a day.
+            var tb: [value.max_time_len]u8 = undefined;
+            if (value.formatTimeOfDay(&tb, i)) |t| try writeStringA(w, t, o.force_ascii) else try w.writeAll("null");
         } else try w.print("{d}", .{i}),
         .uint => |u| try w.print("{d}", .{u}),
         .float => |x| if (std.math.isFinite(x)) {

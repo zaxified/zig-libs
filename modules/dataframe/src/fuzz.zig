@@ -538,7 +538,7 @@ fn kindOfType(t: ColumnType) Kind {
         .decimal => .decimal,
         .text => .text,
         .date => .date,
-        .timestamp, .duration => .timestamp,
+        .timestamp, .duration, .time => .timestamp,
         .categorical => .text,
         .list => .list,
         .@"struct" => .record,

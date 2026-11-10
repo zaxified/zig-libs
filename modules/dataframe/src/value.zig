@@ -64,6 +64,11 @@ pub const ColumnType = enum {
     uint32,
     uint64,
     float32,
+    /// A time of day (polars `Time`, pandas' `datetime.time` cells). The cell value is
+    /// `Value.int`: whole MICROseconds since midnight, `[0, us_per_day)` (pandas'
+    /// precision; polars counts nanoseconds and the digits past the sixth are dropped on
+    /// the way in). Text in and out: `parseTimeOfDay` / `formatTimeOfDay`.
+    time,
 };
 
 pub const Column = struct {
@@ -535,6 +540,14 @@ pub const Value = union(enum) {
                 .text => |t| if (parseDurationCell(t)) |us| .{ .int = us } else null,
                 else => null,
             },
+            // An int (or a duration's int) is microseconds since midnight; text is
+            // `parseTimeOfDay`'s; outside one day null (polars refuses the row).
+            .time => switch (self) {
+                .int => |i| if (isTimeOfDay(i)) self else null,
+                .float => |f| if (floatToInt(i64, f)) |i| (if (isTimeOfDay(i)) Value{ .int = i } else null) else null,
+                .text => |t| if (parseTimeOfDay(t)) |us| .{ .int = us } else null,
+                else => null,
+            },
             // A nested cell keeps its kind; nothing else becomes one.
             .list => if (self == .list) self else null,
             .@"struct" => if (self == .record) self else null,
@@ -716,6 +729,64 @@ pub fn formatIsoTimestamp(buf: *[max_iso_timestamp_len]u8, us: i64) []const u8 {
         w.writeAll(fb[0..end]) catch unreachable;
     }
     w.writeByte('Z') catch unreachable;
+    return w.buffered();
+}
+
+// ── times of day (`.time` cells: `Value.int` microseconds since midnight) ───
+
+/// Longest string `formatTimeOfDay` writes: `HH:MM:SS.ffffff`.
+pub const max_time_len = 15;
+
+/// A time of day as microseconds since midnight, or null: `HH:MM[:SS[.F]]`, two digits
+/// each (no sign, no blanks), hours 0-23, minutes and seconds 0-59, the fraction 1-9
+/// digits with those past the sixth truncated (polars reads 9 into its nanoseconds).
+/// `HH:MM` is pandas' (`to_datetime(...).dt.time`); polars' `str.to_time()` wants the
+/// seconds, so this reads a superset. `24:00` and a leap second `23:59:60` are null
+/// (Python's `time` refuses both).
+pub fn parseTimeOfDay(s: []const u8) ?i64 {
+    if (s.len != 5 and (s.len < 8 or s.len == 9 or s.len > 18)) return null;
+    if (s[2] != ':') return null;
+    const h = digitsAt(s, 0, 2) orelse return null;
+    const m = digitsAt(s, 3, 2) orelse return null;
+    var sec: u32 = 0;
+    var frac: i64 = 0;
+    if (s.len > 5) {
+        if (s[5] != ':') return null;
+        sec = digitsAt(s, 6, 2) orelse return null;
+        if (s.len > 8) {
+            if (s[8] != '.') return null;
+            const digits = s[9..];
+            for (digits, 0..) |c, k| {
+                if (c < '0' or c > '9') return null;
+                if (k < 6) frac = frac * 10 + (c - '0');
+            }
+            var k: usize = digits.len;
+            while (k < 6) : (k += 1) frac *= 10;
+        }
+    }
+    if (h > 23 or m > 59 or sec > 59) return null;
+    return (@as(i64, h) * 3600 + @as(i64, m) * 60 + sec) * timestamp_units_per_second + frac;
+}
+
+/// True when `us` is a time of day a `.time` cell can hold.
+pub fn isTimeOfDay(us: i64) bool {
+    return us >= 0 and us < us_per_day;
+}
+
+/// A `.time` cell as polars prints it (chrono's display, also polars' JSON form):
+/// `HH:MM:SS`, then the fraction when nonzero in groups of three digits, as few as hold
+/// it (`00:00:00.120`, `12:00:00.000005`). Null outside `[0, us_per_day)`.
+/// `parseTimeOfDay` reads every result back.
+pub fn formatTimeOfDay(buf: *[max_time_len]u8, us: i64) ?[]const u8 {
+    if (!isTimeOfDay(us)) return null;
+    const per = timestamp_units_per_second;
+    const secs = @divTrunc(us, per);
+    const frac: u64 = @intCast(@mod(us, per));
+    var w: std.Io.Writer = .fixed(buf);
+    w.print("{d:0>2}:{d:0>2}:{d:0>2}", .{ @as(u64, @intCast(@divTrunc(secs, 3600))), @as(u64, @intCast(@mod(@divTrunc(secs, 60), 60))), @as(u64, @intCast(@mod(secs, 60))) }) catch unreachable;
+    if (frac != 0) {
+        if (frac % 1000 == 0) w.print(".{d:0>3}", .{frac / 1000}) catch unreachable else w.print(".{d:0>6}", .{frac}) catch unreachable;
+    }
     return w.buffered();
 }
 

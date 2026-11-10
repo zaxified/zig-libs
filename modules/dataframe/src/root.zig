@@ -50,6 +50,9 @@ pub const formatIsoTimestamp = value.formatIsoTimestamp;
 pub const max_iso_timestamp_len = value.max_iso_timestamp_len;
 pub const parseDurationCell = value.parseDurationCell;
 pub const formatIsoDuration = value.formatIsoDuration;
+pub const parseTimeOfDay = value.parseTimeOfDay;
+pub const formatTimeOfDay = value.formatTimeOfDay;
+pub const max_time_len = value.max_time_len;
 pub const formatDuration = value.formatDuration;
 pub const max_duration_len = value.max_duration_len;
 

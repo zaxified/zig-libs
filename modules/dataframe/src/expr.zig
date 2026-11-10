@@ -3264,12 +3264,18 @@ pub fn cast(a: std.mem.Allocator, f: Frame, spec: CastSpec) CastError!Frame {
     const col = f.columnAt(ci);
     const from = f.columns[ci].type;
     // An instant or a length of time to text is its ISO form, not its microseconds.
-    const iso_text = (from == .timestamp or from == .duration) and (spec.to == .text or spec.to == .categorical);
+    // A time of day is its `HH:MM:SS[.f]` (polars' `cast(String)` drops the fraction; its
+    // display and JSON keep it, as here).
+    const iso_text = (from == .timestamp or from == .duration or from == .time) and (spec.to == .text or spec.to == .categorical);
     for (vals, 0..) |*o, ri| {
         const src = col.get(ri);
         const v = if (iso_text and src == .int) blk: {
             var buf: [@max(ds.max_iso_timestamp_len, ds.max_duration_len)]u8 = undefined;
-            const t = if (from == .timestamp) ds.formatIsoTimestamp(buf[0..ds.max_iso_timestamp_len], src.int) else ds.formatIsoDuration(buf[0..ds.max_duration_len], src.int);
+            const t = switch (from) {
+                .timestamp => ds.formatIsoTimestamp(buf[0..ds.max_iso_timestamp_len], src.int),
+                .time => ds.formatTimeOfDay(buf[0..ds.max_time_len], src.int) orelse break :blk Value.null,
+                else => ds.formatIsoDuration(buf[0..ds.max_duration_len], src.int),
+            };
             break :blk Value{ .text = try a.dupe(u8, t) };
         } else if (src.isNested() and (spec.to == .text or spec.to == .categorical)) blk: {
             // Its JSON, written with the column's schema (an instant inside stays RFC 3339).

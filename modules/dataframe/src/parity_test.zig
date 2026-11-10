@@ -122,3 +122,87 @@ test "jsonDecode: refusals" {
     const e = try df.jsonDecode(a, try textFrame(a, &.{}), .{ .column = "j" });
     try testing.expectEqual(@as(usize, 0), e.len);
 }
+
+// ── time of day (`.time`), the core: text, cast, CSV, JSON, display ─────────
+// Expected values: polars 2.1 (`pl.Time`) and pandas 3.1 (`datetime.time`), probed
+// 2026-11-10 with the oracle venv (tools/README.md).
+
+test "time: parseTimeOfDay / formatTimeOfDay" {
+    const ok = [_]struct { []const u8, i64 }{
+        .{ "00:00:00", 0 },
+        .{ "01:02:03", 3_723_000_000 },
+        .{ "01:02", 3_720_000_000 }, // pandas' HH:MM
+        .{ "23:59:59.999999", 86_399_999_999 },
+        .{ "00:00:00.12", 120_000 },
+        .{ "12:00:00.123456789", 43_200_123_456 }, // past the sixth digit truncated
+    };
+    for (ok) |c| try testing.expectEqual(@as(?i64, c[1]), df.parseTimeOfDay(c[0]));
+    const bad = [_][]const u8{ "", "1:02:03", "24:00", "23:60", "23:59:60", "01:02:03.", "01:02:03.1234567890", "01-02-03", "+1:02", " 01:02", "01:02:3", "ab:cd" };
+    for (bad) |s| try testing.expectEqual(@as(?i64, null), df.parseTimeOfDay(s));
+    var buf: [df.max_time_len]u8 = undefined;
+    // polars' display (chrono): fraction in groups of three, as few as hold it.
+    const shown = [_]struct { i64, []const u8 }{
+        .{ 3_723_000_000, "01:02:03" },
+        .{ 86_399_999_999, "23:59:59.999999" },
+        .{ 120_000, "00:00:00.120" },
+        .{ 43_200_000_005, "12:00:00.000005" },
+    };
+    for (shown) |c| {
+        try testing.expectEqualStrings(c[1], df.formatTimeOfDay(&buf, c[0]).?);
+        try testing.expectEqual(@as(?i64, c[0]), df.parseTimeOfDay(c[1]));
+    }
+    try testing.expectEqual(@as(?[]const u8, null), df.formatTimeOfDay(&buf, -1));
+    try testing.expectEqual(@as(?[]const u8, null), df.formatTimeOfDay(&buf, 86_400_000_000));
+    try testing.expectEqual(@as(?[]const u8, null), df.formatTimeOfDay(&buf, std.math.minInt(i64)));
+}
+
+test "time: cast in and out" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try textFrame(a, &.{ "01:02:03", "x", null, "23:59:59.5" });
+    const g = try df.cast(a, f, .{ .col = "j", .to = .time });
+    try testing.expectEqual(df.ColumnType.time, g.columnType("j").?);
+    try testing.expectEqual(@as(i64, 3_723_000_000), g.cell(0, "j").?.int);
+    try testing.expect(g.cell(1, "j").? == .null);
+    try testing.expectError(error.CastFailed, df.cast(a, f, .{ .col = "j", .to = .time, .on_error = .fail }));
+    const t = try df.cast(a, g, .{ .col = "j", .to = .text });
+    try testing.expectEqualStrings("23:59:59.500", t.cell(3, "j").?.text);
+    // Int64 microseconds in, out of one day null; to Int64 and to a duration the same count.
+    const k = try df.cast(a, f, .{ .col = "k", .to = .time });
+    try testing.expectEqual(@as(i64, 3), k.cell(3, "k").?.int);
+    const i = try df.cast(a, g, .{ .col = "j", .to = .int });
+    try testing.expectEqual(@as(i64, 3_723_000_000), i.cell(0, "j").?.int);
+    const d = try df.cast(a, g, .{ .col = "j", .to = .duration });
+    try testing.expectEqual(df.ColumnType.duration, d.columnType("j").?);
+    try testing.expectEqual(@as(i64, 3_723_000_000), d.cell(0, "j").?.int);
+}
+
+test "time: CSV and JSON read and write" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const csv = "t,u\n01:02:03,01:02\n23:59:59.999999,\n00:00:00.120,13:30\n";
+    // polars `try_parse_dates` infers Time from HH:MM:SS; a bare HH:MM stays text.
+    const f = try df.readCsv(a, csv, .{ .parse_dates = true });
+    try testing.expectEqual(df.ColumnType.time, f.columnType("t").?);
+    try testing.expectEqual(df.ColumnType.text, f.columnType("u").?);
+    try testing.expectEqual(@as(i64, 120_000), f.cell(2, "t").?.int);
+    const g = try df.readCsv(a, csv, .{ .types = &.{.{ .name = "u", .type = .time }} });
+    try testing.expectEqual(@as(i64, 48_600_000_000), g.cell(2, "u").?.int);
+    try testing.expect(g.cell(1, "u").? == .null);
+    try testing.expectError(error.BadValue, df.readCsv(a, "t\n25:00\n", .{ .types = &.{.{ .name = "t", .type = .time }} }));
+    // Written as polars' display/JSON form; read back the same.
+    var out: std.Io.Writer.Allocating = .init(a);
+    try df.writeCsv(a, &out.writer, try df.select(a, f, &.{"t"}), .{});
+    try testing.expectEqualStrings("t\n01:02:03\n23:59:59.999999\n00:00:00.120\n", out.written());
+    var js: std.Io.Writer.Allocating = .init(a);
+    try df.writeJson(&js.writer, try df.select(a, f, &.{"t"}), .records);
+    // polars: [{"t":"01:02:03"},{"t":"23:59:59.999999"},{"t":"00:00:00.120"}]
+    try testing.expectEqualStrings("[{\"t\":\"01:02:03\"},{\"t\":\"23:59:59.999999\"},{\"t\":\"00:00:00.120\"}]", js.written());
+    const back = try df.readJson(a, js.written(), .{ .types = &.{.{ .name = "t", .type = .time }} });
+    try testing.expectEqual(@as(i64, 86_399_999_999), back.cell(1, "t").?.int);
+    // The display.
+    const shown = try df.format(a, try df.select(a, f, &.{"t"}), .{});
+    try testing.expect(std.mem.find(u8, shown, "23:59:59.999999") != null);
+}
