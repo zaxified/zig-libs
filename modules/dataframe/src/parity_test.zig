@@ -211,3 +211,17 @@ test "time: CSV and JSON read and write" {
     const shown = try df.format(a, try df.select(a, f, &.{"t"}), .{});
     try testing.expect(std.mem.find(u8, shown, "23:59:59.999999") != null);
 }
+
+test "time: map with out_type time stores in-range microseconds (fuzz seed 457)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try textFrame(a, &.{ "a", "b", "c" }); // k = 0, 1, 2
+    // k * 1e6 is a float result; under `.time` it is whole microseconds, k * 1e11 is past a day.
+    const g = try df.map(a, f, .{ .out = "t", .out_type = .time, .lhs = .{ .col = "k" }, .op = .mul, .rhs = .{ .num = 1e6 } });
+    try testing.expect(g.columnAt(2) == .int);
+    try testing.expectEqual(@as(i64, 2_000_000), g.cell(2, "t").?.int);
+    const h = try df.map(a, f, .{ .out = "t", .out_type = .time, .lhs = .{ .col = "k" }, .op = .mul, .rhs = .{ .num = 1e11 } });
+    try testing.expectEqual(@as(i64, 0), h.cell(0, "t").?.int);
+    try testing.expect(h.cell(1, "t").? == .null);
+}

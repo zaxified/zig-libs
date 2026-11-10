@@ -245,6 +245,23 @@ pub fn conform(a: std.mem.Allocator, col: ColumnData, ty: ColumnType, len: usize
             }
             break :blk @unionInit(ColumnData, @tagName(t), .{ .values = values, .valid = valid });
         },
+        // A time of day: Int64 storage of microseconds inside one day (`Value.cast(.time)`
+        // converts a float or text cell); anything else null (fuzz seed 457: `map` with
+        // `out_type = .time` stored its float results under the time column).
+        .time => blk: {
+            if (col == .nulls) break :blk col;
+            if (col == .int) {
+                const ic = col.int;
+                const ok = for (ic.values[0..@min(len, ic.values.len)], 0..) |x, ri| {
+                    if (ic.isValid(ri) and !vm.isTimeOfDay(x)) break false;
+                } else ic.values.len >= len;
+                if (ok) break :blk col;
+            }
+            const cells = try a.alloc(Value, len);
+            defer a.free(cells);
+            for (cells, 0..) |*o, ri| o.* = col.get(ri).cast(.time) orelse .null;
+            break :blk try columnFromCells(a, cells);
+        },
         else => col,
     };
 }
