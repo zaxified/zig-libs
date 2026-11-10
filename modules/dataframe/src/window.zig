@@ -345,7 +345,9 @@ pub fn aggWidthType(st: ColumnType, func: t0.AggFn) ?ColumnType {
         .sum, .prod, .mean, .median, .std, .@"var", .quantile, .sem, .skew, .kurt => .float32,
         else => null,
     };
-    if (!dtype.isWidth(st) or !dtype.isInteger(st)) return null;
+    // Int64 too (polars: `sum` of an Int64 is Int64): the caller passes it only when every
+    // stored cell is an int (`verbs.aggregateImpl`), a declared Int64 holding floats keeps Float64.
+    if (!dtype.isInteger(st)) return null;
     return switch (func) {
         .sum => switch (st) {
             .int8, .int16, .uint8, .uint16 => .int,
@@ -391,7 +393,7 @@ pub fn fixWidthAgg(a: std.mem.Allocator, st: ColumnType, func: t0.AggFn, ty: Col
         };
         return;
     }
-    if (!dtype.isInteger(ty) or !dtype.isWidth(st) or (func != .sum and func != .prod)) return;
+    if (!dtype.isInteger(ty) or !dtype.isInteger(st) or (func != .sum and func != .prod)) return;
     const n = cells.len;
     const acc = try a.alloc(i128, n);
     defer a.free(acc);

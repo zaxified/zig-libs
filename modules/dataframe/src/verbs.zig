@@ -605,7 +605,13 @@ fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: 
     for (gidx, 0..) |ci, i| cols[i] = f.columns[ci];
     for (spec.aggs, 0..) |ag, i| {
         // A width source (W11) has its own result types (`win.aggWidthType`).
-        const ty = (if (rate_idx == null) win.aggWidthType(f.columns[sidx[i]].type, ag.func) else null) orelse if (spec.temporal_results)
+        // An Int64 source only when it stores ints alone (a declared Int64 may hold floats).
+        const st = f.columns[sidx[i]].type;
+        const ints_only = st != .int or switch (colOf(f, sidx[i])) {
+            .int, .nulls => true,
+            else => false,
+        };
+        const ty = (if (rate_idx == null and ints_only) win.aggWidthType(st, ag.func) else null) orelse if (spec.temporal_results)
             core.aggOutTypeTemporal(f.columns, sidx[i], ag.func, rate_idx != null)
         else
             core.aggOutType(f.columns, sidx[i], ag.func, rate_idx != null);

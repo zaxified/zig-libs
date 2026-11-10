@@ -24,19 +24,11 @@ const vectors = @embedFile("oracle_vectors.json");
 /// Deliberate differences from what the engines answered: id substring, and why.
 /// A case listed here must still DIFFER, or the entry is stale and the test fails.
 const known = [_]struct { id: []const u8, why: []const u8, always: bool = true }{
-    .{ .id = "-big-agg-sum", .why = "`aggregate` `sum` adds in f64, so 2^53 + 1 is lost; both engines keep int64. `sum_exact` is exact; the default moves to the engines' in D2" },
     .{ .id = "-cast-text-int", .why = "text \"1e2\" to int: a whole number here (and pandas' to_numeric), null in polars. Not every seed draws it", .always = false },
 };
 
 /// Deliberate differences in output TYPE from BOTH engines, listed the same way.
-const known_types = [_]struct { id: []const u8, why: []const u8 }{
-    .{ .id = "-agg-sum-h-n", .why = "`aggregate` `sum` of an int column is float (`.big-agg-sum`); both engines int" },
-    .{ .id = "-agg-sum-g-n", .why = "the same" },
-    .{ .id = "-agg-sum-g+h-n", .why = "the same" },
-    .{ .id = "-agg-prod-h-n", .why = "`prod` is float; both engines int, wrapping" },
-    .{ .id = "-agg-prod-g-n", .why = "the same" },
-    .{ .id = "-agg-prod-g+h-n", .why = "the same" },
-};
+const known_types = [_]struct { id: []const u8, why: []const u8 }{};
 
 fn jstr(o: J, k: []const u8) []const u8 {
     return o.object.get(k).?.string;

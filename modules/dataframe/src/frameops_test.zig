@@ -106,7 +106,7 @@ test "groupByDynamic and upsample" {
     });
     const g = try df.groupByDynamic(a, f, .{ .index = "t", .every = "1h", .aggs = &.{.{ .src = "v", .out = "s", .func = .sum }} });
     try expectCol(g, "t", &.{ ts("2024-01-01T00:00:00Z"), ts("2024-01-01T01:00:00Z"), ts("2024-01-01T02:00:00Z") });
-    try expectCol(g, "s", &.{ fl(3), fl(3), fl(4) });
+    try expectCol(g, "s", &.{ i(3), i(3), i(4) }); // sum of an Int64 is Int64 (polars; W11)
     const gb = try df.groupByDynamic(a, f, .{ .index = "t", .every = "2h", .by = &.{"k"}, .aggs = &.{.{ .src = "v", .out = "n", .func = .count }} });
     try expectCol(gb, "k", &.{ t("a"), t("a"), t("b") });
     try expectCol(gb, "t", &.{ ts("2024-01-01T00:00:00Z"), ts("2024-01-01T02:00:00Z"), ts("2024-01-01T00:00:00Z") });
