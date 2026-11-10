@@ -694,7 +694,8 @@ fn aroundEven(x: f64, digits: i32) f64 {
 }
 
 fn percentLabel(a: std.mem.Allocator, p: f64) std.mem.Allocator.Error![]const u8 {
-    return a.print("{d}%", .{aroundEven(p * 100, 10)});
+    // `+ 0.0` turns a percentile of -0.0 into 0 (pandas `0%`, not `-0%`).
+    return a.print("{d}%", .{aroundEven(p * 100, 10) + 0.0});
 }
 
 const NamedStat = struct { name: []const u8, v: Value };
@@ -746,7 +747,12 @@ pub fn describeWith(a: std.mem.Allocator, f: Frame, spec: DescribeSpec) Describe
         if (k != .numeric) all_numeric = false;
         if (k == .temporal or k == .duration) any_time = true;
     }
-    if (all_numeric and default_pcts) {
+    // `describe` finds its columns by name: with a repeated name it would describe the
+    // first of them twice, so a selection whose names do not lead back to the same
+    // columns takes the general path below.
+    var by_name = true;
+    for (sel.items) |ci| by_name = by_name and nm.get(f.columns[ci].name) == ci;
+    if (all_numeric and default_pcts and by_name) {
         const names = try a.alloc([]const u8, sel.items.len);
         for (names, sel.items) |*n, ci| n.* = f.columns[ci].name;
         // `describe` reads an empty list as "every numeric column": say the empty selection here.

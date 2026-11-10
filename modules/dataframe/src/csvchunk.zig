@@ -478,7 +478,12 @@ pub const CsvChunkReader = struct {
         const fields = try aa.alloc([]const u8, s.width + 1);
         var sp = csvio.recordSplitOptions(&s.opts);
         sp.on_overflow = .truncate;
-        const got = csvstream.splitFieldsOpts(rec, fields, s.opts.delimiter, s.opts.quote, aa, sp) catch return rec;
+        // A record the splitter refuses is stored as it came; running out of memory is not
+        // a refusal and must not store an unbalanced record raw.
+        const got = csvstream.splitFieldsOpts(rec, fields, s.opts.delimiter, s.opts.quote, aa, sp) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return rec,
+        };
         var w: std.Io.Writer.Allocating = .init(aa);
         const wo: csvstream.WriteOptions = .{
             .delimiter = s.opts.delimiter,
