@@ -1539,8 +1539,9 @@ fn jsonToValue(a: std.mem.Allocator, work: *Work, jv: std.json.Value, want: Colu
         },
         // An instant or a length of time: an ISO 8601 / RFC 3339 (resp. ISO 8601 duration)
         // string, or a number already in the column's unit (microseconds) — `Value.cast`'s
-        // rules, so a JSON feed and a cast agree. Anything else → null.
-        .timestamp, .duration => blk: {
+        // rules, so a JSON feed and a cast agree. A time of day the same way (`"01:02:03"` or
+        // microseconds since midnight; outside one day null). Anything else → null.
+        .timestamp, .duration, .time => blk: {
             const v: Value = switch (jv) {
                 .string => |s| .{ .text = s },
                 .integer => |i| .{ .int = i },
@@ -2050,6 +2051,27 @@ test "shape: a .timestamp column reads RFC 3339 strings and microsecond numbers"
     try testing.expect(d.columnAt(0).get(5) == .null);
     // 2009-02-13 UTC midnight = 1234567890 - (23*3600 + 31*60 + 30) = 1234483200.
     try testing.expectEqual(Value{ .int = 1234483200_000000 }, d.columnAt(0).get(6));
+}
+
+test "shape: a .time column reads HH:MM:SS text and microseconds since midnight" {
+    // dataframe's time of day (2026-11-10): `Value.cast(.time)` on the JSON value, so a
+    // feed and a cast agree; outside one day, or not a time, null.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try shape(a,
+        \\{"r":[{"t":"01:02:03"},{"t":3723000000},{"t":"25:00"},{"t":-1},{"t":true},{"t":"00:00:00.120"}]}
+    , .{
+        .path = "r",
+        .columns = &.{.{ .name = "t", .key = "t", .type = .time }},
+    });
+    try testing.expectEqual(@as(usize, 6), d.len);
+    try testing.expectEqual(Value{ .int = 3_723_000_000 }, d.columnAt(0).get(0));
+    try testing.expectEqual(Value{ .int = 3_723_000_000 }, d.columnAt(0).get(1));
+    try testing.expect(d.columnAt(0).get(2) == .null);
+    try testing.expect(d.columnAt(0).get(3) == .null);
+    try testing.expect(d.columnAt(0).get(4) == .null);
+    try testing.expectEqual(Value{ .int = 120_000 }, d.columnAt(0).get(5));
 }
 
 test "TEETH: MAX_PATH_DEPTH is load-bearing and is actually applied" {
