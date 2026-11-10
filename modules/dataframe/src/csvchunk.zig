@@ -114,6 +114,10 @@ pub const CsvChunkReader = struct {
     buf: std.ArrayList(u8) = .empty,
     ends: std.ArrayList(usize) = .empty,
     lines: std.ArrayList(u64) = .empty,
+    /// Per queued record, the bytes `max_bytes` counts for it (the input's own, not a
+    /// re-encoded copy's), and their sum.
+    sizes: std.ArrayList(usize) = .empty,
+    size_total: usize = 0,
     /// A header-less file's first record, until it is queued.
     pending: ?[]const u8 = null,
     pending_line: u64 = 0,
@@ -159,6 +163,7 @@ pub const CsvChunkReader = struct {
         s.buf.deinit(s.gpa);
         s.ends.deinit(s.gpa);
         s.lines.deinit(s.gpa);
+        s.sizes.deinit(s.gpa);
         s.enc.deinit(s.gpa);
         s.state.deinit();
     }
@@ -445,6 +450,9 @@ pub const CsvChunkReader = struct {
         s.ends.shrinkRetainingCapacity(left);
         std.mem.copyForwards(u64, s.lines.items[0..left], s.lines.items[k..]);
         s.lines.shrinkRetainingCapacity(left);
+        for (s.sizes.items[0..k]) |z| s.size_total -= z;
+        std.mem.copyForwards(usize, s.sizes.items[0..left], s.sizes.items[k..]);
+        s.sizes.shrinkRetainingCapacity(left);
     }
 
     /// Queues data records until `target` are there, the stream or `n_rows` ends.
@@ -460,11 +468,18 @@ pub const CsvChunkReader = struct {
             // did would leave them out of step, and `drop`/`locateBadLine` would index past `lines`.
             try s.ends.ensureUnusedCapacity(s.gpa, 1);
             try s.lines.ensureUnusedCapacity(s.gpa, 1);
+            try s.sizes.ensureUnusedCapacity(s.gpa, 1);
+            const before = s.buf.items.len;
             try appendRecord(&s.buf, s.gpa, if (rec.unbalanced) try s.reencode(rec.bytes) else rec.bytes);
-            // The cap is on the records' bytes, not on the terminators this file adds (seed 15628).
-            if (s.buf.items.len - s.hdr_len - (s.ends.items.len + 1) > s.opts.max_bytes) return error.InputTooLarge;
+            // The cap is on the records' bytes, not on the terminators this file adds (seed 15628),
+            // and not on the quotes a re-encoded record gains: the whole read counts the input's
+            // (fuzz seed 168996: 166 bytes under `max_bytes` 172, every field of a record quoted).
+            const counted = if (rec.unbalanced) rec.bytes.len else s.buf.items.len - before - 1;
+            if (s.size_total +| counted > s.opts.max_bytes) return error.InputTooLarge;
             s.ends.appendAssumeCapacity(s.buf.items.len);
             s.lines.appendAssumeCapacity(rec.line);
+            s.sizes.appendAssumeCapacity(counted);
+            s.size_total += counted;
             s.taken += 1;
         }
     }

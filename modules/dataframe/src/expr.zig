@@ -1320,6 +1320,9 @@ const Compiler = struct {
                 if (r.by.len == 0 or (r.rest and r.n == 0)) return error.BadExpr;
                 const count = if (r.rest) r.n else r.n +| 1;
                 if (count > sf.max_str_columns) return error.TooLarge;
+                // The names are made once per visit: they weigh as many nodes (fuzz seed 493021).
+                if (c.visits.* +| count > max_nodes) return error.ExprTooLarge;
+                c.visits.* += count;
                 const names = try c.a.alloc([]const u8, count);
                 for (names, 0..) |*nm, i| nm.* = try c.a.print("field_{d}", .{i});
                 try c.go(r.x, depth + 1);
