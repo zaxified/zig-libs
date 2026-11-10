@@ -223,22 +223,7 @@ of a member to disk and a sparse header of a few hundred bytes can declare a lar
 Beyond the documented out-of-scope list (pax 'g' and records beyond
 `path`/`linkpath`/`size`/`uid`/`gid`/`mtime`/`GNU.sparse.*`, sparse writing, per-file compression, encryption/signing, special files).
 
-- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
-
-  6 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
-
-  | site | source → dest | shape | function | reach | risk note |
-  |---|---|---|---|---|---|
-  | `src/go_oracle.zig:141:17` | `i64 -> u32` | @intCast | goEntry | T test/tools only | test oracle (Go vectors), small values |
-  | `src/go_oracle.zig:142:16` | `i64 -> u32` | @intCast | goEntry | T test/tools only | test oracle |
-  | `src/go_oracle.zig:143:16` | `i64 -> u32` | @intCast | goEntry | T test/tools only | test oracle |
-  | `src/root.zig:545:25` | `i128 -> u32` | std.math.cast | numField | A reachable from external input | header uid/gid/mode (wire, octal or base-256) -> u32: 2^31..2^32-1 reachable (uid 4294967294 is common); math.cast after the range check |
-  | `src/root.zig:624:25` | `i128 -> u64` | std.math.cast | sizeField | A reachable from external input | header size (base-256, up to 88 bits) -> u64: 2^63..2^64-1 reachable from a crafted header; size checks downstream |
-  | `src/root.zig:930:26` | `i64 -> u63` | @max/@min refinement | emitHeader | C reachable only in extreme/far cases | writer mtime >= 2^62 s only |
-
-  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
-
-  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 6 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
 - (sweep GW 2026-10-31, fix round) **`packDir` limits left as documented**: a file that shrinks, is replaced or fails to read while packed is now zero-padded to its header size and counted in `skipped` (GNU tar behaviour); a refused DIRECTORY (uid/gid/mtime out of ustar range) is counted once in `skipped` whatever its subtree holds, and one whose `openDir` fails keeps its header and is not counted (open fds: one per stack frame, RLIMIT_NOFILE); the walk neither stays on one device nor avoids pseudo filesystems (`/proc/kcore`, bind-mount loops can make the tree effectively infinite) -- a `same_device` / `max_entries` / `max_bytes` option is the fix; stored names are the given paths (a root `../x` yields an escaping archive). The module has no extractor: path-escape checks belong to whoever extracts (axp-core only packs; axp-vault ingest only re-hashes content).
 
 ## Status

@@ -97,23 +97,7 @@ netlink/wireguard/l2disco/procnet — a deliberate scope decision, not a gap).
 - **`ErrInfo` lacks `ee_info`** (requested by pathmtu, 2026-11-03): the next-hop MTU of a Frag-Needed, which `IP_RECVERR` delivers. Without it pathmtu's ping-socket lane bisects, about 11 probes per narrowing, where the hint would give one. Results are exact either way. Additive field.
 - **Standard deviation / jitter in `Stats`** (survey 2026-09-30): pro-bing reports `StdDevRtt`; `Stats` keeps min/max/total/last only, so a caller feeding results through the callback must accumulate its own sum of squares (rg `min_ns|total_ns` in `src/pinger.zig`). Effort: small. Fits CONVENTIONS §2.
 
-- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
-
-  7 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
-
-  | site | source → dest | shape | function | reach | risk note |
-  |---|---|---|---|---|---|
-  | `src/Socket.zig:236:12` | `i32 -> u16` | @intCast | randomIdent | B reachable in normal computation | pid & 0xffff -> u16: 32768..65535 reachable for pids >= 32768 (common); ICMP identifier, compared with reply ids |
-  | `src/pinger.zig:886:9` | `i64 -> u63` | @max/@min refinement | nextWaitNs | D unreachable (bounded below 2^(N-1)) | wait ns, << 2^62 |
-  | `src/pinger.zig:1015:61` | `i64 -> u63` | @max/@min refinement | handleReply | D unreachable (bounded below 2^(N-1)) | rtt ns, << 2^62 |
-  | `src/pinger.zig:1092:9` | `i64 -> u63` | @max/@min refinement | waitReadable | D unreachable (bounded below 2^(N-1)) | wait ns |
-  | `src/pinger.zig:1141:54` | `i64 -> u63` | @max/@min refinement | drainReplies | D unreachable (bounded below 2^(N-1)) | clock delta ns |
-  | `src/pinger.zig:1256:12` | `i64 -> u32` | @intCast | originateMsAt | D unreachable (bounded below 2^(N-1)) | ms of day < 86.4e6 < 2^31 |
-  | `src/pinger.zig:2061:36` | `i64 -> u63` | @max/@min refinement | test.integration: embed API prepare/step/pollFds round against loopback | T test/tools only | test |
-
-  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
-
-  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 7 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
 
 **No-panic sweep § GO leftovers (2026-10-30)** — not fixed, with reasons (report: `~/CML/20261029-panic-sweep/icmp-sweep.report.md`):
 - `Pinger.stats(id)` / `targetAddr(id)` with an id `addTarget*` never returned: now a documented checked panic; the message path cannot be asserted in-process.

@@ -185,21 +185,7 @@ matching `list`'s per-kind scoping); mandatory (non-advisory) locking; encryptio
   are never reclaimed; `putWithTTL` renewal is fail-closed only for a new key (a crash keeps the old
   bytes under the new deadline); `list`/`iterate` include expired-unswept records (by design, `sweep`
   relies on it). The model fuzz harness injects no faults (failure paths unexercised).
-- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
-
-  2 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
-
-  | site | source → dest | shape | function | reach | risk note |
-  |---|---|---|---|---|---|
-  | `src/root.zig:639:48` | `i128 -> u32 (+1 more)` | std json.static.sliceToInt | get | C reachable only in extreme/far cases | std.json u8/u32 fields of caller's T: poison only for float-formatted numbers in the upper half; consumer compares on fields possible |
-  | `src/root.zig:654:55` | `i128 -> u32 (+1 more)` | std json.static.sliceToInt | listTyped | C reachable only in extreme/far cases | std.json u8/u32 fields of caller's T (as :639) |
-
-  Std sites pulled in by this module:
-  - `std/json/static.zig:784:19` (i128 -> u64 (+3 more), @intCast, in `sliceToInt`), reach C reachable only in extreme/far cases: float-formatted JSON number (e.g. 200.0) -> caller uN: upper half poison; plain integers take fmt.parseInt (unaffected).
-
-  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
-
-  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
 - (sweep GW 2026-10-31, fix round) **`list`/`listTyped` materialize every name/item** into the caller's arena (iterator or paged form is the fix; `listTyped` keeps every record's bytes). Foreign file names that are not valid keys are no longer listed. (Fixed 2026-11-01: `delete` on a never-created kind returns `false`, not the directory fsync's `FileNotFound`.) A FIFO planted at a record path blocks the opening call. A caller wrapping `lockKey` around `casPutBytes`/`putWithTTL` self-deadlocks (the flock is per open file description). A typed `get`/`listTyped` into a self-recursive `T` recurses with the document depth (std.json); `std.json.Value` parses iteratively but costs ~40 bytes per open container.
 
 ## Status

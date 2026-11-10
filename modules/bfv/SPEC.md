@@ -347,15 +347,4 @@ paper/spec is not a copyrightable work; no third-party source was ported).
 
 - **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `reduceWide` (per polynomial coefficient). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
 
-- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
-
-  2 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
-
-  | site | source → dest | shape | function | reach | risk note |
-  |---|---|---|---|---|---|
-  | `src/bfv.zig:1034:31` | `i606 -> u301 (+16 more)` | @intCast | rescaleTensor | D unreachable (bounded below 2^(N-1)) | QU has q_bits+1 bits, value < q < 2^(N-1) |
-  | `src/encode.zig:98:23` | `i128 -> u64` | @intCast | mulRef | C reachable only in extreme/far cases | r in [0, t); poison only if the caller-chosen plaintext modulus t >= 2^63 |
-
-  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
-
-  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).

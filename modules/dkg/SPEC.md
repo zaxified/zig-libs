@@ -426,13 +426,4 @@ here.
 - **Resharing with aux refresh** (2026-09-30): a membership change needs new parties' Paillier/ring-Pedersen material; today it is attached by the caller.
 - **A FROST-flavoured DKG (Pedersen DKG with proof of knowledge, RFC 9591 ciphersuite)** (survey 2026-09-30): sibling `frost` has only a trusted dealer, and frost-core ships a DKG; the `commit.zig`/`core.zig` pieces are curve-generic in spirit but bound to secp256k1 `Element`/`Scalar` from `threshold_ecdsa`. Effort: medium; belongs with the `frost` module. Fits §2.
 
-- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
-
-  No own sites in this module; only std sites pulled in (below).
-
-  Std sites pulled in by this module:
-  - `std/json/static.zig:784:19` (i128 -> u64 (+3 more), @intCast, in `sliceToInt`), reach C reachable only in extreme/far cases: float-formatted JSON number (e.g. 200.0) -> caller uN: upper half poison; plain integers take fmt.parseInt (unaffected).
-
-  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
-
-  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).

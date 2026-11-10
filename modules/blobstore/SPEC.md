@@ -289,17 +289,7 @@ by design, `meta.platform = .posix`).
 
 (The 2026-09-30 survey items - multi-hash, compression, packing, chunking/encryption - have verdicts below; none is planned.)
 
-- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
-
-  1 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
-
-  | site | source → dest | shape | function | reach | risk note |
-  |---|---|---|---|---|---|
-  | `src/root.zig:1117:40` | `i96 -> u64` | @intCast | reapStaleIngestTemps | C reachable only in extreme/far cases | age ns >= 2^63 (292 years) only; compare follows |
-
-  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
-
-  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
 - (sweep GW 2026-10-31, status 2026-11-03) `list`/`listNamed` still materialize every name into the
   caller's arena; `Store.names` is the bounded-memory form (done). `put(reader)` streams to EOF;
   `putLimited` bounds it (done). A FIFO or other non-regular file at a blob/sidecar path no longer

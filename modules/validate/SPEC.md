@@ -288,25 +288,7 @@ for a body the decoder rejects mid-way (so the invalid path still reports every 
 - ~~**`unique` and `oneof` on numbers**~~ **DONE 2026-10-24** — `Rule.unique` (JSON Schema `uniqueItems`, JSON equality, O(n log n) via a SipHash128 structural hash, streaming paths materialize the array) and `one_of` on `.int`/`.float` rules compared by value (it was ignored there, while the export listed the entries as strings and so refused every number). Both replayed by python-jsonschema and ajv (four crafted rule sets); `unique` also against a quadratic model (`unique` fuzz harness).
 - **Cross-field rules on query/path params** *(2026-10-11)* — `validateQuery` / `validateParams` ignore `Rule.cross`. Effort: small, but needs the coerced values of all parameters.
 
-- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
-
-  4 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
-
-  | site | source → dest | shape | function | reach | risk note |
-  |---|---|---|---|---|---|
-  | `src/root.zig:2362:42` | `i128 -> u8 (+4 more)` | std json.static.sliceToInt, std json.static.innerParseFromValue | parseIntoLimited | A reachable from external input | std.json.parseFromValue of caller's T: .integer -> u8/u32 directly (same as the fixed jwe shape): upper half reachable from the request body; validat… |
-  | `src/root.zig:2566:53` | `i128 -> u32 (+2 more)` | std json.static.sliceToInt | parseOnePass | C reachable only in extreme/far cases | std.json token parse of caller's T: u8/u16/u32 poison only for float-formatted numbers |
-  | `src/root.zig:2595:47` | `i128 -> u32 (+1 more)` | std json.static.sliceToInt | parseMultiPass | C reachable only in extreme/far cases | as :2566 |
-  | `tools/bench.zig:109:47` | `i128 -> u8` | std json.static.sliceToInt | one | T test/tools only | tools |
-
-  Std sites pulled in by this module:
-  - `std/json/static.zig:582:28` (i64 -> u8 (+1 more), @intCast, in `innerParseFromValue`), reach A reachable from external input: json Value .integer -> caller uN after explicit range check: upper half reachable from JSON input (same shape as the fixed jwe site).
-  - `std/json/static.zig:784:19` (i128 -> u64 (+3 more), @intCast, in `sliceToInt`), reach C reachable only in extreme/far cases: float-formatted JSON number (e.g. 200.0) -> caller uN: upper half poison; plain integers take fmt.parseInt (unaffected).
-  - `std/math.zig:536:5` (i64 -> u63 (+1 more), @max/@min refinement, in `clamp`), reach D unreachable (bounded below 2^(N-1)): clamp(lower=0 comptime) refinement; reach depends on caller bounds (all observed callers small).
-
-  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
-
-  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 4 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
 
 ## Status
 `gap · any · util · reentrant` + deps: `router`, `http`, `netaddr` — canonical source is
