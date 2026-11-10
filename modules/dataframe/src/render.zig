@@ -352,6 +352,36 @@ pub const LatexOptions = struct {
     header: bool = true,
 };
 
+/// `%.6f` of a finite float, as Python prints it: the exact binary value rounded half to even
+/// at the sixth decimal. `{d:.6}` rounds the shortest digits instead (`0.0000005` gives
+/// `0.000001`, Python `0.000000`) and pads with zeros past 2^53, so the digits come from integer
+/// arithmetic: the value is `mant * 2^e`.
+fn fixed6(al: std.mem.Allocator, w: *std.Io.Writer, x: f64) error{ OutOfMemory, WriteFailed }!void {
+    const bits: u64 = @bitCast(x);
+    const bexp: i32 = @intCast((bits >> 52) & 0x7ff);
+    const frac = bits & ((1 << 52) - 1);
+    const mant: u64 = if (bexp == 0) frac else frac | (1 << 52);
+    const e: i32 = (if (bexp == 0) 1 else bexp) - 1075;
+    if (bits >> 63 != 0) try w.writeByte('-');
+    if (e >= 0) {
+        var m = try std.math.big.int.Managed.init(al);
+        try m.set(mant);
+        try m.shiftLeft(&m, @intCast(e));
+        const digits = m.toString(al, 10, .lower) catch return error.OutOfMemory; // base 10 is valid
+        return w.print("{s}.000000", .{digits});
+    }
+    const shift: u32 = @intCast(-e);
+    const n: u128 = @as(u128, mant) * 1_000_000; // 73 bits
+    var q: u128 = 0;
+    if (shift < 128) {
+        q = n >> @intCast(shift);
+        const rem = n & ((@as(u128, 1) << @intCast(shift)) - 1);
+        const half = @as(u128, 1) << @intCast(shift - 1);
+        if (rem > half or (rem == half and q & 1 == 1)) q += 1;
+    }
+    try w.print("{d}.{d:0>6}", .{ q / 1_000_000, q % 1_000_000 });
+}
+
 fn latexText(w: *std.Io.Writer, s: []const u8, escape: bool) std.Io.Writer.Error!void {
     if (!escape) return w.writeAll(s);
     for (s) |c| switch (c) {
@@ -359,18 +389,21 @@ fn latexText(w: *std.Io.Writer, s: []const u8, escape: bool) std.Io.Writer.Error
             try w.writeByte('\\');
             try w.writeByte(c);
         },
-        '~' => try w.writeAll("\\textasciitilde{}"),
-        '^' => try w.writeAll("\\textasciicircum{}"),
-        '\\' => try w.writeAll("\\textbackslash{}"),
+        // pandas 3.1 writes these three with a trailing blank, not `{}` (oracle2k `lat-specials-esc`).
+        '~' => try w.writeAll("\\textasciitilde "),
+        '^' => try w.writeAll("\\textasciicircum "),
+        '\\' => try w.writeAll("\\textbackslash "),
         else => try w.writeByte(c),
     };
 }
 
 /// `f` as a LaTeX table in pandas' `to_latex(index=False)` layout (booktabs rules): `\begin{tabular}{lrr}`,
-/// a column format letter `r` for a number column (int, float, decimal) and `l` for the rest, a
-/// header row, `\midrule`, one row per line, `\bottomrule`. A `caption` or `label` wraps it in
-/// `\begin{table}`. Control characters in a cell are written as `\n`-style escapes (and so, with
-/// `escape`, as `\textbackslash{}n`). Not done: `longtable`, `column_format`, `position`, `multicolumn`.
+/// a column format letter `r` for a number or bool column (int, float, decimal) and `l` for the rest, a
+/// header row, `\midrule` (written without a header too), one row per line, `\bottomrule`. A `caption`
+/// or `label` wraps it in `\begin{table}`. A float is written with six decimals (pandas' Styler
+/// precision, `1.500000`, `1e-07` as `0.000000`). Text and names go out byte for byte, a tab or
+/// newline included (pandas does not touch them), `null_text` is never escaped. Not done: `longtable`,
+/// `column_format`, `position`, `multicolumn`, `formatters`, `float_format`.
 pub fn latexTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: LatexOptions) RenderError!void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -382,23 +415,30 @@ pub fn latexTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: LatexOpt
         if (opts.label) |l| try w.print("\\label{{{s}}}\n", .{l});
     }
     try w.writeAll("\\begin{tabular}{");
-    for (f.columns) |c| try w.writeByte(if (isNumeric(c.type)) 'r' else 'l');
+    for (f.columns) |c| try w.writeByte(if (isNumeric(c.type) or c.type == .bool) 'r' else 'l');
     try w.writeAll("}\n\\toprule\n");
     if (opts.header) {
         for (f.columns, 0..) |c, ci| {
             if (ci != 0) try w.writeAll(" & ");
-            _ = arena.reset(.retain_capacity);
-            try latexText(w, try cellText(al, .{ .text = c.name }, text_col, "", std.math.maxInt(usize), false), opts.escape);
+            try latexText(w, c.name, opts.escape);
         }
-        try w.writeAll(" \\\\\n\\midrule\n");
+        try w.writeAll(" \\\\\n");
     }
+    try w.writeAll("\\midrule\n");
     for (0..if (f.columns.len == 0) 0 else f.len) |ri| {
         for (f.columns, 0..) |c, ci| {
             if (ci != 0) try w.writeAll(" & ");
             _ = arena.reset(.retain_capacity);
             const v = f.columnAt(ci).get(ri);
-            const t = if (v == .float and std.math.isNan(v.float)) opts.null_text else try cellText(al, v, c, opts.null_text, std.math.maxInt(usize), false);
-            try latexText(w, t, opts.escape);
+            if (v == .null or (v == .float and std.math.isNan(v.float))) {
+                try w.writeAll(opts.null_text);
+            } else switch (v) {
+                .text => |t| try latexText(w, t, opts.escape),
+                .float => |x| if (std.math.isInf(x)) try w.writeAll(if (x > 0) "inf" else "-inf") else {
+                    try fixed6(al, w, x);
+                },
+                else => try latexText(w, try cellText(al, v, c, opts.null_text, std.math.maxInt(usize), false), opts.escape),
+            }
         }
         try w.writeAll(" \\\\\n");
     }

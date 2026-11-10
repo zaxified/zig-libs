@@ -135,9 +135,14 @@ test "time: parseTimeOfDay / formatTimeOfDay" {
         .{ "23:59:59.999999", 86_399_999_999 },
         .{ "00:00:00.12", 120_000 },
         .{ "12:00:00.123456789", 43_200_123_456 }, // past the sixth digit truncated
+        .{ "1:02:03", 3_723_000_000 }, // polars and pandas read one-digit fields
+        .{ "1:2:3", 3_723_000_000 },
+        .{ " 01:02:03", 3_723_000_000 },
+        .{ "\t01:02:03", 3_723_000_000 },
+        .{ "01:02:03.1234567891", 3_723_123_456 }, // polars keeps nine digits and drops the tenth
     };
     for (ok) |c| try testing.expectEqual(@as(?i64, c[1]), df.parseTimeOfDay(c[0]));
-    const bad = [_][]const u8{ "", "1:02:03", "24:00", "23:60", "23:59:60", "01:02:03.", "01:02:03.1234567890", "01-02-03", "+1:02", " 01:02", "01:02:3", "ab:cd" };
+    const bad = [_][]const u8{ "", "24:00", "23:60", "23:59:60", "01:02:03.", "01-02-03", "+1:02", "01:02:03 ", "1:002:03", "01:02:03:04", "ab:cd" };
     for (bad) |s| try testing.expectEqual(@as(?i64, null), df.parseTimeOfDay(s));
     var buf: [df.max_time_len]u8 = undefined;
     // polars' display (chrono): fraction in groups of three, as few as hold it.
@@ -183,10 +188,10 @@ test "time: CSV and JSON read and write" {
     defer arena.deinit();
     const a = arena.allocator();
     const csv = "t,u\n01:02:03,01:02\n23:59:59.999999,\n00:00:00.120,13:30\n";
-    // polars `try_parse_dates` infers Time from HH:MM:SS; a bare HH:MM stays text.
+    // polars `try_parse_dates` infers Time from HH:MM:SS and from a bare HH:MM (oracle2k).
     const f = try df.readCsv(a, csv, .{ .parse_dates = true });
     try testing.expectEqual(df.ColumnType.time, f.columnType("t").?);
-    try testing.expectEqual(df.ColumnType.text, f.columnType("u").?);
+    try testing.expectEqual(df.ColumnType.time, f.columnType("u").?);
     try testing.expectEqual(@as(i64, 120_000), f.cell(2, "t").?.int);
     const g = try df.readCsv(a, csv, .{ .types = &.{.{ .name = "u", .type = .time }} });
     try testing.expectEqual(@as(i64, 48_600_000_000), g.cell(2, "u").?.int);

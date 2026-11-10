@@ -737,35 +737,49 @@ pub fn formatIsoTimestamp(buf: *[max_iso_timestamp_len]u8, us: i64) []const u8 {
 /// Longest string `formatTimeOfDay` writes: `HH:MM:SS.ffffff`.
 pub const max_time_len = 15;
 
-/// A time of day as microseconds since midnight, or null: `HH:MM[:SS[.F]]`, two digits
-/// each (no sign, no blanks), hours 0-23, minutes and seconds 0-59, the fraction 1-9
-/// digits with those past the sixth truncated (polars reads 9 into its nanoseconds).
-/// `HH:MM` is pandas' (`to_datetime(...).dt.time`); polars' `str.to_time()` wants the
-/// seconds, so this reads a superset. `24:00` and a leap second `23:59:60` are null
-/// (Python's `time` refuses both).
+/// A time of day as microseconds since midnight, or null: `H[H]:M[M][:S[S][.F]]` after
+/// leading blanks and tabs (polars' `str.to_time` and pandas read `1:2:3` and ` 01:02:03`, oracle2k
+/// `time-str-to-time`), hours 0-23, minutes and seconds 0-59, the fraction one or more digits
+/// with those past the sixth dropped (polars keeps nine as nanoseconds). No sign, no trailing
+/// blank. `H:M` is pandas'; polars' `str.to_time()` wants the seconds, so this reads a
+/// superset. `24:00` and a leap second `23:59:60` are null (Python's `time` refuses both).
 pub fn parseTimeOfDay(s: []const u8) ?i64 {
-    if (s.len != 5 and (s.len < 8 or s.len == 9 or s.len > 18)) return null;
-    if (s[2] != ':') return null;
-    const h = digitsAt(s, 0, 2) orelse return null;
-    const m = digitsAt(s, 3, 2) orelse return null;
+    var i: usize = 0;
+    while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
+    const h = fieldAt(s, &i) orelse return null;
+    if (i >= s.len or s[i] != ':') return null;
+    i += 1;
+    const m = fieldAt(s, &i) orelse return null;
     var sec: u32 = 0;
     var frac: i64 = 0;
-    if (s.len > 5) {
-        if (s[5] != ':') return null;
-        sec = digitsAt(s, 6, 2) orelse return null;
-        if (s.len > 8) {
-            if (s[8] != '.') return null;
-            const digits = s[9..];
-            for (digits, 0..) |c, k| {
+    if (i < s.len) {
+        if (s[i] != ':') return null;
+        i += 1;
+        sec = fieldAt(s, &i) orelse return null;
+        if (i < s.len) {
+            if (s[i] != '.' or i + 1 == s.len) return null;
+            var k: usize = 0;
+            for (s[i + 1 ..]) |c| {
                 if (c < '0' or c > '9') return null;
                 if (k < 6) frac = frac * 10 + (c - '0');
+                k += 1;
             }
-            var k: usize = digits.len;
             while (k < 6) : (k += 1) frac *= 10;
         }
     }
     if (h > 23 or m > 59 or sec > 59) return null;
     return (@as(i64, h) * 3600 + @as(i64, m) * 60 + sec) * timestamp_units_per_second + frac;
+}
+
+/// One or two digits at `s[i..]`, `i` moved past them.
+fn fieldAt(s: []const u8, i: *usize) ?u32 {
+    var n: u32 = 0;
+    var k: usize = 0;
+    while (k < 2 and i.* < s.len and s[i.*] >= '0' and s[i.*] <= '9') : (k += 1) {
+        n = n * 10 + (s[i.*] - '0');
+        i.* += 1;
+    }
+    return if (k == 0) null else n;
 }
 
 /// True when `us` is a time of day a `.time` cell can hold.

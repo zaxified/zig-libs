@@ -60,8 +60,8 @@ test "linearSpaces: one list per row" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // polars' example has num_samples per row (4 and 5); here n is shared, so 3 for both.
-    const f = try df.linearSpaces(a, "r", &.{ 1, -1, null }, &.{ 3, 2, 5 }, 3, .both);
+    // polars' example has num_samples per row; here one count is broadcast.
+    const f = try df.linearSpaces(a, "r", &.{ 1, -1, null }, &.{ 3, 2, 5 }, &.{3}, .both);
     try testing.expectEqual(@as(usize, 3), f.len);
     const r0 = f.cell(0, "r").?.list;
     try testing.expectEqual(@as(f64, 1), r0.get(0).float);
@@ -72,7 +72,7 @@ test "linearSpaces: one list per row" {
     try testing.expectEqual(@as(f64, 0.5), r1.get(1).float);
     try testing.expectEqual(@as(f64, 2), r1.get(2).float);
     try testing.expect(f.cell(2, "r").? == .null);
-    const g = try df.linearSpaces(a, "r", &.{0}, &.{4}, 4, .left);
+    const g = try df.linearSpaces(a, "r", &.{0}, &.{4}, &.{4}, .left);
     try testing.expectEqual(@as(f64, 3), g.cell(0, "r").?.list.get(3).float);
 }
 
@@ -84,11 +84,11 @@ test "plural ranges: hostile input is an error or empty, never a panic" {
     // mismatched lengths
     try testing.expectError(error.BadArgument, df.dateRanges(a, "r", &.{ d(2022, 1, 1), d(2022, 1, 2) }, &.{ d(2022, 1, 3), d(2022, 1, 3), d(2022, 1, 4) }, .{}));
     try testing.expectError(error.BadArgument, df.datetimeRanges(a, "r", &.{ 1, 2 }, &.{ 1, 2, 3 }, .{}));
-    try testing.expectError(error.BadArgument, df.linearSpaces(a, "r", &.{ 1, 2 }, &.{ 1, 2, 3 }, 3, .both));
+    try testing.expectError(error.BadArgument, df.linearSpaces(a, "r", &.{ 1, 2 }, &.{ 1, 2, 3 }, &.{3}, .both));
     try testing.expectError(error.BadArgument, df.dateRanges(a, "r", &.{}, &.{ d(2022, 1, 3), d(2022, 1, 3) }, .{}));
     // empty inputs: no rows
     try testing.expectEqual(@as(usize, 0), (try df.dateRanges(a, "r", &.{}, &.{d(2022, 1, 3)}, .{})).len);
-    try testing.expectEqual(@as(usize, 0), (try df.linearSpaces(a, "r", &.{1}, &.{}, 3, .both)).len);
+    try testing.expectEqual(@as(usize, 0), (try df.linearSpaces(a, "r", &.{1}, &.{}, &.{3}, .both)).len);
     // bad intervals: zero, negative, empty, finer than a day, garbage
     for ([_][]const u8{ "0d", "-1d", "", "12h", "1mo1d", "xyz", "99999999999999999999d" }) |iv| {
         try testing.expectError(error.BadInterval, df.dateRanges(a, "r", &.{d(2022, 1, 1)}, &.{d(2022, 1, 5)}, .{ .interval = iv }));
@@ -113,16 +113,16 @@ test "plural ranges: hostile input is an error or empty, never a panic" {
     _ = df.datetimeRanges(a, "r", &.{std.math.minInt(i64)}, &.{std.math.maxInt(i64)}, .{ .interval = "1d" }) catch {};
     _ = df.datetimeRanges(a, "r", &.{std.math.maxInt(i64) - 5}, &.{std.math.maxInt(i64)}, .{ .interval = "1us" }) catch {};
     // linearSpaces: n = 0, 1, huge; non-finite bounds
-    const z = try df.linearSpaces(a, "r", &.{ 0, 1 }, &.{ 1, 2 }, 0, .both);
+    const z = try df.linearSpaces(a, "r", &.{ 0, 1 }, &.{ 1, 2 }, &.{0}, .both);
     try testing.expectEqual(@as(usize, 0), z.cell(0, "r").?.list.len());
-    const one = try df.linearSpaces(a, "r", &.{7}, &.{9}, 1, .both);
+    const one = try df.linearSpaces(a, "r", &.{7}, &.{9}, &.{1}, .both);
     try testing.expectEqual(@as(f64, 7), one.cell(0, "r").?.list.get(0).float);
     for ([_]df.Closed{ .both, .left, .right, .none }) |c| {
-        _ = try df.linearSpaces(a, "r", &.{ std.math.inf(f64), std.math.nan(f64) }, &.{ 1, std.math.inf(f64) }, 3, c);
-        _ = try df.linearSpaces(a, "r", &.{1}, &.{2}, 1, c);
+        _ = try df.linearSpaces(a, "r", &.{ std.math.inf(f64), std.math.nan(f64) }, &.{ 1, std.math.inf(f64) }, &.{3}, c);
+        _ = try df.linearSpaces(a, "r", &.{1}, &.{2}, &.{1}, c);
     }
-    try testing.expectError(error.TooLarge, df.linearSpaces(a, "r", &.{1}, &.{2}, std.math.maxInt(usize), .both));
-    try testing.expectError(error.TooLarge, df.linearSpaces(a, "r", &.{ 1, 2, 3 }, &.{4}, df.max_range_rows / 2 + 1, .both));
+    try testing.expectError(error.TooLarge, df.linearSpaces(a, "r", &.{1}, &.{2}, &.{std.math.maxInt(usize)}, .both));
+    try testing.expectError(error.TooLarge, df.linearSpaces(a, "r", &.{ 1, 2, 3 }, &.{4}, &.{df.max_range_rows / 2 + 1}, .both));
 }
 
 fn sample(a: std.mem.Allocator) !Frame {
@@ -148,16 +148,16 @@ test "toLatex: pandas' to_latex(index=False) layout" {
     // pandas docs example (without its formatters/float_format): lrr, booktabs rules.
     try testing.expectEqualStrings(
         "\\begin{tabular}{lrr}\n\\toprule\nname & age & height \\\\\n\\midrule\n" ++
-            "Raphael & 26 & 181.23 \\\\\nDonatello & 45 & 177.65 \\\\\n\\bottomrule\n\\end{tabular}\n",
+            "Raphael & 26 & 181.230000 \\\\\nDonatello & 45 & 177.650000 \\\\\n\\bottomrule\n\\end{tabular}\n",
         try df.toLatex(a, f, .{}),
     );
     try testing.expectEqualStrings(
         "\\begin{table}\n\\caption{People}\n\\label{tab:p}\n\\begin{tabular}{lrr}\n\\toprule\nname & age & height \\\\\n\\midrule\n" ++
-            "Raphael & 26 & 181.23 \\\\\nDonatello & 45 & 177.65 \\\\\n\\bottomrule\n\\end{tabular}\n\\end{table}\n",
+            "Raphael & 26 & 181.230000 \\\\\nDonatello & 45 & 177.650000 \\\\\n\\bottomrule\n\\end{tabular}\n\\end{table}\n",
         try df.toLatex(a, f, .{ .caption = "People", .label = "tab:p" }),
     );
     try testing.expectEqualStrings(
-        "\\begin{tabular}{lrr}\n\\toprule\nRaphael & 26 & 181.23 \\\\\nDonatello & 45 & 177.65 \\\\\n\\bottomrule\n\\end{tabular}\n",
+        "\\begin{tabular}{lrr}\n\\toprule\n\\midrule\nRaphael & 26 & 181.230000 \\\\\nDonatello & 45 & 177.650000 \\\\\n\\bottomrule\n\\end{tabular}\n",
         try df.toLatex(a, f, .{ .header = false }),
     );
 }
@@ -174,7 +174,7 @@ test "toLatex: escape, na_rep, empty frames, hostile text" {
     try testing.expect(std.mem.indexOf(u8, raw, "a&b%c$d#e_f{g}h~i^j\\k") != null);
     const esc = try df.toLatex(a, f, .{ .escape = true, .null_text = "--" });
     try testing.expect(std.mem.indexOf(u8, esc, "x\\_y \\& \xff \\\\\n") != null);
-    try testing.expect(std.mem.indexOf(u8, esc, "a\\&b\\%c\\$d\\#e\\_f\\{g\\}h\\textasciitilde{}i\\textasciicircum{}j\\textbackslash{}k \\\\\n") != null);
+    try testing.expect(std.mem.indexOf(u8, esc, "a\\&b\\%c\\$d\\#e\\_f\\{g\\}h\\textasciitilde i\\textasciicircum j\\textbackslash k \\\\\n") != null);
     try testing.expect(std.mem.indexOf(u8, esc, "\n-- \\\\\n") != null);
     // no rows, no columns
     const empty: Frame = .{ .columns = cols, .data = data, .len = 0 };

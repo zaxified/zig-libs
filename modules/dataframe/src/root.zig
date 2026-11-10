@@ -652,6 +652,7 @@ test {
     _ = @import("parity_test.zig");
     _ = @import("time_ops_test.zig");
     _ = @import("parity_c_test.zig");
+    _ = @import("s2par_oracle_test.zig");
     _ = @import("nested_test.zig");
     _ = @import("regex_test.zig");
     _ = @import("tz_test.zig");
