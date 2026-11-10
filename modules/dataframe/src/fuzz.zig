@@ -720,7 +720,7 @@ fn pickStructCol(src: anytype, f: Frame) []const u8 {
 }
 
 fn genExprS2(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Expr) Allocator.Error!df.Expr {
-    return switch (below(src, 42)) {
+    return switch (below(src, 44)) {
         0 => .{ .round_sig_figs = .{ .x = x, .digits = pickOf(src, u32, &.{ 0, 1, 3, 15, 17, 400, std.math.maxInt(u32) }) } },
         1 => .{ .is_close = .{
             .l = x,
@@ -830,6 +830,15 @@ fn genExprS2(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Ex
             for (fs) |*nf| nf.* = .{ .name = pickOf(src, []const u8, &record_names_ext), .x = (try subExpr(src, a, f, depth, x)).* };
             break :blk .{ .struct_fields = .{ .x = xc, .fields = fs, .keep = chance(src, 50) } };
         },
+        // Wave W10: regex `find` (literal or not) and a record's JSON text (`x` any kind: a
+        // non-struct cell takes the error path, a struct column the schema path).
+        42 => .{ .find_regex = .{ .x = x, .pattern = pickOf(src, []const u8, &regex_pool), .literal = chance(src, 25) } },
+        43 => .{ .json_encode = .{ .x = if (chance(src, 50)) blk: {
+            const xc = try a.create(df.Expr);
+            xc.* = .{ .col = pickStructCol(src, f) };
+            expr_emitted[@backingInt(std.meta.activeTag(xc.*))] += 1;
+            break :blk xc;
+        } else x } },
         else => .{ .strftime = .{ .x = x, .format = pickOf(src, []const u8, &.{ "%Y-%m-%dT%H:%M:%S%.f", "%j %U %w", "%e %p %I", "%s %%", "%G-%V" }) } },
     };
 }

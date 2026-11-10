@@ -955,6 +955,10 @@ pub fn wideToLong(a: std.mem.Allocator, f: Frame, spec: WideToLongSpec) WideToLo
     const hits = try a.alloc(std.ArrayList(Hit), spec.stubnames.len);
     for (hits) |*h| h.* = .empty;
     var suffixes: std.ArrayList([]const u8) = .empty;
+    // Suffix -> its index in `suffixes` (a hash, not a scan: many suffix columns made this
+    // quadratic, review W10R-2).
+    var suffix_at: std.StringHashMapUnmanaged(usize) = .empty;
+    defer suffix_at.deinit(a);
     var is_value = try a.alloc(bool, f.columns.len);
     @memset(is_value, false);
     for (spec.stubnames, 0..) |stub, si| {
@@ -971,13 +975,20 @@ pub fn wideToLong(a: std.mem.Allocator, f: Frame, spec: WideToLongSpec) WideToLo
         var m = try regex.Matcher.init(a, re);
         defer m.deinit();
         for (f.columns, 0..) |c, ci| {
+            // The caller's `suffix` goes into the pattern as it is (pandas pastes it the same
+            // way), so an alternation in it can match a name that does not start with the
+            // prefix: such a name is no stub column (review W10R-1: it was sliced past its end).
+            if (!std.mem.startsWith(u8, c.name, prefix.items)) continue;
             if (m.find(c.name, 0) == null) continue;
             for (iidx) |ii| if (ii == ci) return error.BadPattern;
-            try hits[si].append(a, .{ .ci = ci, .suffix = c.name[prefix.items.len..] });
+            const rest = c.name[prefix.items.len..];
+            try hits[si].append(a, .{ .ci = ci, .suffix = rest });
             is_value[ci] = true;
-            var seen = false;
-            for (suffixes.items) |x| seen = seen or std.mem.eql(u8, x, c.name[prefix.items.len..]);
-            if (!seen) try suffixes.append(a, c.name[prefix.items.len..]);
+            const g = try suffix_at.getOrPut(a, rest);
+            if (!g.found_existing) {
+                g.value_ptr.* = suffixes.items.len;
+                try suffixes.append(a, rest);
+            }
         }
         if (hits[si].items.len == 0) return error.NoSuchColumn;
     }
@@ -1068,17 +1079,22 @@ pub fn wideToLong(a: std.mem.Allocator, f: Frame, spec: WideToLongSpec) WideToLo
         cols[at] = f.columns[first];
         if (promote) cols[at].type = .float;
         cols[at].name = stub;
+        // The stub's column for each suffix (the first of a repeated name), once per stub
+        // rather than a scan of its columns per cell (review W10R-2).
+        const col_of = try a.alloc(?usize, nj);
+        @memset(col_of, null);
+        for (hits[si].items) |h| {
+            const j = suffix_at.get(h.suffix).?; // every hit's suffix was put in above
+            if (col_of[j] == null) col_of[j] = h.ci;
+        }
         const cells = try a.alloc(Value, total_rows);
         for (cells, src, suf) |*c, ri, j| {
             c.* = .null;
-            for (hits[si].items) |h| {
-                if (std.mem.eql(u8, h.suffix, suffixes.items[j])) {
-                    c.* = f.columnAt(h.ci).get(ri);
-                    if (promote and c.* == .int) {
-                        const as_float: f64 = @floatFromInt(c.int);
-                        c.* = .{ .float = as_float };
-                    }
-                    break;
+            if (col_of[j]) |ci| {
+                c.* = f.columnAt(ci).get(ri);
+                if (promote and c.* == .int) {
+                    const as_float: f64 = @floatFromInt(c.int);
+                    c.* = .{ .float = as_float };
                 }
             }
         }

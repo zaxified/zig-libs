@@ -72,3 +72,18 @@ test "CSV of a zoned column keeps the seconds of an offset (textio g)" {
     try df.writeJson(&j.writer, f, .records);
     try testing.expect(std.mem.find(u8, j.written(), "-00:44") != null);
 }
+
+test "wideToLong: a suffix pattern with an alternation does not slice a short name past its end (review W10R-1)" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `q` is shorter than the prefix `A_` and comes before the `i` column: the injected
+    // `(?:.)\z` alternative matches it.
+    const f = try st.mk(a, &.{ .{ .name = "q", .type = .int }, .{ .name = "A_1", .type = .int }, .{ .name = "id", .type = .int } }, &.{
+        &.{ i(7), i(10), i(1) }, &.{ i(8), i(20), i(2) },
+    });
+    const g = try df.wideToLong(a, f, .{ .stubnames = &.{"A_"}, .i = &.{"id"}, .j = "year", .suffix = "x)|(?:." });
+    try testing.expectEqual(@as(usize, 2), g.len);
+    try st.expectCol(g, "A_", &.{ i(10), i(20) });
+    try st.expectCol(g, "q", &.{ i(7), i(8) });
+}
