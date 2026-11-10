@@ -882,3 +882,20 @@ test "W11B values: sort and distinct order and group width keys by their exact v
     try testing.expectEqual(@as(usize, 2), j.len);
     try has(j, "k", .uint64);
 }
+
+test "W11B io: thousands and decimal marks read into a width column as into an Int64 or Float64" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ts = [_]df.TypeOverride{ .{ .name = "i", .type = .int32 }, .{ .name = "u", .type = .uint64 }, .{ .name = "f", .type = .float32 } };
+    const f = try df.readCsv(a, "i;u;f\n1.234;18.446.744.073.709.551.615;1,5\n-7;0;0,1\n", .{ .delimiter = ';', .thousands = '.', .decimal = ',', .types = &ts });
+    try testing.expect(fm.widthsConform(f));
+    try testing.expectEqual(@as(i64, 1234), f.cell(0, "i").?.int);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), f.cell(0, "u").?.uint);
+    try testing.expectEqual(@as(f64, 1.5), f.cell(0, "f").?.float);
+    try testing.expectEqual(@as(f64, @as(f32, 0.1)), f.cell(1, "f").?.float);
+    // The same document read as Int64 and Float64 gives the same numbers.
+    const g = try df.readCsv(a, "i;f\n1.234;1,5\n", .{ .delimiter = ';', .thousands = '.', .decimal = ',', .types = &.{ .{ .name = "i", .type = .int }, .{ .name = "f", .type = .float } } });
+    try testing.expectEqual(@as(i64, 1234), g.cell(0, "i").?.int);
+    try testing.expectEqual(@as(f64, 1.5), g.cell(0, "f").?.float);
+}
