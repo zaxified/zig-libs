@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-10** — **CHANGED**: a column declared as dataframe's new fixed-size `.array` is refused with `error.UnsupportedColumnType`, as `.list` and `.struct` are (the conversion switch would otherwise reach `unreachable`).
 - **2026-11-10** — **ADDED**: a `.binary` column (dataframe's new Binary) reads a JSON string as base64, the form dataframe's writers emit (`dataframe.parseBinary`); anything else null.
 - **2026-11-10** — **ADDED**: a `.time` column (dataframe's new time of day) reads `"HH:MM:SS"` text or microseconds since midnight by `Value.cast(.time)`, as `.timestamp`/`.duration` read theirs; outside one day null.
 - **2026-11-10** — **ADDED** (follows dataframe wave W11): a column declared with one of dataframe's width types (`int8` … `uint64`, `float32`) reads the JSON number into that width, range-checked by `Value.cast` (out of range: null, as for an Int64 that does not fit); a UInt64 above `maxInt(i64)` (a number string to `std.json`) is read exactly.

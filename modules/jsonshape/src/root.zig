@@ -176,7 +176,7 @@ pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) ShapeErro
     // After the charge: it saturates on a column count that is a lie, and the list is
     // not read before it.
     for (spec.columns) |jc| {
-        if (jc.type == .list or jc.type == .@"struct") return error.UnsupportedColumnType;
+        if (jc.type == .list or jc.type == .array or jc.type == .@"struct") return error.UnsupportedColumnType;
     }
     const cols = try a.alloc(Column, spec.columns.len);
     const keys = try a.alloc(KeyRef, spec.columns.len);
@@ -1504,7 +1504,7 @@ fn jsonToValue(a: std.mem.Allocator, work: *Work, jv: std.json.Value, want: Colu
         else => {},
     }
     return switch (want) {
-        .list, .@"struct" => unreachable, // refused by `shape` before any cell is read
+        .list, .array, .@"struct" => unreachable, // refused by `shape` before any cell is read
         .int => .{ .int = jsonToInt(jv) orelse return .null },
         .float => .{ .float = jsonToFloat(jv) orelse return .null },
         // dataframe's width types (W11): the integer (a UInt64 above maxInt(i64) arrives as a
@@ -2726,7 +2726,7 @@ test "shape: a categorical column is stored encoded, a duration parses, list and
     try std.testing.expectEqual(@as(i64, 1_000_000), f.columnAt(1).get(0).int); // PT1S, in microseconds
     try std.testing.expectEqual(@as(i64, 5), f.columnAt(1).get(1).int); // a number is already in the unit
     try std.testing.expect(f.columnAt(1).get(2) == .null);
-    for ([_]ColumnType{ .list, .@"struct" }) |t| {
+    for ([_]ColumnType{ .list, .array, .@"struct" }) |t| {
         try std.testing.expectError(error.UnsupportedColumnType, shape(a, "[]", .{ .columns = &.{.{ .name = "n", .key = "n", .type = t }} }));
     }
 }
