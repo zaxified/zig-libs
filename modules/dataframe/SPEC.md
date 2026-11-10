@@ -1018,8 +1018,10 @@ window, pandas' `pairwise=True` (a matrix per window).
 
 **Not built, each with its reason (survey rows, by number; re-checked against the code 2026-11-10):** index
 alignment of frame arithmetic (19: there is no index, so frames align by position, the refused index family);
-the SciPy `interpolate` methods (`cubic`, `spline`, `pchip`, `akima`, …) (51: pandas hands them to SciPy, an
-optional dependency outside pandas, and polars offers `linear` and `nearest` only, both built here); `set_sorted` (62) and `cast_time_unit` (99) are refused with their reasons in § What this module
+SciPy's `spline`, `polynomial`, `krogh`, `barycentric` and `from_derivatives` interpolation (51: pandas hands
+them to SciPy's FITPACK smoothing splines and polynomial interpolators, an optional dependency outside pandas;
+polars offers `linear` and `nearest` only; `quadratic`, `cubic`, `pchip` and `akima` — the ones a pandas user
+reaches for — were built 2026-11-10); `set_sorted` (62) and `cast_time_unit` (99) are refused with their reasons in § What this module
 is, and what it is not; `extract_many`/`find_many` (96) and `json_decode` (97) were built 2026-11-10. Built since
 this list was written: `fold` (31: `Expr.fold`, `foldColumns`), the pivot index family (53: `pivotKeys`,
 `pivotMany`, `margins`), `align_frames` (68; pandas' index `align` goes with the index), `repeat_by` into list cells
@@ -1203,9 +1205,21 @@ one-column scope whose column is the list's element column and evaluated for eve
 row of the scope is the element's position in the list's storage, so nothing is copied before the body runs). The
 body's intermediates live in an arena that goes with the cell and is returned to the evaluator's budget, so a list of
 n elements costs n bodies against `max_eval_bytes`/`max_eval_work` (R2's bounds) and holds nothing afterwards
-(`s2w6_test.zig` "list_eval is bounded"). **The body is row-wise** — `Expr` has no aggregating arm, so polars'
-`pl.element().sum()`/`.rank()`/`.cum_sum()` inside `eval` are not here; `list.agg(pl.element().sum())` is a `list`
-reduction (`ListOp.sum`, `mean`, `min`, ...) of the `list_eval` (oracle case `list-agg_sum`). `.col` inside a body is
+(`s2w6_test.zig` "list_eval is bounded"). **Inside a body, `Expr.element_op` (2026-11-10) runs over the
+elements of the list in hand** (polars `pl.element().sum()`, `.rank()`, `.cum_sum()` inside `eval`): its operand is
+evaluated for every element of that list, then the operation once over those values — aggregations (`sum`, `mean`,
+`median`, `min`, `max`, `count`, `len`, `n_unique`, `first`, `last`, `std`/`var` with `ddof`, `quantile`,
+`arg_min`/`arg_max`) broadcast to every element, so `element - element.mean()` works; per-element operations
+(`rank`, the cumulative `sum`/`prod`/`min`/`max`/`count`, `diff`, `shift`, `reverse`, `sort`) give one value per
+element; `unique` changes the length and is accepted only as the whole body (polars raises a ShapeError when it meets
+another length). A body made only of aggregates gives a one-element list, for an empty list too (polars: sum `[0]`,
+mean `[null]`); in `list_filter` a scalar predicate keeps all or none. Each node's result is computed once per list,
+in the list's arena, under the same budget; outside an element scope the arm is `error.BadExpr`. The kernels are the
+`list` and window ones (`window.cellVector`, `core.quantileInterp`). Kept differences: a NaN is a missing cell, as
+everywhere in this module (polars keeps it, so its sum is NaN); `quantile` defaults to `linear` (pandas; polars
+`nearest`); a sum of text is null (polars raises); ranks and counts are Int64 (polars UInt32).
+`list.agg(pl.element().sum())` is still also a `list` reduction (`ListOp.sum`, `mean`, `min`, ...) of the
+`list_eval` (oracle case `list-agg_sum`). `.col` inside a body is
 `error.NoSuchColumn`, `.element` outside one `error.BadExpr`. Frame verbs: `explodeAll` (every list column,
 `LengthMismatch` as `explode`), `flattenList` (pandas `Series.list.flatten`: nulls and empties contribute nothing),
 `structDtypes` (pandas `Series.struct.dtypes`). *Struct*: `struct_op` — `rename_fields` (names by position; a count
@@ -1239,7 +1253,7 @@ rename list of the wrong length) is `error.BadCategories` (pandas `ValueError`).
 sort puts a null first ascending and descending; ours follows `SortSpec.missing` (the vectors use `.first`). **Not done,
 with the reason:** a categorical in `pivot`/`window` order-aware functions (`cummin`, `rank` still read the text), a
 fuzz generator for the categorical dictionary and ordering (the module's random frames hold lexical dictionaries only —
-the `Expr` generator got the new list and struct arms), `list.eval` bodies with aggregates (above), polars'
+the `Expr` generator got the new list and struct arms), polars'
 `list.sample` value stream, a struct `eval` over a nested path (`x` must be a plain column).
 
 **Surveyed 2026-11-10 (rows 103, 108):** polars' `Expr` method list, the `arr`, `bin` and `ext`
@@ -1309,3 +1323,23 @@ the reason).
   form; polars refuses binary in CSV and cannot write it to JSON), read back with `types`; bad base64
   is `error.BadValue`. `jsonshape` reads a `.binary` column the same way. Kept difference: `bin.get`
   past the end is null as `list.get` (polars raises unless `null_on_oob`).
+- *Fixed-size Array* (`ColumnType.array`, polars `Array(inner, n)`; owner's decision 2026-11-10): a list
+  column with a declared width — cells `Value.list`, storage `ColumnData.list`, `Column.inner[0]` the
+  element column, `Column.array_width` the length of every valid row (0 allowed; `frame.arraysConform`
+  states the invariant). A verb that carries the column keeps its width; one that stores a value of the
+  caller or of another column into it conforms the storage (`frame.conformColumn`: a cell that is no list
+  of that length is null). `cast` list to array checks the width per row (null, or `CastFailed` with
+  `.fail`; polars raises even with `strict=False`), another array width is `error.BadExpr`, array to list
+  drops the width. `Expr.arr` is polars' `arr` namespace over the `list` functions (`reverse`/`sort`/
+  `shift` keep the width, `unique` gives a list), `arr_to_struct` (`field_0`…), `arr_dot`/`list_dot`
+  (overflow null where polars wraps) and `concat_arr` (mixed element kinds coerced, as `concat_list`;
+  polars refuses). The expression schema carries the width, so an array-valued `mutate` is typed
+  `.array`. JSON writes an array and `readJson` reads one with `types` (width checked; polars cannot
+  read it), CSV writes its JSON text, the display is polars' `array[i64, 3]`.
+- *`interpolate` `quadratic`, `cubic`, `pchip`, `akima`* (pandas 3.1 over SciPy 1.18.1, 188 probed cases
+  at 1e-12 relative): `quadratic`/`cubic` are SciPy `interp1d`'s splines (no value outside the first and
+  last present x), `pchip` the Fritsch–Carlson monotone cubic (extrapolates with the end polynomial where
+  `limit_direction` allows), `akima` Akima's (no extrapolation); too few points, a repeated or (pchip,
+  akima) unsorted x and a non-finite y for pchip/akima are `error.BadArgument`, as pandas raises.
+- *`toLatex` options*: `column_format`, `longtable` (pandas' `\endfirsthead`/`\endhead`/`\endfoot`/
+  `\endlastfoot` layout) and `position`, exactly as pandas 3.1 writes them (80 probed texts).

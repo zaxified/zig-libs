@@ -695,3 +695,30 @@ test "binary + binary: an x + x tower is walked in linear time (Z3 regression)" 
         try testing.expect(err == error.TooLarge or err == error.ExprTooLarge or err == error.BadExpr);
     };
 }
+
+test "interpolate slinear, nearest, zero never extrapolate (pandas 3.1, SciPy interp1d)" {
+    // pandas: Series([nan, 1, nan, 3, nan, nan]).interpolate(method=m, limit_direction=d) for
+    // d in forward/backward/both: slinear [nan, 1, 2, 3, nan, nan], nearest and zero
+    // [nan, 1, 1, 3, nan, nan] (probed 2026-11-10); `linear` both: [1, 1, 2, 3, 3, 3].
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const D = @import("root.zig");
+    const cells = [_]D.Value{ .null, .{ .float = 1 }, .null, .{ .float = 3 }, .null, .null };
+    const cols = try a.dupe(D.Column, &.{.{ .name = "y", .type = .float }});
+    const data = try a.dupe(D.ColumnData, &.{try D.columnFromCells(a, &cells)});
+    const f: D.Frame = .{ .columns = cols, .data = data, .len = cells.len };
+    const Want = struct { m: @FieldType(D.InterpolateSpec, "method"), mid: f64 };
+    for ([_]Want{ .{ .m = .slinear, .mid = 2 }, .{ .m = .nearest, .mid = 1 }, .{ .m = .zero, .mid = 1 } }) |w| {
+        for ([_]@typeInfo(@FieldType(D.InterpolateSpec, "limit_direction")).optional.child{ .forward, .backward, .both }) |d| {
+            const g = try D.interpolate(a, f, .{ .col = "y", .method = w.m, .limit_direction = d });
+            try std.testing.expect(g.cell(0, "y").? == .null);
+            try std.testing.expectEqual(w.mid, g.cell(2, "y").?.float);
+            try std.testing.expect(g.cell(4, "y").? == .null);
+            try std.testing.expect(g.cell(5, "y").? == .null);
+        }
+    }
+    const l = try D.interpolate(a, f, .{ .col = "y", .limit_direction = .both });
+    try std.testing.expectEqual(@as(f64, 1), l.cell(0, "y").?.float);
+    try std.testing.expectEqual(@as(f64, 3), l.cell(5, "y").?.float);
+}

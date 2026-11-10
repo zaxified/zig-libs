@@ -298,3 +298,17 @@ test "element operations: empty, all-null and many-row frames do not panic" {
         try testing.expect(r[0] == .list);
     }
 }
+
+test "binIntervals count over a declared column holding a non-numeric cell: an error, not a panic (fuzz driver 2026-11-10)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const D = @import("root.zig");
+    const cells = [_]D.Value{ .{ .text = "x" }, .{ .float = 1 }, .{ .float = 3 } };
+    for ([_]D.ColumnType{ .float, .int }) |ty| {
+        const cols = try a.dupe(D.Column, &.{.{ .name = "v", .type = ty }});
+        const data = try a.dupe(D.ColumnData, &.{try D.columnFromCells(a, &cells)});
+        const f: D.Frame = .{ .columns = cols, .data = data, .len = cells.len };
+        if (D.binIntervals(a, f, .{ .col = "v", .out = "b", .breaks = .{ .count = 3 } })) |_| {} else |e| try std.testing.expect(e == error.NotOrderable or e == error.BadEdges);
+    }
+}

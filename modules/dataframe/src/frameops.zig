@@ -479,7 +479,11 @@ pub fn interpolate(a: std.mem.Allocator, f: Frame, spec: InterpolateSpec) Error!
             continue;
         }
         if (!in_range) {
-            // Beyond the known points: repeat the nearest one.
+            // Beyond the known points: `linear` repeats the nearest one (pandas' numpy
+            // `interp`); `slinear`, `nearest` and `zero` are SciPy's `interp1d`, which does not
+            // extrapolate, so pandas leaves NaN there whatever `limit_direction` says (probed
+            // 2026-11-10: [nan, 1, nan, 3, nan] slinear "both" -> [nan, 1, 2, 3, nan]).
+            if (spec.method != .linear) continue;
             o.* = .{ .float = if (x < p[0].x) p[0].y else p[p.len - 1].y };
             continue;
         }

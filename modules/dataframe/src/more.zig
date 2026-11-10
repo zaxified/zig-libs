@@ -1682,9 +1682,12 @@ fn binIntervalsImpl(a: std.mem.Allocator, f: Frame, spec: BinIntervalsSpec) BinE
                 if (Value.order(v, mx) == .gt) mx = v;
             }
             for (out, 1..) |*o, i| {
-                if (ty == .float) {
-                    const lo = mn.asFloat().?; // a float column's cell
-                    const hi = mx.asFloat().?;
+                // A float column, or an int-declared one whose storage holds another kind (a
+                // hand-built or mixed column: fuzz, 2026-11-10, `mn.asFloat().?` panicked on a
+                // non-numeric cell): the float edges, or `error.NotOrderable`.
+                if (dtype.isFloat(ty) or mn != .int or mx != .int) {
+                    const lo = mn.asFloat() orelse return error.NotOrderable;
+                    const hi = mx.asFloat() orelse return error.NotOrderable;
                     o.* = .{ .float = lo + (hi - lo) * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n)) };
                 } else {
                     // (min * (n - i) + max * i) / n in exact arithmetic, rounded as the bin side asks.
