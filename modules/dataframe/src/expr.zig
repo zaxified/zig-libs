@@ -739,6 +739,13 @@ const Inst = union(enum) {
     lit: Value,
     unary: Unary,
     binary: Binary,
+    /// `binary` on a width-typed node (W11): the node's `ty` is known from the schema, so the
+    /// result is that type (`evalBinaryW`).
+    binary_w: struct { op: Binary, ty: ColumnType },
+    /// `unary` on an operand of the width type `ty` (`evalUnaryW`).
+    unary_w: struct { op: Unary, ty: ColumnType },
+    /// The cell in the width type `ty` (an integer out of range is null, a Float32 rounds to f32).
+    fit: ColumnType,
     is_in: []const u8, // index into Program.sets, as a pointer-sized handle (below)
     if_else,
     coalesce: u32,
@@ -993,7 +1000,16 @@ const Compiler = struct {
         if (try c.orderedCompare(op, l, r, depth)) return;
         try c.go(l, depth + 1);
         try c.go(r, depth + 1);
+        if (widthBinaryType(c.f, op, l, r)) |ty| return c.push(.{ .binary_w = .{ .op = op, .ty = ty } }, 2);
         try c.push(.{ .binary = op }, 2);
+    }
+
+    /// A `fit` to the width type of `e`, when the schema says `e` is one (its cells may be of
+    /// another width: the branches of an `if_else`, a literal with a Float32).
+    fn fitWidth(c: *Compiler, e: *const Expr) Error!void {
+        const t = numType(c.f, e) orelse return;
+        // A Float64 meeting of a width (an Int64 with a UInt64 branch) turns the integers float.
+        if (dtype.isWidth(t) or (t == .float and widthBranch(c.f, e))) try c.push(.{ .fit = t }, 1);
     }
 
     fn go(c: *Compiler, e: *const Expr, depth: usize) Error!void {
@@ -1004,7 +1020,14 @@ const Compiler = struct {
             .col => |name| try c.push(.{ .col = c.f.columnIndex(name) orelse return error.NoSuchColumn }, 0),
             .lit => |v| try c.push(.{ .lit = v }, 0),
             .unary => |u| {
+                const in = numType(c.f, u.x);
+                // polars refuses to negate an unsigned column (a literal is a weak value).
+                if (u.op == .neg and u.x.* != .lit) if (in) |t| if (dtype.isUnsigned(t)) return error.BadExpr;
                 try c.go(u.x, depth + 1);
+                if (in) |t| if (dtype.isWidth(t)) {
+                    try c.push(.{ .unary_w = .{ .op = u.op, .ty = t } }, 1);
+                    return;
+                };
                 try c.push(.{ .unary = u.op }, 1);
             },
             .binary => |b| {
@@ -1021,12 +1044,14 @@ const Compiler = struct {
                 try c.go(f.then, depth + 1);
                 try c.go(f.otherwise, depth + 1);
                 try c.push(.if_else, 3);
+                try c.fitWidth(e);
             },
             .coalesce => |xs| {
                 if (xs.len == 0) return error.BadExpr;
                 if (xs.len > max_nodes) return error.ExprTooLarge;
                 for (xs) |*x| try c.go(x, depth + 1);
                 try c.push(.{ .coalesce = @intCast(xs.len) }, xs.len);
+                try c.fitWidth(e);
             },
             .cast => |k| {
                 if (k.zone) |zn| if (k.to != .timestamp or tz.find(zn) == null) return error.BadExpr;
@@ -1041,6 +1066,7 @@ const Compiler = struct {
             .round => |r| {
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .round = .{ .decimals = r.decimals, .mode = r.mode } }, 1);
+                try c.fitWidth(e);
             },
             .round_sig_figs => |r| {
                 if (r.digits == 0) return error.BadExpr;
@@ -1673,7 +1699,7 @@ fn evalUnary(a: std.mem.Allocator, op: Unary, v: Value) Error!Value {
         .is_nan, .is_not_nan, .is_finite, .is_infinite => {
             const x: f64 = switch (v) {
                 .float => |f| f,
-                .int, .decimal => 0,
+                .int, .uint, .decimal => 0,
                 else => return .null,
             };
             return .{ .bool = switch (op) {
@@ -2112,6 +2138,12 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
                 stack[sp - 2] = try evalBinary(a, op, stack[sp - 2], stack[sp - 1]);
                 sp -= 1;
             },
+            .binary_w => |b| {
+                stack[sp - 2] = try evalBinaryW(a, b.op, b.ty, stack[sp - 2], stack[sp - 1]);
+                sp -= 1;
+            },
+            .unary_w => |u| stack[sp - 1] = try evalUnaryW(a, u.op, u.ty, stack[sp - 1]),
+            .fit => |t| stack[sp - 1] = fitCell(stack[sp - 1], t),
             .is_in => |set| {
                 const v = stack[sp - 1];
                 if (keys.isMissing(v)) {
@@ -2630,6 +2662,299 @@ fn temporalOf(t: ColumnType) ?ColumnType {
     };
 }
 
+// ── numeric widths (wave W11) ───────────────────────────────────────────────
+
+/// An operand's static type, and its value when it is a literal (a weak operand: it adopts
+/// the other side's type when it fits, polars' rule).
+const NumOpd = struct { ty: ColumnType, lit: ?Value = null };
+
+/// The smallest signed integer type that holds `x` (UInt64 above `maxInt(i64)`): a literal's
+/// own type, polars `lit(5)` being Int8.
+fn litIntType(x: i128) ColumnType {
+    if (dtype.fits(x, .int8)) return .int8;
+    if (dtype.fits(x, .int16)) return .int16;
+    if (dtype.fits(x, .int32)) return .int32;
+    if (dtype.fits(x, .int)) return .int;
+    return .uint64;
+}
+
+/// The smallest unsigned integer type that holds the non-negative `x`.
+fn litUintType(x: i128) ColumnType {
+    if (dtype.fits(x, .uint8)) return .uint8;
+    if (dtype.fits(x, .uint16)) return .uint16;
+    if (dtype.fits(x, .uint32)) return .uint32;
+    return .uint64;
+}
+
+fn numOperand(f: Frame, e: *const Expr, steps: *usize) ?NumOpd {
+    switch (e.*) {
+        .lit => |v| return switch (v) {
+            .int => |i| .{ .ty = litIntType(i), .lit = v },
+            .uint => .{ .ty = .uint64, .lit = v },
+            .float => .{ .ty = .float, .lit = v },
+            else => null,
+        },
+        else => return if (numTypeB(f, e, steps)) |t| .{ .ty = t } else null,
+    }
+}
+
+/// The type a literal takes beside a column of type `col` (polars' weak literal): the
+/// column's type when the literal fits it, else the supertype of the column's and the
+/// literal's own (an unsigned column with a non-negative literal: the smallest unsigned type
+/// that holds it). A float literal beside a Float32 stays Float32, beside an integer is Float64.
+fn weakJoin(col: ColumnType, lit: NumOpd) ?ColumnType {
+    const v = lit.lit orelse return dtype.supertype(col, lit.ty);
+    if (lit.ty == .float) return if (col == .float32) .float32 else .float;
+    if (dtype.isFloat(col)) return col;
+    const x = dtype.exactI128(v) orelse return null;
+    if (dtype.fits(x, col)) return col;
+    if (dtype.isUnsigned(col) and x >= 0) return dtype.supertype(col, litUintType(x));
+    return dtype.supertype(col, lit.ty);
+}
+
+/// The type two operands meet in; null when either is unknown or both are literals (a
+/// literal beside a literal keeps the module's Int64 / Float64).
+fn joinOperands(l: NumOpd, r: NumOpd) ?ColumnType {
+    if (l.lit != null and r.lit != null) return null;
+    if (l.lit != null) return weakJoin(r.ty, l);
+    if (r.lit != null) return weakJoin(l.ty, r);
+    return dtype.supertype(l.ty, r.ty);
+}
+
+/// `joinOperands` over every branch of an `if_else` / `coalesce`: the supertype of the
+/// non-literal ones first, then each literal weakly.
+fn joinAll(f: Frame, xs: []const *const Expr, steps: *usize) ?ColumnType {
+    if (xs.len > 64) return null;
+    var opds: [64]NumOpd = undefined;
+    for (xs, 0..) |x, k| opds[k] = numOperand(f, x, steps) orelse return null;
+    var acc: ?ColumnType = null;
+    for (opds[0..xs.len]) |o| {
+        if (o.lit != null) continue;
+        acc = if (acc) |t| dtype.supertype(t, o.ty) orelse return null else o.ty;
+    }
+    var t = acc orelse return null;
+    for (opds[0..xs.len]) |o| {
+        if (o.lit == null) continue;
+        t = weakJoin(t, o) orelse return null;
+    }
+    return t;
+}
+
+/// Whether a branch of the `if_else` / `coalesce` `e` is of a width type (or a UInt64 literal).
+fn widthBranch(f: Frame, e: *const Expr) bool {
+    var steps: usize = 0;
+    switch (e.*) {
+        .if_else => |c| {
+            for ([_]*const Expr{ c.then, c.otherwise }) |x| if (numOperand(f, x, &steps)) |o| if (dtype.isWidth(o.ty)) return true;
+        },
+        .coalesce => |xs| {
+            for (xs) |*x| if (numOperand(f, x, &steps)) |o| if (dtype.isWidth(o.ty)) return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
+fn arithOp(op: Binary) bool {
+    return switch (op) {
+        .add, .sub, .mul, .div, .floordiv, .truncdiv, .mod, .pow, .min, .max, .bit_and, .bit_or, .bit_xor => true,
+        else => false,
+    };
+}
+
+/// The numeric type of `e` the schema promises, or null when it is unknown (a text, a
+/// nested or a time value, an operator whose type the cells decide). polars' rules: a binary
+/// arithmetic node is the supertype of its operands (`dtype.supertype`; an integer literal
+/// weak, see `weakJoin`), `/` is Float64 (Float32 beside Float32 and the narrow integers),
+/// `neg`, `abs`, `sign` keep the operand's width, a math function of a Float32 is Float32,
+/// `if_else` and `coalesce` the supertype of their branches, `cast` its target.
+fn numType(f: Frame, e: *const Expr) ?ColumnType {
+    var steps: usize = 0;
+    return numTypeB(f, e, &steps);
+}
+
+/// Most nodes one `numType` walks: an expression whose subexpressions are shared by several
+/// parents is a DAG that walks as a tree of 2^depth nodes (the compiler's own budget counts
+/// every visit for the same reason); past this the type is unknown and the cells decide.
+const max_type_steps: usize = 4096;
+
+fn numTypeB(f: Frame, e: *const Expr, steps: *usize) ?ColumnType {
+    steps.* += 1;
+    if (steps.* > max_type_steps) return null;
+    switch (e.*) {
+        .col => |name| {
+            const t = f.columnType(name) orelse return null;
+            return if (dtype.isNumeric(t)) t else null;
+        },
+        .lit => |v| return switch (v) {
+            .int => .int,
+            .uint => .uint64,
+            .float => .float,
+            else => null,
+        },
+        .cast => |c| return if (dtype.isNumeric(c.to)) c.to else null,
+        .unary => |u| {
+            const t = numTypeB(f, u.x, steps) orelse return null;
+            return switch (u.op) {
+                .neg, .abs => t,
+                .sign, .floor, .ceil, .round => if (dtype.isFloat(t) or dtype.isWidth(t)) t else null,
+                .bit_not => if (dtype.isInteger(t)) t else null,
+                .sqrt, .exp, .log, .log10, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .sinh, .cosh, .tanh, .asinh, .acosh, .atanh, .cbrt, .log1p, .expm1, .log2, .erf, .erfc, .degrees, .radians => if (t == .float32) .float32 else .float,
+                else => null,
+            };
+        },
+        .binary => |b| {
+            if (!arithOp(b.op)) return null;
+            const l = numOperand(f, b.l, steps) orelse return null;
+            const r = numOperand(f, b.r, steps) orelse return null;
+            const t = joinOperands(l, r) orelse return null;
+            return switch (b.op) {
+                // polars: `f32 / f32` and `f32 / (an integer of 16 bits or less)` are Float32, an
+                // integer divided by a Float32, or by a wider integer, Float64; a literal is weak.
+                .div => if (l.lit != null or r.lit != null)
+                    (if (dtype.isFloat(t)) t else .float)
+                else if (l.ty == .float32 and (r.ty == .float32 or (dtype.isInteger(r.ty) and dtype.bits(r.ty) <= 16))) .float32 else .float,
+                .bit_and, .bit_or, .bit_xor => if (dtype.isInteger(t)) t else null,
+                else => t,
+            };
+        },
+        .if_else => |c| return joinAll(f, &.{ c.then, c.otherwise }, steps),
+        .coalesce => |xs| {
+            if (xs.len == 0 or xs.len > 64) return null;
+            var ptrs: [64]*const Expr = undefined;
+            for (xs, 0..) |*x, i| ptrs[i] = x;
+            return joinAll(f, ptrs[0..xs.len], steps);
+        },
+        .round => |r| {
+            const t = numTypeB(f, r.x, steps) orelse return null;
+            return if (dtype.isWidth(t)) t else null;
+        },
+        else => return null,
+    }
+}
+
+/// The width type `a op b` is, when it is one (`dtype.isWidth`) and `op` is arithmetic;
+/// the compiler then emits `binary_w`. Int64 and Float64 results keep the plain operator.
+fn widthBinaryType(f: Frame, op: Binary, l: *const Expr, r: *const Expr) ?ColumnType {
+    if (!arithOp(op)) return null;
+    const node: Expr = .{ .binary = .{ .op = op, .l = l, .r = r } };
+    const t = numType(f, &node) orelse return null;
+    return if (dtype.isWidth(t)) t else null;
+}
+
+/// `x ** y` in an `i128`, null past it (or a negative exponent, which has no integer result).
+fn powInt(x: i128, y: i128) ?i128 {
+    if (y < 0) return null;
+    if (x == 0) return if (y == 0) 1 else 0;
+    if (x == 1) return 1;
+    if (x == -1) return if (@mod(y, 2) == 0) 1 else -1;
+    var acc: i128 = 1;
+    var i: i128 = 0;
+    // |x| >= 2: the product leaves an i128 within 127 steps, whatever `y` is.
+    while (i < y) : (i += 1) acc = std.math.mul(i128, acc, x) catch return null;
+    return acc;
+}
+
+/// `l op r` where the node's type `ty` is a width (W11), as polars computes it: integers
+/// in an `i128`, the result then fitted to `ty` (one outside its range is null, where both
+/// engines wrap; `x // 0` and `x % 0` are null as polars'); a Float32 node rounds both
+/// operands and the result to f32 (a literal first, as polars casts it). Other operators
+/// and cells (a text, a missing cell) as `evalBinary`.
+fn evalBinaryW(a: std.mem.Allocator, op: Binary, ty: ColumnType, l: Value, r: Value) Error!Value {
+    if (keys.isMissing(l) or keys.isMissing(r)) return .null;
+    if (dtype.isInteger(ty)) {
+        const x = dtype.exactI128(l) orelse return .null;
+        const y = dtype.exactI128(r) orelse return .null;
+        const res: ?i128 = switch (op) {
+            .add => std.math.add(i128, x, y) catch null,
+            .sub => std.math.sub(i128, x, y) catch null,
+            .mul => std.math.mul(i128, x, y) catch null,
+            .floordiv => if (y == 0) null else @divFloor(x, y),
+            .truncdiv => if (y == 0) null else @divTrunc(x, y),
+            // Python's: the sign of the divisor (as the Int64 path).
+            .mod => if (y == 0) null else x - @divFloor(x, y) * y,
+            .pow => powInt(x, y),
+            .min => @min(x, y),
+            .max => @max(x, y),
+            .bit_and => x & y,
+            .bit_or => x | y,
+            .bit_xor => x ^ y,
+            else => return evalBinary(a, op, l, r),
+        };
+        return dtype.fitInt(res orelse return .null, ty) orelse .null;
+    }
+    const lx = l.asFloat() orelse return .null;
+    const ry = r.asFloat() orelse return .null;
+    const v = try evalBinary(a, op, .{ .float = dtype.roundF32(lx) }, .{ .float = dtype.roundF32(ry) });
+    return if (v == .float) .{ .float = dtype.roundF32(v.float) } else v;
+}
+
+/// The cell in the width type `t`: an integer type keeps a whole number in its range (else
+/// null), Float32 rounds to f32; any other type leaves the cell.
+fn fitCell(v: Value, t: ColumnType) Value {
+    if (keys.isMissing(v)) return .null;
+    if (dtype.isInteger(t)) {
+        const x = dtype.exactI128(v) orelse return .null;
+        return dtype.fitInt(x, t) orelse .null;
+    }
+    if (t == .float32) return if (v.asFloat()) |x| .{ .float = dtype.roundF32(x) } else .null;
+    if (t == .float) return if (v.asFloat()) |x| .{ .float = x } else v;
+    return v;
+}
+
+/// The bits of the integer `x` in the width of `t` (its two's complement, sign-extended
+/// above a narrow signed type, cut to the width).
+fn bitsOf(x: i128, t: ColumnType) u64 {
+    const n = dtype.bits(t);
+    const u: u128 = @bitCast(x);
+    const all: u64 = @truncate(u);
+    return if (n >= 64) all else all & ((@as(u64, 1) << @intCast(n)) - 1);
+}
+
+/// `op v` where `v` is a cell of the width type `ty` (W11): integers keep their type
+/// (`neg`/`abs` out of range: null, where both engines wrap; `sign` is an integer; `floor`,
+/// `ceil`, `round` leave an integer as it is, polars' `round`; the bit counts are those of
+/// the type's own width), a Float32 gives f32 again. Other operators as `evalUnary`.
+fn evalUnaryW(a: std.mem.Allocator, op: Unary, ty: ColumnType, v: Value) Error!Value {
+    if (dtype.isInteger(ty) and !keys.isMissing(v)) {
+        const x = dtype.exactI128(v) orelse return .null;
+        switch (op) {
+            .neg => return dtype.fitInt(-x, ty) orelse .null, // |x| < 2^64: no overflow
+            .abs => return dtype.fitInt(if (x < 0) -x else x, ty) orelse .null,
+            .sign => return .{ .int = if (x > 0) 1 else if (x < 0) -1 else 0 },
+            .floor, .ceil, .round => return v,
+            .bit_not => return dtype.fitInt(if (dtype.isSigned(ty)) ~x else @as(i128, bitsOf(~x, ty)), ty) orelse .null,
+            .count_ones, .count_zeros, .leading_zeros, .trailing_zeros, .leading_ones, .trailing_ones => {
+                const n: u64 = dtype.bits(ty);
+                const p = bitsOf(x, ty);
+                const inv = bitsOf(~x, ty);
+                const k: u64 = switch (op) {
+                    .count_ones => @popCount(p),
+                    .count_zeros => n - @popCount(p),
+                    .leading_zeros => leadingZeros(p, n),
+                    .trailing_zeros => trailingZeros(p, n),
+                    .leading_ones => leadingZeros(inv, n),
+                    else => trailingZeros(inv, n),
+                };
+                return .{ .int = @intCast(k) };
+            },
+            else => {},
+        }
+    }
+    const r = try evalUnary(a, op, v);
+    if (ty == .float32 and r == .float) return .{ .float = dtype.roundF32(r.float) };
+    return r;
+}
+
+/// Zero bits above the highest set one of the `width`-bit pattern `b`.
+fn leadingZeros(b: u64, width: u64) u64 {
+    return if (b == 0) width else @as(u64, @clz(b)) - (64 - width);
+}
+
+fn trailingZeros(b: u64, width: u64) u64 {
+    return if (b == 0) width else @ctz(b);
+}
+
 fn typeOf(v: Value) ColumnType {
     return switch (v) {
         .int => .int,
@@ -2790,6 +3115,14 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
         return .{ .columns = cols, .data = data, .len = f.len };
     }
     var ty: ColumnType = as.type orelse if (any_text) .text else if (any_bool) .bool else if (any_float) .float else if (any_decimal) .decimal else if (any_int) .int else .float;
+    // A width type the schema promises (W11: `i8 + i8` is Int8, `f32 * 2` Float32, a column
+    // carried over keeps its type): the column has it, whatever the cells say.
+    var static_width = false;
+    if (as.type == null and !any_text and !any_bool and !any_decimal) if (numType(f, &as.expr)) |nt| if (dtype.isWidth(nt)) {
+        ty = nt;
+        static_width = true;
+        for (vals) |*c| c.* = fitCell(c.*, nt);
+    };
     // An instant or a length of time kept by the expression (its cells are ints or
     // ISO text like any other): the column says so, as polars' does.
     if (as.type == null) if (temporalType(f, &as.expr)) |t| {
@@ -2807,7 +3140,7 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
             return .{ .columns = cols, .data = data, .len = f.len };
         }
     };
-    if (as.type == null and kinds > 1) {
+    if (as.type == null and kinds > 1 and !static_width) {
         for (vals) |*c| {
             if (keys.isMissing(c.*)) continue;
             const promoted: Value = c.cast(ty) orelse .null;

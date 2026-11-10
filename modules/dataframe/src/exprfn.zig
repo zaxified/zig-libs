@@ -130,6 +130,13 @@ pub fn round(v: Value, decimals: i32, mode: RoundMode) Value {
             const r = roundExact(i, @intCast(@min(-@as(i64, decimals), 39)), mode) orelse return .null;
             return if (std.math.cast(i64, r)) |x| .{ .int = x } else .null;
         },
+        // A UInt64 above `maxInt(i64)` (W11); the result, an `i64` or `u64`, as Int64's.
+        .uint => |u| {
+            if (decimals >= 0) return v;
+            const r = roundExact(u, @intCast(@min(-@as(i64, decimals), 39)), mode) orelse return .null;
+            if (std.math.cast(i64, r)) |x| return .{ .int = x };
+            return if (std.math.cast(u64, r)) |x| .{ .uint = x } else .null;
+        },
         .decimal => |raw| {
             const scale_digits: i64 = 12;
             const k = scale_digits - decimals;
