@@ -488,6 +488,12 @@ pub const Expr = union(enum) {
     extract: struct { x: *const Expr, pattern: []const u8, group: usize = 1 },
     /// polars `str.count_matches(pattern)`, pandas `str.count`: non-overlapping matches.
     count_regex: struct { x: *const Expr, pattern: []const u8 },
+    /// polars `str.find(pattern, literal=False)`: the BYTE offset (polars' unit, not the
+    /// character index Python's `str.find` gives) of the first match, null when there is none
+    /// or the cell is not text. With `literal` the pattern is plain text. pandas has no
+    /// regex `find` returning null (`str.find` is literal and answers -1; use `find` there).
+    /// An invalid pattern is `error.BadPattern` (polars `strict=True`).
+    find_regex: struct { x: *const Expr, pattern: []const u8, literal: bool = false },
     /// polars `str.replace(pattern, value, n=1)` and `str.replace_all` (`all`), pandas
     /// `str.replace(regex=True)`: `with` is a template (`$1`, `${name}`, `$$`) unless
     /// `literal`. `n` (pandas `n=`; zero is `error.BadExpr`) replaces the first `n` matches
@@ -703,6 +709,13 @@ pub const Expr = union(enum) {
     /// polars `struct.rename_fields`, `name.map_fields` / `prefix_fields` / `suffix_fields`
     /// and the field drop; see `listfn.StructOp`. Not a record: null.
     struct_op: struct { x: *const Expr, op: lf.StructOp },
+    /// polars `struct.json_encode()`: the record's JSON text, the `jsonio.writeValue` form
+    /// (also what a cast of a nested cell to text gives, and what the JSON writer writes). When
+    /// `x` is a column reference the column's declared schema is used (an instant inside a
+    /// field stays RFC 3339); otherwise the cell alone decides. A null struct cell gives the
+    /// text `null`, as polars. A cell that is not a record (a column that is not a struct) is
+    /// null (polars: `SchemaError`).
+    json_encode: struct { x: *const Expr },
     /// polars `struct.with_fields(...)` (`keep` true: the record's fields, the named ones
     /// replaced in place and new names appended) and `struct.eval(...)` (`keep` false: a
     /// record of just these fields). Each `fields` entry is evaluated over the record's own
@@ -718,7 +731,7 @@ pub const NormalForm = fnx.NormalForm;
 /// One field of `Expr.struct_of`.
 pub const NamedExpr = struct { name: []const u8, x: Expr };
 
-pub const RegexOp = enum { contains, extract, count, replace, extract_all, split, extract_groups };
+pub const RegexOp = enum { contains, extract, count, find, replace, extract_all, split, extract_groups };
 
 const Inst = union(enum) {
     col: usize,
@@ -747,6 +760,7 @@ const Inst = union(enum) {
     /// `layout` null (the format has `%Z`), its abbreviation, translated per cell.
     strftime_tz: struct { fmt: []const u8, layout: ?[]const u8, zone: *const tz.Zone },
     offset_by: dtf.Duration,
+    offset_by_zoned: struct { d: dtf.Duration, zone: *const tz.Zone },
     truncate: struct { d: dtf.Duration, mode: dtf.RoundTo },
     truncate_zoned: struct { d: dtf.Duration, mode: dtf.RoundTo, zone: *const tz.Zone },
     add_business_days: struct { n: i64, mask: [7]bool, holidays: []const i64, roll: dtf.Roll, plain: bool },
@@ -793,6 +807,7 @@ const Inst = union(enum) {
     list_sample: *lf.Sampler,
     list_map: ListMap,
     struct_op: lf.StructOp,
+    json_encode: ?Column,
     struct_fields: StructFields,
     /// The code of column `n`'s categorical cell as an int (null where the cell is null).
     cat_code: usize,
@@ -1079,6 +1094,11 @@ const Compiler = struct {
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .regex = .{ .op = .count, .m = try c.matcher(r.pattern), .groups = &.{} } }, 1);
             },
+            .find_regex => |r| {
+                const pat = if (r.literal) try regex.quoteMetaAlloc(c.a, r.pattern) else r.pattern;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .regex = .{ .op = .find, .m = try c.matcher(pat), .groups = &.{} } }, 1);
+            },
             .extract => |r| {
                 const m = try c.matcher(r.pattern);
                 const n = m.re.groupCount();
@@ -1147,6 +1167,12 @@ const Compiler = struct {
             .offset_by => |r| {
                 const d = dtf.parseDuration(r.by) orelse return error.BadExpr;
                 try c.go(r.x, depth + 1);
+                // A zoned column moves its calendar units on the wall clock (see `dtfn.offsetByZoned`).
+                if (zoneOf(c.f, r.x)) |zn| {
+                    const z = tz.find(zn) orelse return error.BadExpr;
+                    try c.push(.{ .offset_by_zoned = .{ .d = d, .zone = z } }, 1);
+                    return;
+                }
                 try c.push(.{ .offset_by = d }, 1);
             },
             .truncate => |r| {
@@ -1499,6 +1525,11 @@ const Compiler = struct {
             .element => {
                 if (!c.element_scope) return error.BadExpr;
                 try c.push(.{ .col = 0 }, 0);
+            },
+            .json_encode => |r| {
+                try c.go(r.x, depth + 1);
+                const decl: ?Column = if (r.x.* == .col) (if (c.f.columnIndex(r.x.col)) |ci| c.f.columns[ci] else null) else null;
+                try c.push(.{ .json_encode = decl }, 1);
             },
             .struct_op => |r| {
                 switch (r.op) {
@@ -2007,6 +2038,10 @@ fn regexCell(a: std.mem.Allocator, r: RegexInst, t: []const u8) Error!Value {
             while (it.next()) |_| n += 1; // at most len + 1 matches: no overflow
             return .{ .int = n };
         },
+        .find => {
+            const hit = r.m.find(t, 0) orelse return .null;
+            return .{ .int = std.math.cast(i64, hit.start) orelse return .null };
+        },
         .extract => {
             if (!r.m.captures(t, 0, r.groups)) return .null;
             const span = r.groups[r.group] orelse return .null;
@@ -2138,6 +2173,10 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
             .truncate_zoned => |r| {
                 const v = stack[sp - 1];
                 stack[sp - 1] = if (keys.isMissing(v)) .null else try dtf.roundToZoned(a, v, r.d, r.mode, r.zone);
+            },
+            .offset_by_zoned => |r| {
+                const v = stack[sp - 1];
+                stack[sp - 1] = if (keys.isMissing(v)) .null else try dtf.offsetByZoned(a, v, r.d, r.zone);
             },
             .strftime_tz => |r| {
                 const v = stack[sp - 1];
@@ -2290,6 +2329,16 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
                 sp += 1;
             },
             .struct_op => |op| stack[sp - 1] = try lf.structCell(a, stack[sp - 1], op),
+            .json_encode => |decl| {
+                const v = stack[sp - 1];
+                if (v == .record) {
+                    var out: std.Io.Writer.Allocating = .init(a);
+                    defer out.deinit();
+                    jsonio.writeValue(&out.writer, v, decl, 0) catch return error.OutOfMemory; // an Allocating writer fails only so
+                    if (out.written().len > fnx.max_text_result) return error.TooLarge;
+                    stack[sp - 1] = .{ .text = try out.toOwnedSlice() };
+                } else stack[sp - 1] = if (v == .null) .{ .text = "null" } else .null;
+            },
             .struct_fields => |m| {
                 const v = stack[sp - 1];
                 stack[sp - 1] = if (v == .record) try structFields(a, m, v.record, one_a, one) else .null;

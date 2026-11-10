@@ -362,6 +362,67 @@ hands the next `n` non-blank ones to `readNdjson`; each chunk is typed on its ow
 pandas (a cross-chunk schema would have to decide what a key one chunk lacks means, which no engine defines for
 ndjson), and `types` fixes a column in every chunk. Engine answers: `tools/oracle2h.py`, `src/s2w9_oracle_test.zig`.
 
+
+**Wave W10 (dataframe S2, 2026-11-10): the cheap parity gaps.** Seven items the survey found "missing and it
+matters"; each was asked of the engines first (`tools/oracle2i.py`, 231 cases, replayed by
+`src/s2w10_oracle_test.zig`; the edge cases no engine is asked are in `src/s2w10_test.zig`).
+- **`Expr.find_regex`** (polars `str.find(pattern, literal=False)`): the **byte** offset of the first match
+  (polars' unit, not the character index of pandas/Python `str.find`, which is also literal and answers -1),
+  null when there is none or the cell is not text; an invalid pattern is `error.BadPattern` (`strict=True`).
+  `literal` quotes the pattern (`regex.quoteMetaAlloc`). Same plumbing and linear-time guarantee as
+  `contains_regex`/`extract`.
+- **`corrWith(left, right, {method, drop})`** (pandas `DataFrame.corrwith`, `axis=0`): columns named in both
+  frames correlated by row position; no row index here, so frames of different length are
+  `error.LengthMismatch` (pandas aligns on the index), and `other` is a frame, never a Series. The result is
+  `column` + `corr`: shared columns in the left frame's order, then (unless `drop`) the one-sided ones sorted by
+  name with a null (pandas NaN). A shared text column is `error.NotNumeric` (pandas `TypeError`). Spearman is
+  checked against pandas' `DataFrame.corr(method="spearman")` of the two columns side by side (corrwith's own
+  needs SciPy, not installed). The arithmetic is `corr.zig`'s (complete pairs, `pearson`, `rankAverage`); work
+  capped by `max_corr_work`.
+- **`Expr.json_encode`** (polars `struct.json_encode()`): the record's JSON through `jsonio.writeValue`, the
+  writer the cast to text and the JSON writers share (no second encoder). With a column reference the declared
+  schema is used (an instant inside stays RFC 3339). A null struct cell gives the text `null`, as polars; a cell
+  that is not a record is null (polars `SchemaError`). Kept difference: polars writes `1e-7`, the shared writer
+  `1e-07` (both valid JSON). Result text over `max_text_result` is `error.TooLarge`.
+- **`unstack(step, how, columns, fill_value / fill_values)`** (polars `DataFrame.unstack`): `.vertical` and
+  `.horizontal`, the `<name>_<k>` names zero-padded to the width of the largest `k`, types kept, a scalar fill
+  (`fill_value`) or one per column (`fill_values`, a wrong count is an error as in polars), cast to the column's
+  type as polars does. An empty frame or `step = 0` is `error.BadArgument` (polars raises a Python error); the
+  result is capped at `max_unpivot_cells` cells (`error.TooLarge`; polars would allocate any `step`); a column
+  listed twice is `error.DuplicateColumn`.
+- **`wideToLong(stubnames, i, j, sep, suffix)`** (pandas `wide_to_long`): an unpivot of the columns
+  `<stub><sep><suffix>` (the `regex` module's Rust grammar for `suffix`, the stub and separator quoted) into one
+  value column per stub. pandas' (`i`, `j`) index is ordinary columns: `i...`, `j`, the other columns, the stubs.
+  Row order and the `j` typing are pandas' (one `i` column: all rows of the first suffix, then the next; several:
+  each source row's suffixes together; `j` int, else float, else text; suffixes in order of first appearance).
+  Differences: a suffix a stub lacks is null in an unchanged-type column (pandas turns an int column into float
+  with NaN; an int and a float column of one stub make a float one here too); the other columns keep frame order
+  (pandas uses a set, so its order changes between runs); a stub with no column is `error.NoSuchColumn`
+  (pandas returns an empty frame), an `i` that repeats is `error.NotUnique` (pandas `ValueError`), a stub of
+  mixed non-numeric types `error.BadArgument`, `j` naming a column `error.DuplicateColumn`; the result is capped
+  at `max_unpivot_cells` cells.
+- **`binIntervals` / `binQuantiles` / `binRanks`** (polars 2.1 `Expr.bin_intervals` / `bin_quantiles` /
+  `bin_ranks`; they exist in 2.1.0, marked experimental), as frame verbs like `cut`: `col`, `out`, a list of
+  breakpoints / quantiles / rank fractions or a count of bins, `labels` (one per bin, else the bin number as an
+  int; text here where polars has an `Enum`), `include_intervals` (a record `{bin, left, right}` with open outer
+  ends) and `right_closed` (not for ranks). Quantile breakpoints are values at `floor(q * (n - 1))` (a count `k`: in
+  integer arithmetic); rank cuts are at `round(r * n)` positions in stable sorted order (a count: near-equal bins,
+  the remainder to the first ones), so equal values can split; derived equal-width breakpoints of an int-like
+  column are rounded to the side that keeps the bins' integers those of the exact ones (up for `[a, b)`, down
+  for `(a, b]`). Differences: NaN is missing (this module's one rule) and gets no bin, polars bins it last
+  and counts it; the bin count is capped at `max_bins` (2^20, `error.TooLarge`); columns are `int`, `float`,
+  `timestamp`, `duration`, `date`, `text` (quantiles and a count: numeric only), others `error.NotOrderable`;
+  `error.BadEdges` for decreasing breakpoints or fractions, fractions outside [0, 1], a count of 0, and
+  `error.BadLabels` for a label count that is not the bin count or a repeated label.
+- **`offset_by` on a zoned column**: the calendar units (`mo`, `q`, `y`, `w`, `d`) move the wall clock of the
+  zone (`1d` keeps 12:00 across a DST change, an elapsed 23 or 25 hours) and the sub-day part (`h`, `m`, `s`, `ms`,
+  `us`, `ns`) is added as elapsed time after it (`1d1h`), as polars (this changes the previous elapsed-time result
+  for calendar units; `dtfn.offsetByZoned`). A wall-clock result the zone skips is `local - offset after the
+  gap` (02:30 in a 02:00 to 03:00 jump is 01:30; polars, unlike `truncate`'s forward move); one it shows twice
+  is the pass the input was in (the same UTC offset), the earlier one if the input's offset is neither. `Duration`
+  gained `days` (calendar days given, a week as seven). `add_business_days` on a zoned column was not asked of the engines and is
+  not built (it still works on the instant as before).
+
 **Limits** (all `CsvReadOptions` fields, each with its own error; a hostile input is an error, never
 a panic or an unbounded allocation): `max_bytes` 256 MiB (`InputTooLarge`), `max_columns` 65536
 (`TooManyColumns`), `max_cell_bytes` 1 MiB (`CellTooLarge`), `max_record_bytes` 16 MiB
@@ -499,7 +560,7 @@ the end cell with 0), and `tabular`'s row verbs as a re-derived oracle on genera
 - **expr.zig, left after the S2 review (2026-11-09, source "expr.zig S2 review", all LOW):** (a) `match_regex` wraps the pattern as `\A(?:…)\z`; a `(?x)` pattern ending in a `#` comment swallows the wrapper and fails to compile. (b) `zoneOf` has no case for `.list` get/first/last/min/max/item, `.field` or `.fold` (`.element` of a `list_eval` body has one since the fix): a zoned value taken out of a list or struct, or folded with min/max, gets no zone. (c) `to_datetime` with `.infer` picks the format from the first non-null cell of the frame given to `compile`, so a per-chunk `mutate` can infer different formats per chunk. (d) `replace_time_zone`/`convert_time_zone` skip the non-timestamp check when `temporalType` returns null.
 - **strfn.zig, left after the S2 review (2026-11-09, source "strfn.zig S2 review", all LOW):** (a) `wrap`'s tab stop counts a lone continuation byte as 0 columns while the character count counts bytes for invalid UTF-8 (`"\x80\tx"`): the two disagree on invalid input. (b) `fnx.charStarts` allocates (len+1)*8 bytes per cell (128 MiB for a 16 MiB cell), and one invalid byte switches the whole cell to byte indexing, so `sliceReplace` can split a code point (invalid UTF-8 out). (c) The strfn helpers rely on the `expr.zig` guards for an empty `by`/`from` and for `limit = 0` (`rsplitLiteral` with `by = ""` would loop to out-of-memory): add local guards when strfn becomes `pub`. (d) `getDummies` names borrow the input when `prefix == null` and allocate otherwise (fine under the arena contract).
 - **exprfn.zig, left after the S2 review (2026-11-09, source "exprfn.zig S2 review", all LOW, no panic found):** (a) `erfc` for |x| in about 1.5..2 is `1 - erfSeries(x)`: about 1e-13 relative, not the documented 1e-15 (the oracle tolerance 1e-12 hides it) — measure against `math.erfc` and move the series cut-off or weaken the doc; above |x| ≈ 26.5 `@exp(-x²)` is subnormal (the value is too). (b) A cell over 16 MiB: the ASCII and invalid-UTF-8 branches of `lower`/`upper`/`casefold`/`capitalize`/`title`/`swapcase` have no cap, the unitext branch (`ut_opts`, `max_text_result`) returns `TooLarge`, also for an already-normalized `normalize`. (c) `title`/`swapcase`/`capitalize` on mixed-validity text take ASCII rules (documented); no test pins it. (d) No round-trip test of `escape_regex` through `modules/regex` (`\#`, `\&`, `\~` accepted?), only the polars string oracle.
-- **Time zones, left after wave W7 (2026-11-09):** (1) `offset_by` of a zoned column adds elapsed time (pandas `Timedelta`); polars' calendar units (`1d`, `1mo` keep the wall clock across a DST change) need the wall-clock arithmetic of `roundToZoned` applied to `offset_by`/`add_business_days` — the engines were not asked, so not built. (2) A callback verb's `OutColumn` and a `struct_of`/`list` built by an `Expr` carry no zone (the inner column is described by kind): cast the result, or give the schema; `Column.inner` already carries a declared one. (3) `groupByDynamic` of a zoned index with a sub-day `every` cuts on the wall clock like `truncate`; no engine answer was taken for it (the vectors cover `1d` and `1mo`). (4) `datetime_format` of the CSV writer takes `%z` but not `%Z` (use `Expr.strftime`). (5) `tz.full`'s pre-1970 history (+79 KB per binary that calls `mutate`) is the open choice in `tz`; until then a zoned column before 1970 shows the zone's state at the epoch. (6) Comparison of a naive against a zoned column compares instants (pandas `False`, polars `SchemaError`).
+- **Time zones, left after wave W7 (2026-11-09):** (1) A callback verb's `OutColumn` and a `struct_of`/`list` built by an `Expr` carry no zone (the inner column is described by kind): cast the result, or give the schema; `Column.inner` already carries a declared one. (2) `groupByDynamic` of a zoned index with a sub-day `every` cuts on the wall clock like `truncate`; no engine answer was taken for it (the vectors cover `1d` and `1mo`). (3) `datetime_format` of the CSV writer takes `%z` but not `%Z` (use `Expr.strftime`). (4) `tz.full`'s pre-1970 history (+79 KB per binary that calls `mutate`) is the open choice in `tz`; until then a zoned column before 1970 shows the zone's state at the epoch. (5) Comparison of a naive against a zoned column compares instants (pandas `False`, polars `SchemaError`).
 
 **S2 wave W2 (2026-11-09), the everyday single-parameter gaps — built, with the engine each follows.**
 pandas 3.1 unless said (`src/s2w2_test.zig` by hand; the engine cases in `tools/oracle2.py` groups `w2_*`, replayed by

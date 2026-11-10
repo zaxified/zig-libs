@@ -389,6 +389,9 @@ pub const Duration = struct {
     us: i64 = 0,
     /// Whole weeks given (`truncate` aligns those to Monday).
     weeks: i64 = 0,
+    /// The calendar days given, a week as seven (already inside `us`): `offsetByZoned` moves
+    /// these on the wall clock, the rest of `us` as elapsed time.
+    days: i64 = 0,
 };
 
 /// polars' duration language: `[-]` then integer-unit pairs, units `ns us ms s m h d w
@@ -442,8 +445,11 @@ pub fn parseDuration(s: []const u8) ?Duration {
         const add = if (per == 0) @divTrunc(n, 1000) else std.math.mul(i64, n, per) catch return null;
         d.us = std.math.add(i64, d.us, add) catch return null;
         if (eq(unit, "w")) d.weeks += n;
+        if (eq(unit, "d")) d.days = std.math.add(i64, d.days, n) catch return null;
+        if (eq(unit, "w")) d.days = std.math.add(i64, d.days, std.math.mul(i64, n, 7) catch return null) catch return null;
     }
     if (neg) {
+        d.days = -d.days;
         d.months = -d.months;
         d.us = -d.us;
         d.weeks = -d.weeks;
@@ -465,6 +471,43 @@ pub fn offsetBy(a: std.mem.Allocator, v: Value, d: Duration) error{OutOfMemory}!
         us = usOf(q) orelse return .null;
     }
     us = std.math.add(i64, us, d.us) catch return .null;
+    return write(a, us, in.shape);
+}
+
+/// polars `dt.offset_by` on a zoned instant: the calendar part (months, days, weeks) moves
+/// the WALL CLOCK of `zone` (`1d` keeps 12:00 across a DST change, so the elapsed time is 23 or
+/// 25 hours), then the sub-day part (`h m s ms us ns`) is added as elapsed time (`1d1h` is the
+/// wall-clock day, then an hour of elapsed time). A wall-clock result the zone shows twice (a
+/// fold) is the pass the input was in (the same UTC offset), the earlier one when the input's
+/// offset is neither; one it skips (a gap) is the instant `local - offset after the gap`,
+/// so 02:30 in a 02:00 to 03:00 jump is 01:30 (all as polars answers, checked against 2.1). A
+/// duration with no calendar part, and a date cell (no zone), are `offsetBy`. Null past the
+/// representable range.
+pub fn offsetByZoned(a: std.mem.Allocator, v: Value, d: Duration, zone: *const tz.Zone) error{OutOfMemory}!Value {
+    const in = read(v) orelse return .null;
+    if (in.shape == .date or (d.months == 0 and d.days == 0)) return offsetBy(a, v, d);
+    const off0 = tz.offsetAt(zone, @divFloor(in.us, us_per_s)).off;
+    var local = std.math.add(i64, in.us, @as(i64, off0) * us_per_s) catch return .null;
+    if (d.months != 0) {
+        const p = partsOf(local);
+        const months = std.math.cast(i32, d.months) orelse return .null;
+        var q = datefmt.addMonths(p, months);
+        q.nanosecond = p.nanosecond;
+        local = usOf(q) orelse return .null;
+    }
+    const day_us = std.math.mul(i64, d.days, us_per_day) catch return .null;
+    local = std.math.add(i64, local, day_us) catch return .null;
+    const secs = @divFloor(local, us_per_s);
+    const frac = @mod(local, us_per_s);
+    const inst: i64 = switch (tz.resolveLocal(zone, secs)) {
+        .unique => |u| u,
+        .nonexistent => |g| g.earlier,
+        // A fold: the pass the input was in, else the earlier one.
+        .ambiguous => |g| if (tz.offsetAt(zone, g.later).off == off0 and tz.offsetAt(zone, g.earlier).off != off0) g.later else g.earlier,
+    };
+    var us = std.math.add(i64, std.math.mul(i64, inst, us_per_s) catch return .null, frac) catch return .null;
+    const sub = std.math.sub(i64, d.us, std.math.mul(i64, d.days, us_per_day) catch return .null) catch return .null;
+    us = std.math.add(i64, us, sub) catch return .null;
     return write(a, us, in.shape);
 }
 

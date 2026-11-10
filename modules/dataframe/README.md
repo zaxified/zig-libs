@@ -14,7 +14,7 @@ position.
   `is_in`, `if_else`, `coalesce`, text ops); `window` per group (shift, diff, pct_change,
   cumulative, rolling by count or time, expanding, ewm, rank, ffill/bfill, interpolate,
   transform); `joinAsof`, `concatByName`, `partitionBy`, `valueCounts`, `describe`,
-  `cut`, `clip`, `replace`, `page`/`tail`/`topN`/`nlargest`/`sample`, `resample` (day to
+  `cut`, `binIntervals`/`binQuantiles`/`binRanks`, `unstack`, `wideToLong`, `corrWith`, `clip`, `replace`, `page`/`tail`/`topN`/`nlargest`/`sample`, `resample` (day to
   year), `reduce`.
 - **Frame structure:** `clone`, `clear`, `take` (gather, negative from the end),
   `gatherEvery`, `reverse`, `insertColumn`, `hstack`, `replaceColumn`, `popColumn`,
