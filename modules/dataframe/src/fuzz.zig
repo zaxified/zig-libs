@@ -707,8 +707,20 @@ fn genChain(src: anytype, a: Allocator, x: *const df.Expr) Allocator.Error!df.Ex
     return cur.*;
 }
 
+fn pickStructCol(src: anytype, f: Frame) []const u8 {
+    var n: usize = 0;
+    for (f.columns) |c| n += @intFromBool(c.type == .@"struct");
+    if (n == 0) return pickCol(src, f);
+    var k = below(src, n);
+    for (f.columns) |c| if (c.type == .@"struct") {
+        if (k == 0) return c.name;
+        k -= 1;
+    };
+    return pickCol(src, f);
+}
+
 fn genExprS2(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Expr) Allocator.Error!df.Expr {
-    return switch (below(src, 41)) {
+    return switch (below(src, 42)) {
         0 => .{ .round_sig_figs = .{ .x = x, .digits = pickOf(src, u32, &.{ 0, 1, 3, 15, 17, 400, std.math.maxInt(u32) }) } },
         1 => .{ .is_close = .{
             .l = x,
@@ -809,6 +821,15 @@ fn genExprS2(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Ex
         37 => .{ .if_else = .{ .cond = x, .then = x, .otherwise = try subExpr(src, a, f, depth, x) } },
         38 => .{ .concat_list = try subList(src, a, f, depth, x, 3) },
         39 => .{ .is_in = .{ .x = x, .values = &.{} } },
+        // `struct_fields` reads the field names from a struct column's storage: only a column serves.
+        41 => blk: {
+            const xc = try a.create(df.Expr);
+            xc.* = .{ .col = pickStructCol(src, f) };
+            expr_emitted[@backingInt(std.meta.activeTag(xc.*))] += 1;
+            const fs = try a.alloc(df.NamedExpr, range(src, usize, 0, 2));
+            for (fs) |*nf| nf.* = .{ .name = pickOf(src, []const u8, &record_names_ext), .x = (try subExpr(src, a, f, depth, x)).* };
+            break :blk .{ .struct_fields = .{ .x = xc, .fields = fs, .keep = chance(src, 50) } };
+        },
         else => .{ .strftime = .{ .x = x, .format = pickOf(src, []const u8, &.{ "%Y-%m-%dT%H:%M:%S%.f", "%j %U %w", "%e %p %I", "%s %%", "%G-%V" }) } },
     };
 }
@@ -972,12 +993,42 @@ fn agree(comptime what: []const u8, new: anytype, old: anytype) !void {
             }
         } else |_| {}
     } else |_| {}
+    // A column that is null in every row: `concat` of frames whose categorical pieces share a
+    // dictionary keeps it (SPEC, "unused categories included"), the cell path has no cell to
+    // encode and answers `.nulls`. Same type, same (null) cells.
+    if (new) |nf| {
+        if (old) |of| {
+            if (sameUpToNullDictionary(nf, of)) return;
+        } else |_| {}
+    } else |_| {}
     d4b.agree(what, new, old) catch |e| {
         if (new) |nf| {
             if (old) |of| describeDiff(nf, of) else |_| {}
         } else |_| {}
         return e;
     };
+}
+
+fn allNull(c: ColumnData, len: usize) bool {
+    for (0..len) |i| if (c.get(i) != .null) return false;
+    return true;
+}
+
+/// `d4b.sameFrame`, except that a categorical column and a `.nulls` one may stand for the
+/// same all-null column.
+fn sameUpToNullDictionary(x: Frame, y: Frame) bool {
+    if (x.len != y.len or x.columns.len != y.columns.len) return false;
+    for (x.columns, y.columns) |c, d| if (c.type != d.type or !std.mem.eql(u8, c.name, d.name)) return false;
+    for (0..x.columns.len) |ci| {
+        const p = x.columnAt(ci);
+        const q = y.columnAt(ci);
+        if (d4b.sameColumn(p, q, x.len)) continue;
+        const tp = std.meta.activeTag(p);
+        const tq = std.meta.activeTag(q);
+        if (!((tp == .categorical and tq == .nulls) or (tp == .nulls and tq == .categorical))) return false;
+        if (!allNull(p, x.len)) return false;
+    }
+    return true;
 }
 
 fn describeDiff(x: Frame, y: Frame) void {

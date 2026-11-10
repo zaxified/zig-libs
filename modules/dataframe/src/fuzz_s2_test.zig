@@ -31,3 +31,48 @@ test "fuzz s2: chunked csv reader under max_bytes just above the input length" {
     while (try rd.next(a, 2)) |ch| rows += ch.len;
     try testing.expectEqual(whole.len, rows);
 }
+
+// Fuzz seed 493021 (frames target, `where`): a tower of 70 shared `binary` nodes over a
+// `split_fields` with n = 4096. The visit cap (`max_nodes`) refused it, but only after 65536
+// visits that each built 4097 names (8 s, 2 GB): a node's weight is its names, too.
+test "fuzz s2: a shared tower over split_fields is refused fast" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try a.create(df.Expr);
+    col.* = .{ .col = "t" };
+    var cur = try a.create(df.Expr);
+    cur.* = .{ .split_fields = .{ .x = col, .by = ",", .n = 4096, .rest = true } };
+    for (0..70) |_| {
+        const e = try a.create(df.Expr);
+        e.* = .{ .binary = .{ .op = .eq, .l = cur, .r = cur } };
+        cur = e;
+    }
+    const cols = [_]df.Column{.{ .name = "t", .type = .text }};
+    const cells = [_]df.Value{ .{ .text = "a,b" }, .{ .text = "" } };
+    const data = [_]df.ColumnData{try df.columnFromCells(a, &cells)};
+    const f: df.Frame = .{ .columns = &cols, .data = &data, .len = 2 };
+    const t0 = std.Io.Timestamp.now(testing.io, .awake);
+    try testing.expectError(error.ExprTooLarge, df.where(a, f, cur));
+    const ms = @divTrunc(t0.durationTo(std.Io.Timestamp.now(testing.io, .awake)).nanoseconds, 1_000_000);
+    try testing.expect(ms < 1000);
+}
+
+test "fuzz s2: split_fields at its widest is still accepted, alone and ten times in one expression" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = try a.create(df.Expr);
+    col.* = .{ .col = "t" };
+    const cols = [_]df.Column{.{ .name = "t", .type = .text }};
+    const cells = [_]df.Value{ .{ .text = "a,b" }, .{ .text = "" } };
+    const data = [_]df.ColumnData{try df.columnFromCells(a, &cells)};
+    const f: df.Frame = .{ .columns = &cols, .data = &data, .len = 2 };
+    const one: df.Expr = .{ .split_fields = .{ .x = col, .by = ",", .n = 4096, .rest = true } };
+    const assign1 = [_]df.Assign{.{ .out = "o", .expr = one }};
+    _ = try df.mutate(a, f, &assign1);
+    var parts: [10]df.Expr = undefined;
+    for (&parts) |*p| p.* = one;
+    const assign10 = [_]df.Assign{.{ .out = "o", .expr = .{ .coalesce = &parts } }};
+    _ = try df.mutate(a, f, &assign10);
+}
