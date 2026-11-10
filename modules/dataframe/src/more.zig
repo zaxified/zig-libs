@@ -120,7 +120,8 @@ pub fn topN(a: std.mem.Allocator, f: Frame, spec: TopNSpec) Error!Frame {
         // The value wins when both name the same column, as in the row verb.
         if (ci == label_idx) cells[keep] = .{ .text = t.label };
         if (ci == value_idx) cells[keep] = .{ .float = tail_sum };
-        d.* = try fm.columnFromCells(a, cells);
+        // The tail's sum is an f64 and its label text: a width column holds neither as they are (D4).
+        d.* = try fm.conform(a, try fm.columnFromCells(a, cells), f.columns[ci].type, keep + 1);
     }
     return .{ .columns = f.columns, .data = data, .len = keep + 1 };
 }
@@ -1241,7 +1242,9 @@ pub fn replace(a: std.mem.Allocator, f: Frame, spec: ReplaceSpec) Error!Frame {
         try keys.encode(a, &scratch, v, .as_null);
         o.* = if (try t.getBytes(scratch.items)) |id| tos[id] else v;
     }
-    return withColumn(a, f, ci, f.columns[ci].type, try fm.columnFromCells(a, cells));
+    // A replacement may not fit a declared width (`conform` makes the storage agree with it).
+    const ty = f.columns[ci].type;
+    return withColumn(a, f, ci, ty, try fm.conform(a, try fm.columnFromCells(a, cells), ty, f.len));
 }
 
 pub const CutSpec = struct {

@@ -197,7 +197,9 @@ pub fn horizontal(a: std.mem.Allocator, f: Frame, spec: HorizontalSpec) Error!Fr
                     if (v == .int and !iover) {
                         if (std.math.add(i64, isum, v.int)) |s| isum = s else |_| iover = true;
                     }
-                    if (v != .int) any_float = true;
+                    // Above Int64's top (UInt64): the Int64 total cannot hold it, so it is an overflow (null),
+                    // not a float sum of a column of integers (sweep W11-9).
+                    if (v == .uint) iover = true else if (v != .int) any_float = true;
                     fsum += v.asFloat().?;
                 },
                 .min => best = if (best == .null or v.order(best) == .lt) v else best,
@@ -241,11 +243,22 @@ pub fn horizontal(a: std.mem.Allocator, f: Frame, spec: HorizontalSpec) Error!Fr
             if (c == .float) out_ty = .float;
         }
     }
+    // A UInt64 cell above Int64's top (min / max of unsigned columns) cannot sit in an Int64 column: the
+    // result is UInt64 when no cell is negative, else Float64 (D5: Int64 meets UInt64 in Float64).
+    if (out_ty == .int and spec.func != .count) {
+        var any_big = false;
+        var any_neg = false;
+        for (cells) |c| {
+            any_big = any_big or c == .uint;
+            any_neg = any_neg or (c == .int and c.int < 0);
+        }
+        if (any_big) out_ty = if (any_neg) .float else .uint64;
+    }
     if (out_ty == .float) {
         // An all-int row of a mixed frame still answers float, as a decimal does.
         for (cells) |*c| {
             // Read before the write (result location: the tag is written first).
-            if (c.* == .int or c.* == .decimal) {
+            if (c.* == .int or c.* == .uint or c.* == .decimal) {
                 const x = c.asFloat().?;
                 c.* = .{ .float = x };
             }
@@ -594,7 +607,8 @@ pub fn replaceStrict(a: std.mem.Allocator, f: Frame, spec: ReplaceStrictSpec) Er
     }
     const data = try a.alloc(ColumnData, f.columns.len);
     for (data, 0..) |*d, i| d.* = f.columnAt(i);
-    data[ci] = try fm.columnFromCells(a, cells);
+    // A mapped value may not fit a declared width: `conform` makes the storage agree with it (D4).
+    data[ci] = try fm.conform(a, try fm.columnFromCells(a, cells), cols[ci].type, f.len);
     return .{ .columns = cols, .data = data, .len = f.len };
 }
 

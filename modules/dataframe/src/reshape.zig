@@ -636,7 +636,8 @@ pub fn scatter(a: std.mem.Allocator, f: Frame, spec: ScatterSpec) Error!Frame {
         // (`conform` would make it null).
         if (dtype.isWidth(f.columns[ci].type) and v != .null) {
             const held = v.cast(f.columns[ci].type) orelse return error.BadArgument;
-            if (!held.eql(v)) return error.BadArgument; // a fraction, say
+            // A fraction, say; Float32 rounds the value as `cast` does (0.1 is an everyday literal).
+            if (f.columns[ci].type != .float32 and !held.eql(v)) return error.BadArgument;
         }
         cells[@intCast(r)] = v;
     }
@@ -1099,9 +1100,10 @@ pub fn wideToLong(a: std.mem.Allocator, f: Frame, spec: WideToLongSpec) WideToLo
             c.* = .null;
             if (col_of[j]) |ci| {
                 c.* = f.columnAt(ci).get(ri);
-                if (dtype.isFloat(stub_ty) and c.* == .int) {
-                    const as_float: f64 = @floatFromInt(c.int);
-                    c.* = .{ .float = as_float };
+                // A UInt64 above Int64's top is a `.uint` cell: a Float64 stub holds it as a float too.
+                if (dtype.isFloat(stub_ty) and (c.* == .int or c.* == .uint)) {
+                    const x = c.asFloat().?; // read before the write: the result location writes the tag first
+                    c.* = .{ .float = x };
                 }
             }
         }

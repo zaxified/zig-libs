@@ -258,8 +258,8 @@ pub fn eqMissing(l: Value, r: Value) bool {
     const lm = isMissing(l);
     const rm = isMissing(r);
     if (lm or rm) return lm and rm;
-    const ln = l == .int or l == .float or l == .decimal;
-    const rn = r == .int or r == .float or r == .decimal;
+    const ln = l == .int or l == .uint or l == .float or l == .decimal;
+    const rn = r == .int or r == .uint or r == .float or r == .decimal;
     if (ln != rn) return false;
     if (!ln and std.meta.activeTag(l) != std.meta.activeTag(r)) return false;
     return l.order(r) == .eq;

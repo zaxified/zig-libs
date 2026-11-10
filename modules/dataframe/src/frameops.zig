@@ -92,7 +92,8 @@ fn resultType(cells: []Value) ColumnType {
 fn operandMeet(op: ex.Binary, l: ColumnType, r: ColumnType) ?ColumnType {
     if (!dtype.isNumeric(l) or !dtype.isNumeric(r)) return null;
     if (!dtype.isWidth(l) and !dtype.isWidth(r)) return null;
-    if (op == .div) return .float;
+    // As `Expr` (polars): Float32 over Float32 or over an integer of 16 bits or less stays Float32.
+    if (op == .div) return if (l == .float32 and (r == .float32 or (dtype.isInteger(r) and dtype.bits(r) <= 16))) .float32 else .float;
     return dtype.supertype(l, r);
 }
 
@@ -107,7 +108,10 @@ fn smallestFor(x: i128) ColumnType {
 /// column Float32 and an integer one Float64.
 fn literalMeet(op: ex.Binary, col: ColumnType, v: Value) ?ColumnType {
     if (!dtype.isWidth(col)) return null;
-    if (op == .div) return .float;
+    if (op == .div) return switch (v) { // as `Expr`: a literal is weak, beside Float32 it stays Float32
+        .int, .uint, .float => if (col == .float32) .float32 else .float,
+        else => null,
+    };
     switch (v) {
         .int, .uint => {
             if (dtype.isFloat(col)) return col;

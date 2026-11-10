@@ -331,6 +331,14 @@ fn sum(l: vm.ListView) Value {
                 over_d = over_d or d[1] != 0;
                 sf += e.asFloat().?;
             },
+            .uint => |u| {
+                // Above Int64's top: an Int64 total cannot hold it (null), a decimal or float one can.
+                over_i = true;
+                sf += @floatFromInt(u);
+                const d = @addWithOverflow(sd, @as(i128, u) * vm.decimal_scale); // u < 2^64, scale < 2^40
+                sd = d[0];
+                over_d = over_d or d[1] != 0;
+            },
             .float => |x| {
                 kind = .float;
                 sf += x;
