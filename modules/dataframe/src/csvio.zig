@@ -411,8 +411,9 @@ const k_float: u8 = 2;
 const k_bool: u8 = 4;
 const k_date: u8 = 8;
 const k_stamp: u8 = 16;
-/// `HH:MM:SS[.F]` under `parse_dates` (polars `try_parse_dates` infers `Time` from it; a
-/// bare `HH:MM` stays text there, so here too).
+/// A time of day under `parse_dates`: polars' `try_parse_dates` infers `Time` from whatever
+/// `parseTimeOfDay` reads (`H:M`, `1:02:03`, a leading blank, oracle2k `time-csv-probe-try-*`);
+/// a trailing blank keeps the column text there, so the raw cell is tried, not the trimmed one.
 const k_time: u8 = 32;
 
 fn isNullCell(opts: *const CsvReadOptions, s: []const u8) bool {
@@ -511,7 +512,7 @@ fn kindsOf(s: []const u8, parse_dates: bool) u8 {
     }
     if (parseBoolToken(s) != null) m |= k_bool;
     if (parse_dates) {
-        if (isIsoDate(s)) m |= k_date else if (value.parseIsoTimestamp(s) != null) m |= k_stamp else if (t.len >= 8 and value.parseTimeOfDay(t) != null) m |= k_time;
+        if (isIsoDate(s)) m |= k_date else if (value.parseIsoTimestamp(s) != null) m |= k_stamp else if (value.parseTimeOfDay(s) != null) m |= k_time;
     }
     return m;
 }

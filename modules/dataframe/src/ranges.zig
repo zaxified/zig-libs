@@ -138,12 +138,18 @@ fn fillLinear(vals: []f64, start: f64, end: f64, closed: Closed) void {
         .left, .right => if (n > 0) (end - start) / nf else 0,
         .none => (end - start) / (nf + 1),
     };
+    // polars' arithmetic (oracle2k `linspace-sweep-*`, 800 draws per mode): the first sample is `start`
+    // (`.both`, `.left`) or `start + step` (`.right`, `.none`), the others add `step` once per
+    // index, and the last one is snapped to its exact bound: `end` (`.both`, `.right`) or `end - step`.
     const first: f64 = switch (closed) {
-        .both, .left => 0,
-        .right, .none => 1,
+        .both, .left => start,
+        .right, .none => start + step,
     };
-    for (vals, 0..) |*v, i| v.* = start + (first + @as(f64, @floatFromInt(i))) * step;
-    if (closed == .both and n > 1) vals[n - 1] = end;
+    for (vals, 0..) |*v, i| v.* = first + @as(f64, @floatFromInt(i)) * step;
+    if (n > 1) vals[n - 1] = switch (closed) {
+        .both, .right => end,
+        .left, .none => end - step,
+    };
 }
 
 /// The row count of two per-row inputs of which one may hold a single entry for every row
@@ -154,17 +160,22 @@ fn rowCount(la: usize, lb: usize) RangeError!usize {
 }
 
 /// polars `linear_spaces(start, end, num_samples, closed)`: one list of floats per row,
-/// `linearSpace(start[i], end[i], n, closed)`. `starts` and `ends` have the same length, or
-/// one of them has one entry used for every row; a null bound makes the row's list null.
-/// `n` is shared by every row. All lists together hold at most `max_range_rows` values.
-pub fn linearSpaces(a: std.mem.Allocator, name: []const u8, starts: []const ?f64, ends: []const ?f64, n: usize, closed: Closed) RangeError!Frame {
-    const rows = try rowCount(starts.len, ends.len);
-    if (n > max_range_rows) return error.TooLarge;
+/// `linearSpace(start[i], end[i], ns[i], closed)`. `starts`, `ends` and `ns` (the per-row
+/// `num_samples`) have the same length, or one entry used for every row; a null bound or a
+/// null count makes the row's list null. All lists together hold at most `max_range_rows`
+/// values, and no count may exceed it.
+pub fn linearSpaces(a: std.mem.Allocator, name: []const u8, starts: []const ?f64, ends: []const ?f64, ns: []const ?usize, closed: Closed) RangeError!Frame {
+    const rows = try rowCount(try rowCount(starts.len, ends.len), ns.len);
+    var widest: usize = 0;
+    for (ns) |m| if (m) |k| {
+        if (k > max_range_rows) return error.TooLarge;
+        widest = @max(widest, k);
+    };
     const cells = try a.alloc(Value, rows);
     defer a.free(cells);
-    const items = try a.alloc(Value, n);
+    const items = try a.alloc(Value, widest);
     defer a.free(items);
-    const vals = try a.alloc(f64, n);
+    const vals = try a.alloc(f64, widest);
     defer a.free(vals);
     var total: usize = 0;
     for (cells, 0..) |*c, i| {
@@ -176,11 +187,15 @@ pub fn linearSpaces(a: std.mem.Allocator, name: []const u8, starts: []const ?f64
             c.* = .null;
             continue;
         };
+        const n = ns[if (ns.len == 1) 0 else i] orelse {
+            c.* = .null;
+            continue;
+        };
         total = std.math.add(usize, total, n) catch return error.TooLarge;
         if (total > max_range_rows) return error.TooLarge;
-        fillLinear(vals, s, e, closed);
-        for (items, vals) |*it, v| it.* = .{ .float = v };
-        c.* = try lf.makeList(a, items);
+        fillLinear(vals[0..n], s, e, closed);
+        for (items[0..n], vals[0..n]) |*it, v| it.* = .{ .float = v };
+        c.* = try lf.makeList(a, items[0..n]);
     }
     const inner = try a.dupe(Column, &[_]Column{.{ .name = "", .type = .float }});
     return fromCells(a, name, .list, cells, inner);
