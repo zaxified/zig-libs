@@ -85,7 +85,10 @@ position.
 Provenance: original work of the zig-libs authors (MIT); the storage comes from
 `dataset`'s `Frame` and the verbs from `tabular`, same authors. Modeled after pandas
 (BSD-3-Clause) and polars (MIT): verb names and behaviour from their documentation, no
-source consulted or copied. `src/oracle_vectors.json` holds generated tables and what
+source copied. Design references (consulted for edge rules, nothing copied): pandas'
+`core/missing.py` and SciPy's `interpolate` package (both BSD-3-Clause) for the
+`quadratic`/`cubic`/`pchip`/`akima` interpolation in `src/interpfn.zig`, and pandas'
+`read_fwf` column detection (`python_parser.py`, BSD-3-Clause) for `readFwf`'s `.infer`. `src/oracle_vectors.json` holds generated tables and what
 pandas 3.1.0 and polars 2.1.0 answered over them, `src/oracle2_vectors.json` the same for the D2 verbs and `src/oracle3_io_vectors.json` for CSV and JSON
 input and output (`tools/README.md`); no outside data.
 

@@ -3254,6 +3254,10 @@ fn binTypeOf(f: Frame, e: *const Expr) BinKind {
     return binTypeB(f, e, &steps);
 }
 
+/// `binTypeB`'s budget: it runs at every node `go` visits (`refuseBinaryOperand`), so a
+/// walk is kept short; a deeper operand is `.unknown`, decided by the cells.
+const max_bin_steps: usize = 1024; // a 200-term `+` chain is ~400 steps; 2^16 `go` visits x 1024 stays bounded
+
 fn binJoin(l: BinKind, r: BinKind) BinKind {
     if (l == .yes and r == .yes) return .yes;
     if (l == .no and r == .no) return .no;
@@ -3263,7 +3267,7 @@ fn binJoin(l: BinKind, r: BinKind) BinKind {
 
 fn binTypeB(f: Frame, e: *const Expr, steps: *usize) BinKind {
     steps.* += 1;
-    if (steps.* > max_type_steps) return .unknown;
+    if (steps.* > max_bin_steps) return .unknown;
     return switch (e.*) {
         .col => |name| if (f.columnType(name)) |t| (if (t == .binary) BinKind.yes else .no) else .unknown,
         .lit => |v| if (v == .null) .unknown else .no,
@@ -3274,24 +3278,46 @@ fn binTypeB(f: Frame, e: *const Expr, steps: *usize) BinKind {
             else => .no,
         },
         .list => |l| switch (l.op) {
-            .get, .first, .last, .min, .max, .item => if (elementColumn(f, l.x)) |c| (if (c.type == .binary) BinKind.yes else .no) else .unknown,
+            // A column's element only: `shapeOf` over any other operand has no step budget, and
+            // this runs before `go` charges its visits (review H1, 2026-11-10: a shared
+            // `if_else` DAG under `list.first` was a 2^depth walk at compile).
+            .get, .first, .last, .min, .max, .item => if (l.x.* != .col) .unknown else if (elementColumn(f, l.x)) |c| (if (c.type == .binary) BinKind.yes else .no) else .unknown,
             else => .unknown,
         },
         .field => |r| if (fieldColumn(f, r.x, r.name)) |c| (if (c.type == .binary) BinKind.yes else .no) else .unknown,
-        .if_else => |c| binJoin(binTypeB(f, c.then, steps), binTypeB(f, c.otherwise, steps)),
+        .if_else => |c| binMix(f, c.then, binTypeB(f, c.then, steps), c.otherwise, binTypeB(f, c.otherwise, steps)),
         .coalesce => |xs| blk: {
             if (xs.len == 0 or xs.len > 64) break :blk .unknown;
             var k = binTypeB(f, &xs[0], steps);
-            for (xs[1..]) |*x| k = binJoin(k, binTypeB(f, x, steps));
+            var any_yes = k == .yes;
+            for (xs[1..]) |*x| {
+                const xk = binTypeB(f, x, steps);
+                any_yes = any_yes or xk == .yes;
+                k = binJoin(k, xk);
+            }
+            if (any_yes and k != .yes) {
+                // Binary beside text or null parts only: Binary (polars' supertype).
+                for (xs) |*x| if (binTypeB(f, x, steps) != .yes and !binAddOperand(f, x)) break :blk .unknown;
+                break :blk .yes;
+            }
             break :blk k;
         },
         .binary => |b| switch (b.op) {
-            .min, .max => binJoin(binTypeB(f, b.l, steps), binTypeB(f, b.r, steps)),
+            .min, .max => binMix(f, b.l, binTypeB(f, b.l, steps), b.r, binTypeB(f, b.r, steps)),
             .add => if (binAddOkB(f, b.l, b.r, steps)) .yes else .unknown,
             else => .unknown,
         },
         else => .unknown,
     };
+}
+
+/// Two branches of one value (`if_else`, `coalesce`, `min`/`max`): binary beside binary, an
+/// unknown, a text or a null is Binary (polars' supertype of Binary and String; probed
+/// 2026-11-10: `when(c).then(bin).otherwise(str)` is Binary).
+fn binMix(f: Frame, l: *const Expr, lk: BinKind, r: *const Expr, rk: BinKind) BinKind {
+    if (lk == .yes and (rk != .no or binAddOperand(f, r))) return .yes;
+    if (rk == .yes and (lk != .no or binAddOperand(f, l))) return .yes;
+    return binJoin(lk, rk);
 }
 
 /// A value polars concatenates to a binary one with `+`: a text (its bytes) or a null.
@@ -3315,7 +3341,7 @@ fn binAddOk(f: Frame, l: *const Expr, r: *const Expr) bool {
 /// `binAddOk` sharing the walk's step budget (`x + x` towers must stay linear, not 2^n).
 fn binAddOkB(f: Frame, l: *const Expr, r: *const Expr, steps: *usize) bool {
     const lk = binTypeB(f, l, steps);
-    const rk = binTypeB(f, r, steps);
+    const rk = if (r == l) lk else binTypeB(f, r, steps); // `x + x`: one walk
     if (lk == .yes and (rk == .yes or binAddOperand(f, r))) return true;
     return rk == .yes and binAddOperand(f, l);
 }
@@ -3339,11 +3365,31 @@ fn refuseBinaryOperand(f: Frame, e: *const Expr) Error!void {
             if (b.op == .add and binAddOk(f, b.l, b.r)) return;
             switch (b.op) {
                 // A binary beside a text, a number or a bool is polars' SchemaError.
-                .eq, .ne, .lt, .le, .gt, .ge, .eq_missing, .ne_missing, .min, .max => if (l == .no or r == .no) return error.BadExpr,
+                // `min`/`max` of a binary and a text is Binary (polars `min_horizontal`).
+                .min, .max => if ((l == .no and !binAddOperand(f, b.l)) or (r == .no and !binAddOperand(f, b.r))) return error.BadExpr,
+                .eq, .ne, .lt, .le, .gt, .ge, .eq_missing, .ne_missing => if (l == .no or r == .no) return error.BadExpr,
                 else => return error.BadExpr,
             }
         },
         .concat_str => |c| for (c.parts) |*p| if (binTypeOf(f, p) == .yes) return error.BadExpr,
+        // A binary branch beside a text, number or bool one (review M2, 2026-11-10: the
+        // column was typed text and held bytes that are no UTF-8); polars refuses the mix.
+        .if_else => |c| {
+            const t = binTypeOf(f, c.then);
+            const o = binTypeOf(f, c.otherwise);
+            if (t == .yes and o == .no and !binAddOperand(f, c.otherwise)) return error.BadExpr;
+            if (o == .yes and t == .no and !binAddOperand(f, c.then)) return error.BadExpr;
+        },
+        .coalesce => |xs| {
+            var any_yes = false;
+            var other = false; // a part statically neither binary nor text (a number, a bool)
+            for (xs[0..@min(xs.len, 64)]) |*x| switch (binTypeOf(f, x)) {
+                .yes => any_yes = true,
+                .no => other = other or !binAddOperand(f, x),
+                .unknown => {},
+            };
+            if (any_yes and other) return error.BadExpr;
+        },
         else => {},
     }
 }
@@ -4076,5 +4122,11 @@ pub fn argWhere(a: std.mem.Allocator, f: Frame, e: *const Expr) Error![]const u3
         kept[n] = @intCast(ri); // checkRowsU32 bounds the row count
         n += @intFromBool(v == .bool and v.bool);
     }
-    return a.realloc(kept, n) catch kept[0..n];
+    // A failed shrink keeps the whole buffer: the caller frees what it was given, so the
+    // result must be the allocation itself (review L1, 2026-11-10: `kept[0..n]` freed a
+    // shorter slice than was allocated).
+    if (a.remap(kept, n)) |r| return r;
+    const out = try a.dupe(u32, kept[0..n]);
+    a.free(kept);
+    return out;
 }

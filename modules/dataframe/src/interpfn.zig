@@ -5,7 +5,11 @@
 //! textbook ones SciPy documents, written out here: a not-a-knot B-spline collocation
 //! with banded Gaussian elimination, Fritsch-Carlson PCHIP derivatives with the
 //! one-sided three-point end rule, Akima's weighted slopes, and piecewise cubic Hermite
-//! evaluation. Original work of the zig-libs authors (MIT).
+//! evaluation. Written from the published algorithms by the zig-libs authors (MIT); the
+//! numerics deliberately match SciPy 1.18 (the PCHIP slope and end rules, the Hermite
+//! coefficient form, Akima's flat-region threshold), whose `interpolate` sources and
+//! pandas' `core/missing.py` (both BSD-3-Clause) were consulted as design references for
+//! those edge rules — no source copied (README § Provenance).
 
 const std = @import("std");
 

@@ -842,3 +842,50 @@ test "hostile: a binary column holding something that is not bytes never panics"
     _ = mutate(a, f, .{ .bin = .{ .x = try col(a, "b"), .op = .{ .size = .b } } }) catch {};
     _ = mutate(a, f, .{ .bin = .{ .x = try col(a, "b"), .op = .{ .encode = .hex } } }) catch {};
 }
+
+test "review H1/M2 2026-11-10: binary typing is bounded on a shared DAG; binary beside text is Binary (polars)" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const cols = try a.dupe(df.Column, &.{
+        .{ .name = "c", .type = .bool },
+        .{ .name = "b", .type = .binary },
+        .{ .name = "s", .type = .text },
+        .{ .name = "i", .type = .int },
+        .{ .name = "l", .type = .list, .inner = &.{.{ .name = "", .type = .text }} },
+    });
+    const lists = try fm.columnFromCells(a, &.{ .null, .null });
+    const data = try a.dupe(df.ColumnData, &.{
+        try fm.columnFromCells(a, &.{ .{ .bool = true }, .{ .bool = false } }),
+        try fm.columnFromCells(a, &.{ .{ .text = "\xff" }, .{ .text = "a" } }),
+        try fm.columnFromCells(a, &.{ .{ .text = "x" }, .{ .text = "y" } }),
+        try fm.columnFromCells(a, &.{ .{ .int = 1 }, .{ .int = 2 } }),
+        lists,
+    });
+    const f: Frame = .{ .columns = cols, .data = data, .len = 2 };
+    // H1: a 60-level DAG (both branches the same node) under `list.first`, inside `replace`:
+    // 2^60 schema steps before the fix; now it compiles at once (an error or a column).
+    var y: df.Expr = .{ .col = "l" };
+    const cond: df.Expr = .{ .col = "c" };
+    for (0..60) |_| {
+        const node = try a.create(df.Expr);
+        node.* = y;
+        y = .{ .if_else = .{ .cond = &cond, .then = node, .otherwise = node } };
+    }
+    const first: df.Expr = .{ .list = .{ .x = &y, .op = .first } };
+    _ = df.mutate(a, f, &.{.{ .out = "r", .expr = .{ .replace = .{ .x = &first, .from = "a", .to = "b" } } }}) catch {};
+    // M2: polars `when(c).then(bin).otherwise(str)` is Binary; `.otherwise(int)` a SchemaError.
+    const cb: df.Expr = .{ .col = "b" };
+    const cs: df.Expr = .{ .col = "s" };
+    const c_i: df.Expr = .{ .col = "i" };
+    const g = try df.mutate(a, f, &.{.{ .out = "r", .expr = .{ .if_else = .{ .cond = &cond, .then = &cb, .otherwise = &cs } } }});
+    try testing.expectEqual(df.ColumnType.binary, g.columnType("r").?);
+    try testing.expectEqualStrings("\xff", g.cell(0, "r").?.text);
+    try testing.expectEqualStrings("y", g.cell(1, "r").?.text);
+    try testing.expectError(error.BadExpr, df.mutate(a, f, &.{.{ .out = "r", .expr = .{ .if_else = .{ .cond = &cond, .then = &cb, .otherwise = &c_i } } }}));
+    const co = try df.mutate(a, f, &.{.{ .out = "r", .expr = .{ .coalesce = &.{ cb, cs } } }});
+    try testing.expectEqual(df.ColumnType.binary, co.columnType("r").?);
+    try testing.expectError(error.BadExpr, df.mutate(a, f, &.{.{ .out = "r", .expr = .{ .coalesce = &.{ cb, c_i } } }}));
+    const mn = try df.mutate(a, f, &.{.{ .out = "r", .expr = .{ .binary = .{ .op = .min, .l = &cb, .r = &cs } } }});
+    try testing.expectEqual(df.ColumnType.binary, mn.columnType("r").?);
+}
