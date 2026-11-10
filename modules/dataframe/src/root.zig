@@ -173,6 +173,8 @@ pub const where = expr.where;
 pub const argWhere = expr.argWhere;
 pub const cast = expr.cast;
 pub const ListOp = expr.ListOp;
+pub const ElemOp = expr.ElemOp;
+pub const CumKind = expr.CumKind;
 /// `Expr.bin` (polars `Expr.bin`): the `.binary` column's operations; see `binfn.zig`.
 pub const BinaryOp = expr.BinaryOp;
 pub const SizeUnit = expr.SizeUnit;
@@ -655,6 +657,7 @@ test {
     _ = @import("fuzz_s2_test.zig");
     _ = @import("jsonread_test.zig");
     _ = @import("parity_test.zig");
+    _ = @import("parity_z2_test.zig");
     _ = @import("time_ops_test.zig");
     _ = @import("binary_test.zig");
     _ = @import("array_test.zig");
