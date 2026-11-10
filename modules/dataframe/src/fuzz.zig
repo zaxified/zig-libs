@@ -827,7 +827,7 @@ fn pickStructCol(src: anytype, f: Frame) []const u8 {
 }
 
 fn genExprS2(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Expr) Allocator.Error!df.Expr {
-    return switch (below(src, 44)) {
+    return switch (below(src, 46)) {
         0 => .{ .round_sig_figs = .{ .x = x, .digits = pickOf(src, u32, &.{ 0, 1, 3, 15, 17, 400, std.math.maxInt(u32) }) } },
         1 => .{ .is_close = .{
             .l = x,
@@ -838,6 +838,10 @@ fn genExprS2(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Ex
         } },
         2 => .{ .translate = .{ .x = x, .from = pickOf(src, []const u8, &str_pool), .to = pickOf(src, []const u8, &str_pool), .delete = pickOf(src, []const u8, &str_pool) } },
         3 => .{ .contains_any = .{ .x = x, .patterns = pickOf(src, []const []const u8, &pat_lists), .ascii_case_insensitive = chance(src, 50) } },
+        // Parity wave B: `extract_many` / `find_many`; `pat_lists` holds an empty pattern (the
+        // refusal path), the flag draw sometimes asks for `overlapping` with `leftmost` (refused too).
+        44 => .{ .extract_many = .{ .x = x, .patterns = pickOf(src, []const []const u8, &pat_lists), .ascii_case_insensitive = chance(src, 50), .overlapping = chance(src, 35), .leftmost = chance(src, 25) } },
+        45 => .{ .find_many = .{ .x = x, .patterns = pickOf(src, []const []const u8, &pat_lists), .ascii_case_insensitive = chance(src, 50), .overlapping = chance(src, 35), .leftmost = chance(src, 25) } },
         4 => .{ .replace_many = .{
             .x = x,
             .patterns = pickOf(src, []const []const u8, &pat_lists),
@@ -1832,7 +1836,48 @@ fn printCsvTable() void {
         std.debug.print("CSVERR {s}={d}\n", .{ name, csv_err_n[i] });
 }
 
+/// `readFwf` over random lines, with a drawn spec (inferred, widths, colspecs, hostile ones) and
+/// reader options: an error or a well-formed frame, never a crash.
+fn fwfTarget(src: anytype, a: Allocator) !void {
+    driver.hit("fwf");
+    const alphabet = "ab1 .\n\t-\"#,\r\xc3\xa9\xff";
+    const b = try a.alloc(u8, below(src, 160));
+    for (b) |*c| c.* = alphabet[below(src, alphabet.len)];
+    var o: df.FwfReadOptions = .{ .infer_nrows = pickOf(src, usize, &.{ 0, 1, 3, 100 }) };
+    switch (below(src, 4)) {
+        0 => {},
+        1 => {
+            const w = try a.alloc(usize, range(src, usize, 0, 5));
+            for (w) |*x| x.* = pickOf(src, usize, &.{ 0, 1, 2, 3, 7, std.math.maxInt(usize) });
+            o.spec = .{ .widths = w };
+        },
+        else => {
+            const cs = try a.alloc(df.Colspec, range(src, usize, 0, 5));
+            for (cs) |*c| c.* = .{ .start = pickOf(src, usize, &.{ 0, 1, 2, 5, 9, std.math.maxInt(usize) }), .end = pickOf(src, usize, &.{ 0, 1, 3, 6, 12, std.math.maxInt(usize) }) };
+            o.spec = .{ .colspecs = cs };
+        },
+    }
+    o.csv.has_header = chance(src, 70);
+    if (chance(src, 20)) o.csv.comment = '#';
+    if (chance(src, 20)) o.csv.skip_rows = range(src, usize, 1, 3);
+    if (chance(src, 20)) o.csv.parse_dates = true;
+    if (chance(src, 15)) o.csv.thousands = ',';
+    if (chance(src, 10)) o.csv.max_bytes = range(src, usize, 0, b.len + 8);
+    if (chance(src, 8)) o.csv.max_columns = range(src, usize, 0, 4);
+    if (chance(src, 8)) o.csv.max_rows = range(src, usize, 0, 4);
+    if (chance(src, 8)) o.csv.max_cells = range(src, usize, 0, 20);
+    if (chance(src, 8)) o.csv.max_record_bytes = range(src, usize, 0, 40);
+    const f = df.readFwf(a, b, o) catch {
+        driver.hit("fwf_err");
+        return;
+    };
+    driver.hit("fwf_ok");
+    try expectWellFormed("fwf", f);
+    try expectWidths("fwf", f);
+}
+
 fn csvTarget(src: anytype, a: Allocator) !void {
+    if (chance(src, 20)) return fwfTarget(src, a);
     driver.hit("csv");
     const delim: u8 = if (chance(src, 93)) pickOf(src, u8, ",;\t|") else pickOf(src, u8, &.{ '"', '\n', '\r', 0, 'a', ' ' });
     const quote: u8 = if (chance(src, 90)) '"' else pickOf(src, u8, &.{ 0, '\'', ',', '\n' });

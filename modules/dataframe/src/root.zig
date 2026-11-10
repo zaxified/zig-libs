@@ -460,6 +460,11 @@ pub const pandas_na_values = csvio.pandas_na_values;
 pub const polars_na_values = csvio.polars_na_values;
 pub const readCsv = csvio.readCsv;
 pub const readCsvReader = csvio.readCsvReader;
+const fwfio = @import("fwfio.zig");
+pub const readFwf = fwfio.readFwf;
+pub const FwfReadOptions = fwfio.FwfReadOptions;
+pub const FwfSpec = fwfio.FwfSpec;
+pub const Colspec = fwfio.Colspec;
 pub const writeCsv = csvio.writeCsv;
 
 const csvchunk = @import("csvchunk.zig");
@@ -597,6 +602,7 @@ test {
     _ = @import("review2_test.zig");
     _ = @import("textio.zig");
     _ = csvio;
+    _ = fwfio;
     _ = csvchunk;
     _ = ndjsonchunk;
     _ = @import("s2w9_test.zig");
@@ -609,6 +615,7 @@ test {
     _ = @import("s2w11a_test.zig");
     _ = @import("s2w11b_test.zig");
     _ = @import("s2w11b_oracle_test.zig");
+    _ = @import("parity_b_test.zig");
     _ = @import("dtype.zig");
     _ = jsonio;
     _ = jsonread;
