@@ -44,7 +44,23 @@ verb would carry its cost, and polars users do without — owner's decision 2026
 lazy optimizer or SQL (row 78); chunked storage (79); Python-language mechanics (rows 6, 9,
 14, 17, 22, 57); plotting and styling (72); Period dtype (70); Excel/SQL/pickle and other
 client libraries (76). Arrow, Parquet and the other columnar formats (75) are separate
-planned modules, `arrow` and `parquet`.
+planned modules, `arrow` and `parquet`; so are pandas' other file formats (Feather, ORC, Iceberg,
+HDF5, Stata, SAS, SPSS, `read_html`), and XML (`read_xml`/`to_xml`: an adapter over the sibling
+`xml` module, so that this module's closure — consumed by applications — does not grow by a parser
+it does not otherwise need; owner's decision 2026-11-10). Also refused (survey rows 103/108,
+2026-11-10): polars' `Expr.ext`/`register_extension_type` and the global string cache (types
+registered from Python; a categorical here carries its own dictionary); `pl.sql`/`sql_expr` and
+`read_sql`/`to_sql` (a SQL engine, a database driver); `map_batches`, `pipe_with_dtype`, the
+`from_*`/`to_dict`/`to_records`/`to_numpy` conversions, pickle and the clipboard (Python, NumPy or
+Arrow objects: `FrameBuilder`, the callback verbs and `writeJson` are the equivalents here);
+`defer`/`collect_all`/`explain_all` (the lazy engine); `approx_n_unique`/`approx_quantile` (the
+exact `n_unique`/`quantile` answer them); `cumulative_eval` (marked unstable by polars; an
+expanding `rollingMap` callback computes it); `cast_time_unit` (one unit, microseconds, for every
+instant and duration, as PostgreSQL and DuckDB `TIMESTAMP`: there is no unit to change);
+`set_sorted` (a hint to polars' optimizer; no verb here keeps or trusts a sortedness flag, the
+sorted-input verbs check their input instead); `json_normalize` (`readJson` builds the nested
+`struct`/`list` columns and `unnest` flattens them; the `sep`-joined key paths and `record_path`
+projection of deep documents are `jsonshape`'s column key paths).
 
 **Not here, by plan:** row verbs and `viaRows` (rule 3 of the plan: `Frame` is the only
 table model, so the card measures the one path that exists); `dataset`'s private wire
@@ -1000,9 +1016,11 @@ the two-pass values in the last bits; polars' `rolling_cov` `ddof` default and i
 window's nulls. Not here: polars' `random` rank method, the `rolling_time` forms, a Spearman
 window, pandas' `pairwise=True` (a matrix per window).
 
-**Still missing (survey rows, by number; re-checked against the code 2026-11-10):** index alignment of frame
-arithmetic (19: there is no index; by position here), the scipy `interpolate` methods (`cubic`, `spline`, `pchip`,
-…) (51), `set_sorted` (62), `extract_many`/`find_many` (96), `json_decode` (97), `cast_time_unit` (99). Built since
+**Not built, each with its reason (survey rows, by number; re-checked against the code 2026-11-10):** index
+alignment of frame arithmetic (19: there is no index, so frames align by position, the refused index family);
+the SciPy `interpolate` methods (`cubic`, `spline`, `pchip`, `akima`, …) (51: pandas hands them to SciPy, an
+optional dependency outside pandas, and polars offers `linear` and `nearest` only, both built here); `set_sorted` (62) and `cast_time_unit` (99) are refused with their reasons in § What this module
+is, and what it is not; `extract_many`/`find_many` (96) and `json_decode` (97) were built 2026-11-10. Built since
 this list was written: `fold` (31: `Expr.fold`, `foldColumns`), the pivot index family (53: `pivotKeys`,
 `pivotMany`, `margins`), `align_frames` (68; pandas' index `align` goes with the index), `repeat_by` into list cells
 (89: `listfn.repeatBy`), and in wave W10 `wide_to_long` (55) and polars `bin_*` (85); the `str`/`dt` gaps this list
@@ -1224,5 +1242,9 @@ fuzz generator for the categorical dictionary and ordering (the module's random 
 the `Expr` generator got the new list and struct arms), `list.eval` bodies with aggregates (above), polars'
 `list.sample` value stream, a struct `eval` over a nested path (`x` must be a plain column).
 
-**Not surveyed:** polars' `list`, `array`, `struct`, `cat`, `bin`, `ext`, `name`
-namespaces and the `Expr`-only pages (rows 103, 108).
+**Surveyed 2026-11-10 (rows 103, 108):** polars' `Expr` method list, the `arr`, `bin` and `ext`
+namespaces, the top-level function pages and pandas' input/output reference; what they hold is built
+(waves of 2026-11-10: `jsonDecode`, `extract_many`/`find_many`, `readFwf`, `dateRanges`/
+`datetimeRanges`/`linearSpaces`/`timeRanges`, `toLatex`, `argWhere`, the time-of-day, Binary and
+fixed-size Array column types) or refused with its reason in § What this module is, and what it is
+not. polars' `arg_sort_by` is `argSort` over several keys and `nth` is `Selector.by_index`.
