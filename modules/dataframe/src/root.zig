@@ -655,6 +655,7 @@ test {
     _ = @import("fuzz_s2_test.zig");
     _ = @import("jsonread_test.zig");
     _ = @import("parity_test.zig");
+    _ = @import("parity_z1_test.zig");
     _ = @import("time_ops_test.zig");
     _ = @import("binary_test.zig");
     _ = @import("parity_c_test.zig");

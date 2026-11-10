@@ -19,11 +19,11 @@ the name it had under `tabular`, which `BENCH_PY` defaults to):
 ```bash
 python3 -m venv .zig-cache/tabular-oracle-venv
 .zig-cache/tabular-oracle-venv/bin/pip install --only-binary :all: \
-    pandas==3.1.0 polars==2.1.0 duckdb==2.0.0 pyarrow==26.0.0 numpy==2.5.4
+    pandas==3.1.0 polars==2.1.0 duckdb==2.0.0 pyarrow==26.0.0 numpy==2.5.4 scipy==1.18.1
 ```
 
-pandas is BSD-3-Clause, polars and DuckDB MIT, pyarrow Apache-2.0, numpy BSD-3-Clause; none of
-their source was read or copied, and no output of theirs other than the vectors is committed.
+pandas is BSD-3-Clause, polars and DuckDB MIT, pyarrow Apache-2.0, numpy and SciPy BSD-3-Clause; none of
+their source was copied (the Z1 `interpolate` methods were written after reading SciPy's `scipy/interpolate` and pandas' `core/missing.py` to match the call shapes and edge rules), and no output of theirs other than the vectors is committed.
 
 ## Re-taking the vectors
 
