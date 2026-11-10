@@ -429,17 +429,26 @@ fn inSet(set: []const u8, cp: u21) bool {
 
 const whitespace = " \t\r\n\x0b\x0c";
 
-/// Strip the characters of `chars` (whitespace when null) from `side` (pandas
-/// `strip(to_strip)`/`lstrip`/`rstrip`, polars `strip_chars`/`_start`/`_end`).
+/// The characters a null `chars` strips. A valid UTF-8 cell: Python's `str.isspace`
+/// (`unitext.isSpaceCp`, pandas `strip()`; polars' White_Space is the same except U+001C..U+001F,
+/// which only Python counts). An ill-formed cell is bytes: the six ASCII whitespace bytes.
+fn isStripSpace(cp: u21, valid: bool) bool {
+    if (valid) return ut.isSpaceCp(cp);
+    return cp < 0x80 and std.mem.findScalar(u8, whitespace, @intCast(cp)) != null;
+}
+
+/// Strip the characters of `chars` (Unicode whitespace when null, see `isStripSpace`) from `side`
+/// (pandas `strip(to_strip)`/`lstrip`/`rstrip`, polars `strip_chars`/`_start`/`_end`). Explicit
+/// `chars` is a set of characters, matched exactly.
 pub fn stripChars(t: []const u8, chars: ?[]const u8, side: StripSide) []const u8 {
-    const set = chars orelse whitespace;
+    const set = chars orelse "";
     const valid = std.unicode.utf8ValidateSlice(t);
     var lo: usize = 0;
     var hi: usize = t.len;
     if (side != .end) {
         while (lo < hi) {
             const d = decodeAt(t, lo, valid);
-            if (!inSet(set, d.cp)) break;
+            if (!(if (chars == null) isStripSpace(d.cp, valid) else inSet(set, d.cp))) break;
             lo += d.len;
         }
     }
@@ -451,7 +460,7 @@ pub fn stripChars(t: []const u8, chars: ?[]const u8, side: StripSide) []const u8
                 while (s > lo and t[s] & 0xC0 == 0x80) s -= 1;
             }
             const d = decodeAt(t, s, valid);
-            if (!inSet(set, d.cp)) break;
+            if (!(if (chars == null) isStripSpace(d.cp, valid) else inSet(set, d.cp))) break;
             hi = s;
         }
     }

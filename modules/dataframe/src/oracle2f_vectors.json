@@ -4026,7 +4026,12 @@ null,
 "ß",
 "ǅ",
 "Ⅻ",
-"ａｂ"
+"ａｂ",
+"किताब",
+"सः",
+"กิน",
+"ः",
+"ा"
 ],
 "names": [
 "abc",
@@ -4046,7 +4051,17 @@ null,
 "x²",
 "Ⅻ",
 "ａｂ",
-"１２"
+"１２",
+"किताब",
+"सः",
+"กิน",
+"हिन्दी",
+"नमस्ते",
+"é",
+"ः",
+"ा",
+"Ⅻ१",
+"किताब१"
 ],
 "sel": "alpha"
 },
@@ -4067,7 +4082,14 @@ null,
 "ǅ",
 "Ⅻ",
 "ａｂ",
-"１２"
+"１２",
+"किताब",
+"सः",
+"กิน",
+"ः",
+"ा",
+"Ⅻ१",
+"किताब१"
 ],
 "names": [
 "abc",
@@ -4087,7 +4109,17 @@ null,
 "x²",
 "Ⅻ",
 "ａｂ",
-"１２"
+"１２",
+"किताब",
+"सः",
+"กิน",
+"हिन्दी",
+"नमस्ते",
+"é",
+"ः",
+"ा",
+"Ⅻ१",
+"किताब१"
 ],
 "sel": "alphanumeric"
 },
@@ -4118,7 +4150,17 @@ null,
 "x²",
 "Ⅻ",
 "ａｂ",
-"１２"
+"１２",
+"किताब",
+"सः",
+"กิน",
+"हिन्दी",
+"नमस्ते",
+"é",
+"ः",
+"ा",
+"Ⅻ१",
+"किताब१"
 ],
 "sel": "digit"
 },
@@ -4189,5 +4231,929 @@ null,
 "ﬁ"
 ],
 "op": "upper"
+},
+{
+"id": "strip-strip-pd",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"a",
+"a",
+"a",
+"a",
+"a",
+"a",
+"​a​",
+"a",
+"a",
+"a b",
+"",
+"",
+"",
+null,
+"a b",
+"​",
+"été",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"a",
+"​"
+],
+"op": "strip",
+"cols": {
+"x": [
+" a ",
+"\ta\n",
+" a ",
+" a ",
+"　a　",
+"a",
+"​a​",
+" a ",
+" a  ",
+" a b ",
+"  ",
+" 　",
+"",
+null,
+"a b",
+"​",
+"  été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​ "
+]
+}
+},
+{
+"id": "strip-strip-pl",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"a",
+"a",
+"a",
+"a",
+"a",
+"a",
+"​a​",
+"a",
+"a",
+"a b",
+"",
+"",
+"",
+null,
+"a b",
+"​",
+"été",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"a",
+"​"
+],
+"op": "strip",
+"cols": {
+"x": [
+" a ",
+"\ta\n",
+" a ",
+" a ",
+"　a　",
+"a",
+"​a​",
+" a ",
+" a  ",
+" a b ",
+"  ",
+" 　",
+"",
+null,
+"a b",
+"​",
+"  été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​ "
+]
+}
+},
+{
+"id": "strip-chars-strip-pd",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"a",
+"a",
+"a",
+"a",
+"a",
+"a",
+"​a​",
+"a",
+"a",
+"a b",
+"",
+"",
+"",
+null,
+"a b",
+"​",
+"été",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"a",
+"​"
+],
+"op": "strip_chars",
+"side": "both",
+"cols": {
+"x": [
+" a ",
+"\ta\n",
+" a ",
+" a ",
+"　a　",
+"a",
+"​a​",
+" a ",
+" a  ",
+" a b ",
+"  ",
+" 　",
+"",
+null,
+"a b",
+"​",
+"  été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​ "
+]
+}
+},
+{
+"id": "strip-chars-strip-pl",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"a",
+"a",
+"a",
+"a",
+"a",
+"a",
+"​a​",
+"a",
+"a",
+"a b",
+"",
+"",
+"",
+null,
+"a b",
+"​",
+"été",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"a",
+"​"
+],
+"op": "strip_chars",
+"side": "both",
+"cols": {
+"x": [
+" a ",
+"\ta\n",
+" a ",
+" a ",
+"　a　",
+"a",
+"​a​",
+" a ",
+" a  ",
+" a b ",
+"  ",
+" 　",
+"",
+null,
+"a b",
+"​",
+"  été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​ "
+]
+}
+},
+{
+"id": "strip-lstrip-pd",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"a ",
+"a\n",
+"a ",
+"a ",
+"a　",
+"a",
+"​a​",
+"a ",
+"a  ",
+"a b ",
+"",
+"",
+"",
+null,
+"a b",
+"​",
+"été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"a",
+"​ "
+],
+"op": "lstrip",
+"cols": {
+"x": [
+" a ",
+"\ta\n",
+" a ",
+" a ",
+"　a　",
+"a",
+"​a​",
+" a ",
+" a  ",
+" a b ",
+"  ",
+" 　",
+"",
+null,
+"a b",
+"​",
+"  été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​ "
+]
+}
+},
+{
+"id": "strip-lstrip-pl",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"a ",
+"a\n",
+"a ",
+"a ",
+"a　",
+"a",
+"​a​",
+"a ",
+"a  ",
+"a b ",
+"",
+"",
+"",
+null,
+"a b",
+"​",
+"été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"a",
+"​ "
+],
+"op": "lstrip",
+"cols": {
+"x": [
+" a ",
+"\ta\n",
+" a ",
+" a ",
+"　a　",
+"a",
+"​a​",
+" a ",
+" a  ",
+" a b ",
+"  ",
+" 　",
+"",
+null,
+"a b",
+"​",
+"  été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​ "
+]
+}
+},
+{
+"id": "strip-chars-lstrip-pd",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"a ",
+"a\n",
+"a ",
+"a ",
+"a　",
+"a",
+"​a​",
+"a ",
+"a  ",
+"a b ",
+"",
+"",
+"",
+null,
+"a b",
+"​",
+"été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"a",
+"​ "
+],
+"op": "strip_chars",
+"side": "start",
+"cols": {
+"x": [
+" a ",
+"\ta\n",
+" a ",
+" a ",
+"　a　",
+"a",
+"​a​",
+" a ",
+" a  ",
+" a b ",
+"  ",
+" 　",
+"",
+null,
+"a b",
+"​",
+"  été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​ "
+]
+}
+},
+{
+"id": "strip-chars-lstrip-pl",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"a ",
+"a\n",
+"a ",
+"a ",
+"a　",
+"a",
+"​a​",
+"a ",
+"a  ",
+"a b ",
+"",
+"",
+"",
+null,
+"a b",
+"​",
+"été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"a",
+"​ "
+],
+"op": "strip_chars",
+"side": "start",
+"cols": {
+"x": [
+" a ",
+"\ta\n",
+" a ",
+" a ",
+"　a　",
+"a",
+"​a​",
+" a ",
+" a  ",
+" a b ",
+"  ",
+" 　",
+"",
+null,
+"a b",
+"​",
+"  été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​ "
+]
+}
+},
+{
+"id": "strip-rstrip-pd",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+" a",
+"\ta",
+" a",
+" a",
+"　a",
+"a",
+"​a​",
+" a",
+" a",
+" a b",
+"",
+"",
+"",
+null,
+"a b",
+"​",
+"  été",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​"
+],
+"op": "rstrip",
+"cols": {
+"x": [
+" a ",
+"\ta\n",
+" a ",
+" a ",
+"　a　",
+"a",
+"​a​",
+" a ",
+" a  ",
+" a b ",
+"  ",
+" 　",
+"",
+null,
+"a b",
+"​",
+"  été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​ "
+]
+}
+},
+{
+"id": "strip-rstrip-pl",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+" a",
+"\ta",
+" a",
+" a",
+"　a",
+"a",
+"​a​",
+" a",
+" a",
+" a b",
+"",
+"",
+"",
+null,
+"a b",
+"​",
+"  été",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​"
+],
+"op": "rstrip",
+"cols": {
+"x": [
+" a ",
+"\ta\n",
+" a ",
+" a ",
+"　a　",
+"a",
+"​a​",
+" a ",
+" a  ",
+" a b ",
+"  ",
+" 　",
+"",
+null,
+"a b",
+"​",
+"  été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​ "
+]
+}
+},
+{
+"id": "strip-chars-rstrip-pd",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+" a",
+"\ta",
+" a",
+" a",
+"　a",
+"a",
+"​a​",
+" a",
+" a",
+" a b",
+"",
+"",
+"",
+null,
+"a b",
+"​",
+"  été",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​"
+],
+"op": "strip_chars",
+"side": "end",
+"cols": {
+"x": [
+" a ",
+"\ta\n",
+" a ",
+" a ",
+"　a　",
+"a",
+"​a​",
+" a ",
+" a  ",
+" a b ",
+"  ",
+" 　",
+"",
+null,
+"a b",
+"​",
+"  été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​ "
+]
+}
+},
+{
+"id": "strip-chars-rstrip-pl",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+" a",
+"\ta",
+" a",
+" a",
+"　a",
+"a",
+"​a​",
+" a",
+" a",
+" a b",
+"",
+"",
+"",
+null,
+"a b",
+"​",
+"  été",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​"
+],
+"op": "strip_chars",
+"side": "end",
+"cols": {
+"x": [
+" a ",
+"\ta\n",
+" a ",
+" a ",
+"　a　",
+"a",
+"​a​",
+" a ",
+" a  ",
+" a b ",
+"  ",
+" 　",
+"",
+null,
+"a b",
+"​",
+"  été  ",
+"x y",
+"᠎a᠎",
+"﻿a﻿",
+"\t\u000b\f\ra",
+" ​ "
+]
+}
+},
+{
+"id": "strip-c0-strip-pd",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"a",
+"a",
+"a",
+""
+],
+"op": "strip",
+"cols": {
+"x": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+]
+}
+},
+{
+"id": "strip-c0-strip-pl",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+],
+"op": "strip",
+"cols": {
+"x": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+]
+}
+},
+{
+"id": "strip-c0-chars-strip-pd",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"a",
+"a",
+"a",
+""
+],
+"op": "strip_chars",
+"side": "both",
+"cols": {
+"x": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+]
+}
+},
+{
+"id": "strip-c0-chars-strip-pl",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+],
+"op": "strip_chars",
+"side": "both",
+"cols": {
+"x": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+]
+}
+},
+{
+"id": "strip-c0-lstrip-pd",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"a\u001d",
+"a\u001e",
+"a\u001c",
+""
+],
+"op": "lstrip",
+"cols": {
+"x": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+]
+}
+},
+{
+"id": "strip-c0-lstrip-pl",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+],
+"op": "lstrip",
+"cols": {
+"x": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+]
+}
+},
+{
+"id": "strip-c0-chars-lstrip-pd",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"a\u001d",
+"a\u001e",
+"a\u001c",
+""
+],
+"op": "strip_chars",
+"side": "start",
+"cols": {
+"x": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+]
+}
+},
+{
+"id": "strip-c0-chars-lstrip-pl",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+],
+"op": "strip_chars",
+"side": "start",
+"cols": {
+"x": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+]
+}
+},
+{
+"id": "strip-c0-rstrip-pd",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"\u001ca",
+"\u001fa",
+"a",
+""
+],
+"op": "rstrip",
+"cols": {
+"x": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+]
+}
+},
+{
+"id": "strip-c0-rstrip-pl",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+],
+"op": "rstrip",
+"cols": {
+"x": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+]
+}
+},
+{
+"id": "strip-c0-chars-rstrip-pd",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"\u001ca",
+"\u001fa",
+"a",
+""
+],
+"op": "strip_chars",
+"side": "end",
+"cols": {
+"x": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+]
+}
+},
+{
+"id": "strip-c0-chars-rstrip-pl",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+],
+"op": "strip_chars",
+"side": "end",
+"cols": {
+"x": [
+"\u001ca\u001d",
+"\u001fa\u001e",
+"a\u001c",
+"\u001c"
+]
+}
 }
 ]

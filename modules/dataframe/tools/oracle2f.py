@@ -161,7 +161,10 @@ def g_classes():
         run(name, one)
 
 
-NAMES = ["abc", "ABC", "abc1", "123", "٣٤٥", "²³", "½", "Žluťoučký", "日本語", "a b", "a_b", "été", "ß", "ǅ", "x²", "Ⅻ", "ａｂ", "１２"]
+# The last block holds combining vowel signs (Other_Alphabetic: Devanagari ि ा ः, Thai ิ), a virama
+# (Mn, not Alphabetic), a plain combining acute (Mn, not Alphabetic) and a Mc sign alone.
+NAMES = ["abc", "ABC", "abc1", "123", "٣٤٥", "²³", "½", "Žluťoučký", "日本語", "a b", "a_b", "été", "ß", "ǅ", "x²", "Ⅻ", "ａｂ", "１２",
+         "किताब", "सः", "กิน", "हिन्दी", "नमस्ते", "e\u0301", "\u0903", "ा", "Ⅻ१", "किताब१"]
 
 
 def g_names():
@@ -186,7 +189,41 @@ def g_names():
     ren("upper", lambda: pl.all().name.to_uppercase())
 
 
-for g in (g_case, g_unaccent, g_classes, g_names):
+# Whitespace around text: `strip`/`lstrip`/`rstrip` (pandas, Python `str.strip()`) and `strip_chars` with no
+# characters (polars, Rust `White_Space`). U+200B ZERO WIDTH SPACE is not whitespace in either; U+0085, U+00A0,
+# U+2003, U+3000 are in both.
+WS_TEXTS = [
+    " a ", "\ta\n", "\u00a0a\u00a0", "\u2003a\u2003", "\u3000a\u3000", "\u0085a\u0085", "\u200ba\u200b",
+    "\u2028a\u2029", "\u1680a\u202f\u205f", "\u2000a b\u200a", "  ", "\u00a0\u3000", "", None, "a b", "\u200b",
+    "\u00a0 \u00e9t\u00e9 \u00a0", "x\u00a0y", "\u180ea\u180e", "\ufeffa\ufeff", "\u0009\u000b\u000c\u000da",
+    "\u00a0\u200b\u00a0",
+]
+# U+001C..U+001F: Python's isspace (so pandas strips them), not Rust's White_Space (polars keeps them).
+C0_TEXTS = ["\x1ca\x1d", "\x1fa\x1e", "a\x1c", "\x1c"]
+
+
+def g_strip():
+    for texts, tag in ((WS_TEXTS, "strip"), (C0_TEXTS, "strip-c0")):
+        pdf = pl.DataFrame({"x": texts}, schema={"x": pl.String})
+        for name, op, pf, side in (
+            ("strip", "strip", lambda: pl.col("x").str.strip_chars(), "both"),
+            ("lstrip", "lstrip", lambda: pl.col("x").str.strip_chars_start(), "start"),
+            ("rstrip", "rstrip", lambda: pl.col("x").str.strip_chars_end(), "end"),
+        ):
+            def one(name=name, op=op, pf=pf, side=side, texts=texts, tag=tag, pdf=pdf):
+                a = cells(getattr(pser(texts).str, name)().tolist())
+                b = cells(pdf.select(pf().alias("o"))["o"].to_list())
+                case(f"{tag}-{name}-pd", "expr", "pandas", a, op=op, cols={"x": texts})
+                case(f"{tag}-{name}-pl", "expr", "polars", b, op=op, cols={"x": texts})
+                # `strip_chars` with null chars is the same function under another name here.
+                case(f"{tag}-chars-{name}-pd", "expr", "pandas", a, op="strip_chars", side=side, cols={"x": texts})
+                case(f"{tag}-chars-{name}-pl", "expr", "polars", b, op="strip_chars", side=side, cols={"x": texts})
+                diff = [(t, x, y) for t, x, y in zip(texts, a, b) if x != y]
+                notes.append(f"{tag} {name}: pandas(Python) vs polars differ on {len(diff)} cells: {diff[:4]}")
+            run(f"{tag}-{name}", one)
+
+
+for g in (g_case, g_unaccent, g_classes, g_names, g_strip):
     try:
         g()
     except Exception as e:  # noqa: BLE001

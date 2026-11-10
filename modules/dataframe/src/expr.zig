@@ -1703,7 +1703,7 @@ fn evalUnary(a: std.mem.Allocator, op: Unary, v: Value) Error!Value {
             return switch (op) {
                 .lower => .{ .text = try fnx.lower(a, t) },
                 .upper => .{ .text = try fnx.upper(a, t) },
-                .strip => .{ .text = std.mem.trim(u8, t, " \t\r\n\x0b\x0c") },
+                .strip => .{ .text = fnx.stripChars(t, null, .both) },
                 else => .{ .int = @intCast(std.unicode.utf8CountCodepoints(t) catch t.len) },
             };
         },

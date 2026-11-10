@@ -221,3 +221,79 @@ test "w8 names: rename lower/upper by the Unicode mapping, selectors by Unicode 
     const alnum = try st.selectColumns(a, f, .alphanumeric);
     try testing.expectEqual(@as(usize, 6 - 1), alnum.len); // not the superscript two
 }
+
+test "w8 strip: Unicode whitespace around valid text, Python str.strip() (U4)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    // U+00A0, U+2003, U+3000, U+0085 and U+001C are whitespace to Python's `str.strip()` (isspace);
+    // U+200B ZERO WIDTH SPACE and U+FEFF are not.
+    try expectText("a", fnx.stripChars("\u{A0}a\u{A0}", null, .both));
+    try expectText("a", fnx.stripChars("\u{2003}a\u{3000}", null, .both));
+    try expectText("a", fnx.stripChars("\u{85}a\u{85}", null, .both));
+    try expectText("a", fnx.stripChars("\x1ca\x1d", null, .both));
+    try expectText("a\u{A0}", fnx.stripChars("\u{A0}a\u{A0}", null, .start));
+    try expectText("\u{A0}a", fnx.stripChars("\u{A0}a\u{A0}", null, .end));
+    try expectText("\u{200B}a\u{200B}", fnx.stripChars("\u{200B}a\u{200B}", null, .both));
+    try expectText("a\u{A0}b", fnx.stripChars(" \u{A0}a\u{A0}b\u{2028}\u{2029} ", null, .both));
+    try expectText("", fnx.stripChars("\u{A0}\u{3000} \t", null, .both));
+    try expectText("\u{200B}", fnx.stripChars("\u{A0}\u{200B}\u{A0}", null, .both));
+    // Through the three `Unary` ops and `strip_chars` with null chars.
+    const f = try textFrame(a, &.{ "\u{A0}é\u{3000}", null, "\u{2003}x" });
+    const x = try a.create(ex.Expr);
+    x.* = .{ .col = "x" };
+    const out = try ex.mutate(a, f, &.{
+        .{ .out = "s", .expr = .{ .unary = .{ .op = .strip, .x = x } } },
+        .{ .out = "l", .expr = .{ .unary = .{ .op = .lstrip, .x = x } } },
+        .{ .out = "r", .expr = .{ .unary = .{ .op = .rstrip, .x = x } } },
+        .{ .out = "c", .expr = .{ .strip_chars = .{ .x = x, .chars = null, .side = .both } } },
+    });
+    try expectText("é", out.series("s").?.get(0).text);
+    try expectText("é\u{3000}", out.series("l").?.get(0).text);
+    try expectText("\u{A0}é", out.series("r").?.get(0).text);
+    try expectText("é", out.series("c").?.get(0).text);
+    try testing.expect(out.series("s").?.get(1) == .null);
+    try expectText("x", out.series("s").?.get(2).text);
+    // Explicit chars stay exact: U+00A0 is stripped only when it is listed.
+    try expectText("\u{A0}a", fnx.stripChars("\u{A0}a\u{A0}", "\u{A0}", .end));
+    try expectText("a", fnx.stripChars("\u{A0}a\u{A0}", "\u{A0}", .both));
+    try expectText(" a ", fnx.stripChars(" a ", "\u{A0}", .both));
+}
+
+test "w8 strip: a cell that is not valid UTF-8 is bytes, ASCII whitespace only (U4)" {
+    // The module's policy: no code points, so only the six ASCII whitespace bytes go; 0x85 and 0xA0 as
+    // bytes are not whitespace, and neither are 0x1C..0x1F (as before U4).
+    try expectText("\xffa\xff", fnx.stripChars(" \t\xffa\xff\n ", null, .both));
+    try expectText("\xA0a\xFF", fnx.stripChars("\xA0a\xFF", null, .both));
+    try expectText("\xC2\xA0\xFF", fnx.stripChars("\xC2\xA0\xFF", null, .both)); // a would-be U+00A0 next to a stray byte
+    try expectText("\x1ca\xff", fnx.stripChars("\x1ca\xff ", null, .both));
+}
+
+test "w8 names: alpha / alphanumeric selectors use the Alphabetic property, combining vowel signs count (U3)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    // Devanagari ि ा, Thai ิ and Devanagari ः are Other_Alphabetic; the virama (U+094D) and a combining
+    // acute (U+0301) are not; digits stay Nd (the Devanagari digit one is Nd).
+    const names = [_][]const u8{ "किताब", "सः", "กิน", "हिन्दी", "e\u{301}", "किताब१", "१२", "Ⅻ", "x²", "abc" };
+    const cols = try a.alloc(vm.Column, names.len);
+    const data = try a.alloc(fm.ColumnData, names.len);
+    for (cols, data, names) |*c, *d, n| {
+        c.* = .{ .name = n, .type = .int };
+        d.* = try fm.columnFromCells(a, &.{.{ .int = 1 }});
+    }
+    const f: Frame = .{ .columns = cols, .data = data, .len = 1 };
+    const alpha = try st.selectColumns(a, f, .alpha);
+    try testing.expectEqual(@as(usize, 5), alpha.len);
+    try expectText("किताब", alpha[0]);
+    try expectText("सः", alpha[1]);
+    try expectText("กิน", alpha[2]);
+    try expectText("Ⅻ", alpha[3]);
+    try expectText("abc", alpha[4]);
+    const alnum = try st.selectColumns(a, f, .alphanumeric);
+    try testing.expectEqual(@as(usize, 7), alnum.len); // the five, plus "किताब१" and "१२"
+    try expectText("किताब१", alnum[3]);
+    const digit = try st.selectColumns(a, f, .digit);
+    try testing.expectEqual(@as(usize, 1), digit.len);
+    try expectText("१२", digit[0]);
+}

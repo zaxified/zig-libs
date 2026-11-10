@@ -310,12 +310,11 @@ fn patternKey(p: []const u8) [2]usize {
     return .{ @intFromPtr(p.ptr), p.len };
 }
 
-/// polars' `cs.alpha()` class for one code point: the letters of Python's `isalpha` and
-/// the letter numbers (`Ⅻ`). polars uses the Alphabetic property, which also holds some
-/// combining vowel signs (Other_Alphabetic, e.g. Devanagari `ा`); `unitext` has no such
-/// property, so those names are not alpha here.
+/// polars' `cs.alpha()` class for one code point: the Alphabetic property (letters, letter
+/// numbers such as `Ⅻ`, and the combining vowel signs of Other_Alphabetic such as Devanagari
+/// `ा`), which is `unitext.isAlphabeticCp`; Python's narrower `isalpha` is not used here.
 fn nameAlpha(cp: u21) bool {
-    return ut.isAlphaCp(cp) or ut.generalCategory(cp) == .Nl;
+    return ut.isAlphabeticCp(cp);
 }
 
 fn nameAlnum(cp: u21) bool {

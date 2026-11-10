@@ -10,6 +10,7 @@ const fm = @import("frame.zig");
 const ex = @import("expr.zig");
 const st = @import("structure.zig");
 const nm = @import("names.zig");
+const fnx = @import("exprfn.zig");
 const Frame = fm.Frame;
 const Column = vm.Column;
 const Value = vm.Value;
@@ -18,8 +19,9 @@ const J = std.json.Value;
 const vectors = @embedFile("oracle2f_vectors.json");
 
 /// Deliberate differences from what the engines answered: id substring and why.
-const known = [_]struct { id: []const u8, why: []const u8 }{
+const known = [_]struct { id: []const u8, why: []const u8, pl_only: bool = false }{
     .{ .id = "title-pl", .why = "polars `to_titlecase` treats an apostrophe as part of the word (They're); pandas and Python title() start a word after it (They'Re), and that is what `title` follows" },
+    .{ .id = "strip-c0-", .pl_only = true, .why = "U+001C..U+001F are whitespace to Python `str.strip()` (pandas, which `strip`/`lstrip`/`rstrip`/`strip_chars` follow, as `is_space` already does) and not to Rust's White_Space (polars keeps them); only the `-pl` answers differ, the `-pd` ones are replayed" },
     .{ .id = "unaccent-recipe", .why = "checked against the pandas NFKD recipe in a separate test on the cells both agree on (run below with the same vectors)" },
 };
 
@@ -65,7 +67,7 @@ fn fail(id: []const u8, comptime fmt: []const u8, args: anytype) void {
 }
 
 fn isKnown(id: []const u8) bool {
-    for (known) |k| if (std.mem.find(u8, id, k.id) != null) return true;
+    for (known) |k| if (std.mem.find(u8, id, k.id) != null and (!k.pl_only or std.mem.endsWith(u8, id, "-pl"))) return true;
     return false;
 }
 
@@ -78,6 +80,8 @@ fn runExpr(a: std.mem.Allocator, c: J) !void {
     x.* = .{ .col = "x" };
     const e: ex.Expr = if (std.mem.eql(u8, op, "normalize"))
         .{ .normalize = .{ .x = x, .form = std.meta.stringToEnum(ex.NormalForm, strOf(c, "form").?).? } }
+    else if (std.mem.eql(u8, op, "strip_chars"))
+        .{ .strip_chars = .{ .x = x, .chars = null, .side = std.meta.stringToEnum(fnx.StripSide, strOf(c, "side").?).? } }
     else
         .{ .unary = .{ .op = std.meta.stringToEnum(ex.Unary, op).?, .x = x } };
     const out = try ex.mutate(a, f, &.{.{ .out = "o", .expr = e }});
