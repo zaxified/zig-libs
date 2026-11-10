@@ -9,6 +9,7 @@ const std = @import("std");
 const vm = @import("value.zig");
 const fm = @import("frame.zig");
 const keys = @import("keys.zig");
+const dtype = @import("dtype.zig");
 const core = @import("core.zig");
 const sp = @import("spec.zig");
 const verbs = @import("verbs.zig");
@@ -67,8 +68,9 @@ pub fn clone(a: std.mem.Allocator, f: Frame) Error!Frame {
     for (data, 0..) |*d, ci| {
         const col = f.columnAt(ci);
         for (cells, 0..) |*c, ri| c.* = col.get(ri);
-        // `columnFromCells` copies text; the boxed path copies it as well.
-        d.* = try fm.columnFromCells(a, cells);
+        // `columnFromCells` copies text; the boxed path copies it as well. A width column
+        // gets its own array again.
+        d.* = try fm.conform(a, try fm.columnFromCells(a, cells), f.columns[ci].type, f.len);
     }
     return .{ .columns = cols, .data = data, .len = f.len };
 }
@@ -258,7 +260,8 @@ pub fn addAffix(a: std.mem.Allocator, f: Frame, spec: AffixSpec) Error!Frame {
 /// (`.all_of = &.{ include, .{ .not = &exclude } }`).
 pub const Selector = union(enum) {
     all,
-    /// `.int`, `.float`, `.decimal` (pandas `"number"`, polars `cs.numeric()`).
+    /// Every integer and float type (Int64 and the widths, Float64 and Float32) and `.decimal`
+    /// (pandas `"number"`, polars `cs.numeric()`).
     numeric,
     /// `.date`, `.timestamp` (polars `cs.temporal()`).
     temporal,
@@ -337,7 +340,7 @@ fn matches(f: Frame, ci: usize, s: Selector, depth: usize, budget: *usize, pats:
     const c = f.columns[ci];
     return switch (s) {
         .all => true,
-        .numeric => c.type == .int or c.type == .float or c.type == .decimal,
+        .numeric => dtype.isNumeric(c.type) or c.type == .decimal,
         .temporal => c.type == .date or c.type == .timestamp,
         .text => c.type == .text,
         .boolean => c.type == .bool,
@@ -518,7 +521,7 @@ pub fn info(a: std.mem.Allocator, f: Frame) Error!Frame {
         const s: Series = .{ .name = f.columns[ci].name, .type = f.columns[ci].type, .data = f.columnAt(ci), .len = f.len };
         const nc = s.nullCount();
         names[ci] = .{ .text = s.name };
-        types[ci] = .{ .text = @tagName(s.type) };
+        types[ci] = .{ .text = if (dtype.isWidth(s.type)) dtype.name(s.type) else @tagName(s.type) };
         non_null[ci] = .{ .int = @intCast(f.len - nc) };
         nulls[ci] = .{ .int = @intCast(nc) };
         bytes[ci] = .{ .int = @intCast(@min(columnBytes(f, ci), std.math.maxInt(i64))) };
@@ -542,8 +545,8 @@ fn sameCell(x: Value, y: Value) bool {
     const yn = y == .float and std.math.isNan(y.float);
     if (xn or yn) return xn and yn;
     if (x == .null or y == .null) return x == .null and y == .null;
-    const xnum = x == .int or x == .float or x == .decimal;
-    const ynum = y == .int or y == .float or y == .decimal;
+    const xnum = x.asFloat() != null; // .int, .uint, .float, .decimal
+    const ynum = y.asFloat() != null;
     if (xnum != ynum) return false;
     if (!xnum and std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
     return x.order(y) == .eq;
@@ -605,10 +608,20 @@ pub fn transpose(a: std.mem.Allocator, f: Frame, spec: TransposeSpec) Error!Fram
     var all_num = true;
     for (src.items) |ci| {
         const t = f.columns[ci].type;
-        all_num = all_num and (t == .int or t == .float or t == .decimal);
+        all_num = all_num and (dtype.isNumeric(t) or t == .decimal);
         if (ty) |u| mixed = mixed or u != t else ty = t;
     }
-    const out_ty: ColumnType = if (!mixed) (ty orelse .float) else if (all_num) .float else .text;
+    // Numbers of different types meet in their supertype (a decimal among them: a float).
+    var meet: ColumnType = .float;
+    if (mixed and all_num) {
+        var acc: ?ColumnType = null;
+        for (src.items) |ci| {
+            const t = f.columns[ci].type;
+            acc = if (acc) |u| (dtype.supertype(u, t) orelse .float) else t;
+        }
+        meet = acc orelse .float;
+    }
+    const out_ty: ColumnType = if (!mixed) (ty orelse .float) else if (all_num) meet else .text;
     // Timestamps in one zone stay in it; in several, the instants stay and the zone goes.
     var out_zone: ?[]const u8 = null;
     if (out_ty == .timestamp and src.items.len > 0) {
@@ -621,7 +634,7 @@ pub fn transpose(a: std.mem.Allocator, f: Frame, spec: TransposeSpec) Error!Fram
             }
         }
     }
-    const to_float = mixed and all_num;
+    const to_float = mixed and all_num and dtype.isFloat(out_ty);
 
     const has_header = spec.header_name != null;
     const width = f.len + @intFromBool(has_header);
@@ -651,7 +664,7 @@ pub fn transpose(a: std.mem.Allocator, f: Frame, spec: TransposeSpec) Error!Fram
             c.* = if (to_float and v != .null) (if (v.asFloat()) |x| .{ .float = x } else v) else v;
         }
         cols[k + ri] = .{ .name = name, .type = out_ty, .time_zone = out_zone };
-        data[k + ri] = try fm.columnFromCells(a, cells);
+        data[k + ri] = try fm.conform(a, try fm.columnFromCells(a, cells), out_ty, m);
     }
     try checkUniqueHashed(a, cols);
     return .{ .columns = cols, .data = data, .len = m };

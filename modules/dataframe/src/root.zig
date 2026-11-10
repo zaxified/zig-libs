@@ -605,6 +605,7 @@ test {
     _ = @import("s2w10_oracle_test.zig");
     _ = @import("s2w11_oracle_test.zig");
     _ = @import("s2w11_test.zig");
+    _ = @import("s2w11b_test.zig");
     _ = @import("dtype.zig");
     _ = jsonio;
     _ = jsonread;

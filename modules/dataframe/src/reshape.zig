@@ -16,6 +16,7 @@ const verbs = @import("verbs.zig");
 const ex = @import("expr.zig");
 const an = @import("analysis.zig");
 const st = @import("structure.zig");
+const dtype = @import("dtype.zig");
 const dtf = @import("dtfn.zig");
 const regex = @import("regex");
 const Column = vm.Column;
@@ -127,8 +128,8 @@ pub const max_join_where_pairs: usize = 1 << 26;
 
 fn compareHolds(op: sp.CmpOp, l: Value, r: Value) bool {
     if (isMissing(l) or isMissing(r)) return false;
-    const ln = l == .int or l == .float or l == .decimal;
-    const rn = r == .int or r == .float or r == .decimal;
+    const ln = l.asFloat() != null; // .int, .uint, .float, .decimal
+    const rn = r.asFloat() != null;
     if (ln != rn) return false;
     if (!ln and std.meta.activeTag(l) != std.meta.activeTag(r)) return false;
     const o = l.order(r);
@@ -264,7 +265,7 @@ fn fillGaps(a: std.mem.Allocator, f: Frame, left: Frame, on: []const []const u8)
             if (mark.get(row) != .null) last = f.columnAt(ci).get(row);
             x.* = last;
         }
-        data[ci] = try fm.columnFromCells(a, cells);
+        data[ci] = try fm.conform(a, try fm.columnFromCells(a, cells), c.type, f.len);
     }
     return verbs.select(a, .{ .columns = f.columns, .data = data, .len = f.len }, keep);
 }
@@ -528,14 +529,14 @@ pub fn combineFirst(a: std.mem.Allocator, f: Frame, g: Frame) Error!Frame {
             o.* = if (!isMissing(v)) v else if (other) |gi| (if (ri < g.len) g.columnAt(gi).get(ri) else .null) else v;
         }
         try cols.append(a, c);
-        try data.append(a, try fm.columnFromCells(a, cells));
+        try data.append(a, try fm.conform(a, try fm.columnFromCells(a, cells), c.type, rows));
     }
     for (g.columns, 0..) |c, gi| {
         if (f_names.get(c.name) != null) continue;
         const gc = g.columnAt(gi);
         for (cells, 0..) |*o, ri| o.* = if (ri < g.len) gc.get(ri) else .null;
         try cols.append(a, c);
-        try data.append(a, try fm.columnFromCells(a, cells));
+        try data.append(a, try fm.conform(a, try fm.columnFromCells(a, cells), c.type, rows));
     }
     return .{ .columns = cols.items, .data = data.items, .len = rows };
 }
@@ -558,7 +559,7 @@ pub fn update(a: std.mem.Allocator, f: Frame, g: Frame) Error!Frame {
             const v: Value = if (ri < g.len) gc.get(ri) else .null;
             o.* = if (!isMissing(v)) v else fc.get(ri);
         }
-        data[ci] = try fm.columnFromCells(a, cells);
+        data[ci] = try fm.conform(a, try fm.columnFromCells(a, cells), c.type, f.len);
     }
     return .{ .columns = f.columns, .data = data, .len = f.len };
 }
@@ -630,10 +631,17 @@ pub fn scatter(a: std.mem.Allocator, f: Frame, spec: ScatterSpec) Error!Frame {
     for (spec.idx, 0..) |i, k| {
         const r = if (i < 0) n + i else i;
         if (r < 0 or r >= n) return error.IndexOutOfBounds;
-        cells[@intCast(r)] = if (spec.values.len == 1) spec.values[0] else spec.values[k];
+        const v = if (spec.values.len == 1) spec.values[0] else spec.values[k];
+        // A column of a width holds only values of it: a value that is not one is refused
+        // (`conform` would make it null).
+        if (dtype.isWidth(f.columns[ci].type) and v != .null) {
+            const held = v.cast(f.columns[ci].type) orelse return error.BadArgument;
+            if (!held.eql(v)) return error.BadArgument; // a fraction, say
+        }
+        cells[@intCast(r)] = v;
     }
     const data = try shared(a, f);
-    data[ci] = try fm.columnFromCells(a, cells);
+    data[ci] = try fm.conform(a, try fm.columnFromCells(a, cells), f.columns[ci].type, f.len);
     return .{ .columns = f.columns, .data = data, .len = f.len };
 }
 
@@ -901,7 +909,7 @@ pub fn unstack(a: std.mem.Allocator, f: Frame, spec: UnstackSpec) Error!Frame {
                 const from = if (vertical) j * spec.step + r else r * spec.step + j;
                 c.* = if (from < f.len) src.get(from) else fill;
             }
-            data[at] = try fm.columnFromCells(a, cells);
+            data[at] = try fm.conform(a, try fm.columnFromCells(a, cells), f.columns[ci].type, rows);
             at += 1;
         }
     }
@@ -1042,7 +1050,7 @@ pub fn wideToLong(a: std.mem.Allocator, f: Frame, spec: WideToLongSpec) WideToLo
     var at: usize = 0;
     for (iidx) |ii| {
         cols[at] = f.columns[ii];
-        data[at] = try takeCol(a, f.columnAt(ii), src);
+        data[at] = try takeCol(a, f.columnAt(ii), f.columns[ii].type, src);
         at += 1;
     }
     // j: int, else float, else text.
@@ -1062,22 +1070,21 @@ pub fn wideToLong(a: std.mem.Allocator, f: Frame, spec: WideToLongSpec) WideToLo
     at += 1;
     for (others.items) |ci| {
         cols[at] = f.columns[ci];
-        data[at] = try takeCol(a, f.columnAt(ci), src);
+        data[at] = try takeCol(a, f.columnAt(ci), f.columns[ci].type, src);
         at += 1;
     }
     for (spec.stubnames, 0..) |stub, si| {
         const first = hits[si].items[0].ci;
-        // One type; an int and a float column make a float one (pandas' concat does).
-        var promote = false;
+        // One type; numeric columns of different types meet in their supertype (an int and a
+        // float column make a float one, as pandas' concat does).
+        var stub_ty = f.columns[first].type;
         for (hits[si].items) |h| {
             const t = f.columns[h.ci].type;
-            if (t == f.columns[first].type) continue;
-            const numeric = (t == .int or t == .float) and (f.columns[first].type == .int or f.columns[first].type == .float);
-            if (!numeric) return error.BadArgument;
-            promote = true;
+            if (t == stub_ty) continue;
+            stub_ty = dtype.supertype(stub_ty, t) orelse return error.BadArgument;
         }
         cols[at] = f.columns[first];
-        if (promote) cols[at].type = .float;
+        cols[at].type = stub_ty;
         cols[at].name = stub;
         // The stub's column for each suffix (the first of a repeated name), once per stub
         // rather than a scan of its columns per cell (review W10R-2).
@@ -1092,13 +1099,13 @@ pub fn wideToLong(a: std.mem.Allocator, f: Frame, spec: WideToLongSpec) WideToLo
             c.* = .null;
             if (col_of[j]) |ci| {
                 c.* = f.columnAt(ci).get(ri);
-                if (promote and c.* == .int) {
+                if (dtype.isFloat(stub_ty) and c.* == .int) {
                     const as_float: f64 = @floatFromInt(c.int);
                     c.* = .{ .float = as_float };
                 }
             }
         }
-        data[at] = try fm.columnFromCells(a, cells);
+        data[at] = try fm.conform(a, try fm.columnFromCells(a, cells), stub_ty, total_rows);
         at += 1;
     }
     try rejectDuplicateNames(a, cols);
@@ -1112,8 +1119,8 @@ fn rejectDuplicateNames(a: std.mem.Allocator, cols: []const Column) Error!void {
     for (cols) |c| if ((try seen.getOrPut(a, c.name)).found_existing) return error.DuplicateColumn;
 }
 
-fn takeCol(a: std.mem.Allocator, col: ColumnData, idx: []const usize) Error!ColumnData {
+fn takeCol(a: std.mem.Allocator, col: ColumnData, ty: ColumnType, idx: []const usize) Error!ColumnData {
     const cells = try a.alloc(Value, idx.len);
     for (cells, idx) |*c, ri| c.* = col.get(ri);
-    return fm.columnFromCells(a, cells);
+    return fm.conform(a, try fm.columnFromCells(a, cells), ty, idx.len);
 }

@@ -15,6 +15,7 @@
 const std = @import("std");
 const vm = @import("value.zig");
 const fm = @import("frame.zig");
+const dtype = @import("dtype.zig");
 const core = @import("core.zig");
 const keys = @import("keys.zig");
 const sp = @import("spec.zig");
@@ -348,6 +349,9 @@ fn intsWithMissing(a: std.mem.Allocator, col: ColumnData, rows: usize) Error!?[]
             if (c.valid == null) return c.values;
         },
         .float => |c| if (c.values.len != rows) return null,
+        // The narrower widths read cell by cell below; a UInt64 or Float32 cell that is no
+        // i64 ends the pass (`exactInt`), the row-key path takes over.
+        inline .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => |c| if (c.values.len != rows) return null,
         else => return null,
     }
     const out = try a.alloc(i64, rows);
@@ -701,6 +705,7 @@ fn repeatPlain(a: std.mem.Allocator, col: ColumnData, rows: usize, m: usize, tot
         .float => |c| return if (try repeatTyped(f64, a, c, rows, m, total)) |r| .{ .float = r } else null,
         .bool => |c| return if (try repeatTyped(bool, a, c, rows, m, total)) |r| .{ .bool = r } else null,
         .decimal => |c| return if (try repeatTyped(i128, a, c, rows, m, total)) |r| .{ .decimal = r } else null,
+        inline .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => |c, t| return if (try repeatTyped(std.meta.Elem(@TypeOf(c.values)), a, c, rows, m, total)) |r| @unionInit(ColumnData, @tagName(t), r) else null,
         else => return null,
     }
 }
@@ -726,7 +731,7 @@ fn weave(comptime T: type, comptime tag: []const u8, a: std.mem.Allocator, cols:
 }
 
 /// The melted columns woven row by row, in the array their cells' tags call for.
-fn interleave(a: std.mem.Allocator, f: Frame, vals: []const usize, total: usize, typed: bool) Error!ColumnData {
+fn interleave(a: std.mem.Allocator, f: Frame, vals: []const usize, total: usize, typed: bool, ty: ColumnType) Error!ColumnData {
     const cols = try a.alloc(ColumnData, vals.len);
     defer a.free(cols);
     for (cols, vals) |*c, vi| c.* = colOf(f, vi);
@@ -735,6 +740,14 @@ fn interleave(a: std.mem.Allocator, f: Frame, vals: []const usize, total: usize,
         if (try weave(i64, "int", a, cols, f.len, total)) |r| return r;
         if (try weave(bool, "bool", a, cols, f.len, total)) |r| return r;
         if (try weave(i128, "decimal", a, cols, f.len, total)) |r| return r;
+        if (try weave(i8, "int8", a, cols, f.len, total)) |r| return r;
+        if (try weave(i16, "int16", a, cols, f.len, total)) |r| return r;
+        if (try weave(i32, "int32", a, cols, f.len, total)) |r| return r;
+        if (try weave(u8, "uint8", a, cols, f.len, total)) |r| return r;
+        if (try weave(u16, "uint16", a, cols, f.len, total)) |r| return r;
+        if (try weave(u32, "uint32", a, cols, f.len, total)) |r| return r;
+        if (try weave(u64, "uint64", a, cols, f.len, total)) |r| return r;
+        if (try weave(f32, "float32", a, cols, f.len, total)) |r| return r;
     }
     const out = try a.alloc(Value, total);
     for (cols, 0..) |c, k| {
@@ -744,13 +757,25 @@ fn interleave(a: std.mem.Allocator, f: Frame, vals: []const usize, total: usize,
             at += cols.len;
         }
     }
-    return fm.columnFromCells(a, out);
+    return fm.conform(a, try fm.columnFromCells(a, out), ty, total);
 }
 
 /// Wide to long (pandas `melt`, polars `unpivot`): one row per input row and melted
 /// column, the id columns, then `out_key` (the melted column's name) and `out_value`.
 pub fn unpivot(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec) Error!Frame {
     return unpivotImpl(a, f, spec, true);
+}
+
+/// The type of the melted value column: the first column's, except that columns of different
+/// numeric types with a width among them meet in their supertype (polars `unpivot`).
+fn meltedType(f: Frame, vals: []const usize) ColumnType {
+    if (vals.len == 0) return .text;
+    var ty = f.columns[vals[0]].type;
+    var any_width = dtype.isWidth(ty);
+    for (vals[1..]) |vi| any_width = any_width or dtype.isWidth(f.columns[vi].type);
+    if (!any_width) return ty;
+    for (vals[1..]) |vi| ty = dtype.supertype(ty, f.columns[vi].type) orelse return f.columns[vals[0]].type;
+    return ty;
 }
 
 fn unpivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec, typed: bool) Error!Frame {
@@ -766,7 +791,7 @@ fn unpivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec, typed: bool
         }
     }
     const vals = val_idxs.items;
-    const value_type: ColumnType = if (vals.len > 0) f.columns[vals[0]].type else .text;
+    const value_type = meltedType(f, vals);
     const cols = try a.alloc(Column, id_idxs.len + 2);
     for (id_idxs, 0..) |ii, i| cols[i] = f.columns[ii];
     cols[id_idxs.len] = .{ .name = spec.out_key, .type = .text };
@@ -790,7 +815,7 @@ fn unpivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec, typed: bool
     }
 
     data[id_idxs.len] = try meltedNames(a, f, vals, total);
-    data[id_idxs.len + 1] = try interleave(a, f, vals, total, typed);
+    data[id_idxs.len + 1] = try interleave(a, f, vals, total, typed, value_type);
     return .{ .columns = cols, .data = data, .len = total };
 }
 
@@ -1241,7 +1266,18 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec_in: sp.JoinSpe
             for (out, pairs.left, pairs.right, 0..) |*o, li, ri, at| {
                 o.* = if (li == keys.none) from.get(ri) else col.get(at);
             }
-            data[l] = try fm.columnFromCells(a, out);
+            // A width key stays its width (D10); a right-only cell that is no value of it
+            // (an Int64 1000 against an Int8 key) widens the column to the two types'
+            // supertype instead of becoming null.
+            if (dtype.isWidth(cols[l].type)) {
+                for (out) |v| {
+                    if (!cellFitsType(v, cols[l].type)) {
+                        cols[l].type = dtype.supertype(cols[l].type, right.columns[m].type) orelse cols[l].type;
+                        break;
+                    }
+                }
+            }
+            data[l] = try fm.conform(a, try fm.columnFromCells(a, out), cols[l].type, pairs.left.len);
             // A categorical key stays categorical (its declared type is the left's): the union of
             // two different dictionaries is encoded again, lexically, as `concat` does.
             if (cols[l].type == .categorical) data[l] = try fm.encodeCategorical(a, data[l], pairs.left.len);
@@ -1271,6 +1307,14 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec_in: sp.JoinSpe
         out = try takeRows(a, out, try sortedRows(a, out, lk, dirs, .last));
     }
     return out;
+}
+
+/// Whether `v` is a value of the numeric type `ty` (a null is; a non-numeric type holds anything).
+fn cellFitsType(v: Value, ty: ColumnType) bool {
+    if (v == .null) return true;
+    if (dtype.isInteger(ty)) return if (dtype.exactI128(v)) |x| dtype.fits(x, ty) else false;
+    if (dtype.isFloat(ty)) return v.asFloat() != null;
+    return true;
 }
 
 /// The coalesced key of a join when both sides store it as the same categorical (same
@@ -1494,8 +1538,8 @@ fn sortKeyColumn(a: std.mem.Allocator, f: Frame, ci: usize, dir: sp.SortDir, out
             };
             return;
         },
-        .int => ints = true,
-        .float => floats = true,
+        .int, .int8, .int16, .int32, .uint8, .uint16, .uint32 => ints = true,
+        .float, .float32 => floats = true,
         .boxed => |c| for (0..f.len) |ri| switch (if (ri < c.len) c[ri] else Value.null) {
             .int => ints = true,
             .float => floats = true,
@@ -1746,20 +1790,22 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
     var fill: Value = .null;
     var promote = false;
     const fv: ?f64 = spec.fill_value orelse spec.fill.asFloat();
-    if (fv) |x| switch (cell_type) {
-        .float => fill = .{ .float = x },
-        .int => {
-            if (Value.floatToInt(i64, x)) |i| {
-                if (@as(f64, @floatFromInt(i)) == x) fill = .{ .int = i };
+    if (fv) |x| {
+        if (dtype.isFloat(cell_type)) {
+            fill = .{ .float = x };
+        } else if (dtype.isInteger(cell_type)) {
+            // A whole number that the cell type holds stays an integer, else the cells turn float.
+            if (Value.floatToInt(i128, x)) |i| {
+                if (@as(f64, @floatFromInt(i)) == x) fill = dtype.fitInt(i, cell_type) orelse .null;
             }
             if (fill == .null) {
                 cell_type = .float;
                 promote = true;
                 fill = .{ .float = x };
             }
-        },
-        .decimal => fill = (Value{ .float = x }).cast(.decimal) orelse .null,
-        else => {},
+        } else if (cell_type == .decimal) {
+            fill = (Value{ .float = x }).cast(.decimal) orelse .null;
+        }
     } else switch (spec.fill) {
         .text => {
             fill = spec.fill;
@@ -1867,12 +1913,12 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
             }
         }
         if (spec.margins) cells[nr] = col_margin[ck.id];
-        d.* = try fm.columnFromCells(a, cells);
+        d.* = try fm.conform(a, try fm.columnFromCells(a, cells), cell_type, out_rows);
     }
     if (spec.margins) {
         for (cells[0..nr], row_margin) |*o, m| o.* = m;
         cells[nr] = corner[0];
-        data[1 + nc] = try fm.columnFromCells(a, cells);
+        data[1 + nc] = try fm.conform(a, try fm.columnFromCells(a, cells), cell_type, out_rows);
     }
     return .{ .columns = cols, .data = data, .len = out_rows };
 }
@@ -1954,16 +2000,18 @@ pub fn fillna(a: std.mem.Allocator, f: Frame, spec: sp.FillNaSpec) Error!Frame {
         defer lk.deinit(a);
         for (spec.per_column) |pc| {
             const ci = try lk.of(pc.col);
-            data[ci] = try fillColumn(a, data[ci], f.len, pc.value, spec.limit);
+            data[ci] = try fillColumn(a, data[ci], f.columns[ci].type, f.len, pc.value, spec.limit);
         }
     } else {
-        for (try subsetIdxs(a, f, spec.subset)) |ci| data[ci] = try fillColumn(a, data[ci], f.len, spec.value, spec.limit);
+        for (try subsetIdxs(a, f, spec.subset)) |ci| data[ci] = try fillColumn(a, data[ci], f.columns[ci].type, f.len, spec.value, spec.limit);
     }
     return .{ .columns = f.columns, .data = data, .len = f.len };
 }
 
-/// `col` with its first `limit` missing cells replaced by `value`; shared when none is.
-fn fillColumn(a: std.mem.Allocator, col: ColumnData, rows: usize, value: Value, limit: ?usize) Error!ColumnData {
+/// `col` with its first `limit` missing cells replaced by `value`; shared when none is. A
+/// column declared with a width keeps its array (`fm.conform`): a `value` that is no value of
+/// the width leaves the cell null.
+fn fillColumn(a: std.mem.Allocator, col: ColumnData, ty: ColumnType, rows: usize, value: Value, limit: ?usize) Error!ColumnData {
     var any = false;
     for (0..rows) |ri| {
         if (keys.isMissing(col.get(ri))) {
@@ -1982,7 +2030,7 @@ fn fillColumn(a: std.mem.Allocator, col: ColumnData, rows: usize, value: Value, 
             left -= 1;
         } else c.* = v;
     }
-    return fm.columnFromCells(a, cells);
+    return fm.conform(a, try fm.columnFromCells(a, cells), ty, rows);
 }
 
 test "allValid sets no bit past rows (fuzz note: validity bits past len)" {

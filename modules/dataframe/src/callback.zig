@@ -194,7 +194,8 @@ fn viewsOk(v: Value, depth: u8) bool {
 /// dictionary-encoded.
 fn finishColumn(a: std.mem.Allocator, data: ColumnData, len: usize, name: []const u8, out: OutColumn) CallbackError!struct { Column, ColumnData } {
     const ty = out.type orelse inferred(data);
-    const d = if (ty == .categorical) try fm.encodeCategorical(a, data, len) else data;
+    // A declared width gets its own array (`fit` already refused a cell it does not hold).
+    const d = if (ty == .categorical) try fm.encodeCategorical(a, data, len) else try fm.conform(a, data, ty, len);
     return .{ .{ .name = name, .type = ty, .inner = out.inner }, d };
 }
 

@@ -98,6 +98,8 @@ pub fn explode(a: std.mem.Allocator, f: Frame, cols: []const []const u8) NestErr
             .{ .name = src.name, .type = src.inner[0].type, .inner = src.inner[0].inner, .time_zone = src.inner[0].time_zone }
         else
             .{ .name = src.name, .type = storageType(d.*) };
+        // The element type declared a width: the elements' array is that width's.
+        d.* = try fm.conform(a, d.*, out_cols[ci].type, rows);
     }
     return .{ .columns = out_cols, .data = data, .len = rows };
 }
@@ -148,7 +150,7 @@ pub fn flattenList(a: std.mem.Allocator, f: Frame, col: []const u8) NestError!Fr
     const cols = try a.alloc(Column, 1);
     cols[0] = elementColumn(f.columns[ci], items);
     const data = try a.alloc(ColumnData, 1);
-    data[0] = items;
+    data[0] = try fm.conform(a, items, cols[0].type, total);
     return .{ .columns = cols, .data = data, .len = total };
 }
 
@@ -303,11 +305,12 @@ pub fn unnest(a: std.mem.Allocator, f: Frame, spec: UnnestSpec) NestError!Frame 
         for (c.inner) |ic| _ = try decl.getOrPutValue(a, ic.name, ic);
         for (fields.names, fields.data) |fname, fd| {
             const out_name = if (spec.separator) |sep| try std.mem.concat(a, u8, &.{ c.name, sep, fname }) else fname;
-            try cols.append(a, if (decl.get(fname)) |dc|
+            const out_col: Column = if (decl.get(fname)) |dc|
                 .{ .name = out_name, .type = dc.type, .inner = dc.inner, .time_zone = dc.time_zone }
             else
-                .{ .name = out_name, .type = storageType(fd) });
-            try data.append(a, fd);
+                .{ .name = out_name, .type = storageType(fd) };
+            try cols.append(a, out_col);
+            try data.append(a, try fm.conform(a, fd, out_col.type, f.len));
         }
     }
     var seen: std.StringHashMapUnmanaged(void) = .empty;

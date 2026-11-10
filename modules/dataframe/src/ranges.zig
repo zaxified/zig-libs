@@ -45,7 +45,8 @@ fn single(a: std.mem.Allocator, name: []const u8, ty: ColumnType, data: ColumnDa
 }
 
 fn fromCells(a: std.mem.Allocator, name: []const u8, ty: ColumnType, cells: []const Value, inner: []const Column) RangeError!Frame {
-    return single(a, name, ty, try fm.columnFromCells(a, cells), cells.len, inner);
+    // A declared width (a UInt64 above 2^63 comes boxed) gets its own array.
+    return single(a, name, ty, try fm.conform(a, try fm.columnFromCells(a, cells), ty, cells.len), cells.len, inner);
 }
 
 /// How many values `start, start + step, ...` lie before `end` (exclusive), 0 when the step
