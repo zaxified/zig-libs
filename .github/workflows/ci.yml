@@ -382,7 +382,7 @@ jobs:
       # ships a release that does not. Nothing to do here but know why it stays.
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
           # ⚠ setup-zig's OWN build cache is off on purpose, and not for the
           # quota reason that keeps it off in the `full` job below. Measured
           # directly here: it persisted ~137 MB of a ~1.1 GB build cache and
@@ -418,7 +418,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/zig-global
-          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.zg.outputs.cpu }}-0.17.0-g2
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.zg.outputs.cpu }}-0.17.1-g1
       # ⭐ A WEEK IN EVERY BUILD-CACHE KEY (2026-09-18). An entry restores the
       # previous tree, adds to it and saves the whole, and nothing ever
       # deletes: the scoped entry grew 589 -> 646 -> 1156 -> 1364 MB over four
@@ -454,10 +454,11 @@ jobs:
           # `base4` (2026-10-18): Zig 0.16 -> 0.17. Without it the fallback
           # would restore a 0.16 tree into a 0.17 job in the same week --
           # nothing in it can hit, it only costs the restore and the space.
+          # `base5` (2026-11-10): Zig 0.17.0 -> 0.17.1, same reason.
           # Per shard: matrix jobs sharing one key clobber each other.
-          key: zig-${{ runner.os }}-base4-${{ steps.gen.outputs.week }}-${{ matrix.shard }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
+          key: zig-${{ runner.os }}-base5-${{ steps.gen.outputs.week }}-${{ matrix.shard }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
           restore-keys: |
-            zig-${{ runner.os }}-base4-${{ steps.gen.outputs.week }}-${{ matrix.shard }}-
+            zig-${{ runner.os }}-base5-${{ steps.gen.outputs.week }}-${{ matrix.shard }}-
       - name: Mark the restored build tree
         if: env.ZIGLIBS_DRY_RUN != '1'
         run: touch "$RUNNER_TEMP/zig-cache-restored"
@@ -594,7 +595,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
           # Nothing here is worth a cache entry: it saved 93 MB under a new
           # run-id key every run (2026-09-18), for 9 s of work.
           use-cache: false
@@ -626,7 +627,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/zig-global
-          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.zg.outputs.cpu }}-0.17.0-g2
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.zg.outputs.cpu }}-0.17.1-g1
       - name: The sub-second gates, before anything expensive starts
         run: bash scripts/test.sh checks-fast
       - name: Choose the lanes
@@ -951,7 +952,7 @@ jobs:
       # ships a release that does not. Nothing to do here but know why it stays.
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
           # setup-zig's own build cache stays off here for the same reason as
           # in the scoped job: measured dropping the compiled `o/`
           # outputs. The toolchain download is still cached by it.
@@ -984,7 +985,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/zig-global
-          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.zg.outputs.cpu }}-0.17.0-g2
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.zg.outputs.cpu }}-0.17.1-g1
       # Weekly cache generation, as in the scoped job -- see there.
       - name: Cache generation
         id: gen
@@ -1370,7 +1371,7 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       # Builds every example-apps/ project against THIS commit, through the
       # package machinery rather than an in-repo addImport. An app's source is
       # written against the tree, so the pin is never what fails here: red means
@@ -1615,7 +1616,7 @@ jobs:
           persist-credentials: false
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
           use-cache: false
       - name: Tag the tested commit locally, print the notes
         id: prepare
@@ -1695,7 +1696,7 @@ jobs:
           persist-credentials: false
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
           use-cache: false
       - name: example-apps through their pins
         env:
