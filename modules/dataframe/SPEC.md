@@ -753,9 +753,9 @@ arms `casefold` (pandas), `is_decimal`, `is_numeric` (pandas), `unaccent`, and `
 is `normalize("NFKD")` and dropping the combining marks, which agrees on accented Latin (checked against that recipe in the
 tests) but leaves `ł`, `ß`, `æ` alone and also folds compatibility forms, where `unaccent` folds the former and not the latter.
 `is_alpha`/`is_digit`/`is_alnum`/`is_space`/`is_lower`/`is_upper`/`is_title` are Python's Unicode classes (`²` is a digit, `½` and
-`Ⅻ` are numeric only). The selectors follow polars, not Python: `alpha` = letters and letter numbers (`Ⅻ`), `digit` = `Nd`
-(`٣٤٥`, `１２`; not `²`), `alphanumeric` = both; polars' Alphabetic property also counts some combining vowel signs, which
-`unitext` does not expose, so those names are not alpha here. **Invalid UTF-8 (one policy for the module):** a cell that is not
+`Ⅻ` are numeric only). The selectors follow polars, not Python: `alpha` = the Alphabetic property (`unitext.isAlphabeticCp`: letters, letter
+numbers such as `Ⅻ`, and combining vowel signs such as Devanagari `ा` or Thai `ิ`; a virama or a bare combining acute is
+not; since 2026-11-10), `digit` = `Nd` (`٣٤٥`, `１２`; not `²`), `alphanumeric` = both. **Invalid UTF-8 (one policy for the module):** a cell that is not
 valid UTF-8 has no code points, so it is handled as bytes, as `length` and `pad` already do: the case functions change its
 ASCII letters only, `normalize`/`unaccent` return it unchanged, every `is*` class is false. A result is capped at
 `max_text_result` (`error.TooLarge`), as `pad`. **pandas storage:** pandas 3's default Arrow-backed `str` dtype maps case by
@@ -765,8 +765,11 @@ Arrow storage) are `known` differences. polars has no `casefold`, `swapcase`, `c
 dependency adds 158,056 B (1,053,096 to 1,211,152, +15%) to a ReleaseSmall binary that calls `mutate` with one `add`
 (the instruction set is dispatched at run time, so the tables come in whatever the expression). **Build option candidate:**
 `dataframe-unicode` (default on, off = the former ASCII behaviour) would remove it; not added (CONVENTIONS §4.2, open for
-the owner's decision). Left: language-tailored case (Turkish, Lithuanian) is not in `unitext`; `str.strip` and
-`Selector` by name remain whitespace/ASCII as before.
+the owner's decision). **Strip (2026-11-10):** `strip`/`lstrip`/`rstrip` and `strip_chars` with null chars strip Unicode whitespace from a
+valid UTF-8 cell (`unitext.isSpaceCp`: Python `str.strip()`, as pandas; polars' Rust `White_Space` differs only on
+U+001C..U+001F, which polars keeps and Python strips, a `known` difference of the replay); U+200B is not whitespace. A
+cell that is not valid UTF-8 is bytes (the six ASCII whitespace bytes only); an explicit `chars` set is matched exactly.
+Left: language-tailored case (Turkish, Lithuanian) is not in `unitext`.
 
 **Time zones (row 71 and the column-carried zone, survey row 98; 2026-11-08 and 2026-11-09 wave W7, tests in
 `src/tz_test.zig`, `src/s2w7_test.zig`, `src/s2w7_carry_test.zig`, `src/s2w7_oracle_test.zig`):**
