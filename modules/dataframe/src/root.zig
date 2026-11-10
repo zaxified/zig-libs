@@ -459,6 +459,8 @@ pub const CsvReadError = csvio.CsvReadError;
 pub const CsvReadOptions = csvio.CsvReadOptions;
 pub const CsvWriteOptions = csvio.CsvWriteOptions;
 pub const CsvWriteError = csvio.CsvWriteError;
+/// A `.binary` cell from the base64 text the writers emit (null: not base64).
+pub const parseBinary = csvio.parseBinary;
 pub const CsvQuote = csvio.CsvQuote;
 pub const ColumnNulls = csvio.ColumnNulls;
 pub const BadLines = csvio.BadLines;

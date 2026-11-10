@@ -1521,6 +1521,12 @@ fn jsonToValue(a: std.mem.Allocator, work: *Work, jv: std.json.Value, want: Colu
             .bool => |b| .{ .bool = b },
             else => .null,
         },
+        // dataframe's Binary (2026-11-10): a JSON string is base64, as dataframe writes and
+        // reads it (`Value.cast(.binary)` of text is its UTF-8 bytes, not a decode).
+        .binary => switch (jv) {
+            .string => |s| (try df.parseBinary(a, s)) orelse .null,
+            else => .null,
+        },
         .text, .date, .categorical => switch (jv) {
             .string => |s| .{ .text = s }, // the frame builder copies it
             .number_string => |s| .{ .text = s },
@@ -2072,6 +2078,23 @@ test "shape: a .time column reads HH:MM:SS text and microseconds since midnight"
     try testing.expect(d.columnAt(0).get(3) == .null);
     try testing.expect(d.columnAt(0).get(4) == .null);
     try testing.expectEqual(Value{ .int = 120_000 }, d.columnAt(0).get(5));
+}
+
+test "shape: a .binary column reads base64 strings, as dataframe writes them" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try shape(a,
+        \\{"r":[{"b":"AGFi"},{"b":"//4="},{"b":"not base64!"},{"b":7},{"b":""}]}
+    , .{
+        .path = "r",
+        .columns = &.{.{ .name = "b", .key = "b", .type = .binary }},
+    });
+    try testing.expectEqualStrings("\x00ab", d.columnAt(0).get(0).text);
+    try testing.expectEqualStrings("\xff\xfe", d.columnAt(0).get(1).text);
+    try testing.expect(d.columnAt(0).get(2) == .null);
+    try testing.expect(d.columnAt(0).get(3) == .null);
+    try testing.expectEqualStrings("", d.columnAt(0).get(4).text);
 }
 
 test "TEETH: MAX_PATH_DEPTH is load-bearing and is actually applied" {
