@@ -732,34 +732,98 @@ pub fn containsAny(t: []const u8, patterns: []const []const u8, fold: bool) bool
     return false;
 }
 
-/// polars `str.replace_many(patterns, replace_with)`: non-overlapping, the match that
-/// ENDS first wins, and of those that end together the longest (measured against the
-/// engine: "lo" loses to "l" in "hello" whichever comes first, "bc" beats "abcd" in
-/// "abcd", and "ab" beats "b" in "abc" whichever comes first); `with` has one entry for
-/// every pattern or one for all. An empty pattern is refused by the compiler.
+/// One match of a pattern in a text: byte offset, byte length, pattern index.
+pub const ManyHit = struct { start: usize, len: usize, pat: usize };
+
+/// polars' default (`standard`) next match at or after `from`: the match that ENDS first,
+/// and of those that end together the longest (measured against the engine: "lo" loses to
+/// "l" in "hello" whichever comes first, "bc" beats "abcd" in "abcd", and "ab" beats "b"
+/// in "abc" whichever comes first). Empty patterns never match (the compiler refuses them).
+pub fn nextMatch(t: []const u8, from: usize, patterns: []const []const u8, fold: bool) ?ManyHit {
+    var e: usize = from +| 1;
+    while (e <= t.len) : (e += 1) {
+        var best: ?usize = null;
+        for (patterns, 0..) |p, k| {
+            if (p.len == 0 or p.len > e - from or !eqFold(t[e - p.len .. e], p, fold)) continue;
+            if (best == null or p.len > patterns[best.?].len) best = k;
+        }
+        if (best) |k| return .{ .start = e - patterns[k].len, .len = patterns[k].len, .pat = k };
+    }
+    return null;
+}
+
+/// polars `leftmost=True`: the match that STARTS first at or after `from`; at one start the
+/// pattern listed first wins.
+pub fn nextLeftmost(t: []const u8, from: usize, patterns: []const []const u8, fold: bool) ?ManyHit {
+    var s: usize = from;
+    while (s < t.len) : (s += 1) {
+        for (patterns, 0..) |p, k| {
+            if (p.len == 0 or p.len > t.len - s or !eqFold(t[s..][0..p.len], p, fold)) continue;
+            return .{ .start = s, .len = p.len, .pat = k };
+        }
+    }
+    return null;
+}
+
+pub const ManyMode = enum { standard, leftmost, overlapping };
+
+/// More matches than this in one cell (4M) are `error.TooLarge`.
+pub const max_many_hits: usize = 1 << 22;
+
+/// polars `str.extract_many` / `find_many`: every match of `patterns` in `t`, appended to
+/// `out`. `standard` and `leftmost` are non-overlapping scans (`nextMatch`, `nextLeftmost`);
+/// `overlapping` reports every occurrence of every pattern, in order of the match END, at
+/// one end the longer pattern first (inferred from the Aho-Corasick output chain), then the
+/// lower pattern index.
+pub fn findMany(a: std.mem.Allocator, t: []const u8, patterns: []const []const u8, fold: bool, mode: ManyMode, out: *std.ArrayList(ManyHit)) error{ OutOfMemory, TooLarge }!void {
+    switch (mode) {
+        .standard, .leftmost => {
+            var i: usize = 0;
+            while (i <= t.len) {
+                const hit = (if (mode == .standard) nextMatch(t, i, patterns, fold) else nextLeftmost(t, i, patterns, fold)) orelse break;
+                if (out.items.len >= max_many_hits) return error.TooLarge;
+                try out.append(a, hit);
+                i = hit.start + hit.len;
+            }
+        },
+        .overlapping => {
+            const order = try a.alloc(usize, patterns.len);
+            defer a.free(order);
+            for (order, 0..) |*o, k| o.* = k;
+            const Ctx = struct {
+                ps: []const []const u8,
+                fn less(c: @This(), x: usize, y: usize) bool {
+                    if (c.ps[x].len != c.ps[y].len) return c.ps[x].len > c.ps[y].len;
+                    return x < y;
+                }
+            };
+            std.mem.sortUnstable(usize, order, Ctx{ .ps = patterns }, Ctx.less);
+            var e: usize = 1;
+            while (e <= t.len) : (e += 1) {
+                for (order) |k| {
+                    const p = patterns[k];
+                    if (p.len == 0 or p.len > e or !eqFold(t[e - p.len .. e], p, fold)) continue;
+                    if (out.items.len >= max_many_hits) return error.TooLarge;
+                    try out.append(a, .{ .start = e - p.len, .len = p.len, .pat = k });
+                }
+            }
+        },
+    }
+}
+
+/// polars `str.replace_many(patterns, replace_with)`: non-overlapping (`nextMatch`);
+/// `with` has one entry for every pattern or one for all. An empty pattern is refused by
+/// the compiler.
 pub fn replaceMany(a: std.mem.Allocator, t: []const u8, patterns: []const []const u8, with: []const []const u8, fold: bool) error{ OutOfMemory, TooLarge }![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0; // text before `i` is done
-    scan: while (i < t.len) {
-        var e: usize = i + 1;
-        while (e <= t.len) : (e += 1) {
-            var best: ?usize = null;
-            for (patterns, 0..) |p, k| {
-                if (p.len == 0 or p.len > e - i or !eqFold(t[e - p.len .. e], p, fold)) continue;
-                if (best == null or p.len > patterns[best.?].len) best = k;
-            }
-            if (best) |k| {
-                const len = patterns[k].len;
-                try out.appendSlice(a, t[i .. e - len]);
-                try out.appendSlice(a, if (with.len == 1) with[0] else with[k]);
-                if (out.items.len > max_text_result) return error.TooLarge;
-                i = e;
-                continue :scan;
-            }
-        }
-        try out.appendSlice(a, t[i..]);
-        break;
+    while (nextMatch(t, i, patterns, fold)) |hit| {
+        try out.appendSlice(a, t[i..hit.start]);
+        try out.appendSlice(a, if (with.len == 1) with[0] else with[hit.pat]);
+        if (out.items.len > max_text_result) return error.TooLarge;
+        i = hit.start + hit.len;
     }
+    try out.appendSlice(a, t[i..]);
     if (out.items.len > max_text_result) return error.TooLarge;
     return out.items;
 }

@@ -458,6 +458,13 @@ pub const Expr = union(enum) {
     /// polars `str.replace_many`: `with` one entry per pattern or one for all, no empty
     /// pattern (else `error.BadExpr`).
     replace_many: struct { x: *const Expr, patterns: []const []const u8, with: []const []const u8, ascii_case_insensitive: bool = false },
+    /// polars `str.extract_many(patterns, ascii_case_insensitive, overlapping, leftmost)`: the
+    /// matched substrings as a list of text (`fnx.findMany`; no match is an empty list). An
+    /// empty pattern, or `overlapping` with `leftmost`, is `error.BadExpr`.
+    extract_many: struct { x: *const Expr, patterns: []const []const u8, ascii_case_insensitive: bool = false, overlapping: bool = false, leftmost: bool = false },
+    /// polars `str.find_many`: as `extract_many`, the BYTE offsets of the matches as a list
+    /// of `uint32` (an offset past `u32` is `error.TooLarge`).
+    find_many: struct { x: *const Expr, patterns: []const []const u8, ascii_case_insensitive: bool = false, overlapping: bool = false, leftmost: bool = false },
     /// One calendar component (pandas `dt.<part>`, polars `dt.<part>()`); see `dtfn`
     /// for the three temporal cell shapes.
     dt: struct { x: *const Expr, part: dtf.DtPart },
@@ -761,6 +768,7 @@ const Inst = union(enum) {
     to_integer: u8,
     contains_any: struct { patterns: []const []const u8, fold: bool },
     replace_many: struct { patterns: []const []const u8, with: []const []const u8, fold: bool },
+    many: struct { patterns: []const []const u8, fold: bool, mode: fnx.ManyMode, offsets: bool },
     dt: dtf.DtPart,
     strptime: struct { layout: []const u8, to: dtf.ParseTo },
     strftime: []const u8,
@@ -1012,6 +1020,15 @@ const Compiler = struct {
         if (dtype.isWidth(t) or (t == .float and widthBranch(c.f, e))) try c.push(.{ .fit = t }, 1);
     }
 
+    /// `extract_many` / `find_many`: one instruction after the text.
+    fn many(c: *Compiler, x: *const Expr, patterns: []const []const u8, fold: bool, overlapping: bool, leftmost: bool, offsets: bool, depth: usize) Error!void {
+        for (patterns) |pat| if (pat.len == 0) return error.BadExpr;
+        if (overlapping and leftmost) return error.BadExpr;
+        try c.go(x, depth + 1);
+        const mode: fnx.ManyMode = if (overlapping) .overlapping else if (leftmost) .leftmost else .standard;
+        try c.push(.{ .many = .{ .patterns = patterns, .fold = fold, .mode = mode, .offsets = offsets } }, 1);
+    }
+
     fn go(c: *Compiler, e: *const Expr, depth: usize) Error!void {
         if (depth >= max_depth) return error.ExprTooLarge;
         if (c.visits.* >= max_nodes) return error.ExprTooLarge;
@@ -1113,6 +1130,8 @@ const Compiler = struct {
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .replace_many = .{ .patterns = r.patterns, .with = r.with, .fold = r.ascii_case_insensitive } }, 1);
             },
+            .extract_many => |r| try c.many(r.x, r.patterns, r.ascii_case_insensitive, r.overlapping, r.leftmost, false, depth),
+            .find_many => |r| try c.many(r.x, r.patterns, r.ascii_case_insensitive, r.overlapping, r.leftmost, true, depth),
             .contains_regex => |r| {
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .regex = .{ .op = .contains, .m = try c.matcher(r.pattern), .groups = &.{} } }, 1);
@@ -2118,6 +2137,22 @@ fn regexCell(a: std.mem.Allocator, r: RegexInst, t: []const u8) Error!Value {
     }
 }
 
+/// `extract_many` / `find_many` of one cell: the list of matched substrings or of start offsets.
+fn manyCell(a: std.mem.Allocator, t: []const u8, patterns: []const []const u8, fold: bool, mode: fnx.ManyMode, offsets: bool) Error!Value {
+    var hits: std.ArrayList(fnx.ManyHit) = .empty;
+    defer hits.deinit(a);
+    try fnx.findMany(a, t, patterns, fold, mode, &hits);
+    const cells = try a.alloc(Value, hits.items.len);
+    defer a.free(cells);
+    for (cells, hits.items) |*cell, h| {
+        cell.* = if (offsets)
+            .{ .int = std.math.cast(u32, h.start) orelse return error.TooLarge }
+        else
+            .{ .text = t[h.start..][0..h.len] };
+    }
+    return lf.makeList(a, cells);
+}
+
 /// One row of `p`. Every instruction but the last allocates in `tmp`, the last in `last`
 /// (see `RowScratch`); `one` (the `is_in` key scratch, kept across rows) grows in `one_a`.
 fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocator, p: Program, f: Frame, ri: usize, stack: []Value, one: *std.ArrayList(u8)) Error!Value {
@@ -2202,6 +2237,10 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
                     .replace_many => |r| .{ .text = try fnx.replaceMany(a, t, r.patterns, r.with, r.fold) },
                     else => unreachable, // the prong names these seven
                 };
+            },
+            .many => |r| {
+                const v = stack[sp - 1];
+                stack[sp - 1] = if (v == .text) try manyCell(a, v.text, r.patterns, r.fold, r.mode, r.offsets) else .null;
             },
             .regex => |r| {
                 const v = stack[sp - 1];
@@ -2465,6 +2504,7 @@ fn nestedInner(f: Frame, e: *const Expr) []const Column {
 
 /// The element column of a list of text (the text functions' list results).
 const text_items = [_]Column{.{ .name = "", .type = .text }};
+const u32_items = [_]Column{.{ .name = "", .type = .uint32 }};
 
 /// The element of a list whose shape is `s`, when the schema names it.
 fn elementOfShape(s: Shape) ?Column {
@@ -2509,7 +2549,8 @@ fn shapeOf(f: Frame, e: *const Expr) Shape {
             } else &.{},
             .typed = true,
         },
-        .split, .split_regex, .extract_all, .split_ws, .rsplit => .{ .inner = &text_items, .typed = true },
+        .split, .split_regex, .extract_all, .split_ws, .rsplit, .extract_many => .{ .inner = &text_items, .typed = true },
+        .find_many => .{ .inner = &u32_items, .typed = true },
         .repeat_by, .list_eval => .{ .typed = true },
         else => .{},
     };
