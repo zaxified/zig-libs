@@ -218,7 +218,20 @@ fn applyScalar(a: std.mem.Allocator, fn_name: []const u8, args: J, cell: J, in_k
         return ef.round(v, d, enumOf(ef.RoundMode, jstr(args, "mode")));
     }
     if (eq(u8, fn_name, "round_sig_figs")) return ef.roundSigFigs(v, @intCast(args.object.get("digits").?.integer));
-    if (eq(u8, fn_name, "dt_part")) return dtf.part(a, v, enumOf(dtf.DtPart, jstr(args, "part")));
+    if (eq(u8, fn_name, "dt_part")) {
+        const which = enumOf(dtf.DtPart, jstr(args, "part"));
+        const r = try dtf.part(a, v, which);
+        // `dt.time` is a `.time` cell (microseconds since midnight) now; the vectors hold the
+        // engines' `HH:MM:SS[.ffffff]` text of it.
+        if (which == .time and r == .int) {
+            const us: u64 = @intCast(r.int);
+            const secs = us / 1_000_000;
+            const frac = us % 1_000_000;
+            if (frac == 0) return .{ .text = try a.print("{d:0>2}:{d:0>2}:{d:0>2}", .{ secs / 3600, secs / 60 % 60, secs % 60 }) };
+            return .{ .text = try a.print("{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ secs / 3600, secs / 60 % 60, secs % 60, frac }) };
+        }
+        return r;
+    }
     if (eq(u8, fn_name, "strptime")) return dtf.strptime(a, v, layout.?, .timestamp);
     if (eq(u8, fn_name, "strftime")) return dtf.strftime(a, v, layout.?);
     if (eq(u8, fn_name, "offset_by")) return dtf.offsetBy(a, v, dtf.parseDuration(jstr(args, "every")) orelse return .null);

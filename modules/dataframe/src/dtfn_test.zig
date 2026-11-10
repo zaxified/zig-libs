@@ -77,8 +77,9 @@ test "dt components of a date and of a timestamp" {
     try expectV(.{ .int = 18630 }, try part(a, t, .epoch_days));
     try expectV(.{ .int = @divFloor(t.int, 1_000_000) }, try part(a, t, .epoch_seconds));
     try expectV(txt("2021-01-03"), try part(a, t, .date));
-    try expectV(txt("12:34:56.789012"), try part(a, t, .time));
-    try expectV(txt("00:00:00"), try part(a, d, .time));
+    // `dt.time` is a time-of-day cell (microseconds since midnight), no longer text.
+    try expectV(.{ .int = (12 * 3600 + 34 * 60 + 56) * 1_000_000 + 789012 }, try part(a, t, .time));
+    try expectV(.{ .int = 0 }, try part(a, d, .time));
     try expectV(ts("2021-01-01T12:34:56.789012Z"), try part(a, t, .month_start));
     // A timestamp as ISO text keeps that shape.
     try expectV(.{ .int = 56 }, try part(a, txt("2021-01-03 12:34:56"), .second));

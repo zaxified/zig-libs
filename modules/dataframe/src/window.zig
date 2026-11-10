@@ -412,8 +412,26 @@ pub fn fixWidthAgg(a: std.mem.Allocator, st: ColumnType, func: t0.AggFn, ty: Col
     for (cells, acc, dead) |*c, x, d| c.* = if (d) .null else (dtype.fitInt(x, ty) orelse .null);
 }
 
+/// A time-of-day source whose result is a time or a duration: the float cells (a mean, a
+/// difference) are whole microseconds, truncated; one outside the day (a time) is null.
+fn fitTimeCells(src: ColumnType, out_type: ColumnType, out: []Value) void {
+    if (src != .time or (out_type != .time and out_type != .duration)) return;
+    for (out) |*c| c.* = if (missing(c.*)) .null else c.cast(out_type) orelse .null;
+}
+
 fn outType(f: Frame, vi: usize, op: WindowOp) ColumnType {
     if (widthWindowType(f.columns[vi].type, op)) |t| return t;
+    // A time of day: its order statistics and its `shift`/fills stay times, a mean or quantile is
+    // a time (truncated), a difference of two is a duration (polars `Time`).
+    if (f.columns[vi].type == .time) switch (op) {
+        .cum_min, .cum_max => return .time,
+        .diff => return .duration,
+        .transform => |t| switch (t.func) {
+            .mean, .median, .quantile => return .time,
+            else => {},
+        },
+        else => {},
+    };
     return switch (op) {
         .shift, .ffill, .bfill => f.columns[vi].type,
         .cum_count, .row_number => .int,
@@ -509,7 +527,7 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
         } else return error.BadFill;
     }
 
-    if (typed and !promote and plain_layout and !dtype.isWidth(f.columns[vi].type)) {
+    if (typed and !promote and plain_layout and !dtype.isWidth(f.columns[vi].type) and f.columns[vi].type != .time) {
         if (try windowTyped(a, f, vi, pidx, op, int_col)) |col| {
             return withColumn(a, f, .{ .name = spec.out, .type = out_type, .time_zone = Column.zoneFor(f.columns[vi], out_type) }, col);
         }
@@ -594,9 +612,11 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
             }
         }
         if (out_type == .float32) roundCells(out);
+        fitTimeCells(f.columns[vi].type, out_type, out);
         if (spec.mapping != .group_to_rows) return mapped(a, f, spec, fac, mem, oidx, out_type, Column.zoneFor(f.columns[vi], out_type), out);
     }
     if (out_type == .float32) roundCells(out);
+    fitTimeCells(f.columns[vi].type, out_type, out);
 
     return withColumn(a, f, .{ .name = spec.out, .type = out_type, .time_zone = Column.zoneFor(f.columns[vi], out_type) }, try fm.conform(a, try fm.columnFromCells(a, out), out_type, f.len));
 }

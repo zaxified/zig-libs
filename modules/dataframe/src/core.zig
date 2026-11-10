@@ -543,6 +543,14 @@ pub fn aggOutTypeTemporal(columns: []const ds.Column, src_idx: usize, func: AggF
             .std => .duration,
             else => base,
         },
+        // A time of day follows the timestamp rule: the location statistics are times again
+        // (polars `Time`), `std` a duration; `sum`, `prod` and `var` stay `.float` (polars
+        // refuses them on a `Time`; this module answers as it does for a timestamp).
+        .time => switch (func) {
+            .mean, .median, .quantile => .time,
+            .std => .duration,
+            else => base,
+        },
         else => base,
     };
 }

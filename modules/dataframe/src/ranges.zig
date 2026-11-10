@@ -392,7 +392,8 @@ pub fn datetimeSpace(a: std.mem.Allocator, name: []const u8, start: i64, end: i6
 /// One list per row from the instants of a calendar range: `rows` rows, row `i` is null when
 /// `bounds(i)` gives null, else the instants of `instantsBetween`. `date` makes ISO date
 /// text cells (a `.date` list), else timestamp ints.
-fn rangesList(a: std.mem.Allocator, name: []const u8, rows: usize, starts: anytype, ends: anytype, d: dtf.Duration, spec: CalendarSpec, comptime date: bool) RangeError!Frame {
+fn rangesList(a: std.mem.Allocator, name: []const u8, rows: usize, starts: anytype, ends: anytype, d: dtf.Duration, closed: Closed, business: bool, comptime kind: enum { date, timestamp, time }) RangeError!Frame {
+    const date = kind == .date;
     const cells = try a.alloc(Value, rows);
     defer a.free(cells);
     var items: std.ArrayList(Value) = .empty;
@@ -409,7 +410,7 @@ fn rangesList(a: std.mem.Allocator, name: []const u8, rows: usize, starts: anyty
         };
         const s = if (date) try dayStart(sv) else sv;
         const e = if (date) try dayStart(ev) else ev;
-        const ts = try instantsBetween(a, s, e, d, spec.closed, spec.business);
+        const ts = try instantsBetween(a, s, e, d, closed, business);
         defer a.free(ts);
         total = std.math.add(usize, total, ts.len) catch return error.TooLarge;
         if (total > max_range_rows) return error.TooLarge;
@@ -417,7 +418,11 @@ fn rangesList(a: std.mem.Allocator, name: []const u8, rows: usize, starts: anyty
         for (ts) |t| try items.append(a, if (date) try dtf.dayText(a, @divFloor(t, day_us)) else .{ .int = t });
         c.* = try lf.makeList(a, items.items);
     }
-    const inner = try a.dupe(Column, &[_]Column{.{ .name = "", .type = if (date) .date else .timestamp }});
+    const inner = try a.dupe(Column, &[_]Column{.{ .name = "", .type = switch (kind) {
+        .date => .date,
+        .timestamp => .timestamp,
+        .time => .time,
+    } }});
     return fromCells(a, name, .list, cells, inner);
 }
 
@@ -427,7 +432,7 @@ fn rangesList(a: std.mem.Allocator, name: []const u8, rows: usize, starts: anyty
 /// together hold at most `max_range_rows` dates (`error.TooLarge`).
 pub fn dateRanges(a: std.mem.Allocator, name: []const u8, starts: []const ?vm.Date, ends: []const ?vm.Date, spec: CalendarSpec) RangeError!Frame {
     const d = try parseInterval(spec, true);
-    return rangesList(a, name, try rowCount(starts.len, ends.len), starts, ends, d, spec, true);
+    return rangesList(a, name, try rowCount(starts.len, ends.len), starts, ends, d, spec.closed, spec.business, .date);
 }
 
 /// polars `datetime_ranges(start, end, interval, closed)`: one list of timestamps per row
@@ -435,5 +440,32 @@ pub fn dateRanges(a: std.mem.Allocator, name: []const u8, starts: []const ?vm.Da
 /// and the cap as `dateRanges`.
 pub fn datetimeRanges(a: std.mem.Allocator, name: []const u8, starts: []const ?i64, ends: []const ?i64, spec: CalendarSpec) RangeError!Frame {
     const d = try parseInterval(spec, false);
-    return rangesList(a, name, try rowCount(starts.len, ends.len), starts, ends, d, spec, false);
+    return rangesList(a, name, try rowCount(starts.len, ends.len), starts, ends, d, spec.closed, spec.business, .timestamp);
+}
+
+/// The interval of `timeRange`: a positive, fixed length (no months), else `error.BadArgument`.
+fn timeInterval(interval: dtf.Duration) RangeError!dtf.Duration {
+    if (interval.months != 0 or interval.us <= 0) return error.BadArgument;
+    return interval;
+}
+
+/// polars `pl.time_range(start, end, interval, closed)`: a `.time` column from `start` to
+/// `end` (microseconds since midnight, both within one day, else `error.BadArgument`) every
+/// `interval` (`dtfn.parseDuration`'s result; positive and fixed, else `error.BadArgument`).
+/// polars' defaults are `start` 0 and `end` `us_per_day - 1` (23:59:59.999999); `closed` as
+/// `datetimeRange`. A start after the end is an empty column.
+pub fn timeRange(a: std.mem.Allocator, name: []const u8, start: i64, end: i64, interval: dtf.Duration, closed: Closed) RangeError!Frame {
+    const d = try timeInterval(interval);
+    if (!vm.isTimeOfDay(start) or !vm.isTimeOfDay(end)) return error.BadArgument;
+    const ts = try instantsBetween(a, start, end, d, closed, false);
+    return single(a, name, .time, .{ .int = .{ .values = ts } }, ts.len, &.{});
+}
+
+/// polars `pl.time_ranges`: one list of times per row, `timeRange(start[i], end[i], interval,
+/// closed)`. Broadcast, nulls and the cap as `dateRanges`; a bound outside one day is
+/// `error.BadArgument`.
+pub fn timeRanges(a: std.mem.Allocator, name: []const u8, starts: []const ?i64, ends: []const ?i64, interval: dtf.Duration, closed: Closed) RangeError!Frame {
+    const d = try timeInterval(interval);
+    for ([2][]const ?i64{ starts, ends }) |side| for (side) |b| if (b) |x| if (!vm.isTimeOfDay(x)) return error.BadArgument;
+    return rangesList(a, name, try rowCount(starts.len, ends.len), starts, ends, d, closed, false, .time);
 }
