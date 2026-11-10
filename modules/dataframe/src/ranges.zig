@@ -125,6 +125,13 @@ pub fn intRanges(a: std.mem.Allocator, name: []const u8, starts: []const ?i64, e
 pub fn linearSpace(a: std.mem.Allocator, name: []const u8, start: f64, end: f64, n: usize, closed: Closed) RangeError!Frame {
     if (n > max_range_rows) return error.TooLarge;
     const vals = try a.alloc(f64, n);
+    fillLinear(vals, start, end, closed);
+    return single(a, name, .float, .{ .float = .{ .values = vals } }, n, &.{});
+}
+
+/// The samples of `linearSpace` written into `vals` (its length is `n`, already capped).
+fn fillLinear(vals: []f64, start: f64, end: f64, closed: Closed) void {
+    const n = vals.len;
     const nf: f64 = @floatFromInt(n);
     const step: f64 = switch (closed) {
         .both => if (n > 1) (end - start) / (nf - 1) else 0,
@@ -137,7 +144,46 @@ pub fn linearSpace(a: std.mem.Allocator, name: []const u8, start: f64, end: f64,
     };
     for (vals, 0..) |*v, i| v.* = start + (first + @as(f64, @floatFromInt(i))) * step;
     if (closed == .both and n > 1) vals[n - 1] = end;
-    return single(a, name, .float, .{ .float = .{ .values = vals } }, n, &.{});
+}
+
+/// The row count of two per-row inputs of which one may hold a single entry for every row
+/// (`intRanges`' broadcast); `error.BadArgument` when they disagree.
+fn rowCount(la: usize, lb: usize) RangeError!usize {
+    if (la != lb and la != 1 and lb != 1) return error.BadArgument;
+    return if (la == 1) lb else la;
+}
+
+/// polars `linear_spaces(start, end, num_samples, closed)`: one list of floats per row,
+/// `linearSpace(start[i], end[i], n, closed)`. `starts` and `ends` have the same length, or
+/// one of them has one entry used for every row; a null bound makes the row's list null.
+/// `n` is shared by every row. All lists together hold at most `max_range_rows` values.
+pub fn linearSpaces(a: std.mem.Allocator, name: []const u8, starts: []const ?f64, ends: []const ?f64, n: usize, closed: Closed) RangeError!Frame {
+    const rows = try rowCount(starts.len, ends.len);
+    if (n > max_range_rows) return error.TooLarge;
+    const cells = try a.alloc(Value, rows);
+    defer a.free(cells);
+    const items = try a.alloc(Value, n);
+    defer a.free(items);
+    const vals = try a.alloc(f64, n);
+    defer a.free(vals);
+    var total: usize = 0;
+    for (cells, 0..) |*c, i| {
+        const s = starts[if (starts.len == 1) 0 else i] orelse {
+            c.* = .null;
+            continue;
+        };
+        const e = ends[if (ends.len == 1) 0 else i] orelse {
+            c.* = .null;
+            continue;
+        };
+        total = std.math.add(usize, total, n) catch return error.TooLarge;
+        if (total > max_range_rows) return error.TooLarge;
+        fillLinear(vals, s, e, closed);
+        for (items, vals) |*it, v| it.* = .{ .float = v };
+        c.* = try lf.makeList(a, items);
+    }
+    const inner = try a.dupe(Column, &[_]Column{.{ .name = "", .type = .float }});
+    return fromCells(a, name, .list, cells, inner);
 }
 
 /// Most bytes `repeatValue` may copy: `n` times the value's text or nested elements (each
@@ -341,4 +387,53 @@ pub fn datetimeSpace(a: std.mem.Allocator, name: []const u8, start: i64, end: i6
         t.* = @intCast(start + @divFloor(q_ns, 1000));
     }
     return timestampColumn(a, name, out);
+}
+
+/// One list per row from the instants of a calendar range: `rows` rows, row `i` is null when
+/// `bounds(i)` gives null, else the instants of `instantsBetween`. `date` makes ISO date
+/// text cells (a `.date` list), else timestamp ints.
+fn rangesList(a: std.mem.Allocator, name: []const u8, rows: usize, starts: anytype, ends: anytype, d: dtf.Duration, spec: CalendarSpec, comptime date: bool) RangeError!Frame {
+    const cells = try a.alloc(Value, rows);
+    defer a.free(cells);
+    var items: std.ArrayList(Value) = .empty;
+    defer items.deinit(a);
+    var total: usize = 0;
+    for (cells, 0..) |*c, i| {
+        const sv = starts[if (starts.len == 1) 0 else i] orelse {
+            c.* = .null;
+            continue;
+        };
+        const ev = ends[if (ends.len == 1) 0 else i] orelse {
+            c.* = .null;
+            continue;
+        };
+        const s = if (date) try dayStart(sv) else sv;
+        const e = if (date) try dayStart(ev) else ev;
+        const ts = try instantsBetween(a, s, e, d, spec.closed, spec.business);
+        defer a.free(ts);
+        total = std.math.add(usize, total, ts.len) catch return error.TooLarge;
+        if (total > max_range_rows) return error.TooLarge;
+        items.clearRetainingCapacity();
+        for (ts) |t| try items.append(a, if (date) try dtf.dayText(a, @divFloor(t, day_us)) else .{ .int = t });
+        c.* = try lf.makeList(a, items.items);
+    }
+    const inner = try a.dupe(Column, &[_]Column{.{ .name = "", .type = if (date) .date else .timestamp }});
+    return fromCells(a, name, .list, cells, inner);
+}
+
+/// polars `date_ranges(start, end, interval, closed)`: one list of dates per row,
+/// `dateRange(start[i], end[i], spec)`. `starts` and `ends` have the same length, or one of
+/// them has one entry used for every row; a null bound makes the row's list null. All lists
+/// together hold at most `max_range_rows` dates (`error.TooLarge`).
+pub fn dateRanges(a: std.mem.Allocator, name: []const u8, starts: []const ?vm.Date, ends: []const ?vm.Date, spec: CalendarSpec) RangeError!Frame {
+    const d = try parseInterval(spec, true);
+    return rangesList(a, name, try rowCount(starts.len, ends.len), starts, ends, d, spec, true);
+}
+
+/// polars `datetime_ranges(start, end, interval, closed)`: one list of timestamps per row
+/// (microseconds since the epoch), `datetimeRange(start[i], end[i], spec)`. Broadcast, nulls
+/// and the cap as `dateRanges`.
+pub fn datetimeRanges(a: std.mem.Allocator, name: []const u8, starts: []const ?i64, ends: []const ?i64, spec: CalendarSpec) RangeError!Frame {
+    const d = try parseInterval(spec, false);
+    return rangesList(a, name, try rowCount(starts.len, ends.len), starts, ends, d, spec, false);
 }
