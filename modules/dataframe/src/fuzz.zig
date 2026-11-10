@@ -113,6 +113,11 @@ pub fn resetReach() void {
     verb_err = @splat(0);
     verb_typed_checked = @splat(0);
     valid_past_len = 0;
+    expr_emitted = @splat(0);
+    unary_emitted = @splat(0);
+    win_emitted = @splat(0);
+    expr_root_ok = @splat(0);
+    expr_root_err = @splat(0);
 }
 
 fn printVerbTable() void {
@@ -257,9 +262,10 @@ fn expectWellFormed(what: []const u8, f: Frame) !void {
 const name_pool = [_][]const u8{ "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9" };
 
 const text_pool = [_][]const u8{
-    "",           "a",    "b",         "abc",  "Hello",  " pad ",  "\xc3\xa9\xe2\x82\xac", "\xff\xfe", "NA", "1",
-    "2.5",        "true", "a,b",       "q\"x", "l1\nl2", "x|y",    "\xf0\x9f\x98\x80",     "\x00",     "-7", "1e3",
-    "2020-01-01", "\r\n", "aaaa bbbb", "Zz",   "\x80",   "ab\xc3",
+    "",           "a",    "b",         "abc",  "Hello",  " pad ",  "\xc3\xa9\xe2\x82\xac", "\xff\xfe",     "NA",           "1",
+    "2.5",        "true", "a,b",       "q\"x", "l1\nl2", "x|y",    "\xf0\x9f\x98\x80",     "\x00",         "-7",           "1e3",
+    "2020-01-01", "\r\n", "aaaa bbbb", "Zz",   "\x80",   "ab\xc3", "e\xcc\x81",            "\xef\xac\x81", "\xe1\xba\x9e", "\xc7\x86",
+    "A\xcc\x8a",
 };
 
 const date_pool = [_][]const u8{ "2020-01-01", "2020-02-29", "1999-12-31", "0000-01-01", "9999-12-31", "2020-13-45", "", "x", "2021-02-29", "2020-1-1" };
@@ -480,7 +486,14 @@ fn genOperand(src: anytype, f: Frame) df.Operand {
     return if (chance(src, 60)) .{ .col = pickCol(src, f) } else .{ .num = genFloat(src) };
 }
 
+/// Counts the tag of every generated node (reach of the `Expr` arms), then hands it back.
 fn genExpr(src: anytype, a: Allocator, f: Frame, depth: usize) Allocator.Error!*const df.Expr {
+    const e = try genExprRaw(src, a, f, depth);
+    expr_emitted[@backingInt(std.meta.activeTag(e.*))] += 1;
+    return e;
+}
+
+fn genExprRaw(src: anytype, a: Allocator, f: Frame, depth: usize) Allocator.Error!*const df.Expr {
     const e = try a.create(df.Expr);
     const leaf = depth >= 3 or chance(src, 25);
     if (leaf) {
@@ -488,8 +501,14 @@ fn genExpr(src: anytype, a: Allocator, f: Frame, depth: usize) Allocator.Error!*
         return e;
     }
     const x = try genExpr(src, a, f, depth + 1);
+    // Waves W2-W5 and W8 (strings, regex, dates and times, zones, folds, normalize) and the
+    // shapes that stress the walk: shared sub-expressions and a very deep chain.
+    if (chance(src, 50)) {
+        e.* = try genExprS2(src, a, f, depth, x);
+        return e;
+    }
     e.* = switch (below(src, 38)) {
-        0, 1, 2 => .{ .unary = .{ .op = pickEnum(src, df.Unary), .x = x } },
+        0, 1, 2 => .{ .unary = .{ .op = pickUnary(src), .x = x } },
         3, 4, 5, 6 => .{ .binary = .{ .op = pickEnum(src, df.Binary), .l = x, .r = try genExpr(src, a, f, depth + 1) } },
         7 => blk: {
             const vals = try a.alloc(Value, below(src, 4));
@@ -543,9 +562,10 @@ fn genExpr(src: anytype, a: Allocator, f: Frame, depth: usize) Allocator.Error!*
         34 => blk: {
             const elem = try a.create(df.Expr);
             elem.* = .element;
+            expr_emitted[@backingInt(std.meta.activeTag(elem.*))] += 1;
             const body = try a.create(df.Expr);
             body.* = switch (below(src, 3)) {
-                0 => .{ .unary = .{ .op = pickEnum(src, df.Unary), .x = elem } },
+                0 => .{ .unary = .{ .op = pickUnary(src), .x = elem } },
                 1 => .{ .binary = .{ .op = pickEnum(src, df.Binary), .l = elem, .r = try genExpr(src, a, f, depth + 1) } },
                 else => .{ .list = .{ .x = elem, .op = genListOp(src, a) } },
             };
@@ -575,6 +595,227 @@ fn genExpr(src: anytype, a: Allocator, f: Frame, depth: usize) Allocator.Error!*
     return e;
 }
 
+// ── dataframe S2 waves W2-W5, W8: the Expr arms the first generator lacks ──
+
+const n_expr_tags = std.enums.values(std.meta.Tag(df.Expr)).len;
+const n_unary = std.enums.values(df.Unary).len;
+const n_win_tags = std.enums.values(std.meta.Tag(df.WindowOp)).len;
+var expr_emitted: [n_expr_tags]u64 = @splat(0);
+var unary_emitted: [n_unary]u64 = @splat(0);
+var win_emitted: [n_win_tags]u64 = @splat(0);
+/// Root tag of a `mutate` expression that evaluated / was refused: a tag that is only ever
+/// refused (`BadExpr` on every draw) is generated but never run.
+var expr_root_ok: [n_expr_tags]u64 = @splat(0);
+var expr_root_err: [n_expr_tags]u64 = @splat(0);
+
+fn pickUnary(src: anytype) df.Unary {
+    const u = pickEnum(src, df.Unary);
+    unary_emitted[@backingInt(u)] += 1;
+    return u;
+}
+
+fn printExprTable() void {
+    for (std.enums.values(std.meta.Tag(df.Expr)), 0..) |t, i|
+        std.debug.print("EXPR {t} emitted={d} root_ok={d} root_err={d}\n", .{ t, expr_emitted[i], expr_root_ok[i], expr_root_err[i] });
+    for (std.enums.values(df.Unary), 0..) |u, i| std.debug.print("UNARY {t} emitted={d}\n", .{ u, unary_emitted[i] });
+    for (std.enums.values(std.meta.Tag(df.WindowOp)), 0..) |t, i| std.debug.print("WINOP {t} emitted={d}\n", .{ t, win_emitted[i] });
+}
+
+/// Every `Expr` tag, `Unary` op and `WindowOp` tag was generated at least once (`element`
+/// and the leaves included).
+fn expectExprReach() !void {
+    var missing = false;
+    for (std.enums.values(std.meta.Tag(df.Expr)), 0..) |t, i| if (expr_emitted[i] == 0) {
+        std.debug.print("reach: Expr arm {t} never generated\n", .{t});
+        missing = true;
+    };
+    for (std.enums.values(df.Unary), 0..) |u, i| if (unary_emitted[i] == 0) {
+        std.debug.print("reach: Unary {t} never generated\n", .{u});
+        missing = true;
+    };
+    for (std.enums.values(std.meta.Tag(df.WindowOp)), 0..) |t, i| if (win_emitted[i] == 0) {
+        std.debug.print("reach: WindowOp {t} never generated\n", .{t});
+        missing = true;
+    };
+    if (missing) return error.HarnessDoesNotReach;
+}
+
+fn countRoot(e: df.Expr, ok: bool) void {
+    const i = @backingInt(std.meta.activeTag(e));
+    if (ok) expr_root_ok[i] += 1 else expr_root_err[i] += 1;
+}
+
+const str_pool = [_][]const u8{ "", "a", "ab", "abc", "\xc3\xa9", "\xff", "e\xcc\x81", " ", "-" };
+const pat_lists = [_][]const []const u8{ &.{}, &.{"a"}, &.{ "a", "b" }, &.{ "", "a" }, &.{"\xff"}, &.{ "ab", "a", "\xc3\xa9" }, &.{ "A", "B" } };
+const with_lists = [_][]const []const u8{ &.{}, &.{"x"}, &.{ "x", "y" }, &.{ "", "" }, &.{ "\xff", "z" }, &.{ "1", "2", "3" } };
+const with_pool = [_][]const u8{ "", "$1", "${n}", "$$", "\xff", "x", "$0$0" };
+const zone_pool = [_][]const u8{ "Europe/Prague", "America/New_York", "UTC", "Nowhere/Land", "", "Asia/Kolkata", "Pacific/Chatham" };
+const edge_counts = [_]usize{ 0, 1, 2, 3, 5, 40, 4096, std.math.maxInt(usize) };
+const edge_starts = [_]i64{ 0, 1, -1, 2, -3, 100, std.math.minInt(i64), std.math.maxInt(i64) };
+
+fn subExpr(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Expr) Allocator.Error!*const df.Expr {
+    // One time in six the very node `x` again: a shared sub-expression, a DAG.
+    if (chance(src, 17)) return x;
+    return genExpr(src, a, f, depth + 1);
+}
+
+fn optSub(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Expr) Allocator.Error!?*const df.Expr {
+    if (chance(src, 50)) return null;
+    return try subExpr(src, a, f, depth, x);
+}
+
+fn subList(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Expr, max: usize) Allocator.Error![]const df.Expr {
+    const xs = try a.alloc(df.Expr, range(src, usize, 0, max));
+    for (xs) |*c| c.* = (try subExpr(src, a, f, depth, x)).*;
+    return xs;
+}
+
+fn genDates(src: anytype, a: Allocator) Allocator.Error![]const df.Date {
+    const ds = try a.alloc(df.Date, range(src, usize, 0, 3));
+    for (ds) |*d| d.* = switch (below(src, 5)) {
+        0 => .{ .y = 2020, .m = 13, .d = 40 },
+        1 => .{ .y = std.math.minInt(i32), .m = 0, .d = 0 },
+        2 => .{ .y = std.math.maxInt(i32), .m = 12, .d = 31 },
+        3 => .{ .y = 1970, .m = 1, .d = 1 },
+        else => .{ .y = range(src, i32, 1999, 2021), .m = range(src, u8, 1, 12), .d = range(src, u8, 1, 28) },
+    };
+    return ds;
+}
+
+fn genWeekMask(src: anytype) [7]bool {
+    if (chance(src, 40)) return .{ true, true, true, true, true, false, false };
+    var m: [7]bool = undefined;
+    for (&m) |*b| b.* = chance(src, 50);
+    return m;
+}
+
+/// A chain of `n` unary nodes over `x`, or a tower where each level uses the level below
+/// twice (a DAG of 2^n paths): both are refused or walked in time linear in the nodes.
+fn genChain(src: anytype, a: Allocator, x: *const df.Expr) Allocator.Error!df.Expr {
+    var cur = x;
+    const tower = chance(src, 50);
+    const n: usize = if (tower) pickOf(src, usize, &.{ 4, 16, 24, 40, 70 }) else pickOf(src, usize, &.{ 2, 50, 120, 254, 255, 256, 300 });
+    for (0..n) |_| {
+        const e = try a.create(df.Expr);
+        e.* = if (tower)
+            .{ .binary = .{ .op = pickEnum(src, df.Binary), .l = cur, .r = cur } }
+        else
+            .{ .unary = .{ .op = pickUnary(src), .x = cur } };
+        expr_emitted[@backingInt(std.meta.activeTag(e.*))] += 1;
+        cur = e;
+    }
+    return cur.*;
+}
+
+fn genExprS2(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Expr) Allocator.Error!df.Expr {
+    return switch (below(src, 41)) {
+        0 => .{ .round_sig_figs = .{ .x = x, .digits = pickOf(src, u32, &.{ 0, 1, 3, 15, 17, 400, std.math.maxInt(u32) }) } },
+        1 => .{ .is_close = .{
+            .l = x,
+            .r = try subExpr(src, a, f, depth, x),
+            .rel_tol = pickOf(src, f64, &.{ 1e-9, 0, -1, std.math.nan(f64), std.math.inf(f64), 1e308 }),
+            .abs_tol = pickOf(src, f64, &.{ 0, 1, -1, std.math.nan(f64), std.math.inf(f64) }),
+            .nans_equal = chance(src, 50),
+        } },
+        2 => .{ .translate = .{ .x = x, .from = pickOf(src, []const u8, &str_pool), .to = pickOf(src, []const u8, &str_pool), .delete = pickOf(src, []const u8, &str_pool) } },
+        3 => .{ .contains_any = .{ .x = x, .patterns = pickOf(src, []const []const u8, &pat_lists), .ascii_case_insensitive = chance(src, 50) } },
+        4 => .{ .replace_many = .{
+            .x = x,
+            .patterns = pickOf(src, []const []const u8, &pat_lists),
+            .with = pickOf(src, []const []const u8, &with_lists),
+            .ascii_case_insensitive = chance(src, 50),
+        } },
+        5 => .{ .contains_regex = .{ .x = x, .pattern = pickOf(src, []const u8, &regex_pool) } },
+        6 => .{ .extract = .{ .x = x, .pattern = pickOf(src, []const u8, &regex_pool), .group = range(src, usize, 0, 3) } },
+        7 => .{ .count_regex = .{ .x = x, .pattern = pickOf(src, []const u8, &regex_pool) } },
+        8 => .{ .replace_regex = .{
+            .x = x,
+            .pattern = pickOf(src, []const u8, &regex_pool),
+            .with = pickOf(src, []const u8, &with_pool),
+            .all = chance(src, 50),
+            .literal = chance(src, 25),
+            .n = if (chance(src, 50)) null else pickOf(src, usize, &edge_counts),
+        } },
+        9 => if (chance(src, 50))
+            .{ .to_local = .{ .x = x, .zone = pickOf(src, []const u8, &zone_pool) } }
+        else
+            .{ .from_local = .{ .x = x, .zone = pickOf(src, []const u8, &zone_pool), .policy = pickEnum(src, df.TzPolicy) } },
+        10 => .{ .is_between = .{ .x = x, .lower = try subExpr(src, a, f, depth, x), .upper = try subExpr(src, a, f, depth, x), .closed = pickEnum(src, df.Closed) } },
+        11 => .{ .concat_str = .{
+            .parts = try subList(src, a, f, depth, x, 3),
+            .separator = pickOf(src, []const u8, &str_pool),
+            .ignore_nulls = chance(src, 50),
+            .na_rep = if (chance(src, 50)) null else pickOf(src, []const u8, &str_pool),
+        } },
+        12 => .{ .fold = .{ .op = pickEnum(src, df.Binary), .parts = try subList(src, a, f, depth, x, 3), .acc = try optSub(src, a, f, depth, x) } },
+        13 => .{ .business_day_count = .{ .start = x, .end = try subExpr(src, a, f, depth, x), .week_mask = genWeekMask(src), .holidays = try genDates(src, a) } },
+        14 => .{ .make_date = .{ .year = x, .month = try subExpr(src, a, f, depth, x), .day = try subExpr(src, a, f, depth, x) } },
+        15 => .{ .make_datetime = .{
+            .year = x,
+            .month = try subExpr(src, a, f, depth, x),
+            .day = try subExpr(src, a, f, depth, x),
+            .hour = try optSub(src, a, f, depth, x),
+            .minute = try optSub(src, a, f, depth, x),
+            .second = try optSub(src, a, f, depth, x),
+            .microsecond = try optSub(src, a, f, depth, x),
+        } },
+        16 => .{ .make_duration = .{
+            .weeks = try optSub(src, a, f, depth, x),
+            .days = x,
+            .hours = try optSub(src, a, f, depth, x),
+            .minutes = try optSub(src, a, f, depth, x),
+            .seconds = try optSub(src, a, f, depth, x),
+            .milliseconds = try optSub(src, a, f, depth, x),
+            .microseconds = try optSub(src, a, f, depth, x),
+        } },
+        17 => .{ .from_epoch = .{ .x = x, .unit = pickEnum(src, df.EpochUnit) } },
+        18 => .{ .split_ws = .{ .x = x, .limit = if (chance(src, 50)) null else pickOf(src, usize, &edge_counts) } },
+        19 => .{ .rsplit = .{ .x = x, .by = pickOf(src, []const u8, &str_pool), .limit = if (chance(src, 50)) null else pickOf(src, usize, &edge_counts) } },
+        20 => .{ .partition = .{ .x = x, .sep = pickOf(src, []const u8, &str_pool), .last = chance(src, 50) } },
+        21 => .{ .split_fields = .{ .x = x, .by = pickOf(src, []const u8, &str_pool), .n = pickOf(src, usize, &edge_counts), .rest = chance(src, 50) } },
+        22 => .{ .wrap = .{ .x = x, .width = pickOf(src, usize, &edge_counts), .break_long_words = chance(src, 50), .break_on_hyphens = chance(src, 50) } },
+        23 => .{ .slice_replace = .{
+            .x = x,
+            .start = if (chance(src, 40)) null else pickOf(src, i64, &edge_starts),
+            .stop = if (chance(src, 40)) null else pickOf(src, i64, &edge_starts),
+            .with = pickOf(src, []const u8, &str_pool),
+        } },
+        24 => if (chance(src, 50))
+            .{ .encode = .{ .x = x, .how = pickEnum(src, df.Encoding) } }
+        else
+            .{ .decode = .{ .x = x, .how = pickEnum(src, df.Encoding) } },
+        25 => .{ .affix_any = .{ .x = x, .patterns = pickOf(src, []const []const u8, &pat_lists), .end = chance(src, 50) } },
+        26 => .{ .replace_n = .{ .x = x, .from = pickOf(src, []const u8, &str_pool), .to = pickOf(src, []const u8, &str_pool), .n = pickOf(src, usize, &edge_counts) } },
+        27 => .{ .match_regex = .{ .x = x, .pattern = pickOf(src, []const u8, &regex_pool), .full = chance(src, 50) } },
+        28 => .{ .to_datetime = .{ .x = x, .mode = pickEnum(src, df.DateMode), .dayfirst = chance(src, 50), .to = pickEnum(src, df.ParseTo) } },
+        29 => .{ .td_components = .{ .x = x } },
+        30 => .{ .dt_combine = .{ .date = x, .time = try subExpr(src, a, f, depth, x) } },
+        31 => .{ .dt_replace = .{
+            .x = x,
+            .year = try optSub(src, a, f, depth, x),
+            .month = try optSub(src, a, f, depth, x),
+            .day = try optSub(src, a, f, depth, x),
+            .hour = try optSub(src, a, f, depth, x),
+            .minute = try optSub(src, a, f, depth, x),
+            .second = try optSub(src, a, f, depth, x),
+            .microsecond = try optSub(src, a, f, depth, x),
+        } },
+        32 => .{ .tz_offset = .{ .x = x, .zone = pickOf(src, []const u8, &zone_pool), .kind = pickEnum(src, df.OffsetKind) } },
+        33 => .{ .is_business_day = .{ .x = x, .week_mask = genWeekMask(src), .holidays = try genDates(src, a) } },
+        34 => .{ .normalize = .{ .x = x, .form = pickEnum(src, df.NormalForm) } },
+        35 => try genChain(src, a, x),
+        // The old arms again with a shared operand: `l` and `r` the same node.
+        36 => .{ .binary = .{ .op = pickEnum(src, df.Binary), .l = x, .r = x } },
+        37 => .{ .if_else = .{ .cond = x, .then = x, .otherwise = try subExpr(src, a, f, depth, x) } },
+        38 => .{ .concat_list = try subList(src, a, f, depth, x, 3) },
+        39 => .{ .is_in = .{ .x = x, .values = &.{} } },
+        else => .{ .strftime = .{ .x = x, .format = pickOf(src, []const u8, &.{ "%Y-%m-%dT%H:%M:%S%.f", "%j %U %w", "%e %p %I", "%s %%", "%G-%V" }) } },
+    };
+}
+
+/// The window module's `Closed` (`df.Closed` is the `is_between` one).
+const WinClosed = @import("window.zig").Closed;
+
 const record_names_ext = [_][]const u8{ "x", "y", "x", "" };
 /// Empty matches, groups that take no part, a named group, a bad pattern, none.
 const regex_pool = [_][]const u8{ "a", "", "a*", "(a)(b)?", "(?P<n>[0-9]+)", "[", "\\d+|x", "(x)|(y)" };
@@ -602,10 +843,48 @@ fn genListOp(src: anytype, a: Allocator) df.ListOp {
     };
 }
 
-fn genWinOp(src: anytype, f: Frame) df.WindowOp {
+fn genEwm(src: anytype, f: Frame) df.Ewm {
+    return .{
+        .alpha = if (chance(src, 40)) genQ(src) else null,
+        .span = if (chance(src, 30)) genFloat(src) else null,
+        .com = if (chance(src, 20)) genFloat(src) else null,
+        .halflife = if (chance(src, 20)) genFloat(src) else null,
+        .adjust = chance(src, 50),
+        .ignore_na = chance(src, 50),
+        .min_periods = range(src, usize, 0, 3),
+        .func = pickEnum(src, @FieldType(df.Ewm, "func")),
+        .times_col = if (chance(src, 25)) pickCol(src, f) else null,
+    };
+}
+
+fn genWinType(src: anytype) df.WinType {
+    return switch (below(src, 5)) {
+        0 => .{ .exponential = .{ .tau = genFloat(src) } },
+        1 => .{ .gaussian = .{ .std = genFloat(src) } },
+        2 => .{ .general_gaussian = .{ .p = genFloat(src), .sig = genFloat(src) } },
+        3 => .{ .kaiser = .{ .beta = genFloat(src) } },
+        else => pickOf(src, df.WinType, &.{ .boxcar, .triang, .hamming, .hann, .bartlett, .barthann, .blackman, .blackmanharris, .nuttall, .flattop, .parzen, .bohman, .cosine }),
+    };
+}
+
+fn genRollingPair(src: anytype, f: Frame, wins: []const usize) df.RollingPair {
+    const timed = chance(src, 25);
+    return .{
+        .other = pickCol(src, f),
+        .window = if (chance(src, 30)) null else pickOf(src, usize, wins),
+        .min_periods = if (chance(src, 50)) null else range(src, usize, 0, 3),
+        .center = chance(src, 50),
+        .ddof = range(src, u32, 0, 3),
+        .time_col = if (timed) pickCol(src, f) else null,
+        .period = pickOf(src, i64, &.{ 1, 0, -1, 5, std.math.maxInt(i64), std.math.minInt(i64) }),
+        .closed = pickEnum(src, WinClosed),
+    };
+}
+
+fn genWinOp(src: anytype, a: Allocator, f: Frame) Allocator.Error!df.WindowOp {
     const wins = [_]usize{ 0, 1, 2, 3, 5, 20, 100, 1 << 40, std.math.maxInt(usize) };
     const fns = comptime std.enums.values(df.WinFn);
-    return switch (below(src, 19)) {
+    const op: df.WindowOp = switch (below(src, 26)) {
         16 => .{ .rolling_rank = .{
             .window = if (chance(src, 30)) null else pickOf(src, usize, &wins),
             .min_periods = if (chance(src, 50)) null else range(src, usize, 0, 3),
@@ -613,30 +892,47 @@ fn genWinOp(src: anytype, f: Frame) df.WindowOp {
             .method = pickEnum(src, df.RankMethod),
             .descending = chance(src, 50),
             .pct = chance(src, 50),
+            .time_col = if (chance(src, 25)) pickCol(src, f) else null,
+            .period = pickOf(src, i64, &.{ 1, 0, -1, 5, std.math.maxInt(i64), std.math.minInt(i64) }),
+            .closed = pickEnum(src, WinClosed),
         } },
-        17, 18 => blk: {
-            const rp: df.RollingPair = .{
-                .other = pickCol(src, f),
-                .window = if (chance(src, 30)) null else pickOf(src, usize, &wins),
-                .min_periods = if (chance(src, 50)) null else range(src, usize, 0, 3),
-                .center = chance(src, 50),
-                .ddof = range(src, u32, 0, 3),
-            };
-            break :blk if (chance(src, 50)) .{ .rolling_corr = rp } else .{ .rolling_cov = rp };
-        },
+        17 => .{ .rolling_corr = genRollingPair(src, f, &wins) },
+        18 => .{ .rolling_cov = genRollingPair(src, f, &wins) },
+        19 => .{ .ewm_cov = .{ .other = pickCol(src, f), .ewm = genEwm(src, f), .bias = chance(src, 50) } },
+        20 => .{ .ewm_corr = .{ .other = pickCol(src, f), .ewm = genEwm(src, f), .bias = chance(src, 50) } },
+        15 => .{ .ewm_by = .{
+            .time_col = pickCol(src, f),
+            .half_life = pickOf(src, i64, &.{ 1, 0, -1, 5, 1000, std.math.maxInt(i64), std.math.minInt(i64) }),
+            .func = pickEnum(src, @FieldType(df.EwmBy, "func")),
+        } },
         0 => .{ .shift = .{ .n = pickOf(src, i64, &.{ 1, -1, 0, 2, 3, -7, 1000, std.math.minInt(i64), std.math.maxInt(i64) }), .fill = if (chance(src, 50)) .null else .{ .float = 0.5 } } },
         1 => .{ .diff = range(src, i64, -3, 3) },
         2 => .{ .pct_change = pickOf(src, i64, &.{ 1, 0, -1, 2, std.math.minInt(i64) }) },
         3 => .cum_sum,
         4 => pickOf(src, df.WindowOp, &.{ .cum_prod, .cum_min, .cum_max, .cum_count, .row_number }),
-        5, 6 => .{ .rolling = .{
-            .window = pickOf(src, usize, &wins),
-            .func = fns[below(src, fns.len)],
-            .min_periods = if (chance(src, 50)) null else range(src, usize, 0, 3),
-            .center = chance(src, 50),
-            .q = genQ(src),
-            .ddof = range(src, u32, 0, 3),
-        } },
+        5, 6, 21 => blk: {
+            const w = pickOf(src, usize, &wins);
+            // A weight per window row (the length must match), only for a window that is small.
+            var weights: ?[]const f64 = null;
+            if (w >= 1 and w <= 5 and chance(src, 30)) {
+                const ws = try a.alloc(f64, if (chance(src, 85)) w else w + 1);
+                for (ws) |*x| x.* = genFloat(src);
+                weights = ws;
+            }
+            break :blk .{ .rolling = .{
+                .window = w,
+                .func = fns[below(src, fns.len)],
+                .min_periods = if (chance(src, 50)) null else range(src, usize, 0, 3),
+                .center = chance(src, 50),
+                .q = genQ(src),
+                .ddof = range(src, u32, 0, 3),
+                .closed = pickEnum(src, WinClosed),
+                .step = pickOf(src, usize, &.{ 1, 0, 2, 3, std.math.maxInt(usize) }),
+                .forward = chance(src, 15),
+                .weights = weights,
+                .win_type = if (weights == null and chance(src, 20)) genWinType(src) else null,
+            } };
+        },
         7 => .{ .rolling_time = .{
             .time_col = pickCol(src, f),
             .period = pickOf(src, i64, &.{ 1, 0, -1, 5, std.math.maxInt(i64), std.math.minInt(i64) }),
@@ -644,23 +940,18 @@ fn genWinOp(src: anytype, f: Frame) df.WindowOp {
             .min_periods = range(src, usize, 0, 3),
             .q = genQ(src),
             .ddof = range(src, u32, 0, 3),
+            .closed = pickEnum(src, WinClosed),
         } },
         8 => .{ .expanding = .{ .func = fns[below(src, fns.len)], .min_periods = range(src, usize, 0, 3), .q = genQ(src), .ddof = range(src, u32, 0, 3) } },
-        9 => .{ .ewm = .{
-            .alpha = if (chance(src, 40)) genQ(src) else null,
-            .span = if (chance(src, 30)) genFloat(src) else null,
-            .com = if (chance(src, 20)) genFloat(src) else null,
-            .halflife = if (chance(src, 20)) genFloat(src) else null,
-            .adjust = chance(src, 50),
-            .ignore_na = chance(src, 50),
-            .min_periods = range(src, usize, 0, 3),
-        } },
-        10 => .{ .rank = .{ .method = pickEnum(src, df.RankMethod), .descending = chance(src, 50) } },
+        9 => .{ .ewm = genEwm(src, f) },
+        10 => .{ .rank = .{ .method = pickEnum(src, df.RankMethod), .descending = chance(src, 50), .pct = chance(src, 50), .na_option = pickEnum(src, df.RankNa) } },
         11 => .{ .ffill = if (chance(src, 50)) null else range(src, usize, 0, 3) },
         12 => .{ .bfill = if (chance(src, 50)) null else range(src, usize, 0, 3) },
         13 => .{ .interpolate = .{ .extend_last = chance(src, 50) } },
         else => .{ .transform = .{ .func = pickEnum(src, df.AggFn), .q = genQ(src) } },
     };
+    win_emitted[@backingInt(std.meta.activeTag(op))] += 1;
+    return op;
 }
 
 // ── running a verb ──────────────────────────────────────────────────────────
@@ -821,7 +1112,7 @@ fn runVerb(src: anytype, a: Allocator, cur: Frame, v: Verb) !Frame {
             const spec: df.WindowSpec = .{
                 .value_col = pickCol(src, f),
                 .out = pickOf(src, []const u8, &.{ "w", "c0", "c1" }),
-                .op = genWinOp(src, f),
+                .op = try genWinOp(src, a, f),
                 .partition_by = try pickCols(src, a, f, 2),
             };
             break :blk try settle(.window, df.window(a, f, spec), hooks.wi.windowCells(a, f, spec));
@@ -860,7 +1151,9 @@ fn runVerb(src: anytype, a: Allocator, cur: Frame, v: Verb) !Frame {
                 .expr = (try genExpr(src, a, f, 0)).*,
                 .type = if (chance(src, 50)) null else pickEnum(src, ColumnType),
             };
-            break :blk try settle(.mutate, df.mutate(a, f, assigns), hooks.ex.mutateCells(a, f, assigns));
+            const got = try settle(.mutate, df.mutate(a, f, assigns), hooks.ex.mutateCells(a, f, assigns));
+            for (assigns) |s| countRoot(s.expr, got != null);
+            break :blk got;
         },
         .transpose => blk: {
             const names = try a.alloc([]const u8, if (chance(src, 60)) f.len else range(src, usize, 0, 3));
@@ -1436,7 +1729,7 @@ fn csvChunked(src: anytype, a: Allocator, bytes: []const u8, o: csvio.CsvReadOpt
             std.debug.print("csv chunked: chunk at row {d} failed {t}, the whole read gave {d} rows\n", .{ row, e, f.len });
             std.debug.print("  bytes={any}\n  delim={d} quote={d} header={} skip={d} after={d} comment={d} n={d} step={d}\n  strict_quotes={} max_quoted_lines={?d} max_record_bytes={d} max_bytes={d} max_cell_bytes={d} truncate_ragged={} on_bad_lines={t}\n  names={any}\n  columns={any}\n  f.names=", .{ bytes, o.delimiter, o.quote, o.has_header, o.skip_rows, o.skip_rows_after_header, o.comment, n, step, o.strict_quotes, o.max_quoted_lines, o.max_record_bytes, o.max_bytes, o.max_cell_bytes, o.truncate_ragged, o.on_bad_lines, o.names, o.columns });
             for (f.columns) |c| std.debug.print("[{s}]", .{c.name});
-            std.debug.print("\n", .{});
+            std.debug.print("\n  options={any}\n", .{o});
             return error.ChunkedDisagrees;
         };
         const ch = maybe orelse break;
@@ -1757,11 +2050,13 @@ test "fuzz driver: DATAFRAME_FUZZ" {
     driver.run(harness, .{ .prefix = "DATAFRAME_FUZZ", .name = "dataframe" }) catch |e| {
         if (e != error.SkipZigTest) {
             printVerbTable();
+            printExprTable();
             printCsvTable();
         }
         return e;
     };
     printVerbTable();
+    printExprTable();
     printCsvTable();
 }
 
@@ -1781,4 +2076,19 @@ test "fuzz harness: 300 seeds in every test run, and every verb gets called" {
         std.debug.print("reach: verb {t} never called in 300 seeds\n", .{v});
         return error.HarnessDoesNotReach;
     };
+}
+
+test "fuzz harness: the generators reach every Expr arm, Unary op and WindowOp" {
+    resetReach();
+    for (0..20000) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: driver.Rng = .{ .r = prng.random() };
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const f = try genFrame(&rng, a, 0, 3);
+        _ = try genExpr(&rng, a, f, 0);
+        _ = try genWinOp(&rng, a, f);
+    }
+    try expectExprReach();
 }
