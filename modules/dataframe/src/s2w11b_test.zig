@@ -19,6 +19,10 @@ const callback = @import("callback.zig");
 const names_mod = @import("names.zig");
 const catfn = @import("catfn.zig");
 const ranges = @import("ranges.zig");
+const cc = @import("csvchunk.zig");
+const ndc = @import("ndjsonchunk.zig");
+const s2w9 = @import("s2w9_test.zig");
+const render = @import("render.zig");
 const Frame = fm.Frame;
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
@@ -105,10 +109,7 @@ fn all(f: Frame) !void {
     return kept(f);
 }
 
-test "W11B sweep: verbs.zig" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+fn sweepVerbsZig(a: std.mem.Allocator) !void {
     const f = try fixture(a);
     try kept(f);
     const r = try side(a);
@@ -181,10 +182,7 @@ fn series(f: Frame, name: []const u8) df.Series {
     return f.series(name).?;
 }
 
-test "W11B sweep: structure.zig" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+fn sweepStructureZig(a: std.mem.Allocator) !void {
     const f = try fixture(a);
     const r = try side(a);
 
@@ -277,10 +275,7 @@ fn timeFrame(a: std.mem.Allocator) !Frame {
     return b.toOwned();
 }
 
-test "W11B sweep: reshape.zig" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+fn sweepReshapeZig(a: std.mem.Allocator) !void {
     const f = try fixture(a);
     const r = try side(a);
     const tf = try timeFrame(a);
@@ -428,10 +423,7 @@ fn lowerName(_: void, a: std.mem.Allocator, n: []const u8) error{OutOfMemory}![]
     return std.fmt.allocPrint(a, "{s}_x", .{n});
 }
 
-test "W11B sweep: nestverbs.zig" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+fn sweepNestverbsZig(a: std.mem.Allocator) !void {
     const doc =
         \\[{"id":1,"xs":[3,1,2],"ys":[1.5,2.5,3.5],"p":{"a":1,"b":"x"}},
         \\ {"id":2,"xs":[],"ys":[],"p":null},
@@ -479,10 +471,7 @@ test "W11B sweep: nestverbs.zig" {
     try has(bad, "xs", .uint8);
 }
 
-test "W11B sweep: frameops.zig" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+fn sweepFrameopsZig(a: std.mem.Allocator) !void {
     const f = try fixture(a);
     const num = try numericOnly(a, f);
     const tf = try timeFrame(a);
@@ -564,10 +553,7 @@ test "W11B sweep: frameops.zig" {
     }
 }
 
-test "W11B sweep: colfn, callback, names, catfn, ranges" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+fn sweepColfnCallbackNamesCatfnRanges(a: std.mem.Allocator) !void {
     const f = try fixture(a);
     const num = try numericOnly(a, f);
 
@@ -652,4 +638,247 @@ test "W11B sweep: colfn, callback, names, catfn, ranges" {
 fn rowFirstU8(_: void, _: std.mem.Allocator, r: callback.Row) error{}!Value {
     const v = r.at(4);
     return if (v == .null) .null else v;
+}
+
+test "W11B io: chunk readers accept the widths like readCsv and readNdjson" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const types_csv = [_]df.TypeOverride{ .{ .name = "a", .type = .int8 }, .{ .name = "b", .type = .uint64 }, .{ .name = "c", .type = .float32 }, .{ .name = "d", .type = .uint16 } };
+    const doc = "a,b,c,d\n-128,18446744073709551615,0.1,\n127,9223372036854775808,1e39,65535\n5,0,,7\n";
+    // Whole read: the types, the arrays, the cells.
+    const whole = try df.readCsv(a, doc, .{ .types = &types_csv });
+    try testing.expect(fm.widthsConform(whole));
+    try has(whole, "a", .int8);
+    try has(whole, "d", .uint16);
+    // The chunks, put end to end, are the whole read; every chunk holds its widths.
+    for ([_]usize{ 0, 1, 3 }) |step| {
+        var slow: s2w9.Slow = undefined;
+        slow.init(doc, step);
+        var rd = try cc.CsvChunkReader.init(a, &slow.interface, .{ .types = &types_csv }, .{});
+        defer rd.deinit();
+        var row: usize = 0;
+        while (try rd.next(a, 2)) |ch| {
+            try testing.expect(fm.widthsConform(ch));
+            try has(ch, "b", .uint64);
+            for (0..ch.len) |ri| {
+                for (0..4) |ci| {
+                    const x = whole.columnAt(ci).get(row);
+                    const y = ch.columnAt(ci).get(ri);
+                    try testing.expectEqual(std.meta.activeTag(x), std.meta.activeTag(y));
+                    if (x == .float) try testing.expect(x.float == y.float) else if (x == .uint) try testing.expectEqual(x.uint, y.uint) else if (x == .int) try testing.expectEqual(x.int, y.int);
+                }
+                row += 1;
+            }
+        }
+        try testing.expectEqual(whole.len, row);
+    }
+    // Out of range is `error.BadValue`, as in `readCsv`; a Float32 beyond its range is infinity.
+    const bad = "a,b,c,d\n128,1,1,1\n";
+    try testing.expectError(error.BadValue, df.readCsv(a, bad, .{ .types = &types_csv }));
+    var slow: s2w9.Slow = undefined;
+    slow.init(bad, 0);
+    var rd = try cc.CsvChunkReader.init(a, &slow.interface, .{ .types = &types_csv }, .{});
+    defer rd.deinit();
+    try testing.expectError(error.BadValue, rd.next(a, 4));
+    try testing.expect(std.math.isInf(whole.cell(1, "c").?.float));
+    // `ignore_errors` nulls the cell that does not fit the width, as it does for an Int64.
+    slow.init(bad, 0);
+    var rd2 = try cc.CsvChunkReader.init(a, &slow.interface, .{ .types = &types_csv, .null_values = &.{"NA"} }, .{ .ignore_errors = true });
+    defer rd2.deinit();
+    const ig = (try rd2.next(a, 4)).?;
+    try testing.expect(ig.cell(0, "a").? == .null);
+    try has(ig, "a", .int8);
+
+    // NDJSON
+    const json_types = [_]df.TypeOverride{ .{ .name = "a", .type = .int16 }, .{ .name = "b", .type = .uint64 }, .{ .name = "c", .type = .float32 } };
+    const nd = "{\"a\":-32768,\"b\":18446744073709551615,\"c\":0.1}\n{\"a\":null,\"b\":1,\"c\":null}\n{\"a\":7,\"b\":9223372036854775808,\"c\":2.5}\n";
+    slow.init(nd, 2);
+    var jr = ndc.NdjsonChunkReader.init(testing.allocator, &slow.interface, .{ .types = &json_types });
+    defer jr.deinit();
+    var seen: usize = 0;
+    while (try jr.next(a, 2)) |ch| {
+        try testing.expect(fm.widthsConform(ch));
+        try has(ch, "a", .int16);
+        try has(ch, "c", .float32);
+        seen += ch.len;
+    }
+    try testing.expectEqual(@as(usize, 3), seen);
+    slow.init("{\"a\":40000,\"b\":1,\"c\":1}\n", 0);
+    var jr2 = ndc.NdjsonChunkReader.init(testing.allocator, &slow.interface, .{ .types = &json_types });
+    defer jr2.deinit();
+    try testing.expectError(error.BadValue, jr2.next(a, 2));
+}
+
+test "W11B io: render, glimpse, info and the JSON schema name the widths" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try df.select(a, try fixture(a), &.{ "i8", "u64", "f32", "i64" });
+    // The dtype row: polars' short names for the widths, the tag for Int64.
+    const t = try df.format(a, f, .{ .show_dtypes = true });
+    for ([_][]const u8{ "i8", "u64", "f32" }) |name| try testing.expect(std.mem.find(u8, t, name) != null);
+    try testing.expect(std.mem.find(u8, t, "9223372036854775813") != null); // UInt64 above 2^63 whole
+    try testing.expect(std.mem.find(u8, t, "inf") != null); // a Float32 infinity
+    // Float32 cells in the shortest f32 text, not the widened double's.
+    try testing.expect(std.mem.find(u8, t, "0.1") != null);
+    try testing.expect(std.mem.find(u8, t, "0.10000000149011612") == null);
+    const md = try df.toMarkdown(a, f, .{});
+    try testing.expect(std.mem.find(u8, md, "0.1") != null);
+    const html = try df.toHtml(a, f, .{});
+    try testing.expect(std.mem.find(u8, html, "18446744073709551615") != null);
+    const g = try df.glimpse(a, f, .{});
+    try testing.expect(std.mem.find(u8, g, "<i8>") != null and std.mem.find(u8, g, "<u64>") != null and std.mem.find(u8, g, "<f32>") != null);
+    // JSON Table Schema: an integer width is `integer`, Float32 `number`; reading it back
+    // gives Int64 and Float64 (the schema has no width).
+    var out: std.Io.Writer.Allocating = .init(a);
+    try df.writeJson(&out.writer, try df.select(a, f, &.{ "i8", "u64", "f32" }), .table);
+    try testing.expect(std.mem.find(u8, out.written(), "\"type\":\"integer\"") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "\"type\":\"number\"") != null);
+    const back = try df.readJson(a, out.written(), .{ .orient = .table });
+    try has(back, "i8", .int);
+    try has(back, "f32", .float);
+    _ = render;
+}
+
+fn sweepIoAndKeyHelpers(a: std.mem.Allocator) !void {
+    const f = try fixture(a);
+    const num = try numericOnly(a, f);
+    // `map` appends a float column; the width columns it passes on are untouched.
+    try kept(try df.map(a, num, .{ .out = "m", .lhs = .{ .col = "i8" }, .op = .add, .rhs = .{ .col = "u16" } }));
+    // The row order `sort` gives and the same through `sortedRows`, a width key included.
+    const order = try verbs.sortedRows(a, f, &.{7}, &.{.asc}, .auto);
+    try testing.expectEqual(@as(usize, rows), order.len);
+    const jc = try verbs.joinChecked(a, f, try side(a), .{ .on = "k", .how = .left });
+    try has(jc, "r_f32", .float32);
+    const fac = try verbs.factorKeys(a, f, &.{ 7, 8 });
+    try testing.expectEqual(@as(usize, rows), fac.ids.len);
+    // Every writer takes every width; the CSV round trip with the types given is exact.
+    var csv: std.Io.Writer.Allocating = .init(a);
+    try df.writeCsv(a, &csv.writer, f, .{});
+    const ts = try a.alloc(df.TypeOverride, f.columns.len);
+    for (ts, f.columns) |*t, c| t.* = .{ .name = c.name, .type = c.type };
+    const back = try df.readCsv(a, csv.written(), .{ .types = ts });
+    try kept(back);
+    try testing.expect(df.equals(f, back));
+    var reader: std.Io.Reader = .fixed(csv.written());
+    const via = try df.readCsvReader(a, &reader, .{ .types = ts });
+    try testing.expect(df.equals(f, via));
+    for ([_]df.JsonOrient{ .records, .columns, .split, .index, .values, .table }) |orient| {
+        var out: std.Io.Writer.Allocating = .init(a);
+        try df.writeJson(&out.writer, f, orient);
+        _ = try std.json.parseFromSliceLeaky(std.json.Value, a, out.written(), .{});
+    }
+    var nd: std.Io.Writer.Allocating = .init(a);
+    try df.writeNdjson(&nd.writer, f);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, nd.written(), "\n"), '\n');
+    while (lines.next()) |l| _ = try std.json.parseFromSliceLeaky(std.json.Value, a, l, .{});
+    _ = try df.format(a, f, .{ .show_dtypes = true });
+    _ = try df.toMarkdown(a, f, .{});
+    _ = try df.toHtml(a, f, .{});
+    _ = try df.glimpse(a, f, .{});
+    _ = try @import("csvio.zig").applyZones(a, f, &.{});
+}
+
+// ONE sweep: every public verb of part B (`verbs`, `structure`, `reshape`, `nestverbs`, `frameops`,
+// `colfn`, `callback`, `names`, `catfn`, `ranges`) on a frame that holds all eight width columns
+// beside an Int64, a text and a null-only column. Each keeps the types it passes on and every
+// width column its own array (`frame.widthsConform`). The results part A's files build (the
+// aggregates, `concat(.vertical)`/`.diagonal`, the arithmetic of a UInt64 column) are checked
+// after the merge: the places are marked in the functions.
+test "W11B sweep: every public verb of part B on a frame with all eight widths" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try sweepVerbsZig(a);
+    try sweepStructureZig(a);
+    try sweepReshapeZig(a);
+    try sweepNestverbsZig(a);
+    try sweepFrameopsZig(a);
+    try sweepColfnCallbackNamesCatfnRanges(a);
+    try sweepIoAndKeyHelpers(a);
+}
+
+test "W11B values: what the verbs do with a value the width does not hold" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try fixture(a);
+    // fillna with a value that is no Int8 leaves the cell null; one that is fills it.
+    const none = try df.fillna(a, f, .{ .subset = &.{"i8"}, .value = .{ .int = 1000 } });
+    try testing.expect(none.cell(3, "i8").? == .null);
+    try has(none, "i8", .int8);
+    const some = try df.fillna(a, f, .{ .subset = &.{"i8"}, .value = .{ .int = -7 } });
+    try testing.expectEqual(@as(i64, -7), some.cell(3, "i8").?.int);
+    // A full join that takes a right-only key from the right: Int8 against Int64 1000 widens
+    // the key column instead of nulling the key.
+    const lc = try a.dupe(Column, &.{ .{ .name = "k", .type = .int8 }, .{ .name = "v", .type = .int } });
+    var lb = try fm.FrameBuilder.init(a, lc, 2);
+    try lb.appendRow(&.{ .{ .int = 1 }, .{ .int = 10 } });
+    try lb.appendRow(&.{ .{ .int = 2 }, .{ .int = 20 } });
+    const rc = try a.dupe(Column, &.{ .{ .name = "k", .type = .int }, .{ .name = "w", .type = .int } });
+    var rb = try fm.FrameBuilder.init(a, rc, 2);
+    try rb.appendRow(&.{ .{ .int = 1000 }, .{ .int = 7 } });
+    try rb.appendRow(&.{ .{ .int = 2 }, .{ .int = 8 } });
+    const j = try df.join(a, try lb.toOwned(), try rb.toOwned(), .{ .on = "k", .how = .full, .coalesce_keys = true });
+    try has(j, "k", .int);
+    try testing.expectEqual(@as(i64, 1000), j.cell(2, "k").?.int);
+    // Without a right-only key the Int8 key stays Int8.
+    var rb2 = try fm.FrameBuilder.init(a, rc, 1);
+    try rb2.appendRow(&.{ .{ .int = 2 }, .{ .int = 8 } });
+    var lb2 = try fm.FrameBuilder.init(a, lc, 1);
+    try lb2.appendRow(&.{ .{ .int = 2 }, .{ .int = 20 } });
+    try has(try df.join(a, try lb2.toOwned(), try rb2.toOwned(), .{ .on = "k", .how = .full, .coalesce_keys = true }), "k", .int8);
+    // unpivot: melted columns of different numeric types meet in their supertype.
+    const m = try df.unpivot(a, f, .{ .id_cols = &.{"k"}, .value_cols = &.{ "i8", "u8" } });
+    try has(m, "value", .int16);
+    try testing.expectEqual(@as(i64, 255), m.cell(3, "value").?.int); // row 1, the u8 column
+    const m2 = try df.unpivot(a, f, .{ .id_cols = &.{"k"}, .value_cols = &.{ "i8", "i64" } });
+    try has(m2, "value", .int);
+    // A pivot of a width cell type keeps it, and its fill follows the type.
+    const pv = try df.pivot(a, f, .{ .row_key = "k", .col_key = "txt", .value_col = "i16", .agg = .first, .fill_value = 7 });
+    try testing.expect(fm.widthsConform(pv));
+}
+
+test "W11B values: sort and distinct order and group width keys by their exact value" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try fixture(a);
+    for (names[0..9], 0..) |n, ci| {
+        const asc = try df.sort(a, f, .{ .key = n });
+        const desc = try df.sort(a, f, .{ .key = n, .dir = .desc });
+        for (0..rows - 1) |i| {
+            try testing.expect(asc.columnAt(ci).get(i).order(asc.columnAt(ci).get(i + 1)) != .gt);
+            try testing.expect(desc.columnAt(ci).get(i).order(desc.columnAt(ci).get(i + 1)) != .lt);
+        }
+        // The null sorts first ascending (`.auto`), last descending.
+        try testing.expect(asc.columnAt(ci).get(0) == .null);
+        try testing.expect(desc.columnAt(ci).get(rows - 1) == .null);
+        // Rows 0 and 4 repeat: one fewer distinct value than rows, per column.
+        const d = try df.distinct(a, try df.select(a, f, &.{n}), .{ .keys = &.{} });
+        try testing.expect(d.len < rows);
+        try testing.expect(fm.widthsConform(d));
+    }
+    // The UInt64 key above 2^63 is its own group, apart from 2^63 itself and from any Int64.
+    const kc = try a.dupe(Column, &.{ .{ .name = "k", .type = .uint64 }, .{ .name = "v", .type = .int } });
+    var kb = try fm.FrameBuilder.init(a, kc, 5);
+    const two63: u64 = 1 << 63;
+    try kb.appendRow(&.{ .{ .uint = two63 }, .{ .int = 1 } });
+    try kb.appendRow(&.{ .{ .uint = two63 + 1 }, .{ .int = 2 } });
+    try kb.appendRow(&.{ .{ .uint = two63 }, .{ .int = 3 } });
+    try kb.appendRow(&.{ .{ .int = 5 }, .{ .int = 4 } });
+    try kb.appendRow(&.{ .{ .uint = std.math.maxInt(u64) }, .{ .int = 5 } });
+    const kf = try kb.toOwned();
+    const g = try df.aggregate(a, kf, .{ .group_by = &.{"k"}, .aggs = &.{.{ .src = "v", .out = "n", .func = .size }} });
+    try testing.expectEqual(@as(usize, 4), g.len);
+    try testing.expectEqual(@as(i64, 2), g.cell(0, "n").?.int);
+    try has(g, "k", .uint64);
+    // A float key of 2^63 equals the UInt64 2^63 in a join, and the key keeps the left type.
+    const fc = try a.dupe(Column, &.{ .{ .name = "k", .type = .float }, .{ .name = "w", .type = .int } });
+    var fb = try fm.FrameBuilder.init(a, fc, 1);
+    try fb.appendRow(&.{ .{ .float = 9223372036854775808.0 }, .{ .int = 9 } });
+    const j = try df.join(a, kf, try fb.toOwned(), .{ .on = "k", .how = .inner });
+    try testing.expectEqual(@as(usize, 2), j.len);
+    try has(j, "k", .uint64);
 }
