@@ -5,7 +5,7 @@ Unicode text algorithms on UTF-8 strings, Unicode 17.0.0: **full case mapping**
 İ → i̇, Final_Sigma), **normalization** (`normalize` NFC / NFD / NFKC / NFKD,
 `quickCheck`, `isNormalized`), **`unaccent`** (`"ŽLUŤOUČKÝ KŮŇ"` → `"ZLUTOUCKY KUN"`,
 `Łódź` → `Lodz`, `Straße` → `Strasse`) and the Python-`str` **classification**
-(`isAlpha`, `isDecimal`, `isDigit`, `isNumeric`, `isAlnum`, `isSpace`, `isUpper`,
+(`isAlpha`, `isAlphabetic` (the Alphabetic property), `isDecimal`, `isDigit`, `isNumeric`, `isAlnum`, `isSpace`, `isUpper`,
 `isLower`, `isTitle`, `isPrintable`, `isAscii`) with per-code-point properties
 (`generalCategory`, `combiningClass`, `toLowerCp` …).
 

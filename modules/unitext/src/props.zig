@@ -8,7 +8,7 @@
 //! is the Alphabetic property (broader: includes Nl and Other_Alphabetic) and
 //! `char::is_numeric` is Nd+Nl+No (narrower than Python's `isnumeric`, which
 //! includes the CJK ideograph numerals): the per-code-point functions here are
-//! Python's, not Rust's.
+//! Python's, not Rust's, except `isAlphabeticCp` (the Alphabetic property, Rust's and polars').
 
 const std = @import("std");
 const ucd = @import("ucd.zig");
@@ -35,6 +35,14 @@ pub fn isAlphaCp(cp: u21) bool {
         .Lu, .Ll, .Lt, .Lm, .Lo => true,
         else => false,
     };
+}
+
+/// The Alphabetic derived property (`DerivedCoreProperties.txt`: Lu, Ll, Lt, Lm, Lo, Nl and
+/// Other_Alphabetic, which includes many combining vowel signs of category Mc / Mn). This is
+/// Rust's `char::is_alphabetic` and polars' `cs.alpha()`; `isAlphaCp` is Python's narrower
+/// `str.isalpha` (letters only).
+pub fn isAlphabeticCp(cp: u21) bool {
+    return ucd.flags(cp) & ucd.f_alphabetic != 0;
 }
 
 /// Python `str.isdecimal`: Numeric_Type=Decimal (category Nd).
@@ -118,6 +126,12 @@ fn allOf(s: []const u8, opts: Options, comptime pred: fn (u21) bool) error{Inval
 /// Python `str.isalpha()`; false for the empty string.
 pub fn isAlpha(s: []const u8, opts: Options) error{InvalidUtf8}!bool {
     return allOf(s, opts, isAlphaCp);
+}
+
+/// Every code point has the Alphabetic property (`isAlphabeticCp`; Rust `str::chars().all(char::is_alphabetic)`);
+/// false for the empty string.
+pub fn isAlphabetic(s: []const u8, opts: Options) error{InvalidUtf8}!bool {
+    return allOf(s, opts, isAlphabeticCp);
 }
 
 /// Python `str.isdecimal()`; false for the empty string.

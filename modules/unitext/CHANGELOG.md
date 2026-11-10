@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-10** — **NEW:** `isAlphabeticCp` / `isAlphabetic`, the Alphabetic derived property (L + Nl + Other_Alphabetic: Rust `char::is_alphabetic`, polars `cs.alpha()`; combining vowel signs such as U+0903 count, U+00B2 and U+0301 do not), one more `gcflags` bit (+132 B of tables); checked for every code point against `DerivedCoreProperties.txt` (`src/testdata/alphabetic_ranges.txt`). **CHANGED:** `unaccent` with `expand_ligatures` (default) now expands the twelve Latin digraph letters U+01C4-01CC and U+01F1-01F3 to DZ/Dz/dz, LJ/Lj/lj, NJ/Nj/nj as ICU's Latin-ASCII does (they stayed as they were before).
 - **2026-11-09** — **FIXED:** `unaccent` folded the titlecase digraphs U+01C5 Dž, U+01C8 Lj, U+01CB Nj, U+01F2 Dz to one ASCII letter and dropped the second; they now stay as they are (the generator's name rule no longer matches a name containing a second `LETTER`; 238 letters). Independent review and no-panic sweep of the module found nothing else.
 - **2026-11-09** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog: the `Alphabetic` derived property (`isAlphabeticCp`), asked for by `dataframe`'s polars-style selectors.
 - **2026-11-09** — **NEW:** consumer example `example/main.zig` (CONVENTIONS 7.2: 70 `pub fn`): an accent- and case-insensitive search key, `upper` of `ß`, field validation, `lowerTo` into a fixed buffer, the ill-formed-UTF-8 policies; `zig build run-example-unitext`.

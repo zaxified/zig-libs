@@ -65,6 +65,7 @@ pub const f_cased: u16 = 1 << 7;
 pub const f_ignorable: u16 = 1 << 8;
 pub const f_space: u16 = 1 << 9;
 pub const num_shift = 10;
+pub const f_alphabetic: u16 = 1 << 12;
 
 /// The packed `gcflags` record of `cp`.
 pub inline fn flags(cp: u21) u16 {
@@ -75,9 +76,9 @@ pub inline fn category(cp: u21) GeneralCategory {
     return @fromBackingInt(@intCast(flags(cp) & 31));
 }
 
-/// Numeric_Type: 0 none, 1 Numeric, 2 Digit, 3 Decimal.
+/// Numeric_Type (bits 10-11 of the record; bit 12 is `f_alphabetic`): 0 none, 1 Numeric, 2 Digit, 3 Decimal.
 pub inline fn numericType(cp: u21) u2 {
-    return @intCast(flags(cp) >> num_shift);
+    return @intCast((flags(cp) >> num_shift) & 3);
 }
 
 /// The packed `norm` record of `cp`.

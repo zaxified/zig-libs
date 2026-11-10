@@ -218,11 +218,83 @@ test "classification matches the documented Python behaviour" {
 test "unaccent: titlecase digraphs keep both letters (UR-1)" {
     // Dž Lj Nj Dz (U+01C5 U+01C8 U+01CB U+01F2) are named "LATIN CAPITAL LETTER D WITH SMALL LETTER Z
     // WITH CARON" and have only a compatibility decomposition; the name rule used to fold them to
-    // their first letter (D L N D), silently dropping the second letter. They stay as they are,
-    // like their all-capital and all-small siblings.
-    const digraphs = "\u{1C5}\u{1C8}\u{1CB}\u{1F2}";
-    try expectUnaccent(digraphs, digraphs);
-    try expectUnaccent("\u{1C4}\u{1C6}\u{1C7}\u{1C9}", "\u{1C4}\u{1C6}\u{1C7}\u{1C9}");
+    // their first letter (D L N D), silently dropping the second letter. They keep both letters:
+    // since 2026-11-10 expanded to Dz Lj Nj Dz (they stayed untouched before; the next test).
+    try expectUnaccent("\u{1C5}\u{1C8}\u{1CB}\u{1F2}", "DzLjNjDz");
+}
+
+test "unaccent: the twelve Latin digraphs DZ LJ NJ expand like Latin-ASCII (UR-1 follow-up)" {
+    // U+01C4-01CC and U+01F1-01F3: capital, titlecase and small shape of each digraph, two ASCII
+    // letters in the same shape. (Before 2026-11-10 they stayed as they were; UR-1 left the
+    // expansion to the owner, who chose parity with Latin-ASCII.)
+    const cases = [_]struct { cp: u21, want: []const u8 }{
+        .{ .cp = 0x1C4, .want = "DZ" }, .{ .cp = 0x1C5, .want = "Dz" }, .{ .cp = 0x1C6, .want = "dz" },
+        .{ .cp = 0x1C7, .want = "LJ" }, .{ .cp = 0x1C8, .want = "Lj" }, .{ .cp = 0x1C9, .want = "lj" },
+        .{ .cp = 0x1CA, .want = "NJ" }, .{ .cp = 0x1CB, .want = "Nj" }, .{ .cp = 0x1CC, .want = "nj" },
+        .{ .cp = 0x1F1, .want = "DZ" }, .{ .cp = 0x1F2, .want = "Dz" }, .{ .cp = 0x1F3, .want = "dz" },
+    };
+    for (cases) |c| {
+        var b: [4]u8 = undefined;
+        const n = try std.unicode.utf8Encode(c.cp, &b);
+        try expectUnaccent(b[0..n], c.want);
+        // inside text, and with the option off the digraph stays
+        var buf: [16]u8 = undefined;
+        const in = try std.fmt.bufPrint(&buf, "a{s}b", .{b[0..n]});
+        const got = try ut.unaccent(a, in, .{ .expand_ligatures = false });
+        defer a.free(got);
+        try testing.expectEqualStrings(in, got);
+    }
+    try expectUnaccent("Ǆungla ǈubljana Ǌegoš", "DZungla Ljubljana NJegos");
+}
+
+test "isAlphabeticCp: the Alphabetic derived property (spot cases)" {
+    try testing.expect(ut.isAlphabeticCp(0x0903)); // DEVANAGARI SIGN VISARGA, Mc, Other_Alphabetic
+    try testing.expect(!ut.isAlphaCp(0x0903));
+    try testing.expect(ut.isAlphabeticCp(0x093E)); // vowel sign AA, Mc
+    try testing.expect(ut.isAlphabeticCp(0x0E34)); // THAI CHARACTER SARA I, Mn, Other_Alphabetic
+    try testing.expect(ut.isAlphabeticCp(0x2160) and ut.isAlphabeticCp(0x216B) and ut.isAlphabeticCp(0x2188)); // Nl: Roman numerals
+    try testing.expect(ut.isAlphabeticCp('a') and ut.isAlphabeticCp(0x4E00) and ut.isAlphabeticCp(0x01C5) and ut.isAlphabeticCp(0x02B0));
+    try testing.expect(!ut.isAlphabeticCp(0x00B2)); // SUPERSCRIPT TWO, No
+    try testing.expect(!ut.isAlphabeticCp(0x0301)); // COMBINING ACUTE, Mn without Other_Alphabetic
+    try testing.expect(!ut.isAlphabeticCp('1') and !ut.isAlphabeticCp(' ') and !ut.isAlphabeticCp(0x200B));
+    try testing.expect(!ut.isAlphabeticCp(0xD800) and !ut.isAlphabeticCp(0x110000) and !ut.isAlphabeticCp(0x1FFFFF));
+    try testing.expect(try ut.isAlphabetic("हिन्दी", .{}) == false); // virama U+094D is not Alphabetic
+    try testing.expect(try ut.isAlphabetic("किताब", .{}));
+    try testing.expect(!(try ut.isAlphabetic("", .{})));
+    try testing.expect(!(try ut.isAlphabetic("a1", .{})));
+}
+
+test "isAlphabeticCp: every code point against the ranges of DerivedCoreProperties.txt 17.0.0" {
+    // testdata/alphabetic_ranges.txt is written by tools/ucd_gen/gen.py straight from the UCD file,
+    // independently of the packed table the function reads.
+    const data = @embedFile("testdata/alphabetic_ranges.txt");
+    var expected = try a.alloc(bool, 0x110000);
+    defer a.free(expected);
+    @memset(expected, false);
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        var lo: u21 = undefined;
+        var hi: u21 = undefined;
+        if (std.mem.find(u8, line, "..")) |p| {
+            lo = try std.fmt.parseInt(u21, line[0..p], 16);
+            hi = try std.fmt.parseInt(u21, line[p + 2 ..], 16);
+        } else {
+            lo = try std.fmt.parseInt(u21, line, 16);
+            hi = lo;
+        }
+        var c: u32 = lo;
+        while (c <= hi) : (c += 1) {
+            expected[c] = true;
+            count += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 147_421), count); // the ranges of the 17.0.0 file, summed
+    var cp: u32 = 0;
+    while (cp < 0x110000) : (cp += 1) {
+        try testing.expectEqual(expected[cp], ut.isAlphabeticCp(@intCast(cp)));
+    }
 }
 
 test "sweep: every per-code-point function is total on hostile u21 values (US-0)" {
@@ -232,6 +304,7 @@ test "sweep: every per-code-point function is total on hostile u21 values (US-0)
         _ = ut.generalCategory(cp);
         _ = ut.combiningClass(cp);
         _ = ut.isAlphaCp(cp);
+        _ = ut.isAlphabeticCp(cp);
         _ = ut.isDecimalCp(cp);
         _ = ut.isDigitCp(cp);
         _ = ut.isNumericCp(cp);

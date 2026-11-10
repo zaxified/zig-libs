@@ -8,7 +8,8 @@
 //!   * letters with no decomposition named "LATIN SMALL|CAPITAL LETTER X WITH ..." (X one
 //!     letter): ł -> l, ø -> o, đ -> d, ħ -> h, ŧ -> t, ɓ -> b, ..., and DOTLESS I/J, ETH;
 //!   * (`expand_ligatures`, default on) the ligatures and double letters that stand for
-//!     several letters: æ -> ae, œ -> oe, ĳ -> ij, ß -> ss, þ -> th, ﬀ ﬁ ﬂ ﬃ ﬄ ﬅ ﬆ.
+//!     several letters: æ -> ae, œ -> oe, ĳ -> ij, ß -> ss, þ -> th, ﬀ ﬁ ﬂ ﬃ ﬄ ﬅ ﬆ, and the
+//!     digraph letters Ǆ ǅ ǆ -> DZ Dz dz, Ǉ ǈ ǉ -> LJ Lj lj, Ǌ ǋ ǌ -> NJ Nj nj, Ǳ ǲ ǳ -> DZ Dz dz.
 //!
 //! This is what PostgreSQL's `unaccent` and ICU's "Latin-ASCII" give for Latin text
 //! and what Python's `unidecode` gives for the covered letters; scikit-learn's

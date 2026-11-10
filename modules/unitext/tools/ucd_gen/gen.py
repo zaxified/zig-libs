@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Generate `src/tables.zig` (the Unicode Character Database tables `unitext`
 reads) and `src/testdata/normalization_test.txt` (a frozen copy of
-NormalizationTest.txt) from UCD files.
+NormalizationTest.txt) and `src/testdata/alphabetic_ranges.txt` (the Alphabetic
+ranges of DerivedCoreProperties.txt) from UCD files.
 
     tools/ucd_gen/fetch.sh 17.0.0                 # the files below into tools/ucd_gen/data/17.0.0/ (gitignored)
     python3 -I tools/ucd_gen/gen.py --ucd tools/ucd_gen/data/17.0.0 -out src
@@ -18,8 +19,8 @@ derived `unaccent` table and this code are ours.
 What is derived here and how (the module's SPEC.md says the same):
 
   * General_Category, Bidi_Class (only WS/B/S matter: `isSpace`), the
-    Uppercase / Lowercase / Cased / Case_Ignorable properties and
-    Numeric_Type -> one 16-bit record per code point (`gcflags`).
+    Uppercase / Lowercase / Cased / Case_Ignorable / Alphabetic properties and
+    Numeric_Type -> one 16-bit record per code point (`gcflags`; bit 12 is the Alphabetic derived property).
   * Canonical_Combining_Class, NFC_QC / NFKC_QC (Yes, Maybe, No), NFD_QC,
     NFKD_QC -> one 16-bit record per code point (`norm`).
   * Full recursive canonical and compatibility decompositions (Hangul
@@ -33,7 +34,7 @@ What is derived here and how (the module's SPEC.md says the same):
     SpecialCasing entry is kept only if it differs from the simple mapping).
   * `unaccent_*`: letters without any decomposition whose name is
     "LATIN (SMALL|CAPITAL) LETTER <X> WITH ..." (X one letter A-Z), plus a
-    short named list (see NAMED_LETTERS / NAMED_EXPANSIONS below).
+    short named list (see NAMED_LETTERS / NAMED_EXPANSIONS / NAMED_DIGRAPHS below).
 """
 
 import os
@@ -49,6 +50,7 @@ GC_INDEX = {g: i for i, g in enumerate(GCS)}
 # gcflags layout (u16): bits 0-4 general category, then flags.
 F_UPPER, F_LOWER, F_CASED, F_IGNORABLE, F_SPACE = 1 << 5, 1 << 6, 1 << 7, 1 << 8, 1 << 9
 NUM_SHIFT = 10  # bits 10-11: 0 none, 1 Numeric, 2 Digit, 3 Decimal
+F_ALPHABETIC = 1 << 12  # the Alphabetic derived property (DerivedCoreProperties.txt)
 
 # norm layout (u16): bits 0-7 ccc; 8-9 NFC_QC; 10-11 NFKC_QC (0 Yes, 1 Maybe, 2 No); 12 NFD_QC=No; 13 NFKD_QC=No.
 
@@ -66,6 +68,23 @@ NAMED_LETTERS = {
 NAMED_EXPANSIONS = {
     "AE": "ae", "OE": "oe", "IJ": "ij", "SHARP S": "ss", "THORN": "th",
     "FF": "ff", "FI": "fi", "FL": "fl", "FFI": "ffi", "FFL": "ffl", "ST": "st", "LONG S T": "st",
+}
+# The Latin digraph letters DZ, LJ, NJ in their three case shapes (U+01C4-01CC, U+01F1-01F3),
+# expanded like ICU's Latin-ASCII. Matched against the UCD name exactly (they have only a
+# compatibility decomposition; the "X WITH ..." letter rule must not see the titlecase ones).
+NAMED_DIGRAPHS = {
+    "LATIN CAPITAL LETTER DZ WITH CARON": "DZ",
+    "LATIN CAPITAL LETTER D WITH SMALL LETTER Z WITH CARON": "Dz",
+    "LATIN SMALL LETTER DZ WITH CARON": "dz",
+    "LATIN CAPITAL LETTER LJ": "LJ",
+    "LATIN CAPITAL LETTER L WITH SMALL LETTER J": "Lj",
+    "LATIN SMALL LETTER LJ": "lj",
+    "LATIN CAPITAL LETTER NJ": "NJ",
+    "LATIN CAPITAL LETTER N WITH SMALL LETTER J": "Nj",
+    "LATIN SMALL LETTER NJ": "nj",
+    "LATIN CAPITAL LETTER DZ": "DZ",
+    "LATIN CAPITAL LETTER D WITH SMALL LETTER Z": "Dz",
+    "LATIN SMALL LETTER DZ": "dz",
 }
 
 
@@ -147,7 +166,7 @@ class Ucd:
     def load_props(self):
         core = prop_ranges(os.path.join(self.dir, "DerivedCoreProperties.txt"))
         self.cp_props = {}
-        for p in ("Uppercase", "Lowercase", "Cased", "Case_Ignorable"):
+        for p in ("Uppercase", "Lowercase", "Cased", "Case_Ignorable", "Alphabetic"):
             s = set()
             for lo, hi, _ in core[p]:
                 s.update(range(lo, hi + 1))
@@ -307,12 +326,14 @@ def build(u):
             v |= F_CASED
         if c in sets["Case_Ignorable"]:
             v |= F_IGNORABLE
+        if c in sets["Alphabetic"]:
+            v |= F_ALPHABETIC
         g = GCS[u.gc[c]]
         if g == "Zs" or u.bidi[c] in ("WS", "B", "S"):
             v |= F_SPACE
         v |= u.numtype.get(c, 0) << NUM_SHIFT
         gcf[c] = v
-    out.append(emit_table("gcflags", gcf, "u16", str, "General_Category (bits 0-4), flags and Numeric_Type per code point."))
+    out.append(emit_table("gcflags", gcf, "u16", str, "General_Category (bits 0-4), flags (bit 12: Alphabetic) and Numeric_Type per code point."))
 
     # norm
     nrm = [0] * n
@@ -428,6 +449,10 @@ def build(u):
         if m and m.group(2) in NAMED_EXPANSIONS and not has_canon:
             s = NAMED_EXPANSIONS[m.group(2)]
             lig.append((c, s.upper() if m.group(1) == "CAPITAL" else s))
+            continue
+        if nm in NAMED_DIGRAPHS and not has_canon:
+            lig.append((c, NAMED_DIGRAPHS[nm]))
+    assert sum(1 for c in u.name if u.name[c] in NAMED_DIGRAPHS) == len(NAMED_DIGRAPHS), "a digraph name is missing from the UCD"
     out.append("/// Letters with no decomposition that `unaccent` folds to one ASCII letter, `{ cp, ascii }`, sorted by cp.\n")
     out.append("pub const UnaccentLetter = struct { cp: u32, ascii: u8 };\n")
     out.append("pub const unaccent_letters = [_]UnaccentLetter{\n" + "".join(f"    .{{ .cp = 0x{c:X}, .ascii = '{a}' }},\n" for c, a in letters) + "};\n")
@@ -480,6 +505,18 @@ def norm_test(u):
     return head + "\n".join(lines) + "\n"
 
 
+def alphabetic_test(u):
+    """Frozen Alphabetic ranges from DerivedCoreProperties.txt (an independent check of the packed flag)."""
+    lines = []
+    for lo, hi, _ in sorted(prop_ranges(os.path.join(u.dir, "DerivedCoreProperties.txt"))["Alphabetic"]):
+        lines.append(f"{lo:X}" if lo == hi else f"{lo:X}..{hi:X}")
+    head = (
+        f"# unitext: the Alphabetic ranges of DerivedCoreProperties.txt of Unicode {u.version} (Unicode License v3; see ../../NOTICE).\n"
+        "# Comments and the property name removed by tools/ucd_gen/gen.py; one `lo` or `lo..hi` per line, hex.\n"
+    )
+    return head + "\n".join(lines) + "\n"
+
+
 def main():
     args = sys.argv[1:]
     opts = {}
@@ -492,7 +529,8 @@ def main():
     u = Ucd(ucd)
     body, _, _ = build(u)
     tables = zig_fmt(header(u) + body)
-    files = {"tables.zig": tables, os.path.join("testdata", "normalization_test.txt"): norm_test(u)}
+    files = {"tables.zig": tables, os.path.join("testdata", "normalization_test.txt"): norm_test(u),
+             os.path.join("testdata", "alphabetic_ranges.txt"): alphabetic_test(u)}
     if "-out" in opts:
         for f, t in files.items():
             path = os.path.join(opts["-out"], f)
