@@ -427,6 +427,41 @@ matters"; each was asked of the engines first (`tools/oracle2i.py`, 231 cases, r
   before W10; review W10R-3). `add_business_days` on a zoned column was not asked of the engines and is
   not built (it still works on the instant as before).
 
+**Wave W11 (dataframe S2, 2026-11-10): real dtype widths.** The owner chose real width types over names checked as
+ranges (2026-11-10): `ColumnType` `int8`, `int16`, `int32`, `uint8`, `uint16`, `uint32`, `uint64`, `float32` beside
+`int` (Int64) and `float` (Float64), each with its own array. Engines asked first (`tools/oracle2j.py`, 6113 cases of
+polars 2.1 and pandas 3.1, replayed by `src/s2w11_oracle_test.zig` (cast, read, write), `src/s2w11a_oracle_test.zig`
+(arithmetic, literals, unary, aggregates, combining) and `src/s2w11b_oracle_test.zig` (keys, sort, unique, group by,
+type names); plain tests `src/s2w11_test.zig`, `src/s2w11a_test.zig`, `src/s2w11b_test.zig` (a sweep of every verb over
+a frame of all eight widths)). Design in one place: `src/dtype.zig` (predicates, ranges, `supertype`).
+- **Storage follows a declared width** (for `int`/`float` it still follows the cells): `frame.conform` gives a
+  width column its array, a cell the width does not hold becoming null; every builder, reader, `cast`, `mutate`
+  and verb result passes through it, and `frame.widthsConform` is checked on every verb result by the fuzz
+  harness. A width cell reads as `Value.int` / `Value.float` (exact); a UInt64 above `maxInt(i64)` as the new
+  `Value.uint`, which orders, compares, keys (one key with an equal float or decimal), sorts and joins by its
+  exact value.
+- **Types of results** follow polars: a binary arithmetic node is the supertype of its operands, computed from the
+  schema before any cell (`expr.numType`, at most 4096 nodes walked); an integer literal is weak (`i8 + 1` is Int8,
+  `i8 + 128` Int16); `/` per polars' table; `sum`/`cum_sum`/`prod` of Int8/Int16/UInt8/UInt16 are Int64, of
+  Int32/UInt32/UInt64/Float32/Int64 their own type; mean-like aggregates of a Float32 are Float32; `diff` of an
+  unsigned type the next wider signed one; concat, `if_else`, `coalesce` meet in the supertype. Unary minus of an
+  unsigned column is `error.BadExpr` (polars raises).
+- **`cast`** to a width checks the range (out of it: null, `error.CastFailed` with `.fail`); `CastSpec.on_error`
+  gains `.wrap` (polars `wrap_numerical`, numpy `astype`): an integer wraps, a float saturates, NaN is 0.
+- **I/O**: inference stays Int64/Float64 (both engines); `types` accepts the widths, a value out of range is
+  `error.BadValue` (polars' `read_csv`); a Float32 cell is written as its shortest f32 digits (`0.1`), a UInt64 as
+  its digits; type names in `info`/`show_dtypes` are polars' short ones (`i8` … `u64`, `f32`).
+- **Differences kept, each with its reason in the replay's `known` list:** an integer result outside its type is
+  **null** (both engines wrap; the module's Int64 rule before W11); Int64 or a narrower signed type with UInt64
+  meets in **Float64** (polars Int128, which this module does not have; pandas float64); NaN stays missing (a NaN
+  cast is null); `readJson` reads a typed cell as `readCsv` reads its text (polars' `read_json` casts leniently);
+  joins accept keys of any two numeric types by exact value (polars refuses Int64 with Float64), the key keeping the
+  left type and widening to the supertype when a right-only key does not fit it; `n_unique`/counts stay Int64 (polars
+  UInt32); Float32 aggregates add in f64 and round once (within one f32 ulp of polars); the bin verbs give Int64/Float64
+  interval ends. **Changed for Int64 with W11:** `aggregate` `sum`/`prod` of an Int64 column storing ints is Int64,
+  exact in an `i128`, null on overflow (it was Float64, so 2^53 + 1 was lost; the engines' answer).
+- Not part of W11: Int128, Binary, fixed-size Array and a time-of-day type.
+
 **Limits** (all `CsvReadOptions` fields, each with its own error; a hostile input is an error, never
 a panic or an unbounded allocation): `max_bytes` 256 MiB (`InputTooLarge`), `max_columns` 65536
 (`TooManyColumns`), `max_cell_bytes` 1 MiB (`CellTooLarge`), `max_record_bytes` 16 MiB
@@ -722,7 +757,7 @@ compositions of the verbs here (survey §6):
 accessor (row 98); `format`/`formatColumn` for text rendering (row 77).
 
 **D2, decided by the plan (§ Decided, 2026-11-05):** pandas and polars defaults (skip-NA, an
-int `sum` stays int; the oracle's `-big-agg-sum` and the six int-type entries then go);
+int `sum` stays int — done in W11, 2026-11-10: the oracle's `-big-agg-sum` and the six int-type entries went);
 `merge` `validate` and `indicator` (64); `corr` and `cov` on the table (41); a comptime
 callback verb for `map_elements`/`apply`/`rolling_map`/`map_groups` (21; done 2026-11-08, below); time zones through
 `tz` (71); list, struct and duration columns (56, 94, 100, 102); categorical columns (101);
