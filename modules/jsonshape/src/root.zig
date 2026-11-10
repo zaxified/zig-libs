@@ -1507,6 +1507,16 @@ fn jsonToValue(a: std.mem.Allocator, work: *Work, jv: std.json.Value, want: Colu
         .list, .@"struct" => unreachable, // refused by `shape` before any cell is read
         .int => .{ .int = jsonToInt(jv) orelse return .null },
         .float => .{ .float = jsonToFloat(jv) orelse return .null },
+        // dataframe's width types (W11): the integer (a UInt64 above maxInt(i64) arrives as a
+        // number string) or the float, then the width's range by `Value.cast` (out of it: null).
+        .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => blk: {
+            const v: Value = if (jsonToInt(jv)) |i| .{ .int = i } else switch (jv) {
+                .number_string => |s| if (std.fmt.parseInt(u64, s, 10)) |u| .{ .uint = u } else |_| break :blk .null,
+                else => break :blk .null,
+            };
+            break :blk v.cast(want) orelse .null;
+        },
+        .float32 => (Value{ .float = jsonToFloat(jv) orelse return .null }).cast(.float32) orelse .null,
         .bool => switch (jv) {
             .bool => |b| .{ .bool = b },
             else => .null,
@@ -2632,6 +2642,7 @@ test "shape: the cells `shape` gives, and its refusals" {
                     .text => |t| try std.testing.expectEqualStrings(t, g.text),
                     .float => |x| try std.testing.expectEqual(x, g.float),
                     .int => |x| try std.testing.expectEqual(x, g.int),
+                    .uint => |x| try std.testing.expectEqual(x, g.uint),
                     .bool => |x| try std.testing.expectEqual(x, g.bool),
                     .decimal => |x| try std.testing.expectEqual(x, g.decimal),
                     .null => {},

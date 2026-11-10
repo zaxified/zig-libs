@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-10** — **ADDED** (follows dataframe wave W11): a column declared with one of dataframe's width types (`int8` … `uint64`, `float32`) reads the JSON number into that width, range-checked by `Value.cast` (out of range: null, as for an Int64 that does not fit); a UInt64 above `maxInt(i64)` (a number string to `std.json`) is read exactly.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the depth check calls `jsontext.depthWithin` (same limit, same `error.DepthLimit`); `DuplicateKeys` is now an alias of `dataframe.JsonDuplicateKeys` (same two values); new dependency `jsontext`.
 - **2026-11-08** — BREAKING: `shape` returns a `dataframe.Frame` (it was a `dataset.Dataset`); the module now depends on `dataframe`, not `dataset` (step R of the dataframe split). `shapeFrame` is a deprecated alias of `shape` for one release. Cells are `dataframe.Value`s, text copied by the frame builder, so nothing borrows the JSON tree. ADDED: declared `.categorical` (read as text, stored encoded) and `.duration` (parsed as `.timestamp` is, ISO 8601 duration text or microseconds) columns; a declared `.list` or `.struct` column is the new `error.UnsupportedColumnType` of `shape`'s new error set `ShapeError = Error || error{UnsupportedColumnType}` (`Error` itself is unchanged; checked before any cell is read; SPEC Backlog). Every other refusal and limit is unchanged.
 

@@ -119,6 +119,7 @@ fn printFrame(out: *std.Io.Writer, f: df.Frame) !void {
             switch (f.columnAt(ci).get(ri)) {
                 .null => try out.writeAll("null"),
                 .int => |x| try out.print("{d}", .{x}),
+                .uint => |x| try out.print("{d}", .{x}),
                 .float => |x| try out.print("{d}", .{x}),
                 .text => |x| try out.writeAll(x),
                 .bool => |x| try out.writeAll(if (x) "true" else "false"),
