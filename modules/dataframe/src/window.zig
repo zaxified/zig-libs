@@ -1344,6 +1344,18 @@ fn computeOne(a: std.mem.Allocator, cells: []const Value, extra: Extra, op: Wind
     }
 }
 
+/// `op` over the cells of one partition as `window` runs it (a per-list evaluation in
+/// `Expr.element_op` uses it): the order-dependent operations only, not `transform`.
+pub fn cellVector(a: std.mem.Allocator, cells: []const Value, op: WindowOp, out: []Value) Error!void {
+    var int_col = true;
+    for (cells) |c| if (c != .int and !missing(c)) {
+        int_col = false;
+        break;
+    };
+    var work: usize = 0;
+    try computeOne(a, cells, .{}, op, int_col, &work, out);
+}
+
 /// The index `n` rows behind `i` (ahead for negative `n`), when in range.
 fn offset(i: usize, by: i64, n: usize) ?usize {
     const target = std.math.sub(i128, @intCast(i), by) catch return null;

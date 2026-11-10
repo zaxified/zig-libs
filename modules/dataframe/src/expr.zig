@@ -40,6 +40,8 @@ const sf = @import("strfn.zig");
 const bf = @import("binfn.zig");
 const nv = @import("nestverbs.zig");
 const catfn = @import("catfn.zig");
+const wn = @import("window.zig");
+const specs = @import("spec.zig");
 pub const ListOp = lf.ListOp;
 /// `Expr.bin` (polars `Expr.bin`): see `binfn`.
 pub const BinaryOp = bf.BinOp;
@@ -732,9 +734,11 @@ pub const Expr = union(enum) {
     list_sample: struct { x: *const Expr, n: ?usize = null, fraction: ?f64 = null, with_replacement: bool = false, shuffle: bool = false, seed: u64 = 0 },
     /// polars `list.eval(expr)`: `body` evaluated for every element of each list cell, with
     /// `.element` (polars `pl.element()`) standing for the element; the results are a list
-    /// of the same length. `body` is row-wise: polars' aggregating bodies (`pl.element().sum()`,
-    /// `.rank()`, `.cum_sum()`) are not here, but `list.agg` is this followed by a `list`
-    /// reduction (`.list = .{ .op = .sum, .x = list_eval }`). A cell that is not a list is null.
+    /// of the same length. `body` is row-wise except for `element_op`, which works on all the
+    /// elements of the one list being evaluated (polars' `pl.element().sum()`, `.rank()`,
+    /// `.cum_sum()`); a body made of aggregates alone (`element_op` aggregations, literals,
+    /// arithmetic of them) gives a list of ONE element, as polars. A cell that is not a list
+    /// is null.
     list_eval: struct { x: *const Expr, body: *const Expr },
     /// polars `list.filter(predicate)`: the elements for which `pred` (over `.element`) is
     /// true; false and null drop the element.
@@ -742,6 +746,15 @@ pub const Expr = union(enum) {
     /// polars `pl.element()`: the current element, only inside `list_eval` / `list_filter`
     /// (else `error.BadExpr`). Its schema is the list column's declared element, if any.
     element,
+    /// An aggregation or order-dependent operation over ALL the elements of the list being
+    /// evaluated, valid only inside `list_eval` / `list_filter` (else `error.BadExpr`), polars'
+    /// `pl.element().sum()`, `.rank()`, `.cum_sum()`, `.unique()` ...: `x` (row-wise over
+    /// `.element`) is evaluated for every element, then `op` runs over the results once per
+    /// list. An aggregation gives one value that every element sees (so `element - mean` works);
+    /// a vector operation gives one value per position. `unique` changes the length and so is
+    /// accepted only as the whole body of a `list_eval` (polars raises when it is mixed with
+    /// another length). See `ElemOp`.
+    element_op: struct { x: *const Expr, op: ElemOp },
     /// polars `struct.rename_fields`, `name.map_fields` / `prefix_fields` / `suffix_fields`
     /// and the field drop; see `listfn.StructOp`. Not a record: null.
     struct_op: struct { x: *const Expr, op: lf.StructOp },
@@ -869,6 +882,7 @@ const Inst = union(enum) {
     list_to_struct: []const []const u8,
     list_sample: *lf.Sampler,
     list_map: ListMap,
+    element_op: *ElemVec,
     struct_op: lf.StructOp,
     json_encode: ?Column,
     struct_fields: StructFields,
@@ -877,7 +891,74 @@ const Inst = union(enum) {
 };
 
 /// `list_eval` / `list_filter`: `body` over the elements, in a one-column scope `elem`.
-const ListMap = struct { body: Program, filter: bool, elem: Column };
+/// `vecs` are the `element_op` nodes of the body (reset for every list), `scalar` marks a
+/// body of aggregates alone (one result element), `root` the `element_op` that is the whole
+/// body when it changes the length.
+const ListMap = struct { body: Program, filter: bool, elem: Column, vecs: []const *ElemVec = &.{}, scalar: bool = false, root: ?*ElemVec = null };
+
+/// Kinds of cumulative operation of `ElemOp.cum`.
+pub const CumKind = enum { sum, prod, min, max, count };
+
+/// What `Expr.element_op` computes over the elements of one list, the argument's values in
+/// order. Missing elements (null, NaN for the numbers) are skipped by the aggregations;
+/// the numbers' `mean`, `std`, `var`, `median` and `quantile` are null for a list holding a
+/// NaN (as `list.mean`), `sum`, `min`, `max` follow `listfn.listCell`.
+pub const ElemOp = union(enum) {
+    // aggregations: one value per list
+    sum,
+    mean,
+    median,
+    min,
+    max,
+    /// The non-null elements (polars `count`).
+    count,
+    /// All the elements, null included (polars `len`).
+    len,
+    n_unique,
+    first,
+    last,
+    std: u32,
+    @"var": u32,
+    /// `q` in [0, 1] (else `error.BadExpr`); `interpolation` as the `quantile` aggregate (polars'
+    /// default is `nearest`, which here rounds an exact half to even, numpy's rule).
+    quantile: struct { q: f64, interpolation: specs.Interpolation = .linear },
+    arg_min,
+    arg_max,
+    // one value per element
+    /// 1-based, nulls stay null; `first` is polars' `ordinal`.
+    rank: struct { method: wn.RankMethod = .average, descending: bool = false },
+    /// `count` is polars' `cum_count`: the non-null elements so far, 1-based (a null
+    /// element repeats the total).
+    cum: struct { kind: CumKind, reverse: bool = false },
+    /// `x[i] - x[i - n]`, null where either is missing or off the end; negative `n` looks ahead.
+    diff: i64,
+    /// The values moved `n` places toward the end (negative: the start), null in the gap.
+    shift: i64,
+    reverse,
+    sort: struct { descending: bool = false, nulls_last: bool = false },
+    // changes the length: only as the whole body of `list_eval`
+    /// The distinct values in order of first appearance.
+    unique,
+
+    fn isAgg(op: ElemOp) bool {
+        return switch (op) {
+            .sum, .mean, .median, .min, .max, .count, .len, .n_unique, .first, .last, .std, .@"var", .quantile, .arg_min, .arg_max => true,
+            else => false,
+        };
+    }
+};
+
+/// One `element_op` of a compiled body: the argument's program, and the result for the list
+/// being evaluated (`start`/`n` locate it in the element storage), computed on first use.
+const ElemVec = struct {
+    arg: Program,
+    op: ElemOp,
+    start: usize = 0,
+    n: usize = 0,
+    done: bool = false,
+    one: Value = .null,
+    cells: []Value = &.{},
+};
 
 /// Where an output field of `struct_fields` comes from: field `pass` of the record, or the
 /// result of program `prog`.
@@ -921,6 +1002,13 @@ const Compiler = struct {
     cur: usize = 0,
     /// Inside `list_eval` / `list_filter`: `.element` is column 0 of `f`.
     element_scope: bool = false,
+    /// In an element scope: the `element_op` nodes compiled so far, the `.element` and
+    /// vector-valued nodes (a row-wise result) and the aggregations counted, and the
+    /// expression that is the whole body of a `list_eval` (where `unique` may stand).
+    vecs: std.ArrayList(*ElemVec) = .empty,
+    row_refs: usize = 0,
+    agg_refs: usize = 0,
+    body_root: ?*const Expr = null,
 
     fn push(c: *Compiler, inst: Inst, pops: usize) Error!void {
         if (c.code.items.len >= max_nodes) return error.ExprTooLarge;
@@ -1742,12 +1830,39 @@ const Compiler = struct {
                     else => {},
                 };
                 var sub: Compiler = .{ .a = c.a, .f = .{ .columns = cols, .data = data, .len = 0 }, .element_scope = true, .visits = c.visits };
+                if (e.* == .list_eval) sub.body_root = r.body;
                 try sub.go(r.body, depth + 1);
-                try c.push(.{ .list_map = .{ .body = .{ .code = sub.code.items, .stack = sub.max }, .filter = e.* == .list_filter, .elem = elem } }, 1);
+                const root: ?*ElemVec = if (r.body.* == .element_op and r.body.element_op.op == .unique) sub.vecs.items[sub.vecs.items.len - 1] else null;
+                try c.push(.{ .list_map = .{
+                    .body = .{ .code = sub.code.items, .stack = sub.max },
+                    .filter = e.* == .list_filter,
+                    .elem = elem,
+                    .vecs = sub.vecs.items,
+                    .scalar = e.* == .list_eval and sub.row_refs == 0 and sub.agg_refs > 0,
+                    .root = root,
+                } }, 1);
             },
             .element => {
                 if (!c.element_scope) return error.BadExpr;
+                c.row_refs += 1;
                 try c.push(.{ .col = 0 }, 0);
+            },
+            .element_op => |r| {
+                if (!c.element_scope) return error.BadExpr;
+                switch (r.op) {
+                    .quantile => |q| if (!(q.q >= 0 and q.q <= 1)) return error.BadExpr,
+                    .unique => if (c.body_root != e) return error.BadExpr,
+                    else => {},
+                }
+                var arg: Compiler = .{ .a = c.a, .f = c.f, .element_scope = true, .visits = c.visits };
+                try arg.go(r.x, depth + 1);
+                const v = try c.a.create(ElemVec);
+                v.* = .{ .arg = .{ .code = arg.code.items, .stack = arg.max }, .op = r.op };
+                // The argument's own `element_op` nodes are reset with this one.
+                for (arg.vecs.items) |nested| try c.vecs.append(c.a, nested);
+                try c.vecs.append(c.a, v);
+                if (r.op.isAgg()) c.agg_refs += 1 else c.row_refs += 1;
+                try c.push(.{ .element_op = v }, 0);
             },
             .json_encode => |r| {
                 try c.go(r.x, depth + 1);
@@ -2609,6 +2724,11 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
                 const v = stack[sp - 1];
                 stack[sp - 1] = if (v == .list) try listMap(a, m, v.list, one_a, one) else .null;
             },
+            .element_op => |v| {
+                try elemFill(v, last, one_a, f, one);
+                stack[sp] = if (v.op.isAgg()) v.one else if (ri >= v.start and ri - v.start < v.cells.len) v.cells[ri - v.start] else .null;
+                sp += 1;
+            },
             .cat_code => |ci| {
                 stack[sp] = switch (f.columnAt(ci)) {
                     .categorical => |cc| if (cc.codes.isValid(ri)) Value{ .int = cc.codes.values[ri] } else .null,
@@ -2650,6 +2770,22 @@ fn listMap(a: std.mem.Allocator, m: ListMap, l: ds.ListView, one_a: std.mem.Allo
     const data = [1]ColumnData{l.items.*};
     const scope: Frame = .{ .columns = &cols, .data = &data, .len = 0 };
     const stack = try ia.alloc(Value, m.body.stack);
+    for (m.vecs) |v| {
+        v.start = l.start;
+        v.n = n;
+        v.done = false;
+        v.one = .null;
+        v.cells = &.{};
+    }
+    if (m.root) |rv| {
+        try elemFill(rv, ia, one_a, scope, one);
+        return lf.makeList(a, rv.cells);
+    }
+    if (m.scalar and !m.filter) {
+        // A body of aggregates alone: one result, whatever the list's length (polars).
+        const r = try eval(ia, ia, one_a, m.body, scope, l.start, stack, one);
+        return lf.makeList(a, &.{r});
+    }
     const out = try a.alloc(Value, n);
     defer a.free(out);
     var k: usize = 0;
@@ -2666,6 +2802,118 @@ fn listMap(a: std.mem.Allocator, m: ListMap, l: ds.ListView, one_a: std.mem.Allo
         }
     }
     return lf.makeList(a, out[0..k]);
+}
+
+/// The result of an `element_op` for the list in hand: the argument over every element, then
+/// the operation once (a no-op after the first call for the list). `a` is the list's arena.
+fn elemFill(v: *ElemVec, a: std.mem.Allocator, one_a: std.mem.Allocator, f: Frame, one: *std.ArrayList(u8)) Error!void {
+    if (v.done) return;
+    const n = v.n;
+    const cells = try a.alloc(Value, n);
+    const stack = try a.alloc(Value, v.arg.stack);
+    for (cells, 0..) |*c, i| c.* = try eval(a, a, one_a, v.arg, f, v.start + i, stack, one);
+    v.done = true;
+    if (v.op.isAgg()) {
+        v.one = try elemAgg(a, v.op, cells);
+        return;
+    }
+    switch (v.op) {
+        .rank => |r| {
+            const out = try a.alloc(Value, n);
+            try winCells(a, cells, .{ .rank = .{ .method = r.method, .descending = r.descending } }, out);
+            v.cells = out;
+        },
+        .cum => |c| {
+            const out = try a.alloc(Value, n);
+            if (c.reverse) std.mem.reverse(Value, cells);
+            if (c.kind == .count) {
+                var seen: i64 = 0;
+                for (cells, out) |x, *o| {
+                    if (!keys.isMissing(x)) seen += 1;
+                    o.* = .{ .int = seen };
+                }
+            } else try winCells(a, cells, switch (c.kind) {
+                .sum => .cum_sum,
+                .prod => .cum_prod,
+                .min => .cum_min,
+                else => .cum_max,
+            }, out);
+            if (c.reverse) std.mem.reverse(Value, out);
+            v.cells = out;
+        },
+        .diff => |d| {
+            const out = try a.alloc(Value, n);
+            try winCells(a, cells, .{ .diff = d }, out);
+            v.cells = out;
+        },
+        .shift => |d| {
+            const out = try a.alloc(Value, n);
+            try winCells(a, cells, .{ .shift = .{ .n = d } }, out);
+            v.cells = out;
+        },
+        .reverse, .sort, .unique => {
+            const lop: lf.ListOp = switch (v.op) {
+                .reverse => .reverse,
+                .sort => |s| .{ .sort = .{ .descending = s.descending, .nulls_last = s.nulls_last } },
+                else => .unique,
+            };
+            const res = try lf.listCell(a, try lf.makeList(a, cells), lop);
+            const out = try a.alloc(Value, if (res == .list) res.list.len() else 0);
+            for (out, 0..) |*o, i| o.* = res.list.get(i);
+            v.cells = out;
+        },
+        else => unreachable, // `isAgg` took the rest
+    }
+}
+
+/// `op` of the window kernels over the cells of one list (the cells of one partition).
+fn winCells(a: std.mem.Allocator, cells: []const Value, op: wn.WindowOp, out: []Value) Error!void {
+    wn.cellVector(a, cells, op, out) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.TooLarge,
+    };
+}
+
+/// An aggregating `ElemOp` over the cells of one list, by `listfn`'s reductions where it has them.
+fn elemAgg(a: std.mem.Allocator, op: ElemOp, cells: []const Value) Error!Value {
+    switch (op) {
+        .count => {
+            var k: i64 = 0;
+            for (cells) |c| k += @intFromBool(!keys.isMissing(c));
+            return .{ .int = k };
+        },
+        .median, .quantile => {
+            const xs = try a.alloc(f64, cells.len);
+            var k: usize = 0;
+            for (cells) |c| {
+                if (keys.isMissing(c)) continue;
+                const x = (if (c == .bool) @as(?f64, if (c.bool) 1 else 0) else c.asFloat()) orelse return .null;
+                xs[k] = x;
+                k += 1;
+            }
+            return if (op == .median)
+                core.quantileInterp(xs[0..k], 0.5, .linear)
+            else
+                core.quantileInterp(xs[0..k], op.quantile.q, op.quantile.interpolation);
+        },
+        else => {},
+    }
+    const lop: lf.ListOp = switch (op) {
+        .sum => .sum,
+        .mean => .mean,
+        .min => .min,
+        .max => .max,
+        .len => .len,
+        .n_unique => .n_unique,
+        .first => .first,
+        .last => .last,
+        .std => |d| .{ .std = d },
+        .@"var" => |d| .{ .@"var" = d },
+        .arg_min => .arg_min,
+        .arg_max => .arg_max,
+        else => unreachable, // the prongs above and `isAgg`
+    };
+    return lf.listCell(a, try lf.makeList(a, cells), lop);
 }
 
 /// `struct_fields` for one record: the programs over the record's fields as columns (the
@@ -2886,6 +3134,7 @@ fn zoneOf(f: Frame, e: *const Expr) ?[]const u8 {
         .cast => |c| if (c.to == .timestamp) c.zone else null,
         .convert_time_zone => |r| r.zone,
         .replace_time_zone => |r| r.zone,
+        .element_op => |r| zoneOf(f, r.x),
         .offset_by => |r| zoneOf(f, r.x),
         .truncate => |r| zoneOf(f, r.x),
         .add_business_days => |r| zoneOf(f, r.x),

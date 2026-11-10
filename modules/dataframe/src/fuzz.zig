@@ -105,6 +105,20 @@ const Verb = enum {
     rolling_map,
     map_groups,
     filter_groups,
+    // ── W10 and the 2026-11-10 parity verbs ──
+    unstack,
+    wide_to_long,
+    bin_intervals,
+    bin_quantiles,
+    bin_ranks,
+    corr_with,
+    json_decode,
+    date_ranges,
+    datetime_ranges,
+    linear_spaces,
+    time_ranges,
+    arg_where,
+    to_latex,
 };
 const n_verbs = std.enums.values(Verb).len;
 var verb_ok: [n_verbs]u64 = @splat(0);
@@ -758,10 +772,21 @@ fn genExprRaw(src: anytype, a: Allocator, f: Frame, depth: usize) Allocator.Erro
             elem.* = .element;
             expr_emitted[@backingInt(std.meta.activeTag(elem.*))] += 1;
             const body = try a.create(df.Expr);
-            body.* = switch (below(src, 3)) {
+            body.* = switch (below(src, 5)) {
                 0 => .{ .unary = .{ .op = pickUnary(src), .x = elem } },
                 1 => .{ .binary = .{ .op = pickEnum(src, df.Binary), .l = elem, .r = try genExpr(src, a, f, depth + 1) } },
-                else => .{ .list = .{ .x = elem, .op = genListOp(src, a) } },
+                2 => .{ .list = .{ .x = elem, .op = genListOp(src, a) } },
+                // The list's own elements (polars `pl.element().sum()`, `.rank()`, ...), alone or
+                // combined row-wise with the element (`element - element.mean()`).
+                else => blk2: {
+                    const eo = try a.create(df.Expr);
+                    eo.* = .{ .element_op = .{ .x = elem, .op = genElemOp(src) } };
+                    expr_emitted[@backingInt(std.meta.activeTag(eo.*))] += 1;
+                    if (chance(src, 50)) break :blk2 eo.*;
+                    // An element_op of an element_op, or one mixed with the element.
+                    if (chance(src, 50)) break :blk2 .{ .element_op = .{ .x = eo, .op = genElemOp(src) } };
+                    break :blk2 .{ .binary = .{ .op = pickEnum(src, df.Binary), .l = elem, .r = eo } };
+                },
             };
             break :blk if (chance(src, 50)) .{ .list_eval = .{ .x = x, .body = body } } else .{ .list_filter = .{ .x = x, .pred = body } };
         },
@@ -1106,6 +1131,68 @@ fn genBinOp(src: anytype) df.BinaryOp {
         else => .{ .reinterpret = .{ .to = pickOf(src, df.ColumnType, &.{ .int, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float, .float32, .text }), .big_endian = chance(src, 50) } },
     };
 }
+
+fn genElemOp(src: anytype) df.ElemOp {
+    return switch (below(src, 20)) {
+        0 => .sum,
+        1 => .mean,
+        2 => .median,
+        3 => .min,
+        4 => .max,
+        5 => .count,
+        6 => .len,
+        7 => .n_unique,
+        8 => .first,
+        9 => .last,
+        10 => .{ .std = pickOf(src, u32, &.{ 0, 1, 2, std.math.maxInt(u32) }) },
+        11 => .{ .@"var" = pickOf(src, u32, &.{ 0, 1, 2, std.math.maxInt(u32) }) },
+        12 => .{ .quantile = .{ .q = pickOf(src, f64, &.{ 0, 0.3, 0.5, 1, -0.1, 1.5, std.math.nan(f64) }), .interpolation = pickEnum(src, df.Interpolation) } },
+        13 => if (chance(src, 50)) .arg_min else .arg_max,
+        14 => .{ .rank = .{ .method = pickEnum(src, df.RankMethod), .descending = chance(src, 50) } },
+        15 => .{ .cum = .{ .kind = pickEnum(src, df.CumKind), .reverse = chance(src, 50) } },
+        16 => if (chance(src, 50)) .{ .diff = pickOf(src, i64, &.{ 0, 1, -1, 2, 100, std.math.minInt(i64), std.math.maxInt(i64) }) } else .{ .shift = pickOf(src, i64, &.{ 0, 1, -1, 2, 100, std.math.minInt(i64), std.math.maxInt(i64) }) },
+        17 => if (chance(src, 50)) .reverse else .{ .sort = .{ .descending = chance(src, 50), .nulls_last = chance(src, 50) } },
+        else => .unique,
+    };
+}
+
+/// A column of the frame that the `bin_*` verbs take (int or float), mostly.
+fn pickNumCol(src: anytype, f: Frame) []const u8 {
+    if (chance(src, 90)) for (f.columns) |c| if (c.type == .int or c.type == .float) return c.name;
+    return pickCol(src, f);
+}
+
+/// A fraction list or a bin count for `binQuantiles` / `binRanks`.
+fn genFractions(src: anytype) df.BinFractions {
+    if (chance(src, 40)) return .{ .count = if (chance(src, 90)) range(src, usize, 1, 5) else pickOf(src, usize, &.{ 0, 1 << 40 }) };
+    if (chance(src, 85)) return .{ .at = pickOf(src, []const f64, &.{ &.{}, &.{0.5}, &.{ 0.25, 0.75 }, &.{ 0, 1 } }) };
+    return .{ .at = pickOf(src, []const f64, &.{ &.{ 0.75, 0.25 }, &.{ -0.1, 2 }, &.{std.math.nan(f64)} }) };
+}
+
+fn genDate(src: anytype) ?df.Date {
+    if (chance(src, 15)) return null;
+    return df.Date.fromOrdinal(pickOf(src, i64, &.{ 0, 1, 365, 19_000, 19_031, -1, 100_000, std.math.maxInt(i64) }));
+}
+
+fn genInstant(src: anytype) ?i64 {
+    if (chance(src, 15)) return null;
+    const day: i64 = 86_400_000_000;
+    return pickOf(src, i64, &.{ 0, day, 3 * day, 40 * day, -day, 1 << 50, std.math.minInt(i64), std.math.maxInt(i64) });
+}
+
+fn genCalendar(src: anytype) df.CalendarSpec {
+    return .{
+        .interval = pickOf(src, []const u8, &.{ "1d", "2d", "1h", "1mo", "1w", "0d", "", "-1d", "1x", "1us", "36h" }),
+        .closed = pickEnum(src, df.Closed),
+        .business = chance(src, 25),
+    };
+}
+
+const json_pool = [_][]const u8{
+    "1",         "-2.5",                        "true",              "null",        "\"x\"",             "[1,2,3]",   "[]",   "{}",
+    "{\"a\":1}", "{\"a\":1,\"b\":[true,null]}", "{\"a\":{\"b\":2}}", "[[1],[2,3]]", "{\"a\":1,\"a\":2}", "[1,\"x\"]", "",     "{",
+    "tru",       "[1,",                         "\"\\ud800\"",       "1e999",       "{\"a\":1}  ",       "nan",       "\xff", "0123",
+};
 
 fn genListOp(src: anytype, a: Allocator) df.ListOp {
     const idx = [_]i64{ 0, 1, -1, 2, -3, 100, std.math.minInt(i64), std.math.maxInt(i64) };
@@ -1590,6 +1677,214 @@ fn runVerb(src: anytype, a: Allocator, cur: Frame, v: Verb) !Frame {
         .filter_groups => blk: {
             var cb: Cb = .{ .seed = range(src, u64, 0, std.math.maxInt(u64)) };
             break :blk try settle(.filter_groups, df.filterGroups(a, f, .{ .by = try pickCols(src, a, f, 2) }, &cb, Cb.keep), {});
+        },
+        .unstack => blk: {
+            const spec: df.UnstackSpec = .{
+                .step = if (chance(src, 80)) range(src, usize, 1, f.len + 1) else pickOf(src, usize, &.{ 0, 1 << 40 }),
+                .how = pickEnum(src, df.UnstackHow),
+                .columns = try pickCols(src, a, f, 3),
+                .fill_value = genValue(src, a),
+            };
+            const got = df.unstack(a, f, spec);
+            // Vertical: `step` rows; horizontal: one row per block of `step` source rows.
+            if (got) |g| {
+                const blocks = if (spec.step == 0) 0 else (f.len - 1) / spec.step + 1;
+                const want = if (spec.how == .vertical) spec.step else blocks;
+                if (g.len != want) return failAt("unstack: row count", want, g.len);
+            } else |_| {}
+            break :blk try settle(.unstack, got, {});
+        },
+        .wide_to_long => blk: {
+            // The frame's columns renamed to `id`, `A1`, `B2`, `A3`, ... so the stubs match.
+            const cols = try a.alloc(Column, f.columns.len);
+            for (cols, f.columns, 0..) |*c, src_col, k| {
+                c.* = src_col;
+                c.name = if (k == 0) "id" else try std.fmt.allocPrint(a, "{c}{d}", .{ @as(u8, if (k % 2 == 1) 'A' else 'B'), k });
+            }
+            // `id` identifies the rows (row numbers), as `i` must.
+            const data = try a.dupe(ColumnData, f.data);
+            if (cols.len > 0) {
+                const ids = try a.alloc(i64, f.len);
+                for (ids, 0..) |*x, r| x.* = @intCast(r);
+                cols[0].type = .int;
+                cols[0].inner = &.{};
+                data[0] = .{ .int = .{ .values = ids } };
+            }
+            // The value columns of one type (stub columns of types with no supertype are refused), mostly.
+            if (cols.len > 2 and chance(src, 85)) for (2..cols.len) |k| {
+                const name = cols[k].name;
+                cols[k] = cols[1];
+                cols[k].name = name;
+                data[k] = data[1];
+            };
+            const wide: Frame = .{ .columns = cols, .data = data, .len = f.len };
+            // Mostly valid: a stub that matches, `id` as the identifier, a free name for `j`.
+            const spec: df.WideToLongSpec = .{
+                .stubnames = if (chance(src, 88)) pickOf(src, []const []const u8, &.{ &.{ "A", "B" }, &.{"A"}, &.{"B"} }) else pickOf(src, []const []const u8, &.{ &.{}, &.{ "A", "A" }, &.{"zz"} }),
+                .i = if (chance(src, 88)) &.{"id"} else pickOf(src, []const []const u8, &.{ &.{ "id", "A1" }, &.{}, &.{"nope"} }),
+                .j = if (chance(src, 88)) "t" else pickOf(src, []const u8, &.{ "id", "A1", "" }),
+                .sep = pickOf(src, []const u8, &.{ "", "", "_" }),
+                .suffix = if (chance(src, 88)) "\\d+" else pickOf(src, []const u8, &.{ "[0-9]", "(", "", ".*" }),
+            };
+            const w2l = df.wideToLong(a, wide, spec);
+            break :blk try settle(.wide_to_long, w2l, {});
+        },
+        .bin_intervals => blk: {
+            // Mostly valid: an orderable column, ascending breaks, no labels.
+            const pts = try a.alloc(Value, range(src, usize, 0, 3));
+            var at: i64 = genInt(src) >> 2;
+            for (pts) |*p| {
+                p.* = if (chance(src, 95)) Value{ .int = at } else genValue(src, a);
+                at +|= range(src, i64, 0, 40);
+            }
+            const spec: df.BinIntervalsSpec = .{
+                .col = pickNumCol(src, f),
+                .out = pickOf(src, []const u8, &.{ "b", "c0" }),
+                .breaks = if (chance(src, 75)) .{ .at = pts } else .{ .count = if (chance(src, 90)) range(src, usize, 1, 5) else 0 },
+                .labels = if (chance(src, 85)) &.{} else pickOf(src, []const []const u8, &.{ &.{ "x", "y" }, &.{ "x", "x" }, &.{ "a", "b", "c", "d" } }),
+                .include_intervals = chance(src, 30),
+                .right_closed = chance(src, 50),
+            };
+            const got = df.binIntervals(a, f, spec);
+            if (got) |g| {
+                if (g.len != f.len) return failAt("bin_intervals: row count", f.len, g.len);
+            } else |_| {}
+            break :blk try settle(.bin_intervals, got, {});
+        },
+        .bin_quantiles => blk: {
+            const spec: df.BinQuantilesSpec = .{
+                .col = pickNumCol(src, f),
+                .out = pickOf(src, []const u8, &.{ "b", "c0" }),
+                .quantiles = genFractions(src),
+                .labels = if (chance(src, 85)) &.{} else pickOf(src, []const []const u8, &.{ &.{ "x", "y" }, &.{ "a", "b", "c" } }),
+                .include_intervals = chance(src, 30),
+                .right_closed = chance(src, 50),
+            };
+            const got = df.binQuantiles(a, f, spec);
+            if (got) |g| {
+                if (g.len != f.len) return failAt("bin_quantiles: row count", f.len, g.len);
+            } else |_| {}
+            break :blk try settle(.bin_quantiles, got, {});
+        },
+        .bin_ranks => blk: {
+            const spec: df.BinRanksSpec = .{
+                .col = pickNumCol(src, f),
+                .out = pickOf(src, []const u8, &.{ "b", "c0" }),
+                .ranks = genFractions(src),
+                .labels = if (chance(src, 85)) &.{} else pickOf(src, []const []const u8, &.{ &.{ "x", "y" }, &.{ "a", "b", "c" } }),
+                .include_intervals = chance(src, 30),
+            };
+            const got = df.binRanks(a, f, spec);
+            if (got) |g| {
+                if (g.len != f.len) return failAt("bin_ranks: row count", f.len, g.len);
+            } else |_| {}
+            break :blk try settle(.bin_ranks, got, {});
+        },
+        .corr_with => blk: {
+            // Mostly the numeric columns of the frame against a shuffled copy of them (every pair
+            // has a namesake and a length); sometimes another frame (names, types, lengths may not fit).
+            var ncols: usize = 0;
+            for (f.columns) |c| ncols += @intFromBool(c.type == .int or c.type == .float);
+            const cols = try a.alloc(Column, ncols);
+            const data = try a.alloc(ColumnData, ncols);
+            var k: usize = 0;
+            for (f.columns, f.data) |c, d| if (c.type == .int or c.type == .float) {
+                cols[k] = c;
+                data[k] = d;
+                k += 1;
+            };
+            const left: Frame = .{ .columns = cols, .data = data, .len = f.len };
+            const idx = try a.alloc(i64, f.len);
+            for (idx, 0..) |*x, r| x.* = @intCast((r * 7 + 3) % @max(f.len, 1));
+            const right = if (ncols > 0 and chance(src, 88)) (df.take(a, left, idx) catch left) else try genFrame(src, a, below(src, 3), if (chance(src, 90)) f.len else genRows(src));
+            const spec: df.CorrWithSpec = .{ .method = pickEnum(src, df.CorrMethod), .drop = chance(src, 50) };
+            break :blk try settle(.corr_with, df.corrWith(a, if (ncols > 0) left else f, right, spec), {});
+        },
+        .json_decode => blk: {
+            // A text column of JSON snippets, valid, nested, truncated and not JSON at all.
+            const cells = try a.alloc(Value, genRows(src));
+            for (cells) |*c| c.* = if (chance(src, 10)) .null else .{ .text = pickOf(src, []const u8, &json_pool) };
+            const cols = try a.dupe(Column, &.{ .{ .name = "j", .type = .text }, .{ .name = "k", .type = .int } });
+            const ks = try a.alloc(Value, cells.len);
+            for (ks, 0..) |*k, i| k.* = .{ .int = @intCast(i) };
+            const data = try a.dupe(ColumnData, &.{ try df.columnFromCells(a, cells), try df.columnFromCells(a, ks) });
+            const jf: Frame = .{ .columns = cols, .data = data, .len = cells.len };
+            const spec: df.JsonDecodeSpec = .{
+                .column = pickOf(src, []const u8, &.{ "j", "j", "j", "k", "zz" }),
+                .out = pickOf(src, ?[]const u8, &.{ null, "d", "k" }),
+                .type = pickOf(src, ?ColumnType, &.{ null, null, .int, .text, .list, .@"struct" }),
+                .duplicate_keys = pickEnum(src, @FieldType(df.JsonDecodeSpec, "duplicate_keys")),
+            };
+            const got = df.jsonDecode(a, jf, spec);
+            if (got) |g| {
+                if (g.len != jf.len) return failAt("json_decode: row count", jf.len, g.len);
+            } else |_| {}
+            _ = try settle(.json_decode, got, {});
+            break :blk null;
+        },
+        .date_ranges => blk: {
+            const n_s = range(src, usize, 0, 3);
+            const n_e = pickOf(src, usize, &.{ 1, n_s, 2 });
+            const starts = try a.alloc(?df.Date, n_s);
+            for (starts) |*d| d.* = genDate(src);
+            const ends = try a.alloc(?df.Date, n_e);
+            for (ends) |*d| d.* = genDate(src);
+            const got = df.dateRanges(a, "r", starts, ends, genCalendar(src));
+            _ = try settle(.date_ranges, got, {});
+            break :blk null;
+        },
+        .datetime_ranges => blk: {
+            const starts = try a.alloc(?i64, range(src, usize, 0, 3));
+            for (starts) |*d| d.* = genInstant(src);
+            const ends = try a.alloc(?i64, pickOf(src, usize, &.{ 1, starts.len, 2 }));
+            for (ends) |*d| d.* = genInstant(src);
+            _ = try settle(.datetime_ranges, df.datetimeRanges(a, "r", starts, ends, genCalendar(src)), {});
+            break :blk null;
+        },
+        .linear_spaces => blk: {
+            const starts = try a.alloc(?f64, range(src, usize, 0, 3));
+            for (starts) |*d| d.* = if (chance(src, 15)) null else genFloat(src);
+            const ends = try a.alloc(?f64, pickOf(src, usize, &.{ 1, starts.len, 2 }));
+            for (ends) |*d| d.* = if (chance(src, 15)) null else genFloat(src);
+            const ns = try a.alloc(?usize, pickOf(src, usize, &.{ 1, starts.len, 2 }));
+            for (ns) |*d| d.* = if (chance(src, 15)) null else pickOf(src, usize, &.{ 0, 1, 2, 5, 1000, 1 << 40 });
+            _ = try settle(.linear_spaces, df.linearSpaces(a, "r", starts, ends, ns, pickEnum(src, df.Closed)), {});
+            break :blk null;
+        },
+        .time_ranges => blk: {
+            const times = [_]i64{ 0, 3_600_000_000, 43_200_000_000, 86_399_999_999, 86_400_000_000, -1 };
+            const starts = try a.alloc(?i64, range(src, usize, 0, 3));
+            for (starts) |*d| d.* = if (chance(src, 15)) null else pickOf(src, i64, &times);
+            const ends = try a.alloc(?i64, pickOf(src, usize, &.{ 1, starts.len, 2 }));
+            for (ends) |*d| d.* = if (chance(src, 15)) null else pickOf(src, i64, &times);
+            const interval = df.parseDuration(pickOf(src, []const u8, &.{ "1h", "30m", "1us", "0s", "1mo", "-1h", "2d", "" })) orelse df.Duration{ .months = 0, .us = 0 };
+            _ = try settle(.time_ranges, df.timeRanges(a, "r", starts, ends, interval, pickEnum(src, df.Closed)), {});
+            break :blk null;
+        },
+        .arg_where => blk: {
+            const e = try genExpr(src, a, f, 0);
+            const got = df.argWhere(a, f, e);
+            if (got) |idx| {
+                // Strictly increasing row numbers inside the frame.
+                for (idx, 0..) |r, k| if (r >= f.len or (k > 0 and idx[k - 1] >= r)) return failAt("arg_where: indices", r, f.len);
+            } else |_| {}
+            record(.arg_where, if (got) |_| true else |_| false);
+            break :blk null;
+        },
+        .to_latex => blk: {
+            const opts: df.LatexOptions = .{
+                .null_text = pickOf(src, []const u8, &.{ "NaN", "", "\\x", "\xff" }),
+                .escape = chance(src, 50),
+                .caption = pickOf(src, ?[]const u8, &.{ null, "c", "a_b%" }),
+                .label = pickOf(src, ?[]const u8, &.{ null, "l" }),
+                .header = chance(src, 70),
+            };
+            const got = df.toLatex(a, f, opts);
+            if (got) |text| {
+                if (!std.mem.startsWith(u8, text, "\\begin{")) return failAt("to_latex: starts with \\begin", text.len, 0);
+            } else |_| {}
+            record(.to_latex, if (got) |_| true else |_| false);
+            break :blk null;
         },
     };
     return next orelse cur;
@@ -2459,6 +2754,12 @@ test "fuzz harness: 300 seeds in every test run, and every verb gets called" {
     driver.resetReach();
     for (std.enums.values(Verb), 0..) |v, i| if (verb_ok[i] + verb_err[i] == 0) {
         std.debug.print("reach: verb {t} never called in 300 seeds\n", .{v});
+        return error.HarnessDoesNotReach;
+    };
+    // The W10 and parity verbs also have to answer, not only be refused (specs that are all
+    // invalid would test nothing past the argument checks).
+    for (std.enums.values(Verb), 0..) |v, i| if (@backingInt(v) >= @backingInt(Verb.unstack) and verb_ok[i] == 0) {
+        std.debug.print("reach: verb {t} never answered in 300 seeds (refused {d})\n", .{ v, verb_err[i] });
         return error.HarnessDoesNotReach;
     };
     // The width check ran on real results: a verb handed a frame with a width column and
