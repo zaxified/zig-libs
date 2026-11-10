@@ -30,6 +30,7 @@ const csvio = @import("csvio.zig");
 const d4b = @import("d4b_test.zig");
 const s2w9 = @import("s2w9_test.zig");
 const dtype = @import("dtype.zig");
+const vm = @import("value.zig");
 const fm = @import("frame.zig");
 const tkfuzz = @import("testkit").fuzz;
 const driver = tkfuzz.driver;
@@ -262,6 +263,22 @@ fn expectWidths(what: []const u8, f: Frame) !void {
     return error.WidthsDoNotConform;
 }
 
+/// Every `.time` column of `f` holds only a time of day (an int in `[0, us_per_day)`) or null:
+/// whatever a verb does with one, the cell never leaves the day.
+fn expectTimes(what: []const u8, f: Frame) !void {
+    for (f.columns, 0..) |c, ci| {
+        if (c.type != .time) continue;
+        const col = f.columnAt(ci);
+        for (0..f.len) |ri| {
+            const v = col.get(ri);
+            if (v == .null) continue;
+            if (v == .int and vm.isTimeOfDay(v.int)) continue;
+            std.debug.print("{s}: time column {d} row {d} holds {any}\n", .{ what, ci, ri, v });
+            return error.TimeOutOfDay;
+        }
+    }
+}
+
 /// The verbs whose result's widths the harness checks: every one (W11: a verb that passes a
 /// width column on keeps its array, one that computes a width result conforms it).
 fn widthChecked(v: Verb) bool {
@@ -354,9 +371,9 @@ fn genValue(src: anytype, a: Allocator) Value {
 
 /// `int8`..`float32` are the fixed-width numbers (wave W11): a column of one of them holds its
 /// own array (`frame.conform`), its cells drawn from the width's edges.
-const Kind = enum { int, float, bool, decimal, text, date, timestamp, boxed, nulls, list, record, int8, int16, int32, uint8, uint16, uint32, uint64, float32 };
+const Kind = enum { int, float, bool, decimal, text, date, timestamp, time, boxed, nulls, list, record, int8, int16, int32, uint8, uint16, uint32, uint64, float32 };
 
-const base_kinds = [_]Kind{ .int, .float, .bool, .decimal, .text, .date, .timestamp, .boxed, .nulls, .list, .record };
+const base_kinds = [_]Kind{ .int, .float, .bool, .decimal, .text, .date, .timestamp, .time, .boxed, .nulls, .list, .record };
 const width_kinds = [_]Kind{ .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 };
 
 /// One column in four or so is a width.
@@ -462,6 +479,7 @@ fn kindType(k: Kind, src: anytype) ColumnType {
         .text => .text,
         .date => .date,
         .timestamp => .timestamp,
+        .time => .time,
         .boxed => if (chance(src, 50)) .text else .float,
         .nulls => pickEnum(src, ColumnType),
         .list => .list,
@@ -479,6 +497,12 @@ fn genCell(src: anytype, a: Allocator, k: Kind) Value {
         .text => .{ .text = genText(src, a) },
         .date => .{ .text = pickOf(src, []const u8, &date_pool) },
         .timestamp => .{ .int = if (chance(src, 70)) range(src, i64, -2_000_000_000_000_000, 200_000_000_000_000_000) else genInt(src) },
+        // A time of day: the day's first and last microsecond, or anywhere in it.
+        .time => .{ .int = switch (below(src, 4)) {
+            0 => 0,
+            1 => 86_399_999_999,
+            else => range(src, i64, 0, 86_399_999_999),
+        } },
         .boxed => genValue(src, a),
         .nulls => .null,
         .list => genList(src, a, 0),
@@ -538,7 +562,8 @@ fn kindOfType(t: ColumnType) Kind {
         .decimal => .decimal,
         .text => .text,
         .date => .date,
-        .timestamp, .duration, .time => .timestamp,
+        .timestamp, .duration => .timestamp,
+        .time => .time,
         .categorical => .text,
         .list => .list,
         .@"struct" => .record,
@@ -636,7 +661,7 @@ fn genExprRaw(src: anytype, a: Allocator, f: Frame, depth: usize) Allocator.Erro
         15 => .{ .strip_chars = .{ .x = x, .chars = if (chance(src, 50)) null else pickOf(src, []const u8, &.{ "", "a ", "\xff" }), .side = pickEnum(src, df.StripSide) } },
         16 => .{ .to_integer = .{ .x = x, .base = pickOf(src, u8, &.{ 10, 2, 16, 36, 1, 0, 37, 255 }) } },
         17 => .{ .dt = .{ .x = x, .part = pickEnum(src, df.DtPart) } },
-        18 => .{ .strptime = .{ .x = x, .format = pickOf(src, []const u8, &.{ "%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d/%m/%y", "%", "%Q", "" }), .to = if (chance(src, 50)) .date else .timestamp } },
+        18 => .{ .strptime = .{ .x = x, .format = pickOf(src, []const u8, &.{ "%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d/%m/%y", "%", "%Q", "" }), .to = pickEnum(src, df.ParseTo) } },
         19 => .{ .strftime = .{ .x = x, .format = pickOf(src, []const u8, &.{ "%Y-%m-%d", "%H:%M:%S.%f", "%A %B", "%", "", "%H:%M %z %Z", "%:z" }) } },
         20 => .{ .offset_by = .{ .x = x, .by = pickOf(src, []const u8, &.{ "1d", "1mo2d", "-3h", "", "9999999999999d", "1x" }) } },
         21 => if (chance(src, 50))
@@ -1182,6 +1207,7 @@ fn settle(comptime v: Verb, typed: anytype, cells: anytype) !?Frame {
     if (typed) |f| {
         record(v, true);
         try expectWellFormed(@tagName(v), f);
+        if (!oom_mode) try expectTimes(@tagName(v), f);
         if (input_conforms and widthChecked(v)) {
             try expectWidths(@tagName(v), f);
             for (f.columns) |c| if (dtype.isWidth(c.type)) {

@@ -679,13 +679,14 @@ pub const DescribeSpec = struct {
 
 pub const DescribeError = Error || error{BadArgument};
 
-const DescribeKind = enum { numeric, temporal, duration, other };
+const DescribeKind = enum { numeric, temporal, duration, time, other };
 
 fn describeKind(t: ColumnType) DescribeKind {
     return switch (t) {
         .int, .float, .decimal, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => .numeric,
         .timestamp => .temporal,
         .duration => .duration,
+        .time => .time,
         else => .other,
     };
 }
@@ -897,7 +898,12 @@ fn describeNumberLike(a: std.mem.Allocator, col: ColumnData, rows: usize, kind: 
     const mk = struct {
         fn of(al: std.mem.Allocator, k: DescribeKind, x: f64) std.mem.Allocator.Error!Value {
             if (k == .numeric) return .{ .float = x };
-            const us = Value.floatToInt(i64, @round(x)) orelse return .null;
+            const us = Value.floatToInt(i64, if (k == .time) @trunc(x) else @round(x)) orelse return .null;
+            if (k == .time) {
+                // A time of day (the statistics are times; `std` has none).
+                var tb: [vm.max_time_len]u8 = undefined;
+                return if (vm.formatTimeOfDay(&tb, us)) |t| .{ .text = try al.dupe(u8, t) } else .null;
+            }
             if (k == .temporal) {
                 var buf: [vm.max_iso_timestamp_len]u8 = undefined;
                 return .{ .text = try al.dupe(u8, vm.formatIsoTimestamp(&buf, us)) };
@@ -908,7 +914,7 @@ fn describeNumberLike(a: std.mem.Allocator, col: ColumnData, rows: usize, kind: 
     }.of;
     try out.append(a, .{ .name = "count", .v = if (kind == .numeric) .{ .float = @floatFromInt(m) } else .{ .int = @intCast(m) } });
     try out.append(a, .{ .name = "mean", .v = if (m == 0) .null else try mk(a, kind, sum / @as(f64, @floatFromInt(m))) });
-    if (kind != .temporal) {
+    if (kind != .temporal and kind != .time) {
         const sd = core.momentResult(mo, .std, 1);
         try out.append(a, .{ .name = "std", .v = if (sd.asFloat()) |x| try mk(a, kind, x) else .null });
     }

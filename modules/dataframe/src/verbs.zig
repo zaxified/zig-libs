@@ -664,7 +664,7 @@ fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: 
             }
         }
         // A time-valued result is whole microseconds, not the float the accumulator made.
-        if (out_ty == .duration or out_ty == .timestamp) for (cells) |*c| {
+        if (out_ty == .duration or out_ty == .timestamp or out_ty == .time) for (cells) |*c| {
             if (c.* == .float) c.* = c.cast(out_ty) orelse .null;
         };
         d.* = try fm.conform(a, try fm.columnFromCells(a, cells), out_ty, n);

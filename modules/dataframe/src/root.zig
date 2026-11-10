@@ -531,6 +531,8 @@ pub const linearSpace = ranges.linearSpace;
 pub const linearSpaces = ranges.linearSpaces;
 pub const dateRanges = ranges.dateRanges;
 pub const datetimeRanges = ranges.datetimeRanges;
+pub const timeRange = ranges.timeRange;
+pub const timeRanges = ranges.timeRanges;
 pub const repeatValue = ranges.repeatValue;
 pub const ones = ranges.ones;
 pub const zeros = ranges.zeros;
@@ -648,6 +650,7 @@ test {
     _ = @import("fuzz_s2_test.zig");
     _ = @import("jsonread_test.zig");
     _ = @import("parity_test.zig");
+    _ = @import("time_ops_test.zig");
     _ = @import("parity_c_test.zig");
     _ = @import("nested_test.zig");
     _ = @import("regex_test.zig");

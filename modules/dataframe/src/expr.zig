@@ -775,6 +775,8 @@ const Inst = union(enum) {
     /// `strftime` of a zoned instant: the zone's wall clock with its offset (`%z`) and, with
     /// `layout` null (the format has `%Z`), its abbreviation, translated per cell.
     strftime_tz: struct { fmt: []const u8, layout: ?[]const u8, zone: *const tz.Zone },
+    /// A format with `%.f`: translated per cell (the fraction's width follows the cell).
+    strftime_frac: struct { fmt: []const u8, zone: ?*const tz.Zone },
     offset_by: dtf.Duration,
     offset_by_zoned: struct { d: dtf.Duration, zone: *const tz.Zone },
     truncate: struct { d: dtf.Duration, mode: dtf.RoundTo },
@@ -1008,8 +1010,30 @@ const Compiler = struct {
         if (try c.orderedCompare(op, l, r, depth)) return;
         try c.go(l, depth + 1);
         try c.go(r, depth + 1);
+        try c.timeArithmetic(op, l, r);
         if (widthBinaryType(c.f, op, l, r)) |ty| return c.push(.{ .binary_w = .{ .op = op, .ty = ty } }, 2);
         try c.push(.{ .binary = op }, 2);
+    }
+
+    /// A time of day is not an instant: no `dt` operation that moves or cuts one (polars
+    /// refuses those on `Time`). Call after `go(x)`: `temporalType` walks only a bounded operand.
+    fn refuseTime(c: *Compiler, x: *const Expr) Error!void {
+        if (temporalType(c.f, x) == .time) return error.BadExpr;
+    }
+
+    /// Arithmetic on a time of day: only `time - time` (a duration) exists; every other
+    /// operator that computes a number from it (polars SchemaError / InvalidOperation) is
+    /// refused. Comparisons, min/max, the null-aware forms and boolean logic stay.
+    fn timeArithmetic(c: *Compiler, op: Binary, l: *const Expr, r: *const Expr) Error!void {
+        switch (op) {
+            .add, .sub, .mul, .div, .floordiv, .truncdiv, .mod, .pow, .bit_and, .bit_or, .bit_xor, .log_base, .atan2 => {},
+            else => return,
+        }
+        const lt = temporalType(c.f, l) == .time;
+        const rt = temporalType(c.f, r) == .time;
+        if (!lt and !rt) return;
+        if (op == .sub and lt and rt) return;
+        return error.BadExpr;
     }
 
     /// A `fit` to the width type of `e`, when the schema says `e` is one (its cells may be of
@@ -1041,6 +1065,7 @@ const Compiler = struct {
                 // polars refuses to negate an unsigned column (a literal is a weak value).
                 if (u.op == .neg and u.x.* != .lit) if (in) |t| if (dtype.isUnsigned(t)) return error.BadExpr;
                 try c.go(u.x, depth + 1);
+                if (u.op == .neg or u.op == .abs) try c.refuseTime(u.x);
                 if (in) |t| if (dtype.isWidth(t)) {
                     try c.push(.{ .unary_w = .{ .op = u.op, .ty = t } }, 1);
                     return;
@@ -1161,11 +1186,13 @@ const Compiler = struct {
             .to_local => |r| {
                 const zone = tz.find(r.zone) orelse return error.BadExpr;
                 try c.go(r.x, depth + 1);
+                try c.refuseTime(r.x);
                 try c.push(.{ .to_local = zone }, 1);
             },
             .from_local => |r| {
                 const zone = tz.find(r.zone) orelse return error.BadExpr;
                 try c.go(r.x, depth + 1);
+                try c.refuseTime(r.x);
                 try c.push(.{ .from_local = .{ .zone = zone, .policy = r.policy } }, 1);
             },
             .convert_time_zone => |r| {
@@ -1183,6 +1210,8 @@ const Compiler = struct {
             },
             .dt => |r| {
                 try c.go(r.x, depth + 1);
+                // A time of day has no calendar and no instant: only its clock parts exist.
+                if (temporalType(c.f, r.x) == .time and !timePart(r.part)) return error.BadExpr;
                 // A zoned column shows its zone's wall clock (polars and pandas); the epoch and
                 // duration parts are the instant's own. `month_start`/`month_end` are instants
                 // again: cut on the wall clock, read back in the zone.
@@ -1192,12 +1221,19 @@ const Compiler = struct {
                 if (zone) |z| if (r.part == .month_start or r.part == .month_end) try c.push(.{ .from_local = .{ .zone = z, .policy = .compatible } }, 1);
             },
             .strptime => |r| {
-                const layout = dtf.translateFormat(c.a, r.format) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr;
+                const layout = (if (r.to == .time) dtf.translateTimeParse(c.a, r.format) else dtf.translateFormat(c.a, r.format)) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr;
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .strptime = .{ .layout = layout, .to = r.to } }, 1);
             },
             .strftime => |r| {
                 try c.go(r.x, depth + 1); // first: `zoneOf` walks only an operand `go` has bounded
+                if (dtf.hasFrac(r.format)) {
+                    // `%.f` (chrono): the fraction's digits follow the cell, so the format is translated per cell.
+                    const zone: ?*const tz.Zone = if (zoneOf(c.f, r.x)) |zn| (tz.find(zn) orelse return error.BadExpr) else null;
+                    dtf.checkFracFormat(c.a, r.format) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr;
+                    try c.push(.{ .strftime_frac = .{ .fmt = r.format, .zone = zone } }, 1);
+                    return;
+                }
                 if (zoneOf(c.f, r.x)) |zn| {
                     const zone = tz.find(zn) orelse return error.BadExpr;
                     // `%Z` (the abbreviation) changes with the cell, so its format is translated per cell.
@@ -1213,6 +1249,7 @@ const Compiler = struct {
             .offset_by => |r| {
                 const d = dtf.parseDuration(r.by) orelse return error.BadExpr;
                 try c.go(r.x, depth + 1);
+                try c.refuseTime(r.x);
                 // A zoned column moves its calendar units on the wall clock (see `dtfn.offsetByZoned`).
                 if (zoneOf(c.f, r.x)) |zn| {
                     const z = tz.find(zn) orelse return error.BadExpr;
@@ -1226,6 +1263,7 @@ const Compiler = struct {
                 const ok = (d.months > 0 and d.us == 0) or (d.months == 0 and d.us > 0);
                 if (!ok) return error.BadExpr;
                 try c.go(r.x, depth + 1);
+                try c.refuseTime(r.x);
                 // A zoned column cuts on its wall clock, whatever the step (see `dtfn.roundToZoned`).
                 if (zoneOf(c.f, r.x)) |zn| {
                     const z = tz.find(zn) orelse return error.BadExpr;
@@ -1237,6 +1275,7 @@ const Compiler = struct {
             .add_business_days => |r| {
                 const plain = std.mem.eql(bool, &r.week_mask, &dtf.monday_to_friday) and r.holidays.len == 0 and r.roll == .forward;
                 try c.go(r.x, depth + 1);
+                try c.refuseTime(r.x);
                 try c.push(.{ .add_business_days = .{ .n = r.n, .mask = r.week_mask, .holidays = try holidayDays(c.a, r.holidays), .roll = r.roll, .plain = plain } }, 1);
             },
             .list => |r| {
@@ -1339,6 +1378,7 @@ const Compiler = struct {
                 // Each operand counts by its own local day when it is zoned.
                 for ([2]*const Expr{ r.start, r.end }) |side| {
                     try c.go(side, depth + 1);
+                    try c.refuseTime(side);
                     if (zoneOf(c.f, side)) |zn| try c.push(.{ .to_local = tz.find(zn) orelse return error.BadExpr }, 1);
                 }
                 try c.push(.{ .business_day_count = .{ .mask = r.week_mask, .holidays = days[0..k] } }, 2);
@@ -1434,6 +1474,12 @@ const Compiler = struct {
                 try c.push(.{ .regex = .{ .op = .contains, .m = try c.matcher(anchored), .groups = &.{} } }, 1);
             },
             .to_datetime => |r| {
+                if (r.to == .time) {
+                    // polars `str.to_time()`: no layout to infer; `HH:MM[:SS[.f]]`.
+                    try c.go(r.x, depth + 1);
+                    try c.push(.{ .to_datetime = .{ .to = .time, .layouts = &.{}, .iso_only = true } }, 1);
+                    return;
+                }
                 var layouts: std.ArrayList([]const u8) = .empty;
                 for (dtf.inferFormats(r.dayfirst)) |fmt| {
                     layouts.append(c.a, dtf.translateInfer(c.a, fmt) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr) catch return error.OutOfMemory;
@@ -1489,6 +1535,7 @@ const Compiler = struct {
             },
             .dt_replace => |r| {
                 try c.go(r.x, depth + 1);
+                try c.refuseTime(r.x);
                 // A zoned column replaces fields of its wall clock and reads the result back in its zone.
                 const zone = if (zoneOf(c.f, r.x)) |zn| (tz.find(zn) orelse return error.BadExpr) else null;
                 if (zone) |z| try c.push(.{ .to_local = z }, 1);
@@ -1506,10 +1553,12 @@ const Compiler = struct {
             .tz_offset => |r| {
                 const zone = tz.find(r.zone) orelse return error.BadExpr;
                 try c.go(r.x, depth + 1);
+                try c.refuseTime(r.x);
                 try c.push(.{ .tz_offset = .{ .zone = zone, .kind = r.kind } }, 1);
             },
             .is_business_day => |r| {
                 try c.go(r.x, depth + 1);
+                try c.refuseTime(r.x);
                 // A zoned column's business day is its local day (as the `dt` part reads it).
                 if (zoneOf(c.f, r.x)) |zn| try c.push(.{ .to_local = tz.find(zn) orelse return error.BadExpr }, 1);
                 try c.push(.{ .is_business_day = .{ .mask = r.week_mask, .holidays = try holidayDays(c.a, r.holidays) } }, 1);
@@ -2262,6 +2311,10 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
                 const v = stack[sp - 1];
                 stack[sp - 1] = if (keys.isMissing(v)) .null else try dtf.strftimeZoned(a, v, r.fmt, r.layout, r.zone);
             },
+            .strftime_frac => |r| {
+                const v = stack[sp - 1];
+                stack[sp - 1] = if (keys.isMissing(v)) .null else try dtf.strftimeFrac(a, v, r.fmt, r.zone);
+            },
             .to_local => |zone| stack[sp - 1] = try dtf.toLocal(a, stack[sp - 1], zone),
             .from_local => |r| stack[sp - 1] = try dtf.fromLocal(a, stack[sp - 1], r.zone, r.policy),
             .add_business_days => |r| {
@@ -2628,17 +2681,20 @@ fn zoneOf(f: Frame, e: *const Expr) ?[]const u8 {
 fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
     return switch (e.*) {
         .col => |name| switch (f.columnType(name) orelse return null) {
-            .timestamp, .duration, .date => |t| t,
+            .timestamp, .duration, .date, .time => |t| t,
             else => null,
         },
         .cast => |c| switch (c.to) {
-            .timestamp, .duration, .date => c.to,
+            .timestamp, .duration, .date, .time => c.to,
             else => null,
         },
         .strptime => |r| switch (r.to) {
             .date => .date,
             .timestamp => .timestamp,
+            .time => .time,
         },
+        // `dt.time` is a time of day (polars `Time`), the other parts are numbers or text.
+        .dt => |r| if (r.part == .time) .time else null,
         .offset_by => |r| temporalType(f, r.x),
         .truncate => |r| temporalType(f, r.x),
         .add_business_days => |r| temporalType(f, r.x),
@@ -2646,7 +2702,11 @@ fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
         .make_datetime => .timestamp,
         .make_duration => .duration,
         .from_epoch => |r| if (r.unit == .day) .date else .timestamp,
-        .to_datetime => |r| if (r.to == .date) .date else .timestamp,
+        .to_datetime => |r| switch (r.to) {
+            .date => .date,
+            .timestamp => .timestamp,
+            .time => .time,
+        },
         .dt_combine => .timestamp,
         .dt_replace => |r| temporalType(f, r.x),
         .tz_offset => .duration,
@@ -2668,7 +2728,7 @@ fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
             const l = temporalType(f, b.l);
             const r = temporalType(f, b.r);
             break :blk switch (b.op) {
-                .sub => if (l == .timestamp and r == .timestamp)
+                .sub => if ((l == .timestamp and r == .timestamp) or (l == .time and r == .time))
                     .duration
                 else if (l == .timestamp and r == .duration)
                     .timestamp
@@ -2698,8 +2758,16 @@ fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
 
 fn temporalOf(t: ColumnType) ?ColumnType {
     return switch (t) {
-        .timestamp, .duration, .date => t,
+        .timestamp, .duration, .date, .time => t,
         else => null,
+    };
+}
+
+/// The `dt` parts a time of day has: its clock fields (polars `Time` has no more).
+fn timePart(p: dtf.DtPart) bool {
+    return switch (p) {
+        .hour, .minute, .second, .millisecond, .microsecond, .nanosecond => true,
+        else => false,
     };
 }
 
@@ -3180,7 +3248,7 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
         if (fits) {
             ty = t;
             // `dur / 2` evaluates to a float: whole microseconds, as polars truncates.
-            if (t != .date and any_float) for (vals) |*c| {
+            if ((t != .date and any_float) or t == .time) for (vals) |*c| {
                 c.* = if (keys.isMissing(c.*)) .null else c.cast(t) orelse .null;
             };
             cols[at] = .{ .name = as.out, .type = ty, .time_zone = if (ty == .timestamp) zoneOf(f, &as.expr) else null };

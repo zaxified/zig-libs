@@ -263,7 +263,7 @@ pub const Selector = union(enum) {
     /// Every integer and float type (Int64 and the widths, Float64 and Float32) and `.decimal`
     /// (pandas `"number"`, polars `cs.numeric()`).
     numeric,
-    /// `.date`, `.timestamp` (polars `cs.temporal()`).
+    /// `.date`, `.timestamp`, `.time` (polars `cs.temporal()`).
     temporal,
     /// `.text` (polars `cs.string()`).
     text,
@@ -341,7 +341,7 @@ fn matches(f: Frame, ci: usize, s: Selector, depth: usize, budget: *usize, pats:
     return switch (s) {
         .all => true,
         .numeric => dtype.isNumeric(c.type) or c.type == .decimal,
-        .temporal => c.type == .date or c.type == .timestamp,
+        .temporal => c.type == .date or c.type == .timestamp or c.type == .time,
         .text => c.type == .text,
         .boolean => c.type == .bool,
         .by_type => |ts| std.mem.findScalar(ColumnType, ts, c.type) != null,

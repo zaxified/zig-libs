@@ -68,8 +68,8 @@ pub const DtPart = enum {
     epoch_us,
     /// The date as `YYYY-MM-DD` text (pandas and polars `date`).
     date,
-    /// The time of day as `HH:MM:SS`, `.ffffff` added when there is a fraction
-    /// (pandas and polars `time`, as text).
+    /// The time of day as a `.time` cell: microseconds since midnight (pandas and
+    /// polars `time`).
     time,
     /// The first / last day of the month, time of day kept, the input's shape (polars
     /// `month_start`/`month_end`, pandas `+ MonthBegin(-1)`/`MonthEnd(0)` style).
@@ -222,10 +222,8 @@ pub fn part(a: std.mem.Allocator, v: Value, which: DtPart) error{OutOfMemory}!Va
         .epoch_ms => .{ .int = @divFloor(in.us, 1000) },
         .epoch_us => .{ .int = in.us },
         .date => dateText(a, day),
-        .time => .{ .text = if (frac_us == 0)
-            try a.print("{d:0>2}:{d:0>2}:{d:0>2}", .{ p.hour, p.minute, p.second })
-        else
-            try a.print("{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ p.hour, p.minute, p.second, @as(u64, @intCast(frac_us)) }) },
+        // A time of day: the microseconds since midnight (a `.time` cell), not text.
+        .time => .{ .int = @mod(in.us, us_per_day) },
         .month_start, .month_end => blk: {
             var q = p;
             q.day = if (which == .month_start) 1 else dim;
@@ -244,17 +242,23 @@ pub const FormatError = error{ OutOfMemory, BadFormat };
 /// the text between them literal (`[` and `]` included). Another directive, or a `%`
 /// at the end, is `error.BadFormat`.
 pub fn translateFormat(a: std.mem.Allocator, fmt: []const u8) FormatError![]const u8 {
-    return translateImpl(a, fmt, false);
+    return translateImpl(a, fmt, false, false);
+}
+
+/// `translateFormat` for parsing a time of day (`strptime` to a `.time`): `%H %I %M %S` read one
+/// or two digits, as chrono's parser does (polars `str.to_time("%I.%M%p")` reads `1.30pm`).
+pub fn translateTimeParse(a: std.mem.Allocator, fmt: []const u8) FormatError![]const u8 {
+    return translateImpl(a, fmt, false, true);
 }
 
 /// `translateFormat` that also takes `%-d` and `%-m` (glibc, chrono: no leading zero; one or
 /// two digits when parsing). Used by the formats `inferFormats` lists; the public format
 /// language of `strptime`/`strftime` stays the engines' documented one, which refuses them.
 pub fn translateInfer(a: std.mem.Allocator, fmt: []const u8) FormatError![]const u8 {
-    return translateImpl(a, fmt, true);
+    return translateImpl(a, fmt, true, false);
 }
 
-fn translateImpl(a: std.mem.Allocator, fmt: []const u8, nopad_ok: bool) FormatError![]const u8 {
+fn translateImpl(a: std.mem.Allocator, fmt: []const u8, nopad_ok: bool, lenient_clock: bool) FormatError![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var lit: std.ArrayList(u8) = .empty;
     defer lit.deinit(a);
@@ -310,10 +314,10 @@ fn translateImpl(a: std.mem.Allocator, fmt: []const u8, nopad_ok: bool) FormatEr
             'y' => "YY",
             'm' => "MM",
             'd' => "DD",
-            'H' => "hh",
-            'I' => "ii",
-            'M' => "mm",
-            'S' => "ss",
+            'H' => if (lenient_clock) "h" else "hh",
+            'I' => if (lenient_clock) "i" else "ii",
+            'M' => if (lenient_clock) "m" else "mm",
+            'S' => if (lenient_clock) "s" else "ss",
             'p' => "A",
             'f' => "SSSSSS",
             'z' => "ZZZ",
@@ -354,7 +358,7 @@ fn translateImpl(a: std.mem.Allocator, fmt: []const u8, nopad_ok: bool) FormatEr
     return out.items;
 }
 
-pub const ParseTo = enum { date, timestamp };
+pub const ParseTo = enum { date, timestamp, time };
 
 /// pandas `to_datetime(format=)`, polars `str.strptime`/`to_date`/`to_datetime`: the
 /// whole text must match `layout` (`translateFormat`'s output), else null (polars'
@@ -364,6 +368,12 @@ pub fn strptime(a: std.mem.Allocator, v: Value, layout: []const u8, to: ParseTo)
     if (v != .text) return .null;
     const m = datefmt.parsePrefix(v.text, layout) catch return .null;
     if (m.len != v.text.len) return .null;
+    if (to == .time) {
+        // polars `str.to_time(format)`: only the clock fields count; an offset in the text is ignored.
+        const t = m.parts;
+        const us = (@as(i64, t.hour) * 3600 + @as(i64, t.minute) * 60 + t.second) * us_per_s + @divFloor(t.nanosecond, 1000);
+        return if (vm.isTimeOfDay(us)) .{ .int = us } else .null;
+    }
     const p = if (m.parts.off_min != null) datefmt.toUtc(m.parts) else m.parts;
     const us = usOf(p) orelse return .null;
     return write(a, us, if (to == .date) .date else .int);
@@ -724,6 +734,71 @@ pub fn checkZonedFormat(a: std.mem.Allocator, fmt: []const u8) FormatError!void 
     _ = try translateFormat(a, try substituteAbbr(a, fmt, "UTC"));
 }
 
+/// `fmt` with every `%.f` (chrono: the fraction of the second with a leading dot, as few
+/// digits as hold it in groups of three, nothing when it is zero) replaced by that text for
+/// the microseconds `frac_us`; `%%` and the other directives are left as they are.
+fn substituteFrac(a: std.mem.Allocator, fmt: []const u8, frac_us: i64) error{OutOfMemory}![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < fmt.len) {
+        if (fmt[i] == '%' and i + 1 < fmt.len) {
+            if (fmt[i + 1] == '.' and i + 2 < fmt.len and fmt[i + 2] == 'f') {
+                if (frac_us != 0) {
+                    if (@mod(frac_us, 1000) == 0) try out.print(a, ".{d:0>3}", .{@as(u64, @intCast(@divFloor(frac_us, 1000)))}) else try out.print(a, ".{d:0>6}", .{@as(u64, @intCast(frac_us))});
+                }
+                i += 3;
+                continue;
+            }
+            try out.appendSlice(a, fmt[i .. i + 2]);
+            i += 2;
+            continue;
+        }
+        try out.append(a, fmt[i]);
+        i += 1;
+    }
+    return out.items;
+}
+
+/// Whether `fmt` has a `%.f` (so it is translated per cell by `strftimeFrac`).
+pub fn hasFrac(fmt: []const u8) bool {
+    var i: usize = 0;
+    while (i + 1 < fmt.len) {
+        if (fmt[i] != '%') {
+            i += 1;
+        } else if (i + 2 < fmt.len and fmt[i + 1] == '.' and fmt[i + 2] == 'f') {
+            return true;
+        } else i += 2;
+    }
+    return false;
+}
+
+/// Whether a format with `%.f` (and maybe `%Z`) is one the translator accepts: checked at
+/// compile time so that a bad format is `error.BadExpr`, not a column of nulls.
+pub fn checkFracFormat(a: std.mem.Allocator, fmt: []const u8) FormatError!void {
+    _ = try translateFormat(a, try substituteAbbr(a, try substituteFrac(a, fmt, 120_000), "UTC"));
+}
+
+/// `strftime` of a format with `%.f`: the wall clock of `zone` (null: the cell as it is), the
+/// format translated per cell. A format `translateFormat` refuses is null.
+pub fn strftimeFrac(a: std.mem.Allocator, v: Value, fmt: []const u8, zone: ?*const tz.Zone) error{OutOfMemory}!Value {
+    const in = read(v) orelse return .null;
+    const secs = @divFloor(in.us, us_per_s);
+    const off: i32 = if (zone != null and in.shape != .date) tz.offsetAt(zone.?, secs).off else 0;
+    const local = std.math.add(i64, in.us, @as(i64, off) * us_per_s) catch return .null;
+    const abbr: []const u8 = if (zone) |z| tz.abbrevAt(z, secs) else "UTC";
+    const lay = translateFormat(a, try substituteAbbr(a, try substituteFrac(a, fmt, @mod(local, us_per_s)), abbr)) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BadFormat => return .null,
+    };
+    var p = partsOf(local);
+    p.off_min = @divTrunc(off, 60);
+    const t = datefmt.format(a, p, lay) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .null,
+    };
+    return .{ .text = t };
+}
+
 /// `strftime` of a zoned instant (polars `dt.strftime` and pandas `dt.strftime` of a
 /// tz-aware column): the wall clock of `zone`, `%z`/`%:z` its offset at that instant and
 /// `%Z` its abbreviation (`CEST`, `EST`; `+03` for a zone with no letters). `layout` is the
@@ -949,6 +1024,7 @@ const month_first_formats = [_][]const u8{
 pub fn parseIso(a: std.mem.Allocator, v: Value, to: ParseTo) error{OutOfMemory}!Value {
     if (v != .text) return .null;
     const t = v.text;
+    if (to == .time) return if (vm.parseTimeOfDay(t)) |us| .{ .int = us } else .null;
     const us = if (t.len == 10)
         (if (vm.parseIsoDate(t)) |d| d.ordinal() * us_per_day else return .null)
     else
