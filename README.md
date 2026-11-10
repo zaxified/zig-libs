@@ -527,7 +527,7 @@ way to recognise it.
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
 | [`blobstore`](modules/blobstore/README.md) | 2 (S,E,A,P) | Content-addressed blob store (git-object/restic style) with refcounted GC, configurable fan-out and a cross-process ingest lock, plus name-addressed and small named-record layers; crash-safe. | posix | hashdigest |
-| [`dataframe`](modules/dataframe/README.md) | 3 (S) | Columnar dataframe (`Frame`): typed columns, validity bitmaps and pandas/polars verbs — aggregate, join, pivot, sort, melt, filter. | any | datefmt, csvstream, regex, tz, unitext |
+| [`dataframe`](modules/dataframe/README.md) | 2 (S,E,A,P) | Columnar dataframe (`Frame`): typed columns, validity bitmaps and pandas/polars verbs — aggregate, join, pivot, sort, melt, filter. | any | datefmt, csvstream, regex, tz, unitext |
 | [`decimal`](modules/decimal/README.md) | 2 (S,E,A,P) | Exact i128 fixed-point decimal for money math with IEEE/GDA rounding modes and rescale — float-free arithmetic, f64 only at an explicit fromFloat/toFloat boundary. | any | — |
 | [`filestore`](modules/filestore/README.md) | 2 (S,A,P) | DB-less durable keyed document store — one atomically-written file per record, plus a typed-JSON convenience layer. | posix | clock |
 | [`finstats`](modules/finstats/README.md) | 2 (S,E,A,P) | Portfolio/financial statistics over plain slices — XIRR, TWR, risk, beta, Monte-Carlo, correlation, drawdowns. | any | datefmt |
