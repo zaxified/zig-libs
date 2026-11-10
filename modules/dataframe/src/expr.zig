@@ -24,6 +24,7 @@
 //!   case functions then treat as bytes too; see SPEC, "Unicode text").
 
 const std = @import("std");
+const dtype = @import("dtype.zig");
 const ds = @import("value.zig");
 const fm = @import("frame.zig");
 const keys = @import("keys.zig");
@@ -1850,7 +1851,7 @@ fn evalBinary(a: std.mem.Allocator, op: Binary, l: Value, r: Value) Error!Value 
     switch (op) {
         .eq, .ne, .lt, .le, .gt, .ge => {
             const same = switch (l) {
-                .int, .float, .decimal => r == .int or r == .float or r == .decimal,
+                .int, .uint, .float, .decimal => r == .int or r == .uint or r == .float or r == .decimal,
                 .text => r == .text,
                 .bool => r == .bool,
                 // Lists and records compare as polars compares them (`Value.order`).
@@ -1989,6 +1990,7 @@ pub fn castValue(a: std.mem.Allocator, v: Value, to: ColumnType) Error!Value {
         .text, .date, .categorical => switch (v) {
             .text => return v,
             .int => |i| return .{ .text = try a.print("{d}", .{i}) },
+            .uint => |u| return .{ .text = try a.print("{d}", .{u}) },
             .float => |f| return .{ .text = try a.print("{d}", .{f}) },
             .bool => |b| return .{ .text = if (b) "true" else "false" },
             .decimal => |r| return .{ .text = try decimalText(a, r) },
@@ -2002,22 +2004,26 @@ pub fn castValue(a: std.mem.Allocator, v: Value, to: ColumnType) Error!Value {
                 return .{ .text = try out.toOwnedSlice() };
             },
         },
-        .int => switch (v) {
-            .bool => |b| return .{ .int = @intFromBool(b) },
+        // Every integer width: the value, then the width's range (out of it: null).
+        .int, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => switch (v) {
+            .bool => |b| return dtype.fitInt(@intFromBool(b), to) orelse .null,
             .text => |t| {
                 const s = std.mem.trim(u8, t, " \t");
                 if (std.mem.findAny(u8, s, "_xX") != null) return .null;
-                if (std.fmt.parseInt(i64, s, 10)) |i| return .{ .int = i } else |_| {}
+                if (std.fmt.parseInt(i128, s, 10)) |i| return dtype.fitInt(i, to) orelse .null else |_| {}
                 const f = parseNumber(s) orelse return .null;
                 // Whole only ("1e2"): "12.9" is not an int, say so rather than truncate.
-                const i = Value.floatToInt(i64, f) orelse return .null;
-                return if (@as(f64, @floatFromInt(i)) == f) .{ .int = i } else .null;
+                const i = Value.floatToInt(i128, f) orelse return .null;
+                return if (@as(f64, @floatFromInt(i)) == f) dtype.fitInt(i, to) orelse .null else .null;
             },
             else => {},
         },
-        .float => switch (v) {
+        .float, .float32 => switch (v) {
             .bool => |b| return .{ .float = @floatFromInt(@intFromBool(b)) },
-            .text => |t| return .{ .float = parseNumber(std.mem.trim(u8, t, " \t")) orelse return .null },
+            .text => |t| {
+                const x = parseNumber(std.mem.trim(u8, t, " \t")) orelse return .null;
+                return .{ .float = if (to == .float32) dtype.roundF32(x) else x };
+            },
             else => {},
         },
         .bool => if (v == .text) {
@@ -2761,7 +2767,7 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
         if (as.type) |ty| {
             if (!keys.isMissing(v)) v = castValue(bud.allocator(), v, ty) catch |e| return if (e == error.OutOfMemory and bud.hit) error.TooLarge else e;
         } else switch (v) {
-            .int => any_int = true,
+            .int, .uint => any_int = true,
             .float => |x| any_float = any_float or !std.math.isNan(x),
             .decimal => any_decimal = true,
             .text => any_text = true,
@@ -2813,6 +2819,7 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
     for (data[0..f.columns.len], 0..) |*d, ci| d.* = f.columnAt(ci);
     data[at] = try fm.columnFromCells(a, vals);
     if (ty == .categorical) data[at] = try fm.encodeCategorical(a, data[at], f.len);
+    data[at] = try fm.conform(a, data[at], ty, f.len);
     return .{ .columns = cols, .data = data, .len = f.len };
 }
 
@@ -2844,7 +2851,11 @@ pub const CastSpec = struct {
     to: ColumnType,
     /// `.null`: an unconvertible cell becomes null (pandas' `errors="coerce"`,
     /// polars' `strict=False`). `.fail`: `error.CastFailed` (their strict default).
-    on_error: enum { null, fail } = .null,
+    /// `.wrap`: to an integer type, a number out of its range wraps (polars
+    /// `wrap_numerical=True`, numpy `astype`): an integer keeps its low bits, a float
+    /// saturates as polars' does (NaN 0, past the range the range's end); any other
+    /// unconvertible cell is null. To a non-integer type `.wrap` is `.null`.
+    on_error: enum { null, fail, wrap } = .null,
     /// With `to = .timestamp`: the zone the result carries, polars
     /// `cast(Datetime("us", time_zone=...))`: the cells stay the same UTC instants (see
     /// `Expr.cast`). Null gives a naive column, also from a zoned one, again the same
@@ -2864,6 +2875,25 @@ pub const CastSpec = struct {
 };
 
 pub const CastError = Error || error{CastFailed};
+
+/// `CastSpec.on_error = .wrap` for a cell the plain cast left null: an integer wraps into
+/// `to`, a float saturates (polars' `wrap_numerical`, Rust's `as`: NaN 0, ±inf and
+/// anything past the range the range's end, else toward zero); anything else stays null.
+fn wrapCell(v: Value, to: ColumnType) Value {
+    switch (v) {
+        .int, .uint, .decimal => return dtype.wrapInt(dtype.truncInt(v) orelse return .null, to),
+        .float => |x| {
+            if (std.math.isNan(x)) return dtype.fitInt(0, to).?;
+            const lo = dtype.intMin(to);
+            const hi = dtype.intMax(to);
+            const t = @trunc(x);
+            if (t <= @as(f64, @floatFromInt(lo))) return dtype.fitInt(lo, to).?;
+            if (t >= @as(f64, @floatFromInt(hi))) return dtype.fitInt(hi, to).?;
+            return dtype.fitInt(@intFromFloat(t), to) orelse .null; // strictly inside: fits
+        },
+        else => return .null,
+    }
+}
 
 /// Convert one column by `castValue`'s rule, the declared type following.
 pub fn cast(a: std.mem.Allocator, f: Frame, spec: CastSpec) CastError!Frame {
@@ -2896,11 +2926,11 @@ pub fn cast(a: std.mem.Allocator, f: Frame, spec: CastSpec) CastError!Frame {
             break :blk Value{ .text = try out.toOwnedSlice() };
         } else try castValue(a, src, spec.to);
         if (spec.on_error == .fail and v == .null and !keys.isMissing(src)) return error.CastFailed;
-        o.* = v;
+        o.* = if (spec.on_error == .wrap and v == .null and dtype.isInteger(spec.to)) wrapCell(src, spec.to) else v;
     }
     const data = try a.alloc(ColumnData, cols.len);
     for (data, 0..) |*d, i| d.* = f.columnAt(i);
-    data[ci] = try fm.columnFromCells(a, vals);
+    data[ci] = try fm.conform(a, try fm.columnFromCells(a, vals), spec.to, f.len);
     if (spec.to == .categorical) {
         if (spec.categories) |cats| {
             const enc = catfn.encodeWith(a, data[ci], f.len, cats, spec.ordered) catch |e| return switch (e) {

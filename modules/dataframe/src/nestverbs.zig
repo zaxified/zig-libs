@@ -252,7 +252,9 @@ pub fn storageType(d: ColumnData) ColumnType {
             .text => break .text,
             .list => break .list,
             .record => break .@"struct",
+            .uint => break .uint64,
         } else .float,
+        inline .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => |_, t| @field(ColumnType, @tagName(t)),
     };
 }
 

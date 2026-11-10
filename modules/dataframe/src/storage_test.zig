@@ -47,6 +47,7 @@ pub fn sameCell(w: Value, g: Value) bool {
     return switch (g) {
         .null => true,
         .int => |x| x == w.int,
+        .uint => |x| x == w.uint,
         .float => |x| (std.math.isNan(x) and std.math.isNan(w.float)) or @as(u64, @bitCast(x)) == @as(u64, @bitCast(w.float)),
         .text => |x| std.mem.eql(u8, x, w.text),
         .bool => |x| x == w.bool,
@@ -87,6 +88,7 @@ fn expectSameStorage(want: ColumnData, got: ColumnData) !void {
             try expectSameBits(want.text.valid, c.valid);
         },
         .categorical, .list, .@"struct" => return error.TestUnexpectedResult, // no generated table makes one
+        .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => return error.TestUnexpectedResult, // no generated table makes one
         .boxed => |c| {
             try testing.expectEqual(want.boxed.len, c.len);
             for (want.boxed, c) |w, g| try testing.expect(sameCell(w, g));

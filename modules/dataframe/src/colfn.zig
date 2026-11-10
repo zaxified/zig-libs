@@ -258,6 +258,7 @@ pub fn cumFoldColumns(a: std.mem.Allocator, f: Frame, spec: CumFoldSpec, ctx: an
             .categorical => .categorical,
             .list => .list,
             .@"struct" => .@"struct",
+            inline .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => |_, t| @field(vm.ColumnType, @tagName(t)),
         } };
     }
     return .{ .columns = cols, .data = data, .len = f.len };

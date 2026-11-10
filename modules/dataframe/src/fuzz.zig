@@ -188,6 +188,7 @@ fn columnOk(d: ColumnData, len: usize, depth: u8) bool {
         .float => |c| typedOk(f64, c, len),
         .bool => |c| typedOk(bool, c, len),
         .decimal => |c| typedOk(i128, c, len),
+        inline .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => |c| typedOk(std.meta.Elem(@TypeOf(c.values)), c, len),
         .boxed => |c| c.len == len,
         .list => |c| listOk(c, len) and columnOk(c.items.*, c.offsets[len], depth + 1),
         .@"struct" => |c| st: {
@@ -219,6 +220,7 @@ fn sameCell(x: Value, y: Value) bool {
     return switch (x) {
         .null => true,
         .int => |v| v == y.int,
+        .uint => |v| v == y.uint,
         .float => |v| @as(u64, @bitCast(v)) == @as(u64, @bitCast(y.float)) or (std.math.isNan(v) and std.math.isNan(y.float)),
         .bool => |v| v == y.bool,
         .decimal => |v| v == y.decimal,
@@ -426,8 +428,8 @@ fn genFrame(src: anytype, a: Allocator, first: usize, n_rows: usize) !Frame {
 
 fn kindOfType(t: ColumnType) Kind {
     return switch (t) {
-        .int => .int,
-        .float => .float,
+        .int, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => .int,
+        .float, .float32 => .float,
         .bool => .bool,
         .decimal => .decimal,
         .text => .text,

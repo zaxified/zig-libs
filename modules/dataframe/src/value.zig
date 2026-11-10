@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const datefmt = @import("datefmt");
+const dtype = @import("dtype.zig");
 const tz = @import("tz");
 
 pub const ColumnType = enum {
@@ -50,6 +51,19 @@ pub const ColumnType = enum {
     /// `ColumnData.@"struct"`, which holds the field names. `Column.inner` declares the
     /// fields, in order.
     @"struct",
+    /// Fixed-width numbers (wave W11), polars `Int8`..`UInt64`, `Float32`; `.int` is Int64
+    /// and `.float` Float64. A column of one of these holds its own array
+    /// (`ColumnData.int8`.., `frame.conform`); its cells read as `Value.int` (`Value.uint`
+    /// for a UInt64 above `maxInt(i64)`) and `Value.float` (a Float32 widened exactly).
+    /// Predicates, ranges and the meeting type of two operands: `dtype.zig`.
+    int8,
+    int16,
+    int32,
+    uint8,
+    uint16,
+    uint32,
+    uint64,
+    float32,
 };
 
 pub const Column = struct {
@@ -178,6 +192,9 @@ pub const Value = union(enum) {
     decimal: i128,
     list: ListView,
     record: RecordView,
+    /// A UInt64 cell above `maxInt(i64)`; every smaller one is `.int`. Numeric like
+    /// `.int`: it orders, compares, keys and converts by its exact value.
+    uint: u64,
 
     /// Coerce a numeric cell to f64 (int→float, float→float, decimal→float by
     /// dividing out the scale — lossy for values needing exact precision, use
@@ -185,6 +202,7 @@ pub const Value = union(enum) {
     pub fn asFloat(self: Value) ?f64 {
         return switch (self) {
             .int => |i| @floatFromInt(i),
+            .uint => |u| @floatFromInt(u),
             .float => |f| f,
             .decimal => |r| @as(f64, @floatFromInt(r)) / @as(f64, @floatFromInt(decimal_scale)),
             else => null,
@@ -351,7 +369,7 @@ pub const Value = union(enum) {
 
     fn isNumeric(v: Value) bool {
         return switch (v) {
-            .int, .float, .decimal => true,
+            .int, .uint, .float, .decimal => true,
             else => false,
         };
     }
@@ -371,21 +389,32 @@ pub const Value = union(enum) {
             if (an and bn) return .eq;
             return if (an) .gt else .lt;
         }
-        return switch (a) {
-            .int => |x| switch (b) {
-                .int => |y| std.math.order(x, y),
+        // Integers (`.int`, `.uint`) as i128: a UInt64 above 2^63 against an i64 is exact.
+        const ai: ?i128 = switch (a) {
+            .int => |x| x,
+            .uint => |x| x,
+            else => null,
+        };
+        const bi: ?i128 = switch (b) {
+            .int => |x| x,
+            .uint => |x| x,
+            else => null,
+        };
+        if (ai) |x| {
+            if (bi) |y| return std.math.order(x, y);
+            return switch (b) {
                 .float => |y| orderFloatInt(y, x).invert(),
-                .decimal => |y| std.math.order(@as(i128, x) * decimal_scale, y),
+                .decimal => |y| std.math.order(x * decimal_scale, y), // |x| < 2^64: fits i128 ×10^12
                 else => unreachable, // callers pass numerics only (isNumeric)
-            },
-            .float => |x| switch (b) {
-                .int => |y| orderFloatInt(x, y),
+            };
+        }
+        return switch (a) {
+            .float => |x| if (bi) |y| orderFloatInt(x, y) else switch (b) {
                 .float => |y| std.math.order(x, y),
                 .decimal => |y| orderFloatDecimal(x, y),
                 else => unreachable, // callers pass numerics only (isNumeric)
             },
-            .decimal => |x| switch (b) {
-                .int => |y| std.math.order(x, @as(i128, y) * decimal_scale),
+            .decimal => |x| if (bi) |y| std.math.order(x, y * decimal_scale) else switch (b) {
                 .float => |y| orderFloatDecimal(y, x).invert(),
                 .decimal => |y| std.math.order(x, y),
                 else => unreachable, // callers pass numerics only (isNumeric)
@@ -394,12 +423,12 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Order of the (non-NaN) float `f` against the integer `i`, exactly.
-    fn orderFloatInt(f: f64, i: i64) std.math.Order {
-        if (f >= 9223372036854775808.0) return .gt; // 2^63: above every i64
+    /// Order of the (non-NaN) float `f` against the integer `i` (an i64 or a u64), exactly.
+    fn orderFloatInt(f: f64, i: i128) std.math.Order {
+        if (f >= 18446744073709551616.0) return .gt; // 2^64: above every i64 and u64
         if (f < -9223372036854775808.0) return .lt;
         const fl = @floor(f);
-        const fi: i64 = @intFromFloat(fl); // in range: checked above
+        const fi: i128 = @intFromFloat(fl); // in range: checked above
         const o = std.math.order(fi, i);
         if (o != .eq) return o;
         return if (f > fl) .gt else .eq;
@@ -440,7 +469,7 @@ pub const Value = union(enum) {
         return switch (v) {
             .null => 0,
             .bool => 1,
-            .int, .float, .decimal => 2,
+            .int, .uint, .float, .decimal => 2,
             .text => 3,
             .list => 4,
             .record => 5,
@@ -468,18 +497,23 @@ pub const Value = union(enum) {
     /// cell of their kind and make nothing else one (text is not parsed as JSON here).
     pub fn cast(self: Value, to: ColumnType) ?Value {
         return switch (to) {
-            .int => if (self.asInt()) |i| .{ .int = i } else null,
+            // Toward zero, then the width's range: out of it is null (`dtype.fitInt`).
+            .int, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => if (dtype.truncInt(self)) |x| dtype.fitInt(x, to) else null,
             .float => if (self.asFloat()) |f| .{ .float = f } else null,
+            // Rounded to the nearest f32; past its range ±infinity, as polars' cast.
+            .float32 => if (self.asFloat()) |f| .{ .float = dtype.roundF32(f) } else null,
             .text, .date, .categorical => if (self.asText()) |t| .{ .text = t } else null,
             .bool => switch (self) {
                 .bool => self,
                 .int => |i| .{ .bool = i != 0 },
+                .uint => .{ .bool = true }, // above maxInt(i64): never zero
                 .float => |f| .{ .bool = f != 0 },
                 else => null,
             },
             .decimal => switch (self) {
                 .decimal => self,
                 .int => |i| .{ .decimal = @as(i128, i) * decimal_scale },
+                .uint => |u| .{ .decimal = @as(i128, u) * decimal_scale }, // < 2^64 × 10^12 < 2^127
                 // The scaled product is what is converted, so the scaled
                 // product is what must be in range — `isFinite(f)` alone let
                 // `1e30` through into a cast of `1e42`.

@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const vm = @import("value.zig");
+const dtype = @import("dtype.zig");
 const fm = @import("frame.zig");
 const keys = @import("keys.zig");
 const sp = @import("spec.zig");
@@ -133,10 +134,10 @@ pub const max_rolling_map_work = sp.max_rolling_work;
 fn fit(v: Value, ty: ColumnType) ?Value {
     if (v == .null) return v;
     return switch (ty) {
-        .int, .timestamp, .duration => if (v == .int) v else null,
-        .float => switch (v) {
-            .float => v,
-            .int => |i| .{ .float = @floatFromInt(i) },
+        .timestamp, .duration => if (v == .int) v else null,
+        .int, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => if (v == .int or v == .uint) dtype.fitInt(dtype.exactI128(v).?, ty) else null,
+        .float, .float32 => switch (v) {
+            .float, .int, .uint => .{ .float = if (ty == .float32) dtype.roundF32(v.asFloat().?) else v.asFloat().? },
             else => null,
         },
         .text, .date, .categorical => if (v == .text) v else null,
@@ -158,6 +159,7 @@ fn inferred(d: ColumnData) ColumnType {
         .categorical => .categorical,
         .list => .list,
         .@"struct" => .@"struct",
+        inline .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => |_, t| @field(ColumnType, @tagName(t)),
     };
 }
 

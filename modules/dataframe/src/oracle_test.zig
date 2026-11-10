@@ -306,7 +306,7 @@ fn rankOf(v: Value) u8 {
     return switch (v) {
         .null => 0,
         .bool => 1,
-        .int, .float, .decimal => 2,
+        .int, .uint, .float, .decimal => 2,
         .text => 3,
         .list, .record => 4, // the engines' vectors hold none
     };
@@ -332,7 +332,7 @@ const RowCtx = struct {
             if (rx != ry) return rx < ry;
             switch (x) {
                 .bool => if (x.bool != y.bool) return !x.bool,
-                .int, .float, .decimal => {
+                .int, .uint, .float, .decimal => {
                     if (x == .int and y == .int) {
                         if (x.int != y.int) return x.int < y.int;
                         continue;
@@ -410,8 +410,8 @@ fn compare(a: std.mem.Allocator, c: J, got: Frame) !?[]const u8 {
 
 fn kindName(ty: ColumnType) []const u8 {
     return switch (ty) {
-        .int, .timestamp, .duration => "int",
-        .float => "float",
+        .int, .timestamp, .duration, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => "int",
+        .float, .float32 => "float",
         .text, .date, .categorical => "text",
         .bool => "bool",
         .decimal => "decimal",
@@ -423,8 +423,8 @@ fn kindName(ty: ColumnType) []const u8 {
 fn cellFits(ty: ColumnType, v: Value) bool {
     if (missing(v)) return true;
     return switch (ty) {
-        .int, .timestamp, .duration => v == .int,
-        .float => v == .float,
+        .int, .timestamp, .duration, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => v == .int or v == .uint,
+        .float, .float32 => v == .float,
         .text, .date, .categorical => v == .text,
         .bool => v == .bool,
         .decimal => v == .decimal,

@@ -117,6 +117,7 @@ fn sameCellBits(x: Value, y: Value) bool {
     return switch (x) {
         .null => true,
         .int => |v| v == y.int,
+        .uint => |v| v == y.uint,
         .float => |v| @as(u64, @bitCast(v)) == @as(u64, @bitCast(y.float)) or (std.math.isNan(v) and std.math.isNan(y.float)),
         .bool => |v| v == y.bool,
         .decimal => |v| v == y.decimal,
@@ -136,6 +137,7 @@ fn validNullness(c: df.ColumnData) ?bool {
         .categorical => |t| t.codes.valid == null,
         .list => |t| t.valid == null,
         .@"struct" => |t| t.valid == null,
+        inline .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => |t| t.valid == null,
     };
 }
 

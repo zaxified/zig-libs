@@ -14,6 +14,7 @@
 //! Use an arena: the frame's arrays may sit behind slice capacity (see `FrameBuilder`).
 
 const std = @import("std");
+const dtype = @import("dtype.zig");
 const csvstream = @import("csvstream");
 const value = @import("value.zig");
 const frame_mod = @import("frame.zig");
@@ -447,6 +448,14 @@ const NullSet = struct {
 
 /// `[+-]?[0-9]+` that fits an i64, in one pass over the bytes: what `isIntGrammar` and
 /// `std.fmt.parseInt(i64, t, 10)` give together (null for either failing).
+/// An integer's text as an `i128`: what `fastInt` reads, and past `maxInt(i64)` a u64
+/// (a UInt64 column's upper half). Null for anything else.
+fn parseWideInt(t: []const u8) ?i128 {
+    if (fastInt(t)) |x| return x;
+    if (!textio.isIntGrammar(t)) return null;
+    return std.fmt.parseInt(u64, t, 10) catch null;
+}
+
 fn fastInt(t: []const u8) ?i64 {
     var i: usize = 0;
     var neg = false;
@@ -577,10 +586,14 @@ pub fn parseAs(ty: ColumnType, s: []const u8) ?Value {
     switch (ty) {
         .text, .categorical => return .{ .text = s },
         .int => return .{ .int = fastInt(textio.trimBlank(s)) orelse return null },
-        .float => {
+        // A width: the integer's text, then its range (out of it: null, `error.BadValue`
+        // for the readers, as polars' `could not parse`).
+        .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => return dtype.fitInt(parseWideInt(textio.trimBlank(s)) orelse return null, ty),
+        .float, .float32 => {
             const t = textio.trimBlank(s);
             if (!textio.isFloatGrammar(t)) return null;
-            return .{ .float = textio.parseFloatToken(t) orelse return null };
+            const x = textio.parseFloatToken(t) orelse return null;
+            return .{ .float = if (ty == .float32) dtype.roundF32(x) else x };
         },
         .bool => return .{ .bool = parseBoolToken(s) orelse return null },
         .date => return if (isIsoDate(s)) .{ .text = s } else null,
@@ -1111,11 +1124,13 @@ const Acc = struct {
     fn setReady(s: *Acc, a: std.mem.Allocator, first_len: usize) std.mem.Allocator.Error!void {
         const n = s.cap;
         switch (s.ty) {
-            .int, .timestamp, .duration => {
+            // A width is stored as Int64 or (UInt64) its bit pattern, Float32 as f64; the
+            // reader's `encodeDeclared` narrows them (`frame.conform`).
+            .int, .timestamp, .duration, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => {
                 s.ints = try a.alloc(i64, n);
                 @memset(s.ints, 0);
             },
-            .float => {
+            .float, .float32 => {
                 s.floats = try a.alloc(f64, n);
                 @memset(s.floats, 0);
             },
@@ -1161,14 +1176,21 @@ const Acc = struct {
                 if (!s.ready) try s.setReady(a, 0);
                 s.ints[ri] = x;
             },
-            .float => {
+            .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => {
+                const x = parseWideInt(textio.trimBlank(c)) orelse return error.BadValue;
+                if (!dtype.fits(x, s.ty)) return error.BadValue;
+                if (!s.ready) try s.setReady(a, 0);
+                // UInt64's upper half as its bit pattern; `finish` reads the array as u64.
+                s.ints[ri] = if (s.ty == .uint64) @bitCast(@as(u64, @intCast(x))) else @intCast(x);
+            },
+            .float, .float32 => {
                 const t = textio.trimBlank(c);
                 const x = fastFloat(t) orelse blk: {
                     if (!textio.isFloatGrammar(t)) return error.BadValue;
                     break :blk textio.parseFloatToken(t) orelse return error.BadValue;
                 };
                 if (!s.ready) try s.setReady(a, 0);
-                s.floats[ri] = x;
+                s.floats[ri] = if (s.ty == .float32) dtype.roundF32(x) else x;
             },
             .bool => {
                 const x = parseBoolToken(c) orelse return error.BadValue;
@@ -1261,8 +1283,9 @@ const Acc = struct {
         if (s.nonnull == 0) return .nulls;
         const valid: ?[]const u64 = if (s.nonnull == rows) null else s.valid[0 .. rows / 64 + 1];
         return switch (s.ty) {
-            .int, .timestamp, .duration => .{ .int = .{ .values = s.ints[0..rows], .valid = valid } },
-            .float => .{ .float = .{ .values = s.floats[0..rows], .valid = valid } },
+            .int, .timestamp, .duration, .int8, .int16, .int32, .uint8, .uint16, .uint32 => .{ .int = .{ .values = s.ints[0..rows], .valid = valid } },
+            .uint64 => .{ .uint64 = .{ .values = @ptrCast(s.ints[0..rows]), .valid = valid } },
+            .float, .float32 => .{ .float = .{ .values = s.floats[0..rows], .valid = valid } },
             .bool => .{ .bool = .{ .values = s.bools[0..rows], .valid = valid } },
             .decimal => .{ .decimal = .{ .values = s.decs[0..rows], .valid = valid } },
             .text, .date, .categorical => .{ .text = .{ .offsets = s.offsets[0 .. rows + 1], .bytes = s.bytes.items, .valid = valid } },
@@ -1510,8 +1533,11 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
                     (if (sci) formatSci(&big, x, opts.float_precision) else formatPlain(&big, x, opts.float_precision))
                 else if (opts.float_precision) |p|
                     textio.formatFloatFixed(&big, x, @min(p, 22))
+                else if (c.type == .float32)
+                    textio.formatFloat32(nb[0..textio.max_float_len], @floatCast(x))
                 else
                     textio.formatFloat(nb[0..textio.max_float_len], x),
+                .uint => |u| std.fmt.bufPrint(&nb, "{d}", .{u}) catch unreachable, // 20 digits fit
                 .decimal => |r| textio.formatDecimal(&db, r),
                 .text => |t| blk: {
                     text_like = true;

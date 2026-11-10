@@ -255,7 +255,12 @@ fn concatTyped(a: std.mem.Allocator, frames: []const Frame, maps: []const fm.Nam
         const tag = std.meta.activeTag(col);
         // A dictionary-encoded piece goes by its cells; the result is encoded again.
         // Nested pieces go by their cells too: `columnFromCells` gathers their elements.
-        if (tag == .boxed or tag == .categorical or tag == .list or tag == .@"struct") return null;
+        // A width piece too: the cell path stacks it, the caller's `conform` narrows it.
+        switch (tag) {
+            .boxed, .categorical, .list, .@"struct" => return null,
+            .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => return null,
+            else => {},
+        }
         if (tag == .nulls or t.len == 0) continue;
         if (concatPresent(col, t.len) == 0) continue;
         if (kind) |k| {
@@ -270,6 +275,7 @@ fn concatTyped(a: std.mem.Allocator, frames: []const Frame, maps: []const fm.Nam
         .decimal => .{ .decimal = try concatPlain(i128, a, frames, maps, name, total) },
         .text => .{ .text = try concatText(a, frames, maps, name, total) },
         .nulls, .boxed, .categorical, .list, .@"struct" => unreachable,
+        .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => unreachable,
     };
 }
 

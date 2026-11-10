@@ -22,6 +22,7 @@ fn write(w: *std.Io.Writer, v: Value) std.Io.Writer.Error!void {
     switch (v) {
         .null => try w.writeAll("null"),
         .int => |i| try w.print("{d}", .{i}),
+        .uint => |u| try w.print("{d}", .{u}),
         .float => |x| try w.print("{d}", .{x}),
         .bool => |b| try w.writeAll(if (b) "true" else "false"),
         .decimal => |d| try w.print("d{d}", .{d}),

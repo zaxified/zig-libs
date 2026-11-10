@@ -15,6 +15,16 @@ pub const max_float_len = 32;
 /// or in scientific notation (`1e-05`, `1.5e+16`, two exponent digits at least) when the
 /// decimal exponent is below -4 or above 15. The caller handles NaN and infinities.
 pub fn formatFloat(buf: *[max_float_len]u8, f: f64) []const u8 {
+    return formatShortest(buf, f);
+}
+
+/// `formatFloat` for a Float32 cell: the shortest digits that read back as the same
+/// f32 (`0.1`, where the f64 it widens to would print `0.10000000149011612`).
+pub fn formatFloat32(buf: *[max_float_len]u8, f: f32) []const u8 {
+    return formatShortest(buf, f);
+}
+
+fn formatShortest(buf: *[max_float_len]u8, f: anytype) []const u8 {
     std.debug.assert(std.math.isFinite(f));
     var tmp: [48]u8 = undefined;
     // `{e}` prints the shortest round-trip digits: `1.2345e2`, `-5e-324`, `0e0`.

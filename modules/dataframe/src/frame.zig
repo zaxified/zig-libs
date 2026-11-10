@@ -14,6 +14,7 @@ const vm = @import("value.zig");
 const Value = vm.Value;
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
+const dtype = @import("dtype.zig");
 
 /// One typed column's cells. A null cell holds 0 in `values`, and `valid` has its
 /// bit clear; `valid == null` means no cell is null. NaN is a value, not a null.
@@ -148,6 +149,17 @@ pub const ColumnData = union(enum) {
     @"struct": *const StructColumn,
     /// Cells of more than one `Value` tag.
     boxed: []const Value,
+    /// The fixed-width numbers (wave W11): a column declared `.int8`..`.float32` holds one
+    /// of these (`conform`). Cells read as `Value.int` (`Value.uint` for a UInt64 above
+    /// `maxInt(i64)`) and `Value.float`, widened exactly.
+    int8: TypedColumn(i8),
+    int16: TypedColumn(i16),
+    int32: TypedColumn(i32),
+    uint8: TypedColumn(u8),
+    uint16: TypedColumn(u16),
+    uint32: TypedColumn(u32),
+    uint64: TypedColumn(u64),
+    float32: TypedColumn(f32),
 
     /// The rows the storage holds, or null for `.nulls` (no storage, any length). A hand-built
     /// column may hold fewer or more than its frame's `len`; `get` reads a missing row as null.
@@ -163,6 +175,7 @@ pub const ColumnData = union(enum) {
             .list => |x| x.offsets.len -| 1,
             .@"struct" => |x| x.len,
             .boxed => |x| x.len,
+            inline .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => |x| x.values.len,
         };
     }
 
@@ -180,9 +193,65 @@ pub const ColumnData = union(enum) {
             .list => |c| return if (c.at(row)) |l| .{ .list = l } else .null,
             .@"struct" => |c| return if (c.isValid(row)) .{ .record = .{ .fields = c, .row = row } } else .null,
             .boxed => |c| return if (row < c.len) c[row] else .null,
+            inline .int8, .int16, .int32, .uint8, .uint16, .uint32 => |c| return if (c.isValid(row)) .{ .int = c.values[row] } else .null,
+            .uint64 => |c| {
+                if (!c.isValid(row)) return .null;
+                const u = c.values[row];
+                return if (u <= std.math.maxInt(i64)) .{ .int = @intCast(u) } else .{ .uint = u };
+            },
+            .float32 => |c| return if (c.isValid(row)) .{ .float = c.values[row] } else .null,
         }
     }
 };
+
+/// `col` stored as the width type `ty` declares (`ColumnType.int8`..`.float32`): its own
+/// array, each cell converted exactly; a cell that is not a value of `ty` (out of range, a
+/// fraction, another kind) is null. Any other `ty`, or storage already of that kind, comes
+/// back as it is. The verbs range-check before they store, so the null here is a guard:
+/// whatever a hand-built or mixed column holds, the declared width and the array agree.
+pub fn conform(a: std.mem.Allocator, col: ColumnData, ty: ColumnType, len: usize) std.mem.Allocator.Error!ColumnData {
+    return switch (ty) {
+        inline .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => |t| blk: {
+            if (std.meta.activeTag(col) == @field(std.meta.Tag(ColumnData), @tagName(t))) break :blk col;
+            if (col == .nulls) break :blk col;
+            const T = switch (t) {
+                .float32 => f32,
+                else => dtype.IntOf(t),
+            };
+            const values = try a.alloc(T, len);
+            var valid: ?[]u64 = null;
+            for (values, 0..) |*o, ri| {
+                const v = col.get(ri);
+                const got: ?T = if (T == f32) (if (v.asFloat()) |f| @as(f32, @floatCast(f)) else null) else if (dtype.exactI128(v)) |x| std.math.cast(T, x) else null;
+                if (got) |g| {
+                    o.* = g;
+                    continue;
+                }
+                o.* = 0;
+                if (valid == null) {
+                    const bitmap = try a.alloc(u64, (len + 63) / 64);
+                    @memset(bitmap, ~@as(u64, 0));
+                    valid = bitmap;
+                }
+                valid.?[ri / 64] &= ~(@as(u64, 1) << @intCast(ri % 64));
+            }
+            break :blk @unionInit(ColumnData, @tagName(t), .{ .values = values, .valid = valid });
+        },
+        else => col,
+    };
+}
+
+/// Whether every column declared with a width type holds that width's array (or no
+/// storage): what `conform` makes true. For tests and the fuzz harness.
+pub fn widthsConform(f: Frame) bool {
+    for (f.columns, 0..) |c, ci| {
+        if (!dtype.isWidth(c.type)) continue;
+        const d = f.columnAt(ci);
+        if (d == .nulls) continue;
+        if (!std.mem.eql(u8, @tagName(std.meta.activeTag(d)), @tagName(c.type))) return false;
+    }
+    return true;
+}
 
 /// `v` with the storage it borrows copied into `a` (text and every nested level), so it
 /// outlives the column it was read from; a nested value at `depth` past
@@ -288,15 +357,16 @@ pub fn encodeCategorical(a: std.mem.Allocator, col: ColumnData, len: usize) erro
 }
 
 /// `f` with every column declared `.categorical` dictionary-encoded (the readers type a
-/// column, then store it as text). The frame's arrays are reused, its `data` replaced.
+/// column, then store it as text) and every width column in its own array (`conform`). The frame's arrays are reused, its `data` replaced.
 pub fn encodeDeclared(a: std.mem.Allocator, f: Frame) error{ OutOfMemory, TooLarge }!Frame {
     var any = false;
-    for (f.columns) |c| any = any or c.type == .categorical;
+    for (f.columns) |c| any = any or c.type == .categorical or dtype.isWidth(c.type);
     if (!any) return f;
     const data = try a.alloc(ColumnData, f.columns.len);
     for (data, f.columns, 0..) |*d, c, ci| {
         d.* = f.columnAt(ci);
         if (c.type == .categorical) d.* = try encodeCategorical(a, d.*, f.len);
+        d.* = try conform(a, d.*, c.type, f.len);
     }
     return .{ .columns = f.columns, .data = data, .len = f.len };
 }
@@ -665,7 +735,7 @@ pub const ColBuilder = struct {
             .bool => |x| return s.push(.bool, "bools", x),
             .decimal => |x| return s.push(.decimal, "decimals", x),
             .text => |x| return s.pushText(x),
-            .list, .record => return s.appendSlow(v),
+            .list, .record, .uint => return s.appendSlow(v),
         }
     }
 
@@ -679,8 +749,16 @@ pub const ColBuilder = struct {
     }
 
     fn appendSlow(s: *ColBuilder, v: Value) std.mem.Allocator.Error!void {
+        // A UInt64 above maxInt(i64) has no array of its own here: the column is boxed
+        // (`conform` gives a declared UInt64 its `u64` array).
+        if (v == .uint) {
+            if (s.kind != .boxed) try s.toBoxed();
+            try s.boxed.append(s.a, v);
+            s.len += 1;
+            return;
+        }
         const k: Kind = switch (v) {
-            .null => unreachable,
+            .null, .uint => unreachable,
             .int => .int,
             .float => .float,
             .bool => .bool,
@@ -813,11 +891,11 @@ pub const FrameBuilder = struct {
     }
 
     /// The frame shares the builder's arrays, so the builder must not be used after
-    /// this.
+    /// this. A column declared with a width type gets that width's array (`conform`).
     pub fn toOwned(self: *const FrameBuilder) std.mem.Allocator.Error!Frame {
         if (self.failed) return error.OutOfMemory;
         const data = try self.a.alloc(ColumnData, self.cols.len);
-        for (data, self.cols) |*d, *c| d.* = c.finish();
+        for (data, self.cols, self.columns) |*d, *c, col| d.* = try conform(self.a, c.finish(), col.type, self.len);
         return .{ .columns = self.columns, .data = data, .len = self.len };
     }
 };

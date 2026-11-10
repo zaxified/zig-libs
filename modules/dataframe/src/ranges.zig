@@ -184,6 +184,7 @@ pub fn repeatValue(a: std.mem.Allocator, name: []const u8, v: Value, n: usize, t
         .decimal => .decimal,
         .list => .list,
         .record => .@"struct",
+        .uint => .uint64,
         .float, .null => .float,
     };
     const f = try fromCells(a, name, if (v == .null) ty orelse own else own, cells, &.{});

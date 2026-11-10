@@ -24,6 +24,7 @@ pub fn same(x: Value, y: Value) bool {
     return switch (x) {
         .null => true,
         .int => |i| i == y.int,
+        .uint => |u| u == y.uint,
         .float => |v| v == y.float or @abs(v - y.float) <= 1e-12 * @max(@abs(v), 1),
         .bool => |b| b == y.bool,
         .decimal => |d| d == y.decimal,

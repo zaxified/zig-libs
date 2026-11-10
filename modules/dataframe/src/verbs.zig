@@ -1076,6 +1076,7 @@ fn takeAt(a: std.mem.Allocator, col: ColumnData, idx: []const u32, has_none: boo
         .float => |c| return .{ .float = try takeTyped(f64, a, c, idx, has_none) },
         .bool => |c| return .{ .bool = try takeTyped(bool, a, c, idx, has_none) },
         .decimal => |c| return .{ .decimal = try takeTyped(i128, a, c, idx, has_none) },
+        inline .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => |c, t| return @unionInit(ColumnData, @tagName(t), try takeTyped(std.meta.Elem(@TypeOf(c.values)), a, c, idx, has_none)),
         .text => |c| return .{ .text = try takeText(a, c, idx) },
         // The codes are taken, the dictionary shared: a value no row keeps stays in it,
         // as in pandas (unused categories) and polars.
@@ -1652,6 +1653,7 @@ fn appendValueKey(a: std.mem.Allocator, buf: *std.ArrayList(u8), v: Value) Error
         .null => try buf.append(a, 0),
         .bool => |b| try buf.append(a, if (b) '1' else '0'),
         .int => |i| try buf.print(a, "{d}", .{i}),
+        .uint => |u| try buf.print(a, "{d}", .{u}),
         .float => |x| try buf.print(a, "{d}", .{x}),
         .text => |t| try buf.appendSlice(a, t),
         .decimal => |r| try buf.print(a, "d{d}", .{r}), // raw i128, exact key

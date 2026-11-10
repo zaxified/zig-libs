@@ -245,8 +245,8 @@ fn writeDoc(w: *std.Io.Writer, f: Frame, orient: JsonOrient, o: *const JsonWrite
 
 fn tableType(t: ColumnType) []const u8 {
     return switch (t) {
-        .int => "integer",
-        .float, .decimal => "number",
+        .int, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => "integer",
+        .float, .float32, .decimal => "number",
         .bool => "boolean",
         .text, .categorical => "string",
         .date => "date",
@@ -330,6 +330,7 @@ fn writeValueO(w: *std.Io.Writer, v0: Value, col: ?value.Column, depth: u8, o: *
             var ub: [value.max_duration_len]u8 = undefined;
             try writeStringA(w, value.formatIsoDuration(&ub, i), o.force_ascii);
         } else try w.print("{d}", .{i}),
+        .uint => |u| try w.print("{d}", .{u}),
         .float => |x| if (std.math.isFinite(x)) {
             var fb: [textio.max_float_len]u8 = undefined;
             if (o.double_precision) |p| {
@@ -344,6 +345,8 @@ fn writeValueO(w: *std.Io.Writer, v0: Value, col: ?value.Column, depth: u8, o: *
                     try w.writeAll(t);
                     try w.writeAll(".0");
                 }
+            } else if (ty == .float32) {
+                try w.writeAll(textio.formatFloat32(&fb, @floatCast(x)));
             } else try w.writeAll(textio.formatFloat(&fb, x));
         } else try w.writeAll("null"),
         .decimal => |r| {

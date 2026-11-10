@@ -18,6 +18,7 @@
 //! row at the 1/2 load kept here). A seed never reaches a result: ids are first-seen.
 
 const std = @import("std");
+const dtype = @import("dtype.zig");
 const ds = @import("value.zig");
 const Value = ds.Value;
 
@@ -39,6 +40,7 @@ pub const Nan = enum {
 pub inline fn exactInt(v: Value) ?i64 {
     switch (v) {
         .int => |i| return i,
+        .uint => |u| return std.math.cast(i64, u), // a hand-built one at or below maxInt(i64)
         .float => |f| {
             // Bounds as in Value.floatToInt; `f == @trunc(f)` rejects NaN too.
             if (!(f >= -9223372036854775808.0 and f < 9223372036854775808.0)) return null;
@@ -51,6 +53,13 @@ pub inline fn exactInt(v: Value) ?i64 {
         },
         else => return null,
     }
+}
+
+/// The u64 above `maxInt(i64)` a numeric cell equals exactly, if any.
+fn exactAboveI64(v: Value) ?u64 {
+    const x = dtype.exactI128(v) orelse return null;
+    if (x <= std.math.maxInt(i64)) return null;
+    return std.math.cast(u64, x);
 }
 
 /// The f64 exactly equal to the decimal `raw / 10^12`, if there is one. In integers,
@@ -102,6 +111,13 @@ fn encodeAt(a: std.mem.Allocator, buf: *std.ArrayList(u8), v0: Value, nan: Nan, 
         try buf.appendSlice(a, std.mem.asBytes(&i));
         return;
     }
+    // A whole number in [2^63, 2^64) — a UInt64 cell, or a float or decimal equal to one —
+    // keys as that u64, so the three meet as `Value.order` says they are equal.
+    if (exactAboveI64(v)) |u| {
+        try buf.append(a, 'u');
+        try buf.appendSlice(a, std.mem.asBytes(&u));
+        return;
+    }
     switch (v) {
         .null => try buf.append(a, '0'),
         .bool => |b| try buf.appendSlice(a, if (b) "b1" else "b0"),
@@ -129,7 +145,7 @@ fn encodeAt(a: std.mem.Allocator, buf: *std.ArrayList(u8), v0: Value, nan: Nan, 
                 try buf.appendSlice(a, std.mem.asBytes(&r));
             }
         },
-        .int => unreachable, // exactInt took it
+        .int, .uint => unreachable, // exactInt or exactAboveI64 took it
         .list, .record => unreachable, // the switch above took them
     }
 }

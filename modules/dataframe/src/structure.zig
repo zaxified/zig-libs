@@ -469,7 +469,7 @@ fn dataBytes(col: ColumnData, n: usize, depth: u8) usize {
     if (depth >= vm.max_nesting_depth) return 0;
     return switch (col) {
         .nulls => 0,
-        inline .int, .float, .bool, .decimal => |c| @min(c.values.len, n) * @sizeOf(std.meta.Elem(@TypeOf(c.values))) + bitmapBytes(c.valid, n),
+        inline .int, .float, .bool, .decimal, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => |c| @min(c.values.len, n) * @sizeOf(std.meta.Elem(@TypeOf(c.values))) + bitmapBytes(c.valid, n),
         .text => |c| blk: {
             const rows = @min(n, c.offsets.len -| 1);
             const span = if (rows == 0) 0 else c.offsets[rows] -| c.offsets[0];

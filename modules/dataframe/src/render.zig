@@ -69,7 +69,8 @@ fn cellText(a: std.mem.Allocator, v: Value, col: value.Column, null_text: []cons
             value.formatDuration(&ub, i)
         else
             std.fmt.bufPrint(&nb, "{d}", .{i}) catch unreachable,
-        .float => |x| if (std.math.isNan(x)) "NaN" else if (std.math.isInf(x)) (if (x > 0) "inf" else "-inf") else textio.formatFloat(nb[0..textio.max_float_len], x),
+        .float => |x| if (std.math.isNan(x)) "NaN" else if (std.math.isInf(x)) (if (x > 0) "inf" else "-inf") else if (ty == .float32) textio.formatFloat32(nb[0..textio.max_float_len], @floatCast(x)) else textio.formatFloat(nb[0..textio.max_float_len], x),
+        .uint => |u| std.fmt.bufPrint(&nb, "{d}", .{u}) catch unreachable, // 20 digits fit
         .decimal => |r| textio.formatDecimal(&db, r),
         .text => |t| t,
         // A nested cell shows as its JSON (polars prints `[1, 2]` and `{1,"a"}`; the JSON
@@ -350,6 +351,14 @@ fn glimpseType(t: value.Column) []const u8 {
         .duration => "<duration[μs]>",
         .list => "<list>",
         .@"struct" => "<struct>",
+        .int8 => "<i8>",
+        .int16 => "<i16>",
+        .int32 => "<i32>",
+        .uint8 => "<u8>",
+        .uint16 => "<u16>",
+        .uint32 => "<u32>",
+        .uint64 => "<u64>",
+        .float32 => "<f32>",
     };
 }
 

@@ -542,7 +542,7 @@ pub fn aggOutTypeTemporal(columns: []const ds.Column, src_idx: usize, func: AggF
 
 pub fn kindOf(v: Value) enum { number, text, bool, list, record, other } {
     return switch (v) {
-        .int, .float, .decimal => .number,
+        .int, .uint, .float, .decimal => .number,
         .text => .text,
         .bool => .bool,
         .list => .list,
