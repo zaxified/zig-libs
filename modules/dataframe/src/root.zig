@@ -623,6 +623,7 @@ test {
     _ = @import("sweep_s1_test.zig");
     _ = @import("sweep_s2b_test.zig");
     _ = @import("sweep_s2_test.zig");
+    _ = @import("sweep_w11_test.zig");
     _ = @import("sweep_s2a_test.zig");
     _ = @import("fuzz.zig");
     _ = @import("fuzz_s2_test.zig");

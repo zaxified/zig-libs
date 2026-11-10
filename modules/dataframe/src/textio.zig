@@ -20,7 +20,11 @@ pub fn formatFloat(buf: *[max_float_len]u8, f: f64) []const u8 {
 
 /// `formatFloat` for a Float32 cell: the shortest digits that read back as the same
 /// f32 (`0.1`, where the f64 it widens to would print `0.10000000149011612`).
+/// A value past f32's range (a hand-built column declared Float32 may hold a wider f64) is
+/// `inf`/`-inf` as the cast makes it, and NaN `NaN`: the caller's finite check was on the f64.
 pub fn formatFloat32(buf: *[max_float_len]u8, f: f32) []const u8 {
+    if (std.math.isNan(f)) return "NaN";
+    if (std.math.isInf(f)) return if (f > 0) "inf" else "-inf";
     return formatShortest(buf, f);
 }
 

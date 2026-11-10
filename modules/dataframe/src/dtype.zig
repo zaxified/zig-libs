@@ -202,16 +202,23 @@ pub fn wrapInt(x: i128, t: ColumnType) Value {
     };
 }
 
+/// No width type holds a magnitude past this (UInt64's top is just below it), so a cell
+/// beyond it is "not an integer of any width" and the width code never sees one: its
+/// `i128` arithmetic (`-x`, `x - y`, `@divFloor(x, -1)`) cannot then overflow (sweep W11-2).
+const exact_limit: i128 = 1 << 64;
+
 /// The integer a numeric cell holds exactly as an `i128`: `.int`, `.uint`; a float or
-/// decimal only when it is whole and within ±2^127 (callers that truncate use `truncInt`).
+/// decimal only when it is whole and within ±2^64, past which no width type has a value
+/// (callers that truncate use `truncInt`).
 pub fn exactI128(v: Value) ?i128 {
-    return switch (v) {
+    const x: i128 = switch (v) {
         .int => |i| i,
         .uint => |u| u,
-        .float => |f| if (f == @trunc(f)) Value.floatToInt(i128, f) else null,
-        .decimal => |r| if (@rem(r, vm.decimal_scale) == 0) @divExact(r, vm.decimal_scale) else null,
-        else => null,
+        .float => |f| if (f == @trunc(f)) Value.floatToInt(i128, f) orelse return null else return null,
+        .decimal => |r| if (@rem(r, vm.decimal_scale) == 0) @divExact(r, vm.decimal_scale) else return null,
+        else => return null,
     };
+    return if (x > exact_limit or x < -exact_limit) null else x;
 }
 
 /// A numeric cell truncated toward zero to an `i128` (pandas' and polars' float → int

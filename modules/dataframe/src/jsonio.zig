@@ -346,7 +346,9 @@ fn writeValueO(w: *std.Io.Writer, v0: Value, col: ?value.Column, depth: u8, o: *
                     try w.writeAll(".0");
                 }
             } else if (ty == .float32) {
-                try w.writeAll(textio.formatFloat32(&fb, @floatCast(x)));
+                // A hand-built Float32 column may hold an f64 past f32's range: null, as a non-finite is.
+                const x32: f32 = @floatCast(x);
+                try w.writeAll(if (std.math.isFinite(x32)) textio.formatFloat32(&fb, x32) else "null");
             } else try w.writeAll(textio.formatFloat(&fb, x));
         } else try w.writeAll("null"),
         .decimal => |r| {

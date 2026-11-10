@@ -3084,6 +3084,8 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
     var any_bool = false;
     var any_list = false;
     var any_record = false;
+    var any_uint = false; // a UInt64 above Int64's top among the cells
+    var any_neg_int = false;
     var bud = Budget.init(a);
     var row = RowScratch.init(&bud);
     defer row.deinit();
@@ -3092,7 +3094,14 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
         if (as.type) |ty| {
             if (!keys.isMissing(v)) v = castValue(bud.allocator(), v, ty) catch |e| return if (e == error.OutOfMemory and bud.hit) error.TooLarge else e;
         } else switch (v) {
-            .int, .uint => any_int = true,
+            .int => |i| {
+                any_int = true;
+                any_neg_int = any_neg_int or i < 0;
+            },
+            .uint => {
+                any_int = true;
+                any_uint = true;
+            },
             .float => |x| any_float = any_float or !std.math.isNan(x),
             .decimal => any_decimal = true,
             .text => any_text = true,
@@ -3146,6 +3155,17 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
             const promoted: Value = c.cast(ty) orelse .null;
             c.* = promoted;
         }
+    }
+    // An Int64 column cannot hold a cell above Int64's top (`max(i8, u64)`): UInt64 when no cell is
+    // negative, else Float64 (D5: Int64 meets UInt64 in Float64) (sweep W11-2).
+    if (as.type == null and ty == .int and any_uint) {
+        if (any_neg_int) {
+            ty = .float;
+            for (vals) |*c| if (!keys.isMissing(c.*)) {
+                const promoted: Value = c.cast(.float) orelse .null;
+                c.* = promoted;
+            };
+        } else ty = .uint64;
     }
     cols[at] = .{ .name = as.out, .type = ty };
     const data = try a.alloc(ColumnData, width);

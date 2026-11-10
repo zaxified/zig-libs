@@ -745,19 +745,21 @@ fn interleave(a: std.mem.Allocator, f: Frame, vals: []const usize, total: usize,
     const cols = try a.alloc(ColumnData, vals.len);
     defer a.free(cols);
     for (cols, vals) |*c, vi| c.* = colOf(f, vi);
+    // A woven array is conformed to the declared type: a hand-built width column whose storage is
+    // another kind must not make the melted column disagree with its declaration.
     if (typed and vals.len > 0) {
-        if (try weave(f64, "float", a, cols, f.len, total)) |r| return r;
-        if (try weave(i64, "int", a, cols, f.len, total)) |r| return r;
-        if (try weave(bool, "bool", a, cols, f.len, total)) |r| return r;
-        if (try weave(i128, "decimal", a, cols, f.len, total)) |r| return r;
-        if (try weave(i8, "int8", a, cols, f.len, total)) |r| return r;
-        if (try weave(i16, "int16", a, cols, f.len, total)) |r| return r;
-        if (try weave(i32, "int32", a, cols, f.len, total)) |r| return r;
-        if (try weave(u8, "uint8", a, cols, f.len, total)) |r| return r;
-        if (try weave(u16, "uint16", a, cols, f.len, total)) |r| return r;
-        if (try weave(u32, "uint32", a, cols, f.len, total)) |r| return r;
-        if (try weave(u64, "uint64", a, cols, f.len, total)) |r| return r;
-        if (try weave(f32, "float32", a, cols, f.len, total)) |r| return r;
+        if (try weave(f64, "float", a, cols, f.len, total)) |r| return fm.conform(a, r, ty, total);
+        if (try weave(i64, "int", a, cols, f.len, total)) |r| return fm.conform(a, r, ty, total);
+        if (try weave(bool, "bool", a, cols, f.len, total)) |r| return fm.conform(a, r, ty, total);
+        if (try weave(i128, "decimal", a, cols, f.len, total)) |r| return fm.conform(a, r, ty, total);
+        if (try weave(i8, "int8", a, cols, f.len, total)) |r| return fm.conform(a, r, ty, total);
+        if (try weave(i16, "int16", a, cols, f.len, total)) |r| return fm.conform(a, r, ty, total);
+        if (try weave(i32, "int32", a, cols, f.len, total)) |r| return fm.conform(a, r, ty, total);
+        if (try weave(u8, "uint8", a, cols, f.len, total)) |r| return fm.conform(a, r, ty, total);
+        if (try weave(u16, "uint16", a, cols, f.len, total)) |r| return fm.conform(a, r, ty, total);
+        if (try weave(u32, "uint32", a, cols, f.len, total)) |r| return fm.conform(a, r, ty, total);
+        if (try weave(u64, "uint64", a, cols, f.len, total)) |r| return fm.conform(a, r, ty, total);
+        if (try weave(f32, "float32", a, cols, f.len, total)) |r| return fm.conform(a, r, ty, total);
     }
     const out = try a.alloc(Value, total);
     for (cols, 0..) |c, k| {
@@ -784,8 +786,19 @@ fn meltedType(f: Frame, vals: []const usize) ColumnType {
     var any_width = dtype.isWidth(ty);
     for (vals[1..]) |vi| any_width = any_width or dtype.isWidth(f.columns[vi].type);
     if (!any_width) return ty;
-    for (vals[1..]) |vi| ty = dtype.supertype(ty, f.columns[vi].type) orelse return f.columns[vals[0]].type;
+    // No supertype (a text, a bool ... among the numbers): the first column's type as before W11, but the
+    // Int64/Float64 of a width, whose array would drop the cells that are not numbers (sweep W11-9).
+    for (vals[1..]) |vi| ty = dtype.supertype(ty, f.columns[vi].type) orelse return widthless(f.columns[vals[0]].type);
     return ty;
+}
+
+/// The Int64 / Float64 of a width type (its array would drop cells that are not of the width), any
+/// other type as it is: what a column declares when cells of several kinds meet in it (sweep W11-9).
+fn widthless(t: ColumnType) ColumnType {
+    return switch (t) {
+        .float32 => .float,
+        else => if (dtype.isWidth(t)) .int else t,
+    };
 }
 
 fn unpivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec, typed: bool) Error!Frame {
@@ -1282,7 +1295,7 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec_in: sp.JoinSpe
             if (dtype.isWidth(cols[l].type)) {
                 for (out) |v| {
                     if (!cellFitsType(v, cols[l].type)) {
-                        cols[l].type = dtype.supertype(cols[l].type, right.columns[m].type) orelse cols[l].type;
+                        cols[l].type = dtype.supertype(cols[l].type, right.columns[m].type) orelse widthless(cols[l].type); // no supertype (a text key): cells keep their kinds
                         break;
                     }
                 }

@@ -41,6 +41,7 @@ pub inline fn truthy(v: Value) ?bool {
     return switch (v) {
         .bool => |b| b,
         .int => |i| i != 0,
+        .uint => |u| u != 0,
         .float => |f| f != 0,
         .decimal => |d| d != 0,
         else => null,
@@ -214,6 +215,7 @@ pub fn accumulate(
                 const term: ?i128 = switch (if (fxRate(r, rate_idx) == 1) r[ci] else v) {
                     .decimal => |d| d,
                     .int => |i| @as(i128, i) * ds.decimal_scale, // |i| < 2^63, scale < 2^40: fits
+                    .uint => |u| @as(i128, u) * ds.decimal_scale, // u < 2^64: fits
                     .float => if (v.cast(.decimal)) |c| c.decimal else null,
                     else => null,
                 };
@@ -501,10 +503,15 @@ pub fn aggregateCellsWithin(groups: usize, aggs: usize) Error!void {
     if (cells > spec.max_aggregate_cells) return error.TooLarge;
 }
 
+/// An integer or float type, the widths included (the fx conversion applies to all of them).
+fn isNumericType(t: ds.ColumnType) bool {
+    return @import("dtype.zig").isNumeric(t);
+}
+
 pub fn aggOutType(columns: []const ds.Column, src_idx: usize, func: AggFn, fx: bool) ColumnType {
     return switch (func) {
         // fx writes a converted cell as a float, whatever the source's numeric kind.
-        .min, .max, .first, .last, .mode => if (fx and (columns[src_idx].type == .int or columns[src_idx].type == .decimal))
+        .min, .max, .first, .last, .mode => if (fx and (columns[src_idx].type == .decimal or isNumericType(columns[src_idx].type)))
             .float
         else
             columns[src_idx].type,
