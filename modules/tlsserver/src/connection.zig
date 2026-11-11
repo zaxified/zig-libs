@@ -688,6 +688,8 @@ const GuardRig = struct {
     /// Whether the guard is held, and sends made without it (`checked`).
     held: bool = false,
     unguarded_sends: usize = 0,
+    /// With `checked`: octets the connection's output has flushed to the socket.
+    flushed: usize = 0,
     /// With `checked`: the connection's output, which forwards to `sw` and
     /// counts every send made without the guard held.
     checked: std.Io.Writer = undefined,
@@ -720,6 +722,7 @@ const GuardRig = struct {
         g.sr = stream.reader(io, g.in_buf);
         g.held = false;
         g.unguarded_sends = 0;
+        g.flushed = 0;
         if (checked) {
             g.sw = stream.writer(io, &g.fwd_buf);
             g.checked = .{ .vtable = &.{ .drain = checkedDrain }, .buffer = g.out_buf, .end = 0 };
@@ -767,6 +770,7 @@ const GuardRig = struct {
         const g: *GuardRig = @alignCast(@fieldParentPtr("checked", w));
         if (!g.held) g.unguarded_sends += 1;
         const out = &g.sw.interface;
+        const buffered = w.buffered().len;
         try out.writeAll(w.buffered());
         w.end = 0;
         var n: usize = 0;
@@ -776,6 +780,7 @@ const GuardRig = struct {
             n += d.len * times;
         }
         try out.flush();
+        g.flushed += buffered + n;
         return n;
     }
 
@@ -1011,10 +1016,11 @@ test "an offloaded key signs through Connection.signer, after the flight so far 
 
         fn sign(ctx: ?*anyopaque, scheme: u16, message: []const u8, out: []u8) error{SigningFailed}![]const u8 {
             const s: *@This() = @ptrCast(@alignCast(ctx.?));
-            // The ServerHello through the Certificate are on the socket.
-            var avail: c_int = 0;
-            _ = std.os.linux.ioctl(s.rig.fds[1], std.os.linux.T.FIONREAD, @intFromPtr(&avail));
-            if (avail == 0 or s.rig.conn.server.pendingOutput().len != 0) return error.SigningFailed;
+            // The ServerHello through the Certificate went out: flushed to the
+            // socket, nothing left pending. Counted at the rig's output, not by
+            // FIONREAD on the peer's end: the peer thread reads concurrently and
+            // may already have drained it (arm64 CI, 2026-11-11).
+            if (s.rig.flushed == 0 or s.rig.conn.server.pendingOutput().len != 0) return error.SigningFailed;
             s.signed += 1;
             const tls13 = @import("tls13");
             return tls13.certverify.signContent(@fromBackingInt(scheme), .{ .ecdsa_p256 = &s.rig.p256 }, message, null, out) catch error.SigningFailed;
