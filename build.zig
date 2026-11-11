@@ -988,8 +988,8 @@ pub fn build(b: *std.Build) void {
         // now also carries a `run-example-<name>` step (below), and a run step
         // forces the artifact to be emitted and LINKED -- so this compile no
         // longer passes `-fno-emit-bin`, and consumer-BINARY facts that used to
-        // sit outside it (link-time reach: a MIPS `PC16` fixup overflows at
-        // ±128 KB) are inside it now. What is still outside is what a module
+        // sit outside it (unresolved symbols, link-time reach limits) are
+        // inside it now, for the host target. What is still outside is what a module
         // DRAGS IN by size (`http`'s TLS-vs-plaintext split was 334 KB), which
         // needs a measured binary; `scripts/checks/check-http-sizeprobe.sh` is the one
         // place this repository does that.

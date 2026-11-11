@@ -32,6 +32,11 @@ directory.
   the destination type; 0.17.1 fixes it, and the collection's 0.17.0 workarounds are gone. Since
   `minimum_zig_version` is advisory (Zig reads it nowhere), `build.zig` refuses an older compiler
   with a compile error. Tag `2026-11-10` is the last one built for 0.17.0.
+- **README drops the MIPS `out of range PC16 fixup` consumer gotcha (2026-11-11).** It was a Zig
+  0.16 LLVM failure, not a text-size threshold: the consumer that hit it (a BE-MIPS32
+  `mips32+soft_float` ReleaseSmall agent) links on 0.17.1 with its `noinline` workaround removed,
+  and `chachapoly`'s mips32 ReleaseSafe test build, which failed the same way on 0.16, passed on
+  0.17.0. The portability table keeps the "compiles, not links" caveat without the example.
 - **Docs follow the 0.17.1 move (2026-11-11).** The root README states Zig 0.17.1 (status line,
   requirement, which older tags build with 0.17.0 / 0.16) and carries Zig-version, release and
   licence badges; the example apps' READMEs ask for 0.17.1 like their `init.sh`; the vendored

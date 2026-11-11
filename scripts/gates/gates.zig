@@ -4932,11 +4932,9 @@ fn renderPortableTable(
             "a claim currently broken and tracked — and this table exists so the two are never " ++
             "shown as the same thing.\n\n" ++
             "**A row states that the module's tests and its whole public surface compile for " ++
-            "that target. It does not state that a binary containing the module links for it.** Link-time reach limits are a property " ++
-            "of the consuming binary's total text size, not of any single module: on 32-bit MIPS " ++
-            "a branch's `PC16` fixup reaches ±128 KB, and a large enough consumer overruns it no " ++
-            "matter which modules it picked. What that looks like, and what to do about it, is " ++
-            "under *Consumer gotchas* below.\n\n",
+            "that target. It does not state that a binary containing the module links for it.** " ++
+            "Nothing here emits or links a binary for these targets, so a link-time failure " ++
+            "in the consuming binary is outside what a row can show.\n\n",
         .{ module_list.len, module_list.len, rows.items.len, n_pairs, n_pass, n_fail },
     );
 
