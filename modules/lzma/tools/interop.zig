@@ -34,7 +34,11 @@ const std = @import("std");
 const lzma = @import("lzma");
 const corpus = lzma.interop_corpus;
 
-const scratch = ".zig-cache/lzma-interop";
+const scratch_root = ".zig-cache/lzma-interop";
+/// Shards run at once (2026-11-11): the checks are liblzma and our coder doing real
+/// work, single-threaded, ~300 s in one process; independent units split by index.
+/// CPU-bound, so one per CPU, at most 8 (each peaks at ~0.7 GB with its oracle).
+const max_shards = 8;
 const lzref = ".zig-cache/lzma-oracle/lzref";
 const testdata = "modules/lzma/src/testdata";
 
@@ -49,6 +53,22 @@ const Ctx = struct {
     checks: usize = 0,
     quick: bool = false,
     goldens: ?*std.ArrayList(Golden) = null,
+    /// This process's scratch directory and the reference programs' file paths in it.
+    scratch: []const u8,
+    paths: Paths,
+    shard: usize = 0,
+    nshards: usize = 1,
+    unit: usize = 0,
+
+    const Paths = struct { in: []const u8, ref: []const u8, vin: []const u8, vout: []const u8, pyin: []const u8, pyout: []const u8, xzin: []const u8 };
+
+    /// Whether the next unit of work is this shard's. Every caller asks once per
+    /// unit, in the same order in every shard, so the shards cover each unit once.
+    fn mine(c: *Ctx) bool {
+        const k = c.unit;
+        c.unit += 1;
+        return k % c.nshards == c.shard;
+    }
 
     fn fail(c: *Ctx, comptime fmt: []const u8, args: anytype) void {
         c.failures += 1;
@@ -91,7 +111,7 @@ const Ctx = struct {
     /// liblzma's compression of `plain`. `fmt` is xz | alone | raw1 | raw2.
     fn refEnc(c: *Ctx, plain: []const u8, fmt: []const u8, spec: []const u8, check: []const u8) ![]u8 {
         try c.put("in.bin", plain);
-        try c.run(&.{ lzref, "enc", fmt, spec, check, scratch ++ "/in.bin", scratch ++ "/ref.out" });
+        try c.run(&.{ lzref, "enc", fmt, spec, check, c.paths.in, c.paths.ref });
         return c.get("ref.out");
     }
 
@@ -99,7 +119,7 @@ const Ctx = struct {
     const Verdict = struct { ok: bool, len: usize, out: []u8 };
     fn refDec(c: *Ctx, fmt: []const u8, stream: []const u8) !Verdict {
         try c.put("v.in", stream);
-        const r = try c.exec(&.{ lzref, "dec", fmt, scratch ++ "/v.in", scratch ++ "/v.out" });
+        const r = try c.exec(&.{ lzref, "dec", fmt, c.paths.vin, c.paths.vout });
         defer c.gpa.free(r.stdout);
         defer c.gpa.free(r.stderr);
         if (!okExit(r)) return error.ReferenceFailed;
@@ -114,7 +134,7 @@ const Ctx = struct {
         try c.put("v.in", stream);
         const hex = std.fmt.bytesToHex(props, .lower);
         var sb: [24]u8 = undefined;
-        const r = try c.exec(&.{ lzref, "raw1", &hex, try std.mem.print(&sb, "{d}", .{size}), if (eopm) "1" else "0", scratch ++ "/v.in", scratch ++ "/v.out" });
+        const r = try c.exec(&.{ lzref, "raw1", &hex, try std.mem.print(&sb, "{d}", .{size}), if (eopm) "1" else "0", c.paths.vin, c.paths.vout });
         defer c.gpa.free(r.stdout);
         defer c.gpa.free(r.stderr);
         if (!okExit(r)) return error.ReferenceFailed;
@@ -127,7 +147,7 @@ const Ctx = struct {
         try c.put("py.in", plain);
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(c.gpa);
-        try argv.appendSlice(c.gpa, &.{ "python3", "-I", "-c", code, scratch ++ "/py.in", scratch ++ "/py.out" });
+        try argv.appendSlice(c.gpa, &.{ "python3", "-I", "-c", code, c.paths.pyin, c.paths.pyout });
         try argv.appendSlice(c.gpa, extra);
         const r = try c.exec(argv.items);
         defer c.gpa.free(r.stdout);
@@ -142,7 +162,7 @@ const Ctx = struct {
         defer argv.deinit(c.gpa);
         try argv.appendSlice(c.gpa, &.{ "xz", "-c", "-k" });
         try argv.appendSlice(c.gpa, args);
-        try argv.append(c.gpa, scratch ++ "/xz.in");
+        try argv.append(c.gpa, c.paths.xzin);
         const r = try c.exec(argv.items);
         defer c.gpa.free(r.stderr);
         if (!okExit(r)) {
@@ -187,9 +207,11 @@ fn decodeFromLiblzma(c: *Ctx) !void {
         defer c.gpa.free(plain);
         for (presetsFor(shape.len, c.quick)) |spec| {
             const preset = spec[0] - '0';
-            const xz = try c.refEnc(plain, "xz", spec, checks[n % checks.len]);
-            defer c.gpa.free(xz);
+            const check = checks[n % checks.len];
             n += 1;
+            if (!c.mine()) continue;
+            const xz = try c.refEnc(plain, "xz", spec, check);
+            defer c.gpa.free(xz);
             expectSame(c, "xz", shape.name, lzma.decompress(c.gpa, xz, .xz, dec_opts), plain);
 
             const alone = try c.refEnc(plain, "alone", spec, "");
@@ -226,6 +248,7 @@ fn decodeFromPython(c: *Ctx) !void {
     for (names) |name| {
         const shape = corpus.find(name).?;
         if (c.quick and shape.len > 500_000) continue;
+        if (!c.mine()) continue;
         const plain = try corpus.generate(c.gpa, shape);
         defer c.gpa.free(plain);
         for (check_ids, 0..) |chk, i| {
@@ -272,6 +295,7 @@ fn decodeFromPython(c: *Ctx) !void {
 
 fn decodeFromXzProgram(c: *Ctx) !void {
     for ([_][]const u8{ "text-1m", "mixed-200k", "records-400k", "random-300k" }) |name| {
+        if (!c.mine()) continue;
         const plain = try corpus.generate(c.gpa, corpus.find(name).?);
         defer c.gpa.free(plain);
         const variants = [_][]const []const u8{
@@ -327,6 +351,7 @@ fn verdictAgrees(c: *Ctx, what: []const u8, ours: anyerror![]u8, v: Ctx.Verdict,
 }
 
 fn structureChecks(c: *Ctx) !void {
+    if (!c.mine()) return;
     const plain = try corpus.generate(c.gpa, corpus.find("text-small").?);
     defer c.gpa.free(plain);
     const za = try c.refEnc(plain, "xz", "6", "crc64");
@@ -439,6 +464,7 @@ fn encoderParity(c: *Ctx) !void {
         const list: []const []const u8 = if (big) &.{ "1", "6" } else if (shape.len > 200_000) &presets_small else &presets_all;
         for (list, 0..) |spec, i| {
             const check = checks[(i + shape.len) % checks.len];
+            if (!c.mine()) continue;
             const golden = shape.len <= 200_000 and (inList(&golden_presets, spec) or (shape.len <= 20_000 and inList(&golden_small, spec)) or (shape.len <= 5000 and std.mem.eql(u8, spec, "9")));
             try parity(c, shape.name, plain, "xz", spec, check, golden);
             if (i % 3 == 0) try parity(c, shape.name, plain, "alone", spec, "", golden and shape.len <= 20_000 and (std.mem.eql(u8, spec, "1") or std.mem.eql(u8, spec, "6")));
@@ -446,7 +472,7 @@ fn encoderParity(c: *Ctx) !void {
             if (i % 5 == 2) try parity(c, shape.name, plain, "raw1", spec, "", golden and shape.len <= 20_000 and (std.mem.eql(u8, spec, "1") or std.mem.eql(u8, spec, "6")));
         }
         if (!big and shape.len <= 500_000) {
-            for (custom) |spec| try parity(c, shape.name, plain, "xz", spec, "crc64", shape.len <= 20_000);
+            for (custom) |spec| if (c.mine()) try parity(c, shape.name, plain, "xz", spec, "crc64", shape.len <= 20_000);
         }
     }
 }
@@ -502,8 +528,6 @@ fn writeGoldens(c: *Ctx, goldens: []const Golden) !void {
 
 fn mutantChecks(c: *Ctx) !void {
     const names = [_][]const u8{ "text-9999", "random-small", "runs-5", "all-bytes", "mixed-small" };
-    var prng: std.Random.DefaultPrng = .init(0x1a2b);
-    const rnd = prng.random();
     const per: usize = if (c.quick) 40 else 400;
     var tol: usize = 0;
     var agree_ok: usize = 0;
@@ -520,6 +544,12 @@ fn mutantChecks(c: *Ctx) !void {
         const plain = try corpus.generate(c.gpa, shape);
         defer c.gpa.free(plain);
         for (bases) |b| {
+            // Its own generator per unit, so a shard draws the same mutants for it
+            // whichever other units it skips.
+            const seed = 0x1a2b +% c.unit;
+            if (!c.mine()) continue;
+            var prng: std.Random.DefaultPrng = .init(seed);
+            const rnd = prng.random();
             const base = try c.refEnc(plain, b.fmt, b.spec, b.check);
             defer c.gpa.free(base);
             for (0..per) |_| {
@@ -549,7 +579,7 @@ fn mutantChecks(c: *Ctx) !void {
                 _ = verdictAgrees(c, name, lzma.decompress(c.gpa, s, fmt, dec_opts), v, &tol);
                 if (c.failures != before) {
                     try c.put("mutant.bin", s);
-                    std.debug.print("  (mutant of {s} {s}, saved as {s}/mutant.bin)\n", .{ name, b.fmt, scratch });
+                    std.debug.print("  (mutant of {s} {s}, saved as {s}/mutant.bin)\n", .{ name, b.fmt, c.scratch });
                 } else if (v.ok) agree_ok += 1 else agree_err += 1;
             }
         }
@@ -569,23 +599,58 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var quick = false;
     var decoder_only = false;
     var encoder_only = false;
+    var shard: ?usize = null;
+    var nshards: usize = @min(max_shards, std.Thread.getCpuCount() catch 1);
+    var pass: std.ArrayList([]const u8) = .empty;
+    defer pass.deinit(gpa);
     var args = init.args.iterate();
-    _ = args.skip();
+    const self_exe = args.next() orelse return 2;
     while (args.next()) |a| {
-        if (std.mem.eql(u8, a, "--capture")) capture = true else if (std.mem.eql(u8, a, "--quick")) quick = true else if (std.mem.eql(u8, a, "--decoder")) decoder_only = true else if (std.mem.eql(u8, a, "--encoder")) encoder_only = true else {
-            std.debug.print("usage: interop-lzma [--capture] [--quick] [--decoder]\n", .{});
+        if (std.mem.eql(u8, a, "--capture")) capture = true else if (std.mem.eql(u8, a, "--quick")) quick = true else if (std.mem.eql(u8, a, "--decoder")) decoder_only = true else if (std.mem.eql(u8, a, "--encoder")) encoder_only = true else if (std.mem.eql(u8, a, "--shard")) {
+            // internal: `--shard K/N`, what the parent below passes its children
+            const v = args.next() orelse return 2;
+            const slash = std.mem.indexOfScalar(u8, v, '/') orelse return 2;
+            shard = std.fmt.parseInt(usize, v[0..slash], 10) catch return 2;
+            nshards = std.fmt.parseInt(usize, v[slash + 1 ..], 10) catch return 2;
+            if (nshards == 0 or shard.? >= nshards) return 2;
+            continue;
+        } else {
+            std.debug.print("usage: interop-lzma [--capture] [--quick] [--decoder] [--encoder]\n", .{});
             return 2;
         }
+        try pass.append(gpa, a);
     }
-
-    var dir = try std.Io.Dir.cwd().createDirPathOpen(io, scratch, .{});
-    defer dir.close(io);
-    var c: Ctx = .{ .gpa = gpa, .io = io, .dir = dir, .quick = quick };
 
     if (std.Io.Dir.cwd().access(io, lzref, .{})) {} else |_| {
         std.debug.print("building the liblzma oracle ...\n", .{});
-        try c.run(&.{ "bash", "modules/lzma/tools/build-oracle.sh" });
+        const r = std.process.run(gpa, io, .{ .argv = &.{ "bash", "modules/lzma/tools/build-oracle.sh" } }) catch return error.NoReference;
+        defer gpa.free(r.stdout);
+        defer gpa.free(r.stderr);
+        if (!r.term.success()) {
+            std.debug.print("build-oracle.sh failed: {s}\n", .{r.stderr});
+            return error.ReferenceFailed;
+        }
     }
+
+    // The parent: run the shards at once and add their counts up. `--capture`
+    // stays in one process, because it writes the goldens in order.
+    if (shard == null and !capture and nshards > 1) return runShards(gpa, io, self_exe, pass.items, nshards);
+
+    var sb: [64]u8 = undefined;
+    const scratch = if (shard) |k| try std.mem.print(&sb, "{s}/shard-{d}", .{ scratch_root, k }) else scratch_root;
+    var dir = try std.Io.Dir.cwd().createDirPathOpen(io, scratch, .{});
+    defer dir.close(io);
+    var pb: [7][96]u8 = undefined;
+    const paths: Ctx.Paths = .{
+        .in = try std.mem.print(&pb[0], "{s}/in.bin", .{scratch}),
+        .ref = try std.mem.print(&pb[1], "{s}/ref.out", .{scratch}),
+        .vin = try std.mem.print(&pb[2], "{s}/v.in", .{scratch}),
+        .vout = try std.mem.print(&pb[3], "{s}/v.out", .{scratch}),
+        .pyin = try std.mem.print(&pb[4], "{s}/py.in", .{scratch}),
+        .pyout = try std.mem.print(&pb[5], "{s}/py.out", .{scratch}),
+        .xzin = try std.mem.print(&pb[6], "{s}/xz.in", .{scratch}),
+    };
+    var c: Ctx = .{ .gpa = gpa, .io = io, .dir = dir, .quick = quick, .scratch = scratch, .paths = paths, .shard = shard orelse 0, .nshards = if (shard != null) nshards else 1 };
 
     var goldens: std.ArrayList(Golden) = .empty;
     defer {
@@ -602,8 +667,70 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     }
     if (!decoder_only) try encoderParity(&c);
 
+    if (shard != null) {
+        var rb: [48]u8 = undefined;
+        try dir.writeFile(io, .{ .sub_path = "result", .data = try std.mem.print(&rb, "{d} {d}\n", .{ c.checks, c.failures }) });
+        return if (c.failures != 0) 1 else 0;
+    }
     std.debug.print("{d} checks, {d} failures\n", .{ c.checks, c.failures });
     if (c.failures != 0) return 1;
     if (capture) try writeGoldens(&c, goldens.items);
     return 0;
+}
+
+/// Starts `n` copies of this program with `--shard k/n`, waits for all of them,
+/// and sums the counts each wrote to its scratch directory. Any shard that did
+/// not finish cleanly, or wrote no count, fails the run.
+fn runShards(gpa: std.mem.Allocator, io: std.Io, self_exe: []const u8, pass: []const []const u8, n: usize) !u8 {
+    const children = try gpa.alloc(?std.process.Child, n);
+    defer gpa.free(children);
+    var bufs = try gpa.alloc([24]u8, n);
+    defer gpa.free(bufs);
+    for (0..n) |k| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(gpa);
+        try argv.append(gpa, self_exe);
+        try argv.appendSlice(gpa, pass);
+        try argv.appendSlice(gpa, &.{ "--shard", try std.mem.print(&bufs[k], "{d}/{d}", .{ k, n }) });
+        // A stale count from an earlier run must not stand in for this one.
+        var pbuf: [96]u8 = undefined;
+        std.Io.Dir.cwd().deleteFile(io, try std.mem.print(&pbuf, "{s}/shard-{d}/result", .{ scratch_root, k })) catch {};
+        children[k] = std.process.spawn(io, .{ .argv = argv.items }) catch |e| blk: {
+            std.debug.print("could not start shard {d} ({s})\n", .{ k, @errorName(e) });
+            break :blk null;
+        };
+    }
+    var checks_sum: usize = 0;
+    var failures_sum: usize = 0;
+    var broken: usize = 0;
+    for (children, 0..) |*ch, k| {
+        const term = if (ch.*) |*child| child.wait(io) catch null else null;
+        if (term == null or !(term.?.success() or (term.? == .exited and term.?.exited == 1))) {
+            std.debug.print("shard {d}/{d} did not finish ({any})\n", .{ k, n, term });
+            broken += 1;
+            continue;
+        }
+        var pbuf: [96]u8 = undefined;
+        const res = std.Io.Dir.cwd().readFileAlloc(io, try std.mem.print(&pbuf, "{s}/shard-{d}/result", .{ scratch_root, k }), gpa, .limited(64)) catch {
+            std.debug.print("shard {d}/{d} wrote no count\n", .{ k, n });
+            broken += 1;
+            continue;
+        };
+        defer gpa.free(res);
+        var it = std.mem.tokenizeAny(u8, res, " \n");
+        checks_sum += std.fmt.parseInt(usize, it.next() orelse "x", 10) catch {
+            broken += 1;
+            continue;
+        };
+        failures_sum += std.fmt.parseInt(usize, it.next() orelse "x", 10) catch {
+            broken += 1;
+            continue;
+        };
+    }
+    std.debug.print("{d} checks, {d} failures ({d} shards)\n", .{ checks_sum, failures_sum, n });
+    if (broken != 0) {
+        std.debug.print("{d} shard(s) broken\n", .{broken});
+        return 1;
+    }
+    return if (failures_sum != 0) 1 else 0;
 }
