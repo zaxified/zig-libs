@@ -364,3 +364,30 @@ test "Store.deinit frees the binding of a backend reservation still held" {
     try testing.expect((try store.begin("held", digest_a, &req, testing.allocator)) == .reserved);
     store.deinit();
 }
+
+test "KvBackend through begin: a digest that differs in any single byte is a mismatch" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var clk: Clock = .{};
+    var db = try openDb(&sim, &clk);
+    defer db.close();
+    var kb = KvBackend{ .db = &db, .gpa = testing.allocator };
+    defer kb.deinit();
+    var store = Store{ .backend = kb.backend(), .clock = clk.storeClock() };
+    defer store.deinit();
+    var d: [32]u8 = undefined;
+    for (&d, 0..) |*c, i| c.* = @intCast(i * 5 + 2);
+    try testing.expect((try store.begin("k", d, null, testing.allocator)) == .reserved);
+    store.record("k", d, 200, "text/plain", "ok");
+    store.finish("k", null);
+    for (0..32) |i| {
+        var other = d;
+        other[i] ^= 0x80;
+        errdefer std.debug.print("byte {d} of the digest differs\n", .{i});
+        try testing.expect((try store.begin("k", other, null, testing.allocator)) == .mismatch);
+    }
+    switch (try store.begin("k", d, null, testing.allocator)) {
+        .replay => |blob| testing.allocator.free(blob),
+        else => return error.TestExpectedReplay,
+    }
+}

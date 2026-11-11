@@ -2022,7 +2022,7 @@ fn runWireGz(r: *router.Router, bytes: []const u8, out_buf: []u8, gzip: bool) []
 }
 
 /// What the capture handlers do, picked by the test.
-const RawMode = enum { plain, status_500, big, upgrade, detach, sse, coded, trailer, fail, respond_then_more, json };
+const RawMode = enum { plain, status_500, big, upgrade, detach, sse, coded, trailer, fail, respond_then_more, json, swallow };
 
 const RawApp = struct {
     calls: u32 = 0,
@@ -2092,6 +2092,17 @@ fn hRaw(ctx: *router.Ctx) anyerror!void {
             try ctx.res.setHeader("Content-Type", "application/json");
             const as: [300]u8 = @splat('q');
             try ctx.res.writeAll("{\"v\":\"" ++ as ++ "\"}");
+        },
+        .swallow => {
+            // One 5000-byte write through a wire that cannot take it (the
+            // test's output buffer is far smaller): the sink fails part-way
+            // and the handler swallows the error, returning normally. One
+            // write, not many: after a failed drain the bytes stay buffered
+            // and the tap would see them again on every further write, which
+            // overflows the collection and refuses for that reason instead.
+            try ctx.res.setHeader("Content-Type", "text/plain");
+            const xs: [5000]u8 = @splat('x');
+            ctx.res.writeAll(&xs) catch {};
         },
     }
 }
@@ -3853,4 +3864,130 @@ test "Store.deinit frees the request binding of a reservation still held" {
     var req: u8 = 0;
     try testing.expect((try store.begin("held", d, &req, testing.allocator)) == .reserved);
     store.deinit(); // its in_flight key is the binding's key: freed once
+}
+
+// ── whole-module mutation run 2026-11-11: survivors ─────────────────────────
+
+test "begin compares the whole fingerprint: a digest that differs in any single byte is a mismatch (ramcache)" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var d: [digest_len]u8 = undefined;
+    for (&d, 0..) |*c, i| c.* = @intCast(i * 7 + 1);
+    try testing.expect((try store.begin("k", d, null, testing.allocator)) == .reserved);
+    store.record("k", d, 200, "text/plain", "ok");
+    store.finish("k", null);
+    for (0..digest_len) |i| {
+        var other = d;
+        other[i] ^= 0x01;
+        errdefer std.debug.print("byte {d} of the digest differs\n", .{i});
+        try testing.expect((try store.begin("k", other, null, testing.allocator)) == .mismatch);
+    }
+    switch (try store.begin("k", d, null, testing.allocator)) {
+        .replay => |blob| testing.allocator.free(blob),
+        else => return error.TestExpectedReplay,
+    }
+}
+
+test "fingerprint covers the whole body: two bodies that share a long prefix are two requests (422)" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try idemRouter(&r, &idem, &app, hOrder);
+    var b1: [2048]u8 = undefined;
+    const first = runWire(&r, reqKeyBody("POST", "/orders", "tail", "0123456789abcdef0123456789abcdef0123456789abcdefA"), &b1);
+    try testing.expectEqualStrings("order-1", bodyOf(first));
+    var b2: [2048]u8 = undefined;
+    const second = runWire(&r, reqKeyBody("POST", "/orders", "tail", "0123456789abcdef0123456789abcdef0123456789abcdefB"), &b2);
+    try testing.expect(std.mem.startsWith(u8, second, "HTTP/1.1 422"));
+    try testing.expectEqual(@as(u32, 1), app.calls);
+}
+
+test "record of a response that cannot be encoded is dropped, never a panic; nothing is replayed afterwards" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    const d: [digest_len]u8 = @splat(3);
+    // Status with bit 15 set, and a content type longer than a u16 length.
+    try testing.expect((try store.begin("bad", d, null, testing.allocator)) == .reserved);
+    store.record("bad", d, 0x8000 | 200, "text/plain", "x");
+    store.finish("bad", null);
+    try testing.expect((try store.begin("bad", d, null, testing.allocator)) == .reserved);
+    const long_ct = try testing.allocator.alloc(u8, 65536);
+    defer testing.allocator.free(long_ct);
+    @memset(long_ct, 'c');
+    store.record("bad", d, 200, long_ct, "x");
+    store.finish("bad", null);
+    try testing.expect((try store.begin("bad", d, null, testing.allocator)) == .reserved);
+    store.finish("bad", null);
+}
+
+test "Clock.monotonic advances and never goes back" {
+    const c = Clock.monotonic;
+    const first = c.now();
+    var prev = first;
+    var advanced = false;
+    for (0..2_000_000) |_| {
+        const t = c.now();
+        try testing.expect(t >= prev);
+        prev = t;
+        if (t > first) {
+            advanced = true;
+            break;
+        }
+    }
+    try testing.expect(advanced);
+    try testing.expect(first < std.math.maxInt(i64));
+}
+
+test "parseKey refuses a quoted key with a byte above 0x7e, 0x80 and 0xff included" {
+    var buf: [max_scoped_key]u8 = undefined;
+    try testing.expect(parseKey("\"a\x80b\"", 255, &buf) == null);
+    try testing.expect(parseKey("\"a\xffb\"", 255, &buf) == null);
+    try testing.expect(parseKey("\"\xc3\xa9\"", 255, &buf) == null);
+    try testing.expect(validKey("a\x80b", 255) == false);
+    try testing.expectEqualStrings("a b", parseKey("\"a b\"", 255, &buf).?);
+}
+
+test "capture refuses a response whose sink failed part-way, even when the handler swallowed the error" {
+    var f: CapFixture = undefined;
+    try f.init(.swallow, .{});
+    defer f.deinit();
+    var b: [1024]u8 = undefined; // far less than the 6000-byte body
+    _ = runWire(&f.r, reqKey("POST", "/orders", "sink-1"), &b);
+    _ = runWire(&f.r, reqKey("POST", "/orders", "sink-1"), &b);
+    try testing.expectEqual(@as(u32, 2), f.app.calls);
+    try testing.expectEqual(@as(u64, 2), f.store.capture_refused.load(.monotonic));
+}
+
+test "Options.header_name and replay_header name the header read for the key and the one stamped on a replay" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store, .options = .{ .header_name = "X-Idem", .replay_header = "X-Replayed" } };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try idemRouter(&r, &idem, &app, hOrder);
+    const custom = "POST /orders HTTP/1.1\r\nHost: t\r\nX-Idem: k1\r\nConnection: close\r\n\r\n";
+    var b1: [2048]u8 = undefined;
+    _ = runWire(&r, custom, &b1);
+    var b2: [2048]u8 = undefined;
+    const replay = runWire(&r, custom, &b2);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+    try testing.expectEqualStrings("true", headerValue(replay, "X-Replayed").?);
+    try testing.expect(headerValue(replay, "Idempotent-Replayed") == null);
+    // The default header is no key here: such requests run every time.
+    var b3: [2048]u8 = undefined;
+    _ = runWire(&r, reqKey("POST", "/orders", "k2"), &b3);
+    _ = runWire(&r, reqKey("POST", "/orders", "k2"), &b3);
+    try testing.expectEqual(@as(u32, 3), app.calls);
 }
