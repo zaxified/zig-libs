@@ -2246,3 +2246,335 @@ test "integration: limited route over loopback — 200s, 429 + Retry-After, key 
 fn hHello(ctx: *router.Ctx) anyerror!void {
     try ctx.res.writeAll("hello");
 }
+
+// ── tests: whole-module mutation run 2026-11-11 (survivors) ─────────────────
+
+test "TokenBucket.full stamps its instant and starts with no event" {
+    const cfg: TokenBucket.Config = .{ .rate_per_s = 1, .burst = 3 };
+    const b: TokenBucket = .full(cfg, 123);
+    try testing.expectEqual(@as(u64, 123), b.updated_ns);
+    try testing.expectEqual(@as(u64, 0), b.last_event_ns);
+    try testing.expectEqual(@as(f64, 3), b.tokens);
+}
+
+test "TokenBucket: reserveNAt saturates the due instant instead of wrapping" {
+    // 1e-12 tokens/s: one token owed is 1e21 ns, past u64. The instant it is
+    // due saturates; `now + wait` must not wrap to a time in the past.
+    const cfg: TokenBucket.Config = .{ .rate_per_s = 1e-12, .burst = 1 };
+    var b: TokenBucket = .full(cfg, 0);
+    try testing.expect(b.allowNAt(cfg, 5, 1).allowed);
+    const r = b.reserveNAt(cfg, 5, 1, std.math.maxInt(u64));
+    try testing.expect(r.ok);
+    try testing.expectEqual(std.math.maxInt(u64), r.time_to_act_ns);
+    try testing.expectEqual(std.math.maxInt(u64) - 5, r.delayNs(5));
+    try testing.expectEqual(std.math.maxInt(u64), b.last_event_ns);
+    // A finite cap refuses it and takes nothing.
+    const before = b.tokens;
+    try testing.expect(!b.reserveNAt(cfg, 5, 1, std.time.ns_per_s).ok);
+    try testing.expectEqual(before, b.tokens);
+}
+
+test "TokenBucket: cancelAt — not-ok reservation, refill before restore, burst cap, last_event rewind" {
+    const s = std.time.ns_per_s;
+    const cfg: TokenBucket.Config = .{ .rate_per_s = 1, .burst = 4 };
+
+    { // a reservation that is not ok gives nothing back (even one built by hand)
+        var b: TokenBucket = .full(cfg, 0);
+        try testing.expect(b.allowNAt(cfg, 0, 4).allowed);
+        var bogus: Reservation = .{ .ok = false, .n = 2, .time_to_act_ns = 5 * s, .rate_per_s = 1 };
+        b.cancelAt(cfg, &bogus, 0);
+        try testing.expectEqual(@as(f64, 0), b.tokens);
+    }
+    { // the balance is brought up to the cancel's instant before the tokens come back
+        var b: TokenBucket = .full(cfg, 0);
+        try testing.expect(b.allowNAt(cfg, 0, 4).allowed);
+        var a = b.reserveNAt(cfg, 0, 1, std.math.maxInt(u64)); // due at 1 s, balance -1
+        b.cancelAt(cfg, &a, s / 2);
+        try testing.expectApproxEqAbs(@as(f64, 0.5), b.tokens, 1e-9); // -1 + 0.5 refilled + 1 back
+        try testing.expectEqual(@as(u64, s / 2), b.updated_ns);
+        // The reservation was the latest event, but its predecessor's instant
+        // (0) already lies before the cancel: last_event is not rewound.
+        try testing.expectEqual(@as(u64, s), b.last_event_ns);
+    }
+    { // the restored balance is capped at the burst in force NOW
+        var b: TokenBucket = .full(cfg, 0);
+        var a = b.reserveNAt(cfg, 0, 1, std.math.maxInt(u64)); // due now, balance 3
+        const small: TokenBucket.Config = .{ .rate_per_s = 1, .burst = 2 };
+        b.cancelAt(small, &a, 0);
+        try testing.expectEqual(@as(f64, 2), b.tokens);
+    }
+    { // cancelling the latest reservation rewinds last_event to its predecessor
+        var b: TokenBucket = .full(cfg, 0);
+        try testing.expect(b.allowNAt(cfg, 0, 4).allowed);
+        var a = b.reserveNAt(cfg, 0, 2, std.math.maxInt(u64)); // due at 2 s
+        try testing.expectEqual(@as(u64, 2 * s), b.last_event_ns);
+        b.cancelAt(cfg, &a, 0);
+        try testing.expectApproxEqAbs(@as(f64, 0), b.tokens, 1e-9);
+        try testing.expectEqual(@as(u64, 0), b.last_event_ns); // 2 s - 2 tokens' worth = 0 >= now
+    }
+    { // a later reservation built on this one: only the part it did not use comes back, last_event stays
+        var b: TokenBucket = .full(cfg, 0);
+        try testing.expect(b.allowNAt(cfg, 0, 4).allowed);
+        var a = b.reserveNAt(cfg, 0, 2, std.math.maxInt(u64)); // due at 2 s
+        _ = b.reserveNAt(cfg, 0, 1, std.math.maxInt(u64)); // due at 3 s, balance -3
+        b.cancelAt(cfg, &a, 0); // 2 - (3 s - 2 s) * 1/s = 1 back
+        try testing.expectApproxEqAbs(@as(f64, -2), b.tokens, 1e-9);
+        try testing.expectEqual(@as(u64, 3 * s), b.last_event_ns);
+    }
+    { // later reservations used more than this one holds: nothing comes back, and nothing is taken
+        const cfg2: TokenBucket.Config = .{ .rate_per_s = 1, .burst = 2 };
+        var b: TokenBucket = .full(cfg2, 0);
+        try testing.expect(b.allowNAt(cfg2, 0, 2).allowed);
+        var a = b.reserveNAt(cfg2, 0, 1, std.math.maxInt(u64)); // due at 1 s
+        _ = b.reserveNAt(cfg2, 0, 2, std.math.maxInt(u64)); // due at 3 s, balance -3
+        b.cancelAt(cfg2, &a, 0); // 1 - (3 s - 1 s) = -1 -> no-op
+        try testing.expectEqual(@as(f64, -3), b.tokens);
+        try testing.expectEqual(@as(u32, 0), a.n);
+        try testing.expectEqual(@as(u64, 3 * s), b.last_event_ns);
+    }
+}
+
+test "wholeTokens, durationNs, ceilMs: NaN, negative, zero and saturating edges" {
+    const nan = std.math.nan(f64);
+    const max64 = std.math.maxInt(u64);
+    // wholeTokens: floor, 0 for a debt, NaN as 0, capped at u32 max.
+    try testing.expectEqual(@as(u32, 0), wholeTokens(nan));
+    try testing.expectEqual(@as(u32, 0), wholeTokens(-3));
+    try testing.expectEqual(@as(u32, 0), wholeTokens(0));
+    try testing.expectEqual(@as(u32, 0), wholeTokens(0.999));
+    try testing.expectEqual(@as(u32, 2), wholeTokens(2.5));
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), wholeTokens(1e12));
+    // durationNs: truncates, 0 for NaN/negative/zero, saturates (also exactly at 2^64).
+    try testing.expectEqual(@as(u64, 0), durationNs(nan, 1));
+    try testing.expectEqual(@as(u64, 0), durationNs(-1, 1));
+    try testing.expectEqual(@as(u64, 0), durationNs(0, 1));
+    try testing.expectEqual(@as(u64, 333333333), durationNs(1, 3));
+    try testing.expectEqual(@as(u64, 1_000_000_000), durationNs(1, 1));
+    try testing.expectEqual(@as(u64, max64), durationNs(1e30, 1));
+    try testing.expectEqual(@as(u64, max64), durationNs(1, 1e-300)); // 1e309: infinite
+    try testing.expectEqual(@as(u64, max64), durationNs(18446744073.709553, 1)); // 1e9 * that = 2^64 exactly
+    // ceilMs: rounds up, 0 for NaN/negative/zero, saturates (also exactly at 2^64).
+    try testing.expectEqual(@as(u64, 0), ceilMs(nan));
+    try testing.expectEqual(@as(u64, 0), ceilMs(-1));
+    try testing.expectEqual(@as(u64, 0), ceilMs(0));
+    try testing.expectEqual(@as(u64, 1), ceilMs(0.0001));
+    try testing.expectEqual(@as(u64, 1000), ceilMs(1));
+    try testing.expectEqual(@as(u64, 1001), ceilMs(1.0001));
+    try testing.expectEqual(@as(u64, max64), ceilMs(1e30));
+    try testing.expectEqual(@as(u64, max64), ceilMs(std.math.inf(f64)));
+    try testing.expectEqual(@as(u64, max64), ceilMs(1.844674407370955e16)); // *1000 = 2^64 exactly
+}
+
+test "Limiter: an idle key is swept only after strictly more than its refill time (+1 ns)" {
+    // 3/s, burst 1: refill takes 333333333.3 ns, truncated to ...333, plus 1.
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 3, .burst = 1, .ttl_ms = 1, .key = .forwarded_ip });
+    defer l.deinit();
+    try testing.expectEqual(@as(u64, 333333334), l.idle_ns);
+    try testing.expect(l.allowAt("a", 0).allowed);
+    try testing.expect(l.allowAt("b", 333333334).allowed); // idle == the threshold: a stays
+    try testing.expectEqual(@as(usize, 2), l.keyCount());
+    try testing.expect(l.allowAt("c", 333333335).allowed); // one ns more: a goes
+    try testing.expectEqual(@as(usize, 2), l.keyCount()); // b + c
+}
+
+test "optionsError: the smallest valid sizes are accepted" {
+    try testing.expect(optionsError(.{ .rate_per_s = 1, .burst = 1, .max_keys = 1, .max_key_len = 1, .v6_key_bits = 128, .key = .forwarded_ip }) == null);
+    try testing.expect(optionsError(.{ .rate_per_s = 1, .burst = 1, .v6_key_bits = 0, .key = .forwarded_ip }) == null);
+}
+
+test "Limiter: waitN fails open on allocation failure, and truncates the key like allow" {
+    {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        var l = Limiter.init(failing.allocator(), .{ .rate_per_s = 1000, .burst = 1, .key = .forwarded_ip });
+        defer l.deinit();
+        try l.waitN(testing.io, "k", 1, 0); // key not trackable: returns at once, unpaced
+        try l.waitN(testing.io, "k", 1, 0);
+        try testing.expectEqual(@as(usize, 0), l.keyCount());
+    }
+    {
+        var tc: TestClock = .{};
+        var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.001, .burst = 1, .max_key_len = 4, .clock = tc.clock(), .key = .forwarded_ip });
+        defer l.deinit();
+        try l.waitN(testing.io, "abcdX", 1, 0); // takes the only token
+        try testing.expectError(error.WaitTooLong, l.waitN(testing.io, "abcdY", 1, 0)); // same stored key "abcd"
+        try testing.expectEqual(@as(usize, 1), l.keyCount());
+    }
+}
+
+test "Limiter: waitN sleeps the whole reservation delay" {
+    var tc: TestClock = .{}; // frozen: the delay is exactly 20 ms
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 50, .burst = 1, .clock = tc.clock(), .key = .forwarded_ip });
+    defer l.deinit();
+    try l.waitN(testing.io, "k", 1, std.math.maxInt(u64)); // full: no wait
+    const t0 = Clock.monotonic.now();
+    try l.waitN(testing.io, "k", 1, std.math.maxInt(u64)); // 20 ms owed
+    const slept = Clock.monotonic.now() - t0;
+    try testing.expect(slept >= 19 * std.time.ns_per_ms);
+}
+
+test "Limiter: a failed map insert after the entry allocation frees the entry" {
+    // allocation 0 = the entry, allocation 1 = the map's table: the insert
+    // fails after the entry exists; the testing allocator reports a leak.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    var tc: TestClock = .{};
+    var l = Limiter.init(failing.allocator(), .{ .rate_per_s = 1, .burst = 1, .clock = tc.clock(), .key = .forwarded_ip });
+    defer l.deinit();
+    try testing.expect(l.allow("k").allowed); // fail-open
+    try testing.expectEqual(@as(usize, 0), l.keyCount());
+}
+
+/// A thread that calls one public `Limiter` entry point.
+const LockProbe = struct {
+    l: *Limiter,
+    op: enum { allow, key_count, current_config, set_rate, wait_n },
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(p: *LockProbe) void {
+        switch (p.op) {
+            .allow => _ = p.l.allowAt("k", 0),
+            .key_count => _ = p.l.keyCount(),
+            .current_config => _ = p.l.currentConfig(),
+            .set_rate => p.l.setConfigAt(2, null, 0),
+            .wait_n => p.l.waitN(testing.io, "k", 1, 0) catch {},
+        }
+        p.done.store(true, .release);
+    }
+};
+
+test "Limiter: every public entry point waits for the lock (a removed lock hides from the race test)" {
+    inline for (.{ .allow, .key_count, .current_config, .set_rate, .wait_n }) |op| {
+        var l = Limiter.init(testing.allocator, .{ .rate_per_s = 1, .burst = 1, .key = .forwarded_ip });
+        defer l.deinit();
+        var p: LockProbe = .{ .l = &l, .op = op };
+        lockSpin(&l.lock);
+        const t = try std.Thread.spawn(.{}, LockProbe.run, .{&p});
+        try testing.io.sleep(.fromNanoseconds(50 * std.time.ns_per_ms), .awake);
+        const early = p.done.load(.acquire);
+        l.lock.unlock();
+        t.join();
+        try testing.expect(!early);
+        try testing.expect(p.done.load(.acquire));
+    }
+}
+
+test "Limiter: keys equal in both compared words, or in only one, stay distinct (keyEql fast path)" {
+    // A 2-key table is one probe group, so two keys whose 7-bit fingerprints
+    // collide (1 in 128) reach `keyEql`. Over 2500 pairs per family a compare
+    // that skips a word, the middle byte or the length merges some pair.
+    var tc: TestClock = .{};
+    const Pair = struct {
+        fn expectDistinct(a: []const u8, b: []const u8, clk: Clock) !void {
+            var l = Limiter.init(testing.allocator, .{ .rate_per_s = 1, .burst = 1, .ttl_ms = 0, .clock = clk, .key = .forwarded_ip });
+            defer l.deinit();
+            try testing.expect(l.allow(a).allowed);
+            try testing.expect(l.allow(b).allowed); // its own bucket, not a's drained one
+            try testing.expectEqual(@as(usize, 2), l.keyCount());
+        }
+    };
+    var a: [17]u8 = undefined;
+    var b: [17]u8 = undefined;
+    for (0..2500) |i| {
+        var w: [8]u8 = undefined;
+        _ = std.mem.print(&w, "{x:0>8}", .{i}) catch unreachable;
+        var w2: [8]u8 = undefined;
+        _ = std.mem.print(&w2, "{x:0>8}", .{i + 0x10000}) catch unreachable;
+        // same bytes, different length: w vs w ++ w (both words of the longer one equal w)
+        @memcpy(a[0..8], &w);
+        @memcpy(a[8..16], &w);
+        try Pair.expectDistinct(a[0..8], a[0..16], tc.clock());
+        // equal last word, different first word (len 16)
+        @memcpy(a[0..8], &w);
+        @memcpy(a[8..16], "TAILTAIL");
+        @memcpy(b[0..8], &w2);
+        @memcpy(b[8..16], "TAILTAIL");
+        try Pair.expectDistinct(a[0..16], b[0..16], tc.clock());
+        // equal first word, different last word (len 16)
+        @memcpy(a[0..8], "HEADHEAD");
+        @memcpy(a[8..16], &w);
+        @memcpy(b[0..8], "HEADHEAD");
+        @memcpy(b[8..16], &w2);
+        try Pair.expectDistinct(a[0..16], b[0..16], tc.clock());
+        // len 17: differ only in the middle byte, which neither word covers if the fast path took 17
+        @memcpy(a[0..8], &w);
+        a[8] = 'A';
+        @memcpy(a[9..17], &w2);
+        @memcpy(b[0..8], &w);
+        b[8] = 'B';
+        @memcpy(b[9..17], &w2);
+        try Pair.expectDistinct(a[0..17], b[0..17], tc.clock());
+    }
+}
+
+fn peerAt(comptime text: []const u8) !std.Io.net.IpAddress {
+    return try netaddr.parseAddrPort(text).?.toStd();
+}
+
+/// The one key a limiter tracks, as text (it holds exactly one).
+fn expectOnlyKey(l: *Limiter, want: []const u8) !void {
+    lockSpin(&l.lock);
+    defer l.lock.unlock();
+    try testing.expectEqual(@as(usize, 1), l.map.count());
+    var it = l.map.keyIterator();
+    try testing.expectEqualStrings(want, it.next().?.*.key);
+}
+
+test "middleware: an empty API-key header or X-Real-IP value falls through to the next source, not to the empty key" {
+    var tc: TestClock = .{};
+    var buf: [1024]u8 = undefined;
+    const a = try peerAt("1.1.1.1:80");
+    const b = try peerAt("2.2.2.2:80");
+    { // .header: an empty value is no key
+        var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.01, .burst = 1, .clock = tc.clock(), .key = .{ .header = "X-Api-Key" } });
+        defer l.deinit();
+        var rl = try RouterUnderLimit.init(&l);
+        defer rl.deinit();
+        rl.start();
+        try expectStatus(runWirePeer(&rl.r, wire("X-Api-Key:\r\n"), &buf, a), "200");
+        try expectStatus(runWirePeer(&rl.r, wire("X-Api-Key:   \r\n"), &buf, b), "200"); // not a's bucket
+        try expectStatus(runWirePeer(&rl.r, wire("X-Api-Key:\r\n"), &buf, a), "429"); // keyed by peer a
+    }
+    { // forwarded_ip: an empty X-Real-IP is no address
+        var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.01, .burst = 1, .clock = tc.clock(), .key = .forwarded_ip });
+        defer l.deinit();
+        var rl = try RouterUnderLimit.init(&l);
+        defer rl.deinit();
+        rl.start();
+        try expectStatus(runWirePeer(&rl.r, wire("X-Real-IP:\r\n"), &buf, a), "200");
+        try expectStatus(runWirePeer(&rl.r, wire("X-Real-IP:\r\n"), &buf, b), "200");
+        try expectStatus(runWirePeer(&rl.r, wire("X-Real-IP:\r\n"), &buf, a), "429");
+    }
+}
+
+test "middleware: .header without the header keys an IPv6 client by its /64 too" {
+    var tc: TestClock = .{};
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.01, .burst = 1, .clock = tc.clock(), .key = .{ .header = "X-Api-Key" } });
+    defer l.deinit();
+    var rl = try RouterUnderLimit.init(&l);
+    defer rl.deinit();
+    rl.start();
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 2001:db8:1:2::1\r\n"), &buf), "200");
+    try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 2001:db8:1:2::2\r\n"), &buf), "429");
+    try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 2001:db8:1:3::1\r\n"), &buf), "200"); // another /64
+}
+
+test "middleware: no client address at all is keyed by fallback_key, on both client-IP key sources" {
+    var tc: TestClock = .{};
+    var buf: [1024]u8 = undefined;
+    inline for (.{ KeySource.forwarded_ip, KeySource{ .forwarded_ip_trusted = .loopback } }) |src| {
+        var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.01, .burst = 1, .clock = tc.clock(), .key = src });
+        defer l.deinit();
+        var rl = try RouterUnderLimit.init(&l);
+        defer rl.deinit();
+        rl.start();
+        try expectStatus(runWire(&rl.r, wire(""), &buf), "200");
+        try expectOnlyKey(&l, fallback_key);
+    }
+}
+
+test "ipKey: text that is not an address stays the key as it is" {
+    var buf: [peer_key_len_max]u8 = undefined;
+    try testing.expectEqualStrings("not-an-ip", ipKey("not-an-ip", 64, &buf));
+    try testing.expectEqualStrings("unknown", ipKey("unknown", 64, &buf));
+    try testing.expectEqualStrings("", ipKey("", 64, &buf));
+}

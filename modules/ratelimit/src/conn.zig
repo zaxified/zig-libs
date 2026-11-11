@@ -741,3 +741,91 @@ test "the shipped connection defaults are the values the owner ruled" {
     for (0..default_conn_burst) |_| try testing.expect(cl.allowPeer(peer).allowed);
     try testing.expect(!cl.allowPeer(peer).allowed);
 }
+
+// ── tests: whole-module mutation run 2026-11-11 (survivors) ─────────────────
+
+test "optionsError: a /128 unlisted v6 key is valid" {
+    try testing.expect(optionsError(.{ .unlisted_v6_bits = 128 }) == null);
+    try testing.expect(optionsError(.{ .unlisted_v4_bits = 0, .unlisted_v6_bits = 0 }) == null);
+}
+
+test "ConnectionLimiter: an unlisted peer refills at the default rate, not faster" {
+    var tc: TestClock = .{};
+    var cl = try ConnectionLimiter.init(testing.allocator, .{ .rate_per_s = 1, .burst = 1, .clock = tc.clock() });
+    defer cl.deinit();
+    const peer = addr("198.51.100.9");
+    try testing.expect(cl.allowPeer(peer).allowed);
+    try testing.expectEqual(@as(u64, 1000), cl.allowPeer(peer).retry_after_ms);
+    tc.advanceMs(600);
+    try testing.expect(!cl.allowPeer(peer).allowed); // 0.6 tokens
+    tc.advanceMs(400);
+    try testing.expect(cl.allowPeer(peer).allowed);
+}
+
+test "ConnectionLimiter: with unlisted_v6_bits = 128 two addresses differing only in the last byte have two buckets" {
+    var tc: TestClock = .{};
+    var cl = try ConnectionLimiter.init(testing.allocator, .{ .rate_per_s = 0.001, .burst = 1, .unlisted_v6_bits = 128, .clock = tc.clock() });
+    defer cl.deinit();
+    const x = addr("2001:db8::1");
+    const y = addr("2001:db8::2");
+    try testing.expect(cl.allowPeer(x).allowed);
+    try testing.expect(cl.allowPeer(y).allowed); // its own bucket
+    try testing.expectEqual(@as(usize, 2), cl.unlistedKeyCount());
+    try testing.expect(!cl.allowPeer(x).allowed);
+    try testing.expect(!cl.allowPeer(y).allowed);
+    // and a v6 /56 option really cuts at 56 bits: these two share a bucket
+    var cl56 = try ConnectionLimiter.init(testing.allocator, .{ .rate_per_s = 0.001, .burst = 1, .unlisted_v6_bits = 56, .clock = tc.clock() });
+    defer cl56.deinit();
+    try testing.expect(cl56.allowPeer(addr("2001:db8:0:ff::1")).allowed);
+    try testing.expect(!cl56.allowPeer(addr("2001:db8:0:ab::2")).allowed); // same /56
+    try testing.expect(cl56.allowPeer(addr("2001:db8:1::1")).allowed); // another /56
+}
+
+test "ConnectionLimiter: unlisted keys idle past unlisted_ttl_ms are swept when a new key arrives" {
+    var tc: TestClock = .{};
+    var cl = try ConnectionLimiter.init(testing.allocator, .{ .rate_per_s = 100, .burst = 1, .unlisted_ttl_ms = 1000, .clock = tc.clock() });
+    defer cl.deinit();
+    try testing.expect(cl.allowPeer(addr("198.51.100.1")).allowed);
+    try testing.expectEqual(@as(usize, 1), cl.unlistedKeyCount());
+    tc.advanceMs(2000);
+    try testing.expect(cl.allowPeer(addr("198.51.100.2")).allowed);
+    try testing.expectEqual(@as(usize, 1), cl.unlistedKeyCount()); // .1 swept
+}
+
+test "ConnectionLimiter: a /128 v4-mapped prefix is the v4 host; a plain v6 /112 stays v6" {
+    const users = [_]User{
+        .{ .name = "mapped-host", .prefixes = &.{pfx("::ffff:192.0.2.7/128")} },
+        .{ .name = "v6-112", .prefixes = &.{pfx("2001:db8::/112")} },
+    };
+    var cl = try ConnectionLimiter.init(testing.allocator, .{ .users = &users });
+    defer cl.deinit();
+    try testing.expectEqual(@as(?usize, 0), cl.userIndex(addr("192.0.2.7")));
+    try testing.expectEqual(@as(?usize, null), cl.userIndex(addr("192.0.2.8")));
+    try testing.expectEqual(@as(?usize, 1), cl.userIndex(addr("2001:db8::1")));
+    try testing.expectEqual(@as(?usize, 1), cl.userIndex(addr("2001:db8::ffff")));
+    try testing.expectEqual(@as(?usize, null), cl.userIndex(addr("2001:db8::1:0"))); // outside the /112
+    try testing.expectEqual(@as(?usize, null), cl.userIndex(addr("2001:dead::1"))); // not "2001::/16"
+}
+
+test "ConnectionLimiter: allowPeerAt waits for the lock on the user path" {
+    const Probe = struct {
+        cl: *ConnectionLimiter,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(p: *@This()) void {
+            _ = p.cl.allowPeerAt(addr("192.0.2.7"), 0);
+            p.done.store(true, .release);
+        }
+    };
+    const users = [_]User{.{ .name = "u", .prefixes = &.{pfx("192.0.2.0/24")} }};
+    var cl = try ConnectionLimiter.init(testing.allocator, .{ .users = &users });
+    defer cl.deinit();
+    var p: Probe = .{ .cl = &cl };
+    lockSpin(&cl.lock);
+    const t = try std.Thread.spawn(.{}, Probe.run, .{&p});
+    try testing.io.sleep(.fromNanoseconds(50 * std.time.ns_per_ms), .awake);
+    const early = p.done.load(.acquire);
+    cl.lock.unlock();
+    t.join();
+    try testing.expect(!early);
+    try testing.expect(p.done.load(.acquire));
+}
