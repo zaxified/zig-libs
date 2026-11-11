@@ -2689,3 +2689,354 @@ test "escaping: a tab in finding text is \\t, DEL is \\x7f" {
     const d: Diagnostic = .{ .path = "", .severity = .@"error", .code = "", .message = "a\tb\x7fc" };
     try testing.expectEqualStrings("error: a\\tb\\x7fc\n", try renderToString(&buf, d, .{}));
 }
+
+// ── mutation audit 2026-11-11 ────────────────────────────────────────────────
+
+test "charWidth: every code point equals the width table, controls and DEL are 0" {
+    for (0..0x20) |c| try testing.expectEqual(@as(u2, 0), charWidth(@intCast(c)));
+    for (0x20..0x7f) |c| try testing.expectEqual(@as(u2, 1), charWidth(@intCast(c)));
+    for (0x7f..0xa0) |c| try testing.expectEqual(@as(u2, 0), charWidth(@intCast(c)));
+    var ri: usize = 0;
+    var cp: u32 = 0xa0;
+    while (cp <= 0x10ffff) : (cp += 1) {
+        while (ri < width_table.ranges.len and width_table.ranges[ri].hi < cp) ri += 1;
+        const want: u2 = if (ri < width_table.ranges.len and cp >= width_table.ranges[ri].lo) width_table.ranges[ri].w else 1;
+        if (charWidth(@intCast(cp)) != want) {
+            std.debug.print("charWidth(U+{X}) = {d}, table says {d}\n", .{ cp, charWidth(@intCast(cp)), want });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "isShownAsQuestion and isWhiteSpace: exactly the documented sets" {
+    var cp: u32 = 0;
+    while (cp <= 0x10ffff) : (cp += 1) {
+        const q = cp <= 0x1f or (cp >= 0x7f and cp <= 0x9f) or cp == 0x2028 or cp == 0x2029 or (cp >= 0x202a and cp <= 0x202e) or (cp >= 0x2066 and cp <= 0x2069);
+        const ws = (cp >= 9 and cp <= 13) or cp == 0x20 or cp == 0x85 or cp == 0xa0 or cp == 0x1680 or (cp >= 0x2000 and cp <= 0x200a) or
+            cp == 0x2028 or cp == 0x2029 or cp == 0x202f or cp == 0x205f or cp == 0x3000;
+        if (isShownAsQuestion(@intCast(cp)) != q or isWhiteSpace(@intCast(cp)) != ws) {
+            std.debug.print("U+{X}: shown-as-? {} white-space {}\n", .{ cp, isShownAsQuestion(@intCast(cp)), isWhiteSpace(@intCast(cp)) });
+            return error.TestUnexpectedResult;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), leadingSpace("  "));
+    try testing.expectEqual(@as(usize, 3), leadingSpace("\u{3000}"));
+    try testing.expectEqual(@as(usize, 4), leadingSpace(" \u{3000}x"));
+    try testing.expectEqual(@as(usize, 0), leadingSpace("\xe3\x80"));
+}
+
+fn escapedOf(buf: []u8, s: []const u8) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try writeEscaped(&w, s);
+    return w.buffered();
+}
+
+test "writeEscaped: every single byte, truncated and complete sequences, the C1 and separator escapes" {
+    var buf: [64]u8 = undefined;
+    for (0..256) |b| {
+        const c: u8 = @intCast(b);
+        var want_buf: [8]u8 = undefined;
+        const want: []const u8 = switch (c) {
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            0x20...0x7e => &[_]u8{c},
+            else => try std.fmt.bufPrint(&want_buf, "\\x{x:0>2}", .{c}),
+        };
+        try testing.expectEqualStrings(want, try escapedOf(&buf, &[_]u8{c}));
+    }
+    try testing.expectEqualStrings("\xc3\xa9", try escapedOf(&buf, "\xc3\xa9"));
+    try testing.expectEqualStrings("a\xc3\xa9", try escapedOf(&buf, "a\xc3\xa9"));
+    try testing.expectEqualStrings("\\xe3\\x80", try escapedOf(&buf, "\xe3\x80"));
+    try testing.expectEqualStrings("\\u{009f}", try escapedOf(&buf, "\u{9f}"));
+    try testing.expectEqualStrings("\u{a0}", try escapedOf(&buf, "\u{a0}"));
+    try testing.expectEqualStrings("\\u{2028}x\\u{2029}", try escapedOf(&buf, "\u{2028}x\u{2029}"));
+    try testing.expectEqualStrings("\\u{202a}\\u{202e}\\u{2066}\\u{2069}", try escapedOf(&buf, "\u{202a}\u{202e}\u{2066}\u{2069}"));
+    try testing.expectEqualStrings("\u{2027}\u{202f}\u{2065}\u{206a}", try escapedOf(&buf, "\u{2027}\u{202f}\u{2065}\u{206a}"));
+}
+
+test "writeLsp: a file name is percent-encoded byte by byte, uppercase hex, only A-Za-z0-9-._~/:@ stay" {
+    var name: [255]u8 = undefined;
+    for (&name, 1..) |*n, b| n.* = @intCast(b);
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(testing.allocator);
+    try want.appendSlice(testing.allocator, "\"uri\":\"file://");
+    for (name) |c| {
+        if (std.ascii.isAlphanumeric(c) or std.mem.findScalar(u8, "-._~/:@", c) != null) {
+            try want.append(testing.allocator, c);
+        } else try want.print(testing.allocator, "%{X:0>2}", .{c});
+    }
+    try want.append(testing.allocator, '"');
+    const d: Diagnostic = .{ .path = "", .severity = .warning, .code = "", .message = "m", .labels = &.{.{ .file = &name, .line = 1 }} };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeLsp(&w, d, &.{}, .utf16, .{});
+    try testing.expect(std.mem.find(u8, w.buffered(), want.items) != null);
+}
+
+test "sortByPosition: a missing line sorts after a present one whatever the column; ties keep their order" {
+    var diag: Diagnostics = .init(testing.allocator);
+    defer diag.deinit();
+    try diag.append(.{ .path = "", .col = 1, .severity = .info, .code = "", .message = "no line" });
+    try diag.append(.{ .path = "", .line = 5, .col = 2, .severity = .info, .code = "", .message = "line 5" });
+    diag.sortByPosition();
+    try testing.expectEqualStrings("line 5", diag.items.items[0].message);
+    // 200 findings over 5 lines: the sort is stable (a sort that is not reorders some of the ties).
+    var many: Diagnostics = .init(testing.allocator);
+    defer many.deinit();
+    var prng = std.Random.DefaultPrng.init(7);
+    var seq: [200]u32 = undefined;
+    for (&seq, 0..) |*s, i| {
+        s.* = @intCast(i);
+        try many.append(.{ .path = "", .line = prng.random().uintLessThan(u32, 5), .severity = .info, .code = "", .message = "", .expr_off = @intCast(i) });
+    }
+    many.sortByPosition();
+    for (many.items.items[1..], many.items.items[0 .. many.items.items.len - 1]) |b, a| {
+        try testing.expect(a.line.? <= b.line.?);
+        if (a.line.? == b.line.?) try testing.expect(a.expr_off.? < b.expr_off.?);
+    }
+}
+
+test "Source.range: an end past the text is null even when the start fits" {
+    const s: Source = .{ .file = "f", .text = "ab\ncd" };
+    try testing.expect(s.range(1, 100) == null);
+    try testing.expect(s.range(1, 5) != null);
+}
+
+test "Source.indexLines accepts a text of maxInt(u32) bytes (a read-only zero mapping, no memory committed)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const max32: usize = std.math.maxInt(u32);
+    const rc = linux.mmap(null, max32, .{ .READ = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true }, -1, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const base: [*]align(4096) u8 = @ptrFromInt(rc);
+    defer _ = linux.munmap(base, max32);
+    const starts = try Source.indexLines(testing.allocator, base[0..max32]);
+    defer testing.allocator.free(starts);
+    try testing.expectEqual(@as(usize, 1), starts.len);
+    try testing.expectError(error.SourceTooLarge, Source.indexLines(testing.allocator, base[0 .. max32 + 1]));
+}
+
+test "colour: the exact SGR bytes of the header for every severity" {
+    var buf: [256]u8 = undefined;
+    const sevs = [_]Severity{ .@"error", .warning, .info, .hint };
+    const codes = [_][]const u8{ "\x1b[1;31m", "\x1b[1;33m", "\x1b[1;36m", "\x1b[1;36m" };
+    for (sevs, codes) |sev, code| {
+        const d: Diagnostic = .{ .path = "", .severity = sev, .code = "c", .message = "m" };
+        var want_buf: [128]u8 = undefined;
+        const want = try std.fmt.bufPrint(&want_buf, "{s}{s}[c]\x1b[0m\x1b[1m: m\x1b[0m\n", .{ code, @tagName(sev) });
+        try testing.expectEqualStrings(want, try renderToString(&buf, d, .{ .color = true }));
+    }
+}
+
+test "short: fix forms, hostile file/replacement/code/location text is escaped" {
+    var buf: [512]u8 = undefined;
+    const base: Diagnostic = .{ .path = "", .file = "f", .line = 1, .col = 3, .severity = .@"error", .code = "", .message = "m" };
+    var d = base;
+    d.fix = .{ .line = 1, .col = 3, .end_line = 2, .end_col = 3, .replacement = "x" };
+    try testing.expectEqualStrings("f:1:3: error: m; fix: replace f:1:3..2:3 with \"x\"\n", try renderToString(&buf, d, .{}));
+    d.fix = .{ .file = "g\x1b", .line = 4, .col = 5, .end_line = 6, .end_col = 9, .replacement = "r\x1b" };
+    try testing.expectEqualStrings("f:1:3: error: m; fix: replace g\\x1b:4:5..6:9 with \"r\\x1b\"\n", try renderToString(&buf, d, .{}));
+    d.fix = .{ .file = "g\x1b", .line = 4, .col = 5, .replacement = "r\x1b" };
+    try testing.expectEqualStrings("f:1:3: error: m; fix: insert \"r\\x1b\" at g\\x1b:4:5\n", try renderToString(&buf, d, .{}));
+    var h = base;
+    h.file = "a\x1b";
+    h.col = null;
+    h.code = "c\x07";
+    try testing.expectEqualStrings("a\\x1b:1: error[c\\x07]: m\n", try renderToString(&buf, h, .{}));
+}
+
+fn snipOf(text: []const u8, d: Diagnostic, o: RenderOptions) ![]u8 {
+    var opts = o;
+    opts.style = .snippet;
+    opts.sources = &.{.{ .file = "f", .text = text }};
+    return renderAlloc(d, opts);
+}
+
+test "snippet: the closing empty row appears whichever single part follows the snippet" {
+    const base: Diagnostic = .{ .path = "", .file = "f", .line = 1, .col = 1, .severity = .@"error", .code = "", .message = "m" };
+    var cases: [5]Diagnostic = .{ base, base, base, base, base };
+    cases[0].path = "a.b";
+    cases[1].suggest = "s";
+    cases[2].fix = .{ .line = 1, .col = 1, .replacement = "x" };
+    cases[3].code_url = "https://x.invalid/";
+    cases[4].notes = &.{.{ .message = "n" }};
+    for (cases) |d| {
+        const out = try snipOf("ab\n", d, .{});
+        defer testing.allocator.free(out);
+        try testing.expect(std.mem.find(u8, out, "  |\n  = ") != null);
+    }
+    // 65 spans: the 65th is a location line, and an empty row precedes it.
+    var labels: [64]Label = undefined;
+    for (&labels) |*l| l.* = .{ .line = 1, .col = 1, .end_line = 1, .end_col = 2 };
+    var many = base;
+    many.labels = &labels;
+    const over = try snipOf("ab\n", many, .{});
+    defer testing.allocator.free(over);
+    try testing.expect(std.mem.find(u8, over, "  |\n  --> ") != null);
+    // Exactly 64 spans: nothing is left out, so no empty row at the end.
+    many.labels = labels[0..63];
+    const exact = try snipOf("ab\n", many, .{});
+    defer testing.allocator.free(exact);
+    try testing.expect(std.mem.endsWith(u8, exact, "\n\n"));
+    try testing.expect(!std.mem.endsWith(u8, exact, "|\n\n"));
+    try testing.expect(std.mem.find(u8, exact, "-->") != null and std.mem.count(u8, exact, "-->") == 1);
+}
+
+test "snippet: the locus is the earliest primary span, a later primary beats an earlier secondary, ties keep the first" {
+    const text = "a\nb\nc\nd\ne\n";
+    var d: Diagnostic = .{ .path = "", .file = "f", .line = 3, .col = 1, .severity = .@"error", .code = "", .message = "m" };
+    d.labels = &.{.{ .line = 1, .col = 1 }};
+    var out = try snipOf(text, d, .{});
+    try testing.expect(std.mem.find(u8, out, "--> f:3:1\n") != null);
+    testing.allocator.free(out);
+    d.line = 5;
+    d.labels = &.{.{ .line = 2, .col = 1, .primary = true }};
+    out = try snipOf(text, d, .{});
+    try testing.expect(std.mem.find(u8, out, "--> f:2:1\n") != null);
+    testing.allocator.free(out);
+    // Columns past the end clamp to the same byte: the first span stays the locus.
+    d.line = 1;
+    d.col = 50;
+    d.labels = &.{.{ .line = 1, .col = 99, .primary = true }};
+    out = try snipOf("ab\n", d, .{});
+    try testing.expect(std.mem.find(u8, out, "--> f:1:50\n") != null);
+    testing.allocator.free(out);
+}
+
+test "snippet: a finding without a file is not quoted when there are two sources" {
+    const d: Diagnostic = .{ .path = "", .line = 1, .col = 1, .severity = .@"error", .code = "", .message = "m" };
+    const out = try renderAlloc(d, .{ .style = .snippet, .sources = &.{ .{ .file = "a", .text = "x\n" }, .{ .file = "b", .text = "y\n" } } });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.find(u8, out, "1 |") == null);
+}
+
+test "snippet: context lines belong to their own file and unquotable labels add none" {
+    const d: Diagnostic = .{ .path = "", .file = "a", .line = 3, .col = 1, .severity = .@"error", .code = "", .message = "m", .labels = &.{
+        .{ .file = "b", .line = 1, .col = 1 },
+        .{ .file = "nowhere", .line = 1, .col = 1 },
+    } };
+    const out = try renderAlloc(d, .{ .style = .snippet, .after_label_lines = 2, .sources = &.{
+        .{ .file = "a", .text = "1\n2\n3\n4\n5\n6\n7\n" },
+        .{ .file = "b", .text = "p\nq\nr\ns\nt\nu\n" },
+    } });
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        "error: m\n" ++
+            "  --> a:3:1\n" ++
+            "  |\n" ++
+            "3 | 3\n" ++
+            "  | ^\n" ++
+            "4 | 4\n" ++
+            "5 | 5\n" ++
+            "  |\n" ++
+            "  --> b:1:1\n" ++
+            "  |\n" ++
+            "1 | p\n" ++
+            "  | -\n" ++
+            "2 | q\n" ++
+            "3 | r\n" ++
+            "  |\n" ++
+            "  --> nowhere:1:1\n\n",
+        out,
+    );
+}
+
+test "snippet: a byte that is not UTF-8 is one column wide even when its value is a zero-width code point" {
+    // 0xAD alone is invalid UTF-8 (shown as ?); as U+00AD it would be width 0.
+    const d: Diagnostic = .{ .path = "", .file = "f", .line = 1, .col = 3, .end_line = 1, .end_col = 4, .severity = .@"error", .code = "", .message = "m" };
+    const out = try snipOf("a\xadb\n", d, .{});
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.find(u8, out, "1 | a?b\n  |   ^\n") != null);
+}
+
+test "snippet column=char: a byte-order mark after the first character still counts as a character" {
+    const d: Diagnostic = .{ .path = "", .file = "f", .line = 1, .col = 5, .severity = .@"error", .code = "", .message = "m" };
+    const out = try snipOf("a\u{feff}b\n", d, .{ .column = .char });
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.find(u8, out, "--> f:1:3\n") != null);
+}
+
+test "Margin: computed window for hand-checked arithmetic cases (whitespace trim, labels fit, spans fit, give up)" {
+    const Case = struct { a: [6]usize, line_len: usize, want: [4]usize };
+    const cases = [_]Case{
+        .{ .a = .{ 5, 16, 33, 40, 36, 176 }, .line_len = 183, .want = .{ 10, 46, 10, 46 } },
+        .{ .a = .{ 6, 60, 84, 129, 53, 214 }, .line_len = 37, .want = .{ 48, 101, 37, 37 } },
+        .{ .a = .{ 12, 1, 4, 33, 65, 90 }, .line_len = 96, .want = .{ 0, 65, 0, 65 } },
+        .{ .a = .{ 24, 23, 74, 106, 63, 95 }, .line_len = 48, .want = .{ 17, 80, 17, 48 } },
+        .{ .a = .{ 26, 32, 89, 141, 48, 45 }, .line_len = 38, .want = .{ 0, 45, 0, 38 } },
+        .{ .a = .{ 27, 56, 72, 72, 45, 151 }, .line_len = 197, .want = .{ 42, 87, 42, 87 } },
+        .{ .a = .{ 38, 57, 66, 91, 65, 14 }, .line_len = 81, .want = .{ 16, 16, 16, 81 } },
+        .{ .a = .{ 43, 59, 79, 120, 29, 50 }, .line_len = 63, .want = .{ 21, 50, 21, 50 } },
+        .{ .a = .{ 45, 46, 53, 98, 67, 175 }, .line_len = 257, .want = .{ 39, 106, 39, 106 } },
+        .{ .a = .{ 47, 79, 108, 116, 64, 69 }, .line_len = 197, .want = .{ 25, 69, 25, 69 } },
+        .{ .a = .{ 56, 75, 128, 140, 69, 119 }, .line_len = 150, .want = .{ 69, 138, 69, 138 } },
+        .{ .a = .{ 57, 38, 47, 52, 8, 202 }, .line_len = 231, .want = .{ 32, 53, 32, 53 } },
+        .{ .a = .{ 57, 71, 125, 184, 62, 231 }, .line_len = 260, .want = .{ 65, 131, 65, 131 } },
+        .{ .a = .{ 61, 71, 112, 166, 12, 143 }, .line_len = 108, .want = .{ 65, 118, 65, 108 } },
+        .{ .a = .{ 63, 0, 42, 47, 61, 142 }, .line_len = 208, .want = .{ 0, 61, 0, 61 } },
+        .{ .a = .{ 66, 72, 126, 132, 59, 39 }, .line_len = 23, .want = .{ 44, 44, 23, 23 } },
+        .{ .a = .{ 66, 85, 88, 107, 53, 122 }, .line_len = 250, .want = .{ 60, 113, 60, 113 } },
+    };
+    for (cases) |c| {
+        const m = Margin.init(c.a[0], c.a[1], c.a[2], c.a[3], c.a[4], c.a[5]);
+        try testing.expectEqual(c.want[0], m.computed_left);
+        try testing.expectEqual(c.want[1], m.computed_right);
+        try testing.expectEqual(c.want[2], m.left(c.line_len));
+        try testing.expectEqual(c.want[3], m.right(c.line_len));
+        try testing.expectEqual(c.want[0] > 0, m.wasCutLeft());
+    }
+}
+
+const long100 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL\n";
+
+fn cutOf(text: []const u8, d: Diagnostic, tw: u16) ![]u8 {
+    return snipOf(text, d, .{ .term_width = tw });
+}
+
+test "term_width: cut on both sides, one side, with leading blanks, wide characters and hanging labels" {
+    const base: Diagnostic = .{ .path = "", .file = "f", .line = 1, .col = 50, .end_line = 1, .end_col = 54, .severity = .@"error", .code = "", .message = "m", .span_message = "here" };
+    var out = try cutOf(long100, base, 30);
+    try testing.expectEqualStrings("error: m\n  --> f:1:50\n  |\n1 | ...IJKLMNOPQRSTUVWXYZ01...\n  |         ^^^^ here\n\n", out);
+    testing.allocator.free(out);
+
+    var b2 = base;
+    b2.labels = &.{ .{ .line = 1, .col = 40, .end_line = 1, .end_col = 44, .message = "left" }, .{ .line = 1, .col = 60, .end_line = 1, .end_col = 63, .message = "right" } };
+    out = try cutOf(long100, b2, 40);
+    try testing.expectEqualStrings("error: m\n  --> f:1:50\n  |\n1 | ...ABCDEFGHIJKLMNOPQRSTUVWXYZ0123...\n" ++
+        "  |       ----      ^^^^      --- right\n" ++
+        "  |       |         |          \n" ++
+        "  |       |         here\n" ++
+        "  |       left\n\n", out);
+    testing.allocator.free(out);
+
+    var b3 = base;
+    b3.col = 3;
+    b3.end_col = 6;
+    out = try cutOf(long100, b3, 25);
+    try testing.expectEqualStrings("error: m\n  --> f:1:3\n  |\n1 | 0123456789abcdefgh...\n  |   ^^^ here\n\n", out);
+    testing.allocator.free(out);
+
+    var b4 = base;
+    b4.col = 95;
+    b4.end_col = 99;
+    out = try cutOf(long100, b4, 25);
+    try testing.expectEqualStrings("error: m\n  --> f:1:95\n  |\n1 | ...tuvwxyzABCDEFGH...\n  |       ^^^^ here\n\n", out);
+    testing.allocator.free(out);
+
+    var b5 = base;
+    b5.col = 42;
+    b5.end_col = 43;
+    b5.span_message = "ws";
+    out = try cutOf("                                        x" ++ long100, b5, 30);
+    try testing.expectEqualStrings("error: m\n  --> f:1:42\n  |\n1 | ...   x0123456789abcdef...\n  |        ^ ws\n\n", out);
+    testing.allocator.free(out);
+
+    var b6 = base;
+    b6.col = 16;
+    b6.end_col = 22;
+    b6.span_message = "w";
+    out = try cutOf("\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\n", b6, 20);
+    try testing.expectEqualStrings("error: m\n  --> f:1:16\n  |\n1 | ... \u{4e16}\u{754c}\u{4e16}\u{754c}...\n  |       ^^^^ w\n\n", out);
+    testing.allocator.free(out);
+}
