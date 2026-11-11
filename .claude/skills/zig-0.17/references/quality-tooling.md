@@ -4,7 +4,7 @@ Coverage, dead code, duplication, linting and fuzzing. Zig ships none of these,
 and the usual third-party answers each have a trap that silently produces a
 green result. The measurements below come from upstream and were made against Zig
 `0.17.0-dev.1158` on macOS (aarch64), not re-run here; the std APIs shown were
-checked against the released 0.17.0 (the fuzzer is unchanged since 0.16).
+checked against the released 0.17.0 and the 0.17.1 diff (the fuzzer is unchanged since 0.16).
 
 ## Quick Reference
 

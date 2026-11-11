@@ -1,6 +1,6 @@
 # std.process - Process Management API Reference
 
-Process spawning, environment variables, argument parsing, and system utilities in Zig 0.17.0 (the 0.16 restructuring below is unchanged in 0.17.0 unless a section says otherwise).
+Process spawning, environment variables, argument parsing, and system utilities in Zig 0.17.1 (the 0.16 restructuring below is unchanged in 0.17 unless a section says otherwise).
 
 ## Table of Contents
 - [Module Structure](#module-structure)
@@ -507,8 +507,9 @@ return std.process.replace(io, .{
 });
 ```
 
-`std.process.can_replace` is `false` on Windows, Haiku, and WASI (there, `replace`
-returns `error.OperationUnsupported`).
+`std.process.can_replace` is `false` on Windows, Haiku, WASI, tvOS and watchOS (there, `replace`
+returns `error.OperationUnsupported`; tvOS/watchOS were added in 0.17.1). `std.process.can_spawn`
+is `false` on WASI, tvOS and watchOS (0.17.0 also listed iOS and visionOS).
 
 ### System Memory
 

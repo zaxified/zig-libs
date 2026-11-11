@@ -185,18 +185,22 @@ test "no leaks on allocation failure" {
 - `error.SwallowedOutOfMemoryError` - `OutOfMemory` was caught but not propagated
 - `error.NondeterministicMemoryUsage` - allocation count varies between runs
 
-**0.17.0 and in-place resizing.** The check counts allocator calls in a baseline run
+**In-place resizing (0.17.1 behaviour first).** On 0.17.1 (`7c793c2`, #37141)
+`checkAllAllocationFailures` builds every `FailingAllocator` with `.resize_fail_index = 0`
+(`testing.zig`): every `resize` and `remap` inside the check fails, so the code under test always
+takes its fresh-`alloc` path there, and the runs are deterministic. A test that relied on an
+in-place grow inside the check now sees one more `alloc` (and one more failure point).
+On 0.17.0 the check counts allocator calls in a baseline run
 (`testing.zig` `checkAllAllocationFailures`, the `needed_alloc_count` run) and fails with
 `NondeterministicMemoryUsage` when a later run used fewer. On 0.17.0 a function whose scratch
 allocator resizes in place (a `std.heap.BufferFirstAllocator` over a stack buffer, a
 `SafeAllocator`) can trip it, because a resize or remap that succeeds in place in one run and fails in another (forcing a
 fresh `alloc`) changes the number of `alloc` calls the baseline counted (only `alloc` is counted,
-`FailingAllocator` keeps one separate counter, `resize_index` in `testing/FailingAllocator.zig`, shared by `resize` and `remap`) (seen in a migration: two tests of a JSON validator; reported fixed on
-0.17.x, commit `7c793c2`; a three-line `ArrayList` growth probe did NOT reproduce it on 0.17.0).
-Workaround: inside the function handed to `checkAllAllocationFailures`, wrap the allocator you
+`FailingAllocator` keeps one separate counter, `resize_index` in `testing/FailingAllocator.zig`, shared by `resize` and `remap`) (seen in a migration: two tests of a JSON validator; a three-line `ArrayList` growth probe did
+NOT reproduce it on 0.17.0). Workaround for code that must pass on 0.17.0: inside the function handed to `checkAllAllocationFailures`, wrap the allocator you
 were given in one that forwards `alloc`/`free` and refuses `resize` (`false`) and `remap`
-(`null`), and use the wrapper everywhere below that point; mark it `// zig 0.17.1: 7c793c2`
-so it can be deleted.
+(`null`), and use the wrapper everywhere below that point (this is what 0.17.1 does itself);
+mark it `// zig 0.17.0 only: 7c793c2` so it can be deleted once the project requires 0.17.1.
 
 ## Temporary Directory
 

@@ -36,8 +36,8 @@ const big: u64 = 100;
 const small: u8 = @intCast(big);  // OK if value fits
 ```
 From a signed to a narrower *unsigned* type (`i64` to `u32`) `@intCast` and `std.math.cast` are
-miscompiled in optimized builds in 0.17.0 (#37131): cast to the same-width unsigned type first,
-each step range-checked, see zig-gotchas.md.
+miscompiled in optimized builds in 0.17.0 (#37131, fixed in 0.17.1): code that must build with
+0.17.0 casts to the same-width unsigned type first, each step range-checked, see zig-gotchas.md.
 
 ### @floatCast
 ```zig

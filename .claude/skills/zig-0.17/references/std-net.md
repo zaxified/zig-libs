@@ -1,4 +1,4 @@
-# std.Io.net Reference (0.17.0; migrating from 0.15.x std.net)
+# std.Io.net Reference (0.17.1; migrating from 0.15.x std.net)
 
 Cross-platform networking abstractions: TCP and Unix sockets, address parsing, connecting by host name, stream I/O.
 

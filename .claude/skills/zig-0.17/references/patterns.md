@@ -1,6 +1,6 @@
 # Zig Patterns Reference
 
-Comprehensive patterns for writing idiomatic Zig code. This reference contains best practices extracted from the Zig standard library and established community idioms (checked against Zig 0.17.0 unless a section says it is an excerpt from older std source).
+Comprehensive patterns for writing idiomatic Zig code. This reference contains best practices extracted from the Zig standard library and established community idioms (checked against Zig 0.17.0 and the 0.17.1 diff unless a section says it is an excerpt from older std source).
 
 ## Table of Contents
 

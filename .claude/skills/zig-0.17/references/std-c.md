@@ -965,8 +965,8 @@ fn checkError(result: c_int) !void {
     if (result < 0) {
         const errno_val = c._errno().*;
         // Convert to std.posix error
-        // errno is never negative, but a signed -> narrower unsigned @intCast is miscompiled in
-        // optimized builds (#37131): range-checked two-step cast
+        // errno is never negative, but Zig 0.17.0 miscompiles a signed -> narrower unsigned
+        // @intCast in optimized builds (#37131, fixed in 0.17.1): range-checked two-step cast
         const e = std.math.cast(u16, std.math.cast(u32, errno_val) orelse return error.Unexpected) orelse return error.Unexpected;
         return std.posix.unexpectedErrno(@fromBackingInt(e));
     }

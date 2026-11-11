@@ -1,6 +1,6 @@
 # std.compress - Compression API Reference
 
-Compression and decompression algorithms in Zig 0.17.0. Supports DEFLATE (gzip, zlib), LZMA, LZMA2, XZ, and Zstandard.
+Compression and decompression algorithms in Zig 0.17.1. Supports DEFLATE (gzip, zlib), LZMA, LZMA2, XZ, and Zstandard.
 
 ## Table of Contents
 - [Module Structure](#module-structure)
@@ -139,7 +139,7 @@ const decompressed = try decompress.reader.allocRemaining(allocator, .limited(25
 defer allocator.free(decompressed);
 ```
 
-**Never use the empty-buffer form (`.init(&input, &.{}, .{})`) on hostile input.** On 0.17.0
+**Never use the empty-buffer form (`.init(&input, &.{}, .{})`) on hostile input.** On 0.17.0 and 0.17.1 (zstd unchanged)
 the decompressor checks the limit against a compressed block's *compressed* size
 (`compress/zstd/Decompress.zig:300`) while the block expands to up to 128 KiB, so `stream`
 returns more than `limit` and `Reader.stream` asserts on it (`Io/Reader.zig:177`). Probe: with

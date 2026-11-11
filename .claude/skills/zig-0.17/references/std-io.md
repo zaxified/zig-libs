@@ -1,4 +1,4 @@
-# std.io - I/O API Reference (0.15.x → 0.16, valid in 0.17.0)
+# std.io - I/O API Reference (0.15.x → 0.16, valid in 0.17.1)
 
 New buffered I/O API introduced in Zig 0.15.x ("Writergate"). Non-generic, buffer-integrated Reader and Writer interfaces.
 

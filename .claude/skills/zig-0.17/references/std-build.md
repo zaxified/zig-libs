@@ -1,5 +1,5 @@
 
-# std.Build - Zig Build System Reference (0.17.0)
+# std.Build - Zig Build System Reference (0.17.1)
 
 The Zig build system models projects as directed acyclic graphs (DAG) of build steps. Build scripts are written in Zig itself (`build.zig`), providing full language features during configuration.
 
@@ -487,7 +487,7 @@ update_step.dependOn(&update_src.step);
     .name = .myproject,             // an enum literal, not a string
     .version = "1.0.0",
     .fingerprint = 0x0123456789abcdef, // generated once: zig build prints the value to use
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .zlib = .{
             .url = "https://example.com/zlib-zig-1.0.0.tar.gz",
@@ -596,7 +596,10 @@ run_cmd.addArgs(&.{ "--config", "debug.json" });
 // Change working directory
 run_cmd.setCwd(b.path("data"));
 
-// Set environment variables
+// Set environment variables. The first call freezes the whole environment of this step at
+// configure time (cached): later shell variables never reach it. To keep the live
+// environment, use addSystemCommand(&.{ "env", "DEBUG=1" }) + addArtifactArg(exe) instead
+// (zig-gotchas.md, "The build configuration is cached on inputs it cannot see").
 run_cmd.setEnvironmentVariable("DEBUG", "1");
 
 // Create run step
@@ -1031,7 +1034,7 @@ ZON (Zig Object Notation) is used for package manifests.
     .fingerprint = 0x0123456789abcdef,
 
     // Minimum Zig version (optional)
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
 
     // Dependencies (optional)
     .dependencies = .{
@@ -1137,6 +1140,14 @@ zig build --prefix=/opt/myapp
 zig build --prefix-lib-dir=lib64
 zig build --prefix-exe-dir=sbin
 ```
+
+0.17.1 (`17cf964`) separates where the build writes from where the files will live: the
+`install_*` path bases are `$DESTDIR` + the prefix, and the new `deployed_prefix`,
+`deployed_lib`, `deployed_bin`, `deployed_include` bases (`std.Build.Configuration.LazyPath.Relative.Base`;
+`b.graph.path(.deployed_lib, "foo.pc")` or `.{ .relative = .{ .base = .deployed_lib, .sub_path = "foo.pc" } }`) are the paths on the target system, unaffected by `$DESTDIR`.
+They exist for files that must embed absolute install paths (a pkg-config `.pc` file); avoid
+embedding absolute paths otherwise. The configure phase cannot depend on either kind (it
+panics). Read from the 0.17.1 source, not run for this skill.
 
 ## Common Patterns
 

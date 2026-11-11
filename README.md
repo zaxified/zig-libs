@@ -1,6 +1,9 @@
 # zig-libs
 
 [![CI](https://github.com/zaxified/zig-libs/actions/workflows/ci.yml/badge.svg)](https://github.com/zaxified/zig-libs/actions/workflows/ci.yml)
+[![Zig 0.17.1](https://img.shields.io/badge/Zig-0.17.1-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/download/#release-0.17.1)
+[![Release](https://img.shields.io/github/v/release/zaxified/zig-libs?sort=date)](https://github.com/zaxified/zig-libs/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A curated collection of **foundational Zig modules** — performance-minded, universal where
 possible, and built against something that already exists: a published specification, a set of
@@ -14,7 +17,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 258 modules (Zig 0.17.0, tests green in `ReleaseSafe` and `ReleaseFast`)
+**Status:** 258 modules (Zig 0.17.1, tests green in `ReleaseSafe` and `ReleaseFast`)
 · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -54,8 +57,9 @@ carry their own attribution; it does not catalogue provenance.
 Three ways to declare the dependency, and a fourth that overrides whichever you picked. The
 `build.zig` half is identical for all of them.
 
-Requires Zig 0.17.0 (`minimum_zig_version` in `build.zig.zon`); Tags up to and including `2026-10-18`
-build with Zig 0.16.
+Requires Zig 0.17.1 (`minimum_zig_version` in `build.zig.zon`; `build.zig` refuses an older compiler).
+Older tags: up to and including `2026-11-10` build with Zig 0.17.0, up to and including
+`2026-10-18` with Zig 0.16.
 
 **1. Local path** — developing against an unpushed checkout. Relative, so the manifest
 carries no home-dir path:

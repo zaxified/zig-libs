@@ -1,8 +1,8 @@
 # std.json - JSON Parsing and Serialization
 
-JSON RFC 8259 compliant parsing and stringification in Zig 0.17.0.
+JSON RFC 8259 compliant parsing and stringification in Zig 0.17.1.
 
-**Optimized-build caveat (#37131):** `parseFromValue` into an unsigned field from a `Value.integer`, and a float-formatted integer such as `4e9`, go through a signed-to-narrower-unsigned `@intCast` (`json/static.zig:582,784`) that 0.17.0 miscompiles in ReleaseSafe/ReleaseFast; plain integer text goes through `std.fmt.parseInt` and is fine. A range check on the value std already returned is exactly what the poison lets LLVM fold away, so it proves nothing: parse such fields as `i64` and narrow with the two-step spelling in zig-gotchas.md.
+**Optimized-build caveat, 0.17.0 only (#37131, fixed in 0.17.1):** `parseFromValue` into an unsigned field from a `Value.integer`, and a float-formatted integer such as `4e9`, go through a signed-to-narrower-unsigned `@intCast` (`json/static.zig:582,784`) that 0.17.0 miscompiles in ReleaseSafe/ReleaseFast; plain integer text goes through `std.fmt.parseInt` and is fine. A range check on the value std already returned is exactly what the poison lets LLVM fold away, so it proves nothing: on 0.17.0, parse such fields as `i64` and narrow with the two-step spelling in zig-gotchas.md.
 
 ## Table of Contents
 - [Parsing JSON](#parsing-json)

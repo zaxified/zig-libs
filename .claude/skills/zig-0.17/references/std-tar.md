@@ -1,6 +1,6 @@
 # std.tar - Tar Archive API Reference
 
-Tar archive reading and writing in Zig 0.17.0. Supports POSIX ustar, GNU extensions for long names, and pax extended headers.
+Tar archive reading and writing in Zig 0.17.1. Supports POSIX ustar, GNU extensions for long names, and pax extended headers.
 
 ## Table of Contents
 - [Module Structure](#module-structure)
@@ -234,7 +234,7 @@ var src_buf: [4096]u8 = undefined;
 var src_reader = src_file.reader(io, &src_buf);
 const stat = try src_file.stat(io);
 // Stat.mtime is `Io.Timestamp` (nanoseconds); writeFile wants POSIX seconds.
-// i96 -> u96 -> u64, each step range-checked (signed -> narrower unsigned @intCast: #37131)
+// i96 -> u96 -> u64, each step range-checked (also safe on 0.17.0, see #37131 in zig-gotchas.md)
 const secs = @divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s);
 const mtime_secs: u64 = std.math.cast(u64, std.math.cast(u96, secs) orelse 0) orelse 0;
 
@@ -429,7 +429,7 @@ fn createTarFromDir(io: std.Io, allocator: Allocator, source_dir: std.Io.Dir, ro
                 var file_reader = file.reader(io, &buf);
                 const stat = try file.stat(io);
                 const secs = @divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s);
-                const mtime_secs: u64 = std.math.cast(u64, std.math.cast(u96, secs) orelse 0) orelse 0; // #37131
+                const mtime_secs: u64 = std.math.cast(u64, std.math.cast(u96, secs) orelse 0) orelse 0; // two steps: safe on 0.17.0 too (#37131)
                 try w.writeFile(entry.path, &file_reader, mtime_secs);
             },
             .sym_link => {

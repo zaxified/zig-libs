@@ -1,6 +1,6 @@
 # std.zip - ZIP Archive API Reference
 
-ZIP archive reading and extraction in Zig 0.17.0. Supports ZIP and ZIP64 formats with store and deflate compression.
+ZIP archive reading and extraction in Zig 0.17.1. Supports ZIP and ZIP64 formats with store and deflate compression.
 
 ## Table of Contents
 - [Module Structure](#module-structure)

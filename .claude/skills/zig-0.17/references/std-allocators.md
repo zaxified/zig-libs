@@ -272,6 +272,11 @@ var safe: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{
 
 Maximum performance for multithreaded ReleaseFast builds. Few safety features. **Caveat:** soak-test its RSS first: one project measured `smp_allocator` growing +5.4 MB/min under a long soak, see SKILL.md "Naming Changes"; `SafeAllocator` over `page_allocator` or `c_allocator` are the alternatives (measurement from a migration, not re-run for this skill).
 
+How it works, and what follows from it (`heap/SmpAllocator.zig`, unchanged since 0.16 apart from renames):
+- **Size classes end at 32 KiB** (half the 64 KiB slab; larger only where the page size exceeds 64 KiB). Anything larger goes straight to `PageAllocator.map` on `alloc` and is unmapped on `free`, so every such allocation pays fresh page faults. Measured on 0.17.0 (ReleaseFast, x86_64, 10 000 rounds of alloc, `@memset`, free): 32 KiB took 8 minor faults in total, 32 KiB + 1 byte 90 000, 64 KiB 160 000 (every page, every round). A hot path that allocates scratch above 32 KiB per call should keep the buffer across calls.
+- **Growth with balanced alloc and free.** `alloc` on an empty size class moves the thread to the next per-CPU slot (`max_alloc_search = 1`) and maps a new 64 KiB slab there; `free` returns the block to the slot the thread is on now. In one project (a compressor, one thread, 8 CPUs) a call pattern hopped slots every call and always freed its 32 KiB block where the next call did not look: 1 001 slabs in 2 000 calls, 660 MB RSS after 25 600 calls, flat 2.7 MB on `c_allocator`. Other patterns (`ArrayList` growth loops) stayed flat; whether a pattern resonates depends on the CPU count (measured in that project, not re-run for this skill). In the same family: an `ArenaAllocator` created per call on top of `smp_allocator` reached 3.6 GB RSS over 2 million calls in another project. If RSS grows under `smp_allocator`, run the same loop on `c_allocator`; the fixes are a libc allocator, buffers kept across calls, or a stack buffer in front of the per-call arena (`std.heap.BufferFirstAllocator`).
+- Default selection (`std/start.zig`): `init.gpa` is `smp_allocator` in multithreaded ReleaseFast/ReleaseSmall builds without libc and off wasm; full rule in SKILL.md "Naming Changes".
+
 ```zig
 const allocator = std.heap.smp_allocator;
 const data = try allocator.alloc(u8, 1000);

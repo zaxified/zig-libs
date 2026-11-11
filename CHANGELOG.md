@@ -32,6 +32,11 @@ directory.
   the destination type; 0.17.1 fixes it, and the collection's 0.17.0 workarounds are gone. Since
   `minimum_zig_version` is advisory (Zig reads it nowhere), `build.zig` refuses an older compiler
   with a compile error. Tag `2026-11-10` is the last one built for 0.17.0.
+- **Docs follow the 0.17.1 move (2026-11-11).** The root README states Zig 0.17.1 (status line,
+  requirement, which older tags build with 0.17.0 / 0.16) and carries Zig-version, release and
+  licence badges; the example apps' READMEs ask for 0.17.1 like their `init.sh`; the vendored
+  `zig-0.17` skill moves to zig-skills `v0.17.1-r1` (installed by its `install.py`, which checks
+  the tag's audit record and gate CI).
 - **Zig 0.17.1 std behaviour that modules inherit (2026-11-11, swept against the 0.17.0 → 0.17.1
   std diff and commit list).** `std.Io.net.IpAddress.parse` now accepts IPv6 literals with an IPv4
   tail after any prefix (`64:ff9b::192.0.2.1`, `1::2:1.2.3.4`; 0.17.0 took only `::ffff:a.b.c.d`), so

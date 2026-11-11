@@ -1,22 +1,22 @@
 ---
 name: zig-0.17
-description: "Zig 0.17.0 patterns, checked against the released standard library. Use when writing, reviewing, or debugging Zig code for Zig 0.17.x (zig version / minimum_zig_version in build.zig.zon; a 0.16 project uses the zig skill instead), build.zig and build.zig.zon files, or comptime metaprogramming. Covers the 0.17 changes: array ** removed (@splat), errdefer capture and @cImport removed (translate-c package), @intFromEnum to @backingInt, struct-of-arrays @typeInfo (field_names, field_types), @bitCast on extern structs, @hasDecl pub-only, std.builtin to std.lang with .debug/.safe/.fast/.small, SafeAllocator and BufferFirstAllocator, Allocator.print and mem.print, mem.find, zon.parse with an arena, b.args to addPassthruArgs, custom build steps removed (host tool + Run step), array/vector @bitCast as logical little-endian bits, the #37131 signed-to-narrower-unsigned @intCast/math.cast miscompile in optimized builds, the configurer/maker build split with its cached configuration (undeclared configure-time reads go stale: dependOnDirectoryContents, poisonCache), optimize-mode spellings on the CLI, incremental builds with the self-hosted backend, and zig-pkg/. Also prevents older patterns from training data: the std.Io instance threaded through files, sockets, clocks and locks (std.fs to std.Io.Dir/File, std.net to std.Io.net, std.time timestamps and Timer to std.Io.Clock, std.Thread.Mutex/Condition/Pool to std.Io.Mutex/Condition/Group, std.crypto.random to io.randomSecure), main(init: std.process.Init), build system APIs (root_module, Compile methods to Module methods), buffered Reader/Writer with flush, removed async/await and usingnamespace; plus gotchas found in production code."
+description: "Zig 0.17.1 patterns, checked against the released standard library (0.17.0 bugs that 0.17.1 fixes are marked, with workarounds). Use when writing, reviewing, or debugging Zig code for Zig 0.17.x (zig version / minimum_zig_version in build.zig.zon; a 0.16 project uses the zig skill instead), build.zig and build.zig.zon files, or comptime metaprogramming. Covers the 0.17 changes: array ** removed (@splat), errdefer capture and @cImport removed (translate-c package), @intFromEnum to @backingInt, struct-of-arrays @typeInfo (field_names, field_types), @bitCast on extern structs, @hasDecl pub-only, std.builtin to std.lang with .debug/.safe/.fast/.small, SafeAllocator and BufferFirstAllocator, Allocator.print and mem.print, mem.find, zon.parse with an arena, b.args to addPassthruArgs, custom build steps removed (host tool + Run step), array/vector @bitCast as logical little-endian bits, the per-byte lowering of wide @bitCast and readInt/writeInt(u128) (#36256) that makes std AES-GCM 2.6x slower, the 0.17.0 #37131 signed-to-narrower-unsigned @intCast/math.cast miscompile (fixed in 0.17.1), the configurer/maker build split with its cached configuration (undeclared configure-time reads go stale: dependOnDirectoryContents, poisonCache), optimize-mode spellings on the CLI, incremental builds with the self-hosted backend, and zig-pkg/. Also prevents older patterns from training data: the std.Io instance threaded through files, sockets, clocks and locks (std.fs to std.Io.Dir/File, std.net to std.Io.net, std.time timestamps and Timer to std.Io.Clock, std.Thread.Mutex/Condition/Pool to std.Io.Mutex/Condition/Group, std.crypto.random to io.randomSecure), main(init: std.process.Init), build system APIs (root_module, Compile methods to Module methods), buffered Reader/Writer with flush, removed async/await and usingnamespace; plus gotchas found in production code."
 license: MIT
 compatibility:
   - claude-code
   - opencode
   - codex
 metadata:
-  version: "0.17.0"
+  version: "0.17.1"
   language: "zig"
   category: "programming-language"
 ---
 
-# Zig Language Reference (v0.17.0)
+# Zig Language Reference (v0.17.1)
 
 Zig evolves rapidly. Training data contains outdated patterns that cause compilation errors. This skill documents breaking changes and correct modern patterns.
 
-**Version coverage:** 0.17.0 (current) with migration notes from 0.16, 0.15.x and 0.14.x.
+**Version coverage:** 0.17.1 (current; 0.17.0 differences are marked "0.17.0 only") with migration notes from 0.16, 0.15.x and 0.14.x.
 
 ## Design Principles
 
@@ -44,9 +44,11 @@ Larger cohesive files are idiomatic in Zig. Keep related code together — tests
 - Prefer `const` over `var` — immutability signals intent and enables optimizations
 - Prefer slices over raw pointers — bounds safety
 
-## Critical: Zig 0.17.0 Changes
+## Critical: Zig 0.17 Changes
 
-Everything below the 0.17 sections still describes 0.17.0 unless it is marked as old. Check
+Everything below the 0.17 sections still describes 0.17.1 unless it is marked as old. Statements
+"measured/run on 0.17.0" were taken before 0.17.1 and kept after reviewing the 0.17.0 → 0.17.1
+std diff. Check
 the project's toolchain first (`zig version`, `minimum_zig_version` in `build.zig.zon`): a
 0.16 project needs the 0.16 skill, not these spellings.
 
@@ -81,22 +83,28 @@ Replacing `**` mechanically (all forms below compiled and ran on 0.17.0):
   drop the `comptime` (error: "redundant comptime keyword in already comptime scope").
 - String repetition (`"ab" ** 3`, `line ** n` with a comptime `line`) has no builtin: use a
   comptime helper, and **declare it `inline fn`**. Assign the result from a `comptime` block and
-  return a pointer to that constant, and give the loop an eval quota that scales with the work —
-  `n * (s.len + 4) + 1000` (one migration saw `evaluation exceeded 3002 backwards branches` with
-  `n * 2 + 1000` at n = 998, which an isolated probe did not reproduce, so do not tune the quota
-  down):
+  return a pointer to that constant. Build it with `@splat` of rows plus a `@bitCast`, not with a
+  loop that copies into an array `var`: such a loop costs quadratic compile time (see
+  zig-gotchas.md, "A comptime loop that writes into an array `var` is quadratic"; the loop
+  version took 3.9 / 14.7 / 66 s of Sema for n = 10k / 20k / 40k copies of `"abc"`, this one
+  0.05 / 0.07 / 0.09 s, Zig 0.17.0; the same on 0.16.0, so this is old, the removal of `**` just
+  makes people write the loop). It needs no eval quota:
   ```zig
   inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
       const rep_result = comptime blk: {
-          @setEvalBranchQuota(n * (s.len + 4) + 1000);
-          var buf: [s.len * n:0]u8 = undefined;
-          for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
-          const rep_final = buf;
-          break :blk rep_final;
+          const rows: [n][s.len]u8 = @splat(s[0..s.len].*);
+          const flat: [s.len * n]u8 = @bitCast(rows);
+          break :blk flat ++ [_:0]u8{};
       };
       return &rep_result;
   }
   ```
+  (Run on 0.17.0 in Debug, ReleaseSafe and ReleaseFast: `"x" ++ strRepeat("ab", 3) ++ "y"`
+  returned from a `noinline fn` and read after a stack clobber, the sentinel, `n = 0`, an empty
+  `s`, 1000 copies, and the `inline for (msgs)` shape below; also in ReleaseSafe on s390x under
+  qemu. The sentinel of uniform strings such as `strRepeat("a", 100)`, the case `b23c07e` fixed
+  for other comptime arrays, read through a `noinline` function: present on 0.17.0 and 0.17.1
+  in all three modes.)
   Write it as `const r = comptime blk: { ...; break :blk f; }; return &r;`, not as
   `comptime { ...; return &f; }`: the latter fails ("function called at runtime cannot return
   value at comptime") when the helper is called from a runtime scope (probe-verified in a
@@ -124,8 +132,11 @@ Replacing `**` mechanically (all forms below compiled and ran on 0.17.0):
   (seen on an array of structs): grep the result for `\[[0-9]+\]u8, @splat\([a-z]` and check
   each hit's real element type.
 - Multi-element arrays (`[_]T{ a, b } ** N`): the same shape without the sentinel,
-  `fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [unit.len * n]T`
-  (a plain function with `@setEvalBranchQuota` and a `@memcpy` loop).
+  `fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [unit.len * n]T`.
+  For integer or float elements use the `@splat`-rows-and-`@bitCast` body above; a
+  `@memcpy` loop with `@setEvalBranchQuota` works for any `T` but is quadratic in compile time,
+  so keep it for short results. (The `@splat` form was run on 0.17.0 with `u16` and `f32` units in
+  Debug and ReleaseFast, and on s390x under qemu.)
 - Watch for `@typeInfo(X).@"enum".fields.len` used as the length: it is now
   `.field_names.len`, e.g. `var seen: [@typeInfo(E).@"enum".field_names.len]bool = @splat(false);`
   (a mechanical rewrite that wraps `@splat(false)` in `@as([@typeInfo(E)]bool, …)` yields invalid code).
@@ -223,8 +234,39 @@ strings, so the `.name` of a declaration entry goes) instead of `decls`, `error_
   big-endian code needed `@bitReverse` after it (a match-mask extraction); remove it. Checked at
   comptime on x86_64 and mips-linux-musl with a negative control, and a mask-extraction routine
   ran correctly on s390x under qemu (migration observations).
-- **`@intCast` / `std.math.cast` from a signed integer to a narrower *unsigned* one is
-  miscompiled in optimized builds (open, see #37131; not fixed in 0.17.0).** The
+- **A `@bitCast` between `[N]u8` (N > 8) and a type with a different element size is a
+  per-byte loop in 0.17, and above 64 bits LLVM cannot fold it back (open, see #36256).** It
+  hits `u128`/`u96`/`u192`/`u256`/`u48` ↔ bytes, so every `std.mem.readInt`/`writeInt` of those
+  widths (both endians), and `[4]u32`, `[2]u64`, `[8]u64`, `@Vector(4, u32)`, `@Vector(2, u64)`
+  ↔ bytes. ReleaseFast x86_64, instructions per function 0.16 → 0.17: `readInt(u128, p, .big)`
+  7 → 52, `writeInt(u128, …)` 6 → 62, `[16]u8` → `[4]u32` 6 → 75, `[64]u8` → `[16]u32` 9 → 168.
+  `readInt(u48)` (6 bytes) takes 23 instructions against 6 for `u64` (on 0.17.0 and 0.17.1). Not
+  hit: 8/16/32/64-bit integers, same-element-size casts (`[16]u8` ↔ `@Vector(16, u8)`, `[4]u32` ↔
+  `@Vector(4, u32)`), pointer casts. The std code pays too: `std.crypto.core.modes.ctr` writes
+  each counter with `writeInt(u128, …)` and GHASH uses `u128` casts, so on 0.17
+  `aes_gcm.Aes128Gcm` takes 2.6x and `onetimeauth.Ghash` 2.4x the cycles of 0.16 (16 KiB
+  messages), `base64.standard.Encoder` 1.33x; SHA-2 and BLAKE2 are unchanged. Workaround with
+  identical bytes: go through a pointer, which LLVM keeps as one load/store (for a byte array
+  to wider lanes, the `@Vector(N, u8)` route in zig-gotchas.md "byte array and wider lanes" also
+  works: `[16]u8` → `@Vector(16, u8)` → `@Vector(2, u64)` is 5 instructions on 0.17.0 and 0.17.1). Re-measured on
+  0.17.1: `readInt(u128)` 52, unchanged (#36256 is still open):
+  ```zig
+  // SLOW on 0.17 in a hot loop: ~60 instructions
+  std.mem.writeInt(u128, buf[0..16], ctr, .big);
+  // RIGHT: one byte swap + one unaligned store
+  @as(*align(1) u128, @ptrCast(buf[0..16])).* = std.mem.nativeToBig(u128, ctr);
+  const v = std.mem.bigToNative(u128, @as(*align(1) const u128, @ptrCast(buf[0..16])).*);
+  ```
+  Only worth it where the cast runs per block or per element; one conversion per operation costs
+  a few dozen instructions. To find every such cast with its call site, scan the Debug LLVM IR
+  (`zig test -ODebug -fllvm -fno-emit-bin -femit-llvm-ir=x.ll …`) for `zext i8 … to iN` /
+  `trunc iN … to i8` with N > 64 and follow each `!dbg` through its `inlinedAt` chain.
+- **0.17.0 only (fixed in 0.17.1): `@intCast` / `std.math.cast` from a signed integer to a
+  narrower *unsigned* one is miscompiled in optimized builds (#37131).** On 0.17.1 the shape
+  below returns 2 in every mode (run for this skill); a project that must still build with
+  0.17.0 needs the spelling below; one that drops it must refuse 0.17.0 with a comptime
+  `builtin.zig_version` check (`minimum_zig_version` is not enforced by Zig; recipe in
+  zig-gotchas.md). On 0.17.0 the
   frontend emits LLVM `trunc nsw` (it should be `nuw`), so every value in the upper half of
   the destination range (`0x8000_0000..0xFFFF_FFFF` for `u32`) is poison and LLVM may delete
   any check that depends on it. Debug is unaffected, so the tests pass there. Whether an
@@ -367,6 +409,16 @@ run_cmd.addPassthruArgs();   // forwards `zig build run -- a b c`
   `b.root.joinString(gpa, sub)` returns a path that already includes `root_dir`, so passing it
   to `b.root.root_dir.handle` doubles the prefix (`Cache/Path.zig` `joinString` vs `openDir`).
   `LazyPath.getDisplayName()` → `"{f}"`.
+  `Cache.Path` has no `readFileAlloc`: a 0.16 `b.build_root.handle.readFileAlloc(io, sub, …)`
+  becomes "declare, then read the joined path from `cwd()`" (checked on 0.17.0; editing the
+  file reran the configuration):
+  ```zig
+  b.dependOnFileContents(b.path(sub));
+  const full = try b.root.joinString(b.allocator, sub);
+  const text = try std.Io.Dir.cwd().readFileAlloc(b.graph.io, full, b.allocator, .limited(1 << 20));
+  ```
+- `b.dupe(s)` returns `[]const u8` (0.16: `[]u8`): to modify the copy in place
+  (`std.mem.replaceScalar`, …) use `b.allocator.dupe(u8, s)`.
 - **Custom build steps are gone.** `Step.makeFn`/`Step.init` with a user function no longer
   exist: a `Step` carries a `tag` from the closed `Configuration.Step.Tag` set (`compile`, `run`,
   `fmt`, `write_file`, `check_file`, `options`, …), because the maker executes a serialized
@@ -409,7 +461,8 @@ run_cmd.addPassthruArgs();   // forwards `zig build run -- a b c`
 - Fetched packages land in `zig-pkg/` in the project (add it to `.gitignore`); `--pkg-path` /
   `ZIG_LOCAL_PKG_DIR` move it; `zig build --fork=<path>` overrides a dependency for one build.
 - Overriding the build runner is gone (`--build-runner`); IDEs use `zig build --listen=-`
-  (Build Server Protocol). **ZLS does not work with 0.17.0** — expect no editor diagnostics.
+  (Build Server Protocol). Use ZLS 0.17.0 (released 2026-10-19); some of its build.zig
+  integration regressed (see Tooling > ZLS).
 
 ### Optimize modes and backends
 - **Both spellings work in 0.17, only the old ones in 0.16:** `-OReleaseSafe` / `-Osafe` for
@@ -426,10 +479,33 @@ run_cmd.addPassthruArgs();   // forwards `zig build run -- a b c`
   ("unrecognized parameter", measured).
 
 ### Moving a 0.16 project
-1. Pin the toolchain (`minimum_zig_version = "0.17.0"`, CI) and cache the global cache in CI.
-   Tell the user before they switch their toolchain: **ZLS does not work with 0.17.0**, so an
-   editor on the project (VS Code, Neovim, …) loses diagnostics and completion until a ZLS
-   release supports it; `zig build` is the error source meanwhile (see Tooling > ZLS).
+1. Pin the toolchain (`minimum_zig_version = "0.17.1"`, CI) and cache the global cache in CI.
+   Tell the user before they switch their toolchain that the editor needs ZLS 0.17.0 too, and
+   that some imports may not resolve in it (see Tooling > ZLS); `zig build` stays the
+   authoritative error source.
+   **Check every dependency for a 0.17 line before touching your own code**: compare the
+   `build.zig.zon` pin with the upstream's branches and `master`; a dependency whose
+   `build.zig` does not configure on 0.17 stops the migration at its first step. Seen in one
+   migration: a SQLite wrapper package had no 0.17 line at all, a PostgreSQL client had one only
+   on `master` (read the diff before moving the pin). A wrapper around a C library can usually
+   be replaced by the C source itself: pin the upstream archive (here the SQLite amalgamation),
+   compile it in your own `build.zig` and translate its header with `b.addTranslateC` (see
+   "@cImport is removed" above). From that migration (builds and passes its tests on 0.17.0):
+   ```zig
+   // build.zig.zon: .sqlite = .{ .url = "https://www.sqlite.org/2025/sqlite-amalgamation-3490200.zip", .hash = … } (the hash `zig fetch --save` prints)
+   const amalgamation = b.dependency("sqlite", .{}).path(""); // a plain archive, no build.zig
+   const header = b.addTranslateC(.{               // translate the archive's header, never a system one
+       .root_source_file = amalgamation.path(b, "sqlite3.h"),
+       .target = target,
+       .optimize = optimize,
+   });
+   const lib = b.addLibrary(.{ .name = "sqlite", .linkage = .static, .root_module = b.createModule(.{
+       .target = target, .optimize = optimize, .link_libc = true,
+   }) });
+   lib.root_module.addCSourceFile(.{ .file = amalgamation.path(b, "sqlite3.c"), .flags = &.{"-std=c99"} });
+   mod.addImport("sqlite3", header.createModule()); // mod: the Zig module calling the C API (link_libc = true)
+   mod.linkLibrary(lib);
+   ```
 2. Parse first: `zig ast-check` every file — array `**`, `errdefer |e|`, `void{}`, `@cImport`
    stop at the parser.
 3. `zig fmt` rewrites `@intFromEnum`/`@enumFromInt`; the rest is by hand: struct-of-arrays
@@ -443,9 +519,10 @@ run_cmd.addPassthruArgs();   // forwards `zig build run -- a b c`
    between `[N]u8` and an integer that meant "the bytes as they lie in memory" is now a
    logical little-endian cast; replace it by `std.mem.bytesToValue`/`toBytes` (or
    `readInt`/`writeInt` with an explicit endianness) — see "Silent changes".
-   Also every signed-to-narrower-unsigned `@intCast`/`std.math.cast` (see "Silent changes",
-   #37131): the tests pass in Debug and fail, or silently pass a missing check, in ReleaseSafe/
-   ReleaseFast, so run the suite in an optimized mode too.
+   Move to 0.17.1, not 0.17.0: 0.17.0 miscompiles every signed-to-narrower-unsigned
+   `@intCast`/`std.math.cast` in optimized builds (see "Silent changes", #37131), and the tests
+   pass in Debug. Set `.minimum_zig_version = "0.17.1"` (advisory only; a library that relies on
+   0.17.1 adds the comptime version check from zig-gotchas.md). Run the suite in an optimized mode too.
    A hot `[N]u8` <-> wider-lane vector or >= 16-byte integer `@bitCast` (not `[4]u8`<->`u32` / `[8]u8`<->`u64`, a single load) also became a byte loop: route it through
    `@Vector(N, u8)` (see zig-gotchas.md, "byte array and wider lanes").
 5. Re-measure: constant-time checks and benchmarks (LLVM 22); anything that pins source text
@@ -485,7 +562,7 @@ by a `[^)]*` regex breaks a call whose `X` contains a call (`map.get("A") orelse
 backend compiles incrementally. Measured on a 10-line program in Debug (Zig 0.17.0, x86_64 Linux, 8-core machine):
 self-hosted 479 ms for the first build, then 14 ms and 6 ms per edit; with `.use_llvm = true`
 every edit was a full 2–3 s rebuild.
-For the edit loop (and while ZLS does not work) run it with the self-hosted backend, e.g.
+For the edit loop (and where ZLS does not resolve an import) run it with the self-hosted backend, e.g.
 `zig build -fincremental --watch -Dselfhosted=true` when the build exposes such an option;
 test with LLVM. There is no incremental mode without `--watch`.
 
@@ -1078,7 +1155,7 @@ if (@typeInfo(T) == .int) { ... }
 if (@typeInfo(T) == .bool) { ... }
 if (@typeInfo(T) == .pointer) { ... }
 
-// Accessing fields (0.17: struct-of-arrays, see "Zig 0.17.0 Changes"):
+// Accessing fields (0.17: struct-of-arrays, see "Zig 0.17 Changes"):
 const names = @typeInfo(T).@"struct".field_names;
 const types = @typeInfo(T).@"struct".field_types;
 const tag_type = @typeInfo(T).@"enum".tag_type;
@@ -1179,6 +1256,7 @@ var server = std.http.Server.init(
 | `error: configuration failed: FileSystemFailure` | 0.17: `dependOn…Contents` on a path that does not exist — declare the nearest existing ancestor |
 | `no field named 'args' in struct 'Build'` | 0.17: `run_cmd.addPassthruArgs()` |
 | `no field named 'build_root' in struct 'Build'` | 0.17: `b.root` (a `Cache.Path`) |
+| `expected type '[]u8', found '[]const u8'` on `b.dupe(...)` | 0.17: `b.dupe` returns `[]const u8`; a mutable copy is `b.allocator.dupe(u8, s)` |
 | `no field named 'ReleaseFast' in enum 'lang.Optimize'` | 0.17: `.debug`, `.safe`, `.fast`, `.small` |
 | `'zon.parse' has no member named 'fromSliceAlloc'` | 0.17: `std.zon.parse.fromSlice(T, .{ .gpa, .arena, .source, .diagnostics })` |
 | `missing struct field: pointer_stability` | 0.17 ArrayList: initialize with `.empty`, not a field literal |
@@ -1310,7 +1388,7 @@ Load these references when working with specific modules:
 - **[Zig Patterns](references/patterns.md)** - **Load when writing new code or reviewing code quality.** Comprehensive best practices extracted from the Zig standard library: quick patterns (memory/allocators, file I/O, HTTP, JSON, testing, build system) plus idiomatic code patterns covering syntax (closures, context pattern, options structs, destructuring), polymorphism (duck typing, generics, custom formatting, dynamic/static dispatch), safety (diagnostics, error payloads, defer/errdefer, compile-time assertions), and performance (const pointer passing)
 - **[Production Patterns](references/production-patterns.md)** - **Load when building large-scale Zig systems or optimizing performance.** Real-world patterns from Bun, Ghostty, TigerBeetle: modular build systems, CPU feature locking, pre-allocated message pools, counting allocators, SIMD with scalar fallback, intrusive linked lists, cache-line aligned SoA, work-stealing thread pools, SmolStr (15-byte SSO), comptime string maps, EnumUnionType generation, VOPR fuzzing, snapshot testing, edge-biased fuzz generation, platform abstraction facades, Objective-C bridges, opaque C wrappers with RAII, packed struct bitfields, Result union types, radix sort, tournament trees
 - **[MCP Server Patterns](references/mcp-server-patterns.md)** - **Load when building MCP servers, LSP bridges, JSON-RPC services, or protocol translators in Zig.** Patterns from zig-mcp: newline-delimited vs Content-Length transport, thread-based request correlation with ResetEvent, arena-per-request memory, child process lifecycle with pipe ownership transfer, tool registry with function pointers, std.json.Stringify for manual JSON building, lazy document sync with double-check locking, graceful degradation, auto-reconnect on crash, comptime schema generation, file URI encoding, common serialization gotchas
-- **[Gotchas](references/zig-gotchas.md)** - **Load when debugging code that compiles but misbehaves, or before a release.** Traps found in production code, each with its 0.17.0 status: what 0.17 changed silently (@bitCast arrays, @hasDecl, containsAtLeastScalar, SafeAllocator RSS), tuple swap, generic struct identity, @intFromFloat range, cancellation behind Io.Reader, fiber contextSwitch, fuzz corpus length prefix, self-hosted vs LLVM backend, allocRemaining limit, a struct holding a slice into its own field, byte-loop array/vector @bitCast, HashMap tombstones, byte-loop memcmp/secureZero, key schedules on the stack, build.zig.zon facts
+- **[Gotchas](references/zig-gotchas.md)** - **Load when debugging code that compiles but misbehaves, or before a release.** Traps found in production code, each with its 0.17 status (0.17.0-only ones marked fixed in 0.17.1): what 0.17 changed silently (@bitCast arrays, @hasDecl, containsAtLeastScalar, SafeAllocator RSS), tuple swap, generic struct identity, @intFromFloat range, a pointer into a by-value parameter, cancellation behind Io.Reader, a custom Io.Reader with only `stream` (one call per small read), fiber contextSwitch, fuzz corpus length prefix, self-hosted vs LLVM backend, allocRemaining limit, a struct holding a slice into its own field, byte-loop array/vector @bitCast, HashMap tombstones, byte-loop memcmp/secureZero, std.mem.find over secrets (Boyer-Moore-Horspool), ecdsa SecretKey.fromBytes without a range check, key schedules on the stack, build.zig.zon facts
 - **[Code Review](references/code-review.md)** - **Load when reviewing Zig code.** Systematic checklist organized by confidence level: ALWAYS FLAG (removed features, changed syntax, API changes), FLAG WITH CONTEXT (exception safety bugs, missing flush, allocator issues), SUGGEST (style improvements). Includes migration examples for 0.14/0.15 breaking changes
 
 ### Serialization
@@ -1345,14 +1423,18 @@ IDE support via Language Server Protocol. Provides autocomplete, go-to-definitio
 
 **Version matching rule:** Use ZLS release matching your Zig release (0.16.x ZLS for 0.16.x Zig). Nightly Zig needs nightly ZLS.
 
-**Zig 0.17.0: ZLS does not work.** The configurer/maker split removed the build-runner hook
-ZLS used; ZLS and Zig are moving it to the Build Server Protocol. Until a ZLS release supports
-0.17, compile (`zig build`) to see errors instead of relying on editor diagnostics.
+**Zig 0.17: ZLS 0.17.0 (released 2026-10-19), with regressions.** The configurer/maker split
+removed the build-runner hook ZLS used; most of it came back through the build system
+protocol, but per the ZLS 0.17.0 release notes (linked from https://github.com/zigtools/zls/releases/tag/0.17.0,
+issue zigtools/zls#3277) type resolution of package imports inside `build.zig` and of modules
+exported only with `b.addModule` (no compile step) regressed, and file watching on Windows
+misses external changes. When the editor cannot resolve an import, compile (`zig build`) for the
+real errors. (Not tried against 0.17.1 for this skill.)
 
 **Installation:** the user's decision — point them at https://github.com/zigtools/zls
 (releases, or the VS Code "Zig Language" extension, which bundles it); do not install it on
-their behalf. Pick the ZLS release that matches the project's Zig release; for 0.17.0 there is
-none yet.
+their behalf. Pick the ZLS release that matches the project's Zig release (ZLS 0.17.0 for Zig
+0.17.x).
 
 **Editor support:** VS Code, Neovim (nvim-lspconfig), Helix, JetBrains, Emacs (lsp-mode), Sublime Text, Kate.
 
@@ -1375,19 +1457,19 @@ Manage multiple Zig versions side-by-side. Useful for migrating between versions
 **Usage:**
 ```bash
 zigup fetch 0.16.0          # download without changing default
-zigup fetch 0.17.0          # download without changing default
+zigup fetch 0.17.1          # download without changing default
 zigup list                  # show installed versions
-zigup 0.17.0                # set as default
+zigup 0.17.1                # set as default
 zigup run 0.16.0 build      # run specific version without changing default
-zigup run 0.17.0 build test # test with specific version
+zigup run 0.17.1 build test # test with specific version
 zigup clean 0.16.0          # remove old version
 ```
 
 **Migration workflow:**
 ```bash
-zigup run 0.17.0 build 2>&1 | head -40  # try build with new version
+zigup run 0.17.1 build 2>&1 | head -40  # try build with new version
 # fix errors, re-run until clean
-zigup 0.17.0                              # promote to default
+zigup 0.17.1                              # promote to default
 ```
 
 ### anyzig (Version Manager)
@@ -1424,7 +1506,7 @@ zig any --help
 .{
     .name = .myproject,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     // ...
 }
 ```

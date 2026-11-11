@@ -139,7 +139,7 @@ try Aes256Gcm.decrypt(&decrypted, &ciphertext, tag, associated_data, nonce, key)
 0.17.0 on targets without AES hardware: the software AES is bitsliced unless
 `std.options.side_channels_mitigations == .none` (`crypto/aes/soft.zig:6-8,294`), so
 `optimal_parallel_blocks` is larger than 1 and the context is several KB (3024 bytes on s390x
-in a migration probe). See zig-gotchas.md "Known 0.17.0 library behaviour".
+in a migration probe). See zig-gotchas.md "Known 0.17 library behaviour".
 
 Key constants:
 - `key_length`: 32 bytes (256 bits)

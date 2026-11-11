@@ -1,12 +1,24 @@
-# std.http Reference (0.17.0)
+# std.http Reference (0.17.1)
 
 HTTP client and server implementation with TLS, connection pooling, compression, and WebSocket support.
 
-**TLS limit in 0.17.0:** `std.http.Client` over https (`std.crypto.tls.Client`) does not check that
+**TLS limit in 0.17.0 and 0.17.1 (`crypto/Certificate.zig` unchanged):** `std.http.Client` over https (`std.crypto.tls.Client`) does not check that
 an issuer is a CA, so a holder of any publicly trusted leaf certificate can sign a certificate
 for another host and be accepted. Do not rely on it alone against an active attacker; pin the
 server's certificate (see "TLS Configuration") or use a TLS library that validates the chain
 (ask the user before adding a dependency). Details: zig-gotchas.md.
+
+**Message bodies in 0.17.1** (`15c1d31`, `std/http.zig`, `http/Client.zig`): whether a message
+has a body is decided by its headers, not its method (`requestHasBody` / `responseHasBody` are
+no longer consulted; only `HEAD` is special). On 0.17.0 the server ignored a body sent with a
+`GET`/`DELETE`/`OPTIONS` request (its bytes stayed in the stream), and the client asserted in
+`sendBodiless` on a method that "has a body" (a bodiless `POST`) and in `sendBody` on one that
+"has none" (a `DELETE` with a body); on 0.17.1 both work. A request without `Content-Length` and
+`Transfer-Encoding` has no body (RFC 7230). The client
+returns a connection to the pool only after the request body was ended (`BodyWriter.end`), so an
+unframed request no longer poisons the pool. A hand-built `std.http.Reader` needs the new
+required field `side` (`.request` for the server-side reader, which reads requests;
+`.response` for the client-side reader, which reads responses): code that fills the struct itself stops compiling, loudly.
 
 ## Table of Contents
 - [HTTP Client](#http-client)
@@ -534,13 +546,14 @@ try ws.flush();
 
 ```zig
 const Method = enum {
-    GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH,
+    GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH, QUERY,
 
-    pub fn requestHasBody(m: Method) bool;   // POST, PUT, PATCH
-    pub fn responseHasBody(m: Method) bool;  // GET, POST, DELETE, CONNECT, OPTIONS, PATCH
-    pub fn safe(m: Method) bool;             // GET, HEAD, OPTIONS, TRACE
-    pub fn idempotent(m: Method) bool;       // GET, HEAD, PUT, DELETE, OPTIONS, TRACE
-    pub fn cacheable(m: Method) bool;        // GET, HEAD
+    // Since 0.17.1 std.http itself no longer consults these two (see top of file)
+    pub fn requestHasBody(m: Method) bool;   // POST, PUT, PATCH, QUERY
+    pub fn responseHasBody(m: Method) bool;  // GET, POST, PUT, DELETE, CONNECT, OPTIONS, PATCH, QUERY
+    pub fn safe(m: Method) bool;             // GET, HEAD, OPTIONS, TRACE, QUERY
+    pub fn idempotent(m: Method) bool;       // GET, HEAD, PUT, DELETE, OPTIONS, TRACE, QUERY
+    pub fn cacheable(m: Method) bool;        // GET, HEAD, QUERY
 };
 ```
 

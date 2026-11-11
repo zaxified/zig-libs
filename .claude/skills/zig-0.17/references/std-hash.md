@@ -487,8 +487,8 @@ fn consistentHash(key: []const u8, num_buckets: u32) u32 {
         j = @intFromFloat(@as(f64, @floatFromInt(b + 1)) *
             (@as(f64, 1 << 31) / @as(f64, @floatFromInt((h >> 33) + 1))));
     }
-    // b is never negative here (num_buckets > 0): go through the same-width unsigned type (signed -> narrower
-    // unsigned @intCast is miscompiled in optimized builds, #37131, see zig-gotchas.md)
+    // b is never negative here (num_buckets > 0): go through the same-width unsigned type (Zig 0.17.0
+    // miscompiles signed -> narrower unsigned @intCast in optimized builds, #37131, fixed in 0.17.1)
     const ub: u64 = @intCast(b);
     return @intCast(ub);
 }

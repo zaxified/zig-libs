@@ -180,9 +180,9 @@ const PendingRequest = struct {
     allocator: std.mem.Allocator,
 };
 
-/// `Io.Event.waitTimeout` can return `error.Timeout` on a spurious wakeup (0.17.0,
-/// upstream #36912), so a Timeout only counts once the event is still unset AND the
-/// deadline has passed. Compiled and run on 0.17.0.
+/// On 0.17.0 `Io.Event.waitTimeout` can return `error.Timeout` on a spurious wakeup
+/// (#36912, fixed in 0.17.1), so a Timeout only counts once the event is still unset AND the
+/// deadline has passed. Harmless on 0.17.1. Compiled and run on 0.17.0.
 fn waitEvent(io: std.Io, event: *std.Io.Event, timeout: std.Io.Clock.Duration) error{ RequestTimeout, Canceled }!void {
     const deadline: std.Io.Clock.Timestamp = .fromNow(io, timeout);
     while (!event.isSet()) {
