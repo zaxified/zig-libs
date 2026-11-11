@@ -95,8 +95,7 @@ card: **Performance:** ref 0.33–1.06× OpenSSL <version> libcrypto (key schedu
 
 The TLS 1.3 handshake building blocks that more than one TLS-family engine in the collection
 needs, so each is written, anchored and audited once. Today, all moved from `dtls` on
-2026-10-20 as step M0 of the `tlsserver` plan (`~/CML/tlsserver-2026-10-20/DESIGN.md` in the
-coordinator's workspace):
+2026-10-20 as step M0 of the `tlsserver` plan:
 
 - the RFC 8446 §7.1 key schedule (`keyschedule.zig`);
 - the RFC 8446 §4.4.3 CertificateVerify signed content and sign/verify (`certverify.zig`);

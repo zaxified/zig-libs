@@ -483,8 +483,8 @@ stride returns `error.KeyTooLong`. Callers must therefore size `key_buf` as
 - ~~Ranked-prefix cursor / pagination~~ — **done 2026-10-04**:
   `QueryOptions.after`.
 
-- **No-panic sweep 2026-10-28 (LOW, not fixed)** — the review is
-  `~/CML/20261028-panic-sweep/trie-sweep.report.md`; T-1 to T-3 and T-5 to T-11
+- **No-panic sweep 2026-10-28 (LOW, not fixed)** —
+  T-1 to T-3 and T-5 to T-11
   are fixed in `src/` (implicit `buf.len` work cap for `max_visited == 0`,
   `KeyTooLong` on both builders, a poisoned `SortedBuilder` after a failed
   `insert`, a curated `trie.format`).

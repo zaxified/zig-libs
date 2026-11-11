@@ -102,7 +102,7 @@ server said.
    TLS`, and a client that keeps its buffer executes it as though it had arrived inside
    TLS. A test drives exactly those bytes, and a second test drives the same bytes split
    across two `feed()` calls to show the guard does not depend on how the reply happened
-   to be chunked (F3, `~/CML/20260901-zig-libs-audit/A1/smtp.md`).
+   to be chunked (F3).
    ⚠ **This bounds what the module can see, not what is true on the wire.** `receiveReply`
    returns as soon as one complete reply is parsed; bytes the peer already sent but this
    process has not yet read off the socket are invisible to `atBoundary()` — it is a

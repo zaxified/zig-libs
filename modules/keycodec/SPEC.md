@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-11-05 · mutation 2026-11-07 (547/574, 27 eq) · src b52d60ba267499c4
 
-Audit detail: mutation run 2026-11-06 (whole module, `~/CML/20261105-keycodec/`, outside the repo): 390
+Audit detail: mutation run 2026-11-06 (whole module, outside the repo): 390
 mutants in one ReleaseSafe build; 378 killed by the suite (2 of them hangs), 4 burn mutants
 (`burn.run` dropped from either entry point, the burn writing 0xff, `stack` skipped) killed by
 the ReleaseFast stack probe, each planted and seen to fail it. Equivalent 8: six guards a later
@@ -315,8 +315,7 @@ never), no explicit EC parameters (never).
 
 ## Open
 
-- Independent review 2026-11-05 (`~/CML/20261105-keycodec/review.report.md`,
-  outside the repo): no HIGH/MED; LOW 1-7 and INFO 1, 2, 4 fixed the same
+- Independent review 2026-11-05 (outside the repo): no HIGH/MED; LOW 1-7 and INFO 1, 2, 4 fixed the same
   day (RSA v2 public key checked, one-line PEM with a `:` after it, PKCS#1
   version/INTEGER and attribute shape, EC curve fallback, PKCS#1 writer
   checks, failed writes wiped, stray BEGIN skipped, writer burn depth,

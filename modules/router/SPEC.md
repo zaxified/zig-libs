@@ -203,7 +203,7 @@ shared by `RuntimeTree` and the comptime `StaticTree`, `Scan`): 249 schemata mut
 time over one ReleaseSafe build: `Scan`, `matchStep`, the accessors, `Static`, dispatch, `groupFor`,
 `tryRedirect`, registration, mount/with, `HostRouter`, the pattern grammar; 11 comptime mutants of
 `buildStatic` in a second binary). First run 183/238 killed; 11 tests added; rerun: 227 killed, 21
-equivalent (argued in `~/CML/20261025-wave10/router-audit.report.md`), 1 mutant dropped as
+equivalent, 1 mutant dropped as
 inert (its construction never applied it). Finding (LOW, fixed): the `extra` virtual
 trailing-slash segment was charged one level of `max_path_segments`, so a legal 256-segment route
 lost its redirect in `Router` and in `Static.trailingSlashVariant` (test "extra: the virtual
@@ -212,7 +212,7 @@ around and past the 64-byte `Scan` window (6000 paths × 5 methods × 2 postures
 changed: `prefixCovers`' wildcard branch is dead (a group with a wildcard prefix can never
 register a route) — Backlog.
 
-**Mutation (2026-11-07,** whole module after `http.Server.normalizePathInto` became an error union; schemata over a copy, ReleaseSafe, the whole suite, `~/CML/20261107-router-mut/`): 389 mutants over `root.zig` 141–2470, 355 killed, 34 equivalent, none undecided. 15 new tests (direct-caller targets, `groupFor` rank, mount 404/405 inheritance, `HostRouter.map` refusals and wildcard order, OOM sweep over constraint compile, 256-segment depth bound, hostile targets and captures). Equivalents: the `normalizePathInto` error arm is unreachable (`checkOriginPath` caps at 2048 = `normalize_buf_len`); `groupFor` ties cannot occur (unique `g.index`); `validatePattern` repeats `addRoute`/`insert` checks; `min_reach` only prunes and `Scan` only accelerates (neither moves a slash or a match); `matchSegPattern` remainder checks covered by the next line. `buildStatic` (comptime) not re-mutated: its source is unchanged since the 2026-10-28 run killed its 11 comptime mutants. INFO, no change: `HostRouter.routerFor` lets `x..example.com` reach `*.example.com` (a malformed Host lands on the wildcard site, no privilege change); `Node.hasEndpoint` is dead code.
+**Mutation (2026-11-07,** whole module after `http.Server.normalizePathInto` became an error union; schemata over a copy, ReleaseSafe, the whole suite): 389 mutants over `root.zig` 141–2470, 355 killed, 34 equivalent, none undecided. 15 new tests (direct-caller targets, `groupFor` rank, mount 404/405 inheritance, `HostRouter.map` refusals and wildcard order, OOM sweep over constraint compile, 256-segment depth bound, hostile targets and captures). Equivalents: the `normalizePathInto` error arm is unreachable (`checkOriginPath` caps at 2048 = `normalize_buf_len`); `groupFor` ties cannot occur (unique `g.index`); `validatePattern` repeats `addRoute`/`insert` checks; `min_reach` only prunes and `Scan` only accelerates (neither moves a slash or a match); `matchSegPattern` remainder checks covered by the next line. `buildStatic` (comptime) not re-mutated: its source is unchanged since the 2026-10-28 run killed its 11 comptime mutants. INFO, no change: `HostRouter.routerFor` lets `x..example.com` reach `*.example.com` (a malformed Host lands on the wildcard site, no privilege change); `Node.hasEndpoint` is dead code.
 
 **Fuzz (2026-10-07):** `src/fuzz_test.zig` — random route tables (static, `:p`/`{p}`, in-segment
 shapes, constraints, wildcards, trailing slashes) registered directly, via a group, an inline group

@@ -41,8 +41,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   packet body, not just its header (F2); `userdata.DataBlock.decode` now
   refuses a bit-counted length that isn't a whole number of octets instead of
   silently floor-dividing it (F9); `tpkt.Framer.feed` no longer recompacts its
-  buffer on every call (F10, perf only). Full detail and RED->GREEN
-  measurements: `~/CML/20260901-zig-libs-audit/A1/s7comm.md`.
+  buffer on every call (F10, perf only). Full detail and RED->GREEN.
 
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` /
   `fuzzSeedInto` copies in this module's fuzz files are now `testkit.fuzz`. The

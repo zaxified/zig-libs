@@ -77,7 +77,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   datagram of non-devlink messages costs another; corrected in both places it was claimed.
   **LOW — an unguarded slice in the live kernel-echo test** (`m.payload[4..]`, then
   `echoed[0..16]`) would panic in Debug on a short capped ACK. Bounded.
-  Ledger: `~/CML/20260931-zig-libs-audit/devlink.md`.
 
 - **2026-08-24** — Public request builders: one `buildX` per request-performing
   `Devlink` method (`buildDevices`, `buildInfo`, `buildPorts`, `buildPort`,

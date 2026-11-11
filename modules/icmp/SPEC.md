@@ -99,7 +99,7 @@ netlink/wireguard/l2disco/procnet — a deliberate scope decision, not a gap).
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 7 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
 
-**No-panic sweep § GO leftovers (2026-10-30)** — not fixed, with reasons (report: `~/CML/20261029-panic-sweep/icmp-sweep.report.md`):
+**No-panic sweep § GO leftovers (2026-10-30)** — not fixed, with reasons:
 - `Pinger.stats(id)` / `targetAddr(id)` with an id `addTarget*` never returned: now a documented checked panic; the message path cannot be asserted in-process.
 - `drainErrQueue`'s `icmp_errors +|= 1` (same saturation as IC-5) has no test: it needs a real `MSG_ERRQUEUE` entry.
 - `waitReadable` converts up to 292 years of wait into `timespec.sec` with `@intCast`: only a 32-bit target (i32 sec) can trip it; no test possible on 64-bit.

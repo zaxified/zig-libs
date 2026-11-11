@@ -177,8 +177,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     also carry `-1.5e300` — confirming the mask is load-bearing for
     existing coverage too); reverted after measurement, 74/74 (Debug and
     ReleaseFast).
-  - F1/F6/F8/F13/F14 — still open; see
-    `~/CML/20260901-zig-libs-audit/A1/protobuf.md`'s 2026-09-10 dojezd
+  - F1/F6/F8/F13/F14 — still open 2026-09-10 dojezd
     disposition for why each needs a decision or more budget than this
     pass had.
 - **2026-09-10** — A1 fix campaign, wave-3 audit findings. **Consumer-visible: a `sint32`
@@ -233,8 +232,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     (added by the 2026-08-06 wave) and `InvalidUtf8`; its test count ("65 tests") was
     already stale on top of that (73 after this wave, including `NonMinimalTag`'s three
     new tests, F4/F5's two, and F7's one). Both fixed.
-  - F1 (HIGH), F6/F8/F10/F12/F13/F14 (MED/LOW) — left open; see
-    `~/CML/20260901-zig-libs-audit/A1/protobuf.md`'s 2026-09-10 disposition for why each
+  - F1 (HIGH), F6/F8/F10/F12/F13/F14 (MED/LOW) — left open 2026-09-10 disposition for why each
     one needs a decision this fix pass could not make on its own, or costs more than
     this pass's budget covers.
 - **2026-09-08** — **NO CONSUMER-VISIBLE CHANGE:** two of `fuzzDecodeNeverPanics`'s

@@ -258,7 +258,7 @@ Rust std::process as fastest; spawn+wait ×2000, 8 concurrent spawners, 100 MB c
 - **pidfd signalling** (survey 2026-09-30): already deferred in the SPEC (closes the PID-reuse window). Effort medium. Fits §2.
 - **Pipelines (`a | b`)** (survey 2026-09-30): duct's headline feature; not a common need for the daemon use this module targets, listed as a gap for completeness. Effort large. Fits §2.
 
-**No-panic sweep § GO leftovers (2026-10-30)** — not fixed, with reasons (report: `~/CML/20261029-panic-sweep/procrun-sweep.report.md`):
+**No-panic sweep § GO leftovers (2026-10-30)** — not fixed, with reasons:
 - `Handle.writeStdin` blocks the calling thread until the child reads (documented); there is no deadline variant. A caller that needs one writes from its own thread.
 - `run` without `runTimeout`/`Spec.cancel` waits for pipe EOF without bound (documented); a descendant holding the pipe holds `run`.
 - A child that exits on its own without reading all of `stdin_body` makes `run`/`runTimeout` return `error.BrokenPipe` and drop the captured output (documented, bxp relies on it; not a crash). When procrun itself kills the child (deadline/cancel) the EPIPE is swallowed and the `Output` returned with `timed_out`/`canceled` (D9, 2026-10-30).

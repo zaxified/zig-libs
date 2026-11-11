@@ -246,7 +246,7 @@ keeping the RTT on an app-check downgrade fails it ALONE — no earlier test ass
 
 ## Backlog / deferred
 - **Delta audit 2026-10-29 (no-panic sweep § GI):** 1 mutant (the plain `+` back in the poll-timeout round-up): killed. Not scored: `monoNs`'s failed-`clock_gettime` path (no test can make the call fail). Unfiltered ReleaseSafe suite.
-- **No-panic sweep 2026-10-29 (§ GI)** (reports `~/CML/20261029-panic-sweep/probe-sweep.report.md`, `review-pagecache-probe.report.md`): R-probe-1 / PR-2 (MED) `probeMany` capped targets and repetitions but not their product (~268 M connects, ~15 GiB of `Result` slots) — closed by `Options.max_attempts` (owner 2026-10-29, `error.TooManyAttempts`); R-probe-3 (LOW) no total-time cap across `LiveConnector`'s OS connect timeout, `interval.ms` and `timeout_ms` (documented knobs).
+- **No-panic sweep 2026-10-29 (§ GI)**: R-probe-1 / PR-2 (MED) `probeMany` capped targets and repetitions but not their product (~268 M connects, ~15 GiB of `Result` slots) — closed by `Options.max_attempts` (owner 2026-10-29, `error.TooManyAttempts`); R-probe-3 (LOW) no total-time cap across `LiveConnector`'s OS connect timeout, `interval.ms` and `timeout_ms` (documented knobs).
 Name resolution is not bounded by `timeout_ns` and cannot be by a `poll`-based connector — see the
 threat-model section for what each `Resolve` mode does and does not promise. `LiveConnector`'s
 advisory `timeout_ns` stays advisory: `std.Io.Threaded` panics on a connect timeout, and the fix is

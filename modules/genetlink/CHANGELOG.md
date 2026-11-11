@@ -49,8 +49,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   - **F9 (LOW):** `genetlink` registered with `scripts/checks/check-uapi-consts.py` (previously the only
     automatic check of its constants ran through `nl80211`'s own private copy, which SPEC's backlog
     plans to delete).
-  See `SPEC.md` for the full writeup and `~/CML/20260901-zig-libs-audit/A1/genetlink.md` for the
-  audit record.
+  See `SPEC.md` for the full writeup.
 
 - **2026-09-07** — **both fuzz harnesses discarded the seed before reading a byte of it.**
   `fuzzSplitPayload` opened `smith.bytes(&buf)` and then sliced to

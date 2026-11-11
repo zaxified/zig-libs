@@ -84,7 +84,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   overflow` in Debug, a ~2^32-point walk in ReleaseFast. Pinned.
   Every fix carries a regression test that goes red when the fix is reverted; `Value.asInt`'s
   unguarded `@intFromFloat` (a public entry point reachable from decoded wire bytes) saturates
-  instead of being undefined. Ledger: `~/CML/20260931-zig-libs-audit/dnp3.md`.
+  instead of being undefined.
 
 - **2026-08-18** — Portability fix (`check-portable`), and a latent 32-bit correctness
   bug it uncovered: `Cursor.item_pos` and the class-0 static-scan's `scan_stride`

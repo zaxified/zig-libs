@@ -31,7 +31,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   (`Io.Timestamp.now(io, .real)`) instead of a direct `clock_gettime`, so it
   runs under a simulated `Io` (`simio`'s pilot). Same clock on a real host;
   no API change.
-- **2026-09-10** — A1 audit fix campaign (`~/CML/20260901-zig-libs-audit/A1/sntp.md`), zero
+- **2026-09-10** — A1 audit fix campaign, zero
   consumers in this repo, so hardening was ours to decide: `query`'s two anti-spoof guards (peer
   address/port match, origin-timestamp echo) held zero test coverage of their own — a mutation
   deleting either left the whole suite green (F1). Split them, plus a new truncation check, into

@@ -48,7 +48,7 @@ no compiled competitor measured for speed. See "Survey 2026-11-05".
 
 ## Survey 2026-11-05 (ffn 1.3.0, empyrical-reloaded 0.5.12, quantstats 0.0.86, Rust `quantstats` 0.3.0, FinanceToolkit)
 
-Replaces the **rejected** and **Backlog** verdicts of the survey below. Those rested on "no consumer", "seldom used" or "a few lines for a caller", and none of those is a reason a rival's user would accept (owner, 2026-11-05). Lists read from the installed packages by AST, nothing imported; the 88 Rust names from docs.rs. Full table: `~/CML/20261105-dataframe-split/survey-F1-finstats.md`. Everything added is in `finstats.slice`.
+Replaces the **rejected** and **Backlog** verdicts of the survey below. Those rested on "no consumer", "seldom used" or "a few lines for a caller", and none of those is a reason a rival's user would accept (owner, 2026-11-05). Lists read from the installed packages by AST, nothing imported; the 88 Rust names from docs.rs. Everything added is in `finstats.slice`.
 
 | Group | Verdict |
 |---|---|
@@ -151,7 +151,7 @@ shows at 1e-4 or more):
   a level that overflows to +inf gives +inf total return, no panic.
 
 ## Design & invariants
-**One surface, plain slices (step R of `~/CML/20261105-dataframe-split/plan.md`, done 2026-11-08).** Every function lives in `slice.zig` (with `ratios.zig`, `calendar.zig`, `overfit.zig`, `factor.zig`, helpers in `core.zig`) and `root.zig` re-exports each public declaration by name; `finstats.slice` stays as an alias namespace for one release and is deprecated. There is no table type in the module: inputs are `[]const f64`, dates are ISO `YYYY-MM-DD` text, a result row is a named struct. The `Dataset` functions and their error set (`NoSuchColumn`) are gone, so a bad date is `error.BadDate` everywhere (it used to read as 1970-01-01 in the `Dataset` functions) and a NaN flow is `XirrNoRoot` in `xirr` (it used to be dropped). The rest of this section keeps the conventions the old `Dataset` text stated, which did not change; `slice.zig`'s head comment states the error rules.
+**One surface, plain slices (step R of the dataframe split, done 2026-11-08).** Every function lives in `slice.zig` (with `ratios.zig`, `calendar.zig`, `overfit.zig`, `factor.zig`, helpers in `core.zig`) and `root.zig` re-exports each public declaration by name; `finstats.slice` stays as an alias namespace for one release and is deprecated. There is no table type in the module: inputs are `[]const f64`, dates are ISO `YYYY-MM-DD` text, a result row is a named struct. The `Dataset` functions and their error set (`NoSuchColumn`) are gone, so a bad date is `error.BadDate` everywhere (it used to read as 1970-01-01 in the `Dataset` functions) and a NaN flow is `XirrNoRoot` in `xirr` (it used to be dropped). The rest of this section keeps the conventions the old `Dataset` text stated, which did not change; `slice.zig`'s head comment states the error rules.
 
 Portfolio/financial statistics over plain slices: dated-flow IRR (`xirr`, plus a Newton-with-
 bisection-fallback sibling `xirrPrecise`), daily time-weighted return

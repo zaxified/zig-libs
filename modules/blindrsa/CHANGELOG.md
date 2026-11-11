@@ -109,13 +109,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   controls — B6 stays open, and the new test asserts only the half that IS fixed
   (the `r_bytes` buffer wipe, closing half of B9) while printing, not asserting, the
   unresolved half. `scripts/modtest blindrsa`: 57/58 (Debug, 1 skip), 58/58
-  (ReleaseFast). See `~/CML/20260901-zig-libs-audit/A1/blindrsa.md`'s
-  2026-09-10 (fixwt/a) Dispozice for the full RED/RED measurement.
+  (ReleaseFast). The full RED/RED measurement is in the
+  audit's 2026-09-10 disposition.
 
 - **2026-09-10** — A1 fix campaign, audit findings B1/B2/B3/B4/B7/B8/B10/B11/B14/B15
   closed (13/18 open findings; B6/B9/B16/B18 left open, B13/B19 found already fixed
-  elsewhere — see `~/CML/20260901-zig-libs-audit/A1/blindrsa.md`'s Dispozice section
-  for the full breakdown). **Breaking:** `blindSign` no longer `catch unreachable`s
+  elsewhere — the audit's disposition has the full breakdown). **Breaking:** `blindSign` no longer `catch unreachable`s
   `rsa.rsasp1`'s `error.FaultDetected` (a Debug/ReleaseSafe panic, UB in ReleaseFast,
   on a CRT fault the sibling `rsa` module's own Bellcore/BDL self-check legitimately
   raises) — it now returns the ALREADY-documented `error.SigningFailure` instead

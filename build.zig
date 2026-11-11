@@ -489,7 +489,7 @@ pub fn build(b: *std.Build) void {
     // Skylake-family host a branch on a 32-byte boundary runs from the legacy
     // decoder, so two builds with the same instructions differed 5 % in
     // `bench-brotli` (2026-10-27) -- a ratio within that of 1.0 says nothing
-    // until both sides are padded (owner 2026-10-27; `~/CML/zig-017/jcc`).
+    // until both sides are padded (owner 2026-10-27).
     // The run gets `BENCH_JCC_SAFE=1` so the bench pads its foreign side too.
     const jcc_safe = b.option(
         bool,

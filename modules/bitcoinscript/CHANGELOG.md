@@ -90,7 +90,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   rather than after. ⛔ Left alone deliberately: both rest on Core's ordering as remembered
   rather than on `interpreter.cpp` (no network on the audit host), and changing the error
   ordering of a consensus interpreter on an unverified premise is worse than the divergence.
-  Ledger: `~/CML/20260931-zig-libs-audit/bitcoinscript.md`.
 
 - **2026-08-06** — Security audit: the interpreter appeared to omit Bitcoin Core's
   legacy `FindAndDelete` sighash step for a class of legacy scripts, which looked like

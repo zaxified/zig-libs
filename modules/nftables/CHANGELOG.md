@@ -89,7 +89,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   **Docs:** `NF_NAT_RANGE_MAP_IPS`'s comment described behaviour this module does not have, and
   SPEC's "unanchored header offsets" backlog bullet had outlived its defect — a stale bullet
   makes a future auditor skip a check that now works. Every fix carries a test that goes red when
-  the fix is reverted. Ledger: `~/CML/20260931-zig-libs-audit/nftables.md`.
+  the fix is reverted.
 
 - **2026-08-18** — **BEHAVIOURAL, not breaking:** two API gaps closed after a
   consumer adopted the native read path and hit both. (1) `Socket.listTables`/

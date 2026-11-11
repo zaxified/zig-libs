@@ -79,7 +79,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   sweep. A regression test also pins that two `KeyPair.generate` calls produce
   different seeds (F5) — the suite previously could not tell a fresh key from
   `entropy.fill` hardcoded to a constant. P1 applies throughout (0 consumers in
-  `zig-libs`). A1 audit: `~/CML/20260901-zig-libs-audit/A1/minisign.md`.
+  `zig-libs`).
 
 - **2026-09-07** — Both fuzz targets ran one fixed input for their whole existence.
   `fuzzParseSignatureFile` built its `.minisig` from `smith.bytes` + ranged lengths and

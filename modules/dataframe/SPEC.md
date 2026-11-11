@@ -1122,8 +1122,7 @@ expression names it (an element of a timestamp list stays `.timestamp`). **Not y
 56/94 rest): `struct` `json_encode`, regex `find` (91); everything else of the former list
 (`list.eval`/`filter`/`agg`, the set operations, `gather`, `gather_every`, `shift`, `diff`, `item`,
 `sample`, `to_struct`, `repeat_by`, `explode` of every list column, struct `rename_fields`/`with_fields`/
-`eval`) is wave W6's, below. Original design, steps 3 and 4:
-`~/CML/20261108-d5/S3-design.md`. Also not here: polars'
+`eval`) is wave W6's, below. Original design, steps 3 and 4:. Also not here: polars'
 fixed-size `array` type; group/join/sort keys over nested columns go through the encoded-row
 path (no typed fast path; measure first); `readCsv` refuses a nested `types` entry (CSV has no
 nesting; parsing a JSON text in a CSV cell is `jsonshape`'s or a later `json_decode`, row 97).

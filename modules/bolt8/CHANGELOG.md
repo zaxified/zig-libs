@@ -96,8 +96,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   desync warning (F6), unauthenticated-work deadline note (F8), backfilled the missing
   2026-08-12 changelog entry (F11), fixed a README snippet that failed to compile
   (F12), documented why `NonceExhausted` cannot occur today (F13), added the one
-  missing BOLT#8 named test vector (F4). See `~/CML/20260901-zig-libs-audit/A1/bolt8.md`
-  for the full disposition and RED/GREEN measurements.
+  missing BOLT#8 named test vector (F4).
 
 - **2026-09-09** — Licensing: `NOTICE` kind changed from `provenance note` (record only) to
   `third-party attribution` (carries a CONDITION). `src/kat_vectors.zig` embeds BOLT#8's Appendix A transport test vectors verbatim from `lightning/bolts`,

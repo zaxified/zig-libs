@@ -443,7 +443,6 @@ past the end), added.
   in total across peers, linear scans of the pending/listen tables); M-8 `uri_template.match` costs
   about n x literal length per template on adversarial uris (hypothesis, unmeasured); M-9 the schema
   step budget is not size-aware (`codePoints` / `toNum` over a 16 MiB string cost one step).
-  Report: `~/CML/20261028-panic-sweep/mcp-sweep.report.md`.
 - **Review 2026-10-24, documented rather than changed** (owner may decide otherwise):
   per-peer caps are entry counts, not bytes (a peer may hold 1024 listens of up to 256 KiB of
   URIs each; a 16 MiB line can parse into ~0.5 GB of `std.json.Value`), so the transport owns the

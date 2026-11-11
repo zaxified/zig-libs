@@ -435,7 +435,7 @@ What moved it (2026-10-25): `FsStorage.initMmap` (reads lent from a mapping of t
 
 ## Backlog / deferred
 
-- **No-panic sweep 2026-10-29:** fixed K-1 (manifest `next_file_id` bound + `NoSpaceLeft` on id exhaustion), K-2/K-3 (hint expiry must agree with op), K-4 (replay checks the CRC in pieces before allocating the key), K-5 (hint size bounded by 2x data file + 20), K-6 (v1 active file in a manifest is Corrupt), K-7 (`FsStorage` handle checks), K-8/K-9 as docs; not fixed: K-7 for `SimStorage` (test double, asserts on handles by design), K-8 behaviour (a failed rotation still poisons the store, now documented with its ~60-file / 120 GiB size), K-9 (a lifetime contract, no guard possible without a refcount). Report: `~/CML/20261028-panic-sweep/kv-sweep.report.md`.
+- **No-panic sweep 2026-10-29:** fixed K-1 (manifest `next_file_id` bound + `NoSpaceLeft` on id exhaustion), K-2/K-3 (hint expiry must agree with op), K-4 (replay checks the CRC in pieces before allocating the key), K-5 (hint size bounded by 2x data file + 20), K-6 (v1 active file in a manifest is Corrupt), K-7 (`FsStorage` handle checks), K-8/K-9 as docs; not fixed: K-7 for `SimStorage` (test double, asserts on handles by design), K-8 behaviour (a failed rotation still poisons the store, now documented with its ~60-file / 120 GiB size), K-9 (a lifetime contract, no guard possible without a refcount).
 
 - **FIXED (2026-10-01, simio kv pilot): the spinlock deadlocked under a fiber/evented `Io`.**
   `Db` holds its lock across `Storage` calls (`writeAll`, `sync`). Under an `Io` that runs

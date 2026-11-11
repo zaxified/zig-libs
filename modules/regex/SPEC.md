@@ -72,7 +72,7 @@ call 0.39. **Where we are behind:** Nesting stops at 250 levels where Go goes fu
 row). Programs with the Rust grammar's assertions and bytes-mode programs run on the VMs only
 (Rust keeps its lazy DFA there).
 
-**Rust `regex` 1.13.1 and RE2, one by one** (survey 2026-10-28, `~/CML/20261028-regex-s1/`; every
+**Rust `regex` 1.13.1 and RE2, one by one** (survey 2026-10-28; every
 Rust row answered by the crate through `tools/rust_regex_oracle`): Rust's grammar → `Options{
 .syntax = .rust }` (flags `i m s R U u x`, Unicode `\d \s \w \b`, `(?x)`, CRLF mode, `\< \>
 \b{start|end|start-half|end-half}`, `\u`/`\U`, class set operations and nested classes, all
@@ -427,7 +427,7 @@ single timings swing 5–10 % with layout and load.
   Teddy takes 64 patterns and its fat variant 16 buckets; past 32 here the prefixes are cut
   shorter, and with fewer than two bytes the first-byte set is used. Non-x86 targets look the
   nibbles up by a select tree (AArch64 has `tbl`), unmeasured.
-- **Intel JCC erratum in the prefilter scan** *(2026-10-19, `~/CML/zig-017/jcc/REPORT.md` Q4)* — `Prefilter.next`'s `cmp;jne` back-edge (31–40 % of `isMatch` samples) and a loop in `runDfa` cross a 32-byte boundary in the current layout: mitigated build 0.825–0.856× the cycles (mite 492–537 M → 11–37 M uops). Layout luck, moves with any edit. Fix (user-approved 2026-10-19): the scan loop in inline asm behind `.p2align 5`, or at least `asm volatile(".p2align 5")` as the FIRST statement of the loop body (never before the loop); re-check with `jcc-scan.py` after each compiler bump.
+- **Intel JCC erratum in the prefilter scan** *(2026-10-19 Q4)* — `Prefilter.next`'s `cmp;jne` back-edge (31–40 % of `isMatch` samples) and a loop in `runDfa` cross a 32-byte boundary in the current layout: mitigated build 0.825–0.856× the cycles (mite 492–537 M → 11–37 M uops). Layout luck, moves with any edit. Fix (user-approved 2026-10-19): the scan loop in inline asm behind `.p2align 5`, or at least `asm volatile(".p2align 5")` as the FIRST statement of the loop body (never before the loop); re-check with `jcc-scan.py` after each compiler bump.
 - **A DFA for searches with positions** *(survey 2026-10-07; the `isMatch` DFA done 2026-10-07
   night)* — RE2's and Rust's forward + reverse DFA to find a match's span before the
   capture engine runs; dense long-text find-all is already 0.24–0.32 of Go's time, so speed only.

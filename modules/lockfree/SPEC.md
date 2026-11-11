@@ -1121,7 +1121,7 @@ Items from §6 stay there; the survey adds what a crossbeam user hits first.
 - (2026-10-14) `BoundedQueue`/`Queue(T)` lost-CAS backoff: `SegQueue` measured `2^10` against
   `Backoff.spin`'s `2^6` as a large win under 4×4/8×8 contention (§4d); the other CAS loops
   were not re-measured. Effort: small; fits §2.
-- ~~(2026-10-14, survey `~/CML/20261014-lockfree-s2/`) S2 items R1–R14~~ — ✅ 2026-10-14 (§4a.1, §4b, §4c, §4d). Was: with the owner's
+- ~~(2026-10-14) S2 items R1–R14~~ — ✅ 2026-10-14 (§4a.1, §4b, §4c, §4d). Was: with the owner's
   answers: runtime-capacity ring, `force_push`, `capacity`/push-returns-item/drain,
   handle-free unbounded queue ergonomics, FIFO deque, `stealBatch*`, `Injector`, `Steal`
   helpers, `Worker`/`Stealer` views, wide `T` (word-wise atomic slot copy), `repin`/

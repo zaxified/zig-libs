@@ -176,5 +176,4 @@ None claimed: the data is public. There is no secret in this module.
 short string over a small alphabet) and `src/mutation_dec_test.zig` (a symbol-level LZMA encoder and a
 hand-built `.xz` writer for decoder corners). Blind review of the 2026-10-31 decoder change: no HIGH/MED;
 three LOW fixed (asm off on the self-hosted backend, wrap only a ring with slack, `max_dict` note).
-Reports: `~/CML/20261031-lzma-g2/`.
 - Big-endian and 32-bit targets are not run; `meta.targets` is `linux64`.

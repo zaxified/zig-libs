@@ -84,7 +84,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
   `scripts/modtest pathmtu`: 35/35 (Debug and ReleaseFast).
 
-  Also inspected `~/CML/20260901-zig-libs-audit/evidence/pathmtu-probes/`
+  Also inspected the audit's probe files
   (21 files) per `CONVENTIONS.md` §9: all reference `pub` audit-only helpers
   (`auditQuery`, `audit_echo`, `auditRecvLoop`, `auditRandomStartSeq`) that no
   longer exist on this source, or are point-in-time full-file snapshots of an

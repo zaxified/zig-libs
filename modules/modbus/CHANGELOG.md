@@ -91,7 +91,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `max_rw_read_registers` 125→250 panics in Debug and, in **ReleaseFast, writes 402 bytes into a
   253-byte stack buffer with no panic at all** — so the 2026-08-10 record's claim that "the
   failure mode really is a safety panic rather than silent corruption" held only in Debug.
-  Ledger: `~/CML/20260931-zig-libs-audit/modbus.md`.
 
 - **2026-08-23** — **Breaking:** `packBits` and `unpackBits` return
   `error{BufferTooSmall}!` instead of a plain value/`void`. Both used to

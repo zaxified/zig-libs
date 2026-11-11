@@ -18,8 +18,8 @@ round arrays, each as a compact JSON string escaped for Zig, with a banner
 naming THIS file and the capture date so the next reader knows how to re-obtain
 them.
 
-⚠ The banner used to name `~/CML/.../A1/repro/drand/gen_vectors.py` — a path
-outside the repository, so anyone who read it had no way to re-run the
+⚠ The banner used to name a copy of this script in the auditor's private notes —
+a path outside the repository, so anyone who read it had no way to re-run the
 generator. That is the defect this whole directory exists to fix; the banner now
 names a path that ships.
 """

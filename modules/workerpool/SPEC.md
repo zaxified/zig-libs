@@ -363,9 +363,9 @@ shutdownNow" (`queuedCount` back at 0); `started` counted at dequeue by "working
 gated jobs).
 
 ## 6b. Backlog / deferred
-- **Delta audit 2026-10-29 (§ GK, report `~/CML/20261029-panic-sweep/gk-delta-audit.report.md`):** 7 mutants, 6 killed on the first run; the survivor (dropping `deinit`'s own-job guard, hidden by `drain`'s guard on a running pool) now killed by "deinit from a job of an already draining pool still panics (audit WP-5)" → 7/7. ReleaseSafe, unfiltered suite.
+- **Delta audit 2026-10-29 (§ GK):** 7 mutants, 6 killed on the first run; the survivor (dropping `deinit`'s own-job guard, hidden by `drain`'s guard on a running pool) now killed by "deinit from a job of an already draining pool still panics (audit WP-5)" → 7/7. ReleaseSafe, unfiltered suite.
 
-- (2026-10-25) **Audit leftovers** (report `~/CML/20261025-wave13/workerpool-audit.report.md`; the
+- (2026-10-25) **Audit leftovers** (the
   two MED defects -- a job submitted after `pause()` returned could start, and a `SubmitFailed`
   rollback left a `wait` parked on an idle pool -- were fixed the same day): ~~`drain`/`shutdownNow`/
   `deinit` from a job of the same pool join their own thread~~ (DONE 2026-10-29, sweep WP-1: checked
@@ -374,7 +374,7 @@ gated jobs).
   disabled `taking` handshake in 2 of 3 runs (a race window, not a seam) -- a seam would make it
   deterministic. Effort: small.
 
-- (2026-10-29, blind review `~/CML/20261029-panic-sweep/review-testkit-workerpool.report.md`)
+- (2026-10-29, blind review)
   Left in the Backlog: **R-WP-3** `n_workers` unclamped (30k threads) and `spin_ns = maxInt` means
   never park; **R-WP-4** concurrent `drain` + `deinit` is a use-after-free (single owner documented);
   **R-WP-6** no timeout variant of `wait`/`drain`.

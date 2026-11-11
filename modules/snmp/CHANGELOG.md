@@ -68,8 +68,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   **LOW — the catalog cell outlived the code**: `meta.doc` (the rendered source of truth) still
   said "privacy crypto in progress" while RFC 7860 SHA-224/256/384/512 and DES-CBC + AES-128-CFB
   ship, KAT- and net-snmp-anchored.
-  Every fix carries a regression test that goes red when the fix is reverted. Ledger:
-  `~/CML/20260931-zig-libs-audit/snmp.md`.
+  Every fix carries a regression test that goes red when the fix is reverted.
 
 - **2026-08-23** — **Behavioural:** `TransportError` gains `Canceled`, and
   `UdpTransport.exchangeFn` recovers it from `Socket.send`/`.receiveTimeout`

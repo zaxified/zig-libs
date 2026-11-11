@@ -139,7 +139,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   ciphertext (documented, deliberate, and asserted by a test, but a divergence from the `std`
   oracle this module claims drop-in parity with); and **AVX-512 (`lanes = 8`) has no external
   vector at all** — no such hardware here, and no RFC 8439 §A.5 (m = 265) vector exists in the
-  repo to reach it. Ledger: `~/CML/20260931-zig-libs-audit/chachapoly.md`.
+  repo to reach it.
 
 - **2026-08-11** — Security audit: eleven findings fixed (part of the collection-wide
   audit; the root changelog records no further detail than this). Byte-exact against RFC

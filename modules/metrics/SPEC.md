@@ -171,7 +171,7 @@ existing NOTICE for the vendored documentation excerpt is unrelated and unaffect
   `max_series_per_family` with defaults on. Still open from that review: R1-3 summary `buf_cap` /
   `age_buckets` without an upper bound (caller options, eager per-series allocation), R1-5 `delete` is
   O(series) under the registry lock.
-- **Audit 2026-10-25 leftovers** (report `~/CML/20261025-wave13/metrics-audit.report.md`; M1 summary
+- **Audit 2026-10-25 leftovers** (M1 summary
   `_sum`/`_count` collision and M2 `familyLocked` atomicity were fixed the same day):
   **M3** a `*Metric` from `Vec.with` dangles after a concurrent `delete`/`reset` of that series when
   no scrape holds it (documented on `delete`; a refcount would close it, cost unmeasured);

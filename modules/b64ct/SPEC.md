@@ -16,8 +16,8 @@
 
 **Downstream consumer:** no
 
-Audit 2026-10-17: an independent read-only review (findings and verdict in
-`~/CML/20261017-b64ct/review.report.md`, outside the repo): no HIGH; MEDIUM 1 —
+Audit 2026-10-17: an independent read-only review (findings and verdict kept
+outside the repo): no HIGH; MEDIUM 1 —
 `encode`/`encodeWrapped` checked `out` and `line_len` only with asserts (gone
 in ReleaseFast; `line_len` 1–3 looped writing past `out`) → runtime panic and
 comptime `line_len`; LOW/INFO 2–7 → `encodedLen` without `n + 2`, wipe tests for

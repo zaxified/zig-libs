@@ -8,8 +8,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private nesting prescan behind `jsonDepthOk` now calls `jsontext.depthWithin` (same results); new dependency `jsontext`.
 - **2026-10-28** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: its independent review plus 12 mutants over the changed code, 12 killed, 0 equivalent. Survivors of the first run became tests. Checked panics are not mutated (a test cannot observe a panic in-process). Cumulative 56/56, 0 eq. Card A1 again.
 - **2026-10-28** — **Fix (no-panic sweep):** no consumer-reachable panic, stack overflow or UB left
-  that a peer or caller input could drive (independent sweep of every pub entry point,
-  `~/CML/20261028-panic-sweep/mcp-sweep.report.md`). New `pub const max_json_depth = 128` and
+  that a peer or caller input could drive (independent sweep of every pub entry point). New `pub const max_json_depth = 128` and
   `pub fn jsonDepthOk`: a string-aware bracket-depth pre-scan runs before every parse of JSON text the
   module did not write. An inbound message nested deeper is `-32700 Parse error` (it was parsed into
   ~1 GB of Values for a 16 MiB line of `[`); a custom method's output nested deeper is `-32603`

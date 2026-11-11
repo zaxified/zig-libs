@@ -1551,7 +1551,7 @@ EOF
     # `modules/<m>/src/ctgrind_harness.zig`) and names generic instances
     # `print__func_N`. Before the basename rule above, every 0.17 witness fell
     # into `unattr` (CT1 run, 26 modules: 76 of 78 claim rows red, 357
-    # contexts). Copies of that run (~/CML/zig-017/ct017/run2.log).
+    # contexts). Copies of that run.
     st_case "W8 0.17 result print from a harness helper" witness 0 <<'EOF'
 ==1== Use of uninitialised value of size 8
 ==1==    at 0x10543CB: Io.Writer.printHex (std/Io/Writer.zig:1944)

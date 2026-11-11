@@ -126,7 +126,7 @@ no EKU check and the empty extension passes, as every other EKU does.
 
 ## Go Verify parity (S2, 2026-10-11)
 
-Survey `~/CML/20261011-x509-s2/survey.report.md` (plan R0–R7); behaviour pinned by probes, not by
+Survey 2026-10-11 (plan R0–R7); behaviour pinned by probes, not by
 reading Go's source (BSD-3; public API and `go doc` only). **Oracle:** `tools/go_oracle` (Go 1.26
 `x509.ParseCertificate` + `Verify`/`VerifyHostname` through the public API) and the OpenSSL 3.5 CLI,
 both driven by `tools/gen_names_fixtures.py`, which writes the committed corpus `src/data/s2/corpus.bin`

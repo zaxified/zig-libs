@@ -124,7 +124,7 @@ cross-locale negative (comma/dot swapped). Run: `zig build test-numparse`.
 
 ## Backlog / deferred
 - **Delta audit 2026-10-29 (no-panic sweep § GI):** the sweep changed tests only; no mutants, the review date moves. Unfiltered ReleaseSafe suite.
-- **No-panic sweep 2026-10-29 (§ GI):** no defect. R-numparse-1 (LOW, behaviour): `1E-9999%` becomes `e-10001`, which `Decimal.parse` refuses, so it is null while `1E-9999` is 0 (report `~/CML/20261029-panic-sweep/review-openapi-numparse.report.md`).
+- **No-panic sweep 2026-10-29 (§ GI):** no defect. R-numparse-1 (LOW, behaviour): `1E-9999%` becomes `e-10001`, which `Decimal.parse` refuses, so it is null while `1E-9999` is 0.
 Per the module README's "Deferred" section: currency symbols, CJK 4-digit myriad grouping,
 native and prefix percent signs (`٪`, tr `%12`). (Every CLDR locale and the native digits are done
 since 2026-10-20.) (Scientific notation, percent

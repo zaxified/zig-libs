@@ -376,7 +376,7 @@ internal and was driven through its public SQL API, not called directly.
 ## Backlog / non-goals
 
 - **Delta audit 2026-10-29 (no-panic sweep § GI):** 3 mutants over `dropSpan` (empty-span return dropped, span cut to its first page, always the whole-file sweep): 3/3 killed on the first run. Unfiltered ReleaseSafe suite.
-- **No-panic sweep 2026-10-29 (§ GI), left as LOW** (reports `~/CML/20261029-panic-sweep/pagecache-sweep.report.md`, `review-pagecache-probe.report.md`): R-pagecache-2 a last close / truncating open / rename / delete runs ramcache `removeMatching`, a scan of the resident map; R-pagecache-3 read-ahead's scratch buffer is up to the cache budget per sequential miss (caller option, documented); R-pagecache-4 `findByPath`/`findById` are linear in open files; R-pagecache-5 a double `releasePage` or one after `deinit` is undetected (ramcache assert; documented on `preadRef`, a generation token would close it).
+- **No-panic sweep 2026-10-29 (§ GI), left as LOW**: R-pagecache-2 a last close / truncating open / rename / delete runs ramcache `removeMatching`, a scan of the resident map; R-pagecache-3 read-ahead's scratch buffer is up to the cache budget per sequential miss (caller option, documented); R-pagecache-4 `findByPath`/`findById` are linear in open files; R-pagecache-5 a double `releasePage` or one after `deinit` is undetected (ramcache assert; documented on `preadRef`, a generation token would close it).
 - ~~Not fiber-reentrant: a reserved page is visible before it is filled~~ -- **fixed 2026-09-29**
   (qap H4): ramcache now treats an unfilled reservation as a miss for `get`/`pin`/`drainDirty`; the
   module doc states the contract ("fiber-reentrant on one thread") and two tests interleave a

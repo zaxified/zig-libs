@@ -64,7 +64,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   but not re-exported from `root.zig`) — additive only, no existing
   signature changed. Split into its own line because it lands in a separate
   commit from the rest of the F4/F5/F6/F7/F9 work; see that entry for detail.
-- **2026-09-10** — A1 fix campaign, F4/F5/F6/F7/F9 (audit `~/CML/20260901-zig-libs-audit/A1/xdp-classifier.md`):
+- **2026-09-10** — A1 fix campaign, F4/F5/F6/F7/F9:
   - **F4 (userspace LPM reference disagreed with the kernel trie in two
     documented cases).** `lookupReference`'s tie-break used `>`, so a
     duplicate `(addr, prefix_len)` picked the FIRST-loaded rule; the kernel's

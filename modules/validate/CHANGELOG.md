@@ -241,7 +241,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   **LOW — `isEmail`'s documented 254-byte ceiling** and **the offset-optional date-time profile**
   are pinned. Removing the email cap left the suite green while 255–318-byte addresses became
   acceptable; the date-time choice had no corpus case at all in either direction.
-  Ledger: `~/CML/20260931-zig-libs-audit/validate.md`.
 
 - **2026-07-28** — Security audit: the module's untrusted-input surface gained fuzz
   harnesses — `fuzzValidateJson` and `fuzzValidateFormat` (the latter across all 12

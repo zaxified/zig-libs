@@ -80,7 +80,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   ubusd VM capture that answers it landed in commit `463e443e`, before this audit,
   and the paragraph was simply never updated (F11). Every closed finding has a
   measured RED (pre-fix)→GREEN (post-fix) run in
-  `~/CML/20260901-zig-libs-audit/A1/blobmsg.md`'s disposition.
+  the audit's disposition.
   **F10 (both fuzz harnesses running one empty input) was already fixed** by the
   2026-09-07 entry below, which postdates the audit — verified, not re-fixed. All
   11 findings are now closed.

@@ -95,7 +95,7 @@ loop, NS lookup. ⚠ The acme-dns side is a STAND-IN written from joohoi/acme-dn
 ## Backlog / deferred
 
 **Review 2026-10-16** (an independent reviewer, read-only; every finding re-read against the code by
-the coordinator; report `~/CML/20261016-acme-s1/acmedns-review.report.md`, not in the repository).
+the coordinator, not in the repository).
 Fixed the same day, each with a test: **M1** a nameserver whose address lookup failed was dropped
 and the propagation check could pass without it — NS addresses are now resolved on every pass
 (`zone.nameserverIps`, rcode-aware: `dns.Resolver.lookupIp` reads a SERVFAIL as "no address"), an
