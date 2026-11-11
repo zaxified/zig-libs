@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-11** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation run over `root.zig` (266 schemata mutants: `parse`, `write`, `childOf`, key/value grammar, `TraceState` parse/put/delete/write, header-name check, middleware, `singleHeader`/`combinedHeader`, id generation, hex): 250 killed, 16 equivalent or untestable (4 checked config `@panic`s); 47 survived the existing suite and 31 of them asked for six new tests (every byte against the key/value/hex sets, `write` of every flags byte, a duplicate counted toward the 32-member cap, `delete` matching the whole key, SplitMix64 known-answer test for `mix64`, the process prefix computed once even under racing first callers, a duplicated `traceparent` whose first copy is a future version).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the header-name character test in `isUsableHeaderName` calls `http.h1.isToken` (same RFC 9110 tchar set, non-empty); the framing-header rejection stays. (duplicate-code pass)
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private wall/monotonic OS reads that only seed the process prefix hash (duplicate-code pass) now call `clock.realtimeNs()` / `clock.monotonicNs()`; the seed values differ in representation only. New dependency: `clock`.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the GJ decision fix: 5 mutants on the new header-name check, 5/5 killed on the first run. Card A1 again.

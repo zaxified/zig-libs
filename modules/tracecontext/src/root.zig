@@ -1739,3 +1739,135 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation run 2026-11-11: the tests its survivors asked for ──
+
+test "grammar sets are exact over every byte: key first / key rest / value, and lowercase hex digits" {
+    // Every one of the 256 byte values is checked against an independent
+    // restatement of each set (survivors: admitting `_`, a backtick, `{`, `/`,
+    // `:`, `A`, `=`, `,`, `+`, 0x00, 0x80 and excluding `9` went unnoticed).
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        const lower = b >= 'a' and b <= 'z';
+        const digit = b >= '0' and b <= '9';
+        try testing.expectEqual(lower or digit, isValidKey(&.{b}));
+        try testing.expectEqual(lower or digit or b == '_' or b == '-' or b == '*' or b == '/' or b == '@', isValidKey(&.{ 'a', b }));
+        try testing.expectEqual(b >= 0x20 and b <= 0x7e and b != ',' and b != '=', isValidValue(&.{ 'x', b, 'x' }));
+        // The same byte as one hex digit in every digit position of a header.
+        const hex = lower and b <= 'f' or digit;
+        const nib: u8 = if (digit) b - '0' else b -% 'a' +% 10;
+        const base = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        inline for (.{ 1, 3, 33, 34, 36, 50, 51, 53, 54 }) |pos| {
+            var h: [base.len]u8 = base.*;
+            h[pos] = b;
+            if (hex) {
+                const tp = try TraceParent.parse(&h);
+                switch (pos) {
+                    33 => try testing.expectEqual(nib, @as(u8, tp.trace_id[15] >> 4)),
+                    34 => try testing.expectEqual(nib, @as(u8, tp.trace_id[15] & 0x0f)),
+                    50 => try testing.expectEqual(nib, @as(u8, tp.parent_id[7] >> 4)),
+                    51 => try testing.expectEqual(nib, @as(u8, tp.parent_id[7] & 0x0f)),
+                    53 => try testing.expectEqual(nib, @as(u8, tp.flags >> 4)),
+                    54 => try testing.expectEqual(nib, @as(u8, tp.flags & 0x0f)),
+                    else => {},
+                }
+            } else if (pos == 1 or pos == 3) {
+                // position 3 is the first trace-id digit, 1 the version's
+                if (pos == 1) try testing.expectError(error.BadVersion, TraceParent.parse(&h)) else try testing.expectError(error.BadHex, TraceParent.parse(&h));
+            } else {
+                try testing.expectError(error.BadHex, TraceParent.parse(&h));
+            }
+        }
+    }
+}
+
+test "TraceParent.write renders every flags byte, and the ids, as lowercase hex that parses back" {
+    for (0..256) |i| {
+        const tp: TraceParent = .{ .trace_id = @splat(0xa5), .parent_id = .{ 1, 2, 3, 4, 5, 6, 7, 0x8f }, .flags = @intCast(i) };
+        var buf: [TraceParent.header_len]u8 = undefined;
+        const s = tp.write(&buf);
+        var want: [TraceParent.header_len]u8 = undefined;
+        _ = try std.fmt.bufPrint(&want, "00-a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5-010203040506078f-{x:0>2}", .{i});
+        try testing.expectEqualStrings(&want, s);
+        const back = try TraceParent.parse(s);
+        try testing.expectEqual(tp.flags, back.flags);
+        try testing.expectEqualSlices(u8, &tp.trace_id, &back.trace_id);
+    }
+}
+
+test "TraceState: a duplicate counts toward the 32-member cap; delete matches the whole key" {
+    var buf: [1024]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    for (0..32) |i| try w.print("k{d}=v,", .{i});
+    // 32 distinct members + a repeat of the first: 33 non-empty members.
+    try w.writeAll("k0=w");
+    try testing.expectError(error.TooManyMembers, TraceState.parse(w.buffered()));
+    // 31 distinct + a repeat = 32: kept, the repeat dropped.
+    var w2: Writer = .fixed(buf[512..]);
+    for (0..31) |i| try w2.print("k{d}=v,", .{i});
+    try w2.writeAll("k0=w");
+    const ok = try TraceState.parse(w2.buffered());
+    try testing.expectEqual(@as(usize, 31), ok.members().len);
+    try testing.expectEqualStrings("v", ok.get("k0").?);
+
+    var ts = try TraceState.parse("rojo=1,congo=2");
+    try testing.expect(!ts.delete("ro"));
+    try testing.expect(!ts.delete("roj"));
+    try testing.expect(!ts.delete("rojox"));
+    try testing.expectEqual(@as(usize, 2), ts.members().len);
+    try testing.expect(ts.delete("rojo"));
+    try testing.expectEqual(@as(usize, 1), ts.members().len);
+}
+
+test "mix64 is SplitMix64's finalizer: known outputs (seed 0, first three, and the zero image)" {
+    const gamma: u64 = 0x9e3779b97f4a7c15;
+    try testing.expectEqual(@as(u64, 0xe220a8397b1dcdaf), mix64(gamma));
+    try testing.expectEqual(@as(u64, 0x6e789e6aa1b965f4), mix64(gamma *% 2));
+    try testing.expectEqual(@as(u64, 0x06c45d188009454f), mix64(gamma *% 3));
+    try testing.expectEqual(@as(u64, 0), mix64(0));
+}
+
+test "the process prefix is computed once: stable across calls, one value for racing first callers" {
+    try testing.expectEqual(processPrefix(), processPrefix());
+    const a = newTraceId();
+    const b = newTraceId();
+    try testing.expectEqualSlices(u8, a[0..8], b[0..8]);
+
+    // Forget the cached prefix and let many threads be the "first" caller at
+    // once: the compare-and-swap makes them all agree on one value.
+    const saved = prefix_cache.load(.monotonic);
+    defer prefix_cache.store(saved, .monotonic);
+    prefix_cache.store(0, .monotonic);
+    const n = 16;
+    const T = struct {
+        fn run(go: *std.atomic.Value(bool), out: *u64) void {
+            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+            out.* = processPrefix();
+        }
+    };
+    var got: [n]u64 = undefined;
+    var go: std.atomic.Value(bool) = .init(false);
+    var threads: [n]std.Thread = undefined;
+    for (&threads, &got) |*th, *g| th.* = try std.Thread.spawn(.{}, T.run, .{ &go, g });
+    go.store(true, .release);
+    for (threads) |th| th.join();
+    for (got) |g| try testing.expectEqual(got[0], g);
+    try testing.expect(got[0] != 0);
+}
+
+test "a duplicated traceparent is discarded even when its first copy is a future version with an extension" {
+    // Joined as one comma list, `01-<prefix>-extra,00-…` would parse as the
+    // first header's Level 1 prefix; the duplicate must start a fresh trace.
+    var tc = TraceContext{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(tc.middleware());
+    try r.get("/", hEchoCurrent);
+    var buf: [1024]u8 = undefined;
+    const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\n" ++
+        "traceparent: 01-" ++ sample_trace ++ "-" ++ sample_span ++ "-01-extra\r\n" ++
+        "traceparent: " ++ sample ++ "\r\nConnection: close\r\n\r\n", &buf);
+    const hdr = headerValue(got, "traceparent").?;
+    _ = try TraceParent.parse(hdr);
+    try testing.expect(!std.mem.eql(u8, sample_trace, hdr[3..35]));
+}
