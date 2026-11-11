@@ -259,11 +259,11 @@ module's `SPEC.md`, and the card prints all of them as a profile, e.g. `S2 E1 A1
 |---|---|---|---|---|---|
 | **S** scope | ahead (lead ≤ 180 days old) | parity, or a lead measured longer ago | core | mvp | poc |
 | **E** evidence | external oracle, run live (`tools/interop.zig`) | external, frozen vectors | mixed | re-derived | self |
-| **A** audit | review + mutation run, clean score, over the current source | both, but the source changed since, the score is missing, or a survivor is unexplained | only one, or a date is `?` | none | — |
-| **H** hardening | no-panic sweep, plus fuzz driver and ctgrind runs recorded where they apply | — | fuzz and ctgrind partly recorded, or no no-panic sweep | sweep recorded, but neither fuzz nor ctgrind | — |
-| **P** performance | ≤ 1× the reference and ≤ 1.25× the fastest in the field | ≤ 1.1× the reference | ≤ 2×, or not measured | > 2× slower | — |
+| **A** audit | review + mutation run, clean score, over the current source | both, but the source changed since, the score is missing, or a survivor is unexplained | only one, or a date is `?` | none | not used: the axis ends at 4 |
+| **H** hardening | no-panic sweep, plus fuzz driver and ctgrind runs recorded where they apply | no-panic sweep, but a fuzz or ctgrind run that applies is missing | no no-panic sweep; fuzz and ctgrind recorded where they apply | no no-panic sweep, and a fuzz or ctgrind run that applies is missing | nothing: no sweep, and none of the fuzz/ctgrind runs that apply |
+| **P** performance | ≤ 1× the reference and ≤ 1.25× the fastest in the field | ≤ 1.1× the reference | ≤ 2×, or not measured | > 2× slower | not used: the axis ends at 4 |
 
-A `—` means the axis has no such step. In a card's profile, `S?` is a scope not surveyed yet, and
+In a card's profile, `S?` is a scope not surveyed yet, and
 `H–` or `P–` is an axis that does not apply to the module, so it caps nothing. A known open defect sets the grade to 5 whatever the axes say, shown as `D5`. For modules with no outside truth
 (internal algorithms, class C/D) the evidence axis asks what the tests are checked against
 instead: an independent reference model compared by fuzzing (1), a model or invariant (2), or
@@ -393,7 +393,7 @@ way to recognise it.
 | [`health`](modules/health/README.md) | 1 | Liveness (`/healthz`) + readiness (`/readyz`) probe middleware — 200/503 from registered dependency checks (k8s probe contract) | any | router, http |
 | [`http`](modules/http/README.md) | 2 (A) | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32, b64ct |
 | [`idempotency`](modules/idempotency/README.md) | 2 (A) | Idempotency-Key dedup of unsafe retries — middleware + store (ramcache, or a pluggable Backend; durable KvBackend) replaying a recorded response without re-running the handler | any | router, http, ramcache, kv, clock |
-| [`jwe`](modules/jwe/README.md) | 3 (S,H,P) | JSON Web Encryption (RFC 7516/7518) compact serialization — RSA-OAEP/AxxxKW/ECDH-ES key management + AES-GCM/CBC-HMAC content encryption, AES-128/192/256 throughout (AES-192 via the aes192/aesgcm modules) | any | rsa, p256, aescbc, aeskw, aes192, aesgcm |
+| [`jwe`](modules/jwe/README.md) | 4 (H) | JSON Web Encryption (RFC 7516/7518) compact serialization — RSA-OAEP/AxxxKW/ECDH-ES key management + AES-GCM/CBC-HMAC content encryption, AES-128/192/256 throughout (AES-192 via the aes192/aesgcm modules) | any | rsa, p256, aescbc, aeskw, aes192, aesgcm |
 | [`jwt`](modules/jwt/README.md) | 2 (A) | JWT/JWS + OIDC resource-server validator — parse/claims/verify (HS/ES/EdDSA/RSA and post-quantum ML-DSA per RFC 9964, alg-confusion-safe), JWKS-by-kid incl. kty:AKP, OIDC discovery, plus a router Bearer middleware | any | http, router, p256, p384, p521, rsa, ct25519, b64ct, sha2, keycodec, clock |
 | [`llmclient`](modules/llmclient/README.md) | 3 (S,E,H,P) | Anthropic Messages API client (buffered + streaming SSE) over `http` — no third-party SDK | any | http |
 | [`metrics`](modules/metrics/README.md) | 2 (A) | Prometheus registry (counter/gauge/histogram) + `/metrics` + request middleware with a per-request hook (access logging: `accesslog`) | posix | router, http, procnet, clock |
@@ -403,7 +403,7 @@ way to recognise it.
 | [`requestid`](modules/requestid/README.md) | 2 (A) | Request/correlation-ID middleware — adopts incoming `X-Request-Id` or generates one, echoes on response, exposed via `current()` | any | router, http, clock |
 | [`resilience`](modules/resilience/README.md) | 2 (S,A,P) | Circuit breaker (consecutive or failure-rate window) + retry/backoff + timeout + bulkhead for calling upstreams (generic, zero-alloc) | posix | clock |
 | [`router`](modules/router/README.md) | 1 | REST routing, go-chi/chi parity — trie matcher ({name}, in-segment, regexp, wildcard), middleware, groups/mount, host routing, 404/405 | any | http, regex |
-| [`saml`](modules/saml/README.md) | 3 (S,E,H,P) | SAML 2.0 SSO **service-provider** — XSW-hardened Response verification against an IdP key, AuthnRequest builder, SP-metadata generator, IdP-metadata parser, multi-key IdP rollover; decrypts `EncryptedAssertion` via `xmlenc` | any | xmldsig, xml, xmlenc, rsa, x509, datefmt |
+| [`saml`](modules/saml/README.md) | 4 (H) | SAML 2.0 SSO **service-provider** — XSW-hardened Response verification against an IdP key, AuthnRequest builder, SP-metadata generator, IdP-metadata parser, multi-key IdP rollover; decrypts `EncryptedAssertion` via `xmlenc` | any | xmldsig, xml, xmlenc, rsa, x509, datefmt |
 | [`security-headers`](modules/security-headers/README.md) | 1 | Secure-by-default response headers (HSTS/CSP/nosniff/frame/referrer/COOP/CORP) | any | router, http |
 | [`sessions`](modules/sessions/README.md) | 2 (A) | Server-side web sessions + OWASP-hardened cookies + signed double-submit CSRF middleware | any | router, http, cookies, ramcache, entropy, kv, clock |
 | [`staticfiles`](modules/staticfiles/README.md) | 2 (A) | Path-traversal-safe static file handler over `http` — MIME by extension, ETag/conditional 304, byte-range 206/416; symlinks not followed, dotfiles refused by default | any | http |
@@ -411,11 +411,11 @@ way to recognise it.
 | [`tracecontext`](modules/tracecontext/README.md) | 2 (A) | W3C Trace Context — `traceparent`/`tracestate` parse + generate + propagation middleware (child span per hop) for distributed tracing | any | router, http, clock |
 | [`upstream`](modules/upstream/README.md) | 3 (S,H,P) | Load-balanced upstream pool + failover — round-robin/weighted/least-conn/P2C/EWMA/consistent-hash ring, add/remove/drain while serving, per-upstream breaker+bulkhead, active+passive health checks | any | resilience, probe |
 | [`validate`](modules/validate/README.md) | 1 | Request body/query/params validation → aggregated 400 (typed + schema + string-format checks) + JSON DoS caps (depth/array/field size) | any | router, http, netaddr, datefmt |
-| [`webhooksig`](modules/webhooksig/README.md) | 3 (S,E,H,P) | Webhook signatures: Standard Webhooks (v1 HMAC + v1a Ed25519), Stripe, Slack, GitHub-style `<prefix><hex|base64>` (SHA-1/256/512) — constant-time sign/verify, replay tolerance, key rotation, gating middleware | any | router, http, b64ct |
+| [`webhooksig`](modules/webhooksig/README.md) | 4 (H) | Webhook signatures: Standard Webhooks (v1 HMAC + v1a Ed25519), Stripe, Slack, GitHub-style `<prefix><hex|base64>` (SHA-1/256/512) — constant-time sign/verify, replay tolerance, key rotation, gating middleware | any | router, http, b64ct |
 | [`websocket`](modules/websocket/README.md) | 1 | RFC 6455 WebSocket — handshake + frame layer (masking, fragmentation, UTF-8 validation, size caps), transport-agnostic client + server; permessage-deflate (no context takeover) and an optional read/write loop | any | http |
 | [`xml`](modules/xml/README.md) | 3 (S,E,H,P) | Namespace-aware, security-hardened XML 1.0 parser → C14N-ready infoset tree; DOCTYPE-reject default blocks XXE/billion-laughs/depth-bomb. Foundation for `xmldsig`/`saml` | any | — |
-| [`xmldsig`](modules/xmldsig/README.md) | 3 (S,E,H,P) | XML Canonicalization (C14N) + XML-Signature **verification only** — RSA/ECDSA, algorithm allow-list (XSLT/XPath rejected); KeyInfo cert is untrusted, caller must pin trust | any | xml, rsa, p256 |
-| [`xmlenc`](modules/xmlenc/README.md) | 3 (S,E,H,P) | XML-Encryption (xmlenc-core-1) **decryption only** — recovers `EncryptedAssertion` plaintext (RSA-OAEP/AES-KW key transport + AES-GCM/CBC content), decrypt-then-verify | any | xml, rsa, aescbc, aeskw, aes192, aesgcm |
+| [`xmldsig`](modules/xmldsig/README.md) | 4 (H) | XML Canonicalization (C14N) + XML-Signature **verification only** — RSA/ECDSA, algorithm allow-list (XSLT/XPath rejected); KeyInfo cert is untrusted, caller must pin trust | any | xml, rsa, p256 |
+| [`xmlenc`](modules/xmlenc/README.md) | 4 (H) | XML-Encryption (xmlenc-core-1) **decryption only** — recovers `EncryptedAssertion` plaintext (RSA-OAEP/AES-KW key transport + AES-GCM/CBC content), decrypt-then-verify | any | xml, rsa, aescbc, aeskw, aes192, aesgcm |
 
 **Also worth reaching for from `web`** — these are filed under another library (in brackets), and appear here because a consumer working in `web` has a use for them:
 
@@ -453,7 +453,7 @@ way to recognise it.
 | [`iec104`](modules/iec104/README.md) | 3 (S,H,P) | IEC 60870-5-104 telecontrol — APCI/APDU framing, I/S/U formats with k/w flow control, ASDU codec, transport-agnostic master (controlling station) | any | — |
 | [`iec61850`](modules/iec61850/README.md) | 3 (S,H,P) | IEC 61850 substation automation — MMS (ISO 9506) client over ISO-on-TCP with the ACSI object model, plus GOOSE publish/subscribe + SV sampled values | any | xml |
 | [`iec62351`](modules/iec62351/README.md) | 3 (S,E,H,P) | IEC 62351 power-systems security — GOOSE/SV authentication (62351-6) over caller-supplied PDU bytes, MMS application authentication (62351-4), checkable TLS policy | any | x509, rsa, p256, aesgcm |
-| [`imap`](modules/imap/README.md) | 4 (S) | IMAP4rev2 (RFC 9051) client — mailbox-name codec, wire grammar, FETCH/ENVELOPE/BODYSTRUCTURE, SEARCH, IDLE; transport-agnostic (owns no socket, speaks no TLS) | any | — |
+| [`imap`](modules/imap/README.md) | 4 (S,H) | IMAP4rev2 (RFC 9051) client — mailbox-name codec, wire grammar, FETCH/ENVELOPE/BODYSTRUCTURE, SEARCH, IDLE; transport-agnostic (owns no socket, speaks no TLS) | any | — |
 | [`isis`](modules/isis/README.md) | 4 (S) | IS-IS (ISO/IEC 10589) PDU codec — common header + TLV framework + IIH/LSP PDUs + SPB (802.1aq) TLVs; pure bounds-checked encode/decode, wire foundation for an SPB control plane | any | — |
 | [`isis-adj`](modules/isis-adj/README.md) | 4 (S) | IS-IS point-to-point adjacency state machine (ISO 10589 §8.2 + RFC 5303) — pure time-injected FSM driving one P2P neighbour Down→Init→Up from IIH PDUs | any | isis |
 | [`isis-dis`](modules/isis-dis/README.md) | 3 (S,E,H,P) | IS-IS LAN Designated-IS election (ISO 10589 §8.4.5) — elects DIS from priority + SNPA (tie-break, preemptive), derives the pseudonode LSP-ID; pure time-injected | any | isis |

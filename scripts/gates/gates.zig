@@ -3099,7 +3099,9 @@ fn moduleMaturity(b: *Build, io: std.Io, name: []const u8) ?Maturity {
 ///   A audit       review + mutation dated, score without unexplained survivors, over
 ///                 the current src 1 · both dated otherwise 2 · only one, or a `?` 3
 ///                 · neither 4
-///   H hardening   every applicable item (fuzz, ct) dated 1 · some 3 · none 4 · all n/a: no cap
+///   H hardening   no-panic sweep + every applicable fuzz/ct dated 1 · sweep, some
+///                 fuzz/ct missing 2 · no sweep, fuzz/ct complete 3 · no sweep, some
+///                 missing 4 · no sweep and none dated 5 · sweep and all n/a: no cap
 ///   P performance ref ≤ 1 and fastest ≤ 1.25 1 · ref ≤ 1 2 · ref ≤ 2 or not measured 3
 ///                 · ref > 2 4 · n/a: no cap
 ///   D defects     any known open defect 5
@@ -3194,31 +3196,32 @@ fn maturityGrade(b: *Build, m: Maturity, today: i64) ?MaturityGrade {
         break :blk .{ .letter = 'A', .n = 1, .why = "audit" };
     };
 
-    // H -- hardening. A module with no no-panic sweep recorded is H3 at best
-    // (owner, 2026-10-28; gate on since 2026-10-30, when the queue of grade
-    // 1-2 modules was empty): grade 1-2 promises a consumer cannot crash, OOM
-    // or hang through the module, and only the sweep checks that.
+    // H -- hardening. Grade 1-2 promises a consumer cannot crash, OOM or hang
+    // through the module, and only the no-panic sweep checks that (owner,
+    // 2026-10-28), so the sweep splits the axis: with it 1-2, without it 3-5.
+    // Fuzz and ctgrind, where they apply, then decide within each half
+    // (owner, 2026-11-11: every missing step makes it worse, no unused level --
+    // until then a sweep without fuzz/ct graded H4 and no sweep at all H3).
     axes[3] = blk: {
-        if (m.panic == .none) break :blk .{ .letter = 'H', .n = 3, .why = "hardening (no-panic sweep not recorded)" };
+        const swept = m.panic != .none;
         var applicable: u8 = 0;
         var dated: u8 = 0;
-        var none: u8 = 0;
         for ([_]Hardening{ m.fuzz, m.ct }) |h| switch (h) {
             .na => {},
             .dated => {
                 applicable += 1;
                 dated += 1;
             },
-            .none => {
-                applicable += 1;
-                none += 1;
-            },
-            .unknown => applicable += 1,
+            .none, .unknown => applicable += 1,
         };
-        if (applicable == 0) break :blk null;
-        if (dated == applicable) break :blk .{ .letter = 'H', .n = 1, .why = "hardening" };
-        if (none == applicable) break :blk .{ .letter = 'H', .n = 4, .why = "hardening (none of fuzz/ct done)" };
-        break :blk .{ .letter = 'H', .n = 3, .why = "hardening (fuzz/ct not all recorded)" };
+        if (swept) {
+            if (applicable == 0) break :blk null;
+            if (dated == applicable) break :blk .{ .letter = 'H', .n = 1, .why = "hardening" };
+            break :blk .{ .letter = 'H', .n = 2, .why = "hardening (fuzz/ct not all recorded)" };
+        }
+        if (dated == applicable) break :blk .{ .letter = 'H', .n = 3, .why = "hardening (no-panic sweep not recorded)" };
+        if (dated == 0) break :blk .{ .letter = 'H', .n = 5, .why = "hardening (no sweep, no fuzz/ct recorded)" };
+        break :blk .{ .letter = 'H', .n = 4, .why = "hardening (no sweep, fuzz/ct not all recorded)" };
     };
 
     // P -- performance.
