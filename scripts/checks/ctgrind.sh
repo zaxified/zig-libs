@@ -1637,6 +1637,7 @@ DO_CHECK=0
 DO_SELF_TEST=0
 PATTERN_OVERRIDE=""
 DO_UPDATE_DIGESTS=0
+DO_VERIFY_DIGESTS=0
 DO_UPDATE_OUTPUTS=0
 # One memcheck process pins one core and cannot use a second, so the default is
 # every core. Lower it with -j when you want the machine back, or when comparing
@@ -1657,6 +1658,8 @@ while [[ $# -gt 0 ]]; do
         # ones", so it must be typed on purpose and land in a diff, never be a
         # side effect of a green run.
         --update-digests) DO_UPDATE_DIGESTS=1; shift ;;
+        # Only the source-pin half of --check, no build and no valgrind (~1 s).
+        --verify-digests) DO_VERIFY_DIGESTS=1; shift ;;
         # The output pin's counterpart. Unlike --update-digests this RUNS the
         # measurement, because the value can only come from a run. Same reason
         # for being a separate verb: re-pinning says "I looked at what the
@@ -1668,26 +1671,52 @@ while [[ $# -gt 0 ]]; do
         *) MODULES+=("$1"); shift ;;
     esac
 done
+src_digest() {
+    local module="$1" pattern="$2"
+    local dir="$REPO_ROOT/modules/$module/src"
+    [[ -d "$dir" ]] || { echo "NO-SRC"; return; }
+    # `pattern` is a regex over basenames with `[.]` escapes: turn it back into
+    # a plain alternation and take each name that exists in the module.
+    # ⛔ Strip a trailing line guard (`root[.]zig:[1-9]`) first. Measured
+    # 2026-09-09: without it the guard silently turned the SOURCE PIN OFF --
+    # bolt3's shachain rows carried NO-OWN-SRC. The trailing line guard must be
+    # stripped, or the pin is silently disabled for exactly the rows careful
+    # enough to carry one.
+    local names; names="$(printf '%s' "$pattern" | sed 's/\[\.\]/./g' | tr '|' '\n' | sed 's/:\[[0-9-]*\][*+]*$//;s/:[0-9]*$//')"
+    local files=()
+    local n
+    while IFS= read -r n; do
+        [[ -n "$n" && -f "$dir/$n" ]] && files+=("$dir/$n")
+    done <<<"$names"
+    if [[ ${#files[@]} -eq 0 ]]; then echo "NO-OWN-SRC"; return; fi
+    printf '%s\n' "${files[@]}" | LC_ALL=C sort | xargs cat | sha256sum | cut -c1-16
+}
+
+# The source pin is the one part of --check that needs neither a build nor
+# valgrind, and it is the part that goes red most often: any edit to a pinned
+# file -- a test-only one included -- fails the full CI's ctgrind lane (tag CI
+# 43023357233, tlsserver, 2026-11-11; 38 re-pin commits 10-01..11-11). So it
+# runs alone in checks-fast, where the miss costs seconds instead of a tag.
+# The counts are not checked here: only a measurement can check those.
+if [[ "$DO_VERIFY_DIGESTS" == "1" ]]; then
+    vfail=0; vrows=0
+    while IFS=$'\t' read -r m mo t _ _ esrc _; do
+        [[ "$m" =~ ^# || -z "$m" ]] && continue
+        vrows=$((vrows + 1))
+        actual="$(src_digest "$m" "${PATTERN[$m/$t]:-}")"
+        if [[ "$actual" != "${esrc:-}" ]]; then
+            echo "FAIL $m/$mo/$t: the sources this row counts changed (digest $actual, pinned ${esrc:-none})." >&2
+            vfail=1
+        fi
+    done <"$EXPECTED_FILE"
+    if (( vfail )); then
+        echo "ctgrind --verify-digests: stale source pin(s). Re-read the contexts (or re-pin from a full-CI ctgrind run whose counts did not move), then --update-digests <module>." >&2
+        exit 1
+    fi
+    echo "ctgrind --verify-digests: $vrows row(s), every source pin current"
+    exit 0
+fi
 if [[ "$DO_UPDATE_DIGESTS" == "1" ]]; then
-    src_digest() {
-        local module="$1" pattern="$2"
-        local dir="$REPO_ROOT/modules/$module/src"
-        [[ -d "$dir" ]] || { echo "NO-SRC"; return; }
-        # ⛔ Strip a trailing line guard (`root[.]zig:[1-9]`) before looking the
-        # name up. Measured 2026-09-09: without this the guard silently turned
-        # the SOURCE PIN OFF -- bolt3's shachain rows have carried NO-OWN-SRC
-        # since the guard was added, so the file they count could be rewritten
-        # under them and only the count would have to be re-hit. The guard is
-        # about which FRAMES to attribute; it says nothing about which FILE the
-        # row is about.
-        local names; names="$(printf '%s' "$pattern" | sed 's/\[\.\]/./g' | tr '|' '\n' | sed 's/:\[[0-9-]*\][*+]*$//;s/:[0-9]*$//')"
-        local files=() n
-        while IFS= read -r n; do
-            [[ -n "$n" && -f "$dir/$n" ]] && files+=("$dir/$n")
-        done <<<"$names"
-        if [[ ${#files[@]} -eq 0 ]]; then echo "NO-OWN-SRC"; return; fi
-        printf '%s\n' "${files[@]}" | LC_ALL=C sort | xargs cat | sha256sum | cut -c1-16
-    }
     # Modules named on the command line limit the re-pin to their rows; every
     # other row keeps its digest. ⛔ Until 2026-10-02 the names were ignored
     # here: `--update-digests bulletproofs` rewrote the digests of five other
@@ -2151,24 +2180,8 @@ out_digest() {
 # Only the MODULE'S OWN files are hashed. A pattern may also name std files
 # (`ct25519/std`, `chachapoly/aead`), which live outside the tree and move with
 # the toolchain; the count bounds already carry those.
-src_digest() {
-    local module="$1" pattern="$2"
-    local dir="$REPO_ROOT/modules/$module/src"
-    [[ -d "$dir" ]] || { echo "NO-SRC"; return; }
-    # `pattern` is a regex over basenames with `[.]` escapes: turn it back into
-    # a plain alternation and take each name that exists in the module.
-    # See the --update-digests copy above: the trailing line guard must be
-    # stripped, or the pin is silently disabled for exactly the rows careful
-    # enough to carry one.
-    local names; names="$(printf '%s' "$pattern" | sed 's/\[\.\]/./g' | tr '|' '\n' | sed 's/:\[[0-9-]*\][*+]*$//;s/:[0-9]*$//')"
-    local files=()
-    local n
-    while IFS= read -r n; do
-        [[ -n "$n" && -f "$dir/$n" ]] && files+=("$dir/$n")
-    done <<<"$names"
-    if [[ ${#files[@]} -eq 0 ]]; then echo "NO-OWN-SRC"; return; fi
-    printf '%s\n' "${files[@]}" | LC_ALL=C sort | xargs cat | sha256sum | cut -c1-16
-}
+# src_digest() is defined once, above the argument handling: --update-digests
+# and --verify-digests use it without building or measuring anything.
 
 echo
 fail=0

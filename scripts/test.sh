@@ -1879,6 +1879,11 @@ phase_checks_fast_tail() {
     # it in the push lane; scripts/modtest is the dynamic half. ~5 s.
     step "check-test-stderr" ./scripts/checks/check-test-stderr.py
 
+    # Any edit to a file a ctgrind row pins (a test-only one included) fails
+    # the full CI's ctgrind lane; the source-pin half needs no build and no
+    # valgrind, so it runs here (tag CI 43023357233, 2026-11-11). ~5 s.
+    step "check-ctgrind-digests" ./scripts/checks/ctgrind.sh --verify-digests
+
     # The root NOTICE stopped listing modules on 2026-09-06: a module's
     # third-party obligation is discharged in the module's own NOTICE, and the
     # root file answers one question only -- is the library as a whole still
