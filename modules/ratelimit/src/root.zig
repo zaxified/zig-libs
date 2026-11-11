@@ -2578,3 +2578,27 @@ test "ipKey: text that is not an address stays the key as it is" {
     try testing.expectEqualStrings("unknown", ipKey("unknown", 64, &buf));
     try testing.expectEqualStrings("", ipKey("", 64, &buf));
 }
+
+var recorded_sleep_ns: ?i96 = null;
+
+fn recordSleep(_: ?*anyopaque, t: std.Io.Timeout) std.Io.Cancelable!void {
+    recorded_sleep_ns = switch (t) {
+        .duration => |d| d.raw.nanoseconds,
+        else => -1,
+    };
+}
+
+test "Limiter: waitN asks its Io to sleep exactly the reservation delay (recording Io)" {
+    // An Io whose `sleep` records the request instead of sleeping.
+    var vt = testing.io.vtable.*;
+    vt.sleep = recordSleep;
+    const io: std.Io = .{ .userdata = testing.io.userdata, .vtable = &vt };
+    var tc: TestClock = .{}; // frozen: the delay is exact
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 50, .burst = 1, .clock = tc.clock(), .key = .forwarded_ip });
+    defer l.deinit();
+    recorded_sleep_ns = null;
+    try l.waitN(io, "k", 1, std.math.maxInt(u64)); // full: no sleep at all
+    try testing.expectEqual(@as(?i96, null), recorded_sleep_ns);
+    try l.waitN(io, "k", 1, std.math.maxInt(u64)); // one token at 50/s
+    try testing.expectEqual(@as(?i96, 20 * std.time.ns_per_ms), recorded_sleep_ns);
+}
