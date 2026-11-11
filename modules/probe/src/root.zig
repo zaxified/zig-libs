@@ -1940,6 +1940,12 @@ const FakeSys = struct {
     started: [8]?u64 = @splat(null),
     closed: [8]bool = @splat(false),
     closes: usize = 0,
+    /// `poll` bookkeeping: how often it ran and the last timeout it was given
+    /// (-1 = wait forever); a runaway loop of zero-wait polls panics instead of
+    /// hanging the suite. `poll_err` makes every poll fail with that errno.
+    polls: usize = 0,
+    last_wait_ms: i32 = 0,
+    poll_err: ?tl.E = null,
 
     fn index(fd: i32) usize {
         return @intCast(fd - 100);
@@ -1972,6 +1978,10 @@ const FakeSys = struct {
         return if (after == never) never else self.began[k] + after;
     }
     fn poll(self: *FakeSys, pfds: []tl.pollfd, wait_ms: i32) union(enum) { ready: usize, err: tl.E } {
+        self.polls += 1;
+        self.last_wait_ms = wait_ms;
+        if (self.polls > 10_000) @panic("FakeSys: poll spun");
+        if (self.poll_err) |e| return .{ .err = e };
         var ready: usize = 0;
         for (pfds) |*pf| if (self.closed[index(pf.fd)]) {
             pf.revents = tl.POLL.NVAL;
@@ -3486,4 +3496,339 @@ test "delta audit: the connectors report the refuser's and the winner's address 
     const bcast = lc.connector().connect(.{ .host = "255.255.255.255", .port = 9 }, std.time.ns_per_s);
     try testing.expect(bcast.status != .up and bcast.status != .refused);
     try testing.expect(bcast.addr == null);
+}
+
+// ── whole-module mutation run 2026-11-11: tests for the survivors ───────────
+
+test "mutation: probeTcp drops the rtt of every non-up outcome; max_targets is the largest accepted list" {
+    var scripts = [_]FakeConnector.Script{
+        .{ .host = "slow", .outcomes = &.{.{ .status = .timeout, .rtt_ns = 999 }} },
+        .{ .host = "ref", .outcomes = &.{.{ .status = .refused, .rtt_ns = 999 }} },
+        .{ .host = "err", .outcomes = &.{.{ .status = .@"error", .rtt_ns = 999 }} },
+    };
+    var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
+    const opts: Options = .{ .connector = fake.connector() };
+    // A connector may keep the rtt of a budget miss (LiveConnector does); the
+    // prober's Result carries an rtt for `.up` only.
+    for ([_][]const u8{ "slow", "ref", "err" }) |h| {
+        try testing.expectEqual(@as(?u64, null), probeTcp(.{ .host = h, .port = 1 }, opts).rtt_ns);
+    }
+    const one = [_]Target{.{ .host = "slow", .port = 1 }};
+    const rs = try probeMany(testing.allocator, &one, .{ .connector = fake.connector(), .max_targets = 1 });
+    freeResults(testing.allocator, rs);
+}
+
+test "mutation: probeMany frees everything on an allocation failure at any step; a failed handle array runs inline" {
+    var scripts = [_]FakeConnector.Script{
+        .{ .host = "a", .outcomes = &.{.{ .status = .up, .rtt_ns = 5 }} },
+    };
+    var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
+    const targets = [_]Target{ .{ .host = "a", .port = 1 }, .{ .host = "a", .port = 2 }, .{ .host = "a", .port = 3 } };
+    // Allocation 0 is the results array, 1..3 the sample slice of each target.
+    // A leak is reported by `testing.allocator` when the test ends.
+    for (0..4) |k| {
+        var fa = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = k });
+        try testing.expectError(error.OutOfMemory, probeMany(fa.allocator(), &targets, .{
+            .connector = fake.connector(),
+            .max_concurrent = 1,
+        }));
+    }
+    // Allocation 4 is the thread-handle array: its failure is not an error, the
+    // calling thread runs every target.
+    var fa = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 4 });
+    const before = fake.total_calls.load(.monotonic);
+    const rs = try probeMany(fa.allocator(), &targets, .{ .connector = fake.connector(), .max_concurrent = 3 });
+    defer freeResults(fa.allocator(), rs);
+    try testing.expect(fa.has_induced_failure);
+    try testing.expectEqual(@as(u32, 3), fake.total_calls.load(.monotonic) - before);
+    for (rs) |r| try testing.expectEqual(Status.up, r.samples[0].kind);
+}
+
+test "mutation: probeMany's calling thread is a worker -- max_concurrent connects can all be in flight" {
+    var scripts = [_]FakeConnector.Script{
+        .{ .host = "a", .outcomes = &.{.{ .status = .up, .rtt_ns = 1 }} },
+    };
+    // Every connect holds until four are inside at once: reached only if the
+    // calling thread works beside the three helpers.
+    var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0, .hold_until_in_flight = 4, .hold_budget = 4_000_000 };
+    const targets: [4]Target = @splat(.{ .host = "a", .port = 1 });
+    const rs = try probeMany(testing.allocator, &targets, .{ .connector = fake.connector(), .max_concurrent = 4 });
+    defer freeResults(testing.allocator, rs);
+    try testing.expectEqual(@as(u32, 4), fake.max_in_flight.load(.acquire));
+}
+
+test "mutation: VerdictFold -- up after a timeout is up, a timeout keeps its errno" {
+    const F = PosixConnector.VerdictFold;
+    const V = PosixConnector.Verdict;
+    const etimedout: i32 = @backingInt(std.os.linux.E.TIMEDOUT);
+    {
+        var f: F = .{};
+        try testing.expect(!f.add(V{ .status = .timeout }));
+        try testing.expect(f.add(V{ .status = .up }));
+        try testing.expectEqual(Status.up, f.result().status);
+    }
+    {
+        // A per-address timeout with its errno, then a later error.
+        var f: F = .{};
+        _ = f.add(V{ .status = .timeout, .errno = etimedout });
+        try testing.expectEqual(@as(?i32, etimedout), f.result().errno);
+        try testing.expectEqual(Status.timeout, f.result().status);
+    }
+    {
+        // The budget running out over a failed address keeps that address's errno.
+        var f: F = .{};
+        _ = f.add(V{ .status = .@"error", .errno = 113 });
+        f.budgetGone();
+        try testing.expectEqual(Status.timeout, f.result().status);
+        try testing.expectEqual(@as(?i32, 113), f.result().errno);
+    }
+}
+
+test "race (scripted): saturating arithmetic near the top of the clock; budget 0 polls without a timeout" {
+    const ms = FakeSys.ms;
+    // maxInt budget on a clock reading 1 s: `t0 + budget` must saturate, not wrap
+    // to a deadline already in the past.
+    {
+        var sys: FakeSys = .{ .plans = &.{.{ .pending = .{ .after_ns = 5 * ms } }} };
+        const addrs = fakeAddrs(1);
+        const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, std.math.maxInt(u64));
+        try testing.expectEqual(Status.up, r.verdict.status);
+        try testing.expectEqual(@as(?u64, 5 * ms), r.connect_ns);
+    }
+    // A clock 10 ms below maxInt: the next-start time `now + 250 ms` saturates.
+    {
+        var sys: FakeSys = .{ .clock = std.math.maxInt(u64) - 10 * ms, .plans = &.{.{ .pending = .{ .after_ns = 5 * ms } }} };
+        const addrs = fakeAddrs(1);
+        const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, 0);
+        try testing.expectEqual(Status.up, r.verdict.status);
+        try testing.expectEqual(@as(?u64, 5 * ms), r.connect_ns);
+    }
+    // Budget 0 = no budget: poll with -1 (wait for the handshake), never 0.
+    {
+        var sys: FakeSys = .{ .plans = &.{.{ .pending = .{ .after_ns = 5 * ms } }} };
+        const addrs = fakeAddrs(1);
+        const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, 0);
+        try testing.expectEqual(Status.up, r.verdict.status);
+        try testing.expectEqual(@as(i32, -1), sys.last_wait_ms);
+    }
+}
+
+test "race (scripted): a connect decided inside start reports a connect time of zero and its own address" {
+    var sys: FakeSys = .{ .plans = &.{.{ .done = .{ .status = .up } }} };
+    const addrs = fakeAddrs(1);
+    const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, std.time.ns_per_s);
+    try testing.expectEqual(Status.up, r.verdict.status);
+    try testing.expectEqual(@as(?u64, 0), r.connect_ns); // not the absolute clock reading
+    try testing.expect(r.addr.?.eql(addrs[0]));
+}
+
+test "race (scripted): a failing poll is the verdict, with its errno, and the descriptor is closed" {
+    const ms = FakeSys.ms;
+    var sys: FakeSys = .{
+        .plans = &.{.{ .pending = .{ .after_ns = FakeSys.never } }},
+        .poll_err = .INVAL,
+    };
+    const addrs = fakeAddrs(1);
+    const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, 500 * ms);
+    try testing.expectEqual(Status.@"error", r.verdict.status);
+    try testing.expectEqual(@as(?i32, @backingInt(tl.E.INVAL)), r.verdict.errno);
+    try testing.expectEqual(@as(usize, 1), sys.closes);
+}
+
+test "PosixConnector: an excluded family is an error before the budget is looked at; a spent budget keeps its rtt" {
+    const ln = try listenLoopback(false, 8);
+    _ = tl.close(ln.fd);
+    var buf: [24]u8 = undefined;
+    const t4 = try Target.parse(try std.mem.print(&buf, "127.0.0.1:{d}", .{ln.port}));
+    // 1 ns of budget is gone by the time the literal is parsed, but a literal
+    // of the excluded family has no usable address: an `.error`, not a
+    // `.timeout` (the no-address guard comes first).
+    var pc: PosixConnector = .{ .resolve = .literal_only, .ip_protocol = .ip6 };
+    const out = pc.connector().connect(t4, 1);
+    try testing.expectEqual(Status.@"error", out.status);
+    try testing.expectEqual(@as(?i32, null), out.errno);
+    // And the budget miss of a usable address reports how long it took.
+    pc.ip_protocol = .any;
+    const miss = pc.connector().connect(t4, 1);
+    try testing.expectEqual(Status.timeout, miss.status);
+    try testing.expect(miss.rtt_ns != null);
+}
+
+test "live: a black-holed attempt that ends on the budget reports how long it took" {
+    var bh = try BlackHole.init();
+    defer bh.deinit();
+    var buf: [24]u8 = undefined;
+    const t = try bh.target(&buf);
+    var pc: PosixConnector = .{ .resolve = .literal_only };
+    const out = pc.connector().connect(t, 100 * std.time.ns_per_ms);
+    try testing.expectEqual(Status.timeout, out.status);
+    try testing.expect(out.rtt_ns.? >= 90 * std.time.ns_per_ms);
+    try testing.expect(out.rtt_ns.? < 5 * std.time.ns_per_s);
+}
+
+test "live: startAttempt opens a non-blocking, close-on-exec socket" {
+    var bh = try BlackHole.init();
+    defer bh.deinit();
+    const st = PosixConnector.startAttempt(.{ .v4 = .{ 127, 0, 0, 1 } }, bh.port, null, null);
+    const fd = switch (st) {
+        .pending => |fd| fd,
+        .done => return testkit.skip("the black hole did not leave the connect pending", .{}),
+    };
+    defer _ = tl.close(fd);
+    const fl = tl.fcntl(fd, tl.F.GETFL, 0);
+    try testing.expect(fl & tl.SOCK.NONBLOCK != 0);
+    const fdfl = tl.fcntl(fd, tl.F.GETFD, 0);
+    try testing.expect(fdfl & tl.FD_CLOEXEC != 0);
+}
+
+test "live: startAttempt carries the errno when socket() itself fails" {
+    const L = try lowestFreeFd();
+    var orig: tl.rlimit = undefined;
+    if (tl.errno(tl.getrlimit(.NOFILE, &orig)) != .SUCCESS) return testkit.skip("getrlimit failed", .{});
+    if (orig.cur <= @as(u64, @intCast(L))) return testkit.skip("descriptor limit already reached", .{});
+    // Descriptors numbered >= the soft limit cannot be opened: the next one is `L`.
+    var lim = orig;
+    lim.cur = @intCast(L);
+    if (tl.errno(tl.setrlimit(.NOFILE, &lim)) != .SUCCESS) return testkit.skip("setrlimit failed", .{});
+    const st = PosixConnector.startAttempt(.{ .v4 = .{ 127, 0, 0, 1 } }, 1, null, null);
+    _ = tl.setrlimit(.NOFILE, &orig);
+    switch (st) {
+        .done => |v| {
+            try testing.expectEqual(Status.@"error", v.status);
+            try testing.expectEqual(@as(?i32, @backingInt(tl.E.MFILE)), v.errno);
+        },
+        .pending => |fd| {
+            _ = tl.close(fd);
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
+test "live: attempts that fail before the connect do not leak a descriptor" {
+    const ln = try listenLoopback(false, 8);
+    defer _ = tl.close(ln.fd);
+    var buf: [24]u8 = undefined;
+    const t = try Target.parse(try std.mem.print(&buf, "127.0.0.1:{d}", .{ln.port}));
+    var bind_fail: PosixConnector = .{ .resolve = .literal_only, .source = .{ .v4 = .{ 203, 0, 113, 1 } } };
+    var dev_fail: PosixConnector = .{ .resolve = .literal_only, .device = "nosuchif0" };
+    _ = bind_fail.connector().connect(t, std.time.ns_per_s);
+    _ = dev_fail.connector().connect(t, std.time.ns_per_s);
+    const before = try lowestFreeFd();
+    for (0..12) |_| {
+        try testing.expectEqual(Status.@"error", bind_fail.connector().connect(t, std.time.ns_per_s).status);
+        try testing.expectEqual(Status.@"error", dev_fail.connector().connect(t, std.time.ns_per_s).status);
+    }
+    try testing.expectEqual(before, try lowestFreeFd());
+}
+
+test "live: an unknown device name carries the kernel's errno; a synchronous connect failure carries its errno" {
+    const ln = try listenLoopback(false, 8);
+    defer _ = tl.close(ln.fd);
+    var buf: [24]u8 = undefined;
+    const t = try Target.parse(try std.mem.print(&buf, "127.0.0.1:{d}", .{ln.port}));
+    var pc: PosixConnector = .{ .resolve = .literal_only, .device = "nosuchif0" };
+    const bad = pc.connector().connect(t, std.time.ns_per_s);
+    try testing.expectEqual(Status.@"error", bad.status);
+    // ENODEV; before Linux 5.7 the unprivileged call is refused with EPERM first.
+    const e = bad.errno orelse return error.TestUnexpectedResult;
+    try testing.expect(e == @backingInt(tl.E.NODEV) or e == @backingInt(tl.E.PERM));
+
+    // The limited broadcast address fails inside connect() (ENETUNREACH, or
+    // EACCES with a route): an error with its errno, not a bare error.
+    var pc2: PosixConnector = .{ .resolve = .literal_only };
+    const bcast = pc2.connector().connect(.{ .host = "255.255.255.255", .port = 9 }, std.time.ns_per_s);
+    try testing.expectEqual(Status.@"error", bcast.status);
+    try testing.expect(bcast.errno != null);
+    try testing.expect(bcast.addr == null);
+}
+
+test "finishAttempt: POLLNVAL, an unreadable SO_ERROR and a hang-up without a completed handshake are errors" {
+    const rc = tl.socket(tl.AF.INET, tl.SOCK.STREAM | tl.SOCK.NONBLOCK | tl.SOCK.CLOEXEC, 0);
+    try testing.expect(tl.errno(rc) == .SUCCESS);
+    const fd: i32 = @intCast(rc);
+    defer _ = tl.close(fd);
+    // POLLNVAL wins even when the socket looks writable.
+    const nval = PosixConnector.finishAttempt(fd, tl.POLL.NVAL | tl.POLL.OUT);
+    try testing.expectEqual(Status.@"error", nval.status);
+    // No pending error and no POLLOUT: POLLHUP alone is not a handshake.
+    const hup = PosixConnector.finishAttempt(fd, tl.POLL.HUP);
+    try testing.expectEqual(Status.@"error", hup.status);
+    // POLLOUT with no pending error is the success the poll loop waits for.
+    try testing.expectEqual(Status.up, PosixConnector.finishAttempt(fd, tl.POLL.OUT).status);
+    // getsockopt failing (bad descriptor) is an error carrying EBADF, whatever the revents say.
+    const bad = PosixConnector.finishAttempt(-1, tl.POLL.OUT);
+    try testing.expectEqual(Status.@"error", bad.status);
+    try testing.expectEqual(@as(?i32, @backingInt(tl.E.BADF)), bad.errno);
+}
+
+test "live: a literal's family must match the policy before the attempt; an invalid host name is an error, not a cancelation" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var pc: PosixConnector = .{ .io = threaded.io(), .resolve = .system };
+    const out = pc.connector().connect(.{ .host = "not a host name", .port = 80 }, std.time.ns_per_s);
+    try testing.expectEqual(Status.@"error", out.status);
+    const name300: [300]u8 = @splat('a');
+    const long = pc.connector().connect(.{ .host = &name300, .port = 80 }, std.time.ns_per_s);
+    try testing.expectEqual(Status.@"error", long.status);
+}
+
+const RearmResult = struct { r: TargetResult, rearmed: bool };
+
+/// `probeTargetTask` that also reports whether the cancelation is still armed
+/// when the run is over (a connector or sleeper that swallowed it says no).
+fn probeTargetRearmTask(io: std.Io, target: Target, opts: Options, block_first: bool) Allocator.Error!RearmResult {
+    if (block_first) io.sleep(.fromSeconds(10), .awake) catch io.recancel();
+    const r = try probeTarget(testing.allocator, target, opts);
+    const rearmed = if (io.checkCancel()) |_| false else |_| true;
+    return .{ .r = r, .rearmed = rearmed };
+}
+
+test "cancel: a canceled .system lookup and a canceled interval sleep leave the cancelation armed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    {
+        var pc: PosixConnector = .{ .io = io, .resolve = .system };
+        const opts: Options = .{ .connector = pc.connector(), .count = 2 };
+        var fut = io.concurrent(probeTargetRearmTask, .{ io, Target{ .host = "localhost", .port = 1 }, opts, true }) catch
+            return error.SkipZigTest;
+        sleepMs(50);
+        const res = try fut.cancel(io);
+        defer res.r.deinit(testing.allocator);
+        try testing.expectEqual(Status.canceled, res.r.samples[0].kind);
+        try testing.expect(res.rearmed);
+    }
+    {
+        var scripts = [_]FakeConnector.Script{
+            .{ .host = "svc", .outcomes = &.{.{ .status = .up, .rtt_ns = 7 }} },
+        };
+        var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
+        var sl: IoSleeper = .{ .io = io };
+        const opts: Options = .{
+            .connector = fake.connector(),
+            .count = 5,
+            .interval = .{ .ms = 10_000, .sleeper = sl.sleeper() },
+        };
+        var fut = io.concurrent(probeTargetRearmTask, .{ io, Target{ .host = "svc", .port = 1 }, opts, false }) catch
+            return error.SkipZigTest;
+        sleepMs(100);
+        const res = try fut.cancel(io);
+        defer res.r.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 4), res.r.canceledCount());
+        try testing.expect(res.rearmed);
+    }
+}
+
+test "live: LiveConnector closes the stream of every successful connect" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var lc: LiveConnector = .{ .io = threaded.io() };
+    const ln = try listenLoopback(false, 64);
+    defer _ = tl.close(ln.fd);
+    var buf: [24]u8 = undefined;
+    const t = try Target.parse(try std.mem.print(&buf, "127.0.0.1:{d}", .{ln.port}));
+    try testing.expectEqual(Status.up, lc.connector().connect(t, 5 * std.time.ns_per_s).status);
+    const before = try lowestFreeFd();
+    for (0..12) |_| try testing.expectEqual(Status.up, lc.connector().connect(t, 5 * std.time.ns_per_s).status);
+    try testing.expectEqual(before, try lowestFreeFd());
 }
