@@ -9,8 +9,8 @@
         // cleared every lane at that commit. Bumped by the commit under each
         // new tag, so a copy taken from tag T is built against T.
         .zig_libs = .{
-            .url = "git+https://github.com/zaxified/zig-libs#2026-11-02",
-            .hash = "zig_libs-0.0.0-WiQ0GuOIIgkzMoaRE7R-YI5w40vEd031C4TR1semIhz2",
+            .url = "git+https://github.com/zaxified/zig-libs#2026-11-11",
+            .hash = "zig_libs-0.0.0-WiQ0Glm2WAoExDji5e6y0c8U9d5KL1Zkr5jgbbhKDl4t",
         },
         // To follow the development branch instead, or to pin one commit,
         // replace the two lines above with one of these and run
