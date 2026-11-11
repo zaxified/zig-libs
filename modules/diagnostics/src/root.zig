@@ -3385,3 +3385,17 @@ test "colour: hanging labels draw their pointers in the label's own colour and r
         out,
     );
 }
+
+test "colour: a caret past the end of the line is closed with its own reset" {
+    const d: Diagnostic = .{ .path = "", .file = "f", .line = 1, .col = 10, .severity = .@"error", .code = "", .message = "m" };
+    const out = try snipOf("abc\n", d, .{ .color = true });
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        "\x1b[1;31merror\x1b[0m\x1b[1m: m\x1b[0m\n" ++
+            "  \x1b[1;34m-->\x1b[0m f:1:10\n" ++
+            "  \x1b[1;34m|\x1b[0m\n" ++
+            "\x1b[1;34m1\x1b[0m \x1b[1;34m|\x1b[0m abc\n" ++
+            "  \x1b[1;34m|\x1b[0m    \x1b[1;31m^\x1b[0m\n\n",
+        out,
+    );
+}

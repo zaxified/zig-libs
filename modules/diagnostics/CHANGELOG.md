@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** test for the reset that closes a caret drawn past the end of a coloured line (mutation audit).
 - **2026-11-11** — **NO CONSUMER-VISIBLE CHANGE:** third mutation-audit round, tests only: eight exact-text goldens for `term_width` cuts (wide, zero-width and invalid-UTF-8 characters, tabs, hanging labels, two files, multi-line spans), a label message measured in display columns, an all-blank line, and the colour of hanging-label pointers.
 - **2026-11-11** — **NO CONSUMER-VISIBLE CHANGE:** second mutation-audit round, tests only: `positionLessThan` called directly, locus choice with unquotable spans, `fromLsp` type and range guards, severity and code mapping, truncated percent escapes, a label in another file reading that file's text, empty tags and labels in `writeLsp`.
 - **2026-11-11** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit, tests only: exact-set tests for `charWidth` (every code point against the table), the `?`-shown and white-space sets, `writeEscaped` per byte, the percent-encoding of every file-name byte, colour bytes, fix forms, the closing row, the locus choice, the Margin arithmetic and `term_width` cut goldens.
