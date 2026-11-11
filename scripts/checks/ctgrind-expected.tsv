@@ -1649,8 +1649,8 @@ timelock_envelope	ReleaseFast	env	1	8	58d6d84ce8471213	eb40a7f3ed6eaa0a
 # privacy round trip, OPEN FINDING: des.zig is table-driven (S-box and
 # permutation lookups indexed by key- and data-dependent values) -> 256.
 # Not fixed: SNMPv3 DES is legacy; replacing it is the owner's decision.
-snmp	ReleaseFast	kdf	1	0	b308a8ec930ce714	b7a78ad081fdb5eb
-snmp	ReleaseFast	auth	1	0	b308a8ec930ce714	42cc3493cbe134d7
+snmp	ReleaseFast	kdf	1	0	ccbfd8dbe82e2efe	b7a78ad081fdb5eb
+snmp	ReleaseFast	auth	1	0	ccbfd8dbe82e2efe	42cc3493cbe134d7
 snmp	ReleaseFast	aes	1	0	03bccc909f1f3cb3	aeff07ae5b6a7083
 snmp	ReleaseFast	des	1	256	b230314abc8b4c78	f7e7b8e6152d7073
 # aes192 (2026-10-10) — enc / dec: key + plaintext (enc) or ciphertext (dec)
@@ -1930,15 +1930,15 @@ tls13	ReleaseFast	sign_rsa	1	2	0946d446b39eeb5a	15b034e3d63aca72
 # tainted; every in-file count is an exact 0. rho is declassified inside
 # KeyGen (kem.zig: it is published in ek), so SampleNTT's rejection loop
 # over it is not counted.
-mlkem	ReleaseFast	keygen512	1	0	c0af9ef9fd97cc14	c8287b52d3e5f778
-mlkem	ReleaseFast	keygen768	1	0	c0af9ef9fd97cc14	eb016d7e8c3cc899
-mlkem	ReleaseFast	keygen1024	1	0	c0af9ef9fd97cc14	7aff6ff648180dbf
-mlkem	ReleaseFast	encaps512	1	0	c0af9ef9fd97cc14	aaf60090db82bd9b
-mlkem	ReleaseFast	encaps768	1	0	c0af9ef9fd97cc14	da25956af0f64e4b
-mlkem	ReleaseFast	encaps1024	1	0	c0af9ef9fd97cc14	4f3a04ae41de05ac
-mlkem	ReleaseFast	decaps512	1	0	c0af9ef9fd97cc14	1cc002f740d266a9
-mlkem	ReleaseFast	decaps768	1	0	c0af9ef9fd97cc14	69dbd1230a031721
-mlkem	ReleaseFast	decaps1024	1	0	c0af9ef9fd97cc14	38f8642262218d87
+mlkem	ReleaseFast	keygen512	1	0	13e6273d5f891b63	c8287b52d3e5f778
+mlkem	ReleaseFast	keygen768	1	0	13e6273d5f891b63	eb016d7e8c3cc899
+mlkem	ReleaseFast	keygen1024	1	0	13e6273d5f891b63	7aff6ff648180dbf
+mlkem	ReleaseFast	encaps512	1	0	13e6273d5f891b63	aaf60090db82bd9b
+mlkem	ReleaseFast	encaps768	1	0	13e6273d5f891b63	da25956af0f64e4b
+mlkem	ReleaseFast	encaps1024	1	0	13e6273d5f891b63	4f3a04ae41de05ac
+mlkem	ReleaseFast	decaps512	1	0	13e6273d5f891b63	1cc002f740d266a9
+mlkem	ReleaseFast	decaps768	1	0	13e6273d5f891b63	69dbd1230a031721
+mlkem	ReleaseFast	decaps1024	1	0	13e6273d5f891b63	38f8642262218d87
 # keycodec (2026-11-06) — the key codec under every PEM/PKCS#8/SEC1 reader of jwt, tlsserver,
 # acme, rsa and ssh. Seven OpenSSL keys (EC P-256 SEC1, P-384 PKCS#8, P-521 SEC1, Ed25519,
 # X25519, ML-DSA-44 both, ML-KEM-512 seed); RSA left to `rsa` (its secret is the whole PKCS#1).
