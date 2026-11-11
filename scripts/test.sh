@@ -1462,7 +1462,7 @@ cmd_changed() {
                 # nothing a push lane runs, and counting it as a harness edit
                 # sent nearly every crypto push down the smoke path (2026-10-10).
                 ;;
-            .github/*|scripts/test.sh|scripts/tag.sh|scripts/check-apps.sh|scripts/lib/*|scripts/checks/*|scripts/hooks/*|scripts/gates/*)
+            .github/*|scripts/test.sh|scripts/check-apps.sh|scripts/lib/*|scripts/checks/*|scripts/hooks/*|scripts/gates/*)
                 # The harness or the CI lane definition itself: no narrower set
                 # can be trusted, because what narrows it is the thing that
                 # changed. `scripts/gates/` (Zig 0.17, 2026-10-18) IS the gates
@@ -1851,7 +1851,7 @@ phase_checks_fast() {
 # them a fail-fast gate rather than one more thing to wait for.
 phase_checks_fast_tail() {
     step "hook self-test" ./scripts/hooks/test-pre-commit.sh
-    step "tag.sh self-test" ./scripts/lib/test-tag.sh
+    step "auto-release self-test" ./scripts/lib/test-tag.sh
     step "release-notes self-test" python3 -I scripts/lib/release-notes.py --self-test
     step "ci-red-issue self-test" python3 -I scripts/lib/ci-red-issue.py --self-test
     step "check-ci-cache-keys" ./scripts/checks/check-ci-cache-keys.sh

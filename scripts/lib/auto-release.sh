@@ -78,9 +78,16 @@ cmd_since() {
     if [ "$n" -gt 0 ]; then output "changed=true"; else output "changed=false"; fi
 }
 
-# Live needs all of it, spelled exactly. Everything else is the dry path.
+# Live needs all of it, spelled exactly. Everything else is the dry path. A
+# dispatch is live only when it asked for it (`release: live` → ZIGLIBS_RELEASE,
+# 2026-11-11); `dry-run` and `none` stay dry.
 is_live() {
-    [ "${AUTO_TAG_LIVE:-0}" = 1 ] && [ "${GITHUB_EVENT_NAME:-}" = schedule ] && [ "${GITHUB_REF:-}" = refs/heads/main ]
+    [ "${AUTO_TAG_LIVE:-0}" = 1 ] && [ "${GITHUB_REF:-}" = refs/heads/main ] || return 1
+    case "${GITHUB_EVENT_NAME:-}" in
+        schedule) return 0 ;;
+        workflow_dispatch) [ "${ZIGLIBS_RELEASE:-}" = live ] ;;
+        *) return 1 ;;
+    esac
 }
 
 cmd_prepare() {

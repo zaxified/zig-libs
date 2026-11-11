@@ -1,52 +1,25 @@
 #!/usr/bin/env bash
-# Self-test for scripts/tag.sh and scripts/lib/auto-release.sh — their whole job is to say NO, and a
-# gate that never says no is decoration.
+# Self-test for scripts/lib/auto-release.sh, the only route to a date tag since
+# 2026-11-11 (a scheduled run or a `release: live` dispatch; scripts/tag.sh is
+# gone). Its whole job is to say NO, and a gate that never says no is decoration.
 #
-# It earned this file by fooling its own author: the first attempt to verify
-# the red-lane refusal planted a failing test in the working tree, and tag.sh
-# refused — on the DIRTY TREE check, which fires first. The lane check never
-# ran. A refusal for the wrong reason looks exactly like a refusal for the
-# right one.
+# A refusal for the wrong reason looks exactly like a refusal for the right one
+# (the first version of this file, testing tag.sh, refused on the dirty-tree
+# guard and never reached the check it meant to test), so every refusal below
+# also greps for its own reason.
 #
-# Runs against a throwaway git repo with a STUBBED `gh` on PATH (tag.sh asks it
-# one question: CI's status and conclusion on HEAD), so every CI outcome --
-# green, red, cancelled, still running, never run -- is something the test can
-# actually arrange, in milliseconds. Same pattern as
-# scripts/hooks/test-pre-commit.sh.
+# Runs against a throwaway repository with a bare `origin` and stubbed `zig`
+# and `gh` on PATH. Same pattern as scripts/hooks/test-pre-commit.sh.
 #
 #   usage: scripts/lib/test-tag.sh
 #   exit 0 = every case behaved; exit 1 = a case did not, and says which.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TAG_SH="$SCRIPT_DIR/../tag.sh"
-[[ -x "$TAG_SH" ]] || {
-    echo "test-tag: $TAG_SH is not executable" >&2
-    exit 1
-}
 
-WORK="$(mktemp -d)"
-# Captured stdout must live OUTSIDE the repo under test. Writing it into $WORK
-# made an untracked file in that repo, so tag.sh refused on the dirty-tree
-# guard and never ran a lane — the log cases below then read a stale log from
-# an earlier case and reported a logging bug that did not exist. Third time
-# today that guard masked what was behind it.
+# Captured stdout lives OUTSIDE the repository under test: written inside, it
+# made the tree dirty and every later case refused on that guard instead.
 OUT="$(mktemp -d)"
-trap 'rm -rf "$WORK" "$OUT"' EXIT
-mkdir -p "$WORK/scripts/lib"
-cp "$TAG_SH" "$WORK/scripts/tag.sh"
-cp "$SCRIPT_DIR/tag-lib.sh" "$SCRIPT_DIR/release-notes.py" "$WORK/scripts/lib/"
-cd "$WORK" || exit 1
-git init -q -b main .
-git config user.email t@t
-git config user.name t
-# The real repo gitignores `.zig-cache/`; this throwaway one must too, or the
-# lane logs tag.sh writes there make the tree dirty and every LATER case
-# refuses on the dirty-tree guard instead of testing what it meant to. That
-# is how the first version of these log cases failed: not because the logging
-# was broken, but because the fixture was.
-printf '.zig-cache/\n' > .gitignore
-
 fails=0
 check() { # check <label> <expected-exit> <actual-exit>
     if [[ "$2" == "$3" ]]; then
@@ -57,88 +30,13 @@ check() { # check <label> <expected-exit> <actual-exit>
     fi
 }
 
-# `gh` stub on PATH: answers the one query tag.sh makes with $FAKE_CI, the
-# "<status> <conclusion>" pair of CI's run on HEAD ("" = no run at all).
-mkdir -p "$WORK/bin"
-cat > "$WORK/bin/gh" <<'STUB'
-#!/usr/bin/env bash
-[[ -n "${FAKE_CI-}" ]] && echo "$FAKE_CI"
-exit 0
-STUB
-chmod +x "$WORK/bin/gh"
-export PATH="$WORK/bin:$PATH"
-printf 'bin/\n' >> .gitignore
-git add -A
-git commit -qm base
-
-echo "tag.sh self-test"
-
-FAKE_CI="completed success" bash scripts/tag.sh 2026-08-12 >/dev/null 2>&1
-check "CI green on HEAD -> tags" 0 $?
-[[ "$(git tag)" == "2026-08-12" ]] ||
-    { printf '  FAIL %-54s tag list is "%s"\n' "tag is named for the date" "$(git tag)"; fails=$((fails + 1)); }
-
-FAKE_CI="completed success" bash scripts/tag.sh 2026-08-12 >/dev/null 2>&1
-check "second tag same day -> suffixed, no collision" 0 $?
-git rev-parse -q --verify refs/tags/2026-08-12.1 >/dev/null ||
-    { printf '  FAIL %-54s\n' "second tag became 2026-08-12.1"; fails=$((fails + 1)); }
-
-for ci in "completed failure" "completed cancelled" "in_progress null" "queued null" ""; do
-    before="$(git tag | wc -l)"
-    FAKE_CI="$ci" bash scripts/tag.sh 2026-09-01 >"$OUT/out.txt" 2>&1
-    check "CI '${ci:-no run}' -> refuse" 1 $?
-    [[ "$(git tag | wc -l)" == "$before" ]] ||
-        { printf '  FAIL %-54s\n' "no tag was created for CI '${ci:-no run}'"; fails=$((fails + 1)); }
-    grep -q "NOT tagging" "$OUT/out.txt" ||
-        { printf '  FAIL %-54s\n' "refusal for CI '${ci:-no run}' says why"; fails=$((fails + 1)); }
-done
-
-echo dirt > dirt.txt
-FAKE_CI="completed success" bash scripts/tag.sh 2026-09-02 >/dev/null 2>&1
-check "dirty tree -> refuse" 1 $?
-rm -f dirt.txt
-
-git checkout -q -b side
-FAKE_CI="completed success" bash scripts/tag.sh 2026-09-03 >/dev/null 2>&1
-check "not on main -> refuse" 1 $?
-git checkout -q main
-
-before="$(git tag | wc -l)"
-FAKE_CI="completed success" bash scripts/tag.sh --dry-run 2026-09-04 >/dev/null 2>&1
-check "--dry-run, CI green -> succeeds" 0 $?
-[[ "$(git tag | wc -l)" == "$before" ]] ||
-    { printf '  FAIL %-54s\n' "--dry-run created no tag"; fails=$((fails + 1)); }
-
-FAKE_CI="completed success" bash scripts/tag.sh v1.2.3 >/dev/null 2>&1
-check "semver-shaped argument -> refuse" 1 $?
-
-mkdir -p .github/workflows
-printf 'env:\n  ZIGLIBS_DRY_RUN: "1"\n' > .github/workflows/ci.yml
-git add -A && git commit -qm dry
-before="$(git tag | wc -l)"
-FAKE_CI="completed success" bash scripts/tag.sh 2026-09-05 >"$OUT/out.txt" 2>&1
-check "CI green but ci.yml is a DRY run -> refuse" 1 $?
-[[ "$(git tag | wc -l)" == "$before" ]] && grep -q "DRY_RUN" "$OUT/out.txt" ||
-    { printf '  FAIL %-54s\n' "dry refusal created no tag and says why"; fails=$((fails + 1)); }
-for spelling in "'1'" '"1"  # comment' '1' '"true"'; do
-    printf 'env:\n  ZIGLIBS_DRY_RUN: %s\n' "$spelling" > .github/workflows/ci.yml
-    git commit -qam "dry $spelling"
-    FAKE_CI="completed success" bash scripts/tag.sh 2026-09-06 >/dev/null 2>&1
-    check "dry run spelled $spelling -> refuse" 1 $?
-done
-printf 'env:\n  ZIGLIBS_DRY_RUN: "0"  # off\n' > .github/workflows/ci.yml
-git commit -qam real
-FAKE_CI="completed success" bash scripts/tag.sh 2026-09-05 >/dev/null 2>&1
-check "ci.yml with dry run OFF -> tags" 0 $?
-
 # ── the scheduled route: scripts/lib/auto-release.sh ─────────────────────────
 #
-# A second throwaway repository, because this one has to look like the real thing:
-# apps with pins, a bare `origin` to push to, a `zig` stub for the package hash.
-echo
+# The repository has to look like the real thing: apps with pins, a bare
+# `origin` to push to, a `zig` stub for the package hash.
 echo "auto-release.sh self-test"
 AR_WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK" "$OUT" "$AR_WORK"' EXIT
+trap 'rm -rf "$OUT" "$AR_WORK"' EXIT
 git init -q --bare "$AR_WORK/origin.git"
 git init -q -b main "$AR_WORK/repo"
 cd "$AR_WORK/repo" || exit 1
@@ -218,7 +116,7 @@ git checkout -q --detach
 AUTO_TAG_LIVE=1 GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/main AUTO_RELEASE_DAY=2026-11-04 \
     GITHUB_OUTPUT="$AR_WORK/out" bash "$AR" prepare "$tested" "$AR_WORK/b1" >"$OUT/prep.txt" 2>&1
 check "prepare on a dispatch -> succeeds" 0 $?
-[[ "$(out_get live)" == 0 ]] || say "a dispatch is never live, even with the switch on" "$(out_get live)"
+[[ "$(out_get live)" == 0 ]] || say "a dispatch that did not ask is not live, even with the switch on" "$(out_get live)"
 grep -q 'nothing is pushed' "$OUT/prep.txt" || say "the dry path says what it would do"
 [[ -z "$(remote_tag 2026-11-04)" ]] || say "the dry path pushed nothing"
 tag="$(out_get tag)"; commit="$(out_get commit)"
@@ -253,6 +151,17 @@ bash "$AR" prepare "$dry_sha" "$AR_WORK/b0" >"$OUT/dry.txt" 2>&1
 check "prepare: ZIGLIBS_DRY_RUN on -> refuse" 1 $?
 grep -q DRY_RUN "$OUT/dry.txt" || say "the dry refusal says why"
 git checkout -q main
+# Every spelling of "on" refuses (tag-lib.sh ci_dry_run_on), checked here since
+# tag.sh, which used to carry these cases, is gone.
+for spelling in "'1'" '"1"  # comment' '1' '"true"'; do
+    printf 'env:\n  ZIGLIBS_DRY_RUN: %s\n' "$spelling" > .github/workflows/ci.yml
+    git commit -qam "dry $spelling"
+    s_sha="$(git rev-parse HEAD)"
+    git checkout -q --detach
+    bash "$AR" prepare "$s_sha" "$AR_WORK/b0" >/dev/null 2>&1
+    check "prepare: dry run spelled $spelling -> refuse" 1 $?
+    git checkout -q main
+done
 printf 'env:\n  ZIGLIBS_DRY_RUN: "0"\n' > .github/workflows/ci.yml
 git commit -qam real
 tested="$(git rev-parse HEAD)"
@@ -270,9 +179,21 @@ check "prepare live -> succeeds" 0 $?
 [[ "$(out_get live)" == 1 ]] || say "the schedule on main with the switch on is live"
 tag="$(out_get tag)"; commit="$(out_get commit)"
 back_to_tested
+# A dispatch that asked for `release: live`, on main, is live too (2026-11-11).
+: > "$AR_WORK/out"
+AUTO_TAG_LIVE=1 GITHUB_EVENT_NAME=workflow_dispatch ZIGLIBS_RELEASE=live GITHUB_REF=refs/heads/main \
+    AUTO_RELEASE_DAY=2026-11-05 GITHUB_OUTPUT="$AR_WORK/out" bash "$AR" prepare "$tested" "$AR_WORK/b0" >/dev/null 2>&1
+check "prepare: dispatch with release live -> succeeds" 0 $?
+[[ "$(out_get live)" == 1 ]] || say "a release: live dispatch on main is live" "$(out_get live)"
+git tag -d 2026-11-05 >/dev/null 2>&1
+git checkout -q -f "$tested"
 for env_case in "AUTO_TAG_LIVE=0 GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/main" \
     "AUTO_TAG_LIVE=1 GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/side" \
-    "AUTO_TAG_LIVE=true GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/main"; do
+    "AUTO_TAG_LIVE=true GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/main" \
+    "AUTO_TAG_LIVE=1 GITHUB_EVENT_NAME=workflow_dispatch ZIGLIBS_RELEASE=dry-run GITHUB_REF=refs/heads/main" \
+    "AUTO_TAG_LIVE=1 GITHUB_EVENT_NAME=workflow_dispatch ZIGLIBS_RELEASE=live GITHUB_REF=refs/heads/side" \
+    "AUTO_TAG_LIVE=0 GITHUB_EVENT_NAME=workflow_dispatch ZIGLIBS_RELEASE=live GITHUB_REF=refs/heads/main" \
+    "AUTO_TAG_LIVE=1 GITHUB_EVENT_NAME=push ZIGLIBS_RELEASE=live GITHUB_REF=refs/heads/main"; do
     : > "$AR_WORK/out"
     env $env_case AUTO_RELEASE_DAY=2026-11-05 GITHUB_OUTPUT="$AR_WORK/out" bash "$AR" prepare "$tested" "$AR_WORK/b0" >/dev/null 2>&1
     [[ "$(out_get live)" == 0 ]] || say "not live: $env_case" "$(out_get live)"
@@ -495,8 +416,8 @@ GITHUB_OUTPUT="$AR_WORK/out" bash "$AR" since >/dev/null 2>&1
 
 echo
 if [[ $fails -eq 0 ]]; then
-    echo "tag.sh and auto-release.sh self-test: all cases behaved"
+    echo "auto-release.sh self-test: all cases behaved"
     exit 0
 fi
-echo "tag.sh and auto-release.sh self-test: $fails case(s) misbehaved" >&2
+echo "auto-release.sh self-test: $fails case(s) misbehaved" >&2
 exit 1

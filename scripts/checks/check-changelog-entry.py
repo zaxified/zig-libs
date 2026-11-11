@@ -213,7 +213,7 @@ CODE_LINES = 25
 PUB_RE = re.compile(r"^pub\b")
 
 # CONVENTIONS.md §8: "The form is exactly `- **YYYY-MM-DD** — the entry text`".
-# The same `20YY-MM-DD` shape `scripts/tag.sh` accepts, so there is one date
+# The same `20YY-MM-DD` shape `scripts/lib/auto-release.sh` accepts, so there is one date
 # format in this repo and not two.
 ENTRY_RE = re.compile(r"^\+\s*-\s+\*\*(20\d\d-\d\d-\d\d)\*\*")
 

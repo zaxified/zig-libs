@@ -735,7 +735,7 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   and consumers kept pinning something ever older. The old rule's fear, tags cut by a green
   run several times a day, is answered by the schedule. The claim did not get cheaper:
   a scheduled run sets `ZIGLIBS_STRICT_STAMPS=1` (volatile stamps do not count, every interop
-  anchor is re-taken) and runs the apps with `check-apps.sh --run`, as a tag run does. What
+  anchor is re-taken) and runs the apps with `check-apps.sh --run`. What
   stamps skip there is what a green stamp already proved at that fingerprint
   (`scripts/README.md`, *Stamps*), and each `modules`/`examples` lane is three jobs by primary
   lib. A tag pushed with `GITHUB_TOKEN` starts no workflow, so there is no second matrix.
@@ -775,9 +775,17 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   Red on a scheduled run does not block anyone: work goes on, and a later green run tags
   whatever main holds then and closes the issue.
 
-  **By hand, between runs:** `scripts/tag.sh` still works, on main, refuses unless CI passed on
-  HEAD, and does not push. Pushing such a tag runs the full matrix on the tag ref (with the
-  pins check); green means a Release cut by hand from its message, red means withdrawal.
+  **By hand, between runs: a dispatch with `release: live`** (main, `lane: all`; since
+  2026-11-11, replacing `scripts/tag.sh`): `gh workflow run ci.yml --ref main -f release=live`.
+  It is the scheduled run started by hand, the same jobs and the same strict stamps; it is red
+  when nothing landed since the newest released tag, or while an orphan tag stands. **Continue
+  mode:** when a lane fails for a reason outside the code (a runner's DNS, a mirror), `gh run
+  rerun <id> --failed` re-runs that lane, `gate` and the release jobs in the same run over the
+  same commit; the tag is created only after the matrix is green, so nothing is withdrawn. A
+  code change means a new dispatch, and green stamps credit every module that did not move.
+  The hand-cut route it replaces pushed the tag first and ran the matrix on the tag ref, so a red
+  lane meant withdrawing a published claim; one runner DNS outage cost tag `2026-11-11` three
+  full matrices. No date tag is pushed by hand any more, and none starts a run.
 
   **The tag message carries what moved since the previous tag** and the Release repeats it,
   because that is the one question a reader of a dated tag has. It is generated
@@ -879,7 +887,7 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   ```
 
   on the top-level bullet; continuation paragraphs and nested bullets belong to the entry
-  above and carry nothing. The date is `20YY-MM-DD` — the same shape `scripts/tag.sh`
+  above and carry nothing. The date is `20YY-MM-DD` — the same shape `scripts/lib/auto-release.sh`
   accepts for a tag name, so there is one date format in this repo and not two. Any bold
   tag (`**BREAKING:**`, `**BEHAVIOURAL, not breaking**`) goes *after* the date, never
   instead of it.

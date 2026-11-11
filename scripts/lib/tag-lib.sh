@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# What cutting a dated tag means, shared by the two routes to one: scripts/tag.sh
-# (by hand) and scripts/lib/auto-release.sh (a scheduled CI run). Sourced, sets no
+# What cutting a dated tag means, for scripts/lib/auto-release.sh (a scheduled run
+# or a `release: live` dispatch; scripts/tag.sh went 2026-11-11). Sourced, sets no
 # shell options, and works on the current directory, which must be a repo root.
 
 # Exit 0 when ci.yml at <rev> has ZIGLIBS_DRY_RUN on. A DRY-RUN CI proves the

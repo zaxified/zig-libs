@@ -1691,7 +1691,7 @@ fn checkChangelogShape(name: []const u8, path: []const u8, text: []const u8, fai
 ///
 /// THE FORMAT: `- **YYYY-MM-DD** — <entry>`, on the top-level bullet only.
 /// Continuation paragraphs and nested bullets belong to the entry above and
-/// carry nothing. The date is `20YY-MM-DD`, the same shape `scripts/tag.sh`
+/// carry nothing. The date is `20YY-MM-DD`, the same shape `scripts/lib/auto-release.sh`
 /// accepts for a tag name, so the repo has ONE date format rather than two.
 ///
 /// The date is WHEN THE CHANGE LANDED ON MAIN, not when the entry was typed.
@@ -1795,7 +1795,7 @@ fn checkEntryDates(name: []const u8, path: []const u8, text: []const u8, failed:
             std.log.err(
                 "{s}:{d}: changelog entry opens with a bold span that is not a date — " ++
                     "`{s}…`. The form is exactly `- **YYYY-MM-DD** — `, zero-padded, " ++
-                    "year first, em dash after (the same shape scripts/tag.sh accepts " ++
+                    "year first, em dash after (the same shape scripts/lib/auto-release.sh accepts " ++
                     "for a tag). A bold tag such as `**BREAKING:**` goes AFTER the date, " ++
                     "not instead of it. Module '{s}'; see CONVENTIONS.md §8.",
                 .{ path, line_no, rest[0..@min(rest.len, 32)], name },
@@ -1805,7 +1805,7 @@ fn checkEntryDates(name: []const u8, path: []const u8, text: []const u8, failed:
 }
 
 /// The `**YYYY-MM-DD** — ` opening of an entry, or null if it is absent or
-/// malformed. The date shape mirrors `scripts/tag.sh`'s own
+/// malformed. The date shape mirrors `scripts/lib/auto-release.sh`'s
 /// `^20[0-9]{2}-[0-9]{2}-[0-9]{2}$` so a tag name and an entry date are the
 /// same kind of string.
 fn entryDate(rest: []const u8) ?[]const u8 {
