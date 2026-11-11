@@ -1884,6 +1884,11 @@ phase_checks_fast_tail() {
     # valgrind, so it runs here (tag CI 43023357233, 2026-11-11). ~5 s.
     step "check-ctgrind-digests" ./scripts/checks/ctgrind.sh --verify-digests
 
+    # A Zig bump must move build.zig.zon, every setup-zig `version:` and every
+    # count-insns baseline header together; the count lane refused a stale
+    # header only in full CI (42929122017, 2026-11-11). <1 s.
+    step "check-toolchain-pins" python3 -I scripts/checks/check-toolchain-pins.py
+
     # The root NOTICE stopped listing modules on 2026-09-06: a module's
     # third-party obligation is discharged in the module's own NOTICE, and the
     # root file answers one question only -- is the library as a whole still

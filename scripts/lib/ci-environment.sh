@@ -462,8 +462,19 @@ echo "::group::valgrind"
 # ⚠ No `|| true`. For the `tests` role a failed install costs a SKIP and the
 # capability report names it; here the lane's entire purpose is the run, so a
 # silent partial install would be the "gate that scans nothing" shape again.
-sudo apt-get update -qq
-sudo apt-get install "${APT_QUIET[@]}" valgrind
+#
+# Up to three attempts, 30 s apart: a runner whose resolver hiccups (tag CI
+# 43040077339, 2026-11-11: "Temporary failure resolving security.ubuntu.com")
+# lost both the ctgrind and the count lane to a single failed fetch, and a full
+# re-run of the tag matrix costs ~1.5 h. Still red if all three fail.
+for attempt in 1 2 3; do
+    sudo apt-get update -qq || true
+    if sudo apt-get install "${APT_QUIET[@]}" valgrind && command -v valgrind >/dev/null; then
+        break
+    fi
+    echo "valgrind install attempt $attempt failed"
+    [[ $attempt -lt 3 ]] && sleep 30
+done
 valgrind --version
 echo "::endgroup::"
 fi
