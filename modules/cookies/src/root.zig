@@ -1431,3 +1431,29 @@ test "percentDecode: an output exactly as long as the input is enough" {
     try testing.expectError(error.NoSpaceLeft, percentDecode(out[0..2], "a%4"));
     try testing.expectEqualStrings("aA", try percentDecode(out[0..4], "a%41"));
 }
+
+test "parse: a one-byte header is one valueless cookie" {
+    var it = parse("a");
+    const c = it.next().?;
+    try std.testing.expectEqualStrings("a", c.name);
+    try std.testing.expectEqualStrings("", c.value);
+    try std.testing.expect(it.next() == null);
+    try std.testing.expectEqualStrings("", find("a", "a").?);
+}
+
+test "SetCookie: Expires accepts every weekday and every month name" {
+    const days = [_][]const u8{ "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    var line: [64]u8 = undefined;
+    var buf: [128]u8 = undefined;
+    for (days) |d| for (months) |m| {
+        const e = try std.fmt.bufPrint(&line, "{s}, 06 {s} 1994 08:49:37 GMT", .{ d, m });
+        _ = try (SetCookie{ .name = "n", .value = "v", .expires = e }).bufPrint(&buf);
+    };
+}
+
+test "percentDecode: a % with one hex digit and one non-hex digit is kept literally, in either order" {
+    var out: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("%z4", try percentDecode(&out, "%z4"));
+    try std.testing.expectEqualStrings("%4z", try percentDecode(&out, "%4z"));
+}

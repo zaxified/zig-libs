@@ -484,3 +484,54 @@ test "private: after a successful open the rest of `out` (nonce and tag bytes) i
     try testing.expectEqual(raw_len - 28, got.len);
     try testing.expect(std.mem.allEqual(u8, plain[got.len..raw_len], 0));
 }
+
+test "Key.generateInto fills both halves" {
+    var k: Key = .{ .signing = @splat(0), .encryption = @splat(0) };
+    try Key.generateInto(&k, testing.io);
+    try testing.expect(!std.mem.allEqual(u8, &k.signing, 0));
+    try testing.expect(!std.mem.allEqual(u8, &k.encryption, 0));
+}
+
+test "private.openBufLen: at least the decoded size and at most two bytes more" {
+    for (0..64) |n| {
+        const raw = secure.private.overhead + n;
+        const buf = secure.private.openBufLen(secure.private.len(n));
+        try testing.expect(buf >= raw and buf - raw <= 2);
+    }
+}
+
+test "private.sealTimedNonce: the bytes of an independent construction (std AES-256-GCM, ad = timed domain, name)" {
+    const k = vectorKey();
+    const Aes = std.crypto.aead.aes_gcm.Aes256Gcm;
+    const value = "user=42&x";
+    const issued: i64 = 1_760_000_000;
+    const nonce: [12]u8 = @splat(7);
+    for ([_][]const u8{ "sid", "a", "a-longer-cookie-name" }) |name| {
+        var m: [8 + value.len]u8 = undefined;
+        std.mem.writeInt(i64, m[0..8], issued, .big);
+        @memcpy(m[8..], value);
+        var ad_buf: [64]u8 = undefined;
+        const ad = try std.fmt.bufPrint(&ad_buf, "timed1\x00{s}", .{name});
+        var raw: [12 + m.len + 16]u8 = undefined;
+        @memcpy(raw[0..12], &nonce);
+        var tag: [16]u8 = undefined;
+        Aes.encrypt(raw[12..][0..m.len], &tag, &m, ad, nonce, k.encryption);
+        @memcpy(raw[12 + m.len ..], &tag);
+        var want: [128]u8 = undefined;
+        const want_s = std.base64.standard.Encoder.encode(&want, &raw);
+        var out: [128]u8 = undefined;
+        const got = try secure.private.sealTimedNonce(&k, name, value, issued, nonce, &out);
+        try testing.expectEqualStrings(want_s, got);
+    }
+}
+
+test "openTimed: a 7-byte plaintext that authenticates under the timed associated data is refused, not sliced" {
+    // `seal` takes any name: under "timed1\0sid" it makes a record whose
+    // associated data is exactly the one `openTimed` derives for "sid", and
+    // whose plaintext is one byte shorter than an issue time.
+    const k = vectorKey();
+    var buf: [64]u8 = undefined;
+    const sealed = try secure.private.seal(&k, "timed1\x00sid", "1234567", @splat(3), buf[0..secure.private.len(7)]);
+    var plain: [64]u8 = undefined;
+    try testing.expect(secure.private.openTimed(&.{k}, "sid", sealed, 1_760_000_000, 100, &plain) == null);
+}

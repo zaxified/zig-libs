@@ -375,3 +375,26 @@ test "parse: a rule that cannot be encoded is skipped, never fatal and never gue
     const h65 = try std.fmt.bufPrint(&host, "x.{s}.uk", .{enc65});
     try testing.expectEqualStrings("uk", list.publicSuffix(h65));
 }
+
+test "punycode: vectors that separate damp 700 from 699, the adapt loop bound by one, and tmax by one" {
+    // Expectations are Python's `str.encode('punycode')`; each input changes
+    // its output when `adapt` divides by 699 instead of 700, loops while
+    // `delta > 456` instead of `> 455`, or `t` takes tmax one position early.
+    const cases = [_][2][]const u8{
+        .{ "\u{25d8}\u{1913}", "0ef156d" },
+        .{ "\u{b37}\u{1ebb}\u{a06}", "x8b32di24b" },
+        .{ "\u{198f}\u{2859}", "kif000e" },
+    };
+    for (cases) |c| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try punycodeEncode(testing.allocator, &out, c[0]);
+        try testing.expectEqualStrings(c[1], out.items);
+    }
+}
+
+test "toAscii: DEL is an ASCII byte (lowercased in place), not a reason for an xn-- form" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("a\x7fb.c", try toAscii(arena.allocator(), "A\x7fB.c"));
+}

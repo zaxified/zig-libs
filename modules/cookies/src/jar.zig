@@ -1138,3 +1138,58 @@ test "lowerInto takes 256 bytes and not 257; defaultPath of a relative or empty 
     try testing.expectEqual(@as(usize, 3000), (Options{}).max_cookies);
     try testing.expectEqual(@as(usize, 50), (Options{}).max_per_domain);
 }
+
+test "SetCookie.parse: tabs around names and values are trimmed; an empty Domain is ignored" {
+    const sc = SetCookie.parse("a\t=\tb\t;\tSecure\t; Path\t=\t/x\t").?;
+    try testing.expectEqualStrings("a", sc.name);
+    try testing.expectEqualStrings("b", sc.value);
+    try testing.expect(sc.secure);
+    try testing.expectEqualStrings("/x", sc.path.?);
+    try testing.expect(SetCookie.parse("a=b; Domain=").?.domain == null);
+    try testing.expect(SetCookie.parse("a=b; Domain=.").?.domain == null);
+    try testing.expect(SetCookie.parse("a=b; Path=").?.path == null);
+}
+
+test "parseCookieDate: every month name is read, in either case" {
+    const names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    for (names, 1..) |nm, m| {
+        var buf: [32]u8 = undefined;
+        const want = datefmt.ymdToEpochDay(2001, @intCast(m), 1) * std.time.s_per_day;
+        const s = try std.fmt.bufPrint(&buf, "1 {s} 2001 00:00:00", .{nm});
+        try testing.expectEqual(want, parseCookieDate(s).?);
+        var low: [32]u8 = undefined;
+        try testing.expectEqual(want, parseCookieDate(std.ascii.lowerString(&low, s)).?);
+    }
+}
+
+test "setCookieAt: a host longer than 256 bytes stores nothing and sends nothing" {
+    var j = Jar.init(testing.allocator, undefined, .{});
+    defer j.deinit();
+    var buf: [320]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "http://{s}/", .{&@as([300]u8, @splat('a'))});
+    try j.setCookieAt(u(text), "a=1", t0);
+    try testing.expectEqual(@as(usize, 0), j.count());
+    var out: [32]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    try testing.expect(!try j.writeCookiesAt(u(text), t0, &w, "Cookie: "));
+}
+
+test "cookieJar: write_cookies reads the jar's clock, store stamps the expiry with it" {
+    var j = Jar.init(testing.allocator, std.testing.io, .{});
+    defer j.deinit();
+    const cj = j.cookieJar();
+    // Stored at a fixed time in 2001 with a 100 s life: long expired by the jar's own clock.
+    try j.setCookieAt(u("http://h.test/"), "old=1; Max-Age=100", 1_000_000_000);
+    try testing.expectEqual(@as(usize, 1), j.count());
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try testing.expect(!try cj.write_cookies(cj.ctx, u("http://h.test/"), &w, "Cookie: "));
+    try testing.expectEqual(@as(usize, 0), j.count());
+    const before = j.clockNow();
+    const head = try http.h1.ResponseHead.parse("HTTP/1.1 200 OK\r\nSet-Cookie: n=1; Max-Age=1000\r\n\r\n");
+    cj.store(cj.ctx, u("http://h.test/"), &head);
+    const after = j.clockNow();
+    try testing.expectEqual(@as(usize, 1), j.count());
+    const exp = j.entries.items[0].expiry.?;
+    try testing.expect(exp >= before + 1000 and exp <= after + 1000);
+}
