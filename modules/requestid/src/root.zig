@@ -545,6 +545,132 @@ test "echo is skipped, not a 500, when an outer middleware filled the header tab
     try testing.expectEqualStrings("peer-1", bodyOf(got)); // current() still set
 }
 
+fn fillHeaderBytes(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    // Leaves 16 bytes of the copy store: the 12-byte name of `X-Request-Id`
+    // fits, the 6-byte value does not (`HeaderBytesExhausted` mid-pair).
+    const fill: [http.Server.header_copy_bytes - "X-F".len - 16]u8 = @splat('a');
+    try ctx.res.setHeader("X-F", &fill);
+    return next.run(ctx);
+}
+
+test "echo is skipped, not a 500, when an outer middleware spent the header byte budget" {
+    // Mutation 2026-11-11: re-propagating `HeaderBytesExhausted` survived --
+    // only the table-full case (`TooManyHeaders`) was exercised.
+    var ri = RequestId{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(.{ .state = null, .run = fillHeaderBytes });
+    try r.use(ri.middleware());
+    try r.get("/", hEchoCurrent);
+
+    var buf: [8192]u8 = undefined;
+    const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: peer-1\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(headerValue(got, "X-F") != null); // the outer header is intact
+    try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "X-Request-Id"));
+    try testing.expectEqualStrings("peer-1", bodyOf(got)); // current() still set
+}
+
+const HeadSentOuter = struct {
+    var inner_err: ?anyerror = null;
+    fn run(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+        try ctx.res.writeAll("x");
+        try ctx.res.flush(); // the head is on the wire: no header can be set any more
+        next.run(ctx) catch |err| {
+            inner_err = err;
+        };
+    }
+};
+
+test "an echo failure other than the budget errors propagates (head already sent)" {
+    // Mutation 2026-11-11: swallowing every other error survived. The only
+    // reachable one is `HeadersSent`, an outer middleware that flushed first.
+    var ri = RequestId{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(.{ .state = null, .run = HeadSentOuter.run });
+    try r.use(ri.middleware());
+    try r.get("/", hEchoCurrent);
+
+    HeadSentOuter.inner_err = null;
+    var buf: [1024]u8 = undefined;
+    _ = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expectEqual(@as(?anyerror, error.HeadersSent), HeadSentOuter.inner_err);
+}
+
+test "middleware() panics on a header name the echo could never set (child process)" {
+    // `middleware()` @panics, in every build mode. A panic cannot be caught
+    // in-process, so the test re-runs this test binary with the bad name in
+    // the environment; the child takes the first branch and must die with
+    // the panic message. Mutation 2026-11-11: dropping the check survived.
+    if (testing.environ.getPosix("REQUESTID_PANIC_CHILD")) |name| {
+        var ri = RequestId{ .options = .{ .header_name = name } };
+        _ = ri.middleware();
+        return; // reached only when the guard is gone: the child exits 0
+    }
+    const gpa = testing.allocator;
+    const exe = try std.process.executablePathAlloc(testing.io, gpa);
+    defer gpa.free(exe);
+    for ([_][]const u8{ "Content-Length", "transfer-encoding", "Bad Name", "" }) |bad| {
+        var env = try testing.environ.createMap(gpa);
+        defer env.deinit();
+        try env.put("REQUESTID_PANIC_CHILD", bad);
+        const res = try std.process.run(gpa, testing.io, .{ .argv = &.{exe}, .environ_map = &env });
+        defer gpa.free(res.stdout);
+        defer gpa.free(res.stderr);
+        errdefer std.debug.print("child for header_name \"{s}\": {any}\n{s}\n", .{ bad, res.term, res.stderr });
+        try testing.expect(!(res.term == .exited and res.term.exited == 0));
+        try testing.expect(std.mem.find(u8, res.stderr, "Options.header_name is not a usable header name") != null);
+    }
+}
+
+test "isAdoptable: every single byte value, alone and inside an id, against the charset" {
+    // An exhaustive companion of the random model-fuzz: mutation 2026-11-11
+    // survivors accepted `[`, `{` and `/`, which random bytes rarely hit.
+    var c: usize = 0;
+    while (c < 256) : (c += 1) {
+        const b: u8 = @intCast(c);
+        const ok = (b >= 'A' and b <= 'Z') or (b >= 'a' and b <= 'z') or (b >= '0' and b <= '9') or b == '.' or b == '_' or b == '-';
+        const one = [_]u8{b};
+        const mid = [_]u8{ 'a', b, 'b' };
+        const last = [_]u8{ 'a', 'b', b };
+        try testing.expectEqual(ok, isAdoptable(&one));
+        try testing.expectEqual(ok, isAdoptable(&mid));
+        try testing.expectEqual(ok, isAdoptable(&last));
+    }
+}
+
+test "generateInto: a prefix with leading zero digits is still 32 hex characters" {
+    // Mutation 2026-11-11: space padding on the prefix field survived (a real
+    // prefix has a leading zero nibble only one time in sixteen).
+    prefix_cache.store(0xab, .monotonic);
+    defer prefix_cache.store(0, .monotonic);
+    var a: [generated_len]u8 = undefined;
+    const id = generateInto(&a);
+    try testing.expectEqual(@as(usize, generated_len), id.len);
+    try testing.expectEqualStrings("00000000000000ab", id[0..16]);
+    try testing.expect(modelIsGenerated(id));
+}
+
+test "processPrefix: a fresh computation differs from an earlier one (it is not a constant)" {
+    // Mutation 2026-11-11: a constant prefix survived every other test.
+    // Reset the cache and compute twice with the monotonic clock advanced
+    // in between: the hash mixes the clocks, so the values must differ.
+    defer prefix_cache.store(0, .monotonic);
+    prefix_cache.store(0, .monotonic);
+    const p1 = processPrefix();
+    const t = monoNs();
+    var spins: usize = 0;
+    while (monoNs() == t) : (spins += 1) {
+        try testing.expect(spins < 100_000_000); // a clock that never advances is a failure, not a hang
+        std.atomic.spinLoopHint();
+    }
+    prefix_cache.store(0, .monotonic);
+    const p2 = processPrefix();
+    try testing.expect(p1 != 0 and p2 != 0);
+    try testing.expect(p1 != p2);
+}
+
 test "custom header name" {
     var ri = RequestId{ .options = .{ .header_name = "X-Correlation-Id" } };
     var r = router.Router.init(testing.allocator);

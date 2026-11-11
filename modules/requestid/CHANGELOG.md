@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-11** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation run (83 schemata mutants over the production code, 74 killed, 9 equivalent) added six tests: the echo skipped on an exhausted header byte budget (`HeaderBytesExhausted`), other echo errors propagating (`HeadersSent`), the `middleware()` panic on a bad `header_name` (checked in a child process), every byte value against the adoptable charset, a prefix with leading zeros still 32 hex characters, and a fresh prefix that is not a constant.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the header-name character test in `isUsableHeaderName` calls `http.h1.isToken` (same RFC 9110 tchar set, non-empty); the framing-header rejection stays. (duplicate-code pass)
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private wall/monotonic OS reads that only seed the process prefix hash (duplicate-code pass) now call `clock.realtimeNs()` / `clock.monotonicNs()`; the seed values differ in representation only. New dependency: `clock`.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 1 mutant over the best-effort echo (budget errors re-propagated): 1/1 killed on the first run. Card A1 again.
