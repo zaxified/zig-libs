@@ -15,7 +15,7 @@ a third implementation -- traces the same path and must agree.
 Driven by tools/interop.zig (`zig build interop-traceroute`):
 
     kernel_oracle.py judge EXE OUT    run every scenario; write the Zig vectors to OUT
-    kernel_oracle.py inner EXE        (internal) runs inside `unshare -rmn`
+    kernel_oracle.py inner EXE [K N]  (internal) runs inside `unshare -rmn`; shard K of N
 
 Everything runs in `unshare -rmn` (a tmpfs over /run for `ip netns`); no root,
 no network, nothing on the host changes.
@@ -163,10 +163,39 @@ def classic(fam, method):
     return hops, out
 
 
-def inner(exe):
-    subprocess.run(['mount', '-t', 'tmpfs', 'tmpfs', '/run'], check=True)
-    os.makedirs('/run/netns', exist_ok=True)
-    results = []
+def trace_case(exe, scenario, fam, method):
+    """One `--trace` over a fresh chain shaped for `scenario`, then traceroute(8) over another fresh one."""
+    name = '%s-%s-%s' % (fam, method, scenario)
+    topology()
+    shape(scenario)
+    listener = None
+    if scenario == 'open-port':
+        listener = subprocess.Popen(['ip', 'netns', 'exec', 's', sys.executable, '-c', LISTENER])
+        time.sleep(0.5)
+    p = sh('ip', 'netns', 'exec', 'c', exe, '--trace', DEST[fam], method, str(MAX_HOPS), str(PROBES),
+           str(TIMEOUT_MS), check=False)
+    if listener:
+        listener.kill()
+        listener.wait()
+    if p.returncode != 0:
+        return {'name': name, 'error': p.stderr[-400:]}
+    r = json.loads(p.stdout)
+    topology()
+    shape(scenario)
+    if listener:
+        listener = subprocess.Popen(['ip', 'netns', 'exec', 's', sys.executable, '-c', LISTENER])
+        time.sleep(0.5)
+    r['classic'], r['classic_text'] = classic(fam, method)
+    if listener:
+        listener.kill()
+        listener.wait()
+    r.update(name=name, scenario=scenario, fam=fam, method=method)
+    return r
+
+
+def jobs():
+    """Every case, in the order the vectors list them. Each builds its own topology, so any subset runs alone."""
+    out = []
     for scenario in SCENARIOS:
         for fam in ('v4', 'v6'):
             for method in ('icmp', 'udp', 'tcp', 'icmp-dgram', 'udp-dgram', 'icmp-flow', 'udp-flow', 'udp-dgram-flow'):
@@ -174,39 +203,34 @@ def inner(exe):
                     continue
                 if scenario == 'open-port' and method != 'tcp':
                     continue
-                name = '%s-%s-%s' % (fam, method, scenario)
-                topology()
-                shape(scenario)
-                listener = None
-                if scenario == 'open-port':
-                    listener = subprocess.Popen(['ip', 'netns', 'exec', 's', sys.executable, '-c', LISTENER])
-                    time.sleep(0.5)
-                p = sh('ip', 'netns', 'exec', 'c', exe, '--trace', DEST[fam], method, str(MAX_HOPS), str(PROBES),
-                       str(TIMEOUT_MS), check=False)
-                if p.returncode != 0:
-                    results.append({'name': name, 'error': p.stderr[-400:]})
-                    if listener:
-                        listener.kill()
-                        listener.wait()
-                    continue
-                r = json.loads(p.stdout)
-                if listener:
-                    listener.kill()
-                    listener.wait()
-                topology()
-                shape(scenario)
-                if listener:
-                    listener = subprocess.Popen(['ip', 'netns', 'exec', 's', sys.executable, '-c', LISTENER])
-                    time.sleep(0.5)
-                r['classic'], r['classic_text'] = classic(fam, method)
-                if listener:
-                    listener.kill()
-                    listener.wait()
-                r.update(name=name, scenario=scenario, fam=fam, method=method)
-                results.append(r)
-    results.extend(mtr_scenarios(exe))
-    results.extend(parallel_scenarios(exe))
-    results.append(ecmp(exe))
+                out.append((trace_case, (scenario, fam, method)))
+    for fam in ('v4', 'v6'):
+        for method in ('icmp', 'udp', 'udp-flow', 'udp-dgram-flow', 'tcp', 'icmp-dgram'):
+            out.append((mtr_case, (fam, method)))
+        for method in ('icmp', 'udp-flow', 'tcp'):
+            out.append((mtrset_case, (fam, method)))
+    for fam in ('v4', 'v6'):
+        for scenario in ('clean', 'prohibited-r3', 'silent-r2'):
+            for method in ('icmp', 'udp', 'tcp', 'icmp-dgram', 'udp-dgram', 'udp-flow'):
+                out.append((parallel_case, (fam, scenario, method)))
+    out.append((ecmp, ()))
+    return out
+
+
+# ⭐ SHARDED (2026-11-11): the oracle waits on the kernel (a chain rebuild is ~2.2 s, CPU
+# ~15 % of the wall clock), and ran ~93 cases one after another for ~8 minutes. Each
+# shard is its own `unshare -rmn` (own /run/netns tmpfs, own namespaces), so shards
+# share nothing; `judge` puts the results back in `jobs()` order.
+SHARDS = 8
+
+
+def inner(exe, shard=0, nshards=1):
+    subprocess.run(['mount', '-t', 'tmpfs', 'tmpfs', '/run'], check=True)
+    os.makedirs('/run/netns', exist_ok=True)
+    results = []
+    for i, (fn, args) in enumerate(jobs()):
+        if i % nshards == shard:
+            results.append([i, fn(exe, *args)])
     for n in NS + ('r2b',):
         sh('ip', 'netns', 'del', n, check=False)
     json.dump(results, sys.stdout)
@@ -230,75 +254,69 @@ def mtr_answerers(fam, method):
     return hops, out.stdout + out.stderr
 
 
-def mtr_scenarios(exe):
-    """Continuous mode over a clean chain: `LiveMtr` against the topology and mtr(8), `LiveMtrSet` with the server and
-    r3 as two members (r3 ends a hop earlier)."""
-    results = []
-    for fam in ('v4', 'v6'):
-        for method in ('icmp', 'udp', 'udp-flow', 'udp-dgram-flow', 'tcp', 'icmp-dgram'):
-            name = 'mtr-%s-%s' % (fam, method)
-            topology()
-            p = sh('ip', 'netns', 'exec', 'c', exe, '--mtr', method, str(MAX_HOPS), str(TIMEOUT_MS), DEST[fam], check=False)
-            want = [[addr(fam, i, 2)] for i in range(4)]
-            why = []
-            if p.returncode != 0:
-                why.append('failed: ' + p.stderr[-300:])
-            else:
-                r = json.loads(p.stdout)[0]
-                if not r['reached'] or r['hops'] != want:
-                    why.append('%s, topology says %s' % (r, want))
-            if not method.endswith('dgram') and not method.endswith('flow'):
-                topology()
-                seen, text = mtr_answerers(fam, method)
-                if {k: v for k, v in seen.items()} != {i + 1: w[0] for i, w in enumerate(want)}:
-                    why.append('mtr(8) saw %s:\n%s' % (seen, text))
-            results.append({'name': name, 'mtr': True, 'why': why})
-        for method in ('icmp', 'udp-flow', 'tcp'):
-            name = 'mtrset-%s-%s' % (fam, method)
-            topology()
-            other = addr(fam, 2, 2)
-            p = sh('ip', 'netns', 'exec', 'c', exe, '--mtr', method, str(MAX_HOPS), str(TIMEOUT_MS), DEST[fam], other, check=False)
-            why = []
-            if p.returncode != 0:
-                why.append('failed: ' + p.stderr[-300:])
-            else:
-                a, b = json.loads(p.stdout)
-                want_a = [[addr(fam, i, 2)] for i in range(4)]
-                want_b = [[addr(fam, i, 2)] for i in range(3)]
-                if not a['reached'] or a['hops'] != want_a or not b['reached'] or b['hops'] != want_b:
-                    why.append('%s %s' % (a, b))
-            results.append({'name': name, 'mtr': True, 'why': why})
-    return results
+def mtr_case(exe, fam, method):
+    """Continuous mode over a clean chain: `LiveMtr` against the topology and mtr(8)."""
+    name = 'mtr-%s-%s' % (fam, method)
+    topology()
+    p = sh('ip', 'netns', 'exec', 'c', exe, '--mtr', method, str(MAX_HOPS), str(TIMEOUT_MS), DEST[fam], check=False)
+    want = [[addr(fam, i, 2)] for i in range(4)]
+    why = []
+    if p.returncode != 0:
+        why.append('failed: ' + p.stderr[-300:])
+    else:
+        r = json.loads(p.stdout)[0]
+        if not r['reached'] or r['hops'] != want:
+            why.append('%s, topology says %s' % (r, want))
+    if not method.endswith('dgram') and not method.endswith('flow'):
+        topology()
+        seen, text = mtr_answerers(fam, method)
+        if {k: v for k, v in seen.items()} != {i + 1: w[0] for i, w in enumerate(want)}:
+            why.append('mtr(8) saw %s:\n%s' % (seen, text))
+    return {'name': name, 'mtr': True, 'why': why}
 
 
-def parallel_scenarios(exe):
+def mtrset_case(exe, fam, method):
+    """`LiveMtrSet` with the server and r3 as two members (r3 ends a hop earlier)."""
+    name = 'mtrset-%s-%s' % (fam, method)
+    topology()
+    other = addr(fam, 2, 2)
+    p = sh('ip', 'netns', 'exec', 'c', exe, '--mtr', method, str(MAX_HOPS), str(TIMEOUT_MS), DEST[fam], other, check=False)
+    why = []
+    if p.returncode != 0:
+        why.append('failed: ' + p.stderr[-300:])
+    else:
+        a, b = json.loads(p.stdout)
+        want_a = [[addr(fam, i, 2)] for i in range(4)]
+        want_b = [[addr(fam, i, 2)] for i in range(3)]
+        if not a['reached'] or a['hops'] != want_a or not b['reached'] or b['hops'] != want_b:
+            why.append('%s %s' % (a, b))
+    return {'name': name, 'mtr': True, 'why': why}
+
+
+def parallel_case(exe, fam, scenario, method):
     """A window of 4 on the live chain: the same trace, every method, including a filter's errors arriving while more
     probes are out, which is when a socket's pending error meets the next send."""
-    results = []
-    for fam in ('v4', 'v6'):
-        for scenario in ('clean', 'prohibited-r3', 'silent-r2'):
-            for method in ('icmp', 'udp', 'tcp', 'icmp-dgram', 'udp-dgram', 'udp-flow'):
-                name = 'parallel-%s-%s-%s' % (fam, method, scenario)
-                topology()
-                shape(scenario)
-                p = sh('ip', 'netns', 'exec', 'c', exe, '--trace', DEST[fam], method + '-par', str(MAX_HOPS), str(PROBES), str(TIMEOUT_MS), check=False)
-                why = []
-                if p.returncode != 0:
-                    why.append('failed: ' + p.stderr[-300:])
-                else:
-                    r = json.loads(p.stdout)
-                    want = truth(scenario, fam, method)
-                    got = [{(k, a, c) for k, a, c, _ in hop} for hop in r['hops']]
-                    if got != [{w} for w in want]:
-                        why.append('%s, topology says %s' % (got, want))
-                results.append({'name': name, 'mtr': True, 'why': why})
-    return results
+    name = 'parallel-%s-%s-%s' % (fam, method, scenario)
+    topology()
+    shape(scenario)
+    p = sh('ip', 'netns', 'exec', 'c', exe, '--trace', DEST[fam], method + '-par', str(MAX_HOPS), str(PROBES), str(TIMEOUT_MS), check=False)
+    why = []
+    if p.returncode != 0:
+        why.append('failed: ' + p.stderr[-300:])
+    else:
+        r = json.loads(p.stdout)
+        want = truth(scenario, fam, method)
+        got = [{(k, a, c) for k, a, c, _ in hop} for hop in r['hops']]
+        if got != [{w} for w in want]:
+            why.append('%s, topology says %s' % (got, want))
+    return {'name': name, 'mtr': True, 'why': why}
 
 
 def ecmp(exe):
     """r1 balances the server's prefix over r2 and r2b by the UDP 5-tuple: classic UDP probes, whose ports differ,
     see both at TTL 2; flow-stable ones must see one. Hash seeds differ per netns, so classic gets three takes."""
     topology()
+    sh('ip', 'netns', 'del', 'r2b', check=False)
     sh('ip', 'netns', 'add', 'r2b')
     sh('ip', '-n', 'r2b', 'link', 'set', 'lo', 'up')
     for dev, left, right, net in (('m1', 'r1', 'r2b', 11), ('m2', 'r2b', 'r3', 12)):
@@ -362,12 +380,23 @@ def zopt(v):
 
 
 def judge(exe, out_path):
-    p = subprocess.run(['unshare', '-rmn', sys.executable, os.path.abspath(__file__), 'inner', os.path.abspath(exe)],
-                       capture_output=True, text=True)
-    sys.stderr.write(p.stderr)
-    if p.returncode != 0:
+    procs = [subprocess.Popen(['unshare', '-rmn', sys.executable, os.path.abspath(__file__), 'inner',
+                               os.path.abspath(exe), str(k), str(SHARDS)],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for k in range(SHARDS)]
+    indexed, failed = [], False
+    for p in procs:
+        out, err = p.communicate()
+        sys.stderr.write(err)
+        if p.returncode != 0:
+            failed = True
+            continue
+        indexed.extend(json.loads(out))
+    if failed:
         return 1
-    results = json.loads(p.stdout)
+    if sorted(i for i, _ in indexed) != list(range(len(jobs()))):
+        sys.stderr.write('kernel_oracle: the shards did not return every case exactly once\n')
+        return 1
+    results = [r for _, r in sorted(indexed, key=lambda x: x[0])]
     v = sh('traceroute', '-V', check=False)
     version = re.search(r'\d+\.\d+\.\d+', v.stdout + v.stderr).group(0)
     bad = 0
@@ -498,6 +527,8 @@ if __name__ == '__main__':
         sys.exit(judge(sys.argv[2], sys.argv[3]))
     elif len(sys.argv) == 3 and sys.argv[1] == 'inner':
         inner(sys.argv[2])
+    elif len(sys.argv) == 5 and sys.argv[1] == 'inner':
+        inner(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
     else:
         sys.stderr.write(__doc__)
         sys.exit(2)

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-11** — **NO CONSUMER-VISIBLE CHANGE:** `tools/kernel_oracle.py` runs its ~93 cases in 8 parallel `unshare -rmn` shards and merges them in the old order; `zig build interop-traceroute` 489 s → 74 s locally, same 109 traces and verdicts.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** private `onesSum` (duplicate-code pass) calls `icmp.checksum.sum`; same results.
 - **2026-11-02** — **CONSUMER-VISIBLE (additive, one fix):** `Mtr.on_answer` reports each answer as `round` accepts it, for a live display (`example-apps/tiny-mtr`). `Mtr.reset` now zeroes `rounds`, as its comment always said; a caller showing `rounds` after a reset sees the new count.
 
