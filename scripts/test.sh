@@ -1889,6 +1889,41 @@ phase_checks_fast_tail() {
     # header only in full CI (42929122017, 2026-11-11). <1 s.
     step "check-toolchain-pins" python3 -I scripts/checks/check-toolchain-pins.py
 
+    # Static checks that read source and compile nothing but the small zl-gates
+    # tool, moved here from `phase_checks` (2026-11-11, owner: cheap checks are
+    # enforced before any push, full compiles stay on GitHub). check-global-alloc
+    # alone turned a full run red after ~20 min (sandbox, full CI 42400941000).
+    # Measured locally: 0.4 / 1.0 / 0.8 s, fuzz-reach 7 s, example-assert 0.4 s.
+    step "check-fuzz" zig build check-fuzz
+    step "check-global-alloc" zig build check-global-alloc
+    step "check-skip-as-pass" ./scripts/checks/check-skip-as-pass.py
+
+    # `zig build check-fuzz` proves a harness EXISTS; this proves it READS its
+    # input. A `Smith` ranged draw returns the range MINIMUM unless the eight
+    # bytes it reads as a little-endian u64 already lie inside the range, so a
+    # harness that opens with one -- or that slices its drawn bytes to a length
+    # that came from one -- replays every corpus seed, and every crash `--fuzz`
+    # minimises into a seed, as the same fixed input. 416 of 474 targets did at
+    # landing. `--advisory` printed that burn-down without failing anything --
+    # but a gate that never fails protects nothing, and the burn-down is being
+    # done a module at a time over many sessions, so a module fixed in week one
+    # could regress in week three with no signal at all. `--ratchet` compares
+    # against `scripts/checks/fuzz-reach-baseline.txt`, a ceiling PER MODULE: it fails
+    # only where a module got worse, names the modules that have improved since
+    # the file was written, and comes off entirely when the baseline is empty.
+    # The ceiling is per module rather than one total on purpose -- a total lets
+    # one module regress while another improves and still reads green.
+    # It still FAILS on a malformed or stale exemption.
+    step "check-fuzz-reach" ./scripts/checks/check-fuzz-reach.py --ratchet
+
+    # `run-examples` builds and runs each example in the LANE's optimize mode,
+    # so in a ReleaseFast lane every `std.debug.assert` in one is compiled out
+    # and the example prints its success lines having checked nothing. Three
+    # examples compared against an external oracle that way and printed that it
+    # agreed; breaking `sealedbox`'s PyNaCl constant left the old example
+    # exiting 0 and still claiming a byte-exact match.
+    step "check-example-assert" ./scripts/checks/check-example-assert.py
+
     # The root NOTICE stopped listing modules on 2026-09-06: a module's
     # third-party obligation is discharged in the module's own NOTICE, and the
     # root file answers one question only -- is the library as a whole still
@@ -1941,8 +1976,6 @@ phase_checks_fast_tail() {
 # unseen on three of four lanes. It lives in `modules`, per arch.
 phase_checks() {
     step "check-testonly" zig build check-testonly
-    step "check-fuzz" zig build check-fuzz
-    step "check-global-alloc" zig build check-global-alloc
     step "check-portable" zig build check-portable
     step "check-http-sizeprobe" ./scripts/checks/check-http-sizeprobe.sh
     # falcon's constant-time property is invisible to every value test (the
@@ -1951,33 +1984,7 @@ phase_checks() {
     # the emulation is bypassed. See the script header.
     step "check-fp-freedom" ./scripts/checks/check-fp-freedom.sh
     step "check-ct-compare" ./scripts/checks/check-ct-compare.py
-    step "check-skip-as-pass" ./scripts/checks/check-skip-as-pass.py
 
-    # `zig build check-fuzz` proves a harness EXISTS; this proves it READS its
-    # input. A `Smith` ranged draw returns the range MINIMUM unless the eight
-    # bytes it reads as a little-endian u64 already lie inside the range, so a
-    # harness that opens with one -- or that slices its drawn bytes to a length
-    # that came from one -- replays every corpus seed, and every crash `--fuzz`
-    # minimises into a seed, as the same fixed input. 416 of 474 targets did at
-    # landing. `--advisory` printed that burn-down without failing anything --
-    # but a gate that never fails protects nothing, and the burn-down is being
-    # done a module at a time over many sessions, so a module fixed in week one
-    # could regress in week three with no signal at all. `--ratchet` compares
-    # against `scripts/checks/fuzz-reach-baseline.txt`, a ceiling PER MODULE: it fails
-    # only where a module got worse, names the modules that have improved since
-    # the file was written, and comes off entirely when the baseline is empty.
-    # The ceiling is per module rather than one total on purpose -- a total lets
-    # one module regress while another improves and still reads green.
-    # It still FAILS on a malformed or stale exemption.
-    step "check-fuzz-reach" ./scripts/checks/check-fuzz-reach.py --ratchet
-
-    # `run-examples` builds and runs each example in the LANE's optimize mode,
-    # so in a ReleaseFast lane every `std.debug.assert` in one is compiled out
-    # and the example prints its success lines having checked nothing. Three
-    # examples compared against an external oracle that way and printed that it
-    # agreed; breaking `sealedbox`'s PyNaCl constant left the old example
-    # exiting 0 and still claiming a byte-exact match.
-    step "check-example-assert" ./scripts/checks/check-example-assert.py
     step "check-ctgrind" zig build check-ctgrind
 }
 
