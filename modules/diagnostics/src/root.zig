@@ -3143,3 +3143,245 @@ test "writeLsp: empty tags and empty labels write no key" {
     try testing.expect(std.mem.find(u8, w.buffered(), "tags") == null);
     try testing.expect(std.mem.find(u8, w.buffered(), "relatedInformation") == null);
 }
+
+const GoldRow = struct {
+    text_a: []const u8,
+    text_b: []const u8,
+    two: bool,
+    file: []const u8,
+    line: u32,
+    col: ?u32,
+    end_line: ?u32,
+    end_col: ?u32,
+    span_message: []const u8,
+    labels: []const Label,
+    tab_width: u8,
+    start_ctx: u32,
+    end_ctx: u32,
+    before: u32,
+    after: u32,
+    unicode: bool,
+    term_width: ?u16,
+    char_col: bool,
+    expect: []const u8,
+};
+
+// Each row was picked because a mutant of the 2026-11-11 audit changed its output and no other test's: margin,
+// window and caret code for cut lines with wide, zero-width and invalid-UTF-8 characters, tabs, hanging labels,
+// two files and multi-line spans. The text was read against the rules (window width, `...` ends, caret columns,
+// label order) when it was recorded.
+const gold_rows = [_]GoldRow{
+    // H1698
+    .{ .text_a = " gxcx\xff\xcc\x81\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xcc\x81\xf0\x9f\x98\x80z\t\xffz22c\xe4\xb8\x96c\xcc\x81cgd1222 b zx2a\n0a\xe4\xb8\x96z\xe4\xb8\x96yy\xe4\xb8\x96y\xc3\xa9eg0\t0xa\xc3\xa9\xf0\x9f\x98\x80\xf0\x9f\x98\x80ccchh\xc3\xa9\xf0\x9f\x98\x80\t2gz2y  \xe4\xb8\x96g \n", .text_b = "zchz2\ne\xc3\xa92g\t\xf0\x9f\x98\x80\xe4\xb8\x96\xf0\x9f\x98\x80 g1fz\tb\xf0\x9f\x98\x80gc\xff2hc\xffc\ty dcf2d", .two = true, .file = "a", .line = 1, .col = 34, .end_line = 2, .end_col = 5, .span_message = "two words", .labels = &.{
+        .{ .file = "b", .line = 2, .col = 13, .end_line = 2, .end_col = 3, .message = "two words", .primary = null },
+        .{ .file = "b", .line = 2, .col = 16, .end_line = 2, .end_col = 22, .message = "", .primary = null },
+        .{ .file = null, .line = 1, .col = 10, .end_line = 2, .end_col = 29, .message = "m", .primary = null },
+    }, .tab_width = 0, .start_ctx = 0, .end_ctx = 0, .before = 2, .after = 1, .unicode = true, .term_width = 21, .char_col = false, .expect =
+    \\error: m
+    \\  ┌─ a:1:34
+    \\  │    
+    \\1 │      gxcx?́😀😀́😀z?z22c世ćcgd1...
+    \\  │ ╭───────────────────────^
+    \\  │ │ ╭────────'
+    \\2 │ │ │ 0a世z世yy世yéeg00xaé😀😀c...
+    \\  │ ╰─│────^ two words
+    \\  │   ╰──────────────────────' m
+    \\3 │     
+    \\  │    
+    \\  ┌─ b:2:13
+    \\  │
+    \\1 │ zchz2
+    \\2 │ eé2g😀世😀 g1fzb...
+    \\  │       --------
+    \\  │       │   
+    \\  │       │ two words
+    \\
+    \\
+    },
+    // H2814
+    .{ .text_a = " \t \t             \t\t       \t \t\t \t \t\xe4\xb8\x96 \xf0\x9f\x98\x80 \xf0\x9f\x98\x80\xe4\xb8\x96\t 1aeyx g2xg\xe4\xb8\x96dh\xc3\xa9d d1\tcyc\xff\n\t \t          \t \t  \t\t\t      \t \t  h2x gfc ye1dx\n", .text_b = " \t \t     \t    \t\t\t      \t\t\t   \t\t  \t\t \t  \tzy1 \xe4\xb8\x96aa \n  \t       \t   \t  \t   \t    \t    \t  \t \t\t  cbd", .two = false, .file = "a", .line = 2, .col = 33, .end_line = null, .end_col = 2, .span_message = "m", .labels = &.{
+        .{ .file = null, .line = 2, .col = 61, .end_line = null, .end_col = 29, .message = "m", .primary = true },
+        .{ .file = null, .line = 1, .col = 42, .end_line = 1, .end_col = 7, .message = "m", .primary = null },
+    }, .tab_width = 1, .start_ctx = 2, .end_ctx = 0, .before = 0, .after = 2, .unicode = true, .term_width = 40, .char_col = false, .expect =
+    \\error: m
+    \\  ┌─ a:2:33
+    \\  │
+    \\1 │ ...     世 😀 😀世  1aeyx g2xg世d...
+    \\  │            -- m
+    \\2 │ ...   h2x gfc ye1dx
+    \\  │       ^            ^ m
+    \\  │       │            
+    \\  │       m
+    \\3 │ ...
+    \\
+    \\
+    },
+    // G289
+    .{ .text_a = " ehb\xffgx\xc3\xa912\xc3\xa9\xc3\xa9\xf0\x9f\x98\x80zhbb\t2xg  0dga\n\xffg2yx zxd h\xf0\x9f\x98\x80 ybx zdf1f2\xe4\xb8\x962x\n1x1xd\xf0\x9f\x98\x80be\xe4\xb8\x96bb\xffa0g\xe4\xb8\x96 bb zzed bb\t1cdax\xcc\x81\xfff\xe4\xb8\x9621fdbz1\xff\xc3\xa9z\xcc\x81dy\xf0\x9f\x98\x80 zegf \xffz\xff\xffz2\xf0\x9f\x98\x80bf\n\xc3\xa9\xcc\x81 c1x\t\xf0\x9f\x98\x80f\thh1z g\thcgh\xe4\xb8\x96czfa\xe4\xb8\x96g\t\xc3\xa9\xe4\xb8\x96 \n", .text_b = "0fgcya  b1\xc3\xa9x\t c\xe4\xb8\x961\t1\xc3\xa9he   0\tydxfaz\xcc\x81bdg\xcc\x81hbeyx\xc3\xa9\xe4\xb8\x96e\xcc\x81\t\xe4\xb8\x96\xcc\x81 fy2 \xcc\x81d\xc3\xa9e1b\xe4\xb8\x96f\xc3\xa9f\xffz\t\n\xf0\x9f\x98\x80\xcc\x811\t\xe4\xb8\x96 2ah\xe4\xb8\x96\xc3\xa9fhe\xe4\xb8\x96\xf0\x9f\x98\x80 x\xff bchh\xe4\xb8\x96 h1fx0d \xffg\xffz 1fh\xf0\x9f\x98\x80\xcc\x81f\xcc\x811zh\xc3\xa91 0e \xffceexa a0gy\xfff\n\xcc\x81\xe4\xb8\x96\xe4\xb8\x96cc\xcc\x81\xf0\x9f\x98\x80xeg\xc3\xa9 e\xcc\x81\xe4\xb8\x96\xf0\x9f\x98\x802b\xf0\x9f\x98\x80\xc3\xa9 agyag2\xcc\x811\xcc\x810h\xe4\xb8\x96hfg\xf0\x9f\x98\x80x\xcc\x810", .two = false, .file = "a", .line = 3, .col = 71, .end_line = 4, .end_col = null, .span_message = "", .labels = &.{
+        .{ .file = null, .line = 2, .col = 12, .end_line = null, .end_col = 58, .message = "two words", .primary = true },
+        .{ .file = null, .line = 1, .col = 38, .end_line = 4, .end_col = null, .message = "m", .primary = true },
+    }, .tab_width = 1, .start_ctx = 2, .end_ctx = 1, .before = 1, .after = 0, .unicode = false, .term_width = 56, .char_col = true, .expect =
+    \\error: m
+    \\  --> a:1:28
+    \\  |    
+    \\1 |      ehb?gxé12éé😀zhbb 2xg  0dga
+    \\  |   /----------------------------^
+    \\2 |   | ?g2yx zxd h😀 ybx zdf1f2世2x
+    \\  |   |            ^^ two words
+    \\3 |   | 1x1xd😀be世bb?a0g世 bb zzed bb 1cdax́?f世21fdbz1?éźdy😀 zegf ?...
+    \\  | /-|-----------------------------------------------------------^
+    \\4 | | | é́ c1x 😀f hh1z g hcgh世czfa世g é世 
+    \\  | \-|-----------------------------------^
+    \\  |   \-----------------------------------^ m
+    \\
+    \\
+    },
+    // G2128
+    .{ .text_a = "c\xf0\x9f\x98\x80zbdz0g\xffbyb\xffh2010g 2za\xcc\x81ayaz1 \t2 1\xf0\x9f\x98\x80gbe0xf\xf0\x9f\x98\x80\xff1202\xc3\xa9\xcc\x81\xff\xffy22\xcc\x81\xcc\x810\xffyg\t\xf0\x9f\x98\x80\t\nb\xffdde \xe4\xb8\x96 \t 2b\xe4\xb8\x96ba\xff", .text_b = "c e00\xcc\x81yh\tbc0f\t1\xcc\x81\xc3\xa92h hf zz\t\xf0\x9f\x98\x800h\xc3\xa9\t\xe4\xb8\x96\xe4\xb8\x96afya\xc3\xa9 \xcc\x81\xc3\xa9f\xff0a\xc3\xa910h\xc3\xa9\t\xcc\x81d\xc3\xa9\ndc1e1ygx\xc3\xa9\tz2\xc3\xa9h\xff\xc3\xa9cze1\ta fhz\xc3\xa9da 0\xe4\xb8\x96eye yx\xff \xe4\xb8\x96bchz\xe4\xb8\x96 x0\xf0\x9f\x98\x80\xff \te\ng 2g\tyxb\xf0\x9f\x98\x80zb\t2\xe4\xb8\x96gfz\xe4\xb8\x962\xe4\xb8\x96\xcc\x81 \xe4\xb8\x9621zeg\xcc\x81zd\xc3\xa90\xffdbb\xc3\xa9\xcc\x81\xcc\x81a \xe4\xb8\x96\xcc\x81 1\xf0\x9f\x98\x80yz\xe4\xb8\x96\xcc\x81f\tga\xe4\xb8\x96 \n", .two = true, .file = "a", .line = 2, .col = 67, .end_line = null, .end_col = 65, .span_message = "m", .labels = &.{
+        .{ .file = "b", .line = 1, .col = 58, .end_line = null, .end_col = 69, .message = "two words", .primary = null },
+        .{ .file = null, .line = 1, .col = null, .end_line = 2, .end_col = 40, .message = "", .primary = true },
+        .{ .file = null, .line = 3, .col = 45, .end_line = 2, .end_col = 47, .message = "m", .primary = true },
+    }, .tab_width = 0, .start_ctx = 0, .end_ctx = 1, .before = 2, .after = 2, .unicode = true, .term_width = 40, .char_col = true, .expect =
+    \\error: m
+    \\  ┌─ a:1
+    \\  │  
+    \\1 │ ╭ c😀zbdz0g?byb?h2010g 2záayaz1 ...
+    \\2 │ │ b?dde 世  2b世ba?
+    \\  │ │                  ^ m
+    \\  │ ╰─────────────────^
+    \\  │  
+    \\  ┌─ b:1:44
+    \\  │
+    \\1 │ ...fyaé ́éf?0aé10hé́dé
+    \\  │            - two words
+    \\2 │ ... eye yx? 世bchz世 x0😀? e
+    \\3 │ ...zdé0?dbbé́́a 世́ 1😀yz世́fga世 
+    \\  │
+    \\  ┌─ a:3:45: m
+    \\
+    \\
+    },
+    // G333
+    .{ .text_a = "2yx2hxhg\n\xcc\x81 f", .text_b = "h\xc3\xa92\n\xfff\theh\nf\n", .two = true, .file = "a", .line = 2, .col = 6, .end_line = 1, .end_col = 1, .span_message = "", .labels = &.{
+        .{ .file = "b", .line = 3, .col = 4, .end_line = 5, .end_col = null, .message = "m", .primary = true },
+    }, .tab_width = 8, .start_ctx = 2, .end_ctx = 0, .before = 2, .after = 0, .unicode = false, .term_width = 9, .char_col = false, .expect =
+    \\error: m
+    \\  --> a:2:6
+    \\  |
+    \\1 | 2yx2hxhg
+    \\2 | ́ f
+    \\  |   ^
+    \\  |
+    \\  --> b:3:4
+    \\  |
+    \\1 | hé2
+    \\2 | ...
+    \\3 | f
+    \\  |  ^ m
+    \\
+    \\
+    },
+    // H2954
+    .{ .text_a = " \t\t  \t\t     b0\xffa\xf0\x9f\x98\x80 d hdxz1 f\t0 e \xcc\x81\xc3\xa9x\xcc\x81zy1\tgh\n\t             a\tg h\xc3\xa9 2c1 ea fc\xcc\x810gda\tce\xfff\xe4\xb8\x96x1zf0yag\n     \t   \t  \t\t  \t\t\t\t              \t\t  \xe4\xb8\x96\xc3\xa9f1\xe4\xb8\x96y1xg\xe4\xb8\x960ye\xf0\x9f\x98\x80\xe4\xb8\x9601bff\xe4\xb8\x96\xf0\x9f\x98\x80\taczce\xe4\xb8\x96a1 gfcdczbagx\xf0\x9f\x98\x80h2e \xcc\x81 cb\xc3\xa90", .text_b = "\t\t\t zg2by\t\t2b\xffbdah\xffbhhg 2eh0heb0a\xf0\x9f\x98\x80 z\xc3\xa9\n  bzcebd \xe4\xb8\x96z 02\taye\xffg0zxz\xe4\xb8\x96\xc3\xa9 \xcc\x81 gfzzh gha2\xc3\xa9 hy z\tc\xf0\x9f\x98\x80gxa\n  e\xffecb\xf0\x9f\x98\x80a\xe4\xb8\x96cf\xff\n", .two = false, .file = "a", .line = 3, .col = 23, .end_line = null, .end_col = 46, .span_message = "", .labels = &.{}, .tab_width = 2, .start_ctx = 1, .end_ctx = 1, .before = 2, .after = 2, .unicode = true, .term_width = 39, .char_col = true, .expect =
+    \\error: m
+    \\  ┌─ a:3:23
+    \\  │
+    \\1 │ ... b0?a😀 d hdxz1 f 0 e ́éx́zy1 gh
+    \\2 │ ... a  g hé 2c1 ea fć0gda  ce?f...
+    \\3 │ ...                            ...
+    \\  │                  ^
+    \\
+    \\
+    },
+};
+
+test "term_width goldens: edge cases pinned (cut windows, hanging labels, two files, multi-line spans)" {
+    for (gold_rows, 0..) |row, n| {
+        const d: Diagnostic = .{
+            .path = "",
+            .file = row.file,
+            .line = row.line,
+            .col = row.col,
+            .end_line = row.end_line,
+            .end_col = row.end_col,
+            .severity = .@"error",
+            .code = "",
+            .message = "m",
+            .span_message = row.span_message,
+            .labels = row.labels,
+        };
+        const both = [_]Source{ .{ .file = "a", .text = row.text_a }, .{ .file = "b", .text = row.text_b } };
+        var buf: [16384]u8 = undefined;
+        const got = try renderToString(&buf, d, .{
+            .style = .snippet,
+            .sources = if (row.two) &both else both[0..1],
+            .tab_width = row.tab_width,
+            .start_context_lines = row.start_ctx,
+            .end_context_lines = row.end_ctx,
+            .before_label_lines = row.before,
+            .after_label_lines = row.after,
+            .chars = if (row.unicode) .unicode else .ascii,
+            .term_width = row.term_width,
+            .column = if (row.char_col) .char else .byte,
+        });
+        testing.expectEqualStrings(row.expect, got) catch |e| {
+            std.debug.print("golden row {d}\n", .{n});
+            return e;
+        };
+    }
+}
+
+test "term_width: a label message is measured in display columns, an all-blank line does not set the left whitespace" {
+    const line100 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL";
+    var d: Diagnostic = .{ .path = "", .file = "f", .line = 1, .col = 41, .end_line = 1, .end_col = 45, .severity = .@"error", .code = "", .message = "m", .span_message = "\u{4e16}\u{754c}\u{4e16}" };
+    var out = try snipOf(line100 ++ "\n", d, .{ .term_width = 40 });
+    try testing.expectEqualStrings(
+        \\error: m
+        \\  --> f:1:41
+        \\  |
+        \\1 | ...vwxyzABCDEFGHIJKLMNOPQRSTUVWXY...
+        \\  |             ^^^^ 世界世
+        \\
+        \\
+    ,
+        out,
+    );
+    testing.allocator.free(out);
+    d.col = 30;
+    d.end_col = 32;
+    d.span_message = "";
+    out = try snipOf("                                                            \n", d, .{ .term_width = 34 });
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        \\error: m
+        \\  --> f:1:30
+        \\  |
+        \\1 | ...                        ...
+        \\  |               ^^
+        \\
+        \\
+    ,
+        out,
+    );
+}
+
+test "colour: hanging labels draw their pointers in the label's own colour and reset after the carets" {
+    const d: Diagnostic = .{ .path = "", .file = "f", .line = 1, .col = 2, .end_line = 1, .end_col = 4, .severity = .@"error", .code = "", .message = "m", .span_message = "p", .labels = &.{
+        .{ .line = 1, .col = 6, .end_line = 1, .end_col = 8, .message = "s" },
+        .{ .line = 1, .col = 10, .end_line = 1, .end_col = 12, .message = "t" },
+    } };
+    const out = try snipOf("abcdefghijklmn\n", d, .{ .color = true });
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        "\x1b[1;31merror\x1b[0m\x1b[1m: m\x1b[0m\n" ++
+            "  \x1b[1;34m-->\x1b[0m f:1:2\n" ++
+            "  \x1b[1;34m|\x1b[0m\n" ++
+            "\x1b[1;34m1\x1b[0m \x1b[1;34m|\x1b[0m abcdefghijklmn\n" ++
+            "  \x1b[1;34m|\x1b[0m  \x1b[1;31m^^\x1b[0m  \x1b[1;34m--\x1b[0m  \x1b[1;34m--\x1b[0m t\n" ++
+            "  \x1b[1;34m|\x1b[0m  \x1b[1;31m|\x1b[0m   \x1b[1;34m|\x1b[0m    \n" ++
+            "  \x1b[1;34m|\x1b[0m  \x1b[1;31m|\x1b[0m   s\n" ++
+            "  \x1b[1;34m|\x1b[0m  p\n" ++
+            "\n",
+        out,
+    );
+}
