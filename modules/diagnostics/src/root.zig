@@ -2805,6 +2805,8 @@ test "Source.range: an end past the text is null even when the start fits" {
 
 test "Source.indexLines accepts a text of maxInt(u32) bytes (a read-only zero mapping, no memory committed)" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    // A 32-bit usize cannot hold maxInt(u32) + 1; such a target has no address space for it either.
+    if (@bitSizeOf(usize) < 64) return error.SkipZigTest;
     const linux = std.os.linux;
     const max32: usize = std.math.maxInt(u32);
     const rc = linux.mmap(null, max32, .{ .READ = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true }, -1, 0);
@@ -3039,4 +3041,105 @@ test "term_width: cut on both sides, one side, with leading blanks, wide charact
     out = try cutOf("\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\u{4e16}\u{754c}\n", b6, 20);
     try testing.expectEqualStrings("error: m\n  --> f:1:16\n  |\n1 | ... \u{4e16}\u{754c}\u{4e16}\u{754c}...\n  |       ^^^^ w\n\n", out);
     testing.allocator.free(out);
+}
+
+test "positionLessThan: a finding with no line is not before one with a line, whatever the columns" {
+    const a: Diagnostic = .{ .path = "", .col = 1, .severity = .info, .code = "", .message = "" };
+    const b: Diagnostic = .{ .path = "", .line = 5, .col = 2, .severity = .info, .code = "", .message = "" };
+    try testing.expect(!positionLessThan({}, a, b));
+    try testing.expect(positionLessThan({}, b, a));
+}
+
+test "snippet: the locus skips an unquotable first span and prefers a primary one; an unquotable primary label is never the locus" {
+    const text = "a\nb\nc\nd\n";
+    var d: Diagnostic = .{ .path = "", .file = "nowhere", .line = 9, .col = 1, .severity = .@"error", .code = "", .message = "m" };
+    d.labels = &.{ .{ .file = "f", .line = 1, .col = 1 }, .{ .file = "f", .line = 4, .col = 1, .primary = true } };
+    var out = try snipOf(text, d, .{});
+    try testing.expect(std.mem.find(u8, out, "--> f:4:1\n") != null);
+    testing.allocator.free(out);
+    d = .{ .path = "", .file = "f", .line = 3, .col = 1, .severity = .@"error", .code = "", .message = "m" };
+    d.labels = &.{.{ .file = "nowhere", .line = 1, .col = 1, .primary = true }};
+    out = try snipOf(text, d, .{});
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.find(u8, out, "--> f:3:1\n") != null);
+}
+
+fn fromJson(arena: std.mem.Allocator, text: []const u8, file: ?[]const u8, sources: []const Source, enc: PositionEncoding) FromLspError!Diagnostic {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch return error.InvalidDiagnostic;
+    return fromLsp(arena, v, file, sources, enc, .{});
+}
+
+const lsp_head = "{\"message\":\"m\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}}";
+const lsp_range = "{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}}";
+
+test "fromLsp: every wrongly typed or out-of-range part is InvalidDiagnostic" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bad = [_][]const u8{
+        lsp_head ++ ",\"codeDescription\":5}",
+        lsp_head ++ ",\"codeDescription\":{\"href\":5}}",
+        lsp_head ++ ",\"tags\":5}",
+        lsp_head ++ ",\"tags\":[\"x\"]}",
+        lsp_head ++ ",\"relatedInformation\":5}",
+        lsp_head ++ ",\"relatedInformation\":[5]}",
+        lsp_head ++ ",\"relatedInformation\":[{\"location\":5,\"message\":\"x\"}]}",
+        lsp_head ++ ",\"relatedInformation\":[{\"location\":{\"uri\":\"u\",\"range\":" ++ lsp_range ++ "},\"message\":5}]}",
+        lsp_head ++ ",\"relatedInformation\":[{\"location\":{\"uri\":5,\"range\":" ++ lsp_range ++ "},\"message\":\"x\"}]}",
+        "{\"message\":\"m\",\"range\":{\"start\":5,\"end\":{\"line\":0,\"character\":1}}}",
+        "{\"message\":\"m\",\"range\":{\"start\":{\"line\":\"1\",\"character\":0},\"end\":{\"line\":0,\"character\":1}}}",
+        "{\"message\":\"m\",\"range\":{\"start\":{\"line\":4294967295,\"character\":0},\"end\":{\"line\":0,\"character\":1}}}",
+        "{\"message\":\"m\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":4294967295,\"character\":1}}}",
+    };
+    for (bad) |text| try testing.expectError(error.InvalidDiagnostic, fromJson(arena, text, null, &.{}, .utf16));
+}
+
+test "fromLsp: severity, integer code, unknown tags, empty related information, a range over two lines" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const sevs = [_]struct { json: []const u8, want: Severity }{
+        .{ .json = ",\"severity\":1", .want = .@"error" },
+        .{ .json = ",\"severity\":2", .want = .warning },
+        .{ .json = ",\"severity\":3", .want = .info },
+        .{ .json = ",\"severity\":4", .want = .hint },
+        .{ .json = ",\"severity\":9", .want = .@"error" },
+        .{ .json = "", .want = .@"error" },
+    };
+    for (sevs) |c| try testing.expectEqual(c.want, (try fromJson(arena, try std.mem.concat(arena, u8, &.{ lsp_head, c.json, "}" }), null, &.{}, .utf16)).severity);
+    try testing.expectEqualStrings("42", (try fromJson(arena, lsp_head ++ ",\"code\":42}", null, &.{}, .utf16)).code);
+    const t = try fromJson(arena, lsp_head ++ ",\"tags\":[9]}", null, &.{}, .utf16);
+    try testing.expect(t.tags == null);
+    const t2 = try fromJson(arena, lsp_head ++ ",\"tags\":[2,9,1]}", null, &.{}, .utf16);
+    try testing.expectEqualSlices(Tag, &.{ .deprecated, .unnecessary }, t2.tags.?);
+    const e = try fromJson(arena, lsp_head ++ ",\"relatedInformation\":[]}", null, &.{}, .utf16);
+    try testing.expect(e.labels == null);
+    // Same character on two lines is a range, not a point.
+    const r = try fromJson(arena, "{\"message\":\"m\",\"range\":{\"start\":{\"line\":0,\"character\":5},\"end\":{\"line\":1,\"character\":5}}}", null, &.{}, .utf16);
+    try testing.expectEqual(@as(?u32, 2), r.end_line);
+    try testing.expectEqual(@as(?u32, 6), r.end_col);
+}
+
+test "fromLsp: a truncated percent escape stays literal; a label in another file reads that file's text" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{ "file:///a%4", "file:///a%" }) |uri| {
+        const j = try std.fmt.allocPrint(arena, "{s},\"relatedInformation\":[{{\"location\":{{\"uri\":\"{s}\",\"range\":{s}}},\"message\":\"x\"}}]}}", .{ lsp_head, uri, lsp_range });
+        const dd = try fromJson(arena, j, null, &.{}, .utf16);
+        try testing.expectEqualStrings(uri["file://".len..], dd.labels.?[0].file.?);
+    }
+    const j = try std.fmt.allocPrint(arena, "{s},\"relatedInformation\":[{{\"location\":{{\"uri\":\"file:///b\",\"range\":{{\"start\":{{\"line\":0,\"character\":2}},\"end\":{{\"line\":0,\"character\":3}}}}}},\"message\":\"x\"}}]}}", .{lsp_head});
+    const srcs = [_]Source{ .{ .file = "a", .text = "xy\n" }, .{ .file = "/b", .text = "\u{1F600}z\n" } };
+    const dd = try fromJson(arena, j, "a", &srcs, .utf16);
+    try testing.expectEqual(@as(u32, 5), dd.labels.?[0].col.?);
+}
+
+test "writeLsp: empty tags and empty labels write no key" {
+    const d: Diagnostic = .{ .path = "", .severity = .warning, .code = "", .message = "m", .tags = &.{}, .labels = &.{} };
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeLsp(&w, d, &.{}, .utf16, .{});
+    try testing.expect(std.mem.find(u8, w.buffered(), "tags") == null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "relatedInformation") == null);
 }

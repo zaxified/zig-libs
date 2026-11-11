@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-11** — **NO CONSUMER-VISIBLE CHANGE:** second mutation-audit round, tests only: `positionLessThan` called directly, locus choice with unquotable spans, `fromLsp` type and range guards, severity and code mapping, truncated percent escapes, a label in another file reading that file's text, empty tags and labels in `writeLsp`.
 - **2026-11-11** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit, tests only: exact-set tests for `charWidth` (every code point against the table), the `?`-shown and white-space sets, `writeEscaped` per byte, the percent-encoding of every file-name byte, colour bytes, fix forms, the closing row, the locus choice, the Margin arithmetic and `term_width` cut goldens.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `Source.location` line lookup (duplicate-code pass) uses `std.sort.partitionPoint`; same result.
 - **2026-11-07** — **Tests:** delta audit of `Source.location`: a byte at the first line start of an index that does not begin at 0, and the `u32` bounds on the byte and the index length (checked with an unreadable page standing in for a 4 GiB text and a 2^32-entry index); mutation delta run, 31 schemata mutants, 30 killed and 1 equivalent.
