@@ -622,6 +622,7 @@ test {
     _ = @import("audit_test.zig");
     _ = @import("client_mut_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("mutation_b_test.zig");
 }
 
 /// LIVE third-party interop (response trailers vs real curl/nghttp2) — tests
