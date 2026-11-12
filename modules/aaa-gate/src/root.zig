@@ -4744,3 +4744,222 @@ test "STACKPROBE: no user:password residue below the middleware after a Basic re
     const secrets = [_][]const u8{probe_basic_plain};
     _ = try ProbeSP.run("basic request", probeBasicRequest, .{&r}, &secrets, .{ .burn = false, .residue = false });
 }
+
+// ── whole-module mutation run 2026-11-11: tests for the survivors ───────────
+
+test "init: a throttle window beyond the u64 range in nanoseconds saturates, it does not overflow" {
+    var clk: TestClock = .{};
+    var g = try Gate.init(testing.allocator, .{ .token = "s3cr3t", .throttle_window_ms = std.math.maxInt(u64), .clock = clk.clock() });
+    defer g.deinit();
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), g.window_ns);
+    // and the window then holds for good: the second denial a day later is still coalesced
+    try testing.expectEqual(@as(?u64, 0), g.deniedDecision("k"));
+    clk.advanceMs(24 * 60 * 60 * 1000);
+    try testing.expectEqual(@as(?u64, null), g.deniedDecision("k"));
+}
+
+test "basicFingerprint: ':' is the one separator — for every other byte two pairs that move it do not collide" {
+    // A user holds no ':' (RFC 7617), so ("a:c", ...) cannot exist; with any other byte b as the
+    // separator, ("a" b "c", "x") and ("a", "c" b "x") would hash the same bytes.
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        if (b == ':') continue;
+        const u1_ = [_]u8{ 'a', b, 'c' };
+        const p2 = [_]u8{ 'c', b, 'x' };
+        try testing.expect(!std.mem.eql(u8, &basicFingerprint(&u1_, "x"), &basicFingerprint("a", &p2)));
+    }
+    // the digest is SHA-256 of exactly user ":" password
+    var want: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash("alice:s3cret", &want, .{});
+    try testing.expectEqualSlices(u8, &want, &basicFingerprint("alice", "s3cret"));
+}
+
+test "api_key without api_key_query_param reads no query pair: an empty or header-like name is not a credential" {
+    var g = try Gate.init(testing.allocator, .{ .auth_mode = .api_key, .api_key = "k3y" });
+    defer g.deinit();
+    try testing.expectEqual(@as(usize, 1), g.key_sources.len);
+    var gr = try GatedRouter.init(&g, null);
+    defer gr.deinit();
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "X-Api-Key: k3y\r\n"), &buf), "200");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t?=k3y", ""), &buf), "401");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t?X-Api-Key=k3y", ""), &buf), "401");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t?api_key=k3y&k=k3y", ""), &buf), "401");
+    // configured, the query parameter is the second source
+    var gq = try Gate.init(testing.allocator, .{ .auth_mode = .api_key, .api_key = "k3y", .api_key_query_param = "api_key" });
+    defer gq.deinit();
+    try testing.expectEqual(@as(usize, 2), gq.key_sources.len);
+    var grq = try GatedRouter.init(&gq, null);
+    defer grq.deinit();
+    try expectStatus(runWire(&grq.r, wire("GET", "/t?api_key=k3y", ""), &buf), "200");
+    try expectStatus(runWire(&grq.r, wire("GET", "/t?=k3y", ""), &buf), "401");
+}
+
+test "repeated credential fields: a header named like a query or cookie key source is not a repeat" {
+    var buf: [1024]u8 = undefined;
+    // only a HEADER source names a field the gate reads
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .api_key,
+        .api_key = "k3y",
+        .api_key_sources = &.{ .{ .kind = .query, .name = "k" }, .{ .kind = .cookie, .name = "sid" } },
+    });
+    defer g.deinit();
+    var gr = try GatedRouter.init(&g, null);
+    defer gr.deinit();
+    try expectStatus(runWire(&gr.r, wire("GET", "/t?k=k3y", "K: a\r\nK: b\r\n"), &buf), "200");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Cookie: sid=k3y\r\nSid: a\r\nSid: b\r\n"), &buf), "200");
+}
+
+test "credentials_optional: a header named like a query or cookie key source is no credential" {
+    var buf: [1024]u8 = undefined;
+    inline for (.{ KeySource.Kind.query, KeySource.Kind.cookie }) |kind| {
+        var g = try Gate.init(testing.allocator, .{
+            .auth_mode = .api_key,
+            .api_key = "k3y",
+            .credentials_optional = true,
+            .api_key_sources = &.{.{ .kind = kind, .name = "tok" }},
+        });
+        defer g.deinit();
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(g.middleware());
+        try r.get("/t", hWhoAmI);
+        try testing.expectEqualStrings("anon", bodyOf(runWire(&r, wire("GET", "/t", "Tok: whatever\r\n"), &buf)));
+    }
+}
+
+test "scheme names: one wrong byte anywhere in Bearer / Basic makes it another scheme" {
+    var out: [16]u8 = undefined;
+    inline for (.{ "Bearer", "Basic" }) |name| {
+        for (0..name.len) |i| {
+            var s: [name.len]u8 = undefined;
+            @memcpy(&s, name);
+            s[i] = if (s[i] == 'x') 'y' else 'x';
+            var hdr: [32]u8 = undefined;
+            const h = std.mem.print(&hdr, "{s} YTpi", .{&s}) catch unreachable;
+            if (name.len == 6) {
+                try testing.expectEqual(@as(?[]const u8, null), bearerTokenOf(h));
+            } else {
+                try testing.expectEqual(@as(?BasicCredentials, null), basicCredentialsOf(h, &out));
+            }
+        }
+    }
+}
+
+test "headerKey: a value that is exactly the prefix has it, with nothing after (not absent)" {
+    try testing.expectEqualStrings("", headerKey("Bearer", "Bearer").?);
+    try testing.expectEqualStrings("", headerKey("  key  ", "KEY").?);
+    try testing.expectEqual(@as(?[]const u8, null), headerKey("Bear", "Bearer"));
+    // a TAB around the value is trimmed like a space
+    try testing.expectEqualStrings("k", headerKey("\tBearer k\t", "Bearer ").?);
+}
+
+test "clientKeyFrom: SP and TAB around the rightmost X-Forwarded-For element and the X-Real-IP value are trimmed" {
+    var buf: [client_key_len_max]u8 = undefined;
+    try testing.expectEqualStrings("198.51.100.7", clientKeyFrom("10.0.0.1,\t198.51.100.7\t", null, null, &buf));
+    try testing.expectEqualStrings("198.51.100.7", clientKeyFrom("10.0.0.1, 198.51.100.7 ", null, null, &buf));
+    try testing.expectEqualStrings("203.0.113.5", clientKeyFrom(null, "\t203.0.113.5\t", null, &buf));
+    try testing.expectEqualStrings("203.0.113.5", clientKeyFrom(null, " 203.0.113.5 ", null, &buf));
+}
+
+test "authorize: the user length is 0 for every non-Basic result, whatever the caller left in it" {
+    var body: http.Server.RequestBody = .{ .none = .fixed("") };
+    var g = try Gate.init(testing.allocator, .{ .token = "tok" });
+    defer g.deinit();
+    var user_buf: [basic_credentials_max]u8 = undefined;
+    var user_len: usize = 77;
+    const good = fuzzRequest("Authorization: Bearer tok\r\n", "", &body);
+    try testing.expectEqual(@as(?Identity.Scheme, .bearer), authorize(&g, &good, &user_buf, &user_len));
+    try testing.expectEqual(@as(usize, 0), user_len);
+    user_len = 77;
+    const bad = fuzzRequest("Authorization: Bearer nope\r\n", "", &body);
+    try testing.expectEqual(@as(?Identity.Scheme, null), authorize(&g, &bad, &user_buf, &user_len));
+    try testing.expectEqual(@as(usize, 0), user_len);
+    // a repeated credential field is denied before anything is read
+    user_len = 77;
+    const twice = fuzzRequest("Authorization: Bearer tok\r\nAuthorization: Bearer tok\r\n", "", &body);
+    try testing.expectEqual(@as(?Identity.Scheme, null), authorize(&g, &twice, &user_buf, &user_len));
+    try testing.expectEqual(@as(usize, 0), user_len);
+}
+
+test "middleware .any: a valid API key AND a valid Basic credential -> the API key identity (precedence), no user name" {
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .any,
+        .api_key = "ap1key",
+        .basic_users = &.{.{ .user = "alice", .password = "s3cret" }},
+    });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hWhoAmI);
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("api_key:", bodyOf(runWire(&r, wire("GET", "/t", "Authorization: Basic YWxpY2U6czNjcmV0\r\nX-Api-Key: ap1key\r\n"), &buf)));
+    try testing.expectEqualStrings("basic:alice", bodyOf(runWire(&r, wire("GET", "/t", "Authorization: Basic YWxpY2U6czNjcmV0\r\n"), &buf)));
+}
+
+test "init: the gate keeps its own copies of api_key_header and api_key_query_param" {
+    var hdr = "X-Company-Key".*;
+    var q = "api_key".*;
+    var g = try Gate.init(testing.allocator, .{ .api_key = "k", .auth_mode = .api_key, .api_key_header = &hdr, .api_key_query_param = &q });
+    defer g.deinit();
+    @memset(&hdr, 'x');
+    @memset(&q, 'y');
+    try testing.expectEqualStrings("X-Company-Key", g.api_key_header);
+    try testing.expectEqualStrings("api_key", g.api_key_query_param.?);
+    var d = try Gate.init(testing.allocator, .{ .api_key = "k", .auth_mode = .api_key });
+    defer d.deinit();
+    try testing.expectEqualStrings(default_api_key_header, d.api_key_header);
+    try testing.expectEqual(@as(?[]const u8, null), d.api_key_query_param);
+}
+
+test "deny path: without the cached header values the 401 carries the same challenge and media type" {
+    var g = try Gate.init(testing.allocator, .{ .token = "s3cr3t", .realm = "r" });
+    defer g.deinit();
+    g.challenge_value = null; // as for a gate not built by `init`: checked per request
+    g.deny_content_type_value = null;
+    var gr = try GatedRouter.init(&g, null);
+    defer gr.deinit();
+    var buf: [1024]u8 = undefined;
+    const got = runWire(&gr.r, wire("GET", "/t", ""), &buf);
+    try expectStatus(got, "401");
+    try expectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"r\"");
+    try expectHeaderLine(got, "Content-Type: text/plain");
+    try testing.expectEqualStrings("Unauthorized\n", bodyOf(got));
+}
+
+test "init: key sources with non-empty prefixes are freed on every allocation failure" {
+    // An empty prefix is a zero-length dupe (no allocation), so the earlier unwinding test
+    // never reached the prefix copies.
+    const opts: Options = .{
+        .auth_mode = .api_key,
+        .api_key = "k",
+        .api_key_sources = &.{
+            .{ .kind = .header, .name = "Authorization", .prefix = "Token " },
+            .{ .kind = .header, .name = "X-K", .prefix = "Key " },
+            .{ .kind = .cookie, .name = "s" },
+        },
+    };
+    var fa = testing.FailingAllocator.init(testing.allocator, .{});
+    var probe = try Gate.init(fa.allocator(), opts);
+    probe.deinit();
+    const n = fa.alloc_index;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var f = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        try testing.expectError(error.OutOfMemory, Gate.init(f.allocator(), opts));
+    }
+}
+
+test "throttle: tracking a new key unwinds each of its allocation failures and still admits the denial" {
+    // entry, key copy, map slot: the failure at each one must leave nothing behind
+    // (testing.allocator reports a leak) and nothing tracked.
+    inline for (0..3) |fail_at| {
+        var f = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_at });
+        var t: Throttle = .{};
+        defer t.deinit(testing.allocator);
+        try testing.expectEqual(@as(?u64, 0), t.decide(f.allocator(), "client-key", 0, std.time.ns_per_s, 8));
+        try testing.expectEqual(@as(usize, 0), t.map.count());
+        try testing.expect(t.lru.first == null);
+    }
+}
