@@ -6618,6 +6618,15 @@ test "mutation M: case folding walks a four-member orbit to its end" {
         defer re.deinit(testing.allocator);
         for ([_][]const u8{ "θ", "Θ", "ϑ", "ϴ" }) |t| try testing.expect(re.fullMatch(t));
     }
+    // The same through a class (`foldFrom` there, not the literal's fold),
+    // in both grammars.
+    for ([_]Syntax{ .perl, .rust }) |s| {
+        for ([_][]const u8{ "(?i)[θ]", "(?i)[ϴ]", "(?i)[Θ]", "(?i)[ϑ]" }) |p| {
+            var re = try Regex.compileOptions(testing.allocator, p, .{ .syntax = s });
+            defer re.deinit(testing.allocator);
+            for ([_][]const u8{ "θ", "Θ", "ϑ", "ϴ" }) |t| try testing.expect(re.fullMatch(t));
+        }
+    }
 }
 
 test "mutation M: \\v is U+000B in both grammars" {
@@ -6673,6 +6682,16 @@ test "mutation M: expand after $$, a bad name byte, a cut sequence, a short grou
     // Fewer groups than names: a named group past the slice is unset.
     try re.expand(&out.writer, "[${x}]", input, groups[0..1]);
     try testing.expectEqualStrings("[]", out.written());
+    out.clearRetainingCapacity();
+    // A `$` that starts no variable is written as it is, and the template
+    // goes on: a later variable is still expanded.
+    try re.expand(&out.writer, "a$ $1|$-${x}", input, &groups);
+    try testing.expectEqualStrings("a$ a|$-a", out.written());
+    out.clearRetainingCapacity();
+    // A lead byte whose sequence does not decode (a surrogate, an overlong
+    // two-byte form) ends the name, and the bytes are copied as they are.
+    try re.expand(&out.writer, "$x\xed\xa0\x80|$1\xc0\x80", input, &groups);
+    try testing.expectEqualStrings("a\xed\xa0\x80|a\xc0\x80", out.written());
 }
 
 test "mutation M: literalPrefix of a long literal and around the surrogates" {
@@ -6695,5 +6714,45 @@ test "mutation M: literalPrefix of a long literal and around the surrogates" {
         out.clearRetainingCapacity();
         _ = try r.literalPrefix(&out.writer);
         try testing.expectEqualStrings(c.w, out.written());
+    }
+}
+
+test "mutation M: the wide-code-point caches start empty, whatever the allocator hands out" {
+    // `wideCaches` creates the tables from the allocator's memory and must
+    // clear them: a stale non-zero key is a cache hit for a transition that
+    // was never worked out. A fixed buffer filled with 0xFF stands in for a
+    // recycled heap block (the testing allocator's own 0xAA fill is one such
+    // pattern; this one does not depend on it).
+    var re = try Regex.compile(testing.allocator, "\\w+");
+    defer re.deinit(testing.allocator);
+    var buf: [@sizeOf(FindDfa.WideCaches) + 64]u8 align(64) = undefined;
+    @memset(&buf, 0xFF);
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var d: FindDfa = .init(fba.allocator(), &re);
+    defer d.deinit();
+    const w = try d.wideCaches();
+    try testing.expect(d.wide == w);
+    for (w.fwd) |e| try testing.expectEqual(FindDfa.Wide.empty, e);
+    for (w.rev) |e| try testing.expectEqual(FindDfa.Wide.empty, e);
+    // Asked again, the same tables, not a second block.
+    try testing.expect((try d.wideCaches()) == w);
+}
+
+test "mutation M: bytes mode finds a four-byte code point on the Pike VM" {
+    // A thread inside a four-byte sequence waits `rem` = 3, 2, 1 bytes keyed
+    // `rem * n + pc` in the list's `seen`: the tables are 4n entries, one
+    // more than a 3n sizing would give (an out-of-bounds key in safe builds).
+    var re = try Regex.compileOptions(testing.allocator, "(.)(.)", .{ .syntax = .rust, .utf8 = false });
+    defer re.deinit(testing.allocator);
+    var m = try Matcher.init(testing.allocator, &re);
+    defer m.deinit();
+    const text = "\xF0\x9F\x98\x80\xF0\x9F\x98\x81";
+    for ([_]bool{ false, true }) |pike| {
+        m.pike_only = pike;
+        try testing.expectEqual(Span{ .start = 0, .end = 8 }, m.find(text, 0).?);
+        var caps: [3]?Span = undefined;
+        try testing.expect(m.captures(text, 0, &caps));
+        try testing.expectEqual(Span{ .start = 0, .end = 4 }, caps[1].?);
+        try testing.expectEqual(Span{ .start = 4, .end = 8 }, caps[2].?);
     }
 }
