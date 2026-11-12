@@ -60,6 +60,22 @@
                  changes the audit is STALE and counts 2. Carrying a hash over a
                  purely mechanical change (a Zig migration, `zig fmt`) is allowed;
                  the commit that does it says so.
+                 Which run restores it (2026-11-12): a WHOLE-MODULE run — every
+                 guard of the production code — when the module has none yet, when
+                 the code changed since the last one exceeds ~20 % of the
+                 production lines, or when that run is over 12 months old.
+                 Otherwise a DELTA run restores it: mutants over every function
+                 the change touched (the whole function, not only its changed
+                 lines) and over the guards elsewhere that read state the change
+                 writes; same strict verdict, 0 undecided; its score goes on the
+                 Audit line and the Mutation paragraph names the base commit. A
+                 delta REVIEW without mutants never refreshes `src`.
+                 Mutant set: one mutant per guard and operator class (flip, drop,
+                 off-by-one, swap arm, skip assignment, error remap) — not every
+                 literal ±1; none on arid code (logging, declarations, comptime
+                 constants and field defaults, asserts, test helpers). A mutant
+                 that changes only cost (a fast path, a cache, a sort choice) is
+                 equivalent, noted "cost-only".
                  1 = both dated, scored clean, over the current src · 2 = both, but
                  stale/unscored · 3 = one of them, or a `?` · 4 = neither.
      Hardening (H) — `fuzz`: when the deterministic fuzz driver last ran this
