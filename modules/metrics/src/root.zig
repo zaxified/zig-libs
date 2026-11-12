@@ -802,8 +802,6 @@ const Family = struct {
     funcs: bool = false,
     /// Set for a family a `Collector` emits (it then has no children).
     collector: ?*CollectorEntry = null,
-    /// This family's position in its collector's `descs`.
-    desc_index: usize = 0,
     /// Removed by `unregister`: a collector's samples for it are dropped.
     removed: bool = false,
     /// Series pointers into this family are held by a component that never
@@ -1054,7 +1052,7 @@ pub const Registry = struct {
         entry.* = .{ .collector = collector, .families = try a.alloc(*Family, descs.len) };
         try r.families.ensureUnusedCapacity(a, descs.len);
         try r.family_index.ensureUnusedCapacity(a, @intCast(descs.len));
-        for (descs, entry.families, 0..) |d, *slot, i| {
+        for (descs, entry.families) |d, *slot| {
             const f = try a.create(Family);
             f.* = .{
                 .name = try a.dupe(u8, d.name),
@@ -1067,7 +1065,6 @@ pub const Registry = struct {
                 },
                 .buckets = &.{},
                 .collector = entry,
-                .desc_index = i,
             };
             slot.* = f;
         }
