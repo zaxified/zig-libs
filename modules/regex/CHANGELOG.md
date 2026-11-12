@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-12** — **Tests:** whole-module mutation run over `syntax.zig`, `root.zig` and `teddy.zig` (schemata, ReleaseSafe, 4009 mutants): new `src/mutation_test.zig` (registered in `root.zig`) pins the parser limits (`max_depth` for a repetition, `max_groups`, `max_stacked` budget, nested counted repeats under the Rust limit), the Rust nest-height bookkeeping (alternations, classes, set operations, captures), octal and class edge cases (POSIX `-`, `[z-a`, `[[::]`, adjacent-range merge, negation up to U+10FFFF), case folding of classes (alternating runs, the all-of-Unicode shortcut, stale ranges), Rust CRLF, look-around, property `!=` and byte classes, Teddy at every offset, and a differential of every engine and table size against the Pike VM; no production code changed.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written hex-digit switch is replaced by `std.fmt.charToDigit(c, 16)` (same digits accepted, both cases, same results).
 - **2026-11-07** — **Tests:** delta audit of `replaceN`: `replaceNLiteral` with a `null` limit and `replaceAllLiteral` over several matches (empty matches included) pinned in the module's own test; mutation delta run, 18 schemata mutants, all killed.
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** README notes that `replaceN` follows Rust `replacen` in limit and empty matches, but its template syntax is Go's.

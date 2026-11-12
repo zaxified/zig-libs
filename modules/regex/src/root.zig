@@ -4819,6 +4819,7 @@ test {
     _ = @import("go_oracle_test.zig");
     _ = @import("rust_oracle_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 test "robustness: random patterns and inputs compile or refuse, and match, without a trap" {
