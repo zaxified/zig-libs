@@ -1609,10 +1609,18 @@ pub const Db = struct {
             const name = try self.fileName(id, "data");
             defer self.gpa.free(name);
             const last = i + 1 == n_files;
-            const fh = self.store.open(name, if (ro) .read_only else .open_or_create) catch |e| switch (e) {
+            // `OpenMode` has no "existing, read-write": a writer probes with
+            // `.read_only` first, so a listed file that is missing is refused
+            // without being created empty (which would erase the evidence and
+            // write to a directory whose open fails).
+            const probe = self.store.open(name, .read_only) catch |e| switch (e) {
                 // Gone between our manifest read and now: a writer's merge.
                 error.FileNotFound => return if (ro) error.Retry else error.Corrupt,
                 else => return e,
+            };
+            const fh = if (ro) probe else blk: {
+                self.store.close(probe);
+                break :blk try self.store.open(name, .open_or_create);
             };
             const fsize = self.store.size(fh) catch |e| {
                 self.store.close(fh);
@@ -7281,6 +7289,28 @@ test "open: every stray file past next_file_id goes, a listed file with a bad he
     std.mem.writeInt(u32, bad_version[4..8], 7, .little);
     try sim.installFile("db.0.data", bad_version);
     try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 64 }));
+}
+
+test "open: a listed file that is missing is refused without being created" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoFileStore(&sim);
+    const manifest = try testing.allocator.dupe(u8, sim.fileContent("db").?);
+    defer testing.allocator.free(manifest);
+    try sim.storage().delete("db.0.data");
+    // A writer refuses, and leaves the directory as it found it: the missing
+    // file stays missing (not an empty file that reads like a bad header),
+    // the manifest is untouched.
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 64 }));
+    try testing.expect(sim.fileContent("db.0.data") == null);
+    try testing.expectEqualSlices(u8, manifest, sim.fileContent("db").?);
+    // A second writer open gives the same answer, not a different one off a
+    // file the first open left behind.
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 64 }));
+    try testing.expect(sim.fileContent("db.0.data") == null);
+    // A reader sees a file that vanished under it: Busy after its retries.
+    try testing.expectError(error.Busy, Db.open(testing.allocator, sim.storage(), "db", .{ .read_only = true }));
+    try testing.expect(sim.fileContent("db.0.data") == null);
 }
 
 test "open: states around an unfinished migration are told apart" {
