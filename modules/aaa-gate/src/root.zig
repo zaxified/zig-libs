@@ -4392,8 +4392,7 @@ test {
 // ── lead tests (2026-10-25): header-confusion behaviour pinned over the wire ──
 // The `**Ahead:**` line of the maturity card cites these by name; the same
 // cases run against labstack/echo v5.4.0, gofiber/fiber v2.52.16 / v3.6.1 and
-// gin v1.12.0 in the field report (modules/aaa-gate/tools/go_fast_bench,
-// ~/CML/20261025-wave10/aaa-field.report.md).
+// gin v1.12.0 in the field report (modules/aaa-gate/tools/go_fast_bench).
 
 test "lead: Bearer scheme is case-insensitive and tolerates runs of spaces; a tab or a suffixed token does not admit" {
     var g = try Gate.init(testing.allocator, .{ .token = "s3cr3t" });

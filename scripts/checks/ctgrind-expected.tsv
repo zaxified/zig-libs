@@ -1861,9 +1861,9 @@ minisign	ReleaseFast	open	1	6	81a53e65bb74db69	1876f3ea9f53cddd
 # (`containsFp`, timing_safe.eql folded without early exit) adds none. No
 # witness: the verdict leaves the module as a constant enum chosen by that one
 # branch, so total = in-file.
-aaa-gate	ReleaseFast	bearer	2	2	c9b860c7ac6a6e05	b0e8295638441324
-aaa-gate	ReleaseFast	api_key	2	2	c9b860c7ac6a6e05	964c6a19647f3cd3
-aaa-gate	ReleaseFast	basic	2	2	c9b860c7ac6a6e05	3e1202ab86ba6261
+aaa-gate	ReleaseFast	bearer	2	2	fa6b79bf1d1faceb	b0e8295638441324
+aaa-gate	ReleaseFast	api_key	2	2	fa6b79bf1d1faceb	964c6a19647f3cd3
+aaa-gate	ReleaseFast	basic	2	2	fa6b79bf1d1faceb	3e1202ab86ba6261
 
 # tls13 (2026-10-31). ks*: the whole RFC 8446 §7.1 schedule over tainted PSK + DHE secret,
 # 0 in-file (HKDF/HMAC are std's; the 20 contexts are the propagation witness).
