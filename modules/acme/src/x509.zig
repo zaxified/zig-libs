@@ -3346,3 +3346,12 @@ test "mutation: EC CSR structure checks before the signature (key length, attrib
         try expectCsrError(error.BadCsrSignature, d);
     }
 }
+
+test "mutation 2026-11-12: pemBlockCount counts the blocks of its label and reads a malformed tail as no block at all" {
+    try testing.expectEqual(@as(usize, 1), try pemBlockCount("CERTIFICATE", test_cert_pem));
+    try testing.expectEqual(@as(usize, 2), try pemBlockCount("CERTIFICATE", test_cert_pem ++ test_root_cert_pem));
+    try testing.expectEqual(@as(usize, 0), try pemBlockCount("CERTIFICATE REQUEST", test_cert_pem));
+    // A well-formed BEGIN line without its END line is an iterator error: the
+    // count is 0, not the one good block before it (fail closed).
+    try testing.expectEqual(@as(usize, 0), try pemBlockCount("CERTIFICATE", test_cert_pem ++ "-----BEGIN CERTIFICATE-----\nAAAA\n"));
+}

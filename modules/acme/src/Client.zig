@@ -7418,3 +7418,37 @@ test "wave 2: a call cancelled while the CA stalls mid-body is Canceled, not Htt
     try testing.expect(bg.done.load(.acquire));
     try testing.expectEqual(@as(?Error, error.Canceled), bg.err);
 }
+
+test "mutation 2026-11-12: the built-in DNS-01 solver refuses an identifier whose record name is too long, publishes and removes nothing" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var transport = http.Client.init(io, testing.allocator, .{});
+    defer transport.deinit();
+    var account_key: jws.KeyPair = undefined;
+    try jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(14)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var zone: TestZone = .{};
+    var c = Client.init(io, testing.allocator, &transport, &account_key, .{
+        .directory_url = "http://127.0.0.1:1/dir",
+        .challenge_type = .dns_01,
+        .dns_publisher = zone.publisher(),
+    });
+    defer c.deinit();
+    const solver = c.solverFor(.dns_01).?;
+
+    const too_long: ChallengeRequest = .{ .type = .dns_01, .identifier = strRepeat("x", 254), .ip = false, .wildcard = false, .token = "tok", .key_authorization = "tok.thumb" };
+    try testing.expectError(error.SolverFailed, solver.present(solver.ctx, &too_long));
+    solver.cleanup(solver.ctx, &too_long);
+    try testing.expectEqual(@as(u32, 0), zone.presents);
+    try testing.expectEqual(@as(u32, 0), zone.cleanups);
+
+    // Control: the longest name is published and removed under its own name.
+    const longest: ChallengeRequest = .{ .type = .dns_01, .identifier = strRepeat("x", 253), .ip = false, .wildcard = false, .token = "tok", .key_authorization = "tok.thumb" };
+    try solver.present(solver.ctx, &longest);
+    try testing.expect(zone.live);
+    solver.cleanup(solver.ctx, &longest);
+    try testing.expect(!zone.live and !zone.bad_cleanup);
+    try testing.expectEqual(@as(u32, 1), zone.presents);
+    try testing.expectEqual(@as(u32, 1), zone.cleanups);
+}

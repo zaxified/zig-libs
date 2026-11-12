@@ -1672,3 +1672,23 @@ test "mutation: checkRsaKey wipes the RSA key pair before freeing it" {
     try std.testing.expectEqual(@as(usize, 1), spy.zero_frees);
     try std.testing.expectEqual(@as(usize, 0), spy.dirty_frees);
 }
+
+test "mutation 2026-11-12: a chain skips blocks of other labels and refuses a CERTIFICATE block that does not decode" {
+    const fx = @import("testdata/manager_fixtures.zig");
+    const chain = fx.a1_crt ++ "\n" ++ fx.ca_pem ++ "\n";
+    const t: i64 = 1767225600 + 30 * std.time.s_per_day;
+    // A key block after the certificates is not a certificate.
+    _ = try checkPair(std.testing.allocator, &.{"a.example"}, chain ++ fx.a1_key, fx.a1_key, t, &.{});
+    // A CERTIFICATE block with a body that is no base64 is not skipped.
+    try std.testing.expectError(error.MalformedChain, checkPair(std.testing.allocator, &.{"a.example"}, chain ++ "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n", fx.a1_key, t, &.{}));
+    // An unterminated block is not "the certificates read so far".
+    try std.testing.expectError(error.MalformedChain, checkPair(std.testing.allocator, &.{"a.example"}, chain ++ "-----BEGIN CERTIFICATE-----\nAAAA\n", fx.a1_key, t, &.{}));
+}
+
+test "mutation 2026-11-12: ratioRenewAt treats a certificate that expires before it starts as a zero lifetime" {
+    // notAfter < notBefore (a skewed or hostile CA): the lifetime clamps to 0,
+    // so the renewal point is never later than the expiry.
+    try std.testing.expectEqual(@as(i64, 1000), ratioRenewAt(2000, 1000, 50));
+    try std.testing.expectEqual(@as(i64, 1000), ratioRenewAt(2000, 1000, 1));
+    try std.testing.expectEqual(@as(i64, 2000), ratioRenewAt(2000, 1000, 0));
+}
