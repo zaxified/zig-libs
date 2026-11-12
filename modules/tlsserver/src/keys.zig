@@ -911,3 +911,20 @@ test "wave 2: an RSA key keycodec reads but rsa refuses is MalformedKey" {
         return;
     };
 }
+
+test "wave 4: an EC key against a certificate that holds another kind of key is a KeyMismatch" {
+    const certs = @import("test_certs.zig");
+    const E = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const sk = try E.SecretKey.fromBytes(certs.p256_scalar);
+    const spki = try x509.spkiOf(&certs.rsa2048_cert);
+    try testing.expectError(error.KeyMismatch, ecMatches(E, &.{ 0x2a, 0x86, 0x48 }, &sk, spki));
+}
+
+test "wave 4: an EC key of another curve than the certificate's is a KeyMismatch" {
+    const certs = @import("test_certs.zig");
+    const E = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+    const sk = try E.SecretKey.fromBytes(certs.p384_scalar);
+    const spki = try x509.spkiOf(&certs.p256_cert);
+    // P-384's OID (1.3.132.0.34) against a P-256 certificate.
+    try testing.expectError(error.KeyMismatch, ecMatches(E, &.{ 0x2b, 0x81, 0x04, 0x00, 0x22 }, &sk, spki));
+}

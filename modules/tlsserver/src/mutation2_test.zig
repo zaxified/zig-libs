@@ -176,3 +176,26 @@ test "outbound: QUIC keeps handshake data only, to the octet, and wipes what wri
     q2.wipe();
     try testing.expect(std.mem.allEqual(u8, &buf, 0));
 }
+
+// ---- Wave 4 (2026-11-12 whole-module re-run, strict verdicts).
+
+test "wave 4: inbound: a QUIC receive side installs no key" {
+    var in = inbound.Inbound.init(&joiner_buf);
+    in.quic = true;
+    try in.installRx(.aes_128_gcm_sha256, &secret32);
+    try testing.expect(!in.protected);
+}
+
+test "wave 4: inbound: an undecryptable record is not skipped as refused early data while a handshake message is half held" {
+    var in = try protectedIn();
+    in.skip_early = 100;
+    try in.joiner.push(&.{ 1, 0, 0, 10, 0xaa, 0xbb });
+    var rec: [26]u8 = @splat(9);
+    rec[0..5].* = .{ 23, 3, 3, 0, 21 };
+    try testing.expectError(error.BadRecordMac, in.next(&rec));
+    // The same record with nothing held is skipped within the budget.
+    in = try protectedIn();
+    in.skip_early = 100;
+    const r = try in.next(&rec);
+    try testing.expect(r.event == .need_more);
+}

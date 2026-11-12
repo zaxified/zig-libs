@@ -1256,3 +1256,30 @@ test "wave 3: a transport that takes part of the output and fails keeps the rest
             try testing.expectEqualSlices(u8, &.{ 0, 2, 2, 10 }, c.server.pendingOutput());
     }
 }
+
+test "wave 4: read after the client's close_notify is null again, without asking the transport" {
+    const r = try IdleRig.create();
+    defer testing.allocator.destroy(r);
+    r.c.server.state = .connected;
+    r.c.server.peer_closed = true;
+    try testing.expectEqual(@as(?[]u8, null), try r.c.read());
+    try testing.expectEqual(@as(?[]u8, null), try r.c.read());
+}
+
+test "wave 4: a spent reader record is dropped on rebase, an unread one is a boundary error" {
+    const r = try IdleRig.create();
+    defer testing.allocator.destroy(r);
+    const c = &r.c;
+    c.app_in.buffer = r.in_buf[0..10];
+    c.app_in.seek = 4;
+    c.app_in.end = 4;
+    try Connection.readerRebase(&c.app_in, 1);
+    try testing.expectEqual(@as(usize, 0), c.app_in.buffer.len);
+    try testing.expectEqual(@as(usize, 0), c.app_in.seek);
+    try testing.expectEqual(@as(usize, 0), c.app_in.end);
+    c.app_in.buffer = r.in_buf[0..10];
+    c.app_in.seek = 2;
+    c.app_in.end = 4;
+    try testing.expectError(error.ReadFailed, Connection.readerRebase(&c.app_in, 1));
+    try testing.expectEqual(@as(usize, 10), c.app_in.buffer.len);
+}

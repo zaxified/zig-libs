@@ -6730,6 +6730,8 @@ const EchTest = struct {
     ebuf: []u8,
     s: Server,
     sender: hpke.Setup(hpke.X25519Kem, aesgcm.Aes128Gcm, 32),
+    sender256: hpke.Setup(hpke.X25519Kem, aesgcm.Aes256Gcm, 32),
+    sender_chacha: hpke.Setup(hpke.X25519Kem, @import("chachapoly").ChaCha20Poly1305, 32),
 
     const Opts = struct {
         /// The config's (KDF, AEAD) list, raw (default: HKDF-SHA256 with the three AEADs).
@@ -6771,6 +6773,8 @@ const EchTest = struct {
         @memcpy(info[8..][0..t.config.len], t.config);
         const eph = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(0x55));
         try hpke.schedule.setupBaseSDeterministic(hpke.X25519Kem, aesgcm.Aes128Gcm, 32, &t.sender, t.kp.public_key, &eph, info[0 .. 8 + t.config.len]);
+        try hpke.schedule.setupBaseSDeterministic(hpke.X25519Kem, aesgcm.Aes256Gcm, 32, &t.sender256, t.kp.public_key, &eph, info[0 .. 8 + t.config.len]);
+        try hpke.schedule.setupBaseSDeterministic(hpke.X25519Kem, @import("chachapoly").ChaCha20Poly1305, 32, &t.sender_chacha, t.kp.public_key, &eph, info[0 .. 8 + t.config.len]);
         return t;
     }
 
@@ -6808,7 +6812,11 @@ const EchTest = struct {
         // with it zero.
         const sealed = try gpa.alloc(u8, payload_len);
         defer gpa.free(sealed);
-        try t.sender.context.seal(rec[9..], plain, sealed);
+        switch (o.seal_aead) {
+            ech.aead_aes128_gcm => try t.sender.context.seal(rec[9..], plain, sealed),
+            ech.aead_aes256_gcm => try t.sender256.context.seal(rec[9..], plain, sealed),
+            else => try t.sender_chacha.context.seal(rec[9..], plain, sealed),
+        }
         @memcpy(rec[rec.len - payload_len ..], sealed);
         return rec;
     }
@@ -6818,6 +6826,8 @@ const EchTest = struct {
 const EchOffer = struct {
     kdf: u16 = 1,
     aead: u16 = 1,
+    /// The AEAD the payload is really sealed with (the header's `aead` is what it claims).
+    seal_aead: u16 = 1,
     config_id: u8 = 9,
     /// Null: the sender's `enc` in a first hello, none in a second.
     enc: ?[]const u8 = null,
@@ -8769,4 +8779,233 @@ test "wave 3: the worst first flight — a retry, the longest share, a 255-octet
     // which the bound counts as 63-octet protected ones.
     const used = r.s.pendingOutput().len;
     try testing.expect(n >= used + outbound.alert_reserve + 176 + 64);
+}
+
+// ---- Wave 4 (2026-11-12 whole-module re-run): guards the 2026-11 schemata never reached.
+
+test "wave 4: a strike register that cannot remember a ticket refuses it (fail closed)" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var reg = tlsresume.replay.StrikeRegister.init(fa.allocator(), 4, 60_000);
+    defer reg.deinit();
+    const g = strikeRegisterGuard(&reg);
+    try testing.expect(!g.admit(g.ctx, "ticket", 0));
+    // With memory the same ticket is admitted once, then refused.
+    var ok = tlsresume.replay.StrikeRegister.init(testing.allocator, 4, 60_000);
+    defer ok.deinit();
+    const g2 = strikeRegisterGuard(&ok);
+    try testing.expect(g2.admit(g2.ctx, "ticket", 0));
+    try testing.expect(!g2.admit(g2.ctx, "ticket", 1));
+}
+
+test "wave 4: CacheTicketer seals into room of exactly cache_id_len octets" {
+    const Cache = SessionCache(0);
+    var cache: Cache = try .init(testing.allocator, 2, 100);
+    defer cache.deinit();
+    const Fixed = struct {
+        fn now(_: ?*anyopaque) i64 {
+            return 50_999;
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(3);
+    const ct: CacheTicketer(Cache) = .{ .cache = &cache, .clock = .{ .now_ms = Fixed.now }, .random = prng.random() };
+    const t = ct.ticketer();
+    var room: [64]u8 = undefined;
+    const id = t.seal(t.ctx, "state", @splat(0), room[0..cache_id_len]) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, cache_id_len), id.len);
+    var out: [ticketStateLen(0)]u8 = undefined;
+    try testing.expectEqualStrings("state", t.open(t.ctx, id, 50, &out).?);
+}
+
+test "wave 4: minOutputLen counts the client leaf each ticket may carry" {
+    const plain = try W3Script.create(.{ .ticketer = W3Plain.ticketer, .count = 4 });
+    defer plain.destroy();
+    const auth = try W3Script.create(.{ .ticketer = W3Plain.ticketer, .count = 4, .client_auth = true });
+    defer auth.destroy();
+    // Four tickets, each with a leaf of up to `default_max_leaf_len`.
+    try testing.expect(minOutputLen(&auth.cfg, testKey()) >= 4 * clientauth.default_max_leaf_len);
+    try testing.expect(minOutputLen(&auth.cfg, testKey()) > minOutputLen(&plain.cfg, testKey()));
+}
+
+test "wave 4: only the first max_psk_identities identities of a hello are looked at" {
+    const r = try W3Script.create(.{ .ticketer = W3Plain.ticketer });
+    defer r.destroy();
+    var store: [1][1024]u8 = undefined;
+    var t: [1][]const u8 = undefined;
+    try r.issue(false, &store, &t);
+    // The ticket as the last identity looked at resumes; as the one after, it is not seen.
+    for ([_]usize{ max_psk_identities - 1, max_psk_identities }) |at| {
+        var ids: [max_psk_identities + 1][]const u8 = undefined;
+        for (&ids) |*id| id.* = "not a ticket";
+        ids[at] = t[0];
+        const r2 = try W3Script.create(.{ .ticketer = W3Plain.ticketer });
+        defer r2.destroy();
+        const rec = try w3PskHello(.{ .psk_modes = &.{1} }, &ids, at, "");
+        defer testing.allocator.free(rec);
+        _ = try r2.hello(rec);
+        try testing.expectEqual(at == max_psk_identities - 1, r2.s.isResumed());
+    }
+}
+
+test "wave 4: a ClientHello that does not parse: decode_error when malformed, illegal_parameter for a repeated extension" {
+    try expectRefusal(.{ .extra = &.{.{ 18, "x" }} }, error.DecodeError, .decode_error);
+    try expectRefusal(.{ .extra = &.{ .{ 0x7777, "" }, .{ 0x7777, "" } } }, error.IllegalParameter, .illegal_parameter);
+}
+
+test "wave 4: an inner hello that does not parse after decryption is refused with the parse's own error" {
+    const outer: Hello = .{ .sni = "public.example" };
+    const bad = [_]struct { Hello, Error }{
+        .{ .{ .sni = "secret.example", .extra = &.{.{ 18, "x" }} }, error.DecodeError },
+        .{ .{ .sni = "secret.example", .extra = &.{ .{ 0x7777, "" }, .{ 0x7777, "" } } }, error.IllegalParameter },
+    };
+    for (bad) |c| {
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        const rec = try t.clientHello(outer, c[0], .{});
+        defer testing.allocator.free(rec);
+        try testing.expectError(c[1], t.s.feed(rec));
+    }
+}
+
+test "wave 4: an ECH offer sealed with AES-256-GCM or ChaCha20-Poly1305 is opened, as one with AES-128-GCM" {
+    const outer: Hello = .{ .sni = "public.example" };
+    const inner: Hello = .{ .sni = "secret.example" };
+    for ([_]u16{ ech.aead_aes128_gcm, ech.aead_aes256_gcm, ech.aead_chacha20_poly1305 }) |a| {
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        const rec = try t.clientHello(outer, inner, .{ .aead = a, .seal_aead = a });
+        defer testing.allocator.free(rec);
+        _ = try t.s.feed(rec);
+        try testing.expect(t.s.echAccepted());
+        try testing.expectEqualStrings("secret.example", t.s.serverName().?);
+    }
+}
+
+test "wave 4: a backend server takes an inner offer in the first hello only, and a malformed one is refused" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    {
+        // An inner offer that first shows in the second hello is not confirmed.
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        const r1 = try buildRecord(testing.allocator, x25519_share_first);
+        defer testing.allocator.free(r1);
+        try testing.expect((try s.feed(r1)).event == .need_more);
+        var second = p256_only;
+        second.ech = &.{1};
+        const r2 = try buildRecord(testing.allocator, second);
+        defer testing.allocator.free(r2);
+        _ = try s.feed(r2);
+        try testing.expect(s.ech_state == .none);
+    }
+    {
+        // An outer offer is no business of a server without keys: not looked at.
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        const rec = try buildRecord(testing.allocator, .{ .ech = &.{0} });
+        defer testing.allocator.free(rec);
+        _ = try s.feed(rec);
+        try testing.expect(s.ech_state == .none);
+    }
+    {
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        const rec = try buildRecord(testing.allocator, .{ .ech = &.{1} });
+        defer testing.allocator.free(rec);
+        _ = try s.feed(rec);
+        try testing.expect(s.ech_state == .backend);
+    }
+    try expectRefusal(.{ .ech = &.{ 1, 0xff } }, error.DecodeError, .decode_error);
+}
+
+test "wave 4: legacy_version of exactly TLS 1.0 is let through" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const rec = try buildRecord(testing.allocator, .{ .legacy_version = 0x0301 });
+    defer testing.allocator.free(rec);
+    _ = try s.feed(rec);
+    try testing.expect(s.pendingOutput().len != 0);
+}
+
+test "wave 4: QUIC — a one-octet legacy_session_id is refused, and the JA4 of a QUIC hello says so" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const quic: Quic = .{ .transport_parameters = "TP" };
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .alpn_protocols = &.{"h3"}, .quic = &quic, .ja4 = true };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [8192]u8 = undefined;
+    {
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        const rec = try buildRecord(testing.allocator, .{ .alpn = &.{"h3"}, .quic_tp = "c", .session_id = "a" });
+        defer testing.allocator.free(rec);
+        try testing.expectError(error.IllegalParameter, s.quicFeed(.initial, rec[5..]));
+    }
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const rec = try buildRecord(testing.allocator, .{ .alpn = &.{"h3"}, .quic_tp = "c" });
+    defer testing.allocator.free(rec);
+    _ = try s.quicFeed(.initial, rec[5..]);
+    try testing.expectEqual(@as(u8, 'q'), s.ja4().?[0]);
+}
+
+test "wave 4: an ECHConfig with octets after its extensions is not a config" {
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(3));
+    var buf: [256]u8 = undefined;
+    const good = try ech.makeConfig(&buf, 9, &kp.public_key, "public.example", 0);
+    _ = try ech.parseConfig(good);
+    var longer: [257]u8 = undefined;
+    @memcpy(longer[0..good.len], good);
+    longer[good.len] = 0xaa;
+    std.mem.writeInt(u16, longer[2..4], @intCast(good.len - 4 + 1), .big);
+    try testing.expectError(error.InvalidConfig, ech.parseConfig(longer[0 .. good.len + 1]));
+}
+
+test "wave 4: a HelloRetryRequest allows a second compatibility CCS, and no third" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const r1 = try buildRecord(testing.allocator, x25519_share_first);
+    defer testing.allocator.free(r1);
+    try testing.expect((try s.feed(r1)).event == .need_more);
+    try testing.expectEqual(State.client_hello_retry, s.state);
+    const ccs = [_]u8{ 20, 3, 3, 0, 1, 1 };
+    var c1 = ccs;
+    _ = try s.feed(&c1);
+    var c2 = ccs;
+    _ = try s.feed(&c2);
+    var c3 = ccs;
+    try testing.expectError(error.UnexpectedMessage, s.feed(&c3));
+}
+
+/// The octets a server queues for the client's Finished: its tickets.
+fn w4TicketBytes(r: *W3Script) !usize {
+    const rec = try buildRecord(testing.allocator, .{ .psk_modes = &.{1} });
+    defer testing.allocator.free(rec);
+    _ = try r.hello(rec);
+    r.s.discardOutput(r.s.pendingOutput().len);
+    try testing.expect((try r.finished()).event == .handshake_done);
+    return r.s.pendingOutput().len;
+}
+
+test "wave 4: a ticket carries the early_data extension only when early data has a size" {
+    var strikes = tlsresume.replay.StrikeRegister.init(testing.allocator, 8, 60_000);
+    defer strikes.deinit();
+    const none = try W3Script.create(.{ .ticketer = W3Plain.ticketer });
+    defer none.destroy();
+    const zero = try W3Script.create(.{ .ticketer = W3Plain.ticketer, .strikes = &strikes });
+    defer zero.destroy();
+    zero.early.max_size = 0;
+    const some = try W3Script.create(.{ .ticketer = W3Plain.ticketer, .strikes = &strikes });
+    defer some.destroy();
+    const n_none = try w4TicketBytes(none);
+    try testing.expectEqual(n_none, try w4TicketBytes(zero));
+    try testing.expect(try w4TicketBytes(some) > n_none);
 }
