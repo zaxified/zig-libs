@@ -9080,6 +9080,11 @@ test "STACKPROBE: wave 5 — no secret residue after serialize" {
     var secrets: [3][32]u8 = .{ p.s.client_application_secret[0..32].*, p.s.server_application_secret[0..32].*, p.s.exporter_master_secret[0..32].* };
     defer std.crypto.secureZero(u8, std.mem.asBytes(&secrets));
     var blob: [8192]u8 = undefined;
-    const key: [32]u8 = @splat(7);
-    _ = try Wave5Probe.run("serialize", Server.serialize, .{ &p.s, &blob, &key, "" }, &[_][]const u8{ &secrets[0], &secrets[1], &secrets[2] }, .{});
+    // Distinct octets: the blob key's AEAD state in `serializeBody` starts with
+    // the key itself, a needle the probe can see (32 equal octets it cannot).
+    var key: [32]u8 = undefined;
+    Sha256.hash("wave 5 serialize probe key", &key, .{});
+    defer std.crypto.secureZero(u8, &key);
+    const key_needle = key;
+    _ = try Wave5Probe.run("serialize", Server.serialize, .{ &p.s, &blob, &key, "" }, &[_][]const u8{ &secrets[0], &secrets[1], &secrets[2], &key_needle }, .{});
 }
