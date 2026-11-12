@@ -6963,3 +6963,1233 @@ test "one-read get: records around the stack-buffer size and a long key, copying
     defer db.close();
     try expectBoundaryRecords(&db);
 }
+
+// ── tests added by the whole-module mutation run (2026-11) ──────────────────
+
+/// A `Storage` decorator over `SimStorage` for what the simulator cannot do
+/// by itself: refuse one kind of call on demand (a failing rename or
+/// directory sync, a failing delete, a write that fails after N more), count
+/// `sync` calls and open handles, and behave like a read-only mount.
+const SpyStorage = struct {
+    inner: Storage,
+    syncs: usize = 0,
+    live_handles: isize = 0,
+    fail_rename: bool = false,
+    fail_sync_dir: bool = false,
+    fail_delete: bool = false,
+    /// `writeAll` fails (`InputOutput`) once this many more writes went through.
+    fail_write_in: ?usize = null,
+    /// A read-only mount: every open but `.read_only`, and every write,
+    /// truncation, rename, delete and directory sync, is `AccessDenied`.
+    deny_writes: bool = false,
+
+    fn storage(s: *SpyStorage) Storage {
+        return .{ .ctx = s, .vtable = &vtable };
+    }
+
+    fn of(ctx: *anyopaque) *SpyStorage {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    const vtable = Storage.VTable{
+        .open = vOpen,
+        .size = vSize,
+        .pread = vPread,
+        .writeAll = vWriteAll,
+        .sync = vSync,
+        .truncate = vTruncate,
+        .close = vClose,
+        .rename = vRename,
+        .delete = vDelete,
+        .syncDir = vSyncDir,
+        .tryLockExclusive = vLock,
+    };
+
+    fn vOpen(c: *anyopaque, p: []const u8, m: Storage.OpenMode) Storage.Error!Storage.Handle {
+        const s = of(c);
+        if (s.deny_writes and m != .read_only) return error.AccessDenied;
+        const h = try s.inner.open(p, m);
+        s.live_handles += 1;
+        return h;
+    }
+    fn vSize(c: *anyopaque, h: Storage.Handle) Storage.Error!u64 {
+        return of(c).inner.size(h);
+    }
+    fn vPread(c: *anyopaque, h: Storage.Handle, b: []u8, o: u64) Storage.Error!usize {
+        return of(c).inner.pread(h, b, o);
+    }
+    fn vWriteAll(c: *anyopaque, h: Storage.Handle, b: []const u8, o: u64) Storage.Error!void {
+        const s = of(c);
+        if (s.deny_writes) return error.AccessDenied;
+        if (s.fail_write_in) |*n| {
+            if (n.* == 0) {
+                s.fail_write_in = null;
+                return error.InputOutput;
+            }
+            n.* -= 1;
+        }
+        return s.inner.writeAll(h, b, o);
+    }
+    fn vSync(c: *anyopaque, h: Storage.Handle) Storage.Error!void {
+        const s = of(c);
+        s.syncs += 1;
+        if (s.deny_writes) return error.AccessDenied;
+        return s.inner.sync(h);
+    }
+    fn vTruncate(c: *anyopaque, h: Storage.Handle, l: u64) Storage.Error!void {
+        const s = of(c);
+        if (s.deny_writes) return error.AccessDenied;
+        return s.inner.truncate(h, l);
+    }
+    fn vClose(c: *anyopaque, h: Storage.Handle) void {
+        const s = of(c);
+        s.live_handles -= 1;
+        s.inner.close(h);
+    }
+    fn vRename(c: *anyopaque, a: []const u8, b: []const u8) Storage.Error!void {
+        const s = of(c);
+        if (s.deny_writes) return error.AccessDenied;
+        if (s.fail_rename) return error.InputOutput;
+        return s.inner.rename(a, b);
+    }
+    fn vDelete(c: *anyopaque, p: []const u8) Storage.Error!void {
+        const s = of(c);
+        if (s.deny_writes) return error.AccessDenied;
+        if (s.fail_delete) return error.InputOutput;
+        return s.inner.delete(p);
+    }
+    fn vSyncDir(c: *anyopaque) Storage.Error!void {
+        const s = of(c);
+        if (s.deny_writes) return error.AccessDenied;
+        if (s.fail_sync_dir) return error.InputOutput;
+        return s.inner.syncDir();
+    }
+    fn vLock(c: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+        return of(c).inner.tryLockExclusive(h);
+    }
+};
+
+/// Every byte after a data file's header belongs to one record, and that
+/// record is counted live or dead: the per-file counters add up to the file,
+/// the live keys to `count`, the dead bytes to `deadBytes`.
+fn expectAccounting(db: *Db) !void {
+    const stats = try db.fileStats(testing.allocator);
+    defer testing.allocator.free(stats);
+    var live_keys: u64 = 0;
+    var dead_bytes: u64 = 0;
+    for (stats) |st| {
+        try testing.expectEqual(st.size - header_len, st.live_bytes + st.dead_bytes);
+        live_keys += st.live_keys;
+        dead_bytes += st.dead_bytes;
+    }
+    try testing.expectEqual(@as(u64, db.count()), live_keys);
+    try testing.expectEqual(db.deadBytes(), dead_bytes);
+}
+
+fn dataName(buf: []u8, id: u32) []const u8 {
+    return std.mem.print(buf, "db.{d}.data", .{id}) catch unreachable;
+}
+
+test "accounting: every byte after a header is a live or a dead record, through every transition" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 0 };
+    const options: Options = .{ .max_file_size = 100, .clock = mc.clock() };
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        for ([_][]const u8{ "a", "b", "c", "d", "e" }) |k| try db.put(k, v30);
+        try expectAccounting(&db);
+        try db.put("a", v30); // overwrite
+        try db.delete("b");
+        try db.delete("nope"); // absent: nothing written, nothing counted
+        try expectAccounting(&db);
+        try db.putExpiring("x", v30, 500);
+        try db.putExpiring("y", v30, 5000);
+        try expectAccounting(&db);
+        mc.now_ms = 1000; // "x" is expired but still in memory
+        try expectAccounting(&db);
+        // Merge every sealed file, then compact the lot.
+        const stats = try db.fileStats(testing.allocator);
+        defer testing.allocator.free(stats);
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(testing.allocator);
+        for (stats) |st| if (!st.active) try ids.append(testing.allocator, st.id);
+        try db.merge(ids.items);
+        try expectAccounting(&db);
+        try db.put("c", v30);
+        try db.compact();
+        try expectAccounting(&db);
+        try db.put("z", v30);
+        try db.delete("z");
+        try expectAccounting(&db);
+    }
+    // Replay, and replay through hints, rebuild the same books.
+    mc.now_ms = 0;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        try expectAccounting(&db);
+        try db.putExpiring("w", v30, 100);
+        mc.now_ms = 200;
+        try expectAccounting(&db);
+        try db.compact();
+        try expectAccounting(&db);
+    }
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    defer db.close();
+    try expectAccounting(&db);
+}
+
+test "read-only: a reader needs no write access of any kind" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var active_id: u32 = 0;
+    {
+        var w = try Db.open(testing.allocator, sim.storage(), "m", .{ .max_file_size = 64 });
+        defer w.close();
+        try w.put("a", v30);
+        try w.put("b", v30);
+        try w.put("c", v30);
+        active_id = w.active().id;
+    }
+    {
+        var w = try Db.open(testing.allocator, sim.storage(), "s", .{});
+        defer w.close();
+        try w.put("a", v30);
+    }
+    try sim.installFile("e", ""); // a store whose creation never got to its header
+    try sim.appendDurable("s", "\x05\x06\x07");
+    var nb: [24]u8 = undefined;
+    try sim.appendDurable(try std.mem.print(&nb, "m.{d}.data", .{active_id}), "\x05\x06\x07");
+    for ([_][]const u8{ "m", "s" }) |name| {
+        var b1: [16]u8 = undefined;
+        var b2: [16]u8 = undefined;
+        try sim.installFile(try std.mem.print(&b1, "{s}.compact", .{name}), "stale");
+        try sim.installFile(try std.mem.print(&b2, "{s}.manifest", .{name}), "stale");
+    }
+    const s_before = try testing.allocator.dupe(u8, sim.fileContent("s").?);
+    defer testing.allocator.free(s_before);
+
+    var spy: SpyStorage = .{ .inner = sim.storage(), .deny_writes = true };
+    const ro: Options = .{ .read_only = true };
+    {
+        var r = try Db.open(testing.allocator, spy.storage(), "m", ro);
+        defer r.close();
+        try expectGet(&r, "a", v30);
+        try expectGet(&r, "c", v30);
+    }
+    {
+        var r = try Db.open(testing.allocator, spy.storage(), "s", ro);
+        defer r.close();
+        try expectGet(&r, "a", v30);
+    }
+    {
+        var r = try Db.open(testing.allocator, spy.storage(), "e", ro);
+        defer r.close();
+        try testing.expectEqual(@as(usize, 0), r.count());
+    }
+    try testing.expectEqual(@as(isize, 0), spy.live_handles);
+    try testing.expectEqualSlices(u8, s_before, sim.fileContent("s").?);
+    try testing.expectEqual(@as(usize, 0), sim.fileContent("e").?.len);
+    for ([_][]const u8{ "m.compact", "m.manifest", "s.compact", "s.manifest" }) |n| try testing.expect(sim.fileContent(n) != null);
+}
+
+test "open: a stale manifest temp beside a single-file store is removed" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("a", v30);
+    }
+    // A migration that crashed before its first rename left its temp.
+    try sim.installFile("db.manifest", "stale");
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    try testing.expect(sim.fileContent("db.manifest") == null);
+    try expectGet(&db, "a", v30);
+}
+
+/// Two data files and a manifest: "a" in `db.0.data`, "b" in `db.1.data`.
+fn twoFileStore(sim: *SimStorage) !void {
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 64 });
+    defer db.close();
+    try db.put("a", v30);
+    try db.put("b", v30);
+    try testing.expect(db.multi);
+}
+
+test "open: a manifest too small or too big to be one is Corrupt, never a panic or a big allocation" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    // Every size below the smallest possible manifest, each with a valid CRC
+    // and a file count that would send the parser on.
+    var size: usize = header_len;
+    while (size < header_len + 20) : (size += 1) {
+        var buf: [header_len + 20]u8 = @splat(0);
+        Db.writeHeader(buf[0..header_len], version_manifest);
+        std.mem.writeInt(u32, buf[8..12], 2, .little);
+        std.mem.writeInt(u32, buf[12..16], 1, .little);
+        if (size >= 12) std.mem.writeInt(u32, buf[size - 4 ..][0..4], std.hash.Crc32.hash(buf[0 .. size - 4]), .little);
+        try sim.installFile("db", buf[0..size]);
+        try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "db", .{}));
+    }
+    // A file over the cap is refused before anything is allocated for it.
+    const big = try testing.allocator.alloc(u8, max_manifest_len + 16);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    Db.writeHeader(big[0..header_len], version_manifest);
+    try sim.installFile("db", big);
+    var small: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&small);
+    try testing.expectError(error.Corrupt, Db.open(fba.allocator(), sim.storage(), "db", .{}));
+}
+
+test "open: every stray file past next_file_id goes, a listed file with a bad header is Corrupt" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoFileStore(&sim);
+    var nb: [3][24]u8 = undefined;
+    var strays: [3][]const u8 = undefined;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 64 });
+        defer db.close();
+        for (&strays, 0..) |*s, i| {
+            s.* = try std.mem.print(&nb[i], "db.{d}.data", .{db.next_file_id + @as(u32, @intCast(i))});
+        }
+    }
+    for (strays) |s| try sim.installFile(s, "ZKVL\x02\x00\x00\x00garbage");
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 64 });
+        defer db.close();
+        try expectGet(&db, "b", v30);
+    }
+    for (strays) |s| try testing.expect(sim.fileContent(s) == null);
+
+    // A listed file that is not ours: wrong magic with a good version, and a
+    // good magic with a version no data file has.
+    const good = try testing.allocator.dupe(u8, sim.fileContent("db.0.data").?);
+    defer testing.allocator.free(good);
+    const bad_magic = try testing.allocator.dupe(u8, good);
+    defer testing.allocator.free(bad_magic);
+    bad_magic[0] = 'X';
+    try sim.installFile("db.0.data", bad_magic);
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 64 }));
+    const bad_version = try testing.allocator.dupe(u8, good);
+    defer testing.allocator.free(bad_version);
+    std.mem.writeInt(u32, bad_version[4..8], 7, .little);
+    try sim.installFile("db.0.data", bad_version);
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 64 }));
+}
+
+test "open: states around an unfinished migration are told apart" {
+    // No `<path>`, `<path>.0.data` there, no manifest temp: not a state this
+    // module leaves — Corrupt for a writer, "keeps vanishing" for a reader.
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        try sim.installFile("db.0.data", "ZKVL\x02\x00\x00\x00");
+        try testing.expectError(error.Busy, Db.open(testing.allocator, sim.storage(), "db", .{ .read_only = true }));
+        try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "db", .{}));
+    }
+    // A header-only store beside an unrelated `<path>.0.data` is just a store.
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        {
+            var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+            db.close();
+        }
+        try sim.installFile("db.0.data", "unrelated");
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try testing.expectEqual(@as(usize, 0), db.count());
+        try testing.expect(!db.multi);
+    }
+    // A reader never finishes a migration, even over a torn `<path>`.
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        try sim.installFile("db", "ZKV");
+        try sim.installFile("db.0.data", "ZKVL\x02\x00\x00\x00");
+        try sim.installFile("db.manifest", "temp");
+        var r = try Db.open(testing.allocator, sim.storage(), "db", .{ .read_only = true });
+        defer r.close();
+        try testing.expectEqualSlices(u8, "ZKV", sim.fileContent("db").?);
+        try testing.expect(sim.fileContent("db.manifest") != null);
+    }
+    // The handle of the half-migrated `<path>` is closed once it is replaced.
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        try twoFileStore(&sim);
+        try sim.installFile("db.manifest", sim.fileContent("db").?);
+        try sim.storage().delete("db");
+        var spy: SpyStorage = .{ .inner = sim.storage() };
+        {
+            var db = try Db.open(testing.allocator, spy.storage(), "db", .{ .max_file_size = 64 });
+            defer db.close();
+            try expectGet(&db, "a", v30);
+        }
+        try testing.expectEqual(@as(isize, 0), spy.live_handles);
+    }
+}
+
+test "refresh: a reader takes over the writer's file layout, not just its keys" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var w = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 64 });
+    defer w.close();
+    try w.put("a", "x");
+    var r = try Db.open(testing.allocator, sim.storage(), "db", .{ .read_only = true });
+    defer r.close();
+    try testing.expect(!r.multi);
+    try w.put("b", v30);
+    try w.put("c", v30);
+    try testing.expect(w.multi);
+    try r.refresh();
+    try testing.expect(r.multi);
+    try testing.expectEqual(w.next_file_id, r.next_file_id);
+    try testing.expectEqual(w.dead_bytes, r.dead_bytes);
+    try expectGet(&r, "c", v30);
+}
+
+test "manifest: the temp lists obsolete and pending files, and is cut to its length" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    try db.obsolete.append(testing.allocator, 7);
+    try db.pending.append(testing.allocator, 9);
+    try db.writeManifestTemp(&.{ 3, 4 }, 12);
+    const m = sim.fileContent("db.manifest").?;
+    try testing.expectEqual(@as(usize, header_len + 12 + 4 * 4 + 4), m.len);
+    try testing.expectEqualSlices(u8, file_magic, m[0..4]);
+    try testing.expectEqual(version_manifest, std.mem.readInt(u32, m[4..8], .little));
+    const want = [_]u32{ 12, 2, 2, 3, 4, 7, 9 };
+    for (want, 0..) |w, i| try testing.expectEqual(w, std.mem.readInt(u32, m[8 + 4 * i ..][0..4], .little));
+    try testing.expectEqual(std.hash.Crc32.hash(m[0 .. m.len - 4]), std.mem.readInt(u32, m[m.len - 4 ..][0..4], .little));
+    // A later, shorter manifest replaces it whole: no tail of the old one.
+    db.obsolete.clearRetainingCapacity();
+    db.pending.clearRetainingCapacity();
+    try db.writeManifestTemp(&.{3}, 12);
+    const m2 = sim.fileContent("db.manifest").?;
+    try testing.expectEqual(@as(usize, header_len + 12 + 4 + 4), m2.len);
+}
+
+test "stale files at the name of a new file are emptied, never extended" {
+    const junk: [300]u8 = @splat(0xAB);
+    // A merge output: a sealed file with a tail of junk would be refused.
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        {
+            var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 100 });
+            defer db.close();
+            for ([_][]const u8{ "a", "b", "c", "d", "e" }) |k| try db.put(k, v30);
+            // A stray that appeared after `open` swept the namespace.
+            var nb: [24]u8 = undefined;
+            try sim.installFile(try std.mem.print(&nb, "db.{d}.data", .{db.next_file_id}), &junk);
+            try db.compact();
+        }
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 100 });
+        defer db.close();
+        try testing.expectEqual(@as(usize, 5), db.count());
+        try expectGet(&db, "a", v30);
+    }
+    // The single-file compaction temp.
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("a", v30);
+        try db.put("b", v30);
+        try sim.installFile("db.compact", &junk);
+        try db.compact();
+        try testing.expectEqual(@as(usize, header_len + 2 * (rec_fixed + 1 + 30)), sim.fileContent("db").?.len);
+    }
+}
+
+/// Six keys "k0".."k5" in a multi-file store, compacted: every output has a hint.
+/// Returns the id of the first (sealed) output.
+fn hintedSixKeys(sim: *SimStorage, options: Options) !u32 {
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    defer db.close();
+    for (0..6) |i| {
+        var k: [4]u8 = undefined;
+        try db.put(try std.mem.print(&k, "k{d}", .{i}), v30);
+    }
+    try db.compact();
+    return db.files.items[0].id;
+}
+
+const HintForgery = enum { magic, ghost_entry, junk_tail, op_unknown, del_with_value, key_len_lie };
+
+/// `good` (a hint) with one defect and a CRC that still holds.
+fn forgeHint(gpa: Allocator, good: []const u8, kind: HintForgery) ![]u8 {
+    const tail_at = good.len - 12; // data length u64, CRC u32
+    const old_data_len = std.mem.readInt(u64, good[tail_at..][0..8], .little);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, good[0..tail_at]);
+    var data_len = old_data_len;
+    switch (kind) {
+        .magic => out.items[0] ^= 1,
+        .ghost_entry => {
+            // An entry for a record past the end of the data file.
+            var e: [hint_entry_fixed + 2]u8 = undefined;
+            e[0] = op_put;
+            std.mem.writeInt(u32, e[1..5], 2, .little);
+            std.mem.writeInt(u32, e[5..9], 30, .little);
+            std.mem.writeInt(u64, e[9..17], old_data_len, .little);
+            std.mem.writeInt(i64, e[17..25], no_expiry, .little);
+            @memcpy(e[25..], "gh");
+            try out.appendSlice(gpa, &e);
+            data_len += recordLen(2, 30);
+        },
+        .junk_tail => try out.appendSlice(gpa, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }),
+        .op_unknown => out.items[header_len] = 7,
+        .del_with_value => out.items[header_len] = op_del,
+        .key_len_lie => {
+            // Last entry: a longer key and a shorter value, the same record
+            // length, but the hint holds no such key.
+            const last = tail_at - (hint_entry_fixed + 2);
+            std.mem.writeInt(u32, out.items[last + 1 ..][0..4], 10, .little);
+            std.mem.writeInt(u32, out.items[last + 5 ..][0..4], 22, .little);
+        },
+    }
+    var tail: [12]u8 = undefined;
+    std.mem.writeInt(u64, tail[0..8], data_len, .little);
+    try out.appendSlice(gpa, tail[0..8]);
+    try out.appendSlice(gpa, tail[8..12]);
+    const crc_at = out.items.len - 4;
+    std.mem.writeInt(u32, out.items[crc_at..][0..4], std.hash.Crc32.hash(out.items[0..crc_at]), .little);
+    return out.toOwnedSlice(gpa);
+}
+
+test "hints: a hint with any defect is refused, even one whose CRC holds" {
+    const options: Options = .{ .max_file_size = 100 };
+    // The data file of the first output has a rotten value: only a replay
+    // would notice, so an open that succeeds has used the hint.
+    for ([_]HintForgery{ .magic, .ghost_entry, .junk_tail, .op_unknown, .del_with_value, .key_len_lie }) |kind| {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        const first_id = try hintedSixKeys(&sim, options);
+        var hb: [16]u8 = undefined;
+        var db_b: [16]u8 = undefined;
+        const hint_name = try std.mem.print(&hb, "db.{d}.hint", .{first_id});
+        const data_name = try std.mem.print(&db_b, "db.{d}.data", .{first_id});
+        const forged = try forgeHint(testing.allocator, sim.fileContent(hint_name).?, kind);
+        defer testing.allocator.free(forged);
+        try sim.installFile(hint_name, forged);
+        const val_at = std.mem.find(u8, sim.fileContent(data_name).?, v30).?;
+        sim.flipByte(data_name, val_at + 3);
+        testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "db", options)) catch |e| {
+            std.debug.print("forgery {s} was accepted\n", .{@tagName(kind)});
+            return e;
+        };
+        // The forged hint alone, with sound data, costs nothing but a replay.
+        sim.flipByte(data_name, val_at + 3);
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        try testing.expectEqual(@as(usize, 6), db.count());
+        try expectGet(&db, "k1", v30);
+    }
+    // And the unforged one is used (the control for the rot).
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const first_id = try hintedSixKeys(&sim, options);
+    var db_b: [16]u8 = undefined;
+    const data_name = try std.mem.print(&db_b, "db.{d}.data", .{first_id});
+    sim.flipByte(data_name, std.mem.find(u8, sim.fileContent(data_name).?, v30).? + 3);
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    defer db.close();
+    try testing.expectEqual(@as(usize, 6), db.count());
+}
+
+test "hints: a file too short to hold one is replayed, whatever its bytes" {
+    const options: Options = .{ .max_file_size = 100 };
+    var len: usize = 0;
+    while (len <= hint_entry_fixed) : (len += 1) {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        const first_id = try hintedSixKeys(&sim, options);
+        var hb: [16]u8 = undefined;
+        const hint_name = try std.mem.print(&hb, "db.{d}.hint", .{first_id});
+        var junk: [hint_entry_fixed + 1]u8 = @splat(0);
+        @memcpy(junk[0..4], hint_magic);
+        std.mem.writeInt(u32, junk[4..8], hint_version, .little);
+        try sim.installFile(hint_name, junk[0..len]);
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        try testing.expectEqual(@as(usize, 6), db.count());
+    }
+}
+
+test "hints: records with an expiry are applied from the hint, and expired ones are dropped at open" {
+    var mc: ManualClock = .{ .now_ms = 0 };
+    const options: Options = .{ .max_file_size = 100, .clock = mc.clock() };
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var first_id: u32 = 0;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        for (0..4) |i| {
+            var k: [4]u8 = undefined;
+            try db.putExpiring(try std.mem.print(&k, "k{d}", .{i}), v30, 1_000_000);
+        }
+        try db.put("p", v30);
+        try db.compact();
+        first_id = db.files.items[0].id;
+    }
+    var db_b: [16]u8 = undefined;
+    const data_name = try std.mem.print(&db_b, "db.{d}.data", .{first_id});
+    sim.flipByte(data_name, std.mem.find(u8, sim.fileContent(data_name).?, v30).? + 3);
+    {
+        // Used, not replayed: the rot is never read.
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        try testing.expectEqual(@as(usize, 5), db.keydir.count());
+        try testing.expectEqual(@as(usize, 4), db.expiring);
+        try expectAccountingCounts(&db);
+    }
+    mc.now_ms = 2_000_000; // every expiring key is past its instant at open
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    defer db.close();
+    try testing.expectEqual(@as(usize, 1), db.keydir.count());
+    try testing.expectEqual(@as(usize, 0), db.expiring);
+}
+
+/// `expectAccounting` without the file-size sum (a rotten value is not read,
+/// so the file is not touched either way — this is just the counters).
+fn expectAccountingCounts(db: *Db) !void {
+    var live_keys: u64 = 0;
+    for (db.files.items) |df| live_keys += df.live_keys;
+    try testing.expectEqual(@as(u64, db.keydir.count()), live_keys);
+}
+
+test "merge: a marker is kept only for a key that is gone, and an expired record still leaves one" {
+    // 1. The expired record's older value sits in an unmerged file: no marker
+    //    would bring it back at the next open.
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var mc: ManualClock = .{ .now_ms = 0 };
+        const options: Options = .{ .clock = mc.clock() };
+        {
+            var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+            defer db.close();
+            try db.put("k", "old");
+            try db.rotateLocked();
+            try db.putExpiring("k", "new", 100);
+            try db.rotateLocked();
+            mc.now_ms = 200;
+            try db.merge(&.{db.files.items[1].id});
+            try expectGet(&db, "k", null);
+            try expectAccounting(&db);
+        }
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        try expectGet(&db, "k", null);
+        try testing.expectEqual(@as(usize, 0), db.count());
+    }
+    // 2. A deletion marker for a key that was written again since needs no copy.
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("x", "1");
+        try db.rotateLocked();
+        try db.put("a", "1");
+        try db.delete("a");
+        try db.rotateLocked();
+        try db.put("a", "2");
+        try testing.expectEqual(@as(usize, 3), db.files.items.len);
+        try db.merge(&.{db.files.items[1].id});
+        try testing.expectEqual(@as(usize, 2), db.files.items.len); // nothing live, no marker: no output
+        try expectGet(&db, "a", "2");
+        try expectAccounting(&db);
+    }
+}
+
+test "merge: the output has a hint that open uses; a failed delete of a merged file is retried at open" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var spy: SpyStorage = .{ .inner = sim.storage() };
+    const options: Options = .{ .max_file_size = 100 };
+    var merged: [2]u32 = undefined;
+    var out_id: u32 = 0;
+    {
+        var db = try Db.open(testing.allocator, spy.storage(), "db", options);
+        defer db.close();
+        for (0..6) |i| {
+            var k: [4]u8 = undefined;
+            try db.put(try std.mem.print(&k, "k{d}", .{i}), v30);
+        }
+        try testing.expect(db.files.items.len >= 3);
+        merged = .{ db.files.items[0].id, db.files.items[1].id };
+        out_id = db.next_file_id;
+        spy.fail_delete = true;
+        try db.merge(&merged);
+        spy.fail_delete = false;
+        // Deleting the merged files failed: the books still list them.
+        try testing.expectEqual(@as(usize, 2), db.obsolete.items.len);
+        try expectAccounting(&db);
+        // A rotation writes the manifest again; it lists them as obsolete.
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            var k: [4]u8 = undefined;
+            try db.put(try std.mem.print(&k, "n{d}", .{i}), v30);
+        }
+        const m = sim.fileContent("db").?;
+        const n_files = std.mem.readInt(u32, m[12..16], .little);
+        try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, m[16..20], .little));
+        for (0..2) |j| {
+            const id = std.mem.readInt(u32, m[20 + 4 * (n_files + j) ..][0..4], .little);
+            try testing.expect(id == merged[0] or id == merged[1]);
+        }
+    }
+    var nb: [24]u8 = undefined;
+    for (merged) |id| try testing.expect(sim.fileContent(dataName(&nb, id)) != null);
+    // The merge output carries a hint, and an open uses it: rot in its data
+    // is never read.
+    var hb: [24]u8 = undefined;
+    const hint_name = try std.mem.print(&hb, "db.{d}.hint", .{out_id});
+    try testing.expect(sim.fileContent(hint_name) != null);
+    const out_name = dataName(&nb, out_id);
+    sim.flipByte(out_name, std.mem.find(u8, sim.fileContent(out_name).?, v30).? + 3);
+    var db = try Db.open(testing.allocator, spy.storage(), "db", options);
+    defer db.close();
+    try testing.expectEqual(@as(usize, 10), db.count());
+    for (merged) |id| try testing.expect(sim.fileContent(dataName(&nb, id)) == null);
+}
+
+test "merge: copies of keys rewritten or deleted meanwhile are dead weight; the manifest written meanwhile lists the output" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var gate: GateStorage = .{ .inner = sim.storage() };
+    var db = try Db.open(testing.allocator, gate.storage(), "db", .{ .max_file_size = 100, .sync = .none });
+    defer db.close();
+    for ([_][]const u8{ "a", "b", "c", "d", "e" }) |k| try db.put(k, v30);
+    const stats = try db.fileStats(testing.allocator);
+    defer testing.allocator.free(stats);
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(testing.allocator);
+    for (stats) |st| if (!st.active) try ids.append(testing.allocator, st.id);
+    try testing.expectEqual(@as(usize, 2), ids.items.len);
+    ids.shrinkRetainingCapacity(1); // F0 = a, b: one output, so the gate parks after the copy
+    const out_id = db.next_file_id;
+
+    gate.armed.store(true, .release);
+    const Merger = struct {
+        fn run(d: *Db, which: []const u32) void {
+            d.merge(which) catch unreachable;
+        }
+    };
+    {
+        const t = try std.Thread.spawn(.{}, Merger.run, .{ &db, ids.items });
+        defer t.join();
+        defer gate.open_gate.store(true, .release);
+        while (!gate.in_sync.load(.acquire)) try std.Thread.yield();
+        gate.armed.store(false, .release);
+        // "b" is rewritten into the active file at the offset its old record
+        // has in its sealed one; "a" is deleted. The delete's tombstone does
+        // not fit the active file: a rotation writes a manifest meanwhile.
+        try db.put("b", "rewritten during the merge");
+        try db.delete("a");
+        const m = sim.fileContent("db").?;
+        const n_files = std.mem.readInt(u32, m[12..16], .little);
+        const n_obs = std.mem.readInt(u32, m[16..20], .little);
+        var listed = false;
+        for (0..n_obs) |j| {
+            if (std.mem.readInt(u32, m[20 + 4 * (n_files + j) ..][0..4], .little) == out_id) listed = true;
+        }
+        try testing.expect(listed);
+    }
+    try expectGet(&db, "a", null);
+    try expectGet(&db, "b", "rewritten during the merge");
+    try expectGet(&db, "c", v30);
+    try expectGet(&db, "d", v30);
+    try expectGet(&db, "e", v30);
+    try expectAccounting(&db);
+}
+
+test "failures: a namespace change that fails poisons the store, and what it named is kept" {
+    // single-file compaction: rename, then directory sync
+    inline for (.{ "rename", "sync_dir" }) |which| {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var spy: SpyStorage = .{ .inner = sim.storage() };
+        var db = try Db.open(testing.allocator, spy.storage(), "db", .{});
+        defer db.close();
+        try db.put("a", v30);
+        @field(spy, "fail_" ++ which) = true;
+        try testing.expectError(error.InputOutput, db.compact());
+        try testing.expect(db.poisoned);
+        try testing.expectError(error.Poisoned, db.put("b", v30));
+        try expectGet(&db, "a", v30);
+    }
+    // a rotation (here: the migration)
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var spy: SpyStorage = .{ .inner = sim.storage() };
+        var db = try Db.open(testing.allocator, spy.storage(), "db", .{ .max_file_size = 64 });
+        defer db.close();
+        try db.put("a", v30);
+        spy.fail_rename = true;
+        try testing.expectError(error.InputOutput, db.put("b", v30));
+        try testing.expect(db.poisoned);
+        try testing.expectError(error.Poisoned, db.put("c", v30));
+    }
+    // merge and multi-file compaction, at the rename and at the directory sync
+    inline for (.{ "merge", "compact" }) |op| {
+        inline for (.{ "rename", "sync_dir" }) |which| {
+            var sim = SimStorage.init(testing.allocator);
+            defer sim.deinit();
+            var spy: SpyStorage = .{ .inner = sim.storage() };
+            const options: Options = .{ .max_file_size = 100 };
+            var out_first: u32 = 0;
+            {
+                var db = try Db.open(testing.allocator, spy.storage(), "db", options);
+                defer db.close();
+                for ([_][]const u8{ "a", "b", "c", "d", "e" }) |k| try db.put(k, v30);
+                out_first = db.next_file_id;
+                @field(spy, "fail_" ++ which) = true;
+                const r = if (comptime std.mem.eql(u8, op, "merge")) db.merge(&.{ db.files.items[0].id, db.files.items[1].id }) else db.compact();
+                try testing.expectError(error.InputOutput, r);
+                try testing.expect(db.poisoned);
+                try testing.expectError(error.Poisoned, db.put("f", v30));
+                // From the manifest rename on the outputs may be what `<path>`
+                // names: a failure there leaves them, and the next open decides.
+                var nb: [24]u8 = undefined;
+                try testing.expect(sim.fileContent(dataName(&nb, out_first)) != null);
+            }
+            spy.fail_rename = false;
+            spy.fail_sync_dir = false;
+            var db = try Db.open(testing.allocator, spy.storage(), "db", options);
+            defer db.close();
+            try testing.expectEqual(@as(usize, 5), db.count());
+            for ([_][]const u8{ "a", "b", "c", "d", "e" }) |k| try expectGet(&db, k, v30);
+        }
+    }
+}
+
+test "failures: a merge or compaction that fails midway leaves no output, no handle and no pending id" {
+    inline for (.{ "merge", "compact" }) |op| {
+        var fail_at: usize = 0;
+        while (fail_at < 5) : (fail_at += 1) {
+            var sim = SimStorage.init(testing.allocator);
+            defer sim.deinit();
+            var spy: SpyStorage = .{ .inner = sim.storage() };
+            {
+                var db = try Db.open(testing.allocator, spy.storage(), "db", .{ .max_file_size = 100 });
+                defer db.close();
+                for ([_][]const u8{ "a", "b", "c", "d", "e" }) |k| try db.put(k, v30);
+                const first_new = db.next_file_id;
+                spy.fail_write_in = fail_at;
+                const r = if (comptime std.mem.eql(u8, op, "merge")) db.merge(&.{ db.files.items[0].id, db.files.items[1].id }) else db.compact();
+                try testing.expectError(error.InputOutput, r);
+                spy.fail_write_in = null;
+                try testing.expect(!db.poisoned);
+                try testing.expectEqual(@as(usize, 0), db.pending.items.len);
+                var nb: [24]u8 = undefined;
+                var id = first_new;
+                while (id < db.next_file_id) : (id += 1) try testing.expect(sim.fileContent(dataName(&nb, id)) == null);
+                for ([_][]const u8{ "a", "b", "c", "d", "e" }) |k| try expectGet(&db, k, v30);
+                try expectAccounting(&db);
+            }
+            try testing.expectEqual(@as(isize, 0), spy.live_handles);
+        }
+    }
+}
+
+test "failures: a poisoned store does not sync at close; compaction is a durability barrier" {
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var spy: SpyStorage = .{ .inner = sim.storage() };
+        var db = try Db.open(testing.allocator, spy.storage(), "db", .{ .sync = .none });
+        try db.put("a", v30);
+        spy.fail_write_in = 0;
+        try testing.expectError(error.InputOutput, db.put("b", v30));
+        try testing.expect(db.poisoned and db.unsynced);
+        const before = spy.syncs;
+        db.close();
+        try testing.expectEqual(before, spy.syncs);
+    }
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 64, .sync = .none });
+        defer db.close();
+        try db.put("a", v30);
+        try db.put("b", v30);
+        try testing.expect(db.multi and db.unsynced);
+        try db.compact();
+        try testing.expect(!db.unsynced);
+    }
+}
+
+test "iterators: pinned files outlive a merge until the last of them lets go" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var spy: SpyStorage = .{ .inner = sim.storage() };
+    {
+        var db = try Db.open(testing.allocator, spy.storage(), "db", .{ .max_file_size = 100 });
+        defer db.close();
+        for ([_][]const u8{ "a", "b", "c", "d", "e" }) |k| try db.put(k, v30);
+        var it1 = try db.iterator(testing.allocator, "");
+        var it2 = try db.iterator(testing.allocator, "");
+        try testing.expectEqual(@as(usize, 5), it1.remaining());
+        _ = try it1.next();
+        try testing.expectEqual(@as(usize, 4), it1.remaining());
+        try db.merge(&.{ db.files.items[0].id, db.files.items[1].id });
+        it1.deinit(); // it2 still pins the retired files
+        try testing.expect(db.retired.items.len > 0);
+        var n: usize = 0;
+        while (try it2.next()) |p| {
+            try testing.expectEqualSlices(u8, v30, p.value);
+            n += 1;
+        }
+        try testing.expectEqual(@as(usize, 5), n);
+        it2.deinit();
+        try testing.expectEqual(@as(usize, 0), db.retired.items.len);
+    }
+    try testing.expectEqual(@as(isize, 0), spy.live_handles);
+}
+
+test "iterators: many keys in one file; an allocation failure leaves nothing pinned or leaked" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 1 << 20 });
+    defer db.close();
+    for (0..200) |i| {
+        var k: [8]u8 = undefined;
+        try db.put(try std.mem.print(&k, "key{d:0>3}", .{i}), "v");
+    }
+    {
+        var it = try db.iterator(testing.allocator, "key");
+        defer it.deinit();
+        try testing.expectEqual(@as(usize, 200), it.remaining());
+    }
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
+        if (db.iterator(fa.allocator(), "key")) |it_ok| {
+            var it = it_ok;
+            it.deinit();
+            break;
+        } else |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            for (db.files.items) |df| try testing.expectEqual(@as(u32, 0), df.pins.load(.monotonic));
+        }
+    }
+    try testing.expect(fail_index > 3);
+}
+
+test "expiry: a clock at the end of i64 time hides the expiring keys and only those" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 0 };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+    defer db.close();
+    try db.put("a", "1");
+    try db.putExpiring("b", "2", 1000);
+    mc.now_ms = std.math.maxInt(i64);
+    const ks = try db.keys(testing.allocator, "");
+    defer ks.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), ks.keys.len);
+    try testing.expectEqualStrings("a", ks.keys[0]);
+    var it = try db.iterator(testing.allocator, "");
+    defer it.deinit();
+    try testing.expectEqual(@as(usize, 1), it.remaining());
+    try testing.expect(db.exists("a"));
+    try testing.expect(!db.exists("b"));
+}
+
+test "FileStat and fileStats: fragmentation of an empty file, the single file's id, expired keys" {
+    const empty: Db.FileStat = .{ .id = 0, .size = header_len, .live_keys = 0, .live_bytes = 0, .dead_keys = 0, .dead_bytes = 0, .active = false };
+    try testing.expectEqual(@as(u8, 0), empty.fragmentation());
+    const half: Db.FileStat = .{ .id = 0, .size = 0, .live_keys = 1, .live_bytes = 0, .dead_keys = 1, .dead_bytes = 0, .active = false };
+    try testing.expectEqual(@as(u8, 50), half.fragmentation());
+
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 0 };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+    defer db.close();
+    try db.put("a", v30);
+    try db.putExpiring("b", v30, 100);
+    {
+        const stats = try db.fileStats(testing.allocator);
+        defer testing.allocator.free(stats);
+        try testing.expectEqual(@as(usize, 1), stats.len);
+        try testing.expectEqual(@as(u32, 0), stats[0].id); // not the single-file marker
+        try testing.expectEqual(@as(u64, 2), stats[0].live_keys);
+    }
+    mc.now_ms = 200;
+    const stats = try db.fileStats(testing.allocator);
+    defer testing.allocator.free(stats);
+    try testing.expectEqual(@as(u64, 1), stats[0].live_keys);
+    try testing.expectEqual(@as(u64, rec_fixed + 1 + 30), stats[0].live_bytes);
+    try testing.expectEqual(@as(u64, rec_fixed + exp_len + 1 + 30), stats[0].dead_bytes);
+}
+
+test "merge: mergePlan's dead-bytes threshold takes a file at exactly that many bytes" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 100 });
+    defer db.close();
+    // F0 = a, b (both overwritten later: 88 dead bytes), F1 = c, d (one dead), F2 = a, b, c.
+    for ([_][]const u8{ "a", "b", "c", "d" }) |k| try db.put(k, v30);
+    try db.put("a", v30);
+    try db.put("b", v30);
+    try db.put("c", v30);
+    const stats = try db.fileStats(testing.allocator);
+    defer testing.allocator.free(stats);
+    try testing.expectEqual(@as(u64, 88), stats[0].dead_bytes);
+    // Only the dead-bytes thresholds can fire: fragmentation and size are off.
+    var t: Db.MergeThresholds = .{ .trigger_fragmentation = 255, .trigger_dead_bytes = 88, .threshold_fragmentation = 255, .threshold_dead_bytes = 88, .small_file = 0 };
+    const plan = (try db.mergePlan(testing.allocator, t)).?;
+    defer testing.allocator.free(plan);
+    try testing.expectEqual(@as(usize, 1), plan.len);
+    try testing.expectEqual(stats[0].id, plan[0]);
+    t.trigger_dead_bytes = 89;
+    t.threshold_dead_bytes = 88;
+    try testing.expect((try db.mergePlan(testing.allocator, t)) == null);
+    t.trigger_dead_bytes = 44;
+    t.threshold_dead_bytes = 89;
+    const plan3 = (try db.mergePlan(testing.allocator, t)) orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(plan3);
+    try testing.expectEqual(@as(usize, 0), plan3.len); // due, but no file reaches 89
+}
+
+test "spin locks: a writer excludes readers and writers, readers exclude a writer" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const T = struct {
+        fn reader(l: *RwLock, entered: *std.atomic.Value(bool)) void {
+            l.lockShared();
+            entered.store(true, .release);
+            l.unlockShared();
+        }
+        fn writer(l: *RwLock, entered: *std.atomic.Value(bool)) void {
+            l.lock();
+            entered.store(true, .release);
+            l.unlock();
+        }
+        /// True when the thread got in within a generous spell of yields.
+        fn gotIn(entered: *std.atomic.Value(bool)) bool {
+            var i: usize = 0;
+            while (i < 20_000) : (i += 1) {
+                if (entered.load(.acquire)) return true;
+                std.Thread.yield() catch {};
+            }
+            return false;
+        }
+    };
+    // A writer is inside: a reader and a second writer both wait.
+    inline for (.{ T.reader, T.writer }) |body| {
+        var l: RwLock = .{ .io = null };
+        var entered: std.atomic.Value(bool) = .init(false);
+        l.lock();
+        const t = try std.Thread.spawn(.{}, body, .{ &l, &entered });
+        const early = T.gotIn(&entered);
+        l.unlock();
+        t.join();
+        try testing.expect(!early);
+        try testing.expect(entered.load(.acquire));
+    }
+    // A reader is inside: a writer waits.
+    {
+        var l: RwLock = .{ .io = null };
+        var entered: std.atomic.Value(bool) = .init(false);
+        l.lockShared();
+        const t = try std.Thread.spawn(.{}, T.writer, .{ &l, &entered });
+        const early = T.gotIn(&entered);
+        l.unlockShared();
+        t.join();
+        try testing.expect(!early);
+        try testing.expect(entered.load(.acquire));
+    }
+}
+
+test "sync policy: .interval_ms counts from open, not from time zero" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 1_000_000 };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .sync = .{ .interval_ms = 1000 }, .sync_clock = mc.clock() });
+    defer db.close();
+    try db.put("a", "1");
+    try testing.expect(db.unsynced); // no time has passed since open: not due
+    mc.now_ms += 1000;
+    try db.put("b", "1");
+    try testing.expect(!db.unsynced); // exactly the interval: due
+}
+
+test "Storage.preadFull: a short file is Corrupt, never a hang" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const st = sim.storage();
+    const h = try st.open("f", .open_or_create);
+    defer st.close(h);
+    try st.writeAll(h, "abcd", 0);
+    var buf: [8]u8 = undefined;
+    try testing.expectError(error.Corrupt, st.preadFull(h, &buf, 0));
+    try st.preadFull(h, buf[0..2], 2);
+    try testing.expectEqualSlices(u8, "cd", buf[0..2]);
+}
+
+test "put: a key or value past u32 is refused before anything is read or allocated" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var db = try Db.open(fa.allocator(), sim.storage(), "db", .{});
+    defer db.close();
+    var byte: u8 = 'x';
+    const base: [*]const u8 = @ptrCast(&byte);
+    const max = std.math.maxInt(u32);
+    // The slices are never dereferenced: the length checks come first, and
+    // the allocation of the record that follows them is made to fail.
+    fa.fail_index = fa.alloc_index;
+    try testing.expectError(error.KeyTooLong, db.put(base[0 .. max + 1], "v"));
+    try testing.expectError(error.ValueTooLong, db.put("k", base[0 .. max + 1]));
+    try testing.expectError(error.OutOfMemory, db.put(base[0..max], "v"));
+    try testing.expectError(error.OutOfMemory, db.put("k", base[0..max]));
+}
+
+test "recovery: cutting a torn tail makes the records before it durable" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    {
+        // A writer whose process dies: its records are in the OS cache, not on media.
+        var dead = try Db.open(arena.allocator(), sim.storage(), "db", .{ .sync = .none, .lock = .none });
+        try dead.put("a", v30);
+        try dead.put("b", v30);
+    }
+    const h = try sim.storage().open("db", .open_or_create);
+    try sim.storage().writeAll(h, "\x05\x06\x07", try sim.storage().size(h)); // a torn append
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .lock = .none });
+        defer db.close();
+        try testing.expectEqual(@as(usize, 2), db.count());
+    }
+    // Power loss now: only what the recovery made durable is left.
+    sim.ops_until_crash = 0;
+    try testing.expectError(error.Crashed, sim.storage().sync(h));
+    sim.reboot();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .lock = .none });
+    defer db.close();
+    try testing.expectEqual(@as(usize, 2), db.count());
+    try expectGet(&db, "a", v30);
+}
+
+test "get: a record past the stack buffer is checked against the entry that found it" {
+    var big_a: [5000]u8 = undefined;
+    for (&big_a, 0..) |*c, i| c.* = @truncate(i *% 31 +% 7);
+    // Rot in the value.
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("k", &big_a);
+        try expectGet(&db, "k", &big_a);
+        sim.flipByte("db", header_len + rec_fixed + 1 + 2500);
+        try testing.expectError(error.Corrupt, db.get(testing.allocator, "k"));
+    }
+    // An entry pointing at another key's record of the same shape.
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("a1", &big_a);
+        try db.put("a2", &big_a);
+        db.keydir.getPtr("a1").?.off = db.keydir.get("a2").?.off;
+        try testing.expectError(error.Corrupt, db.get(testing.allocator, "a1"));
+    }
+    // An entry whose lengths are not the record's, the record's bytes and
+    // CRC being sound and the bytes the entry would read being the very
+    // ones the record's CRC covers.
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("a", &big_a);
+        try db.put("ab", big_a[0..4999]);
+        db.keydir.getPtr("a").?.off = db.keydir.get("ab").?.off;
+        try testing.expectError(error.Corrupt, db.get(testing.allocator, "a"));
+    }
+}
+
+test "real filesystem: create_truncate empties an existing file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs = FsStorage.init(testing.io, tmp.dir);
+    const st = fs.storage();
+    const h = try st.open("f", .open_or_create);
+    try st.writeAll(h, "0123456789", 0);
+    st.close(h);
+    const h2 = try st.open("f", .create_truncate);
+    defer st.close(h2);
+    try testing.expectEqual(@as(u64, 0), try st.size(h2));
+}
+
+/// A clock that counts its readings.
+const CountClock = struct {
+    reads: usize = 0,
+
+    fn clock(cc: *CountClock) Clock {
+        return .{ .ctx = cc, .nowFn = nowFn };
+    }
+
+    fn nowFn(ctx: ?*anyopaque) i64 {
+        const cc: *CountClock = @ptrCast(@alignCast(ctx.?));
+        cc.reads += 1;
+        return 0;
+    }
+};
+
+test "expiry: compacting a multi-file store without expiring keys never reads the clock" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var cc: CountClock = .{};
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 64, .clock = cc.clock() });
+    defer db.close();
+    try db.put("a", v30);
+    try db.put("b", v30);
+    try db.put("c", v30);
+    try testing.expect(db.multi);
+    const before = cc.reads;
+    try db.compact();
+    try testing.expectEqual(before, cc.reads);
+    try expectGet(&db, "c", v30);
+}
+
+test "replay: a CRC-valid record with an op byte this module never writes ends the log there" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("a", v30);
+    }
+    const good_len = sim.fileContent("db").?.len;
+    var rec: [rec_fixed + 3 + 1]u8 = undefined;
+    encodeRecord(&rec, 5, "bad", "v");
+    try sim.appendDurable("db", &rec);
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    try expectGet(&db, "bad", null);
+    try testing.expectEqual(@as(usize, 1), db.count());
+    try testing.expectEqual(good_len, sim.fileContent("db").?.len); // the tail was cut
+}
