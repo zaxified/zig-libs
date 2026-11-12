@@ -3709,7 +3709,10 @@ pub const Server = struct {
     /// where its author sees it, instead.
     pub fn addTool(self: *Server, tool: Tool) (error{DuplicateTool} || header_annotations.Error)!void {
         if (self.findTool(tool.name) != null) return error.DuplicateTool;
-        try header_annotations.validate(self.gpa, tool.input_schema);
+        // The depth cap first: a schema nested past `max_literal_depth` is
+        // treated as not JSON everywhere else (`tools/list` reports it), so it
+        // is not parsed here either — the annotation check skips non-JSON.
+        if (literalDepthOk(tool.input_schema)) try header_annotations.validate(self.gpa, tool.input_schema);
         const check = try ToolCheck.init(self.gpa, tool);
         errdefer check.deinit(self.gpa);
         try self.tool_checks.ensureUnusedCapacity(self.gpa, 1);
@@ -14003,4 +14006,26 @@ fn oomBigListen(gpa: std.mem.Allocator) !void {
     for (0..20) |i| try line.print(testing.allocator, "{s}\"{s}\"", .{ if (i == 0) "" else ",", &big });
     try line.appendSlice(testing.allocator, "]}}}");
     try s.handleMessage(line.items, &out.writer);
+}
+
+test "addTool: a schema past the literal depth cap is not parsed for annotations" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    // An annotation that breaks the rules at the root, inside a schema nested
+    // one level past `max_literal_depth`: that schema is not JSON to this
+    // module, so the annotation check does not parse it (the cap comes first).
+    const depth = max_literal_depth + 1;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try text.appendSlice(testing.allocator, "{\"type\":\"object\",\"x-mcp-header\":\"H\",\"d\":");
+    try text.appendNTimes(testing.allocator, '[', depth - 1);
+    try text.appendNTimes(testing.allocator, ']', depth - 1);
+    try text.append(testing.allocator, '}');
+    try testing.expect(!literalDepthOk(text.items));
+    try s.addTool(.{ .name = "deep", .description = "", .input_schema = text.items, .handler = flagTool });
+    // One level shallower is within the cap and is judged.
+    _ = text.orderedRemove(text.items.len - 2);
+    _ = text.orderedRemove(text.items.len - 2 - (depth - 2));
+    try testing.expect(literalDepthOk(text.items));
+    try testing.expectError(error.HeaderAnnotationNotReachable, s.addTool(.{ .name = "shallow", .description = "", .input_schema = text.items, .handler = flagTool }));
 }
