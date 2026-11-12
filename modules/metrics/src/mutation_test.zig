@@ -281,3 +281,32 @@ test "Endpoint: with max_in_flight set a GET under the limit still serves the ex
     const bad = runWire(&r, "POST /metrics HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &buf2);
     try testing.expect(std.ascii.findIgnoreCase(bad, "content-type: text/plain\r\n") != null);
 }
+
+fn hBoomAfterHead(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(202);
+    try ctx.res.writeAll("partial");
+    try ctx.res.flush();
+    return error.Boom;
+}
+
+fn hBoomBeforeHead(_: *router.Ctx) anyerror!void {
+    return error.Boom;
+}
+
+test "RequestMetrics: a handler error counts the status already on the wire, or 500 when nothing was sent" {
+    var reg = metrics.Registry.init(testing.allocator);
+    defer reg.deinit();
+    var rm = try metrics.RequestMetrics.init(&reg, .{});
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(rm.middleware());
+    try r.get("/late", hBoomAfterHead);
+    try r.get("/early", hBoomBeforeHead);
+    var buf: [4096]u8 = undefined;
+    _ = runWire(&r, "GET /late HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+    _ = runWire(&r, "GET /early HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+    const out = try render(&reg, false);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "http_requests_total{method=\"get\",code=\"2xx\"} 1\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "http_requests_total{method=\"get\",code=\"5xx\"} 1\n") != null);
+}
