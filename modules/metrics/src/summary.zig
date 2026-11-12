@@ -666,3 +666,51 @@ test "epsilon at the registry's minimum keeps the stream bounded (sweep ME-4)" {
     // 402 entries measured (2026-10-29); epsilon 0 would keep all 200k.
     try testing.expect(s.streams[s.head].l.items.len < 2000);
 }
+
+// ── mutation run 2026-11-11: tests for the survivors ────────────────────────
+
+test "validation: NaN epsilon is refused like NaN quantile" {
+    try testing.expectError(error.InvalidEpsilon, Summary.init(testing.allocator, .{ .objectives = &.{.{ .quantile = 0.5, .epsilon = nan }} }));
+}
+
+test "query: a one-sample compressed list answers from the list, not the empty buffer" {
+    const a = testing.allocator;
+    const targets = [_]Objective{.{ .quantile = 0.5, .epsilon = 0.05 }};
+    var st: Stream = .{};
+    defer st.deinit(a);
+    try st.merge(a, &targets, &.{5.0});
+    try testing.expectEqual(@as(usize, 1), st.l.items.len);
+    try testing.expectEqual(@as(usize, 0), st.b.items.len);
+    try testing.expectEqual(@as(f64, 5.0), st.query(a, &targets, 0.5));
+}
+
+test "snapshot before any observation anchors the window (it starts at the first timed call)" {
+    var s = try Summary.init(testing.allocator, .{ .objectives = &.{.{ .quantile = 0.5, .epsilon = 0.05 }}, .max_age_ns = 500, .age_buckets = 5 });
+    defer s.deinit();
+    var q: [1]f64 = undefined;
+    _ = s.snapshot(0, &q); // anchored at 0: the head bucket ends at 100
+    s.observe(7, 99);
+    _ = s.snapshot(50, &q);
+    try testing.expectEqual(@as(f64, 7), q[0]);
+    // Anchored at 0 all five buckets have rotated by 550; anchored at the
+    // observation (99) only four would have.
+    _ = s.snapshot(550, &q);
+    try testing.expect(std.math.isNan(q[0]));
+}
+
+test "times at the top of u64 saturate instead of overflowing" {
+    var s = try Summary.init(testing.allocator, .{ .objectives = &.{.{ .quantile = 0.5, .epsilon = 0.05 }} });
+    defer s.deinit();
+    s.observe(1, std.math.maxInt(u64) - 1); // anchor: expires_ns would overflow
+    s.observe(2, std.math.maxInt(u64));
+    var q: [1]f64 = undefined;
+    const snap = s.snapshot(std.math.maxInt(u64), &q);
+    try testing.expectEqual(@as(u64, 2), snap.count);
+
+    var t = try Summary.init(testing.allocator, .{ .objectives = &.{.{ .quantile = 0.5, .epsilon = 0.05 }} });
+    defer t.deinit();
+    t.observe(1, 0);
+    t.observe(2, std.math.maxInt(u64)); // steps * bucket_ns + expires_ns overflows u64
+    const snap2 = t.snapshot(std.math.maxInt(u64), &q);
+    try testing.expectEqual(@as(u64, 2), snap2.count);
+}

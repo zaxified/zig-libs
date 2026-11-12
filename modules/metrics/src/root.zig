@@ -5150,6 +5150,7 @@ test {
     _ = @import("lead_test.zig");
     _ = @import("audit_test.zig");
     _ = @import("sweep_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
