@@ -12492,3 +12492,1515 @@ test "sweep 2026-10-28 M-3: brackets inside a string do not count toward max_jso
         \\
     );
 }
+
+// ── whole-module mutation run 2026-11-11: gaps it found ─────────────────────
+
+fn parseJsonText(arena: std.mem.Allocator, text: []const u8) !std.json.Value {
+    return std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+}
+
+test "mutation 2026-11-11: SamplingResult.parse refuses every malformed member and tells the block kinds apart" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    const bad = [_]struct { []const u8, SamplingResult.ParseError }{
+        .{ "5", error.MalformedResult },
+        .{ "{\"model\":\"m\",\"content\":{\"type\":\"text\",\"text\":\"x\"}}", error.MalformedResult }, // no role
+        .{ "{\"role\":5,\"model\":\"m\",\"content\":{\"type\":\"text\",\"text\":\"x\"}}", error.MalformedResult },
+        .{ "{\"role\":\"system\",\"model\":\"m\",\"content\":{\"type\":\"text\",\"text\":\"x\"}}", error.MalformedResult },
+        .{ "{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"x\"}}", error.MalformedResult }, // no model
+        .{ "{\"role\":\"user\",\"model\":5,\"content\":{\"type\":\"text\",\"text\":\"x\"}}", error.MalformedResult },
+        .{ "{\"role\":\"user\",\"model\":\"m\"}", error.MalformedResult }, // no content
+        .{ "{\"role\":\"user\",\"model\":\"m\",\"content\":\"x\"}", error.MalformedResult },
+        .{ "{\"role\":\"user\",\"model\":\"m\",\"content\":[{\"type\":\"text\",\"text\":\"x\"}]}", error.UnsupportedContent },
+        .{ "{\"role\":\"user\",\"model\":\"m\",\"content\":{\"type\":\"text\",\"text\":\"x\"},\"stopReason\":5}", error.MalformedResult },
+        .{ "{\"role\":\"user\",\"model\":\"m\",\"content\":{\"type\":5}}", error.MalformedResult },
+        .{ "{\"role\":\"user\",\"model\":\"m\",\"content\":{\"text\":\"x\"}}", error.MalformedResult },
+        .{ "{\"role\":\"user\",\"model\":\"m\",\"content\":{\"type\":\"text\"}}", error.MalformedResult },
+        .{ "{\"role\":\"user\",\"model\":\"m\",\"content\":{\"type\":\"text\",\"text\":5}}", error.MalformedResult },
+        .{ "{\"role\":\"user\",\"model\":\"m\",\"content\":{\"type\":\"video\",\"data\":\"d\",\"mimeType\":\"v\"}}", error.UnsupportedContent },
+        .{ "{\"role\":\"user\",\"model\":\"m\",\"content\":{\"type\":\"image\",\"mimeType\":\"v\"}}", error.MalformedResult },
+        .{ "{\"role\":\"user\",\"model\":\"m\",\"content\":{\"type\":\"image\",\"data\":\"d\"}}", error.MalformedResult },
+        .{ "{\"role\":\"user\",\"model\":\"m\",\"content\":{\"type\":\"image\",\"data\":5,\"mimeType\":\"v\"}}", error.MalformedResult },
+        .{ "{\"role\":\"user\",\"model\":\"m\",\"content\":{\"type\":\"audio\",\"data\":\"d\",\"mimeType\":5}}", error.MalformedResult },
+    };
+    for (bad) |c| try testing.expectError(c[1], SamplingResult.parse(try parseJsonText(a, c[0])));
+
+    const img = try SamplingResult.parse(try parseJsonText(a, "{\"role\":\"assistant\",\"model\":\"m\",\"content\":{\"type\":\"image\",\"data\":\"AAA=\",\"mimeType\":\"image/png\"},\"stopReason\":\"endTurn\"}"));
+    try testing.expect(img.content == .image);
+    try testing.expectEqualStrings("AAA=", img.content.image.data);
+    try testing.expectEqualStrings("image/png", img.content.image.mime_type);
+    try testing.expectEqual(Role.assistant, img.role);
+    try testing.expectEqualStrings("endTurn", img.stop_reason.?);
+    const au = try SamplingResult.parse(try parseJsonText(a, "{\"role\":\"user\",\"model\":\"m\",\"content\":{\"type\":\"audio\",\"data\":\"BBB=\",\"mimeType\":\"audio/wav\"}}"));
+    try testing.expect(au.content == .audio);
+    try testing.expectEqualStrings("audio/wav", au.content.audio.mime_type);
+    try testing.expectEqual(Role.user, au.role);
+    try testing.expect(au.stop_reason == null);
+    // `stopReason: null` is absent, not malformed.
+    const nul = try SamplingResult.parse(try parseJsonText(a, "{\"role\":\"user\",\"model\":\"m\",\"content\":{\"type\":\"text\",\"text\":\"x\"},\"stopReason\":null}"));
+    try testing.expect(nul.stop_reason == null);
+}
+
+test "mutation 2026-11-11: validateElicitationSchema — every malformed shape has its own refusal" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    const P = "{\"type\":\"object\",\"properties\":{\"x\":";
+    const bad = [_]struct { []const u8, SchemaError }{
+        .{ P ++ "{\"type\":\"string\",\"title\":5}}}", error.SchemaUnsupportedKeyword },
+        .{ P ++ "{\"type\":\"boolean\",\"description\":5}}}", error.SchemaUnsupportedKeyword },
+        .{ P ++ "{\"type\":5}}}", error.SchemaUnsupportedType },
+        .{ P ++ "{}}}", error.SchemaUnsupportedType },
+        .{ "{\"type\":5,\"properties\":{}}", error.SchemaTypeNotObject },
+        .{ "{\"type\":\"object\",\"properties\":5}", error.SchemaMissingProperties },
+        .{ "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}},\"required\":[1]}", error.SchemaBadRequired },
+        .{ "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}},\"required\":\"x\"}", error.SchemaBadRequired },
+        .{ P ++ "{\"type\":\"string\",\"minLength\":\"1\"}}}", error.SchemaBadBound },
+        .{ P ++ "{\"type\":\"string\",\"maxLength\":-1}}}", error.SchemaBadBound },
+        .{ P ++ "{\"type\":\"string\",\"pattern\":5}}}", error.SchemaUnsupportedKeyword },
+        .{ P ++ "{\"type\":\"string\",\"format\":\"ipv4\"}}}", error.SchemaBadFormat },
+        .{ P ++ "{\"type\":\"string\",\"enum\":\"a\"}}}", error.SchemaBadEnum },
+        .{ P ++ "{\"type\":\"string\",\"enum\":[\"a\"],\"enumNames\":\"x\"}}}", error.SchemaBadEnum },
+        .{ P ++ "{\"type\":\"string\",\"enum\":[\"a\"],\"enumNames\":[1]}}}", error.SchemaBadEnum },
+        .{ P ++ "{\"type\":\"string\",\"oneOf\":5}}}", error.SchemaBadEnum },
+        .{ P ++ "{\"type\":\"string\",\"oneOf\":[]}}}", error.SchemaBadEnum },
+        .{ P ++ "{\"type\":\"string\",\"oneOf\":[1]}}}", error.SchemaBadEnum },
+        .{ P ++ "{\"type\":\"string\",\"oneOf\":[{\"const\":\"a\",\"x\":1}]}}}", error.SchemaBadEnum },
+        .{ P ++ "{\"type\":\"string\",\"oneOf\":[{\"const\":\"a\",\"title\":1}]}}}", error.SchemaBadEnum },
+        .{ P ++ "{\"type\":\"number\",\"default\":\"x\"}}}", error.SchemaBadDefault },
+        .{ P ++ "{\"type\":\"integer\",\"default\":1.5}}}", error.SchemaBadDefault },
+        .{ P ++ "{\"type\":\"boolean\",\"minimum\":1}}}", error.SchemaUnsupportedKeyword },
+        .{ P ++ "{\"type\":\"array\",\"x\":1,\"items\":{\"type\":\"string\",\"enum\":[\"a\"]}}}}", error.SchemaUnsupportedKeyword },
+        .{ P ++ "{\"type\":\"array\",\"minItems\":-1,\"items\":{\"type\":\"string\",\"enum\":[\"a\"]}}}}", error.SchemaBadBound },
+        .{ P ++ "{\"type\":\"array\",\"maxItems\":-1,\"items\":{\"type\":\"string\",\"enum\":[\"a\"]}}}}", error.SchemaBadBound },
+        .{ P ++ "{\"type\":\"array\",\"items\":5}}}", error.SchemaBadItems },
+        .{ P ++ "{\"type\":\"array\",\"items\":{\"anyOf\":[{\"const\":\"a\"}],\"type\":\"string\"}}}}", error.SchemaBadItems },
+        .{ P ++ "{\"type\":\"array\",\"items\":{\"anyOf\":[]}}}}", error.SchemaBadItems },
+        .{ P ++ "{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[\"a\"],\"pattern\":\"x\"}}}}", error.SchemaBadItems },
+        .{ P ++ "{\"type\":\"array\",\"items\":{\"type\":5,\"enum\":[\"a\"]}}}}", error.SchemaBadItems },
+        .{ P ++ "{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":5}}}}", error.SchemaBadItems },
+        .{ P ++ "{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[]}}}}", error.SchemaBadItems },
+        .{ P ++ "{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[1]}}}}", error.SchemaBadItems },
+        .{ P ++ "{\"type\":\"array\",\"default\":\"x\",\"items\":{\"type\":\"string\",\"enum\":[\"a\"]}}}}", error.SchemaBadDefault },
+        .{ P ++ "{\"type\":\"array\",\"default\":[1],\"items\":{\"type\":\"string\",\"enum\":[\"a\"]}}}}", error.SchemaBadDefault },
+    };
+    for (bad) |c| testing.expectError(c[1], validateElicitationSchema(a, c[0])) catch |e| {
+        std.debug.print("schema: {s}\n", .{c[0]});
+        return e;
+    };
+    const good = [_][]const u8{
+        "{\"type\":\"object\",\"title\":\"t\",\"description\":\"d\",\"properties\":{\"x\":{\"type\":\"string\"}}}",
+        P ++ "{\"type\":\"string\",\"minLength\":0,\"maxLength\":0}}}",
+        P ++ "{\"type\":\"string\",\"format\":\"uri\"}}}",
+        P ++ "{\"type\":\"string\",\"format\":\"date\"}}}",
+        P ++ "{\"type\":\"string\",\"format\":\"date-time\"}}}",
+        P ++ "{\"type\":\"number\",\"minimum\":1.5,\"maximum\":2,\"default\":1.5}}}",
+        P ++ "{\"type\":\"integer\",\"default\":2}}}",
+        P ++ "{\"type\":\"array\",\"description\":\"d\",\"minItems\":0,\"maxItems\":0,\"items\":{\"type\":\"string\",\"enum\":[\"a\"]},\"default\":[\"a\"]}}}",
+    };
+    for (good) |g| try validateElicitationSchema(a, g);
+    // Nested deeper than `max_literal_depth` is not JSON as far as this goes.
+    const deep = try a.alloc(u8, 2 * (max_literal_depth + 20));
+    @memset(deep[0 .. deep.len / 2], '[');
+    @memset(deep[deep.len / 2 ..], ']');
+    try testing.expectError(error.SchemaNotJson, validateElicitationSchema(a, deep));
+}
+
+test "mutation 2026-11-11: URL safety — authority splitting and the scheme check, case-insensitively" {
+    try testing.expect(splitAuthority("[::1") == null);
+    try testing.expect(splitAuthority(":80") == null);
+    try testing.expect(splitAuthority("a[b") == null);
+    try testing.expect(splitAuthority("a]b") == null);
+    try testing.expect(splitAuthority("a:8x") == null);
+    try testing.expect(splitAuthority("[::1]x") == null);
+    const ok = splitAuthority("[::1]:8080/path").?;
+    try testing.expectEqualStrings("[::1]", ok.host);
+    try testing.expectEqualStrings("8080", ok.port);
+    // `#` ends the authority as well: the client opens localhost, not evil.example.
+    try testing.expect(isSafeElicitationUrl("http://localhost#@evil.example/"));
+    try testing.expect(isSafeElicitationUrl("HTTPS://example.com/x"));
+    try testing.expect(isSafeElicitationUrl("HTTP://LOCALHOST:3000/"));
+    try testing.expect(!isSafeElicitationUrl("HTTPS://"));
+    const nope: ClientResponse = .{ .id = 1, .kind = .sampling, .arena = testing.allocator, .payload = .{ .result = .null } };
+    try testing.expect(!nope.userRejected());
+}
+
+/// An unbuffered writer that records every byte it is given and how often it
+/// was flushed — the in-memory writers of the other tests make `flush` a no-op
+/// and so cannot tell a missing flush from a present one.
+const FlushProbe = struct {
+    writer: std.Io.Writer = .{ .vtable = &vtable, .buffer = &.{} },
+    flushes: usize = 0,
+    data: [4096]u8 = undefined,
+    len: usize = 0,
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain, .flush = flush };
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *FlushProbe = @fieldParentPtr("writer", w);
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            if (self.len + d.len > self.data.len) return error.WriteFailed;
+            @memcpy(self.data[self.len..][0..d.len], d);
+            self.len += d.len;
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| {
+            if (self.len + last.len > self.data.len) return error.WriteFailed;
+            @memcpy(self.data[self.len..][0..last.len], last);
+            self.len += last.len;
+            n += last.len;
+        }
+        return n;
+    }
+
+    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *FlushProbe = @fieldParentPtr("writer", w);
+        self.flushes += 1;
+    }
+
+    fn written(self: *const FlushProbe) []const u8 {
+        return self.data[0..self.len];
+    }
+};
+
+test "mutation 2026-11-11: every line the server writes is flushed — progress, responses, pushes" {
+    var p: FlushProbe = .{};
+    const prog: Progress = .{ .out = &p.writer, .token_json = "7" };
+    prog.report(1, 2, "hi");
+    try testing.expect(p.flushes == 1);
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":7,\"progress\":1,\"total\":2,\"message\":\"hi\"}}\n",
+        p.written(),
+    );
+
+    var s = testServer(null);
+    defer s.deinit();
+    var q: FlushProbe = .{};
+    try s.handleMessage("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}", &q.writer);
+    try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n", q.written());
+    try testing.expect(q.flushes == 1);
+
+    // `notifyListChanged` on a session peer.
+    var ps = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer ps.deinit();
+    ps.push = true;
+    var sink_out: FlushProbe = .{};
+    const Sink = struct {
+        probe: *FlushProbe,
+        fn writerFor(ctx: ?*anyopaque, peer: u64) ?*std.Io.Writer {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            return if (peer == 0) &self.probe.writer else null;
+        }
+    };
+    var sink_ctx: Sink = .{ .probe = &sink_out };
+    const sink: PushSink = .{ .ctx = &sink_ctx, .writerFor = Sink.writerFor };
+    var devnull: FlushProbe = .{};
+    try ps.handleMessage("{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}", &devnull.writer);
+    try ps.handleMessage("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}", &devnull.writer);
+    try testing.expectEqual(@as(usize, 1), ps.notifyListChanged(sink, .tools));
+    try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n", sink_out.written());
+    try testing.expect(sink_out.flushes == 1);
+}
+
+test "mutation 2026-11-11: a progress line that does not fit its 1 KiB buffer is dropped whole, never cut" {
+    var empty: FlushProbe = .{};
+    const prog: Progress = .{ .out = &empty.writer, .token_json = "7" };
+    prog.report(1, 2, "");
+    const overhead = empty.len; // the whole line with an empty message
+    const room = 1024 - overhead;
+    var msg: [1100]u8 = @splat('x');
+    {
+        var p: FlushProbe = .{};
+        const pr: Progress = .{ .out = &p.writer, .token_json = "7" };
+        pr.report(1, 2, msg[0..room]);
+        try testing.expectEqual(@as(usize, 1024), p.len); // fits exactly
+        try testing.expect(p.written()[1023] == '\n');
+    }
+    for ([_]usize{ 1, 2, 3, 4, 5, 60 }) |extra| {
+        var p: FlushProbe = .{};
+        const pr: Progress = .{ .out = &p.writer, .token_json = "7" };
+        pr.report(1, 2, msg[0 .. room + extra]);
+        try testing.expectEqual(@as(usize, 0), p.len);
+        try testing.expectEqual(@as(usize, 0), p.flushes);
+    }
+}
+
+/// What a handler saw of its request context, copied out of the per-message
+/// arena (which dies with the response).
+const Seen = struct {
+    text: [128]u8 = undefined,
+    len: usize = 0,
+    url: []const u8 = "",
+    sampling: []const u8 = "",
+    failed: bool = false,
+    cap_elicit: bool = false,
+
+    fn rec(self: *Seen, ci: ?ClientInfo, version: []const u8, elicit: bool) void {
+        const s = std.fmt.bufPrint(&self.text, "{s} {s} {}", .{ if (ci) |c| c.name else "?", version, elicit }) catch unreachable;
+        self.len = s.len;
+    }
+
+    fn said(self: *const Seen) []const u8 {
+        return self.text[0..self.len];
+    }
+};
+
+fn errName(r: anytype) []const u8 {
+    return if (r) |_| "ok" else |e| @errorName(e);
+}
+
+fn seenTool(ctx: ?*anyopaque, call: *ToolCall) bool {
+    const seen: *Seen = @ptrCast(@alignCast(ctx.?));
+    seen.rec(call.clientInfo(), call.protocolVersion(), call.clientCapabilities().elicitation);
+    seen.url = errName(call.urlElicitationRequired("m", &.{}));
+    seen.sampling = errName(call.requestSampling(.{ .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }}, .max_tokens = 1 }, .{}));
+    seen.failed = call.failWith(.{ .code = -32001, .message = "m" });
+    return false;
+}
+
+fn seenPrompt(ctx: ?*anyopaque, req: *PromptRequest) bool {
+    const seen: *Seen = @ptrCast(@alignCast(ctx.?));
+    seen.rec(req.clientInfo(), req.protocolVersion(), req.clientCapabilities().elicitation);
+    seen.url = errName(req.urlElicitationRequired("m", &.{}));
+    seen.failed = req.failWith(.{ .code = -32001, .message = "m" });
+    req.reportProgress(1, 2, "p");
+    req.message(.user, "x");
+    return true;
+}
+
+fn seenResource(ctx: ?*anyopaque, req: *ResourceRequest) bool {
+    const seen: *Seen = @ptrCast(@alignCast(ctx.?));
+    seen.rec(req.clientInfo(), req.protocolVersion(), req.clientCapabilities().elicitation);
+    seen.url = errName(req.urlElicitationRequired("m", &.{}));
+    seen.failed = req.failWith(.{ .code = -32001, .message = "m" });
+    req.reportProgress(1, 2, "r");
+    return true;
+}
+
+fn seenMethod(ctx: ?*anyopaque, req: *MethodRequest) bool {
+    const seen: *Seen = @ptrCast(@alignCast(ctx.?));
+    seen.cap_elicit = req.clientCapabilities().elicitation;
+    seen.failed = req.failWith(.{ .code = -32001, .message = "m" });
+    req.reportProgress(1, 2, "m");
+    return true;
+}
+
+fn boomTool(_: ?*anyopaque, call: *ToolCall) bool {
+    return call.failProtocol(-32001, "boom", "{\"a\":1}");
+}
+fn boomPrompt(_: ?*anyopaque, req: *PromptRequest) bool {
+    return req.failProtocol(-32001, "boom", "{\"a\":1}");
+}
+fn boomResource(_: ?*anyopaque, req: *ResourceRequest) bool {
+    return req.failProtocol(-32001, "boom", "{\"a\":1}");
+}
+fn boomMethod(_: ?*anyopaque, req: *MethodRequest) bool {
+    return req.failProtocol(-32001, "boom", "{\"a\":1}");
+}
+
+const modern_meta = "\"_meta\":{\"progressToken\":\"p\",\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{\"elicitation\":{}},\"io.modelcontextprotocol/clientInfo\":{\"name\":\"modcli\",\"version\":\"9\"}}";
+
+test "mutation 2026-11-11: the request context of a tool, prompt, resource and method, in both eras" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    var seen: Seen = .{};
+    try s.addTool(.{ .name = "seen", .description = "", .input_schema = "{}", .handler = seenTool, .ctx = &seen });
+    try s.addPrompt(.{ .name = "seen", .handler = seenPrompt, .ctx = &seen });
+    try s.addResource(.{ .uri = "x://seen", .name = "seen", .handler = seenResource, .ctx = &seen });
+    try s.addMethod(.{ .name = "acme/seen", .handler = seenMethod, .ctx = &seen });
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    // Peer 5 handshook as a session client that can sample but not elicit.
+    try s.handleMessageFrom(
+        \\{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"sampling":{}},"clientInfo":{"name":"sesscli","version":"1"}}}
+    , &sink.writer, 5);
+
+    const sess = [_]struct { []const u8, []const u8 }{
+        .{ "tools/call", "{\"name\":\"seen\",\"_meta\":{\"progressToken\":\"p\"}}" },
+        .{ "prompts/get", "{\"name\":\"seen\",\"_meta\":{\"progressToken\":\"p\"}}" },
+        .{ "resources/read", "{\"uri\":\"x://seen\",\"_meta\":{\"progressToken\":\"p\"}}" },
+    };
+    for (sess) |c| {
+        seen = .{};
+        sink.clearRetainingCapacity();
+        const msg = try testing.allocator.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{s}}}", .{ c[0], c[1] });
+        defer testing.allocator.free(msg);
+        try s.handleMessageFrom(msg, &sink.writer, 5);
+        try testing.expectEqualStrings("sesscli 2025-11-25 false", seen.said());
+        try testing.expect(seen.failed);
+        if (std.mem.eql(u8, c[0], "tools/call")) {
+            try testing.expectEqualStrings("NoMessages", seen.url);
+            // The answer can only come from the peer that asked: the request
+            // inherits the caller's peer and so passes peer 5's sampling gate.
+            try testing.expectEqualStrings("ok", seen.sampling);
+        } else {
+            try testing.expectEqualStrings("NoMessages", seen.url);
+        }
+    }
+    s.forgetPeer(5);
+    try s.handleMessageFrom(
+        \\{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"sampling":{}},"clientInfo":{"name":"sesscli","version":"1"}}}
+    , &sink.writer, 5);
+
+    const mod = [_]struct { []const u8, []const u8 }{
+        .{ "tools/call", "{\"name\":\"seen\"," ++ modern_meta ++ "}" },
+        .{ "prompts/get", "{\"name\":\"seen\"," ++ modern_meta ++ "}" },
+        .{ "resources/read", "{\"uri\":\"x://seen\"," ++ modern_meta ++ "}" },
+    };
+    for (mod) |c| {
+        seen = .{};
+        sink.clearRetainingCapacity();
+        const msg = try testing.allocator.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{s}}}", .{ c[0], c[1] });
+        defer testing.allocator.free(msg);
+        try s.handleMessageFrom(msg, &sink.writer, 5);
+        try testing.expectEqualStrings("modcli 2026-07-28 true", seen.said());
+        try testing.expect(seen.failed);
+        try testing.expectEqualStrings("StatelessRequest", seen.url);
+        if (std.mem.eql(u8, c[0], "tools/call")) try testing.expectEqualStrings("StatelessRequest", seen.sampling);
+    }
+    // A custom method sees the request's own capabilities, not the session's.
+    seen = .{};
+    try s.handleMessageFrom("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"acme/seen\",\"params\":{" ++ modern_meta ++ "}}", &sink.writer, 5);
+    try testing.expect(seen.cap_elicit and seen.failed);
+    seen = .{};
+    try s.handleMessageFrom("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"acme/seen\",\"params\":{\"_meta\":{\"progressToken\":\"p\"}}}", &sink.writer, 5);
+    try testing.expect(!seen.cap_elicit and seen.failed);
+}
+
+test "mutation 2026-11-11: failProtocol carries its message and data on every request kind" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "boom", .description = "", .input_schema = "{}", .handler = boomTool });
+    try s.addPrompt(.{ .name = "boom", .handler = boomPrompt });
+    try s.addResource(.{ .uri = "x://boom", .name = "boom", .handler = boomResource });
+    try s.addMethod(.{ .name = "acme/boom", .handler = boomMethod });
+    const want =
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"boom","data":{"a":1}}}
+        \\
+    ;
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"boom\"}}", want);
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"prompts/get\",\"params\":{\"name\":\"boom\"}}", want);
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\",\"params\":{\"uri\":\"x://boom\"}}", want);
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"acme/boom\"}", want);
+}
+
+fn noArgsTool(_: ?*anyopaque, call: *ToolCall) bool {
+    call.write(call.strArg("x") orelse "none");
+    return false;
+}
+fn noArgsPrompt(_: ?*anyopaque, req: *PromptRequest) bool {
+    req.message(.user, req.strArg("x") orelse "none");
+    return true;
+}
+fn ctxArgCompleter(_: ?*anyopaque, req: *CompletionRequest) void {
+    req.add(req.contextArg("k") orelse "no-ctx");
+}
+
+test "mutation 2026-11-11: argument accessors on a request that carries no arguments, and contextArg without a context" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "t", .description = "", .input_schema = "{}", .handler = noArgsTool, .allow_structured = false });
+    try s.addPrompt(.{ .name = "p", .handler = noArgsPrompt, .completer = ctxArgCompleter });
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"t\"}}",
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"none"}],"isError":false}}
+        \\
+    );
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"prompts/get\",\"params\":{\"name\":\"p\"}}",
+        \\{"jsonrpc":"2.0","id":1,"result":{"messages":[{"role":"user","content":{"type":"text","text":"none"}}]}}
+        \\
+    );
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"completion/complete\",\"params\":{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"p\"},\"argument\":{\"name\":\"a\",\"value\":\"\"}}}",
+        \\{"jsonrpc":"2.0","id":1,"result":{"completion":{"values":["no-ctx"],"hasMore":false}}}
+        \\
+    );
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"completion/complete\",\"params\":{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"p\"},\"argument\":{\"name\":\"a\",\"value\":\"\"},\"context\":{\"arguments\":{\"k\":\"v\"}}}}",
+        \\{"jsonrpc":"2.0","id":1,"result":{"completion":{"values":["v"],"hasMore":false}}}
+        \\
+    );
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"completion/complete\",\"params\":{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"p\"},\"argument\":{\"name\":\"a\",\"value\":\"\"},\"context\":{\"arguments\":{\"k\":5}}}}",
+        \\{"jsonrpc":"2.0","id":1,"result":{"completion":{"values":["no-ctx"],"hasMore":false}}}
+        \\
+    );
+}
+
+test "mutation 2026-11-11: StateSeal tokens match an independently computed HMAC, and refuse fields no length prefix can hold" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    var key: [32]u8 = undefined;
+    for (&key, 0..) |*b, i| b.* = @intCast(i);
+    const seal: StateSeal = .{ .key = key };
+    const b: StateSeal.Binding = .{ .method = "tools/call", .target = "t", .principal = "p", .extra = "e" };
+    // Computed with Python's hmac: HMAC-SHA256(key, "mcp-request-state" || head ||
+    // (len32be || field) for method, target, principal, extra, payload).
+    const kat = "AQAAAAAAAAZAoJ8P2dCEG35oICIyTqysrhuZualeWcr3bAnltxz9b7FzdGF0ZQ";
+    try testing.expectEqualStrings(kat, try seal.seal(a, b, "state", 1000, 600));
+    try testing.expectEqualStrings("state", try seal.open(a, b, kat, 1599));
+    try testing.expectError(error.StateExpired, seal.open(a, b, kat, 1600));
+    try testing.expectError(error.StateExpired, seal.open(a, b, kat, -1));
+    // A negative clock reads as 0 when sealing: expiry = 0 + ttl.
+    const neg = "AQAAAAAAAAAKTZcb-vnu7GhfCMG77C3XhmRyNF06E6NqV-PbGBf2OrQ";
+    try testing.expectEqualStrings(neg, try seal.seal(a, .{ .method = "tools/call", .target = "t" }, "", -5, 10));
+    try testing.expectEqualStrings("", try seal.open(a, .{ .method = "tools/call", .target = "t" }, neg, 9));
+    try testing.expectError(error.StateExpired, seal.open(a, .{ .method = "tools/call", .target = "t" }, neg, 10));
+
+    // A field of 4 GiB or more cannot be length-prefixed: refused before the
+    // bytes are touched. The slice is a lie (one byte behind it), never read.
+    const one: [1]u8 = .{0};
+    const big: []const u8 = @as([*]const u8, &one)[0..(@as(usize, 1) << 32)];
+    try testing.expectError(error.OutOfMemory, seal.seal(a, .{ .method = big, .target = "t" }, "x", 0, 1));
+    try testing.expectError(error.OutOfMemory, seal.seal(a, .{ .method = "m", .target = big }, "x", 0, 1));
+    try testing.expectError(error.OutOfMemory, seal.seal(a, .{ .method = "m", .target = "t", .principal = big }, "x", 0, 1));
+    try testing.expectError(error.OutOfMemory, seal.seal(a, .{ .method = "m", .target = "t", .extra = big }, "x", 0, 1));
+    try testing.expectError(error.OutOfMemory, seal.seal(a, .{ .method = "m", .target = "t" }, big, 0, 1));
+    try testing.expectError(error.StateInvalid, seal.open(a, .{ .method = big, .target = "t", .principal = "p", .extra = "e" }, kat, 0));
+    try testing.expectError(error.StateInvalid, seal.open(a, .{ .method = "tools/call", .target = big, .principal = "p", .extra = "e" }, kat, 0));
+    try testing.expectError(error.StateInvalid, seal.open(a, .{ .method = "tools/call", .target = "t", .principal = big, .extra = "e" }, kat, 0));
+    try testing.expectError(error.StateInvalid, seal.open(a, .{ .method = "tools/call", .target = "t", .principal = "p", .extra = big }, kat, 0));
+}
+
+test "mutation 2026-11-11: a list cursor is accepted by the list that minted it only, and only in its canonical form" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    const kinds = [_]ListKind{ .tools, .resources, .templates, .prompts };
+    for (kinds) |k| {
+        const c = try k.cursor(a, 7);
+        try testing.expectEqual(@as(?usize, 7), k.decodeCursor(c, 10));
+        try testing.expectEqual(@as(?usize, 7), k.decodeCursor(c, 7));
+        try testing.expect(k.decodeCursor(c, 6) == null);
+        for (kinds) |o| if (o != k) try testing.expect(o.decodeCursor(c, 10) == null);
+    }
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    var buf: [64]u8 = undefined;
+    const cases = [_]struct { []const u8, ?usize }{
+        .{ "t:0", 0 },
+        .{ "t:10", 10 },
+        .{ "t;5", null }, // wrong separator
+        .{ "t:+5", null }, // a sign parseInt would take
+        .{ "t:-5", null },
+        .{ "t:05", null }, // leading zero: one cursor per position
+        .{ "t:5x", null },
+        .{ "t:", null },
+        .{ "x:5", null },
+        .{ "t:11", null }, // past the end
+    };
+    for (cases) |c| {
+        const text = enc.encode(&buf, c[0]);
+        try testing.expectEqual(c[1], ListKind.tools.decodeCursor(text, 10));
+    }
+    try testing.expect(ListKind.tools.decodeCursor("", 10) == null);
+    try testing.expect(ListKind.tools.decodeCursor("!!!!", 10) == null);
+    try testing.expect(ListKind.tools.decodeCursor(&@as([40]u8, @splat('A')), 10) == null);
+}
+
+fn slowToolNoSchema(_: ?*anyopaque, call: *ToolCall) bool {
+    call.reportProgress(1, 2, "half");
+    call.write("{}");
+    return false;
+}
+
+test "mutation 2026-11-11: only a string or integer progressToken opts into progress notifications" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "slow", .description = "", .input_schema = "{}", .handler = slowToolNoSchema });
+    const tokens = [_]struct { []const u8, bool }{
+        .{ "\"a\"", true },
+        .{ "7", true },
+        .{ "true", false },
+        .{ "1.5", false },
+        .{ "null", false },
+        .{ "{}", false },
+        .{ "[1]", false },
+    };
+    for (tokens) |t| {
+        const msg = try testing.allocator.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"slow\",\"_meta\":{{\"progressToken\":{s}}}}}}}", .{t[0]});
+        defer testing.allocator.free(msg);
+        var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer aw.deinit();
+        try s.handleMessage(msg, &aw.writer);
+        try testing.expectEqual(t[1], std.mem.indexOf(u8, aw.written(), "notifications/progress") != null);
+    }
+}
+
+test "mutation 2026-11-11: an integral float is an i64 argument up to the representable edge, and not a bit past it" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    const edge = [_]struct { []const u8, ?i64 }{
+        .{ "{\"n\":-9223372036854775808.0}", std.math.minInt(i64) },
+        .{ "{\"n\":9223372036854774784.0}", 9223372036854774784 },
+        .{ "{\"n\":5.0}", 5 },
+        .{ "{\"n\":9223372036854775808.0}", null },
+        .{ "{\"n\":-9223372036854777856.0}", null },
+        .{ "{\"n\":-1e30}", null },
+        .{ "{\"n\":1e30}", null },
+        .{ "{\"n\":1.5}", null },
+        .{ "{\"n\":\"5\"}", null },
+    };
+    for (edge) |e| {
+        const r = lookupArg(i64, try parseJsonText(a, e[0]), "n");
+        if (e[1]) |want| {
+            try testing.expect(r == .value);
+            try testing.expectEqual(want, r.value);
+        } else try testing.expect(r == .wrong_type);
+    }
+}
+
+fn blocksAuditTool(_: ?*anyopaque, call: *ToolCall) bool {
+    const ann: Annotations = .{ .audience = &.{ .user, .assistant }, .priority = 0.25, .last_modified = "2026-01-01T00:00:00Z" };
+    call.add(.{ .text = .{ .text = "t", .annotations = ann } });
+    call.add(.{ .image = .{ .data_base64 = "AAAA", .mime_type = "image/png", .annotations = .{ .priority = 0.5 } } });
+    call.add(.{ .resource_link = .{ .uri = "x://a", .name = "a", .title = "T", .description = "D", .mime_type = "text/plain", .size = 12, .annotations = .{ .audience = &.{.assistant} } } });
+    call.add(.{ .resource = .{ .uri = "x://b", .mime_type = "text/plain", .text = "hello", .annotations = .{ .last_modified = "2026" } } });
+    call.add(.{ .resource = .{ .uri = "x://c", .blob_base64 = "QUJD" } });
+    call.addImage(&.{ 0xfb, 0xff, 0xfe }, "image/png");
+    call.addAudio(&.{ 0xfb, 0xff, 0xfe }, "audio/wav");
+    return false;
+}
+
+fn blobAuditResource(_: ?*anyopaque, req: *ResourceRequest) bool {
+    req.blob(req.uri, "application/octet-stream", &.{ 0xfb, 0xff, 0xfe });
+    return true;
+}
+
+test "mutation 2026-11-11: every content block kind, its optional members and its annotations, byte for byte" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "blocks", .description = "", .input_schema = "{}", .handler = blocksAuditTool });
+    try s.addResource(.{ .uri = "x://blob", .name = "blob", .handler = blobAuditResource });
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"blocks\"}}",
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"t","annotations":{"audience":["user","assistant"],"priority":0.25,"lastModified":"2026-01-01T00:00:00Z"}},{"type":"image","data":"AAAA","mimeType":"image/png","annotations":{"priority":0.5}},{"type":"resource_link","uri":"x://a","name":"a","title":"T","description":"D","mimeType":"text/plain","size":12,"annotations":{"audience":["assistant"]}},{"type":"resource","resource":{"uri":"x://b","mimeType":"text/plain","text":"hello","annotations":{"lastModified":"2026"}}},{"type":"resource","resource":{"uri":"x://c","blob":"QUJD"}},{"type":"image","data":"+//+","mimeType":"image/png"},{"type":"audio","data":"+//+","mimeType":"audio/wav"}],"isError":false}}
+        \\
+    );
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\",\"params\":{\"uri\":\"x://blob\"}}",
+        \\{"jsonrpc":"2.0","id":2,"result":{"contents":[{"uri":"x://blob","mimeType":"application/octet-stream","blob":"+//+"}]}}
+        \\
+    );
+}
+
+test "mutation 2026-11-11: resource annotations are written when any one member is set, and not at all when none is" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addResource(.{ .uri = "x://1", .name = "1", .handler = contextResource, .annotations = .{ .audience = &.{.user} } });
+    try s.addResource(.{ .uri = "x://2", .name = "2", .handler = contextResource, .annotations = .{ .priority = 0.25 } });
+    try s.addResource(.{ .uri = "x://3", .name = "3", .handler = contextResource, .annotations = .{ .last_modified = "2026" } });
+    try s.addResource(.{ .uri = "x://4", .name = "4", .handler = contextResource, .annotations = .{} });
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/list\"}",
+        \\{"jsonrpc":"2.0","id":1,"result":{"resources":[{"uri":"x://1","name":"1","annotations":{"audience":["user"]}},{"uri":"x://2","name":"2","annotations":{"priority":0.25}},{"uri":"x://3","name":"3","annotations":{"lastModified":"2026"}},{"uri":"x://4","name":"4"}]}}
+        \\
+    );
+}
+
+test "mutation 2026-11-11: a listen is told about the catalog it asked for, not another" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.push = true;
+    var ts: TestSink = .{ .aw = .init(testing.allocator) };
+    defer ts.aw.deinit();
+    const open = "{\"jsonrpc\":\"2.0\",\"id\":%ID%,\"method\":\"subscriptions/listen\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}},\"notifications\":{\"%KEY%\":true}}}";
+    const asks = [_]struct { []const u8, []const u8 }{ .{ "1", "toolsListChanged" }, .{ "2", "promptsListChanged" }, .{ "3", "resourcesListChanged" } };
+    for (asks) |c| {
+        const a = try std.mem.replaceOwned(u8, testing.allocator, open, "%ID%", c[0]);
+        defer testing.allocator.free(a);
+        const b = try std.mem.replaceOwned(u8, testing.allocator, a, "%KEY%", c[1]);
+        defer testing.allocator.free(b);
+        var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer sink.deinit();
+        try s.handleMessage(b, &sink.writer);
+    }
+    const kinds = [_]ListChange{ .tools, .prompts, .resources };
+    const want = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":1}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":2}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":3}}}\n",
+    };
+    for (kinds, want) |k, w| {
+        ts.aw.clearRetainingCapacity();
+        try testing.expectEqual(@as(usize, 1), s.notifyListChanged(ts.sink(), k));
+        try testing.expectEqualStrings(w, ts.aw.written());
+    }
+}
+
+// ── mutation 2026-11-11: dispatch, limits, bookkeeping ──────────────────────
+
+/// Feed one message and assert that the answer contains `needle`.
+fn expectContains(s: *Server, msg: []const u8, needle: []const u8) !void {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.handleMessage(msg, &aw.writer);
+    if (std.mem.indexOf(u8, aw.written(), needle) == null) {
+        std.debug.print("answer: {s}\nlacks:  {s}\n", .{ aw.written(), needle });
+        return error.TestExpectedEqual;
+    }
+}
+
+fn rpcLine(arena: std.mem.Allocator, method: []const u8, params: []const u8) ![]u8 {
+    return arena.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{s}}}", .{ method, params });
+}
+
+fn deepText(a: std.mem.Allocator, open: []const u8, close: []const u8, core: []const u8, n: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    for (0..n) |_| try buf.appendSlice(a, open);
+    try buf.appendSlice(a, core);
+    for (0..n) |_| try buf.appendSlice(a, close);
+    return buf.items;
+}
+
+test "mutation 2026-11-11: methods refuse params that are not what they take, each with its own -32602" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.push = true;
+    try s.addPrompt(.{ .name = "p", .handler = noArgsPrompt, .completer = ctxArgCompleter });
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "completion/complete", "5", "Invalid params" },
+        .{ "completion/complete", "{\"ref\":5,\"argument\":{}}", "Invalid params" },
+        .{ "completion/complete", "{\"ref\":{},\"argument\":5}", "Invalid params" },
+        .{ "completion/complete", "{\"ref\":{\"type\":5},\"argument\":{\"name\":\"a\",\"value\":\"v\"}}", "Invalid params" },
+        .{ "completion/complete", "{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"p\"},\"argument\":{\"name\":5,\"value\":\"v\"}}", "Invalid params" },
+        .{ "completion/complete", "{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"p\"},\"argument\":{\"name\":\"a\",\"value\":5}}", "Invalid params" },
+        .{ "completion/complete", "{\"ref\":{\"type\":\"ref/prompt\",\"name\":5},\"argument\":{\"name\":\"a\",\"value\":\"v\"}}", "Invalid ref" },
+        .{ "completion/complete", "{\"ref\":{\"type\":\"ref/resource\",\"uri\":5},\"argument\":{\"name\":\"a\",\"value\":\"v\"}}", "Invalid ref" },
+        .{ "completion/complete", "{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"nope\"},\"argument\":{\"name\":\"a\",\"value\":\"v\"}}", "Unknown prompt" },
+        .{ "completion/complete", "{\"ref\":{\"type\":\"ref/resource\",\"uri\":\"x://nope\"},\"argument\":{\"name\":\"a\",\"value\":\"v\"}}", "Unknown resource template" },
+        .{ "completion/complete", "{\"ref\":{\"type\":\"ref/other\"},\"argument\":{\"name\":\"a\",\"value\":\"v\"}}", "Invalid ref type" },
+        .{ "prompts/get", "5", "Invalid params" },
+        .{ "prompts/get", "{\"name\":5}", "Invalid prompt name" },
+        .{ "resources/subscribe", "5", "Invalid params" },
+        .{ "resources/subscribe", "{\"uri\":5}", "Invalid uri" },
+    };
+    for (cases) |c| {
+        const want = try a.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":-32602,\"message\":\"{s}\"}}}}\n", .{c[2]});
+        expectResponse(&s, try rpcLine(a, c[0], c[1]), want) catch |e| {
+            std.debug.print("case: {s} {s}\n", .{ c[0], c[1] });
+            return e;
+        };
+    }
+    // A `context` that is not an object is ignored, not an error.
+    try expectContains(&s, try rpcLine(a, "completion/complete", "{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"p\"},\"argument\":{\"name\":\"a\",\"value\":\"\"},\"context\":5}"), "\"values\":[\"no-ctx\"]");
+    try expectContains(&s, try rpcLine(a, "completion/complete", "{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"p\"},\"argument\":{\"name\":\"a\",\"value\":\"\"},\"context\":{\"arguments\":5}}"), "\"values\":[\"no-ctx\"]");
+}
+
+const CancelProbe = struct {
+    s: *Server,
+    wrong_peer: bool = true,
+    flag_wrong: bool = true,
+    other_id: bool = true,
+    non_conforming: bool = true,
+    right: bool = false,
+    flag_right: bool = false,
+};
+
+fn probeTool(ctx: ?*anyopaque, call: *ToolCall) bool {
+    const p: *CancelProbe = @ptrCast(@alignCast(ctx.?));
+    p.wrong_peer = p.s.cancelInflight(2, .{ .integer = 7 });
+    p.flag_wrong = call.cancelled();
+    p.other_id = p.s.cancelInflight(1, .{ .integer = 8 });
+    p.non_conforming = p.s.cancelInflight(1, .{ .bool = true });
+    p.right = p.s.cancelInflight(1, .{ .integer = 7 });
+    p.flag_right = call.cancelled();
+    return false;
+}
+
+fn deepArrayValue(a: std.mem.Allocator, levels: usize) !std.json.Value {
+    var v: std.json.Value = .{ .integer = 0 };
+    for (0..levels) |_| {
+        var arr = std.json.Array.init(a);
+        try arr.append(v);
+        v = .{ .array = arr };
+    }
+    return v;
+}
+
+test "mutation 2026-11-11: a cancel finds the call of that peer and that id, and refuses ids that were never issued" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    var probe: CancelProbe = .{ .s = &s };
+    try s.addTool(.{ .name = "probe", .description = "", .input_schema = "{}", .handler = probeTool, .ctx = &probe });
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    try s.handleMessageFrom("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"probe\"}}", &sink.writer, 1);
+    try testing.expectEqualStrings("", sink.written()); // cancelled: no response
+    try testing.expect(!probe.wrong_peer);
+    try testing.expect(!probe.flag_wrong);
+    try testing.expect(!probe.other_id);
+    try testing.expect(!probe.non_conforming);
+    try testing.expect(probe.right);
+    try testing.expect(probe.flag_right);
+
+    // An id that cannot be a JSON-RPC id is refused before it is serialized
+    // (the serializer recurses once per level).
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const deep = try deepArrayValue(st.allocator(), 200_000);
+    try testing.expect(!s.cancelInflight(0, deep));
+    try testing.expect(!s.cancelListen(0, deep));
+
+    // `cancelListen` finds the listen of that peer and that id only.
+    s.push = true;
+    const l1 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":{}}}";
+    const l2 = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":{}}}";
+    try s.handleMessageFrom(l1, &sink.writer, 0);
+    try s.handleMessageFrom(l2, &sink.writer, 3);
+    try testing.expect(!s.cancelListen(3, .{ .integer = 1 }));
+    try testing.expect(!s.cancelListen(0, .{ .integer = 2 }));
+    try testing.expect(s.cancelListen(0, .{ .integer = 1 }));
+    try testing.expectEqual(@as(usize, 1), s.listens.items.len);
+    try testing.expect(!s.cancelListen(0, .{ .integer = 1 }));
+    // Two peers, one listen each: ending one peer's leaves the other's.
+    try s.handleMessageFrom(l1, &sink.writer, 0);
+    try testing.expectEqual(@as(usize, 1), try s.endSubscriptions(&sink.writer, 0));
+    try testing.expectEqual(@as(usize, 1), s.listens.items.len);
+    try testing.expectEqual(@as(u64, 3), s.listens.items[0].peer);
+    // Left open: `deinit` frees it (the leak checker is the assertion).
+}
+
+fn listenLine(a: std.mem.Allocator, id: []const u8, uris: []const []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.print(a, "{{\"jsonrpc\":\"2.0\",\"id\":\"{s}\",\"method\":\"subscriptions/listen\",\"params\":{{{s},\"notifications\":{{\"resourceSubscriptions\":[", .{ id, modern_meta });
+    for (uris, 0..) |u, i| try buf.print(a, "{s}\"{s}\"", .{ if (i == 0) "" else ",", u });
+    try buf.appendSlice(a, "]}}}");
+    return buf.items;
+}
+
+fn answeredWith(s: *Server, msg: []const u8, peer: u64, needle: []const u8) !bool {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.handleMessageFrom(msg, &aw.writer, peer);
+    return std.mem.indexOf(u8, aw.written(), needle) != null;
+}
+
+test "mutation 2026-11-11: listen limits sit exactly where they say: id length, uri length, uri count, uri bytes" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.push = true;
+    const ack = "notifications/subscriptions/acknowledged";
+    // The id is quoted when serialized: 126 characters make 128 bytes.
+    try testing.expect(try answeredWith(&s, try listenLine(a, &@as([126]u8, @splat('i')), &.{}), 0, ack));
+    try testing.expect(try answeredWith(&s, try listenLine(a, &@as([127]u8, @splat('i')), &.{}), 0, "Request id too long"));
+    try testing.expect(try answeredWith(&s, try listenLine(a, "u1", &.{&@as([max_subscription_uri_len]u8, @splat('x'))}), 0, ack));
+    try testing.expect(try answeredWith(&s, try listenLine(a, "u2", &.{&@as([max_subscription_uri_len + 1]u8, @splat('x'))}), 0, "Subscription uri too long"));
+    const many = try a.alloc([]const u8, max_subscriptions_per_peer + 1);
+    @memset(many, "a");
+    try testing.expect(try answeredWith(&s, try listenLine(a, "n1", many[0..max_subscriptions_per_peer]), 1, ack));
+    try testing.expect(try answeredWith(&s, try listenLine(a, "n2", many), 1, "Too many subscriptions"));
+    const big = try a.alloc([]const u8, max_listen_uri_bytes / max_subscription_uri_len + 1);
+    const ybuf: [max_subscription_uri_len]u8 = @splat('y');
+    @memset(big, &ybuf);
+    try testing.expect(try answeredWith(&s, try listenLine(a, "b1", big[0 .. big.len - 1]), 2, ack));
+    try testing.expect(try answeredWith(&s, try listenLine(a, "b2", big), 2, "Too many subscriptions"));
+}
+
+fn fakeListen(gpa: std.mem.Allocator, peer: u64) !Listen {
+    return .{ .peer = peer, .id_json = try gpa.dupe(u8, "0"), .tools = false, .prompts = false, .resources = false, .uris = try gpa.alloc([]u8, 0) };
+}
+
+test "mutation 2026-11-11: a peer holds 1024 listens and 1024 subscriptions; all peers together hold 4096 and 65536" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.push = true;
+    const ack = "notifications/subscriptions/acknowledged";
+    for (0..max_subscriptions_per_peer) |i| {
+        const id = try a.print("{d}", .{i});
+        try testing.expect(try answeredWith(&s, try listenLine(a, id, &.{}), 0, ack));
+    }
+    try testing.expect(try answeredWith(&s, try listenLine(a, "over", &.{}), 0, "Too many subscriptions"));
+    // Per-peer budgets are separate: another peer is unaffected.
+    try testing.expect(try answeredWith(&s, try listenLine(a, "other", &.{}), 1, ack));
+    // The global cap: fill the table with other peers' listens, up to the cap.
+    while (s.listens.items.len < max_listens) {
+        try s.listens.append(testing.allocator, try fakeListen(testing.allocator, 100 + s.listens.items.len / 1000));
+    }
+    try testing.expect(try answeredWith(&s, try listenLine(a, "last", &.{}), 5000, "Too many subscriptions"));
+    // Session subscriptions: one peer's 1024, then everyone's 65536.
+    for (0..max_subscriptions_per_peer) |i| {
+        const m = try a.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/subscribe\",\"params\":{{\"uri\":\"u{d}\"}}}}", .{i});
+        try testing.expect(try answeredWith(&s, m, 7, "\"result\":{}"));
+    }
+    const over = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"over\"}}";
+    try testing.expect(try answeredWith(&s, over, 7, "Too many subscriptions"));
+    // A repeat of an uri already held is a no-op even when full.
+    try testing.expect(try answeredWith(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"u0\"}}", 7, "\"result\":{}"));
+    try testing.expectEqual(@as(usize, max_subscriptions_per_peer), s.session_subs.items.len);
+    while (s.session_subs.items.len < max_session_subscriptions) {
+        try s.session_subs.append(testing.allocator, .{ .peer = 100 + s.session_subs.items.len / 1000, .uri = try testing.allocator.dupe(u8, "z") });
+    }
+    try testing.expect(try answeredWith(&s, over, 8, "Too many subscriptions"));
+}
+
+test "mutation 2026-11-11: subscribe and unsubscribe are per peer, idempotent, and unsubscribing an unknown uri adds nothing" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.push = true;
+    const sub = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"x://a\"}}";
+    const unsub = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/unsubscribe\",\"params\":{\"uri\":\"x://a\"}}";
+    try testing.expect(try answeredWith(&s, unsub, 1, "\"result\":{}"));
+    try testing.expectEqual(@as(usize, 0), s.session_subs.items.len);
+    _ = try answeredWith(&s, sub, 1, "");
+    _ = try answeredWith(&s, sub, 1, "");
+    try testing.expectEqual(@as(usize, 1), s.session_subs.items.len);
+    _ = try answeredWith(&s, sub, 2, "");
+    try testing.expectEqual(@as(usize, 2), s.session_subs.items.len);
+    _ = try answeredWith(&s, unsub, 2, "");
+    try testing.expectEqual(@as(usize, 1), s.session_subs.items.len);
+    try testing.expectEqual(@as(u64, 1), s.session_subs.items[0].peer);
+    // `push` off: nothing is delivered even to a standing subscription.
+    var ts: TestSink = .{ .aw = .init(testing.allocator) };
+    defer ts.aw.deinit();
+    try testing.expectEqual(@as(usize, 0), s.notifyResourceUpdated(ts.sink(), "x://a")); // peer 1: no sink
+    _ = try answeredWith(&s, sub, 0, "");
+    try testing.expectEqual(@as(usize, 1), s.notifyResourceUpdated(ts.sink(), "x://a"));
+    s.push = false;
+    try testing.expectEqual(@as(usize, 0), s.notifyResourceUpdated(ts.sink(), "x://a"));
+    try testing.expectEqual(@as(usize, 0), s.notifyListChanged(ts.sink(), .tools));
+    // A listen's uri list is exact.
+    s.push = true;
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    try s.handleMessageFrom("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":{\"resourceSubscriptions\":[\"x://only\"]}}}", &sink.writer, 0);
+    ts.aw.clearRetainingCapacity();
+    try testing.expectEqual(@as(usize, 0), s.notifyResourceUpdated(ts.sink(), "x://other"));
+    try testing.expectEqual(@as(usize, 1), s.notifyResourceUpdated(ts.sink(), "x://only"));
+}
+
+test "mutation 2026-11-11: an elicitation send honours the pending cap and leaves nothing pending when the write fails" {
+    const form: ElicitationRequest = .{ .form = .{ .message = "m", .requested_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\"}}}" } };
+    var s = try serverWithCaps("{\"elicitation\":{}}");
+    defer s.deinit();
+    s.max_pending = 2;
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    _ = try s.sendElicitationRequest(&aw.writer, form, .{});
+    const second = try s.sendElicitationRequest(&aw.writer, form, .{});
+    try testing.expectError(error.TooManyPending, s.sendElicitationRequest(&aw.writer, form, .{}));
+    // `reason` "" leaves the member out.
+    aw.clearRetainingCapacity();
+    try s.cancelRequest(&aw.writer, second, "");
+    const want = try testing.allocator.print("{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":{d}}}}}\n", .{second});
+    defer testing.allocator.free(want);
+    try testing.expectEqualStrings(want, aw.written());
+    try testing.expectEqual(@as(usize, 1), s.pendingCount());
+
+    var tiny: [4]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&tiny);
+    var s2 = try serverWithCaps("{\"elicitation\":{}}");
+    defer s2.deinit();
+    try testing.expectError(error.WriteFailed, s2.sendElicitationRequest(&w, form, .{}));
+    try testing.expectEqual(@as(usize, 0), s2.pendingCount());
+}
+
+const RespCap = struct {
+    is_err: bool = false,
+    code: i32 = 0,
+    msg: [32]u8 = undefined,
+    msg_len: usize = 0,
+    has_data: bool = false,
+};
+
+fn capResp(ctx: ?*anyopaque, resp: *const ClientResponse) void {
+    const c: *RespCap = @ptrCast(@alignCast(ctx.?));
+    switch (resp.payload) {
+        .err => |e| {
+            c.is_err = true;
+            c.code = e.code;
+            @memcpy(c.msg[0..e.message.len], e.message);
+            c.msg_len = e.message.len;
+            c.has_data = e.data != null;
+        },
+        .result => {},
+    }
+}
+
+test "mutation 2026-11-11: a client's error answer is decoded member by member, leniently" {
+    const sreq: SamplingRequest = .{ .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }}, .max_tokens = 1 };
+    const cases = [_]struct { []const u8, i32, []const u8, bool }{
+        .{ "{\"code\":5,\"message\":\"m\",\"data\":{\"a\":1}}", 5, "m", true },
+        .{ "{\"code\":5,\"message\":7}", 5, "", false },
+        .{ "{\"code\":5}", 5, "", false },
+        .{ "{\"code\":\"x\",\"message\":\"m\",\"data\":null}", error_code.internal_error, "m", false },
+        .{ "{\"code\":2147483648,\"message\":\"m\"}", error_code.internal_error, "m", false },
+        .{ "{\"code\":-2147483648,\"message\":\"m\"}", std.math.minInt(i32), "m", false },
+        .{ "{\"code\":2147483647}", std.math.maxInt(i32), "", false },
+        .{ "{\"code\":-2147483649}", error_code.internal_error, "", false },
+        .{ "5", error_code.internal_error, "", false },
+    };
+    for (cases) |c| {
+        var s = try serverWithCaps("{\"sampling\":{}}");
+        defer s.deinit();
+        var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer sink.deinit();
+        var cap: RespCap = .{};
+        const id = try s.sendSamplingRequest(&sink.writer, sreq, .{ .on_response = capResp, .ctx = &cap });
+        const answer = try testing.allocator.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{s}}}", .{ id, c[0] });
+        defer testing.allocator.free(answer);
+        sink.clearRetainingCapacity();
+        try s.handleMessage(answer, &sink.writer);
+        try testing.expectEqualStrings("", sink.written());
+        try testing.expect(cap.is_err);
+        try testing.expectEqual(c[1], cap.code);
+        try testing.expectEqualStrings(c[2], cap.msg[0..cap.msg_len]);
+        try testing.expectEqual(c[3], cap.has_data);
+    }
+}
+
+test "mutation 2026-11-11: blank lines of any whitespace are dropped, leading whitespace never hides a structured result" {
+    var s = testServer(null);
+    defer s.deinit();
+    for ([_][]const u8{ " ", "\t", "\r", "\n", " \t\r\n", "\t\t" }) |ws| try expectResponse(&s, ws, "");
+    for ([_][]const u8{ " ", "\t", "\r", "\n" }) |ws| {
+        const text = try testing.allocator.print("{s}{{\"a\":1}}", .{ws});
+        defer testing.allocator.free(text);
+        try testing.expect(isSingleJsonObject(testing.allocator, text));
+    }
+    try testing.expect(!isSingleJsonObject(testing.allocator, " [1]"));
+    try testing.expect(!isSingleJsonObject(testing.allocator, "   "));
+    try testing.expect(!isSingleJsonObject(testing.allocator, ""));
+    // Out of memory while validating is "not JSON", never "JSON".
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expect(!isSingleJsonObject(fa.allocator(), "{\"a\":1}"));
+    var fb = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expect(!isSingleJsonValue(fb.allocator(), "[1]"));
+    // A raw CR inside a line is data, not a line end.
+    var in: std.Io.Reader = .fixed("a\rb\nc\n");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try testing.expectEqualStrings("a\rb", (try readLine(testing.allocator, &in, &buf)).?);
+    // A method that is not a string, with an id that is no id.
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":[1],\"method\":5}",
+        \\{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request id"}}
+        \\
+    );
+}
+
+const CustomProbe = struct { calls: u32 = 0, notification: bool = false };
+
+fn customProbe(ctx: ?*anyopaque, req: *MethodRequest) bool {
+    const p: *CustomProbe = @ptrCast(@alignCast(ctx.?));
+    p.calls += 1;
+    p.notification = req.notification;
+    return true; // writes nothing: the result is `{}`
+}
+
+fn customOwnMembers(_: ?*anyopaque, req: *MethodRequest) bool {
+    req.write("{\"_meta\":{\"x\":1},\"resultType\":\"mine\",\"a\":1}");
+    return true;
+}
+
+test "mutation 2026-11-11: custom methods and notifications are served only in the eras they declare" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    var pm: CustomProbe = .{};
+    var pn1: CustomProbe = .{};
+    var pn2: CustomProbe = .{};
+    try s.addMethod(.{ .name = "acme/plain", .handler = customProbe, .ctx = &pm });
+    try s.addMethod(.{ .name = "acme/m1", .handler = customProbe, .ctx = &pm, .stateless = false });
+    try s.addMethod(.{ .name = "acme/m2", .handler = customProbe, .ctx = &pm, .session = false });
+    try s.addMethod(.{ .name = "acme/own", .handler = customOwnMembers });
+    try s.addNotification(.{ .name = "acme/n1", .handler = customProbe, .ctx = &pn1, .stateless = false });
+    try s.addNotification(.{ .name = "acme/n2", .handler = customProbe, .ctx = &pn2, .session = false });
+    const ok_session =
+        \\{"jsonrpc":"2.0","id":1,"result":{}}
+        \\
+    ;
+    const ok_modern =
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"t","version":"0"}}}}
+        \\
+    ;
+    const gone =
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}
+        \\
+    ;
+    const M = "{" ++ modern_meta ++ "}";
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"acme/plain\"}", ok_session);
+    try testing.expect(!pm.notification);
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"acme/plain\",\"params\":" ++ M ++ "}", ok_modern);
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"acme/m1\"}", ok_session);
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"acme/m1\",\"params\":" ++ M ++ "}", gone);
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"acme/m2\"}", gone);
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"acme/m2\",\"params\":" ++ M ++ "}", ok_modern);
+    // The handler's own `_meta` and `resultType` give way to the era's in a
+    // 2026-07-28 answer, and are the handler's own before it.
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"acme/own\"}", "\"result\":{\"_meta\":{\"x\":1},\"resultType\":\"mine\",\"a\":1}");
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"acme/own\",\"params\":" ++ M ++ "}", "\"result\":{\"resultType\":\"complete\",\"a\":1,\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"t\",\"version\":\"0\"}}}");
+    // Notifications: delivered, flagged as such, never answered.
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"method\":\"acme/n1\"}", "");
+    try testing.expectEqual(@as(u32, 1), pn1.calls);
+    try testing.expect(pn1.notification);
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"method\":\"acme/n1\",\"params\":" ++ M ++ "}", "");
+    try testing.expectEqual(@as(u32, 1), pn1.calls);
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"method\":\"acme/n2\"}", "");
+    try testing.expectEqual(@as(u32, 0), pn2.calls);
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"method\":\"acme/n2\",\"params\":" ++ M ++ "}", "");
+    try testing.expectEqual(@as(u32, 1), pn2.calls);
+    // Names this module owns, and the empty name, cannot be registered.
+    try testing.expectError(error.ReservedMethod, s.addMethod(.{ .name = "", .handler = customProbe }));
+    try testing.expectError(error.ReservedMethod, s.addNotification(.{ .name = "", .handler = customProbe }));
+    try testing.expectError(error.ReservedMethod, s.addNotification(.{ .name = "notifications/cancelled", .handler = customProbe }));
+    try testing.expectError(error.ReservedMethod, s.addMethod(.{ .name = "tools/call", .handler = customProbe }));
+    try testing.expectError(error.DuplicateMethod, s.addMethod(.{ .name = "acme/plain", .handler = customProbe }));
+    try s.setCapabilityExtras("", "");
+    try testing.expectError(error.InvalidCapabilityJson, s.setCapabilityExtras("[]", ""));
+}
+
+fn countingCompleter(ctx: ?*anyopaque, req: *CompletionRequest) void {
+    const n: *u32 = @ptrCast(@alignCast(ctx.?));
+    n.* += 1;
+    req.add("v");
+}
+
+fn hundredCompleter(ctx: ?*anyopaque, req: *CompletionRequest) void {
+    const n: *u32 = @ptrCast(@alignCast(ctx.?));
+    for (0..n.*) |_| req.add("v");
+}
+
+test "mutation 2026-11-11: completers get their own ctx; a template alone makes the server complete; the answer holds 100 values" {
+    var c1: u32 = 0;
+    var c2: u32 = 0;
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addResourceTemplate(.{ .uri_template = "x://{a}", .name = "t", .completer = countingCompleter, .ctx = &c2 });
+    // Only a template has a completer: `completions` is advertised and works.
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\"}}", "\"completions\":{}");
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"completion/complete\",\"params\":{\"ref\":{\"type\":\"ref/resource\",\"uri\":\"x://{a}\"},\"argument\":{\"name\":\"a\",\"value\":\"\"}}}", "\"values\":[\"v\"]");
+    try testing.expectEqual(@as(u32, 1), c2);
+    try s.addPrompt(.{ .name = "p", .handler = noArgsPrompt, .completer = countingCompleter, .ctx = &c1 });
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"completion/complete\",\"params\":{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"p\"},\"argument\":{\"name\":\"a\",\"value\":\"\"}}}", "\"values\":[\"v\"]");
+    try testing.expectEqual(@as(u32, 1), c1);
+    try testing.expectEqual(@as(u32, 1), c2);
+
+    var n: u32 = 100;
+    try s.addPrompt(.{ .name = "q", .handler = noArgsPrompt, .completer = hundredCompleter, .ctx = &n });
+    const q = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"completion/complete\",\"params\":{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"q\"},\"argument\":{\"name\":\"a\",\"value\":\"\"}}}";
+    try expectContains(&s, q, "\"hasMore\":false");
+    n = 101;
+    try expectContains(&s, q, "\"hasMore\":true");
+    n = 99;
+    try expectContains(&s, q, "\"hasMore\":false");
+}
+
+fn outTool(ctx: ?*anyopaque, call: *ToolCall) bool {
+    const is_error: *bool = @ptrCast(@alignCast(ctx.?));
+    call.write("{\"n\":\"x\"}");
+    return is_error.*;
+}
+
+fn plainOutTool(_: ?*anyopaque, call: *ToolCall) bool {
+    call.write("hello world");
+    return false;
+}
+
+test "mutation 2026-11-11: tool output is checked against its schema exactly when it should be, in both eras" {
+    var fails = false;
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    const schema = "{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\"}}}";
+    try s.addTool(.{ .name = "o", .description = "", .input_schema = "{}", .output_schema = schema, .handler = outTool, .ctx = &fails });
+    try s.addTool(.{ .name = "free", .description = "", .input_schema = "{}", .output_schema = schema, .handler = outTool, .ctx = &fails, .allow_structured = false });
+    try s.addTool(.{ .name = "root", .description = "", .input_schema = "{}", .output_schema = "{\"type\":\"object\",\"required\":[\"z\"]}", .handler = outTool, .ctx = &fails });
+    try s.addTool(.{ .name = "plain", .description = "", .input_schema = "{}", .output_schema = "{\"patternProperties\":{}}", .handler = plainOutTool });
+    const call = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"o\"}}";
+    const M = "{\"name\":\"o\"," ++ modern_meta ++ "}";
+    try expectResponse(&s, call,
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"Output validation error: /n: expected integer, got string"}],"isError":true}}
+        \\
+    );
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":" ++ M ++ "}",
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","content":[{"type":"text","text":"Output validation error: /n: expected integer, got string"}],"isError":true,"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"t","version":"0"}}}}
+        \\
+    );
+    // A root-level failure has no location to name.
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"root\"}}", "\"text\":\"Output validation error: missing required property \\\"z\\\"\"");
+    // `allow_structured = false` leaves the output unchecked.
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"free\"}}", "\"text\":\"{\\\"n\\\":\\\"x\\\"}\"");
+    // `validate_tool_io = false` too.
+    s.validate_tool_io = false;
+    try expectContains(&s, call, "\"structuredContent\":{\"n\":\"x\"}");
+    s.validate_tool_io = true;
+    // A handler that failed reports its own failure, not the schema's.
+    fails = true;
+    try expectResponse(&s, call,
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"n\":\"x\"}"}],"structuredContent":{"n":"x"},"isError":true}}
+        \\
+    );
+    // A schema outside the checkable subset is not checked, and plain text
+    // is never spliced in as structured content, whatever the era.
+    const plain = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"plain\"," ++ modern_meta ++ "}}";
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.handleMessage(plain, &aw.writer);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "structuredContent") == null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "hello world") != null);
+}
+
+fn flagTool(_: ?*anyopaque, call: *ToolCall) bool {
+    call.write("{}");
+    return false;
+}
+
+test "mutation 2026-11-11: removal keeps the parallel tables aligned and says whether it removed anything" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "a", .description = "", .input_schema = "{\"type\":\"object\",\"required\":[\"x\"]}", .handler = flagTool });
+    try s.addTool(.{ .name = "b", .description = "", .input_schema = "{}", .handler = flagTool });
+    try testing.expect(!s.removeTool("zz"));
+    try testing.expect(s.removeTool("a"));
+    // `b` now sits where `a` was: it must be checked against its own schema.
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"b\"}}", "\"isError\":false");
+
+    try s.addResource(.{ .uri = "x://r", .name = "r", .handler = contextResource });
+    try testing.expect(!s.removeResource("x://zz"));
+    try testing.expect(s.removeResource("x://r"));
+    try testing.expect(!s.removeResource("x://r"));
+    try testing.expectEqual(@as(usize, 0), s.resources.items.len);
+
+    try s.addPrompt(.{ .name = "p", .handler = noArgsPrompt });
+    try testing.expect(!s.removePrompt("zz"));
+    try testing.expect(s.removePrompt("p"));
+    try testing.expect(!s.removePrompt("p"));
+    try testing.expectEqual(@as(usize, 0), s.prompts.items.len);
+
+    try s.addResourceTemplate(.{ .uri_template = "a://{x}", .name = "a", .handler = varTemplate });
+    try s.addResourceTemplate(.{ .uri_template = "b://{y}", .name = "b", .handler = varTemplate });
+    try testing.expect(!s.removeResourceTemplate("zz"));
+    try testing.expect(s.removeResourceTemplate("a://{x}"));
+    try testing.expect(!s.removeResourceTemplate("a://{x}"));
+    try testing.expectEqual(@as(usize, 1), s.template_parsed.items.len);
+    // The surviving template is matched with its own plan.
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\",\"params\":{\"uri\":\"b://q\"}}", "\"text\":\"q\"");
+}
+
+fn varTemplate(_: ?*anyopaque, req: *ResourceRequest) bool {
+    const v = req.vars orelse return false;
+    req.text(req.uri, "", if (v.len == 1) (req.variable(v[0].name) orelse "?") else "none");
+    return true;
+}
+
+fn flaggedTemplate(_: ?*anyopaque, req: *ResourceRequest) bool {
+    req.protocol_error = .{ .code = -32001, .message = "set directly" };
+    return false;
+}
+
+fn unmatchableTemplate(_: ?*anyopaque, req: *ResourceRequest) bool {
+    req.text(req.uri, "", if (req.vars == null) "no vars" else "vars");
+    return true;
+}
+
+test "mutation 2026-11-11: a template handler that sets an error and declines still ends the search; a template with no inverse reads without vars" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addResourceTemplate(.{ .uri_template = "x://{a}/{a}", .name = "dup", .handler = unmatchableTemplate });
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\",\"params\":{\"uri\":\"x://q/q\"}}", "\"text\":\"no vars\"");
+    var s2 = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s2.deinit();
+    try s2.addResourceTemplate(.{ .uri_template = "x://{a}", .name = "first", .handler = flaggedTemplate });
+    try s2.addResourceTemplate(.{ .uri_template = "x://{b}", .name = "second", .handler = varTemplate });
+    try expectResponse(&s2, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\",\"params\":{\"uri\":\"x://q\"}}",
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"set directly"}}
+        \\
+    );
+}
+
+test "mutation 2026-11-11: wire shapes the module writes for its own definitions" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0", .description = "D", .website_url = "https://x" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "a", .description = "d", .input_schema = "{}", .handler = flagTool, .annotations = .{ .title = "T", .read_only_hint = true, .destructive_hint = false, .idempotent_hint = true, .open_world_hint = false } });
+    try s.addResourceTemplate(.{ .uri_template = "x://{a}", .name = "t", .annotations = .{ .priority = 0.25 }, .meta_json = "{\"k\":1}", .handler = varTemplate });
+    try s.addPrompt(.{ .name = "p", .handler = noArgsPrompt, .arguments = &.{ .{ .name = "q" }, .{ .name = "r", .description = "dd", .required = true } } });
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}", "\"annotations\":{\"title\":\"T\",\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true,\"openWorldHint\":false}");
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/templates/list\"}", "\"annotations\":{\"priority\":0.25},\"_meta\":{\"k\":1}}");
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"prompts/list\"}", "\"arguments\":[{\"name\":\"q\"},{\"name\":\"r\",\"description\":\"dd\",\"required\":true}]");
+    // The 2026-07-28 serverInfo carries the identity extras too.
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{" ++ modern_meta ++ "}}", "serverInfo\":{\"name\":\"t\",\"version\":\"0\",\"description\":\"D\",\"websiteUrl\":\"https://x\"}");
+    // `_meta` that is not an object is the session path's business, not an error.
+    var e = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer e.deinit();
+    try expectResponse(&e, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{\"_meta\":5}}",
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
+        \\
+    );
+}
+
+test "mutation 2026-11-11: server/discover advertises what is offered, and the flags of a push server" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.push = true;
+    var c: u32 = 0;
+    try s.addResourceTemplate(.{ .uri_template = "x://{a}", .name = "t", .completer = countingCompleter, .ctx = &c });
+    const disc = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{" ++ modern_meta ++ "}}";
+    try expectContains(&s, disc, "\"capabilities\":{\"tools\":{\"listChanged\":true},\"resources\":{\"subscribe\":true,\"listChanged\":true},\"completions\":{}}");
+    try s.addPrompt(.{ .name = "p", .handler = noArgsPrompt });
+    try expectContains(&s, disc, "\"prompts\":{\"listChanged\":true},\"completions\":{}}");
+    s.push = false;
+    try expectContains(&s, disc, "\"capabilities\":{\"tools\":{},\"resources\":{},\"prompts\":{},\"completions\":{}}");
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\"}}", "\"capabilities\":{\"tools\":{\"listChanged\":false},\"resources\":{\"subscribe\":false,\"listChanged\":false},\"prompts\":{\"listChanged\":false},\"completions\":{}}");
+}
+
+test "mutation 2026-11-11: only a true flag in a listen filter is honoured" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.push = true;
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":{\"toolsListChanged\":false,\"promptsListChanged\":\"yes\",\"resourcesListChanged\":1}}}", "\"notifications\":{}}}");
+    try testing.expect(!s.listens.items[0].tools and !s.listens.items[0].prompts and !s.listens.items[0].resources);
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":{\"resourceSubscriptions\":5}}}", "Invalid resourceSubscriptions");
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":{\"resourceSubscriptions\":[5]}}}", "Invalid resourceSubscriptions");
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":5}}", "Invalid notifications filter");
+}
+
+fn oomSession(gpa: std.mem.Allocator) !void {
+    var s = Server.init(gpa, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.push = true;
+    var buf: [65536]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try s.addTool(.{ .name = "a", .description = "", .input_schema = "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}}}", .output_schema = "{\"type\":\"object\"}", .handler = flagTool });
+    try s.addResourceTemplate(.{ .uri_template = "x://{a}", .name = "t", .handler = varTemplate });
+    const msgs = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"n\",\"version\":\"v\",\"title\":\"t\"}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"n2\",\"version\":\"v\"}}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"x://a\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":{\"toolsListChanged\":true,\"resourceSubscriptions\":[\"x://a\",\"x://b\"]}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"a\",\"arguments\":{\"x\":\"y\"}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"resources/read\",\"params\":{\"uri\":\"x://q\"}}",
+    };
+    for (msgs) |m| try s.handleMessage(m, &w);
+    s.forgetPeer(0);
+}
+
+test "mutation 2026-11-11: no allocation failure on any path of a session leaks or corrupts" {
+    try testing.checkAllAllocationFailures(testing.allocator, oomSession, .{});
+}
+
+test "mutation 2026-11-11: text nested far past the limits is refused before anything parses it" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    const deep_obj = try deepText(a, "{\"a\":", "}", "0", 400_000);
+    const deep_arr = try deepText(a, "[", "]", "0", 400_000);
+    try testing.expectError(error.SchemaNotJson, validateElicitationSchema(a, deep_arr));
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    // A registered schema that deep is not compiled: the tool registers, unchecked.
+    try s.addTool(.{ .name = "deep", .description = "", .input_schema = deep_obj, .handler = flagTool });
+    // Output that deep is "not JSON", whatever the schema says.
+    try s.addTool(.{ .name = "out", .description = "", .input_schema = "{}", .output_schema = "{}", .handler = deepOutTool, .ctx = @ptrCast(deep_arr.ptr) });
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"out\"}}", "its output is not JSON");
+    // `_meta` that deep makes the list that carries it fail, not crash.
+    try s.addResource(.{ .uri = "x://m", .name = "m", .meta_json = deep_obj, .handler = contextResource });
+    try expectContains(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/list\"}", "failed to build resources/list");
+}
+
+fn deepOutTool(ctx: ?*anyopaque, call: *ToolCall) bool {
+    const text: [*]const u8 = @ptrCast(ctx.?);
+    // 400,000 levels, two bytes each plus the core.
+    call.write(text[0..800_001]);
+    return false;
+}
+
+test "mutation 2026-11-11: sampling and elicitation checks sit exactly at their edges" {
+    const base: SamplingRequest = .{ .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }}, .max_tokens = 1 };
+    const caps: ClientCapabilities = .{ .sampling = true, .elicitation = true, .elicitation_form = true, .elicitation_url = true };
+    try checkSamplingRequest(caps, base);
+    for ([_]f64{ 0.0, 1.0 }) |p| {
+        var r = base;
+        r.model_preferences = .{ .cost_priority = p, .speed_priority = p, .intelligence_priority = p };
+        try checkSamplingRequest(caps, r);
+    }
+    for ([_]f64{ -0.0000001, 1.0000001, std.math.nan(f64) }) |p| {
+        var r = base;
+        r.model_preferences = .{ .speed_priority = p };
+        try testing.expectError(error.InvalidPriority, checkSamplingRequest(caps, r));
+    }
+    // Every member of a full request reaches the wire, in the spec's order.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeSamplingRequestLine(&aw.writer, 3, .{
+        .messages = &.{.{ .role = .assistant, .content = .{ .text = "hi" } }},
+        .max_tokens = 10,
+        .system_prompt = "s",
+        .temperature = 0.5,
+        .stop_sequences = &.{"x"},
+        .model_preferences = .{ .hints = &.{.{ .name = "claude" }}, .cost_priority = 0.1, .speed_priority = 0.5, .intelligence_priority = 0.9 },
+    });
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":3,"method":"sampling/createMessage","params":{"messages":[{"role":"assistant","content":{"type":"text","text":"hi"}}],"modelPreferences":{"hints":[{"name":"claude"}],"costPriority":0.1,"intelligencePriority":0.9,"speedPriority":0.5},"systemPrompt":"s","maxTokens":10,"temperature":0.5,"stopSequences":["x"]}}
+        \\
+    , aw.written());
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    try testing.expectError(error.EmptyMessage, checkElicitationRequest(st.allocator(), caps, .{ .form = .{ .message = "", .requested_schema = "{\"type\":\"object\",\"properties\":{}}" } }));
+    // A schema that is not JSON never reaches the wire as if it were.
+    aw.clearRetainingCapacity();
+    try testing.expectError(error.SchemaNotJson, writeElicitationRequestLine(st.allocator(), &aw.writer, 1, .{ .form = .{ .message = "m", .requested_schema = "{bad" } }, true));
+}
+
+test "mutation 2026-11-11: an InputRound keeps its own copy of a key, forgets what it asked on reset, and seals under its own binding" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    const mr: ModernRequest = .{ .version = "2026-07-28", .capabilities = .{ .sampling = true }, .client = null };
+    var r: InputRound = .{ .arena = a, .modern = &mr, .method = "tools/call", .target = "t" };
+    const ask: InputRequest = .{ .sampling = .{ .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }}, .max_tokens = 1 } };
+    var kb = "a".*;
+    try r.ask(&kb, ask);
+    kb[0] = 'b'; // the caller's buffer changed: the round must not follow it
+    try r.ask("b", ask);
+    try testing.expectError(error.DuplicateInputKey, r.ask("a", ask));
+    try testing.expect(r.inputRequired());
+    try r.setState("s");
+    r.resetAsked();
+    try testing.expect(!r.inputRequired());
+    try testing.expectEqual(@as(usize, 0), r.keys.items.len);
+    try testing.expect(r.state_out == null);
+    try testing.expectEqual(@as(usize, 0), r.requests_json.items.len);
+    // `sealState` binds method and target: opened elsewhere under the same binding.
+    var key: [32]u8 = @splat(7);
+    const seal: StateSeal = .{ .key = key };
+    try r.sealState(&seal, "payload", .{ .now_sec = 100, .principal = "me" });
+    const token = r.state_out.?;
+    try testing.expectEqualStrings("payload", try seal.open(a, .{ .method = "tools/call", .target = "t", .principal = "me" }, token, 101));
+    try testing.expectError(error.StateInvalid, seal.open(a, .{ .method = "tools/get", .target = "t", .principal = "me" }, token, 101));
+    key[0] = 8;
+    var sess: InputRound = .{ .arena = a, .method = "m", .target = "t" };
+    try testing.expectError(error.SessionRequest, sess.sealState(&seal, "p", .{ .now_sec = 0 }));
+    try testing.expectError(error.SessionRequest, sess.setState("s"));
+    try testing.expectError(error.SessionRequest, sess.ask("k", ask));
+}
+
+test "mutation 2026-11-11: clientInfo and tool-argument leniency: a non-string title, name or version records what it can" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try feed(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"clientInfo\":{\"name\":\"n\",\"version\":\"v\",\"title\":5}}}");
+    try testing.expectEqualStrings("n", s.clientInfo(0).?.name);
+    try testing.expect(s.clientInfo(0).?.title == null);
+    try feed(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"clientInfo\":{\"name\":5,\"version\":\"v\"}}}");
+    try testing.expect(s.clientInfo(0) == null);
+    try feed(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"clientInfo\":{\"name\":\"n\",\"version\":5}}}");
+    try testing.expect(s.clientInfo(0) == null);
+}
+
+const SelfCancel = struct { s: *Server, id: std.json.Value, found: bool = false };
+
+fn selfCancelTool(ctx: ?*anyopaque, call: *ToolCall) bool {
+    const p: *SelfCancel = @ptrCast(@alignCast(ctx.?));
+    p.found = p.s.cancelInflight(0, p.id);
+    _ = call;
+    return false;
+}
+
+fn countingTemplate(ctx: ?*anyopaque, req: *ResourceRequest) bool {
+    const n: *u32 = @ptrCast(@alignCast(ctx.?));
+    n.* += 1;
+    req.text(req.uri, "", "second");
+    return true;
+}
+
+test "mutation 2026-11-11: round two — ids at the cancel limit, template search, push gating, forgetPeer, progress, and small edges" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    // A request id that serializes to 128 bytes can be cancelled; 129 cannot.
+    for ([_]struct { usize, bool }{ .{ 126, true }, .{ 127, false } }) |c| {
+        var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+        defer s.deinit();
+        const id = try a.alloc(u8, c[0]);
+        @memset(id, 'i');
+        var p: SelfCancel = .{ .s = &s, .id = .{ .string = id } };
+        try s.addTool(.{ .name = "t", .description = "", .input_schema = "{}", .handler = selfCancelTool, .ctx = &p });
+        var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer sink.deinit();
+        const msg = try a.print("{{\"jsonrpc\":\"2.0\",\"id\":\"{s}\",\"method\":\"tools/call\",\"params\":{{\"name\":\"t\"}}}}", .{id});
+        try s.handleMessage(msg, &sink.writer);
+        try testing.expectEqual(c[1], p.found);
+    }
+    // A template that sets an error and declines ends the search: the next one never runs.
+    var calls: u32 = 0;
+    var s2 = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s2.deinit();
+    try s2.addResourceTemplate(.{ .uri_template = "x://{a}", .name = "first", .handler = flaggedTemplate });
+    try s2.addResourceTemplate(.{ .uri_template = "x://{b}", .name = "second", .handler = countingTemplate, .ctx = &calls });
+    try expectContains(&s2, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\",\"params\":{\"uri\":\"x://q\"}}", "set directly");
+    try testing.expectEqual(@as(u32, 0), calls);
+    // Push gating with an initialized session peer and an open listen.
+    var s3 = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s3.deinit();
+    s3.push = true;
+    var ts: TestSink = .{ .aw = .init(testing.allocator) };
+    defer ts.aw.deinit();
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    try s3.handleMessage("{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\"}}", &sink.writer);
+    try s3.handleMessage("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}", &sink.writer);
+    try s3.handleMessage("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":{\"toolsListChanged\":true,\"resourcesListChanged\":true}}}", &sink.writer);
+    try testing.expect(std.mem.indexOf(u8, sink.written(), "\"notifications\":{\"toolsListChanged\":true,\"resourcesListChanged\":true}}}") != null);
+    try testing.expectEqual(@as(usize, 2), s3.notifyListChanged(ts.sink(), .tools));
+    s3.push = false;
+    try testing.expectEqual(@as(usize, 0), s3.notifyListChanged(ts.sink(), .tools));
+    s3.push = true;
+    // forgetPeer takes the peer's listens with it, and only its own.
+    try s3.handleMessageFrom("{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":{}}}", &sink.writer, 4);
+    try testing.expectEqual(@as(usize, 2), s3.listens.items.len);
+    s3.forgetPeer(4);
+    try testing.expectEqual(@as(usize, 1), s3.listens.items.len);
+    try testing.expectEqual(@as(u64, 0), s3.listens.items[0].peer);
+    // A method handler's progress reaches the wire.
+    var sm = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer sm.deinit();
+    var seen: Seen = .{};
+    try sm.addMethod(.{ .name = "acme/seen", .handler = seenMethod, .ctx = &seen });
+    try expectContains(&sm, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"acme/seen\",\"params\":{\"_meta\":{\"progressToken\":\"p\"}}}", "\"notifications/progress\",\"params\":{\"progressToken\":\"p\",\"progress\":1,\"total\":2,\"message\":\"m\"}");
+    // A tool whose x-mcp-header annotation breaks the rules is refused at registration.
+    try testing.expectError(error.HeaderAnnotationNotReachable, sm.addTool(.{ .name = "h", .description = "", .input_schema = "{\"type\":\"object\",\"x-mcp-header\":\"H\"}", .handler = flagTool }));
+    // Model preferences without hints write no `hints` member.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeSamplingRequestLine(&aw.writer, 1, .{ .messages = &.{.{ .role = .user, .content = .{ .text = "x" } }}, .max_tokens = 1, .model_preferences = .{ .cost_priority = 0.5 } });
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"modelPreferences\":{\"costPriority\":0.5}") != null);
+    try testing.expect(splitAuthority("[") == null);
+    try testing.expect(splitAuthority("[x") == null);
+    // A progress line cut by an escape that does not fit is never half-written.
+    var empty: FlushProbe = .{};
+    const prog: Progress = .{ .out = &empty.writer, .token_json = "7" };
+    prog.report(1, 2, "");
+    const room = 1024 - empty.len;
+    var msg: [1100]u8 = @splat('x');
+    for (0..16) |k| {
+        msg[room - 12 + k] = 1;
+        var p: FlushProbe = .{};
+        const pr: Progress = .{ .out = &p.writer, .token_json = "7" };
+        pr.report(1, 2, msg[0 .. room - 12 + k + 1]);
+        if (p.len != 0) try testing.expect(std.json.validate(testing.allocator, p.written()) catch false);
+        @memset(msg[room - 12 .. room + 4], 'x');
+    }
+}
+
+test "mutation 2026-11-11: a listen that cannot be acknowledged for want of memory leaves nothing behind" {
+    try testing.checkAllAllocationFailures(testing.allocator, oomBigListen, .{});
+}
+
+fn oomBigListen(gpa: std.mem.Allocator) !void {
+    var s = Server.init(gpa, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.push = true;
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(testing.allocator);
+    const big: [8000]u8 = @splat('u');
+    try line.print(testing.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"subscriptions/listen\",\"params\":{{{s},\"notifications\":{{\"resourceSubscriptions\":[", .{modern_meta});
+    for (0..20) |i| try line.print(testing.allocator, "{s}\"{s}\"", .{ if (i == 0) "" else ",", &big });
+    try line.appendSlice(testing.allocator, "]}}}");
+    try s.handleMessage(line.items, &out.writer);
+}

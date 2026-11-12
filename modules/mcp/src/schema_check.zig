@@ -1123,3 +1123,237 @@ test "sweep 2026-10-28 M-1: discarded anyOf/oneOf/not/if failures build no point
     try testing.expectEqualStrings("required", (try is.validate(out.allocator(), inst)).?.keyword);
     try testing.expect(out.queryCapacity() < 16 * 1024);
 }
+
+fn deepText(a: std.mem.Allocator, open: []const u8, close: []const u8, core: []const u8, n: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    for (0..n) |_| try buf.appendSlice(a, open);
+    try buf.appendSlice(a, core);
+    for (0..n) |_| try buf.appendSlice(a, close);
+    return buf.items;
+}
+
+fn compileText(arena: std.mem.Allocator, text: []const u8) CompileError!Schema {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch unreachable;
+    return Schema.compile(arena, v);
+}
+
+fn validateText(arena: std.mem.Allocator, schema: []const u8, instance: []const u8) !?Failure {
+    const sc = try compileText(arena, schema);
+    const inst = try std.json.parseFromSliceLeaky(std.json.Value, arena, instance, .{});
+    return sc.validate(arena, inst);
+}
+
+fn expectFails(arena: std.mem.Allocator, schema: []const u8, instance: []const u8, keyword: []const u8, pointer: []const u8) !void {
+    const f = (try validateText(arena, schema, instance)) orelse {
+        std.debug.print("expected a failure: {s} <- {s}\n", .{ schema, instance });
+        return error.TestExpectedEqual;
+    };
+    try testing.expectEqualStrings(keyword, f.keyword);
+    try testing.expectEqualStrings(pointer, f.pointer);
+}
+
+test "mutation 2026-11-11: compile refuses every keyword value of the wrong shape, each with the error that names it" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    const bad = [_]struct { []const u8, CompileError }{
+        .{ "5", error.SchemaNotObject },
+        .{ "[]", error.SchemaNotObject },
+        .{ "{\"enum\":5}", error.BadKeywordValue },
+        .{ "{\"pattern\":5}", error.BadKeywordValue },
+        .{ "{\"$id\":5}", error.BadKeywordValue },
+        .{ "{\"properties\":{\"a\":{\"$id\":\"x\"}}}", error.UnsupportedKeyword },
+        .{ "{\"properties\":5}", error.BadKeywordValue },
+        .{ "{\"properties\":{\"a\":5}}", error.BadKeywordValue },
+        .{ "{\"properties\":{\"a\":{\"enum\":5}}}", error.BadKeywordValue },
+        .{ "{\"required\":[1]}", error.BadKeywordValue },
+        .{ "{\"required\":\"a\"}", error.BadKeywordValue },
+        .{ "{\"not\":5}", error.BadKeywordValue },
+        .{ "{\"not\":{\"enum\":5}}", error.BadKeywordValue },
+        .{ "{\"allOf\":5}", error.BadKeywordValue },
+        .{ "{\"allOf\":[]}", error.BadKeywordValue },
+        .{ "{\"allOf\":[5]}", error.BadKeywordValue },
+        .{ "{\"anyOf\":[{\"enum\":5}]}", error.BadKeywordValue },
+        .{ "{\"uniqueItems\":1}", error.BadKeywordValue },
+        .{ "{\"minimum\":\"x\"}", error.BadKeywordValue },
+        .{ "{\"minItems\":-1}", error.BadKeywordValue },
+        .{ "{\"minItems\":-1.0}", error.BadKeywordValue },
+        .{ "{\"minItems\":1.5}", error.BadKeywordValue },
+        .{ "{\"minItems\":9007199254740992.0}", error.BadKeywordValue },
+        .{ "{\"minItems\":\"1\"}", error.BadKeywordValue },
+        .{ "{\"multipleOf\":0}", error.BadKeywordValue },
+        .{ "{\"multipleOf\":-1}", error.BadKeywordValue },
+        .{ "{\"$ref\":5}", error.BadKeywordValue },
+        .{ "{\"$ref\":\"#/nope\"}", error.BadRef },
+        .{ "{\"$ref\":\"#/$defs/a\",\"$defs\":5}", error.BadRef },
+        .{ "{\"$ref\":\"#/$defs/a\",\"$defs\":{\"a\":5}}", error.BadRef },
+        .{ "{\"$ref\":\"#/$defs/a%2Fb\",\"$defs\":{\"a/b\":{}}}", error.BadRef },
+        .{ "{\"$ref\":\"#/$defs/a%4\",\"$defs\":{\"a%4\":{}}}", error.BadRef },
+        .{ "{\"$ref\":\"#/$defs/a~\",\"$defs\":{\"a~\":{}}}", error.BadRef },
+        .{ "{\"$ref\":\"#/$defs/a~2\",\"$defs\":{\"a~2\":{}}}", error.BadRef },
+        .{ "{\"type\":[]}", error.BadKeywordValue },
+        .{ "{\"type\":[5]}", error.BadKeywordValue },
+        .{ "{\"type\":[\"x\"]}", error.BadKeywordValue },
+        .{ "{\"type\":\"x\"}", error.BadKeywordValue },
+        .{ "{\"type\":5}", error.BadKeywordValue },
+        .{ "{\"patternProperties\":{}}", error.UnsupportedKeyword },
+    };
+    for (bad) |c| testing.expectError(c[1], compileText(a, c[0])) catch |e| {
+        std.debug.print("schema: {s}\n", .{c[0]});
+        return e;
+    };
+    const good = [_][]const u8{
+        "true",
+        "{\"title\":1,\"description\":1,\"default\":1,\"examples\":1,\"$schema\":1,\"$comment\":1,\"deprecated\":1,\"readOnly\":1,\"writeOnly\":1,\"format\":1,\"contentEncoding\":1,\"contentMediaType\":1,\"x-any\":1}",
+        "{\"minItems\":0.0}",
+        "{\"minItems\":9007199254740991.0}",
+        "{\"$ref\":\"#/$defs/aA\",\"$defs\":{\"aA\":{}}}",
+        "{\"$ref\":\"#/$defs/a%41\",\"$defs\":{\"aA\":{}}}",
+        "{\"$ref\":\"#/definitions/a~1b\",\"definitions\":{\"a/b\":{}}}",
+        "{\"$ref\":\"#/$defs/a~0b\",\"$defs\":{\"a~b\":{}}}",
+        "{\"multipleOf\":0.5,\"minimum\":-1,\"exclusiveMinimum\":0,\"maximum\":9,\"exclusiveMaximum\":10}",
+        "{\"type\":[\"integer\",\"null\"],\"enum\":[1,null],\"const\":1}",
+    };
+    for (good) |g| _ = try compileText(a, g);
+    // A reference name of 256 bytes fits the decode buffer, 257 does not.
+    const n256: [256]u8 = @splat('n');
+    const defs256 = try a.print("{{\"$ref\":\"#/$defs/{s}\",\"$defs\":{{\"{s}\":{{}}}}}}", .{ &n256, &n256 });
+    _ = try compileText(a, defs256);
+    const n257: [257]u8 = @splat('n');
+    const defs257 = try a.print("{{\"$ref\":\"#/$defs/{s}\",\"$defs\":{{\"{s}\":{{}}}}}}", .{ &n257, &n257 });
+    try testing.expectError(error.BadRef, compileText(a, defs257));
+}
+
+test "mutation 2026-11-11: nesting is allowed 256 levels deep, not 257, at compile and at validation" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    const n256 = try deepText(a, "{\"allOf\":[", "]}", "{}", 256);
+    const n257 = try deepText(a, "{\"allOf\":[", "]}", "{}", 257);
+    const s256 = try compileText(a, n256);
+    try testing.expect((try s256.validate(a, .{ .integer = 1 })) == null);
+    try testing.expectError(error.BadKeywordValue, compileText(a, n257));
+    const nots256 = try deepText(a, "{\"not\":", "}", "{}", 256);
+    _ = try compileText(a, nots256);
+    try testing.expectError(error.BadKeywordValue, compileText(a, try deepText(a, "{\"not\":", "}", "{}", 257)));
+    // A reference loop through a deep schema runs out of depth before references.
+    const loop = try deepText(a, "{\"allOf\":[", "]}", "{\"$ref\":\"#\"}", 200);
+    try expectFails(a, loop, "1", "depth", "");
+    try expectFails(a, "{\"$ref\":\"#\"}", "1", "$ref", "");
+    // Instances nest 256 levels in an equality test, not 257.
+    const inner255 = try deepText(a, "[", "]", "0", 255);
+    const inner256 = try deepText(a, "[", "]", "0", 256);
+    const u = "{\"uniqueItems\":true}";
+    try expectFails(a, u, try a.print("[{s},{s}]", .{ inner255, inner255 }), "uniqueItems", "/1");
+    try expectFails(a, u, try a.print("[{s},{s}]", .{ inner256, inner256 }), "depth", "/1");
+    // Exactly 64 references are followed; the 65th is refused.
+    var defs64: std.ArrayList(u8) = .empty;
+    try defs64.appendSlice(a, "{\"$ref\":\"#/$defs/d0\",\"$defs\":{");
+    for (0..64) |i| {
+        if (i != 0) try defs64.append(a, ',');
+        if (i < 63) try defs64.print(a, "\"d{d}\":{{\"$ref\":\"#/$defs/d{d}\"}}", .{ i, i + 1 }) else try defs64.print(a, "\"d{d}\":{{}}", .{i});
+    }
+    try defs64.appendSlice(a, "}}");
+    try testing.expect((try validateText(a, defs64.items, "1")) == null);
+    var defs65: std.ArrayList(u8) = .empty;
+    try defs65.appendSlice(a, "{\"$ref\":\"#/$defs/d0\",\"$defs\":{");
+    for (0..65) |i| {
+        if (i != 0) try defs65.append(a, ',');
+        if (i < 64) try defs65.print(a, "\"d{d}\":{{\"$ref\":\"#/$defs/d{d}\"}}", .{ i, i + 1 }) else try defs65.print(a, "\"d{d}\":{{}}", .{i});
+    }
+    try defs65.appendSlice(a, "}}");
+    try expectFails(a, defs65.items, "1", "$ref", "");
+}
+
+test "mutation 2026-11-11: every failing keyword names itself and where, and the numbers are compared exactly" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    const cases = [_]struct { []const u8, []const u8, []const u8, []const u8 }{
+        .{ "false", "1", "false", "" },
+        .{ "{\"enum\":[1,2]}", "3", "enum", "" },
+        .{ "{\"minimum\":5}", "4", "minimum", "" },
+        .{ "{\"exclusiveMinimum\":5}", "5", "exclusiveMinimum", "" },
+        .{ "{\"maximum\":5}", "6", "maximum", "" },
+        .{ "{\"exclusiveMaximum\":5}", "5", "exclusiveMaximum", "" },
+        .{ "{\"multipleOf\":3}", "7", "multipleOf", "" },
+        .{ "{\"minLength\":2}", "\"a\"", "minLength", "" },
+        .{ "{\"minItems\":2}", "[1]", "minItems", "" },
+        .{ "{\"maxItems\":1}", "[1,2]", "maxItems", "" },
+        .{ "{\"minProperties\":2}", "{\"a\":1}", "minProperties", "" },
+        .{ "{\"maxProperties\":1}", "{\"a\":1,\"b\":2}", "maxProperties", "" },
+        .{ "{\"properties\":{\"a/b\":{\"type\":\"string\"}}}", "{\"a/b\":1}", "type", "/a~1b" },
+        .{ "{\"properties\":{\"a~b\":{\"type\":\"string\"}}}", "{\"a~b\":1}", "type", "/a~0b" },
+        // The boundary values pass: at the minimum, at the maximum, exactly.
+        .{ "{\"minimum\":5,\"maximum\":5,\"minLength\":1,\"maxLength\":1,\"minItems\":1,\"maxItems\":1}", "5", "", "" },
+    };
+    for (cases) |c| {
+        if (c[2].len == 0) {
+            try testing.expect((try validateText(a, c[0], c[1])) == null);
+            try testing.expect((try validateText(a, "{\"minLength\":1,\"maxLength\":1,\"minItems\":1,\"maxItems\":1,\"minProperties\":1,\"maxProperties\":1}", "\"x\"")) == null);
+            try testing.expect((try validateText(a, "{\"minLength\":1,\"maxLength\":1,\"minItems\":1,\"maxItems\":1,\"minProperties\":1,\"maxProperties\":1}", "[0]")) == null);
+            try testing.expect((try validateText(a, "{\"minLength\":1,\"maxLength\":1,\"minItems\":1,\"maxItems\":1,\"minProperties\":1,\"maxProperties\":1}", "{\"k\":0}")) == null);
+        } else try expectFails(a, c[0], c[1], c[2], c[3]);
+    }
+    // Code points, not bytes, are counted.
+    try testing.expect((try validateText(a, "{\"minLength\":2,\"maxLength\":2}", "\"\u{e9}\u{e9}\"")) == null);
+    // 2^53 + 1 is not 2^53, though both are the same double.
+    try expectFails(a, "{\"enum\":[9007199254740993]}", "9007199254740992", "enum", "");
+    try expectFails(a, "{\"const\":9007199254740993}", "9007199254740992", "const", "");
+    // Infinity is no integer; the message says what the value is.
+    try expectFails(a, "{\"type\":\"integer\"}", "1e999", "type", "");
+    try expectFails(a, "{\"type\":\"string\"}", "5", "type", "");
+    try expectFails(a, "{\"type\":\"string\"}", "5.0", "type", "");
+    try testing.expectEqualStrings("expected string, got integer", (try validateText(a, "{\"type\":\"string\"}", "5")).?.message);
+    try testing.expectEqualStrings("expected string, got integer", (try validateText(a, "{\"type\":\"string\"}", "5.0")).?.message);
+    try testing.expectEqualStrings("expected string, got number", (try validateText(a, "{\"type\":\"string\"}", "1.5")).?.message);
+    // A decimal divisor is lenient to a relative 1e-9, and no more.
+    try testing.expect((try validateText(a, "{\"multipleOf\":0.01}", "0.07")) == null);
+    try testing.expect((try validateText(a, "{\"multipleOf\":1}", "1000000000000.0005")) == null);
+    try expectFails(a, "{\"multipleOf\":1}", "1000.5", "multipleOf", "");
+    try expectFails(a, "{\"multipleOf\":0.01}", "0.075", "multipleOf", "");
+}
+
+test "mutation 2026-11-11: the step budget is charged per application and per comparison, and reports where it ran out first" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    const empty = try compileText(a, "{}");
+    try testing.expect((try empty.validateBudget(a, .{ .integer = 1 }, 1)) == null);
+    try testing.expectEqualStrings("budget", (try empty.validateBudget(a, .{ .integer = 1 }, 0)).?.keyword);
+    // uniqueItems pays for every pair twice: once to count, once to compare.
+    const uniq = try compileText(a, "{\"uniqueItems\":true}");
+    var arr: std.json.Array = std.json.Array.init(a);
+    for (0..100) |i| try arr.append(.{ .integer = @intCast(i) });
+    try testing.expectEqualStrings("budget", (try uniq.validateBudget(a, .{ .array = arr }, 6000)).?.keyword);
+    try testing.expect((try uniq.validateBudget(a, .{ .array = arr }, 12000)) == null);
+    // The pointer is where the budget first ran out, not where it last did.
+    const any = try compileText(a, "{\"anyOf\":[{\"properties\":{\"a\":{}}},{}]}");
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, "a", .{ .integer = 1 });
+    const f = (try any.validateBudget(a, .{ .object = obj }, 2)).?;
+    try testing.expectEqualStrings("budget", f.keyword);
+    try testing.expectEqualStrings("/a", f.pointer);
+    // The default is a million: 999,999 items (and the root) fit, a million do not.
+    const items = try compileText(a, "{\"items\":{}}");
+    var big = std.json.Array.init(a);
+    try big.ensureTotalCapacity(max_steps);
+    for (0..max_steps - 1) |_| big.appendAssumeCapacity(.{ .integer = 1 });
+    try testing.expect((try items.validate(a, .{ .array = big })) == null);
+    big.appendAssumeCapacity(.{ .integer = 1 });
+    try testing.expectEqualStrings("budget", (try items.validate(a, .{ .array = big })).?.keyword);
+    var half = std.json.Array.init(a);
+    try half.ensureTotalCapacity(max_steps / 2 + 100_000);
+    for (0..max_steps / 2 + 100_000) |_| half.appendAssumeCapacity(.{ .integer = 1 });
+    try testing.expect((try items.validate(a, .{ .array = half })) == null);
+}
+
+test "mutation 2026-11-11: a reference name is unescaped over exactly its own bytes" {
+    var buf: [8]u8 = "xx0yyyyy".*;
+    // `a~` ends in a bare `~`: the byte after it in the buffer is stale, and must not be read.
+    try testing.expect(unescapeName(&buf, "a~") == null);
+    var buf2: [8]u8 = "xx1yyyyy".*;
+    try testing.expect(unescapeName(&buf2, "a~") == null);
+    var buf3: [8]u8 = undefined;
+    try testing.expectEqualStrings("a~b/c", unescapeName(&buf3, "a~0b~1c").?);
+}

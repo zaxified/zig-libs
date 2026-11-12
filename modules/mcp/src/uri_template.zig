@@ -1181,3 +1181,161 @@ test "varNames lists every variable in order" {
     const dotted = try Template.parse(arena_state.allocator(), "{a.b_c1}");
     try testing.expectEqualStrings("a.b_c1", dotted.varNames()[0]);
 }
+
+test "mutation 2026-11-11: reserved characters in a value are encoded by every operator that is not + or #" {
+    try expectExpansions(&.{
+        .{ "{;path}", ";path=%2Ffoo%2Fbar" },
+        .{ "{?path}", "?path=%2Ffoo%2Fbar" },
+        .{ "{&path}", "&path=%2Ffoo%2Fbar" },
+        .{ "{.path}", ".%2Ffoo%2Fbar" },
+        .{ "{/path}", "/%2Ffoo%2Fbar" },
+        .{ "{path}", "%2Ffoo%2Fbar" },
+        .{ "{+path}", "/foo/bar" },
+        .{ "{#path}", "#/foo/bar" },
+    });
+}
+
+test "mutation 2026-11-11: every operator's stop characters end a bounded value" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // (template, uri that would match if the stop character were not one)
+    const stopped = [_][2][]const u8{
+        .{ "a/{x}/z", "a/b/c/z" },
+        .{ "a/{x}/z", "a/b?c/z" },
+        .{ "a/{x}/z", "a/b#c/z" },
+        .{ "a/{x}/z", "a/b&c/z" },
+        .{ "a/{x}/z", "a/b,c/z" },
+        .{ "a/{+x}/z", "a/b?c/z" },
+        .{ "a/{+x}/z", "a/b#c/z" },
+        .{ "a{.x}/z", "a.b.c/z" },
+        .{ "a{.x}/z", "a.b/c/z" },
+        .{ "a{.x}/z", "a.b?c/z" },
+        .{ "a{.x}/z", "a.b#c/z" },
+        .{ "a{/x};z", "a/b/c;z" },
+        .{ "a{/x};z", "a/b?c;z" },
+        .{ "a{/x};z", "a/b#c;z" },
+        .{ "a{;x}/z", "a;x=1;2/z" },
+        .{ "a{;x}/z", "a;x=1/2/z" },
+        .{ "a{;x}/z", "a;x=1?2/z" },
+        .{ "a{;x}/z", "a;x=1#2/z" },
+        .{ "a{?x}b", "a?x=1&2b" },
+        .{ "a{?x}b", "a?x=1#2b" },
+        .{ "a{&x}b", "a&x=1&2b" },
+        .{ "a{&x}b", "a&x=1#2b" },
+    };
+    for (stopped) |c| try expectNoMatch(a, c[0], c[1]);
+    // The same templates match when the value holds none of them.
+    try expectMatch(a, "a/{x}/z", "a/b/z", &.{sv("x", "b")});
+    try expectMatch(a, "a/{+x}/z", "a/b/c/z", &.{sv("x", "b/c")});
+    try expectMatch(a, "a{.x}/z", "a.b/z", &.{sv("x", "b")});
+    try expectMatch(a, "a{/x};z", "a/b;z", &.{sv("x", "b")});
+    try expectMatch(a, "a{;x}/z", "a;x=1/z", &.{sv("x", "1")});
+    try expectMatch(a, "a{?x}b", "a?x=1b", &.{sv("x", "1")});
+    try expectMatch(a, "a{&x}b", "a&x=1b", &.{sv("x", "1")});
+}
+
+fn parseOk(a: std.mem.Allocator, tpl: []const u8) !Template {
+    return Template.parse(a, tpl);
+}
+
+test "mutation 2026-11-11: template limits, literals, names and prefix lengths sit exactly at their bounds" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const lit8192: [max_template_len]u8 = @splat('a');
+    _ = try parseOk(a, &lit8192);
+    const lit8193: [max_template_len + 1]u8 = @splat('a');
+    try testing.expectError(error.InvalidTemplate, Template.parse(a, &lit8193));
+    _ = try parseOk(a, "{x:9999}");
+    try testing.expectError(error.InvalidTemplate, Template.parse(a, "{x:10000}"));
+    try testing.expectError(error.InvalidTemplate, Template.parse(a, "{x:+5}"));
+    try testing.expectError(error.InvalidTemplate, Template.parse(a, "{x:05}"));
+    try testing.expectError(error.InvalidTemplate, Template.parse(a, "{x,.a}"));
+    try testing.expectError(error.InvalidTemplate, Template.parse(a, "{x,a.}"));
+    try testing.expectError(error.InvalidTemplate, Template.parse(a, "{a..b}"));
+    _ = try parseOk(a, "{a.b.c}");
+    _ = try parseOk(a, "{a_1.b}");
+    for ("\"'<>\\^`|}") |c| {
+        const tpl = try a.print("a{c}b", .{c});
+        try testing.expectError(error.InvalidTemplate, Template.parse(a, tpl));
+    }
+    try testing.expectError(error.InvalidTemplate, Template.parse(a, "a\x7fb"));
+    try testing.expectError(error.InvalidTemplate, Template.parse(a, "a b"));
+    try testing.expectError(error.InvalidTemplate, Template.parse(a, "a%4"));
+    try testing.expectError(error.InvalidTemplate, Template.parse(a, "a%4G"));
+    try testing.expectError(error.InvalidTemplate, Template.parse(a, "a%G4"));
+    _ = try parseOk(a, "a%4Fb");
+    // Why a template cannot be matched is part of what it reports.
+    try testing.expectEqualStrings("a variable name is used more than once", (try parseOk(a, "{x}{x}")).unmatchable.?);
+    try testing.expectEqualStrings("an explode variable must be first in its expression", (try parseOk(a, "{/a,b*}")).unmatchable.?);
+    try expectNoMatch(a, "{x}/{x}", "");
+}
+
+test "mutation 2026-11-11: expansion keeps unreserved characters, passes reserved ones and pct-triplets only for + and #" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const all_reserved = ":/?#[]@!$&'()*+,;=";
+    try testing.expectEqualStrings(all_reserved, try expandToOwned(a, "{+x}", &.{sv("x", all_reserved)}));
+    try testing.expectEqualStrings("a-b_c~d.e", try expandToOwned(a, "{x}", &.{sv("x", "a-b_c~d.e")}));
+    try testing.expectEqualStrings("50%25", try expandToOwned(a, "{+x}", &.{sv("x", "50%25")}));
+    try testing.expectEqualStrings("%41", try expandToOwned(a, "{+x}", &.{sv("x", "%41")}));
+    try testing.expectEqualStrings("%254", try expandToOwned(a, "{+x}", &.{sv("x", "%4")}));
+    try testing.expectEqualStrings("%25G1", try expandToOwned(a, "{+x}", &.{sv("x", "%G1")}));
+    try testing.expectEqualStrings("%251G", try expandToOwned(a, "{+x}", &.{sv("x", "%1G")}));
+    try testing.expectEqualStrings("%2541", try expandToOwned(a, "{x}", &.{sv("x", "%41")}));
+    const items: []const []const u8 = &.{ "a/b", "c" };
+    try testing.expectEqualStrings("a/b,c", try expandToOwned(a, "{+l}", &.{lv("l", items)}));
+    try testing.expectEqualStrings("#a/b,c", try expandToOwned(a, "{#l}", &.{lv("l", items)}));
+    try testing.expectEqualStrings("a%2Fb,c", try expandToOwned(a, "{l}", &.{lv("l", items)}));
+    // A prefix cuts at code points, and a cut sequence never reads past the end.
+    try testing.expectEqualStrings("a%E2%82", try expandToOwned(a, "{x:5}", &.{sv("x", "a\xe2\x82")}));
+}
+
+test "mutation 2026-11-11: matching bounds — uri length, anchoring, overlap, prefix capture, explode segments" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const ok_uri: [max_uri_len]u8 = @splat('a');
+    try expectMatch(a, "{x}", &ok_uri, &.{sv("x", &ok_uri)});
+    const long_uri: [max_uri_len + 1]u8 = @splat('a');
+    try expectNoMatch(a, "{x}", &long_uri);
+    try expectMatch(a, "a{?x}", "a?x=1#frag", &.{sv("x", "1")});
+    try expectMatch(a, "a?b{?x}", "a?b?x=1", &.{sv("x", "1")});
+    try expectMatch(a, "a#b{?x}", "a#b?x=1", &.{sv("x", "1")});
+    try expectMatch(a, "{#f}{?x}", "#abc?x=1", &.{ sv("f", "abc"), sv("x", "1") });
+    try expectNoMatch(a, "{x}/z", "a/b/z");
+    try expectNoMatch(a, "{x}/z", "z");
+    try expectNoMatch(a, "a{+x}a", "a");
+    try expectNoMatch(a, "a/{+g}", "a");
+    try expectNoMatch(a, "a/{x}/{+g}", "b/q/rest");
+    try expectMatch(a, "ab{x}", "abab", &.{sv("x", "ab")});
+    try expectNoMatch(a, "s/{+g}/a/{x}", "s/q/a/b/c");
+    try expectMatch(a, "{x}-{+g}", "ab-cd-ef", &.{ sv("x", "ab"), sv("g", "cd-ef") });
+    try expectNoMatch(a, "{x}-{+g}", "a/b-c");
+    try expectNoMatch(a, "{x}-{+g}", "ab");
+    try expectMatch(a, "{;x}/{+g}", ";x/rest", &.{ sv("x", ""), sv("g", "rest") });
+    try expectMatch(a, "{;x}/{+g}", ";x=1/rest", &.{ sv("x", "1"), sv("g", "rest") });
+    try expectMatch(a, "{;x}/{+g}", ";x=/rest", &.{ sv("x", ""), sv("g", "rest") });
+    try expectNoMatch(a, "{;x}/{+g}", ";y=1/rest");
+    // Code points, not bytes, count against a prefix length.
+    try expectMatch(a, "{x:2}", "%C3%A9%C3%A9", &.{sv("x", "\u{e9}\u{e9}")});
+    try expectNoMatch(a, "{x:2}", "abc");
+    try expectMatch(a, "a/{+x:3}", "a/abc", &.{sv("x", "abc")});
+    try expectNoMatch(a, "a/{+x:3}", "a/abcd");
+    const empty: []const []const u8 = &.{""};
+    try expectMatch(a, "{;list*}", ";list", &.{lv("list", empty)});
+    const two: []const []const u8 = &.{ "a", "b" };
+    try expectMatch(a, "{;list*}", ";list=a;list=b", &.{lv("list", two)});
+    try expectNoMatch(a, "{;list*}", ";other=a");
+}
+
+test "mutation 2026-11-11: round two — ifemp belongs to ; alone, and a bare ; name needs its = or its next literal" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try expectNoMatch(a, "a{?x}b", "a?xb");
+    try expectNoMatch(a, "a{&x}b", "a&xb");
+    try expectNoMatch(a, "{;x}/{+g}", ";xZ/rest");
+}

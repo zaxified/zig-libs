@@ -227,3 +227,60 @@ test "the chain depth mcp-http reads is the depth allowed" {
     try deep.build(&w, max_chain + 1);
     try testing.expectError(error.HeaderAnnotationNotReachable, check(w.buffered()));
 }
+
+test "mutation 2026-11-11: every tchar is a legal header name character, and the others are not" {
+    const tchars = "!#$%&'*+-.^_`|~";
+    for (tchars) |c| {
+        const s = try testing.allocator.print("{{\"type\":\"object\",\"properties\":{{\"p\":{{\"type\":\"string\",\"x-mcp-header\":\"A{c}\"}}}}}}", .{c});
+        defer testing.allocator.free(s);
+        try check(s);
+    }
+    for ("()/:;<=>?@[]{} ,\x7f\x01") |c| {
+        const s = try testing.allocator.print("{{\"type\":\"object\",\"properties\":{{\"p\":{{\"type\":\"string\",\"x-mcp-header\":\"A\\u{x:0>4}\"}}}}}}", .{c});
+        defer testing.allocator.free(s);
+        try testing.expectError(error.HeaderAnnotationInvalidName, check(s));
+    }
+}
+
+/// `levels` nested `items` objects, the innermost carrying the annotation.
+fn nestedAnnotation(levels: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(testing.allocator);
+    for (0..levels) |_| try buf.appendSlice(testing.allocator, "{\"items\":");
+    try buf.appendSlice(testing.allocator, "{\"type\":\"string\",\"x-mcp-header\":\"H\"}");
+    for (0..levels) |_| try buf.append(testing.allocator, '}');
+    return buf.toOwnedSlice(testing.allocator);
+}
+
+test "mutation 2026-11-11: the walk looks 72 levels down and no further" {
+    const at72 = try nestedAnnotation(72);
+    defer testing.allocator.free(at72);
+    try testing.expectError(error.HeaderAnnotationNotReachable, check(at72));
+    const at73 = try nestedAnnotation(73);
+    defer testing.allocator.free(at73);
+    try check(at73);
+    const at65 = try nestedAnnotation(65);
+    defer testing.allocator.free(at65);
+    try testing.expectError(error.HeaderAnnotationNotReachable, check(at65));
+}
+
+test "mutation 2026-11-11: a property that is itself an array is no parameter, so its elements cannot be annotated" {
+    try testing.expectError(error.HeaderAnnotationNotReachable, check(
+        \\{"type":"object","properties":{"a":[{"x-mcp-header":"H","type":"string"}]}}
+    ));
+}
+
+test "mutation 2026-11-11: enum and examples hold data, not schemas" {
+    try check(
+        \\{"type":"object","properties":{"a":{"type":"string","enum":[{"x-mcp-header":"H"}]}}}
+    );
+    try check(
+        \\{"type":"object","properties":{"a":{"type":"string","examples":[{"x-mcp-header":"H"}]}}}
+    );
+}
+
+test "mutation 2026-11-11: const holds data, not a schema" {
+    try check(
+        \\{"type":"object","properties":{"a":{"type":"string","const":{"x-mcp-header":"H"}}}}
+    );
+}

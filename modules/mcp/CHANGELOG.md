@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-11** — **NO CONSUMER-VISIBLE CHANGE:** Whole-module mutation run over `root.zig` (production part), `uri_template.zig`, `schema_check.zig` and `header_annotations.zig`: 1727 mutant-schemata mutants, 1661 killed over three runs, 64 judged equivalent (each with the invariant that makes it so), 2 more pinned by tests added after the last build; 55 new tests close the survivors (error-shape tables for every parser, request-context accessors in both eras, the subscription and pending limits at their exact edges, a flush-counting writer, an independently computed `StateSeal` token, cursor canonicality, operator stop characters and reserved-character encoding of the URI templates, schema keyword shapes and budget accounting, the `x-mcp-header` walk depth). No defect found.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private nesting prescan behind `jsonDepthOk` now calls `jsontext.depthWithin` (same results); new dependency `jsontext`.
 - **2026-10-28** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: its independent review plus 12 mutants over the changed code, 12 killed, 0 equivalent. Survivors of the first run became tests. Checked panics are not mutated (a test cannot observe a panic in-process). Cumulative 56/56, 0 eq. Card A1 again.
 - **2026-10-28** — **Fix (no-panic sweep):** no consumer-reachable panic, stack overflow or UB left
