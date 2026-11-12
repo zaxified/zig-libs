@@ -668,3 +668,50 @@ test "SubnetIterator: a hand-built iterator past its end, or off the step grid, 
     try std.testing.expect(off.next() != null);
     try std.testing.expect(off.next() == null);
 }
+
+test "IpSet lookups: v6 spans ending below a v4 query keep the search monotone (mutation 2026-11-11)" {
+    // Spans in set order: 1.0.0.0/8, ::1, 2001:db8::/32, 2002::/16. For a v4
+    // query every v6 span ends "after" it (family order), even ::1 whose end
+    // is a smaller integer than the query value. A predicate that compared
+    // the end values across families would call ::1 "before" the query; the
+    // bisection then probes it, moves right and lands past the v4 span that
+    // holds the address (four spans: the probe sequence is 0, 1, 2).
+    var b: na.IpSetBuilder = .empty;
+    defer b.deinit(gpa);
+    try b.addPrefix(gpa, pfx("1.0.0.0/8"));
+    try b.add(gpa, ip("::1"));
+    try b.addPrefix(gpa, pfx("2001:db8::/32"));
+    try b.addPrefix(gpa, pfx("2002::/16"));
+    var s = try b.toSet(gpa);
+    defer s.deinit(gpa);
+    try testing.expectEqual(@as(usize, 4), s.rangeCount());
+    try testing.expect(s.contains(ip("1.2.3.4")));
+    try testing.expect(s.containsRange(rng("1.2.3.4", "1.2.3.9")));
+    try testing.expect(s.overlapsRange(rng("1.2.3.4", "1.2.3.9")));
+    try testing.expect(!s.contains(ip("2.0.0.1")));
+    try testing.expect(s.contains(ip("::1")));
+    try testing.expect(s.contains(ip("2001:db8::7")));
+    try testing.expect(s.contains(ip("2002::1")));
+}
+
+test "systemSource closes its probe socket (mutation 2026-11-11)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    // The kernel hands out the lowest free descriptor: a leaked probe socket
+    // would push the next one up by one per call.
+    const lowest = struct {
+        fn get() ?i32 {
+            const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+            if (linux.errno(rc) != .SUCCESS) return null;
+            const fd: i32 = @intCast(rc);
+            _ = linux.close(fd);
+            return fd;
+        }
+    };
+    const before = lowest.get() orelse return error.SkipZigTest;
+    for (0..3) |_| {
+        _ = na.systemSource(ip("127.0.0.1"));
+        _ = na.systemSource(ip("::1"));
+    }
+    try testing.expectEqual(before, lowest.get().?);
+}
