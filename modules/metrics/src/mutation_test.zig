@@ -215,3 +215,69 @@ test "ProcessCollector: process_virtual_memory_max_bytes is 2^64-1 when the addr
     if (lim.cur != std.math.maxInt(@TypeOf(lim.cur)) and lim.cur >= 1_000_000) return; // %g renders large values in e-notation
     try testing.expect(std.mem.indexOf(u8, out, want) != null);
 }
+
+test "registerCollector: a desc with a bad name or label names is refused and leaves nothing behind" {
+    var reg = metrics.Registry.init(testing.allocator);
+    defer reg.deinit();
+    const cb: metrics.Collector = .{ .collect = noCollect };
+    try testing.expectError(error.InvalidName, reg.registerCollector(&.{.{ .name = "bad name", .help = "h", .kind = .gauge }}, cb));
+    try testing.expectError(error.InvalidName, reg.registerCollector(&.{
+        .{ .name = "fine_one", .help = "h", .kind = .gauge },
+        .{ .name = "1bad", .help = "h", .kind = .gauge },
+    }, cb));
+    try testing.expectError(error.InvalidLabelName, reg.registerCollector(&.{.{ .name = "cl_a", .help = "h", .kind = .gauge, .label_names = &.{"bad-label"} }}, cb));
+    try testing.expectError(error.InvalidLabelName, reg.registerCollector(&.{.{ .name = "cl_b", .help = "h", .kind = .gauge, .label_names = &.{ "x", "x" } }}, cb));
+    // None of the refused names was taken.
+    try reg.registerCollector(&.{.{ .name = "fine_one", .help = "h", .kind = .gauge }}, cb);
+}
+
+test "name collisions: a summary derives only _sum/_count, so a sibling _bucket is free; a histogram's _sum is not" {
+    var reg = metrics.Registry.init(testing.allocator);
+    defer reg.deinit();
+    _ = try reg.summary("sx_lat", "h", &.{}, .{});
+    _ = try reg.counter("sx_lat_bucket", "h", &.{});
+    try testing.expectError(error.NameCollision, reg.counter("sx_lat_sum", "h", &.{}));
+    try testing.expectError(error.NameCollision, reg.counter("sx_lat_count", "h", &.{}));
+    _ = try reg.histogram("hx_lat", "h", &.{}, &.{1});
+    try testing.expectError(error.NameCollision, reg.counter("hx_lat_bucket", "h", &.{}));
+    // The other direction: the derived name is registered first.
+    _ = try reg.counter("sy_lat_bucket", "h", &.{});
+    _ = try reg.summary("sy_lat", "h", &.{}, .{});
+    _ = try reg.counter("hz_lat_bucket", "h", &.{});
+    try testing.expectError(error.NameCollision, reg.histogram("hz_lat", "h", &.{}, &.{1}));
+}
+
+test "Summary: quantile 0 and 1 answer the minimum and the maximum of a small sample" {
+    var reg = metrics.Registry.init(testing.allocator);
+    defer reg.deinit();
+    const s = try reg.summary("q01", "h", &.{}, .{ .objectives = &.{
+        .{ .quantile = 0, .epsilon = 0.01 },
+        .{ .quantile = 1, .epsilon = 0.01 },
+    } });
+    s.observe(5);
+    s.observe(1);
+    s.observe(3);
+    var q: [2]f64 = undefined;
+    const snap = s.snapshot(&q);
+    try testing.expectEqual(@as(u64, 3), snap.count);
+    try testing.expectEqual(@as(f64, 1), q[0]);
+    try testing.expectEqual(@as(f64, 5), q[1]);
+}
+
+test "Endpoint: with max_in_flight set a GET under the limit still serves the exposition; the 405 is text/plain" {
+    var reg = metrics.Registry.init(testing.allocator);
+    defer reg.deinit();
+    const c = try reg.counter("mif_total", "h", &.{});
+    c.inc();
+    var ep: metrics.Endpoint = .{ .registry = &reg, .max_in_flight = 4 };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(ep.middleware());
+    var buf: [4096]u8 = undefined;
+    const got = runWire(&r, "GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, got, "mif_total 1\n") != null);
+    var buf2: [4096]u8 = undefined;
+    const bad = runWire(&r, "POST /metrics HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &buf2);
+    try testing.expect(std.ascii.findIgnoreCase(bad, "content-type: text/plain\r\n") != null);
+}
