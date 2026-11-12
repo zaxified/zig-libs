@@ -1136,7 +1136,10 @@ pub const Handler = struct {
                     if (want_dir and !follow and de != error.NameTooLong and isSymlinkComponent(parent, h.io, leaf)) return error.Forbidden;
                     return mapOpenError(de);
                 };
-                test_f11_leaf_dir_opens += 1; // A1 F11 measurement
+                // A1 F11 measurement. Test builds only: `Handler` is
+                // `shared_read`, so a plain global increment on the serve path
+                // would be a data race between concurrent serves.
+                if (@import("builtin").is_test) test_f11_leaf_dir_opens += 1;
                 if (follow) {
                     verifyContainedDir(h.root, h.io, d) catch {
                         d.close(h.io);
@@ -2350,8 +2353,10 @@ fn statusOf(resp: []const u8) u16 {
 /// A1 F11: counts how many times `resolveForServe` opens the REQUEST'S OWN
 /// target directory (the leaf-is-directory branch) during one `serve` call
 /// — the specific "doubled `openat`" F11 measured. Test-only instrumentation,
-/// same pattern as `test_leave_bytes`/`test_fill_table` below.
-var test_f11_leaf_dir_opens: usize = 0;
+/// same pattern as `test_leave_bytes`/`test_fill_table` below. `void`
+/// outside test builds, so the production serve path holds no shared write.
+var test_f11_leaf_dir_opens: if (@import("builtin").is_test) usize else void =
+    if (@import("builtin").is_test) 0 else {};
 
 /// A middleware that spends the response writer's 4 KiB header copy store
 /// before `staticfiles` gets to compose anything — one header sized so that
