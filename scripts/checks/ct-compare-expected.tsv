@@ -32,7 +32,7 @@ modules/idempotency/src/root.zig	2	7
 modules/iec62351/src/acse.zig	1	0
 modules/iec62351/src/goose.zig	5	2
 modules/jwe/src/enc.zig	1	0
-modules/jwt/src/cache.zig	1	7
+modules/jwt/src/cache.zig	1	9
 modules/jwt/src/pem.zig	1	0
 modules/jwt/src/root.zig	1	35
 modules/mcp/src/root.zig	1	39
