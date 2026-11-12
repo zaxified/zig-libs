@@ -1020,3 +1020,43 @@ test "VerifiedCache: the policy's strings are length-delimited -- (iss ab, aud c
     try testing.expectEqual(@as(?TestValue, null), try cache.lookup(token, &set, p2));
     try testing.expectError(error.IssuerMismatch, cache.verifyJwks(testing.allocator, token, &set, p2, &d));
 }
+
+test "VerifiedCache: a key set with id 1 caches like any other (id 0 is the only anonymous id), and re-inserting a token reuses its slot" {
+    var set = try root.parseJwks(testing.allocator, jwks_a);
+    defer set.deinit();
+    var one = set;
+    one.id = 1;
+    var cache: Cache = try .init(testing.allocator, testing.io, .{ .capacity = 4 }); // one bucket of 4
+    defer cache.deinit();
+    var json_buf: [256]u8 = undefined;
+    var tokens: [4][]u8 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = try mintSub(&json_buf, i, 5000);
+    defer for (tokens) |t| testing.allocator.free(t);
+    // B, A, A, C, D: the repeated A must not take a second slot, so D finds a free one.
+    const order = [_]usize{ 0, 1, 1, 2, 3 };
+    for (order) |i| {
+        var parsed = try root.parseVerifyJwks(testing.allocator, tokens[i], set, policy(1000));
+        defer parsed.deinit();
+        cache.insert(tokens[i], &parsed, &one, policy(1000), .{});
+    }
+    for (tokens) |t| try testing.expect((try cache.lookup(t, &one, policy(1000))) != null);
+    // verifyJwks under id 1 consults the cache as well: a deriver that must not run.
+    var d: Deriver = .{};
+    _ = try cache.verifyJwks(testing.allocator, tokens[0], &one, policy(1000), &d);
+    try testing.expectEqual(@as(usize, 0), d.calls);
+}
+
+test "VerifiedCache: the policy digest is length-delimited even when a policy string embeds a field header (mutation run 2026-11-12)" {
+    // A field is hashed as (tag, u64 length, bytes). With the length left
+    // unwritten the header is a constant (tag + filler; ReleaseSafe fills
+    // `undefined` with 0xaa), and a policy string that embeds those 9 bytes
+    // moves the field boundary without changing the hashed bytes.
+    const key: [Mac.key_length]u8 = @splat(7);
+    const hdr = "\x01\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa";
+    const p1: root.Options = .{ .now_s = 1000, .issuer = .{ .required = "x" ++ hdr ++ "y" }, .audience = .{ .required = "z" } };
+    const p2: root.Options = .{ .now_s = 1000, .issuer = .{ .required = "x" }, .audience = .{ .required = "y" ++ hdr ++ "z" } };
+    const d1 = keyDigest(&key, "", "tok", p1);
+    const d2 = keyDigest(&key, "", "tok", p2);
+    try testing.expect(!std.mem.eql(u8, &d1, &d2));
+    try testing.expect(std.mem.eql(u8, &d1, &keyDigest(&key, "", "tok", p1)));
+}

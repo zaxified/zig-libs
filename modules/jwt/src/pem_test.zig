@@ -143,3 +143,55 @@ test "pem: PrivateKey.deinit leaves no copy of the secret scalar in the value" {
     k.deinit();
     try testing.expect(std.mem.find(u8, std.mem.asBytes(k), &secret) == null);
 }
+
+test "pem: an SPKI ML-DSA-44/65/87 public key reads as its own parameter set and verifies what that set signed (mutation run 2026-11-12)" {
+    const keycodec = @import("keycodec");
+    inline for (.{
+        .{ root.MlDsa44, keycodec.Algorithm.ml_dsa_44, "ml_dsa_44" },
+        .{ root.MlDsa65, keycodec.Algorithm.ml_dsa_65, "ml_dsa_65" },
+        .{ root.MlDsa87, keycodec.Algorithm.ml_dsa_87, "ml_dsa_87" },
+    }) |c| {
+        const kp = try testing.allocator.create(c[0].KeyPair);
+        defer testing.allocator.destroy(kp);
+        kp.* = try c[0].KeyPair.generateDeterministic(@splat(7));
+        const raw = kp.public_key.toBytes();
+        var buf: [keycodec.max_public_der_len]u8 = undefined;
+        const der = try keycodec.writeSpki(&buf, .{ .algorithm = c[1], .key = &raw });
+        const vk = try root.Key.fromSpki(der);
+        try testing.expectEqualStrings(c[2], @tagName(vk));
+        try signAndVerify(@unionInit(root.SigningKey, c[2], kp), vk);
+    }
+}
+
+test "pem: an RSA private key signs RS*/PS* only; every other alg is InvalidKey (mutation run 2026-11-12)" {
+    const k = try testing.allocator.create(root.PrivateKey);
+    defer testing.allocator.destroy(k);
+    const rsa_case = for (vectors.cases) |c| {
+        if (std.mem.eql(u8, c.name, "rsa-pkcs8")) break c;
+    } else unreachable;
+    try root.PrivateKey.fromPem(k, rsa_case.key_pem);
+    defer k.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(3)));
+    for ([_]root.Alg{ .HS256, .HS384, .HS512, .ES256, .ES384, .ES512, .EdDSA, .none, .unknown, .@"ML-DSA-44", .@"ML-DSA-65", .@"ML-DSA-87" }) |alg| {
+        try testing.expectError(error.InvalidKey, k.rsaSigningKey(alg, csprng.random()));
+        try testing.expectError(error.InvalidKey, k.rsaSigningKey(alg, null));
+    }
+}
+
+test "pem: an SPKI of an algorithm JWS has no use for is InvalidKey (X25519/X448/Ed448/ML-KEM), never read as another key type (mutation run 2026-11-12)" {
+    const keycodec = @import("keycodec");
+    const cases = [_]struct { a: keycodec.Algorithm, len: usize }{
+        .{ .a = .x25519, .len = 32 },
+        .{ .a = .x448, .len = 56 },
+        .{ .a = .ed448, .len = 57 },
+        .{ .a = .ml_kem_512, .len = 800 },
+        .{ .a = .ml_kem_768, .len = 1184 },
+        .{ .a = .ml_kem_1024, .len = 1568 },
+    };
+    var raw: [2048]u8 = @splat(0x42);
+    for (cases) |c| {
+        var buf: [keycodec.max_public_der_len]u8 = undefined;
+        const der = keycodec.writeSpki(&buf, .{ .algorithm = c.a, .key = raw[0..c.len] }) catch continue;
+        try testing.expectError(error.InvalidKey, root.Key.fromSpki(der));
+    }
+}

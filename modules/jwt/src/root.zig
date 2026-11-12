@@ -10332,3 +10332,95 @@ test "resourceInvalidReason: every verification failure names its own cause in t
     };
     for (cases) |c| try testing.expectEqualStrings(c.body, resourceInvalidReason(c.err));
 }
+
+test "ResourceServer: the scheme must be followed by exactly a space, a control character is no separator (mutation run 2026-11-12)" {
+    const gpa = testing.allocator;
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_jwks_url, .body = rs_jwks_json },
+    } };
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    defer provider.deinit();
+    var fc: FixedClock = .{ .now_s = 1000 };
+    var rs = try ResourceServer.init(gpa, .{
+        .provider = &provider,
+        .claim_opts = .{ .issuer = .{ .required = "https://issuer.example" }, .audience = .{ .required = "api://svc" } },
+        .required_scopes = &.{"read"},
+        .clock = fc.clock(),
+    });
+    defer rs.deinit();
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(rs.middleware());
+    try r.get("/data", resProtectedHandler);
+
+    const good_claims =
+        \\{"iss":"https://issuer.example","aud":"api://svc","sub":"alice","exp":2000,"scope":"read write"}
+    ;
+    var tok_buf: [1024]u8 = undefined;
+    const good = mintRs256(&tok_buf, good_claims);
+    var req_buf: [1400]u8 = undefined;
+    var out_buf: [1024]u8 = undefined;
+    res_test_hits = 0;
+    // Byte 6 below and above the space: neither is a separator.
+    for ([_]u8{ '\t', 0x01, 0x1f, '!', '~', 'x' }) |sep| {
+        var bearer_buf: [1100]u8 = undefined;
+        const bearer = std.mem.print(&bearer_buf, "Bearer{c}{s}", .{ sep, good }) catch unreachable;
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try testing.expect(!std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    }
+    try testing.expectEqual(@as(u32, 0), res_test_hits);
+    // A one-byte token is a present (invalid) credential, not a missing one.
+    const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", "Bearer x"), &out_buf);
+    try resExpectStatus(got, "401");
+    try resExpectHeaderLine(got, "WWW-Authenticate: Bearer error=\"invalid_token\"");
+}
+
+test "Guard.challengeFor: an allocation failure has no challenge, whatever scopes are required (mutation run 2026-11-12)" {
+    const gpa = testing.allocator;
+    var set = try parseJwks(gpa, rs_jwks_json);
+    defer set.deinit();
+    var g_scoped = try Guard.init(gpa, .{ .jwks = &set, .claim_opts = .{ .issuer = .any, .audience = .any }, .required_scopes = &.{"read"} });
+    defer g_scoped.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), g_scoped.challengeFor(error.OutOfMemory));
+    try testing.expect(g_scoped.challengeFor(error.InsufficientScope) != null);
+    try testing.expect(g_scoped.challengeFor(error.MissingToken) != null);
+    try testing.expect(g_scoped.challengeFor(error.InvalidToken) != null);
+}
+
+test "AuthContext.hasScope: granted and not granted (mutation run 2026-11-12)" {
+    var actx: AuthContext = .{ .token = try scopeClaimsOf(testing.allocator,
+        \\{"scope":"read write"}
+    ) };
+    defer actx.deinit();
+    try testing.expect(actx.hasScope("read"));
+    try testing.expect(actx.hasScope("write"));
+    try testing.expect(!actx.hasScope("admin"));
+    try testing.expect(!actx.hasScope("rea"));
+}
+
+test "Guard over a static JwkSet with issuer = .any accepts any issuer, and a pinned issuer only its own (mutation run 2026-11-12)" {
+    const gpa = testing.allocator;
+    var jwks = try parseJwks(gpa, rs_jwks_json);
+    defer jwks.deinit();
+    var fc: FixedClock = .{ .now_s = 1000 };
+    var guard = try Guard.init(gpa, .{
+        .jwks = &jwks,
+        .claim_opts = .{ .issuer = .any, .audience = .{ .required = "api://svc" } },
+        .clock = fc.clock(),
+    });
+    defer guard.deinit();
+    test_guard = &guard;
+    defer test_guard = null;
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.get("/data", guardTestHandler);
+    var tok_buf: [1024]u8 = undefined;
+    var bearer_buf: [1100]u8 = undefined;
+    var req_buf: [1400]u8 = undefined;
+    var out_buf: [1024]u8 = undefined;
+    inline for ([_][]const u8{ "https://issuer.example", "https://other.example", "x" }) |iss| {
+        const tok = mintRs256(&tok_buf, "{\"iss\":\"" ++ iss ++ "\",\"aud\":\"api://svc\",\"sub\":\"alice\",\"exp\":2000}");
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+        try resExpectStatus(resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf), "200");
+    }
+}

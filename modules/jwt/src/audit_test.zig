@@ -1158,3 +1158,114 @@ test "encodeJson: an allocation failure at any point, the heap header path inclu
     }
     return error.TestUnexpectedResult;
 }
+
+// ── mutation run 2026-11-12 (second whole-module run, jwt-run2) ─────────────
+
+test "parse: the dots of a compact token are counted exactly, an adjacent dot is never skipped" {
+    // `"x".."y".z` shapes: a search that starts one byte late (dot1 + 2 /
+    // dot2 + 2) would walk past an adjacent dot and report a base64 error
+    // instead of the structural one.
+    const bad = [_][]const u8{
+        "e30..e30.AAAA", // empty payload AND a fourth segment
+        "e30.e30..", // third dot right after the second
+        "e30.e30.A.", // fourth segment empty
+        "e30.e30.A.B", // fourth segment
+        "e30..e30", // empty payload
+        ".e30.AAAA", // empty header
+        "e30.e30", // two segments
+        "e30",
+        "",
+    };
+    for (bad) |t| try testing.expectError(error.MalformedToken, jwt.parse(gpa, t));
+}
+
+test "key sources: only status 200 is a document, 100..199 and 3xx are HttpStatus (discovery and JWKS)" {
+    const F = struct {
+        fn f(ctx: *anyopaque, _: []const u8, buf: []u8) jwt.FetchError!jwt.Fetcher.Result {
+            const st: *u16 = @ptrCast(@alignCast(ctx));
+            const body = "{\"keys\":[]}";
+            @memcpy(buf[0..body.len], body);
+            return .{ .status = st.*, .body_len = body.len };
+        }
+    };
+    var st: u16 = 199;
+    const fetcher: jwt.Fetcher = .{ .ctx = &st, .fetchFn = F.f };
+    for ([_]u16{ 0, 100, 199, 201, 204, 301, 404, 500 }) |s| {
+        st = s;
+        try testing.expectError(error.HttpStatus, jwt.fetchJwks(gpa, fetcher, "https://x/jwks"));
+        try testing.expectError(error.HttpStatus, jwt.discover(gpa, fetcher, "https://x"));
+    }
+    st = 200;
+    var ok = try jwt.fetchJwks(gpa, fetcher, "https://x/jwks");
+    ok.deinit();
+}
+
+test "RSA keys: a modulus_len above the real one is InvalidKey as well, not a signature-length verdict" {
+    var n: [256]u8 = @splat(0);
+    n[255] = 1;
+    n[0] = 0x80;
+    const vk = try jwt.rsa.VerifyKey.fromBytes(&n, &[_]u8{ 1, 0, 1 });
+    const lying: jwt.Key = .{ .rsa = .{ .inner = vk, .modulus_len = 257 } };
+    const t = try rawToken(gpa, "{\"alg\":\"RS256\"}", "{\"exp\":2000}", &(@as([257]u8, @splat(7))));
+    defer gpa.free(t);
+    var p = try jwt.parse(gpa, t);
+    defer p.deinit();
+    try testing.expectError(error.InvalidKey, jwt.verify(&p, lying));
+}
+
+test "Provider.refresh by issuer: an allocation failure during discovery or the key fetch is OutOfMemory, never a silent success without keys" {
+    const kp = try edKp(0x24);
+    const jwks_json = try edJwks(gpa, &kp, "a");
+    defer gpa.free(jwks_json);
+    var fx: Routed = .{
+        .jwks_body = jwks_json,
+        .disco_body = "{\"issuer\":\"https://issuer.example\",\"jwks_uri\":\"https://issuer.example/jwks\"}",
+    };
+    var i: usize = 0;
+    var ok_runs: usize = 0;
+    while (i < 400) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = i });
+        var provider = jwt.Provider.init(fa.allocator(), fx.fetcher(), .{ .issuer = ISS, .ttl_s = 0 }) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        defer provider.deinit();
+        provider.refresh(1000) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        // A refresh that reports success has the discovery document and the keys.
+        try testing.expect(provider.metadata != null);
+        try testing.expect(provider.jwks != null);
+        ok_runs += 1;
+        if (!fa.has_induced_failure) break;
+    }
+    try testing.expect(ok_runs > 0);
+}
+
+test "encodeJson / SigningKey.sign: an RSA key of 2047 bits is below the signing floor (mutation run 2026-11-12)" {
+    const builtin = @import("builtin");
+    // Two ~1024-bit primes: p from a 2048-bit pair, q from a 2046-bit pair, so n = p*q has 2047 bits.
+    // Key generation is slow in Debug; the release lanes carry this test.
+    if (builtin.mode == .debug) return error.SkipZigTest;
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(11)));
+    const a = try gpa.create(jwt.rsa.KeyPair);
+    defer gpa.destroy(a);
+    const b = try gpa.create(jwt.rsa.KeyPair);
+    defer gpa.destroy(b);
+    try jwt.rsa.generate(a, csprng.random(), 2048, 65537);
+    defer a.secret_key.deinit();
+    try jwt.rsa.generate(b, csprng.random(), 2046, 65537);
+    defer b.secret_key.deinit();
+    var pb: [128]u8 = undefined;
+    var qb: [128]u8 = undefined;
+    try a.secret_key.p.v.toBytes(&pb, .big);
+    try b.secret_key.p.v.toBytes(&qb, .big);
+    const odd = try gpa.create(jwt.rsa.KeyPair);
+    defer gpa.destroy(odd);
+    try jwt.rsa.SecretKey.fromPrimes(&odd.secret_key, &pb, &qb, &[_]u8{ 1, 0, 1 });
+    defer odd.secret_key.deinit();
+    if (odd.secret_key.n.bits() != 2047) return error.SkipZigTest; // top bits of the generated primes decide
+    try testing.expectError(error.InvalidKey, jwt.encodeJson(gpa, "{}", .{ .rs256 = odd }, .{}));
+    try testing.expectError(error.InvalidKey, jwt.encodeJson(gpa, "{}", .{ .ps256 = .{ .key = odd, .random = csprng.random() } }, .{}));
+}
