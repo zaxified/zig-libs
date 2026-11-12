@@ -726,3 +726,44 @@ test "Form.parse: a gunzipped request body is read to its decoded end, not to th
     try testing.expect(std.mem.startsWith(u8, out.buffered(), "HTTP/1.1 200 "));
     try testing.expect(std.mem.endsWith(u8, out.buffered(), "xyz"));
 }
+
+// ── mutation run 2026-11-12 (server half): tests for survivors ──────────────
+
+fn maFailStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    return error.ReadFailed;
+}
+
+test "mutation-a: readBody maps a failing reader to ReadFailed and an exhausted allocator to OutOfMemory" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    for ([_]?u64{ null, 5 }) |len| {
+        var r: std.Io.Reader = .{ .vtable = &.{ .stream = maFailStream }, .buffer = &.{}, .seek = 0, .end = 0 };
+        try testing.expectError(error.ReadFailed, parseSource(arena.allocator(), .{
+            .method = .post,
+            .content_type = urlencoded_type,
+            .query = "",
+            .body = .{ .reader = &r },
+            .content_length = len,
+        }, .{}));
+        // Every allocation point of a parse fails in turn: only OutOfMemory may come out.
+        var n: usize = 0;
+        var saw_oom = false;
+        while (n < 24) : (n += 1) {
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = n });
+            var fa: std.heap.ArenaAllocator = .init(failing.allocator());
+            defer fa.deinit();
+            var rr: std.Io.Reader = .fixed("a=1&b=2&c=3");
+            if (parseSource(fa.allocator(), .{
+                .method = .post,
+                .content_type = urlencoded_type,
+                .query = "q=1",
+                .body = .{ .reader = &rr },
+                .content_length = if (len != null) 11 else null,
+            }, .{})) |_| {} else |e| {
+                try testing.expectEqual(error.OutOfMemory, e);
+                saw_oom = true;
+            }
+        }
+        try testing.expect(saw_oom);
+    }
+}

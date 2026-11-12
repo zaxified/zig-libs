@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-12** — **TESTS (mutation run, server half, ReleaseSafe schemata over Server, h2_server, h1, body, form, multipart, servecontent, sse, problem, crossorigin, hostguard, bufpool, zeroize):** 3731 mutants run (3280 killed, 58 equivalent), new tests for survivors in `Server.zig` (absolute-form authority and Host clash, asterisk-form, handler-closed connection, no 500 after the head went out, upgrade/tunnel refusals, `setHeader("Trailer")` error mapping, `reset()`), `body.zig` (media-type parameters and duplicate comparison), `form.zig` (read/allocation error mapping) and `h1.zig` (version bytes); no production change.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written hex-digit switch is replaced by `std.fmt.charToDigit(c, 16)` (same digits accepted, both cases, same results).
 - **2026-11-07** — **NO CONSUMER-VISIBLE CHANGE:** `sizeprobe/build.zig` wires `keycodec` into `rsa` (rsa imports it since the keycodec move; full CI's `check-http-sizeprobe` failed to compile the probe).
 - **2026-11-07** — **TEST:** `h2_client.Session.readBody` with an empty buffer returns `EmptyBuffer` (the former contract panic, pinned).

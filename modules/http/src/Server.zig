@@ -11758,3 +11758,142 @@ test "wave4: trailers: a ninth name is refused at the declaration; delHeader(Tra
     try testing.expectError(error.TooManyTrailers, rw.declareTrailer("X-I"));
     try testing.expectError(error.TrailerNotDeclared, rw.setTrailer("X-I", "3"));
 }
+
+// ── mutation run 2026-11-12 (server half): tests for survivors ──────────────
+
+fn maServe(handler: Handler, wire: []const u8, out_buf: []u8) []const u8 {
+    var in: Reader = .fixed(wire);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    var trailer_buf: [256]u8 = undefined;
+    serveStream(.{
+        .handler = handler,
+        .server_name = "test",
+        .now = .{ .epochSeconds = fixedEpoch },
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+        .trailers = &trailer_buf,
+    });
+    return out.buffered();
+}
+
+fn maCount(hay: []const u8, needle: []const u8) usize {
+    return std.mem.count(u8, hay, needle);
+}
+
+fn maFirstLine(got: []const u8) []const u8 {
+    return got[0 .. std.mem.indexOf(u8, got, "\r\n") orelse got.len];
+}
+
+fn maEchoPath(req: *Request, rw: *ResponseWriter) anyerror!void {
+    try rw.writer().print("path={s}", .{req.path});
+}
+
+fn maCloseHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    _ = req;
+    rw.close_connection = true;
+    try rw.writeAll("bye");
+}
+
+fn maFailAfterHead(req: *Request, rw: *ResponseWriter) anyerror!void {
+    _ = req;
+    // More than the 64-byte response buffer: the head goes out chunked.
+    var big: [120]u8 = undefined;
+    @memset(&big, 'x');
+    try rw.writeAll(&big);
+    return error.Boom;
+}
+
+fn maUpgradeProbe(req: *Request, rw: *ResponseWriter) anyerror!void {
+    if (req.method == .connect) {
+        rw.tunnel(200) catch |e| return rw.setHeader("X-R", @errorName(e));
+        return;
+    }
+    rw.upgrade("foo") catch |e| return rw.setHeader("X-R", @errorName(e));
+}
+
+test "mutation-a: an absolute-form target whose authority is not a host is a 400" {
+    var out_buf: [1024]u8 = undefined;
+    for ([_][]const u8{ "http:///x", "http://a<b/x", "ftp://h/x" }) |target| {
+        var wire_buf: [128]u8 = undefined;
+        const wire = try std.fmt.bufPrint(&wire_buf, "GET {s} HTTP/1.0\r\n\r\n", .{target});
+        const got = maServe(maEchoPath, wire, &out_buf);
+        try testing.expectEqualStrings("HTTP/1.1 400 Bad Request", maFirstLine(got));
+    }
+    const ok = maServe(maEchoPath, "GET http://x/x HTTP/1.1\r\nHost: x\r\n\r\n", &out_buf);
+    // A Host that disagrees with the authority is refused (RFC 9112 section 3.3).
+    const clash = maServe(maEchoPath, "GET http://h/x HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
+    try testing.expectEqualStrings("HTTP/1.1 400 Bad Request", maFirstLine(clash));
+    try testing.expectEqualStrings("HTTP/1.1 200 OK", maFirstLine(ok));
+    try testing.expect(std.mem.endsWith(u8, ok, "path=/x"));
+}
+
+test "mutation-a: the asterisk-form target reaches the handler untouched" {
+    var out_buf: [1024]u8 = undefined;
+    const got = maServe(maEchoPath, "OPTIONS * HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+    try testing.expect(std.mem.endsWith(u8, got, "path=*"));
+}
+
+test "mutation-a: a handler that closes the connection ends the exchange" {
+    var out_buf: [2048]u8 = undefined;
+    const got = maServe(maCloseHandler, "GET /a HTTP/1.1\r\nHost: t\r\n\r\nGET /b HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
+    try testing.expectEqual(@as(usize, 1), maCount(got, "HTTP/1.1 200 "));
+    try testing.expect(std.mem.indexOf(u8, got, "Connection: close\r\n") != null);
+}
+
+test "mutation-a: a handler failing after the head went out gets no 500 and no further request" {
+    var out_buf: [4096]u8 = undefined;
+    const got = maServe(maFailAfterHead, "GET /a HTTP/1.1\r\nHost: t\r\n\r\nGET /b HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
+    try testing.expectEqual(@as(usize, 1), maCount(got, "HTTP/1.1 "));
+    try testing.expectEqual(@as(usize, 0), maCount(got, " 500 "));
+}
+
+test "mutation-a: upgrade and tunnel are refused when the request carries a body, on HTTP/1.0 and on HEAD" {
+    var out_buf: [1024]u8 = undefined;
+    const want = "X-R: Unsupported\r\n";
+    const post = maServe(maUpgradeProbe, "POST /a HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nConnection: close\r\n\r\nab", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, post, want) != null);
+    const h10 = maServe(maUpgradeProbe, "GET /a HTTP/1.0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, h10, want) != null);
+    const head = maServe(maUpgradeProbe, "HEAD /a HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, head, want) != null);
+    const con_body = maServe(maUpgradeProbe, "CONNECT h:1 HTTP/1.1\r\nHost: h:1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nab", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, con_body, want) != null);
+    // A plain GET upgrades: 101 on the wire.
+    const ok = maServe(maUpgradeProbe, "GET /a HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: foo\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 101 "));
+}
+
+fn maApi(req: *Request, rw: *ResponseWriter) anyerror!void {
+    _ = req;
+    var line: [256]u8 = undefined;
+    var lw: Writer = .fixed(&line);
+    // A Trailer header naming more fields than the table holds is TooManyHeaders;
+    // a list with a forbidden member declares nothing at all.
+    rw.setHeader("Trailer", "A,B,C,D,E,F,G,H,I") catch |e| try lw.print("t9={s};", .{@errorName(e)});
+    rw.setHeader("Trailer", "X-Ok, Content-Length") catch |e| try lw.print("bad={s};", .{@errorName(e)});
+    rw.setTrailer("X-Ok", "v") catch |e| try lw.print("undeclared={s};", .{@errorName(e)});
+    try rw.setHeader("X-A", "1");
+    rw.status = 404;
+    try rw.declareTrailers(&.{"X-T"});
+    try rw.reset();
+    // reset() restored the table: eight trailers fit again, none of the old state is left.
+    try rw.declareTrailers(&.{ "A", "B", "C", "D", "E", "F", "G", "H" });
+    try rw.writeAll(lw.buffered());
+}
+
+test "mutation-a: ResponseWriter.setHeader(Trailer) error mapping and reset() restoring every field" {
+    var out_buf: [2048]u8 = undefined;
+    const got = maServe(maApi, "GET /a HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+    try testing.expect(std.mem.indexOf(u8, got, "X-A:") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "t9=TooManyHeaders;bad=InvalidHeader;undeclared=TrailerNotDeclared;") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "Trailer: A, B, C, D, E, F, G, H\r\n") != null);
+}

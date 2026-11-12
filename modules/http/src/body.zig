@@ -732,3 +732,35 @@ test "indexOfUnquoted: a backslash at the very end of a quoted run is not an ove
     try std.testing.expectEqual(@as(?usize, null), indexOfUnquoted("\"\\", ';'));
     try std.testing.expectEqual(@as(?usize, 6), indexOfUnquoted("\"a\\\";\";", ';'));
 }
+
+// ── mutation run 2026-11-12 (server half): tests for survivors ──────────────
+
+test "mutation-a: checkMediaType refuses a parameter that does not start with a semicolon" {
+    // `cd=e` after a value is not a parameter; skipping its first byte would read `d=e`.
+    try std.testing.expect(!checkMediaType("text/plain; a=b cd=e").clean);
+    try std.testing.expect(!checkMediaType("text/plain; a=b c=d").clean);
+    try std.testing.expect(checkMediaType("text/plain; a=b; c=d").clean);
+}
+
+test "mutation-a: duplicate parameters compare by full unescaped value, in both directions" {
+    try std.testing.expectEqualStrings("", checkMediaType("text/plain; a=x; a=xy").media_type);
+    try std.testing.expectEqualStrings("", checkMediaType("text/plain; a=xy; a=x").media_type);
+    // Quoted-pairs are unescaped before the comparison: `\y` stays, `\\` is one backslash.
+    try std.testing.expectEqualStrings("text/plain", checkMediaType("text/plain; a=\"x\\y\"; a=\"x\\\\y\"").media_type);
+    try std.testing.expectEqualStrings("", checkMediaType("text/plain; a=\"x\\\"y\"; a=\"xy\"").media_type);
+    try std.testing.expectEqualStrings("text/plain", checkMediaType("text/plain; a=\"x\\\"y\"; A=\"x\\\"y\"").media_type);
+}
+
+test "mutation-a: ParamIterator skips nameless parameters and survives a lone quote value" {
+    var it = ContentType.parse("text/plain; =v; ; a=b").?.params();
+    const first = it.next().?;
+    try std.testing.expectEqualStrings("a", first.name);
+    try std.testing.expectEqualStrings("b", first.value);
+    try std.testing.expect(it.next() == null);
+    var it2 = ContentType.parse("text/plain; q=\"").?.params();
+    try std.testing.expectEqualStrings("\"", it2.next().?.value);
+    var it3 = ContentType.parse("text/plain; q=\"x").?.params();
+    try std.testing.expectEqualStrings("\"x", it3.next().?.value);
+    var it4 = ContentType.parse("text/plain; q=\"\"").?.params();
+    try std.testing.expectEqualStrings("", it4.next().?.value);
+}

@@ -2544,3 +2544,18 @@ test "ChunkedWriter.init refuses an empty buffer (2026-11-07)" {
     var one: [1]u8 = undefined;
     _ = try ChunkedWriter.init(&out, &one);
 }
+
+// ── mutation run 2026-11-12 (server half): tests for survivors ──────────────
+
+test "mutation-a: only HTTP/1.0 and HTTP/1.1 are versions, byte by byte" {
+    for ([_][]const u8{ "HTTP/2.1", "HTTP/1x1", "HTTP/2.0", "HTTP/1.2", "HTTP/0.9" }) |v| {
+        var req_buf: [64]u8 = undefined;
+        const req = try std.fmt.bufPrint(&req_buf, "GET / {s}\r\nHost: t\r\n\r\n", .{v});
+        try std.testing.expectError(error.UnsupportedVersion, RequestHead.parse(req));
+        var resp_buf: [64]u8 = undefined;
+        const resp = try std.fmt.bufPrint(&resp_buf, "{s} 200 OK\r\nContent-Length: 0\r\n\r\n", .{v});
+        try std.testing.expectError(error.UnsupportedVersion, ResponseHead.parse(resp));
+    }
+    _ = try RequestHead.parse("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    _ = try ResponseHead.parse("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+}
