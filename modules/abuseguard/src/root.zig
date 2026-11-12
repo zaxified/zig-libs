@@ -4546,3 +4546,42 @@ test "persist: parseSnapshotLine rejects an underscore in the millisecond count"
     // Kills: the digit loop's upper bound dropped (parseInt skips '_').
     try testing.expectError(error.InvalidRecord, parseSnapshotLine("greylist 192.0.2.1/32 1_0"));
 }
+
+test "restore: a greylist the full store cannot track answers StoreFull, like a ban does" {
+    // Kills: the greylist branch of `restore` skipping an untrackable key
+    // (`continue`) instead of reporting `StoreFull`.
+    var tc: TestClock = .{};
+    var g = try Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .clock = tc.clock() });
+    defer g.deinit();
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("10.0.0.1"))); // pins the only slot
+    try testing.expectError(error.StoreFull, g.restore(&.{.{ .prefix = mkPrefix("10.0.0.2/32"), .greylist_remaining_ms = 1000 }}));
+    try testing.expect(!g.isGreylisted(mkIp("10.0.0.2")));
+    g.connClosed(mkIp("10.0.0.1"));
+}
+
+fn hStatus399(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(399);
+    try ctx.res.writeAll("x");
+}
+
+fn hStatus499(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(499);
+    try ctx.res.writeAll("x");
+}
+
+test "middleware: the 4xx range is 400..499 -- 399 never strikes, 499 does" {
+    // Kills: the lower bound `>= 400` widened to `>= 399`.
+    var tc: TestClock = .{};
+    var g = try Guard.init(testing.allocator, .{ .ban_threshold = 1, .ban_after_offenses = 0, .strike_decay_ms = 0, .clock = tc.clock() });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/s399", hStatus399);
+    try r.get("/s499", hStatus499);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWirePeer(&r, wire("/s399", ""), &buf, mkPeer4("203.0.113.81", 1)), "399");
+    try testing.expectEqual(@as(usize, 0), g.trackedCount());
+    try expectStatus(runWirePeer(&r, wire("/s499", ""), &buf, mkPeer4("203.0.113.82", 1)), "499");
+    try testing.expect(g.isGreylisted(mkIp("203.0.113.82")));
+}
