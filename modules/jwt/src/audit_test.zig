@@ -1125,3 +1125,36 @@ test "Provider: neither issuer nor jwks_uri is error.NoKeySource at init and at 
     p.options.jwks_uri = null; // public options changed after init
     try std.testing.expectError(error.NoKeySource, p.refresh(1000));
 }
+
+// ── whole-module mutation run 2026-11-12 ───────────────────────────────────
+
+test "encodeJson: a payload that is valid JSON but not an object is InvalidClaims, whatever its first byte" {
+    const secret: [32]u8 = @splat(0x42);
+    const payloads = [_][]const u8{ "[]", "[1]", "1", "-1", "0", "\"s\"", "true", "false", "null", " [1] ", "\t\"x\"" };
+    for (payloads) |p| {
+        try testing.expectError(error.InvalidClaims, jwt.encodeJson(gpa, p, .{ .hs256 = &secret }, .{}));
+    }
+}
+
+fn encodeLongKidOom(a: std.mem.Allocator) anyerror!void {
+    const secret: [32]u8 = @splat(0x42);
+    const kid: [300]u8 = @splat('k'); // the header outgrows the 256-byte stack buffer
+    // Not freed: the caller's arena owns it (encode.zig's shrink-realloc fallback hands back a slice
+    // shorter than its block, which a real `free` would reject -- see the mutation report).
+    _ = try jwt.encodeJson(a, "{\"sub\":\"x\"}", .{ .hs256 = &secret }, .{ .kid = &kid });
+}
+
+test "encodeJson: an allocation failure at any point, the heap header path included, is OutOfMemory (never InvalidClaims)" {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = i });
+        encodeLongKidOom(fa.allocator()) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        if (!fa.has_induced_failure) return;
+    }
+    return error.TestUnexpectedResult;
+}

@@ -10049,3 +10049,286 @@ test "JWKS: an OKP key without crv is missing_crv; key material that is not base
     try testing.expectEqual(JwkSkipReason.missing_crv, set.skipped[0].reason);
     try testing.expectEqual(JwkSkipReason.invalid_base64, set.skipped[1].reason);
 }
+
+// ── whole-module mutation run 2026-11-12: tests for the survivors ───────────
+
+/// An allocator whose `index`-th allocation fails and which never grows a block
+/// in place (`resize`/`remap` refuse), so every growth is an allocation that can
+/// fail with the old block still live -- the shape an `errdefer` must clean up.
+const NoGrowAllocator = struct {
+    backing: std.mem.Allocator,
+    fail_at: usize,
+    count: usize = 0,
+    failed: bool = false,
+
+    fn allocator(self: *NoGrowAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *NoGrowAllocator = @ptrCast(@alignCast(ctx));
+        defer self.count += 1;
+        if (self.count == self.fail_at) {
+            self.failed = true;
+            return null;
+        }
+        return self.backing.rawAlloc(len, alignment, ra);
+    }
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *NoGrowAllocator = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ra);
+    }
+};
+
+/// Run `f` with an allocator failing at index 0, 1, 2, ... until it succeeds
+/// without an induced failure, once with std's failing allocator and once with
+/// `NoGrowAllocator`. Every failure must be exactly `OutOfMemory` (an
+/// allocation failure is never reported as a content error) and `f` must leak
+/// nothing (the testing allocator underneath checks that).
+fn sweepOutOfMemory(comptime f: fn (std.mem.Allocator) anyerror!void) !void {
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        f(fa.allocator()) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        if (!fa.has_induced_failure) break;
+    } else return error.TestUnexpectedResult;
+    i = 0;
+    while (i < 2000) : (i += 1) {
+        var ng: NoGrowAllocator = .{ .backing = testing.allocator, .fail_at = i };
+        f(ng.allocator()) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        if (!ng.failed) return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn oomParse(a: std.mem.Allocator) anyerror!void {
+    // A payload with many members: its JSON tree outgrows the arena's pre-sized chunk,
+    // so the parse itself allocates (and can fail) while building the object.
+    var payload: [4096]u8 = undefined;
+    var w: Writer = .fixed(&payload);
+    try w.writeAll("{\"iss\":\"a\",\"aud\":[\"x\",\"y\"],\"exp\":1.5");
+    for (0..150) |n| try w.print(",\"c{d}\":{d}", .{ n, n });
+    try w.writeAll("}");
+    var buf: [8192]u8 = undefined;
+    const tok = buildToken(&buf, "{\"alg\":\"HS256\",\"kid\":\"k\"}", w.buffered());
+    var p = try parse(a, tok);
+    p.deinit();
+}
+
+fn oomParseJwks(a: std.mem.Allocator) anyerror!void {
+    var set = try parseJwks(a, rs_jwks_json);
+    set.deinit();
+    // A key whose decoded material (6000 bytes) does not fit what the JSON parse left in the arena.
+    const head = "{\"keys\":[{\"kty\":\"oct\",\"k\":\"";
+    const tail = "\"}]}";
+    var json: [head.len + 8000 + tail.len]u8 = undefined;
+    @memcpy(json[0..head.len], head);
+    @memset(json[head.len..][0..8000], 'A');
+    @memcpy(json[head.len + 8000 ..], tail);
+    var big = try parseJwks(a, &json);
+    big.deinit();
+}
+
+fn oomDiscover(a: std.mem.Allocator) anyerror!void {
+    var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_wellknown_url, .body = test_discovery_json }} };
+    var md = try discover(a, stub.fetcher(), "https://issuer.example");
+    md.deinit();
+}
+
+fn oomRefresh(a: std.mem.Allocator) anyerror!void {
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_wellknown_url, .body = test_discovery_json },
+        .{ .url = test_jwks_url, .body = rs_jwks_json },
+    } };
+    var p = try Provider.init(a, stub.fetcher(), .{ .issuer = "https://issuer.example" });
+    defer p.deinit();
+    try p.refresh(1000);
+}
+
+fn oomTokenResponse(a: std.mem.Allocator) anyerror!void {
+    var tr = try parseTokenResponse(a,
+        \\{"access_token":"a","token_type":"Bearer","expires_in":3600,"id_token":"x","refresh_token":"r","scope":"openid"}
+    );
+    tr.deinit();
+}
+
+fn oomOAuthError(a: std.mem.Allocator) anyerror!void {
+    var e = try parseOAuthError(a,
+        \\{"error":"invalid_request","error_description":"bad thing","error_uri":"https://e.example/x"}
+    );
+    e.deinit();
+}
+
+fn oomAuthorizationUrl(a: std.mem.Allocator) anyerror!void {
+    const url = try buildAuthorizationUrl(a, "https://issuer.example/authorize", .{
+        .client_id = "c",
+        .redirect_uri = "https://app.example/cb",
+        .state = "s",
+        .nonce = "n",
+        .code_challenge = "ch",
+        .code_challenge_method = .S256,
+    });
+    a.free(url);
+}
+
+fn oomTokenRequest(a: std.mem.Allocator) anyerror!void {
+    var tr = try buildTokenRequest(a, "https://issuer.example/token", .{
+        .code = "c",
+        .redirect_uri = "https://app.example/cb",
+        .client_id = "id",
+        .code_verifier = "v",
+        .client_auth = .{ .client_secret_post = "secret" },
+    });
+    tr.deinit(a);
+}
+
+test "allocation failure at every point: OutOfMemory exactly, never a content error, no leak (parse, JWKS, discovery, refresh, token response, OAuth error, request builders)" {
+    try sweepOutOfMemory(oomParse);
+    try sweepOutOfMemory(oomParseJwks);
+    try sweepOutOfMemory(oomDiscover);
+    try sweepOutOfMemory(oomRefresh);
+    try sweepOutOfMemory(oomTokenResponse);
+    try sweepOutOfMemory(oomOAuthError);
+    try sweepOutOfMemory(oomAuthorizationUrl);
+    try sweepOutOfMemory(oomTokenRequest);
+}
+
+test "mapFetchError: only a canceled wait is Canceled, every other transport failure is FetchFailed" {
+    try testing.expectEqual(error.Canceled, mapFetchError(error.Canceled));
+    try testing.expectEqual(error.FetchFailed, mapFetchError(error.ConnectFailed));
+    try testing.expectEqual(error.FetchFailed, mapFetchError(error.ReadFailed));
+}
+
+test "JWKS: an OKP x of 31 or 33 bytes is invalid_key (never sliced to 32), a JWK use other than sig/enc is .other" {
+    const enc_b64 = std.base64.url_safe_no_pad.Encoder;
+    const zeros: [33]u8 = @splat(0);
+    var x31: [64]u8 = undefined;
+    var x33: [64]u8 = undefined;
+    const x31s = enc_b64.encode(&x31, zeros[0..31]);
+    const x33s = enc_b64.encode(&x33, zeros[0..33]);
+    var json_buf: [512]u8 = undefined;
+    const json = try std.mem.print(&json_buf, "{{\"keys\":[{{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"{s}\"}},{{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"{s}\"}}]}}", .{ x31s, x33s });
+    var set = try parseJwks(testing.allocator, json);
+    defer set.deinit();
+    try testing.expectEqual(@as(usize, 0), set.keys.len);
+    try testing.expectEqual(@as(usize, 2), set.skipped.len);
+    try testing.expectEqual(JwkSkipReason.invalid_key, set.skipped[0].reason);
+    try testing.expectEqual(JwkSkipReason.invalid_key, set.skipped[1].reason);
+
+    var uses = try parseJwks(testing.allocator,
+        \\{"keys":[{"kty":"oct","k":"ERERERERERERERERERERERERERERERERERERERERERE","use":"sig"},
+        \\{"kty":"oct","k":"ERERERERERERERERERERERERERERERERERERERERERE","use":"enc"},
+        \\{"kty":"oct","k":"ERERERERERERERERERERERERERERERERERERERERERE","use":"proprietary"},
+        \\{"kty":"oct","k":"ERERERERERERERERERERERERERERERERERERERERERE"}]}
+    );
+    defer uses.deinit();
+    try testing.expectEqual(@as(usize, 4), uses.keys.len);
+    try testing.expectEqual(@as(?KeyUse, .sig), uses.keys[0].use);
+    try testing.expectEqual(@as(?KeyUse, .enc), uses.keys[1].use);
+    try testing.expectEqual(@as(?KeyUse, .other), uses.keys[2].use);
+    try testing.expectEqual(@as(?KeyUse, null), uses.keys[3].use);
+}
+
+test "ResourceServer and Guard: the insufficient_scope challenge exists only when scopes are required" {
+    const gpa = testing.allocator;
+    var stub: ScriptFetcher = .{ .script = &.{} };
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url });
+    defer provider.deinit();
+    var set = try parseJwks(gpa, rs_jwks_json);
+    defer set.deinit();
+
+    var rs_open = try ResourceServer.init(gpa, .{ .provider = &provider, .claim_opts = mut_test_opts });
+    defer rs_open.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), rs_open.challenge_scope);
+    var rs_scoped = try ResourceServer.init(gpa, .{ .provider = &provider, .claim_opts = mut_test_opts, .required_scopes = &.{"read"} });
+    defer rs_scoped.deinit();
+    try testing.expect(std.mem.find(u8, rs_scoped.challenge_scope.?, "insufficient_scope") != null);
+
+    var g_open = try Guard.init(gpa, .{ .jwks = &set, .claim_opts = .{ .issuer = .any, .audience = .any } });
+    defer g_open.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), g_open.challengeFor(error.InsufficientScope));
+    var g_scoped = try Guard.init(gpa, .{ .jwks = &set, .claim_opts = .{ .issuer = .any, .audience = .any }, .required_scopes = &.{"read"} });
+    defer g_scoped.deinit();
+    try testing.expect(std.mem.find(u8, g_scoped.challengeFor(error.InsufficientScope).?, "insufficient_scope") != null);
+}
+
+test "ResourceServer: a 401 is text/plain; Guard: a failed at+jwt typ check is invalid_token, not a missing credential" {
+    const gpa = testing.allocator;
+    var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_jwks_url, .body = rs_jwks_json }} };
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    defer provider.deinit();
+    var fc: FixedClock = .{ .now_s = 1000 };
+    var tok_buf: [1024]u8 = undefined;
+    var bearer_buf: [1100]u8 = undefined;
+    var req_buf: [1400]u8 = undefined;
+    var out_buf: [1024]u8 = undefined;
+
+    var rs = try ResourceServer.init(gpa, .{ .provider = &provider, .claim_opts = mut_test_opts, .clock = fc.clock() });
+    defer rs.deinit();
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(rs.middleware());
+    try r.get("/data", resProtectedHandler);
+    {
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", "Bearer not.a.jwt"), &out_buf);
+        try resExpectStatus(got, "401");
+        try resExpectHeaderLine(got, "Content-Type: text/plain");
+    }
+
+    var guard = try Guard.init(gpa, .{
+        .provider = &provider,
+        .claim_opts = .{ .issuer = .any, .audience = .{ .required = "api://svc" } },
+        .require_at_jwt_typ = true,
+        .clock = fc.clock(),
+    });
+    defer guard.deinit();
+    test_guard = &guard;
+    defer test_guard = null;
+    var r2 = router.Router.init(gpa);
+    defer r2.deinit();
+    try r2.get("/d", guardTestHandler);
+    const tok = mintRs256(&tok_buf,
+        \\{"aud":"api://svc","sub":"a","exp":2000}
+    );
+    const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+    const got = resRunWire(&r2, resWire(&req_buf, "GET", "/d", bearer), &out_buf);
+    try resExpectStatus(got, "401");
+    try testing.expect(std.mem.find(u8, got, "error=\"invalid_token\"") != null);
+}
+
+test "resourceInvalidReason: every verification failure names its own cause in the 401 body" {
+    const cases = [_]struct { err: anyerror, body: []const u8 }{
+        .{ .err = error.Expired, .body = "token expired" },
+        .{ .err = error.NotYetValid, .body = "token not yet valid" },
+        .{ .err = error.IssuedInFuture, .body = "token issued in the future" },
+        .{ .err = error.IssuerMismatch, .body = "issuer mismatch" },
+        .{ .err = error.AudienceMismatch, .body = "audience mismatch" },
+        .{ .err = error.MissingExp, .body = "token missing exp" },
+        .{ .err = error.BadSignature, .body = "bad signature" },
+        .{ .err = error.UnsecuredToken, .body = "unsecured token rejected" },
+        .{ .err = error.AlgKeyMismatch, .body = "unsupported algorithm" },
+        .{ .err = error.UnsupportedAlg, .body = "unsupported algorithm" },
+        .{ .err = error.NoMatchingKey, .body = "no matching key" },
+        .{ .err = error.IssuerNotConfigured, .body = "issuer not configured" },
+        .{ .err = error.DiscoveryFailed, .body = "key set unavailable" },
+        .{ .err = error.JwksFetchFailed, .body = "key set unavailable" },
+        .{ .err = error.MalformedToken, .body = "malformed token" },
+        .{ .err = error.InvalidBase64, .body = "malformed token" },
+        .{ .err = error.InvalidJson, .body = "malformed token" },
+        .{ .err = error.NotAnObject, .body = "malformed token" },
+        .{ .err = error.InvalidClaim, .body = "invalid token" },
+        .{ .err = error.InvalidKey, .body = "invalid token" },
+    };
+    for (cases) |c| try testing.expectEqualStrings(c.body, resourceInvalidReason(c.err));
+}

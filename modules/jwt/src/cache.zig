@@ -953,3 +953,70 @@ test "VerifiedCache: deinit wipes the table before freeing it and leaves capacit
     _ = try cache.verifyJwks(testing.allocator, token, &set, policy(1000), &d);
     try testing.expect(std.mem.find(u8, &mem, "wipe-me") == null);
 }
+
+// ── whole-module mutation run 2026-11-12 ───────────────────────────────────
+
+test "VerifiedCache: a set without identity stores nothing and evicts nothing, even into a full bucket" {
+    var set = try root.parseJwks(testing.allocator, jwks_a);
+    defer set.deinit();
+    var cache: Cache = try .init(testing.allocator, testing.io, .{ .capacity = 4 }); // one bucket of 4
+    defer cache.deinit();
+    var d: Deriver = .{};
+    var json_buf: [256]u8 = undefined;
+    var tokens: [4][]u8 = undefined;
+    for (&tokens, 0..) |*t, i| {
+        t.* = try mintSub(&json_buf, i, 5000);
+        _ = try cache.verifyJwks(testing.allocator, t.*, &set, policy(1000), &d);
+    }
+    defer for (tokens) |t| testing.allocator.free(t);
+    // A hand-assembled set (id 0) is never cached: inserting under it must not push a live entry out.
+    var anon = set;
+    anon.id = 0;
+    const extra = try mintSub(&json_buf, 99, 5000);
+    defer testing.allocator.free(extra);
+    var parsed = try root.parseVerifyJwks(testing.allocator, extra, set, policy(1000));
+    defer parsed.deinit();
+    cache.insert(extra, &parsed, &anon, policy(1000), .{});
+    for (tokens) |t| try testing.expect((try cache.lookup(t, &set, policy(1000))) != null);
+    try testing.expectEqual(@as(?TestValue, null), try cache.lookup(extra, &set, policy(1000)));
+}
+
+test "VerifiedCache.insert: the byte after the parse's signing input must be the dot (any other byte, even a smaller one, stores nothing)" {
+    var set = try root.parseJwks(testing.allocator, jwks_a);
+    defer set.deinit();
+    var cache: Cache = try .init(testing.allocator, testing.io, .{ .capacity = 4 });
+    defer cache.deinit();
+    const token = try mint(
+        \\{"iss":"https://issuer.test","aud":"api://a","sub":"u","exp":5000}
+    );
+    defer testing.allocator.free(token);
+    var parsed = try root.parseVerifyJwks(testing.allocator, token, set, policy(1000));
+    defer parsed.deinit();
+    const bad = try testing.allocator.dupe(u8, token);
+    defer testing.allocator.free(bad);
+    bad[parsed.signing_input.len] = '-'; // 0x2D, below '.' (0x2E)
+    cache.insert(bad, &parsed, &set, policy(1000), .{});
+    try testing.expectEqual(@as(?TestValue, null), try cache.lookup(bad, &set, policy(1000)));
+    bad[parsed.signing_input.len] = '/'; // 0x2F, above
+    cache.insert(bad, &parsed, &set, policy(1000), .{});
+    try testing.expectEqual(@as(?TestValue, null), try cache.lookup(bad, &set, policy(1000)));
+}
+
+test "VerifiedCache: the policy's strings are length-delimited -- (iss ab, aud c) and (iss a, aud bc) are different policies" {
+    var set = try root.parseJwks(testing.allocator, jwks_a);
+    defer set.deinit();
+    var cache: Cache = try .init(testing.allocator, testing.io, .{ .capacity = 16 });
+    defer cache.deinit();
+    const token = try mint(
+        \\{"iss":"a","aud":"bc","sub":"u","exp":5000}
+    );
+    defer testing.allocator.free(token);
+    const p1: root.Options = .{ .now_s = 1000, .issuer = .{ .required = "a" }, .audience = .{ .required = "bc" } };
+    const p2: root.Options = .{ .now_s = 1000, .issuer = .{ .required = "ab" }, .audience = .{ .required = "c" } };
+    var d: Deriver = .{};
+    _ = try cache.verifyJwks(testing.allocator, token, &set, p1, &d);
+    try testing.expect((try cache.lookup(token, &set, p1)) != null);
+    // Under the other policy the token is not cached (and would not verify: its iss is "a").
+    try testing.expectEqual(@as(?TestValue, null), try cache.lookup(token, &set, p2));
+    try testing.expectError(error.IssuerMismatch, cache.verifyJwks(testing.allocator, token, &set, p2, &d));
+}
