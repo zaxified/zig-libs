@@ -5985,6 +5985,8 @@ const golden_cases = [_]GoldenCase{
     .{ .p = "\\d+ž", .t = 4 },
     .{ .p = "(?-u:\\xff)+|b", .t = 2, .o = .{ .syntax = .rust, .utf8 = false } }, .{ .p = "\\b{start}\\w", .t = 0, .o = .{ .syntax = .rust } },
     .{ .p = "[ab]{3}$", .t = 3 },                                                 .{ .p = "\\x{10FFFD}|y", .t = 2 },
+    .{ .p = "[a-z]+$", .t = 0 },                                                  .{ .p = "x[ab]*$", .t = 3 },
+    .{ .p = "q[^q]*$", .t = 2 },
 };
 
 fn goldenText(buf: []u8, which: u8) []const u8 {
@@ -6088,6 +6090,9 @@ const golden_want = [_][1 + std.EnumArray(Probe, usize).len]u64{
     .{ 11218002173469069820, 0, 0, 0, 0, 0, 0, 0, 11, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3930, 5568, 0, 4, 11153, 0, 0, 0 },
     .{ 16025140877391608600, 0, 4, 3, 0, 6, 0, 8, 3002, 3002, 0, 0, 12, 0, 12, 6, 0, 0, 84, 0, 6, 6, 3, 0, 0, 0, 0, 0, 774, 3, 0, 0, 0, 0, 1500, 3087, 0, 0, 0 },
     .{ 17791598714729744375, 2, 5, 2, 0, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 114, 105, 18, 216, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 11, 20, 0, 0, 0 },
+    .{ 16512095191518823459, 0, 4, 3, 0, 0, 0, 0, 2193, 2193, 0, 0, 0, 0, 0, 0, 0, 0, 129, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2117, 0, 0, 0 },
+    .{ 12216273954606837675, 0, 1, 0, 0, 6, 0, 6, 1501, 1501, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1500, 1, 0, 0, 0 },
+    .{ 12216273954606837675, 0, 1, 0, 0, 418, 0, 12, 865, 865, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 612, 702, 0, 0, 378 },
 };
 
 test "golden work table: the engines' caches, limits and skips do the work they did" {
@@ -6210,4 +6215,485 @@ test "mutation M: the lazy DFAs take a program of exactly Dfa.max_insts" {
         }
     }
     try testing.expect(found_fwd and found_rev);
+}
+
+// Every error site of the three grammars (mutation audit 2026-11-12): which
+// error a bad pattern reports, under each syntax, is part of the API (the
+// error names are public). The table pins it for a spread of bad and
+// borderline patterns; set `errtab_print` to regenerate after a deliberate
+// change.
+const errtab_print = false;
+
+const errtab_patterns = [_][]const u8{
+    "(",
+    ")",
+    "[",
+    "[a",
+    "[z-a]",
+    "a**",
+    "*",
+    "+a",
+    "a{2,1}",
+    "a{1001}",
+    "a{100001}",
+    "\\",
+    "a\\",
+    "\\p",
+    "\\p{",
+    "\\p{Foo}",
+    "\\pX",
+    "\\p{L",
+    "\\P{^L}",
+    "[[:foo:]]",
+    "[[:alpha:]",
+    "[[:alpha",
+    "[[:^alpha:]]",
+    "(?P<",
+    "(?P<>a)",
+    "(?P<a>x)(?P<a>y)",
+    "(?P<a",
+    "(?P<a>",
+    "(?P<1a>a)",
+    "(?P<n\xc3\xa9>a)",
+    "(?<a>x)",
+    "(?<",
+    "(?<a",
+    "(?'a'x)",
+    "(?i",
+    "(?z)",
+    "(?i-)",
+    "(?-)",
+    "(?i-i)",
+    "(?--i)",
+    "(?ii)",
+    "(?:",
+    "(?:a",
+    "a|*",
+    "(*)",
+    "()",
+    "(|)",
+    "\\8",
+    "\\0",
+    "\\x",
+    "\\x{",
+    "\\x{}",
+    "\\x{110000}",
+    "\\x{D800}",
+    "\\xZ",
+    "\\xA",
+    "\\u12",
+    "\\u12345",
+    "\\U0011FFFF",
+    "\\U0010FFFF",
+    "\\x{FFFFFFFFF}",
+    "\\b{foo}",
+    "\\b{start",
+    "\\b{start}",
+    "\\b{end-half}",
+    "\\b{verylongnameoverbuf}",
+    "\\b{",
+    "[\\d-z]",
+    "[a-\\d]",
+    "[a&&]",
+    "[a&&b]",
+    "[a--b]",
+    "[a~~b]",
+    "[a-&&b]",
+    "[]",
+    "[]a]",
+    "[^]",
+    "[^]a]",
+    "x{2}{3}",
+    "x**",
+    "x*?*",
+    "(?x) a #c",
+    "\\Q..\\E",
+    "\\Z",
+    "\\C",
+    "\\z",
+    "\\A",
+    "\\<",
+    "\\>",
+    "\\e",
+    "\\a\\f\\t\\n\\r\\v",
+    "\\y",
+    "\\_",
+    "\\-",
+    "\\ ",
+    "[\\p{L}--\\pN]",
+    "[[a]",
+    "[a[b]]",
+    "[a-]",
+    "[-a]",
+    "[a-b-c]",
+    "\\d{2,}",
+    "\xff",
+    "a\xc3",
+    "[\xff]",
+    "[\xc3]",
+    "{",
+    "a{",
+    "a{1",
+    "a{1,",
+    "a{,2}",
+    "a{ 1 }",
+    "a{1,2",
+    "(?s-u:.)",
+    "(?-u:\\xff)",
+    "(?-u)\\xff",
+    "(?-u)[\\xff]",
+    "(?u)\\w",
+    "(?R)",
+    "(?U)a+",
+    "(?m)^$",
+    "\\pL\\p{Greek}\\p{^Greek}",
+    "\\p{Script=Greek}",
+    "\\p{sc:greek}",
+    "\\p{gc=Lu}",
+    "\\p{Is Greek}",
+    "\\p{ Lu }",
+    "[[:word:]]",
+    "[\\w&&\\d]",
+    "[a-z--aeiou]",
+    "[[:^digit:]&&\\x00-\\x7f]",
+    "(?i)\\x{17F}",
+    "x{0}",
+    "x{1000}",
+    "((((((((((a))))))))))",
+    "a{2}{2}{2}",
+    "(?flags)",
+    "(?<=a)",
+    "(?=a)",
+    "(?!a)",
+    "(?#c)",
+    "\\k<a>",
+    "\\g1",
+    "\\N{SPACE}",
+    "[\\b]",
+    "[\\B]",
+    "\\B{x}",
+    "\\Pl",
+    "\\p{Lu",
+    "\\p{}",
+};
+
+fn errtabName(gpa: std.mem.Allocator, pattern: []const u8, syn: Syntax) []const u8 {
+    var re = Regex.compileOptions(gpa, pattern, .{ .syntax = syn }) catch |e| return @errorName(e);
+    re.deinit(gpa);
+    return "ok";
+}
+
+const errtab_want = [_][3][]const u8{
+    .{ "MissingParen", "MissingParen", "MissingParen" },
+    .{ "UnexpectedParen", "UnexpectedParen", "UnexpectedParen" },
+    .{ "MissingBracket", "MissingBracket", "MissingBracket" },
+    .{ "MissingBracket", "MissingBracket", "MissingBracket" },
+    .{ "InvalidCharRange", "InvalidCharRange", "InvalidCharRange" },
+    .{ "InvalidNestedRepeat", "ok", "ok" },
+    .{ "MissingRepeatArgument", "MissingRepeatArgument", "MissingRepeatArgument" },
+    .{ "MissingRepeatArgument", "MissingRepeatArgument", "MissingRepeatArgument" },
+    .{ "InvalidRepeatSize", "InvalidRepeatSize", "InvalidRepeatSize" },
+    .{ "InvalidRepeatSize", "InvalidRepeatSize", "ok" },
+    .{ "InvalidRepeatSize", "InvalidRepeatSize", "InvalidRepeatSize" },
+    .{ "TrailingBackslash", "TrailingBackslash", "TrailingBackslash" },
+    .{ "TrailingBackslash", "TrailingBackslash", "TrailingBackslash" },
+    .{ "InvalidUnicodeClass", "InvalidEscape", "InvalidUnicodeClass" },
+    .{ "InvalidUnicodeClass", "InvalidEscape", "InvalidUnicodeClass" },
+    .{ "InvalidUnicodeClass", "InvalidEscape", "InvalidUnicodeClass" },
+    .{ "InvalidUnicodeClass", "InvalidEscape", "InvalidUnicodeClass" },
+    .{ "InvalidUnicodeClass", "InvalidEscape", "InvalidUnicodeClass" },
+    .{ "ok", "InvalidEscape", "InvalidUnicodeClass" },
+    .{ "InvalidCharClass", "InvalidCharClass", "ok" },
+    .{ "MissingBracket", "MissingBracket", "MissingBracket" },
+    .{ "MissingBracket", "MissingBracket", "MissingBracket" },
+    .{ "ok", "ok", "ok" },
+    .{ "InvalidNamedCapture", "MissingRepeatArgument", "InvalidNamedCapture" },
+    .{ "InvalidNamedCapture", "MissingRepeatArgument", "InvalidNamedCapture" },
+    .{ "ok", "MissingRepeatArgument", "InvalidNamedCapture" },
+    .{ "InvalidNamedCapture", "MissingRepeatArgument", "InvalidNamedCapture" },
+    .{ "MissingParen", "MissingRepeatArgument", "MissingParen" },
+    .{ "ok", "MissingRepeatArgument", "InvalidNamedCapture" },
+    .{ "InvalidNamedCapture", "MissingRepeatArgument", "ok" },
+    .{ "ok", "MissingRepeatArgument", "ok" },
+    .{ "InvalidNamedCapture", "MissingRepeatArgument", "InvalidNamedCapture" },
+    .{ "InvalidNamedCapture", "MissingRepeatArgument", "InvalidNamedCapture" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "InvalidPerlOp" },
+    .{ "MissingParen", "MissingRepeatArgument", "MissingParen" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "InvalidPerlOp" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "InvalidPerlOp" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "InvalidPerlOp" },
+    .{ "ok", "MissingRepeatArgument", "InvalidPerlOp" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "InvalidPerlOp" },
+    .{ "ok", "MissingRepeatArgument", "InvalidPerlOp" },
+    .{ "MissingParen", "MissingRepeatArgument", "MissingParen" },
+    .{ "MissingParen", "MissingRepeatArgument", "MissingParen" },
+    .{ "MissingRepeatArgument", "MissingRepeatArgument", "MissingRepeatArgument" },
+    .{ "MissingRepeatArgument", "MissingRepeatArgument", "MissingRepeatArgument" },
+    .{ "ok", "ok", "ok" },
+    .{ "ok", "ok", "ok" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "ok", "ok", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "ok", "ok", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "ok" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "ok" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "ok", "InvalidEscape", "InvalidEscape" },
+    .{ "ok", "InvalidEscape", "InvalidEscape" },
+    .{ "ok", "InvalidEscape", "ok" },
+    .{ "ok", "InvalidEscape", "ok" },
+    .{ "ok", "InvalidEscape", "InvalidEscape" },
+    .{ "ok", "InvalidEscape", "InvalidEscape" },
+    .{ "ok", "InvalidEscape", "InvalidCharRange" },
+    .{ "InvalidCharRange", "InvalidEscape", "InvalidCharRange" },
+    .{ "ok", "ok", "ok" },
+    .{ "ok", "ok", "ok" },
+    .{ "InvalidCharRange", "InvalidCharRange", "ok" },
+    .{ "ok", "ok", "ok" },
+    .{ "InvalidCharRange", "InvalidCharRange", "InvalidCharRange" },
+    .{ "MissingBracket", "MissingBracket", "MissingBracket" },
+    .{ "ok", "ok", "ok" },
+    .{ "MissingBracket", "MissingBracket", "MissingBracket" },
+    .{ "ok", "ok", "ok" },
+    .{ "InvalidNestedRepeat", "ok", "ok" },
+    .{ "InvalidNestedRepeat", "ok", "ok" },
+    .{ "InvalidNestedRepeat", "ok", "ok" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "ok" },
+    .{ "ok", "InvalidEscape", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "ok", "InvalidEscape", "ok" },
+    .{ "ok", "InvalidEscape", "ok" },
+    .{ "ok", "ok", "ok" },
+    .{ "ok", "ok", "ok" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "ok", "ok", "ok" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "ok", "ok", "ok" },
+    .{ "ok", "ok", "ok" },
+    .{ "ok", "ok", "ok" },
+    .{ "InvalidCharRange", "InvalidEscape", "ok" },
+    .{ "ok", "ok", "MissingBracket" },
+    .{ "ok", "ok", "ok" },
+    .{ "ok", "ok", "ok" },
+    .{ "ok", "ok", "ok" },
+    .{ "ok", "InvalidCharRange", "ok" },
+    .{ "ok", "InvalidEscape", "ok" },
+    .{ "InvalidUtf8", "InvalidUtf8", "InvalidUtf8" },
+    .{ "InvalidUtf8", "InvalidUtf8", "InvalidUtf8" },
+    .{ "InvalidUtf8", "InvalidUtf8", "InvalidUtf8" },
+    .{ "InvalidUtf8", "InvalidUtf8", "InvalidUtf8" },
+    .{ "ok", "ok", "MissingRepeatArgument" },
+    .{ "ok", "ok", "InvalidRepeatSize" },
+    .{ "ok", "ok", "InvalidRepeatSize" },
+    .{ "ok", "ok", "InvalidRepeatSize" },
+    .{ "ok", "ok", "InvalidRepeatSize" },
+    .{ "ok", "ok", "ok" },
+    .{ "ok", "ok", "InvalidRepeatSize" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "InvalidUtf8" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "InvalidUtf8" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "InvalidUtf8" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "InvalidUtf8" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "ok" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "ok" },
+    .{ "ok", "MissingRepeatArgument", "ok" },
+    .{ "ok", "MissingRepeatArgument", "ok" },
+    .{ "ok", "InvalidEscape", "InvalidUnicodeClass" },
+    .{ "InvalidUnicodeClass", "InvalidEscape", "ok" },
+    .{ "InvalidUnicodeClass", "InvalidEscape", "ok" },
+    .{ "InvalidUnicodeClass", "InvalidEscape", "ok" },
+    .{ "InvalidUnicodeClass", "InvalidEscape", "ok" },
+    .{ "ok", "InvalidEscape", "ok" },
+    .{ "ok", "ok", "ok" },
+    .{ "ok", "InvalidEscape", "ok" },
+    .{ "ok", "InvalidCharRange", "ok" },
+    .{ "ok", "ok", "ok" },
+    .{ "ok", "MissingRepeatArgument", "ok" },
+    .{ "ok", "ok", "ok" },
+    .{ "ok", "ok", "ok" },
+    .{ "ok", "ok", "ok" },
+    .{ "InvalidNestedRepeat", "ok", "ok" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "InvalidPerlOp" },
+    .{ "InvalidNamedCapture", "MissingRepeatArgument", "InvalidPerlOp" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "InvalidPerlOp" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "InvalidPerlOp" },
+    .{ "InvalidPerlOp", "MissingRepeatArgument", "InvalidPerlOp" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "InvalidEscape", "InvalidEscape", "InvalidEscape" },
+    .{ "ok", "InvalidEscape", "InvalidRepeatSize" },
+    .{ "ok", "InvalidEscape", "ok" },
+    .{ "InvalidUnicodeClass", "InvalidEscape", "InvalidUnicodeClass" },
+    .{ "InvalidUnicodeClass", "InvalidEscape", "InvalidUnicodeClass" },
+};
+
+test "error table: each bad pattern reports the error it did, under each syntax" {
+    const gpa = testing.allocator;
+    const syns = [_]Syntax{ .perl, .posix, .rust };
+    var h: std.hash.Wyhash = .init(0);
+    if (errtab_print or errtab_want.len != errtab_patterns.len) std.debug.print("ERRTAB-BEGIN\n", .{});
+    for (errtab_patterns, 0..) |p, i| {
+        var got: [3][]const u8 = undefined;
+        for (syns, &got) |s, *g| {
+            g.* = errtabName(gpa, p, s);
+            h.update(g.*);
+            h.update("|");
+        }
+        if (errtab_print or errtab_want.len != errtab_patterns.len) {
+            std.debug.print("    .{{ \"{s}\", \"{s}\", \"{s}\" }},\n", .{ got[0], got[1], got[2] });
+            continue;
+        }
+        for (got, errtab_want[i], syns) |g, w, s| if (!std.mem.eql(u8, g, w)) {
+            std.debug.print("/{f}/ ({t}): {s}, want {s}\n", .{ std.zig.fmtString(p), s, g, w });
+            return error.TestUnexpectedResult;
+        };
+    }
+    // errtab-check
+    if (errtab_print or errtab_want.len != errtab_patterns.len) std.debug.print("ERRTAB-END {x}\n", .{h.final()});
+}
+
+test "mutation M: runDfa caches a step on DEL and never indexes its ASCII table with 0x80" {
+    var re = try Regex.compile(testing.allocator, "[^a]+");
+    defer re.deinit(testing.allocator);
+    const del: [8]u8 = @splat(0x7f);
+    probe_counts = .initFill(0);
+    try testing.expect(re.fullMatch(&del));
+    try testing.expect(probe_counts.get(.dfa_step) <= 2);
+    // A match found while stepping over an invalid byte 0x80.
+    var ab = try Regex.compile(testing.allocator, "[ab]");
+    defer ab.deinit(testing.allocator);
+    try testing.expect(ab.isMatch("b\x80"));
+    try testing.expect(ab.isMatch("\x80b\x80"));
+}
+
+test "mutation M: each Rust flag has its own bit (no false duplicate)" {
+    const gpa = testing.allocator;
+    for ([_][]const u8{ "(?Uu)a", "(?Rx)a", "(?imsUuRx)a", "(?i-mU)a", "(?u-R)a" }) |p| {
+        var re = try Regex.compileOptions(gpa, p, .{ .syntax = .rust });
+        re.deinit(gpa);
+    }
+    try testing.expectError(error.InvalidPerlOp, Regex.compileOptions(gpa, "(?UU)a", .{ .syntax = .rust }));
+}
+
+test "mutation M: error sites of the Go and Rust escapes, groups, classes and properties" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { p: []const u8, s: Syntax, e: anyerror }{
+        .{ .p = "\\x{1g}", .s = .perl, .e = error.InvalidEscape },
+        .{ .p = "\\xg1", .s = .perl, .e = error.InvalidEscape },
+        .{ .p = "\\x1g", .s = .perl, .e = error.InvalidEscape },
+        .{ .p = "[\\Q]", .s = .perl, .e = error.InvalidEscape },
+        .{ .p = "a{1,x}", .s = .rust, .e = error.InvalidRepeatSize },
+        .{ .p = "(?", .s = .rust, .e = error.MissingParen },
+        .{ .p = "(?)", .s = .rust, .e = error.MissingRepeatArgument },
+        .{ .p = "\\\xc3\xa9", .s = .rust, .e = error.InvalidEscape },
+        .{ .p = "\\x{1g}", .s = .rust, .e = error.InvalidEscape },
+        .{ .p = "\\p\\", .s = .rust, .e = error.InvalidUnicodeClass },
+        .{ .p = "(?-u)\\pL", .s = .rust, .e = error.InvalidUnicodeClass },
+        .{ .p = "\\p{Foo=Bar}", .s = .rust, .e = error.InvalidUnicodeClass },
+        .{ .p = "\\p{Script=Foo}", .s = .rust, .e = error.InvalidUnicodeClass },
+        .{ .p = "[^", .s = .rust, .e = error.MissingBracket },
+        .{ .p = "[-", .s = .rust, .e = error.MissingBracket },
+        .{ .p = "(?-u)[^a]", .s = .rust, .e = error.InvalidUtf8 },
+        .{ .p = "[a-", .s = .rust, .e = error.MissingBracket },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("/{f}/ ({t})\n", .{ std.zig.fmtString(c.p), c.s });
+        try testing.expectError(c.e, Regex.compileOptions(gpa, c.p, .{ .syntax = c.s }));
+    }
+}
+
+test "mutation M: case folding walks a four-member orbit to its end" {
+    // θ Θ ϑ ϴ: three rounds of fold images.
+    for ([_][]const u8{ "(?i)θ", "(?i)ϴ" }) |p| {
+        var re = try Regex.compile(testing.allocator, p);
+        defer re.deinit(testing.allocator);
+        for ([_][]const u8{ "θ", "Θ", "ϑ", "ϴ" }) |t| try testing.expect(re.fullMatch(t));
+    }
+}
+
+test "mutation M: \\v is U+000B in both grammars" {
+    for ([_]Syntax{ .perl, .rust }) |s| {
+        var re = try Regex.compileOptions(testing.allocator, "\\v", .{ .syntax = s });
+        defer re.deinit(testing.allocator);
+        try testing.expect(re.fullMatch("\x0b"));
+        try testing.expect(!re.fullMatch("\x0c"));
+    }
+}
+
+test "mutation M: Matcher.find past the end finds nothing" {
+    const gpa = testing.allocator;
+    var e = try Regex.compile(gpa, "");
+    defer e.deinit(gpa);
+    var m = try Matcher.init(gpa, &e);
+    defer m.deinit();
+    try testing.expect(m.find("abc", 4) == null);
+    try testing.expect(m.find("abc", 9) == null);
+}
+
+test "mutation M: the VM lists' generation counter wraps without losing threads" {
+    const gpa = testing.allocator;
+    var re = try Regex.compile(gpa, "(a|ab)(c|bcd)(d*)");
+    defer re.deinit(gpa);
+    var m = try Matcher.init(gpa, &re);
+    defer m.deinit();
+    m.pike_only = true;
+    for (&m.lists) |*l| l.gen = std.math.maxInt(u32);
+    try testing.expectEqual(Span{ .start = 0, .end = 4 }, m.find("abcd", 0).?);
+}
+
+test "mutation M: expand after $$, a bad name byte, a cut sequence, a short groups slice and two-digit groups" {
+    const gpa = testing.allocator;
+    var re = try Regex.compile(gpa, "(?P<x>a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)");
+    defer re.deinit(gpa);
+    const input = "abcdefghijk";
+    var m = try Matcher.init(gpa, &re);
+    defer m.deinit();
+    var groups: [12]?Span = undefined;
+    try testing.expect(m.captures(input, 0, &groups));
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try re.expand(&out.writer, "$$-$1-$$x$2|$9|$10|$11", input, &groups);
+    try testing.expectEqualStrings("$-a-$xb|i|j|k", out.written());
+    out.clearRetainingCapacity();
+    try re.expand(&out.writer, "<$x\xff>", input, &groups);
+    try testing.expectEqualStrings("<a\xff>", out.written());
+    out.clearRetainingCapacity();
+    try re.expand(&out.writer, "<$x\xc3", input, &groups);
+    try testing.expectEqualStrings("<a\xc3", out.written());
+    out.clearRetainingCapacity();
+    // Fewer groups than names: a named group past the slice is unset.
+    try re.expand(&out.writer, "[${x}]", input, groups[0..1]);
+    try testing.expectEqualStrings("[]", out.written());
+}
+
+test "mutation M: literalPrefix of a long literal and around the surrogates" {
+    const gpa = testing.allocator;
+    var long: [3500]u8 = @splat('q');
+    var re = try Regex.compile(gpa, &long);
+    defer re.deinit(gpa);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try testing.expect(try re.literalPrefix(&out.writer));
+    try testing.expectEqual(@as(usize, 3500), out.written().len);
+    const cases = [_]struct { p: []const u8, w: []const u8 }{
+        .{ .p = "\\x{D7FF}", .w = "\u{D7FF}" },
+        .{ .p = "\\x{DFFF}", .w = "\u{FFFD}" },
+        .{ .p = "\\x{E000}", .w = "\u{E000}" },
+    };
+    for (cases) |c| {
+        var r = try Regex.compile(gpa, c.p);
+        defer r.deinit(gpa);
+        out.clearRetainingCapacity();
+        _ = try r.literalPrefix(&out.writer);
+        try testing.expectEqualStrings(c.w, out.written());
+    }
 }
