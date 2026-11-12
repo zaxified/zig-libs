@@ -2122,3 +2122,118 @@ const posix_classes = std.StaticStringMap([]const Range).initComptime(.{
     .{ "word", &word_ranges },
     .{ "xdigit", &[_]Range{ .{ .lo = '0', .hi = '9' }, .{ .lo = 'A', .hi = 'F' }, .{ .lo = 'a', .hi = 'f' } } },
 });
+
+// ── tests (mutation audit 2026-11-12) ──
+
+const testing = std.testing;
+
+fn linearHas(rs: []const Range, cp: u21) bool {
+    for (rs) |r| if (cp >= r.lo and cp <= r.hi) return true;
+    return false;
+}
+
+test "rustNormalize: `is` prefix, `isc` kept, separators and non-ASCII bytes dropped, truncated to the buffer" {
+    var buf: [max_class_name]u8 = undefined;
+    // A bare `is` (any case) is only the prefix: nothing is left.
+    try testing.expectEqualStrings("", rustNormalize("is", &buf));
+    try testing.expectEqualStrings("", rustNormalize("IS", &buf));
+    // `isc` stays ISO_Comment; `c` alone and any other `is…` name do not.
+    try testing.expectEqualStrings("isc", rustNormalize("isc", &buf));
+    try testing.expectEqualStrings("isc", rustNormalize("Is_C", &buf));
+    try testing.expectEqualStrings("c", rustNormalize("c", &buf));
+    try testing.expectEqualStrings("d", rustNormalize("isd", &buf));
+    try testing.expectEqualStrings("cc", rustNormalize("isCc", &buf));
+    try testing.expectEqualStrings("letter", rustNormalize("Is Letter", &buf));
+    // A non-ASCII byte is dropped (0x80 and 0xff), DEL is kept.
+    try testing.expectEqualStrings("ab", rustNormalize("a\x80b", &buf));
+    try testing.expectEqualStrings("ab", rustNormalize("a\xffb", &buf));
+    try testing.expectEqualStrings("a\x7fb", rustNormalize("a\x7fb", &buf));
+    // Longer than the buffer: cut at its length (no write past it).
+    const long: [100]u8 = @splat('x');
+    try testing.expectEqual(@as(usize, max_class_name), rustNormalize(&long, &buf).len);
+}
+
+test "looseName: separators dropped, nothing left is null, too long is null" {
+    var buf: [max_class_name]u8 = undefined;
+    try testing.expectEqual(@as(?[]const u8, null), looseName("", &buf));
+    try testing.expectEqual(@as(?[]const u8, null), looseName(" _-", &buf));
+    try testing.expectEqualStrings("greek", looseName("Gr-eek_", &buf).?);
+    const long: [100]u8 = @splat('x');
+    try testing.expectEqual(@as(?[]const u8, null), looseName(&long, &buf));
+}
+
+test "inTable: both ends of every range are in, the neighbours and the tail are not" {
+    const base = findName("n").?;
+    var all: [1024]Range = undefined;
+    var seen: usize = 0;
+    var it: TableRanges = .init(base);
+    while (it.next()) |r| : (seen += 1) all[seen] = r;
+    try testing.expect(seen > 10);
+    const rs = all[0..seen];
+    for (rs) |r| {
+        try testing.expect(inTable(base, r.lo));
+        try testing.expect(inTable(base, r.hi));
+        if (r.lo > 0) try testing.expectEqual(linearHas(rs, r.lo - 1), inTable(base, r.lo - 1));
+        try testing.expectEqual(linearHas(rs, r.hi + 1), inTable(base, r.hi + 1));
+    }
+    try testing.expect(!inTable(base, 0x10ffff));
+    try testing.expect(!inTable(base, rs[rs.len - 1].hi + 1));
+    // A range of one code point (U+00AA) and the first range's low end.
+    const alpha = findName("alphabetic").?;
+    try testing.expect(inTable(alpha, 0xaa));
+    try testing.expect(inTable(alpha, 'A'));
+    try testing.expect(!inTable(alpha, 0x10ffff));
+}
+
+test "isRustAlphabetic / isRustNumeric agree with their tables on every code point they split on" {
+    // The `< 0x80` shortcut is the table's own ASCII part.
+    const alpha = comptime findName("alphabetic").?;
+    const num = comptime findName("n").?;
+    var cp: u21 = 0;
+    while (cp < 0x400) : (cp += 1) {
+        try testing.expectEqual(inTable(alpha, cp), isRustAlphabetic(cp));
+        try testing.expectEqual(inTable(num, cp), isRustNumeric(cp));
+    }
+    try testing.expect(isRustAlphabetic(0xaa));
+    try testing.expect(isRustNumeric(0xb2));
+    try testing.expect(!isRustNumeric(0x80));
+    try testing.expect(!isRustAlphabetic(0x7f));
+}
+
+test "isPerlWord: both ends of every range of the table" {
+    const rs = &perl_word_ranges;
+    try testing.expect(rs.len > 100);
+    for (rs) |r| {
+        try testing.expect(isPerlWord(r.lo));
+        try testing.expect(isPerlWord(r.hi));
+        if (r.hi < 0x10ffff) try testing.expectEqual(linearHas(rs, r.hi + 1), isPerlWord(r.hi + 1));
+        if (r.lo > 0) try testing.expectEqual(linearHas(rs, r.lo - 1), isPerlWord(r.lo - 1));
+    }
+    try testing.expect(!isPerlWord(0x10ffff));
+}
+
+test "sortRanges: ascending by low end, equal low ends keep their order (insertion sort)" {
+    var rs = [_]Range{ .{ .lo = 5, .hi = 9 }, .{ .lo = 5, .hi = 6 }, .{ .lo = 3, .hi = 4 } };
+    sortRanges(&rs);
+    try testing.expectEqualSlices(Range, &.{ .{ .lo = 3, .hi = 4 }, .{ .lo = 5, .hi = 9 }, .{ .lo = 5, .hi = 6 } }, &rs);
+    // Past the insertion limit (pdq) the order by low end holds as well.
+    var many: [40]Range = undefined;
+    for (&many, 0..) |*r, i| r.* = .{ .lo = @intCast((i * 7) % 40), .hi = @intCast(100 + i) };
+    sortRanges(&many);
+    for (many[1..], many[0 .. many.len - 1]) |r, p| try testing.expect(p.lo <= r.lo);
+}
+
+test "foldNext: no fold is the identity, orbits close, the alternating-run parity cannot overflow" {
+    try testing.expectEqual(@as(u21, '!'), foldNext('!'));
+    try testing.expectEqual(@as(u21, 0x10ffff), foldNext(0x10ffff));
+    try testing.expectEqual(@as(u21, 0x7f), foldNext(0x7f));
+    try testing.expectEqual(@as(u21, 'A'), foldNext('a'));
+    try testing.expectEqual(@as(u21, 'a'), foldNext('A'));
+    // An alternating run: each member's partner, and back.
+    try testing.expect(foldNext(0x100) != 0x100);
+    try testing.expectEqual(@as(u21, 0x100), foldNext(foldNext(0x100)));
+    try testing.expectEqual(@as(u21, 0x101), foldNext(0x100));
+    try testing.expectEqual(@as(u21, 0x100), foldNext(0x101));
+    // `(cp + run.lo) & 1` (the same parity as `cp - run.lo`) stays in a u21.
+    for (casefold.runs) |run| if (run.alt) try testing.expect(@as(u32, run.hi) * 2 < (1 << 21));
+}

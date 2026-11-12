@@ -74,6 +74,57 @@ const Inst = syntax.Inst;
 const Range = syntax.Range;
 const Assert = syntax.Assert;
 
+/// Test hook (mutation audit 2026-11-12): counts of internal events that do
+/// not change a result — a lazy DFA's slow steps and table resets, a
+/// prefilter's skips, which engine answered — so that tests can pin the
+/// caches, limits and give-up heuristics no answer shows. File-private;
+/// `probe` compiles to nothing outside test builds.
+const Probe = enum {
+    dfa_skip,
+    dfa_step,
+    dfa_slow_ok,
+    dfa_reset,
+    rev_step,
+    rev_reset,
+    rev_reach,
+    set_step,
+    set_start,
+    bytes_step,
+    back_wide_hit,
+    back_step,
+    back_flush,
+    back_reach,
+    fwd_skip,
+    fwd_scan,
+    fwd_wide_hit,
+    fwd_step,
+    span_tracked,
+    span_back,
+    fwd_eoi,
+    fwd_flush,
+    op_run,
+    op_fast,
+    op_wide,
+    fl_block64,
+    fl_block32,
+    lit_try,
+    dfa_made,
+    pike_bytes_step,
+    bt_rebase,
+    bt_at,
+    pike_step,
+    reader_ascii,
+    dec_ascii,
+    dec_two,
+    before_two,
+    rune_wide,
+};
+threadlocal var probe_counts: std.EnumArray(Probe, usize) = .initFill(0);
+
+inline fn probe(comptime e: Probe) void {
+    if (@import("builtin").is_test) probe_counts.getPtr(e).* += 1;
+}
+
 /// The reader front end's errors: the reader failed before the answer was
 /// settled, or the `Regex` is in bytes mode (slices only).
 pub const ReaderError = error{ ReadFailed, BytesMode };
@@ -390,6 +441,7 @@ pub const Regex = struct {
         while (true) {
             if (skip and d.idle[s]) {
                 // No thread alive: jump to where a match can start.
+                probe(.dfa_skip);
                 pos = pf.next(input, pos) orelse return false;
                 s = d.intern(start, .ofIf(re.asserts, runeBefore(input, pos)), restart);
             }
@@ -405,15 +457,18 @@ pub const Regex = struct {
                 if (t == 1) return true;
             }
             const here = decode(input, pos);
+            probe(.dfa_step);
             const next = re.dfaStep(d.keys[s], d.ctxs[s], here.cp.?, restart, full) orelse {
                 if (c < 0x80) d.trans[s][c] = 1;
                 return true;
             };
             if (next[0] == 0 and next[1] == 0) return false; // no thread left
+            probe(.dfa_slow_ok);
             const ctx: Dfa.Ctx = .ofIf(re.asserts, here.cp);
             var cache = c < 0x80;
             const ns = d.find(next, ctx) orelse blk: {
                 if (d.n == Dfa.max_states) {
+                    probe(.dfa_reset);
                     // Full: start over; the current state is not needed again.
                     d.n = 0;
                     cache = false;
@@ -463,6 +518,7 @@ pub const Regex = struct {
                     continue;
                 }
             }
+            probe(.rev_step);
             const prev = re.revStep(d.keys[s], d.ctxs[s], here.cp.?);
             var cache = ascii;
             if (prev[0] == 0 and prev[1] == 0) {
@@ -472,6 +528,7 @@ pub const Regex = struct {
             const ctx: Dfa.Ctx = .ofIf(asserts, here.cp);
             const ps = d.find(prev, ctx) orelse blk: {
                 if (d.n == limit) {
+                    probe(.rev_reset);
                     // Full: start over; the current state is not needed again.
                     d.n = 0;
                     cache = false;
@@ -506,6 +563,7 @@ pub const Regex = struct {
     fn revAccepts(re: *const Regex, d: *RevDfa, s: u8, prev: ?u21) bool {
         const pc = Dfa.Ctx.of(prev);
         const slot = &d.accepts[s][@backingInt(pc)];
+        if (slot.* == .unknown) probe(.rev_reach);
         if (slot.* == .unknown) slot.* = if (re.revReaches(d.keys[s], d.ctxs[s], pc)) .yes else .no;
         return slot.* == .yes;
     }
@@ -565,8 +623,12 @@ pub const Regex = struct {
                     cur.clear(words);
                 }
             }
+            probe(.set_step);
             const here = text.at(pos);
-            if ((!full and (!pf.anchored or pos == 0)) or pos == 0) re.closureSet(cur, 0, prev, here.cp, stack);
+            if ((!full and (!pf.anchored or pos == 0)) or pos == 0) {
+                probe(.set_start);
+                re.closureSet(cur, 0, prev, here.cp, stack);
+            }
             // No thread left: anchored, nothing can start later; unanchored,
             // the next position starts a new one.
             if (cur.n == 0 and (full or here.cp == null)) return null;
@@ -743,6 +805,7 @@ pub const Regex = struct {
         cur.clear();
         var pos: usize = 0;
         while (true) {
+            probe(.bytes_step);
             const at_end = pos >= input.len;
             if (!full or pos == 0) re.closureSet(cur, 0, bytesBefore(input, pos), bytesAt(input, pos), stack);
             if (cur.n == 0 and (full or at_end)) return null;
@@ -1472,6 +1535,7 @@ const FindDfa = struct {
                 const w = caches.rev[Wide.slot(key)];
                 if (w.key == key) {
                     if (w.val & 1 != 0) best = pos;
+                    probe(.back_wide_hit);
                     if (w.val & dead != 0) return best;
                     s = (w.val >> 8) - 1;
                     pos -= here.w;
@@ -1482,6 +1546,7 @@ const FindDfa = struct {
             const acc = d.revAccepts(re, s, ctx);
             if (acc) best = pos;
             const acc_bit: u16 = @intFromBool(acc);
+            probe(.back_step);
             const prev = re.revStep(r.keys.items[s], r.ctxs.items[s], here.cp.?);
             if (prev[0] == 0 and prev[1] == 0) {
                 try d.revCache(s, input, pos, here, key, dead | acc_bit);
@@ -1524,6 +1589,7 @@ const FindDfa = struct {
 
     /// `rev` is full: empty it, and what remembers its states.
     fn revFlush(d: *FindDfa) void {
+        probe(.back_flush);
         d.rev.clear();
         if (d.wide) |w| w.rev = @splat(.empty);
         d.rev_start = @splat(0);
@@ -1533,6 +1599,7 @@ const FindDfa = struct {
     /// code point before the position already worked out.
     inline fn revAccepts(d: *FindDfa, re: *const Regex, s: u16, ctx: Dfa.Ctx) bool {
         const a = &d.rev.accepts.items[s][@backingInt(ctx)];
+        if (a.* == .unknown) probe(.back_reach);
         if (a.* == .unknown) a.* = if (re.revReaches(d.rev.keys.items[s], d.rev.ctxs.items[s], ctx)) .yes else .no;
         return a.* == .yes;
     }
@@ -1570,6 +1637,7 @@ const FindDfa = struct {
                 if (!st.restart) return if (end == no_end) null else end; // no thread left
                 if (d.skip_idle) {
                     // No thread alive, none matched yet: jump to where one can start.
+                    probe(.fwd_skip);
                     pos = pf.next(input, pos) orelse return null;
                     s = try d.idleAt(input, pos);
                 }
@@ -1624,6 +1692,7 @@ const FindDfa = struct {
                 // the cost (`\b\w+\b`, where each accented letter ends a
                 // match): once most scans moved less than a block, the
                 // steps over the bytes are cached instead (`midAfter`).
+                probe(.fwd_scan);
                 const to = pf.next(input, pos) orelse return null;
                 d.scan_score += if (to - pos >= 32) 1 else -1;
                 pos = to;
@@ -1636,6 +1705,7 @@ const FindDfa = struct {
                 const w = (try d.wideCaches()).fwd[Wide.slot(key)];
                 if (w.key == key) {
                     if (w.val & 1 != 0) end = pos;
+                    probe(.fwd_wide_hit);
                     if (w.val & (begin | join) != 0) d.note(track, w.val, pos);
                     s = (w.val >> 8) - 1;
                     pos += here.w;
@@ -1644,6 +1714,7 @@ const FindDfa = struct {
             }
             const restart = d.states.items[s].restart;
             var next: [Dfa.max_insts]u16 = undefined;
+            probe(.fwd_step);
             const r = d.step(re, s, here.cp.?, &next);
             if (r.matched) end = pos;
             const tracked: u16 = if (!d.track) 0 else if (r.began) begin else if (r.joined) join else 0;
@@ -1699,9 +1770,11 @@ const FindDfa = struct {
         const end = (try @call(.always_inline, run, .{ d, re, input, from, false, &reach, &track })) orelse return null;
         if (d.track and track.clean and track.origin != no_end) {
             std.debug.assert(track.origin <= end);
+            probe(.span_tracked);
             d.tracked += 1;
             return .{ .start = track.origin, .end = end };
         }
+        probe(.span_back);
         return .{ .start = try @call(.always_inline, start, .{ d, re, input, from, end }), .end = end };
     }
 
@@ -1794,6 +1867,7 @@ const FindDfa = struct {
     fn accepts(d: *FindDfa, re: *const Regex, s: u16) bool {
         const st = &d.states.items[s];
         if (st.eoi == .unknown) {
+            probe(.fwd_eoi);
             var seen: Dfa.Set = .{ 0, 0 };
             var n: usize = 0;
             var out: [Dfa.max_insts]u16 = undefined;
@@ -1868,6 +1942,7 @@ const FindDfa = struct {
         d.idle = @splat(0);
         d.anchored = @splat(0);
         if (d.wide) |w| w.fwd = @splat(.empty);
+        probe(.fwd_flush);
         d.flushes += 1;
     }
 
@@ -2101,6 +2176,7 @@ const OnePass = struct {
     /// The leftmost-first match starting at `at`, its slots into `best`
     /// (`caps` scratch); `reach` set to where the reading stopped.
     noinline fn run(op: *const OnePass, re: *const Regex, input: []const u8, at: usize, caps: []usize, best: []usize, reach: *usize) bool {
+        probe(.op_run);
         // The slots written in `caps`, and in `best` by the last match: no
         // clearing and copying of the whole slices (with a length known only
         // at run time, each a `compiler_rt` call).
@@ -2137,6 +2213,7 @@ const OnePass = struct {
                 const step = trans[r + c];
                 if (step == 0 or step >> 16 != 0) break;
                 r = @as(u16, @truncate(step));
+                probe(.op_fast);
                 pos += 1;
             }
             if (pos >= input.len) break;
@@ -2179,6 +2256,7 @@ const OnePass = struct {
     /// the decode and the edge walk kept the loop's pointers on the stack
     /// (measured: 40 instructions per ASCII byte).
     noinline fn wideStep(op: *const OnePass, re: *const Regex, input: []const u8, pos: usize, r: usize) struct { step: u64, w: usize } {
+        probe(.op_wide);
         const d = decode(input, pos);
         const root = op.roots.items[r >> 7];
         for (op.edges.items[root.first..][0..root.len]) |edge| {
@@ -2281,6 +2359,7 @@ fn findLiteral(input: []const u8, pos: usize, lit: []const u8) ?usize {
     var i = pos;
     // Two blocks per test: a candidate is rare, the loop is the cost.
     while (i + last + 64 <= input.len) : (i += 64) {
+        probe(.fl_block64);
         const a0: V = input[i..][0..32].*;
         const b0: V = input[i + last ..][0..32].*;
         const a1: V = input[i + 32 ..][0..32].*;
@@ -2294,6 +2373,7 @@ fn findLiteral(input: []const u8, pos: usize, lit: []const u8) ?usize {
         }
     }
     while (i + last + 32 <= input.len) : (i += 32) {
+        probe(.fl_block32);
         const a: V = input[i..][0..32].*;
         const b: V = input[i + last ..][0..32].*;
         const m1: u32 = @bitCast(a == first_v);
@@ -2792,6 +2872,7 @@ pub const Matcher = struct {
             var spent: usize = 0;
             while (spent <= 2 * (pos - from) + 256) {
                 const p = re.prefilter.next(input, pos) orelse return @as(?Span, null);
+                probe(.lit_try);
                 if (d.run(re, input, p, true, &reach, &untracked) catch return null) |e| return .{ .start = p, .end = e };
                 spent += reach - p;
                 pos = p + 1;
@@ -2818,6 +2899,7 @@ pub const Matcher = struct {
             d.limit = 12;
             d.rev_limit = 6;
         }
+        probe(.dfa_made);
         m.dfa = d;
         return d;
     }
@@ -3000,6 +3082,7 @@ pub const Matcher = struct {
         var matched = false;
         var pos = from;
         while (true) {
+            probe(.pike_bytes_step);
             const at_end = pos >= input.len;
             if (!matched and ((!full and !m.anchor) or pos == from)) {
                 @memset(m.tmp, nil);
@@ -3089,6 +3172,7 @@ pub const Matcher = struct {
             if (pf.first != null) start = pf.next(input, start) orelse return .none;
             if (m.anchor and start != from) return .none;
             if (start > win.hi) {
+                probe(.bt_rebase);
                 win.clear(m.bt_visited.items, n);
                 win = .{ .base = start, .width = width, .hi = start };
             }
@@ -3116,6 +3200,7 @@ pub const Matcher = struct {
     };
 
     fn backtrackAt(m: *Matcher, input: []const u8, start: usize, win: *Window) enum { found, none, pike } {
+        probe(.bt_at);
         const re = m.re;
         const n = re.insts.len;
         const visited = m.bt_visited.items;
@@ -3233,6 +3318,7 @@ pub const Matcher = struct {
         const sync = if (@TypeOf(text.*).can_skip) seqEnd(text.input, from) else from;
         const pf = &re.prefilter;
         while (true) {
+            probe(.pike_step);
             if (!matched and cur.n == 0 and !full) {
                 // No thread alive: a match can only start where the prefilter allows.
                 if ((pf.anchored or m.anchor) and pos != from) break;
@@ -3410,7 +3496,10 @@ const ReaderText = struct {
     fn read(t: *ReaderText) Decoded {
         const bad: Decoded = .{ .cp = 0xfffd, .w = 1 };
         const c = t.byte() orelse return .{ .cp = null, .w = 0 };
-        if (c < 0x80) return .{ .cp = c, .w = 1 };
+        if (c < 0x80) {
+            probe(.reader_ascii);
+            return .{ .cp = c, .w = 1 };
+        }
         const len = std.unicode.utf8ByteSequenceLength(c) catch return bad;
         var buf: [4]u8 = undefined;
         buf[0] = c;
@@ -3475,11 +3564,16 @@ const Decoded = struct { cp: ?u21, w: usize };
 fn decode(input: []const u8, i: usize) Decoded {
     if (i >= input.len) return .{ .cp = null, .w = 0 };
     const c = input[i];
-    if (c < 0x80) return .{ .cp = c, .w = 1 };
+    if (c < 0x80) {
+        probe(.dec_ascii);
+        return .{ .cp = c, .w = 1 };
+    }
     // Two bytes (Latin, Greek, Cyrillic, …) inline: `utf8Decode` is a call,
     // a quarter of a find-all over Czech text. C2..DF: no overlong form.
-    if (c >= 0xc2 and c <= 0xdf and i + 1 < input.len and input[i + 1] & 0xc0 == 0x80)
+    if (c >= 0xc2 and c <= 0xdf and i + 1 < input.len and input[i + 1] & 0xc0 == 0x80) {
+        probe(.dec_two);
         return .{ .cp = @as(u21, c & 0x1f) << 6 | (input[i + 1] & 0x3f), .w = 2 };
+    }
     const len = std.unicode.utf8ByteSequenceLength(c) catch return .{ .cp = 0xfffd, .w = 1 };
     if (i + len > input.len) return .{ .cp = 0xfffd, .w = 1 };
     const cp = std.unicode.utf8Decode(input[i..][0..len]) catch return .{ .cp = 0xfffd, .w = 1 };
@@ -3493,8 +3587,10 @@ fn decodeBefore(input: []const u8, i: usize) Decoded {
     const c = input[i - 1];
     if (c < 0x80) return .{ .cp = c, .w = 1 };
     // Two bytes inline, as `decode`.
-    if (c & 0xc0 == 0x80 and i >= 2 and input[i - 2] >= 0xc2 and input[i - 2] <= 0xdf)
+    if (c & 0xc0 == 0x80 and i >= 2 and input[i - 2] >= 0xc2 and input[i - 2] <= 0xdf) {
+        probe(.before_two);
         return .{ .cp = @as(u21, input[i - 2] & 0x1f) << 6 | (c & 0x3f), .w = 2 };
+    }
     var back: usize = 2;
     while (back <= @min(4, i)) : (back += 1) {
         const d = decode(input[0..i], i - back);
@@ -3523,6 +3619,7 @@ fn runeBefore(input: []const u8, i: usize) ?u21 {
 }
 
 noinline fn runeBeforeWide(input: []const u8, i: usize) u21 {
+    probe(.rune_wide);
     return decodeBefore(input, i).cp.?;
 }
 
@@ -4820,6 +4917,8 @@ test {
     _ = @import("rust_oracle_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("mutation_test.zig");
+    _ = @import("mutation_parse_test.zig");
+    _ = @import("mutation_engine_test.zig");
 }
 
 test "robustness: random patterns and inputs compile or refuse, and match, without a trap" {
@@ -5305,4 +5404,810 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+// ── tests: mutation audit 2026-11-12 (private paths and the probe hook) ──
+
+test "mutation audit A: decode reads DEL as itself, refuses the overlong C1 lead, takes C2..DF pairs" {
+    try testing.expectEqual(Decoded{ .cp = 0x7f, .w = 1 }, decode("\x7f", 0));
+    try testing.expectEqual(Decoded{ .cp = 0xfffd, .w = 1 }, decode("\xc1\x81", 0));
+    try testing.expectEqual(Decoded{ .cp = 0x80, .w = 2 }, decode("\xc2\x80", 0));
+    try testing.expectEqual(Decoded{ .cp = 0x7ff, .w = 2 }, decode("\xdf\xbf", 0));
+    try testing.expectEqual(Decoded{ .cp = 0xe9, .w = 2 }, decode("a\xc3\xa9", 1));
+    try testing.expectEqual(Decoded{ .cp = 0xfffd, .w = 1 }, decode("\xc2", 0));
+    try testing.expectEqual(Decoded{ .cp = 0xfffd, .w = 1 }, decode("\xc2a", 0));
+    try testing.expectEqual(Decoded{ .cp = null, .w = 0 }, decode("a", 1));
+}
+
+test "mutation audit A: decodeBefore refuses what decode refuses, DEL is itself" {
+    try testing.expectEqual(Decoded{ .cp = 0x7f, .w = 1 }, decodeBefore("a\x7f", 2));
+    // A lead that is no lead of a pair: C0 after C3, the overlong C1 81, E0 A0 cut short.
+    try testing.expectEqual(Decoded{ .cp = 0xfffd, .w = 1 }, decodeBefore("\xc3\xc0", 2));
+    try testing.expectEqual(Decoded{ .cp = 0xfffd, .w = 1 }, decodeBefore("\xc1\x81", 2));
+    try testing.expectEqual(Decoded{ .cp = 0xfffd, .w = 1 }, decodeBefore("\xe0\xa0", 2));
+    // Valid sequences of every width end where they should.
+    try testing.expectEqual(Decoded{ .cp = 0xe9, .w = 2 }, decodeBefore("\xc3\xa9", 2));
+    try testing.expectEqual(Decoded{ .cp = 0x80, .w = 2 }, decodeBefore("\xc2\x80", 2));
+    try testing.expectEqual(Decoded{ .cp = 0x7ff, .w = 2 }, decodeBefore("\xdf\xbf", 2));
+    try testing.expectEqual(Decoded{ .cp = 0x20ac, .w = 3 }, decodeBefore("\xe2\x82\xac", 3));
+    try testing.expectEqual(Decoded{ .cp = 0x1f600, .w = 4 }, decodeBefore("x\xf0\x9f\x98\x80", 5));
+    try testing.expectEqual(Decoded{ .cp = 0xfffd, .w = 1 }, decodeBefore("\x80", 1));
+}
+
+test "mutation audit A: seqEnd goes over at most three continuation bytes" {
+    try testing.expectEqual(@as(usize, 4), seqEnd("a\x80\x80\x80\x80\x80", 1));
+    try testing.expectEqual(@as(usize, 2), seqEnd("a\x80b", 1));
+    try testing.expectEqual(@as(usize, 0), seqEnd("a\x80", 0));
+    try testing.expectEqual(@as(usize, 2), seqEnd("a\x80", 1));
+    try testing.expectEqual(@as(usize, 1), seqEnd("a", 1));
+}
+
+test "mutation audit A: runeBefore: a lone continuation byte is U+FFFD, DEL and ASCII are themselves" {
+    try testing.expectEqual(@as(?u21, null), runeBefore("", 0));
+    try testing.expectEqual(@as(?u21, 0xfffd), runeBefore("\x80", 1));
+    try testing.expectEqual(@as(?u21, 0x7f), runeBefore("\x7f", 1));
+    try testing.expectEqual(@as(?u21, 'a'), runeBefore("xa", 2));
+    try testing.expectEqual(@as(?u21, 0xe9), runeBefore("\xc3\xa9", 2));
+}
+
+test "mutation audit A: bytesBefore: at most three continuation bytes back, ASCII shadow only for a byte past ASCII" {
+    try testing.expectEqual(@as(?u21, null), bytesBefore("", 0));
+    try testing.expectEqual(@as(?u21, 'a'), bytesBefore("a", 1));
+    // Four continuation bytes after a valid four-byte sequence: the walk stops
+    // three back, on a continuation byte (an invalid byte), not on the lead.
+    try testing.expectEqual(@as(?u21, invalid), bytesBefore("\xf0\x90\x80\x80\x80", 5));
+    // U+0080 (a code point below 0x81, ending in a byte >= 0x80) is itself.
+    try testing.expectEqual(@as(?u21, 0x80), bytesBefore("\xc2\x80", 2));
+    // DEL before a continuation byte: ASCII seen as shadow; DEL alone: DEL.
+    try testing.expectEqual(@as(?u21, ascii_shadow + 0x7f), bytesBefore("\x7f\x80", 2));
+    try testing.expectEqual(@as(?u21, 0x7f), bytesBefore("\x7f", 1));
+    // `σ\x80` reads σ; a lone continuation byte is invalid.
+    try testing.expectEqual(@as(?u21, 0x3c3), bytesBefore("\xcf\x83\x80", 3));
+    try testing.expectEqual(@as(?u21, invalid), bytesBefore("\x80", 1));
+}
+
+test "mutation audit A: isUnicodeWord over ASCII, the ASCII shadow and the table" {
+    try testing.expect(!isUnicodeWord(null));
+    var c: u21 = 0;
+    while (c < 0x300) : (c += 1) {
+        const want = if (c < 0x80) isWord(c) else syntax.isPerlWord(c);
+        try testing.expectEqual(want, isUnicodeWord(c));
+    }
+    try testing.expect(isUnicodeWord(ascii_shadow + 'a'));
+    try testing.expect(isUnicodeWord(ascii_shadow + '_'));
+    try testing.expect(!isUnicodeWord(ascii_shadow + '-'));
+    try testing.expect(!isUnicodeWord(ascii_shadow));
+    try testing.expect(!isUnicodeWord(ascii_shadow + 0x7f));
+    try testing.expect(!isUnicodeWord(ascii_shadow + 0x80));
+    try testing.expect(!isUnicodeWord(invalid));
+    try testing.expect(isUnicodeWord(0x3c3));
+}
+
+test "mutation audit A: ReaderText.read: DEL, a lone continuation byte, end" {
+    var r: std.Io.Reader = .fixed("\x7f\x80");
+    var t: ReaderText = .{ .r = &r };
+    try testing.expectEqual(Decoded{ .cp = 0x7f, .w = 1 }, t.read());
+    try testing.expectEqual(Decoded{ .cp = 0xfffd, .w = 1 }, t.read());
+    try testing.expectEqual(Decoded{ .cp = null, .w = 0 }, t.read());
+}
+
+test "mutation audit A: ReaderText.read peeks an invalid tail from a buffer of 4, takes it byte by byte below" {
+    const text = "\xe2\x82A";
+    // Buffer of 4: peeked; the tail stays in the reader, nothing is held.
+    var buf4: [4]u8 = undefined;
+    var tr4: std.testing.Reader = .init(&buf4, &.{.{ .buffer = text }});
+    var t4: ReaderText = .{ .r = &tr4.interface };
+    try testing.expectEqual(Decoded{ .cp = 0xfffd, .w = 1 }, t4.read());
+    try testing.expectEqual(@as(u8, 0), t4.held_n);
+    try testing.expectEqual(@as(u8, 0x82), try tr4.interface.takeByte());
+    // Buffer of 3: taken, then the tail goes back into `held`.
+    var buf3: [3]u8 = undefined;
+    var tr3: std.testing.Reader = .init(&buf3, &.{.{ .buffer = text }});
+    var t3: ReaderText = .{ .r = &tr3.interface };
+    try testing.expectEqual(Decoded{ .cp = 0xfffd, .w = 1 }, t3.read());
+    try testing.expectEqual(@as(u8, 2), t3.held_n);
+    try testing.expectEqualSlices(u8, "\x82A", t3.held[0..2]);
+    // The held bytes read next: 0x82 (invalid), then `A`.
+    try testing.expectEqual(Decoded{ .cp = 0xfffd, .w = 1 }, t3.read());
+    try testing.expectEqual(Decoded{ .cp = 'A', .w = 1 }, t3.read());
+    // A valid sequence is the same either way.
+    var buf4b: [4]u8 = undefined;
+    var tv: std.testing.Reader = .init(&buf4b, &.{.{ .buffer = "\xe2\x82\xac" }});
+    var t5: ReaderText = .{ .r = &tv.interface };
+    try testing.expectEqual(Decoded{ .cp = 0x20ac, .w = 3 }, t5.read());
+}
+
+test "mutation audit A: ReaderText records a failure of the reader (peeked tail, unbuffered)" {
+    // A reader that yields its bytes, then fails.
+    const Half = struct {
+        r: std.Io.Reader,
+        left: []const u8,
+        fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const self: *@This() = @fieldParentPtr("r", r);
+            if (self.left.len == 0) return error.ReadFailed;
+            const n = limit.minInt(self.left.len);
+            try w.writeAll(self.left[0..n]);
+            self.left = self.left[n..];
+            return n;
+        }
+    };
+    // `\xe2` then a failure while its tail is peeked.
+    var buf: [8]u8 = undefined;
+    var h: Half = .{ .r = .{ .vtable = &.{ .stream = Half.stream }, .buffer = &buf, .seek = 0, .end = 0 }, .left = "\xe2" };
+    var t: ReaderText = .{ .r = &h.r };
+    try testing.expectEqual(Decoded{ .cp = 0xfffd, .w = 1 }, t.read());
+    try testing.expect(t.failed);
+
+    // An unbuffered reader that fails at once.
+    const Fail = struct {
+        interface: std.Io.Reader = .{ .vtable = &.{ .stream = stream }, .buffer = &.{}, .seek = 0, .end = 0 },
+        fn stream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            return error.ReadFailed;
+        }
+    };
+    var f: Fail = .{};
+    var tu: ReaderText = .{ .r = &f.interface };
+    try testing.expectEqual(Decoded{ .cp = null, .w = 0 }, tu.read());
+    try testing.expect(tu.failed);
+}
+
+test "mutation audit A (hook): decode's ASCII and two-byte fast paths are taken" {
+    probe_counts = .initFill(0);
+    _ = decode("abc", 1);
+    try testing.expectEqual(@as(usize, 1), probe_counts.get(.dec_ascii));
+    // C2 80 (lead C2, even continuation), DF BF (lead DF, odd continuation),
+    // each ending exactly at the end of the input, and one with text after.
+    probe_counts = .initFill(0);
+    _ = decode("\xc2\x80", 0);
+    _ = decode("\xdf\xbf", 0);
+    _ = decode("\xc3\xa9z", 0);
+    try testing.expectEqual(@as(usize, 3), probe_counts.get(.dec_two));
+    // Not on the fast path: C1 (overlong), a lone lead, a lead before a non-continuation.
+    probe_counts = .initFill(0);
+    _ = decode("\xc1\x81", 0);
+    _ = decode("\xc2", 0);
+    _ = decode("\xc2a", 0);
+    try testing.expectEqual(@as(usize, 0), probe_counts.get(.dec_two));
+}
+
+test "mutation audit A (hook): decodeBefore's two-byte fast path is taken for C2..DF leads" {
+    probe_counts = .initFill(0);
+    _ = decodeBefore("\xc2\x80", 2); // i == 2, lead C2, continuation 80
+    _ = decodeBefore("\xdf\xbf", 2); // lead DF, continuation BF (odd, 0xbf mask)
+    _ = decodeBefore("x\xc3\xa9", 3);
+    try testing.expectEqual(@as(usize, 3), probe_counts.get(.before_two));
+    probe_counts = .initFill(0);
+    _ = decodeBefore("\xc1\x81", 2);
+    _ = decodeBefore("\xe0\xa0", 2);
+    _ = decodeBefore("\xc3\xc0", 2);
+    _ = decodeBefore("a", 1);
+    try testing.expectEqual(@as(usize, 0), probe_counts.get(.before_two));
+}
+
+test "mutation audit A (hook): runeBefore answers ASCII (DEL included) without the wide path" {
+    probe_counts = .initFill(0);
+    _ = runeBefore("a", 1);
+    _ = runeBefore("\x7f", 1);
+    try testing.expectEqual(@as(usize, 0), probe_counts.get(.rune_wide));
+    _ = runeBefore("\x80", 1);
+    _ = runeBefore("\xc3\xa9", 2);
+    try testing.expectEqual(@as(usize, 2), probe_counts.get(.rune_wide));
+}
+
+test "mutation audit A (hook): ReaderText.read answers ASCII without the decode path" {
+    var r: std.Io.Reader = .fixed("ab\x7f");
+    var t: ReaderText = .{ .r = &r };
+    probe_counts = .initFill(0);
+    _ = t.read();
+    _ = t.read();
+    _ = t.read();
+    try testing.expectEqual(@as(usize, 3), probe_counts.get(.reader_ascii));
+}
+
+fn dirtyOf(comptime T: type) T {
+    var t: T = undefined;
+    @memset(std.mem.asBytes(&t), 0xff);
+    return t;
+}
+
+test "mutation B: dfaClosure says whether the match is among the instructions it reaches" {
+    var re = try Regex.compile(testing.allocator, "ab");
+    defer re.deinit(testing.allocator);
+    var matched: bool = true;
+    _ = re.dfaClosure(.{ 1, 0 }, null, null, &matched);
+    try testing.expect(!matched);
+    var e = try Regex.compile(testing.allocator, "a*");
+    defer e.deinit(testing.allocator);
+    matched = false;
+    _ = e.dfaClosure(.{ 1, 0 }, null, null, &matched);
+    try testing.expect(matched);
+}
+
+test "mutation B: setLoop and RegexSet.runLoop clear every word of the scratch they use (a dirty one)" {
+    const gpa = testing.allocator;
+    var k: usize = 1;
+    while (k <= 140) : (k += 1) {
+        const pat = try gpa.alloc(u8, k);
+        defer gpa.free(pat);
+        @memset(pat, 'a');
+        var re = try Regex.compile(gpa, pat);
+        defer re.deinit(gpa);
+        var stack: [2 * max_insts]u16 = undefined;
+
+        var a = dirtyOf(StateSet);
+        var b = dirtyOf(StateSet);
+        var t: SliceText = .{ .input = pat };
+        try testing.expectEqual(@as(?usize, k), re.setLoop(&t, false, &a, &b, &stack));
+
+        var set = try RegexSet.compile(gpa, &[_][]const u8{pat}, .{});
+        defer set.deinit(gpa);
+        var view = set.view();
+        var found: usize = 0;
+        var c = dirtyOf(StateSet);
+        var d = dirtyOf(StateSet);
+        try testing.expect(set.runLoop(&view, pat, null, &found, &c, &d, &stack));
+    }
+}
+
+test "mutation B: Prefilter.next searches a two-byte literal as a literal, and falls back to the first-byte set" {
+    var re = try Regex.compile(testing.allocator, "ab");
+    defer re.deinit(testing.allocator);
+    try testing.expectEqual(@as(u8, 2), re.prefilter.lit_len);
+    // The literal is at 1; the one-byte set {a} would stop at 0.
+    try testing.expectEqual(@as(?usize, 1), re.prefilter.next("aab", 0));
+
+    var set: [4]u64 = .{ 0, 0, 0, 0 };
+    const b: u8 = 'b';
+    set[b >> 6] |= @as(u64, 1) << @truncate(b);
+    const pf: Prefilter = .{ .first = set };
+    try testing.expectEqual(@as(?usize, 2), pf.next("aab", 0));
+    try testing.expectEqual(@as(?usize, null), pf.next("aab", 3));
+    try testing.expectEqual(@as(?usize, null), pf.next("aaa", 0));
+}
+
+test "mutation B: findLiteral takes a 64-byte block while a whole one remains, and a 32-byte block likewise" {
+    var buf: [193]u8 = undefined;
+    @memset(&buf, 'x');
+    // last = 1: the 64-byte loop runs while i + 65 <= 193: i = 0, 64, 128.
+    probe_counts = .initFill(0);
+    try testing.expectEqual(@as(?usize, null), findLiteral(&buf, 0, "ab"));
+    try testing.expectEqual(@as(usize, 3), probe_counts.get(.fl_block64));
+    // 33 bytes: no 64-byte block, one 32-byte block (0 + 1 + 32 <= 33).
+    probe_counts = .initFill(0);
+    try testing.expectEqual(@as(?usize, null), findLiteral(buf[0..33], 0, "ab"));
+    try testing.expectEqual(@as(usize, 0), probe_counts.get(.fl_block64));
+    try testing.expectEqual(@as(usize, 1), probe_counts.get(.fl_block32));
+    // And the answers are right at every offset of a text of 130 bytes.
+    var text: [130]u8 = undefined;
+    for (0..text.len - 1) |at| {
+        @memset(&text, 'x');
+        text[at] = 'a';
+        text[at + 1] = 'b';
+        try testing.expectEqual(@as(?usize, at), findLiteral(&text, 0, "ab"));
+        try testing.expectEqual(@as(?usize, null), findLiteral(&text, at + 1, "ab"));
+    }
+}
+
+test "mutation B: OnePass.run reports where the reading stopped" {
+    const gpa = testing.allocator;
+    var re = try Regex.compile(gpa, "(a)(b)");
+    defer re.deinit(gpa);
+    var m = try Matcher.init(gpa, &re);
+    defer m.deinit();
+    m.dfa_eager = true;
+    var out: [3]?Span = undefined;
+    try testing.expect(m.captures("ab", 0, &out));
+    const op = m.onepass.?;
+    var reach: usize = 12345;
+    try testing.expect(op.run(&re, "abz", 0, m.tmp, m.best, &reach));
+    try testing.expectEqual(@as(usize, 2), reach);
+    reach = 777;
+    try testing.expect(!op.run(&re, "ax", 0, m.tmp, m.best, &reach));
+    try testing.expectEqual(@as(usize, 1), reach);
+}
+
+test "mutation B: a start not read off the forward pass is not counted as tracked, and is found by the backward DFA" {
+    const gpa = testing.allocator;
+    var re = try Regex.compile(gpa, "[a-f][0-9](x)");
+    defer re.deinit(gpa);
+    var m = try Matcher.init(gpa, &re);
+    defer m.deinit();
+    m.dfa_eager = true;
+    _ = m.makeDfa();
+    m.dfa.?.track = false;
+    var out: [2]?Span = undefined;
+    try testing.expect(m.captures("!!c5xZ", 0, &out));
+    try testing.expectEqual(Span{ .start = 2, .end = 5 }, out[0].?);
+    try testing.expectEqual(Span{ .start = 4, .end = 5 }, out[1].?);
+    try testing.expectEqual(@as(usize, 0), m.dfa.?.tracked);
+    try testing.expect(m.dfa.?.rev.keys.items.len > 0);
+}
+
+test "mutation B: the set VM skips where no match can start, stops where no thread can, starts threads only where it may" {
+    const gpa = testing.allocator;
+    // Unanchored: the prefilter jumps over a text without a candidate.
+    var re = try Regex.compile(gpa, "[ab]x");
+    defer re.deinit(gpa);
+    const z = try gpa.alloc(u8, 1000);
+    defer gpa.free(z);
+    @memset(z, 'z');
+    probe_counts = .initFill(0);
+    try testing.expectEqual(@as(?usize, null), re.shortestMatch(z));
+    try testing.expect(probe_counts.get(.set_step) <= 2);
+
+    // Anchored: when the thread died past the start, nothing more is read,
+    // and no thread is started past it.
+    var an = try Regex.compile(gpa, "^[ab]x");
+    defer an.deinit(gpa);
+    const t = try gpa.alloc(u8, 1002);
+    defer gpa.free(t);
+    @memset(t, 'b');
+    t[0] = 'a';
+    t[1] = 'z';
+    probe_counts = .initFill(0);
+    try testing.expectEqual(@as(?usize, null), an.shortestMatch(t));
+    try testing.expect(probe_counts.get(.set_step) <= 3);
+    try testing.expectEqual(@as(usize, 1), probe_counts.get(.set_start));
+
+    // Full match: no thread left ends the run (a program past the DFA).
+    const long = try gpa.alloc(u8, 150);
+    defer gpa.free(long);
+    @memset(long, 'a');
+    var lr = try Regex.compile(gpa, long);
+    defer lr.deinit(gpa);
+    try testing.expect(lr.insts.len > Dfa.max_insts);
+    const text = try gpa.alloc(u8, 1001);
+    defer gpa.free(text);
+    @memset(text, 'x');
+    text[0] = 'b';
+    probe_counts = .initFill(0);
+    try testing.expect(!lr.fullMatch(text));
+    try testing.expect(probe_counts.get(.set_step) <= 3);
+}
+
+test "mutation B: the byte-mode set VM stops a full match when no thread is left" {
+    const gpa = testing.allocator;
+    var rb = try Regex.compileOptions(gpa, "abc", .{ .syntax = .rust, .utf8 = false });
+    defer rb.deinit(gpa);
+    const text = try gpa.alloc(u8, 1001);
+    defer gpa.free(text);
+    @memset(text, 'y');
+    text[0] = 'x';
+    probe_counts = .initFill(0);
+    try testing.expect(!rb.fullMatch(text));
+    try testing.expect(probe_counts.get(.bytes_step) <= 3);
+}
+
+/// `(A)(x*)Z` read from `from`: a first candidate of `spent` bytes that fails
+/// (A, spent - 1 x, Y), then a match. With the candidate loop's budget
+/// (twice the text moved past, plus 256) kept, the second candidate is
+/// tried and the forward DFA never runs; exceeded, the DFA finds the match
+/// (`want_dfa`). `OnePass.run` runs twice either way.
+fn budgetCase(spent: usize, from: usize, want_dfa: bool) !void {
+    const gpa = testing.allocator;
+    var re = try Regex.compile(gpa, "(A)(x*)Z");
+    defer re.deinit(gpa);
+    const text = try gpa.alloc(u8, from + spent + 4);
+    defer gpa.free(text);
+    @memset(text[0..from], 'q');
+    text[from] = 'A';
+    @memset(text[from + 1 ..][0 .. spent - 1], 'x');
+    text[from + spent] = 'Y';
+    @memcpy(text[from + spent + 1 ..], "AxZ");
+    var m = try Matcher.init(gpa, &re);
+    defer m.deinit();
+    m.dfa_eager = true;
+    var out: [3]?Span = undefined;
+    probe_counts = .initFill(0);
+    try testing.expect(m.captures(text, from, &out));
+    try testing.expectEqual(Span{ .start = from + spent + 1, .end = text.len }, out[0].?);
+    try testing.expectEqual(Span{ .start = from + spent + 2, .end = from + spent + 3 }, out[2].?);
+    try testing.expectEqual(@as(usize, 2), probe_counts.get(.op_run));
+    try testing.expectEqual(want_dfa, probe_counts.get(.fwd_step) != 0);
+}
+
+test "mutation B: the one-pass engine's candidate loop spends at most 2 * (text moved past) + 256" {
+    try budgetCase(258, 0, false); // 258 <= 2 * 1 + 256: another candidate
+    try budgetCase(259, 0, true); // 259 >  258: the DFA
+    try budgetCase(259, 10, true); // the budget counts from `from`, not past it
+    try budgetCase(258, 10, false); // and the spent bytes are reach - p, not reach + p
+}
+
+test "mutation B: the one-pass loop takes plain steps in its fast loop and ASCII steps from the table" {
+    const gpa = testing.allocator;
+    var re = try Regex.compile(gpa, "\\x7f*(y)");
+    defer re.deinit(gpa);
+    var m = try Matcher.init(gpa, &re);
+    defer m.deinit();
+    m.dfa_eager = true;
+    var text: [51]u8 = undefined;
+    @memset(text[0..50], 0x7f);
+    text[50] = 'y';
+    var out: [2]?Span = undefined;
+    probe_counts = .initFill(0);
+    try testing.expect(m.capturesAnchored(&text, 0, &out));
+    try testing.expectEqual(Span{ .start = 0, .end = 51 }, out[0].?);
+    try testing.expectEqual(Span{ .start = 50, .end = 51 }, out[1].?);
+    try testing.expect(probe_counts.get(.op_fast) >= 40);
+    try testing.expectEqual(@as(usize, 0), probe_counts.get(.op_wide));
+}
+
+test "mutation B: the backtracker's start loop stops for an anchored program, moves its window past a skip, keeps it otherwise" {
+    const gpa = testing.allocator;
+    // An anchored program: one try, not one per candidate.
+    var an = try Regex.compile(gpa, "^[ab]x");
+    defer an.deinit(gpa);
+    const az = try gpa.alloc(u8, 1000);
+    defer gpa.free(az);
+    for (az, 0..) |*c, i| c.* = if (i % 2 == 0) 'a' else 'z';
+    var m = try Matcher.init(gpa, &an);
+    defer m.deinit();
+    probe_counts = .initFill(0);
+    try testing.expect(m.find(az, 0) == null);
+    try testing.expect(probe_counts.get(.bt_at) <= 2);
+
+    // A skip past everything visited moves the window.
+    var ab = try Regex.compile(gpa, "ab");
+    defer ab.deinit(gpa);
+    var m2 = try Matcher.init(gpa, &ab);
+    defer m2.deinit();
+    probe_counts = .initFill(0);
+    const hit = m2.find("xxxxab", 0);
+    try testing.expectEqual(Span{ .start = 4, .end = 6 }, hit.?);
+    try testing.expect(probe_counts.get(.bt_rebase) >= 1);
+
+    // Consecutive starts move it once: the first start past the window's
+    // furthest position (a start at it keeps the window).
+    var bc = try Regex.compile(gpa, "[ab]c");
+    defer bc.deinit(gpa);
+    var m3 = try Matcher.init(gpa, &bc);
+    defer m3.deinit();
+    probe_counts = .initFill(0);
+    const hit3 = m3.find("aaaaaaac", 0);
+    try testing.expectEqual(Span{ .start = 6, .end = 8 }, hit3.?);
+    try testing.expectEqual(@as(usize, 1), probe_counts.get(.bt_rebase));
+}
+
+test "mutation B: a match far past the backtracker's window is found by moving the window, not by the Pike VM" {
+    const gpa = testing.allocator;
+    var re = try Regex.compile(gpa, "(a)b");
+    defer re.deinit(gpa);
+    const text = try gpa.alloc(u8, 300_000);
+    defer gpa.free(text);
+    @memset(text, 'x');
+    text[299_990] = 'a';
+    text[299_991] = 'b';
+    var m = try Matcher.init(gpa, &re);
+    defer m.deinit();
+    m.onepass_off = true;
+    var out: [2]?Span = undefined;
+    probe_counts = .initFill(0);
+    try testing.expect(m.captures(text, 0, &out));
+    try testing.expectEqual(Span{ .start = 299_990, .end = 299_992 }, out[0].?);
+    try testing.expectEqual(@as(usize, 0), probe_counts.get(.pike_step));
+}
+
+test "mutation B: the Pike VMs stop reading where no thread can start or be alive" {
+    const gpa = testing.allocator;
+    // Bytes mode: a match found, the rest not read; an anchored search over
+    // a text that does not start with the match.
+    var rb = try Regex.compileOptions(gpa, "a", .{ .syntax = .rust, .utf8 = false });
+    defer rb.deinit(gpa);
+    var mb = try Matcher.init(gpa, &rb);
+    defer mb.deinit();
+    mb.pike_only = true;
+    const az = try gpa.alloc(u8, 1001);
+    defer gpa.free(az);
+    @memset(az, 'z');
+    az[0] = 'a';
+    probe_counts = .initFill(0);
+    try testing.expectEqual(Span{ .start = 0, .end = 1 }, mb.find(az, 0).?);
+    try testing.expect(probe_counts.get(.pike_bytes_step) <= 5);
+    az[0] = 'z';
+    probe_counts = .initFill(0);
+    try testing.expect(mb.findAnchored(az, 0) == null);
+    try testing.expect(probe_counts.get(.pike_bytes_step) <= 3);
+
+    // Text mode: an anchored search, and an anchored program, over a text of
+    // candidates ("xa" ...) that the prefilter would keep jumping to.
+    const xa = try gpa.alloc(u8, 1000);
+    defer gpa.free(xa);
+    for (xa, 0..) |*c, i| c.* = if (i % 2 == 0) 'x' else 'a';
+    var rt = try Regex.compile(gpa, "a");
+    defer rt.deinit(gpa);
+    var mt = try Matcher.init(gpa, &rt);
+    defer mt.deinit();
+    mt.pike_only = true;
+    probe_counts = .initFill(0);
+    try testing.expect(mt.findAnchored(xa, 0) == null);
+    try testing.expect(probe_counts.get(.pike_step) <= 4);
+    var ra = try Regex.compile(gpa, "^a");
+    defer ra.deinit(gpa);
+    var ma = try Matcher.init(gpa, &ra);
+    defer ma.deinit();
+    ma.pike_only = true;
+    probe_counts = .initFill(0);
+    try testing.expect(ma.find(xa, 0) == null);
+    try testing.expect(probe_counts.get(.pike_step) <= 4);
+}
+
+test "mutation B: the Pike VMs' full-match mode takes a match only at the end of the text" {
+    const gpa = testing.allocator;
+    var re = try Regex.compile(gpa, "a+");
+    defer re.deinit(gpa);
+    var m = try Matcher.init(gpa, &re);
+    defer m.deinit();
+    var t1: SliceText = .{ .input = "aaa" };
+    try testing.expect(m.runOn(&t1, 0, true));
+    var t2: SliceText = .{ .input = "aab" };
+    try testing.expect(!m.runOn(&t2, 0, true));
+
+    var rb = try Regex.compileOptions(gpa, "a+", .{ .syntax = .rust, .utf8 = false });
+    defer rb.deinit(gpa);
+    var mb = try Matcher.init(gpa, &rb);
+    defer mb.deinit();
+    try testing.expect(mb.runOnBytes("aaa", 0, true));
+    try testing.expect(!mb.runOnBytes("aab", 0, true));
+}
+
+// The golden work table (mutation audit 2026-11-12). The lazy DFAs' caches,
+// table limits, give-up heuristics and prefilter skips never change an
+// answer, so the answers alone cannot pin them: each row is a case's answers
+// (digest) and every `Probe` count, over `isMatch`, `fullMatch`,
+// `shortestMatch`, `isMatchReader` and a find-all on three `Matcher`s
+// (default, `dfa_eager`, `dfa_eager` with `dfa_small`). A deliberate change
+// to the engines' work changes rows: set `golden_print`, run the module's
+// tests, and paste the printed table after checking the answers held
+// (the other tests).
+const golden_print = false;
+
+const GoldenCase = struct { p: []const u8, t: u8, o: Options = .{} };
+
+const golden_cases = [_]GoldenCase{
+    .{ .p = "\\w+", .t = 0 },                                                     .{ .p = "\\w+", .t = 1 },
+    .{ .p = "\\w+", .t = 2 },                                                     .{ .p = "[0-9]+", .t = 0 },
+    .{ .p = "[0-9]+", .t = 1 },                                                   .{ .p = "[0-9]+", .t = 4 },
+    .{ .p = "hello|world|foo|bar|baz", .t = 0 },                                  .{ .p = "hello|world|foo|bar|baz", .t = 2 },
+    .{ .p = "quick\\w*", .t = 0 },                                                .{ .p = "z\\d*", .t = 0 },
+    .{ .p = "z\\d*", .t = 1 },                                                    .{ .p = "\\bfo\\w*\\b", .t = 0 },
+    .{ .p = "\\b\\w\\w\\b", .t = 1 },                                             .{ .p = "(?m)^\\w+ \\w+$", .t = 0 },
+    .{ .p = "[ab]*a[ab]{6}", .t = 3 },                                            .{ .p = "(a|b)*a(a|b){6}$", .t = 3 },
+    .{ .p = "[a-z]+\\n$", .t = 0 },                                               .{ .p = "o[gx] \\d+\\n$", .t = 0 },
+    .{ .p = "zzz$", .t = 0 },                                                     .{ .p = "^the", .t = 0 },
+    .{ .p = "\\Aquick", .t = 0 },
+    .{ .p = "\\p{Han}+|😀", .t = 2 },
+    .{ .p = "[^a]+", .t = 2 },
+    .{ .p = "(?i)PŘÍLIŠ|ódy", .t = 1 },
+    .{ .p = ".", .t = 2 },                                                        .{ .p = "a*", .t = 3 },
+    .{ .p = "[a-f][0-9]", .t = 0 },                                               .{ .p = "\\w+\\s\\w+", .t = 1 },
+    .{ .p = ".*fox", .t = 0 },                                                    .{ .p = "(?:ab|a)+b", .t = 3 },
+    .{ .p = "ž+", .t = 4 },
+    .{ .p = "\\d+ž", .t = 4 },
+    .{ .p = "(?-u:\\xff)+|b", .t = 2, .o = .{ .syntax = .rust, .utf8 = false } }, .{ .p = "\\b{start}\\w", .t = 0, .o = .{ .syntax = .rust } },
+    .{ .p = "[ab]{3}$", .t = 3 },                                                 .{ .p = "\\x{10FFFD}|y", .t = 2 },
+};
+
+fn goldenText(buf: []u8, which: u8) []const u8 {
+    var n: usize = 0;
+    const unit: []const u8 = switch (which) {
+        0 => "the quick brown fox 123 jumps over the lazy dog 4567 foo bar baz a1 b22 f3\n",
+        1 => "Příliš žluťoučký kůň úpěl ďábelské ódy 42 a čeština 7, žžž ěé\n",
+        2 => "日本語 text 😀 x\u{10FFFD}y \x7f\xff\x80 ab12 hello 中文 \xe2\x82 baz \xf0\x9f\x98 end ",
+        4 => "1žžžžžžžžžžžžžžžžžžžžžžžžžžžžžžžžžžžžžžžž22é3é4žžž5 ",
+        else => "",
+    };
+    if (which == 3) {
+        var prng: std.Random.DefaultPrng = .init(0x676f6c64);
+        const rng = prng.random();
+        while (n < 1500) : (n += 1) buf[n] = "aab"[rng.uintLessThan(usize, 3)];
+        return buf[0..n];
+    }
+    while (n + unit.len <= 1200) : (n += unit.len) @memcpy(buf[n..][0..unit.len], unit);
+    return buf[0..n];
+}
+
+fn goldenFindAll(m: *Matcher, input: []const u8, h: *std.hash.Wyhash) void {
+    var from: usize = 0;
+    while (from <= input.len) {
+        const sp = m.find(input, from) orelse break;
+        h.update(std.mem.asBytes(&[2]u64{ sp.start, sp.end }));
+        from = if (sp.end > sp.start) sp.end else sp.end + 1;
+    }
+    h.update("|");
+    if (m.dfa) |d| {
+        const fields = [_]u64{ d.flushes, d.states.items.len, d.rev.len(), d.tracked, d.joins, @bitCast(@as(i64, d.scan_score)), @intFromBool(d.track) };
+        h.update(std.mem.asBytes(&fields));
+    }
+}
+
+fn goldenRow(gpa: std.mem.Allocator, case: GoldenCase) ![1 + std.EnumArray(Probe, usize).len]u64 {
+    var buf: [1600]u8 = undefined;
+    const input = goldenText(&buf, case.t);
+    var re = try Regex.compileOptions(gpa, case.p, case.o);
+    defer re.deinit(gpa);
+    probe_counts = .initFill(0);
+    var h: std.hash.Wyhash = .init(0);
+    const flags = [_]bool{ re.isMatch(input), re.fullMatch(input), re.isMatch(input[0 .. input.len / 2]) };
+    h.update(std.mem.asBytes(&flags));
+    const short: u64 = re.shortestMatch(input) orelse std.math.maxInt(u64);
+    h.update(std.mem.asBytes(&short));
+    if (!re.bytes) {
+        var r: std.Io.Reader = .fixed(input);
+        const found = try re.isMatchReader(&r);
+        h.update(std.mem.asBytes(&found));
+    }
+    for (0..3) |config| {
+        var m = try Matcher.init(gpa, &re);
+        defer m.deinit();
+        m.dfa_eager = config != 0;
+        m.dfa_small = config == 2;
+        goldenFindAll(&m, input, &h);
+        // Again on the same `Matcher`: the second pass reads the caches.
+        goldenFindAll(&m, input, &h);
+    }
+    var row: [1 + std.EnumArray(Probe, usize).len]u64 = undefined;
+    row[0] = h.final();
+    for (probe_counts.values, row[1..]) |v, *x| x.* = v;
+    return row;
+}
+
+const golden_want = [_][1 + std.EnumArray(Probe, usize).len]u64{
+    .{ 15164632721457695747, 2, 8, 5, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 132, 1632, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 144, 0, 0, 0 },
+    .{ 10048191757018527131, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 96, 0, 404, 1260, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 2, 88, 326, 0, 0 },
+    .{ 16040365197490733272, 2, 5, 2, 0, 0, 0, 0, 8, 8, 0, 0, 0, 0, 0, 0, 96, 1371, 96, 756, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 5, 77, 0, 0, 0 },
+    .{ 12384312014502880017, 2, 5, 2, 0, 0, 0, 0, 24, 24, 0, 0, 0, 0, 0, 0, 0, 0, 120, 480, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 24, 129, 0, 0, 0 },
+    .{ 15115527827644834550, 2, 5, 2, 0, 0, 0, 0, 43, 43, 0, 0, 0, 0, 0, 0, 174, 0, 27, 168, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 28, 36, 0, 0, 0 },
+    .{ 8638340579144201148, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 192, 0, 39, 360, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 28, 21, 0, 0 },
+    .{ 17510967732706982897, 2, 9, 6, 0, 0, 0, 0, 61, 61, 0, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 288, 3, 0, 0, 0, 0, 59, 47, 0, 0, 0 },
+    .{ 1697275548591039429, 2, 13, 10, 0, 0, 0, 0, 36, 36, 0, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 216, 3, 0, 0, 0, 0, 23, 53, 0, 0, 0 },
+    .{ 6803076195450018575, 2, 13, 10, 0, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0, 189, 6, 96, 3, 0, 0, 0, 0, 12, 43, 0, 0, 0 },
+    .{ 7308186787397403972, 2, 5, 2, 0, 0, 0, 0, 45, 45, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 45, 18, 0, 0, 0 },
+    .{ 12216273954606837675, 2, 1, 0, 0, 0, 0, 0, 869, 869, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 560, 1, 0, 0, 0 },
+    .{ 16661322863164733733, 2, 9, 6, 0, 0, 0, 0, 24, 24, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 22, 32, 0, 0, 0 },
+    .{ 8957657828776279370, 4, 12, 9, 0, 0, 0, 0, 11, 11, 0, 0, 0, 0, 0, 0, 96, 0, 557, 420, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 99, 480, 3, 3 },
+    .{ 3698356145194735362, 1226, 96, 95, 0, 0, 0, 0, 2161, 2161, 0, 0, 0, 0, 0, 0, 0, 0, 135, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2151, 0, 0, 0 },
+    .{ 10115942991274251655, 2, 1264, 1262, 34, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 0, 0, 3222, 0, 0, 4, 217, 0, 0, 0, 0, 0, 6, 3, 0, 0, 0, 0, 10, 4502, 0, 0, 0 },
+    .{ 15643903801131319530, 0, 1248, 1248, 34, 0, 0, 0, 3002, 3002, 0, 0, 0, 0, 0, 6, 0, 0, 7690, 0, 0, 12, 439, 0, 0, 0, 0, 0, 6, 3, 0, 0, 0, 0, 1500, 11937, 0, 0, 0 },
+    .{ 16512095191518823459, 0, 4, 3, 0, 4, 0, 4, 2193, 2193, 0, 0, 0, 0, 0, 0, 0, 0, 129, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2117, 0, 0, 0 },
+    .{ 16692255664732926537, 0, 1, 0, 0, 6, 0, 6, 1441, 1441, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 1200, 517, 0, 0, 0 },
+    .{ 12216273954606837675, 0, 1, 0, 0, 0, 0, 0, 1201, 1201, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 126, 7, 0, 3, 0, 0, 0, 0, 1200, 1, 0, 0, 0 },
+    .{ 9928401522073452516, 0, 12, 9, 0, 0, 0, 0, 8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0, 6, 32, 0, 0, 0 },
+    .{ 8817487514071533497, 0, 3, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0, 3, 8, 0, 0, 0 },
+    .{ 255220893118731787, 2, 8, 5, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 96, 1296, 78, 324, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 55, 0, 0, 0 },
+    .{ 9535395973114509801, 0, 18, 15, 0, 0, 0, 0, 4, 4, 0, 15, 24, 0, 6, 0, 0, 1482, 87, 216, 6, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 100, 0, 0, 0 },
+    .{ 7977390198355055948, 2, 21, 18, 0, 0, 0, 0, 14, 14, 0, 0, 0, 0, 0, 0, 0, 0, 330, 0, 0, 0, 33, 0, 0, 0, 0, 0, 168, 3, 0, 0, 0, 0, 5, 229, 136, 0, 0 },
+    .{ 6979640180260109447, 0, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 3, 0, 6, 0, 0, 2430, 144, 4746, 6, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 432, 0, 1, 96, 0, 0, 0 },
+    .{ 9195713229761359493, 0, 5, 2, 0, 0, 0, 0, 2, 2, 0, 0, 6, 0, 6, 0, 0, 0, 24, 0, 4944, 3, 3, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 3, 31, 0, 0, 0 },
+    .{ 18108727944704394641, 24, 29, 26, 0, 0, 0, 0, 95, 95, 0, 0, 0, 0, 0, 0, 0, 0, 132, 288, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 70, 215, 0, 0, 0 },
+    .{ 5569908290217341108, 20, 54, 51, 0, 0, 0, 0, 72, 72, 0, 0, 36, 0, 12, 0, 96, 0, 349, 0, 168, 6, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 28, 271, 194, 30, 24 },
+    .{ 1304118577475789381, 0, 76, 73, 0, 0, 0, 0, 40, 40, 0, 0, 0, 0, 0, 0, 0, 0, 216, 96, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 22, 332, 0, 0, 0 },
+    .{ 2510107502798244048, 2, 14, 11, 0, 0, 0, 0, 14, 14, 0, 0, 0, 0, 0, 0, 0, 0, 21, 0, 0, 3, 0, 0, 0, 0, 0, 0, 678, 3, 0, 0, 0, 0, 9, 49, 0, 0, 0 },
+    .{ 12771596290932658175, 2, 5, 2, 0, 0, 0, 0, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 141, 0, 144, 3, 0, 0, 0, 0, 1, 7, 14, 0, 0 },
+    .{ 12524798475987748091, 2, 9, 6, 0, 0, 0, 0, 6, 6, 0, 0, 0, 0, 0, 0, 144, 0, 30, 144, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 25, 20, 0, 0 },
+    .{ 16695608249434358507, 0, 0, 0, 0, 0, 0, 0, 0, 0, 92, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6588, 6918, 0, 0, 3771, 0, 0, 0 },
+    .{ 11218002173469069820, 0, 0, 0, 0, 0, 0, 0, 11, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3930, 5568, 0, 4, 11153, 0, 0, 0 },
+    .{ 16025140877391608600, 0, 4, 3, 0, 6, 0, 8, 3002, 3002, 0, 0, 12, 0, 12, 6, 0, 0, 84, 0, 6, 6, 3, 0, 0, 0, 0, 0, 774, 3, 0, 0, 0, 0, 1500, 3087, 0, 0, 0 },
+    .{ 17791598714729744375, 2, 5, 2, 0, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 114, 105, 18, 216, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 11, 20, 0, 0, 0 },
+};
+
+test "golden work table: the engines' caches, limits and skips do the work they did" {
+    const gpa = testing.allocator;
+    const print = golden_print or golden_want.len != golden_cases.len;
+    var h: std.hash.Wyhash = .init(0);
+    if (print) std.debug.print("GOLDEN-BEGIN\n", .{});
+    for (golden_cases, 0..) |case, i| {
+        const row = try goldenRow(gpa, case);
+        h.update(std.mem.asBytes(&row));
+        if (print) {
+            std.debug.print("    .{any},\n", .{row});
+            continue;
+        }
+        const want = golden_want[i];
+        if (!std.mem.eql(u64, &row, &want)) {
+            std.debug.print("golden row {d} (/{s}/, text {d}):\n", .{ i, case.p, case.t });
+            for (row, want, 0..) |got, w, j| if (got != w) {
+                const what = if (j == 0) "answers" else @tagName(@as(Probe, @fromBackingInt(@intCast(j - 1))));
+                std.debug.print("  {s}: {d}, want {d}\n", .{ what, got, w });
+            };
+            return error.TestUnexpectedResult;
+        }
+    }
+    // golden-check
+    if (print) std.debug.print("GOLDEN-END {x}\n", .{h.final()});
+}
+
+test "mutation M: a pattern error comes back before any heap scratch, and from the full Builder before the large one" {
+    // Fits the stack Builder: no allocation at all before the error.
+    var none = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.MissingParen, Regex.compile(none.allocator(), "(a"));
+    // Past the stack Builder's nodes, an error at the end: the heap
+    // `Builder` reports it; the large one is never made.
+    var buf: [301]u8 = undefined;
+    @memset(buf[0..300], 'a');
+    buf[300] = '(';
+    var one = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    try testing.expectError(error.MissingParen, Regex.compile(one.allocator(), &buf));
+}
+
+fn mutationCompileNamed(gpa: std.mem.Allocator) !void {
+    var re = try Regex.compile(gpa, "(?P<first>a)(?P<second>b)(c)");
+    re.deinit(gpa);
+}
+
+test "mutation M: compile frees every table on any allocation failure" {
+    try std.testing.checkAllAllocationFailures(testing.allocator, mutationCompileNamed, .{});
+}
+
+test "mutation M: deinit of a comptime Regex frees nothing" {
+    var re = comptime comptimeCompile("a+b");
+    try testing.expect(!re.owned);
+    re.deinit(testing.allocator);
+}
+
+/// A pattern `prefix ++ "a{500}b{n}"` compiled with `opts` whose program is
+/// exactly `want` instructions long, or null.
+fn mutationExactProgram(gpa: std.mem.Allocator, buf: []u8, prefix: []const u8, suffix: []const u8, want: usize, opts: Options) !?Regex {
+    for (0..700) |n| {
+        const pat = try std.fmt.bufPrint(buf, "{s}a{{500}}b{{{d}}}{s}", .{ prefix, n, suffix });
+        var re = Regex.compileOptions(gpa, pat, opts) catch |e| switch (e) {
+            error.PatternTooLarge => continue,
+            else => return e,
+        };
+        if (re.insts.len == want) return re;
+        re.deinit(gpa);
+    }
+    return null;
+}
+
+test "mutation M: a program of exactly max_insts compiles in bytes mode and keeps its prefilter" {
+    const gpa = testing.allocator;
+    var buf: [64]u8 = undefined;
+    var bytes = (try mutationExactProgram(gpa, &buf, "", "", max_insts, .{ .syntax = .rust, .utf8 = false })) orelse
+        return error.TestUnexpectedResult;
+    bytes.deinit(gpa);
+    var plain = (try mutationExactProgram(gpa, &buf, "zq", "", max_insts, .{})) orelse return error.TestUnexpectedResult;
+    defer plain.deinit(gpa);
+    try testing.expect(plain.prefilter.first != null);
+}
+
+test "mutation M: Teddy is built for a plain program only" {
+    const gpa = testing.allocator;
+    var small = try Regex.compile(gpa, "foo\\w|bar\\w|baz\\w");
+    defer small.deinit(gpa);
+    try testing.expect(small.prefilter.teddy != null);
+    var big = try Regex.compile(gpa, "foo\\w{600}|bar\\w{600}|baz\\w{600}");
+    defer big.deinit(gpa);
+    try testing.expect(big.insts.len > max_insts);
+    try testing.expect(big.prefilter.teddy == null);
+    var bytes = try Regex.compileOptions(gpa, "foo\\w|bar\\w|baz\\w", .{ .syntax = .rust, .utf8 = false });
+    defer bytes.deinit(gpa);
+    try testing.expect(bytes.prefilter.teddy == null);
+}
+
+test "mutation M: the lazy DFAs take a program of exactly Dfa.max_insts" {
+    const gpa = testing.allocator;
+    var found_fwd = false;
+    var found_rev = false;
+    var buf: [32]u8 = undefined;
+    for (100..140) |n| {
+        for ([_][]const u8{ "", "$" }) |suffix| {
+            const pat = try std.fmt.bufPrint(&buf, "xa{{{d}}}{s}", .{ n, suffix });
+            var re = try Regex.compile(gpa, pat);
+            defer re.deinit(gpa);
+            if (re.insts.len != Dfa.max_insts) continue;
+            // Long enough for the tail check of `$`: the reverse DFA reads it.
+            const text: [200]u8 = @splat('a');
+            probe_counts = .initFill(0);
+            // Forwards: a full match (no prefilter skip); backwards: `isMatch`.
+            if (suffix.len == 0) try testing.expect(!re.fullMatch("xaaa")) else try testing.expect(!re.isMatch(&text));
+            if (suffix.len == 0) {
+                try testing.expect(probe_counts.get(.dfa_step) > 0);
+                found_fwd = true;
+            } else {
+                try testing.expect(probe_counts.get(.rev_step) > 0);
+                found_rev = true;
+            }
+        }
+    }
+    try testing.expect(found_fwd and found_rev);
 }

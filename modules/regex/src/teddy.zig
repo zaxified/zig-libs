@@ -17,6 +17,15 @@ const builtin = @import("builtin");
 const syntax = @import("syntax.zig");
 
 const Inst = syntax.Inst;
+
+/// Test hook (mutation audit 2026-11-12): counts of the search loops' steps,
+/// which no result shows (a candidate is verified either way). File-private;
+/// `probe` compiles to nothing outside test builds.
+threadlocal var probe_counts: struct { vec_block: usize = 0, cand_block: usize = 0, scalar_step: usize = 0, verify: usize = 0, bs_vec: usize = 0 } = .{};
+
+inline fn probe(comptime field: []const u8) void {
+    if (builtin.is_test) @field(probe_counts, field) += 1;
+}
 const Range = syntax.Range;
 
 /// Prefixes kept, at most; past it the prefixes are cut shorter, and below
@@ -67,6 +76,7 @@ pub const Teddy = struct {
         const zero: V = @splat(0);
         var i = pos;
         while (i + (m - 1) + lanes <= input.len) : (i += lanes) {
+            probe("vec_block");
             var c: V = @splat(0xff);
             inline for (0..m) |j| {
                 const v: V = input[i + j ..][0..lanes].*;
@@ -74,6 +84,7 @@ pub const Teddy = struct {
             }
             var mask: u32 = @bitCast(c != zero);
             if (mask == 0) continue;
+            probe("cand_block");
             const bits: [lanes]u8 = c;
             while (mask != 0) : (mask &= mask - 1) {
                 const at = i + @ctz(mask);
@@ -81,6 +92,7 @@ pub const Teddy = struct {
             }
         }
         while (i + m <= input.len) : (i += 1) {
+            probe("scalar_step");
             var b: u8 = 0xff;
             inline for (0..m) |j| {
                 const x = input[i + j];
@@ -93,6 +105,7 @@ pub const Teddy = struct {
 
     /// Does `input[at..]` begin with a prefix of one of `buckets`?
     fn verify(t: *const Teddy, input: []const u8, at: usize, buckets: u8) bool {
+        probe("verify");
         var b = buckets;
         while (b != 0) : (b &= b - 1) {
             const k = @ctz(b);
@@ -170,6 +183,7 @@ pub const ByteSet = struct {
         const zero: V = @splat(0);
         var i = pos;
         while (i + lanes <= input.len) : (i += lanes) {
+            probe("bs_vec");
             const v: V = input[i..][0..lanes].*;
             const c = lookup(lo, v & nib) & lookup(hi, v >> @splat(@as(u3, 4)));
             const mask: u32 = @bitCast(c != zero);
@@ -415,4 +429,190 @@ test "ByteSet: the nibble tables hold exactly the set, and find agrees with a by
         nine[c >> 6] |= @as(u64, 1) << @intCast(c & 63);
     };
     try testing.expectEqual(null, ByteSet.build(nine));
+}
+
+// ── tests (mutation audit 2026-11-12) ──
+
+const test_ranges = [_]Range{
+    .{ .lo = 'a', .hi = 'a' },
+    .{ .lo = 'b', .hi = 'b' },
+    .{ .lo = 'c', .hi = 'c' },
+    .{ .lo = 'd', .hi = 'd' },
+    .{ .lo = 'e', .hi = 'e' },
+};
+
+fn runeAt(i: u16) Inst {
+    return .{ .rune = .{ .start = i, .len = 1 } };
+}
+
+test "collect: a `jmp` is followed to its target" {
+    const prog = [_]Inst{ runeAt(0), runeAt(1), .{ .jmp = 3 }, .match };
+    const t = Teddy.build(&prog, &test_ranges).?;
+    try testing.expectEqual(@as(u8, 1), t.n);
+    try testing.expectEqualStrings("ab", t.pats[0][0..t.lens[0]]);
+    try testing.expectEqual(@as(u8, 2), t.masks);
+}
+
+test "collect: the walk's step budget is 4096 (a longer cut is tried when it is over)" {
+    const gpa = testing.allocator;
+    // `saves` empty instructions, then `abcde` and the match: the walk at the
+    // 8-byte cut takes saves + 6 steps (5 runes and the match); at the 4-byte
+    // cut it ends on the fourth rune (saves + 4).
+    for ([_]struct { usize, u8 }{ .{ 4090, 5 }, .{ 4091, 4 } }) |c| {
+        const prog = try gpa.alloc(Inst, c[0] + 6);
+        defer gpa.free(prog);
+        for (prog[0..c[0]]) |*in| in.* = .{ .save = 0 };
+        for (0..5) |i| prog[c[0] + i] = runeAt(@intCast(i));
+        prog[c[0] + 5] = .match;
+        const t = Teddy.build(prog, &test_ranges).?;
+        try testing.expectEqual(@as(u8, 1), t.n);
+        try testing.expectEqual(c[1], t.lens[0]);
+    }
+}
+
+test "collect: the stack takes 63 nested splits (it holds 64 entries), no more is asked of it" {
+    const gpa = testing.allocator;
+    // 63 splits chained through `x`, all with `y` at the rune pair `ab`.
+    const prog = try gpa.alloc(Inst, 63 + 4);
+    defer gpa.free(prog);
+    for (prog[0..63], 0..) |*in, i| in.* = .{ .split = .{ .x = @intCast(i + 1), .y = 64 } };
+    prog[63] = .{ .jmp = 64 };
+    prog[64] = runeAt(0);
+    prog[65] = runeAt(1);
+    prog[66] = .match;
+    const t = Teddy.build(prog, &test_ranges).?;
+    try testing.expectEqual(@as(u8, 1), t.n);
+    try testing.expectEqualStrings("ab", t.pats[0][0..t.lens[0]]);
+}
+
+test "collect: U+FFFD (which reads an invalid byte) ends a prefix, its neighbours do not" {
+    // `a` then one code point of the class: the prefix is 4 bytes with U+FFFC
+    // or U+FFFE, and only `a` (too short for a Teddy) with U+FFFD in it.
+    for ([_]struct { u21, bool }{ .{ 0xfffc, true }, .{ 0xfffd, false }, .{ 0xfffe, true } }) |c| {
+        const rs = [_]Range{ .{ .lo = 'a', .hi = 'a' }, .{ .lo = c[0], .hi = c[0] } };
+        const prog = [_]Inst{ runeAt(0), runeAt(1), .match };
+        const t = Teddy.build(&prog, &rs);
+        try testing.expectEqual(c[1], t != null);
+        if (t) |tt| {
+            var enc: [4]u8 = undefined;
+            const w = try std.unicode.utf8Encode(c[0], &enc);
+            try testing.expectEqual(@as(u8, @intCast(1 + w)), tt.lens[0]);
+            try testing.expectEqualSlices(u8, enc[0..w], tt.pats[0][1..][0..w]);
+        }
+    }
+}
+
+test "collect: a surrogate is never read, the code points around it are" {
+    // `a` then [U+DFFF, U+E000]: only U+E000 (EE 80 80) is a path.
+    const rs = [_]Range{ .{ .lo = 'a', .hi = 'a' }, .{ .lo = 0xdfff, .hi = 0xe000 } };
+    const prog = [_]Inst{ runeAt(0), runeAt(1), .match };
+    const t = Teddy.build(&prog, &rs).?;
+    try testing.expectEqual(@as(u8, 1), t.n);
+    try testing.expectEqualSlices(u8, "a\xee\x80\x80", t.pats[0][0..t.lens[0]]);
+    // A class of surrogates alone leaves no path: no Teddy (not an empty one).
+    const only = [_]Range{.{ .lo = 0xdfff, .hi = 0xdfff }};
+    const prog2 = [_]Inst{ runeAt(0), .match };
+    try testing.expectEqual(@as(?Teddy, null), Teddy.build(&prog2, &only));
+}
+
+test "fromSet: the prefixes are sorted by bytes and bucketed in that order" {
+    const words = [_][]const u8{ "aa", "bb", "cc", "bc" };
+    var set: Set = .{};
+    for (words) |w| {
+        @memset(&set.pats[set.n], 0);
+        @memcpy(set.pats[set.n][0..w.len], w);
+        set.lens[set.n] = @intCast(w.len);
+        set.n += 1;
+    }
+    const t = fromSet(&set).?;
+    try testing.expectEqual(@as(u8, 4), t.n);
+    const sorted = [_][]const u8{ "aa", "bb", "bc", "cc" };
+    for (sorted, 0..) |w, i| try testing.expectEqualStrings(w, t.pats[i][0..t.lens[i]]);
+    // And `find` answers exactly (a prefilter that verifies in full).
+    try testing.expectEqual(@as(?usize, 2), t.find("xxbcxx", 0));
+    try testing.expectEqual(@as(?usize, 3), t.find("xxxccxx", 0));
+    try testing.expectEqual(@as(?usize, null), t.find("xbxcxbxcxabxaxbbx"[0..8], 0));
+    var long: [100]u8 = @splat('x');
+    long[70] = 'c';
+    long[71] = 'c';
+    try testing.expectEqual(@as(?usize, 70), t.find(&long, 0));
+    try testing.expectEqual(@as(?usize, null), t.find(&long, 71));
+}
+
+fn expectByteSetExact(set: [4]u64, bs: ByteSet) !void {
+    for (0..256) |c| {
+        const in = set[c >> 6] & (@as(u64, 1) << @intCast(c & 63)) != 0;
+        try testing.expectEqual(in, bs.lo[c & 0x0f] & bs.hi[c >> 4] != 0);
+    }
+}
+
+test "ByteSet.build: eight buckets are allowed, equal low-nibble sets share one, an empty row takes none" {
+    if (!has_avx2) return error.SkipZigTest;
+    // Eight high nibbles with eight different low-nibble sets ({h} each).
+    var eight: [4]u64 = @splat(0);
+    for (0..8) |h| {
+        const c = h << 4 | h;
+        eight[c >> 6] |= @as(u64, 1) << @intCast(c & 63);
+    }
+    try expectByteSetExact(eight, ByteSet.build(eight).?);
+    // Ten high nibbles with the same low-nibble set {0, 1}: one bucket.
+    var shared: [4]u64 = @splat(0);
+    for (0..10) |h| for (0..2) |l| {
+        const c = h << 4 | l;
+        shared[c >> 6] |= @as(u64, 1) << @intCast(c & 63);
+    };
+    try expectByteSetExact(shared, ByteSet.build(shared).?);
+}
+
+fn probeTeddy(words: []const []const u8) Teddy {
+    var set: Set = .{};
+    for (words) |w| {
+        @memset(&set.pats[set.n], 0);
+        @memcpy(set.pats[set.n][0..w.len], w);
+        set.lens[set.n] = @intCast(w.len);
+        set.n += 1;
+    }
+    return fromSet(&set).?;
+}
+
+test "mutation audit A (hook): Teddy takes a vector block exactly when input.len allows it" {
+    const t = probeTeddy(&.{ "ab", "cd" }); // masks == 2: needs i + 1 + 32 <= len
+    var text: [33]u8 = @splat('x');
+    probe_counts = .{};
+    try testing.expectEqual(@as(?usize, null), t.find(&text, 0));
+    try testing.expectEqual(@as(usize, 1), probe_counts.vec_block); // 0 + 1 + 32 <= 33
+    try testing.expectEqual(@as(usize, 0), probe_counts.cand_block); // no candidate: `mask == 0` continue
+    // The tail (position 32 only, 32 + 2 <= 33 is false: none) is empty.
+    probe_counts = .{};
+    var short: [32]u8 = @splat('x');
+    try testing.expectEqual(@as(?usize, null), t.find(&short, 0));
+    try testing.expectEqual(@as(usize, 0), probe_counts.vec_block);
+    try testing.expectEqual(@as(usize, 31), probe_counts.scalar_step); // i + 2 <= 32
+}
+
+test "mutation audit A (hook): the scalar tail verifies only where every nibble table agrees" {
+    const t = probeTeddy(&.{ "ab", "cd" });
+    // `q` (0x71): its low nibble is `a`'s, its high nibble is nobody's; `r` (0x72) is `b`'s low nibble.
+    var text: [60]u8 = undefined;
+    for (&text, 0..) |*c, i| c.* = if (i % 2 == 0) 'q' else 'r';
+    probe_counts = .{};
+    try testing.expectEqual(@as(?usize, null), t.find(&text, 0));
+    try testing.expectEqual(@as(usize, 0), probe_counts.verify);
+    // A true hit verifies (at least once).
+    probe_counts = .{};
+    text[40] = 'a';
+    text[41] = 'b';
+    try testing.expectEqual(@as(?usize, 40), t.find(&text, 0));
+    try testing.expect(probe_counts.verify >= 1);
+}
+
+test "mutation audit A (hook): ByteSet.find takes a vector block for exactly 32 bytes" {
+    if (!has_avx2) return error.SkipZigTest;
+    var set: [4]u64 = @splat(0);
+    set['z' >> 6] |= @as(u64, 1) << @intCast('z' & 63);
+    const bs = ByteSet.build(set).?;
+    var text: [32]u8 = @splat('x');
+    probe_counts = .{};
+    try testing.expectEqual(@as(?usize, null), bs.find(&text, 0));
+    try testing.expectEqual(@as(usize, 1), probe_counts.bs_vec); // 0 + 32 <= 32
 }
