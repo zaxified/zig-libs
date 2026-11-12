@@ -1929,16 +1929,20 @@ tls13	ReleaseFast	sign_rsa	1	2	0946d446b39eeb5a	15b034e3d63aca72
 # mlkem — added 2026-11-01. d‖z (keygen), m (encaps), dk + ciphertext (decaps)
 # tainted; every in-file count is an exact 0. rho is declassified inside
 # KeyGen (kem.zig: it is published in ek), so SampleNTT's rejection loop
-# over it is not counted.
-mlkem	ReleaseFast	keygen512	1	0	13e6273d5f891b63	c8287b52d3e5f778
-mlkem	ReleaseFast	keygen768	1	0	13e6273d5f891b63	eb016d7e8c3cc899
-mlkem	ReleaseFast	keygen1024	1	0	13e6273d5f891b63	7aff6ff648180dbf
-mlkem	ReleaseFast	encaps512	1	0	13e6273d5f891b63	aaf60090db82bd9b
-mlkem	ReleaseFast	encaps768	1	0	13e6273d5f891b63	da25956af0f64e4b
-mlkem	ReleaseFast	encaps1024	1	0	13e6273d5f891b63	4f3a04ae41de05ac
-mlkem	ReleaseFast	decaps512	1	0	13e6273d5f891b63	1cc002f740d266a9
-mlkem	ReleaseFast	decaps768	1	0	13e6273d5f891b63	69dbd1230a031721
-mlkem	ReleaseFast	decaps1024	1	0	13e6273d5f891b63	38f8642262218d87
+# over it is not counted. fromBytesN (2026-11-12): SecretKey.fromBytes with the s vector and z
+# tainted (ek and H(ek) are public); in-file 0 pins fromNttBytes' range check as branch-free.
+mlkem	ReleaseFast	keygen512	1	0	86c446f4519a9bea	c8287b52d3e5f778
+mlkem	ReleaseFast	keygen768	1	0	86c446f4519a9bea	eb016d7e8c3cc899
+mlkem	ReleaseFast	keygen1024	1	0	86c446f4519a9bea	7aff6ff648180dbf
+mlkem	ReleaseFast	encaps512	1	0	86c446f4519a9bea	aaf60090db82bd9b
+mlkem	ReleaseFast	encaps768	1	0	86c446f4519a9bea	da25956af0f64e4b
+mlkem	ReleaseFast	encaps1024	1	0	86c446f4519a9bea	4f3a04ae41de05ac
+mlkem	ReleaseFast	decaps512	1	0	86c446f4519a9bea	1cc002f740d266a9
+mlkem	ReleaseFast	decaps768	1	0	86c446f4519a9bea	69dbd1230a031721
+mlkem	ReleaseFast	decaps1024	1	0	86c446f4519a9bea	38f8642262218d87
+mlkem	ReleaseFast	fromBytes512	1	0	86c446f4519a9bea	a8d5466e804a363d
+mlkem	ReleaseFast	fromBytes768	1	0	86c446f4519a9bea	8cbe1dfd1b2d618c
+mlkem	ReleaseFast	fromBytes1024	1	0	86c446f4519a9bea	856d03c6374f92c1
 # keycodec (2026-11-06) — the key codec under every PEM/PKCS#8/SEC1 reader of jwt, tlsserver,
 # acme, rsa and ssh. Seven OpenSSL keys (EC P-256 SEC1, P-384 PKCS#8, P-521 SEC1, Ed25519,
 # X25519, ML-DSA-44 both, ML-KEM-512 seed); RSA left to `rsa` (its secret is the whole PKCS#1).

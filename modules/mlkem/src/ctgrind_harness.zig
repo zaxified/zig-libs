@@ -6,7 +6,8 @@
 //! `zig build test` (memcheck's context count is valgrind's own output).
 //!
 //! Usage: ctgrind-mlkem <target> <yes|no>
-//!   targets: keygen{512,768,1024} | encaps{512,768,1024} | decaps{512,768,1024}
+//!   targets: keygen{512,768,1024} | encaps{512,768,1024} | decaps{512,768,1024} |
+//!             fromBytes{512,768,1024}
 //!
 //! ## What is tainted (marked undefined), per target
 //!
@@ -23,6 +24,11 @@
 //!             re-encryption comparison (the Fujisaki-Okamoto select) as a
 //!             secret-dependent value. `pk` and `H(pk)` stay clean: they are
 //!             public.
+//!   fromBytesN  `SecretKey.fromBytes` of a valid dk: the secret part only (the
+//!             encoded s vector, the first 384 * k bytes, and z) is tainted. The
+//!             embedded ek and H(ek) are public, so the §7.3 modulus check and
+//!             the hash compare on them are not counted. `fromNttBytes`'s
+//!             range check over the secret s must stay branch-free.
 //!
 //! ## Why the three traps do not bite
 //!
@@ -47,6 +53,9 @@ const Target = enum {
     decaps512,
     decaps768,
     decaps1024,
+    fromBytes512,
+    fromBytes768,
+    fromBytes1024,
 };
 const Taint = enum { yes, no };
 
@@ -113,6 +122,22 @@ fn decaps(comptime K: type, taint: bool, label: []const u8) void {
     std.debug.print("ss={x}\n", .{ss});
 }
 
+fn fromBytes(comptime K: type, taint: bool, label: []const u8) void {
+    const kp = K.KeyPair.generateDeterministic(publicBytes(K.seed_length, label));
+    var dk = kp.secret_key.toBytes();
+    // s (384 bytes per vector element) leads the encoding; z is the last 32.
+    const s_len = dk.len - K.PublicKey.encoded_length - 64;
+    taintBytes(taint, dk[0..s_len]);
+    taintBytes(taint, dk[dk.len - 32 ..]);
+    const dr = reload([K.SecretKey.encoded_length]u8, &dk);
+    const sk = K.SecretKey.fromBytes(&dr) catch {
+        std.debug.print("fromBytes failed\n", .{});
+        return;
+    };
+    // Propagation witness: the imported secret's z and a decaps result.
+    std.debug.print("z={x}\n", .{sk.z});
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var it = init.args.iterate();
     _ = it.next(); // argv[0]
@@ -131,5 +156,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .decaps512 => decaps(mlkem.MLKem512, taint, "ctgrind-mlkem-512"),
         .decaps768 => decaps(mlkem.MLKem768, taint, "ctgrind-mlkem-768"),
         .decaps1024 => decaps(mlkem.MLKem1024, taint, "ctgrind-mlkem-1024"),
+        .fromBytes512 => fromBytes(mlkem.MLKem512, taint, "ctgrind-mlkem-512"),
+        .fromBytes768 => fromBytes(mlkem.MLKem768, taint, "ctgrind-mlkem-768"),
+        .fromBytes1024 => fromBytes(mlkem.MLKem1024, taint, "ctgrind-mlkem-1024"),
     }
 }

@@ -172,7 +172,7 @@ declare -A TARGETS=(
     # `mul(basePoint, s)`) and `ladder` (C4: runtime-decoded point, runtime
     # `precompute` table) added 2026-09-16; see modules/ct25519/SPEC.md § C3.
     [ct25519]="ct25519 std comb ladderbase ladder msm x25519"
-    [mlkem]="keygen512 keygen768 keygen1024 encaps512 encaps768 encaps1024 decaps512 decaps768 decaps1024"
+    [mlkem]="keygen512 keygen768 keygen1024 encaps512 encaps768 encaps1024 decaps512 decaps768 decaps1024 fromBytes512 fromBytes768 fromBytes1024"
     [decaf448]="scalarmul"
     [bn254]="field scalarmul"
     # `verify` (A1 E15) added 2026-09-16 is DOCUMENTARY: verify has no secret,
@@ -463,6 +463,9 @@ declare -A PATTERN=(
     [mlkem/decaps512]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
     [mlkem/decaps768]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
     [mlkem/decaps1024]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
+    [mlkem/fromBytes512]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
+    [mlkem/fromBytes768]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
+    [mlkem/fromBytes1024]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
     [hqc/decaps]='prng[.]zig|gf256[.]zig|gf2x[.]zig|reedsolomon[.]zig|reedmuller[.]zig|pke[.]zig|kem[.]zig|code[.]zig'
     [hqc/keygen]='prng[.]zig|gf256[.]zig|gf2x[.]zig|reedsolomon[.]zig|reedmuller[.]zig|pke[.]zig|kem[.]zig|code[.]zig'
     [hqc/encaps]='prng[.]zig|gf256[.]zig|gf2x[.]zig|reedsolomon[.]zig|reedmuller[.]zig|pke[.]zig|kem[.]zig|code[.]zig'
@@ -975,6 +978,9 @@ declare -A LABEL=(
     [mlkem/decaps512]='mlkem Decaps (dk + ct secret) 512'
     [mlkem/decaps768]='mlkem Decaps (dk + ct secret) 768'
     [mlkem/decaps1024]='mlkem Decaps (dk + ct secret) 1024'
+    [mlkem/fromBytes512]='mlkem SecretKey.fromBytes (s + z secret) 512'
+    [mlkem/fromBytes768]='mlkem SecretKey.fromBytes (s + z secret) 768'
+    [mlkem/fromBytes1024]='mlkem SecretKey.fromBytes (s + z secret) 1024'
     [decaf448/scalarmul]='decaf448+ed448'
     [ecvrf/prove]='ecvrf KeyPair (sk; Y declassified)'
     [ecvrf/verify]='ecvrf verify (public alpha; DOCUMENTARY)'
