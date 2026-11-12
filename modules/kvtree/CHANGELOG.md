@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Tests only: three more from the same mutation run: a branch of the bulk loader filled with its slots counted, a freelist chain that rots after open (count and entry at the high water) refused by the next commit, and a merge across siblings of different kinds ending in `Corrupt`.
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Tests only: 29 new tests from a whole-module mutation run over `root.zig`, `core.zig`, `format.zig`, `pager.zig` and `bulk.zig` (598 schemata mutants; the first run left 130 alive). They pin the exact geometry limits of node accessors and the `*ViewSafe` checks, `Meta.decode` with a valid CRC, `ovfPages` at exact multiples, balanced-split cuts and ties, the strict order check of the bulk loader and its bounded memory, the meta-slot alternation, open-time refusal of ids outside the version (root, branch children, overflow chains, freelist head and entries, full and two-page freelist chains), borrowed pages given back on every error and scan, cursor state after a failed `first`/`last`/step, every failed write, sync and truncate of a commit, and `copyTo` temp-file handling.
 
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `Prng.next` (duplicate-code pass) runs `std.Random.SplitMix64` (same constants, same sequence); a known-answer test pins the stream.

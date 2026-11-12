@@ -5373,3 +5373,78 @@ test "core.commit refuses a value past 2 GiB by its length alone" {
     const changes = [_]core.Change{.{ .put = .{ .key = "k", .val = huge } }};
     try testing.expectError(error.EntryTooLarge, core.commit(&db.commit_scratch, &db.pager, db.meta_rec, .{ .changes = &changes }, db.oldestReader(), 0));
 }
+
+test "a freelist chain that rots after open is refused by the commit that reads it: a count no page holds, an entry at the high water" {
+    for ([_]bool{ true, false }) |bad_count| {
+        var sim = kv.SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var db = try ktOpenSim(&sim, "z.kvt");
+        defer db.close();
+        try db.put("a", "1");
+        try db.put("b", "2");
+        const fr = db.meta_rec.free_root;
+        try testing.expect(fr != 0);
+        const c = sim.fileContent("z.kvt").?;
+        const off = @as(usize, fr) * page_size;
+        if (bad_count) {
+            // 340 entries that are valid, and a 341st at the very end of the page.
+            std.mem.writeInt(u16, c[off..][0..2], 400, .little);
+            std.mem.writeInt(u32, c[off + 2 ..][0..4], 0, .little);
+            for (0..341) |k| std.mem.writeInt(u32, c[off + 6 + k * 12 ..][0..4], format.first_data_page, .little);
+        } else {
+            std.mem.writeInt(u16, c[off..][0..2], 1, .little);
+            std.mem.writeInt(u32, c[off + 6 ..][0..4], @intCast(db.pager.high_water), .little);
+        }
+        try testing.expectError(error.Storage, db.put("z", "1"));
+    }
+}
+
+test "a commit that would merge a node with a sibling of another kind finds the tree Corrupt" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const kinds = [_]bool{ true, false };
+    for (kinds) |leaf_left| {
+        const pages = try ktBlank(a, 5);
+        var lb = format.LeafBuilder.init(a);
+        if (leaf_left) {
+            // root(2): L(3) | "m" -> B(4): leaf(5)
+            var root = format.BranchBuilder.init(a, 3);
+            try root.insert("m", 4);
+            root.encode(&pages[0]);
+            try lb.put("a", "1");
+            try lb.put("b", "2");
+            lb.encode(&pages[1]);
+            const bb = format.BranchBuilder.init(a, 5);
+            bb.encode(&pages[2]);
+            var l5 = format.LeafBuilder.init(a);
+            try l5.put("m", "3");
+            l5.encode(&pages[3]);
+        } else {
+            // root(2): B(3) | "m" -> leaf(6);  B: X(4) | "c" -> Y(5)
+            var root = format.BranchBuilder.init(a, 3);
+            try root.insert("m", 6);
+            root.encode(&pages[0]);
+            var b3 = format.BranchBuilder.init(a, 4);
+            try b3.insert("c", 5);
+            b3.encode(&pages[1]);
+            try lb.put("a", "1");
+            try lb.put("b", "2");
+            lb.encode(&pages[2]);
+            var y = format.LeafBuilder.init(a);
+            try y.put("c", "3");
+            y.encode(&pages[3]);
+            var z = format.LeafBuilder.init(a);
+            try z.put("m", "4");
+            z.encode(&pages[4]);
+        }
+        var sim = kv.SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.allow_overwrite = true;
+        const len: usize = if (leaf_left) 4 else 5;
+        try ktForgeFull(&sim, "k.kvt", pages[0..len], ktMeta(2, 0, 0, 2 + len));
+        var db = try Db.open(testing.allocator, sim.storage(), "k.kvt", .{});
+        defer db.close();
+        try testing.expectError(error.Corrupt, db.del("a"));
+    }
+}

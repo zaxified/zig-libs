@@ -1490,7 +1490,8 @@ test "leafViewSafe and branchViewSafe refuse what their bounds checks exist for"
 
     // A page of the other kind.
     var bb = BranchBuilder.init(a, 5);
-    try bb.insert("k", 6);
+    // Child id 0: read as a leaf cell this is a zero-length value, so only the kind byte refuses it.
+    try bb.insert("k", 0);
     bb.encode(&page);
     try testing.expect(branchViewSafe(&page) != null);
     try testing.expect(leafViewSafe(&page) == null);

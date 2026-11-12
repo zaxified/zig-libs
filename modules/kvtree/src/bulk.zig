@@ -421,3 +421,34 @@ test "a loader's arenas are recycled: memory held while loading does not grow wi
     try std.testing.expect(fa.allocated_bytes - fa.freed_bytes < 150_000);
     try l.finish();
 }
+
+test "a branch is filled to the byte with its slots counted: nine 448-byte separators do not fit" {
+    var sim = kv.SimStorage.init(std.testing.allocator);
+    defer sim.deinit();
+    var pager = try bulkPager(&sim);
+    var l = Loader.init(std.testing.allocator, &pager);
+    defer l.deinit();
+    // One entry per leaf (2500-byte values), so every leaf contributes a separator.
+    var key: [448]u8 = undefined;
+    var val: [2500]u8 = undefined;
+    @memset(&val, 'v');
+    for (0..14) |i| {
+        @memset(&key, 'k');
+        _ = try std.fmt.bufPrint(key[0..4], "{d:0>4}", .{i});
+        try l.add(&key, &val);
+    }
+    try l.finish();
+    var page: [page_size]u8 = undefined;
+    var branches: usize = 0;
+    for (format.first_data_page..l.next_id) |id| {
+        try pager.readPage(@intCast(id), &page);
+        switch (format.kindOf(&page).?) {
+            .leaf => try std.testing.expect(format.leafViewSafe(&page) != null),
+            .branch => {
+                branches += 1;
+                try std.testing.expect(format.branchViewSafe(&page) != null);
+            },
+        }
+    }
+    try std.testing.expect(branches >= 2);
+}
