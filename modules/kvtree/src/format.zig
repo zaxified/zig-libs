@@ -1377,3 +1377,211 @@ test "binarySearch: the prefetch of the probes it never makes cannot fault, what
     try testing.expect(s.found);
     try testing.expectEqual(@as(u16, 2), s.index);
 }
+
+// ── tests added by the 2026-11 whole-module mutation run ─────────────────────
+
+test "ovfPages counts whole pages exactly, and encodeOverflow leaves nothing of the old buffer in the page" {
+    try testing.expectEqual(@as(usize, 1), ovfPages(1));
+    try testing.expectEqual(@as(usize, 1), ovfPages(ovf_data));
+    try testing.expectEqual(@as(usize, 2), ovfPages(ovf_data + 1));
+    try testing.expectEqual(@as(usize, 2), ovfPages(2 * ovf_data));
+    try testing.expectEqual(@as(usize, 3), ovfPages(2 * ovf_data + 1));
+
+    var page: [page_size]u8 = @splat(0xAB);
+    encodeOverflow(&page, 7, "xyz");
+    try testing.expectEqual(overflow_kind, page[0]);
+    for (page[1..4]) |b| try testing.expectEqual(@as(u8, 0), b);
+    try testing.expectEqual(@as(?PageId, 7), overflowNext(&page));
+    try testing.expectEqualSlices(u8, "xyz", overflowData(&page)[0..3]);
+    for (page[ovf_hdr + 3 ..]) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "Meta.decode refuses a page whose CRC is right but whose magic, version or page size is not" {
+    const m = Meta{ .txn_id = 5, .root = 2, .free_root = 0, .free_count = 0, .high_water = 3 };
+    var page: [page_size]u8 = undefined;
+    m.encode(&page);
+    try testing.expect(Meta.decode(&page) != null);
+    const Fix = struct {
+        fn recrc(p: *[page_size]u8) void {
+            std.mem.writeInt(u32, p[44..48], crc32.hash(p[0..44]), .little);
+        }
+    };
+    var p = page;
+    p[0] = 'Y';
+    Fix.recrc(&p);
+    try testing.expect(Meta.decode(&p) == null);
+    for ([_]u32{ 0, 1, format_v4 + 1, 0xffff_ffff }) |v| {
+        p = page;
+        std.mem.writeInt(u32, p[4..8], v, .little);
+        Fix.recrc(&p);
+        try testing.expect(Meta.decode(&p) == null);
+    }
+    for ([_]u32{ format_v2, format_v3, format_v4 }) |v| {
+        p = page;
+        std.mem.writeInt(u32, p[4..8], v, .little);
+        Fix.recrc(&p);
+        try testing.expectEqual(v, Meta.decode(&p).?.version);
+    }
+    p = page;
+    std.mem.writeInt(u32, p[8..12], 2 * page_size, .little);
+    Fix.recrc(&p);
+    try testing.expect(Meta.decode(&p) == null);
+}
+
+test "node accessors: every geometry limit is exact (count, slot, cell at the page end, longest key, forged small offsets)" {
+    var page: [page_size]u8 = @splat(0);
+    encodeEmptyLeaf(&page);
+    // count: max_node_count is the most a page can hold.
+    std.mem.writeInt(u16, page[2..4], @intCast(max_node_count), .little);
+    try testing.expectEqual(@as(u16, max_node_count), try Leaf.init(&page).count());
+    std.mem.writeInt(u16, page[2..4], @intCast(max_node_count + 1), .little);
+    try testing.expectError(error.Corrupt, Leaf.init(&page).count());
+
+    // The last slot that lies inside the page.
+    std.mem.writeInt(u16, page[page_size - 2 ..][0..2], 123, .little);
+    try testing.expectEqual(@as(usize, 123), try slotOffset(&page, (page_size - hdr_len - 2) / 2));
+    try testing.expectError(error.Corrupt, slotOffset(&page, (page_size - hdr_len) / 2));
+
+    // A cell that ends exactly at the end of the page: empty key, empty value.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var lb = LeafBuilder.init(a);
+    try lb.put("", "");
+    lb.encode(&page);
+    try testing.expectEqualStrings("", try Leaf.init(&page).keyAt(0));
+    try testing.expectEqualStrings("", try Leaf.init(&page).valAt(0));
+    try testing.expect(leafViewSafe(&page) != null);
+    var bb = BranchBuilder.init(a, 3);
+    try bb.insert("", 4);
+    bb.encode(&page);
+    try testing.expectEqualStrings("", try Branch.init(&page).keyAt(0));
+    try testing.expect(branchViewSafe(&page) != null);
+
+    // The longest key a leaf holds (a cell of exactly max_cell_len).
+    const long_key = try a.alloc(u8, max_cell_len - 6);
+    @memset(long_key, 'k');
+    var lb2 = LeafBuilder.init(a);
+    try lb2.put(long_key, "");
+    lb2.encode(&page);
+    try testing.expectEqual(long_key.len, (try Leaf.init(&page).keyAt(0)).len);
+    try testing.expect(leafViewSafe(&page) != null);
+
+    // Forged: a slot that points into the page header. The key's own bounds
+    // hold (offset + 6 + klen fits), only the cell-size limit refuses it.
+    page = @splat(0);
+    std.mem.writeInt(u16, page[2..4], 1, .little); // count
+    std.mem.writeInt(u16, page[4..6], 4085, .little); // key length, at offset 4
+    std.mem.writeInt(u16, page[8..10], 4, .little); // slot 0 -> offset 4
+    try testing.expectError(error.Corrupt, Leaf.init(&page).keyAt(0));
+    // Same for the value: offset 8 (= the slot itself), key length 8, value 4074.
+    page = @splat(0);
+    std.mem.writeInt(u16, page[2..4], 1, .little);
+    std.mem.writeInt(u16, page[8..10], 8, .little);
+    std.mem.writeInt(u32, page[10..14], 4074, .little);
+    try testing.expectError(error.Corrupt, Leaf.init(&page).valAt(0));
+}
+
+test "leafViewSafe and branchViewSafe refuse what their bounds checks exist for" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var page: [page_size]u8 = undefined;
+
+    // A page of the other kind.
+    var bb = BranchBuilder.init(a, 5);
+    try bb.insert("k", 6);
+    bb.encode(&page);
+    try testing.expect(branchViewSafe(&page) != null);
+    try testing.expect(leafViewSafe(&page) == null);
+    var lb = LeafBuilder.init(a);
+    try lb.put("k", "v");
+    lb.encode(&page);
+    try testing.expect(leafViewSafe(&page) != null);
+    try testing.expect(branchViewSafe(&page) == null);
+
+    // A slot that points into the slot directory.
+    inline for (.{ NodeKind.leaf, NodeKind.branch }) |kind| {
+        page = @splat(0);
+        page[0] = @backingInt(kind);
+        std.mem.writeInt(u16, page[2..4], 1, .little);
+        std.mem.writeInt(u16, page[8..10], 8, .little);
+        std.mem.writeInt(u16, page[10..12], 0, .little);
+        const got = if (kind == .leaf) leafViewSafe(&page) == null else branchViewSafe(&page) == null;
+        try testing.expect(got);
+    }
+
+    // A cell whose key runs past the page end although its length is below the cell limit.
+    page = @splat(0);
+    page[0] = @backingInt(NodeKind.branch);
+    std.mem.writeInt(u16, page[2..4], 1, .little);
+    std.mem.writeInt(u16, page[8..10], 4000, .little);
+    std.mem.writeInt(u16, page[4000..4002], 4000, .little);
+    try testing.expect(branchViewSafe(&page) == null);
+
+    // A leaf cell whose value runs past the page end.
+    page = @splat(0);
+    std.mem.writeInt(u16, page[2..4], 1, .little);
+    std.mem.writeInt(u16, page[8..10], 4000, .little);
+    std.mem.writeInt(u16, page[4000..4002], 100, .little);
+    std.mem.writeInt(u32, page[4002..4006], 100, .little);
+    try testing.expect(leafViewSafe(&page) == null);
+}
+
+test "builders: an entry no leaf can hold is refused by putOverflow and putBucket; a branch is full at exactly a page" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var lb = LeafBuilder.init(a);
+    const ref = [_]u8{ 9, 0, 0, 0 };
+    const k_ok = try a.alloc(u8, 4076);
+    @memset(k_ok, 'a');
+    try lb.putOverflow(k_ok, &ref, 5000);
+    const k_big = try a.alloc(u8, 4077);
+    @memset(k_big, 'b');
+    try testing.expectError(error.EntryTooLarge, lb.putOverflow(k_big, &ref, 5000));
+    const hdr: [bucket_hdr_len]u8 = @splat(0);
+    const b_ok = try a.alloc(u8, 4068);
+    @memset(b_ok, 'c');
+    try lb.putBucket(b_ok, &hdr);
+    const b_big = try a.alloc(u8, 4069);
+    @memset(b_big, 'd');
+    try testing.expectError(error.EntryTooLarge, lb.putBucket(b_big, &hdr));
+
+    // byteSize == page_size is a node that fits.
+    var bb = BranchBuilder.init(a, 2);
+    const sep = try a.alloc(u8, page_size - hdr_len - slot_len - 6);
+    @memset(sep, 's');
+    try bb.insert(sep, 3);
+    try testing.expectEqual(page_size, bb.byteSize());
+    try testing.expect(!bb.overflows());
+    var bb2 = BranchBuilder.init(a, 2);
+    const sep2 = try a.alloc(u8, sep.len + 1);
+    @memset(sep2, 's');
+    try bb2.insert(sep2, 3);
+    try testing.expect(bb2.overflows());
+}
+
+test "split cuts where the larger half is smallest: at the end for a big last entry, the first of equal cuts on a tie" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const big = try a.alloc(u8, 3000);
+    @memset(big, 'x');
+    var lb = LeafBuilder.init(a);
+    try lb.put("a", "0123456789");
+    try lb.put("b", "0123456789");
+    try lb.put("c", big);
+    const sp = try lb.split();
+    try testing.expectEqual(@as(usize, 2), lb.entries.items.len);
+    try testing.expectEqualStrings("c", sp.sep);
+
+    const hundred: [100]u8 = @splat('h');
+    var tie = LeafBuilder.init(a);
+    try tie.put("a", &hundred);
+    try tie.put("b", &hundred);
+    try tie.put("c", &hundred);
+    const sp2 = try tie.split();
+    try testing.expectEqual(@as(usize, 1), tie.entries.items.len);
+    try testing.expectEqualStrings("b", sp2.sep);
+}

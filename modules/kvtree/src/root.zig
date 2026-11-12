@@ -2002,6 +2002,11 @@ const FailNthSync = struct {
     inner: kv.Storage,
     sync_calls: usize = 0,
     fail_at: ?usize = null,
+    write_calls: usize = 0,
+    /// Every write from this call number on fails (and is not forwarded).
+    fail_write_from: ?usize = null,
+    truncate_calls: usize = 0,
+    fail_truncate: bool = false,
 
     fn cast(ctx: *anyopaque) *FailNthSync {
         return @ptrCast(@alignCast(ctx));
@@ -2016,7 +2021,10 @@ const FailNthSync = struct {
         return cast(ctx).inner.pread(h, buf, off);
     }
     fn vWriteAll(ctx: *anyopaque, h: kv.Storage.Handle, bytes: []const u8, off: u64) kv.Storage.Error!void {
-        return cast(ctx).inner.writeAll(h, bytes, off);
+        const self = cast(ctx);
+        self.write_calls += 1;
+        if (self.fail_write_from) |f| if (self.write_calls >= f) return error.InputOutput;
+        return self.inner.writeAll(h, bytes, off);
     }
     fn vSync(ctx: *anyopaque, h: kv.Storage.Handle) kv.Storage.Error!void {
         const self = cast(ctx);
@@ -2027,7 +2035,10 @@ const FailNthSync = struct {
         return r;
     }
     fn vTruncate(ctx: *anyopaque, h: kv.Storage.Handle, len: u64) kv.Storage.Error!void {
-        return cast(ctx).inner.truncate(h, len);
+        const self = cast(ctx);
+        self.truncate_calls += 1;
+        if (self.fail_truncate) return error.InputOutput;
+        return self.inner.truncate(h, len);
     }
     fn vClose(ctx: *anyopaque, h: kv.Storage.Handle) void {
         cast(ctx).inner.close(h);
@@ -4881,4 +4892,484 @@ test "kvtree sweep KT-4: buckets that nest deeper than max_bucket_depth after op
     var b = (try txn.bucket("b")).?;
     for (1..max_bucket_depth) |_| b = (try b.bucket("b")).?;
     try testing.expectError(error.Corrupt, b.bucket("b"));
+}
+
+// ── tests added by the 2026-11 whole-module mutation run ─────────────────────
+
+fn slotTxns(db: *Db) ![2]u64 {
+    var page: [page_size]u8 = undefined;
+    var out: [2]u64 = undefined;
+    for (0..2) |s| {
+        try db.pager.readPage(@intCast(s), &page);
+        out[s] = format.Meta.decode(&page).?.txn_id;
+    }
+    return out;
+}
+
+test "meta slots: a fresh store has both at txn 0, and each commit writes the slot its base does not occupy" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "m.kvt");
+    defer db.close();
+    try testing.expectEqual([2]u64{ 0, 0 }, try slotTxns(&db));
+    for (1..6) |k| {
+        try db.put("k", "v");
+        var want = [2]u64{ 0, 0 };
+        want[k % 2] = k;
+        want[(k + 1) % 2] = k - 1;
+        try testing.expectEqual(want, try slotTxns(&db));
+    }
+}
+
+test "buckets: setSequence round-trips, and a transaction that only reads a bucket commits nothing" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "s.kvt");
+    defer db.close();
+    {
+        var txn = try db.begin();
+        const b = try txn.createBucket("b");
+        try b.setSequence(41);
+        try testing.expectEqual(@as(u64, 41), try b.sequence());
+        try b.put("k", "v");
+        try txn.commit();
+    }
+    const before = db.meta_rec;
+    {
+        var txn = try db.begin();
+        const b = (try txn.bucket("b")).?;
+        try testing.expectEqual(@as(u64, 41), try b.sequence());
+        const v = try b.get(testing.allocator, "k");
+        defer if (v) |x| testing.allocator.free(x);
+        try testing.expectEqualStrings("v", v.?);
+        try txn.commit();
+    }
+    try testing.expectEqual(before.txn_id, db.meta_rec.txn_id);
+    try testing.expectEqual(before.root, db.meta_rec.root);
+    var snap = try db.snapshot();
+    defer snap.release();
+    try testing.expectEqual(@as(u64, 41), (try snap.bucket("b")).?.sequence());
+}
+
+test "buckets: a handle below a deleted bucket refuses to open or create, and a name is validated when opening too" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "d.kvt");
+    defer db.close();
+    var txn = try db.begin();
+    defer txn.rollback();
+    const b1 = try txn.createBucket("b1");
+    const b2 = try b1.createBucket("b2");
+    try txn.deleteBucket("b1");
+    try testing.expectError(error.BucketNotFound, b1.bucket("x"));
+    try testing.expectError(error.BucketNotFound, b1.createBucket("x"));
+    try testing.expectError(error.BucketNotFound, b2.bucket("x"));
+    try testing.expectError(error.BucketNotFound, b2.createBucket("x"));
+    try testing.expectError(error.InvalidBucketName, txn.bucket(""));
+    const long = try testing.allocator.alloc(u8, 5000);
+    defer testing.allocator.free(long);
+    @memset(long, 'n');
+    try testing.expectError(error.InvalidBucketName, txn.bucket(long));
+}
+
+test "Txn.getRef: a buffered put is lent from the batch, a buffered delete hides the base value" {
+    var ls: LendingSim = .{ .sim = kv.SimStorage.init(testing.allocator) };
+    defer ls.sim.deinit();
+    ls.sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, ls.storage(), "t.kvt", .{});
+    defer db.close();
+    try db.put("base", "B");
+    var txn = try db.begin();
+    defer txn.rollback();
+    try txn.put("new", "N");
+    var r = (try txn.getRef("new")).?;
+    try testing.expectEqualStrings("N", r.bytes);
+    r.release();
+    var r2 = (try txn.getRef("base")).?;
+    try testing.expectEqualStrings("B", r2.bytes);
+    r2.release();
+    try txn.del("base");
+    try testing.expect((try txn.getRef("base")) == null);
+    try txn.put("base", "B2");
+    var r3 = (try txn.getRef("base")).?;
+    try testing.expectEqualStrings("B2", r3.bytes);
+    r3.release();
+}
+
+test "a commit that finds its base page missing reports Storage" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "t.kvt");
+    defer db.close();
+    try db.pager.store.truncate(db.pager.handle, 2 * page_size);
+    try testing.expectError(error.Storage, db.put("b", "2"));
+}
+
+/// Pages for `ktForgeFull`: `n` empty leaves.
+fn ktBlank(a: Allocator, n: usize) ![][page_size]u8 {
+    const pages = try a.alloc([page_size]u8, n);
+    for (pages) |*p| format.encodeEmptyLeaf(p);
+    return pages;
+}
+
+/// A freelist chain page naming `ids`, followed by `next`.
+fn ktFlPage(ids: []const u32, next: u32) [page_size]u8 {
+    var page: [page_size]u8 = @splat(0);
+    std.mem.writeInt(u16, page[0..2], @intCast(ids.len), .little);
+    std.mem.writeInt(u32, page[2..6], next, .little);
+    for (ids, 0..) |id, k| std.mem.writeInt(u32, page[6 + k * 12 ..][0..4], id, .little);
+    return page;
+}
+
+fn ktForgeFull(sim: *kv.SimStorage, path: []const u8, pages: []const [page_size]u8, m: format.Meta) !void {
+    const h = try sim.storage().open(path, .create_truncate);
+    var p = Pager.init(sim.storage(), h, 0);
+    for (pages, 0..) |*pg, i| try p.writePage(@intCast(2 + i), pg);
+    try ktWriteMetas(&p, m);
+}
+
+fn ktMeta(root: u32, free_root: u32, free_count: u64, hw: u64) format.Meta {
+    return .{ .txn_id = 1, .root = root, .free_root = free_root, .free_count = free_count, .high_water = hw };
+}
+
+fn ktExpectOpenCorrupt(pages: []const [page_size]u8, m: format.Meta) !void {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try ktForgeFull(&sim, "f.kvt", pages, m);
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "f.kvt", .{}));
+}
+
+fn ktExpectOpens(pages: []const [page_size]u8, m: format.Meta) !void {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try ktForgeFull(&sim, "f.kvt", pages, m);
+    var db = try Db.open(testing.allocator, sim.storage(), "f.kvt", .{});
+    db.close();
+}
+
+test "open refuses ids that name pages outside the version: root, branch children, overflow chain, freelist head and entries" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // The root id is past the high water, but a page is there (the file is longer).
+    try ktExpectOpenCorrupt(try ktBlank(a, 70), ktMeta(65, 0, 0, 3));
+
+    // A branch: leftmost / a right child outside the version.
+    for ([_]bool{ true, false }) |left_bad| {
+        const pages = try ktBlank(a, 108);
+        var bb = format.BranchBuilder.init(a, if (left_bad) 100 else 3);
+        try bb.insert("m", if (left_bad) 3 else 100);
+        bb.encode(&pages[0]);
+        try ktExpectOpenCorrupt(pages, ktMeta(2, 0, 0, 4));
+    }
+
+    // An overflow reference to a page outside the version.
+    {
+        const pages = try ktBlank(a, 108);
+        var lb = format.LeafBuilder.init(a);
+        const ref = [_]u8{ 100, 0, 0, 0 };
+        try lb.putOverflow("k", &ref, 5000);
+        lb.encode(&pages[0]);
+        var m = ktMeta(2, 0, 0, 3);
+        m.version = format.format_v3;
+        try ktExpectOpenCorrupt(pages, m);
+    }
+
+    // A freelist whose head is outside the version.
+    try ktExpectOpenCorrupt(try ktBlank(a, 108), ktMeta(2, 100, 1, 3));
+
+    // Entries: a meta page, the high water itself.
+    for ([_]u32{ 1, 4 }) |bad| {
+        const pages = try ktBlank(a, 3);
+        pages[1] = ktFlPage(&.{bad}, 0);
+        try ktExpectOpenCorrupt(pages, ktMeta(2, 3, 1, 4));
+    }
+
+    // A count no page can hold, with enough valid entries before it to reach the end of the page.
+    {
+        const pages = try ktBlank(a, 343);
+        var ids: [340]u32 = undefined;
+        for (&ids, 0..) |*id, i| id.* = @intCast(4 + i);
+        pages[1] = ktFlPage(&ids, 0);
+        std.mem.writeInt(u16, pages[1][0..2], 400, .little);
+        std.mem.writeInt(u32, pages[1][6 + 340 * 12 ..][0..4], 344, .little);
+        try ktExpectOpenCorrupt(pages, ktMeta(2, 3, 400, 345));
+    }
+}
+
+test "open accepts a full freelist page and a freelist chain of two pages" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cap = pager_mod.Freelist.capacity;
+    try testing.expectEqual(@as(usize, 340), cap);
+
+    // Exactly one page of entries (ids 4 ..= 343).
+    {
+        const pages = try ktBlank(a, 342);
+        var ids: [cap]u32 = undefined;
+        for (&ids, 0..) |*id, i| id.* = @intCast(4 + i);
+        pages[1] = ktFlPage(&ids, 0);
+        try ktExpectOpens(pages, ktMeta(2, 3, cap, 344));
+    }
+    // Two pages: 340 + 2 entries.
+    {
+        const pages = try ktBlank(a, 345);
+        var ids: [cap]u32 = undefined;
+        for (&ids, 0..) |*id, i| id.* = @intCast(5 + i);
+        pages[1] = ktFlPage(&ids, 4);
+        pages[2] = ktFlPage(&.{ 345, 346 }, 0);
+        try ktExpectOpens(pages, ktMeta(2, 3, cap + 2, 347));
+    }
+}
+
+/// The page ids a root branch of a store holds, leftmost first.
+fn ktRootKids(db: *Db, out: []PageId) !usize {
+    var page: [page_size]u8 = undefined;
+    try db.pager.readPage(db.meta_rec.root, &page);
+    const br = format.Branch.init(&page);
+    const n = try br.count();
+    for (0..n + 1) |i| out[i] = try br.childAtIndex(i);
+    return n + 1;
+}
+
+fn ktSetKind(sim: *kv.SimStorage, path: []const u8, page_id: PageId, kind: u8) u8 {
+    const c = sim.fileContent(path).?;
+    const old = c[@as(usize, page_id) * page_size];
+    c[@as(usize, page_id) * page_size] = kind;
+    return old;
+}
+
+test "getRef on a lending store: a child that loops or lies outside the version is Corrupt, and no page stays borrowed" {
+    var ls: LendingSim = .{ .sim = kv.SimStorage.init(testing.allocator) };
+    defer ls.sim.deinit();
+    ls.sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, ls.storage(), "r.kvt", .{});
+    defer db.close();
+    try ktFill(&db, 300);
+    var kids: [64]PageId = undefined;
+    const nk = try ktRootKids(&db, &kids);
+    try testing.expect(nk >= 3);
+    const root = db.meta_rec.root;
+    const left_off = @as(usize, root) * page_size + 4;
+    const c = ls.sim.fileContent("r.kvt").?;
+    const real_left = std.mem.readInt(u32, c[left_off..][0..4], .little);
+    try testing.expectEqual(kids[0], real_left);
+
+    pokeU32(&ls.sim, "r.kvt", left_off, @intCast(db.meta_rec.high_water + 5));
+    try testing.expectError(error.Corrupt, db.getRef("k0000"));
+    pokeU32(&ls.sim, "r.kvt", left_off, root);
+    try testing.expectError(error.Corrupt, db.getRef("k0000"));
+    pokeU32(&ls.sim, "r.kvt", left_off, real_left);
+
+    // A page of no valid kind, reached by a borrowed read.
+    const old = ktSetKind(&ls.sim, "r.kvt", kids[0], 9);
+    try testing.expectError(error.Corrupt, db.getRef("k0000"));
+    _ = ktSetKind(&ls.sim, "r.kvt", kids[0], old);
+
+    // Whole scans in both directions, and cursors dropped half-way, give every borrow back.
+    var cur = try db.cursor();
+    defer cur.deinit();
+    try cur.first();
+    var n: usize = 0;
+    while (try cur.next()) |_| n += 1;
+    try testing.expectEqual(@as(usize, 300), n);
+    while (try cur.prev()) |_| n -= 1;
+    try testing.expectEqual(@as(usize, 0), n);
+    var half = try db.cursor();
+    defer half.deinit();
+    try half.seek("k0100");
+    for (0..120) |_| _ = try half.next();
+}
+
+test "a cursor whose first, last or step fails is unpositioned, not left on a half-finished descent" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "c.kvt");
+    defer db.close();
+    try ktFill(&db, 300);
+    var kids: [64]PageId = undefined;
+    const nk = try ktRootKids(&db, &kids);
+    try testing.expect(nk >= 3);
+    var cur = try db.cursor();
+    defer cur.deinit();
+
+    var old = ktSetKind(&sim, "c.kvt", kids[0], 9);
+    try testing.expectError(error.Corrupt, cur.first());
+    try testing.expect((try cur.next()) == null);
+    _ = ktSetKind(&sim, "c.kvt", kids[0], old);
+
+    old = ktSetKind(&sim, "c.kvt", kids[nk - 1], 9);
+    try testing.expectError(error.Corrupt, cur.last());
+    try testing.expect((try cur.prev()) == null);
+    _ = ktSetKind(&sim, "c.kvt", kids[nk - 1], old);
+
+    old = ktSetKind(&sim, "c.kvt", kids[1], 9);
+    try cur.first();
+    while (true) {
+        const e = cur.next() catch break;
+        try testing.expect(e != null);
+    }
+    try testing.expect((try cur.next()) == null);
+    try testing.expect((try cur.prev()) == null);
+    try cur.last();
+    while (true) {
+        const e = cur.prev() catch break;
+        try testing.expect(e != null);
+    }
+    try testing.expect((try cur.next()) == null);
+    _ = ktSetKind(&sim, "c.kvt", kids[1], old);
+}
+
+test "Txn.bucket on a tree whose child rotted: a page past the version, or a loop, is Corrupt" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "b.kvt");
+    defer db.close();
+    try ktFill(&db, 300);
+    const root = db.meta_rec.root;
+    const left_off = @as(usize, root) * page_size + 4;
+    // A valid empty leaf just past the version.
+    const hw: u32 = @intCast(db.meta_rec.high_water);
+    var blank: [page_size]u8 = undefined;
+    format.encodeEmptyLeaf(&blank);
+    try db.pager.writePage(hw + 1, &blank);
+    pokeU32(&sim, "b.kvt", left_off, hw + 1);
+    var txn = try db.begin();
+    try testing.expectError(error.Corrupt, txn.bucket("k0000"));
+    pokeU32(&sim, "b.kvt", left_off, root);
+    try testing.expectError(error.Corrupt, txn.bucket("k0000"));
+    txn.rollback();
+}
+
+test "after reopening a file longer than its meta says, the next commit shortens it" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "g.kvt", .{ .shrink_min_pages = 2 });
+    defer db.close();
+    try fillThenShrink(&db, 200, 140);
+    const peak = db.meta_rec.high_water;
+    var rounds: usize = 0;
+    while (db.meta_rec.high_water >= peak and rounds < 10) : (rounds += 1) try touch(&db, 1);
+    try testing.expect(fileBytes(&sim, "g.kvt") > db.meta_rec.high_water * page_size);
+    db.close();
+    db = try Db.open(testing.allocator, sim.storage(), "g.kvt", .{ .shrink_min_pages = 2 });
+    const base_hw = db.meta_rec.high_water;
+    try touch(&db, 1);
+    try testing.expectEqual(@max(base_hw, db.meta_rec.high_water) * page_size, fileBytes(&sim, "g.kvt"));
+}
+
+test "copyTo: the same path on another storage is a copy; a stale temp is truncated; a failed copy leaves no temp" {
+    var src = kv.SimStorage.init(testing.allocator);
+    defer src.deinit();
+    src.allow_overwrite = true;
+    var dst = kv.SimStorage.init(testing.allocator);
+    defer dst.deinit();
+    dst.allow_overwrite = true;
+    var db = try ktOpenSim(&src, "same.kvt");
+    defer db.close();
+    try ktFill(&db, 300);
+    {
+        const s = dst.storage();
+        const h = try s.open("same.kvt.copy", .create_truncate);
+        const junk: [page_size]u8 = @splat(0xEE);
+        for (0..60) |i| try s.writeAll(h, &junk, i * page_size);
+        s.close(h);
+    }
+    try db.copyTo(dst.storage(), "same.kvt");
+    {
+        var copy = try Db.open(testing.allocator, dst.storage(), "same.kvt", .{});
+        defer copy.close();
+        try testing.expectEqual(copy.meta_rec.high_water * page_size, fileBytes(&dst, "same.kvt"));
+        try expectSameEntries(&db, &copy);
+    }
+    var kids: [64]PageId = undefined;
+    _ = try ktRootKids(&db, &kids);
+    _ = ktSetKind(&src, "same.kvt", kids[1], 9);
+    try testing.expectError(error.Corrupt, db.copyTo(dst.storage(), "same.kvt"));
+    if (dst.storage().open("same.kvt.copy", .read_only)) |h| {
+        dst.storage().close(h);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "recover: a file shorter than two pages has no second meta slot and is Unrecoverable, not a storage error" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const h = try sim.storage().open("r.kvt", .create_truncate);
+    var p = Pager.init(sim.storage(), h, 0);
+    var buf: [page_size]u8 = undefined;
+    ktMeta(2, 0, 0, 3).encode(&buf);
+    try p.writePage(0, &buf);
+    try testing.expectError(error.Unrecoverable, core.recover(testing.allocator, &p));
+}
+
+test "every failed write of a commit -- node, freelist chain, meta, overflow page -- is CommitFailed and poisons the Db" {
+    const big: [2 * page_size]u8 = @splat('o');
+    for ([_]bool{ false, true }) |with_overflow| {
+        var n: usize = 1;
+        while (n < 40) : (n += 1) {
+            var sim = kv.SimStorage.init(testing.allocator);
+            defer sim.deinit();
+            sim.allow_overwrite = true;
+            var wrap = FailNthSync{ .inner = sim.storage() };
+            var db = try Db.open(testing.allocator, wrap.storage(), "w.kvt", .{ .lock = .none });
+            defer db.close();
+            try db.put("a", "1");
+            try db.put("b", "2");
+            wrap.fail_write_from = wrap.write_calls + n;
+            var txn = try db.begin();
+            try txn.put("c", "3");
+            if (with_overflow) try txn.put("o", &big);
+            txn.commit() catch |e| {
+                try testing.expect(e == error.CommitFailed);
+                try testing.expectError(error.CommitFailed, db.begin());
+                continue;
+            };
+            break;
+        }
+        try testing.expect(n > 3);
+    }
+}
+
+test "a failed sync before the meta write is CommitFailed too" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var wrap = FailNthSync{ .inner = sim.storage() };
+    var db = try Db.open(testing.allocator, wrap.storage(), "p.kvt", .{ .lock = .none });
+    defer db.close();
+    try db.put("a", "1");
+    wrap.fail_at = wrap.sync_calls + 1;
+    var txn = try db.begin();
+    try txn.put("b", "2");
+    try testing.expectError(error.CommitFailed, txn.commit());
+    try testing.expectError(error.CommitFailed, db.begin());
+}
+
+test "a failed truncate after the commit is swallowed: the commit stands" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var wrap = FailNthSync{ .inner = sim.storage() };
+    var db = try Db.open(testing.allocator, wrap.storage(), "t.kvt", .{ .lock = .none, .shrink_min_pages = 2 });
+    defer db.close();
+    wrap.fail_truncate = true;
+    try fillThenShrink(&db, 200, 140);
+    var rounds: usize = 0;
+    while (rounds < 12) : (rounds += 1) try touch(&db, 1);
+    try testing.expect(wrap.truncate_calls > 0);
+}
+
+test "core.commit refuses a value past 2 GiB by its length alone" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "h.kvt");
+    defer db.close();
+    var dummy: u8 = 0;
+    const huge = @as([*]const u8, @ptrCast(&dummy))[0 .. format.max_value_len + 1];
+    const changes = [_]core.Change{.{ .put = .{ .key = "k", .val = huge } }};
+    try testing.expectError(error.EntryTooLarge, core.commit(&db.commit_scratch, &db.pager, db.meta_rec, .{ .changes = &changes }, db.oldestReader(), 0));
 }

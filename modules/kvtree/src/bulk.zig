@@ -341,3 +341,83 @@ test "a bucket not above the key before it is Corrupt too, and a plain key not a
     try std.testing.expectError(error.Corrupt, l.add("b", "1"));
     try l.addBucket("c", hdr);
 }
+
+// ── tests added by the 2026-11 whole-module mutation run ─────────────────────
+
+fn bulkPager(sim: *kv.SimStorage) !Pager {
+    const h = try sim.storage().open("b", .create_truncate);
+    return Pager.init(sim.storage(), h, 0);
+}
+
+test "order is checked against the LAST key added, not the first of the node" {
+    var sim = kv.SimStorage.init(std.testing.allocator);
+    defer sim.deinit();
+    var pager = try bulkPager(&sim);
+    var l = Loader.init(std.testing.allocator, &pager);
+    defer l.deinit();
+    try l.add("a", "1");
+    try l.add("c", "3");
+    try std.testing.expectError(error.Corrupt, l.add("b", "2"));
+    const hdr: format.BucketHdr = .{ .root = 2, .seq = 0 };
+    try std.testing.expectError(error.Corrupt, l.addBucket("b", hdr));
+}
+
+test "an entry no page can hold is refused, not written: key too long for an overflow reference, key too long for a bucket cell, value past 2 GiB" {
+    var sim = kv.SimStorage.init(std.testing.allocator);
+    defer sim.deinit();
+    var pager = try bulkPager(&sim);
+    var l = Loader.init(std.testing.allocator, &pager);
+    defer l.deinit();
+    const key = try std.testing.allocator.alloc(u8, 4090);
+    defer std.testing.allocator.free(key);
+    @memset(key, 'k');
+    const val = try std.testing.allocator.alloc(u8, 5000);
+    defer std.testing.allocator.free(val);
+    @memset(val, 'v');
+    try std.testing.expectError(error.EntryTooLarge, l.add(key, val));
+    try std.testing.expectError(error.EntryTooLarge, l.addBucket(key[0..4075], .{ .root = 2, .seq = 0 }));
+    // A value of 2^31 bytes, never read: the refusal comes from its length alone.
+    var dummy: u8 = 0;
+    const huge = @as([*]const u8, @ptrCast(&dummy))[0 .. format.max_value_len + 1];
+    try std.testing.expectError(error.EntryTooLarge, l.add("k", huge));
+    try std.testing.expectEqual(@as(u64, 0), pager.file_pages);
+}
+
+test "every node of a level after the first is filled to the byte, never past it" {
+    var sim = kv.SimStorage.init(std.testing.allocator);
+    defer sim.deinit();
+    var pager = try bulkPager(&sim);
+    var l = Loader.init(std.testing.allocator, &pager);
+    defer l.deinit();
+    // One entry costs 1023 bytes with its slot: three fit a page (4088 left),
+    // four would take 4092 -- which a node counting its 8 header bytes as 0 would try.
+    var val: [1012]u8 = undefined;
+    @memset(&val, 'v');
+    var kb: [3]u8 = undefined;
+    for (0..12) |i| try l.add(try std.fmt.bufPrint(&kb, "k{d:0>2}", .{i}), &val);
+    try l.finish();
+    var page: [page_size]u8 = undefined;
+    for (format.first_data_page..l.next_id) |id| {
+        try pager.readPage(@intCast(id), &page);
+        switch (format.kindOf(&page).?) {
+            .leaf => try std.testing.expect(format.leafViewSafe(&page) != null),
+            .branch => try std.testing.expect(format.branchViewSafe(&page) != null),
+        }
+    }
+}
+
+test "a loader's arenas are recycled: memory held while loading does not grow with the entries" {
+    var sim = kv.SimStorage.init(std.testing.allocator);
+    defer sim.deinit();
+    var pager = try bulkPager(&sim);
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var l = Loader.init(fa.allocator(), &pager);
+    defer l.deinit();
+    var val: [100]u8 = undefined;
+    @memset(&val, 'v');
+    var kb: [8]u8 = undefined;
+    for (0..6000) |i| try l.add(try std.fmt.bufPrint(&kb, "{d:0>8}", .{i}), &val);
+    // 6000 entries are ~650 KB; a bounded loader holds a few nodes.
+    try std.testing.expect(fa.allocated_bytes - fa.freed_bytes < 150_000);
+    try l.finish();
+}

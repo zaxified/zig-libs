@@ -693,3 +693,44 @@ test "kvtree sweep KT-9: cutTail over a high_water beyond the u32 page-id space 
     try testing.expectEqual(hw, try fl.cutTail(testing.allocator, hw, 10, 1));
     try testing.expectEqual(@as(usize, 1), fl.len());
 }
+
+// ── tests added by the 2026-11 whole-module mutation run ─────────────────────
+
+test "file_pages follows the highest page written, and fileSizePages counts whole pages only" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var p = try testPager(&sim);
+    var page: [page_size]u8 = undefined;
+    format.encodeEmptyLeaf(&page);
+    try p.writePage(5, &page);
+    try testing.expectEqual(@as(u64, 6), p.file_pages);
+    try p.writePage(3, &page);
+    try testing.expectEqual(@as(u64, 6), p.file_pages);
+    try testing.expectEqual(@as(u64, 6), try p.fileSizePages());
+    // A torn last page is not a page.
+    try sim.storage().writeAll(p.handle, page[0..100], 6 * page_size);
+    try testing.expectEqual(@as(u64, 6), try p.fileSizePages());
+    try p.truncateTo(4);
+    try testing.expectEqual(@as(u64, 4), p.file_pages);
+    try testing.expectEqual(@as(u64, 4), try p.fileSizePages());
+}
+
+test "an empty freelist writes no chain, and a chain page carries nothing past its entries" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var p = try testPager(&sim);
+    var fl = Freelist{};
+    defer fl.deinit(testing.allocator);
+    const before = p.file_pages;
+    try testing.expectEqual(@as(PageId, 0), try fl.writeChainOn(&p, &.{}));
+    try testing.expectEqual(before, p.file_pages);
+
+    var page: [page_size]u8 = @splat(0xAB);
+    Freelist.encodeChunk(&.{ 7, 9 }, &.{ 3, 4 }, 0, &page);
+    try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, page[0..2], .little));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, page[2..6], .little));
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, page[6..10], .little));
+    try testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, page[22..30], .little));
+    for (page[Freelist.hdr_bytes + 2 * Freelist.entry_bytes ..]) |b| try testing.expectEqual(@as(u8, 0), b);
+}
