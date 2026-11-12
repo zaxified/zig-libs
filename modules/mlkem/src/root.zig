@@ -135,3 +135,121 @@ test "pairwiseConsistencyCheck rejects a mismatched pair" {
     const mixed: MLKem768.KeyPair = .{ .secret_key = a.secret_key, .public_key = b.public_key };
     try testing.expectError(error.PairwiseConsistency, mixed.pairwiseConsistencyCheck());
 }
+
+// Tests added by the 2026-11-11 whole-module mutation run.
+
+fn rejectionKey(comptime K: type, sk: *const K.SecretKey, c: *const [K.ciphertext_length]u8) [32]u8 {
+    // J(z ‖ c) with z read back from the dk encoding (its last 32 bytes).
+    const dk = sk.toBytes();
+    var out: [32]u8 = undefined;
+    var j = std.crypto.hash.sha3.Shake256.init(.{});
+    j.update(dk[dk.len - 32 ..]);
+    j.update(c);
+    j.squeeze(&out);
+    return out;
+}
+
+test "decaps of a ciphertext damaged in any single byte is exactly J(z ‖ c); an intact one gives K" {
+    inline for (.{ MLKem512, MLKem768, MLKem1024 }, 0..) |K, which| {
+        const kp = K.KeyPair.generateDeterministic(@splat(@as(u8, 0x30 + which)));
+        const m: [32]u8 = @splat(0x11);
+        const enc = kp.public_key.encapsDeterministic(&m);
+        try testing.expectEqualSlices(u8, &enc.shared_secret, &kp.secret_key.decaps(&enc.ciphertext));
+        for (0..K.ciphertext_length) |at| {
+            var bad = enc.ciphertext;
+            bad[at] ^= @as(u8, 1) << @intCast(at % 8);
+            try testing.expectEqualSlices(u8, &rejectionKey(K, &kp.secret_key, &bad), &kp.secret_key.decaps(&bad));
+        }
+        // An all-different ciphertext too (every byte of the comparison differs).
+        var other: [K.ciphertext_length]u8 = undefined;
+        for (&other, enc.ciphertext) |*o, c| o.* = ~c;
+        try testing.expectEqualSlices(u8, &rejectionKey(K, &kp.secret_key, &other), &kp.secret_key.decaps(&other));
+    }
+}
+
+test "SecretKey.fromBytes reduces dk_pke coefficients >= q exactly like std" {
+    const nist = std.crypto.kem.ml_kem;
+    inline for (.{
+        .{ MLKem512, nist.MLKem512 },
+        .{ MLKem768, nist.MLKem768 },
+        .{ MLKem1024, nist.MLKem1024 },
+    }) |pair| {
+        const K = pair[0];
+        const S = pair[1];
+        const kp = K.KeyPair.generateDeterministic(@splat(5));
+        var dk = kp.secret_key.toBytes();
+        const k = (K.PublicKey.encoded_length - 32) / 384;
+        // coefficient 0 of every polynomial of ŝ := 4095, and the last two := 4095
+        for (0..k) |i| {
+            dk[384 * i] = 0xff;
+            dk[384 * i + 1] |= 0x0f;
+        }
+        dk[384 * k - 3] = 0xff;
+        dk[384 * k - 2] = 0xff;
+        dk[384 * k - 1] = 0xff;
+        const ours = try K.SecretKey.fromBytes(&dk);
+        const theirs = try S.SecretKey.fromBytes(&dk);
+        try testing.expectEqualSlices(u8, &theirs.toBytes(), &ours.toBytes());
+        const first: u16 = @as(u16, ours.toBytes()[0]) | (@as(u16, ours.toBytes()[1] & 0x0f) << 8);
+        try testing.expect(first < 3329);
+        const enc = kp.public_key.encapsDeterministic(&@as([32]u8, @splat(0x22)));
+        try testing.expectEqualSlices(u8, &(try theirs.decaps(&enc.ciphertext)), &ours.decaps(&enc.ciphertext));
+    }
+}
+
+test "fresh randomness: generate, generateInto, tryGenerate, encaps and tryEncaps never repeat" {
+    const io = testing.io;
+    inline for (.{ MLKem512, MLKem768, MLKem1024 }) |K| {
+        const a = K.KeyPair.generate(io);
+        const b = K.KeyPair.generate(io);
+        var c: K.KeyPair = undefined;
+        K.KeyPair.generateInto(&c, io);
+        var d: K.KeyPair = undefined;
+        try K.KeyPair.tryGenerateInto(&d, io, .{});
+        const e = try K.KeyPair.tryGenerate(io, .{});
+        const pairs = [_]K.KeyPair{ a, b, c, d, e };
+        for (pairs, 0..) |x, i| {
+            for (pairs[i + 1 ..]) |y| {
+                try testing.expect(!std.mem.eql(u8, &x.secret_key.seedBytes().?, &y.secret_key.seedBytes().?));
+                try testing.expect(!std.mem.eql(u8, &x.public_key.toBytes(), &y.public_key.toBytes()));
+            }
+            const enc = x.public_key.encaps(io);
+            try testing.expectEqualSlices(u8, &enc.shared_secret, &x.secret_key.decaps(&enc.ciphertext));
+        }
+        const e1 = a.public_key.encaps(io);
+        const e2 = a.public_key.encaps(io);
+        const t1 = try a.public_key.tryEncaps(io);
+        const t2 = try a.public_key.tryEncaps(io);
+        const encs = [_]K.EncapsulatedSecret{ e1, e2, t1, t2 };
+        for (encs, 0..) |x, i| {
+            for (encs[i + 1 ..]) |y| {
+                try testing.expect(!std.mem.eql(u8, &x.ciphertext, &y.ciphertext));
+                try testing.expect(!std.mem.eql(u8, &x.shared_secret, &y.shared_secret));
+            }
+            try testing.expectEqualSlices(u8, &x.shared_secret, &a.secret_key.decaps(&x.ciphertext));
+        }
+    }
+}
+
+test "parameter sets and encoded sizes are the FIPS 203 Table 2 and 3 values" {
+    const p = @import("kem.zig");
+    inline for (.{
+        .{ p.ml_kem_512, MLKem512, "ML-KEM-512", 2, 3, 10, 4, 800, 1632, 768 },
+        .{ p.ml_kem_768, MLKem768, "ML-KEM-768", 3, 2, 10, 4, 1184, 2400, 1088 },
+        .{ p.ml_kem_1024, MLKem1024, "ML-KEM-1024", 4, 2, 11, 5, 1568, 3168, 1568 },
+    }) |row| {
+        const K = row[1];
+        try testing.expectEqualStrings(row[2], row[0].name);
+        try testing.expectEqualStrings(row[2], K.name);
+        try testing.expectEqual(@as(u8, row[3]), row[0].k);
+        try testing.expectEqual(@as(u2, row[4]), row[0].eta1);
+        try testing.expectEqual(@as(u4, row[5]), row[0].du);
+        try testing.expectEqual(@as(u4, row[6]), row[0].dv);
+        try testing.expectEqual(@as(usize, row[7]), K.PublicKey.encoded_length);
+        try testing.expectEqual(@as(usize, row[8]), K.SecretKey.encoded_length);
+        try testing.expectEqual(@as(usize, row[9]), K.ciphertext_length);
+        try testing.expectEqual(@as(usize, 32), K.shared_length);
+        try testing.expectEqual(@as(usize, 32), K.encaps_seed_length);
+        try testing.expectEqual(@as(usize, 64), K.seed_length);
+    }
+}

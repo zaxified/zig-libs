@@ -792,3 +792,180 @@ test "rejUniform: stops at 256, stays inside the slack, ignores a trailing parti
     try testing.expectEqual(@as(usize, 1), rejUniform(&c, 0, &group_c));
     try testing.expectEqual(@as(i16, 0), c[0]);
 }
+
+// Tests added by the 2026-11-11 whole-module mutation run.
+
+test "zetas equal the pq-crystals table entry by entry" {
+    const want = [128]i16{
+        -1044, -758,  -359,  -1517, 1493,  1422,  287,   202,
+        -171,  622,   1577,  182,   962,   -1202, -1474, 1468,
+        573,   -1325, 264,   383,   -829,  1458,  -1602, -130,
+        -681,  1017,  732,   608,   -1542, 411,   -205,  -1571,
+        1223,  652,   -552,  1015,  -1293, 1491,  -282,  -1544,
+        516,   -8,    -320,  -666,  -1618, -1162, 126,   1469,
+        -853,  -90,   -271,  830,   107,   -1421, -247,  -951,
+        -398,  961,   -1508, -725,  448,   -1065, 677,   -1275,
+        -1103, 430,   555,   843,   -1251, 871,   1550,  105,
+        422,   587,   177,   -235,  -291,  -460,  1574,  1653,
+        -246,  778,   1159,  -147,  -777,  1483,  -602,  1119,
+        -1590, 644,   -872,  349,   418,   329,   -156,  -75,
+        817,   1097,  603,   610,   1322,  -1285, -1465, 384,
+        -1215, -136,  1218,  -1335, -874,  220,   -1187, -1659,
+        -1185, -1530, -1278, 794,   -1510, -854,  -870,  478,
+        -108,  -308,  996,   991,   958,   -1460, 1522,  1628,
+    };
+    try testing.expectEqualSlices(i16, &want, &zetas);
+}
+
+test "barrett maps every i16 into [0, q] congruently, and normalize into [0, q)" {
+    var base: i32 = -32768;
+    while (base < 32768) : (base += 16) {
+        var xs: [16]i16 = undefined;
+        for (0..16) |l| xs[l] = @intCast(base + @as(i32, @intCast(l)));
+        const r: [16]i16 = barrett(xs);
+        for (0..16) |l| {
+            const a: i32 = xs[l];
+            try testing.expect(r[l] >= 0 and r[l] <= q);
+            try testing.expectEqual(@as(i32, 0), @mod(@as(i32, r[l]) - a, q));
+        }
+    }
+    // The same through Poly.normalize: canonical, and equal to a mod q.
+    var p: Poly = undefined;
+    var v: i32 = -32768;
+    while (v < 32768) {
+        for (0..256) |i| {
+            p.coeffs()[i] = @intCast(v);
+            v += 1;
+        }
+        const orig = p.coeffsConst().*;
+        p.normalize();
+        for (0..256) |i| try testing.expectEqual(@as(i16, @intCast(@mod(@as(i32, orig[i]), q))), p.coeffsConst()[i]);
+    }
+}
+
+test "csubq maps [0, 2q) onto [0, q) and Poly.reduce is barrett" {
+    var a: i32 = 0;
+    while (a < 2 * q) : (a += 16) {
+        var xs: [16]i16 = undefined;
+        for (0..16) |l| xs[l] = @intCast(@min(a + @as(i32, @intCast(l)), 2 * q - 1));
+        const r: [16]i16 = csubq(xs);
+        for (0..16) |l| try testing.expectEqual(@as(i16, @intCast(@mod(@as(i32, xs[l]), q))), r[l]);
+    }
+    var p: Poly = undefined;
+    var ref: Poly = undefined;
+    for (0..256) |i| p.coeffs()[i] = @intCast(@as(i32, @intCast(i)) * 257 - 32768);
+    ref = p;
+    p.reduce();
+    inline for (0..16) |i| ref.v[i] = barrett(ref.v[i]);
+    try testing.expectEqualSlices(i16, ref.coeffsConst(), p.coeffsConst());
+}
+
+test "Poly.add and Poly.sub are lane-wise wrapping +/-" {
+    var a: Poly = undefined;
+    var b: Poly = undefined;
+    for (0..256) |i| {
+        a.coeffs()[i] = @intCast(@as(i32, @intCast(i)) * 101 - 12000);
+        b.coeffs()[i] = @intCast(@as(i32, @intCast(i)) * -37 + 5000);
+    }
+    const s = a.add(b);
+    const d = a.sub(b);
+    for (0..256) |i| {
+        try testing.expectEqual(a.coeffsConst()[i] +% b.coeffsConst()[i], s.coeffsConst()[i]);
+        try testing.expectEqual(a.coeffsConst()[i] -% b.coeffsConst()[i], d.coeffsConst()[i]);
+    }
+}
+
+test "fromNttBytes decides every one of the 256 slots at the q boundary" {
+    var p: Poly = undefined;
+    for ([_]u16{ 0, 3328, 3329, 3330, 4000, 4095 }) |val| {
+        for (0..256) |slot| {
+            var bytes: [384]u8 = @splat(0);
+            const pair = slot / 2;
+            const lo = val & 0xff;
+            const hi = val >> 8;
+            if (slot % 2 == 0) {
+                bytes[3 * pair] = @truncate(lo);
+                bytes[3 * pair + 1] = @truncate(hi);
+            } else {
+                bytes[3 * pair + 1] = @truncate(lo << 4);
+                bytes[3 * pair + 2] = @truncate((lo >> 4) | (hi << 4));
+            }
+            try testing.expectEqual(val < q, p.fromNttBytes(&bytes));
+            // the decoded value sits at its FIPS 203 slot
+            var back: [384]u8 = undefined;
+            if (val < q) {
+                p.toNttBytes(&back);
+                try testing.expectEqualSlices(u8, &bytes, &back);
+            }
+        }
+    }
+}
+
+test "fromMsg / toMsg: bit i of the message is coefficient i (0 or 1665) and back" {
+    var p: Poly = undefined;
+    var m: [32]u8 = undefined;
+    for (0..256) |i| {
+        m = @splat(0);
+        m[i / 8] = @as(u8, 1) << @intCast(i % 8);
+        p.fromMsg(&m);
+        for (0..256) |j| try testing.expectEqual(@as(i16, if (i == j) 1665 else 0), p.coeffsConst()[j]);
+        var back: [32]u8 = undefined;
+        p.toMsg(&back);
+        try testing.expectEqualSlices(u8, &m, &back);
+    }
+    m = @splat(0xff);
+    p.fromMsg(&m);
+    for (0..256) |j| try testing.expectEqual(@as(i16, 1665), p.coeffsConst()[j]);
+}
+
+test "Compress_1 is symmetric: x and q - x give the same bit, so decrypt may subtract either way" {
+    try testing.expectEqual(@as(u16, 0), compressCoeff(1, 0));
+    for (1..3329) |x| {
+        try testing.expectEqual(compressCoeff(1, @intCast(x)), compressCoeff(1, @intCast(3329 - x)));
+    }
+}
+
+test "baseMulAcc adds under 3700 per call: four calls and invNtt need no reduce in front (k <= 4)" {
+    // Pins the bound behind the redundant `reduce` before invNtt (encrypt u and v,
+    // decrypt w, keygen t): |fqmul| <= ~0.56 q for |a|, |b| <= q, so a call adds < 3700 per
+    // coefficient and four calls stay below 14800, where invNtt's first layer (s0 + s1 < 29600)
+    // and its Montgomery products still fit in i16.
+    var prng = std.Random.DefaultPrng.init(0xb0d);
+    const rnd = prng.random();
+    var worst: i32 = 0;
+    for (0..400) |round| {
+        var acc: Poly = .zero;
+        for (0..4) |_| {
+            var a: Poly = undefined;
+            var b: Poly = undefined;
+            for (0..256) |i| {
+                switch (round % 4) {
+                    0 => {
+                        a.coeffs()[i] = q;
+                        b.coeffs()[i] = q;
+                    },
+                    1 => {
+                        a.coeffs()[i] = if (rnd.boolean()) q else -q;
+                        b.coeffs()[i] = if (rnd.boolean()) q else -q;
+                    },
+                    else => {
+                        a.coeffs()[i] = rnd.intRangeAtMost(i16, -q, q);
+                        b.coeffs()[i] = rnd.intRangeAtMost(i16, -q, q);
+                    },
+                }
+            }
+            acc.baseMulAcc(&a, &b);
+        }
+        for (acc.coeffsConst()) |c| {
+            const mag: i32 = @intCast(@abs(@as(i32, c)));
+            worst = @max(worst, mag);
+        }
+        var reduced = acc;
+        reduced.reduce();
+        var plain = acc;
+        plain.invNtt();
+        reduced.invNtt();
+        for (0..256) |i| try testing.expectEqual(modq(reduced.coeffsConst()[i]), modq(plain.coeffsConst()[i]));
+    }
+    try testing.expect(worst < 4 * 3700);
+}
