@@ -6987,6 +6987,9 @@ const SpyStorage = struct {
     fail_delete: bool = false,
     /// `writeAll` fails (`InputOutput`) once this many more writes went through.
     fail_write_in: ?usize = null,
+    /// `size` / `pread` fail (`InputOutput`) once this many more calls went through.
+    fail_size_in: ?usize = null,
+    fail_pread_in: ?usize = null,
     /// A read-only mount: every open but `.read_only`, and every write,
     /// truncation, rename, delete and directory sync, is `AccessDenied`.
     deny_writes: bool = false,
@@ -7021,10 +7024,26 @@ const SpyStorage = struct {
         return h;
     }
     fn vSize(c: *anyopaque, h: Storage.Handle) Storage.Error!u64 {
-        return of(c).inner.size(h);
+        const s = of(c);
+        if (s.fail_size_in) |*n| {
+            if (n.* == 0) {
+                s.fail_size_in = null;
+                return error.InputOutput;
+            }
+            n.* -= 1;
+        }
+        return s.inner.size(h);
     }
     fn vPread(c: *anyopaque, h: Storage.Handle, b: []u8, o: u64) Storage.Error!usize {
-        return of(c).inner.pread(h, b, o);
+        const s = of(c);
+        if (s.fail_pread_in) |*n| {
+            if (n.* == 0) {
+                s.fail_pread_in = null;
+                return error.InputOutput;
+            }
+            n.* -= 1;
+        }
+        return s.inner.pread(h, b, o);
     }
     fn vWriteAll(c: *anyopaque, h: Storage.Handle, b: []const u8, o: u64) Storage.Error!void {
         const s = of(c);
@@ -7311,6 +7330,75 @@ test "open: a listed file that is missing is refused without being created" {
     // A reader sees a file that vanished under it: Busy after its retries.
     try testing.expectError(error.Busy, Db.open(testing.allocator, sim.storage(), "db", .{ .read_only = true }));
     try testing.expect(sim.fileContent("db.0.data") == null);
+}
+
+test "open: a refused open of a listed file leaves no handle open" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoFileStore(&sim);
+    const good0 = try testing.allocator.dupe(u8, sim.fileContent("db.0.data").?);
+    defer testing.allocator.free(good0);
+    const good1 = try testing.allocator.dupe(u8, sim.fileContent("db.1.data").?);
+    defer testing.allocator.free(good1);
+    // A sealed file with a bad magic.
+    const bad = try testing.allocator.dupe(u8, good0);
+    defer testing.allocator.free(bad);
+    bad[0] = 'X';
+    try sim.installFile("db.0.data", bad);
+    {
+        var spy: SpyStorage = .{ .inner = sim.storage() };
+        try testing.expectError(error.Corrupt, Db.open(testing.allocator, spy.storage(), "db", .{ .max_file_size = 64 }));
+        try testing.expectEqual(@as(isize, 0), spy.live_handles);
+    }
+    try sim.installFile("db.0.data", good0);
+    // The active file with a valid version that is not the expiry one.
+    const plain = try testing.allocator.dupe(u8, good1);
+    defer testing.allocator.free(plain);
+    std.mem.writeInt(u32, plain[4..8], version_plain, .little);
+    try sim.installFile("db.1.data", plain);
+    {
+        var spy: SpyStorage = .{ .inner = sim.storage() };
+        try testing.expectError(error.Corrupt, Db.open(testing.allocator, spy.storage(), "db", .{ .max_file_size = 64 }));
+        try testing.expectEqual(@as(isize, 0), spy.live_handles);
+    }
+}
+
+test "open: a failing size, pread or allocation hands the error back and leaves no handle open" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoFileStore(&sim);
+    inline for (.{ "fail_size_in", "fail_pread_in" }) |field| {
+        var k: usize = 0;
+        while (k < 64) : (k += 1) {
+            var spy: SpyStorage = .{ .inner = sim.storage() };
+            @field(spy, field) = k;
+            if (Db.open(testing.allocator, spy.storage(), "db", .{ .max_file_size = 64 })) |db_ok| {
+                var db = db_ok;
+                db.close();
+                try testing.expectEqual(@as(isize, 0), spy.live_handles);
+                // The injected failure sits past the last call: swept.
+                try testing.expect(@field(spy, field) != null);
+                break;
+            } else |e| {
+                try testing.expectEqual(error.InputOutput, e);
+                try testing.expectEqual(@as(isize, 0), spy.live_handles);
+            }
+        } else return error.TestUnexpectedResult;
+    }
+    var k: usize = 0;
+    while (k < 400) : (k += 1) {
+        var spy: SpyStorage = .{ .inner = sim.storage() };
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = k });
+        if (Db.open(failing.allocator(), spy.storage(), "db", .{ .max_file_size = 64 })) |db_ok| {
+            var db = db_ok;
+            db.close();
+            try testing.expectEqual(@as(isize, 0), spy.live_handles);
+            break;
+        } else |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            try testing.expectEqual(@as(isize, 0), spy.live_handles);
+        }
+    } else return error.TestUnexpectedResult;
 }
 
 test "open: states around an unfinished migration are told apart" {

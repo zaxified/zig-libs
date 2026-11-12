@@ -4192,6 +4192,29 @@ test "lineTerminatorLen and skipJson5WsAndComments never read past the end" {
     try std.testing.expectEqual(@as(usize, 0), skipJson5WsAndComments("/x", 0));
 }
 
+test "skipJson5WsAndComments and atUnterminatedComment: an unterminated /* stops the skip at its start" {
+    // The documented contract: the skip stops AT the `/*`, it does not run to the end.
+    try std.testing.expectEqual(@as(usize, 0), skipJson5WsAndComments("/* x", 0));
+    try std.testing.expectEqual(@as(usize, 1), skipJson5WsAndComments(" /*", 0));
+    try std.testing.expectEqual(@as(usize, 6), skipJson5WsAndComments("/* */ /* x", 0));
+    try std.testing.expect(atUnterminatedComment("/*", 0));
+    try std.testing.expect(atUnterminatedComment("a /* x", 2));
+    try std.testing.expect(!atUnterminatedComment("/", 0)); // no byte after it: no read past the end
+    try std.testing.expect(!atUnterminatedComment("/x", 0));
+    try std.testing.expect(!atUnterminatedComment("b*", 0)); // `*` after a non-slash
+    try std.testing.expect(!atUnterminatedComment("", 0));
+}
+
+test "an unquoted key followed by a lone slash or a stray star is recovered, a bare /* is refused" {
+    try expectRefusedByBoth("{a /*");
+    try msPlain("{a /", "$err_trace_1");
+    try msAnn("{a /", "$err_1");
+    try msPlain("{a / b: 1}", "$err_trace_1");
+    try msAnn("{a / b: 1}", "$err_1");
+    try msPlain("{a b*: 1}", "$err_trace_1");
+    try msAnn("{a b*: 1}", "$err_1");
+}
+
 test "needsLeadingComma: after a value yes, after an opener, a comma or a colon no" {
     const cases = [_]struct { []const u8, bool }{
         .{ "", false },

@@ -5304,6 +5304,25 @@ fn mkdirs(root: Dir, names: []const []const u8) !void {
     }
 }
 
+test "descriptors: a followed file link that leaves the root is refused and its descriptor given back" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "secret.txt", .data = "SECRET" });
+    try mkdirs(tmp.dir, &.{"root"});
+    var root = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    defer root.close(io);
+    try root.symLink(io, "../secret.txt", "esc.txt", .{});
+    var h_follow = Handler.init(io, root, .{ .follow_symlinks = true });
+    const before = try openFdCount();
+    var buf: [4096]u8 = undefined;
+    const resp = sendReq(&h_follow, "GET", "/esc.txt", "", &buf);
+    const after = try openFdCount();
+    try testing.expectEqual(@as(u16, 403), statusOf(resp));
+    try testing.expect(std.mem.find(u8, resp, "SECRET") == null);
+    try testing.expectEqual(before, after);
+}
+
 test "descriptors: every route through Handler, resolveFile and openWithinRoot gives back what it opened" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
