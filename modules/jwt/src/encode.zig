@@ -210,7 +210,14 @@ pub fn encodeJson(gpa: std.mem.Allocator, claims_json: []const u8, key: SigningK
     out[n] = '.';
     n += 1;
     n += b64.encode(out[n..], sig).len;
-    return gpa.realloc(out, n) catch out[0..n];
+    // The caller frees the token with its own length, so the slice returned
+    // must BE the allocation. A shrink in place keeps it; otherwise copy into
+    // an exact block (a failed shrinking realloc used to return `out[0..n]`,
+    // shorter than its block -- a wrong-length free, mutation run 2026-11-12).
+    if (gpa.resize(out, n)) return out[0..n];
+    const exact = gpa.dupe(u8, out[0..n]) catch return error.OutOfMemory;
+    gpa.free(out);
+    return exact;
 }
 
 fn maxSignatureLen() usize {
@@ -467,6 +474,27 @@ test "encode: a short HMAC secret and non-object claims are refused" {
     for ([_][]const u8{ "[1,2]", "\"x\"", "", "{\"a\":1", "{\"a\":1}{}", "  " }) |bad| {
         try testing.expectError(error.InvalidClaims, encodeJson(testing.allocator, bad, .{ .hs256 = &k }, .{}));
     }
+}
+
+test "encodeJson: a token is always freeable with its own length, even when the final shrink cannot happen" {
+    // Mutation run 2026-11-12: a failed shrinking `realloc` used to return
+    // `out[0..n]`, shorter than its block, so the documented `free(token)`
+    // freed with the wrong length (a panic under the testing allocator, UB
+    // elsewhere). Every resize fails here and every allocation index fails
+    // once; each success must free cleanly, each failure must be OutOfMemory.
+    const k = @as([32]u8, @splat(0x42));
+    const kid: [300]u8 = @splat('k');
+    var i: usize = 0;
+    var successes: usize = 0;
+    while (i < 64) : (i += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i, .resize_fail_index = 0 });
+        const a = failing.allocator();
+        if (encodeJson(a, "{\"sub\":\"x\"}", .{ .hs256 = &k }, .{ .kid = &kid })) |tok| {
+            successes += 1;
+            a.free(tok);
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+    try testing.expect(successes > 0);
 }
 
 test "encodeJson: verbatim payload, deterministic output, known HS256 bytes" {
