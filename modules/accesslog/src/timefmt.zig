@@ -417,3 +417,24 @@ const OneByte = struct {
         return n;
     }
 };
+
+test "mutation 2026-11-12: end: without a latency adds nothing, not even a nanosecond before a boundary" {
+    var e = entryAt(999_999_999); // 0.999999999 s, latency_ns null
+    try testing.expectEqualStrings("0", try fmtAt("end:sec", e));
+    try testing.expectEqualStrings("999", try fmtAt("end:msec_frac", e));
+    try testing.expectEqualStrings("999999", try fmtAt("end:usec_frac", e));
+    try testing.expectEqualStrings("00:00:00", try fmtAt("end:%H:%M:%S", e));
+    e.latency_ns = 1; // one nanosecond does cross it
+    try testing.expectEqualStrings("1", try fmtAt("end:sec", e));
+}
+
+test "mutation 2026-11-12: a one-letter token after another token, and the century divisor" {
+    const e = entryAt(t0);
+    // `%p` and `%u` are one-letter layout tokens: the merge guard reads their first byte only
+    try testing.expectEqualStrings("55", try fmtAt("%u%u", e));
+    try testing.expectEqualStrings("PMPM", try fmtAt("%p%p", e));
+    try testing.expectEqualStrings("14PM", try fmtAt("%H%p", e));
+    // 1999-12-31T23:59:59Z and 2100-01-01T00:00:00Z tell /100 from /99 and /101
+    try testing.expectEqualStrings("19", try fmtAt("%C", entryAt(946_684_799 * std.time.ns_per_s)));
+    try testing.expectEqualStrings("21", try fmtAt("%C", entryAt(4_102_444_800 * std.time.ns_per_s)));
+}

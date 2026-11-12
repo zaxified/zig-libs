@@ -969,3 +969,50 @@ test "mutation 2026-11-07: unsynchronized leaves the batch alone; an oversize li
     try testing.expectEqual(@as(usize, 1), fc.flushes); // nothing was queued, so no flush of an empty batch
     try testing.expect(fc.bytes > huge.len);
 }
+
+/// An unbuffered writer that counts its drain calls and bytes: one `writeAll`
+/// is one drain, a streamed line is many.
+const DrainCount = struct {
+    interface: std.Io.Writer,
+    drains: usize = 0,
+    bytes: usize = 0,
+
+    fn init() DrainCount {
+        return .{ .interface = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} } };
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const c: *DrainCount = @alignCast(@fieldParentPtr("interface", w));
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| n += d.len;
+        n += data[data.len - 1].len * splat;
+        c.drains += 1;
+        c.bytes += n;
+        return n;
+    }
+};
+
+test "mutation 2026-11-12: a line of exactly direct_line_max bytes is ONE write, one byte more is streamed" {
+    var target: [Sink.direct_line_max + 16]u8 = undefined;
+    @memset(&target, 'a');
+    var probe: [Sink.direct_line_max + 256]u8 = undefined;
+    var e: Entry = .{ .timestamp_ns = 1, .method = "GET", .target = target[0..1], .status = 200 };
+    var pw: std.Io.Writer = .fixed(&probe);
+    try write(e, .logfmt, &pw);
+    const base = pw.buffered().len; // the line with a one-byte target
+    for ([_]bool{ false, true }) |synchronized| {
+        // exactly direct_line_max: one drain; one byte more: the streamed path
+        e.target = target[0 .. Sink.direct_line_max - base + 1];
+        var exact = DrainCount.init();
+        var s1 = Sink.init(&exact.interface, .{ .format = .logfmt, .synchronized = synchronized });
+        s1.log(e);
+        try testing.expectEqual(@as(usize, Sink.direct_line_max), exact.bytes);
+        try testing.expectEqual(@as(usize, 1), exact.drains);
+        e.target = target[0 .. Sink.direct_line_max - base + 2];
+        var over = DrainCount.init();
+        var s2 = Sink.init(&over.interface, .{ .format = .logfmt, .synchronized = synchronized });
+        s2.log(e);
+        try testing.expectEqual(@as(usize, Sink.direct_line_max + 1), over.bytes);
+        try testing.expect(over.drains > 1);
+    }
+}

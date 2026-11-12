@@ -1018,3 +1018,42 @@ test "mutation 2026-11-07: a rename that fails for a reason other than a missing
     try testing.expect(rf.last_rotate_error != null);
     try testing.expectEqual(@as(u64, 8), rf.size);
 }
+
+test "mutation 2026-11-12: max_backups 0 holds one descriptor, a positive one holds two" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const before = try openFds();
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "d.log", .{ .max_backups = 0 });
+    try testing.expectEqual(before + 1, try openFds());
+    rf.close();
+    try testing.expectEqual(before, try openFds());
+    var rf2 = try RotatingFile.open(tmp.dir, testing.io, "d.log", .{ .max_backups = 1 });
+    try testing.expectEqual(before + 2, try openFds());
+    rf2.close();
+}
+
+test "mutation 2026-11-12: a record over max_size rotates a file that holds a single byte, on both paths" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    fake_now = 1_793_973_909;
+    for ([_]bool{ false, true }) |via_writer| {
+        const nm = if (via_writer) "one1.log" else "one0.log";
+        var rf = try RotatingFile.open(tmp.dir, testing.io, nm, .{ .max_size = 5, .now_s = fakeNow });
+        defer rf.close();
+        try rf.write("a"); // size 1: not empty, not over
+        if (via_writer) try rf.interface().writeAll("0123456789") else try rf.write("0123456789");
+        try testing.expectEqual(@as(u64, 10), rf.size);
+        try testing.expectEqual(@as(usize, 2), try listCount(tmp.dir, nm[0..5]));
+    }
+}
+
+test "mutation 2026-11-12: slices before a huge splat saturate the byte count, they never overflow it" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "s.log", .{ .max_size = 0 });
+    const w = rf.interface();
+    rf.file.?.close(testing.io); // the descriptor is gone: the first slice fails at once
+    // 3 + 1 * maxInt(usize) does not fit a u64; the total saturates and the write fails, no overflow trap
+    try testing.expectError(error.WriteFailed, RotatingFile.drain(w, &.{ "abc", "x" }, std.math.maxInt(usize)));
+    rf.file = null; // already closed above
+}
