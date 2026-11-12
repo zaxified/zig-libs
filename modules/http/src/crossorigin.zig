@@ -335,3 +335,27 @@ test "mutation run 2: originHost refuses a control byte anywhere, keeps a space 
     try validateOrigin("https://\x80.example");
     try std.testing.expectEqualStrings("\x80.example", originHost("https://%80.example", &buf).?);
 }
+
+test "mutation-a: parseOrigin and originHost follow Go's url.Parse split" {
+    try testing.expect(parseOrigin(":foo") == null);
+    const a = parseOrigin("http:///x").?;
+    try testing.expectEqualStrings("", a.host);
+    try testing.expectEqualStrings("/x", a.path);
+    const b = parseOrigin("///x").?;
+    try testing.expectEqualStrings("", b.host);
+    try testing.expectEqualStrings("///x", b.path);
+    try testing.expect(parseOrigin("1a:b") == null);
+    try testing.expect(parseOrigin("a/b:c") != null);
+    try testing.expect(parseOrigin("mailto:a:b") != null);
+    const f = parseOrigin("http://h/p?q=1#frag").?;
+    try testing.expectEqualStrings("h", f.host);
+    try testing.expectEqualStrings("/p", f.path);
+    try testing.expectEqualStrings("q=1", f.query);
+    try testing.expectEqualStrings("frag", f.fragment);
+    try testing.expect(parseOrigin("http://a\x01b") == null);
+    var buf: [max_host]u8 = undefined;
+    try testing.expect(originHost("http://h%zzz", &buf) == null);
+    try testing.expect(originHost("http://h%4", &buf) == null);
+    try testing.expect(originHost("http://h:12a", &buf) == null);
+    try testing.expectEqualStrings("h:80", originHost("http://h:80", &buf).?);
+}

@@ -317,3 +317,12 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "mutation-a: validSequenceLen checks every continuation byte of a 3- and 4-byte sequence" {
+    try testing.expectEqual(@as(usize, 3), validSequenceLen("\xE2\x82\xAC"));
+    try testing.expectEqual(@as(usize, 0), validSequenceLen("\xE2\x82\x28"));
+    try testing.expectEqual(@as(usize, 0), validSequenceLen("\xE2\x82\xC0"));
+    try testing.expectEqual(@as(usize, 4), validSequenceLen("\xF0\x9F\x98\x80"));
+    try testing.expectEqual(@as(usize, 0), validSequenceLen("\xF0\x9F\x98\x28"));
+    try testing.expectEqual(@as(usize, 0), validSequenceLen("\xF0\x9F\x28\x80"));
+}

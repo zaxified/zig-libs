@@ -11898,3 +11898,969 @@ test "mutation-a: ResponseWriter.setHeader(Trailer) error mapping and reset() re
     try testing.expect(std.mem.indexOf(u8, got, "t9=TooManyHeaders;bad=InvalidHeader;undeclared=TrailerNotDeclared;") != null);
     try testing.expect(std.mem.indexOf(u8, got, "Trailer: A, B, C, D, E, F, G, H\r\n") != null);
 }
+
+// ── mutation run 2026-11-12, round 2 (server half): ResponseWriter ──────────
+
+const MaSink = struct {
+    names: [32][]const u8 = undefined,
+    values: [32][]const u8 = undefined,
+    n: usize = 0,
+    head_done: u32 = 0,
+    fail_head_done: bool = false,
+
+    fn put(ctx: *anyopaque, name: []const u8, value: []const u8) Writer.Error!void {
+        const s: *MaSink = @ptrCast(@alignCast(ctx));
+        s.names[s.n] = name;
+        s.values[s.n] = value;
+        s.n += 1;
+    }
+
+    fn done(ctx: *anyopaque, _: u16, _: bool, _: ?u64) Writer.Error!void {
+        const s: *MaSink = @ptrCast(@alignCast(ctx));
+        s.head_done += 1;
+        if (s.fail_head_done) {
+            s.fail_head_done = false;
+            return error.WriteFailed;
+        }
+    }
+
+    fn fieldSink(s: *MaSink) ResponseWriter.FieldSink {
+        return .{ .ctx = s, .put = put, .head_done = done };
+    }
+
+    fn count(s: *const MaSink, name: []const u8) usize {
+        var c: usize = 0;
+        for (s.names[0..s.n]) |nm| {
+            if (std.mem.eql(u8, nm, name)) c += 1;
+        }
+        return c;
+    }
+
+    fn find(s: *const MaSink, name: []const u8) ?[]const u8 {
+        for (s.names[0..s.n], s.values[0..s.n]) |nm, v| {
+            if (std.mem.eql(u8, nm, name)) return v;
+        }
+        return null;
+    }
+};
+
+/// A connection writer that remembers what reached its sink (a flush).
+const MaDrainRec = struct {
+    buf: [256]u8 = undefined,
+    w: Writer = undefined,
+    drained: usize = 0,
+
+    fn init(r: *MaDrainRec) void {
+        r.w = .{ .buffer = &r.buf, .vtable = &.{ .drain = drain } };
+    }
+
+    fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
+        const r: *MaDrainRec = @alignCast(@fieldParentPtr("w", w));
+        r.drained += w.end;
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| n += d.len;
+        n += data[data.len - 1].len * splat;
+        r.drained += n;
+        return n;
+    }
+};
+
+const MaVaryCase = struct { name: []const u8, value: []const u8, varies: usize };
+const ma_vary_cases = [_]MaVaryCase{
+    .{ .name = "", .value = "", .varies = 1 },
+    .{ .name = "Vary", .value = "Accept-Encoding", .varies = 1 },
+    .{ .name = "Vary", .value = "*", .varies = 1 },
+    .{ .name = "VARY", .value = "Cookie, accept-ENCODING", .varies = 1 },
+    .{ .name = "Vary", .value = "Cookie", .varies = 2 },
+    .{ .name = "X-Hint", .value = "accept-encoding", .varies = 1 },
+    .{ .name = "X-Hint", .value = "*", .varies = 1 },
+};
+
+test "mutation-a: Vary: Accept-Encoding is added unless a Vary header already covers it, on both head writers" {
+    const scratch = try testing.allocator.create(GzipScratch);
+    defer testing.allocator.destroy(scratch);
+    for (ma_vary_cases) |c| {
+        for ([_]bool{ false, true }) |sinked| {
+            var sink: MaSink = .{};
+            var out_buf: [2048]u8 = undefined;
+            var out: Writer = .fixed(&out_buf);
+            var body_buf: [256]u8 = undefined;
+            var chunk_buf: [64]u8 = undefined;
+            var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+                .compression = .{ .min_size = 4 },
+                .gzip_scratch = scratch,
+                .accept_gzip = true,
+                .field_sink = if (sinked) sink.fieldSink() else null,
+            });
+            try rw.setHeader("Content-Type", "application/json");
+            if (c.name.len != 0) try rw.setHeader(c.name, c.value);
+            try rw.interface.writeAll("{\"a\":\"bcdefghijk\"}");
+            try rw.end();
+            try testing.expect(rw.headSent());
+            var lower: [2048]u8 = undefined;
+            const lo = std.ascii.lowerString(&lower, out.buffered());
+            const got = if (sinked) sink.count("vary") else std.mem.count(u8, lo, "\r\nvary: ");
+            try testing.expectEqual(c.varies, got);
+        }
+    }
+    // No compression configured: no Vary at all, whatever the handler set.
+    for ([_]bool{ false, true }) |sinked| {
+        var sink: MaSink = .{};
+        var out_buf: [512]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [64]u8 = undefined;
+        var chunk_buf: [64]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .field_sink = if (sinked) sink.fieldSink() else null });
+        try rw.writeAll("hi");
+        try rw.end();
+        var lower: [512]u8 = undefined;
+        const lo = std.ascii.lowerString(&lower, out.buffered());
+        try testing.expectEqual(@as(usize, 0), if (sinked) sink.count("vary") else std.mem.count(u8, lo, "vary:"));
+    }
+}
+
+test "mutation-a: only a response that is really encoded gets its ETag weakened, and a weak tag is left alone" {
+    const scratch = try testing.allocator.create(GzipScratch);
+    defer testing.allocator.destroy(scratch);
+    const Case = struct { etag: []const u8, body: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .etag = "\"s\"", .body = "{\"a\":\"bcdefghijk\"}", .want = "W/\"s\"" },
+        .{ .etag = "W/\"w\"", .body = "{\"a\":\"bcdefghijk\"}", .want = "W/\"w\"" },
+        .{ .etag = "\"s\"", .body = "{}", .want = "\"s\"" }, // below min_size: identity
+    };
+    for (cases) |c| {
+        for ([_]bool{ false, true }) |sinked| {
+            var sink: MaSink = .{};
+            var out_buf: [2048]u8 = undefined;
+            var out: Writer = .fixed(&out_buf);
+            var body_buf: [256]u8 = undefined;
+            var chunk_buf: [64]u8 = undefined;
+            var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+                .compression = .{ .min_size = 4 },
+                .gzip_scratch = scratch,
+                .accept_gzip = true,
+                .field_sink = if (sinked) sink.fieldSink() else null,
+            });
+            try rw.setHeader("Content-Type", "application/json");
+            try rw.setHeader("ETag", c.etag);
+            try rw.interface.writeAll(c.body);
+            try rw.end();
+            if (sinked) {
+                try testing.expectEqualStrings(c.want, sink.find("etag").?);
+            } else {
+                var r: Reader = .fixed(out.buffered());
+                var head_buf: [1024]u8 = undefined;
+                const res = try h1.ResponseHead.parse(try h1.readHead(&r, &head_buf));
+                try testing.expectEqualStrings(c.want, res.header("etag").?);
+            }
+        }
+    }
+}
+
+test "mutation-a: the h2 head keeps every name and weak tag it copied, and never lowercases a caller's own bytes" {
+    const scratch = try testing.allocator.create(GzipScratch);
+    defer testing.allocator.destroy(scratch);
+    const rw = try testing.allocator.create(ResponseWriter);
+    defer testing.allocator.destroy(rw);
+    var sink: MaSink = .{};
+    var out_buf: [2048]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    rw.initAt(&out, &body_buf, &chunk_buf, .{
+        .compression = .{ .min_size = 4 },
+        .gzip_scratch = scratch,
+        .accept_gzip = true,
+        .field_sink = sink.fieldSink(),
+    });
+    try rw.setHeader("Content-Type", "application/json");
+    try rw.setHeader("ETag", "\"strong\"");
+    try rw.setHeaderStatic("X-Static-One", "1");
+    try rw.setHeaderStatic("X-Static-Two", "2");
+    // A name outside the writer's store (here on the stack, above the heap
+    // object), never touched: it is copied, not lowered in place.
+    var caller_name = "X-Caller-Owned".*;
+    if (@intFromPtr(&caller_name) < @intFromPtr(rw) + @sizeOf(ResponseWriter)) return error.SkipZigTest;
+    rw.headers[rw.headers_len] = .{ .name = &caller_name, .value = "c" };
+    rw.headers_len += 1;
+    try rw.interface.writeAll("{\"a\":\"bcdefghijk\"}");
+    try rw.end();
+    try testing.expectEqualStrings("X-Caller-Owned", &caller_name);
+    try testing.expectEqualStrings("W/\"strong\"", sink.find("etag").?);
+    try testing.expectEqualStrings("1", sink.find("x-static-one").?);
+    try testing.expectEqualStrings("2", sink.find("x-static-two").?);
+    try testing.expectEqualStrings("c", sink.find("x-caller-owned").?);
+    // Each lowered copy is still intact after every later one was made.
+    try testing.expectEqual(@as(usize, 1), sink.count("x-static-one"));
+    try testing.expectEqual(@as(usize, 1), sink.count("x-static-two"));
+    try testing.expectEqual(@as(usize, 1), sink.count("x-caller-owned"));
+}
+
+test "mutation-a: upgrade and tunnel refuse a field sink, HTTP/1.0, HEAD and a missing reader, and hand over completely" {
+    var in: Reader = .fixed("");
+    var sink: MaSink = .{};
+    var out_buf: [512]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    const Case = struct { opts: ResponseWriter.InitOptions, want_upgrade: anyerror, want_tunnel: anyerror };
+    const cases = [_]Case{
+        .{ .opts = .{ .upgradable = true, .tunnelable = true, .upgrade_in = &in, .field_sink = sink.fieldSink() }, .want_upgrade = error.Unsupported, .want_tunnel = error.Unsupported },
+        .{ .opts = .{ .upgradable = true, .tunnelable = true, .upgrade_in = &in, .http1_0 = true }, .want_upgrade = error.Unsupported, .want_tunnel = error.BadStatus },
+        .{ .opts = .{ .upgradable = true, .tunnelable = true, .upgrade_in = &in, .head_request = true }, .want_upgrade = error.Unsupported, .want_tunnel = error.BadStatus },
+        .{ .opts = .{ .upgradable = false, .tunnelable = true, .upgrade_in = &in }, .want_upgrade = error.Unsupported, .want_tunnel = error.BadStatus },
+        .{ .opts = .{ .upgradable = true, .tunnelable = false, .upgrade_in = &in }, .want_upgrade = error.BadStatus, .want_tunnel = error.Unsupported },
+        .{ .opts = .{ .upgradable = true, .tunnelable = true, .upgrade_in = null }, .want_upgrade = error.BadStatus, .want_tunnel = error.Unsupported },
+    };
+    for (cases) |c| {
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, c.opts);
+        // `error.BadStatus` marks "gets past the gate": upgrade has no such error,
+        // so for it the want is checked only where it is Unsupported.
+        const up = rw.upgrade("foo");
+        if (c.want_upgrade == error.Unsupported) {
+            try testing.expectError(error.Unsupported, up);
+            try testing.expect(!rw.headSent());
+        }
+        var out2: Writer = .fixed(&out_buf);
+        var rw2: ResponseWriter = .init(&out2, &body_buf, &chunk_buf, c.opts);
+        const tu = rw2.tunnel(404);
+        try testing.expectError(c.want_tunnel, tu);
+    }
+    // The gate's own status range: 199 and 300 are refused, 200 and 299 pass.
+    for ([_]struct { status: u16, ok: bool }{ .{ .status = 199, .ok = false }, .{ .status = 200, .ok = true }, .{ .status = 299, .ok = true }, .{ .status = 300, .ok = false } }) |s| {
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .tunnelable = true, .upgrade_in = &in });
+        if (s.ok) try rw.tunnel(s.status) else try testing.expectError(error.BadStatus, rw.tunnel(s.status));
+    }
+    // A successful hand-over: every flag set, the head flushed to the connection.
+    {
+        var rec: MaDrainRec = .{};
+        rec.init();
+        var rw: ResponseWriter = .init(&rec.w, &body_buf, &chunk_buf, .{ .upgradable = true, .upgrade_in = &in });
+        try rw.upgrade("foo");
+        try testing.expect(rw.ended and rw.detached and rw.handed_over and rw.headSent());
+        try testing.expect(rw.body == .discard);
+        try testing.expect(!rw.close_connection);
+        try testing.expect(rec.drained > 0 and rec.w.end == 0);
+    }
+    {
+        var rec: MaDrainRec = .{};
+        rec.init();
+        var rw: ResponseWriter = .init(&rec.w, &body_buf, &chunk_buf, .{ .tunnelable = true, .upgrade_in = &in, .http1_0 = true, .close_connection = true });
+        try rw.tunnel(200);
+        try testing.expect(rw.ended and rw.detached and rw.handed_over and rw.headSent());
+        try testing.expect(rw.body == .discard);
+        try testing.expect(!rw.close_connection and !rw.http1_0);
+        try testing.expect(rec.drained > 0 and rec.w.end == 0);
+    }
+}
+
+test "mutation-a: HEAD and bodiless statuses frame by what is declared, never by an invented length" {
+    var out_buf: [512]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    // HEAD, nothing written, nothing declared: no length at all.
+    {
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .head_request = true });
+        try rw.end();
+        try testing.expect(std.mem.find(u8, out.buffered(), "Content-Length") == null);
+    }
+    // HEAD with a buffered body mirrors GET's length.
+    {
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .head_request = true });
+        try rw.writeAll("abc");
+        try rw.end();
+        try testing.expect(std.mem.find(u8, out.buffered(), "Content-Length: 3\r\n") != null);
+        try testing.expect(std.mem.endsWith(u8, out.buffered(), "\r\n\r\n"));
+    }
+    // 204 that was handed bytes: no length, no body.
+    {
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+        rw.setStatus(204);
+        try rw.writeAll("abc");
+        try rw.end();
+        try testing.expect(std.mem.find(u8, out.buffered(), "Content-Length") == null);
+        try testing.expect(std.mem.endsWith(u8, out.buffered(), "\r\n\r\n"));
+    }
+}
+
+test "mutation-a: a provider's coding is used when it is the only one the client accepts, and acquired once across a reset" {
+    const scratch = try testing.allocator.create(GzipScratch);
+    defer testing.allocator.destroy(scratch);
+    // The client refuses gzip but names the provider's coding.
+    {
+        var t: TestProvider = .{};
+        const p = t.provider();
+        var out_buf: [1024]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [256]u8 = undefined;
+        var chunk_buf: [32]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+            .compression = .{ .min_size = 4 },
+            .gzip_scratch = scratch,
+            .accept_gzip = false,
+            .encoder_provider = &p,
+            .accept_encoding = "x-test",
+        });
+        try rw.setHeader("Content-Type", "application/json");
+        try rw.interface.writeAll("{\"a\":\"bcdefghijk\"}");
+        try rw.end();
+        rw.releaseEncoder();
+        var head_buf: [1024]u8 = undefined;
+        var body_out: [256]u8 = undefined;
+        var bw: Writer = .fixed(&body_out);
+        try testing.expectEqualStrings("x-test", (try encodedAnswer(out.buffered(), &bw)).?);
+        try testing.expectEqual(@as(u32, 1), t.acquired);
+        _ = &head_buf;
+    }
+    // An encoder acquired for an end() that then failed is reused after reset(), not borrowed twice.
+    {
+        var t: TestProvider = .{};
+        const p = t.provider();
+        var out_buf: [1024]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [256]u8 = undefined;
+        var chunk_buf: [32]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+            .compression = .{ .min_size = 4 },
+            .gzip_scratch = scratch,
+            .accept_gzip = false,
+            .encoder_provider = &p,
+            .accept_encoding = "x-test",
+        });
+        try rw.setHeader("Content-Type", "application/json");
+        try rw.setHeader("Content-Length", "99");
+        try rw.interface.writeAll("{\"a\":\"bcdefghijk\"}");
+        try testing.expectError(error.WriteFailed, rw.end());
+        try testing.expectEqual(@as(u32, 1), t.acquired);
+        try rw.reset();
+        try rw.setHeader("Content-Type", "application/json");
+        try rw.interface.writeAll("{\"a\":\"bcdefghijk\"}");
+        try rw.end();
+        rw.releaseEncoder();
+        var body_out: [256]u8 = undefined;
+        var bw: Writer = .fixed(&body_out);
+        try testing.expectEqualStrings("x-test", (try encodedAnswer(out.buffered(), &bw)).?);
+        try testing.expectEqual(@as(u32, 1), t.acquired);
+        try testing.expectEqual(@as(u32, 1), t.released);
+    }
+}
+
+test "mutation-a: reset() restores the header store, the framing flags, the trailers and the body mode" {
+    var out_buf: [8192]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    // The copied-header store is whole again.
+    {
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+        var big: [3000]u8 = undefined;
+        @memset(&big, 'v');
+        try rw.setHeader("X-Big", &big);
+        try rw.reset();
+        try rw.setHeader("X-Big", &big);
+    }
+    // A failed end() leaves `ended` and `failed` set; reset() clears both.
+    {
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+        try rw.setHeader("Content-Length", "5");
+        try rw.interface.writeAll("abc");
+        try testing.expectError(error.WriteFailed, rw.end());
+        try testing.expect(rw.failed and rw.ended and rw.connectionMustClose());
+        try rw.reset();
+        try testing.expect(!rw.failed and !rw.ended and !rw.connectionMustClose());
+        try rw.writeAll("ok");
+        try rw.end();
+        try testing.expect(std.mem.endsWith(u8, out.buffered(), "\r\n\r\nok"));
+    }
+    // A trailer set before reset() does not ride on the chunked body after it.
+    {
+        var out: Writer = .fixed(&out_buf);
+        var small: [8]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &small, &chunk_buf, .{});
+        try rw.declareTrailer("X-Sum");
+        try rw.setTrailer("X-Sum", "1");
+        try rw.reset();
+        try rw.writeAll("0123456789abcdef");
+        try rw.end();
+        try testing.expect(std.mem.find(u8, out.buffered(), "X-Sum") == null);
+        try testing.expect(std.mem.find(u8, out.buffered(), "Transfer-Encoding: chunked") != null);
+    }
+    // A coding named by a head that then failed to go out is not left on the next one.
+    {
+        var sink: MaSink = .{ .fail_head_done = true };
+        var t: TestEncoder = .{};
+        var out: Writer = .fixed(&out_buf);
+        var wide_body: [256]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &wide_body, &chunk_buf, .{
+            .compression = .{ .min_size = 4 },
+            .encoder = t.encoder(),
+            .field_sink = sink.fieldSink(),
+        });
+        try rw.setHeader("Content-Type", "text/plain");
+        try rw.interface.writeAll("hello, encoder");
+        try testing.expectError(error.WriteFailed, rw.end());
+        try testing.expect(!rw.headSent());
+        try rw.reset();
+        try rw.setHeader("Content-Type", "image/png");
+        try rw.interface.writeAll("raw");
+        try rw.end();
+        try testing.expectEqual(@as(usize, 1), sink.count("content-encoding"));
+    }
+    // An upgrade whose head did not fit leaves the body mode `discard`; reset() takes it back.
+    {
+        var in: Reader = .fixed("");
+        var tiny: [8]u8 = undefined;
+        var out: Writer = .fixed(&tiny);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .upgradable = true, .upgrade_in = &in });
+        try testing.expectError(error.WriteFailed, rw.upgrade("foo"));
+        try testing.expect(!rw.headSent());
+        try rw.reset();
+        var out2: Writer = .fixed(&out_buf);
+        rw.out = &out2;
+        try rw.writeAll("hi");
+        try rw.end();
+        try testing.expect(std.mem.startsWith(u8, out2.buffered(), "HTTP/1.1 200 OK\r\n"));
+        try testing.expect(std.mem.endsWith(u8, out2.buffered(), "hi"));
+    }
+}
+
+test "mutation-a: a response that breaks its own framing is marked failed on every path that detects it" {
+    const scratch = try testing.allocator.create(GzipScratch);
+    defer testing.allocator.destroy(scratch);
+    var out_buf: [4096]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    // Trailers declared, then a status that has no body to carry them.
+    {
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [64]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+        try rw.declareTrailer("X-Sum");
+        rw.setStatus(204);
+        try testing.expectError(error.WriteFailed, rw.end());
+        try testing.expect(rw.failed);
+    }
+    // Buffered compressed body that disagrees with its declared length.
+    {
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [256]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .compression = .{ .min_size = 4 }, .gzip_scratch = scratch, .accept_gzip = true });
+        try rw.setHeader("Content-Type", "application/json");
+        try rw.setHeader("Content-Length", "99");
+        try rw.interface.writeAll("{\"a\":\"bcdefghijk\"}");
+        try testing.expectError(error.WriteFailed, rw.end());
+        try testing.expect(rw.failed and !rw.headSent());
+    }
+    // Streamed identity body: under- and over-delivery of a declared length.
+    for ([_]usize{ 10, 30 }) |n| {
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [8]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+        try rw.setHeader("Content-Length", "20");
+        var data: [30]u8 = undefined;
+        @memset(&data, 'x');
+        if (n > 20) {
+            try testing.expectError(error.WriteFailed, rw.interface.writeAll(data[0..n]));
+        } else {
+            try rw.interface.writeAll(data[0..n]);
+            try testing.expectError(error.WriteFailed, rw.end());
+        }
+        try testing.expect(rw.failed and rw.connectionMustClose());
+    }
+    // The same two for a compressed streamed body.
+    for ([_]usize{ 10, 30 }) |n| {
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [8]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .compression = .{ .min_size = 4 }, .gzip_scratch = scratch, .accept_gzip = true });
+        try rw.setHeader("Content-Type", "application/json");
+        try rw.setHeader("Content-Length", "20");
+        var data: [30]u8 = undefined;
+        @memset(&data, 'x');
+        if (n > 20) {
+            try testing.expectError(error.WriteFailed, rw.interface.writeAll(data[0..n]));
+        } else {
+            try rw.interface.writeAll(data[0..n]);
+            try testing.expectError(error.WriteFailed, rw.end());
+        }
+        try testing.expect(rw.failed and rw.connectionMustClose());
+    }
+    // An encoder whose finish fails.
+    {
+        const Fin = struct {
+            fn begin(_: *anyopaque, dst: *Writer, _: ?u64) Writer.Error!*Writer {
+                return dst;
+            }
+            fn finish(_: *anyopaque) Writer.Error!void {
+                return error.WriteFailed;
+            }
+        };
+        var dummy: u8 = 0;
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [256]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+            .compression = .{ .min_size = 4 },
+            .encoder = .{ .name = "x-fin", .ctx = &dummy, .begin = Fin.begin, .finish = Fin.finish },
+        });
+        try rw.setHeader("Content-Type", "application/json");
+        try rw.interface.writeAll("{\"a\":\"bcdefghijk\"}");
+        try testing.expectError(error.WriteFailed, rw.end());
+        try testing.expect(rw.failed);
+    }
+}
+
+test "mutation-a: a vectored write reaches the body in order through every sink" {
+    const scratch = try testing.allocator.create(GzipScratch);
+    defer testing.allocator.destroy(scratch);
+    var out_buf: [4096]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    const part_texts = [_][]const u8{ "aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc" };
+    // Identity (declared length), chunked, and HTTP/1.0 until-close bodies.
+    const Mode = enum { identity, chunked, until_close };
+    for ([_]Mode{ .identity, .chunked, .until_close }) |mode| {
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [8]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .http1_0 = mode == .until_close });
+        if (mode == .identity) try rw.setHeader("Content-Length", "30");
+        var parts = part_texts;
+        try rw.interface.writeVecAll(&parts);
+        try rw.end();
+        try testing.expect(std.mem.find(u8, out.buffered(), "aaaaaaaaaabbbbbbbbbbcccccccccc") != null or mode == .chunked);
+        if (mode == .chunked) {
+            for (part_texts) |p| try testing.expect(std.mem.find(u8, out.buffered(), p) != null);
+        }
+    }
+    // The compressed sink: the decoded stream holds all three parts.
+    {
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [8]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .compression = .{ .min_size = 4 }, .gzip_scratch = scratch, .accept_gzip = true });
+        try rw.setHeader("Content-Type", "application/json");
+        var parts = part_texts;
+        try rw.interface.writeVecAll(&parts);
+        try rw.end();
+        try expectGzipResponse(out.buffered(), "aaaaaaaaaabbbbbbbbbbcccccccccc");
+    }
+}
+
+// ── mutation run 2026-11-12, round 2 (server half): serving loop ────────────
+
+test "mutation-a: PooledBuffers lays the five buffers one after another in the slab" {
+    var pool = try bufpool.BufferPool.init(testing.allocator, 15, 1);
+    defer pool.deinit();
+    var layout: PooledBuffers = .{ .pool = &pool, .head_len = 1, .request_body_len = 2, .response_body_len = 3, .chunk_len = 4, .trailers_len = 5 };
+    const p = try layout.provider();
+    const b = p.acquire(p.ctx).?;
+    defer p.release(p.ctx, b);
+    try testing.expectEqual(@as(usize, 1), b.head.len);
+    try testing.expectEqual(@as(usize, 2), b.request_body.len);
+    try testing.expectEqual(@as(usize, 3), b.response_body.len);
+    try testing.expectEqual(@as(usize, 4), b.chunk.len);
+    try testing.expectEqual(@as(usize, 5), b.trailers.len);
+    const base = @intFromPtr(b.head.ptr);
+    try testing.expectEqual(base + 1, @intFromPtr(b.request_body.ptr));
+    try testing.expectEqual(base + 3, @intFromPtr(b.response_body.ptr));
+    try testing.expectEqual(base + 6, @intFromPtr(b.chunk.ptr));
+    try testing.expectEqual(base + 10, @intFromPtr(b.trailers.ptr));
+}
+
+const MaErrRec = struct {
+    n: u32 = 0,
+    kind: ErrorKind = .handler_failed,
+    status: u16 = 0,
+
+    fn hook(ctx: ?*anyopaque, kind: ErrorKind, _: ?anyerror, status: u16, _: ?net.IpAddress) void {
+        const r: *MaErrRec = @ptrCast(@alignCast(ctx.?));
+        r.n += 1;
+        r.kind = kind;
+        r.status = status;
+    }
+};
+
+test "mutation-a: a 503 for want of buffers and a 500 are the server's failure; a 400 is the request's" {
+    var rec: MaErrRec = .{};
+    var cp: CountingProvider = .{ .fail_at = 1 };
+    var in: Reader = .fixed("GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var none: [0]u8 = undefined;
+    serveStream(.{
+        .handler = testHandler,
+        .buffers_provider = cp.provider(),
+        .on_error = MaErrRec.hook,
+        .on_error_ctx = &rec,
+    }, &in, &out, .{ .head = &none, .request_body = &none, .response_body = &none, .chunk = &none });
+    try testing.expectEqual(@as(u32, 1), rec.n);
+    try testing.expectEqual(@as(u16, 503), rec.status);
+    try testing.expectEqual(ErrorKind.server_failed, rec.kind);
+
+    rec = .{};
+    _ = maServeHooked(maEchoPath, "GET /a HTTP/1.1\r\nHost: t\r\nContent-Encoding: br\r\nConnection: close\r\n\r\n", &out_buf, &rec);
+    try testing.expectEqual(@as(u16, 415), rec.status);
+    try testing.expectEqual(ErrorKind.request_refused, rec.kind);
+}
+
+fn maServeHooked(handler: Handler, wire: []const u8, out_buf: []u8, rec: *MaErrRec) []const u8 {
+    var in: Reader = .fixed(wire);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    var trailer_buf: [256]u8 = undefined;
+    serveStream(.{
+        .handler = handler,
+        .on_error = MaErrRec.hook,
+        .on_error_ctx = rec,
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+        .trailers = &trailer_buf,
+    });
+    return out.buffered();
+}
+
+fn maKeepHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    _ = req;
+    // A handler may not talk the connection into staying open past a Connection: close.
+    rw.close_connection = false;
+    try rw.writeAll("x");
+}
+
+fn maHostEcho(req: *Request, rw: *ResponseWriter) anyerror!void {
+    try rw.writer().print("host={s};path={s}", .{ req.head.host orelse "none", req.path });
+}
+
+fn maDetachHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    _ = req;
+    rw.detach();
+    try rw.writeAll("first");
+}
+
+test "mutation-a: serveStream keeps a request's Connection: close over the handler, reads the absolute-form authority as Host, and flushes a detached head" {
+    var out_buf: [2048]u8 = undefined;
+    const got = maServe(maKeepHandler, "GET /a HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\nGET /b HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
+    try testing.expectEqual(@as(usize, 1), maCount(got, "HTTP/1.1 200 "));
+
+    const h10 = maServe(maHostEcho, "GET http://auth.example/x HTTP/1.0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.endsWith(u8, h10, "host=auth.example;path=/x"));
+
+    var rec: MaDrainRec = .{};
+    rec.init();
+    var in: Reader = .fixed("GET /a HTTP/1.1\r\nHost: t\r\n\r\n");
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [64]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var trailer_buf: [64]u8 = undefined;
+    serveStream(.{ .handler = maDetachHandler }, &in, &rec.w, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+        .trailers = &trailer_buf,
+    });
+    try testing.expect(rec.drained >= "HTTP/1.1 200 OK\r\n".len);
+    try testing.expectEqual(@as(usize, 0), rec.w.end);
+}
+
+fn maKaHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    if (std.mem.eql(u8, req.path, "/early")) {
+        // The head is on the wire, promising a kept-alive connection, before keep-alives go off.
+        try rw.writeAll("head-goes-out");
+        try rw.flush();
+        req.control.?.server.setKeepAlivesEnabled(false);
+        try rw.writeAll("tail");
+        return;
+    }
+    if (std.mem.eql(u8, req.path, "/late")) req.control.?.server.setKeepAlivesEnabled(false);
+    try rw.writeAll("late");
+}
+
+test "integration: keep-alives turned off while a handler runs end the connection only if the head has not gone out yet" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    for ([_]struct { path: []const u8, served: usize, closes: usize }{
+        .{ .path = "/early", .served = 2, .closes = 1 },
+        .{ .path = "/late", .served = 1, .closes = 1 },
+    }) |c| {
+        var server = init(io, testing.allocator, .{ .handler = maKaHandler, .read_timeout_ms = 20_000 });
+        defer server.deinit();
+        server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+        defer thread.join();
+        defer server.shutdown();
+        var wire_buf: [256]u8 = undefined;
+        const wire = try std.fmt.bufPrint(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\n\r\nGET /next HTTP/1.1\r\nHost: t\r\n\r\n", .{c.path});
+        var buf: [2048]u8 = undefined;
+        const got = timedExchange(io, &server, wire, &buf) catch |err|
+            return testkit.loopbackSkip("loopback exchange failed ({t})", .{err});
+        try testing.expectEqual(c.served, std.mem.count(u8, got.got, "HTTP/1.1 200 "));
+        try testing.expectEqual(c.closes, std.mem.count(u8, got.got, "Connection: close\r\n"));
+    }
+}
+
+// ── mutation run 2026-11-12, round 2 (server half): deadlines ───────────────
+
+test "mutation-a: earliestDeadlineNs is the smallest armed deadline, and 0 only when none is armed" {
+    var t: TimeoutReader = undefined;
+    const cases = [_]struct { d: u64, c: u64, p: u64, want: u64 }{
+        .{ .d = 0, .c = 0, .p = 0, .want = 0 },
+        .{ .d = 100, .c = 0, .p = 0, .want = 100 },
+        .{ .d = 0, .c = 100, .p = 0, .want = 100 },
+        .{ .d = 0, .c = 0, .p = 100, .want = 100 },
+        .{ .d = 300, .c = 200, .p = 100, .want = 100 },
+        .{ .d = 0, .c = 50, .p = 70, .want = 50 },
+        .{ .d = 70, .c = 0, .p = 50, .want = 50 },
+        .{ .d = 70, .c = 50, .p = 0, .want = 50 },
+    };
+    for (cases) |c| {
+        t.deadline_ns = c.d;
+        t.conn_deadline_ns = c.c;
+        t.phase_deadline_ns = c.p;
+        try testing.expectEqual(c.want, t.earliestDeadlineNs());
+    }
+}
+
+fn maStalledReaderTimeout(opts: Options, want: anyerror) !void {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var log: ErrorLogForTest = .{};
+    var o = opts;
+    o.handler = bigHandler;
+    o.on_error = ErrorLogForTest.record;
+    o.on_error_ctx = &log;
+    var server = init(io, testing.allocator, o);
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    const small = std.mem.toBytes(@as(c_int, 2048));
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &small) catch {};
+    var wbuf: [256]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll("GET /big HTTP/1.1\r\nHost: t\r\n\r\n");
+    try sw.interface.flush();
+    while (server.activeConnections() == 0) try sleepMs(io, 5);
+    try waitNoConns(io, &server);
+    try expectOneTimeout(&log, want);
+}
+
+test "mutation-a: a stalled reader is a ResponseTimeout under a response deadline alone, a WriteTimeout when the stall bound fires first" {
+    try maStalledReaderTimeout(.{ .handler = bigHandler, .write_timeout_ms = 0, .response_timeout_ms = 150 }, error.ResponseTimeout);
+    try maStalledReaderTimeout(.{ .handler = bigHandler, .write_timeout_ms = 150, .response_timeout_ms = 60_000 }, error.WriteTimeout);
+}
+
+test "integration: a finished write leaves no deadline behind to kill the idle connection" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = init(io, testing.allocator, .{ .handler = testHandler, .write_timeout_ms = 100, .read_timeout_ms = 20_000 });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [512]u8 = undefined;
+    var wbuf: [512]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll("GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    try sw.interface.flush();
+    // Idle for three write timeouts, then ask again on the same connection.
+    try sleepMs(io, 350);
+    try sw.interface.writeAll("GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    try sw.interface.flush();
+    var got_buf: [1024]u8 = undefined;
+    var w: Writer = .fixed(&got_buf);
+    _ = sr.interface.streamRemaining(&w) catch {};
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, w.buffered(), "HTTP/1.1 200 "));
+}
+
+fn maUpgradeIdleHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    const io: *const std.Io = @ptrCast(@alignCast(req.context.?));
+    try rw.upgrade("foo");
+    const conn = req.upgraded(rw) orelse return error.UpgradeLost;
+    // Well past every HTTP deadline of the connection, then read and write on it.
+    try sleepMs(io.*, 450);
+    const b = try conn.reader.takeByte();
+    try conn.writer.writeByte(b);
+    try conn.writer.flush();
+}
+
+test "integration: an upgraded connection is out of reach of the request and response deadlines" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var io_copy = io;
+    var server = init(io, testing.allocator, .{
+        .handler = maUpgradeIdleHandler,
+        .context = &io_copy,
+        .read_timeout_ms = 0,
+        .request_timeout_ms = 150,
+        .response_timeout_ms = 150,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [512]u8 = undefined;
+    var wbuf: [64]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll("GET /up HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: foo\r\n\r\n");
+    try sw.interface.flush();
+    // The 101 head, then one byte behind it that the handler reads long after the deadlines.
+    while (true) {
+        const line = try sr.interface.takeDelimiterInclusive('\n');
+        if (line.len <= 2) break;
+    }
+    try sw.interface.writeAll("x");
+    try sw.interface.flush();
+    try testing.expectEqual(@as(u8, 'x'), try sr.interface.takeByte());
+}
+
+test "integration: shutdownGraceful and close both stop the accept loop, so serve returns without a further shutdown" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    for ([_]bool{ true, false }) |graceful| {
+        var server = init(io, testing.allocator, .{ .handler = testHandler, .read_timeout_ms = 20_000 });
+        defer server.deinit();
+        server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+        var buf: [1024]u8 = undefined;
+        const got = timedExchange(io, &server, "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf) catch |err| {
+            server.shutdown();
+            thread.join();
+            return testkit.loopbackSkip("loopback exchange failed ({t})", .{err});
+        };
+        try testing.expect(std.mem.startsWith(u8, got.got, "HTTP/1.1 200 "));
+        if (graceful) try server.shutdownGraceful(5_000) else server.close();
+        thread.join();
+    }
+}
+
+test "mutation-a: reason phrases of the 2xx tail, and a refused Trailer advert when the header table is full" {
+    try testing.expectEqualStrings("Multi-Status", reasonPhrase(207));
+    try testing.expectEqualStrings("Already Reported", reasonPhrase(208));
+    try testing.expectEqualStrings("IM Used", reasonPhrase(226));
+
+    var out_buf: [512]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        var nb: [8]u8 = undefined;
+        const nm = std.fmt.bufPrint(&nb, "X-{d}", .{i}) catch unreachable;
+        rw.setHeader(nm, "v") catch break;
+    }
+    try testing.expect(i < 64);
+    try testing.expectError(error.TooManyTrailers, rw.declareTrailer("A"));
+    try testing.expectEqual(@as(usize, 0), rw.declared_trailers_len);
+    try testing.expect(!rw.declaredTrailer("A"));
+}
+
+/// A reader that hands over `src` and then fails (not ends) at `fail_at`.
+const MaFailAt = struct {
+    src: []const u8,
+    pos: usize = 0,
+    fail_at: usize,
+    interface: Reader,
+
+    fn init(src: []const u8, fail_at: usize, buffer: []u8) MaFailAt {
+        return .{ .src = src, .fail_at = fail_at, .interface = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 } };
+    }
+
+    fn stream(io_r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+        const c: *MaFailAt = @alignCast(@fieldParentPtr("interface", io_r));
+        if (c.pos >= c.fail_at) return error.ReadFailed;
+        if (c.pos >= c.src.len) return error.EndOfStream;
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        const n = @min(dest.len, c.fail_at - c.pos, c.src.len - c.pos);
+        @memcpy(dest[0..n], c.src[c.pos..][0..n]);
+        w.advance(n);
+        c.pos += n;
+        return n;
+    }
+};
+
+fn maGzHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    var buf: [32]u8 = undefined;
+    const n = req.reader().readSliceShort(&buf) catch |e| return rw.writeAll(@errorName(e));
+    try rw.writer().print("n={d}", .{n});
+}
+
+fn maServeGzIn(in: *Reader, out_buf: []u8) ![]const u8 {
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    var trailer_buf: [256]u8 = undefined;
+    const gunzip = try testing.allocator.create(GunzipScratch);
+    defer testing.allocator.destroy(gunzip);
+    serveStream(.{
+        .handler = maGzHandler,
+        .max_decompressed_request_bytes = 1 << 20,
+        .verify_inbound_trailer = true,
+    }, in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+        .trailers = &trailer_buf,
+        .gunzip = gunzip,
+    });
+    return out.buffered();
+}
+
+test "mutation-a: a gzip request body whose transport fails inside its header reads as failed" {
+    const head = "POST /g HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\nConnection: close\r\n\r\n";
+    const wire = head ++ "\x1f\x8b\x08\x00\x00";
+    var out_buf: [1024]u8 = undefined;
+    var in_buf: [512]u8 = undefined;
+    {
+        var src = MaFailAt.init(wire, head.len + 3, &in_buf);
+        const got = try maServeGzIn(&src.interface, &out_buf);
+        try testing.expect(std.mem.endsWith(u8, got, "ReadFailed"));
+    }
+}
+
+test "mutation-a: a response with no Content-Type is never compressed, and never crashes the gate" {
+    const scratch = try testing.allocator.create(GzipScratch);
+    defer testing.allocator.destroy(scratch);
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .compression = .{ .min_size = 4 }, .gzip_scratch = scratch, .accept_gzip = true });
+    try rw.interface.writeAll("{\"a\":\"bcdefghijk\"}");
+    try rw.end();
+    try testing.expect(std.mem.find(u8, out.buffered(), "Content-Encoding") == null);
+    try testing.expect(std.mem.endsWith(u8, out.buffered(), "{\"a\":\"bcdefghijk\"}"));
+}

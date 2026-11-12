@@ -767,3 +767,60 @@ test "mutation-a: readBody maps a failing reader to ReadFailed and an exhausted 
         try testing.expect(saw_oom);
     }
 }
+
+fn maFormCapHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const f = Form.parse(arena.allocator(), req, .{ .max_urlencoded_bytes = 4 }) catch |e| {
+        try rw.writeAll(@errorName(e));
+        return;
+    };
+    try rw.writeAll(f.postValue("a") orelse "none");
+}
+
+test "mutation-a: Form.parse refuses a request whose declared length is over the cap before reading its body" {
+    // The declared 1000 is over the cap of 4; only 3 body bytes follow. Read-first would
+    // end in the transport's failure, not in BodyTooLarge.
+    const wire = "POST /f HTTP/1.1\r\nHost: t\r\nContent-Type: application/x-www-form-urlencoded\r\n" ++
+        "Content-Length: 1000\r\nConnection: close\r\n\r\na=1";
+    var in: std.Io.Reader = .fixed(wire);
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    var trailer_buf: [256]u8 = undefined;
+    Server.serveStream(.{ .handler = maFormCapHandler }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+        .trailers = &trailer_buf,
+    });
+    try testing.expect(std.mem.endsWith(u8, out.buffered(), "BodyTooLarge"));
+}
+
+test "mutation-a: an empty urlencoded body has no pairs, and multipart without a boundary is MalformedForm" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var r: std.Io.Reader = .fixed("");
+    const f = try parseSource(a, .{
+        .method = .post,
+        .content_type = urlencoded_type,
+        .query = "",
+        .body = .{ .reader = &r },
+        .content_length = 0,
+    }, .{ .max_params = 0 });
+    try testing.expectEqual(@as(usize, 0), f.post.len);
+    try testing.expect(f.malformed);
+    var r2: std.Io.Reader = .fixed("--B--\r\n");
+    try testing.expectError(error.MalformedForm, parseSource(a, .{
+        .method = .post,
+        .content_type = "multipart/form-data",
+        .query = "",
+        .body = .{ .reader = &r2 },
+        .content_length = null,
+    }, .{}));
+}

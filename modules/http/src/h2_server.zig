@@ -8523,3 +8523,140 @@ test "wave4: dispatcher: after a worker's .close the connection task leaves at t
     // frame or two.
     try testing.expect(wave4PingAcks(fw.buf.items) < total / 2);
 }
+
+// ── mutation run 2026-11-12, round 2 (server half) ──────────────────────────
+
+/// An allocator that notes every block handed back with a non-zero byte left in it.
+const MaWipeAlloc = struct {
+    backing: Allocator,
+    dirty_frees: u32 = 0,
+    frees: u32 = 0,
+
+    fn allocator(s: *MaWipeAlloc) Allocator {
+        return .{ .ptr = s, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const s: *MaWipeAlloc = @ptrCast(@alignCast(ctx));
+        return s.backing.rawAlloc(len, a, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const s: *MaWipeAlloc = @ptrCast(@alignCast(ctx));
+        return s.backing.rawResize(memory, a, new_len, ra);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const s: *MaWipeAlloc = @ptrCast(@alignCast(ctx));
+        return s.backing.rawRemap(memory, a, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ra: usize) void {
+        const s: *MaWipeAlloc = @ptrCast(@alignCast(ctx));
+        for (memory) |b| {
+            if (b != 0) {
+                s.dirty_frees += 1;
+                break;
+            }
+        }
+        s.frees += 1;
+        s.backing.rawFree(memory, a, ra);
+    }
+};
+
+test "mutation-a: Job.consume gives back a prefix that is big enough and half the buffer, wipes what it frees, and Job.deinit wipes the body" {
+    const min = Job.reclaim_min_bytes;
+    const Case = struct { len: usize, take: usize, want_pos: usize, want_len: usize };
+    const cases = [_]Case{
+        .{ .len = 100, .take = 100, .want_pos = 0, .want_len = 0 }, // fully drained
+        .{ .len = 20000, .take = 10000, .want_pos = 10000, .want_len = 20000 }, // under the floor, exactly half
+        .{ .len = 40000, .take = min, .want_pos = min, .want_len = 40000 }, // at the floor, under half
+        .{ .len = 2 * min, .take = min, .want_pos = 0, .want_len = min }, // at the floor, exactly half
+        .{ .len = 40000, .take = 20000, .want_pos = 0, .want_len = 20000 },
+        .{ .len = 2 * min - 2, .take = min - 1, .want_pos = min - 1, .want_len = 2 * min - 2 }, // a byte under the floor
+    };
+    for (cases) |c| {
+        var wa: MaWipeAlloc = .{ .backing = testing.allocator };
+        const gpa = wa.allocator();
+        var job: Job = .{ .id = 1, .headers = .{ .fields = &.{} } };
+        try job.body.ensureTotalCapacityPrecise(gpa, c.len);
+        for (0..c.len) |i| job.body.appendAssumeCapacity(@intCast(i % 251 + 1));
+        job.consume(c.take);
+        try testing.expectEqual(c.want_pos, job.read_pos);
+        try testing.expectEqual(c.want_len, job.body.items.len);
+        const all = job.body.allocatedSlice();
+        if (c.want_pos == 0) {
+            // What is left moved to the front, in order; everything else is zero.
+            for (job.body.items, 0..) |b, i| try testing.expectEqual(@as(u8, @intCast((c.take + i) % 251 + 1)), b);
+            // The tail wipe is only visible where `shrinkRetainingCapacity` does not
+            // overwrite what it releases with `undefined` (the unsafe modes).
+            if (!std.debug.runtime_safety) {
+                for (all[c.want_len..c.len]) |b| try testing.expectEqual(@as(u8, 0), b);
+            }
+        } else {
+            for (job.body.items, 0..) |b, i| try testing.expectEqual(@as(u8, @intCast(i % 251 + 1)), b);
+        }
+        job.deinit(gpa);
+        try testing.expect(wa.frees >= 1);
+        // `Allocator.free` fills the block with `undefined` first in the safe modes.
+        if (!std.debug.runtime_safety) try testing.expectEqual(@as(u32, 0), wa.dirty_frees);
+    }
+}
+
+const MaStateRec = struct {
+    n: usize = 0,
+    states: [16]Server.ConnState = undefined,
+
+    fn hook(ctx: ?*anyopaque, _: ?std.Io.net.IpAddress, state: Server.ConnState) void {
+        const r: *MaStateRec = @ptrCast(@alignCast(ctx.?));
+        if (r.n < r.states.len) r.states[r.n] = state;
+        r.n += 1;
+    }
+};
+
+fn maCountFrames(bytes: []const u8, kind: u8) usize {
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i + 9 <= bytes.len) {
+        const len = (@as(usize, bytes[i]) << 16) | (@as(usize, bytes[i + 1]) << 8) | bytes[i + 2];
+        if (bytes[i + 3] == kind) n += 1;
+        i += 9 + len;
+    }
+    return n;
+}
+
+test "mutation-a: an h2c session reports new, active, idle, closed around each request it serves" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    _ = try peer.conn.startStream(&peer.wire, &get_fields, true);
+    var rec: MaStateRec = .{};
+    var in: Reader = .fixed(peer.wire.items);
+    var out_buf: [4096]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    serve(gpa, .{ .handler = testHandler, .on_conn_state = MaStateRec.hook, .on_conn_state_ctx = &rec }, &in, &out);
+    try testing.expectEqual(@as(usize, 4), rec.n);
+    try testing.expectEqual(Server.ConnState.new, rec.states[0]);
+    try testing.expectEqual(Server.ConnState.active, rec.states[1]);
+    try testing.expectEqual(Server.ConnState.idle, rec.states[2]);
+    try testing.expectEqual(Server.ConnState.closed, rec.states[3]);
+}
+
+test "mutation-a: a session that ends on the stream cap and a peer GOAWAY says GOAWAY once" {
+    const gpa = testing.allocator;
+    for ([_]?u32{ null, 1 }) |cap| {
+        var peer: TestPeer = .init(gpa, .{});
+        defer peer.deinit();
+        try peer.conn.sendPreface(&peer.wire);
+        _ = try peer.conn.startStream(&peer.wire, &get_fields, true);
+        try peer.conn.sendGoaway(&peer.wire, .no_error, "");
+        var in: Reader = .fixed(peer.wire.items);
+        var out_buf: [4096]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var o: Options = .{ .handler = testHandler };
+        if (cap) |c| o.limits.max_streams_per_connection = c;
+        serve(gpa, o, &in, &out);
+        try testing.expectEqual(@as(usize, 1), maCountFrames(out.buffered(), 0x7));
+    }
+}

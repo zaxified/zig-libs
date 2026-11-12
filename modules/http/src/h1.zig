@@ -2559,3 +2559,41 @@ test "mutation-a: only HTTP/1.0 and HTTP/1.1 are versions, byte by byte" {
     _ = try RequestHead.parse("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
     _ = try ResponseHead.parse("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
 }
+
+test "mutation-a: a chunk extension may have whitespace before a later semicolon, never at its end" {
+    try testing.expect(isChunkExt(""));
+    try testing.expect(isChunkExt(";a=1;b=2"));
+    try testing.expect(isChunkExt(";a=1 ;b=2"));
+    try testing.expect(isChunkExt(";a \t;b"));
+    try testing.expect(!isChunkExt(";a=1 x"));
+    try testing.expect(!isChunkExt("a=1"));
+}
+
+fn maH1FailStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    return error.ReadFailed;
+}
+
+test "mutation-a: head and chunk parsing refuse an empty or bare-LF line, and a failing transport stays ReadFailed" {
+    // An empty first line is a malformed head, never an out-of-range read.
+    try testing.expectError(error.MalformedHead, RequestHead.parse("\nGET / HTTP/1.1\r\nHost: x\r\n\r\n"));
+    // 12 or more bytes that do not start with HTTP/.
+    try testing.expectError(error.MalformedHead, ResponseHead.parse("XTTP/1.1 200 OK\r\n\r\n"));
+    // A block with no CRLF at all has nothing to unfold.
+    var blk = "abc".*;
+    unfoldObsFold(&blk);
+    try testing.expectEqualStrings("abc", &blk);
+    // A transport that fails while the head is read is ReadFailed, not a framing verdict.
+    var rb: [16]u8 = undefined;
+    var failing: std.Io.Reader = .{ .vtable = &.{ .stream = maH1FailStream }, .buffer = &rb, .seek = 0, .end = 0 };
+    var head_buf: [64]u8 = undefined;
+    try testing.expectError(error.ReadFailed, readHead(&failing, &head_buf));
+    // A chunk-size line that is a lone LF (one byte) is malformed.
+    for ([_][]const u8{ "\n", "\r\n", "5\nhello\r\n0\r\n\r\n" }) |wire| {
+        var src: std.Io.Reader = .fixed(wire);
+        var cb: [32]u8 = undefined;
+        var cr: ChunkedReader = .init(&src, &cb);
+        var sink_buf: [64]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try testing.expectError(error.ReadFailed, cr.reader.streamRemaining(&sink));
+    }
+}

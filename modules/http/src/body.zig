@@ -764,3 +764,12 @@ test "mutation-a: ParamIterator skips nameless parameters and survives a lone qu
     var it4 = ContentType.parse("text/plain; q=\"\"").?.params();
     try std.testing.expectEqualStrings("", it4.next().?.value);
 }
+
+test "mutation-a: a quoted value is stripped only when it starts and ends with a quote, and escapes compare after unescaping" {
+    var it = ContentType.parse("text/plain; q=ab\"").?.params();
+    try std.testing.expectEqualStrings("ab\"", it.next().?.value);
+    // Equal after the same skip rule applied to both would hide a wrong skip rule: these differ.
+    try std.testing.expectEqualStrings("", checkMediaType("text/plain; a=\"x;\"; a=\"y;\"").media_type);
+    try std.testing.expectEqualStrings("text/plain", checkMediaType("text/plain; a=\"x;\"; a=\"x;\"").media_type);
+    try std.testing.expectEqualStrings("", checkMediaType("text/plain; a=\"x,\"; a=\"y,\"").media_type);
+}

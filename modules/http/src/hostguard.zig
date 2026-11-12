@@ -181,3 +181,10 @@ test "HostGuard: ports of one to five digits pass, an empty name after the dot n
     try testing.expect(!odd.allows("."));
     try testing.expect(!odd.allows(".:80"));
 }
+
+test "mutation-a: splitHost refuses a bracketed value that is no IP literal, without crashing" {
+    try testing.expect(splitHost("[zz]") == null);
+    try testing.expect(splitHost("[]") == null);
+    try testing.expect(splitHost("[1.2.3.4]") == null);
+    try testing.expect(splitHost("[::1]") != null);
+}

@@ -1378,3 +1378,51 @@ test "Iterator: once the closing delimiter is consumed, next stays null" {
     try std.testing.expectEqual(@as(?Part, null), try it.next());
     try std.testing.expectEqual(@as(?Part, null), try it.next());
 }
+
+test "mutation-a: partialDelimiterSuffix holds back exactly a proper prefix of the delimiter" {
+    const b = "bnd";
+    try testing.expectEqual(@as(usize, 0), partialDelimiterSuffix("abc\rX", b));
+    try testing.expectEqual(@as(usize, 1), partialDelimiterSuffix("abc\r", b));
+    try testing.expectEqual(@as(usize, 2), partialDelimiterSuffix("abc\r\n", b));
+    try testing.expectEqual(@as(usize, 3), partialDelimiterSuffix("abc\r\n-", b));
+    try testing.expectEqual(@as(usize, 4), partialDelimiterSuffix("abc\r\n--", b));
+    try testing.expectEqual(@as(usize, 5), partialDelimiterSuffix("abc\r\n--b", b));
+    try testing.expectEqual(@as(usize, 6), partialDelimiterSuffix("abc\r\n--bn", b));
+    try testing.expectEqual(@as(usize, 0), partialDelimiterSuffix("\r\nx", b));
+    try testing.expectEqual(@as(usize, 0), partialDelimiterSuffix("abc\r\n--zz", b));
+}
+
+test "mutation-a: Reader: a body that ends right after a delimiter is MalformedBody, and the closing delimiter ends it for good" {
+    var in_buf: [64]u8 = undefined;
+    var hdr: [header_buf_len]u8 = undefined;
+    for ([_][]const u8{ db, db ++ " \t " }) |src| {
+        var chunked: ChunkedReader = .init(src, 3, &in_buf);
+        var mr = try Reader.init(&chunked.interface, test_boundary, &hdr, .{});
+        try testing.expectError(error.MalformedBody, mr.nextPart());
+    }
+    // After the closing delimiter nothing is read again: even with a part-shaped
+    // epilogue in front of the stream, the answer stays null.
+    const src = db ++ "--" ++ crlf ++ "Content-Disposition: form-data; name=\"x\"" ++ crlf ++ crlf ++ "v" ++ crlf ++ db ++ "--";
+    var chunked: ChunkedReader = .init(src, 64, &in_buf);
+    var mr = try Reader.init(&chunked.interface, test_boundary, &hdr, .{});
+    try testing.expect((try mr.nextPart()) == null);
+    chunked.interface.toss(2);
+    try testing.expect((try mr.nextPart()) == null);
+}
+
+test "mutation-a: a part's unquoted name and filename are returned as sent" {
+    const src = db ++ crlf ++
+        "Content-Disposition: form-data; name=field; filename=up.bin" ++ crlf ++ crlf ++
+        "v" ++ crlf ++ db ++ "--" ++ crlf;
+    var it = parse(mut(src), test_boundary, .{});
+    const p = (try it.next()).?;
+    try testing.expectEqualStrings("field", p.name.?);
+    try testing.expectEqualStrings("up.bin", p.filename.?);
+    var in_buf: [64]u8 = undefined;
+    var hdr: [header_buf_len]u8 = undefined;
+    var chunked: ChunkedReader = .init(src, 7, &in_buf);
+    var mr = try Reader.init(&chunked.interface, test_boundary, &hdr, .{});
+    const sp = (try mr.nextPart()).?;
+    try testing.expectEqualStrings("field", sp.name.?);
+    try testing.expectEqualStrings("up.bin", sp.filename.?);
+}
