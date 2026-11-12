@@ -823,7 +823,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                     // skip horizontal space only, so the valid `{a\n: 1}`
                     // went into error recovery (audit 2026-10-04).
                     const j = skipJson5WsAndComments(input, i);
-                    if (j >= input.len or input[j] == ':') {
+                    if (j >= input.len or input[j] == ':' or atUnterminatedComment(input, j)) {
                         // Normal path: output quoted key
                         try push(&out, alloc, '"');
                         try pushSlice(&out, alloc, input[key_start..i]);
@@ -1295,10 +1295,13 @@ fn lineTerminatorLen(input: []const u8, i: usize) usize {
 /// CR, LF, and the JSON5-only kinds (U+2028/U+2029 among them).
 /// `skipJson5Ws`, also past whole `//` and `/* */` comments: JSON5 §6 lets
 /// a comment stand wherever whitespace may, so `{a /* c */: 1}` has its colon
-/// after the comment. An unterminated `/*` stops the skip at its start (the
-/// main loop then refuses it as before). Until 2026-10-05 the key peek
-/// stopped at the comment and sent a valid key into `$err_trace` recovery
-/// (the reference JSON5 oracle).
+/// after the comment. An unterminated `/*` stops the skip at its start
+/// (`atUnterminatedComment`); the key is then emitted as is and the main
+/// loop refuses the comment, as it does after a value (`{a: 1} /* x`).
+/// Until 2026-10-05 the key peek stopped at the comment and sent a valid key
+/// into `$err_trace` recovery (the reference JSON5 oracle); until 2026-11-12
+/// an unterminated comment after a key went there too, recovered instead of
+/// refused.
 fn skipJson5WsAndComments(input: []const u8, from: usize) usize {
     var j = skipJson5Ws(input, from);
     while (j + 1 < input.len and input[j] == '/') {
@@ -1312,6 +1315,12 @@ fn skipJson5WsAndComments(input: []const u8, from: usize) usize {
         j = skipJson5Ws(input, j);
     }
     return j;
+}
+
+/// `skipJson5WsAndComments` stopped at `j` on a `/*`: it stops there only
+/// when the comment has no `*/`.
+fn atUnterminatedComment(input: []const u8, j: usize) bool {
+    return j + 1 < input.len and input[j] == '/' and input[j + 1] == '*';
 }
 
 fn skipJson5Ws(input: []const u8, from: usize) usize {
@@ -2053,7 +2062,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                     // Peek past ALL whitespace incl. \n/\r — catches keys
                     // split by a newline (`file_type_o\n  ut: ...`).
                     const j = skipJson5WsAndComments(input, i);
-                    if (j >= input.len or input[j] == ':') {
+                    if (j >= input.len or input[j] == ':' or atUnterminatedComment(input, j)) {
                         try out.append(alloc, '"');
                         try out.appendSlice(alloc, input[key_start..i]);
                         try out.append(alloc, '"');
@@ -4453,9 +4462,14 @@ test "unquoted key: a comment with `*/` right after `/*`, and an unterminated on
     const r = try preprocessAnnotated(gpa, "{a /*/ x */ : 1}");
     defer gpa.free(r.out);
     try std.testing.expect(std.mem.find(u8, r.out, "$err") == null);
-    // `{a /* x` is recovered like any other junk before the colon.
-    try msPlain("{a /* x", "$err_trace_1");
-    try msAnn("{a /* x", "$err_1");
+    // `{a /* x` is refused, as an unterminated comment after a value is:
+    // it is not junk before a colon to recover from.
+    try expectRefusedByBoth("{a /* x");
+    try expectRefusedByBoth("{a /* x\n: 1}");
+    try expectRefusedByBoth("{a: 1} /* x");
+    // A terminated comment and a `//` one still reach the colon.
+    try expectValue("{a /* x */ : 1}", "{\"a\": 1}");
+    try expectValue("{a // x\n: 1}", "{\"a\": 1}");
 }
 
 test "a key may not hold a character that ends the input half-way" {
