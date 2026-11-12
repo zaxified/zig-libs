@@ -4016,3 +4016,468 @@ test "diagnostic prefix stays short whatever runs of '_' the input holds (no-pan
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 3 + 64), parsed.value.object.count());
 }
+
+// ── survivors of the 2026-11 whole-module mutation run ──────────────────────
+// Each test below pins a guard no earlier test looked at; the comment names it.
+
+fn msHas(out: []const u8, needle: []const u8) !void {
+    std.testing.expect(std.mem.find(u8, out, needle) != null) catch |e| {
+        std.debug.print("out: {s}\nwant a substring: {s}\n", .{ out, needle });
+        return e;
+    };
+}
+
+fn msPlain(src: []const u8, needle: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const out = try preprocess(gpa, src);
+    defer gpa.free(out);
+    try msHas(out, needle);
+}
+
+fn msAnn(src: []const u8, needle: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const r = try preprocessAnnotated(gpa, src);
+    defer gpa.free(r.out);
+    try msHas(r.out, needle);
+}
+
+/// The document is taken by the single-pass reader (and read the same).
+fn msTaken(src: []const u8, opts: ParseOptions) !void {
+    const gpa = std.testing.allocator;
+    const before = directTaken();
+    const p = try parseFromSlice(std.json.Value, gpa, src, opts);
+    p.deinit();
+    try std.testing.expectEqual(before + 1, directTaken());
+}
+
+fn msRefusedValue(src: []const u8) !void {
+    const gpa = std.testing.allocator;
+    if (parseFromSlice(std.json.Value, gpa, src, .{})) |p| {
+        p.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "SourceMap.record and sourceOffset: every branch of the point list" {
+    const gpa = std.testing.allocator;
+    var m: SourceMap = .{};
+    defer m.deinit(gpa);
+    try m.record(gpa, 0, 0);
+    try m.record(gpa, 0, 5); // nothing emitted since: the later token owns offset 0
+    try std.testing.expectEqual(@as(usize, 1), m.points.items.len);
+    try std.testing.expectEqual(@as(usize, 5), m.points.items[0].src);
+    try m.record(gpa, 2, 10);
+    try m.record(gpa, 5, 15);
+    try m.record(gpa, 3, 20); // output past 3 was taken back: (5, 15) goes, (2, 10) stays
+    try std.testing.expectEqual(@as(usize, 3), m.points.items.len);
+    try std.testing.expectEqual(@as(usize, 2), m.points.items[1].out);
+    try std.testing.expectEqual(@as(usize, 10), m.points.items[1].src);
+    try std.testing.expectEqual(@as(usize, 3), m.points.items[2].out);
+    try std.testing.expectEqual(@as(usize, 20), m.points.items[2].src);
+    try std.testing.expectEqual(@as(usize, 10), m.sourceOffset(2));
+    try std.testing.expectEqual(@as(usize, 22), m.sourceOffset(5)); // past the last point: verbatim
+
+    // An empty map is the identity.
+    var e: SourceMap = .{};
+    try std.testing.expectEqual(@as(usize, 7), e.sourceOffset(7));
+
+    // Before the first point: that point's source.
+    var f: SourceMap = .{};
+    defer f.deinit(gpa);
+    try f.points.append(gpa, .{ .out = 5, .src = 100 });
+    try std.testing.expectEqual(@as(usize, 100), f.sourceOffset(2));
+
+    // A rewritten token's output may be longer than its source: never past
+    // the next token's start minus one.
+    var g: SourceMap = .{};
+    defer g.deinit(gpa);
+    try g.points.append(gpa, .{ .out = 0, .src = 0 });
+    try g.points.append(gpa, .{ .out = 5, .src = 3 });
+    try std.testing.expectEqual(@as(usize, 2), g.sourceOffset(4));
+    try std.testing.expectEqual(@as(usize, 3), g.sourceOffset(5));
+}
+
+test "source map: a run of whitespace costs one point, not one per byte" {
+    const gpa = std.testing.allocator;
+    var m: SourceMap = .{};
+    defer m.deinit(gpa);
+    const out = try preprocessWithOptions(gpa, "[" ++ strRepeat(" ", 200) ++ "1]", .{ .source_map = &m });
+    defer gpa.free(out);
+    try std.testing.expect(m.points.items.len < 10);
+}
+
+test "parseFromSlice: opts.diagnostic wins over the one in json5 options, and a std.json error has no length" {
+    const gpa = std.testing.allocator;
+    var d1: Diagnostic = .{};
+    var d2: Diagnostic = .{};
+    if (parseFromSlice(std.json.Value, gpa, "[1,,]", .{ .diagnostic = &d1, .json5 = .{ .diagnostic = &d2 } })) |p| {
+        p.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expect(d1.message.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), d1.len);
+    try std.testing.expectEqual(@as(usize, 0), d2.message.len);
+}
+
+test "single-pass reader: takes whitespace after an opener, and a value of exactly max_value_len" {
+    try msTaken("[ ]", .{});
+    try msTaken("{ }", .{});
+    var o: ParseOptions = .{};
+    o.json.max_value_len = 5;
+    try msTaken("[12345]", o);
+    try msTaken("['abcde']", o);
+    try msTaken("{abcde: 1}", o);
+}
+
+test "single-pass reader: what it must not accept" {
+    // A raw CR is no string content (the reader had LF only in view).
+    try msRefusedValue("\"a\rb\"");
+    try msRefusedValue("'a\rb'");
+    // A backslash at the very end, `\0` at the very end.
+    try msRefusedValue("\"abc\\");
+    try msRefusedValue("'abc\\");
+    try msRefusedValue("\"\\0");
+    // Every lone surrogate, at the edges of the range.
+    try msRefusedValue("\"\\uD800\"");
+    try msRefusedValue("\"\\uDBFF\"");
+    try msRefusedValue("\"\\uDC00\"");
+    try msRefusedValue("\"\\uDFFF\"");
+    // ... and the code points next to it are ordinary.
+    const gpa = std.testing.allocator;
+    const p = try parseFromSlice(std.json.Value, gpa, "\"\\uD7FF\\uE000\"", .{});
+    defer p.deinit();
+    try std.testing.expectEqualStrings("\u{D7FF}\u{E000}", p.value.string);
+}
+
+test "isJsonNumber is RFC 8259's number, whatever emitNumber hands it" {
+    const ok = [_][]const u8{ "0", "-0", "7", "10", "-12", "1.5", "0.25", "1e5", "1E5", "1e+5", "1e-5", "-1.5E-5", "12e0" };
+    for (ok) |s| try std.testing.expect(isJsonNumber(s));
+    const bad = [_][]const u8{ "", "-", "+1", ".5", "1.", "01", "1e", "1e+", "1.e5", "1e5.", "0x10", "Infinity", "1.5.5", "--1", "1 ", " 1" };
+    for (bad) |s| {
+        std.testing.expect(!isJsonNumber(s)) catch |e| {
+            std.debug.print("isJsonNumber accepted {s}\n", .{s});
+            return e;
+        };
+    }
+}
+
+test "LineCounter and lineOf: forward, backward, and past the end" {
+    const s = "a\nb\nc\n";
+    var lc: LineCounter = .{};
+    try std.testing.expectEqual(@as(usize, 1), lc.at(s, 0));
+    try std.testing.expectEqual(@as(usize, 2), lc.at(s, 2));
+    try std.testing.expectEqual(@as(usize, 3), lc.at(s, 4));
+    try std.testing.expectEqual(@as(usize, 4), lc.at(s, 99)); // clamped to the end
+    try std.testing.expectEqual(@as(usize, 2), lc.at(s, 3)); // backwards: rescanned from byte 0
+    try std.testing.expectEqual(@as(usize, 1), lineOf(s, 0));
+    try std.testing.expectEqual(@as(usize, 3), lineOf(s, 5));
+    try std.testing.expectEqual(@as(usize, 4), lineOf(s, 99));
+}
+
+test "lineTerminatorLen and skipJson5WsAndComments never read past the end" {
+    try std.testing.expectEqual(@as(usize, 0), lineTerminatorLen("ab", 2));
+    try std.testing.expectEqual(@as(usize, 1), lineTerminatorLen("a\r", 1));
+    try std.testing.expectEqual(@as(usize, 2), lineTerminatorLen("a\r\nb", 1));
+    try std.testing.expectEqual(@as(usize, 3), lineTerminatorLen("\u{2028}", 0));
+    try std.testing.expectEqual(@as(usize, 0), skipJson5WsAndComments("/", 0));
+    try std.testing.expectEqual(@as(usize, 0), skipJson5WsAndComments("/x", 0));
+}
+
+test "needsLeadingComma: after a value yes, after an opener, a comma or a colon no" {
+    const cases = [_]struct { []const u8, bool }{
+        .{ "", false },
+        .{ "  ", false },
+        .{ "{", false },
+        .{ "{ ", false },
+        .{ "[\t", false },
+        .{ "a,\n", false },
+        .{ "a:\r", false },
+        .{ "a: ", false },
+        .{ "1", true },
+        .{ "\"x\" ", true },
+        .{ "}\n\t", true },
+    };
+    for (cases) |c| try std.testing.expectEqual(c[1], needsLeadingComma(c[0]));
+}
+
+test "diagnosticPrefix: a run as long as the bound, a run at the end of the input, collisions" {
+    const gpa = std.testing.allocator;
+    // len 13: the bound is √26 + 2 = 7, and the run of 7 is not recorded.
+    const a = try diagnosticPrefix(gpa, "$err_" ++ "_______" ++ "1", "$err_");
+    defer gpa.free(a);
+    try std.testing.expectEqualStrings("$err_", a);
+    // The run ends with the input: no digit follows, nothing to read.
+    const b = try diagnosticPrefix(gpa, "x$err__", "$err_");
+    defer gpa.free(b);
+    try std.testing.expectEqualStrings("$err_", b);
+    // Runs 0 and 1 are taken by the input's own keys: two underscores more.
+    const c = try diagnosticPrefix(gpa, "$err_1 $err__2", "$err_");
+    defer gpa.free(c);
+    try std.testing.expectEqualStrings("$err___", c);
+}
+
+test "identUnitLen: which escapes and which bytes are identifier parts" {
+    const eq = std.testing.expectEqual;
+    // Escapes that spell JSON5 whitespace, a line terminator or a surrogate half.
+    const refused = [_][]const u8{
+        "\\u00a0", "\\ufeff", "\\u1680", "\\u2000", "\\u200a", "\\u2028", "\\u2029",
+        "\\u202f", "\\u205f", "\\u3000", "\\ud800", "\\udbff", "\\udc00", "\\udfff",
+    };
+    for (refused) |s| try eq(@as(usize, 0), identUnitLen(s, 0, true));
+    // The code points next to every edge of those ranges.
+    const taken = [_][]const u8{
+        "\\u0080", "\\u00a1", "\\u167f", "\\u1fff", "\\u200b", "\\u2027", "\\u202e",
+        "\\u2030", "\\u205e", "\\u3001", "\\ud7ff", "\\ue000", "\\ufefe",
+    };
+    for (taken) |s| try eq(@as(usize, 6), identUnitLen(s, 0, true));
+    // ASCII spelled as an escape follows the ASCII rules.
+    try eq(@as(usize, 6), identUnitLen("\\u005f", 0, true));
+    try eq(@as(usize, 6), identUnitLen("\\u0024", 0, true));
+    try eq(@as(usize, 0), identUnitLen("\\u0031", 0, true));
+    try eq(@as(usize, 6), identUnitLen("\\u0031", 0, false));
+    // Only `\u` is an escape.
+    try eq(@as(usize, 0), identUnitLen("\\U0041", 0, true));
+    // A multi-byte character that ends the input, a lead byte, a bad sequence.
+    try eq(@as(usize, 2), identUnitLen("é", 0, true));
+    try eq(@as(usize, 0), identUnitLen("\xff", 0, true));
+    try eq(@as(usize, 0), identUnitLen("\xc3\x28", 0, true));
+    try std.testing.expect(isIdentByte('_') and isIdentByte('$') and isIdentByte('7') and isIdentByte('Z'));
+    try std.testing.expect(!isIdentByte('-') and !isIdentByte('.') and !isIdentByte(' '));
+}
+
+test "a key position left behind by a closer, a colon or a string does not turn later bytes into keys" {
+    // After `}`, `[`, `]`, `:` the next token is not a key.
+    try expectRewrite("{} x", "{} x");
+    try expectRewrite("{[x]: 1}", "{[x]: 1}");
+    try expectRewrite("{]x}", "{]x}");
+    try expectRewrite("{: 1}", "{: 1}");
+    // After a quoted key the next token is a colon; `b` is not another key.
+    const gpa = std.testing.allocator;
+    const dq = try preprocess(gpa, "{\"a\" b: 1}");
+    defer gpa.free(dq);
+    try std.testing.expectEqualStrings("{\"a\" b: 1}", dq);
+    const sq = try preprocess(gpa, "{'a' b: 1}");
+    defer gpa.free(sq);
+    try std.testing.expectEqualStrings("{\"a\" b: 1}", sq);
+    try msAnn("{\"a\" b: 1}", "missing comma before 'b'");
+    try msAnn("{'a' b: 1}", "missing comma before 'b'");
+}
+
+test "lone and doubled commas stay where they are" {
+    try expectRewrite(",]", ",]");
+    try expectRewrite("[1,,]", "[1,,]");
+    try expectRefusedByBoth("[\t,]");
+    try expectRefusedByBoth("[\r,]");
+}
+
+test "a recovered document keeps its trailing comma out" {
+    // `{a b: 1,` is cut off inside an object that recovery already opened.
+    const gpa = std.testing.allocator;
+    const plain = try preprocess(gpa, "{a b: 1,");
+    defer gpa.free(plain);
+    try std.testing.expect(jsonParses(gpa, plain));
+    const ann = try preprocessAnnotated(gpa, "{a b: 1,");
+    defer gpa.free(ann.out);
+    try std.testing.expect(jsonParses(gpa, ann.out));
+}
+
+test "recovery messages: line, trimmed fragments and the counter, plain entry point" {
+    try msPlain("{\n\n a b: 1 }", "a b: '1' --> malformed key at line 3");
+    try msPlain("{\n a b }", "a b --> missing colon after key at line 2");
+    // The value is trimmed of every kind of whitespace.
+    try msPlain("{a b: 1 }", "a b: '1' --> malformed key at line 1");
+    try msPlain("{a b: 1\t}", "a b: '1' --> malformed key at line 1");
+    try msPlain("{a b: 1\r}", "a b: '1' --> malformed key at line 1");
+    try msPlain("{a b: 1\n}", "a b: '1' --> malformed key at line 1");
+    // A key the module cannot spell.
+    try msPlain("{@a: 1, b: 2}", "\"$err_trace_1\": \"'@a: 1' --> key is not an identifier this module accepts, at line 1\"");
+    try msPlain("{@a}", "'@a' --> key is not an identifier");
+    // The colon after a comment is looked for after the comment.
+    try msPlain("{a /* : */ b: 1}", "a /* : */ b: '1' --> malformed key at line 1");
+    try msPlain("{a /* , */ b}", "a /* , */ b --> missing colon after key");
+}
+
+test "recovery messages: the same through the annotated entry point" {
+    try msAnn("{a b: 1 }", "a b: '1' --> malformed key (whitespace in key) at line 1");
+    try msAnn("{a\rb: 1}", "(newline in key)");
+    try msAnn("{@a: 1, b: 2}", "\"$err_1\": \"'@a: 1' --> key is not an identifier this module accepts, at line 1\"");
+    try msAnn("{@a}", "'@a' --> key is not an identifier");
+    try msAnn("{a /* : */ b: 1}", "a /* : */ b: '1' --> malformed key");
+    try msAnn("{a /* , */ b}", "a b --> missing colon after key at line 1");
+    // A long tail is capped like a long key.
+    try msAnn("{a " ++ strRepeat("b", 40) ++ "}", "a " ++ strRepeat("b", 30) ++ " --> missing colon after key at line 1");
+    try msAnn("{a: " ++ strRepeat("x", 40) ++ "}", "'" ++ strRepeat("x", 30) ++ "' --> invalid literal");
+    // An identifier is letters, digits and `_`, then optional whitespace before `:`.
+    try msAnn("{a: foo_bar}", "'foo_bar' --> invalid literal");
+    try msAnn("{a: foo1}", "'foo1' --> invalid literal");
+    try msAnn("{a: 1 b : 2}", "missing comma before 'b'");
+    try msAnn("{a: 1,\n b: 2\n c: 3}", "\"$err_1\": \"missing comma before 'c' at line 3\"");
+}
+
+test "findKeyColon stops at `}` and `]`, and steps over both kinds of string" {
+    for ([_][]const u8{ "{a b} : 1", "{a b] : 1}" }) |src| {
+        try msPlain(src, "missing colon after key");
+        try msAnn(src, "missing colon after key");
+    }
+    try msPlain("{a b 'x:y' c: 1}", "'x:y' c: '1'");
+    try msAnn("{a b 'x:y' c: 1}", "'x:y' c: '1'");
+    try msPlain("{a b \"x:y\" c: 1}", "malformed key");
+    try msAnn("{a b \"x:y\" c: 1}", "malformed key");
+}
+
+test "error recovery: a comma or a bracket inside the skipped value" {
+    try expectSiblingsSurvive("{a b: \"x,y\", c: 1}", &.{.{ "c", 1 }});
+    try expectSiblingsSurvive("{a b: 'x,y', c: 1}", &.{.{ "c", 1 }});
+    try expectSiblingsSurvive("{a b: [1, 2], c: 3}", &.{.{ "c", 3 }});
+    // The siblings survive a value cut in the middle too (the rest is recovered
+    // as junk), so the message is what shows the value was skipped whole.
+    try msPlain("{a b: \"x,y\", c: 1}", "a b: '\\\"x,y\\\"' --> malformed key at line 1");
+    try msPlain("{a b: 'x,y', c: 1}", "a b: ''x,y'' --> malformed key at line 1");
+    try msAnn("{a b: \"x,y\", c: 1}", "a b: '\\\"x,y\\\"' --> malformed key (whitespace in key) at line 1");
+    try msAnn("{a b: [1, 2], c: 3}", "a b: '[1, 2]' --> malformed key (whitespace in key) at line 1");
+    // The key is trimmed of the whitespace before its colon.
+    try msPlain("{a b : 1}", "a b: '1' --> malformed key");
+    try msAnn("{a b : 1}", "a b: '1' --> malformed key");
+}
+
+test "recovery messages never carry a raw control byte" {
+    const gpa = std.testing.allocator;
+    const inputs = [_][]const u8{
+        "{a b: 1\r2}", "{a b: \x00}", "{a b: \x08}", "{a b: \x0b}", "{a b: \x0e}", "{a b: \x1f}",
+    };
+    for (inputs) |in| {
+        const plain = try preprocess(gpa, in);
+        defer gpa.free(plain);
+        try std.testing.expect(jsonParses(gpa, plain));
+        const ann = try preprocessAnnotated(gpa, in);
+        defer gpa.free(ann.out);
+        try std.testing.expect(jsonParses(gpa, ann.out));
+    }
+}
+
+test "annotated: an unterminated string in an object is recovered, wherever it ends" {
+    const gpa = std.testing.allocator;
+    // The line of the message is the line the string STARTED on, even across
+    // a line continuation (the string below spans two lines).
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "{a: \"x\\\ny\nz, b: 1}", .want = "unterminated string at line 1" },
+        .{ .src = "{a: 'x\\\ny\nz, b: 1}", .want = "unterminated string at line 1" },
+        .{ .src = "{a: \"x\\\ny", .want = "unterminated string at end of input (line 1)" },
+        .{ .src = "{a: 'x\\\ny", .want = "unterminated string at end of input (line 1)" },
+        // CR and LF each end it, in both kinds of string; the rest of the value is skipped.
+        .{ .src = "{a: \"x\ry, b: 1}", .want = "unterminated string at line 1" },
+        .{ .src = "{a: 'x\ny, b: 1}", .want = "unterminated string at line 1" },
+        .{ .src = "{a: 'x\ry, b: 1}", .want = "unterminated string at line 1" },
+        .{ .src = "{a: 'x", .want = "unterminated string at end of input (line 1)" },
+    };
+    for (cases) |c| {
+        const r = try preprocessAnnotated(gpa, c.src);
+        defer gpa.free(r.out);
+        try std.testing.expect(jsonParses(gpa, r.out));
+        try msHas(r.out, c.want);
+    }
+    // The skipped value does not take the next member with it.
+    for ([_][]const u8{ "{a: \"x\ny, b: 1}", "{a: 'x\ny, b: 1}" }) |src| {
+        const r = try preprocessAnnotated(gpa, src);
+        defer gpa.free(r.out);
+        const p = try std.json.parseFromSlice(std.json.Value, gpa, r.out, .{});
+        defer p.deinit();
+        try std.testing.expectEqual(@as(i64, 1), p.value.object.get("b").?.integer);
+    }
+    // Outside an object nothing is recovered: refused, as in `preprocess`.
+    try expectRefusedByBoth("'a\nb'");
+    try expectRefusedByBoth("'a\rb'");
+    try expectRefusedByBoth("\"a\rb\"");
+    try expectRefusedByBoth("\"x\\");
+    try expectRefusedByBoth("'x\\");
+}
+
+test "annotated: queued value errors are flushed at the comma, before a missing comma, and dropped by a closing bracket" {
+    const gpa = std.testing.allocator;
+    const r = try preprocessAnnotated(gpa, "{a: foo, b: 1}");
+    defer gpa.free(r.out);
+    const p = try std.json.parseFromSlice(std.json.Value, gpa, r.out, .{});
+    defer p.deinit();
+    const keys = p.value.object.keys();
+    try std.testing.expectEqual(@as(usize, 3), keys.len);
+    try std.testing.expectEqualStrings("a", keys[0]);
+    try std.testing.expectEqualStrings("$err_1", keys[1]);
+    try std.testing.expectEqualStrings("b", keys[2]);
+    // The error of `foo` comes out before the one for the missing comma.
+    const q = try preprocessAnnotated(gpa, "{a: foo b: 1}");
+    defer gpa.free(q.out);
+    const pq = try std.json.parseFromSlice(std.json.Value, gpa, q.out, .{});
+    defer pq.deinit();
+    try msHas(pq.value.object.get("$err_1").?.string, "invalid literal");
+    try msHas(pq.value.object.get("$err_2").?.string, "missing comma");
+    // A `]` throws away what was queued before the array opened.
+    const s = try preprocessAnnotated(gpa, "{a: foo [1], b: 2}");
+    defer gpa.free(s.out);
+    try std.testing.expect(std.mem.find(u8, s.out, "invalid literal") == null);
+    // `NaN` is a keyword like `Infinity` (passed through, std.json refuses it).
+    const n = try preprocessAnnotated(gpa, "{a: NaN}");
+    defer gpa.free(n.out);
+    try std.testing.expectEqualStrings("{\"a\": NaN}", n.out);
+    // A missing comma outside an object is not recovered.
+    const t = try preprocessAnnotated(gpa, "[1 b: 2]");
+    defer gpa.free(t.out);
+    try std.testing.expect(std.mem.find(u8, t.out, "$err") == null);
+}
+
+test "annotated: allocation failure at the first queued error of each kind of string" {
+    for ([_][]const u8{ "{a: \"y\n, c: 1}", "{a: 'x" }) |in| {
+        try failEveryAllocation(annotatedAndFree, in);
+    }
+}
+
+test "an unterminated block comment comes out as it went in, last byte once" {
+    try expectRewrite("{a: 1 /*cZ", "{\"a\": 1 /*cZ");
+}
+
+test "numbers glued to identifier characters stay whole, and a dropped + still separates" {
+    try expectRewrite("[1_.5]", "[1_.5]");
+    try expectRewrite("[1$.5]", "[1$.5]");
+    try expectRewrite("[1a.5]", "[1a.5]");
+    try expectRewrite("[0x1g.5]", "[0x1g.5]");
+    try expectRewrite("[Infinity_]", "[Infinity_]");
+    try expectRewrite("[Infinity$]", "[Infinity$]");
+    try expectRefusedByBoth("[1+.5]");
+    // An exponent without digits is not one; what follows is its own number.
+    try expectRewrite("[1e+.5]", "[1e 0.5]");
+}
+
+test "unquoted key: a comment with `*/` right after `/*`, and an unterminated one" {
+    try expectValue("{a /*/ x */ : 1}", "{\"a\": 1}");
+    try msAnn("{a /*/ x */ : 1}", "\"a\"");
+    const gpa = std.testing.allocator;
+    const r = try preprocessAnnotated(gpa, "{a /*/ x */ : 1}");
+    defer gpa.free(r.out);
+    try std.testing.expect(std.mem.find(u8, r.out, "$err") == null);
+    // `{a /* x` is recovered like any other junk before the colon.
+    try msPlain("{a /* x", "$err_trace_1");
+    try msAnn("{a /* x", "$err_1");
+}
+
+test "a key may not hold a character that ends the input half-way" {
+    // `{é` ends in a complete character: the key is read, the document refused.
+    try expectRefusedByBoth("{é");
+}
+
+test "strings: escapes whose text is pinned, in both entry points" {
+    try expectRewrite("'\\/'", "\"\\/\"");
+    try expectRewrite("'\\0", "\"\\u0000");
+    try expectRewrite("'\\x4", "\"\\x4");
+    try expectRewrite("'\\xG1'", "\"\\xG1\"");
+    try expectRewrite("'\\x1G'", "\"\\x1G\"");
+    try expectRewrite("'\\x4A\\xE9'", "\"\\u004a\\u00e9\"");
+    // A space in a string is a space (the annotated entry point sends each byte through appendStringByte).
+    try expectRewrite("['a b']", "[\"a b\"]");
+}
+
+test "strings past one vector: a control byte inside the first vector" {
+    const gpa = std.testing.allocator;
+    const pad: [40]u8 = @splat('p');
+    const out = try preprocess(gpa, "'\x1f" ++ pad ++ "'");
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("\"\\u001f" ++ pad ++ "\"", out);
+}

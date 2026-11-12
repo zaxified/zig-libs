@@ -624,3 +624,49 @@ test "write: structs, optionals, enums, slices, tuples, unions" {
     defer testing.allocator.free(val);
     try testing.expectEqualStrings("\"q\"", val);
 }
+
+// ── survivors of the 2026-11 whole-module mutation run ──────────────────────
+
+fn parseAndRender(json: []const u8, opts: Options) ![]u8 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    return render(parsed.value, opts);
+}
+
+test "bare keys: the edge letters and digits of each range" {
+    const got = try parseAndRender("{\"z\":1,\"A\":2,\"Z\":3,\"a0\":4,\"a9\":5,\"$\":6,\"_\":7,\"a{\":8}", .{});
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("{z:1,A:2,Z:3,a0:4,a9:5,$:6,_:7,'a{':8}", got);
+}
+
+test "indent 1: the space after `key:` is written" {
+    const got = try parseAndRender("{\"a\":1}", .{ .indent = 1 });
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("{\n a: 1,\n}", got);
+}
+
+test "a NUL is `\\x00` before every digit and `\\0` before anything else" {
+    const got = try parseAndRender("\"\\u00000|\\u00009|\\u0000/|\\u0000:\"", .{});
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("'\\x000|\\x009|\\0/|\\0:'", got);
+}
+
+test "a truncated U+2028 at the end of a string is written as the bytes it is" {
+    const got = try renderAny(@as([]const u8, "x\xe2\x80"), .{});
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("'x\xe2\x80'", got);
+}
+
+test "a comptime float and the two kinds of enum" {
+    const f = try renderAny(1.5, .{});
+    defer testing.allocator.free(f);
+    try testing.expectEqualStrings("1.5", f);
+    const E = enum(u8) { a = 1, b = 2, _ };
+    const named = try renderAny(E.a, .{});
+    defer testing.allocator.free(named);
+    try testing.expectEqualStrings("'a'", named);
+    // A value the enum has no name for is its integer.
+    const unnamed = try renderAny(@as(E, @fromBackingInt(@intCast(9))), .{});
+    defer testing.allocator.free(unnamed);
+    try testing.expectEqualStrings("9", unnamed);
+}
