@@ -11826,12 +11826,13 @@ test "mutation-a: an absolute-form target whose authority is not a host is a 400
         const got = maServe(maEchoPath, wire, &out_buf);
         try testing.expectEqualStrings("HTTP/1.1 400 Bad Request", maFirstLine(got));
     }
+    // Each answer is checked before the next serve reuses `out_buf`.
     const ok = maServe(maEchoPath, "GET http://x/x HTTP/1.1\r\nHost: x\r\n\r\n", &out_buf);
+    try testing.expectEqualStrings("HTTP/1.1 200 OK", maFirstLine(ok));
+    try testing.expect(std.mem.endsWith(u8, ok, "path=/x"));
     // A Host that disagrees with the authority is refused (RFC 9112 section 3.3).
     const clash = maServe(maEchoPath, "GET http://h/x HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
     try testing.expectEqualStrings("HTTP/1.1 400 Bad Request", maFirstLine(clash));
-    try testing.expectEqualStrings("HTTP/1.1 200 OK", maFirstLine(ok));
-    try testing.expect(std.mem.endsWith(u8, ok, "path=/x"));
 }
 
 test "mutation-a: the asterisk-form target reaches the handler untouched" {
