@@ -1283,3 +1283,39 @@ test "wave 4: a spent reader record is dropped on rebase, an unread one is a bou
     try testing.expectError(error.ReadFailed, Connection.readerRebase(&c.app_in, 1));
     try testing.expectEqual(@as(usize, 10), c.app_in.buffer.len);
 }
+
+test "wave 5: keyUpdate into an output that cannot hold it even empty is OutputFull" {
+    const r = try IdleRig.create();
+    defer testing.allocator.destroy(r);
+    defer r.c.deinit();
+    const c = &r.c;
+    c.server.state = .connected;
+    // Room for no record at all (a KeyUpdate record is 22 octets): the first
+    // attempt leaves it queued, the drain has nothing to send, the second
+    // attempt leaves it queued again.
+    c.server.out.buf = r.out_buf[0..8];
+    try testing.expectError(error.OutputFull, c.keyUpdate(.update_not_requested));
+    try testing.expectEqual(@as(usize, 0), c.server.pendingOutput().len);
+}
+
+test "wave 5: writeAll seals what writer() holds before its own data" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const g = try GuardRig.create(gpa);
+    defer g.destroy();
+    var got: [3]u8 = undefined;
+    var peer: GuardRig.Peer = .{ .rig = g, .mode = .read_then_send, .got = &got };
+    var peer_thread: GuardRig.Joined = .{ .t = try std.Thread.spawn(.{}, GuardRig.Peer.run, .{&peer}) };
+    defer peer_thread.join();
+    errdefer g.shutdown();
+    try g.conn.handshake();
+    // "XY" waits in the writer's open record; `writeAll` must seal it first.
+    try g.conn.writer().writeAll("XY");
+    try g.conn.writeAll("Z");
+    try testing.expectEqualStrings("a", (try g.conn.read()).?);
+    try g.conn.close();
+    try testing.expectEqual(null, try g.conn.read());
+    peer_thread.join();
+    try testing.expectEqual(null, peer.err);
+    try testing.expectEqualStrings("XYZ", &got);
+}

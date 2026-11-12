@@ -928,3 +928,16 @@ test "wave 4: an EC key of another curve than the certificate's is a KeyMismatch
     // P-384's OID (1.3.132.0.34) against a P-256 certificate.
     try testing.expectError(error.KeyMismatch, ecMatches(E, &.{ 0x2b, 0x81, 0x04, 0x00, 0x22 }, &sk, spki));
 }
+
+test "wave 5: an EC leaf without named-curve parameters is a KeyMismatch, not a malformed certificate" {
+    const certs = @import("test_certs.zig");
+    const E = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const sk = try E.SecretKey.fromBytes(certs.p256_scalar);
+    // SubjectPublicKeyInfo { { id-ecPublicKey }, BIT STRING 04 01 }: the
+    // algorithm is EC but there is no curve to compare (and the point is junk).
+    const der = "\x30\x10\x30\x09\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x03\x03\x00\x04\x01";
+    const spki = try x509.parseSpki(der);
+    try testing.expect(spki.algorithmIs(&x509.safe.oid_ec_public_key));
+    try testing.expect(spki.namedCurveOid() == null);
+    try testing.expectError(error.KeyMismatch, ecMatches(E, &x509.safe.oid_prime256v1, &sk, spki));
+}

@@ -9009,3 +9009,77 @@ test "wave 4: a ticket carries the early_data extension only when early data has
     try testing.expectEqual(n_none, try w4TicketBytes(zero));
     try testing.expect(try w4TicketBytes(some) > n_none);
 }
+
+test "wave 5: a Certificate that does not fit the output is OutputFull at every size, never internal_error" {
+    // Sizes from the ServerHello alone upward: somewhere in the climb the
+    // output holds the EncryptedExtensions but not the Certificate that
+    // follows, and `certificateMessage`'s BufferTooSmall is OutputFull there.
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    var failed: usize = 0;
+    var out_len: usize = 64;
+    while (out_len <= 8192) : (out_len += 16) {
+        const r = try w3Feed(&cfg, .{}, out_len);
+        defer w3Done(r);
+        if (r.err == null) break;
+        try testing.expectEqual(@as(?Error, error.OutputFull), r.err);
+        failed += 1;
+    } else return error.NeverFit;
+    try testing.expect(failed > 10);
+}
+
+test "wave 5: a certificate chain that bypassed check is internal_error at the ClientHello, not OutputFull" {
+    // The ClientHello step runs `check` on the key it picked, so
+    // `certificateMessage`'s FieldTooLong and InvalidStaples are unreachable
+    // (the mapping to InternalError there is defensive; the mutant that
+    // maps them to OutputFull is equivalent). An empty chain, which `check`
+    // refuses, fails here instead, as the server's own fault.
+    var prng = std.Random.DefaultPrng.init(1);
+    var ck = testKey().*;
+    ck.chain = &.{};
+    const cfg: Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+    const r = try w3Feed(&cfg, .{}, 32 * 1024);
+    defer w3Done(r);
+    try testing.expectEqual(@as(?Error, error.InternalError), r.err);
+}
+
+/// Two steps run under `burn.handshake_burn`: the offloaded signature
+/// finishing the flight (Finished, the application secrets) and the blob
+/// seal. ReleaseFast only; a build without the burn leaves the keys in the
+/// dead stack below the call.
+const wave5_sp = @import("testkit").stackprobe;
+const Wave5Probe = wave5_sp.Probe(.{ .window = 320 * 1024, .repeats = 1 });
+
+test "STACKPROBE: wave 5 — no secret residue after provideSignature" {
+    try wave5_sp.skipUnlessOptimized();
+    const off: CertifiedKey = .{ .chain = &test_chain, .key = null, .offload = .{ .schemes = &.{0x0403} } };
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = &off }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const rec = try buildRecord(testing.allocator, .{});
+    defer testing.allocator.free(rec);
+    try testing.expect((try s.feed(rec)).event == .signature_needed);
+    var buf: [certverify.max_signature_len]u8 = undefined;
+    const sig = try certverify.signContent(.ecdsa_secp256r1_sha256, testKey().key.?, s.signatureRequest().?.message, null, &buf);
+    // The steps past the burn (the transcript, the record layer) leave public
+    // data, which reaches below the burn's 16 KiB: needles only.
+    _ = try Wave5Probe.run("provideSignature", Server.provideSignature, .{ &s, sig }, &[_][]const u8{
+        s.client_handshake_secret[0..32], s.client_application_secret[0..32], s.server_application_secret[0..32], s.exporter_master_secret[0..32],
+    }, .{ .residue = false });
+    try testing.expect(s.state == .client_finished);
+}
+
+test "STACKPROBE: wave 5 — no secret residue after serialize" {
+    try wave5_sp.skipUnlessOptimized();
+    const p = try createPeerWith(.{ .extract = true });
+    defer p.destroy();
+    // `serialize` wipes the live ones: the needles are copies.
+    var secrets: [3][32]u8 = .{ p.s.client_application_secret[0..32].*, p.s.server_application_secret[0..32].*, p.s.exporter_master_secret[0..32].* };
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&secrets));
+    var blob: [8192]u8 = undefined;
+    const key: [32]u8 = @splat(7);
+    _ = try Wave5Probe.run("serialize", Server.serialize, .{ &p.s, &blob, &key, "" }, &[_][]const u8{ &secrets[0], &secrets[1], &secrets[2] }, .{});
+}
