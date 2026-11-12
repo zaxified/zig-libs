@@ -3824,6 +3824,24 @@ test "Manager.iterate: RamcacheStore cannot enumerate" {
     try testing.expectEqual(@as(usize, 0), ctx.seen);
 }
 
+// Whole-module mutation run 2026-11-12: `iterateImpl`'s `orelse continue` for a key that is
+// no framed record. One junk key sitting before every session in the listing, in
+// whichever order `db.keys` lists them (insertion, sorted, hashed), must not end the walk.
+test "Manager.iterate over KvStore: junk keys under the prefix are skipped, the walk goes on" {
+    var env: KvEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    var m = try env.manager();
+    var name: [32]u8 = undefined;
+    for (0..12) |i| try env.db.put(try std.mem.print(&name, "session:!junk{d}", .{i}), "xy");
+    var ids: [5][64]u8 = undefined;
+    try fiveUsers(&m, &ids);
+    for (0..12) |i| try env.db.put(try std.mem.print(&name, "session:~junk{d}", .{i}), "xy");
+    var ctx: Logout = .{ .uid = "A" };
+    try testing.expectEqual(@as(usize, 3), try m.iterate(testing.allocator, &ctx, Logout.visit));
+    try testing.expectEqual(@as(usize, 5), ctx.seen); // all five sessions, no junk key
+}
+
 fn sha256Of(id: []const u8) [32]u8 {
     var h: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(id, &h, .{});

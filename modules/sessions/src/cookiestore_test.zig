@@ -265,6 +265,23 @@ test "CookieManager.init refuses what it cannot serve" {
     _ = try CookieManager.init(.{ .io = testing.io, .keys = env.keys[0..1] });
 }
 
+// Whole-module mutation run 2026-11-12: attributes that alone overflow the Set-Cookie line
+// (a 4000-byte name, a 1000-byte path: each valid by itself) are a SIZE error (`BufferTooSmall`
+// of the probe), not an options error.
+test "CookieManager.init: name and path that together outgrow a Set-Cookie line are InvalidCookieSize" {
+    var env: Env = .{};
+    const long_name: [4000]u8 = @splat('a');
+    var path: [1000]u8 = @splat('p');
+    path[0] = '/';
+    try testing.expectError(error.InvalidCookieSize, CookieManager.init(.{
+        .io = testing.io,
+        .keys = env.keys[0..1],
+        .clock = env.clk.clock(),
+        .cookie_name = &long_name,
+        .cookie_path = &path,
+    }));
+}
+
 test "CookieManager.seal refuses a Session it did not fill" {
     var env: Env = .{};
     const m = try env.manager(.{});

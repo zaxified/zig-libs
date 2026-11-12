@@ -292,3 +292,15 @@ test "putLimited: the buffer's own capacity bounds the result even when the limi
     len = try putLimited(16, &buf, len, 100_000, "k2", "01234");
     try testing.expectEqual(@as(usize, 16), len);
 }
+
+// Whole-module mutation run 2026-11-12: a blob this layer never writes (two entries with one
+// key, hand-built) is still read first-match-wins, and `remove` takes the first one.
+test "locate: the first of two entries with the same key wins" {
+    const blob = [_]u8{ tag, 1, 'k', 1, 0, 'a', 1, 'k', 1, 0, 'b' };
+    try testing.expectEqualStrings("a", (try get(&blob, "k")).?);
+    var buf: [tcap]u8 = undefined;
+    @memcpy(buf[0..blob.len], &blob);
+    const r = try remove(&buf, blob.len, "k");
+    try testing.expect(r.removed);
+    try testing.expectEqualStrings("b", (try get(buf[0..r.len], "k")).?);
+}
