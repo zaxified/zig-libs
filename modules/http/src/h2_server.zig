@@ -8660,3 +8660,51 @@ test "mutation-a: a session that ends on the stream cap and a peer GOAWAY says G
         try testing.expectEqual(@as(usize, 1), maCountFrames(out.buffered(), 0x7));
     }
 }
+
+test "mutation-a: a request with no :scheme, or an empty :path, is RST_STREAM(PROTOCOL_ERROR)" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const no_scheme = [_]hpack.Field{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/hello" },
+        .{ .name = ":authority", .value = "t" },
+    };
+    const empty_path = [_]hpack.Field{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "" },
+        .{ .name = ":authority", .value = "t" },
+    };
+    const sid1 = try peer.conn.startStream(&peer.wire, &no_scheme, true);
+    const sid2 = try peer.conn.startStream(&peer.wire, &empty_path, true);
+    var out_buf: [4096]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+    try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid1).rst);
+    try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid2).rst);
+}
+
+test "integration: an h2c server sends its SETTINGS as soon as it has read the client preface" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = Server.init(io, testing.allocator, .{ .handler = testHandler, .enable_h2c = true, .read_timeout_ms = 1500 });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [256]u8 = undefined;
+    var wbuf: [64]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    // The preface alone: the client then waits for the server's first frame.
+    try sw.interface.writeAll(h2.preface);
+    try sw.interface.flush();
+    const hdr = try sr.interface.takeArray(9);
+    try testing.expectEqual(@as(u8, 4), hdr[3]); // SETTINGS
+}

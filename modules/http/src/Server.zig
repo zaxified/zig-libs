@@ -12864,3 +12864,282 @@ test "mutation-a: a response with no Content-Type is never compressed, and never
     try testing.expect(std.mem.find(u8, out.buffered(), "Content-Encoding") == null);
     try testing.expect(std.mem.endsWith(u8, out.buffered(), "{\"a\":\"bcdefghijk\"}"));
 }
+
+fn maBodyEchoHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    var buf: [16]u8 = undefined;
+    const n = try req.reader().readSliceShort(&buf);
+    try rw.writeAll(buf[0..n]);
+}
+
+fn maBufferHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    // Write far more than one buffer, then read the request head again: nothing the
+    // response wrote may have landed on the head's bytes.
+    const chunk: [1000]u8 = @splat('r');
+    for (0..24) |_| try rw.writeAll(&chunk);
+    var want: [1000]u8 = undefined;
+    for (&want, 0..) |*ch, i| ch.* = 'a' + @as(u8, @intCast(i % 26));
+    const got = req.header("x-big") orelse "";
+    try rw.writeAll(if (std.mem.eql(u8, got, &want)) "<<OK>>" else "<<BAD>>");
+}
+
+fn maVecHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    _ = req;
+    const a: [60_000]u8 = @splat('A');
+    const b: [60_000]u8 = @splat('B');
+    const c: [60_000]u8 = @splat('C');
+    try rw.setHeader("Content-Length", "180000");
+    var parts = [_][]const u8{ &a, &b, &c };
+    try rw.interface.writeVecAll(&parts);
+}
+
+fn maShutdownHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    const io: *const std.Io = @ptrCast(@alignCast(req.context.?));
+    try rw.upgrade("foo");
+    const conn = req.upgraded(rw) orelse return error.UpgradeLost;
+    conn.shutdown();
+    try sleepMs(io.*, 2000);
+}
+
+test "integration: the head deadline ends with the head" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = init(io, testing.allocator, .{
+        .handler = maBodyEchoHandler,
+        .read_timeout_ms = 20_000,
+        .read_header_timeout_ms = 100,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [512]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll("POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 4\r\nConnection: close\r\n\r\n");
+    try sw.interface.flush();
+    try sleepMs(io, 350);
+    try sw.interface.writeAll("abcd");
+    try sw.interface.flush();
+    var got_buf: [512]u8 = undefined;
+    var w: Writer = .fixed(&got_buf);
+    _ = sr.interface.streamRemaining(&w) catch {};
+    try testing.expectEqualStrings("HTTP/1.1 200 OK", w.buffered()[0..@min(15, w.buffered().len)]);
+    try testing.expect(std.mem.endsWith(u8, w.buffered(), "abcd"));
+}
+
+test "integration: response writes do not land on the request head's buffer" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = init(io, testing.allocator, .{ .handler = maBufferHandler, .read_timeout_ms = 20_000 });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    var wire_buf: [1400]u8 = undefined;
+    var xbig: [1000]u8 = undefined;
+    for (&xbig, 0..) |*ch, i| ch.* = 'a' + @as(u8, @intCast(i % 26));
+    const wire = try std.fmt.bufPrint(&wire_buf, "GET /x HTTP/1.1\r\nHost: t\r\nConnection: close\r\nX-Big: {s}\r\n\r\n", .{xbig});
+    var buf: [32 * 1024]u8 = undefined;
+    const got = timedExchange(io, &server, wire, &buf) catch |err| return testkit.loopbackSkip("loopback exchange failed ({t})", .{err});
+    try testing.expectEqualStrings("HTTP/1.1 200 OK", got.got[0..@min(15, got.got.len)]);
+    try testing.expect(std.mem.find(u8, got.got, "<<OK>>") != null);
+}
+
+test "integration: a vectored body of three large parts arrives whole and in order" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = init(io, testing.allocator, .{ .handler = maVecHandler, .read_timeout_ms = 20_000 });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    const big = try testing.allocator.alloc(u8, 200_000);
+    defer testing.allocator.free(big);
+    const got = timedExchange(io, &server, "GET /v HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", big) catch |err|
+        return testkit.loopbackSkip("loopback exchange failed ({t})", .{err});
+    const body_at = std.mem.find(u8, got.got, "\r\n\r\n").? + 4;
+    try testing.expectEqual(@as(usize, 180_000), got.got.len - body_at);
+    try testing.expectEqual(@as(usize, 60_000), std.mem.count(u8, got.got[body_at..], "A"));
+    try testing.expectEqual(@as(usize, 60_000), std.mem.count(u8, got.got[body_at..], "B"));
+    try testing.expectEqual(@as(usize, 60_000), std.mem.count(u8, got.got[body_at..], "C"));
+}
+
+test "integration: Upgraded.shutdown ends the socket at once, not when the handler returns" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var io_copy = io;
+    var server = init(io, testing.allocator, .{ .handler = maShutdownHandler, .context = &io_copy, .read_timeout_ms = 20_000 });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    var buf: [1024]u8 = undefined;
+    const got = timedExchange(io, &server, "GET /s HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: foo\r\n\r\n", &buf) catch |err|
+        return testkit.loopbackSkip("loopback exchange failed ({t})", .{err});
+    try testing.expectEqualStrings("HTTP/1.1 101 ", got.got[0..@min(13, got.got.len)]);
+    if (got.ms >= 1500) {
+        std.debug.print("EOF came after {d} ms\n", .{got.ms});
+        return error.ShutdownTooLate;
+    }
+}
+
+fn maFlushHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    _ = req;
+    try rw.writeAll("x");
+    try rw.flush(); // the head goes out now
+}
+
+fn maConnRec(ctx: ?*anyopaque, _: ?net.IpAddress, state: ConnState) void {
+    const c: *[4]std.atomic.Value(u32) = @ptrCast(@alignCast(ctx.?));
+    _ = c[@backingInt(state)].fetchAdd(1, .monotonic);
+}
+
+test "mutation-a: keep-alives off puts Connection: close on a head the handler flushes early, and a request is one new/closed pair" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var counts: [4]std.atomic.Value(u32) = .{ .init(0), .init(0), .init(0), .init(0) };
+    var server = init(io, testing.allocator, .{
+        .handler = maFlushHandler,
+        .read_timeout_ms = 20_000,
+        .on_conn_state = maConnRec,
+        .on_conn_state_ctx = &counts,
+    });
+    defer server.deinit();
+    server.setKeepAlivesEnabled(false);
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    var buf: [1024]u8 = undefined;
+    const got = timedExchange(io, &server, "GET /f HTTP/1.1\r\nHost: t\r\n\r\n", &buf) catch |err|
+        return testkit.loopbackSkip("loopback exchange failed ({t})", .{err});
+    try testing.expect(std.mem.find(u8, got.got, "Connection: close\r\n") != null);
+    try waitNoConns(io, &server);
+    try testing.expectEqual(@as(u32, 1), counts[@backingInt(ConnState.new)].load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), counts[@backingInt(ConnState.closed)].load(.monotonic));
+}
+
+test "mutation-a: a handler failing after its head went out is reported with status 0; writeError and tunnel refuse a sent head untouched" {
+    var rec: MaErrRec = .{};
+    var out_buf: [4096]u8 = undefined;
+    _ = maServeHooked(maFailAfterHead, "GET /a HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf, &rec);
+    try testing.expectEqual(@as(u32, 1), rec.n);
+    try testing.expectEqual(ErrorKind.handler_failed, rec.kind);
+    try testing.expectEqual(@as(u16, 0), rec.status);
+
+    var in: Reader = .fixed("");
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .tunnelable = true, .upgrade_in = &in });
+    try rw.setHeader("Content-Length", "10");
+    try rw.writeAll("abc");
+    try rw.flush();
+    try testing.expect(rw.headSent());
+    const before = out.buffered().len;
+    try testing.expectError(error.HeadersSent, rw.tunnel(200));
+    try testing.expectEqual(before, out.buffered().len);
+    try testing.expectError(error.HeadersSent, rw.writeError(400, "no"));
+    try testing.expectEqual(@as(?u64, 10), rw.declared_len);
+
+    // HEAD with a declared length that streams: the head carries it.
+    var out2: Writer = .fixed(&out_buf);
+    var rw2: ResponseWriter = .init(&out2, &body_buf, &chunk_buf, .{ .head_request = true });
+    try rw2.setHeader("Content-Length", "100");
+    try rw2.writeAll("abc");
+    try rw2.flush();
+    try testing.expect(std.mem.find(u8, out2.buffered(), "Content-Length: 100\r\n") != null);
+}
+
+test "mutation-a: bind clears a stale bind error" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var server = init(threaded.io(), testing.allocator, .{ .handler = testHandler });
+    defer server.deinit();
+    server.last_bind_error = "stale";
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    try testing.expect(server.last_bind_error == null);
+}
+
+fn maContinueHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    var buf: [16]u8 = undefined;
+    const n = try req.reader().readSliceShort(&buf);
+    try rw.writeAll(buf[0..n]);
+}
+
+fn maUpWriteHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    try rw.upgrade("foo");
+    const conn = req.upgraded(rw) orelse return error.UpgradeLost;
+    const chunk: [64 * 1024]u8 = @splat('w');
+    for (0..128) |_| try conn.writer.writeAll(&chunk);
+    try conn.writer.flush();
+}
+
+test "integration: 100 Continue reaches the client before it sends the body" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = init(io, testing.allocator, .{ .handler = maContinueHandler, .read_timeout_ms = 1500 });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [512]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll("POST /p HTTP/1.1\r\nHost: t\r\nContent-Length: 4\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n");
+    try sw.interface.flush();
+    const first = try sr.interface.take(25);
+    try testing.expectEqualStrings("HTTP/1.1 100 Continue\r\n\r\n", first);
+    try sw.interface.writeAll("abcd");
+    try sw.interface.flush();
+}
+
+test "integration: an upgraded connection is exempt from the write stall timeout" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = init(io, testing.allocator, .{ .handler = maUpWriteHandler, .read_timeout_ms = 20_000, .write_timeout_ms = 100 });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll("GET /u HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: foo\r\n\r\n");
+    try sw.interface.flush();
+    try sleepMs(io, 600); // the server's 8 MiB write stalls well past 100 ms
+    var total: usize = 0;
+    var sink_buf: [64 * 1024]u8 = undefined;
+    var sink: Writer = .fixed(&sink_buf);
+    while (true) {
+        sink.end = 0;
+        const n = sr.interface.stream(&sink, .limited(sink_buf.len)) catch break;
+        total += n;
+    }
+    try testing.expect(total > 8 * 1024 * 1024);
+}
