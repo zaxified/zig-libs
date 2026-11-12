@@ -420,3 +420,10 @@ test "useProxy: a no_proxy entry that is only a colon names no host and must not
     try testing.expect(useProxy(" : ,, ", "example.com", 80));
     try testing.expect(!useProxy(":,example.com", "example.com", 80));
 }
+
+test "Endpoint.parse: a one-digit port after a bracketed v6 literal is read (mutation run 2026-11-12)" {
+    const e = try Endpoint.parse("[::1]:8");
+    try testing.expectEqualStrings("::1", e.host);
+    try testing.expectEqual(@as(u16, 8), e.port);
+    try testing.expectEqual(@as(u16, 8), (try Endpoint.parse("http://u@[2001:db8::2]:8")).port);
+}

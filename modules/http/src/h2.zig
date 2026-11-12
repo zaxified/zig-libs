@@ -4230,3 +4230,223 @@ test "a second GOAWAY never raises the announced last-stream-id (§6.8, 2026-11-
     const second = out.items[frame_header_len + 8 ..];
     try testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, second[frame_header_len..][0..4], .big));
 }
+
+// ── mutation run 2026-11-12 (client half): the wipes of the raw frame buffer ─
+
+/// An allocator that notes every block handed back with `needle` still in it.
+/// It never resizes or remaps in place, so a growing list always takes the
+/// allocate-copy-free path.
+const WipeWatch = struct {
+    backing: Allocator,
+    needle: []const u8,
+    dirty_frees: u32 = 0,
+    frees: u32 = 0,
+
+    fn allocator(s: *WipeWatch) Allocator {
+        return .{ .ptr = s, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const s: *WipeWatch = @ptrCast(@alignCast(ctx));
+        return s.backing.rawAlloc(len, a, ra);
+    }
+
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ra: usize) void {
+        const s: *WipeWatch = @ptrCast(@alignCast(ctx));
+        if (std.mem.find(u8, memory, s.needle) != null) s.dirty_frees += 1;
+        s.frees += 1;
+        s.backing.rawFree(memory, a, ra);
+    }
+};
+
+const wipe_secret = "S3CR3T-TOKEN-4711";
+/// What the first literal looks like ON THE WIRE: the HPACK prefix (literal
+/// without indexing, a one-byte name, a 17-byte value) and then the secret. The
+/// decoded copy (`Decoder.storage`, which `toOwnedSlice` shrinks by moving it
+/// when the block is left behind) has no such prefix, so it never matches.
+const wipe_needle = "\x00\x01x\x11" ++ wipe_secret;
+
+/// A literal header field without indexing (no HPACK table entry, no Huffman):
+/// `name` (one byte) and a `value_len`-byte value that starts with the secret.
+fn wipeLiteral(buf: []u8, name: u8, value_len: usize) []const u8 {
+    buf[0] = 0x00;
+    buf[1] = 0x01;
+    buf[2] = name;
+    buf[3] = @intCast(value_len);
+    @memset(buf[4..][0..value_len], '.');
+    @memcpy(buf[4..][0..wipe_secret.len], wipe_secret);
+    return buf[0 .. 4 + value_len];
+}
+
+test "connection: the raw frame buffer and the header-block assembly leave no secret in a block they free (unsafe builds; mutation run 2026-11-12)" {
+    // A safe build's `free` overwrites the block with `undefined` before the
+    // allocator sees it, so the wipes can only be observed in the unsafe modes.
+    // The test still runs everywhere (the frames must parse).
+    const unsafe = !std.debug.runtime_safety;
+    const tgpa = testing.allocator;
+    var lit_buf: [64]u8 = undefined;
+
+    // (1) `recv_buf` grows past its first allocation, whose block still holds
+    // the previous call's HEADERS frame (compaction leaves consumed bytes
+    // behind `len`): the old block is zeroed before it is freed.
+    {
+        var ww: WipeWatch = .{ .backing = tgpa, .needle = wipe_needle };
+        var conn: Connection = .init(ww.allocator(), .server, .{});
+        defer conn.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(tgpa);
+        var events: std.ArrayList(Event) = .empty;
+        defer freeEvents(&events);
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(tgpa);
+
+        try wire.appendSlice(tgpa, preface);
+        try encodeSettings(tgpa, &wire, .{});
+        try conn.recv(wire.items, &out, &events);
+        clearEvents(&events); // the peer's SETTINGS
+
+        wire.clearRetainingCapacity();
+        try encodeHeaders(tgpa, &wire, 1, wipeLiteral(&lit_buf, 'x', wipe_secret.len), .{ .end_headers = true });
+        try conn.recv(wire.items, &out, &events);
+        try testing.expectEqual(@as(usize, 1), events.items.len);
+
+        wire.clearRetainingCapacity();
+        try encodeRawFrame(tgpa, &wire, @fromBackingInt(@intCast(0xEE)), 0, 0, &@as([300]u8, @splat(0)));
+        try conn.recv(wire.items, &out, &events);
+        try testing.expect(ww.frees >= 1); // the old block really was handed back
+        if (unsafe) try testing.expectEqual(@as(u32, 0), ww.dirty_frees);
+    }
+
+    // (2) A header block in two frames: the CONTINUATION outgrows the buffer
+    // the HEADERS began (its block holds the secret), and the finished block
+    // is zeroed before it goes back.
+    {
+        var ww: WipeWatch = .{ .backing = tgpa, .needle = wipe_needle };
+        var conn: Connection = .init(ww.allocator(), .server, .{});
+        defer conn.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(tgpa);
+        var events: std.ArrayList(Event) = .empty;
+        defer freeEvents(&events);
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(tgpa);
+
+        try wire.appendSlice(tgpa, preface);
+        try encodeSettings(tgpa, &wire, .{});
+        try conn.recv(wire.items, &out, &events);
+        clearEvents(&events); // the peer's SETTINGS
+
+        wire.clearRetainingCapacity();
+        try encodeHeaders(tgpa, &wire, 1, wipeLiteral(&lit_buf, 'x', wipe_secret.len), .{ .end_headers = false });
+        try conn.recv(wire.items, &out, &events);
+        try testing.expectEqual(@as(usize, 0), events.items.len);
+        try testing.expect(conn.assembling != null);
+
+        wire.clearRetainingCapacity();
+        try encodeContinuation(tgpa, &wire, 1, wipeLiteral(&lit_buf, 'y', 58), true);
+        try conn.recv(wire.items, &out, &events);
+        try testing.expectEqual(@as(usize, 1), events.items.len);
+        try testing.expect(conn.assembling == null);
+        const hl = events.items[0].headers.headers;
+        try testing.expectEqual(@as(usize, 2), hl.fields.len);
+        try testing.expect(ww.frees >= 2); // the grown block and the finished block
+        if (unsafe) try testing.expectEqual(@as(u32, 0), ww.dirty_frees);
+    }
+}
+
+test "connection: the limits are inclusive (frame size, CONTINUATION count, header block) and a dead connection stays dead (mutation run 2026-11-12)" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+
+    // A frame of exactly `max_frame_size` is accepted, one octet more is a
+    // FRAME_SIZE_ERROR (§4.2).
+    {
+        var conn = try testServer();
+        defer conn.deinit();
+        wire.clearRetainingCapacity();
+        const max = conn.local_settings.max_frame_size;
+        const payload = try gpa.alloc(u8, max + 1);
+        defer gpa.free(payload);
+        @memset(payload, 0);
+        try encodeRawFrame(gpa, &wire, @fromBackingInt(@intCast(0xEE)), 0, 0, payload[0..max]);
+        try conn.recv(wire.items, &out, &events);
+        try testing.expectEqual(@as(?Violation, null), conn.violation);
+        wire.clearRetainingCapacity();
+        try encodeRawFrame(gpa, &wire, @fromBackingInt(@intCast(0xEE)), 0, 0, payload);
+        try expectViolation(&conn, wire.items, error.FrameSizeError, .connection);
+    }
+
+    // `max_continuation_frames` CONTINUATIONs complete a block; the next one is flood.
+    {
+        var conn = try testServerWith(.{ .max_continuation_frames = 8 });
+        defer conn.deinit();
+        wire.clearRetainingCapacity();
+        try encodeHeaders(gpa, &wire, 1, &.{}, .{ .end_headers = false, .end_stream = true });
+        for (0..7) |_| try encodeContinuation(gpa, &wire, 1, &.{}, false);
+        try encodeContinuation(gpa, &wire, 1, &.{0x82}, true);
+        clearEvents(&events);
+        try conn.recv(wire.items, &out, &events);
+        try testing.expectEqual(@as(usize, 1), events.items.len);
+        try testing.expectEqual(@as(?Violation, null), conn.violation);
+    }
+
+    // A header block of exactly `max_header_block` octets is accepted, whether the
+    // HEADERS frame alone or HEADERS plus CONTINUATION reaches it; one more is not.
+    {
+        var conn = try testServerWith(.{ .max_header_block = 64 });
+        defer conn.deinit();
+        wire.clearRetainingCapacity();
+        try encodeHeaders(gpa, &wire, 1, &@as([64]u8, @splat(0)), .{ .end_headers = false });
+        try conn.recv(wire.items, &out, &events);
+        try testing.expect(conn.assembling != null);
+        try testing.expectEqual(@as(?Violation, null), conn.violation);
+        wire.clearRetainingCapacity();
+        try encodeContinuation(gpa, &wire, 1, &.{0}, false);
+        try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
+    }
+    {
+        var conn = try testServerWith(.{ .max_header_block = 64 });
+        defer conn.deinit();
+        wire.clearRetainingCapacity();
+        try encodeHeaders(gpa, &wire, 1, &@as([40]u8, @splat(0)), .{ .end_headers = false });
+        try encodeContinuation(gpa, &wire, 1, &@as([24]u8, @splat(0)), false);
+        try conn.recv(wire.items, &out, &events);
+        try testing.expect(conn.assembling != null);
+        try testing.expectEqual(@as(?Violation, null), conn.violation);
+    }
+
+    // While a block is open, a frame of another TYPE on the SAME stream breaks it (§6.10).
+    {
+        var conn = try testServer();
+        defer conn.deinit();
+        wire.clearRetainingCapacity();
+        try encodeHeaders(gpa, &wire, 1, &.{}, .{ .end_headers = false });
+        try encodeData(gpa, &wire, 1, "x", .{});
+        try expectViolation(&conn, wire.items, error.ProtocolError, .connection);
+    }
+
+    // A connection that has failed refuses every later byte, valid or not.
+    {
+        var conn = try testServer();
+        defer conn.deinit();
+        wire.clearRetainingCapacity();
+        try encodeRawFrame(gpa, &wire, .ping, 0, 0, "short"); // §6.7: exactly 8 octets
+        try expectViolation(&conn, wire.items, error.FrameSizeError, .connection);
+        wire.clearRetainingCapacity();
+        try encodePing(gpa, &wire, @splat(0), false);
+        try testing.expectError(error.ProtocolError, conn.recv(wire.items, &out, &events));
+    }
+}
