@@ -5277,3 +5277,568 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation run (2026-11-11): tests for what survived ──────────
+
+/// Descriptors this process holds right now (Linux: `/proc/self/fd`). The
+/// directory handle that iterates it is in both of two readings.
+fn openFdCount() !usize {
+    const io = testing.io;
+    var d = try Dir.openDirAbsolute(io, "/proc/self/fd", .{ .iterate = true });
+    defer d.close(io);
+    var n: usize = 0;
+    var it = d.iterate();
+    while (try it.next(io)) |_| n += 1;
+    return n;
+}
+
+fn mkdirs(root: Dir, names: []const []const u8) !void {
+    for (names) |n| {
+        var d = try root.createDirPathOpen(testing.io, n, .{});
+        d.close(testing.io);
+    }
+}
+
+test "descriptors: every route through Handler, resolveFile and openWithinRoot gives back what it opened" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "secret.txt", .data = "SECRET" });
+    try mkdirs(tmp.dir, &.{ "outside_nofile", "root" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside_nofile/marker.txt", .data = "M" });
+    var root = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    defer root.close(io);
+    try mkdirs(root, &.{ "docs", "bare", "sub/dir", "symidx" });
+    try writeTree(root, &.{
+        .{ "index.html", "ROOT-INDEX" },   .{ "a.txt", "a" },
+        .{ "docs/index.html", "docs" },    .{ "bare/x.txt", "x" },
+        .{ "sub/dir/file.txt", "nested" },
+    });
+    try root.symLink(io, "../../secret.txt", "symidx/index.html", .{});
+    try root.symLink(io, "../outside_nofile", "linklist", .{});
+
+    var h = Handler.init(io, root, .{});
+    var h_list = Handler.init(io, root, .{ .directory_listing = true });
+    var h_follow = Handler.init(io, root, .{ .directory_listing = true, .follow_symlinks = true });
+    var h_fb = Handler.init(io, root, .{ .fallback = "bare" });
+    const Case = struct { h: *Handler, path: []const u8, extra: []const u8 = "", status: u16 };
+    const cases = [_]Case{
+        .{ .h = &h, .path = "/a.txt", .status = 200 }, // a file
+        .{ .h = &h, .path = "/sub/dir/file.txt", .status = 200 }, // two parents to walk
+        .{ .h = &h, .path = "/docs/", .status = 200 }, // a directory with its index
+        .{ .h = &h, .path = "/docs", .status = 301 }, // ... and the redirect that drops the index it opened
+        .{ .h = &h_list, .path = "/bare/", .status = 200 }, // a listing
+        .{ .h = &h_list, .path = "/bare", .status = 301 }, // ... and the redirect that drops the listing's directory
+        .{ .h = &h_list, .path = "/", .status = 200 }, // the root's index
+        .{ .h = &h, .path = "/symidx/", .status = 403 }, // an index that is a symlink: the directory is closed on the error
+        .{ .h = &h_follow, .path = "/linklist/", .status = 403 }, // a listing that escapes the root, refused
+        .{ .h = &h_fb, .path = "/nothing", .extra = html_accept, .status = 404 }, // a fallback naming a directory
+    };
+    for (cases) |c| {
+        const before = try openFdCount();
+        var buf: [4096]u8 = undefined;
+        const resp = sendReq(c.h, "GET", c.path, c.extra, &buf);
+        const after = try openFdCount();
+        if (statusOf(resp) != c.status or before != after) {
+            std.debug.print("route {s}: status {d} (want {d}), descriptors {d} -> {d}\n", .{ c.path, statusOf(resp), c.status, before, after });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    const before = try openFdCount();
+    {
+        var o = try openWithinRoot(root, io, "sub/dir/file.txt", .{});
+        o.close(io);
+    }
+    try testing.expectError(error.IsDir, openWithinRoot(root, io, "sub", .{}));
+    {
+        var o = try openWithinRoot(root, io, "docs", .{});
+        o.close(io);
+    }
+    {
+        var o = try resolveFile(root, io, "/sub/dir/file.txt", .{});
+        o.close(io);
+    }
+    try testing.expectEqual(before, try openFdCount());
+}
+
+test "Snapshot.open closes every directory it walked: only the files stay open, deinit gives them back" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try mkdirs(root, &.{ "a/b", "c" });
+    try writeTree(root, &.{ .{ "a/b/f1.txt", "1" }, .{ "c/f2.txt", "2" }, .{ "f3.txt", "3" } });
+    const before = try openFdCount();
+    var snap = try Snapshot.open(testing.allocator, io, root, .{});
+    try testing.expectEqual(@as(usize, 3), snap.count());
+    try testing.expectEqual(before + 3, try openFdCount());
+    snap.deinit(io);
+    try testing.expectEqual(before, try openFdCount());
+}
+
+test "follow_symlinks off: a symlinked directory at any depth is refused by resolveFile and the Handler" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    try mkdirs(tmp.dir, &.{ "outside", "root" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside/loot.txt", .data = "LOOT" });
+    var root = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    defer root.close(io);
+    try mkdirs(root, &.{"sub"});
+    try writeTree(root, &.{.{ "index.html", "ROOT-INDEX" }});
+    try root.symLink(io, "../../outside", "sub/lnk", .{}); // a symlinked directory TWO levels down
+
+    // The directory component of the walk.
+    try testing.expectError(error.Forbidden, resolveFile(root, io, "/sub/lnk/loot.txt", .{}));
+    // The leaf, asked for as a directory.
+    try testing.expectError(error.Forbidden, resolveFile(root, io, "/sub/lnk/", .{}));
+    // The Handler: not a byte of the target, whatever the depth of the link.
+    var h = Handler.init(io, root, .{});
+    var buf: [4096]u8 = undefined;
+    const resp = sendReq(&h, "GET", "/sub/lnk/loot.txt", "", &buf);
+    try testing.expectEqual(@as(u16, 403), statusOf(resp));
+    try testing.expect(mem.find(u8, resp, "LOOT") == null);
+}
+
+test "follow_symlinks on: links inside the root are followed, a link to a file is not a directory, a link to the root is the root" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try mkdirs(root, &.{"idxdir"});
+    try writeTree(root, &.{ .{ "index.html", "ROOT-INDEX" }, .{ "hello.txt", "hello" } });
+    try root.symLink(io, "hello.txt", "inside_link", .{});
+    try root.symLink(io, "../hello.txt", "idxdir/index.html", .{}); // inside the root, outside the directory
+    try root.symLink(io, ".", "self", .{});
+    const opts: Options = .{ .follow_symlinks = true };
+    var h = Handler.init(io, root, opts);
+    var buf: [4096]u8 = undefined;
+
+    // A link to a file used as a directory component, or asked for as a directory: not found.
+    try testing.expectEqual(@as(u16, 404), statusOf(sendReq(&h, "GET", "/inside_link/x", "", &buf)));
+    try testing.expectEqual(@as(u16, 404), statusOf(sendReq(&h, "GET", "/inside_link/", "", &buf)));
+    try testing.expectError(error.NotFound, resolveFile(root, io, "/inside_link/", opts));
+    try testing.expectError(error.NotFound, resolveFile(root, io, "/inside_link/x", opts));
+
+    // An index that links to another file of the same root is served: it is contained by the ROOT.
+    const idx = sendReq(&h, "GET", "/idxdir/", "", &buf);
+    try testing.expectEqual(@as(u16, 200), statusOf(idx));
+    try testing.expectEqualStrings("hello", bodyOf(idx));
+    var o = try resolveFile(root, io, "/idxdir/", opts);
+    o.close(io);
+
+    // A link to the root itself: the directory's real path is the root's, which is contained.
+    const self = sendReq(&h, "GET", "/self/", "", &buf);
+    try testing.expectEqual(@as(u16, 200), statusOf(self));
+    try testing.expectEqualStrings("ROOT-INDEX", bodyOf(self));
+}
+
+test "mimeType: an empty extension is none, 16 bytes is the longest, an override matches in any case" {
+    const d = "application/octet-stream";
+    const ov = [_]MimeOverride{
+        .{ .ext = "", .media_type = "x/empty" },
+        .{ .ext = "sixteenchars1234", .media_type = "x/sixteen" },
+        .{ .ext = "JS", .media_type = "x/js-override" },
+    };
+    try testing.expectEqualStrings(d, mimeType("name.", &ov, d));
+    try testing.expectEqualStrings("x/sixteen", mimeType("a.sixteenchars1234", &ov, d));
+    try testing.expectEqualStrings(d, mimeType("a.sixteenchars12345", &ov, d)); // 17: default, no overrun
+    try testing.expectEqualStrings(d, mimeType("a." ++ strRepeat("x", 100), &ov, d));
+    try testing.expectEqualStrings("x/js-override", mimeType("a.js", &ov, d)); // the table's own type is behind it
+    try testing.expectEqualStrings("x/js-override", mimeType("a.JS", &ov, d));
+}
+
+test "sanitizePath: a percent escape with one bad digit is malformed, whichever digit" {
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.Malformed, sanitizePath("/%zA", &buf, .{}));
+    try testing.expectError(error.Malformed, sanitizePath("/%Az", &buf, .{}));
+    try testing.expectError(error.Malformed, sanitizePath("/a%g0b", &buf, .{}));
+    try testing.expectError(error.Malformed, sanitizePath("/a%0gb", &buf, .{}));
+}
+
+test "namesDirectory: undecodable and empty input name no directory" {
+    try testing.expect(!namesDirectory(""));
+    try testing.expect(!namesDirectory("%zz"));
+    try testing.expect(!namesDirectory("/a%2"));
+    try testing.expect(namesDirectory("/"));
+    try testing.expect(namesDirectory("/a/"));
+    try testing.expect(namesDirectory("/a%2f"));
+    try testing.expect(namesDirectory("/a/./."));
+    try testing.expect(!namesDirectory("/a"));
+}
+
+test "resolveFile: the dotfile policy is the Options' own" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try testing.expectError(error.DotfileForbidden, resolveFile(fx.root, testing.io, "/.env", .{}));
+    var o = try resolveFile(fx.root, testing.io, "/.env", .{ .serve_dotfiles = true });
+    o.close(testing.io);
+}
+
+test "Options: mime_overrides and default_mime reach the Content-Type of a Handler answer" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{ .{ "a.txt", "A" }, .{ "noext", "N" }, .{ "x.bin", "B" } });
+    const ov = [_]MimeOverride{.{ .ext = "txt", .media_type = "x/override" }};
+    var h = Handler.init(io, root, .{ .mime_overrides = &ov, .default_mime = "x/default" });
+    var buf: [4096]u8 = undefined;
+    try testing.expectEqualStrings("x/override", headerOf(sendReq(&h, "GET", "/a.txt", "", &buf), "content-type").?);
+    try testing.expectEqualStrings("x/default", headerOf(sendReq(&h, "GET", "/noext", "", &buf), "content-type").?);
+    try testing.expectEqualStrings("x/default", headerOf(sendReq(&h, "GET", "/x.bin", "", &buf), "content-type").?);
+}
+
+test "precompressed: a .zst sibling is served under zstd, and the zstd switch is honoured by Handler and Snapshot" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{ .{ "app.js", "console.log(1)" }, .{ "app.js.zst", "ZST-BYTES" } });
+    const ae = "Accept-Encoding: zstd\r\n";
+    var buf: [4096]u8 = undefined;
+
+    var h_on = Handler.init(io, root, .{ .precompressed = .{} });
+    const on = sendReq(&h_on, "GET", "/app.js", ae, &buf);
+    try testing.expectEqualStrings("ZST-BYTES", bodyOf(on));
+    try testing.expectEqualStrings("zstd", headerOf(on, "content-encoding").?);
+    var h_off = Handler.init(io, root, .{ .precompressed = .{ .zstd = false } });
+    const off = sendReq(&h_off, "GET", "/app.js", ae, &buf);
+    try testing.expectEqualStrings("console.log(1)", bodyOf(off));
+    try testing.expect(headerOf(off, "content-encoding") == null);
+
+    var snap_on = try Snapshot.open(testing.allocator, io, root, .{});
+    defer snap_on.deinit(io);
+    const ctx_on: SnapshotCtx = .{ .snap = &snap_on };
+    try testing.expectEqualStrings("ZST-BYTES", bodyOf(snapGet(&ctx_on, "/app.js", ae, &buf)));
+    var snap_off = try Snapshot.open(testing.allocator, io, root, .{ .precompressed = .{ .zstd = false } });
+    defer snap_off.deinit(io);
+    const ctx_off: SnapshotCtx = .{ .snap = &snap_off };
+    const s_off = snapGet(&ctx_off, "/app.js", ae, &buf);
+    try testing.expectEqualStrings("console.log(1)", bodyOf(s_off));
+    try testing.expect(headerOf(s_off, "content-encoding") == null);
+}
+
+test "fallback: only the LAST segment decides whether a missing path is an asset" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{ .fallback = "index.html" });
+    var buf: [4096]u8 = undefined;
+    // A dot in a directory segment is no extension.
+    const nav = sendReq(&h, "GET", "/a/v1.2/app", html_accept, &buf);
+    try testing.expectEqual(@as(u16, 200), statusOf(nav));
+    try testing.expectEqualStrings("<h1>home</h1>", bodyOf(nav));
+    // A dot in the last one is: a broken asset link stays a 404.
+    try testing.expectEqual(@as(u16, 404), statusOf(sendReq(&h, "GET", "/a/v1.2/app.js", html_accept, &buf)));
+}
+
+fn expectedTag(data: []const u8) [tag_len]u8 {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &d, .{});
+    var t: [tag_len]u8 = undefined;
+    t[0] = '"';
+    t[tag_len - 1] = '"';
+    _ = std.mem.print(t[1 .. tag_len - 1], "{x}", .{d[0..16]}) catch unreachable;
+    return t;
+}
+
+test "validators: known-answer ETags, a pre-1970 mtime reads as zero, the content tag is SHA-256's first 128 bits" {
+    var b: [etag_max]u8 = undefined;
+    var bv: [etag_max + 5]u8 = undefined;
+    try testing.expectEqualStrings("W/\"1f-0\"", buildETag(&b, 0x1f, -5, true));
+    try testing.expectEqualStrings("\"1f-0\"", buildETag(&b, 0x1f, -5, false));
+    try testing.expectEqualStrings("W/\"ff-1000\"", buildETag(&b, 255, 4096, true));
+    try testing.expectEqualStrings("W/\"1f-0-gzip\"", buildVariantETag(&bv, 0x1f, -5, true, "gzip"));
+    try testing.expectEqualStrings("\"1f-0-gzip\"", buildVariantETag(&bv, 0x1f, -5, false, "gzip"));
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "hello.txt", "hello world" }});
+    var snap = try Snapshot.open(testing.allocator, io, root, .{});
+    defer snap.deinit(io);
+    const ctx: SnapshotCtx = .{ .snap = &snap };
+    var buf: [4096]u8 = undefined;
+    // sha256("hello world") = b94d27b9934d3e08a52e52d7da7dabfa c484efe3...
+    try testing.expectEqualStrings("\"b94d27b9934d3e08a52e52d7da7dabfa\"", headerOf(snapGet(&ctx, "/hello.txt", "", &buf), "etag").?);
+}
+
+test "contentTag: hashes exactly `size` bytes of a bigger file, and what is there of a shorter one" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    const big = try testing.allocator.alloc(u8, 200_000);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*c, i| c.* = @truncate(i *% 31 +% 7);
+    try writeTree(root, &.{ .{ "big.bin", big }, .{ "short.bin", "0123456789" } });
+
+    var tag: [tag_len]u8 = undefined;
+    const f = try root.openFile(io, "big.bin", .{});
+    defer f.close(io);
+    // Past one 64 KiB block, short of the file: the second read is bounded by `size`.
+    try Snapshot.contentTag(io, f, 70_000, &tag);
+    const want = expectedTag(big[0..70_000]);
+    try testing.expectEqualSlices(u8, &want, &tag);
+
+    // The file shrank after its size was read: the bytes that are there, and no hang.
+    const g = try root.openFile(io, "short.bin", .{});
+    defer g.close(io);
+    try Snapshot.contentTag(io, g, 1000, &tag);
+    const want2 = expectedTag("0123456789");
+    try testing.expectEqualSlices(u8, &want2, &tag);
+}
+
+test "Snapshot without fingerprints: a variant's size+mtime tag carries its coding and follows strong_etag" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{ .{ "app.js", "console.log(1)" }, .{ "app.js.gz", "GZ-BYTES" } });
+    var buf: [4096]u8 = undefined;
+    const ae = "Accept-Encoding: gzip\r\n";
+
+    var weak = try Snapshot.open(testing.allocator, io, root, .{ .fingerprint = false });
+    defer weak.deinit(io);
+    const cw: SnapshotCtx = .{ .snap = &weak };
+    const rw = snapGet(&cw, "/app.js", ae, &buf);
+    try testing.expectEqualStrings("gzip", headerOf(rw, "content-encoding").?);
+    const tw = headerOf(rw, "etag").?;
+    try testing.expect(mem.startsWith(u8, tw, "W/\"") and mem.endsWith(u8, tw, "-gzip\""));
+
+    var strong = try Snapshot.open(testing.allocator, io, root, .{ .fingerprint = false, .serve = .{ .strong_etag = true } });
+    defer strong.deinit(io);
+    const cs: SnapshotCtx = .{ .snap = &strong };
+    const ts = headerOf(snapGet(&cs, "/app.js", ae, &buf), "etag").?;
+    try testing.expect(ts[0] == '"' and mem.endsWith(u8, ts, "-gzip\""));
+}
+
+fn snapshotLongPathHandler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+    const c: *const SnapshotCtx = @ptrCast(@alignCast(req.context.?));
+    const long = strRepeat("a", 2 * max_path_bytes);
+    return c.snap.serve(testing.io, req, rw, long);
+}
+
+fn runViaCtx(entry: http.Server.Handler, ctx: *anyopaque, wire: []const u8, out_buf: []u8) []const u8 {
+    var in: std.Io.Reader = .fixed(wire);
+    var out: std.Io.Writer = .fixed(out_buf);
+    var head_buf: [4096]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [512]u8 = undefined;
+    http.Server.serveStream(.{ .handler = entry, .context = ctx, .server_name = "test" }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+test "Snapshot.serve: HEAD answers the headers only, another method is 405 with Allow, an over-long path is 414" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "a.txt", "A-body" }});
+    var snap = try Snapshot.open(testing.allocator, io, root, .{});
+    defer snap.deinit(io);
+    var ctx: SnapshotCtx = .{ .snap = &snap };
+    var buf: [4096]u8 = undefined;
+
+    const head = runSnapshot(&ctx, "HEAD /a.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expectEqual(@as(u16, 200), statusOf(head));
+    try testing.expectEqualStrings("6", headerOf(head, "content-length").?);
+    try testing.expectEqualStrings("", bodyOf(head));
+    const post = runSnapshot(&ctx, "POST /a.txt HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expectEqual(@as(u16, 405), statusOf(post));
+    try testing.expectEqualStrings("GET, HEAD", headerOf(post, "allow").?);
+
+    const long = runViaCtx(snapshotLongPathHandler, &ctx, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expectEqual(@as(u16, 414), statusOf(long));
+}
+
+test "bare status answers frame their empty body: Content-Length 0" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var buf: [4096]u8 = undefined;
+    for ([_]struct { path: []const u8, status: u16 }{
+        .{ .path = "/.env", .status = 403 },
+        .{ .path = "/nope", .status = 404 },
+        .{ .path = "/sub", .status = 301 },
+    }) |c| {
+        const resp = sendReq(&h, "GET", c.path, "", &buf);
+        try testing.expectEqual(c.status, statusOf(resp));
+        try testing.expectEqualStrings("0", headerOf(resp, "content-length").?);
+    }
+}
+
+fn shrunkSendFileHandler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+    const h: *const Handler = @ptrCast(@alignCast(req.context orelse return error.NoStaticFilesContext));
+    var opened = resolveFile(h.root, h.io, req.path, h.options) catch return sendStatus(rw, 404);
+    defer opened.close(h.io);
+    opened.stat.size += 100; // the file shrank after it was stat'ed
+    return h.sendFile(req, rw, &opened);
+}
+
+test "sendFile: a file that shrank after its stat ends the body where the file ends, it does not spin" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var out: [4096]u8 = undefined;
+    const resp = runViaCtx(shrunkSendFileHandler, &h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
+    try testing.expect(resp.len > 0);
+}
+
+// Header slots: `X-FillN` headers are set until `test_fill_count` of them (or
+// the table) are spent, with `Content-Type` already in, so that the one that
+// then cannot be written is the one under test and `Content-Type`'s own
+// escalation cannot stand in for it (as `tablePressureHandler`, but exact).
+var test_fill_count: usize = 64;
+var test_fill_capacity: usize = 0;
+
+fn fillSlots(rw: *http.Server.ResponseWriter) void {
+    rw.setHeader("Content-Type", "text/plain; charset=utf-8") catch unreachable;
+    var name_buf: [16]u8 = undefined;
+    var spent: usize = 0;
+    for (0..test_fill_count) |i| {
+        const n = std.mem.print(&name_buf, "X-Fill{d}", .{i}) catch unreachable;
+        rw.setHeader(n, "1") catch break;
+        spent += 1;
+    }
+    test_fill_capacity = spent;
+}
+
+fn handlerSlotHandler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+    fillSlots(rw);
+    const h: *const Handler = @ptrCast(@alignCast(req.context orelse return error.NoStaticFilesContext));
+    return h.serve(req, rw);
+}
+
+fn snapshotSlotHandler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+    fillSlots(rw);
+    const c: *const SnapshotCtx = @ptrCast(@alignCast(req.context.?));
+    return c.snap.serve(testing.io, req, rw, req.path);
+}
+
+test "precompressed: a Vary or Content-Encoding that cannot be written is a 500, never a coded body without its label" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root = try variantRoot(&tmp);
+    defer root.close(testing.io);
+    defer test_fill_count = 64;
+    const wire = "GET /app.js HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n";
+    var out: [4096]u8 = undefined;
+
+    // Handler.
+    var h = Handler.init(testing.io, root, .{ .precompressed = .{} });
+    test_fill_count = 0;
+    const ok = runViaCtx(handlerSlotHandler, &h, wire, &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(ok));
+    try testing.expectEqualStrings("gzip", headerOf(ok, "content-encoding").?);
+    test_fill_count = 64;
+    _ = runViaCtx(handlerSlotHandler, &h, wire, &out);
+    const cap = test_fill_capacity;
+    try testing.expect(cap > 1 and cap < 64);
+    test_fill_count = cap - 1; // one slot left: `Vary` takes it, `Content-Encoding` finds none
+    const refused = runViaCtx(handlerSlotHandler, &h, wire, &out);
+    try testing.expectEqual(@as(u16, 500), statusOf(refused));
+    try testing.expect(mem.find(u8, refused, "GZ-BYTES") == null);
+
+    // Snapshot: the same two refusals.
+    var snap = try Snapshot.open(testing.allocator, testing.io, root, .{});
+    defer snap.deinit(testing.io);
+    var ctx: SnapshotCtx = .{ .snap = &snap };
+    test_fill_count = 0;
+    const s_ok = runViaCtx(snapshotSlotHandler, &ctx, wire, &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(s_ok));
+    try testing.expectEqualStrings("gzip", headerOf(s_ok, "content-encoding").?);
+    test_fill_count = cap; // no slot left: `Vary` is refused, with no coding asked for at all
+    const s_vary = runViaCtx(snapshotSlotHandler, &ctx, "GET /app.js HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 500), statusOf(s_vary));
+    test_fill_count = cap - 1;
+    const s_ce = runViaCtx(snapshotSlotHandler, &ctx, wire, &out);
+    try testing.expectEqual(@as(u16, 500), statusOf(s_ce));
+    try testing.expect(mem.find(u8, s_ce, "GZ-BYTES") == null);
+}
+
+const Tally = struct {
+    n: std.atomic.Value(u32) = .init(0),
+    fn rescanned(ctx: ?*anyopaque, _: LiveOptions.Outcome) void {
+        const t: *Tally = @ptrCast(@alignCast(ctx.?));
+        _ = t.n.fetchAdd(1, .monotonic);
+    }
+};
+
+test "Live.start: a rescan every rescan_ms, not one every step" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "a.txt", "A" }});
+    var tally: Tally = .{};
+    const r = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    var live = try Live.open(testing.allocator, io, r, .{ .rescan_ms = 400, .observer = .{ .ctx = &tally, .rescanned = Tally.rescanned } });
+    defer live.deinit(io);
+    try live.start(io);
+    try io.sleep(.fromMilliseconds(1300), .awake);
+    live.stop();
+    // 400, 800 and 1200 ms: three. One per 50 ms step would be twenty-odd.
+    try testing.expect(tally.n.load(.monotonic) <= 4);
+}
+
+test "Live: deinit stops the thread, and a stopped Live starts again" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "a.txt", "A" }});
+    {
+        const r = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+        var live = try Live.open(testing.allocator, io, r, .{ .rescan_ms = 100 });
+        try live.start(io);
+        live.deinit(io); // no stop() of its own: deinit joins the thread
+        try testing.expect(live.thread == null);
+    }
+    const r = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    var live = try Live.open(testing.allocator, io, r, .{ .rescan_ms = 100 });
+    defer live.deinit(io);
+    try live.start(io);
+    live.stop();
+    try live.start(io); // `stopping` was left raised by the stop: the thread must lower it
+    try root.writeFile(io, .{ .sub_path = "new.txt", .data = "N" });
+    var waited: u32 = 0;
+    while (waited < 5000 and live.generations.load(.monotonic) == 1) : (waited += 50) try io.sleep(.fromMilliseconds(50), .awake);
+    try testing.expectEqual(@as(u64, 2), live.generations.load(.monotonic));
+}
+
+test "a segment over NAME_MAX is not found, as a directory component, as a directory leaf, through resolveFile and the Handler" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try mkdirs(root, &.{"d"});
+    // A Debug build panics if a 256-byte name reaches `statFile` (the guards are on the error path
+    // of `openDir`), so this is a test about not asking, not only about the answer.
+    const long = strRepeat("n", 256);
+    try testing.expectError(error.NotFound, resolveFile(root, io, "/d/" ++ long ++ "/x", .{}));
+    try testing.expectError(error.NotFound, resolveFile(root, io, "/" ++ long ++ "/", .{}));
+    var h = Handler.init(io, root, .{});
+    var buf: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 404), statusOf(sendReq(&h, "GET", "/" ++ long ++ "/", "", &buf)));
+    try testing.expectEqual(@as(u16, 404), statusOf(sendReq(&h, "GET", "/d/" ++ long ++ "/x", "", &buf)));
+}
