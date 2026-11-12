@@ -612,3 +612,19 @@ test "findReader and capturesReader: the match anywhere in the stream, a failure
     var h4: Half = .{ .r = .{ .vtable = &.{ .stream = Half.stream }, .buffer = &b4, .seek = 0, .end = 0 }, .left = "xa" };
     try testing.expectError(error.ReadFailed, m.capturesReader(&h4.r, &out));
 }
+
+test "isMatch DFA: a full state table met by the idle skip to a new start context is emptied, not overrun" {
+    // `Dfa.intern`'s reset (`d.n == max_states`) is reached when the 32-state
+    // table fills and the next idle skip lands on a start context it does not
+    // hold. Found by search (main, 2026-11-12): without the reset the add
+    // writes `keys[32]` -- a panic in safe builds, a stack overwrite in
+    // ReleaseFast. The answer must match the Pike VM's.
+    const pat = "a[ab]*b[ab]{5}\\b";
+    const input = "b\n\nc\nab c baab a ab\nbbbacb cccbab\nbcbaacabbabbbabbbbcb\na \ncbbaabc  \nbbbbacab  bbba abb aabc\ncbaac \nbaccabbbaababc bc\naaa babbcbccabbb\nbca\n  aa a cc ab \naababaabbbcacaa aaaca a c\n\nbaaabaaa\nbb\n b   acaa ca baab\nbaa \n   ac ba ca\naa acb bb c baaaaacbbb\nacc\naabbbabaacb\nbabcb abaaacbaa \n\nb  aacacb \nc\nbbbcbacabab\nababa\n cb \naaabba\na\naaa\ncaa\ncaca \nab\nb\na cbbc b abcba  bbab\nbbbbbbca";
+    var re = try Regex.compile(gpa, pat);
+    defer re.deinit(gpa);
+    var m = try Matcher.init(gpa, &re);
+    defer m.deinit();
+    m.pike_only = true;
+    try testing.expectEqual(m.find(input, 0) != null, re.isMatch(input));
+}
