@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit re-recorded; delta mutation run over `hex.literal` (2 mutants: 1 killed, 1 equivalent).
 - **2026-11-08** — **NEW:** `hex.literal` (comptime hex with inferred length, compile error on odd length or a non-hex digit); `hex.bytes` raises its eval-branch quota with `n` so large vectors decode (duplicate-code pass).
 - **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE:** Docs: Backlog records that `stackprobe` cannot see residue above the longest zero run.
 - **2026-11-01** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of `fuzz_driver.runAll` / `runEach` / `asOptions`: 10 mutants, 9 killed, 1 equivalent; the probe tests now fail when a harness skip propagates (a propagated `SkipZigTest` used to pass the old probe test silently).
