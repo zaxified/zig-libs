@@ -6,9 +6,9 @@
 
 **Scope:** parity — curve25519-dalek 5.0 (secret-scalar group operations), not a full curve25519 library: point and scalar types are `std`'s (surveyed 2026-10-10)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-13 (107/116, 9 eq) · src ce380f9af1fcf94e
+**Audit:** review 2026-09-15 · mutation 2026-11-13 (117/126, 9 eq) · src 3b579849135ddc53
 
-Audit detail: the 2026-11-01 mutation run (first scored run) covers the X25519 ladder and fe64 asm, the Edwards comb, Ed25519 verify, point decoding, wNAF/MSM and encodings: 11 survivors closed by new tests (the portable 4-bit comb was never executed on BMI2 hosts, a `mul121665` carry at ~2^-47, `combRecode5` digit range, `wipeState`, an identity-R forgery against `verifyEd25519Strict`); the last survivor — dropping `mul`'s scalar wipe, visible only to a ReleaseFast stack probe — was run on 2026-11-13 and is killed: `STACKPROBE: no scalar or shared-secret residue …` finds 2 images of the scalar after both `mul` and `mulRistretto` (M0 44/47 clean under the same `modtest -Doptimize=ReleaseFast`). 2026-11-13: since that run the source changed only in test code (`fuzz_test.zig` and a test-only `hex32` helper in `root.zig` now come from `testkit.hex`, duplicate-code pass); no production line moved, so the run above still covers every guard and no delta mutants exist.
+Audit detail: the 2026-11-01 mutation run (first scored run) covers the X25519 ladder and fe64 asm, the Edwards comb, Ed25519 verify, point decoding, wNAF/MSM and encodings: 11 survivors closed by new tests (the portable 4-bit comb was never executed on BMI2 hosts, a `mul121665` carry at ~2^-47, `combRecode5` digit range, `wipeState`, an identity-R forgery against `verifyEd25519Strict`); the last survivor — dropping `mul`'s scalar wipe, visible only to a ReleaseFast stack probe — was run on 2026-11-13 and is killed: `STACKPROBE: no scalar or shared-secret residue …` finds 2 images of the scalar after both `mul` and `mulRistretto` (M0 44/47 clean under the same `modtest -Doptimize=ReleaseFast`). Delta 2026-11-13 over P9 (`cswap_asm`, `addsub_asm`), one build per mutant: 10 mutants — the swap mask dropped, one side not swapped, the top limb not swapped; the sum's and the difference's first fold constant (38 → 37), second fold dropped, top carry/borrow ignored, the difference's top limb not stored — all killed; the two second-fold mutants survived the first run (no test drove both inputs near 2^256 through `addsub`) and are killed by `addsub` added to the `P6 fe64` edges × edges differential, every output aliasing. 2026-11-13: since that run the source changed only in test code (`fuzz_test.zig` and a test-only `hex32` helper in `root.zig` now come from `testkit.hex`, duplicate-code pass); no production line moved, so the run above still covers every guard and no delta mutants exist.
 
 **Hardening:** fuzz 2026-11-01 (160,000 runs clean, CT25519_FUZZ, 8 jobs × 20,000, every reach label hit) · ct 2026-09-29 (ctgrind) · panic 2026-10-30 (sweep + blind review: nothing to fix (fixed-size inputs, mulMulti already a checked panic); stack minimum in Backlog)
 
@@ -788,7 +788,7 @@ done faster: our ladder was latency-bound, not instruction-bound.
 3. Tried and dropped: `cswap` as scalar asm (to avoid LLVM's 32-byte vector
    loads of limbs just stored as 8-byte words) — 5 % SLOWER than the
    vectorised Zig `cswap` once the order was fixed; JCC-erratum padding
-   (`-Djcc-safe`) — no change in the ratio.
+   (`-Djcc-safe`) — no change in the ratio. (Reversed on Zig 0.17.1: see P9.)
 
 **Result** (`zig build bench-ct25519`, `BENCH_ROUNDS=5`, spread ≤ 4.1 %):
 `x25519` 43.5 → 30.0 µs = 0.82× libsodium, 0.92× OpenSSL; `tls13`
@@ -805,6 +805,33 @@ Measured (ReleaseFast, ADX build, Kaby Lake): std `Fe` mul 16.6 ns = `fe64` mul 
 - **Encode**: `mulBaseEncode` avoids std's `toBytes` inversion (4.5 µs → 3.2 µs on `fe64`); `mulBaseEncode2` shares one inversion between two points.
 
 Results vs aws-lc-rs 1.18.0 (`bench-tls13`): Ed25519 verify 1.75× → 0.97×; sign 4.33× → 2.13× with the per-signature public-key re-derivation (two combs), 1.36× with the check done once at load (`tls13.certverify.Ed25519Signer`). Final (2026-11-01, second round): sign 12.5 µs = 1.20× aws-lc-rs 10.4 µs (prepared signer), verify 0.98×. In-test split before the burn change: `mulBaseEncode` 10.5 µs (comb ≈ 7.3 + encoding inversion ≈ 3.2), SHA-512 ≈ 0.6 µs per 200 B, `reduce64`+`mulAdd` 0.2 µs, and ≈ 1.2 µs of `tls13`'s 40 KiB `ed25519_burn` zeroing — cut to 8 KiB (stack probe clean). Tried and not worth it: wiping the `fe64.State` with vector stores instead of `secureZero` (no change).
+
+## P9 — X25519 ladder: asm `cswap`, fused add/sub (2026-11-13)
+
+**Why.** `tls13`'s fastest-implementation column had `cli_x25519` at 1.30× aws-lc-rs 1.18.0 (s2n-bignum), over the
+1.25 the P1 row allows (Zig 0.17.1).
+
+**Measured first.** `perf annotate` of `bench-ct25519 x25519`: the hottest instruction of the ladder was
+`vmovdqu` in `cswap` — LLVM vectorised the Zig loop into 32-byte loads of limbs the asm blocks had just written as
+8-byte stores, and a load wider than the stores it reads is not store-forwarded.
+
+**What changed.**
+1. `fe64.cswap` on the asm path is asm (`cswap_asm`: 64-bit loads, `t = m & (x ^ y)`, 64-bit stores) — the
+   opposite of P7's finding on Zig 0.17.0, where the scalar asm swap measured 5 % slower; on 0.17.1 it is
+   3.4 % faster (A/B below), so the toolchain moved the balance.
+2. `addsub_asm`: the three sum/difference pairs of a step taken from the same two inputs (C/D from x3,z3; A/B
+   from x2,z2; DA±CB) are one block each, the first input loaded once — five add/sub blocks a step instead
+   of eight.
+Constant time unchanged in kind: straight-line, a mask, no branch; ctgrind rows for ct25519 (ct25519, comb,
+ladderbase, ladder, msm, x25519) unchanged in count, digests re-pinned.
+
+**Result.** A/B, the old and the new build of `bench-ct25519 -- x25519` alternated four times each (one
+process per run, ratio to libsodium 1.0.18 in the same process): asm `cswap` alone 0.821–0.873 → 0.793–0.806;
+with `addsub` 0.820–0.831 → 0.769–0.790 (medians 0.826 → 0.786, −4.8 %). `tls13` (`bench-tls13`,
+`BENCH_ROUNDS=7`, loaded host, spreads 6–7 %): `cli_x25519` 1.296× → 1.240× aws-lc-rs, 0.81× OpenSSL —
+under 1.25, inside the noise; re-measure on a quiet host before a card line rests on it.
+Correctness: `modtest ct25519` Debug 42/47 and ReleaseFast 44/47 (RFC 7748 vectors, the field differential
+against std); delta mutation over `cswap_asm` and `addsub_asm` (see Audit).
 
 ## Performance — `bench-ct25519` (2026-10-10)
 

@@ -668,16 +668,13 @@ fn ladder(comptime adx: bool, k: *const [32]u8, u: *const [32]u8) [32]u8 {
         // next to each other (DA ∥ CB, BB ∥ AA, ...) and the core overlaps
         // their multiply chains — OpenSSL's `x25519_scalar_mulx` order; the
         // dependent order kept IPC at 1.6 (2026-10-31).
-        F.sub(&st, .d, .x3, .z3); // D = x3 − z3
-        F.sub(&st, .b, .x2, .z2); // B = x2 − z2
-        F.add(&st, .a, .x2, .z2); // A = x2 + z2
-        F.add(&st, .c, .x3, .z3); // C = x3 + z3
+        F.addsub(&st, .c, .d, .x3, .z3); // C = x3 + z3, D = x3 − z3
+        F.addsub(&st, .a, .b, .x2, .z2); // A = x2 + z2, B = x2 − z2
         F.fmul(&st, .da, .d, .a); // DA = D·A
         F.fmul(&st, .cb, .c, .b); // CB = C·B
         F.sq(&st, .bb, .b); // BB = B²
         F.sq(&st, .aa, .a); // AA = A²
-        F.add(&st, .x3, .da, .cb); // DA + CB
-        F.sub(&st, .t, .da, .cb); // DA − CB
+        F.addsub(&st, .x3, .t, .da, .cb); // DA + CB, DA − CB
         F.fmul(&st, .x2, .aa, .bb); // x2 = AA·BB
         F.sub(&st, .e, .aa, .bb); // E = AA − BB
         F.sq(&st, .t, .t); // (DA − CB)²
@@ -793,8 +790,23 @@ const fe64 = struct {
 
     /// Swap slots `a` and `b` iff `swap == 1`, by an xor mask (RFC 7748 §5
     /// cswap).
+    ///
+    /// On the asm path the swap is asm too, in 64-bit loads and stores: the
+    /// blocks around it write each limb with a 64-bit store, and LLVM turned
+    /// the loop below into 256-bit `vmovdqu` loads of those limbs — a load
+    /// wider than the stores it reads cannot be forwarded from them, so every
+    /// swap waited for the four stores to retire (the hottest instruction of
+    /// the ladder in `perf annotate`, 2026-11-13).
     fn cswap(swap: u64, st: *State, comptime a: Slot, comptime b: Slot) void {
         const m = 0 -% swap;
+        if (x86_asm) {
+            asm volatile (rebase(cswap_asm, a, a, b)
+                :
+                : [p] "r" (st),
+                  [m] "r" (m),
+                : .{ .r8 = true, .r9 = true, .r10 = true, .cc = true, .memory = true });
+            return;
+        }
         for (&st[@backingInt(a)], &st[@backingInt(b)]) |*x, *y| {
             const t = m & (x.* ^ y.*);
             x.* ^= t;
@@ -877,6 +889,15 @@ const fe64 = struct {
             /// `o = a − b`; `o` may alias either input.
             inline fn sub(st: *State, comptime o: Slot, comptime a: Slot, comptime b: Slot) void {
                 run(sub_asm, st, o, a, b);
+            }
+
+            /// `o = a + b` and `q = a − b` (one block, `a` loaded once);
+            /// `o`/`q` may alias either input.
+            inline fn addsub(st: *State, comptime o: Slot, comptime q: Slot, comptime a: Slot, comptime b: Slot) void {
+                asm volatile (replace(rebase(addsub_asm, o, a, b), "(%[q])", std.fmt.comptimePrint("+{d}(%[p])", .{@as(usize, @backingInt(q)) * @sizeOf(Limbs)}))
+                    :
+                    : [p] "r" (st),
+                    : clobbers);
             }
 
             /// `o = a · 121665` — RFC 7748's `a24 = (486662 − 2) / 4`.
@@ -1188,6 +1209,26 @@ const fe64 = struct {
 
     /// `a + b`: a 257-bit sum, the carry folded as +38, and a second +38 if
     /// that fold carried (then the low words are < 38, so no third).
+    /// `cswap` of slots `a` and `b` under the mask `%[m]` (0 or all ones),
+    /// limb by limb: `t = m & (x ^ y); x ^= t; y ^= t`.
+    const cswap_asm = blk: {
+        var s: []const u8 = "";
+        for (0..4) |i| {
+            const off = std.fmt.comptimePrint("{d}", .{8 * i});
+            s = s ++
+                "movq " ++ off ++ "(%[a]), %%r8\n" ++
+                "movq " ++ off ++ "(%[b]), %%r9\n" ++
+                "movq %%r8, %%r10\n" ++
+                "xorq %%r9, %%r10\n" ++
+                "andq %[m], %%r10\n" ++
+                "xorq %%r10, %%r8\n" ++
+                "xorq %%r10, %%r9\n" ++
+                "movq %%r8, " ++ off ++ "(%[a])\n" ++
+                "movq %%r9, " ++ off ++ "(%[b])\n";
+        }
+        break :blk s;
+    };
+
     const add_asm =
         \\movq 0(%[a]), %%r8
         \\movq 8(%[a]), %%r9
@@ -1236,6 +1277,55 @@ const fe64 = struct {
         \\movq %%r9, 8(%[o])
         \\movq %%r10, 16(%[o])
         \\movq %%r11, 24(%[o])
+    ;
+
+    /// `o = a + b` and `q = a − b` in one block: `add_asm` then `sub_asm`
+    /// with `a` loaded once (the ladder takes both from the same pair three
+    /// times a step). Every store comes after every load, so `o`/`q` may
+    /// alias `a` or `b`.
+    const addsub_asm =
+        \\movq 0(%[a]), %%r8
+        \\movq 8(%[a]), %%r9
+        \\movq 16(%[a]), %%r10
+        \\movq 24(%[a]), %%r11
+        \\movq %%r8, %%r12
+        \\movq %%r9, %%r13
+        \\movq %%r10, %%r14
+        \\movq %%r11, %%r15
+        \\addq 0(%[b]), %%r8
+        \\adcq 8(%[b]), %%r9
+        \\adcq 16(%[b]), %%r10
+        \\adcq 24(%[b]), %%r11
+        \\sbbq %%rax, %%rax
+        \\andq $38, %%rax
+        \\addq %%rax, %%r8
+        \\adcq $0, %%r9
+        \\adcq $0, %%r10
+        \\adcq $0, %%r11
+        \\sbbq %%rax, %%rax
+        \\andq $38, %%rax
+        \\addq %%rax, %%r8
+        \\subq 0(%[b]), %%r12
+        \\sbbq 8(%[b]), %%r13
+        \\sbbq 16(%[b]), %%r14
+        \\sbbq 24(%[b]), %%r15
+        \\sbbq %%rbx, %%rbx
+        \\andq $38, %%rbx
+        \\subq %%rbx, %%r12
+        \\sbbq $0, %%r13
+        \\sbbq $0, %%r14
+        \\sbbq $0, %%r15
+        \\sbbq %%rbx, %%rbx
+        \\andq $38, %%rbx
+        \\subq %%rbx, %%r12
+        \\movq %%r8, 0(%[o])
+        \\movq %%r9, 8(%[o])
+        \\movq %%r10, 16(%[o])
+        \\movq %%r11, 24(%[o])
+        \\movq %%r12, 0(%[q])
+        \\movq %%r13, 8(%[q])
+        \\movq %%r14, 16(%[q])
+        \\movq %%r15, 24(%[q])
     ;
 
     /// `a · 121665`: a five-word product (top < 2^17), folded.
@@ -2677,7 +2767,7 @@ const field_edges = blk: {
 
 /// One operation on fresh copies of `x`, `y` in slots `p`, `q`; `o` chooses
 /// the output slot, so the aliasing cases (`o` = an input) run too.
-fn fieldOp(comptime adx: bool, comptime op: enum { mul, sq, add, sub, mul121665, invert }, comptime o: fe64.Slot, x: u256, y: u256) u512 {
+fn fieldOp(comptime adx: bool, comptime op: enum { mul, sq, add, sub, mul121665, invert, addsub_sum, addsub_diff }, comptime o: fe64.Slot, x: u256, y: u256) u512 {
     const F = fe64.Ops(adx);
     var st: fe64.State = undefined;
     for (&st) |*l| l.* = .{ 0xdead, 0xbeef, 0xdead, 0xbeef }; // no stale answer to find
@@ -2690,6 +2780,9 @@ fn fieldOp(comptime adx: bool, comptime op: enum { mul, sq, add, sub, mul121665,
         .sub => F.sub(&st, o, .p, .q),
         .mul121665 => F.mul121665(&st, o, .p),
         .invert => F.invert(&st, o, .p),
+        // the other output goes to `t` (or to `r` when `o` is `t`)
+        .addsub_sum => F.addsub(&st, o, if (o == .t) .r else .t, .p, .q),
+        .addsub_diff => F.addsub(&st, if (o == .t) .r else .t, o, .p, .q),
     }
     return canonical(st[@backingInt(o)]);
 }
@@ -2712,6 +2805,12 @@ fn checkFieldPair(comptime adx: bool, x: u256, y: u256) !void {
         .{ .name = "sub", .got = fieldOp(adx, .sub, .r, x, y), .want = want_sub },
         .{ .name = "sub o=a", .got = fieldOp(adx, .sub, .p, x, y), .want = want_sub },
         .{ .name = "sub o=b", .got = fieldOp(adx, .sub, .q, x, y), .want = want_sub },
+        .{ .name = "addsub +", .got = fieldOp(adx, .addsub_sum, .r, x, y), .want = want_add },
+        .{ .name = "addsub + o=a", .got = fieldOp(adx, .addsub_sum, .p, x, y), .want = want_add },
+        .{ .name = "addsub + o=b", .got = fieldOp(adx, .addsub_sum, .q, x, y), .want = want_add },
+        .{ .name = "addsub -", .got = fieldOp(adx, .addsub_diff, .r, x, y), .want = want_sub },
+        .{ .name = "addsub - q=a", .got = fieldOp(adx, .addsub_diff, .p, x, y), .want = want_sub },
+        .{ .name = "addsub - q=b", .got = fieldOp(adx, .addsub_diff, .q, x, y), .want = want_sub },
         .{ .name = "mul121665", .got = fieldOp(adx, .mul121665, .r, x, y), .want = want_a24 },
         .{ .name = "mul121665 in place", .got = fieldOp(adx, .mul121665, .p, x, y), .want = want_a24 },
         .{ .name = "toBytes", .got = canonical(limbsOf(x)), .want = X % p25519 },

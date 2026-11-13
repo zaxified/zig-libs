@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **PERFORMANCE:** the X25519 shared secret is about 5 % faster on x86-64 with MULX/ADX: the ladder's conditional swap is asm with 64-bit loads (LLVM's vectorised swap could not be store-forwarded from the field blocks' 64-bit stores) and the three sum/difference pairs of a ladder step are one asm block each. Same results, same constant-time shape (ctgrind counts unchanged).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** the 2026-11-01 mutation run's last undecided mutant (`mul`'s scalar wipe dropped) run under the ReleaseFast stack probe: killed.
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit re-recorded; since the 2026-11-01 mutation run only test code changed (no production line moved).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
