@@ -1,8 +1,8 @@
 # opaque
 
 RFC 9807 OPAQUE — an augmented password-authenticated key exchange
-(aPAKE), **ristretto255-SHA-512 configuration, 3DH key exchange,
-Identity KSF**. The server never sees the password (not even at
+(aPAKE), 3DH key exchange, **ristretto255-SHA-512 configuration** (top
+level) and **P256-SHA256** (`opaque.P256Sha256`, same function names). The server never sees the password (not even at
 registration) and stores a record that resists precomputation attacks;
 each login yields a mutually authenticated `session_key` (both sides)
 plus a client-only `export_key`. OPRF layer reused from the sibling
@@ -12,8 +12,9 @@ plus a client-only `export_key`. OPRF layer reused from the sibling
 internal RNG (all nonces/blinds/seeds are caller-supplied CSPRNG
 output; blinds via `scalarFromWideBytes`).
 
-KAT-validated byte-exact against RFC 9807 Appendix C.1.1 + C.1.2
-(registration record, KE1/KE2/KE3, session_key, export_key).
+KAT-validated byte-exact against RFC 9807 Appendix C.1.1 + C.1.2 + C.2.1
+(ristretto255) and C.1.5 + C.1.6 + C.2.3 (P-256): registration record,
+KE1/KE2/KE3, session_key, export_key, fake credential response.
 
 ```zig
 const opaque_pake = @import("opaque");

@@ -69,7 +69,7 @@ pub fn main() !void {
     var rejected: [voprf.Nh]u8 = undefined;
     voprf.finalizeVerifiable(password, &blind_scalar, eval.evaluated_element, blinded, server_key.pk, bad_proof, &rejected) catch |err| switch (err) {
         error.InvalidProof => std.debug.print("tampered proof correctly rejected\n", .{}),
-        error.InvalidBlind => return err,
+        error.InvalidBlind, error.InputTooLong => return err,
     };
 
     // A corrupt wire element (not a valid, non-identity ristretto255 point)

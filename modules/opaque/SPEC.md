@@ -16,8 +16,13 @@
 
 **Downstream consumer:** no
 
-RFC 9807 OPAQUE aPAKE, **ristretto255-SHA-512 configuration with the
-3DH key exchange only** (OPRF: ristretto255-SHA512 / RFC 9497
+RFC 9807 OPAQUE aPAKE with the 3DH key exchange, **two configurations**:
+ristretto255-SHA-512 (the top-level API) and, since 2026-11-13,
+**P256-SHA256** (`opaque.P256Sha256`: OPRF P256-SHA256, HKDF/HMAC/SHA-256,
+3DH over P-256, `Npk = 33`, `Nh = 32`; RFC 9807 Appendix C.1.5/C.1.6/C.2.3
+byte-exact, `src/kat_p256_test.zig`). The code is one generic
+`Opaque(C)` (`src/protocol.zig`) over the configuration; the
+ristretto255 configuration in detail (OPRF: ristretto255-SHA512 / RFC 9497
 modeOPRF via the sibling `voprf` module, KDF: HKDF-SHA-512, MAC:
 HMAC-SHA-512, Hash: SHA-512, KSF: pluggable (`Ksf`, mandatory — no
 default, see below), Group: ristretto255).
@@ -292,9 +297,9 @@ design); registers and the red zone below the stack pointer.
 
 ## Out of scope (deliberate)
 
-- **Other groups/suites** (C.1.3-C.1.6: curve25519, P-256): no
-  consumer here needs them; P-256 would drag in a different OPRF
-  ciphersuite `voprf` does not build.
+- **The curve25519 3DH configuration** (C.1.3/C.1.4): ristretto255 OPRF
+  with an X25519 AKE group — not built yet (Backlog); P-256 is built
+  (2026-11-13).
 - ~~**Non-Identity KSFs** (Argon2id/scrypt): parameter policy belongs
   to the consumer; seam documented above.~~ **Now pluggable, 2026-09-15**
   (audit finding M6): `Ksf`, see above — the CONCRETE
@@ -327,12 +332,14 @@ them.
 
 ## Backlog / deferred
 
-- **Other RFC 9807 configurations, first P256-SHA256 with 3DH** *(survey 2026-09-30)*.
-  opaque-ke and bytemare/opaque are configurable over groups; a deployment bound
-  to NIST curves cannot use this module at all. Blocked on `voprf`'s suites (this
-  module reuses `voprf` for the OPRF; see the `voprf` SPEC's Backlog for P-256) plus
-  making the AKE group and the `N*` sizes comptime parameters. Large; pure Zig,
-  fits CONVENTIONS §2.
+- **The curve25519 configuration (C.1.3/C.1.4)** — ristretto255 OPRF with an
+  X25519 AKE: `Opaque(C)` assumes the AKE group is the OPRF group, so this needs a
+  separate `C.Ake` (keygen = `DeriveDiffieHellmanKeyPair` §6.4.1.3, DH = X25519).
+  Moderate; pure Zig (`std.crypto.dh.X25519`).
+- **P256-SHA256 hardening rows** *(2026-11-13)*: the ctgrind harness and the
+  dead-stack probe drive the ristretto255 configuration only; the P-256 one runs
+  through the same code with `voprf`'s P-256 suite (whose own ctgrind rows are
+  pinned) but has no opaque-level row yet.
 - **Fake-record helper** *(survey 2026-09-30)*. bytemare/opaque
   (`GetFakeRecord`) and opaque-zig (`createFakeRecord`) ship one (opaque-ke not checked); here it is a
   documented recipe (`deriveAkeKeyPair` over a random seed, keep `.public_key`, zero

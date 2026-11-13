@@ -1224,9 +1224,12 @@ pir	ReleaseFast	reconstruct	1	1	0b3b9c0b14d4fedf	b6ecd96f96e9b339
 # opaque 2026-11-13: re-pinned source digest only (root.zig gained InputTooLong in three error
 # sets; PATTERN widened to voprf's new protocol/groups/h2c files). --check opaque measured
 # 4 / 11 / 2 in-file, outputs unchanged: the same contexts.
-opaque	ReleaseFast	register	1	4	0e285f83f7c0ccf4	843c12b053124a78
-opaque	ReleaseFast	login	1	11	0e285f83f7c0ccf4	f8be3480eb708638
-opaque	ReleaseFast	serverke2	1	2	0e285f83f7c0ccf4	4ef279b842b3cb55
+# Then the same day: opaque's protocol code moved from root.zig into opaque/src/protocol.zig
+# (generic over the configuration, P256-SHA256 added); --check opaque again 4 / 11 / 2, outputs
+# unchanged; source pin re-pinned (root.zig + protocol.zig).
+opaque	ReleaseFast	register	1	4	39c4a42a201ae932	843c12b053124a78
+opaque	ReleaseFast	login	1	11	39c4a42a201ae932	f8be3480eb708638
+opaque	ReleaseFast	serverke2	1	2	39c4a42a201ae932	4ef279b842b3cb55
 # bip32 mnemonic 3 is the M6-CT tree (8c2f1aa4, constant-time `wordIndex`).
 # The three are the mnemonic split plus two accept/reject verdicts, not the
 # word search.

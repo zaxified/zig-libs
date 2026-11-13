@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **P256-SHA256 configuration** (`opaque.P256Sha256`): RFC 9807 §7's NIST configuration — OPRF P256-SHA256 (`voprf.P256Sha256`), HKDF/HMAC/SHA-256, 3DH over P-256 (§6.4.1.2), `Npk = 33`, `Nh = Nm = Nx = 32`. The protocol is now one generic `Opaque(C)` in `src/protocol.zig`; the top level of `root.zig` is the ristretto255 instance re-exported (source-compatible). `expandMulti` handles any output length (the P-256 `masked_response` needs four HMAC-SHA-256 blocks). Tests: RFC 9807 C.1.5, C.1.6 (registration + login, both sides) and C.2.3 (fake KE2) byte-exact (`src/kat_p256_test.zig`, vectors generated from the RFC text by `tools/gen_p256_vectors.py`).
+
 - **2026-11-13** — **Error-set change:** `FinalizeRegistrationError`, `GenerateKE1Error` and `GenerateKE3Error` gain `InputTooLong`, and `createRegistrationRequest` (through `voprf.BlindError`) can return it: a password longer than RFC 9497's `2^16 - 1`-byte OPRF input bound. Before, such a password hit an assert in `voprf` (a panic in safe builds, UB in ReleaseFast). The internal `deriveKeyPair` calls (constant info strings) map voprf's new `InputTooLong` to `DeriveKeyPairFailed`; it cannot occur there.
 
 - **2026-10-18** — Ported to Zig 0.17.0. Test: `@typeInfo(error set)` is `.error_set.error_names.?` (plain names).
