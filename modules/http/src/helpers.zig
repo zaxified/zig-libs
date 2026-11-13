@@ -567,3 +567,19 @@ test "basicAuth / basicAuthHeader: a buffer of exactly the needed size is enough
     var o9: [9]u8 = undefined;
     try testing.expectError(error.NoSpaceLeft, basicAuthHeader(&o9, "u", "p"));
 }
+
+test "redirectLocation: a trailing slash survives the clean, an empty path part cleans to `.` (Go http.Redirect)" {
+    var buf: [redirect_buf_len]u8 = undefined;
+    // Go keeps the slash path.Clean drops: trailing := HasSuffix(url, "/").
+    try testing.expectEqualStrings("/a/b/", (try redirectLocation("/x/y", "/a//b/", &buf)).href);
+    try testing.expectEqualStrings("/dir/c/", (try redirectLocation("/dir/x", "c/./", &buf)).href);
+    try testing.expectEqualStrings("/a/", (try redirectLocation("/x", "/a/b/../", &buf)).href);
+    try testing.expectEqualStrings("/a/b/?q=1", (try redirectLocation("/x", "/a/b/?q=1", &buf)).href);
+    // No trailing slash in, none out.
+    try testing.expectEqualStrings("/a/b", (try redirectLocation("/x", "/a//b", &buf)).href);
+    try testing.expectEqualStrings("/", (try redirectLocation("/x", "/", &buf)).href);
+    // `*` has no directory and the path part is empty: path.Clean("") is ".",
+    // the query rides behind it (Go splits on the first `?`).
+    try testing.expectEqualStrings(".?q", (try redirectLocation("*", "?q", &buf)).href);
+    try testing.expectEqualStrings(".", (try redirectLocation("*", "", &buf)).href);
+}

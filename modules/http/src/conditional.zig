@@ -908,3 +908,20 @@ test "parseHttpDate: every fixed separator of RFC 850 and asctime is checked, an
     };
     for (bad) |s| try testing.expectEqual(@as(?i64, null), parseHttpDate(s));
 }
+
+test "evaluate: a malformed element is skipped and the list goes on after the next comma; an empty tag is a tag (2026-11-13)" {
+    // RFC 9110 §8.8.3: an entity-tag starts with `"` or `W/"`; an element that
+    // does not is no tag, and the elements after its comma still count
+    // (the module doc: "Malformed elements are skipped"). A bare `x` followed
+    // by a comma and a tag must not swallow that tag through a quote found
+    // further along.
+    try testing.expectEqual(Outcome.proceed, evalWith(.put, "If-Match: x,\"v1\"\r\n", v_both));
+    try testing.expectEqual(Outcome.proceed, evalWith(.put, "If-Match: W/x,\"v1\"\r\n", v_both));
+    try testing.expectEqual(Outcome.not_modified, evalWith(.get, "If-None-Match: abc,W/\"v1\"\r\n", v_both));
+    // `opaque-tag = DQUOTE *etagc DQUOTE`: zero etagc is legal, `""` is a tag.
+    const empty: Validators = .{ .etag = "\"\"" };
+    try testing.expectEqual(Outcome.proceed, evalWith(.put, "If-Match: \"\"\r\n", empty));
+    try testing.expectEqual(Outcome.proceed, evalWith(.put, "If-Match: \"a\", \"\"\r\n", empty));
+    try testing.expectEqual(Outcome.not_modified, evalWith(.get, "If-None-Match: W/\"\"\r\n", empty));
+    try testing.expectEqual(Outcome.precondition_failed, evalWith(.put, "If-Match: \"v1\"\r\n", empty));
+}

@@ -928,3 +928,73 @@ test "PaddedSource: a source with nothing yet is not the end -- zeros start only
     try testing.expectEqual(@as(u64, 2), p.real);
     try testing.expectEqual(@as(u64, 6), p.delivered);
 }
+
+test "Member: a flush reaches the deflate encoder -- the output grows before finish (2026-11-13)" {
+    const gpa = testing.allocator;
+    const scratch = try gpa.create(Scratch);
+    defer gpa.destroy(scratch);
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
+    defer aw.deinit();
+    const w = try scratch.begin(&aw.writer, 6);
+    const header_len = aw.written().len; // the gzip header, nothing of the body yet
+    try w.writeAll("hello, sync flush");
+    try testing.expectEqual(header_len, aw.written().len); // held back in the window
+    try w.flush();
+    // The sync flush pushed everything so far into `output` (the doc of
+    // `Member.flush`: "everything so far decodable").
+    try testing.expect(aw.written().len > header_len);
+    try scratch.finish();
+}
+
+test "Member.drain: the byte count returned is what was consumed, splat included (2026-11-13)" {
+    const gpa = testing.allocator;
+    const scratch = try gpa.create(Scratch);
+    defer gpa.destroy(scratch);
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
+    defer aw.deinit();
+    const w = try scratch.begin(&aw.writer, 6);
+    // `Writer.writeSplat` hands the drain's answer back unchanged (the member
+    // has no buffer): "ab" + "cd" + "ef" * 3 = 10 bytes consumed.
+    const parts = [_][]const u8{ "ab", "cd", "ef" };
+    try testing.expectEqual(@as(usize, 10), try w.writeSplat(&parts, 3));
+    const one = [_][]const u8{"xyz"};
+    try testing.expectEqual(@as(usize, 3), try w.writeSplat(&one, 1));
+    try scratch.finish();
+    const got = aw.written();
+    try testing.expectEqual(@as(u32, 13), std.mem.readInt(u32, got[got.len - 4 ..][0..4], .little));
+}
+
+test "initCompress: history_end_unhashed is reset over a dirty value (2026-11-13)" {
+    const gpa = testing.allocator;
+    const s = try gpa.create(Scratch);
+    defer gpa.destroy(s);
+    var out: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
+    defer out.deinit();
+    // A legal `true`: the field-by-field comparison above fills with a byte
+    // whose low bit reads as `false`, so it cannot see a skipped reset.
+    @memset(std.mem.asBytes(&s.compress), 0x5a);
+    s.compress.history_end_unhashed = true;
+    try initCompress(&s.compress, &out.writer, &s.window, .raw, levelOptions(6));
+    try testing.expect(!s.compress.history_end_unhashed);
+}
+
+test "PaddedSource: padding is written only where the writer has room, a full writer refuses (2026-11-13)" {
+    var empty = std.Io.Reader.fixed("");
+    var in_buf: [decode_in_len]u8 = undefined;
+    var p: PaddedSource = .{
+        .source = &empty,
+        .reader = .{ .vtable = &PaddedSource.vtable, .buffer = &in_buf, .seek = 0, .end = 0 },
+    };
+    // One byte of room is enough for one byte of padding (a request for 2
+    // bytes of capacity would refuse here) ...
+    var one: [1]u8 = .{0xff};
+    var w1: std.Io.Writer = .fixed(&one);
+    try testing.expectEqual(@as(usize, 1), try p.reader.stream(&w1, .unlimited));
+    try testing.expectEqual(@as(u8, 0), one[0]);
+    try testing.expectEqual(@as(u64, 1), p.delivered);
+    // ... and a writer with none refuses, it does not report a 0-byte "success".
+    var none: [0]u8 = .{};
+    var w0: std.Io.Writer = .fixed(&none);
+    try testing.expectError(error.WriteFailed, p.reader.stream(&w0, .unlimited));
+    try testing.expectEqual(@as(u64, 1), p.delivered);
+}

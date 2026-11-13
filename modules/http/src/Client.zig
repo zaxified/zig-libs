@@ -6007,6 +6007,113 @@ test "pool: a stale reused connection (peer already closed it) is retried once t
     try testing.expectEqual(@as(usize, 2), client.dialCount()); // original dial + the retry's redial
 }
 
+/// An origin for the "two stale pooled connections" retry tests: it answers
+/// two connections that are open at the same time (so both end up idle in the
+/// client's pool), hangs up on both, then answers one more -- the retry's
+/// fresh dial. `release` wakes a run that is still waiting in `accept`.
+const StaleTwoOrigin = struct {
+    io: std.Io,
+    listener: *net.Server,
+    hung_up: std.atomic.Value(bool) = .init(false),
+    stop: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn answer(o: *StaleTwoOrigin, s: net.Stream) void {
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [1024]u8 = undefined;
+        var sr = s.reader(o.io, &rbuf);
+        var sw = s.writer(o.io, &wbuf);
+        var head_buf: [1024]u8 = undefined;
+        _ = h1.readHead(&sr.interface, &head_buf) catch {};
+        sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") catch {};
+        sw.interface.flush() catch {};
+    }
+
+    fn run(o: *StaleTwoOrigin) void {
+        defer o.done.store(true, .release);
+        const s1 = o.listener.accept(o.io) catch return;
+        o.answer(s1);
+        const s2 = o.listener.accept(o.io) catch {
+            s1.close(o.io);
+            return;
+        };
+        o.answer(s2);
+        s1.close(o.io);
+        s2.close(o.io);
+        o.hung_up.store(true, .release);
+        const s3 = o.listener.accept(o.io) catch return;
+        defer s3.close(o.io);
+        if (o.stop.load(.acquire)) return;
+        o.answer(s3);
+    }
+
+    fn release(o: *StaleTwoOrigin, port: u16) void {
+        o.stop.store(true, .release);
+        const addr = net.IpAddress.parse("127.0.0.1", port) catch return;
+        while (!o.done.load(.acquire)) {
+            if (addr.connect(o.io, .{ .mode = .stream })) |s| s.close(o.io) else |_| return;
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+/// Both pooled connections of the origin are stale. The retry of a failed
+/// exchange on the first must dial FRESH (`take_idle` false): taking the
+/// other idle connection would hit a second dead one, and the one-shot retry
+/// has no second retry.
+fn expectStaleRetryDialsFresh(comptime plain: bool) !void {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("two stale pooled connections test listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    var origin: StaleTwoOrigin = .{ .io = io, .listener = &listener };
+    const thread = try std.Thread.spawn(.{}, StaleTwoOrigin.run, .{&origin});
+    defer {
+        origin.release(port);
+        thread.join();
+    }
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const send = if (plain) Client.requestPlain else Client.request;
+
+    // Two exchanges in flight at once: two dials, and both connections go
+    // back to the pool.
+    var r1 = try send(&client, .get, url, .{});
+    var r2 = try send(&client, .get, url, .{});
+    drainAndDeinit(&r1);
+    drainAndDeinit(&r2);
+    try testing.expectEqual(@as(usize, 2), client.dialCount());
+    try testing.expectEqual(@as(usize, 2), client.poolIdleCount());
+
+    while (!origin.hung_up.load(.acquire)) std.atomic.spinLoopHint();
+
+    var r3 = try send(&client, .get, url, .{});
+    defer r3.deinit();
+    try testing.expectEqual(@as(u16, 200), r3.status);
+    const body = try r3.readAllAlloc(gpa, 64);
+    defer gpa.free(body);
+    try testing.expectEqualStrings("ok", body);
+    try testing.expectEqual(@as(usize, 3), client.dialCount()); // the retry dialed, it did not take the other stale one
+}
+
+test "pool: with two stale pooled connections the retry dials a fresh one (request)" {
+    try expectStaleRetryDialsFresh(false);
+}
+
+test "pool: with two stale pooled connections the retry dials a fresh one (requestPlain)" {
+    try expectStaleRetryDialsFresh(true);
+}
+
 /// Same shape as `staleConnOrigin` but deliberately does NOT accept a second
 /// connection: the test closes the listener right after this returns, so the
 /// stale-connection retry's redial has nowhere to connect and must fail.
@@ -7137,6 +7244,52 @@ test "HTTP/1.1 trailers: read behind the head after the body, next response star
     try testing.expectEqual(@as(usize, 1), small.dialCount());
 }
 
+test "Response.trailersTruncated: a head that fills max_head_bytes leaves no trailer room; only a dropped trailer line is flagged (2026-11-13)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // `max_head_bytes` == the head block (status line + fields, the closing
+    // blank line is not part of it): the trailer capture buffer is empty.
+    const head_block = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n";
+    const no_trailers = head_block ++ "\r\n2\r\nok\r\n0\r\n\r\n";
+    const dropped = head_block ++ "\r\n2\r\nok\r\n0\r\nX-A: 1\r\n\r\n";
+    const sized = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    var lb: GzipLoopback = undefined;
+    try lb.start(io, &.{ no_trailers, dropped, sized }, "/");
+    defer lb.finish(io);
+    var client = Client.init(io, gpa, .{ .total_timeout_ms = 5000, .max_head_bytes = head_block.len });
+    defer client.deinit();
+    { // Nothing after the closing CRLF: nothing was dropped.
+        var res = try client.request(.get, lb.url, .{});
+        defer res.deinit();
+        const body = try res.readAllAlloc(gpa, 64);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("ok", body);
+        try testing.expect(!res.trailersTruncated());
+        try testing.expectEqual(@as(?[]const u8, null), res.trailer("x-a"));
+    }
+    { // A trailer line that had no room: read off the wire, dropped, flagged.
+        var res = try client.request(.get, lb.url, .{});
+        defer res.deinit();
+        const body = try res.readAllAlloc(gpa, 64);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("ok", body);
+        try testing.expect(res.trailersTruncated());
+        try testing.expectEqual(@as(?[]const u8, null), res.trailer("x-a"));
+    }
+    { // A body that is not chunked has no trailer section to truncate.
+        var res = try client.request(.get, lb.url, .{});
+        defer res.deinit();
+        const body = try res.readAllAlloc(gpa, 64);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("ok", body);
+        try testing.expect(!res.trailersTruncated());
+    }
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+}
+
 test "gzip: off by default — identity asked, a gzip body handed over as sent" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -7640,6 +7793,8 @@ test "http2: request over an h2 connection — proto, head, body, cookies, one p
         const body = try res.readAllAlloc(gpa, 1024);
         defer gpa.free(body);
         try testing.expectEqualStrings("hello h2", body);
+        // h2 trailers are not cut by the HTTP/1.1 head budget.
+        try testing.expect(!res.trailersTruncated());
     }
     { // The cookie the h2 answer set goes out on the next request, and the
         // fields arrive as the h1 head writer would have sent them.
