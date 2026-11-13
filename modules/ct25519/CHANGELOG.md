@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** the 2026-11-01 mutation run's last undecided mutant (`mul`'s scalar wipe dropped) run under the ReleaseFast stack probe: killed.
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit re-recorded; since the 2026-11-01 mutation run only test code changed (no production line moved).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
 - **2026-11-01** — **NO CONSUMER-VISIBLE CHANGE:** fuzz harness (`src/fuzz_test.zig`, `CT25519_FUZZ`): `verifyEd25519Strict` against std `verifyStrict` (same verdict and error; valid, mutated, S+L, small-order, torsion and non-canonical inputs) and X25519 against std; 160 000 runs clean, every reach label hit. Closes full-CI `check-fuzz` (class B byte-accepting API without a harness).
