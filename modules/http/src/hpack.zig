@@ -2685,15 +2685,100 @@ test "wipe: Decoder.deinit zeroes the dynamic table" {
     try testing.expectEqual(@as(usize, 0), w.dirty_frees);
 }
 
-test "wipe: a failed table insert frees the storage and the entry zeroed" {
-    // Allocations: storage (1), spans (2), the entry's block (3), the table's
-    // entry list (4, fails): both marker-holding blocks go back on the error path.
-    var w: zeroize.ScrubAlloc = .{ .marker = wipe_marker, .can_resize = true, .fail_alloc_at = 4 };
+test "wipe: an allocation failure at any point frees only zeroed blocks" {
+    // Whichever allocation fails (storage, spans, the table entry, the table's
+    // entry list, a shrink, the field list), the blocks that go back hold no marker.
+    var blk: [128]u8 = undefined;
+    var fail_at: usize = 1;
+    while (fail_at <= 8) : (fail_at += 1) {
+        for ([_]bool{ false, true }) |can_resize| {
+            var w: zeroize.ScrubAlloc = .{ .marker = wipe_marker, .can_resize = can_resize, .fail_alloc_at = fail_at };
+            var dec: Decoder = .init(w.allocator(), .{});
+            if (dec.decodeBlock(wipeLiteral(&blk, 0x40, "x-secret", wipe_marker))) |hl| {
+                var l = hl;
+                l.deinit(w.allocator());
+            } else |err| try testing.expectEqual(error.OutOfMemory, err);
+            dec.deinit();
+            try testing.expectEqual(@as(usize, 0), w.dirty_frees);
+        }
+    }
+}
+
+test "wipe: storage growth through name references (indexed name, empty value) frees clean blocks" {
+    var w: zeroize.ScrubAlloc = .{ .marker = wipe_marker, .can_resize = false };
     var dec: Decoder = .init(w.allocator(), .{});
     defer dec.deinit();
-    var blk: [128]u8 = undefined;
-    try testing.expectError(error.OutOfMemory, dec.decodeBlock(wipeLiteral(&blk, 0x40, "x-secret", wipe_marker)));
+    var blk: [160]u8 = undefined;
+    var hl1 = try dec.decodeBlock(wipeLiteral(&blk, 0x40, wipe_marker, "."));
+    hl1.deinit(w.allocator());
+    // `0x0f 0x2f 0x00`: literal without indexing, name = entry 62, empty value:
+    // 3 octets of block, 25 octets of storage.
+    var refs: [3 * 60]u8 = undefined;
+    for (0..60) |k| @memcpy(refs[k * 3 ..][0..3], &[_]u8{ 0x0f, 0x2f, 0x00 });
+    var hl2 = try dec.decodeBlock(&refs);
+    try testing.expectEqual(@as(usize, 60), hl2.fields.len);
+    hl2.deinit(w.allocator());
     try testing.expectEqual(@as(usize, 0), w.dirty_frees);
+}
+
+/// Whether the last of `appends` (octet counts, after `refs` indexed fields of
+/// `f` octets each) outgrows the storage `decodeBlock` allocates for a block of
+/// `block_len` octets: first block * 4 + 64, then `ensureUnusedCapacityWiped`'s
+/// doubling.
+fn wipeLastAppendGrows(refs: usize, f: usize, block_len: usize, tail: []const usize) bool {
+    var cap: usize = block_len * 4 + 64;
+    var used: usize = 0;
+    var grew = false;
+    for (0..refs + tail.len) |k| {
+        const n = if (k < refs) f else tail[k - refs];
+        grew = used + n > cap;
+        if (grew) {
+            cap = @max(cap, 64);
+            while (cap < used + n) cap *= 2;
+        }
+        used += n;
+    }
+    return grew;
+}
+
+test "wipe: growth inside a raw string literal and inside a Huffman literal frees clean blocks" {
+    var vbuf: [100]u8 = @splat('.');
+    @memcpy(vbuf[0..wipe_marker.len], wipe_marker);
+    const f = "x-secret".len + vbuf.len;
+    // Huffman-coded value of 60 'a': a 5-bit code, 38 octets; the decoder reserves 61.
+    var hv: std.ArrayList(u8) = .empty;
+    defer hv.deinit(testing.allocator);
+    try huffmanEncode(testing.allocator, &hv, &@as([60]u8, @splat('a')));
+    try testing.expect(hv.items.len < 127);
+    for ([_]bool{ false, true }) |huff| {
+        const lit_len: usize = if (huff) 3 + 1 + hv.items.len else 3 + 1 + 100;
+        const tail = if (huff) [_]usize{ 1, hv.items.len * 8 / 5 + 1 } else [_]usize{ 1, 100 };
+        var refs: usize = 1;
+        while (!wipeLastAppendGrows(refs, f, refs + lit_len, &tail)) : (refs += 1) {
+            try testing.expect(refs < 400);
+        }
+        var w: zeroize.ScrubAlloc = .{ .marker = wipe_marker, .can_resize = false };
+        var dec: Decoder = .init(w.allocator(), .{});
+        defer dec.deinit();
+        var blk: [160]u8 = undefined;
+        var hl1 = try dec.decodeBlock(wipeLiteral(&blk, 0x40, "x-secret", &vbuf));
+        hl1.deinit(w.allocator());
+        var big: std.ArrayList(u8) = .empty;
+        defer big.deinit(testing.allocator);
+        try big.appendNTimes(testing.allocator, 0xBE, refs);
+        try big.appendSlice(testing.allocator, &.{ 0x00, 0x01, 'x' });
+        if (huff) {
+            try big.append(testing.allocator, 0x80 | @as(u8, @intCast(hv.items.len)));
+            try big.appendSlice(testing.allocator, hv.items);
+        } else {
+            try big.append(testing.allocator, 100);
+            try big.appendSlice(testing.allocator, &@as([100]u8, @splat('v')));
+        }
+        var hl2 = try dec.decodeBlock(big.items);
+        try testing.expectEqual(refs + 1, hl2.fields.len);
+        hl2.deinit(w.allocator());
+        try testing.expectEqual(@as(usize, 0), w.dirty_frees);
+    }
 }
 
 test "wipe: Encoder.deinit and eviction zero the values it indexed" {
