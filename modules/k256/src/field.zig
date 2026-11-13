@@ -136,6 +136,120 @@ fn reduceWide(wide: u512) [4]u64 {
 }
 
 /// `z = a·b mod p`, portable Solinas path (the oracle the asm core mirrors).
+// ── limb-level multiply (the runtime path since 2026-11-13) ─────────────────
+//
+// The same schoolbook product and two-fold Solinas reduction as the amd64 asm
+// core (`fast_core.zig`, see its module doc for the bounds), written in plain
+// Zig over `u128` products. Measured 2026-11-13 (`zig build bench-bip340`,
+// ReleaseFast, same host): BIP340 verify 52.8 → 41.9 µs once `Fe.mul`/`Fe.sq`
+// are `inline` (47.8 µs before inlining), sign and keypair ~10 % faster. The
+// asm block carries a `memory` clobber and fixed registers, so every field
+// element around it is spilled and reloaded and LLVM cannot interleave
+// neighbouring operations; the Zig form gives the register allocator the
+// whole point formula. Constant-time like the asm: straight-line, the one
+// select (`reduceLimbs`'s finish) is a `blackBox`-laundered mask. A
+// product-scanning (Comba) variant measured the same (40.2 vs 40.4 µs) and was
+// not kept. The asm core stays, pinned by its differential, but is no longer
+// dispatched.
+const use_limb_mul = true;
+
+inline fn reduceLimbs(t: [8]u64) [4]u64 {
+    const C: u64 = c_fold;
+    var r: [4]u64 = undefined;
+    // fold 1: r = t_lo + C·t_hi, excess word x4 < 2^34.
+    var c: u128 = 0;
+    inline for (0..4) |i| {
+        c += @as(u128, t[i + 4]) * C + t[i];
+        r[i] = @truncate(c);
+        c >>= 64;
+    }
+    // fold 2: += C·x4 (< 2^67); carry-out cf2.
+    c = @as(u128, @as(u64, @truncate(c))) * C + r[0];
+    r[0] = @truncate(c);
+    c >>= 64;
+    inline for (1..4) |i| {
+        c += r[i];
+        r[i] = @truncate(c);
+        c >>= 64;
+    }
+    const cf2: u64 = @truncate(c);
+    // finish: value < 2p; T = r + C, take T iff cf2 or T carried.
+    var tt: [4]u64 = undefined;
+    c = @as(u128, r[0]) + C;
+    tt[0] = @truncate(c);
+    c >>= 64;
+    inline for (1..4) |i| {
+        c += r[i];
+        tt[i] = @truncate(c);
+        c >>= 64;
+    }
+    const mask: u64 = 0 -% blackBox(cf2 | @as(u64, @truncate(c)));
+    inline for (0..4) |i| r[i] = (tt[i] & mask) | (r[i] & ~mask);
+    return r;
+}
+
+inline fn mulLimbs(a: [4]u64, b: [4]u64) [4]u64 {
+    var t: [8]u64 = undefined;
+    {
+        var c: u128 = 0;
+        inline for (0..4) |j| {
+            c += @as(u128, a[j]) * b[0];
+            t[j] = @truncate(c);
+            c >>= 64;
+        }
+        t[4] = @truncate(c);
+    }
+    inline for (1..4) |i| {
+        var c: u128 = 0;
+        inline for (0..4) |j| {
+            c += @as(u128, a[j]) * b[i] + t[i + j];
+            t[i + j] = @truncate(c);
+            c >>= 64;
+        }
+        t[i + 4] = @truncate(c);
+    }
+    return reduceLimbs(t);
+}
+
+inline fn sqLimbs(a: [4]u64) [4]u64 {
+    // Cross products once, doubled, plus the diagonal.
+    var t: [8]u64 = @splat(0);
+    {
+        var c: u128 = 0;
+        inline for (1..4) |j| {
+            c += @as(u128, a[0]) * a[j];
+            t[j] = @truncate(c);
+            c >>= 64;
+        }
+        t[4] = @truncate(c);
+        c = 0;
+        inline for (2..4) |j| {
+            c += @as(u128, a[1]) * a[j] + t[1 + j];
+            t[1 + j] = @truncate(c);
+            c >>= 64;
+        }
+        t[5] = @truncate(c);
+        c = @as(u128, a[2]) * a[3] + t[5];
+        t[5] = @truncate(c);
+        t[6] = @truncate(c >> 64);
+    }
+    t[7] = t[6] >> 63;
+    var i: usize = 6;
+    while (i > 1) : (i -= 1) t[i] = (t[i] << 1) | (t[i - 1] >> 63);
+    t[1] <<= 1;
+    var c: u128 = 0;
+    inline for (0..4) |k| {
+        const d = @as(u128, a[k]) * a[k];
+        c += @as(u128, t[2 * k]) + @as(u64, @truncate(d));
+        t[2 * k] = @truncate(c);
+        c >>= 64;
+        c += @as(u128, t[2 * k + 1]) + @as(u64, @truncate(d >> 64));
+        t[2 * k + 1] = @truncate(c);
+        c >>= 64;
+    }
+    return reduceLimbs(t);
+}
+
 pub fn mulPortable(a: [4]u64, b: [4]u64) [4]u64 {
     const wide: u512 = @as(u512, toU256(a)) * @as(u512, toU256(b));
     return reduceWide(wide);
@@ -305,13 +419,15 @@ pub const Fe = struct {
         return Fe.zero.sub(a);
     }
 
-    /// `a·b mod p`. Dispatches to the gated amd64 core when active, else the
+    /// `a·b mod p`. At runtime the limb-level Zig multiply (`mulLimbs`, see
+    /// `use_limb_mul`); otherwise the gated amd64 core when active, else the
     /// portable Solinas reduction. The `@inComptime()` guard routes comptime
     /// evaluation (e.g. the fixed-base comb-table build in `group.zig`) to the
     /// portable path, because the asm core cannot execute in the comptime
     /// interpreter; at runtime that branch is comptime-dead (`@inComptime()` is
     /// then a comptime-false constant), so it costs nothing.
-    pub fn mul(a: Fe, b: Fe) Fe {
+    pub inline fn mul(a: Fe, b: Fe) Fe {
+        if (use_limb_mul and !@inComptime()) return .{ ._limbs = mulLimbs(a._limbs, b._limbs) };
         if (field_asm_active and !@inComptime()) {
             var z: [4]u64 = undefined;
             fast_core.fieldMul(&z, &a._limbs, &b._limbs);
@@ -320,8 +436,9 @@ pub const Fe = struct {
         return .{ ._limbs = mulPortable(a._limbs, b._limbs) };
     }
 
-    /// `a² mod p`. Dispatches like `mul` (same comptime/asm split).
-    pub fn sq(a: Fe) Fe {
+    /// `a² mod p`. Dispatches like `mul` (`sqLimbs` at runtime).
+    pub inline fn sq(a: Fe) Fe {
+        if (use_limb_mul and !@inComptime()) return .{ ._limbs = sqLimbs(a._limbs) };
         if (field_asm_active and !@inComptime()) {
             var z: [4]u64 = undefined;
             fast_core.fieldSq(&z, &a._limbs);
@@ -909,6 +1026,36 @@ test "invert (constant-time safegcd) == invertChain == invertPublic on edges, sp
         const inv = a.invert();
         try std.testing.expectEqual(a.invertPublic().toInt(), inv.toInt());
         if (i % 16 == 0) try std.testing.expectEqual(a.invertChain().toInt(), inv.toInt());
+    }
+}
+
+test "mulLimbs/sqLimbs == the portable Solinas reduction (edges incl. the fold-2 carry, random)" {
+    const edges = [_]u256{
+        0,                1,                    2,                                c_fold,                  c_fold - 1,
+        1 << 64,          (1 << 128) - 1,       1 << 255,                         field_order - 1,         field_order - 2,
+        field_order >> 1, field_order - c_fold, (1 << 256) - (1 << 33) - 2 * 977, field_order - (1 << 64),
+    };
+    for (edges) |x0| {
+        const x = if (x0 >= field_order) x0 - field_order else x0;
+        for (edges) |y0| {
+            const y = if (y0 >= field_order) y0 - field_order else y0;
+            try std.testing.expectEqual(mulPortable(fromU256(x), fromU256(y)), mulLimbs(fromU256(x), fromU256(y)));
+        }
+        try std.testing.expectEqual(sqPortable(fromU256(x)), sqLimbs(fromU256(x)));
+    }
+    var prng = std.Random.DefaultPrng.init(0x11_4B5_3017);
+    const rand = prng.random();
+    const iters: usize = if (builtin.mode == .debug) 5000 else 100000;
+    for (0..iters) |i| {
+        var x: u256 = rand.int(u256);
+        var y: u256 = rand.int(u256);
+        // Values near p and near 2^256 - 1 in the high limbs stress the folds.
+        if (i % 4 == 1) x = field_order - 1 - rand.int(u64);
+        if (i % 4 == 2) y = field_order - 1 - rand.int(u128);
+        if (x >= field_order) x -= field_order;
+        if (y >= field_order) y -= field_order;
+        try std.testing.expectEqual(mulPortable(fromU256(x), fromU256(y)), mulLimbs(fromU256(x), fromU256(y)));
+        try std.testing.expectEqual(sqPortable(fromU256(x)), sqLimbs(fromU256(x)));
     }
 }
 
