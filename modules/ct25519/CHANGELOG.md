@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit re-recorded; since the 2026-11-01 mutation run only test code changed (no production line moved).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
 - **2026-11-01** — **NO CONSUMER-VISIBLE CHANGE:** fuzz harness (`src/fuzz_test.zig`, `CT25519_FUZZ`): `verifyEd25519Strict` against std `verifyStrict` (same verdict and error; valid, mutated, S+L, small-order, torsion and non-canonical inputs) and X25519 against std; 160 000 runs clean, every reach label hit. Closes full-CI `check-fuzz` (class B byte-accepting API without a harness).
 - **2026-11-01** — **Performance:** the 4×64 comb uses signed radix-32 digits (52 additions instead of 65, 40 KiB table instead of 24.5) and a vector-blend select; Ed25519 signing with one comb 13.7 → 12.5 µs. Same bytes; no API change.

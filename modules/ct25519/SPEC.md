@@ -6,9 +6,9 @@
 
 **Scope:** parity — curve25519-dalek 5.0 (secret-scalar group operations), not a full curve25519 library: point and scalar types are `std`'s (surveyed 2026-10-10)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-01 (106/116, 9 eq) · src d4283d67e92c7a24
+**Audit:** review 2026-09-15 · mutation 2026-11-01 (106/116, 9 eq) · src ce380f9af1fcf94e
 
-Audit detail: the 2026-11-01 mutation run (first scored run) covers the X25519 ladder and fe64 asm, the Edwards comb, Ed25519 verify, point decoding, wNAF/MSM and encodings: 11 survivors closed by new tests (the portable 4-bit comb was never executed on BMI2 hosts, a `mul121665` carry at ~2^-47, `combRecode5` digit range, `wipeState`, an identity-R forgery against `verifyEd25519Strict`); 1 survivor unexplained — dropping `mul`'s scalar wipe, visible only to a ReleaseFast stack probe, which was not run.
+Audit detail: the 2026-11-01 mutation run (first scored run) covers the X25519 ladder and fe64 asm, the Edwards comb, Ed25519 verify, point decoding, wNAF/MSM and encodings: 11 survivors closed by new tests (the portable 4-bit comb was never executed on BMI2 hosts, a `mul121665` carry at ~2^-47, `combRecode5` digit range, `wipeState`, an identity-R forgery against `verifyEd25519Strict`); 1 survivor unexplained — dropping `mul`'s scalar wipe, visible only to a ReleaseFast stack probe, which was not run. 2026-11-13: since that run the source changed only in test code (`fuzz_test.zig` and a test-only `hex32` helper in `root.zig` now come from `testkit.hex`, duplicate-code pass); no production line moved, so the run above still covers every guard and no delta mutants exist.
 
 **Hardening:** fuzz 2026-11-01 (160,000 runs clean, CT25519_FUZZ, 8 jobs × 20,000, every reach label hit) · ct 2026-09-29 (ctgrind) · panic 2026-10-30 (sweep + blind review: nothing to fix (fixed-size inputs, mulMulti already a checked panic); stack minimum in Backlog)
 
