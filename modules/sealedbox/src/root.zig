@@ -1020,3 +1020,36 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+noinline fn burnProbeDirty() void {
+    var b: [768]u8 = undefined;
+    const p: [*]volatile u8 = &b;
+    for (0..b.len) |i| p[i] = 0xC7;
+}
+
+/// Reads a same-sized frame at the same depth: whatever `burnProbeDirty` (or a
+/// burn after it) left there.
+noinline fn burnProbePeek() usize {
+    var b: [768]u8 = undefined;
+    const p: [*]const volatile u8 = &b;
+    var n: usize = 0;
+    for (0..b.len) |i| {
+        if (p[i] == 0xC7) n += 1;
+    }
+    return n;
+}
+
+test "burnCodecStack zeroes every byte of the dead stack at its depth (direct, optimized builds)" {
+    // The four secret-key codecs call it, but the stack probes find nothing for
+    // it to wipe in the current binary (the codecs write into caller buffers), so
+    // they cannot see a burn that skips, stops early or stops one vector short.
+    // This dirties a 768-byte frame at the callers' depth and looks at it after.
+    // Optimized builds only: Debug and ReleaseSafe fill `undefined` with 0xaa.
+    try @import("testkit").stackprobe.skipUnlessOptimized();
+    burnProbeDirty();
+    const kept = burnProbePeek();
+    try std.testing.expect(kept >= 700); // positive control: no burn, the bytes are still there
+    burnProbeDirty();
+    burnCodecStack();
+    try std.testing.expectEqual(@as(usize, 0), burnProbePeek());
+}

@@ -304,3 +304,27 @@ test "h near the modulus takes the reduced branch" {
         try std.testing.expectEqual(a, b);
     }
 }
+
+test "lane sum: the carry after the four lanes are added is needed (finish alone cannot take the raw sum)" {
+    // Dropping `h = carry(1, sum)` survived the 2026-11-13 mutation run: with
+    // random messages the raw lane sum (limbs up to 2^28) lands in the state
+    // that breaks `finish` only about once in 2^23. This message builds it.
+    // r = 1, so each lane keeps its block's limbs. Four blocks of an exact
+    // multiple of 64 bytes end in `finish` with no single-block step after the
+    // sum. Limb 0 of every block is 2^26 - 1 (sum 2^28 - 4), block 0 also has
+    // limb 1 = 2^26 - 1 and limb 2 = 1, and the four 2^128 bits make limb 4
+    // sum to 2^26 (carry 1, times 5 into limb 0). The first reduction chain
+    // then leaves limb 1 at 2^26 + 3 over a limb 2 with bit 0 set, which the
+    // `|` assembly of `finish` cannot represent.
+    const M: u64 = mask26;
+    var key = @as([32]u8, @splat(0));
+    key[0] = 1; // r = 1, s = 0
+    var msg = @as([64]u8, @splat(0));
+    mem.writeInt(u64, msg[0..8], M | (M << 26) | (1 << 52), .little);
+    for (1..4) |b| mem.writeInt(u64, msg[16 * b ..][0..8], M, .little);
+    var want: [16]u8 = undefined;
+    var got: [16]u8 = undefined;
+    std.crypto.onetimeauth.Poly1305.create(&want, &msg, &key);
+    create(&got, &msg, &key);
+    try std.testing.expectEqual(want, got);
+}

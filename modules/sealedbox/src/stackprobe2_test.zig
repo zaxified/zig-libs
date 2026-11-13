@@ -70,9 +70,15 @@ test "STACKPROBE: no recipient secret-key residue after open or the key rebuild"
     try std.testing.expect(short.burn_top < 1024);
     const long = try P.run("seal long", sb.seal, .{ fixed_io, &long_sealed, &long_msg, kp.public_key }, seal_secrets, .{});
     try std.testing.expect(long.burn_top < 1024);
-    _ = try P.run("open long", sb.open, .{ &long_plain, &long_sealed, &kp }, ks, .{});
+    // Same pin for `open`: its body (box key, subkey, keystream block, tag) runs above
+    // ct25519's inner burn, so with no burn in `open` the probe stays green while
+    // those frames go unwiped (mutation run 2026-11-13: bypassing `open`'s burn and
+    // every wipe in its body survived without this).
+    const open_long = try P.run("open long", sb.open, .{ &long_plain, &long_sealed, &kp }, ks, .{});
+    try std.testing.expect(open_long.burn_top < 1024);
     try std.testing.expectEqualSlices(u8, &long_msg, &long_plain);
-    _ = try P.run("open", sb.open, .{ &plain, &sealed, &kp }, ks, .{});
+    const open_short = try P.run("open", sb.open, .{ &plain, &sealed, &kp }, ks, .{});
+    try std.testing.expect(open_short.burn_top < 1024);
     try std.testing.expectEqualStrings(msg, &plain);
     _ = try P.run("openAlloc", openAllocFree, .{ std.heap.page_allocator, &sealed, &kp }, ks, .{});
     _ = try P.run("publicFromSecret", publicFromSecretStore, .{ sk, &pk_out }, ks, .{});
