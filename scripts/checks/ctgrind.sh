@@ -189,7 +189,7 @@ declare -A TARGETS=(
     [montint]="small portable asmcore field ffcontrol dyn"
     # ── added 2026-09-09, A1 R2's first four ────────────────────────────────
     [p256]="comb sign"
-    [rsa]="crt crtbl crtcache noncrt keygen"
+    [rsa]="crt crtbl crtcache noncrt keygen oaepnf"
     [slhdsa]="seed prf"
     # ⚠ `falcon` is here against its own SPEC.md, which argued it should NOT
     # have a row because the red would only measure the sampler's deliberate
@@ -559,6 +559,7 @@ declare -A PATTERN=(
     [rsa/crt]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [rsa/crtbl]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|safegcd[.]zig'
     [rsa/crtcache]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|safegcd[.]zig'
+    [rsa/oaepnf]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [rsa/noncrt]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [rsa/keygen]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [slhdsa/seed]='engine[.]zig|address[.]zig'
@@ -965,6 +966,7 @@ declare -A LABEL=(
     [rsa/crt]='rsa CRT p/q+std ff'
     [rsa/crtbl]='rsa CRT p/q, .csprng blinding'
     [rsa/crtcache]='rsa CRT p/q, .cached blinding x2'
+    [rsa/oaepnf]='rsa decryptOaepHNoFail (CRT + unpad), p/q'
     [rsa/noncrt]='rsa non-CRT d+std ff'
     [rsa/keygen]='rsa fromPrimes, p/q tainted'
     [slhdsa/seed]='slhdsa SK.seed'

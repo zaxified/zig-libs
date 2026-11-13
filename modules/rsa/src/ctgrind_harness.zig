@@ -115,7 +115,7 @@ fn reloadVolatile(comptime T: type, s: *const T) T {
     return out;
 }
 
-const Target = enum { crt, crtbl, crtcache, noncrt, keygen };
+const Target = enum { crt, crtbl, crtcache, noncrt, keygen, oaepnf };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -124,6 +124,7 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "crtcache")) return .crtcache;
     if (std.mem.eql(u8, s, "noncrt")) return .noncrt;
     if (std.mem.eql(u8, s, "keygen")) return .keygen;
+    if (std.mem.eql(u8, s, "oaepnf")) return .oaepnf;
     return error.UnknownTarget;
 }
 
@@ -198,7 +199,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // else -- see the module doc comment for why n/n_mont/e stay public in
     // both targets.
     switch (target) {
-        .crt, .crtbl, .crtcache => {
+        .crt, .crtbl, .crtcache, .oaepnf => {
             taintBytes(taint, std.mem.asBytes(&sk.p));
             taintBytes(taint, std.mem.asBytes(&sk.q));
             taintBytes(taint, std.mem.asBytes(&sk.dp));
@@ -238,6 +239,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
             out = try rsa.rsadpCrtBlinded(modulus_len, c, &sk_reloaded, .{ .cached = &cache });
         },
         .noncrt => out = try rsa.rsadp(modulus_len, c, &sk_reloaded),
+        .oaepnf => {
+            // `decryptOaepHNoFail` (2026-11-13): the whole OAEP unwrap, CRT op
+            // plus the branch-free unpadding, on a real OAEP ciphertext of a
+            // 32-byte message (built with the PUBLIC key before any taint
+            // matters). `ok` is returned as data and is NOT branched on here;
+            // only the witness print below touches it.
+            var drbg = std.Random.ChaCha.init(@splat(0x24));
+            var cbuf: [modulus_len]u8 = undefined;
+            const cek: [32]u8 = @splat(0x5a);
+            const oct = try rsa.encryptOaep(pk, std.crypto.hash.sha2.Sha256, drbg.random(), &cek, "", &cbuf);
+            var msg_out: [32]u8 = undefined;
+            var raw_out: [modulus_len]u8 = undefined;
+            const r = try rsa.decryptOaepHNoFail(&sk_reloaded, std.crypto.hash.sha2.Sha256, std.crypto.hash.sha2.Sha256, .none, oct, "", 32, &msg_out, &raw_out);
+            std.debug.print("ok={} msg={x}\n", .{ r.ok, r.msg });
+            out = raw_out;
+        },
         .keygen => unreachable,
     }
 

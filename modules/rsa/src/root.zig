@@ -1904,8 +1904,9 @@ pub fn ctEqMaskUsize(a: usize, b: usize) usize {
 /// a padding failure is not an `error` — see that function's doc comment for
 /// why, and `xmlenc`'s `rsaOaepUnwrap` for the caller that needs this shape.
 pub const OaepUnwrapResult = struct {
-    /// The recovered `want`-byte OAEP message when `ok` — otherwise
-    /// unspecified content (NOT a decoy; `msg.len` is 0). A caller that
+    /// Always `want` bytes long (the length never depends on secret data):
+    /// the recovered OAEP message when `ok`, all zero otherwise (NOT a
+    /// decoy). A caller that
     /// needs an unpredictable-to-the-peer decoy on `!ok` derives its own
     /// from `raw`, the same division of labor the RSAES-PKCS1-v1.5 path
     /// already has between `rsa.rsadpCrt` (raw block) and the caller's own
@@ -2025,11 +2026,15 @@ noinline fn decryptOaepHNoFailUnburned(
     const len_ok: u8 = @truncate(ctEqMaskUsize(msg_len, want) & 1);
     const valid: u8 = y_ok & lhash_ok & (invalid ^ 1) & found_sep & len_ok;
 
-    if (valid == 1) {
-        @memcpy(out[0..msg_len], db[sep_idx + 1 ..][0..msg_len]);
-        return .{ .msg = out[0..msg_len], .raw = raw_out[0..k], .ok = true };
-    }
-    return .{ .msg = out[0..0], .raw = raw_out[0..k], .ok = false };
+    // Branch-free output: `valid` implies msg_len == want, i.e. the message
+    // starts at the PUBLIC offset db.len - want, so no secret index and no
+    // secret-dependent length is needed. Always write exactly `want` bytes,
+    // masked to zero when !valid; `ok` is returned as data and declassified
+    // by the caller after it has done equal downstream work.
+    const vmask: u8 = 0 -% valid;
+    const tail = db[db.len - want ..];
+    for (out[0..want], tail) |*o, b| o.* = b & vmask;
+    return .{ .msg = out[0..want], .raw = raw_out[0..k], .ok = valid == 1 };
 }
 
 // ── P3: RSASSA-PSS (RFC 8017 §8.1) ───────────────────────────────────────────
@@ -4294,9 +4299,12 @@ test "decryptOaepHNoFail: padding failure -> ok=false, no error, raw still popul
     // erroring.
     var corrupt = kat2048_oaep.ct_sha256;
     corrupt[100] ^= 0x01;
+    @memset(&out, 0xAA);
     const r = try decryptOaepHNoFail(&sk, sha2.Sha256, sha2.Sha256, .none, &corrupt, "", kat2048_oaep.msg.len, &out, &raw);
     try testing.expect(!r.ok);
-    try testing.expectEqual(@as(usize, 0), r.msg.len);
+    // msg is `want` bytes, all zero when !ok, even over a dirty buffer.
+    try testing.expectEqual(kat2048_oaep.msg.len, r.msg.len);
+    try testing.expect(std.mem.allEqual(u8, r.msg, 0));
     // `raw` is populated either way -- it is the caller's decoy-derivation
     // input, not conditional on validity.
     try testing.expect(!std.mem.allEqual(u8, r.raw, 0));
@@ -4317,15 +4325,25 @@ test "decryptOaepHNoFail: want-length mismatch is folded into validity, not a se
     var out: [max_modulus_len]u8 = undefined;
     var raw: [max_modulus_len]u8 = undefined;
 
+    @memset(&out, 0xAA);
     const r = try decryptOaepHNoFail(&sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", kat2048_oaep.msg.len + 1, &out, &raw);
     try testing.expect(!r.ok);
+    try testing.expectEqual(kat2048_oaep.msg.len + 1, r.msg.len);
+    try testing.expect(std.mem.allEqual(u8, r.msg, 0));
 
+    @memset(&out, 0xAA);
     const r2 = try decryptOaepHNoFail(&sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", kat2048_oaep.msg.len - 1, &out, &raw);
     try testing.expect(!r2.ok);
+    try testing.expect(std.mem.allEqual(u8, r2.msg, 0));
 
     // The exact length still succeeds (sanity: this isn't just "always false").
     const r3 = try decryptOaepHNoFail(&sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", kat2048_oaep.msg.len, &out, &raw);
     try testing.expect(r3.ok);
+
+    // Valid result is byte-identical to decryptOaepH's.
+    var out2: [max_modulus_len]u8 = undefined;
+    const ref = try decryptOaepH(&sk, sha2.Sha256, sha2.Sha256, &kat2048_oaep.ct_sha256, "", &out2);
+    try testing.expectEqualSlices(u8, ref, r3.msg);
 }
 
 test "decryptOaepHNoFail: decoupled hash (LabelHash != MgfHash) round-trips too" {
