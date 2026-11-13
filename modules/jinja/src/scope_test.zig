@@ -4,8 +4,8 @@
 //! Unicode case mapping. Expected values are the documented semantics of the
 //! reference (Jinja2 docs "List of Builtin Filters/Tests", the Jinja2 test
 //! suite examples, Python's `%` operator, `textwrap` and `str` methods); the
-//! test names cite the source. Values this author could not confirm against a
-//! live Jinja2 are marked UNCONFIRMED in a comment.
+//! test names cite the source. Since 2026-11-13 every filter here is also in the
+//! oracle corpus (`s3_*` cases of `tools/corpus.zig`, replayed from golden.json).
 
 const std = @import("std");
 const testing = std.testing;
@@ -49,6 +49,10 @@ test "format: floats round the exact binary value, as Python does (2.675 -> 2.67
     try expectOut("{{ '%.2f|%8.3f|%.0f|%.0f|%.0f|%.1f|%.1f'|format(2.675, 3.14159, 0.5, 1.5, 2.5, 0.05, 0.25) }}", "2.67|   3.142|0|2|2|0.1|0.2");
     try expectOut("{{ '%e|%E|%.0e|%g|%g|%g|%g'|format(12345.678, 0.00012, 5.5, 0.0001, 1234567.0, 100000.0, 1e6) }}", "1.234568e+04|1.200000E-04|6e+00|0.0001|1.23457e+06|100000|1e+06");
     try expectOut("{{ '%f|%f|%g'|format(-0.0, 1e22, 0.0) }}", "-0.000000|10000000000000000000000.000000|0");
+}
+
+test "format: inf and nan are zero-padded like Python (oracle s3_format_special_floats)" {
+    try expectOut("{{ '%010f|%-6f|' |format(1e999, 1e999) }}", "0000000inf|inf   |");
 }
 
 test "format: %s %r %c %% and string precision" {
@@ -159,7 +163,8 @@ test "groupby: dotted and numeric attributes, `default` for missing keys (docs: 
 }
 
 test "groupby: case-insensitive grouping by default, case_sensitive=true splits (docs: case_sensitive)" {
-    // Group counts only: whether the grouper prints folded is UNCONFIRMED (SPEC D24).
+    // The grouper is the first member's own value (oracle `s3_groupby_case_insensitive`, SPEC D24).
+    try expectOut("{% for g in [{'k':'B'},{'k':'a'},{'k':'A'},{'k':'b'}]|groupby('k') %}[{{ g.grouper }}:{{ g.list|length }}]{% endfor %}", "[a:2][B:2]");
     try expectOut("{% for g in [{'k':'A'},{'k':'a'},{'k':'B'}]|groupby('k') %}{{ g.list|length }} {% endfor %}", "2 1 ");
     try expectOut("{% for g in [{'k':'A'},{'k':'a'},{'k':'B'}]|groupby('k', none, true) %}{{ g.list|length }} {% endfor %}", "1 1 1 ");
 }
@@ -174,6 +179,8 @@ test "groupby: empty input and keys that do not order" {
 test "sameas: Python `is` on singletons, containers by identity (docs tests/sameas)" {
     try expectOut("{{ none is sameas none }}{{ true is sameas true }}{{ false is sameas none }}{{ false is sameas true }}", "TrueTrueFalseFalse");
     try expectOut("{% set l = [1] %}{{ l is sameas l }}{{ l is sameas [1] }}", "TrueFalse");
+    // Empty containers have no distinguishable identity here (SPEC D26).
+    try expectOut("{{ {} is sameas {} }}{{ [] is sameas [] }}", "FalseFalse");
 }
 
 test "callable: macros are callable, plain values are not (docs tests/callable)" {

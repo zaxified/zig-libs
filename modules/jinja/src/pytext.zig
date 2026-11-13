@@ -522,7 +522,8 @@ pub fn percentFormat(
                 const neg = !std.math.isNan(f) and std.math.signbit(f);
                 const body = try floatBody(a, @abs(f), lower, spec.prec orelse 6, spec.alt, upper);
                 const sign: []const u8 = if (neg) "-" else if (spec.plus) "+" else if (spec.space) " " else "";
-                try emit(a, &out, spec, sign, body, std.math.isFinite(f));
+                // Python zero-pads inf/nan too (`'%010f' % inf` is `0000000inf`).
+                try emit(a, &out, spec, sign, body, true);
             },
             else => return error.BadArgument,
         }

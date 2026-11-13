@@ -1604,11 +1604,13 @@ fn fGroupby(ctx: *Ctx, input: Value, args: Args) Error!Value {
     const dflt: Value = args.get(1, "default") orelse .none;
     const case_sensitive = boolArg(args, 2, "case_sensitive", false);
     const keys = try ctx.arena.alloc(Value, items.len);
+    // The grouper is the FIRST item's own attribute value, not the folded
+    // sort key (checked against Jinja2 3.1.6: `A, a` group as `A`).
+    const raw = try ctx.arena.alloc(Value, items.len);
     for (items, 0..) |it, i| {
         var k = try attrOf(ctx, it, attr);
         if (k == .undef) k = dflt;
-        // `ignore_case` is the `postprocess` of the attribute getter, so the
-        // grouper itself is the lower-cased key.
+        raw[i] = k;
         if (!case_sensitive and k == .string) k = Value.str(try lowerStr(ctx, k.string.bytes));
         keys[i] = k;
     }
@@ -1633,7 +1635,7 @@ fn fGroupby(ctx: *Ctx, input: Value, args: Args) Error!Value {
         const members = try ctx.arena.alloc(Value, j - i);
         for (members, order[i..j]) |*m, idx| m.* = items[idx];
         const pair = try ctx.arena.alloc(Value, 2);
-        pair[0] = keys[order[i]];
+        pair[0] = raw[order[i]];
         pair[1] = .{ .list = members };
         try out.append(ctx.arena, .{ .tuple = pair });
         i = j;
@@ -1833,9 +1835,9 @@ fn tSameas(ctx: *Ctx, input: Value, args: Args) Error!bool {
         .integer => |i| other == .integer and other.integer == i,
         .float => false,
         .string => |sv| other == .string and sv.safe == other.string.safe and std.mem.eql(u8, sv.bytes, other.string.bytes),
-        .list => |l| other == .list and l.ptr == other.list.ptr and l.len == other.list.len,
-        .tuple => |l| other == .tuple and l.ptr == other.tuple.ptr and l.len == other.tuple.len,
-        .map => |m| other == .map and m.pairs.ptr == other.map.pairs.ptr and m.pairs.len == other.map.pairs.len,
+        .list => |l| l.len != 0 and other == .list and l.ptr == other.list.ptr and l.len == other.list.len,
+        .tuple => |l| l.len != 0 and other == .tuple and l.ptr == other.tuple.ptr and l.len == other.tuple.len,
+        .map => |m| m.pairs.len != 0 and other == .map and m.pairs.ptr == other.map.pairs.ptr and m.pairs.len == other.map.pairs.len,
         .namespace => |n| other == .namespace and n == other.namespace,
         .loop => |n| other == .loop and n == other.loop,
         .macro => |m| other == .macro and m.impl == other.macro.impl,

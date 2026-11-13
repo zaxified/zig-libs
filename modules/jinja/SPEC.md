@@ -289,8 +289,9 @@ or a documented, tested behaviour.
 | D21 | A filter or test named by a *string argument* to `map`/`select`/`reject`/`selectattr`/`rejectattr` is resolved at render time, as in the reference — unlike a directly named filter, which is resolved at compile time | runtime error |
 | D22 | `~` and `\|length` on an undefined value are `error.UndefinedValue` under `.lenient` too, where the reference's `Undefined` renders `''` and answers `0` | runtime, stricter |
 | D23 | `groupby` yields plain 2-tuples `(grouper, list)` (their `repr` is the reference's, `_GroupTuple.__repr__ = tuple.__repr__`); this model has no named tuples, so any 2-tuple whose second item is a list answers `.grouper` and `.list`, where the reference answers undefined for other tuples | silent, more permissive |
-| D24 | UNCONFIRMED against the live reference: `groupby` is case-insensitive by default through the attribute getter's `postprocess`, so the grouper of a string key is implemented as the **lower-cased** key; the grouping, sorting and member order are not in doubt, only whether Jinja2 3.1.6 prints the folded or the first item's spelling. Needs one oracle run | to confirm |
-| D25 | `format` follows Python's `%` for `s r d i u x X o c e E f F g G %`, flags, width, precision and `*`; `%a` and the `%(key)` form with positional arguments are errors. `wordwrap` returns a plain string (the reference slices a `Markup` and joins with `str.join`, UNCONFIRMED for markup input) | runtime error / to confirm |
+| D24 | **Resolved by the oracle (2026-11-13):** `groupby` is case-insensitive by default, and the grouper of a group is the **first member's own attribute value** (`A, a` group as `A` when `A` comes first; the group `a, A` prints `a`), not the lower-cased sort key. Implemented and pinned by `s3_groupby_case_insensitive` | closed |
+| D25 | `format` follows Python's `%` for `s r d i u x X o c e E f F g G %`, flags, width, precision and `*` (each case in the corpus, `s3_format_*`); `%a` is an error. `wordwrap` returns a plain string — **confirmed by the oracle**: the reference joins with `str.join`, so a `Markup` input is escaped on output (`s3_wordwrap_markup_in`) | runtime error (`%a`) |
+| D26 | `sameas` on empty containers is false (they have no distinguishable identity in this value model; Python is true only for the same object). `callable` is true for macros and `loop` only: `range`, `dict` and `namespace` are not first-class values here, so `range is callable` is false where the reference answers true | silent |
 
 Why `attr` was dropped rather than implemented (D6): the reference's `attr`
 filter is `getattr` *without* the `getitem` fallback, so applied to a mapping —
@@ -443,9 +444,7 @@ without the whitespace-rewriting options, must never trip a safety check. Any
 `error` is a fine outcome. Per CONVENTIONS §7.1, that evidence is about a Debug
 or ReleaseSafe build.
 
-**Scope tests** (`scope_test.zig`, 2026-11-13): the S3 built-ins. No Python oracle was available to that pass, so the expected
-values are the documented semantics (Jinja2 docs examples and test-suite cases, Python's `%`, `textwrap`, `str`), each test
-names its source, and the UNCONFIRMED ones (D24, D25) await one `zig build interop-jinja -- --capture` run with a corpus extension.
+**Scope tests** (`scope_test.zig`, 2026-11-13): the S3 built-ins. The same filters are in the oracle corpus (80 `s3_*` cases of `tools/corpus.zig`, golden.json re-captured from Jinja2 3.1.6), so the replay compares every one byte for byte; `scope_test.zig` adds the cases the corpus cannot hold (hostile widths, bounds, the sweep).
 
 **Unit tests** (`engine_test.zig`) cover what the reference has no equivalent
 of: compile-time name resolution, diagnostics and line numbers, custom
@@ -662,9 +661,7 @@ makes these bound tests rather than "it errored eventually" tests.
 ## 11. Backlog
 
 - Four absent filters (D6): `pprint` needs Python's pretty-printer layout, `random` needs a seed in the environment to be
-  testable at all, `urlize` needs the reference's URL/e-mail regexes, `attr` is deliberate. **Capture goldens for the S3
-  filters** (`format`, `groupby`, `wordwrap`, `filesizeformat`, Unicode case, `sameas`, `callable`) into `tools/corpus.zig`
-  and `testdata/golden.json` with a live Jinja2 3.1.6 run, and resolve D24/D25.
+  testable at all, `urlize` needs the reference's URL/e-mail regexes, `attr` is deliberate.
 - i18n (`{% trans %}`) and the `{% autoescape %}` block (D2). The latter needs
   autoescaping to become a per-region property of the renderer rather than an
   environment option; worth doing only alongside the former.
