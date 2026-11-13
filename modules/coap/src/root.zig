@@ -77,6 +77,14 @@ pub const block = @import("block.zig");
 /// "lollipop" freshness test (`isNewer`).
 pub const observe = @import("observe.zig");
 
+/// CoRE link-format (RFC 6690): `Writer` (builder), `Parser` (iterator) and the
+/// §4.1 query `Filter` used by `/.well-known/core` discovery.
+pub const linkformat = @import("linkformat.zig");
+
+/// A resource registry and request dispatcher with `/.well-known/core`
+/// discovery over `linkformat`.
+pub const resource = @import("resource.zig");
+
 const external_goldens = @import("external_goldens.zig");
 
 // Flat convenience re-exports of the extensions' primary types.
@@ -95,6 +103,8 @@ test {
     _ = server;
     _ = block;
     _ = observe;
+    _ = linkformat;
+    _ = resource;
     _ = external_goldens;
 }
 
@@ -128,6 +138,12 @@ pub const Code = enum(u8) {
     post = (0 << 5) | 2,
     put = (0 << 5) | 3,
     delete = (0 << 5) | 4,
+    /// 0.05 FETCH (RFC 8132 §2): a GET that carries a request body (a selector).
+    fetch = (0 << 5) | 5,
+    /// 0.06 PATCH (RFC 8132 §3): apply a patch document to the resource.
+    patch = (0 << 5) | 6,
+    /// 0.07 iPATCH (RFC 8132 §3): the idempotent PATCH.
+    ipatch = (0 << 5) | 7,
 
     // 2.xx — success (RFC 7252 §12.1.2).
     created = (2 << 5) | 1,
@@ -141,6 +157,8 @@ pub const Code = enum(u8) {
 
     // 4.xx — client error.
     bad_request = (4 << 5) | 0,
+    /// 4.01 Unauthorized — also the response that carries an Echo challenge
+    /// (RFC 9175 §2.4).
     unauthorized = (4 << 5) | 1,
     bad_option = (4 << 5) | 2,
     forbidden = (4 << 5) | 3,
@@ -150,8 +168,16 @@ pub const Code = enum(u8) {
     /// 4.08 Request Entity Incomplete — the block-wise request body arrived out
     /// of order or a block was missing (RFC 7959 §2.9.2).
     request_entity_incomplete = (4 << 5) | 8,
+    /// 4.09 Conflict (RFC 8132 §3.4): the patch cannot be applied to the
+    /// resource's current state.
+    conflict = (4 << 5) | 9,
+    /// 4.12 Precondition Failed (RFC 7252 §5.9.2.10).
+    precondition_failed = (4 << 5) | 12,
     request_entity_too_large = (4 << 5) | 13,
     unsupported_content_format = (4 << 5) | 15,
+    /// 4.22 Unprocessable Entity (RFC 8132 §3.4): a well-formed but semantically
+    /// invalid patch.
+    unprocessable_entity = (4 << 5) | 22,
 
     // 5.xx — server error.
     internal_server_error = (5 << 5) | 0,
@@ -176,6 +202,15 @@ pub const Code = enum(u8) {
     /// Build a code from class + detail (e.g. `Code.init(2, 5)` == `.content`).
     pub fn init(cls: u3, det: u5) Code {
         return @fromBackingInt(@intCast((@as(u8, cls) << 5) | det));
+    }
+
+    /// True for the methods that can carry a request body that selects or
+    /// modifies the target (POST, PUT, FETCH, PATCH, iPATCH).
+    pub fn hasRequestBody(c: Code) bool {
+        return switch (c) {
+            .post, .put, .fetch, .patch, .ipatch => true,
+            else => false,
+        };
     }
 
     /// A request code (class 0, and not the Empty message).
@@ -239,19 +274,49 @@ pub const SerializeError = error{
 /// their values from `bytes`); the returned `Message.options` is the filled
 /// prefix. No allocation; everything borrows `bytes`.
 pub fn parse(bytes: []const u8, options_buf: []Option) ParseError!Message {
+    return parseImpl(bytes, options_buf, false);
+}
+
+/// Largest token an RFC 8974 extended-token-length message can carry:
+/// 269 + 65535 octets.
+pub const max_extended_token_len = 269 + 65535;
+
+/// Like `parse`, but also accepts the RFC 8974 §2.1 extended token length:
+/// TKL 13 (one extension octet, length = 13 + octet) and TKL 14 (two octets
+/// big-endian, length = 269 + value) after the Message ID; TKL 15 stays a
+/// format error. Use it only towards a peer known to support RFC 8974 (on UDP
+/// that is found by trial and error, §2.2.2); a plain `parse` keeps rejecting
+/// TKL 9..15 as RFC 7252 §3 requires.
+pub fn parseExtended(bytes: []const u8, options_buf: []Option) ParseError!Message {
+    return parseImpl(bytes, options_buf, true);
+}
+
+fn parseImpl(bytes: []const u8, options_buf: []Option, comptime extended: bool) ParseError!Message {
     if (bytes.len < 4) return error.TooShort;
     const b0 = bytes[0];
     if (b0 >> 6 != version) return error.BadVersion;
     const typ: Type = @fromBackingInt(@intCast(@as(u2, @truncate(b0 >> 4))));
     const tkl: u4 = @truncate(b0);
-    if (tkl > max_token_len) return error.BadTokenLength;
     const code: Code = @fromBackingInt(@intCast(bytes[1]));
     const message_id = std.mem.readInt(u16, bytes[2..4], .big);
 
     var pos: usize = 4;
-    if (bytes.len < pos + tkl) return error.Truncated;
-    const token = bytes[pos .. pos + tkl];
-    pos += tkl;
+    var token_len: usize = tkl;
+    if (tkl > max_token_len) {
+        if (!extended or tkl == 15) return error.BadTokenLength;
+        if (tkl == 13) {
+            if (bytes.len < pos + 1) return error.Truncated;
+            token_len = @as(usize, bytes[pos]) + 13;
+            pos += 1;
+        } else {
+            if (bytes.len < pos + 2) return error.Truncated;
+            token_len = @as(usize, std.mem.readInt(u16, bytes[pos..][0..2], .big)) + 269;
+            pos += 2;
+        }
+    }
+    if (bytes.len - pos < token_len) return error.Truncated;
+    const token = bytes[pos .. pos + token_len];
+    pos += token_len;
 
     var n_opts: usize = 0;
     var number: u32 = 0;
@@ -344,16 +409,48 @@ fn writeExtended(value: u32, out: []u8, pos: *usize) SerializeError!void {
 /// should be at least `encodedLen(msg)` bytes. Options must be sorted ascending
 /// by `number`.
 pub fn serialize(msg: Message, out: []u8) SerializeError!usize {
-    if (msg.token.len > max_token_len) return error.BadTokenLength;
-    if (out.len < 4 + msg.token.len) return error.BufferTooSmall;
-    out[0] = (@as(u8, version) << 6) |
-        (@as(u8, @backingInt(msg.type)) << 4) |
-        @as(u8, @intCast(msg.token.len));
+    return serializeImpl(msg, out, false);
+}
+
+/// Like `serialize`, but a token longer than 8 octets is written with the
+/// RFC 8974 §2.1 extended token length (see `parseExtended`). Lengths 9..12
+/// have no encoding (TKL 13 starts at 13) and are `BadTokenLength`, as are
+/// tokens over `max_extended_token_len`.
+pub fn serializeExtended(msg: Message, out: []u8) SerializeError!usize {
+    return serializeImpl(msg, out, true);
+}
+
+/// `encodedLen` for `serializeExtended` (0 for a token no encoding exists for).
+pub fn encodedLenExtended(msg: Message) usize {
+    const t = msg.token.len;
+    const ext: usize = if (t <= max_token_len) 0 else if (t <= 268) 1 else 2;
+    return encodedLen(msg) + ext;
+}
+
+fn serializeImpl(msg: Message, out: []u8, comptime extended: bool) SerializeError!usize {
+    const tlen = msg.token.len;
+    var nibble: u8 = @intCast(@min(tlen, max_token_len));
+    var ext_len: usize = 0;
+    if (tlen > max_token_len) {
+        if (!extended or tlen < 13 or tlen > max_extended_token_len) return error.BadTokenLength;
+        if (tlen <= 268) {
+            nibble = 13;
+            ext_len = 1;
+        } else {
+            nibble = 14;
+            ext_len = 2;
+        }
+    }
+    if (out.len < 4 + ext_len + tlen) return error.BufferTooSmall;
+    out[0] = (@as(u8, version) << 6) | (@as(u8, @backingInt(msg.type)) << 4) | nibble;
     out[1] = @backingInt(msg.code);
     std.mem.writeInt(u16, out[2..4], msg.message_id, .big);
     var pos: usize = 4;
-    @memcpy(out[pos..][0..msg.token.len], msg.token);
-    pos += msg.token.len;
+    if (ext_len == 1) out[pos] = @intCast(tlen - 13);
+    if (ext_len == 2) std.mem.writeInt(u16, out[pos..][0..2], @intCast(tlen - 269), .big);
+    pos += ext_len;
+    @memcpy(out[pos..][0..tlen], msg.token);
+    pos += tlen;
 
     var last_number: u16 = 0;
     for (msg.options) |opt| {
@@ -603,6 +700,42 @@ test "encodedLen matches serialize across shapes" {
     }
 }
 
+test "RFC 8974 §2.1: extended token length round-trips, plain parse still refuses it" {
+    var tok: [300]u8 = undefined;
+    for (&tok, 0..) |*b, i| b.* = @truncate(i *% 7 +% 1);
+    const cases = [_]usize{ 0, 8, 13, 14, 268, 269, 270, 300 };
+    for (cases) |n| {
+        const msg: Message = .{ .type = .confirmable, .code = .get, .message_id = 0x1234, .token = tok[0..n] };
+        var out: [512]u8 = undefined;
+        const len = try serializeExtended(msg, &out);
+        try testing.expectEqual(encodedLenExtended(msg), len);
+        var opts: [2]Option = undefined;
+        const back = try parseExtended(out[0..len], &opts);
+        try expectMessageEqual(msg, back);
+        if (n > 8) try testing.expectError(error.BadTokenLength, parse(out[0..len], &opts));
+    }
+    // Wire shape: TKL 13 + one ext octet (length - 13); TKL 14 + two (length - 269).
+    var out: [512]u8 = undefined;
+    _ = try serializeExtended(.{ .type = .confirmable, .code = .get, .message_id = 1, .token = tok[0..13] }, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x4d, 0x01, 0x00, 0x01, 0x00 }, out[0..5]);
+    _ = try serializeExtended(.{ .type = .confirmable, .code = .get, .message_id = 1, .token = tok[0..270] }, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x4e, 0x01, 0x00, 0x01, 0x00, 0x01 }, out[0..6]);
+}
+
+test "RFC 8974 §2.1: TKL 15, 9..12 tokens and truncation are errors" {
+    var opts: [2]Option = undefined;
+    try testing.expectError(error.BadTokenLength, parseExtended(&.{ 0x4f, 1, 0, 1 }, &opts));
+    try testing.expectError(error.Truncated, parseExtended(&.{ 0x4d, 1, 0, 1 }, &opts)); // no ext octet
+    try testing.expectError(error.Truncated, parseExtended(&.{ 0x4e, 1, 0, 1, 0 }, &opts)); // one of two
+    try testing.expectError(error.Truncated, parseExtended(&.{ 0x4d, 1, 0, 1, 0, 1, 2 }, &opts)); // 13 declared, 2 present
+    var out: [64]u8 = undefined;
+    const tok: [12]u8 = @splat(0);
+    try testing.expectError(error.BadTokenLength, serializeExtended(.{ .type = .confirmable, .code = .get, .message_id = 1, .token = tok[0..9] }, &out));
+    try testing.expectError(error.BadTokenLength, serialize(.{ .type = .confirmable, .code = .get, .message_id = 1, .token = tok[0..9] }, &out));
+    const long: [20]u8 = @splat(0);
+    try testing.expectError(error.BufferTooSmall, serializeExtended(.{ .type = .confirmable, .code = .get, .message_id = 1, .token = &long }, out[0..20]));
+}
+
 test "Code helpers" {
     try testing.expectEqual(@as(u3, 2), Code.content.class());
     try testing.expectEqual(@as(u5, 5), Code.content.detail());
@@ -610,6 +743,17 @@ test "Code helpers" {
     try testing.expect(Code.get.isRequest());
     try testing.expect(!Code.content.isRequest());
     try testing.expect(!Code.empty.isRequest());
+}
+
+test "Code: RFC 8132 §6 method and response code numbers" {
+    try testing.expectEqual(Code.init(0, 5), Code.fetch);
+    try testing.expectEqual(Code.init(0, 6), Code.patch);
+    try testing.expectEqual(Code.init(0, 7), Code.ipatch);
+    try testing.expectEqual(Code.init(4, 9), Code.conflict);
+    try testing.expectEqual(Code.init(4, 22), Code.unprocessable_entity);
+    try testing.expectEqual(Code.init(4, 12), Code.precondition_failed);
+    try testing.expect(Code.fetch.isRequest() and Code.patch.isRequest() and Code.ipatch.isRequest());
+    try testing.expect(Code.patch.hasRequestBody() and !Code.get.hasRequestBody() and !Code.delete.hasRequestBody());
 }
 
 // ── fuzz: datagram parse, never panics ──────────────────────────────────────

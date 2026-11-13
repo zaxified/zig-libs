@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — scope S4 → S3: new `coap.linkformat` (RFC 6690 `Writer`/`Parser`/§4.1 `Filter`) and `coap.resource` (`Registry`, `Resource`, `Registry.dispatch`: routing by Uri-Path, 4.04/4.05, `/.well-known/core` discovery with `rt`/`if`/`ct`/`sz`/`obs`/`title` attributes and query filtering, RFC 7967 No-Response, multicast no-match silence). Named RFC extras: `Code.fetch/patch/ipatch/conflict/precondition_failed/unprocessable_entity` (RFC 8132), option numbers + typed accessors for Echo/Request-Tag (RFC 9175) and No-Response (RFC 7967), content formats 51/52, RFC 8974 extended tokens via the opt-in `parseExtended`/`serializeExtended`/`encodedLenExtended` (plain `parse`/`serialize` unchanged). Two new fuzz harnesses (`coap-linkformat-parse`, `coap-resource-dispatch`).
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-10** — tests: deterministic fuzz driver `COAP_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harness: `parse` (round-trips every accepted datagram byte-for-byte). Verdict: 200,000 runs, ReleaseSafe, clean.

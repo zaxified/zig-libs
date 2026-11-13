@@ -41,6 +41,15 @@ pub const number = struct {
     pub const proxy_uri: u16 = 35;
     pub const proxy_scheme: u16 = 39;
     pub const size1: u16 = 60;
+    /// Echo — the server's freshness / amplification challenge, opaque 1..40
+    /// octets, elective, not repeatable (RFC 9175 §2.2.1, Table 2).
+    pub const echo: u16 = 252;
+    /// No-Response — which response classes the client does not want, uint of
+    /// 0..1 octet, elective but unsafe-to-forward (RFC 7967 §2).
+    pub const no_response: u16 = 258;
+    /// Request-Tag — tells block-wise request bodies apart, opaque 0..8 octets,
+    /// elective, repeatable, request-only (RFC 9175 §3.2).
+    pub const request_tag: u16 = 292;
 };
 
 /// Common Content-Format identifiers (RFC 7252 §12.3 + the CoAP Content-Formats
@@ -52,6 +61,10 @@ pub const content_format = struct {
     pub const octet_stream: u16 = 42;
     pub const exi: u16 = 47;
     pub const json: u16 = 50;
+    /// application/json-patch+json (RFC 8132 §6, RFC 6902) — a PATCH body.
+    pub const json_patch: u16 = 51;
+    /// application/merge-patch+json (RFC 8132 §6, RFC 7396) — a PATCH body.
+    pub const merge_patch: u16 = 52;
     pub const cbor: u16 = 60;
 };
 
@@ -179,6 +192,77 @@ pub const QueryIterator = struct {
 
 pub fn uriQuery(msg: coap.Message) QueryIterator {
     return .{ .options = msg.options };
+}
+
+// ── RFC 9175 Echo / Request-Tag, RFC 7967 No-Response ───────────────────────
+
+/// Echo values are 1..40 octets (RFC 9175 §2.2.1).
+pub const echo_max_len = 40;
+/// Request-Tag values are 0..8 octets (RFC 9175 §3.2).
+pub const request_tag_max_len = 8;
+
+/// A registered opaque option carries a value outside its length range.
+pub const OpaqueError = error{OptionValueLength};
+
+/// The `Echo` (option 252) value, null when absent, or
+/// `error.OptionValueLength` when it is empty or longer than 40 octets. A client
+/// echoing the option back must copy the value unchanged (RFC 9175 §2.2.1).
+pub fn echo(msg: coap.Message) OpaqueError!?[]const u8 {
+    const v = firstOption(msg.options, number.echo) orelse return null;
+    if (v.len < 1 or v.len > echo_max_len) return error.OptionValueLength;
+    return v;
+}
+
+/// Iterates the `Request-Tag` (option 292) values of a request in order; the
+/// option is repeatable. `next` fails with `error.OptionValueLength` on a value
+/// over 8 octets (the iterator then moves past it).
+pub const RequestTagIterator = struct {
+    options: []const Option,
+    i: usize = 0,
+
+    pub fn next(it: *RequestTagIterator) OpaqueError!?[]const u8 {
+        while (it.i < it.options.len) {
+            const o = it.options[it.i];
+            it.i += 1;
+            if (o.number != number.request_tag) continue;
+            if (o.value.len > request_tag_max_len) return error.OptionValueLength;
+            return o.value;
+        }
+        return null;
+    }
+};
+
+pub fn requestTags(msg: coap.Message) RequestTagIterator {
+    return .{ .options = msg.options };
+}
+
+/// No-Response bit values (RFC 7967 §2.1): the bit for class `n.xx` is
+/// `1 << (n - 1)`; OR them to suppress several classes.
+pub const no_response = struct {
+    pub const interested: u8 = 0;
+    pub const suppress_2xx: u8 = 2;
+    pub const suppress_4xx: u8 = 8;
+    pub const suppress_5xx: u8 = 16;
+    /// Every response class RFC 7252 defines (2.xx, 4.xx, 5.xx).
+    pub const suppress_all: u8 = 26;
+
+    /// Whether `value` asks the server not to send a response with `code`.
+    /// Requests, the Empty message and classes the value has no bit for (class
+    /// 0, or class 8 and up, which `Code` cannot carry anyway) are never
+    /// suppressed.
+    pub fn suppresses(value: u8, code: coap.Code) bool {
+        const c = code.class();
+        if (c == 0) return false;
+        return (value >> (c - 1)) & 1 == 1;
+    }
+};
+
+/// The `No-Response` (option 258) value, null when absent (= interested in
+/// everything), or `error.OptionValueTooLong` when it exceeds 1 octet.
+pub fn noResponse(msg: coap.Message) FormatError!?u8 {
+    const v = firstOption(msg.options, number.no_response) orelse return null;
+    if (v.len > 1) return error.OptionValueTooLong;
+    return @intCast(decodeUint(v));
 }
 
 // ── URI ↔ options mapping (RFC 7252 §6) ─────────────────────────────────────
@@ -437,6 +521,68 @@ test "encodeUint minimal big-endian" {
     try testing.expectEqualSlices(u8, &.{ 0x01, 0x00 }, encodeUint(256, &buf));
     try testing.expectEqualSlices(u8, &.{ 0x01, 0x2c }, encodeUint(300, &buf));
     try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, encodeUint(std.math.maxInt(u64), &buf));
+}
+
+test "RFC 9175 Table 2: Echo/Request-Tag numbers and class bits" {
+    try testing.expectEqual(@as(u16, 252), number.echo);
+    try testing.expectEqual(@as(u16, 292), number.request_tag);
+    // Elective (even), safe-to-forward (bit 1 clear); Echo NoCacheKey, Request-Tag in the key.
+    try testing.expect(!isCritical(number.echo) and !isUnsafe(number.echo) and noCacheKey(number.echo));
+    try testing.expect(!isCritical(number.request_tag) and !isUnsafe(number.request_tag) and !noCacheKey(number.request_tag));
+}
+
+test "RFC 9175 §2.2.1: echo accessor enforces 1..40 octets" {
+    const long: [41]u8 = @splat(7);
+    const ok: [40]u8 = @splat(7);
+    const mk = struct {
+        fn m(v: []const u8, store: *[1]Option) coap.Message {
+            store[0] = .{ .number = number.echo, .value = v };
+            return .{ .type = .confirmable, .code = .get, .message_id = 1, .options = store };
+        }
+    }.m;
+    var st: [1]Option = undefined;
+    try testing.expectEqualSlices(u8, &ok, (try echo(mk(&ok, &st))).?);
+    try testing.expectEqualSlices(u8, &.{1}, (try echo(mk(&.{1}, &st))).?);
+    try testing.expectError(error.OptionValueLength, echo(mk(&long, &st)));
+    try testing.expectError(error.OptionValueLength, echo(mk(&.{}, &st)));
+    try testing.expect((try echo(.{ .type = .confirmable, .code = .get, .message_id = 1 })) == null);
+}
+
+test "RFC 9175 §3.2: Request-Tag is repeatable, 0..8 octets" {
+    const opts = [_]Option{
+        .{ .number = number.uri_path, .value = "a" },
+        .{ .number = number.request_tag, .value = &.{ 1, 2 } },
+        .{ .number = number.request_tag, .value = &.{} },
+        .{ .number = number.request_tag, .value = &.{ 9, 9, 9, 9, 9, 9, 9, 9, 9 } },
+    };
+    var it = requestTags(.{ .type = .confirmable, .code = .fetch, .message_id = 1, .options = &opts });
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, (try it.next()).?);
+    try testing.expectEqual(@as(usize, 0), (try it.next()).?.len);
+    try testing.expectError(error.OptionValueLength, it.next());
+    try testing.expect((try it.next()) == null);
+}
+
+test "RFC 7967 §2.1: No-Response value bits" {
+    try testing.expectEqual(@as(u16, 258), number.no_response);
+    try testing.expect(!isCritical(number.no_response) and isUnsafe(number.no_response));
+    try testing.expectEqual(@as(u8, 2 | 8 | 16), no_response.suppress_all);
+    // The RFC's own examples: 2 = not interested in 2.xx, 8 = 4.xx, 16 = 5.xx, 26 = all.
+    try testing.expect(no_response.suppresses(2, .content) and !no_response.suppresses(2, .not_found));
+    try testing.expect(no_response.suppresses(8, .not_found) and !no_response.suppresses(8, .content));
+    try testing.expect(no_response.suppresses(16, .internal_server_error));
+    for ([_]coap.Code{ .content, .not_found, .bad_gateway }) |c| {
+        try testing.expect(no_response.suppresses(26, c));
+        try testing.expect(!no_response.suppresses(0, c));
+    }
+    try testing.expect(!no_response.suppresses(26, .get)); // a request is not a response
+    try testing.expect(!no_response.suppresses(26, .empty));
+    var buf: [8]u8 = undefined;
+    const enc = encodeUint(no_response.suppress_2xx | no_response.suppress_5xx, &buf);
+    const opts = [_]Option{.{ .number = number.no_response, .value = enc }};
+    try testing.expectEqual(@as(?u8, 18), try noResponse(.{ .type = .non_confirmable, .code = .get, .message_id = 1, .options = &opts }));
+    const bad = [_]Option{.{ .number = number.no_response, .value = &.{ 0, 2 } }};
+    try testing.expectError(error.OptionValueTooLong, noResponse(.{ .type = .non_confirmable, .code = .get, .message_id = 1, .options = &bad }));
+    try testing.expect((try noResponse(.{ .type = .non_confirmable, .code = .get, .message_id = 1 })) == null);
 }
 
 test "uint round-trip has no leading zeros" {
