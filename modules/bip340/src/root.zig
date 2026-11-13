@@ -771,6 +771,8 @@ pub const BatchItem = struct {
 /// multiply and the batch was 1.03–1.12× SLOWER than a loop over `verify`;
 /// see `SPEC.md` for the numbers now.
 const batch_chunk = 8;
+/// Draws `verifyBatch` makes for one randomizer before it gives up (`false`).
+const max_draws = 8;
 
 pub fn verifyBatch(items: []const BatchItem, io: std.Io) bool {
     // Empty batch: A1 audit F9 (LOW, round-2 Q5 -- "which normative source
@@ -833,11 +835,15 @@ pub fn verifyBatch(items: []const BatchItem, io: std.Io) bool {
         // whether to use it.
         const a: Scalar = if (i == 0) Scalar.one else blk: {
             var wide: [48]u8 = undefined;
-            while (true) {
+            // Sweep B340-1: a non-zero draw fails with probability ~2^-256, so
+            // `max_draws` is never reached by a working CSPRNG; a degenerate
+            // `io` (all zeros forever) gets `false`, not an endless loop.
+            for (0..max_draws) |_| {
                 io.randomSecure(&wide) catch return false;
                 const n = Scalar.fromBytes48(wide, .little);
                 if (!n.isZero()) break :blk n;
             }
+            return false;
         };
 
         lhs_scalar = lhs_scalar.add(a.mul(s));
@@ -977,6 +983,128 @@ test "A1 F5 (round-2 follow-up): signImpl enforces step 10 on the REAL productio
         }
     }.call;
     try std.testing.expectError(error.SignatureVerificationFailed, signImpl(.{ .secret = &sk }, msg, aux_rand, on, corruptRy));
+}
+
+// ── no-panic sweep 2026-11-13 (B340) ────────────────────────────────────────
+
+/// An `Io` whose `randomSecure` always yields zeros (a degenerate CSPRNG) and
+/// counts the draws; every other operation is `inner`'s.
+const ZeroRngIo = struct {
+    vtable: std.Io.VTable,
+    inner: std.Io,
+    draws: usize = 0,
+
+    fn io(self: *ZeroRngIo) std.Io {
+        self.vtable = self.inner.vtable.*;
+        self.vtable.randomSecure = onRandomSecure;
+        return .{ .userdata = self, .vtable = &self.vtable };
+    }
+
+    fn onRandomSecure(userdata: ?*anyopaque, buffer: []u8) std.Io.RandomSecureError!void {
+        const self: *ZeroRngIo = @ptrCast(@alignCast(userdata.?));
+        self.draws += 1;
+        // A runaway caller is cut off after 1000 draws so a regression fails
+        // the assertion below instead of hanging the suite.
+        if (self.draws > 1000) return error.EntropyUnavailable;
+        @memset(buffer, 0);
+    }
+};
+
+test "verifyBatch: a degenerate all-zero randomSecure ends in false after a bounded number of draws (sweep B340-1)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var zio: ZeroRngIo = .{ .vtable = undefined, .inner = threaded.io() };
+    const io = zio.io();
+
+    const sk = try SecretKey.fromBytes(@as([32]u8, @splat(0x42)));
+    var kp: KeyPair = undefined;
+    try KeyPair.fromSecretKey(&kp, &sk);
+    defer kp.deinit();
+    const sig = try Signature.fromBytes(try sign(&sk, "m", @splat(0), threaded.io(), .{}));
+    const items = [_]BatchItem{
+        .{ .pubkey = kp.public, .msg = "m", .sig = sig },
+        .{ .pubkey = kp.public, .msg = "m", .sig = sig },
+    };
+    try std.testing.expect(!verifyBatch(&items, io));
+    try std.testing.expect(zio.draws >= 1 and zio.draws <= 16);
+    // One item needs no randomizer (a_1 = 1): the zero RNG is never asked.
+    zio.draws = 0;
+    try std.testing.expect(verifyBatch(items[0..1], io));
+    try std.testing.expectEqual(@as(usize, 0), zio.draws);
+}
+
+test "LiftedPublicKey built by hand: a wrong, odd, huge or non-canonical y/x is rejected, never trusted (sweep B340)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const sk = try SecretKey.fromBytes(@as([32]u8, @splat(0x42)));
+    var kp: KeyPair = undefined;
+    try KeyPair.fromSecretKey(&kp, &sk);
+    defer kp.deinit();
+    const sig = try Signature.fromBytes(try sign(&sk, "m", @splat(0), threaded.io(), .{}));
+    const good = try LiftedPublicKey.fromXOnly(kp.public);
+    try std.testing.expect(verifyLifted(&good, "m", sig));
+
+    var bad = good;
+    bad.y = good.y.neg(); // odd root: the wrong point
+    try std.testing.expect(!verifyLifted(&bad, "m", sig));
+    bad.y = Fe.zero;
+    try std.testing.expect(!verifyLifted(&bad, "m", sig));
+    bad.y = Fe.one;
+    try std.testing.expect(!verifyLifted(&bad, "m", sig));
+    bad.y = .{ ._limbs = @splat(std.math.maxInt(u64)) }; // not even a field element
+    try std.testing.expect(!verifyLifted(&bad, "m", sig));
+    bad = good;
+    bad.x = @splat(0xff); // x >= p
+    try std.testing.expect(!verifyLifted(&bad, "m", sig));
+    bad.x = @splat(0); // x = 0 with y of another key
+    try std.testing.expect(!verifyLifted(&bad, "m", sig));
+}
+
+test "every decoder rejects out-of-range input without panicking (sweep B340)" {
+    const ff: [32]u8 = @splat(0xff);
+    try std.testing.expectError(error.InvalidPublicKey, XOnlyPublicKey.fromBytes(ff));
+    try std.testing.expectError(error.InvalidPublicKey, LiftedPublicKey.fromBytes(ff));
+    try std.testing.expectError(error.InvalidSecretKey, SecretKey.fromBytes(ff));
+    var out: SecretKey = undefined;
+    try std.testing.expectError(error.InvalidSecretKey, SecretKey.fromBytesInto(&out, &ff));
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0)), &out.bytes);
+    try std.testing.expectError(error.InvalidSignature, Signature.fromBytes(ff ++ @as([32]u8, @splat(0))));
+    try std.testing.expectError(error.InvalidSignature, Signature.fromBytes(@as([32]u8, @splat(0)) ++ ff));
+    // A hand-built KeyPair with an out-of-range or zero scalar: error, no panic.
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const pk = try XOnlyPublicKey.fromBytes(Secp256k1.basePoint.affineCoordinates().x.toBytes(.big));
+    var kp = KeyPair{ .secret = ff, .public = pk };
+    try std.testing.expectError(error.InvalidSecretKey, signWithKeyPair(&kp, "m", @splat(0), io, .{}));
+    kp.secret = @splat(0);
+    _ = signWithKeyPair(&kp, "m", @splat(0), io, .{}) catch {};
+    try std.testing.expectError(error.SignatureVerificationFailed, signWithKeyPair(&kp, "m", @splat(0), io, .{ .self_verify = true }));
+    // Empty message, all-zero aux_rand, hand-built garbage batch items.
+    const zsig = Signature{ .r = @splat(0), .s = @splat(0) };
+    try std.testing.expect(!verify(pk, "", zsig));
+    const junk = [_]BatchItem{
+        .{ .pubkey = .{ .x = ff }, .msg = "", .sig = zsig },
+        .{ .pubkey = pk, .msg = "", .sig = .{ .r = ff, .s = ff } },
+    };
+    try std.testing.expect(!verifyBatch(&junk, io));
+    try std.testing.expect(!verifyBatch(junk[0..1], io));
+    try std.testing.expect(!verifyBatch(junk[1..2], io));
+    try std.testing.expect(verifyBatch(junk[0..0], io));
+}
+
+test "verifyBatch: a large batch of one valid item repeated is accepted in bounded stack (sweep B340)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const sk = try SecretKey.fromBytes(@as([32]u8, @splat(0x42)));
+    var kp: KeyPair = undefined;
+    try KeyPair.fromSecretKey(&kp, &sk);
+    defer kp.deinit();
+    const sig = try Signature.fromBytes(try sign(&sk, "m", @splat(0), io, .{}));
+    // The batch lives in static storage: `verifyBatch` itself allocates nothing.
+    const items: [300]BatchItem = @splat(.{ .pubkey = kp.public, .msg = "m", .sig = sig });
+    try std.testing.expect(verifyBatch(&items, io));
 }
 
 test "SecretKey.fromBytes REJECTS the all-zero scalar (d == 0 is not in [1, n-1])" {
