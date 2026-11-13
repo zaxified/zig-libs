@@ -31,9 +31,10 @@ What was taken:
     - rust-lang/annotate-snippets-rs 0.12.17 src/renderer/margin.rs (Margin)
       and src/renderer/graphics.rs (the Margin use in draw_snippet, the `...`
       placeholder and window selection of draw_line) — terminal-width cutting
-    - unicode-rs/unicode-width 0.2.2 src/tables.rs — the width lookup, replayed
-      by tools/unicode-width/gen.py into the generated src/width_table.zig
-      (DATA derived from the Unicode Character Database, Unicode 17.0.0)
+    - unicode-rs/unicode-width 0.2.3 src/gen/tables.rs and src/gen/lookup.rs —
+      the width lookup, replayed by tools/unicode-width/gen.py into the generated
+      src/width_table.zig (DATA derived from the Unicode Character Database,
+      Unicode 18.0.0)
 
   DATA (vendored unmodified, test-only):
     - codespan-reporting/tests/term.rs and 28 tests/snapshots/*.snap files,

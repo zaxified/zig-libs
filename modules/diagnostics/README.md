@@ -150,7 +150,7 @@ try diag.render(w, .{
 ```
 
 Columns are display widths (`diagnostics.charWidth(cp)`, the tables of
-unicode-width 0.2.2): East Asian wide, fullwidth and emoji are two columns,
+unicode-width 0.2.3, Unicode 18.0): East Asian wide, fullwidth and emoji are two columns,
 combining marks, ZWJ and variation selectors none, ambiguous characters one.
 `Diagnostic.col` stays a byte column; `RenderOptions.column = .char` only
 changes what the `-->` line prints (the character column; `short` always prints

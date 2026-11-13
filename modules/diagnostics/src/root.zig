@@ -561,7 +561,7 @@ const MultiEnt = struct { col: u8, primary: bool, kind: MultiKind, pos: usize, m
 
 const Chr = struct { idx: usize, len: usize, width: usize, cp: u21, valid: bool };
 
-// ported from unicode-rs/unicode-width 0.2.2 src/tables.rs (MIT OR Apache-2.0)
+// ported from unicode-rs/unicode-width 0.2.3 src/gen/tables.rs (MIT OR Apache-2.0)
 // via the generated width_table.zig: `UnicodeWidthChar::width`, ambiguous narrow.
 /// Display columns of a printable code point: 0 for combining marks, variation
 /// selectors, ZWJ and other zero-width characters, 2 for East Asian Wide /

@@ -27,7 +27,7 @@ fn expectRender(want: []const u8, d: dg.Diagnostic, text: []const u8, o: dg.Rend
     try testing.expectEqualStrings(want, got);
 }
 
-test "charWidth: wide, combining, zero-width, emoji, controls (unicode-width 0.2.2)" {
+test "charWidth: wide, combining, zero-width, emoji, controls (unicode-width 0.2.3)" {
     try testing.expectEqual(@as(u2, 1), dg.charWidth('a'));
     try testing.expectEqual(@as(u2, 1), dg.charWidth(0x00e9)); // e acute
     try testing.expectEqual(@as(u2, 1), dg.charWidth(0x03a9)); // Omega (ambiguous: narrow)
@@ -46,6 +46,12 @@ test "charWidth: wide, combining, zero-width, emoji, controls (unicode-width 0.2
     try testing.expectEqual(@as(u2, 1), dg.charWidth(0x10fffd)); // past the last range
     try testing.expectEqual(@as(u2, 3), dg.charWidth(0x17d8)); // the crate gives Khmer beyyal 3
     try testing.expectEqual(@as(u2, 0), dg.charWidth(0x00ad)); // soft hyphen
+    // Unicode 18.0 (unicode-width 0.2.3): new wide, emoji and combining code points
+    try testing.expectEqual(@as(u2, 2), dg.charWidth(0x191a0)); // JURCHEN RADICAL-01
+    try testing.expectEqual(@as(u2, 2), dg.charWidth(0x1fadd)); // PICKLE
+    try testing.expectEqual(@as(u2, 0), dg.charWidth(0x1aec)); // COMBINING CARON-ACUTE
+    // 0.2.3 gives the halfwidth katakana sound marks one column (0.2.2: none); UCD data unchanged
+    try testing.expectEqual(@as(u2, 1), dg.charWidth(0xff9e));
     try testing.expectEqual(@as(u2, 0), dg.charWidth(0x0007)); // control: no width
 }
 
