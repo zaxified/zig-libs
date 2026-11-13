@@ -345,6 +345,55 @@ test "hello: the SessionTicket extension (RFC 5077): absent, empty, or carrying 
     try testing.expectEqual(full.len - 4, mem.readInt(u24, full[1..4], .big));
 }
 
+test "hello: the largest hello this client can send (5 shares, longest host and ALPN, a maximal cookie, a 2048-byte ticket or PSK identity) fits max_len" {
+    var buf: [max_len]u8 = undefined;
+    const r: [32]u8 = @splat(1);
+    const k1216: [1216]u8 = @splat(1);
+    const k32: [32]u8 = @splat(1);
+    const k65: [65]u8 = @splat(1);
+    const k97: [97]u8 = @splat(1);
+    const k133: [133]u8 = @splat(1);
+    const host: [255]u8 = @splat('h');
+    const alpn: [4 + 2 + 512]u8 = @splat(0);
+    var suites: [24]u8 = @splat(0);
+    suites[1] = 22;
+    const cookie: [max_cookie_len]u8 = @splat('c');
+    const ticket: [max_ticket_len]u8 = @splat('t');
+    var p: Params = .{
+        .random = &r,
+        .session_id = &r,
+        .cipher_suites = &suites,
+        .host = &host,
+        .versions = &.{ .tls_1_3, .tls_1_2 },
+        .groups = &.{ .x25519_ml_kem768, .x25519, .secp256r1, .secp384r1, .secp521r1 },
+        .shares = &.{
+            .{ .group = .x25519_ml_kem768, .key = &k1216 },
+            .{ .group = .x25519, .key = &k32 },
+            .{ .group = .secp256r1, .key = &k65 },
+            .{ .group = .secp384r1, .key = &k97 },
+            .{ .group = .secp521r1, .key = &k133 },
+        },
+        .alpn_ext = &alpn,
+        .status_request = true,
+        .signed_certificate_timestamp = true,
+        .extended_master_secret = true,
+        .renegotiation_info = true,
+        .cookie = &cookie,
+    };
+    // A cached TLS 1.2 ticket (no PSK then: an entry is one kind) ...
+    p.session_ticket = &ticket;
+    const a = try write(&buf, p);
+    try testing.expect(a.len <= max_len);
+    // ... or a TLS 1.3 PSK identity with the empty ticket extension.
+    p.session_ticket = "";
+    p.psk = .{ .identity = &ticket, .obfuscated_ticket_age = 1, .binder_len = 64 };
+    const b = try write(&buf, p);
+    try testing.expect(b.len <= max_len);
+    // Both at once cannot happen, and would not fit: an error, never a panic.
+    p.session_ticket = &ticket;
+    try testing.expectError(error.NoSpaceLeft, write(buf[0 .. max_len - 300], p));
+}
+
 /// The body of extension `t` in the ClientHello `m`, or null.
 fn findExt(m: []const u8, t: u16) ?[]const u8 {
     var i: usize = 4 + 2 + 32 + 1 + 32;

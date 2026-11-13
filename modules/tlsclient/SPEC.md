@@ -206,7 +206,7 @@ std has neither, and adding them is not this module's job. `.ca =
 - **A KeyUpdate must end its record** (RFC 8446 §5.1): anything after it in
   the same record is `TlsUnexpectedMessage`, before the key changes.
 - **`realtime_now`** outside i64 milliseconds is `error.RealtimeInvalid`.
-- **Stack:** `init` needs about 400 KiB free (296 KiB deep, then the 384 KiB
+- **Stack:** `init` needs about 400 KiB free (302 KiB deep: +6 KiB for TLS 1.2 resumption, 2026-11-13, estimated from the new locals, then the 384 KiB
   dead-stack burn); documented on `init`, not checked at run time.
 
 ## Updating the copy
@@ -423,7 +423,8 @@ Why rustls + aws-lc-rs is the "fastest" side and OpenSSL is not measured here: o
   *Before offering:* leaf past notAfter -> entry deleted; a session made without verification is not
   offered to a verifying config; the cipher suite must still be offered. *On the ServerHello:* the
   session_id echo means "resumed" (an echo with nothing offered is `illegal_parameter`: the TLS 1.3
-  compatibility id echoed); then version, suite and EMS answer must equal the session's, else
+  compatibility id echoed -- also with no cache at all; Go's own check, an RFC 8446 §4.1.2 downgrade
+  signal, pinned by a test); then version, suite and EMS answer must equal the session's, else
   `handshake_failure`; the master secret, chain and group come from the session; `VerifyConnection`
   still runs, after the server's Finished and before ours; the server's Finished is first. The
   NewSessionTicket comes before the server's ChangeCipherSpec (required when the ServerHello
@@ -435,7 +436,12 @@ Why rustls + aws-lc-rs is the "fastest" side and OpenSSL is not measured here: o
   effect); a ticket over `max_ticket_len` (2048) is not cached (Go has no cap); the cached chain's
   validity against the bundle is not re-run at resumption (leaf notAfter and the verification tag
   only -- as for TLS 1.3 here; Go re-verifies its `VerifiedChains`); OCSP response and SCTs are not
-  kept with the session. Code: `Client.zig` (offer, abbreviated handshake, ticket handler),
+  kept with the session. **Review fixes 2026-11-13**, also Go's: at offer time the stored chain is
+  verified again under the current bundle and clock and the host name against the leaf (a removed CA
+  or an expired certificate ends the session; TLS 1.3 entries too); a session whose EMS use differs
+  from this hello's is not offered; a ticket over the cap, or a Finished with trailing octets, ends it
+  (`TlsDecodeError`); an entry replaced between offer and Finished is `SessionReplaced`, not an empty
+  view; a ClientHello over `hello.max_len` is `ClientHelloTooLarge`. Code: `Client.zig` (offer, abbreviated handshake, ticket handler),
   `session.zig` (`version12` entries, `fresh12`, `wipe`, `drop`), `hello.zig` (`session_ticket`);
   the ticket codec is `tlsresume.ticket12`.
 - **`VerifiedChains`** — the path `x509.verifyChain` built is not exposed (`ConnectionInfo` has the chain as

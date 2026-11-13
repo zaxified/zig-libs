@@ -39,7 +39,7 @@ comptime {
 pub const meta = .{
     // The module catalog's one-line entry -- README.md's table is rendered
     // from this by `zig build gen-catalog`.
-    .doc = "std's TLS 1.3/1.2 client with the server chain verified by RFC 5280 (x509.verifyChain) — closes ziglang/zig #35877 — grown to Go crypto/tls client parity: Go's defaults (2 key shares + HelloRetryRequest, OCSP/SCT, EMS), client certificates incl. RSA and TLS 1.2, session view + verification hook, exporter, TLS 1.3 resumption.",
+    .doc = "std's TLS 1.3/1.2 client with the server chain verified by RFC 5280 (x509.verifyChain) — closes ziglang/zig #35877 — grown to Go crypto/tls client parity: Go's defaults (2 key shares + HelloRetryRequest, OCSP/SCT, EMS), client certificates incl. RSA and TLS 1.2, session view + verification hook, exporter, TLS 1.3 and TLS 1.2 (RFC 5077) resumption.",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,

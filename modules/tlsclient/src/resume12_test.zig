@@ -54,7 +54,38 @@ fn sessionId() [32]u8 {
 
 // ── cache priming ──────────────────────────────────────────────────────────
 
+const good_host = "good.example.test";
+/// Inside every fixture's validity window (2026-09-25); `far` is past 2036.
+const now_fixture: i64 = 1_790_300_000;
+const far: i64 = 2_200_000_000;
+
+fn pemToDer(pem: []const u8, out: []u8) ![]const u8 {
+    const begin = "-----BEGIN CERTIFICATE-----";
+    const a = (std.mem.find(u8, pem, begin) orelse return error.NoPem) + begin.len;
+    const b = std.mem.findPos(u8, pem, a, "-----END CERTIFICATE-----") orelse return error.NoPem;
+    return out[0..try std.base64.standard.decoderWithIgnore(" \t\r\n").decode(out, pem[a..b])];
+}
+
+/// A bundle holding the fixture root (empty: none).
+fn rootBundle(gpa: std.mem.Allocator, with_root: bool) !std.crypto.Certificate.Bundle {
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    errdefer bundle.deinit(gpa);
+    if (!with_root) return bundle;
+    var buf: [4096]u8 = undefined;
+    const der = try pemToDer(@embedFile("testdata/root.pem"), &buf);
+    const start: u32 = @intCast(bundle.bytes.items.len);
+    try bundle.bytes.appendSlice(gpa, der);
+    try bundle.parseCert(gpa, start, 0);
+    return bundle;
+}
+
 const Prime = struct {
+    /// The fixture chain (leaf, intermediate) for `good_host`, made under a
+    /// bundle, instead of placeholder bytes under no verification.
+    real_chain: bool = false,
+    /// A TLS 1.3 entry (a PSK ticket) instead of a TLS 1.2 one.
+    v13: bool = false,
+    received_s: i64 = now_fixture,
     ticket: []const u8 = "OLD-TICKET",
     suite: u16 = suite_ecdhe_rsa_aes128gcm,
     ems: bool = true,
@@ -63,12 +94,26 @@ const Prime = struct {
 };
 
 fn prime(cache: *Client.SessionCache, p: Prime) *Client.ClientSession {
-    const e = cache.reserve(host).?;
+    const e = cache.reserve(if (p.real_chain) good_host else host).?;
     e.wipe();
     e.verification = .no_verification;
     e.leaf_not_after_s = p.not_after_s;
-    _ = e.setChain(&.{ "leaf-der", "inter-der" });
-    if (p.tls12) {
+    if (p.real_chain) {
+        var b1: [4096]u8 = undefined;
+        var b2: [4096]u8 = undefined;
+        const leaf = pemToDer(@embedFile("testdata/leaf.pem"), &b1) catch unreachable;
+        const inter = pemToDer(@embedFile("testdata/inter.pem"), &b2) catch unreachable;
+        _ = e.setChain(&.{ leaf, inter });
+        e.verification = .bundle;
+    } else _ = e.setChain(&.{ "leaf-der", "inter-der" });
+    if (p.v13) {
+        e.hash = .sha256;
+        @memcpy(e.ticket_buf[0..p.ticket.len], p.ticket);
+        e.ticket_len = @intCast(p.ticket.len);
+        e.ticket_lifetime_s = 3600;
+        e.received_ms = p.received_s * 1000;
+        e.usable = true;
+    } else if (p.tls12) {
         @memcpy(e.resumption_secret[0..48], &master);
         @memcpy(e.ticket_buf[0..p.ticket.len], p.ticket);
         e.ticket_len = @intCast(p.ticket.len);
@@ -97,6 +142,8 @@ const Cfg = struct {
     now_s: i64 = 0,
     ems: bool = true,
     cache: ?*Client.SessionCache,
+    /// Verify against this bundle, for `good_host` (else: no verification, `host`).
+    bundle: ?*std.crypto.Certificate.Bundle = null,
 };
 
 const Result = struct {
@@ -112,9 +159,10 @@ fn run(server: []const u8, cfg: Cfg) Result {
     var fw = Writer.fixed(&out_buf);
     info = .init(&info_storage);
     const e = entropy();
+    var lock: std.Io.RwLock = .init;
     const opts: Client.Options = .{
-        .host = .{ .explicit = host },
-        .ca = .no_verification,
+        .host = .{ .explicit = if (cfg.bundle != null) good_host else host },
+        .ca = if (cfg.bundle) |b| .{ .bundle = .{ .gpa = testing.allocator, .io = testing.io, .lock = &lock, .bundle = b } } else .no_verification,
         .write_buffer = &write_buf,
         .read_buffer = &read_buf,
         .entropy = &e,
@@ -182,6 +230,8 @@ const Srv = struct {
     /// A NewSessionTicket as the very first message after the ServerHello
     /// even though the extension was not announced.
     unannounced_ticket: bool = false,
+    /// One octet after the Finished's verify_data (inside its length).
+    finished_trailing: bool = false,
 };
 
 fn prf(label: []const u8, seed: []const []const u8, comptime n: usize) [n]u8 {
@@ -211,7 +261,7 @@ fn putPlainRecord(w: *Writer, ct: tls.ContentType, body: []const u8) void {
 /// server's Finished (what the client's own Finished is computed over).
 fn buildServer(buf: []u8, ch: []const u8, s: Srv, th: *Sha256) []const u8 {
     var w = Writer.fixed(buf);
-    var scratch: [512]u8 = undefined;
+    var scratch: [2560]u8 = undefined;
     var sw = Writer.fixed(&scratch);
     th.* = Sha256.init(.{});
     th.update(ch);
@@ -236,7 +286,7 @@ fn buildServer(buf: []u8, ch: []const u8, s: Srv, th: *Sha256) []const u8 {
     th.update(sh);
     putPlainRecord(&w, .handshake, sh);
 
-    var nst_buf: [128]u8 = undefined;
+    var nst_buf: [2400]u8 = undefined;
     if (s.ticket) |t| if (s.ticket_ext or s.unannounced_ticket) {
         var nw = Writer.fixed(&nst_buf);
         nw.writeInt(u32, 7200, .big) catch unreachable;
@@ -255,21 +305,24 @@ fn buildServer(buf: []u8, ch: []const u8, s: Srv, th: *Sha256) []const u8 {
     const kb = prf("key expansion", &.{ &server_random, &clientRandom() }, 48);
     var verify = prf("server finished", &.{&hash}, 12);
     if (s.tamper_finished) verify[3] ^= 1;
-    var fin: [16]u8 = undefined;
+    var fin: [17]u8 = undefined;
+    const fin_len: usize = if (s.finished_trailing) 17 else 16;
     fin[0] = 20;
-    std.mem.writeInt(u24, fin[1..4], 12, .big);
-    @memcpy(fin[4..], &verify);
+    std.mem.writeInt(u24, fin[1..4], @intCast(fin_len - 4), .big);
+    @memcpy(fin[4..16], &verify);
+    fin[16] = 0xAA;
     const explicit: [8]u8 = @splat(0);
     var nonce: [12]u8 = undefined;
     @memcpy(nonce[0..4], kb[36..40]); // server_write_IV
     @memcpy(nonce[4..], &explicit);
-    const ad = explicit ++ [_]u8{ 22, 3, 3 } ++ [_]u8{ 0, 16 };
-    var rec: [8 + 16 + 16]u8 = undefined;
+    var ad: [13]u8 = explicit ++ [_]u8{ 22, 3, 3, 0, 16 };
+    ad[12] = @intCast(fin_len);
+    var rec: [8 + 17 + 16]u8 = undefined;
     @memcpy(rec[0..8], &explicit);
-    Aead.encrypt(rec[8..24], rec[24..40], &fin, &ad, nonce, kb[16..32].*);
-    putPlainRecord(&w, .handshake, &rec);
+    Aead.encrypt(rec[8..][0..fin_len], rec[8 + fin_len ..][0..16], fin[0..fin_len], &ad, nonce, kb[16..32].*);
+    putPlainRecord(&w, .handshake, rec[0 .. 8 + fin_len + 16]);
     // The client's Finished covers the server's, as the server sent it.
-    var fin_true: [16]u8 = fin;
+    var fin_true: [16]u8 = fin[0..16].*;
     @memcpy(fin_true[4..], &prf("server finished", &.{&hash}, 12));
     th.update(&fin_true);
     return w.buffered();
@@ -298,7 +351,7 @@ fn expectClientFinished(out: []const u8, ch_len: usize, th: *Sha256) !void {
     try testing.expectEqualSlices(u8, &want, pt[4..16]);
 }
 
-var srv_buf: [2048]u8 = undefined;
+var srv_buf: [4096]u8 = undefined;
 
 fn newCache(storage: []Client.ClientSession) Client.SessionCache {
     return .init(storage, null);
@@ -517,4 +570,92 @@ test "a NewSessionTicket that is malformed is decode_error" {
     const bad = [_]u8{ 22, 3, 3, 0, 11, 4, 0, 0, 7, 0, 0, 0, 1, 0, 9, 'x' };
     @memcpy(srv_buf[sh_only.len..][0..bad.len], &bad);
     try testing.expectEqual(error.TlsDecodeError, run(srv_buf[0 .. sh_only.len + bad.len], .{ .cache = &cache }).err.?);
+}
+
+test "offer time: the stored chain is verified again under the CURRENT roots and clock (Go loadSession / anyValidVerifiedChain), TLS 1.2 and 1.3" {
+    const gpa = testing.allocator;
+    var good = try rootBundle(gpa, true);
+    defer good.deinit(gpa);
+    var none = try rootBundle(gpa, false);
+    defer none.deinit(gpa);
+    var storage: [2]Client.ClientSession = undefined;
+    var cache = newCache(&storage);
+    defer cache.deinit();
+    const psk: u16 = 41; // pre_shared_key
+    const Case = struct { p: Prime, bundle: *std.crypto.Certificate.Bundle, now_s: i64, offered: bool };
+    const cases = [_]Case{
+        .{ .p = .{ .real_chain = true }, .bundle = &good, .now_s = now_fixture, .offered = true },
+        .{ .p = .{ .real_chain = true }, .bundle = &none, .now_s = now_fixture, .offered = false }, // the CA was removed
+        .{ .p = .{ .real_chain = true }, .bundle = &good, .now_s = far, .offered = false }, // intermediate (and root, leaf) expired
+        .{ .p = .{ .real_chain = true, .v13 = true }, .bundle = &good, .now_s = now_fixture, .offered = true },
+        .{ .p = .{ .real_chain = true, .v13 = true }, .bundle = &none, .now_s = now_fixture, .offered = false },
+        .{ .p = .{ .real_chain = true, .v13 = true, .received_s = far }, .bundle = &good, .now_s = far, .offered = false },
+    };
+    for (cases) |c| {
+        _ = prime(&cache, c.p);
+        const r = run("", .{ .cache = &cache, .bundle = c.bundle, .now_s = c.now_s });
+        try testing.expectEqual(error.TlsConnectionTruncated, r.err.?);
+        const msg = r.out[5..];
+        if (c.p.v13) {
+            try testing.expectEqual(c.offered, findExt(msg, psk) != null);
+        } else if (c.offered) {
+            try testing.expectEqualStrings("OLD-TICKET", findExt(msg, hello.ext_session_ticket).?);
+        } else {
+            try testing.expectEqual(@as(usize, 0), findExt(msg, hello.ext_session_ticket).?.len);
+        }
+        // Offered then failed: a TLS 1.2 offer is dropped by the failure (Go);
+        // not offered: dropped by the check.
+        try testing.expectEqual(c.p.v13 and c.offered, cache.find(good_host) != null);
+    }
+}
+
+test "offer: a session whose extended-master-secret use differs from this hello's is not offered (and stays cached)" {
+    var storage: [2]Client.ClientSession = undefined;
+    var cache = newCache(&storage);
+    defer cache.deinit();
+    _ = prime(&cache, .{ .ems = true });
+    const r = run("", .{ .cache = &cache, .ems = false });
+    try testing.expectEqual(@as(usize, 0), findExt(r.out[5..], hello.ext_session_ticket).?.len);
+    try testing.expect(cache.find(host) != null);
+}
+
+test "a NewSessionTicket over max_ticket_len drops the entry, also on a resumption" {
+    var buf: [2048]u8 = undefined;
+    const ch = try clientHello(&buf, .{}, .{ .cache = null });
+    var storage: [2]Client.ClientSession = undefined;
+    var cache = newCache(&storage);
+    defer cache.deinit();
+    _ = prime(&cache, .{});
+    const big: [2049]u8 = @splat('T');
+    var th: Sha256 = undefined;
+    const server = buildServer(&srv_buf, ch, .{ .ticket = &big }, &th);
+    const r = run(server, .{ .cache = &cache });
+    try testing.expect(r.err == null);
+    try testing.expect(sink.did_resume);
+    try expectDropped(&cache);
+}
+
+test "a server Finished with an octet after its verify_data is decode_error (RFC 5246 §7.4.9)" {
+    var buf: [2048]u8 = undefined;
+    const ch = try clientHello(&buf, .{}, .{ .cache = null });
+    var storage: [2]Client.ClientSession = undefined;
+    var cache = newCache(&storage);
+    defer cache.deinit();
+    _ = prime(&cache, .{});
+    var th: Sha256 = undefined;
+    const server = buildServer(&srv_buf, ch, .{ .finished_trailing = true }, &th);
+    const r = run(server, .{ .cache = &cache });
+    try testing.expectEqual(error.TlsDecodeError, r.err.?);
+    try testing.expectEqual(5 + ch.len, r.out.len);
+}
+
+test "an echoed session_id with no cache at all is refused, as Go refuses it (RFC 8446 §4.1.2 compatibility id in a 1.2 answer)" {
+    // go1.26 handshake_client.go, clientHandshakeState.handshake(): `hs.session == nil &&
+    // hs.hello.sessionId != nil && bytes.Equal(hs.hello.sessionId, hs.serverHello.sessionId)`
+    // -> alertIllegalParameter, "server echoed TLS 1.3 compatibility session ID in TLS 1.2".
+    var buf: [2048]u8 = undefined;
+    const ch = try clientHello(&buf, null, .{ .cache = null });
+    var th: Sha256 = undefined;
+    const server = buildServer(&srv_buf, ch, .{ .ticket_ext = false, .ticket = null, .finish = false }, &th);
+    try testing.expectEqual(error.TlsIllegalParameter, run(server, .{ .cache = null }).err.?);
 }

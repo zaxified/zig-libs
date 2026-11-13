@@ -649,6 +649,12 @@ pub const InitError = error{
     /// `groups` empty, a group not in `supported_groups` or listed twice, or
     /// a `key_share_groups` entry not in `groups`.
     GroupsInvalid,
+    /// The ClientHello (shares, host, ALPN, a cookie, tickets) would exceed
+    /// `hello.max_len`.
+    ClientHelloTooLarge,
+    /// The cache entry this connection resumed was replaced by another
+    /// connection before the handshake ended; connect again.
+    SessionReplaced,
     /// `host` over 255 bytes (RFC 6066 §3: a HostName is at most 2^8 - 1
     /// in practice, DNS names 253): it would not fit the ClientHello.
     HostNameInvalid,
@@ -671,7 +677,7 @@ pub const InitError = error{
 /// `input` and `output` need buffer capacity of at least `min_buffer_len`
 /// (see the fields); a smaller one is `error.BufferTooSmall`.
 ///
-/// Stack: the handshake runs about 296 KiB deep and the dead-stack burn then
+/// Stack: the handshake runs about 302 KiB deep (TLS 1.2 resumption added ~6 KiB, 2026-11-13, estimated from the new locals: ticket and master-secret copies, not measured) and the dead-stack burn then
 /// zeroes 384 KiB below the caller (`burn.init_burn`), so the calling thread
 /// needs roughly 400 KiB of free stack; a smaller one (a fibre, a thread
 /// spawned with a small `stack_size`) overflows it.
@@ -794,8 +800,12 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
         // config). A cache shared by different bundles is still one trust
         // domain (review F2, 2026-10-26; see SessionCache).
         if (cache.find(host)) |e| if (e.fresh(now_ms) and resumableUnder(e, options.ca)) {
-            offer = .{ .entry = e, .generation = e.generation, .hash = e.hash, .psk = e.psk, .ticket_len = e.ticket_len, .age = tlsresume.replay.obfuscateAge(@intCast(now_ms - e.received_ms), e.ticket_age_add) };
-            @memcpy(offer.?.ticket_buf[0..e.ticket_len], e.ticket());
+            if (!storedChainValid(e, &options, host, @divFloor(now_ms, 1000))) {
+                _ = cache.drop(host);
+            } else {
+                offer = .{ .entry = e, .generation = e.generation, .hash = e.hash, .psk = e.psk, .ticket_len = e.ticket_len, .age = tlsresume.replay.obfuscateAge(@intCast(now_ms - e.received_ms), e.ticket_age_add) };
+                @memcpy(offer.?.ticket_buf[0..e.ticket_len], e.ticket());
+            }
         };
     };
     defer if (offer) |*o| crypto.secureZero(u8, &o.psk);
@@ -815,11 +825,18 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
         if (cache.find(host)) |e| if (e.version12 and e.usable) {
             if (!e.fresh12(now_ms)) {
                 _ = cache.drop(host);
-            } else if (resumableUnder(e, options.ca) and suiteOffered(e.suite12)) {
-                offer12 = .{ .entry = e, .generation = e.generation, .ticket_len = e.ticket_len, .suite = e.suite12, .ems = e.ems12, .group = e.group12 };
-                @memcpy(offer12.?.master[0..], e.resumption_secret[0..48]);
-                @memcpy(offer12.?.ticket_buf[0..e.ticket_len], e.ticket());
-                track.* = e.generation;
+            } else if (resumableUnder(e, options.ca) and suiteOffered(e.suite12) and e.ems12 == options.extended_master_secret) {
+                // (An entry whose extended-master-secret use differs from this
+                // hello's is not offered: the server's answer could only
+                // mismatch.) Go's loadSession then re-checks the stored chain.
+                if (!storedChainValid(e, &options, host, @divFloor(now_ms, 1000))) {
+                    _ = cache.drop(host);
+                } else {
+                    offer12 = .{ .entry = e, .generation = e.generation, .ticket_len = e.ticket_len, .suite = e.suite12, .ems = e.ems12, .group = e.group12 };
+                    @memcpy(offer12.?.master[0..], e.resumption_secret[0..48]);
+                    @memcpy(offer12.?.ticket_buf[0..e.ticket_len], e.ticket());
+                    track.* = e.generation;
+                }
             }
         };
     }
@@ -834,7 +851,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
     }
     hello_params.shares = shares_buf[0..share_groups.len];
     var hello_buf: [hello.max_len]u8 = undefined;
-    var hello_msg: []const u8 = hello.write(&hello_buf, hello_params) catch unreachable; // bounded: max_len covers every share + host + ALPN + ticket
+    var hello_msg: []const u8 = hello.write(&hello_buf, hello_params) catch return error.ClientHelloTooLarge;
     // RFC 8446 §4.2.11.2: the binder over the ClientHello truncated before
     // the binders list.
     if (offer) |*o| switch (o.hash) {
@@ -932,6 +949,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
     var ticket12_hint: u32 = 0;
     var ticket12_stored = false;
     var ticket12_withdrawn = false;
+    var ticket12_toolong = false;
     var entry12: ?*ClientSession = null;
     var entry12_gen: u64 = 0;
     var saved_chain: [verify.max_chain_len][]const u8 = undefined;
@@ -1249,7 +1267,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                 offer = null;
                                 hello_params.psk = null;
                             };
-                            hello_msg = hello.write(&hello_buf, hello_params) catch unreachable; // bounded as the first
+                            hello_msg = hello.write(&hello_buf, hello_params) catch return error.ClientHelloTooLarge;
                             if (offer) |*o| switch (handshake_cipher) {
                                 inline else => |*p| fillBinder(@TypeOf(p.transcript_hash), hello_buf[0..hello_msg.len], &o.psk, &p.transcript_hash),
                             };
@@ -1821,6 +1839,8 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                             @memcpy(ticket12_buf[0..t.ticket.len], t.ticket);
                             ticket12_len = t.ticket.len;
                             ticket12_stored = true;
+                        } else {
+                            ticket12_toolong = true;
                         }
                         // The server's Finished covers this message.
                         switch (handshake_cipher) {
@@ -1987,7 +2007,10 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                     const pv = &p.version.tls_1_2;
                                     const P = @TypeOf(p.*).A;
                                     try hsd.ensure(P.verify_data_length);
-                                    if (!std.crypto.timing_safe.eql([P.verify_data_length]u8, pv.expected_server_verify_data, hsd.array(P.verify_data_length).*)) return error.TlsDecryptError;
+                                    const got_verify = hsd.array(P.verify_data_length).*;
+                                    // RFC 5246 §7.4.9: exactly verify_data_length octets.
+                                    if (!hsd.eof()) return error.TlsDecodeError;
+                                    if (!std.crypto.timing_safe.eql([P.verify_data_length]u8, pv.expected_server_verify_data, got_verify)) return error.TlsDecryptError;
                                     if (resumed12) {
                                         // zig-libs tlsclient: abbreviated handshake (RFC 5246
                                         // §7.3): the server spoke first; now the view and the
@@ -2049,7 +2072,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                 e.ems12 = ems_negotiated;
                                 e.group12 = if (negotiated_group) |g| @backingInt(g) else 0;
                                 e.usable = true;
-                            } else if (ticket12_withdrawn or (!resumed12 and !ticket12_stored)) {
+                            } else if (ticket12_withdrawn or ticket12_toolong or (!resumed12 and !ticket12_stored)) {
                                 _ = cache.drop(host);
                             }
                         }
@@ -2306,15 +2329,46 @@ fn fillBinder(comptime H: type, msg: []u8, psk: *const [64]u8, prefix: *const H)
 }
 
 /// A resumed session's view: the certificates kept with the ticket.
-fn copyKeptChain(ci: *ConnectionInfo, cache: *SessionCache, entry: *ClientSession, generation: u64) error{ConnectionInfoTooSmall}!void {
+fn copyKeptChain(ci: *ConnectionInfo, cache: *SessionCache, entry: *ClientSession, generation: u64) error{ ConnectionInfoTooSmall, SessionReplaced }!void {
     cache.acquire();
     defer cache.release();
-    if (entry.generation != generation) return; // taken by another connection meanwhile
+    // Taken by another connection meanwhile: the view would have no chain,
+    // and the hook must not judge a resumption on that.
+    if (entry.generation != generation) return error.SessionReplaced;
     var buf: [session.max_chain_len][]const u8 = undefined;
     for (entry.chain(&buf)) |der| {
         if (ci.peer_certificates_len == verify.max_chain_len) break;
         ci.peer_certificates_buf[ci.peer_certificates_len] = try ci.keep(der);
         ci.peer_certificates_len += 1;
+    }
+}
+
+/// Go's `loadSession` checks at offer time, run again over the chain kept
+/// with the session (`e`, caller holds the cache lock): the host name still
+/// matches the leaf, and the chain still verifies under the CURRENT roots and
+/// clock (`anyValidVerifiedChain`) -- a CA removed from the bundle, or a
+/// certificate expired since, ends the session. `.no_verification` sessions
+/// are resumed only without verification (`resumableUnder`): nothing is
+/// re-checked for them.
+fn storedChainValid(e: *const ClientSession, options: *const Options, host: []const u8, now_s: i64) bool {
+    if (options.ca == .no_verification) return true;
+    var buf: [session.max_chain_len][]const u8 = undefined;
+    const chain = e.chain(&buf);
+    if (chain.len == 0) return false;
+    x509.hostname.verify(chain[0], host) catch return false;
+    switch (options.ca) {
+        .no_verification => unreachable,
+        .self_signed => {
+            const parsed = (Certificate{ .buffer = chain[0], .index = 0 }).parse() catch return false;
+            parsed.verify(parsed, now_s) catch return false;
+            return true;
+        },
+        .bundle => |ca| {
+            ca.lock.lockShared(ca.io) catch return false;
+            defer ca.lock.unlockShared(ca.io);
+            verify.verifyAgainstBundle(chain, ca.bundle, now_s) catch return false;
+            return true;
+        },
     }
 }
 
@@ -4065,6 +4119,19 @@ test "CertRequest.choose: a credential with no certificate answers with an empty
     req2.schemes_len = 1;
     req2.choose(&options, .tls_1_3, &.{});
     try std.testing.expect(req2.scheme_ok);
+}
+
+test "copyKeptChain: an entry replaced since the offer is SessionReplaced, never an empty view (review 2026-11-13)" {
+    var entries: [1]ClientSession = undefined;
+    var cache: SessionCache = .init(&entries, null);
+    const entry = cache.reserve("a.test").?;
+    try std.testing.expect(entry.setChain(&.{"leaf"}));
+    var storage: [64]u8 = undefined;
+    var ci: ConnectionInfo = .init(&storage);
+    try copyKeptChain(&ci, &cache, entry, entry.generation);
+    try std.testing.expectEqual(@as(usize, 1), ci.peerCertificates().len);
+    ci.reset();
+    try std.testing.expectError(error.SessionReplaced, copyKeptChain(&ci, &cache, entry, entry.generation - 1));
 }
 
 test "storeTicket: a NewSessionTicket for an entry another connection has taken is ignored (audit 2026-10-26, mutant 56)" {
