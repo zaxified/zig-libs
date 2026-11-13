@@ -369,6 +369,19 @@ pub const KeyExchange = connection.KeyExchange;
 /// reproducible handshake. See "Randomness" above and `Connection.Entropy`.
 pub const Entropy = connection.Entropy;
 
+// ── DTLS 1.2 (RFC 6347) and version negotiation (2026-11-13) ────────────
+/// The DTLS 1.2 engine: same method shape as `Connection`, same `Config`
+/// (`Config.versions = &.{.dtls12}`).
+pub const Connection12 = @import("Connection12.zig").Connection12;
+/// Negotiates DTLS 1.3 vs 1.2 from `Config.versions`.
+pub const Endpoint = @import("Endpoint.zig").Endpoint;
+pub const ProtocolVersion = connection.ProtocolVersion;
+pub const CipherSuite12 = connection.CipherSuite12;
+pub const suite12 = @import("suite12.zig");
+pub const messages12 = @import("messages12.zig");
+pub const record12 = @import("record12.zig");
+pub const prf12 = @import("prf12.zig");
+
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
@@ -423,6 +436,15 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = suite12;
+    _ = messages12;
+    _ = record12;
+    _ = prf12;
+    _ = @import("sig12.zig");
+    _ = @import("Connection12.zig");
+    _ = @import("Endpoint.zig");
+    _ = @import("conn12_test.zig");
+    _ = @import("fuzz12_test.zig");
 }
 
 test "meta.deps is {\"rsa\", \"x509\", \"chachapoly\", \"aesgcm\", \"tls13\", \"mlkem\"} (certauth.zig's RSA SPKI + cert parsing + Connection.zig's ChaCha20-Poly1305 and AES-128-GCM suites + the shared key schedule, certverify and kex; the PSK flight engine itself needs no other sibling modules)" {

@@ -61,6 +61,10 @@ const suitehash = @import("suitehash.zig");
 const Secret = suitehash.Secret;
 const certverify = @import("tls13").certverify;
 const certauth = @import("certauth.zig");
+const suite12 = @import("suite12.zig");
+const messages12 = @import("messages12.zig");
+pub const ProtocolVersion = suite12.ProtocolVersion;
+pub const CipherSuite12 = suite12.CipherSuite12;
 
 const X25519 = std.crypto.dh.X25519;
 /// The `secp256r1` half of the `.cert_dhe` key exchange (RFC 8446 §4.2.8.2).
@@ -166,6 +170,16 @@ pub const CipherSuite = enum(u16) {
 /// PSK ClientHello is unchanged by the second entry.
 const default_cipher_suites = [_]CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384 };
 
+/// What a dual-version (1.3 + 1.2) ClientHello adds for a DTLS 1.2 server
+/// (`Config.versions`): RFC 7627's `extended_master_secret`, RFC 5746's
+/// empty `renegotiation_info` and RFC 8422's `ec_point_formats`. A 1.3
+/// server ignores all three.
+const dual12_extensions = [_]messages.Extension{
+    .{ .ext_type = messages12.ext_extended_master_secret, .data = &.{} },
+    .{ .ext_type = messages12.ext_renegotiation_info, .data = &messages12.renegotiation_info_initial },
+    .{ .ext_type = messages12.ext_ec_point_formats, .data = &messages12.ec_point_formats_uncompressed },
+};
+
 pub const ConfigError = error{
     EmptyPsk,
     EmptyPskIdentity,
@@ -213,6 +227,13 @@ pub const ConfigError = error{
     /// bound to one hash and is usable only with suites of that hash, so
     /// this config could never complete a handshake.
     PskHashMismatch,
+    /// `Config.versions` is empty or names a version twice.
+    InvalidVersions,
+    /// `Config.versions` enables DTLS 1.2 but `Config.cipher_suites12`
+    /// holds no suite this module wires for `Config.key_exchange` (PSK
+    /// suites in `.psk` mode, ECDHE_ECDSA/ECDHE_RSA in the certificate
+    /// modes), or holds a value it does not wire at all.
+    NoCipherSuites12,
 };
 
 /// Server-side HelloRetryRequest / stateless-cookie configuration — RFC 9147
@@ -483,6 +504,33 @@ pub const Config = struct {
     /// `no_application_protocol`). The result is `negotiatedAlpn`.
     alpn_protocols: []const []const u8 = &.{},
 
+    // ── DTLS 1.2 (RFC 6347), all ADDITIVE: the defaults keep a 1.3-only
+    // connection byte-identical to what it was before 1.2 existed.
+
+    /// The DTLS versions this side speaks. `{.dtls13}` (the default) is the
+    /// historical 1.3-only engine. `{.dtls12}` runs `Connection12`;
+    /// `{.dtls13, .dtls12}` (order irrelevant) negotiates — use `Endpoint`,
+    /// which starts the 1.3 engine and hands over to the 1.2 one when the
+    /// peer speaks only 1.2 (a 1.3-capable side then also enforces RFC 8446
+    /// §4.1.3's downgrade sentinel).
+    versions: []const ProtocolVersion = &.{.dtls13},
+    /// DTLS 1.2 suites, preference order (`suite12.default_suites`). Only
+    /// the ones `key_exchange` allows are offered/selected.
+    cipher_suites12: []const CipherSuite12 = &suite12.default_suites,
+    /// DTLS 1.2: refuse a peer without RFC 7627's extended master secret
+    /// (`error.ExtendedMasterSecretRequired`). Without it a man in the
+    /// middle can synchronise two sessions' master secrets (the "triple
+    /// handshake" attack, RFC 7627 §1), which also voids the exporter.
+    require_extended_master_secret: bool = true,
+    /// DTLS 1.2 PSK server: the `psk_identity_hint` (RFC 4279 §2) sent in
+    /// ServerKeyExchange. Empty = no hint (and, for plain PSK, no
+    /// ServerKeyExchange at all).
+    psk_identity_hint: []const u8 = &.{},
+
+    pub fn allows(self: Config, v: ProtocolVersion) bool {
+        return std.mem.indexOfScalar(ProtocolVersion, self.versions, v) != null;
+    }
+
     /// Real, non-crypto validation — catches obviously-broken configs
     /// before anything touches a keyschedule stub. PSK fields stay
     /// mandatory even in certificate mode (see the "certificate mode: what
@@ -490,6 +538,16 @@ pub const Config = struct {
     /// empty `psk` is still rejected.
     // secret-api-ok: Config holds only slices and pointers (psk, cookie_secret, `SecretKey` is a union of pointers to the key), so the by-value copy copies no secret byte; it reads no secret either.
     pub fn validate(self: Config) ConfigError!void {
+        if (self.versions.len == 0 or self.versions.len > 2) return error.InvalidVersions;
+        if (self.versions.len == 2 and self.versions[0] == self.versions[1]) return error.InvalidVersions;
+        if (self.allows(.dtls12)) {
+            var usable = false;
+            for (self.cipher_suites12) |s| {
+                const kx = s.keyExchange() orelse return error.NoCipherSuites12;
+                if (kx.isPsk() == (self.key_exchange == .psk)) usable = true;
+            }
+            if (!usable) return error.NoCipherSuites12;
+        }
         if (self.cipher_suites.len == 0) return error.NoCipherSuites;
         // A suite with no `suiteParams` entry cannot have keys installed, so
         // offering it is a config error, not a negotiation outcome. Rejecting
@@ -702,6 +760,27 @@ pub const HandshakeError = messages.MessageError || handshake.FrameError || hand
     /// offered ALPN, and no protocol is on both lists
     /// (`no_application_protocol`).
     NoApplicationProtocol,
+    /// DTLS 1.2: the peer did not negotiate RFC 7627's extended master
+    /// secret and `Config.require_extended_master_secret` is set.
+    ExtendedMasterSecretRequired,
+    /// DTLS 1.2: the peer's hello carried neither RFC 5746's empty
+    /// `renegotiation_info` nor (client) its SCSV, or carried a non-empty one
+    /// on an initial handshake. This module never renegotiates, and it
+    /// refuses peers that cannot say they won't either (RFC 5746 §1's
+    /// prefix-injection attack targets exactly that silence).
+    SecureRenegotiationRequired,
+    /// RFC 8446 §4.1.3: a 1.3-capable client got a DTLS 1.2 ServerHello
+    /// whose `random` ends in the downgrade sentinel — the server speaks 1.3
+    /// and something in between removed it from the ClientHello.
+    DowngradeDetected,
+    /// INTERNAL to `Endpoint`: the 1.3 engine of a side that also allows
+    /// DTLS 1.2 saw a peer that speaks only 1.2 (a 1.2 ServerHello or
+    /// HelloVerifyRequest at a client, a ClientHello without 1.3 at a
+    /// server). The connection is rolled back untouched; `Endpoint` hands
+    /// the exchange to `Connection12`. A caller driving `Connection`
+    /// directly with `versions` including `.dtls12` sees it and should use
+    /// `Endpoint` instead.
+    NegotiatedDtls12,
 } || CertModeError;
 
 /// Certificate-mode-specific errors (RFC 8446 §4.4) — see this file's
@@ -796,6 +875,11 @@ pub const SendError = error{
     /// mode is silent and catastrophic rather than a typed error, which this
     /// closes.
     SequenceNumberExhausted,
+    /// DTLS 1.2: the peer sent an alert (RFC 5246 §7.2) — `close_notify`
+    /// or a fatal one. This module does not send alerts; the association
+    /// is over either way (`Connection12.peer_alert` holds level and
+    /// description).
+    ReceivedAlert,
 };
 
 /// One direction's record-protection key material, derived from a traffic
@@ -2523,6 +2607,29 @@ pub const Connection = struct {
     /// ignored and `self.client_random` is reused: RFC 8446 §4.1.2 requires
     /// ClientHello2 to be ClientHello1 unmodified except for a short listed
     /// set of changes, and the random is not on that list.
+    /// `supported_versions` of this client's hello: DTLS 1.3, and DTLS 1.2
+    /// after it when `Config.versions` allows it (RFC 8446 §4.2.1,
+    /// preference order).
+    fn offeredVersions(self: *const Connection) []const [2]u8 {
+        return if (self.config.allows(.dtls12)) &.{ messages.version_dtls13, messages.legacy_version_dtls12 } else &.{messages.version_dtls13};
+    }
+
+    /// The 1.3 suites, then — for a dual-version client — the 1.2 suites
+    /// `Connection12` would offer for this `key_exchange`, so a DTLS 1.2
+    /// server can answer the same hello.
+    fn withDual12Suites(self: *const Connection, cs13: []const u16, out: *[24]u16) []const u16 {
+        @memcpy(out[0..cs13.len], cs13);
+        var n = cs13.len;
+        if (!self.config.allows(.dtls12)) return out[0..n];
+        for (self.config.cipher_suites12) |s| {
+            const kx = s.keyExchange() orelse continue;
+            if (kx.isPsk() != (self.config.key_exchange == .psk) or n == out.len) continue;
+            out[n] = @backingInt(s);
+            n += 1;
+        }
+        return out[0..n];
+    }
+
     fn buildClientHello(self: *Connection, entropy: Entropy, cookie: ?[]const u8, body_buf: []u8) HandshakeError![]u8 {
         var random_bytes: [32]u8 = undefined;
         if (cookie == null) {
@@ -2533,7 +2640,8 @@ pub const Connection = struct {
         }
 
         var cs_arr: [8]u16 = undefined;
-        const cs_list = try self.offeredSuites(&cs_arr);
+        var cs_dual: [24]u16 = undefined;
+        const cs_list = self.withDual12Suites(try self.offeredSuites(&cs_arr), &cs_dual);
 
         var modes_buf: [4]u8 = undefined;
         const modes_ext = try messages.encodePskKeyExchangeModes(&.{.psk_ke}, &modes_buf);
@@ -2550,8 +2658,8 @@ pub const Connection = struct {
         const binders = [_][]const u8{placeholder_binder};
         const psk_ext_data = try messages.encodeOfferedPsks(.{ .identities = &identities, .binders = &binders }, &psk_buf);
 
-        var versions_buf: [3]u8 = undefined;
-        const versions_ext = try messages.encodeSupportedVersionsClientHello(&.{messages.version_dtls13}, &versions_buf);
+        var versions_buf: [5]u8 = undefined;
+        const versions_ext = try messages.encodeSupportedVersionsClientHello(self.offeredVersions(), &versions_buf);
 
         // RFC 8446 §9.2 lets a psk_ke-only client omit `supported_groups` and
         // `key_share`, but real servers do not all agree: wolfSSL answers a
@@ -2572,7 +2680,7 @@ pub const Connection = struct {
         var alpn_buf: [max_alpn_list_len]u8 = undefined;
         const alpn_ext = try self.alpnOffer(&alpn_buf);
 
-        var exts_buf: [8]messages.Extension = undefined;
+        var exts_buf: [8 + dual12_extensions.len]messages.Extension = undefined;
         var n_exts: usize = 0;
         exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions_ext };
         n_exts += 1;
@@ -2591,6 +2699,12 @@ pub const Connection = struct {
         if (alpn_ext) |e| {
             exts_buf[n_exts] = e;
             n_exts += 1;
+        }
+        if (self.config.allows(.dtls12)) {
+            for (dual12_extensions) |e| {
+                exts_buf[n_exts] = e;
+                n_exts += 1;
+            }
         }
         exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.pre_shared_key), .data = psk_ext_data };
         n_exts += 1;
@@ -2688,7 +2802,8 @@ pub const Connection = struct {
         }
 
         var cs_arr: [8]u16 = undefined;
-        const cs_list = try self.offeredSuites(&cs_arr);
+        var cs_dual: [24]u16 = undefined;
+        const cs_list = self.withDual12Suites(try self.offeredSuites(&cs_arr), &cs_dual);
 
         var groups_buf: [2 + 2 * advertised_groups.len]u8 = undefined;
         const groups_ext = try messages.encodeSupportedGroups(&advertised_groups, &groups_buf);
@@ -2709,8 +2824,8 @@ pub const Connection = struct {
         // ClientHello above has carried it since the same defect was found
         // there against wolfSSL — see `root.zig`'s note on the four wire
         // defects self-interop passed.
-        var versions_buf: [3]u8 = undefined;
-        const versions_ext = try messages.encodeSupportedVersionsClientHello(&.{messages.version_dtls13}, &versions_buf);
+        var versions_buf: [5]u8 = undefined;
+        const versions_ext = try messages.encodeSupportedVersionsClientHello(self.offeredVersions(), &versions_buf);
 
         var cookie_buf: [2 + max_cookie_len]u8 = undefined;
         const cookie_ext: ?[]const u8 = if (cookie) |c| try messages.encodeCookieExtension(c, &cookie_buf) else null;
@@ -2718,7 +2833,7 @@ pub const Connection = struct {
         var alpn_buf: [max_alpn_list_len]u8 = undefined;
         const alpn_ext = try self.alpnOffer(&alpn_buf);
 
-        var exts_buf: [6]messages.Extension = undefined;
+        var exts_buf: [6 + dual12_extensions.len]messages.Extension = undefined;
         var n_exts: usize = 0;
         exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions_ext };
         n_exts += 1;
@@ -2735,6 +2850,12 @@ pub const Connection = struct {
         if (alpn_ext) |e| {
             exts_buf[n_exts] = e;
             n_exts += 1;
+        }
+        if (self.config.allows(.dtls12)) {
+            for (dual12_extensions) |e| {
+                exts_buf[n_exts] = e;
+                n_exts += 1;
+            }
         }
 
         return messages.encodeClientHello(.{
@@ -3530,6 +3651,24 @@ pub const Connection = struct {
         if (parsed.msg_type != @backingInt(messages.HandshakeType.client_hello)) return error.UnexpectedMessage;
         const ch_body = parsed.body;
 
+        // A dual-version server (`Config.versions`): a ClientHello that does
+        // not offer DTLS 1.3 in `supported_versions` goes to `Connection12`
+        // (via `Endpoint`). Checked before the cookie exchange: a 1.2 client
+        // expects a HelloVerifyRequest, not a HelloRetryRequest.
+        if (self.config.allows(.dtls12)) {
+            var e12: [24]messages.Extension = undefined;
+            const d12 = messages12.decodeClientHello(ch_body, &e12) catch return error.Malformed;
+            const offers13 = if (messages12.findExtension(d12.extensions, messages12.ext_supported_versions)) |sv| blk: {
+                if (sv.len < 1 or sv.len != 1 + @as(usize, sv[0]) or sv[0] % 2 != 0) return error.Malformed;
+                var i: usize = 1;
+                while (i < sv.len) : (i += 2) {
+                    if (std.mem.eql(u8, sv[i..][0..2], &messages.version_dtls13)) break :blk true;
+                }
+                break :blk false;
+            } else false;
+            if (!offers13) return error.NegotiatedDtls12;
+        }
+
         // 16, not 8: a real ClientHello is extension-rich (wolfSSL's carries
         // several this module ignores) and ClientHello2 adds `cookie` on top,
         // and `decodeExtensions` reports an overflow as
@@ -4061,6 +4200,19 @@ pub const Connection = struct {
         var sh_msg_buf: [max_server_hello_body]u8 = undefined;
         var sh_received_buf: [max_server_hello_body]bool = undefined;
         const sh_parsed = try self.takeHandshakeMessage(datagram, &pos, .epoch0_plaintext, &sh_msg_buf, &sh_received_buf, null);
+        // A dual-version client (`Config.versions`): a HelloVerifyRequest, or
+        // a ServerHello without `supported_versions`, is a DTLS 1.2 server —
+        // `Endpoint` hands the exchange to `Connection12`. Not after a
+        // HelloRetryRequest: a server that retried in 1.3 cannot answer 1.2.
+        if (self.config.allows(.dtls12) and !self.saw_hello_retry_request) {
+            if (sh_parsed.msg_type == messages12.HandshakeType.hello_verify_request) return error.NegotiatedDtls12;
+            if (sh_parsed.msg_type == @backingInt(messages.HandshakeType.server_hello)) {
+                var e12: [16]messages.Extension = undefined;
+                if (messages12.decodeServerHello(sh_parsed.body, &e12)) |d| {
+                    if (messages12.findExtension(d.extensions, messages12.ext_supported_versions) == null) return error.NegotiatedDtls12;
+                } else |_| {}
+            }
+        }
         if (sh_parsed.msg_type != @backingInt(messages.HandshakeType.server_hello)) return error.UnexpectedMessage;
 
         var ext_buf: [8]messages.Extension = undefined;
@@ -4417,7 +4569,7 @@ test "protectDispatch(chacha20_poly1305_sha256): byte-identical to Protection(ch
 /// Returns `false` (window left untouched) if `seq` is a duplicate of an
 /// already-accepted sequence number, or so far behind `high.*` that it
 /// falls outside the 64-wide window entirely.
-fn replayCheckAndUpdate(seen_any: *bool, high: *u48, window: *u64, seq: u48) bool {
+pub fn replayCheckAndUpdate(seen_any: *bool, high: *u48, window: *u64, seq: u48) bool {
     if (!seen_any.*) {
         seen_any.* = true;
         high.* = seq;

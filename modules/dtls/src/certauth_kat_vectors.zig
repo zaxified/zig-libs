@@ -91,3 +91,15 @@ pub const rsa_cert_der = der("testdata/certs/rsa-cert.der");
 ///     openssl req -x509 -newkey ed25519 ... -subj "/CN=dtls-test-ed25519"
 pub const p384_cert_der = der("testdata/certs/p384-cert.der");
 pub const ed25519_cert_der = der("testdata/certs/ed25519-cert.der");
+
+/// RSA-2048 self-signed certificate + its PKCS#1 private key, CN=dtls12-test-rsa,
+/// for the DTLS 1.2 ECDHE_RSA suites' self-interop (`conn12_test.zig`): the
+/// test peers trust the certificate as its own anchor. Generated 2026-11-13
+/// with the local OpenSSL CLI:
+///
+///     openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -outform der \
+///       -out rsa12-cert.der -subj "/CN=dtls12-test-rsa" \
+///       -not_before 20261113000000Z -not_after 20361110000000Z
+///     openssl rsa -in key.pem -traditional -outform der -out rsa12-key.der
+pub const rsa12_cert_der = der("testdata/certs/rsa12-cert.der");
+pub const rsa12_key_der = der("testdata/certs/rsa12-key.der");
