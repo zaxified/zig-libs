@@ -6,7 +6,7 @@
 
 **Scope:** ahead — Go regexp go1.26 (surveyed 2026-10-28; Go `regexp` closed 2026-10-07, Rust regex 1.13.1 and RE2 2026-10-28 — parity with both plus the leads below)
 
-**Ahead:** correctness — Go 1.26 `regexp` refuses the 46 multi-word script names it documents (`\p{Old_Persian}`, `\p{SignWriting}`: an underscore or an inner capital); here they match their scripts (test `go oracle: crafted syntax cases and random patterns answer as Go regexp`, GO_DEFECT 46) (measured 2026-10-28) · feature — Rust's grammar, its bytes mode and `RegexSet` beside Go's whole API (Unicode `\b \w`, `\b{start}`, class set operations, `\p{scx=…}` and binary properties, non-UTF-8 haystacks, many patterns in one pass), none of which Go has; Rust has no POSIX leftmost-longest and no reader API (tests `rust oracle: the crate's answers to the Rust grammar`, `rust oracle: bytes mode (regex::bytes)`, `rust oracle: RegexSet`) (measured 2026-10-28) · feature — Unicode 17.0 classes and case folding where Go 1.26 has 15.0 and Rust `regex` 1.13.1 16.0: `\p{Lo}` matches U+323B0 (CJK Extension J) here, not in Go (test `go oracle: …`, UNICODE_VERSION 12) (measured 2026-10-28) · feature — compile-time compilation: `comptimeCompile` turns a bad pattern into a compile error and matches with no allocator, where Go's `MustCompile` panics at run time (test `fullMatch takes any way through, comptimeCompile matches compile`) (measured 2026-10-28)
+**Ahead:** correctness — Go 1.26 `regexp` refuses the 46 multi-word script names it documents (`\p{Old_Persian}`, `\p{SignWriting}`: an underscore or an inner capital); here they match their scripts (test `go oracle: crafted syntax cases and random patterns answer as Go regexp`, GO_DEFECT 46) (measured 2026-10-28) · feature — Rust's grammar, its bytes mode and `RegexSet` beside Go's whole API (Unicode `\b \w`, `\b{start}`, class set operations, `\p{scx=…}` and binary properties, non-UTF-8 haystacks, many patterns in one pass), none of which Go has; Rust has no POSIX leftmost-longest and no reader API (tests `rust oracle: the crate's answers to the Rust grammar`, `rust oracle: bytes mode (regex::bytes)`, `rust oracle: RegexSet`) (measured 2026-10-28) · feature — Unicode 18.0 classes and case folding where Go 1.26 has 15.0 and Rust `regex` 1.13.1 16.0: `\p{Lo}` matches U+323B0 (CJK Extension J) here, not in Go (test `go oracle: …`, UNICODE_VERSION 17) (measured 2026-10-28; count re-pinned 2026-11-13 on 18.0) · feature — compile-time compilation: `comptimeCompile` turns a bad pattern into a compile error and matches with no allocator, where Go's `MustCompile` panics at run time (test `fullMatch takes any way through, comptimeCompile matches compile`) (measured 2026-10-28)
 
 **Audit:** review 2026-11-02 · mutation 2026-11-12 (4773/5014, 241 eq) · src d908ca5c2f7384c2
 
@@ -109,16 +109,16 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   same ranges as an earlier one in the pattern points at those (`\p{L}` is ~700 ranges). `(?i)` folds each
   class member *before* its own negation and the class's `^` after that (Go's order:
   `(?i)\W` excludes U+017F and U+212A, which fold into `\w`).
-- **Case folding is Unicode's simple folding as orbits** (`casefold.zig`, Unicode 17.0,
-  generated from the UCD by `tools/ucd_unicode`): 379 runs, each mapping a code point to its orbit successor by a constant
+- **Case folding is Unicode's simple folding as orbits** (`casefold.zig`, Unicode 18.0,
+  generated from the UCD by `tools/ucd_unicode`): 392 runs, each mapping a code point to its orbit successor by a constant
   delta or as alternating upper/lower pairs. A class folds run by run — the successors of a range
   are ranges — taken `max_orbit - 1` (3) times, so even `(?i)[\x{0}-\x{10FFFF}]` costs a few
   hundred ranges and compiles at comptime; a literal walks its orbit directly.
-- **Unicode classes** (`unicode_tables.zig`, Unicode 17.0, generated from the UCD by
+- **Unicode classes** (`unicode_tables.zig`, Unicode 18.0, generated from the UCD by
   `tools/ucd_unicode` by Rust's `regex-syntax` rules — the same generator run on UCD 16.0 gives
   that crate's tables byte for byte, checked on the interop lane): every class the Rust grammar
   names (categories, scripts, script extensions, binary properties, age, break properties) as
-  LEB128-varint ranges (91 KB); the Go grammar accepts the names Go lists
+  LEB128-varint ranges (94 KB); the Go grammar accepts the names Go lists
   (`tools/rust_unicode/go_names.txt`). A name is looked up in its loose form (ASCII case, spaces, `_`, `-` dropped);
   `Any`, `ASCII` and `Assigned` (the complement of `Cn`) are computed. Folded and negated in
   Go's order, like a Perl class.
@@ -401,7 +401,7 @@ single timings swing 5–10 % with layout and load.
   than the same pattern in `.perl`. Rust keeps its lazy DFA and quits on a byte past ASCII; here the
   DFA contexts would need a Unicode-word class (start/word/other/newline/CR) and a quit to the VMs.
   Same for bytes mode (`Options.utf8 = false`), which has no prefilter either.
-- **Unicode tables cost every consumer 91 KB** *(2026-10-28)* — the grammar is chosen at run time,
+- **Unicode tables cost every consumer 94 KB** *(2026-10-28; 91 KB on Unicode 17.0)* — the grammar is chosen at run time,
   so `unicode_tables.zig` (every property the Rust grammar names) is linked even into a program
   that only ever compiles `.perl` patterns (the Go-generated tables were 11 KB). A build option or
   a comptime-known grammar could leave the Rust-only properties out.
@@ -475,12 +475,13 @@ box over ~280 crafted syntax cases, every Unicode class name with the code point
 `FindStringSubmatchIndex` and `FindAllStringIndex` — again after `Longest()` — plus, for 460
 patterns, `ReplaceAllString` (31 templates), `ReplaceAllLiteralString`, `ReplaceAllStringFunc`,
 `Split`, `FindAllStringSubmatchIndex` and `LiteralPrefix`, and `QuoteMeta` of every ASCII byte.
-`tools/ucd_unicode` builds the Unicode tables from the UCD 17.0; its rules are held to Rust's
+`tools/ucd_unicode` builds the Unicode tables from the UCD 18.0; its rules are held to Rust's
 `regex-syntax` (run as a black box by `tools/rust_unicode`) on UCD 16.0, byte for byte. `src/go_oracle_test.zig` requires every answer, through a slice and through
 a one-byte-per-read reader; the listed divergences are counted and pinned — GO_DEFECT (46: the
 multi-word script names Go refuses), LITERAL_PREFIX (5: ours extends Go's), CAPACITY (1: past
-250 levels; was 5 before big patterns compiled on the heap), UNICODE_VERSION (12: code points assigned
+250 levels; was 5 before big patterns compiled on the heap), UNICODE_VERSION (17: code points assigned
 after Go's 15.0, asked of this module's own `\p{Age=15.0}`). `tools/rust_regex_oracle` does the same for Rust's `regex` 1.13.1 (`src/rust_vectors.zig`,
 `src/rust_oracle_test.zig`; pinned SIZE_LIMIT, CAPACITY, SHORTEST). On the interop lane via `zig build interop-regex -- --check`.
+**Unicode 18.0 (2026-11-13):** the tables moved from UCD 17.0.0 to 18.0.0 — 13,007 code points newly assigned, three new scripts (`Jurchen`, `Proto_Cuneiform`, `Seal`) and `Age=18.0` (451 tables, 1,456 keys), no new binary property and no new break-property value; case folding 379 → 392 runs: four old lowercase letters gained capitals and so orbits ({U+0277, U+A7DD}, {U+027C, U+A7E2}, {U+AB4B, U+AB6C}, {U+AB4C, U+AB6D}), 16 new Latin Extended-G pairs in U+1DF40-1DF7F, and U+1DF95 LIGATURE LONG S WITH DESCENDER S joins ß's orbit ({U+00DF, U+1E9E, U+1DF95}, three members; `max_orbit` stays 4). Anchors: the generator's rules stay held to regex-syntax on UCD 16.0 (unchanged); the 18.0 data only by `gen.py -check`; the Go replay's UNICODE_VERSION count moved 12 → 17, each a vectors' input code point that 18.0 assigned (U+11B0A in `\p{Devanagari}`, U+1246F in `\p{Nl}` and `\p{Letter_Number}`, U+1B168 in `\p{Katakana}`, U+1DF2B in `\p{Latin}`), and no answer moved for an old code point (unexplained 0); the Rust replay (regex 1.13.1, Unicode 16.0) passes unchanged.
 Teeth: its first run found four defects (see tools/README.md); planted bugs fail it (see
 Verification). Still self-graded: behaviour past the capacities (only the error is checked).

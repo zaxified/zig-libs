@@ -23,10 +23,11 @@
 //!    complete depends on its one-pass engine. Both are prefixes every match
 //!    begins with; ours always extends Go's and is never complete where Go's
 //!    is not.
-//!  - UNICODE_VERSION: the classes are Unicode 17.0's (`unicode_tables.zig`,
+//!  - UNICODE_VERSION: the classes are Unicode 18.0's (`unicode_tables.zig`,
 //!    shared with the Rust grammar), Go 1.26's are 15.0: an input holding a
 //!    code point assigned since (`\p{Kawi}` on U+11F5A, 16.0; `\p{Lo}` on
-//!    U+323B0, 17.0) matches here, not in Go. Pinned by count.
+//!    U+323B0, 17.0; `\p{Latin}` on U+1DF2B, 18.0) matches here, not in Go.
+//!    Pinned by count.
 //!  - CAPACITY: a pattern that nests deeper than `max_depth` (250) compiles
 //!    in Go; here `error.NestingDepth` — the price of a recursive parser that
 //!    fits a small thread stack. (A program past `max_insts` compiles on the
@@ -302,6 +303,9 @@ test "go oracle: crafted syntax cases and random patterns answer as Go regexp" {
     try testing.expectEqual(@as(usize, 46), t.go_defect);
     try testing.expect(t.api > 10_000); // the API answers are reached
     try testing.expectEqual(@as(usize, 6), t.literal_prefix);
-    try testing.expectEqual(@as(usize, 12), t.unicode_version);
+    // 12 on the 17.0 tables; 18.0 assigned five more of the vectors' random input code points:
+    // U+11B0A (\p{Devanagari}), U+1246F (\p{Nl} and \p{Letter_Number}), U+1B168 (\p{Katakana}),
+    // U+1DF2B (\p{Latin}).
+    try testing.expectEqual(@as(usize, 17), t.unicode_version);
     try testing.expectEqual(@as(usize, 1), t.capacity); // nesting past 250 (programs past 1024 instructions compile on the heap since 2026-10-28)
 }

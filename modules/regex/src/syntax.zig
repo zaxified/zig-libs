@@ -717,7 +717,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         /// loosely (Unicode TR18: ASCII case ignored, spaces, `_` and `-`
         /// dropped — what Go 1.25+ documents): a name Go lists (`Any`,
         /// `ASCII`, `Assigned`, the general categories and their aliases, the
-        /// scripts), with its class from `unicode_tables.zig` (Unicode 17.0).
+        /// scripts), with its class from `unicode_tables.zig` (Unicode 18.0).
         fn addUnicodeClass(b: *Self, name: []const u8) Error!void {
             var buf: [max_class_name]u8 = undefined;
             const key = looseName(name, &buf) orelse return error.InvalidUnicodeClass;
@@ -1908,7 +1908,7 @@ fn isRustSpaceAt(s: []const u8, i: usize) bool {
 }
 
 /// Rust's `char::is_alphabetic` (the Alphabetic property; Rust's own
-/// Unicode version may differ from the tables' 17.0 — not seen in names).
+/// Unicode version may differ from the tables' 18.0 — not seen in names).
 fn isRustAlphabetic(cp: u21) bool {
     if (cp < 0x80) return std.ascii.isAlphabetic(@intCast(cp));
     return inTable(comptime findName("alphabetic").?, cp);

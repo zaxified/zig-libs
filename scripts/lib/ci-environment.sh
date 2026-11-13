@@ -429,9 +429,10 @@ for crate in modules/diagnostics/tools/codespan_bench modules/regex/tools/rust_r
     cargo fetch --locked --manifest-path "$crate/Cargo.toml" >/dev/null 2>&1 \
         && echo "cargo fetch $crate: OK" || echo "cargo fetch $crate: failed"
 done
-# regex compares its generator against UCD 16.0.0 and 17.0.0 text files
+# regex compares its generator against UCD 16.0.0 (regex-syntax 0.8.11's version, the
+# rules check) and 18.0.0 (the tables' version) text files
 # (gitignored, fetched from unicode.org).
-for ucd in 16.0.0 17.0.0; do
+for ucd in 16.0.0 18.0.0; do
     [[ -e "modules/regex/tools/ucd_unicode/data/$ucd/UnicodeData.txt" ]] \
         || bash modules/regex/tools/ucd_unicode/fetch.sh "$ucd" >/dev/null 2>&1
     [[ -e "modules/regex/tools/ucd_unicode/data/$ucd/UnicodeData.txt" ]] \

@@ -4,7 +4,7 @@
 //! (default) the committed ones, which `test-regex` uses:
 //!  - `tools/go_regexp_oracle`   Go `regexp`, black box → `src/go_vectors.zig`
 //!  - `tools/rust_regex_oracle`  Rust `regex`, black box → `src/rust_vectors.zig`
-//!  - `tools/ucd_unicode`        the UCD 17.0.0 → `src/unicode_tables.zig`,
+//!  - `tools/ucd_unicode`        the UCD 18.0.0 → `src/unicode_tables.zig`,
 //!                               `src/casefold.zig`
 //!  - and the rules that generator applies, against Rust `regex-syntax`:
 //!    `tools/rust_unicode` writes the crate's tables (UCD 16.0.0) into
@@ -17,7 +17,7 @@
 //! `zig build check-interop` compiles it. Needs go 1.26.0 (standard library
 //! only; `GOPROXY=off`), cargo with the pinned crates in its registry
 //! (`--offline`; `regex` 1.13.1 and its four dependencies, read 2026-10-27),
-//! python3, the UCD 16.0.0 and 17.0.0 in `tools/ucd_unicode/data/` (fetched
+//! python3, the UCD 16.0.0 and 18.0.0 in `tools/ucd_unicode/data/` (fetched
 //! once by `tools/ucd_unicode/fetch.sh`) and `zig` on PATH; no network. Run
 //! from the repository root.
 //!
@@ -38,7 +38,7 @@ const tools = [_]Tool{
     .{ .name = "Rust regex oracle", .kind = .cargo, .dir = "modules/regex/tools/rust_regex_oracle", .target = "../../src/rust_vectors.zig" },
     .{ .name = "Rust Unicode tables (UCD 16.0.0, the crate)", .kind = .cargo, .dir = "modules/regex/tools/rust_unicode", .target = rust_tables, .crate_arg = true, .mode = .scratch },
     .{ .name = "UCD generator rules vs regex-syntax (UCD 16.0.0)", .kind = .python, .dir = "modules/regex/tools/ucd_unicode", .target = rust_tables, .mode = .compare, .pre = &.{ "--ucd", "data/16.0.0" } },
-    .{ .name = "Unicode tables (UCD 17.0.0)", .kind = .python, .dir = "modules/regex/tools/ucd_unicode", .target = "../../src", .pre = &.{ "--ucd", "data/17.0.0" } },
+    .{ .name = "Unicode tables (UCD 18.0.0)", .kind = .python, .dir = "modules/regex/tools/ucd_unicode", .target = "../../src", .pre = &.{ "--ucd", "data/18.0.0" } },
 };
 
 /// The registry copy of regex-syntax 0.8.11 (`rust_unicode` reads its alias

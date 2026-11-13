@@ -24,9 +24,9 @@ UCD 16.0.0 against that crate's answers, `--compare-with`):
     `\\d` = Nd (UTS #18);
   - case folding: CaseFolding.txt C + S, as orbits.
 
-    tools/ucd_unicode/fetch.sh 17.0.0                  # UCD.zip into tools/ucd_unicode/data/ (and 16.0.0)
-    python3 tools/ucd_unicode/gen.py --ucd tools/ucd_unicode/data/17.0.0 -out src
-    python3 tools/ucd_unicode/gen.py --ucd tools/ucd_unicode/data/17.0.0 -check src
+    tools/ucd_unicode/fetch.sh 18.0.0                  # UCD.zip into tools/ucd_unicode/data/ (and 16.0.0)
+    python3 tools/ucd_unicode/gen.py --ucd tools/ucd_unicode/data/18.0.0 -out src
+    python3 tools/ucd_unicode/gen.py --ucd tools/ucd_unicode/data/18.0.0 -check src
     # the rules against regex-syntax (cargo, offline): UCD 16.0.0 must give
     # what tools/rust_unicode takes from the crate, byte for byte
     python3 tools/ucd_unicode/gen.py --ucd tools/ucd_unicode/data/16.0.0 --compare-with <rust_unicode -out dir>
