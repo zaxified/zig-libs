@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — Sweep finding SAML-1: the `Conditions` / `SubjectConfirmationData` / `LogoutRequest` time checks computed `now + skew` and `now - skew` with plain operators on the caller's `now_unix` and `clock_skew_secs` (i64), an integer overflow (a panic in checked modes, UB in ReleaseFast) at a clock near the i64 limits. They saturate now (`+|`, `-|`); results for every non-overflowing value are unchanged.
+
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE** (compile follow-up to `xmldsig`'s new `error.OutputTooLarge`): the three exhaustive `xmldsig.c14n.canonicalize` error switches map it (`SigningAssemblyFailed` when signing, `MalformedSoap` for an inbound `ArtifactResponse`); an oversized canonical form in `verify` already folded into `SignatureInvalid`.
 
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `stripLeadingZeros` helper is gone; its call sites use `std.mem.trimStart(u8, bytes, &.{0})` (same result, including the empty result for all-zero input).

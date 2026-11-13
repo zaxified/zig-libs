@@ -1190,11 +1190,11 @@ fn buildResult(alloc: std.mem.Allocator, asrt: *const xml.Element, config: Confi
     if (childEl(asrt, saml_ns, "Conditions")) |cond| {
         if (cond.attr("", "NotBefore")) |nb| {
             const t = try datefmt.parseXsdDateTime(nb);
-            if (now + skew < t) return error.AssertionNotYetValid;
+            if (now +| skew < t) return error.AssertionNotYetValid;
         }
         if (cond.attr("", "NotOnOrAfter")) |noa| {
             const t = try datefmt.parseXsdDateTime(noa);
-            if (now - skew >= t) return error.AssertionExpired;
+            if (now -| skew >= t) return error.AssertionExpired;
             session_noa = t;
         }
         one_time_use = childEl(cond, saml_ns, "OneTimeUse") != null;
@@ -1381,11 +1381,11 @@ fn validateConfirmationTimeBounds(sc: *const xml.Element, now: i64, skew: i64) C
     const scd = childEl(sc, saml_ns, "SubjectConfirmationData") orelse return;
     if (scd.attr("", "NotBefore")) |nb| {
         const t = try datefmt.parseXsdDateTime(nb);
-        if (now + skew < t) return error.AssertionNotYetValid;
+        if (now +| skew < t) return error.AssertionNotYetValid;
     }
     if (scd.attr("", "NotOnOrAfter")) |noa| {
         const t = try datefmt.parseXsdDateTime(noa);
-        if (now - skew >= t) return error.AssertionExpired;
+        if (now -| skew >= t) return error.AssertionExpired;
     }
 }
 
@@ -1401,7 +1401,7 @@ fn validateBearerData(sc: *const xml.Element, config: Config, now: i64, skew: i6
     // NotOnOrAfter is required for a Bearer confirmation.
     const noa = scd.attr("", "NotOnOrAfter") orelse return error.SubjectConfirmationFailed;
     const t = try datefmt.parseXsdDateTime(noa);
-    if (now - skew >= t) return error.AssertionExpired;
+    if (now -| skew >= t) return error.AssertionExpired;
     // InResponseTo correlation.
     if (scd.attr("", "InResponseTo")) |irt| {
         const expected = config.expected_in_response_to orelse return error.InResponseToMismatch;
@@ -1445,11 +1445,11 @@ fn validateHolderOfKeyData(alloc: std.mem.Allocator, sc: *const xml.Element, con
     // NotBefore / NotOnOrAfter are optional for HoK; enforce them if present.
     if (scd.attr("", "NotBefore")) |nb| {
         const t = try datefmt.parseXsdDateTime(nb);
-        if (now + skew < t) return error.AssertionNotYetValid;
+        if (now +| skew < t) return error.AssertionNotYetValid;
     }
     if (scd.attr("", "NotOnOrAfter")) |noa| {
         const t = try datefmt.parseXsdDateTime(noa);
-        if (now - skew >= t) return error.AssertionExpired;
+        if (now -| skew >= t) return error.AssertionExpired;
     }
     // Recipient is optional for HoK; when present it must still match the ACS.
     if (scd.attr("", "Recipient")) |recip| {
@@ -3230,7 +3230,7 @@ fn consumeLogoutRequestXmlBody(
     var not_on_or_after: ?i64 = null;
     if (root.attr("", "NotOnOrAfter")) |noa| {
         const t = try datefmt.parseXsdDateTime(noa);
-        if (config.now_unix - config.clock_skew_secs >= t) return error.RequestExpired;
+        if (config.now_unix -| config.clock_skew_secs >= t) return error.RequestExpired;
         not_on_or_after = t;
     }
 
@@ -3860,6 +3860,7 @@ test {
     _ = @import("test_metadata.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("test_sweep.zig");
 }
 
 const testing = std.testing;
