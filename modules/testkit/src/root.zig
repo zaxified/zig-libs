@@ -22,6 +22,8 @@
 //!   - `stackprobe` — the dead-stack probe engine 55 modules had copied.
 //!   - `bench` — the comparison skeleton 38 `tools/bench.zig` had copied.
 //!   - `guard` — input/output buffers bounded by unreadable pages.
+//!   - `arbitrary` — typed values (structs, unions, slices, UTF-8 strings…) drawn
+//!     from the same choice source, so the tape shrinker shrinks them too.
 //!
 //! Deliberately NOT here: netns setup and privileged-capability probing. Those
 //! read genuinely differently per module (`tc` wants a fresh netns with `lo`
@@ -59,6 +61,7 @@ test {
     _ = guard;
     _ = child;
     _ = @import("shrink.zig");
+    _ = @import("arbitrary.zig");
     _ = @import("fault.zig");
     _ = @import("fuzz_test.zig");
 }
@@ -84,6 +87,11 @@ pub const guard = @import("guard.zig");
 /// Run a function in a forked child and say how it ended (exit code, signal,
 /// or a hang at the limit): how a test asserts a panic or a deadlock.
 pub const child = @import("child.zig");
+
+/// Typed values from a choice source (`fuzz.Rng`, `std.testing.Smith`,
+/// `fuzz.ScriptSource`): the strategy library. See `arbitrary.zig`.
+pub const arbitrary = @import("arbitrary.zig").arbitrary;
+pub const ArbOptions = @import("arbitrary.zig").ArbOptions;
 
 pub const expectHex = @import("golden.zig").expectHex;
 pub const expectBytes = @import("golden.zig").expectBytes;
