@@ -474,8 +474,9 @@ montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 montint	ReleaseFast	dyn	1	2	0733a6ebc914a552	94e445ba261b2dab
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 # 2026-10-14: p256 point formulas as generated asm (point_asm.zig; pattern gains it). Counts unchanged (comb 1 = rejectIdentity group.zig:690 per --stacks, sign <=12); comb output re-pinned because the harness prints raw projective coordinates and the CT mixed addition is now madd-2004-hmv (another representative of the same point; sign pk+sig digest unchanged). ctap2 digests re-pinned too: stale since 9fc3c70d (root.zig fuzz test only), counts 0/0.
-p256	ReleaseFast	comb	1	1	2abc3a382c76c041	e3c458c38b8cf4a8
-p256	ReleaseFast	sign	1	<=12	32b07f33ea5a0a7d	af4baed5c5134f3f
+p256	ReleaseFast	comb	1	1	057d5b2c695da4a4	e3c458c38b8cf4a8
+p256	ReleaseFast	sign	1	<=12	c29edbdea636e7d3	af4baed5c5134f3f
+p256	ReleaseFast	secpt	1	1	057d5b2c695da4a4	0202b342b562adc1
 # rsa 2026-10-02 — the private path moved onto montint.DynModint (reduce of c
 # mod p/q, Garner, unblinding, F3). crt 213 -> 1: the 212 were std.crypto.ff's
 # reduce (shiftIn, compare-and-subtract) and montgomeryMul over the secret
@@ -1702,11 +1703,12 @@ aes192	ReleaseFast	bitsliced	1	0	02d8aa678558eba4	5ea64f081b0ffcbb
 # limbs and the product now comes back as (X·Z : Y : Z³) of the Jacobian
 # point — the same point (tests compare SEC1 bytes against the old RCB
 # ladder); `ecdh`/`keygen`/`sign` print affine bytes and did not move.
-p521	ReleaseFast	mul	1	0	a84441a8ca66dc90	7bcb91b4acac23e9
-p521	ReleaseFast	keygen	1	0	6dffa02d2bb2854a	b44de7eb8b02a855
-p521	ReleaseFast	sign	1	0	6dffa02d2bb2854a	b620c1c667ef0084
-p521	ReleaseFast	ecdh	1	0	a84441a8ca66dc90	a348bd01a2bccfcc
-p521	ReleaseFast	vartime	1	>=1	681f6d30dc32257a	11557f4b46d4c2af
+p521	ReleaseFast	mul	1	0	68ac8ddf3b2054ca	7bcb91b4acac23e9
+p521	ReleaseFast	keygen	1	0	84b41aef8c39a02d	b44de7eb8b02a855
+p521	ReleaseFast	sign	1	0	84b41aef8c39a02d	b620c1c667ef0084
+p521	ReleaseFast	ecdh	1	0	68ac8ddf3b2054ca	a348bd01a2bccfcc
+p521	ReleaseFast	vartime	1	>=1	9eb7de72328a6412	11557f4b46d4c2af
+p521	ReleaseFast	cmov	1	0	daaa4ae0771d98ab	d38ed19668c79445
 # p384 (2026-10-13) — NIST P-384, new module (p521's algorithms over a Montgomery
 # field with an amd64 MULX/ADX core, fast_core.zig — CPU skylake has ADX, so the
 # asm path is the one measured). mul / keygen / sign / ecdh: secret tainted end to

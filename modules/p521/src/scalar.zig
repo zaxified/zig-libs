@@ -64,7 +64,7 @@ inline fn condSub(t: [10]u64) Limbs {
     }
     // Underflow overall iff t[9] < borrow, i.e. t < n: keep t.
     const under: u64 = @truncate(((@as(u128, t[9]) -% borrow) >> 64) & 1);
-    const keep = 0 -% under;
+    const keep = ct.blackBox(0 -% under);
     var out: Limbs = undefined;
     inline for (0..9) |i| out[i] = (t[i] & keep) | (r[i] & ~keep);
     return out;
@@ -210,7 +210,7 @@ pub const Scalar = struct {
             r[i] = @truncate(d);
             borrow = @truncate((d >> 64) & 1);
         }
-        const m = 0 -% borrow;
+        const m = ct.blackBox(0 -% borrow);
         var c: u64 = 0;
         inline for (0..9) |i| {
             const x = @as(u128, r[i]) + (N[i] & m) + c;

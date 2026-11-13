@@ -16,6 +16,11 @@
 //!              tainted seed: the RFC 6979 HMAC-DRBG, `k·G`, `k⁻¹` (Fermat),
 //!              `s = k⁻¹(e + r·d)`. The message is public.
 //! * `ecdh`   — `ecdhInto`, secret tainted, peer public.
+//! * `cmov`   — `Fe.cMov` with a tainted select bit (the primitive behind
+//!              `fromAffineCoordinates`, `recoverY` and `add`'s identity
+//!              fix-up when the point is secret-derived, e.g. a hash-to-curve
+//!              output). Added 2026-11-13: LLVM had lowered the unlaundered
+//!              mask to a jump and no other row put a tainted bit through it.
 //! * `vartime` — POSITIVE CONTROL: a tainted scalar into `mulPublic`, which
 //!              is documented variable time; it MUST produce in-file
 //!              contexts, or the measurement is not seeing this module.
@@ -61,7 +66,7 @@ fn secretScalar(comptime domain: []const u8) [66]u8 {
     return s;
 }
 
-const Target = enum { mul, keygen, sign, ecdh, vartime };
+const Target = enum { mul, keygen, sign, ecdh, vartime, cmov };
 
 fn taintIf(cond: bool, bytes: []u8) void {
     if (cond) std.valgrind.memcheck.makeMemUndefined(bytes);
@@ -95,6 +100,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("x={x}\n", .{std.mem.asBytes(&q.x.l)});
             std.debug.print("y={x}\n", .{std.mem.asBytes(&q.y.l)});
             std.debug.print("z={x}\n", .{std.mem.asBytes(&q.z.l)});
+        },
+        .cmov => {
+            var sel = secretBytes(1, "ctgrind-p521-cmov-v1");
+            taintIf(tainted, &sel);
+            const bit: u1 = @truncate(reloadVolatile(1, &sel)[0]);
+            var a = peer.x;
+            a.cMov(peer.y, bit);
+            std.debug.print("a={x}\n", .{std.mem.asBytes(&a.l)});
         },
         .keygen => {
             var d = secretScalar("ctgrind-p521-keygen-v1");

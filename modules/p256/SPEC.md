@@ -213,6 +213,13 @@ jumps and zero secret-indexed loads before the core is declared done.
   fallback `mulDoubleAddCt` is a fixed 256-iteration double-and-add with `cMov`.
   `mulPublic`/`mulDoubleBasePublic` are explicitly VARIABLE-TIME and only for
   PUBLIC scalars (verification), matching std's contract.
+  Secret POINT (2026-11-13, ctgrind row `secpt`, found by a voprf harness): the
+  fast-path test `isBasePointRepr` is branch-free (limbs of the three differences
+  OR-ed, one compare), where it used to short-circuit on x, then y, then z. The one
+  jump on its verdict ("the point is exactly G") is declassified: it is false for
+  every point except the public constant, so a secret point reveals nothing unless
+  it equals G (about 2^-256 for a hashed point). Row `secpt`: 2 in-file before the
+  fix, 1 after (the product's `rejectIdentity` verdict, as in `comb`).
 - **Scalar**: `mul`/`add`/`sub`/codecs are std's constant-time fiat field, wrapped;
   `invert` is this module's safegcd (`modinv.zig`, fixed 590 divsteps, every
   decision a `blackBox`-laundered mask), re-encoded through std's branch-free

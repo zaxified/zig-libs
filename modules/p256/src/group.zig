@@ -412,7 +412,18 @@ pub const P256 = struct {
         // secret. So this adds no secret-dependent branch. `combMulBase` is
         // pinned bit-for-bit to `mulDoubleAddCt` by the gated differential, so
         // it cannot answer differently either.
-        if (p.isBasePointRepr()) return combMulBaseUnburned(s_, endian);
+        //
+        // When the POINT is secret (voprf multiplies H(input)), the verdict is
+        // still one bit of it: "is it exactly G". The test itself is
+        // branch-free (`isBasePointRepr`); the one jump on its verdict is
+        // declassified for ctgrind (a no-op without `-fvalgrind`) because for
+        // any point that is not the public constant G it is false, and a
+        // hashed point equals G with probability about 2^-256. A caller that
+        // multiplies an attacker-steerable point that may equal G learns only
+        // that it did, which it knew.
+        var is_g = p.isBasePointRepr();
+        std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&is_g));
+        if (is_g) return combMulBaseUnburned(s_, endian);
         if (comptime gate.fast_scalarmul_implemented) {
             return mulCtWindowed(p, s_, endian);
         }
@@ -432,9 +443,19 @@ pub const P256 = struct {
     /// branches of `mul` return the same answer by construction, so no
     /// assertion on the *result* can tell which one ran.
     pub fn isBasePointRepr(p: P256) bool {
-        return p.x.equivalent(basePoint.x) and
-            p.y.equivalent(basePoint.y) and
-            p.z.equivalent(basePoint.z);
+        // Branch-free fold: OR the limbs of the three differences and compare
+        // once. The short-circuit `and` of three `equivalent` calls branched
+        // on x, then y, then z of a point that is SECRET when the caller
+        // multiplies a secret point (voprf: H(input)); ctgrind finding
+        // 2026-11-13. The remaining verdict is still a secret-dependent
+        // choice of fast path (see `mulUnburned`), but it is one bit that is
+        // true only for the constant G (about 2^-256 for a hashed point).
+        const dx = p.x.sub(basePoint.x).limbs;
+        const dy = p.y.sub(basePoint.y).limbs;
+        const dz = p.z.sub(basePoint.z).limbs;
+        var acc: u64 = 0;
+        inline for (0..4) |i| acc |= dx[i] | dy[i] | dz[i];
+        return acc == 0;
     }
 
     /// Portable CONSTANT-TIME fixed 256-bit double-and-add with a branch-free

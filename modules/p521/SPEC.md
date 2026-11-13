@@ -139,7 +139,12 @@ rows in `scripts/checks/ctgrind-expected.tsv`):** `P521.mulInto` (`mul`),
 (`ecdh`): 0 in-file contexts, ReleaseFast, CPU skylake. The positive control
 `vartime` (a tainted scalar into `mulPublic`) reports 9 in-file (5 before the
 Jacobian rewrite of 2026-10-11) — the harness
-does see this module.
+does see this module. Row `cmov` (2026-11-13, a tainted select bit into
+`Fe.cMov`): 0 in-file; before the fix 1, because the unlaundered mask became a
+conditional jump (no other row put a tainted bit through `cMov`, which a
+secret-derived point reaches via `fromAffineCoordinates`, `recoverY` and `add`).
+Every secret-bit mask in field, scalar and group now goes through
+`ct.blackBox`; the remaining `if`s test public values (encodings, error paths).
 
 **Declassified, not absent** (`ct.zig`; each a value the API reveals):
 

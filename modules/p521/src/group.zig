@@ -768,12 +768,7 @@ pub const base_table: BaseTable = @import("base_table.zig").table;
 
 /// Optimization barrier: launder a value through an empty inline asm so LLVM
 /// loses what it knows about it (p256's `blackBox`, montint `b199192`).
-inline fn blackBox(x: u64) u64 {
-    return asm volatile (""
-        : [ret] "=r" (-> u64),
-        : [x] "0" (x),
-    );
-}
+const blackBox = ct.blackBox;
 
 /// `dst = (dst & ~mask) | (src & mask)`, `mask` 0 or all ones.
 inline fn blend(dst: *field.Fe, src: field.Fe, mask: u64) void {

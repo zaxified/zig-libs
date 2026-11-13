@@ -188,7 +188,7 @@ declare -A TARGETS=(
     [k256]="field mul comb sign ecdsa"
     [montint]="small portable asmcore field ffcontrol dyn"
     # ── added 2026-09-09, A1 R2's first four ────────────────────────────────
-    [p256]="comb sign"
+    [p256]="comb sign secpt"
     [rsa]="crt crtbl crtcache noncrt keygen oaepnf"
     [slhdsa]="seed prf"
     # ⚠ `falcon` is here against its own SPEC.md, which argued it should NOT
@@ -326,7 +326,7 @@ declare -A TARGETS=(
     [snmp]="kdf auth aes des"
     [aes192]="enc dec bitsliced"
     # ── 2026-10-10: p521 (NIST P-521): mul/keygen/sign/ecdh claims + the vartime positive control ──
-    [p521]="mul keygen sign ecdh vartime"
+    [p521]="mul keygen sign ecdh vartime cmov"
     # ── 2026-10-13: p384 (NIST P-384): mul/keygen/sign/ecdh claims + the vartime positive control ──
     [p384]="mul keygen sign ecdh vartime"
     # ── 2026-10-13: tlsresume: STEK, resumption secret/PSK/binder key, 0-RTT key schedule ──
@@ -555,6 +555,7 @@ declare -A PATTERN=(
     # pattern names std's AEAD: the shipped ES256 surface is std's generic
     # signer over THIS module's group, so attributing that arithmetic to
     # someone else would be the evasion this gate exists to refuse.
+    [p256/secpt]='group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig'
     [p256/sign]='ecdsa[.]zig|common[.]zig|scalar[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig'
     [rsa/crt]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [rsa/crtbl]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|safegcd[.]zig'
@@ -831,6 +832,7 @@ declare -A PATTERN=(
     [p521/ecdh]='field[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig'
     [p384/ecdh]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig'
     [p521/vartime]='field[.]zig|scalar[.]zig|group[.]zig'
+    [p521/cmov]='field[.]zig|scalar[.]zig|group[.]zig|ct[.]zig'
     [p384/vartime]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig'
     # tlsresume (2026-10-13): the module's own files; the AES-GCM tag verdict
     # and the HKDF/HMAC are std's and show up as in-file only through the
@@ -963,6 +965,7 @@ declare -A LABEL=(
     [threshold_ecdsa/open7]='thr_ecdsa type-7 opening: rho under secret lambda'
     [p256/comb]='p256 combMulBase'
     [p256/sign]='p256 sign+std ecdsa'
+    [p256/secpt]='p256 mulInto, SECRET POINT (isBasePointRepr)'
     [rsa/crt]='rsa CRT p/q+std ff'
     [rsa/crtbl]='rsa CRT p/q, .csprng blinding'
     [rsa/crtcache]='rsa CRT p/q, .cached blinding x2'
@@ -1189,6 +1192,7 @@ declare -A LABEL=(
     [p521/sign]='p521 generateDeterministicInto+signPrehashedInto (seed tainted)'
     [p384/sign]='p384 generateDeterministicInto+signPrehashedInto (seed tainted)'
     [p521/ecdh]='p521 ecdhInto (secret tainted)'
+    [p521/cmov]='p521 Fe.cMov (select bit tainted)'
     [p384/ecdh]='p384 ecdhInto (secret tainted)'
     [p521/vartime]='p521 mulPublic POSITIVE CONTROL (scalar tainted, must flag)'
     [p384/vartime]='p384 mulPublic POSITIVE CONTROL (scalar tainted, must flag)'

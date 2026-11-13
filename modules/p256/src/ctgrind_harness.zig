@@ -122,12 +122,13 @@ fn secretScalar(comptime domain: []const u8) [32]u8 {
     return s;
 }
 
-const Target = enum { comb, sign };
+const Target = enum { comb, sign, secpt };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "comb")) return .comb;
     if (std.mem.eql(u8, s, "sign")) return .sign;
+    if (std.mem.eql(u8, s, "secpt")) return .secpt;
     return error.UnknownTarget;
 }
 
@@ -166,6 +167,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // Raw projective coordinates via `Fe.toBytes` (a branch-free
             // limb write), not `affineCoordinates`: that runs `Fe.invert`,
             // a separate claim this target does not make.
+            std.debug.print("x={x}\n", .{q.x.toBytes(.big)});
+            std.debug.print("y={x}\n", .{q.y.toBytes(.big)});
+            std.debug.print("z={x}\n", .{q.z.toBytes(.big)});
+        },
+        .secpt => {
+            // `P256.mulInto` with a SECRET POINT (voprf multiplies H(input)
+            // by the key) and a public scalar: the fast-path test
+            // `isBasePointRepr` looks at the point's coordinates. Added
+            // 2026-11-13, when its short-circuit `and` branched on them.
+            const peer = P256.basePoint.dbl().add(P256.basePoint);
+            var pt = peer;
+            taintIf(tainted, std.mem.asBytes(&pt));
+            const p = P256{ .x = pt.x, .y = pt.y, .z = pt.z };
+            const k = secretScalar("ctgrind-p256-harness-secpt-scalar-v1");
+            var q: P256 = undefined;
+            try P256.mulInto(p, &q, &k, .big);
             std.debug.print("x={x}\n", .{q.x.toBytes(.big)});
             std.debug.print("y={x}\n", .{q.y.toBytes(.big)});
             std.debug.print("z={x}\n", .{q.z.toBytes(.big)});

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE (results bit-identical):** constant-time hardening. `Fe.cMov` built its mask as `0 -% c` without a barrier and LLVM lowered the select to a conditional jump on the (secret) bit; the mask is now laundered through the new `ct.blackBox` (p256's pattern), as are the masks of `Fe.canonical` and of `Scalar` `condSub`/`sub`. A ctgrind row `cmov` (tainted select bit) sees the old jump (1 in-file) and the fix (0); the existing rows never put a tainted bit through `cMov`. Bench (ReleaseFast, loaded host): no measurable change.
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GT). `Signature.der_encoded_length_max` 139 → 141: `fromBytes` accepts any 132 bytes, and `toDer` on an r/s with top byte ≥ 0x80 wrote 141 bytes into a 139-byte buffer (panic in safe builds, 2-byte stack overflow in ReleaseFast); valid signatures encode byte-identically. Tests: `src/sweep_test.zig` (also pins DER parse, SEC1 and ECDH edge cases).
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 - **2026-10-18** — Test fix (big-endian only): the `fromBytesReduce(.little)` differential test built its bytes as `@bitCast(nativeToLittle(w))`; Zig 0.17's int -> array `@bitCast` is already little-endian on every target, so the swap reversed them on big-endian. Now `writeInt(.little)`. s390x (qemu) passes.

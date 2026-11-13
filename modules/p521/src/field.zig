@@ -25,6 +25,7 @@
 //! no limb goes negative.
 
 const std = @import("std");
+const ct = @import("ct.zig");
 const NonCanonicalError = std.crypto.errors.NonCanonicalError;
 const NotSquareError = std.crypto.errors.NotSquareError;
 
@@ -138,7 +139,7 @@ pub const Fe = struct {
             t[i] = s & ((@as(u64, 1) << bits) - 1);
             carry = s >> bits;
         }
-        const m = 0 -% carry;
+        const m = ct.blackBox(0 -% carry);
         inline for (0..9) |i| r[i] = (t[i] & m) | (r[i] & ~m);
         return r;
     }
@@ -313,9 +314,11 @@ pub const Fe = struct {
         return a.canonical()[0] & 1 != 0;
     }
 
-    /// `a.* = b` when `c == 1`, unchanged when `c == 0`; no branch.
+    /// `a.* = b` when `c == 1`, unchanged when `c == 0`; no branch. The mask is
+    /// laundered through `ct.blackBox`: without it LLVM lowered the select to a
+    /// conditional jump on the (secret) bit.
     pub fn cMov(a: *Fe, b: Fe, c: u1) void {
-        const m = 0 -% @as(u64, c);
+        const m = ct.blackBox(0 -% @as(u64, c));
         inline for (0..9) |i| a.l[i] ^= (a.l[i] ^ b.l[i]) & m;
     }
 };
