@@ -1,5 +1,6 @@
 # unitext: Rust (17, 0, 0) str::to_lowercase / to_uppercase (char::UNICODE_VERSION), frozen by tools/rust_case.rs.
 # C;cp;lower;upper (only where either differs from the code point) and S;cps;lower;upper.
+# restricted by tools/restrict_vectors.py (UCD 17.0.0 -> 18.0.0): 41 code points whose lower/upper mapping changed are `X` lines (skipped); strings with a code point whose mappings or Cased / Case_Ignorable changed (203 code points) are dropped.
 C;41;61;41
 C;42;62;42
 C;43;63;43
@@ -458,6 +459,8 @@ C;26F;26F;19C
 C;271;271;2C6E
 C;272;272;19D
 C;275;275;19F
+X;277;;
+X;27C;;
 C;27D;27D;2C64
 C;280;280;1A6
 C;282;282;A7C5
@@ -2276,9 +2279,15 @@ C;A7D9;A7D9;A7D8
 C;A7DA;A7DB;A7DA
 C;A7DB;A7DB;A7DA
 C;A7DC;19B;A7DC
+X;A7DD;;
+X;A7E2;;
 C;A7F5;A7F6;A7F5
 C;A7F6;A7F6;A7F5
+X;AB4B;;
+X;AB4C;;
 C;AB53;AB53;A7B3
+X;AB6C;;
+X;AB6D;;
 C;AB70;AB70;13A0
 C;AB71;AB71;13A1
 C;AB72;AB72;13A2
@@ -2969,6 +2978,39 @@ C;16ED0;16ED0;16EB5
 C;16ED1;16ED1;16EB6
 C;16ED2;16ED2;16EB7
 C;16ED3;16ED3;16EB8
+X;1DF40;;
+X;1DF41;;
+X;1DF48;;
+X;1DF49;;
+X;1DF4A;;
+X;1DF4B;;
+X;1DF4D;;
+X;1DF4E;;
+X;1DF51;;
+X;1DF52;;
+X;1DF68;;
+X;1DF69;;
+X;1DF6A;;
+X;1DF6B;;
+X;1DF6C;;
+X;1DF6D;;
+X;1DF6E;;
+X;1DF6F;;
+X;1DF72;;
+X;1DF73;;
+X;1DF74;;
+X;1DF75;;
+X;1DF76;;
+X;1DF77;;
+X;1DF78;;
+X;1DF79;;
+X;1DF7A;;
+X;1DF7B;;
+X;1DF7C;;
+X;1DF7D;;
+X;1DF7E;;
+X;1DF7F;;
+X;1DF95;;
 C;1E900;1E922;1E900
 C;1E901;1E923;1E901
 C;1E902;1E924;1E902

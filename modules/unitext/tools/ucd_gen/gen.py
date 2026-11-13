@@ -4,9 +4,9 @@ reads) and `src/testdata/normalization_test.txt` (a frozen copy of
 NormalizationTest.txt) and `src/testdata/alphabetic_ranges.txt` (the Alphabetic
 ranges of DerivedCoreProperties.txt) from UCD files.
 
-    tools/ucd_gen/fetch.sh 17.0.0                 # the files below into tools/ucd_gen/data/17.0.0/ (gitignored)
-    python3 -I tools/ucd_gen/gen.py --ucd tools/ucd_gen/data/17.0.0 -out src
-    python3 -I tools/ucd_gen/gen.py --ucd tools/ucd_gen/data/17.0.0 -check src
+    tools/ucd_gen/fetch.sh 18.0.0                 # the files below into tools/ucd_gen/data/18.0.0/ (gitignored)
+    python3 -I tools/ucd_gen/gen.py --ucd tools/ucd_gen/data/18.0.0 -out src
+    python3 -I tools/ucd_gen/gen.py --ucd tools/ucd_gen/data/18.0.0 -check src
     python3 -I tools/ucd_gen/gen.py --ucd tools/ucd_gen/data/16.0.0 -out <scratch dir>   # CPython 3.14's version
 
 Reads (all under the UCD directory): UnicodeData.txt, SpecialCasing.txt,
@@ -325,7 +325,7 @@ def unaccent_lists(u):
     """(letters, expansions) of `unaccent`: `[(cp, ascii)]` each, sorted by cp, derived from the UCD names."""
     letters = []
     lig = []
-    rx = re.compile(r"^LATIN (SMALL|CAPITAL) (?:LETTER|LIGATURE) (.+)$")
+    rx = re.compile(r"^LATIN (SMALL|CAPITAL) (LETTER|LIGATURE) (.+)$")
     rx_smallcap = re.compile(r"^LATIN (?:LETTER SMALL CAPITAL|SMALL CAPITAL LETTER) (.+)$")
     for c in sorted(u.name):
         nm = u.name[c]
@@ -336,16 +336,18 @@ def unaccent_lists(u):
             continue
         m = rx_smallcap.match(nm)
         if m:
-            capital, rest = True, m.group(1)
+            capital, ligature, rest = True, False, m.group(1)
         else:
             m = rx.match(nm)
             if not m:
                 continue
-            capital, rest = m.group(1) == "CAPITAL", m.group(2)
+            capital, ligature, rest = m.group(1) == "CAPITAL", m.group(2) == "LIGATURE", m.group(3)
         base, _, mods = rest.partition(" WITH ")
         # "... WITH SMALL LETTER Z WITH CARON" is a titlecase digraph (Dž Lj Nj Dz), not one
         # letter with a diacritic: folding it to its first letter would drop letters (UR-1).
-        if "LETTER" in mods.split():
+        # Likewise a ligature "WITH" something joins a second letter, not a mark
+        # (U+1DF95 LIGATURE LONG S WITH DESCENDER S, Unicode 18).
+        if "LETTER" in mods.split() or (ligature and mods):
             continue
         if re.fullmatch(r"[A-Z]", base):
             letters.append((c, base if capital else base.lower()))

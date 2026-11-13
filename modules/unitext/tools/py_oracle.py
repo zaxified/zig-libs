@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: MIT
 """Freeze CPython's answers as the test vectors of `unitext` (`src/testdata/cpython_vectors.txt`).
 
-    python3 -I tools/py_oracle.py --ucd16 tools/ucd_gen/data/16.0.0 --ucd17 tools/ucd_gen/data/17.0.0 -out src/testdata/cpython_vectors.txt
+    python3 -I tools/py_oracle.py --ucd16 tools/ucd_gen/data/16.0.0 --ucd tools/ucd_gen/data/17.0.0 \
+        --ucd tools/ucd_gen/data/18.0.0 -out src/testdata/cpython_vectors.txt
 
-CPython 3.14's `unicodedata` is Unicode 16.0.0, the module's tables are 17.0.0, so
-only code points whose UCD data are IDENTICAL in both versions are compared: for each
-code point, every record the answers depend on (UnicodeData row, SpecialCasing,
-CaseFolding, the Uppercase / Lowercase / Cased / Case_Ignorable properties,
-Numeric_Type, the quick-check values and the records of every code point in its
-decompositions and case mappings) must be equal in the two directories. The line
-count of the exclusion is written into the file header.
+CPython 3.14's `unicodedata` is Unicode 16.0.0, the module's tables are 18.0.0, so
+only code points whose UCD data are IDENTICAL in 16.0.0 and in every `--ucd` directory
+(each version up to the tables') are compared: for each code point, every record the
+answers depend on (UnicodeData row, SpecialCasing, CaseFolding, the Uppercase /
+Lowercase / Cased / Case_Ignorable properties, Numeric_Type, the quick-check values and
+the records of every code point in its decompositions and case mappings) must be equal
+in all the directories. The count of the exclusion is written into the file header.
 
 Needs only the Python 3 standard library and `tools/ucd_gen/gen.py` (imported, for
 its UCD parser). CPython supplies, per code point (surrogates excluded): general
@@ -71,18 +72,24 @@ def closure(u, c):
 def main():
     args = sys.argv[1:]
     opts = {}
+    newer = []
     while args:
         a = args.pop(0)
-        opts[a] = args.pop(0)
+        if a == "--ucd":
+            newer.append(gen.Ucd(args.pop(0)))
+        else:
+            opts[a] = args.pop(0)
+    if not newer:
+        gen.die("usage: py_oracle.py --ucd16 DIR --ucd DIR [--ucd DIR ...] -out FILE")
     u16 = gen.Ucd(opts["--ucd16"])
-    u17 = gen.Ucd(opts["--ucd17"])
     assert unicodedata.unidata_version == u16.version, (unicodedata.unidata_version, u16.version)
     cache = {}
 
     def same(c):
         r = cache.get(c)
         if r is None:
-            r = cache[c] = rec(u16, c) == rec(u17, c)
+            r16 = rec(u16, c)
+            r = cache[c] = all(rec(u, c) == r16 for u in newer)
         return r
 
     ok = [False] * (MAX_CP + 1)
@@ -92,7 +99,7 @@ def main():
             continue
         if 0xAC00 <= c <= 0xD7A3 and (c - 0xAC00) % 11 != 0 and c != 0xD7A3:
             continue  # Hangul is algorithmic: every 11th syllable (all L, V and T combinations recur) and the last
-        if all(same(x) for x in closure(u16, c)) and all(same(x) for x in closure(u17, c)):
+        if all(same(x) for x in closure(u16, c)) and all(same(x) for u in newer for x in closure(u, c)):
             ok[c] = True
         else:
             skipped += 1
@@ -160,14 +167,14 @@ def main():
     py = sys.version.split()[0]
     header = [
         f"# unitext: CPython {py} answers (unicodedata {unicodedata.unidata_version}), frozen by tools/py_oracle.py.",
-        f"# Code points whose UCD data differ between {u16.version} and {u17.version} (incl. their decomposition / mapping targets) are left out: {skipped}.",
+        f"# Code points whose UCD data differ between {u16.version} and any of " + ", ".join(u.version for u in newer) + f" (incl. their decomposition / mapping targets) are left out: {skipped}.",
         "# Range line: cp[-cp];gc;ccc;flags(" + ",".join(PREDS) + ");isnormalized(nfc,nfd,nfkc,nfkd);lower;upper;title;casefold;nfc;nfd;nfkc;nfkd;simple lower;upper;title;fold",
         "# A mapping field is empty when the answer is the code point itself; mappings are hex code points. Simple columns: read from the UCD text by this script, not CPython.",
         "# String line: S;cps;flags;isnormalized;lower;upper;title;capitalize;swapcase;casefold;nfc;nfd;nfkc;nfkd",
     ]
     with open(opts["-out"], "w", encoding="utf-8") as fh:
         fh.write("\n".join(header + out + sl) + "\n")
-    sys.stderr.write(f"wrote {opts['-out']}: {len(out)} range lines, {len(sl)} strings, {skipped} code points skipped as changed 16->17\n")
+    sys.stderr.write(f"wrote {opts['-out']}: {len(out)} range lines, {len(sl)} strings, {skipped} code points skipped as changed since {u16.version}\n")
 
 
 if __name__ == "__main__":

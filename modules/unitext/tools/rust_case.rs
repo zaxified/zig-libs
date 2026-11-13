@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 //! Freeze Rust's `str::to_lowercase` / `to_uppercase` answers (Unicode 17.0.0 in Rust
-//! 1.93, the module's version) as `src/testdata/rust_vectors.txt`.
+//! 1.93; the module's tables are 18.0.0) as `src/testdata/rust_vectors.txt`.
 //!
 //!     rustc --edition 2021 -O tools/rust_case.rs -o <scratch>/rust_case
 //!     <scratch>/rust_case src/testdata/cpython_vectors.txt > src/testdata/rust_vectors.txt
+//!     python3 -I tools/restrict_vectors.py --oracle-ucd tools/ucd_gen/data/17.0.0 \
+//!         --ucd tools/ucd_gen/data/18.0.0 src/testdata/rust_vectors.txt   # while Rust < tables
 //!
 //! std only, no crates. Lines: `C;cp;lower;upper` for every scalar value whose lowercase
 //! or uppercase is not itself (hex code points, space separated), and `S;cps;lower;upper`

@@ -212,7 +212,7 @@ test "classification matches the documented Python behaviour" {
     try testing.expect(try ut.isSpace(" \t\u{3000}\u{85}", .{}));
     try testing.expect(!(try ut.isPrintable("a\u{A0}", .{})));
     try testing.expectEqual(ut.GeneralCategory.Mn, ut.generalCategory(0x301));
-    try testing.expectEqualStrings("17.0.0", ut.unicode_version);
+    try testing.expectEqualStrings("18.0.0", ut.unicode_version);
 }
 
 test "unaccent: titlecase digraphs keep both letters (UR-1)" {
@@ -302,7 +302,7 @@ test "isAlphabeticCp: the Alphabetic derived property (spot cases)" {
     try testing.expect(!(try ut.isAlphabetic("a1", .{})));
 }
 
-test "isAlphabeticCp: every code point against the ranges of DerivedCoreProperties.txt 17.0.0" {
+test "isAlphabeticCp: every code point against the ranges of DerivedCoreProperties.txt 18.0.0" {
     // testdata/alphabetic_ranges.txt is written by tools/ucd_gen/gen.py straight from the UCD file,
     // independently of the packed table the function reads.
     const data = @embedFile("testdata/alphabetic_ranges.txt");
@@ -328,7 +328,7 @@ test "isAlphabeticCp: every code point against the ranges of DerivedCoreProperti
             count += 1;
         }
     }
-    try testing.expectEqual(@as(usize, 147_421), count); // the ranges of the 17.0.0 file, summed
+    try testing.expectEqual(@as(usize, 160_254), count); // the ranges of the 18.0.0 file, summed
     var cp: u32 = 0;
     while (cp < 0x110000) : (cp += 1) {
         try testing.expectEqual(expected[cp], ut.isAlphabeticCp(@intCast(cp)));

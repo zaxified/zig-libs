@@ -2,12 +2,14 @@
 
 //! Conformance replays of frozen vector files (see README DATA and SPEC Anchoring):
 //!
-//!   testdata/normalization_test.txt  Unicode's NormalizationTest.txt (17.0.0), all five parts
+//!   testdata/normalization_test.txt  Unicode's NormalizationTest.txt (18.0.0), all five parts
 //!   testdata/cpython_vectors.txt     CPython 3.14.4 (unicodedata 16.0.0) on every code point
-//!                                    whose UCD data are identical in 16.0.0 and 17.0.0, plus
-//!                                    2000 seeded strings (tools/py_oracle.py)
+//!                                    whose UCD data are identical in 16.0.0, 17.0.0 and 18.0.0,
+//!                                    plus 2000 seeded strings (tools/py_oracle.py)
 //!   testdata/rust_vectors.txt        Rust 1.93 (Unicode 17.0.0) to_lowercase / to_uppercase on
-//!                                    EVERY scalar value and on the same strings (tools/rust_case.rs)
+//!                                    every scalar value whose case mappings are the same in 17.0.0
+//!                                    and 18.0.0 (the 41 others are `X` lines, skipped:
+//!                                    tools/restrict_vectors.py) and on 2000 strings (tools/rust_case.rs)
 
 const std = @import("std");
 const ut = @import("root.zig");
@@ -184,7 +186,7 @@ fn normFn(comptime f: ut.Form) MapFn {
     }.go;
 }
 
-test "CPython vectors: every code point of the 16.0.0/17.0.0 intersection and 2000 strings" {
+test "CPython vectors: every code point of the 16.0.0/17.0.0/18.0.0 intersection and 2000 strings" {
     const a = testing.allocator;
     var it = std.mem.splitScalar(u8, cpython_vectors, '\n');
     var cps: usize = 0;
@@ -290,6 +292,7 @@ test "Rust vectors: to_lowercase / to_uppercase of every scalar value and of the
     defer want_upper.deinit(a);
     var cp: u21 = 0;
     var changed: usize = 0;
+    var skipped: usize = 0;
     var strs: usize = 0;
     var lbuf: [64]u8 = undefined;
     var ubuf: [64]u8 = undefined;
@@ -306,7 +309,13 @@ test "Rust vectors: to_lowercase / to_uppercase of every scalar value and of the
         want_upper.clearRetainingCapacity();
         try fromHex(&want_lower, a, lo_f);
         try fromHex(&want_upper, a, up_f);
-        if (kind[0] == 'C') {
+        if (kind[0] == 'X') {
+            // case mappings changed after Rust's Unicode version: neither Rust's answer nor identity
+            const target = try std.fmt.parseInt(u21, key, 16);
+            while (cp < target) : (cp += 1) try expectIdentity(cp, &lbuf, &ubuf);
+            skipped += 1;
+            cp = target + 1;
+        } else if (kind[0] == 'C') {
             const target = try std.fmt.parseInt(u21, key, 16);
             // everything before `target` that Rust did not list maps to itself
             while (cp < target) : (cp += 1) try expectIdentity(cp, &lbuf, &ubuf);
@@ -328,7 +337,7 @@ test "Rust vectors: to_lowercase / to_uppercase of every scalar value and of the
             try eqStr("upper", line, want_upper.items, u);
         }
     }
-    try testing.expect(changed > 3000 and strs == 2000);
+    try testing.expect(changed > 3000 and strs == 2000 and skipped == 41);
 }
 
 fn expectIdentity(cp: u21, lbuf: []u8, ubuf: []u8) !void {

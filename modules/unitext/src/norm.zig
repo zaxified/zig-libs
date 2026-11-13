@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Unicode normalization forms NFC, NFD, NFKC, NFKD (UAX #15, Unicode 17) of UTF-8
+//! Unicode normalization forms NFC, NFD, NFKC, NFKD (UAX #15, Unicode 18) of UTF-8
 //! strings, and the quick-check / is-normalized tests.
 //!
 //! Behaviour is CPython's `unicodedata.normalize` / `is_normalized`, Rust's

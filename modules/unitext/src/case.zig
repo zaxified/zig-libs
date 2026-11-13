@@ -3,7 +3,7 @@
 //! Full Unicode case mapping of UTF-8 strings: lower, upper, title, capitalize,
 //! swapcase, casefold, and the simple per-code-point mappings.
 //!
-//! Behaviour is CPython's `str` methods (3.14, Unicode 16 there, 17 here): the
+//! Behaviour is CPython's `str` methods (3.14, Unicode 16 there, 18 here): the
 //! mappings are UnicodeData's simple ones overridden by the **unconditional** entries
 //! of SpecialCasing.txt (ß -> SS, ŉ -> ʼN, İ -> i̇, ligatures, Greek iota subscript),
 //! lowercase applies the Final_Sigma rule, and no language-tailored rule is applied
