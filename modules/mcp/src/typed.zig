@@ -540,3 +540,284 @@ test "schemaOf: verdicts agree with jsonschema-go" {
     try expectOracle(OShape, &oracle_shape);
     try expectOracle(OTriple, &oracle_triple);
 }
+
+// ── mutation-run tests (2026-11-13): the hostile-client shapes of `decode` ──
+
+fn objWith(arena: std.mem.Allocator, key: []const u8, val: std.json.Value) !std.json.Value {
+    var m: std.json.ObjectMap = .empty;
+    try m.put(arena, key, val);
+    return .{ .object = m };
+}
+
+/// Decode `{"n": val}` into `struct { n: T }`: the value, or the refusal message.
+fn decodeOne(comptime T: type, val: std.json.Value) !union(enum) { ok: T, refused: []const u8 } {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var f: Failure = .{};
+    const r = parse(struct { n: T }, arena, try objWith(arena, "n", val), &f) catch |e| {
+        if (e != error.InvalidArguments) return e;
+        try testing.expectEqualStrings("/n", f.pointer);
+        return .{ .refused = f.message };
+    };
+    return .{ .ok = r.n };
+}
+
+fn expectRefused(comptime T: type, val: std.json.Value, message: []const u8) !void {
+    const r = try decodeOne(T, val);
+    try testing.expect(r == .refused);
+    try testing.expectEqualStrings(message, r.refused);
+}
+
+test "parse: integers from hostile floats and edge values" {
+    const range = "must be an integer in range";
+    const inf = std.math.inf(f64);
+    // huge, infinite and NaN doubles never reach the integer conversion
+    try expectRefused(i64, .{ .float = 1e300 }, range);
+    try expectRefused(i64, .{ .float = -1e300 }, range);
+    try expectRefused(i64, .{ .float = inf }, range);
+    try expectRefused(i64, .{ .float = -inf }, range);
+    try expectRefused(i64, .{ .float = std.math.nan(f64) }, range);
+    try expectRefused(i64, .{ .float = 0.5 }, range);
+    try expectRefused(i64, .{ .float = -0.5 }, range);
+    // 2^63 is refused as out of range; -2^63 passes the range check and meets the bound
+    try expectRefused(i64, .{ .float = 9.223372036854775808e18 }, range);
+    const between = "must be an integer between -9007199254740991 and 9007199254740991";
+    try expectRefused(i64, .{ .float = -9.223372036854775808e18 }, between);
+    try expectRefused(i64, .{ .float = 9007199254740992.0 }, between);
+    try expectRefused(i64, .{ .integer = -9007199254740992 }, between);
+    try expectRefused(i64, .{ .integer = std.math.minInt(i64) }, between);
+    try expectRefused(i64, .{ .integer = std.math.maxInt(i64) }, between);
+    try expectRefused(i64, .{ .number_string = "123456789012345678901234567890" }, range);
+    try expectRefused(i64, .{ .number_string = "5" }, range);
+    // the exact edges are accepted
+    try testing.expectEqual(@as(i64, 9007199254740991), (try decodeOne(i64, .{ .integer = 9007199254740991 })).ok);
+    try testing.expectEqual(@as(i64, -9007199254740991), (try decodeOne(i64, .{ .integer = -9007199254740991 })).ok);
+    try testing.expectEqual(@as(i64, 9007199254740991), (try decodeOne(i64, .{ .float = 9007199254740991.0 })).ok);
+    try testing.expectEqual(@as(i64, -9007199254740991), (try decodeOne(i64, .{ .float = -9007199254740991.0 })).ok);
+    try testing.expectEqual(@as(i64, 0), (try decodeOne(i64, .{ .float = -0.0 })).ok);
+    try testing.expectEqual(@as(i8, -128), (try decodeOne(i8, .{ .integer = -128 })).ok);
+    try testing.expectEqual(@as(i8, 127), (try decodeOne(i8, .{ .integer = 127 })).ok);
+    try testing.expectEqual(@as(u8, 0), (try decodeOne(u8, .{ .integer = 0 })).ok);
+    try testing.expectEqual(@as(u8, 255), (try decodeOne(u8, .{ .float = 255.0 })).ok);
+    try expectRefused(i8, .{ .integer = 128 }, "must be an integer between -128 and 127");
+    try expectRefused(i8, .{ .integer = -129 }, "must be an integer between -128 and 127");
+    try expectRefused(u8, .{ .float = -1.0 }, "must be an integer between 0 and 255");
+    try expectRefused(u64, .{ .integer = -1 }, "must be an integer between 0 and 9007199254740991");
+    try expectRefused(i64, .{ .string = "1" }, "must be an integer");
+    try expectRefused(i64, .{ .bool = true }, "must be an integer");
+    try expectRefused(i64, .{ .null = {} }, "must be an integer");
+    try expectRefused(i64, .{ .array = std.json.Array.init(testing.allocator) }, "must be an integer");
+}
+
+test "parse: floats, strings, booleans and enums refuse the wrong JSON type" {
+    // a bare huge integer (a `number_string` after std.json) is a valid double
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var f: Failure = .{};
+    const big = try parseText(struct { x: f64 }, arena, "{\"x\":100000000000000000000}", &f);
+    try testing.expectEqual(@as(f64, 1e20), big.x);
+    const neg = try parseText(struct { x: f64 }, arena, "{\"x\":-3}", &f);
+    try testing.expectEqual(@as(f64, -3.0), neg.x);
+    // f32 saturates to infinity instead of trapping
+    const wide = try parseText(struct { x: f32 }, arena, "{\"x\":1e300}", &f);
+    try testing.expect(std.math.isInf(wide.x));
+    try expectRefused(f64, .{ .number_string = "12x" }, "must be a number");
+    try expectRefused(f64, .{ .bool = false }, "must be a number");
+    try expectRefused(f64, .{ .null = {} }, "must be a number");
+    try expectRefused(bool, .{ .integer = 1 }, "must be a boolean");
+    try expectRefused(bool, .{ .string = "true" }, "must be a boolean");
+    try expectRefused(bool, .{ .null = {} }, "must be a boolean");
+    try expectRefused([]const u8, .{ .integer = 1 }, "must be a string");
+    try expectRefused([]const u8, .{ .null = {} }, "must be a string");
+    try expectRefused(Color, .{ .null = {} }, "must be a string");
+    try expectRefused(Color, .{ .string = "" }, "must be one of red, green");
+    try expectRefused(Color, .{ .string = "gree" }, "must be one of red, green");
+    try expectRefused([]const bool, .{ .object = .empty }, "must be an array");
+    try expectRefused([2]bool, .{ .string = "ab" }, "must be an array");
+    try expectRefused(Inner, .{ .array = std.json.Array.init(testing.allocator) }, "must be an object");
+    try expectRefused(Inner, .{ .null = {} }, "must be an object");
+    try testing.expectEqual(Color.red, (try decodeOne(Color, .{ .string = "red" })).ok);
+    try testing.expectEqual(Color.green, (try decodeOne(Color, .{ .string = "green" })).ok);
+    try testing.expectEqual(false, (try decodeOne(bool, .{ .bool = false })).ok);
+}
+
+test "parse: the pointer names the full path through arrays and structs" {
+    const S = struct { items: []const Inner = &.{}, m: []const []const bool = &.{}, g: [2][2]bool = .{ .{ false, false }, .{ false, false } }, o: struct { a: struct { c: u8 } = .{ .c = 0 } } = .{} };
+    try expectFail(S, "{\"items\":[{\"x\":1},{\"x\":\"q\"}]}", "/items/1/x", "must be an integer");
+    try expectFail(S, "{\"items\":[{\"x\":1},{}]}", "/items/1", "missing required property \"x\"");
+    try expectFail(S, "{\"m\":[[true],[true,1]]}", "/m/1/1", "must be a boolean");
+    try expectFail(S, "{\"m\":[[true],5]}", "/m/1", "must be an array");
+    try expectFail(S, "{\"g\":[[true,true],[true,1]]}", "/g/1/1", "must be a boolean");
+    try expectFail(S, "{\"g\":[[true,true],[true]]}", "/g/1", "must have exactly 2 items");
+    try expectFail(S, "{\"g\":[[true,true]]}", "/g", "must have exactly 2 items");
+    try expectFail(S, "{\"g\":[[true,true],[true,true],[true,true]]}", "/g", "must have exactly 2 items");
+    try expectFail(S, "{\"o\":{\"a\":{\"c\":300}}}", "/o/a/c", "must be an integer between 0 and 255");
+    try expectFail(S, "{\"o\":{\"a\":{\"c\":1,\"d\":2}}}", "/o/a", "unexpected property \"d\"");
+    // nesting far beyond the type is a plain type error, not a descent
+    var deep: [400]u8 = undefined;
+    @memset(deep[0..200], '[');
+    @memset(deep[200..], ']');
+    var text: [420]u8 = undefined;
+    const t = try std.fmt.bufPrint(&text, "{{\"m\":[{s}]}}", .{deep[0..400]});
+    try expectFail(S, t, "/m/0/0", "must be a boolean");
+}
+
+test "parse: optional elements, null as absent, defaults" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var f: Failure = .{};
+    const S = struct { xs: []const ?u8 = &.{}, d: ?u32 = 5, e: ?u32 = null, k: u8 = 3, u: ?Color = .green, w: ?Color = null };
+    const a = try parseText(S, arena, "{\"xs\":[1,null,3],\"u\":\"red\",\"w\":\"green\"}", &f);
+    try testing.expectEqual(@as(usize, 3), a.xs.len);
+    try testing.expectEqual(@as(?u8, 1), a.xs[0]);
+    try testing.expectEqual(@as(?u8, null), a.xs[1]);
+    try testing.expectEqual(@as(?u8, 3), a.xs[2]);
+    try testing.expectEqual(@as(?u32, 5), a.d); // absent: the default, not null
+    try testing.expectEqual(@as(?u32, null), a.e);
+    try testing.expectEqual(@as(u8, 3), a.k);
+    try testing.expectEqual(@as(?Color, .red), a.u);
+    try testing.expectEqual(@as(?Color, .green), a.w);
+    // an explicit null is "absent": the default applies (`?T = 5` stays 5)
+    const b = try parseText(S, arena, "{\"d\":null,\"e\":null,\"u\":null,\"w\":null}", &f);
+    try testing.expectEqual(@as(?u32, 5), b.d);
+    try testing.expectEqual(@as(?u32, null), b.e);
+    try testing.expectEqual(@as(?Color, .green), b.u);
+    try testing.expectEqual(@as(?Color, null), b.w);
+    const c = try parseText(S, arena, "{}", &f);
+    try testing.expectEqual(@as(?u32, 5), c.d);
+    try testing.expectEqual(@as(?Color, .green), c.u);
+    // a non-optional field is not rescued by null, default or not
+    try expectFail(S, "{\"k\":null}", "/k", "must be an integer");
+    try expectFail(S, "{\"d\":\"x\"}", "/d", "must be an integer");
+    try expectFail(S, "{\"xs\":[1,\"x\"]}", "/xs/1", "must be an integer");
+    try expectFail(S, "{\"xs\":[300]}", "/xs/0", "must be an integer between 0 and 255");
+}
+
+test "parse: unknown property is matched exactly and echoed truncated" {
+    const S = struct { name: u8 = 0, n: u8 = 0 };
+    try expectFail(S, "{\"names\":1}", "", "unexpected property \"names\"");
+    try expectFail(S, "{\"nam\":1}", "", "unexpected property \"nam\"");
+    try expectFail(S, "{\"\":1}", "", "unexpected property \"\"");
+    try expectFail(S, "{\"Name\":1}", "", "unexpected property \"Name\"");
+    const long: [100]u8 = @splat('k');
+    const k64: [64]u8 = @splat('k');
+    try expectFail(S, "{\"" ++ long ++ "\":1}", "", "unexpected property \"" ++ k64 ++ "\"");
+    try expectFail(S, "{\"" ++ k64 ++ "\":1}", "", "unexpected property \"" ++ k64 ++ "\"");
+    const k65: [65]u8 = @splat('k');
+    try expectFail(S, "{\"" ++ k65 ++ "\":1}", "", "unexpected property \"" ++ k64 ++ "\"");
+    // known keys together with an unknown one: the unknown one still refuses
+    try expectFail(S, "{\"name\":1,\"n\":2,\"zz\":3}", "", "unexpected property \"zz\"");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var f: Failure = .{};
+    const ok = try parseText(S, arena_state.allocator(), "{\"name\":1,\"n\":2}", &f);
+    try testing.expectEqual(@as(u8, 1), ok.name);
+    try testing.expectEqual(@as(u8, 2), ok.n);
+}
+
+test "parse: the failure record is reset by every call" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var f: Failure = .{ .pointer = "/stale", .message = "stale" };
+    _ = try parseText(struct { n: u8 }, arena, "{\"n\":1}", &f);
+    try testing.expectEqualStrings("", f.pointer);
+    try testing.expectEqualStrings("", f.message);
+    try testing.expectError(error.InvalidArguments, parseText(struct { n: u8 }, arena, "{\"n\":\"x\"}", &f));
+    try testing.expectEqualStrings("/n", f.pointer);
+    // a second refusal on the same record does not accumulate the first one's path
+    try testing.expectError(error.InvalidArguments, parseText(struct { n: u8 }, arena, "{}", &f));
+    try testing.expectEqualStrings("", f.pointer);
+    try testing.expectEqualStrings("missing required property \"n\"", f.message);
+}
+
+test "parse: OOM while building the pointer or message is OutOfMemory" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var f: Failure = .{};
+    const A = struct { l: []const bool };
+    const bad_elem = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), "{\"l\":[1]}", .{});
+    var one: [1]u8 = undefined; // room for the one-element slice, not for the "/0" pointer
+    var fba = std.heap.FixedBufferAllocator.init(&one);
+    try testing.expectError(error.OutOfMemory, parse(A, fba.allocator(), bad_elem, &f));
+    const B = struct { n: u8 };
+    const bad_field = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), "{\"n\":\"x\"}", .{});
+    var fa0 = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, parse(B, fa0.allocator(), bad_field, &f));
+    const unknown = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), "{\"zz\":1}", .{});
+    var fa2 = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, parse(B, fa2.allocator(), unknown, &f));
+    // a sweep over every allocation point of a full document: ok or OOM, never a crash
+    const doc = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(),
+        \\{"name":"n","count":1,"big":2,"ratio":1,"ok":true,"color":"red","tags":["a"],"pair":[1,2],"inner":{"x":1},"items":[{"x":1}]}
+    , .{});
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        var inner_arena = std.heap.ArenaAllocator.init(fa.allocator());
+        defer inner_arena.deinit();
+        _ = parse(Rich, inner_arena.allocator(), doc, &f) catch |e| if (e != error.OutOfMemory) return e;
+    }
+}
+
+/// Fails exactly the allocation number `fail_at` and serves every other one
+/// (`std.testing.FailingAllocator` keeps failing from its index on, so it
+/// cannot show what a handler does after the failure).
+const OneShotFail = struct {
+    inner: std.mem.Allocator,
+    fail_at: usize,
+    n: usize = 0,
+
+    fn allocator(self: *OneShotFail) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *OneShotFail = @ptrCast(@alignCast(ctx));
+        defer self.n += 1;
+        if (self.n == self.fail_at) return null;
+        return self.inner.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *OneShotFail = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(m, a, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *OneShotFail = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(m, a, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *OneShotFail = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(m, a, ra);
+    }
+};
+
+test "parse: an OOM after the first allocation leaves the failure record untouched" {
+    var backing = std.heap.ArenaAllocator.init(testing.allocator);
+    defer backing.deinit();
+    const doc_arena = backing.allocator();
+    const Nested = struct { l: []const []const bool };
+    const Arr = struct { g: [1][]const bool };
+    const Obj = struct { l: []const bool };
+    const nested = try std.json.parseFromSliceLeaky(std.json.Value, doc_arena, "{\"l\":[[true]]}", .{});
+    const arr = try std.json.parseFromSliceLeaky(std.json.Value, doc_arena, "{\"g\":[[true]]}", .{});
+    const obj = try std.json.parseFromSliceLeaky(std.json.Value, doc_arena, "{\"l\":[true]}", .{});
+    var f: Failure = .{};
+    // the inner slice (allocation 1) fails: element, field and root frames must not add a pointer
+    var s1: OneShotFail = .{ .inner = doc_arena, .fail_at = 1 };
+    try testing.expectError(error.OutOfMemory, parse(Nested, s1.allocator(), nested, &f));
+    try testing.expectEqualStrings("", f.pointer);
+    try testing.expectEqualStrings("", f.message);
+    var s2: OneShotFail = .{ .inner = doc_arena, .fail_at = 0 };
+    try testing.expectError(error.OutOfMemory, parse(Arr, s2.allocator(), arr, &f));
+    try testing.expectEqualStrings("", f.pointer);
+    var s3: OneShotFail = .{ .inner = doc_arena, .fail_at = 0 };
+    try testing.expectError(error.OutOfMemory, parse(Obj, s3.allocator(), obj, &f));
+    try testing.expectEqualStrings("", f.pointer);
+    // and the same documents decode when nothing fails
+    var s4: OneShotFail = .{ .inner = doc_arena, .fail_at = 99 };
+    const r = try parse(Nested, s4.allocator(), nested, &f);
+    try testing.expect(r.l[0][0]);
+}

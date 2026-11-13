@@ -14121,3 +14121,135 @@ test "typed tool: argsAs failure with validation off is a tool failure naming th
         \\
     );
 }
+
+/// Fails exactly the allocation number `fail_at` and serves every other one
+/// (`std.testing.FailingAllocator` keeps failing from its index on, so it
+/// cannot show what a handler does after the failure).
+const OneShotFail = struct {
+    inner: std.mem.Allocator,
+    fail_at: usize,
+    n: usize = 0,
+
+    fn allocator(self: *OneShotFail) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *OneShotFail = @ptrCast(@alignCast(ctx));
+        defer self.n += 1;
+        if (self.n == self.fail_at) return null;
+        return self.inner.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *OneShotFail = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(m, a, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *OneShotFail = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(m, a, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *OneShotFail = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(m, a, ra);
+    }
+};
+
+fn typedCall(arena: std.mem.Allocator, args: std.json.Value, out: *std.ArrayList(u8), server: *Server, transport: *std.Io.Writer) ToolCall {
+    return .{ .arena = arena, .args = args, .progress = null, .out = out, .server = server, .transport = transport };
+}
+
+test "ToolCall.argsAs: value on success, pointer text on refusal, OOM is not a tool failure" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "1" });
+    defer s.deinit();
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // success writes nothing
+    {
+        var out: std.ArrayList(u8) = .empty;
+        const args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"city\":\"Brno\",\"days\":3,\"units\":\"metric\"}", .{});
+        var call = typedCall(arena, args, &out, &s, &sink.writer);
+        const a = try call.argsAs(TypedArgs);
+        try testing.expectEqualStrings("Brno", a.city);
+        try testing.expectEqual(@as(u8, 3), a.days);
+        try testing.expect(a.units.? == .metric);
+        try testing.expectEqual(@as(usize, 0), out.items.len);
+    }
+    // a nested/pointer refusal and a root refusal (no ": " after an empty pointer)
+    {
+        var out: std.ArrayList(u8) = .empty;
+        const args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"city\":\"Brno\",\"days\":\"x\"}", .{});
+        var call = typedCall(arena, args, &out, &s, &sink.writer);
+        try testing.expectError(error.InvalidArguments, call.argsAs(TypedArgs));
+        try testing.expectEqualStrings("error: Invalid arguments: /days: must be an integer", out.items);
+    }
+    {
+        var out: std.ArrayList(u8) = .empty;
+        var call = typedCall(arena, .null, &out, &s, &sink.writer);
+        try testing.expectError(error.InvalidArguments, call.argsAs(TypedArgs));
+        try testing.expectEqualStrings("error: Invalid arguments: missing required property \"city\"", out.items);
+    }
+    {
+        var out: std.ArrayList(u8) = .empty;
+        var call = typedCall(arena, .{ .integer = 7 }, &out, &s, &sink.writer);
+        try testing.expectError(error.InvalidArguments, call.argsAs(TypedArgs));
+        try testing.expectEqualStrings("error: Invalid arguments: must be an object", out.items);
+    }
+    // OOM while decoding is OutOfMemory and writes no "invalid arguments" text
+    {
+        const L = struct { l: []const bool };
+        const args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"l\":[true]}", .{});
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        var call = typedCall(fa.allocator(), args, &out, &s, &sink.writer);
+        try testing.expectError(error.OutOfMemory, call.argsAs(L));
+        try testing.expectEqual(@as(usize, 0), out.items.len);
+    }
+    // the same when only that one allocation fails (later ones, such as the message's, would succeed)
+    {
+        const L = struct { l: []const bool };
+        const args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"l\":[true]}", .{});
+        var one: OneShotFail = .{ .inner = arena, .fail_at = 0 };
+        var out: std.ArrayList(u8) = .empty;
+        var call = typedCall(one.allocator(), args, &out, &s, &sink.writer);
+        try testing.expectError(error.OutOfMemory, call.argsAs(L));
+        try testing.expectEqual(@as(usize, 0), out.items.len);
+    }
+}
+
+test "ToolCall.writeJson: appends, omits null optionals, survives OOM" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "1" });
+    defer s.deinit();
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    var call = typedCall(arena, .null, &out, &s, &sink.writer);
+    call.write("pre:");
+    call.writeJson(TypedOut{ .city = "Brno", .days = 3 });
+    try testing.expectEqualStrings("pre:{\"city\":\"Brno\",\"days\":3}", out.items);
+    call.writeJson(TypedOut{ .city = "x", .days = 1, .note = "n" });
+    try testing.expectEqualStrings("pre:{\"city\":\"Brno\",\"days\":3}{\"city\":\"x\",\"days\":1,\"note\":\"n\"}", out.items);
+    // every allocation point: nothing is written or the whole text is, never a crash or a fragment
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        var inner = std.heap.ArenaAllocator.init(fa.allocator());
+        defer inner.deinit();
+        var o2: std.ArrayList(u8) = .empty;
+        var c2 = typedCall(inner.allocator(), .null, &o2, &s, &sink.writer);
+        c2.writeJson(TypedOut{ .city = "Brno", .days = 3 });
+        try testing.expect(o2.items.len == 0 or std.mem.eql(u8, o2.items, "{\"city\":\"Brno\",\"days\":3}"));
+    }
+    // a failing first allocation leaves the result empty (the text is dropped, not half-written)
+    var fa0 = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var o3: std.ArrayList(u8) = .empty;
+    var c3 = typedCall(fa0.allocator(), .null, &o3, &s, &sink.writer);
+    c3.writeJson(TypedOut{ .city = "Brno", .days = 3 });
+    try testing.expectEqual(@as(usize, 0), o3.items.len);
+}
