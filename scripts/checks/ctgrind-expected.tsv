@@ -492,8 +492,8 @@ p256	ReleaseFast	secpt	1	1	057d5b2c695da4a4	0202b342b562adc1
 # 2026-10-14: crt 2 -> 1: the doubled FaultDetected verdict context is gone
 # (privateOpCrtPtr restructured for CRT-domain blinding); the 1 left is the
 # F3 verdict, root.zig:985 (--stacks).
-rsa	ReleaseFast	crt	1	1	d77b796d93415876	d4057b00f9df7b56
-rsa	ReleaseFast	noncrt	1	0	d77b796d93415876	d4057b00f9df7b56
+rsa	ReleaseFast	crt	1	1	b69611048533c71f	d4057b00f9df7b56
+rsa	ReleaseFast	noncrt	1	0	b69611048533c71f	d4057b00f9df7b56
 # rsa crtbl / crtcache (2026-10-18) — the CRT op with base blinding: `.csprng`
 # (2 = the F3 verdict root.zig `MontParams.eql(&chk, &c)` + drawBlindingPair's
 # one redraw verdict `ok == 0`, a decision about the random r) and `.cached`
@@ -504,8 +504,8 @@ rsa	ReleaseFast	noncrt	1	0	d77b796d93415876	d4057b00f9df7b56
 # `if (self.serves(sk))` in `BlindingCache.next` (root.zig:1128) is now tainted
 # on the second op, where `n`/`e` already match. Stacks re-read: the other three
 # are the documented ones (root.zig:1200 draw, 1290 F3 twice).
-rsa	ReleaseFast	crtbl	1	2	d77b796d93415876	d4057b00f9df7b56
-rsa	ReleaseFast	crtcache	1	4	d77b796d93415876	d4057b00f9df7b56
+rsa	ReleaseFast	crtbl	1	2	b69611048533c71f	d4057b00f9df7b56
+rsa	ReleaseFast	crtcache	1	4	b69611048533c71f	d4057b00f9df7b56
 # rsa oaepnf (2026-11-13) — rsa.decryptOaepHNoFail end to end (CRT op + OAEP unpad)
 # on a real 32-byte-CEK ciphertext, p/q/dp/dq/qinv tainted. The 1 in-file context
 # is privateOpCrtPtr's F3 verdict (root.zig:1286, reached from :1996), the same
@@ -514,7 +514,7 @@ rsa	ReleaseFast	crtcache	1	4	d77b796d93415876	d4057b00f9df7b56
 # is returned as data (before 2026-11-13: `if (valid == 1)` + a copy from a
 # secret offset, 2 contexts at root.zig:2028-2029). The 21 witness contexts are
 # the harness's std.debug.print of ok/msg/raw.
-rsa	ReleaseFast	oaepnf	1	1	d77b796d93415876	7e7c9776c2e11410
+rsa	ReleaseFast	oaepnf	1	1	b69611048533c71f	7e7c9776c2e11410
 # rsa keygen (2026-10-03) — SecretKey.fromPrimes on the 2048-bit KAT, p and q
 # tainted. λ = montint.nt.lcm, d/dP/dQ = inverseOfModulus (even moduli), qInv by
 # Fermat on montint: 0 contexts in nt.zig and in the inversion/ladder code. Left,
@@ -526,7 +526,7 @@ rsa	ReleaseFast	oaepnf	1	1	d77b796d93415876	7e7c9776c2e11410
 # stripLeadingZeros on p, q (2, their length); fromLimbsBits/build of p_mont,
 # q_mont (length verdicts); the verdicts p == q, gcd(e, λ) = 1, d/dP/dQ ≠ 0 and
 # the qInv self-check.
-rsa	ReleaseFast	keygen	1	<=173	d77b796d93415876	2cb28867b78d48a6
+rsa	ReleaseFast	keygen	1	<=173	b69611048533c71f	2cb28867b78d48a6
 slhdsa	ReleaseFast	seed	1	4	960caaf9efdcbd42	e0fdde7f5c62a2d6
 # Zig 0.17.0 (2026-10-18): prf 8 -> 9, BENIGN (public by the scheme). The +1 is xmssPkFromSig's
 # auth-path direction test `(idx >> k) & 1` (engine.zig:432) at a fourth address (loop unrolled).
@@ -1634,9 +1634,9 @@ base32	ReleaseFast	decode	1	8	94eac68bddeb9560	4b6a48f852c57125
 # the t == 0 verdict 2; client 8 = hashToGroup rejectIdentity 2 + the blind
 # canonical-scalar verdict 3 + the blind == 0 verdict 3; keygen 3 = the
 # constant-time skS == 0 verdict per mode.
-voprf	ReleaseFast	server	1	5	4fd6d92d7f780cd2	985a5bcd0456a35f
-voprf	ReleaseFast	client	1	8	4fd6d92d7f780cd2	82e99d9133134c5f
-voprf	ReleaseFast	keygen	1	3	4fd6d92d7f780cd2	f2504d3c494735f2
+voprf	ReleaseFast	server	1	5	e1889b806fc20f54	985a5bcd0456a35f
+voprf	ReleaseFast	client	1	8	e1889b806fc20f54	82e99d9133134c5f
+voprf	ReleaseFast	keygen	1	3	e1889b806fc20f54	f2504d3c494735f2
 # voprf (2026-11-13): the protocol code moved from root.zig into protocol.zig/groups.zig/h2c.zig
 # (every RFC 9497 suite through one generic layer); PATTERN widened to those files. The three
 # ristretto255 rows above kept their counts (5/8/3, same contexts, same out digests).
@@ -1675,18 +1675,18 @@ voprf	ReleaseFast	keygen	1	3	4fd6d92d7f780cd2	f2504d3c494735f2
 #                 it (main 2026-11-13); h2c now uses the sibling's `Fe.cMov` for p256 and p521
 #                 (re-measured: every count unchanged) and keeps its own laundered byte select
 #                 for p384, whose `Fe.cMov` still builds its mask from the bare bit.
-voprf	ReleaseFast	decaf448-server	1	21	4fd6d92d7f780cd2	9543f02b1201b9cb
-voprf	ReleaseFast	decaf448-client	1	19	4fd6d92d7f780cd2	969cd54fa62ca9e8
-voprf	ReleaseFast	decaf448-keygen	1	6	4fd6d92d7f780cd2	d3f8144ee6d4be08
-voprf	ReleaseFast	p256-server	1	59	4fd6d92d7f780cd2	6afdfb7a486b2a85
-voprf	ReleaseFast	p256-client	1	27	4fd6d92d7f780cd2	5d8dfb2d4afe8974
-voprf	ReleaseFast	p256-keygen	1	12	4fd6d92d7f780cd2	d26dc23c71b4c631
-voprf	ReleaseFast	p384-server	1	30	4fd6d92d7f780cd2	5ed6c2e0c382fda2
-voprf	ReleaseFast	p384-client	1	15	4fd6d92d7f780cd2	ff25c1410ee44fb9
-voprf	ReleaseFast	p384-keygen	1	3	4fd6d92d7f780cd2	c65d6fb0102b9c90
-voprf	ReleaseFast	p521-server	1	26	4fd6d92d7f780cd2	5a0178ab968c5fe9
-voprf	ReleaseFast	p521-client	1	7	4fd6d92d7f780cd2	c519de5273b05353
-voprf	ReleaseFast	p521-keygen	1	3	4fd6d92d7f780cd2	517083316574f2e7
+voprf	ReleaseFast	decaf448-server	1	21	e1889b806fc20f54	9543f02b1201b9cb
+voprf	ReleaseFast	decaf448-client	1	19	e1889b806fc20f54	969cd54fa62ca9e8
+voprf	ReleaseFast	decaf448-keygen	1	6	e1889b806fc20f54	d3f8144ee6d4be08
+voprf	ReleaseFast	p256-server	1	59	e1889b806fc20f54	6afdfb7a486b2a85
+voprf	ReleaseFast	p256-client	1	27	e1889b806fc20f54	5d8dfb2d4afe8974
+voprf	ReleaseFast	p256-keygen	1	12	e1889b806fc20f54	d26dc23c71b4c631
+voprf	ReleaseFast	p384-server	1	30	e1889b806fc20f54	5ed6c2e0c382fda2
+voprf	ReleaseFast	p384-client	1	15	e1889b806fc20f54	ff25c1410ee44fb9
+voprf	ReleaseFast	p384-keygen	1	3	e1889b806fc20f54	c65d6fb0102b9c90
+voprf	ReleaseFast	p521-server	1	26	e1889b806fc20f54	5a0178ab968c5fe9
+voprf	ReleaseFast	p521-client	1	7	e1889b806fc20f54	c519de5273b05353
+voprf	ReleaseFast	p521-keygen	1	3	e1889b806fc20f54	517083316574f2e7
 # smtp (2026-10-10) — auth: the password through plainResponse/loginResponse
 # at three tail lengths. FIX: std.base64 indexed its alphabet by the secret
 # and checkCredential branched per byte: 312 -> 6. The 6 = the one
