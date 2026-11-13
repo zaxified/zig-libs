@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — Review fixes: reused timer slots start clean; `setWaker` quiesces
+  itself; `.inherit` enforces the entry cap and the 1 MiB bound exactly; docs for
+  clear-then-drain, mandatory `quiesce`, exec-time environ.
 - **2026-11-13** — Scope S4 -> S3: `Waker` (eventfd, self-pipe fallback) +
   `JobTable.setWaker`/`quiesce` wake the poll on job completion (libuv
   `uv_async_send`); `Timers` min-heap with an injected clock, bounded handle count,

@@ -94,7 +94,9 @@ var fds = [_]Loop.pollfd{
 };
 // ... poll ...
 if (fds[0].revents != 0) { waker.clear(); jobs.drain(&onDone); }
-// teardown: after the last job is DONE, jobs.quiesce(); then waker.deinit().
+// Order: clear() THEN drain() (drain-then-clear can lose a wake).
+// teardown: after the last job is DONE, jobs.quiesce() is MANDATORY, before
+// waker.deinit() and before destroying the table (setWaker calls it itself).
 
 // Timers (the clock is yours: Loop.nowMs() in production, an integer in tests):
 const h = try loop.timers.add(gpa, &onTimer, ctx);  // inactive; at most max_timers

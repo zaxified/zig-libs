@@ -221,10 +221,13 @@ pub fn JobTable(comptime N: usize, comptime Job: type) type {
 
         /// Attach (or detach, with null) the waker that `finish` signals. Refused
         /// with `error.Busy` while any slot is RUNNING/DONE, so no worker can read
-        /// the pointer mid-change. Loop-thread only. The waker must outlive every
-        /// job and be closed only after `quiesce()`.
+        /// the pointer mid-change; it also calls `quiesce()` itself, since a worker
+        /// past its DONE store may still hold the old waker. Loop-thread only. The
+        /// waker must outlive every job; `quiesce()` is MANDATORY before
+        /// `Waker.deinit` and before destroying the table.
         pub fn setWaker(self: *Self, w: ?*const Waker) error{Busy}!void {
             if (self.busy() != 0) return error.Busy;
+            self.quiesce();
             self.waker = w;
         }
 
@@ -451,6 +454,8 @@ pub const Waker = struct {
         return .{ .read_fd = fds[0], .write_fd = fds[1] };
     }
 
+    /// Close the fds. With a `JobTable` using this waker, call `table.quiesce()`
+    /// first (after the last job was DONE): a worker may still be inside `wake`.
     pub fn deinit(self: *Waker) void {
         _ = linux.close(self.read_fd);
         if (self.write_fd != self.read_fd) _ = linux.close(self.write_fd);
@@ -475,7 +480,8 @@ pub const Waker = struct {
     }
 
     /// Consume all pending wakes so `fd()` stops being readable until the next
-    /// `wake`. Loop-thread only. Bounded: at most pipe-capacity / 64 reads.
+    /// `wake`. Loop order must be `clear()` THEN
+    /// `drain()`: drain-then-clear can erase the wake of a job finishing in between. Loop-thread only. Bounded: at most pipe-capacity / 64 reads.
     pub fn clear(self: *const Waker) void {
         var buf: [64]u8 = undefined;
         while (true) {
@@ -557,10 +563,8 @@ pub const Timers = struct {
             const idx = self.free_head;
             const s = &self.slots.items[idx];
             self.free_head = s.next_free;
-            s.in_use = true;
-            s.cb = cb;
-            s.context = context;
-            s.next_free = none;
+            // A reused slot must not inherit the previous timer's schedule.
+            s.* = .{ .generation = s.generation, .in_use = true, .cb = cb, .context = context };
             return .{ .index = idx, .generation = s.generation };
         }
         if (self.slots.items.len >= self.max_timers) return error.TooManyTimers;
@@ -653,7 +657,9 @@ pub const Timers = struct {
     /// Fire every timer due at `now`, earliest first (ties in start order), and
     /// return how many fired. A timer started from inside a callback waits for the
     /// next `run` even if it is already due, so a callback that keeps re-arming
-    /// itself with 0 ms cannot hold the loop.
+    /// itself with 0 ms cannot hold the loop. (The check looks at the heap top only:
+    /// an older timer sorted behind such a new one fires one `run` later;
+    /// `pollTimeout` reports 0 so the next poll does not block.)
     pub fn run(self: *Timers, now: u64) usize {
         const horizon = self.next_seq;
         var fired: usize = 0;
@@ -748,7 +754,8 @@ pub const Env = union(enum) {
     /// No variables at all (the `spawnDetached` default). Such a child needs absolute exec paths.
     empty,
     /// A snapshot of the parent's environment, read libc-free from
-    /// `/proc/self/environ` when the job is submitted.
+    /// `/proc/self/environ` when the job is submitted. That file is the
+    /// environment at exec time: a later `setenv`/`putenv` is NOT reflected.
     inherit,
     /// Exactly these `NAME=value` strings (each with a non-empty name, no NUL).
     list: []const []const u8,
@@ -800,6 +807,7 @@ const OwnedEnv = struct {
         }
         errdefer gpa.free(buf);
         const count = splitEnviron(buf, null);
+        if (count > env_max_entries) return error.EnvTooLarge;
         const vec = try gpa.alloc(?[*:0]const u8, count + 1);
         _ = splitEnviron(buf, vec);
         vec[count] = null;
@@ -846,10 +854,13 @@ fn readEnviron(gpa: std.mem.Allocator) EnvError![]u8 {
             return error.EnvUnavailable;
         }
         if (rc == 0) break;
-        if (list.items.len + rc + 1 > env_max_bytes) return error.EnvTooLarge;
+        if (list.items.len + rc > env_max_bytes) return error.EnvTooLarge;
         try list.appendSlice(gpa, chunk[0..rc]);
     }
-    if (list.items.len == 0 or list.items[list.items.len - 1] != 0) try list.append(gpa, 0);
+    if (list.items.len == 0 or list.items[list.items.len - 1] != 0) {
+        if (list.items.len + 1 > env_max_bytes) return error.EnvTooLarge;
+        try list.append(gpa, 0);
+    }
     return list.toOwnedSlice(gpa);
 }
 
@@ -1812,4 +1823,40 @@ test "spawnDetachedEnv: an allocation failure at every step leaks nothing (.list
             break;
         }
     }
+}
+
+test "Timers.add: a reused slot starts clean (no stale repeat/due/seq)" {
+    const gpa = std.testing.allocator;
+    var t: Timers = .{};
+    defer t.deinit(gpa);
+    const a = try t.add(gpa, TimerLog.rec, null);
+    try t.start(a, 0, 10, 25);
+    try t.close(a);
+    const b = try t.add(gpa, TimerLog.rec, null);
+    try std.testing.expectEqual(a.index, b.index);
+    try std.testing.expectEqual(@as(u64, 0), try t.getRepeat(b));
+    try t.again(b, 100); // repeat 0: must only stop
+    try std.testing.expect(!(try t.isActive(b)));
+    try std.testing.expectEqual(@as(usize, 0), t.activeCount());
+}
+
+test "JobTable.setWaker waits out a worker still inside finish" {
+    const Job = struct { v: u32 = 0 };
+    var table: JobTable(1, Job) = .{};
+    var w = try Waker.init();
+    defer w.deinit();
+    try table.setWaker(&w);
+    // Simulate a worker past its DONE store but not yet done with the waker.
+    _ = table.finishing.fetchAdd(1, .acq_rel);
+    const T = struct {
+        fn run(tb: *JobTable(1, Job)) void {
+            const ts: linux.timespec = .{ .sec = 0, .nsec = 5_000_000 };
+            _ = linux.nanosleep(&ts, null);
+            _ = tb.finishing.fetchSub(1, .release);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, T.run, .{&table});
+    try table.setWaker(null); // must block until the fake worker leaves
+    try std.testing.expectEqual(@as(u32, 0), table.finishing.load(.acquire));
+    th.join();
 }
