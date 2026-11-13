@@ -492,3 +492,103 @@ test "Config.validate: versions and 1.2 suites" {
     try c13.validate();
     try testing.expectError(error.InvalidVersions, Connection12.clientInit(c13));
 }
+
+/// Re-frames `flight` so the handshake message of type `split_type` travels
+/// as two fragments in two datagrams (RFC 6347 §4.2.3), as a peer with a
+/// small MTU sends a certificate chain.
+fn splitFlight(flight: []const u8, split_type: u8, d1: []u8, d2: []u8) !struct { []const u8, []const u8 } {
+    var n1: usize = 0;
+    var n2: usize = 0;
+    var second = false;
+    var pos: usize = 0;
+    while (pos < flight.len) {
+        const hdr = try record.decodePlaintext(flight[pos..]);
+        const rec = flight[pos..][0 .. record.plaintext_header_len + hdr.length];
+        pos += rec.len;
+        const frag = rec[record.plaintext_header_len..];
+        if (hdr.content_type == 22 and hdr.epoch == 0 and frag[0] == split_type) {
+            const hh = try handshake.decodeHeader(frag);
+            const body = frag[handshake.header_len..];
+            const half = body.len / 2;
+            inline for (.{ 0, 1 }) |k| {
+                const off: usize = if (k == 0) 0 else half;
+                const part = if (k == 0) body[0..half] else body[half..];
+                const dst = if (k == 0) d1[n1..] else d2[n2..];
+                _ = try record.encodePlaintext(.{ .content_type = 22, .epoch = 0, .sequence_number = hdr.sequence_number + k, .length = @intCast(handshake.header_len + part.len) }, dst);
+                var h: [handshake.header_len]u8 = undefined;
+                handshake.encodeHeader(.{ .msg_type = hh.msg_type, .length = hh.length, .message_seq = hh.message_seq, .fragment_offset = @intCast(off), .fragment_length = @intCast(part.len) }, &h);
+                @memcpy(dst[13..25], &h);
+                @memcpy(dst[25..][0..part.len], part);
+                if (k == 0) n1 += 25 + part.len else n2 += 25 + part.len;
+            }
+            second = true;
+            continue;
+        }
+        if (second) {
+            // Every later record moves up by one: the second fragment took
+            // the next record number (epoch-0 records are unauthenticated,
+            // so renumbering them is what a fragmenting sender does anyway).
+            @memcpy(d2[n2..][0..rec.len], rec);
+            var renum = hdr;
+            renum.sequence_number += 1;
+            _ = try record.encodePlaintext(renum, d2[n2..]);
+            n2 += rec.len;
+        } else {
+            @memcpy(d1[n1..][0..rec.len], rec);
+            n1 += rec.len;
+        }
+    }
+    return .{ d1[0..n1], d2[0..n2] };
+}
+
+test "dtls12: a Certificate fragmented across two datagrams is reassembled (RFC 6347 §4.2.3)" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(13)));
+    const rnd = seeded(&csprng);
+    var client = try Connection12.clientInit(ecdsaClientConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    var server = try Connection12.serverInit(ecdsaServerConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    var bufs: Bufs = .{};
+    const ch = try client.startHandshake(rnd, 0, &bufs.a);
+    const f4 = try server.handleFlight(ch, rnd, 0, &bufs.b);
+    var d1: [4096]u8 = undefined;
+    var d2: [4096]u8 = undefined;
+    const parts = try splitFlight(f4.out, m12.HandshakeType.certificate, &d1, &d2);
+    // The fragmenting sender used one more epoch-0 record number.
+    server.send_seq[0] += 1;
+    const r1 = try client.handleFlight(parts[0], rnd, 0, &bufs.a);
+    try testing.expect(r1.need_more_data);
+    try testing.expectEqual(c12.State.wait_server_hello_done, client.state);
+    // The SAME first datagram again (a duplicate) changes nothing.
+    _ = try client.handleFlight(parts[0], rnd, 0, &bufs.a);
+    const f5 = try client.handleFlight(parts[1], rnd, 0, &bufs.a);
+    try testing.expectEqual(c12.State.wait_server_finished, client.state);
+    const f6 = try server.handleFlight(f5.out, rnd, 0, &bufs.b);
+    try testing.expect(f6.done);
+    try testing.expect((try client.handleFlight(f6.out, rnd, 0, &bufs.a)).done);
+    try exchangeData(&client, &server);
+}
+
+test "dtls12: a peer alert is error.ReceivedAlert, during and after the handshake" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(14)));
+    const rnd = seeded(&csprng);
+    var client = try Connection12.clientInit(pskConfig(.client, &.{.psk_with_aes_128_gcm_sha256}));
+    var server = try Connection12.serverInit(pskConfig(.server, &.{.psk_with_aes_128_gcm_sha256}));
+    var bufs: Bufs = .{};
+    const ch = try client.startHandshake(rnd, 0, &bufs.a);
+    // A plaintext fatal handshake_failure(40) in epoch 0.
+    var alert: [15]u8 = undefined;
+    _ = try record.encodePlaintext(.{ .content_type = 21, .epoch = 0, .sequence_number = 0, .length = 2 }, &alert);
+    alert[13] = 2;
+    alert[14] = 40;
+    try testing.expectError(error.ReceivedAlert, client.handleFlight(&alert, rnd, 0, &bufs.b));
+    try testing.expectEqual(c12.State.wait_server_hello, client.state); // rolled back
+    const f4 = try server.handleFlight(ch, rnd, 0, &bufs.b);
+    const f5 = try client.handleFlight(f4.out, rnd, 0, &bufs.a);
+    const f6 = try server.handleFlight(f5.out, rnd, 0, &bufs.b);
+    try testing.expect((try client.handleFlight(f6.out, rnd, 0, &bufs.a)).done);
+    // After the handshake, an encrypted close_notify(0).
+    var rec_buf: [64]u8 = undefined;
+    const close = try @import("record12.zig").seal(&server.write_keys, 1, server.send_seq[1], 21, &.{ 1, 0 }, &rec_buf);
+    var out: [64]u8 = undefined;
+    try testing.expectError(error.ReceivedAlert, client.recv(close, &out));
+    try testing.expectEqual([2]u8{ 1, 0 }, client.peer_alert.?);
+}
