@@ -10,13 +10,15 @@
 //! ## What this measures
 //!
 //!  * `hs` — a full in-memory PSK handshake (`Connection` client and server,
-//!    AES-128-GCM, the module's own loopback flow) with the pre-shared key
+//!    AES-128-GCM-SHA256, then AES-256-GCM-SHA384 with a SHA-384 PSK, the
+//!    module's own loopback flow) with the pre-shared key
 //!    tainted on both sides: PSK binder (compute + verify), the whole key
 //!    schedule, the handshake record protection, both Finished MACs and
 //!    their verification, and `installApplicationKeys`. Randoms are public.
 //!  * `app` — after an UNTAINTED handshake, both directions' record keys
 //!    (AEAD key, static IV, sequence-number mask key) tainted, then
-//!    `send`/`recv` both ways under AES-128-GCM and ChaCha20-Poly1305: record
+//!    `send`/`recv` both ways under AES-128-GCM, ChaCha20-Poly1305 and
+//!    AES-256-GCM (2026-11-13): record
 //!    protection, sequence-number masking, and the receiver's DTLSInnerPlaintext
 //!    handling of the decrypted (secret) content.
 //!
@@ -24,8 +26,8 @@
 //!    application traffic secrets and exporter master secret tainted, then a
 //!    KeyUpdate in each direction (RFC 9147 §8: the `update_requested`
 //!    exchange, ACKs, `"traffic upd"` derivation, the new record keys used
-//!    both ways) and an RFC 8446 §7.5 export, under AES-128-GCM and
-//!    ChaCha20-Poly1305.
+//!    both ways) and an RFC 8446 §7.5 export, under AES-128-GCM,
+//!    ChaCha20-Poly1305 and AES-256-GCM-SHA384 (48-byte secrets).
 //!
 //! The in-file pattern is this module's own files.
 //!
@@ -51,8 +53,9 @@ fn secretBytes(comptime n: usize, label: []const u8) [n]u8 {
 
 fn handshake(suite: dtls.CipherSuite, psk: []const u8, client: *Connection, server: *Connection) !void {
     const id = "device-042";
-    client.* = try Connection.clientInit(.{ .role = .client, .psk_identity = id, .psk = psk, .cipher_suites = &.{suite} });
-    server.* = try Connection.serverInit(.{ .role = .server, .psk_identity = id, .psk = psk, .cipher_suites = &.{suite} });
+    const suites = [_]dtls.CipherSuite{suite};
+    client.* = try Connection.clientInit(.{ .role = .client, .psk_identity = id, .psk = psk, .psk_hash = suite.hash(), .cipher_suites = &suites });
+    server.* = try Connection.serverInit(.{ .role = .server, .psk_identity = id, .psk = psk, .psk_hash = suite.hash(), .cipher_suites = &suites });
     var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x10)));
     const rnd: dtls.Entropy = .{ .seeded_for_test = csprng.random() };
     var buf1: [1500]u8 = undefined;
@@ -123,14 +126,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var server: Connection = undefined;
     switch (target) {
         .hs => {
-            var psk = secretBytes(32, "ctgrind-dtls-psk-v1");
-            if (taint == .yes) std.valgrind.memcheck.makeMemUndefined(&psk);
-            try handshake(.aes_128_gcm_sha256, &psk, &client, &server);
-            std.debug.print("ctgrind_result={x}\n", .{client.write_keys.key[0..16].*});
+            for ([_]dtls.CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384 }) |suite| {
+                var psk = secretBytes(32, "ctgrind-dtls-psk-v1");
+                if (taint == .yes) std.valgrind.memcheck.makeMemUndefined(&psk);
+                try handshake(suite, &psk, &client, &server);
+                std.debug.print("ctgrind_result={x}\n", .{client.write_keys.key[0..client.write_keys.key_len]});
+            }
         },
         .app => {
             const psk = secretBytes(32, "ctgrind-dtls-psk-v1");
-            for ([_]dtls.CipherSuite{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256 }) |suite| {
+            for ([_]dtls.CipherSuite{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256, .aes_256_gcm_sha384 }) |suite| {
                 try handshake(suite, &psk, &client, &server);
                 if (taint == .yes) {
                     taintKeys(&client);
@@ -141,7 +146,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         },
         .ku => {
             const psk = secretBytes(32, "ctgrind-dtls-psk-v1");
-            for ([_]dtls.CipherSuite{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256 }) |suite| {
+            for ([_]dtls.CipherSuite{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256, .aes_256_gcm_sha384 }) |suite| {
                 try handshake(suite, &psk, &client, &server);
                 var plain: [64]u8 = undefined;
                 // The server's final-flight ACK, so the KeyUpdate ACKs are

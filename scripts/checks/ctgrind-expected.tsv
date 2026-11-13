@@ -1443,9 +1443,21 @@ tlsclient	ReleaseFast	cv	1	30	aac4ebb6ece329f8	a92e71f50313cf2b
 # public to the peer that sent it; app 14 = 4 AEAD verdicts + seq-number
 # reconstruction + padding scan + content-type dispatch per record.
 # 2026-11-01 (re-pin; --stacks diff against 1eb591f0, contexts matched by kind / top frame / module chain): hs 119 -> 120 = +1 tls13 transcript.zig `writeHeader`'s `len > 0xFFFFFF` guard (121caa2b no-panic sweep) on the length of the handshake message appended in handleFlightClient -- a public wire length, class (b) of the above. app unchanged (line numbers moved only).
-dtls	ReleaseFast	hs	1	123	a74fca2e74aefb8f	ca9a2595f120b466
+# 2026-11-13 (TLS_AES_256_GCM_SHA384; local --stacks runs of 7d8dcc749 and of the change, contexts matched by kind / module chain):
+# the harness now also runs AES-256-GCM-SHA384 (hs: a second handshake with a SHA-384 PSK; app/ku: a third suite in the loop).
+# hs 123 -> 174 = +51, all class (a)/(b): the transcript hash over the DECRYPTED handshake messages now runs through
+# suitehash.Transcript (32 old contexts under handleFlightClient -> 59 under suitehash append/currentHash/writeHeader: the
+# SHA-256 instance plus the SHA-384 one of the second handshake, std sha2 Sha2x64 update/final), +17 std memcpy/memset
+# inside SHA-384's 128-byte block buffering of those messages, +1 the client-Finished MAC verdict now attributed to
+# suitehash.macEql (timing_safe.eql result, as before). app 23 -> 13 and ku 22 -> 21: the same record-path sites
+# (sequence-number reconstruction, padding scan, content-type dispatch, replay window, AEAD tag verdicts, processAck)
+# counted once instead of twice -- LLVM unrolled the old two-suite loop in the harness, so each site had one context per
+# copy; the three-suite loop is not unrolled. AES-256-GCM adds one tag-verdict context (its own AesGcm instantiation) in
+# app; in ku the three aesgcm verdict contexts become two. No new kind of site; no branch on a key or secret.
+# suitehash[.]zig added to the dtls patterns (source pin).
+dtls	ReleaseFast	hs	1	174	f995e94fb958f400	61a204df8edf79a0
 # 2026-11-03 (re-pin from full CI 41622100028, counts only, not read by --stacks): dtls app 14 -> 13, down by one after chachapoly's short AEAD engine (no dtls source changed). Owner rule: no local ctgrind re-run.
-dtls	ReleaseFast	app	1	23	a74fca2e74aefb8f	ac0eb91f2511d729
+dtls	ReleaseFast	app	1	13	f995e94fb958f400	70da17057fd7a044
 # 2026-11-13 (KeyUpdate / exporter / ALPN; local --stacks run, contexts read one by one): hs 120 -> 123 = +3 messages.zig
 # decodeExtensions on the DECRYPTED EncryptedExtensions (the client now parses it for the ALPN answer), class (b). app 13 -> 23:
 # per record the replay window (replayCheckAndUpdate, now reached through per-epoch pointers, so inlined once per record: 12)
@@ -1454,7 +1466,7 @@ dtls	ReleaseFast	app	1	23	a74fca2e74aefb8f	ac0eb91f2511d729
 # exporter master secret tainted, a KeyUpdate each way (update_requested), the ACKs, records both ways on epoch 4, an
 # RFC 8446 §7.5 export, under AES-128-GCM and ChaCha20-Poly1305: 22 = the same class-(b) record sites as app plus
 # processAck's parsing of the decrypted ACK body (2) and its replay window (2). No branch on a key or secret.
-dtls	ReleaseFast	ku	1	22	a74fca2e74aefb8f	8db3bb36ab50305d
+dtls	ReleaseFast	ku	1	21	f995e94fb958f400	505aa3fdd426f98d
 # tlsserver (2026-10-21) — hs: Server.feed on the plaintext ClientHello
 # records of five recorded sessions (P-256/X25519, P-256/X25519MLKEM768, P-384,
 # Ed25519, a HelloRetryRequest) up to the first flight, every octet of
