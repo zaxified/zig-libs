@@ -40,7 +40,8 @@ modules/mlkem/src/kem.zig	1
 modules/mls/src/keyschedule.zig	2
 # mqtt 2026-10-17: acl.zig Passwords.verify compares the derived PBKDF2 hash with timing_safe.eql; the 15 plain compares are rule keywords, topics and usernames (public).
 modules/mqtt/src/acl.zig	1
-modules/opaque/src/root.zig	3
+# opaque 2026-11-13: the protocol moved from root.zig into protocol.zig (comptime suite generic); same compares, same count.
+modules/opaque/src/protocol.zig	3
 modules/opcua/src/security.zig	1
 modules/opcua/src/server.zig	1
 modules/otp/src/root.zig	3
@@ -74,7 +75,8 @@ modules/tlsresume/src/psk.zig	1
 modules/tlsserver/src/keys.zig	1
 # tlsserver 2026-10-20: the client's Finished verify_data is compared with timing_safe.eql; the 4 plain compares are ALPN names, the SNI of a retried ClientHello, and two in tests (an SNI, the HelloRetryRequest random) -- all public.
 modules/tlsserver/src/server.zig	1
-modules/voprf/src/root.zig	5
+# voprf 2026-11-13: the protocol moved from root.zig into protocol.zig (comptime suite generic); same compares, same count.
+modules/voprf/src/protocol.zig	5
 modules/webhooksig/src/root.zig	2
 # wireguard conf.zig 2026-11-03: 4 constant-time = key against zero in formatConfig (private, pre-shared), key against the device's in sync and samePeer. 7 plain = allowed-ip bytes in samePeer (public) and tests or the fuzz harness over fixture keys.
 modules/wireguard/src/conf.zig	4
