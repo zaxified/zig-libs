@@ -38,4 +38,18 @@ pub fn expectReportedCut(comptime T: type, comptime readFrom: anytype, text: []c
     defer testing.allocator.free(cut.entries);
     try testing.expect(cut.truncated);
     try testing.expectEqual(whole.entries.len - 1, cut.entries.len);
+
+    // A limit equal to the file size: every row arrives, the flag is conservative.
+    const exact: procnet.Reported(T) = try readFrom(testing.allocator, io, path, text.len);
+    defer testing.allocator.free(exact.entries);
+    try testing.expect(exact.truncated);
+    try testing.expectEqual(whole.entries.len, exact.entries.len);
+
+    // A missing table is empty and not "truncated".
+    var gone_buf: [128]u8 = undefined;
+    const gone = try std.mem.print(&gone_buf, ".zig-cache/tmp/{s}/no-such-table", .{&tmp.sub_path});
+    const none: procnet.Reported(T) = try readFrom(testing.allocator, io, gone, 4096);
+    defer testing.allocator.free(none.entries);
+    try testing.expect(!none.truncated);
+    try testing.expectEqual(@as(usize, 0), none.entries.len);
 }
