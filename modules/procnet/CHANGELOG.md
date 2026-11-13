@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit recorded from the delta mutation run since the 2026-10-18 audit (128 mutants: 111 killed, 17 equivalent).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit since `bbe3a85c5` (128 mutants over the `readVirtualLines*` family, the `*Reporting` readers, `parseHex128`/`parseIpv6Routes`, `findAll`/`find`, `indexSocketOwners`, `parseLimits`): tests only, found no defect. Finding: a file of exactly `limit` bytes is flagged `truncated` (complete bytes, conservative flag). New tests in `sweep_test.zig`/`reported_test.zig`: live sockets/owners/readUnix, fd and owner caps, EMFILE, a >512 KiB `/proc/net/udp`, ipv6 column validation, `parseLimits` accounting.
 - **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE:** Docs: delta review of the source changes since the recorded audit, findings in the SPEC Backlog.
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GO sweep: 13/15 killed; survivors are `skipped_rows +|=` (needs 4 GiB, equivalent), the `max_total_fds` off-by-one (/proc content not under test control) and the `cpus_allowed` default (undefined bytes are deterministic here; only valgrind/MSan see it). New test: inode 0 never matches; the max_total_fds test also checks the walk stops early.
