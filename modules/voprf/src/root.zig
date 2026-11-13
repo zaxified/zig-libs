@@ -190,13 +190,15 @@ pub const contextString = Default.contextString;
 /// `len_in_bytes <= 64` (`ell = 1`). `msg` may be passed as multiple parts.
 /// Validated standalone against RFC 9380 Appendix K.3 (`kat_test.zig`).
 /// The general expander (any SHA-2 hash, any `ell`) is `h2c.expandMessageXmd`.
+/// Caller contract: `dst` is 1..255 bytes (RFC 9380 §5.3.1 step 1); anything
+/// else is a checked `@panic("voprf: ...")`, never undefined behaviour.
 pub fn expandMessageXmd(
     comptime len_in_bytes: usize,
     msg_parts: []const []const u8,
     dst: []const u8,
 ) [len_in_bytes]u8 {
     comptime std.debug.assert(len_in_bytes > 0 and len_in_bytes <= 64); // ell == 1
-    std.debug.assert(dst.len > 0 and dst.len <= 255);
+    if (dst.len == 0 or dst.len > 255) @panic("voprf: expandMessageXmd: DST must be 1..255 bytes");
     const block_size = 128; // SHA-512 input block size (s_in_bytes)
     const z_pad = @as([block_size]u8, @splat(0));
     var l_i_b_str: [2]u8 = undefined;
@@ -235,6 +237,7 @@ pub const scalarFromWideBytes = Default.scalarFromWideBytes;
 pub const Proof = Default.Proof;
 pub const KeyPair = Default.KeyPair;
 pub const max_input_length = protocol.max_input_length;
+pub const max_batch_length = protocol.max_batch_length;
 pub const InputTooLongError = protocol.InputTooLongError;
 pub const DeriveKeyPairError = protocol.DeriveKeyPairError;
 pub const deriveKeyPair = Default.deriveKeyPair;
@@ -286,6 +289,7 @@ test {
     _ = @import("stackprobe_test.zig");
     _ = @import("h2c_test.zig");
     _ = @import("suite_kat_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 test "wire sizes match RFC 9497 §4.1" {

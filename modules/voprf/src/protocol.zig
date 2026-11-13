@@ -27,6 +27,10 @@ pub const DeserializeScalarError = error{InvalidScalar};
 /// framed with a two-byte length); a longer slice is `error.InputTooLong`.
 pub const max_input_length = 0xffff;
 pub const InputTooLongError = error{InputTooLong};
+/// RFC 9497 §2.2.1 indexes a batch's composites with a two-byte counter, so a
+/// proof covers at most `2^16 - 1` elements; a longer batch is
+/// `error.ProofGenerationFailed` (server) / `error.InvalidProof` (client).
+pub const max_batch_length = 0xffff;
 
 fn checkLen(n: usize) InputTooLongError!void {
     if (n > max_input_length) return error.InputTooLong;
@@ -233,7 +237,8 @@ pub fn Protocol(comptime G: type) type {
             c_list: []const Element,
             d_list: []const Element,
         ) CompositesError!Composites {
-            std.debug.assert(c_list.len >= 1 and c_list.len == d_list.len);
+            std.debug.assert(c_list.len >= 1 and c_list.len == d_list.len); // every caller checked
+            if (c_list.len > max_batch_length) return error.DegenerateComposite; // `i` below must fit a u16
             const seed = compositesSeed(mode, b);
             var m_acc: G.Point = undefined;
             for (c_list, d_list, 0..) |c_i, d_i, i| {
@@ -253,7 +258,8 @@ pub fn Protocol(comptime G: type) type {
             c_list: []const Element,
             d_list: []const Element,
         ) CompositesError!Composites {
-            std.debug.assert(c_list.len >= 1 and c_list.len == d_list.len);
+            std.debug.assert(c_list.len >= 1 and c_list.len == d_list.len); // every caller checked
+            if (c_list.len > max_batch_length) return error.DegenerateComposite; // `i` below must fit a u16
             const seed = compositesSeed(mode, b);
             var m_acc: G.Point = undefined;
             var z_acc: G.Point = undefined;
@@ -488,6 +494,7 @@ pub fn Protocol(comptime G: type) type {
         ) BlindEvaluateVerifiableError!Proof {
             if (blinded.len == 0) return error.EmptyBatch;
             if (evaluated_out.len != blinded.len) return error.MismatchedLengths;
+            if (blinded.len > max_batch_length) return error.ProofGenerationFailed;
             for (blinded, evaluated_out) |blinded_element, *out| {
                 out.* = blindEvaluateBody(sk, blinded_element);
             }
@@ -627,6 +634,7 @@ pub fn Protocol(comptime G: type) type {
         ) PoprfEvaluateError!Proof {
             if (blinded.len == 0) return error.EmptyBatch;
             if (evaluated_out.len != blinded.len) return error.MismatchedLengths;
+            if (blinded.len > max_batch_length) return error.ProofGenerationFailed;
             const m = infoScalar(info);
             const t = G.sAdd(sk.*, m);
             if (std.crypto.timing_safe.eql([Ns]u8, t, @as([Ns]u8, @splat(0)))) return error.InverseError;
