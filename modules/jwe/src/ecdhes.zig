@@ -254,6 +254,10 @@ noinline fn deriveZUnburned(private: *const PrivateKey, peer: PublicKey, out: *[
 /// keydatalen (bytes); for SHA-256 and keydatalen <= 256 bits a single
 /// round runs, but the counter loop is general (A256CBC-HS512 direct needs
 /// two rounds). Byte-exact against RFC 7518 Appendix C (test below).
+///
+/// An empty `derived` derives nothing. A `derived` of 2^29 bytes or more, or an
+/// `alg_id`/`apu`/`apv` of 2^32 bytes or more, cannot be
+/// expressed in the KDF's 32-bit fields: a checked `@panic("jwe: …")`.
 pub fn concatKdfSha256(
     z: []const u8,
     alg_id: []const u8,
@@ -272,7 +276,10 @@ noinline fn concatKdfSha256Unburned(
     apv: []const u8,
     derived: []u8,
 ) void {
-    std.debug.assert(derived.len > 0);
+    // Caller-contract checks (sweep JWE-2): an empty `derived` derives nothing,
+    // and the lengths below are 32-bit fields of the KDF's input.
+    if (derived.len == 0) return;
+    if (derived.len > std.math.maxInt(u32) / 8) @panic("jwe: concat KDF output longer than 2^29 - 1 bytes");
     const keydata_bits: u32 = @intCast(derived.len * 8);
     var counter: u32 = 1;
     var off: usize = 0;
@@ -298,6 +305,7 @@ noinline fn concatKdfSha256Unburned(
 }
 
 fn hashLenData(h: *Sha256, data: []const u8) void {
+    if (data.len > std.math.maxInt(u32)) @panic("jwe: concat KDF input longer than 2^32 - 1 bytes");
     var be: [4]u8 = undefined;
     std.mem.writeInt(u32, &be, @intCast(data.len), .big);
     h.update(&be);

@@ -229,6 +229,16 @@ pub const EncodeError = error{BufferTooSmall};
 /// listed on `EncodeParams` — stable but not meaningful (JOSE consumers must
 /// not depend on member order).
 pub fn encode(buf: []u8, params: EncodeParams) EncodeError![]const u8 {
+    // Every byte-carrying member is base64url-encoded into a fixed scratch
+    // sized for `max_member_len` raw bytes; a longer one would run off its end.
+    // `BufferTooSmall`, like any header that does not fit (sweep JWE-1).
+    inline for (.{ params.iv, params.tag, params.p2s, params.apu, params.apv }) |m| {
+        if (m) |v| if (v.len > max_member_len) return error.BufferTooSmall;
+    }
+    if (params.epk) |e| {
+        if (e.x.len > max_member_len) return error.BufferTooSmall;
+        if (e.y) |y| if (y.len > max_member_len) return error.BufferTooSmall;
+    }
     var fw = std.Io.Writer.fixed(buf);
     var js: std.json.Stringify = .{ .writer = &fw, .options = .{} };
     writeAll(&js, params) catch |err| switch (err) {

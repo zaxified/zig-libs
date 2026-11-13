@@ -896,6 +896,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 test "dir + A128GCM real round-trip" {

@@ -115,6 +115,9 @@ noinline fn decryptUnburned(
 /// `A128GCM`/`A192GCM`/`A256GCM` (RFC 7518 §5.3) — the `aesgcm` module's
 /// `Aes128Gcm`/`Aes192Gcm`/`Aes256Gcm` (std has no AES-192 and is slow on 0.17).
 const gcm = struct {
+    /// NIST SP 800-38D: a GCM message is at most 2^36 - 32 bytes.
+    const max_gcm_message_len: usize = (1 << 36) - 32;
+
     // secret-api-ok: `gcm` is private to this file and reached only through `encrypt` / `decrypt` above, which run it under `burn.content_burn`
     pub fn encrypt(
         enc: Enc,
@@ -125,6 +128,9 @@ const gcm = struct {
         ciphertext_out: []u8,
         tag_out: []u8,
     ) Error!usize {
+        // `aesgcm.encrypt` panics beyond 2^36 - 32 bytes (the GCM counter
+        // limit); no output buffer can take such a message (sweep JWE-3).
+        if (plaintext.len > max_gcm_message_len) return error.BufferTooSmall;
         if (ciphertext_out.len < plaintext.len or tag_out.len < 16 or iv.len != 12) return error.BufferTooSmall;
         const ct = ciphertext_out[0..plaintext.len];
         const tag = tag_out[0..16];
