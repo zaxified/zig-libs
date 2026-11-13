@@ -962,8 +962,11 @@ spake2plus	ReleaseFast	computel	1	2	5fad515ff1d5c2b6	37d06a2f53487905
 spake2plus	ReleaseFast	proverstart	1	5	5fad515ff1d5c2b6	5b3e4131495365d6
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 spake2plus	ReleaseFast	verifierstart	1	5	5fad515ff1d5c2b6	ce61814fc8e1b2b7
-spake2plus	ReleaseFast	proverfinish	1	9	5fad515ff1d5c2b6	5cdf0fe20429a208
-spake2plus	ReleaseFast	verifierfinish	1	7	5fad515ff1d5c2b6	dbdff43379a90cf5
+# 2026-11-13 (G4 wave): proverfinish 9 -> 7, verifierfinish 7 -> 6 after p256 `isBasePointRepr`
+# became branch-free (its short-circuit `and` on the multiplied point's coordinates; the verdict is
+# declassified once in p256 `mulUnburned`). No spake2plus source changed; counts only went down.
+spake2plus	ReleaseFast	proverfinish	1	7	5fad515ff1d5c2b6	5cdf0fe20429a208
+spake2plus	ReleaseFast	verifierfinish	1	6	5fad515ff1d5c2b6	dbdff43379a90cf5
 # bbs proofgen 9 -> 15 (re-pin 2026-10-06, draft-04 -> draft-12): the proof gained
 # two public points (D, T2) -- serialized into the challenge (bbs.zig:387, 5 points
 # now), made affine (:632-634, :640) and encoded (:153 via :653) -- plus the
@@ -2101,10 +2104,10 @@ jwe	ReleaseFast	rsa	1	20	198f278acedab8ab	043474d84426957a
 #   branch (ed25519.zig:115 x2 are its keygen twins) + 1 root.zig:494, the
 #   constant-time compare of the embedded public half against the derived one
 #   (true for every valid key, a verdict by design).
-webhooksig	ReleaseFast	verify	1	0	b6e6b8df5a7828b0	b517d0804f4a93d2
-webhooksig	ReleaseFast	sign	1	77	b6e6b8df5a7828b0	854ae236c5fea038
-webhooksig	ReleaseFast	keys	1	1	b6e6b8df5a7828b0	4fb3c2a0bf839a0e
-webhooksig	ReleaseFast	ed25519	1	30	b6e6b8df5a7828b0	0ddab6b90956b2fe
+webhooksig	ReleaseFast	verify	1	0	691f63387d17ed1d	b517d0804f4a93d2
+webhooksig	ReleaseFast	sign	1	77	691f63387d17ed1d	854ae236c5fea038
+webhooksig	ReleaseFast	keys	1	1	691f63387d17ed1d	4fb3c2a0bf839a0e
+webhooksig	ReleaseFast	ed25519	1	30	691f63387d17ed1d	0ddab6b90956b2fe
 # xmlenc, 2026-11-13 (sweep hB): the RSA private key (OAEP, v1.5), the KEK (kw-aes) and
 # through them the CEK, driven through `decryptData` on a real EncryptedData. NO context is
 # xmlenc's own except the CBC plaintext length. Every non-zero is attributed below (the
@@ -2139,4 +2142,4 @@ xmlenc	ReleaseFast	kw	1	3	57e15451cd55c988	65e898b409f3bf26
 # The decryption path is deliberately not a row: see the harness header (the contexts there are
 # xml.parse on the recovered plaintext, which is the output, and the key-dependent work is
 # xmlenc's own rows).
-saml	ReleaseFast	sign	1	45	e05c0ebbb2d14f16	88075a41bcf0b2bb
+saml	ReleaseFast	sign	1	45	d6d644a6789a2f1f	88075a41bcf0b2bb
