@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **Fix (no-panic sweep):** `Verifier.init`'s precondition checks on its options (empty secret, no key, more than `max_keys` secrets or public keys, a timestamped scheme without a `clock`, an undecoded `whsec_` secret, an empty header name) were `std.debug.assert`, undefined behaviour in ReleaseFast; they are now a checked `@panic("webhooksig: …")` in every build mode. No accepted configuration changed.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0. `max_body_bytes` boundary: 0.17 `allocRemaining(.limited(n))` accepts exactly n bytes, which is the documented limit ("a body larger than this is 413"), so the call is unchanged; new test pins n bytes read (401 bad MAC) and n+1 -> 413.

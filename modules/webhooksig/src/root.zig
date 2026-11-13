@@ -100,6 +100,12 @@ pub const meta = .{
 
 const Allocator = std.mem.Allocator;
 
+/// Caller-contract check that stays in ReleaseFast (a bare `assert` there is
+/// undefined behaviour on a violated precondition).
+fn require(ok: bool, comptime msg: []const u8) void {
+    if (!ok) @panic("webhooksig: " ++ msg);
+}
+
 /// The MAC primitive: HMAC-SHA256 (RFC 2104 + FIPS 180-4).
 pub const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 
@@ -621,7 +627,7 @@ pub const standard = struct {
 
 /// Most keys one verification tries (the rotation set). A verifier with
 /// more is a configuration error; the extras are ignored by the free
-/// functions and refused by `Verifier.init` (asserted).
+/// functions and refused by `Verifier.init` (a checked panic).
 pub const max_keys = 8;
 
 // ── Stripe ──────────────────────────────────────────────────────────────────
@@ -747,8 +753,8 @@ pub const Scheme = enum {
 pub const Options = struct {
     /// The primary signing secret (raw bytes; retained). No secret at all
     /// (and, for `.standard_webhooks`, no public key) is a misconfiguration
-    /// (asserted) — a gate with no key can verify nothing. At most
-    /// `max_keys` secrets (asserted).
+    /// (a checked panic) — a gate with no key can verify nothing. At most
+    /// `max_keys` secrets (a checked panic).
     secret: ?[]const u8 = null,
     /// Additional valid secrets (rotation set): a body signed with **any**
     /// configured secret passes. Add the new secret, migrate senders, then
@@ -774,7 +780,7 @@ pub const Options = struct {
     /// `.standard_webhooks` only: Ed25519 keys accepting `v1a` signatures
     /// (decode `whpk_…` with `standard.decodePublicKey`). Copied.
     public_keys: []const std.crypto.sign.Ed25519.PublicKey = &.{},
-    /// Required (asserted) by the timestamped schemes: unix seconds now.
+    /// Required (a checked panic) by the timestamped schemes: unix seconds now.
     clock: ?Clock = null,
     /// Timestamped schemes: the replay window, either direction.
     tolerance_s: u32 = default_tolerance_s,
@@ -815,6 +821,12 @@ pub const Verifier = struct {
     clock: ?Clock = null,
     tolerance_s: u32 = default_tolerance_s,
 
+    /// Contract violations (an empty secret, no key at all, more than
+    /// `max_keys` secrets or public keys, a timestamped scheme without a
+    /// `clock`, an undecoded `whsec_` secret, an empty header name) are a
+    /// checked `@panic("webhooksig: …")` in every build mode: they are
+    /// configuration, never request data.
+    ///
     /// Build a verifier. Secret/header/prefix slices are copied, so the
     /// caller's buffers need not outlive this call (the secrets *are*
     /// retained, as owned copies). Requires at least one secret.
@@ -825,23 +837,23 @@ pub const Verifier = struct {
             secrets.deinit(gpa);
         }
         if (options.secret) |s| {
-            std.debug.assert(s.len != 0);
+            require(s.len != 0, "empty secret");
             try secrets.append(gpa, try gpa.dupe(u8, s));
         }
         for (options.extra_secrets) |s| {
-            std.debug.assert(s.len != 0);
+            require(s.len != 0, "empty secret");
             try secrets.append(gpa, try gpa.dupe(u8, s));
         }
         // A gate needs a key; `max_keys` bounds the per-request work.
-        std.debug.assert(secrets.items.len + options.public_keys.len != 0);
-        std.debug.assert(options.scheme == .standard_webhooks or secrets.items.len != 0);
-        std.debug.assert(secrets.items.len <= max_keys and options.public_keys.len <= max_keys);
-        if (options.scheme != .prefixed) std.debug.assert(options.clock != null);
+        require(secrets.items.len + options.public_keys.len != 0, "no secret and no public key");
+        require(options.scheme == .standard_webhooks or secrets.items.len != 0, "this scheme needs a secret");
+        require(secrets.items.len <= max_keys and options.public_keys.len <= max_keys, "more than max_keys secrets or public keys");
+        if (options.scheme != .prefixed) require(options.clock != null, "a timestamped scheme needs a clock");
         // A `whsec_…` string is not the key: decode it first.
         if (options.scheme == .standard_webhooks) for (secrets.items) |s|
-            std.debug.assert(!std.mem.startsWith(u8, s, standard.secret_prefix));
+            require(!std.mem.startsWith(u8, s, standard.secret_prefix), "decode the whsec_ secret with standard.decodeSecret first");
 
-        std.debug.assert(options.header.len != 0);
+        require(options.header.len != 0, "empty header name");
         const header = try gpa.dupe(u8, options.header);
         errdefer gpa.free(header);
         const prefix = try gpa.dupe(u8, options.prefix);
@@ -2013,6 +2025,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
