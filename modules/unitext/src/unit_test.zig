@@ -247,6 +247,44 @@ test "unaccent: the twelve Latin digraphs DZ LJ NJ expand like Latin-ASCII (UR-1
     try expectUnaccent("Ǆungla ǈubljana Ǌegoš", "DZungla Ljubljana NJegos");
 }
 
+test "unaccent: letters without WITH in their name fold like Latin-ASCII (eng, kra, long s, ...)" {
+    // A consumer's report 2026-11-13: ŋ Ŋ (LATIN SMALL/CAPITAL LETTER ENG) stayed; the name rule only
+    // knew "<X> WITH ...".
+    try expectUnaccent("ŋ Ŋ", "n N");
+    try expectUnaccent("Ŋaŋ ĸ ſ ẛ ɛ Ɛ ʉ Ʉ ɡ Ɩ Ɖ", "Nan q s s e E u U g I D");
+}
+
+test "unaccent: a named base keeps folding under WITH modifiers" {
+    // DOTLESS J WITH STROKE, LONG S WITH DIAGONAL / HIGH STROKE, OPEN E WITH RETROFLEX HOOK
+    try expectUnaccent("ɟ ẜ ẝ ᶓ", "j s s e");
+}
+
+test "unaccent: small capitals fold to the capital letter" {
+    // LATIN LETTER SMALL CAPITAL A / G / ETH / R, LATIN SMALL CAPITAL LETTER I WITH STROKE
+    try expectUnaccent("ᴀ ɢ ᴆ ᵻ ʀ", "A G D I R");
+}
+
+test "unaccent: medieval glyph variants fold to their letter" {
+    // INSULAR D / F / T, BROKEN L, MIDDLE-WELSH V, SMALL CAPITAL BARRED B
+    try expectUnaccent("ꝺ ꝼ ꞇ Ꞇ ꝇ ỽ ᴃ", "d f t T l v B");
+}
+
+test "unaccent: ligature letters and IPA digraphs expand under expand_ligatures" {
+    try expectUnaccent("Ꜳ ꜵ ƕ ƣ Ƣ ᵫ ꝏ ꝡ Ỻ ỻ", "AA ao hv oi OI ue oo vy LL ll");
+    try expectUnaccent("ȸ ȹ ʣ ʥ ʦ ʪ ʫ", "db qp dz dz ts ls lz");
+    try expectUnaccent("ꝥ Ꝥ ᵺ ɶ ᴁ", "th TH th OE AE");
+    const in = "ꜵ ƕ ȸ ꝥ ɶ";
+    const got = try ut.unaccent(a, in, .{ .expand_ligatures = false });
+    defer a.free(got);
+    try testing.expectEqualStrings(in, got);
+}
+
+test "unaccent: letters left where Latin-ASCII is arbitrary or not a letter" {
+    // HENG WITH HOOK, the abbreviation letters DUM / RUM / SMALL CAPITAL RUM, N PRECEDED BY APOSTROPHE
+    // (Latin-ASCII: h, d, r, R, 'n), and a fullwidth letter (a compatibility form).
+    try expectUnaccent("ɧ ꝱ ꝵ ꝶ ŉ Ａ", "ɧ ꝱ ꝵ ꝶ ŉ Ａ");
+}
+
 test "isAlphabeticCp: the Alphabetic derived property (spot cases)" {
     try testing.expect(ut.isAlphabeticCp(0x0903)); // DEVANAGARI SIGN VISARGA, Mc, Other_Alphabetic
     try testing.expect(!ut.isAlphaCp(0x0903));

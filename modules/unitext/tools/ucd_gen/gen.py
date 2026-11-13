@@ -32,9 +32,10 @@ What is derived here and how (the module's SPEC.md says the same):
     status C and S) as deltas; the unconditional entries of SpecialCasing.txt
     and the status F entries of CaseFolding.txt as `special_*` lists (a
     SpecialCasing entry is kept only if it differs from the simple mapping).
-  * `unaccent_*`: letters without any decomposition whose name is
-    "LATIN (SMALL|CAPITAL) LETTER <X> WITH ..." (X one letter A-Z), plus a
-    short named list (see NAMED_LETTERS / NAMED_EXPANSIONS / NAMED_DIGRAPHS below).
+  * `unaccent_*`: letters without a canonical decomposition whose name is
+    "LATIN (SMALL|CAPITAL) LETTER <base> [WITH ...]" (or a small capital), the
+    base one letter A-Z or a named base (see NAMED_LETTERS / NAMED_EXPANSIONS /
+    NAMED_DIGRAPHS below; checked against ICU Latin-ASCII by tools/latin_ascii_diff.py).
 """
 
 import os
@@ -54,20 +55,34 @@ F_ALPHABETIC = 1 << 12  # the Alphabetic derived property (DerivedCoreProperties
 
 # norm layout (u16): bits 0-7 ccc; 8-9 NFC_QC; 10-11 NFKC_QC (0 Yes, 1 Maybe, 2 No); 12 NFD_QC=No; 13 NFKD_QC=No.
 
-# Letters with no "X WITH ..." name that a user expects folded to one ASCII
-# letter. Matched against the UCD name exactly; the capital/small case of the
-# result follows the name's SMALL/CAPITAL.
+# `unaccent` reads a Latin letter's UCD name as `LATIN (SMALL|CAPITAL) (LETTER|LIGATURE) <base>
+# [WITH <modifiers>]`, or `LATIN LETTER SMALL CAPITAL <base> ...` / `LATIN SMALL CAPITAL LETTER
+# <base> ...` (a small capital folds to the capital letter). A base of one letter A-Z folds to that
+# letter; the bases below are the other letter names that stand for one ASCII letter. The modifiers
+# (hook, stroke, bar, tail, ...) are dropped, as NFD + dropping marks drops an accent. Only letters
+# without a canonical decomposition are listed (the rest reach their base through NFD); the case of
+# the result follows SMALL / CAPITAL.
 NAMED_LETTERS = {
-    "LATIN SMALL LETTER DOTLESS I": "i",
-    "LATIN SMALL LETTER DOTLESS J": "j",
-    "LATIN SMALL LETTER ETH": "d",
-    "LATIN CAPITAL LETTER ETH": "D",
+    "DOTLESS I": "i", "DOTLESS J": "j", "ETH": "d", "LONG S": "s",
+    # letters of their own alphabet's order whose ASCII stand-in is fixed by the orthography or by
+    # transliteration practice: Sami / African eng (n), Greenlandic kra (q since the 1973 reform),
+    # the African open e, iota, u bar and D, the script g (a glyph variant of g)
+    "ENG": "n", "KRA": "q", "OPEN E": "e", "IOTA": "i", "U BAR": "u", "AFRICAN D": "d", "SCRIPT G": "g",
+    # the medieval / Celtic glyph variants of one letter
+    "BROKEN L": "l", "INSULAR D": "d", "INSULAR F": "f", "INSULAR T": "t", "MIDDLE-WELSH V": "v",
+    "BARRED B": "b",
 }
-# Ligatures and letters that stand for several ASCII letters (the
-# `expand_ligatures` option): LATIN (SMALL|CAPITAL) (LETTER|LIGATURE) <key>.
+# Ligatures, digraph letters and letters that stand for several ASCII letters (the
+# `expand_ligatures` option), by the same name shape.
 NAMED_EXPANSIONS = {
-    "AE": "ae", "OE": "oe", "IJ": "ij", "SHARP S": "ss", "THORN": "th",
+    "AE": "ae", "OE": "oe", "IJ": "ij", "SHARP S": "ss", "THORN": "th", "TH": "th",
     "FF": "ff", "FI": "fi", "FL": "fl", "FFI": "ffi", "FFL": "ffl", "ST": "st", "LONG S T": "st",
+    # the medievalist and Americanist ligature letters
+    "AA": "aa", "AO": "ao", "AU": "au", "AV": "av", "AY": "ay", "OO": "oo", "VY": "vy", "UE": "ue",
+    "HV": "hv", "OI": "oi", "MIDDLE-WELSH LL": "ll",
+    # the IPA digraph letters
+    "DB DIGRAPH": "db", "QP DIGRAPH": "qp", "DZ DIGRAPH": "dz", "TS DIGRAPH": "ts",
+    "LS DIGRAPH": "ls", "LZ DIGRAPH": "lz",
 }
 # The Latin digraph letters DZ, LJ, NJ in their three case shapes (U+01C4-01CC, U+01F1-01F3),
 # expanded like ICU's Latin-ASCII. Matched against the UCD name exactly (they have only a
@@ -306,6 +321,44 @@ def emit_table(name, raw, ztype, fmt, doc):
 
 
 
+def unaccent_lists(u):
+    """(letters, expansions) of `unaccent`: `[(cp, ascii)]` each, sorted by cp, derived from the UCD names."""
+    letters = []
+    lig = []
+    rx = re.compile(r"^LATIN (SMALL|CAPITAL) (?:LETTER|LIGATURE) (.+)$")
+    rx_smallcap = re.compile(r"^LATIN (?:LETTER SMALL CAPITAL|SMALL CAPITAL LETTER) (.+)$")
+    for c in sorted(u.name):
+        nm = u.name[c]
+        if c < 0x80 or c in u.canon:
+            continue  # ASCII, or reaches its base letter through NFD
+        if nm in NAMED_DIGRAPHS:
+            lig.append((c, NAMED_DIGRAPHS[nm]))
+            continue
+        m = rx_smallcap.match(nm)
+        if m:
+            capital, rest = True, m.group(1)
+        else:
+            m = rx.match(nm)
+            if not m:
+                continue
+            capital, rest = m.group(1) == "CAPITAL", m.group(2)
+        base, _, mods = rest.partition(" WITH ")
+        # "... WITH SMALL LETTER Z WITH CARON" is a titlecase digraph (Dž Lj Nj Dz), not one
+        # letter with a diacritic: folding it to its first letter would drop letters (UR-1).
+        if "LETTER" in mods.split():
+            continue
+        if re.fullmatch(r"[A-Z]", base):
+            letters.append((c, base if capital else base.lower()))
+        elif base in NAMED_LETTERS:
+            s = NAMED_LETTERS[base]
+            letters.append((c, s.upper() if capital else s))
+        elif base in NAMED_EXPANSIONS:
+            s = NAMED_EXPANSIONS[base]
+            lig.append((c, s.upper() if capital else s))
+    assert sum(1 for c in u.name if u.name[c] in NAMED_DIGRAPHS) == len(NAMED_DIGRAPHS), "a digraph name is missing from the UCD"
+    return letters, lig
+
+
 def build(u):
     n = MAX_CP + 1
     out = []
@@ -428,31 +481,7 @@ def build(u):
     delta_table("fold", lambda c: u.fold_simple.get(c), fold_sp, "Simple case folding (CaseFolding C+S) as `delta * 2 + special`; bit 0 set = `special_fold` has the full folding (status F).")
 
     # unaccent
-    letters = []
-    lig = []
-    rx = re.compile(r"^LATIN (SMALL|CAPITAL) LETTER ([A-Z]) WITH ")
-    rx2 = re.compile(r"^LATIN (SMALL|CAPITAL) (?:LETTER|LIGATURE) (.+)$")
-    for c in sorted(u.name):
-        nm = u.name[c]
-        has_canon = c in u.canon
-        m = rx.match(nm)
-        # "... WITH SMALL LETTER Z WITH CARON" is a titlecase digraph (Dž Lj Nj Dz), not one
-        # letter with a diacritic: folding it to its first letter would drop letters.
-        if m and not has_canon and " LETTER " not in nm[m.end():]:
-            ch = m.group(2)
-            letters.append((c, ch.lower() if m.group(1) == "SMALL" else ch.upper()))
-            continue
-        if nm in NAMED_LETTERS and not has_canon:
-            letters.append((c, NAMED_LETTERS[nm]))
-            continue
-        m = rx2.match(nm)
-        if m and m.group(2) in NAMED_EXPANSIONS and not has_canon:
-            s = NAMED_EXPANSIONS[m.group(2)]
-            lig.append((c, s.upper() if m.group(1) == "CAPITAL" else s))
-            continue
-        if nm in NAMED_DIGRAPHS and not has_canon:
-            lig.append((c, NAMED_DIGRAPHS[nm]))
-    assert sum(1 for c in u.name if u.name[c] in NAMED_DIGRAPHS) == len(NAMED_DIGRAPHS), "a digraph name is missing from the UCD"
+    letters, lig = unaccent_lists(u)
     out.append("/// Letters with no decomposition that `unaccent` folds to one ASCII letter, `{ cp, ascii }`, sorted by cp.\n")
     out.append("pub const UnaccentLetter = struct { cp: u32, ascii: u8 };\n")
     out.append("pub const unaccent_letters = [_]UnaccentLetter{\n" + "".join(f"    .{{ .cp = 0x{c:X}, .ascii = '{a}' }},\n" for c, a in letters) + "};\n")

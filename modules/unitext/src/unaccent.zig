@@ -5,14 +5,19 @@
 //! The ICU recipe "NFD; remove [:Nonspacing Mark:]; NFC", plus two additions that
 //! decomposition cannot give (tables derived from UCD names by `tools/ucd_gen/gen.py`):
 //!
-//!   * letters with no decomposition named "LATIN SMALL|CAPITAL LETTER X WITH ..." (X one
-//!     letter): ł -> l, ø -> o, đ -> d, ħ -> h, ŧ -> t, ɓ -> b, ..., and DOTLESS I/J, ETH;
+//!   * letters with no canonical decomposition named "LATIN SMALL|CAPITAL LETTER X WITH ..."
+//!     (X one letter): ł -> l, ø -> o, đ -> d, ħ -> h, ŧ -> t, ɓ -> b, ...; the letters whose
+//!     name is another word that stands for one letter (DOTLESS I/J, ETH, ENG, KRA, LONG S,
+//!     OPEN E, U BAR, SCRIPT G, the insular letters, ...: ŋ -> n, ĸ -> q, ſ -> s), with or
+//!     without "WITH ..."; and the small capitals, which fold to the capital (ᴀ -> A);
 //!   * (`expand_ligatures`, default on) the ligatures and double letters that stand for
-//!     several letters: æ -> ae, œ -> oe, ĳ -> ij, ß -> ss, þ -> th, ﬀ ﬁ ﬂ ﬃ ﬄ ﬅ ﬆ, and the
-//!     digraph letters Ǆ ǅ ǆ -> DZ Dz dz, Ǉ ǈ ǉ -> LJ Lj lj, Ǌ ǋ ǌ -> NJ Nj nj, Ǳ ǲ ǳ -> DZ Dz dz.
+//!     several letters: æ -> ae, œ -> oe, ĳ -> ij, ß -> ss, þ -> th, ﬀ ﬁ ﬂ ﬃ ﬄ ﬅ ﬆ, the
+//!     digraph letters Ǆ ǅ ǆ -> DZ Dz dz, Ǉ ǈ ǉ -> LJ Lj lj, Ǌ ǋ ǌ -> NJ Nj nj, Ǳ ǲ ǳ -> DZ Dz dz,
+//!     the medievalist ligatures (Ꜳ -> AA, ꝏ -> oo, ...) and the IPA digraphs (ʦ -> ts, ...).
 //!
-//! This is what PostgreSQL's `unaccent` and ICU's "Latin-ASCII" give for Latin text
-//! and what Python's `unidecode` gives for the covered letters; scikit-learn's
+//! This is what PostgreSQL's `unaccent` and ICU's "Latin-ASCII" give for Latin letters
+//! (checked against `uconv -x Latin-ASCII` by `tools/latin_ascii_diff.py`; SPEC.md lists
+//! where they differ) and what Python's `unidecode` gives for the covered letters; scikit-learn's
 //! `strip_accents_unicode` is "NFKD; drop marks" and leaves ł, ø, æ, ß alone.
 //! Nonspacing marks of EVERY script are removed (Hebrew points, Arabic harakat,
 //! Devanagari vowel signs of category Mn), not only Latin accents; text in such
