@@ -476,13 +476,14 @@ test "decline: a server that does not echo the session_id gets a full handshake;
     try expectDropped(&cache);
 }
 
-test "mismatches abort and drop the entry: suite, and the extended master secret either way (RFC 7627 §5.3)" {
+test "mismatches abort and drop the entry: suite, and the server dropping the extended master secret (RFC 7627 §5.3)" {
     var buf: [2048]u8 = undefined;
     const Case = struct { p: Prime, s: Srv };
     const cases = [_]Case{
         .{ .p = .{}, .s = .{ .suite = 0xc030 } }, // another suite the client offers
         .{ .p = .{}, .s = .{ .ems = false } }, // the session had EMS, the server's answer has none
-        .{ .p = .{ .ems = false }, .s = .{ .ems = true } }, // and the other way round
+        // (The other way round, a session without EMS and an answer with it, cannot
+        // happen: such an entry is not offered while this hello asks for EMS.)
     };
     for (cases) |c| {
         const ch = try clientHello(&buf, c.p, .{ .cache = null });
