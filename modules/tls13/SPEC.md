@@ -404,6 +404,8 @@ the client, the hybrid client-share length check removed (a panic).
 
 ## Backlog / deferred
 
+- **P1, 2026-11-13 (Zig 0.17.1, `bench-tls13` on a loaded host):** `cli_x25519` 1.296× → 1.240× aws-lc-rs after `ct25519` P9 (asm `cswap`, fused add/sub) — under 1.25 but inside the 6–7 % spread; re-measure on a quiet host before the card says P1. `sign_rsa_pss_rsae_sha256` 1.06–1.12× OpenSSL: OpenSSL signs RSA-2048 here with `rsaz_avx2` (vector Montgomery, no AVX-512 on this CPU), `montint` is scalar MULX/ADX — closing it means an AVX2 Montgomery in `montint`, a multi-day project the owner deferred (2026-11-13: "X25519 teď, RSA později").
+
 - **Engine support for secp521r1 / MLKEM512 / MLKEM768** (2026-11-01): `kex` computes them (OpenSSL oracle both ways); `tlsserver` and `dtls` keep their offered/accepted group lists, so no engine offers them yet.
 
 - **End-to-end interop for SecP256r1MLKEM768 / SecP384r1MLKEM1024:** `tlsserver` (and
