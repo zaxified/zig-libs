@@ -1434,9 +1434,18 @@ tlsclient	ReleaseFast	cv	1	30	aac4ebb6ece329f8	a92e71f50313cf2b
 # public to the peer that sent it; app 14 = 4 AEAD verdicts + seq-number
 # reconstruction + padding scan + content-type dispatch per record.
 # 2026-11-01 (re-pin; --stacks diff against 1eb591f0, contexts matched by kind / top frame / module chain): hs 119 -> 120 = +1 tls13 transcript.zig `writeHeader`'s `len > 0xFFFFFF` guard (121caa2b no-panic sweep) on the length of the handshake message appended in handleFlightClient -- a public wire length, class (b) of the above. app unchanged (line numbers moved only).
-dtls	ReleaseFast	hs	1	120	cdd5d0d88f8c3aeb	ca9a2595f120b466
+dtls	ReleaseFast	hs	1	123	a74fca2e74aefb8f	ca9a2595f120b466
 # 2026-11-03 (re-pin from full CI 41622100028, counts only, not read by --stacks): dtls app 14 -> 13, down by one after chachapoly's short AEAD engine (no dtls source changed). Owner rule: no local ctgrind re-run.
-dtls	ReleaseFast	app	1	13	cdd5d0d88f8c3aeb	ac0eb91f2511d729
+dtls	ReleaseFast	app	1	23	a74fca2e74aefb8f	ac0eb91f2511d729
+# 2026-11-13 (KeyUpdate / exporter / ALPN; local --stacks run, contexts read one by one): hs 120 -> 123 = +3 messages.zig
+# decodeExtensions on the DECRYPTED EncryptedExtensions (the client now parses it for the ALPN answer), class (b). app 13 -> 23:
+# per record the replay window (replayCheckAndUpdate, now reached through per-epoch pointers, so inlined once per record: 12)
+# + seq-number reconstruction (4) + padding scan (4) + 3 AEAD verdicts -- all on the decrypted sequence number / content,
+# class (b), no new kind of site. ku (new): after an untainted handshake both sides' application traffic secrets and
+# exporter master secret tainted, a KeyUpdate each way (update_requested), the ACKs, records both ways on epoch 4, an
+# RFC 8446 §7.5 export, under AES-128-GCM and ChaCha20-Poly1305: 22 = the same class-(b) record sites as app plus
+# processAck's parsing of the decrypted ACK body (2) and its replay window (2). No branch on a key or secret.
+dtls	ReleaseFast	ku	1	22	a74fca2e74aefb8f	8db3bb36ab50305d
 # tlsserver (2026-10-21) — hs: Server.feed on the plaintext ClientHello
 # records of five recorded sessions (P-256/X25519, P-256/X25519MLKEM768, P-384,
 # Ed25519, a HelloRetryRequest) up to the first flight, every octet of

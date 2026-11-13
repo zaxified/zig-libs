@@ -20,6 +20,13 @@
 //!    protection, sequence-number masking, and the receiver's DTLSInnerPlaintext
 //!    handling of the decrypted (secret) content.
 //!
+//!  * `ku` (2026-11-13) — after an UNTAINTED handshake, both sides'
+//!    application traffic secrets and exporter master secret tainted, then a
+//!    KeyUpdate in each direction (RFC 9147 §8: the `update_requested`
+//!    exchange, ACKs, `"traffic upd"` derivation, the new record keys used
+//!    both ways) and an RFC 8446 §7.5 export, under AES-128-GCM and
+//!    ChaCha20-Poly1305.
+//!
 //! The in-file pattern is this module's own files.
 //!
 //! ## The propagation witness
@@ -33,7 +40,7 @@ const builtin = @import("builtin");
 const dtls = @import("root.zig");
 
 const Connection = dtls.Connection;
-const Target = enum { hs, app };
+const Target = enum { hs, app, ku };
 const Taint = enum { yes, no };
 
 fn secretBytes(comptime n: usize, label: []const u8) [n]u8 {
@@ -74,6 +81,34 @@ fn taintKeys(c: *Connection) void {
     }
 }
 
+fn taintSecrets(c: *Connection) void {
+    std.valgrind.memcheck.makeMemUndefined(&c.ap_write_secret);
+    std.valgrind.memcheck.makeMemUndefined(&c.ap_read_secret);
+    std.valgrind.memcheck.makeMemUndefined(&c.exporter_master);
+}
+
+/// Moves `from`'s next `poll` record to `to`; `to.recv` must report it as
+/// the control record `want`.
+fn relay(from: *Connection, to: *Connection, want: anyerror) !void {
+    var wire: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    const rec = (try from.poll(0, &wire)) orelse return error.NothingToSend;
+    if (to.recv(rec, &plain)) |_| return error.UnexpectedData else |err| if (err != want) return err;
+}
+
+fn keyUpdate(client: *Connection, server: *Connection) !void {
+    try client.requestKeyUpdate(true);
+    try relay(client, server, error.ReceivedKeyUpdate); // client KeyUpdate(update_requested)
+    try relay(server, client, error.ReceivedAck); // its ACK: client write key moves
+    try relay(server, client, error.ReceivedKeyUpdate); // server's own KeyUpdate
+    try relay(client, server, error.ReceivedAck); // its ACK: server write key moves
+    if (client.write_epoch != 4 or server.write_epoch != 4) return error.KeyUpdateIncomplete;
+    try exchange(client, server);
+    var ekm: [32]u8 = undefined;
+    try client.exportKeyingMaterial("EXTRACTOR-dtls_srtp", null, &ekm);
+    std.debug.print("ctgrind_result={x}\n", .{ekm});
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var it = init.args.iterate();
     _ = it.next(); // argv[0]
@@ -102,6 +137,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     taintKeys(&server);
                 }
                 try exchange(&client, &server);
+            }
+        },
+        .ku => {
+            const psk = secretBytes(32, "ctgrind-dtls-psk-v1");
+            for ([_]dtls.CipherSuite{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256 }) |suite| {
+                try handshake(suite, &psk, &client, &server);
+                var plain: [64]u8 = undefined;
+                // The server's final-flight ACK, so the KeyUpdate ACKs are
+                // the only ones in flight.
+                if (try server.poll(0, &plain)) |_| return error.UnexpectedControlRecord;
+                if (taint == .yes) {
+                    taintSecrets(&client);
+                    taintSecrets(&server);
+                }
+                try keyUpdate(&client, &server);
             }
         },
     }

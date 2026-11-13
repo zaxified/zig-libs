@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-09-07 · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DTLS_FUZZ: `dtls-keyupdate` added 2026-11-13, not yet budget-run; `dtls-handshake` PSK / HelloRetryRequest cookie / (EC)DHE with one flight damaged, `dtls-record`, `dtls-wire`; certificate-authenticated flights not driven) · ct 2026-10-10 (ctgrind: PSK through a full handshake, record keys through send/recv; `hs` 120 (119 until 2026-11-01: +1 public `transcript.writeHeader` length guard) / `app` 14 in-file, none a branch on a key — constant-time-check verdicts and processing of decrypted content)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DTLS_FUZZ: `dtls-keyupdate` added 2026-11-13, not yet budget-run; `dtls-handshake` PSK / HelloRetryRequest cookie / (EC)DHE with one flight damaged, `dtls-record`, `dtls-wire`; certificate-authenticated flights not driven) · ct 2026-10-10 (ctgrind: PSK through a full handshake, record keys through send/recv; `hs` 123 (120 until 2026-11-13: +3 parsing the decrypted EncryptedExtensions for ALPN; 119 until 2026-11-01: +1 public `transcript.writeHeader` length guard) / `app` 23 (13 until 2026-11-13: the replay window now per epoch) / `ku` 22 (2026-11-13: KeyUpdate both ways + exporter, traffic and exporter secrets tainted) in-file, none a branch on a key — constant-time-check verdicts and processing of decrypted content)
 **Performance:** not measured
 
 **Known defects:** none recorded
