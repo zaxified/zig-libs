@@ -275,8 +275,11 @@ Not implemented: sampling-with-tools (`tools`/`toolChoice`), `includeContext`,
   Unsupported types (non-slice pointers, unions, ...) are compile errors naming
   the field. `argsAs` failures write `error: Invalid arguments: /ptr: why`.
   ```zig
-  const Args = struct { city: []const u8, days: u8 = 1,
-      pub const mcp_descriptions = .{ .city = "City name" }, };
+  const Args = struct {
+      city: []const u8,
+      days: u8 = 1,
+      pub const mcp_descriptions = .{ .city = "City name" };
+  };
   // .input_schema = mcp.schemaOf(Args), ...
   fn h(_: ?*anyopaque, call: *mcp.ToolCall) bool {
       const a = call.argsAs(Args) catch return true;
