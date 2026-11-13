@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit recorded from the delta mutation run over the typed tools (97 mutants: 96 killed, 1 equivalent).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation run over the typed-tools decoder (`typed.zig` `parse`/`decode` every arm, `ToolCall.argsAs`/`writeJson`): 91 mutants, 90 killed, 1 equivalent (`bad` resetting a pointer `parse` already cleared). New tests: hostile floats (1e300, inf, NaN, -0.0, 2^63 edges), integer bound edges, wrong JSON types per arm, full JSON Pointer paths through arrays/structs, optional elements and `null` as absent with defaults, exact unknown-property matching and 64-byte truncation, failure-record reset, and OOM that fails one allocation only (pointer and message untouched, no "invalid arguments" text). No defect found.
 - **2026-11-13** — **New:** typed tools. `mcp.schemaOf(T)` derives a tool's JSON Schema text from a Zig struct at compile time (ints bounded by width and +-(2^53-1), enums, optionals, slices, arrays, nested structs, `mcp_descriptions`), `ToolCall.argsAs(T)` decodes the arguments into it with a JSON-Pointer error, `ToolCall.writeJson(v)` writes a struct result. Checked against google/jsonschema-go's verdicts (`tools/typed_oracle`).
 
