@@ -81,6 +81,18 @@ pub const Secp256k1 = struct {
         if (is_identity != 0) return error.IdentityElement;
     }
 
+    /// `rejectIdentity` with the verdict laundered through `blackBox`, so it
+    /// compiles to ONE conditional jump. The comb's endpoint check (it reveals
+    /// only "the result is O", i.e. `s ≡ 0 mod n`): with the plain form LLVM
+    /// split it into two jumps after the w = 6 rewrite (2026-11-13, ctgrind
+    /// `comb` row: two contexts at the same line instead of one).
+    fn rejectIdentityOneBranch(p: Secp256k1) IdentityElementError!void {
+        const affine_0 = @intFromBool(p.x.equivalent(AffineCoordinates.identityElement.x)) &
+            (@intFromBool(p.y.isZero()) | @intFromBool(p.y.equivalent(AffineCoordinates.identityElement.y)));
+        const is_identity: u64 = @intFromBool(p.z.isZero()) | affine_0;
+        if (blackBox(is_identity) != 0) return error.IdentityElement;
+    }
+
     /// Build a point from affine coordinates, checking the curve equation.
     pub fn fromAffineCoordinates(p: AffineCoordinates) EncodingError!Secp256k1 {
         const x = p.x;
@@ -413,8 +425,8 @@ pub const Secp256k1 = struct {
     /// CONSTANT-TIME fixed-base multiply `s·G` for a possibly-SECRET scalar,
     /// via the precomputed comb table (`comb_table`) — the fast signing path
     /// (BIP340/ECDSA nonce commitment + pubkey derivation). Bit-exact to
-    /// `basePoint.mul(s)` (the naive CT ladder) but ~4× faster: the online phase
-    /// is `comb_t` point additions with NO doublings, because each window's
+    /// `basePoint.mul(s)` (the naive CT ladder) but much faster: the online phase
+    /// is `fb_t` point additions with NO doublings, because each window's
     /// table already carries the `2^(w·i)` factor. `error.IdentityElement` iff
     /// `s ≡ 0 (mod n)`. See the comb section below for the CT-gather contract.
     pub inline fn combMulBase(s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
@@ -468,21 +480,116 @@ pub const Secp256k1 = struct {
     /// differential has teeth. The table index `[i][j]` is driven only by the
     /// PUBLIC loop counters — never by a secret — so this stays constant-time
     /// for any table. `pub` for that harness (cf. `mulPublicDoubleAdd`).
+    ///
+    /// Since 2026-11-13 the shape of `p256`'s `combMulBaseFastWithTable`
+    /// (and of libsecp256k1's `ecmult_gen`): w = 6, an AFFINE table, a
+    /// Jacobian accumulator with the incomplete constant-time mixed addition
+    /// (`addMixedCtJac`, 8M + 3S, against the complete projective 12M + 2·m_b)
+    /// on windows 0 .. fb_t−2 and the complete mixed formula (`addMixed`) on
+    /// the top one — 43 additions instead of 65.
+    ///
+    /// Why the incomplete addition is safe below the top window: before
+    /// window i the accumulator is `L·G`, `L = Σ_{j<i} d_j·2^(6j)`, and the
+    /// entry is `d_i·2^(6i)·G`. `|L| ≤ 32·(2^(6i) − 1)/63 < 2^(6i) ≤
+    /// |d_i|·2^(6i) ≤ 2^(6i+5) ≤ 2^251`, so `0 < |L ± d_i·2^(6i)| < 2^252 < n`
+    /// and P ≠ ±Q. `L = 0` (P = O) happens exactly while every lower digit was
+    /// 0 — the lowest nonzero digit `d_m` has `0 < |d_m| ≤ 32 < 64`, so it
+    /// cannot cancel against multiples of 2^(6m+6), and `|L| < 2^252 < n` — and
+    /// that is the `started` mask, under which the first nonzero digit LOADS
+    /// its entry instead of adding. The top window's entry reaches 16·2^252 >
+    /// n/2, where the argument fails, so it stays complete. Every branch here
+    /// is on the PUBLIC window index.
     pub fn combMulBaseWithTable(tab: *const CombTable, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
         const k = scalarValue(s_, endian);
-        var acc = Secp256k1.identityElement;
-        // Recoding and gather are shared with `mul` (see `signedDigit` and
-        // `gatherSigned` below for their constant-time contracts); here each
-        // window has its own table row, which already carries the `2^(w·i)`
-        // factor, so digits are consumed low → high with no doubling at all.
+        var acc = CtJac.identity;
+        var started: u64 = 0;
         var carry: u64 = 0;
         var i: usize = 0;
-        while (i < comb_t) : (i += 1) {
-            const d = signedDigit(k, i, &carry);
-            acc = acc.add(gatherSigned(&tab[i], d.mag, d.is_neg));
+        while (i < fb_t) : (i += 1) {
+            const shift: usize = i * fb_w; // PUBLIC (loop-derived) shift
+            const wv: u64 = if (shift < 256) (@as(u64, @truncate(k >> @intCast(shift))) & fb_wmask) else 0;
+            const x = wv + carry; // 0 .. 2^w
+            // is_neg ⟺ x ≥ 2^(w−1): then d = x − 2^w (< 0) and carry
+            // propagates. `>=` lowers to setcc; the mask is laundered so the
+            // select below cannot become a branch on the secret digit.
+            const is_neg: u64 = @intFromBool(x >= fb_half);
+            carry = is_neg;
+            const negmask: u64 = blackBox(0 -% is_neg);
+            const m = ((fb_twow - x) & negmask) | (x & ~negmask); // 0 .. 2^(w−1)
+
+            // Masked linear scan over EVERY entry of window i (laundered
+            // per-entry mask: no secret-indexed load or jump table). `m == 0`
+            // matches nothing and leaves the non-point (0, 0), which the
+            // `nonzero` blend below discards.
+            var g = AffineCoordinates{ .x = Fe.zero, .y = Fe.zero };
+            var j: usize = 0;
+            while (j < fb_teeth) : (j += 1) {
+                const match: u64 = @intFromBool(@as(u64, j + 1) == m);
+                const mask = blackBox(0 -% match);
+                blendLimbs(&g.x, tab[i][j].x, mask);
+                blendLimbs(&g.y, tab[i][j].y, mask);
+            }
+            // Signed digit: blend in the unconditionally computed −y.
+            blendLimbs(&g.y, g.y.neg(), negmask);
+
+            // Always add (fixed schedule), keep the result iff the digit is
+            // nonzero.
+            const nonzero: u64 = blackBox(0 -% @as(u64, @intFromBool(m != 0)));
+            if (i + 1 < fb_t) { // PUBLIC loop index
+                const sum = addMixedCtJac(acc, g);
+                var cand = CtJac{ .x = g.x, .y = g.y, .z = Fe.one };
+                blendJac(&cand, sum, blackBox(started));
+                blendJac(&acc, cand, nonzero);
+                started |= nonzero;
+            } else {
+                // Top window: projective + the complete mixed formula, which
+                // handles `acc = O` (the Jacobian `(1 : 1 : 0)` maps to
+                // `(0 : 1 : 0)`) and `acc = ±g`.
+                var proj = jacToProjectiveCt(acc);
+                const sum = proj.addMixed(g);
+                blendLimbs(&proj.x, sum.x, nonzero);
+                blendLimbs(&proj.y, sum.y, nonzero);
+                blendLimbs(&proj.z, sum.z, nonzero);
+                try proj.rejectIdentityOneBranch();
+                return proj;
+            }
         }
-        try acc.rejectIdentity();
-        return acc;
+        unreachable;
+    }
+
+    /// Mixed addition `p + q` with `q` AFFINE: RCB algorithm 8 (complete for
+    /// every projective `p`, the identity included, and every affine `q`; an
+    /// affine `q` is never the identity) — algorithm 7 with `Z2 = 1` folded
+    /// in, 11M + 2·m_b. Fixed schedule, no branch. Pinned to `add` by the
+    /// test below.
+    pub fn addMixed(p: Secp256k1, q: AffineCoordinates) Secp256k1 {
+        var t0 = p.x.mul(q.x);
+        var t1 = p.y.mul(q.y);
+        var t3 = q.x.add(q.y);
+        var t4 = p.x.add(p.y);
+        t3 = t3.mul(t4);
+        t4 = t0.add(t1);
+        t3 = t3.sub(t4);
+        t4 = q.y.mul(p.z);
+        t4 = t4.add(p.y); // Y1 + Y2·Z1
+        var Y3 = q.x.mul(p.z);
+        Y3 = Y3.add(p.x); // X1 + X2·Z1
+        var X3 = t0.dbl();
+        t0 = X3.add(t0);
+        var t2 = p.z.mulSmall(21); // 3b, b = 7
+        var Z3 = t1.add(t2);
+        t1 = t1.sub(t2);
+        Y3 = Y3.mulSmall(21); // 3b
+        X3 = t4.mul(Y3);
+        t2 = t3.mul(t1);
+        X3 = t2.sub(X3);
+        Y3 = Y3.mul(t0);
+        t1 = t1.mul(Z3);
+        Y3 = t1.add(Y3);
+        t0 = t0.mul(t3);
+        Z3 = Z3.mul(t4);
+        Z3 = Z3.add(t0);
+        return .{ .x = X3, .y = Y3, .z = Z3 };
     }
 
     /// VARIABLE-TIME scalar multiply for a PUBLIC scalar. Dispatches to the
@@ -734,26 +841,27 @@ fn glvCombine(comptime k: usize, tabs: *const [k][glv_table_len]Secp256k1, es: *
 // per signature (the nonce commitment R = k·G and the pubkey P = d·G). A naive
 // constant-time double-and-add pays 256 doublings + 256 conditional adds; the
 // fixed-base **windowed comb** replaces that with a precomputed table so the
-// online phase does NO doublings at all — just `comb_t` point additions, one
+// online phase does NO doublings at all — just `fb_t` point additions, one
 // per signed digit, gathered constant-time from the table (the technique behind
 // libsecp256k1's `ecmult_gen`).
 //
-// Design (w = 4): the scalar is recoded into `comb_t` signed digits of `w`
-// bits, d_i ∈ [−2^(w−1), 2^(w−1)−1] (a running-carry Booth recoding, so
-// Σ d_i·2^(w·i) = k exactly, including the raw-scalar range up to 2^256−1 — the
-// extra window absorbs the final carry). Window `i` owns a table of the
-// magnitudes {1,2,…,2^(w−1)}·2^(w·i)·G; the sign of a digit is applied by a
-// masked point negation, which halves the table. Online cost = comb_t adds.
-//
-//   memory: comb_t · comb_teeth projective points
-//         = 65 · 8 · (3 × 32 B) = 48.75 KiB of .rodata (a comptime constant).
+// Design (w = 6, since 2026-11-13; w = 4 projective before): the scalar is
+// recoded into `fb_t = 43` signed digits of `w` bits, d_i ∈ [−2^(w−1),
+// 2^(w−1)−1] (a running-carry Booth recoding, so Σ d_i·2^(w·i) = k exactly
+// for every raw 256-bit scalar: the top window holds 4 scalar bits, so its
+// digit is at most 16 and never carries out). Window `i` owns the magnitudes
+// {1,…,2^(w−1)}·2^(w·i)·G; the sign of a digit is a masked point negation,
+// which halves the table. Entries are AFFINE (batch-normalised at comptime
+// with one inversion), so the online addition is a mixed one.
 //
 // The table is generated at COMPTIME (via the portable field path — the
 // `@inComptime()` guard in `field.zig` keeps the runtime asm core out of the
-// comptime interpreter), stored PROJECTIVE so no comptime field inversions are
-// needed (affine conversion would run a Fermat inverse per entry).
+// comptime interpreter).
+//
+// `mul` (variable base, secret scalar) keeps the w = 4 recoding below
+// (`comb_*`, `signedDigit`, `gatherSigned`): its table is built per call.
 
-/// Comb window width in bits. `256 % comb_w == 0` keeps the window layout exact.
+/// `mul`'s window width in bits. `256 % comb_w == 0` keeps the window layout exact.
 const comb_w: usize = 4;
 /// Table entries per window: magnitudes 1..2^(w−1) (the signed digit folds the
 /// sign out, halving the table).
@@ -761,8 +869,69 @@ const comb_teeth: usize = 1 << (comb_w - 1); // 8
 /// Number of windows: 256/w low windows plus one to absorb the recoding carry.
 const comb_t: usize = (256 / comb_w) + 1; // 65
 
-/// The precomputed comb table type: `[window][magnitude−1]` projective points.
-pub const CombTable = [comb_t][comb_teeth]Secp256k1;
+/// Fixed-base comb (`combMulBase`) window width in bits (2026-11-13; it
+/// shared `mul`'s w = 4 projective layout before). `p256`'s fixed-base
+/// layout, and libsecp256k1's default table size (86 KiB).
+const fb_w: usize = 6;
+/// Fixed-base table entries per window: magnitudes 1..2^(w−1).
+const fb_teeth: usize = 1 << (fb_w - 1); // 32
+/// Fixed-base windows covering 256 bits (the last one partial).
+const fb_t: usize = (256 + fb_w - 1) / fb_w; // 43
+const fb_half: u64 = 1 << (fb_w - 1); // 32
+const fb_twow: u64 = 1 << fb_w; // 64
+const fb_wmask: u64 = fb_twow - 1;
+
+comptime {
+    // No carry can leave the top window: its raw value plus the incoming
+    // carry must stay below 2^(w−1). Otherwise `fb_t` needs one more window.
+    std.debug.assert((@as(u64, 1) << @intCast(256 - (fb_t - 1) * fb_w)) <= fb_half);
+}
+
+/// The precomputed fixed-base table type: `[window][magnitude−1]` AFFINE
+/// points, `43 · 32 · 64 B = 88 064 B` of `.rodata` (was `65 · 8 · 96 B =
+/// 49 920 B`, w = 4 projective, until 2026-11-13).
+pub const CombTable = [fb_t][fb_teeth]AffineCoordinates;
+
+/// Jacobian `(X : Y : Z)` ↔ affine `(X/Z², Y/Z³)` for the constant-time comb
+/// accumulator ONLY. Unlike `ecmult.Gej`, nothing here branches: the comb's
+/// schedule rules out the exceptional inputs (see `combMulBaseWithTable`).
+const CtJac = struct {
+    x: field.Fe,
+    y: field.Fe,
+    z: field.Fe,
+    const identity = CtJac{ .x = field.Fe.one, .y = field.Fe.one, .z = field.Fe.zero };
+};
+
+/// Mixed addition, `q` affine (EFD madd-2004-hmv, 8M + 3S), WITHOUT the
+/// exceptional cases (`p = O`, `p = ±q`): a fixed schedule, no branch — on
+/// those inputs the result is meaningless, and `combMulBaseWithTable` never
+/// feeds them. `p256`'s `Jac.addMixedCtFormula`; the formula does not
+/// involve the curve's `a` or `b`.
+inline fn addMixedCtJac(p: CtJac, q: AffineCoordinates) CtJac {
+    const z1z1 = p.z.sq();
+    const h = z1z1.mul(q.x).sub(p.x); // U2 − X
+    const r = z1z1.mul(p.z).mul(q.y).sub(p.y); // S2 − Y
+    const hh = h.sq();
+    const hhh = hh.mul(h);
+    const v = hh.mul(p.x); // X·H²
+    const x3 = r.sq().sub(v.dbl()).sub(hhh);
+    const y3 = v.sub(x3).mul(r).sub(hhh.mul(p.y));
+    const z3 = p.z.mul(h);
+    return .{ .x = x3, .y = y3, .z = z3 };
+}
+
+/// Jacobian → projective, branch-free: `(XZ : Y : Z³)`. The `(1 : 1 : 0)`
+/// identity becomes `(0 : 1 : 0)` with no special case.
+inline fn jacToProjectiveCt(p: CtJac) Secp256k1 {
+    const z2 = p.z.sq();
+    return .{ .x = p.x.mul(p.z), .y = p.y, .z = z2.mul(p.z) };
+}
+
+inline fn blendJac(dst: *CtJac, src: CtJac, mask: u64) void {
+    blendLimbs(&dst.x, src.x, mask);
+    blendLimbs(&dst.y, src.y, mask);
+    blendLimbs(&dst.z, src.z, mask);
+}
 
 /// `mul`'s per-call table: `[magnitude−1]` projective multiples of one point.
 pub const VarBaseTable = [comb_teeth]Secp256k1;
@@ -825,23 +994,41 @@ inline fn gatherSigned(row: *const [comb_teeth]Secp256k1, mag: u64, is_neg: u64)
     return g;
 }
 
-/// Build the comb table at comptime. `tab[i][j] = (j+1)·2^(w·i)·G`, projective.
+/// Build the fixed-base table at comptime: `tab[i][j] = (j+1)·2^(w·i)·G` on
+/// the complete projective formulas, then batch-normalised to affine with ONE
+/// comptime inversion (Montgomery's trick) — `p256`'s `buildBaseTable`.
 fn buildCombTable() CombTable {
-    @setEvalBranchQuota(100_000_000);
-    var tab: CombTable = undefined;
+    @setEvalBranchQuota(200_000_000);
+    const n = fb_t * fb_teeth;
+    var proj: [n]Secp256k1 = undefined;
     var base = Secp256k1.basePoint; // 2^(w·i)·G, starting at G
     var i: usize = 0;
-    while (i < comb_t) : (i += 1) {
-        var acc = base; // 1·base
-        tab[i][0] = acc;
+    while (i < fb_t) : (i += 1) {
+        proj[i * fb_teeth] = base;
         var j: usize = 1;
-        while (j < comb_teeth) : (j += 1) {
-            acc = acc.add(base); // (j+1)·base
-            tab[i][j] = acc;
+        while (j < fb_teeth) : (j += 1) {
+            // Even multiples as a doubling of the half, odd ones as one more
+            // addition of `base` — fewer comptime field multiplies.
+            proj[i * fb_teeth + j] = if ((j + 1) % 2 == 0)
+                proj[i * fb_teeth + (j + 1) / 2 - 1].dbl()
+            else
+                proj[i * fb_teeth + j - 1].add(base);
         }
-        // base ← 2^w · base for the next window.
         var d: usize = 0;
-        while (d < comb_w) : (d += 1) base = base.dbl();
+        while (d < fb_w) : (d += 1) base = base.dbl();
+    }
+    var prefix: [n]field.Fe = undefined;
+    prefix[0] = proj[0].z;
+    i = 1;
+    while (i < n) : (i += 1) prefix[i] = prefix[i - 1].mul(proj[i].z);
+    var inv = prefix[n - 1].invert();
+    var tab: CombTable = undefined;
+    i = n;
+    while (i > 0) {
+        i -= 1;
+        const zinv = if (i == 0) inv else inv.mul(prefix[i - 1]);
+        if (i > 0) inv = inv.mul(proj[i].z);
+        tab[i / fb_teeth][i % fb_teeth] = .{ .x = proj[i].x.mul(zinv), .y = proj[i].y.mul(zinv) };
     }
     return tab;
 }
@@ -937,6 +1124,32 @@ test "differential vs std: dbl/add/scalarmul on random scalars" {
         const kd = Secp256k1.mulDoubleBasePublic(kp1, s2b, kp2, s1b, .big) catch continue;
         const sd = Std.mulDoubleBasePublic(sp1, s2b, sp2, s1b, .big) catch continue;
         try eqAffine(kd, sd);
+    }
+}
+
+fn expectSamePoint(a: Secp256k1, b: Secp256k1) !void {
+    const aa = a.affineCoordinates();
+    const ba = b.affineCoordinates();
+    try std.testing.expectEqualSlices(u8, &ba.x.toBytes(.big), &aa.x.toBytes(.big));
+    try std.testing.expectEqualSlices(u8, &ba.y.toBytes(.big), &aa.y.toBytes(.big));
+}
+
+test "addMixed == add for affine q, incl. p = identity, p = q, p = -q and an un-normalised p" {
+    var prng = std.Random.DefaultPrng.init(0xADD_313E);
+    const rand = prng.random();
+    for (0..64) |_| {
+        var b1: [32]u8 = undefined;
+        var b2: [32]u8 = undefined;
+        rand.bytes(&b1);
+        rand.bytes(&b2);
+        const p = Secp256k1.basePoint.mulPublic(b1, .big) catch continue; // projective, z != 1
+        const q = (Secp256k1.basePoint.mulPublic(b2, .big) catch continue).affineCoordinates();
+        const qp = Secp256k1{ .x = q.x, .y = q.y, .z = field.Fe.one };
+        try expectSamePoint(p.addMixed(q), p.add(qp));
+        try expectSamePoint(Secp256k1.identityElement.addMixed(q), qp);
+        const pa = p.affineCoordinates();
+        try expectSamePoint(p.addMixed(pa), p.dbl());
+        try std.testing.expectError(error.IdentityElement, p.addMixed(pa.neg()).rejectIdentity());
     }
 }
 

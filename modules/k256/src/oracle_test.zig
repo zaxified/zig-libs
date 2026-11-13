@@ -205,19 +205,20 @@ test "comb: combMulBase(k)·G == std.basePoint.mul(k), random + edges" {
 }
 
 test "comb positive control: a corrupted table DISAGREES with std (harness has teeth)" {
-    // Drop a whole window (window 10 → all teeth = identity), i.e. digit 10
-    // contributes nothing no matter its value. Any scalar with a nonzero
-    // digit-10 (~15/16 of them) then yields the wrong point — so this must
-    // diverge from std on the large majority of inputs. Proves the differential
-    // above would catch a dropped-digit / wrong-table comb.
+    // Corrupt a whole window (window 10 → every tooth = G, an affine table
+    // cannot hold the identity), i.e. digit 10 contributes ±G whatever its
+    // value. Any scalar with a digit-10 magnitude other than 1 (~62/64 of them)
+    // then yields the wrong point — so this must diverge from std on the large
+    // majority of inputs. Proves the differential above would catch a
+    // wrong-table comb.
     var bad = group.comb_table;
-    for (&bad[10]) |*e| e.* = Secp256k1.identityElement;
+    for (&bad[10]) |*e| e.* = group.comb_table[0][0];
 
     // Same std-mul cost as `comb_random_iters` above (~30ms/draw in Debug):
     // 500 draws ran ~15s isolated. Cut in Debug; the ~15/16 expected
     // disagreement rate needs only a modest sample to stay far from flaky.
     const rounds: usize = if (builtin.mode == .debug) 50 else 500;
-    const min_disagreements = rounds - rounds / 5; // > 80%, expected ~93.75%
+    const min_disagreements = rounds - rounds / 5; // > 80%, expected ~96.9%
 
     var prng = std.Random.DefaultPrng.init(0xBADC_0FFE_10);
     const rand = prng.random();
