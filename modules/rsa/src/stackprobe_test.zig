@@ -287,6 +287,7 @@ var cur_sk: rsa.SecretKey = undefined;
 var cur_pk: rsa.PublicKey = undefined;
 var cur_ct: [256]u8 = undefined;
 var out_buf: [512]u8 = undefined;
+var raw_buf: [512]u8 = undefined;
 var pss_prng: std.Random.DefaultPrng = undefined;
 
 noinline fn callSignPkcs1v15() void {
@@ -301,6 +302,10 @@ noinline fn callSignPss() void {
 noinline fn callDecryptOaep() void {
     const m = rsa.decryptOaep(&cur_sk, Sha256, &cur_ct, "", &out_buf) catch unreachable;
     std.mem.doNotOptimizeAway(m.ptr);
+}
+noinline fn callDecryptOaepNoFail() void {
+    const r = rsa.decryptOaepHNoFail(&cur_sk, Sha256, Sha256, .none, &cur_ct, "", 16, &out_buf, &raw_buf) catch unreachable;
+    std.mem.doNotOptimizeAway(r.msg.ptr);
 }
 noinline fn callFromPrimes() void {
     var sk: rsa.SecretKey = undefined;
@@ -387,6 +392,9 @@ test "STACKPROBE: no key or CRT residue on the dead stack after signing, decrypt
     crtHalves(&n, &m);
     n.sort();
     bad += try runProbe("decryptOaep", callDecryptOaep, &n);
+
+    // `decryptOaepHNoFail` (its own burn): same ciphertext, same needles.
+    bad += try runProbe("decryptOaepHNoFail", callDecryptOaepNoFail, &n);
 
     try std.testing.expectEqual(@as(usize, 0), bad);
 }

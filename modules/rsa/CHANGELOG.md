@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the branch-free `decryptOaepHNoFail` (35 mutants); new tests pin the separator scan (empty PS, 0x01 inside the message, stray octet after lHash), the public size guards, the raw RSADP block and the function's stack burn (`stackprobe_test.zig`).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit recorded from the delta mutation run since the 2026-10-18 audit (91 mutants: 65 killed, 26 equivalent).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit since `bb4efd9a9` (91 mutants over `byteLen`, `bigModInverse`, `fromPrimesImpl`, the `trimStart` call sites, `BlindingCache`, the primitive length guards, `emsaPssEncodeDigest`, the SPKI/PKCS#1/PKCS#8 readers, the PBES2 profile and the PEM walk): tests only, no defect found. New tests in `sweep_test.zig`: `bigModInverse` gcd, `fromPrimes` edge exponents / composite `p` / oversized product / padded primes, and `BlindingCache` shared between keys with the same first prime, swapped primes, or a shorter modulus equal in its low limbs.
 - **2026-11-08** — **NEW:** `ctEqMaskUsize(a, b)` is public (all-ones iff equal, branch-free); `xmlenc` had a verbatim copy.

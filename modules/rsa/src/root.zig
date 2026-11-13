@@ -6860,6 +6860,74 @@ test "OAEP decryption refuses a stray PS octet and a missing separator (both ent
     try testing.expect(!(try decryptOaepHNoFail(&sk, Sha256, Sha256, .none, &y_ct, "", 3, &out, &raw)).ok);
 }
 
+/// `lHash("") ‖ 0x00 × ps_len ‖ 0x01 ‖ m` as the 223-octet DB of `kat2048` + SHA-256
+/// (`ps_len` = 190 - m.len: the message ends the DB).
+fn oaepDbFor(m: []const u8) [223]u8 {
+    var db: [223]u8 = @splat(0);
+    std.crypto.hash.sha2.Sha256.hash("", db[0..32], .{});
+    const ps_len = 190 - m.len;
+    db[32 + ps_len] = 0x01;
+    @memcpy(db[33 + ps_len ..], m);
+    return db;
+}
+
+test "decryptOaepHNoFail: separator position, public guards and the raw block (mutation delta 2026-11-13)" {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const sk = try kat2048.secretKey();
+    var out: [max_modulus_len]u8 = undefined;
+    var raw: [max_modulus_len]u8 = undefined;
+
+    // A message full of 0x01 and nonzero octets, at the largest size the key
+    // carries (190), with an EMPTY PS: the separator is the first octet after
+    // lHash. Only the first 0x01 is the separator; later ones are message.
+    var m190: [190]u8 = undefined;
+    for (&m190, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
+    try testing.expectEqual(@as(u8, 1), m190[0]);
+    const db_full = oaepDbFor(&m190);
+    const ct_full = try oaepCraft(0x00, &db_full);
+    const r_full = try decryptOaepHNoFail(&sk, Sha256, Sha256, .none, &ct_full, "", 190, &out, &raw);
+    try testing.expect(r_full.ok);
+    try testing.expectEqualSlices(u8, &m190, r_full.msg);
+
+    // Same with a PS of 5 octets (0x01 octets inside the message again).
+    const db_ps = oaepDbFor(m190[0..185]);
+    const ct_ps = try oaepCraft(0x00, &db_ps);
+    const r_ps = try decryptOaepHNoFail(&sk, Sha256, Sha256, .none, &ct_ps, "", 185, &out, &raw);
+    try testing.expect(r_ps.ok);
+    try testing.expectEqualSlices(u8, m190[0..185], r_ps.msg);
+
+    // A nonzero non-0x01 octet right after lHash is not PS.
+    const m_short = [_]u8{ 9, 0x01, 8, 0x01, 0x01, 7 };
+    var db_stray = oaepDbFor(&m_short);
+    db_stray[32] = 0x02;
+    const ct_stray = try oaepCraft(0x00, &db_stray);
+    @memset(&out, 0xAA);
+    const r_stray = try decryptOaepHNoFail(&sk, Sha256, Sha256, .none, &ct_stray, "", m_short.len, &out, &raw);
+    try testing.expect(!r_stray.ok);
+    try testing.expect(std.mem.allEqual(u8, r_stray.msg, 0));
+
+    // `raw` is the RSADP block (not caller garbage), valid or not.
+    @memset(&raw, 0xAA);
+    _ = try decryptOaepHNoFail(&sk, Sha256, Sha256, .none, &ct_stray, "", m_short.len, &out, &raw);
+    const expect_raw = try rsadpCrt(256, ct_stray, &sk);
+    try testing.expectEqualSlices(u8, &expect_raw, raw[0..256]);
+
+    // Public-size guards: a shorter ciphertext (a valid OS2IP input on its
+    // own), a ciphertext >= n, and too-small buffers.
+    try testing.expectError(error.DecryptionError, decryptOaepHNoFail(&sk, Sha256, Sha256, .none, ct_ps[1..], "", 185, &out, &raw));
+    const ff: [256]u8 = @splat(0xff);
+    try testing.expectError(error.DecryptionError, decryptOaepHNoFail(&sk, Sha256, Sha256, .none, &ff, "", 185, &out, &raw));
+    try testing.expectError(error.BufferTooSmall, decryptOaepHNoFail(&sk, Sha256, Sha256, .none, &ct_ps, "", 185, &out, raw[0..255]));
+    try testing.expectError(error.BufferTooSmall, decryptOaepHNoFail(&sk, Sha256, Sha256, .none, &ct_ps, "", 185, out[0..184], &raw));
+
+    // k < 2 hLen + 2: a 512-bit key cannot carry SHA-256 OAEP at all.
+    var sk512: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk512, &kat512.p, &kat512.q, &kat512.e);
+    defer sk512.deinit();
+    const ct64: [64]u8 = @splat(0x11);
+    try testing.expectError(error.DecryptionError, decryptOaepHNoFail(&sk512, Sha256, Sha256, .none, &ct64, "", 0, &out, &raw));
+}
+
 test "OAEP decryption checks its output buffers up front, from public sizes only" {
     // `decryptOaep*`'s contract: `out` ≥ k − 2hLen − 2 (the largest message
     // the key can carry), checked BEFORE the private op so the answer never
