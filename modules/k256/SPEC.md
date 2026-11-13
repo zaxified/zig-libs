@@ -642,7 +642,7 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
     secp256k1 (prime order) but reachable by a hand-built `Secp256k1{…}` that is off the curve
     — every decoder (`fromSec1`, `fromAffineCoordinates`, `recoverY`) checks the curve, so only
     a caller bypassing them gets there. The RCB path gives a wrong point there instead.
-- **Speed toward libsecp256k1, 2026-11-13** (`bip340` bench vs libsecp256k1 v0.8.0): keypair 0.68–0.71×, sign 0.69–0.77× (no self-verify on either side), verify 1.12–1.16× — after CT safegcd inversion, the w = 6 affine comb, the inlined limb multiply, the integer GLV split and zero-run wNAF. Open for verify: lazy reduction (below, item 3), a wider G table (libsecp's window is 15, ours 10), and the limb multiply's instruction count. The secret-path `mul` (variable base, w = 4 projective, RCB) did not get the comb's treatment: an affine per-call table needs a constant-time batch inversion; not measured.
+- **Speed toward libsecp256k1, 2026-11-13** (`bip340` bench vs libsecp256k1 v0.8.0): keypair 0.69–0.72×, sign 0.78–0.79× (no self-verify on either side), verify 0.99–1.01× — after CT safegcd inversion, the w = 6 affine comb, the inlined limb multiply, the integer GLV split and zero-run wNAF (verify 1.12–1.16× at that point), then **weak field elements in `ecmult`** (`F`: values `< 2^256`, add/sub/mulSmall fold only the carry out of 2^256, `field.mulWeak`/`sqWeak` stop after the two Solinas folds; branch-free, the rare second folds masked) and **libsecp256k1's `gej_double`** (3M + 4S). The secret paths keep canonical `Fe`. Measured: masking the rare second folds costs ~4 % against branching on them (0.95–0.97×), but the branches put ~50 ctgrind contexts into `adaptor/presign` (whose mandatory self-check verifies secret-derived values) — kept masked. Open for verify: a wider G table (libsecp's window is 15, ours 10; w = 12 read 0.95× vs 0.97× in one pair of runs, inside the noise, not kept), and the limb multiply's instruction count. The secret-path `mul` (variable base, w = 4 projective, RCB) did not get the comb's treatment: an affine per-call table needs a constant-time batch inversion; not measured.
 - **Speed toward libsecp256k1.** 2026-10-07 perf over BIP340 verify: point add 36 %, double
   33 %, `lift_x` square root + affine inversion ~25 %. Done 2026-10-07: addition-chain
   inversion/sqrt, two-fold asm reduction, `ecmult` (Jacobian + mixed adds + affine G table)
@@ -650,7 +650,7 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
   (`Fe.invertPublic`, verify 59 → 53 µs); (2) ~~`verifyBatch` on a multi-point Straus~~ DONE 2026-10-07
   (`mulMultiBasePublic`, 79 → 51 µs/sig); a double-base with two arbitrary points still runs
   the RCB `glvCombine` (no consumer on a hot path); (3) lazily reduced field elements (libsecp's magnitude tracking) so add/sub
-  skip the select; (4) field mul latency (~80 cycles: product rows ~27, reduction ~25,
+  skip the select — DONE 2026-11-13 for the public double-base multiply only (`ecmult`'s weak form, above); (4) field mul latency (~80 cycles: product rows ~27, reduction ~25,
   store/load). Each needs ctgrind re-measured where it touches CT paths.
 
 1. ~~`fast_core.fieldMul`/`fieldSq` — the `MULX/ADX` field mul + square with the

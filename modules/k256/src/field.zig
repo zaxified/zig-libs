@@ -153,7 +153,9 @@ fn reduceWide(wide: u512) [4]u64 {
 // dispatched.
 const use_limb_mul = true;
 
-inline fn reduceLimbs(t: [8]u64) [4]u64 {
+/// Folds 1 and 2 of `reduceLimbs`: `r + cf2·2^256 ≡ t`, value `< 2^256 + 2^67`
+/// (`cf2 = 1` forces `r < 2^67`).
+inline fn foldLimbs(t: [8]u64) struct { r: [4]u64, cf2: u64 } {
     const C: u64 = c_fold;
     var r: [4]u64 = undefined;
     // fold 1: r = t_lo + C·t_hi, excess word x4 < 2^34.
@@ -172,7 +174,15 @@ inline fn reduceLimbs(t: [8]u64) [4]u64 {
         r[i] = @truncate(c);
         c >>= 64;
     }
-    const cf2: u64 = @truncate(c);
+    return .{ .r = r, .cf2 = @truncate(c) };
+}
+
+inline fn reduceLimbs(t: [8]u64) [4]u64 {
+    const C: u64 = c_fold;
+    const f = foldLimbs(t);
+    var r = f.r;
+    const cf2 = f.cf2;
+    var c: u128 = undefined;
     // finish: value < 2p; T = r + C, take T iff cf2 or T carried.
     var tt: [4]u64 = undefined;
     c = @as(u128, r[0]) + C;
@@ -189,6 +199,11 @@ inline fn reduceLimbs(t: [8]u64) [4]u64 {
 }
 
 inline fn mulLimbs(a: [4]u64, b: [4]u64) [4]u64 {
+    return reduceLimbs(productLimbs(a, b));
+}
+
+/// The 512-bit schoolbook product `a·b`.
+inline fn productLimbs(a: [4]u64, b: [4]u64) [8]u64 {
     var t: [8]u64 = undefined;
     {
         var c: u128 = 0;
@@ -208,11 +223,15 @@ inline fn mulLimbs(a: [4]u64, b: [4]u64) [4]u64 {
         }
         t[i + 4] = @truncate(c);
     }
-    return reduceLimbs(t);
+    return t;
 }
 
 inline fn sqLimbs(a: [4]u64) [4]u64 {
-    // Cross products once, doubled, plus the diagonal.
+    return reduceLimbs(squareLimbs(a));
+}
+
+/// The 512-bit square `a²`: cross products once, doubled, plus the diagonal.
+inline fn squareLimbs(a: [4]u64) [8]u64 {
     var t: [8]u64 = @splat(0);
     {
         var c: u128 = 0;
@@ -247,7 +266,31 @@ inline fn sqLimbs(a: [4]u64) [4]u64 {
         t[2 * k + 1] = @truncate(c);
         c >>= 64;
     }
-    return reduceLimbs(t);
+    return t;
+}
+
+/// Weak finish for PUBLIC data (`ecmult`): folds 1-2, then `+ c·cf2` (the
+/// carry out of fold 2, set only when the folded value is within 2^67 of
+/// 2^256) as a masked add instead of `reduceLimbs`' canonicalising four-limb
+/// select. The result is WEAK: `< 2^256`, `≡` the product, possibly `≥ p`.
+/// `cf2 = 1` forces `r < 2^67`, so `r + c` cannot carry past limb 1.
+inline fn reduceLimbsLazy(t: [8]u64) [4]u64 {
+    const f = foldLimbs(t);
+    var r = f.r;
+    const s = @as(u128, r[0]) + (c_fold & (0 -% blackBox(f.cf2)));
+    r[0] = @truncate(s);
+    r[1] += @as(u64, @truncate(s >> 64));
+    return r;
+}
+
+/// Like `mulLimbs`, with the weak finish `reduceLimbsLazy`.
+inline fn mulLimbsLazy(a: [4]u64, b: [4]u64) [4]u64 {
+    return reduceLimbsLazy(productLimbs(a, b));
+}
+
+/// Like `sqLimbs`, with the weak finish `reduceLimbsLazy`.
+inline fn sqLimbsLazy(a: [4]u64) [4]u64 {
+    return reduceLimbsLazy(squareLimbs(a));
 }
 
 pub fn mulPortable(a: [4]u64, b: [4]u64) [4]u64 {
@@ -259,6 +302,26 @@ pub fn mulPortable(a: [4]u64, b: [4]u64) [4]u64 {
 pub fn sqPortable(a: [4]u64) [4]u64 {
     const av: u512 = toU256(a);
     return reduceWide(av * av);
+}
+
+/// `a·b mod p` for PUBLIC data, on raw limbs that need NOT be
+/// canonical: any `a, b < 2^256` (the WEAK form `ecmult` keeps between
+/// operations), and the result is weak too (`< 2^256`, maybe `≥ p`). Valid
+/// because no reduction step uses `a, b < p`: the product is `< 2^512`, so
+/// fold 1 still leaves an excess word `< 2^34` and fold 2 a value
+/// `< 2^256 + 2^67`; `reduceLimbsLazy` stops there. At comptime the portable
+/// `reduceWide` (canonical; it reaches `< 2^256` after three folds for any
+/// 512-bit input). Branch-free, but only `Fe.mul` carries the constant-time
+/// claim; this is for public data.
+pub inline fn mulWeak(a: [4]u64, b: [4]u64) [4]u64 {
+    if (!@inComptime()) return mulLimbsLazy(a, b);
+    return mulPortable(a, b);
+}
+
+/// `a²` in the weak form (see `mulWeak`); public data only.
+pub inline fn sqWeak(a: [4]u64) [4]u64 {
+    if (!@inComptime()) return sqLimbsLazy(a);
+    return sqPortable(a);
 }
 
 // ── the field element type ──────────────────────────────────────────────────

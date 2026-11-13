@@ -5,9 +5,9 @@
 //! libsecp256k1's `ecmult` design, re-derived on k256's `Fe`:
 //!
 //!   * **Jacobian coordinates** `(X, Y, Z)` ↦ `(X/Z², Y/Z³)` with the
-//!     incomplete `a = 0` formulas — doubling 2M + 5S (dbl-2009-l), mixed
-//!     addition 8M + 3S — where `group.zig`'s complete RCB law pays 6M + 2S
-//!     and 12M. Incomplete means the special cases (identity, `a = ±b`) are
+//!     incomplete `a = 0` formulas — doubling 3M + 4S (libsecp256k1's
+//!     `gej_double`), mixed addition 8M + 3S — where `group.zig`'s complete
+//!     RCB law pays 6M + 2S and 12M. Incomplete means the special cases (identity, `a = ±b`) are
 //!     branches; that is fine here and ONLY here, because every input is
 //!     public. Secret scalars never reach this file (`group.mul` and
 //!     `combMulBase` stay on RCB).
@@ -20,6 +20,10 @@
 //!     a mixed addition; the accumulator lives on the isomorphic curve and the
 //!     common `Z` is multiplied back into its `Z` at the end. (`a = 0`, so the
 //!     formulas never see the curve constant that the isomorphism changes.)
+//!   * **Weak field elements** (`F`, since 2026-11-13): values `< 2^256`, not
+//!     reduced below `p` between operations, so add/sub/mul skip the masked
+//!     canonicalising select `Fe` pays (see `F`). Branch-free like `Fe`,
+//!     but not a constant-time claim: public data only.
 //!   * **G's table precomputed affine** at comptime with a wider window
 //!     (`g_window`), together with `φ(G)`'s (`(β·x, y)`); its entries enter the
 //!     isomorphic frame through the same common `Z` (`addGeScaled`).
@@ -35,19 +39,137 @@ const scalarmod = @import("scalar.zig");
 
 const Fe = field.Fe;
 
-/// An affine point. Never the identity: tables hold odd multiples of a point
-/// of prime order.
-pub const Ge = struct {
-    x: Fe,
-    y: Fe,
+// ── the weak field form (VARIABLE-TIME — public data only) ──────────────────
+//
+// `F` holds any value `< 2^256` congruent to the element, not necessarily
+// `< p` — libsecp256k1's "magnitude" idea cut down to what four full limbs
+// allow. `Fe`'s add/sub/mulSmall canonicalise after every operation (a second
+// carry chain, a laundered mask and a 4-limb select each); here they only fold
+// the carry/borrow out of 2^256 back in (`2^256 ≡ c`), one chain plus a masked
+// constant, and the second fold that can follow (probability ~2^-220 on a real
+// input: both operands within `c` of 2^256) is masked too. Every value here is
+// public, but the code still does not branch on field values: a carry out of
+// 2^256 is a coin flip a branch would mispredict, and callers such as
+// `adaptor.preSign`'s self-check run this on values derived from a secret
+// (published ones, but ctgrind counts them).
+// `mul`/`sq` take and return weak values too (`field.mulWeak`: the two Solinas
+// folds and a masked add of the final carry, instead of `Fe.mul`'s
+// canonicalising four-limb select).
+// Zero tests compare against both representatives, `0` and `p`.
+// Measured 2026-11-13 (`zig build bench-bip340`): see SPEC § Performance.
 
-    fn neg(a: Ge) Ge {
-        return .{ .x = a.x, .y = a.y.neg() };
+const p_int: u256 = field.field_order;
+const c_fold: u256 = (1 << 32) + 977; // 2^256 − p
+
+/// `0 − bit` as a 256-bit mask, the bit laundered so LLVM keeps the masked
+/// fold instead of a branch (a coin flip it would mispredict, or, for the rare
+/// folds, a branch on data). No-op barrier at comptime.
+inline fn mask(bit: u1) u256 {
+    if (@inComptime()) return @as(u256, 0) -% bit;
+    const b = asm (""
+        : [ret] "=r" (-> u64),
+        : [x] "0" (@as(u64, bit)),
+    );
+    return @as(u256, 0) -% @as(u256, b);
+}
+
+const F = struct {
+    v: u256,
+
+    const zero = F{ .v = 0 };
+    const one = F{ .v = 1 };
+
+    inline fn of(a: Fe) F {
+        return .{ .v = a.toInt() };
+    }
+
+    /// The canonical element (one conditional subtract: `v < 2^256 < 2p`).
+    inline fn fe(a: F) Fe {
+        const d = @subWithOverflow(a.v, p_int); // borrow => a.v < p, keep it
+        const r = d[0] +% (p_int & mask(d[1]));
+        return .{ ._limbs = .{ @truncate(r), @truncate(r >> 64), @truncate(r >> 128), @truncate(r >> 192) } };
+    }
+
+    inline fn limbs(a: F) [4]u64 {
+        return .{ @truncate(a.v), @truncate(a.v >> 64), @truncate(a.v >> 128), @truncate(a.v >> 192) };
+    }
+
+    inline fn ofLimbs(l: [4]u64) F {
+        return .{ .v = @as(u256, l[0]) | (@as(u256, l[1]) << 64) | (@as(u256, l[2]) << 128) | (@as(u256, l[3]) << 192) };
+    }
+
+    inline fn mul(a: F, b: F) F {
+        return ofLimbs(field.mulWeak(a.limbs(), b.limbs()));
+    }
+
+    inline fn sq(a: F) F {
+        return ofLimbs(field.sqWeak(a.limbs()));
+    }
+
+    /// `a + b`: `s = a + b − k·2^256` (`k` the carry), `+ k·c`; a second
+    /// carry leaves a value `< c`, so one more `+ c` cannot carry.
+    inline fn add(a: F, b: F) F {
+        const s = @addWithOverflow(a.v, b.v);
+        const t = @addWithOverflow(s[0], c_fold & mask(s[1]));
+        return .{ .v = t[0] +% (c_fold & mask(t[1])) };
+    }
+
+    inline fn dbl(a: F) F {
+        return a.add(a);
+    }
+
+    /// `a − b`: a borrow means `a − b + 2^256`, so subtract `c`; a second
+    /// borrow leaves a value `≥ 2^256 − c`, so one more `− c` cannot borrow.
+    inline fn sub(a: F, b: F) F {
+        const d = @subWithOverflow(a.v, b.v);
+        const t = @subWithOverflow(d[0], c_fold & mask(d[1]));
+        return .{ .v = t[0] -% (c_fold & mask(t[1])) };
+    }
+
+    inline fn neg(a: F) F {
+        return zero.sub(a);
+    }
+
+    /// `k·a` for a small comptime `k`: `lo + hi·c` with `hi < k`, so
+    /// `hi·c < 2^38` and a carry out of 2^256 leaves a value `< 2^38`.
+    inline fn mulSmall(a: F, comptime k: u64) F {
+        comptime std.debug.assert(k < 32);
+        const w: u320 = @as(u320, a.v) * k;
+        const hi: u256 = @intCast(w >> 256);
+        const s = @addWithOverflow(@as(u256, @truncate(w)), hi * c_fold);
+        return .{ .v = s[0] +% (c_fold & mask(s[1])) };
+    }
+
+    /// `a / 2`: `(a + p·(a odd)) >> 1`, with the 257th bit shifted back in.
+    inline fn half(a: F) F {
+        const s = @addWithOverflow(a.v, p_int & mask(@truncate(a.v & 1)));
+        return .{ .v = (s[0] >> 1) | (@as(u256, s[1]) << 255) };
+    }
+
+    /// `v ∈ {0, p}` as ONE verdict: both limb-wise compares are folded into
+    /// a single word before the test (two 256-bit `==` compiled to a chain
+    /// of per-limb jumps — more ctgrind contexts on callers that feed this
+    /// secret-derived values, such as `adaptor.preSign`'s self-check).
+    inline fn isZero(a: F) bool {
+        const l = a.limbs();
+        const pl = comptime (F{ .v = p_int }).limbs();
+        const z = l[0] | l[1] | l[2] | l[3];
+        const zp = (l[0] ^ pl[0]) | (l[1] ^ pl[1]) | (l[2] ^ pl[2]) | (l[3] ^ pl[3]);
+        // `x == 0` iff `(x | −x)` has its top bit clear.
+        const nz = ((z | (0 -% z)) & (zp | (0 -% zp))) >> 63;
+        return nz == 0;
     }
 };
 
-/// A Jacobian point; `inf` marks the identity (its coordinates are then
-/// meaningless).
+/// An affine point (public interface type; canonical coordinates). Never the
+/// identity: tables hold odd multiples of a point of prime order.
+pub const Ge = struct {
+    x: Fe,
+    y: Fe,
+};
+
+/// A Jacobian point (public interface type; canonical coordinates); `inf`
+/// marks the identity (its coordinates are then meaningless).
 pub const Gej = struct {
     x: Fe,
     y: Fe,
@@ -55,28 +177,63 @@ pub const Gej = struct {
     inf: bool,
 
     pub const infinity = Gej{ .x = Fe.zero, .y = Fe.one, .z = Fe.zero, .inf = true };
+};
 
-    fn fromGe(a: Ge) Gej {
-        return .{ .x = a.x, .y = a.y, .z = Fe.one, .inf = false };
+/// `Ge` in the weak form.
+const Gw = struct {
+    x: F,
+    y: F,
+
+    inline fn of(a: Ge) Gw {
+        return .{ .x = F.of(a.x), .y = F.of(a.y) };
     }
 
-    /// `2a`, dbl-2009-l for `a = 0`: 2M + 5S. secp256k1 has no point of order
-    /// two (its order is an odd prime), so `Y = 0` never occurs.
-    fn dbl(a: Gej) Gej {
+    fn neg(a: Gw) Gw {
+        return .{ .x = a.x, .y = a.y.neg() };
+    }
+};
+
+/// `Gej` in the weak form: what the multiply works on.
+const Jw = struct {
+    x: F,
+    y: F,
+    z: F,
+    inf: bool,
+
+    const infinity = Jw{ .x = F.zero, .y = F.one, .z = F.zero, .inf = true };
+
+    fn of(a: Gej) Jw {
+        return .{ .x = F.of(a.x), .y = F.of(a.y), .z = F.of(a.z), .inf = a.inf };
+    }
+
+    fn gej(a: Jw) Gej {
+        return .{ .x = a.x.fe(), .y = a.y.fe(), .z = a.z.fe(), .inf = a.inf };
+    }
+
+    fn fromGe(a: Gw) Jw {
+        return .{ .x = a.x, .y = a.y, .z = F.one, .inf = false };
+    }
+
+    /// `2a` for `a = 0`, libsecp256k1's `gej_double` (3M + 4S):
+    /// `L = 3X²/2`, `S = Y²`, `T = X·S`, `X3 = L² − 2T`,
+    /// `Y3 = L·(T − X3) − S²`, `Z3 = Y·Z` — dbl-2009-l's point with `Z` halved
+    /// (so `X` quartered, `Y` divided by eight), which trades one square for a
+    /// multiply and five of its eleven additions for one halving. Until
+    /// 2026-11-13 this was dbl-2009-l itself (2M + 5S). secp256k1 has no point
+    /// of order two (its order is an odd prime), so `Y = 0` never occurs.
+    fn dbl(a: Jw) Jw {
         if (a.inf) return a;
-        const xx = a.x.sq();
-        const yy = a.y.sq();
-        const yyyy = yy.sq();
-        const d = a.x.add(yy).sq().sub(xx).sub(yyyy).dbl();
-        const e = xx.mulSmall(3);
-        const x3 = e.sq().sub(d.dbl());
-        const y3 = e.mul(d.sub(x3)).sub(yyyy.mulSmall(8));
-        const z3 = a.y.mul(a.z).dbl();
+        const s = a.y.sq();
+        const l = a.x.sq().mulSmall(3).half();
+        const t = a.x.mul(s);
+        const x3 = l.sq().sub(t.dbl());
+        const y3 = l.mul(t.sub(x3)).sub(s.sq());
+        const z3 = a.y.mul(a.z);
         return .{ .x = x3, .y = y3, .z = z3, .inf = false };
     }
 
     /// `a + b` for `b` affine in `a`'s frame (mixed addition, 8M + 3S).
-    fn addGe(a: Gej, b: Ge) Gej {
+    fn addGe(a: Jw, b: Gw) Jw {
         if (a.inf) return fromGe(b);
         return addCore(a, b, a.z).p;
     }
@@ -84,10 +241,10 @@ pub const Gej = struct {
     /// `a + ψ(b)` where `ψ(x, y) = (s²·x, s³·y)` maps the affine `b` from the
     /// curve into `a`'s isomorphic frame (scale `s`): 9M + 3S. How G's
     /// entries meet an accumulator that lives in P's table frame.
-    fn addGeScaled(a: Gej, b: Ge, s: Fe) Gej {
+    fn addGeScaled(a: Jw, b: Gw, s: F) Jw {
         if (a.inf) {
             const s2 = s.sq();
-            return .{ .x = b.x.mul(s2), .y = b.y.mul(s2.mul(s)), .z = Fe.one, .inf = false };
+            return .{ .x = b.x.mul(s2), .y = b.y.mul(s2.mul(s)), .z = F.one, .inf = false };
         }
         return addCore(a, b, a.z.mul(s)).p;
     }
@@ -96,14 +253,14 @@ pub const Gej = struct {
     /// (1 when `b` is already in `a`'s frame). Returns the sum and `h` with
     /// `Z3 = a.z·h` — the z-ratio the table builder records. `h = 0` is the
     /// special case `ψ(b) = ±a`: double, or the identity.
-    fn addCore(a: Gej, b: Ge, az: Fe) struct { p: Gej, h: Fe } {
+    fn addCore(a: Jw, b: Gw, az: F) struct { p: Jw, h: F } {
         const z12 = az.sq();
         const u_2 = b.x.mul(z12);
         const s_2 = b.y.mul(z12).mul(az);
         const h = u_2.sub(a.x);
         const i = s_2.sub(a.y);
         if (h.isZero()) {
-            return .{ .p = if (i.isZero()) a.dbl() else infinity, .h = Fe.zero };
+            return .{ .p = if (i.isZero()) a.dbl() else infinity, .h = F.zero };
         }
         const h2 = h.sq();
         const h3 = h.mul(h2);
@@ -129,21 +286,21 @@ pub const Gej = struct {
 ///
 /// `a` must not be the identity. Every addition is then generic: `a_{i−1} = ±d`
 /// would mean `(2i−1)·a = ±2a`, i.e. a point of order ≤ 2i+1 < n.
-fn oddMultiplesGlobalZ(comptime n: usize, a: Gej, out: *[n]Ge) Fe {
+fn oddMultiplesGlobalZ(comptime n: usize, a: Jw, out: *[n]Gw) F {
     const d = a.dbl();
-    const d_ge = Ge{ .x = d.x, .y = d.y };
+    const d_ge = Gw{ .x = d.x, .y = d.y };
     const zd2 = d.z.sq();
-    var ai = Gej{ .x = a.x.mul(zd2), .y = a.y.mul(zd2.mul(d.z)), .z = a.z, .inf = false };
-    var zr: [n]Fe = undefined;
+    var ai = Jw{ .x = a.x.mul(zd2), .y = a.y.mul(zd2.mul(d.z)), .z = a.z, .inf = false };
+    var zr: [n]F = undefined;
     out[0] = .{ .x = ai.x, .y = ai.y };
     for (1..n) |i| {
-        const r = Gej.addCore(ai, d_ge, ai.z);
+        const r = Jw.addCore(ai, d_ge, ai.z);
         if (r.h.isZero()) @panic("k256 ecmult: odd-multiple table hit a = ±2a (point of small order)");
         ai = r.p;
         zr[i] = r.h;
         out[i] = .{ .x = ai.x, .y = ai.y };
     }
-    var zs = Fe.one;
+    var zs = F.one;
     var i: usize = n - 1;
     while (i > 0) : (i -= 1) {
         zs = zs.mul(zr[i]);
@@ -155,9 +312,9 @@ fn oddMultiplesGlobalZ(comptime n: usize, a: Gej, out: *[n]Ge) Fe {
 
 /// φ on a table: `φ(x, y) = (β·x, y)`. φ commutes with every frame map `ψ_s`
 /// (both scale coordinates), so a table and its image share one frame.
-fn phiTable(comptime n: usize, tab: *const [n]Ge) [n]Ge {
-    const beta = comptime (Fe.fromInt(scalarmod.beta) catch unreachable);
-    var out: [n]Ge = undefined;
+fn phiTable(comptime n: usize, tab: *const [n]Gw) [n]Gw {
+    const beta = comptime F.of(Fe.fromInt(scalarmod.beta) catch unreachable);
+    var out: [n]Gw = undefined;
     for (tab, &out) |t, *o| o.* = .{ .x = t.x.mul(beta), .y = t.y };
     return out;
 }
@@ -285,9 +442,15 @@ fn topDigit(strings: []const [wnaf_len]i16) usize {
 }
 
 /// `±tab[(|d|−1)/2]` for an odd nonzero digit `d`.
-inline fn tableEntry(tab: []const Ge, d: i16) Ge {
+inline fn tableEntry(tab: []const Gw, d: i16) Gw {
     if (d > 0) return tab[@intCast(@divExact(d - 1, 2))];
     return tab[@intCast(@divExact(-d - 1, 2))].neg();
+}
+
+/// `tableEntry` over G's canonical comptime table.
+inline fn gTableEntry(tab: []const Ge, d: i16) Gw {
+    if (d > 0) return Gw.of(tab[@intCast(@divExact(d - 1, 2))]);
+    return Gw.of(tab[@intCast(@divExact(-d - 1, 2))]).neg();
 }
 
 // ── the tables and the multiply ─────────────────────────────────────────────
@@ -310,20 +473,25 @@ pub const GTables = [2][g_tab_len]Ge;
 /// frame scale maps the entries back onto the curve itself.
 fn buildGTables() GTables {
     @setEvalBranchQuota(200_000_000);
-    const g = Gej{
-        .x = Fe.fromInt(55066263022277343669578718895168534326250603453777594175500187360389116729240) catch unreachable,
-        .y = Fe.fromInt(32670510020758816978083085130507043184471273380659243275938904335757337482424) catch unreachable,
-        .z = Fe.one,
+    const g = Jw{
+        .x = F.of(Fe.fromInt(55066263022277343669578718895168534326250603453777594175500187360389116729240) catch unreachable),
+        .y = F.of(Fe.fromInt(32670510020758816978083085130507043184471273380659243275938904335757337482424) catch unreachable),
+        .z = F.one,
         .inf = false,
     };
-    var framed: [g_tab_len]Ge = undefined;
+    var framed: [g_tab_len]Gw = undefined;
     const s = oddMultiplesGlobalZ(g_tab_len, g, &framed);
-    const sinv = s.invert();
+    const sinv = F.of(s.fe().invert());
     const sinv2 = sinv.sq();
     const sinv3 = sinv2.mul(sinv);
+    var tw: [g_tab_len]Gw = undefined;
+    for (framed, &tw) |f, *t| t.* = .{ .x = f.x.mul(sinv2), .y = f.y.mul(sinv3) };
+    const phi = phiTable(g_tab_len, &tw);
     var tabs: GTables = undefined;
-    for (framed, &tabs[0]) |f, *t| t.* = .{ .x = f.x.mul(sinv2), .y = f.y.mul(sinv3) };
-    tabs[1] = phiTable(g_tab_len, &tabs[0]);
+    for (tw, phi, &tabs[0], &tabs[1]) |a, b, *ta, *tb| {
+        ta.* = .{ .x = a.x.fe(), .y = a.y.fe() };
+        tb.* = .{ .x = b.x.fe(), .y = b.y.fe() };
+    }
     return tabs;
 }
 
@@ -374,25 +542,25 @@ fn strauss(comptime max: usize, gt: *const GTables, g_scalar: u256, points: []co
     const hg = splitToSignedHalves(g_scalar) orelse zero;
     es[0] = wnafDigits(g_window, hg[0]);
     es[1] = wnafDigits(g_window, hg[1]);
-    var tabs: [max][2][p_tab_len]Ge = undefined;
-    var scales: [max]Fe = undefined;
+    var tabs: [max][2][p_tab_len]Gw = undefined;
+    var scales: [max]F = undefined;
     for (points, scalars, 0..) |p, sc, j| {
         std.debug.assert(!p.inf);
         const h = splitToSignedHalves(sc) orelse zero;
         es[2 + 2 * j] = wnafDigits(p_window, h[0]);
         es[3 + 2 * j] = wnafDigits(p_window, h[1]);
-        scales[j] = oddMultiplesGlobalZ(p_tab_len, p, &tabs[j][0]);
+        scales[j] = oddMultiplesGlobalZ(p_tab_len, Jw.of(p), &tabs[j][0]);
     }
     var scale = scales[0];
     if (k > 1) {
-        var prefix: [max]Fe = undefined;
-        var acc = Fe.one;
+        var prefix: [max]F = undefined;
+        var acc = F.one;
         for (0..k) |j| {
             prefix[j] = acc;
             acc = acc.mul(scales[j]);
         }
         scale = acc;
-        var suffix = Fe.one;
+        var suffix = F.one;
         var j = k;
         while (j > 0) {
             j -= 1;
@@ -406,13 +574,13 @@ fn strauss(comptime max: usize, gt: *const GTables, g_scalar: u256, points: []co
     for (tabs[0..k]) |*t| t[1] = phiTable(p_tab_len, &t[0]);
 
     const strings = es[0 .. 2 + 2 * k];
-    var r = Gej.infinity;
+    var r = Jw.infinity;
     var i = topDigit(strings);
     while (i > 0) {
         i -= 1;
         r = r.dbl();
-        if (strings[0][i] != 0) r = r.addGeScaled(tableEntry(&gt[0], strings[0][i]), scale);
-        if (strings[1][i] != 0) r = r.addGeScaled(tableEntry(&gt[1], strings[1][i]), scale);
+        if (strings[0][i] != 0) r = r.addGeScaled(gTableEntry(&gt[0], strings[0][i]), scale);
+        if (strings[1][i] != 0) r = r.addGeScaled(gTableEntry(&gt[1], strings[1][i]), scale);
         for (tabs[0..k], 0..) |*t, j| {
             const d0 = strings[2 + 2 * j][i];
             const d1 = strings[3 + 2 * j][i];
@@ -422,7 +590,7 @@ fn strauss(comptime max: usize, gt: *const GTables, g_scalar: u256, points: []co
     }
     if (r.inf) return null;
     r.z = r.z.mul(scale);
-    return r;
+    return r.gej();
 }
 
 test "splitInteger == the splitScalar route on edges and random scalars, and reconstructs k" {
@@ -501,6 +669,53 @@ fn expectSame(g_scalar: u256, p: Secp256k1, p_scalar: u256) !void {
     } else {
         try std.testing.expect(got == null);
     }
+}
+
+/// `x mod p` for the weak-form oracle.
+fn modP(x: u512) u256 {
+    return @intCast(x % p_int);
+}
+
+test "ecmult: weak field ops == integer arithmetic mod p, incl. the rare second folds" {
+    // Edges: both representatives of 0, values within c of 2^256 (where the
+    // second fold of add/sub/mulSmall and mul's cf2 branch fire), and odd
+    // values near 2^256 (half's 257th bit).
+    const top = ~@as(u256, 0);
+    const edges = [_]u256{
+        0,              1,         2,         c_fold - 1,      c_fold,       c_fold + 1, p_int - 1,      p_int,
+        p_int + 1,      p_int + 2, top - 1,   top,             top - c_fold, 1 << 255,   (1 << 255) - 1, 1 << 128,
+        (1 << 192) + 7, top >> 1,  top - 977, top - (1 << 32),
+    };
+    var prng = std.Random.DefaultPrng.init(0xEC_3017_F00D);
+    const rand = prng.random();
+    var hits: [4]usize = @splat(0); // second fold of add, sub; mul result ≥ p; half carry
+    for (0..edges.len * edges.len + 3000) |i| {
+        const a: u256 = if (i < edges.len * edges.len) edges[i / edges.len] else rand.int(u256);
+        const b: u256 = if (i < edges.len * edges.len) edges[i % edges.len] else rand.int(u256);
+        const fa = F{ .v = a };
+        const fb = F{ .v = b };
+        const s = fa.add(fb);
+        try std.testing.expectEqual(modP(@as(u512, a) + b), modP(s.v));
+        if (@addWithOverflow(@addWithOverflow(a, b)[0], c_fold)[1] == 1 and @addWithOverflow(a, b)[1] == 1) hits[0] += 1;
+        const d = fa.sub(fb);
+        try std.testing.expectEqual(modP(@as(u512, a) + 2 * @as(u512, p_int) - b), modP(d.v));
+        if (a < b and @subWithOverflow(a, b)[0] < c_fold) hits[1] += 1;
+        const m = fa.mul(fb);
+        try std.testing.expectEqual(modP(@as(u512, a) * b), modP(m.v));
+        if (m.v >= p_int) hits[2] += 1;
+        try std.testing.expectEqual(modP(@as(u512, a) * a), modP(fa.sq().v));
+        try std.testing.expectEqual(modP(@as(u512, a) * 3), modP(fa.mulSmall(3).v));
+        try std.testing.expectEqual(modP(@as(u512, a) * 8), modP(fa.mulSmall(8).v));
+        const h = fa.half();
+        try std.testing.expectEqual(modP(@as(u512, a)), modP(@as(u512, h.v) * 2));
+        if (a & 1 == 1 and @addWithOverflow(a, p_int)[1] == 1) hits[3] += 1;
+        try std.testing.expectEqual(modP(a) == 0, modP(fa.neg().v) == 0);
+        try std.testing.expectEqual(modP(@as(u512, a) + modP(fa.neg().v)), 0);
+        try std.testing.expectEqual(modP(a) == 0, fa.isZero());
+        try std.testing.expectEqual(modP(a), fa.fe().toInt());
+    }
+    // The edge set reaches every rare branch.
+    for (hits) |n| try std.testing.expect(n > 0);
 }
 
 test "ecmult: G tables are the affine odd multiples of G and φ(G)" {

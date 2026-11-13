@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, BIP340_FUZZ, forgery check) · ct 2026-09-09 (ctgrind)
 
-**Performance:** ref 0.68–1.16× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-11-13)
+**Performance:** ref 0.69–1.01× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-11-13)
 
 **Known defects:** none recorded
 
@@ -304,16 +304,16 @@ check, the four burns (`sign`, `signFromSecretKey`'s, `fromSecretKey`'s, `comput
 
 ## Performance
 
-**Measured 2026-11-13** (Zig 0.17.1, `zig build bench-bip340`, ReleaseFast, best of five per row, two runs on a host shared with other agents' jobs; libsecp256k1 v0.8.0 `zig cc -O3`, x86-64 asm, default tables). The card carries the range over both runs.
+**Measured 2026-11-13, after k256's weak-field `ecmult`** (Zig 0.17.1, `zig build bench-bip340`, ReleaseFast, best of five per row, two runs on a host shared with other agents' jobs; libsecp256k1 v0.8.0 `zig cc -O3`, x86-64 asm, default tables). The card carries the range over both runs.
 
 | row | what it measures (both sides) | ours ns/op | libsecp256k1 ns/op | ours/ref |
 |---|---|--:|--:|--:|
-| keypair | secret key → x-only key (`KeyPair.fromSecretKey` / `keypair_create` + `keypair_xonly_pub`) | 14 616 – 14 729 | 20 771 – 21 625 | 0.68 – 0.71 |
-| sign | 32-byte message from a ready key pair, default options (`signWithKeyPair(…, .{})` / `schnorrsig_sign32`); neither side self-verifies | 16 816 – 17 105 | 22 263 – 24 506 | 0.69 – 0.77 |
-| verify | one signature under a key parsed once outside the loop (`LiftedPublicKey` + `verifyLifted` / `xonly_pubkey_parse` + `schnorrsig_verify`) | 41 412 – 41 786 | 36 141 – 37 110 | 1.12 – 1.16 |
-| verifyBatch | per signature, 64-signature batch (ours only) | ~40 000 | — | — |
+| keypair | secret key → x-only key (`KeyPair.fromSecretKey` / `keypair_create` + `keypair_xonly_pub`) | 14 663 – 14 980 | 20 928 – 21 283 | 0.69 – 0.72 |
+| sign | 32-byte message from a ready key pair, default options (`signWithKeyPair(…, .{})` / `schnorrsig_sign32`); neither side self-verifies | 17 559 – 17 806 | 22 582 – 22 647 | 0.78 – 0.79 |
+| verify | one signature under a key parsed once outside the loop (`LiftedPublicKey` + `verifyLifted` / `xonly_pubkey_parse` + `schnorrsig_verify`) | 35 374 – 35 580 | 35 200 – 35 561 | 0.99 – 1.01 |
+| verifyBatch | per signature, 64-signature batch (ours only) | ~39 000 | — | — |
 
-Earlier the same day the reference side read 33.3–35.8 µs for verify (ratio 1.16–1.25 for our 40.4–41.9 µs), so the verify ratio's spread is mostly the host's.
+Before k256's weak-field change, the same day: verify 41 412 – 41 786 ns against 36 141 – 37 110 (1.12 – 1.16×), keypair 0.68 – 0.71×, sign 0.69 – 0.77×. Earlier the same day the reference side read 33.3–35.8 µs for verify (ratio 1.16–1.25 for our 40.4–41.9 µs), so the verify ratio's spread is mostly the host's.
 
 Baseline before this work (same host, same day): keypair 27.3 µs (1.33×), sign 82.1 µs (3.58×, with the then-mandatory self-verify), verify 52.7 µs (1.44×, lifting the key on every call). What moved it:
 
@@ -323,10 +323,11 @@ Baseline before this work (same host, same day): keypair 27.3 µs (1.33×), sign
 - **k256, limb-level Zig field multiply, inlined**, instead of the asm block with a `memory` clobber: verify 52.8 → 41.9 µs.
 - **k256, integer GLV split + zero-run wNAF**, **bip340, integer `s`/`−e` in verify**, **`verifyLifted`**: verify 41.9 → ~40.4 µs.
 - Tried and dropped: a product-scanning (Comba) multiply (40.2 vs 40.4 µs, inside the noise).
+- **k256, weak field elements in `ecmult` + libsecp256k1's doubling** (later 2026-11-13): the verifier's double-base multiply keeps field values `< 2^256` instead of `< p` between operations (add/sub fold only the carry out of 2^256; the multiply skips its canonicalising select), and doubles with `gej_double` (3M + 4S, six additions + one halving, instead of 2M + 5S with eleven additions): verify 1.12–1.16× → 0.99–1.01×. A form with branches on the rare second folds measured 0.95–0.97× but added ~50 ctgrind contexts to `adaptor/presign` (its self-check verifies secret-derived values), so the shipped form masks them. A G window of 12 instead of 10 read 0.95× vs 0.97× in one pair of runs — inside the host's spread, not kept (it would quadruple the 32 KiB table).
 
 ## Backlog / deferred
 
-- **verify is 1.12–1.16× libsecp256k1 (P2 needs ≤ 1.1×), 2026-11-13.** Everything else is below 1.0. What remains is per-field-operation cost, not operation count: `ecmult` already has libsecp's shape (GLV + wNAF, P's table in one global-Z frame, an affine G table). The open levers, in k256: (1) lazily reduced field elements (libsecp's magnitude tracking), so add/sub skip the carry chain and masked select they pay now on canonical 4×64 limbs; (2) a wider G table — libsecp's default window is 15, ours 10 (~7 fewer mixed additions per verify, ~5 % by operation count; w = 12 had measured +0.6 % before the field changes, re-measure now); (3) the limb multiply's codegen (~1 300 instructions for one Jacobian doubling, ~2× a hand-scheduled MULX/ADX body without a memory clobber).
+- **verify 0.99–1.01× libsecp256k1 since 2026-11-13** (was 1.12–1.16×; P2 met, every row ≤ 1.1×). Left, all in k256: the masked second folds of the weak form cost ~4 % against a branching form (rejected for its ctgrind contexts, see § Performance); a wider G table (libsecp's window 15, ours 10; 12 was inside the noise); the limb multiply's instruction count (~2× a hand-scheduled MULX/ADX body).
 
 - **Reviewed 2026-10-08** (line-by-line review of the current `src/`, after the 2026-10-07
   speed work: `signWithKeyPair`, the multi-base `verifyBatch`, `affineCoordinatesPublic` in
