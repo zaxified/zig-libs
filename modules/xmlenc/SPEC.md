@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-03 · mutation 2026-09-03 · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, XMLENC_FUZZ) · ct none
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, XMLENC_FUZZ) · panic 2026-11-13 (sweep of every pub entry point: `decryptDataToDocument` use-after-free, its element cap, heap-stack CipherValue walk) · ct 2026-11-13 (ctgrind: RSA secret members tainted for rsa-oaep-mgf1p + GCM / CBC and rsa-1_5 + GCM, KEK tainted for kw-aes256 + GCM; no xmlenc-own context except the CBC plaintext length; the rsa-1_5 extraction loop was compiled to a secret-dependent branch and is fixed; oaep 5 / cbc 16 / rsa15 3 / kw 3 in-file, itemised in scripts/checks/ctgrind-expected.tsv)
 
 **Performance:** not measured
 
@@ -224,14 +224,31 @@ strings.)
   an early `return error`); and the mask helpers, exhaustively over all 65 536
   byte pairs plus a boundary table for the `usize` forms. The helpers are
   load-bearing — a wrong mask turns the RFC 8017 §7.2.2 teeth tests red.
-- *NOT verified:* that the emitted machine code is branch-free. **No test in this
-  repo measures timing**, and none can: a unit test cannot see a conditional
+- *Measured 2026-11-13 (ctgrind, `src/ctgrind_harness.zig`, ReleaseFast, key / KEK
+  tainted, `decryptData` driven end to end; rows in `scripts/checks/ctgrind-expected.tsv`):*
+  - `oaep` 5 in-file: rsa `privateOpCrtPtr` F3 fault-check verdict (1), rsa
+    `decryptOaepHNoFailUnburned` `if (valid == 1)` (2) and its `msg_len` memcpy (1),
+    aesgcm tag verdict (1). **No xmlenc context.** ⚠ The two rsa OAEP contexts are the
+    `decryptOaepHNoFail` verdict branch (`rsa/root.zig:2028-2029`): "no fail" means no
+    error VALUE, not no observable verdict. xmlenc relies on it only for the decoy-CEK
+    countermeasure (work equal on both outcomes); the branch itself is rsa's to close.
+  - `cbc` 16: the same four rsa contexts, `aescbc.unpadXmlEnc` verdict, and xmlenc's
+    `aesCbcDecrypt` `alloc(plain_len)` / `memcpy(plain_len)` — the plaintext LENGTH, which
+    the API returns to the caller by contract.
+  - `rsa15` 3: rsa F3 verdict, xmlenc `rsaPkcs1v15Unwrap`'s `if (good == 0)` (the one
+    accept/reject branch above), aesgcm tag verdict. **It read 4 before 2026-11-13:** the
+    masked message-extraction loop (`ctEqMaskUsize(s, sep_idx)`) was lowered by LLVM to a
+    branch on the separator position although the source has none — exactly the compiler
+    risk named in the next bullet. A `blackBox` asm barrier on the mask fixed it
+    (measured, 4 -> 3); the ctgrind row is the regression test.
+  - `kw` 3: aeskw integrity-check verdict, aesgcm tag verdict (accept and reject).
+- *Still NOT verified:* that the emitted machine code is branch-free **on other targets,
+  Zig versions and optimize modes** (the rows are x86-64, Zig 0.17.1, ReleaseFast). No
+  unit test in this repo measures timing, and none can: a unit test cannot see a conditional
   move, cannot time a cache miss, and cannot prevent a future compiler from
-  lowering the mask arithmetic into a branch. `std.crypto.timing_safe.classify`
-  (valgrind/ctgrind) and a dudect-style statistical harness are the tools that
-  would close this; neither is wired into this repo, and `classify` is a silent
-  no-op without valgrind. Treat the constant-time property as *argued from the
-  source, not measured*.
+  lowering the mask arithmetic into a branch. The ctgrind lane (valgrind, above) is the
+  measurement; a dudect-style statistical timing harness is not wired into this repo.
+  Outside the measured configuration, treat the property as *argued from the source*.
 - The residual risk is therefore compiler-dependent, which is one more reason
   `allow_weak_rsa15` stays off by default. Migrating the IdP off `rsa-1_5`
   remains the only complete answer.

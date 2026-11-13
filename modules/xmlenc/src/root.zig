@@ -576,7 +576,7 @@ fn rsaPkcs1v15Unwrap(sk: *const rsa.SecretKey, wrapped: []const u8, out: *[64]u8
     defer std.crypto.secureZero(u8, &msg_buf);
     var s: usize = 2;
     while (s + 1 < em.len) : (s += 1) {
-        const m: u8 = @truncate(ctEqMaskUsize(s, sep_idx));
+        const m: u8 = @truncate(blackBox(ctEqMaskUsize(s, sep_idx)));
         const take = @min(em.len - s - 1, msg_buf.len);
         for (msg_buf[0..take], em[s + 1 ..][0..take]) |*o, v| o.* |= v & m;
     }
@@ -917,6 +917,19 @@ fn ctEqByteMask(a: u8, b: u8) usize {
 
 /// All-ones iff `a == b`, all-zeros otherwise. Branch-free (`rsa`'s, the one copy).
 const ctEqMaskUsize = rsa.ctEqMaskUsize;
+
+/// Optimization barrier for a mask built from a secret. Without it LLVM can see
+/// that `ctEqMaskUsize` yields 0 or all-ones and lowers the masked accumulate in
+/// `rsaPkcs1v15Unwrap`'s extraction loop to `if (s == sep_idx) { ... }`: a branch
+/// on the padding-separator position, measured under valgrind (ctgrind row
+/// `xmlenc/rsa15`, `rsaPkcs1v15Unwrap` line of the `ctEqMaskUsize(s, sep_idx)`
+/// call, 2026-11-13) although the source has none.
+inline fn blackBox(x: usize) usize {
+    return asm volatile (""
+        : [ret] "=r" (-> usize),
+        : [x] "0" (x),
+    );
+}
 
 /// All-ones iff `a >= b` (unsigned), all-zeros otherwise. Branch-free.
 fn ctGeMaskUsize(a: usize, b: usize) usize {

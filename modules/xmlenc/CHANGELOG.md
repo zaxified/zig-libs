@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — ctgrind harness (`src/ctgrind_harness.zig`; rows `oaep`, `cbc`, `rsa15`, `kw`) and one fix it found: `rsaPkcs1v15Unwrap`'s masked message-extraction loop was lowered by LLVM to a branch on the padding-separator position (the `rsa15` row read 4 in-file contexts, 3 after an asm barrier on the mask). No behavioural change. The rows and their per-context attribution are in `SPEC.md` § Constant-time posture.
+
 - **2026-11-13** — **Public API change** (no in-repo importer affected: `saml` uses `decryptData` / `decryptAssertion`) and two fixes from the 2026-11-13 no-panic sweep (XEN-1..3).
   - **XEN-3 (HIGH, use-after-free):** `decryptDataToDocument` parsed the recovered plaintext and then freed it, but `xml.parse` borrows its input (every element/attribute slice and `Document.source`), so the returned tree pointed into freed memory (reading `root.local` of a 280 KB plaintext segfaulted). It now returns `DecryptedDocument { doc, plaintext }`; `deinit(alloc)` releases the tree, then wipes and frees the plaintext.
   - **XEN-2:** that parse used `xml`'s default element cap (1,048,576, ~350 MiB of tree) on attacker-chosen plaintext; new `Options.max_elements` (default 65,536).

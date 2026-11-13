@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-03 · mutation 2026-10-05 (24/25, 1 eq) · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, XMLDSIG_FUZZ) · ct none
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, XMLDSIG_FUZZ) · panic 2026-11-13 (sweep of every pub entry point: canonical-output cap against exclusive-C14N namespace re-rendering, O(1) rendered-namespace lookups, PrefixList cost per declaration) · ct n/a (public-key verification only: the key, document and signature are public; the one secret-adjacent buffer, a decrypted assertion canonicalized by `verify`, is wiped on release, not branched on)
 
 **Performance:** not measured
 
@@ -302,6 +302,8 @@ namespace; an RSA method with an EC key (`KeyAlgorithmMismatch`, not a quiet `fa
 **Equivalent:** `countByAttr`'s early exit at 3 instead of 2 (only "exactly one" matters).
 
 ## Backlog / deferred
+
+- **Sweep 2026-11-13 leftovers.** (1) Each of up to `max_references` references canonicalizes its whole target, so `verify` does up to 8 (saml: 1) full canonical passes per call; output is capped, work is linear per pass. (2) `max_c14n_output_len` is a byte bound on the output, not on the CPU of producing it; a document that stays under it can still take a few hundred ms per pass at 64 MiB. (3) A PrefixList token `xmlns` resolves to the reserved xmlns namespace and is rendered as `xmlns:xmlns=...` (pre-existing, unchanged; invalid input, not a crash).
 
 **Missing and it matters** *(survey 2026-09-30)*:
 

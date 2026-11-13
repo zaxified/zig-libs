@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-15 · mutation 2026-09-10 · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, SAML_FUZZ) · ct none
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, SAML_FUZZ) · panic 2026-11-13 (sweep of every pub entry point: saturating clock/skew arithmetic; the xmldsig canonical-output cap reaches it through `verify`; every Document-returning or Document-borrowing path checked for lifetime) · ct 2026-11-13 (ctgrind: SP RSA key signing, sign 45 in-file = 1 rsa verdict + 44 base64 of the public signature; the decryption path is xmlenc's row, see the harness header)
 
 **Performance:** not measured
 
@@ -782,6 +782,9 @@ integer-equality path. All RSA keys in these tests are test material only.
 **How it got there.** The anchoring work landed. DONE 9f9d238: genuine xmlsec1 EncryptedAssertion over the already-anchored signed one
 
 ## Backlog / deferred
+
+- **Pre-authentication canonical-output bound (sweep 2026-11-13).** `sigOptsFor` leaves `xmldsig.Options.max_c14n_output_len` at its 64 MiB default, so an unauthenticated Response can still make one reference canonicalize to ~64 MiB (arena growth ~3x) before the signature is checked, and `consumeArtifactResponseSoap` can return an enclosed message of that size. Bounded, no longer an OOM from ~160 KB of input; tightening it (a `Config` field, or a lower constant here) is a policy choice left open.
+- **ctgrind: decryption path not a row (2026-11-13).** Driven and measured (95 in-file, nearly all `xml.parse` on the recovered plaintext); deliberately not pinned, see `src/ctgrind_harness.zig`. The key-dependent work is `xmlenc`'s rows.
 
 Closed 2026-10-06 (were the three survey-2026-09-30 items): SP metadata generation
 (`buildSpMetadata`), more than one IdP verification key (`additional_idp_keys`), and the

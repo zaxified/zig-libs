@@ -2033,3 +2033,36 @@ webhooksig	ReleaseFast	verify	1	0	b6e6b8df5a7828b0	b517d0804f4a93d2
 webhooksig	ReleaseFast	sign	1	77	b6e6b8df5a7828b0	854ae236c5fea038
 webhooksig	ReleaseFast	keys	1	1	b6e6b8df5a7828b0	4fb3c2a0bf839a0e
 webhooksig	ReleaseFast	ed25519	1	30	b6e6b8df5a7828b0	0ddab6b90956b2fe
+# xmlenc, 2026-11-13 (sweep hB): the RSA private key (OAEP, v1.5), the KEK (kw-aes) and
+# through them the CEK, driven through `decryptData` on a real EncryptedData. NO context is
+# xmlenc's own except the CBC plaintext length. Every non-zero is attributed below (the
+# pattern is any `root.zig`, so the sibling modules' contexts count here):
+#   oaep 5   rsa privateOpCrtPtr:1286 (F3 fault-check verdict, 1) + rsa decryptOaepHNoFailUnburned
+#            :2028 `if (valid == 1)` (2) and its msg_len memcpy :2029 (1) -- rsa's own OAEP verdict,
+#            there is no rsa row for OAEP unpadding (follow-up for rsa) -- + aesgcm :1048 (the GCM
+#            tag verdict, the accept/reject the API discloses, 1).
+#   cbc 16   the same four rsa contexts + aescbc unpadXmlEnc :688 (verdict) + xmlenc aesCbcDecrypt
+#            :702 alloc(plain_len) and :706 memcpy(plain_len) -- the plaintext LENGTH, returned to
+#            the caller by contract -- and the memcpy-internal contexts of those two.
+#   rsa15 3  rsa privateOpCrtPtr (F3 verdict) + xmlenc rsaPkcs1v15Unwrap `if (good == 0)` (the one
+#            accept/reject branch, documented in its doc comment) + aesgcm tag verdict. It was 4:
+#            the masked extraction loop (`ctEqMaskUsize(s, sep_idx)`) was compiled to a branch on
+#            the separator position; an asm barrier (`blackBox`) fixed it, measured.
+#   kw 3     aeskw unwrapBody :171 (integrity-check verdict) + aesgcm tag verdict, accept and reject.
+xmlenc	ReleaseFast	oaep	1	5	57e15451cd55c988	b6a414715b391ccc
+xmlenc	ReleaseFast	cbc	1	16	57e15451cd55c988	cb2ee56c03b2b7a6
+xmlenc	ReleaseFast	rsa15	1	3	57e15451cd55c988	fcf38565ab1ce414
+xmlenc	ReleaseFast	kw	1	3	57e15451cd55c988	65e898b409f3bf26
+# saml, 2026-11-13 (sweep hB): the SP's RSA private key signing a LogoutRequest and a redirect
+# query string (`sign_with` / `buildSignedRedirectQuery`).
+#   sign 45  1 = rsa privateOpCrtPtr:1286 (the F3 fault-check verdict, rsa's own row) + 44 =
+#            saml `base64EncodeAlloc` (root.zig:3737, from signProtocolMessage:2315 and
+#            buildSignedRedirectQuery:2793): std's base64 encoder indexes its table with the
+#            bytes of the FINISHED SIGNATURE, a public value that is still marked undefined here
+#            because saml cannot declassify its own intermediate. Nothing in saml's own code
+#            branches on key material; the witness column is 0 for the same reason (a table
+#            lookup at a tainted index yields a defined byte).
+# The decryption path is deliberately not a row: see the harness header (the contexts there are
+# xml.parse on the recovered plaintext, which is the output, and the key-dependent work is
+# xmlenc's own rows).
+saml	ReleaseFast	sign	1	45	e05c0ebbb2d14f16	88075a41bcf0b2bb

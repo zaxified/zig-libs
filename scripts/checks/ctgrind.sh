@@ -339,6 +339,10 @@ declare -A TARGETS=(
     [jwe]="content kw ecdh pbes2 rsa"
     # ── 2026-11-13: webhooksig: HMAC secrets + signature compare, Standard Webhooks key text, Ed25519 whsk_ ──
     [webhooksig]="verify sign keys ed25519"
+    # ── 2026-11-13: xmlenc: RSA private key (OAEP, v1.5), KEK (kw-aes), CEK -> CBC/GCM content ──
+    [xmlenc]="oaep cbc rsa15 kw"
+    # ── 2026-11-13: saml: the SP RSA key signing a LogoutRequest / redirect query ──
+    [saml]="sign"
     # ── 2026-10-20: minisign: Ed25519 seed (sign), password + key (seal), password (open) ──
     [minisign]="sign seal open"
     # ── 2026-10-31: tls13: key schedule, kex per group (sharedSecret / serverExchange), CertificateVerify signers ──
@@ -435,6 +439,8 @@ declare -A MODES=(
     [jwt]="ReleaseFast"
     [jwe]="ReleaseFast"
     [webhooksig]="ReleaseFast"
+    [xmlenc]="ReleaseFast"
+    [saml]="ReleaseFast"
     [minisign]="ReleaseFast"
     [tls13]="ReleaseFast"
 )
@@ -856,6 +862,11 @@ declare -A PATTERN=(
     [webhooksig/sign]='root[.]zig|burn[.]zig'
     [webhooksig/keys]='root[.]zig|burn[.]zig'
     [webhooksig/ed25519]='root[.]zig|burn[.]zig'
+    [xmlenc/oaep]='root[.]zig|burn[.]zig'
+    [xmlenc/cbc]='root[.]zig|burn[.]zig'
+    [xmlenc/rsa15]='root[.]zig|burn[.]zig'
+    [xmlenc/kw]='root[.]zig|burn[.]zig'
+    [saml/sign]='root[.]zig|burn[.]zig'
     [minisign/sign]='root[.]zig|burn[.]zig|blake2b[.]zig'
     [minisign/seal]='root[.]zig|burn[.]zig|blake2b[.]zig'
     [minisign/open]='root[.]zig|burn[.]zig|blake2b[.]zig'
@@ -1200,6 +1211,11 @@ declare -A LABEL=(
     [webhooksig/sign]='webhooksig sign (every scheme, secret tainted; the public-MAC encoders are the count)'
     [webhooksig/keys]='webhooksig standard.decodeSecret + encodeSecret (whsec_ body tainted)'
     [webhooksig/ed25519]='webhooksig decodeSigningKey (both whsk_ layouts) + signEd25519 (seed tainted)'
+    [xmlenc/oaep]='xmlenc decryptData rsa-oaep-mgf1p + AES-256-GCM (rsa secret members tainted)'
+    [xmlenc/cbc]='xmlenc decryptData rsa-oaep-mgf1p + AES-128-CBC + XML-Enc unpad (rsa secret members tainted)'
+    [xmlenc/rsa15]='xmlenc decryptData rsa-1_5 + AES-256-GCM (rsa secret members tainted)'
+    [xmlenc/kw]='xmlenc decryptData kw-aes256 accept + reject (KEK tainted)'
+    [saml/sign]='saml buildLogoutRequest + buildSignedRedirectQuery RSA-SHA256 (SP rsa secret members tainted)'
     [minisign/sign]='minisign signDigest + signTrustedComment (Ed25519 seed tainted)'
     [minisign/seal]='minisign sealSecretKey (seed + password tainted)'
     [minisign/open]='minisign openSecretKey (password tainted)'
