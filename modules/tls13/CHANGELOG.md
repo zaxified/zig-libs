@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **HARDENING (error-set addition):** `certverify.SignError` gains `EntropyFailure` (rsa's bounded blinding draw gave up on a broken `random`); RSA-PSS signing returns it instead of hanging.
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog records the P1 rows after `ct25519` P9 (`cli_x25519` 1.24× aws-lc-rs, to re-measure quietly) and the deferred RSA-PSS AVX2 route.
 - **2026-11-01** — **Tests:** FFDHE delta mutation audit (55 mutants, 46 killed, 9 equivalent; card 123/142, A1 again): exact 64-draw limit and masked-first-byte acceptance in `generate`, `sharedSecret` reads only `xlen` bytes / `xbits` bits, base-2 Fermat check of p and q for all five RFC 7919 groups (the 4096/6144/8192 primes had no independent check); the `tls13-kex` fuzz harness covers ffdhe2048/3072 with aimed Y = 0, 1, p−1, p, >p damage.
 - **2026-11-01** — **Performance:** FFDHE key generation and the shared secret walk only the `xbits` (225..400) exponent bits through `montint`'s new `DynModint.powBits` instead of all `64·L` (8192 for ffdhe8192); still constant-time in the secret exponent, outputs and KATs unchanged.

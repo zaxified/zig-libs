@@ -124,6 +124,22 @@ test "blindWithFactor reproduces RFC 9474 Appendix A.4 blinded_msg + inv byte-ex
     try testing.expectEqual(@as(usize, 0), ctx.salt_len);
 }
 
+test "blindSign with a generator that only yields zeros is SigningFailure, not a hang (rsa BRSA-3)" {
+    const sk = try kat.secretKey();
+    const pk = try kat.publicKey();
+    const Zeros = struct {
+        draws: usize = 0,
+        fn fill(self: *@This(), buf: []u8) void {
+            @memset(buf, 0);
+            self.draws += 1;
+            if (self.draws > 10_000) @panic("unbounded blinding redraw loop");
+        }
+    };
+    var z = Zeros{};
+    var out: [blindrsa.max_modulus_len]u8 = undefined;
+    try testing.expectError(error.SigningFailure, blindrsa.blindSign(&sk, pk, std.Random.init(&z, Zeros.fill), &kat.a1.blinded_msg, &out));
+}
+
 test "blindSign reproduces RFC 9474 Appendix A.1 blind_sig byte-exact (SS7.2 internal blinding is output-invariant)" {
     const sk = try kat.secretKey();
     const pk = try kat.publicKey();

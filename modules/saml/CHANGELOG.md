@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** the RSA signing switches map rsa's new `error.EntropyFailure` (error-set addition upstream) to `SigningFailed`.
 - **2026-11-13** — **Hardening:** new `max_c14n_output_len` field on `Config`, `LogoutRequestConfig`, `LogoutResponseConfig` and `ArtifactResponseConfig` (default `default_max_c14n_output_len` = 4 MiB) passed to every `xmldsig.verify`; before, the pre-authentication POST path inherited xmldsig's 64 MiB canonical-output cap. Over-cap documents fail with `SignatureInvalid`. Tests: a ~5 MiB signed Response is refused by default and accepted with the cap raised.
 - **2026-11-13** — ctgrind harness (`src/ctgrind_harness.zig`, row `sign`: the SP RSA key signing a LogoutRequest and a redirect query). No code change.
 

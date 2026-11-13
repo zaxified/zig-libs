@@ -505,6 +505,11 @@ pub const SignError = BuildContentError || error{
     /// hardware fault or fault-injection attack was caught. Security event,
     /// never a benign size/config error.
     FaultDetected,
+    /// The caller's `random` (it also drives the RSA-CRT base blinding) failed
+    /// to deliver a usable blinding factor in a bounded number of draws (rsa
+    /// `error.EntropyFailure`): a broken or adversarial generator. No
+    /// signature is produced.
+    EntropyFailure,
 };
 
 /// Produces a CertificateVerify signature over the RFC 8446 §4.4.3 signed
@@ -656,6 +661,7 @@ fn signRsaPss(scheme: SignatureScheme, sk: *const rsa.SecretKey, content: []cons
         // signature is withheld. Propagate as a distinct security signal, not
         // a size error.
         error.FaultDetected => error.FaultDetected,
+        error.EntropyFailure => error.EntropyFailure,
     };
 }
 

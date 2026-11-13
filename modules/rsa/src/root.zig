@@ -941,6 +941,12 @@ pub const PrimitiveError = error{
     /// `m^e mod n` did not equal the input `c`, so at least one CRT half was
     /// faulted. The (potentially secret-leaking) result is withheld — audit F3.
     FaultDetected,
+    /// The blinding generator (`Blinding.csprng` / `.cached`) did not produce a
+    /// usable blinding factor within `max_blinding_draws` draws: it is broken
+    /// or adversarial (only zeros, only values >= n, ...). Nothing was
+    /// computed and nothing secret was released; use another generator, or
+    /// `Blinding.none` if masking is deliberately off.
+    EntropyFailure,
 };
 
 // Runtime-length (slice) cores. The `out` buffer must be exactly the modulus
@@ -1120,7 +1126,7 @@ pub const BlindingCache = struct {
     }
 
     /// The pair for this op: the cached one squared, or a fresh draw.
-    fn next(self: *BlindingCache, sk: *const SecretKey) void {
+    fn next(self: *BlindingCache, sk: *const SecretKey) error{EntropyFailure}!void {
         if (self.serves(sk)) {
             const P = &self.pair;
             P.rpe = sk.p_mont.sq(&P.rpe);
@@ -1128,7 +1134,7 @@ pub const BlindingCache = struct {
             P.rqe = sk.q_mont.sq(&P.rqe);
             P.rq_inv = sk.q_mont.sq(&P.rq_inv);
         } else {
-            self.pair = drawBlindingPair(sk, self.rng);
+            self.pair = try drawBlindingPair(sk, self.rng);
             const L = sk.n_mont.L;
             @memcpy(self.n[0..L], sk.n_mont.m[0..L]);
             self.n_limbs = L;
@@ -1162,7 +1168,7 @@ const BlindingPair = struct { rpe: MontElem, rqe: MontElem, rp_inv: MontElem, rq
 /// bound shortfall can produce a wrong unblinding; both just redraw — a
 /// decision about the random `r`, not about a secret. Still ~5 % of a
 /// 2048-bit op (2026-10-18), which `Blinding.cached` amortizes.
-fn drawBlindingPair(sk: *const SecretKey, rng: std.Random) BlindingPair {
+fn drawBlindingPair(sk: *const SecretKey, rng: std.Random) error{EntropyFailure}!BlindingPair {
     const n_len = sk.n_mont.byteLen();
     var e_be: [4]u8 = undefined;
     std.mem.writeInt(u32, &e_be, sk.publicExponent(), .big);
@@ -1171,11 +1177,24 @@ fn drawBlindingPair(sk: *const SecretKey, rng: std.Random) BlindingPair {
     one[0] = 1;
     const half_bits = @max(sk.p_mont.nbits, sk.q_mont.nbits);
 
-    while (true) {
+    // The top byte is masked to the bit length of `n` (public), so a draw is
+    // accepted with probability >= 1/2 even for a modulus whose top byte is
+    // 0x01 (bits = 8·n_len − 7, 513-bit keys are allowed).
+    const top_mask: u8 = @intCast(@as(u16, 0xff) >> @intCast(8 * n_len - sk.n_mont.nbits));
+
+    // At most `max_blinding_draws` draws: per draw the miss probability is
+    // <= 1/2 (rejection against `n` after the mask above; non-units and
+    // divstep shortfalls are ~2^-1023), so an honest generator exhausts
+    // the bound with probability <= 2^-128 — never in practice. A generator
+    // that only yields zeros or values >= n gets `error.EntropyFailure`
+    // instead of hanging every signing/decryption call above this one.
+    var draws: u32 = 0;
+    while (draws < max_blinding_draws) : (draws += 1) {
         // Uniform r in [1, n−1] by rejection sampling (>= n and 0 redraw).
         var r_raw: [max_modulus_len]u8 = undefined;
         defer std.crypto.secureZero(u8, r_raw[0..n_len]);
         rng.bytes(r_raw[0..n_len]);
+        r_raw[0] &= top_mask;
         var r_el = sk.n_mont.elemFromBytesBE(r_raw[0..n_len]) catch continue;
         defer std.crypto.secureZero(u64, &r_el);
         if (MontParams.isZero(&r_el)) continue;
@@ -1200,7 +1219,12 @@ fn drawBlindingPair(sk: *const SecretKey, rng: std.Random) BlindingPair {
         out.rqe = sk.q_mont.powPublic(&rq, e_s);
         return out;
     }
+    return error.EntropyFailure;
 }
+
+/// Draw bound of `drawBlindingPair` (miss probability per draw <= 1/2, so
+/// 2^-128 for an honest generator).
+const max_blinding_draws: u32 = 128;
 
 /// The blinding inverse's limb width matches montint's element exactly.
 const BlindInverter = safegcd.Inverter(@typeInfo(MontElem).array.len * 64);
@@ -1229,7 +1253,7 @@ fn privateOpCrtPtr(sk: *const SecretKey, in: []const u8, out: []u8, blinding: Bl
     switch (blinding) {
         .none => {},
         .csprng => |g| {
-            var b = drawBlindingPair(sk, g);
+            var b = try drawBlindingPair(sk, g);
             // Every field is a montint result: zero above its slot, so only
             // the slot limbs can hold a secret (wiping the 4 KiB struct byte
             // by byte cost ~1 µs at the 8192-bit capacity).
@@ -1240,7 +1264,7 @@ fn privateOpCrtPtr(sk: *const SecretKey, in: []const u8, out: []u8, blinding: Bl
             r_inv = .{ .p = b.rp_inv, .q = b.rq_inv };
         },
         .cached => |cache| {
-            cache.next(sk);
+            try cache.next(sk);
             cp = sk.p_mont.mul(&cp, &cache.pair.rpe);
             cq = sk.q_mont.mul(&cq, &cache.pair.rqe);
             r_inv = .{ .p = cache.pair.rp_inv, .q = cache.pair.rq_inv };
@@ -1513,7 +1537,7 @@ fn emsaPkcs1v15EncodeDigest(comptime Hash: type, digest: *const [Hash.digest_len
     em[em.len - Hash.digest_length ..][0..Hash.digest_length].* = digest.*;
 }
 
-pub const SignPkcs1v15Error = EmsaEncodeError || error{ BufferTooSmall, FaultDetected };
+pub const SignPkcs1v15Error = EmsaEncodeError || error{ BufferTooSmall, FaultDetected, EntropyFailure };
 
 /// Sign `msg` with EMSA-PKCS1-v1_5 encoding (RFC 8017 §9.2) + the RSASP1
 /// signature primitive (§8.2.1). `out` must be at least as long as the
@@ -1572,6 +1596,7 @@ noinline fn signPkcs1v15DigestUnburned(sk: *const SecretKey, comptime Hash: type
     privateOpCrtPtr(sk, em, out[0..k], blinding) catch |err| switch (err) {
         error.MessageRepresentativeOutOfRange => unreachable,
         error.FaultDetected => return error.FaultDetected,
+        error.EntropyFailure => return error.EntropyFailure,
     };
     return out[0..k];
 }
@@ -2103,7 +2128,7 @@ fn emsaPssEncodeDigest(comptime Hash: type, comptime MgfHash: type, m_hash: *con
     em[em_len - 1] = 0xbc; // step 12: trailer field.
 }
 
-pub const SignPssError = EmsaEncodeError || error{ BufferTooSmall, FaultDetected };
+pub const SignPssError = EmsaEncodeError || error{ BufferTooSmall, FaultDetected, EntropyFailure };
 
 /// Sign `msg` with RSASSA-PSS (RFC 8017 §8.1.1): EMSA-PSS-ENCODE (§9.1.1)
 /// over emBits = modBits - 1, then the RSASP1 signature primitive (CRT fast
@@ -2167,6 +2192,7 @@ noinline fn signPssDigestUnburned(sk: *const SecretKey, comptime Hash: type, com
     privateOpCrtPtr(sk, em_buf[0..k], out[0..k], .{ .csprng = random }) catch |err| switch (err) {
         error.MessageRepresentativeOutOfRange => unreachable,
         error.FaultDetected => return error.FaultDetected,
+        error.EntropyFailure => return error.EntropyFailure,
     };
     return out[0..k];
 }

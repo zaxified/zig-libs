@@ -571,7 +571,8 @@ pub const BlindSignError = error{
 /// masked big-int Euclid for `b⁻¹`; `rsa` does it in the CRT domain on
 /// montint (two half-size constant-time safegcd inverses, interleaved).
 /// A generator that can never produce a usable `b` (all zeros, or only
-/// values `>= n`) makes the draw loop forever, as before; one that keeps
+/// values `>= n`) ends in `error.SigningFailure` (`rsa`'s
+/// `error.EntropyFailure` after 128 draws) instead of hanging; one that keeps
 /// producing a multiple of `p` or `q` — a party who knows the factors — did
 /// stop after four draws and now does not.
 ///
@@ -618,6 +619,8 @@ pub fn blindSign(
     const s_bytes = rsa.rsadpCrtBlinded(max_modulus_len, m_bytes, sk, .{ .csprng = random }) catch |err| switch (err) {
         error.MessageRepresentativeOutOfRange => return error.InvalidBlindedMessage,
         error.FaultDetected => return error.SigningFailure,
+        // A broken/adversarial `random` never yielded a usable blinding factor.
+        error.EntropyFailure => return error.SigningFailure,
     };
 
     // Step 3: mandatory self-check RSAVP1(pk, s) == m — fail closed. It is

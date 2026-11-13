@@ -336,3 +336,134 @@ test "BlindingCache: a shorter key whose modulus equals the cached one in its lo
         try std.testing.expectEqualSlices(u8, &m48, &got);
     }
 }
+
+/// A generator that always writes `fill_byte`; counts the modulus-length
+/// draws and panics past 10_000 so an unbounded redraw loop fails fast.
+const StuckRandom = struct {
+    fill_byte: u8,
+    n_len: usize,
+    draws: usize = 0,
+    fn fill(self: *StuckRandom, buf: []u8) void {
+        @memset(buf, self.fill_byte);
+        if (buf.len != self.n_len) return;
+        self.draws += 1;
+        if (self.draws > 10_000) @panic("drawBlindingPair: unbounded redraw loop");
+    }
+    fn random(self: *StuckRandom) std.Random {
+        return std.Random.init(self, fill);
+    }
+};
+
+test "a blinding generator that only yields zeros or values >= n is error.EntropyFailure after 128 draws, on every blinded entry (sweep BRSA-3)" {
+    var kp = try testKey();
+    defer kp.secret_key.deinit();
+    const sk = &kp.secret_key;
+    const k = 64;
+    var c: [k]u8 = @splat(0);
+    c[k - 1] = 0x2a;
+    // 0x00: r == 0; 0xff: r >= n (the top byte is masked to n's bit length,
+    // so all-ones is still >= n).
+    for ([_]u8{ 0x00, 0xff }) |byte| {
+        var g = StuckRandom{ .fill_byte = byte, .n_len = k };
+        try std.testing.expectError(error.EntropyFailure, rsa.rsadpCrtBlinded(k, c, sk, .{ .csprng = g.random() }));
+        try std.testing.expectEqual(@as(usize, 128), g.draws);
+
+        var g2 = StuckRandom{ .fill_byte = byte, .n_len = k };
+        var cache = rsa.BlindingCache.init(g2.random());
+        defer cache.deinit();
+        try std.testing.expectError(error.EntropyFailure, rsa.rsadpCrtBlinded(k, c, sk, .{ .cached = &cache }));
+        try std.testing.expectEqual(@as(usize, 128), g2.draws);
+
+        var g3 = StuckRandom{ .fill_byte = byte, .n_len = k };
+        var sig: [k]u8 = undefined;
+        try std.testing.expectError(error.EntropyFailure, rsa.signPss(sk, std.crypto.hash.sha2.Sha256, g3.random(), "m", 8, &sig));
+        try std.testing.expectEqual(@as(usize, 128), g3.draws); // the salt draw is shorter than n_len
+
+        var g4 = StuckRandom{ .fill_byte = byte, .n_len = k };
+        try std.testing.expectError(error.EntropyFailure, rsa.signPkcs1v15Blinded(sk, std.crypto.hash.sha2.Sha256, .{ .csprng = g4.random() }, "m", &sig));
+        try std.testing.expectEqual(@as(usize, 128), g4.draws);
+    }
+}
+
+test "a failed draw leaves a BlindingCache usable once the generator recovers (sweep BRSA-3)" {
+    var kp = try testKey();
+    defer kp.secret_key.deinit();
+    const sk = &kp.secret_key;
+    const k = 64;
+    var c: [k]u8 = @splat(0);
+    c[k - 1] = 0x2a;
+    // 200 stuck draws, then the real generator.
+    const Recovering = struct {
+        inner: std.Random,
+        stuck_left: usize,
+        fn fill(self: *@This(), buf: []u8) void {
+            if (self.stuck_left > 0) {
+                self.stuck_left -= 1;
+                @memset(buf, 0);
+                return;
+            }
+            self.inner.bytes(buf);
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(0x3b5a);
+    var rec = Recovering{ .inner = prng.random(), .stuck_left = 200 };
+    var cache = rsa.BlindingCache.init(std.Random.init(&rec, Recovering.fill));
+    defer cache.deinit();
+    try std.testing.expectError(error.EntropyFailure, rsa.rsadpCrtBlinded(k, c, sk, .{ .cached = &cache }));
+    try std.testing.expectEqual(@as(usize, 72), rec.stuck_left);
+    // The next op consumes the 72 remaining zero draws, then succeeds.
+    const want = try rsa.rsadpCrt(k, c, sk);
+    const got = try rsa.rsadpCrtBlinded(k, c, sk, .{ .cached = &cache });
+    try std.testing.expectEqualSlices(u8, &want, &got);
+}
+
+test "an honest generator never hits the draw bound, even for a modulus whose top byte is small (sweep BRSA-3)" {
+    // 514-bit key: n_len = 65, top byte 0x02 or 0x03. Without masking the
+    // draw to n's bit length only ~1/128 of the draws would be < n and 128
+    // draws would fail about a third of the time.
+    var prng = std.Random.DefaultPrng.init(0x5eed_514);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 514, 65537);
+    defer kp.secret_key.deinit();
+    const sk = &kp.secret_key;
+    const k = 65;
+    var c: [k]u8 = @splat(0);
+    c[k - 1] = 0x2a;
+    const want = try rsa.rsadpCrt(k, c, sk);
+    for (0..60) |_| {
+        const got = try rsa.rsadpCrtBlinded(k, c, sk, .{ .csprng = prng.random() });
+        try std.testing.expectEqualSlices(u8, &want, &got);
+    }
+}
+
+test "a failed draw does not make an exhausted BlindingCache pair look fresh: the next op redraws (sweep BRSA-3)" {
+    var kp = try testKey();
+    defer kp.secret_key.deinit();
+    const sk = &kp.secret_key;
+    const k = 64;
+    var c: [k]u8 = @splat(0);
+    c[k - 1] = 0x2a;
+    const Switch = struct {
+        inner: std.Random,
+        stuck: bool = false,
+        draws: usize = 0,
+        fn fill(self: *@This(), buf: []u8) void {
+            if (buf.len == k and !self.stuck) self.draws += 1;
+            if (self.stuck) @memset(buf, 0) else self.inner.bytes(buf);
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(0x3b5b);
+    var sw = Switch{ .inner = prng.random() };
+    var cache = rsa.BlindingCache.init(std.Random.init(&sw, Switch.fill));
+    defer cache.deinit();
+    // refresh_every ops use up the pair (one draw), `left` is then 0.
+    for (0..rsa.BlindingCache.refresh_every) |_| _ = try rsa.rsadpCrtBlinded(k, c, sk, .{ .cached = &cache });
+    try std.testing.expectEqual(@as(usize, 1), sw.draws);
+    sw.stuck = true;
+    try std.testing.expectError(error.EntropyFailure, rsa.rsadpCrtBlinded(k, c, sk, .{ .cached = &cache }));
+    sw.stuck = false;
+    sw.draws = 0;
+    _ = try rsa.rsadpCrtBlinded(k, c, sk, .{ .cached = &cache });
+    // The exhausted pair must not be served again: a fresh draw happened.
+    try std.testing.expect(sw.draws >= 1);
+}
