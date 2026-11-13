@@ -1625,9 +1625,9 @@ base32	ReleaseFast	decode	1	8	94eac68bddeb9560	4b6a48f852c57125
 # the t == 0 verdict 2; client 8 = hashToGroup rejectIdentity 2 + the blind
 # canonical-scalar verdict 3 + the blind == 0 verdict 3; keygen 3 = the
 # constant-time skS == 0 verdict per mode.
-voprf	ReleaseFast	server	1	5	cce3ae18c22a56ce	985a5bcd0456a35f
-voprf	ReleaseFast	client	1	8	cce3ae18c22a56ce	82e99d9133134c5f
-voprf	ReleaseFast	keygen	1	3	cce3ae18c22a56ce	f2504d3c494735f2
+voprf	ReleaseFast	server	1	5	4fd6d92d7f780cd2	985a5bcd0456a35f
+voprf	ReleaseFast	client	1	8	4fd6d92d7f780cd2	82e99d9133134c5f
+voprf	ReleaseFast	keygen	1	3	4fd6d92d7f780cd2	f2504d3c494735f2
 # voprf (2026-11-13): the protocol code moved from root.zig into protocol.zig/groups.zig/h2c.zig
 # (every RFC 9497 suite through one generic layer); PATTERN widened to those files. The three
 # ristretto255 rows above kept their counts (5/8/3, same contexts, same out digests).
@@ -1637,42 +1637,47 @@ voprf	ReleaseFast	keygen	1	3	cce3ae18c22a56ce	f2504d3c494735f2
 #                 (decaf448, p256; p384/p521 range checks are branch-free),
 #                 hashToGroup identity verdict x2, unblind `blind == 0` verdict x3;
 #                 keygen: DeriveKeyPair `skS == 0` verdict x3 (one per mode).
-#   decaf448    - SIBLING contexts, removed by the ed448 fix of `field.zig:553` `Fe.ctSelect`
-#                 (mask from an unlaundered bool -> a jump): groups.zig encode (decaf448
-#                 Element.encode: ctSelect + `field.zig:473` invert's zero verdict), 17+17 server
-#                 (every element the prover encodes, incl. the tainted evaluated elements and
-#                 composites), 3+3 client (the SECRET unblinded element), 3+3 keygen (pkS);
-#                 groups.zig hashToGroup (decaf448 oneWayMap of the PRIVATE input): ctSelect 12,
-#                 `field.zig:160` fromBytes canonical verdict 4, element.zig 4; groups.zig
-#                 mulPublic identity verdict on the (public, wire) composite terms 2.
-#   p256        - SIBLING: `group.zig:435` isBasePointRepr short-circuit on the multiplied point
-#                 (2 server, 2 client + 1), removed by the p256 fix; `group.zig:567/694` mulInto's
-#                 laundered identity verdict (9+3 server, 5 client, 3 keygen) - the documented
-#                 "verdict the error reveals anyway"; std `pcurves/common.zig:74` / p256
-#                 `field.zig:384` fromBytes canonical-range verdicts on values that always pass
-#                 (voprf `sc` scalar decode 12+2 server, 3+3 client; h2c reduceHalves 4+4 server,
-#                 4+4 client, 3+3 keygen); server: mulPublic is p256's VARIABLE-TIME multiply on
-#                 the composite scalars `di`, which are hashes of the (public, wire) blinded and
-#                 evaluated elements - tainted only because the harness taints skS; 13 contexts
-#                 in p256 group.zig:7xx-10xx (wNAF digits) + 1 at group.zig:0.
+#   decaf448    - since the ed448 fix of `Fe.ctSelect` (mask from an unlaundered bool -> a jump;
+#                 laundered in main 2026-11-13, re-measured the same day: server 38 -> 21, client
+#                 34 -> 19, keygen 9 -> 6, every one of the removed contexts was that select):
+#                 groups.zig encode -> ed448 `field.zig:518` invert's zero verdict, 17 server (every
+#                 element the prover encodes), 3 client (the unblinded element), 3 keygen (pkS);
+#                 groups.zig hashToGroup (oneWayMap of the PRIVATE input): ed448 `field.zig:179`
+#                 fromBytes canonical verdict 4 + element.zig feFromBytesReduced 4 (client);
+#                 groups.zig mulPublic identity verdict on the (public, wire) composite terms 2.
+#   p256        - since the p256 fix of `group.zig` isBasePointRepr (short-circuit compare of the
+#                 multiplied point, 2 server + 2 client; branch-free in main 2026-11-13; server
+#                 61 -> 59, client 29 -> 27, keygen 12 unchanged): mulInto's laundered identity
+#                 verdict `group.zig:588` 9 server / 5 client, `group.zig:715` (comb) 3 server /
+#                 3 keygen - the documented "verdict the error reveals anyway"; std
+#                 `pcurves/common.zig:74` / p256 `field.zig:384` fromBytes canonical-range
+#                 verdicts on values that always pass (voprf `sc` scalar decode 12 server, 3
+#                 client; `sInvert` 2 server, 3 client; h2c reduceHalves 4+4 server, 4+4 client,
+#                 3+3 keygen); server: mulPublic is p256's VARIABLE-TIME multiply on the composite
+#                 scalars `di`, hashes of the (public, wire) blinded and evaluated elements -
+#                 tainted only because the harness taints skS; 23 contexts in p256
+#                 group.zig:7xx-11xx (computeWnaf 8, wnafPoint 4, mulPublic 3, mulPublicJac 2,
+#                 add 2, addMixed 2, toProjective 1, dbl 1).
 #   p384, p521  - server: the same variable-time mulPublic on the public composite scalars
 #                 (26 / 22 contexts in group.zig) + mulInto's laundered identity verdict 2;
 #                 client: identity verdict 2; p384 `field.zig:72` fromBytes canonical verdict in
-#                 h2c reduceHalves 4+4 (p521's fromBytes is branch-free). p521's own `Fe.cMov` is
-#                 a jump at ReleaseFast: h2c.zig selects with its own laundered mask instead
-#                 (8 client contexts before, 0 now).
-voprf	ReleaseFast	decaf448-server	1	38	cce3ae18c22a56ce	9543f02b1201b9cb
-voprf	ReleaseFast	decaf448-client	1	34	cce3ae18c22a56ce	969cd54fa62ca9e8
-voprf	ReleaseFast	decaf448-keygen	1	9	cce3ae18c22a56ce	d3f8144ee6d4be08
-voprf	ReleaseFast	p256-server	1	61	cce3ae18c22a56ce	6afdfb7a486b2a85
-voprf	ReleaseFast	p256-client	1	29	cce3ae18c22a56ce	5d8dfb2d4afe8974
-voprf	ReleaseFast	p256-keygen	1	12	cce3ae18c22a56ce	d26dc23c71b4c631
-voprf	ReleaseFast	p384-server	1	30	cce3ae18c22a56ce	5ed6c2e0c382fda2
-voprf	ReleaseFast	p384-client	1	15	cce3ae18c22a56ce	ff25c1410ee44fb9
-voprf	ReleaseFast	p384-keygen	1	3	cce3ae18c22a56ce	c65d6fb0102b9c90
-voprf	ReleaseFast	p521-server	1	26	cce3ae18c22a56ce	5a0178ab968c5fe9
-voprf	ReleaseFast	p521-client	1	7	cce3ae18c22a56ce	c519de5273b05353
-voprf	ReleaseFast	p521-keygen	1	3	cce3ae18c22a56ce	517083316574f2e7
+#                 h2c reduceHalves 4+4 (p521's fromBytes is branch-free). h2c.zig's `sel`: p521's
+#                 own `Fe.cMov` was a jump at ReleaseFast (8 client contexts) until p521 laundered
+#                 it (main 2026-11-13); h2c now uses the sibling's `Fe.cMov` for p256 and p521
+#                 (re-measured: every count unchanged) and keeps its own laundered byte select
+#                 for p384, whose `Fe.cMov` still builds its mask from the bare bit.
+voprf	ReleaseFast	decaf448-server	1	21	4fd6d92d7f780cd2	9543f02b1201b9cb
+voprf	ReleaseFast	decaf448-client	1	19	4fd6d92d7f780cd2	969cd54fa62ca9e8
+voprf	ReleaseFast	decaf448-keygen	1	6	4fd6d92d7f780cd2	d3f8144ee6d4be08
+voprf	ReleaseFast	p256-server	1	59	4fd6d92d7f780cd2	6afdfb7a486b2a85
+voprf	ReleaseFast	p256-client	1	27	4fd6d92d7f780cd2	5d8dfb2d4afe8974
+voprf	ReleaseFast	p256-keygen	1	12	4fd6d92d7f780cd2	d26dc23c71b4c631
+voprf	ReleaseFast	p384-server	1	30	4fd6d92d7f780cd2	5ed6c2e0c382fda2
+voprf	ReleaseFast	p384-client	1	15	4fd6d92d7f780cd2	ff25c1410ee44fb9
+voprf	ReleaseFast	p384-keygen	1	3	4fd6d92d7f780cd2	c65d6fb0102b9c90
+voprf	ReleaseFast	p521-server	1	26	4fd6d92d7f780cd2	5a0178ab968c5fe9
+voprf	ReleaseFast	p521-client	1	7	4fd6d92d7f780cd2	c519de5273b05353
+voprf	ReleaseFast	p521-keygen	1	3	4fd6d92d7f780cd2	517083316574f2e7
 # smtp (2026-10-10) — auth: the password through plainResponse/loginResponse
 # at three tail lengths. FIX: std.base64 indexed its alphabet by the secret
 # and checkCredential branched per byte: 312 -> 6. The 6 = the one

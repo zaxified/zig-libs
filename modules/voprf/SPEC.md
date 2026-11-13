@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-10-05 (21/25, 4 eq) · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, `voprf-verifiable` / `voprf-poprf` at `.scale` 10 = 20,000 runs, VOPRF_FUZZ; `voprf-decode-suites` added 2026-11-13, not yet driven) · ct 2026-11-13 (ctgrind ReleaseFast, 15 targets = 5 suites × server/client/keygen; ristretto255 `server` 5 / `client` 8 / `keygen` 3 in-file unchanged, single verdicts; decaf448 38/34/9 and p256 61/29/12 include SIBLING contexts — ed448 `Fe.ctSelect`, p256 `isBasePointRepr` — fixed in those modules, not here; p384 30/15/3, p521 26/7/3: verdicts plus the variable-time `mulPublic` on the public composite scalars; itemised in `scripts/checks/ctgrind-expected.tsv`) · panic 2026-11-13 (sweep of every pub entry point of all five suites: a batch of 2^16 + 1 elements or more overflowed the u16 composite index in the prover and the verifier, now `ProofGenerationFailed` / `InvalidProof` (`max_batch_length` = 2^16 - 1, RFC 9497 §2.2.1); `expandMessageXmd`'s DST contract is a checked `@panic`; non-canonical / zero secrets, hostile encodings and wiped per-role objects are total on every suite, `sweep_test.zig`) · input bounds 2026-11-13 (every `input`/`info` > 65535 bytes is `error.InputTooLong`, was an assert)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, `voprf-verifiable` / `voprf-poprf` at `.scale` 10 = 20,000 runs, VOPRF_FUZZ; `voprf-decode-suites` added 2026-11-13, not yet driven) · ct 2026-11-13 (ctgrind ReleaseFast, 15 targets = 5 suites × server/client/keygen; ristretto255 `server` 5 / `client` 8 / `keygen` 3 in-file unchanged, single verdicts; decaf448 21/19/6 and p256 59/27/12 since the sibling fixes (ed448 `Fe.ctSelect`, p256 `isBasePointRepr`; were 38/34/9 and 61/29/12), what remains is verdicts, the siblings' canonical-range decode verdicts on values that always pass, and on the server the variable-time `mulPublic` on the public composite scalars; p384 30/15/3, p521 26/7/3 the same; the NIST hash-to-curve selects with the siblings' laundered `Fe.cMov` (p256, p521) and its own laundered byte select for p384; itemised in `scripts/checks/ctgrind-expected.tsv`) · input bounds 2026-11-13 (every `input`/`info` > 65535 bytes is `error.InputTooLong`, was an assert) · panic 2026-11-13 (sweep of every pub entry point of all five suites: a batch of 2^16 + 1 elements or more overflowed the u16 composite index in the prover and the verifier, now `ProofGenerationFailed` / `InvalidProof` (`max_batch_length` = 2^16 - 1, RFC 9497 §2.2.1); `expandMessageXmd`'s DST contract is a checked `@panic`; non-canonical / zero secrets, hostile encodings and wiped per-role objects are total on every suite, `sweep_test.zig`) · input bounds 2026-11-13 (every `input`/`info` > 65535 bytes is `error.InputTooLong`, was an assert)
 **Performance:** not measured
 
 **Known defects:** none recorded
@@ -196,7 +196,9 @@ suite's `Ne`/`Nh`.
   is "the scalar is 0 mod n", voprf maps it to the identity element instead
   of an error, so no voprf API reports it. The NIST hash-to-curve treats the
   input as secret (it is the client's private input): `cMov` selects only,
-  no branch on `u` or any field value. Per-suite ctgrind rows: see
+  no branch on `u` or any field value — the sibling's `Fe.cMov` where it
+  launders its mask (p256; p521 since 2026-11-13), a local laundered byte
+  select for p384, whose `Fe.cMov` builds its mask from the bare bit. Per-suite ctgrind rows: see
   § Hardening below and `scripts/checks/ctgrind-expected.tsv`.
 
   PUBLIC scalars stay on std's `mul` on purpose: `verifyProof`'s `s`/`c`
@@ -315,6 +317,11 @@ input bound" (65536 refused, 65535 accepted, every entry point, two suites).
 - **Dead-stack probe for the new suites.** `stackprobe_test.zig` probes the
   ristretto255 entry points only; the other suites run under the same burns
   scaled ×2 (`groups.zig` `burn_scale`), not measured.
+- **zig-libs request: p384 — `Fe.cMov` builds its mask from the bare bit**
+  (2026-11-13). It measured clean under ctgrind, but p521's identical form
+  compiled to a jump on the bit at ReleaseFast, and p256/p521 now launder
+  theirs (`blackBox`). Until p384 does, `h2c.zig`'s `sel` keeps a laundered
+  byte select for p384 (`own_select`); then drop it.
 - **Performance of the NIST suites** — not measured (no bench); `powC1` in
   `sqrt_ratio` is a plain square-and-multiply (an addition chain would cut
   it), and the composite sums use one `mulPublic` per term instead of a
