@@ -368,8 +368,13 @@ pub const Point = struct {
     /// (`x = X*Z^-1`, `y = Y*Z^-1`), write `y` as little-endian 57 bytes
     /// (top byte always `0`), then copy `x`'s parity bit
     /// (`Fe.isOdd`) into the top bit of that final byte.
+    ///
+    /// Total: a `Point` with `z == 0` (not a point; only a caller building the
+    /// struct field by field, or running `add`/`dbl` on off-curve fields, can
+    /// make one) encodes as 57 zero bytes (`x = y = 0`) instead of trapping
+    /// (sweep E448-1). Every point this module produces has `z != 0`.
     pub fn toBytes(p: Point) [57]u8 {
-        const z_inv = p.z.invert() catch unreachable; // z is never 0 for a valid point
+        const z_inv = p.z.invert() catch Fe.zero;
         const x_affine = p.x.mul(z_inv);
         const y_affine = p.y.mul(z_inv);
         var out = @as([57]u8, @splat(0));
@@ -1087,6 +1092,14 @@ test "verify rejects S >= L in a Signature built field by field (RFC 8032 §5.2.
     var high = good.s;
     high[56] = 0x01;
     try std.testing.expectError(error.InvalidScalar, verify(.{ .r = good.r, .s = high }, "msg", "", kp.public_key));
+}
+
+test "Point.toBytes of a z = 0 Point is total (sweep E448-1)" {
+    const bad: Point = .{ .x = Fe.one, .y = Fe.one, .z = Fe.zero };
+    try std.testing.expectEqualSlices(u8, &(@as([57]u8, @splat(0))), &bad.toBytes());
+    // and a computed one: add() of two off-curve (0,0,0) fields stays at z = 0.
+    const zero_pt: Point = .{ .x = Fe.zero, .y = Fe.zero, .z = Fe.zero };
+    try std.testing.expectEqualSlices(u8, &(@as([57]u8, @splat(0))), &zero_pt.add(zero_pt).toBytes());
 }
 
 test "Point.equivalent tells P from -P" {

@@ -156,6 +156,12 @@ pub const Fe = struct {
     /// carry accumulation inside the arithmetic implementation
     /// (`reduceAfterFold` and friends), not part of the field value
     /// itself.
+    ///
+    /// CONTRACT (sweep E448-3): an `Fe` the caller builds field by field must
+    /// be weakly reduced (every limb `< 2^57`); build one only through
+    /// `fromBytes`, the constants and the arithmetic below. A larger limb
+    /// overflows the `u64`/`u128` accumulators (a safety panic in safe builds,
+    /// a wrong residue in unsafe ones; never memory-unsafe).
     limbs: [num_limbs]u64,
 
     /// The additive identity.
@@ -620,15 +626,23 @@ pub const Fe = struct {
     /// 56 random bytes from `io` until `fromBytes` accepts — same
     /// technique/rationale as `bls12_381.Fp.random`'s own doc comment
     /// (must NOT use a biased `bytes mod p` reduction over a same-width
-    /// sample). REAL: delegates entirely to `fromBytes`'s already-real
-    /// canonical check, no field arithmetic of its own.
+    /// sample). A draw is rejected with probability ~2^-224, so an honest
+    /// `io` never needs a second one. The loop is BOUNDED (`random_attempts`):
+    /// an `io` whose `random` is broken (constant `0xff`, say) would otherwise
+    /// hang the caller; after the bound the last draw is returned with its top
+    /// bit cleared (always `< 2^447 < p`, so canonical) — a defined, non-random
+    /// result for an `io` that was never random (sweep E448-2).
     pub fn random(io: std.Io) Fe {
         var buf: [encoded_bytes]u8 = undefined;
-        while (true) {
+        for (0..random_attempts) |_| {
             io.random(&buf);
             return Fe.fromBytes(buf) catch continue;
         }
+        buf[encoded_bytes - 1] &= 0x7f;
+        return Fe.fromBytes(buf) catch Fe.zero; // cannot fail: value < 2^447 < p
     }
+
+    const random_attempts = 64;
 };
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -930,4 +944,24 @@ test "sqrtRatio matches sqrt(u * v^-1), rejects non-squares" {
         v = v.square().sub(u);
     }
     try std.testing.expect(Fe.sqrtRatio(Fe.zero, Fe.one).?.isZero());
+}
+
+test "Fe.random with an io that never yields a canonical draw is bounded and canonical (sweep E448-2)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const Stuck = struct {
+        var vt: std.Io.VTable = undefined;
+        var calls: usize = 0;
+        fn onRandom(_: ?*anyopaque, buffer: []u8) void {
+            calls += 1;
+            if (calls > 100_000) @panic("Fe.random: unbounded redraw loop");
+            @memset(buffer, 0xff); // every draw is >= p
+        }
+    };
+    Stuck.vt = threaded.io().vtable.*;
+    Stuck.vt.random = Stuck.onRandom;
+    const io: std.Io = .{ .userdata = null, .vtable = &Stuck.vt };
+    const fe = Fe.random(io);
+    try std.testing.expectEqual(@as(usize, Fe.random_attempts), Stuck.calls);
+    _ = try Fe.fromBytes(fe.toBytes());
 }
