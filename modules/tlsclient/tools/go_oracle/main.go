@@ -581,9 +581,35 @@ func main() {
 	// resume: the second connection of two, through a session cache.
 	add(&ccase{id: "resume-13", family: "resume", twice: true, server: cfg(p256, nil)})
 	add(&ccase{id: "resume-13-alpn", family: "resume", twice: true, alpn: h2h1, server: cfg(p256, func(c *tls.Config) { c.NextProtos = h2h1 })})
-	add(&ccase{id: "resume-12", family: "resume", twice: true, expect: "gap",
-		why:    "TLS 1.2 session resumption not implemented (SPEC Backlog); Go resumes",
+	// TLS 1.2 (RFC 5077 tickets): the second connection resumes (Go's server
+	// line says res=1) -- ECDSA and RSA certificates, ALPN; a server that
+	// rejects the ticket (UnwrapSession: nil) or has tickets off gets a full
+	// handshake the second time too (res=0); a server that withdraws the ticket
+	// it announced (RFC 5077 section 3.3: a zero-length NewSessionTicket) leaves
+	// both clients with nothing to offer.
+	add(&ccase{id: "resume-12", family: "resume", twice: true,
 		server: cfg(p256, func(c *tls.Config) { c.MaxVersion = tls12 })})
+	add(&ccase{id: "resume-12-rsa", family: "resume", twice: true,
+		server: cfg(std("rsa2048"), func(c *tls.Config) { c.MaxVersion = tls12 })})
+	add(&ccase{id: "resume-12-alpn", family: "resume", twice: true, alpn: h2h1,
+		server: cfg(p256, func(c *tls.Config) { c.MaxVersion = tls12; c.NextProtos = h2h1 })})
+	add(&ccase{id: "resume-12-chacha20", family: "resume", twice: true,
+		server: cfg(p256, func(c *tls.Config) {
+			c.MaxVersion = tls12
+			c.CipherSuites = []uint16{tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256}
+		})})
+	add(&ccase{id: "resume-12-rejected", family: "resume", twice: true,
+		server: cfg(p256, func(c *tls.Config) {
+			c.MaxVersion = tls12
+			c.UnwrapSession = func([]byte, tls.ConnectionState) (*tls.SessionState, error) { return nil, nil }
+		})})
+	add(&ccase{id: "resume-12-withdrawn", family: "resume", twice: true,
+		server: cfg(p256, func(c *tls.Config) {
+			c.MaxVersion = tls12
+			c.WrapSession = func(tls.ConnectionState, *tls.SessionState) ([]byte, error) { return []byte{}, nil }
+		})})
+	add(&ccase{id: "resume-12-tickets-off", family: "resume", twice: true,
+		server: cfg(p256, func(c *tls.Config) { c.MaxVersion = tls12; c.SessionTicketsDisabled = true })})
 	add(&ccase{id: "resume-13-tickets-off", family: "resume", twice: true, server: cfg(p256, func(c *tls.Config) { c.SessionTicketsDisabled = true })})
 
 	// staple: an OCSP response and two SCTs stapled by the server.

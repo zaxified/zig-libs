@@ -262,9 +262,11 @@ pub const Options = struct {
     /// the view). An error aborts with `error.TlsConnectionRejected`.
     /// Requires `connection_info`.
     verify_connection: ?VerifyConnection = null,
-    /// TLS 1.3 session resumption (Go `ClientSessionCache`, also opt-in
-    /// there): tickets from this server name are kept here and offered back
-    /// as a PSK (psk_dhe_ke: a fresh ECDHE still runs; no 0-RTT). Needs
+    /// TLS 1.3 and TLS 1.2 session resumption (Go `ClientSessionCache`, also
+    /// opt-in there): tickets from this server name are kept here and offered
+    /// back -- in TLS 1.3 as a PSK (psk_dhe_ke: a fresh ECDHE still runs; no
+    /// 0-RTT), in TLS 1.2 in the SessionTicket extension (RFC 5077; the
+    /// abbreviated handshake, the cached master secret). Needs
     /// `host = .explicit` (the cache key). A resumed handshake has no
     /// Certificate message; the session view shows the chain kept with the
     /// ticket. Borrowed for the connection: the cache must outlive every
@@ -277,7 +279,7 @@ pub const Options = struct {
 
 // zig-libs tlsclient: the session view and the verification hook.
 
-/// TLS 1.3 resumption (Go `ClientSessionCache`): pass a cache as
+/// TLS 1.3 and 1.2 resumption (Go `ClientSessionCache`): pass a cache as
 /// `Options.session_cache`; see `session.zig`.
 pub const SessionCache = session.SessionCache;
 pub const ClientSession = session.ClientSession;
@@ -699,7 +701,31 @@ fn initIntoBody(out: *Client, input: *Reader, output: *Writer, options: Options)
     out.* = try initBody(input, output, options);
 }
 
+/// zig-libs tlsclient: TLS 1.2 resumption -- as Go does, a handshake that
+/// fails after a cached session was loaded (or a half-made entry reserved)
+/// throws that entry away: a ticket the server mishandles must not be
+/// offered again (RFC 5077 §3.2).
 fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client {
+    var track: u64 = 0;
+    return initBodyImpl(input, output, options, &track) catch |e| {
+        if (track != 0) if (options.session_cache) |cache| switch (options.host) {
+            .no_verification => {},
+            .explicit => |host| {
+                cache.acquire();
+                defer cache.release();
+                if (cache.find(host)) |en| if (en.generation == track) {
+                    _ = cache.drop(host);
+                };
+            },
+        };
+        return e;
+    };
+}
+
+fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) InitError!Client {
+    // zig-libs tlsclient: the handshake's `inline else` arms over the five
+    // ciphers outgrew the default comptime branch quota (TLS 1.2 resumption).
+    @setEvalBranchQuota(100_000);
     // zig-libs tlsclient: std asserted the input capacity (UB in
     // ReleaseFast) and met a too-small output only at the first record
     // (no-panic sweep 2026-10-28).
@@ -774,6 +800,31 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
     };
     defer if (offer) |*o| crypto.secureZero(u8, &o.psk);
     if (offer) |*o| hello_params.psk = .{ .identity = o.ticket(), .obfuscated_ticket_age = o.age, .binder_len = @intCast(o.hashLen()) };
+    // zig-libs tlsclient: TLS 1.2 resumption (Go `loadSession`): with a cache
+    // and TLS 1.2 on offer the SessionTicket extension is always sent -- the
+    // cached ticket when a session of this host is fresh and its suite is
+    // still offered, else empty ("I accept tickets") -- and the random
+    // session_id doubles as the marker a resuming server echoes (RFC 5077
+    // §3.4). An entry past its leaf's expiry is deleted.
+    const ticket_offered = options.session_cache != null and host.len != 0 and offer_12;
+    var offer12: ?ResumeOffer12 = null;
+    if (ticket_offered) {
+        const cache = options.session_cache.?;
+        cache.acquire();
+        defer cache.release();
+        if (cache.find(host)) |e| if (e.version12 and e.usable) {
+            if (!e.fresh12(now_ms)) {
+                _ = cache.drop(host);
+            } else if (resumableUnder(e, options.ca) and suiteOffered(e.suite12)) {
+                offer12 = .{ .entry = e, .generation = e.generation, .ticket_len = e.ticket_len, .suite = e.suite12, .ems = e.ems12, .group = e.group12 };
+                @memcpy(offer12.?.master[0..], e.resumption_secret[0..48]);
+                @memcpy(offer12.?.ticket_buf[0..e.ticket_len], e.ticket());
+                track.* = e.generation;
+            }
+        };
+    }
+    defer if (offer12) |*o| crypto.secureZero(u8, &o.master);
+    if (ticket_offered) hello_params.session_ticket = if (offer12) |*o| o.ticket() else "";
     var shares_buf: [supported_groups.len]hello.Share = undefined;
     // In TLS 1.2 only, no key_share is sent (RFC 8446 §4.2.8 is TLS 1.3's).
     const share_groups = if (options.max_version == .tls_1_3) options.key_share_groups else &.{};
@@ -869,6 +920,20 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
     var session_generation: u64 = 0;
     // zig-libs tlsclient: resumption state.
     var psk_accepted = false;
+    // zig-libs tlsclient: TLS 1.2 resumption state (RFC 5077): the server
+    // answered with a SessionTicket extension; the session was resumed
+    // (abbreviated handshake); its NewSessionTicket, copied out of the record
+    // buffer; the entry made at Certificate time for the new session.
+    var server_ticket_ext = false;
+    var resumed12 = false;
+    var ticket12_seen = false;
+    var ticket12_buf: [session.max_ticket_len]u8 = undefined;
+    var ticket12_len: usize = 0;
+    var ticket12_hint: u32 = 0;
+    var ticket12_stored = false;
+    var ticket12_withdrawn = false;
+    var entry12: ?*ClientSession = null;
+    var entry12_gen: u64 = 0;
     var saved_chain: [verify.max_chain_len][]const u8 = undefined;
     var saved_chain_len: usize = 0;
     var leaf_not_after: i64 = std.math.maxInt(i64);
@@ -998,6 +1063,11 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
             .change_cipher_spec => {
                 ctd.ensure(1) catch continue :fragment;
                 if (ctd.decode(tls.ChangeCipherSpecType) != .change_cipher_spec) return error.TlsIllegalParameter;
+                // zig-libs tlsclient: a server that announced a SessionTicket
+                // must send its NewSessionTicket first (RFC 5077 §3.3; Go
+                // reads it before the ChangeCipherSpec and fails otherwise).
+                if (tls_version == .tls_1_2 and server_ticket_ext and !ticket12_seen and pending_cipher_state == .application)
+                    return error.TlsUnexpectedMessage;
                 cipher_state = pending_cipher_state;
             },
             .handshake => while (true) {
@@ -1108,6 +1178,10 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         hello.ext_extended_master_secret => if (!is_hrr and options.extended_master_secret) {
                                             if (ext_size != 0) return error.TlsDecodeError;
                                             ems_negotiated = true;
+                                        },
+                                        // RFC 5077 §3.2: the server will send a NewSessionTicket.
+                                        hello.ext_session_ticket => if (!is_hrr) {
+                                            server_ticket_ext = true;
                                         },
                                         // RFC 5746 §3.4: on an initial handshake it must be empty.
                                         hello.ext_renegotiation_info => if (!is_hrr and options.renegotiation_info) {
@@ -1273,15 +1347,64 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 cipher_state = .handshake;
                                 handshake_state = .encrypted_extensions;
                             },
-                            .tls_1_2 => switch (cipher_suite_tag) {
-                                .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                                .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-                                .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-                                .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-                                .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-                                .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-                                => handshake_state = .certificate,
-                                else => return error.TlsIllegalParameter,
+                            .tls_1_2 => {
+                                // zig-libs tlsclient: Go's checks (handshake_client.go):
+                                // the server echoes the session_id only to resume a
+                                // session we offered -- our random id was never
+                                // anyone's (RFC 5077 §3.4) -- and a ticket it was
+                                // not asked for is refused.
+                                const echoed = mem.eql(u8, legacy_session_id_echo, &legacy_session_id);
+                                if (echoed and offer12 == null) return error.TlsIllegalParameter;
+                                if (server_ticket_ext and !ticket_offered) return error.TlsIllegalParameter;
+                                if (echoed) {
+                                    // Abbreviated handshake (RFC 5246 §7.3): the cached
+                                    // master secret keys the connection; same suite and
+                                    // the same extended-master-secret answer as the
+                                    // session's (RFC 7627 §5.3) or the server is wrong.
+                                    const o = &offer12.?;
+                                    if (@backingInt(cipher_suite_tag) != o.suite) return error.TlsIllegalParameter;
+                                    if (o.ems != ems_negotiated) return error.TlsIllegalParameter;
+                                    tls12_master = o.master;
+                                    if (o.group != 0) negotiated_group = @as(tls.NamedGroup, @fromBackingInt(o.group));
+                                    switch (handshake_cipher) {
+                                        inline else => |*p| {
+                                            const P = @TypeOf(p.*).A;
+                                            var key_block = hmacExpandLabel(
+                                                P.Hmac,
+                                                &o.master,
+                                                &.{ "key expansion", &server_hello_rand, &client_hello_rand },
+                                                @sizeOf(P.Tls_1_2),
+                                            );
+                                            defer crypto.secureZero(u8, &key_block);
+                                            p.version = .{ .tls_1_2 = .{
+                                                .expected_server_verify_data = hmacExpandLabel(
+                                                    P.Hmac,
+                                                    &o.master,
+                                                    &.{ "server finished", &p.transcript_hash.peek() },
+                                                    P.verify_data_length,
+                                                ),
+                                                .app_cipher = mem.bytesToValue(P.Tls_1_2, &key_block),
+                                            } };
+                                            if (ems_negotiated) exporter = .{ .tls12 = .{
+                                                .hash = hashKind(P.Hmac.mac_length),
+                                                .master = o.master,
+                                                .randoms = client_hello_rand ++ server_hello_rand,
+                                            } };
+                                        },
+                                    }
+                                    resumed12 = true;
+                                    pending_cipher_state = .application;
+                                    handshake_state = .finished;
+                                } else switch (cipher_suite_tag) {
+                                    .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                                    .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                                    .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+                                    .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                                    .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                                    .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                                    => handshake_state = .certificate,
+                                    else => return error.TlsIllegalParameter,
+                                }
                             },
                             else => return error.TlsIllegalParameter,
                         };
@@ -1417,6 +1540,27 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 try verify.verifyAgainstBundle(peer_chain[0..peer_chain_len], ca.bundle, now_sec);
                                 handshake_state = .trust_chain_established;
                             },
+                        }
+
+                        // zig-libs tlsclient: a server that will issue a TLS 1.2
+                        // ticket (it announced the extension): the entry for it
+                        // is made now, while the certificates' bytes still exist
+                        // (the plaintext records they sit in are overwritten by
+                        // the next reads); it becomes usable at the end of the
+                        // handshake, once the ticket is in.
+                        if (tls_version == .tls_1_2 and server_ticket_ext and ticket_offered) {
+                            const cache = options.session_cache.?;
+                            cache.acquire();
+                            defer cache.release();
+                            if (cache.reserve(host)) |e| {
+                                e.wipe();
+                                e.leaf_not_after_s = leaf_not_after;
+                                e.verification = verificationOf(options.ca);
+                                _ = e.setChain(saved_chain[0..saved_chain_len]);
+                                entry12 = e;
+                                entry12_gen = e.generation;
+                                track.* = e.generation;
+                            }
                         }
 
                         if (Certificate.Chain != void) {
@@ -1580,8 +1724,8 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         &client_hello_rand,
                                         &server_hello_rand,
                                     }, 48);
+                                tls12_master = master_secret;
                                 if (ems_negotiated) {
-                                    tls12_master = master_secret;
                                     exporter = .{ .tls12 = .{
                                         .hash = hashKind(P.Hmac.mac_length),
                                         .master = master_secret,
@@ -1623,7 +1767,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     .expected_server_verify_data = hmacExpandLabel(
                                         P.Hmac,
                                         &master_secret,
-                                        &.{ "server finished", &p.transcript_hash.finalResult() },
+                                        &.{ "server finished", &p.transcript_hash.peek() },
                                         P.verify_data_length,
                                     ),
                                     .app_cipher = mem.bytesToValue(P.Tls_1_2, &key_block),
@@ -1660,6 +1804,37 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         write_seq += 1;
                         pending_cipher_state = .application;
                         handshake_state = .finished;
+                    },
+                    // zig-libs tlsclient: TLS 1.2 NewSessionTicket (RFC 5077 §3.3),
+                    // after our Finished (a full handshake) or after the
+                    // ServerHello (a resumption), before the server's
+                    // ChangeCipherSpec, only when its ServerHello announced one.
+                    .new_session_ticket => {
+                        if (tls_version != .tls_1_2 or cipher_state != .cleartext or handshake_state != .finished) return error.TlsUnexpectedMessage;
+                        if (!server_ticket_ext or ticket12_seen) return error.TlsUnexpectedMessage;
+                        const t = tlsresume.ticket12.NewSessionTicket12.decode(hsd.rest()) catch return error.TlsDecodeError;
+                        ticket12_seen = true;
+                        ticket12_hint = t.lifetime_hint_s;
+                        if (t.isWithdrawal()) {
+                            ticket12_withdrawn = true;
+                        } else if (t.ticket.len <= session.max_ticket_len) {
+                            @memcpy(ticket12_buf[0..t.ticket.len], t.ticket);
+                            ticket12_len = t.ticket.len;
+                            ticket12_stored = true;
+                        }
+                        // The server's Finished covers this message.
+                        switch (handshake_cipher) {
+                            inline else => |*p| {
+                                const P = @TypeOf(p.*).A;
+                                p.transcript_hash.update(wrapped_handshake);
+                                p.version.tls_1_2.expected_server_verify_data = hmacExpandLabel(
+                                    P.Hmac,
+                                    &tls12_master,
+                                    &.{ "server finished", &p.transcript_hash.peek() },
+                                    P.verify_data_length,
+                                );
+                            },
+                        }
                     },
                     .certificate_verify => {
                         if (tls_version != .tls_1_3) return error.TlsUnexpectedMessage;
@@ -1772,6 +1947,9 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         // older connection on the same entry receives later would
                                         // be derived from the wrong secret (review F3, 2026-10-26).
                                         if (cache.reserve(host)) |e| {
+                                            // zig-libs tlsclient: a TLS 1.2 session of this host
+                                            // (its master secret) is replaced by this one.
+                                            if (!reuse) e.wipe();
                                             e.hash = hashKind(P.Hash.digest_length);
                                             @memcpy(e.resumption_secret[0..res.len], &res);
                                             if (!reuse) {
@@ -1810,6 +1988,31 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     const P = @TypeOf(p.*).A;
                                     try hsd.ensure(P.verify_data_length);
                                     if (!std.crypto.timing_safe.eql([P.verify_data_length]u8, pv.expected_server_verify_data, hsd.array(P.verify_data_length).*)) return error.TlsDecryptError;
+                                    if (resumed12) {
+                                        // zig-libs tlsclient: abbreviated handshake (RFC 5246
+                                        // §7.3): the server spoke first; now the view and the
+                                        // hook (Go's VerifyConnection runs on a resumption too),
+                                        // then our ChangeCipherSpec + Finished over the
+                                        // transcript through the server's.
+                                        p.transcript_hash.update(wrapped_handshake);
+                                        if (info) |ci| {
+                                            try copyKeptChain(ci, options.session_cache.?, offer12.?.entry, offer12.?.generation);
+                                            fillInfo(ci, tls_version, negotiated_suite, negotiated_group, alpn_selected, hrr_seen, ems_negotiated);
+                                            ci.did_resume = true;
+                                            if (options.verify_connection) |vc| vc.verify(vc.context, ci) catch return error.TlsConnectionRejected;
+                                        }
+                                        const verify_data = hmacExpandLabel(
+                                            P.Hmac,
+                                            &tls12_master,
+                                            &.{ "client finished", &p.transcript_hash.peek() },
+                                            P.verify_data_length,
+                                        );
+                                        const fin_record = finished12Record(P, pv, write_seq, &verify_data);
+                                        var fin_vec = [_][]const u8{ &client_change_cipher_spec_msg, &fin_record };
+                                        try output.writeVecAll(&fin_vec);
+                                        try output.flush();
+                                        write_seq += 1;
+                                    }
                                     break :app_cipher @unionInit(tls.ApplicationCipher, @tagName(tag), .{ .tls_1_2 = pv.app_cipher });
                                 },
                                 else => unreachable,
@@ -1817,7 +2020,38 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         };
                         if (info) |ci| {
                             fillInfo(ci, tls_version, negotiated_suite, negotiated_group, alpn_selected, hrr_seen, ems_negotiated);
-                            ci.did_resume = psk_accepted;
+                            ci.did_resume = psk_accepted or resumed12;
+                        }
+                        // zig-libs tlsclient: the TLS 1.2 session goes into the cache
+                        // (Go `saveSessionTicket`): a ticket seen, kept in the entry
+                        // made at Certificate time (full handshake) or in place
+                        // (resumption: same chain, new ticket, same master secret);
+                        // a withdrawal (RFC 5077 §3.3: empty ticket) removes the
+                        // entry. No NewSessionTicket: the cache is left alone.
+                        if (tls_version == .tls_1_2 and ticket_offered and ticket12_seen) {
+                            const cache = options.session_cache.?;
+                            cache.acquire();
+                            defer cache.release();
+                            const target: ?*ClientSession = if (resumed12) blk: {
+                                const o = &offer12.?;
+                                break :blk if (o.entry.generation == o.generation) o.entry else null;
+                            } else if (entry12) |e| (if (e.generation == entry12_gen) e else null) else null;
+                            if (ticket12_stored and target != null) {
+                                const e = target.?;
+                                @memset(e.resumption_secret[0..], 0);
+                                @memcpy(e.resumption_secret[0..48], &tls12_master);
+                                @memcpy(e.ticket_buf[0..ticket12_len], ticket12_buf[0..ticket12_len]);
+                                e.ticket_len = @intCast(ticket12_len);
+                                e.ticket_lifetime_s = ticket12_hint;
+                                e.received_ms = now_ms;
+                                e.version12 = true;
+                                e.suite12 = @backingInt(negotiated_suite);
+                                e.ems12 = ems_negotiated;
+                                e.group12 = if (negotiated_group) |g| @backingInt(g) else 0;
+                                e.usable = true;
+                            } else if (ticket12_withdrawn or (!resumed12 and !ticket12_stored)) {
+                                _ = cache.drop(host);
+                            }
                         }
                         if (options.ssl_key_log) |ssl_key_log| ssl_key_log.* = .{
                             .client_key_seq = key_seq,
@@ -1864,7 +2098,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             .hello_retry_request = hrr_seen,
                             .cipher_suite = negotiated_suite,
                             .exporter = exporter,
-                            .did_resume = psk_accepted,
+                            .did_resume = psk_accepted or resumed12,
                             .session_cache = options.session_cache,
                             .session_entry = session_entry,
                             .session_generation = session_generation,
@@ -1977,6 +2211,69 @@ const ResumeOffer = struct {
         };
     }
 };
+
+// ── zig-libs tlsclient: TLS 1.2 resumption helpers ───────────────────────
+
+/// A cached TLS 1.2 session copied out for one handshake (the master secret
+/// is a secret: zeroed when `init` ends).
+const ResumeOffer12 = struct {
+    entry: *ClientSession,
+    generation: u64,
+    master: [48]u8 = undefined,
+    ticket_buf: [session.max_ticket_len]u8 = undefined,
+    ticket_len: u16,
+    suite: u16,
+    ems: bool,
+    group: u16,
+
+    fn ticket(o: *const ResumeOffer12) []const u8 {
+        return o.ticket_buf[0..o.ticket_len];
+    }
+};
+
+/// Whether `suite` is in the ClientHello's cipher_suites (Go
+/// `mutualCipherSuite(hello.cipherSuites, session.cipherSuite)`).
+fn suiteOffered(suite: u16) bool {
+    var i: usize = 2; // past the u16 length
+    while (i + 2 <= cipher_suites.len) : (i += 2) {
+        if (mem.readInt(u16, cipher_suites[i..][0..2], .big) == suite) return true;
+    }
+    return false;
+}
+
+/// Our TLS 1.2 Finished record, encrypted under the connection's keys with
+/// sequence number `seq` (RFC 5246 §7.4.9, RFC 5288 §3 explicit nonce).
+fn finished12Record(comptime P: type, pv: anytype, seq: u64, verify_data: *const [P.verify_data_length]u8) [tls.record_header_len + P.record_iv_length + 4 + P.verify_data_length + P.mac_length]u8 {
+    var cleartext: [4 + P.verify_data_length]u8 = undefined;
+    cleartext[0] = @backingInt(tls.HandshakeType.finished);
+    mem.writeInt(u24, cleartext[1..4], P.verify_data_length, .big);
+    @memcpy(cleartext[4..], verify_data);
+    const nonce: [P.AEAD.nonce_length]u8 = nonce: {
+        const V = @Vector(P.AEAD.nonce_length, u8);
+        const pad = @as([P.AEAD.nonce_length - 8]u8, @splat(0));
+        const operand: V = pad ++ @as([8]u8, @bitCast(@byteSwap(seq)));
+        break :nonce @as(V, pv.app_cipher.client_write_IV ++ pv.app_cipher.client_salt) ^ operand;
+    };
+    var rec: [tls.record_header_len + P.record_iv_length + 4 + P.verify_data_length + P.mac_length]u8 = undefined;
+    rec[0] = @backingInt(tls.ContentType.handshake);
+    mem.writeInt(u16, rec[1..3], @backingInt(tls.ProtocolVersion.tls_1_2), .big);
+    mem.writeInt(u16, rec[3..5], rec.len - tls.record_header_len, .big);
+    @memcpy(rec[5..][0..P.record_iv_length], nonce[P.fixed_iv_length..]);
+    const body = 5 + P.record_iv_length;
+    var ad: [13]u8 = undefined;
+    mem.writeInt(u64, ad[0..8], seq, .big);
+    @memcpy(ad[8..11], rec[0..3]);
+    mem.writeInt(u16, ad[11..13], cleartext.len, .big);
+    P.AEAD.encrypt(
+        rec[body..][0..cleartext.len],
+        rec[rec.len - P.mac_length ..][0..P.mac_length],
+        &cleartext,
+        &ad,
+        nonce,
+        pv.app_cipher.client_write_key,
+    );
+    return rec;
+}
 
 fn hashKindOf(suite: tls.CipherSuite) HashKind {
     return switch (suite) {

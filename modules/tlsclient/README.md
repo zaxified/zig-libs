@@ -81,7 +81,7 @@ var client = try tls.Client.init(&r.interface, &w.interface, .{
     // or .client_auth_select = .{ .context = ctx, .select = pick }  (Go GetClientCertificate)
     .connection_info = &info,                           // Go ConnectionState
     .verify_connection = .{ .context = ctx, .verify = check }, // Go VerifyConnection
-    .session_cache = &cache,                            // TLS 1.3 resumption (Go ClientSessionCache)
+    .session_cache = &cache,                            // TLS 1.3 and 1.2 resumption (Go ClientSessionCache)
 });
 const proto = client.alpn_protocol;                     // ?[]const u8, one of ours
 var km: [32]u8 = undefined;
@@ -99,7 +99,14 @@ try client.exportKeyingMaterial("EXPERIMENTAL-my-proto", null, &km); // RFC 8446
   from the server's list. With no acceptable key an empty Certificate is sent
   (RFC 8446 §4.4.2.3) and the server decides.
 - **Resumption:** TLS 1.3 tickets, psk_dhe_ke (a fresh ECDHE still runs), no
-  0-RTT; not TLS 1.2. ECH is not supported (deferred).
+  0-RTT; and TLS 1.2 tickets (RFC 5077), as Go's client does them: the same
+  `session_cache` (one entry per server name) offers the cached ticket in the
+  SessionTicket extension, an echoed session_id means the abbreviated handshake
+  (server Finished first), `did_resume` is true and `verify_connection` runs;
+  a full handshake's NewSessionTicket replaces the entry, an empty one (a
+  withdrawal) or any failure after a session was offered drops it. Not by
+  server-assigned session IDs (Go does not either). Tickets over 2 KiB are not
+  cached. ECH is not supported (deferred).
 - **KeyUpdate:** answered when the server asks, and sent on our own after
   2^23 records.
 

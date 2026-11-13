@@ -59,6 +59,7 @@ test {
     _ = @import("stackprobe_test.zig");
     _ = @import("keygen.zig");
     _ = @import("hello.zig");
+    _ = @import("resume12_test.zig");
     _ = @import("session.zig");
     // The handshake path: analysed in full, so a patch that does not
     // compile cannot hide behind laziness.

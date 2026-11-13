@@ -22,6 +22,7 @@ const mem = std.mem;
 pub const ext_extended_master_secret: u16 = 23; // RFC 7627
 pub const ext_renegotiation_info: u16 = 0xff01; // RFC 5746
 pub const hs_certificate_status: u8 = 22; // RFC 6066 §8
+pub const ext_session_ticket: u16 = 35; // RFC 5077
 
 /// The longest ClientHello this module writes (handshake message, without
 /// the record header): every share at once is ~1.6 KiB, a ticket identity
@@ -85,6 +86,10 @@ pub const Params = struct {
     signed_certificate_timestamp: bool = false,
     extended_master_secret: bool = false,
     renegotiation_info: bool = false,
+    /// TLS 1.2 session tickets (RFC 5077 §3.2): null, no extension; set, a
+    /// SessionTicket extension carrying these bytes (empty: "I support
+    /// tickets", as Go sends when it has none cached).
+    session_ticket: ?[]const u8 = null,
     /// A HelloRetryRequest's cookie to echo (RFC 8446 §4.2.2), or "".
     cookie: []const u8 = "",
     psk: ?Psk = null,
@@ -165,6 +170,11 @@ pub fn write(buf: []u8, p: Params) Error![]u8 {
     if (p.renegotiation_info) {
         const e = try w.ext(ext_renegotiation_info);
         try w.byte(0); // empty renegotiated_connection: initial handshake
+        w.close(e);
+    }
+    if (p.session_ticket) |t| {
+        const e = try w.ext(ext_session_ticket);
+        try w.bytes(t);
         w.close(e);
     }
     if (p.cookie.len != 0) {
@@ -307,4 +317,45 @@ test "hello: a buffer too small is NoSpaceLeft, never a partial write past it" {
         .groups = &.{.x25519},
         .shares = &.{},
     }));
+}
+
+test "hello: the SessionTicket extension (RFC 5077): absent, empty, or carrying the ticket" {
+    var buf: [max_len]u8 = undefined;
+    const r: [32]u8 = @splat(1);
+    const base: Params = .{
+        .random = &r,
+        .session_id = &r,
+        .cipher_suites = &.{ 0, 2, 0xc0, 0x2f },
+        .host = "",
+        .versions = &.{.tls_1_2},
+        .groups = &.{.x25519},
+        .shares = &.{},
+    };
+    const none = try write(&buf, base);
+    const none_len = none.len;
+    try testing.expect(findExt(none, ext_session_ticket) == null);
+    var p = base;
+    p.session_ticket = "";
+    const empty = try write(&buf, p);
+    try testing.expectEqual(none_len + 4, empty.len);
+    try testing.expectEqual(@as(usize, 0), findExt(empty, ext_session_ticket).?.len);
+    p.session_ticket = "TICKET";
+    const full = try write(&buf, p);
+    try testing.expectEqualStrings("TICKET", findExt(full, ext_session_ticket).?);
+    try testing.expectEqual(full.len - 4, mem.readInt(u24, full[1..4], .big));
+}
+
+/// The body of extension `t` in the ClientHello `m`, or null.
+fn findExt(m: []const u8, t: u16) ?[]const u8 {
+    var i: usize = 4 + 2 + 32 + 1 + 32;
+    i += 2 + mem.readInt(u16, m[i..][0..2], .big); // cipher suites
+    i += 2; // compression
+    const end = i + 2 + mem.readInt(u16, m[i..][0..2], .big);
+    i += 2;
+    while (i < end) {
+        const len = mem.readInt(u16, m[i + 2 ..][0..2], .big);
+        if (mem.readInt(u16, m[i..][0..2], .big) == t) return m[i + 4 ..][0..len];
+        i += 4 + len;
+    }
+    return null;
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-//! zig-libs tlsclient: the client-side TLS 1.3 session cache (Go
-//! `ClientSessionCache` / `NewLRUClientSessionCache`).
+//! zig-libs tlsclient: the client-side session cache (Go
+//! `ClientSessionCache` / `NewLRUClientSessionCache`), TLS 1.3 and TLS 1.2.
 //!
 //! One entry per server name, least recently stored replaced first. An entry
 //! is reserved when a full handshake completes -- the resumption master
@@ -41,8 +41,18 @@ pub const ClientSession = struct {
     /// 0: free. Assigned at `reserve`, so a client holding an entry can tell
     /// whether another connection has taken it since.
     generation: u64 = 0,
-    /// A ticket is present and the PSK derived.
+    /// A ticket is present and the PSK derived (TLS 1.3), or the TLS 1.2
+    /// session is complete.
     usable: bool = false,
+    /// TLS 1.2 session (RFC 5077): `resumption_secret[0..48]` is the master
+    /// secret, `ticket` the opaque ticket, `psk` and `hash` unused.
+    version12: bool = false,
+    /// TLS 1.2: the negotiated cipher suite (code point), whether the session
+    /// used the extended master secret (RFC 7627), the key-exchange group
+    /// (0: none).
+    suite12: u16 = 0,
+    ems12: bool = false,
+    group12: u16 = 0,
     hash: HashKind = .sha256,
     resumption_secret: [64]u8 = undefined,
     psk: [64]u8 = undefined,
@@ -60,6 +70,26 @@ pub const ClientSession = struct {
     chain_buf: [max_chain_bytes]u8 = undefined,
     chain_lens: [max_chain_len]u16 = undefined,
     chain_count: u8 = 0,
+
+    /// Whether a TLS 1.2 session may be offered at `now_ms`: Go checks only the
+    /// leaf's notAfter (the ticket's lifetime hint is advisory, RFC 5077 §3.3,
+    /// and Go ignores it -- the server refuses a ticket it no longer honours).
+    pub fn fresh12(s: *const ClientSession, now_ms: i64) bool {
+        if (!s.usable or !s.version12) return false;
+        return @divFloor(now_ms, 1000) < s.leaf_not_after_s;
+    }
+
+    /// Zero everything but the key and the generation (secrets included).
+    pub fn wipe(s: *ClientSession) void {
+        const k = s.key_buf;
+        const kl = s.key_len;
+        const g = s.generation;
+        std.crypto.secureZero(u8, mem.asBytes(s));
+        s.* = .{};
+        s.key_buf = k;
+        s.key_len = kl;
+        s.generation = g;
+    }
 
     pub fn key(s: *const ClientSession) []const u8 {
         return s.key_buf[0..s.key_len];
@@ -108,7 +138,7 @@ pub const ClientSession = struct {
 
     /// Whether the ticket may be offered at `now_ms` (lifetime, leaf expiry).
     pub fn fresh(s: *const ClientSession, now_ms: i64) bool {
-        if (!s.usable) return false;
+        if (!s.usable or s.version12) return false;
         // Checked: an extreme caller clock against a stored `received_ms`
         // overflowed the subtraction (no-panic sweep 2026-10-28).
         const age_ms = std.math.sub(i64, now_ms, s.received_ms) catch return false;
@@ -144,6 +174,15 @@ pub const SessionCache = struct {
 
     pub fn release(c: *SessionCache) void {
         if (c.lock) |l| l.mutex.unlock(l.io);
+    }
+
+    /// Free the entry for `k` (secrets zeroed); false when there was none
+    /// (caller holds the lock). Go: `Put(key, nil)`.
+    pub fn drop(c: *SessionCache, k: []const u8) bool {
+        const e = c.find(k) orelse return false;
+        std.crypto.secureZero(u8, mem.asBytes(e));
+        e.* = .{};
+        return true;
     }
 
     /// secret-api-ok: compares only the cache key (the server name + port, public); the session secrets are not read.
@@ -250,4 +289,47 @@ test "ClientSession.setChain: exactly max_chain_bytes fits, one more does not (a
     // The budget is shared across certificates: 1 + (max - 1) fits.
     try testing.expect(s.setChain(&.{ exact[0..1], exact[0 .. max_chain_bytes - 1] }));
     try testing.expect(!s.setChain(&.{ exact[0..2], exact[0 .. max_chain_bytes - 1] }));
+}
+
+test "TLS 1.2 entries: fresh12 checks only the leaf's expiry (Go ignores the lifetime hint); fresh never offers one as a PSK" {
+    var s: ClientSession = .{ .usable = true, .version12 = true, .ticket_lifetime_s = 0, .leaf_not_after_s = 1_000 };
+    try testing.expect(s.fresh12(0)); // a hint of 0 ("unspecified", RFC 5077 §3.3) is no expiry
+    try testing.expect(s.fresh12(999_999));
+    try testing.expect(!s.fresh12(1_000_000)); // notAfter reached
+    try testing.expect(!s.fresh(0)); // a TLS 1.3 offer never takes it
+    s.version12 = false;
+    try testing.expect(!s.fresh12(0)); // and a 1.3 entry is not a 1.2 session
+    s.version12 = true;
+    s.usable = false;
+    try testing.expect(!s.fresh12(0));
+}
+
+test "ClientSession.wipe zeroes every secret but keeps the key and generation; SessionCache.drop frees the entry" {
+    var storage: [2]ClientSession = undefined;
+    var c: SessionCache = .init(&storage, null);
+    defer c.deinit();
+    const e = c.reserve("a.test").?;
+    const gen = e.generation;
+    @memset(e.resumption_secret[0..], 0xAA);
+    @memset(e.psk[0..], 0xBB);
+    @memcpy(e.ticket_buf[0..3], "tkt");
+    e.ticket_len = 3;
+    e.usable = true;
+    e.version12 = true;
+    e.suite12 = 0xc02f;
+    try testing.expect(e.setChain(&.{"leaf"}));
+    e.wipe();
+    for (e.resumption_secret) |b| try testing.expectEqual(@as(u8, 0), b);
+    for (e.psk) |b| try testing.expectEqual(@as(u8, 0), b);
+    for (e.ticket_buf[0..3]) |b| try testing.expectEqual(@as(u8, 0), b);
+    try testing.expect(!e.usable and !e.version12);
+    try testing.expectEqual(@as(u16, 0), e.suite12);
+    try testing.expectEqual(@as(u8, 0), e.chain_count);
+    try testing.expectEqualStrings("a.test", e.key());
+    try testing.expectEqual(gen, e.generation);
+    @memset(e.resumption_secret[0..], 0xCC);
+    try testing.expect(c.drop("a.test"));
+    try testing.expect(c.find("a.test") == null);
+    for (e.resumption_secret) |b| try testing.expectEqual(@as(u8, 0), b);
+    try testing.expect(!c.drop("a.test"));
 }
