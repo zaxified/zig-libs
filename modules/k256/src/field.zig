@@ -379,14 +379,22 @@ pub const Fe = struct {
         return .{ .x2 = x2, .x3 = x3, .x22 = x22, .x223 = x223 };
     }
 
-    /// Multiplicative inverse via Fermat's little theorem: `a^(p−2) mod p`
-    /// (`invert(0) == 0`, matching std). Constant-time in `a`.
+    /// Multiplicative inverse (`invert(0) == 0`, matching std). Constant-time
+    /// in `a`.
     ///
-    /// `p − 2` = 223 ones, a zero, 22 ones, 4 zeros, `101101` — the
-    /// `onesRuns` head plus a fixed tail: 255 squarings + 15 multiplies, about
-    /// half the cost of the square-and-multiply loop it replaced (2026-10-07).
-    /// `powConst` stays as its differential oracle in the tests.
+    /// Since 2026-11-13 the constant-time safegcd (`safegcd.inverseCt`,
+    /// libsecp256k1's `secp256k1_modinv64`): a fixed 590 divsteps, about 3×
+    /// faster here than the Fermat chain (`invertChain`), which stays as its
+    /// differential oracle together with `powConst`.
     pub fn invert(a: Fe) Fe {
+        return .{ ._limbs = fromU256(safegcd.inverseCt(a.value())) };
+    }
+
+    /// Fermat's little theorem: `a^(p−2) mod p`, constant-time. `p − 2` = 223
+    /// ones, a zero, 22 ones, 4 zeros, `101101` — the `onesRuns` head plus a
+    /// fixed tail: 255 squarings + 15 multiplies. `invert` until 2026-11-13;
+    /// now its test oracle.
+    fn invertChain(a: Fe) Fe {
         const r = onesRuns(a);
         var t = r.x223.sqn(23).mul(r.x22);
         t = t.sqn(5).mul(a);
@@ -577,6 +585,67 @@ const safegcd = struct {
             r[i + 1] += r[i] >> 62;
             r[i] &= @as(i64, @intCast(m62));
         }
+    }
+
+    /// 59 CONSTANT-TIME divsteps (libsecp256k1 `secp256k1_modinv64_divsteps_59`):
+    /// every step runs the same instructions, the two conditions (`zeta < 0`,
+    /// `g` odd) are masks laundered through `blackBox` so LLVM cannot turn the
+    /// masked adds back into branches. `zeta = −(delta + 1/2)`; the matrix
+    /// starts at 8·I, so after 59 steps it is scaled by 2^62 like the
+    /// variable-time form's.
+    fn divsteps59(zeta_in: i64, f0: u64, g0: u64, t: *Trans) i64 {
+        var u: u64 = 8;
+        var v: u64 = 0;
+        var q: u64 = 0;
+        var r: u64 = 8;
+        var f = f0;
+        var g = g0;
+        var zeta = zeta_in;
+        for (3..62) |_| {
+            var mask1: u64 = blackBox(@bitCast(zeta >> 63));
+            const mask2: u64 = 0 -% blackBox(g & 1);
+            // x, y, z = f, u, v negated when zeta < 0.
+            const x = (f ^ mask1) -% mask1;
+            const y = (u ^ mask1) -% mask1;
+            const z = (v ^ mask1) -% mask1;
+            // Add them to g, q, r when g is odd.
+            g +%= x & mask2;
+            q +%= y & mask2;
+            r +%= z & mask2;
+            // Both conditions: zeta becomes −zeta − 2, else zeta − 1.
+            mask1 &= mask2;
+            zeta = (zeta ^ @as(i64, @bitCast(mask1))) -% 1;
+            // And (f, u, v) += (g, q, r).
+            f +%= g & mask1;
+            u +%= q & mask1;
+            v +%= r & mask1;
+            g >>= 1;
+            u <<= 1;
+            v <<= 1;
+        }
+        t.* = .{ .u = @bitCast(u), .v = @bitCast(v), .q = @bitCast(q), .r = @bitCast(r) };
+        return zeta;
+    }
+
+    /// `x^−1 mod p` for `x < p` (0 ↦ 0) in CONSTANT time: libsecp256k1's
+    /// `secp256k1_modinv64` — a fixed 10 × 59 = 590 divsteps (enough for any
+    /// 256-bit input), `update_de_62` and the full five-limb `update_fg_62`
+    /// every round (no limb dropping, no early exit), then `normalize_62` by
+    /// the sign of `f`, all of which are mask arithmetic.
+    fn inverseCt(x: u256) u256 {
+        var d: S62 = .{ 0, 0, 0, 0, 0 };
+        var e: S62 = .{ 1, 0, 0, 0, 0 };
+        var f: S62 = modulus;
+        var g: S62 = fromInt(x);
+        var zeta: i64 = -1; // zeta = −(delta + 1/2); delta starts at 1/2
+        for (0..10) |_| {
+            var t: Trans = undefined;
+            zeta = divsteps59(zeta, @bitCast(f[0]), @bitCast(g[0]), &t);
+            updateDe(&d, &e, t);
+            updateFgVar(5, &f, &g, t); // fixed length 5: the CT `update_fg_62`
+        }
+        normalize62(&d, f[4]);
+        return toInt(d);
     }
 
     /// `x^−1 mod p` for `x < p` (0 ↦ 0). Variable-time.
@@ -775,6 +844,7 @@ test "invert/sqrt addition chains == powConst(p−2) / powConst((p+1)/4)" {
 
 fn expectChainsMatch(a: Fe) !void {
     try std.testing.expectEqual(a.powConst(field_order - 2).toInt(), a.invert().toInt());
+    try std.testing.expectEqual(a.invertChain().toInt(), a.invert().toInt());
     const root = a.powConst((field_order + 1) / 4);
     if (a.sqrt()) |x| {
         try std.testing.expectEqual(root.toInt(), x.toInt());
@@ -812,6 +882,33 @@ test "invertPublic (safegcd) == invert on edges, structured and random elements"
             try std.testing.expect(a.mul(inv).equivalent(Fe.one));
             try std.testing.expect(inv.toInt() < field_order);
         }
+    }
+}
+
+test "invert (constant-time safegcd) == invertChain == invertPublic on edges, sparse and random elements" {
+    const edges = [_]u256{
+        0,                 1,                                2,               3,               977,
+        1 << 32,           (1 << 62) - 1,                    1 << 62,         (1 << 124) + 1,  1 << 248,
+        1 << 255,          field_order >> 1,                 field_order - 2, field_order - 1, field_order - (1 << 62),
+        field_order - 977, (1 << 256) - (1 << 33) - 2 * 977,
+    };
+    for (edges) |v0| {
+        const v = if (v0 >= field_order) v0 - field_order else v0;
+        const a = Fe{ ._limbs = fromU256(v) };
+        try std.testing.expectEqual(a.invertChain().toInt(), a.invert().toInt());
+    }
+    var prng = std.Random.DefaultPrng.init(0xC7_5AFE_6CD);
+    const rand = prng.random();
+    const iters: usize = if (builtin.mode == .debug) 2000 else 20000;
+    for (0..iters) |i| {
+        var v: u256 = rand.int(u256);
+        if (i % 3 == 1) v = @as(u256, 1) << rand.int(u8) | @as(u256, rand.int(u64));
+        if (i % 3 == 2) v = field_order - 1 - rand.int(u128);
+        if (v >= field_order) v -= field_order;
+        const a = Fe{ ._limbs = fromU256(v) };
+        const inv = a.invert();
+        try std.testing.expectEqual(a.invertPublic().toInt(), inv.toInt());
+        if (i % 16 == 0) try std.testing.expectEqual(a.invertChain().toInt(), inv.toInt());
     }
 }
 
