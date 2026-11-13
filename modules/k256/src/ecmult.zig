@@ -29,6 +29,7 @@
 //! RCB GLV path (`glvCombine`) and the plain double-and-add stay the oracles.
 
 const std = @import("std");
+const math = std.math;
 const field = @import("field.zig");
 const scalarmod = @import("scalar.zig");
 
@@ -171,9 +172,49 @@ pub const GlvHalf = struct { mag: u256, negative: bool };
 /// multiple is the identity). Reducing first is legal for any raw scalar
 /// because the curve group has prime order `n` (`s·P = (s mod n)·P`) — the
 /// portable double-and-add scans raw bits and agrees for the same reason.
+///
+/// Since 2026-11-13 over the integers (`splitInteger`), not through std's
+/// Montgomery scalar field: the lattice gives both halves exactly, so no
+/// reduction mod `n` is needed. Same halves as the `splitScalar` route
+/// (`splitToSignedHalvesViaScalar`, its test oracle).
 pub fn splitToSignedHalves(s_raw: u256) ?[2]GlvHalf {
     const n = scalarmod.field_order;
     // 2^256 < 2n, so a single conditional subtract fully reduces.
+    const s = if (s_raw >= n) s_raw - n else s_raw;
+    if (s == 0) return null;
+    return splitInteger(s);
+}
+
+/// The lattice basis `{(a1, b1), (a2, b2)}` of `{(x, y) : x + y·λ ≡ 0 (mod n)}`
+/// (Guide to ECC §3.5; `b1 = −glv_b1_neg`, `b2 = a1`, `a2 = a1 − b1`), and the
+/// rounded multipliers `g1 = round(2^384·b2/n)`, `g2 = round(2^384·(−b1)/n)`.
+const lat_a1: i320 = 64502973549206556628585045361533709077;
+const lat_b1: i320 = -303414439467246543595250775667605759171;
+const lat_a2: i320 = lat_a1 - lat_b1;
+const lat_b2: i320 = lat_a1;
+
+/// `k = k1 + k2·λ (mod n)` for `0 < k < n`, exactly: `c_i = round(k·g_i /
+/// 2^384)`, `k2 = −c1·b1 − c2·b2`, `k1 = k − c1·a1 − c2·a2` over the integers
+/// (`k1 + k2·λ = k − c1·(a1 + b1·λ) − c2·(a2 + b2·λ) ≡ k`). Products stay
+/// below 2^260, so `i320` holds every intermediate.
+fn splitInteger(k: u256) [2]GlvHalf {
+    const t1 = math.mulWide(u256, k, scalarmod.glv_g1);
+    const t2 = math.mulWide(u256, k, scalarmod.glv_g2);
+    const c1: i320 = @as(u128, @truncate(t1 >> 384)) + @as(i320, @as(u1, @truncate(t1 >> 383)));
+    const c2: i320 = @as(u128, @truncate(t2 >> 384)) + @as(i320, @as(u1, @truncate(t2 >> 383)));
+    const k2 = -c1 * lat_b1 - c2 * lat_b2;
+    const k1 = @as(i320, k) - c1 * lat_a1 - c2 * lat_a2;
+    return .{ signedHalf(k1), signedHalf(k2) };
+}
+
+fn signedHalf(v: i320) GlvHalf {
+    return .{ .mag = @intCast(@abs(v)), .negative = v < 0 };
+}
+
+/// The previous route (`scalarmod.splitScalar`, std's scalar field, then
+/// `glvHalf`): the oracle `splitInteger` is tested against.
+fn splitToSignedHalvesViaScalar(s_raw: u256) ?[2]GlvHalf {
+    const n = scalarmod.field_order;
     const s = if (s_raw >= n) s_raw - n else s_raw;
     if (s == 0) return null;
     var sb: [32]u8 = undefined;
@@ -209,16 +250,19 @@ pub fn wnafDigits(comptime w: u5, h: GlvHalf) [wnaf_len]i16 {
     var v = h.mag;
     var i: usize = 0;
     while (v != 0) : (i += 1) {
-        if (@as(u1, @truncate(v)) == 1) {
-            const r: i32 = @intCast(@as(u32, @truncate(v)) & (full - 1));
-            const d: i32 = if (r >= half) r - @as(i32, @intCast(full)) else r;
-            if (d >= 0) {
-                v -= @as(u256, @intCast(d));
-            } else {
-                v += @as(u256, @intCast(-d));
-            }
-            e[i] = @intCast(if (h.negative) -d else d);
+        // Skip the run of zero bits in one step (2026-11-13; it was one
+        // 256-bit shift per bit): same digits, ~w× fewer wide shifts.
+        const z: u8 = @intCast(@ctz(v));
+        v >>= z;
+        i += z;
+        const r: i32 = @intCast(@as(u32, @truncate(v)) & (full - 1));
+        const d: i32 = if (r >= half) r - @as(i32, @intCast(full)) else r;
+        if (d >= 0) {
+            v -= @as(u256, @intCast(d));
+        } else {
+            v += @as(u256, @intCast(-d));
         }
+        e[i] = @intCast(if (h.negative) -d else d);
         v >>= 1;
     }
     return e;
@@ -379,6 +423,39 @@ fn strauss(comptime max: usize, gt: *const GTables, g_scalar: u256, points: []co
     if (r.inf) return null;
     r.z = r.z.mul(scale);
     return r;
+}
+
+test "splitInteger == the splitScalar route on edges and random scalars, and reconstructs k" {
+    const n = scalarmod.field_order;
+    const lam = scalarmod.Scalar.fromBytes(leInt(scalarmod.lambda), .little) catch unreachable;
+    var prng = std.Random.DefaultPrng.init(0x5B117_1A3B);
+    const rand = prng.random();
+    const edges = [_]u256{ 1, 2, n - 1, n - 2, n >> 1, (n >> 1) + 1, scalarmod.lambda, n - scalarmod.lambda, 1 << 128, (1 << 128) - 1, 1 << 255 };
+    for (0..4000 + edges.len) |i| {
+        var k: u256 = if (i < edges.len) edges[i] else rand.int(u256);
+        if (k >= n) k -= n;
+        if (k == 0) continue;
+        const got = splitToSignedHalves(k).?;
+        const want = splitToSignedHalvesViaScalar(k).?;
+        for (got, want) |g, w| {
+            try std.testing.expectEqual(w.mag, g.mag);
+            try std.testing.expectEqual(w.negative, g.negative);
+            try std.testing.expect(g.mag < (1 << 129));
+        }
+        // k1 + k2·λ ≡ k (mod n), with the signs applied.
+        const k1 = scalarmod.Scalar.fromBytes(leInt(got[0].mag), .little) catch unreachable;
+        const k2 = scalarmod.Scalar.fromBytes(leInt(got[1].mag), .little) catch unreachable;
+        const s1 = if (got[0].negative) k1.neg() else k1;
+        const s2 = if (got[1].negative) k2.neg() else k2;
+        const kk = scalarmod.Scalar.fromBytes(leInt(k), .little) catch unreachable;
+        try std.testing.expect(s1.add(s2.mul(lam)).equivalent(kk));
+    }
+}
+
+fn leInt(x: u256) [32]u8 {
+    var b: [32]u8 = undefined;
+    std.mem.writeInt(u256, &b, x, .little);
+    return b;
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────

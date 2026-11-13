@@ -65,8 +65,12 @@
 //!     read 2 before `mulInner` existed, the base point 1; the ladder it
 //!     replaced read 2 at `group.zig:277`, LLVM having split the `z == 0` test
 //!     from the affine-identity test).
-//!   * `group.zig:399` — `combMulBaseWithTable`'s `try acc.rejectIdentity()`,
-//!     1 context per call: once in `comb`, twice in `sign`, once in `ecdsa`.
+//!   * `group.zig:553` — `combMulBaseWithTable`'s `try
+//!     proj.rejectIdentityOneBranch()` (`:399`, `acc.rejectIdentity()`, before
+//!     the 2026-11-13 w = 6 affine comb), 1 context per call: once in `comb`,
+//!     twice in `sign`, once in `ecdsa`. The plain `rejectIdentity` read 2 there
+//!     after the rewrite (LLVM split it into two jumps), hence the one-branch
+//!     form.
 //!
 //! Either way the branch is on "did the whole scalar multiplication land on
 //! the neutral element", i.e. `s ≡ 0 (mod n)`. It is the same one-bit
