@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-03 · mutation 2026-09-03 · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, XMLENC_FUZZ) · ct 2026-11-13 (ctgrind: RSA secret members tainted for rsa-oaep-mgf1p + GCM / CBC and rsa-1_5 + GCM, KEK tainted for kw-aes256 + GCM; no xmlenc-own context except the CBC plaintext length; the rsa-1_5 extraction loop was compiled to a secret-dependent branch and is fixed; oaep 5 / cbc 16 / rsa15 3 / kw 3 in-file, itemised in scripts/checks/ctgrind-expected.tsv) · panic 2026-11-13 (sweep of every pub entry point: `decryptDataToDocument` use-after-free, its element cap, heap-stack CipherValue walk)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, XMLENC_FUZZ) · ct 2026-11-13 (ctgrind: RSA secret members tainted for rsa-oaep-mgf1p + GCM / CBC and rsa-1_5 + GCM, KEK tainted for kw-aes256 + GCM; no xmlenc-own context except the CBC plaintext length; the rsa-1_5 extraction loop was compiled to a secret-dependent branch and is fixed; oaep 3 / cbc 14 / rsa15 3 / kw 3 in-file, itemised in scripts/checks/ctgrind-expected.tsv) · panic 2026-11-13 (sweep of every pub entry point: `decryptDataToDocument` use-after-free, its element cap, heap-stack CipherValue walk)
 
 **Performance:** not measured
 
@@ -226,15 +226,14 @@ strings.)
   load-bearing — a wrong mask turns the RFC 8017 §7.2.2 teeth tests red.
 - *Measured 2026-11-13 (ctgrind, `src/ctgrind_harness.zig`, ReleaseFast, key / KEK
   tainted, `decryptData` driven end to end; rows in `scripts/checks/ctgrind-expected.tsv`):*
-  - `oaep` 5 in-file: rsa `privateOpCrtPtr` F3 fault-check verdict (1), rsa
-    `decryptOaepHNoFailUnburned` `if (valid == 1)` (2) and its `msg_len` memcpy (1),
-    aesgcm tag verdict (1). **No xmlenc context.** ⚠ The two rsa OAEP contexts are the
-    `decryptOaepHNoFail` verdict branch (`rsa/root.zig:2028-2029`): "no fail" means no
-    error VALUE, not no observable verdict. xmlenc relies on it only for the decoy-CEK
-    countermeasure (work equal on both outcomes); the branch itself is rsa's to close.
-  - `cbc` 16: the same four rsa contexts, `aescbc.unpadXmlEnc` verdict, and xmlenc's
-    `aesCbcDecrypt` `alloc(plain_len)` / `memcpy(plain_len)` — the plaintext LENGTH, which
-    the API returns to the caller by contract.
+  - `oaep` 3 in-file: rsa `privateOpCrtPtr` F3 fault-check verdict (1), xmlenc `rsaOaepUnwrap`'s
+    `if (!r.ok)` (the one accept/reject branch, choosing the decoy CEK — the same class as
+    `rsaPkcs1v15Unwrap`'s `if (good == 0)` below), aesgcm tag verdict (1). It read 5 until rsa's
+    `decryptOaepHNoFail` became branch-free on 2026-11-13 (its two verdict-branch contexts are
+    gone; rsa now has its own `oaepnf` ctgrind row, 0 contexts in the unpadding).
+  - `cbc` 14 (16 before the same rsa fix): the same two rsa/xmlenc contexts, `aescbc.unpadXmlEnc`
+    verdict, and xmlenc's `aesCbcDecrypt` `alloc(plain_len)` / `memcpy(plain_len)` — the plaintext
+    LENGTH, which the API returns to the caller by contract.
   - `rsa15` 3: rsa F3 verdict, xmlenc `rsaPkcs1v15Unwrap`'s `if (good == 0)` (the one
     accept/reject branch above), aesgcm tag verdict. **It read 4 before 2026-11-13:** the
     masked message-extraction loop (`ctEqMaskUsize(s, sep_idx)`) was lowered by LLVM to a

@@ -175,7 +175,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   | target | tainted | total | in-file | witness |
   |---|---|---|---|---|
   | `master` — `masterFromSeed` | seed | 6 | 2 | 4 |
-  | `derive` — `derivePath` `m/44'/0'/0'/0/0` | master private scalar | 29 | 25 | 4 |
+  | `derive` — `derivePath` `m/44'/0'/0'/0/0` | master private scalar | 24 | 20 | 4 |
   | `seed` — `mnemonicToSeed` | mnemonic | 2 | **0** | 2 |
   | `mnemonic` — `mnemonicToEntropy` | mnemonic | 5 | **3** | 2 |
   | `xprv` — `serializePriv` + `parseExtended` | master private scalar | 2 | **0** | 2 |
@@ -204,6 +204,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
     from five return addresses (LLVM unrolled `derivePathBody`'s loop in the
     harness build, so memcheck stops merging the five steps). No new source
     line; context diff in `scripts/checks/ctgrind-expected.tsv`.
+  - Re-measured 2026-11-13 after `k256`'s affine comb (G4 wave): `derive` 25 → 20. The comb's
+    endpoint identity check is now `rejectIdentityOneBranch`, one address instead of two, in each
+    of the five unrolled steps; no `bip32` source changed.
   - `seed`: PBKDF2-HMAC-SHA512 over the mnemonic is branch-free.
   - `mnemonic` 3 in-file, 2 witness (2026-09-16, finding M6-CT — `wordIndex`
     rewritten from a binary search to a full 2048-entry linear scan with a
