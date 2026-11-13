@@ -264,6 +264,26 @@ Not implemented: sampling-with-tools (`tools`/`toolChoice`), `includeContext`,
 
 - **Arguments:** `call.arg(T, key)` → `absent` / `value` / `wrong_type`;
   `call.require(T, key)` writes "missing 'k'" / "'k' must be …".
+- **Typed tools (2026-11-13):** `mcp.schemaOf(Args)` is the JSON Schema text of a
+  Zig struct (comptime; goes straight into `Tool.input_schema`/`output_schema`),
+  `call.argsAs(Args) catch return true` decodes the arguments into it, and
+  `call.writeJson(out)` answers with a struct (so `structuredContent` follows).
+  Like Go's `AddTool[In, Out]`, with Zig's tools: required = not `?T` and no
+  default; ints get `minimum`/`maximum` from their width, clamped to +-(2^53-1);
+  `[]const u8` is a string, an enum a string `enum`, `[]const T`/`[N]T` an
+  array; `pub const mcp_descriptions = .{ .field = "text" }` gives `description`s.
+  Unsupported types (non-slice pointers, unions, ...) are compile errors naming
+  the field. `argsAs` failures write `error: Invalid arguments: /ptr: why`.
+  ```zig
+  const Args = struct { city: []const u8, days: u8 = 1,
+      pub const mcp_descriptions = .{ .city = "City name" }, };
+  // .input_schema = mcp.schemaOf(Args), ...
+  fn h(_: ?*anyopaque, call: *mcp.ToolCall) bool {
+      const a = call.argsAs(Args) catch return true;
+      call.writeJson(.{ .city = a.city });
+      return false;
+  }
+  ```
 - **Schemas enforced:** arguments are checked against `input_schema` and a
   structured result against `output_schema` (`schema_check`, a JSON Schema
   2020-12 subset); a failure is an `isError:true` result. Off:

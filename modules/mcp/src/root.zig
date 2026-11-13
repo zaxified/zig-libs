@@ -107,6 +107,11 @@ pub const header_annotations = @import("header_annotations.zig");
 /// The JSON Schema 2020-12 subset `tools/call` checks arguments and
 /// `structuredContent` against (`Server.validate_tool_io`).
 pub const schema_check = @import("schema_check.zig");
+/// Typed tools: `schemaOf(T)` and `ToolCall.argsAs(T)`.
+pub const typed = @import("typed.zig");
+/// The JSON Schema text for a Zig type, for `Tool.input_schema` /
+/// `Tool.output_schema` (see `typed.zig` for the mapping).
+pub const schemaOf = typed.schemaOf;
 /// RFC 6570 parse/expand/match; `resources/read` matches a request's uri
 /// against each template (`ResourceRequest.vars`).
 pub const uri_template = @import("uri_template.zig");
@@ -2794,6 +2799,33 @@ pub const ToolCall = struct {
     // secret-api-ok: `key` is a JSON object key (an argument name), not a secret
     pub fn requireStr(self: *ToolCall, key: []const u8) ?[]const u8 {
         return self.require([]const u8, key);
+    }
+
+    /// The call's arguments decoded into `T` (a struct; see `schemaOf` for
+    /// the type mapping, and use `schemaOf(T)` as the tool's `input_schema` so
+    /// the server's own validation runs first). A mismatch (missing required
+    /// property, wrong JSON type, unknown property, integer out of range)
+    /// writes "error: Invalid arguments: <pointer>: <why>" to the result, like
+    /// `require`, and returns `error.InvalidArguments`, so a handler reads
+    /// `const a = call.argsAs(Args) catch return true;`. Strings and slices live
+    /// in the request arena. (Named `argsAs` because `args` is the raw value.)
+    pub fn argsAs(self: *ToolCall, comptime T: type) typed.ParseError!T {
+        var f: typed.Failure = .{};
+        return typed.parse(T, self.arena, self.args, &f) catch |e| {
+            if (e == error.InvalidArguments) {
+                self.print("error: Invalid arguments: {s}{s}{s}", .{ f.pointer, if (f.pointer.len != 0) ": " else "", f.message });
+            }
+            return e;
+        };
+    }
+
+    /// Write `value` as JSON text to the result (null optional fields are
+    /// omitted, which is what `schemaOf` declares for `?T`). A tool whose
+    /// output is one such object also gets it as `structuredContent`. OOM is
+    /// swallowed, as for `write`.
+    pub fn writeJson(self: *ToolCall, value: anytype) void {
+        const text = std.json.Stringify.valueAlloc(self.arena, value, .{ .emit_null_optional_fields = false }) catch return;
+        self.out.appendSlice(self.arena, text) catch {};
     }
 
     /// Write a tool-failure message and return `true` (the handler's isError
@@ -5836,6 +5868,7 @@ test {
     _ = header_annotations;
     _ = schema_check;
     _ = uri_template;
+    _ = typed;
     _ = @import("sdk_oracle.zig");
 }
 
@@ -14028,4 +14061,63 @@ test "addTool: a schema past the literal depth cap is not parsed for annotations
     _ = text.orderedRemove(text.items.len - 2 - (depth - 2));
     try testing.expect(literalDepthOk(text.items));
     try testing.expectError(error.HeaderAnnotationNotReachable, s.addTool(.{ .name = "shallow", .description = "", .input_schema = text.items, .handler = flagTool }));
+}
+
+const TypedArgs = struct {
+    city: []const u8,
+    days: u8 = 1,
+    units: ?enum { metric, imperial } = null,
+    pub const mcp_descriptions = .{ .city = "City name" };
+};
+const TypedOut = struct { city: []const u8, days: u8, note: ?[]const u8 = null };
+
+fn typedHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
+    _ = ctx;
+    const a = call.argsAs(TypedArgs) catch return true;
+    call.writeJson(TypedOut{ .city = a.city, .days = a.days });
+    return false;
+}
+
+test "typed tool: schemaOf plugs into Tool, argsAs decodes, writeJson answers structuredContent" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "1" });
+    defer s.deinit();
+    try s.addTool(.{
+        .name = "weather",
+        .description = "typed",
+        .input_schema = schemaOf(TypedArgs),
+        .output_schema = schemaOf(TypedOut),
+        .handler = &typedHandler,
+    });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weather","arguments":{"city":"Brno","days":3}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"city\":\"Brno\",\"days\":3}"}],"structuredContent":{"city":"Brno","days":3},"isError":false}}
+        \\
+    );
+    // The server's own validation (from the generated schema) answers first.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"weather","arguments":{"city":"Brno","days":300}}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Input validation error: Invalid arguments for tool weather: /days: 300 is greater than the maximum 255"}],"isError":true}}
+        \\
+    );
+}
+
+test "typed tool: argsAs failure with validation off is a tool failure naming the pointer" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "1" });
+    defer s.deinit();
+    s.validate_tool_io = false;
+    try s.addTool(.{ .name = "weather", .description = "typed", .input_schema = schemaOf(TypedArgs), .handler = &typedHandler });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weather","arguments":{"city":"Brno","units":"kelvin"}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"error: Invalid arguments: /units: must be one of metric, imperial"}],"isError":true}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"weather","arguments":{"days":2}}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"error: Invalid arguments: missing required property \"city\""}],"isError":true}}
+        \\
+    );
 }
