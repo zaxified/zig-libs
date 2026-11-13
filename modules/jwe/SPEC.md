@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-03 · mutation 2026-10-05 (32/35, 3 eq) · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWE_FUZZ) · ct none
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWE_FUZZ) · ct 2026-11-13 (ctgrind, decrypt side, tainted key per kind: dir CEK 18, AxxxKW/GCMKW KEK 5, ECDH-ES static key 8, PBES2 password 3, RSA-OAEP key 20 in-file, unattributed 0; every context is a designed public verdict, itemised under Constant-time; the encrypt side draws its secrets internally and emits only public ciphertext, so it takes no tainted input) · panic 2026-11-13 (sweep of every pub entry point: an `apu`/`apv`/`iv`/`tag`/`p2s`/`epk` member over 128 bytes overran the header encoder's base64 scratch, now `HeaderTooLarge`/`BufferTooSmall`; the Concat KDF accepts an empty output and panics with a checked message beyond its 32-bit fields; a GCM plaintext past 2^36 - 32 bytes is `BufferTooSmall`)
 
 **Performance:** not measured
 
@@ -166,6 +166,35 @@ placement).
   scope and implemented — see `ecdhes.zig`, byte-exact against RFC 7518
   Appendix C. `ECDH-ES+A192KW` included (its KEK goes to `aeskw`'s AES-192
   arm).
+
+## Constant-time (ctgrind, 2026-11-13)
+
+`src/ctgrind_harness.zig`, driven by `scripts/checks/ctgrind.sh jwe`; the pinned table is in
+`scripts/checks/ctgrind-expected.tsv` (ReleaseFast, unattributed 0, controls and traps 0).
+Decrypt only: a token is built with an untainted key copy, the decryptor gets a tainted copy,
+accept and a flipped-octet reject per algorithm. The plaintext length is declassified in the
+harness (public once the tag verified); the module's own branches on it stay counted.
+
+- **content 18** — GCM tag verdict `aesgcm` root.zig:1048 x3 (one per key size); CBC-HMAC tag
+  verdict `enc.zig:314` x6 (`timing_safe.eql` result, accept + reject, 3 encs), checked BEFORE any
+  decryption; PKCS#7 unpad result `aescbc` root.zig:651 x2; the plaintext length
+  (`root.zig:865` `n == plaintext.len` x3, its realloc std Allocator.zig:440 / PageAllocator.zig:226 x4).
+  All public: accept/reject, and a length the authenticated sender chose.
+- **kw 5** — `aeskw` root.zig:171 unwrap integrity verdict x2, `aesgcm` :1048 x3 (content tag + GCMKW
+  unwrap tag at `alg.zig:114`/`:116`). The unwrap verdict only picks the §11.5 decoy CEK.
+- **ecdh 8** — `ecdhes.zig:221` `rejectNonCanonical(d)` x2 (true for every valid key), p256
+  `group.zig:567` identity-result verdict x1 (delegated), std `curve25519.zig:77` `x2.isZero()`
+  identity verdict x1, `aeskw` :171 x2, `aesgcm` :1048 x2.
+- **pbes2 3** — `aeskw` :171 x2, `aesgcm` :1048 x1; PBKDF2 over the tainted password raises none.
+- **rsa 20** (10 per `RSA-OAEP` / `RSA-OAEP-256`) — `rsa` root.zig:1286 F3 fault-check verdict;
+  root.zig:1883 the OAEP decode's single decision point (`valid != 1`); root.zig:1889 the recovered
+  message copy, whose size-class branches in the std memcpy are 6 contexts; `jwe` root.zig:761
+  `got.len != cek_len`; `aesgcm` :1048 content tag. The OAEP decode itself is branch-free
+  (leading byte, lHash compare, separator scan and padding check are folded into one flag, no
+  early exit by failure reason), so Manger's oracle has nothing to read. A bad key unwrap, of any
+  kind, substitutes a decoy CEK (RFC 7516 §11.5) and runs the same content decryption, ending in
+  the same `AuthenticationFailed` as a bad tag; a ciphertext that decodes validly with a correct
+  length is one whose sender (anyone, the key is public) knew the CEK, so it opens no oracle.
 
 ## `TODO(fable)` checklist — done-record (completed 2026-07-11)
 

@@ -335,6 +335,8 @@ declare -A TARGETS=(
     [acme]="jws csr pem pem384 pkcs8 anykey"
     # ── 2026-10-13: jwt: HMAC secrets (sign + verify), ES/EdDSA/RS/PS signing keys ──
     [jwt]="hmac ec rsa"
+    # ── 2026-11-13: jwe: decrypt side — dir CEK, AxxxKW / AxxxGCMKW KEK, ECDH-ES static private key, PBES2 password, RSA-OAEP secret key ──
+    [jwe]="content kw ecdh pbes2 rsa"
     # ── 2026-10-20: minisign: Ed25519 seed (sign), password + key (seal), password (open) ──
     [minisign]="sign seal open"
     # ── 2026-10-31: tls13: key schedule, kex per group (sharedSecret / serverExchange), CertificateVerify signers ──
@@ -429,6 +431,7 @@ declare -A MODES=(
     [tlsresume]="ReleaseFast"
     [acme]="ReleaseFast"
     [jwt]="ReleaseFast"
+    [jwe]="ReleaseFast"
     [minisign]="ReleaseFast"
     [tls13]="ReleaseFast"
 )
@@ -837,6 +840,13 @@ declare -A PATTERN=(
     [jwt/hmac]='root[.]zig|encode[.]zig|burn[.]zig'
     [jwt/ec]='root[.]zig|encode[.]zig|burn[.]zig'
     [jwt/rsa]='root[.]zig|encode[.]zig|burn[.]zig'
+    # jwe (2026-11-13): the module's own files. `root.zig` also matches the
+    # delegated rsa/aesgcm/aeskw root.zig frames; the tsv comment itemises them.
+    [jwe/content]='root[.]zig|enc[.]zig|burn[.]zig'
+    [jwe/kw]='root[.]zig|alg[.]zig|burn[.]zig'
+    [jwe/ecdh]='root[.]zig|alg[.]zig|ecdhes[.]zig|burn[.]zig'
+    [jwe/pbes2]='root[.]zig|alg[.]zig|burn[.]zig'
+    [jwe/rsa]='root[.]zig|alg[.]zig|burn[.]zig'
     [minisign/sign]='root[.]zig|burn[.]zig|blake2b[.]zig'
     [minisign/seal]='root[.]zig|burn[.]zig|blake2b[.]zig'
     [minisign/open]='root[.]zig|burn[.]zig|blake2b[.]zig'
@@ -1172,6 +1182,11 @@ declare -A LABEL=(
     [jwt/hmac]='jwt HS256/384/512 sign + verify accept + reject (secret tainted)'
     [jwt/ec]='jwt ES256/ES384/ES512/EdDSA sign (signing key tainted)'
     [jwt/rsa]='jwt RS256 + PS256 sign (rsa secret members tainted)'
+    [jwe/content]='jwe decryptCompact, dir + A128/A192/A256GCM + A128/A192/A256CBC-HS* (CEK tainted; accept + tag-flip reject)'
+    [jwe/kw]='jwe decryptCompact, A128KW/A256KW/A128GCMKW/A256GCMKW (KEK tainted; accept + Encrypted-Key-flip reject)'
+    [jwe/ecdh]='jwe decryptCompact, ECDH-ES and ECDH-ES+A256KW on P-256 and X25519 (static private key tainted)'
+    [jwe/pbes2]='jwe decryptCompact, PBES2-HS256+A128KW (password tainted)'
+    [jwe/rsa]='jwe decryptCompact, RSA-OAEP + RSA-OAEP-256 (rsa secret members tainted)'
     [minisign/sign]='minisign signDigest + signTrustedComment (Ed25519 seed tainted)'
     [minisign/seal]='minisign sealSecretKey (seed + password tainted)'
     [minisign/open]='minisign openSecretKey (password tainted)'

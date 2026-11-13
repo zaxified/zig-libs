@@ -1960,3 +1960,44 @@ mlkem	ReleaseFast	fromBytes1024	1	0	86c446f4519a9bea	856d03c6374f92c1
 keycodec	ReleaseFast	der	1	2	01cf014117dc5d87	9a4675b0ba53c58e
 keycodec	ReleaseFast	write	1	4	01cf014117dc5d87	2ca3d057bb7a9dbf
 keycodec	ReleaseFast	pem	1	3	01cf014117dc5d87	3727ff639b8dfcc7
+# jwe (2026-11-13) — the decrypt side, one target per key kind (the encrypt side's
+# secrets are drawn inside the call and its ciphertext is public; only decrypt takes
+# a module-held secret). Tokens are built with an UNTAINTED key copy, the decryptor
+# gets a tainted copy; accept + reject per algorithm. The harness declassifies the
+# plaintext LENGTH (public once the tag verified); the module's own branches on it
+# stay in the counts below. Every context is a designed public verdict:
+# content 18 = 3 GCM tag verdicts (aesgcm root.zig:1048 `open`, one per key size,
+#   delegated) + 6 CBC-HMAC tag verdicts (jwe enc.zig:314, `timing_safe.eql` result,
+#   accept and reject run = 2 stacks per enc) + 2 PKCS#7 length scans (aescbc
+#   root.zig:651 via enc.zig, the unpad result) + 3 finishDecrypt (root.zig:865
+#   `n == plaintext.len`, the plaintext length) + 4 realloc contexts of that same
+#   length (finishDecrypt:866 -> std Allocator.zig:440 and PageAllocator.zig:226).
+# kw 5 = aeskw unwrap integrity verdict (aeskw root.zig:171, accept + reject = 2)
+#   + GCM content tag verdict (aesgcm:1048, 1) + GCMKW unwrap tag verdict (aesgcm:1048
+#   via alg.zig:114/:116, 2). The unwrap verdict only selects the RFC 7516 §11.5
+#   decoy CEK; both outcomes then run the same content decryption.
+# ecdh 8 = ecdhes.zig:221 `P256.scalar.rejectNonCanonical(d)` x2 (the static scalar
+#   is canonical for any valid key: its verdict is a key-validity bit, true for
+#   every key this row can hold) + p256 group.zig:567 mulCtWindowed x1 (delegated:
+#   the identity-result verdict of the windowed multiply, the p256 row's own) + std
+#   curve25519.zig:77 x1 (`x2.isZero()` identity verdict, public by design) + aeskw
+#   :171 x2 + aesgcm:1048 x2.
+# pbes2 3 = aeskw:171 x2 (accept + reject) + aesgcm:1048 x1. The PBKDF2 / HMAC key
+#   schedule on the tainted password raises none.
+# rsa 20 = 10 per alg (RSA-OAEP, RSA-OAEP-256): rsa root.zig:1286 (F3 Bellcore
+#   fault-check verdict, always true unless a fault) + root.zig:1883 (the OAEP
+#   decode's ONE decision point `valid != 1`: y byte, lHash compare, separator scan
+#   and padding check are branch-free and folded into that flag, so no early exit
+#   precedes it) + root.zig:1889 `@memcpy(out[0..msg_len])`, the recovered
+#   message's length (public on success; the std memcpy's size-class branches
+#   copySmallLength/copy16ToSmallLimit and four copyFixedLength = 6 contexts) +
+#   jwe root.zig:761 `got.len != cek_len` (a valid OAEP of the wrong length takes
+#   the same decoy path as an invalid one) + aesgcm:1048 content tag verdict.
+#   A valid-length message vs the decoy differ by a 32-byte copy vs one SHA-256, but
+#   a ciphertext that decodes validly is one the sender knew the CEK of (the public
+#   key makes any such ciphertext), so no oracle is opened.
+jwe	ReleaseFast	content	1	18	10d8c513ea326a08	5b95af95390d7044
+jwe	ReleaseFast	kw	1	5	198f278acedab8ab	29bdefbeeb697801
+jwe	ReleaseFast	ecdh	1	8	8e24d1f5528d947d	0e8a78e319485b8a
+jwe	ReleaseFast	pbes2	1	3	198f278acedab8ab	45882587fad30673
+jwe	ReleaseFast	rsa	1	20	198f278acedab8ab	043474d84426957a
