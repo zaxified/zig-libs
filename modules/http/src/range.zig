@@ -334,7 +334,7 @@ pub fn apply(
 /// Same as `apply`, but additionally bounds the SUM of the resolved ranges'
 /// byte lengths (not just their count) against `max_bytes`.
 ///
-/// G6 (`~/CML/20260901-zig-libs-audit/A1/http.md`): `default_max_ranges`
+/// G6 (the 2026-09-01 A1 audit): `default_max_ranges`
 /// bounds the NUMBER of ranges, not the bytes they cover — a handful of
 /// overlapping/repeated ranges can still multiply the served representation
 /// many times over (measured: `bytes=0-` repeated 16 times, 53 request
@@ -1046,7 +1046,7 @@ test "apply: malformed Range ignored → 200 whole body" {
 
 // ── G6: applyBounded byte cap ───────────────────────────────────────────────
 //
-// audit G6 (`~/CML/20260901-zig-libs-audit/A1/http.md`): `default_max_ranges`
+// audit G6 (the 2026-09-01 A1 audit): `default_max_ranges`
 // caps range COUNT, not the bytes they cover — overlapping/repeated ranges
 // still multiply the served representation per accepted range. `applyBounded`
 // adds an opt-in byte-sum cap on top of `apply`'s existing behavior;

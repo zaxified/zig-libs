@@ -526,7 +526,7 @@ pub const Limits = struct {
     /// closing one. The handler-parallelism knob is
     /// `Dispatcher.max_concurrent_handlers` (default 8); see its doc comment.
     max_concurrent_streams: u32 = 100,
-    /// F11 (`~/CML/20260901-zig-libs-audit/A1/http.md`): when the jobs map
+    /// F11 (the 2026-09-01 A1 audit): when the jobs map
     /// is at `max_concurrent_streams` and a NEW stream arrives, evict the
     /// oldest job that has made no progress at all (no body bytes received,
     /// handler never dispatched) to make room instead of refusing the new
@@ -1602,7 +1602,7 @@ const Session = struct {
         }
     }
 
-    /// F11 (`~/CML/20260901-zig-libs-audit/A1/http.md`, opt-in via
+    /// F11 (the 2026-09-01 A1 audit, opt-in via
     /// `Limits.evict_idle_streams_on_capacity`): find the OLDEST job that
     /// has made no progress at all — no body bytes received, handler never
     /// dispatched, not yet complete — and evict it: RST_STREAM
@@ -4309,7 +4309,7 @@ test "h2c serve: evict_idle_streams_on_capacity=false (default) still refuses �
 }
 
 test "h2c serve: evict_idle_streams_on_capacity=true evicts the oldest idle, no-progress stream" {
-    // F11 (`~/CML/20260901-zig-libs-audit/A1/http.md`): "100 parked HEADERS
+    // F11 (the 2026-09-01 A1 audit): "100 parked HEADERS
     // with no END_STREAM occupy every slot on the connection forever." Two
     // streams open HEADERS only (no DATA, no END_STREAM) against a limit of
     // 2 -- exactly that shape. A third, COMPLETE stream must evict the

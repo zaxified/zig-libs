@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit re-recorded over the Unicode 18.0.0 tables (data-only source change, no guard moved).
 - **2026-11-13** — **CHANGED:** Unicode tables and case folding moved from 17.0.0 to **18.0.0** (`unicode_version`): `\p{Jurchen}`, `\p{Proto_Cuneiform}`, `\p{Seal}`, `\p{Age=18.0}` and the 13,007 new code points in their categories; `(?i)` gains the orbits {U+0277, U+A7DD}, {U+027C, U+A7E2}, {U+AB4B, U+AB6C}, {U+AB4C, U+AB6D}, 16 Latin Extended-G pairs, and U+1DF95 joins {ß, ẞ}. The Go replay's pinned UNICODE_VERSION count is 17 (five input code points 18.0 assigned).
 - **2026-11-12** — **TEST:** closing the last mutation survivors: the wide-code-point caches of the lazy DFA start empty from a dirty allocator (`wideCaches`), bytes mode on a four-byte code point (the Pike VM's `rem`-keyed lists need 4n entries), case folding of a class through the whole four-member orbit (both grammars), `expand` going on after a `$` that starts no variable, and a lead byte whose sequence does not decode ending a name. From the mutation run (ids 200992, 201619, 150083, 550002, 550007). NO CONSUMER-VISIBLE CHANGE.
 - **2026-11-12** — **TEST:** `isMatch`'s ASCII DFA: a full 32-state table met by the idle skip to a start context it does not hold is emptied, not overrun (`Dfa.intern`'s reset; input found by search — without the reset the add writes past the table). From the mutation run (id 200543).

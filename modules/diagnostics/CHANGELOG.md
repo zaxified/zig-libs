@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit re-recorded over the unicode-width 0.2.3 table (data-only source change, no guard moved).
 - **2026-11-13** — **CHANGED:** `charWidth` widths are unicode-width 0.2.3's (Unicode 18.0.0; were 0.2.2, Unicode 17.0.0): 1,027 code points new in 18.0 get their width (Jurchen and Khitan ideographs and new emoji two columns, new combining marks none), and U+FF9E / U+FF9F (halfwidth katakana sound marks) go from zero to one column, as the crate now gives them. `tools/unicode-width/gen.py` reads the 0.2.3 layout (`src/gen/tables.rs` + `lookup.rs`) and takes the extracted crate directory.
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** test for the reset that closes a caret drawn past the end of a coloured line (mutation audit).
 - **2026-11-11** — **NO CONSUMER-VISIBLE CHANGE:** third mutation-audit round, tests only: eight exact-text goldens for `term_width` cuts (wide, zero-width and invalid-UTF-8 characters, tabs, hanging labels, two files, multi-line spans), a label message measured in display columns, an all-blank line, and the colour of hanging-label pointers.

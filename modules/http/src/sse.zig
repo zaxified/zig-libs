@@ -276,7 +276,7 @@ test "sse: invalid event/id/comment fields are rejected before writing" {
 
 // ── G10: does an empty-data event actually reach the client? ────────────────
 //
-// A1 audit G10 (`~/CML/20260901-zig-libs-audit/A1/http.md`) worried that
+// A1 audit G10 (the 2026-09-01 A1 audit) worried that
 // `Event{ .data = "" }` produces `data:\n`, and read from memory (network was
 // unavailable to that fixer) that a conformant `EventSource` silently DROPS
 // an event whose data buffer is empty, while still advancing
