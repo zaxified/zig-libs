@@ -188,9 +188,8 @@ pub fn main() !void {
 
     // (4) `blind` gives up rather than proceed with a non-invertible
     // blinding factor: an RNG rigged to always draw `sk.p` (a real factor
-    // of THIS key's own modulus `n`) makes every sampled `r` (and every
-    // masking scalar `maskedInvert` draws internally) share that factor,
-    // so no retry within the bounded attempt loop can ever succeed. This
+    // of THIS key's own modulus `n`) makes every sampled `r` share that
+    // factor, so no retry within the bounded attempt loop can ever succeed. This
     // is the only way to reach `error.InvalidBlindingFactor` through the
     // public API without inverting SHA-384 — same technique
     // `kat_test.zig` uses against the RFC's fixed key, replayed here

@@ -107,7 +107,7 @@ test "blindWithFactor reproduces RFC 9474 Appendix A.1 blinded_msg + inv byte-ex
     const got = try blindrsa.blindWithFactor(pk, Sha384, &kat.a1.prepared_msg, &kat.a1.salt, &kat.r, &ctx, &blinded_msg);
     try testing.expectEqualSlices(u8, &kat.a1.blinded_msg, got);
     // The Context must carry the RFC's published inv (r⁻¹ mod n) —
-    // independently validates the local extended-Euclid inverse against
+    // independently validates the composite-modulus inverse against
     // RFC-published data — plus the right verify parameters.
     try testing.expectEqualSlices(u8, &kat.a1.inv, ctx.r_inv[0..kat.a1.inv.len]);
     try testing.expectEqual(kat.a1.salt.len, ctx.salt_len);
@@ -575,7 +575,7 @@ test "finalize: an out buffer one byte short of ctx.modulus_len is an error, not
 // call whose length matches it (`blind`'s own salt draw — audit finding
 // B16, see `root.zig`'s `blind` doc comment) and real, but SEEDED-hence-
 // reproducible, bytes from a `ChaCha` CSPRNG on every other call (`r`'s
-// draw, `maskedInvert`'s masking scalar, any redraw). Same length-based
+// draw, any redraw). Same length-based
 // discriminator as `ctgrind_harness.zig`'s `BlindRandom`: `head.len` here
 // is always `Sha384.digest_length` (48), which can never collide with a
 // modulus-length draw.
@@ -756,10 +756,9 @@ test "B8: separate keys per encoding option round-trip independently (RFC 9474 S
 
 // A rigged `std.Random` that always returns `p` (a prime factor of the RFC
 // 9474 KAT modulus `n = p*q`), zero-padded to whatever width is requested —
-// so every `sampleFe` draw `blind` makes (both the blinding factor `r` and
-// `maskedInvert`'s internal masking scalar `u`) comes back as `p` itself:
-// non-invertible mod `n` (gcd(p, n) == p), and the mask can never rescue
-// it (`v = p*u mod n` still shares the factor `p` with `n`). This is the
+// so every `sampleElem` draw `blind` makes (the blinding factor `r`) comes
+// back as `p` itself: non-invertible mod `n` (gcd(p, n) == p), so
+// `m·r` never is either. This is the
 // ONLY way to reach `blind`'s retry-exhausted `error.InvalidBlindingFactor`
 // path through the PUBLIC API without inverting SHA-384 — no existing test
 // exercises it (the retry-exhaustion path was previously unreachable by

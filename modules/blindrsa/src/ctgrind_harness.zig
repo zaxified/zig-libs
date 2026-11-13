@@ -14,6 +14,16 @@
 //!    Euclid on `v = x·u mod n` for a fresh uniform secret mask `u` … and
 //!    unmasks with one more constant-time `mul`."
 //!
+//! ⚠ 2026-11-13: that paragraph (and the walk-through below) describes the
+//! `std.crypto.ff` + masked big-int Euclid path as it was. `blind` now runs
+//! on `rsa.PublicKey.n_mont` (montint: `sampleElem`, the constant-time
+//! safegcd `DynModint.inverse` of `m·r`, `powPublic`, `mul`), with no mask
+//! and no Euclid; `blindSign`'s §7.2 blinding is `rsa.rsadpCrtBlinded`'s own.
+//! The taint scheme is unchanged: `r` is still the one modulus-length draw
+//! (`sampleElem` draws exactly the modulus length), there is just no
+//! masking draw `u` any more. Read `sampleFe` as `sampleElem` and
+//! `maskedInvert`/`feInvert` as `blindCore`'s inversion below.
+//!
 //! Until this harness that paragraph had no measurement behind it. Run it
 //! by hand (this module has NO per-module block in `scripts/checks/ctgrind.sh` yet
 //! — see that script's header for why, and the suggested config lines at
@@ -222,9 +232,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     switch (target) {
         .blind => {
-            // r is the ONLY tainted value; the masking secret `u` (drawn
-            // inside maskedInvert via the SAME `random`) and every redraw
-            // come from the untainted ChaCha stream below — see BlindRandom.
+            // r is the ONLY tainted value; the salt and every redraw come
+            // from the untainted ChaCha stream below — see BlindRandom.
             var br = BlindRandom.init(&kat.r, taint, @as([32]u8, @splat(0x51)));
             const random = std.Random.init(&br, BlindRandom.fill);
 
@@ -277,7 +286,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const sig = try blindrsa.blindSign(&sk_reloaded, pk, random, &kat.a1.blinded_msg, &out);
 
             // Propagation proof: the blind signature is derived from the
-            // tainted sk via rsasp1 + the §7.2 unblind multiply.
+            // tainted sk via rsa's blinded CRT op.
             std.debug.print("blind_sig={x}\n", .{sig});
         },
     }

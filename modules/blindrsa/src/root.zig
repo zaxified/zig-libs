@@ -28,7 +28,7 @@
 //!     (rejection sampling, see SPEC.md's uniformity note), invert `r`
 //!     mod the COMPOSITE modulus `n` (see "the composite-modulus inverse"
 //!     below), `x = RSAVP1(pk, r)`, `blinded_msg = m·x mod n`.
-//!   - `blindSign` — RFC 9474 §4 BlindSign (RSASP1 via `rsa.rsasp1`'s CRT
+//!   - `blindSign` — RFC 9474 §4 BlindSign (RSASP1 via `rsa.rsadpCrtBlinded`'s CRT
 //!     path + the mandatory RSAVP1 self-check), WITH RFC 9474 §7.2's
 //!     RECOMMENDED private-op blinding implemented on top (see
 //!     `blindSign`'s doc comment).
@@ -41,22 +41,17 @@
 //!
 //! ## The composite-modulus inverse (and its timing posture)
 //!
-//! The one primitive RFC 9474 needs that neither `std.crypto.ff` nor the
-//! repo's public API provides is a modular INVERSE over a composite
-//! modulus (`ff` has `pow`/`powPublic` but no `invert`; Fermat inversion
-//! `x^(n-2)` needs a PRIME modulus, and the client doing the inverting
-//! does not know `n`'s factorization). `rsa`'s own key derivation needs
-//! exactly this too (`d = e⁻¹ mod λ(n)`) and now exports the routine as
-//! `pub fn bigModInverse` for exactly this cross-module reuse — this
-//! module no longer carries a local copy, only the byte<->BigInt glue
-//! (`newBig`/`bigFromBytes`) and its own masking layer around the call.
-//! `rsa.bigModInverse`'s Euclid loop is VARIABLE-TIME in its operands, so
-//! the secret-input paths never feed a raw secret into it: `blind`/
-//! `blindSign` invert through `maskedInvert` (multiplicative blinding of
-//! the Euclid operand itself — the divisions run on `x·u mod n` for a
-//! fresh uniform secret `u`, a value statistically independent of `x`).
-//! Only the deterministic `blindWithFactor` KAT seam runs the Euclid loop
-//! on its input directly — see its doc comment.
+//! The one primitive RFC 9474 needs that `std.crypto.ff` does not provide
+//! is a modular INVERSE over a composite modulus (Fermat inversion
+//! `x^(n-2)` needs a PRIME modulus, and the client doing the inverting does
+//! not know `n`'s factorization). Since 2026-11-13 it is
+//! `montint.DynModint.inverse` on the `n_mont` every `rsa.PublicKey`
+//! already carries: a batched Bernstein–Yang safegcd, constant-time in the
+//! operand and in the modulus value, and the same engine `rsa`'s private-op
+//! blinding uses. `blind` inverts `m·r` once (steps 4 and 6 together, see
+//! `blindCore`). Before, it was `rsa.bigModInverse`'s variable-time big-int
+//! Euclid behind a multiplicative mask, plus a big-int gcd for step 4 —
+//! correct, but 4.6–5.0× CIRCL for `blind` as a whole.
 //!
 //! ## PSS-encode + MGF1 reuse
 //!
@@ -113,168 +108,59 @@ fn byteLen(bits: usize) usize {
     return (bits + 7) / 8;
 }
 
-// ── composite-modulus number theory (extended Euclid over big.int) ──────
+// ── composite-modulus arithmetic on rsa's montint modulus ─────────────────
 //
-// `std.crypto.ff` deliberately has no `invert` (and Fermat inversion needs
-// a prime modulus), so the blinding inverse `r⁻¹ mod n` is computed with
-// the classic extended Euclidean algorithm over `std.math.big.int`. All
-// scratch lives in a stack FixedBufferAllocator arena that is securely
-// zeroed on exit (the operands are secret blinding factors).
-//
-// The Euclid loop itself is `rsa.bigModInverse` (exported `pub` for exactly
-// this reuse — see its doc comment in `modules/rsa/src/root.zig`), the same
-// routine `SecretKey.fromPrimes` uses privately to derive `d = e⁻¹ mod λ(n)`.
-// This file only keeps the byte<->BigInt conversion helpers below (`newBig`/
-// `bigFromBytes`), still needed locally for `isCoprime`'s own gcd check and
-// for building `feInvert`'s operands before handing them to `rsa`.
+// Every client-side operation here — the blinding factor, the composite-
+// modulus inverse, `r^e`, the blinding and unblinding products — runs on the
+// `montint.DynModint` that `rsa.PublicKey` already carries for `n`
+// (`pk.n_mont`, built once when the key is parsed). Until 2026-11-13 this
+// layer was `std.crypto.ff` plus an extended Euclid over `std.math.big`
+// (`rsa.bigModInverse`) behind a multiplicative mask, and a second big-int
+// gcd for RFC 9474's coprimality check: variable-time, masked to compensate,
+// and most of `blind`'s cost (4.6–5.5× CIRCL). `DynModint.inverse` is
+// montint's batched Bernstein–Yang safegcd — constant-time in the operand and
+// in the modulus value, a few tens of µs at 2048 bits, and the same engine
+// `rsa`'s own private-op blinding inverts with — so neither the mask nor the
+// big-int scratch arenas are needed any more.
 
-const BigInt = std.math.big.int.Managed;
+/// `rsa.PublicKey.n_mont`'s type, `montint.DynModint(rsa.max_modulus_bits)`,
+/// named through the field so this module needs no `montint` dependency of
+/// its own: every operation used here is a `pub` method of that type.
+const NMont = @FieldType(rsa.PublicKey, "n_mont");
+/// A normal-domain element of `NMont` (`8 · max_limbs` bytes, little-endian
+/// limbs, zero above the modulus's slot).
+const Elem = NMont.Elem;
 
-/// Limb capacity covering `rsa.max_modulus_bits`-sized operands with
-/// product headroom; every scratch `BigInt` is pre-sized to this so the
-/// Euclid loop performs no reallocation-driven growth inside the
-/// fixed-buffer arena.
-const big_capacity = (2 * rsa.max_modulus_bits) / @bitSizeOf(std.math.big.Limb) + 4;
-
-fn newBig(gpa: std.mem.Allocator) !BigInt {
-    return BigInt.initCapacity(gpa, big_capacity);
+fn wipeElem(e: *Elem) void {
+    std.crypto.secureZero(u64, e);
 }
 
-/// Big-endian unsigned bytes -> `BigInt` (leading zeros tolerated).
-fn bigFromBytes(gpa: std.mem.Allocator, bytes: []const u8) !BigInt {
-    var x = try newBig(gpa);
-    if (bytes.len == 0) {
-        try x.set(0);
-        return x;
-    }
-    var m = x.toMutable();
-    m.readTwosComplement(bytes, bytes.len * 8, .big, .unsigned);
-    x.setMetadata(m.positive, m.len);
-    return x;
+/// `pk.e` big-endian, without leading zeros (the public exponent `powPublic`
+/// walks). `e < n` always fits `buf`.
+fn exponentBE(pk: *const rsa.PublicKey, buf: *[max_modulus_len]u8) []const u8 {
+    pk.e.toBytes(buf, .big) catch unreachable; // e < n ≤ 2^(8·max_modulus_len)
+    return std.mem.trimStart(u8, buf, &.{0});
 }
 
-const InvertError = error{NotInvertible};
-
-/// `x⁻¹ mod m` at the `Fe` level. VARIABLE-TIME in `x` (see
-/// `rsa.bigModInverse`) — callers holding a secret `x` go through
-/// `maskedInvert` instead; this direct form is for the deterministic
-/// `blindWithFactor` KAT seam and for values already independent of any
-/// long-term secret.
-fn feInvert(m: rsa.Modulus, x_param: rsa.Fe) InvertError!rsa.Fe {
-    const modulus_len = byteLen(m.bits());
-
-    // `x_param` arrives as a by-value Fe copy -- this function's OWN copy on
-    // its own frame, same class of gap as audit finding B6/B9 (which fixed
-    // `blind`/`blindCore`/`maskedInvert`/`blindSign`'s struct-level Fe
-    // copies but missed this one): only `x_bytes` below was ever wiped, not
-    // the struct-level `x` that produced it. `feInvert` is reached with a
-    // real, unmasked secret both via `maskedInvert` (masked `v`) and
-    // directly via `blindWithFactor` (the caller's raw `r`), so this is
-    // live, not theoretical.
-    var x = x_param;
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&x));
-
-    var x_bytes: [max_modulus_len]u8 = undefined;
-    defer std.crypto.secureZero(u8, &x_bytes);
-    x.toBytes(x_bytes[0..modulus_len], .big) catch unreachable; // x < m fits
-    var n_bytes: [max_modulus_len]u8 = undefined;
-    m.toBytes(n_bytes[0..modulus_len], .big) catch unreachable;
-
-    var scratch: [128 * 1024]u8 = undefined;
-    defer std.crypto.secureZero(u8, &scratch);
-    var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    const gpa = fba.allocator();
-
-    var out_buf: [max_modulus_len]u8 = undefined;
-    defer std.crypto.secureZero(u8, &out_buf);
-    const impl = struct {
-        fn run(a: std.mem.Allocator, xb: []const u8, nb: []const u8, out: []u8) !void {
-            var bx = try bigFromBytes(a, xb);
-            var bm = try bigFromBytes(a, nb);
-            var inv = try rsa.bigModInverse(a, &bx, &bm);
-            inv.toConst().writeTwosComplement(out, .big);
-        }
-    };
-    // The arena is sized so allocation cannot fail; every failure mode
-    // collapses fail-closed into NotInvertible.
-    impl.run(gpa, x_bytes[0..modulus_len], n_bytes[0..modulus_len], out_buf[0..modulus_len]) catch
-        return error.NotInvertible;
-    return rsa.Fe.fromBytes(m, out_buf[0..modulus_len], .big) catch unreachable; // inv < m canonical
-}
-
-/// `x⁻¹ mod m` for a SECRET `x`: masks `x` with a fresh uniform secret `u`
-/// before running the variable-time Euclid loop, so the divisions operate
-/// on `v = x·u mod n` — a uniformly distributed value statistically
-/// independent of `x` — and unmasks via `x⁻¹ = v⁻¹·u mod n`. The masking
-/// multiplications themselves are `std.crypto.ff`'s constant-time `mul`.
-/// A `NotInvertible` result is retried under a fresh mask (the mask, not
-/// `x`, may be the non-invertible party — probability ~2⁻²⁰⁴⁷ for a real
-/// modulus); persistent failure means `x` itself shares a factor with `m`.
-fn maskedInvert(m: rsa.Modulus, x: rsa.Fe, random: std.Random) InvertError!rsa.Fe {
-    var attempt: usize = 0;
-    while (attempt < 4) : (attempt += 1) {
-        // u/v/v_inv are secret Fe VALUES, not just the byte buffers they get
-        // serialized into elsewhere -- audit finding B6/B9: only the byte
-        // copies were ever secureZero'd, leaving the struct-level copy (the
-        // one `std.crypto.ff` actually computes with) live on the stack.
-        var u = sampleFe(m, random);
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&u));
-        var v = m.mul(x, u);
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&v));
-        var v_inv = feInvert(m, v) catch continue;
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&v_inv));
-        return m.mul(v_inv, u);
-    }
-    return error.NotInvertible;
-}
-
-/// gcd(a, n) == 1 over big-endian byte strings (RFC 9474 §4 Blind step 4's
-/// `is_coprime` check — a genuine big-int gcd against the COMPOSITE `n`,
-/// not an `Fe` operation). Fails CLOSED (returns `false`) if the scratch
-/// arena is ever exhausted.
-fn isCoprime(a_bytes: []const u8, n_bytes: []const u8) bool {
-    var scratch: [128 * 1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    return isCoprimeAlloc(fba.allocator(), a_bytes, n_bytes);
-}
-
-/// `isCoprime`'s allocator-parameterized core (audit finding B12). Split out
-/// SOLELY so a test can hand it a `std.testing.FailingAllocator` and hit the
-/// `catch false` fail-closed path directly and cheaply — the real 128 KiB
-/// scratch arena above only exhausts on an input around ~128 KB / ~1M bits,
-/// and `std.math.big.int`'s gcd at that size is minutes-scale, impractical
-/// inside a unit test's time budget (see A1/blindrsa.md B12). Private helper
-/// (`isCoprime` itself is not `pub` either); no public API change.
-fn isCoprimeAlloc(gpa: std.mem.Allocator, a_bytes: []const u8, n_bytes: []const u8) bool {
-    const impl = struct {
-        fn run(a: std.mem.Allocator, ab: []const u8, nb: []const u8) !bool {
-            var ba = try bigFromBytes(a, ab);
-            var bn = try bigFromBytes(a, nb);
-            var g = try newBig(a);
-            try g.gcd(&ba, &bn);
-            return g.toConst().orderAgainstScalar(1) == .eq;
-        }
-    };
-    return impl.run(gpa, a_bytes, n_bytes) catch false;
-}
-
-/// Uniform random field element in `[1, m)` by REJECTION sampling: draw
-/// `bits(m)` random bits (top byte masked), reject `>= m` or `== 0`,
-/// redraw. NOT the biased "reduce a wide random value mod n" shortcut —
-/// `r`'s uniformity is what the blinding security argument leans on (see
-/// SPEC.md "Uniform sampling"). Acceptance probability is > 1/2 per draw
-/// (the mask bounds the candidate below `2^bits(m) < 2m`).
-fn sampleFe(m: rsa.Modulus, random: std.Random) rsa.Fe {
-    const modulus_bits = m.bits();
+/// Uniform random element of `[1, m)` into `out` by REJECTION sampling: draw
+/// `bits(m)` random bits (top byte masked), reject `>= m` or `== 0`, redraw.
+/// NOT the biased "reduce a wide random value mod n" shortcut — `r`'s
+/// uniformity is what the blinding security argument leans on (see SPEC.md
+/// "Uniform sampling"). Acceptance probability is > 1/2 per draw (the mask
+/// bounds the candidate below `2^bits(m) < 2m`). One `random.bytes` call of
+/// exactly the modulus length per attempt (the ctgrind harness and the tests
+/// recognise the draw by that length).
+fn sampleElem(np: *const NMont, random: std.Random, out: *Elem) void {
+    const modulus_bits = np.bits();
     const modulus_len = byteLen(modulus_bits);
     var buf: [max_modulus_len]u8 = undefined;
-    defer std.crypto.secureZero(u8, &buf);
+    defer std.crypto.secureZero(u8, buf[0..modulus_len]);
     while (true) {
         random.bytes(buf[0..modulus_len]);
         buf[0] &= @as(u8, 0xff) >> @intCast(8 * modulus_len - modulus_bits);
-        const fe = rsa.Fe.fromBytes(m, buf[0..modulus_len], .big) catch continue;
-        if (fe.isZero()) continue;
-        return fe;
+        out.* = np.elemFromBytesBE(buf[0..modulus_len]) catch continue;
+        if (NMont.isZero(out)) continue;
+        return;
     }
 }
 
@@ -425,34 +311,33 @@ pub const BlindError = PssEncodeError || error{
 /// this module). Determinism for the RFC 9474 Appendix A KATs (whose fixed
 /// `r` this function cannot take) lives in `blindWithFactor`, which keeps
 /// the `salt` parameter for exactly that reason. `random` MUST be
-/// cryptographically secure — the salt, the blinding factor `r`'s
-/// secrecy/uniformity (the entire unlinkability argument), and the
-/// Euclid-masking inside `maskedInvert` all depend on it. On success,
+/// cryptographically secure — the salt and the blinding factor `r`'s
+/// secrecy/uniformity (the entire unlinkability argument) depend on it. On success,
 /// writes the modulus-length blinded message into `blinded_msg_out` and
 /// fills `ctx_out` with everything `finalize` needs later.
 ///
-/// Construction (RFC 9474 §4 Blind): steps 5-6 here (sample `r` uniform
-/// in `[1, n)` by rejection, `inv = r⁻¹ mod n` via the masked
-/// extended-Euclid inverse), steps 1-4 and 7-9 in `blindCore` (shared
-/// with `blindWithFactor`).
+/// Construction (RFC 9474 §4 Blind): the salt is drawn here, everything
+/// else (sample `r` uniform in `[1, n)` by rejection, `inv = r⁻¹ mod n`,
+/// the blinding itself) in `blindCore`, shared with `blindWithFactor`.
 /// A1 B6/B9: the secrets that survive `blind()` are not copies this module
-/// holds. Every `Fe` and byte buffer on the path is `secureZero`'d already,
-/// and the residue stayed at the same count — it lives in `std.crypto.ff`'s
-/// own internals (Montgomery scratch, byte<->limb conversion) and in
-/// `std.math.big`'s Euclid temporaries, which no `secureZero` this module
-/// can write reaches. So the stack those callees used is zeroed wholesale
-/// instead, the technique `bip340` (F2), `xmss` (F3) and `bulletproofs`
-/// (B12) close the same class with.
+/// holds. Every `Elem` and byte buffer on the path is `secureZero`'d
+/// already; the residue lives in the callees' own temporaries (montint's
+/// Montgomery and safegcd scratch; until 2026-11-13 `std.crypto.ff`'s and
+/// `std.math.big`'s), which no `secureZero` this module can write reaches. So
+/// the stack those callees used is zeroed wholesale instead, the technique
+/// `bip340` (F2), `xmss` (F3) and `bulletproofs` (B12) close the same class
+/// with.
 ///
-/// Sized from the deepest frame on the path: `feInvert` alone puts a 128 KiB
-/// Euclid arena on its own frame, and `maskedInvert` can call it under
-/// `blind`'s own frames, so 256 KiB covers the tree with room. The probe
-/// asserts zero residue, so a call tree that outgrows this goes red there.
+/// Sized when the deepest frame was a 128 KiB big-int Euclid arena
+/// (`blind` left 207 632 B of dirty stack); montint's operations need less
+/// (`DynModint.stack_bytes`: at most 144 KiB at the 8192-bit capacity). The
+/// probe asserts zero residue, so a call tree that outgrows this goes red
+/// there.
 const blind_stack_burn = 256 * 1024;
 
 /// `blindSign` reaches deeper than `blind`: its CRT private op runs inside
 /// `rsa`, and the probe measured 335 424 B of dirty stack below the call
-/// where `blind` leaves 207 632 B. Measured consequence of getting this
+/// where `blind` left 207 632 B (2026-10, both before montint). Measured consequence of getting this
 /// wrong: at 256 KiB the key's prime factors `p` and `q` were still readable
 /// (2 hits each) below the burn.
 const sign_stack_burn = 512 * 1024;
@@ -495,22 +380,10 @@ pub fn blind(
     const salt = salt_buf[0..salt_len];
     random.bytes(salt);
 
-    // Steps 5-6: sample r ∈ [1, n) uniformly; invert it (masked — r is
-    // secret and the Euclid loop is variable-time). A non-invertible r
-    // (gcd(r, n) != 1 — probability ~2⁻²⁰⁴⁷, or evidence n is malformed)
-    // is redrawn a bounded number of times, then reported.
-    var attempt: usize = 0;
-    while (attempt < 4) : (attempt += 1) {
-        // Defense in depth alongside blindCore's own wipe of its by-value
-        // copies (audit finding B6/B9): this frame's r/r_inv are a
-        // DIFFERENT stack slot than blindCore's parameter copies.
-        var r = sampleFe(pk.n, random);
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&r));
-        var r_inv = maskedInvert(pk.n, r, random) catch continue;
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&r_inv));
-        return blindCore(pk, Hash, prepared_msg, salt, r, r_inv, ctx_out, blinded_msg_out);
-    }
-    return error.InvalidBlindingFactor;
+    // Steps 5-6 (sample r ∈ [1, n) uniformly, invert it) run inside
+    // blindCore, where m is known: one inversion serves both step 4's
+    // coprimality check and step 6 (see blindCore).
+    return blindCore(pk, Hash, prepared_msg, salt, .{ .random = random }, ctx_out, blinded_msg_out);
 }
 
 /// Deterministic variant of `blind` with a caller-supplied blinding
@@ -519,11 +392,11 @@ pub fn blind(
 /// (`kat_test.zig` feeds the RFC's own fixed `r` and asserts
 /// `blinded_msg`/`ctx.r_inv` byte-exact).
 ///
-/// **Timing caveat**: unlike `blind`, this form runs the VARIABLE-TIME
-/// extended-Euclid inverse directly on `r` (no mask — masking would
-/// require randomness, defeating the deterministic purpose). Production
-/// clients should call `blind`; use this only where `r`'s timing exposure
-/// is acceptable (tests, KATs, single-shot offline use). `r`'s uniformity
+/// Production clients should call `blind`: this form takes `r` from the
+/// caller, does not burn the stack afterwards, and keeps the PSS salt as a
+/// parameter (RFC 9474 §7.4, see `blind`). Since 2026-11-13 its arithmetic
+/// is the same constant-time montint path as `blind`'s (until then it ran
+/// the variable-time Euclid inverse on `r` unmasked). `r`'s uniformity
 /// requirements (SPEC.md) still apply — a biased or reused `r` breaks
 /// unlinkability regardless of which entry point computed with it.
 pub fn blindWithFactor(
@@ -535,45 +408,52 @@ pub fn blindWithFactor(
     ctx_out: *Context,
     blinded_msg_out: []u8,
 ) BlindError![]u8 {
-    // r must OS2IP into [1, n): fromBytes rejects >= n, isZero rejects 0.
-    const r = rsa.Fe.fromBytes(pk.n, r_bytes, .big) catch return error.InvalidBlindingFactor;
-    if (r.isZero()) return error.InvalidBlindingFactor;
-    // Step 6: inv = r⁻¹ mod n — also rejects gcd(r, n) != 1.
-    const r_inv = feInvert(pk.n, r) catch return error.InvalidBlindingFactor;
-    return blindCore(pk, Hash, prepared_msg, salt, r, r_inv, ctx_out, blinded_msg_out);
+    // r must OS2IP into [1, n): elemFromBytesBE rejects >= n, isZero rejects
+    // 0. Step 6's inverse (which also rejects gcd(r, n) != 1) runs in
+    // blindCore.
+    var r = pk.n_mont.elemFromBytesBE(r_bytes) catch return error.InvalidBlindingFactor;
+    defer wipeElem(&r);
+    if (NMont.isZero(&r)) return error.InvalidBlindingFactor;
+    return blindCore(pk, Hash, prepared_msg, salt, .{ .fixed = &r }, ctx_out, blinded_msg_out);
 }
 
-/// RFC 9474 §4 Blind steps 1-4 and 7-9, shared by `blind` (which sampled
-/// and masked-inverted `r`) and `blindWithFactor` (which parsed and
-/// direct-inverted it):
+/// Where `blindCore` gets its blinding factor `r` from.
+const BlindingFactor = union(enum) {
+    /// `blind`: drawn uniformly from `[1, n)`, redrawn (at most 4 draws in
+    /// all) if it is not a unit mod `n`.
+    random: std.Random,
+    /// `blindWithFactor`: the caller's `r`, already checked to be in
+    /// `[1, n)`; a non-unit is `error.InvalidBlindingFactor`.
+    fixed: *const Elem,
+};
+
+/// RFC 9474 §4 Blind, shared by `blind` and `blindWithFactor`; everything
+/// after step 2 runs on `pk.n_mont` (see "composite-modulus arithmetic"
+/// above):
 /// 1. `encoded_msg = pssEncode(...)` over `em_bits = bits(n) - 1`.
 /// 2. `m = OS2IP(encoded_msg)`.
-/// 4. `gcd(m, n) == 1` or abort (`error.InvalidMessageBlinding`).
-/// 7. `x = RSAVP1(pk, r) = r^e mod n` — via `rsa.rsavp1` at
-///    `max_modulus_len` width (OS2IP is zero-padding-invariant, so the
-///    fixed-width call serves every modulus size).
-/// 8. `z = (m · x) mod n` — constant-time `ff` multiplication.
+/// 4-6. `r` from `factor`; `t = (m · r)⁻¹ mod n` by the constant-time
+///    safegcd inverse. `t` exists iff BOTH `m` and `r` are units, so the one
+///    inversion is step 4's `gcd(m, n) == 1` check and step 6's inverse at
+///    once: `inv = r⁻¹ = t · m`. Only when it fails is `m` inverted on its
+///    own, to tell the two causes apart (`error.InvalidMessageBlinding` for
+///    `m`, a redraw or `error.InvalidBlindingFactor` for `r`).
+/// 7. `x = RSAVP1(pk, r) = r^e mod n` (`powPublic`: variable-time in the
+///    public `e` only).
+/// 8. `z = (m · x) mod n`.
 /// 9. `blinded_msg = I2OSP(z, modulus_len)`.
 fn blindCore(
     pk: rsa.PublicKey,
     comptime Hash: type,
     prepared_msg: []const u8,
     salt: []const u8,
-    r_param: rsa.Fe,
-    r_inv_param: rsa.Fe,
+    factor: BlindingFactor,
     ctx_out: *Context,
     blinded_msg_out: []u8,
 ) BlindError![]u8 {
-    // r/r_inv arrive as by-value Fe params, i.e. this function's OWN copy on
-    // its own frame -- audit finding B6: wiping only the derived byte
-    // buffers below (r_bytes) left this struct-level copy live. Copied into
-    // `var`s (params are immutable) so a mutable address is available for
-    // secureZero.
-    var r = r_param;
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&r));
-    var r_inv = r_inv_param;
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&r_inv));
-    const modulus_bits = pk.n.bits();
+    const np = &pk.n_mont;
+    // The montint modulus's own length (`toBytesBE` below requires it).
+    const modulus_bits = np.bits();
     const modulus_len = byteLen(modulus_bits);
     const em_bits = modulus_bits - 1;
     const em_len = byteLen(em_bits);
@@ -586,43 +466,57 @@ fn blindCore(
     // Step 2: m = OS2IP(encoded_msg). EM < 2^em_bits < n by construction
     // (pssEncode step 11 clears the excess top bits), so this cannot be
     // non-canonical; guarded defensively all the same.
-    const m = rsa.Fe.fromBytes(pk.n, em_buf[0..em_len], .big) catch return error.InvalidMessageBlinding;
+    var m = np.elemFromBytesBE(em_buf[0..em_len]) catch return error.InvalidMessageBlinding;
+    defer wipeElem(&m);
 
-    // Step 4: gcd(m, n) == 1 — the RFC's own "SHOULD abort" guard. A hit
-    // would mean the encoded message shares a factor with n (negligible
-    // for a well-formed encoding against a real modulus; finding one is
-    // factoring n).
-    var n_bytes: [max_modulus_len]u8 = undefined;
-    pk.n.toBytes(n_bytes[0..modulus_len], .big) catch unreachable;
-    if (!isCoprime(em_buf[0..em_len], n_bytes[0..modulus_len])) return error.InvalidMessageBlinding;
+    // Steps 4-6. r, m·r and the inverses are secret (any one of them
+    // unblinds blinded_msg); every Elem is wiped on exit, and `blind`'s
+    // stack burn takes what montint leaves below.
+    var r: Elem = undefined;
+    defer wipeElem(&r);
+    var t: Elem = undefined;
+    defer wipeElem(&t);
+    var r_inv: Elem = undefined;
+    defer wipeElem(&r_inv);
+    const attempts: usize = switch (factor) {
+        .random => 4,
+        .fixed => 1,
+    };
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        // A non-unit r (it shares p or q with n: probability ~2^-1023 for a
+        // uniform draw, or evidence n is malformed) is redrawn a bounded
+        // number of times, then reported.
+        if (attempt == attempts) return error.InvalidBlindingFactor;
+        switch (factor) {
+            .random => |g| sampleElem(np, g, &r),
+            .fixed => |f| r = f.*,
+        }
+        t = np.mul(&m, &r);
+        if (np.inverse(&t, &r_inv)) break; // r_inv = (m·r)⁻¹ for now
+        // m·r is not a unit. Step 4: if m itself is not, abort — the RFC's
+        // own "SHOULD abort" (negligible for a well-formed encoding against
+        // a real modulus; finding one is factoring n). Else r was the cause.
+        if (!np.inverse(&m, &t)) return error.InvalidMessageBlinding;
+    }
+    r_inv = np.mul(&r_inv, &m); // (m·r)⁻¹·m = r⁻¹
 
     ctx_out.* = .{
         .prepared_msg = prepared_msg,
         .salt_len = salt.len,
         .modulus_len = modulus_len,
     };
-    r_inv.toBytes(ctx_out.r_inv[0..modulus_len], .big) catch unreachable; // r_inv < n fits
+    np.toBytesBE(&r_inv, ctx_out.r_inv[0..modulus_len]);
 
     // Step 7: x = RSAVP1(pk, r) = r^e mod n. Like r itself, x is SECRET
-    // (x would unblind blinded_msg: m = blinded_msg · x⁻¹) — both byte
-    // buffers are wiped on exit.
-    var r_bytes: [max_modulus_len]u8 = undefined;
-    defer std.crypto.secureZero(u8, &r_bytes);
-    r.toBytes(&r_bytes, .big) catch unreachable; // zero-padded to full width
-    // `unreachable` is safe here (unlike the sk.rsasp1 call in blindSign,
-    // audit finding B1): rsavp1 is the PUBLIC operation and its
-    // PrimitiveError can only ever be MessageRepresentativeOutOfRange, never
-    // FaultDetected (that member is returned solely by the CRT PRIVATE op,
-    // privateOpCrt's Bellcore/BDL self-check) — and r came from sampleFe,
-    // which only ever returns a value < pk.n, so the range check cannot
-    // fire either.
-    var x_bytes = rsa.rsavp1(max_modulus_len, r_bytes, pk) catch unreachable; // r < n in range
-    defer std.crypto.secureZero(u8, &x_bytes);
-    const x = rsa.Fe.fromBytes(pk.n, &x_bytes, .big) catch unreachable; // x < n canonical
+    // (x would unblind blinded_msg: m = blinded_msg · x⁻¹).
+    var e_buf: [max_modulus_len]u8 = undefined;
+    var x = np.powPublic(&r, exponentBE(&pk, &e_buf));
+    defer wipeElem(&x);
 
     // Steps 8-9: z = m·x mod n; blinded_msg = I2OSP(z, modulus_len).
-    const z = pk.n.mul(m, x);
-    z.toBytes(blinded_msg_out[0..modulus_len], .big) catch unreachable; // z < n fits
+    const z = np.mul(&m, &x);
+    np.toBytesBE(&z, blinded_msg_out[0..modulus_len]);
     return blinded_msg_out[0..modulus_len];
 }
 
@@ -657,22 +551,27 @@ pub const BlindSignError = error{
 /// be the public half of `sk` (checked by assertion). `random` feeds the
 /// RFC 9474 §7.2 hardening below and MUST be cryptographically secure.
 ///
-/// **§7.2 private-op blinding — IMPLEMENTED here** (not inherited:
-/// `rsa.rsasp1` performs no message blinding of its own; `std.crypto.ff`
-/// gives a constant-time Montgomery-ladder modexp, and this layers the
-/// RFC's separately-RECOMMENDED base blind on top for a signer processing
-/// many requests under one key): draw a fresh secret `b ∈ [1, n)`, sign
-/// `m·b^e` instead of `m`, and unblind the result —
-/// `s = (m·b^e)^d · b⁻¹ = m^d·b·b⁻¹ = m^d (mod n)` — so the CRT
-/// private-key operation never runs on attacker-chosen input directly.
-/// The output is bit-identical to the unblinded computation.
+/// **§7.2 private-op blinding** — `rsa.rsadpCrtBlinded` with
+/// `.{ .csprng = random }` (`rsa`'s F2 base blinding; plain `rsa.rsasp1`
+/// runs unblinded): a fresh secret unit `b ∈ [1, n)` is drawn per call, the
+/// CRT halves run on `m·b^e` instead of `m`, and each half is unblinded by
+/// `b⁻¹` — `s = (m·b^e)^d · b⁻¹ = m^d (mod n)` — so the private-key
+/// operation never runs on attacker-chosen input directly. The output is
+/// bit-identical to the unblinded computation. Until 2026-11-13 this module
+/// built the same construction itself, mod `n` on `std.crypto.ff` with a
+/// masked big-int Euclid for `b⁻¹`; `rsa` does it in the CRT domain on
+/// montint (two half-size constant-time safegcd inverses, interleaved).
+/// A generator that can never produce a usable `b` (all zeros, or only
+/// values `>= n`) makes the draw loop forever, as before; one that keeps
+/// producing a multiple of `p` or `q` — a party who knows the factors — did
+/// stop after four draws and now does not.
 ///
 /// Construction (RFC 9474 §4 BlindSign + §7.2):
 /// 1. `m = OS2IP(blinded_msg)`, range-checked against `sk.n` (`blinded_msg`
 ///    must be exactly `modulus_len` bytes and `m < n`) —
 ///    `error.InvalidBlindedMessage` on failure.
-/// 2. `s = RSASP1(sk, m)` via `rsa.rsasp1` (CRT fast path), wrapped in the
-///    §7.2 base blind above.
+/// 2. `s = RSASP1(sk, m)` via `rsa.rsadpCrtBlinded` (CRT, with the §7.2
+///    base blind above; RSASP1 and RSADP are the same primitive).
 /// 3. Mandatory self-check: `m' = RSAVP1(pk, s)` via `rsa.rsavp1`; if
 ///    `m' != m`, return `error.SigningFailure` (fail closed) — NEVER
 ///    return an unverified `blind_sig` (Boneh-DeMillo-Lipton CRT-fault
@@ -686,68 +585,33 @@ pub fn blindSign(
     blinded_msg: []const u8,
     out: []u8,
 ) BlindSignError![]u8 {
-    // Same reason as `blind`: the secrets that survive are inside
-    // `std.crypto.ff` and `std.math.big`, not in copies this module holds.
-    // Runs last, after every secureZero below. See burnStack.
+    // Same reason as `blind`: the secrets that survive are inside `rsa` and
+    // `montint`, not in copies this module holds. Runs last. See burnStack.
     defer burnStack(sign_stack_burn);
     std.debug.assert(pk.n.v.eql(sk.n.v)); // pk must be sk's public half
     const modulus_len = byteLen(sk.n.bits());
     if (out.len < modulus_len) return error.OutputTooSmall;
 
-    // Step 1: OS2IP + range check (length exact, value < n).
+    // Step 1: OS2IP + range check (length exact here, value < n inside rsa:
+    // its `MessageRepresentativeOutOfRange`).
     if (blinded_msg.len != modulus_len) return error.InvalidBlindedMessage;
-    const m = rsa.Fe.fromBytes(sk.n, blinded_msg, .big) catch return error.InvalidBlindedMessage;
+    var m_bytes = @as([max_modulus_len]u8, @splat(0));
+    @memcpy(m_bytes[max_modulus_len - modulus_len ..], blinded_msg);
 
-    // Step 2 (+ §7.2): s = ((m·b^e)^d)·b⁻¹ mod n. b and b⁻¹ are secret;
-    // b's inverse goes through the masked Euclid (see maskedInvert), and
-    // every intermediate byte buffer is wiped.
-    var attempt: usize = 0;
-    const s: rsa.Fe = while (attempt < 4) : (attempt += 1) {
-        // b/b_inv are secret Fe VALUES (audit finding B6/B9) -- only their
-        // byte-buffer serializations below were ever wiped before this fix.
-        var b = sampleFe(sk.n, random);
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&b));
-        var b_inv = maskedInvert(sk.n, b, random) catch continue;
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&b_inv));
+    // Step 2 (+ §7.2): s = RSASP1(sk, m) under rsa's base blinding. Audit
+    // finding B1: `FaultDetected` (rsa's Bellcore/BDL check, audit F3 in
+    // `rsa`) is a real, reachable outcome — a CRT fault — and is exactly the
+    // event SigningFailure exists for, never `unreachable`.
+    const s_bytes = rsa.rsadpCrtBlinded(max_modulus_len, m_bytes, sk, .{ .csprng = random }) catch |err| switch (err) {
+        error.MessageRepresentativeOutOfRange => return error.InvalidBlindedMessage,
+        error.FaultDetected => return error.SigningFailure,
+    };
 
-        var b_bytes: [max_modulus_len]u8 = undefined;
-        defer std.crypto.secureZero(u8, &b_bytes);
-        b.toBytes(&b_bytes, .big) catch unreachable; // b < n fits
-        // Same reasoning as blindCore's rsavp1 call above: rsavp1 is the
-        // PUBLIC op (never returns FaultDetected) and b came from sampleFe
-        // (always < sk.n), so MessageRepresentativeOutOfRange cannot fire.
-        var xb_bytes = rsa.rsavp1(max_modulus_len, b_bytes, pk) catch unreachable; // b < n in range
-        defer std.crypto.secureZero(u8, &xb_bytes);
-        const x_b = rsa.Fe.fromBytes(sk.n, &xb_bytes, .big) catch unreachable; // < n canonical
-
-        var mb_bytes: [max_modulus_len]u8 = undefined;
-        defer std.crypto.secureZero(u8, &mb_bytes);
-        sk.n.mul(m, x_b).toBytes(&mb_bytes, .big) catch unreachable; // < n fits
-        // The CRT private-key op itself — constant-time ff pow inside rsa.
-        // Audit finding B1: this call's PrimitiveError is NOT range-only —
-        // unlike the rsavp1 (public-op) calls above, rsasp1 routes through
-        // privateOpCrt, whose Bellcore/BDL self-check (audit F3 in `rsa`)
-        // can legitimately return `error.FaultDetected` on a CRT fault
-        // (bit-flip, hardware glitch). That is exactly the event
-        // BlindSignError.SigningFailure and SPEC.md's "fail-closed by
-        // design" promise exist for; `catch unreachable` turned a
-        // documented, reachable failure into a Debug/ReleaseSafe panic and
-        // ReleaseFast UB instead. Range is still guaranteed (mb_bytes is a
-        // mod-n product), so the only realistic error left is the fault.
-        var sb_bytes = rsa.rsasp1(max_modulus_len, mb_bytes, sk) catch return error.SigningFailure;
-        defer std.crypto.secureZero(u8, &sb_bytes);
-        const s_b = rsa.Fe.fromBytes(sk.n, &sb_bytes, .big) catch unreachable; // < n canonical
-
-        break sk.n.mul(s_b, b_inv);
-    } else return error.SigningFailure;
-
-    // Step 3: mandatory self-check RSAVP1(pk, s) == m — fail closed.
-    var s_bytes: [max_modulus_len]u8 = undefined;
-    s.toBytes(&s_bytes, .big) catch unreachable; // s < n fits
+    // Step 3: mandatory self-check RSAVP1(pk, s) == m — fail closed. It is
+    // independent of rsa's own F3 check: it runs against `pk`, not `sk`, so it
+    // also catches a `pk` that is not `sk`'s public half (B3, B18).
     const m_check = rsa.rsavp1(max_modulus_len, s_bytes, pk) catch return error.SigningFailure;
-    var m_expect = @as([max_modulus_len]u8, @splat(0));
-    @memcpy(m_expect[max_modulus_len - modulus_len ..], blinded_msg);
-    if (!std.crypto.timing_safe.eql([max_modulus_len]u8, m_check, m_expect)) {
+    if (!std.crypto.timing_safe.eql([max_modulus_len]u8, m_check, m_bytes)) {
         return error.SigningFailure;
     }
 
@@ -794,7 +658,7 @@ pub const FinalizeError = error{
 ///    signature, so a non-canonical value fails closed as
 ///    `error.SignatureVerificationFailed` (same terminal error the
 ///    trailing verify would produce; no separate oracle).
-/// 3. `s = (z · ctx.r_inv) mod n` — constant-time `ff` multiplication
+/// 3. `s = (z · ctx.r_inv) mod n` — constant-time montint multiplication
 ///    (`ctx.r_inv` is secret).
 /// 4. `sig = I2OSP(s, modulus_len)`.
 /// 5. `verify(pk, Hash, ctx.prepared_msg, sig, ctx.salt_len)` — MANDATORY;
@@ -807,19 +671,24 @@ pub fn finalize(pk: rsa.PublicKey, comptime Hash: type, blind_sig: []const u8, c
     // mismatched modulus_len would otherwise slice ctx.r_inv (a fixed
     // [max_modulus_len]u8 array) out of bounds below, and ReleaseFast
     // compiles both the assert and that slice's bounds check out together.
-    if (ctx.modulus_len > max_modulus_len or byteLen(pk.n.bits()) != ctx.modulus_len)
+    // The length is the montint modulus's own, which `toBytesBE` below
+    // requires (it panics on a shorter output).
+    const np = &pk.n_mont;
+    if (ctx.modulus_len > max_modulus_len or np.byteLen() != ctx.modulus_len)
         return error.InvalidContext;
 
-    // Step 2: z = OS2IP(blind_sig), fail-closed on z >= n.
-    const z = rsa.Fe.fromBytes(pk.n, blind_sig, .big) catch return error.SignatureVerificationFailed;
+    // Step 2: z = OS2IP(blind_sig), fail-closed on z >= n. On `pk.n_mont`
+    // (montint) like `blind`; `std.crypto.ff` until 2026-11-13.
+    const z = np.elemFromBytesBE(blind_sig) catch return error.SignatureVerificationFailed;
     // ctx.r_inv was written by blind/blindWithFactor as a canonical value
     // < n; a corrupted/foreign ctx fails closed here too.
-    const r_inv = rsa.Fe.fromBytes(pk.n, ctx.r_inv[0..ctx.modulus_len], .big) catch
+    var r_inv = np.elemFromBytesBE(ctx.r_inv[0..ctx.modulus_len]) catch
         return error.SignatureVerificationFailed;
+    defer wipeElem(&r_inv);
 
     // Steps 3-4: s = z·r⁻¹ mod n; sig = I2OSP(s, modulus_len).
     const sig = out[0..ctx.modulus_len];
-    pk.n.mul(z, r_inv).toBytes(sig, .big) catch unreachable; // s < n fits
+    np.toBytesBE(&np.mul(&z, &r_inv), sig);
 
     // Step 5: mandatory trailing verify — fail-closed.
     try verify(pk, Hash, ctx.prepared_msg, sig, ctx.salt_len);
@@ -921,196 +790,185 @@ test "pssEncode rejects a salt too long for the target size (RFC 8017 SS9.1.1 st
     );
 }
 
-// ── private-helper tests (extended-Euclid inverse, gcd, sampling) ───────
+// ── private-helper tests (montint inverse, blind's steps 4-6, sampling) ──
 
 const kat = @import("kat_vectors.zig");
 
-test "feInvert: hand-checkable small case (7^-1 mod 15 == 13)" {
-    const m = try rsa.Modulus.fromPrimitive(u8, 15);
-    const seven = try rsa.Fe.fromPrimitive(u8, m, 7);
-    const inv = try feInvert(m, seven);
-    try std.testing.expectEqual(@as(u8, 13), try inv.toPrimitive(u8));
+/// A small public modulus as an `NMont` (`fromBytesBEPublic` takes any odd
+/// value >= 3; the slot is the 256-bit minimum).
+fn smallMont(v: u16) !NMont {
+    var be: [2]u8 = undefined;
+    std.mem.writeInt(u16, &be, v, .big);
+    return NMont.fromBytesBEPublic(&be);
 }
 
-test "feInvert: non-coprime input fails (5 shares a factor with 15)" {
-    const m = try rsa.Modulus.fromPrimitive(u8, 15);
-    const five = try rsa.Fe.fromPrimitive(u8, m, 5);
-    try std.testing.expectError(error.NotInvertible, feInvert(m, five));
+fn smallElem(v: u64) Elem {
+    var e = NMont.zero;
+    e[0] = v;
+    return e;
 }
 
-test "feInvert reproduces the RFC 9474 published inv from r (and back) over the real 4096-bit composite n" {
+test "n_mont inverse: hand-checkable small case (7^-1 mod 15 == 13) and a non-unit (5 mod 15)" {
+    const m = try smallMont(15);
+    var inv: Elem = undefined;
+    try std.testing.expect(m.inverse(&smallElem(7), &inv));
+    try std.testing.expectEqual(@as(u64, 13), inv[0]);
+    try std.testing.expect(!m.inverse(&smallElem(5), &inv));
+}
+
+test "n_mont inverse reproduces the RFC 9474 published inv from r (and back) over the real 4096-bit composite n, and rejects a factor of n" {
     const pk = try kat.publicKey();
-    const r = try rsa.Fe.fromBytes(pk.n, &kat.r, .big);
-    const inv = try feInvert(pk.n, r);
+    const np = &pk.n_mont;
+    const r = try np.elemFromBytesBE(&kat.r);
+    var inv: Elem = undefined;
+    try std.testing.expect(np.inverse(&r, &inv));
     var got: [kat.a1.inv.len]u8 = undefined;
-    try inv.toBytes(&got, .big);
+    np.toBytesBE(&inv, &got);
     try std.testing.expectEqualSlices(u8, &kat.a1.inv, &got);
     // Inverse of the inverse round-trips to r (inv is unique in [0, n)).
-    const r_back = try feInvert(pk.n, inv);
+    var r_back: Elem = undefined;
+    try std.testing.expect(np.inverse(&inv, &r_back));
     var got_r: [kat.r.len]u8 = undefined;
-    try r_back.toBytes(&got_r, .big);
+    np.toBytesBE(&r_back, &got_r);
     try std.testing.expectEqualSlices(u8, &kat.r, &got_r);
+    // gcd(p, n) == p != 1.
+    const p_el = try np.elemFromBytesBE(&kat.p);
+    try std.testing.expect(!np.inverse(&p_el, &inv));
 }
 
-test "feInvert rejects a factor of n (gcd(p, n) == p != 1)" {
-    const pk = try kat.publicKey();
-    var p_wide = @as([kat.n.len]u8, @splat(0));
-    @memcpy(p_wide[kat.n.len - kat.p.len ..], &kat.p);
-    const p_fe = try rsa.Fe.fromBytes(pk.n, &p_wide, .big);
-    try std.testing.expectError(error.NotInvertible, feInvert(pk.n, p_fe));
+// ── blind steps 4-6: one inversion of m·r, and which of the two failed ────
+//
+// `blindCore` inverts `t = m·r` once and derives `r⁻¹ = t⁻¹·m`; only when that
+// fails does it invert `m` alone, to decide between step 4's
+// `InvalidMessageBlinding` and a bad `r`. A real RSA modulus never shows
+// either failure (finding one is factoring `n`), so these tests use a modulus
+// with a known small factor: `n = 3·p` (`p` the KAT key's 2048-bit prime;
+// `PublicKey.fromBytes` checks size and parity, not primality). Then
+// `m` is a unit iff `3 ∤ m`, and since 256 ≡ 1 (mod 3) that is the byte sum
+// of the encoding mod 3.
+
+fn threeTimesP() [kat.p.len + 1]u8 {
+    var out: [kat.p.len + 1]u8 = undefined;
+    var carry: u16 = 0;
+    var i: usize = kat.p.len;
+    while (i > 0) : (i -= 1) {
+        const v = @as(u16, kat.p[i - 1]) * 3 + carry;
+        out[i] = @truncate(v);
+        carry = v >> 8;
+    }
+    out[0] = @intCast(carry);
+    return out;
 }
 
-// ── B5 anchor: the masking itself, not the value it produces ───────────────
-//
-// ⛔⛔ The test below this one ("mask cancels exactly") asserts VALUE equality
-// with the direct inverse — and therefore passes EXACTLY WHEN THE MASKING IS
-// GONE. The audit proved it: mutation `m8` (`maskedInvert` replaced by
-// `return feInvert(m, x);`) and `m21b` (the mask replaced by the constant 3)
-// both SURVIVED 42/42. Textbook `feedback_property_no_value_test_can_see`:
-// the guard was built on the artefact, not on the property.
-//
-// ⚠ And ctgrind cannot cover this either — a constant mask is still
-// branch-free, so no context count moves. The property is "a FRESH, UNIFORM
-// scalar is drawn per attempt", which is about the algorithm's use of
-// randomness, and the seam that makes it observable is already there:
-// `maskedInvert` takes its `std.Random` as a parameter.
-//
-// So these two tests count draws and force the retry path. Between them:
-//   * `m8` draws nothing at all           -> both fail,
-//   * `m21b` draws nothing and never retries -> both fail,
-//   * an implementation that draws once and reuses it -> the second fails.
+/// A salt for which `pssEncode(msg, salt)` over `pk` is (`want_div3`) or is
+/// not a multiple of 3. Deterministic: tries salts 0, 1, 2, … (each is a
+/// multiple with probability ~1/3).
+fn saltFor(pk: rsa.PublicKey, msg: []const u8, want_div3: bool) ![48]u8 {
+    const Sha384 = std.crypto.hash.sha2.Sha384;
+    const em_bits = pk.n.bits() - 1;
+    var em: [max_modulus_len]u8 = undefined;
+    const em_slice = em[0..byteLen(em_bits)];
+    var salt: [48]u8 = @splat(0);
+    for (0..64) |k| {
+        salt[47] = @intCast(k);
+        try pssEncode(Sha384, msg, &salt, em_bits, em_slice);
+        var sum: usize = 0;
+        for (em_slice) |c| sum += c;
+        if ((sum % 3 == 0) == want_div3) return salt;
+    }
+    return error.NoSuchSalt;
+}
 
-/// A `std.Random` that hands out a scripted sequence of full-width values and
-/// counts how many draws were taken. `sampleFe` requests `modulus_len` bytes
-/// per attempt, so one draw == one masking scalar.
+test "blind steps 4-6: a non-unit m is InvalidMessageBlinding, a non-unit r is InvalidBlindingFactor, and r_inv is r's inverse (n = 3p)" {
+    const Sha384 = std.crypto.hash.sha2.Sha384;
+    const n3 = threeTimesP();
+    const pk = try rsa.PublicKey.fromBytes(&n3, &kat.e);
+    const msg = "blindrsa steps 4-6";
+    var ctx: Context = undefined;
+    var out: [max_modulus_len]u8 = undefined;
+    var r_be = @as([n3.len]u8, @splat(0));
+
+    // m divisible by 3, r = 2 a unit: step 4 fails on m.
+    const salt_bad_m = try saltFor(pk, msg, true);
+    r_be[n3.len - 1] = 2;
+    try std.testing.expectError(error.InvalidMessageBlinding, blindWithFactor(pk, Sha384, msg, &salt_bad_m, &r_be, &ctx, &out));
+
+    // m a unit, r = 3 not: the factor is reported, not the message.
+    const salt_ok = try saltFor(pk, msg, false);
+    r_be[n3.len - 1] = 3;
+    try std.testing.expectError(error.InvalidBlindingFactor, blindWithFactor(pk, Sha384, msg, &salt_ok, &r_be, &ctx, &out));
+
+    // m a unit, r = 2: succeeds, and ctx.r_inv is 2⁻¹ mod n = (n + 1) / 2.
+    r_be[n3.len - 1] = 2;
+    _ = try blindWithFactor(pk, Sha384, msg, &salt_ok, &r_be, &ctx, &out);
+    const np = &pk.n_mont;
+    const r_inv = try np.elemFromBytesBE(ctx.r_inv[0..ctx.modulus_len]);
+    try std.testing.expect(NMont.isOne(&np.mul(&r_inv, &smallElem(2))));
+}
+
+/// A `std.Random` that scripts the modulus-length draws (`sampleElem`'s `r`)
+/// and counts them; every other draw (the salt) is zeros.
 const ScriptedRandom = struct {
+    r_len: usize,
     values: []const []const u8,
     draws: usize = 0,
 
     fn fill(self: *ScriptedRandom, buf: []u8) void {
+        @memset(buf, 0);
+        if (buf.len != self.r_len) return;
         const v = self.values[@min(self.draws, self.values.len - 1)];
         self.draws += 1;
-        @memset(buf, 0);
-        if (buf.len >= v.len) {
-            @memcpy(buf[buf.len - v.len ..], v);
-        } else {
-            @memcpy(buf, v[v.len - buf.len ..]);
-        }
+        @memcpy(buf[buf.len - v.len ..], v);
     }
 };
 
-test "B5: maskedInvert DRAWS a fresh scalar and RETRIES when the mask makes the product non-invertible" {
+test "blind redraws r after a non-unit draw, and the result is blindWithFactor's for the second draw" {
+    const Sha384 = std.crypto.hash.sha2.Sha384;
     const pk = try kat.publicKey();
-    const r = try rsa.Fe.fromBytes(pk.n, &kat.r, .big);
-
-    // First draw is `p`, a factor of `n`: `v = r*p mod n` still shares the
-    // factor, so `feInvert` must fail and the loop must draw AGAIN. The second
-    // draw is an ordinary value that works.
-    var second = @as([kat.n.len]u8, @splat(0));
-    second[kat.n.len - 1] = 0x07;
-    var scripted = ScriptedRandom{ .values = &.{ &kat.p, &second } };
+    // First r draw is `p` (shares a factor with n), the second the RFC's r.
+    var scripted = ScriptedRandom{ .r_len = kat.n.len, .values = &.{ &kat.p, &kat.r } };
     const random = std.Random.init(&scripted, ScriptedRandom.fill);
-
-    const inv = try maskedInvert(pk.n, r, random);
-
-    // Still the right answer -- masking must cancel exactly.
-    var got: [kat.a1.inv.len]u8 = undefined;
-    try inv.toBytes(&got, .big);
-    try std.testing.expectEqualSlices(u8, &kat.a1.inv, &got);
-
-    // ⛔ The load-bearing assertion. An unmasked invert answers straight from
-    // `r` and never touches the RNG; a constant mask never touches it either.
-    // Two draws means: one scalar was drawn, its product was rejected, and a
-    // SECOND, DIFFERENT one was drawn.
+    var ctx: Context = undefined;
+    var out: [max_modulus_len]u8 = undefined;
+    const blinded = try blind(pk, Sha384, &kat.a1.prepared_msg, Sha384.digest_length, random, &ctx, &out);
     try std.testing.expectEqual(@as(usize, 2), scripted.draws);
+    try std.testing.expectEqualSlices(u8, &kat.a1.inv, ctx.r_inv[0..ctx.modulus_len]);
+
+    const zero_salt: [Sha384.digest_length]u8 = @splat(0);
+    var ctx2: Context = undefined;
+    var out2: [max_modulus_len]u8 = undefined;
+    const want = try blindWithFactor(pk, Sha384, &kat.a1.prepared_msg, &zero_salt, &kat.r, &ctx2, &out2);
+    try std.testing.expectEqualSlices(u8, want, blinded);
 }
 
-test "B5: a mask that never changes cannot rescue a non-invertible product — the retry bound is real" {
+test "blind gives up after exactly four non-unit draws" {
+    const Sha384 = std.crypto.hash.sha2.Sha384;
     const pk = try kat.publicKey();
-    const r = try rsa.Fe.fromBytes(pk.n, &kat.r, .big);
-
-    // Every draw is `p`, so every attempt's product keeps the shared factor.
-    // A correct implementation exhausts its four attempts and fails closed;
-    // it must not loop forever, and it must not return a wrong value.
-    var scripted = ScriptedRandom{ .values = &.{&kat.p} };
+    var scripted = ScriptedRandom{ .r_len = kat.n.len, .values = &.{&kat.p} };
     const random = std.Random.init(&scripted, ScriptedRandom.fill);
-
-    try std.testing.expectError(error.NotInvertible, maskedInvert(pk.n, r, random));
-    // Four attempts, four scalars. Pins the bound the loop declares, and fails
-    // for an implementation that draws once and reuses it.
+    var ctx: Context = undefined;
+    var out: [max_modulus_len]u8 = undefined;
+    try std.testing.expectError(error.InvalidBlindingFactor, blind(pk, Sha384, &kat.a1.prepared_msg, 0, random, &ctx, &out));
     try std.testing.expectEqual(@as(usize, 4), scripted.draws);
 }
 
-test "maskedInvert matches the direct inverse (mask cancels exactly) and rejects non-invertible input" {
-    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x33)));
-    const random = csprng.random();
-    const pk = try kat.publicKey();
-
-    const r = try rsa.Fe.fromBytes(pk.n, &kat.r, .big);
-    const inv = try maskedInvert(pk.n, r, random);
-    var got: [kat.a1.inv.len]u8 = undefined;
-    try inv.toBytes(&got, .big);
-    try std.testing.expectEqualSlices(u8, &kat.a1.inv, &got);
-
-    var p_wide = @as([kat.n.len]u8, @splat(0));
-    @memcpy(p_wide[kat.n.len - kat.p.len ..], &kat.p);
-    const p_fe = try rsa.Fe.fromBytes(pk.n, &p_wide, .big);
-    try std.testing.expectError(error.NotInvertible, maskedInvert(pk.n, p_fe, random));
-}
-
-test "isCoprime: factor of n is NOT coprime; RFC encoded_msg IS (blind step 4's exact check)" {
-    try std.testing.expect(!isCoprime(&kat.p, &kat.n));
-    try std.testing.expect(!isCoprime(&kat.q, &kat.n));
-    try std.testing.expect(isCoprime(&kat.a1.encoded_msg, &kat.n));
-    try std.testing.expect(isCoprime(&kat.a4.encoded_msg, &kat.n));
-    // gcd(0, n) = n != 1.
-    try std.testing.expect(!isCoprime(&[_]u8{0}, &kat.n));
-    try std.testing.expect(isCoprime(&[_]u8{1}, &kat.n));
-}
-
-// ── B12 anchor: isCoprime fails CLOSED, not open, when its arena is
-// exhausted ─────────────────────────────────────────────────────────────
-//
-// Audit mutation m20 flips `catch false` to `catch true` in isCoprime's
-// exhaustion path: RFC 9474 Blind step 4's "is_coprime" guard would then
-// ACCEPT a message that shares a factor with n whenever the 128 KiB scratch
-// arena runs out, instead of rejecting it (`error.InvalidMessageBlinding`).
-// The audit itself flagged this as testable "only with a rigged input" —
-// reproducing the real arena's exhaustion needs an ~128 KB / ~1M-bit input,
-// and `std.math.big.int`'s gcd at that size is minutes-scale (checked: not
-// safe inside a unit test's time budget or `scripts/modtest`'s timeout, see
-// A1/blindrsa.md B12). `isCoprimeAlloc` above exists so this test can force
-// the SAME failure path -- an allocator that fails on its very first
-// request -- without touching the real arena size or the real gcd cost at
-// all: cheap, deterministic, and it exercises the identical `catch false`
-// `impl.run(...) catch false` line the real `isCoprime` runs.
-test "B12: isCoprime fails CLOSED (false), not open, when the underlying allocator is exhausted" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    // A well-formed, definitely-coprime pair (RFC 9474's own encoded_msg
-    // vs. n) -- if isCoprimeAlloc ever returns `true` here, the allocator
-    // failure was ignored rather than propagated fail-closed.
-    try std.testing.expectEqual(false, isCoprimeAlloc(failing.allocator(), &kat.a1.encoded_msg, &kat.n));
-    // Confirms the `false` above came from the injected allocator failure
-    // (not some other reason) -- the failure really was induced.
-    try std.testing.expect(failing.has_induced_failure);
-}
-
-test "sampleFe: always in [1, n), even for a modulus with few top-byte bits" {
+test "sampleElem: always in [1, n), even for a modulus with few top-byte bits" {
     var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x44)));
     const random = csprng.random();
     // 0x0209 = 521 (prime, 10 bits): the top byte carries only 2 usable
     // bits, so an unmasked draw would reject ~87% of the time — exercises
     // the top-byte mask, the rejection loop, and the zero rejection.
-    const m = try rsa.Modulus.fromPrimitive(u16, 521);
+    const m = try smallMont(521);
+    var e: Elem = undefined;
     var i: usize = 0;
     while (i < 200) : (i += 1) {
-        const fe = sampleFe(m, random);
-        const v = try fe.toPrimitive(u16);
-        try std.testing.expect(v >= 1 and v < 521);
+        sampleElem(&m, random, &e);
+        try std.testing.expect(e[0] >= 1 and e[0] < 521);
+        for (e[1..]) |w| try std.testing.expectEqual(@as(u64, 0), w);
     }
 }
 
-// ── B2 anchor: sampleFe's UNIFORMITY, not just its range ───────────────────
+// ── B2 anchor: sampleElem's UNIFORMITY, not just its range ─────────────────
 //
 // ⛔⛔ The test above only pins the RANGE. RFC 9474 §4.2 makes uniformity a
 // MUST ("The blinding factor r MUST be randomly chosen from a uniform
@@ -1119,9 +977,10 @@ test "sampleFe: always in [1, n), even for a modulus with few top-byte bits" {
 // but nothing enforced it. Two audit mutations SURVIVED the range-only
 // test, 42/42 green: `m7b` (top-byte mask one bit too narrow, so every draw
 // lands in the LOWER HALF `[1, 2^(bits-1))`) and `m6` (drop the `isZero`
-// rejection). These two tests close that gap.
+// rejection). These two tests close that gap (written for `sampleFe`, the
+// `std.crypto.ff` sampler `sampleElem` replaced on 2026-11-13).
 
-test "B2: sampleFe is not biased toward the lower half of the modulus (audit mutation m7b)" {
+test "B2: sampleElem is not biased toward the lower half of the modulus (audit mutation m7b)" {
     var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x66)));
     const random = csprng.random();
     // 1021 is prime; bits(1021) == 10 and 2^9 == 512 sits almost exactly at
@@ -1129,15 +988,15 @@ test "B2: sampleFe is not biased toward the lower half of the modulus (audit mut
     // sampler over [1, 1021) puts roughly HALF its draws at >= 512, while a
     // sampler whose top-byte mask is one bit too narrow can NEVER produce a
     // value >= 512 at all: every draw collapses into [1, 512).
-    const m = try rsa.Modulus.fromPrimitive(u16, 1021);
+    const m = try smallMont(1021);
     const n: usize = 4000;
     var above_half: usize = 0;
+    var e: Elem = undefined;
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        const fe = sampleFe(m, random);
-        const v = try fe.toPrimitive(u16);
-        try std.testing.expect(v >= 1 and v < 1021);
-        if (v >= 512) above_half += 1;
+        sampleElem(&m, random, &e);
+        try std.testing.expect(e[0] >= 1 and e[0] < 1021);
+        if (e[0] >= 512) above_half += 1;
     }
     // True uniform expectation is ~50%; a halved-range sampler scores 0%.
     // 30% is a wide margin below the true rate and a wide margin above the
@@ -1145,7 +1004,7 @@ test "B2: sampleFe is not biased toward the lower half of the modulus (audit mut
     try std.testing.expect(above_half >= n * 3 / 10);
 }
 
-test "B2: sampleFe rejects a zero draw and retries rather than returning it (audit mutation m6)" {
+test "B2: sampleElem rejects a zero draw and retries rather than returning it (audit mutation m6)" {
     const ZeroThenRandom = struct {
         inner: std.Random,
         zeros_left: usize,
@@ -1163,13 +1022,12 @@ test "B2: sampleFe rejects a zero draw and retries rather than returning it (aud
     var scripted = ZeroThenRandom{ .inner = csprng.random(), .zeros_left = 1 };
     const random = std.Random.init(&scripted, ZeroThenRandom.fill);
 
-    const m = try rsa.Modulus.fromPrimitive(u16, 1021);
-    const fe = sampleFe(m, random);
-    const v = try fe.toPrimitive(u16);
+    const m = try smallMont(1021);
+    var e: Elem = undefined;
+    sampleElem(&m, random, &e);
     // A sampler that skipped the isZero rejection would have returned 0
     // straight from the scripted first (all-zero) draw.
-    try std.testing.expect(v != 0);
-    try std.testing.expect(v >= 1 and v < 1021);
+    try std.testing.expect(e[0] >= 1 and e[0] < 1021);
     try std.testing.expectEqual(@as(usize, 0), scripted.zeros_left); // the zero draw WAS consumed
 }
 

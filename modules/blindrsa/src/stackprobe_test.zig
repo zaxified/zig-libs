@@ -15,10 +15,11 @@
 //! NEGATIVE control (a call that never sees the secret, must find 0) and a
 //! POSITIVE control (the same value parked in a local, must be found).
 //!
-//! `DeadStackFixedRandom` pins every random draw to the RFC's `r`, so the
-//! blinding factor AND `maskedInvert`'s mask `u` are both that value, which
-//! makes `v = r·u mod n = r² mod n` — the value the variable-time Euclid
-//! arena actually chews on — computable here without instrumenting the module.
+//! `DeadStackFixedRandom` pins every random draw to the RFC's `r` (the salt
+//! draw takes its last 48 bytes), so the blinding factor is that value and
+//! `t = m·r mod n` — the operand `blind`'s inverse runs on — is computable
+//! here without instrumenting the module. Until 2026-11-13 the needles were
+//! `r` and the masked `v = r·u = r²` of the big-int Euclid `blind` used then.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -174,7 +175,7 @@ fn count(needle: []const u8) usize {
     return hits;
 }
 
-test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead stack" {
+test "STACKPROBE (A1 B6/B9): blind() leaves no r, no m·r and no r⁻¹ on the dead stack" {
     if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     pk = try kat.publicKey();
 
@@ -204,35 +205,47 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
     for (0..3) |round| {
         measure(runBlind);
 
-        // Needles C/D: the masked `v = r·u mod n` that `maskedInvert` feeds to
-        // `feInvert`'s variable-time Euclid arena — B9's second half, which
-        // never had an anchor. Computed AFTER the snapshot, so it cannot
-        // contaminate the window it is searched in.
+        // Needles C/D: `t = m·r mod n`, the operand of `blind`'s safegcd
+        // inverse (B9's second half: what the inversion chews on). E/F:
+        // `r⁻¹` (the RFC's `inv`), held as montint limbs on the way into
+        // `ctx`. Computed AFTER the snapshot, so they cannot contaminate the
+        // window they are searched in.
+        const Sha384 = std.crypto.hash.sha2.Sha384;
+        const em_bits = pk.n.bits() - 1;
+        var em: [MAX]u8 = undefined;
+        const em_s = em[0 .. (em_bits + 7) / 8];
+        brsa.pssEncode(Sha384, &kat.a1.prepared_msg, kat.r[MAX - Sha384.digest_length ..], em_bits, em_s) catch unreachable;
+        const m_fe = rsa.Fe.fromBytes(pk.n, em_s, .big) catch unreachable;
         const r_fe = rsa.Fe.fromBytes(pk.n, &kat.r, .big) catch unreachable;
-        const v_fe = pk.n.mul(r_fe, r_fe);
+        const v_fe = pk.n.mul(m_fe, r_fe);
         var v_be: [MAX]u8 = undefined;
         v_fe.toBytes(&v_be, .big) catch unreachable;
         var v_le: [MAX]u8 = undefined;
         for (v_be, 0..) |c, idx| v_le[MAX - 1 - idx] = c;
+        var inv_le: [MAX]u8 = undefined;
+        for (kat.a1.inv, 0..) |c, idx| inv_le[MAX - 1 - idx] = c;
 
         const hits_r_be = count(r_be);
         const hits_r_le = count(r_le);
         const hits_v_be = count(v_be[0..32]);
         const hits_v_le = count(v_le[0..32]);
+        const hits_inv = count(kat.a1.inv[0..32]) + count(inv_le[0..32]);
         const dirty = dirtyDepth();
-        errdefer std.debug.print("  blind #{d}: r big-endian={d} r limbs={d} v=r^2 big-endian={d} v limbs={d}; dirty below the call {d} B\n", .{
-            round, hits_r_be, hits_r_le, hits_v_be, hits_v_le, dirty,
+        errdefer std.debug.print("  blind #{d}: r big-endian={d} r limbs={d} t=m·r big-endian={d} t limbs={d} r⁻¹={d}; dirty below the call {d} B\n", .{
+            round, hits_r_be, hits_r_le, hits_v_be, hits_v_le, hits_inv, dirty,
         });
 
+        try std.testing.expectEqual(@as(usize, 0), hits_inv);
         try std.testing.expectEqual(@as(usize, 0), hits_r_be);
         try std.testing.expectEqual(@as(usize, 0), hits_r_le);
         try std.testing.expectEqual(@as(usize, 0), hits_v_be);
         try std.testing.expectEqual(@as(usize, 0), hits_v_le);
     }
 
-    // `blindSign` is the other half of B6: its own `b`/`b_inv` go through the
-    // same `maskedInvert`, and the CRT private op runs on the key itself.
-    // Under the fixed random `b` is again `kat.r`, so the same needles apply.
+    // `blindSign` is the other half of B6: the §7.2 blinding factor `b`
+    // (drawn inside `rsa.rsadpCrtBlinded` since 2026-11-13) and the CRT
+    // private op on the key itself. Under the fixed random `b` is again
+    // `kat.r`, so the `r` needles apply.
     // `p`/`q` are measured too -- they belong to `rsa`, not here; the
     // key-copy control is reported with a failure, not asserted.
     sk = try kat.secretKey();
@@ -250,32 +263,20 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
     for (0..3) |round| {
         measure(runSign);
 
-        const r_fe = rsa.Fe.fromBytes(pk.n, &kat.r, .big) catch unreachable;
-        const v_fe = pk.n.mul(r_fe, r_fe);
-        var v_be: [MAX]u8 = undefined;
-        v_fe.toBytes(&v_be, .big) catch unreachable;
-        var v_le: [MAX]u8 = undefined;
-        for (v_be, 0..) |c, idx| v_le[MAX - 1 - idx] = c;
-
         const hits_b_be = count(r_be);
         const hits_b_le = count(r_le);
-        const hits_v_be = count(v_be[0..32]);
-        const hits_v_le = count(v_le[0..32]);
         const hits_p = count(kat.p[0..32]) + count(p_rev[0..32]);
         const hits_q = count(kat.q[0..32]) + count(q_rev[0..32]);
         var ob: [256]u8 = undefined;
         const offsets = hitOffsets(p_rev[0..32], &ob);
         const dirty = dirtyDepth();
-        errdefer std.debug.print("  blindSign #{d}: b big-endian={d} b limbs={d} v=b^2 big-endian={d} v limbs={d}; key p={d} q={d}; p limb hits at {s}; dirty below the call {d} B (burn starts at {d})\n", .{
-            round,     hits_b_be,                hits_b_le, hits_v_be,
-            hits_v_le, hits_p,                   hits_q,    offsets,
-            dirty,     WINDOW - sign_burn_bytes,
+        errdefer std.debug.print("  blindSign #{d}: b big-endian={d} b limbs={d}; key p={d} q={d}; p limb hits at {s}; dirty below the call {d} B (burn starts at {d})\n", .{
+            round,   hits_b_be, hits_b_le,                hits_p, hits_q,
+            offsets, dirty,     WINDOW - sign_burn_bytes,
         });
 
         try std.testing.expectEqual(@as(usize, 0), hits_b_be);
         try std.testing.expectEqual(@as(usize, 0), hits_b_le);
-        try std.testing.expectEqual(@as(usize, 0), hits_v_be);
-        try std.testing.expectEqual(@as(usize, 0), hits_v_le);
         // B20: the key's prime factors. These were 2 hits each while
         // `blindSign` took `rsa.SecretKey` BY VALUE -- an ABI copy made in
         // the CALLER's frame, which no burn in the callee can reach. The

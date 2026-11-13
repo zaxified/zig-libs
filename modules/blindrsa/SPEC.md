@@ -8,9 +8,9 @@
 
 **Audit:** review 2026-09-16 · mutation 2026-09-11 · src ?
 
-**Hardening:** fuzz 2026-10-07 (20,000 runs clean, BLINDRSA_FUZZ, forgery check) · ct 2026-10-02 (ctgrind)
+**Hardening:** fuzz 2026-10-07 (20,000 runs clean, BLINDRSA_FUZZ, forgery check) · ct 2026-11-13 (ctgrind: blind 3, sign 4 in-file contexts, all accept/reject verdicts)
 
-**Performance:** ref 0.18–5.45× CIRCL v1.6.1 `blindsign/blindrsa` (stand-in for RFC 9474, which has no code) · fastest ? (measured 2026-10-20)
+**Performance:** ref 0.10–0.81× CIRCL v1.6.1 `blindsign/blindrsa` (stand-in for RFC 9474, which has no code) · fastest ? (measured 2026-11-13)
 
 **Known defects:** none recorded
 
@@ -108,50 +108,56 @@ finding B14 — `blindWithFactor -> blindSign -> finalize -> verify`,
 
 ## Resolved design decisions (the former "TODO(fable)" items)
 
-1. **The composite-modulus inverse** — needs extended Euclid over
-   `std.math.big.int.Managed` (`std.crypto.ff` has no `invert`, and Fermat
-   inversion needs a prime modulus). `rsa` needed the identical routine
-   for its own key derivation and now exports it as `pub fn
-   bigModInverse` (`modules/rsa/src/root.zig`); this module calls that
-   directly (via `feInvert`) instead of carrying a local copy — the only
-   code that remains here is the byte<->BigInt glue (`newBig`/
-   `bigFromBytes`, still needed for `isCoprime`'s own gcd check) and the
-   masking layer (`maskedInvert`) around the call. Validated against
-   RFC-published data: inverting the RFC's `r` reproduces the RFC's
-   published `inv` byte-exact over the real 4096-bit composite `n` (plus
-   small hand-checkable cases and gcd≠1 rejection).
-   **Timing posture**: `rsa.bigModInverse`'s Euclid loop is variable-time
-   in its operands (same contract in both modules — verified before
-   unifying: `rsa` and `blindrsa`'s prior local copies were the same
-   bare, unmasked algorithm; the masking is layered on top by the caller
-   in both cases — `rsa`'s own `invModN` masks by only ever calling it on
-   a fresh random `r`, `blindrsa`'s `maskedInvert` masks explicitly), so
-   secret inputs never reach it raw — see "Constant-time" under "Threat
-   model" below for the masking construction.
-2. **`blind`** — implemented per the RFC construction (gcd(m,n) check via
-   `big.int.gcd`, rejection-sampled uniform `r ∈ [1,n)`, masked inverse,
-   `x = RSAVP1(pk,r)` via `rsa.rsavp1`, `blinded_msg = m·x mod n` via
-   constant-time `ff.mul`). A second entry point, **`blindWithFactor`**,
-   takes a caller-supplied `r` — the KAT-mode seam that makes `blind`'s
-   output byte-exactly reproducible against Appendix A (the RFC pins
-   `inv` but not `r`; `kat_vectors.zig` embeds the recomputed
-   `r = inv⁻¹ mod n`, cross-checked in Python both ways before
-   embedding). `blindWithFactor` runs the inverse UNMASKED (deterministic
-   by design) — documented as test/KAT-grade, production callers use
-   `blind`.
+1. **The composite-modulus inverse** — since 2026-11-13
+   `montint.DynModint.inverse` on the `n_mont` every `rsa.PublicKey`
+   carries (`std.crypto.ff` has no `invert`, and Fermat inversion needs a
+   prime modulus): a batched Bernstein–Yang safegcd, constant-time in the
+   operand and in the modulus value, the engine `rsa`'s own private-op
+   blinding inverts with. Its result is checked (`a·a⁻¹ ≡ 1`) before it is
+   returned. This module reaches the type through the field
+   (`@FieldType(rsa.PublicKey, "n_mont")`), so it needs no `montint`
+   dependency of its own. Validated against RFC-published data: inverting
+   the RFC's `r` reproduces the RFC's published `inv` byte-exact over the
+   real 4096-bit composite `n` (plus a hand-checkable small case and
+   non-unit rejection).
+   **History**: until 2026-11-13 it was `rsa.bigModInverse` — a
+   variable-time `std.math.big` extended Euclid — run on a masked operand
+   `x·u mod n` (`maskedInvert`) with `std.crypto.ff` around it, and RFC
+   9474 step 4's coprimality check was a second big-int gcd. Correct, but
+   it made `blind` 4.6–5.0× CIRCL (see Performance).
+2. **`blind`** — implemented per the RFC construction, on `pk.n_mont`:
+   rejection-sampled uniform `r ∈ [1,n)` (`sampleElem`), then ONE inversion
+   `t = (m·r)⁻¹` that serves step 4 (`gcd(m, n) = 1`) and step 6 together —
+   `m·r` is a unit iff both are — with `inv = r⁻¹ = t·m`; only if it fails
+   is `m` inverted alone, to report `InvalidMessageBlinding` (for `m`) or
+   redraw `r` (at most four draws, then `InvalidBlindingFactor`). Then
+   `x = r^e` (`powPublic`) and `blinded_msg = m·x mod n`. A second entry
+   point, **`blindWithFactor`**, takes a caller-supplied `r` — the KAT-mode
+   seam that makes `blind`'s output byte-exactly reproducible against
+   Appendix A (the RFC pins `inv` but not `r`; `kat_vectors.zig` embeds the
+   recomputed `r = inv⁻¹ mod n`, cross-checked in Python both ways before
+   embedding). It runs the same constant-time arithmetic (until 2026-11-13
+   it inverted `r` unmasked on the variable-time Euclid); it is still the
+   test/KAT seam — production callers use `blind`, which draws `r` and the
+   salt itself and burns the stack.
 3. **`blindSign`** — RFC 9474 §7.2's private-op-blinding hardening is
-   IMPLEMENTED (not skipped, not inherited — `rsa.rsasp1` does no message
-   blinding of its own): a fresh secret `b ∈ [1,n)` is drawn per call,
-   the CRT private-key operation runs on `m·b^e mod n` instead of `m`,
-   and the result is unblinded with `b⁻¹` (via the masked inverse). The
-   output is bit-identical to the unblinded computation (asserted by the
-   byte-exact Appendix A KATs under two different RNG seeds), so this
-   costs one extra public-exp modexp + two muls per signature and changes
-   no observable behavior. `blindSign` therefore takes a
-   `random: std.Random` parameter; the mandatory RSAVP1 self-check
-   remains fail-closed on top.
+   IMPLEMENTED, through `rsa.rsadpCrtBlinded(…, .{ .csprng = random })`
+   (plain `rsa.rsasp1` runs unblinded): a fresh secret unit `b ∈ [1,n)` is
+   drawn per call, the CRT halves run on `m·b^e`, and each is unblinded by
+   `b⁻¹` mod `p` / mod `q` (two half-size safegcd inverses, interleaved).
+   The output is bit-identical to the unblinded computation (asserted by the
+   byte-exact Appendix A KATs under two different RNG seeds), and `rsa`'s F3
+   fault check runs inside; `blindSign`'s own mandatory RSAVP1 self-check
+   against `pk` remains fail-closed on top. Until 2026-11-13 this module
+   built the §7.2 wrapper itself, mod `n` on `std.crypto.ff` with the masked
+   Euclid for `b⁻¹` (its unblinding multiply was 3 ctgrind contexts). One
+   behaviour changed with it: a generator that keeps returning a multiple of
+   `p` or `q` (a party that knows the factors) used to end in
+   `SigningFailure` after four draws; `rsa`'s draw loop now retries until it
+   gets a unit. A generator that never yields a candidate in `[1, n)` (all
+   zeros, say) loops forever in both versions.
 4. **`finalize`** — implemented: `s = z · ctx.r_inv mod n` (constant-time
-   `ff.mul`), I2OSP, then the MANDATORY trailing `verify` — the only
+   montint `mul` on `pk.n_mont`; `ff.mul` until 2026-11-13), I2OSP, then the MANDATORY trailing `verify` — the only
    return path goes through it, and a non-canonical `blind_sig`
    (`z >= n`) fails closed with the same terminal
    `error.SignatureVerificationFailed` (no separate error oracle).
@@ -168,14 +174,15 @@ For most uses in this repository that bias is immaterial (e.g. reducing a
 hash output into a scalar field for a nonce), but `r`'s DISTRIBUTION is
 exactly what the blinding security proof leans on (a non-uniform `r`
 leaks information about `m` through `blinded_msg`'s distribution).
-`blind` step 5 (`sampleFe` in `root.zig`) therefore uses REJECTION
+`blind` step 5 (`sampleElem` in `root.zig`; `sampleFe` on `std.crypto.ff`
+until 2026-11-13) therefore uses REJECTION
 sampling: draw `bits(n)` random bits (top byte masked, so acceptance
 probability exceeds 1/2 per draw), interpret big-endian, reject and
 redraw if the result is `>= n` or `== 0` — the same
 constant-`ish`-effort reject-sample shape `rsa.generate`/`generatePrime`
 already use elsewhere in this repository for prime candidates, just with
-a different accept predicate (`< n`, not primality). The same sampler
-feeds `blindSign`'s §7.2 blinding factor and `maskedInvert`'s masks.
+a different accept predicate (`< n`, not primality). `blindSign`'s §7.2
+blinding factor is drawn by `rsa` the same way (rejection on `n`).
 
 ## Threat model / limits
 
@@ -208,34 +215,49 @@ feeds `blindSign`'s §7.2 blinding factor and `maskedInvert`'s masks.
   (the ONLY way `finalize` can return a `sig` is through the real
   `verify` wrapper — see `root.zig`'s doc comment for the exact call it
   must make).
-- **Constant-time posture (as implemented)**: every modular
-  multiplication and exponentiation on secret material goes through
-  `std.crypto.ff`'s constant-time paths — the private-key operation
-  inside `blindSign` is `rsa.rsasp1`'s CRT modexp (constant-time `pow`),
-  and every secret-operand `mul` (blinding, unblinding, unmasking) is
-  `ff`'s constant-time multiplication. The ONE inherently
-  non-constant-time piece is the extended-Euclid modular inverse
-  (`big.int` division loop — `ff` cannot express a composite-modulus
-  inverse, and Bernstein-Yang-style constant-time inversion was judged
-  out of scope). The secret paths therefore never feed a raw secret into
-  it: `blind` and `blindSign` invert through `maskedInvert`, which runs
-  Euclid on `v = x·u mod n` for a fresh uniform secret mask `u` — a
-  value statistically independent of `x` — and unmasks with one more
-  constant-time `mul` (`x⁻¹ = v⁻¹·u`). Only the deterministic
-  `blindWithFactor` KAT seam inverts its input directly (documented on
-  the function; production clients use `blind`). Secret byte buffers
-  (`r`, `x = r^e`, `b`, Euclid scratch arenas) are wiped with
-  `std.crypto.secureZero` on scope exit.
+- **Constant-time posture (as implemented)**: since 2026-11-13 every
+  operation on secret material is montint (`rsa.PublicKey.n_mont` on the
+  client, `rsa`'s CRT path on the server), constant-time in the values:
+  `mul`, `powPublic` (variable-time in the public `e` only), and the
+  safegcd `inverse`, which runs on the secret `m·r` directly — there is no
+  mask any more, because the inverse no longer leaks. Secret buffers (`r`,
+  `m·r`, `r⁻¹`, `x = r^e`) are wiped with `std.crypto.secureZero` on scope
+  exit. What remains value-dependent is a handful of accept/reject
+  verdicts, and the ctgrind rows (re-measured 2026-11-13, `--stacks`) are
+  exactly these:
+  - **`blind`: 3 in-file contexts** (was ≤ 493, all `std.math.big` inside
+    the Euclid over the masked operand): (1) `montint` `elemFromBytesBE`'s
+    `< n` verdict inside `sampleElem`'s rejection loop, and (2) the
+    sampler's `isZero` rejection — both decide only whether a candidate is
+    DISCARDED, and a discarded candidate is never used; (3) `blindCore`'s
+    `if (np.inverse(&t, …)) break` on the unit verdict of `m·r`, false
+    only for a multiple of `p` or `q`.
+  - **`sign`: 4 in-file contexts** (was 7): `rsa` `drawBlindingPair`'s
+    redraw verdict on its blinding pair (rsa `root.zig` ~1196, false only
+    for `b ≡ 0 mod p or q`), `rsa`'s F3 fault-check verdict (~1286), the
+    `std.crypto.ff` `fromBytes` canonicality check when `rsavp1` parses the
+    signature `s` for the self-check, and `blindSign`'s own self-check
+    `timing_safe.eql` verdict — the last three on a signature that is about
+    to be published or refused. The three `ff` `montgomeryMul`
+    extra-reduction contexts of the old unblinding multiply (over the §7.2
+    mask `b⁻¹`) and the `ff` parse of `s_b` are gone.
+  Until then `blind` ran a variable-time big-int Euclid on a masked operand
+  (`maskedInvert`: `v = x·u mod n` for a fresh uniform `u`, unmasked by one
+  more `ff.mul`) and a big-int gcd for step 4.
   **And that is not enough on its own** (audit B6/B9): the copies that
-  survive a call are not ones this module holds. `std.crypto.ff` keeps
-  Montgomery and byte↔limb temporaries of its own, and `std.math.big`'s
-  Euclid arena holds more, so `blind` and `blindSign` additionally ZERO THE
+  survive a call are not ones this module holds. The callees keep
+  temporaries of their own (montint's Montgomery and safegcd scratch; until
+  2026-11-13 `std.crypto.ff`'s and `std.math.big`'s Euclid arena), so
+  `blind` and `blindSign` additionally ZERO THE
   STACK their callees used, in a `noinline` helper that runs after every
   other wipe (`blind_stack_burn` 256 KiB, `sign_stack_burn` 512 KiB; the
-  probe measured 207 632 B and 335 424 B of dirty stack below those calls).
+  probe measured 207 632 B and 335 424 B of dirty stack below those calls
+  before 2026-11-13; the sizes were kept and the probe still reads zero).
   `src/stackprobe_test.zig` asserts the result with a NEGATIVE and a
-  POSITIVE control in the same binary; measured, removing either burn brings
-  the blinding factor back (`r` and `b`, 1 hit each), and so does making the
+  POSITIVE control in the same binary (needles since 2026-11-13: `r`, the
+  inverse's operand `m·r`, `r⁻¹`; before, `r` and the masked `v = r²`);
+  measured on the old path, removing either burn brought the blinding
+  factor back (`r` and `b`, 1 hit each), and so did making the
   helper inlinable — the burn then lands in the caller's frame, above the
   region the computation used. The individual `secureZero` calls stay as
   defence in depth, but they are no longer separately observable: the burn
@@ -297,13 +319,15 @@ feeds `blindSign`'s §7.2 blinding factor and `maskedInvert`'s masks.
   plain `verify`, out-of-range or wrong-length `blinded_msg` at
   `blindSign`, and bad blinding factors at `blindWithFactor` (zero,
   `>= n`, and `r = p` — a real factor of `n`, the gcd≠1 path).
-- Private-helper unit tests in `root.zig`: `rsa.bigModInverse` via `feInvert`
-  (small hand-checkable case, non-coprime rejection, RFC `r` ↔ `inv`
-  round-trip over the real 4096-bit composite, factor-of-`n` rejection),
-  `maskedInvert` (mask cancels exactly; rejects non-invertible input),
-  `isCoprime` (factors of `n`, RFC `encoded_msg`s, 0 and 1), and
-  `sampleFe` (always in `[1, m)` for a modulus exercising the top-byte
-  mask).
+- Private-helper unit tests in `root.zig` (rewritten 2026-11-13 for the
+  montint path): `n_mont.inverse` (small hand-checkable case and a
+  non-unit, RFC `r` ↔ `inv` round-trip over the real 4096-bit composite,
+  factor-of-`n` rejection); `blind`'s steps 4-6 over a modulus with a known
+  small factor (`n = 3p`: a non-unit `m` is `InvalidMessageBlinding`, a
+  non-unit `r` is `InvalidBlindingFactor`, and `r_inv` is `r`'s inverse);
+  `blind` redrawing after a non-unit `r` (draws counted, result equal to
+  `blindWithFactor`'s for the second draw) and giving up after exactly four;
+  `sampleElem` range, uniformity (B2 `m7b`) and zero rejection (B2 `m6`).
 - Random-path round-trips: `blind → blindSign → finalize → verify` over
   the RFC 4096-bit key (both PSS and PSSZERO salt lengths, asserting a
   fresh `r` does NOT reproduce the KAT `blinded_msg`) and over a fresh
@@ -314,12 +338,23 @@ feeds `blindSign`'s §7.2 blinding factor and `maskedInvert`'s masks.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-blindrsa`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.18–5.45×, against 0.35–8.85× before. The card carries these figures.
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-blindrsa`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.18–5.45×, against 0.35–8.85× before.
+
+**2026-11-13, Zig 0.17.1: `blind` 4.6–5.0× → 0.54–0.81×** (`zig build bench-blindrsa`, same host, loaded by other jobs). The baseline that morning (`BENCH_ROUNDS=5`) was ref 0.17–5.03×, every row but `blind` already below 0.65×. `blind` cost 575 µs at RSA-2048 and 1.50 ms at 4096 against CIRCL's 120 µs / 300 µs: two big-int passes over the composite `n` (the masked Euclid inverse and step 4's gcd) on top of `std.crypto.ff`. It now runs on `rsa.PublicKey.n_mont` with one constant-time safegcd inversion of `m·r` for both steps (Design decisions 1-2); `blindSign`'s §7.2 blinding moved into `rsa.rsadpCrtBlinded` (CRT-domain, half-size inverses) and `finalize`'s multiply onto montint. The card carries the `BENCH_ROUNDS=7` run:
+
+| workload | ours µs | CIRCL µs | ours/CIRCL | before (same day) |
+|---|--:|--:|--:|--:|
+| 2048 rand blind | 84.9 | 124.3 | 0.68 | 4.79 |
+| 2048 zero blind | 97.9 | 121.2 | 0.81 | 4.64 |
+| 4096 rand blind | 220.2 | 330.6 | 0.67 | 4.88 |
+| 4096 zero blind | 225.7 | 336.0 | 0.67 | 5.03 |
+| blindSign (4 rows) | 740 / 4403–4586 | 4748–44707 | 0.10–0.16 | 0.17–0.25 |
+| finalize (4 rows) | 21.7–101.3 | 57.6–206.4 | 0.34–0.49 | 0.41–0.61 |
+| verify (4 rows) | 18.5–98.3 | 64.3–204.1 | 0.26–0.48 | 0.32–0.38 |
+
+Spread: the `BENCH_ROUNDS=5` run just before gave `blind` 0.54/0.66/0.66 and one 1.28 (4096 zero, 372 µs, against 213 µs for 4096 rand in the same run, which costs the same). The `=7` rerun put that row at 226 µs (0.67), so the 1.28 is host noise, not a slow path. CIRCL's `blindSign` swings 28–45 ms at 4096 between runs. Every row is below 1.0× in both runs apart from that one outlier, so P2 holds with margin.
 
 ## Backlog / deferred
-
-- **`blind` is 8.3–8.9× slower than CIRCL** *(measured 2026-10-07, `zig build bench-blindrsa`: 0.81 ms vs 0.10 ms at RSA-2048, 2.2 ms vs 0.25 ms at 4096)*. `blind` is dominated by the masked composite-modulus inverse (`maskedInvert` over `rsa.bigModInverse`'s Euclid loop, plus the stack burn) while CIRCL uses `math/big` `ModInverse` directly (variable-time, no masking). Look for a faster constant-cost inverse (e.g. a binary/safegcd-style one on montint limbs) before giving up the masking; `finalize` at RSA-4096 (1.26–1.38×) is a smaller gap of the same kind. Pure Zig, fits CONVENTIONS §2.
-- **`blindSign`'s unblinding off `std.crypto.ff`** (2026-10-02): `sk.n.mul(s_b, b_inv)` runs ff's `montgomeryMul`, whose extra-reduction select branches in ReleaseFast (ctgrind `sign`: 3 contexts, over the §7.2 mask `b_inv`); the parse of `s_b` adds one. `rsa` moved its own private path onto `montint.DynModint` the same day; doing the same here means carrying a `DynModint` for `n` (or rsa exposing its `n_mont`). Effort S. Fits §2.
 
 - **Partially blind RSA (draft-irtf-cfrg-partially-blind-rsa)** *(survey 2026-09-30)*.
   Public metadata bound into the signature — the feature that lets a token issuer
