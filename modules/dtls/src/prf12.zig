@@ -53,6 +53,7 @@ fn pHashT(comptime alg: HashAlg, secret: []const u8, seed: []const []const u8, o
 /// RFC 5246 §5: `PRF(secret, label, seed) = P_<hash>(secret, label + seed)`,
 /// with `label + seed` given as parts (`label` first) so no caller has to
 /// concatenate secrets into a scratch buffer. Fills all of `out`.
+// secret-api-ok: writes into the caller's `out`; the engine calls it inside its entry points' burns, and P_hash's own A(i)/block temporaries are wiped on return.
 pub fn prf(alg: HashAlg, secret: []const u8, label: []const u8, seed: []const []const u8, out: []u8) void {
     var parts: [6][]const u8 = undefined;
     std.debug.assert(seed.len < parts.len); // internal callers only, at most 4 seed parts

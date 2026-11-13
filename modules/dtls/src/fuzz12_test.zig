@@ -76,12 +76,17 @@ const HsMark = fz.Marker(enum { connected, refused, stalled, after_damage_connec
 
 pub fn fuzzHandshake12(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     _ = gpa;
-    const mode: Mode = if (S == fuzz_driver.Rng) @fromBackingInt(@intCast(src.valueRangeAtMost(u8, 0, 3))) else .psk;
+    // Full-range `value(u64)` reduced by hand, not a ranged draw (check-fuzz-reach R1).
+    const mode: Mode = @fromBackingInt(@intCast(src.value(u64) % 4));
     const cfg = configs(mode);
     var client = try Connection12.clientInit(cfg[0]);
     var server = try Connection12.serverInit(cfg[1]);
-    var seed: [32]u8 = undefined;
-    src.bytes(&seed);
+    // `--fuzz` (Smith): the input is the first datagram itself, drawn first
+    // in one call (check-fuzz-reach); the handshake randomness is fixed.
+    var raw: [2048]u8 = undefined;
+    var raw_len: usize = 0;
+    var seed: [32]u8 = @splat(0x5a);
+    if (S == fuzz_driver.Rng) src.bytes(&seed) else raw_len = src.slice(&raw);
     var csprng = std.Random.DefaultCsprng.init(seed);
     const rnd: conn13.Entropy = .{ .seeded_for_test = csprng.random() };
 
@@ -99,7 +104,6 @@ pub fn fuzzHandshake12(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerr
         at = src.valueRangeAtMost(u8, 0, 4);
     }
     var bufs: [2][8192]u8 = undefined;
-    var raw: [2048]u8 = undefined;
     var cur: []const u8 = client.startHandshake(rnd, 0, &bufs[0]) catch return;
     var to_server = true;
     var err_seen = false;
@@ -115,8 +119,8 @@ pub fn fuzzHandshake12(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerr
                 changed = n != cur.len or !std.mem.eql(u8, msg, cur);
             },
             .random => {
-                const n = src.slice(&raw);
-                msg = raw[0..n];
+                if (S == fuzz_driver.Rng) raw_len = src.slice(&raw);
+                msg = raw[0..raw_len];
                 changed = true;
             },
             .drop => break,
@@ -195,9 +199,9 @@ pub fn fuzzWire12(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
     _ = gpa;
     var gbuf: [2048]u8 = undefined;
     var buf: [2048]u8 = undefined;
-    const which: u8 = if (S == fuzz_driver.Rng) src.valueRangeAtMost(u8, 0, 5) else 0;
+    const which: u8 = @intCast(src.value(u64) % 6); // full-range draw (check-fuzz-reach R2)
     var input: []const u8 = undefined;
-    if (S == fuzz_driver.Rng and src.valueRangeAtMost(u8, 0, 3) != 0) {
+    if (src.value(u64) % 4 != 0) {
         const g = try genuine(which, &gbuf);
         input = buf[0..fz.damage(src, &buf, g)];
     } else input = buf[0..src.slice(&buf)];

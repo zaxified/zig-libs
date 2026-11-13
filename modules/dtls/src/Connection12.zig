@@ -290,6 +290,7 @@ pub const Connection12 = struct {
     /// (a dual-version hello) after the peer answered as a DTLS 1.2 server.
     /// `ch_body` is that hello's body, `message_seq` 0, sent in epoch-0
     /// record `next_record_seq - 1`. Used by `Endpoint`.
+    // secret-api-ok: the returned value holds a ClientHello and counters only; no key material exists before the ServerHello.
     pub fn fromDualClientHello(config: Config, ch_body: []const u8, next_record_seq: u48, now_ms: u64) HandshakeError!Connection12 {
         if (ch_body.len > max_client_hello or ch_body.len < 34) return error.Malformed;
         var c = Connection12{ .role = .client, .config = config, .state = .wait_server_hello };

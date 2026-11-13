@@ -1481,8 +1481,8 @@ dtls	ReleaseFast	ku	1	21	e2bf56be34b962fb	505aa3fdd426f98d
 #   app12 — after untainted handshakes, both directions' record keys (key, implicit salt / IV) tainted, send/recv both
 #   ways under AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM: 3 in-file = the 3 AEAD tag verdicts. (The 1.2 record header
 #   is public, so unlike app there is no sequence-number or content-type context.) No branch on a key or secret.
-dtls	ReleaseFast	hs12	1	96	8d7fe3dc55f3ed40	d87712f4d6e60179
-dtls	ReleaseFast	app12	1	3	8d7fe3dc55f3ed40	a30c6f8f370c5fa7
+dtls	ReleaseFast	hs12	1	96	b080caca411e3b30	d87712f4d6e60179
+dtls	ReleaseFast	app12	1	3	b080caca411e3b30	a30c6f8f370c5fa7
 # tlsserver (2026-10-21) — hs: Server.feed on the plaintext ClientHello
 # records of five recorded sessions (P-256/X25519, P-256/X25519MLKEM768, P-384,
 # Ed25519, a HelloRetryRequest) up to the first flight, every octet of

@@ -1,6 +1,7 @@
 # dtls
 
-DTLS 1.3 (RFC 9147). Two key-exchange modes (`Config.key_exchange`): `.psk`
+DTLS 1.3 (RFC 9147) and DTLS 1.2 (RFC 6347, since 2026-11-13 — see
+"DTLS 1.2 and version negotiation" below). Two key-exchange modes (`Config.key_exchange`): `.psk`
 (default, pre-shared-key, no (EC)DHE) with an additive X.509
 Certificate/CertificateVerify/CertificateRequest authentication layer on top,
 and `.cert_dhe` (PSK-less ephemeral key exchange — X25519, secp256r1, or the
@@ -200,6 +201,42 @@ minimal one-hop check only), `CertificateEntry` extensions (OCSP/SCT),
 session resumption, and the CCM suites (Zig 0.17 std ships only
 13-byte-nonce CCM presets, its generic `AesCcm` is not `pub`; the TLS/DTLS profile needs a 12-byte nonce — see
 `src/aead.zig`).
+
+## DTLS 1.2 and version negotiation
+
+`Config.versions` picks the protocol: `{.dtls13}` (the default — the 1.3
+`Connection`, unchanged), `{.dtls12}` (`Connection12`), or both, through
+`Endpoint`, which starts in 1.3 and hands over to the 1.2 engine when the
+peer only speaks 1.2 (with RFC 8446 §4.1.3's downgrade sentinel enforced by
+both sides).
+
+```zig
+const dtls = @import("dtls");
+
+var client = try dtls.Endpoint.clientInit(.{
+    .role = .client,
+    .versions = &.{ .dtls13, .dtls12 },
+    .key_exchange = .cert_dhe,
+    .peer_verify = .{ .trust_anchor = anchor_der },
+    .expected_peer_name = "device.example",
+    .now_sec = now,
+});
+const hello = try client.startHandshake(.{ .csprng = rng }, now_ms, &out);
+// ... client.handleFlight(datagram, .{ .csprng = rng }, now_ms, &out) until
+// isConnected(); then send / recv; client.version() says which one won.
+```
+
+1.2 suites (`Config.cipher_suites12`, pion/dtls's order): ECDHE_ECDSA and
+ECDHE_RSA with AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305; PSK with
+AES-128-GCM and ECDHE_PSK with ChaCha20-Poly1305 (`.psk` mode). Groups
+X25519, secp256r1, secp384r1. RSA-PSS preferred, PKCS#1 v1.5 accepted for
+1.2 peers that offer nothing else. HelloVerifyRequest cookies (stateless,
+via `Config.hello_retry`), retransmission, mutual authentication, the RFC
+5705 exporter and ALPN. Extended master secret (RFC 7627) and secure
+renegotiation signalling (RFC 5746) are required from the peer by default;
+renegotiation itself, CBC suites, static-RSA key exchange, compression and
+resumption are deliberately absent. Self-interop tested only so far — no
+live 1.2 peer yet (SPEC Backlog).
 
 ## Import
 

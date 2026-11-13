@@ -38,12 +38,14 @@ pub const Endpoint = union(enum) {
     v13: Connection,
     v12: Connection12,
 
+    // secret-api-ok: Config is slices and pointers only; a fresh engine holds no key material.
     pub fn clientInit(config: Config) conn13.ConfigError!Endpoint {
         try config.validate();
         if (config.allows(.dtls13)) return .{ .v13 = try Connection.clientInit(config) };
         return .{ .v12 = try Connection12.clientInit(config) };
     }
 
+    // secret-api-ok: as `clientInit`.
     pub fn serverInit(config: Config) conn13.ConfigError!Endpoint {
         try config.validate();
         if (config.allows(.dtls13)) return .{ .v13 = try Connection.serverInit(config) };
@@ -72,6 +74,7 @@ pub const Endpoint = union(enum) {
         };
     }
 
+    // secret-api-ok: dispatch only; both engines' `handleFlight` run their whole body under `burn.flight_burn`.
     pub fn handleFlight(self: *Endpoint, datagram: []const u8, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
         switch (self.*) {
             .v12 => |*c| return c.handleFlight(datagram, entropy, now_ms, out),
