@@ -116,6 +116,13 @@ pub const Options = struct {
     /// attacker-sized CipherValue). Default 4 MiB — far above any real SAML
     /// assertion.
     max_ciphertext_len: usize = 4 << 20,
+
+    /// `decryptDataToDocument` only: most elements the recovered plaintext may
+    /// parse into. The plaintext is attacker-chosen (whoever can encrypt to the
+    /// relying party's public key chooses it) and up to `max_ciphertext_len`
+    /// bytes; `xml`'s own default (1,048,576 elements) is ~350 MiB of tree at
+    /// the cap. 65,536 is far past any assertion (`saml` itself allows 8,192).
+    max_elements: usize = 65536,
 };
 
 pub const Error = error{
@@ -246,29 +253,49 @@ pub fn decryptAssertion(
     return decryptData(alloc, ed, sk, options);
 }
 
-/// Like `decryptData`, but parse the recovered octets and return the root
-/// element inside an owned `xml.Document` (caller `deinit`s). Handy when the
-/// caller wants the tree directly; SAML prefers `decryptAssertion` (bytes) so
-/// it can re-parse with its own ID-attribute options.
+/// The result of `decryptDataToDocument`: the parsed tree AND the plaintext
+/// buffer it borrows from. `xml.parse` does not copy its input (every element
+/// and attribute slice, and `Document.source`, point into it), so the buffer has
+/// to live exactly as long as the document; this owns both.
+pub const DecryptedDocument = struct {
+    doc: xml.Document,
+    /// The recovered octets `doc` borrows from. Do not free or modify.
+    plaintext: []u8,
+
+    /// Release the tree first (its slices borrow `plaintext`), then wipe the
+    /// recovered content before it goes back to `alloc` (CONVENTIONS §2.1 Z2:
+    /// it is a subject identity and every attribute asserted about it). `alloc`
+    /// must be the allocator `decryptDataToDocument` was given.
+    pub fn deinit(self: *DecryptedDocument, alloc: std.mem.Allocator) void {
+        self.doc.deinit();
+        std.crypto.secureZero(u8, self.plaintext);
+        alloc.free(self.plaintext);
+        self.* = undefined;
+    }
+};
+
+/// Like `decryptData`, but parse the recovered octets and return the tree
+/// together with the buffer it borrows from (caller `deinit`s with the same
+/// `alloc`). Handy when the caller wants the tree directly; SAML prefers
+/// `decryptAssertion` (bytes) so it can re-parse with its own ID-attribute
+/// options. The plaintext is attacker-chosen, so it is parsed under
+/// `Options.max_elements`.
 pub fn decryptDataToDocument(
     alloc: std.mem.Allocator,
     encrypted_data: *const xml.Element,
     sk: *const rsa.SecretKey,
     options: Options,
-) (Error || xml.ParseError)!xml.Document {
+) (Error || xml.ParseError)!DecryptedDocument {
     const plain = try decryptData(alloc, encrypted_data, sk, options);
-    // CONVENTIONS §2.1 Z1: this function ALLOCATES and FREES the plaintext
-    // itself and never hands it out, so wiping it is not the caller's job —
-    // it is this function's. `decryptData`'s doc comment three lines up says
-    // exactly that about its own return value, and the repo-wide zeroization
-    // pass that added the wipes inside `decryptData` walked past this sibling.
-    // Measured before the fix with a free-scanning allocator in ReleaseFast:
-    // 1 of 12 released blocks still held the whole recovered SAML assertion.
-    defer {
+    // CONVENTIONS §2.1 Z1: on a parse failure this function allocated and frees
+    // the plaintext itself, so wiping it is its job. On success ownership moves
+    // into the returned `DecryptedDocument`, whose `deinit` does the same.
+    errdefer {
         std.crypto.secureZero(u8, plain);
         alloc.free(plain);
     }
-    return xml.parse(alloc, plain, .{ .id_attr_names = &.{"ID"} });
+    const doc = try xml.parse(alloc, plain, .{ .id_attr_names = &.{"ID"}, .max_elements = options.max_elements });
+    return .{ .doc = doc, .plaintext = plain };
 }
 
 // ── content algorithm classification ────────────────────────────────────────
@@ -750,12 +777,12 @@ fn decodeBase64FromElement(alloc: std.mem.Allocator, el: *const xml.Element, max
     const max_chars = (std.math.divCeil(usize, max_len, 3) catch return error.CiphertextTooLarge) * 4 + 4;
 
     var n_sig: usize = 0;
-    try countSignificant(el, max_chars, &n_sig);
+    try countSignificant(alloc, el, max_chars, &n_sig);
 
     const compact = try alloc.alloc(u8, n_sig);
     defer alloc.free(compact);
     var w: usize = 0;
-    gatherSignificant(el, compact, &w);
+    try gatherSignificant(alloc, el, compact, &w);
     std.debug.assert(w == n_sig);
 
     const dec = std.base64.standard.Decoder;
@@ -771,35 +798,65 @@ fn isB64Space(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\r' or c == '\n';
 }
 
-fn countSignificant(el: *const xml.Element, cap: usize, n: *usize) Error!void {
-    for (el.children) |c| switch (c.content) {
-        .text, .cdata => |t| {
-            for (t) |ch| {
-                if (isB64Space(ch)) continue;
-                n.* += 1;
-                if (n.* > cap) return error.CiphertextTooLarge;
-            }
-        },
-        // `textContent` descends into child elements and `xmlsec1` accepts a
-        // nested element inside CipherValue too, so the traversal matches both
-        // — this is a bound on the work, not a change of shape.
-        .element => |e| try countSignificant(e, cap, n),
-        .comment, .pi => {},
-    };
+/// Count the significant (non-whitespace) characters under `el`, refusing past
+/// `cap`. An explicit heap stack, not recursion: the nesting depth is whatever
+/// `xml.Options.max_depth` the CALLER parsed the document with (a supported
+/// knob; `xml`'s own parser keeps its stack on the heap), so a native-stack walk
+/// is a SIGSEGV at a few tens of thousands of levels.
+fn countSignificant(alloc: std.mem.Allocator, el: *const xml.Element, cap: usize, n: *usize) Error!void {
+    var stack: std.ArrayList([]const xml.Child) = .empty;
+    defer stack.deinit(alloc);
+    try stack.append(alloc, el.children);
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top.len == 0) {
+            _ = stack.pop();
+            continue;
+        }
+        const c = top.*[0];
+        top.* = top.*[1..];
+        switch (c.content) {
+            .text, .cdata => |t| {
+                for (t) |ch| {
+                    if (isB64Space(ch)) continue;
+                    n.* += 1;
+                    if (n.* > cap) return error.CiphertextTooLarge;
+                }
+            },
+            // `textContent` descends into child elements and `xmlsec1` accepts a
+            // nested element inside CipherValue too, so the traversal matches both
+            // — this is a bound on the work, not a change of shape.
+            .element => |e| try stack.append(alloc, e.children),
+            .comment, .pi => {},
+        }
+    }
 }
 
-fn gatherSignificant(el: *const xml.Element, out: []u8, w: *usize) void {
-    for (el.children) |c| switch (c.content) {
-        .text, .cdata => |t| {
-            for (t) |ch| {
-                if (isB64Space(ch)) continue;
-                out[w.*] = ch;
-                w.* += 1;
-            }
-        },
-        .element => |e| gatherSignificant(e, out, w),
-        .comment, .pi => {},
-    };
+/// `countSignificant`'s walk, writing the characters into `out` (sized by it).
+fn gatherSignificant(alloc: std.mem.Allocator, el: *const xml.Element, out: []u8, w: *usize) Error!void {
+    var stack: std.ArrayList([]const xml.Child) = .empty;
+    defer stack.deinit(alloc);
+    try stack.append(alloc, el.children);
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top.len == 0) {
+            _ = stack.pop();
+            continue;
+        }
+        const c = top.*[0];
+        top.* = top.*[1..];
+        switch (c.content) {
+            .text, .cdata => |t| {
+                for (t) |ch| {
+                    if (isB64Space(ch)) continue;
+                    out[w.*] = ch;
+                    w.* += 1;
+                }
+            },
+            .element => |e| try stack.append(alloc, e.children),
+            .comment, .pi => {},
+        }
+    }
 }
 
 /// Decode a base64 element's text into `out` (small, fixed buffers only — for

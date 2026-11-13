@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **Public API change** (no in-repo importer affected: `saml` uses `decryptData` / `decryptAssertion`) and two fixes from the 2026-11-13 no-panic sweep (XEN-1..3).
+  - **XEN-3 (HIGH, use-after-free):** `decryptDataToDocument` parsed the recovered plaintext and then freed it, but `xml.parse` borrows its input (every element/attribute slice and `Document.source`), so the returned tree pointed into freed memory (reading `root.local` of a 280 KB plaintext segfaulted). It now returns `DecryptedDocument { doc, plaintext }`; `deinit(alloc)` releases the tree, then wipes and frees the plaintext.
+  - **XEN-2:** that parse used `xml`'s default element cap (1,048,576, ~350 MiB of tree) on attacker-chosen plaintext; new `Options.max_elements` (default 65,536).
+  - **XEN-1:** the base64 text walk under `CipherValue` recursed once per nesting level (depth is the caller's `xml.Options.max_depth`); it is now an explicit heap stack (1,000,000 levels decode).
+
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `ctEqMaskUsize` is `rsa.ctEqMaskUsize` instead of a verbatim private copy.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 

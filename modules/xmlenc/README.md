@@ -49,7 +49,10 @@ const pt = try xmlenc.decryptData(alloc, encrypted_data, sk, .{});
 ```
 
 `decryptDataToDocument` is a convenience that parses the recovered octets and
-returns an owned `xml.Document`.
+returns a `DecryptedDocument`: the tree plus the plaintext buffer it borrows
+from (`xml.parse` does not copy its input). `deinit(alloc)` releases the tree,
+then wipes and frees the plaintext. The recovered octets are parsed under
+`Options.max_elements` (default 65 536).
 
 ## Security
 

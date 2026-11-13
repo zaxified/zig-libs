@@ -1496,13 +1496,11 @@ test "Z1: decryptDataToDocument wipes the plaintext IT frees, not just the ones 
     var scan = FreeScanner{ .child = a, .needle = "the recovered assertion body" };
     const sa = scan.allocator();
     var inner = try xmlenc.decryptDataToDocument(sa, outer.root, &kp.secret_key, .{});
-    // Snapshot BEFORE `inner.deinit()`. The returned document legitimately
-    // holds the assertion — it is the caller's to destroy (§2.1 Z2) — so
-    // letting the scanner see its arena go back would make this test fail for
-    // a reason it is not about.
+    // The returned value holds the assertion until its `deinit` (§2.1 Z2), which
+    // wipes the plaintext before the block goes back, so the scan covers it.
+    inner.deinit(sa);
     const frees_seen = scan.frees_seen;
     const leaked = scan.leaked_plaintext;
-    inner.deinit();
 
     try std.testing.expect(frees_seen > 0);
     if (leaked) {
@@ -1523,4 +1521,103 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+// ── sweep 2026-11-13 (XEN) ──────────────────────────────────────────────────
+
+test "decryptData: a CipherValue nested past any native stack is decoded, not a SIGSEGV (sweep XEN-1)" {
+    // `xml.Options.max_depth` is the caller's knob and `xml`'s own parser keeps
+    // its stack on the heap, so a document parsed with a large limit reaches
+    // xmlenc. The base64 text walk used to recurse once per nesting level.
+    const a = testing.allocator;
+    const kp = try makeKey();
+    const cek = @as([32]u8, @splat(0x5C));
+    const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
+    defer a.free(wrapped);
+    const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
+    defer a.free(content);
+    const cek_b64 = try b64(a, wrapped);
+    defer a.free(cek_b64);
+    const content_b64 = try b64(a, content);
+    defer a.free(content_b64);
+
+    const depth = 1_000_000;
+    var nested: std.ArrayList(u8) = .empty;
+    defer nested.deinit(a);
+    for (0..depth) |_| try nested.appendSlice(a, "<x>");
+    try nested.appendSlice(a, content_b64);
+    for (0..depth) |_| try nested.appendSlice(a, "</x>");
+
+    const doc_src = try buildEncryptedData(a, xenc11_ns ++ "aes256-gcm", xenc_ns ++ "rsa-oaep-mgf1p", cek_b64, nested.items);
+    defer a.free(doc_src);
+    var doc = try xml.parse(a, doc_src, .{ .max_depth = depth + 16 });
+    defer doc.deinit();
+    const out = try xmlenc.decryptData(a, doc.root, &kp.secret_key, .{});
+    defer a.free(out);
+    try testing.expectEqualStrings(plaintext_assertion, out);
+}
+
+test "decryptDataToDocument: the recovered plaintext is parsed under an element cap (sweep XEN-2)" {
+    const a = testing.allocator;
+    const kp = try makeKey();
+    const cek = @as([32]u8, @splat(0x6D));
+    const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
+    defer a.free(wrapped);
+    const cek_b64 = try b64(a, wrapped);
+    defer a.free(cek_b64);
+
+    // 70 000 elements: past the 65 536 default, nowhere near max_ciphertext_len.
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(a);
+    try big.appendSlice(a, "<r>");
+    for (0..70_000) |_| try big.appendSlice(a, "<a/>");
+    try big.appendSlice(a, "</r>");
+    const content = try gcmEncrypt(a, Aes256Gcm, cek, big.items);
+    defer a.free(content);
+    const content_b64 = try b64(a, content);
+    defer a.free(content_b64);
+    const doc_src = try buildEncryptedData(a, xenc11_ns ++ "aes256-gcm", xenc_ns ++ "rsa-oaep-mgf1p", cek_b64, content_b64);
+    defer a.free(doc_src);
+    var outer = try xml.parse(a, doc_src, .{});
+    defer outer.deinit();
+
+    try testing.expectError(error.TooManyElements, xmlenc.decryptDataToDocument(a, outer.root, &kp.secret_key, .{}));
+    // The cap is an Option: raised, the same document parses (positive control,
+    // so a cap of zero cannot pass the refusal alone).
+    var inner = try xmlenc.decryptDataToDocument(a, outer.root, &kp.secret_key, .{ .max_elements = 70_100 });
+    defer inner.deinit(a);
+    try testing.expectEqual(@as(usize, 70_000), inner.doc.root.children.len);
+}
+
+test "decryptDataToDocument: the returned document does not point into freed memory (sweep XEN-3)" {
+    // `xml.parse` borrows its input. The plaintext used to be freed on return,
+    // so every name and value slice of the returned tree dangled: reading
+    // `root.local` of a 280 KB recovered document was a SIGSEGV (the freed block
+    // is unmapped); small plaintexts only survived because their block stayed
+    // mapped.
+    const a = testing.allocator;
+    const kp = try makeKey();
+    const cek = @as([32]u8, @splat(0x7E));
+    const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
+    defer a.free(wrapped);
+    const cek_b64 = try b64(a, wrapped);
+    defer a.free(cek_b64);
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(a);
+    try big.appendSlice(a, "<root-with-a-name>");
+    for (0..60_000) |_| try big.appendSlice(a, "<a/>");
+    try big.appendSlice(a, "</root-with-a-name>");
+    const content = try gcmEncrypt(a, Aes256Gcm, cek, big.items);
+    defer a.free(content);
+    const content_b64 = try b64(a, content);
+    defer a.free(content_b64);
+    const doc_src = try buildEncryptedData(a, xenc11_ns ++ "aes256-gcm", xenc_ns ++ "rsa-oaep-mgf1p", cek_b64, content_b64);
+    defer a.free(doc_src);
+    var outer = try xml.parse(a, doc_src, .{});
+    defer outer.deinit();
+
+    var inner = try xmlenc.decryptDataToDocument(a, outer.root, &kp.secret_key, .{});
+    defer inner.deinit(a);
+    try testing.expectEqualStrings("root-with-a-name", inner.doc.root.local);
+    try testing.expectEqualStrings(big.items, inner.doc.source);
 }
