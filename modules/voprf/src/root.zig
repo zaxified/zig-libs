@@ -234,6 +234,8 @@ pub const deserializeScalar = Default.deserializeScalar;
 pub const scalarFromWideBytes = Default.scalarFromWideBytes;
 pub const Proof = Default.Proof;
 pub const KeyPair = Default.KeyPair;
+pub const max_input_length = protocol.max_input_length;
+pub const InputTooLongError = protocol.InputTooLongError;
 pub const DeriveKeyPairError = protocol.DeriveKeyPairError;
 pub const deriveKeyPair = Default.deriveKeyPair;
 pub const GenerateProofError = protocol.GenerateProofError;
@@ -268,6 +270,12 @@ pub const finalizePoprfUnverified = Default.finalizePoprfUnverified;
 pub const PoprfDirectEvaluateError = protocol.PoprfDirectEvaluateError;
 pub const evaluatePoprf = Default.evaluatePoprf;
 const poprfInfoScalar = Default.poprfInfoScalar;
+pub const OprfClient = Default.OprfClient;
+pub const VoprfClient = Default.VoprfClient;
+pub const PoprfClient = Default.PoprfClient;
+pub const OprfServer = Default.OprfServer;
+pub const VoprfServer = Default.VoprfServer;
+pub const PoprfServer = Default.PoprfServer;
 
 // ── tests ────────────────────────────────────────────────────────────────
 
@@ -342,14 +350,15 @@ test "blindEvaluate REPORTS NOTHING about a degenerate skS (constant-time)" {
 }
 
 test "blind/blindEvaluate carry no error a caller could branch on a secret with" {
-    // `blindEvaluate` has no error union at all; `blind`'s only member is
-    // `InvalidInput`, which comes from `hashToGroup` (PUBLIC input framing),
-    // never from the multiply. `InvalidBlind` must NOT be back.
+    // `blindEvaluate` has no error union at all; `blind`'s members are
+    // `InvalidInput` (from `hashToGroup`) and `InputTooLong` (the PUBLIC
+    // input length, 2026-11-13), never anything from the multiply.
+    // `InvalidBlind` must NOT be back.
     try std.testing.expect(@typeInfo(@TypeOf(blindEvaluate)).@"fn".return_type.? == Element);
     const blind_err = @typeInfo(@typeInfo(@TypeOf(blind)).@"fn".return_type.?).error_union.error_set;
     const members = @typeInfo(blind_err).error_set.error_names.?;
-    try std.testing.expectEqual(@as(usize, 1), members.len);
-    try std.testing.expectEqualStrings("InvalidInput", members[0]);
+    try std.testing.expectEqual(@as(usize, 2), members.len);
+    for (members) |name| try std.testing.expect(std.mem.eql(u8, name, "InvalidInput") or std.mem.eql(u8, name, "InputTooLong"));
 }
 
 test "deserializeScalar enforces canonicity" {
@@ -390,7 +399,7 @@ test "finalize refuses a non-canonical blind (blind + L)" {
 
 test "POPRF: skS == -m is InverseError, and pkS == -m*G is a refused tweaked key" {
     const info = "inverse";
-    const sk = scalar.neg(poprfInfoScalar(info));
+    const sk = scalar.neg(try poprfInfoScalar(info));
     const b = shim.scalarFromWideBytes(@as([64]u8, @splat(0x44)));
     const blinded = try shim.blind(.poprf, "input", b);
     var out: [1]Element = undefined;

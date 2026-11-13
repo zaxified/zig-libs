@@ -258,8 +258,12 @@ fn Nist(
         /// arise from a degenerate secret (see the type comment) and encodes
         /// as `Ne` zero bytes, which `decode` refuses.
         pub fn encode(p: Point) [Ne]u8 {
-            if (isIdentity(p)) return @splat(0);
-            return p.toCompressedSec1();
+            // Branch-free: the element can be secret (the client's unblinded
+            // element), so the identity verdict only masks the bytes.
+            var out = p.toCompressedSec1();
+            const mask: u8 = 0 -% h2c.launder(@intFromBool(p.z.isZero()));
+            for (&out) |*o| o.* &= ~mask;
+            return out;
         }
         pub fn decode(b: [Ne]u8) ElementError!Point {
             if (b[0] != 0x02 and b[0] != 0x03) return error.InvalidElement;
@@ -294,8 +298,12 @@ fn Nist(
         }
         fn sc(a: [Ns]u8) Scalar {
             // Every scalar reaching here is canonical (validated at the API
-            // boundary or produced by a reduction); the arm only keeps the
-            // call panic-free.
+            // boundary or produced by a reduction), so the canonical-range
+            // check inside `fromBytes` always passes; the arm only keeps the
+            // call panic-free. (P-256's `fromBytes` is std's: its range check
+            // is one branch on the verdict — ctgrind counts it, it reveals
+            // nothing. std's `fromBytes64` reduction does the same check
+            // three times, so it is not the cleaner road.)
             return Scalar.fromBytes(a, .big) catch Scalar.zero;
         }
         pub fn sAdd(a: [Ns]u8, b: [Ns]u8) [Ns]u8 {

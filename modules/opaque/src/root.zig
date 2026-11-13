@@ -512,7 +512,8 @@ fn deriveAkeKeyPairBody(seed: *const [Nseed]u8, out: *AkeKeyPair) error{DeriveKe
 /// The by-value form for callers that already run inside a burned frame.
 fn akeKeyPair(seed: *const [Nseed]u8) error{DeriveKeyPairFailed}!AkeKeyPair {
     var kp: voprf.KeyPair = undefined;
-    try voprf.deriveKeyPair(.oprf, seed, "OPAQUE-DeriveDiffieHellmanKeyPair", &kp);
+    // The info string is a constant, so voprf's `InputTooLong` cannot occur.
+    voprf.deriveKeyPair(.oprf, seed, "OPAQUE-DeriveDiffieHellmanKeyPair", &kp) catch return error.DeriveKeyPairFailed;
     return .{ .private_key = kp.sk, .public_key = kp.pk.toBytes() };
 }
 
@@ -524,7 +525,8 @@ fn deriveOprfKey(oprf_seed: [Nh]u8, credential_identifier: []const u8) error{Der
     defer std.crypto.secureZero(u8, &seed);
     expandMulti(&seed, &oprf_seed, &.{ credential_identifier, "OprfKey" });
     var kp: voprf.KeyPair = undefined;
-    try voprf.deriveKeyPair(.oprf, &seed, "OPAQUE-DeriveKeyPair", &kp);
+    // Constant info: voprf's `InputTooLong` cannot occur.
+    voprf.deriveKeyPair(.oprf, &seed, "OPAQUE-DeriveKeyPair", &kp) catch return error.DeriveKeyPairFailed;
     return kp.sk;
 }
 
@@ -601,7 +603,7 @@ fn randomizedPassword(
     blind: [Ns]u8,
     evaluated_message: [Noe]u8,
     ksf: Ksf,
-) (error{ InvalidMessage, InvalidBlind } || error{KsfFailed})![Nx]u8 {
+) (error{ InvalidMessage, InvalidBlind, InputTooLong } || error{KsfFailed})![Nx]u8 {
     const evaluated = voprf.Element.fromBytes(evaluated_message) catch return error.InvalidMessage;
     var oprf_output: [Nh]u8 = undefined;
     try voprf.finalize(password, &blind, evaluated, &oprf_output);
@@ -783,7 +785,8 @@ fn createRegistrationResponseBody(
     };
 }
 
-pub const FinalizeRegistrationError = error{ InvalidMessage, InvalidBlind, DeriveKeyPairFailed, IdentityTooLong, KsfFailed };
+/// `InputTooLong`: a password longer than RFC 9497's `2^16 - 1`-byte OPRF input bound.
+pub const FinalizeRegistrationError = error{ InvalidMessage, InvalidBlind, DeriveKeyPairFailed, IdentityTooLong, KsfFailed, InputTooLong };
 
 pub const FinalizeRegistrationResult = struct {
     /// The `RegistrationRecord` to send to the server (§5.1
@@ -862,7 +865,8 @@ pub const ServerLoginState = struct {
 
 /// No `InvalidBlind`: `voprf.blind` only returns `InvalidInput`; the blind is
 /// first used, and can first fail, in `generateKE3` (A1/opaque.md L2).
-pub const GenerateKE1Error = error{ InvalidInput, DeriveKeyPairFailed };
+/// `InputTooLong`: a password longer than RFC 9497's `2^16 - 1`-byte OPRF input bound.
+pub const GenerateKE1Error = error{ InvalidInput, DeriveKeyPairFailed, InputTooLong };
 
 pub const GenerateKE1Result = struct {
     ke1: KE1,
@@ -1024,6 +1028,8 @@ fn generateKE2Body(
 }
 
 pub const GenerateKE3Error = error{
+    /// A password longer than RFC 9497's `2^16 - 1`-byte OPRF input bound.
+    InputTooLong,
     InvalidMessage,
     InvalidBlind,
     InvalidPublicKey,

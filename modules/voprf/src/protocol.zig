@@ -23,12 +23,21 @@ pub const Mode = enum(u8) {
 pub const InvalidInputError = error{InvalidInput};
 pub const DeserializeElementError = error{InvalidElement};
 pub const DeserializeScalarError = error{InvalidScalar};
-pub const DeriveKeyPairError = error{DeriveKeyPairFailed};
+/// RFC 9497 bounds every `input` and `info` at `2^16 - 1` bytes (they are
+/// framed with a two-byte length); a longer slice is `error.InputTooLong`.
+pub const max_input_length = 0xffff;
+pub const InputTooLongError = error{InputTooLong};
+
+fn checkLen(n: usize) InputTooLongError!void {
+    if (n > max_input_length) return error.InputTooLong;
+}
+
+pub const DeriveKeyPairError = error{ DeriveKeyPairFailed, InputTooLong };
 pub const GenerateProofError = error{ProofGenerationFailed};
 pub const VerifyProofError = error{InvalidProof};
-pub const BlindError = error{InvalidInput};
-pub const FinalizeError = error{InvalidBlind};
-pub const EvaluateError = error{InvalidInput};
+pub const BlindError = error{ InvalidInput, InputTooLong };
+pub const FinalizeError = error{ InvalidBlind, InputTooLong };
+pub const EvaluateError = error{ InvalidInput, InputTooLong };
 pub const BlindEvaluateVerifiableError = error{
     ProofGenerationFailed,
     /// `blinded.len == 0`: an empty batch has no well-defined proof.
@@ -37,15 +46,16 @@ pub const BlindEvaluateVerifiableError = error{
     MismatchedLengths,
 };
 pub const BlindEvaluateBatchError = error{MismatchedLengths};
-pub const FinalizeVerifiableError = error{ InvalidBlind, InvalidProof };
-pub const FinalizeBatchError = error{ InvalidBlind, InvalidProof, EmptyBatch, MismatchedLengths };
+pub const FinalizeVerifiableError = error{ InvalidBlind, InvalidProof, InputTooLong };
+pub const FinalizeBatchError = error{ InvalidBlind, InvalidProof, EmptyBatch, MismatchedLengths, InputTooLong };
 pub const PoprfEvaluateError = error{
     InverseError,
+    InputTooLong,
     ProofGenerationFailed,
     EmptyBatch,
     MismatchedLengths,
 };
-pub const PoprfDirectEvaluateError = error{ InvalidInput, InverseError };
+pub const PoprfDirectEvaluateError = error{ InvalidInput, InverseError, InputTooLong };
 
 const CompositesError = error{DegenerateComposite};
 
@@ -164,6 +174,7 @@ pub fn Protocol(comptime G: type) type {
         /// RFC 9497 §3.2.1 `DeriveKeyPair(seed, info)`. Output through `out`
         /// (written only on success); stack burned.
         pub fn deriveKeyPair(comptime mode: Mode, seed: *const [32]u8, info: []const u8, out: *KeyPair) DeriveKeyPairError!void {
+            try checkLen(info.len);
             return burn.run(derive_burn, DeriveKeyPairError!void, DeriveBody(mode).f, .{ seed, info, out });
         }
 
@@ -378,6 +389,7 @@ pub fn Protocol(comptime G: type) type {
 
         /// RFC 9497 §3.3.1 `Blind(input)` with caller-supplied blind scalar.
         pub fn blind(comptime mode: Mode, input: []const u8, blind_scalar: *const [Ns]u8) BlindError!Element {
+            try checkLen(input.len);
             return burn.run(mul_burn, BlindError!Element, BlindBody(mode).f, .{ input, blind_scalar });
         }
 
@@ -412,6 +424,7 @@ pub fn Protocol(comptime G: type) type {
 
         /// RFC 9497 §3.3.1 `Finalize(input, blind, evaluatedElement)`.
         pub fn finalize(input: []const u8, blind_scalar: *const [Ns]u8, evaluated_element: Element, out: *[Nh]u8) FinalizeError!void {
+            try checkLen(input.len);
             return burn.run(mul_burn, FinalizeError!void, finalizeBody, .{ input, blind_scalar, evaluated_element, out });
         }
 
@@ -422,6 +435,7 @@ pub fn Protocol(comptime G: type) type {
 
         /// RFC 9497 §3.3.1 `Evaluate(skS, input)` — the direct PRF.
         pub fn evaluate(comptime mode: Mode, sk: *const [Ns]u8, input: []const u8, out: *[Nh]u8) EvaluateError!void {
+            try checkLen(input.len);
             return burn.run(mul_burn, EvaluateError!void, EvaluateBody(mode).f, .{ sk, input, out });
         }
 
@@ -490,6 +504,7 @@ pub fn Protocol(comptime G: type) type {
             proof: Proof,
             out: *[Nh]u8,
         ) FinalizeVerifiableError!void {
+            try checkLen(input.len);
             return burn.run(proof_burn, FinalizeVerifiableError!void, finalizeVerifiableBody, .{ input, blind_scalar, evaluated_element, blinded_element, pk, proof, out });
         }
 
@@ -520,6 +535,7 @@ pub fn Protocol(comptime G: type) type {
             proof: Proof,
             outputs: [][Nh]u8,
         ) FinalizeBatchError!void {
+            for (inputs) |input| try checkLen(input.len);
             return burn.run(proof_burn, FinalizeBatchError!void, finalizeVerifiableBatchBody, .{ inputs, blinds, evaluated, blinded, pk, proof, outputs });
         }
 
@@ -546,8 +562,14 @@ pub fn Protocol(comptime G: type) type {
 
         /// §3.3.3's framed-info scalar `m = HashToScalar("Info" ||
         /// I2OSP(len(info), 2) || info)` (public: a hash of public `info`).
-        pub fn poprfInfoScalar(info: []const u8) [Ns]u8 {
-            std.debug.assert(info.len <= 0xffff);
+        pub fn poprfInfoScalar(info: []const u8) InputTooLongError![Ns]u8 {
+            try checkLen(info.len);
+            return infoScalar(info);
+        }
+
+        /// `poprfInfoScalar` for a length the entry point already checked.
+        fn infoScalar(info: []const u8) [Ns]u8 {
+            std.debug.assert(info.len <= max_input_length);
             var info_len: [2]u8 = undefined;
             std.mem.writeInt(u16, &info_len, @intCast(info.len), .big);
             return hashToScalar(.poprf, &.{ "Info", &info_len, info });
@@ -565,6 +587,8 @@ pub fn Protocol(comptime G: type) type {
             pk: Element,
             blind_scalar: *const [Ns]u8,
         ) BlindError!PoprfBlindResult {
+            try checkLen(input.len);
+            try checkLen(info.len);
             return burn.run(mul_burn, BlindError!PoprfBlindResult, blindPoprfBody, .{ input, info, pk, blind_scalar });
         }
 
@@ -574,7 +598,7 @@ pub fn Protocol(comptime G: type) type {
             pk: Element,
             blind_scalar: *const [Ns]u8,
         ) BlindError!PoprfBlindResult {
-            const m = poprfInfoScalar(info);
+            const m = infoScalar(info);
             const t_point = G.mulBasePublic(m) catch return error.InvalidInput;
             const tweaked = G.add(t_point, pk.p);
             if (G.isIdentity(tweaked)) return error.InvalidInput;
@@ -590,6 +614,7 @@ pub fn Protocol(comptime G: type) type {
             evaluated_out: []Element,
             proof_r: *const [Ns]u8,
         ) PoprfEvaluateError!Proof {
+            try checkLen(info.len);
             return burn.run(proof_burn, PoprfEvaluateError!Proof, blindEvaluatePoprfBatchBody, .{ sk, blinded, info, evaluated_out, proof_r });
         }
 
@@ -602,7 +627,7 @@ pub fn Protocol(comptime G: type) type {
         ) PoprfEvaluateError!Proof {
             if (blinded.len == 0) return error.EmptyBatch;
             if (evaluated_out.len != blinded.len) return error.MismatchedLengths;
-            const m = poprfInfoScalar(info);
+            const m = infoScalar(info);
             const t = G.sAdd(sk.*, m);
             if (std.crypto.timing_safe.eql([Ns]u8, t, @as([Ns]u8, @splat(0)))) return error.InverseError;
             const t_inv = G.sInvert(t);
@@ -637,6 +662,8 @@ pub fn Protocol(comptime G: type) type {
             tweaked_key: Element,
             out: *[Nh]u8,
         ) FinalizeVerifiableError!void {
+            try checkLen(input.len);
+            try checkLen(info.len);
             return burn.run(proof_burn, FinalizeVerifiableError!void, finalizePoprfBody, .{ input, blind_scalar, evaluated_element, blinded_element, proof, info, tweaked_key, out });
         }
 
@@ -667,6 +694,8 @@ pub fn Protocol(comptime G: type) type {
             tweaked_key: Element,
             outputs: [][Nh]u8,
         ) FinalizeBatchError!void {
+            for (inputs) |input| try checkLen(input.len);
+            try checkLen(info.len);
             return burn.run(proof_burn, FinalizeBatchError!void, finalizePoprfBatchBody, .{ inputs, blinds, evaluated, blinded, proof, info, tweaked_key, outputs });
         }
 
@@ -694,6 +723,8 @@ pub fn Protocol(comptime G: type) type {
             info: []const u8,
             out: *[Nh]u8,
         ) FinalizeError!void {
+            try checkLen(input.len);
+            try checkLen(info.len);
             return burn.run(mul_burn, FinalizeError!void, finalizePoprfUnverifiedBody, .{ input, blind_scalar, evaluated_element, info, out });
         }
 
@@ -710,17 +741,160 @@ pub fn Protocol(comptime G: type) type {
 
         /// RFC 9497 §3.3.3 `Evaluate(skS, input, info)` — the direct POPRF.
         pub fn evaluatePoprf(sk: *const [Ns]u8, input: []const u8, info: []const u8, out: *[Nh]u8) PoprfDirectEvaluateError!void {
+            try checkLen(input.len);
+            try checkLen(info.len);
             return burn.run(mul_burn, PoprfDirectEvaluateError!void, evaluatePoprfBody, .{ sk, input, info, out });
         }
 
         fn evaluatePoprfBody(sk: *const [Ns]u8, input: []const u8, info: []const u8, out: *[Nh]u8) PoprfDirectEvaluateError!void {
             const input_element = try hashToGroup(.poprf, input);
-            const m = poprfInfoScalar(info);
+            const m = infoScalar(info);
             const t = G.sAdd(sk.*, m);
             if (std.crypto.timing_safe.eql([Ns]u8, t, @as([Ns]u8, @splat(0)))) return error.InverseError;
             const t_inv = G.sInvert(t);
             const evaluated = G.mulSecret(input_element.p, &t_inv);
             out.* = finalizeHash(input, info, G.encode(evaluated));
         }
+
+        // ── §3.2/§3.3 context objects (the facebook/voprf / CIRCL shape) ──
+        //
+        // Thin state holders over the functions above, one per role and
+        // mode, as facebook/voprf's `OprfClient`/`VoprfServer`/... and
+        // CIRCL's `Client`/`Server` types: the client object keeps its blind
+        // and blinded element between `blind` and `finalize`, the server
+        // object its key pair. They add no protocol logic. They hold
+        // SECRETS by value (the blind, the key), so the owner calls `wipe`
+        // when done; no randomness is drawn here (caller-supplied, as
+        // everywhere in this module).
+
+        /// OPRF-mode client state (§3.3.1).
+        pub const OprfClient = struct {
+            blind_scalar: [Ns]u8,
+            blinded_element: Element,
+
+            pub fn blind(input: []const u8, blind_scalar: *const [Ns]u8) BlindError!OprfClient {
+                return .{ .blind_scalar = blind_scalar.*, .blinded_element = try Self.blind(.oprf, input, blind_scalar) };
+            }
+            pub fn finalize(c: *const OprfClient, input: []const u8, evaluated_element: Element, out: *[Nh]u8) FinalizeError!void {
+                return Self.finalize(input, &c.blind_scalar, evaluated_element, out);
+            }
+            pub fn wipe(c: *OprfClient) void {
+                std.crypto.secureZero(u8, &c.blind_scalar);
+            }
+        };
+
+        /// VOPRF-mode client state (§3.3.2): `finalize` verifies the proof
+        /// against `pk` before unblinding.
+        pub const VoprfClient = struct {
+            blind_scalar: [Ns]u8,
+            blinded_element: Element,
+
+            pub fn blind(input: []const u8, blind_scalar: *const [Ns]u8) BlindError!VoprfClient {
+                return .{ .blind_scalar = blind_scalar.*, .blinded_element = try Self.blind(.voprf, input, blind_scalar) };
+            }
+            pub fn finalize(c: *const VoprfClient, input: []const u8, evaluated_element: Element, proof: Proof, pk: Element, out: *[Nh]u8) FinalizeVerifiableError!void {
+                return Self.finalizeVerifiable(input, &c.blind_scalar, evaluated_element, c.blinded_element, pk, proof, out);
+            }
+            pub fn wipe(c: *VoprfClient) void {
+                std.crypto.secureZero(u8, &c.blind_scalar);
+            }
+        };
+
+        /// POPRF-mode client state (§3.3.3): also keeps the tweaked key
+        /// derived from `pk` and `info` at blinding time.
+        pub const PoprfClient = struct {
+            blind_scalar: [Ns]u8,
+            blinded_element: Element,
+            tweaked_key: Element,
+
+            pub fn blind(input: []const u8, info: []const u8, pk: Element, blind_scalar: *const [Ns]u8) BlindError!PoprfClient {
+                const r = try Self.blindPoprf(input, info, pk, blind_scalar);
+                return .{ .blind_scalar = blind_scalar.*, .blinded_element = r.blinded_element, .tweaked_key = r.tweaked_key };
+            }
+            pub fn finalize(c: *const PoprfClient, input: []const u8, evaluated_element: Element, proof: Proof, info: []const u8, out: *[Nh]u8) FinalizeVerifiableError!void {
+                return Self.finalizePoprf(input, &c.blind_scalar, evaluated_element, c.blinded_element, proof, info, c.tweaked_key, out);
+            }
+            pub fn wipe(c: *PoprfClient) void {
+                std.crypto.secureZero(u8, &c.blind_scalar);
+            }
+        };
+
+        /// OPRF-mode server (§3.3.1): holds `skS`.
+        pub const OprfServer = struct {
+            sk: [Ns]u8,
+
+            /// §3.2.1 `DeriveKeyPair` in OPRF mode.
+            pub fn derive(seed: *const [32]u8, info: []const u8) DeriveKeyPairError!OprfServer {
+                var kp: KeyPair = undefined;
+                defer std.crypto.secureZero(u8, &kp.sk);
+                try deriveKeyPair(.oprf, seed, info, &kp);
+                return .{ .sk = kp.sk };
+            }
+            pub fn blindEvaluate(s: *const OprfServer, blinded_element: Element) Element {
+                return Self.blindEvaluate(&s.sk, blinded_element);
+            }
+            pub fn blindEvaluateBatch(s: *const OprfServer, blinded: []const Element, evaluated_out: []Element) BlindEvaluateBatchError!void {
+                return Self.blindEvaluateBatch(&s.sk, blinded, evaluated_out);
+            }
+            pub fn evaluate(s: *const OprfServer, input: []const u8, out: *[Nh]u8) EvaluateError!void {
+                return Self.evaluate(.oprf, &s.sk, input, out);
+            }
+            pub fn wipe(s: *OprfServer) void {
+                std.crypto.secureZero(u8, &s.sk);
+            }
+        };
+
+        /// VOPRF-mode server (§3.3.2): holds the key pair; `publicKey` is
+        /// what clients verify against.
+        pub const VoprfServer = struct {
+            key_pair: KeyPair,
+
+            pub fn derive(seed: *const [32]u8, info: []const u8) DeriveKeyPairError!VoprfServer {
+                var s: VoprfServer = undefined;
+                try deriveKeyPair(.voprf, seed, info, &s.key_pair);
+                return s;
+            }
+            pub fn publicKey(s: *const VoprfServer) Element {
+                return s.key_pair.pk;
+            }
+            pub fn blindEvaluate(s: *const VoprfServer, blinded_element: Element, proof_r: *const [Ns]u8) BlindEvaluateVerifiableError!VerifiableEvaluation {
+                return Self.blindEvaluateVerifiable(&s.key_pair.sk, s.key_pair.pk, blinded_element, proof_r);
+            }
+            pub fn blindEvaluateBatch(s: *const VoprfServer, blinded: []const Element, evaluated_out: []Element, proof_r: *const [Ns]u8) BlindEvaluateVerifiableError!Proof {
+                return Self.blindEvaluateVerifiableBatch(&s.key_pair.sk, s.key_pair.pk, blinded, evaluated_out, proof_r);
+            }
+            pub fn evaluate(s: *const VoprfServer, input: []const u8, out: *[Nh]u8) EvaluateError!void {
+                return Self.evaluate(.voprf, &s.key_pair.sk, input, out);
+            }
+            pub fn wipe(s: *VoprfServer) void {
+                std.crypto.secureZero(u8, &s.key_pair.sk);
+            }
+        };
+
+        /// POPRF-mode server (§3.3.3).
+        pub const PoprfServer = struct {
+            key_pair: KeyPair,
+
+            pub fn derive(seed: *const [32]u8, info: []const u8) DeriveKeyPairError!PoprfServer {
+                var s: PoprfServer = undefined;
+                try deriveKeyPair(.poprf, seed, info, &s.key_pair);
+                return s;
+            }
+            pub fn publicKey(s: *const PoprfServer) Element {
+                return s.key_pair.pk;
+            }
+            pub fn blindEvaluate(s: *const PoprfServer, blinded_element: Element, info: []const u8, proof_r: *const [Ns]u8) PoprfEvaluateError!VerifiableEvaluation {
+                return Self.blindEvaluatePoprf(&s.key_pair.sk, blinded_element, info, proof_r);
+            }
+            pub fn blindEvaluateBatch(s: *const PoprfServer, blinded: []const Element, info: []const u8, evaluated_out: []Element, proof_r: *const [Ns]u8) PoprfEvaluateError!Proof {
+                return Self.blindEvaluatePoprfBatch(&s.key_pair.sk, blinded, info, evaluated_out, proof_r);
+            }
+            pub fn evaluate(s: *const PoprfServer, input: []const u8, info: []const u8, out: *[Nh]u8) PoprfDirectEvaluateError!void {
+                return Self.evaluatePoprf(&s.key_pair.sk, input, info, out);
+            }
+            pub fn wipe(s: *PoprfServer) void {
+                std.crypto.secureZero(u8, &s.key_pair.sk);
+            }
+        };
     };
 }

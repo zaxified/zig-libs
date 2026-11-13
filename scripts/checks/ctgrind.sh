@@ -301,7 +301,7 @@ declare -A TARGETS=(
     # ── 2026-10-10: ct-wave: CTAP2 client PIN, shared secret, pinUvAuthToken ──
     [ctap2]="pin token"
     # ── 2026-10-10: ct-wave: VOPRF server key, client input/blinds, keygen seed ──
-    [voprf]="server client keygen"
+    [voprf]="server client keygen decaf448-server decaf448-client decaf448-keygen p256-server p256-client p256-keygen p384-server p384-client p384-keygen p521-server p521-client p521-keygen"
     # ── 2026-10-10: ct-wave: base32 encode/decode of a secret ──
     [base32]="encode decode"
     # ── 2026-10-10: ct-wave: timelock envelope lock secrets, HQC dk ──
@@ -715,9 +715,12 @@ declare -A PATTERN=(
     # ct25519, so their constant-time property is opaque's for every byte of
     # the password that flows through them. The source pin hashes only
     # modules/opaque/src/root.zig.
-    [opaque/register]='root[.]zig'
-    [opaque/login]='root[.]zig'
-    [opaque/serverke2]='root[.]zig'
+    # 2026-11-13: voprf's OPRF code moved from its root.zig into protocol.zig,
+    # groups.zig and h2c.zig, so those basenames join the column (none of them
+    # exists in opaque's own src, so the source pin still hashes root.zig only).
+    [opaque/register]='root[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [opaque/login]='root[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [opaque/serverke2]='root[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
     # bip32's own files; k256/std frames count through their bip32.zig or
     # bip39.zig callers (the whole paragraph is matched).
     [bip32/master]='bip32[.]zig'
@@ -791,9 +794,24 @@ declare -A PATTERN=(
     [tenantkex/ik]='root[.]zig|burn[.]zig'
     [ctap2/pin]='clientpin[.]zig|root[.]zig'
     [ctap2/token]='clientpin[.]zig|root[.]zig'
-    [voprf/server]='root[.]zig|burn[.]zig'
-    [voprf/client]='root[.]zig|burn[.]zig'
-    [voprf/keygen]='root[.]zig|burn[.]zig'
+    # voprf's protocol code moved from root.zig into protocol.zig/groups.zig/h2c.zig
+    # (2026-11-13, every RFC 9497 suite); root.zig re-exports the ristretto255 instance.
+    # A flat alternation, not `(a|b)[.]zig`: src_digest splits the pattern on `|`.
+    [voprf/server]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [voprf/client]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [voprf/keygen]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [voprf/decaf448-server]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [voprf/decaf448-client]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [voprf/decaf448-keygen]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [voprf/p256-server]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [voprf/p256-client]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [voprf/p256-keygen]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [voprf/p384-server]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [voprf/p384-client]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [voprf/p384-keygen]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [voprf/p521-server]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [voprf/p521-client]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [voprf/p521-keygen]='root[.]zig|burn[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
     [base32/encode]='root[.]zig'
     [base32/decode]='root[.]zig'
     [timelock_envelope/kdf]='envelope[.]zig|stream[.]zig|root[.]zig|burn[.]zig'
@@ -1162,6 +1180,18 @@ declare -A LABEL=(
     [voprf/server]='voprf blindEvaluate/Verifiable/Poprf + evaluate (skS + proof nonce tainted)'
     [voprf/client]='voprf blind/finalize/Verifiable/Poprf (input + blinds tainted)'
     [voprf/keygen]='voprf deriveKeyPair x3 modes (seed tainted)'
+    [voprf/decaf448-server]='voprf decaf448-SHAKE256 server (skS + proof nonce tainted)'
+    [voprf/decaf448-client]='voprf decaf448-SHAKE256 client (input + blinds tainted)'
+    [voprf/decaf448-keygen]='voprf decaf448-SHAKE256 deriveKeyPair x3 modes (seed tainted)'
+    [voprf/p256-server]='voprf P256-SHA256 server (skS + proof nonce tainted)'
+    [voprf/p256-client]='voprf P256-SHA256 client (input + blinds tainted)'
+    [voprf/p256-keygen]='voprf P256-SHA256 deriveKeyPair x3 modes (seed tainted)'
+    [voprf/p384-server]='voprf P384-SHA384 server (skS + proof nonce tainted)'
+    [voprf/p384-client]='voprf P384-SHA384 client (input + blinds tainted)'
+    [voprf/p384-keygen]='voprf P384-SHA384 deriveKeyPair x3 modes (seed tainted)'
+    [voprf/p521-server]='voprf P521-SHA512 server (skS + proof nonce tainted)'
+    [voprf/p521-client]='voprf P521-SHA512 client (input + blinds tainted)'
+    [voprf/p521-keygen]='voprf P521-SHA512 deriveKeyPair x3 modes (seed tainted)'
     [base32/encode]='base32 encode std/hex, pad/case (secret tainted)'
     [base32/decode]='base32 decode std/hex, pad/case + reject (text tainted)'
     [timelock_envelope/kdf]='timelock_envelope deriveKeys+deriveStreamKey (lock secrets tainted)'

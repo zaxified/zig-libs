@@ -242,3 +242,108 @@ test "scalarFromWideBytes: canonical output at every suite's width" {
         _ = try S.deserializeScalar(s);
     }
 }
+
+fn runObjects(comptime S: type, sv_suite: sv.SuiteVectors) !void {
+    // Test Vector 1 of each mode, driven through the context objects.
+    var ib: [64]u8 = undefined;
+    var info_buf: [64]u8 = undefined;
+    {
+        const mv = sv_suite.oprf;
+        const v = mv.vectors[0];
+        const seed = try hx(32, mv.seed);
+        var server = try S.OprfServer.derive(&seed, try hxAlloc(&ib, mv.key_info));
+        defer server.wipe();
+        const input = try hxAlloc(&ib, v.input[0]);
+        var client = try S.OprfClient.blind(input, &(try hx(S.Ns, v.blind[0])));
+        defer client.wipe();
+        const ev = server.blindEvaluate(client.blinded_element);
+        var out: [S.Nh]u8 = undefined;
+        try client.finalize(input, ev, &out);
+        try expectHex(v.output[0], &out);
+        try server.evaluate(input, &out);
+        try expectHex(v.output[0], &out);
+    }
+    {
+        const mv = sv_suite.voprf;
+        const v = mv.vectors[0];
+        const seed = try hx(32, mv.seed);
+        var server = try S.VoprfServer.derive(&seed, try hxAlloc(&ib, mv.key_info));
+        defer server.wipe();
+        try expectHex(mv.pk.?, &server.publicKey().toBytes());
+        const input = try hxAlloc(&ib, v.input[0]);
+        var client = try S.VoprfClient.blind(input, &(try hx(S.Ns, v.blind[0])));
+        defer client.wipe();
+        const ev = try server.blindEvaluate(client.blinded_element, &(try hx(S.Ns, v.proof_random_scalar.?)));
+        try expectHex(v.proof.?, &ev.proof.toBytes());
+        var out: [S.Nh]u8 = undefined;
+        try client.finalize(input, ev.evaluated_element, ev.proof, server.publicKey(), &out);
+        try expectHex(v.output[0], &out);
+        // Verifying against the wrong key fails closed.
+        try testing.expectError(error.InvalidProof, client.finalize(input, ev.evaluated_element, ev.proof, S.Element.generator, &out));
+    }
+    {
+        const mv = sv_suite.poprf;
+        const v = mv.vectors[0];
+        const seed = try hx(32, mv.seed);
+        var server = try S.PoprfServer.derive(&seed, try hxAlloc(&ib, mv.key_info));
+        defer server.wipe();
+        const input = try hxAlloc(&ib, v.input[0]);
+        const info = try hxAlloc(&info_buf, v.info.?);
+        var client = try S.PoprfClient.blind(input, info, server.publicKey(), &(try hx(S.Ns, v.blind[0])));
+        defer client.wipe();
+        const ev = try server.blindEvaluate(client.blinded_element, info, &(try hx(S.Ns, v.proof_random_scalar.?)));
+        var out: [S.Nh]u8 = undefined;
+        try client.finalize(input, ev.evaluated_element, ev.proof, info, &out);
+        try expectHex(v.output[0], &out);
+        try server.evaluate(input, info, &out);
+        try expectHex(v.output[0], &out);
+    }
+}
+
+test "context objects (Oprf/Voprf/Poprf Client+Server) reproduce Test Vector 1 of A.1-A.5, every mode" {
+    try runObjects(voprf.Ristretto255Sha512, sv.ristretto255_sha512);
+    try runObjects(voprf.Decaf448Shake256, sv.decaf448_shake256);
+    try runObjects(voprf.P256Sha256, sv.p256_sha256);
+    try runObjects(voprf.P384Sha384, sv.p384_sha384);
+    try runObjects(voprf.P521Sha512, sv.p521_sha512);
+}
+
+test "RFC 9497 2^16-1 input bound: a 65536-byte input/info is error.InputTooLong at every entry point, 65535 is accepted" {
+    const long = try testing.allocator.alloc(u8, voprf.max_input_length + 1);
+    defer testing.allocator.free(long);
+    @memset(long, 'x');
+    const max = long[0..voprf.max_input_length];
+    inline for (.{ voprf.Ristretto255Sha512, voprf.P256Sha256 }) |S| {
+        var seed = @as([32]u8, @splat(7));
+        var kp: S.KeyPair = undefined;
+        try testing.expectError(error.InputTooLong, S.deriveKeyPair(.voprf, &seed, long, &kp));
+        try S.deriveKeyPair(.voprf, &seed, max, &kp);
+        var bs: [S.Ns]u8 = undefined;
+        S.scalarFromWideBytes(&@as([S.wide_length]u8, @splat(3)), &bs);
+        var out: [S.Nh]u8 = undefined;
+        var outs: [1][S.Nh]u8 = undefined;
+        const g = S.Element.generator;
+        const proof = S.Proof{ .c = bs, .s = bs };
+        try testing.expectError(error.InputTooLong, S.blind(.oprf, long, &bs));
+        _ = try S.blind(.oprf, max, &bs);
+        try testing.expectError(error.InputTooLong, S.finalize(long, &bs, g, &out));
+        try S.finalize(max, &bs, g, &out);
+        try testing.expectError(error.InputTooLong, S.evaluate(.oprf, &kp.sk, long, &out));
+        try testing.expectError(error.InputTooLong, S.finalizeVerifiable(long, &bs, g, g, kp.pk, proof, &out));
+        try testing.expectError(error.InputTooLong, S.finalizeVerifiableBatch(&.{long}, &.{bs}, &.{g}, &.{g}, kp.pk, proof, &outs));
+        try testing.expectError(error.InputTooLong, S.blindPoprf(long, "i", kp.pk, &bs));
+        try testing.expectError(error.InputTooLong, S.blindPoprf("x", long, kp.pk, &bs));
+        var ev: [1]S.Element = undefined;
+        try testing.expectError(error.InputTooLong, S.blindEvaluatePoprfBatch(&kp.sk, &.{g}, long, &ev, &bs));
+        try testing.expectError(error.InputTooLong, S.blindEvaluatePoprf(&kp.sk, g, long, &bs));
+        try testing.expectError(error.InputTooLong, S.finalizePoprf(long, &bs, g, g, proof, "i", g, &out));
+        try testing.expectError(error.InputTooLong, S.finalizePoprf("x", &bs, g, g, proof, long, g, &out));
+        try testing.expectError(error.InputTooLong, S.finalizePoprfBatch(&.{"x"}, &.{bs}, &.{g}, &.{g}, proof, long, g, &outs));
+        try testing.expectError(error.InputTooLong, S.finalizePoprfUnverified(long, &bs, g, "i", &out));
+        try testing.expectError(error.InputTooLong, S.evaluatePoprf(&kp.sk, "x", long, &out));
+        try testing.expectError(error.InputTooLong, S.evaluatePoprf(&kp.sk, long, "i", &out));
+        try testing.expectError(error.InputTooLong, S.poprfInfoScalar(long));
+        _ = try S.poprfInfoScalar(max);
+        try testing.expectError(error.InputTooLong, S.OprfServer.derive(&seed, long));
+    }
+}

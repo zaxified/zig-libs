@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **Error-set change:** `FinalizeRegistrationError`, `GenerateKE1Error` and `GenerateKE3Error` gain `InputTooLong`, and `createRegistrationRequest` (through `voprf.BlindError`) can return it: a password longer than RFC 9497's `2^16 - 1`-byte OPRF input bound. Before, such a password hit an assert in `voprf` (a panic in safe builds, UB in ReleaseFast). The internal `deriveKeyPair` calls (constant info strings) map voprf's new `InputTooLong` to `DeriveKeyPairFailed`; it cannot occur there.
+
 - **2026-10-18** — Ported to Zig 0.17.0. Test: `@typeInfo(error set)` is `.error_set.error_names.?` (plain names).
 - **2026-10-10** — tests: deterministic fuzz driver `OPAQUE_FUZZ` (`src/fuzz_test.zig`): `opaque-login` (registration + login with knob-chosen keys: the genuine KE3 is accepted and both session and export keys agree; a wrong password or context, one flipped bit in KE1, KE2, KE3 or the stored record, and a damaged KE2 are refused) and `opaque-hostile` (random fixed-width wire messages into `createRegistrationResponse` / `generateKE2` / `generateKE3`: never a panic, a KE2 nobody made never opens). ReleaseSafe, clean.
 - **2026-10-09** — **Breaking:** dead-stack burn for every secret-handling entry

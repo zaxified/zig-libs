@@ -25,6 +25,17 @@
 
 const std = @import("std");
 
+/// An optimization barrier on a byte: the result is `x`, but the compiler
+/// can no longer prove it is 0 or 1, so a mask built from it is not turned
+/// back into a branch.
+pub fn launder(x: u8) u8 {
+    var v = x;
+    asm volatile (""
+        : [v] "+r" (v),
+    );
+    return v;
+}
+
 /// RFC 9380 §5.3.1 `expand_message_xmd(msg, DST, len_in_bytes)` with hash
 /// `Hash` (a `std.crypto.hash.sha2` type). `msg` is given as consecutive
 /// parts (`parts[0] || parts[1] || ...`, never concatenated in memory).
@@ -171,9 +182,19 @@ pub fn Nist(
         /// `c1 = (p - 3) / 4` of Appendix F.2.1.2.
         const c1 = (p - 3) / 4;
 
+        /// `CMOV(a, b, c)`: `b` if `c == 1`, else `a`, without a branch.
+        /// Not the sibling's `Fe.cMov`: `p521`'s compiles to a conditional
+        /// jump on `c` at ReleaseFast (ctgrind `voprf/p521-client`,
+        /// 2026-11-13; `p256`'s is laundered, `p384`'s measured clean), so
+        /// this selects over the element's bytes with a mask the optimizer
+        /// cannot see through (`launder`). zig-libs: drop once p521 Fe.cMov is
+        /// laundered.
         fn sel(a: Fe, b: Fe, c: u1) Fe {
             var r = a;
-            r.cMov(b, c);
+            const mask: u8 = 0 -% launder(@as(u8, c));
+            const rb = std.mem.asBytes(&r);
+            const bb = std.mem.asBytes(&b);
+            for (rb, bb) |*x, y| x.* ^= (x.* ^ y) & mask;
             return r;
         }
 

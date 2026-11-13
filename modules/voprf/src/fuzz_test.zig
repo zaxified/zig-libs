@@ -3,7 +3,8 @@
 //! Deterministic fuzz driver for voprf (added 2026-10-10): `VOPRF_FUZZ=<runs>[,<first seed>]`
 //! (testkit's driver; `_ONLY` selects a harness by name). Harness names:
 //! `voprf-decode` (Element / Proof / scalar decoders: accepted means
-//! canonical, i.e. re-encodes to the input), `voprf-oprf`, `voprf-verifiable`
+//! canonical, i.e. re-encodes to the input), `voprf-decode-suites` (the same
+//! for decaf448 / P-256 / P-384 / P-521), `voprf-oprf`, `voprf-verifiable`
 //! and `voprf-poprf` (a genuine exchange agrees with the direct evaluation;
 //! a damaged wire element is never a silent success: it differs or is
 //! refused, and a verifiable proof with ONE flipped bit in the evaluated
@@ -134,6 +135,65 @@ test "fuzz driver: VOPRF_FUZZ (decode)" {
 }
 test "fuzz harness: decode, 400 seeds, reaches every outcome" {
     try DecodeMark.reach(fuzzDecode, "voprf-decode", 400);
+}
+
+const SuiteDecodeMark = Marker(enum { decaf448, p256, p384, p521, element_ok, element_refused, proof_ok, proof_refused, scalar_ok, scalar_refused });
+
+/// `voprf-decode-suites`: the same canonicity property as `voprf-decode`
+/// for the four non-default ciphersuites' decoders (decaf448 decoding,
+/// SEC1-compressed P-256/P-384/P-521 points, big-endian NIST scalars).
+fn fuzzDecodeSuites(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    var raw: [8]u8 = undefined;
+    const raw_len: usize = src.slice(&raw);
+    var knobs: Cursor = .{ .bytes = raw[0..raw_len] };
+    const which_suite = knobs.ranged(0, 3);
+    const suites = .{ .{ voprf.Decaf448Shake256, .decaf448 }, .{ voprf.P256Sha256, .p256 }, .{ voprf.P384Sha384, .p384 }, .{ voprf.P521Sha512, .p521 } };
+    inline for (suites, 0..) |entry, idx| {
+        if (which_suite == idx) {
+            const P = entry[0];
+            SuiteDecodeMark.mark(entry[1]);
+            var seed: [32]u8 = undefined;
+            expand(&knobs, &seed);
+            var kp: P.KeyPair = undefined;
+            try P.deriveKeyPair(.voprf, &seed, "fuzz", &kp);
+            var wide: [P.wide_length]u8 = undefined;
+            expand(&knobs, &wide);
+            var r: [P.Ns]u8 = undefined;
+            P.scalarFromWideBytes(&wide, &r);
+            const genuine_proof = (try P.generateProof(.voprf, &kp.sk, P.Element.generator, kp.pk, &.{P.Element.generator}, &.{kp.pk}, &r)).toBytes();
+            const pk_bytes = kp.pk.toBytes();
+            const frames = [_][]const u8{ &pk_bytes, &genuine_proof, &kp.sk };
+            const which = knobs.ranged(0, 2);
+            var fresh: [P.Proof.encoded_length]u8 = undefined;
+            src.bytes(&fresh);
+            var buf: [P.Proof.encoded_length]u8 = undefined;
+            const n = damage(src, &buf, frames[which]);
+            var fixed: [P.Proof.encoded_length]u8 = fresh;
+            @memcpy(fixed[0..n], buf[0..n]);
+            if (P.Element.fromBytes(fixed[0..P.Ne].*)) |e| {
+                if (!std.mem.eql(u8, &e.toBytes(), fixed[0..P.Ne])) return error.NonCanonicalElementAccepted;
+                SuiteDecodeMark.mark(.element_ok);
+            } else |_| SuiteDecodeMark.mark(.element_refused);
+            if (P.Proof.fromBytes(fixed)) |pf| {
+                if (!std.mem.eql(u8, &pf.toBytes(), &fixed)) return error.NonCanonicalProofAccepted;
+                SuiteDecodeMark.mark(.proof_ok);
+            } else |_| SuiteDecodeMark.mark(.proof_refused);
+            if (P.deserializeScalar(fixed[0..P.Ns].*)) |sc| {
+                if (!std.mem.eql(u8, &sc, fixed[0..P.Ns])) return error.NonCanonicalScalarAccepted;
+                SuiteDecodeMark.mark(.scalar_ok);
+            } else |_| SuiteDecodeMark.mark(.scalar_refused);
+        }
+    }
+}
+
+test "fuzz: voprf decoders of every ciphersuite are canonical" {
+    try testing.fuzz({}, smithWrap(fuzzDecodeSuites), .{});
+}
+test "fuzz driver: VOPRF_FUZZ (decode-suites)" {
+    try fuzz_driver.run(fuzzDecodeSuites, .{ .prefix = "VOPRF_FUZZ", .name = "voprf-decode-suites", .scale = 10 });
+}
+test "fuzz harness: decode-suites, 200 seeds, reaches every outcome" {
+    try SuiteDecodeMark.reach(fuzzDecodeSuites, "voprf-decode-suites", 200);
 }
 
 const ExMark = Marker(enum { genuine_accepted, damaged_blinded_differs, damaged_blinded_refused, damaged_evaluated_differs, damaged_evaluated_refused });

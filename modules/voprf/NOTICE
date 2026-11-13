@@ -66,3 +66,20 @@ module.
 KAT-validated byte-exact against RFC 9497 Appendix A.1 (19/19 tests,
 Debug + ReleaseFast). See `SPEC.md` for the threat model and the DLEQ
 construction notes.
+
+Extension 2026-11-13: all five ciphersuites
+-------------------------------------------
+
+The decaf448-SHAKE256, P256-SHA256, P384-SHA384 and P521-SHA512 suites
+(RFC 9497 §4.2-§4.5) were added from the same RFC text, with the groups
+taken from this repository's sibling modules (`decaf448`, `p256`, `p384`,
+`p521`) through their public APIs. `src/h2c.zig` (RFC 9380 §5.3
+expand_message_xmd/xof, §5.2 hash_to_field, §6.6.2 simplified SWU,
+Appendix F.2.1.2 sqrt_ratio) is a clean-room transcription of RFC 9380's
+own pseudocode; no other hash-to-curve implementation was consulted. The
+RFC 9497 Appendix A.1-A.5 vectors (`src/suite_vectors.zig`) and the RFC
+9380 Appendix J.1.1/J.2.1/J.3.1 and K.1/K.3 vectors (`src/h2c_vectors.zig`)
+are generated from https://www.rfc-editor.org/rfc/rfc9497.txt and
+https://www.rfc-editor.org/rfc/rfc9380.txt by `tools/gen_vectors.py`,
+which only re-flows the RFCs' wrapped hex; they are public specification
+artifacts.
