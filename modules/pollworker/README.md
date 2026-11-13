@@ -14,7 +14,14 @@ blocks that only share the "single owner drives the loop" discipline:
   atomic (acquire/release) — no mutex. `spawnDetached(argv, report)` runs the
   RUNNING→DONE half on a detached thread that fork/exec/waitpid's an arbitrary
   argv, keeping the between-fork-and-exec window async-signal-safe (raw
-  syscalls, no allocation in the child).
+  syscalls, no allocation in the child). `spawnDetachedEnv` adds a child
+  environment (`Env`: `.empty` / `.inherit` / `.list`).
+- **`Waker`** — an eventfd (self-pipe fallback) a worker writes when a job
+  finishes, so a `poll` on `waker.fd()` returns at once (libuv `uv_async_send`).
+  `JobTable.setWaker` makes `finish` signal it.
+- **`Timers`** — one-shot and repeating timers in a min-heap with an injected
+  millisecond clock (libuv `uv_timer_*`); `Loop.timeoutMs` folds the next due
+  time into the `poll` timeout, `Loop.runTimers` fires what is due.
 
 - A single-owner `poll(2)` loop plus a fork/detach
   job table: the loop drives a unix-socket accept + per-tick reap/publish, and
@@ -74,17 +81,41 @@ decoded from the `wait(2)` status word (no libc `W*` macros). Back-pressure is
 the fixed slot count `N`: `claim` returns null and `spawnDetached` returns
 `error.TableFull` when every slot is busy.
 
+### Waker, timers, environment
+
+```zig
+// Wake the poll when a job completes (no waiting out the poll timeout):
+var waker = try pollworker.Waker.init();            // eventfd, pipe fallback
+defer waker.deinit();
+try jobs.setWaker(&waker);                          // before submitting jobs
+var fds = [_]Loop.pollfd{
+    .{ .fd = waker.fd(), .events = Loop.POLL.IN, .revents = 0 },
+    .{ .fd = listen_fd, .events = Loop.POLL.IN, .revents = 0 },
+};
+// ... poll ...
+if (fds[0].revents != 0) { waker.clear(); jobs.drain(&onDone); }
+// teardown: after the last job is DONE, jobs.quiesce(); then waker.deinit().
+
+// Timers (the clock is yours: Loop.nowMs() in production, an integer in tests):
+const h = try loop.timers.add(gpa, &onTimer, ctx);  // inactive; at most max_timers
+try loop.timers.start(h, now, 500, 1000);           // first at +500 ms, then every 1000
+const wait = loop.timeoutMs(now, 250);              // poll timeout, capped by the next timer
+// ... poll(wait) ...
+_ = loop.runTimers(try Loop.nowMs());               // fire what is due
+try loop.timers.stop(h);  try loop.timers.again(h, now);  try loop.timers.close(h);
+
+// Child environment (replaces the whole environment, like uv_process_options env):
+try jobs.spawnDetachedEnv(gpa, &.{ "/bin/sh", "-c", "echo $X" }, .{ .list = &.{"X=1"} }, &record);
+try jobs.spawnDetachedEnv(gpa, argv, .inherit, &record);   // snapshot of /proc/self/environ
+```
+
 ## Not in scope (DEFER)
 
 - **The curl-specific fetch** (body read into a buffer, negative-cache on
   failure, stderr capture) stays in the app — this module only spawns + reports
   process completion.
-- **eventfd / real completion notification.** Results are observed by the loop
-  polling `drain` each tick, not by waking the `poll` on completion. An eventfd
-  registered in the pollset would remove the drain latency.
-- **Environment inheritance.** Detached children exec with an *empty*
-  environment; exec absolute paths (which need no `PATH`). A caller-supplied
-  envp is a future option.
+- **epoll / fd registration.** `Loop.poll` is still `poll(2)`: O(n) in the fd
+  count, and the caller keeps the `pollfd` array. No signal handles.
 - **Back-pressure beyond a fixed slot count** (queueing/retry) — the caller
   handles a full table (e.g. re-try on a later tick).
 - **Windows / non-Linux** — Linux-only by design (raw syscalls).

@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — Scope S4 -> S3: `Waker` (eventfd, self-pipe fallback) +
+  `JobTable.setWaker`/`quiesce` wake the poll on job completion (libuv
+  `uv_async_send`); `Timers` min-heap with an injected clock, bounded handle count,
+  generation-checked handles, `Loop.timeoutMs`/`runTimers`/`nowMs` (libuv
+  `uv_timer_*`); `Env` + `JobTable.spawnDetachedEnv` (`.empty`/`.inherit`/`.list`,
+  bounded, validated). `spawnDetached` is unchanged (empty environment).
 - **2026-10-18** — Ported to Zig 0.17.0. `dupeZ` -> `dupeSentinel(u8, s, 0)`; `waitpid` status is `i32`.
 - **2026-10-05** — Mutation run: 22 of 22 killed, 0 equivalent; 7 tests added
   (`poll` EINTR, `drain` skipping RUNNING, empty argv, `spawnDetached` under
