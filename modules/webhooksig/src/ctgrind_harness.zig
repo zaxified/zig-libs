@@ -119,7 +119,7 @@ fn verifyTarget(t: Taint) !void {
     verdict("sha512b64 reject", wh.verifyFormat(f5, &secret, body, b5bad[0..s5.len]));
 
     // Verifier over a rotation set: the secrets are copied into the heap, taint the copies.
-    var v = try wh.Verifier.init(std.heap.page_allocator, .{ .secret = &secret2, .extra_secrets = &.{&pub_secret} });
+    var v = try wh.Verifier.init(std.heap.page_allocator, .{ .secret = &secret2, .extra_secrets = &.{&pub_secret} }); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
     defer v.deinit();
     for (v.secrets.items) |s| taint(t, s);
     verdict("verifier accept", v.verifyBody(body, sig));

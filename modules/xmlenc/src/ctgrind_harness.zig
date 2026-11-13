@@ -183,7 +183,7 @@ fn publish(label: []const u8, bytes: []u8) void {
 }
 
 fn decryptAndReport(label: []const u8, doc: *const xml.Document, sk: *const rsa.SecretKey, opts: xmlenc.Options) void {
-    if (xmlenc.decryptData(std.heap.page_allocator, doc.root, sk, opts)) |out| {
+    if (xmlenc.decryptData(std.heap.page_allocator, doc.root, sk, opts)) |out| { // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
         publish(label, out);
         std.debug.print("ctgrind_result {s} ok\n", .{label});
     } else |e| {
@@ -226,7 +226,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 const content = cbcContent(&content_buf, &cek16, plaintext);
                 try build(&fx, xenc ++ "aes128-cbc", xenc ++ "rsa-oaep-mgf1p", wrapped, content);
             }
-            var doc = try xml.parse(std.heap.page_allocator, fx.src(), .{});
+            var doc = try xml.parse(std.heap.page_allocator, fx.src(), .{}); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
             defer doc.deinit();
             taintKey(t, &kp.secret_key);
             decryptAndReport(@tagName(target), &doc, &kp.secret_key, .{});
@@ -248,7 +248,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const ct = try rsa.rsaep(256, em, kp.public_key);
             const content = gcmContent(&content_buf, &cek, plaintext, false);
             try build(&fx, xenc11 ++ "aes256-gcm", xenc ++ "rsa-1_5", &ct, content);
-            var doc = try xml.parse(std.heap.page_allocator, fx.src(), .{});
+            var doc = try xml.parse(std.heap.page_allocator, fx.src(), .{}); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
             defer doc.deinit();
             taintKey(t, &kp.secret_key);
             decryptAndReport("rsa15", &doc, &kp.secret_key, .{ .allow_weak_rsa15 = true });
@@ -263,7 +263,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             for ([_]bool{ false, true }) |flip| {
                 const content = gcmContent(&content_buf, &cek, plaintext, flip);
                 try build(&fx, xenc11 ++ "aes256-gcm", xenc ++ "kw-aes256", &wrapped, content);
-                var doc = try xml.parse(std.heap.page_allocator, fx.src(), .{});
+                var doc = try xml.parse(std.heap.page_allocator, fx.src(), .{}); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
                 defer doc.deinit();
                 taint(t, &kek);
                 decryptAndReport(if (flip) "kw-reject" else "kw-accept", &doc, &kp.secret_key, .{ .kek = &kek });

@@ -109,7 +109,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try rsa.SecretKey.fromPrimes(&kp.secret_key, &kat_p, &kat_q, &kat_e);
     defer kp.secret_key.deinit();
     kp.public_key = try rsa.PublicKey.fromBytes(&kat_n, &kat_e);
-    const alloc = std.heap.page_allocator;
+    const alloc = std.heap.page_allocator; // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
 
     switch (target) {
         .sign => {

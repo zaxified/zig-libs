@@ -46,7 +46,7 @@ const jwe = @import("root.zig");
 const rsa = @import("rsa");
 
 const memcheck = std.valgrind.memcheck;
-const gpa = std.heap.page_allocator;
+const gpa = std.heap.page_allocator; // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
 
 const Target = enum { content, kw, ecdh, pbes2, rsa };
 const Taint = enum { yes, no };
