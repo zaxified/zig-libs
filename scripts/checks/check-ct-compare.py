@@ -33,6 +33,14 @@ which should make a constant-time comparison makes one. A module that has never
 had a `timing_safe` call has no row here and this gate says nothing about it.
 Read a green run as "no site regressed", never as "all comparisons are safe".
 
+## One column (owner 2026-11-13)
+
+Until 2026-11-13 the pin had a second column, the file's plain `std.mem.eql`
+calls, so that a swap would show as a drop on the left AND a rise on the right.
+It was dropped: in seven weeks it forced ~21 re-pins of files whose public-byte
+comparisons merely moved, and it was never the sole signal of a defect -- the
+drop in the constant-time column is what a swap looks like, and it alone fails.
+
 ## Aliases
 
 ⚠ A literal grep for `timing_safe.eql` measures a smaller world than it looks
@@ -55,8 +63,6 @@ PIN = os.path.join(REPO, "scripts", "checks", "ct-compare-expected.tsv")
 # gate is about, and a swap between them is as much a regression as a swap to
 # `std.mem`.
 CT_FNS = ("eql", "lt", "gt")
-# The value-equal, timing-unequal replacements a mutation reaches for.
-PLAIN_FNS = ("eql", "eqlBytes")
 
 
 def strip_comments(src: str) -> str:
@@ -129,8 +135,7 @@ def measure(path: str):
     with open(path, encoding="utf-8") as fh:
         src = strip_comments(fh.read())
     ct_roots = resolve_aliases(src, "std.crypto.timing_safe")
-    plain_roots = resolve_aliases(src, "std.mem")
-    return count_calls(src, ct_roots, CT_FNS), count_calls(src, plain_roots, PLAIN_FNS)
+    return count_calls(src, ct_roots, CT_FNS)
 
 
 def scan_all(only=None):
@@ -149,9 +154,9 @@ def scan_all(only=None):
             if not name.endswith(".zig") or name == "ctgrind_harness.zig":
                 continue
             rel = f"modules/{module}/src/{name}"
-            ct, plain = measure(os.path.join(src_dir, name))
+            ct = measure(os.path.join(src_dir, name))
             if ct:
-                found[rel] = (ct, plain)
+                found[rel] = ct
     return found
 
 
@@ -164,8 +169,9 @@ def read_pin():
             line = line.rstrip("\n")
             if not line or line.startswith("#"):
                 continue
-            path, ct, plain = line.split("\t")
-            rows[path] = (int(ct), int(plain))
+            # A legacy third column (plain std.mem compares) is ignored.
+            fields = line.split("\t")
+            rows[fields[0]] = int(fields[1])
     return rows
 
 
@@ -176,12 +182,8 @@ HEADER = """\
 # ctap2pin, 2026-09-09: not one context moves), so the only thing that can hold
 # the decision in place is a count that goes red when it changes.
 #
-# path<TAB>constant-time compares<TAB>plain std.mem compares in the same file
+# path<TAB>constant-time compares (timing_safe.eql/lt/gt, aliases resolved)
 #
-# ⚠ The second column is context, not a verdict: plenty of files legitimately
-# compare public bytes with `std.mem.eql`. It is pinned so that a swap shows up
-# as BOTH a drop on the left and a rise on the right, which is what a mutation
-# looks like and what a refactor usually does not.
 """
 
 
@@ -220,10 +222,9 @@ def write_pin(rows):
     with open(PIN, "w", encoding="utf-8") as fh:
         fh.write(HEADER)
         for path in sorted(rows):
-            ct, plain = rows[path]
             for line in notes.get(path, []):
                 fh.write(line + "\n")
-            fh.write(f"{path}\t{ct}\t{plain}\n")
+            fh.write(f"{path}\t{rows[path]}\n")
 
 
 def main() -> int:
@@ -277,16 +278,15 @@ def main() -> int:
 
     fail = 0
     for path in sorted(pinned):
-        want_ct, want_plain = pinned[path]
+        want_ct = pinned[path]
         if not os.path.exists(os.path.join(REPO, path)):
             print(f"FAIL {path}: pinned file no longer exists — re-pin deliberately.", file=sys.stderr)
             fail = 1
             continue
-        got_ct, got_plain = found.get(path, measure(os.path.join(REPO, path)))
-        if got_ct != want_ct or got_plain != want_plain:
+        got_ct = found.get(path, measure(os.path.join(REPO, path)))
+        if got_ct != want_ct:
             print(
-                f"FAIL {path}: constant-time compares {got_ct} (pinned {want_ct}), "
-                f"plain std.mem compares {got_plain} (pinned {want_plain}).",
+                f"FAIL {path}: constant-time compares {got_ct} (pinned {want_ct}).",
                 file=sys.stderr,
             )
             if got_ct < want_ct:
