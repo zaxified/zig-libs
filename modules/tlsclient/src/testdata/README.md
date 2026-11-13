@@ -10,6 +10,7 @@ mirror a misreading of its own. All P-256, ten years from 2026-09-24.
 | `leaf.pem` | inter | server leaf, `CA:FALSE`, SAN `DNS:good.example.test`, EKU serverAuth |
 | `forged.pem` | **leaf** (signed with leaf's key) | SAN `DNS:victim.example.test` -- the ziglang/zig #35877 attack |
 | `leaf-client.pem` | inter | `CA:FALSE`, EKU clientAuth only |
+| `selfsigned.pem` | self | self-signed server leaf, SAN `DNS:good.example.test`, `CA:FALSE`, same validity window (2026-11-13, for the `.self_signed` branch of the resumption chain re-check; key discarded) |
 
 `leaf.key.pem` and `forged.key.pem` are kept for `tools/openssl-oracle.sh`,
 which serves these chains with `openssl s_server`; they are throwaway keys.

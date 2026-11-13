@@ -91,10 +91,16 @@ const Prime = struct {
     ems: bool = true,
     not_after_s: i64 = std.math.maxInt(i64),
     tls12: bool = true,
+    /// The cache key (default: `good_host` with a real chain, else `host`).
+    key: ?[]const u8 = null,
+    chain: Chain = .auto,
+    ver: ?@TypeOf(@as(Client.ClientSession, .{}).verification) = null,
+
+    const Chain = enum { auto, selfsigned, leaf_only, none };
 };
 
 fn prime(cache: *Client.SessionCache, p: Prime) *Client.ClientSession {
-    const e = cache.reserve(if (p.real_chain) good_host else host).?;
+    const e = cache.reserve(p.key orelse if (p.real_chain) good_host else host).?;
     e.wipe();
     e.verification = .no_verification;
     e.leaf_not_after_s = p.not_after_s;
@@ -106,6 +112,17 @@ fn prime(cache: *Client.SessionCache, p: Prime) *Client.ClientSession {
         _ = e.setChain(&.{ leaf, inter });
         e.verification = .bundle;
     } else _ = e.setChain(&.{ "leaf-der", "inter-der" });
+    {
+        var b1: [4096]u8 = undefined;
+        var b2: [4096]u8 = undefined;
+        switch (p.chain) {
+            .auto => {},
+            .selfsigned => _ = e.setChain(&.{pemToDer(@embedFile("testdata/selfsigned.pem"), &b1) catch unreachable}),
+            .leaf_only => _ = e.setChain(&.{pemToDer(@embedFile("testdata/leaf.pem"), &b2) catch unreachable}),
+            .none => e.chain_count = 0,
+        }
+        if (p.ver) |v| e.verification = v;
+    }
     if (p.v13) {
         e.hash = .sha256;
         @memcpy(e.ticket_buf[0..p.ticket.len], p.ticket);
@@ -134,6 +151,32 @@ var read_buf: [Client.min_buffer_len]u8 = undefined;
 var write_buf: [Client.min_buffer_len]u8 = undefined;
 var out_buf: [Client.min_buffer_len]u8 = undefined;
 var sink: Client = undefined;
+
+/// A buffering sink: what `output` holds is not "sent" until it is flushed.
+const BufSink = struct {
+    w: Writer,
+    got: [8192]u8 = undefined,
+    n: usize = 0,
+
+    fn append(s: *BufSink, b: []const u8) void {
+        @memcpy(s.got[s.n..][0..b.len], b);
+        s.n += b.len;
+    }
+
+    fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
+        const s: *BufSink = @fieldParentPtr("w", w);
+        s.append(w.buffer[0..w.end]);
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            s.append(d);
+            n += d.len;
+        }
+        for (0..splat) |_| s.append(data[data.len - 1]);
+        return n + data[data.len - 1].len * splat;
+    }
+};
+var bsink: BufSink = undefined;
 var info_storage: [16 * 1024]u8 = undefined;
 var info: Client.ConnectionInfo = undefined;
 
@@ -144,6 +187,15 @@ const Cfg = struct {
     cache: ?*Client.SessionCache,
     /// Verify against this bundle, for `good_host` (else: no verification, `host`).
     bundle: ?*std.crypto.Certificate.Bundle = null,
+    /// Trust the server's own certificate (`.self_signed`), for `good_host`.
+    self_signed: bool = false,
+    /// `.host = .no_verification`: no server name, so no cache key.
+    no_host: bool = false,
+    host: ?[]const u8 = null,
+    verify: ?Client.VerifyConnection = null,
+    /// `output` buffers until flushed (the default is a fixed writer, where
+    /// buffered and sent are the same).
+    buffered: bool = false,
 };
 
 const Result = struct {
@@ -157,12 +209,15 @@ fn run(server: []const u8, cfg: Cfg) Result {
     var reader = Reader.fixed(&in_buf);
     reader.end = server.len;
     var fw = Writer.fixed(&out_buf);
+    bsink = .{ .w = .{ .buffer = &out_buf, .vtable = &.{ .drain = BufSink.drain } } };
+    const output: *Writer = if (cfg.buffered) &bsink.w else &fw;
     info = .init(&info_storage);
     const e = entropy();
     var lock: std.Io.RwLock = .init;
     const opts: Client.Options = .{
-        .host = .{ .explicit = if (cfg.bundle != null) good_host else host },
-        .ca = if (cfg.bundle) |b| .{ .bundle = .{ .gpa = testing.allocator, .io = testing.io, .lock = &lock, .bundle = b } } else .no_verification,
+        .host = if (cfg.no_host) .no_verification else .{ .explicit = cfg.host orelse if (cfg.bundle != null or cfg.self_signed) good_host else host },
+        .verify_connection = cfg.verify,
+        .ca = if (cfg.self_signed) .self_signed else if (cfg.bundle) |b| .{ .bundle = .{ .gpa = testing.allocator, .io = testing.io, .lock = &lock, .bundle = b } } else .no_verification,
         .write_buffer = &write_buf,
         .read_buffer = &read_buf,
         .entropy = &e,
@@ -173,10 +228,10 @@ fn run(server: []const u8, cfg: Cfg) Result {
         .session_cache = cfg.cache,
     };
     var err: ?anyerror = null;
-    Client.initInto(&sink, &reader, &fw, opts) catch |x| {
+    Client.initInto(&sink, &reader, output, opts) catch |x| {
         err = x;
     };
-    return .{ .err = err, .out = fw.buffered() };
+    return .{ .err = err, .out = if (cfg.buffered) bsink.got[0..bsink.n] else fw.buffered() };
 }
 
 /// The ClientHello handshake message `run` writes first (record header
@@ -232,6 +287,8 @@ const Srv = struct {
     unannounced_ticket: bool = false,
     /// One octet after the Finished's verify_data (inside its length).
     finished_trailing: bool = false,
+    /// A second NewSessionTicket right after the first.
+    second_ticket: bool = false,
 };
 
 fn prf(label: []const u8, seed: []const []const u8, comptime n: usize) [n]u8 {
@@ -297,6 +354,16 @@ fn buildServer(buf: []u8, ch: []const u8, s: Srv, th: *Sha256) []const u8 {
         th.update(m);
         putPlainRecord(&w, .handshake, m);
     };
+    if (s.second_ticket) {
+        var nw = Writer.fixed(&nst_buf);
+        nw.writeInt(u32, 7200, .big) catch unreachable;
+        nw.writeInt(u16, 3, .big) catch unreachable;
+        nw.writeAll("TWO") catch unreachable;
+        var sw3 = Writer.fixed(scratch[sw.end + 2200 ..]);
+        const m = putHs(&sw3, .new_session_ticket, nw.buffered());
+        th.update(m);
+        putPlainRecord(&w, .handshake, m);
+    }
     if (!s.finish) return w.buffered();
 
     putPlainRecord(&w, .change_cipher_spec, &.{1});
@@ -346,6 +413,7 @@ fn expectClientFinished(out: []const u8, ch_len: usize, th: *Sha256) !void {
     var pt: [16]u8 = undefined;
     try Aead.decrypt(&pt, rec[13..29], rec[29..45].*, &ad, nonce, kb[0..16].*);
     try testing.expectEqual(@as(u8, 20), pt[0]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 12 }, pt[1..4]);
     const hash = th.peek();
     const want = prf("client finished", &.{&hash}, 12);
     try testing.expectEqualSlices(u8, &want, pt[4..16]);
@@ -369,6 +437,8 @@ test "offer: the cached ticket goes out in the SessionTicket extension; the rand
     try testing.expectEqualStrings("OLD-TICKET", findExt(ch, hello.ext_session_ticket).?);
     try testing.expectEqualSlices(u8, &sessionId(), ch[4 + 2 + 32 + 1 ..][0..32]);
     try testing.expect(findExt(ch, hello.ext_extended_master_secret) != null);
+    // A TLS 1.2 entry is never also a TLS 1.3 PSK (pre_shared_key, 41).
+    try testing.expect(findExt(ch, 41) == null);
 }
 
 test "offer: no cache, TLS 1.3 only: no extension; a cache without a TLS 1.2 session: an empty one (Go: 'I accept tickets')" {
@@ -406,9 +476,14 @@ test "resume: abbreviated handshake -- server Finished first, ours verified agai
     const gen = e.generation;
     var th: Sha256 = undefined;
     const server = buildServer(&srv_buf, ch, .{}, &th);
-    const r = run(server, .{ .cache = &cache });
+    const r = run(server, .{ .cache = &cache, .now_s = 1234 });
     try testing.expect(r.err == null);
     try expectClientFinished(r.out, ch.len, &th);
+    // Our Finished was record 0: the next record we send must not reuse its nonce.
+    try testing.expectEqual(@as(u64, 1), sink.write_seq);
+    try testing.expectEqual(@as(i64, 1_234_000), e.received_ms);
+    for (e.resumption_secret[48..]) |b| try testing.expectEqual(@as(u8, 0), b);
+    try testing.expectEqual(@as(?tls.NamedGroup, .secp256r1), info.negotiated_group);
     try testing.expect(sink.did_resume);
     try testing.expect(info.did_resume);
     try testing.expectEqual(tls.ProtocolVersion.tls_1_2, info.version);
@@ -659,4 +734,232 @@ test "an echoed session_id with no cache at all is refused, as Go refuses it (RF
     var th: Sha256 = undefined;
     const server = buildServer(&srv_buf, ch, .{ .ticket_ext = false, .ticket = null, .finish = false }, &th);
     try testing.expectEqual(error.TlsIllegalParameter, run(server, .{ .cache = null }).err.?);
+}
+
+// ── review additions (mutation delta run 2026-11-13) ──────────────────────
+
+const HookCtx = struct {
+    cache: *Client.SessionCache,
+    /// Replace the entry as another connection would (a new generation).
+    bump: bool = false,
+    refuse: bool = false,
+    calls: usize = 0,
+    saw_resume: bool = false,
+    chain_len: usize = 0,
+    version: tls.ProtocolVersion = .tls_1_3,
+
+    fn verify(ctx: ?*anyopaque, ci: *const Client.ConnectionInfo) anyerror!void {
+        const h: *HookCtx = @ptrCast(@alignCast(ctx.?));
+        h.calls += 1;
+        h.saw_resume = ci.did_resume;
+        h.chain_len = ci.peerCertificates().len;
+        h.version = ci.version;
+        if (h.bump) _ = h.cache.reserve(host);
+        if (h.refuse) return error.Pinned;
+    }
+};
+
+test "resume: the verification hook runs on a resumption (kept chain, did_resume); refusing aborts before our Finished and drops the entry" {
+    var buf: [2048]u8 = undefined;
+    const ch = try clientHello(&buf, .{}, .{ .cache = null });
+    var storage: [2]Client.ClientSession = undefined;
+    var cache = newCache(&storage);
+    defer cache.deinit();
+    for ([_]bool{ false, true }) |refuse| {
+        _ = prime(&cache, .{});
+        var h: HookCtx = .{ .cache = &cache, .refuse = refuse };
+        var th: Sha256 = undefined;
+        const server = buildServer(&srv_buf, ch, .{}, &th);
+        const r = run(server, .{ .cache = &cache, .verify = .{ .context = &h, .verify = HookCtx.verify } });
+        try testing.expectEqual(@as(usize, 1), h.calls);
+        try testing.expect(h.saw_resume);
+        try testing.expectEqual(@as(usize, 2), h.chain_len);
+        try testing.expectEqual(tls.ProtocolVersion.tls_1_2, h.version);
+        if (refuse) {
+            try testing.expectEqual(error.TlsConnectionRejected, r.err.?);
+            try testing.expectEqual(5 + ch.len, r.out.len);
+            try expectDropped(&cache);
+        } else {
+            try testing.expect(r.err == null);
+            try expectClientFinished(r.out, ch.len, &th);
+        }
+    }
+}
+
+test "resume: an entry another connection replaced meanwhile is neither overwritten by our ticket nor dropped by our failure" {
+    var buf: [2048]u8 = undefined;
+    const ch = try clientHello(&buf, .{}, .{ .cache = null });
+    var storage: [2]Client.ClientSession = undefined;
+    var cache = newCache(&storage);
+    defer cache.deinit();
+    for ([_]bool{ false, true }) |refuse| {
+        const e = prime(&cache, .{});
+        const gen = e.generation;
+        var h: HookCtx = .{ .cache = &cache, .bump = true, .refuse = refuse };
+        var th: Sha256 = undefined;
+        const server = buildServer(&srv_buf, ch, .{}, &th);
+        const r = run(server, .{ .cache = &cache, .verify = .{ .context = &h, .verify = HookCtx.verify } });
+        try testing.expect(e.generation != gen);
+        // Neither way the other connection's entry is touched.
+        try testing.expect(cache.find(host) != null);
+        try testing.expectEqualStrings("OLD-TICKET", e.ticket());
+        try testing.expect(e.usable);
+        try testing.expectEqual(refuse, r.err != null);
+    }
+}
+
+test "resume: a NewSessionTicket of exactly max_ticket_len is kept" {
+    var buf: [2048]u8 = undefined;
+    const ch = try clientHello(&buf, .{}, .{ .cache = null });
+    var storage: [2]Client.ClientSession = undefined;
+    var cache = newCache(&storage);
+    defer cache.deinit();
+    const e = prime(&cache, .{});
+    const exact: [2048]u8 = @splat('T');
+    var th: Sha256 = undefined;
+    const server = buildServer(&srv_buf, ch, .{ .ticket = &exact }, &th);
+    const r = run(server, .{ .cache = &cache });
+    try testing.expect(r.err == null);
+    try testing.expectEqual(@as(u16, 2048), e.ticket_len);
+    try testing.expectEqualSlices(u8, &exact, e.ticket());
+    try testing.expect(e.usable);
+}
+
+test "resume: the exporter of a resumed session is RFC 5705 over the cached master secret with EMS, and unavailable without (RFC 7627 §4)" {
+    var buf: [2048]u8 = undefined;
+    var out: [32]u8 = undefined;
+    {
+        const ch = try clientHello(&buf, .{}, .{ .cache = null });
+        var storage: [2]Client.ClientSession = undefined;
+        var cache = newCache(&storage);
+        defer cache.deinit();
+        _ = prime(&cache, .{});
+        var th: Sha256 = undefined;
+        const server = buildServer(&srv_buf, ch, .{}, &th);
+        try testing.expect(run(server, .{ .cache = &cache }).err == null);
+        try sink.exportKeyingMaterial("EXPERIMENTAL", null, &out);
+        const want = prf("EXPERIMENTAL", &.{ &clientRandom(), &server_random }, 32);
+        try testing.expectEqualSlices(u8, &want, &out);
+    }
+    {
+        const ch = try clientHello(&buf, .{ .ems = false }, .{ .cache = null, .ems = false });
+        var storage: [2]Client.ClientSession = undefined;
+        var cache = newCache(&storage);
+        defer cache.deinit();
+        _ = prime(&cache, .{ .ems = false });
+        var th: Sha256 = undefined;
+        const server = buildServer(&srv_buf, ch, .{ .ems = false }, &th);
+        try testing.expect(run(server, .{ .cache = &cache, .ems = false }).err == null);
+        try testing.expectError(error.ExporterUnavailable, sink.exportKeyingMaterial("EXPERIMENTAL", null, &out));
+    }
+}
+
+test "NewSessionTicket placement: not before the Certificate, not twice; a ChangeCipherSpec early in a full handshake is not a missing ticket" {
+    var buf: [2048]u8 = undefined;
+    const ch = try clientHello(&buf, .{}, .{ .cache = null });
+    var storage: [2]Client.ClientSession = undefined;
+    var cache = newCache(&storage);
+    defer cache.deinit();
+    var th: Sha256 = undefined;
+    // A ticket right after a ServerHello that did not resume (no Certificate yet).
+    _ = prime(&cache, .{});
+    var server = buildServer(&srv_buf, ch, .{ .echo = false, .ticket = "X", .finish = false }, &th);
+    try testing.expectEqual(error.TlsUnexpectedMessage, run(server, .{ .cache = &cache }).err.?);
+    // Two.
+    _ = prime(&cache, .{});
+    server = buildServer(&srv_buf, ch, .{ .second_ticket = true }, &th);
+    try testing.expectEqual(error.TlsUnexpectedMessage, run(server, .{ .cache = &cache }).err.?);
+    // A ChangeCipherSpec straight after a full handshake's ServerHello, ticket announced:
+    // ignored (the Certificate is awaited), not "ticket missing".
+    _ = prime(&cache, .{});
+    server = buildServer(&srv_buf, ch, .{ .echo = false, .ticket = null, .finish = false }, &th);
+    @memcpy(srv_buf[server.len..][0..6], &[_]u8{ 20, 3, 3, 0, 1, 1 });
+    try testing.expectEqual(error.TlsConnectionTruncated, run(srv_buf[0 .. server.len + 6], .{ .cache = &cache }).err.?);
+}
+
+test "offer: no server name, no cache key: no ticket extension at all" {
+    var storage: [2]Client.ClientSession = undefined;
+    var cache = newCache(&storage);
+    defer cache.deinit();
+    const r = run("", .{ .cache = &cache, .no_host = true });
+    try testing.expectEqual(error.TlsConnectionTruncated, r.err.?);
+    try testing.expect(findExt(r.out[5..], hello.ext_session_ticket) == null);
+}
+
+test "offer: a session made without verification is not offered under a bundle and stays; one for a name its leaf does not cover, or kept with no chain, is deleted" {
+    const gpa = testing.allocator;
+    var good = try rootBundle(gpa, true);
+    defer good.deinit(gpa);
+    var storage: [2]Client.ClientSession = undefined;
+    var cache = newCache(&storage);
+    defer cache.deinit();
+    const other = "other.example.test";
+    const Case = struct { p: Prime, key: []const u8, kept: bool };
+    const cases = [_]Case{
+        .{ .p = .{ .key = good_host }, .key = good_host, .kept = true }, // placeholder chain, no_verification
+        .{ .p = .{ .real_chain = true, .key = other }, .key = other, .kept = false }, // leaf is for good_host
+        .{ .p = .{ .real_chain = true, .chain = .none }, .key = good_host, .kept = false },
+    };
+    for (cases) |c| {
+        _ = prime(&cache, c.p);
+        const r = run("", .{ .cache = &cache, .bundle = &good, .now_s = now_fixture, .host = c.key });
+        try testing.expectEqual(error.TlsConnectionTruncated, r.err.?);
+        try testing.expectEqual(@as(usize, 0), findExt(r.out[5..], hello.ext_session_ticket).?.len);
+        try testing.expectEqual(c.kept, cache.find(c.key) != null);
+        _ = cache.drop(c.key);
+    }
+}
+
+test "offer under .self_signed: the kept leaf must verify against itself, within its validity" {
+    var storage: [2]Client.ClientSession = undefined;
+    var cache = newCache(&storage);
+    defer cache.deinit();
+    const Case = struct { p: Prime, now_s: i64, offered: bool };
+    const cases = [_]Case{
+        .{ .p = .{ .key = good_host, .chain = .selfsigned, .ver = .self_signed }, .now_s = now_fixture, .offered = true },
+        .{ .p = .{ .key = good_host, .chain = .leaf_only, .ver = .self_signed }, .now_s = now_fixture, .offered = false }, // signed by another
+        .{ .p = .{ .key = good_host, .chain = .selfsigned, .ver = .self_signed }, .now_s = far, .offered = false }, // expired
+    };
+    for (cases) |c| {
+        _ = prime(&cache, c.p);
+        const r = run("", .{ .cache = &cache, .self_signed = true, .now_s = c.now_s });
+        try testing.expectEqual(error.TlsConnectionTruncated, r.err.?);
+        const ext = findExt(r.out[5..], hello.ext_session_ticket).?;
+        try testing.expectEqual(c.offered, ext.len != 0);
+        _ = cache.drop(good_host);
+    }
+}
+
+test "offer: every TLS 1.2 suite this client offers can be resumed, and no value spanning two list entries can" {
+    var storage: [2]Client.ClientSession = undefined;
+    var cache = newCache(&storage);
+    defer cache.deinit();
+    const suites = [_]u16{ 0xc02f, 0xc030, 0xcca8, 0xc02b, 0xc02c, 0xcca9 };
+    for (suites) |sv| {
+        _ = prime(&cache, .{ .suite = sv });
+        const r = run("", .{ .cache = &cache });
+        try testing.expectEqualStrings("OLD-TICKET", findExt(r.out[5..], hello.ext_session_ticket).?);
+        _ = cache.drop(host);
+    }
+    // Adjacent entries c0 2b c0 2c / c0 2c cc a9 read at an odd offset.
+    for ([_]u16{ 0x2bc0, 0x2ccc, 0xc02b -% 0x100 }) |sv| {
+        _ = prime(&cache, .{ .suite = sv });
+        const r = run("", .{ .cache = &cache });
+        try testing.expectEqual(@as(usize, 0), findExt(r.out[5..], hello.ext_session_ticket).?.len);
+        _ = cache.drop(host);
+    }
+}
+
+test "resume: our ChangeCipherSpec and Finished are flushed before init returns (a server that speaks first would wait for them)" {
+    var buf: [2048]u8 = undefined;
+    const ch = try clientHello(&buf, .{}, .{ .cache = null });
+    var storage: [2]Client.ClientSession = undefined;
+    var cache = newCache(&storage);
+    defer cache.deinit();
+    _ = prime(&cache, .{});
+    var th: Sha256 = undefined;
+    const server = buildServer(&srv_buf, ch, .{}, &th);
+    const r = run(server, .{ .cache = &cache, .buffered = true });
+    try testing.expect(r.err == null);
+    try expectClientFinished(r.out, ch.len, &th);
 }

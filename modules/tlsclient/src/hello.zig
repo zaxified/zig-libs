@@ -408,3 +408,22 @@ fn findExt(m: []const u8, t: u16) ?[]const u8 {
     }
     return null;
 }
+
+test "hello: a buffer of exactly the message's size suffices, one byte less is NoSpaceLeft" {
+    var big: [max_len]u8 = undefined;
+    const r: [32]u8 = @splat(1);
+    const p: Params = .{
+        .random = &r,
+        .session_id = &r,
+        .cipher_suites = &.{ 0, 2, 0xc0, 0x2f },
+        .host = "",
+        .versions = &.{.tls_1_2},
+        .groups = &.{.x25519},
+        .shares = &.{},
+        .session_ticket = "TICKET",
+    };
+    const n = (try write(&big, p)).len;
+    var exact: [max_len]u8 = undefined;
+    try testing.expectEqual(n, (try write(exact[0..n], p)).len);
+    try testing.expectError(error.NoSpaceLeft, write(exact[0 .. n - 1], p));
+}

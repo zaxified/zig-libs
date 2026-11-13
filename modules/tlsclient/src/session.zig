@@ -333,3 +333,28 @@ test "ClientSession.wipe zeroes every secret but keeps the key and generation; S
     for (e.resumption_secret) |b| try testing.expectEqual(@as(u8, 0), b);
     try testing.expect(!c.drop("a.test"));
 }
+
+test "SessionCache.find: a free entry is never found, not even by the empty name (review 2026-11-13)" {
+    var storage: [2]ClientSession = undefined;
+    var c: SessionCache = .init(&storage, null);
+    defer c.deinit();
+    try testing.expect(c.find("") == null);
+    _ = c.reserve("a.test").?;
+    try testing.expect(c.find("") == null);
+    try testing.expect(c.find("b.test") == null);
+    try testing.expect(c.find("a.test") != null);
+}
+
+test "SessionCache.reserve: an empty key or one over max_key_len is refused (no panic through the public cache); exactly max_key_len is kept" {
+    var storage: [2]ClientSession = undefined;
+    var c: SessionCache = .init(&storage, null);
+    defer c.deinit();
+    const long: [max_key_len + 1]u8 = @splat('a');
+    try testing.expect(c.reserve("") == null);
+    try testing.expect(c.reserve(&long) == null);
+    const e = c.reserve(long[0..max_key_len]).?;
+    try testing.expectEqual(@as(usize, max_key_len), e.key().len);
+    var empty: [0]ClientSession = .{};
+    var z: SessionCache = .init(&empty, null);
+    try testing.expect(z.reserve("a.test") == null);
+}

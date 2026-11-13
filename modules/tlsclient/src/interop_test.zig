@@ -1006,6 +1006,170 @@ test "interop: resumption is not offered to another name, nor after the ticket's
     try testing.expect(cache.find("good.example.test").?.usable);
 }
 
+// ── 2026-11-13: TLS 1.2 session tickets (RFC 5077) against openssl ────────
+
+const ProbeHook = struct {
+    cache: *Client.SessionCache,
+    /// Replace the entry as another connection would (a new generation).
+    bump: bool = false,
+    refuse: bool = false,
+    calls: usize = 0,
+    saw_entry: bool = false,
+    saw_usable: bool = false,
+    saw_version12: bool = false,
+    saw_ticket_len: u16 = 0,
+
+    fn verify(ctx: ?*anyopaque, _: *const Client.ConnectionInfo) anyerror!void {
+        const h: *ProbeHook = @ptrCast(@alignCast(ctx.?));
+        h.calls += 1;
+        if (h.cache.find("good.example.test")) |e| {
+            h.saw_entry = true;
+            h.saw_usable = e.usable;
+            h.saw_version12 = e.version12;
+            h.saw_ticket_len = e.ticket_len;
+        }
+        if (h.bump) _ = h.cache.reserve("good.example.test");
+        if (h.refuse) return error.Pinned;
+    }
+};
+
+/// A complete-looking TLS 1.2 entry whose ticket and secret no server knows.
+fn primeStale12(cache: *Client.SessionCache) *Client.ClientSession {
+    const e = cache.reserve("good.example.test").?;
+    e.wipe();
+    e.verification = .bundle;
+    _ = e.setChain(&.{ derFromPem(@embedFile("testdata/leaf.pem")), derFromPem(@embedFile("testdata/inter.pem")) });
+    e.version12 = true;
+    e.usable = true;
+    e.suite12 = 0xc02f;
+    e.ems12 = true;
+    e.group12 = 0x0017;
+    @memset(e.resumption_secret[0..48], 0x42);
+    @memcpy(e.ticket_buf[0..5], "STALE");
+    e.ticket_len = 5;
+    return e;
+}
+
+test "interop: TLS 1.2 resumption -- the ticket of a full handshake resumes, twice; the view keeps the chain; the entry is complete" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    var entries: [1]Client.ClientSession = undefined;
+    var cache: Client.SessionCache = .init(&entries, null);
+    defer cache.deinit();
+    var srv = try Server.startProto(io, tmp.dir, "-tls1_2", "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-rev", "-naccept", "3" });
+    defer srv.stop(io);
+    const first = try session(io, srv.port, &bundle, .{ .session_cache = &cache, .max_version = .tls_1_2 });
+    try testing.expect(!first.resumed);
+    try testing.expectEqual(std.crypto.tls.ProtocolVersion.tls_1_2, first.version);
+    try testing.expectEqualStrings("olleh", first.echo[0..first.echo_len]);
+    const e = cache.find("good.example.test").?;
+    try testing.expect(e.usable and e.version12 and e.ems12);
+    try testing.expect(e.ticket_len > 0);
+    try testing.expect(e.suite12 != 0);
+    try testing.expect(e.group12 != 0);
+    try testing.expect(e.leaf_not_after_s < std.math.maxInt(i64));
+    try testing.expect(e.verification == .bundle);
+    try testing.expectEqual(@as(u8, 2), e.chain_count);
+    const gen = e.generation;
+    for (0..2) |_| {
+        var storage: [16 * 1024]u8 = undefined;
+        var ci: Client.ConnectionInfo = .init(&storage);
+        var h: Hook = .{ .refuse = false };
+        const again = try session(io, srv.port, &bundle, .{ .session_cache = &cache, .max_version = .tls_1_2, .connection_info = &ci, .verify_connection = .{ .context = &h, .verify = Hook.verify } });
+        try testing.expect(again.resumed);
+        try testing.expect(ci.did_resume);
+        try testing.expectEqualStrings("olleh", again.echo[0..again.echo_len]);
+        try testing.expectEqual(@as(usize, 2), ci.peerCertificates().len);
+        try testing.expectEqualSlices(u8, derFromPem(@embedFile("testdata/leaf.pem")), ci.peerCertificates()[0]);
+        try testing.expectEqual(@as(usize, 1), h.calls);
+        try testing.expectEqual(first.group, again.group);
+        try testing.expectEqual(first.group, ci.negotiated_group);
+        try testing.expectEqual(gen, e.generation);
+    }
+}
+
+test "interop: TLS 1.2 against a server without tickets: a cached session is not resumed and is left alone" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    var entries: [1]Client.ClientSession = undefined;
+    var cache: Client.SessionCache = .init(&entries, null);
+    defer cache.deinit();
+    const e = primeStale12(&cache);
+    const gen = e.generation;
+    var srv = try Server.startProto(io, tmp.dir, "-tls1_2", "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-rev", "-no_ticket" });
+    defer srv.stop(io);
+    const s = try session(io, srv.port, &bundle, .{ .session_cache = &cache, .max_version = .tls_1_2 });
+    try testing.expect(!s.resumed);
+    try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+    // Nothing was reserved, nothing replaced: the server never said it would send a ticket.
+    try testing.expectEqual(gen, e.generation);
+    try testing.expect(e.usable and e.version12);
+    try testing.expectEqualStrings("STALE", e.ticket());
+}
+
+test "interop: TLS 1.2, a ticket-issuing server that does not resume: the entry is made at the Certificate, unusable until the ticket is in; one another connection replaces meanwhile is not filled; a refusal drops it" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    var entries: [1]Client.ClientSession = undefined;
+    var cache: Client.SessionCache = .init(&entries, null);
+    defer cache.deinit();
+    var srv = try Server.startProto(io, tmp.dir, "-tls1_2", "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-rev", "-naccept", "2" });
+    defer srv.stop(io);
+    // (1) The stale ticket is declined; the hook (after the Certificate) sees the half-made entry,
+    // then replaces it as another connection would.
+    const e = primeStale12(&cache);
+    var h: ProbeHook = .{ .cache = &cache, .bump = true };
+    var storage: [16 * 1024]u8 = undefined;
+    var ci: Client.ConnectionInfo = .init(&storage);
+    const s = try session(io, srv.port, &bundle, .{ .session_cache = &cache, .max_version = .tls_1_2, .connection_info = &ci, .verify_connection = .{ .context = &h, .verify = ProbeHook.verify } });
+    try testing.expect(!s.resumed);
+    try testing.expect(h.saw_entry);
+    try testing.expect(!h.saw_usable and !h.saw_version12);
+    try testing.expectEqual(@as(u16, 0), h.saw_ticket_len);
+    // The entry was replaced during the handshake: the new ticket was not written into it.
+    try testing.expect(!e.usable and !e.version12);
+    // (2) A refusal after the Certificate throws the half-made entry away.
+    var h2: ProbeHook = .{ .cache = &cache, .refuse = true };
+    _ = cache.drop("good.example.test");
+    var ci2: Client.ConnectionInfo = .init(&storage);
+    try testing.expectError(error.TlsConnectionRejected, session(io, srv.port, &bundle, .{ .session_cache = &cache, .max_version = .tls_1_2, .connection_info = &ci2, .verify_connection = .{ .context = &h2, .verify = ProbeHook.verify } }));
+    try testing.expect(h2.saw_entry);
+    try testing.expect(cache.find("good.example.test") == null);
+}
+
+test "interop: a TLS 1.3 handshake replaces a cached TLS 1.2 session of the host; its ticket then resumes, repeatedly, with the chain kept" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    var entries: [1]Client.ClientSession = undefined;
+    var cache: Client.SessionCache = .init(&entries, null);
+    defer cache.deinit();
+    const e = primeStale12(&cache);
+    var srv = try Server.startWith(io, tmp.dir, "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-rev", "-naccept", "3" });
+    defer srv.stop(io);
+    const first = try session(io, srv.port, &bundle, .{ .session_cache = &cache });
+    try testing.expect(!first.resumed);
+    try testing.expectEqual(std.crypto.tls.ProtocolVersion.tls_1_3, first.version);
+    try testing.expect(!e.version12);
+    try testing.expectEqual(@as(u16, 0), e.suite12);
+    try testing.expect(e.usable);
+    for (0..2) |_| {
+        const again = try session(io, srv.port, &bundle, .{ .session_cache = &cache });
+        try testing.expect(again.resumed);
+    }
+}
+
 // ── S2 (2026-10-13): IP-address hosts, SAN-only names ──────────────────────
 
 test "interop: an IP host -- no SNI, matched against iPAddress SANs; a CN-only certificate is refused" {
