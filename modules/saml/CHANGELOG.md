@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE** (compile follow-up to `xmldsig`'s new `error.OutputTooLarge`): the three exhaustive `xmldsig.c14n.canonicalize` error switches map it (`SigningAssemblyFailed` when signing, `MalformedSoap` for an inbound `ArtifactResponse`); an oversized canonical form in `verify` already folded into `SignatureInvalid`.
+
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `stripLeadingZeros` helper is gone; its call sites use `std.mem.trimStart(u8, bytes, &.{0})` (same result, including the empty result for all-zero input).
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 

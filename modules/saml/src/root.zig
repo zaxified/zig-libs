@@ -2283,7 +2283,7 @@ fn signProtocolMessage(
     // structural failures above.
     const ref_canon = xmldsig.c14n.canonicalize(alloc, doc1.root, .{ .mode = .exclusive, .omit = sig1 }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.MaxDepthExceeded => return error.SigningAssemblyFailed,
+        error.MaxDepthExceeded, error.OutputTooLarge => return error.SigningAssemblyFailed,
     };
     defer alloc.free(ref_canon);
     var dgst: [Sha256.digest_length]u8 = undefined;
@@ -2304,7 +2304,7 @@ fn signProtocolMessage(
     const si2 = childEl(sig2, xmldsig.ds_ns, "SignedInfo") orelse return error.SigningAssemblyFailed;
     const si_canon = xmldsig.c14n.canonicalize(alloc, si2, .{ .mode = .exclusive }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.MaxDepthExceeded => return error.SigningAssemblyFailed,
+        error.MaxDepthExceeded, error.OutputTooLarge => return error.SigningAssemblyFailed,
     };
     defer alloc.free(si_canon);
 
@@ -3701,7 +3701,7 @@ pub fn consumeArtifactResponseSoap(alloc: std.mem.Allocator, soap_xml: []const u
     // concerned.
     const enclosed_xml = xmldsig.c14n.canonicalize(alloc, enclosed, .{ .mode = .exclusive }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.MaxDepthExceeded => return error.MalformedSoap,
+        error.MaxDepthExceeded, error.OutputTooLarge => return error.MalformedSoap,
     };
     return .{ .enclosed_message_xml = enclosed_xml };
 }

@@ -121,6 +121,13 @@ pub const Options = struct {
     ///
     /// A real SAML assertion carries one reference; eight is already generous.
     max_references: usize = 8,
+    /// Largest canonical form one reference (or `SignedInfo`) may produce, in
+    /// bytes; `error.OutputTooLarge` beyond it. Exclusive C14N re-renders a
+    /// namespace declaration on every element using the prefix, so the canonical
+    /// form of a small unauthenticated document can be thousands of times its
+    /// size (see `c14n.Options.max_output_len`). Real signed content is within a
+    /// small multiple of the document.
+    max_c14n_output_len: usize = 64 << 20,
     /// If set, `URI="#value"` references are resolved by matching this
     /// unqualified attribute's local name instead of the parser's ID heuristic
     /// (`getElementById`). SAML profiles that use a non-standard ID attribute
@@ -182,6 +189,11 @@ pub const VerifyError = error{
     /// whose own parser keeps its stack on the heap, so raising it was safe for
     /// `xml` and a SIGSEGV here (measured: depth 36 000 in ReleaseFast).
     MaxDepthExceeded,
+    /// The canonical form of a reference (or of `SignedInfo`) would exceed
+    /// `c14n.Options.max_output_len`. Exclusive C14N re-renders a namespace
+    /// declaration on every element that uses the prefix, so the canonical form
+    /// of a small document can be orders of magnitude larger than the document.
+    OutputTooLarge,
     /// A named C14N / digest / signature / transform algorithm is not on the
     /// allow-list (or SHA-1 used without `allow_weak_sha1`).
     UnsupportedAlgorithm,
@@ -423,9 +435,10 @@ pub fn verify(
     if (!saw_reference) return error.MalformedSignature;
 
     // ── Signature validation over canonicalized SignedInfo ───────────────────
-    const si_c14n = c14n.canonicalize(arena, signed_info, .{ .mode = si_mode }) catch |e| switch (e) {
+    const si_c14n = c14n.canonicalize(arena, signed_info, .{ .mode = si_mode, .max_output_len = options.max_c14n_output_len }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.MaxDepthExceeded => return error.MaxDepthExceeded,
+        error.OutputTooLarge => return error.OutputTooLarge,
     };
     const sig_bytes = try decodeBase64(arena, try textOf(arena, signature_value_el));
     const sig_ok = try verifySignature(sig_alg, options.key, si_c14n, sig_bytes);
@@ -536,9 +549,11 @@ fn validateReference(
         .mode = mode,
         .inclusive_prefixes = inclusive_prefixes,
         .omit = omit,
+        .max_output_len = options.max_c14n_output_len,
     }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.MaxDepthExceeded => return error.MaxDepthExceeded,
+        error.OutputTooLarge => return error.OutputTooLarge,
     };
     const got_digest = try computeDigest(arena, dig_alg, canon);
 
@@ -1445,6 +1460,32 @@ test "verify: the reference count is capped, and the cap is paid BEFORE the cano
         try testing.expect(!res.valid);
         try testing.expectEqual(@as(usize, 8), res.references.len);
     }
+}
+
+test "verify: a reference whose canonical form explodes is refused, not an OOM (sweep XDS-1)" {
+    // 100 KB xmlns:p URI on an element that does not use `p` + 8000 `<p:c/>`
+    // children, referenced with exclusive C14N: ~800 MB canonical form from
+    // ~160 KB of unauthenticated input, before any signature check.
+    const a = testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(a);
+    try src.appendSlice(a, "<Envelope xmlns=\"urn:demo\" xmlns:p=\"urn:");
+    try src.appendNTimes(a, 'u', 100_000);
+    try src.appendSlice(a, "\"><ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:SignedInfo>" ++
+        "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+        "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>" ++
+        "<ds:Reference URI=\"\"><ds:Transforms><ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/></ds:Transforms>" ++
+        "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/><ds:DigestValue>AAAA</ds:DigestValue></ds:Reference>" ++
+        "</ds:SignedInfo><ds:SignatureValue>AAAA</ds:SignatureValue></ds:Signature>");
+    for (0..8000) |_| try src.appendSlice(a, "<p:c/>");
+    try src.appendSlice(a, "</Envelope>");
+    var doc = try xml.parse(a, src.items, .{});
+    defer doc.deinit();
+    const sig = childByName(doc.root, "Signature").?;
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+    try testing.expectError(error.OutputTooLarge, verify(a, &doc, sig, .{ .key = .{ .rsa = pk } }));
+    // The knob is the caller's.
+    try testing.expectError(error.OutputTooLarge, verify(a, &doc, sig, .{ .key = .{ .rsa = pk }, .max_c14n_output_len = 1 << 20 }));
 }
 
 test "verify: one reference's canonical form does not outlive it" {

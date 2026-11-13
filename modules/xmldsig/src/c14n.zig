@@ -72,24 +72,70 @@ pub const Options = struct {
     ///
     /// 256 matches `xml`'s own default, and is far past any real signature.
     max_depth: usize = 256,
+    /// Largest canonical form this will produce, in bytes.
+    ///
+    /// Exclusive C14N re-renders a namespace declaration on EVERY element that
+    /// utilizes the prefix when no output ancestor rendered it, so the output is
+    /// not bounded by the input: one 100 KB `xmlns:p` URI on an element that
+    /// does not use `p`, plus 8000 `<p:c/>` children (160 KB of input), is ~800 MB
+    /// of canonical form. `max_elements` and `max_depth` bound the tree, not
+    /// what it serializes to. Checked after every element, so the overshoot is
+    /// one element's worth.
+    max_output_len: usize = 64 << 20,
 };
 
-pub const Error = std.mem.Allocator.Error || error{MaxDepthExceeded};
+pub const Error = std.mem.Allocator.Error || error{ MaxDepthExceeded, OutputTooLarge };
+
+/// Deterministic work counters (test seam, like `xml`'s `resolveNsCounted`):
+/// a regression test pins the COMPLEXITY of the namespace bookkeeping with a
+/// number instead of a stopwatch.
+pub const Stats = struct {
+    /// Entries inspected by `RenderedNs.lookup` (1 per call on the hashed path).
+    lookup_probes: usize = 0,
+    /// Calls of `considerExclusivePrefix`.
+    prefix_considered: usize = 0,
+    /// Test oracle: make every element walk the whole PrefixList, as the
+    /// implementation did before 2026-11-13 (see `gatherNsExclusive`).
+    full_list_scan: bool = false,
+};
 
 /// Canonicalize the subtree rooted at `root` and return freshly-allocated
 /// UTF-8 bytes owned by the caller (`alloc`).
 pub fn canonicalize(alloc: std.mem.Allocator, root: *const xml.Element, options: Options) Error![]u8 {
+    return canonicalizeCounted(alloc, root, options, null);
+}
+
+fn canonicalizeCounted(alloc: std.mem.Allocator, root: *const xml.Element, options: Options, stats: ?*Stats) Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
 
-    var rendered: RenderedNs = .{};
-    defer rendered.entries.deinit(alloc);
+    var rendered: RenderedNs = .{ .stats = stats };
+    defer rendered.deinit(alloc);
+
+    // The PrefixList as a set: below the apex only a prefix DECLARED on the
+    // element can be novel (see `gatherNsExclusive`), so the per-element cost is
+    // the element's own declarations, not the list length.
+    var prefix_set: std.StringHashMapUnmanaged(void) = .empty;
+    defer prefix_set.deinit(alloc);
+    var default_listed = false;
+    if (options.mode.isExclusive()) {
+        for (options.inclusive_prefixes) |p| {
+            if (p.len == 0 or std.mem.eql(u8, p, "#default")) {
+                default_listed = true;
+            } else {
+                try prefix_set.put(alloc, p, {});
+            }
+        }
+    }
 
     var w: Writer = .{
         .alloc = alloc,
         .out = &out,
         .rendered = &rendered,
         .options = options,
+        .prefix_set = &prefix_set,
+        .default_listed = default_listed,
+        .stats = stats,
     };
     try w.writeElement(root, 0, true);
     return out.toOwnedSlice(alloc);
@@ -101,23 +147,39 @@ pub fn canonicalize(alloc: std.mem.Allocator, root: *const xml.Element, options:
 // rule can ask "what value (if any) is currently rendered for this prefix?".
 
 const RenderedNs = struct {
-    const Entry = struct { prefix: []const u8, uri: []const u8, depth: usize };
+    const Entry = struct {
+        prefix: []const u8,
+        uri: []const u8,
+        depth: usize,
+        /// The entry this one shadows (same prefix, nearer the root), if any.
+        prev: ?usize,
+    };
     entries: std.ArrayList(Entry) = .empty,
+    /// prefix -> index of its topmost entry. A linear scan from the top made
+    /// every lookup O(entries on the output path) = O(depth x declarations),
+    /// and exclusive C14N does one lookup per attribute and per listed prefix.
+    top: std.StringHashMapUnmanaged(usize) = .empty,
+    stats: ?*Stats = null,
+
+    fn deinit(self: *RenderedNs, alloc: std.mem.Allocator) void {
+        self.entries.deinit(alloc);
+        self.top.deinit(alloc);
+    }
 
     /// Nearest currently-rendered URI for `prefix`, or null if none is in force.
     fn lookup(self: *const RenderedNs, prefix: []const u8) ?[]const u8 {
-        var i = self.entries.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (std.mem.eql(u8, self.entries.items[i].prefix, prefix)) {
-                return self.entries.items[i].uri;
-            }
-        }
-        return null;
+        if (self.stats) |st| st.lookup_probes += 1;
+        const i = self.top.get(prefix) orelse return null;
+        return self.entries.items[i].uri;
     }
 
     fn push(self: *RenderedNs, alloc: std.mem.Allocator, prefix: []const u8, uri: []const u8, depth: usize) !void {
-        try self.entries.append(alloc, .{ .prefix = prefix, .uri = uri, .depth = depth });
+        // Reserve first: an append that succeeds followed by a failing map put
+        // would leave an entry the map does not know about.
+        try self.top.ensureUnusedCapacity(alloc, 1);
+        const idx = self.entries.items.len;
+        try self.entries.append(alloc, .{ .prefix = prefix, .uri = uri, .depth = depth, .prev = self.top.get(prefix) });
+        self.top.putAssumeCapacity(prefix, idx);
     }
 
     /// Drop every entry pushed at `depth` or deeper (called when leaving a node).
@@ -125,7 +187,12 @@ const RenderedNs = struct {
         while (self.entries.items.len > 0 and
             self.entries.items[self.entries.items.len - 1].depth >= depth)
         {
-            _ = self.entries.pop();
+            const e = self.entries.pop().?; // loop condition: non-empty
+            if (e.prev) |pi| {
+                self.top.putAssumeCapacity(e.prefix, pi); // key present: it was this entry's
+            } else {
+                _ = self.top.remove(e.prefix);
+            }
         }
     }
 };
@@ -140,6 +207,9 @@ const Writer = struct {
     out: *std.ArrayList(u8),
     rendered: *RenderedNs,
     options: Options,
+    prefix_set: *const std.StringHashMapUnmanaged(void),
+    default_listed: bool,
+    stats: ?*Stats = null,
 
     fn raw(self: *Writer, s: []const u8) Error!void {
         try self.out.appendSlice(self.alloc, s);
@@ -160,11 +230,16 @@ const Writer = struct {
         var ns_out: std.ArrayList(NsOut) = .empty;
         defer ns_out.deinit(self.alloc);
         if (self.options.mode.isExclusive()) {
-            try self.gatherNsExclusive(el, depth, &ns_out);
+            try self.gatherNsExclusive(el, is_apex, &ns_out);
         } else {
             try self.gatherNsInclusive(el, depth, is_apex, &ns_out);
         }
-        sortNs(ns_out.items);
+        // Sorted, then de-duplicated: the same prefix can be queued twice at one
+        // element (several attributes using it), always with the same URI. A
+        // membership test per queueing was O(queued) each, O(attributes^2) per
+        // element.
+        const n_ns = sortNs(ns_out.items);
+        ns_out.shrinkRetainingCapacity(n_ns);
 
         // 2. Collect the attributes to emit (with inherited xml:* on the apex
         //    for inclusive canonicalization).
@@ -201,6 +276,7 @@ const Writer = struct {
             try self.raw("\"");
         }
         try self.raw(">");
+        if (self.out.items.len > self.options.max_output_len) return error.OutputTooLarge;
 
         // 4. Children in document order.
         for (el.children) |c| switch (c.content) {
@@ -210,8 +286,14 @@ const Writer = struct {
                 }
                 try self.writeElement(child, depth + 1, false);
             },
-            .text => |t| try self.writeEscapedText(t),
-            .cdata => |t| try self.writeCData(t),
+            .text => |t| {
+                try self.writeEscapedText(t);
+                if (self.out.items.len > self.options.max_output_len) return error.OutputTooLarge;
+            },
+            .cdata => |t| {
+                try self.writeCData(t);
+                if (self.out.items.len > self.options.max_output_len) return error.OutputTooLarge;
+            },
             .comment => |cm| if (self.options.mode.withComments()) {
                 try self.raw("<!--");
                 try self.raw(cm);
@@ -232,14 +314,14 @@ const Writer = struct {
         try self.raw("</");
         try self.writeQName(el.prefix, el.local);
         try self.raw(">");
+        if (self.out.items.len > self.options.max_output_len) return error.OutputTooLarge;
 
         // 6. Leave scope: discard the namespaces we rendered here.
         self.rendered.popDepth(depth);
     }
 
     // ── exclusive namespace rendering ───────────────────────────────────────
-    fn gatherNsExclusive(self: *Writer, el: *const xml.Element, depth: usize, ns_out: *std.ArrayList(NsOut)) Error!void {
-        _ = depth;
+    fn gatherNsExclusive(self: *Writer, el: *const xml.Element, is_apex: bool, ns_out: *std.ArrayList(NsOut)) Error!void {
         // Default namespace: visibly utilized iff the element itself has no
         // prefix. Attributes never utilize the default namespace.
         var default_handled = false;
@@ -259,22 +341,43 @@ const Writer = struct {
         // InclusiveNamespaces PrefixList: listed prefixes are handled
         // inclusively — rendered whenever in scope and novel, even if not
         // visibly utilized here.
-        for (self.options.inclusive_prefixes) |p| {
-            if (p.len == 0 or std.mem.eql(u8, p, "#default")) {
-                if (!default_handled) {
-                    try self.considerExclusiveDefault(el, ns_out);
-                    default_handled = true;
+        //
+        // Only the apex has to look at the whole list. Below it the parent (an
+        // output element) already considered every listed prefix, so a listed
+        // prefix this element does not DECLARE resolves exactly as it did there
+        // and is already rendered with that value (or is unbound): it cannot be
+        // novel. Walking the whole list per element made the cost
+        // O(elements x list length), and the list is attacker-supplied.
+        const scan_all = is_apex or (if (self.stats) |st| st.full_list_scan else false);
+        if (scan_all) {
+            for (self.options.inclusive_prefixes) |p| {
+                if (p.len == 0 or std.mem.eql(u8, p, "#default")) {
+                    if (!default_handled) {
+                        try self.considerExclusiveDefault(el, ns_out);
+                        default_handled = true;
+                    }
+                } else {
+                    try self.considerExclusivePrefix(el, p, ns_out);
                 }
-            } else {
-                try self.considerExclusivePrefix(el, p, ns_out);
+            }
+        } else {
+            for (el.ns_decls) |d| {
+                if (d.prefix.len == 0) {
+                    if (self.default_listed and !default_handled) {
+                        try self.considerExclusiveDefault(el, ns_out);
+                        default_handled = true;
+                    }
+                } else if (self.prefix_set.contains(d.prefix)) {
+                    try self.considerExclusivePrefix(el, d.prefix, ns_out);
+                }
             }
         }
     }
 
     fn considerExclusivePrefix(self: *Writer, el: *const xml.Element, prefix: []const u8, ns_out: *std.ArrayList(NsOut)) Error!void {
+        if (self.stats) |st| st.prefix_considered += 1;
         if (prefix.len == 0) return; // default handled separately
         if (std.mem.eql(u8, prefix, "xml")) return; // reserved, never declared
-        if (containsNs(ns_out.items, prefix)) return; // already queued here
         const uri = el.resolveNs(prefix) orelse return;
         if (self.rendered.lookup(prefix)) |prev| {
             if (std.mem.eql(u8, prev, uri)) return; // already rendered, same value
@@ -283,7 +386,6 @@ const Writer = struct {
     }
 
     fn considerExclusiveDefault(self: *Writer, el: *const xml.Element, ns_out: *std.ArrayList(NsOut)) Error!void {
-        if (containsNs(ns_out.items, "")) return;
         const uri = el.resolveNs("") orelse "";
         const prev = self.rendered.lookup("");
         if (uri.len == 0) {
@@ -409,19 +511,22 @@ const Writer = struct {
     }
 };
 
-fn containsNs(items: []const NsOut, prefix: []const u8) bool {
-    for (items) |n| if (std.mem.eql(u8, n.prefix, prefix)) return true;
-    return false;
-}
-
 /// Namespaces sort by prefix; the default declaration (empty prefix) sorts
-/// first, then prefixes in ascending byte order.
-fn sortNs(items: []NsOut) void {
+/// first, then prefixes in ascending byte order. Returns the length after
+/// dropping repeats of one prefix (always the same URI at one element).
+fn sortNs(items: []NsOut) usize {
     std.mem.sort(NsOut, items, {}, struct {
         fn lt(_: void, a: NsOut, b: NsOut) bool {
             return std.mem.lessThan(u8, a.prefix, b.prefix);
         }
     }.lt);
+    var n: usize = 0;
+    for (items) |it| {
+        if (n > 0 and std.mem.eql(u8, items[n - 1].prefix, it.prefix)) continue;
+        items[n] = it;
+        n += 1;
+    }
+    return n;
 }
 
 /// Attributes sort by namespace URI, then by local name. Unprefixed (no
@@ -686,4 +791,190 @@ test "inclusive apex inherits xml:lang from ancestor outside subtree" {
     const src = "<r xml:lang=\"en\"><child>t</child></r>";
     // Canonicalizing <child> alone (inclusive) copies the ancestor xml:lang.
     try expectC14n(src, "child", .{ .mode = .inclusive }, "<child xml:lang=\"en\">t</child>");
+}
+
+// ── sweep 2026-11-13 (XDS) ──────────────────────────────────────────────────
+
+fn parseOk(src: []const u8) !xml.Document {
+    return xml.parse(testing.allocator, src, .{ .max_elements = 1 << 20 });
+}
+
+test "canonicalize: exclusive re-rendering of a big namespace URI is capped, not an OOM (sweep XDS-1)" {
+    // One 100 KB xmlns:p URI on a root that does not use `p`, 8000 `<p:c/>`
+    // children (~160 KB of input). Each child re-renders the declaration:
+    // ~800 MB of canonical form without the cap.
+    const a = testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(a);
+    try src.appendSlice(a, "<r xmlns:p=\"urn:");
+    try src.appendNTimes(a, 'u', 100_000);
+    try src.appendSlice(a, "\">");
+    for (0..8000) |_| try src.appendSlice(a, "<p:c/>");
+    try src.appendSlice(a, "</r>");
+    var doc = try parseOk(src.items);
+    defer doc.deinit();
+
+    try testing.expectError(error.OutputTooLarge, canonicalize(a, doc.root, .{ .mode = .exclusive }));
+    // The limit is the caller's: a small one trips early, a big one lets a
+    // legitimate document through.
+    try testing.expectError(error.OutputTooLarge, canonicalize(a, doc.root, .{ .mode = .exclusive, .max_output_len = 1 << 20 }));
+    var small = try parseOk("<r xmlns:p=\"urn:x\"><p:c/><p:c/></r>");
+    defer small.deinit();
+    const ok = try canonicalize(a, small.root, .{ .mode = .exclusive, .max_output_len = 80 });
+    defer a.free(ok);
+    try testing.expectEqualStrings("<r><p:c xmlns:p=\"urn:x\"></p:c><p:c xmlns:p=\"urn:x\"></p:c></r>", ok);
+    try testing.expectError(error.OutputTooLarge, canonicalize(a, small.root, .{ .mode = .exclusive, .max_output_len = ok.len - 1 }));
+}
+
+test "canonicalize: a long text run is counted against max_output_len (sweep XDS-1)" {
+    const a = testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(a);
+    try src.appendSlice(a, "<r>");
+    try src.appendNTimes(a, '\r', 1000); // CR -> &#xD;, 5x
+    try src.appendSlice(a, "</r>");
+    var doc = try parseOk(src.items);
+    defer doc.deinit();
+    const out = try canonicalize(a, doc.root, .{ .mode = .exclusive });
+    defer a.free(out);
+    try testing.expect(out.len > 1000);
+    try testing.expectError(error.OutputTooLarge, canonicalize(a, doc.root, .{ .mode = .exclusive, .max_output_len = out.len - 1 }));
+}
+
+test "canonicalize: rendered-namespace lookups are O(1), not a scan of the output path (sweep XDS-2)" {
+    // 40 nested ancestors, each rendering 25 junk prefixes (visibly utilized by
+    // an attribute): ~1000 entries on the output path. The leaf then carries
+    // 400 attributes in a prefix the root already rendered, one lookup each.
+    // A scan from the top walks the junk for every one of them.
+    const a = testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(a);
+    try src.appendSlice(a, "<p:r xmlns:p=\"urn:p\">");
+    for (0..40) |i| {
+        try src.print(a, "<a", .{});
+        for (0..25) |j| try src.print(a, " xmlns:q{d}_{d}=\"urn:{d}_{d}\" q{d}_{d}:x=\"1\"", .{ i, j, i, j, i, j });
+        try src.appendSlice(a, ">");
+    }
+    try src.appendSlice(a, "<leaf");
+    for (0..400) |k| try src.print(a, " p:a{d}=\"1\"", .{k});
+    try src.appendSlice(a, "/>");
+    for (0..40) |_| try src.appendSlice(a, "</a>");
+    try src.appendSlice(a, "</p:r>");
+    var doc = try parseOk(src.items);
+    defer doc.deinit();
+
+    var st: Stats = .{};
+    const out = try canonicalizeCounted(a, doc.root, .{ .mode = .exclusive }, &st);
+    defer a.free(out);
+    // One lookup per considered prefix; a scan would be ~400 x 1000 = 400 000.
+    try testing.expect(st.lookup_probes < 4 * (400 + 40 * 26 * 2 + 10));
+}
+
+test "canonicalize: the PrefixList costs per apex and per declaration, not per element (sweep XDS-3)" {
+    const a = testing.allocator;
+    const p_n = 2000;
+    const e_n = 2000;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(a);
+    try src.appendSlice(a, "<r>");
+    for (0..e_n) |_| try src.appendSlice(a, "<c/>");
+    try src.appendSlice(a, "</r>");
+    var doc = try parseOk(src.items);
+    defer doc.deinit();
+    var toks: std.ArrayList([]const u8) = .empty;
+    defer toks.deinit(a);
+    var names: std.ArrayList(u8) = .empty;
+    defer names.deinit(a);
+    for (0..p_n) |i| try names.print(a, "p{d} ", .{i});
+    var it = std.mem.tokenizeScalar(u8, names.items, ' ');
+    while (it.next()) |t| try toks.append(a, t);
+
+    var st: Stats = .{};
+    const out = try canonicalizeCounted(a, doc.root, .{ .mode = .exclusive, .inclusive_prefixes = toks.items }, &st);
+    defer a.free(out);
+    try testing.expect(st.prefix_considered <= p_n + 4 * e_n); // was p_n x e_n = 4 000 000
+}
+
+test "canonicalize: PrefixList below the apex only reacts to declarations on the element (sweep XDS-3)" {
+    const src = "<p:r xmlns:p=\"urn:p\" xmlns:a=\"1\"><p:x xmlns:a=\"2\"><p:y xmlns:a=\"2\"/></p:x></p:r>";
+    try expectC14n(src, "r", .{ .mode = .exclusive, .inclusive_prefixes = &.{"a"} }, "<p:r xmlns:a=\"1\" xmlns:p=\"urn:p\"><p:x xmlns:a=\"2\"><p:y></p:y></p:x></p:r>");
+}
+
+test "canonicalize: several attributes in one prefix declare it once (sweep XDS-2)" {
+    try expectC14n("<e xmlns:p=\"urn:p\" p:a=\"1\" p:b=\"2\" p:c=\"3\"/>", "e", .{ .mode = .exclusive }, "<e xmlns:p=\"urn:p\" p:a=\"1\" p:b=\"2\" p:c=\"3\"></e>");
+}
+
+test "canonicalize: whole-list scan and per-declaration PrefixList agree on random documents (sweep XDS-3)" {
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xC14_0001);
+    const rnd = prng.random();
+    const pf = [_][]const u8{ "a", "b", "c", "d" };
+    var checked: usize = 0;
+    for (0..600) |_| {
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(a);
+        try src.appendSlice(a, "<a:r xmlns:a=\"u0\" xmlns:b=\"u1\" xmlns:c=\"u2\" xmlns:d=\"u3\" xmlns=\"ud\">");
+        // A random tree, depth-first, as an explicit open stack.
+        var open: usize = 0;
+        var n: usize = 0;
+        while (n < 30) : (n += 1) {
+            const act = rnd.uintLessThan(u8, 4);
+            if (act == 0 and open > 0) {
+                try src.appendSlice(a, "</e>");
+                open -= 1;
+                continue;
+            }
+            try src.appendSlice(a, "<e");
+            var used: [5]bool = @splat(false);
+            // Declarations: a few of a-d and the default, values from a small pool.
+            for (0..rnd.uintLessThan(usize, 4)) |_| {
+                const k = rnd.uintLessThan(usize, 5);
+                if (used[k]) continue;
+                used[k] = true;
+                if (k == 4) {
+                    const v = rnd.uintLessThan(u8, 3);
+                    if (v == 0) try src.appendSlice(a, " xmlns=\"\"") else try src.print(a, " xmlns=\"ud{d}\"", .{v});
+                } else try src.print(a, " xmlns:{s}=\"u{d}\"", .{ pf[k], rnd.uintLessThan(u8, 3) });
+            }
+            for (0..rnd.uintLessThan(usize, 3)) |i| {
+                try src.print(a, " {s}:t{d}=\"v\"", .{ pf[rnd.uintLessThan(usize, 4)], i });
+            }
+            if (rnd.boolean()) {
+                try src.appendSlice(a, "/>");
+            } else {
+                try src.appendSlice(a, ">");
+                open += 1;
+            }
+        }
+        while (open > 0) : (open -= 1) try src.appendSlice(a, "</e>");
+        try src.appendSlice(a, "</a:r>");
+
+        var doc = xml.parse(a, src.items, .{}) catch continue;
+        defer doc.deinit();
+        var list: std.ArrayList([]const u8) = .empty;
+        defer list.deinit(a);
+        for ([_][]const u8{ "a", "b", "c", "d", "#default", "zz" }) |t| {
+            if (rnd.boolean()) try list.append(a, t);
+        }
+        // The apex: the root, or a random first-level element.
+        var apex: *const xml.Element = doc.root;
+        if (rnd.boolean()) {
+            for (doc.root.children) |c| switch (c.content) {
+                .element => |e| {
+                    apex = e;
+                    break;
+                },
+                else => {},
+            };
+        }
+        var fast: Stats = .{};
+        var slow: Stats = .{ .full_list_scan = true };
+        const o1 = try canonicalizeCounted(a, apex, .{ .mode = .exclusive, .inclusive_prefixes = list.items }, &fast);
+        defer a.free(o1);
+        const o2 = try canonicalizeCounted(a, apex, .{ .mode = .exclusive, .inclusive_prefixes = list.items }, &slow);
+        defer a.free(o2);
+        try testing.expectEqualStrings(o2, o1);
+        checked += 1;
+    }
+    try testing.expect(checked > 300);
 }

@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **Public error-set addition** (`error.OutputTooLarge` in `c14n.Error` and `VerifyError`; new fields `c14n.Options.max_output_len` and `Options.max_c14n_output_len`, both default 64 MiB) and two quadratic-cost fixes, from the 2026-11-13 no-panic sweep (XDS-1..3). Importers of `xmldsig` in `modules/*/src`: only `saml`, whose three exhaustive `c14n.canonicalize` switches (`signProtocolMessage` x2, `consumeArtifactResponseSoap`) now map the new member (to `SigningAssemblyFailed` / `MalformedSoap`); its `verifyUnderTrustedKeys` already folds every other `verify` error into `SignatureInvalid`.
+  - **XDS-1 (HIGH):** exclusive C14N re-renders `xmlns:p="..."` on every element that uses `p` when no output ancestor rendered it, so the canonical form was not bounded by the input: a 100 KB URI plus 8000 `<p:c/>` children (~160 KB) canonicalized to ~800 MB (OOM-killed at a 6 GB cap), pre-authentication through `verify`. Output is now capped.
+  - **XDS-2:** the rendered-namespace stack was scanned linearly on every lookup (one per attribute / listed prefix), O(depth x declarations) each; now a prefix map, O(1). Repeated prefixes on one element are de-duplicated after sorting instead of by a linear membership test.
+  - **XDS-3:** the `InclusiveNamespaces` PrefixList (attacker-supplied) was walked in full at every element, O(elements x list length); below the apex only prefixes declared on the element can be novel, so only those are considered. Output is byte-identical (differential test against the whole-list walk on 600 random documents).
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
