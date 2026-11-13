@@ -48,16 +48,21 @@
 //! limbs of 28 bits for a 32-bit-word target) would not change this
 //! module's public API.
 //!
-//! Every stored `Fe` is a CANONICAL representative (`0 <= value < p`) —
-//! the same storage convention `bls12_381/src/fp.zig` documents for its
-//! own field (see that module's "MONTGOMERY-STORAGE CONVENTION" note):
-//! `fromBytes` rejects non-canonical input outright, and every arithmetic
-//! op below must return a fully-reduced (not just "less than 2^456") limb
-//! set — carrying unreduced headroom ACROSS a public API boundary (e.g. in
-//! `toBytes`, or in `isOdd`'s parity read) would silently break both.
-//! This is a contract the arithmetic below upholds (every op finishes
-//! with `reduceAfterFold`'s full renormalization + canonical subtract),
-//! not an optional optimization.
+//! ## Weak reduction (since 2026-11-13)
+//!
+//! An `Fe` is WEAKLY reduced: every limb `< 2^57`, value any representative
+//! of its residue class below `2^457`. `add`/`sub`/`mulSmall` end with one
+//! parallel carry step (`carryWeak`) and `mul`/`square` with one carry pass
+//! after the Goldilocks fold (`reduceColumns`); none of them subtracts `p`.
+//! The CANONICAL representative (`0 <= value < p`) is produced only where a
+//! value leaves the arithmetic or is compared — `toBytes`, `isOdd` (through
+//! `toBytes`), `isZero`, `eql`, all via `canonical` — so those, and the
+//! byte codec, behave exactly as before. `fromBytes` and the constants are
+//! canonical, which is also weak. `ctSelect`/`ctSwap` are limb-wise and need
+//! no canonical form. Until 2026-11-13 every operation returned the
+//! canonical form (three carry rounds and a conditional subtraction after
+//! each `add`, `sub` and `mul`): 43 % of an Ed448/X448 profile was that
+//! reduction. Code outside this file never reads `limbs`.
 //!
 //! Source: RFC 7748 §4.2 (the prime, in the "curve448" parameter table)
 //! and RFC 8032 §5.2.1 ("Modular Arithmetic" — inversion via `a^(p-2)`,
@@ -169,15 +174,14 @@ pub const Fe = struct {
         return .{ .limbs = limbs };
     }
 
-    /// Serializes to little-endian 56 bytes. REAL, PROVIDED `fe` is
-    /// already canonical (`< p` per-limb-and-in-aggregate) — the storage
-    /// convention every arithmetic op must uphold (module doc comment).
-    /// Pure inverse of `fromBytes`'s limb packing: no reduction performed
-    /// here.
+    /// Serializes the canonical representative (`canonical`, see "Weak
+    /// reduction" in the module doc comment) to little-endian 56 bytes:
+    /// the inverse of `fromBytes`'s limb packing.
     pub fn toBytes(fe: Fe) [encoded_bytes]u8 {
+        const c = fe.canonical();
         var out: [encoded_bytes]u8 = undefined;
         inline for (0..num_limbs) |i| {
-            const limb = fe.limbs[i];
+            const limb = c.limbs[i];
             inline for (0..7) |j| {
                 out[i * 7 + j] = @intCast((limb >> (8 * j)) & 0xff);
             }
@@ -214,40 +218,18 @@ pub const Fe = struct {
         if (is_less == 0) return error.NonCanonical; // bytes >= p
     }
 
-    /// `true` iff `fe == 0`. Constant-time: ORs every limb of the
-    /// CANONICAL representative (storage convention, module doc comment —
-    /// every `Fe` reaching a public API boundary is fully reduced, so the
-    /// zero element has exactly one limb pattern) into one accumulator,
-    /// then does a single data-independent comparison. No early exit, no
-    /// branch on individual limb values.
-    pub fn isZero(fe: Fe) bool {
-        var acc: u64 = 0;
-        for (fe.limbs) |l| acc |= l;
-        return acc == 0;
-    }
-
-    /// Constant-time equality of two CANONICAL representatives: XOR every
-    /// limb pair into one accumulator (canonical storage makes limb-wise
-    /// equality equivalent to field equality), single final comparison —
-    /// no early exit, no branch on secret limb values.
-    pub fn eql(a: Fe, b: Fe) bool {
-        var acc: u64 = 0;
-        for (a.limbs, b.limbs) |x, y| acc |= x ^ y;
-        return acc == 0;
-    }
-
-    /// Shared reduction tail for `add`/`sub`/`mul`: takes 8 unreduced
-    /// limb accumulators, each `< 2^58` (the widest any caller produces —
-    /// `mul`'s post-fold limbs are sums of at most 4 terms `< 2^56`),
-    /// and returns the fully-reduced canonical `Fe`. Constant-time: fixed
-    /// three carry-propagate+fold rounds followed by one branch-free
-    /// conditional subtraction of `p`.
+    /// The canonical representative (`0 <= value < p`, every limb
+    /// `< 2^56`) of a weakly reduced `fe` (see "Weak reduction" in the
+    /// module doc comment). Constant-time: a FIXED three carry-propagate +
+    /// fold rounds, then one branch-free conditional subtraction of `p`.
     ///
-    /// Bounds argument (why exactly three rounds always suffice):
-    /// - Round 1 input limbs `< 2^58`, so the running carry never exceeds
-    ///   3 and the final carry-out `c1 <= 3`. Folding (`2^448 ≡ 2^224 + 1
-    ///   (mod p)`: add `c1` to limbs 0 and 4) leaves limbs `<= 2^56 + 2`
-    ///   and total value `< 2^448 + 4*(2^224 + 1) < 2^449`.
+    /// Bounds argument (why exactly three rounds always suffice; written
+    /// for input limbs `< 2^58`, and every weakly reduced `Fe` has them
+    /// `< 2^57`):
+    /// - Round 1: the running carry never exceeds 3 and the final carry-out
+    ///   `c1 <= 3`. Folding (`2^448 ≡ 2^224 + 1 (mod p)`: add `c1` to limbs
+    ///   0 and 4) leaves limbs `<= 2^56 + 2` and total value
+    ///   `< 2^448 + 4*(2^224 + 1) < 2^449`.
     /// - Round 2 therefore carries out `c2 <= 1`; if `c2 == 1` the
     ///   remaining value is `< 4*2^224 + 4` (limbs 5..7 zero, limb 4
     ///   tiny), so folding `c2` cannot push any limb past `2^56 - 1`.
@@ -255,10 +237,10 @@ pub const Fe = struct {
     ///   renormalize the (at most) two limbs round 2's fold touched.
     /// After round 3 every limb is `< 2^56` and the value is `< 2^448 <
     /// 2p`, so ONE conditional subtract of `p` canonicalizes.
-    fn reduceAfterFold(r_in: [num_limbs]u128) Fe {
-        var r = r_in;
+    pub fn canonical(fe: Fe) Fe {
+        var r = fe.limbs;
         inline for (0..3) |_| {
-            var carry: u128 = 0;
+            var carry: u64 = 0;
             inline for (0..num_limbs) |i| {
                 const cur = r[i] + carry;
                 r[i] = cur & limb_mask;
@@ -268,9 +250,26 @@ pub const Fe = struct {
             r[0] += carry;
             r[4] += carry;
         }
-        var limbs: [num_limbs]u64 = undefined;
-        inline for (0..num_limbs) |i| limbs[i] = @intCast(r[i]);
-        return condSubP(limbs);
+        return condSubP(r);
+    }
+
+    /// `true` iff `fe == 0` (mod p). Constant-time: ORs every limb of the
+    /// CANONICAL representative into one accumulator, then does a single
+    /// data-independent comparison. No early exit, no branch on individual
+    /// limb values.
+    pub fn isZero(fe: Fe) bool {
+        var acc: u64 = 0;
+        for (fe.canonical().limbs) |l| acc |= l;
+        return acc == 0;
+    }
+
+    /// Constant-time field equality: XOR every limb pair of the two
+    /// CANONICAL representatives into one accumulator, single final
+    /// comparison — no early exit, no branch on secret limb values.
+    pub fn eql(a: Fe, b: Fe) bool {
+        var acc: u64 = 0;
+        for (a.canonical().limbs, b.canonical().limbs) |x, y| acc |= x ^ y;
+        return acc == 0;
     }
 
     /// Branch-free `if (v >= p) v -= p` over canonical-width limbs (each
@@ -296,130 +295,117 @@ pub const Fe = struct {
         return .{ .limbs = out };
     }
 
-    /// `a + b (mod p)`. Construction: schoolbook 8-limb addition followed
-    /// by a Solinas-style reduction exploiting `2^448 ≡ 2^224 + 1 (mod
-    /// p)` — i.e. any bit set above position 447 folds back in as a
-    /// shifted-by-224 addition plus a unit addition, NOT a generic
-    /// division. See the module doc comment's "Limb representation"
-    /// section for why 56-bit limbs make this fold land on a limb
-    /// boundary (no partial-limb shifting needed at the fold point).
-    /// Must be constant-time (no branch on limb values) and MUST leave
-    /// `limbs` fully renormalized (`< 2^56` each, `< p` in aggregate) per
-    /// the storage convention — a lazily-reduced intermediate result
-    /// (allowed mid-computation, using the limbs' 8 spare high bits) must
-    /// be fully carried/folded before this function returns.
+    /// One PARALLEL carry step back to the weak bound: every limb keeps its
+    /// low 56 bits plus the carry out of the limb below it, and the carry
+    /// out of limb 7 folds into limbs 0 and 4 (`2^448 ≡ 2^224 + 1`). For
+    /// input limbs `< 2^(56+k)` the output limbs are `< 2^56 + 2^(k+1)`
+    /// (limb 4 takes two carries) — weakly reduced for any `k <= 55`. No
+    /// carry chain: the eight limbs are independent.
+    inline fn carryWeak(r: [num_limbs]u64) Fe {
+        var out: [num_limbs]u64 = undefined;
+        const top = r[num_limbs - 1] >> limb_bits;
+        out[0] = (r[0] & limb_mask) + top;
+        inline for (1..num_limbs) |i| out[i] = (r[i] & limb_mask) + (r[i - 1] >> limb_bits);
+        out[4] += top;
+        return .{ .limbs = out };
+    }
+
+    /// `a + b (mod p)`, weakly reduced: a limb-wise sum (limbs `< 2^58`)
+    /// and one `carryWeak` step (limbs `< 2^56 + 8`). Constant-time.
     pub fn add(a: Fe, b: Fe) Fe {
-        var r: [num_limbs]u128 = undefined;
-        inline for (0..num_limbs) |i| r[i] = @as(u128, a.limbs[i]) + b.limbs[i]; // < 2^57
-        return reduceAfterFold(r);
+        var r: [num_limbs]u64 = undefined;
+        inline for (0..num_limbs) |i| r[i] = a.limbs[i] + b.limbs[i];
+        return carryWeak(r);
     }
 
-    /// `a - b (mod p)`. Construction: add a fixed multiple of `p` to `a`
-    /// first (to guarantee no borrow below zero across the whole
-    /// subtraction — the standard "add 2p or a comptime-chosen multiple
-    /// of p before subtracting" trick used by essentially every
-    /// constant-time modular-subtraction implementation, including
-    /// `std.crypto.ecc.Edwards25519.Fe.sub`'s own 25519 analogue), then
-    /// subtract `b` limb-wise with borrow propagation, then fold per
-    /// `add`'s reduction. Constant-time; fully renormalized on return.
+    /// `4p` limb-wise: every limb `4 * (2^56 - 1)`, limb 4 `4 * (2^56 - 2)`
+    /// — each at least `2^58 - 8`, above any weakly reduced limb.
+    const four_p: [num_limbs]u64 = blk: {
+        var l: [num_limbs]u64 = undefined;
+        for (0..num_limbs) |i| l[i] = 4 * p_limbs[i];
+        break :blk l;
+    };
+
+    /// `a - b (mod p)`, weakly reduced: per limb `a[i] + 4p[i] - b[i]`,
+    /// which is never negative (`4p[i] >= 2^58 - 8 > 2^57 > b[i]`) and
+    /// `< 2^59`, so no borrow chain; the value `a + 4p - b ≡ a - b`. Then
+    /// one `carryWeak` step (limbs `< 2^56 + 16`). Constant-time.
     pub fn sub(a: Fe, b: Fe) Fe {
-        // Per-limb `a[i] + 2*p[i] - b[i]` is always non-negative
-        // (2*p_limbs[i] >= 2^57 - 4 > 2^56 - 1 >= b.limbs[i]) so no
-        // borrow chain is needed at all; the aggregate value is
-        // `a + 2p - b ≡ a - b (mod p)` with every limb < 2^58, exactly
-        // reduceAfterFold's input contract.
-        var r: [num_limbs]u128 = undefined;
-        inline for (0..num_limbs) |i| {
-            r[i] = @as(u128, a.limbs[i]) + 2 * @as(u128, p_limbs[i]) - b.limbs[i];
-        }
-        return reduceAfterFold(r);
+        var r: [num_limbs]u64 = undefined;
+        inline for (0..num_limbs) |i| r[i] = a.limbs[i] + four_p[i] - b.limbs[i];
+        return carryWeak(r);
     }
 
-    /// `-a (mod p)`, i.e. `p - a` (or `0` if `a == 0`). Construction:
-    /// `sub(Fe.zero, a)` — no separate primitive needed, mirroring
-    /// `bls12_381.Fp.neg`'s identical delegation.
+    /// `-a (mod p)`, i.e. `sub(Fe.zero, a)`.
     pub fn neg(a: Fe) Fe {
         return sub(Fe.zero, a);
     }
 
-    /// `a * b (mod p)`. Construction: full 8×8-limb schoolbook
-    /// multiplication into a 16-limb (896-bit) double-width accumulator,
-    /// THEN a Solinas/Goldilocks reduction exploiting `2^448 ≡ 2^224 + 1
-    /// (mod p)` to fold the high 8 limbs back into the low 8 — the
-    /// standard technique for this exact prime shape (see e.g. Mike
-    /// Hamburg's original Goldilocks paper / `libdecaf`'s 64-bit `p448`
-    /// backend, both cited as design references in `NOTICE`; NOT ported
-    /// source — this module's own limb layout/API is independent).
-    /// Constant-time; fully renormalized (`< 2^56` per limb) on return.
-    /// This — along with `square` — is the PERFORMANCE-CRITICAL inner
-    /// loop the whole 56-bit/Solinas-reduction design choice (module doc
-    /// comment) exists to make fast; a correct-but-slow fallback via
-    /// `std.crypto.ff.Modulus(448)` is a legitimate STOPGAP if a
-    /// crypto-core pass wants field arithmetic working before optimizing,
-    /// but that is a deliberate trade against this module's stated
-    /// design rationale, not the intended end state.
+    /// `a * b (mod p)`, weakly reduced. Construction: full 8×8-limb
+    /// schoolbook multiplication into 15 `u128` column accumulators, then
+    /// `reduceColumns` (the Goldilocks fold `2^448 ≡ 2^224 + 1` applied to
+    /// the columns, one carry pass). Design references: Mike Hamburg's
+    /// Goldilocks paper / `libdecaf`'s 64-bit `p448` backend, cited in
+    /// `NOTICE`; NOT ported source. Constant-time.
+    ///
+    /// Bound: weakly reduced inputs have limbs `< 2^57`, so each product is
+    /// `< 2^114` and a column of at most 8 products `< 2^117`.
     pub fn mul(a: Fe, b: Fe) Fe {
-        // 8×8 schoolbook into 15 u128 column accumulators (column i+j
-        // sums at most 8 products of 56-bit limbs: < 8 * 2^112 < 2^115).
         var cols = @as([15]u128, @splat(0));
         inline for (0..num_limbs) |i| {
             inline for (0..num_limbs) |j| {
                 cols[i + j] += @as(u128, a.limbs[i]) * b.limbs[j];
             }
         }
-        return reduceProduct(cols);
+        return reduceColumns(cols);
     }
 
-    /// Shared carry-propagate + Goldilocks fold tail for `mul`/`square`:
-    /// takes the 15 double-width column accumulators of an 8×8 (or
-    /// symmetric-8×8) product (each `< 2^116`, the widest either caller
-    /// produces) and returns the fully-reduced canonical `Fe`.
+    /// Shared tail of `mul`/`square`: 15 double-width columns (each
+    /// `< 2^118`) to a weakly reduced `Fe`.
     ///
-    /// Carry-propagate the columns into 16 clean 56-bit limbs. The full
-    /// product is `< 2^896 = 2^(16*56)`, so the carry out of column 14 is
-    /// the entire limb 15 (`< 2^56`) and nothing spills past it. Then the
-    /// Goldilocks fold: writing the 896-bit product as four 224-bit
-    /// (4-limb) chunks `A + B*2^224 + C*2^448 + D*2^672` and using
-    /// `2^448 ≡ 2^224 + 1`, `2^672 ≡ 2*2^224 + 1 (mod p)`:
-    ///   `product ≡ (A + C + D) + (B + C + 2D) * 2^224`
-    /// — every term lands exactly on a limb boundary (the whole point of
-    /// the 56-bit layout; no cross-limb shifting), leaving 8 accumulators
-    /// each `< 4 * 2^56 = 2^58`, `reduceAfterFold`'s input contract.
-    fn reduceProduct(cols: [15]u128) Fe {
-        var t: [16]u64 = undefined;
+    /// 1. Fold the high columns, highest first: column `k >= 8` stands for
+    ///    `2^(56k) = 2^448 * 2^(56(k-8)) ≡ 2^(56(k-4)) + 2^(56(k-8))`, so it
+    ///    is added to columns `k-4` and `k-8`; columns 12..14 land on 8..10,
+    ///    which are folded in turn. No limb shifting: every term lands on a
+    ///    limb boundary (the point of the 56-bit layout). Each of columns
+    ///    0..7 ends as a sum of at most four inputs: `< 2^120`.
+    /// 2. ONE sequential carry pass over the 8 columns. Its carry-out is
+    ///    `< 2^65`; folded into limbs 0 and 4, and the (`< 2^10`) carries
+    ///    out of those two into limbs 1 and 5. Every limb ends `< 2^57`.
+    ///
+    /// Until 2026-11-13 every product was carried through all 15 columns
+    /// and then FULLY reduced (three carry rounds and a conditional
+    /// subtraction of `p`): 43 % of an Ed448/X448 profile.
+    inline fn reduceColumns(cols_in: [15]u128) Fe {
+        var c = cols_in;
+        inline for (0..7) |t| {
+            const k = 14 - t;
+            c[k - 4] += c[k];
+            c[k - 8] += c[k];
+        }
+        var out: [num_limbs]u64 = undefined;
         var carry: u128 = 0;
-        inline for (0..15) |i| {
-            const cur = cols[i] + carry;
-            t[i] = @intCast(cur & limb_mask);
+        inline for (0..num_limbs) |i| {
+            const cur = c[i] + carry;
+            out[i] = @as(u64, @truncate(cur)) & limb_mask;
             carry = cur >> limb_bits;
         }
-        t[15] = @intCast(carry);
-        var r: [num_limbs]u128 = undefined;
-        inline for (0..4) |i| {
-            r[i] = @as(u128, t[i]) + t[8 + i] + t[12 + i];
-            r[4 + i] = @as(u128, t[4 + i]) + t[8 + i] + 2 * @as(u128, t[12 + i]);
-        }
-        return reduceAfterFold(r);
+        const l0 = @as(u128, out[0]) + carry;
+        out[0] = @as(u64, @truncate(l0)) & limb_mask;
+        out[1] += @intCast(l0 >> limb_bits);
+        const l4 = @as(u128, out[4]) + carry;
+        out[4] = @as(u64, @truncate(l4)) & limb_mask;
+        out[5] += @intCast(l4 >> limb_bits);
+        return .{ .limbs = out };
     }
 
-    /// `a^2 (mod p)`. Construction: identical to `mul(a, a)` but a
-    /// dedicated squaring routine skips the ~half of the schoolbook
-    /// cross-terms that are exact duplicates under `a*b == b*a` (the
-    /// usual squaring speedup — same idea `std.crypto.ecc.Edwards25519.
-    /// Fe.sq`/`bls12_381.Fp.square` (`modulus.sq`) both apply for their
-    /// own fields). A correct-but-unoptimized fallback of literally
-    /// `mul(a, a)` is acceptable as a first pass; the dedicated
-    /// half-schoolbook version is a documented follow-up, not a
-    /// correctness requirement.
+    /// `a^2 (mod p)`, weakly reduced. Dedicated squaring: each off-diagonal
+    /// cross product is computed ONCE and doubled (28 cross products + 8
+    /// diagonals vs 64). Structurally symmetric and data-independent ⇒
+    /// constant-time in the base. Column bound for limbs `< 2^57`: one
+    /// diagonal (`< 2^114`) plus ≤ 4 doubled cross products (`< 2^115`
+    /// each) ⇒ `< 2^118`, inside `reduceColumns`'s contract.
     pub fn square(a: Fe) Fe {
-        // Dedicated squaring: exploit `a[i]*a[j] == a[j]*a[i]` so each
-        // off-diagonal cross product is computed ONCE and doubled, halving
-        // the 8×8 schoolbook's multiplies (28 cross products + 8 diagonals
-        // vs 64). Structurally symmetric and data-independent ⇒ still
-        // constant-time in the base. Column bound: at most one diagonal
-        // (`a[k/2]^2 < 2^112`) plus ≤4 doubled cross products
-        // (`2*a[i]*a[j] < 2^113`) ⇒ each column `< 2^112 + 4*2^113 < 2^116`,
-        // inside `reduceProduct`'s input contract.
         var cols = @as([15]u128, @splat(0));
         inline for (0..num_limbs) |i| {
             cols[2 * i] += @as(u128, a.limbs[i]) * a.limbs[i];
@@ -427,75 +413,85 @@ pub const Fe = struct {
                 cols[i + j] += 2 * (@as(u128, a.limbs[i]) * a.limbs[j]);
             }
         }
-        return reduceProduct(cols);
+        return reduceColumns(cols);
     }
 
-    /// `a * s (mod p)` for a small (`< 2^32`) PUBLIC comptime scalar `s`.
-    /// Much cheaper than a full `mul` against a field element: a single
-    /// 56×≤32-bit partial product per limb (8 multiplies) instead of the
-    /// 8×8 schoolbook (64). Used by `x448.zig`'s ladder for the `a24 * E`
-    /// step (`a24 = 39081`), which was a full `Fe.mul` against a
-    /// comptime-built field element (audit F5). Constant-time: `s` is a
-    /// public compile-time constant and the per-limb schedule is fixed.
+    /// `a^(2^n)`: `n` successive squarings (`n` public, comptime).
+    fn squareN(a: Fe, comptime n: usize) Fe {
+        var r = a;
+        for (0..n) |_| r = r.square();
+        return r;
+    }
+
+    /// `a * s (mod p)` for a small (`< 2^32`) PUBLIC comptime scalar `s`,
+    /// weakly reduced. Much cheaper than a full `mul` against a field
+    /// element: one 57×32-bit partial product per limb (8 multiplies)
+    /// instead of the 8×8 schoolbook (64). Used by `x448.zig`'s ladder for
+    /// the `a24 * E` step (`a24 = 39081`), which was a full `Fe.mul`
+    /// against a comptime-built field element (audit F5). Constant-time:
+    /// `s` is a public compile-time constant and the schedule is fixed.
     ///
-    /// Bound: each `a.limbs[i] * s < 2^56 * 2^32 = 2^88`; the running
-    /// carry stays `< 2^32`, so the final carry-out of limb 7 is `< 2^33`.
-    /// Folding it via `2^448 ≡ 2^224 + 1` into limbs 0 and 4 leaves those
-    /// `< 2^56 + 2^33 < 2^58`, `reduceAfterFold`'s input contract.
+    /// Bound: each product is `< 2^57 * 2^32 = 2^89`; its high part
+    /// (`>> 56`) `< 2^33` moves one limb up (limb 7's folds into 0 and 4),
+    /// so every limb ends `< 2^56 + 2^34`.
     pub fn mulSmall(a: Fe, comptime s: u32) Fe {
-        var r: [num_limbs]u128 = undefined;
-        var carry: u128 = 0;
+        var lo: [num_limbs]u64 = undefined;
+        var hi: [num_limbs]u64 = undefined;
         inline for (0..num_limbs) |i| {
-            const cur = @as(u128, a.limbs[i]) * s + carry;
-            r[i] = cur & limb_mask;
-            carry = cur >> limb_bits;
+            const pr = @as(u128, a.limbs[i]) * s;
+            lo[i] = @as(u64, @truncate(pr)) & limb_mask;
+            hi[i] = @intCast(pr >> limb_bits);
         }
-        r[0] += carry;
-        r[4] += carry;
-        return reduceAfterFold(r);
+        var out: [num_limbs]u64 = undefined;
+        out[0] = lo[0] + hi[num_limbs - 1];
+        inline for (1..num_limbs) |i| out[i] = lo[i] + hi[i - 1];
+        out[4] += hi[num_limbs - 1];
+        return .{ .limbs = out };
+    }
+
+    /// `e222 = a^(2^222 - 1)`, the shared head of `invert`'s and `sqrt`'s
+    /// addition chains (`e_k = a^(2^k - 1)`, built by
+    /// `e_(j+k) = e_j^(2^k) * e_k`), and `e2` for `sqrt`'s tail. 227
+    /// squarings, 10 multiplications.
+    fn chainHead(a: Fe) struct { e2: Fe, e222: Fe } {
+        const e2 = a.square().mul(a);
+        const e3 = e2.square().mul(a);
+        const e6 = e3.squareN(3).mul(e3);
+        const e12 = e6.squareN(6).mul(e6);
+        const e24 = e12.squareN(12).mul(e12);
+        const e30 = e24.squareN(6).mul(e6);
+        const e48 = e24.squareN(24).mul(e24);
+        const e96 = e48.squareN(48).mul(e48);
+        const e192 = e96.squareN(96).mul(e96);
+        const e222 = e192.squareN(30).mul(e30);
+        return .{ .e2 = e2, .e222 = e222 };
     }
 
     /// Multiplicative inverse; `error.NotInvertible` if `a == 0`.
-    /// Construction: Fermat's little theorem, `a^(p-2) mod p`, via
-    /// `pow(a, inv_exponent_be)` — RFC 8032 §5.2.1's own recommended
-    /// construction ("it is recommended to use the identity
-    /// x^-1 = x^(p-2) (mod p). Inverting zero should never happen").
-    /// `p-2`'s bytes are a FIXED PUBLIC exponent (`inv_exponent_be`,
-    /// precomputed above), so this needs no runtime `Fe` subtraction; the
-    /// EXPONENT is public either way, so no separate "public vs
-    /// constant-time-secret exponent" variant is needed here (contrast
-    /// `bls12_381.Fp.inv`'s doc comment, which discusses that same
-    /// distinction for `std.crypto.ff`'s two `pow` variants — this
-    /// module's own `pow` need not expose the distinction until a
-    /// crypto-core pass decides it wants the public-exponent speed
-    /// optimization).
+    /// Fermat's little theorem, `a^(p-2) mod p` (RFC 8032 §5.2.1: "it is
+    /// recommended to use the identity x^-1 = x^(p-2) (mod p)"), by a fixed
+    /// addition chain: `p - 2 = 2^225 * (2^223 - 1) + 4 * (2^222 - 1) + 1`,
+    /// so `a^(p-2) = e223^(2^225) * e222^4 * a` with `e223 = e222^2 * a`
+    /// (`chainHead`). 455 squarings and 13 multiplications —
+    /// `pow(a, p - 2)`, the generic
+    /// square-and-always-multiply this was until 2026-11-13, spends 448 of
+    /// each. The chain is fixed and public: constant-time in `a`.
     pub fn invert(a: Fe) error{NotInvertible}!Fe {
         if (a.isZero()) return error.NotInvertible;
-        return a.pow(inv_exponent_be); // a^(p-2), Fermat (RFC 8032 §5.2.1)
+        const h = chainHead(a);
+        const e223 = h.e222.square().mul(a);
+        return e223.squareN(225).mul(h.e222.squareN(2).mul(a));
     }
 
     /// `a^e (mod p)`, `e` a BIG-ENDIAN 56-byte exponent (note: the
     /// OPPOSITE endianness from `fromBytes`/`toBytes`'s little-endian
     /// VALUE encoding — a deliberate convention split, matching
-    /// `bls12_381.Fp.pow`'s own big-endian-exponent choice, so a
-    /// crypto-core pass does not need to invent a fresh convention).
-    /// Construction: square-and-multiply (or a fixed-window variant) over
-    /// `mul`/`square`, MSB-to-LSB. `invert` and `sqrt` are this
-    /// function's only current callers, both with FIXED PUBLIC exponents
-    /// (`inv_exponent_be`, `sqrt_exponent_be`), so a fully
-    /// constant-time-in-the-BASE (branch only on public exponent bits,
-    /// never on `a`'s value) square-and-multiply is sufficient — no
-    /// constant-time-in-the-exponent requirement exists for THIS module's
-    /// own two callers, though a general-purpose `pow` intended for
-    /// future secret-exponent callers (there are none yet) would want
-    /// that property too.
+    /// `bls12_381.Fp.pow`'s own big-endian-exponent choice). Square-and-
+    /// ALWAYS-multiply, MSB-to-LSB: constant-time in the base AND in the
+    /// exponent (the multiply is computed every bit and mask-selected).
+    /// `invert` and `sqrt` use fixed addition chains instead (2026-11-13);
+    /// this stays for callers with other exponents (`decaf448`).
     pub fn pow(a: Fe, e: [encoded_bytes]u8) Fe {
-        // Square-and-ALWAYS-multiply, MSB-to-LSB: constant-time in the
-        // base (mul/square are), and — beyond this module's own two
-        // fixed-public-exponent callers' needs — constant-time in the
-        // exponent too, by computing the multiply unconditionally and
-        // mask-selecting the result (defense-in-depth for hypothetical
-        // future secret-exponent callers; costs one extra mul per bit).
         var result = Fe.one;
         for (e) |byte| {
             var k: u4 = 0;
@@ -509,18 +505,37 @@ pub const Fe = struct {
     }
 
     /// Square root, or `null` if `a` is not a quadratic residue.
-    /// Construction: RFC 8032 §5.2.1's own recipe — `p ≡ 3 (mod 4)`
-    /// (confirmed: `p_bytes[0] == 0xff`, i.e. `p mod 4 == 3` reading the
-    /// little-endian low byte), so the simple case applies directly:
-    /// candidate `c = a^((p+1)/4) mod p` via `pow(a, sqrt_exponent_be)`;
-    /// verify `c^2 == a` (`c.square().eql(a)`) — if it doesn't, `a` has
-    /// no square root, return `null`. Identical shape to
-    /// `bls12_381.Fp.sqrt`'s own `p ≡ 3 (mod 4)` case (that field is
-    /// ALSO `3 mod 4`) — no Tonelli-Shanks general case is needed for
-    /// either.
+    /// RFC 8032 §5.2.1's recipe for `p ≡ 3 (mod 4)` (`p_bytes[0] == 0xff`):
+    /// candidate `c = a^((p+1)/4)`, verified by `c^2 == a`. The exponent
+    /// is `(p+1)/4 = 2^446 - 2^222 = 2^222 * (2^224 - 1)`, so
+    /// `c = e224^(2^222)` with `e224 = e222^4 * e2` (`chainHead`): 451
+    /// squarings, 11 multiplications
+    /// (the generic `pow` until 2026-11-13: 448 of each). Constant-time in
+    /// `a` up to the residue verdict.
     pub fn sqrt(a: Fe) ?Fe {
-        const c = a.pow(sqrt_exponent_be); // a^((p+1)/4), p ≡ 3 (mod 4)
+        const h = chainHead(a);
+        const c = h.e222.squareN(2).mul(h.e2).squareN(222);
         return if (c.square().eql(a)) c else null;
+    }
+
+    /// `sqrt(u / v)`, or `null` if `u / v` is not a square (or `v == 0`
+    /// while `u != 0`), with no separate inversion: RFC 8032 §5.2.3's
+    /// combined power for edwards448, `x = u^3 * v * (u^5 * v^3)^((p-3)/4)`,
+    /// accepted iff `v * x^2 == u`. `(p-3)/4 = 2^223 * (2^223 - 1) +
+    /// (2^222 - 1)`, so the power is `e223^(2^223) * e222` over `chainHead`
+    /// — one 451-squaring chain where `invert` + `sqrt` took two. Used by
+    /// point decoding (`ed448.zig`). Constant-time in `u`, `v` up to the
+    /// verdict.
+    pub fn sqrtRatio(u: Fe, v: Fe) ?Fe {
+        const u_sq = u.square();
+        const u_cu = u_sq.mul(u);
+        const v_cu = v.square().mul(v);
+        const t = u_cu.mul(u_sq).mul(v_cu); // u^5 v^3
+        const h = chainHead(t);
+        const e223 = h.e222.square().mul(t);
+        const pw = e223.squareN(223).mul(h.e222);
+        const x = u_cu.mul(v).mul(pw);
+        return if (v.mul(x.square()).eql(u)) x else null;
     }
 
     /// `true` iff the canonical representative of `a` is odd — the "x_0"
@@ -540,9 +555,8 @@ pub const Fe = struct {
     /// constant-time windowed scalar multiplication (`ed448.zig`) needs
     /// for its conditional swaps and masked table scans. Operates
     /// LIMB-LEVEL (a single 64-bit mask merge per limb, no branch, no
-    /// secret-dependent index) — both inputs are canonical by the storage
-    /// convention (module doc comment), so limb-wise selection yields the
-    /// canonical representative of whichever operand was chosen. This
+    /// secret-dependent index): the result is whichever operand's limbs
+    /// were chosen, weakly reduced like both inputs. This
     /// replaces an earlier `toBytes`/`fromBytes` round-trip merge: the
     /// masked select sits on the hot path of every windowed scalarmul, so
     /// the two serializations + reparse per select were a real cost
@@ -680,8 +694,17 @@ test "p limb form matches p_bytes" {
     // p_limbs is an internal constant (condSubP's subtrahend); check it
     // against the independently-derived p_bytes wire form by packing it
     // through the same codec an Fe uses.
+    // `toBytes` canonicalizes since 2026-11-13 (p itself encodes as 0), so
+    // the limbs are packed here directly, 7 bytes each.
+    var packed_p: [encoded_bytes]u8 = undefined;
+    for (p_limbs, 0..) |limb, i| {
+        for (0..7) |j| packed_p[i * 7 + j] = @truncate(limb >> @intCast(8 * j));
+    }
+    try std.testing.expectEqualSlices(u8, &p_bytes, &packed_p);
+    // And as a (weakly reduced) field element p is zero.
     const p_as_fe = Fe{ .limbs = p_limbs };
-    try std.testing.expectEqualSlices(u8, &p_bytes, &p_as_fe.toBytes());
+    try std.testing.expect(p_as_fe.isZero());
+    try std.testing.expect(std.mem.allEqual(u8, &p_as_fe.toBytes(), 0));
 }
 
 /// A fixed, arbitrary canonical test element used by the self-checks
@@ -738,4 +761,135 @@ test "Fe arithmetic: sqrt(a^2) squares back to a^2; a known non-residue has no r
     // -(a^2) is a non-residue: p ≡ 3 (mod 4) makes -1 a non-residue, so
     // exactly one of x, -x is a QR for any nonzero x.
     try std.testing.expect(a2.neg().sqrt() == null);
+}
+
+// ── weak reduction against an independent oracle (2026-11-13) ─────────────
+//
+// `std.crypto.ff` over the same prime is the oracle: an unrelated generic
+// Montgomery implementation. Operands include the values next to `0`, `p`
+// and `2^224`, and long chains of operations that never canonicalize in
+// between, so the bounds in "Weak reduction" are exercised at their edges.
+
+const OracleM = std.crypto.ff.Modulus(448);
+
+fn oracleFe(m: OracleM, fe: Fe) !OracleM.Fe {
+    return OracleM.Fe.fromBytes(m, &fe.toBytes(), .little);
+}
+
+fn expectMatches(got: Fe, want: OracleM.Fe) !void {
+    var wb: [encoded_bytes]u8 = undefined;
+    try want.toBytes(&wb, .little);
+    try std.testing.expectEqualSlices(u8, &wb, &got.toBytes());
+}
+
+fn feFromP(minus: u8) !Fe {
+    var b = p_bytes;
+    b[0] -= minus;
+    return Fe.fromBytes(b);
+}
+
+test "weak reduction: add/sub/mul/square/mulSmall/neg match std.crypto.ff on edge values and long unreduced chains" {
+    const m = try OracleM.fromBytes(&p_bytes, .little);
+    var edge: [7]Fe = undefined;
+    edge[0] = Fe.zero;
+    edge[1] = Fe.one;
+    edge[2] = try feFromP(1); // p - 1
+    edge[3] = try feFromP(2); // p - 2
+    var b224 = @as([encoded_bytes]u8, @splat(0));
+    b224[28] = 1; // 2^224
+    edge[4] = try Fe.fromBytes(b224);
+    var b224m1 = @as([encoded_bytes]u8, @splat(0));
+    @memset(b224m1[0..28], 0xff); // 2^224 - 1
+    edge[5] = try Fe.fromBytes(b224m1);
+    edge[6] = testElement();
+
+    for (edge) |a| for (edge) |b| {
+        const oa = try oracleFe(m, a);
+        const ob = try oracleFe(m, b);
+        try expectMatches(a.add(b), m.add(oa, ob));
+        try expectMatches(a.sub(b), m.sub(oa, ob));
+        try expectMatches(a.mul(b), m.mul(oa, ob));
+        try std.testing.expectEqual(a.eql(b), oa.eql(ob));
+    };
+    const s1 = try OracleM.Fe.fromPrimitive(u32, m, 39081);
+    const s2 = try OracleM.Fe.fromPrimitive(u32, m, 0xffffffff);
+    for (edge) |a| {
+        const oa = try oracleFe(m, a);
+        try expectMatches(a.square(), m.sq(oa));
+        try expectMatches(a.neg(), m.sub(m.zero, oa));
+        try expectMatches(a.mulSmall(39081), m.mul(oa, s1));
+        try expectMatches(a.mulSmall(0xffffffff), m.mul(oa, s2));
+    }
+
+    // Chains with no canonical form in between: every intermediate is only
+    // weakly reduced, and each step feeds the next.
+    const opm1 = try oracleFe(m, edge[2]);
+    var x = edge[2];
+    var ox = opm1;
+    var y = edge[6];
+    var oy = try oracleFe(m, y);
+    for (0..3000) |i| {
+        switch (i % 6) {
+            0 => {
+                x = x.add(y);
+                ox = m.add(ox, oy);
+            },
+            1 => {
+                y = y.sub(x);
+                oy = m.sub(oy, ox);
+            },
+            2 => {
+                x = x.mul(y).add(x);
+                ox = m.add(m.mul(ox, oy), ox);
+            },
+            3 => {
+                y = y.square().sub(edge[2]);
+                oy = m.sub(m.sq(oy), opm1);
+            },
+            4 => {
+                x = x.neg().mulSmall(0xffffffff);
+                ox = m.mul(m.sub(m.zero, ox), s2);
+            },
+            else => {
+                y = y.add(y).add(y).add(y).sub(edge[2]).sub(edge[2]);
+                oy = m.sub(m.sub(m.add(m.add(m.add(oy, oy), oy), oy), opm1), opm1);
+            },
+        }
+    }
+    try expectMatches(x, ox);
+    try expectMatches(y, oy);
+}
+
+test "addition-chain invert and sqrt agree with the generic pow" {
+    var a = testElement();
+    for (0..16) |_| {
+        const inv = try a.invert();
+        try std.testing.expect(inv.eql(a.pow(inv_exponent_be)));
+        try std.testing.expect(inv.mul(a).eql(Fe.one));
+        const sq = a.square();
+        const r = sq.sqrt() orelse return error.TestUnexpectedResult;
+        try std.testing.expect(r.eql(sq.pow(sqrt_exponent_be)));
+        try std.testing.expect(r.square().eql(sq));
+        a = a.mul(a).add(Fe.one);
+    }
+    try std.testing.expectError(error.NotInvertible, Fe.zero.invert());
+    try std.testing.expectError(error.NotInvertible, Fe.zero.sub(Fe.zero).invert());
+}
+
+test "sqrtRatio matches sqrt(u * v^-1), rejects non-squares" {
+    var u = testElement();
+    var v = testElement().square().add(Fe.one);
+    for (0..16) |_| {
+        const want = u.mul(try v.invert()).sqrt();
+        const got = Fe.sqrtRatio(u, v);
+        try std.testing.expectEqual(want == null, got == null);
+        if (got) |x| {
+            // Either root is acceptable; both square to u/v.
+            try std.testing.expect(x.square().mul(v).eql(u));
+            try std.testing.expect(x.eql(want.?) or x.eql(want.?.neg()));
+        }
+        u = u.mul(v).add(Fe.one);
+        v = v.square().sub(u);
+    }
+    try std.testing.expect(Fe.sqrtRatio(Fe.zero, Fe.one).?.isZero());
 }

@@ -291,36 +291,75 @@ pub const Point = struct {
         return acc;
     }
 
-    /// Variable-time `[s1]p1 + [s2]p2`, for PUBLIC inputs only (Ed448
-    /// `verify`). Straus/Shamir simultaneous double-scalar multiplication
-    /// with a shared 4-bit window: one interleaved 448-doubling pass over
-    /// both scalars, with a direct (data-dependent) table index and a
-    /// skipped add on a zero nibble — legitimate here because every input
-    /// to verification (`S`, `k`, `B`, `A'`) is public. Replaces the two
-    /// full constant-time `Point.mul`s the cofactored check used to run
-    /// (~half the doublings, plus no masked-scan overhead), the source of
-    /// verify's outsized gap vs C (audit F2).
-    fn mulDoubleVartime(s1: scalar.CompressedScalar, p1: Point, s2: scalar.CompressedScalar, p2: Point) Point {
-        var t1: [16]Point = undefined;
-        var t2: [16]Point = undefined;
-        t1[0] = identityElement;
-        t2[0] = identityElement;
-        t1[1] = p1;
-        t2[1] = p2;
-        inline for (2..16) |j| {
-            t1[j] = t1[j - 1].add(p1);
-            t2[j] = t2[j - 1].add(p2);
+    /// Width-`w` NAF of a PUBLIC scalar `< 2^448` (`s[56]` must be 0):
+    /// digits in `{0, ±1, ±3, …, ±(2^(w-1) - 1)}`, at most one non-zero in
+    /// any `w` consecutive positions, `Σ digits[i]·2^i = s`. Variable-time
+    /// (verify's inputs are public). Returns the index one past the highest
+    /// non-zero digit (0 for `s = 0`).
+    fn wnaf(comptime w: comptime_int, s: *const scalar.CompressedScalar, digits: *[wnaf_len]i8) usize {
+        var k: u512 = std.mem.readInt(u456, s, .little);
+        @memset(digits, 0);
+        var i: usize = 0;
+        var top: usize = 0;
+        while (k != 0) : (i += 1) {
+            if (k & 1 == 1) {
+                var digit: i32 = @intCast(k & ((1 << w) - 1));
+                if (digit >= 1 << (w - 1)) digit -= 1 << w;
+                digits[i] = @intCast(digit);
+                if (digit > 0) k -= @intCast(digit) else k += @intCast(-digit);
+                top = i + 1;
+            }
+            k >>= 1;
         }
+        return top;
+    }
+
+    /// A NAF of a value `< 2^448` has at most 449 digits.
+    const wnaf_len = 449;
+    /// Window of the base point's NAF in `verify` (comptime table of 32
+    /// odd multiples) and of the public key's (8 odd multiples, built per
+    /// call).
+    const base_wnaf_w = 7;
+    const var_wnaf_w = 5;
+
+    /// `[1]B, [3]B, …, [63]B`, built at comptime for `mulDoubleBaseVartime`.
+    const baseOdd: [1 << (base_wnaf_w - 2)]Point = blk: {
+        @setEvalBranchQuota(10_000_000);
+        var t: [1 << (base_wnaf_w - 2)]Point = undefined;
+        const b2 = basePoint.dbl();
+        t[0] = basePoint;
+        for (1..t.len) |j| t[j] = t[j - 1].add(b2);
+        break :blk t;
+    };
+
+    /// Variable-time `[s1]B + [s2]p2`, for PUBLIC inputs only (Ed448
+    /// `verify`): Straus/Shamir simultaneous double-scalar multiplication
+    /// over width-`w` NAFs — `B`'s odd multiples come from the comptime
+    /// `baseOdd` (w = 7: ~1/8 of the positions add), `p2`'s from a
+    /// per-call table of 8 (w = 5: ~1/6). Data-dependent indices and
+    /// skipped adds are legitimate here because every input to
+    /// verification (`S`, `k`, `B`, `A'`) is public. Until 2026-11-13 this
+    /// was a shared 4-bit fixed window over both scalars with no
+    /// precomputation for `B` (~238 additions against ~130 now).
+    fn mulDoubleBaseVartime(s1: *const scalar.CompressedScalar, s2: *const scalar.CompressedScalar, p2: Point) Point {
+        var n1: [wnaf_len]i8 = undefined;
+        var n2: [wnaf_len]i8 = undefined;
+        const top = @max(wnaf(base_wnaf_w, s1, &n1), wnaf(var_wnaf_w, s2, &n2));
+
+        var t2: [1 << (var_wnaf_w - 2)]Point = undefined;
+        const p2x2 = p2.dbl();
+        t2[0] = p2;
+        for (1..t2.len) |j| t2[j] = t2[j - 1].add(p2x2);
+
         var acc = identityElement;
-        var w: usize = 112;
-        while (w > 0) {
-            w -= 1;
-            acc = acc.dbl().dbl().dbl().dbl();
-            const shift = w * 4;
-            const n1: u4 = @truncate(s1[shift / 8] >> @intCast(shift % 8));
-            const n2: u4 = @truncate(s2[shift / 8] >> @intCast(shift % 8));
-            if (n1 != 0) acc = acc.add(t1[n1]);
-            if (n2 != 0) acc = acc.add(t2[n2]);
+        var i = top;
+        while (i > 0) {
+            i -= 1;
+            acc = acc.dbl();
+            const d1 = n1[i];
+            if (d1 > 0) acc = acc.add(baseOdd[@intCast(d1 >> 1)]) else if (d1 < 0) acc = acc.add(baseOdd[@intCast((-d1) >> 1)].neg());
+            const d2 = n2[i];
+            if (d2 > 0) acc = acc.add(t2[@intCast(d2 >> 1)]) else if (d2 < 0) acc = acc.add(t2[@intCast((-d2) >> 1)].neg());
         }
         return acc;
     }
@@ -379,8 +418,10 @@ pub const Point = struct {
         const y2 = y.mul(y);
         const u = y2.sub(Fe.one);
         const v = d.mul(y2).sub(Fe.one);
-        const v_inv = v.invert() catch unreachable; // v is never 0 for edwards448 (RFC 8032 5.2.3)
-        var x = Fe.sqrt(u.mul(v_inv)) orelse return error.InvalidEncoding;
+        // RFC 8032 §5.2.3's combined power: one exponentiation instead of an
+        // inversion plus a square root (`Fe.sqrtRatio`; v is never 0 for
+        // edwards448). Was `sqrt(u * v^-1)` until 2026-11-13.
+        var x = Fe.sqrtRatio(u, v) orelse return error.InvalidEncoding;
 
         if (x.isZero() and x0 == 1) return error.InvalidEncoding;
         if (@intFromBool(x.isOdd()) != x0) x = x.neg();
@@ -720,8 +761,9 @@ fn verifyInternal(sig: Signature, ph_message: []const u8, ctx: []const u8, pubke
     // Cofactored check `[4][S]B == [4]R + [4][k]A'`, rearranged to
     // `[4]([S]B + [k](-A')) == [4]R` so both scalar mults fold into ONE
     // vartime Straus double-scalar pass (public inputs — see
-    // `mulDoubleVartime`).
-    const lhs = Point.mulDoubleVartime(sig.s, Point.basePoint, k_scalar, a_point.neg()).clearCofactor();
+    // `mulDoubleBaseVartime`). Both scalars are `< L < 2^446`: `S` by the
+    // step-1 check above, `k` reduced.
+    const lhs = Point.mulDoubleBaseVartime(&sig.s, &k_scalar, a_point.neg()).clearCofactor();
 
     if (!lhs.equivalent(r_point.clearCofactor())) return error.SignatureVerificationFailed;
 }
@@ -1102,4 +1144,32 @@ test "RNG seam: KeyPair.generate really draws entropy, and round-trips end to en
     // sign with the freshly drawn key, verify with its own public key.
     const sig = try sign(&kp1, "message under a freshly drawn key", "");
     try verify(sig, "message under a freshly drawn key", "", kp1.public_key);
+}
+
+test "mulDoubleBaseVartime (wNAF, comptime B table) agrees with the constant-time [s1]B + [s2]P, including all-ones and sparse scalars" {
+    const P = Point.mulBasePoint(scalar.reduceWide(@as([114]u8, @splat(0x5a))));
+    var digest: [114]u8 = undefined;
+    for (0..12) |round| {
+        for (&digest, 0..) |*b, i| b.* = @truncate(i * 31 + round * 101 + 7);
+        var s1 = scalar.reduceWide(digest);
+        digest[0] ^= 0xff;
+        var s2 = scalar.reduceWide(digest);
+        switch (round) {
+            0 => s1 = scalar.zero,
+            1 => s2 = scalar.zero,
+            2 => {
+                s1 = scalar.zero;
+                s1[0] = 1;
+            },
+            3 => {
+                // L - 1 style dense scalar: every bit of the low 440 set.
+                s2 = scalar.zero;
+                @memset(s2[0..55], 0xff);
+            },
+            else => {},
+        }
+        const want = Point.mulBasePoint(s1).add(P.mul(s2));
+        const got = Point.mulDoubleBaseVartime(&s1, &s2, P);
+        try std.testing.expect(got.equivalent(want));
+    }
 }
