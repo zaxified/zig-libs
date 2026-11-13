@@ -143,3 +143,196 @@ test "fromPrimes accepts a four-byte public exponent below 2^32 (sweep audit GP-
     }
     try std.testing.expect(accepted >= 1);
 }
+
+// ── mutation audit 2026-11-13 (delta over bb4efd9a9): tests asked for by survivors ──
+
+test "bigModInverse: a value sharing a factor with the modulus has no inverse (mutation audit)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var e2 = try std.math.big.int.Managed.initSet(a, 2);
+    var m4 = try std.math.big.int.Managed.initSet(a, 4);
+    try std.testing.expectError(error.InvalidPrivateKey, rsa.bigModInverse(a, &e2, &m4));
+}
+
+test "fromPrimes: empty, zero, one and even exponents, a composite p, p == q and a product past the size cap are refused (mutation audit)" {
+    var kp = try testKey();
+    defer kp.secret_key.deinit();
+    var pb: [64]u8 = undefined;
+    var qb: [64]u8 = undefined;
+    const p = primeBytes(kp.secret_key.p, &pb);
+    const q = primeBytes(kp.secret_key.q, &qb);
+    var sk: rsa.SecretKey = undefined;
+    const bad_e = [_][]const u8{ &.{}, &.{0}, &.{ 0, 0 }, &.{1}, &.{ 0, 0, 1 }, &.{4}, &.{ 1, 0, 0 } };
+    for (bad_e) |e| try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPrimes(&sk, p, q, e));
+    // 15 is not prime: only the final q * q^-1 = 1 (mod p) check sees it.
+    try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPrimes(&sk, &.{15}, &.{7}, &.{5}));
+    try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPrimes(&sk, p, p, &.{ 1, 0, 1 }));
+
+    // p * q past max_modulus_bits: q need not be prime for the derivation to run
+    // on, so only the size check stops it (the product would be cut to 8192 bits).
+    var big_q: [rsa.max_modulus_len]u8 = @splat(0xB7);
+    var refused: usize = 0;
+    var tried: usize = 0;
+    for ([_]u8{ 3, 5, 7, 11, 13, 17 }) |e| {
+        tried += 1;
+        if (rsa.SecretKey.fromPrimes(&sk, p, &big_q, &.{e})) {
+            sk.deinit();
+            return error.AcceptedAnOversizedModulus;
+        } else |err| {
+            try std.testing.expectEqual(error.InvalidPrivateKey, err);
+            refused += 1;
+        }
+    }
+    try std.testing.expectEqual(tried, refused);
+}
+
+test "fromPrimes: leading zeros on p, q and e, however many, do not change the key (mutation audit)" {
+    var kp = try testKey();
+    defer kp.secret_key.deinit();
+    var pb: [64]u8 = undefined;
+    var qb: [64]u8 = undefined;
+    const p = primeBytes(kp.secret_key.p, &pb);
+    const q = primeBytes(kp.secret_key.q, &qb);
+    var pad_p: [rsa.max_modulus_len + 40]u8 = @splat(0);
+    var pad_q: [rsa.max_modulus_len + 40]u8 = @splat(0);
+    @memcpy(pad_p[pad_p.len - p.len ..], p);
+    @memcpy(pad_q[pad_q.len - q.len ..], q);
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPrimes(&sk, &pad_p, q, &.{ 1, 0, 1 });
+    sk.deinit();
+    try rsa.SecretKey.fromPrimes(&sk, p, &pad_q, &.{ 1, 0, 1 });
+    sk.deinit();
+}
+
+fn mulmod256(a: u512, b: u512, m: u512) u512 {
+    return @intCast((@as(u1024, a) * b) % m);
+}
+
+fn powmod256(base: u512, exp: u512, m: u512) u512 {
+    var r: u512 = 1;
+    var b = base % m;
+    var e = exp;
+    while (e != 0) : (e >>= 1) {
+        if (e & 1 == 1) r = mulmod256(r, b, m);
+        b = mulmod256(b, b, m);
+    }
+    return r;
+}
+
+/// Miller-Rabin with the first twelve primes as bases (exact below 3.3e24; above that
+/// a composite would have to be a strong pseudoprime to all twelve).
+fn isPrimeWide(n: u512) bool {
+    const bases = [_]u512{ 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37 };
+    for (bases) |b| {
+        if (n == b) return true;
+        if (n % b == 0) return false;
+    }
+    var t: u512 = 41;
+    while (t < 2000) : (t += 2) {
+        if (n % t == 0) return false;
+    }
+    var d = n - 1;
+    var s: u32 = 0;
+    while (d & 1 == 0) : (d >>= 1) s += 1;
+    outer: for (bases) |b| {
+        var x = powmod256(b, d, n);
+        if (x == 1 or x == n - 1) continue;
+        var i: u32 = 1;
+        while (i < s) : (i += 1) {
+            x = mulmod256(x, x, n);
+            if (x == n - 1) continue :outer;
+        }
+        return false;
+    }
+    return true;
+}
+
+test "BlindingCache: shared between keys that differ only in the second prime, or in the order of the same two primes, it never serves a pair drawn for another key (mutation audit)" {
+    // Three primes p, q, q2 of 65..70 bits that share their low 64-bit limb: the
+    // keys (p,q) and (q,p) have the same n and e and primes that differ only in
+    // the upper limb; (p,q) and (p,q2) share the first prime but not n.
+    var primes: [3]u128 = undefined;
+    var found: usize = 0;
+    var a: u128 = 1;
+    while (found < 3) : (a += 1) {
+        const cand = (a << 64) | 0x9e37_79b9_7f4a_7c15;
+        if (!isPrimeWide(cand) or (cand - 1) % 65537 == 0) continue;
+        primes[found] = cand;
+        found += 1;
+    }
+    var pbuf: [3][16]u8 = undefined;
+    for (primes, 0..) |v, i| std.mem.writeInt(u128, &pbuf[i], v, .big);
+    const e: []const u8 = &.{ 1, 0, 1 };
+    var ska: rsa.SecretKey = undefined; // (p, q)
+    var skb: rsa.SecretKey = undefined; // (q, p)
+    var skc: rsa.SecretKey = undefined; // (p, q2)
+    try rsa.SecretKey.fromPrimes(&ska, &pbuf[0], &pbuf[1], e);
+    defer ska.deinit();
+    try rsa.SecretKey.fromPrimes(&skb, &pbuf[1], &pbuf[0], e);
+    defer skb.deinit();
+    try rsa.SecretKey.fromPrimes(&skc, &pbuf[0], &pbuf[2], e);
+    defer skc.deinit();
+
+    var m24: [24]u8 = @splat(0);
+    std.mem.writeInt(u128, m24[8..], 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef, .big);
+    const keys = [_]*const rsa.SecretKey{ &ska, &ska, &skb, &skb, &ska, &skc, &skc, &ska, &skb, &skc };
+    var prng = std.Random.DefaultPrng.init(0xb11d);
+    var cache = rsa.BlindingCache.init(prng.random());
+    defer cache.deinit();
+    for (keys) |sk| {
+        const c = try rsa.rsaep(24, m24, sk.publicKey());
+        const got = try rsa.rsadpCrtBlinded(24, c, sk, .{ .cached = &cache });
+        try std.testing.expectEqualSlices(u8, &m24, &got);
+    }
+}
+
+test "BlindingCache: a shorter key whose modulus equals the cached one in its low limbs is not served the cached pair (mutation audit)" {
+    // X = (p, q) and W = (p, q2) with q = q2 + 2^256: the same first prime and
+    // e, n_W = n_X mod 2^256, but n_W has four limbs (one 256-bit slot) and n_X eight. After W the
+    // cache holds W's four limbs over X's stale upper ones, so only the limb
+    // count tells the cache that the pair it holds is not X's.
+    var p: u128 = 0;
+    var a: u128 = 1;
+    while (true) : (a += 1) {
+        const cand = (a << 64) | 0x9e37_79b9_7f4a_7c15;
+        if (isPrimeWide(cand) and (cand - 1) % 65537 != 0) {
+            p = cand;
+            break;
+        }
+    }
+    const q2: u512 = 1_000_003;
+    var q: u512 = 0;
+    var k: u512 = 1;
+    while (true) : (k += 1) {
+        const cand = q2 + (k << 256);
+        if (isPrimeWide(cand) and (cand - 1) % 65537 != 0) {
+            q = cand;
+            break;
+        }
+    }
+    var pb: [16]u8 = undefined;
+    std.mem.writeInt(u128, &pb, p, .big);
+    var qb: [64]u8 = undefined;
+    std.mem.writeInt(u512, &qb, q, .big);
+    var q2b: [64]u8 = undefined;
+    std.mem.writeInt(u512, &q2b, q2, .big);
+    const e: []const u8 = &.{ 1, 0, 1 };
+    var skx: rsa.SecretKey = undefined;
+    var skw: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPrimes(&skx, &pb, &qb, e);
+    defer skx.deinit();
+    try rsa.SecretKey.fromPrimes(&skw, &pb, &q2b, e);
+    defer skw.deinit();
+
+    var m48: [48]u8 = @splat(0);
+    std.mem.writeInt(u64, m48[40..], 0x0123_4567_89ab_cdef, .big);
+    var prng = std.Random.DefaultPrng.init(0xb12d);
+    var cache = rsa.BlindingCache.init(prng.random());
+    defer cache.deinit();
+    for ([_]*const rsa.SecretKey{ &skx, &skw, &skx, &skx, &skw, &skx }) |sk| {
+        const c = try rsa.rsaep(48, m48, sk.publicKey());
+        const got = try rsa.rsadpCrtBlinded(48, c, sk, .{ .cached = &cache });
+        try std.testing.expectEqualSlices(u8, &m48, &got);
+    }
+}
