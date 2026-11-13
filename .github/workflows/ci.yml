@@ -366,12 +366,19 @@ jobs:
           - shard: net
             groups: -Dgroup=net
             split: ""
+          # rest in THREE by name hash (2026-11-13): a wave touching ~50 modules
+          # left rest-2 compiling 52 of its 56 modules cold, over the step's
+          # 12-minute cap twice in a row (run 43515148020); a timed-out step
+          # saves no stamps, so the shard could never warm up on its own.
           - shard: rest-1
             groups: -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os
-            split: 1/2
+            split: 1/3
           - shard: rest-2
             groups: -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os
-            split: 2/2
+            split: 2/3
+          - shard: rest-3
+            groups: -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os
+            split: 3/3
     name: changed modules [${{ matrix.shard }}]
     steps:
       # Full history: `test.sh changed <base>` diffs against the base branch,
