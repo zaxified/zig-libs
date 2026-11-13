@@ -2,7 +2,7 @@
 
 //! Deterministic fuzz driver for dtls (added 2026-10-10).
 //!
-//! Three harnesses (a damaged record that is accepted at all is a failure) over the module's in-memory client <-> server flow, each
+//! Four harnesses (a damaged record that is accepted at all is a failure) over the module's in-memory client <-> server flow, each
 //! generic over its source of choices; `DTLS_FUZZ=<runs>[,<first seed>]` runs
 //! them (testkit's fuzz driver; `_ONLY`, `_MS`, `_SEEDFILE`, `_INPUT` as
 //! documented there):
@@ -17,9 +17,12 @@
 //!   damaged / replayed / reordered. An undamaged record is accepted once; a
 //!   replay is refused; a damaged record is refused or, if accepted, carries
 //!   exactly the plaintext that was sent.
+//! - `dtls-keyupdate` (2026-11-13): a connected pair runs KeyUpdates while
+//!   the ACK / KeyUpdate records are dropped, damaged or duplicated; after a
+//!   lossless flush nothing is pending and both directions' keys agree.
 //! - `dtls-wire`: the parsers (plaintext and unified record headers,
 //!   handshake header + reassembler, ClientHello / ServerHello and the
-//!   message decoders, ACK) on damaged genuine hellos and on random bytes.
+//!   message decoders, ACK, ALPN) on damaged genuine hellos and on random bytes.
 
 const std = @import("std");
 const testing = std.testing;
@@ -363,6 +366,141 @@ test "fuzz harness: record, 300 seeds, reaches every outcome" {
     try RecMark.reach(fuzzRecord, "dtls-record", 300);
 }
 
+// ── dtls-keyupdate ──────────────────────────────────────────────────────────
+//
+// A connected pair runs 1-4 KeyUpdates (RFC 9147 §8), either side, with or
+// without `update_requested`, while every control record `poll` emits is
+// dropped, damaged, duplicated or delivered, and time jumps past the
+// retransmission timer whenever nothing is in flight. After a lossless
+// flush: no update is stuck, both directions' keys agree, records cross. A
+// control record must never come out of `recv` as application data, and an
+// undamaged one is never refused as damage.
+
+const KuMark = Marker(enum { completed, dropped, damaged_refused, duplicated, delivered, retransmitted });
+
+fn pick(src: anytype, n: u8) u8 {
+    var b: [1]u8 = undefined;
+    src.bytes(&b);
+    return b[0] % n;
+}
+
+/// Delivers `rec` to `to`; `damaged` says whether it was altered.
+fn kuDeliver(to: *Connection, rec: []const u8, damaged: bool) !void {
+    var plain: [256]u8 = undefined;
+    if (to.recv(rec, &plain)) |_| {
+        std.debug.print("dtls-keyupdate: a control record came out as application data (damaged={})\n", .{damaged});
+        return error.ControlRecordAsData;
+    } else |err| switch (err) {
+        error.ReceivedKeyUpdate, error.ReceivedAck, error.ReplayedRecord, error.ReceivedPostHandshakeMessage => {},
+        error.DecryptionFailed, error.Malformed, error.RecordTooShort => if (!damaged) {
+            std.debug.print("dtls-keyupdate: an undamaged control record was refused: {t}\n", .{err});
+            return err;
+        },
+        else => return err,
+    }
+}
+
+/// One pass over both sides' `poll`; `lossy` lets `src` decide each fate.
+/// Returns whether anything was sent.
+fn kuPass(comptime S: type, src: *S, side: *[2]Connection, now: u64, lossy: bool) !bool {
+    var any = false;
+    for (0..2) |x| {
+        var budget: usize = 4;
+        while (budget > 0) : (budget -= 1) {
+            var w: [256]u8 = undefined;
+            const was_in_flight = side[x].ku_state == .in_flight;
+            const rec = (try side[x].poll(now, &w)) orelse break;
+            if (was_in_flight and side[x].ku_records_len > 1) KuMark.mark(.retransmitted);
+            any = true;
+            const to = &side[1 - x];
+            const fate: u8 = if (lossy) pick(src, 6) else 5;
+            switch (fate) {
+                0 => KuMark.mark(.dropped),
+                1 => {
+                    var d: [256]u8 = undefined;
+                    var n = rec.len;
+                    if (S == fuzz_driver.Rng) {
+                        n = damage(src, &d, rec);
+                    } else {
+                        @memcpy(d[0..n], rec);
+                        d[pick(src, @intCast(@min(n, 255)))] ^= 0x01;
+                    }
+                    const damaged = n != rec.len or !std.mem.eql(u8, d[0..n], rec);
+                    try kuDeliver(to, d[0..n], damaged);
+                    if (damaged) KuMark.mark(.damaged_refused);
+                },
+                2 => {
+                    try kuDeliver(to, rec, false);
+                    try kuDeliver(to, rec, false);
+                    KuMark.mark(.duplicated);
+                },
+                else => {
+                    try kuDeliver(to, rec, false);
+                    KuMark.mark(.delivered);
+                },
+            }
+        }
+    }
+    return any;
+}
+
+pub fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    try ensurePair(.psk_gcm);
+    var side = [2]Connection{ pair[0], pair[1] };
+    var now: u64 = 0;
+    const rounds = 1 + pick(src, 4);
+    for (0..rounds) |_| {
+        const a = pick(src, 2);
+        side[a].requestKeyUpdate(pick(src, 2) == 0) catch |err| switch (err) {
+            error.KeyUpdatePending => {},
+            else => return err,
+        };
+        for (0..12) |_| {
+            if (!try kuPass(S, src, &side, now, true)) now += 70_000;
+        }
+    }
+    // Lossless flush: every queued ACK / KeyUpdate goes through.
+    var quiet: usize = 0;
+    for (0..64) |_| {
+        if (try kuPass(S, src, &side, now, false)) {
+            quiet = 0;
+        } else if (side[0].keyUpdatePending() or side[1].keyUpdatePending()) {
+            now += 70_000;
+        } else {
+            quiet += 1;
+            if (quiet == 2) break;
+        }
+    }
+    if (side[0].keyUpdatePending() or side[1].keyUpdatePending()) {
+        std.debug.print("dtls-keyupdate: an update is still pending after a lossless flush\n", .{});
+        return error.KeyUpdateStuck;
+    }
+    if (side[0].write_epoch == application_epoch and side[1].write_epoch == application_epoch) return error.NoUpdateCompleted;
+    try expectEstablished(&side[0], &side[1]);
+    KuMark.mark(.completed);
+}
+
+const application_epoch = conn_mod.application_epoch;
+
+fn fuzzKeyUpdateSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzKeyUpdate(testkit.fuzz.ScriptSource, &src, testing.allocator);
+}
+
+test "fuzz: KeyUpdate exchanges under loss, damage and duplication" {
+    try testing.fuzz({}, fuzzKeyUpdateSmith, .{});
+}
+
+test "fuzz driver: DTLS_FUZZ (keyupdate)" {
+    try fuzz_driver.run(fuzzKeyUpdate, .{ .prefix = "DTLS_FUZZ", .name = "dtls-keyupdate" });
+}
+
+test "fuzz harness: keyupdate, 200 seeds, reaches every outcome" {
+    try KuMark.reach(fuzzKeyUpdate, "dtls-keyupdate", 200);
+}
+
 // ── dtls-wire ───────────────────────────────────────────────────────────────
 
 var seeds_ready = false;
@@ -374,6 +512,8 @@ var seed_ext: [64]u8 = undefined;
 var seed_ext_len: usize = 0;
 var seed_ack: [64]u8 = undefined;
 var seed_ack_len: usize = 0;
+var seed_alpn: [64]u8 = undefined;
+var seed_alpn_len: usize = 0;
 
 fn ensureSeeds() !void {
     if (seeds_ready) return;
@@ -399,6 +539,7 @@ fn ensureSeeds() !void {
         .{ .ext_type = 51, .data = "" },
     }, &seed_ext);
     seed_ext_len = exts.len;
+    seed_alpn_len = (try messages.encodeAlpn(&.{ "h2", "coap", "webrtc" }, &seed_alpn)).len;
     seed_ack_len = (try flight.encodeAck(&.{ .{ .epoch = 2, .sequence_number = 0 }, .{ .epoch = 2, .sequence_number = 5 } }, &seed_ack)).len;
     seeds_ready = true;
 }
@@ -422,6 +563,7 @@ const WireMark = Marker(enum {
     server_hello,
     extensions,
     ack,
+    alpn,
     refused,
 });
 
@@ -432,7 +574,8 @@ pub fn fuzzWire(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     var n: usize = 0;
     if (S != fuzz_driver.Rng) {
         n = src.slice(&buf);
-    } else switch (src.valueRangeAtMost(u8, 0, 6)) {
+    } else switch (src.valueRangeAtMost(u8, 0, 7)) {
+        7 => n = damage(src, &buf, seed_alpn[0..seed_alpn_len]),
         4 => n = damage(src, &buf, seed_ext[0..seed_ext_len]),
         5 => n = damage(src, &buf, seed_ack[0..seed_ack_len]),
         0, 1 => n = damage(src, &buf, seed_ch[src.index(2)][0..seed_ch_len[0]]),
@@ -522,6 +665,13 @@ pub fn fuzzWire(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     } else |_| {}
     if (messages.decodeCookieExtension(input)) |_| {
         ok = true;
+    } else |_| {}
+    if (messages.AlpnIter.init(input)) |it0| {
+        WireMark.mark(.alpn);
+        ok = true;
+        var it = it0;
+        while (it.next()) |name| if (name.len == 0) return error.EmptyAlpnName;
+        _ = messages.decodeAlpnSelected(input) catch {};
     } else |_| {}
     var u16s: [16]u16 = undefined;
     if (messages.decodeU16ListExtension(input, &u16s)) |_| {
