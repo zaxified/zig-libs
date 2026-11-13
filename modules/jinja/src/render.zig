@@ -1187,6 +1187,7 @@ const Renderer = struct {
             .namespace => |ns| return ns.get(name) orelse .{ .undef = .{ .name = name } },
             .loop => |l| return self.loopAttr(l, name),
             .macro => |m| return self.macroAttr(m, name),
+            .tuple => |t| return filters.groupAttr(t, name) orelse .{ .undef = .{ .name = name } },
             else => return .{ .undef = .{ .name = name } },
         }
     }

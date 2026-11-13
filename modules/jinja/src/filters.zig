@@ -9,6 +9,8 @@
 
 const std = @import("std");
 const value = @import("value.zig");
+const ut = @import("unitext");
+const pytext = @import("pytext.zig");
 
 const Value = value.Value;
 
@@ -158,6 +160,7 @@ fn attrOf(ctx: *Ctx, item: Value, spec: Value) Error!Value {
                 cur = switch (cur) {
                     .map => |m| m.get(part) orelse return .{ .undef = .{ .name = part } },
                     .namespace => |ns| ns.get(part) orelse return .{ .undef = .{ .name = part } },
+                    .tuple => |t| groupAttr(t, part) orelse return .{ .undef = .{ .name = part } },
                     else => return .{ .undef = .{ .name = part } },
                 };
             }
@@ -169,20 +172,40 @@ fn attrOf(ctx: *Ctx, item: Value, spec: Value) Error!Value {
 
 // ── string filters ──────────────────────────────────────────────────────────
 
+/// Unicode case mapping (CPython's `str.upper()`/`lower()`/`title()`/
+/// `capitalize()`, which is what Jinja2 calls) through `unitext`. Ill-formed
+/// UTF-8 passes through unchanged instead of failing: a template engine that
+/// refuses a context string for its bytes would turn a case filter into a
+/// render error, and the reference cannot see such bytes at all.
+const case_opts: ut.Options = .{ .invalid_utf8 = .pass_through, .max_output = value.max_alloc };
+
+fn caseErr(e: ut.Error) Error {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooLarge => error.OutOfRange,
+        // Unreachable with `.pass_through`; kept total.
+        error.InvalidUtf8 => error.BadArgument,
+    };
+}
+
+fn lowerStr(ctx: *Ctx, s: []const u8) Error![]u8 {
+    return ut.lower(ctx.arena, s, case_opts) catch |e| return caseErr(e);
+}
+
+fn upperStr(ctx: *Ctx, s: []const u8) Error![]u8 {
+    return ut.upper(ctx.arena, s, case_opts) catch |e| return caseErr(e);
+}
+
 fn fUpper(ctx: *Ctx, input: Value, args: Args) Error!Value {
     _ = args;
     const s = try ctx.toStr(input);
-    const out = try ctx.arena.dupe(u8, s);
-    for (out) |*c| c.* = std.ascii.toUpper(c.*);
-    return markupAware(ctx, input, out);
+    return markupAware(ctx, input, try upperStr(ctx, s));
 }
 
 fn fLower(ctx: *Ctx, input: Value, args: Args) Error!Value {
     _ = args;
     const s = try ctx.toStr(input);
-    const out = try ctx.arena.dupe(u8, s);
-    for (out) |*c| c.* = std.ascii.toLower(c.*);
-    return markupAware(ctx, input, out);
+    return markupAware(ctx, input, try lowerStr(ctx, s));
 }
 
 // W2-A1/A2-jinja-F6: `do_capitalize` is `soft_str(s).capitalize()`, and
@@ -196,8 +219,7 @@ fn fLower(ctx: *Ctx, input: Value, args: Args) Error!Value {
 fn fCapitalize(ctx: *Ctx, input: Value, args: Args) Error!Value {
     _ = args;
     const s = try ctx.toStr(input);
-    const out = try ctx.arena.dupe(u8, s);
-    for (out, 0..) |*c, i| c.* = if (i == 0) std.ascii.toUpper(c.*) else std.ascii.toLower(c.*);
+    const out = ut.capitalize(ctx.arena, s, case_opts) catch |e| return caseErr(e);
     return markupAware(ctx, input, out);
 }
 
@@ -208,10 +230,11 @@ fn fCapitalize(ctx: *Ctx, input: Value, args: Args) Error!Value {
 /// `'`) is an ordinary mid-word byte and does not start a new titlecased
 /// word — unlike the "any non-alphabetic byte" rule this replaced, which
 /// diverged on ordinary configuration data (paths, FQDNs, interface names).
-fn isTitleBoundary(c: u8) bool {
+fn isTitleBoundaryCp(c: u21) bool {
     return switch (c) {
-        '-', ' ', '\t', '\r', '\n', 0x0b, 0x0c, '(', '{', '[', '<' => true,
-        else => false,
+        '-', '(', '{', '[', '<' => true,
+        // Python's `\s` on `str`: `str.isspace()` characters.
+        else => ut.isSpaceCp(c),
     };
 }
 
@@ -237,15 +260,35 @@ fn isTitleBoundary(c: u8) bool {
 fn fTitle(ctx: *Ctx, input: Value, args: Args) Error!Value {
     _ = args;
     const s = try ctx.toStr(input);
-    const out = try ctx.arena.dupe(u8, s);
-    var prev_boundary = false;
-    for (out, 0..) |*c, i| {
-        const boundary = isTitleBoundary(c.*);
-        const transition = i == 0 or boundary != prev_boundary;
-        c.* = if (transition) std.ascii.toUpper(c.*) else std.ascii.toLower(c.*);
-        prev_boundary = boundary;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        // One piece = a maximal run of boundary or of non-boundary code points.
+        const first = pieceStart(s, i);
+        var j = i + first.len;
+        while (j < s.len) {
+            const nx = pieceStart(s, j);
+            if (nx.boundary != first.boundary) break;
+            j += nx.len;
+        }
+        const piece = s[i..j];
+        // `item[0].upper() + item[1:].lower()` (a boundary run has no case).
+        try out.appendSlice(ctx.arena, try upperStr(ctx, piece[0..first.len]));
+        try out.appendSlice(ctx.arena, try lowerStr(ctx, piece[first.len..]));
+        if (out.items.len > value.max_alloc) return error.OutOfRange;
+        i = j;
     }
-    return Value.str(out);
+    return Value.str(out.items);
+}
+
+const Piece = struct { len: usize, boundary: bool };
+
+/// The code point at `i` (one byte for ill-formed input, which is no boundary).
+fn pieceStart(s: []const u8, i: usize) Piece {
+    const n = std.unicode.utf8ByteSequenceLength(s[i]) catch return .{ .len = 1, .boundary = false };
+    if (i + n > s.len) return .{ .len = 1, .boundary = false };
+    const cp = std.unicode.utf8Decode(s[i .. i + n]) catch return .{ .len = 1, .boundary = false };
+    return .{ .len = n, .boundary = isTitleBoundaryCp(cp) };
 }
 
 // `.title()` as a METHOD call is a different function from the filter above:
@@ -258,13 +301,7 @@ fn fTitle(ctx: *Ctx, input: Value, args: Args) Error!Value {
 // plain-`str`-reconstructing filter.
 fn titleMethod(ctx: *Ctx, input: Value) Error!Value {
     const s = try ctx.toStr(input);
-    const out = try ctx.arena.dupe(u8, s);
-    var at_start = true;
-    for (out) |*c| {
-        const alpha = std.ascii.isAlphabetic(c.*);
-        c.* = if (at_start) std.ascii.toUpper(c.*) else std.ascii.toLower(c.*);
-        at_start = !alpha;
-    }
+    const out = ut.title(ctx.arena, s, case_opts) catch |e| return caseErr(e);
     return markupAware(ctx, input, out);
 }
 
@@ -1178,9 +1215,7 @@ fn sortKeys(ctx: *Ctx, items: []const Value, attribute: ?Value, case_sensitive: 
                 if (case_sensitive) {
                     keys[i].text = s.bytes;
                 } else {
-                    const low = try ctx.arena.dupe(u8, s.bytes);
-                    for (low) |*c| c.* = std.ascii.toLower(c.*);
-                    keys[i].text = low;
+                    keys[i].text = try lowerStr(ctx, s.bytes);
                 }
             },
             else => textual = false,
@@ -1239,9 +1274,7 @@ fn fUnique(ctx: *Ctx, input: Value, args: Args) Error!Value {
     for (items) |it| {
         var key = if (attribute != null and attribute.? != .none) try attrOf(ctx, it, attribute.?) else it;
         if (!case_sensitive and key == .string) {
-            const low = try ctx.arena.dupe(u8, key.string.bytes);
-            for (low) |*c| c.* = std.ascii.toLower(c.*);
-            key = Value.str(low);
+            key = Value.str(try lowerStr(ctx, key.string.bytes));
         }
         var dup = false;
         for (seen.items) |s| if (value.valueEql(s, key)) {
@@ -1505,6 +1538,109 @@ fn jsonString(w: *std.Io.Writer, s: []const u8) Error!void {
     w.writeAll("\"") catch return error.OutOfMemory;
 }
 
+// ── format / wordwrap / filesizeformat / groupby ────────────────────────────
+
+/// `do_format`: `soft_str(value) % (kwargs or args)`; both at once is the
+/// reference's `FilterArgumentError`. A markup format string is `Markup %`,
+/// which escapes its `%s`/`%r` operands and yields markup.
+fn fFormat(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    if (args.pos.len != 0 and args.kw.len != 0) return error.BadArgument;
+    const fmt = try ctx.toStr(input);
+    const markup = ctx.autoescape and isMarkup(input);
+    var named: ?value.Map = null;
+    if (args.kw.len != 0) {
+        const pairs = try ctx.arena.alloc(value.Pair, args.kw.len);
+        for (args.kw, 0..) |k, i| pairs[i] = .{ .key = Value.str(k.name), .value = k.value };
+        named = .{ .pairs = pairs };
+    }
+    const out = try pytext.percentFormat(ctx.arena, fmt, args.pos, named, markup, ctx.strict);
+    return .{ .string = .{ .bytes = out, .safe = markup } };
+}
+
+fn fWordwrap(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const s = try ctx.toStr(input);
+    const width = try intArg(args.get(0, "width") orelse Value{ .integer = 79 }, 79);
+    const break_long = boolArg(args, 1, "break_long_words", true);
+    const wrapstring: []const u8 = blk: {
+        const v = args.get(2, "wrapstring") orelse break :blk "\n";
+        if (v == .none) break :blk "\n";
+        break :blk try ctx.toStr(v);
+    };
+    const hyphens = boolArg(args, 3, "break_on_hyphens", true);
+    const out = try pytext.wordwrap(ctx.arena, s, width, break_long, wrapstring, hyphens);
+    return Value.str(out);
+}
+
+fn fFilesizeformat(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const binary = boolArg(args, 0, "binary", false);
+    const f: f64 = switch (input) {
+        .integer => |i| @floatFromInt(i),
+        .float => |x| x,
+        .boolean => |b| if (b) 1.0 else 0.0,
+        .string => |sv| std.fmt.parseFloat(f64, std.mem.trim(u8, sv.bytes, " \t\r\n\x0b\x0c")) catch return error.BadArgument,
+        .undef => return error.UndefinedValue,
+        else => return error.TypeMismatch,
+    };
+    return Value.str(try pytext.fileSize(ctx.arena, f, binary));
+}
+
+/// `_GroupTuple` is a named tuple `(grouper, list)`. This model has no named
+/// tuples, so a 2-tuple whose second item is a list answers `.grouper` and
+/// `.list` (SPEC D23).
+pub fn groupAttr(t: []const Value, name: []const u8) ?Value {
+    if (t.len != 2 or t[1] != .list) return null;
+    if (std.mem.eql(u8, name, "grouper")) return t[0];
+    if (std.mem.eql(u8, name, "list")) return t[1];
+    return null;
+}
+
+fn groupLess(keys: []const Value, a: usize, b: usize) bool {
+    return value.compare(.lt, keys[a], keys[b]) catch false;
+}
+
+fn fGroupby(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const items = try seq(ctx, input);
+    const attr = args.get(0, "attribute") orelse return error.BadArgument;
+    const dflt: Value = args.get(1, "default") orelse .none;
+    const case_sensitive = boolArg(args, 2, "case_sensitive", false);
+    const keys = try ctx.arena.alloc(Value, items.len);
+    for (items, 0..) |it, i| {
+        var k = try attrOf(ctx, it, attr);
+        if (k == .undef) k = dflt;
+        // `ignore_case` is the `postprocess` of the attribute getter, so the
+        // grouper itself is the lower-cased key.
+        if (!case_sensitive and k == .string) k = Value.str(try lowerStr(ctx, k.string.bytes));
+        keys[i] = k;
+    }
+    // `sorted(…, key=expr)` raises `TypeError` for keys that do not order.
+    if (keys.len > 1) {
+        const numeric = keys[0] == .integer or keys[0] == .float or keys[0] == .boolean;
+        for (keys) |k| {
+            const n = k == .integer or k == .float or k == .boolean;
+            if (numeric) {
+                if (!n) return error.TypeMismatch;
+            } else if (keys[0] != .string or k != .string) return error.TypeMismatch;
+        }
+    }
+    const order = try ctx.arena.alloc(usize, items.len);
+    for (order, 0..) |*o, i| o.* = i;
+    std.sort.block(usize, order, keys, groupLess);
+    var out: std.ArrayList(Value) = .empty;
+    var i: usize = 0;
+    while (i < order.len) {
+        var j = i + 1;
+        while (j < order.len and value.valueEql(keys[order[i]], keys[order[j]])) j += 1;
+        const members = try ctx.arena.alloc(Value, j - i);
+        for (members, order[i..j]) |*m, idx| m.* = items[idx];
+        const pair = try ctx.arena.alloc(Value, 2);
+        pair[0] = keys[order[i]];
+        pair[1] = .{ .list = members };
+        try out.append(ctx.arena, .{ .tuple = pair });
+        i = j;
+    }
+    return .{ .list = out.items };
+}
+
 // ── registry ────────────────────────────────────────────────────────────────
 
 pub const builtin_filters = [_]Entry{
@@ -1518,9 +1654,12 @@ pub const builtin_filters = [_]Entry{
     .{ .name = "dictsort", .func = fDictsort },
     .{ .name = "e", .func = fEscape },
     .{ .name = "escape", .func = fEscape },
+    .{ .name = "filesizeformat", .func = fFilesizeformat },
     .{ .name = "first", .func = fFirst },
     .{ .name = "float", .func = fFloat },
     .{ .name = "forceescape", .func = fForceEscape },
+    .{ .name = "format", .func = fFormat },
+    .{ .name = "groupby", .func = fGroupby },
     .{ .name = "indent", .func = fIndent },
     .{ .name = "int", .func = fInt },
     .{ .name = "items", .func = fItems },
@@ -1553,6 +1692,7 @@ pub const builtin_filters = [_]Entry{
     .{ .name = "upper", .func = fUpper },
     .{ .name = "urlencode", .func = fUrlencode },
     .{ .name = "wordcount", .func = fWordcount },
+    .{ .name = "wordwrap", .func = fWordwrap },
     .{ .name = "xmlattr", .func = fXmlattr },
 };
 
@@ -1654,22 +1794,12 @@ fn tDivisibleby(ctx: *Ctx, input: Value, args: Args) Error!bool {
 fn tUpperTest(ctx: *Ctx, input: Value, args: Args) Error!bool {
     _ = args;
     const s = try ctx.toStr(input);
-    var has_alpha = false;
-    for (s) |c| {
-        if (std.ascii.isAlphabetic(c)) has_alpha = true;
-        if (std.ascii.isLower(c)) return false;
-    }
-    return has_alpha;
+    return ut.isUpper(s, case_opts) catch false;
 }
 fn tLowerTest(ctx: *Ctx, input: Value, args: Args) Error!bool {
     _ = args;
     const s = try ctx.toStr(input);
-    var has_alpha = false;
-    for (s) |c| {
-        if (std.ascii.isAlphabetic(c)) has_alpha = true;
-        if (std.ascii.isUpper(c)) return false;
-    }
-    return has_alpha;
+    return ut.isLower(s, case_opts) catch false;
 }
 
 fn cmpTest(comptime op: value.CmpOp) TestFn {
@@ -1682,6 +1812,36 @@ fn cmpTest(comptime op: value.CmpOp) TestFn {
     }.f;
 }
 
+fn tCallable(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    _ = args;
+    // A macro (and the `loop` object, whose `__call__` always exists) are the
+    // only callables a value can be here.
+    return input == .macro or input == .loop;
+}
+
+/// `is sameas`: Python `is`. `None`, booleans and small scalars are
+/// singletons/interned in CPython, so they compare by value; containers and
+/// the mutable objects by identity.
+fn tSameas(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = ctx;
+    const other = args.get(0, "other") orelse return error.BadArgument;
+    return switch (input) {
+        .undef => other == .undef,
+        .none => other == .none,
+        .boolean => |b| other == .boolean and other.boolean == b,
+        .integer => |i| other == .integer and other.integer == i,
+        .float => false,
+        .string => |sv| other == .string and sv.safe == other.string.safe and std.mem.eql(u8, sv.bytes, other.string.bytes),
+        .list => |l| other == .list and l.ptr == other.list.ptr and l.len == other.list.len,
+        .tuple => |l| other == .tuple and l.ptr == other.tuple.ptr and l.len == other.tuple.len,
+        .map => |m| other == .map and m.pairs.ptr == other.map.pairs.ptr and m.pairs.len == other.map.pairs.len,
+        .namespace => |n| other == .namespace and n == other.namespace,
+        .loop => |n| other == .loop and n == other.loop,
+        .macro => |m| other == .macro and m.impl == other.macro.impl,
+    };
+}
+
 fn tIn(ctx: *Ctx, input: Value, args: Args) Error!bool {
     _ = ctx;
     const container = args.get(0, "seq") orelse return error.BadArgument;
@@ -1690,6 +1850,7 @@ fn tIn(ctx: *Ctx, input: Value, args: Args) Error!bool {
 
 pub const builtin_tests = [_]TestEntry{
     .{ .name = "boolean", .func = tBoolean },
+    .{ .name = "callable", .func = tCallable },
     .{ .name = "defined", .func = tDefined },
     .{ .name = "divisibleby", .func = tDivisibleby },
     .{ .name = "eq", .func = cmpTest(.eq) },
@@ -1713,6 +1874,7 @@ pub const builtin_tests = [_]TestEntry{
     .{ .name = "none", .func = tNone },
     .{ .name = "number", .func = tNumber },
     .{ .name = "odd", .func = tOdd },
+    .{ .name = "sameas", .func = tSameas },
     .{ .name = "sequence", .func = tSequence },
     .{ .name = "string", .func = tString },
     .{ .name = "true", .func = tTrue },

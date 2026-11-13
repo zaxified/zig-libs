@@ -40,7 +40,7 @@
 //! `{% from … import … as … %}`; `{% macro %}` with defaults, `varargs`,
 //! `kwargs` and introspection attributes; `{% call %}` / `caller()`. Without a
 //! loader those tags are `error.NoLoader`, never a quiet nothing. What remains
-//! unimplemented (i18n, the `{% autoescape %}` block, eight filters) is a
+//! unimplemented (i18n, the `{% autoescape %}` block, four filters) is a
 //! compile error naming it — see SPEC.md §6.
 //!
 //! ## Two things a caller must decide, and this module refuses to guess
@@ -80,7 +80,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "Jinja2 3.1.x (pallets/jinja) — behaviour anchored byte-for-byte against it",
-    .deps = .{}, // std only
+    .deps = .{"unitext"},
 };
 
 const lexer = @import("lexer.zig");
@@ -443,6 +443,7 @@ test {
     _ = @import("filters.zig");
     _ = @import("diag.zig");
     _ = @import("engine_test.zig");
+    _ = @import("scope_test.zig");
     _ = @import("conform.zig");
     _ = @import("reference_replay_test.zig");
     _ = @import("bench.zig");

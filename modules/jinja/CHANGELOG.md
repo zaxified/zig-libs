@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — New filters `format` (Python `%`, exact float rounding), `groupby`, `wordwrap` (`textwrap.wrap`), `filesizeformat`; new tests `sameas`, `callable`; `upper`/`lower`/`capitalize`/`title`, `is upper`/`is lower` and the case folding of `sort`/`min`/`max`/`unique` now use full Unicode case mapping through the new `unitext` dependency (ill-formed UTF-8 passes through). A template that used to fail to compile on these names now renders; a non-ASCII string through a case filter now changes where it used to stay as is.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.

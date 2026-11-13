@@ -20,7 +20,7 @@ is HTML-escaped — are explicit options rather than defaults you discover in
 production.
 
 Anything the reference has that this does not — i18n (`{% trans %}`), the
-`{% autoescape %}` block, eight filters, four tests, three globals — is a
+`{% autoescape %}` block, four filters, two tests, three globals — is a
 **compile error naming the tag or name**, never a silent no-op. `SPEC.md` §6
 lists every one.
 
@@ -304,16 +304,17 @@ surface halfway through a render", which was a false absolute.
 |---|---|---|---|
 | `abs` | `batch` | `capitalize` | `center` |
 | `count` | `d` | `default` | `dictsort` |
-| `e` | `escape` | `first` | `float` |
-| `forceescape` | `indent` | `int` | `items` |
-| `join` | `last` | `length` | `list` |
-| `lower` | `map` | `max` | `min` |
-| `reject` | `rejectattr` | `replace` | `reverse` |
-| `round` | `safe` | `select` | `selectattr` |
-| `slice` | `sort` | `string` | `striptags` |
-| `sum` | `title` | `tojson` | `trim` |
-| `truncate` | `unique` | `upper` | `urlencode` |
-| `wordcount` | `xmlattr` | | |
+| `e` | `escape` | `filesizeformat` | `first` |
+| `float` | `forceescape` | `format` | `groupby` |
+| `indent` | `int` | `items` | `join` |
+| `last` | `length` | `list` | `lower` |
+| `map` | `max` | `min` | `reject` |
+| `rejectattr` | `replace` | `reverse` | `round` |
+| `safe` | `select` | `selectattr` | `slice` |
+| `sort` | `string` | `striptags` | `sum` |
+| `title` | `tojson` | `trim` | `truncate` |
+| `unique` | `upper` | `urlencode` | `wordcount` |
+| `wordwrap` | `xmlattr` | | |
 
 Keyword arguments work as in the reference (`sort(reverse=true,
 attribute='n')`, `join(', ', attribute='name')`, `default('x', true)`,
@@ -321,9 +322,9 @@ attribute='n')`, `join(', ', attribute='name')`, `default('x', true)`,
 `min`, `max`, `unique` and `dictsort` are case-**insensitive** by default, as
 there.
 
-Filters deliberately **not** implemented — `attr`, `filesizeformat`, `format`,
-`groupby`, `pprint`, `random`, `urlize`, `wordwrap` — and why, are listed in
-`SPEC.md` §6.
+Filters not implemented — `attr`, `pprint`, `random`, `urlize` — and why, are listed in
+`SPEC.md` §6; `SPEC.md` §6.1 compares the whole builtin set with Jinja2 3.1.
+`upper`, `lower`, `capitalize` and `title` use full Unicode case mapping.
 
 ### Registering your own
 
@@ -344,10 +345,10 @@ name resolution happens at compile time.
 
 ## Tests
 
-`boolean` · `defined` · `divisibleby` · `eq` · `equalto` · `escaped` · `even` ·
+`boolean` · `callable` · `defined` · `divisibleby` · `eq` · `equalto` · `escaped` · `even` ·
 `false` · `float` · `ge` · `greaterthan` · `gt` · `in` · `integer` ·
 `iterable` · `le` · `lessthan` · `lower` · `lt` · `mapping` · `ne` · `none` ·
-`number` · `odd` · `sequence` · `string` · `true` · `undefined` · `upper`
+`number` · `odd` · `sameas` · `sequence` · `string` · `true` · `undefined` · `upper`
 
 Both call forms work: `x is divisibleby(3)` and `x is divisibleby 3`, and
 `is not` negates.

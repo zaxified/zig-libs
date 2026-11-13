@@ -325,7 +325,7 @@ pub const module_list = [_]Module{
     .{ .name = "json5", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "ini", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "yaml", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
-    .{ .name = "jinja", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
+    .{ .name = "jinja", .libs = &.{"format"}, .deps = &.{"unitext"}, .test_deps = &.{"testkit"} },
     .{ .name = "cbor", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "protobuf", .libs = &.{ "format", "web" }, .test_deps = &.{"testkit"} },
     .{ .name = "grpc", .libs = &.{"web"}, .deps = &.{ "http", "protobuf", "b64ct", "clock" }, .test_deps = &.{"testkit"} },
