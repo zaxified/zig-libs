@@ -630,6 +630,330 @@ test "an allocation failure is an error, not a panic" {
     try testing.expectError(error.OutOfMemory, arbitrary([8][]const u8, Rng, &rng, fa.allocator(), .{}));
 }
 
+// ── mutation delta 2026-11-13: every draw pinned by a script ─────────────────
+//
+// `ScriptSource` reads big-endian octets and reduces modulo the span, so a
+// script chooses each branch and each boundary exactly; the random tests above
+// only see them on average.
+
+fn scripted(a: std.mem.Allocator, comptime T: type, script: []const u8, comptime opts: ArbOptions) !T {
+    var src: ScriptSource = .init(script);
+    return arbitrary(T, ScriptSource, &src, a, opts);
+}
+
+fn expectIntArms(comptime T: type) !void {
+    var arena = newArena();
+    defer arena.deinit();
+    const info = @typeInfo(T).int;
+    const lo = std.math.minInt(T);
+    const hi = std.math.maxInt(T);
+    const one: T = if (info.signedness == .signed and info.bits == 1) -1 else 1;
+    const want = [_]T{ 0, one, if (info.signedness == .signed) -1 else hi, lo, hi, lo +% 1, hi -% 1 };
+    for (want, 0..) |w, k| {
+        try testing.expectEqual(w, try scripted(arena.allocator(), T, &.{@intCast(k)}, .{}));
+    }
+    // 7 and 63 are the uniform draw: the octets that follow, big-endian.
+    const octets = [_]u8{ 0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78 };
+    const n = @max(1, info.bits / 8);
+    const U = @Int(.unsigned, info.bits);
+    const uniform: T = if (info.bits <= 8) @bitCast(@as(U, @truncate(octets[0]))) else @bitCast(std.mem.readInt(U, octets[0..n], .big));
+    for ([_]u8{ 7, 8, 62, 63 }) |sel| {
+        try testing.expectEqual(uniform, try scripted(arena.allocator(), T, &([_]u8{sel} ++ octets), .{}));
+    }
+}
+
+test "integer draw: the selector octet picks exactly 0, 1, -1/max, min, max, min+1, max-1, else uniform" {
+    var arena = newArena();
+    defer arena.deinit();
+    try expectIntArms(u1);
+    try expectIntArms(i1);
+    try expectIntArms(u8);
+    try expectIntArms(i8);
+    try expectIntArms(u16);
+    try expectIntArms(i16);
+    try expectIntArms(u32);
+    try expectIntArms(i64);
+    try expectIntArms(u128);
+    try expectIntArms(i128);
+    // u0 draws nothing.
+    try testing.expectEqual(@as(u0, 0), try scripted(arena.allocator(), u0, &.{5}, .{}));
+}
+
+test "integer draw: edges are about 1 in 9 and the uniform part is wide" {
+    var prng = std.Random.DefaultPrng.init(61);
+    var rng: Rng = .{ .r = prng.random() };
+    var arena = newArena();
+    defer arena.deinit();
+    const edge = [_]i64{ 0, 1, -1, std.math.minInt(i64), std.math.maxInt(i64), std.math.minInt(i64) + 1, std.math.maxInt(i64) - 1 };
+    var counts: [edge.len]usize = @splat(0);
+    var wide: usize = 0;
+    const draws = 64_000;
+    for (0..draws) |_| {
+        const v = try arbitrary(i64, Rng, &rng, arena.allocator(), .{});
+        for (edge, 0..) |e, k| {
+            if (v == e) counts[k] += 1;
+        }
+        if (v > (1 << 40) or v < -(1 << 40)) wide += 1;
+    }
+    // Each arm is 1 draw in 64 (expected 1000, sigma 31).
+    for (counts) |c| try testing.expect(c > 700 and c < 1300);
+    try testing.expect(wide > draws / 2);
+    // The unsigned maximum has two arms (2 in 64).
+    var hi: usize = 0;
+    for (0..draws) |_| {
+        if (try arbitrary(u64, Rng, &rng, arena.allocator(), .{}) == std.math.maxInt(u64)) hi += 1;
+    }
+    try testing.expect(hi > 1600 and hi < 2400);
+}
+
+fn bitsOf(comptime F: type, v: F) @Int(.unsigned, @bitSizeOf(F)) {
+    return @bitCast(v);
+}
+
+fn expectFloatArms(comptime F: type) !void {
+    var arena = newArena();
+    defer arena.deinit();
+    const U = @Int(.unsigned, @bitSizeOf(F));
+    const want = [_]F{
+        0.0,
+        1.0,
+        -1.0,
+        std.math.copysign(@as(F, 0.0), @as(F, -1.0)),
+        std.math.inf(F),
+        -std.math.inf(F),
+        std.math.nan(F),
+        std.math.floatTrueMin(F),
+        std.math.floatMax(F),
+        -std.math.floatMax(F),
+        std.math.floatMin(F),
+    };
+    for (want, 0..) |w, k| {
+        const got = try scripted(arena.allocator(), F, &.{@intCast(k)}, .{});
+        if (k == 6) {
+            try testing.expect(std.math.isNan(got));
+            // ... and 0.0 where NaN is off.
+            try testing.expectEqual(bitsOf(F, 0.0), bitsOf(F, try scripted(arena.allocator(), F, &.{6}, .{ .float_nan = false })));
+        } else {
+            try testing.expectEqual(bitsOf(F, w), bitsOf(F, got));
+        }
+    }
+    // 11: a small integer, 0..=1024 (span 1024, two octets, reduced mod 1025).
+    try testing.expectEqual(@as(F, 1024.0), try scripted(arena.allocator(), F, &.{ 11, 0x04, 0x00 }, .{}));
+    try testing.expectEqual(@as(F, 42.0), try scripted(arena.allocator(), F, &.{ 11, 0x00, 0x2a }, .{}));
+    try testing.expectEqual(@as(F, 0.0), try scripted(arena.allocator(), F, &.{ 11, 0x04, 0x01 }, .{}));
+    // 12 and 63: the bit pattern of the next octets.
+    const octets = [_]u8{ 0x3f, 0x80, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc };
+    const bits = @bitSizeOf(F);
+    const pat: U = std.mem.readInt(U, octets[0 .. bits / 8], .big);
+    for ([_]u8{ 12, 13, 63 }) |sel| {
+        try testing.expectEqual(pat, bitsOf(F, try scripted(arena.allocator(), F, &([_]u8{sel} ++ octets), .{})));
+    }
+}
+
+test "float draw: the selector octet picks each edge; 12.. is the raw bit pattern" {
+    var arena = newArena();
+    defer arena.deinit();
+    try expectFloatArms(f16);
+    try expectFloatArms(f32);
+    try expectFloatArms(f64);
+    try expectFloatArms(f128);
+    // f80 draws an f64 pattern and widens it.
+    const pi_octets = [_]u8{ 0x40, 0x09, 0x21, 0xfb, 0x54, 0x44, 0x2d, 0x18 };
+    const want: f80 = @floatCast(@as(f64, @bitCast(std.mem.readInt(u64, &pi_octets, .big))));
+    try testing.expectEqual(want, try scripted(arena.allocator(), f80, &([_]u8{20} ++ pi_octets), .{}));
+    // NaN filter: the pattern 0x7fc00000 is a NaN; with float_nan = false it is 0.0.
+    const nan_pat = [_]u8{ 20, 0x7f, 0xc0, 0x00, 0x00 };
+    try testing.expect(std.math.isNan(try scripted(arena.allocator(), f32, &nan_pat, .{})));
+    try testing.expectEqual(@as(u32, 0), bitsOf(f32, try scripted(arena.allocator(), f32, &nan_pat, .{ .float_nan = false })));
+}
+
+test "bool, optional, enum and union draws follow the script" {
+    var arena = newArena();
+    defer arena.deinit();
+    try testing.expect(!try scripted(arena.allocator(), bool, &.{0}, .{}));
+    try testing.expect(try scripted(arena.allocator(), bool, &.{1}, .{}));
+    try testing.expect(!try scripted(arena.allocator(), bool, &.{2}, .{}));
+    // Optional: only draw 0 is null (of 0..7).
+    try testing.expectEqual(@as(?u8, null), try scripted(arena.allocator(), ?u8, &.{0}, .{}));
+    try testing.expectEqual(@as(?u8, 1), try scripted(arena.allocator(), ?u8, &.{ 1, 1 }, .{}));
+    try testing.expectEqual(@as(?u8, 255), try scripted(arena.allocator(), ?u8, &.{ 7, 4 }, .{}));
+    try testing.expectEqual(@as(?u8, null), try scripted(arena.allocator(), ?u8, &.{8}, .{})); // 8 % 8 == 0
+    // Exhaustive enum: one index draw, no unnamed branch.
+    try testing.expectEqual(Color.green, try scripted(arena.allocator(), Color, &.{7}, .{}));
+    try testing.expectEqual(Color.blue, try scripted(arena.allocator(), Color, &.{2}, .{}));
+    try testing.expectEqual(Color.red, try scripted(arena.allocator(), Color, &.{0}, .{}));
+    // Non-exhaustive: 7 of 0..7 is an unnamed value, else a named one.
+    try testing.expectEqual(Open.a, try scripted(arena.allocator(), Open, &.{0}, .{}));
+    try testing.expectEqual(Open.b, try scripted(arena.allocator(), Open, &.{ 6, 1 }, .{}));
+    try testing.expectEqual(@as(Open, @fromBackingInt(@intCast(0x5a))), try scripted(arena.allocator(), Open, &.{ 7, 7, 0x5a }, .{}));
+    try testing.expectEqual(@as(Open, @fromBackingInt(@intCast(255))), try scripted(arena.allocator(), Open, &.{ 7, 4 }, .{}));
+    // Non-exhaustive with no named value: the unnamed branch, without a selector draw.
+    const Bare = enum(u8) { _ };
+    try testing.expectEqual(@as(Bare, @fromBackingInt(@intCast(1))), try scripted(arena.allocator(), Bare, &.{1}, .{}));
+    // Union: the tag is one index draw, then the payload.
+    try testing.expectEqual(Shape.dot, try scripted(arena.allocator(), Shape, &.{0}, .{}));
+    try testing.expectEqual(Shape{ .circle = 255 }, try scripted(arena.allocator(), Shape, &.{ 1, 4 }, .{}));
+    try testing.expectEqual(Shape{ .circle = 0 }, try scripted(arena.allocator(), Shape, &.{ 4, 0 }, .{})); // 4 % 3
+    try testing.expectEqual(Shape{ .rect = .{ .w = 1, .h = 65535 } }, try scripted(arena.allocator(), Shape, &.{ 2, 1, 4 }, .{}));
+    // Arrays, vectors, structs and tuples draw every slot, in order.
+    try testing.expectEqualSlices(u8, &.{ 1, 255, 0 }, &(try scripted(arena.allocator(), [3]u8, &.{ 1, 2, 3 }, .{})));
+    const vec = try scripted(arena.allocator(), @Vector(3, u8), &.{ 1, 2, 3 }, .{});
+    try testing.expectEqualSlices(u8, &.{ 1, 255, 0 }, &@as([3]u8, vec));
+    const St = struct { a: u8, b: u8, c: u8 };
+    try testing.expectEqual(St{ .a = 1, .b = 255, .c = 0 }, try scripted(arena.allocator(), St, &.{ 1, 2, 3 }, .{}));
+    const tup = try scripted(arena.allocator(), struct { u8, u8, u8 }, &.{ 1, 2, 3 }, .{});
+    try testing.expectEqual(@as(u8, 255), tup[1]);
+    try testing.expectEqual(@as(u8, 0), tup[2]);
+}
+
+test "depth: an optional is a level, an array/struct/union field is not, a slice element is" {
+    var arena = newArena();
+    defer arena.deinit();
+    const ones: [64]u8 = @splat(1);
+    const o1: ArbOptions = .{ .max_depth = 1 };
+    // Fields of containers sit at the container's own depth: still some at depth 0.
+    try testing.expectEqual([3]?u8{ 1, 1, 1 }, try scripted(arena.allocator(), [3]?u8, &ones, o1));
+    const S2 = struct { a: ?u8, b: ?u8 };
+    try testing.expectEqual(S2{ .a = 1, .b = 1 }, try scripted(arena.allocator(), S2, &ones, o1));
+    const U2 = union(enum) { x: ?u8 };
+    try testing.expectEqual(U2{ .x = 1 }, try scripted(arena.allocator(), U2, &ones, o1));
+    // The optional's payload is one level down: a slice in it is empty at max_depth 1, one octet at 2.
+    const a = try scripted(arena.allocator(), ?[]const u8, &ones, o1);
+    try testing.expect(a != null and a.?.len == 0);
+    var src: ScriptSource = .init(&ones);
+    const b = try arbitrary(?[]const u8, ScriptSource, &src, arena.allocator(), .{ .max_depth = 2 });
+    try testing.expectEqualSlices(u8, &.{1}, b.?);
+    // A slice's elements are one level down: null at max_depth 1, some at 2.
+    var src2: ScriptSource = .init(&ones);
+    const c = try arbitrary([]const ?u8, ScriptSource, &src2, arena.allocator(), o1);
+    try testing.expectEqual(@as(usize, 1), c.len);
+    try testing.expectEqual(@as(?u8, null), c[0]);
+    var src3: ScriptSource = .init(&ones);
+    const d = try arbitrary([]const ?u8, ScriptSource, &src3, arena.allocator(), .{ .max_depth = 2 });
+    try testing.expectEqual(@as(?u8, 1), d[0]);
+    // The same for a sentinel slice (its own loop).
+    var src4: ScriptSource = .init(&ones);
+    const e = try arbitrary([:null]const ?u8, ScriptSource, &src4, arena.allocator(), o1);
+    try testing.expectEqual(@as(usize, 1), e.len);
+    try testing.expectEqual(@as(?u8, null), e[0]);
+    var src5: ScriptSource = .init(&ones);
+    const f = try arbitrary([:null]const ?u8, ScriptSource, &src5, arena.allocator(), .{ .max_depth = 2 });
+    try testing.expectEqual(@as(?u8, 1), f[0]);
+    // A chain through an optional slice: depth counts two levels a step.
+    const Chain = struct { next: ?[]const @This() };
+    var src6: ScriptSource = .init(&ones);
+    const ch = try arbitrary(Chain, ScriptSource, &src6, arena.allocator(), .{ .max_depth = 2 });
+    // root (depth 0): optional -> 1, slice at 1 (n = 1), element at depth 2: its optional is null.
+    try testing.expectEqual(@as(usize, 1), ch.next.?.len);
+    try testing.expectEqual(@as(?[]const Chain, null), ch.next.?[0].next);
+}
+
+test "slice length: 0..=max_len exactly, and .any bytes are the script's octets" {
+    var arena = newArena();
+    defer arena.deinit();
+    // index(max_len + 1): 16 is the longest, 17 wraps to 0.
+    const run16 = [_]u8{16} ++ [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    try testing.expectEqualSlices(u8, run16[1..], try scripted(arena.allocator(), []const u8, &run16, .{}));
+    try testing.expectEqual(@as(usize, 0), (try scripted(arena.allocator(), []const u8, &[_]u8{17} ++ run16, .{})).len);
+    try testing.expectEqual(@as(usize, 0), (try scripted(arena.allocator(), []const u8, &.{0}, .{})).len);
+    // One octet, and an empty slice that draws nothing before the next one.
+    try testing.expectEqualSlices(u8, &.{9}, try scripted(arena.allocator(), []const u8, &.{ 1, 9 }, .{}));
+    const two = try scripted(arena.allocator(), [2][]const u8, &.{ 0, 3, 7, 8, 9 }, .{});
+    try testing.expectEqual(@as(usize, 0), two[0].len);
+    try testing.expectEqualSlices(u8, &.{ 7, 8, 9 }, two[1]);
+    // A wider max_len spans two octets.
+    const big = try scripted(arena.allocator(), []const u8, &([_]u8{ 0x01, 0x2c } ++ @as([300]u8, @splat(0xee))), .{ .max_len = 400 });
+    try testing.expectEqual(@as(usize, 300), big.len);
+    // A slice of non-bytes draws each element (selector octet 1 -> 1).
+    try testing.expectEqualSlices(u16, &.{ 1, 1 }, try scripted(arena.allocator(), []const u16, &.{ 2, 1, 1 }, .{}));
+}
+
+test "ascii_printable: 0x20 and 0x7e both reachable, nothing outside" {
+    var arena = newArena();
+    defer arena.deinit();
+    try testing.expectEqualStrings(" ~ ", try scripted(arena.allocator(), []const u8, &.{ 3, 0, 94, 95 }, .{ .bytes = .ascii_printable }));
+    const z = try scripted(arena.allocator(), [:0]const u8, &.{ 2, 5, 6 }, .{ .bytes = .ascii_printable });
+    try testing.expectEqualStrings("%&", z);
+    try testing.expectEqual(@as(u8, 0), z[z.len]);
+}
+
+fn expectOneCp(script: []const u8, want: []const u8) !void {
+    var arena = newArena();
+    defer arena.deinit();
+    const s = try scripted(arena.allocator(), []const u8, script, .{ .bytes = .utf8 });
+    try testing.expectEqualSlices(u8, want, s);
+    try testing.expect(std.unicode.utf8ValidateSlice(s));
+}
+
+test "utf8: every class, boundary and edge pinned by a script" {
+    var arena = newArena();
+    defer arena.deinit();
+    // n = 1 code point; then the class octet and the range octets.
+    try expectOneCp(&.{ 1, 0, 0x7f }, "\x7f");
+    try expectOneCp(&.{ 1, 1, 0x41 }, "A");
+    try expectOneCp(&.{ 1, 2, 0x42 }, "B");
+    try expectOneCp(&.{ 1, 3, 0x43 }, "C");
+    try expectOneCp(&.{ 1, 3, 0x80 }, "\x00"); // span 0x7f: 0x80 wraps
+    try expectOneCp(&.{ 1, 4, 0x07, 0x7f }, "\xdf\xbf"); // U+07FF
+    try expectOneCp(&.{ 1, 4, 0x07, 0x80 }, "\xc2\x80"); // wraps to U+0080
+    try expectOneCp(&.{ 1, 4, 0x00, 0x00 }, "\xc2\x80");
+    try expectOneCp(&.{ 1, 5, 0x00, 0x00 }, "\xe0\xa0\x80"); // U+0800
+    try expectOneCp(&.{ 1, 5, 0xcf, 0xff }, "\xed\x9f\xbf"); // U+D7FF, the last before the gap
+    try expectOneCp(&.{ 1, 5, 0xd0, 0x00 }, "\xee\x80\x80"); // jumps to U+E000
+    try expectOneCp(&.{ 1, 5, 0xef, 0xff }, "\xef\xbf\xbf"); // U+FFFF
+    try expectOneCp(&.{ 1, 5, 0xf0, 0x00 }, "\xe0\xa0\x80"); // wraps to U+0800
+    try expectOneCp(&.{ 1, 6, 0x00, 0x00, 0x00 }, "\xf0\x90\x80\x80"); // U+10000
+    try expectOneCp(&.{ 1, 6, 0x0f, 0xff, 0xff }, "\xf4\x8f\xbf\xbf"); // U+10FFFF
+    try expectOneCp(&.{ 1, 6, 0x10, 0x00, 0x00 }, "\xf0\x90\x80\x80"); // wraps
+    // Class 7 (and 15 % 8): one of the ten edges by index.
+    const edges = [_][]const u8{
+        "\x7f",         "\xc2\x80",     "\xdf\xbf",     "\xe0\xa0\x80",     "\xed\x9f\xbf",
+        "\xee\x80\x80", "\xef\xbf\xbd", "\xef\xbf\xbf", "\xf0\x90\x80\x80", "\xf4\x8f\xbf\xbf",
+    };
+    for (edges, 0..) |e, k| {
+        try expectOneCp(&.{ 1, 7, @intCast(k) }, e);
+        try expectOneCp(&.{ 1, 15, @intCast(k) }, e);
+    }
+    const four_cp = "\xf4\x8f\xbf\xbf\xf4\x8f\xbf\xbf\xf4\x8f\xbf\xbf";
+    // Several four-byte code points fill a 4-byte-per-point buffer exactly.
+    const four = [_]u8{ 3, 6, 0x0f, 0xff, 0xff, 6, 0x0f, 0xff, 0xff, 6, 0x0f, 0xff, 0xff };
+    try testing.expectEqualStrings(four_cp, try scripted(arena.allocator(), []const u8, &four, .{ .bytes = .utf8 }));
+    // A sentinel slice holds the same bytes, with its sentinel after them.
+    const z = try scripted(arena.allocator(), [:0]const u8, &four, .{ .bytes = .utf8 });
+    try testing.expectEqual(@as(usize, 12), z.len);
+    try testing.expectEqualStrings(four_cp, z);
+    try testing.expectEqual(@as(u8, 0), z[z.len]);
+    // Mixed lengths: the byte length is the sum of the encoded lengths.
+    try testing.expectEqualStrings("A\xc2\x80\xe0\xa0\x80", try scripted(arena.allocator(), []const u8, &.{ 3, 0, 0x41, 4, 0, 0, 5, 0, 0 }, .{ .bytes = .utf8 }));
+}
+
+fn expectOom(comptime T: type, comptime opts: ArbOptions, fail_index: usize) !void {
+    var mem: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    var fa: testing.FailingAllocator = .init(fba.allocator(), .{ .fail_index = fail_index });
+    var src: ScriptSource = .init(&@as([64]u8, @splat(3)));
+    try testing.expectError(error.OutOfMemory, arbitrary(T, ScriptSource, &src, fa.allocator(), opts));
+}
+
+test "an allocation failure at any site is error.OutOfMemory (three octets per slice)" {
+    inline for (.{ .any, .ascii_printable, .utf8 }) |mode| {
+        const o: ArbOptions = .{ .bytes = mode };
+        try expectOom([]const u8, o, 0);
+        try expectOom([:0]const u8, o, 0);
+        try expectOom([:0]const u8, o, 1); // the sentinel copy
+    }
+    try expectOom([]const u16, .{}, 0);
+    try expectOom([:0]const u16, .{}, 0);
+    try expectOom([2][]const u8, .{}, 0);
+    try expectOom([2][]const u8, .{}, 1);
+    try expectOom(?[]const u8, .{}, 0);
+    try expectOom(struct { a: u8, b: []const u8 }, .{}, 0);
+    try expectOom(union(enum) { a: []const u8 }, .{}, 0);
+    try expectOom([]const []const u8, .{}, 0);
+    try expectOom([]const []const u8, .{}, 1);
+    try expectOom([]const ?[]const u8, .{}, 1);
+}
+
 // ── a failing property shrinks to a small typed value ────────────────────────
 
 const Rec = struct { x: i32, name: []const u8, opt: ?u8, tag: Color, pair: [2]u8 };
