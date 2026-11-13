@@ -1455,9 +1455,9 @@ tlsclient	ReleaseFast	cv	1	30	aac4ebb6ece329f8	a92e71f50313cf2b
 # copy; the three-suite loop is not unrolled. AES-256-GCM adds one tag-verdict context (its own AesGcm instantiation) in
 # app; in ku the three aesgcm verdict contexts become two. No new kind of site; no branch on a key or secret.
 # suitehash[.]zig added to the dtls patterns (source pin).
-dtls	ReleaseFast	hs	1	174	f995e94fb958f400	61a204df8edf79a0
+dtls	ReleaseFast	hs	1	174	e2bf56be34b962fb	61a204df8edf79a0
 # 2026-11-03 (re-pin from full CI 41622100028, counts only, not read by --stacks): dtls app 14 -> 13, down by one after chachapoly's short AEAD engine (no dtls source changed). Owner rule: no local ctgrind re-run.
-dtls	ReleaseFast	app	1	13	f995e94fb958f400	70da17057fd7a044
+dtls	ReleaseFast	app	1	13	e2bf56be34b962fb	70da17057fd7a044
 # 2026-11-13 (KeyUpdate / exporter / ALPN; local --stacks run, contexts read one by one): hs 120 -> 123 = +3 messages.zig
 # decodeExtensions on the DECRYPTED EncryptedExtensions (the client now parses it for the ALPN answer), class (b). app 13 -> 23:
 # per record the replay window (replayCheckAndUpdate, now reached through per-epoch pointers, so inlined once per record: 12)
@@ -1466,7 +1466,23 @@ dtls	ReleaseFast	app	1	13	f995e94fb958f400	70da17057fd7a044
 # exporter master secret tainted, a KeyUpdate each way (update_requested), the ACKs, records both ways on epoch 4, an
 # RFC 8446 §7.5 export, under AES-128-GCM and ChaCha20-Poly1305: 22 = the same class-(b) record sites as app plus
 # processAck's parsing of the decrypted ACK body (2) and its replay window (2). No branch on a key or secret.
-dtls	ReleaseFast	ku	1	21	f995e94fb958f400	505aa3fdd426f98d
+dtls	ReleaseFast	ku	1	21	e2bf56be34b962fb	505aa3fdd426f98d
+# 2026-11-13 (DTLS 1.2, Connection12; local --stacks run, contexts read by top frame and module chain). hs/app/ku
+# unchanged in count (174/13/21); their source digests move because Connection.zig gained the 1.2 Config fields, the
+# dual-version hello and the NegotiatedDtls12 gates (no tainted path touched). New rows:
+#   hs12 — three Connection12 handshakes: PSK AES-128-GCM and ECDHE_PSK ChaCha20 with the PSK tainted on both sides,
+#   ECDHE_ECDSA AES-256-GCM-SHA384 with the server's ephemeral ECDHE key tainted after its flight. 96 in-file, all class
+#   (a)/(b) of the dtls note above: the Finished verdicts (timing_safe.eql result, Connection12 606/647) and the AEAD tag
+#   verdicts of the epoch-1 Finished records (aesgcm root.zig:1048 x3, chachapoly root.zig:1207); everything else is the
+#   receiver working on the DECRYPTED Finished: handshake-header decoding (handshake.zig:91, Connection12 510-537),
+#   in-order reassembly and its memcpy into rx_msg (std memcpy.zig under 534), and message-type dispatch / order checks
+#   (Connection12 559, 571, 603, 620-627, and :0 inlined frames under processHandshakeRecord). The premaster, P_SHA256 /
+#   P_SHA384 (master secret, key block, verify_data), the ECDH shared secret and the record sealing add NO context.
+#   app12 — after untainted handshakes, both directions' record keys (key, implicit salt / IV) tainted, send/recv both
+#   ways under AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM: 3 in-file = the 3 AEAD tag verdicts. (The 1.2 record header
+#   is public, so unlike app there is no sequence-number or content-type context.) No branch on a key or secret.
+dtls	ReleaseFast	hs12	1	96	8d7fe3dc55f3ed40	d87712f4d6e60179
+dtls	ReleaseFast	app12	1	3	8d7fe3dc55f3ed40	a30c6f8f370c5fa7
 # tlsserver (2026-10-21) — hs: Server.feed on the plaintext ClientHello
 # records of five recorded sessions (P-256/X25519, P-256/X25519MLKEM768, P-384,
 # Ed25519, a HelloRetryRequest) up to the first flight, every octet of

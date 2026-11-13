@@ -279,7 +279,7 @@ declare -A TARGETS=(
     # ── 2026-10-10: ct-wave: TLS 1.3 client ephemerals/key schedule, client-auth key ──
     [tlsclient]="kex cv"
     # ── 2026-10-10: ct-wave: DTLS 1.3 PSK, key schedule, record keys ──
-    [dtls]="hs app ku"
+    [dtls]="hs app ku hs12 app12"
     # ── 2026-10-21: TLS 1.3 server first flight, record keys, ticket key ──
     [tlsserver]="hs app ticket ech"
     # ── 2026-10-10: ct-wave: QUIC 1-RTT traffic secret, packet + header protection ──
@@ -773,6 +773,8 @@ declare -A PATTERN=(
     [tlsserver/ech]='server[.]zig|record[.]zig|inbound[.]zig|outbound[.]zig|hello[.]zig|messages[.]zig|burn[.]zig|zeroize[.]zig|keys[.]zig|clientauth[.]zig|alert[.]zig|connection[.]zig|root[.]zig|ech[.]zig|delegated[.]zig|fingerprint[.]zig'
     [dtls/app]='Connection[.]zig|aead[.]zig|keyschedule[.]zig|record[.]zig|engine[.]zig|suitehash[.]zig|handshake[.]zig|flight[.]zig|messages[.]zig|burn[.]zig|root[.]zig'
     [dtls/ku]='Connection[.]zig|aead[.]zig|keyschedule[.]zig|record[.]zig|engine[.]zig|suitehash[.]zig|handshake[.]zig|flight[.]zig|messages[.]zig|burn[.]zig|root[.]zig'
+    [dtls/hs12]='Connection[.]zig|Connection12[.]zig|record12[.]zig|prf12[.]zig|sig12[.]zig|messages12[.]zig|suite12[.]zig|messages[.]zig|record[.]zig|handshake[.]zig|suitehash[.]zig|burn[.]zig|root[.]zig'
+    [dtls/app12]='Connection[.]zig|Connection12[.]zig|record12[.]zig|prf12[.]zig|sig12[.]zig|messages12[.]zig|suite12[.]zig|messages[.]zig|record[.]zig|handshake[.]zig|suitehash[.]zig|burn[.]zig|root[.]zig'
     [quic-crypto/aes]='keyschedule[.]zig|protection[.]zig|headerprot[.]zig|burn[.]zig|root[.]zig|version[.]zig'
     [quic-crypto/chacha]='keyschedule[.]zig|protection[.]zig|headerprot[.]zig|burn[.]zig|root[.]zig|version[.]zig'
     [megolm/msg]='session[.]zig|session_key[.]zig|ratchet[.]zig|cipher[.]zig|message[.]zig|pickle[.]zig|burn[.]zig|root[.]zig'
@@ -1153,6 +1155,8 @@ declare -A LABEL=(
     [dtls/hs]='dtls PSK handshake (psk tainted)'
     [dtls/app]='dtls send/recv AES-GCM+ChaCha (record keys tainted)'
     [dtls/ku]='dtls KeyUpdate both ways + exporter (traffic/exporter secrets tainted)'
+    [dtls/hs12]='dtls 1.2 PSK/ECDHE_PSK/ECDHE_ECDSA handshakes (psk / server ECDHE key tainted)'
+    [dtls/app12]='dtls 1.2 send/recv AES-GCM+ChaCha (record keys tainted)'
     [tlsserver/hs]='tlsserver ClientHello -> first flight (randomness + cert key tainted)'
     [tlsserver/app]='tlsserver record seal/open x3 suites (traffic secret tainted)'
     [tlsserver/ticket]='tlsserver ticket issue + resume (STEK tainted)'
