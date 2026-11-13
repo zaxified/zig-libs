@@ -90,6 +90,13 @@ carry, and the second/third fold's top word must be handled without a
 data-dependent branch. The differential (`oracle_test.zig`) pins it bit-for-bit to
 `reduceWide`.
 
+**2026-11-13:** `Fe.invert` is the constant-time safegcd (libsecp256k1's
+`secp256k1_modinv64`, a fixed 590 divsteps); the Fermat chain below is
+`invertChain`, its test oracle. Square roots still use the chain. `Fe.mul`/`Fe.sq`
+run the limb-level Zig form of the product + reduction (`mulLimbs`/`sqLimbs`,
+inlined); the amd64 asm core is no longer dispatched (its `memory` clobber cost
+~20 % of a verify), see `field.zig` § limb-level multiply.
+
 Inversion is Fermat (`a^(p−2)`) and square roots `a^((p+1)/4)` (valid because
 `p ≡ 3 mod 4`, BIP340's `lift_x` root), both through libsecp256k1's run-of-ones
 addition chain (`Fe.onesRuns`: `x_k = a^(2^k−1)` up to `x223`, then a fixed tail):
@@ -576,6 +583,13 @@ to the 8 official BIP340 sign vectors, now through the comb path.
 
 ### The comb (constant-time k·G) and its side-channel contract
 
+**2026-11-13: the comb is now w = 6 with an affine table** (`43 · 32 · 64 B =
+88 KiB`) and constant-time Jacobian mixed additions below the top window, the
+complete RCB mixed addition (`addMixed`) on it — `p256`'s layout; the proof that
+the incomplete addition never sees `P = O` or `P = ±Q` is at
+`combMulBaseWithTable`. The w = 4 description below is the previous layout,
+which `mul` (variable base) still uses for its per-call table.
+
 Window `w = 4`, `comb_t = 65` signed digits (a running-carry Booth recoding, so
 `Σ dᵢ·2^{w·i} = k` exactly, incl. the raw-scalar range to 2^256−1). Each window
 owns a table of `{1,…,2^{w−1}}·2^{w·i}·G`; the sign of a digit is a masked point
@@ -628,6 +642,7 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
     secp256k1 (prime order) but reachable by a hand-built `Secp256k1{…}` that is off the curve
     — every decoder (`fromSec1`, `fromAffineCoordinates`, `recoverY`) checks the curve, so only
     a caller bypassing them gets there. The RCB path gives a wrong point there instead.
+- **Speed toward libsecp256k1, 2026-11-13** (`bip340` bench vs libsecp256k1 v0.8.0): keypair 0.68–0.71×, sign 0.69–0.77× (no self-verify on either side), verify 1.12–1.16× — after CT safegcd inversion, the w = 6 affine comb, the inlined limb multiply, the integer GLV split and zero-run wNAF. Open for verify: lazy reduction (below, item 3), a wider G table (libsecp's window is 15, ours 10), and the limb multiply's instruction count. The secret-path `mul` (variable base, w = 4 projective, RCB) did not get the comb's treatment: an affine per-call table needs a constant-time batch inversion; not measured.
 - **Speed toward libsecp256k1.** 2026-10-07 perf over BIP340 verify: point add 36 %, double
   33 %, `lift_x` square root + affine inversion ~25 %. Done 2026-10-07: addition-chain
   inversion/sqrt, two-fold asm reduction, `ecmult` (Jacobian + mixed adds + affine G table)

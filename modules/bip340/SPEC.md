@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, BIP340_FUZZ, forgery check) · ct 2026-09-09 (ctgrind)
 
-**Performance:** ref 1.38–3.85× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-10-20)
+**Performance:** ref 0.68–1.16× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-11-13)
 
 **Known defects:** none recorded
 
@@ -136,9 +136,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   (e.g. a broken RNG feeding `aux_rand`, or a nonce-derivation bug) leaks
   `d` from two signatures via the standard Schnorr nonce-reuse algebra —
   this is the single highest-severity property `sign`'s implementation
-  must get right, which is exactly why BIP340 mandates the
-  self-verification step before `sign` returns (catches a large class of
-  such bugs, though not a broken RNG).
+  must get right, which is why BIP340 recommends a self-verification step
+  before `sign` returns (catches a large class of such bugs and induced
+  faults, though not a broken RNG; BIP340 allows omitting it when the cost
+  is prohibitive). **Here it is opt-in since 2026-11-13**
+  (`SignOptions.self_verify`, default off as in libsecp256k1 — owner
+  decision, reversing the 2026-10-07 one to always run it): it costs about
+  one `verify`, more than the signing itself.
 - **x-only / even-y convention**: every public key and every nonce point
   `R` is committed to the curve with an *implicit*, always-even y. This
   halves the search space per point (a real but small operational
@@ -194,8 +198,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 All three formerly-stubbed cores are implemented and KAT-validated
 (byte-exact against all 19 official vectors, Debug + ReleaseFast):
 
-1. **`sign`** — BIP340 "Default Signing", all 10 steps including the
-   mandatory self-verify-before-return (fails closed with
+1. **`sign`** — BIP340 "Default Signing", all 10 steps; step 10, the
+   self-verify-before-return, runs with `SignOptions.self_verify` (opt-in
+   since 2026-11-13, see Threat model; it fails closed with
    `error.SignatureVerificationFailed` instead of emitting a maybe-bad
    signature). Nonce/challenge hashes stream via `hash.taggedHasher`
    (the comptime tag midstate + `update` per part — no concatenation
@@ -299,9 +304,29 @@ check, the four burns (`sign`, `signFromSecretKey`'s, `fromSecretKey`'s, `comput
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-bip340`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 1.38–3.85×, against 1.30–3.99× before. The card carries these figures.
+**Measured 2026-11-13** (Zig 0.17.1, `zig build bench-bip340`, ReleaseFast, best of five per row, two runs on a host shared with other agents' jobs; libsecp256k1 v0.8.0 `zig cc -O3`, x86-64 asm, default tables). The card carries the range over both runs.
+
+| row | what it measures (both sides) | ours ns/op | libsecp256k1 ns/op | ours/ref |
+|---|---|--:|--:|--:|
+| keypair | secret key → x-only key (`KeyPair.fromSecretKey` / `keypair_create` + `keypair_xonly_pub`) | 14 616 – 14 729 | 20 771 – 21 625 | 0.68 – 0.71 |
+| sign | 32-byte message from a ready key pair, default options (`signWithKeyPair(…, .{})` / `schnorrsig_sign32`); neither side self-verifies | 16 816 – 17 105 | 22 263 – 24 506 | 0.69 – 0.77 |
+| verify | one signature under a key parsed once outside the loop (`LiftedPublicKey` + `verifyLifted` / `xonly_pubkey_parse` + `schnorrsig_verify`) | 41 412 – 41 786 | 36 141 – 37 110 | 1.12 – 1.16 |
+| verifyBatch | per signature, 64-signature batch (ours only) | ~40 000 | — | — |
+
+Earlier the same day the reference side read 33.3–35.8 µs for verify (ratio 1.16–1.25 for our 40.4–41.9 µs), so the verify ratio's spread is mostly the host's.
+
+Baseline before this work (same host, same day): keypair 27.3 µs (1.33×), sign 82.1 µs (3.58×, with the then-mandatory self-verify), verify 52.7 µs (1.44×, lifting the key on every call). What moved it:
+
+- **Self-verify opt-in** (owner decision 2026-11-13, `SignOptions.self_verify`, default off as in libsecp256k1): sign no longer pays a `verify`. When on, the check is projective (no inversion).
+- **k256, constant-time safegcd inversion** (libsecp's `modinv64`) replacing the Fermat chain in every secret `affineCoordinates`: about −5 µs on keypair and sign.
+- **k256, w = 6 affine comb** with constant-time Jacobian mixed additions (`p256`'s layout): 43 additions instead of 65 for every `k·G`. With the inversion: keypair 27 → 15 µs.
+- **k256, limb-level Zig field multiply, inlined**, instead of the asm block with a `memory` clobber: verify 52.8 → 41.9 µs.
+- **k256, integer GLV split + zero-run wNAF**, **bip340, integer `s`/`−e` in verify**, **`verifyLifted`**: verify 41.9 → ~40.4 µs.
+- Tried and dropped: a product-scanning (Comba) multiply (40.2 vs 40.4 µs, inside the noise).
 
 ## Backlog / deferred
+
+- **verify is 1.12–1.16× libsecp256k1 (P2 needs ≤ 1.1×), 2026-11-13.** Everything else is below 1.0. What remains is per-field-operation cost, not operation count: `ecmult` already has libsecp's shape (GLV + wNAF, P's table in one global-Z frame, an affine G table). The open levers, in k256: (1) lazily reduced field elements (libsecp's magnitude tracking), so add/sub skip the carry chain and masked select they pay now on canonical 4×64 limbs; (2) a wider G table — libsecp's default window is 15, ours 10 (~7 fewer mixed additions per verify, ~5 % by operation count; w = 12 had measured +0.6 % before the field changes, re-measure now); (3) the limb multiply's codegen (~1 300 instructions for one Jacobian doubling, ~2× a hand-scheduled MULX/ADX body without a memory clobber).
 
 - **Reviewed 2026-10-08** (line-by-line review of the current `src/`, after the 2026-10-07
   speed work: `signWithKeyPair`, the multi-base `verifyBatch`, `affineCoordinatesPublic` in
@@ -322,4 +347,4 @@ check, the four burns (`sign`, `signFromSecretKey`'s, `fromSecretKey`'s, `comput
     (`a·s·G − a·R − a·e·P`), G's scalar only in the last chunk, an identity partial sum
     contributes nothing, randomizers from `randomSecure` drawn after the batch is fixed;
     `verify` with `affineCoordinatesPublic` (public inputs only).
-- 2026-10-07: slower than the reference on every measured operation (`tools/bench.zig`, libsecp256k1 v0.8.0): keypair 1.56×, verify 2.56×, sign 7.37× (was 2.00/3.39/9.30 before the same-day k256 field change). `sign` = two fixed-base multiplies (public key per call, nonce point) + the BIP340 self-verification, which the owner decided to KEEP (2026-10-07: fault-injection guard; speed comes from the arithmetic, not from dropping it). The curve arithmetic is `k256`'s (MULX/ADX field, GLV, comb), not std's; profiled verify (perf, 2026-10-07): point add 36 %, double 33 %, the two exponentiations (`lift_x` square root, affine inversion) ~25 %. Next levers are in k256's backlog: a precomputed affine G table for the double-base verify, a variable-time safegcd inversion, lazy reduction. `verifyBatch` per signature (64-item batch) was no faster than a single `verify`. **2026-10-07 later (k256 `ecmult`, `signWithKeyPair`, multi-base batch):** keypair 1.31×, verify 1.77×, sign 4.43× (from a ready `KeyPair`; with safegcd the same night verify 1.57×, sign 3.99×, as libsecp's `schnorrsig_sign32`), `verifyBatch` 51 µs/sig = 0.87× a single verify.
+- 2026-10-07: slower than the reference on every measured operation (`tools/bench.zig`, libsecp256k1 v0.8.0): keypair 1.56×, verify 2.56×, sign 7.37× (was 2.00/3.39/9.30 before the same-day k256 field change). `sign` = two fixed-base multiplies (public key per call, nonce point) + the BIP340 self-verification, which the owner decided to KEEP (2026-10-07: fault-injection guard; speed comes from the arithmetic, not from dropping it). ⚠ Reversed by the owner 2026-11-13: the self-verification is opt-in (`SignOptions.self_verify`, default off, as in libsecp256k1); see § Performance. The curve arithmetic is `k256`'s (MULX/ADX field, GLV, comb), not std's; profiled verify (perf, 2026-10-07): point add 36 %, double 33 %, the two exponentiations (`lift_x` square root, affine inversion) ~25 %. Next levers are in k256's backlog: a precomputed affine G table for the double-base verify, a variable-time safegcd inversion, lazy reduction. `verifyBatch` per signature (64-item batch) was no faster than a single `verify`. **2026-10-07 later (k256 `ecmult`, `signWithKeyPair`, multi-base batch):** keypair 1.31×, verify 1.77×, sign 4.43× (from a ready `KeyPair`; with safegcd the same night verify 1.57×, sign 3.99×, as libsecp's `schnorrsig_sign32`), `verifyBatch` 51 µs/sig = 0.87× a single verify.
