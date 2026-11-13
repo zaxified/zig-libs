@@ -740,6 +740,32 @@ test "a ServerHello pre_shared_key with no PSK offered is illegal_parameter (aud
     try testing.expectEqual(@as(?anyerror, error.TlsIllegalParameter), runClient(plainRecord(&rec, msg), null).init_err);
 }
 
+test "a TLS 1.3 ServerHello carrying a TLS 1.2-only extension is illegal_parameter (Go checkServerHelloOrHRR)" {
+    // SessionTicket (35), extended_master_secret (23), renegotiation_info
+    // (0xff01), ALPN (16), status_request (5), SCT (18): Go 1.26 refuses every
+    // one in a 1.3 ServerHello, asked for or not (handshake_client_tls13.go).
+    try ensureTemplates();
+    var sh_buf: [256]u8 = undefined;
+    var rec: [300]u8 = undefined;
+    const extras = [_][]const u8{
+        &.{ 0, 35, 0, 0 },
+        &.{ 0, 23, 0, 0 },
+        &.{ 0xff, 0x01, 0, 1, 0 },
+        &.{ 0, 16, 0, 5, 0, 3, 2, 'h', '2' },
+        &.{ 0, 5, 0, 0 },
+        &.{ 0, 18, 0, 5, 0, 3, 0, 1, 0x42 }, // a well-formed list of one 1-byte SCT
+    };
+    for (extras) |extra| {
+        const msg = serverHello13(&sh_buf, .AES_128_GCM_SHA256, extra);
+        try testing.expectEqual(@as(?anyerror, error.TlsIllegalParameter), runClient(plainRecord(&rec, msg), null).init_err);
+    }
+    // Control: the same ServerHello without the extension gets past the check
+    // (and then runs out of input).
+    const plain = serverHello13(&sh_buf, .AES_128_GCM_SHA256, "");
+    const got: ?anyerror = runClient(plainRecord(&rec, plain), null).init_err;
+    try testing.expect(got == null or got.? != error.TlsIllegalParameter);
+}
+
 test "an accepted PSK whose suite hash is not the ticket's is illegal_parameter (audit mutant 54)" {
     // RFC 8446 §4.2.11: the server must pick a suite of the PSK's hash.
     try ensureTemplates();

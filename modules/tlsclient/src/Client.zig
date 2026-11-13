@@ -1124,6 +1124,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                         var hrr_selected: ?tls.NamedGroup = null;
                         var hrr_cookie: ?[]const u8 = null;
                         var sh_group: ?tls.NamedGroup = null;
+                        var tls12_only_ext = false;
                         if (!hsd.eof()) {
                             try hsd.ensure(2);
                             const extensions_size = hsd.decode(u16);
@@ -1133,6 +1134,15 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                 const et = all_extd.decode(tls.ExtensionType);
                                 const ext_size = all_extd.decode(u16);
                                 var extd = try all_extd.sub(ext_size);
+                                // Extensions only a TLS 1.2 ServerHello may carry; refused
+                                // below once the version is 1.3 (as Go 1.26's
+                                // checkServerHelloOrHRR: "a ServerHello extension
+                                // forbidden in TLS 1.3"), whether or not we asked for them.
+                                const etv = @backingInt(et);
+                                if (et == .application_layer_protocol_negotiation or et == .status_request or
+                                    et == .signed_certificate_timestamp or etv == hello.ext_extended_master_secret or
+                                    etv == hello.ext_session_ticket or etv == hello.ext_renegotiation_info)
+                                    tls12_only_ext = true;
                                 switch (et) {
                                     .supported_versions => {
                                         if (supported_version) |_| return error.TlsIllegalParameter;
@@ -1215,7 +1225,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                         // zig-libs tlsclient: the version must be one we offered.
                         if (!versionOffered(versions, tls_version)) return error.TlsIllegalParameter;
                         switch (tls_version) {
-                            .tls_1_3 => if (!mem.eql(u8, legacy_session_id_echo, &legacy_session_id)) return error.TlsIllegalParameter,
+                            .tls_1_3 => if (!mem.eql(u8, legacy_session_id_echo, &legacy_session_id) or tls12_only_ext) return error.TlsIllegalParameter,
                             // RFC 8446 §4.1.3: a client that offered TLS 1.3
                             // refuses either downgrade sentinel; one that did
                             // not (max_version 1.2) only the TLS 1.1 one.
