@@ -34,7 +34,9 @@ Implemented and validated:
   X25519MLKEM768 PQ hybrid (both halves pinned against their primitives,
   and the whole thing against wolfSSL — see the post-quantum section).
   Proven by an
-  in-memory client↔server interop suite: both validated suites reach
+  in-memory client↔server interop suite: all three wired suites
+  (AES-128-GCM-SHA256, AES-256-GCM-SHA384 with its SHA-384 key schedule —
+  `Config.psk_hash` for a SHA-384 PSK — and ChaCha20-Poly1305-SHA256) reach
   `.connected` with byte-identical derived keys, a real `send`/`recv`
   round trip, caller-clocked retransmission on a dropped ClientHello, and
   typed-error (never panic) rejection of a wrong PSK, mismatched PSK
@@ -150,7 +152,8 @@ structural rather than asserted. RFC 8446 §4.4.1's `message_hash` transcript
 rewrite is what makes it possible.
 
 The cookie is `HMAC-SHA256(cookie_secret, label || peer_binding ||
-version || cipher_suite || Hash(ClientHello1))`. `peer_binding` is
+version || cipher_suite || Hash(ClientHello1))`, the hash under the
+suite's own hash (32 or 48 bytes). `peer_binding` is
 **caller-supplied** — typically the peer's packed address and port. It has to
 be: this module never touches a socket (the caller owns the datagram I/O), so
 the peer's address is an input in the same way the clock (`Config.now_sec`)
