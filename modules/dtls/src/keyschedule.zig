@@ -32,6 +32,12 @@ pub const deriveApplicationTrafficSecrets = S.deriveApplicationTrafficSecrets;
 pub const deriveFinishedKey = S.deriveFinishedKey;
 pub const computeFinishedVerifyData = S.computeFinishedVerifyData;
 pub const deriveTrafficKeyIv = S.deriveTrafficKeyIv;
+pub const deriveApplicationSecrets = S.deriveApplicationSecrets;
+pub const nextApplicationTrafficSecret = S.nextApplicationTrafficSecret;
+pub const exportKeyingMaterial = S.exportKeyingMaterial;
+pub const ExportError = S.ExportError;
+pub const max_exporter_label_len = S.max_exporter_label_len;
+pub const maxExporterLen = S.maxExporterLen;
 
 /// RFC 9147 §4.2.3: `sn_key = HKDF-Expand-Label(Secret, "sn", "",
 /// key_length)` — the key for the sequence-number-masking keystream

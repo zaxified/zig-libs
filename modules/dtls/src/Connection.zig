@@ -38,9 +38,15 @@
 //! uses whichever offered share it can (`clientHelloShare`). Both roles, and
 //! all three retry shapes on the client side, are proven against wolfSSL.
 //!
+//! **After the handshake** (2026-11-13): KeyUpdate both ways
+//! (`requestKeyUpdate`, `recv` → `error.ReceivedKeyUpdate`, `poll` emits the
+//! ACK / KeyUpdate records, RFC 9147 §8), the RFC 8446 §7.5 exporter
+//! (`exportKeyingMaterial`) and RFC 7301 ALPN (`Config.alpn_protocols`,
+//! `negotiatedAlpn`).
+//!
 //! **Deliberately out of scope** (see `startHandshake`'s doc comment and
-//! `root.zig` for the full list): 0-RTT, session resumption, key update,
-//! and (inherited from `aead.zig`) the CCM suites.
+//! `root.zig` for the full list): 0-RTT, session resumption, and (inherited
+//! from `aead.zig`) the CCM suites.
 
 const std = @import("std");
 const messages = @import("messages.zig");
@@ -179,6 +185,9 @@ pub const ConfigError = error{
     /// nothing to verify and an accommodating one would complete an
     /// anonymous handshake in "certificate" mode.
     LocalCertificateRequired,
+    /// `Config.alpn_protocols` holds an empty name, a name over 255 bytes,
+    /// or more than `max_alpn_list_len` bytes once encoded (RFC 7301 §3.1).
+    InvalidAlpnProtocols,
 };
 
 /// Server-side HelloRetryRequest / stateless-cookie configuration — RFC 9147
@@ -420,6 +429,27 @@ pub const Config = struct {
     /// hybrid on its own.
     key_share_group: messages.NamedGroup = .x25519,
 
+    /// RFC 9147 §8 / RFC 8446 §5.5: once this many records have been sent
+    /// under one application write key, `send` QUEUES a KeyUpdate
+    /// (`update_not_requested`); the next `poll` emits it, and the new write
+    /// key takes over when the peer ACKs it. `null` turns the automatic rekey
+    /// off (`requestKeyUpdate` still works). The default, 2^24, sits just
+    /// below RFC 8446 §5.5's AES-GCM confidentiality limit of 2^24.5
+    /// full-size records per key, which is the tightest of the suites wired
+    /// here. Records keep flowing under the old key until the ACK arrives;
+    /// `error.SequenceNumberExhausted` stays the hard stop if it never does.
+    key_update_after_records: ?u48 = 1 << 24,
+
+    /// RFC 7301 ALPN, most-preferred first. Empty (the default) = no ALPN:
+    /// a client offers none, a server ignores the client's offer. A CLIENT
+    /// offers these in its ClientHello and accepts a server selection only
+    /// from this list; a SERVER selects ITS first preference the client also
+    /// offered and returns it in EncryptedExtensions — and if the client
+    /// offered ALPN but nothing overlaps, fails with
+    /// `error.NoApplicationProtocol` (RFC 7301 §3.2's
+    /// `no_application_protocol`). The result is `negotiatedAlpn`.
+    alpn_protocols: []const []const u8 = &.{},
+
     /// Real, non-crypto validation — catches obviously-broken configs
     /// before anything touches a keyschedule stub. PSK fields stay
     /// mandatory even in certificate mode (see the "certificate mode: what
@@ -447,6 +477,14 @@ pub const Config = struct {
         // Checked in every mode/role (harmless where the field is unused):
         // a config error should not depend on which side reads the config.
         if (!groupAdvertised(@backingInt(self.key_share_group))) return error.UnsupportedKeyShareGroup;
+        if (self.alpn_protocols.len > 0) {
+            var alpn_len: usize = 2;
+            for (self.alpn_protocols) |name| {
+                if (name.len == 0 or name.len > 255) return error.InvalidAlpnProtocols;
+                alpn_len += 1 + name.len;
+            }
+            if (alpn_len > max_alpn_list_len) return error.InvalidAlpnProtocols;
+        }
         switch (self.key_exchange) {
             .psk => {
                 if (self.psk.len == 0) return error.EmptyPsk;
@@ -624,6 +662,10 @@ pub const HandshakeError = messages.MessageError || handshake.FrameError || hand
     /// (they are ordinary retransmission), so this names only the
     /// genuinely-interleaved case, which no conforming sender produces.
     InterleavedFragments,
+    /// RFC 7301 §3.2: this server has `Config.alpn_protocols`, the client
+    /// offered ALPN, and no protocol is on both lists
+    /// (`no_application_protocol`).
+    NoApplicationProtocol,
 } || CertModeError;
 
 /// Certificate-mode-specific errors (RFC 8446 §4.4) — see this file's
@@ -687,20 +729,33 @@ pub const SendError = error{
     ReceivedAck,
     /// The record authenticated and decrypted, but its inner content type is
     /// `handshake` (22) on the application epoch — a post-handshake message
-    /// (NewSessionTicket, KeyUpdate, RFC 8446 §4.6). This module implements
-    /// none of them (see the "Out of scope" list in `root.zig`), so the
-    /// record is reported rather than silently dropped: a caller that does
-    /// not need resumption or key update can read the next datagram, but it
-    /// is told what it is skipping.
+    /// other than a KeyUpdate (that is `ReceivedKeyUpdate`): a
+    /// NewSessionTicket, which is ACKed (queued for `poll`) and ignored since
+    /// resumption is not implemented, or a message ahead of the expected
+    /// `message_seq`, dropped for the peer to retransmit. The caller reads
+    /// the next datagram.
     ReceivedPostHandshakeMessage,
+    /// The record carried a KeyUpdate (RFC 9147 §8, RFC 8446 §4.6.3) and it
+    /// has been PROCESSED: this side now reads with the peer's next
+    /// application key (the previous one stays installed for late, reordered
+    /// records), an ACK for the record is queued, and — if the peer asked
+    /// for it — so is this side's own KeyUpdate. Ordinary protocol traffic,
+    /// not damage: call `poll` to send what was queued, then read the next
+    /// datagram. A retransmitted copy of a KeyUpdate already processed
+    /// returns this too (it only re-queues the ACK).
+    ReceivedKeyUpdate,
     /// RFC 9147 §4.5.4: the application-epoch send sequence number has
     /// reached its 48-bit ceiling. `send_seq` is a `u48` incremented with
     /// `+%=`, so without this guard the NEXT record after the ceiling would
     /// silently wrap to 0 and reuse a nonce under the unchanged traffic key
     /// (AES-GCM: authentication-key recovery + plaintext XOR; total loss of
     /// the record layer). §4.5.4 requires terminating the connection (or
-    /// rekeying — not implemented here, see the file header) rather than
-    /// letting that happen. Audit A1 (dtls) F4/LOW4: theoretical at current
+    /// rekeying) rather than
+    /// letting that happen. Rekeying is what `Config.key_update_after_records`
+    /// does long before this point (2^24 by default, and each KeyUpdate
+    /// restarts the sequence space); this stays the hard stop for a peer that
+    /// never ACKs the update. Also returned by `requestKeyUpdate` at RFC 9147
+    /// §8's 2^48-1 epoch ceiling. Audit A1 (dtls) F4/LOW4: theoretical at current
     /// traffic rates (~9 years at 1M records/s on one epoch) but the failure
     /// mode is silent and catastrophic rather than a typed error, which this
     /// closes.
@@ -747,6 +802,40 @@ const content_type_ack: u8 = 26;
 /// actually sends is `max_send_seq - 1` and the wraparound increment in
 /// `protectRecord` can never run.
 const max_send_seq: u48 = std.math.maxInt(u48);
+
+/// RFC 9147 §8: "sending implementations MUST NOT allow the epoch to exceed
+/// 2^48-1". This side refuses to start a KeyUpdate that would; receiving is
+/// not limited (the same section forbids enforcing it on the peer).
+const max_send_epoch: u64 = (1 << 48) - 1;
+
+/// `Connection.ack_queue` capacity (post-handshake records owed an ACK).
+const max_ack_queue = 8;
+/// `Connection.ku_records` capacity (records that carried our KeyUpdate).
+const max_ku_records = 8;
+
+/// RFC 8446 §4.6.3 `KeyUpdateRequest`.
+const key_update_not_requested: u8 = 0;
+const key_update_requested: u8 = 1;
+/// RFC 8446 §4 `HandshakeType` values of the post-handshake messages this
+/// engine reads on the application epoch.
+const hs_type_new_session_ticket: u8 = 4;
+const hs_type_key_update: u8 = 24;
+
+const KeyUpdateState = enum { idle, queued, in_flight };
+
+/// Cap on the encoded ALPN extension body this side sends (2-byte list
+/// length + names). Keeps the ClientHello inside `max_client_hello_body`
+/// next to a hybrid key share; real lists ("h2", "coap", "webrtc", ...) are
+/// a few dozen bytes.
+const max_alpn_list_len = 256;
+
+/// The EncryptedExtensions this server sends: list length + one ALPN
+/// extension (4-byte header + 2-byte list length + 1 + 255-byte name).
+const ee_body_cap = 2 + 4 + 2 + 1 + 255;
+/// The EncryptedExtensions body a client accepts. Was 64; the ALPN answer
+/// alone can be 264 bytes, and a real server may add `server_name`,
+/// `max_fragment_length`, `supported_groups` (RFC 8446 §4.2) on top.
+const ee_recv_cap = 512;
 
 // ── incoming-flight reassembly bounds (RFC 9147 §5.2) ────────────────────
 //
@@ -1329,6 +1418,50 @@ pub const Connection = struct {
     /// application epoch — see `replayCheckAndUpdate`'s doc comment.
     recv_window: u64 = 0,
 
+    // ── post-handshake key update (RFC 9147 §8, RFC 8446 §4.6.3) ────────
+    /// Epoch of `write_keys` / `read_keys`: `application_epoch` once
+    /// connected, +1 per completed KeyUpdate in that direction. The two
+    /// directions move independently. `send_seq` and the receive window
+    /// above belong to these epochs.
+    write_epoch: u64 = 0,
+    read_epoch: u64 = 0,
+    /// The current application traffic secrets (RFC 8446 §7.2's
+    /// `application_traffic_secret_N`), kept so the next one can be derived.
+    /// Wiped in `deinit`.
+    ap_write_secret: [32]u8 = undefined,
+    ap_read_secret: [32]u8 = undefined,
+    /// RFC 9147 §8: "receivers MUST retain the pre-update keying material
+    /// until receipt and successful decryption of a message using the new
+    /// keys". One generation is kept: the peer cannot update again before
+    /// this side has ACKed, i.e. before it has the new keys itself.
+    prev_read_keys: DirKeys = .{},
+    prev_read_live: bool = false,
+    prev_recv: EpochSeqState = .{},
+    /// Record numbers this side owes an ACK for (post-handshake messages),
+    /// flushed by `poll`. Bounded: a record past the cap is not ACKed and the
+    /// peer simply retransmits it.
+    ack_queue: [max_ack_queue]flight.RecordNumber = undefined,
+    ack_queue_len: u8 = 0,
+    /// This side's own KeyUpdate: `.queued` (built by the next `poll`),
+    /// `.in_flight` (sent, awaiting the ACK that switches `write_keys`).
+    ku_state: KeyUpdateState = .idle,
+    ku_request_peer: bool = false,
+    ku_message_seq: u16 = 0,
+    /// Every record that has carried the in-flight KeyUpdate (each
+    /// retransmission is a fresh record, RFC 9147 §5.7); an ACK naming any
+    /// of them completes the update. A ring: the newest `max_ku_records`.
+    ku_records: [max_ku_records]flight.RecordNumber = undefined,
+    ku_records_len: u8 = 0,
+    ku_records_next: u8 = 0,
+    ku_timer: flight.RetransmitTimer = flight.RetransmitTimer.init(1000, 60_000),
+    /// RFC 8446 §7.1 `exporter_master_secret`, set when the application
+    /// secrets are derived; read by `exportKeyingMaterial`. Wiped in `deinit`.
+    exporter_master: [32]u8 = undefined,
+    /// RFC 7301: the negotiated application protocol, `alpn_len == 0` when
+    /// none was (see `negotiatedAlpn`).
+    alpn: [255]u8 = undefined,
+    alpn_len: u8 = 0,
+
     // ── handshake-in-progress state (RFC 9147 §5 flight engine) ─────────
     /// Running transcript hash (RFC 8446 §4.4.1, TLS-style 4-byte-header
     /// framing — see `engine.zig`).
@@ -1680,8 +1813,21 @@ pub const Connection = struct {
     /// verbatim (doubling the backoff) into `out` and returns it; `null`
     /// otherwise. Never blocks, never sleeps — `now_ms` is entirely
     /// caller-supplied, matching `flight.zig`'s fake-clock-testable style.
+    ///
+    /// **Once connected** (RFC 9147 §7/§8) it returns the next control
+    /// record this side owes the peer — ONE record per call, since `recv`
+    /// reads one record per datagram; call again until `null`. In order: the ACK for post-handshake messages `recv` processed
+    /// (immediately, not timer-gated), this side's own KeyUpdate once it is
+    /// queued (`requestKeyUpdate`, `Config.key_update_after_records`, or a
+    /// peer's `update_requested`), and a retransmission of that KeyUpdate —
+    /// in a fresh record — while its ACK is outstanding and the timer has
+    /// expired. Call it after every `recv` that returned
+    /// `error.ReceivedKeyUpdate` and periodically while a KeyUpdate is in
+    /// flight. A caller that never does keeps a working connection; the
+    /// peer simply keeps its old keys and retransmits.
     pub fn poll(self: *Connection, now_ms: u64, out: []u8) HandshakeError!?[]const u8 {
-        if (self.state == .connected or self.state == .start) return null;
+        if (self.state == .connected) return burn.run(burn.record_burn, SendError!?[]const u8, pollConnected, .{ self, now_ms, out });
+        if (self.state == .start) return null;
         if (self.last_flight_len == 0) return null;
         if (!self.retransmit_timer.isExpired(now_ms)) return null;
         if (out.len < self.last_flight_len) return error.BufferTooShort;
@@ -1723,13 +1869,229 @@ pub const Connection = struct {
 
         self.write_keys = deriveDir(Hkdf, params, my_secret);
         self.read_keys = deriveDir(Hkdf, params, peer_secret);
+        self.ap_write_secret = my_secret.*;
+        self.ap_read_secret = peer_secret.*;
         self.suite = suite;
         self.epoch = application_epoch;
+        self.write_epoch = application_epoch;
+        self.read_epoch = application_epoch;
         self.send_seq = 0;
         self.recv_max_seq = 0;
         self.recv_seen_any = false;
         self.recv_window = 0;
+        secureZeroDirKeys(&self.prev_read_keys);
+        self.prev_read_live = false;
+        self.prev_recv = .{};
+        self.ack_queue_len = 0;
+        self.ku_state = .idle;
+        self.ku_records_len = 0;
+        self.ku_records_next = 0;
+        self.ku_timer.reset();
         self.state = .connected;
+    }
+
+    /// Queues a KeyUpdate (RFC 9147 §8, RFC 8446 §4.6.3) for this side's
+    /// sending direction; the next `poll` emits it. `request_peer` sets
+    /// `update_requested`, asking the peer to update its own sending key in
+    /// return. The new write key is used only once the peer has ACKed the
+    /// KeyUpdate (RFC 9147 §8: "implementations MUST NOT send records with
+    /// the new keys or send a new KeyUpdate until the previous KeyUpdate has
+    /// been acknowledged"), so records `send` produces until then still go
+    /// out under the current key. One update at a time:
+    /// `error.KeyUpdatePending` while one is queued or in flight.
+    /// `error.SequenceNumberExhausted` if the write epoch is at RFC 9147 §8's
+    /// 2^48-1 sending ceiling.
+    pub fn requestKeyUpdate(self: *Connection, request_peer: bool) error{ NotConnected, KeyUpdatePending, SequenceNumberExhausted }!void {
+        if (self.state != .connected) return error.NotConnected;
+        if (self.ku_state != .idle) return error.KeyUpdatePending;
+        if (self.write_epoch >= max_send_epoch) return error.SequenceNumberExhausted;
+        self.queueKeyUpdate(request_peer);
+    }
+
+    fn queueKeyUpdate(self: *Connection, request_peer: bool) void {
+        self.ku_state = .queued;
+        self.ku_request_peer = request_peer;
+        self.ku_message_seq = self.message_seq;
+        self.message_seq +%= 1;
+        self.ku_records_len = 0;
+        self.ku_records_next = 0;
+        self.ku_timer.reset();
+    }
+
+    /// Whether this side has a KeyUpdate queued or awaiting its ACK.
+    pub fn keyUpdatePending(self: Connection) bool {
+        return self.ku_state != .idle;
+    }
+
+    fn pollConnected(self: *Connection, now_ms: u64, out: []u8) SendError!?[]const u8 {
+        if (self.ack_queue_len > 0) {
+            var ack_body_buf: [2 + max_ack_queue * flight.record_number_len]u8 = undefined;
+            const ack_body = flight.encodeAck(self.ack_queue[0..self.ack_queue_len], &ack_body_buf) catch
+                return error.BufferTooShort;
+            const rec = try self.protectRecord(content_type_ack, ack_body, out);
+            self.ack_queue_len = 0;
+            return rec;
+        }
+        const send_ku = switch (self.ku_state) {
+            .idle => false,
+            .queued => true,
+            .in_flight => self.ku_timer.isExpired(now_ms),
+        };
+        if (send_ku) {
+            var frag: [handshake.header_len + 1]u8 = undefined;
+            handshake.encodeHeader(.{
+                .msg_type = hs_type_key_update,
+                .length = 1,
+                .message_seq = self.ku_message_seq,
+                .fragment_offset = 0,
+                .fragment_length = 1,
+            }, frag[0..handshake.header_len]);
+            frag[handshake.header_len] = if (self.ku_request_peer) key_update_requested else key_update_not_requested;
+            const rn: flight.RecordNumber = .{ .epoch = self.write_epoch, .sequence_number = self.send_seq };
+            const rec = try self.protectRecord(content_type_handshake, &frag, out);
+            self.ku_records[self.ku_records_next] = rn;
+            self.ku_records_next = (self.ku_records_next + 1) % max_ku_records;
+            if (self.ku_records_len < max_ku_records) self.ku_records_len += 1;
+            if (self.ku_state == .queued) {
+                self.ku_state = .in_flight;
+                self.ku_timer.arm(now_ms);
+            } else {
+                self.ku_timer.onTimeout(now_ms);
+            }
+            return rec;
+        }
+        return null;
+    }
+
+    /// An ACK arrived on the application epoch: if it names a record that
+    /// carried this side's in-flight KeyUpdate, the update completes — the
+    /// write key moves to `application_traffic_secret_N+1` (RFC 8446 §7.2)
+    /// and the write epoch advances, with its sequence numbers from 0.
+    /// Malformed ACK bodies are `error.Malformed`; ACKs naming anything else
+    /// (e.g. the handshake's final flight, re-ACKed) are ignored.
+    fn processAck(self: *Connection, body: []const u8) SendError!void {
+        if (body.len < 2) return error.Malformed;
+        const list_len: usize = std.mem.readInt(u16, body[0..2], .big);
+        if (body.len != 2 + list_len or list_len % flight.record_number_len != 0) return error.Malformed;
+        if (self.ku_state != .in_flight) return;
+        var i: usize = 2;
+        while (i < body.len) : (i += flight.record_number_len) {
+            const rn = flight.decodeRecordNumber(body[i..][0..flight.record_number_len]);
+            for (self.ku_records[0..self.ku_records_len]) |sent| {
+                if (sent.epoch == rn.epoch and sent.sequence_number == rn.sequence_number) {
+                    self.completeKeyUpdate();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn completeKeyUpdate(self: *Connection) void {
+        const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
+        // `suite` has a `suiteParams` entry: keys were installed under it.
+        const params = suiteParams(self.suite).?;
+        keyschedule.nextApplicationTrafficSecret(Hkdf, &self.ap_write_secret, &self.ap_write_secret);
+        secureZeroDirKeys(&self.write_keys);
+        self.write_keys = deriveDir(Hkdf, params, &self.ap_write_secret);
+        self.write_epoch += 1;
+        self.send_seq = 0;
+        self.ku_state = .idle;
+        self.ku_records_len = 0;
+        self.ku_records_next = 0;
+        self.ku_timer.reset();
+    }
+
+    fn queueAck(self: *Connection, rn: flight.RecordNumber) void {
+        for (self.ack_queue[0..self.ack_queue_len]) |q| {
+            if (q.epoch == rn.epoch and q.sequence_number == rn.sequence_number) return;
+        }
+        if (self.ack_queue_len >= max_ack_queue) return;
+        self.ack_queue[self.ack_queue_len] = rn;
+        self.ack_queue_len += 1;
+    }
+
+    /// Handshake-type content on the application epoch (RFC 8446 §4.6): one
+    /// or more handshake fragments in one authenticated record `rn`.
+    ///   * KeyUpdate at the expected `message_seq`, received under the
+    ///     CURRENT read epoch: the read key moves to the next secret (the old
+    ///     one is retained, RFC 9147 §8), the record is ACKed, and a
+    ///     requested update is queued unless one is already pending or the
+    ///     epoch ceiling forbids it (RFC 9147 §8 overrides TLS's "MUST
+    ///     respond" there).
+    ///   * NewSessionTicket: ACKed and skipped (resumption is not
+    ///     implemented; without the ACK the peer would retransmit it).
+    ///   * A message BEHIND the expected `message_seq` is a retransmission
+    ///     of one already processed (our ACK was lost): only re-ACKed.
+    ///   * A message AHEAD of it is dropped unACKed (an earlier one was
+    ///     lost; the peer retransmits both).
+    /// Anything else — another message type, a KeyUpdate of the wrong
+    /// length or with a request value other than 0/1 (RFC 8446 §4.6.3:
+    /// illegal_parameter), a KeyUpdate under the previous epoch — is
+    /// `error.Malformed`. Always returns an error: `ReceivedKeyUpdate` or
+    /// `ReceivedPostHandshakeMessage` on success, which `recv` passes on.
+    fn processPostHandshake(self: *Connection, body: []const u8, rn: flight.RecordNumber, from_prev_epoch: bool) SendError {
+        var pos: usize = 0;
+        var saw_key_update = false;
+        var ack = false;
+        while (pos < body.len) {
+            const hdr = handshake.decodeHeader(body[pos..]) catch return error.Malformed;
+            if (body.len - pos - handshake.header_len < hdr.fragment_length) return error.Malformed;
+            const frag = body[pos + handshake.header_len ..][0..hdr.fragment_length];
+            pos += handshake.header_len + hdr.fragment_length;
+
+            const expected = self.peer_message_seq orelse return error.Malformed;
+            if (hdr.message_seq != expected) {
+                if (messageSeqOlderThan(hdr.message_seq, expected)) {
+                    ack = true;
+                    if (hdr.msg_type == hs_type_key_update) saw_key_update = true;
+                }
+                continue;
+            }
+            switch (hdr.msg_type) {
+                hs_type_key_update => {
+                    if (hdr.length != 1 or hdr.fragment_offset != 0 or hdr.fragment_length != 1) return error.Malformed;
+                    const req = frag[0];
+                    if (req != key_update_not_requested and req != key_update_requested) return error.Malformed;
+                    if (from_prev_epoch) return error.Malformed;
+                    self.applyPeerKeyUpdate();
+                    self.peer_message_seq = expected +% 1;
+                    if (req == key_update_requested and self.ku_state == .idle and self.write_epoch < max_send_epoch)
+                        self.queueKeyUpdate(false);
+                    saw_key_update = true;
+                    ack = true;
+                },
+                hs_type_new_session_ticket => {
+                    // Only the final fragment completes the message; any
+                    // fragment is ACKed (its bytes are not needed here).
+                    if (@as(u32, hdr.fragment_offset) + hdr.fragment_length == hdr.length)
+                        self.peer_message_seq = expected +% 1;
+                    ack = true;
+                },
+                else => return error.Malformed,
+            }
+        }
+        if (ack) self.queueAck(rn);
+        if (saw_key_update) return error.ReceivedKeyUpdate;
+        return error.ReceivedPostHandshakeMessage;
+    }
+
+    fn applyPeerKeyUpdate(self: *Connection) void {
+        const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
+        const params = suiteParams(self.suite).?;
+        secureZeroDirKeys(&self.prev_read_keys);
+        self.prev_read_keys = self.read_keys;
+        self.prev_read_live = true;
+        self.prev_recv = .{
+            .recv_max_seq = self.recv_max_seq,
+            .recv_seen_any = self.recv_seen_any,
+            .recv_window = self.recv_window,
+        };
+        keyschedule.nextApplicationTrafficSecret(Hkdf, &self.ap_read_secret, &self.ap_read_secret);
+        self.read_keys = deriveDir(Hkdf, params, &self.ap_read_secret);
+        self.read_epoch += 1;
+        self.recv_max_seq = 0;
+        self.recv_seen_any = false;
+        self.recv_window = 0;
     }
 
     /// Protects `plaintext` as an application_data record (RFC 9147 §4.2):
@@ -1758,6 +2120,15 @@ pub const Connection = struct {
         // sends.
         if (self.send_seq >= max_send_seq) return error.SequenceNumberExhausted;
         const params = suiteParams(self.suite) orelse return error.UnsupportedSuite;
+        // RFC 9147 §8 / RFC 8446 §5.5 automatic rekey: queue (not send) a
+        // KeyUpdate once this write key has carried enough records; `poll`
+        // emits it, and this record still goes out under the current key.
+        if (inner_content_type == content_type_application_data) {
+            if (self.config.key_update_after_records) |limit| {
+                if (self.send_seq >= limit and self.ku_state == .idle and self.write_epoch < max_send_epoch)
+                    self.queueKeyUpdate(false);
+            }
+        }
 
         // DTLSInnerPlaintext = content || content_type (no extra padding).
         var inner_buf: [1500]u8 = undefined;
@@ -1773,7 +2144,7 @@ pub const Connection = struct {
         // Encode the header with the PLAINTEXT sequence number — this is the
         // AEAD additional_data (RFC 9147 §4.2.1: header prior to sn encrypt).
         const hdr = record.UnifiedHeader{
-            .epoch_low = @truncate(self.epoch),
+            .epoch_low = @truncate(self.write_epoch),
             .seq_len = seq_len,
             .seq_wire = @truncate(self.send_seq),
             .cid = null,
@@ -1783,7 +2154,7 @@ pub const Connection = struct {
         const hdr_len = hdr_slice.len;
         if (out.len < hdr_len + ct_len) return error.BufferTooShort;
 
-        const n = protectDispatch(self.suite, &self.write_keys, self.epoch, self.send_seq, inner, out[0..hdr_len], out[hdr_len..]) catch
+        const n = protectDispatch(self.suite, &self.write_keys, self.write_epoch, self.send_seq, inner, out[0..hdr_len], out[hdr_len..]) catch
             return error.BufferTooShort;
         std.debug.assert(n == ct_len);
 
@@ -1830,16 +2201,31 @@ pub const Connection = struct {
         var hdr_buf: [16]u8 = undefined;
         if (hdr_len > hdr_buf.len) return error.Malformed;
         @memcpy(hdr_buf[0..hdr_len], datagram[0..hdr_len]);
-        try snMaskDispatch(self.suite, &self.read_keys, ct[0..16], hdr_buf[seq_off..][0..seq_bytes_n]);
 
+        // RFC 9147 §4.2.2 epoch reconstruction: the header carries the
+        // epoch's low 2 bits. They name either the current read epoch or —
+        // after a KeyUpdate — the previous one, whose keys are retained for
+        // late, reordered records (§8). The peer cannot be AHEAD of
+        // `read_epoch` (it switches only after this side ACKs its
+        // KeyUpdate), so any other value cannot be deprotected.
+        const use_prev = dec.hdr.epoch_low != @as(u2, @truncate(self.read_epoch));
+        if (use_prev and !(self.prev_read_live and dec.hdr.epoch_low == @as(u2, @truncate(self.read_epoch -% 1))))
+            return error.DecryptionFailed;
+        const keys = if (use_prev) &self.prev_read_keys else &self.read_keys;
+        const rx_epoch = if (use_prev) self.read_epoch - 1 else self.read_epoch;
+        const seen_any = if (use_prev) &self.prev_recv.recv_seen_any else &self.recv_seen_any;
+        const max_seq = if (use_prev) &self.prev_recv.recv_max_seq else &self.recv_max_seq;
+        const window = if (use_prev) &self.prev_recv.recv_window else &self.recv_window;
+
+        try snMaskDispatch(self.suite, keys, ct[0..16], hdr_buf[seq_off..][0..seq_bytes_n]);
         const wire_low: u16 = if (seq_len == .short)
             hdr_buf[seq_off]
         else
             std.mem.readInt(u16, hdr_buf[seq_off..][0..2], .big);
-        const largest = if (self.recv_seen_any) self.recv_max_seq else 0;
+        const largest = if (seen_any.*) max_seq.* else 0;
         const full_seq = record.reconstructSequenceNumber(largest, seq_len, wire_low);
 
-        const body_len = unprotectDispatch(self.suite, &self.read_keys, self.epoch, full_seq, ct, hdr_buf[0..hdr_len], out) catch
+        const body_len = unprotectDispatch(self.suite, keys, rx_epoch, full_seq, ct, hdr_buf[0..hdr_len], out) catch
             return error.DecryptionFailed;
         if (body_len == 0) return error.Malformed; // must hold at least the content type
 
@@ -1862,17 +2248,48 @@ pub const Connection = struct {
         // re-inject it indefinitely, raising a fresh `ReceivedAck` each time
         // instead of `ReplayedRecord`, and driving any caller that counts or
         // acts on those events.
-        if (!replayCheckAndUpdate(&self.recv_seen_any, &self.recv_max_seq, &self.recv_window, full_seq))
+        if (!replayCheckAndUpdate(seen_any, max_seq, window, full_seq))
             return error.ReplayedRecord;
 
         const ctype = out[end - 1];
-        if (ctype != content_type_application_data) return switch (ctype) {
-            content_type_ack => error.ReceivedAck,
-            content_type_handshake => error.ReceivedPostHandshakeMessage,
-            else => error.Malformed,
-        };
+        if (ctype != content_type_application_data) {
+            const body = out[0 .. end - 1];
+            switch (ctype) {
+                content_type_ack => {
+                    try self.processAck(body);
+                    return error.ReceivedAck;
+                },
+                content_type_handshake => return self.processPostHandshake(body, .{ .epoch = rx_epoch, .sequence_number = full_seq }, use_prev),
+                else => return error.Malformed,
+            }
+        }
 
         return out[0 .. end - 1];
+    }
+
+    pub const ExportError = error{NotConnected} || keyschedule.ExportError;
+
+    /// RFC 8446 §7.5 keying-material exporter (the TLS 1.3 replacement for
+    /// RFC 5705, used by DTLS-SRTP and by any protocol that binds keys to
+    /// the channel), over this connection's `exporter_master_secret`:
+    /// `HKDF-Expand-Label(Derive-Secret(exporter_master_secret, label, ""),
+    /// "exporter", Hash(context_value), out.len)`. Per RFC 9147 §5.9 every
+    /// HKDF-Expand-Label in DTLS 1.3 carries the `"dtls13"` prefix, this one
+    /// included, so the output differs from a TLS 1.3 exporter over the
+    /// same secret. `context == null` and an empty context are the same
+    /// value (RFC 8446 §7.5). Only once connected; `label.len <=
+    /// keyschedule.max_exporter_label_len` and `out.len <=
+    /// keyschedule.maxExporterLen(HkdfSha256)` are errors, not panics.
+    pub fn exportKeyingMaterial(self: *const Connection, label: []const u8, context: ?[]const u8, out: []u8) ExportError!void {
+        if (self.state != .connected) return error.NotConnected;
+        return keyschedule.exportKeyingMaterial(
+            std.crypto.hash.sha2.Sha256,
+            std.crypto.kdf.hkdf.HkdfSha256,
+            out,
+            &self.exporter_master,
+            label,
+            context orelse "",
+        );
     }
 
     /// Whether a HelloRetryRequest was part of this connection's handshake
@@ -1905,6 +2322,11 @@ pub const Connection = struct {
         std.crypto.secureZero(u8, &self.hs_traffic_server);
         std.crypto.secureZero(u8, &self.pending_ap_client);
         std.crypto.secureZero(u8, &self.pending_ap_server);
+        std.crypto.secureZero(u8, &self.ap_write_secret);
+        std.crypto.secureZero(u8, &self.ap_read_secret);
+        std.crypto.secureZero(u8, &self.exporter_master);
+        secureZeroDirKeys(&self.prev_read_keys);
+        self.prev_read_live = false;
         // `.cert_dhe` ephemeral X25519 private key — already wiped mid-handshake
         // for forward secrecy, but wipe again defensively (idempotent; the
         // handshake may have errored out before reaching that point).
@@ -1915,6 +2337,68 @@ pub const Connection = struct {
         self.write_keys.sn_len = 0;
         self.read_keys.key_len = 0;
         self.read_keys.sn_len = 0;
+    }
+
+    /// The RFC 7301 protocol negotiated in the handshake, or `null` when
+    /// ALPN was not used (either side had no `Config.alpn_protocols`, or
+    /// the server chose not to answer). Aliases this `Connection`.
+    pub fn negotiatedAlpn(self: *const Connection) ?[]const u8 {
+        return if (self.alpn_len == 0) null else self.alpn[0..self.alpn_len];
+    }
+
+    /// Client: the ClientHello's ALPN extension, or `null` with no
+    /// `Config.alpn_protocols`. `Config.validate` bounded the list.
+    fn alpnOffer(self: *const Connection, buf: *[max_alpn_list_len]u8) HandshakeError!?messages.Extension {
+        if (self.config.alpn_protocols.len == 0) return null;
+        const data = try messages.encodeAlpn(self.config.alpn_protocols, buf);
+        return .{ .ext_type = @backingInt(messages.ExtensionType.application_layer_protocol_negotiation), .data = data };
+    }
+
+    /// Server: RFC 7301 §3.2 selection over the ClientHello's extensions —
+    /// this server's first preference the client also offered, stored in
+    /// `alpn`. No server list or no client offer: no ALPN. An offer with no
+    /// overlap: `error.NoApplicationProtocol`. A malformed offer:
+    /// `error.Malformed`.
+    fn serverSelectAlpn(self: *Connection, exts: []const messages.Extension) HandshakeError!void {
+        self.alpn_len = 0;
+        if (self.config.alpn_protocols.len == 0) return;
+        const offer = for (exts) |e| {
+            if (e.ext_type == @backingInt(messages.ExtensionType.application_layer_protocol_negotiation)) break e.data;
+        } else return;
+        _ = messages.AlpnIter.init(offer) catch return error.Malformed;
+        for (self.config.alpn_protocols) |ours| {
+            var it = messages.AlpnIter.init(offer) catch unreachable;
+            while (it.next()) |theirs| {
+                if (std.mem.eql(u8, ours, theirs)) {
+                    @memcpy(self.alpn[0..ours.len], ours);
+                    self.alpn_len = @intCast(ours.len);
+                    return;
+                }
+            }
+        }
+        return error.NoApplicationProtocol;
+    }
+
+    /// Client: the server's EncryptedExtensions. An ALPN answer must name
+    /// exactly one protocol (RFC 7301 §3.1) that this client offered; one
+    /// it never offered — or any answer when it offered none — is
+    /// `error.Malformed` (RFC 8446 §4.2: an extension the client did not
+    /// send is `unsupported_extension`).
+    fn clientAcceptAlpn(self: *Connection, ee_body: []const u8) HandshakeError!void {
+        self.alpn_len = 0;
+        var ext_buf: [16]messages.Extension = undefined;
+        const exts = messages.decodeEncryptedExtensions(ee_body, &ext_buf) catch return error.Malformed;
+        for (exts) |e| {
+            if (e.ext_type != @backingInt(messages.ExtensionType.application_layer_protocol_negotiation)) continue;
+            const name = messages.decodeAlpnSelected(e.data) catch return error.Malformed;
+            for (self.config.alpn_protocols) |ours| {
+                if (std.mem.eql(u8, ours, name)) {
+                    @memcpy(self.alpn[0..name.len], name);
+                    self.alpn_len = @intCast(name.len);
+                    break;
+                }
+            } else return error.Malformed;
+        }
     }
 
     // ── handshake flight engine (RFC 9147 §5, PSK-only) ──────────────────
@@ -1983,7 +2467,10 @@ pub const Connection = struct {
 
         // `pre_shared_key` MUST be the last extension (RFC 8446 §4.2.11) —
         // the binder is computed over everything that precedes it.
-        var exts_buf: [7]messages.Extension = undefined;
+        var alpn_buf: [max_alpn_list_len]u8 = undefined;
+        const alpn_ext = try self.alpnOffer(&alpn_buf);
+
+        var exts_buf: [8]messages.Extension = undefined;
         var n_exts: usize = 0;
         exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions_ext };
         n_exts += 1;
@@ -1997,6 +2484,10 @@ pub const Connection = struct {
         n_exts += 1;
         if (cookie_ext) |c| {
             exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.cookie), .data = c };
+            n_exts += 1;
+        }
+        if (alpn_ext) |e| {
+            exts_buf[n_exts] = e;
             n_exts += 1;
         }
         exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.pre_shared_key), .data = psk_ext_data };
@@ -2126,7 +2617,10 @@ pub const Connection = struct {
         var cookie_buf: [2 + max_cookie_len]u8 = undefined;
         const cookie_ext: ?[]const u8 = if (cookie) |c| try messages.encodeCookieExtension(c, &cookie_buf) else null;
 
-        var exts_buf: [5]messages.Extension = undefined;
+        var alpn_buf: [max_alpn_list_len]u8 = undefined;
+        const alpn_ext = try self.alpnOffer(&alpn_buf);
+
+        var exts_buf: [6]messages.Extension = undefined;
         var n_exts: usize = 0;
         exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions_ext };
         n_exts += 1;
@@ -2138,6 +2632,10 @@ pub const Connection = struct {
         n_exts += 1;
         if (cookie_ext) |c| {
             exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.cookie), .data = c };
+            n_exts += 1;
+        }
+        if (alpn_ext) |e| {
+            exts_buf[n_exts] = e;
             n_exts += 1;
         }
 
@@ -3062,6 +3560,7 @@ pub const Connection = struct {
         if (retry_suite) |committed| {
             if (suite != committed) return error.NoCipherSuiteOverlap;
         }
+        try self.serverSelectAlpn(dec.extensions);
 
         // ClientHello accepted (PSK binder verified, or cert-DHE key_share
         // extracted): commit it to the transcript.
@@ -3141,10 +3640,18 @@ pub const Connection = struct {
         self.hs_write_keys = deriveDir(Hkdf, params, &self.hs_traffic_server);
         self.hs_read_keys = deriveDir(Hkdf, params, &self.hs_traffic_client);
 
-        var ee_body_buf: [8]u8 = undefined;
-        const ee_body = messages.encodeEncryptedExtensions(&.{}, &ee_body_buf) catch return error.BufferTooShort;
+        // EncryptedExtensions: empty, or the RFC 7301 selection (a list of
+        // exactly one name).
+        var alpn_sel_buf: [2 + 1 + 255]u8 = undefined;
+        const ee_exts_one = [1]messages.Extension{.{
+            .ext_type = @backingInt(messages.ExtensionType.application_layer_protocol_negotiation),
+            .data = if (self.negotiatedAlpn()) |name| try messages.encodeAlpn(&.{name}, &alpn_sel_buf) else &.{},
+        }};
+        const ee_exts: []const messages.Extension = if (self.alpn_len != 0) &ee_exts_one else &.{};
+        var ee_body_buf: [ee_body_cap]u8 = undefined;
+        const ee_body = messages.encodeEncryptedExtensions(ee_exts, &ee_body_buf) catch return error.BufferTooShort;
         self.transcript.append(@backingInt(messages.HandshakeType.encrypted_extensions), ee_body);
-        var ee_frag_buf: [8 + handshake.header_len]u8 = undefined;
+        var ee_frag_buf: [ee_body_cap + handshake.header_len]u8 = undefined;
         const ee_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.encrypted_extensions), self.message_seq, ee_body, &ee_frag_buf);
         self.message_seq +%= 1;
         const ee_seq = self.hs2.send_seq;
@@ -3218,7 +3725,7 @@ pub const Connection = struct {
         var ms: [32]u8 = undefined;
         keyschedule.deriveMasterSecret(Hkdf, &ms, &hs_secret, &eh);
         const th_through_server_finished = self.transcript.currentHash();
-        keyschedule.deriveApplicationTrafficSecrets(Hkdf, &self.pending_ap_client, &self.pending_ap_server, &ms, &th_through_server_finished);
+        keyschedule.deriveApplicationSecrets(Hkdf, &self.pending_ap_client, &self.pending_ap_server, &self.exporter_master, &ms, &th_through_server_finished);
 
         var all_records: [6]flight.RecordNumber = undefined;
         var n: usize = 0;
@@ -3530,10 +4037,11 @@ pub const Connection = struct {
         self.hs_write_keys = deriveDir(Hkdf, params, &self.hs_traffic_client);
         self.hs_read_keys = deriveDir(Hkdf, params, &self.hs_traffic_server);
 
-        var ee_msg_buf: [64]u8 = undefined;
-        var ee_received_buf: [64]bool = undefined;
+        var ee_msg_buf: [ee_recv_cap]u8 = undefined;
+        var ee_received_buf: [ee_recv_cap]bool = undefined;
         const ee_parsed = try self.takeHandshakeMessage(datagram, &pos, .epoch2_protected, &ee_msg_buf, &ee_received_buf, null);
         if (ee_parsed.msg_type != @backingInt(messages.HandshakeType.encrypted_extensions)) return error.UnexpectedMessage;
+        try self.clientAcceptAlpn(ee_parsed.body);
         self.transcript.append(@backingInt(messages.HandshakeType.encrypted_extensions), ee_parsed.body);
 
         // ── certificate mode: optional CertificateRequest?, Certificate?,
@@ -3571,7 +4079,7 @@ pub const Connection = struct {
         keyschedule.deriveMasterSecret(Hkdf, &ms, &hs_secret, &eh);
         const th_through_server_finished = self.transcript.currentHash();
         var ap: struct { client: [32]u8, server: [32]u8 } = undefined;
-        keyschedule.deriveApplicationTrafficSecrets(Hkdf, &ap.client, &ap.server, &ms, &th_through_server_finished);
+        keyschedule.deriveApplicationSecrets(Hkdf, &ap.client, &ap.server, &self.exporter_master, &ms, &th_through_server_finished);
 
         // ── certificate mode: this client's own Certificate/CertificateVerify,
         // ONLY if the server asked (`cert_result.requested_client_cert`).
@@ -3705,7 +4213,7 @@ fn deriveDir(comptime Hkdf: type, params: SuiteParams, secret: *const [32]u8) Di
 fn protectDispatch(
     suite: CipherSuite,
     keys: *const DirKeys,
-    epoch: u16,
+    epoch: u64,
     seq: u48,
     inner: []const u8,
     aad: []const u8,
@@ -3721,7 +4229,7 @@ fn protectDispatch(
 fn unprotectDispatch(
     suite: CipherSuite,
     keys: *const DirKeys,
-    epoch: u16,
+    epoch: u64,
     seq: u48,
     ct: []const u8,
     aad: []const u8,
@@ -7662,4 +8170,446 @@ test "doc: every entry point where randomness enters states the CSPRNG requireme
         const window_start = at -| 6000;
         try testing.expect(std.mem.find(u8, src[window_start..at], needle) != null);
     }
+}
+
+// ── KeyUpdate (RFC 9147 §8, RFC 8446 §4.6.3) and the exporter (RFC 8446
+// §7.5) ──────────────────────────────────────────────────────────────────
+
+/// A connected PSK client/server pair (`suite`), the server's final-flight
+/// ACK already consumed by the client.
+fn kuPair(suite: CipherSuite, client_cfg_extra: Config, client: *Connection, server: *Connection) !void {
+    var cc = client_cfg_extra;
+    cc.role = .client;
+    cc.psk_identity = "device-042";
+    cc.psk = "a-shared-pre-shared-key";
+    cc.cipher_suites = &.{suite};
+    var sc = cc;
+    sc.role = .server;
+    client.* = try Connection.clientInit(cc);
+    server.* = try Connection.serverInit(sc);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x10)));
+    const rnd = seededForTest(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const f2 = try server.handleFlight(ch, rnd, 0, &buf2);
+    const cf = try client.handleFlight(f2.out, rnd, 0, &buf1);
+    try testing.expect(cf.done);
+    const sr = try server.handleFlight(cf.out, rnd, 0, &buf2);
+    try testing.expect(sr.done);
+    var plain: [64]u8 = undefined;
+    try testing.expectError(error.ReceivedAck, client.recv(sr.out, &plain));
+}
+
+fn expectDirKeysEqual(a: DirKeys, b: DirKeys) !void {
+    try testing.expectEqualSlices(u8, a.key[0..a.key_len], b.key[0..b.key_len]);
+    try testing.expectEqualSlices(u8, &a.iv, &b.iv);
+    try testing.expectEqualSlices(u8, a.sn_key[0..a.sn_len], b.sn_key[0..b.sn_len]);
+}
+
+fn expectRoundTrip(from: *Connection, to: *Connection, msg: []const u8) !void {
+    var wire: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    const rec = try from.send(msg, &wire);
+    try testing.expectEqualSlices(u8, msg, try to.recv(rec, &plain));
+}
+
+/// Copies one `poll` record out of the connection's scratch buffer.
+fn pollOne(conn: *Connection, now_ms: u64, store: []u8) !?[]const u8 {
+    var tmp: [256]u8 = undefined;
+    const rec = (try conn.poll(now_ms, &tmp)) orelse return null;
+    @memcpy(store[0..rec.len], rec);
+    return store[0..rec.len];
+}
+
+fn keyUpdateFigure14(suite: CipherSuite) !void {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(suite, .{ .role = .client }, &client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var plain: [256]u8 = undefined;
+    const old_client_write = client.write_keys;
+
+    // Client: KeyUpdate(update_requested), sent under epoch 3.
+    try client.requestKeyUpdate(true);
+    try testing.expectError(error.KeyUpdatePending, client.requestKeyUpdate(false));
+    var ku_store: [256]u8 = undefined;
+    const ku = (try pollOne(&client, 0, &ku_store)).?;
+    try testing.expectEqual(@as(u8, 3), ku[0] & 0x03);
+    try testing.expect(client.keyUpdatePending());
+    // §8: the new keys are NOT used before the ACK — still epoch 3.
+    try expectRoundTrip(&client, &server, "before the ack");
+    try testing.expectEqual(@as(u64, 3), client.write_epoch);
+
+    // Server: processes it, reads epoch 4 from now on, owes an ACK and (as
+    // requested) its own KeyUpdate.
+    try testing.expectError(error.ReceivedKeyUpdate, server.recv(ku, &plain));
+    try testing.expectEqual(@as(u64, 4), server.read_epoch);
+    try testing.expectEqual(KeyUpdateState.queued, server.ku_state);
+    var ack_store: [256]u8 = undefined;
+    const ack = (try pollOne(&server, 0, &ack_store)).?;
+    var sku_store: [256]u8 = undefined;
+    const sku = (try pollOne(&server, 0, &sku_store)).?;
+    try testing.expectEqual(@as(?[]const u8, null), try server.poll(0, &plain));
+    // The server's own KeyUpdate also goes out under its old epoch 3.
+    try testing.expectEqual(@as(u8, 3), sku[0] & 0x03);
+
+    // Client: the ACK switches its write key (epoch 4, sequence from 0).
+    try testing.expectError(error.ReceivedAck, client.recv(ack, &plain));
+    try testing.expectEqual(@as(u64, 4), client.write_epoch);
+    try testing.expectEqual(@as(u48, 0), client.send_seq);
+    try testing.expect(!client.keyUpdatePending());
+    try testing.expect(!std.mem.eql(u8, &old_client_write.key, &client.write_keys.key));
+    try expectDirKeysEqual(client.write_keys, server.read_keys);
+    {
+        var wire: [256]u8 = undefined;
+        const rec = try client.send("epoch four", &wire);
+        try testing.expectEqual(@as(u8, 0), rec[0] & 0x03); // 4 & 3
+        try testing.expectEqualSlices(u8, "epoch four", try server.recv(rec, &plain));
+    }
+
+    // Client: the server's KeyUpdate, then the ACK back (sent under the
+    // client's NEW epoch 4 — Figure 14).
+    try testing.expectError(error.ReceivedKeyUpdate, client.recv(sku, &plain));
+    try testing.expectEqual(@as(u64, 4), client.read_epoch);
+    // update_not_requested: the client queues no further update.
+    try testing.expectEqual(KeyUpdateState.idle, client.ku_state);
+    var cack_store: [256]u8 = undefined;
+    const cack = (try pollOne(&client, 0, &cack_store)).?;
+    try testing.expectEqual(@as(u8, 0), cack[0] & 0x03);
+    try testing.expectError(error.ReceivedAck, server.recv(cack, &plain));
+    try testing.expectEqual(@as(u64, 4), server.write_epoch);
+    try expectDirKeysEqual(server.write_keys, client.read_keys);
+
+    try expectRoundTrip(&client, &server, "both directions on epoch 4");
+    try expectRoundTrip(&server, &client, "and back");
+}
+
+test "KeyUpdate: RFC 9147 §8 Figure 14 exchange, update_requested, both directions rekey — AES-128-GCM" {
+    try keyUpdateFigure14(.aes_128_gcm_sha256);
+}
+
+test "KeyUpdate: RFC 9147 §8 Figure 14 exchange, update_requested, both directions rekey — ChaCha20-Poly1305" {
+    try keyUpdateFigure14(.chacha20_poly1305_sha256);
+}
+
+test "KeyUpdate: RFC 8446 §7.2 traffic upd — the new read key is the one derived from application_traffic_secret_N+1" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.aes_128_gcm_sha256, .{ .role = .client }, &client, &server);
+    const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
+    // Independent derivation from the secret the handshake installed.
+    var next: [32]u8 = undefined;
+    keyschedule.expandLabel(Hkdf, keyschedule.dtls13_prefix, 32, &next, &client.ap_write_secret, "traffic upd", "");
+    var want_key: [16]u8 = undefined;
+    var want_iv: [12]u8 = undefined;
+    keyschedule.deriveTrafficKeyIv(Hkdf, 16, 12, &want_key, &want_iv, &next);
+
+    try client.requestKeyUpdate(false);
+    var plain: [256]u8 = undefined;
+    var ku_store: [256]u8 = undefined;
+    const ku = (try pollOne(&client, 0, &ku_store)).?;
+    try testing.expectError(error.ReceivedKeyUpdate, server.recv(ku, &plain));
+    try testing.expectEqualSlices(u8, &want_key, server.read_keys.key[0..16]);
+    try testing.expectEqualSlices(u8, &want_iv, &server.read_keys.iv);
+    // update_not_requested: nothing but the ACK is owed.
+    try testing.expectEqual(KeyUpdateState.idle, server.ku_state);
+}
+
+test "KeyUpdate: RFC 9147 §8 — a late record of the previous epoch still decrypts with the retained keys" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.aes_128_gcm_sha256, .{ .role = .client }, &client, &server);
+    var plain: [256]u8 = undefined;
+    var late_store: [256]u8 = undefined;
+    const late_rec = try client.send("sent before the update, delivered after", &late_store);
+
+    try client.requestKeyUpdate(false);
+    var ku_store: [256]u8 = undefined;
+    const ku = (try pollOne(&client, 0, &ku_store)).?;
+    try testing.expectError(error.ReceivedKeyUpdate, server.recv(ku, &plain));
+    var ack_store: [256]u8 = undefined;
+    const ack = (try pollOne(&server, 0, &ack_store)).?;
+    try testing.expectError(error.ReceivedAck, client.recv(ack, &plain));
+    try expectRoundTrip(&client, &server, "epoch 4 record first");
+
+    try testing.expectEqualSlices(u8, "sent before the update, delivered after", try server.recv(late_rec, &plain));
+    // The previous epoch keeps its own replay window.
+    try testing.expectError(error.ReplayedRecord, server.recv(late_rec, &plain));
+}
+
+test "KeyUpdate: RFC 9147 §5.7/§8 — a lost KeyUpdate is retransmitted in a fresh record; a lost ACK only re-ACKs" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.chacha20_poly1305_sha256, .{ .role = .client }, &client, &server);
+    var plain: [256]u8 = undefined;
+
+    try client.requestKeyUpdate(false);
+    var first_store: [256]u8 = undefined;
+    const first = (try pollOne(&client, 0, &first_store)).?; // lost
+    try testing.expectEqual(@as(?[]const u8, null), try client.poll(999, &plain));
+    var second_store: [256]u8 = undefined;
+    const second = (try pollOne(&client, 1000, &second_store)).?;
+    try testing.expect(!std.mem.eql(u8, first, second)); // a new record number
+    try testing.expectEqual(@as(u8, 2), client.ku_records_len);
+
+    try testing.expectError(error.ReceivedKeyUpdate, server.recv(second, &plain));
+    try testing.expectEqual(@as(u64, 4), server.read_epoch);
+    var ack_store: [256]u8 = undefined;
+    _ = (try pollOne(&server, 0, &ack_store)).?; // this ACK is lost too
+
+    // The first copy arrives late, under what is now the server's previous
+    // epoch: a retransmission, so the server re-ACKs and does NOT rekey again.
+    try testing.expectError(error.ReceivedKeyUpdate, server.recv(first, &plain));
+    try testing.expectEqual(@as(u64, 4), server.read_epoch);
+    var ack2_store: [256]u8 = undefined;
+    const ack2 = (try pollOne(&server, 0, &ack2_store)).?;
+    // That ACK names the FIRST record; it still completes the update.
+    try testing.expectError(error.ReceivedAck, client.recv(ack2, &plain));
+    try testing.expectEqual(@as(u64, 4), client.write_epoch);
+    try expectRoundTrip(&client, &server, "after the retransmitted update");
+    try expectRoundTrip(&server, &client, "server still on epoch 3");
+}
+
+test "KeyUpdate: an ACK that names other records does not switch the write key" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.aes_128_gcm_sha256, .{ .role = .client }, &client, &server);
+    var plain: [256]u8 = undefined;
+    try client.requestKeyUpdate(false);
+    var ku_store: [256]u8 = undefined;
+    _ = (try pollOne(&client, 0, &ku_store)).?;
+    var body_buf: [2 + flight.record_number_len]u8 = undefined;
+    const body = try flight.encodeAck(&.{.{ .epoch = 3, .sequence_number = 12345 }}, &body_buf);
+    var wire: [256]u8 = undefined;
+    const rec = try server.protectRecord(content_type_ack, body, &wire);
+    try testing.expectError(error.ReceivedAck, client.recv(rec, &plain));
+    try testing.expectEqual(@as(u64, 3), client.write_epoch);
+    try testing.expect(client.keyUpdatePending());
+    // A truncated ACK body is Malformed, not a panic.
+    const bad = try server.protectRecord(content_type_ack, body[0 .. body.len - 1], &wire);
+    try testing.expectError(error.Malformed, client.recv(bad, &plain));
+}
+
+/// Sends a hand-built post-handshake handshake message from `from`.
+fn sendRawHandshake(from: *Connection, msg_type: u8, message_seq: u16, payload: []const u8, wire: []u8) ![]const u8 {
+    var frag: [64]u8 = undefined;
+    handshake.encodeHeader(.{
+        .msg_type = msg_type,
+        .length = @intCast(payload.len),
+        .message_seq = message_seq,
+        .fragment_offset = 0,
+        .fragment_length = @intCast(payload.len),
+    }, frag[0..handshake.header_len]);
+    @memcpy(frag[handshake.header_len..][0..payload.len], payload);
+    return from.protectRecord(content_type_handshake, frag[0 .. handshake.header_len + payload.len], wire);
+}
+
+test "KeyUpdate: RFC 8446 §4.6.3 — a request value other than 0/1, a wrong length, or another message type is Malformed and changes nothing" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.aes_128_gcm_sha256, .{ .role = .client }, &client, &server);
+    var plain: [256]u8 = undefined;
+    var wire: [256]u8 = undefined;
+    const seq = client.message_seq;
+    try testing.expectError(error.Malformed, server.recv(try sendRawHandshake(&client, hs_type_key_update, seq, &.{2}, &wire), &plain));
+    try testing.expectError(error.Malformed, server.recv(try sendRawHandshake(&client, hs_type_key_update, seq, &.{ 0, 0 }, &wire), &plain));
+    try testing.expectError(error.Malformed, server.recv(try sendRawHandshake(&client, hs_type_key_update, seq, &.{}, &wire), &plain));
+    // A CertificateRequest (post-handshake auth was never offered).
+    try testing.expectError(error.Malformed, server.recv(try sendRawHandshake(&client, 13, seq, &.{ 0, 0, 0 }, &wire), &plain));
+    try testing.expectEqual(@as(u64, 3), server.read_epoch);
+    try testing.expectEqual(@as(u8, 0), server.ack_queue_len);
+    try expectRoundTrip(&client, &server, "still usable");
+}
+
+test "KeyUpdate: a NewSessionTicket is ACKed and skipped; a message AHEAD of message_seq is dropped unACKed" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.aes_128_gcm_sha256, .{ .role = .client }, &client, &server);
+    var plain: [256]u8 = undefined;
+    var wire: [256]u8 = undefined;
+    const seq = server.message_seq;
+    try testing.expectError(error.ReceivedPostHandshakeMessage, client.recv(try sendRawHandshake(&server, hs_type_key_update, seq +% 1, &.{0}, &wire), &plain));
+    try testing.expectEqual(@as(u8, 0), client.ack_queue_len);
+    try testing.expectEqual(@as(u64, 3), client.read_epoch);
+    try testing.expectError(error.ReceivedPostHandshakeMessage, client.recv(try sendRawHandshake(&server, hs_type_new_session_ticket, seq, &.{ 0, 0, 0, 1 }, &wire), &plain));
+    try testing.expectEqual(@as(u8, 1), client.ack_queue_len);
+    try testing.expectEqual(@as(?u16, seq +% 1), client.peer_message_seq);
+    var ack_store: [256]u8 = undefined;
+    const ack = (try pollOne(&client, 0, &ack_store)).?;
+    try testing.expectError(error.ReceivedAck, server.recv(ack, &plain));
+}
+
+test "KeyUpdate: Config.key_update_after_records queues an update; off when null; NotConnected before the handshake" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.aes_128_gcm_sha256, .{ .role = .client, .key_update_after_records = 2 }, &client, &server);
+    var plain: [256]u8 = undefined;
+    try expectRoundTrip(&client, &server, "one");
+    try expectRoundTrip(&client, &server, "two");
+    try testing.expect(!client.keyUpdatePending());
+    try expectRoundTrip(&client, &server, "three"); // send_seq reached 2
+    try testing.expect(client.keyUpdatePending());
+    var ku_store: [256]u8 = undefined;
+    const ku = (try pollOne(&client, 0, &ku_store)).?;
+    try testing.expectError(error.ReceivedKeyUpdate, server.recv(ku, &plain));
+    var ack_store: [256]u8 = undefined;
+    const ack = (try pollOne(&server, 0, &ack_store)).?;
+    try testing.expectError(error.ReceivedAck, client.recv(ack, &plain));
+    try testing.expectEqual(@as(u64, 4), client.write_epoch);
+
+    var c2: Connection = undefined;
+    var s2: Connection = undefined;
+    try kuPair(.aes_128_gcm_sha256, .{ .role = .client, .key_update_after_records = null }, &c2, &s2);
+    c2.send_seq = 1 << 30;
+    var wire: [256]u8 = undefined;
+    _ = try c2.send("far past any limit", &wire);
+    try testing.expect(!c2.keyUpdatePending());
+
+    var fresh = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "secret" });
+    try testing.expectError(error.NotConnected, fresh.requestKeyUpdate(false));
+    try testing.expectEqual(@as(?[]const u8, null), try fresh.poll(0, &plain));
+}
+
+test "KeyUpdate: RFC 9147 §8 — this side never starts an update past the 2^48-1 epoch ceiling" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.aes_128_gcm_sha256, .{ .role = .client }, &client, &server);
+    client.write_epoch = max_send_epoch;
+    try testing.expectError(error.SequenceNumberExhausted, client.requestKeyUpdate(false));
+}
+
+test "exporter: RFC 8446 §7.5 — both sides export the same keying material; label, context and length all matter" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.aes_128_gcm_sha256, .{ .role = .client }, &client, &server);
+    var a: [60]u8 = undefined;
+    var b: [60]u8 = undefined;
+    try client.exportKeyingMaterial("EXTRACTOR-dtls_srtp", null, &a);
+    try server.exportKeyingMaterial("EXTRACTOR-dtls_srtp", null, &b);
+    try testing.expectEqualSlices(u8, &a, &b);
+    // §7.5: no context and an empty context are the same value.
+    try server.exportKeyingMaterial("EXTRACTOR-dtls_srtp", "", &b);
+    try testing.expectEqualSlices(u8, &a, &b);
+    try server.exportKeyingMaterial("EXTRACTOR-dtls_srtp", "ctx", &b);
+    try testing.expect(!std.mem.eql(u8, &a, &b));
+    try server.exportKeyingMaterial("EXPORTER-other", null, &b);
+    try testing.expect(!std.mem.eql(u8, &a, &b));
+    // The length is an input of HKDF-Expand-Label: a shorter export is NOT a prefix.
+    var short: [16]u8 = undefined;
+    try client.exportKeyingMaterial("EXTRACTOR-dtls_srtp", null, &short);
+    try testing.expect(!std.mem.eql(u8, a[0..16], &short));
+
+    // RFC 9147 §5.9: the "dtls13" prefix, i.e. NOT the TLS 1.3 exporter
+    // over the same secret.
+    const ks = @import("tls13").keyschedule;
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
+    var tls_out: [60]u8 = undefined;
+    try ks.tls13.exportKeyingMaterial(Sha256, Hkdf, &tls_out, &client.exporter_master, "EXTRACTOR-dtls_srtp", "");
+    try testing.expect(!std.mem.eql(u8, &a, &tls_out));
+    var dtls_out: [60]u8 = undefined;
+    try ks.dtls13.exportKeyingMaterial(Sha256, Hkdf, &dtls_out, &client.exporter_master, "EXTRACTOR-dtls_srtp", "");
+    try testing.expectEqualSlices(u8, &a, &dtls_out);
+
+    // The exporter secret is NOT one of the traffic secrets.
+    try testing.expect(!std.mem.eql(u8, &client.exporter_master, &client.ap_write_secret));
+    try testing.expect(!std.mem.eql(u8, &client.exporter_master, &client.ap_read_secret));
+
+    // Bounds are errors; before the handshake, NotConnected.
+    var big_label: [256]u8 = @splat('a');
+    try testing.expectError(error.LabelTooLong, client.exportKeyingMaterial(&big_label, null, &short));
+    var fresh = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "secret" });
+    try testing.expectError(error.NotConnected, fresh.exportKeyingMaterial("x", null, &short));
+}
+
+// ── ALPN (RFC 7301) ─────────────────────────────────────────────────────
+
+fn alpnHandshake(client_alpn: []const []const u8, server_alpn: []const []const u8, client: *Connection, server: *Connection) !void {
+    const base = Config{ .role = .client, .psk_identity = "device-042", .psk = "a-shared-pre-shared-key" };
+    var cc = base;
+    cc.alpn_protocols = client_alpn;
+    var sc = base;
+    sc.role = .server;
+    sc.alpn_protocols = server_alpn;
+    client.* = try Connection.clientInit(cc);
+    server.* = try Connection.serverInit(sc);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x21)));
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    try driveHandshake(client, server, seededForTest(&csprng), &buf1, &buf2);
+}
+
+test "ALPN (RFC 7301 §3.2): the server picks ITS first preference the client offered; both sides see it" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try alpnHandshake(&.{ "coap", "h2", "webrtc" }, &.{ "webrtc", "h2" }, &client, &server);
+    try testing.expectEqualStrings("webrtc", server.negotiatedAlpn().?);
+    try testing.expectEqualStrings("webrtc", client.negotiatedAlpn().?);
+}
+
+test "ALPN: absent on either side means no ALPN, and the handshake is unaffected" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try alpnHandshake(&.{}, &.{"h2"}, &client, &server);
+    try testing.expectEqual(@as(?[]const u8, null), client.negotiatedAlpn());
+    try testing.expectEqual(@as(?[]const u8, null), server.negotiatedAlpn());
+    try alpnHandshake(&.{"h2"}, &.{}, &client, &server);
+    try testing.expectEqual(@as(?[]const u8, null), client.negotiatedAlpn());
+    try testing.expectEqual(@as(?[]const u8, null), server.negotiatedAlpn());
+}
+
+test "ALPN (RFC 7301 §3.2): no overlap is error.NoApplicationProtocol on the server" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try testing.expectError(error.NoApplicationProtocol, alpnHandshake(&.{"coap"}, &.{"h2"}, &client, &server));
+}
+
+test "ALPN: the cert_dhe ClientHello carries the offer too" {
+    var c = try Connection.clientInit(.{
+        .role = .client,
+        .key_exchange = .cert_dhe_insecure_unauthenticated,
+        .alpn_protocols = &.{"webrtc"},
+    });
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x22)));
+    var body_buf: [max_client_hello_body]u8 = undefined;
+    const body = try c.buildClientHelloCertDhe(seededForTest(&csprng), null, @backingInt(c.config.key_share_group), &body_buf);
+    var ext_buf: [16]messages.Extension = undefined;
+    const dec = try messages.decodeClientHello(body, &ext_buf);
+    var server = try Connection.serverInit(.{ .role = .server, .key_exchange = .cert_dhe_insecure_unauthenticated, .alpn_protocols = &.{"webrtc"} });
+    try server.serverSelectAlpn(dec.extensions);
+    try testing.expectEqualStrings("webrtc", server.negotiatedAlpn().?);
+}
+
+test "ALPN: a server answer the client never offered, or a two-name answer, is Malformed" {
+    var c = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "secret", .alpn_protocols = &.{"coap"} });
+    var alpn_buf: [32]u8 = undefined;
+    var ee_buf: [64]u8 = undefined;
+    const alpn_type = @backingInt(messages.ExtensionType.application_layer_protocol_negotiation);
+    const other = try messages.encodeExtensions(&.{.{ .ext_type = alpn_type, .data = try messages.encodeAlpn(&.{"h2"}, &alpn_buf) }}, &ee_buf);
+    try testing.expectError(error.Malformed, c.clientAcceptAlpn(other));
+    const two = try messages.encodeExtensions(&.{.{ .ext_type = alpn_type, .data = try messages.encodeAlpn(&.{ "coap", "h2" }, &alpn_buf) }}, &ee_buf);
+    try testing.expectError(error.Malformed, c.clientAcceptAlpn(two));
+    const good = try messages.encodeExtensions(&.{.{ .ext_type = alpn_type, .data = try messages.encodeAlpn(&.{"coap"}, &alpn_buf) }}, &ee_buf);
+    try c.clientAcceptAlpn(good);
+    try testing.expectEqualStrings("coap", c.negotiatedAlpn().?);
+    // A client that offered nothing rejects any answer.
+    var none = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "secret" });
+    try testing.expectError(error.Malformed, none.clientAcceptAlpn(good));
+}
+
+test "ALPN: Config.validate bounds the list — empty name, over-long name, over-long list" {
+    const base = Config{ .role = .client, .psk_identity = "id", .psk = "secret" };
+    var cfg = base;
+    cfg.alpn_protocols = &.{""};
+    try testing.expectError(error.InvalidAlpnProtocols, cfg.validate());
+    const long: [256]u8 = @splat('x');
+    cfg.alpn_protocols = &.{&long};
+    try testing.expectError(error.InvalidAlpnProtocols, cfg.validate());
+    const name: [100]u8 = @splat('y');
+    cfg.alpn_protocols = &.{ &name, &name, &name };
+    try testing.expectError(error.InvalidAlpnProtocols, cfg.validate());
+    cfg.alpn_protocols = &.{ &name, &name };
+    try cfg.validate();
 }

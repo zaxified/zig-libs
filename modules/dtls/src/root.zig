@@ -255,9 +255,15 @@
 //! while the ECDSA/Ed25519 arms fall back to RFC 6979/8032 deterministic
 //! derivation.
 //!
+//! **Post-handshake (2026-11-13):** KeyUpdate in both directions (RFC 9147
+//! §8: ACK-gated switch, previous read epoch retained, `poll` emits the
+//! control records, automatic rekey at `Config.key_update_after_records`);
+//! the RFC 8446 §7.5 exporter (`Connection.exportKeyingMaterial`, `"dtls13"`
+//! labels per RFC 9147 §5.9); RFC 7301 ALPN (`Config.alpn_protocols`,
+//! `Connection.negotiatedAlpn`). NewSessionTicket is ACKed and ignored.
+//!
 //! **Out of scope (deliberate, not deferred-as-a-stub):** 0-RTT/early data; session
-//! resumption (`res binder`/NewSessionTicket); key update (RFC 8446
-//! §4.6.3); and the CCM
+//! resumption (`res binder`/NewSessionTicket); and the CCM
 //! suites (Zig 0.16 std ships only a 13-byte-nonce CCM; the TLS/DTLS
 //! profile needs 12 — see `aead.zig`'s CCM caveat).
 //!

@@ -56,6 +56,8 @@ pub const ExtensionType = enum(u16) {
     pre_shared_key = 41,
     psk_key_exchange_modes = 45,
     key_share = 51,
+    /// RFC 7301 §3.1.
+    application_layer_protocol_negotiation = 16,
     _,
 };
 
@@ -781,6 +783,74 @@ pub fn encodeEncryptedExtensions(exts: []const Extension, out: []u8) MessageErro
 
 pub fn decodeEncryptedExtensions(buf: []const u8, out: []Extension) MessageError![]Extension {
     return decodeExtensions(buf, out);
+}
+
+// ── ALPN (RFC 7301 §3.1) ─────────────────────────────────────────────────
+//
+//   opaque ProtocolName<1..2^8-1>;
+//   struct { ProtocolName protocol_name_list<2..2^16-1> } ProtocolNameList;
+//
+// The ClientHello carries the client's list; the server's EncryptedExtensions
+// (TLS 1.3 moved it there, RFC 8446 §4.2) carries a list of EXACTLY one name
+// (RFC 7301 §3.1: "MUST contain exactly one").
+
+/// Encodes `protocols` as an ALPN extension body. Every name must be 1..255
+/// bytes (`error.Malformed` otherwise, never a truncated length byte), and
+/// the list must not be empty.
+pub fn encodeAlpn(protocols: []const []const u8, out: []u8) MessageError![]u8 {
+    if (protocols.len == 0) return error.Malformed;
+    var list_len: usize = 0;
+    for (protocols) |p| {
+        if (p.len == 0 or p.len > 255) return error.Malformed;
+        list_len += 1 + p.len;
+    }
+    if (list_len > std.math.maxInt(u16)) return error.ListTooLong;
+    if (out.len < 2 + list_len) return error.BufferTooShort;
+    std.mem.writeInt(u16, out[0..2], @intCast(list_len), .big);
+    var i: usize = 2;
+    for (protocols) |p| {
+        out[i] = @intCast(p.len);
+        @memcpy(out[i + 1 ..][0..p.len], p);
+        i += 1 + p.len;
+    }
+    return out[0..i];
+}
+
+/// Walks an ALPN extension body's `protocol_name_list`. `init` validates the
+/// whole list up front (exact outer length, at least one name, every name
+/// 1..255 bytes and inside the list), so `next` cannot fail.
+pub const AlpnIter = struct {
+    rest: []const u8,
+
+    pub fn init(data: []const u8) MessageError!AlpnIter {
+        if (data.len < 2) return error.Malformed;
+        const list_len: usize = std.mem.readInt(u16, data[0..2], .big);
+        if (list_len != data.len - 2 or list_len == 0) return error.Malformed;
+        var i: usize = 2;
+        while (i < data.len) {
+            const n = data[i];
+            if (n == 0 or data.len - i - 1 < n) return error.Malformed;
+            i += 1 + n;
+        }
+        return .{ .rest = data[2..] };
+    }
+
+    pub fn next(self: *AlpnIter) ?[]const u8 {
+        if (self.rest.len == 0) return null;
+        const n = self.rest[0];
+        const name = self.rest[1..][0..n];
+        self.rest = self.rest[1 + n ..];
+        return name;
+    }
+};
+
+/// Decodes a SERVER's ALPN extension body: a valid list holding exactly one
+/// name (RFC 7301 §3.1). Returns that name, aliasing `data`.
+pub fn decodeAlpnSelected(data: []const u8) MessageError![]const u8 {
+    var it = try AlpnIter.init(data);
+    const name = it.next().?;
+    if (it.next() != null) return error.Malformed;
+    return name;
 }
 
 // ── Finished (RFC 8446 §4.4.4) ───────────────────────────────────────────
@@ -2175,4 +2245,40 @@ test "corpus: every message seed reaches its decoder, and the counts are pinned"
     }
     try expectReach(r, .{ .entries = 5, .accepted = 3, .walked = 2 });
     try testing.expectEqual(@as(usize, 0), cr.dropped);
+}
+
+test "ALPN (RFC 7301 §3.1): encode/decode round trip, and the server form holds exactly one name" {
+    var buf: [64]u8 = undefined;
+    const body = try encodeAlpn(&.{ "h2", "coap" }, &buf);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 8, 2, 'h', '2', 4, 'c', 'o', 'a', 'p' }, body);
+    var it = try AlpnIter.init(body);
+    try std.testing.expectEqualStrings("h2", it.next().?);
+    try std.testing.expectEqualStrings("coap", it.next().?);
+    try std.testing.expectEqual(@as(?[]const u8, null), it.next());
+    // Two names is a client list, not a server selection.
+    try std.testing.expectError(error.Malformed, decodeAlpnSelected(body));
+    const one = try encodeAlpn(&.{"coap"}, &buf);
+    try std.testing.expectEqualStrings("coap", try decodeAlpnSelected(one));
+}
+
+test "ALPN (RFC 7301 §3.1): malformed lists are typed errors — empty name, empty list, overrun, wrong outer length" {
+    try std.testing.expectError(error.Malformed, AlpnIter.init(&.{}));
+    try std.testing.expectError(error.Malformed, AlpnIter.init(&.{ 0, 0 }));
+    try std.testing.expectError(error.Malformed, AlpnIter.init(&.{ 0, 1, 0 }));
+    try std.testing.expectError(error.Malformed, AlpnIter.init(&.{ 0, 3, 5, 'a', 'b' }));
+    try std.testing.expectError(error.Malformed, AlpnIter.init(&.{ 0, 4, 2, 'a', 'b' }));
+    try std.testing.expectError(error.Malformed, AlpnIter.init(&.{ 0, 2, 2, 'a', 'b' }));
+    var buf: [8]u8 = undefined;
+    try std.testing.expectError(error.Malformed, encodeAlpn(&.{""}, &buf));
+    try std.testing.expectError(error.Malformed, encodeAlpn(&.{}, &buf));
+    var long: [256]u8 = @splat('x');
+    try std.testing.expectError(error.Malformed, encodeAlpn(&.{&long}, &buf));
+}
+
+test "ALPN: every truncation of a valid list is a typed error, never a panic" {
+    var buf: [64]u8 = undefined;
+    const body = try encodeAlpn(&.{ "h2", "coap", "x" }, &buf);
+    for (0..body.len) |n| {
+        if (AlpnIter.init(body[0..n])) |_| return error.TestUnexpectedResult else |e| try std.testing.expectEqual(error.Malformed, e);
+    }
 }

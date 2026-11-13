@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [openssl/openssl](https://github.com/openssl/openssl) | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | DTLS 1.0/1.2, SRTP; DTLS 1.3 not offered as far as the survey could tell *(inferred)*. |
 | Zig `std` / Rust `rustls` / Go `crypto/tls` | — | MIT / mixed / BSD-3-Clause | — | — | None of them implement DTLS. |
 
-**Where we are ahead:** the only DTLS in pure Zig, and a rare DTLS 1.3 (RFC 9147) one at all: mbedtls and OpenSSL have none *(inferred)*; wire-verified against a live wolfSSL 5.9.1 in both roles (PSK and certificate mode, HelloRetryRequest, a 256-byte-MTU fragmented Certificate, mutual authentication), plus the X25519MLKEM768 hybrid key share, which pion does not list. **Where we are behind:** DTLS 1.2 entirely; KeyUpdate, resumption and 0-RTT; the CCM suites (the RFC 7925 CoAP default; untested against any peer) and AES-256-GCM; connection ID beyond framing; ALPN and the exporter (so no DTLS-SRTP/WebRTC).
+**Where we are ahead:** the only DTLS in pure Zig, and a rare DTLS 1.3 (RFC 9147) one at all: mbedtls and OpenSSL have none *(inferred)*; wire-verified against a live wolfSSL 5.9.1 in both roles (PSK and certificate mode, HelloRetryRequest, a 256-byte-MTU fragmented Certificate, mutual authentication), plus the X25519MLKEM768 hybrid key share, which pion does not list. **Where we are behind:** DTLS 1.2 entirely; resumption and 0-RTT; the CCM suites (the RFC 7925 CoAP default; untested against any peer) and AES-256-GCM; connection ID beyond framing; `use_srtp` (the exporter and ALPN it builds on landed 2026-11-13, as did KeyUpdate).
 
 ## Design & invariants
 
@@ -312,6 +312,57 @@ same PEER-supplied X.509 via the same `certauth` path, so it inherits the
 `certauth.zig` verbatim — this pass adds no new cert-parse call sites beyond
 that path and does not worsen it; hardened DER parsing remains the tracked
 follow-up.
+
+## Post-handshake: KeyUpdate, exporter, ALPN (2026-11-13)
+
+API (additive; every existing caller is unchanged):
+
+- **KeyUpdate** (RFC 9147 §8, RFC 8446 §4.6.3/§7.2).
+  `Connection.requestKeyUpdate(request_peer)` queues one;
+  `Config.key_update_after_records` (default 2^24, the RFC 8446 §5.5 AES-GCM
+  margin; `null` = off) queues one automatically from `send`. `poll(now_ms,
+  out)`, which used to return `null` once connected, now returns the control
+  records this side owes, one record per call: the ACK for processed
+  post-handshake messages, then the queued KeyUpdate, then — timer-gated —
+  a retransmission of an un-ACKed KeyUpdate in a fresh record. The write key
+  switches only when an ACK names a record that carried the KeyUpdate
+  (§8: "MUST NOT send records with the new keys ... until the previous
+  KeyUpdate has been acknowledged"). `recv` on a peer KeyUpdate returns the
+  new `error.ReceivedKeyUpdate`: the read key moved to the next secret, the
+  previous one is kept (one generation, §8 "MUST retain the pre-update
+  keying material"; §4.2.2 epoch reconstruction picks it by the 2 epoch
+  bits), an ACK is queued and, for `update_requested`, so is this side's own
+  update unless one is pending or the 2^48-1 epoch ceiling forbids it (§8
+  overrides TLS's "MUST respond"). A retransmitted KeyUpdate only re-ACKs. A
+  NewSessionTicket is ACKed and ignored (no resumption). Request values
+  other than 0/1, a wrong length, a KeyUpdate under the previous epoch, or
+  any other post-handshake type is `error.Malformed`. New errors:
+  `ReceivedKeyUpdate`, `KeyUpdatePending`. Epochs are `u64`
+  (`write_epoch`/`read_epoch`).
+- **Exporter** (RFC 8446 §7.5). `Connection.exportKeyingMaterial(label,
+  context, out)` over `exporter_master_secret` (derived with the
+  application secrets via `tls13.keyschedule.deriveApplicationSecrets`),
+  with RFC 9147 §5.9's `"dtls13"` HKDF-Expand-Label prefix — so the bytes
+  differ from a TLS 1.3 exporter over the same secret. Bounds are errors
+  (`LabelTooLong`, `OutputTooLong`); `NotConnected` before the handshake.
+  This is what DTLS-SRTP keying (RFC 5764's `"EXTRACTOR-dtls_srtp"`) needs;
+  `use_srtp` negotiation itself is still Backlog.
+- **ALPN** (RFC 7301). `Config.alpn_protocols` (preference order, each name
+  1..255 bytes, encoded list ≤ 256 bytes — `error.InvalidAlpnProtocols`).
+  Client: offered in both ClientHello forms; a server answer must be one
+  name it offered (`error.Malformed` otherwise). Server: its first
+  preference the client also offered goes into EncryptedExtensions; an offer
+  with no overlap is `error.NoApplicationProtocol` (§3.2). Result:
+  `Connection.negotiatedAlpn()`. The client's EncryptedExtensions buffer grew
+  64 → 512 bytes, so a server's other EE extensions still fit.
+
+**Validation:** no published DTLS 1.3 KeyUpdate or exporter vector exists
+(RFC 8448 has neither); the tests are the RFC 9147 §8 Figure 14 exchange in
+both suites, the next read key re-derived independently from RFC 8446 §7.2's
+`"traffic upd"` label, late previous-epoch records, a lost KeyUpdate and a
+lost ACK, the exporter equal on both sides and distinct from the TLS-prefix
+exporter. Not yet against a live peer: the wolfSSL interop program has no
+KeyUpdate or ALPN case.
 
 ## Threat model / out of scope
 
@@ -605,9 +656,9 @@ two `Connection`s written from the same reading of the RFC cannot see.
 - 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet; still the stateless call per record — a cached context would need per-epoch key storage behind the generic `Protection(Aead)` shared with ChaCha20 (deferred until a consumer measures DTLS throughput).
 
 - **DTLS 1.2 (RFC 6347) client/server** (survey 2026-09-30). Every mbedtls-, OpenSSL- and most wolfSSL-based peer, WebRTC, LwM2M and most CoAP gear speak 1.2; pion/dtls and wolfSSL both offer it. A user with any such peer cannot connect. Effort: large (separate handshake, cookie exchange, CBC/GCM/CCM record layer, EMS). Fits §2.
-- **KeyUpdate (send and receive) and the 48-bit sequence rekey** (survey 2026-09-30). A peer that sends KeyUpdate makes the connection unusable here (`ReceivedPostHandshakeMessage`), and the sender stops at the 2^48 ceiling. Effort: medium. Fits §2.
-- **CCM / CCM_8 suites and AES-256-GCM** (survey 2026-09-30). RFC 7925's constrained-device profile, this module's stated CoAP audience, mandates CCM_8. Blocked on a 12-byte-nonce CCM (std 0.17 exports only the 13-byte presets; its generic `AesCcm` is private, `aes_ccm.zig:36`); needs an own CCM. Effort: medium. Fits §2.
+- **KeyUpdate / ALPN against a live peer** (2026-11-13). Implemented and self-interop tested (see "Post-handshake"), but `tools/interop.zig` has no case where wolfSSL sends or answers a KeyUpdate or negotiates ALPN; adding one means extending the reviewed `wolfssl_peer.c` (`wolfSSL_update_keys`, `wolfSSL_UseALPN`) and re-capturing the replay transcript. Effort: small.
+- **CCM / CCM_8 suites** (survey 2026-09-30). RFC 7925's constrained-device profile, this module's stated CoAP audience, mandates CCM_8. Blocked on a 12-byte-nonce CCM: std 0.17.1 exports only the 13-byte presets (its generic `AesCcm` is private, `aes_ccm.zig:36`), and the sibling `oscore` uses std's 13-byte `Aes128Ccm8` directly, so there is no CCM core to reuse. Wanted: an **`aesccm` module (12/13-byte nonce, tag 8/16) shared by oscore + dtls** (rechecked 2026-11-13). Effort: medium. Fits §2.
 - **Session tickets / resumption and 0-RTT** (survey 2026-09-30). Saves a handshake on constrained links; pion has it for 1.2, wolfSSL for 1.3. Effort: medium (sibling `tlsresume` covers the server ticket seal for TLS). Fits §2.
-- **TLS exporter (RFC 5705/8446 §7.5) and ALPN, then use_srtp** (survey 2026-09-30). Needed for DTLS-SRTP (WebRTC) and for any protocol that binds keys to the channel. Effort: small (exporter), small (ALPN), medium (SRTP). Fits §2.
+- **use_srtp (RFC 5764)** (survey 2026-09-30; exporter and ALPN landed 2026-11-13). The SRTP protection-profile negotiation; the keying material is already `exportKeyingMaterial("EXTRACTOR-dtls_srtp", …)`. Needed for DTLS-SRTP (WebRTC). Effort: medium. Fits §2.
 - **Dead-stack hygiene, what the 2026-10-09 sweep did not cover** (narrowed from "beyond CertificateVerify signing"). `Connection.startHandshake`/`handleFlight`/`installApplicationKeys`/`send`/`recv` are burned and probed through a full in-memory handshake (PSK, cert X25519, cert P-256 with mutual auth, cert X25519MLKEM768; both AEADs; 0 residue, see CHANGELOG). Not covered: (a) the standalone public helpers `keyschedule.*`, `aead.Protection`, `record.*` called directly by a consumer return/take secrets by value in the CALLER's frame (the engine's own uses are inside the entry-point burns); (b) secrets that stay in the live `Connection` after the handshake (`pending_ap_*` on the server, `hs_*` keys and traffic secrets until `deinit`) are by design, not dead stack; (c) HelloRetryRequest/cookie flows and the retransmission path (`poll`) are not driven by the probe; (d) the signature noise and nonce of the client/server CertificateVerify are measured only as far as the entropy draw and `certverify.sign`'s own probe, not the ECDSA nonce itself inside a live connection. Effort: small.
 
