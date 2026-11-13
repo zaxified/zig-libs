@@ -10,12 +10,15 @@
 //! native P2WSH multisig, P2SH-P2WSH multisig, and P2TR key-path (via
 //! `PSBT_IN_TAP_KEY_SIG`, BIP371's field — not part of BIP174 v0 proper, but
 //! added to `input_key` in `root.zig` so a taproot input can be finalized at
-//! all). Multisig scripts are recognized only in the `OP_1..OP_16 <pubkey>*
+//! all) and P2TR script path (BIP371 `TAP_LEAF_SCRIPT` + `TAP_SCRIPT_SIG`, for
+//! a leaf that is `<key> OP_CHECKSIG` or BIP387 `multi_a`; the control block
+//! must commit to the output key). Multisig scripts are recognized only in the `OP_1..OP_16 <pubkey>*
 //! OP_1..OP_16 OP_CHECKMULTISIG` shape (every real-world multisig script);
 //! `M`/`N` encoded as a generic `CScriptNum` push (valid consensus, but
 //! never used in practice since it only matters above 16 keys) is treated as
 //! non-standard. Anything else — timelocked scripts, tapscript,
-//! non-multisig bare P2SH redeem scripts — is `error.NonStandardScript`,
+//! non-multisig bare P2SH redeem scripts, any other tapscript leaf — is
+//! `error.NonStandardScript`,
 //! never silently mis-assembled.
 //!
 //! ## Verify-on-finalize
@@ -41,8 +44,11 @@
 //!
 //! Per spec, all input fields except the UTXO and unknown/proprietary
 //! fields are cleared once finalized: `PARTIAL_SIG`, `SIGHASH_TYPE`,
-//! `REDEEM_SCRIPT`, `WITNESS_SCRIPT`, `BIP32_DERIVATION`, and (this module's
-//! addition) `TAP_KEY_SIG` are dropped from the input map; everything else
+//! `REDEEM_SCRIPT`, `WITNESS_SCRIPT`, `BIP32_DERIVATION`, the hash-preimage
+//! fields and (this module's addition, per BIP371 "Finalizers should remove")
+//! `TAP_KEY_SIG`/`TAP_SCRIPT_SIG`/`TAP_LEAF_SCRIPT`/`TAP_MERKLE_ROOT` are
+//! dropped from the input map (`TAP_INTERNAL_KEY` and `TAP_BIP32_DERIVATION`,
+//! which BIP371 does not ask to remove, stay); everything else
 //! (the UTXO, `PROPRIETARY`, any unrecognized key type) passes through
 //! untouched. `finalize` is idempotent: an input that already carries a
 //! `FINAL_SCRIPTSIG`/`FINAL_SCRIPTWITNESS` is left exactly as-is (treated as
@@ -346,6 +352,86 @@ fn buildMultisigWitness(
     return items.toOwnedSlice(allocator);
 }
 
+// ── P2TR script path (BIP371 PSBT_IN_TAP_LEAF_SCRIPT / TAP_SCRIPT_SIG) ──
+
+/// A recognized tapscript leaf: `n` x-only keys, `m` of which must sign.
+/// `n == 1`: `<key> OP_CHECKSIG` (and `m == 1`). `n > 1`: BIP387 `multi_a`,
+/// `<k1> OP_CHECKSIG (<ki> OP_CHECKSIGADD)* <m> OP_NUMEQUAL`. Either way key
+/// `i` sits at `script[1 + 34 * i ..][0..32]`, because every key element is
+/// `0x20 <32 bytes> <opcode>`.
+const TapLeafShape = struct { n: usize, m: usize };
+
+fn parseTapLeaf(script: []const u8) ?TapLeafShape {
+    const OP_CHECKSIG = 0xac;
+    const OP_CHECKSIGADD = 0xba;
+    const OP_NUMEQUAL = 0x9c;
+    if (script.len == 34 and script[0] == 0x20 and script[33] == OP_CHECKSIG) return .{ .n = 1, .m = 1 };
+    // multi_a: n key elements, then the threshold, then OP_NUMEQUAL.
+    var n: usize = 0;
+    var o: usize = 0;
+    while (o + 34 <= script.len and script[o] == 0x20 and script[o + 33] == (if (n == 0) @as(u8, OP_CHECKSIG) else OP_CHECKSIGADD)) {
+        n += 1;
+        o += 34;
+    }
+    if (n < 2) return null;
+    const tail = script[o..];
+    const m: usize = if (tail.len == 2 and tail[0] >= 0x51 and tail[0] <= 0x60 and tail[1] == OP_NUMEQUAL)
+        tail[0] - 0x50
+    else if (tail.len == 3 and tail[0] == 0x01 and tail[1] >= 17 and tail[1] <= 0x7f and tail[2] == OP_NUMEQUAL)
+        tail[1] // a minimal one-byte push of 17..127
+    else
+        return null;
+    if (m > n) return null;
+    return .{ .n = n, .m = m };
+}
+
+/// Witness stack of a script-path spend: `[sig for key n .. sig for key 1,
+/// script, control block]` (the interpreter consumes key 1's signature first,
+/// so it is the stack top; a key that does not sign gets an empty item and
+/// exactly `m` keys sign -- `OP_NUMEQUAL` rejects more). The first leaf that
+/// commits to the output key (BIP341) and that the signatures present
+/// satisfy is used; a leaf with an invalid signature is not retried -- the
+/// caller's `verifyScript` pass rejects the input.
+fn finalizeTaprootScriptPath(allocator: Allocator, m: psbt.Map, program: []const u8) InputFinalizeError![][]const u8 {
+    var saw_leaf = false;
+    var saw_recognized = false;
+    var err: InputFinalizeError = error.MissingTaprootSignature;
+    var it = psbt.bip371.inputTapLeafScripts(m);
+    while (it.next()) |leaf| {
+        saw_leaf = true;
+        if (leaf.leaf_version != bitcoinscript.tapscript.TAPSCRIPT_LEAF_VERSION) continue;
+        if (leaf.control_block[0] & 0xfe != leaf.leaf_version) continue;
+        if (!bitcoinscript.tapscript.verifyCommitment(program, leaf.control_block, leaf.script)) continue;
+        const shape = parseTapLeaf(leaf.script) orelse continue;
+        saw_recognized = true;
+        const leaf_hash = bitcoinscript.tapscript.tapleafHash(leaf.leaf_version, leaf.script);
+
+        const items = try allocator.alloc([]const u8, shape.n + 2);
+        errdefer allocator.free(items);
+        for (items[0..shape.n]) |*item| item.* = &.{};
+        var have: usize = 0;
+        var i: usize = 0;
+        while (i < shape.n and have < shape.m) : (i += 1) {
+            const key: [32]u8 = leaf.script[1 + 34 * i ..][0..32].*;
+            if (psbt.bip371.inputTapScriptSig(m, key, leaf_hash)) |sig| {
+                items[shape.n - 1 - i] = sig; // key 1's signature ends up on top of the stack
+                have += 1;
+            }
+        }
+        if (have < shape.m) {
+            allocator.free(items);
+            // Some but too few signatures on a multi_a leaf is the more telling refusal.
+            if (have > 0 and shape.n > 1) err = error.InsufficientSignatures;
+            continue;
+        }
+        items[shape.n] = leaf.script;
+        items[shape.n + 1] = leaf.control_block;
+        return items;
+    }
+    if (saw_recognized) return err;
+    return if (saw_leaf) error.NonStandardScript else error.MissingTaprootSignature;
+}
+
 fn finalizeWitnessProgram(
     allocator: Allocator,
     m: psbt.Map,
@@ -365,10 +451,10 @@ fn finalizeWitnessProgram(
         return try buildMultisigWitness(allocator, m, ws.value, expected_sighash, ctx);
     }
     if (wp.version == 1 and wp.program.len == 32) {
-        // P2TR key-path.
+        // P2TR: key path when TAP_KEY_SIG is there, else a script path.
         if (!all_utxos_resolved) return error.TaprootMissingAllUtxos;
-        const sig = psbt.inputTapKeySig(m) orelse return error.MissingTaprootSignature;
-        return try allocator.dupe([]const u8, &[_][]const u8{sig});
+        if (psbt.inputTapKeySig(m)) |sig| return try allocator.dupe([]const u8, &[_][]const u8{sig});
+        return try finalizeTaprootScriptPath(allocator, m, wp.program);
     }
     return error.NonStandardScript;
 }
@@ -478,7 +564,14 @@ fn isClearableOnFinalize(keytype: u64) bool {
         psbt.input_key.REDEEM_SCRIPT,
         psbt.input_key.WITNESS_SCRIPT,
         psbt.input_key.BIP32_DERIVATION,
+        psbt.input_key.RIPEMD160,
+        psbt.input_key.SHA256,
+        psbt.input_key.HASH160,
+        psbt.input_key.HASH256,
         psbt.input_key.TAP_KEY_SIG,
+        psbt.input_key.TAP_SCRIPT_SIG,
+        psbt.input_key.TAP_LEAF_SCRIPT,
+        psbt.input_key.TAP_MERKLE_ROOT,
         => true,
         else => false,
     };

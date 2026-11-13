@@ -31,11 +31,15 @@
 //!    nonzero `PSBT_GLOBAL_VERSION` with `error.UnsupportedPsbtVersion`. These
 //!    two Core vectors are this fix's external oracle (test group A below).
 //!
-//! 2. **Everything else Core's `invalid`/`invalid_with_msg` sets exercise
-//!    that this module still accepts is out of its declared scope, not a
-//!    bug.** Every remaining case was individually decoded (its keytypes
+//! 2. **BIP371 defects are now rejected (2026-11-13).** Core's 11 `invalid[]`
+//!    taproot-field cases (28-35, 37, 38, 41) and `invalid_with_msg[0]`/`[1]`
+//!    (taproot keypath length, empty tap tree) were accepted as passthrough
+//!    until `parse` learned the BIP371 field shapes (`bip371.zig`); each is now
+//!    a reject with a specific error. **Everything else Core's
+//!    `invalid`/`invalid_with_msg` sets exercise that this module still accepts
+//!    is out of its declared scope, not a bug.** Every remaining case was individually decoded (its keytypes
 //!    inspected directly, not guessed from Core's message) and falls into
-//!    exactly one bucket: BIP371 Taproot single-sig fields (`0x13`-`0x18`,
+//!    exactly one bucket: (formerly) BIP371 Taproot single-sig fields (`0x13`-`0x18`,
 //!    `0x5`-`0x7` at output scope), MuSig2 fields (`0x1a`-`0x1c`, a BIP-374-ish
 //!    proposal Core validates), BIP370 (PSBTv2) fields coexisting with or
 //!    instead of this module's v0 fields, or BIP174 §"Signer"'s TXID-of-
@@ -110,9 +114,38 @@ test "Core invalid[19] and invalid[42]: PSBT_GLOBAL_VERSION=1/2 specifically rej
 
 // ── B/C: out-of-scope BIP370/BIP371/MuSig2/Signer-role content -- ACCEPTED, not a bug ──
 
-test "Core invalid[]: BIP370/BIP371/MuSig2/Signer-role content is accepted as opaque passthrough (documented scope cut, not a bug)" {
+/// BIP371 field defects Core's `invalid` set lists; `parse` has validated these
+/// since the BIP371 typed fields landed (`bip371.zig`), each with the error for
+/// its defect. Indices are Core's `invalid[]`.
+fn expectedTaprootRejection(core_index: usize) ?anyerror {
+    return switch (core_index) {
+        28, 29, 30, 32, 35 => error.InvalidFixedFieldLength, // key / script-sig / internal-key values of the wrong size
+        31, 33, 34, 37, 38, 41 => error.InvalidKeyDataLength, // x-only key, key+leaf hash or control block of the wrong size
+        else => null,
+    };
+}
+
+test "Core invalid[]: BIP371 field defects are rejected with the specific error (formerly accepted as out of scope)" {
+    const allocator = testing.allocator;
+    var n: usize = 0;
+    for (vectors.invalid_out_of_scope) |case| {
+        if (!std.mem.eql(u8, case.reason, "taproot")) continue;
+        const raw = try hexToBytesAlloc(allocator, case.hex);
+        defer allocator.free(raw);
+        const want = expectedTaprootRejection(case.core_index) orelse return error.TestUnexpectedResult;
+        testing.expectError(want, psbt.parse(allocator, raw)) catch |err| {
+            std.debug.print("FAIL: core_index={d}\n", .{case.core_index});
+            return err;
+        };
+        n += 1;
+    }
+    try testing.expectEqual(@as(usize, 11), n);
+}
+
+test "Core invalid[]: BIP370/MuSig2/Signer-role content is accepted as opaque passthrough (documented scope cut, not a bug)" {
     const allocator = testing.allocator;
     for (vectors.invalid_out_of_scope) |case| {
+        if (std.mem.eql(u8, case.reason, "taproot")) continue;
         const raw = try hexToBytesAlloc(allocator, case.hex);
         defer allocator.free(raw);
         var result = psbt.parse(allocator, raw) catch |err| {
@@ -130,7 +163,7 @@ test "Core invalid[]: BIP370/BIP371/MuSig2/Signer-role content is accepted as op
     }
 }
 
-test "Core invalid_with_msg: 4 of 23 rejected (3 defensibly, 1 coincidentally); the other 19 are out-of-scope Taproot/MuSig2 content, accepted" {
+test "Core invalid_with_msg: 6 of 23 rejected (3 as PSBTv2, 2 BIP371 defects, 1 garbage); the other 17 are MuSig2 content, accepted" {
     const allocator = testing.allocator;
     for (vectors.invalid_with_msg) |case| {
         const raw = try hexToBytesAlloc(allocator, case.hex);
@@ -146,23 +179,29 @@ test "Core invalid_with_msg: 4 of 23 rejected (3 defensibly, 1 coincidentally); 
                 };
             },
             0 => {
-                // Coincidental (see file doc comment): fuzzer garbage, so
-                // Truncated fires from the unrelated "not enough bytes for
-                // the maps the garbage unsigned tx implies" path -- not
-                // because this module validates Taproot BIP32 keypath length.
-                testing.expectError(error.Truncated, result) catch |err| {
+                // "Input Taproot BIP32 keypath has an invalid length": the
+                // BIP371 derivation value shape check (it used to be rejected
+                // only coincidentally, as fuzzer garbage).
+                testing.expectError(error.InvalidFixedFieldLength, result) catch |err| {
                     std.debug.print("FAIL: core_index=0 (core msg: \"{s}\")\n", .{case.core_message});
                     return err;
                 };
             },
+            1 => {
+                // "Output Taproot tree must not be empty".
+                testing.expectError(error.InvalidTapTree, result) catch |err| {
+                    std.debug.print("FAIL: core_index=1 (core msg: \"{s}\")\n", .{case.core_message});
+                    return err;
+                };
+            },
             else => {
-                // Out-of-scope Taproot/MuSig2 content: must be ACCEPTED.
+                // Out-of-scope MuSig2 content: must be ACCEPTED.
                 if (result) |r| {
                     var res = r;
                     res.deinit(allocator);
                 } else |err| {
                     std.debug.print(
-                        "FAIL (expected ACCEPT as out-of-scope Taproot/MuSig2 content): core_index={d} (core msg: \"{s}\") err={}\n",
+                        "FAIL (expected ACCEPT as out-of-scope MuSig2 content): core_index={d} (core msg: \"{s}\") err={}\n",
                         .{ case.core_index, case.core_message, err },
                     );
                     return err;

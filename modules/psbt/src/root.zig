@@ -95,18 +95,39 @@ pub const input_key = struct {
     pub const BIP32_DERIVATION: u64 = 0x06;
     pub const FINAL_SCRIPTSIG: u64 = 0x07;
     pub const FINAL_SCRIPTWITNESS: u64 = 0x08;
+    /// `PSBT_IN_RIPEMD160` .. `PSBT_IN_HASH256` (BIP174): keydata is the hash,
+    /// value is its preimage. See `PreimageKind`.
+    pub const RIPEMD160: u64 = 0x0a;
+    pub const SHA256: u64 = 0x0b;
+    pub const HASH160: u64 = 0x0c;
+    pub const HASH256: u64 = 0x0d;
     pub const PROPRIETARY: u64 = 0xfc;
     /// BIP371's taproot key-path signature (not part of BIP174 v0 proper —
     /// added here so `finalize.zig` can assemble a P2TR key-path witness;
     /// see its module doc comment). Value is the 64-byte BIP340 Schnorr
     /// signature, or 65 bytes with an explicit trailing sighash-type byte.
     pub const TAP_KEY_SIG: u64 = 0x13;
+    /// BIP371: keydata `<xonlypubkey> <leafhash>`, value a 64/65-byte signature.
+    pub const TAP_SCRIPT_SIG: u64 = 0x14;
+    /// BIP371: keydata the control block, value `<script> <leaf version>`.
+    pub const TAP_LEAF_SCRIPT: u64 = 0x15;
+    /// BIP371: keydata an x-only key, value `<n> <leafhash>*n <fingerprint> <path>`.
+    pub const TAP_BIP32_DERIVATION: u64 = 0x16;
+    /// BIP371: the 32-byte x-only internal key.
+    pub const TAP_INTERNAL_KEY: u64 = 0x17;
+    /// BIP371: the 32-byte script-tree merkle root.
+    pub const TAP_MERKLE_ROOT: u64 = 0x18;
 };
 
 pub const output_key = struct {
     pub const REDEEM_SCRIPT: u64 = 0x00;
     pub const WITNESS_SCRIPT: u64 = 0x01;
     pub const BIP32_DERIVATION: u64 = 0x02;
+    /// BIP371 output fields: the internal key, the script tree
+    /// (`{depth leaf-version script-len script}*`) and per-key derivations.
+    pub const TAP_INTERNAL_KEY: u64 = 0x05;
+    pub const TAP_TREE: u64 = 0x06;
+    pub const TAP_BIP32_DERIVATION: u64 = 0x07;
     pub const PROPRIETARY: u64 = 0xfc;
 };
 
@@ -153,6 +174,33 @@ pub const Map = struct {
             if (r.keytype == keytype and std.mem.eql(u8, r.keydata, keydata)) return r;
         }
         return null;
+    }
+
+    /// Stores `rec`: replaces the value of the record with the same raw key,
+    /// otherwise inserts it before the first record whose raw key sorts after
+    /// it (so a map built only through `put` is in BIP174's key order, the
+    /// order Bitcoin Core writes). `rec.keydata`/`rec.value` are stored as
+    /// given, not copied -- the typed `set*` functions (see `update.zig`) own
+    /// their buffers through an arena-like allocator, like `finalize`.
+    /// `allocator` must be the one `records` was allocated with.
+    pub fn put(self: *Map, allocator: Allocator, rec: Record) Allocator.Error!void {
+        for (self.records) |*r| {
+            if (keysEqual(r.*, rec)) {
+                r.value = rec.value;
+                return;
+            }
+        }
+        var at: usize = self.records.len;
+        for (self.records, 0..) |r, i| {
+            if (lessThanKey({}, rec, r)) {
+                at = i;
+                break;
+            }
+        }
+        const old_len = self.records.len;
+        self.records = try allocator.realloc(self.records, old_len + 1);
+        std.mem.copyBackwards(Record, self.records[at + 1 ..], self.records[at..old_len]);
+        self.records[at] = rec;
     }
 };
 
@@ -300,7 +348,39 @@ fn readCompactSizeAdvance(bytes: []const u8, offset: *usize) bitcointx.tx.Compac
     return r.value;
 }
 
-pub const ParseError = bitcointx.tx.DeserializeError || error{
+/// A key-value record that is shaped wrongly for its (known) key type. Raised
+/// by `parse` for every record, and by the typed `set*` functions for the one
+/// record they build, so a PSBT assembled through them always parses back.
+pub const RecordError = error{
+    /// A "no key data" field (see `Map.find`'s doc comment) has extra
+    /// bytes in its key beyond the type byte.
+    UnexpectedKeyData,
+    /// A pubkey-keyed field's keydata is neither 33 (compressed) nor 65
+    /// (uncompressed) bytes.
+    InvalidPubkeyLength,
+    /// A fixed-shape value (VERSION/SIGHASH_TYPE: exactly 4 bytes; XPUB/
+    /// BIP32_DERIVATION: a 4-byte fingerprint plus a whole number of
+    /// 4-byte path elements; the BIP371 key/signature/derivation values)
+    /// doesn't match its required shape.
+    InvalidFixedFieldLength,
+    /// The keydata of a field whose key carries a fixed-size datum (a BIP371
+    /// x-only key, key + leaf hash, control block; a BIP174 preimage hash) has
+    /// the wrong size.
+    InvalidKeyDataLength,
+    /// `PSBT_OUT_TAP_TREE` is empty, has a leaf version with the low bit set or
+    /// a depth above 128, or its leaves are not the depth-first listing of one
+    /// complete binary tree (BIP371).
+    InvalidTapTree,
+    /// `PSBT_GLOBAL_VERSION` is present with a nonzero value. BIP174
+    /// §"Version 0": "Version 0 PSBTs must either omit PSBT_GLOBAL_VERSION
+    /// or include it and set it to 0." This module implements BIP174 v0
+    /// only (BIP370/PSBTv2 is out of scope -- see SPEC.md), so a PSBT that
+    /// declares a different version cannot be correctly interpreted and
+    /// must be rejected rather than silently parsed as if it were v0.
+    UnsupportedPsbtVersion,
+};
+
+pub const ParseError = bitcointx.tx.DeserializeError || RecordError || error{
     /// The first 5 bytes are not `0x70 0x73 0x62 0x74 0xff`.
     BadMagic,
     /// The same raw key (keytype + keydata) appears twice in one map.
@@ -313,23 +393,6 @@ pub const ParseError = bitcointx.tx.DeserializeError || error{
     /// The unsigned tx has a non-empty scriptSig on some input; BIP174
     /// requires every input's scriptSig to be empty.
     UnsignedTxHasScriptSig,
-    /// A "no key data" field (see `Map.find`'s doc comment) has extra
-    /// bytes in its key beyond the type byte.
-    UnexpectedKeyData,
-    /// A pubkey-keyed field's keydata is neither 33 (compressed) nor 65
-    /// (uncompressed) bytes.
-    InvalidPubkeyLength,
-    /// A fixed-shape value (VERSION/SIGHASH_TYPE: exactly 4 bytes; XPUB/
-    /// BIP32_DERIVATION: a 4-byte fingerprint plus a whole number of
-    /// 4-byte path elements) doesn't match its required shape.
-    InvalidFixedFieldLength,
-    /// `PSBT_GLOBAL_VERSION` is present with a nonzero value. BIP174
-    /// §"Version 0": "Version 0 PSBTs must either omit PSBT_GLOBAL_VERSION
-    /// or include it and set it to 0." This module implements BIP174 v0
-    /// only (BIP370/PSBTv2 is out of scope -- see SPEC.md), so a PSBT that
-    /// declares a different version cannot be correctly interpreted and
-    /// must be rejected rather than silently parsed as if it were v0.
-    UnsupportedPsbtVersion,
 };
 
 fn parseMap(allocator: Allocator, bytes: []const u8, offset: *usize) ParseError!Map {
@@ -361,73 +424,82 @@ fn parseMap(allocator: Allocator, bytes: []const u8, offset: *usize) ParseError!
     return .{ .records = try records.toOwnedSlice(allocator) };
 }
 
-fn requireNoKeyData(r: Record) ParseError!void {
+pub fn requireNoKeyData(r: Record) RecordError!void {
     if (r.keydata.len != 0) return error.UnexpectedKeyData;
 }
 
-fn requirePubkeyLen(r: Record) ParseError!void {
+fn requirePubkeyLen(r: Record) RecordError!void {
     if (r.keydata.len != 33 and r.keydata.len != 65) return error.InvalidPubkeyLength;
 }
 
-fn requireFixedValueLen(r: Record, n: usize) ParseError!void {
+pub fn requireFixedValueLen(r: Record, n: usize) RecordError!void {
     if (r.value.len != n) return error.InvalidFixedFieldLength;
 }
 
-fn requireBip32ValueShape(r: Record) ParseError!void {
+fn requireBip32ValueShape(r: Record) RecordError!void {
     if (r.value.len < 4 or (r.value.len - 4) % 4 != 0) return error.InvalidFixedFieldLength;
 }
 
-fn validateGlobalMap(m: Map) ParseError!void {
-    for (m.records) |r| {
-        switch (r.keytype) {
-            global_key.UNSIGNED_TX => try requireNoKeyData(r),
-            global_key.VERSION => {
-                try requireNoKeyData(r);
-                try requireFixedValueLen(r, 4);
-                // BIP174 §"Version 0": a present PSBT_GLOBAL_VERSION must be 0.
-                if (std.mem.readInt(u32, r.value[0..4], .little) != 0) return error.UnsupportedPsbtVersion;
-            },
-            global_key.XPUB => try requireBip32ValueShape(r),
-            else => {}, // unknown / PROPRIETARY -- opaque passthrough
-        }
+/// Structural check of one global-map record (what `parse` applies to each).
+pub fn validateGlobalRecord(r: Record) RecordError!void {
+    switch (r.keytype) {
+        global_key.UNSIGNED_TX => try requireNoKeyData(r),
+        global_key.VERSION => {
+            try requireNoKeyData(r);
+            try requireFixedValueLen(r, 4);
+            // BIP174 §"Version 0": a present PSBT_GLOBAL_VERSION must be 0.
+            if (std.mem.readInt(u32, r.value[0..4], .little) != 0) return error.UnsupportedPsbtVersion;
+        },
+        global_key.XPUB => try requireBip32ValueShape(r),
+        else => {}, // unknown / PROPRIETARY -- opaque passthrough
     }
 }
 
-fn validateInputMap(m: Map) ParseError!void {
-    for (m.records) |r| {
-        switch (r.keytype) {
-            input_key.NON_WITNESS_UTXO,
-            input_key.WITNESS_UTXO,
-            input_key.REDEEM_SCRIPT,
-            input_key.WITNESS_SCRIPT,
-            input_key.FINAL_SCRIPTSIG,
-            input_key.FINAL_SCRIPTWITNESS,
-            => try requireNoKeyData(r),
-            input_key.SIGHASH_TYPE => {
-                try requireNoKeyData(r);
-                try requireFixedValueLen(r, 4);
-            },
-            input_key.PARTIAL_SIG => try requirePubkeyLen(r),
-            input_key.BIP32_DERIVATION => {
-                try requirePubkeyLen(r);
-                try requireBip32ValueShape(r);
-            },
-            else => {},
-        }
+/// Structural check of one input-map record.
+pub fn validateInputRecord(r: Record) RecordError!void {
+    switch (r.keytype) {
+        input_key.NON_WITNESS_UTXO,
+        input_key.WITNESS_UTXO,
+        input_key.REDEEM_SCRIPT,
+        input_key.WITNESS_SCRIPT,
+        input_key.FINAL_SCRIPTSIG,
+        input_key.FINAL_SCRIPTWITNESS,
+        => try requireNoKeyData(r),
+        input_key.SIGHASH_TYPE => {
+            try requireNoKeyData(r);
+            try requireFixedValueLen(r, 4);
+        },
+        input_key.PARTIAL_SIG => try requirePubkeyLen(r),
+        input_key.BIP32_DERIVATION => {
+            try requirePubkeyLen(r);
+            try requireBip32ValueShape(r);
+        },
+        else => try bip371.validateInputRecord(r),
     }
 }
 
-fn validateOutputMap(m: Map) ParseError!void {
-    for (m.records) |r| {
-        switch (r.keytype) {
-            output_key.REDEEM_SCRIPT, output_key.WITNESS_SCRIPT => try requireNoKeyData(r),
-            output_key.BIP32_DERIVATION => {
-                try requirePubkeyLen(r);
-                try requireBip32ValueShape(r);
-            },
-            else => {},
-        }
+/// Structural check of one output-map record.
+pub fn validateOutputRecord(r: Record) RecordError!void {
+    switch (r.keytype) {
+        output_key.REDEEM_SCRIPT, output_key.WITNESS_SCRIPT => try requireNoKeyData(r),
+        output_key.BIP32_DERIVATION => {
+            try requirePubkeyLen(r);
+            try requireBip32ValueShape(r);
+        },
+        else => try bip371.validateOutputRecord(r),
     }
+}
+
+fn validateGlobalMap(m: Map) RecordError!void {
+    for (m.records) |r| try validateGlobalRecord(r);
+}
+
+fn validateInputMap(m: Map) RecordError!void {
+    for (m.records) |r| try validateInputRecord(r);
+}
+
+fn validateOutputMap(m: Map) RecordError!void {
+    for (m.records) |r| try validateOutputRecord(r);
 }
 
 /// Parses a whole PSBT buffer. Rejects on any structural or per-field
@@ -655,6 +727,39 @@ pub fn combine(allocator: Allocator, a: Psbt, b: Psbt) CombineError!Psbt {
     };
 }
 
+// ── Creator / Updater, BIP371 taproot fields, hash preimages, Base64 ────
+//
+// Implementations live in `update.zig` and `bip371.zig`; re-exported here so
+// callers only need `@import("psbt")`.
+
+pub const bip371 = @import("bip371.zig");
+const update = @import("update.zig");
+pub const CreateError = update.CreateError;
+pub const UpdateError = update.UpdateError;
+pub const fromUnsignedTx = update.fromUnsignedTx;
+pub const setGlobalXpub = update.setGlobalXpub;
+pub const setInputNonWitnessUtxo = update.setInputNonWitnessUtxo;
+pub const setInputWitnessUtxo = update.setInputWitnessUtxo;
+pub const setInputPartialSig = update.setInputPartialSig;
+pub const setInputSighashType = update.setInputSighashType;
+pub const setInputRedeemScript = update.setInputRedeemScript;
+pub const setInputWitnessScript = update.setInputWitnessScript;
+pub const setInputBip32Derivation = update.setInputBip32Derivation;
+pub const setOutputRedeemScript = update.setOutputRedeemScript;
+pub const setOutputWitnessScript = update.setOutputWitnessScript;
+pub const setOutputBip32Derivation = update.setOutputBip32Derivation;
+pub const PreimageKind = update.PreimageKind;
+pub const Preimage = update.Preimage;
+pub const Preimages = update.Preimages;
+pub const inputPreimages = update.inputPreimages;
+pub const inputPreimage = update.inputPreimage;
+pub const preimageMatches = update.preimageMatches;
+pub const setInputPreimage = update.setInputPreimage;
+pub const OwnedPsbt = update.OwnedPsbt;
+pub const Base64Error = update.Base64Error;
+pub const fromBase64 = update.fromBase64;
+pub const toBase64 = update.toBase64;
+
 // ── finalize / extract (Input Finalizer + Transaction Extractor) ───────
 //
 // Implementation lives in `finalize.zig` (its own module doc comment has
@@ -688,6 +793,12 @@ test {
     _ = @import("core_kat_vectors.zig");
     _ = @import("core_kat_test.zig");
     _ = @import("regtest_kat_test.zig");
+    _ = bip371;
+    _ = update;
+    _ = @import("bip_vectors.zig");
+    _ = @import("update_test.zig");
+    _ = @import("bip371_test.zig");
+    _ = @import("finalize_taproot_test.zig");
 }
 
 test "meta.deps names bitcointx, bitcoinscript and ripemd160" {
@@ -804,7 +915,7 @@ const psbt_seeds = [_][]const u8{
 };
 
 const fz = @import("fuzz_test.zig");
-const ParseMark = fz.Marker(enum { refused, parsed, round_tripped, witness_decoded, finalized, extracted });
+const ParseMark = fz.Marker(enum { refused, parsed, round_tripped, witness_decoded, finalized, extracted, typed_walked, tap_field_parsed, created });
 const DamageMark = fz.Marker(enum { generated, damaged_refused, damaged_parsed, damaged_roundtrip, combined });
 
 test "fuzz: parse never panics on arbitrary bytes" {
@@ -963,6 +1074,70 @@ fn appendFinalRecords(list: *std.ArrayList(u8), allocator: Allocator, cur: *tkfu
     }
 }
 
+/// Appends one well-shaped BIP371 / hash-preimage record (valid for its
+/// keytype, so the BIP371 validators accept it) to the map being written.
+/// Drawn from its OWN cursor, so adding it leaves every other draw of the
+/// generator where it was. `output` selects the output-map keytypes.
+fn appendShapedRecord(list: *std.ArrayList(u8), allocator: Allocator, cur: *tkfuzz.Cursor, output: bool) !void {
+    var key32: [32]u8 = undefined;
+    for (&key32) |*b| b.* = cur.byte();
+    var sig: [65]u8 = undefined;
+    for (&sig) |*b| b.* = cur.byte();
+    const sig_len: usize = if (cur.byte() & 1 == 1) 64 else 65;
+
+    // A BIP371 derivation value: n leaf hashes, a fingerprint, a path.
+    var deriv: [1 + 64 + 4 + 12]u8 = undefined;
+    const n_hashes: usize = cur.ranged(0, 2);
+    const n_steps: usize = cur.ranged(0, 3);
+    deriv[0] = @intCast(n_hashes);
+    var dn: usize = 1;
+    for (0..n_hashes * 32 + 4 + n_steps * 4) |_| {
+        deriv[dn] = cur.byte();
+        dn += 1;
+    }
+
+    if (output) {
+        switch (cur.ranged(0, 2)) {
+            0 => try appendFuzzRecord(list, allocator, output_key.TAP_INTERNAL_KEY, &.{}, &key32),
+            1 => {
+                // Depth-first listings of complete trees, and now and then a broken one.
+                const leaf = [_]u8{ 0xc0, 0x01, 0x51 };
+                var tree: std.ArrayList(u8) = .empty;
+                defer tree.deinit(allocator);
+                const depths: []const u8 = switch (cur.ranged(0, 4)) {
+                    0 => &.{0},
+                    1 => &.{ 1, 1 },
+                    2 => &.{ 1, 2, 2 },
+                    3 => &.{ 2, 2, 1 },
+                    else => &.{ 1, 3 }, // incomplete
+                };
+                for (depths) |d| {
+                    try tree.append(allocator, d);
+                    try tree.appendSlice(allocator, &leaf);
+                }
+                try appendFuzzRecord(list, allocator, output_key.TAP_TREE, &.{}, tree.items);
+            },
+            else => try appendFuzzRecord(list, allocator, output_key.TAP_BIP32_DERIVATION, &key32, deriv[0..dn]),
+        }
+        return;
+    }
+    switch (cur.ranged(0, 7)) {
+        0 => try appendFuzzRecord(list, allocator, input_key.TAP_INTERNAL_KEY, &.{}, &key32),
+        1 => try appendFuzzRecord(list, allocator, input_key.TAP_MERKLE_ROOT, &.{}, &key32),
+        2 => try appendFuzzRecord(list, allocator, input_key.TAP_KEY_SIG, &.{}, sig[0..sig_len]),
+        3 => try appendFuzzRecord(list, allocator, input_key.TAP_SCRIPT_SIG, &(key32 ++ key32), sig[0..sig_len]),
+        4 => {
+            var cb: [33 + 96]u8 = undefined;
+            for (&cb) |*b| b.* = cur.byte();
+            const cb_len = 33 + 32 * cur.ranged(0, 3);
+            try appendFuzzRecord(list, allocator, input_key.TAP_LEAF_SCRIPT, cb[0..cb_len], &.{ 0x51, 0xc0 });
+        },
+        5 => try appendFuzzRecord(list, allocator, input_key.TAP_BIP32_DERIVATION, &key32, deriv[0..dn]),
+        6 => try appendFuzzRecord(list, allocator, input_key.SHA256, &key32, sig[0..cur.ranged(0, 65)]),
+        else => try appendFuzzRecord(list, allocator, input_key.HASH160, key32[0..20], sig[0..cur.ranged(0, 65)]),
+    }
+}
+
 /// The PSBT skeleton both `fuzzParse` and its corpus guard build, so the guard
 /// cannot drift onto a different generator.
 const FuzzPsbtShape = struct { n_in: usize, n_out: usize };
@@ -1000,18 +1175,24 @@ fn buildFuzzPsbt(buf: *std.ArrayList(u8), allocator: Allocator, cur: *tkfuzz.Cur
     // `FINAL_SCRIPTWITNESS` on *every* input, `extract` refuses at the first
     // one and everything behind it stays unreachable.
     const finalize_them = cur.byte() & 1 == 1;
+    var shape_cur: tkfuzz.Cursor = .{ .bytes = cur.bytes, .at = cur.bytes.len / 2 + 3 };
     var i: usize = 0;
     while (i < n_in) : (i += 1) {
         try appendFuzzedRecordsOpen(buf, allocator, cur, &.{
-            input_key.NON_WITNESS_UTXO, input_key.WITNESS_UTXO,     input_key.PARTIAL_SIG,
-            input_key.SIGHASH_TYPE,     input_key.BIP32_DERIVATION,
+            input_key.NON_WITNESS_UTXO,     input_key.WITNESS_UTXO,     input_key.PARTIAL_SIG,
+            input_key.SIGHASH_TYPE,         input_key.BIP32_DERIVATION, input_key.RIPEMD160,
+            input_key.TAP_KEY_SIG,          input_key.TAP_SCRIPT_SIG,   input_key.TAP_LEAF_SCRIPT,
+            input_key.TAP_BIP32_DERIVATION, input_key.TAP_INTERNAL_KEY,
         });
+        if (shape_cur.byte() & 1 == 1) try appendShapedRecord(buf, allocator, &shape_cur, false);
         if (finalize_them) try appendFinalRecords(buf, allocator, cur);
         try buf.append(allocator, 0x00); // map terminator
     }
     i = 0;
     while (i < n_out) : (i += 1) {
-        try appendFuzzedRecords(buf, allocator, cur, &.{ output_key.REDEEM_SCRIPT, output_key.BIP32_DERIVATION });
+        try appendFuzzedRecordsOpen(buf, allocator, cur, &.{ output_key.REDEEM_SCRIPT, output_key.BIP32_DERIVATION, output_key.TAP_INTERNAL_KEY, output_key.TAP_TREE, output_key.TAP_BIP32_DERIVATION });
+        if (shape_cur.byte() & 1 == 1) try appendShapedRecord(buf, allocator, &shape_cur, true);
+        try buf.append(allocator, 0x00); // map terminator
     }
     return .{ .n_in = n_in, .n_out = n_out };
 }
@@ -1077,6 +1258,59 @@ fn fuzzParseBody(comptime S: type, smith: *S, allocator: Allocator) anyerror!voi
     defer allocator.free(reser);
     if (!std.mem.eql(u8, reser, buf.items)) return error.RoundTripNotByteExact;
     ParseMark.mark(.round_tripped);
+
+    // The typed readers over whatever parse accepted: none may panic, every
+    // BIP371 value they hand back has the shape its field promises.
+    {
+        for (psbt.inputs) |m| {
+            var leaves = bip371.inputTapLeafScripts(m);
+            while (leaves.next()) |l| {
+                if (l.control_block.len < 33 or (l.control_block.len - 33) % 32 != 0) return error.BadControlBlock;
+                ParseMark.mark(.tap_field_parsed);
+            }
+            var pre = inputPreimages(m);
+            while (pre.next()) |p| {
+                if (p.hash.len != p.kind.hashLen()) return error.BadPreimageHash;
+                _ = preimageMatches(p.kind, p.hash, p.preimage);
+            }
+            for (m.records) |r| {
+                if (r.keytype == input_key.TAP_BIP32_DERIVATION) {
+                    const d = bip371.inputTapBip32Derivation(m, r.keydata[0..32].*) orelse return error.ValidatedDerivationUnreadable;
+                    for (0..d.leafHashCount()) |k| _ = d.leafHash(k);
+                    for (0..d.path.len()) |k| _ = d.path.at(k);
+                }
+                if (r.keytype == input_key.TAP_SCRIPT_SIG) _ = bip371.inputTapScriptSig(m, r.keydata[0..32].*, r.keydata[32..64].*);
+            }
+            _ = bip371.inputTapInternalKey(m);
+            _ = bip371.inputTapMerkleRoot(m);
+        }
+        for (psbt.outputs) |m| {
+            if (bip371.outputTapTree(m)) |t| {
+                var tree = t;
+                var leaves: usize = 0;
+                while (tree.next()) |_| leaves += 1;
+                if (leaves == 0) return error.ValidatedTreeEmpty;
+                ParseMark.mark(.tap_field_parsed);
+            } else if (m.find(output_key.TAP_TREE) != null) return error.ValidatedTreeUnreadable;
+            _ = bip371.outputTapInternalKey(m);
+        }
+        ParseMark.mark(.typed_walked);
+    }
+
+    // The Creator over the parsed transaction: what it builds must parse back.
+    if (n_in > 0) {
+        var arena0 = std.heap.ArenaAllocator.init(allocator);
+        defer arena0.deinit();
+        const a0 = arena0.allocator();
+        const utx = try psbt.unsignedTx(a0);
+        var created = try fromUnsignedTx(a0, utx);
+        try setInputSighashType(a0, &created, 0, 1);
+        const cbytes = try serialize(a0, created);
+        var cback = try parse(a0, cbytes);
+        defer cback.deinit(a0);
+        if (cback.inputs.len != n_in or cback.outputs.len != n_out) return error.CreatorShapeChanged;
+        ParseMark.mark(.created);
+    }
 
     // `decodeWitnessStack` driven directly as well: it is public, it is
     // documented as untrusted-input, and reaching it only through a PSBT that
@@ -1200,7 +1434,8 @@ test "corpus: every script builds a distinct PSBT, and the map/record counts are
     try testing.expectEqual(@as(usize, 10), distinct);
     try testing.expectEqual(@as(usize, 17), input_maps);
     try testing.expectEqual(@as(usize, 13), output_maps);
-    try testing.expectEqual(@as(usize, 3), records);
+    // 2026-11-13: 3 -> 4 -- the shaped BIP371 record (`appendShapedRecord`) lands in one of the corpus PSBTs.
+    try testing.expectEqual(@as(usize, 4), records);
     try testing.expectEqual(@as(usize, 2), finalized);
 }
 

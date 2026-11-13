@@ -370,7 +370,7 @@ pub const module_list = [_]Module{
     .{ .name = "bip340", .libs = &.{"crypto"}, .deps = &.{"k256"}, .test_deps = &.{"testkit"} },
     .{ .name = "taproot", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256", "bitcointx" }, .test_deps = &.{"testkit"} },
     .{ .name = "bitcointx", .libs = &.{"crypto"}, .deps = &.{"bip340"}, .test_deps = &.{"testkit"} },
-    .{ .name = "psbt", .libs = &.{"crypto"}, .deps = &.{ "bitcointx", "bitcoinscript", "ripemd160" }, .test_deps = &.{"testkit"} },
+    .{ .name = "psbt", .libs = &.{"crypto"}, .deps = &.{ "bitcointx", "bitcoinscript", "ripemd160" }, .test_deps = &.{ "testkit", "bip340", "taproot" } },
     .{ .name = "bitcoinscript", .libs = &.{"crypto"}, .deps = &.{ "bitcointx", "k256", "bip340", "ripemd160" }, .test_deps = &.{ "testkit", "taproot" } },
     .{ .name = "btcp2p", .libs = &.{"crypto"}, .deps = &.{"bitcointx"}, .test_deps = &.{"testkit"} },
     .{ .name = "lnwire", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },

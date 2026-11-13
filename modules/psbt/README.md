@@ -1,6 +1,7 @@
 # psbt
 
-BIP174 Partially Signed Bitcoin Transaction (PSBT) v0 — binary (de)serialization, the Combiner
+BIP174 Partially Signed Bitcoin Transaction (PSBT) v0 — binary (de)serialization, the Creator and
+Updater roles (`fromUnsignedTx`, typed `set*` functions), BIP371 taproot fields, Base64 I/O, the Combiner
 role, and (via the sibling `bitcoinscript` Script interpreter) the Input Finalizer and Transaction
 Extractor roles, built on `bitcointx` for the embedded unsigned transaction / UTXO tx bodies. Parses
 untrusted PSBT bytes fail-closed. See `SPEC.md` for the full design, threat model, and what's still
@@ -65,6 +66,29 @@ Every other known field (`PARTIAL_SIG`, `REDEEM_SCRIPT`, `WITNESS_SCRIPT`, `FINA
 `Map.records` (`Record{ keytype, keydata, value }`, all borrowed slices) — `Map.find(keytype)` for
 "no key data" singleton fields, `Map.findKeyed(keytype, keydata)` for pubkey/xpub-keyed fields.
 
+## Create and update a PSBT (Creator / Updater)
+
+```zig
+var arena = std.heap.ArenaAllocator.init(gpa); // the setters assume an arena-like allocator, like `finalize`
+defer arena.deinit();
+const a = arena.allocator();
+
+var p = try psbt.fromUnsignedTx(a, unsigned_tx); // empty input/output maps
+try psbt.setInputNonWitnessUtxo(a, &p, 0, prev_tx); // checked against the input's txid and vout
+try psbt.setInputWitnessUtxo(a, &p, 1, prev_out);
+try psbt.setInputRedeemScript(a, &p, 0, redeem_script);
+try psbt.setInputBip32Derivation(a, &p, 0, pubkey33, master_fingerprint, &.{ 0x80000000 + 44, 0x80000000, 0 });
+try psbt.bip371.setInputTapInternalKey(a, &p, 1, internal_xonly_key); // BIP371: also addInputTapLeafScript, ...
+
+const text = try psbt.toBase64(a, p); // what wallets exchange
+var back = try psbt.fromBase64(gpa, text); // OwnedPsbt: .psbt plus the buffer it borrows from
+defer back.deinit(gpa);
+```
+
+BIP371 fields have typed readers (`psbt.bip371.inputTapInternalKey`, `inputTapLeafScripts`,
+`outputTapTree`, ...), and the hash-preimage fields `psbt.inputPreimage` / `setInputPreimage`.
+`parse` validates all of them structurally.
+
 ## Combine two PSBTs for the same transaction
 
 ```zig
@@ -85,8 +109,8 @@ const raw = try bitcointx.serialize(allocator, tx);
 ```
 
 `finalize` handles P2PKH, native/P2SH-wrapped P2WPKH, bare/P2SH/P2WSH/P2SH-P2WSH multisig, and P2TR
-key-path — see `finalize.zig`'s module doc comment for the exact scope cut (non-standard/timelocked/
-tapscript spends are `error.NonStandardScript`, never silently mis-assembled) and for the
+key-path and script-path (`<key> OP_CHECKSIG` and `multi_a` leaves, from `TAP_LEAF_SCRIPT` + `TAP_SCRIPT_SIG`) — see `finalize.zig`'s module doc comment for the exact scope cut (non-standard/timelocked/
+other tapscript spends are `error.NonStandardScript`, never silently mis-assembled) and for the
 allocator/ownership contract (an arena is assumed). The **Signer** role — producing the
 `PARTIAL_SIG`/`TAP_KEY_SIG` records `finalize` consumes — is not implemented; that needs private-key
 custody and signing policy this module has no opinion about.
@@ -111,7 +135,7 @@ a present `PSBT_GLOBAL_VERSION` is now required to be `0` (BIP174 §"Version 0")
 previously didn't check. Core's own `finalizer`/`extractor` vectors turned out to be byte-identical
 to BIP174's worked example above (no new spend shape), so neither BIP174 nor Core's JSON reaches
 native P2WPKH or native P2WSH multisig — see `SPEC.md` for the full accounting, including which of
-Core's vectors are BIP370/BIP371/MuSig2 content this module deliberately doesn't validate.
+Core's vectors are BIP370/MuSig2 content this module deliberately doesn't validate (its BIP371 taproot-field defects are rejected since 2026-11-13).
 
 Both of those two remaining shapes are now closed too, by capturing against a real Bitcoin Core
 regtest node instead (`regtest_kat_vectors.zig`/`regtest_kat_test.zig`, `zig build test-psbt`):

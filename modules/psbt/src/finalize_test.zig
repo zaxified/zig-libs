@@ -37,12 +37,10 @@
 //!
 //! P2TR key-path is exercised only via its two fail-closed paths (missing
 //! `TAP_KEY_SIG`, missing another input's UTXO when BIP341 needs the full
-//! set) -- a real positive-path Schnorr-signed spend needs `bip340`, which
-//! is only a TRANSITIVE dependency here (through `bitcoinscript`), not a
-//! direct one this module's `build.zig` wiring exposes; broadening that
-//! wiring is out of scope for this change. `bitcoinscript/e2e_test.zig`
-//! already covers a real signed P2TR spend through the exact same
-//! `verifyScript` call `finalize`'s P2TR branch makes.
+//! set); the positive, Schnorr-signed P2TR spends (script path, built with
+//! `taproot` and signed with `bip340`) are in `finalize_taproot_test.zig`, and
+//! `bitcoinscript/e2e_test.zig` covers a signed key-path spend through the
+//! same `verifyScript` call.
 
 const std = @import("std");
 const testing = std.testing;
