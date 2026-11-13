@@ -134,18 +134,18 @@ fn ladder(clamped_scalar: [scalar_length]u8, u: Fe) Fe {
         swap = k_t;
 
         const a = x_2.add(z_2);
-        const aa = a.square();
+        const aa = a.squareI();
         const b = x_2.sub(z_2);
-        const bb = b.square();
+        const bb = b.squareI();
         const e = aa.sub(bb);
         const c = x_3.add(z_3);
         const dd = x_3.sub(z_3);
-        const da = dd.mul(a);
-        const cb = c.mul(b);
-        x_3 = da.add(cb).square();
-        z_3 = x_1.mul(da.sub(cb).square());
-        x_2 = aa.mul(bb);
-        z_2 = e.mul(aa.add(e.mulSmall(a24)));
+        const da = dd.mulI(a);
+        const cb = c.mulI(b);
+        x_3 = da.add(cb).squareI();
+        z_3 = x_1.mulI(da.sub(cb).squareI());
+        x_2 = aa.mulI(bb);
+        z_2 = e.mulI(aa.add(e.mulSmall(a24)));
     }
     Fe.ctSwap(swap == 1, &x_2, &x_3);
     Fe.ctSwap(swap == 1, &z_2, &z_3);

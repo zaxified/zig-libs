@@ -107,18 +107,18 @@ pub const Point = struct {
     /// Z3 = F*G
     /// ```
     pub fn add(p: Point, q: Point) Point {
-        const a = p.z.mul(q.z);
-        const b = a.square();
-        const c = p.x.mul(q.x);
-        const dd = p.y.mul(q.y); // "D" (module-level `d` is the curve constant)
-        const e = d.mul(c).mul(dd);
+        const a = p.z.mulI(q.z);
+        const b = a.squareI();
+        const c = p.x.mulI(q.x);
+        const dd = p.y.mulI(q.y); // "D" (module-level `d` is the curve constant)
+        const e = d.mulI(c).mulI(dd);
         const f = b.sub(e);
         const g = b.add(e);
-        const h = p.x.add(p.y).mul(q.x.add(q.y));
+        const h = p.x.add(p.y).mulI(q.x.add(q.y));
         return .{
-            .x = a.mul(f).mul(h.sub(c).sub(dd)),
-            .y = a.mul(g).mul(dd.sub(c)),
-            .z = f.mul(g),
+            .x = a.mulI(f).mulI(h.sub(c).sub(dd)),
+            .y = a.mulI(g).mulI(dd.sub(c)),
+            .z = f.mulI(g),
         };
     }
 
@@ -134,16 +134,16 @@ pub const Point = struct {
     /// Z3 = E*J
     /// ```
     pub fn dbl(p: Point) Point {
-        const b = p.x.add(p.y).square();
-        const c = p.x.square();
-        const dd = p.y.square(); // "D" (module-level `d` is the curve constant)
+        const b = p.x.add(p.y).squareI();
+        const c = p.x.squareI();
+        const dd = p.y.squareI(); // "D" (module-level `d` is the curve constant)
         const e = c.add(dd);
-        const h = p.z.square();
+        const h = p.z.squareI();
         const j = e.sub(h).sub(h);
         return .{
-            .x = b.sub(e).mul(j),
-            .y = e.mul(c.sub(dd)),
-            .z = e.mul(j),
+            .x = b.sub(e).mulI(j),
+            .y = e.mulI(c.sub(dd)),
+            .z = e.mulI(j),
         };
     }
 

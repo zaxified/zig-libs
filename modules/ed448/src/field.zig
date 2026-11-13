@@ -70,6 +70,20 @@
 
 const std = @import("std");
 
+/// Optimization barrier for a select mask: LLVM cannot see through the
+/// empty asm, so it cannot turn `(a & m) | (b & ~m)` back into a branch on
+/// the condition the mask came from. Without it ReleaseFast compiled
+/// `Fe.ctSelect` to a conditional jump (ctgrind, through decaf448's
+/// `Element.encode`/`oneWayMap` on secret values, 2026-11-13) — the same
+/// leak class montint and p256 launder their masks against.
+pub inline fn blackBox(x: u64) u64 {
+    if (@inComptime()) return x;
+    return asm volatile (""
+        : [ret] "=r" (-> u64),
+        : [x] "0" (x),
+    );
+}
+
 /// Errors from parsing/decoding an `Fe` from bytes.
 pub const FieldError = error{NonCanonical};
 
@@ -289,7 +303,7 @@ pub const Fe = struct {
             diff[i] = t & limb_mask;
         }
         // borrow == 1 -> v < p -> keep the original limbs.
-        const keep: u64 = 0 -% borrow;
+        const keep: u64 = blackBox(0 -% borrow);
         var out: [num_limbs]u64 = undefined;
         inline for (0..num_limbs) |i| out[i] = (limbs[i] & keep) | (diff[i] & ~keep);
         return .{ .limbs = out };
@@ -350,6 +364,14 @@ pub const Fe = struct {
     ///
     /// Bound: weakly reduced inputs have limbs `< 2^57`, so each product is
     /// `< 2^114` and a column of at most 8 products `< 2^117`.
+    ///
+    /// Three other layouts were measured on 2026-11-13 (`bench-ed448`, same
+    /// host) and not kept: limb-by-limb product scanning with the fold
+    /// weights built in and the carry threaded through (X448 1.7× slower:
+    /// one long dependency chain); the same with 8 independent accumulators
+    /// (~10 % slower); and `p521`'s two-accumulators-per-limb form, as fast
+    /// as this one within noise but a 4.7 GB, 3× longer compile once
+    /// inlined into the point formulas (`mulI`).
     pub fn mul(a: Fe, b: Fe) Fe {
         var cols = @as([15]u128, @splat(0));
         inline for (0..num_limbs) |i| {
@@ -414,6 +436,22 @@ pub const Fe = struct {
             }
         }
         return reduceColumns(cols);
+    }
+
+    /// `mul` forced inline at the call site, for the point formulas and the
+    /// X448 ladder step: independent products there overlap only when
+    /// LLVM sees them together (it keeps `mul` out of line otherwise).
+    /// Only the hot formulas use it, not the addition chains. Measured
+    /// 2026-11-13: verify 1.25× → 1.03–1.07× OpenSSL, X448 ~0.97× → ~0.78×.
+    pub inline fn mulI(a: Fe, b: Fe) Fe {
+        @setEvalBranchQuota(100_000);
+        return @call(.always_inline, mul, .{ a, b });
+    }
+
+    /// `square` forced inline (see `mulI`).
+    pub inline fn squareI(a: Fe) Fe {
+        @setEvalBranchQuota(100_000);
+        return @call(.always_inline, square, .{a});
     }
 
     /// `a^(2^n)`: `n` successive squarings (`n` public, comptime).
@@ -562,7 +600,7 @@ pub const Fe = struct {
     /// the two serializations + reparse per select were a real cost
     /// (audit F5).
     pub fn ctSelect(cond: bool, a: Fe, b: Fe) Fe {
-        const mask: u64 = @as(u64, 0) -% @intFromBool(cond);
+        const mask: u64 = blackBox(@as(u64, 0) -% @intFromBool(cond));
         var out: [num_limbs]u64 = undefined;
         inline for (0..num_limbs) |i| out[i] = (a.limbs[i] & mask) | (b.limbs[i] & ~mask);
         return .{ .limbs = out };

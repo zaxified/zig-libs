@@ -8,9 +8,9 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-10-04 (56/58, 2 eq) · src ?
 
-**Hardening:** fuzz 2026-10-07 (200,000 runs clean per harness, ED448_FUZZ) · ct 2026-08-11 (ctgrind)
+**Hardening:** fuzz 2026-10-07 (200,000 runs clean per harness, ED448_FUZZ) · ct 2026-11-13 (ctgrind: full 3, ladder 0, decaf448 scalarmul 0 — unchanged; select masks laundered)
 
-**Performance:** ref 1.10–3.94× OpenSSL 3.5.5 Ed448/X448 · fastest ? (measured 2026-10-20)
+**Performance:** ref 0.47–1.07× OpenSSL 3.5.5 Ed448/X448 · fastest ? (measured 2026-11-13)
 
 **Known defects:** none recorded
 
@@ -248,7 +248,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 The formerly-stubbed number theory, as built (each function's own doc
 comment carries the details):
 
-1. **`field.zig`'s `Fp448` arithmetic.** `mul` is an 8×8-limb schoolbook
+1. **`field.zig`'s `Fp448` arithmetic.** *(As built in 2026-07; the
+   2026-11-13 performance pass replaced the reduction strategy, the
+   multiply layout and `invert`/`sqrt` — see § Performance. What follows
+   is the original design.)* `mul` is an 8×8-limb schoolbook
    multiply into u128 column accumulators, carried into 16 clean 56-bit
    limbs, then Goldilocks-folded: writing the 896-bit product as four
    224-bit chunks `A + B*2^224 + C*2^448 + D*2^672` and using `2^448 ≡
@@ -371,7 +374,20 @@ final swap, `z = 0`, top bit); field canonical check, the fold rounds,
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-ed448`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 1.10–3.94×, against 0.99–3.99× before. The card carries these figures.
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-ed448`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 1.10–3.94×, against 0.99–3.99× before.
+
+**2026-11-13, Zig 0.17.1: ref 0.74–3.21× → 0.47–1.07×** (`zig build bench-ed448` against OpenSSL 3.5.5, same host, shared with other jobs). A profile of the baseline put 43 % of the time in the field reduction (every `add`/`sub`/`mul` returned the canonical form: three carry rounds and a conditional subtraction of `p`), 21 % in `mul`'s body and 19 % in `pow` (the generic square-and-always-multiply behind `invert`/`sqrt`). What changed, each measured:
+
+| step | sign | verify | X448 |
+|---|--:|--:|--:|
+| baseline (`BENCH_ROUNDS=5`) | 0.74 | 3.21 | 2.15 |
+| weak reduction (limbs `< 2^57`, canonical only in `toBytes`/`isOdd`/`isZero`/`eql`) + addition-chain `invert`/`sqrt` | 0.58 | 1.63 | 0.97 |
+| + `Fe.sqrtRatio` decode (RFC 8032 §5.2.3 combined power: one exponentiation per decoded point, not two) + width-7/5 NAF Straus `verify` with a comptime table of 32 odd multiples of `B` | 0.43 | 1.27 | 1.05 |
+| + `mul`/`square` forced inline into `Point.add`/`dbl` and the ladder step (`mulI`/`squareI`) — the card | 0.47 | 1.07 | 0.78 |
+
+The last row's run: sign 152.6 µs vs 326.5 µs, verify 326.1 µs vs 304.6 µs, X448 214.6 µs vs 275.5 µs. OpenSSL's own figures moved 268–428 µs (verify) between runs of the same day, so verify sits at parity: 1.03–1.07× over the last three runs, the 1.03 from a run of an equivalent multiply layout (see `Fe.mul`'s doc comment for the layouts measured and dropped). Every row is ≤ 1.1× (P2).
+
+**Constant time after the pass** (`ctgrind.sh --check --stacks ed448 decaf448`, 2026-11-13): counts unchanged — `full` 3 in-file contexts, all `Fe.invert`'s `isZero` verdict (from `Point.toBytes` in key creation and signing, and the X448 ladder's final `z_2` inversion: the only value it can reject is 0, the documented exceptional case), `ladder` 0, decaf448 `scalarmul` 0. The weak-reduction code is straight-line, and the select masks of `Fe.ctSelect` and `condSubP` now go through `field.blackBox` (an empty asm barrier). ReleaseFast had compiled `Fe.ctSelect` to a conditional jump, seen through decaf448's `Element.encode`/`oneWayMap` on secret values by voprf's ctgrind rows; `ed448`'s own rows never reached it with a tainted condition. The same barrier on `scalar.zig`'s `condSubL` was tried and reverted: it moved a scalar copy into a frame decaf448's `scalar.invert` stack probe reads (30 hits) — left for the scalar's own pass (Backlog). The `Fe.fromBytes` canonical verdict voprf also reports is a verdict on whether an encoding is `< p`. On the decaf448 path that rebuilds an element from computed bytes, it always passes.
 
 ## Backlog / deferred
 
@@ -380,7 +396,8 @@ final swap, `z = 0`, top bit); field canonical check, the fold rounds,
   guarantees (table lookups stay masked; re-run ctgrind). Unmeasured.
 - **RFC 9380 hash-to-curve for edwards448** (`edwards448_XOF:SHAKE256_ELL2_RO_`/`_NU_`) *(survey 2026-09-30)*. Needed by VOPRF/VRF/BLS-style protocols on the 448 curve; `ed448-goldilocks` ships it. Searched `rg -i 'hash_to|hashToCurve|elligator|fromUniform' modules/ed448/src` — nothing. Effort: medium (Elligator 2 + isogeny + `expand_message_xof`, RFC 9380 has vectors). Fits CONVENTIONS §2.
 - **`X448.KeyPair.fromEd448` / Ed448 to X448 key mapping** *(survey 2026-09-30)*. Std's `X25519.KeyPair.fromEd25519` has the 25519 analogue; SPEC's "Out of scope" lists it only as "not in this scaffold", not as a refusal. Effort: small (birational map over `Fp448`). Fits §2.
-- **Speed: verify 4.0× and X448 1.9× OpenSSL's time** *(bench 2026-10-07, `zig build bench-ed448` against OpenSSL 3.5.5; sign 0.99×)*. Caps the grade at 4 (performance axis). Verify already runs one vartime Straus pass; X448, a bare Montgomery ladder, is 1.9× too, so the field arithmetic in `field.zig` is the common cause — OpenSSL's p448 uses 56-bit limbs with Karatsuba-style multiplication. Then verify's remaining gap: two point decompressions (square roots) and a 4-bit window with no precomputed table for `B`. Effort: medium–large; anchored by the RFC KATs and the ctgrind harness (the ladder must stay constant-time).
+- **`scalar.zig` `condSubL` mask not laundered** *(2026-11-13)*: `Fe`'s selects now use `field.blackBox`. The same change on the scalar's conditional subtraction made decaf448's `scalar.invert` stack probe find the scalar (30 hits, 167–199 B below the region top), so it was reverted. It needs a ctgrind look at whether that select lowers to a branch at all, and a burn depth that covers the new frame. Effort S.
+- **Speed leftovers** *(after the 2026-11-13 pass, verify at 1.03–1.07× OpenSSL)*. Not done, in the order they would pay: (1) `scalar.reduceWide`, a bitwise constant-time long division over the 114-byte digest (912 iterations; ~6 % of a sign+verify+X448 profile), could fold by `2^446 ≡ δ (mod L)` like the field does; (2) a Karatsuba split of `Fe.mul` on the Goldilocks halves (`(a0 + a1φ)(b0 + b1φ)`, `φ² ≡ φ + 1`: 48 products instead of 64); (3) mixed (`Z = 1`) additions against an affine form of the comptime `B` table. Effort small–medium each; anchored by the RFC KATs, the `std.crypto.ff` oracle test in `field.zig` and the ctgrind harness.
 - **Wider vector coverage** *(survey 2026-09-30)*: `kat_test.zig` embeds 4 of the RFC 8032 §7.4 Ed448 vectors (blank, 1 octet, 1 octet + context, 11 octets) and 1 Ed448ph; no Wycheproof/edge-case set (`rg -i wycheproof modules/ed448` — nothing). Users of the reference expect the long-message vectors and malleability edge cases. Effort: small, test-only.
 
 ## Anchoring
