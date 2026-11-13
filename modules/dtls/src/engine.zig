@@ -4,8 +4,10 @@
 //! `Transcript-Hash`, reused unchanged by DTLS 1.3 — RFC 9147 §5.8/§5.9) the
 //! flight engine feeds its key schedule from. Since 2026-10-20 the code lives
 //! in the `tls13` module, generic over the suite hash
-//! (`tls13.transcript.Transcript(Hash)`); every suite this module negotiates
-//! is a SHA-256 suite, so `Transcript` is the SHA-256 instance. The tests
+//! (`tls13.transcript.Transcript(Hash)`); `Transcript` is the SHA-256
+//! instance, kept for consumers. Since 2026-11-13 the connection itself runs
+//! `suitehash.Transcript`, both hashes side by side until the suite (SHA-256
+//! or SHA-384) is known. The tests
 //! (framing, the PSK-binder truncation, the HelloRetryRequest message_hash
 //! rewrite, now anchored on RFC 8448 §3/§5) moved with the code.
 //!

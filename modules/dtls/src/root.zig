@@ -357,6 +357,9 @@ pub const Connection = connection.Connection;
 pub const Config = connection.Config;
 pub const Role = connection.Role;
 pub const CipherSuite = connection.CipherSuite;
+/// A suite's hash (`CipherSuite.hash`, `Config.psk_hash`): SHA-256, or
+/// SHA-384 for `aes_256_gcm_sha384`.
+pub const HashAlg = connection.HashAlg;
 /// PSK (`.psk`) vs. PSK-less ephemeral-X25519 certificate (`.cert_dhe`, or
 /// its unauthenticated `.cert_dhe_insecure_unauthenticated` sibling) mode
 /// selector for `Config.key_exchange` — see `Connection.KeyExchange`.
@@ -394,7 +397,7 @@ pub const meta = .{
     // OpenSSL-anchored differential oracle.
     // The PSK-only flight engine itself still needs no sibling modules,
     // see the "meta.deps" test below.
-    .deps = .{ "rsa", "x509", "chachapoly", "aesgcm", "tls13", "mlkem" }, // mlkem: only the tests name it (Connection.zig's PQ-share canonical check, stackprobe); the runtime ML-KEM is tls13.kex's; tls13: the key schedule (keyschedule.zig is a shim since 2026-10-20), certverify and kex; aesgcm: Connection.zig's AES-128-GCM suite (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
+    .deps = .{ "rsa", "x509", "chachapoly", "aesgcm", "tls13", "mlkem" }, // mlkem: only the tests name it (Connection.zig's PQ-share canonical check, stackprobe); the runtime ML-KEM is tls13.kex's; tls13: the key schedule (keyschedule.zig is a shim since 2026-10-20), certverify and kex; aesgcm: Connection.zig's AES-128-GCM and AES-256-GCM suites (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -412,6 +415,7 @@ test {
     _ = keyschedule;
     _ = aead;
     _ = engine;
+    _ = @import("suitehash.zig");
     _ = connection;
     _ = certauth;
     _ = @import("wolfssl_replay.zig");

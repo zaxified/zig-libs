@@ -57,6 +57,8 @@ const burn = @import("burn.zig");
 const handshake = @import("handshake.zig");
 const flight = @import("flight.zig");
 const engine = @import("engine.zig");
+const suitehash = @import("suitehash.zig");
+const Secret = suitehash.Secret;
 const certverify = @import("tls13").certverify;
 const certauth = @import("certauth.zig");
 
@@ -69,6 +71,9 @@ const X25519 = std.crypto.dh.X25519;
 const P256 = std.crypto.ecc.P256;
 
 pub const Role = enum { client, server };
+
+/// A cipher suite's hash (RFC 8446 §7.1): `Config.psk_hash`, `CipherSuite.hash`.
+pub const HashAlg = suitehash.HashAlg;
 
 /// Which key-exchange this connection runs (RFC 8446 §4.2.9 / §4.2.8):
 ///
@@ -129,9 +134,19 @@ pub const KeyExchange = enum {
 /// intended `coap`-transport consumer cares about most.
 pub const CipherSuite = enum(u16) {
     aes_128_gcm_sha256 = 0x1301,
+    aes_256_gcm_sha384 = 0x1302,
     chacha20_poly1305_sha256 = 0x1303,
     aes_128_ccm_sha256 = 0x1304,
     aes_128_ccm_8_sha256 = 0x1305,
+
+    /// The suite's hash (RFC 8446 §B.4: the `_SHAxxx` part of its name) —
+    /// the hash of its whole key schedule, transcript and Finished MACs.
+    pub fn hash(self: CipherSuite) HashAlg {
+        return switch (self) {
+            .aes_256_gcm_sha384 => .sha384,
+            .aes_128_gcm_sha256, .chacha20_poly1305_sha256, .aes_128_ccm_sha256, .aes_128_ccm_8_sha256 => .sha256,
+        };
+    }
 };
 
 /// `Config.cipher_suites`'s default, and the value `Connection.suite` holds
@@ -144,7 +159,12 @@ pub const CipherSuite = enum(u16) {
 /// two `suiteParams` actually wires. Any value here MUST have a
 /// `suiteParams` entry — a default without one is a config that can never
 /// complete a connection, which is what `.aes_128_ccm_8_sha256` was.
-const default_cipher_suites = [_]CipherSuite{.aes_128_gcm_sha256};
+///
+/// AES-256-GCM-SHA384 follows it, as in pion/dtls's and wolfSSL's default
+/// order: a peer that offers only it still connects. A `.psk` client offers
+/// only the suites of `Config.psk_hash` (RFC 8446 §4.2.11), so the default
+/// PSK ClientHello is unchanged by the second entry.
+const default_cipher_suites = [_]CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384 };
 
 pub const ConfigError = error{
     EmptyPsk,
@@ -188,6 +208,11 @@ pub const ConfigError = error{
     /// `Config.alpn_protocols` holds an empty name, a name over 255 bytes,
     /// or more than `max_alpn_list_len` bytes once encoded (RFC 7301 §3.1).
     InvalidAlpnProtocols,
+    /// `key_exchange = .psk` and no suite in `Config.cipher_suites` has the
+    /// hash `Config.psk_hash` names. RFC 8446 §4.2.11: an external PSK is
+    /// bound to one hash and is usable only with suites of that hash, so
+    /// this config could never complete a handshake.
+    PskHashMismatch,
 };
 
 /// Server-side HelloRetryRequest / stateless-cookie configuration — RFC 9147
@@ -321,6 +346,14 @@ pub const Config = struct {
     key_exchange: KeyExchange = .psk,
     psk_identity: []const u8 = &.{},
     psk: []const u8 = &.{},
+    /// The hash the external PSK is bound to (RFC 8446 §4.2.11: "each PSK
+    /// is associated with a single Hash algorithm"; for an external PSK
+    /// SHA-256 when nothing else is provisioned). `.psk` mode only: the
+    /// binder is computed with it, a client offers and a server selects
+    /// only the `cipher_suites` of this hash, and a ServerHello naming a
+    /// suite of the other hash is refused (`error.NoCipherSuiteOverlap`).
+    /// Both ends must agree, as on the PSK itself.
+    psk_hash: HashAlg = .sha256,
     /// Preference order, most-preferred first.
     /// Defaults to AES-128-GCM, the one mandatory-to-implement TLS 1.3 suite.
     /// It used to default to `.aes_128_ccm_8_sha256` -- the CoAP profile's
@@ -489,6 +522,9 @@ pub const Config = struct {
             .psk => {
                 if (self.psk.len == 0) return error.EmptyPsk;
                 if (self.psk_identity.len == 0) return error.EmptyPskIdentity;
+                for (self.cipher_suites) |suite| {
+                    if (suite.hash() == self.psk_hash) break;
+                } else return error.PskHashMismatch;
             },
             // `.cert_dhe`: PSK fields are unused, so they are NOT required —
             // but the AUTHENTICATION material is, and this is the only place
@@ -543,7 +579,7 @@ pub const application_epoch: u16 = 3;
 /// Cap on a HelloRetryRequest cookie this client will echo. RFC 8446 §4.2.2
 /// sets no limit beyond the 2-byte length field; a real server's cookie is a
 /// keyed hash plus context (wolfSSL's is well under 128 bytes, and this
-/// module's own — `cookie_len` below — is 67). The cap keeps ClientHello2
+/// module's own — `cookieLen` below — is 67, or 83 under a SHA-384 suite). The cap keeps ClientHello2
 /// inside the same fixed body buffer as ClientHello1 rather than letting the
 /// peer choose our stack usage.
 const max_cookie_len = 128;
@@ -1162,7 +1198,7 @@ fn ecdheServerExchange(group: u16, peer_share: []const u8, entropy: Entropy) Han
 // So the cookie IS the server's state, handed to a party that must not be
 // able to forge or alter it. Its layout:
 //
-//     version(1) || cipher_suite(2) || Hash(ClientHello1)(32) || mac(32)
+//     version(1) || cipher_suite(2) || Hash(ClientHello1)(32|48) || mac(32)
 //
 // and the MAC covers the caller's `peer_binding` as well as those bytes:
 //
@@ -1201,11 +1237,20 @@ fn ecdheServerExchange(group: u16, peer_share: []const u8, entropy: Entropy) Han
 // anywhere (see `Config.now_sec`).
 
 const cookie_version: u8 = 1;
-/// `version || cipher_suite || Hash(ClientHello1)` — everything the MAC
-/// authenticates that also travels on the wire.
-const cookie_plaintext_len = 1 + 2 + 32;
+/// `version || cipher_suite`, then `Hash(ClientHello1)` under the suite's
+/// hash (RFC 8446 §4.4.1: the `message_hash` rewrite uses the HRR suite's
+/// hash) — everything the MAC authenticates that also travels on the wire.
+/// The MAC itself is HMAC-SHA256 whatever the suite: it is this server's
+/// own integrity check, not part of the protocol.
+const cookie_head_len = 1 + 2;
 const cookie_mac_len = 32;
-const cookie_len = cookie_plaintext_len + cookie_mac_len;
+fn cookieLen(alg: HashAlg) usize {
+    return cookie_head_len + alg.len() + cookie_mac_len;
+}
+/// A SHA-256 suite's cookie (67 bytes).
+const cookie_len = cookie_head_len + 32 + cookie_mac_len;
+/// The longest cookie this server mints (a SHA-384 suite's, 83 bytes).
+const max_cookie_out_len = cookie_head_len + suitehash.max_hash_len + cookie_mac_len;
 
 /// Domain separation for the cookie MAC: this key is used for nothing else
 /// today, but a caller reusing a secret across purposes should not get a
@@ -1214,7 +1259,8 @@ const cookie_mac_label = "dtls 1.3 hello retry cookie v1";
 
 const CookieContents = struct {
     suite: CipherSuite,
-    client_hello1_hash: [32]u8,
+    /// `Hash(ClientHello1)`, `suite.hash().len()` bytes live.
+    client_hello1_hash: Secret,
 };
 
 /// The cookie MAC over `plaintext` (the wire-visible prefix) bound to
@@ -1243,12 +1289,15 @@ fn cookieMac(hr: HelloRetryConfig, plaintext: []const u8) [cookie_mac_len]u8 {
 /// which is what lets a stateless server answer a RETRANSMITTED first
 /// ClientHello with a byte-identical HelloRetryRequest instead of having to
 /// remember it had already sent one.
-fn mintCookie(hr: HelloRetryConfig, c: CookieContents, out: *[cookie_len]u8) void {
+fn mintCookie(hr: HelloRetryConfig, c: CookieContents, out: *[max_cookie_out_len]u8) []const u8 {
+    const n = c.suite.hash().len();
     out[0] = cookie_version;
     std.mem.writeInt(u16, out[1..3], @backingInt(c.suite), .big);
-    @memcpy(out[3..35], &c.client_hello1_hash);
-    const mac = cookieMac(hr, out[0..cookie_plaintext_len]);
-    @memcpy(out[cookie_plaintext_len..], &mac);
+    @memcpy(out[cookie_head_len..][0..n], c.client_hello1_hash[0..n]);
+    const plaintext_len = cookie_head_len + n;
+    const mac = cookieMac(hr, out[0..plaintext_len]);
+    @memcpy(out[plaintext_len..][0..cookie_mac_len], &mac);
+    return out[0 .. plaintext_len + cookie_mac_len];
 }
 
 /// Authenticates `cookie` and returns what it carries, or
@@ -1259,16 +1308,24 @@ fn mintCookie(hr: HelloRetryConfig, c: CookieContents, out: *[cookie_len]u8) voi
 /// thing in the handshake an unauthenticated peer can make the server check
 /// repeatedly for free.
 fn openCookie(hr: HelloRetryConfig, cookie: []const u8) error{CookieVerifyFailed}!CookieContents {
-    if (cookie.len != cookie_len) return error.CookieVerifyFailed;
+    // Only the two lengths this server mints; which one is decided by the
+    // suite field, checked against the length after the MAC.
+    if (cookie.len != cookieLen(.sha256) and cookie.len != cookieLen(.sha384)) return error.CookieVerifyFailed;
     if (cookie[0] != cookie_version) return error.CookieVerifyFailed;
-    const expected = cookieMac(hr, cookie[0..cookie_plaintext_len]);
-    if (!std.crypto.timing_safe.eql([cookie_mac_len]u8, expected, cookie[cookie_plaintext_len..][0..cookie_mac_len].*))
+    const plaintext_len = cookie.len - cookie_mac_len;
+    const expected = cookieMac(hr, cookie[0..plaintext_len]);
+    if (!std.crypto.timing_safe.eql([cookie_mac_len]u8, expected, cookie[plaintext_len..][0..cookie_mac_len].*))
         return error.CookieVerifyFailed;
     // Only AFTER the MAC: a suite value that never came from this server is
-    // not worth decoding, and `cipherSuiteFromU16` returning null for a
-    // MAC-valid cookie would mean our own `cookie_secret` was compromised.
+    // not worth decoding, and `cipherSuiteFromU16` returning null (or a
+    // length that does not match the suite's hash) for a MAC-valid cookie
+    // would mean our own `cookie_secret` was compromised.
     const suite = cipherSuiteFromU16(std.mem.readInt(u16, cookie[1..3], .big)) orelse return error.CookieVerifyFailed;
-    return .{ .suite = suite, .client_hello1_hash = cookie[3..35].* };
+    const n = suite.hash().len();
+    if (plaintext_len != cookie_head_len + n) return error.CookieVerifyFailed;
+    var c: CookieContents = .{ .suite = suite, .client_hello1_hash = undefined };
+    @memcpy(c.client_hello1_hash[0..n], cookie[cookie_head_len..][0..n]);
+    return c;
 }
 
 /// Encodes the HelloRetryRequest body this server sends, and — bit for bit —
@@ -1427,9 +1484,10 @@ pub const Connection = struct {
     read_epoch: u64 = 0,
     /// The current application traffic secrets (RFC 8446 §7.2's
     /// `application_traffic_secret_N`), kept so the next one can be derived.
-    /// Wiped in `deinit`.
-    ap_write_secret: [32]u8 = undefined,
-    ap_read_secret: [32]u8 = undefined,
+    /// Wiped in `deinit`. `suite.hash().len()` bytes live (as in every
+    /// `Secret` field below).
+    ap_write_secret: Secret = undefined,
+    ap_read_secret: Secret = undefined,
     /// RFC 9147 §8: "receivers MUST retain the pre-update keying material
     /// until receipt and successful decryption of a message using the new
     /// keys". One generation is kept: the peer cannot update again before
@@ -1456,7 +1514,7 @@ pub const Connection = struct {
     ku_timer: flight.RetransmitTimer = flight.RetransmitTimer.init(1000, 60_000),
     /// RFC 8446 §7.1 `exporter_master_secret`, set when the application
     /// secrets are derived; read by `exportKeyingMaterial`. Wiped in `deinit`.
-    exporter_master: [32]u8 = undefined,
+    exporter_master: Secret = undefined,
     /// RFC 7301: the negotiated application protocol, `alpn_len == 0` when
     /// none was (see `negotiatedAlpn`).
     alpn: [255]u8 = undefined,
@@ -1464,8 +1522,9 @@ pub const Connection = struct {
 
     // ── handshake-in-progress state (RFC 9147 §5 flight engine) ─────────
     /// Running transcript hash (RFC 8446 §4.4.1, TLS-style 4-byte-header
-    /// framing — see `engine.zig`).
-    transcript: engine.Transcript = .{},
+    /// framing — see `engine.zig`), under both suite hashes until the
+    /// suite is known (`suitehash.Transcript`).
+    transcript: suitehash.Transcript = .{},
     /// Handshake-epoch (epoch 2) record-protection keys — mirrors
     /// `write_keys`/`read_keys` above but for the {EncryptedExtensions,
     /// Finished} flight rather than application data.
@@ -1474,16 +1533,16 @@ pub const Connection = struct {
     /// RFC 8446 §7.1 handshake traffic secrets (`"c hs traffic"`/`"s hs
     /// traffic"`). Persisted (not just used once) because a Finished is
     /// computed/verified later, once the transcript has moved on.
-    hs_traffic_client: [32]u8 = undefined,
-    hs_traffic_server: [32]u8 = undefined,
+    hs_traffic_client: Secret = undefined,
+    hs_traffic_server: Secret = undefined,
     /// Application traffic secrets, derived as soon as the transcript
     /// reaches "through the server's Finished" — but only INSTALLED
     /// (`installApplicationKeys`) once the handshake is mutually
     /// confirmed. The client confirms immediately (having just verified
     /// the server's Finished) and installs right away; the server stashes
     /// these here until the client's Finished verifies.
-    pending_ap_client: [32]u8 = undefined,
-    pending_ap_server: [32]u8 = undefined,
+    pending_ap_client: Secret = undefined,
+    pending_ap_server: Secret = undefined,
     /// Per-epoch record sequence-number bookkeeping for the two handshake
     /// epochs (epoch 0: ClientHello/ServerHello; epoch 2:
     /// EncryptedExtensions/Finished) — kept separate from the application
@@ -1493,10 +1552,6 @@ pub const Connection = struct {
     /// ClientHello1's `random`, kept because RFC 8446 §4.1.2 requires
     /// ClientHello2 to reuse it verbatim after a HelloRetryRequest.
     client_random: [32]u8 = undefined,
-    /// `Hash(ClientHello1)`, captured before the transcript moves on, for
-    /// RFC 8446 §4.4.1's `message_hash` rewrite. Only meaningful once a
-    /// HelloRetryRequest has actually arrived.
-    client_hello1_hash: [32]u8 = undefined,
     /// A HelloRetryRequest has already been processed. RFC 8446 §4.1.4: a
     /// client that receives a second one MUST abort — otherwise a server
     /// could keep a client in an unbounded retry loop.
@@ -1662,12 +1717,12 @@ pub const Connection = struct {
             // HelloRetryRequest (`handleHelloRetryRequest`).
             .cert_dhe, .cert_dhe_insecure_unauthenticated => try self.buildClientHelloCertDhe(entropy, null, @backingInt(self.config.key_share_group), &ch_body_buf),
         };
+        // ClientHello1 is the first message, so until the next one arrives
+        // the transcript hash IS `Hash(ClientHello1)` — under both suite
+        // hashes, since the client cannot know yet which one a
+        // HelloRetryRequest will name; `handleHelloRetryRequest` reads it
+        // from there for RFC 8446 §4.4.1's `message_hash` rewrite.
         self.transcript.append(@backingInt(messages.HandshakeType.client_hello), ch_body);
-        // ClientHello1 is the first message, so the transcript hash right
-        // now IS `Hash(ClientHello1)` — the value RFC 8446 §4.4.1's
-        // `message_hash` rewrite needs if a HelloRetryRequest arrives. It has
-        // to be captured here; once the transcript moves on it is gone.
-        self.client_hello1_hash = self.transcript.currentHash();
 
         var frag_buf: [max_client_hello_body + handshake.header_len]u8 = undefined;
         const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.client_hello), self.message_seq, ch_body, &frag_buf);
@@ -1840,8 +1895,9 @@ pub const Connection = struct {
     /// keys from a completed handshake's client/server application traffic
     /// secrets (RFC 8446 §7.3 key/iv + RFC 9147 §4.2.3 sn), and marks the
     /// connection `connected`. `client_ap_secret`/`server_ap_secret` are the
-    /// outputs of `keyschedule.deriveApplicationTrafficSecrets`. All four
-    /// supported suites use SHA-256, so the schedule uses `HkdfSha256`.
+    /// outputs of `keyschedule.deriveApplicationTrafficSecrets` under
+    /// HKDF-SHA256, so this takes the SHA-256 suites only (a SHA-384 suite
+    /// is `error.UnsupportedSuite`); `installApplicationSecrets` takes any.
     ///
     /// The client WRITES with the client secret and READS with the server's
     /// (and vice-versa for the server), so one call wires both directions
@@ -1852,25 +1908,42 @@ pub const Connection = struct {
         client_ap_secret: *const [32]u8,
         server_ap_secret: *const [32]u8,
     ) SendError!void {
+        if (suite.hash() != .sha256) return error.UnsupportedSuite;
         return burn.run(burn.install_burn, SendError!void, installApplicationKeysBody, .{ self, suite, client_ap_secret, server_ap_secret });
     }
 
+    /// `installApplicationKeys` for any wired suite: the secrets are
+    /// `suite.hash().len()` bytes each (32, or 48 for
+    /// `aes_256_gcm_sha384`); another length is `error.UnsupportedSuite`.
+    pub fn installApplicationSecrets(
+        self: *Connection,
+        suite: CipherSuite,
+        client_ap_secret: []const u8,
+        server_ap_secret: []const u8,
+    ) SendError!void {
+        const n = suite.hash().len();
+        if (client_ap_secret.len != n or server_ap_secret.len != n) return error.UnsupportedSuite;
+        return burn.run(burn.install_burn, SendError!void, installApplicationKeysBody, .{ self, suite, client_ap_secret, server_ap_secret });
+    }
+
+    /// The secrets are `suite.hash().len()` bytes (checked by both callers).
     fn installApplicationKeysBody(
         self: *Connection,
         suite: CipherSuite,
-        client_ap_secret: *const [32]u8,
-        server_ap_secret: *const [32]u8,
+        client_ap_secret: []const u8,
+        server_ap_secret: []const u8,
     ) SendError!void {
-        const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
         const params = suiteParams(suite) orelse return error.UnsupportedSuite;
+        const alg = suite.hash();
+        const n = alg.len();
 
         const my_secret = if (self.role == .client) client_ap_secret else server_ap_secret;
         const peer_secret = if (self.role == .client) server_ap_secret else client_ap_secret;
 
-        self.write_keys = deriveDir(Hkdf, params, my_secret);
-        self.read_keys = deriveDir(Hkdf, params, peer_secret);
-        self.ap_write_secret = my_secret.*;
-        self.ap_read_secret = peer_secret.*;
+        @memcpy(self.ap_write_secret[0..n], my_secret[0..n]);
+        @memcpy(self.ap_read_secret[0..n], peer_secret[0..n]);
+        self.write_keys = deriveDir(alg, params, &self.ap_write_secret);
+        self.read_keys = deriveDir(alg, params, &self.ap_read_secret);
         self.suite = suite;
         self.epoch = application_epoch;
         self.write_epoch = application_epoch;
@@ -1987,12 +2060,11 @@ pub const Connection = struct {
     }
 
     fn completeKeyUpdate(self: *Connection) void {
-        const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
         // `suite` has a `suiteParams` entry: keys were installed under it.
         const params = suiteParams(self.suite).?;
-        keyschedule.nextApplicationTrafficSecret(Hkdf, &self.ap_write_secret, &self.ap_write_secret);
+        suitehash.nextApplicationTrafficSecret(self.suite.hash(), &self.ap_write_secret);
         secureZeroDirKeys(&self.write_keys);
-        self.write_keys = deriveDir(Hkdf, params, &self.ap_write_secret);
+        self.write_keys = deriveDir(self.suite.hash(), params, &self.ap_write_secret);
         self.write_epoch += 1;
         self.send_seq = 0;
         self.ku_state = .idle;
@@ -2076,7 +2148,6 @@ pub const Connection = struct {
     }
 
     fn applyPeerKeyUpdate(self: *Connection) void {
-        const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
         const params = suiteParams(self.suite).?;
         secureZeroDirKeys(&self.prev_read_keys);
         self.prev_read_keys = self.read_keys;
@@ -2086,8 +2157,8 @@ pub const Connection = struct {
             .recv_seen_any = self.recv_seen_any,
             .recv_window = self.recv_window,
         };
-        keyschedule.nextApplicationTrafficSecret(Hkdf, &self.ap_read_secret, &self.ap_read_secret);
-        self.read_keys = deriveDir(Hkdf, params, &self.ap_read_secret);
+        suitehash.nextApplicationTrafficSecret(self.suite.hash(), &self.ap_read_secret);
+        self.read_keys = deriveDir(self.suite.hash(), params, &self.ap_read_secret);
         self.read_epoch += 1;
         self.recv_max_seq = 0;
         self.recv_seen_any = false;
@@ -2277,19 +2348,23 @@ pub const Connection = struct {
     /// HKDF-Expand-Label in DTLS 1.3 carries the `"dtls13"` prefix, this one
     /// included, so the output differs from a TLS 1.3 exporter over the
     /// same secret. `context == null` and an empty context are the same
-    /// value (RFC 8446 §7.5). Only once connected; `label.len <=
-    /// keyschedule.max_exporter_label_len` and `out.len <=
-    /// keyschedule.maxExporterLen(HkdfSha256)` are errors, not panics.
+    /// value (RFC 8446 §7.5). The hash is the negotiated suite's (SHA-384
+    /// for `aes_256_gcm_sha384`). Only once connected; `label.len <=
+    /// keyschedule.max_exporter_label_len` and `out.len <= 255 *
+    /// suite.hash().len()` are errors, not panics.
+    // secret-api-ok: the body is tls13's `keyschedule.exportKeyingMaterial`, which runs under tls13's own dead-stack burn (`ks_burn`); this only selects the suite's hash (flagged since the secret fields became the `Secret` type).
     pub fn exportKeyingMaterial(self: *const Connection, label: []const u8, context: ?[]const u8, out: []u8) ExportError!void {
         if (self.state != .connected) return error.NotConnected;
-        return keyschedule.exportKeyingMaterial(
-            std.crypto.hash.sha2.Sha256,
-            std.crypto.kdf.hkdf.HkdfSha256,
-            out,
-            &self.exporter_master,
-            label,
-            context orelse "",
-        );
+        return switch (self.suite.hash()) {
+            inline else => |a| keyschedule.exportKeyingMaterial(
+                suitehash.Types(a).Hash,
+                suitehash.Types(a).Hkdf,
+                out,
+                self.exporter_master[0..suitehash.Types(a).n],
+                label,
+                context orelse "",
+            ),
+        };
     }
 
     /// Whether a HelloRetryRequest was part of this connection's handshake
@@ -2403,6 +2478,33 @@ pub const Connection = struct {
 
     // ── handshake flight engine (RFC 9147 §5, PSK-only) ──────────────────
 
+    /// Whether this side may negotiate `suite`: configured, wired, and in
+    /// `.psk` mode of `Config.psk_hash` (RFC 8446 §4.2.11 — an external PSK
+    /// is usable only with suites of its own hash). The one definition the
+    /// client's offer, the server's selection and the client's check of
+    /// the server's choice (HelloRetryRequest and ServerHello) all use.
+    fn suiteUsable(config: *const Config, suite: CipherSuite) bool {
+        if (suiteParams(suite) == null) return false;
+        if (config.key_exchange == .psk and suite.hash() != config.psk_hash) return false;
+        for (config.cipher_suites) |cs| {
+            if (cs == suite) return true;
+        }
+        return false;
+    }
+
+    /// Client: the ClientHello's `cipher_suites`, `Config.cipher_suites`
+    /// in order restricted to `suiteUsable`.
+    fn offeredSuites(self: *const Connection, buf: *[8]u16) HandshakeError![]const u16 {
+        if (self.config.cipher_suites.len > buf.len) return error.BufferTooShort;
+        var n: usize = 0;
+        for (self.config.cipher_suites) |cs| {
+            if (!suiteUsable(&self.config, cs)) continue;
+            buf[n] = @backingInt(cs);
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
     /// Builds the ClientHello BODY (post-handshake-header) into `body_buf`:
     /// random || empty session id || `config.cipher_suites` ||
     /// {psk_key_exchange_modes=[psk_ke], signature_algorithms,
@@ -2431,9 +2533,7 @@ pub const Connection = struct {
         }
 
         var cs_arr: [8]u16 = undefined;
-        if (self.config.cipher_suites.len > cs_arr.len) return error.BufferTooShort;
-        for (self.config.cipher_suites, 0..) |cs, i| cs_arr[i] = @backingInt(cs);
-        const cs_list = cs_arr[0..self.config.cipher_suites.len];
+        const cs_list = try self.offeredSuites(&cs_arr);
 
         var modes_buf: [4]u8 = undefined;
         const modes_ext = try messages.encodePskKeyExchangeModes(&.{.psk_ke}, &modes_buf);
@@ -2441,11 +2541,13 @@ pub const Connection = struct {
         var sigalgs_buf: [2 + 2 * default_signature_algorithms.len]u8 = undefined;
         const sigalgs_ext = try signatureAlgorithmsExtension(self.config.signature_algorithms, &sigalgs_buf);
 
-        // 32-byte (SHA-256) placeholder binder, patched below.
-        var placeholder_binder = @as([32]u8, @splat(0));
-        var psk_buf: [128]u8 = undefined;
+        // `Hash.length`-byte placeholder binder (the PSK's hash, RFC 8446
+        // §4.2.11.2), patched below.
+        const alg = self.config.psk_hash;
+        const placeholder_binder = suitehash.zeros(alg);
+        var psk_buf: [128 + suitehash.max_hash_len - 32]u8 = undefined;
         const identities = [_]messages.PskIdentity{.{ .identity = self.config.psk_identity, .obfuscated_ticket_age = 0 }};
-        const binders = [_][]const u8{&placeholder_binder};
+        const binders = [_][]const u8{placeholder_binder};
         const psk_ext_data = try messages.encodeOfferedPsks(.{ .identities = &identities, .binders = &binders }, &psk_buf);
 
         var versions_buf: [3]u8 = undefined;
@@ -2508,28 +2610,26 @@ pub const Connection = struct {
         // binders list itself."
         //
         // `psk_ext_data`'s layout is `ids... || binders_len(2) || len(1) ||
-        // binder(32)`. The binders LIST is a vector, so its 2-byte length
-        // prefix belongs to the list and is dropped with it: Truncate() cuts
-        // the last 2 + 1 + 32 bytes, not 33. Cutting 33 (keeping
+        // binder(Hash.length)`. The binders LIST is a vector, so its 2-byte
+        // length prefix belongs to the list and is dropped with it:
+        // Truncate() cuts the last 2 + 1 + 32 bytes (SHA-256), not 33. Cutting 33 (keeping
         // `binders_len` in the hash) is a two-byte error invisible to
         // self-interop — both sides simply agree on the wrong prefix — and
         // it is what a live wolfSSL peer reported as
         // `alert(illegal_parameter)` / "binder does not verify".
-        const binder_len: usize = 2 + 1 + 32;
+        const binder_len: usize = 2 + 1 + alg.len();
         if (ch_full.len < binder_len) return error.Malformed;
         const truncated = ch_full[0 .. ch_full.len - binder_len];
-        const binder_th = self.transcript.wouldBeHash(@backingInt(messages.HandshakeType.client_hello), ch_full.len, truncated);
+        var th_buf: Secret = undefined;
+        const binder_th = self.transcript.wouldBeHash(alg, @backingInt(messages.HandshakeType.client_hello), ch_full.len, truncated, &th_buf);
 
-        const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
-        const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
-        const eh = emptySha256Hash();
-        var es: [32]u8 = undefined;
-        var bk: [32]u8 = undefined;
-        var binder: [32]u8 = undefined;
-        keyschedule.earlySecret(Hkdf, &es, self.config.psk);
-        keyschedule.binderKey(Hkdf, &bk, &es, &eh);
-        keyschedule.pskBinder(Hkdf, Hmac, &binder, &bk, &binder_th);
-        @memcpy(ch_full[ch_full.len - 32 ..], &binder);
+        var es: Secret = undefined;
+        var bk: Secret = undefined;
+        var binder: Secret = undefined;
+        suitehash.earlySecret(alg, &es, self.config.psk);
+        suitehash.binderKey(alg, &bk, &es);
+        const b = suitehash.pskBinder(alg, &binder, &bk, binder_th);
+        @memcpy(ch_full[ch_full.len - b.len ..], b);
 
         return ch_full;
     }
@@ -2588,9 +2688,7 @@ pub const Connection = struct {
         }
 
         var cs_arr: [8]u16 = undefined;
-        if (self.config.cipher_suites.len > cs_arr.len) return error.BufferTooShort;
-        for (self.config.cipher_suites, 0..) |cs, i| cs_arr[i] = @backingInt(cs);
-        const cs_list = cs_arr[0..self.config.cipher_suites.len];
+        const cs_list = try self.offeredSuites(&cs_arr);
 
         var groups_buf: [2 + 2 * advertised_groups.len]u8 = undefined;
         const groups_ext = try messages.encodeSupportedGroups(&advertised_groups, &groups_buf);
@@ -3023,12 +3121,13 @@ pub const Connection = struct {
         entropy: Entropy,
         out: []u8,
     ) HandshakeError!SentRecord {
-        const th = self.transcript.currentHash();
+        var th_buf: Secret = undefined;
+        const th = self.transcript.currentHash(self.suite.hash(), &th_buf);
         var sig_buf: [max_sig_len]u8 = undefined;
         // `certverify.sign` carries its own requirement in its type (`?std.Random`,
         // fail-closed with `error.RandomRequired` for RSA-PSS), so this is where
         // the arm is erased: the choice was already made at the entry point.
-        const sig = try certverify.sign(scheme, cc.private_key, side, &th, entropy.source(), &sig_buf);
+        const sig = try certverify.sign(scheme, cc.private_key, side, th, entropy.source(), &sig_buf);
 
         var cv_body_buf: [max_certverify_body]u8 = undefined;
         const cv_body = messages.encodeCertificateVerify(.{ .algorithm = @backingInt(scheme), .signature = sig }, &cv_body_buf) catch return error.BufferTooShort;
@@ -3251,9 +3350,10 @@ pub const Connection = struct {
                 // Transcript hash "through Certificate" — everything
                 // appended so far, NOT including this CertificateVerify
                 // message itself (RFC 8446 §4.4.3).
-                const th_through_cert = self.transcript.currentHash();
+                var th_buf: Secret = undefined;
+                const th_through_cert = self.transcript.currentHash(self.suite.hash(), &th_buf);
                 const cv = messages.decodeCertificateVerify(parsed.body) catch return error.Malformed;
-                try self.verifyPeerCert(result.leaf_buf[0..result.leaf_len], cv.algorithm, cv.signature, &th_through_cert, signer_side);
+                try self.verifyPeerCert(result.leaf_buf[0..result.leaf_len], cv.algorithm, cv.signature, th_through_cert, signer_side);
                 self.transcript.append(parsed.msg_type, parsed.body);
                 result.saw_cv = true;
             } else {
@@ -3331,21 +3431,24 @@ pub const Connection = struct {
         ch_body: []const u8,
         out: []u8,
     ) HandshakeError!HandshakeResult {
-        const suite = selectCipherSuite(self.config.cipher_suites, dec.cipher_suites_raw) orelse return error.NoCipherSuiteOverlap;
+        const suite = selectCipherSuite(&self.config, dec.cipher_suites_raw) orelse return error.NoCipherSuiteOverlap;
 
-        // `Hash(ClientHello1)` — RFC 8446 §4.4.1's `message_hash` input.
+        // `Hash(ClientHello1)` under the suite's hash — RFC 8446 §4.4.1's
+        // `message_hash` input.
         // Computed on a THROWAWAY transcript: `self.transcript` must stay
         // untouched, both because this connection is about to be discarded
         // and because the transcript ClientHello2 will be measured against
         // does not contain ClientHello1 at all (it contains the synthetic
         // `message_hash` message instead).
-        var scratch = engine.Transcript{};
+        var scratch = suitehash.Transcript{ .alg = suite.hash() };
         scratch.append(@backingInt(messages.HandshakeType.client_hello), ch_body);
-        var cookie: [cookie_len]u8 = undefined;
-        mintCookie(hr, .{ .suite = suite, .client_hello1_hash = scratch.currentHash() }, &cookie);
+        var contents: CookieContents = .{ .suite = suite, .client_hello1_hash = undefined };
+        _ = scratch.currentHash(suite.hash(), &contents.client_hello1_hash);
+        var cookie_buf: [max_cookie_out_len]u8 = undefined;
+        const cookie = mintCookie(hr, contents, &cookie_buf);
 
         var hrr_body_buf: [max_hrr_body_len]u8 = undefined;
-        const hrr_body = try encodeHelloRetryRequest(suite, &cookie, &hrr_body_buf);
+        const hrr_body = try encodeHelloRetryRequest(suite, cookie, &hrr_body_buf);
 
         // RFC 9147 §5.2 `message_seq` 0: the HelloRetryRequest is the first
         // handshake message this server sends, and `acceptCookie` restores
@@ -3389,7 +3492,8 @@ pub const Connection = struct {
     fn acceptCookie(self: *Connection, hr: HelloRetryConfig, cookie: []const u8) HandshakeError!CipherSuite {
         const contents = try openCookie(hr, cookie);
 
-        self.transcript.resetToMessageHash(contents.client_hello1_hash);
+        const alg = contents.suite.hash();
+        self.transcript.resetToMessageHash(alg, contents.client_hello1_hash[0..alg.len()]);
         var hrr_body_buf: [max_hrr_body_len]u8 = undefined;
         const hrr_body = try encodeHelloRetryRequest(contents.suite, cookie, &hrr_body_buf);
         self.transcript.append(@backingInt(messages.HandshakeType.server_hello), hrr_body);
@@ -3471,13 +3575,12 @@ pub const Connection = struct {
             client_sig_algs_len = sig_algs.len;
         }
 
-        const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
-        const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
-        const eh = emptySha256Hash();
-
         // The early secret (RFC 8446 §7.1) and, in `.cert_dhe` mode, the
         // ephemeral (EC)DHE shared secret that feeds the handshake secret.
-        var es: [32]u8 = undefined;
+        // In `.psk` mode the hash is `Config.psk_hash`, which every suite
+        // `selectCipherSuite` may pick below shares; in `.cert_dhe` mode the
+        // early secret waits for the suite.
+        var es: Secret = undefined;
         var dhe_shared: ?DheSecret = null;
 
         switch (self.config.key_exchange) {
@@ -3494,7 +3597,8 @@ pub const Connection = struct {
                 if (offered.identities.len == 0 or offered.binders.len == 0) return error.NoMatchingPskIdentity;
                 if (!std.mem.eql(u8, offered.identities[0].identity, self.config.psk_identity)) return error.NoMatchingPskIdentity;
                 const binder0 = offered.binders[0];
-                if (binder0.len != 32) return error.Malformed;
+                const palg = self.config.psk_hash;
+                if (binder0.len != palg.len()) return error.Malformed;
 
                 // RFC 8446 §4.2.11.2 truncation point: "up to and including
                 // the PreSharedKeyExtension.identities field", i.e. right
@@ -3514,13 +3618,14 @@ pub const Connection = struct {
                 if (truncate_at > ch_body.len) return error.Malformed;
                 const truncated = ch_body[0..truncate_at];
 
-                keyschedule.earlySecret(Hkdf, &es, self.config.psk);
-                var bk: [32]u8 = undefined;
-                keyschedule.binderKey(Hkdf, &bk, &es, &eh);
-                const binder_th = self.transcript.wouldBeHash(@backingInt(messages.HandshakeType.client_hello), ch_body.len, truncated);
-                var expected_binder: [32]u8 = undefined;
-                keyschedule.pskBinder(Hkdf, Hmac, &expected_binder, &bk, &binder_th);
-                if (!std.crypto.timing_safe.eql([32]u8, expected_binder, binder0[0..32].*)) return error.BinderVerifyFailed;
+                suitehash.earlySecret(palg, &es, self.config.psk);
+                var bk: Secret = undefined;
+                suitehash.binderKey(palg, &bk, &es);
+                var th_buf: Secret = undefined;
+                const binder_th = self.transcript.wouldBeHash(palg, @backingInt(messages.HandshakeType.client_hello), ch_body.len, truncated, &th_buf);
+                var expected_binder: Secret = undefined;
+                const eb = suitehash.pskBinder(palg, &expected_binder, &bk, binder_th);
+                if (!suitehash.macEql(palg, eb, binder0)) return error.BinderVerifyFailed;
             },
             .cert_dhe, .cert_dhe_insecure_unauthenticated => {
                 // PSK-less (EC)DHE: pick a usable client share, make our own
@@ -3544,12 +3649,13 @@ pub const Connection = struct {
                 self.ecdhe_public_len = ex.public_len;
                 dhe_shared = ex.shared;
                 std.crypto.secureZero(u8, &ex.shared.bytes); // the copy in `dhe_shared` is now the only live one
-                const zero_psk = @as([32]u8, @splat(0));
-                keyschedule.earlySecret(Hkdf, &es, &zero_psk);
             },
         }
 
-        const suite = selectCipherSuite(self.config.cipher_suites, dec.cipher_suites_raw) orelse return error.NoCipherSuiteOverlap;
+        const suite = selectCipherSuite(&self.config, dec.cipher_suites_raw) orelse return error.NoCipherSuiteOverlap;
+        const alg = suite.hash();
+        // RFC 8446 §7.1: no PSK ⇒ PSK = 0^Hash.length, of the suite's hash.
+        if (self.config.key_exchange.isCertDhe()) suitehash.earlySecret(alg, &es, suitehash.zeros(alg));
         // RFC 8446 §4.1.4: "Servers MUST ensure that they negotiate the same
         // cipher suite when receiving a conformant updated ClientHello", and
         // a client MUST abort if the ServerHello's suite differs from the
@@ -3563,7 +3669,9 @@ pub const Connection = struct {
         try self.serverSelectAlpn(dec.extensions);
 
         // ClientHello accepted (PSK binder verified, or cert-DHE key_share
-        // extracted): commit it to the transcript.
+        // extracted): commit it to the transcript, which from here on runs
+        // under the suite's hash only.
+        self.transcript.select(alg);
         self.transcript.append(@backingInt(messages.HandshakeType.client_hello), ch_body);
         self.suite = suite;
 
@@ -3630,15 +3738,16 @@ pub const Connection = struct {
 
         // RFC 8446 §7.1: handshake traffic secrets, over the transcript
         // through ServerHello.
-        const th_through_sh = self.transcript.currentHash();
+        var th_buf: Secret = undefined;
+        const th_through_sh = self.transcript.currentHash(alg, &th_buf);
         const dhe_ptr: ?[]const u8 = if (dhe_shared) |*s| s.slice() else null;
-        var hs_secret: [32]u8 = undefined;
-        keyschedule.deriveHandshakeSecret(Hkdf, &hs_secret, &es, &eh, dhe_ptr);
+        var hs_secret: Secret = undefined;
+        suitehash.deriveHandshakeSecret(alg, &hs_secret, &es, dhe_ptr);
         if (dhe_shared) |*s| std.crypto.secureZero(u8, &s.bytes); // forward secrecy: drop the (EC)DHE shared secret
-        keyschedule.deriveHandshakeTrafficSecrets(Hkdf, &self.hs_traffic_client, &self.hs_traffic_server, &hs_secret, &th_through_sh);
+        suitehash.deriveHandshakeTrafficSecrets(alg, &self.hs_traffic_client, &self.hs_traffic_server, &hs_secret, th_through_sh);
         const params = suiteParams(suite) orelse return error.UnsupportedSuite;
-        self.hs_write_keys = deriveDir(Hkdf, params, &self.hs_traffic_server);
-        self.hs_read_keys = deriveDir(Hkdf, params, &self.hs_traffic_client);
+        self.hs_write_keys = deriveDir(alg, params, &self.hs_traffic_server);
+        self.hs_read_keys = deriveDir(alg, params, &self.hs_traffic_client);
 
         // EncryptedExtensions: empty, or the RFC 7301 selection (a list of
         // exactly one name).
@@ -3707,14 +3816,12 @@ pub const Connection = struct {
             extra_n += 1;
         }
 
-        var finished_key: [32]u8 = undefined;
-        keyschedule.deriveFinishedKey(Hkdf, 32, &finished_key, &self.hs_traffic_server);
-        const th_before_finished = self.transcript.currentHash();
-        var verify_data: [32]u8 = undefined;
-        keyschedule.computeFinishedVerifyData(Hmac, &verify_data, &finished_key, &th_before_finished);
-        self.transcript.append(@backingInt(messages.HandshakeType.finished), &verify_data);
-        var fin_frag_buf: [32 + handshake.header_len]u8 = undefined;
-        const fin_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.finished), self.message_seq, &verify_data, &fin_frag_buf);
+        const th_before_finished = self.transcript.currentHash(alg, &th_buf);
+        var vd_buf: Secret = undefined;
+        const verify_data = suitehash.finishedVerifyData(alg, &vd_buf, &self.hs_traffic_server, th_before_finished);
+        self.transcript.append(@backingInt(messages.HandshakeType.finished), verify_data);
+        var fin_frag_buf: [suitehash.max_hash_len + handshake.header_len]u8 = undefined;
+        const fin_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.finished), self.message_seq, verify_data, &fin_frag_buf);
         self.message_seq +%= 1;
         const fin_seq = self.hs2.send_seq;
         {
@@ -3722,10 +3829,10 @@ pub const Connection = struct {
             cursor += fin_record.len;
         }
 
-        var ms: [32]u8 = undefined;
-        keyschedule.deriveMasterSecret(Hkdf, &ms, &hs_secret, &eh);
-        const th_through_server_finished = self.transcript.currentHash();
-        keyschedule.deriveApplicationSecrets(Hkdf, &self.pending_ap_client, &self.pending_ap_server, &self.exporter_master, &ms, &th_through_server_finished);
+        var ms: Secret = undefined;
+        suitehash.deriveMasterSecret(alg, &ms, &hs_secret);
+        const th_through_server_finished = self.transcript.currentHash(alg, &th_buf);
+        suitehash.deriveApplicationSecrets(alg, &self.pending_ap_client, &self.pending_ap_server, &self.exporter_master, &ms, th_through_server_finished);
 
         var all_records: [6]flight.RecordNumber = undefined;
         var n: usize = 0;
@@ -3768,19 +3875,17 @@ pub const Connection = struct {
         }
 
         const fin = messages.decodeFinished(cert_result.finishedVerifyData());
-        if (fin.verify_data.len != 32) return error.Malformed;
+        const alg = self.suite.hash();
+        if (fin.verify_data.len != alg.len()) return error.Malformed;
 
-        const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
-        const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
-        var finished_key: [32]u8 = undefined;
-        keyschedule.deriveFinishedKey(Hkdf, 32, &finished_key, &self.hs_traffic_client);
-        const th = self.transcript.currentHash(); // through the server's own Finished
-        var expected: [32]u8 = undefined;
-        keyschedule.computeFinishedVerifyData(Hmac, &expected, &finished_key, &th);
-        if (!std.crypto.timing_safe.eql([32]u8, expected, fin.verify_data[0..32].*)) return error.FinishedVerifyFailed;
+        var th_buf: Secret = undefined;
+        const th = self.transcript.currentHash(alg, &th_buf); // through the server's own Finished
+        var expected: Secret = undefined;
+        const ev = suitehash.finishedVerifyData(alg, &expected, &self.hs_traffic_client, th);
+        if (!suitehash.macEql(alg, ev, fin.verify_data)) return error.FinishedVerifyFailed;
         self.transcript.append(@backingInt(messages.HandshakeType.finished), fin.verify_data);
 
-        try self.installApplicationKeys(self.suite, &self.pending_ap_client, &self.pending_ap_server);
+        try self.installApplicationSecrets(self.suite, self.pending_ap_client[0..alg.len()], self.pending_ap_server[0..alg.len()]);
         self.clearFlightTracker();
         self.retransmit_timer.reset();
         self.last_flight_len = 0;
@@ -3895,13 +4000,26 @@ pub const Connection = struct {
             if (c.len > max_cookie_len) return error.BufferTooShort;
         }
 
+        // RFC 8446 §4.1.4: the retry's cipher suite must be one this client
+        // offered ("Upon receipt of a HelloRetryRequest, the client MUST
+        // check the legacy_version, legacy_session_id_echo, cipher_suite
+        // ... [and] MUST abort the handshake with an 'illegal_parameter'
+        // alert" otherwise). It fixes the transcript hash from here on.
+        const hrr_suite = cipherSuiteFromU16(hrr.cipher_suite) orelse return error.IllegalHelloRetryRequest;
+        if (!suiteUsable(&self.config, hrr_suite)) return error.IllegalHelloRetryRequest;
+        const alg = hrr_suite.hash();
+
         self.saw_hello_retry_request = true;
         self.hrr_cipher_suite = hrr.cipher_suite;
 
         // RFC 8446 §4.4.1: replace ClientHello1 with `message_hash`, THEN
         // append the HelloRetryRequest, then ClientHello2. Order matters —
         // the binder in ClientHello2 is computed over exactly this prefix.
-        self.transcript.resetToMessageHash(self.client_hello1_hash);
+        // The transcript holds only ClientHello1 so far, so its hash under
+        // the retry suite's hash IS `Hash(ClientHello1)`.
+        var ch1_hash: Secret = undefined;
+        const ch1 = self.transcript.currentHash(alg, &ch1_hash);
+        self.transcript.resetToMessageHash(alg, ch1);
         self.transcript.append(@backingInt(messages.HandshakeType.server_hello), hrr_body);
 
         var ch_body_buf: [max_client_hello_body]u8 = undefined;
@@ -3974,32 +4092,28 @@ pub const Connection = struct {
 
         const suite = cipherSuiteFromU16(sh_dec.cipher_suite) orelse return error.UnsupportedSuite;
         if (suiteParams(suite) == null) return error.UnsupportedSuite;
-        var offered_ok = false;
-        for (self.config.cipher_suites) |cs| {
-            if (cs == suite) offered_ok = true;
-        }
-        if (!offered_ok) return error.NoCipherSuiteOverlap;
+        // Offered, i.e. also (in `.psk` mode) of the PSK's hash: a server
+        // that answers a SHA-256 PSK with a SHA-384 suite is refused here.
+        if (!suiteUsable(&self.config, suite)) return error.NoCipherSuiteOverlap;
         self.suite = suite;
+        const alg = suite.hash();
 
+        self.transcript.select(alg);
         self.transcript.append(@backingInt(messages.HandshakeType.server_hello), sh_parsed.body);
         self.clearFlightTracker(); // the ClientHello flight is now implicitly ACKed
         self.retransmit_timer.reset();
-
-        const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
-        const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
-        const eh = emptySha256Hash();
 
         // Handshake secret: PSK path (`null` DHE) unchanged; cert-DHE path
         // computes the X25519 shared secret from this client's stored
         // ephemeral secret + the server's key_share, and mixes it in via the
         // SAME `deriveHandshakeSecret` (RFC 8446 §7.1) — the early secret's
         // IKM is the zero PSK in that case.
-        var hs_secret: [32]u8 = undefined;
+        var hs_secret: Secret = undefined;
         switch (self.config.key_exchange) {
             .psk => {
-                var es: [32]u8 = undefined;
-                keyschedule.earlySecret(Hkdf, &es, self.config.psk);
-                keyschedule.deriveHandshakeSecret(Hkdf, &hs_secret, &es, &eh, null);
+                var es: Secret = undefined;
+                suitehash.earlySecret(alg, &es, self.config.psk);
+                suitehash.deriveHandshakeSecret(alg, &hs_secret, &es, null);
             },
             .cert_dhe, .cert_dhe_insecure_unauthenticated => {
                 const server_share = try serverHelloShare(sh_dec.extensions);
@@ -4024,18 +4138,18 @@ pub const Connection = struct {
                 std.crypto.secureZero(u8, &self.ecdhe_secret); // forward secrecy: drop the ephemeral private key
                 self.ecdhe_expanded.wipe();
                 self.ecdhe_secret_live = false;
-                const zero_psk = @as([32]u8, @splat(0));
-                var es: [32]u8 = undefined;
-                keyschedule.earlySecret(Hkdf, &es, &zero_psk);
-                keyschedule.deriveHandshakeSecret(Hkdf, &hs_secret, &es, &eh, shared.slice());
+                var es: Secret = undefined;
+                suitehash.earlySecret(alg, &es, suitehash.zeros(alg));
+                suitehash.deriveHandshakeSecret(alg, &hs_secret, &es, shared.slice());
                 std.crypto.secureZero(u8, &shared.bytes); // forward secrecy: drop the (EC)DHE shared secret
             },
         }
-        const th_through_sh = self.transcript.currentHash();
-        keyschedule.deriveHandshakeTrafficSecrets(Hkdf, &self.hs_traffic_client, &self.hs_traffic_server, &hs_secret, &th_through_sh);
+        var th_buf: Secret = undefined;
+        const th_through_sh = self.transcript.currentHash(alg, &th_buf);
+        suitehash.deriveHandshakeTrafficSecrets(alg, &self.hs_traffic_client, &self.hs_traffic_server, &hs_secret, th_through_sh);
         const params = suiteParams(suite).?;
-        self.hs_write_keys = deriveDir(Hkdf, params, &self.hs_traffic_client);
-        self.hs_read_keys = deriveDir(Hkdf, params, &self.hs_traffic_server);
+        self.hs_write_keys = deriveDir(alg, params, &self.hs_traffic_client);
+        self.hs_read_keys = deriveDir(alg, params, &self.hs_traffic_server);
 
         var ee_msg_buf: [ee_recv_cap]u8 = undefined;
         var ee_received_buf: [ee_recv_cap]bool = undefined;
@@ -4061,25 +4175,23 @@ pub const Connection = struct {
             return error.PeerCertificateRequired;
 
         const server_fin = messages.decodeFinished(cert_result.finishedVerifyData());
-        if (server_fin.verify_data.len != 32) return error.Malformed;
+        if (server_fin.verify_data.len != alg.len()) return error.Malformed;
 
-        var server_finished_key: [32]u8 = undefined;
-        keyschedule.deriveFinishedKey(Hkdf, 32, &server_finished_key, &self.hs_traffic_server);
-        const th_before_server_finished = self.transcript.currentHash();
-        var expected_server_vd: [32]u8 = undefined;
-        keyschedule.computeFinishedVerifyData(Hmac, &expected_server_vd, &server_finished_key, &th_before_server_finished);
-        if (!std.crypto.timing_safe.eql([32]u8, expected_server_vd, server_fin.verify_data[0..32].*)) return error.FinishedVerifyFailed;
+        const th_before_server_finished = self.transcript.currentHash(alg, &th_buf);
+        var expected_server_vd: Secret = undefined;
+        const esv = suitehash.finishedVerifyData(alg, &expected_server_vd, &self.hs_traffic_server, th_before_server_finished);
+        if (!suitehash.macEql(alg, esv, server_fin.verify_data)) return error.FinishedVerifyFailed;
         self.transcript.append(@backingInt(messages.HandshakeType.finished), server_fin.verify_data);
 
         // Application traffic secrets are fixed at "through the SERVER's
         // Finished" (RFC 8446 §7.1) regardless of whatever the client sends
         // next below — computed here, BEFORE any client-side certificate
         // messages are appended to the transcript.
-        var ms: [32]u8 = undefined;
-        keyschedule.deriveMasterSecret(Hkdf, &ms, &hs_secret, &eh);
-        const th_through_server_finished = self.transcript.currentHash();
-        var ap: struct { client: [32]u8, server: [32]u8 } = undefined;
-        keyschedule.deriveApplicationSecrets(Hkdf, &ap.client, &ap.server, &self.exporter_master, &ms, &th_through_server_finished);
+        var ms: Secret = undefined;
+        suitehash.deriveMasterSecret(alg, &ms, &hs_secret);
+        const th_through_server_finished = self.transcript.currentHash(alg, &th_buf);
+        var ap: struct { client: Secret, server: Secret } = undefined;
+        suitehash.deriveApplicationSecrets(alg, &ap.client, &ap.server, &self.exporter_master, &ms, th_through_server_finished);
 
         // ── certificate mode: this client's own Certificate/CertificateVerify,
         // ONLY if the server asked (`cert_result.requested_client_cert`).
@@ -4122,15 +4234,13 @@ pub const Connection = struct {
             }
         }
 
-        var client_finished_key: [32]u8 = undefined;
-        keyschedule.deriveFinishedKey(Hkdf, 32, &client_finished_key, &self.hs_traffic_client);
-        const th_for_client_finished = self.transcript.currentHash();
-        var client_vd: [32]u8 = undefined;
-        keyschedule.computeFinishedVerifyData(Hmac, &client_vd, &client_finished_key, &th_for_client_finished);
-        self.transcript.append(@backingInt(messages.HandshakeType.finished), &client_vd);
+        const th_for_client_finished = self.transcript.currentHash(alg, &th_buf);
+        var client_vd_buf: Secret = undefined;
+        const client_vd = suitehash.finishedVerifyData(alg, &client_vd_buf, &self.hs_traffic_client, th_for_client_finished);
+        self.transcript.append(@backingInt(messages.HandshakeType.finished), client_vd);
 
-        var fin_frag_buf: [32 + handshake.header_len]u8 = undefined;
-        const client_fin_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.finished), self.message_seq, &client_vd, &fin_frag_buf);
+        var fin_frag_buf: [suitehash.max_hash_len + handshake.header_len]u8 = undefined;
+        const client_fin_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.finished), self.message_seq, client_vd, &fin_frag_buf);
         self.message_seq +%= 1;
         const client_fin_seq = self.hs2.send_seq;
         const client_fin_record = try self.protectHandshakeMessage(client_fin_fragment, out[cursor..]);
@@ -4146,7 +4256,7 @@ pub const Connection = struct {
         n += 1;
         self.markFlightSent(all_records[0..n]);
 
-        try self.installApplicationKeys(suite, &ap.client, &ap.server);
+        try self.installApplicationSecrets(suite, ap.client[0..alg.len()], ap.server[0..alg.len()]);
         // `now_ms` is used only on the HelloRetryRequest path above (arming
         // the retry flight's timer); once connected the client retransmits
         // nothing.
@@ -4160,6 +4270,7 @@ pub const Connection = struct {
 const chachapoly = @import("chachapoly");
 
 const Aes128Gcm = @import("aesgcm").Aes128Gcm; // zig-libs aesgcm (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
+const Aes256Gcm = @import("aesgcm").Aes256Gcm;
 // The `chacha20_poly1305_sha256` suite is RFC 8439's plain ChaCha20-Poly1305
 // (NOT XChaCha), so the SIMD `chachapoly` sibling applies here — see
 // `aead.zig`'s differential test for the byte-identity proof against std,
@@ -4174,6 +4285,8 @@ const SuiteParams = struct { key_len: u8, sn_len: u8, tag_len: u8, is_chacha: bo
 fn suiteParams(suite: CipherSuite) ?SuiteParams {
     return switch (suite) {
         .aes_128_gcm_sha256 => .{ .key_len = 16, .sn_len = 16, .tag_len = 16, .is_chacha = false },
+        // RFC 9147 §4.2.3: the AES sn key is the AEAD key's length.
+        .aes_256_gcm_sha384 => .{ .key_len = 32, .sn_len = 32, .tag_len = 16, .is_chacha = false },
         .chacha20_poly1305_sha256 => .{ .key_len = 32, .sn_len = 32, .tag_len = 16, .is_chacha = true },
         .aes_128_ccm_sha256, .aes_128_ccm_8_sha256 => null,
     };
@@ -4191,22 +4304,11 @@ fn secureZeroDirKeys(d: *DirKeys) void {
     std.crypto.secureZero(u8, &d.sn_key);
 }
 
-fn deriveDir(comptime Hkdf: type, params: SuiteParams, secret: *const [32]u8) DirKeys {
+fn deriveDir(alg: HashAlg, params: SuiteParams, secret: *const Secret) DirKeys {
     var d = DirKeys{ .key_len = params.key_len, .sn_len = params.sn_len };
-    // Derive each of key + sn at the negotiated width (HKDF-Expand-Label's
-    // length is part of its input, so a 16-byte "key" is NOT a prefix of a
-    // 32-byte one — it must be expanded at the exact suite width).
-    // iv width is suite-independent (12)
-    switch (params.key_len) {
-        16 => keyschedule.deriveTrafficKeyIv(Hkdf, 16, 12, d.key[0..16], &d.iv, secret),
-        32 => keyschedule.deriveTrafficKeyIv(Hkdf, 32, 12, d.key[0..32], &d.iv, secret),
-        else => unreachable,
-    }
-    switch (params.sn_len) {
-        16 => keyschedule.deriveSequenceNumberKey(Hkdf, 16, d.sn_key[0..16], secret),
-        32 => keyschedule.deriveSequenceNumberKey(Hkdf, 32, d.sn_key[0..32], secret),
-        else => unreachable,
-    }
+    // key + sn at the negotiated width, under the suite's hash; the iv
+    // width is suite-independent (12).
+    suitehash.deriveTrafficKeys(alg, params.key_len, params.sn_len, &d.key, &d.iv, &d.sn_key, secret);
     return d;
 }
 
@@ -4221,6 +4323,7 @@ fn protectDispatch(
 ) !usize {
     return switch (suite) {
         .aes_128_gcm_sha256 => aead.Protection(Aes128Gcm).protect(keys.key[0..16], keys.iv, epoch, seq, inner, aad, out),
+        .aes_256_gcm_sha384 => aead.Protection(Aes256Gcm).protect(keys.key[0..32], keys.iv, epoch, seq, inner, aad, out),
         .chacha20_poly1305_sha256 => aead.Protection(ChaCha20Poly1305).protect(keys.key[0..32], keys.iv, epoch, seq, inner, aad, out),
         else => error.UnsupportedSuite,
     };
@@ -4237,6 +4340,7 @@ fn unprotectDispatch(
 ) !usize {
     return switch (suite) {
         .aes_128_gcm_sha256 => aead.Protection(Aes128Gcm).unprotect(keys.key[0..16], keys.iv, epoch, seq, ct, aad, out),
+        .aes_256_gcm_sha384 => aead.Protection(Aes256Gcm).unprotect(keys.key[0..32], keys.iv, epoch, seq, ct, aad, out),
         .chacha20_poly1305_sha256 => aead.Protection(ChaCha20Poly1305).unprotect(keys.key[0..32], keys.iv, epoch, seq, ct, aad, out),
         else => error.UnsupportedSuite,
     };
@@ -4245,6 +4349,7 @@ fn unprotectDispatch(
 fn snMaskDispatch(suite: CipherSuite, keys: *const DirKeys, sample: []const u8, seq_bytes: []u8) !void {
     return switch (suite) {
         .aes_128_gcm_sha256 => aead.encryptSequenceNumberAes(keys.sn_key[0..16], sample, seq_bytes),
+        .aes_256_gcm_sha384 => aead.encryptSequenceNumberAes(keys.sn_key[0..32], sample, seq_bytes),
         .chacha20_poly1305_sha256 => aead.encryptSequenceNumberChaCha20(keys.sn_key[0..32], sample, seq_bytes),
         else => error.UnsupportedSuite,
     };
@@ -4341,11 +4446,12 @@ fn replayCheckAndUpdate(seen_any: *bool, high: *u48, window: *u64, seq: u48) boo
 /// RFC 8446 §4.1.4 requires the HelloRetryRequest and the eventual
 /// ServerHello to select the same suite, and the surest way to guarantee
 /// that is for both to run the same code over the same inputs.
-fn selectCipherSuite(ours: []const CipherSuite, offered_raw: []const u8) ?CipherSuite {
-    for (ours) |want| {
+fn selectCipherSuite(config: *const Config, offered_raw: []const u8) ?CipherSuite {
+    for (config.cipher_suites) |want| {
+        if (!Connection.suiteUsable(config, want)) continue;
         var it = messages.CipherSuiteIter{ .raw = offered_raw };
         while (it.next()) |offered| {
-            if (offered == @backingInt(want) and suiteParams(want) != null) return want;
+            if (offered == @backingInt(want)) return want;
         }
     }
     return null;
@@ -4360,20 +4466,12 @@ fn selectCipherSuite(ours: []const CipherSuite, offered_raw: []const u8) ?Cipher
 fn cipherSuiteFromU16(v: u16) ?CipherSuite {
     return switch (v) {
         @backingInt(CipherSuite.aes_128_gcm_sha256) => .aes_128_gcm_sha256,
+        @backingInt(CipherSuite.aes_256_gcm_sha384) => .aes_256_gcm_sha384,
         @backingInt(CipherSuite.chacha20_poly1305_sha256) => .chacha20_poly1305_sha256,
         @backingInt(CipherSuite.aes_128_ccm_sha256) => .aes_128_ccm_sha256,
         @backingInt(CipherSuite.aes_128_ccm_8_sha256) => .aes_128_ccm_8_sha256,
         else => null,
     };
-}
-
-/// `Sha256("")` — RFC 8446 §7.1's "empty transcript hash", needed at
-/// several key-schedule points (`binderKey`, `deriveHandshakeSecret`,
-/// `deriveMasterSecret`) that logically derive from "no messages yet".
-fn emptySha256Hash() [32]u8 {
-    var h: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash("", &h, .{});
-    return h;
 }
 
 /// Frames `body` as a single-fragment `handshake.zig` message (12-byte
@@ -4665,8 +4763,8 @@ fn driveHandshake(client: *Connection, server: *Connection, rnd: Entropy, buf1: 
 fn loopbackHandshake(suite: CipherSuite) !void {
     const psk_identity = "device-042";
     const psk = "a-shared-pre-shared-key";
-    const cfg_client = Config{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{suite} };
-    const cfg_server = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{suite} };
+    const cfg_client = Config{ .role = .client, .psk_identity = psk_identity, .psk = psk, .psk_hash = suite.hash(), .cipher_suites = &.{suite} };
+    const cfg_server = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .psk_hash = suite.hash(), .cipher_suites = &.{suite} };
     var client = try Connection.clientInit(cfg_client);
     var server = try Connection.serverInit(cfg_server);
     var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x10)));
@@ -5126,7 +5224,8 @@ test "reassembly: a ClientHello split across two datagrams, delivered OUT OF ORD
     const before_state = server.state;
     const before_message_seq = server.message_seq;
     const before_peer_seq = server.peer_message_seq;
-    const before_transcript = server.transcript.currentHash();
+    var before_buf: Secret = undefined;
+    const before_transcript = server.transcript.currentHash(.sha256, &before_buf);
     const before_hs0 = server.hs0;
     const before_hs2 = server.hs2;
 
@@ -5140,8 +5239,9 @@ test "reassembly: a ClientHello split across two datagrams, delivered OUT OF ORD
     try testing.expectEqual(before_state, server.state);
     try testing.expectEqual(before_message_seq, server.message_seq);
     try testing.expectEqual(before_peer_seq, server.peer_message_seq);
-    const after_transcript = server.transcript.currentHash();
-    try testing.expectEqualSlices(u8, &before_transcript, &after_transcript);
+    var after_buf: Secret = undefined;
+    const after_transcript = server.transcript.currentHash(.sha256, &after_buf);
+    try testing.expectEqualSlices(u8, before_transcript, after_transcript);
     try testing.expectEqual(before_hs0, server.hs0);
     try testing.expectEqual(before_hs2, server.hs2);
     try testing.expectEqual(@as(usize, 0), server.last_flight_len);
@@ -6042,8 +6142,10 @@ fn expectHelloRetryRequest(datagram: []const u8) ![]const u8 {
     // `datagram` is a caller buffer that outlives `msg_buf`, so hand back a
     // slice OF IT rather than of the local copy.
     const c = cookie orelse return error.HelloRetryRequestHasNoCookie;
-    try testing.expectEqual(@as(usize, cookie_len), c.len);
-    const tail = datagram[datagram.len - cookie_len ..];
+    // The suite's cookie length: 67 for SHA-256 suites, 83 for SHA-384.
+    const suite = cipherSuiteFromU16(sh.cipher_suite) orelse return error.UnsupportedSuite;
+    try testing.expectEqual(cookieLen(suite.hash()), c.len);
+    const tail = datagram[datagram.len - c.len ..];
     try testing.expectEqualSlices(u8, c, tail);
     return tail;
 }
@@ -6075,7 +6177,9 @@ test "HRR server: the cookie exchange completes — and the connection that answ
     try testing.expectEqual(State.start, server1.state);
     try testing.expectEqual(@as(usize, 0), server1.last_flight_len);
     try testing.expectEqual(@as(usize, 0), server1.pending_flight_count);
-    try testing.expectEqualSlices(u8, &(engine.Transcript{}).currentHash(), &server1.transcript.currentHash());
+    var empty_th: Secret = undefined;
+    var server1_th: Secret = undefined;
+    try testing.expectEqualSlices(u8, (suitehash.Transcript{}).currentHash(.sha256, &empty_th), server1.transcript.currentHash(.sha256, &server1_th));
     // And the answer is SMALLER than the question — the amplification
     // property, stated as an assertion rather than a hope.
     try testing.expect(hrr.out.len < ch1_len);
@@ -6374,38 +6478,39 @@ test "Config.validate: hello_retry with an empty secret or an empty binding is r
 
 test "cookie: the MAC covers the peer binding, the ClientHello hash, and the suite — separately" {
     const hr = HelloRetryConfig{ .cookie_secret = "k", .peer_binding = "203.0.113.9:51000" };
-    const contents = CookieContents{ .suite = .aes_128_gcm_sha256, .client_hello1_hash = @as([32]u8, @splat(0xab)) };
+    const contents = CookieContents{ .suite = .aes_128_gcm_sha256, .client_hello1_hash = @as(Secret, @splat(0xab)) };
 
-    var base: [cookie_len]u8 = undefined;
-    mintCookie(hr, contents, &base);
-    const opened = try openCookie(hr, &base);
+    var base_buf: [max_cookie_out_len]u8 = undefined;
+    const base = mintCookie(hr, contents, &base_buf);
+    try testing.expectEqual(@as(usize, cookie_len), base.len);
+    const opened = try openCookie(hr, base);
     try testing.expectEqual(contents.suite, opened.suite);
-    try testing.expectEqualSlices(u8, &contents.client_hello1_hash, &opened.client_hello1_hash);
+    try testing.expectEqualSlices(u8, contents.client_hello1_hash[0..32], opened.client_hello1_hash[0..32]);
 
     // A different binding, everything else identical.
-    var other_binding: [cookie_len]u8 = undefined;
-    mintCookie(.{ .cookie_secret = "k", .peer_binding = "203.0.113.9:51001" }, contents, &other_binding);
-    try testing.expect(!std.mem.eql(u8, &base, &other_binding));
-    try testing.expectError(error.CookieVerifyFailed, openCookie(hr, &other_binding));
+    var other_buf: [max_cookie_out_len]u8 = undefined;
+    const other_binding = mintCookie(.{ .cookie_secret = "k", .peer_binding = "203.0.113.9:51001" }, contents, &other_buf);
+    try testing.expect(!std.mem.eql(u8, base, other_binding));
+    try testing.expectError(error.CookieVerifyFailed, openCookie(hr, other_binding));
 
     // The length prefix on the binding: without it, splitting the binding
     // differently would hash the same. "203.0.113.9:5100" + "0" must not
     // collide with "203.0.113.9:51000" + "".
-    var truncated_binding: [cookie_len]u8 = undefined;
-    mintCookie(.{ .cookie_secret = "k", .peer_binding = "203.0.113.9:5100" }, contents, &truncated_binding);
-    try testing.expectError(error.CookieVerifyFailed, openCookie(hr, &truncated_binding));
+    var truncated_buf: [max_cookie_out_len]u8 = undefined;
+    const truncated_binding = mintCookie(.{ .cookie_secret = "k", .peer_binding = "203.0.113.9:5100" }, contents, &truncated_buf);
+    try testing.expectError(error.CookieVerifyFailed, openCookie(hr, truncated_binding));
 
     // The suite is authenticated too, so a peer cannot steer the server's
     // HelloRetryRequest reconstruction by editing it.
-    var edited_suite = base;
+    var edited_suite = base_buf;
     edited_suite[1] = 0x13;
     edited_suite[2] = 0x03; // chacha20_poly1305_sha256: a suite we DO support
-    try testing.expectError(error.CookieVerifyFailed, openCookie(hr, &edited_suite));
+    try testing.expectError(error.CookieVerifyFailed, openCookie(hr, edited_suite[0..base.len]));
 
     // As is the version byte, so a future format cannot be misread as v1.
-    var edited_version = base;
+    var edited_version = base_buf;
     edited_version[0] = 2;
-    try testing.expectError(error.CookieVerifyFailed, openCookie(hr, &edited_version));
+    try testing.expectError(error.CookieVerifyFailed, openCookie(hr, edited_version[0..base.len]));
 }
 
 test "handshake: server handleFlight rejects the wrong state" {
@@ -8182,6 +8287,7 @@ fn kuPair(suite: CipherSuite, client_cfg_extra: Config, client: *Connection, ser
     cc.role = .client;
     cc.psk_identity = "device-042";
     cc.psk = "a-shared-pre-shared-key";
+    cc.psk_hash = suite.hash();
     cc.cipher_suites = &.{suite};
     var sc = cc;
     sc.role = .server;
@@ -8301,7 +8407,7 @@ test "KeyUpdate: RFC 8446 §7.2 traffic upd — the new read key is the one deri
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
     // Independent derivation from the secret the handshake installed.
     var next: [32]u8 = undefined;
-    keyschedule.expandLabel(Hkdf, keyschedule.dtls13_prefix, 32, &next, &client.ap_write_secret, "traffic upd", "");
+    keyschedule.expandLabel(Hkdf, keyschedule.dtls13_prefix, 32, &next, client.ap_write_secret[0..32], "traffic upd", "");
     var want_key: [16]u8 = undefined;
     var want_iv: [12]u8 = undefined;
     keyschedule.deriveTrafficKeyIv(Hkdf, 16, 12, &want_key, &want_iv, &next);
@@ -8507,15 +8613,15 @@ test "exporter: RFC 8446 §7.5 — both sides export the same keying material; l
     const Sha256 = std.crypto.hash.sha2.Sha256;
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
     var tls_out: [60]u8 = undefined;
-    try ks.tls13.exportKeyingMaterial(Sha256, Hkdf, &tls_out, &client.exporter_master, "EXTRACTOR-dtls_srtp", "");
+    try ks.tls13.exportKeyingMaterial(Sha256, Hkdf, &tls_out, client.exporter_master[0..32], "EXTRACTOR-dtls_srtp", "");
     try testing.expect(!std.mem.eql(u8, &a, &tls_out));
     var dtls_out: [60]u8 = undefined;
-    try ks.dtls13.exportKeyingMaterial(Sha256, Hkdf, &dtls_out, &client.exporter_master, "EXTRACTOR-dtls_srtp", "");
+    try ks.dtls13.exportKeyingMaterial(Sha256, Hkdf, &dtls_out, client.exporter_master[0..32], "EXTRACTOR-dtls_srtp", "");
     try testing.expectEqualSlices(u8, &a, &dtls_out);
 
     // The exporter secret is NOT one of the traffic secrets.
-    try testing.expect(!std.mem.eql(u8, &client.exporter_master, &client.ap_write_secret));
-    try testing.expect(!std.mem.eql(u8, &client.exporter_master, &client.ap_read_secret));
+    try testing.expect(!std.mem.eql(u8, client.exporter_master[0..32], client.ap_write_secret[0..32]));
+    try testing.expect(!std.mem.eql(u8, client.exporter_master[0..32], client.ap_read_secret[0..32]));
 
     // Bounds are errors; before the handshake, NotConnected.
     var big_label: [256]u8 = @splat('a');
@@ -8612,4 +8718,324 @@ test "ALPN: Config.validate bounds the list — empty name, over-long name, over
     try testing.expectError(error.InvalidAlpnProtocols, cfg.validate());
     cfg.alpn_protocols = &.{ &name, &name };
     try cfg.validate();
+}
+
+// ── TLS_AES_256_GCM_SHA384 (0x1302): the SHA-384 key schedule end to end ──
+//
+// RFC 8446 §B.4 / RFC 9147: every secret, transcript hash, binder and
+// Finished MAC is 48 bytes under this suite. The SHA-384 schedule itself is
+// pinned by `tls13`'s SHA-384 key-schedule tests and `suitehash`'s
+// wrapper-vs-comptime tests; what these tests prove is the WIRING: both
+// sides agree in every mode (PSK, cert-DHE, HelloRetryRequest, KeyUpdate,
+// exporter), and a client offering both hashes follows the server's choice.
+
+fn expectSameKeys(a: *const Connection, b: *const Connection) !void {
+    try expectDirKeysEqual(a.write_keys, b.read_keys);
+    try expectDirKeysEqual(a.read_keys, b.write_keys);
+}
+
+/// The cipher suites of a ClientHello in an epoch-0 datagram.
+fn offeredSuitesOf(datagram: []const u8, out: *[8]u16) ![]const u16 {
+    var body_buf: [max_client_hello_body]u8 = undefined;
+    const body = try clientHelloBodyOf(datagram, &body_buf);
+    var ext_buf: [16]messages.Extension = undefined;
+    const dec = try messages.decodeClientHello(body, &ext_buf);
+    var it = messages.CipherSuiteIter{ .raw = dec.cipher_suites_raw };
+    var n: usize = 0;
+    while (it.next()) |cs| : (n += 1) out[n] = cs;
+    return out[0..n];
+}
+
+test "AES-256-GCM-SHA384 (RFC 8446 §B.4): PSK handshake with psk_hash = .sha384 — 48-byte schedule, 32-byte AES key" {
+    try loopbackHandshake(.aes_256_gcm_sha384);
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.aes_256_gcm_sha384, .{ .role = .client }, &client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    try testing.expectEqual(@as(?HashAlg, .sha384), client.transcript.alg);
+    try testing.expectEqual(@as(?HashAlg, .sha384), server.transcript.alg);
+    try testing.expectEqual(@as(u8, 32), client.write_keys.key_len);
+    try testing.expectEqual(@as(u8, 32), client.write_keys.sn_len);
+    try expectSameKeys(&client, &server);
+}
+
+test "AES-256-GCM-SHA384: the client's ClientHello carries a 48-byte binder (RFC 8446 §4.2.11.2: Hash.length)" {
+    const cfg = Config{ .role = .client, .psk_identity = "device-042", .psk = "k", .psk_hash = .sha384, .cipher_suites = &.{.aes_256_gcm_sha384} };
+    var client = try Connection.clientInit(cfg);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x31)));
+    var buf: [1500]u8 = undefined;
+    const ch = try client.startHandshake(seededForTest(&csprng), 0, &buf);
+    var body_buf: [max_client_hello_body]u8 = undefined;
+    const body = try clientHelloBodyOf(ch, &body_buf);
+    var ext_buf: [16]messages.Extension = undefined;
+    const dec = try messages.decodeClientHello(body, &ext_buf);
+    const psk_data = findExt(dec.extensions, .pre_shared_key).?;
+    var ids: [4]messages.PskIdentity = undefined;
+    var binders: [4][]const u8 = undefined;
+    const offered = try messages.decodeOfferedPsks(psk_data, &ids, &binders);
+    try testing.expectEqual(@as(usize, 48), offered.binders[0].len);
+}
+
+test "AES-256-GCM-SHA384: cert-DHE handshake (zero PSK of Hash.length, RFC 8446 §7.1) completes and protects records" {
+    var cc = certDheClientConfig();
+    cc.cipher_suites = &.{.aes_256_gcm_sha384};
+    var sc = certDheServerConfig();
+    sc.cipher_suites = &.{.aes_256_gcm_sha384};
+    var client = try Connection.clientInit(cc);
+    var server = try Connection.serverInit(sc);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x72)));
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
+    try testing.expectEqual(CipherSuite.aes_256_gcm_sha384, client.suite);
+    try expectSameKeys(&client, &server);
+    try expectRoundTrip(&client, &server, "cert-DHE under AES-256-GCM-SHA384");
+    try expectRoundTrip(&server, &client, "and back");
+}
+
+test "AES-256-GCM-SHA384: a client offering BOTH hashes follows the server's choice — either one (transcript runs both until ServerHello)" {
+    for ([_]CipherSuite{ .aes_256_gcm_sha384, .aes_128_gcm_sha256 }) |server_pick| {
+        var cc = certDheClientConfig();
+        cc.cipher_suites = &.{ .aes_128_gcm_sha256, .aes_256_gcm_sha384 };
+        var sc = certDheServerConfig();
+        const pick = [_]CipherSuite{server_pick};
+        sc.cipher_suites = &pick;
+        var client = try Connection.clientInit(cc);
+        var server = try Connection.serverInit(sc);
+        var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x73)));
+        var buf1: [2048]u8 = undefined;
+        var buf2: [2048]u8 = undefined;
+        try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
+        try testing.expectEqual(server_pick, client.suite);
+        try testing.expectEqual(@as(?HashAlg, server_pick.hash()), client.transcript.alg);
+        try expectSameKeys(&client, &server);
+        try expectRoundTrip(&client, &server, "the server's suite");
+    }
+}
+
+test "AES-256-GCM-SHA384: the DEFAULT suite list offers it second in cert-DHE, and a SHA-256 PSK client does not offer it at all" {
+    try testing.expectEqualSlices(CipherSuite, &.{ .aes_128_gcm_sha256, .aes_256_gcm_sha384 }, (Config{ .role = .client }).cipher_suites);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x74)));
+    var buf: [2048]u8 = undefined;
+    var suites: [8]u16 = undefined;
+
+    var cc = certDheClientConfig();
+    cc.cipher_suites = (Config{ .role = .client }).cipher_suites;
+    var cert_client = try Connection.clientInit(cc);
+    const ch_cert = try cert_client.startHandshake(seededForTest(&csprng), 0, &buf);
+    try testing.expectEqualSlices(u16, &.{ 0x1301, 0x1302 }, try offeredSuitesOf(ch_cert, &suites));
+
+    // RFC 8446 §4.2.11: the external PSK is bound to SHA-256 by default, so
+    // the PSK ClientHello is what it was before the suite existed.
+    var psk_client = try Connection.clientInit(.{ .role = .client, .psk_identity = "device-042", .psk = "k" });
+    const ch_psk = try psk_client.startHandshake(seededForTest(&csprng), 0, &buf);
+    try testing.expectEqualSlices(u16, &.{0x1301}, try offeredSuitesOf(ch_psk, &suites));
+
+    var psk384_client = try Connection.clientInit(.{ .role = .client, .psk_identity = "device-042", .psk = "k", .psk_hash = .sha384 });
+    const ch_psk384 = try psk384_client.startHandshake(seededForTest(&csprng), 0, &buf);
+    try testing.expectEqualSlices(u16, &.{0x1302}, try offeredSuitesOf(ch_psk384, &suites));
+}
+
+test "AES-256-GCM-SHA384: PSK HelloRetryRequest — 83-byte cookie, SHA-384 message_hash (RFC 8446 §4.4.1), stateless completion" {
+    const binding = "203.0.113.9:51384";
+    var sc = hrrServerConfig(binding);
+    sc.psk_hash = .sha384;
+    sc.cipher_suites = &.{ .aes_128_gcm_sha256, .aes_256_gcm_sha384 };
+    var cc = hrrClientConfig(hrr_psk);
+    cc.psk_hash = .sha384;
+    cc.cipher_suites = &.{ .aes_128_gcm_sha256, .aes_256_gcm_sha384 };
+    var client = try Connection.clientInit(cc);
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x75)));
+    const rnd = seededForTest(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+
+    const ch1 = try client.startHandshake(rnd, 0, &buf1);
+    var server1 = try Connection.serverInit(sc);
+    const hrr = try server1.handleFlight(ch1, rnd, 0, &buf2);
+    const cookie = try expectHelloRetryRequest(hrr.out);
+    try testing.expectEqual(cookieLen(.sha384), cookie.len);
+    try testing.expectEqual(@as(usize, 83), cookie.len);
+    server1.deinit();
+
+    const ch2 = try client.handleFlight(hrr.out, rnd, 0, &buf1);
+    try testing.expectEqual(@as(?HashAlg, .sha384), client.transcript.alg);
+    var server2 = try Connection.serverInit(sc);
+    defer server2.deinit();
+    const flight2 = try server2.handleFlight(ch2.out, rnd, 0, &buf2);
+    try testing.expect(server2.sawHelloRetryRequest());
+    const client_fin = try client.handleFlight(flight2.out, rnd, 0, &buf1);
+    try testing.expect(client_fin.done);
+    const server_done = try server2.handleFlight(client_fin.out, rnd, 0, &buf2);
+    try testing.expect(server_done.done);
+    try testing.expectEqual(CipherSuite.aes_256_gcm_sha384, client.suite);
+    try expectSameKeys(&client, &server2);
+    try expectRoundTrip(&client, &server2, "SHA-384 after a retry");
+}
+
+test "AES-256-GCM-SHA384: cert-DHE HelloRetryRequest — a client offering both hashes rewrites ClientHello1 under the RETRY's hash" {
+    const binding = "198.51.100.7:44384";
+    var sc = certDheServerConfig();
+    sc.cipher_suites = &.{.aes_256_gcm_sha384};
+    sc.hello_retry = .{ .cookie_secret = "cert-mode cookie MAC key", .peer_binding = binding };
+    var cc = certDheClientConfig();
+    cc.cipher_suites = &.{ .aes_128_gcm_sha256, .aes_256_gcm_sha384 };
+    var client = try Connection.clientInit(cc);
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x76)));
+    const rnd = seededForTest(&csprng);
+    var buf1: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+
+    const ch1 = try client.startHandshake(rnd, 0, &buf1);
+    var server1 = try Connection.serverInit(sc);
+    const hrr = try server1.handleFlight(ch1, rnd, 0, &buf2);
+    _ = try expectHelloRetryRequest(hrr.out);
+    server1.deinit();
+    const ch2 = try client.handleFlight(hrr.out, rnd, 0, &buf1);
+
+    var server2 = try Connection.serverInit(sc);
+    defer server2.deinit();
+    const flight2 = try server2.handleFlight(ch2.out, rnd, 0, &buf2);
+    const client_fin = try client.handleFlight(flight2.out, rnd, 0, &buf1);
+    try testing.expect(client_fin.done);
+    const server_done = try server2.handleFlight(client_fin.out, rnd, 0, &buf2);
+    try testing.expect(server_done.done);
+    try testing.expectEqual(CipherSuite.aes_256_gcm_sha384, client.suite);
+    try expectSameKeys(&client, &server2);
+    try expectRoundTrip(&server2, &client, "cert-DHE SHA-384 after a retry");
+}
+
+test "AES-256-GCM-SHA384: KeyUpdate (RFC 9147 §8 Figure 14) both directions" {
+    try keyUpdateFigure14(.aes_256_gcm_sha384);
+}
+
+test "AES-256-GCM-SHA384: RFC 8446 §7.2 traffic upd over the 48-byte secret — the new read key is HKDF-SHA384's" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.aes_256_gcm_sha384, .{ .role = .client }, &client, &server);
+    const Hkdf = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
+    var next: [48]u8 = undefined;
+    keyschedule.expandLabel(Hkdf, keyschedule.dtls13_prefix, 48, &next, client.ap_write_secret[0..48], "traffic upd", "");
+    var want_key: [32]u8 = undefined;
+    var want_iv: [12]u8 = undefined;
+    keyschedule.deriveTrafficKeyIv(Hkdf, 32, 12, &want_key, &want_iv, &next);
+    var want_sn: [32]u8 = undefined;
+    keyschedule.deriveSequenceNumberKey(Hkdf, 32, &want_sn, &next);
+
+    try client.requestKeyUpdate(false);
+    var plain: [256]u8 = undefined;
+    var ku_store: [256]u8 = undefined;
+    const ku = (try pollOne(&client, 0, &ku_store)).?;
+    try testing.expectError(error.ReceivedKeyUpdate, server.recv(ku, &plain));
+    try testing.expectEqualSlices(u8, &next, server.ap_read_secret[0..48]);
+    try testing.expectEqualSlices(u8, &want_key, server.read_keys.key[0..32]);
+    try testing.expectEqualSlices(u8, &want_iv, &server.read_keys.iv);
+    try testing.expectEqualSlices(u8, &want_sn, server.read_keys.sn_key[0..32]);
+}
+
+test "AES-256-GCM-SHA384: RFC 8446 §7.5 exporter uses SHA-384 — both sides agree, equals HKDF-SHA384 over the 48-byte secret, 255*48 cap" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.aes_256_gcm_sha384, .{ .role = .client }, &client, &server);
+    var a: [60]u8 = undefined;
+    var b: [60]u8 = undefined;
+    try client.exportKeyingMaterial("EXTRACTOR-dtls_srtp", null, &a);
+    try server.exportKeyingMaterial("EXTRACTOR-dtls_srtp", null, &b);
+    try testing.expectEqualSlices(u8, &a, &b);
+    const Sha384 = std.crypto.hash.sha2.Sha384;
+    const Hkdf = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
+    var want: [60]u8 = undefined;
+    try keyschedule.exportKeyingMaterial(Sha384, Hkdf, &want, client.exporter_master[0..48], "EXTRACTOR-dtls_srtp", "");
+    try testing.expectEqualSlices(u8, &want, &a);
+    // The cap is 255 SHA-384 blocks, not SHA-256's: 255*48 is allowed.
+    var big: [255 * 48 + 1]u8 = undefined;
+    try client.exportKeyingMaterial("EXTRACTOR-dtls_srtp", null, big[0 .. 255 * 48]);
+    try testing.expectError(error.OutputTooLong, client.exportKeyingMaterial("EXTRACTOR-dtls_srtp", null, &big));
+}
+
+test "PSK hash (RFC 8446 §4.2.11): Config.validate refuses a .psk config with no suite of psk_hash" {
+    try testing.expectError(error.PskHashMismatch, (Config{ .role = .client, .psk_identity = "id", .psk = "k", .cipher_suites = &.{.aes_256_gcm_sha384} }).validate());
+    try testing.expectError(error.PskHashMismatch, (Config{ .role = .server, .psk_identity = "id", .psk = "k", .psk_hash = .sha384, .cipher_suites = &.{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256 } }).validate());
+    // The default list has a suite of each hash, so either psk_hash is fine.
+    try (Config{ .role = .client, .psk_identity = "id", .psk = "k", .psk_hash = .sha384 }).validate();
+    try (Config{ .role = .client, .psk_identity = "id", .psk = "k" }).validate();
+    // Not a .psk concern: cert-DHE has no external PSK.
+    var cc = certDheClientConfig();
+    cc.cipher_suites = &.{.aes_256_gcm_sha384};
+    try cc.validate();
+}
+
+test "PSK hash (RFC 8446 §4.2.11): a server whose PSK is SHA-256 refuses a client whose PSK is SHA-384 (binder of the other hash's length)" {
+    var client = try Connection.clientInit(.{ .role = .client, .psk_identity = "device-042", .psk = "k", .psk_hash = .sha384 });
+    var server = try Connection.serverInit(.{ .role = .server, .psk_identity = "device-042", .psk = "k" });
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x77)));
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    const ch = try client.startHandshake(seededForTest(&csprng), 0, &buf1);
+    // The binder is a 48-byte SHA-384 binder; the SHA-256 server reads it as
+    // the wrong length, before any suite is considered.
+    try testing.expectError(error.Malformed, server.handleFlight(ch, seededForTest(&csprng), 0, &buf2));
+    try testing.expectEqual(State.start, server.state);
+}
+
+test "PSK hash (RFC 8446 §4.2.11): a server that answers a SHA-256 PSK with the SHA-384 suite is refused by the client" {
+    // The client offers only 0x1301 (its PSK is SHA-256); a ServerHello that
+    // names 0x1302 anyway is a suite it never offered.
+    var client = try Connection.clientInit(.{ .role = .client, .psk_identity = "device-042", .psk = "k" });
+    var server = try Connection.serverInit(.{ .role = .server, .psk_identity = "device-042", .psk = "k" });
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x78)));
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+    const ch = try client.startHandshake(seededForTest(&csprng), 0, &buf1);
+    const f2 = try server.handleFlight(ch, seededForTest(&csprng), 0, &buf2);
+    var forged: [1500]u8 = undefined;
+    @memcpy(forged[0..f2.out.len], f2.out);
+    // DTLSPlaintext header (13) + handshake header (12) + legacy_version (2)
+    // + random (32) + empty legacy_session_id_echo (1): the cipher suite.
+    const at = 13 + handshake.header_len + 2 + 32 + 1;
+    try testing.expectEqualSlices(u8, &.{ 0x13, 0x01 }, forged[at..][0..2]);
+    forged[at + 1] = 0x02;
+    try testing.expectError(error.NoCipherSuiteOverlap, client.handleFlight(forged[0..f2.out.len], seededForTest(&csprng), 0, &buf1));
+    try testing.expectEqual(State.wait_server_hello, client.state);
+}
+
+test "PSK hash (RFC 8446 §4.1.4): a HelloRetryRequest naming a suite of the other hash is illegal_parameter" {
+    var cc = hrrClientConfig(hrr_psk);
+    cc.cipher_suites = &.{ .aes_128_gcm_sha256, .aes_256_gcm_sha384 }; // 0x1302 configured, but not of the PSK's hash
+    var client = try Connection.clientInit(cc);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x79)));
+    var buf: [1500]u8 = undefined;
+    _ = try client.startHandshake(seededForTest(&csprng), 0, &buf);
+    var cookie_ext_buf: [8]u8 = undefined;
+    const cookie_ext = try messages.encodeCookieExtension("c", &cookie_ext_buf);
+    var versions_buf: [2]u8 = undefined;
+    const versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &versions_buf);
+    const exts = [_]messages.Extension{
+        .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions },
+        .{ .ext_type = @backingInt(messages.ExtensionType.cookie), .data = cookie_ext },
+    };
+    var d = try hrrDatagram(&exts);
+    // `hrrDatagram` names 0x1301; this client (SHA-256 PSK) must also refuse 0x1302.
+    const at = 13 + handshake.header_len + 2 + 32 + 1;
+    try testing.expectEqualSlices(u8, &.{ 0x13, 0x01 }, d.bytes[at..][0..2]);
+    d.bytes[at + 1] = 0x02;
+    try testing.expectError(error.IllegalHelloRetryRequest, client.handleFlight(d.bytes[0..d.len], seededForTest(&csprng), 0, &buf));
+    try testing.expect(!client.sawHelloRetryRequest());
+}
+
+test "installApplicationSecrets: SHA-384 secrets install; the [32]u8 installApplicationKeys refuses a SHA-384 suite; a wrong length is refused" {
+    var client = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k", .psk_hash = .sha384 });
+    var server = try Connection.serverInit(.{ .role = .server, .psk_identity = "id", .psk = "k", .psk_hash = .sha384 });
+    const c = @as([48]u8, @splat(0xc1));
+    const s = @as([48]u8, @splat(0x5e));
+    try testing.expectError(error.UnsupportedSuite, client.installApplicationKeys(.aes_256_gcm_sha384, c[0..32], s[0..32]));
+    try testing.expectError(error.UnsupportedSuite, client.installApplicationSecrets(.aes_256_gcm_sha384, c[0..32], s[0..32]));
+    try testing.expectError(error.UnsupportedSuite, client.installApplicationSecrets(.aes_128_gcm_sha256, &c, &s));
+    try client.installApplicationSecrets(.aes_256_gcm_sha384, &c, &s);
+    try server.installApplicationSecrets(.aes_256_gcm_sha384, &c, &s);
+    try expectSameKeys(&client, &server);
+    try expectRoundTrip(&client, &server, "installed by hand");
 }

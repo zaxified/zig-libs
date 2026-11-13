@@ -21,7 +21,9 @@ modules/dkg/src/core.zig	2
 # dns 2026-10-16: tsig.verify compares the received MAC with the computed one (zero-padded to 64 bytes).
 modules/dns/src/tsig.zig	1
 modules/dnssec/src/ds.zig	1
-modules/dtls/src/Connection.zig	4
+# dtls 2026-11-13: TLS_AES_256_GCM_SHA384 — the PSK binder and both Finished MAC compares moved from Connection.zig into suitehash.macEql (one timing_safe.eql over the suite hash's length, inline-else SHA-256/384); Connection.zig keeps the cookie MAC compare.
+modules/dtls/src/Connection.zig	1
+modules/dtls/src/suitehash.zig	1
 modules/ecvrf/src/ecvrf.zig	1
 modules/hpke/src/schedule.zig	1
 modules/idempotency/src/root.zig	2
