@@ -77,6 +77,34 @@ var res2 = try up.finish();
 defer res2.deinit();
 ```
 
+### Interceptors (auth, retry, tracing)
+
+`Client.Options.interceptors` wraps every `request`/`requestPlain` the way a
+Go user wraps `http.RoundTripper` or an OkHttp user adds an application
+`Interceptor`. The first entry is the outermost; `chain.proceed()` runs the
+rest and, last, the real exchange (redirects and the stale-connection retry
+run inside it, so an interceptor sees one call per request).
+
+```zig
+fn bearer(ctx: ?*anyopaque, chain: *http.Client.Chain) http.Client.Error!http.Client.Response {
+    const token: *const []const u8 = @ptrCast(@alignCast(ctx.?));
+    var hdrs: [1]http.Header = .{.{ .name = "Authorization", .value = token.* }};
+    chain.options.headers = &hdrs; // replaces the downstream headers; copy yours in to keep them
+    return chain.proceed();
+}
+const list = [_]http.Client.Interceptor{.{ .ctx = &token, .intercept = bearer }};
+var client = http.Client.init(io, gpa, .{ .interceptors = &list });
+```
+
+`proceed` may be called 0 times (return `error.Intercepted` or any other
+`Error` to refuse) or several (retry); the interceptor must `deinit` every
+`Response` it does not return. `total_timeout_ms` covers the whole chain,
+retries included. `requestStreaming*`/`putFile*` are not intercepted (a
+streamed body cannot be replayed); the list is borrowed for the client's
+lifetime; do not call `request` on the same client from inside an
+interceptor. Bearer-token and tracing interceptors exist as test-only
+examples in `src/interceptor_test.zig`, not as module API.
+
 ### Plaintext-only client
 
 `Client.requestPlain` / `Client.requestStreamingPlain` / `Client.putFilePlain`

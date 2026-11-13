@@ -205,6 +205,17 @@ pub const Options = struct {
     /// (`connectH2Over`) there is no `Client` to read this from, so set
     /// `h2_client.Options.user_agent` on that call yourself.
     user_agent: []const u8 = "zig-libs-http/0.1",
+    /// Application interceptors (OkHttp's `Interceptor`, Go's
+    /// `http.RoundTripper` wrapping) around every `request` and
+    /// `requestPlain`: authentication, retry, tracing, metrics. The FIRST
+    /// entry is the outermost. See `Interceptor` and `Chain`.
+    ///
+    /// Borrowed, not copied: the slice and every `ctx` it holds must outlive
+    /// the `Client`. Not applied to `requestStreaming`/`requestStreamingPlain`
+    /// (and so not to `putFile`/`putFilePlain`) nor to `H2Session`: a
+    /// streamed body cannot be replayed, and replaying is what an
+    /// interceptor that retries does.
+    interceptors: []const Interceptor = &.{},
     /// A CA bundle shared by several clients, loaded once (`CaBundle.load`)
     /// — e.g. before a process confines itself (Landlock), for clients made
     /// later on other threads. Borrowed: it must outlive the client, which
@@ -552,6 +563,10 @@ pub const Error = error{
     /// `requestStreaming`/`requestStreamingPlain` with a non-null
     /// `options.body`: a streamed request's body comes from its `Upload`.
     BodyNotAllowed,
+    /// Free for an `Interceptor` to refuse a request with (a policy veto, a
+    /// failed token refresh): the client itself never returns it. Any other
+    /// member of this set is just as valid for an interceptor to return.
+    Intercepted,
 };
 
 /// The outbound half of the header-injection defence: every caller-supplied
@@ -625,6 +640,95 @@ pub fn poolSweep(c: *Client) void {
 
 // ── the request/response exchange ───────────────────────────────────────────
 
+/// One application interceptor (`Options.interceptors`). Shape after OkHttp's
+/// application `Interceptor` and Go's `http.RoundTripper` middleware idiom:
+/// it sees the request as a `Chain`, may change it, and calls
+/// `chain.proceed()` for the rest of the interceptors and, last, the real
+/// exchange.
+///
+/// Rules:
+///   * `proceed` may be called 0..n times. 0 = short-circuit (return an
+///     error such as `error.Intercepted`; an interceptor cannot fabricate a
+///     `Response`, which owns a connection); n > 1 = retry. Each `proceed`
+///     is a whole `request`: redirects and the client's stale-connection
+///     retry run inside it, so the interceptor sees ONE call per request,
+///     not one per hop.
+///   * It must `deinit` every `Response` it got from `proceed` and does not
+///     return, e.g. the 503 it retries after; the one it returns passes to
+///     the caller.
+///   * `chain.options` and the other request fields may be replaced before
+///     `proceed`; the change reaches the downstream interceptors and the
+///     exchange only. Slices set there (headers, body, url) must stay valid
+///     until the interceptor returns.
+///   * The interceptor runs on a task of the `Io` when `total_timeout_ms` is
+///     set (see `Options.total_timeout_ms`), possibly another thread than
+///     the caller's, and concurrent requests run it concurrently: its `ctx`
+///     must be thread-safe.
+///   * Do not call `request` on the same `Client` from inside an
+///     interceptor: it would run the chain again, without bound. Use
+///     another client (one without interceptors) for a side request such as
+///     a token refresh.
+pub const Interceptor = struct {
+    ctx: ?*anyopaque = null,
+    intercept: *const fn (ctx: ?*anyopaque, chain: *Chain) Error!Response,
+};
+
+/// What an `Interceptor` sees: the request it may change before `proceed`.
+/// Each interceptor gets its OWN `Chain`; `proceed` makes the next one from a
+/// copy of this one, so a chain can neither run past the end of the list nor
+/// recurse deeper than it. Leave `exchange`, `index` and `deadline` alone.
+pub const Chain = struct {
+    client: *Client,
+    method: http.Method,
+    url: []const u8,
+    /// A copy: replacing `headers`, `body`, ... changes the downstream call
+    /// only.
+    options: RequestOptions,
+    /// The real exchange (TLS-capable for `request`, `http://`-only for
+    /// `requestPlain`, so the plain call graph stays TLS-free).
+    exchange: *const fn (*Client, http.Method, []const u8, RequestOptions) Error!Response,
+    /// Index of the next interceptor.
+    index: usize = 0,
+    /// The `total_timeout_ms` budget of the whole chain, retries included.
+    deadline: ?std.Io.Clock.Timestamp = null,
+
+    /// Run the next interceptor, or the real exchange after the last one.
+    /// `error.Timeout` when the chain's whole budget is spent (checked
+    /// before each call, so a retry loop cannot start fresh work on it).
+    /// The `Response` is the caller's to `deinit`.
+    pub fn proceed(self: *Chain) Error!Response {
+        try self.client.checkDeadline(self.deadline);
+        const list = self.client.options.interceptors;
+        if (self.index >= list.len) return self.exchange(self.client, self.method, self.url, self.options);
+        const it = list[self.index];
+        var next = self.*;
+        next.index = self.index + 1;
+        return it.intercept(it.ctx, &next);
+    }
+};
+
+/// `request`/`requestPlain` with `Options.interceptors` set. `total_timeout_ms`
+/// bounds the whole chain (Go: `Client.Timeout` covers the whole exchange,
+/// retries by a `RoundTripper` included): the chain runs on one bounded task,
+/// and the real exchange inside it is called without a second bound.
+fn requestIntercepted(
+    c: *Client,
+    method: http.Method,
+    url_text: []const u8,
+    options: RequestOptions,
+    exchange: *const fn (*Client, http.Method, []const u8, RequestOptions) Error!Response,
+) Error!Response {
+    const deadline = c.totalDeadline();
+    var chain: Chain = .{ .client = c, .method = method, .url = url_text, .options = options, .exchange = exchange, .deadline = deadline };
+    if (deadline == null) return chain.proceed();
+    return runBounded(c.io, c.options.inline_blocking, deadline, Chain.proceed, .{&chain}) catch |err| switch (err) {
+        // As in `request`: nothing to cancel without a spare unit of
+        // concurrency; `proceed` still checks the deadline between calls.
+        error.ConcurrencyUnavailable => chain.proceed(),
+        else => |e| e,
+    };
+}
+
 /// Perform a request, following redirects per `RequestOptions`. The returned
 /// `Response` owns a connection — read the body via `Response.reader` and
 /// always call `Response.deinit`.
@@ -638,6 +742,7 @@ fn checkOptions(c: *const Client) Error!void {
 
 pub fn request(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions) Error!Response {
     try c.checkOptions();
+    if (c.options.interceptors.len != 0) return c.requestIntercepted(method, url_text, options, requestInner);
     const deadline = c.totalDeadline() orelse return c.requestInner(method, url_text, options);
     return runBounded(c.io, c.options.inline_blocking, deadline, requestInner, .{ c, method, url_text, options }) catch |err| switch (err) {
         // See `connectStream` for the same fallback: without a spare unit of
@@ -812,6 +917,7 @@ fn refusesSchemeDowngrade(options: RequestOptions, from: http.Url, to: http.Url)
 /// this call graph provably TLS-free rather than merely usually-TLS-free.
 pub fn requestPlain(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions) Error!Response {
     try c.checkOptions();
+    if (c.options.interceptors.len != 0) return c.requestIntercepted(method, url_text, options, requestInnerPlain);
     const deadline = c.totalDeadline() orelse return c.requestInnerPlain(method, url_text, options);
     return runBounded(c.io, c.options.inline_blocking, deadline, requestInnerPlain, .{ c, method, url_text, options }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => c.requestInnerPlain(method, url_text, options),
