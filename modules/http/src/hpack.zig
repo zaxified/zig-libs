@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const zeroize = @import("zeroize.zig");
 
 // ── public vocabulary ───────────────────────────────────────────────────────
 
@@ -82,10 +83,15 @@ pub const HeaderList = struct {
     storage: []u8 = &.{},
 
     pub fn deinit(hl: *HeaderList, gpa: Allocator) void {
+        // Decoded names and values are request data (Authorization, cookies):
+        // zero before the block goes back to the allocator.
         if (hl.storage.len > 0) {
+            zeroize.zeroize(hl.storage);
             gpa.free(hl.storage);
         } else {
             for (hl.fields) |f| {
+                zeroize.zeroize(@constCast(f.name));
+                zeroize.zeroize(@constCast(f.value));
                 gpa.free(f.name);
                 gpa.free(f.value);
             }
@@ -481,7 +487,7 @@ fn huffmanDecodeAppend(gpa: Allocator, out: *std.ArrayList(u8), input: []const u
     // Decoded output can't exceed 8/5 of the input (shortest code, 5 bits);
     // reserving it up front makes the per-symbol append branch-free. The
     // reservation is capped by the limit the caller enforces anyway.
-    try out.ensureUnusedCapacity(gpa, @min(limit +| 1, (input.len * 8) / 5 + 1));
+    try zeroize.ensureUnusedCapacityWiped(gpa, out, @min(limit +| 1, (input.len * 8) / 5 + 1));
     var node: u16 = 0;
     for (input) |byte| {
         const hi = huff_dtable[node][byte >> 4];
@@ -692,7 +698,10 @@ const DynamicTable = struct {
     }
 
     fn deinit(t: *DynamicTable, gpa: Allocator) void {
-        for (t.entries.items) |e| gpa.free(e.buf);
+        for (t.entries.items) |e| {
+            zeroize.zeroize(e.buf);
+            gpa.free(e.buf);
+        }
         t.entries.deinit(gpa);
         t.name_index.deinit(gpa);
         t.pair_index.deinit(gpa);
@@ -730,6 +739,7 @@ const DynamicTable = struct {
         }
         t.evicted += 1;
         t.size -= e.buf.len + entry_overhead;
+        zeroize.zeroize(e.buf);
         gpa.free(e.buf);
     }
 
@@ -750,7 +760,10 @@ const DynamicTable = struct {
         }
         while (t.size + esize > t.max_size) t.evictOldest(gpa);
         const buf = try gpa.alloc(u8, name.len + value.len);
-        errdefer gpa.free(buf);
+        errdefer {
+            zeroize.zeroize(buf);
+            gpa.free(buf);
+        }
         @memcpy(buf[0..name.len], name);
         @memcpy(buf[name.len..], value);
         var entry: TableEntry = .{ .buf = buf, .name_len = name.len };
@@ -853,7 +866,10 @@ pub const Decoder = struct {
         // least one octet of block, and its decoded name and value are a few
         // times the indexed reference that stood for them.
         var storage: std.ArrayList(u8) = try .initCapacity(d.gpa, block.len * 4 + 64);
-        errdefer storage.deinit(d.gpa);
+        errdefer {
+            zeroize.zeroize(storage.allocatedSlice());
+            storage.deinit(d.gpa);
+        }
         var spans: std.ArrayList(Span) = try .initCapacity(d.gpa, @min(block.len, 16));
         defer spans.deinit(d.gpa);
 
@@ -893,8 +909,11 @@ pub const Decoder = struct {
             }
         }
 
-        const buf = try storage.toOwnedSlice(d.gpa);
-        errdefer d.gpa.free(buf);
+        const buf = try zeroize.toOwnedSliceWiped(d.gpa, &storage);
+        errdefer {
+            zeroize.zeroize(buf);
+            d.gpa.free(buf);
+        }
         const fields = try d.gpa.alloc(Field, spans.items.len);
         for (spans.items, fields) |sp, *f| f.* = .{
             .name = buf[sp.name_off..][0..sp.name_len],
@@ -942,7 +961,7 @@ pub const Decoder = struct {
         const name_off = storage.items.len;
         const name_len = if (name_index != 0) blk: {
             const e = d.table.lookup(name_index) orelse return error.InvalidHpack;
-            try storage.appendSlice(d.gpa, e.name);
+            try zeroize.appendSliceWiped(d.gpa, storage, e.name);
             break :blk e.name.len;
         } else try d.readString(c, storage, list_size.*);
         const value_off = storage.items.len;
@@ -969,7 +988,7 @@ pub const Decoder = struct {
         const raw = try c.takeSlice(@intCast(len));
         if (!huffman) {
             if (raw.len > budget) return error.HeaderListTooLarge;
-            try storage.appendSlice(d.gpa, raw);
+            try zeroize.appendSliceWiped(d.gpa, storage, raw);
             return raw.len;
         }
         return huffmanDecodeAppend(d.gpa, storage, raw, budget);
@@ -993,7 +1012,7 @@ pub const Decoder = struct {
         sensitive: bool,
     ) DecodeError!void {
         try d.accountField(list_size, name.len, value.len);
-        try storage.ensureUnusedCapacity(d.gpa, name.len + value.len);
+        try zeroize.ensureUnusedCapacityWiped(d.gpa, storage, name.len + value.len);
         const name_off = storage.items.len;
         storage.appendSliceAssumeCapacity(name);
         const value_off = storage.items.len;
@@ -2543,4 +2562,154 @@ test "Huffman decode: the NUL octet survives at every bit alignment, both decode
             try testing.expectEqualSlices(u8, s, out.items);
         }
     }
+}
+
+// ── freed-block wipes: decoded header bytes never go back unzeroed ──────────
+//
+// Each test hands the codec a `ScrubAlloc` and fails if a block that held the
+// marker goes back to it un-zeroed. ⚠ Meaningful in ReleaseFast only: a safe
+// build's `free` poisons the block itself, hiding a missing wipe. Run:
+// `scripts/modtest http -Doptimize=ReleaseFast -Dtest-filter=wipe:`.
+
+const wipe_marker = "WIPE-SECRET-hpw-0123456789";
+
+/// `0x00` literal (no indexing, new name) or, with `index`, `0x40` literal with
+/// incremental indexing; raw (non-Huffman) strings, each under 127 octets.
+fn wipeLiteral(buf: []u8, first: u8, name: []const u8, value: []const u8) []u8 {
+    var n: usize = 0;
+    buf[n] = first;
+    n += 1;
+    buf[n] = @intCast(name.len);
+    n += 1;
+    @memcpy(buf[n..][0..name.len], name);
+    n += name.len;
+    buf[n] = @intCast(value.len);
+    n += 1;
+    @memcpy(buf[n..][0..value.len], value);
+    n += value.len;
+    return buf[0..n];
+}
+
+test "wipe: HeaderList.deinit zeroes decoded storage (shrink that cannot resize, and one that can)" {
+    for ([_]bool{ false, true }) |can_resize| {
+        var w: zeroize.ScrubAlloc = .{ .marker = wipe_marker, .can_resize = can_resize };
+        var dec: Decoder = .init(w.allocator(), .{});
+        defer dec.deinit();
+        var blk: [128]u8 = undefined;
+        var hl = try dec.decodeBlock(wipeLiteral(&blk, 0x00, "x-secret", wipe_marker));
+        try testing.expectEqualStrings(wipe_marker, hl.fields[0].value);
+        hl.deinit(w.allocator());
+        try testing.expectEqual(@as(usize, 0), w.dirty_frees);
+    }
+}
+
+test "wipe: HeaderList.deinit zeroes the strings of a hand-built list" {
+    var w: zeroize.ScrubAlloc = .{ .marker = wipe_marker, .can_resize = true };
+    const gpa = w.allocator();
+    const fields = try gpa.alloc(Field, 1);
+    fields[0] = .{ .name = try gpa.dupe(u8, "x-secret"), .value = try gpa.dupe(u8, wipe_marker) };
+    var hl: HeaderList = .{ .fields = fields };
+    hl.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), w.dirty_frees);
+}
+
+test "wipe: decoder storage growth frees clean blocks (many long fields from one table entry)" {
+    var w: zeroize.ScrubAlloc = .{ .marker = wipe_marker, .can_resize = false };
+    var dec: Decoder = .init(w.allocator(), .{});
+    defer dec.deinit();
+    var blk: [160]u8 = undefined;
+    var val: [115]u8 = @splat('.');
+    @memcpy(val[0..wipe_marker.len], wipe_marker);
+    var hl1 = try dec.decodeBlock(wipeLiteral(&blk, 0x40, "x-secret", &val));
+    hl1.deinit(w.allocator());
+    // 200 indexed references to that entry (index 62): 200 B of block, ~20 KB of
+    // storage over a first allocation of 200 * 4 + 64.
+    const refs: [200]u8 = @splat(0xBE);
+    var hl2 = try dec.decodeBlock(&refs);
+    try testing.expectEqual(@as(usize, 200), hl2.fields.len);
+    hl2.deinit(w.allocator());
+    // The live table entry has not been freed yet: every other block was clean.
+    try testing.expectEqual(@as(usize, 0), w.dirty_frees);
+}
+
+test "wipe: dynamic-table eviction by a size update zeroes the entry" {
+    var w: zeroize.ScrubAlloc = .{ .marker = wipe_marker, .can_resize = true };
+    var dec: Decoder = .init(w.allocator(), .{});
+    defer dec.deinit();
+    var blk: [128]u8 = undefined;
+    var hl = try dec.decodeBlock(wipeLiteral(&blk, 0x40, "x-secret", wipe_marker));
+    hl.deinit(w.allocator());
+    try testing.expectEqual(@as(usize, 1), dec.dynamicTableCount());
+    var hl2 = try dec.decodeBlock(&.{0x20}); // size update to 0
+    hl2.deinit(w.allocator());
+    try testing.expectEqual(@as(usize, 0), dec.dynamicTableCount());
+    try testing.expectEqual(@as(usize, 0), w.dirty_frees);
+}
+
+test "wipe: dynamic-table eviction by overflowing inserts zeroes the oldest entry" {
+    var w: zeroize.ScrubAlloc = .{ .marker = wipe_marker, .can_resize = true };
+    var dec: Decoder = .init(w.allocator(), .{ .max_table_size = 200 });
+    defer dec.deinit();
+    var blk: [128]u8 = undefined;
+    // Each entry is 8 + 25 + 32 = 65 octets: the fourth pushes the first out.
+    for (0..4) |_| {
+        var hl = try dec.decodeBlock(wipeLiteral(&blk, 0x40, "x-secret", wipe_marker));
+        hl.deinit(w.allocator());
+    }
+    try testing.expectEqual(@as(usize, 3), dec.dynamicTableCount());
+    try testing.expectEqual(@as(usize, 0), w.dirty_frees);
+}
+
+test "wipe: an entry larger than the whole table empties it zeroed" {
+    var w: zeroize.ScrubAlloc = .{ .marker = wipe_marker, .can_resize = true };
+    var dec: Decoder = .init(w.allocator(), .{ .max_table_size = 128 });
+    defer dec.deinit();
+    var blk: [160]u8 = undefined;
+    var hl = try dec.decodeBlock(wipeLiteral(&blk, 0x40, "x-secret", wipe_marker));
+    hl.deinit(w.allocator());
+    try testing.expectEqual(@as(usize, 1), dec.dynamicTableCount());
+    var hl2 = try dec.decodeBlock(wipeLiteral(&blk, 0x40, "x-big", &@as([120]u8, @splat('.'))));
+    hl2.deinit(w.allocator());
+    try testing.expectEqual(@as(usize, 0), dec.dynamicTableCount());
+    try testing.expectEqual(@as(usize, 0), w.dirty_frees);
+}
+
+test "wipe: Decoder.deinit zeroes the dynamic table" {
+    var w: zeroize.ScrubAlloc = .{ .marker = wipe_marker, .can_resize = true };
+    var dec: Decoder = .init(w.allocator(), .{});
+    var blk: [128]u8 = undefined;
+    var hl = try dec.decodeBlock(wipeLiteral(&blk, 0x40, "x-secret", wipe_marker));
+    hl.deinit(w.allocator());
+    try testing.expectEqual(@as(usize, 0), w.dirty_frees); // live entry, nothing freed yet
+    dec.deinit();
+    try testing.expectEqual(@as(usize, 0), w.dirty_frees);
+}
+
+test "wipe: a failed table insert frees the storage and the entry zeroed" {
+    // Allocations: storage (1), spans (2), the entry's block (3), the table's
+    // entry list (4, fails): both marker-holding blocks go back on the error path.
+    var w: zeroize.ScrubAlloc = .{ .marker = wipe_marker, .can_resize = true, .fail_alloc_at = 4 };
+    var dec: Decoder = .init(w.allocator(), .{});
+    defer dec.deinit();
+    var blk: [128]u8 = undefined;
+    try testing.expectError(error.OutOfMemory, dec.decodeBlock(wipeLiteral(&blk, 0x40, "x-secret", wipe_marker)));
+    try testing.expectEqual(@as(usize, 0), w.dirty_frees);
+}
+
+test "wipe: Encoder.deinit and eviction zero the values it indexed" {
+    var w: zeroize.ScrubAlloc = .{ .marker = wipe_marker, .can_resize = true };
+    var enc: Encoder = .init(w.allocator(), .{ .max_table_size = 200, .default_sensitive = false });
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    // Reserved up front so `out` (caller-owned, holds the raw values) never grows
+    // through the watched allocator.
+    try out.ensureTotalCapacity(testing.allocator, 4096);
+    for (0..4) |_| { // the fourth distinct entry evicts the first
+        const fields = [_]Field{.{ .name = "x-secret", .value = wipe_marker }};
+        try enc.encodeBlock(&fields, &out);
+        const fields2 = [_]Field{.{ .name = "x-other", .value = wipe_marker ++ "1" }};
+        try enc.encodeBlock(&fields2, &out);
+    }
+    enc.deinit();
+    try testing.expectEqual(@as(usize, 0), w.dirty_frees);
 }

@@ -38,11 +38,16 @@ const testing = std.testing;
 /// `appendSlice` may `realloc`, and a moving realloc frees the old block
 /// with the request bytes still in it (mutation run wave 3, F2/F4).
 pub fn appendSliceWiped(gpa: std.mem.Allocator, list: *std.ArrayList(u8), bytes: []const u8) std.mem.Allocator.Error!void {
-    if (list.unusedCapacitySlice().len >= bytes.len) {
-        list.appendSliceAssumeCapacity(bytes);
-        return;
-    }
-    const need = std.math.add(usize, list.items.len, bytes.len) catch return error.OutOfMemory;
+    try ensureUnusedCapacityWiped(gpa, list, bytes.len);
+    list.appendSliceAssumeCapacity(bytes);
+}
+
+/// `list.ensureUnusedCapacity(gpa, n)` that never hands a block holding data
+/// back to the allocator unzeroed: a growth allocates the new block, copies,
+/// then zeroes and frees the old one. On failure `list` is unchanged.
+pub fn ensureUnusedCapacityWiped(gpa: std.mem.Allocator, list: *std.ArrayList(u8), n: usize) std.mem.Allocator.Error!void {
+    if (list.unusedCapacitySlice().len >= n) return;
+    const need = std.math.add(usize, list.items.len, n) catch return error.OutOfMemory;
     var new_cap: usize = @max(list.capacity, 64);
     while (new_cap < need) new_cap = std.math.mul(usize, new_cap, 2) catch need;
     const new_mem = try gpa.alloc(u8, new_cap);
@@ -53,7 +58,31 @@ pub fn appendSliceWiped(gpa: std.mem.Allocator, list: *std.ArrayList(u8), bytes:
     gpa.free(old);
     list.items = new_mem[0..len];
     list.capacity = new_cap;
-    list.appendSliceAssumeCapacity(bytes);
+}
+
+/// `list.toOwnedSlice(gpa)` that never frees a block holding data unzeroed:
+/// the unused tail is zeroed (it may hold bytes of an earlier, longer use), then
+/// the block is shrunk in place when the allocator can, otherwise a block of exactly `items.len` is allocated,
+/// filled, and the old one zeroed and freed. On failure `list` is unchanged;
+/// on success it is empty.
+pub fn toOwnedSliceWiped(gpa: std.mem.Allocator, list: *std.ArrayList(u8)) std.mem.Allocator.Error![]u8 {
+    const old = list.allocatedSlice();
+    const len = list.items.len;
+    if (len == old.len) {
+        list.* = .empty;
+        return old;
+    }
+    if (len != 0) zeroize(old[len..]);
+    if (len != 0 and gpa.resize(old, len)) {
+        list.* = .empty;
+        return old.ptr[0..len];
+    }
+    const out: []u8 = if (len == 0) &.{} else try gpa.alloc(u8, len);
+    @memcpy(out, list.items);
+    zeroize(old);
+    gpa.free(old);
+    list.* = .empty;
+    return out;
 }
 
 /// Zero every byte of `buf` in place. Handles `buf.len == 0`, lengths
@@ -167,4 +196,96 @@ test "appendSliceWiped: grows like appendSlice and keeps the bytes in order" {
     try testing.expectEqualSlices(u8, expect.items, list.items);
     try appendSliceWiped(gpa, &list, &.{});
     try testing.expectEqual(expect.items.len, list.items.len);
+}
+
+test "ensureUnusedCapacityWiped / toOwnedSliceWiped: contents survive, capacity is exact" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    try appendSliceWiped(gpa, &list, "hello");
+    try ensureUnusedCapacityWiped(gpa, &list, 1000);
+    try testing.expect(list.unusedCapacitySlice().len >= 1000);
+    try testing.expectEqualStrings("hello", list.items);
+    const owned = try toOwnedSliceWiped(gpa, &list);
+    defer gpa.free(owned);
+    try testing.expectEqualStrings("hello", owned);
+    try testing.expectEqual(@as(usize, 0), list.capacity);
+    var empty: std.ArrayList(u8) = .empty;
+    try ensureUnusedCapacityWiped(gpa, &empty, 10);
+    const none = try toOwnedSliceWiped(gpa, &empty);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+/// Counts frees of blocks that still hold `marker`; `can_resize` says whether
+/// `resize` (an in-place shrink) succeeds. Never remaps, so a move shows up as
+/// alloc + free. Meaningful in ReleaseFast only: a safe build's `free`
+/// poisons the block itself, hiding a missing wipe.
+pub const ScrubAlloc = struct {
+    marker: []const u8,
+    can_resize: bool,
+    dirty_frees: usize = 0,
+    /// The nth `alloc` call (1-based) fails; 0 = never.
+    fail_alloc_at: usize = 0,
+    allocs: usize = 0,
+
+    pub fn allocator(w: *ScrubAlloc) std.mem.Allocator {
+        return .{ .ptr = w, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const w: *ScrubAlloc = @ptrCast(@alignCast(ctx));
+        w.allocs += 1;
+        if (w.allocs == w.fail_alloc_at) return null;
+        return testing.allocator.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const w: *ScrubAlloc = @ptrCast(@alignCast(ctx));
+        if (!w.can_resize) return false;
+        return testing.allocator.rawResize(m, a, n, ra);
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const w: *ScrubAlloc = @ptrCast(@alignCast(ctx));
+        if (std.mem.find(u8, m, w.marker) != null) w.dirty_frees += 1;
+        testing.allocator.rawFree(m, a, ra);
+    }
+};
+
+test "ensureUnusedCapacityWiped: the block a growth frees holds no data" {
+    var w: ScrubAlloc = .{ .marker = "SECRET-MARKER-1", .can_resize = false };
+    const gpa = w.allocator();
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try appendSliceWiped(gpa, &list, w.marker);
+    try ensureUnusedCapacityWiped(gpa, &list, 4096); // moves
+    try testing.expectEqualStrings(w.marker, list.items);
+    try testing.expectEqual(@as(usize, 0), w.dirty_frees);
+}
+
+test "toOwnedSliceWiped: a shrink that moves frees a clean block" {
+    var w: ScrubAlloc = .{ .marker = "SECRET-MARKER-2", .can_resize = false };
+    const gpa = w.allocator();
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    try appendSliceWiped(gpa, &list, w.marker);
+    const owned = try toOwnedSliceWiped(gpa, &list);
+    defer gpa.free(owned);
+    try testing.expectEqualStrings(w.marker, owned);
+    try testing.expectEqual(@as(usize, 0), w.dirty_frees);
+}
+
+test "toOwnedSliceWiped: an in-place shrink zeroes the released tail" {
+    const marker = "SECRET-MARKER-3";
+    var buf: [128]u8 align(32) = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    const gpa = fba.allocator();
+    var list: std.ArrayList(u8) = try .initCapacity(gpa, 64);
+    list.appendSliceAssumeCapacity(marker ++ marker ++ marker);
+    list.shrinkRetainingCapacity(4); // the tail still holds the marker
+    const base = list.items.ptr;
+    const owned = try toOwnedSliceWiped(gpa, &list);
+    try testing.expectEqual(base, owned.ptr); // shrunk in place, not moved
+    try testing.expectEqual(@as(usize, 4), owned.len);
+    try expectAllZero(buf[@intFromPtr(base) - @intFromPtr(&buf) + 4 ..][0..60]);
 }
