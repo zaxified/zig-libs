@@ -6,7 +6,9 @@
 
 **Scope:** parity — OpenSSL 4.0 RSA and Go `crypto/rsa` + the `crypto/x509` RSA key codecs: PKCS#1 v1.5 and PSS sign/verify (run-time hash, prehashed digests, PSS salt recovery, decoupled MGF1), OAEP, key generation, PKCS#1/PKCS#8/SPKI/PEM read and write including encrypted PKCS#8 (PBES2/PBKDF2/AES-CBC), OpenSSH private keys, moduli up to 8192 bits (surveyed 2026-09-30 and 2026-10-14, gaps closed 2026-10-14); RSAES-PKCS1-v1_5, multi-prime keys, scrypt/PBES1/legacy-PEM encryption and > 8192-bit moduli are out (see "What is deliberately not done")
 
-**Audit:** review 2026-11-13 · mutation 2026-11-13 (162/198, 36 eq) · src aa0e0e847e537530
+**Audit:** review 2026-11-13 · mutation 2026-11-13 (162/198, 36 eq) · src d376b221f3629c9c
+
+*Delta mutation runs 2026-11-13 (restore A1 after the same day's changes):* branch-free `decryptOaepHNoFail` 35 mutants, 33 killed, 2 equivalent (`found_sep` forced to 1 — with no separator `len_ok` is already 0; the `& 1` before `@truncate` — every other term of `valid` is 0/1); bounded `drawBlindingPair` + `BlindingCache.next` 11/11 killed. The whole-module figure on the Audit line is the earlier run; the src hash covers both deltas.
 
 **Hardening:** fuzz 2026-10-09 (8 x 25,000 seeds per harness clean, RSA_FUZZ) · ct 2026-10-26 (ctgrind) · panic 2026-10-30 (sweep + blind review: e ≥ 2^32 private keys rejected (were catch unreachable on every private op), nested-SPKI recursion removed, short modulus_len primitives → error, PSS/byteLen/modinverse asserts → errors; delta audit 19/20 + 1 eq)
 
