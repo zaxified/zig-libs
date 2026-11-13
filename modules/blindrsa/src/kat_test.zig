@@ -267,8 +267,7 @@ test "B3: blindSign's own mandatory self-check rejects a pk with the wrong e, in
 // mismatch), built and run in ReleaseFast, where the assert is a no-op.
 // If the self-check did not independently reject this, blindSign would need
 // to fall back to the assert for safety and B18 would be a live gap.
-test "B18: even with the pk.n == sk.n assert compiled away (ReleaseFast), a pk with a different modulus is still rejected by the self-check (audit finding B18)" {
-    if (@import("builtin").mode != .fast) return error.SkipZigTest;
+test "B18: a pk with a different modulus is rejected with SigningFailure in every build mode, not asserted (audit finding B18, sweep BRSA-1)" {
     const sk = try kat.secretKey();
 
     // Same byte length as kat.n, same (odd) parity, one bit flipped deep in

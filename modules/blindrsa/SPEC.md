@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-16 · mutation 2026-09-11 · src ?
 
-**Hardening:** fuzz 2026-10-07 (20,000 runs clean, BLINDRSA_FUZZ, forgery check) · ct 2026-11-13 (ctgrind: blind 3, sign 4 in-file contexts, all accept/reject verdicts)
+**Hardening:** fuzz 2026-10-07 (20,000 runs clean, BLINDRSA_FUZZ, forgery check) · ct 2026-11-13 (ctgrind: blind 3, sign 4 in-file contexts, all accept/reject verdicts) · panic 2026-11-13 (sweep of every pub entry point: `blindSign` with a `pk` that is not `sk`'s public half is `SigningFailure` in every build mode, no longer a debug assert; `blind`'s sampling of `r` makes at most 128 draws and then reports `InvalidBlindingFactor`, so a generator that only yields zeros no longer hangs it; the rsa-side blinding redraw in `blindSign` stays unbounded for such a generator, see Backlog)
 
 **Performance:** ref 0.10–0.81× CIRCL v1.6.1 `blindsign/blindrsa` (stand-in for RFC 9474, which has no code) · fastest ? (measured 2026-11-13)
 
@@ -372,3 +372,11 @@ Spread: the `BENCH_ROUNDS=5` run just before gave `blind` 0.54/0.66/0.66 and one
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** RFC 9474 Appendix A.1/A.4 byte-exact KATs
+- **`blindSign` with a generator that never yields a usable base-blinding factor
+  hangs** *(sweep 2026-11-13, class 2)*. `rsa.rsadpCrtBlinded(.csprng)` redraws its
+  blinding factor until it is a unit; a `random` that only returns zeros (or values
+  `>= n`) never ends that loop. `blind`'s own sampler is bounded (128 draws, then
+  `InvalidBlindingFactor`); this one lives in `rsa` (`drawBlindingPair`) and needs a
+  bound there (a draw budget and a `PrimitiveError` member, or a total fallback), not
+  a wrapper here. `random` is documented as MUST be cryptographically secure, so an
+  honest caller is unaffected (a miss has probability ~2^-1023 per draw).

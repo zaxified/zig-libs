@@ -142,6 +142,13 @@ fn exponentBE(pk: *const rsa.PublicKey, buf: *[max_modulus_len]u8) []const u8 {
     return std.mem.trimStart(u8, buf, &.{0});
 }
 
+/// Most draws `sampleElem` makes before giving up. Each draw is accepted with
+/// probability above 1/2 (and a zero is a ~2^-bits event), so an honest
+/// generator needs two draws on average and misses 128 in a row with
+/// probability below 2^-128; a generator that only ever yields zeros, or
+/// values `>= m`, ends here instead of hanging the caller (sweep BRSA-2).
+const max_sample_draws = 128;
+
 /// Uniform random element of `[1, m)` into `out` by REJECTION sampling: draw
 /// `bits(m)` random bits (top byte masked), reject `>= m` or `== 0`, redraw.
 /// NOT the biased "reduce a wide random value mod n" shortcut — `r`'s
@@ -149,19 +156,21 @@ fn exponentBE(pk: *const rsa.PublicKey, buf: *[max_modulus_len]u8) []const u8 {
 /// "Uniform sampling"). Acceptance probability is > 1/2 per draw (the mask
 /// bounds the candidate below `2^bits(m) < 2m`). One `random.bytes` call of
 /// exactly the modulus length per attempt (the ctgrind harness and the tests
-/// recognise the draw by that length).
-fn sampleElem(np: *const NMont, random: std.Random, out: *Elem) void {
+/// recognise the draw by that length). At most `max_sample_draws` draws:
+/// then `error.InvalidBlindingFactor` (a broken `random`, never an honest one).
+fn sampleElem(np: *const NMont, random: std.Random, out: *Elem) error{InvalidBlindingFactor}!void {
     const modulus_bits = np.bits();
     const modulus_len = byteLen(modulus_bits);
     var buf: [max_modulus_len]u8 = undefined;
     defer std.crypto.secureZero(u8, buf[0..modulus_len]);
-    while (true) {
+    for (0..max_sample_draws) |_| {
         random.bytes(buf[0..modulus_len]);
         buf[0] &= @as(u8, 0xff) >> @intCast(8 * modulus_len - modulus_bits);
         out.* = np.elemFromBytesBE(buf[0..modulus_len]) catch continue;
         if (NMont.isZero(out)) continue;
         return;
     }
+    return error.InvalidBlindingFactor;
 }
 
 // ── EMSA-PSS-ENCODE (RFC 8017 §9.1.1) — delegates to `rsa` ──────────────
@@ -489,7 +498,7 @@ fn blindCore(
         // number of times, then reported.
         if (attempt == attempts) return error.InvalidBlindingFactor;
         switch (factor) {
-            .random => |g| sampleElem(np, g, &r),
+            .random => |g| try sampleElem(np, g, &r),
             .fixed => |f| r = f.*,
         }
         t = np.mul(&m, &r);
@@ -548,7 +557,7 @@ pub const BlindSignError = error{
 
 /// RFC 9474 §4 **BlindSign** (server): signs an opaque `blinded_msg` with
 /// the RSA private key, never learning the underlying message. `pk` must
-/// be the public half of `sk` (checked by assertion). `random` feeds the
+/// be the public half of `sk` (`error.SigningFailure` otherwise). `random` feeds the
 /// RFC 9474 §7.2 hardening below and MUST be cryptographically secure.
 ///
 /// **§7.2 private-op blinding** — `rsa.rsadpCrtBlinded` with
@@ -588,7 +597,11 @@ pub fn blindSign(
     // Same reason as `blind`: the secrets that survive are inside `rsa` and
     // `montint`, not in copies this module holds. Runs last. See burnStack.
     defer burnStack(sign_stack_burn);
-    std.debug.assert(pk.n.v.eql(sk.n.v)); // pk must be sk's public half
+    // `pk` must be sk's public half. A caller-passed value, so a checked
+    // verdict rather than an assert (a panic in safe builds, silence in
+    // ReleaseFast): sweep BRSA-1. The RSAVP1 self-check below would also catch
+    // it, but only after the private operation has run.
+    if (!pk.n.v.eql(sk.n.v)) return error.SigningFailure;
     const modulus_len = byteLen(sk.n.bits());
     if (out.len < modulus_len) return error.OutputTooSmall;
 
@@ -962,7 +975,7 @@ test "sampleElem: always in [1, n), even for a modulus with few top-byte bits" {
     var e: Elem = undefined;
     var i: usize = 0;
     while (i < 200) : (i += 1) {
-        sampleElem(&m, random, &e);
+        try sampleElem(&m, random, &e);
         try std.testing.expect(e[0] >= 1 and e[0] < 521);
         for (e[1..]) |w| try std.testing.expectEqual(@as(u64, 0), w);
     }
@@ -994,7 +1007,7 @@ test "B2: sampleElem is not biased toward the lower half of the modulus (audit m
     var e: Elem = undefined;
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        sampleElem(&m, random, &e);
+        try sampleElem(&m, random, &e);
         try std.testing.expect(e[0] >= 1 and e[0] < 1021);
         if (e[0] >= 512) above_half += 1;
     }
@@ -1024,11 +1037,33 @@ test "B2: sampleElem rejects a zero draw and retries rather than returning it (a
 
     const m = try smallMont(1021);
     var e: Elem = undefined;
-    sampleElem(&m, random, &e);
+    try sampleElem(&m, random, &e);
     // A sampler that skipped the isZero rejection would have returned 0
     // straight from the scripted first (all-zero) draw.
     try std.testing.expect(e[0] >= 1 and e[0] < 1021);
     try std.testing.expectEqual(@as(usize, 0), scripted.zeros_left); // the zero draw WAS consumed
+}
+
+test "blind with a generator that never yields a usable r is InvalidBlindingFactor after max_sample_draws, not a hang (sweep BRSA-2)" {
+    const Sha384 = std.crypto.hash.sha2.Sha384;
+    const pk = try kat.publicKey();
+    // Zeros (rejected as r == 0) for every modulus-length draw. Panics past
+    // 100_000 draws so that a loop without a bound fails instead of hanging.
+    const Zeros = struct {
+        draws: usize = 0,
+        fn fill(self: *@This(), buf: []u8) void {
+            @memset(buf, 0);
+            if (buf.len != kat.n.len) return;
+            self.draws += 1;
+            if (self.draws > 100_000) @panic("sampleElem: unbounded redraw loop");
+        }
+    };
+    var zeros = Zeros{};
+    const random = std.Random.init(&zeros, Zeros.fill);
+    var ctx: Context = undefined;
+    var out: [max_modulus_len]u8 = undefined;
+    try std.testing.expectError(error.InvalidBlindingFactor, blind(pk, Sha384, &kat.a1.prepared_msg, 0, random, &ctx, &out));
+    try std.testing.expectEqual(@as(usize, max_sample_draws), zeros.draws);
 }
 
 // ── B6/B9 anchor: secret Fe values (and the byte buffers already wiped)
