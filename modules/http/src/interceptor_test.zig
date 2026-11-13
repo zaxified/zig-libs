@@ -16,11 +16,24 @@ const Server = @import("Server.zig");
 
 var hits_flaky: std.atomic.Value(u32) = .init(0);
 var hits_all: std.atomic.Value(u32) = .init(0);
+var origin_io: std.Io = undefined;
 
 fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
     _ = hits_all.fetchAdd(1, .monotonic);
     const p = req.path;
     if (std.mem.eql(u8, p, "/auth")) return rw.writeAll(req.header("authorization") orelse "none");
+    if (std.mem.eql(u8, p, "/echo")) {
+        var buf: [64]u8 = undefined;
+        return rw.writeAll(try std.mem.print(&buf, "{s} {s}", .{ @tagName(req.method), req.header("x-other") orelse "none" }));
+    }
+    if (std.mem.eql(u8, p, "/slow")) {
+        origin_io.sleep(.fromMilliseconds(1500), .awake) catch {};
+        return rw.writeAll("late");
+    }
+    if (std.mem.eql(u8, p, "/delay")) {
+        origin_io.sleep(.fromMilliseconds(150), .awake) catch {};
+        return rw.writeAll("late-ok");
+    }
     if (std.mem.eql(u8, p, "/flaky")) {
         if (hits_flaky.fetchAdd(1, .monotonic) == 0) {
             rw.status = 503;
@@ -56,6 +69,7 @@ const Origin = struct {
     fn start(o: *Origin, io: std.Io) !void {
         hits_flaky.store(0, .monotonic);
         hits_all.store(0, .monotonic);
+        origin_io = io;
         o.server = Server.init(io, testing.allocator, .{ .handler = handler });
         errdefer o.server.deinit();
         o.server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
@@ -379,4 +393,246 @@ test "interceptors: none set — the call is the plain one (an empty list change
     const text = try body(&res);
     defer testing.allocator.free(text);
     try testing.expectEqualStrings("none", text);
+}
+
+// ── mutation delta 2026-11-13 ───────────────────────────────────────────────
+
+/// Rewrites method and url of the chain before proceeding.
+const Rewrite = struct {
+    method: http.Method,
+    url: []const u8,
+
+    fn intercept(ctx: ?*anyopaque, chain: *Client.Chain) Client.Error!Client.Response {
+        const self: *const Rewrite = @ptrCast(@alignCast(ctx.?));
+        chain.method = self.method;
+        chain.url = self.url;
+        return chain.proceed();
+    }
+};
+
+/// Records the thread the interceptor ran on.
+const ThreadProbe = struct {
+    id: std.Thread.Id = undefined,
+
+    fn intercept(ctx: ?*anyopaque, chain: *Client.Chain) Client.Error!Client.Response {
+        const self: *ThreadProbe = @ptrCast(@alignCast(ctx.?));
+        self.id = std.Thread.getCurrentId();
+        return chain.proceed();
+    }
+};
+
+fn expectBody(res: *Client.Response, want: []const u8) !void {
+    const text = try body(res);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(want, text);
+}
+
+test "interceptors: method, url and options reach the exchange as the caller gave them, or as an interceptor changed them" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var origin: Origin = undefined;
+    try origin.start(io);
+    defer origin.stop();
+
+    var log: Log = .{};
+    var tracer: Tracer = .{ .name = 'T', .log = &log };
+    var ub: [64]u8 = undefined;
+    const x = [_]http.Header{.{ .name = "X-Other", .value = "v1" }};
+    {
+        const list = [_]Client.Interceptor{tracer.interceptor()};
+        var client = Client.init(io, testing.allocator, .{ .interceptors = &list });
+        defer client.deinit();
+        for ([_]bool{ false, true }) |plain| {
+            var res = if (plain)
+                try client.requestPlain(.put, origin.url(&ub, "/echo"), .{ .headers = &x })
+            else
+                try client.request(.put, origin.url(&ub, "/echo"), .{ .headers = &x });
+            defer res.deinit();
+            try expectBody(&res, "put v1");
+        }
+    }
+    {
+        var rw_url_buf: [64]u8 = undefined;
+        var rewrite: Rewrite = .{ .method = .delete, .url = origin.url(&rw_url_buf, "/echo") };
+        const list = [_]Client.Interceptor{ .{ .ctx = &rewrite, .intercept = Rewrite.intercept }, tracer.interceptor() };
+        var client = Client.init(io, testing.allocator, .{ .interceptors = &list });
+        defer client.deinit();
+        // The caller asked for GET /auth; the interceptor turned it into DELETE /echo,
+        // and the headers the caller gave went along.
+        var res = try client.request(.get, origin.url(&ub, "/auth"), .{ .headers = &x });
+        defer res.deinit();
+        try expectBody(&res, "delete v1");
+    }
+}
+
+test "interceptors: an outer retry runs the inner interceptors on every attempt" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var origin: Origin = undefined;
+    try origin.start(io);
+    defer origin.stop();
+
+    var log: Log = .{};
+    var retry: Retry = .{ .max = 3, .io = io };
+    var tracer: Tracer = .{ .name = 'T', .log = &log };
+    const list = [_]Client.Interceptor{ .{ .ctx = &retry, .intercept = Retry.intercept }, tracer.interceptor() };
+    var client = Client.init(io, testing.allocator, .{ .interceptors = &list });
+    defer client.deinit();
+    var ub: [64]u8 = undefined;
+    var res = try client.request(.get, origin.url(&ub, "/flaky"), .{});
+    defer res.deinit();
+    try expectBody(&res, "ok");
+    try testing.expectEqual(@as(u32, 2), retry.attempts);
+    try testing.expectEqual(@as(u32, 2), tracer.calls);
+    try testing.expectEqualStrings("T>T<T>T<", log.text());
+}
+
+test "interceptors: without total_timeout_ms the chain runs on the caller's thread" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var origin: Origin = undefined;
+    try origin.start(io);
+    defer origin.stop();
+
+    var probe: ThreadProbe = .{};
+    const list = [_]Client.Interceptor{.{ .ctx = &probe, .intercept = ThreadProbe.intercept }};
+    // `total_timeout_ms` defaults to 30 000: 0 turns the bound off.
+    var client = Client.init(io, testing.allocator, .{ .interceptors = &list, .total_timeout_ms = 0 });
+    defer client.deinit();
+    var ub: [64]u8 = undefined;
+    for ([_]bool{ false, true }) |plain| {
+        probe.id = undefined;
+        var res = if (plain)
+            try client.requestPlain(.get, origin.url(&ub, "/"), .{})
+        else
+            try client.request(.get, origin.url(&ub, "/"), .{});
+        defer res.deinit();
+        try testing.expectEqual(std.Thread.getCurrentId(), probe.id);
+    }
+}
+
+test "interceptors: inline_blocking with total_timeout_ms — still answers, and the per-proceed check ends a retry loop" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var origin: Origin = undefined;
+    try origin.start(io);
+    defer origin.stop();
+
+    var ub: [64]u8 = undefined;
+    {
+        var retry: Retry = .{ .max = 3, .io = io };
+        const list = [_]Client.Interceptor{.{ .ctx = &retry, .intercept = Retry.intercept }};
+        var client = Client.init(io, testing.allocator, .{ .interceptors = &list, .inline_blocking = true, .total_timeout_ms = 5000 });
+        defer client.deinit();
+        for ([_]bool{ false, true }) |plain| {
+            hits_flaky.store(0, .monotonic);
+            retry.attempts = 0;
+            var res = if (plain)
+                try client.requestPlain(.get, origin.url(&ub, "/flaky"), .{})
+            else
+                try client.request(.get, origin.url(&ub, "/flaky"), .{});
+            defer res.deinit();
+            try expectBody(&res, "ok");
+            try testing.expectEqual(@as(u32, 2), retry.attempts);
+        }
+    }
+    {
+        // Nothing can cancel the task here; only `proceed`'s own check ends the loop.
+        var retry: Retry = .{ .max = std.math.maxInt(u32) - 1, .io = io };
+        const list = [_]Client.Interceptor{.{ .ctx = &retry, .intercept = Retry.intercept }};
+        var client = Client.init(io, testing.allocator, .{ .interceptors = &list, .inline_blocking = true, .total_timeout_ms = 300 });
+        defer client.deinit();
+        for ([_]bool{ false, true }) |plain| {
+            retry.attempts = 0;
+            const r = if (plain)
+                client.requestPlain(.get, origin.url(&ub, "/always503"), .{})
+            else
+                client.request(.get, origin.url(&ub, "/always503"), .{});
+            try testing.expectError(error.Timeout, r);
+            try testing.expect(retry.attempts >= 2);
+        }
+    }
+}
+
+test "interceptors: request keeps the TLS-capable exchange and requestPlain the http-only one" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var log: Log = .{};
+    var tracer: Tracer = .{ .name = 'T', .log = &log };
+    const list = [_]Client.Interceptor{tracer.interceptor()};
+    var client = Client.init(io, testing.allocator, .{ .interceptors = &list });
+    defer client.deinit();
+    // Port 1 on loopback: nothing listens, so a real dial is refused; the
+    // plain exchange never dials an https:// URL.
+    try testing.expectError(error.UnsupportedScheme, client.requestPlain(.get, "https://127.0.0.1:1/", .{}));
+    try testing.expectEqual(@as(usize, 0), client.dialCount());
+    if (client.request(.get, "https://127.0.0.1:1/", .{})) |ok| {
+        var res = ok;
+        res.deinit();
+        return error.TestExpectedError;
+    } else |err| try testing.expect(err != error.UnsupportedScheme);
+    try testing.expectEqual(@as(u32, 2), tracer.calls);
+}
+
+test "interceptors: invalid client options are refused before any interceptor runs" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var log: Log = .{};
+    var tracer: Tracer = .{ .name = 'T', .log = &log };
+    const list = [_]Client.Interceptor{tracer.interceptor()};
+    var client = Client.init(io, testing.allocator, .{ .interceptors = &list, .read_buffer_size = 0 });
+    defer client.deinit();
+    try testing.expectError(error.InvalidOptions, client.request(.get, "http://127.0.0.1:1/", .{}));
+    try testing.expectError(error.InvalidOptions, client.requestPlain(.get, "http://127.0.0.1:1/", .{}));
+    try testing.expectEqual(@as(u32, 0), tracer.calls);
+}
+
+test "interceptors: an interceptor's error comes back unchanged under total_timeout_ms; a slow origin times out" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var origin: Origin = undefined;
+    try origin.start(io);
+    defer origin.stop();
+
+    var ub: [64]u8 = undefined;
+    {
+        const list = [_]Client.Interceptor{.{ .intercept = Refuse.intercept }};
+        var client = Client.init(io, testing.allocator, .{ .interceptors = &list, .total_timeout_ms = 5000 });
+        defer client.deinit();
+        try testing.expectError(error.Intercepted, client.request(.get, origin.url(&ub, "/"), .{}));
+        try testing.expectError(error.Intercepted, client.requestPlain(.get, origin.url(&ub, "/"), .{}));
+    }
+    {
+        // A slow answer inside a roomy budget is still an answer (the budget is in milliseconds).
+        var log: Log = .{};
+        var tracer: Tracer = .{ .name = 'T', .log = &log };
+        const list = [_]Client.Interceptor{tracer.interceptor()};
+        var client = Client.init(io, testing.allocator, .{ .interceptors = &list, .total_timeout_ms = 5000 });
+        defer client.deinit();
+        var res = try client.request(.get, origin.url(&ub, "/delay"), .{});
+        defer res.deinit();
+        try expectBody(&res, "late-ok");
+        var res2 = try client.requestPlain(.get, origin.url(&ub, "/delay"), .{});
+        defer res2.deinit();
+        try expectBody(&res2, "late-ok");
+    }
+    {
+        var log: Log = .{};
+        var tracer: Tracer = .{ .name = 'T', .log = &log };
+        const list = [_]Client.Interceptor{tracer.interceptor()};
+        var client = Client.init(io, testing.allocator, .{ .interceptors = &list, .total_timeout_ms = 300 });
+        defer client.deinit();
+        try testing.expectError(error.Timeout, client.request(.get, origin.url(&ub, "/slow"), .{}));
+        try testing.expectError(error.Timeout, client.requestPlain(.get, origin.url(&ub, "/slow"), .{}));
+        try testing.expectEqual(@as(u32, 2), tracer.calls);
+    }
 }
