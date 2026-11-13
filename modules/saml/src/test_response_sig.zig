@@ -83,3 +83,51 @@ test "M28 teeth: a genuinely Response-level signature that fails to verify is re
 
     try testing.expectError(error.SignatureInvalid, saml.consumeResponseXml(alloc, signed.xml, cfg(signed.key, fx.t_valid)));
 }
+
+fn mintPadded(alloc: std.mem.Allocator, seed: u64, pad_len: usize) !sign.Signed {
+    // The padding rides in an attribute value after `</saml:Conditions>`, so the
+    // assertion stays otherwise identical to `unsigned_assertion_xml`.
+    const tail = "</saml:Assertion>";
+    std.debug.assert(std.mem.endsWith(u8, unsigned_assertion_xml, tail));
+    const head = unsigned_assertion_xml[0 .. unsigned_assertion_xml.len - tail.len];
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try buf.appendSlice(alloc, head);
+    try buf.appendSlice(alloc, "<saml:AttributeStatement><saml:Attribute Name=\"pad\"><saml:AttributeValue>");
+    try buf.appendNTimes(alloc, 'x', pad_len);
+    try buf.appendSlice(alloc, "</saml:AttributeValue></saml:Attribute></saml:AttributeStatement>");
+    try buf.appendSlice(alloc, tail);
+    return sign.signResponse(alloc, seed, response_id, "2024-06-01T12:00:00Z", fx.acs_url, fx.request_id, fx.idp_entity_id, buf.items);
+}
+
+test "max_c14n_output_len: default is 4 MiB; a normal response verifies under it" {
+    try testing.expectEqual(@as(usize, 4 << 20), saml.default_max_c14n_output_len);
+    try testing.expectEqual(saml.default_max_c14n_output_len, (saml.Config{
+        .idp_entity_id = "",
+        .idp_key = undefined,
+        .sp_entity_id = "",
+        .acs_url = "",
+        .now_unix = 0,
+    }).max_c14n_output_len);
+    const alloc = testing.allocator;
+    var signed = try mint(alloc, 0xC14_001);
+    defer signed.deinit(alloc);
+    var res = try saml.consumeResponseXml(alloc, signed.xml, cfg(signed.key, fx.t_valid));
+    res.deinit();
+}
+
+test "max_c14n_output_len: a document whose canonical form exceeds the saml default but not xmldsig's is refused" {
+    const alloc = testing.allocator;
+    // ~5 MiB of text: over saml's 4 MiB, far under xmldsig's 64 MiB.
+    var signed = try mintPadded(alloc, 0xC14_002, 5 << 20);
+    defer signed.deinit(alloc);
+
+    // Control: with the limit raised past the document the very same bytes verify,
+    // so the refusal below is the cap and nothing else.
+    var c = cfg(signed.key, fx.t_valid);
+    c.max_c14n_output_len = 64 << 20;
+    var ok = try saml.consumeResponseXml(alloc, signed.xml, c);
+    ok.deinit();
+
+    try testing.expectError(error.SignatureInvalid, saml.consumeResponseXml(alloc, signed.xml, cfg(signed.key, fx.t_valid)));
+}

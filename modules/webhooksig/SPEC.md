@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (37/37) · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, WEBHOOKSIG_FUZZ) · ct 2026-11-13 (ctgrind: verify 0 in-file = the signature comparison and HMAC under a tainted secret raise no branch of the module (sha256/sha1/sha512, hex/base64, rotation set, Stripe, Slack, Standard Webhooks); sign 77 = the public MAC through the hex/base64 encoders; keys 1 = the SP/TAB trim of the `whsec_` text; ed25519 30 = public-signature base64 22, trims 2, std `rejectIdentity` 5, the embedded-public-half compare 1; itemised in `scripts/checks/ctgrind-expected.tsv`) · panic 2026-11-13 (sweep of every pub entry point: `Verifier.init`'s option preconditions were `std.debug.assert`, now checked panics; no request-data crash found)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, WEBHOOKSIG_FUZZ) · ct 2026-11-13 (ctgrind: verify 0 in-file = the signature comparison and HMAC under a tainted secret raise no branch of the module (sha256/sha1/sha512, hex/base64, rotation set, Stripe, Slack, Standard Webhooks); sign 77 = the public MAC through the hex/base64 encoders; keys 1 = the SP/TAB trim of the `whsec_` text; ed25519 30 = public-signature base64 22, trims 2, std `rejectIdentity` 5, the embedded-public-half compare 1; itemised in `scripts/checks/ctgrind-expected.tsv`) · panic 2026-11-13 (sweep of every pub entry point: `Verifier.init`'s option preconditions were `std.debug.assert`, now `error.InvalidOptions`; no request-data crash found)
 
 **Performance:** not measured
 
@@ -77,7 +77,7 @@ truncated value whose missing bytes are zero would otherwise compare equal).
 - **Bounds:** `max_signatures` = 16 entries per header (more is `InvalidHeader`), of them
   `max_ed25519_signatures` = 4 `v1a` (each Ed25519 check re-hashes the body, so this × the key
   count bounds the body passes); `max_keys` = 8 per verification (free functions ignore extras,
-  `Verifier.init` asserts). Each HMAC is computed once per key, not per presented signature.
+  `Verifier.init` returns `error.InvalidOptions`). Each HMAC is computed once per key, not per presented signature.
 - **Middleware:** `Options.scheme` picks the headers; for timestamped schemes `checkFreshness`
   runs on the headers alone and a stale delivery gets 401 before the body is read (so a stale
   oversized body is 401, not 413). A `Clock` is required (asserted); with asserts compiled out a

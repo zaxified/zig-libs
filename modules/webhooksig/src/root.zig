@@ -100,10 +100,10 @@ pub const meta = .{
 
 const Allocator = std.mem.Allocator;
 
-/// Caller-contract check that stays in ReleaseFast (a bare `assert` there is
-/// undefined behaviour on a violated precondition).
-fn require(ok: bool, comptime msg: []const u8) void {
-    if (!ok) @panic("webhooksig: " ++ msg);
+/// Configuration check for `Verifier.init`: a violated contract is an error
+/// at the API boundary, never a panic or undefined behaviour.
+fn require(ok: bool) error{InvalidOptions}!void {
+    if (!ok) return error.InvalidOptions;
 }
 
 /// The MAC primitive: HMAC-SHA256 (RFC 2104 + FIPS 180-4).
@@ -627,7 +627,7 @@ pub const standard = struct {
 
 /// Most keys one verification tries (the rotation set). A verifier with
 /// more is a configuration error; the extras are ignored by the free
-/// functions and refused by `Verifier.init` (a checked panic).
+/// functions and refused by `Verifier.init` (`error.InvalidOptions`).
 pub const max_keys = 8;
 
 // ── Stripe ──────────────────────────────────────────────────────────────────
@@ -753,8 +753,8 @@ pub const Scheme = enum {
 pub const Options = struct {
     /// The primary signing secret (raw bytes; retained). No secret at all
     /// (and, for `.standard_webhooks`, no public key) is a misconfiguration
-    /// (a checked panic) — a gate with no key can verify nothing. At most
-    /// `max_keys` secrets (a checked panic).
+    /// (`error.InvalidOptions` from `Verifier.init`) — a gate with no key can
+    /// verify nothing. At most `max_keys` secrets (same error).
     secret: ?[]const u8 = null,
     /// Additional valid secrets (rotation set): a body signed with **any**
     /// configured secret passes. Add the new secret, migrate senders, then
@@ -780,7 +780,7 @@ pub const Options = struct {
     /// `.standard_webhooks` only: Ed25519 keys accepting `v1a` signatures
     /// (decode `whpk_…` with `standard.decodePublicKey`). Copied.
     public_keys: []const std.crypto.sign.Ed25519.PublicKey = &.{},
-    /// Required (a checked panic) by the timestamped schemes: unix seconds now.
+    /// Required (`Verifier.init` returns `error.InvalidOptions` without it) by the timestamped schemes: unix seconds now.
     clock: ?Clock = null,
     /// Timestamped schemes: the replay window, either direction.
     tolerance_s: u32 = default_tolerance_s,
@@ -823,37 +823,36 @@ pub const Verifier = struct {
 
     /// Contract violations (an empty secret, no key at all, more than
     /// `max_keys` secrets or public keys, a timestamped scheme without a
-    /// `clock`, an undecoded `whsec_` secret, an empty header name) are a
-    /// checked `@panic("webhooksig: …")` in every build mode: they are
-    /// configuration, never request data.
+    /// `clock`, an undecoded `whsec_` secret, an empty header name) return
+    /// `error.InvalidOptions`: they are configuration, never request data.
     ///
     /// Build a verifier. Secret/header/prefix slices are copied, so the
     /// caller's buffers need not outlive this call (the secrets *are*
     /// retained, as owned copies). Requires at least one secret.
-    pub fn init(gpa: Allocator, options: Options) error{OutOfMemory}!Verifier {
+    pub fn init(gpa: Allocator, options: Options) error{ OutOfMemory, InvalidOptions }!Verifier {
         var secrets: std.ArrayList([]u8) = .empty;
         errdefer {
             for (secrets.items) |s| gpa.free(s);
             secrets.deinit(gpa);
         }
         if (options.secret) |s| {
-            require(s.len != 0, "empty secret");
+            try require(s.len != 0);
             try secrets.append(gpa, try gpa.dupe(u8, s));
         }
         for (options.extra_secrets) |s| {
-            require(s.len != 0, "empty secret");
+            try require(s.len != 0);
             try secrets.append(gpa, try gpa.dupe(u8, s));
         }
         // A gate needs a key; `max_keys` bounds the per-request work.
-        require(secrets.items.len + options.public_keys.len != 0, "no secret and no public key");
-        require(options.scheme == .standard_webhooks or secrets.items.len != 0, "this scheme needs a secret");
-        require(secrets.items.len <= max_keys and options.public_keys.len <= max_keys, "more than max_keys secrets or public keys");
-        if (options.scheme != .prefixed) require(options.clock != null, "a timestamped scheme needs a clock");
+        try require(secrets.items.len + options.public_keys.len != 0);
+        try require(options.scheme == .standard_webhooks or secrets.items.len != 0);
+        try require(secrets.items.len <= max_keys and options.public_keys.len <= max_keys);
+        if (options.scheme != .prefixed) try require(options.clock != null);
         // A `whsec_…` string is not the key: decode it first.
         if (options.scheme == .standard_webhooks) for (secrets.items) |s|
-            require(!std.mem.startsWith(u8, s, standard.secret_prefix), "decode the whsec_ secret with standard.decodeSecret first");
+            try require(!std.mem.startsWith(u8, s, standard.secret_prefix));
 
-        require(options.header.len != 0, "empty header name");
+        try require(options.header.len != 0);
         const header = try gpa.dupe(u8, options.header);
         errdefer gpa.free(header);
         const prefix = try gpa.dupe(u8, options.prefix);

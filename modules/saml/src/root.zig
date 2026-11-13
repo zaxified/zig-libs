@@ -288,6 +288,9 @@ pub const PresentedKey = union(enum) {
     ec_sec1: []const u8,
 };
 
+/// Default for every config's `max_c14n_output_len`: 4 MiB (see the field doc).
+pub const default_max_c14n_output_len: usize = 4 << 20;
+
 /// Everything the SP is configured with out-of-band. `now_unix` is supplied by
 /// the caller — the module never reads the system clock (testability + no
 /// hidden ambient authority).
@@ -331,6 +334,17 @@ pub const Config = struct {
 
     /// Permit the legacy SHA-1 digest / RSA-SHA1 signature algorithms.
     allow_weak_sha1: bool = false,
+    /// Upper bound, in bytes, on the canonical form `xmldsig` may build while
+    /// verifying a signature (applies to `<SignedInfo>` and to every referenced
+    /// subtree). Verification runs on an unauthenticated POST, so the sibling's
+    /// 64 MiB default is far too generous here: the parse is already capped at
+    /// `max_untrusted_elements` (8192) elements, whose canonical form is about
+    /// a megabyte, and the shipped fixtures canonicalize to a few KiB. The
+    /// default is `default_max_c14n_output_len` (4 MiB), several times the
+    /// largest document the element budget alone admits; raise it only for
+    /// responses that carry big inline text (e.g. embedded photos in
+    /// attributes). Exceeding it fails the signature (`SignatureInvalid`).
+    max_c14n_output_len: usize = default_max_c14n_output_len,
     /// Which element the signature must be on. Default `.either`.
     signature_policy: SignaturePolicy = .either,
 
@@ -866,6 +880,7 @@ const TrustedKeys = struct {
     additional: []const xmldsig.VerifyKey,
     allow_weak_sha1: bool,
     id_attr: []const u8,
+    max_c14n_output_len: usize,
 
     fn count(self: TrustedKeys) usize {
         return 1 + self.additional.len;
@@ -876,7 +891,7 @@ const TrustedKeys = struct {
 };
 
 fn trustedKeys(config: Config) TrustedKeys {
-    return .{ .primary = config.idp_key, .additional = config.additional_idp_keys, .allow_weak_sha1 = config.allow_weak_sha1, .id_attr = config.id_attr };
+    return .{ .primary = config.idp_key, .additional = config.additional_idp_keys, .allow_weak_sha1 = config.allow_weak_sha1, .id_attr = config.id_attr, .max_c14n_output_len = config.max_c14n_output_len };
 }
 
 const KeyedResult = struct { res: xmldsig.Result, key_index: usize };
@@ -914,7 +929,7 @@ fn verifyUnderTrustedKeys(
 ) error{SignatureInvalid}!KeyedResult {
     var i: usize = 0;
     while (i < keys.count()) : (i += 1) {
-        var res = xmldsig.verify(alloc, doc, sig, sigOptsFor(keys.at(i), keys.allow_weak_sha1, keys.id_attr)) catch |e| switch (e) {
+        var res = xmldsig.verify(alloc, doc, sig, sigOptsFor(keys.at(i), keys.allow_weak_sha1, keys.id_attr, keys.max_c14n_output_len)) catch |e| switch (e) {
             error.KeyAlgorithmMismatch => continue,
             else => return error.SignatureInvalid,
         };
@@ -932,11 +947,12 @@ fn verifyUnderTrustedKeys(
 /// (IdP key, weak-SHA1 gate, ID-attribute name). Factored out so the Response,
 /// LogoutRequest/LogoutResponse, and ArtifactResponse verifiers — each with
 /// their own, differently-shaped `Config` — build it identically.
-fn sigOptsFor(key: xmldsig.VerifyKey, allow_weak_sha1: bool, id_attr: []const u8) xmldsig.Options {
+fn sigOptsFor(key: xmldsig.VerifyKey, allow_weak_sha1: bool, id_attr: []const u8, max_c14n_output_len: usize) xmldsig.Options {
     return .{
         .key = key,
         .allow_weak_sha1 = allow_weak_sha1,
         .id_attr = id_attr,
+        .max_c14n_output_len = max_c14n_output_len,
         // `signedTargetMatches` refuses anything but exactly one reference, so
         // references 2..8 were guaranteed-discarded work. `xmldsig` gained this
         // knob in the same window that this module started reaching it from an
@@ -3100,6 +3116,17 @@ pub const LogoutRequestConfig = struct {
     now_unix: i64,
     clock_skew_secs: i64 = 60,
     allow_weak_sha1: bool = false,
+    /// Upper bound, in bytes, on the canonical form `xmldsig` may build while
+    /// verifying a signature (applies to `<SignedInfo>` and to every referenced
+    /// subtree). Verification runs on an unauthenticated POST, so the sibling's
+    /// 64 MiB default is far too generous here: the parse is already capped at
+    /// `max_untrusted_elements` (8192) elements, whose canonical form is about
+    /// a megabyte, and the shipped fixtures canonicalize to a few KiB. The
+    /// default is `default_max_c14n_output_len` (4 MiB), several times the
+    /// largest document the element budget alone admits; raise it only for
+    /// responses that carry big inline text (e.g. embedded photos in
+    /// attributes). Exceeding it fails the signature (`SignatureInvalid`).
+    max_c14n_output_len: usize = default_max_c14n_output_len,
     id_attr: []const u8 = "ID",
     /// When set, `<LogoutRequest Destination>` (if present) must equal this —
     /// this SP's Single-Logout endpoint URL.
@@ -3216,7 +3243,7 @@ fn consumeLogoutRequestXmlBody(
     switch (source) {
         .embedded => {
             const sig = childEl(root, xmldsig.ds_ns, "Signature") orelse return error.SignatureMissing;
-            var kr = try verifyUnderTrustedKeys(alloc, &doc, sig, .{ .primary = config.idp_key, .additional = config.additional_idp_keys, .allow_weak_sha1 = config.allow_weak_sha1, .id_attr = config.id_attr });
+            var kr = try verifyUnderTrustedKeys(alloc, &doc, sig, .{ .primary = config.idp_key, .additional = config.additional_idp_keys, .allow_weak_sha1 = config.allow_weak_sha1, .id_attr = config.id_attr, .max_c14n_output_len = config.max_c14n_output_len });
             defer kr.res.deinit(alloc);
             if (!try signedTargetMatches(alloc, &doc, &kr.res, root, config.id_attr)) return error.SignatureWrappingDetected;
         },
@@ -3304,6 +3331,17 @@ pub const LogoutResponseConfig = struct {
     now_unix: i64,
     clock_skew_secs: i64 = 60,
     allow_weak_sha1: bool = false,
+    /// Upper bound, in bytes, on the canonical form `xmldsig` may build while
+    /// verifying a signature (applies to `<SignedInfo>` and to every referenced
+    /// subtree). Verification runs on an unauthenticated POST, so the sibling's
+    /// 64 MiB default is far too generous here: the parse is already capped at
+    /// `max_untrusted_elements` (8192) elements, whose canonical form is about
+    /// a megabyte, and the shipped fixtures canonicalize to a few KiB. The
+    /// default is `default_max_c14n_output_len` (4 MiB), several times the
+    /// largest document the element budget alone admits; raise it only for
+    /// responses that carry big inline text (e.g. embedded photos in
+    /// attributes). Exceeding it fails the signature (`SignatureInvalid`).
+    max_c14n_output_len: usize = default_max_c14n_output_len,
     id_attr: []const u8 = "ID",
     expected_destination: ?[]const u8 = null,
     /// The `ID` of the `LogoutRequest` this SP sent; the response's
@@ -3397,7 +3435,7 @@ pub fn consumeLogoutResponseXml(
     switch (source) {
         .embedded => {
             const sig = childEl(root, xmldsig.ds_ns, "Signature") orelse return error.SignatureMissing;
-            var kr = try verifyUnderTrustedKeys(alloc, &doc, sig, .{ .primary = config.idp_key, .additional = config.additional_idp_keys, .allow_weak_sha1 = config.allow_weak_sha1, .id_attr = config.id_attr });
+            var kr = try verifyUnderTrustedKeys(alloc, &doc, sig, .{ .primary = config.idp_key, .additional = config.additional_idp_keys, .allow_weak_sha1 = config.allow_weak_sha1, .id_attr = config.id_attr, .max_c14n_output_len = config.max_c14n_output_len });
             defer kr.res.deinit(alloc);
             if (!try signedTargetMatches(alloc, &doc, &kr.res, root, config.id_attr)) return error.SignatureWrappingDetected;
         },
@@ -3597,6 +3635,17 @@ pub const ArtifactResponseConfig = struct {
     now_unix: i64,
     clock_skew_secs: i64 = 60,
     allow_weak_sha1: bool = false,
+    /// Upper bound, in bytes, on the canonical form `xmldsig` may build while
+    /// verifying a signature (applies to `<SignedInfo>` and to every referenced
+    /// subtree). Verification runs on an unauthenticated POST, so the sibling's
+    /// 64 MiB default is far too generous here: the parse is already capped at
+    /// `max_untrusted_elements` (8192) elements, whose canonical form is about
+    /// a megabyte, and the shipped fixtures canonicalize to a few KiB. The
+    /// default is `default_max_c14n_output_len` (4 MiB), several times the
+    /// largest document the element budget alone admits; raise it only for
+    /// responses that carry big inline text (e.g. embedded photos in
+    /// attributes). Exceeding it fails the signature (`SignatureInvalid`).
+    max_c14n_output_len: usize = default_max_c14n_output_len,
     id_attr: []const u8 = "ID",
     expected_destination: ?[]const u8 = null,
     /// The `ID` of the `ArtifactResolve` this SP sent.
@@ -3685,7 +3734,7 @@ pub fn consumeArtifactResponseSoap(alloc: std.mem.Allocator, soap_xml: []const u
     if (!std.mem.eql(u8, irt, config.expected_in_response_to)) return error.InResponseToMismatch;
 
     const sig = childEl(root, xmldsig.ds_ns, "Signature") orelse return error.SignatureMissing;
-    var kr = try verifyUnderTrustedKeys(alloc, &doc, sig, .{ .primary = config.idp_key, .additional = config.additional_idp_keys, .allow_weak_sha1 = config.allow_weak_sha1, .id_attr = config.id_attr });
+    var kr = try verifyUnderTrustedKeys(alloc, &doc, sig, .{ .primary = config.idp_key, .additional = config.additional_idp_keys, .allow_weak_sha1 = config.allow_weak_sha1, .id_attr = config.id_attr, .max_c14n_output_len = config.max_c14n_output_len });
     defer kr.res.deinit(alloc);
     if (!try signedTargetMatches(alloc, &doc, &kr.res, root, config.id_attr)) return error.SignatureWrappingDetected;
 
@@ -4361,7 +4410,7 @@ test "TEETH: the signature options really do refuse a second reference" {
     // cost is paid inside the sibling and a wall-clock assertion here would read
     // the same with and without the fix (that mistake was made twice in this
     // campaign).
-    const opts = sigOptsFor(.{ .rsa = undefined }, false, "ID");
+    const opts = sigOptsFor(.{ .rsa = undefined }, false, "ID", default_max_c14n_output_len);
     try testing.expectEqual(@as(usize, 1), opts.max_references);
     // And the module's own rule it exists to match.
     try testing.expectEqual(@as([]const u8, "ID"), opts.id_attr);
@@ -4483,7 +4532,7 @@ test "M31 teeth: verifyCoveringDecrypted refuses an EncryptedAssertion that is n
         var doc2 = try xml.parse(alloc, signed.xml, untrustedXmlOptions());
         defer doc2.deinit();
         const sig = childEl(doc2.root, xmldsig.ds_ns, "Signature").?;
-        var res = try xmldsig.verify(alloc, &doc2, sig, sigOptsFor(signed.key, false, "ID"));
+        var res = try xmldsig.verify(alloc, &doc2, sig, sigOptsFor(signed.key, false, "ID", default_max_c14n_output_len));
         defer res.deinit(alloc);
         try testing.expect(res.valid);
         try testing.expect(try signedTargetMatches(alloc, &doc2, &res, doc2.root, "ID"));
