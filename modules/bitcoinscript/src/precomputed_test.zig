@@ -313,11 +313,11 @@ test "bytes: one cache, three inputs, three sighash algorithms — every real si
 
     const io: std.Io = undefined;
     const sh1 = try bitcointx.bip341.sighash(a, tx, 1, bitcointx.bip341.SIGHASH_DEFAULT, spent);
-    const sig1 = try bip340.sign(&key_sk, &sh1, @as([32]u8, @splat(0x44)), io);
+    const sig1 = try bip340.sign(&key_sk, &sh1, @as([32]u8, @splat(0x44)), io, .{});
 
     var exec: tapscript.ExecData = .{ .tapleaf_hash = leaf_hash, .codesep_pos = 0xffffffff };
     const sh2 = try tapscript.sighash(a, tx, 2, tapscript.SIGHASH_DEFAULT, spent, &exec);
-    const sig2 = try bip340.sign(&leaf_sk, &sh2, @as([32]u8, @splat(0x77)), io);
+    const sig2 = try bip340.sign(&leaf_sk, &sh2, @as([32]u8, @splat(0x77)), io, .{});
 
     const w0 = [_][]const u8{ sig0, &ec_pub };
     const w1 = [_][]const u8{&sig1};

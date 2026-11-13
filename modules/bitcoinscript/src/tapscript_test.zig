@@ -124,7 +124,7 @@ fn signLeaf(a: std.mem.Allocator, sk: bip340.SecretKey, s: *const Setup, aux: u8
     var exec: tapscript.ExecData = .{ .tapleaf_hash = s.tapleaf_hash, .codesep_pos = 0xffffffff };
     const sighash = try tapscript.sighash(a, s.tx, 0, tapscript.SIGHASH_DEFAULT, s.spent, &exec);
     const io: std.Io = undefined;
-    return bip340.sign(&sk, &sighash, @as([32]u8, @splat(aux)), io);
+    return bip340.sign(&sk, &sighash, @as([32]u8, @splat(aux)), io, .{});
 }
 
 // ── 1. script-path CHECKSIG spend ────────────────────────────────────────

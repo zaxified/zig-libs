@@ -346,7 +346,7 @@ pub fn signMerkle(
 ) SignError![64]u8 {
     const root = try merkleRoot(allocator, tlv_stream);
     const digest = bip340.taggedHash(tag, &root);
-    return bip340.sign(secret_key, &digest, aux_rand, io);
+    return bip340.sign(secret_key, &digest, aux_rand, io, .{});
 }
 
 pub const VerifyError = MerkleError || error{InvalidPublicKey};

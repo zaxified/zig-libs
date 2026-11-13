@@ -121,6 +121,49 @@ pub fn xonlyBytesOf(point: []const u8) error{ BadPointLength, BadPointPrefix }![
     };
 }
 
+/// An x-only public key together with its BIP340 `lift_x` point, for a
+/// verifier that checks many signatures under one key: `lift_x` is a square
+/// root (~a tenth of a `verify`), and `XOnlyPublicKey` keeps only the 32
+/// bytes, so `verify` lifts on every call. Build it once
+/// (`fromXOnly`/`fromBytes`, the way libsecp256k1's `xonly_pubkey_parse`
+/// stores the lifted point) and pass it to `verifyLifted`.
+///
+/// The fields are public; `verifyLifted` re-checks that `y` is the even
+/// square root belonging to `x` (two field multiplies), so a hand-built or
+/// corrupted value is rejected like a bad key, never trusted.
+pub const LiftedPublicKey = struct {
+    /// The x-only encoding `bytes(P)` (what the challenge hash commits to).
+    x: [32]u8,
+    /// The even `y` of `lift_x(x)`.
+    y: Fe,
+
+    pub fn fromXOnly(pk: XOnlyPublicKey) XOnlyPublicKeyError!LiftedPublicKey {
+        const x = Fe.fromBytes(pk.x, .big) catch return error.InvalidPublicKey;
+        const y = Secp256k1.recoverY(x, false) catch return error.InvalidPublicKey;
+        return .{ .x = pk.x, .y = y };
+    }
+
+    /// Parse and lift in one step (`XOnlyPublicKey.fromBytes` + `fromXOnly`,
+    /// one square root instead of two).
+    pub fn fromBytes(bytes: [32]u8) XOnlyPublicKeyError!LiftedPublicKey {
+        return fromXOnly(.{ .x = bytes });
+    }
+
+    pub fn xonly(self: LiftedPublicKey) XOnlyPublicKey {
+        return .{ .x = self.x };
+    }
+
+    /// The point, after checking `y` is the even root of `x³ + 7`.
+    fn point(self: *const LiftedPublicKey) ?Secp256k1 {
+        const x = Fe.fromBytes(self.x, .big) catch return null;
+        if (self.y.isOdd()) return null;
+        if (!self.y.sq().equivalent(x.sq().mul(x).add(curve_b))) return null;
+        return .{ .x = x, .y = self.y, .z = Fe.one };
+    }
+};
+
+const curve_b = Fe.fromInt(7) catch unreachable;
+
 // ── secret key / public key / key pair ──────────────────────────────────────
 
 pub const SecretKeyError = error{InvalidSecretKey};
@@ -371,9 +414,12 @@ pub const SignError = error{
 /// future variant that synthesizes `aux_rand` itself) — the BIP340
 /// algorithm above, once `aux_rand` is in hand, is fully deterministic and
 /// does not consume `io`.
-pub fn sign(secret_key: *const SecretKey, msg: []const u8, aux_rand: [32]u8, io: std.Io) SignError![64]u8 {
+///
+/// Step 10 runs only with `opts.self_verify` (see `SignOptions`; off by
+/// default since 2026-11-13, as in libsecp256k1).
+pub fn sign(secret_key: *const SecretKey, msg: []const u8, aux_rand: [32]u8, io: std.Io, opts: SignOptions) SignError![64]u8 {
     _ = io; // deterministic once aux_rand is in hand (see doc comment)
-    const result = signFromSecretKey(secret_key, msg, aux_rand);
+    const result = signFromSecretKey(secret_key, msg, aux_rand, opts);
     burnSignStack();
     return result;
 }
@@ -386,9 +432,23 @@ pub fn sign(secret_key: *const SecretKey, msg: []const u8, aux_rand: [32]u8, io:
 /// key on the dead stack per signature, the A1 F2 class again. So `sign` holds
 /// nothing: the key reaches this frame one level down, and `sign` burns it
 /// after the return. `noinline` is load-bearing, as on `computeUnverified`.
-noinline fn signFromSecretKey(secret_key: *const SecretKey, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {
-    return signImpl(.{ .secret = secret_key }, msg, aux_rand, computeUnverified);
+noinline fn signFromSecretKey(secret_key: *const SecretKey, msg: []const u8, aux_rand: [32]u8, opts: SignOptions) SignError![64]u8 {
+    return signImpl(.{ .secret = secret_key }, msg, aux_rand, opts, computeUnverified);
 }
+
+/// Options for `sign`/`signWithKeyPair`.
+pub const SignOptions = struct {
+    /// BIP340's recommended step 10: verify the fresh signature against its
+    /// own public key before returning it, and fail closed
+    /// (`error.SignatureVerificationFailed`) if it does not. It guards against
+    /// FAULT attacks — a glitched computation whose wrong signature would leak
+    /// the key — and costs about one `verify` (more than the signing itself).
+    /// Off by default, as in libsecp256k1 (owner decision 2026-11-13, which
+    /// reversed the 2026-10-07 one to always run it); turn it on where an
+    /// attacker can induce faults (hardware wallets, signers on shared or
+    /// untrusted hardware).
+    self_verify: bool = false,
+};
 
 /// `sign` with steps 1-2 already done: `key_pair` is what
 /// `KeyPair.fromSecretKey` returned, kept by a caller that signs repeatedly
@@ -398,13 +458,16 @@ noinline fn signFromSecretKey(secret_key: *const SecretKey, msg: []const u8, aux
 ///
 /// `KeyPair`'s fields are public, so a pair can be forged or corrupted (a
 /// `public` that is not `secret·G`, the odd-y `d'` instead of `d`, a zero
-/// or `≥ n` scalar). Such a pair never yields a signature: a scalar `≥ n` is
-/// `error.InvalidSecretKey` (step 9 parses it), and every other mismatch
-/// fails the step-10 self-check against `key_pair.public`
-/// (`error.SignatureVerificationFailed`).
-pub fn signWithKeyPair(key_pair: *const KeyPair, msg: []const u8, aux_rand: [32]u8, io: std.Io) SignError![64]u8 {
+/// or `≥ n` scalar). A scalar `≥ n` is always `error.InvalidSecretKey` (step
+/// 9 parses it). With `opts.self_verify` every other mismatch fails the
+/// step-10 self-check against `key_pair.public`
+/// (`error.SignatureVerificationFailed`); without it such a pair yields a
+/// signature that does not verify under `key_pair.public`. It leaks nothing
+/// more than an honest one: the nonce hash commits to `public`, so a
+/// different `public` gives a different nonce.
+pub fn signWithKeyPair(key_pair: *const KeyPair, msg: []const u8, aux_rand: [32]u8, io: std.Io, opts: SignOptions) SignError![64]u8 {
     _ = io; // as in `sign`
-    return signImpl(.{ .pair = key_pair }, msg, aux_rand, computeUnverified);
+    return signImpl(.{ .pair = key_pair }, msg, aux_rand, opts, computeUnverified);
 }
 
 /// The key `signImpl` signs with: a secret key (steps 1-2 run inside the
@@ -414,8 +477,10 @@ pub fn signWithKeyPair(key_pair: *const KeyPair, msg: []const u8, aux_rand: [32]
 const SignKey = union(enum) { secret: *const SecretKey, pair: *const KeyPair };
 
 /// The (steps 1-9, no self-check) result `computeUnverified` — or a test's
-/// deliberately-corrupted stand-in — hands to `signImpl`.
-const ComputeResult = struct { sig: [64]u8, pubkey: XOnlyPublicKey };
+/// deliberately-corrupted stand-in — hands to `signImpl`. `r_y` is the even
+/// `y` of the nonce point `R` (public, as `R` is), which lets the self-check
+/// compare `s·G − e·P` with `R` projectively, without an inversion.
+const ComputeResult = struct { sig: [64]u8, pubkey: XOnlyPublicKey, r_y: Fe };
 
 /// A1 F5, round-2 follow-up (2026-09-11): the first version of this seam
 /// split `sign` into `computeUnverified` + a standalone `selfCheck`, and a
@@ -446,12 +511,31 @@ fn signImpl(
     key: SignKey,
     msg: []const u8,
     aux_rand: [32]u8,
+    opts: SignOptions,
     compute: *const fn (SignKey, []const u8, [32]u8) SignError!ComputeResult,
 ) SignError![64]u8 {
     const computed = try computeAndBurn(key, msg, aux_rand, compute);
-    const parsed = Signature.fromBytes(computed.sig) catch return error.SignatureVerificationFailed;
-    if (!verify(computed.pubkey, msg, parsed)) return error.SignatureVerificationFailed;
+    if (opts.self_verify and !selfCheck(&computed, msg)) return error.SignatureVerificationFailed;
     return computed.sig;
+}
+
+/// Step 10: BIP340 verification of `computed.sig` under `computed.pubkey`,
+/// with the last step done projectively (2026-11-13). `verify` converts
+/// `R' = s·G − e·P` to affine (one inversion) to test `x(R') == r` and
+/// `y(R')` even; here the expected point is known — `(r, r_y)` — so after
+/// checking that `r_y` is the even root of `r³ + 7` (making `(r, r_y)` THE
+/// even-y point with x-coordinate `r`), `R' == (r, r_y)` is two
+/// multiplications by `Z`. Accepts exactly what `verify` accepts.
+fn selfCheck(computed: *const ComputeResult, msg: []const u8) bool {
+    const sig = Signature.fromBytes(computed.sig) catch return false;
+    const lifted = LiftedPublicKey.fromXOnly(computed.pubkey) catch return false;
+    const rx = Fe.fromBytes(sig.r, .big) catch return false;
+    const ry = computed.r_y;
+    if (ry.isOdd()) return false;
+    if (!ry.sq().equivalent(rx.sq().mul(rx).add(curve_b))) return false;
+    const r_point = challengePoint(&lifted, msg, sig) orelse return false;
+    if (r_point.z.isZero()) return false;
+    return r_point.x.equivalent(rx.mul(r_point.z)) and r_point.y.equivalent(ry.mul(r_point.z));
 }
 
 /// Run steps 1-9, then zero the stack region they used before anything reads
@@ -570,7 +654,12 @@ noinline fn computeUnverified(key: SignKey, msg: []const u8, aux_rand: [32]u8) S
     sig[0..32].* = rx;
     sig[32..64].* = s.toBytes(.big);
 
-    return .{ .sig = sig, .pubkey = kp.public };
+    // R's even y (the point the signature commits to): `y` or `−y`, by the
+    // same parity bit as step 7, selected without a branch.
+    var r_y = r_xy.y;
+    r_y.cMov(r_xy.y.neg(), @intFromBool(r_xy.y.isOdd()));
+
+    return .{ .sig = sig, .pubkey = kp.public, .r_y = r_y };
 }
 
 /// BIP340 §"Verification". Returns `false` on every failure path — it
@@ -599,31 +688,48 @@ noinline fn computeUnverified(key: SignKey, msg: []const u8, aux_rand: [32]u8) S
 /// inputs here are public); `mulDoubleBasePublic` is the variable-time
 /// double-base multiply std provides for exactly this.
 pub fn verify(pubkey: XOnlyPublicKey, msg: []const u8, sig: Signature) bool {
-    // Steps 1-3: lift P; re-check r < p and s < n.
-    const p = pubkey.lift() catch return false;
-    _ = Fe.fromBytes(sig.r, .big) catch return false;
-    const s = Scalar.fromBytes(sig.s, .big) catch return false;
+    // Step 1: lift P (then `verifyLifted` re-checks the lift, cheaply).
+    const lifted = LiftedPublicKey.fromXOnly(pubkey) catch return false;
+    return verifyLifted(&lifted, msg, sig);
+}
 
-    // Step 4: challenge scalar.
-    var challenge_hasher = hash.taggedHasher(hash.challenge_tag);
-    challenge_hasher.update(&sig.r);
-    challenge_hasher.update(&pubkey.x);
-    challenge_hasher.update(msg);
-    const e = reduceToScalar(challenge_hasher.finalResult());
-
-    // Steps 5-6: R = s*G + (n-e)*P; identity => invalid.
-    const r_point = Secp256k1.mulDoubleBasePublic(
-        Secp256k1.basePoint,
-        s.toBytes(.big),
-        p,
-        e.neg().toBytes(.big),
-        .big,
-    ) catch return false;
-
+/// `verify` with step 1 (`lift_x`, a square root) already done: for a
+/// verifier holding a `LiftedPublicKey` across many signatures, as
+/// libsecp256k1's `schnorrsig_verify` takes a parsed key. Same acceptance
+/// set as `verify` for the same key; a `LiftedPublicKey` whose `y` is not the
+/// even root of its `x` is rejected (`false`), never used.
+pub fn verifyLifted(pubkey: *const LiftedPublicKey, msg: []const u8, sig: Signature) bool {
+    const r_point = challengePoint(pubkey, msg, sig) orelse return false;
     // Steps 7-8: even y and x(R) == r.
     const r_xy = r_point.affineCoordinatesPublic();
     if (r_xy.y.isOdd()) return false;
     return std.mem.eql(u8, &r_xy.x.toBytes(.big), &sig.r);
+}
+
+/// Verification steps 1-6 on a lifted key: re-check the lift, `r < p`,
+/// `s < n`, then `R = s·G − e·P` (projective; `null` if any check fails or
+/// `R` is the point at infinity).
+fn challengePoint(pubkey: *const LiftedPublicKey, msg: []const u8, sig: Signature) ?Secp256k1 {
+    const p = pubkey.point() orelse return null;
+    _ = Fe.fromBytes(sig.r, .big) catch return null;
+    // `s < n` and `−e mod n` as plain integers: everything here is public,
+    // and std's Montgomery-form scalar would convert in and out for nothing.
+    const n = scalar.field_order;
+    if (std.mem.readInt(u256, &sig.s, .big) >= n) return null;
+
+    // Step 4: challenge scalar e = int(hash) mod n (one subtraction: 2^256 < 2n).
+    var challenge_hasher = hash.taggedHasher(hash.challenge_tag);
+    challenge_hasher.update(&sig.r);
+    challenge_hasher.update(&pubkey.x);
+    challenge_hasher.update(msg);
+    const digest = challenge_hasher.finalResult();
+    var e = std.mem.readInt(u256, &digest, .big);
+    if (e >= n) e -= n;
+    var neg_e: [32]u8 = undefined;
+    std.mem.writeInt(u256, &neg_e, if (e == 0) 0 else n - e, .big);
+
+    // Steps 5-6: R = s*G + (n-e)*P; identity => invalid.
+    return Secp256k1.mulDoubleBasePublic(Secp256k1.basePoint, sig.s, p, neg_e, .big) catch null;
 }
 
 /// One item for `verifyBatch`.
@@ -823,9 +929,14 @@ test "A1 F5 (round-2 follow-up): signImpl enforces step 10 on the REAL productio
 
     // Positive control: signImpl with the real computation is exactly what
     // sign() does -- same bytes, no regression from the seam.
-    const honest = try signImpl(.{ .secret = &sk }, msg, aux_rand, computeUnverified);
-    const via_sign = try sign(&sk, msg, aux_rand, undefined);
+    const on: SignOptions = .{ .self_verify = true };
+    const honest = try signImpl(.{ .secret = &sk }, msg, aux_rand, on, computeUnverified);
+    const via_sign = try sign(&sk, msg, aux_rand, undefined, on);
     try std.testing.expectEqualSlices(u8, &honest, &via_sign);
+    // Both settings sign the same bytes; the default is off.
+    const default_off = try sign(&sk, msg, aux_rand, undefined, .{});
+    try std.testing.expectEqualSlices(u8, &honest, &default_off);
+    try std.testing.expect(!(SignOptions{}).self_verify);
 
     // The actual regression: inject the fault INTO THE COMPUTE STEP itself
     // (audit mutation M14b's effect: a corrupted `s`), and call signImpl --
@@ -840,7 +951,11 @@ test "A1 F5 (round-2 follow-up): signImpl enforces step 10 on the REAL productio
             return r;
         }
     }.call;
-    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(.{ .secret = &sk }, msg, aux_rand, corruptS));
+    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(.{ .secret = &sk }, msg, aux_rand, on, corruptS));
+    // With the check off the same fault goes through: the option really
+    // gates the check, and nothing else catches a fault.
+    const unchecked = try signImpl(.{ .secret = &sk }, msg, aux_rand, .{}, corruptS);
+    try std.testing.expect(!std.mem.eql(u8, &unchecked, &honest));
 
     // Same for a fault in R (the first 32 bytes, step 5-6's output).
     const corruptR = struct {
@@ -850,7 +965,18 @@ test "A1 F5 (round-2 follow-up): signImpl enforces step 10 on the REAL productio
             return r;
         }
     }.call;
-    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(.{ .secret = &sk }, msg, aux_rand, corruptR));
+    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(.{ .secret = &sk }, msg, aux_rand, on, corruptR));
+
+    // A fault in R's y alone (sig bytes intact): the projective check must
+    // still reject — `r_y` is checked to be the even root of `r³ + 7`.
+    const corruptRy = struct {
+        fn call(k: SignKey, m: []const u8, a: [32]u8) SignError!ComputeResult {
+            var r = try computeUnverified(k, m, a);
+            r.r_y = r.r_y.neg();
+            return r;
+        }
+    }.call;
+    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(.{ .secret = &sk }, msg, aux_rand, on, corruptRy));
 }
 
 test "SecretKey.fromBytes REJECTS the all-zero scalar (d == 0 is not in [1, n-1])" {

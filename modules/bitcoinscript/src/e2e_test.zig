@@ -234,7 +234,7 @@ test "e2e: real P2TR key-path spend verifies via BIP341 sighash + BIP340 Schnorr
     const sighash = try bitcointx.bip341.sighash(a, spend_tx, 0, bitcointx.bip341.SIGHASH_DEFAULT, &spent);
 
     const io_undefined: std.Io = undefined;
-    const sig64 = try bip340.sign(&sk, &sighash, @as([32]u8, @splat(0x44)), io_undefined);
+    const sig64 = try bip340.sign(&sk, &sighash, @as([32]u8, @splat(0x44)), io_undefined, .{});
 
     const witness = [_][]const u8{&sig64};
     const ctx: txctx.TxContext = .{ .tx = spend_tx, .input_index = 0, .spent_outputs = &spent };

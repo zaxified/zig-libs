@@ -51,9 +51,11 @@ const bytes = sig.toBytes();
 **Signing / verifying:**
 
 ```zig
-const sig_bytes = try bip340.sign(&sk, msg, aux_rand, io); // includes the spec-mandated self-verify
-const sig2 = try bip340.signWithKeyPair(&kp, msg, aux_rand, io); // same bytes, skips re-deriving P
+const sig_bytes = try bip340.sign(&sk, msg, aux_rand, io, .{}); // .{ .self_verify = true }: BIP340's fault-attack self-check (~one verify)
+const sig2 = try bip340.signWithKeyPair(&kp, msg, aux_rand, io, .{}); // same bytes, skips re-deriving P
 const ok = bip340.verify(xonly, msg, sig); // never panics/errors: false on every failure path
+const lifted = try bip340.LiftedPublicKey.fromXOnly(xonly); // lift_x once for many signatures
+const ok2 = bip340.verifyLifted(&lifted, msg, sig); // same verdict as verify, no square root per call
 const batch_ok = bip340.verifyBatch(&.{.{ .pubkey = xonly, .msg = msg, .sig = sig }}, io);
 ```
 

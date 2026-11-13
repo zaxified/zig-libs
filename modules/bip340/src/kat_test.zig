@@ -135,7 +135,7 @@ test "KAT: sign reproduces the expected signature for every secret-key vector" {
         const aux = try hex32(vec.aux_rand.?);
         const msg = try hexAlloc(gpa, vec.message);
         defer gpa.free(msg);
-        const got = try bip340.sign(&sk, msg, aux, io);
+        const got = try bip340.sign(&sk, msg, aux, io, .{});
         try std.testing.expectEqualSlices(u8, &(try hex64(vec.signature)), &got);
     }
 }
@@ -155,7 +155,7 @@ test "KAT: signWithKeyPair gives sign's bytes; forged key pairs never sign" {
         var kp: bip340.KeyPair = undefined;
         try bip340.KeyPair.fromSecretKey(&kp, &sk);
         defer kp.deinit();
-        const got = try bip340.signWithKeyPair(&kp, msg, aux, io);
+        const got = try bip340.signWithKeyPair(&kp, msg, aux, io, .{});
         try std.testing.expectEqualSlices(u8, &(try hex64(vec.signature)), &got);
         signed += 1;
 
@@ -163,16 +163,16 @@ test "KAT: signWithKeyPair gives sign's bytes; forged key pairs never sign" {
         // the other y parity, zero, and n itself.
         var wrong_pub = kp;
         wrong_pub.public.x[31] ^= 1;
-        try std.testing.expectError(error.SignatureVerificationFailed, bip340.signWithKeyPair(&wrong_pub, msg, aux, io));
+        try std.testing.expectError(error.SignatureVerificationFailed, bip340.signWithKeyPair(&wrong_pub, msg, aux, io, .{ .self_verify = true }));
         var other_parity = kp;
         other_parity.secret = (try Scalar.fromBytes(kp.secret, .big)).neg().toBytes(.big);
-        try std.testing.expectError(error.SignatureVerificationFailed, bip340.signWithKeyPair(&other_parity, msg, aux, io));
+        try std.testing.expectError(error.SignatureVerificationFailed, bip340.signWithKeyPair(&other_parity, msg, aux, io, .{ .self_verify = true }));
         var zero = kp;
         zero.secret = @as([32]u8, @splat(0));
-        try std.testing.expectError(error.SignatureVerificationFailed, bip340.signWithKeyPair(&zero, msg, aux, io));
+        try std.testing.expectError(error.SignatureVerificationFailed, bip340.signWithKeyPair(&zero, msg, aux, io, .{ .self_verify = true }));
         var order = kp;
         std.mem.writeInt(u256, &order.secret, k256.Secp256k1.scalar.field_order, .big);
-        try std.testing.expectError(error.InvalidSecretKey, bip340.signWithKeyPair(&order, msg, aux, io));
+        try std.testing.expectError(error.InvalidSecretKey, bip340.signWithKeyPair(&order, msg, aux, io, .{}));
     }
     try std.testing.expect(signed >= 4);
 }
@@ -500,7 +500,7 @@ test "batch: sizes across verifyBatch's chunks (1..25) accept; a bad item in any
         var kp: bip340.KeyPair = undefined;
         try bip340.KeyPair.fromSecretKey(&kp, &sk);
         msgs[i] = @as([32]u8, @splat(@intCast(i)));
-        const sig = try bip340.sign(&sk, &msgs[i], @as([32]u8, @splat(0xA5)), io);
+        const sig = try bip340.sign(&sk, &msgs[i], @as([32]u8, @splat(0xA5)), io, .{});
         items[i] = .{ .pubkey = kp.public, .msg = &msgs[i], .sig = try bip340.Signature.fromBytes(sig) };
     }
     for ([_]usize{ 1, 2, 7, 8, 9, 16, 17, 25 }) |n| {
@@ -536,8 +536,8 @@ test "batch: a random-linear-combination forgery (cancelling +d/-d pair) is REJE
     const m2 = @as([32]u8, @splat(0x22));
     const aux = @as([32]u8, @splat(0));
 
-    const sig1 = try bip340.sign(&sk1, &m1, aux, io);
-    const sig2 = try bip340.sign(&sk2, &m2, aux, io);
+    const sig1 = try bip340.sign(&sk1, &m1, aux, io, .{});
+    const sig2 = try bip340.sign(&sk2, &m2, aux, io, .{});
     const p1 = try bip340.Signature.fromBytes(sig1);
     const p2 = try bip340.Signature.fromBytes(sig2);
 
@@ -612,7 +612,7 @@ test "F4: verify() re-checks the pubkey lifts on a hand-constructed XOnlyPublicK
     const io = threaded.io();
     const sk_one = try bip340.SecretKey.fromBytes(@as([31]u8, @splat(0)) ++ [_]u8{1});
     const msg = "F4 lift-check witness";
-    const sig_bytes = try bip340.sign(&sk_one, msg, @as([32]u8, @splat(0)), io);
+    const sig_bytes = try bip340.sign(&sk_one, msg, @as([32]u8, @splat(0)), io, .{});
     const sig = try bip340.Signature.fromBytes(sig_bytes);
 
     try std.testing.expect(!bip340.verify(hand_built_pk, msg, sig));

@@ -117,7 +117,7 @@ test "tweaked key pair signs and verifies: bip340.sign under q verifies against 
         try std.testing.expectEqualSlices(u8, &result.output.x, &q_pub.xonly.toBytes());
 
         // Operational agreement: sign with q, verify under Q-as-x-only.
-        const sig_bytes = try bip340.sign(&q_sk, msg, aux, io);
+        const sig_bytes = try bip340.sign(&q_sk, msg, aux, io, .{});
         const sig = try bip340.Signature.fromBytes(sig_bytes);
         try std.testing.expect(bip340.verify(result.output.asXOnly(), msg, sig));
     }

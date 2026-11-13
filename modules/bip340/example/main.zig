@@ -103,9 +103,9 @@ pub fn main() !void {
     // ── session 1: alice signs msg1, bob signs the same msg1 ────────────
     // Two independently keyed sessions over one message — the shape a
     // multi-party protocol checks each contribution against.
-    const alice_sig1 = try bip340.sign(&alice_sk, &msg1, alice_aux1, io);
+    const alice_sig1 = try bip340.sign(&alice_sk, &msg1, alice_aux1, io, .{});
     must(std.mem.eql(u8, &alice_sig1, &expected_alice_sig1), @src());
-    const bob_sig1 = try bip340.sign(&bob_sk, &msg1, bob_aux1, io);
+    const bob_sig1 = try bip340.sign(&bob_sk, &msg1, bob_aux1, io, .{});
     must(bip340.verify(alice_kp.public, &msg1, try bip340.Signature.fromBytes(alice_sig1)), @src());
     must(bip340.verify(bob_kp.public, &msg1, try bip340.Signature.fromBytes(bob_sig1)), @src());
     std.debug.print("session 1: both signatures verify\n", .{});
@@ -115,7 +115,7 @@ pub fn main() !void {
     // that would surface leftover state (bip340 keeps none: `sign` takes
     // everything by value and returns a plain array, so there is nothing to
     // carry between calls).
-    const alice_sig2 = try bip340.sign(&alice_sk, &msg2, alice_aux2, io);
+    const alice_sig2 = try bip340.sign(&alice_sk, &msg2, alice_aux2, io, .{});
     must(bip340.verify(alice_kp.public, &msg2, try bip340.Signature.fromBytes(alice_sig2)), @src());
     // Cross-session confusion must fail: session 1's signature does not
     // verify against session 2's message, even under the same key.

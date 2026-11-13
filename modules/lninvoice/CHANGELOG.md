@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **BEHAVIOUR CHANGE (BOLT#12 signing):** the BIP340 signer now calls `bip340.sign(…, .{})`, bip340's new default, which no longer re-verifies the signature before returning it (libsecp256k1's behaviour; bip340 changelog 2026-11-13). Same signature bytes; no API change here.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0. `strRepeat` helper is now `inline fn` (dangling-temporary fix).

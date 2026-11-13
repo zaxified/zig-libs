@@ -299,7 +299,7 @@ pub fn expectNoResidue(label: []const u8, comptime call: fn (*const bip340.Secre
 var sign_io: std.Io = undefined;
 
 noinline fn callSign() void {
-    sig_sink = bip340.sign(&cur_sk, msg, cur_aux, sign_io) catch unreachable;
+    sig_sink = bip340.sign(&cur_sk, msg, cur_aux, sign_io, .{}) catch unreachable;
     std.mem.doNotOptimizeAway(&sig_sink);
 }
 
@@ -318,7 +318,7 @@ test "STACKPROBE (A1 F2): no key or nonce residue on the dead stack after sign()
 var probe_pairs: [cases.len]bip340.KeyPair = undefined;
 
 noinline fn callSignWithKeyPair() void {
-    sig_sink = bip340.signWithKeyPair(&probe_pairs[cur_case], msg, cur_aux, sign_io) catch unreachable;
+    sig_sink = bip340.signWithKeyPair(&probe_pairs[cur_case], msg, cur_aux, sign_io, .{}) catch unreachable;
     std.mem.doNotOptimizeAway(&sig_sink);
 }
 

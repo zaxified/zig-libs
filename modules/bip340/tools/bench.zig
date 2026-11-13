@@ -18,12 +18,16 @@
 //!   keypair  secret key -> x-only public key (ours: `KeyPair.fromSecretKey`,
 //!            theirs: `keypair_create` + `keypair_xonly_pub`)
 //!   sign     BIP340 signature of a 32-byte message from a ready key pair
-//!            (ours: `signWithKeyPair`, theirs: `schnorrsig_sign32`); ours
-//!            also runs its mandatory self-verification
+//!            (ours: `signWithKeyPair` with the default options, theirs:
+//!            `schnorrsig_sign32`); since 2026-11-13 ours no longer runs the
+//!            step-10 self-verification by default (`SignOptions.self_verify`,
+//!            off as in libsecp256k1); until then it always did
 //! Until 2026-10-07 ours signed with `sign(secret_key)`, which also derives
 //! the public key on every call (~27 µs more than the pair form).
-//!   verify   one signature (ours lifts the x-only key per call, theirs parses
-//!            it once beforehand)
+//!   verify   one signature under a key parsed once beforehand on both sides
+//!            (ours: `LiftedPublicKey` + `verifyLifted`, theirs:
+//!            `xonly_pubkey_parse` + `schnorrsig_verify`); until 2026-11-13
+//!            ours lifted the x-only key on every call
 //! plus an informational row `verifyBatch/sig`, ours only (libsecp has no batch
 //! verification), no ratio. Both sides double the batch until it takes over
 //! 100 ms and keep the best of five. Inputs are written into
@@ -54,6 +58,7 @@ const Ctx = struct {
     sk: bip340.SecretKey,
     kp: *const bip340.KeyPair,
     pk: bip340.XOnlyPublicKey,
+    lifted: bip340.LiftedPublicKey,
     msg: [32]u8,
     aux: [32]u8,
     sig: bip340.Signature,
@@ -67,12 +72,12 @@ fn doKeypair(c: Ctx) usize {
     return 1;
 }
 fn doSign(c: Ctx) usize {
-    const s = bip340.signWithKeyPair(c.kp, &c.msg, c.aux, c.io) catch unreachable;
+    const s = bip340.signWithKeyPair(c.kp, &c.msg, c.aux, c.io, .{}) catch unreachable;
     std.mem.doNotOptimizeAway(&s);
     return 1;
 }
 fn doVerify(c: Ctx) usize {
-    if (!bip340.verify(c.pk, &c.msg, c.sig)) unreachable;
+    if (!bip340.verifyLifted(&c.lifted, &c.msg, c.sig)) unreachable;
     return 1;
 }
 fn doBatch(c: Ctx) usize {
@@ -126,7 +131,7 @@ pub fn main(init: std.process.Init) !u8 {
     const sk = try bip340.SecretKey.fromBytes(sk_bytes);
     var kp: bip340.KeyPair = undefined;
     try bip340.KeyPair.fromSecretKey(&kp, &sk);
-    const sig_bytes = try bip340.sign(&sk, &msg, aux, io);
+    const sig_bytes = try bip340.sign(&sk, &msg, aux, io, .{});
     const sig = try bip340.Signature.fromBytes(sig_bytes);
     try dir.writeFile(io, .{ .sub_path = "sk.bin", .data = &sk_bytes });
     try dir.writeFile(io, .{ .sub_path = "msg.bin", .data = &msg });
@@ -194,11 +199,11 @@ pub fn main(init: std.process.Init) !u8 {
         var k: bip340.KeyPair = undefined;
         const item_sk = try bip340.SecretKey.fromBytes(b);
         try bip340.KeyPair.fromSecretKey(&k, &item_sk);
-        const s = try bip340.sign(&item_sk, &m, a, io);
+        const s = try bip340.sign(&item_sk, &m, a, io, .{});
         it.* = .{ .pubkey = k.public, .msg = try arena.dupe(u8, &m), .sig = try bip340.Signature.fromBytes(s) };
     }
 
-    const ctx: Ctx = .{ .io = io, .sk = sk, .kp = &kp, .pk = kp.public, .msg = msg, .aux = aux, .sig = sig, .batch = items };
+    const ctx: Ctx = .{ .io = io, .sk = sk, .kp = &kp, .pk = kp.public, .lifted = try bip340.LiftedPublicKey.fromXOnly(kp.public), .msg = msg, .aux = aux, .sig = sig, .batch = items };
 
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
@@ -220,7 +225,7 @@ pub fn main(init: std.process.Init) !u8 {
     const batch = timeIt(io, ctx, doBatch);
     try w.print("{s:<10} {d:>12.0} {s:>13} {s:>14}   (64-signature batch, per signature)\n", .{ "verifyBatch", batch.ns / @as(f64, @floatFromInt(batch.count)), "-", "-" });
     try w.print("\nworst ours/secp256k1 = {d:.2} (best {d:.2})\n", .{ worst, best });
-    try w.print("card: **Performance:** ref {d:.2}–{d:.2}× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-10-07)\n", .{ best, worst });
+    try w.print("card: **Performance:** ref {d:.2}–{d:.2}× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-11-13)\n", .{ best, worst });
     try w.flush();
     return 0;
 }

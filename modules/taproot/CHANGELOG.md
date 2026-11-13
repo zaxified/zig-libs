@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** the KAT test and the example call `bip340.sign(…, .{})` for bip340's new trailing `SignOptions` argument.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private CompactSize encoder in `tree.zig` is replaced by `bitcointx.encodeCompactSize`; `bitcointx` is now a dependency (it only depends on `bip340`, no cycle).
 - **2026-10-10** — tests: deterministic fuzz driver `TAPROOT_FUZZ` (testkit) over random complete script trees (every control-block path recomputes the Merkle root, a changed script does not, output key equals the tweak of the root) and tweakSecretKey/tweakPublicKey agreement. No change to the library code.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region

@@ -113,7 +113,7 @@ pub fn main() !void {
 
         try taproot.tweakSecretKey(&internal_sk, null, &q_bytes);
         const q_sk = try bip340.SecretKey.fromBytes(q_bytes);
-        const sig = try bip340.sign(&q_sk, &message, aux_rand, io);
+        const sig = try bip340.sign(&q_sk, &message, aux_rand, io, .{});
         must(bip340.verify(tweak.output.asXOnly(), &message, try bip340.Signature.fromBytes(sig)), @src());
         std.debug.print("key-path-only signature: {x}\n", .{sig});
         // ACTUALLY RUN: embit's `PublicKey.schnorr_verify(sig, msg)` against
@@ -134,7 +134,7 @@ pub fn main() !void {
 
         try taproot.tweakSecretKey(&internal_sk, merkle_root_bytes, &q_bytes);
         const q_sk = try bip340.SecretKey.fromBytes(q_bytes);
-        const sig = try bip340.sign(&q_sk, &message, aux_rand, io);
+        const sig = try bip340.sign(&q_sk, &message, aux_rand, io, .{});
         must(bip340.verify(tweak.output.asXOnly(), &message, try bip340.Signature.fromBytes(sig)), @src());
         std.debug.print("script-committed signature: {x}\n", .{sig});
         // ACTUALLY RUN: embit's `PublicKey.schnorr_verify(sig, msg)` against
