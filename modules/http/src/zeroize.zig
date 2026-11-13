@@ -289,3 +289,18 @@ test "toOwnedSliceWiped: an in-place shrink zeroes the released tail" {
     try testing.expectEqual(@as(usize, 4), owned.len);
     try expectAllZero(buf[@intFromPtr(base) - @intFromPtr(&buf) + 4 ..][0..60]);
 }
+
+test "toOwnedSliceWiped: an empty result still zeroes the block it gives back" {
+    // `Allocator.resize(block, 0)` frees the block: the shrink to nothing must
+    // not be left to it.
+    for ([_]bool{ false, true }) |can_resize| {
+        var w: ScrubAlloc = .{ .marker = "SECRET-MARKER-4", .can_resize = can_resize };
+        const gpa = w.allocator();
+        var list: std.ArrayList(u8) = .empty;
+        try appendSliceWiped(gpa, &list, w.marker);
+        list.shrinkRetainingCapacity(0); // the block still holds the marker
+        const owned = try toOwnedSliceWiped(gpa, &list);
+        try testing.expectEqual(@as(usize, 0), owned.len);
+        try testing.expectEqual(@as(usize, 0), w.dirty_frees);
+    }
+}

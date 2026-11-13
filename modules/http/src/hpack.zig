@@ -2607,9 +2607,10 @@ test "wipe: HeaderList.deinit zeroes the strings of a hand-built list" {
     var w: zeroize.ScrubAlloc = .{ .marker = wipe_marker, .can_resize = true };
     const gpa = w.allocator();
     const fields = try gpa.alloc(Field, 1);
-    fields[0] = .{ .name = try gpa.dupe(u8, "x-secret"), .value = try gpa.dupe(u8, wipe_marker) };
+    fields[0] = .{ .name = try gpa.dupe(u8, wipe_marker), .value = try gpa.dupe(u8, wipe_marker) };
     var hl: HeaderList = .{ .fields = fields };
     hl.deinit(gpa);
+    // Two blocks held the marker (name and value); both went back zeroed.
     try testing.expectEqual(@as(usize, 0), w.dirty_frees);
 }
 
