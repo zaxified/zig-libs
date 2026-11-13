@@ -2001,3 +2001,35 @@ jwe	ReleaseFast	kw	1	5	198f278acedab8ab	29bdefbeeb697801
 jwe	ReleaseFast	ecdh	1	8	8e24d1f5528d947d	0e8a78e319485b8a
 jwe	ReleaseFast	pbes2	1	3	198f278acedab8ab	45882587fad30673
 jwe	ReleaseFast	rsa	1	20	198f278acedab8ab	043474d84426957a
+# webhooksig (2026-11-13) — the HMAC secrets, the signature comparison, the
+# `whsec_` / `whsk_` key text. Four targets; the harness taints only the secret
+# (the key text's prefix stays public) and prints hex of every witness.
+# verify 0 (exact): sha256= / sha1 / sha512-base64 verify, Verifier rotation set,
+#   Stripe, Slack and Standard Webhooks verify, accept + one octet flipped. The
+#   signatures come from an UNTAINTED copy of the secret, the verify runs on a
+#   tainted one: the HMAC and `timing_safe.eql` raise 112 contexts, all of them the
+#   harness printing the verdict (witness) — none is a branch in webhooksig. The
+#   comparison is constant-time.
+# sign 77 = the PUBLIC MAC through the module's encoders, which index a table by each
+#   MAC octet before the caller can declassify it: `encodeMac`'s hex table
+#   (root.zig:297 x16, :298 x16: the GitHub/SHA-1/Stripe/Slack signers) and std base64
+#   (root.zig:302, via encodeMac: 22 for sha512-base64, and `standard.sign` v1).
+#   The HMAC output is public by design; no context touches the secret itself.
+# keys 1 = `stripPrefix` -> std.mem.trim (root.zig:604): the scan for leading/trailing
+#   SP/TAB compares the key text's last character against ' ' and '\t' and stops at
+#   the first non-whitespace one. For a valid key the answer is always "no" (the
+#   base64 alphabet holds no whitespace), so it carries no key bit; it is a layout
+#   decision on the text, left as is (a branch-free trim would change the accepted
+#   inputs for nothing). b64ct's decode and encode raise none.
+# ed25519 30 = 22 std base64 of the PUBLIC signature (root.zig:533) + 2 stripPrefix
+#   trims as in keys (root.zig:604, the two `whsk_` layouts) + 3 std edwards25519
+#   `rejectIdentity` verdicts on the public-key point (decodeSigningKey seed and
+#   64-byte layouts, root.zig:485/:493) and on the nonce point R (signEd25519,
+#   root.zig:531): one bit, true except with probability ~2^-252, std's own
+#   branch (ed25519.zig:115 x2 are its keygen twins) + 1 root.zig:494, the
+#   constant-time compare of the embedded public half against the derived one
+#   (true for every valid key, a verdict by design).
+webhooksig	ReleaseFast	verify	1	0	b6e6b8df5a7828b0	b517d0804f4a93d2
+webhooksig	ReleaseFast	sign	1	77	b6e6b8df5a7828b0	854ae236c5fea038
+webhooksig	ReleaseFast	keys	1	1	b6e6b8df5a7828b0	4fb3c2a0bf839a0e
+webhooksig	ReleaseFast	ed25519	1	30	b6e6b8df5a7828b0	0ddab6b90956b2fe

@@ -337,6 +337,8 @@ declare -A TARGETS=(
     [jwt]="hmac ec rsa"
     # ── 2026-11-13: jwe: decrypt side — dir CEK, AxxxKW / AxxxGCMKW KEK, ECDH-ES static private key, PBES2 password, RSA-OAEP secret key ──
     [jwe]="content kw ecdh pbes2 rsa"
+    # ── 2026-11-13: webhooksig: HMAC secrets + signature compare, Standard Webhooks key text, Ed25519 whsk_ ──
+    [webhooksig]="verify sign keys ed25519"
     # ── 2026-10-20: minisign: Ed25519 seed (sign), password + key (seal), password (open) ──
     [minisign]="sign seal open"
     # ── 2026-10-31: tls13: key schedule, kex per group (sharedSecret / serverExchange), CertificateVerify signers ──
@@ -432,6 +434,7 @@ declare -A MODES=(
     [acme]="ReleaseFast"
     [jwt]="ReleaseFast"
     [jwe]="ReleaseFast"
+    [webhooksig]="ReleaseFast"
     [minisign]="ReleaseFast"
     [tls13]="ReleaseFast"
 )
@@ -847,6 +850,12 @@ declare -A PATTERN=(
     [jwe/ecdh]='root[.]zig|alg[.]zig|ecdhes[.]zig|burn[.]zig'
     [jwe/pbes2]='root[.]zig|alg[.]zig|burn[.]zig'
     [jwe/rsa]='root[.]zig|alg[.]zig|burn[.]zig'
+    # webhooksig (2026-11-13): the module's own files; `root.zig` also matches the
+    # delegated std-free sibling roots on a stack (none here); the tsv comment itemises.
+    [webhooksig/verify]='root[.]zig|burn[.]zig'
+    [webhooksig/sign]='root[.]zig|burn[.]zig'
+    [webhooksig/keys]='root[.]zig|burn[.]zig'
+    [webhooksig/ed25519]='root[.]zig|burn[.]zig'
     [minisign/sign]='root[.]zig|burn[.]zig|blake2b[.]zig'
     [minisign/seal]='root[.]zig|burn[.]zig|blake2b[.]zig'
     [minisign/open]='root[.]zig|burn[.]zig|blake2b[.]zig'
@@ -1187,6 +1196,10 @@ declare -A LABEL=(
     [jwe/ecdh]='jwe decryptCompact, ECDH-ES and ECDH-ES+A256KW on P-256 and X25519 (static private key tainted)'
     [jwe/pbes2]='jwe decryptCompact, PBES2-HS256+A128KW (password tainted)'
     [jwe/rsa]='jwe decryptCompact, RSA-OAEP + RSA-OAEP-256 (rsa secret members tainted)'
+    [webhooksig/verify]='webhooksig verify (sha256/sha1/sha512, hex/base64), Verifier rotation, Stripe, Slack, Standard Webhooks (secret tainted)'
+    [webhooksig/sign]='webhooksig sign (every scheme, secret tainted; the public-MAC encoders are the count)'
+    [webhooksig/keys]='webhooksig standard.decodeSecret + encodeSecret (whsec_ body tainted)'
+    [webhooksig/ed25519]='webhooksig decodeSigningKey (both whsk_ layouts) + signEd25519 (seed tainted)'
     [minisign/sign]='minisign signDigest + signTrustedComment (Ed25519 seed tainted)'
     [minisign/seal]='minisign sealSecretKey (seed + password tainted)'
     [minisign/open]='minisign openSecretKey (password tainted)'

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (37/37) · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, WEBHOOKSIG_FUZZ) · ct none
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, WEBHOOKSIG_FUZZ) · ct 2026-11-13 (ctgrind: verify 0 in-file = the signature comparison and HMAC under a tainted secret raise no branch of the module (sha256/sha1/sha512, hex/base64, rotation set, Stripe, Slack, Standard Webhooks); sign 77 = the public MAC through the hex/base64 encoders; keys 1 = the SP/TAB trim of the `whsec_` text; ed25519 30 = public-signature base64 22, trims 2, std `rejectIdentity` 5, the embedded-public-half compare 1; itemised in `scripts/checks/ctgrind-expected.tsv`) · panic 2026-11-13 (sweep of every pub entry point: `Verifier.init`'s option preconditions were `std.debug.assert`, now checked panics; no request-data crash found)
 
 **Performance:** not measured
 
@@ -132,6 +132,26 @@ publish a canonical secret/payload/signature triple (`secret = "It's a Secret to
 self-check against it; independently re-verified here with `openssl dgst -sha256 -hmac` before
 adoption. Recorded as a provenance note in this module's README `Provenance:` statement (a short factual test-oracle
 triple, not a vendored corpus — no dedicated `modules/webhooksig/NOTICE` file).
+
+## Constant-time (ctgrind, 2026-11-13)
+
+`src/ctgrind_harness.zig`, `scripts/checks/ctgrind.sh webhooksig` (ReleaseFast, unattributed 0,
+controls and traps 0; pinned in `scripts/checks/ctgrind-expected.tsv`).
+
+- **verify: 0 in-file.** Signatures are produced with an untainted copy of the secret, then
+  verified under a tainted one, accepted and with one octet flipped, for every scheme and the
+  rotation set. The 110 contexts are the harness printing the verdict; the module itself takes
+  no branch on the secret or the comparison result (`timing_safe.eql` over a fixed-size array,
+  `ok = macEql(..) or ok` evaluates the compare first, every secret tried).
+- **sign: 77.** The MAC is public, but `encodeMac`'s hex table (root.zig:297/:298) and std base64
+  (via root.zig:302) index a table by each MAC octet before the caller can declassify it.
+- **keys: 1.** `stripPrefix` -> `std.mem.trim` compares the key text's last character with SP and
+  TAB (root.zig:604). The base64 alphabet has neither, so for a valid key the outcome is constant
+  and carries no key bit; left as is. `b64ct`'s decode/encode raise none.
+- **ed25519: 30.** 22 std base64 of the public signature (root.zig:533), 2 trims as above, std
+  edwards25519 `rejectIdentity` x3 (+2 in keygen) on public-key and nonce points (one bit, true
+  except with probability ~2^-252), and the constant-time compare of the embedded public half
+  (root.zig:494), true for every valid key.
 
 ## Backlog / deferred
 **2026-10-04:** all three survey items are **done** (Standard Webhooks v1/v1a, Stripe, Slack with
