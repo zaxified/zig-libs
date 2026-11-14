@@ -324,13 +324,18 @@ fp_load() {
         echo "$FP_TSV" >&2
         exit 1
     fi
-    # name, fingerprint, build key, tools key (see printModuleFingerprints).
-    # Everything but `cmd_build` (column 3) and `cmd_interop` (column 4) reads
-    # column 2.
-    if ! awk -F'\t' 'NF != 4 { exit 1 } END { exit NR == 0 }' <<< "$FP_TSV"; then
+    # name, test key, build key, tools key, examples key (see
+    # printModuleFingerprints). The test lanes read column 2; `cmd_build`,
+    # `cmd_interop` and the lanes that run examples pick theirs with fp_use.
+    if ! awk -F'\t' 'NF != 5 { exit 1 } END { exit NR == 0 }' <<< "$FP_TSV"; then
         echo "test.sh: module-fingerprints produced nothing usable -- refusing to pass vacuously" >&2
         exit 1
     fi
+}
+
+# Make column $1 of the fingerprints the one stamps read and write (column 2).
+fp_use() {
+    FP_TSV="$(awk -F'\t' -v OFS='\t' -v c="$1" '{ print $1, $c, $c, $c, $c }' <<< "$FP_TSV")"
 }
 
 stamps_lane_key() {
@@ -1631,6 +1636,7 @@ cmd_changed() {
     lane="$(stamps_lane_key changed)"
     lane_mods="$(split_modules "$(lane_modules)")"
     fp_load   # here, in THIS shell: see stamps_record
+    fp_use 5  # this lane runs examples too (B3)
     closure="$(stamps_pending "$lane_mods" "$lane")"
     closure="$(defer_slow "$closure")"
     local total_n
@@ -2299,7 +2305,7 @@ cmd_interop() {
     # The TOOLS key (column 4, 2026-11-14): what the tools programs import as
     # build.zig wires them -- interop_deps, bench_deps and a bench's fastmem +
     # testkit included, which column 2 never saw.
-    FP_TSV="$(awk -F'\t' -v OFS='\t' '{ print $1, $4, $4, $4 }' <<< "$FP_TSV")"
+    fp_use 4
     graph_load
     local compile_lane compile_mods compile_todo
     compile_lane="$(stamps_lane_key check-interop)"
@@ -2477,6 +2483,7 @@ cmd_examples() {
     lane_mods="$(lane_modules)"
     lane="$(stamps_lane_key examples)"
     fp_load   # here, in THIS shell: see stamps_record
+    fp_use 5  # the examples key: column 2 + example/ (B3)
     todo="$(stamps_pending "$lane_mods" "$lane")"
     echo "examples: $(wc -w <<< "$todo") of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' ($(lane_cpu_note)) — compiling and running their examples"
     if [[ -z "${todo// /}" ]]; then
@@ -2526,7 +2533,7 @@ cmd_build() {
     # own lane name keeps these stamps apart from the full-fingerprint ones.
     lane="$(stamps_lane_key build-deps)"
     fp_load   # here, in THIS shell: see stamps_record
-    FP_TSV="$(awk -F'\t' -v OFS='\t' '{ print $1, $3, $3, $3 }' <<< "$FP_TSV")"
+    fp_use 3
     todo="$(stamps_pending "$lane_mods" "$lane")"
     local n
     n=$(wc -w <<< "$todo")
@@ -2615,6 +2622,7 @@ cmd_all() {
     local all_mods
     all_mods="$(lane_modules)"
     fp_load   # before anything runs: the stamps below must carry THESE fingerprints
+    fp_use 5  # it runs examples too, and stamps the `changed` lane (B3)
     local n
     n=$(wc -w <<< "$all_mods")
     echo "all: running every module ($n total, $(printf '%s\n' "${G_HEAVY[@]}" | grep -c heavy) heavy) — ignoring stamps, and then stamping the \`changed\` lane"

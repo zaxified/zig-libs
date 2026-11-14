@@ -156,6 +156,14 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
     // 42629426408 compiled, and its rest-2 lane hit the 12-minute timeout.
     const own = try b.allocator.alloc([32]u8, module_list.len);
     const iface = try b.allocator.alloc([32]u8, module_list.len);
+    // ⭐ AND SPLIT BY WHO READS IT (CI audit B3, 2026-11-14). A test binary is
+    // compiled from `src/` and can read nothing under `tools/` or `example/`
+    // (no `@embedFile` outside the root's directory; no test opens those paths
+    // -- checked by grep that day). `own_test` leaves both out and keys the test
+    // lanes (column 2), so a bench or oracle edit no longer re-runs the module's
+    // tests in four lanes. `own_ex` is `example/` alone, for column 5.
+    const own_test = try b.allocator.alloc([32]u8, module_list.len);
+    const own_ex = try b.allocator.alloc([32]u8, module_list.len);
     for (module_list, 0..) |m, i| {
         var hi = Sha256.init(.{});
         hi.update(m.name);
@@ -273,7 +281,10 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
                 hi.update(v);
             }
         }
-        // Pass 2: fold.
+        // Pass 2: fold. `h` so far holds the module's flags, edges and env --
+        // shared by every part.
+        var h_test = h;
+        var h_ex = Sha256.init(.{});
         for (paths.items, 0..) |path, k| {
             const raw = std.mem.endsWith(u8, path, ".zig") and raw_set.contains(path);
             const content = if (raw)
@@ -284,6 +295,18 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
             h.update(path);
             h.update("\x00");
             h.update(&content);
+            const part: *Sha256 = if (std.mem.startsWith(u8, path, "example/"))
+                &h_ex
+            else if (std.mem.startsWith(u8, path, "tools/"))
+                &h // tools: in `own` only (columns 3 and 4)
+            else
+                &h_test;
+            if (part != &h) {
+                part.update(if (raw) "\x00r:" else "\x00f:");
+                part.update(path);
+                part.update("\x00");
+                part.update(&content);
+            }
             if (std.mem.startsWith(u8, path, "src/")) {
                 hi.update(if (raw) "\x00r:" else "\x00f:");
                 hi.update(path);
@@ -292,6 +315,8 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
             }
         }
         h.final(&own[i]);
+        h_test.final(&own_test[i]);
+        h_ex.final(&own_ex[i]);
         hi.final(&iface[i]);
     }
 
@@ -367,11 +392,20 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
         // re-key anything. Measured before this: swapping two rows re-keyed 47.
         var h = Sha256.init(.{});
         h.update(&machinery.peek());
-        // The module's own full hash, then each dependency's interface hash.
-        h.update(&own[i]);
+        // The module's own TEST hash (B3: no tools/, no example/), then each
+        // dependency's interface hash.
+        h.update(&own_test[i]);
         for (by_name) |j| if (seen[j] and j != i) h.update(&iface[j]);
         var digest: [32]u8 = undefined;
         h.final(&digest);
+        // FIFTH COLUMN: the EXAMPLES key -- column 2 plus `example/`. The lanes
+        // that run examples (`examples`, `changed`, `all`) key on it.
+        var he = Sha256.init(.{});
+        he.update("examples\x00");
+        he.update(&digest);
+        he.update(&own_ex[i]);
+        var ex_digest: [32]u8 = undefined;
+        he.final(&ex_digest);
 
         // ⭐ THIRD COLUMN: the BUILD key (2026-11-14) -- the same, but the
         // closure follows `deps` only, never `test_deps`. The push lane
@@ -455,11 +489,12 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
         for (by_name) |j| if (seen[j] and j != i) ht.update(&iface[j]);
         var tools_digest: [32]u8 = undefined;
         ht.final(&tools_digest);
-        try w.print("{s}\t{s}\t{s}\t{s}\n", .{
+        try w.print("{s}\t{s}\t{s}\t{s}\t{s}\n", .{
             m.name,
             std.fmt.bytesToHex(digest[0..16], .lower),
             std.fmt.bytesToHex(build_digest[0..16], .lower),
             std.fmt.bytesToHex(tools_digest[0..16], .lower),
+            std.fmt.bytesToHex(ex_digest[0..16], .lower),
         });
     }
 
