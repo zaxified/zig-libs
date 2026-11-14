@@ -27,7 +27,9 @@
 //!              with a fresh random r)
 //!   finalize   client Finalize (VOPRF/POPRF include proof verification)
 //!   fulleval   server FullEvaluate / `evaluate`
-//!   client     blind + finalize (a computed row: the sum of the two above)
+//!   client     blind + finalize (a computed row: the sum of the two above).
+//!              For POPRF the card counts this row instead of blind and
+//!              finalize separately, whose split differs between the two.
 //! Both sides double the batch until it takes over 100 ms and keep the best of
 //! five.
 //!
@@ -302,10 +304,15 @@ fn Runner(comptime P: type, comptime mode: Mode) type {
                 const name = try c.arena.print("{s}_{s}", .{ s.tag, wl });
                 const t = go.get(name) orelse return error.MissingRow;
                 const ratio = o.ns / t.ns;
-                stats.add(s.suite, ratio);
+                // POPRF splits the client's work differently: RFC 9497 (and
+                // ours) derives the tweaked key in Blind, CIRCL in Finalize.
+                // Those two rows are shown but not paired one to one; the
+                // card takes their sum, the `client` row, which is.
+                const split_differs = mode == .poprf and (i == 0 or i == 2);
+                if (!split_differs) stats.add(s.suite, ratio);
                 const same = o.count == t.count;
                 if (!same) stats.mismatch = true;
-                try w.print("{s:<22} {d:>12.0} {d:>12.0} {d:>11.2}  {d}{s}\n", .{ name, o.ns, t.ns, ratio, o.count, if (same) "" else " ≠" });
+                try w.print("{s:<22} {d:>12.0} {d:>12.0} {d:>11.2}  {d}{s}{s}\n", .{ name, o.ns, t.ns, ratio, o.count, if (same) "" else " ≠", if (split_differs) "  (split differs, see client)" else "" });
                 if (i == 0 or i == 2) {
                     sum_ours += o.ns;
                     sum_go += t.ns;

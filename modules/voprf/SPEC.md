@@ -9,7 +9,7 @@
 **Audit:** review 2026-07-18 · mutation 2026-10-05 (21/25, 4 eq) · src ?
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, `voprf-verifiable` / `voprf-poprf` at `.scale` 10 = 20,000 runs, VOPRF_FUZZ; `voprf-decode-suites` added 2026-11-13, not yet driven) · ct 2026-11-13 (ctgrind ReleaseFast, 15 targets = 5 suites × server/client/keygen; ristretto255 `server` 5 / `client` 8 / `keygen` 3 in-file unchanged, single verdicts; decaf448 21/19/6 and p256 59/27/12 since the sibling fixes (ed448 `Fe.ctSelect`, p256 `isBasePointRepr`; were 38/34/9 and 61/29/12), what remains is verdicts, the siblings' canonical-range decode verdicts on values that always pass, and on the server the variable-time `mulPublic` on the public composite scalars; p384 30/15/3, p521 26/7/3 the same; the NIST hash-to-curve selects with the siblings' laundered `Fe.cMov` (p256, p521) and its own laundered byte select for p384; itemised in `scripts/checks/ctgrind-expected.tsv`) · input bounds 2026-11-13 (every `input`/`info` > 65535 bytes is `error.InputTooLong`, was an assert) · panic 2026-11-13 (sweep of every pub entry point of all five suites: a batch of 2^16 + 1 elements or more overflowed the u16 composite index in the prover and the verifier, now `ProofGenerationFailed` / `InvalidProof` (`max_batch_length` = 2^16 - 1, RFC 9497 §2.2.1); `expandMessageXmd`'s DST contract is a checked `@panic`; non-canonical / zero secrets, hostile encodings and wiped per-role objects are total on every suite, `sweep_test.zig`) · input bounds 2026-11-13 (every `input`/`info` > 65535 bytes is `error.InputTooLong`, was an assert)
-**Performance:** not measured
+**Performance:** ref 0.18–0.86× CIRCL v1.6.1 `oprf` (stand-in for RFC 9497, whose reference is Sage; 4 suites × OPRF/VOPRF/POPRF, batch 1; POPRF blind and finalize counted as their sum, see § Performance; no decaf448 in CIRCL) · fastest ? (measured 2026-11-14)
 
 **Known defects:** none recorded
 
@@ -306,6 +306,29 @@ input bound" (65536 refused, 65535 accepted, every entry point, two suites).
 - **Serialization frameworks** (facebook/voprf's serde derives) — the wire
   values are the RFC's fixed-width byte strings (`toBytes`/`fromBytes`).
 
+## Performance (2026-11-14)
+
+`zig build bench-voprf` (`tools/bench.zig`, ReleaseFast, against CIRCL v1.6.1
+`oprf` through `tools/go_bench`, Go 1.26; batch 1; best of five after
+doubling the batch past 100 ms). Before timing, per suite × mode: the same
+`DeriveKeyPair` key on both sides, byte-equal FullEvaluate outputs and blinded
+elements (same blind scalar), our server's evaluation and proof finalized by
+CIRCL, CIRCL's finalized by us. Host loaded by other jobs; worst ratio per
+suite over four runs (three on the bench branch, one on main):
+
+| suite | worst ours/CIRCL | best |
+|---|---|---|
+| ristretto255-SHA512 | 0.64–0.73 (one run: oprf fulleval 1.20, not reproduced in three others) | 0.36–0.58 |
+| P256-SHA256 | 0.82–0.86 (one run 1.14 on poprf blindeval, not reproduced) | 0.24–0.40 |
+| P384-SHA384 | 0.63–0.81 | 0.32–0.43 |
+| P521-SHA512 | 0.27–0.44 | 0.12–0.18 |
+
+POPRF splits the client's work differently: RFC 9497 and this module derive
+the tweaked key in `Blind`; CIRCL defers it to `Finalize`. The two rows are
+printed but not paired one to one (ristretto255 `poprf_blind` alone is
+1.11–1.23×); the card counts their sum, the `client` row (0.58–0.65×), which
+does the same work on both sides.
+
 ## Backlog / deferred
 
 - **Shared hash-to-curve module.** `h2c.zig` (expand_message_xmd/xof, the
@@ -322,10 +345,11 @@ input bound" (65536 refused, 65535 accepted, every entry point, two suites).
   compiled to a jump on the bit at ReleaseFast, and p256/p521 now launder
   theirs (`blackBox`). Until p384 does, `h2c.zig`'s `sel` keeps a laundered
   byte select for p384 (`own_select`); then drop it.
-- **Performance of the NIST suites** — not measured (no bench); `powC1` in
-  `sqrt_ratio` is a plain square-and-multiply (an addition chain would cut
-  it), and the composite sums use one `mulPublic` per term instead of a
-  multi-scalar multiply.
+- **Performance leftovers** (bench 2026-11-14, every counted row ≤ 0.86× CIRCL):
+  `powC1` in `sqrt_ratio` is a plain square-and-multiply (an addition chain
+  would cut it), and the composite sums use one `mulPublic` per term instead
+  of a multi-scalar multiply. "fastest" is unmeasured: facebook/voprf (Rust)
+  would be the second implementation.
 
 ## Anchoring
 
