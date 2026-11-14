@@ -120,9 +120,24 @@ echo "::group::yaml conformance suite"
 # (--depth 1, one branch) and failure is a reported gap rather than a red lane,
 # but if this ever becomes flaky the honest fix is to cache the checkout, not to
 # retry it.
-git clone -q -b data --depth 1 https://github.com/yaml/yaml-test-suite \
-    "$HOME/.cache/zig-libs-yaml/yaml-test-suite-data" 2>/dev/null \
-    && echo "yaml-test-suite: OK" || echo "yaml-test-suite: clone failed or already present"
+#
+# ⭐ LIVE, BUT KEYED (CI audit A8, 2026-11-14). Not pinned: the suite is a live
+# oracle on purpose (modules/yaml/src/suite_test.zig) and its ledger turns any
+# upstream change red. But a stamp only re-runs `test-yaml` when yaml's key
+# moves, and the corpus was in no key -- so an upstream change waited for an
+# unrelated yaml edit. The checkout now lives at a path named by its commit and
+# ZIG_LIBS_YAML_SUITE points there; the variable's VALUE is in yaml's key.
+YAML_SUITE_TMP="$HOME/.cache/zig-libs-yaml/yaml-test-suite-data"
+if git clone -q -b data --depth 1 https://github.com/yaml/yaml-test-suite "$YAML_SUITE_TMP" 2>/dev/null \
+    || [[ -d "$YAML_SUITE_TMP/.git" ]]; then
+    yaml_rev="$(git -C "$YAML_SUITE_TMP" rev-parse HEAD 2>/dev/null)"
+    yaml_dir="$HOME/.cache/zig-libs-yaml/suite-${yaml_rev:0:12}"
+    [[ -e "$yaml_dir" ]] || ln -s "$YAML_SUITE_TMP" "$yaml_dir"
+    [[ -n "${GITHUB_ENV:-}" ]] && echo "ZIG_LIBS_YAML_SUITE=$yaml_dir" >> "$GITHUB_ENV"
+    echo "yaml-test-suite: OK, data@${yaml_rev:0:12}"
+else
+    echo "yaml-test-suite: clone failed"
+fi
 echo "::endgroup::"
 
 echo "::group::open62541 container"
@@ -167,7 +182,9 @@ python3 -c 'import websockets; print("websockets:", websockets.__version__)' 2>/
 # ⚠ BOTH ARE REACHED BY A TEST, which is why they are in this role and grpc's
 # venv is not: `opcua`'s asyncua client and `imap`'s pymap server are still
 # spawned from inside those modules' own test binaries.
-for spec in "opcua:asyncua cryptography" "imap:pymap"; do
+# Pinned (CI audit A8, 2026-11-14: the versions CI installed that day) -- an
+# oracle that moves with no commit here moves the anchors it judges.
+for spec in "opcua:asyncua==2.1.0 cryptography==50.0.2" "imap:pymap==0.36.7"; do
     name="${spec%%:*}"
     pkgs="${spec#*:}"
     python3 -m venv "$HOME/.cache/zig-libs-$name" >/dev/null 2>&1 || true
@@ -222,12 +239,13 @@ echo "::group::interop: python oracles"
 # reasons, so this is pinned and bumped deliberately. `test.sh`'s capability
 # report compares the installed version against the golden's own header.
 sudo pip3 install --break-system-packages -q --root-user-action=ignore \
-    "jinja2==3.1.6" sympy brotli protobuf >/dev/null 2>&1 || true
+    "jinja2==3.1.6" "sympy==1.14.0" "brotli==1.2.1" "protobuf==7.36.2" >/dev/null 2>&1 || true
 python3 - <<'PY' || true
 for mod, label in (("jinja2", "jinja2"), ("sympy", "sympy"),
                    ("brotli", "brotli"), ("google.protobuf", "protobuf")):
     try:
-        m = __import__(mod)
+        import importlib
+        m = importlib.import_module(mod)
         print(f"{label}: {getattr(m, '__version__', 'present')}")
     except ImportError:
         print(f"{label}: MISSING")
@@ -239,7 +257,7 @@ PY
 # had grpcio and no `google.protobuf`, and the oracle script died on an import.
 # List everything a venv's own scripts import; nothing outside it will help.
 python3 -m venv "$HOME/.cache/zig-libs-grpc" >/dev/null 2>&1 || true
-"$HOME/.cache/zig-libs-grpc/bin/pip" -q install grpcio protobuf >/dev/null 2>&1 \
+"$HOME/.cache/zig-libs-grpc/bin/pip" -q install "grpcio==1.85.1" "protobuf==7.36.2" >/dev/null 2>&1 \
     && echo "grpc venv: OK" || echo "grpc venv: install failed"
 # `interop-opcua` drives an asyncua peer; `scripts/test.sh interop` hands it
 # OPCUA_PYTHON, the same venv the `tests` role builds for the module's live
@@ -248,7 +266,7 @@ python3 -m venv "$HOME/.cache/zig-libs-grpc" >/dev/null 2>&1 || true
 # package, and the failed transaction took jinja2/sympy/brotli/protobuf down
 # with it (2026-09-18, the lane's first real run: sympy went MISSING).
 python3 -m venv "$HOME/.cache/zig-libs-opcua" >/dev/null 2>&1 || true
-"$HOME/.cache/zig-libs-opcua/bin/pip" -q install asyncua cryptography >/dev/null 2>&1 \
+"$HOME/.cache/zig-libs-opcua/bin/pip" -q install "asyncua==2.1.0" "cryptography==50.0.2" >/dev/null 2>&1 \
     && echo "opcua venv: OK" || echo "opcua venv: install failed"
 echo "::endgroup::"
 

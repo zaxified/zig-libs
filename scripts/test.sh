@@ -2306,7 +2306,10 @@ cmd_interop() {
     compile_mods="$(lane_modules)"
     compile_todo="$(stamps_pending "$compile_mods" "$compile_lane")"
     local take_lane take_todo
-    take_lane="interop week=$(date -u +%GW%V) $(uname -m)"
+    # The peers' pins live in ci-environment.sh (CI audit A8, 2026-11-14): a
+    # bumped pin is a moved oracle, so its digest is in the key too -- before,
+    # a bump waited up to a week to be judged against.
+    take_lane="interop week=$(date -u +%GW%V) peers=$(sha256sum scripts/lib/ci-environment.sh | cut -c1-12) $(uname -m)"
     if [[ "${ZIGLIBS_STRICT_STAMPS:-0}" == 1 ]]; then
         take_todo="${progs[*]}"
     else
