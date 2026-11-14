@@ -564,16 +564,23 @@ jobs:
         with:
           path: ${{ github.workspace }}/.zig-cache
           key: ${{ steps.zcache.outputs.cache-primary-key }}
-      # Only a green run gets here, and only a push, tag or dispatch shares
-      # what it proved; a pull request's stamps would be discarded by the
-      # fetch anyway, so it does not upload them.
+      # A red or timed-out run gets here too (2026-11-14): `test.sh build`
+      # stamps each batch only once it is green, so the file holds nothing
+      # unproven, and keeping it is what lets the next push resume where a
+      # cold run over the step's timeout stopped (run 43522895856 was red on
+      # both attempts because nothing it compiled was kept). Only a push, tag
+      # or dispatch shares what it proved; a pull request's stamps would be
+      # discarded by the fetch anyway, so it does not upload them.
       - name: Keep this lane's stamps
-        if: success() && github.event_name != 'pull_request'
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-scoped-${{ matrix.shard }}-${{ runner.arch }}
           path: ${{ runner.temp }}/stamps/stamps.tsv
           if-no-files-found: ignore
+          # A red attempt now uploads too; its re-run must replace it, not
+          # fail on the name.
+          overwrite: true
 
   # ⭐ THE LANE TABLE LIVES IN A JOB NOW, not in `strategy.matrix.include`, and
   # `workflow_dispatch`'s `lane` input is why. A job-level `if:` cannot see the

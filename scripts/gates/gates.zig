@@ -304,7 +304,39 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
         for (by_name) |j| if (seen[j] and j != i) h.update(&iface[j]);
         var digest: [32]u8 = undefined;
         h.final(&digest);
-        try w.print("{s}\t{s}\n", .{ m.name, std.fmt.bytesToHex(digest[0..16], .lower) });
+
+        // ⭐ THIRD COLUMN: the BUILD key (2026-11-14) -- the same, but the
+        // closure follows `deps` only, never `test_deps`. The push lane
+        // (`test.sh build`) keys its stamps on it: a change to a module every
+        // test imports (testkit: `arbitrary.zig`, push CI 43515148020) re-keyed
+        // every module's full fingerprint and the push lane recompiled the
+        // whole collection, ~100 modules cold per shard, over its timeout. A
+        // test helper's fallout on its importers' tests is the tag lanes' job
+        // (owner 2026-10-10: the push lane is a quick consistency check); the
+        // helper itself is still compiled, because its OWN hash changed.
+        @memset(seen, false);
+        seen[i] = true;
+        sp = 0;
+        stack[sp] = i;
+        sp += 1;
+        while (sp > 0) {
+            sp -= 1;
+            for (module_list[stack[sp]].deps) |d| {
+                const j = moduleIndex(d).?; // checked by the walk above
+                if (!seen[j]) {
+                    seen[j] = true;
+                    stack[sp] = j;
+                    sp += 1;
+                }
+            }
+        }
+        var hb = Sha256.init(.{});
+        hb.update(&machinery.peek());
+        hb.update(&own[i]);
+        for (by_name) |j| if (seen[j] and j != i) hb.update(&iface[j]);
+        var build_digest: [32]u8 = undefined;
+        hb.final(&build_digest);
+        try w.print("{s}\t{s}\t{s}\n", .{ m.name, std.fmt.bytesToHex(digest[0..16], .lower), std.fmt.bytesToHex(build_digest[0..16], .lower) });
     }
 
     var buf: [4096]u8 = undefined;

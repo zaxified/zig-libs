@@ -324,7 +324,9 @@ fp_load() {
         echo "$FP_TSV" >&2
         exit 1
     fi
-    if ! awk -F'\t' 'NF != 2 { exit 1 } END { exit NR == 0 }' <<< "$FP_TSV"; then
+    # name, fingerprint, build key (see printModuleFingerprints). Everything
+    # but `cmd_build` reads column 2.
+    if ! awk -F'\t' 'NF != 3 { exit 1 } END { exit NR == 0 }' <<< "$FP_TSV"; then
         echo "test.sh: module-fingerprints produced nothing usable -- refusing to pass vacuously" >&2
         exit 1
     fi
@@ -2438,8 +2440,14 @@ cmd_build() {
     graph_load
     local lane_mods todo lane
     lane_mods="$(split_modules "$(lane_modules)")"
-    lane="$(stamps_lane_key build)"
+    # The BUILD key, not the fingerprint (2026-11-14): its closure follows
+    # `deps` only, so an edit to testkit -- a test_dep of nearly every module --
+    # no longer re-keys the whole collection in this lane (push CI
+    # 43515148020/43522895856: ~100 modules cold per shard, red twice). Its
+    # own lane name keeps these stamps apart from the full-fingerprint ones.
+    lane="$(stamps_lane_key build-deps)"
     fp_load   # here, in THIS shell: see stamps_record
+    FP_TSV="$(awk -F'\t' -v OFS='\t' '{ print $1, $3, $3 }' <<< "$FP_TSV")"
     todo="$(stamps_pending "$lane_mods" "$lane")"
     local n
     n=$(wc -w <<< "$todo")
@@ -2449,9 +2457,23 @@ cmd_build() {
         summary
         return 0
     fi
-    stamps_narrow "$todo" "$(lane_modules)"  # the WHOLE lane: a split half must still narrow
-    step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
-    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
+    # ⭐ IN BATCHES, each stamped as soon as it is green (2026-11-14). One
+    # `zig build` over every pending module was all-or-nothing: a cold shard
+    # over the CI step's timeout kept no stamp, and the next push started just
+    # as cold -- red for good (run 43522895856, both attempts). A batch costs a
+    # few seconds of configure; what a timed-out run did compile is kept.
+    local batch_size="${ZIGLIBS_BUILD_BATCH:-8}" batch="" k=0 m
+    for m in $todo; do
+        batch="$batch $m"
+        k=$((k + 1))
+        if (( k % batch_size == 0 )) || (( k == n )); then
+            stamps_narrow "${batch# }" "$(lane_modules)"  # the WHOLE lane: a split half must still narrow
+            step "build ($k of $n modules)" zig build "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
+            step "check-examples ($k of $n)" zig build check-examples "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
+            stamps_record "${batch# }" "$lane"
+            batch=""
+        fi
+    done
     # This lane runs no test, so there is no `--summary all` to digest and
     # nothing would land on the run's page. A lane that contributes NOTHING
     # there reads as one that failed to report, not as one with nothing to
@@ -2461,9 +2483,8 @@ cmd_build() {
         printf '### %s\n\n```\n  %-16s %d modules + %d examples compiled, 0 tests run (see cmd_build)\n```\n\n' \
             "${ZIGLIBS_LANE:-gate}" "compile only:" "$n" "$n" >> "$GITHUB_STEP_SUMMARY"
     fi
-    # The stamp below is keyed to the `build` lane, so it claims a compile and
-    # nothing more -- no test lane can mistake it for a run.
-    stamps_record "$todo" "$lane"
+    # The stamps above are keyed to the `build-deps` lane, so they claim a
+    # compile and nothing more -- no test lane can mistake them for a run.
     summary
 }
 
