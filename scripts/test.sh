@@ -403,6 +403,10 @@ stamps_record() {
     # good (audit 2026-09-18); never stamping them made every local run pay
     # for ssh, imap, opcua and tc.
     local _skip=" ${ZIGLIBS_SKIP_LIVE:-} " _vol=" $(live_modules) $_CAP_GAP_MODS " _m _kept="" _held="" _volset=" "
+    # A COMPILE lane talks to no peer and skips no test, so nothing about it is
+    # volatile (CI audit 2026-11-14: ssh recompiled daily in the push and
+    # check-interop lanes for nothing).
+    case "$lane" in build-deps* | check-interop*) _vol=" " ;; esac
     for _m in $mods; do
         case "$_skip" in *" $_m "*) _held="$_held $_m"; continue ;; esac
         _kept="$_kept $_m"
