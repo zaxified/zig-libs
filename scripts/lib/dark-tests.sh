@@ -68,11 +68,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # COST, AND WHY THE GATE DOES NOT CALL THE DEFAULT MODE
 #
-# Zig does NOT cache test *run* steps. Measured on this repo: the same
-# `zig build test-bech32 test-decimal … --summary all` takes 13.3 s twice in a
-# row, with `compile test … cached` and the run steps re-executing every time.
-# So "run every module's suite again to count its tests" costs a second full
-# test run — it would roughly double `scripts/test.sh all`.
+# A second run of every module's suite just to count its tests would cost a full
+# extra test run. (Zig 0.16 never cached test *run* steps -- measured 13.3 s twice
+# in a row. Zig 0.17 DOES: a repeat prints `run test <m> cached`, and an
+# environment change does not invalidate it, 2026-11-14; `scripts/test.sh`
+# therefore passes `-Dfresh-run` to every test and example run.)
 #
 # The summary the gate needs is already printed by the gate's own run, so
 # `scripts/test.sh` passes `--summary all`, keeps that output, and hands it here

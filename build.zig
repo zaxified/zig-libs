@@ -1058,6 +1058,10 @@ pub fn build(b: *std.Build) void {
             // grows a hand-kept list of which ones are safe -- a declaration
             // that would drift the way `.example` did.
             const run_example = b.addRunArtifact(example);
+            // Same cache hole as the module tests (`-Dfresh-run` above): an
+            // example run step is cached on binary + args, not on the
+            // environment it ran in.
+            run_example.has_side_effects = fresh_run;
             b.step(b.fmt("run-example-{s}", .{m.name}), b.fmt("Build AND run the {s} example", .{m.name})).dependOn(&run_example.step);
             if (in_group) run_examples.dependOn(&run_example.step);
         }

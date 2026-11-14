@@ -554,7 +554,7 @@ run_examples_for() {
     done
     [[ ${#run_targets[@]} -eq 0 ]] && return 0
     ZL_STEP_STDERR_IS_OUTPUT=1 step "run-examples (${#run_targets[@]} modules)" \
-        zig build "${run_targets[@]}" "${EXTRA_ZIG_ARGS[@]}"
+        zig build "${run_targets[@]}" -Dfresh-run "${EXTRA_ZIG_ARGS[@]}"
 }
 
 ZL_RUN_EXAMPLES=1
@@ -682,7 +682,7 @@ run_modules() {
     if [[ ${#rest[@]} -gt 0 ]]; then
         local -a targets=()
         for m in "${rest[@]}"; do targets+=("test-$m"); done
-        step "build+test (${#rest[@]} modules)" zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+        step "build+test (${#rest[@]} modules)" zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" -Dfresh-run "${EXTRA_ZIG_ARGS[@]}"
     fi
 
     # Loopback modules in their own namespace, as the calling user, with
@@ -692,7 +692,7 @@ run_modules() {
         local -a targets=()
         for m in "${loopback[@]}"; do targets+=("test-$m"); done
         if netns_run_prefix; then
-            step "loopback build+test (${#loopback[@]} modules${NETNS_RUN[*]:+, netns-run})" "${NETNS_RUN[@]}" zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+            step "loopback build+test (${#loopback[@]} modules${NETNS_RUN[*]:+, netns-run})" "${NETNS_RUN[@]}" zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" -Dfresh-run "${EXTRA_ZIG_ARGS[@]}"
         else
             step "loopback build+test (${#loopback[@]} modules): netns-run unavailable on CI" "$NETNS_RUN_BIN" --probe
         fi
@@ -702,10 +702,10 @@ run_modules() {
         local -a targets=()
         for m in "${netns[@]}"; do targets+=("test-$m"); done
         if have_unshare; then
-            step "netns build+test (${#netns[@]} modules, unshare -rn)" unshare -rn zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+            step "netns build+test (${#netns[@]} modules, unshare -rn)" unshare -rn zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" -Dfresh-run "${EXTRA_ZIG_ARGS[@]}"
         else
             echo "note: unshare -rn unavailable — running netns-gated modules plainly; their privileged tests will SKIP" >&2
-            step "netns build+test (${#netns[@]} modules, NO unshare)" zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+            step "netns build+test (${#netns[@]} modules, NO unshare)" zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" -Dfresh-run "${EXTRA_ZIG_ARGS[@]}"
         fi
     fi
 
@@ -745,7 +745,7 @@ run_modules() {
                     continue
                     ;;
             esac
-            step "live interop: $m" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+            step "live interop: $m" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" -Dfresh-run "${EXTRA_ZIG_ARGS[@]}"
         done
     fi
 
@@ -761,22 +761,22 @@ run_modules() {
             case " $NETNS_MODULES " in
                 *" $m "*)
                     if have_unshare; then
-                        step "timing (serial, unshare -rn): $m" unshare -rn zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+                        step "timing (serial, unshare -rn): $m" unshare -rn zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" -Dfresh-run "${EXTRA_ZIG_ARGS[@]}"
                     else
-                        step "timing (serial, NO unshare): $m" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+                        step "timing (serial, NO unshare): $m" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" -Dfresh-run "${EXTRA_ZIG_ARGS[@]}"
                     fi
                     ;;
                 *)
                     case " $LOOPBACK_MODULES " in
                         *" $m "*)
                             if netns_run_prefix; then
-                                step "timing (serial${NETNS_RUN[*]:+, netns-run}): $m" "${NETNS_RUN[@]}" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+                                step "timing (serial${NETNS_RUN[*]:+, netns-run}): $m" "${NETNS_RUN[@]}" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" -Dfresh-run "${EXTRA_ZIG_ARGS[@]}"
                             else
                                 step "timing (serial): $m: netns-run unavailable on CI" "$NETNS_RUN_BIN" --probe
                             fi
                             ;;
                         *)
-                            step "timing (serial): $m" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+                            step "timing (serial): $m" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" -Dfresh-run "${EXTRA_ZIG_ARGS[@]}"
                             ;;
                     esac
                     ;;
@@ -2378,7 +2378,17 @@ cmd_modules() {
     fi
     stamps_narrow "$todo" "$(lane_modules)"  # the WHOLE lane: a split half must still narrow
     CAP_MODS="$todo" capability_check
-    step "check-pubfn-reach" zig build check-pubfn-reach ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
+    # `check-pubfn-reach` takes only the selecting args (SEL_ARGS), never the
+    # lane's -Doptimize: it is a per-ARCH check, so a ReleaseFast lane would
+    # repeat the ReleaseSafe lane's run on the same arch word for word (CI audit
+    # 2026-11-14: 198 s on RelFast [rest], same verdicts).
+    local _a _fast=0
+    for _a in "${EXTRA_ZIG_ARGS[@]}"; do [[ "$_a" == "-Doptimize=ReleaseFast" ]] && _fast=1; done
+    if (( _fast )); then
+        echo "modules: check-pubfn-reach skipped -- per-arch, the ReleaseSafe lane of this arch runs it"
+    else
+        step "check-pubfn-reach" zig build check-pubfn-reach ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
+    fi
     step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
     _ZL_PARTIAL_MODS="$todo" _ZL_PARTIAL_LANE="$lane" _ZL_ON_FAIL=stamps_partial
     ZL_RUN_EXAMPLES=0 run_modules "$todo"
