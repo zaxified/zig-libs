@@ -1658,9 +1658,8 @@ jobs:
       # ⭐ E1 THROUGH A LIVE ORACLE MUST BE FRESH (owner 2026-11-14, plan v3 D1): a
       # class A/B card at E1 claims a green take against the foreign peer within
       # 30 days; the interop lane's stamps say when each one last passed.
-      # ADVISORY until the owner has seen a dry run's list (2026-11-14: 52 of 52
-      # fresh); then drop `--advisory`.
-      - name: E1 live-oracle takes within 30 days (advisory)
+      # BLOCKING since 2026-11-15 (owner, after the dry run: 52 of 52 fresh).
+      - name: E1 live-oracle takes within 30 days
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -1668,7 +1667,7 @@ jobs:
           bash scripts/lib/ci-stamps.sh fetch stamps-full-interop-X64 "$RUNNER_TEMP/interop-stamps.tsv"
           zig build maturity-report > "$RUNNER_TEMP/maturity.tsv"
           python3 -I scripts/checks/check-e1-takes.py --stamps "$RUNNER_TEMP/interop-stamps.tsv" \
-            --report "$RUNNER_TEMP/maturity.tsv" --advisory
+            --report "$RUNNER_TEMP/maturity.tsv"
       - name: Tag the tested commit locally, print the notes
         id: prepare
         run: bash scripts/lib/auto-release.sh prepare "$GITHUB_SHA" "$RUNNER_TEMP/release"

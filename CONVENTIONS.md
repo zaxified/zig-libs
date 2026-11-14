@@ -1148,6 +1148,10 @@ that reaches it can notice.
      cycles where the CPU counts them): timed one after the other on a shared machine they
      see different loads, measured at ±10 % (zstd, 2026-10-09). The grade's 10 % tolerance
      for P2 (`p2_ref_tolerance` in `scripts/gates/gates.zig`) assumes this method.
+     A bench drives that method through `benchkit` (`drive`, `timeIt`, `foreign`). 24 older
+     benches still carry their own timing loop: each moves onto `benchkit` the next time it is
+     edited for another reason, not in a wave of its own (owner, 2026-11-15 -- the method is
+     the same; a wave would re-measure 24 modules against foreign toolchains for upkeep only).
 
   All three go to `modules/<name>/tools/`, each with a header saying what it needs and what it
   produces. Mutation runners, probes for one finding, benchmarks of a fixed regression and
