@@ -494,6 +494,9 @@ measured run.
 
 ## Backlog / deferred
 
+- **`HandshakeResult` has no wipe helper (sweep 2026-11-14, LOW, additive).** It holds `sk`/`rk`/`ck` in the
+  caller's memory; `Transport.init` copies them, after which the result is dead but only a manual
+  `secureZero` clears it. A `HandshakeResult.deinit` would be additive; left out as an API decision.
 - **Dead-stack copies — MEASURED AND FIXED 2026-10-08 (handshake HIGH, transport MEDIUM).**
   `src/stackprobe_test.zig` (ReleaseFast; needles: both static and both ephemeral keys, `es`/`ee`/
   `se` and their shared-point x, `ck` and the cipher key after each act, `sk`/`rk`; every step on
