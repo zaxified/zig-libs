@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const rsa = @import("rsa");
 const kex = @import("kex.zig");
 const certverify = @import("certverify.zig");
 const kat = @import("certverify_kat_vectors.zig");
@@ -295,4 +296,26 @@ test "sign ecdsa_secp384r1_sha384: hedged noise changes the signature, and it ve
     try certverify.verify(.ecdsa_secp384r1_sha384, pk, .server, th, det);
     try certverify.verify(.ecdsa_secp384r1_sha384, pk, .server, th, h1);
     try certverify.verify(.ecdsa_secp384r1_sha384, pk, .server, th, h2);
+}
+
+// 2026-11-14 delta mutation audit (certverify `signRsaPss` EntropyFailure arm).
+
+const ZeroRandom = struct {
+    fn fill(_: *ZeroRandom, buf: []u8) void {
+        @memset(buf, 0);
+    }
+    fn random(self: *ZeroRandom) std.Random {
+        return std.Random.init(self, fill);
+    }
+};
+
+test "sign: an all-zero `random` (rsa's bounded blinding draw gives up) is error.EntropyFailure on every RSA-PSS scheme" {
+    var rsa_sk: rsa.SecretKey = undefined;
+    try kat.rsa_pss_sha256_server.secretKey(&rsa_sk);
+    const sk = certverify.SecretKey{ .rsa = &rsa_sk };
+    var out: [rsa.max_modulus_len]u8 = undefined;
+    var z = ZeroRandom{};
+    for ([_]certverify.SignatureScheme{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 }) |scheme| {
+        try testing.expectError(error.EntropyFailure, certverify.sign(scheme, sk, .server, &kat.rsa_pss_sha256_server.transcript_hash, z.random(), &out));
+    }
 }
