@@ -13,6 +13,7 @@
 **Performance:** ref 0.28–0.58× aidlx/tsink 0.10.2 with `WalSyncMode::PerAppend` (`zig build bench-tsdb`: 1000 series × 200 scrapes one commit each, 200k-sample bulk, range and matcher reads; both durable on disk; owner's like-for-like choice) · fastest ? (measured 2026-10-20)
 
 **Evidence:** model-fuzz — random appends/compactions/windows compared to a map model; key-order property; codec fuzz
+**Model:** src/root.zig:model check
 
 **Known defects:** none recorded
 

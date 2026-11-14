@@ -12,6 +12,7 @@
 **Performance:** not measured
 
 **Evidence:** model-fuzz — heap vs sorted reference over random deadlines; randomized PROPERTY tests (FIFO, backoff, no starvation)
+**Model:** src/props.zig:brute-force model · src/queue.zig:sorted reference
 
 **Known defects:** none recorded
 

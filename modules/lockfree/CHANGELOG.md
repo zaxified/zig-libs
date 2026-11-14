@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-10-30** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GU). EBR misuse that was an assert (UB in ReleaseFast: a re-pin at a newer epoch, a stuck pin after `unregister`) is a checked panic with an `ebr.msg_*` message in every mode: `enterCritical` on a pinned participant, `exitCritical`/`repin`/`retire` on an unpinned one, `unregister` while pinned or twice — checked through a plain owner-private `pinned` flag (no extra atomic). `mpmc.Queue` enqueue/dequeue use `enterCriticalNested`, so a caller already pinned on the same participant works. Double `NodePool.release`, an oversized `TaggedPtr` tag, `stealBatch*` with limit 0 or into itself: checked panics; `BoundedQueue.advance` with nothing published is a no-op (ReleaseFast spun every producer). `harness` sizes with `std.math.mul` (`error.StressTooLarge`) and joins started threads on a spawn error. Tests: `src/sweep_test.zig`.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 

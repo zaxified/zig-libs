@@ -12,6 +12,7 @@
 **Performance:** not measured
 
 **Evidence:** model — byte-exact comparison with raw Noise_IK as oracle; fuzz is never-panic only
+**Model:** src/root.zig:noise as oracle
 
 **Known defects:** none recorded
 

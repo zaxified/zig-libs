@@ -15,6 +15,7 @@
 **Performance:** n/a — no drop-in reference exists (SQLite pcache / PostgreSQL buffer-pool pattern); SQLite's pcache1 is internal, not callable on its own (2026-10-10)
 
 **Evidence:** model-fuzz — 300 seeded random Storage-op sequences (open/read/write/truncate/close/rename/delete, borrows, torn writes) compared step by step against a naive per-file byte-array model
+**Model:** src/root.zig:MfModel
 
 **Known defects:** none recorded
 

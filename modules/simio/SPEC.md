@@ -13,6 +13,7 @@
 **Performance:** not measured
 
 **Evidence:** model — differential oracle: same std.Io program on Threaded vs simio (fixed programs, not generated)
+**Model:** src/oracle_tests.zig:differential oracle
 
 **Known defects:** none recorded
 

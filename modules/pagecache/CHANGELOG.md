@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** passes `max_pinned_bytes = maxInt(usize)` to its ramcache, keeping the documented borrowed-pages-over-the-cap behaviour (sweep PC-3) under ramcache's new borrow cap (§ GQ).
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 3 mutants over `dropSpan` (empty-span return dropped, span cut to its first page, always the whole-file sweep): 3/3 killed on the first run. Card A1 again.
 - **2026-10-29** — **Fix (no-panic sweep):** a sub-page or unaligned write drops only the cached pages its span touches; it dropped every page of the file, a scan of the whole resident map per small write (blind review R-pagecache-1). The `init` option contracts (`page_size`/`max_pages` 0, their product overflowing) and borrow-release rules are documented.

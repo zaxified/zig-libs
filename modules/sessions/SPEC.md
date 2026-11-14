@@ -17,6 +17,7 @@ Audit detail: the 2026-11-01 review is a delta over `src/root.zig` (the fuzz-dri
 **Performance:** ref 0.04–0.15× alexedwards/scs v2.9.0 + memstore · fastest 0.15× scs (row `new_session`; gofiber/fiber v3.6.1 `middleware/session` + its memory storage measured beside it, faster than scs only on `load_read`, 0.05× there; net of each side's HTTP stack; `tools/go_fast_bench`) (measured 2026-10-24)
 
 **Evidence:** model-fuzz — random create/lookup/persist/regenerate/delete/restart sequences over RamcacheStore and KvStore compared to a naive id → {generation, record} model (CAS with refresh-only touch, strict timeouts, delete = key removal); CSRF hand-written
+**Model:** src/root.zig:SessionModel
 
 **Known defects:** none recorded
 

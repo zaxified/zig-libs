@@ -13,6 +13,7 @@
 **Performance:** not measured
 
 **Evidence:** model-fuzz — Dijkstra/ECT compared to brute-force path enumeration on random small graphs, plus order properties
+**Model:** src/root.zig:enumerateSimplePaths
 
 **Known defects:** none recorded
 

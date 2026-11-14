@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-10-06** — ADDED: merge-sorted scan across all shards — `Store.scan(ScanOptions)` →
   `Scan` (`next`/`deinit`), with `Bound` (unbounded / inclusive / exclusive) start and end,
   `limit` and `ScanDirection` (forward / reverse); new public `KV`, `Bound`, `ScanOptions`,

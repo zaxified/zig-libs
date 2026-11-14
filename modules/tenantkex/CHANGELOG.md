@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-10-18** — Ported to Zig 0.17.0. `X25519.KeyPair.generateDeterministic` no longer returns an error union (`try`/`catch unreachable` dropped). `example/main.zig` wraps `generateDeterministic` in `@as(anyerror!…)` for the now-infallible X25519 call.
 - **2026-10-10** — tests: deterministic fuzz driver `TENANTKEX_FUZZ` (`src/fuzz_test.zig`): `tenantkex-handshake` — a whole Noise_IK exchange with knob-chosen keys, context and payloads agrees on payloads, crossed session keys and transcript hash; one flipped bit in message 1 or 2, a wrong fabric context, an unexpected initiator static (`UnknownInitiator`), damaged copies and out-of-order calls are refused, and a refused message 1 cannot be answered. ReleaseSafe, clean.
 - **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (target `ik`, ReleaseFast): a full per-tenant Noise_IK exchange with both PEs' static private keys and every ephemeral seed tainted. 9 in-file contexts, none a branch of this module's on a key: std's X25519 identity-point check, the AEAD tag-verify outcome and the verdict on the constant-time compare of the decrypted initiator static. No code change.

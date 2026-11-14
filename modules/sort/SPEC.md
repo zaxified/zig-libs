@@ -17,6 +17,7 @@ Purpose, API and use: [README.md](README.md).
 **Performance:** ref 0.55–1.05× Rust std 1.93.1 · fastest 1.80× C++ libstdc++ 15 std::stable_sort (s_u64_saw: ascending runs of 1 000; also u_u64_tail 1.53× std::sort and sel_u64_asc 1.43× std::nth_element — nearly sorted input, where Rust is as slow; every other row ≤ 1.05× the faster of Rust std and libstdc++; JCC-mitigated builds on all sides, `tools/README.md`) (measured 2026-10-25)
 
 **Evidence:** model-fuzz — `std.sort.block` (independent stable merge sort) as the model: key for key for `unstable`, byte for byte for `stable`, the k-th key and both sides for `selectNth`; inputs and scratch against guard pages; lying comparators checked for a permutation
+**Model:** src/test_sort.zig:checkAgainstModel · std:std.sort.block
 
 **Known defects:** none recorded
 

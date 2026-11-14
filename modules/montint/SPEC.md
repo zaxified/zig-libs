@@ -15,6 +15,7 @@ Audit detail: whole-src mutation run (schemata, 179 mutants over montint, limbs,
 **Performance:** ref 0.91–1.02× OpenSSL 3.5.5 BN (Montgomery mul, constant-time and public-exponent modexp, 1024–4096 bit) · fastest ? (measured 2026-10-20)
 
 **Evidence:** model-fuzz — CPython bignum KATs plus asm core vs portable oracle on random (a,b,N) differential
+**Model:** src/kat_test.zig
 
 **Known defects:** none recorded
 

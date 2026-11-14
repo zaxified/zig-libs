@@ -15,6 +15,7 @@
 **Performance:** ref 0.09–0.15× go-chi/chi v5.3.2 RequestID · fastest 0.39× tower-http 0.7.1 `SetRequestId` + `PropagateRequestId` (row `adopt`, net of each side's HTTP stack; `generate` 0.25×; `tools/rust_fast_bench`) (measured 2026-10-24)
 
 **Evidence:** model-fuzz — seeded random options/headers/lengths through the middleware compared with a naive adopt-or-generate model, plus random bytes against a charset-string model of `isAdoptable`
+**Model:** src/root.zig:modelAdoptable · src/root.zig:modelIsGenerated
 
 **Known defects:** none recorded
 

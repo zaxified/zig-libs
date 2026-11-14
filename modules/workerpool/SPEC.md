@@ -15,6 +15,7 @@
 **Performance:** ref 0.05–0.14× Pithikos/C-Thread-Pool 2b56942a · fastest 0.67× panjf2000/ants v2.12.0 (pingpong; rayon-core 1.13.0 ≤ 0.54× on the other rows) (measured 2026-10-25)
 
 **Evidence:** model-fuzz — `src/model_fuzz_test.zig`: a drawn pool (1..4 workers, bounded or not, spin or not) runs a drawn op sequence (gated and open jobs, pause/resume, wait, two-thread bursts, drain, shutdownNow with a waiter across it) on real threads; after each op the pool must settle into the one state a sequential FIFO model predicts (queued/working/completed/submitted counts, per job started/finished exactly once); alone it kills 78 of the audit's 123 mutants, the rest (spawn/allocator failure, Submitter limits, sub-instruction windows) are the seam and unit tests
+**Model:** src/model_fuzz_test.zig:Model
 
 **Known defects:** none recorded
 

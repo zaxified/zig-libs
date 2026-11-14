@@ -15,6 +15,7 @@
 **Performance:** ref 0.25–0.56× BurntSushi/fst 0.4.7 · fastest 1.15× darts-clone 0.32h (lookup_miss; lookup_hit 1.02×, prefix_iter 1.02× marisa-trie 0.3.1, every other row ≤ 1.00× the fastest of fst, darts-clone and marisa-trie; format version 3, lean lookup) (measured 2026-10-24)
 
 **Evidence:** model-fuzz — real trie vs naive oracle over random key sets, positive control, loader fuzz
+**Model:** src/root.zig:Oracle
 
 **Known defects:** none recorded
 

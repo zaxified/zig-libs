@@ -17,6 +17,7 @@ Audit detail: Mutation delta 2026-11-07 (commits `e042ea5b`, `8012bc70`, `eb5a7d
 **Performance:** ref 0.007–0.04× Babel 2.17.0 `parse_decimal(strict)` (python 3.14; `zig build bench-numparse`, six workloads of 1000 lines incl. refusals and native digits) · fastest 0.109× ICU4C 78.2 DecimalFormat::parse (worst workload ar_EG_native; the others 0.065–0.084) (measured 2026-10-23)
 
 **Evidence:** model-fuzz — Babel parse_decimal frozen differential + 20k random strings vs legacy parseGroupedNumber
+**Model:** src/root.zig:differential against Babel · tools/babel-oracle.py
 
 **Known defects:** none recorded
 

@@ -17,6 +17,7 @@ Audit detail: the 2026-11-01 delta (from b20df27a) covers `fuzz_driver.runAll`, 
 **Performance:** ref 0.24–0.48× proptest 1.11.0 · fastest 1.03× libFuzzer (LLVM 21, in-process, the property kept out of its instrumentation — libFuzzer at its cheapest; per input over the same hex property, `alloc+seedfile` the worst row; both sides JCC-padded, `-Djcc-safe`; the driver alone 0.98–1.06× a bare seed loop) (measured 2026-10-27)
 
 **Evidence:** model-fuzz — `hex` against a from-scratch nibble decoder, golden `diff`/`render`/verdicts against a naive first-difference scan and a string-built rendering, the fault transports against their input, the choice tape against the PRNG it records (`src/fuzz_test.zig`); hex also against a strict RFC 4648 decoder over all 16276 short inputs (tools)
+**Model:** src/fuzz_test.zig:nibble · tools/oracle.py
 
 **Known defects:** none recorded
 

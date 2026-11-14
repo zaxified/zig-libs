@@ -15,6 +15,7 @@ Audit detail: the 2026-11-01 review is a delta over `sweep_sharded_test.zig` onl
 **Performance:** ref 0.23–1.01× maypok86/otter v2.3.0 · fastest 1.95× quick_cache 0.6.24 (put_evict; get_hit 1.90×, zipf_mixed 1.45×, get_miss 1.41×, put_update 1.31×; moka 0.12.16 slower than ours on every row) (measured 2026-10-25)
 
 **Evidence:** model-fuzz — the seam harness (`RAMCACHE_FUZZ`, 400 seeds in every run) compares every step against an independent per-key model of the contract (value bytes, TTL/idle stamps and expiry instants, borrows unevictable and byte-stable, drops only where eviction may run, caps after eviction), besides the structural invariants; three planted defects (idle stamp, TTL `>=`, in-place insert stamp) each fail within 20 seeds
+**Model:** src/root.zig:ModelEntry
 
 **Known defects:** none recorded
 

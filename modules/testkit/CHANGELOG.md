@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** audit re-recorded over the new source hash: the only source change since the 2026-11-13 audit is the removal of `bench.zig` and its three references in `root.zig` (moved to `benchkit`), so the delta mutation run has nothing to mutate (0 mutants); the 94/99 counts are from runs over `arbitrary` and `hex`, not `bench`.
 - **2026-11-14** — **Public API change (removal; no in-repo or known consumer affected):** `testkit.bench` is the new module `benchkit` (bench-only, handed to every `tools/bench.zig` by `build.zig`). No test imported it, and as part of testkit -- a `test_dep` of 221 modules -- each of its edits re-keyed every module's tests in every CI lane. Its tests moved with it.
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit recorded from the delta mutation run over `arbitrary` (87 mutants: 84 killed, 2 equivalent, 1 cut at compile).

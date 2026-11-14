@@ -12,6 +12,7 @@
 **Performance:** not measured
 
 **Evidence:** model-fuzz — random puts/overwrites/deletes compared to a sorted reference; global scan order
+**Model:** src/root.zig:RefModel
 
 **Known defects:** none recorded
 

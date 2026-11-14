@@ -17,6 +17,7 @@ Audit detail: the 2026-11-01 delta (from eba301ce) covers `TrustedProxies`, `cli
 **Performance:** ref 0.05–0.28× golang.org/x/time v0.15.0 rate · fastest 1.13× governor 0.10.4 (row `keyed`, its HashMap store behind a spinlock without a key cap or expiry; `bucket` 0.41×; `tools/rust_fast_bench`, clock injected on every side) (measured 2026-10-24)
 
 **Evidence:** model-fuzz — seeded random `allowNAt`/`setConfigAt` sequences over a keyed store compared op by op with an exact integer model (decisions, remaining/retry/reset, key count under second-chance eviction and the idle TTL; `src/model_fuzz_test.zig`), plus frozen reference traces captured from Go x/time/rate (AllowN; AllowN/ReserveN/CancelAt/SetLimitAt/SetBurstAt sequences)
+**Model:** src/model_fuzz_test.zig:Model · tools/xrate/main.go
 
 **Known defects:** none recorded
 

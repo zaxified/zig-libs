@@ -13,6 +13,7 @@
 **Performance:** ref 0.54–1.04× Go os/exec 1.26.8 (`zig build bench-procrun`: 200 sequential and 8×50 concurrent `/bin/true`, 100 MiB capture, 32 MiB `cat` round trip; capture buffers on a heap that keeps freed memory on both sides) · fastest 1.22× worst vs the faster of Go and Rust std::process 1.93.1 (measured 2026-10-20)
 
 **Evidence:** model — 55 spawn scenarios replayed against Python 3.14 `subprocess` (frozen, `src/oracle_*.json`, `tools/oracle/run_python.py`): exits, signal deaths, spawn errors, capture/merge/caps, stdin, env, cwd, fds, process groups, timeouts; invariants: fd count stable over 100 runs, no zombie; 2 listed deliberate differences
+**Model:** src/oracle_test.zig · tools/oracle/run_python.py
 
 **Known defects:** none recorded
 

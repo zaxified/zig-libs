@@ -13,6 +13,7 @@
 **Performance:** not measured
 
 **Evidence:** model-fuzz — random add/remove sequences compared to naive recomputation
+**Model:** src/root.zig:RefModel
 
 **Known defects:** none recorded
 

@@ -12,6 +12,7 @@
 **Performance:** ref 0.50–1.05× crossbeam 0.8 (queue 0.3.14, deque 0.8.8, epoch 0.9.21) · fastest ? (measured 2026-10-20)
 
 **Evidence:** model-fuzz — seed-driven interleaving harness compared to RefQueue reference oracle, with clean/teeth controls
+**Model:** src/harness.zig:RefQueue
 
 **Known defects:** none recorded
 

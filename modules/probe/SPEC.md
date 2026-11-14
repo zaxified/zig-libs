@@ -17,6 +17,7 @@ Audit detail: Mutation delta 2026-11-07 (commits `c65d2d91`, `ef2f0895`: the ans
 **Performance:** n/a — a TCP probe lasts its round trip and the configured timeout/interval, as with blackbox_exporter's tcp prober; the CPU per probe is not what a user picks it for (2026-10-11)
 
 **Evidence:** model-fuzz — random per-target outcome scripts through probeTarget/probeMany compared to a naive model of samples (status, app-check downgrade, RTT only on up) and statistics (two-pass mean/stddev, RFC 3550 jitter, cancellations excluded)
+**Model:** src/root.zig:ProbeModel
 
 **Known defects:** none recorded
 

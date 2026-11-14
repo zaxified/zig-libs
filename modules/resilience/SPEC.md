@@ -13,6 +13,7 @@
 **Performance:** ref 0.03–0.67× gobreaker 2.4.0 / failsafe-go 0.9.8 / cenkalti/backoff 5.0.3 (Go 1.26.8) · fastest ? (measured 2026-10-20)
 
 **Evidence:** model-fuzz — a naive breaker that recounts its window from a plain call list (consecutive, count and time windows, modes, half-open k of n, listener sequence), a rational model of the delay schedule, and an interpreter of `run`'s documented composition against a scripted fake breaker; 8 planted mutants all killed (2026-10-17)
+**Model:** src/model_test.zig:Model · src/model_test.zig:modelDelay
 
 **Known defects:** none recorded
 
