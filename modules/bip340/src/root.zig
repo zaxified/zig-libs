@@ -1147,3 +1147,239 @@ noinline fn stackprobeComputeAndBurn(sk: *const SecretKey, aux: *const [32]u8) v
 test "STACKPROBE (A1 F2): computeAndBurn alone leaves no key or nonce residue on the dead stack" {
     try @import("stackprobe_test.zig").expectNoResidue("computeAndBurn, no step-10 verify after it", stackprobeComputeAndBurn);
 }
+
+// ── delta-audit 2026-11-14 (stale-src restore): tests asked for by surviving mutants ──
+
+/// `e = int(taggedHash(challenge, r || P || msg)) mod n`, the challenge a test
+/// needs to build signatures that are wrong in one chosen way.
+fn testChallenge(r: [32]u8, px: [32]u8, msg: []const u8) Scalar {
+    var h = hash.taggedHasher(hash.challenge_tag);
+    h.update(&r);
+    h.update(&px);
+    h.update(msg);
+    return reduceToScalar(h.finalResult());
+}
+
+/// An x for which `lift_x` fails (no point of the curve has it).
+fn testNonLiftableX() [32]u8 {
+    var i: u64 = 1;
+    while (i < 1000) : (i += 1) {
+        var b: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, b[24..32], i, .big);
+        const x = Fe.fromBytes(b, .big) catch unreachable;
+        if (Secp256k1.recoverY(x, false)) |_| {} else |_| return b;
+    }
+    unreachable;
+}
+
+/// `p + 1`: a non-canonical encoding of the field element 1.
+fn testPPlusOne() [32]u8 {
+    const p: u256 = (1 << 256) - (1 << 32) - 977;
+    var b: [32]u8 = undefined;
+    std.mem.writeInt(u256, &b, p + 1, .big);
+    return b;
+}
+
+test "XOnlyPublicKey.lift and LiftedPublicKey.fromXOnly reject a non-canonical or non-liftable x, even when hand-built (delta 2026-11-14)" {
+    const alias: XOnlyPublicKey = .{ .x = testPPlusOne() };
+    try std.testing.expectError(error.InvalidPublicKey, alias.lift());
+    try std.testing.expectError(error.InvalidPublicKey, LiftedPublicKey.fromXOnly(alias));
+    const bad: XOnlyPublicKey = .{ .x = testNonLiftableX() };
+    try std.testing.expectError(error.InvalidPublicKey, bad.lift());
+    try std.testing.expectError(error.InvalidPublicKey, LiftedPublicKey.fromXOnly(bad));
+    try std.testing.expectError(error.InvalidPublicKey, LiftedPublicKey.fromBytes(bad.x));
+    try std.testing.expectError(error.InvalidPublicKey, XOnlyPublicKey.fromBytes(bad.x));
+    try std.testing.expectError(error.InvalidPublicKey, XOnlyPublicKey.fromBytes(alias.x));
+}
+
+test "LiftedPublicKey.point: a non-canonical x or an odd y is refused by the gate itself (delta 2026-11-14)" {
+    const g = Secp256k1.basePoint.affineCoordinates();
+    const good = try LiftedPublicKey.fromBytes(g.x.toBytes(.big));
+    try std.testing.expect(good.point() != null);
+    // The alias p+1 of x = 1, with the genuine even root of 1^3 + 7: on the curve
+    // after reduction, but the encoding is not canonical.
+    const y1 = try Secp256k1.recoverY(Fe.one, false);
+    const alias: LiftedPublicKey = .{ .x = testPPlusOne(), .y = y1 };
+    try std.testing.expect(alias.point() == null);
+    const canonical: LiftedPublicKey = .{ .x = Fe.one.toBytes(.big), .y = y1 };
+    try std.testing.expect(canonical.point() != null);
+    // The right x with the odd root: a point of the curve, but not lift_x's.
+    const odd: LiftedPublicKey = .{ .x = good.x, .y = good.y.neg() };
+    try std.testing.expect(odd.point() == null);
+}
+
+test "SecretKey.fromBytesInto: success copies the key, zero is rejected and leaves out zeroed (delta 2026-11-14)" {
+    const bytes: [32]u8 = @splat(0x42);
+    var out: SecretKey = .{ .bytes = @splat(0x55) };
+    try SecretKey.fromBytesInto(&out, &bytes);
+    try std.testing.expectEqualSlices(u8, &bytes, &out.bytes);
+    const zero: [32]u8 = @splat(0);
+    out = .{ .bytes = @splat(0x55) };
+    try std.testing.expectError(error.InvalidSecretKey, SecretKey.fromBytesInto(&out, &zero));
+    try std.testing.expectEqualSlices(u8, &zero, &out.bytes);
+}
+
+test "KeyPair.fromSecretKey: an error leaves the out pair zeroed (delta 2026-11-14)" {
+    const zero_sk = SecretKey{ .bytes = @splat(0) };
+    var kp: KeyPair = .{ .secret = @splat(0x55), .public = .{ .x = @splat(0x55) } };
+    try std.testing.expectError(error.InvalidSecretKey, KeyPair.fromSecretKey(&kp, &zero_sk));
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0)), &kp.secret);
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0)), &kp.public.x);
+    const big_sk = SecretKey{ .bytes = @splat(0xff) };
+    kp = .{ .secret = @splat(0x55), .public = .{ .x = @splat(0x55) } };
+    try std.testing.expectError(error.InvalidSecretKey, KeyPair.fromSecretKey(&kp, &big_sk));
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0)), &kp.secret);
+}
+
+test "sign with self_verify succeeds for both parities of R, over many messages (delta 2026-11-14)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const sk = try SecretKey.fromBytes(@as([32]u8, @splat(0x42)));
+    var kp: KeyPair = undefined;
+    try KeyPair.fromSecretKey(&kp, &sk);
+    defer kp.deinit();
+    var buf: [16]u8 = undefined;
+    // 40 messages: the nonce point R has an odd y for about half of them, so
+    // both branches of the even-y selection are signed and self-checked.
+    for (0..40) |i| {
+        const msg = std.fmt.bufPrint(&buf, "self-verify {d}", .{i}) catch unreachable;
+        const sig = try sign(&sk, msg, @splat(0), io, .{ .self_verify = true });
+        const plain = try sign(&sk, msg, @splat(0), io, .{});
+        try std.testing.expectEqualSlices(u8, &plain, &sig);
+        try std.testing.expect(verify(kp.public, msg, try Signature.fromBytes(sig)));
+    }
+}
+
+test "selfCheck rejects a result whose R' = s*G - e*P is the odd twin, the identity, or an endomorphism image of the claimed point (delta 2026-11-14)" {
+    const sk = try SecretKey.fromBytes(@as([32]u8, @splat(0x33)));
+    const msg = "selfCheck delta";
+    const honest = try computeUnverified(.{ .secret = &sk }, msg, @splat(7));
+    try std.testing.expect(selfCheck(&honest, msg));
+    const kp = try KeyPair.derive(&sk);
+    const d = try Scalar.fromBytes(kp.secret, .big);
+    const e = testChallenge(honest.sig[0..32].*, honest.pubkey.x, msg);
+    const s = try Scalar.fromBytes(honest.sig[32..64].*, .big);
+
+    // (a) s' = 2ed - s: R' = -R, same x, the ODD y. Claimed y even: the y
+    // comparison must fail; claimed y odd too: the even-y gate must fail.
+    const ed = e.mul(d);
+    const twin_s = ed.add(ed).sub(s);
+    var twin = honest;
+    twin.sig[32..64].* = twin_s.toBytes(.big);
+    try std.testing.expect(!selfCheck(&twin, msg));
+    twin.r_y = honest.r_y.neg();
+    try std.testing.expect(!selfCheck(&twin, msg));
+    // verify says the same about that signature: its R' has an odd y.
+    try std.testing.expect(!verify(honest.pubkey, msg, try Signature.fromBytes(twin.sig)));
+
+    // (b) R' = O: key = G, r = x(G), s = e. challengePoint is null; a
+    // stand-in point (G) for the null must not be accepted.
+    const g = Secp256k1.basePoint.affineCoordinates();
+    const gx = g.x.toBytes(.big);
+    const e_g = testChallenge(gx, gx, msg);
+    var ident: ComputeResult = .{ .sig = undefined, .pubkey = .{ .x = gx }, .r_y = g.y };
+    ident.sig[0..32].* = gx;
+    ident.sig[32..64].* = e_g.toBytes(.big);
+    try std.testing.expect(!selfCheck(&ident, msg));
+    try std.testing.expect(!verify(.{ .x = gx }, msg, try Signature.fromBytes(ident.sig)));
+
+    // (c) R' = lambda * R0 = (beta*x0, y0): the y matches the claimed
+    // (x0, y0), the x does not. s = lambda*k0 + e*d for e = H(x0 || P || m).
+    const lambda: u256 = 0x5363ad4cc05c30e0a5261c028812645a122e22ea20816678df02967c1b23bd72;
+    var lam_b: [32]u8 = undefined;
+    std.mem.writeInt(u256, &lam_b, lambda, .big);
+    const lam = try Scalar.fromBytes(lam_b, .big);
+    var k0 = try Scalar.fromBytes(@as([32]u8, @splat(0x21)), .big);
+    var r0 = (try Secp256k1.combMulBase(k0.toBytes(.big), .big)).affineCoordinates();
+    if (r0.y.isOdd()) {
+        k0 = k0.neg();
+        r0 = (try Secp256k1.combMulBase(k0.toBytes(.big), .big)).affineCoordinates();
+    }
+    const r0x = r0.x.toBytes(.big);
+    const e0 = testChallenge(r0x, honest.pubkey.x, msg);
+    var found = false;
+    for ([_]Scalar{ lam, lam.mul(lam) }) |l| {
+        const kl = k0.mul(l);
+        const t = (try Secp256k1.combMulBase(kl.toBytes(.big), .big)).affineCoordinates();
+        if (!t.y.equivalent(r0.y) or t.x.equivalent(r0.x)) continue;
+        found = true;
+        var endo: ComputeResult = .{ .sig = undefined, .pubkey = honest.pubkey, .r_y = r0.y };
+        endo.sig[0..32].* = r0x;
+        endo.sig[32..64].* = kl.add(e0.mul(d)).toBytes(.big);
+        try std.testing.expect(!selfCheck(&endo, msg));
+        break;
+    }
+    try std.testing.expect(found);
+}
+
+test "verify/verifyLifted/verifyBatch: a rejected key is not replaced by G, so a signature forged under G is refused (delta 2026-11-14)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const msg = "forged under G";
+    const g = Secp256k1.basePoint.affineCoordinates();
+    const gx = g.x.toBytes(.big);
+
+    // The key is rejected by verifyLifted (odd y) / challengePoint: a sig with
+    // r = x(G) and s = e + 1 is exactly what `R = G` would accept.
+    const good = try LiftedPublicKey.fromBytes(g.x.toBytes(.big));
+    const bad: LiftedPublicKey = .{ .x = good.x, .y = good.y.neg() };
+    const e = testChallenge(gx, bad.x, msg);
+    var sig_s: [64]u8 = undefined;
+    sig_s[0..32].* = gx;
+    sig_s[32..64].* = e.add(Scalar.one).toBytes(.big);
+    const forged = try Signature.fromBytes(sig_s);
+    try std.testing.expect(!verifyLifted(&bad, msg, forged));
+    // Any s with r = x(G) too: the null from the key check must not become G.
+    const any_s = Signature{ .r = gx, .s = Scalar.one.toBytes(.big) };
+    try std.testing.expect(!verifyLifted(&bad, msg, any_s));
+
+    // verifyBatch with a key that does not lift: R = G (k = 1), s = 1 + e
+    // makes the whole sum vanish if the key were replaced by G.
+    const nl = testNonLiftableX();
+    const e_nl = testChallenge(gx, nl, msg);
+    const item: BatchItem = .{
+        .pubkey = .{ .x = nl },
+        .msg = msg,
+        .sig = .{ .r = gx, .s = Scalar.one.add(e_nl).toBytes(.big) },
+    };
+    try std.testing.expect(!verifyBatch(&.{item}, io));
+}
+
+/// An `Io` whose `randomSecure` always fails.
+const FailRngIo = struct {
+    vtable: std.Io.VTable,
+    inner: std.Io,
+
+    fn io(self: *FailRngIo) std.Io {
+        self.vtable = self.inner.vtable.*;
+        self.vtable.randomSecure = onRandomSecure;
+        return .{ .userdata = self, .vtable = &self.vtable };
+    }
+
+    fn onRandomSecure(userdata: ?*anyopaque, buffer: []u8) std.Io.RandomSecureError!void {
+        _ = userdata;
+        @memset(buffer, 0xaa); // junk a caller that ignores the error would use
+        return error.EntropyUnavailable;
+    }
+};
+
+test "verifyBatch: a CSPRNG that cannot deliver makes the batch unverified, never checked against junk (delta 2026-11-14)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var fio: FailRngIo = .{ .vtable = undefined, .inner = threaded.io() };
+    const io = fio.io();
+    const sk = try SecretKey.fromBytes(@as([32]u8, @splat(0x42)));
+    var kp: KeyPair = undefined;
+    try KeyPair.fromSecretKey(&kp, &sk);
+    defer kp.deinit();
+    const sig = try Signature.fromBytes(try sign(&sk, "m", @splat(0), threaded.io(), .{}));
+    const items = [_]BatchItem{
+        .{ .pubkey = kp.public, .msg = "m", .sig = sig },
+        .{ .pubkey = kp.public, .msg = "m", .sig = sig },
+    };
+    try std.testing.expect(!verifyBatch(&items, io));
+    // One item needs no randomizer: still verified without the RNG.
+    try std.testing.expect(verifyBatch(items[0..1], io));
+}
