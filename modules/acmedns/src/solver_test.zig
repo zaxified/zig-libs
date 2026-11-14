@@ -184,3 +184,161 @@ test "present: a name outside Options.zone is refused before publishing" {
     o.zone = "example.org";
     try testing.expectError(error.ZoneNotFound, s2.present("example.org", "t", "t.k"));
 }
+
+// ── mutation-run tests (2026-11-14) ──────────────────────────────────────────
+
+/// Counts calls and logs the cleaned records' domains.
+const Dom = struct {
+    presents: u32 = 0,
+    log: [128]u8 = undefined,
+    log_len: usize = 0,
+    fail: bool = false,
+
+    fn publisher(d: *Dom) root.Publisher {
+        return .{ .ctx = d, .present = present, .cleanup = cleanup };
+    }
+    fn present(ctx: ?*anyopaque, _: *const root.Record) root.PublishError!void {
+        const d: *Dom = @ptrCast(@alignCast(ctx.?));
+        if (d.fail) return error.PublishFailed;
+        d.presents += 1;
+    }
+    fn cleanup(ctx: ?*anyopaque, rec: *const root.Record) void {
+        const d: *Dom = @ptrCast(@alignCast(ctx.?));
+        if (d.log_len != 0) {
+            d.log[d.log_len] = ',';
+            d.log_len += 1;
+        }
+        @memcpy(d.log[d.log_len..][0..rec.domain.len], rec.domain);
+        d.log_len += rec.domain.len;
+    }
+    fn cleaned(d: *const Dom) []const u8 {
+        return d.log[0..d.log_len];
+    }
+};
+
+fn domOptions(d: *Dom) Dns01Solver.Options {
+    return .{ .publisher = d.publisher(), .zone = "example.org", .follow_cname = false, .check_propagation = false };
+}
+
+test "cleanup: matches domain AND value; one record per call, whatever is behind it" {
+    var d: Dom = .{};
+    var s = Dns01Solver.init(std.testing.io, testing.allocator, domOptions(&d));
+    defer s.deinit();
+    const v = acme.jws.dns01TxtValueFromKeyAuthorization("t.k");
+    try s.present("a.example.org", "t", "t.k");
+    try s.present("b.example.org", "t", "t.k"); // same value, other domain
+    s.cleanup("b.example.org", &v);
+    try testing.expectEqualStrings("b.example.org", d.cleaned());
+    try testing.expectEqual(@as(usize, 1), s.pendingCount());
+    s.cleanup("b.example.org", &v); // gone: ignored
+    try testing.expectEqual(@as(usize, 1), s.pendingCount());
+    // The same pair twice (a retried challenge): one cleanup removes one.
+    try s.present("a.example.org", "t", "t.k");
+    s.cleanup("a.example.org", &v);
+    try testing.expectEqual(@as(usize, 1), s.pendingCount());
+    s.cleanup("a.example.org", &v);
+    try testing.expectEqual(@as(usize, 0), s.pendingCount());
+}
+
+test "present: note is reset by the next call; a failed allocation is OutOfMemory through the vtable" {
+    var d: Dom = .{ .fail = true };
+    var s = Dns01Solver.init(std.testing.io, testing.allocator, domOptions(&d));
+    defer s.deinit();
+    try testing.expectError(error.PublishFailed, s.present("a.example.org", "t", "t.k"));
+    try testing.expect(s.note.len != 0);
+    d.fail = false;
+    try s.present("a.example.org", "t", "t.k");
+    try testing.expectEqualStrings("", s.note);
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var s2 = Dns01Solver.init(std.testing.io, failing.allocator(), domOptions(&d));
+    defer s2.deinit();
+    const v = s2.solver();
+    const req: acme.Client.ChallengeRequest = .{
+        .type = .dns_01,
+        .identifier = "a.example.org",
+        .ip = false,
+        .wildcard = false,
+        .token = "t",
+        .key_authorization = "t.k",
+    };
+    try testing.expectError(error.OutOfMemory, v.present(v.ctx, &req));
+}
+
+test "present: delay_ms waits after publishing" {
+    var d: Dom = .{};
+    var o = domOptions(&d);
+    o.delay_ms = 300;
+    var s = Dns01Solver.init(std.testing.io, testing.allocator, o);
+    defer s.deinit();
+    const t0 = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    try s.present("a.example.org", "t", "t.k");
+    const took = t0.durationTo(std.Io.Clock.Timestamp.now(std.testing.io, .awake)).raw.toMilliseconds();
+    try testing.expect(took >= 250);
+    try testing.expectEqual(@as(usize, 1), s.pendingCount());
+}
+
+/// Notices when a block holding `needle` is freed without having been wiped.
+const Spy = struct {
+    inner: std.mem.Allocator,
+    needle: []const u8,
+    plain_free: bool = false,
+
+    fn allocator(s: *Spy) std.mem.Allocator {
+        return .{ .ptr = s, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const s: *Spy = @ptrCast(@alignCast(ctx));
+        return s.inner.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const s: *Spy = @ptrCast(@alignCast(ctx));
+        return s.inner.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const s: *Spy = @ptrCast(@alignCast(ctx));
+        return s.inner.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const s: *Spy = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, m, s.needle)) s.plain_free = true;
+        s.inner.rawFree(m, a, ra);
+    }
+};
+
+test "the key authorization is wiped before its copy is freed" {
+    var spy: Spy = .{ .inner = testing.allocator, .needle = "tok.thumb" };
+    var d: Dom = .{};
+    var s = Dns01Solver.init(std.testing.io, spy.allocator(), domOptions(&d));
+    defer s.deinit();
+    try s.present("a.example.org", "tok", "tok.thumb");
+    const v = acme.jws.dns01TxtValueFromKeyAuthorization("tok.thumb");
+    s.cleanup("a.example.org", &v);
+    try testing.expect(!spy.plain_free);
+    // The control: the spy sees an unwiped free. Only without runtime
+    // safety: `Allocator.free` overwrites the block with `undefined` before
+    // the allocator sees it, which hides the wipe (and its absence) in safe
+    // builds.
+    if (!std.debug.runtime_safety) {
+        const copy = try spy.allocator().dupe(u8, "tok.thumb");
+        spy.allocator().free(copy);
+        try testing.expect(spy.plain_free);
+    }
+}
+
+test "present: a zone of exactly 253 bytes fits, 254 does not" {
+    var d: Dom = .{};
+    var o = domOptions(&d);
+    var ok: [253]u8 = @splat('a');
+    ok[2] = '.';
+    o.zone = &ok;
+    o.override_name = &ok;
+    var s = Dns01Solver.init(std.testing.io, testing.allocator, o);
+    defer s.deinit();
+    try s.present("x.example.org", "t", "t.k");
+    var long: [254]u8 = @splat('a');
+    o.zone = &long;
+    var s2 = Dns01Solver.init(std.testing.io, testing.allocator, o);
+    defer s2.deinit();
+    try testing.expectError(error.NameTooLong, s2.present("x.example.org", "t", "t.k"));
+}

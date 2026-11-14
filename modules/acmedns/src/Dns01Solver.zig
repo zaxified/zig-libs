@@ -393,3 +393,18 @@ fn copyInto(out: *[zone.max_name_len]u8, name: []const u8) error{NameTooLong}![]
     @memcpy(out[0..n.len], n);
     return out[0..n.len];
 }
+
+test "inZone: label boundary, case, the empty zone, equal names" {
+    const t = std.testing;
+    try t.expect(inZone("a.example.org", "example.org"));
+    try t.expect(inZone("EXAMPLE.org", "example.ORG"));
+    try t.expect(inZone("a.B.example.org", "b.example.org"));
+    try t.expect(inZone("anything", ""));
+    try t.expect(!inZone("badexample.org", "example.org"));
+    try t.expect(!inZone("example.org", "a.example.org"));
+    try t.expect(!inZone("xexample.org", "example.org"));
+    try t.expect(!inZone("a.example.com", "example.org"));
+    try t.expect(!inZone("a.example.orx", "example.org"));
+    try t.expect(!inZone("", "example.org"));
+    try t.expect(inZone("a.b", "b") and !inZone(".b", "c.b"));
+}

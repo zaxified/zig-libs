@@ -92,4 +92,5 @@ test {
     _ = @import("zone_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("hostile_test.zig");
+    _ = @import("publishers_test.zig");
 }
