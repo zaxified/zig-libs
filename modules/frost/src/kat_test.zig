@@ -337,6 +337,28 @@ test "round2Sign refuses a commitment list that does not carry its own round-1 c
     try std.testing.expectError(error.InvalidCommitmentList, frost.round2Sign(gpa, identifierFromU16(2), &sk, group_public_key, &nonces, &msg, &list));
 }
 
+test "round2Sign: a zero nonce cannot reproduce its listed commitment and reports IncorrectCommitment" {
+    // nonce * G is the identity for a zero nonce, so the signer's own
+    // commitment check cannot be satisfied: the error is IncorrectCommitment
+    // (the commitment recomputation failed), not a malformed commitment list --
+    // the list itself is the published, well-formed one.
+    const gpa = std.testing.allocator;
+    const group_public_key = elementFromHex(v.group.public_key);
+    const msg = hexN(4, v.group.message);
+    const sk = signingShareFromHex(v.participant_shares.p1);
+    const list = vectorCommitmentList();
+    const zero_hiding = frost.SigningNonces{
+        .hiding = frost.Scalar.zero,
+        .binding = scalarFromHex(v.round1_p1.binding_nonce),
+    };
+    try std.testing.expectError(error.IncorrectCommitment, frost.round2Sign(gpa, identifierFromU16(1), &sk, group_public_key, &zero_hiding, &msg, &list));
+    const zero_binding = frost.SigningNonces{
+        .hiding = scalarFromHex(v.round1_p1.hiding_nonce),
+        .binding = frost.Scalar.zero,
+    };
+    try std.testing.expectError(error.IncorrectCommitment, frost.round2Sign(gpa, identifierFromU16(1), &sk, group_public_key, &zero_binding, &msg, &list));
+}
+
 test "trustedDealerKeygen at t = 3: every share passes the Feldman check against vss_commitment" {
     // share_i·G == Σ_k vss_commitment[k]·i^k (RFC 9591 Appendix C.2's
     // vss_verify). The published vector has t = 2, a single coefficient, so
