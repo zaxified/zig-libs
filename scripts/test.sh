@@ -2324,6 +2324,9 @@ cmd_interop() {
     # bumped pin is a moved oracle, so its digest is in the key too -- before,
     # a bump waited up to a week to be judged against.
     take_lane="interop week=$(date -u +%GW%V) peers=$(sha256sum scripts/lib/ci-environment.sh | cut -c1-12) $(uname -m)"
+    # Like every other lane key (stamps_lane_key): a dry pass must never stand
+    # in for a real take.
+    [[ "${ZIGLIBS_DRY_RUN:-0}" == 1 ]] && take_lane="$take_lane DRY"
     if [[ "${ZIGLIBS_STRICT_STAMPS:-0}" == 1 ]]; then
         take_todo="${progs[*]}"
     else
@@ -2333,10 +2336,23 @@ cmd_interop() {
     echo "interop: $(wc -w <<< "$compile_todo") of $(wc -w <<< "$compile_mods") modules' tools to compile; re-taking the anchors of ${#progs[@]} module(s) against real peers: ${progs[*]}"
     echo "  ⚠ these need the peers scripts/lib/ci-environment.sh installs under the \`interop\` role;"
     echo "    the transcripts they produce are what test-<m> replays hermetically."
+    # ⭐ IN BATCHES, each stamped when green (CI audit B2, 2026-11-14) -- the
+    # push lane's fix, for the same reason: one `check-interop` over every
+    # pending module was all-or-nothing, and a cold lane (38 of its 45 minutes
+    # compiling, run 43410103669) that hit its timeout kept nothing.
     if [[ -n "${compile_todo// /}" ]]; then
-        stamps_narrow "$compile_todo" "$compile_mods"
-        step "check-interop" zig build check-interop "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
-        stamps_record "$compile_todo" "$compile_lane"
+        local batch_size="${ZIGLIBS_INTEROP_BATCH:-24}" batch="" k=0 cn _m
+        cn=$(wc -w <<< "$compile_todo")
+        for _m in $compile_todo; do
+            batch="$batch $_m"
+            k=$((k + 1))
+            if (( k % batch_size == 0 )) || (( k == cn )); then
+                stamps_narrow "${batch# }" "$compile_mods"
+                step "check-interop ($k of $cn modules)" zig build check-interop "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
+                stamps_record "${batch# }" "$compile_lane"
+                batch=""
+            fi
+        done
     fi
     if (( ${#progs[@]} == 0 )); then
         echo "interop: nothing to re-take -- every anchor is stamped for this week at its current fingerprint"
