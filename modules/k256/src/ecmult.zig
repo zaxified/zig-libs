@@ -1001,3 +1001,33 @@ test "affineCoordinatesPublic: an identity with z = 0 and y ∉ {0, 1}" {
     try std.testing.expectEqual(want.x.toInt(), got.x.toInt());
     try std.testing.expectEqual(want.y.toInt(), got.y.toInt());
 }
+
+// ── 2026-11-14 stale-audit mutation run: tests the run asked for ────────────
+
+test "sK: F.isZero accepts exactly 0 and p, limb by limb" {
+    try std.testing.expect(F.isZero(.{ .v = 0 }));
+    try std.testing.expect(F.isZero(.{ .v = p_int }));
+    for (0..4) |k| {
+        const bit = @as(u256, 1) << @intCast(64 * k);
+        try std.testing.expect(!F.isZero(.{ .v = bit }));
+        try std.testing.expect(!F.isZero(.{ .v = p_int ^ bit }));
+    }
+    try std.testing.expect(!F.isZero(.{ .v = 1 }));
+    try std.testing.expect(!F.isZero(.{ .v = p_int - 1 }));
+    try std.testing.expect(!F.isZero(.{ .v = p_int + 1 }));
+}
+
+test "sK: splitToSignedHalves reduces mod n once, and maps 0 and n to null" {
+    const n = scalarmod.field_order;
+    try std.testing.expect(splitToSignedHalves(0) == null);
+    try std.testing.expect(splitToSignedHalves(n) == null);
+    const top: u256 = std.math.maxInt(u256);
+    for ([_][2]u256{ .{ n + 5, 5 }, .{ top, top - n }, .{ n + 1, 1 } }) |c| {
+        const got = splitToSignedHalves(c[0]).?;
+        const want = splitToSignedHalves(c[1]).?;
+        for (got, want) |g, w| {
+            try std.testing.expectEqual(w.mag, g.mag);
+            try std.testing.expectEqual(w.negative, g.negative);
+        }
+    }
+}

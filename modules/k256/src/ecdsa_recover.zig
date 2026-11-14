@@ -633,3 +633,31 @@ test "isLowS: half-order boundary" {
     std.mem.writeInt(u256, &high, (scalarmod.field_order >> 1) + 1, .big);
     try testing.expect(!isLowS(high));
 }
+
+// ── 2026-11-14 stale-audit mutation run: tests the run asked for ────────────
+
+test "sK: sign refuses r = 0 (R.x = n) and s = 0 (e = −r·d) through the signing seam" {
+    const n = scalarmod.field_order;
+    const Injected = struct {
+        var point: Secp256k1 = undefined;
+        fn commit(_: [32]u8, _: std.builtin.Endian) IdentityElementError!Secp256k1 {
+            return point;
+        }
+    };
+    var privkey: [32]u8 = undefined;
+    for (&privkey, 0..) |*b, i| b.* = @intCast(0x31 +% i);
+    const hash = beOf(0x1234_5678);
+
+    // r = 0: a curve point whose x is exactly n (n³ + 7 is a quadratic residue mod p).
+    const xn = try Fe.fromBytes(beOf(n), .big);
+    const yn = try Secp256k1.recoverY(xn, false);
+    Injected.point = try Secp256k1.fromAffineCoordinates(.{ .x = xn, .y = yn });
+    try testing.expectError(error.InvalidNonce, signInner(&privkey, hash, Injected.commit));
+
+    // s = 0: R = G, hash e = −r·d, so e + r·d ≡ 0 whatever the nonce is.
+    Injected.point = Secp256k1.basePoint;
+    const r = reduceToScalar(Secp256k1.basePoint.x.toBytes(.big));
+    const d = try Scalar.fromBytes(privkey, .big);
+    const e = r.mul(d).neg();
+    try testing.expectError(error.InvalidNonce, signInner(&privkey, e.toBytes(.big), Injected.commit));
+}

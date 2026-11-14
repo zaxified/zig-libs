@@ -1439,3 +1439,95 @@ test "the local seedInto helper produces what Smith.slice reads back" {
     const n = smith.slice(&buf);
     try std.testing.expectEqualStrings("abcdef", buf[0..n]);
 }
+
+// ── 2026-11-14 stale-audit mutation run: tests the run asked for ────────────
+
+test "sK: every identity encoding is rejected / mapped to the affine identity; near-identities are not" {
+    const zero = field.Fe.zero;
+    const one = field.Fe.one;
+    const two = try field.Fe.fromInt(2);
+    const ids = [_]Secp256k1{
+        .{ .x = zero, .y = zero, .z = one },
+        .{ .x = zero, .y = zero, .z = two },
+        .{ .x = zero, .y = one, .z = two },
+        .{ .x = one, .y = one, .z = zero },
+        .{ .x = two, .y = zero, .z = zero },
+        Secp256k1.identityElement,
+    };
+    const idc = AffineCoordinates.identityElement;
+    for (ids) |p| {
+        try std.testing.expectError(error.IdentityElement, p.rejectIdentity());
+        try std.testing.expectError(error.IdentityElement, p.rejectIdentityOneBranch());
+        for ([_]AffineCoordinates{ p.affineCoordinates(), p.affineCoordinatesPublic() }) |a| {
+            try std.testing.expectEqualSlices(u8, &idc.x.toBytes(.big), &a.x.toBytes(.big));
+            try std.testing.expectEqualSlices(u8, &idc.y.toBytes(.big), &a.y.toBytes(.big));
+        }
+    }
+    // Not the identity: x ≠ 0 with y = 0, and x = 0 with y ∉ {0, 1}.
+    const near = [_]Secp256k1{
+        .{ .x = one, .y = zero, .z = one },
+        .{ .x = zero, .y = two, .z = one },
+    };
+    for (near) |p| {
+        try p.rejectIdentity();
+        try p.rejectIdentityOneBranch();
+        for ([_]AffineCoordinates{ p.affineCoordinates(), p.affineCoordinatesPublic() }) |a| {
+            try std.testing.expect(!(a.x.equivalent(idc.x) and a.y.equivalent(idc.y)));
+        }
+    }
+}
+
+test "sK: fromAffineCoordinates maps the affine identity to z = 0 and rejects (0, y) off the curve" {
+    const idp = try Secp256k1.fromAffineCoordinates(AffineCoordinates.identityElement);
+    try std.testing.expect(idp.z.isZero());
+    try std.testing.expectError(error.IdentityElement, idp.rejectIdentity());
+    const two = try field.Fe.fromInt(2);
+    try std.testing.expectError(error.InvalidEncoding, Secp256k1.fromAffineCoordinates(.{ .x = field.Fe.zero, .y = two }));
+    try std.testing.expectError(error.InvalidEncoding, Secp256k1.fromAffineCoordinates(.{ .x = field.Fe.one, .y = field.Fe.one }));
+}
+
+test "sK: mulInto zeroes `out` when the product is the identity" {
+    var out: Secp256k1 = undefined;
+    @memset(std.mem.asBytes(&out), 0xAA);
+    const zero_scalar: [32]u8 = @splat(0);
+    try std.testing.expectError(error.IdentityElement, Secp256k1.basePoint.mulInto(&out, &zero_scalar, .big));
+    for (std.mem.asBytes(&out)) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}
+
+test "sK: the public multiplies return IdentityElement for a zero product and for identity inputs" {
+    var nb: [32]u8 = undefined;
+    std.mem.writeInt(u256, &nb, scalarmod.field_order, .big);
+    const zero_scalar: [32]u8 = @splat(0);
+    const G = Secp256k1.basePoint;
+    try std.testing.expectError(error.IdentityElement, G.mulPublicDoubleAdd(zero_scalar, .big));
+    try std.testing.expectError(error.IdentityElement, G.mulPublicDoubleAdd(nb, .big));
+    // s·P + (n − s)·P = n·P = O
+    var s5: [32]u8 = undefined;
+    std.mem.writeInt(u256, &s5, 5, .big);
+    var ns5: [32]u8 = undefined;
+    std.mem.writeInt(u256, &ns5, scalarmod.field_order - 5, .big);
+    const P = G.dbl().add(G);
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublicDoubleAdd(P, s5, P, ns5, .big));
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublic(P, s5, P, ns5, .big));
+    // Generic (neither base is G) GLV path: an identity base is refused, on either side.
+    const Q = G.dbl();
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublic(Q, s5, Secp256k1.identityElement, ns5, .big));
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublic(Secp256k1.identityElement, s5, Q, ns5, .big));
+}
+
+test "sK: mulDoubleBasePublic recognises G by its exact limbs only (−G, and G's x,y with z = 0, take the generic path)" {
+    const G = Secp256k1.basePoint;
+    var s1: [32]u8 = undefined;
+    var s2: [32]u8 = undefined;
+    std.mem.writeInt(u256, &s1, 0x1234_5678_9abc_def0_1111, .big);
+    std.mem.writeInt(u256, &s2, 0xfedc_ba98_7654_3210_2222, .big);
+    const P = G.dbl().add(G);
+    // −G shares x and z with G: treating it as G would give s1·G instead of −s1·G.
+    const got = try Secp256k1.mulDoubleBasePublic(G.neg(), s1, P, s2, .big);
+    const want = try Secp256k1.mulDoubleBasePublicDoubleAdd(G.neg(), s1, P, s2, .big);
+    try std.testing.expect(got.equivalent(want));
+    // (Gx : Gy : 0) is an identity encoding; it must be refused, not read as G.
+    const fake = Secp256k1{ .x = G.x, .y = G.y, .z = field.Fe.zero };
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublic(fake, s1, P, s2, .big));
+    try std.testing.expectError(error.IdentityElement, Secp256k1.mulDoubleBasePublic(P, s2, fake, s1, .big));
+}

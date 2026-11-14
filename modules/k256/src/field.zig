@@ -1321,3 +1321,159 @@ test "add/mulSmall: sums in [p, 2^256), sums past 2^256, folds past 2^256" {
         try std.testing.expectEqual(a.mul(try Fe.fromInt(21)).toInt(), a.mulSmall(21).toInt());
     }
 }
+
+// ── 2026-11-14 stale-audit mutation run: tests the run asked for ────────────
+
+test "sK: normalize(s0, carry) == (s0 + carry·2^256) mod p, including the second fold" {
+    const p: u512 = field_order;
+    const c: u256 = c_fold;
+    const s0s = [_]u256{ 0, 1, c - 1, c, field_order - 1, field_order, field_order + 1, std.math.maxInt(u256) - c, std.math.maxInt(u256) - c + 1, std.math.maxInt(u256) };
+    for (s0s) |s0| {
+        for ([_]u1{ 0, 1 }) |carry| {
+            const want: u512 = (@as(u512, s0) + (@as(u512, carry) << 256)) % p;
+            try std.testing.expectEqual(@as(u256, @intCast(want)), toU256(normalize(s0, carry)));
+        }
+    }
+}
+
+test "sK: reduceLimbsLazy carries r0 + c into r1 (fold 2 leaves r = 2^64 − 1 with cf2 = 1)" {
+    // t_hi = 2^256 − 1 and t_lo chosen so fold 1 leaves excess word c and r = 2^256 + 2^64 − 1 − c²;
+    // fold 2 then wraps to r = 2^64 − 1 with cf2 = 1, and r0 + c carries into r1.
+    const c: u256 = c_fold;
+    const t_lo: u256 = ((@as(u256, 1) << 64) -% 1) -% c * c +% c;
+    const t_hi: u256 = std.math.maxInt(u256);
+    var t: [8]u64 = undefined;
+    t[0..4].* = fromU256(t_lo);
+    t[4..8].* = fromU256(t_hi);
+    const f = foldLimbs(t);
+    try std.testing.expectEqual(@as(u64, 1), f.cf2);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), f.r[0]);
+    const got = toU256(reduceLimbsLazy(t));
+    const want: u512 = (@as(u512, t_lo) + (@as(u512, t_hi) << 256)) % field_order;
+    try std.testing.expectEqual(want, @as(u512, got) % field_order);
+}
+
+test "sK: Fe.isZero reads all four limbs; Fe.equivalent compares all four" {
+    try std.testing.expect(Fe.zero.isZero());
+    for (0..4) |k| {
+        var l = [4]u64{ 0, 0, 0, 0 };
+        l[k] = 1;
+        try std.testing.expect(!(Fe{ ._limbs = l }).isZero());
+        // equivalent: values that differ in limb k only (limb 0 equal everywhere else).
+        var l2 = [4]u64{ 5, 0, 0, 0 };
+        l2[k] += 1;
+        try std.testing.expect(!(Fe{ ._limbs = .{ 5, 0, 0, 0 } }).equivalent(Fe{ ._limbs = l2 }));
+    }
+    try std.testing.expect((Fe{ ._limbs = .{ 5, 7, 9, 11 } }).equivalent(Fe{ ._limbs = .{ 5, 7, 9, 11 } }));
+}
+
+test "sK: safegcd updateDe keeps d, e in (−2p, p) and d'·2^62 ≡ u·d + v·e (mod p)" {
+    const S = safegcd;
+    const p: i512 = field_order;
+    const Ctx = struct {
+        fn val(v: S.S62) i512 {
+            var x: i512 = 0;
+            for (0..5) |i| x += @as(i512, v[i]) << @intCast(62 * i);
+            return x;
+        }
+        fn limbs(x0: i512) S.S62 {
+            var x = x0;
+            var out: S.S62 = undefined;
+            for (0..4) |i| {
+                out[i] = @intCast(x & S.m62);
+                x >>= 62;
+            }
+            out[4] = @intCast(x);
+            return out;
+        }
+        fn inRange(x: i512) bool {
+            return x > -2 * p and x < p;
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(0x5C_DE_0001);
+    const rand = prng.random();
+    const half: i64 = 1 << 61;
+    for (0..20000) |it| {
+        var dv: i512 = undefined;
+        var ev: i512 = undefined;
+        var t: S.Trans = undefined;
+        switch (it % 4) {
+            0 => { // extremes: both entries at the bottom of the range, matrix at full weight
+                dv = -2 * p + 1 + rand.intRangeAtMost(i64, 0, 3);
+                ev = -2 * p + 1 + rand.intRangeAtMost(i64, 0, 3);
+                t = .{ .u = half, .v = half, .q = half, .r = -half };
+            },
+            1 => { // mixed signs
+                dv = -2 * p + 1 + rand.intRangeAtMost(i64, 0, 3);
+                ev = p - 1 - rand.intRangeAtMost(i64, 0, 3);
+                t = .{ .u = half, .v = -half, .q = -half, .r = half };
+            },
+            else => {
+                dv = @mod(@as(i512, rand.int(u256)), 3 * p) - 2 * p;
+                ev = @mod(@as(i512, rand.int(u256)), 3 * p) - 2 * p;
+                const a = rand.intRangeAtMost(i64, -half, half);
+                const b = rand.intRangeAtMost(i64, -half, half);
+                const c = rand.intRangeAtMost(i64, -half, half);
+                const d = rand.intRangeAtMost(i64, -half, half);
+                t = .{ .u = a, .v = b, .q = c, .r = d };
+            },
+        }
+        if (!Ctx.inRange(dv)) dv = 0;
+        if (!Ctx.inRange(ev)) ev = 0;
+        var d = Ctx.limbs(dv);
+        var e = Ctx.limbs(ev);
+        S.updateDe(&d, &e, t);
+        const dn = Ctx.val(d);
+        const en = Ctx.val(e);
+        try std.testing.expect(Ctx.inRange(dn));
+        try std.testing.expect(Ctx.inRange(en));
+        try std.testing.expectEqual(@as(i512, 0), @mod((@as(i512, t.u) * dv + @as(i512, t.v) * ev) - (dn << 62), p));
+        try std.testing.expectEqual(@as(i512, 0), @mod((@as(i512, t.q) * dv + @as(i512, t.r) * ev) - (en << 62), p));
+    }
+}
+
+test "sK: divsteps59 == textbook divsteps from delta = 1/2 (zeta, and the 2^62-scaled matrix)" {
+    // Textbook (Bernstein–Yang) divstep on 2δ: delta = 1/2 initially, so d2 = 1 ↔ zeta = −1,
+    // zeta = −(d2 + 1)/2. Matrix rows scaled by 2 per step (f row doubles, g row does not).
+    var prng = std.Random.DefaultPrng.init(0xD1_55_7E95);
+    const rand = prng.random();
+    for (0..5000) |it| {
+        const zeta0: i64 = if (it % 4 == 0) -1 else rand.intRangeAtMost(i64, -80, 80);
+        const f0: u64 = rand.int(u64) | 1;
+        const g0: u64 = rand.int(u64);
+        var d2: i64 = -2 * zeta0 - 1;
+        var f: u128 = f0;
+        var g: u128 = g0;
+        var n = [2][2]i128{ .{ 1, 0 }, .{ 0, 1 } }; // rows: f, g
+        for (0..59) |_| {
+            if (d2 > 0 and g & 1 == 1) {
+                d2 = 2 - d2;
+                const nf = g;
+                const ng = (g -% f) >> 1;
+                f = nf;
+                g = ng;
+                const rf = n[1];
+                const rg = [2]i128{ n[1][0] - n[0][0], n[1][1] - n[0][1] };
+                n[0] = .{ 2 * rf[0], 2 * rf[1] };
+                n[1] = rg;
+            } else if (g & 1 == 1) {
+                d2 += 2;
+                g = (g +% f) >> 1;
+                const rg = [2]i128{ n[1][0] + n[0][0], n[1][1] + n[0][1] };
+                n[0] = .{ 2 * n[0][0], 2 * n[0][1] };
+                n[1] = rg;
+            } else {
+                d2 += 2;
+                g >>= 1;
+                n[0] = .{ 2 * n[0][0], 2 * n[0][1] };
+            }
+        }
+        var t: safegcd.Trans = undefined;
+        const zeta = safegcd.divsteps59(zeta0, f0, g0, &t);
+        try std.testing.expectEqual(-@divExact(d2 + 1, 2), zeta);
+        try std.testing.expectEqual(@as(i128, 8) * n[0][0], @as(i128, t.u));
+        try std.testing.expectEqual(@as(i128, 8) * n[0][1], @as(i128, t.v));
+        try std.testing.expectEqual(@as(i128, 8) * n[1][0], @as(i128, t.q));
+        try std.testing.expectEqual(@as(i128, 8) * n[1][1], @as(i128, t.r));
+    }
+}
