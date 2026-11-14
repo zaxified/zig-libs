@@ -635,8 +635,23 @@ stamps_partial() {
         green="$green $m"
     done
     [[ -z "${green// /}" ]] && return 0
-    echo "stamps: this run is red, keeping what it proved:$green"
-    stamps_record "${green# }" "$_ZL_PARTIAL_LANE"
+    # ⚠ `success` is not "its tests ran" (CI audit 2026-11-14): the dark-tests
+    # gate runs only after a GREEN step, so a module whose test files went dark
+    # (0 of N ran -- the websocket class) was stamped here whenever another
+    # module of the same step failed, and its next run skipped it. Each green
+    # module must pass the same gate on this log before it is kept.
+    local proven="" dropped=""
+    for m in $green; do
+        if "$SCRIPT_DIR/lib/dark-tests.sh" --summary "$_ZL_KEEP_OUT" "$m" >/dev/null 2>&1; then
+            proven="$proven $m"
+        else
+            dropped="$dropped $m"
+        fi
+    done
+    [[ -n "$dropped" ]] && echo "stamps: not kept (dark-tests did not pass on this log):$dropped"
+    [[ -z "${proven// /}" ]] && return 0
+    echo "stamps: this run is red, keeping what it proved:$proven"
+    stamps_record "${proven# }" "$_ZL_PARTIAL_LANE"
 }
 
 # `ctgrind.sh --check` measures every row before it reports: a module with no
