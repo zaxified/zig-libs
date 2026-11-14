@@ -230,9 +230,19 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
         // SET in this process's environment -- the one the tests will run in
         // -- is folded in with its value. Over-inclusion costs a re-run.
         var env_names = std.StringHashMap(void).init(b.allocator);
-        for (tok) |fm| {
+        // ⭐ AND WHAT A DEPENDENT RUNS (A6, 2026-11-14): a variable read under
+        // `src/` is read by every dependent's test binary too (it links that
+        // code), so it goes into `iface` as well -- before, setting it re-keyed
+        // only the module that names it, and its dependents kept a green stamp
+        // taken under the old value.
+        var src_env_names = std.StringHashMap(void).init(b.allocator);
+        for (tok, paths.items) |fm, path| {
             var it = std.mem.splitScalar(u8, fm.envs, ',');
-            while (it.next()) |e| if (e.len != 0) try env_names.put(e, {});
+            while (it.next()) |e| {
+                if (e.len == 0) continue;
+                try env_names.put(e, {});
+                if (std.mem.startsWith(u8, path, "src/")) try src_env_names.put(e, {});
+            }
         }
         var env_list: std.ArrayList([]const u8) = .empty;
         var eit = env_names.keyIterator();
@@ -256,6 +266,12 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
             h.update(e);
             h.update("=");
             h.update(v);
+            if (src_env_names.contains(e)) {
+                hi.update("\x00env:");
+                hi.update(e);
+                hi.update("=");
+                hi.update(v);
+            }
         }
         // Pass 2: fold.
         for (paths.items, 0..) |path, k| {
