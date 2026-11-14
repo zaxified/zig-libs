@@ -105,13 +105,20 @@ permissions:
 #
 # ⚠ AND ON THE EVENT (2026-09-18). A dispatch over `main` has the push's ref,
 # so it cancelled the push run it was started beside -- observed on e81bba41.
-# That left the commit with no green push run. Two dispatches on one ref still
-# cancel each other: start a `release: live` dispatch only when no other
-# dispatch on main is running (and start no other one while it runs). Two pushes still cancel each other, which stamps make safe:
-# the later run finds the earlier commit's modules unstamped and runs them.
+# That left the commit with no green push run. Two pushes still cancel each
+# other, which stamps make safe: the later run finds the earlier commit's
+# modules unstamped and runs them.
+#
+# ⭐ DISPATCH AND SCHEDULE QUEUE, THEY DO NOT CANCEL (CI audit B6, 2026-11-14).
+# Both run the full shape. In one group, without cancelling, a schedule that
+# fires while a dispatch runs waits for it and then finds its stamps -- before,
+# it started beside it and redid ~2.5 runner-hours (43412672524 next to
+# 43410103669, twice more that month). A second dispatch no longer cancels the
+# first either; it waits. (GitHub keeps one PENDING run per group: a third one
+# replaces the waiting one.)
 concurrency:
-  group: ci-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
+  group: ci-${{ github.ref }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'full' || github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
 
 # Linux-only: several modules (procnet, rawsock, netlink, wireguard, …) are
 # raw-syscall Linux members and are compiled by `zig build test`; socket/netns
