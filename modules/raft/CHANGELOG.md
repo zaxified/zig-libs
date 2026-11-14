@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card evidence `model` → `unclassified` (E2 → E3): the tests check invariants, and no independent model exists to name in `**Model:**`. The grade is unchanged (limited by other axes).
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-10** — tests: deterministic fuzz driver `RAFT_FUZZ` over the existing harnesses (message decode + re-encode round trip, tag, log entry, request-vote, append-entries, persistent state); reach labels count real outcomes. No code or API change.

@@ -1950,6 +1950,8 @@ phase_checks_fast_tail() {
     # bench / sizeprobe program importing a module its kind is not handed.
     # Pure Python, < 1 s.
     step "check-tool-imports" ./scripts/checks/check-tool-imports.py
+    # A class C/D card whose evidence is a model names it (plan E-W4, 2026-11-15).
+    step "check-model-field" ./scripts/checks/check-model-field.py
 
     # A passing test that writes to stderr fails every full lane (test-lib.sh's
     # "OK-but-stderr"), but nothing before the full matrix ran tests: at least

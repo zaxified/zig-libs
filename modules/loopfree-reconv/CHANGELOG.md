@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card evidence `model` → `unclassified` (E2 → E3): the tests check invariants, and no independent model exists to name in `**Model:**`. The grade is unchanged (limited by other axes).
 - **2026-10-05** — Mutation run: 28 of 32 killed, 4 equivalent; 3 tests added and one
   extended (equal-distance shift is class B and intra-class ties ascend by id; a moved
   distance with an unmoved next hop is not changed; frame-slot reuse, short payload,
