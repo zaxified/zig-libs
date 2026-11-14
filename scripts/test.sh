@@ -1946,6 +1946,10 @@ phase_checks_fast_tail() {
     # build.zig makes it stale and only the full-CI interop lane would notice
     # (full CI 42535103239: interop-mcp, `no module named 'jsontext'`). ~1 s.
     step "check-tool-module-lists" ./scripts/checks/check-tool-module-lists.py
+    # Its build.zig-wired sibling (CI audit D4, 2026-11-14): an interop / live /
+    # bench / sizeprobe program importing a module its kind is not handed.
+    # Pure Python, < 1 s.
+    step "check-tool-imports" ./scripts/checks/check-tool-imports.py
 
     # A passing test that writes to stderr fails every full lane (test-lib.sh's
     # "OK-but-stderr"), but nothing before the full matrix ran tests: at least
