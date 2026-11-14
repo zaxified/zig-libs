@@ -407,12 +407,30 @@ stamps_record() {
     # volatile (CI audit 2026-11-14: ssh recompiled daily in the push and
     # check-interop lanes for nothing).
     case "$lane" in build-deps* | check-interop*) _vol=" " ;; esac
+    # ⭐ AN ENVIRONMENT GAP NOBODY LISTED (CI audit A7, 2026-11-14). The list
+    # above knows the gaps `capability_check` probes for; any other test that
+    # skips because the host lacks something was stamped for good. The stamp
+    # now carries the run's counts (`c=<total>/<skipped>`), and a module whose
+    # skips grew by more than its tests did since its last NON-volatile stamp
+    # in this lane -- tests that passed then and skip now -- is stamped
+    # volatile. A new test that skips by mode grows both counts and passes; a
+    # persisting gap stays volatile and is printed on every run until fixed.
+    local _cnt=" " _rose=""
+    if [[ -n "${_ZL_TEST_COUNTS:-}" ]]; then
+        _cnt=" $(awk -F'\t' '{ printf "%s=%d/%d ", $1, $2, $3 }' <<< "$_ZL_TEST_COUNTS")"
+        [[ -f "$STAMPS_FILE" ]] && _rose="$(awk -F'\t' -v lane="$lane" '
+            FNR == NR { tot[$1] = $2; sk[$1] = $3; next }
+            $2 == lane && $5 != "v" && $6 ~ /^c=/ && ($1 in tot) && $4 > when[$1] { when[$1] = $4; base[$1] = substr($6, 3) }
+            END { for (m in base) { split(base[m], b, "/"); if (sk[m] - b[2] > tot[m] - b[1]) printf " %s", m } }
+        ' <(printf '%s\n' "$_ZL_TEST_COUNTS") "$STAMPS_FILE")"
+    fi
     for _m in $mods; do
         case "$_skip" in *" $_m "*) _held="$_held $_m"; continue ;; esac
         _kept="$_kept $_m"
-        case "$_vol" in *" $_m "*) _volset="$_volset$_m " ;; esac
+        case "$_vol $_rose " in *" $_m "*) _volset="$_volset$_m " ;; esac
     done
     [[ -n "$_held" ]] && echo "stamps: not stamped (skipped live on this lane):$_held"
+    [[ -n "${_rose// /}" ]] && echo "stamps: more tests skip than at the last stamp in this lane, with no new tests to explain it (an environment gap?):$_rose"
     [[ -n "${_volset// /}" ]] && echo "stamps: volatile, 24 h and never on a tag (live peer or environment gap):${_volset% }"
     mods="${_kept# }"
     [[ -z "${mods// /}" ]] && return 0
@@ -420,8 +438,14 @@ stamps_record() {
     tmp="$(mktemp "${STAMPS_FILE}.XXXXXX")"
     {
         [[ -f "$STAMPS_FILE" ]] && cat "$STAMPS_FILE"
-        printf '%s\n' "$FP_TSV" | awk -F'\t' -v OFS='\t' -v mods=" $mods " -v vol="$_volset" -v lane="$lane" -v now="$now" \
-            'index(mods, " " $1 " ") { if (index(vol, " " $1 " ")) print $1, lane, $2, now, "v"; else print $1, lane, $2, now }'
+        printf '%s\n' "$FP_TSV" | awk -F'\t' -v OFS='\t' -v mods=" $mods " -v vol="$_volset" -v lane="$lane" -v now="$now" -v cnt="$_cnt" \
+            'index(mods, " " $1 " ") {
+                 f = index(vol, " " $1 " ") ? "v" : ""
+                 i = index(cnt, " " $1 "=")
+                 if (i) { c = substr(cnt, i + length($1) + 2); c = substr(c, 1, index(c, " ") - 1); print $1, lane, $2, now, f, "c=" c }
+                 else if (f != "") print $1, lane, $2, now, f
+                 else print $1, lane, $2, now
+             }'
     } |
         # newest first per (module, lane, fingerprint) -> one line each; then
         # at most STAMPS_KEEP fingerprints per (module, lane)
@@ -655,6 +679,7 @@ stamps_partial() {
     [[ -n "$dropped" ]] && echo "stamps: not kept (dark-tests did not pass on this log):$dropped"
     [[ -z "${proven// /}" ]] && return 0
     echo "stamps: this run is red, keeping what it proved:$proven"
+    _ZL_TEST_COUNTS="$(test_counts "$_ZL_KEEP_OUT")"
     stamps_record "${proven# }" "$_ZL_PARTIAL_LANE"
 }
 
@@ -1016,6 +1041,23 @@ dark_check() {
     done
 
     step "dark-tests" "$SCRIPT_DIR/lib/dark-tests.sh" --summary "$log" $mods
+    _ZL_TEST_COUNTS="$(test_counts "$log")"
+}
+
+# Per module `<name>\t<total>\t<skipped>` from a `--summary all` log, summed
+# over its run-test lines (the same parse as dark-tests.sh). stamps_record
+# compares them with the module's last stamp (CI audit A7).
+_ZL_TEST_COUNTS=""
+test_counts() {
+    awk '
+        /^test-[^ ]+ / { mod = substr($1, 6); next }
+        mod != "" && /run test / && match($0, /\([0-9]+ total\)/) {
+            total[mod] += substr($0, RSTART + 1, RLENGTH - 8)
+            if (match($0, /[0-9]+ skip/)) skip[mod] += substr($0, RSTART, RLENGTH - 5)
+            seen[mod] = 1
+        }
+        END { for (m in seen) printf "%s\t%d\t%d\n", m, total[m], skip[m] }
+    ' "$1"
 }
 
 # ── file -> module mapping ───────────────────────────────────────────────
