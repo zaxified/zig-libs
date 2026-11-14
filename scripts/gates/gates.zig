@@ -192,8 +192,13 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
         var walker = try dir.walk(b.allocator);
         defer walker.deinit();
         while (try walker.next(io)) |entry| {
+            // A symlink was skipped like a directory, so whatever it points at
+            // was in no key (CI audit A10, 2026-11-14: none exist; this keeps it so).
+            if (entry.kind == .sym_link) return step.fail("module-fingerprints: modules/{s}/{s} is a symlink -- its target would be in no key; commit the file", .{ m.name, entry.path });
             if (entry.kind != .file) continue;
-            if (std.mem.endsWith(u8, entry.basename, ".md")) continue;
+            // Prose is out of the key -- except under `src/`, where a test can
+            // `@embedFile` it (A10: none does today).
+            if (std.mem.endsWith(u8, entry.basename, ".md") and !std.mem.startsWith(u8, entry.path, "src/")) continue;
             if (std.mem.eql(u8, entry.basename, "NOTICE") or std.mem.eql(u8, entry.basename, "LICENSE")) continue;
             if (hasComponent(entry.path, ".zig-cache") or hasComponent(entry.path, "zig-out")) continue;
             try paths.append(b.allocator, try b.allocator.dupe(u8, entry.path));
