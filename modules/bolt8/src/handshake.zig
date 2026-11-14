@@ -865,6 +865,7 @@ test "Initiator.genAct3 on an object claiming ready_act3 with no re_pub is Wrong
     var i: Initiator = .{ .ls = ls, .rs_pub = rs.public_key, .state = .ready_act3 };
     i.ss.cipher_state.initializeKey(&@as([32]u8, @splat(7))); // keyed, so Act Three's first encrypt runs
     try testing.expectError(error.WrongState, i.genAct3(&scratch_result));
+    try testing.expectEqual(Initiator.State.failed, i.state);
 }
 
 test "Responder.genAct2 on an object claiming ready_act2 with no re_pub is WrongState (sweep BB-1)" {
@@ -872,6 +873,7 @@ test "Responder.genAct2 on an object claiming ready_act2 with no re_pub is Wrong
     var r: Responder = .{ .ls = ls, .state = .ready_act2 };
     var prng = std.Random.DefaultPrng.init(0xbb1);
     try testing.expectError(error.WrongState, r.genAct2(.{ .seeded_for_test = prng.random() }));
+    try testing.expectEqual(Responder.State.failed, r.state);
 }
 
 test "Responder.readAct3 on an object claiming awaiting_act3 with no ephemeral is WrongState (sweep BB-1)" {

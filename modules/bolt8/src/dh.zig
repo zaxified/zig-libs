@@ -257,3 +257,10 @@ test "KeyPair.generate: rejects nothing observable, always yields a valid public
     const again = tu.keyPair(kp.secret_key);
     try testing.expectEqual(kp.public_key, again.public_key);
 }
+
+test "generateDeterministicInto: a rejected seed leaves a zeroed pair in out, not the caller's old bytes (mutation 2026-11-14)" {
+    var kp: KeyPair = undefined;
+    @memset(std.mem.asBytes(&kp), 0xAA);
+    try testing.expectError(error.InvalidSecretKey, KeyPair.generateDeterministicInto(&kp, &@as([32]u8, @splat(0))));
+    for (std.mem.asBytes(&kp)) |b| try testing.expectEqual(@as(u8, 0), b);
+}

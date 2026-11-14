@@ -543,3 +543,16 @@ test "recvMessage: a forged body releases no plaintext into `out` and leaves rx 
     try receiver.recvMessage(wire[length_frame_len..], &out);
     try testing.expectEqualStrings("hello", &out);
 }
+
+test "sendMessage: a too-small buffer fails before consuming any nonce (mutation 2026-11-14)" {
+    // The length frame alone would fit in `out`; if the size check let a short
+    // buffer through, the length frame would be encrypted (nonce 0 spent) and
+    // only the body would fail, leaving `tx` one frame ahead of the peer.
+    var t = tu.transportOf(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = @as([32]u8, @splat(0)), .remote_static = @as([33]u8, @splat(0)) });
+    var short: [length_frame_len + 5 + 16 - 1]u8 = undefined;
+    try testing.expectError(error.BufferWrongSize, t.sendMessage("hello", &short));
+    try testing.expectEqual(@as(u64, 0), t.tx.cipher.n);
+    var out: [length_frame_len + 5 + 16]u8 = undefined;
+    try t.sendMessage("hello", &out);
+    try testing.expectEqualSlices(u8, kv.msg_outputs[0].bytes, &out);
+}
