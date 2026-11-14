@@ -468,7 +468,7 @@ test "corpus: every signature seed reaches fromBytes, and the outcomes are pinne
 
 // ── F1: verifyBatch's randomizers are what a mutation test needs to see ────
 //
-// A1 audit F1 (`~/CML/20260901-zig-libs-audit/A1/bip340.md`): the random
+// A1 audit F1 (2026-09-01): the random
 // linear-combination coefficients `a_2..a_u` are the ONLY thing standing
 // between `verifyBatch` and an attacker who submits a batch of individually
 // INVALID signatures whose errors are crafted to cancel. Before this test,

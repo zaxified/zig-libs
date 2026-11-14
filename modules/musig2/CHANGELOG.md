@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit recorded (51 mutants, 46 killed, 5 decided, 1 new test); ctgrind source pins refreshed (tests only).
 - **2026-11-14** — tests only: stale-audit restore (delta mutation run over `nonceGen`/`nonceGenBody`, `sign`/`signBurned`, `burnSignStack`, `getSecondKey`, `reduceToScalar`, `cbytesExt` and the secnonce guards they read; 51 mutants, 46 killed, 5 equivalent or unobservable). New test: `getSecondKey` on an empty list returns the zero marker and does not slice past the end. No code change.
 - **2026-10-10** — tests: deterministic fuzz driver `MUSIG2_FUZZ` (testkit) over `partialSigVerify` on damaged partial signatures (only the published one verifies) and a full 2-3 signer session with optional tweak (partial and aggregate signatures verify; flipped bit, wrong message refused). No change to the library code.
 - **2026-10-09** — **BREAKING:** `nonceGen(out: *NonceGenResult, sk: ?*const [32]u8, …, rand_prime: *const [32]u8, io) NonceGenError!void` — the result goes through `out` (zeroed secnonce on error), `sk` and `rand_prime` by pointer (were by value: the caller frame kept copies); migrate with `var r: NonceGenResult = undefined; try nonceGen(&r, &sk, …, &rand_prime, io)`. `nonceGen` now runs under a 32 KiB dead-stack burn (`burn.zig`); new `stackprobe2_test.zig` on `testkit.stackprobe`. `sign` unchanged.

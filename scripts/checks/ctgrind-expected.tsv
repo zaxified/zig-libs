@@ -137,10 +137,10 @@
 #
 # `act1` has no row on purpose: the initiator's Act One never touches the static
 # key, so its zero would say nothing about constant time. See the harness.
-bolt8	ReleaseFast	dh	1	1	3a5322cf2306f6db	0147038b2745ef44
-bolt8	ReleaseFast	keygen	1	3	3a5322cf2306f6db	d7a8d7540234ad3e
-bolt8	ReleaseFast	act3	1	6	942ed0411744f8f1	f60e20889f25f0aa
-bolt8	ReleaseFast	transport	1	3	93208fea6d4e37fc	859416d386f56f8a
+bolt8	ReleaseFast	dh	1	1	1f229efaf8a5d60f	0147038b2745ef44
+bolt8	ReleaseFast	keygen	1	3	1f229efaf8a5d60f	d7a8d7540234ad3e
+bolt8	ReleaseFast	act3	1	6	70520d5c957422bd	f60e20889f25f0aa
+bolt8	ReleaseFast	transport	1	3	8507620bc06ad4fe	859416d386f56f8a
 bn254	ReleaseFast	field	1	1	e6846e4ec6c4207e	831aa25b5c3d2f05
 # bn254 scalarmul 5 -> 2 (re-pin 2026-09-15): `3cda42bf`/`b80e3cce` made
 # `Fr.toBytes` reduce with bn254's own CIOS behind a `blackBox` barrier instead
@@ -602,7 +602,7 @@ bls12_381	ReleaseFast	g2_scalarmul	1	2	ff4570e3f9019260	7f4e15a241002b3f
 # `isOdd (field.zig:227) <- verify (root.zig:625)` is now `verify (root.zig:625)` (isOdd inlined) --
 # the step-10 self-check's `if (r_xy.y.isOdd()) return false` on the public R, same line, still
 # inside this row's pattern. Nothing else moved (normalised stack diff).
-bip340	ReleaseFast	sign	1	<=90	91c6157c34358a2c	0ce3274dc49157be
+bip340	ReleaseFast	sign	1	<=90	54684d236b680a7f	0ce3274dc49157be
 # blindrsa blind <=493 -> <=3 (2026-11-13): blind left std.math.big and
 # std.crypto.ff for montint on rsa.PublicKey.n_mont (safegcd inverse of m*r,
 # no mask, no big-int gcd). Left, diffed with --stacks: dyn.zig elemFromBytesBE's
@@ -937,7 +937,7 @@ frost	ReleaseFast	sign	1	13	e9c0cc9c3a3a82b0	1da8c496388f45b0
 # parse of the signer's own public key and public nonce -- values the signer publishes, tainted
 # because the harness derives them from the secrets. One group.add context in mulPublicGlv gone
 # (inlining). musig2 SPEC.md CT note.
-musig2	ReleaseFast	sign	1	<=103	826526ac5615a5bb	2a2f275cd0c5c7c5
+musig2	ReleaseFast	sign	1	<=103	8c50aacfe75ce8bd	2a2f275cd0c5c7c5
 # taproot secret 10 -> 9 (re-pin 2026-09-15). The row was already stale at
 # 0c0ef527: a --stacks run of that tree reads 9, with the SAME context set as
 # today. The source pin never moved, so the drop came from a dependency before

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** card records the no-panic sweep and the whole-module mutation run (131/137 killed, 6 decided); ctgrind source pins refreshed after the sweep fix (counts unchanged).
 - **2026-11-14** — Test: `Responder.deinit` is pinned to zero its ephemeral key and embedded cipher key, not just `ls` and `ck`.
 - **2026-11-14** — Mutation run: new tests pin that a too-small `sendMessage` buffer spends no nonce, that a rejected seed zeroes `generateDeterministicInto`'s `out`, and that the hand-set-state errors mark `genAct3`/`genAct2` `.failed`.
 - **2026-11-14** — SPEC Backlog: `HandshakeResult` has no wipe helper (additive, deferred).
