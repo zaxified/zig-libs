@@ -573,23 +573,32 @@ test "present: an allocation failure during the propagation check is OutOfMemory
     try lab.start(&rules);
     defer lab.stop();
     var saw_oom = false;
-    for (0..240) |k| {
-        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = k % 120 });
-        var f: Fake = .{};
-        var o = baseOpts(&lab, &f);
-        o.propagation_timeout_ms = 300;
-        // Second half: the authoritative list is given, not looked up.
-        if (k >= 120) o.authoritative = &loopback;
-        var s = Dns01Solver.init(lab.threaded.io(), failing.allocator(), o);
-        defer s.deinit();
-        s.present("a.test", "tok", ka_t) catch |err| {
-            if (failing.has_induced_failure) {
+    // Every allocation point in turn, until a run gets through untouched.
+    for ([_]bool{ false, true }) |given| {
+        var k: usize = 0;
+        var finished = false;
+        while (k < 3000) : (k += 1) {
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = k });
+            var f: Fake = .{};
+            var o = baseOpts(&lab, &f);
+            o.propagation_timeout_ms = 300;
+            // Second pass: the authoritative list is given, not looked up.
+            if (given) o.authoritative = &loopback;
+            var s = Dns01Solver.init(lab.threaded.io(), failing.allocator(), o);
+            defer s.deinit();
+            s.present("a.test", "tok", ka_t) catch |err| {
+                try testing.expect(failing.has_induced_failure);
                 try testing.expectEqual(error.OutOfMemory, err);
                 saw_oom = true;
-            }
-            try testing.expectEqual(f.presents, f.cleanups);
-            try testing.expectEqual(@as(usize, 0), s.pendingCount());
-        };
+                try testing.expectEqual(f.presents, f.cleanups);
+                try testing.expectEqual(@as(usize, 0), s.pendingCount());
+                continue;
+            };
+            try testing.expect(!failing.has_induced_failure);
+            finished = true;
+            break;
+        }
+        try testing.expect(finished);
     }
     try testing.expect(saw_oom);
 }
