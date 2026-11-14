@@ -603,6 +603,36 @@ test "present: an allocation failure during the propagation check is OutOfMemory
     try testing.expect(saw_oom);
 }
 
+test "nameservers: an allocation failure at any point frees everything and says OutOfMemory (sweep AD-4)" {
+    const rules = [_]Rule{
+        .{ .name = "n.test", .qtype = t_ns, .rdata = comptime wire("ns1.n.test") },
+        .{ .name = "n.test", .qtype = t_ns, .rdata = comptime wire("ns2.n.test") },
+        .{ .name = "n.test", .qtype = t_ns, .rdata = comptime wire("ns3.n.test") },
+    };
+    var lab: Lab = undefined;
+    try lab.start(&rules);
+    defer lab.stop();
+    var r = lab.resolver();
+    defer r.deinit();
+    var finished = false;
+    for (0..40) |k| {
+        // `resize_fail_index = 0`: shrinking in place fails, so `toOwnedSlice`
+        // has to allocate, and can fail.
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = k, .resize_fail_index = 0 });
+        const names = zone.nameservers(&r, failing.allocator(), "n.test") catch |err| {
+            try testing.expect(failing.has_induced_failure);
+            try testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        defer zone.freeNames(failing.allocator(), names);
+        try testing.expect(!failing.has_induced_failure);
+        try testing.expectEqual(@as(usize, 3), names.len);
+        finished = true;
+        break;
+    }
+    try testing.expect(finished);
+}
+
 fn chainRules(comptime prefix: []const u8, comptime n: usize) [n]Rule {
     comptime {
         var out: [n]Rule = undefined;
