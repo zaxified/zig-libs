@@ -17,6 +17,7 @@ Audit detail: the 2026-11-01 review is a delta over `core.zig` (the `fuzz driver
 **Performance:** ref 0.60–0.86× go.etcd.io/bbolt v1.5.0 · fastest 1.12× LMDB 0.9.31 (update_txn_1k; put_txn_1k 1.00×, every read row ≤ 0.90× the fastest of bbolt and LMDB; on `kv.FsStorage.initMmap`) (measured 2026-10-25)
 
 **Evidence:** model-fuzz — random op sequences and cursor walks compared to a model (gap model); recover fuzz
+**Model:** src/harness.zig:Model · src/harness.zig:RefStoreImpl
 
 **Known defects:** none recorded
 

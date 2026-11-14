@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-10** — **NO CONSUMER-VISIBLE CHANGE** (Zig 0.17.1 migration): `toU64` is `std.math.cast(u64, x)` again instead of a range test plus bit reinterpretation, which avoided the Zig 0.17.0 `trunc nsw` miscompile (ziglang/zig#37131, fixed in 0.17.1; `build.zig` now refuses older compilers). The hostile-length-field test stays as its regression guard.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `jsonDepthWithin` is now a thin wrapper over `jsontext.depthWithin` (same results); new dependency `jsontext`.
 - **2026-11-03** — **BEHAVIOURAL, not breaking:** `writeFrame`/`writeFrameWithHeader` return the new `error.SkipNotWritable` for a `Prefix.skip` other than null or the whole head (such a frame would not read back); length arithmetic no longer casts signed to a narrower unsigned (Zig #37131 guard); the fuzz model now also checks what the writer emits.

@@ -13,6 +13,7 @@
 **Performance:** not measured
 
 **Evidence:** model-fuzz — Hilbert R-tree compared to naive linear-scan oracle over random point sets plus fuzz
+**Model:** src/root.zig:Oracle
 
 **Known defects:** none recorded
 

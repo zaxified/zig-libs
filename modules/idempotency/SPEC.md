@@ -15,6 +15,7 @@
 **Performance:** n/a — the reference is a specification (Stripe idempotent requests, draft-ietf-httpapi-idempotency-key-header-07), there is no implementation to time (2026-10-10)
 
 **Evidence:** model-fuzz — seeded random request sequences (method, path, key, body, caller, clock) through the middleware compared with a linear-scan model of the documented decision order; pure helpers against models
+**Model:** src/root.zig:linear-scan model · src/root.zig:vs. models on random inputs
 
 **Known defects:** none recorded
 

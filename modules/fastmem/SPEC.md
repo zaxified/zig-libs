@@ -15,6 +15,7 @@ Audit detail: the 2026-11-01 review is a delta over `sweep_test.zig` only (full-
 **Performance:** ref 0.10–1.01× musl 1.2.5 memset/memcpy · fastest 0.57–1.08× glibc 2.43 memset/memcpy (measured 2026-10-26)
 
 **Evidence:** model-fuzz — 3000 seeded cases each for `set` and `copy` (length drawn per arm: small, overlap k = 1/2/4, vector loop, `rep movsb`, `rep stosq`; destination and source offsets 0..127; random fill byte and contents) compared byte by byte with the C11 definition, 128-byte guards checked untouched, every arm reached; plus exhaustive length 0..300 x offset 0..63 and PROT_NONE guard pages on both sides of source and destination
+**Model:** src/root.zig:modelFuzz
 
 **Known defects:** none recorded
 

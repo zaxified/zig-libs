@@ -13,6 +13,7 @@
 **Performance:** not measured
 
 **Evidence:** model-fuzz — random operations and crashes compared to a model; partition-FIFO oracle; damaged-record sweep
+**Model:** src/root.zig:agree with a model · src/root.zig:taskqueue-fold oracle
 
 **Known defects:** none recorded
 

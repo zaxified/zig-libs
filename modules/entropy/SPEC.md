@@ -13,6 +13,7 @@
 **Performance:** ref 0.92–1.01× Go crypto/rand.Read · fastest ? (measured 2026-10-20)
 
 **Evidence:** model — vDSO symbol lookup against an independent section-table model on every exported symbol; output invariants (byte chi-square, per-position coverage) on every route; route pinned by `CountingIo`
+**Model:** src/vgetrandom.zig:modelSymbols · src/vgetrandom.zig:ModelSym
 
 **Known defects:** none recorded
 

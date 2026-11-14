@@ -15,6 +15,7 @@
 **Performance:** ref 0.14–1.00× github.com/rosedblabs/rosedb/v2 v2.4.0 · fastest 1.13× prologic/bitcask v1.0.2 (scan; get_hit 1.00×, every other row ≤ 1.01× the fastest of rosedb, prologic/bitcask and nutsdb; reads through `FsStorage.initMmap`) (measured 2026-10-25)
 
 **Evidence:** model-fuzz — VOPR: randomized fault schedules across seeds with model-checked recovery
+**Model:** src/vopr.zig:modelMatches · src/fault_test.zig:Model
 
 **Known defects:** none recorded
 

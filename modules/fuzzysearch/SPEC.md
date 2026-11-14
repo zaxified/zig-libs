@@ -13,6 +13,7 @@
 **Performance:** not measured
 
 **Evidence:** model-fuzz — pruned automaton walk compared to brute-force OSA over many random key sets plus fuzz driver
+**Model:** src/root.zig:Oracle
 
 **Known defects:** none recorded
 

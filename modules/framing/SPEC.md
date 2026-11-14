@@ -13,6 +13,7 @@
 **Performance:** ref 0.77× tokio-util 0.7.19 `LengthDelimitedCodec` · fastest 0.83× asynchronous-codec 0.7.0 `LengthCodec` (measured 2026-11-03 after the last code change; `zig build bench-framing -Djcc-safe`, 21 rounds, each side keeps its best, wall time, 64-frame ops; per row ours/ref and ours/fastest: `dec_64` 0.17×/0.35×, `dec_1024` 0.58×/0.83×, `enc_64` 0.39×/0.51×, `enc_1024` 0.77×/0.81×. ONLY the u64 big-endian path is measured: it is the one wire all three speak; other widths, offsets and varint are not benchmarked. The host was shared and the spread across rounds was 10-84 %, so a single ratio is soft; three runs before and after (5, 9, 21 rounds) gave worst 0.75, 0.67, 0.77 against the reference and 0.84, 0.79, 0.83 against the fastest, i.e. ours was faster in every row of every run by more than the noise. Both sides time the same per-op work, see the header of `tools/bench.zig`)
 
 **Evidence:** model-fuzz — a literal in-tree model of the format that the fuzz driver compares Decoder, readFrame and readFrameAlloc against, plus an encoder round-trip through the model (400 000 seeds, 2026-11-03); also differenced against tokio-util 0.7.19 (`tools/oracle`, 30 000 cases, 29 311 identical, 211 identical up to a by-design refusal, 478 refused by the oracle and not compared)
+**Model:** src/root.zig:modelDecode · tools/diff.zig · tools/oracle/src/main.rs
 
 **Known defects:** none recorded
 

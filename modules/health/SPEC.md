@@ -15,6 +15,7 @@
 **Performance:** ref 0.01–0.08× alexliesenfeld/health v0.8.1 · fastest 1.09× gofiber/fiber v3.6.1 `middleware/healthcheck` (row `readiness_3_up`, net of each side's HTTP stack; fiber's body carries no per-check detail, ours does; liveness 0.96×, detail-off 0.75×; `tools/go_fast_bench`) (measured 2026-10-24)
 
 **Evidence:** model-fuzz — seeded random configs (checks, names, paths, `detail`) and requests (method, path) through the middleware compared with a naive probe/body/call-count model
+**Model:** src/root.zig:model-fuzz
 
 **Known defects:** none recorded
 

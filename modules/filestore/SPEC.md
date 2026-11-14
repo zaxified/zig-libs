@@ -13,6 +13,7 @@
 **Performance:** ref 0.06–1.00× peterbourgon/diskv v3.0.0 in its atomic `TempDir` mode, Go 1.26.8 (`zig build bench-filestore`: 16 × 1 KiB puts at equal durability — ours `.none`/`.data` vs diskv `Write`/`WriteStream(sync)` 0.74×/1.00×, reads `get` 0.34×, `has` 0.71×, a 1,000-key walk 0.06×; ours `.full` adds the directory fsync diskv never does, 1.97×, info only; real disk, not tmpfs) · fastest ? (measured 2026-11-01)
 
 **Evidence:** model-fuzz — random sequences of every public `Store` operation (put/get/delete/has/CAS/TTL + clock/sweep/list/listPrefix/stream/openRecord/eraseKind/putManyBytes/importFile) against an in-memory key → {bytes, deadline} model (`src/fuzz_test.zig`)
+**Model:** src/fuzz_test.zig:Model
 
 **Known defects:** none recorded
 
