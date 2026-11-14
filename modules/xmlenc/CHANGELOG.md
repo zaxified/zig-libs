@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-14** — **Public API change** (field added; no in-repo importer affected) and a Z1 fix the ReleaseFast lane found: `decryptDataToDocument` wiped its plaintext buffer, but `xml.parse`'s arena holds copies of it too and `Document.deinit` released them unwiped (the ReleaseFast test "Z1: decryptDataToDocument wipes the plaintext IT frees" found the assertion body in a released block; it never ran in ReleaseFast before). The tree's arena is now backed by a private wiping allocator; `DecryptedDocument` gains the `wiper` field that owns it, freed by `deinit`.
+
 - **2026-11-13** — ctgrind harness (`src/ctgrind_harness.zig`; rows `oaep`, `cbc`, `rsa15`, `kw`) and one fix it found: `rsaPkcs1v15Unwrap`'s masked message-extraction loop was lowered by LLVM to a branch on the padding-separator position (the `rsa15` row read 4 in-file contexts, 3 after an asm barrier on the mask). No behavioural change. The rows and their per-context attribution are in `SPEC.md` § Constant-time posture.
 
 - **2026-11-13** — **Public API change** (no in-repo importer affected: `saml` uses `decryptData` / `decryptAssertion`) and two fixes from the 2026-11-13 no-panic sweep (XEN-1..3).

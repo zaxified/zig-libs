@@ -321,6 +321,7 @@ respective sibling modules. Base64 remains from std.
 
 ## Backlog / deferred
 
+- 2026-11-14: `WipingAllocator` is a private copy in `xmlenc`, `xmldsig`, `wireguard` (and `bbs`'s `WipeAllocator`) -- the same adapter four times; a shared home (a small `wipe` module, or `testkit`-free public helper) is an owner decision.
 - 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
 
 **Missing and it matters** *(survey 2026-09-30)*:

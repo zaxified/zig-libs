@@ -2177,10 +2177,10 @@ webhooksig	ReleaseFast	ed25519	1	30	691f63387d17ed1d	0ddab6b90956b2fe
 #            the masked extraction loop (`ctEqMaskUsize(s, sep_idx)`) was compiled to a branch on
 #            the separator position; an asm barrier (`blackBox`) fixed it, measured.
 #   kw 3     aeskw unwrapBody :171 (integrity-check verdict) + aesgcm tag verdict, accept and reject.
-xmlenc	ReleaseFast	oaep	1	3	57e15451cd55c988	b6a414715b391ccc
-xmlenc	ReleaseFast	cbc	1	14	57e15451cd55c988	cb2ee56c03b2b7a6
-xmlenc	ReleaseFast	rsa15	1	3	57e15451cd55c988	fcf38565ab1ce414
-xmlenc	ReleaseFast	kw	1	3	57e15451cd55c988	65e898b409f3bf26
+xmlenc	ReleaseFast	oaep	1	3	2819e99540ad3dfa	b6a414715b391ccc
+xmlenc	ReleaseFast	cbc	1	14	2819e99540ad3dfa	cb2ee56c03b2b7a6
+xmlenc	ReleaseFast	rsa15	1	3	2819e99540ad3dfa	fcf38565ab1ce414
+xmlenc	ReleaseFast	kw	1	3	2819e99540ad3dfa	65e898b409f3bf26
 # saml, 2026-11-13 (sweep hB): the SP's RSA private key signing a LogoutRequest and a redirect
 # query string (`sign_with` / `buildSignedRedirectQuery`).
 #   sign 45  1 = rsa privateOpCrtPtr:1286 (the F3 fault-check verdict, rsa's own row) + 44 =

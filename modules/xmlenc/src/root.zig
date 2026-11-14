@@ -261,6 +261,10 @@ pub const DecryptedDocument = struct {
     doc: xml.Document,
     /// The recovered octets `doc` borrows from. Do not free or modify.
     plaintext: []u8,
+    /// Backs `doc`'s arena, so the arena's blocks are wiped when they go back.
+    /// Heap-allocated: the arena keeps a pointer to it and this struct is
+    /// returned by value.
+    wiper: *WipingAllocator,
 
     /// Release the tree first (its slices borrow `plaintext`), then wipe the
     /// recovered content before it goes back to `alloc` (CONVENTIONS §2.1 Z2:
@@ -270,6 +274,7 @@ pub const DecryptedDocument = struct {
         self.doc.deinit();
         std.crypto.secureZero(u8, self.plaintext);
         alloc.free(self.plaintext);
+        alloc.destroy(self.wiper);
         self.* = undefined;
     }
 };
@@ -294,9 +299,50 @@ pub fn decryptDataToDocument(
         std.crypto.secureZero(u8, plain);
         alloc.free(plain);
     }
-    const doc = try xml.parse(alloc, plain, .{ .id_attr_names = &.{"ID"}, .max_elements = options.max_elements });
-    return .{ .doc = doc, .plaintext = plain };
+    // The tree's arena holds copies of the plaintext too (measured 2026-11-14:
+    // the ReleaseFast Z1 test found the assertion body in a released arena
+    // block after `plain` itself was wiped), so the arena is backed by an
+    // allocator that wipes every block it gives back.
+    const wiper = try alloc.create(WipingAllocator);
+    errdefer alloc.destroy(wiper);
+    wiper.* = .{ .child = alloc };
+    const doc = try xml.parse(wiper.allocator(), plain, .{ .id_attr_names = &.{"ID"}, .max_elements = options.max_elements });
+    return .{ .doc = doc, .plaintext = plain, .wiper = wiper };
 }
+
+/// Forwards to `child` and wipes every block before it goes back (CONVENTIONS
+/// §2.1 Z1). `resize`/`remap` are refused, so a growing or shrinking buffer goes
+/// through alloc + copy + `free`, and that `free` is this one. ReleaseFast is the
+/// mode it matters in: there `Allocator.free`'s `@memset(undefined)` compiles
+/// away. Same shape as `xmldsig`'s and `wireguard`'s private adapters.
+const WipingAllocator = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *WipingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = allocFn,
+            .resize = resizeFn,
+            .remap = remapFn,
+            .free = freeFn,
+        } };
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *WipingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, a, ra);
+    }
+    fn resizeFn(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remapFn(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn freeFn(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *WipingAllocator = @ptrCast(@alignCast(ctx));
+        std.crypto.secureZero(u8, m);
+        self.child.rawFree(m, a, ra);
+    }
+};
 
 // ── content algorithm classification ────────────────────────────────────────
 
