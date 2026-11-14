@@ -6,7 +6,9 @@
 
 **Scope:** parity — libsodium 1.0.22 `sodium_bin2base64`/`sodium_base642bin` (surveyed 2026-10-17)
 
-**Audit:** review 2026-10-30 · mutation 2026-10-30 (51/52, 1 eq) · src a8b50e2fb068fe21
+**Audit:** review 2026-10-30 · mutation 2026-10-30 (51/52, 1 eq) · src 6d4570e2169d9d05
+
+*Source moved without a production-logic change (2026-11-14):* since the recorded run only the `meta` target list (`.linux32` added), `eqMask` turning `pub` with a doc comment (body byte-identical) and a test-file header comment changed — no mutant applies; `eqMask` is exercised again through keycodec's 2026-11-14 delta run.
 
 **Hardening:** fuzz 2026-10-17 (1,000,000 runs clean, B64CT_FUZZ, every reach label hit) · ct 2026-10-17 (ctgrind: octets tainted for `encode`, text for `decode`/`ignore`, 0 in-file; positive controls 204/69/46) · panic 2026-10-30 (sweep + blind review: `encodedLen`/`encodedWrappedLen` saturate; delta audit 6/7 + 1 eq)
 

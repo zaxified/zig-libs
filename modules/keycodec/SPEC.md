@@ -6,7 +6,9 @@
 
 **Scope:** parity — Go 1.26 `crypto/x509` key codecs + `encoding/pem`, RustCrypto `pkcs8`/`sec1`/`spki`, OpenSSL 3.5.5 (surveyed 2026-11-05; both gaps of the survey, encrypted PKCS#8 and PEM headers on encode, closed 2026-11-07)
 
-**Audit:** review 2026-11-05 · mutation 2026-11-07 (547/574, 27 eq) · src b52d60ba267499c4
+**Audit:** review 2026-11-05 · mutation 2026-11-14 (555/582, 27 eq) · src 9e565e6e8c316586
+
+*Delta mutation run 2026-11-14:* `pem.zig` `tokenMask` (now on `b64ct.eqMask`, the local copy removed by the duplicate-code pass) whole plus the shared `eqMask` as seen from here, 8 mutants, 8 killed. `startsHeader` reads `tokenMask`, whose behaviour is unchanged, so its earlier mutants stand.
 
 Audit detail: mutation run 2026-11-06 (whole module, outside the repo): 390
 mutants in one ReleaseSafe build; 378 killed by the suite (2 of them hangs), 4 burn mutants

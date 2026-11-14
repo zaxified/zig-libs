@@ -6,7 +6,9 @@
 
 **Scope:** parity — OpenSSL 3.5.5 (surveyed 2026-10-10)
 
-**Audit:** review 2026-11-01 · mutation 2026-10-30 (24/25, 1 eq) · src 9a7d399b3d8a7719
+**Audit:** review 2026-11-01 · mutation 2026-10-30 (24/25, 1 eq) · src 335fe8902cbe9d75
+
+*Source moved without a production change (2026-11-14):* the test-only `fromHex` helper became `testkit.hex.bytes` (used inside `test` blocks only) and a test-file header comment changed — no production line, no mutant applies.
 
 Audit detail: the 2026-11-01 review is a delta over `stackprobe_test.zig` only (full-CI fix: `initEncInto`'s probe no longer lists the still-zero `dec` schedule as a secret); library source unchanged since the mutation run.
 

@@ -6,7 +6,9 @@
 
 **Scope:** parity — OpenSSL 3.5.5 (surveyed 2026-10-10)
 
-**Audit:** review 2026-10-30 · mutation 2026-10-30 (35/39, 4 eq) · src 2be88be3c8ac7fc7
+**Audit:** review 2026-10-30 · mutation 2026-11-14 (57/61, 4 eq) · src 15e533835209dbc6
+
+*Delta mutation run 2026-11-14 (restores A1 after the 2026-11-13 constant-time fix):* `ct.blackBox` and the four laundered masks (`Fe.canonical`, `Fe.cMov`, `condSub`, `Scalar.sub`) whole, 22 mutants, 22 killed (blackBox returning 0/`~y`/`y^1`; dropped carry passes, skipped fold/select, inverted masks, ignored borrows). Not mutated: the `@inComptime()` guard in `blackBox` (removing it does not compile) and the alias line in `group.zig` (every call site is hit through the blackBox mutants).
 
 **Hardening:** fuzz 2026-10-10 (200,000 runs clean, P521_FUZZ, every reach label hit) · ct 2026-10-11 (ctgrind mul/keygen/sign/ecdh: secret tainted, 0 in-file; positive control `vartime` flags) · panic 2026-10-30 (sweep + blind review: `der_encoded_length_max` 139 → 141, `toDer` of any `fromBytes` input no longer overflows; delta audit 1/1)
 

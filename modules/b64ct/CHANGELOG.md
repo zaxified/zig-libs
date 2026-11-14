@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** Audit `src` refreshed — no production logic changed since the recorded run (`eqMask` made `pub`, `.linux32` target); a test-file comment no longer names a private report path.
 - **2026-11-08** — **NEW:** `eqMask(c, x)` is public (0xff when the bytes are equal, else 0; branch- and table-free), the one copy `keycodec.pem` and `smtp.auth` use.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `meta.targets` gains `.linux32` (the code is portable; `sealedbox`, which targets linux32, now depends on it).
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GU). `encodedLen`/`encodedWrappedLen` saturate instead of wrapping to a small number in ReleaseFast for `n` above 3/4 of the address space (which defeated `encode`'s own length check). Tests: `src/sweep_test.zig`.

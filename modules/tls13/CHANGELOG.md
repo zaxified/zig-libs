@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** Audit line refreshed after the `EntropyFailure` delta mutation run (2/2 killed by the new test).
 - **2026-11-14** — **Tests:** delta mutation audit of `certverify` `signRsaPss`'s new `EntropyFailure` arm: an all-zero `random` must surface `error.EntropyFailure` on every RSA-PSS scheme (kills the arm remapped to another error).
 - **2026-11-13** — **HARDENING (error-set addition):** `certverify.SignError` gains `EntropyFailure` (rsa's bounded blinding draw gave up on a broken `random`); RSA-PSS signing returns it instead of hanging.
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog records the P1 rows after `ct25519` P9 (`cli_x25519` 1.24× aws-lc-rs, to re-measure quietly) and the deferred RSA-PSS AVX2 route.
