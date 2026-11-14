@@ -207,7 +207,7 @@ pub const module_list = [_]Module{
     .{ .name = "resilience", .libs = &.{ "web", "net" }, .deps = &.{"clock"}, .test_deps = &.{"testkit"} },
     .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy", "p256", "p384", "p521", "rsa", "netaddr", "x509", "datefmt", "keycodec" }, .test_deps = &.{"testkit"}, .loopback = true },
     // DNS-01 helpers + publishers for acme; a sibling so acme's consumers do not carry dns/procrun.
-    .{ .name = "acmedns", .libs = &.{"web"}, .deps = &.{ "acme", "dns", "http", "netaddr", "procrun", "b64ct" }, .test_deps = &.{"testkit"} },
+    .{ .name = "acmedns", .libs = &.{"web"}, .deps = &.{ "acme", "dns", "http", "netaddr", "procrun", "b64ct" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "netlink", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "genetlink", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "nl80211", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .netns = true },

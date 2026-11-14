@@ -6,9 +6,11 @@
 
 **Scope:** parity — lego v5 `challenge/dns01` + its generic providers (`rfc2136`, `acmedns`, `httpreq`, `exec`), certmagic `DNS01Solver` (surveyed 2026-10-16 within acme's full-competitor survey, items R12/R13; vendor providers excluded by the owner)
 
-**Audit:** review 2026-10-16 · mutation none · src ?
+**Audit:** review 2026-10-16 · mutation 2026-11-14 (144/154, 10 eq) · src df529ae71ef91569
 
-**Hardening:** fuzz 2026-10-16 (ACMEDNS_FUZZ: acme-dns `/register` reply, TXT reply through `txtPresent`; 500 seeds per test run, every reach label hit) · ct n/a — holds no secret computation: TSIG is `dns.tsig`'s (burned, stack-probed), credentials are passed through to `http` headers
+*First mutation run 2026-11-14* (whole module: Dns01Solver.zig, publishers.zig, zone.zig): 154 mutants, 141 killed in the ReleaseSafe schemata binary (8 more after new tests), 3 more (the `nameservers` errdefers) killed only by a Debug probe because allocation indexes differ by mode, covered by a dedicated `FailingAllocator` test; 7 equivalent (`>`/`>=` at an exact millisecond, `any` implies `asked`, an encoded length that is never 512, a guard callers cannot reach, a seen-list that only saves queries, `trimDot` on names `dns.decode` already returns undotted); 3 unobservable here (the system-resolver branch needs a controlled /etc/resolv.conf -- interop lane; the key-authorization wipe is invisible in safe builds, its test bites in ReleaseFast, not yet run).
+
+**Hardening:** fuzz 2026-10-16 (ACMEDNS_FUZZ: acme-dns `/register` reply, TXT reply through `txtPresent`; 500 seeds per test run, every reach label hit) · ct n/a — holds no secret computation: TSIG is `dns.tsig`'s (burned, stack-probed), credentials are passed through to `http` headers · panic 2026-11-14 (sweep of every pub entry point: HIGH `post`/`register` read the response body with no time bound after the head, so a server sending `200` + `Content-Length` and stalling blocked the caller forever, now `readAllAllocTimeout(64 KiB, total_timeout_ms)`; MED `propagation_timeout_ms` was checked only between passes, while one pass could run servers × addresses × `query_timeout_ms`, now gated before every query; MED a failing `toOwnedSlice` in `zone.nameservers` was a use-after-free and double free instead of `error.OutOfMemory`, plus two leaks on allocation failure; LOW basic-auth bound comment 379 -> 378)
 
 **Performance:** n/a — every step waits on DNS, an HTTP endpoint, a child process or the CA
 
