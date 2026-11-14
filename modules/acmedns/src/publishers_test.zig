@@ -241,6 +241,12 @@ test "HttpReq: default JSON with basic auth, RAW JSON without, cleanup, 2xx" {
     try testing.expect(peer.has("{\"fqdn\":\"_acme-challenge.a.test.\",\"value\":\"loqxcyv8q5onbjqxbmr7sctno3tiaxdfowyjxajeux0\"}"));
     try testing.expect(peer.has("authorization: basic ym9ionb3\r\n"));
     try testing.expect(peer.has("{\"domain\":\"a.test\",\"token\":\"tok\",\"keyauth\":\"tok.thumb\"}"));
+    // The default-mode publisher spoke first (present, cleanup), the RAW one after.
+    const dflt = std.mem.find(u8, peer.log[0..peer.log_len], "{\"fqdn\"").?;
+    const raw_at = std.mem.find(u8, peer.log[0..peer.log_len], "{\"domain\"").?;
+    try testing.expect(dflt < raw_at);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, peer.log[0..peer.log_len], "{\"fqdn\""));
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, peer.log[0..peer.log_len], "{\"domain\""));
     // Both calls of the first publisher carry it, the RAW publisher's none.
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, peer.log[0..peer.log_len], "authorization:"));
 }

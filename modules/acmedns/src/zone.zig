@@ -134,11 +134,17 @@ pub fn nameservers(r: *dns.Resolver, gpa: std.mem.Allocator, zone: []const u8) E
     var msg = try r.query(zone, .ns);
     defer msg.deinit();
     var names: std.ArrayList([]u8) = .empty;
-    errdefer freeNames(gpa, names.items);
-    defer names.deinit(gpa);
+    // Not `freeNames`: that frees the list's own buffer too, which `deinit`
+    // does. On success `toOwnedSlice` leaves the list empty.
+    errdefer {
+        for (names.items) |n| gpa.free(n);
+        names.deinit(gpa);
+    }
     for (msg.answers) |rec| {
         if (rec.class == .in and rec.data == .ns and eqlName(rec.name, zone)) {
-            try names.append(gpa, try gpa.dupe(u8, trimDot(rec.data.ns)));
+            const name = try gpa.dupe(u8, trimDot(rec.data.ns));
+            errdefer gpa.free(name);
+            try names.append(gpa, name);
         }
     }
     return names.toOwnedSlice(gpa);
@@ -276,6 +282,10 @@ test "copyName: a CNAME target copied over the name it came from" {
     try testing.expectEqualStrings("_acme-challenge.example.org", a);
     const b = try copyName(&out, out[16..a.len]);
     try testing.expectEqualStrings("example.org", b);
+    // Overlapping: the source starts inside the destination's range.
+    const c1 = try copyName(&out, "_acme-challenge.example.org");
+    const c2 = try copyName(&out, out[3..c1.len]);
+    try testing.expectEqualStrings("me-challenge.example.org", c2);
     const long: [254]u8 = @splat('a');
     try testing.expectError(error.NameTooLong, copyName(&out, &long));
     const fits: [253]u8 = @splat('a');

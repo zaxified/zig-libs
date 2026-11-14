@@ -275,7 +275,11 @@ fn waitPropagation(s: *Dns01Solver, r: *dns.Resolver, fqdn: []const u8, zone_nam
     var names: [][]u8 = &.{};
     defer zone.freeNames(s.gpa, names);
     if (s.options.authoritative.len != 0) {
-        for (s.options.authoritative) |ip| try servers.append(s.gpa, try s.gpa.dupe(netaddr.Ip, &.{ip}));
+        for (s.options.authoritative) |ip| {
+            const one = try s.gpa.dupe(netaddr.Ip, &.{ip});
+            errdefer s.gpa.free(one);
+            try servers.append(s.gpa, one);
+        }
     } else {
         names = zone.nameservers(r, s.gpa, zone_name) catch |err| {
             s.note = "looking up the zone's NS records failed";

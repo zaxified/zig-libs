@@ -522,6 +522,78 @@ test "propagation: check_resolvers asks every recursive resolver" {
     try s2.present("a.test", "tok", ka_t);
 }
 
+test "propagation: even a zero timeout asks once; a resolvable server that does not answer holds it" {
+    const value = acme.jws.dns01TxtValueFromKeyAuthorization(ka_t);
+    var rd = txtRdataOf(value);
+    const rules = [_]Rule{
+        .{ .name = "a.test", .qtype = t_ns, .rdata = comptime wire("ns1.a.test") },
+        .{ .name = "a.test", .qtype = t_ns, .rdata = comptime wire("ns2.a.test") },
+        .{ .name = "ns1.a.test", .qtype = t_a, .rdata = "\x7f\x00\x00\x01" },
+        .{ .name = "ns1.a.test", .qtype = t_aaaa },
+        .{ .name = "ns2.a.test", .qtype = t_a, .rdata = "\x7f\x00\x00\x02" },
+        .{ .name = "ns2.a.test", .qtype = t_aaaa },
+        .{ .name = "_acme-challenge.a.test", .qtype = t_txt, .rdata = &rd },
+    };
+    var lab: Lab = undefined;
+    try lab.start(&rules);
+    defer lab.stop();
+    var f: Fake = .{};
+    var o = baseOpts(&lab, &f);
+    o.propagation_timeout_ms = 0;
+    o.authoritative = &loopback;
+    {
+        var s = Dns01Solver.init(lab.threaded.io(), testing.allocator, o);
+        defer s.deinit();
+        try s.present("a.test", "tok", ka_t);
+    }
+    // ns2 resolves, but nothing answers there: all must, or one is enough.
+    o.propagation_timeout_ms = 400;
+    o.authoritative = &.{};
+    {
+        var s = Dns01Solver.init(lab.threaded.io(), testing.allocator, o);
+        defer s.deinit();
+        try testing.expectError(error.PropagationTimeout, s.present("a.test", "tok", ka_t));
+    }
+    o.require_all_authoritative = false;
+    var s = Dns01Solver.init(lab.threaded.io(), testing.allocator, o);
+    defer s.deinit();
+    try s.present("a.test", "tok", ka_t);
+}
+
+test "present: an allocation failure during the propagation check is OutOfMemory, never a timeout (sweep AD-4)" {
+    const value = acme.jws.dns01TxtValueFromKeyAuthorization(ka_t);
+    var rd = txtRdataOf(value);
+    const rules = [_]Rule{
+        .{ .name = "a.test", .qtype = t_ns, .rdata = comptime wire("ns1.a.test") },
+        .{ .name = "ns1.a.test", .qtype = t_a, .rdata = "\x7f\x00\x00\x01" },
+        .{ .name = "ns1.a.test", .qtype = t_aaaa },
+        .{ .name = "_acme-challenge.a.test", .qtype = t_txt, .rdata = &rd },
+    };
+    var lab: Lab = undefined;
+    try lab.start(&rules);
+    defer lab.stop();
+    var saw_oom = false;
+    for (0..240) |k| {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = k % 120 });
+        var f: Fake = .{};
+        var o = baseOpts(&lab, &f);
+        o.propagation_timeout_ms = 300;
+        // Second half: the authoritative list is given, not looked up.
+        if (k >= 120) o.authoritative = &loopback;
+        var s = Dns01Solver.init(lab.threaded.io(), failing.allocator(), o);
+        defer s.deinit();
+        s.present("a.test", "tok", ka_t) catch |err| {
+            if (failing.has_induced_failure) {
+                try testing.expectEqual(error.OutOfMemory, err);
+                saw_oom = true;
+            }
+            try testing.expectEqual(f.presents, f.cleanups);
+            try testing.expectEqual(@as(usize, 0), s.pendingCount());
+        };
+    }
+    try testing.expect(saw_oom);
+}
+
 fn chainRules(comptime prefix: []const u8, comptime n: usize) [n]Rule {
     comptime {
         var out: [n]Rule = undefined;
