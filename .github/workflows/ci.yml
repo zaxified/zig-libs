@@ -467,7 +467,7 @@ jobs:
           # nothing in it can hit, it only costs the restore and the space.
           # `base5` (2026-11-10): Zig 0.17.0 -> 0.17.1, same reason.
           # Per shard: matrix jobs sharing one key clobber each other.
-          key: zig-${{ runner.os }}-base5-${{ steps.gen.outputs.week }}-${{ matrix.shard }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
+          key: zig-${{ runner.os }}-base5-${{ steps.gen.outputs.week }}-${{ matrix.shard }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon', '.github/workflows/ci.yml') }}
           restore-keys: |
             zig-${{ runner.os }}-base5-${{ steps.gen.outputs.week }}-${{ matrix.shard }}-
       - name: Mark the restored build tree
@@ -1101,10 +1101,13 @@ jobs:
           #
           # Deleting the six brought it to 3.53 GB. Nothing was lost: a build
           # cache regenerates, and these were already unreachable by design.
-          key: zig-full-z017-${{ matrix.cachekey }}-${{ runner.arch }}-${{ steps.gen.outputs.week }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
+          key: zig-full-z017-${{ matrix.cachekey }}-${{ runner.arch }}-${{ steps.gen.outputs.week }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon', '.github/workflows/ci.yml') }}
           # Last week's tree too: Zig's cache is content-addressed, so what is stale
           # is only unused, and a new week's first run was cold on every lane.
-          # ci-cache-decide.sh empties a tree that outgrows its cap.
+          # ci-cache-decide.sh keeps the previous entry when a tree outgrows its cap.
+          # ci.yml is in the hash (2026-11-14): a lane-table change (a shard re-split,
+          # a -Dcpu) must not hit an EXACT older key -- an exact hit never saves, so
+          # the tree stayed frozen (push run 43522895856, rest-2, twice).
           restore-keys: |
             zig-full-z017-${{ matrix.cachekey }}-${{ runner.arch }}-${{ steps.gen.outputs.week }}-
             zig-full-z017-${{ matrix.cachekey }}-${{ runner.arch }}-
@@ -1280,6 +1283,7 @@ jobs:
           name: ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-full-${{ matrix.cachekey }}-${{ runner.arch }}
           path: ${{ runner.temp }}/stamps/stamps.tsv
           if-no-files-found: ignore
+          overwrite: true  # a re-run attempt replaces it (it uploads on red too)
       - name: Report the cache footprint and what this runner is
         # The number the cache decision has never had. Whether five lanes fit
         # under a 10 GB repository quota is arithmetic, and until this line
@@ -1457,6 +1461,7 @@ jobs:
           name: stamps-apps-${{ runner.arch }}
           path: ${{ runner.temp }}/stamps/stamps.tsv
           if-no-files-found: ignore
+          overwrite: true  # a re-run attempt replaces it (it uploads on red too)
       # The downloader's path (`check-apps.sh --pinned`: fetch by URL and hash,
       # compile the exported package) is `release-pinned`'s, on the tag the
       # release run pushed. It ran here on tag refs until 2026-11-11, when the
