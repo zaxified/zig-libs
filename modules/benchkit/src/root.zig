@@ -656,12 +656,35 @@ test "runCapped: output past capture_limit and a child past the timeout both fai
 // print the rows a real bench program would, and log each call, so the order
 // and the routing of `drive`'s foreign runs can be asserted.
 
+/// The driver reports a failed foreign run on stderr (`std.debug.print`); a
+/// passing test must write nothing there, so the tests that provoke those
+/// reports point fd 2 at /dev/null for their duration.
+const Quiet = struct {
+    saved: i32,
+
+    fn begin() Quiet {
+        const linux = std.os.linux;
+        const saved = linux.dup(2);
+        const null_fd = linux.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+        if (linux.errno(saved) != .SUCCESS or linux.errno(null_fd) != .SUCCESS) return .{ .saved = -1 };
+        _ = linux.dup2(@intCast(null_fd), 2);
+        _ = linux.close(@intCast(null_fd));
+        return .{ .saved = @intCast(saved) };
+    }
+    fn end(q: Quiet) void {
+        if (q.saved < 0) return;
+        _ = std.os.linux.dup2(q.saved, 2);
+        _ = std.os.linux.close(q.saved);
+    }
+};
+
 const Tmp = struct {
     t: testing.TmpDir,
     /// Absolute, symlink-free path of the directory.
     abs: []const u8,
 
     fn init(a: std.mem.Allocator) !Tmp {
+        try needSh();
         var t = testing.tmpDir(.{});
         errdefer t.cleanup();
         return .{ .t = t, .abs = try t.dir.realPathFileAlloc(testing.io, ".", a) };
@@ -678,10 +701,9 @@ const Tmp = struct {
     }
 };
 
-fn noSuchFile(e: anyerror) !void {
-    // A missing /bin/sh (no such system) is a skip, not a pass.
-    if (e == error.FileNotFound) return error.SkipZigTest;
-    return e;
+/// The stand-in programs are `/bin/sh` scripts: without a shell there is nothing to run.
+fn needSh() !void {
+    std.Io.Dir.accessAbsolute(testing.io, "/bin/sh", .{}) catch return error.SkipZigTest;
 }
 
 fn contains(hay: []const u8, needle: []const u8) bool {
@@ -707,16 +729,19 @@ test "score: a reference side without a counter turns the line to wall time; has
 
 test "Summary: the worst, best and spread are maxima/minima, not the last line; a mismatch sticks" {
     var s: Summary = .{};
-    s.add(.{ .by_cycles = true, .ref = 2.0, .fast = 3.0, .has_alt = true, .spread = 0.04, .same_count = false, .info = false });
+    s.add(.{ .by_cycles = false, .ref = 2.0, .fast = 3.0, .has_alt = true, .spread = 0.04, .same_count = false, .info = false });
     s.add(.{ .by_cycles = true, .ref = 1.5, .fast = 1.2, .has_alt = true, .spread = 0.01, .same_count = true, .info = false });
-    s.add(.{ .by_cycles = true, .ref = 1.1, .fast = 4.0, .has_alt = false, .spread = 0, .same_count = true, .info = false, .fast_only = true });
+    s.add(.{ .by_cycles = true, .ref = 1.1, .fast = 2.5, .has_alt = false, .spread = 0, .same_count = true, .info = false, .fast_only = true });
     s.add(.{ .by_cycles = true, .ref = 7.0, .fast = 8.0, .has_alt = false, .spread = 0, .same_count = true, .info = true, .fast_only = true });
-    s.add(.{ .by_cycles = true, .ref = 1.0, .fast = 1.0, .has_alt = true, .spread = 0, .same_count = true, .info = false, .fast_only = true });
+    s.add(.{ .by_cycles = true, .ref = 1.0, .fast = 2.0, .has_alt = true, .spread = 0, .same_count = true, .info = false, .fast_only = true });
     try testing.expectEqual(@as(f64, 2.0), s.worst_ref);
     try testing.expectEqual(@as(f64, 1.5), s.best_ref);
-    try testing.expectEqual(@as(?f64, 4.0), s.worst_fast);
+    // 3.0 from a line with an alt; neither the later has_alt line (1.2) nor
+    // the later fast_only lines (2.5, 2.0) may replace it.
+    try testing.expectEqual(@as(?f64, 3.0), s.worst_fast);
     try testing.expectEqual(@as(f64, 0.04), s.max_spread);
-    try testing.expect(s.by_cycles);
+    // One line without a counter turns the whole summary to wall time for good.
+    try testing.expect(!s.by_cycles);
     try testing.expect(s.mismatch);
 }
 
@@ -844,7 +869,7 @@ test "runCapped: argv, environment and working directory reach the child; the ca
     defer tmp.t.cleanup();
     var env = std.process.Environ.Map.init(a);
     try env.put("BENCHKIT_T", "kept");
-    const r = runCapped(a, testing.io, &.{ "/bin/sh", "-c", "printf '%s|%s' \"$BENCHKIT_T\" \"$(pwd -P)\"" }, &env, .{ .path = tmp.abs }, run_timeout) catch |e| return noSuchFile(e);
+    const r = try runCapped(a, testing.io, &.{ "/bin/sh", "-c", "printf '%s|%s' \"$BENCHKIT_T\" \"$(pwd -P)\"" }, &env, .{ .path = tmp.abs }, run_timeout);
     try testing.expectEqualStrings(try a.print("kept|{s}", .{tmp.abs}), r.stdout);
     // Exactly `capture_limit` bytes pass on either stream, one more does not.
     const lim = @backingInt(capture_limit);
@@ -865,12 +890,14 @@ test "foreign: <exe> <dir> <name>, the row from stdout, the banner from stderr; 
     const a = arena_state.allocator();
     var tmp = try Tmp.init(a);
     defer tmp.t.cleanup();
+    const quiet = Quiet.begin();
+    defer quiet.end();
     try tmp.script(a, "ok", "printf '%s\\t12.5\\t40\\t7\\n' \"$2\"; echo \"dir=$1\" >&2");
     try tmp.script(a, "bad", "printf '%s\\t1\\t2\\t3\\n' \"$2\"; exit 3");
     try tmp.script(a, "sig", "printf '%s\\t1\\t2\\t3\\n' \"$2\"; kill -KILL $$");
     try tmp.script(a, "wrong", "printf 'other\\t1\\t2\\t3\\n'");
     var banner: []const u8 = "";
-    const r = foreign(a, testing.io, "bench-test", try tmp.path(a, "ok"), "/some/dir", "w", &banner) catch |e| return noSuchFile(e);
+    const r = try foreign(a, testing.io, "bench-test", try tmp.path(a, "ok"), "/some/dir", "w", &banner);
     try testing.expectEqual(Row{ .ns = 12.5, .cycles = 40, .count = 7 }, r);
     try testing.expectEqualStrings("dir=/some/dir\n", banner);
     // No banner wanted: still parses.
@@ -890,9 +917,11 @@ test "foreignOnce: <exe> <dir> <mode>; a bad exit or a signal fails" {
     const a = arena_state.allocator();
     var tmp = try Tmp.init(a);
     defer tmp.t.cleanup();
+    const quiet = Quiet.begin();
+    defer quiet.end();
     try tmp.script(a, "once", "case \"$2\" in ok) echo \"$1|$2\" > \"$1/ran.txt\";; sig) kill -KILL $$;; *) echo oops >&2; exit 3;; esac");
     const exe = try tmp.path(a, "once");
-    foreignOnce(a, testing.io, "bench-test", exe, tmp.abs, "ok") catch |e| return noSuchFile(e);
+    try foreignOnce(a, testing.io, "bench-test", exe, tmp.abs, "ok");
     try testing.expectEqualStrings(try a.print("{s}|ok\n", .{tmp.abs}), try tmp.read(a, "ran.txt"));
     try testing.expectError(error.ForeignFailed, foreignOnce(a, testing.io, "bench-test", exe, "/d", "fail"));
     try testing.expectError(error.ForeignFailed, foreignOnce(a, testing.io, "bench-test", exe, "/d", "sig"));
@@ -905,8 +934,10 @@ test "buildForeign: the compiler command line is cc, -O3 -march=native, src, lib
     const a = arena_state.allocator();
     var tmp = try Tmp.init(a);
     defer tmp.t.cleanup();
+    const quiet = Quiet.begin();
+    defer quiet.end();
     const cc_body = try a.print("echo \"$*\" > {s}/args.txt", .{tmp.abs});
-    const exe = buildForeign(a, testing.io, "bench-test", &.{ "/bin/sh", "-c", cc_body, "cc" }, tmp.abs, "f.c", &.{ "liba.so", "libb.so" }) catch |e| return noSuchFile(e);
+    const exe = try buildForeign(a, testing.io, "bench-test", &.{ "/bin/sh", "-c", cc_body, "cc" }, tmp.abs, "f.c", &.{ "liba.so", "libb.so" });
     try testing.expectEqualStrings(try a.print("{s}/foreign_bench", .{tmp.abs}), exe);
     try testing.expectEqualStrings(try a.print("-O3 -march=native f.c liba.so libb.so -o {s}/foreign_bench\n", .{tmp.abs}), try tmp.read(a, "args.txt"));
     // No libs: nothing between the source and -o.
@@ -925,6 +956,8 @@ test "goBuild: offline environment over the caller's, build arguments and workin
     const a = arena_state.allocator();
     var tmp = try Tmp.init(a);
     defer tmp.t.cleanup();
+    const quiet = Quiet.begin();
+    defer quiet.end();
     // `/bin/sh build -o <exe> .` in `dir` runs the file `build` there.
     try tmp.script(a, "build", "echo \"$GOTOOLCHAIN|$GOPROXY|$GOFLAGS|$KEEP|$*|$(pwd -P)\" > got.txt");
     var env = std.process.Environ.Map.init(a);
@@ -932,7 +965,7 @@ test "goBuild: offline environment over the caller's, build arguments and workin
     try env.put("GOPROXY", "on");
     try env.put("GOFLAGS", "-x");
     try env.put("GOTOOLCHAIN", "auto");
-    const exe = goBuild(a, testing.io, "bench-test", &env, .{ .exe = "/bin/sh", .dir = tmp.abs, .abs = "/work/abs" }) catch |e| return noSuchFile(e);
+    const exe = try goBuild(a, testing.io, "bench-test", &env, .{ .exe = "/bin/sh", .dir = tmp.abs, .abs = "/work/abs" });
     try testing.expectEqualStrings("/work/abs/go_bench", exe);
     try testing.expectEqualStrings(try a.print("local|off|-mod=readonly|1|-o /work/abs/go_bench .|{s}\n", .{tmp.abs}), try tmp.read(a, "got.txt"));
     // The caller's map is left as it was.
@@ -1031,7 +1064,7 @@ test "drive: sides alternate per round, each workload goes to its own program, t
     };
     var ctx: DCtx = .{};
     var aw: std.Io.Writer.Allocating = .init(a);
-    const s = drive(testing.io, a, .{ .name = "bench-test", .exes = exes, .abs = tmp.abs, .rounds = 2 }, &ctx, DCtx.once, &ws, &aw.writer) catch |e| return noSuchFile(e);
+    const s = try drive(testing.io, a, .{ .name = "bench-test", .exes = exes, .abs = tmp.abs, .rounds = 2 }, &ctx, DCtx.once, &ws, &aw.writer);
     try testing.expectEqualStrings(
         "A r1\nA o1\nB a1\nA r1\nA o1\nB a1\n" ++ "A r2\nA o2\nA r2\nA o2\n" ++ "A r3\nA o3\nA r3\nA o3\n" ++ "A r4\nA o4\nA r4\nA o4\n",
         try tmp.read(a, "log.txt"),
@@ -1066,7 +1099,7 @@ test "drive: filters pick workloads, zero rounds run once, the work-less side is
     };
     var ctx: DCtx = .{};
     var aw: std.Io.Writer.Allocating = .init(a);
-    const s = drive(testing.io, a, .{ .name = "bench-test", .exes = exes, .abs = tmp.abs, .filters = &.{"w2"}, .rounds = 0 }, &ctx, DCtx.once, &ws, &aw.writer) catch |e| return noSuchFile(e);
+    const s = try drive(testing.io, a, .{ .name = "bench-test", .exes = exes, .abs = tmp.abs, .filters = &.{"w2"}, .rounds = 0 }, &ctx, DCtx.once, &ws, &aw.writer);
     try testing.expectEqualStrings("A r2\nA o2\n", try tmp.read(a, "log.txt"));
     try testing.expectEqual(@as(f64, 2.0), s.best_ref);
     try testing.expectEqual(@as(f64, 2.0), s.worst_ref);
@@ -1082,6 +1115,8 @@ test "drive: a differing output count on either side fails the run" {
     const a = arena_state.allocator();
     var tmp = try Tmp.init(a);
     defer tmp.t.cleanup();
+    const quiet = Quiet.begin();
+    defer quiet.end();
     try tmp.script(a, "R", "case \"$2\" in r) printf 'r\\t10\\t10\\t5\\n';; o) printf 'o\\t10\\t10\\t5\\n';; a) printf 'a\\t10\\t10\\t5\\n';; esac");
     try tmp.script(a, "Rours6", "case \"$2\" in r) printf 'r\\t10\\t10\\t5\\n';; o) printf 'o\\t10\\t10\\t6\\n';; esac");
     try tmp.script(a, "Ralt6", "case \"$2\" in r) printf 'r\\t10\\t10\\t5\\n';; o) printf 'o\\t10\\t10\\t5\\n';; a) printf 'a\\t10\\t10\\t6\\n';; esac");
@@ -1091,7 +1126,7 @@ test "drive: a differing output count on either side fails the run" {
     const none: Work(u32) = .{ .name = "w", .op = 1, .ref = "r", .ours_foreign = "o" };
     const with_alt: Work(u32) = .{ .name = "w", .op = 1, .ref = "r", .alt = "a", .ours_foreign = "o" };
     const run: Run = .{ .name = "bench-test", .exes = &.{ try tmp.path(a, "R"), try tmp.path(a, "Rours6"), try tmp.path(a, "Ralt6") }, .abs = tmp.abs, .rounds = 1 };
-    _ = drive(testing.io, a, run, &ctx, DCtx.once, &[_]W{none}, &aw.writer) catch |e| return noSuchFile(e);
+    _ = try drive(testing.io, a, run, &ctx, DCtx.once, &[_]W{none}, &aw.writer);
     var r1 = run;
     r1.exes = &.{run.exes[1]};
     try testing.expectError(error.CountMismatch, drive(testing.io, a, r1, &ctx, DCtx.once, &[_]W{none}, &aw.writer));
@@ -1122,7 +1157,7 @@ test "drive: a noisy side is flagged, and a side without a counter turns the ver
     const ws = [_]W{.{ .name = "w", .op = 1, .ref = "r", .ours_foreign = "o" }};
     var ctx: DCtx = .{};
     var aw: std.Io.Writer.Allocating = .init(a);
-    const s = drive(testing.io, a, .{ .name = "bench-test", .exes = &.{try tmp.path(a, "N")}, .abs = tmp.abs, .rounds = 2 }, &ctx, DCtx.once, &ws, &aw.writer) catch |e| return noSuchFile(e);
+    const s = try drive(testing.io, a, .{ .name = "bench-test", .exes = &.{try tmp.path(a, "N")}, .abs = tmp.abs, .rounds = 2 }, &ctx, DCtx.once, &ws, &aw.writer);
     // Ref ran as calls 1 and 3: 120 and 160 ns.
     try testing.expectApproxEqAbs(@as(f64, 160.0 / 120.0 - 1), s.max_spread, 1e-12);
     try testing.expect(!s.by_cycles);
@@ -1143,7 +1178,7 @@ test "drive: the in-process side sees each workload's op; wall_only drops its cy
     var aw: std.Io.Writer.Allocating = .init(a);
     const run: Run = .{ .name = "bench-test", .exes = &.{try tmp.path(a, "A")}, .abs = tmp.abs, .rounds = 1 };
     // The first process run may open a descriptor of the Io's own; count after it.
-    _ = drive(testing.io, a, run, &ctx, DCtx.once, &[_]W{.{ .name = "w", .op = 7, .ref = "r", .ours_foreign = "r" }}, &aw.writer) catch |e| return noSuchFile(e);
+    _ = try drive(testing.io, a, run, &ctx, DCtx.once, &[_]W{.{ .name = "w", .op = 7, .ref = "r", .ours_foreign = "r" }}, &aw.writer);
     const before = openFds();
     // The op (7) is the count `once` returns; the reference says 7.
     const s = try drive(testing.io, a, run, &ctx, DCtx.once, &[_]W{.{ .name = "w", .op = 7, .ref = "r" }}, &aw.writer);
