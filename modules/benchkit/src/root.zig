@@ -474,6 +474,9 @@ test "Side: best and worst of the rounds, spread relative to the best" {
     try testing.expectEqual(@as(f64, 30), s.best(true));
     try testing.expectApproxEqAbs(@as(f64, 0.5), s.spread(false), 1e-12);
     try testing.expectApproxEqAbs(@as(f64, 1.0 / 3.0), s.spread(true), 1e-12);
+    // The count is the last row's (the sides agree on it, so any row would do).
+    try testing.expectEqual(@as(u64, 5), s.count);
+    try testing.expectEqual(@as(u64, 9), side(&.{ .{ .ns = 1, .count = 4 }, .{ .ns = 1, .count = 9 } }).count);
 }
 
 test "score: by cycles only when every side counted them" {
@@ -573,7 +576,9 @@ test "timeIt: the count is the last op's result, the time per op" {
     try testing.expectEqual(@as(u64, 42), r.count);
     try testing.expectEqual(@as(f64, 0), r.cycles);
     try testing.expect(r.ns > 0 and r.ns < 1e6);
-    try testing.expect(c.calls > 5);
+    // The batch doubled until it took over 100 ms: a trivial op ran far more
+    // often than the 6 calls of a batch that never doubled.
+    try testing.expect(c.calls > 100_000);
 }
 
 // ── sweep GK (2026-10-29) ────────────────────────────────────────────────────
@@ -643,4 +648,519 @@ test "runCapped: output past capture_limit and a child past the timeout both fai
         error.FileNotFound => return error.SkipZigTest,
         else => return e,
     }
+}
+
+// ── mutation run (2026-11-14, benchkit as a module of its own) ───────────────
+//
+// Foreign programs are small `/bin/sh` scripts written into a temp dir: they
+// print the rows a real bench program would, and log each call, so the order
+// and the routing of `drive`'s foreign runs can be asserted.
+
+const Tmp = struct {
+    t: testing.TmpDir,
+    /// Absolute, symlink-free path of the directory.
+    abs: []const u8,
+
+    fn init(a: std.mem.Allocator) !Tmp {
+        var t = testing.tmpDir(.{});
+        errdefer t.cleanup();
+        return .{ .t = t, .abs = try t.dir.realPathFileAlloc(testing.io, ".", a) };
+    }
+    fn script(x: Tmp, a: std.mem.Allocator, name: []const u8, body: []const u8) !void {
+        const data = try a.print("#!/bin/sh\n{s}\n", .{body});
+        try x.t.dir.writeFile(testing.io, .{ .sub_path = name, .data = data, .flags = .{ .permissions = .executable_file } });
+    }
+    fn path(x: Tmp, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        return a.print("{s}/{s}", .{ x.abs, name });
+    }
+    fn read(x: Tmp, a: std.mem.Allocator, name: []const u8) ![]u8 {
+        return x.t.dir.readFileAlloc(testing.io, name, a, .limited(1 << 20));
+    }
+};
+
+fn noSuchFile(e: anyerror) !void {
+    // A missing /bin/sh (no such system) is a skip, not a pass.
+    if (e == error.FileNotFound) return error.SkipZigTest;
+    return e;
+}
+
+fn contains(hay: []const u8, needle: []const u8) bool {
+    return std.mem.find(u8, hay, needle) != null;
+}
+
+test "score: a reference side without a counter turns the line to wall time; has_alt and info are carried" {
+    const ours = side(&.{.{ .ns = 50, .cycles = 100, .count = 1 }});
+    const ref_no = side(&.{.{ .ns = 100, .cycles = 0, .count = 1 }});
+    const ref = side(&.{.{ .ns = 100, .cycles = 400, .count = 1 }});
+    const slow_alt = side(&.{.{ .ns = 400, .cycles = 900, .count = 1 }});
+    try testing.expect(!score(ours, ref_no, null, false).by_cycles);
+    try testing.expectEqual(@as(f64, 0.5), score(ours, ref_no, null, false).ref);
+    // Fastest = the faster of ref and alt: an alt slower than the reference changes nothing.
+    const l = score(ours, ref, slow_alt, false);
+    try testing.expectEqual(@as(f64, 0.25), l.ref);
+    try testing.expectEqual(@as(f64, 0.25), l.fast);
+    try testing.expect(l.has_alt and !l.info);
+    const m = score(ours, ref, null, true);
+    try testing.expect(!m.has_alt and m.info);
+    try testing.expect(!m.fast_only);
+}
+
+test "Summary: the worst, best and spread are maxima/minima, not the last line; a mismatch sticks" {
+    var s: Summary = .{};
+    s.add(.{ .by_cycles = true, .ref = 2.0, .fast = 3.0, .has_alt = true, .spread = 0.04, .same_count = false, .info = false });
+    s.add(.{ .by_cycles = true, .ref = 1.5, .fast = 1.2, .has_alt = true, .spread = 0.01, .same_count = true, .info = false });
+    s.add(.{ .by_cycles = true, .ref = 1.1, .fast = 4.0, .has_alt = false, .spread = 0, .same_count = true, .info = false, .fast_only = true });
+    s.add(.{ .by_cycles = true, .ref = 7.0, .fast = 8.0, .has_alt = false, .spread = 0, .same_count = true, .info = true, .fast_only = true });
+    s.add(.{ .by_cycles = true, .ref = 1.0, .fast = 1.0, .has_alt = true, .spread = 0, .same_count = true, .info = false, .fast_only = true });
+    try testing.expectEqual(@as(f64, 2.0), s.worst_ref);
+    try testing.expectEqual(@as(f64, 1.5), s.best_ref);
+    try testing.expectEqual(@as(?f64, 4.0), s.worst_fast);
+    try testing.expectEqual(@as(f64, 0.04), s.max_spread);
+    try testing.expect(s.by_cycles);
+    try testing.expect(s.mismatch);
+}
+
+test "timeIt: doubles until a batch takes over 100 ms, then the best of five, per op (scripted clock and counter)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const Clock = struct {
+        script: []const i96,
+        i: usize = 0,
+        fn now(ud: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const c: *@This() = @ptrCast(@alignCast(ud.?));
+            const v = c.script[c.i];
+            c.i += 1;
+            return .{ .nanoseconds = v };
+        }
+    };
+    const vt: std.Io.VTable = comptime blk: {
+        var v = std.Io.failing.vtable.*;
+        v.now = Clock.now;
+        break :blk v;
+    };
+    const ms = 1_000_000;
+    // Doubling: a batch of exactly 100 ms is not over 100 ms (n 1 -> 2), then
+    // 100 ms + 1 ns ends it at n = 2. Five batches of 40, 30, 50, 35, 45 ms.
+    var clock: Clock = .{ .script = &.{
+        0, 100 * ms, 0, 100 * ms + 1,
+        0, 40 * ms,  0, 30 * ms,
+        0, 50 * ms,  0, 35 * ms,
+        0, 45 * ms,
+    } };
+    const io: std.Io = .{ .userdata = &clock, .vtable = &vt };
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    // Counter reads, two per batch: deltas 400, 300, 500, 350, 450.
+    const reads = [_]u64{ 1000, 1400, 2000, 2300, 3000, 3500, 4000, 4350, 5000, 5450 };
+    const Ctx = struct {
+        calls: usize = 0,
+        fn once(c: *@This()) u64 {
+            c.calls += 1;
+            return 42;
+        }
+    };
+    var c: Ctx = .{};
+    _ = linux.write(fds[1], @ptrCast(&reads), @sizeOf(@TypeOf(reads)));
+    const r = timeIt(io, .{ .fd = fds[0] }, Ctx.once, .{&c}, false);
+    try testing.expectEqual(@as(usize, 1 + 2 + 5 * 2), c.calls);
+    try testing.expectEqual(@as(u64, 42), r.count);
+    try testing.expectEqual(@as(f64, 15 * ms), r.ns); // 30 ms best batch / 2
+    try testing.expectEqual(@as(f64, 150), r.cycles); // 300 best delta / 2
+    // wall_only reports no cycles, and a null counter reads 0.
+    clock.i = 0;
+    c = .{};
+    _ = linux.write(fds[1], @ptrCast(&reads), @sizeOf(@TypeOf(reads)));
+    const w = timeIt(io, .{ .fd = fds[0] }, Ctx.once, .{&c}, true);
+    try testing.expectEqual(@as(f64, 0), w.cycles);
+    try testing.expectEqual(@as(f64, 15 * ms), w.ns);
+    clock.i = 0;
+    const z = timeIt(io, .{ .fd = null }, Ctx.once, .{&c}, false);
+    try testing.expectEqual(@as(f64, 0), z.cycles);
+}
+
+test "Cycles: read returns what the counter holds, close releases the descriptor, a null one reads 0" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    try testing.expectEqual(@as(u64, 0), (Cycles{ .fd = null }).read());
+    (Cycles{ .fd = null }).close(); // nothing to release
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[1]);
+    const v: u64 = 0x0123_4567_89ab_cdef;
+    _ = linux.write(fds[1], @ptrCast(&v), @sizeOf(u64));
+    const c: Cycles = .{ .fd = fds[0] };
+    try testing.expectEqual(v, c.read());
+    c.close();
+    var b: [1]u8 = undefined;
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.read(fds[0], &b, 1)));
+}
+
+test "Cycles.open: a usable user-mode cycle counter where perf is permitted" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const c: Cycles = .open();
+    defer c.close();
+    if (c.fd == null) return error.SkipZigTest; // no perf_event_open here
+    const a = c.read();
+    var x: u64 = 1;
+    for (0..2_000_000) |i| {
+        x = x *% 6364136223846793005 +% i;
+        std.mem.doNotOptimizeAway(x);
+    }
+    try testing.expect(c.read() > a);
+}
+
+test "Cycles.open: the counter counts cycles (not instructions) in user mode only" {
+    if (builtin.cpu.arch != .x86_64 or builtin.os.tag != .linux) return error.SkipZigTest;
+    const c: Cycles = .open();
+    defer c.close();
+    if (c.fd == null) return error.SkipZigTest;
+    // `pause` is one instruction of at least ten cycles: a loop of them gets
+    // several cycles per instruction (an instruction counter would get ~3).
+    const n = 200_000;
+    var a = c.read();
+    for (0..n) |_| asm volatile ("pause");
+    var d = c.read() - a;
+    try testing.expect(d > 5 * n);
+    // Kernel time is not counted: 64 MiB zeroed by the kernel is millions of
+    // cycles in `read`, and almost none in this process.
+    const zero = std.os.linux.open("/dev/zero", .{ .ACCMODE = .RDONLY }, 0);
+    if (std.os.linux.errno(zero) != .SUCCESS) return error.SkipZigTest;
+    defer _ = std.os.linux.close(@intCast(zero));
+    var buf: [1 << 20]u8 = undefined;
+    a = c.read();
+    for (0..64) |_| _ = std.os.linux.read(@intCast(zero), &buf, buf.len);
+    d = c.read() - a;
+    try testing.expect(d < 2_000_000);
+}
+
+test "runCapped: argv, environment and working directory reach the child; the cap is exact" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = try Tmp.init(a);
+    defer tmp.t.cleanup();
+    var env = std.process.Environ.Map.init(a);
+    try env.put("BENCHKIT_T", "kept");
+    const r = runCapped(a, testing.io, &.{ "/bin/sh", "-c", "printf '%s|%s' \"$BENCHKIT_T\" \"$(pwd -P)\"" }, &env, .{ .path = tmp.abs }, run_timeout) catch |e| return noSuchFile(e);
+    try testing.expectEqualStrings(try a.print("kept|{s}", .{tmp.abs}), r.stdout);
+    // Exactly `capture_limit` bytes pass on either stream, one more does not.
+    const lim = @backingInt(capture_limit);
+    const ok_out = try a.print("head -c {d} /dev/zero", .{lim});
+    const ok = try runCapped(a, testing.io, &.{ "/bin/sh", "-c", ok_out }, null, .inherit, run_timeout);
+    try testing.expectEqual(lim, ok.stdout.len);
+    const ok_err = try a.print("head -c {d} /dev/zero >&2", .{lim});
+    const ok2 = try runCapped(a, testing.io, &.{ "/bin/sh", "-c", ok_err }, null, .inherit, run_timeout);
+    try testing.expectEqual(lim, ok2.stderr.len);
+    const over = try a.print("head -c {d} /dev/zero", .{lim + 1});
+    try testing.expectError(error.StreamTooLong, runCapped(a, testing.io, &.{ "/bin/sh", "-c", over }, null, .inherit, run_timeout));
+}
+
+test "foreign: <exe> <dir> <name>, the row from stdout, the banner from stderr; a bad exit fails" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = try Tmp.init(a);
+    defer tmp.t.cleanup();
+    try tmp.script(a, "ok", "printf '%s\\t12.5\\t40\\t7\\n' \"$2\"; echo \"dir=$1\" >&2");
+    try tmp.script(a, "bad", "printf '%s\\t1\\t2\\t3\\n' \"$2\"; exit 3");
+    try tmp.script(a, "sig", "printf '%s\\t1\\t2\\t3\\n' \"$2\"; kill -KILL $$");
+    try tmp.script(a, "wrong", "printf 'other\\t1\\t2\\t3\\n'");
+    var banner: []const u8 = "";
+    const r = foreign(a, testing.io, "bench-test", try tmp.path(a, "ok"), "/some/dir", "w", &banner) catch |e| return noSuchFile(e);
+    try testing.expectEqual(Row{ .ns = 12.5, .cycles = 40, .count = 7 }, r);
+    try testing.expectEqualStrings("dir=/some/dir\n", banner);
+    // No banner wanted: still parses.
+    try testing.expectEqual(r, try foreign(a, testing.io, "bench-test", try tmp.path(a, "ok"), "/d", "w", null));
+    // A banner is kept only from a run that succeeded.
+    banner = "unset";
+    try testing.expectError(error.ForeignFailed, foreign(a, testing.io, "bench-test", try tmp.path(a, "bad"), "/d", "w", &banner));
+    try testing.expectError(error.ForeignFailed, foreign(a, testing.io, "bench-test", try tmp.path(a, "sig"), "/d", "w", &banner));
+    try testing.expectEqualStrings("unset", banner);
+    try testing.expectError(error.BadForeignOutput, foreign(a, testing.io, "bench-test", try tmp.path(a, "wrong"), "/d", "w", null));
+}
+
+test "foreignOnce: <exe> <dir> <mode>; a bad exit or a signal fails" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = try Tmp.init(a);
+    defer tmp.t.cleanup();
+    try tmp.script(a, "once", "case \"$2\" in ok) echo \"$1|$2\" > \"$1/ran.txt\";; sig) kill -KILL $$;; *) echo oops >&2; exit 3;; esac");
+    const exe = try tmp.path(a, "once");
+    foreignOnce(a, testing.io, "bench-test", exe, tmp.abs, "ok") catch |e| return noSuchFile(e);
+    try testing.expectEqualStrings(try a.print("{s}|ok\n", .{tmp.abs}), try tmp.read(a, "ran.txt"));
+    try testing.expectError(error.ForeignFailed, foreignOnce(a, testing.io, "bench-test", exe, "/d", "fail"));
+    try testing.expectError(error.ForeignFailed, foreignOnce(a, testing.io, "bench-test", exe, "/d", "sig"));
+}
+
+test "buildForeign: the compiler command line is cc, -O3 -march=native, src, libs, -o exe" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = try Tmp.init(a);
+    defer tmp.t.cleanup();
+    const cc_body = try a.print("echo \"$*\" > {s}/args.txt", .{tmp.abs});
+    const exe = buildForeign(a, testing.io, "bench-test", &.{ "/bin/sh", "-c", cc_body, "cc" }, tmp.abs, "f.c", &.{ "liba.so", "libb.so" }) catch |e| return noSuchFile(e);
+    try testing.expectEqualStrings(try a.print("{s}/foreign_bench", .{tmp.abs}), exe);
+    try testing.expectEqualStrings(try a.print("-O3 -march=native f.c liba.so libb.so -o {s}/foreign_bench\n", .{tmp.abs}), try tmp.read(a, "args.txt"));
+    // No libs: nothing between the source and -o.
+    _ = try buildForeign(a, testing.io, "bench-test", &.{ "/bin/sh", "-c", cc_body, "cc" }, tmp.abs, "g.c", &.{});
+    try testing.expectEqualStrings(try a.print("-O3 -march=native g.c -o {s}/foreign_bench\n", .{tmp.abs}), try tmp.read(a, "args.txt"));
+    try testing.expectError(error.ForeignBuildFailed, buildForeign(a, testing.io, "bench-test", &.{ "/bin/sh", "-c", "exit 3", "cc" }, tmp.abs, "f.c", &.{}));
+    try testing.expectError(error.ForeignBuildFailed, buildForeign(a, testing.io, "bench-test", &.{ "/bin/sh", "-c", "kill -KILL $$", "cc" }, tmp.abs, "f.c", &.{}));
+    // A compiler that cannot be run at all is the spawn error, not a silent pass.
+    try testing.expectError(error.FileNotFound, buildForeign(a, testing.io, "bench-test", &.{"/nonexistent/cc"}, tmp.abs, "f.c", &.{}));
+}
+
+test "goBuild: offline environment over the caller's, build arguments and working directory; failures are GoBuildFailed" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = try Tmp.init(a);
+    defer tmp.t.cleanup();
+    // `/bin/sh build -o <exe> .` in `dir` runs the file `build` there.
+    try tmp.script(a, "build", "echo \"$GOTOOLCHAIN|$GOPROXY|$GOFLAGS|$KEEP|$*|$(pwd -P)\" > got.txt");
+    var env = std.process.Environ.Map.init(a);
+    try env.put("KEEP", "1");
+    try env.put("GOPROXY", "on");
+    try env.put("GOFLAGS", "-x");
+    try env.put("GOTOOLCHAIN", "auto");
+    const exe = goBuild(a, testing.io, "bench-test", &env, .{ .exe = "/bin/sh", .dir = tmp.abs, .abs = "/work/abs" }) catch |e| return noSuchFile(e);
+    try testing.expectEqualStrings("/work/abs/go_bench", exe);
+    try testing.expectEqualStrings(try a.print("local|off|-mod=readonly|1|-o /work/abs/go_bench .|{s}\n", .{tmp.abs}), try tmp.read(a, "got.txt"));
+    // The caller's map is left as it was.
+    try testing.expectEqualStrings("on", env.get("GOPROXY").?);
+    const exe2 = try goBuild(a, testing.io, "bench-test", &env, .{ .exe = "/bin/sh", .dir = tmp.abs, .abs = "/w2", .out = "second", .toolchain = "go1.99.0" });
+    try testing.expectEqualStrings("/w2/second", exe2);
+    try testing.expectEqualStrings(try a.print("go1.99.0|off|-mod=readonly|1|-o /w2/second .|{s}\n", .{tmp.abs}), try tmp.read(a, "got.txt"));
+    try tmp.script(a, "build", "exit 3");
+    const opts: GoBuild = .{ .exe = "/bin/sh", .dir = tmp.abs, .abs = "/w" };
+    try testing.expectError(error.GoBuildFailed, goBuild(a, testing.io, "bench-test", &env, opts));
+    try tmp.script(a, "build", "kill -KILL $$");
+    try testing.expectError(error.GoBuildFailed, goBuild(a, testing.io, "bench-test", &env, opts));
+    // `go` itself missing: also GoBuildFailed, with its own message.
+    try testing.expectError(error.GoBuildFailed, goBuild(a, testing.io, "bench-test", &env, .{ .exe = "/nonexistent/go", .dir = tmp.abs, .abs = "/w" }));
+}
+
+test "exeAt: the panic is benchkit's own message, not a bounds check (the index == len edge)" {
+    const child = @import("testkit").child;
+    if (!child.supported) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = try Tmp.init(a);
+    defer tmp.t.cleanup();
+    const err_path = try a.dupeSentinel(u8, try tmp.path(a, "err.txt"), 0);
+    const S = struct {
+        fn over(path: [:0]const u8, i: usize) u8 {
+            const fd = std.os.linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+            if (std.os.linux.errno(fd) != .SUCCESS) return 2;
+            _ = std.os.linux.dup2(@intCast(fd), 2);
+            const r: Run = .{ .name = "b", .exes = &.{ "/bin/true", "/bin/false" }, .abs = "/" };
+            std.mem.doNotOptimizeAway(exeAt(r, i).len);
+            return 0;
+        }
+    };
+    // i == len and i > len: both are benchkit's message; i < len is fine.
+    for ([_]usize{ 2, 5 }) |i| {
+        const out = try child.run(S.over, .{ err_path, i }, .{ .limit_ms = 5000, .show_stderr = true });
+        try testing.expect(out.eql(.{ .signaled = @backingInt(std.os.linux.SIG.ABRT) }));
+        const msg = try tmp.read(a, "err.txt");
+        try testing.expect(contains(msg, "benchkit: Work.ref_exe/alt_exe indexes past Run.exes"));
+    }
+    const out = try child.run(S.over, .{ err_path, 1 }, .{ .limit_ms = 5000, .show_stderr = true });
+    try testing.expect(out.eql(.{ .exited = 0 }));
+}
+
+/// The two foreign programs of the `drive` tests: A (index 0) and B (index 1).
+/// Every call is logged to `log.txt` as `<exe> <workload>`.
+fn driveScripts(a: std.mem.Allocator, tmp: Tmp) ![]const []const u8 {
+    try tmp.script(a, "A",
+        \\echo "A $2" >> "$1/log.txt"
+        \\case "$2" in o*) echo banner-O >&2;; *) echo banner-A >&2;; esac
+        \\case "$2" in
+        \\  r1) printf 'r1\t200\t400\t5\n';;
+        \\  o1) printf 'o1\t100\t100\t5\n';;
+        \\  r2) printf 'r2\t50\t100\t5\n';;
+        \\  o2) printf 'o2\t60\t200\t5\n';;
+        \\  r3) printf 'r3\t50\t100\t5\n';;
+        \\  o3) printf 'o3\t60\t900\t5\n';;
+        \\  r4) printf 'r4\t50\t100\t5\n';;
+        \\  o4) printf 'o4\t60\t150\t5\n';;
+        \\esac
+    );
+    try tmp.script(a, "B",
+        \\echo "B $2" >> "$1/log.txt"
+        \\echo banner-B >&2
+        \\printf 'a1\t150\t300\t5\n'
+    );
+    const exes = try a.alloc([]const u8, 2);
+    exes[0] = try tmp.path(a, "A");
+    exes[1] = try tmp.path(a, "B");
+    return exes;
+}
+
+const DCtx = struct {
+    op: u32 = 0,
+    fn once(c: *DCtx) u64 {
+        return c.op;
+    }
+};
+
+test "drive: sides alternate per round, each workload goes to its own program, the verdict leaves info and fast_only lines out" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = try Tmp.init(a);
+    defer tmp.t.cleanup();
+    const exes = try driveScripts(a, tmp);
+    const W = Work(u32);
+    const ws = [_]W{
+        .{ .name = "w1", .op = 1, .ref = "r1", .alt = "a1", .ref_exe = 0, .alt_exe = 1, .ours_foreign = "o1" },
+        .{ .name = "w2", .op = 2, .ref = "r2", .ours_foreign = "o2" },
+        .{ .name = "w3", .op = 3, .ref = "r3", .ours_foreign = "o3", .info = true },
+        .{ .name = "w4", .op = 4, .ref = "r4", .ours_foreign = "o4", .fast_only = true },
+    };
+    var ctx: DCtx = .{};
+    var aw: std.Io.Writer.Allocating = .init(a);
+    const s = drive(testing.io, a, .{ .name = "bench-test", .exes = exes, .abs = tmp.abs, .rounds = 2 }, &ctx, DCtx.once, &ws, &aw.writer) catch |e| return noSuchFile(e);
+    try testing.expectEqualStrings(
+        "A r1\nA o1\nB a1\nA r1\nA o1\nB a1\n" ++ "A r2\nA o2\nA r2\nA o2\n" ++ "A r3\nA o3\nA r3\nA o3\n" ++ "A r4\nA o4\nA r4\nA o4\n",
+        try tmp.read(a, "log.txt"),
+    );
+    // w1: 100/400 and 100/min(400, 300); w2: 200/100; w3 is info; w4: 150/100 for fastest only.
+    try testing.expectEqual(@as(f64, 0.25), s.best_ref);
+    try testing.expectEqual(@as(f64, 2.0), s.worst_ref);
+    try testing.expectEqual(@as(?f64, 1.5), s.worst_fast);
+    try testing.expectEqual(@as(f64, 0), s.max_spread);
+    try testing.expect(s.by_cycles and !s.mismatch);
+    // The reference's banner, not the one from our side run through the same program.
+    try testing.expectEqualStrings("banner-A\n", s.banner);
+    try testing.expectEqualStrings("banner-B\n", s.alt_banner);
+    const out = aw.written();
+    try testing.expect(contains(out, "rounds: 2; ratios by user-mode cycles; largest spread 0.0%\n"));
+    try testing.expect(!contains(out, "OVER 5 %"));
+    for ([_][]const u8{ "w1", "w2", "w3", "w4" }) |n| try testing.expect(contains(out, n));
+}
+
+test "drive: filters pick workloads, zero rounds run once, the work-less side is not asked" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = try Tmp.init(a);
+    defer tmp.t.cleanup();
+    const exes = try driveScripts(a, tmp);
+    const W = Work(u32);
+    const ws = [_]W{
+        .{ .name = "w1", .op = 1, .ref = "r1", .alt = "a1", .ref_exe = 0, .alt_exe = 1, .ours_foreign = "o1" },
+        .{ .name = "w2", .op = 2, .ref = "r2", .ours_foreign = "o2" },
+    };
+    var ctx: DCtx = .{};
+    var aw: std.Io.Writer.Allocating = .init(a);
+    const s = drive(testing.io, a, .{ .name = "bench-test", .exes = exes, .abs = tmp.abs, .filters = &.{"w2"}, .rounds = 0 }, &ctx, DCtx.once, &ws, &aw.writer) catch |e| return noSuchFile(e);
+    try testing.expectEqualStrings("A r2\nA o2\n", try tmp.read(a, "log.txt"));
+    try testing.expectEqual(@as(f64, 2.0), s.best_ref);
+    try testing.expectEqual(@as(f64, 2.0), s.worst_ref);
+    try testing.expectEqual(@as(?f64, null), s.worst_fast);
+    try testing.expect(contains(aw.written(), "rounds: 1;"));
+    try testing.expect(!contains(aw.written(), "w1"));
+}
+
+test "drive: a differing output count on either side fails the run" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = try Tmp.init(a);
+    defer tmp.t.cleanup();
+    try tmp.script(a, "R", "case \"$2\" in r) printf 'r\\t10\\t10\\t5\\n';; o) printf 'o\\t10\\t10\\t5\\n';; a) printf 'a\\t10\\t10\\t5\\n';; esac");
+    try tmp.script(a, "Rours6", "case \"$2\" in r) printf 'r\\t10\\t10\\t5\\n';; o) printf 'o\\t10\\t10\\t6\\n';; esac");
+    try tmp.script(a, "Ralt6", "case \"$2\" in r) printf 'r\\t10\\t10\\t5\\n';; o) printf 'o\\t10\\t10\\t5\\n';; a) printf 'a\\t10\\t10\\t6\\n';; esac");
+    const W = Work(u32);
+    var ctx: DCtx = .{};
+    var aw: std.Io.Writer.Allocating = .init(a);
+    const none: Work(u32) = .{ .name = "w", .op = 1, .ref = "r", .ours_foreign = "o" };
+    const with_alt: Work(u32) = .{ .name = "w", .op = 1, .ref = "r", .alt = "a", .ours_foreign = "o" };
+    const run: Run = .{ .name = "bench-test", .exes = &.{ try tmp.path(a, "R"), try tmp.path(a, "Rours6"), try tmp.path(a, "Ralt6") }, .abs = tmp.abs, .rounds = 1 };
+    _ = drive(testing.io, a, run, &ctx, DCtx.once, &[_]W{none}, &aw.writer) catch |e| return noSuchFile(e);
+    var r1 = run;
+    r1.exes = &.{run.exes[1]};
+    try testing.expectError(error.CountMismatch, drive(testing.io, a, r1, &ctx, DCtx.once, &[_]W{none}, &aw.writer));
+    var r2 = run;
+    r2.exes = &.{run.exes[2]};
+    try testing.expectError(error.CountMismatch, drive(testing.io, a, r2, &ctx, DCtx.once, &[_]W{with_alt}, &aw.writer));
+    // The same count on every side passes with an alt, too.
+    _ = try drive(testing.io, a, .{ .name = "bench-test", .exes = &.{run.exes[0]}, .abs = tmp.abs, .rounds = 1 }, &ctx, DCtx.once, &[_]W{with_alt}, &aw.writer);
+}
+
+test "drive: a noisy side is flagged, and a side without a counter turns the verdict to wall time" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = try Tmp.init(a);
+    defer tmp.t.cleanup();
+    // Every call bumps a counter; the reference is slower each time it runs
+    // (three fields: no cycle counter), ours is steady.
+    try tmp.script(a, "N",
+        \\n=0; [ -f "$1/n" ] && n=$(cat "$1/n"); n=$((n+1)); echo $n > "$1/n"
+        \\case "$2" in
+        \\  r) printf 'r\t%s\t5\n' $((100+n*20));;
+        \\  o) printf 'o\t100\t100\t5\n';;
+        \\esac
+    );
+    const W = Work(u32);
+    const ws = [_]W{.{ .name = "w", .op = 1, .ref = "r", .ours_foreign = "o" }};
+    var ctx: DCtx = .{};
+    var aw: std.Io.Writer.Allocating = .init(a);
+    const s = drive(testing.io, a, .{ .name = "bench-test", .exes = &.{try tmp.path(a, "N")}, .abs = tmp.abs, .rounds = 2 }, &ctx, DCtx.once, &ws, &aw.writer) catch |e| return noSuchFile(e);
+    // Ref ran as calls 1 and 3: 120 and 160 ns.
+    try testing.expectApproxEqAbs(@as(f64, 160.0 / 120.0 - 1), s.max_spread, 1e-12);
+    try testing.expect(!s.by_cycles);
+    try testing.expectApproxEqAbs(@as(f64, 100.0 / 120.0), s.best_ref, 1e-12);
+    try testing.expect(contains(aw.written(), "ratios by wall time; largest spread 33.3% (OVER 5 %: noisy run, repeat)\n"));
+}
+
+test "drive: the in-process side sees each workload's op; wall_only drops its cycles; no descriptor is left open" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = try Tmp.init(a);
+    defer tmp.t.cleanup();
+    try tmp.script(a, "A", "printf '%s\\t100\\t100\\t7\\n' \"$2\"");
+    const W = Work(u32);
+    var ctx: DCtx = .{};
+    var aw: std.Io.Writer.Allocating = .init(a);
+    const run: Run = .{ .name = "bench-test", .exes = &.{try tmp.path(a, "A")}, .abs = tmp.abs, .rounds = 1 };
+    // The first process run may open a descriptor of the Io's own; count after it.
+    _ = drive(testing.io, a, run, &ctx, DCtx.once, &[_]W{.{ .name = "w", .op = 7, .ref = "r", .ours_foreign = "r" }}, &aw.writer) catch |e| return noSuchFile(e);
+    const before = openFds();
+    // The op (7) is the count `once` returns; the reference says 7.
+    const s = try drive(testing.io, a, run, &ctx, DCtx.once, &[_]W{.{ .name = "w", .op = 7, .ref = "r" }}, &aw.writer);
+    try testing.expectEqual(before, openFds());
+    try testing.expect(!s.mismatch);
+    // With a counter (and a reference that has one) the verdict is by cycles.
+    const probe: Cycles = .open();
+    defer probe.close();
+    try testing.expectEqual(probe.fd != null, s.by_cycles);
+    const w = try drive(testing.io, a, run, &ctx, DCtx.once, &[_]W{.{ .name = "w", .op = 7, .ref = "r", .wall_only = true }}, &aw.writer);
+    try testing.expect(!w.by_cycles);
+}
+
+fn openFds() usize {
+    var n: usize = 0;
+    for (0..512) |fd| {
+        if (std.os.linux.errno(std.os.linux.fcntl(@intCast(fd), std.os.linux.F.GETFD, 0)) == .SUCCESS) n += 1;
+    }
+    return n;
 }
