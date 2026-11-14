@@ -2457,10 +2457,15 @@ cmd_modules() {
     # lane's -Doptimize: it is a per-ARCH check, so a ReleaseFast lane would
     # repeat the ReleaseSafe lane's run on the same arch word for word (CI audit
     # 2026-11-14: 198 s on RelFast [rest], same verdicts).
+    # The `small` lane too (B10, 2026-11-14): SEL_ARGS never carries
+    # `-Dprofile`, so its copy checked a subset of the RelSafe lane's modules
+    # with the same arguments -- 542 s for verdicts the RelSafe lane gives.
     local _a _fast=0
-    for _a in "${EXTRA_ZIG_ARGS[@]}"; do [[ "$_a" == "-Doptimize=ReleaseFast" ]] && _fast=1; done
+    for _a in "${EXTRA_ZIG_ARGS[@]}"; do
+        [[ "$_a" == "-Doptimize=ReleaseFast" || "$_a" == "-Dprofile=small" ]] && _fast=1
+    done
     if (( _fast )); then
-        echo "modules: check-pubfn-reach skipped -- per-arch, the ReleaseSafe lane of this arch runs it"
+        echo "modules: check-pubfn-reach skipped -- per-arch and profile-blind, the ReleaseSafe lane of this arch runs it"
     else
         step "check-pubfn-reach" zig build check-pubfn-reach ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
     fi
