@@ -1129,3 +1129,14 @@ test "SecNonce.deinit zeroes all 97 secret bytes" {
     sn.deinit();
     try std.testing.expectEqualSlices(u8, &(@as([97]u8, @splat(0))), &sn.bytes);
 }
+
+test "getSecondKey: an empty list gives the all-zero marker and never slices past the end (delta 2026-11-14)" {
+    const none = [_]PlainPublicKey{};
+    try std.testing.expectEqualSlices(u8, &@as([33]u8, @splat(0)), &getSecondKey(&none));
+    // And the two non-empty shapes around it: one key, and all keys equal.
+    const k = PlainPublicKey{ .bytes = @as([33]u8, @splat(2)) };
+    try std.testing.expectEqualSlices(u8, &@as([33]u8, @splat(0)), &getSecondKey(&[_]PlainPublicKey{k}));
+    try std.testing.expectEqualSlices(u8, &@as([33]u8, @splat(0)), &getSecondKey(&[_]PlainPublicKey{ k, k }));
+    const other = PlainPublicKey{ .bytes = @as([33]u8, @splat(3)) };
+    try std.testing.expectEqualSlices(u8, &other.bytes, &getSecondKey(&[_]PlainPublicKey{ k, k, other, k }));
+}
