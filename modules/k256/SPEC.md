@@ -6,7 +6,9 @@
 
 **Scope:** core — libsecp256k1 v0.8.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-08 · mutation 2026-10-08 (48/48) · src 170831e3a2bff684
+**Audit:** review 2026-10-08 · mutation 2026-11-14 (372/408, 36 eq) · src 564b6e1439237dca
+
+*Whole-module mutation run 2026-11-14* (the 2026-10 field/comb/GLV/ecmult rewrite had changed > 20 % of the production lines): 408 mutants over field.zig, group.zig, ecmult.zig and the guards of sign.zig / ecdsa_recover.zig (394 ReleaseSafe, 14 wipe/burn mutants in a ReleaseFast stack-probe binary); 338 killed first, 34 more by 13 new tests (normalize contract, lazy-reduce carry, isZero/equivalent per limb, updateDe range, divsteps59 against the textbook rule, identity encodings, mulInto zeroing on error, IdentityElement on zero products, G recognised by exact limbs, splitToSignedHalves bounds, sign refusing r = 0 / s = 0). 36 decided without a kill: variable-time safegcd round-count/limb-shrink mutants (result-preserving; 66/69 on an exhaustive port check, not a proof), four unobservable (CT safegcd zeta margin, an `inverse` exit never reached, r = 0 needing an unknown dlog, a zero DRBG candidate), recoding equivalents (|d| <= 32 either way), redundant identity guards, wipes of buffers the burn already covers. Not mutated: comptime table builders (covered by the std/BIP340 differentials and corrupted-table controls), the no-longer-dispatched asm core, unchanged scalar.zig.
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, K256_FUZZ; mul at 1/4, sign at 1/4 of it) · ct 2026-09-15 (ctgrind)
 
@@ -742,5 +744,7 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
 **What the tests actually contain.** official BIP340 vectors (kat_vectors.zig) + bit-exact vs std.crypto.ecc.Secp256k1
 
 ## Backlog / deferred
+
+- **`mul`'s local scalar wipe is untested** (mutation 2026-11-14, LOW): `defer secureZero(&s)` in `mul` survives its skip mutant; the stack probe covers `mulInto` only, and the by-value argument copy in the caller's frame prevents an isolating probe for `mul` itself.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
