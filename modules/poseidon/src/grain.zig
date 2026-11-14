@@ -225,6 +225,11 @@ pub fn derive(comptime cfg: Config) Error!Tables(cfg) {
     const Fr = cfg.Fr;
     // One instantiation per field, not one per width — see `Checks`.
     comptime std.debug.assert(cfg.t <= mds_security.max_state_width);
+    // A zero modulus makes the rejection loop below spin forever; `n > 256`
+    // silently drops draw bits in `nextNum`'s u256. Config is comptime, so
+    // both are compile errors, not runtime hazards.
+    comptime if (std.mem.readInt(u256, &cfg.modulus_be, .big) == 0 or cfg.n > 256)
+        @compileError("poseidon: Config needs a non-zero modulus and n <= 256");
     const checks = mds_security.Checks(Fr, &cfg.modulus_be, mds_security.max_state_width);
     var lfsr: Lfsr = .init(cfg.n, cfg.t, cfg.r_f, cfg.r_p);
     const p = std.mem.readInt(u256, &cfg.modulus_be, .big);

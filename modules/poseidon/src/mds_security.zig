@@ -119,6 +119,13 @@ pub fn Checks(comptime Fr: type, comptime p_be: []const u8, comptime n_max: usiz
             round: usize = 0,
         };
 
+        /// Caller contract of every entry point below: `1 <= t <= n_max`. A wider
+        /// `t` would index past the fixed-capacity buffers (UB in ReleaseFast),
+        /// and `t = 0` underflows `algorithm1Literal`'s `t - 1`. Checked panic.
+        fn checkWidth(t: usize) void {
+            if (t < 1 or t > n_max) @panic("poseidon: mds_security state width t must be in 1..n_max");
+        }
+
         // ── the pieces the reference builds out of ──────────────────────────
 
         /// `w_k = e_0^T M^k` for `k = 0 .. count-1`, written to `out`.
@@ -134,6 +141,7 @@ pub fn Checks(comptime Fr: type, comptime p_be: []const u8, comptime n_max: usiz
         /// `S = { x : (M^k x)[0] = 0 for k = 0 .. round_num-1 }`, written to
         /// `out`; returns its dimension. `round_num == 0` is all of `V`.
         pub fn generateVectorspace(m: *const Mat, t: usize, round_num: usize, out: *[n_max]Vec) usize {
+            checkWidth(t);
             if (round_num == 0) {
                 for (0..t) |i| out[i] = la.basisVec(i);
                 return t;
@@ -150,6 +158,7 @@ pub fn Checks(comptime Fr: type, comptime p_be: []const u8, comptime n_max: usiz
         /// Transcribed from the sage loop, including its "stop when the
         /// dimension stops growing" exit.
         pub fn algorithm2(a: *const Mat, t: usize) bool {
+            checkWidth(t);
             var is = la.Echelon.init(t);
             var v = la.basisVec(0);
             _ = is.add(v);
@@ -169,6 +178,7 @@ pub fn Checks(comptime Fr: type, comptime p_be: []const u8, comptime n_max: usiz
         /// `algorithm1Literal` so that the sub-code and the failing round match
         /// the reference exactly.
         pub fn algorithm1(m: *const Mat, t: usize) Error!Alg1 {
+            checkWidth(t);
             var rows: [n_max]Vec = undefined;
             rowSequence(m, t, t, rows[0..t]);
             var e = la.Echelon.init(t);
@@ -181,6 +191,7 @@ pub fn Checks(comptime Fr: type, comptime p_be: []const u8, comptime n_max: usiz
         /// eigenspaces, explicit `S · M^j`. `O(t^5)`, and only ever reached for
         /// a matrix that is going to be rejected.
         pub fn algorithm1Literal(m: *const Mat, t: usize) Error!Alg1 {
+            checkWidth(t);
             // `s = 1`, so `r = floor((t - s)/s) = t - 1`.
             const rounds = t - 1;
             // One field inversion for the whole call, not one per `charPoly`.
@@ -244,6 +255,7 @@ pub fn Checks(comptime Fr: type, comptime p_be: []const u8, comptime n_max: usiz
         /// reduction (unconditional) and, when its hypotheses hold, the
         /// squarefree-characteristic-polynomial test.
         pub fn algorithm3(m: *const Mat, t: usize) bool {
+            checkWidth(t);
             return algorithm3With(m, t, la.orderPoly(m, &la.basisVec(0), t));
         }
 
@@ -251,6 +263,7 @@ pub fn Checks(comptime Fr: type, comptime p_be: []const u8, comptime n_max: usiz
         /// the caller has usually just computed for `algorithm_2` anyway (the
         /// two are the same `O(t^3)` Krylov walk).
         pub fn algorithm3With(m: *const Mat, t: usize, f: la.Poly) bool {
+            checkWidth(t);
             // `e_0` not cyclic for `M` ⇒ not cyclic for any `M^r` either
             // (every power of `M^r` is a power of `M`).
             if (f.deg != @as(isize, @intCast(t))) return false;
@@ -274,6 +287,7 @@ pub fn Checks(comptime Fr: type, comptime p_be: []const u8, comptime n_max: usiz
         /// The transcription: form `M^r` and run `algorithm_2` on it, for every
         /// `r` the reference tests.
         pub fn algorithm3Literal(m: *const Mat, t: usize) bool {
+            checkWidth(t);
             var a = m.*;
             var r: usize = 2;
             while (r <= 4 * t) : (r += 1) {
@@ -297,6 +311,7 @@ pub fn Checks(comptime Fr: type, comptime p_be: []const u8, comptime n_max: usiz
         /// `O(t^2 · log p)` field multiplications per `i`, so do not put it on a
         /// hot path.
         pub fn checkMinpolyCondition(m: *const Mat, t: usize) bool {
+            checkWidth(t);
             const small = la.SmallInverses.init();
             var a = la.identity(t);
             for (1..2 * t + 1) |_| {
@@ -315,6 +330,7 @@ pub fn Checks(comptime Fr: type, comptime p_be: []const u8, comptime n_max: usiz
         /// `algorithm_2` *is* "the order polynomial of `e_0` has degree `t`",
         /// which is the first thing `algorithm_3` needs anyway.
         pub fn isSecure(m: *const Mat, t: usize) Error!bool {
+            checkWidth(t);
             if (!(try algorithm1(m, t)).secure) return false;
             const f = la.orderPoly(m, &la.basisVec(0), t);
             if (f.deg != @as(isize, @intCast(t))) return false; // == !algorithm2(m, t)
@@ -328,6 +344,21 @@ pub fn Checks(comptime Fr: type, comptime p_be: []const u8, comptime n_max: usiz
 
 const bn254 = @import("bn254");
 const testing = std.testing;
+
+test "every entry point accepts the full width range 1..n_max (sweep PS-1)" {
+    // Boundary pin for the checked width panic: t == n_max (6) must work.
+    var s = Sample{ .state = 77 };
+    for ([_]usize{ 1, 6 }) |t| {
+        const m = s.mat(t);
+        _ = try C.isSecure(&m, t);
+        _ = try C.algorithm1(&m, t);
+        _ = C.algorithm2(&m, t);
+        _ = C.algorithm3(&m, t);
+        _ = C.algorithm3Literal(&m, t);
+        var out: [6]C.Vec = undefined;
+        try testing.expectEqual(t, C.generateVectorspace(&m, t, 0, &out));
+    }
+}
 
 /// One instantiation, capacity 6 — the tests only need small widths, and the
 /// point of `n_max` is that `t` is a runtime argument.
