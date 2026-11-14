@@ -220,7 +220,9 @@ pub const AcmeDns = struct {
             .body = req_body,
         });
         defer res.deinit();
-        const body = try res.readAllAlloc(gpa, 64 * 1024);
+        // Bounded in time as well as size: `total_timeout_ms` ends at the head,
+        // so a server that sends its head and stalls would park this call.
+        const body = try res.readAllAllocTimeout(gpa, 64 * 1024, http_options.total_timeout_ms);
         defer gpa.free(body);
         if (res.status != 201 and res.status != 200) return error.RegistrationRefused;
         return parseRegistration(gpa, body);
@@ -333,7 +335,7 @@ pub const HttpReq = struct {
 
 /// `Basic base64(user ":" password)` (RFC 7617). A user-id containing ':'
 /// cannot be represented (RFC 7617 §2) and is refused, as are credentials
-/// over 379 bytes.
+/// over 378 bytes ("user:password"; the encoded header must fit 512 bytes).
 fn basicAuth(buf: *[512]u8, user: []const u8, password: []const u8) error{InvalidCredentials}![]const u8 {
     if (std.mem.findScalar(u8, user, ':') != null) return error.InvalidCredentials;
     var plain: [380]u8 = undefined;
@@ -369,7 +371,8 @@ fn post(client: *http.Client, gpa: std.mem.Allocator, url: []const u8, body: []c
         .follow_redirects = false,
     });
     defer res.deinit();
-    const drained = try res.readAllAlloc(gpa, 64 * 1024);
+    // Bounded in time as well as size (see `register`).
+    const drained = try res.readAllAllocTimeout(gpa, 64 * 1024, client.options.total_timeout_ms);
     gpa.free(drained);
     return res.status;
 }
@@ -473,6 +476,16 @@ test "basicAuth: RFC 7617 §2 example" {
     const long: [400]u8 = @splat('x');
     try testing.expectError(error.InvalidCredentials, basicAuth(&buf, &long, "p"));
     try testing.expectError(error.InvalidCredentials, basicAuth(&buf, "us:er", "p"));
+}
+
+test "basicAuth: the longest credentials that fit, and one byte more (sweep AD-3)" {
+    var buf: [512]u8 = undefined;
+    const user = "u";
+    var pw: [376]u8 = @splat('p'); // "u:" + 376 = 378 bytes joined
+    const ok = try basicAuth(&buf, user, &pw);
+    try testing.expectEqual(@as(usize, 6 + 504), ok.len);
+    var pw2: [377]u8 = @splat('p');
+    try testing.expectError(error.InvalidCredentials, basicAuth(&buf, user, &pw2));
 }
 
 test "joinPath: the segment goes before a query or fragment (lego URL.JoinPath)" {

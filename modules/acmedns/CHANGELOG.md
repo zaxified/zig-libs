@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-14** — **BEHAVIOURAL, not breaking:** (no-panic sweep, hostile network input) `propagation_timeout_ms` now also ends a pass over many or mute servers (the NS list and each name's address list come off the network; before, one pass could outlast the timeout by servers x addresses x `query_timeout_ms`): `Dns01Solver` checks the budget before every query, the first query is always made. `AcmeDns`, `HttpReq` and `AcmeDns.register` read the response body under the HTTP client's `total_timeout_ms` (a server that sent its head and stalled parked the call forever). The basic-auth limit is documented as 378 bytes (was 379; behaviour unchanged). Tests: `hostile_test.zig`, `zone_test.zig`.
 - **2026-11-06** — **Changed:** `Dns01Solver.Error` gains `InvalidDomain` (a domain over 253 bytes, from `acme.Client.dns01RecordName`, which no longer panics).
 - **2026-10-31** — publishers: explicit note for the new `dns.Resolver.Error.RequestTooLarge`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.

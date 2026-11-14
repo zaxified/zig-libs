@@ -241,6 +241,30 @@ fn recursive(s: *Dns01Solver) dns.Resolver {
     });
 }
 
+/// The clock of one propagation wait. The server list comes off the network
+/// (a zone's NS RRset, each name's address list), so one pass can hold
+/// thousands of queries of `query_timeout_ms` each: `gate` is asked before
+/// every query and ends the wait once `propagation_timeout_ms` has run out,
+/// instead of leaving that to the end of the pass.
+const Wait = struct {
+    start: std.Io.Timestamp,
+    /// Queries started; the first is always allowed, so a zero timeout still
+    /// asks once.
+    asked: u32 = 0,
+
+    fn elapsedMs(w: *const Wait, s: *Dns01Solver) u64 {
+        return @intCast(@max(0, w.start.durationTo(std.Io.Clock.awake.now(s.io)).toMilliseconds()));
+    }
+
+    fn gate(w: *Wait, s: *Dns01Solver) Error!void {
+        if (w.asked != 0 and w.elapsedMs(s) >= s.options.propagation_timeout_ms) {
+            s.note = "the TXT record did not reach every authoritative server in time";
+            return error.PropagationTimeout;
+        }
+        w.asked +|= 1;
+    }
+};
+
 /// Poll every authoritative server until all of them answer with `value`.
 fn waitPropagation(s: *Dns01Solver, r: *dns.Resolver, fqdn: []const u8, zone_name: []const u8, value: []const u8) Error!void {
     var servers: std.ArrayList([]netaddr.Ip) = .empty;
@@ -263,14 +287,14 @@ fn waitPropagation(s: *Dns01Solver, r: *dns.Resolver, fqdn: []const u8, zone_nam
         }
     }
 
-    const start = std.Io.Clock.awake.now(s.io);
+    var w: Wait = .{ .start = std.Io.Clock.awake.now(s.io) };
     while (true) {
         const auth_ok = if (names.len != 0)
-            try s.namedServersHave(r, names, fqdn, value)
+            try s.namedServersHave(&w, r, names, fqdn, value)
         else
-            try s.allServersHave(servers.items, fqdn, value);
-        if (auth_ok and try s.resolversHave(fqdn, value)) return;
-        const elapsed: u64 = @intCast(@max(0, start.durationTo(std.Io.Clock.awake.now(s.io)).toMilliseconds()));
+            try s.allServersHave(&w, servers.items, fqdn, value);
+        if (auth_ok and try s.resolversHave(&w, fqdn, value)) return;
+        const elapsed = w.elapsedMs(s);
         if (elapsed >= s.options.propagation_timeout_ms) {
             s.note = "the TXT record did not reach every authoritative server in time";
             return error.PropagationTimeout;
@@ -283,10 +307,10 @@ fn waitPropagation(s: *Dns01Solver, r: *dns.Resolver, fqdn: []const u8, zone_nam
 /// least one of its addresses; an address that does not answer at all is
 /// skipped for the next one. With `require_all_authoritative` off, one
 /// server answering is enough.
-fn allServersHave(s: *Dns01Solver, servers: []const []netaddr.Ip, fqdn: []const u8, value: []const u8) Error!bool {
+fn allServersHave(s: *Dns01Solver, w: *Wait, servers: []const []netaddr.Ip, fqdn: []const u8, value: []const u8) Error!bool {
     var any = false;
     for (servers) |ips| {
-        const has = try s.anyAddressHas(ips, fqdn, value, false);
+        const has = try s.anyAddressHas(w, ips, fqdn, value, false);
         if (has) any = true;
         if (!has and s.options.require_all_authoritative) return false;
     }
@@ -298,10 +322,11 @@ fn allServersHave(s: *Dns01Solver, servers: []const []netaddr.Ip, fqdn: []const 
 /// pre-check fails and is retried), never as absent — dropping it would let
 /// the check pass without the server the CA may ask. A name with no address
 /// at all (NODATA) cannot be asked by the CA either and is left out.
-fn namedServersHave(s: *Dns01Solver, r: *dns.Resolver, names: []const []u8, fqdn: []const u8, value: []const u8) Error!bool {
+fn namedServersHave(s: *Dns01Solver, w: *Wait, r: *dns.Resolver, names: []const []u8, fqdn: []const u8, value: []const u8) Error!bool {
     var any = false;
     var asked = false;
     for (names) |ns| {
+        try w.gate(s);
         const ips = (try zone.nameserverIps(r, s.gpa, ns)) orelse {
             if (s.options.require_all_authoritative) return false;
             continue;
@@ -309,7 +334,7 @@ fn namedServersHave(s: *Dns01Solver, r: *dns.Resolver, names: []const []u8, fqdn
         defer s.gpa.free(ips);
         if (ips.len == 0) continue;
         asked = true;
-        const has = try s.anyAddressHas(ips, fqdn, value, false);
+        const has = try s.anyAddressHas(w, ips, fqdn, value, false);
         if (has) any = true;
         if (!has and s.options.require_all_authoritative) return false;
     }
@@ -318,9 +343,10 @@ fn namedServersHave(s: *Dns01Solver, r: *dns.Resolver, names: []const []u8, fqdn
 
 /// With `check_resolvers`: every configured recursive resolver (or the
 /// system's, when none is configured) answers with the value.
-fn resolversHave(s: *Dns01Solver, fqdn: []const u8, value: []const u8) Error!bool {
+fn resolversHave(s: *Dns01Solver, w: *Wait, fqdn: []const u8, value: []const u8) Error!bool {
     if (!s.options.check_resolvers) return true;
     if (s.options.resolvers.len == 0) {
+        try w.gate(s);
         var r = s.recursive();
         defer r.deinit();
         var msg = r.query(fqdn, .txt) catch |err| switch (err) {
@@ -331,13 +357,14 @@ fn resolversHave(s: *Dns01Solver, fqdn: []const u8, value: []const u8) Error!boo
         return zone.txtPresent(&msg, fqdn, value);
     }
     for (s.options.resolvers) |ip| {
-        if (!try s.anyAddressHas(&.{ip}, fqdn, value, true)) return false;
+        if (!try s.anyAddressHas(w, &.{ip}, fqdn, value, true)) return false;
     }
     return true;
 }
 
-fn anyAddressHas(s: *Dns01Solver, ips: []const netaddr.Ip, fqdn: []const u8, value: []const u8, recursive_query: bool) Error!bool {
+fn anyAddressHas(s: *Dns01Solver, w: *Wait, ips: []const netaddr.Ip, fqdn: []const u8, value: []const u8, recursive_query: bool) Error!bool {
     for (ips) |ip| {
+        try w.gate(s);
         return zone.serverHasTxtRd(s.io, s.gpa, ip, s.options.port, s.options.query_timeout_ms, fqdn, value, recursive_query) catch |err| switch (err) {
             error.OutOfMemory, error.Canceled => |e| return e,
             else => continue,

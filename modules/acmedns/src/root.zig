@@ -91,4 +91,5 @@ test {
     _ = @import("solver_test.zig");
     _ = @import("zone_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("hostile_test.zig");
 }

@@ -54,6 +54,8 @@ const Stub = struct {
     sock: net.Socket,
     rules: []const Rule,
     fallback: u4 = nxdomain,
+    /// Receive and never answer: a server that is up and mute.
+    silent: bool = false,
     stop: std.atomic.Value(bool) = .init(false),
 
     fn bind(io: std.Io, rules: []const Rule) !Stub {
@@ -74,7 +76,7 @@ const Stub = struct {
         const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
         const in = try st.sock.receiveTimeout(st.io, &rbuf, t.toDeadline(st.io));
         const q = in.data;
-        if (q.len < 12) return;
+        if (st.silent or q.len < 12) return;
         // The question: name labels from offset 12, then type and class.
         var name_buf: [256]u8 = undefined;
         var name_len: usize = 0;
@@ -259,6 +261,43 @@ test "propagation: a nameserver whose address does not resolve holds the check (
     try testing.expectError(error.PropagationTimeout, propagationRun(servfail, true));
     // Unless one server is enough by configuration.
     try propagationRun(servfail, false);
+}
+
+fn nowMs(io: std.Io) i64 {
+    const ts = std.Io.Clock.Timestamp.now(io, .awake);
+    return @intCast(@divTrunc(ts.raw.nanoseconds, std.time.ns_per_ms));
+}
+
+test "propagation: the timeout ends a pass over many mute servers, not only the pass (sweep AD-1)" {
+    // Eight authoritative addresses (the list comes off the network in real
+    // use: a zone's NS RRset), none answers; each query waits 300 ms. The
+    // budget is 400 ms: the old code finished the whole pass (8 x 300 ms =
+    // 2.4 s) before looking at the clock.
+    var lab: Lab = undefined;
+    try lab.start(&.{});
+    defer lab.stop();
+    lab.stub.silent = true;
+    var f: Fake = .{};
+    const auth: [8]netaddr.Ip = @splat(.{ .v4 = .{ 127, 0, 0, 1 } });
+    var s = Dns01Solver.init(lab.threaded.io(), testing.allocator, .{
+        .publisher = f.publisher(),
+        .port = lab.stub.port(),
+        .query_timeout_ms = 300,
+        .follow_cname = false,
+        .zone = "a.test",
+        .authoritative = &auth,
+        .require_all_authoritative = false, // every server is asked in a pass
+        .propagation_timeout_ms = 400,
+        .propagation_interval_ms = 50,
+    });
+    defer s.deinit();
+    const t0 = nowMs(lab.threaded.io());
+    try testing.expectError(error.PropagationTimeout, s.present("a.test", "tok", "tok.thumb"));
+    const took = nowMs(lab.threaded.io()) - t0;
+    try testing.expect(took < 1500);
+    // The mute servers were asked at all: the first query is always made.
+    try testing.expectEqual(f.presents, f.cleanups);
+    try testing.expectEqual(@as(usize, 0), s.pendingCount());
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
