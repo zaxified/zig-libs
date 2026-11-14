@@ -81,6 +81,23 @@ fn ctgrindHarnesses(b: *Build) []const []const u8 {
 /// ⚠ The one blind spot of dropping comments: code that reads `@src().line`
 /// sees a line shift that the token stream does not. A false "unchanged" is
 /// the direction that must not happen, so a module doing that must say so.
+/// Completes a `deps`-only closure from the seeds already on `stack[0..sp]`
+/// (each marked in `seen`): a module object a test binary or tools program
+/// imports carries its `deps`, never its `test_deps`.
+fn walkDeps(seen: []bool, stack: []usize, sp: *usize) !void {
+    while (sp.* > 0) {
+        sp.* -= 1;
+        for (module_list[stack[sp.*]].deps) |d| {
+            const j = moduleIndex(d) orelse return error.UnknownDep;
+            if (!seen[j]) {
+                seen[j] = true;
+                stack[sp.*] = j;
+                sp.* += 1;
+            }
+        }
+    }
+}
+
 fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
     _ = options;
     const b = step.owner;
@@ -274,6 +291,41 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
     }.lt);
     const seen = try b.allocator.alloc(bool, module_list.len);
     const stack = try b.allocator.alloc(usize, module_list.len);
+
+    // testkit's PUBLIC SURFACE for the build key (column 3): the first line of
+    // every `pub` declaration in its `src/` (comments stripped by trimming,
+    // files in name order). A renamed, removed or re-signed helper changes it;
+    // a body change does not.
+    var testkit_surface: [32]u8 = undefined;
+    {
+        var hs = Sha256.init(.{});
+        var tk = try b.build_root.handle.openDir(io, "modules/testkit/src", .{ .iterate = true });
+        defer tk.close(io);
+        var names: std.ArrayList([]const u8) = .empty;
+        var it = tk.iterate();
+        while (try it.next(io)) |e| {
+            if (e.kind == .file and std.mem.endsWith(u8, e.name, ".zig")) try names.append(b.allocator, try b.allocator.dupe(u8, e.name));
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        for (names.items) |name| {
+            const src = try tk.readFileAlloc(io, name, b.allocator, .limited(64 * 1024 * 1024));
+            hs.update(name);
+            hs.update("\x00");
+            var lines = std.mem.splitScalar(u8, src, '\n');
+            while (lines.next()) |line| {
+                const t = std.mem.trim(u8, line, " \t\r");
+                if (!std.mem.startsWith(u8, t, "pub ")) continue;
+                hs.update(t);
+                hs.update("\n");
+            }
+        }
+        hs.final(&testkit_surface);
+    }
+
     for (module_list, 0..) |m, i| {
         // Closure by DFS with a visited set: `test_deps` may close a cycle,
         // and a visited set makes that harmless.
@@ -314,29 +366,85 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
         // test helper's fallout on its importers' tests is the tag lanes' job
         // (owner 2026-10-10: the push lane is a quick consistency check); the
         // helper itself is still compiled, because its OWN hash changed.
+        //
+        // CORRECTED the same day (CI audit 2026-11-14): the test binaries this
+        // lane compiles import every `test_dep`, so a test_dep's API break was
+        // green on push. The key now follows the module's own `test_deps` too
+        // (their `mod` carries `deps` only, so the walk below them is `deps`),
+        // EXCEPT testkit, whose 221 importers would all re-key on any edit:
+        // for testkit only its PUBLIC SURFACE goes in (`testkit_surface`, the
+        // first line of every `pub` declaration) -- a rename, removal or
+        // signature change re-keys its importers, a body change does not.
         @memset(seen, false);
         seen[i] = true;
         sp = 0;
-        stack[sp] = i;
-        sp += 1;
-        while (sp > 0) {
-            sp -= 1;
-            for (module_list[stack[sp]].deps) |d| {
-                const j = moduleIndex(d).?; // checked by the walk above
-                if (!seen[j]) {
-                    seen[j] = true;
-                    stack[sp] = j;
-                    sp += 1;
-                }
+        var uses_testkit = false;
+        for ([_][]const []const u8{ m.deps, m.test_deps }) |list| for (list) |d| {
+            if (std.mem.eql(u8, d, "testkit")) {
+                uses_testkit = true;
+                continue;
             }
-        }
+            const j = moduleIndex(d).?; // checked by the walk above
+            if (!seen[j]) {
+                seen[j] = true;
+                stack[sp] = j;
+                sp += 1;
+            }
+        };
+        try walkDeps(seen, stack, &sp);
         var hb = Sha256.init(.{});
         hb.update(&machinery.peek());
         hb.update(&own[i]);
         for (by_name) |j| if (seen[j] and j != i) hb.update(&iface[j]);
+        if (uses_testkit) {
+            hb.update("\x00testkit-surface:");
+            hb.update(&testkit_surface);
+        }
         var build_digest: [32]u8 = undefined;
         hb.final(&build_digest);
-        try w.print("{s}\t{s}\t{s}\n", .{ m.name, std.fmt.bytesToHex(digest[0..16], .lower), std.fmt.bytesToHex(build_digest[0..16], .lower) });
+
+        // ⭐ FOURTH COLUMN: the TOOLS key (2026-11-14) -- what the module's
+        // `tools/` programs (interop, bench, live) can import, as build.zig wires
+        // them: `deps`, `test_deps`, `interop_deps`, `bench_deps`, and for a
+        // bench `fastmem` + `testkit`. `interop_deps` and `bench_deps` were in
+        // NO key before (CI audit: an edit to tlsserver re-took nothing for
+        // tlsresume's interop). `test.sh interop` keys its compile and take
+        // stamps on it; the test lanes keep column 2, so a fastmem edit does not
+        // re-run ~100 modules' tests.
+        @memset(seen, false);
+        seen[i] = true;
+        sp = 0;
+        const has_bench = if (b.build_root.handle.access(io, b.fmt("modules/{s}/tools/bench.zig", .{m.name}), .{})) true else |_| false;
+        const implicit_bench = [_][]const u8{ "fastmem", "testkit" };
+        for ([_][]const []const u8{ m.deps, m.test_deps, m.interop_deps, m.bench_deps, if (has_bench) &implicit_bench else &.{} }) |list| for (list) |d| {
+            const j = moduleIndex(d) orelse return step.fail("module-fingerprints: {s} names unknown tools dep {s}", .{ m.name, d });
+            if (!seen[j]) {
+                seen[j] = true;
+                stack[sp] = j;
+                sp += 1;
+            }
+        };
+        try walkDeps(seen, stack, &sp);
+        var ht = Sha256.init(.{});
+        ht.update(&machinery.peek());
+        ht.update(&own[i]);
+        for (m.interop_deps) |d| {
+            ht.update("\x00i:");
+            ht.update(d);
+        }
+        for (m.bench_deps) |d| {
+            ht.update("\x00b:");
+            ht.update(d);
+        }
+        for (by_name) |j| if (seen[j] and j != i) ht.update(&iface[j]);
+        var tools_digest: [32]u8 = undefined;
+        ht.final(&tools_digest);
+        try w.print("{s}\t{s}\t{s}\t{s}\n", .{
+            m.name,
+            std.fmt.bytesToHex(digest[0..16], .lower),
+            std.fmt.bytesToHex(build_digest[0..16], .lower),
+            std.fmt.bytesToHex(tools_digest[0..16], .lower),
+        });
     }
 
     var buf: [4096]u8 = undefined;
