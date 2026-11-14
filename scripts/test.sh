@@ -1930,6 +1930,10 @@ phase_checks_fast_tail() {
     step "check-package" zig build check-package
     step "check-catalog" zig build check-catalog
     step "check-build-options" ./scripts/checks/check-build-options.py
+    # ⭐ NOT sub-second (16-20 s), and here anyway (CI audit D3, 2026-11-14): a
+    # stale ct-compare pin was seen only by the full `checks` lane, after the
+    # push -- twice in ten days. Here it is red before the push instead.
+    step "check-ct-compare" ./scripts/checks/check-ct-compare.py
 
     # Zig 0.17's `@hasDecl` sees only `pub` declarations, so a probe for an
     # optional capability goes quietly false when the capability is private:
@@ -2053,7 +2057,7 @@ phase_checks() {
     # the ctgrind gate. This disassembly check is the only thing that fails when
     # the emulation is bypassed. See the script header.
     step "check-fp-freedom" ./scripts/checks/check-fp-freedom.sh
-    step "check-ct-compare" ./scripts/checks/check-ct-compare.py
+    # check-ct-compare moved to the fast checks (D3, see there).
 
     step "check-ctgrind" zig build check-ctgrind
 }
