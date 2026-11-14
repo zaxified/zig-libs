@@ -191,10 +191,17 @@ CASES = {
 }
 
 
+def _repeated(fd):
+    """protobuf 7 dropped `FieldDescriptor.label` for `is_repeated` (CI run
+    43634109184, google.protobuf 7.36.2); older releases have only `label`."""
+    r = getattr(fd, "is_repeated", None)
+    return r if r is not None else fd.label == fd.LABEL_REPEATED
+
+
 def populate(msg, values):
     for k, v in values.items():
         fd = msg.DESCRIPTOR.fields_by_name[k]
-        if fd.label == fd.LABEL_REPEATED:
+        if _repeated(fd):
             if fd.type == fd.TYPE_MESSAGE:
                 for item in v:
                     populate(getattr(msg, k).add(), item)
@@ -233,7 +240,7 @@ def dump(msg):
     lines = []
     for fd in sorted(msg.DESCRIPTOR.fields, key=lambda f: f.number):
         v = getattr(msg, fd.name)
-        if fd.label == fd.LABEL_REPEATED:
+        if _repeated(fd):
             lines.append("%s=[%s]" % (fd.name, ",".join(fmt(fd, x) for x in v)))
         elif fd.type == fd.TYPE_MESSAGE:
             lines.append("%s=%s" % (fd.name, fmt(fd, v) if msg.HasField(fd.name) else "<unset>"))
