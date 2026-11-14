@@ -336,7 +336,9 @@ pub const Initiator = struct {
         if (self.state != .awaiting_act2) return error.WrongState;
         errdefer self.state = .failed;
         self.ss.mixHash(&msg.e_pub);
-        const ee = try dh.dh(&self.ephemeral.?.secret_key, msg.e_pub);
+        // `state` is a plain pub field: a hand-built object can say `awaiting_act2` with no ephemeral.
+        const eph = self.ephemeral orelse return error.WrongState; // BB-1
+        const ee = try dh.dh(&eph.secret_key, msg.e_pub);
         self.ss.mixKey(&ee);
         var empty: [0]u8 = undefined;
         try self.ss.decryptAndHash(&msg.tag, &empty);
@@ -393,7 +395,8 @@ pub const Initiator = struct {
         // see the doc comment's nonce-continuity warning).
         var c: [49]u8 = undefined;
         try self.ss.encryptAndHash(&self.ls.public_key, &c);
-        const se = try dh.dh(&self.ls.secret_key, self.re_pub.?);
+        const re = self.re_pub orelse return error.WrongState; // see readAct2Body (BB-1)
+        const se = try dh.dh(&self.ls.secret_key, re);
         self.ss.mixKey(&se);
         var t: [16]u8 = undefined;
         try self.ss.encryptAndHash("", &t);
@@ -540,7 +543,8 @@ pub const Responder = struct {
         errdefer self.state = .failed;
         self.ephemeral = e;
         self.ss.mixHash(&e.public_key);
-        const ee = try dh.dh(&e.secret_key, self.re_pub.?);
+        const re = self.re_pub orelse return error.WrongState; // see Initiator.readAct2Body (BB-1)
+        const ee = try dh.dh(&e.secret_key, re);
         self.ss.mixKey(&ee);
         var tag: [16]u8 = undefined;
         try self.ss.encryptAndHash("", &tag);
@@ -606,7 +610,8 @@ pub const Responder = struct {
         // SEC1 point — `dh.dh`'s `Secp256k1.fromSec1` rejects it with
         // `error.InvalidPublicKey` before any scalar multiply runs (BOLT#8
         // "act3 bad rs test"); only a VALIDATED key is stored.
-        const se = try dh.dh(&self.ephemeral.?.secret_key, rs);
+        const eph = self.ephemeral orelse return error.WrongState; // see Initiator.readAct2Body (BB-1)
+        const se = try dh.dh(&eph.secret_key, rs);
         self.rs_pub = rs;
         // Audit finding F5: `rs_pub` above is set from a VALIDATED key, but
         // the handshake can still fail below (the final `decryptAndHash` —
@@ -630,7 +635,7 @@ pub const Responder = struct {
             .rk = pair[0].k,
             .ck = self.ss.ck,
             .handshake_hash = self.ss.getHandshakeHash(),
-            .remote_static = self.rs_pub.?,
+            .remote_static = rs, // validated above, == self.rs_pub
         };
     }
 };
@@ -838,4 +843,50 @@ test "act ordering is enforced: no second genAct1/genAct2 can silently reuse the
     try testing.expectEqual(Initiator.State.done, initiator.state);
     try testing.expectEqual(Responder.State.done, responder.state);
     try testing.expectError(error.WrongState, responder.readAct3(fin.msg, &scratch_result));
+}
+
+// ── no-panic sweep (2026-11-14) ───────────────────────────────────────
+
+// `state` is a pub field with a default, so a consumer can build an object by
+// literal (or assign the field) and land in an act whose earlier act never ran.
+// The fields that act reads are then null: it must answer `WrongState`, not `.?`.
+
+test "Initiator.readAct2 on an object claiming awaiting_act2 with no ephemeral is WrongState (sweep BB-1)" {
+    const ls = tu.keyPair(@as([32]u8, @splat(0x11)));
+    const rs = tu.keyPair(@as([32]u8, @splat(0x21)));
+    var i: Initiator = .{ .ls = ls, .rs_pub = rs.public_key, .state = .awaiting_act2 };
+    try testing.expectError(error.WrongState, i.readAct2(.{ .e_pub = rs.public_key, .tag = @splat(0) }));
+    try testing.expectEqual(Initiator.State.failed, i.state);
+}
+
+test "Initiator.genAct3 on an object claiming ready_act3 with no re_pub is WrongState (sweep BB-1)" {
+    const ls = tu.keyPair(@as([32]u8, @splat(0x11)));
+    const rs = tu.keyPair(@as([32]u8, @splat(0x21)));
+    var i: Initiator = .{ .ls = ls, .rs_pub = rs.public_key, .state = .ready_act3 };
+    i.ss.cipher_state.initializeKey(&@as([32]u8, @splat(7))); // keyed, so Act Three's first encrypt runs
+    try testing.expectError(error.WrongState, i.genAct3(&scratch_result));
+}
+
+test "Responder.genAct2 on an object claiming ready_act2 with no re_pub is WrongState (sweep BB-1)" {
+    const ls = tu.keyPair(@as([32]u8, @splat(0x21)));
+    var r: Responder = .{ .ls = ls, .state = .ready_act2 };
+    var prng = std.Random.DefaultPrng.init(0xbb1);
+    try testing.expectError(error.WrongState, r.genAct2(.{ .seeded_for_test = prng.random() }));
+}
+
+test "Responder.readAct3 on an object claiming awaiting_act3 with no ephemeral is WrongState (sweep BB-1)" {
+    const ls = tu.keyPair(@as([32]u8, @splat(0x21)));
+    const peer = tu.keyPair(@as([32]u8, @splat(0x11)));
+    // A valid Act Three `c` under a key both sides share, so the first decrypt
+    // succeeds and the next read is the missing `ephemeral`.
+    const key: [32]u8 = @splat(7);
+    var twin: Suite.SymmetricState = .{};
+    twin.cipher_state.initializeKey(&key);
+    var c: [49]u8 = undefined;
+    try twin.encryptAndHash(&peer.public_key, &c);
+
+    var r: Responder = .{ .ls = ls, .state = .awaiting_act3 };
+    r.ss.cipher_state.initializeKey(&key);
+    try testing.expectError(error.WrongState, r.readAct3(.{ .c = c, .t = @splat(0) }, &scratch_result));
+    try testing.expect(r.rs_pub == null);
 }

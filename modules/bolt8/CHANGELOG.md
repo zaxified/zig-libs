@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-14** — No-panic sweep: `Initiator.readAct2`/`genAct3` and `Responder.genAct2`/`readAct3` answer `error.WrongState` (not a `.?` panic) on an object whose `state` field was set by hand ahead of the acts that fill the fields they read; `readAct3` no longer re-reads `rs_pub.?`. New transport test: a forged body leaves no plaintext in `out` and does not advance `rx`.
 - **2026-10-18** — Ported to Zig 0.17.0. Test: union `@typeInfo` uses `field_names`. `tools/peer.zig` follows the in-place `Initiator.init`/`Responder.init`/`genAct3`/`readAct3`/`Transport.init` out-parameter shapes (pre-existing drift).
 - **2026-10-09** — **BREAKING (corrects the entry below):** the `out`/pointer key derivation is
   `KeyPair.generateDeterministicInto(out, seed: *const [32]u8)`; `KeyPair.generateDeterministic(seed)

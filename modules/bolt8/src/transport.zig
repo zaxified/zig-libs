@@ -523,3 +523,23 @@ test "corpus: the transport seeds reach a real AEAD decrypt, not just the length
     try recv_msg.recvMessage(&c, &out);
     try testing.expectEqualStrings("hello", &out);
 }
+
+test "recvMessage: a forged body releases no plaintext into `out` and leaves rx usable (sweep BB-2)" {
+    var sender = tu.transportOf(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = @as([32]u8, @splat(0)), .remote_static = @as([33]u8, @splat(0)) });
+    var receiver = tu.transportOf(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = @as([32]u8, @splat(0)), .remote_static = @as([33]u8, @splat(0)) });
+    var wire: [length_frame_len + 5 + 16]u8 = undefined;
+    try sender.sendMessage("hello", &wire);
+    _ = try receiver.recvLength(wire[0..length_frame_len]);
+
+    // The attacker flips a ciphertext bit (not the tag): an unauthenticated
+    // stream-cipher plaintext must not be left in the caller's buffer.
+    var forged = wire;
+    forged[length_frame_len] ^= 0x01;
+    var out: [5]u8 = @splat(0xAA);
+    try testing.expectError(error.DecryptionFailed, receiver.recvMessage(forged[length_frame_len..], &out));
+    try testing.expectEqualSlices(u8, &@as([5]u8, @splat(0)), &out);
+
+    // A failed decrypt does not advance the nonce: the genuine body still opens.
+    try receiver.recvMessage(wire[length_frame_len..], &out);
+    try testing.expectEqualStrings("hello", &out);
+}
