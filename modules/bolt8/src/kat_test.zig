@@ -361,9 +361,13 @@ test "F2: deinit zeroes the key material each object directly owns" {
 
     var responder = try responderAfterAct2();
     try testing.expect(!std.mem.allEqual(u8, &responder.ls.secret_key, 0));
+    try testing.expect(!std.mem.allEqual(u8, &responder.ephemeral.?.secret_key, 0));
+    try testing.expect(!std.mem.allEqual(u8, &responder.ss.cipher_state.k, 0));
     responder.deinit();
     try testing.expect(std.mem.allEqual(u8, &responder.ls.secret_key, 0));
+    try testing.expect(std.mem.allEqual(u8, &responder.ephemeral.?.secret_key, 0));
     try testing.expect(std.mem.allEqual(u8, &responder.ss.ck, 0));
+    try testing.expect(std.mem.allEqual(u8, &responder.ss.cipher_state.k, 0));
 
     var t = tu.transportOf(.{ .sk = kv.init_sk.*, .rk = kv.init_rk.*, .ck = kv.ck_temp_k3[0].*, .handshake_hash = @as([32]u8, @splat(0)), .remote_static = @as([33]u8, @splat(0)) });
     try testing.expect(!std.mem.allEqual(u8, &t.tx.cipher.k, 0));
