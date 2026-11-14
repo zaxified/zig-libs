@@ -443,6 +443,8 @@ fn authRun(auth: []const netaddr.Ip, require_all: bool) anyerror!void {
     var s = Dns01Solver.init(lab.threaded.io(), testing.allocator, o);
     defer s.deinit();
     try s.present("a.test", "tok", ka_t);
+    // The authoritative servers are asked with RD clear.
+    try testing.expectEqual(@as(u8, 0), lab.stub.last_rd.load(.acquire));
 }
 
 test "propagation: Options.authoritative, all or any server" {
@@ -503,6 +505,8 @@ test "propagation: check_resolvers asks every recursive resolver" {
         var s = Dns01Solver.init(lab.threaded.io(), testing.allocator, o);
         defer s.deinit();
         try s.present("a.test", "tok", ka_t);
+        // The resolvers are asked last, with RD set.
+        try testing.expectEqual(@as(u8, 1), lab.stub.last_rd.load(.acquire));
     }
     // A second resolver that never answers holds it, though the NS lookup
     // (which the first one serves) and the authoritative check pass.
@@ -552,6 +556,9 @@ test "followCname / findZone / nameservers: answers of the wrong class, owner, t
         .{ .name = "fa.t", .qtype = t_cname, .rdata = comptime wire("x.t"), .class = 3 },
         .{ .name = "fb.t", .qtype = t_cname, .rdata = "\x01\x02\x03\x04", .rtype = t_a },
         .{ .name = "fc.t", .qtype = t_cname, .rdata = comptime wire("x.t"), .owner = comptime wire("other.t") },
+        .{ .name = "fd.t", .qtype = t_cname, .rdata = comptime wire("first.t") },
+        .{ .name = "fd.t", .qtype = t_cname, .rdata = comptime wire("second.t") },
+        .{ .name = "first.t", .qtype = t_cname },
         // findZone
         .{ .name = "g.a.test", .qtype = t_soa, .rdata = soa_rdata, .class = 3 },
         .{ .name = "a.test", .qtype = t_soa, .rdata = soa_rdata },
@@ -574,6 +581,7 @@ test "followCname / findZone / nameservers: answers of the wrong class, owner, t
     defer r.deinit();
     var out: [zone.max_name_len]u8 = undefined;
     for ([_][]const u8{ "fa.t", "fb.t", "fc.t" }) |n| try testing.expectEqualStrings(n, try zone.followCname(&r, n, &out));
+    try testing.expectEqualStrings("first.t", try zone.followCname(&r, "fd.t", &out));
     try testing.expectEqualStrings("a.test", try zone.findZone(&r, "g.a.test", &out));
     try testing.expectEqualStrings("b.test", try zone.findZone(&r, "h.b.test", &out));
     try testing.expectEqualStrings("c.test", try zone.findZone(&r, "i.c.test", &out));
@@ -591,6 +599,8 @@ test "nameserverIps: one family failing is not 'unknown'; both failing is; filte
     const rules = [_]Rule{
         .{ .name = "p.test", .qtype = t_a, .rdata = "\x01\x02\x03\x04" },
         .{ .name = "p.test", .qtype = t_aaaa, .rcode = servfail },
+        .{ .name = "v.test", .qtype = t_a },
+        .{ .name = "v.test", .qtype = t_aaaa, .rcode = servfail },
         .{ .name = "q.test", .qtype = t_a, .rcode = servfail },
         .{ .name = "q.test", .qtype = t_aaaa, .rcode = servfail },
         .{ .name = "r.test", .qtype = t_a },
@@ -613,6 +623,7 @@ test "nameserverIps: one family failing is not 'unknown'; both failing is; filte
     try testing.expectEqual(@as(usize, 1), p.len);
     try testing.expect(p[0] == .v4);
     try testing.expectEqual(@as(?[]netaddr.Ip, null), try zone.nameserverIps(&r, gpa, "q.test"));
+    try testing.expectEqual(@as(?[]netaddr.Ip, null), try zone.nameserverIps(&r, gpa, "v.test"));
     const e = (try zone.nameserverIps(&r, gpa, "r.test")).?;
     defer gpa.free(e);
     try testing.expectEqual(@as(usize, 0), e.len);
@@ -625,6 +636,28 @@ test "nameserverIps: one family failing is not 'unknown'; both failing is; filte
     const both = (try zone.nameserverIps(&r, gpa, "u.test")).?;
     defer gpa.free(both);
     try testing.expectEqual(@as(usize, 2), both.len);
+}
+
+test "nameserverIps: a server that never answers is 'unknown'; an allocation failure is an error, not 'unknown'" {
+    var lab: Lab = undefined;
+    try lab.start(&.{});
+    defer lab.stop();
+    lab.stub.silent = true;
+    var r = lab.resolver();
+    defer r.deinit();
+    r.options.timeout_ms = 100;
+    try testing.expectEqual(@as(?[]netaddr.Ip, null), try zone.nameserverIps(&r, testing.allocator, "silent.test"));
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var r2 = dns.Resolver.init(lab.threaded.io(), failing.allocator(), .{
+        .servers = &loopback,
+        .port = lab.stub.port(),
+        .timeout_ms = 100,
+        .attempts = 1,
+        .use_hosts = false,
+        .use_search = false,
+    });
+    defer r2.deinit();
+    try testing.expectError(error.OutOfMemory, zone.nameserverIps(&r2, testing.allocator, "silent.test"));
 }
 
 test "serverHasTxtRd / serverHasTxtAny: the RD bit, the value, wrong-kind answers" {

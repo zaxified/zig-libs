@@ -227,7 +227,7 @@ test "cleanup: matches domain AND value; one record per call, whatever is behind
     const v = acme.jws.dns01TxtValueFromKeyAuthorization("t.k");
     try s.present("a.example.org", "t", "t.k");
     try s.present("b.example.org", "t", "t.k"); // same value, other domain
-    s.cleanup("b.example.org", &v);
+    s.cleanup("B.example.org.", &v); // case and a trailing dot do not matter
     try testing.expectEqualStrings("b.example.org", d.cleaned());
     try testing.expectEqual(@as(usize, 1), s.pendingCount());
     s.cleanup("b.example.org", &v); // gone: ignored
@@ -236,7 +236,7 @@ test "cleanup: matches domain AND value; one record per call, whatever is behind
     try s.present("a.example.org", "t", "t.k");
     s.cleanup("a.example.org", &v);
     try testing.expectEqual(@as(usize, 1), s.pendingCount());
-    s.cleanup("a.example.org", &v);
+    s.cleanup("a.example.org.", &v);
     try testing.expectEqual(@as(usize, 0), s.pendingCount());
 }
 

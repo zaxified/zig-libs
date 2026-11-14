@@ -264,6 +264,7 @@ test "txtPresent: owner, class, split strings, partial values" {
     try testing.expect(txtPresent(&msg, "_ACME-challenge.example.org.", "abcdef"));
     try testing.expect(!txtPresent(&msg, "_acme-challenge.example.org", "abcde"));
     try testing.expect(!txtPresent(&msg, "_acme-challenge.example.org", "abcdefg"));
+    try testing.expect(!txtPresent(&msg, "_acme-challenge.example.org", "abcdeX"));
     try testing.expect(!txtPresent(&msg, "_acme-challenge.example.org", "xyz"));
     try testing.expect(!txtPresent(&msg, "_acme-challenge.example.org", "chaos"));
     try testing.expect(txtPresent(&msg, "other.example.org", "xyz"));
@@ -277,4 +278,7 @@ test "copyName: a CNAME target copied over the name it came from" {
     try testing.expectEqualStrings("example.org", b);
     const long: [254]u8 = @splat('a');
     try testing.expectError(error.NameTooLong, copyName(&out, &long));
+    const fits: [253]u8 = @splat('a');
+    try testing.expectEqual(@as(usize, 253), (try copyName(&out, &fits)).len);
+    try testing.expectEqualStrings("", try copyName(&out, "."));
 }

@@ -144,7 +144,7 @@ test "AcmeDns.present: the account by domain, the request it sends, 200 only" {
     defer threaded.deinit();
     const io = threaded.io();
     var peer: Peer = undefined;
-    peer = .{ .io = io, .listener = undefined, .serve = 2 };
+    peer = .{ .io = io, .listener = undefined, .serve = 4 };
     try peer.start(io);
     defer peer.finish();
     var ub: [64]u8 = undefined;
@@ -159,11 +159,18 @@ test "AcmeDns.present: the account by domain, the request it sends, 200 only" {
     r.domain = "A.test";
     try pub_.present(pub_.ctx, &r);
     try testing.expectEqual(@as(u16, 200), p.last_status);
+    // An account without a fulldomain is not checked against the CNAME.
+    var r_other = rec;
+    r_other.domain = "other.test";
+    try pub_.present(pub_.ctx, &r_other);
     // acme-dns answers 200; any other status is a refusal.
     peer.status = 201;
     try testing.expectError(error.PublishFailed, pub_.present(pub_.ctx, &r));
     try testing.expectEqual(@as(u16, 201), p.last_status);
     try testing.expectEqualStrings("acme-dns refused the update (see last_status)", p.note);
+    peer.status = 200;
+    try pub_.present(pub_.ctx, &r);
+    try testing.expectEqualStrings("", p.note);
     // cleanup does nothing, on the wire too.
     pub_.cleanup(pub_.ctx, &r);
     peer.finish();
@@ -172,8 +179,8 @@ test "AcmeDns.present: the account by domain, the request it sends, 200 only" {
     try testing.expect(peer.has("x-api-key: k2\r\n"));
     try testing.expect(peer.has("content-type: application/json\r\n"));
     try testing.expect(peer.has("{\"subdomain\":\"sub2\",\"txt\":\"" ++ "loqxcyv8q5onbjqxbmr7sctno3tiaxdfowyjxajeux0" ++ "\"}"));
-    try testing.expect(!peer.has("u1") and !peer.has("sub1"));
-    try testing.expectEqual(@as(u32, 2), peer.requests.load(.acquire));
+    try testing.expect(peer.has("x-api-user: u1\r\n") and peer.has("{\"subdomain\":\"sub1\""));
+    try testing.expectEqual(@as(u32, 4), peer.requests.load(.acquire));
 }
 
 test "AcmeDns.present: no account, or a CNAME elsewhere, is refused before anything is sent" {
@@ -206,7 +213,7 @@ test "HttpReq: default JSON with basic auth, RAW JSON without, cleanup, 2xx" {
     defer threaded.deinit();
     const io = threaded.io();
     var peer: Peer = undefined;
-    peer = .{ .io = io, .listener = undefined, .serve = 4, .status = 204 };
+    peer = .{ .io = io, .listener = undefined, .serve = 5, .status = 204 };
     try peer.start(io);
     defer peer.finish();
     var ub: [64]u8 = undefined;
@@ -225,6 +232,9 @@ test "HttpReq: default JSON with basic auth, RAW JSON without, cleanup, 2xx" {
     try testing.expectError(error.PublishFailed, rp.present(rp.ctx, &rec));
     try testing.expectEqual(@as(u16, 500), raw.last_status);
     try testing.expectEqualStrings("the endpoint refused /present (see last_status)", raw.note);
+    peer.status = 204;
+    try rp.present(rp.ctx, &rec);
+    try testing.expectEqualStrings("", raw.note);
     peer.finish();
     try testing.expect(peer.has("post /api/present http/1.1"));
     try testing.expect(peer.has("post /api/cleanup http/1.1"));
@@ -303,7 +313,10 @@ test "AcmeDns.register: the request, 200 and 201 accepted, anything else refused
         \\{"username":"u","password":"p","fulldomain":"f.auth.test","subdomain":"s","allowfrom":[]}
     ;
     var peer: Peer = undefined;
-    peer = .{ .io = io, .listener = undefined, .serve = 4, .status = 201, .body = reply };
+    peer = .{ .io = io, .listener = undefined, .serve = 6, .status = 201, .body = reply };
+    const big = try testing.allocator.alloc(u8, 64 * 1024 + 1);
+    defer testing.allocator.free(big);
+    @memset(big, ' ');
     try peer.start(io);
     defer peer.finish();
     var ub: [64]u8 = undefined;
@@ -324,6 +337,15 @@ test "AcmeDns.register: the request, 200 and 201 accepted, anything else refused
     try testing.expectError(error.RegistrationRefused, publishers.AcmeDns.register(io, testing.allocator, url, httpOpts(), &.{}));
     peer.status = 202;
     try testing.expectError(error.RegistrationRefused, publishers.AcmeDns.register(io, testing.allocator, url, httpOpts(), &.{}));
+    // The reply is read up to 64 KiB, no more.
+    peer.status = 201;
+    peer.body = big[0 .. 64 * 1024];
+    if (publishers.AcmeDns.register(io, testing.allocator, url, httpOpts(), &.{})) |*got| {
+        got.deinit();
+        return error.ExpectedAnError;
+    } else |err| try testing.expect(err != error.BodyTooLarge);
+    peer.body = big;
+    try testing.expectError(error.BodyTooLarge, publishers.AcmeDns.register(io, testing.allocator, url, httpOpts(), &.{}));
     peer.finish();
     try testing.expect(peer.has("post /register http/1.1"));
     try testing.expect(peer.has("content-type: application/json\r\n"));
@@ -340,6 +362,7 @@ const UpdateStub = struct {
     sock: net.Socket,
     thread: ?std.Thread = null,
     rcode: u4 = 0,
+    silent: bool = false,
     last: [1024]u8 = undefined,
     last_len: usize = 0,
     count: std.atomic.Value(u32) = .init(0),
@@ -370,6 +393,7 @@ const UpdateStub = struct {
         if (q.len < 12) return;
         @memcpy(u.last[0..q.len], q);
         u.last_len = q.len;
+        if (u.silent) return;
         var at: usize = 12;
         while (at < q.len and q[at] != 0) at += 1 + q[at];
         const zone_end = at + 1 + 4;
@@ -438,6 +462,107 @@ test "Rfc2136: the update it sends (add / delete one value) and how the rcode is
     try testing.expectError(error.PublishFailed, pub_.present(pub_.ctx, &long));
 }
 
+test "Rfc2136: timeout and attempts are the caller's; a TSIG key demands a signed reply" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var stub: UpdateStub = undefined;
+    stub = .{ .io = io, .sock = undefined, .silent = true };
+    try stub.start(io);
+    defer stub.finish();
+    const port = stub.sock.address.getPort();
+    var p = publishers.Rfc2136.init(io, testing.allocator, .{ .server = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = port, .timeout_ms = 200, .attempts = 1 });
+    var pub_ = p.publisher();
+    const t0 = nowMs(io);
+    try testing.expectError(error.PublishFailed, pub_.present(pub_.ctx, &rec));
+    const one = nowMs(io) - t0;
+    try testing.expect(one >= 150 and one < 1000);
+    try testing.expectEqualStrings("the server did not answer", p.note);
+    p.options.attempts = 3;
+    const t1 = nowMs(io);
+    try testing.expectError(error.PublishFailed, pub_.present(pub_.ctx, &rec));
+    try testing.expect(nowMs(io) - t1 >= 450);
+
+    // The stub answers, unsigned: with a key configured that reply is refused.
+    stub.silent = false;
+    const key: dns.tsig.Key = .{ .name = "k.", .secret = "secret" };
+    p.options.key = &key;
+    p.options.attempts = 1;
+    p.options.timeout_ms = 1000;
+    try testing.expectError(error.PublishFailed, pub_.present(pub_.ctx, &rec));
+    try testing.expectEqualStrings("the server's reply failed TSIG verification", p.note);
+    // The request did carry the signature (a TSIG record in the additional section).
+    var msg = try dns.decode(testing.allocator, stub.last[0..stub.last_len]);
+    defer msg.deinit();
+    try testing.expectEqual(@as(usize, 1), msg.additionals.len);
+    try testing.expectEqual(dns.message.Type.tsig, msg.additionals[0].ty);
+}
+
+/// `fail_index` sweep: an induced allocation failure must come out as
+/// `OutOfMemory` (never as a publisher failure), and nothing may leak.
+fn oomSweep(comptime Ctx: type, ctx: *Ctx, comptime attempt: fn (*Ctx, std.mem.Allocator) anyerror!void) !void {
+    var saw_oom = false;
+    for (0..40) |k| {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = k });
+        attempt(ctx, failing.allocator()) catch |err| {
+            if (failing.has_induced_failure) {
+                try testing.expectEqual(error.OutOfMemory, err);
+                saw_oom = true;
+            }
+            continue;
+        };
+    }
+    try testing.expect(saw_oom);
+}
+
+test "publishers: an allocation failure is OutOfMemory, not PublishFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var stub: UpdateStub = undefined;
+    stub = .{ .io = io, .sock = undefined };
+    try stub.start(io);
+    defer stub.finish();
+    const Rf = struct {
+        io: std.Io,
+        port: u16,
+        fn attempt(c: *@This(), gpa: std.mem.Allocator) anyerror!void {
+            var p = publishers.Rfc2136.init(c.io, gpa, .{ .server = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = c.port, .timeout_ms = 300 });
+            const pub_ = p.publisher();
+            try pub_.present(pub_.ctx, &rec);
+        }
+    };
+    var rf: Rf = .{ .io = io, .port = stub.sock.address.getPort() };
+    try oomSweep(Rf, &rf, Rf.attempt);
+
+    var peer: Peer = undefined;
+    peer = .{ .io = io, .listener = undefined, .serve = 80 };
+    try peer.start(io);
+    defer peer.finish();
+    var ub: [64]u8 = undefined;
+    const ep = try peer.url(&ub, "/h");
+    const Ht = struct {
+        io: std.Io,
+        ep: []const u8,
+        fn attempt(c: *@This(), gpa: std.mem.Allocator) anyerror!void {
+            var p = publishers.HttpReq.init(c.io, gpa, .{ .endpoint = c.ep, .username = "u", .password = "p", .http = httpOpts() });
+            defer p.deinit();
+            const pub_ = p.publisher();
+            try pub_.present(pub_.ctx, &rec);
+        }
+        fn attemptAcme(c: *@This(), gpa: std.mem.Allocator) anyerror!void {
+            const accounts = [_]publishers.AcmeDns.Account{.{ .domain = "a.test", .username = "u", .password = "p", .subdomain = "s" }};
+            var p = publishers.AcmeDns.init(c.io, gpa, .{ .server_url = c.ep, .accounts = &accounts, .http = httpOpts() });
+            defer p.deinit();
+            const pub_ = p.publisher();
+            try pub_.present(pub_.ctx, &rec);
+        }
+    };
+    var ht: Ht = .{ .io = io, .ep = ep };
+    try oomSweep(Ht, &ht, Ht.attempt);
+    try oomSweep(Ht, &ht, Ht.attemptAcme);
+}
+
 // ── exec ────────────────────────────────────────────────────────────────────
 
 fn writeScript(io: std.Io, dir: std.Io.Dir, name: []const u8, body: []const u8) !void {
@@ -470,6 +595,8 @@ test "Exec: argv of both modes, exit codes, stderr tail, timeout" {
     try writeScript(io, tmp.dir, "fail.sh", "echo boom >&2\nexit 3\n");
     try writeScript(io, tmp.dir, "spam.sh", "printf '%01000d' 0 >&2\nprintf END >&2\nexit 1\n");
     try writeScript(io, tmp.dir, "slow.sh", "exec sleep 30\n");
+    try writeScript(io, tmp.dir, "nap.sh", "sleep 0.3\nexit 0\n");
+    try writeScript(io, tmp.dir, "orphan.sh", "sleep 5 &\necho $! > \"$(dirname \"$0\")/pid\"\nwait\n");
     var pb: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = pb[0..try tmp.dir.realPath(io, &pb)];
     var path_buf: [std.Io.Dir.max_path_bytes + 16]u8 = undefined;
@@ -488,6 +615,14 @@ test "Exec: argv of both modes, exit codes, stderr tail, timeout" {
     e.options.mode = .raw;
     try ep.present(ep.ctx, &rec);
     try testing.expectEqualStrings("present\n--\na.test\ntok\ntok.thumb\n", try readAll(io, tmp.dir, "argv", &ab));
+
+    // A note from a failed run is gone after the next call.
+    var nf = publishers.Exec.init(io, gpa, .{ .program = "/nonexistent/acmedns-test" });
+    const nfp = nf.publisher();
+    try testing.expectError(error.PublishFailed, nfp.present(nfp.ctx, &rec));
+    nf.options.program = e.options.program;
+    try nfp.present(nfp.ctx, &rec);
+    try testing.expectEqualStrings("", nf.note);
 
     // A non-zero exit is a failure, with what the program said.
     var f = publishers.Exec.init(io, gpa, .{ .program = try std.mem.print(&path_buf, "{s}/fail.sh", .{dir}) });
@@ -511,6 +646,28 @@ test "Exec: argv of both modes, exit codes, stderr tail, timeout" {
     try testing.expectError(error.PublishFailed, slp.present(slp.ctx, &rec));
     try testing.expect(nowMs(io) - t0 < 10_000);
     try testing.expect(sl.last_term.? != .exited);
+
+    // The timeout is milliseconds: a 0.3 s program fits in 3 s.
+    var nap = publishers.Exec.init(io, gpa, .{ .program = try std.mem.print(&path_buf, "{s}/nap.sh", .{dir}), .timeout_ms = 3000 });
+    const nappub = nap.publisher();
+    try nappub.present(nappub.ctx, &rec);
+
+    // The whole process group goes: a grandchild does not outlive the timeout.
+    var orph = publishers.Exec.init(io, gpa, .{ .program = try std.mem.print(&path_buf, "{s}/orphan.sh", .{dir}), .timeout_ms = 300 });
+    const orp = orph.publisher();
+    try testing.expectError(error.PublishFailed, orp.present(orp.ctx, &rec));
+    const pid_text = std.mem.trim(u8, try readAll(io, tmp.dir, "pid", &ab), " \n");
+    const pid = try std.fmt.parseInt(i32, pid_text, 10);
+    var gone = false;
+    for (0..40) |_| {
+        const rc = std.os.linux.kill(pid, @fromBackingInt(@intCast(0)));
+        if (std.os.linux.errno(rc) == .SRCH) {
+            gone = true;
+            break;
+        }
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+    try testing.expect(gone);
 
     // Not startable.
     var m = publishers.Exec.init(io, gpa, .{ .program = "/nonexistent/acmedns-test" });

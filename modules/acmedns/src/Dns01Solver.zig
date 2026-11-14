@@ -407,4 +407,5 @@ test "inZone: label boundary, case, the empty zone, equal names" {
     try t.expect(!inZone("a.example.orx", "example.org"));
     try t.expect(!inZone("", "example.org"));
     try t.expect(inZone("a.b", "b") and !inZone(".b", "c.b"));
+    try t.expect(inZone(".b", "b")); // an empty first label is still under the zone
 }

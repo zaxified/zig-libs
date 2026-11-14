@@ -496,6 +496,7 @@ test "joinPath: the segment goes before a query or fragment (lego URL.JoinPath)"
         .{ "https://h/api?token=x", "present", "https://h/api/present?token=x" },
         .{ "https://h/api/?token=x#f", "cleanup", "https://h/api/cleanup?token=x#f" },
         .{ "https://h", "update", "https://h/update" },
+        .{ "https://h/api#frag", "present", "https://h/api/present#frag" },
     };
     for (cases) |c| {
         const got = try joinPath(gpa, c[0], c[1]);
