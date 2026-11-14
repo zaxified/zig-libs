@@ -248,7 +248,9 @@ pub fn goBuild(arena: std.mem.Allocator, io: std.Io, bench_name: []const u8, env
     try env.put("GOPROXY", "off");
     try env.put("GOFLAGS", "-mod=readonly");
     const exe = try arena.print("{s}/{s}", .{ opts.abs, opts.out });
-    std.debug.print("{s}: building the Go side ...\n", .{bench_name});
+    // Progress for a person watching a bench; a test passing through here must
+    // leave stderr clean (check-test-stderr).
+    if (!builtin.is_test) std.debug.print("{s}: building the Go side ...\n", .{bench_name});
     const res = runCapped(arena, io, &.{ opts.exe, "build", "-o", exe, "." }, &env, .{ .path = opts.dir }, build_timeout) catch |e| {
         std.debug.print("{s}: could not run go ({t}) -- the benchmark needs it\n", .{ bench_name, e });
         return error.GoBuildFailed;
@@ -440,7 +442,7 @@ pub fn buildForeign(arena: std.mem.Allocator, io: std.Io, bench_name: []const u8
     try argv.appendSlice(arena, &.{ "-O3", "-march=native", src });
     try argv.appendSlice(arena, libs);
     try argv.appendSlice(arena, &.{ "-o", exe });
-    std.debug.print("{s}: building the foreign side ({s}) ...\n", .{ bench_name, src });
+    if (!builtin.is_test) std.debug.print("{s}: building the foreign side ({s}) ...\n", .{ bench_name, src });
     const res = try runCapped(arena, io, argv.items, null, .inherit, build_timeout);
     if (res.term != .exited or res.term.exited != 0) {
         std.debug.print("{s}: the C compiler failed:\n{s}\n", .{ bench_name, res.stderr });
@@ -937,16 +939,16 @@ test "buildForeign: the compiler command line is cc, -O3 -march=native, src, lib
     const quiet = Quiet.begin();
     defer quiet.end();
     const cc_body = try a.print("echo \"$*\" > {s}/args.txt", .{tmp.abs});
-    const exe = try buildForeign(a, testing.io, "bench-test", &.{ "/bin/sh", "-c", cc_body, "cc" }, tmp.abs, "f.c", &.{ "liba.so", "libb.so" });
+    const exe = try buildForeign(a, testing.io, "bench-test", &.{ "/bin/sh", "-c", cc_body, "stand-in" }, tmp.abs, "f.c", &.{ "liba.so", "libb.so" });
     try testing.expectEqualStrings(try a.print("{s}/foreign_bench", .{tmp.abs}), exe);
     try testing.expectEqualStrings(try a.print("-O3 -march=native f.c liba.so libb.so -o {s}/foreign_bench\n", .{tmp.abs}), try tmp.read(a, "args.txt"));
     // No libs: nothing between the source and -o.
-    _ = try buildForeign(a, testing.io, "bench-test", &.{ "/bin/sh", "-c", cc_body, "cc" }, tmp.abs, "g.c", &.{});
+    _ = try buildForeign(a, testing.io, "bench-test", &.{ "/bin/sh", "-c", cc_body, "stand-in" }, tmp.abs, "g.c", &.{});
     try testing.expectEqualStrings(try a.print("-O3 -march=native g.c -o {s}/foreign_bench\n", .{tmp.abs}), try tmp.read(a, "args.txt"));
-    try testing.expectError(error.ForeignBuildFailed, buildForeign(a, testing.io, "bench-test", &.{ "/bin/sh", "-c", "exit 3", "cc" }, tmp.abs, "f.c", &.{}));
-    try testing.expectError(error.ForeignBuildFailed, buildForeign(a, testing.io, "bench-test", &.{ "/bin/sh", "-c", "kill -KILL $$", "cc" }, tmp.abs, "f.c", &.{}));
+    try testing.expectError(error.ForeignBuildFailed, buildForeign(a, testing.io, "bench-test", &.{ "/bin/sh", "-c", "exit 3", "stand-in" }, tmp.abs, "f.c", &.{}));
+    try testing.expectError(error.ForeignBuildFailed, buildForeign(a, testing.io, "bench-test", &.{ "/bin/sh", "-c", "kill -KILL $$", "stand-in" }, tmp.abs, "f.c", &.{}));
     // A compiler that cannot be run at all is the spawn error, not a silent pass.
-    try testing.expectError(error.FileNotFound, buildForeign(a, testing.io, "bench-test", &.{"/nonexistent/cc"}, tmp.abs, "f.c", &.{}));
+    try testing.expectError(error.FileNotFound, buildForeign(a, testing.io, "bench-test", &.{"/nonexistent/no-such-compiler"}, tmp.abs, "f.c", &.{}));
 }
 
 test "goBuild: offline environment over the caller's, build arguments and working directory; failures are GoBuildFailed" {
@@ -979,7 +981,7 @@ test "goBuild: offline environment over the caller's, build arguments and workin
     try tmp.script(a, "build", "kill -KILL $$");
     try testing.expectError(error.GoBuildFailed, goBuild(a, testing.io, "bench-test", &env, opts));
     // `go` itself missing: also GoBuildFailed, with its own message.
-    try testing.expectError(error.GoBuildFailed, goBuild(a, testing.io, "bench-test", &env, .{ .exe = "/nonexistent/go", .dir = tmp.abs, .abs = "/w" }));
+    try testing.expectError(error.GoBuildFailed, goBuild(a, testing.io, "bench-test", &env, .{ .exe = "/nonexistent/no-such-go-tool", .dir = tmp.abs, .abs = "/w" }));
 }
 
 test "exeAt: the panic is benchkit's own message, not a bounds check (the index == len edge)" {
