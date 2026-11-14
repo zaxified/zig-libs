@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit recorded (37 mutants, 35 killed, 2 equivalent); Audit line refreshed (A1).
 - **2026-11-14** — tests: stale-audit mutation run over the code changed since the 2026-10-08 audit (37 mutants: 34 killed by the existing suite, 2 equivalent, 1 killed by the new test below): `round2Sign` with a zero hiding or binding nonce returns `IncorrectCommitment` (the commitment recomputation fails on the identity), which no test had pinned -- the error arm was swappable for `InvalidCommitmentList`. No source change.
 - **2026-10-10** — tests: deterministic fuzz driver `FROST_FUZZ` (frost now has `testkit` in `test_deps`; the local seed/cursor copies in `kat_test.zig` are kept, see the note there): `frost-verify` (published signature with 0-40 octets replaced: the published one verifies, no other 65 octets do), new `frost-wire` (Element/Signature/scalar/Identifier decoders on damaged published values and uniform bytes; what is accepted re-encodes to the same octets) and new `frost-protocol` ((t,n) trusted-dealer keygen, drawn quorum, both rounds, aggregate, verify; a flipped signature bit, another message, a flipped bit of one signature share -- named by `verifySignatureShare`, and an `aggregate` over it is refused by `verify` -- are rejected). No source change.
 - **2026-10-08** — **BREAKING + FIX (secrets in the caller's frame):** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
