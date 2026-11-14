@@ -10,7 +10,7 @@
 //! Usage: `proptest_bench <work dir> <workload>`; workloads `hex` and
 //! `alloc` (the same plus two heap allocations per input). Prints
 //! `name \t ns/op \t count` (wall time; no cycle counter on this side) and
-//! a banner on stderr. Timing as `testkit.bench.timeIt`: double the batch
+//! a banner on stderr. Timing as `benchkit.timeIt`: double the batch
 //! until it takes over 100 ms, then the best of five.
 
 use proptest::collection::vec;

@@ -61,7 +61,7 @@
 //! Ratios are ours/theirs by wall time, best of rounds, sides alternating.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const syslog = @import("syslog");
 const linux = std.os.linux;
 

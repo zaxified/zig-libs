@@ -40,7 +40,7 @@
 //! because boringtun does not pad and every side should do the same work). Inputs are real IPv4 headers
 //! over seeded random bytes, written into `.zig-cache/bench-wireguard/`.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it takes over 100
+//! Method (`benchkit`): each side doubles its batch until it takes over 100
 //! ms and keeps the best of five; per workload the sides alternate for
 //! `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the spread printed
 //! is (worst round − best round) / best round per side. Ratios are by wall time, as
@@ -50,7 +50,7 @@
 //! workloads.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const wireguard = @import("wireguard");
 const hs = wireguard.handshake;

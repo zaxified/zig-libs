@@ -42,7 +42,7 @@
 //! the cheaper net cost of {chi, tower-http} per row, worst over the rows.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const http = @import("http");
 const router = @import("router");
 const requestid = @import("requestid");

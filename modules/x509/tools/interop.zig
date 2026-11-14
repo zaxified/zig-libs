@@ -40,7 +40,7 @@
 
 const std = @import("std");
 const x509 = @import("x509");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 
 const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const Allocator = std.mem.Allocator;

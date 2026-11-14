@@ -30,7 +30,7 @@
 //! found by name search (2026-11-02); the card says `fastest ?`.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const fin = @import("finstats");
 
 const bench_name = "bench-finstats";

@@ -36,7 +36,7 @@
 //! + sum of the days of month).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const df = @import("dataframe");
 const Value = df.Value;
 const Frame = df.Frame;

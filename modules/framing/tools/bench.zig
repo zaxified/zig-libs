@@ -28,7 +28,7 @@
 //! Wall time only (the foreign side counts no cycles). Ratios are ours/ref.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const framing = @import("framing");
 
 const bench_name = "bench-framing";

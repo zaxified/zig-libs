@@ -6,7 +6,7 @@
 // `foreign_bench <work dir> <workload>`; the workload name and the input
 // generator are specified in bench.zig's header, and this file follows it.
 // Prints `workload \t ns/op \t user-mode cycles/op \t count`; the banner
-// goes to stderr. Timing as testkit.bench: double the batch until it takes
+// goes to stderr. Timing as benchkit: double the batch until it takes
 // over 100 ms, keep the best of five.
 
 #include <algorithm>

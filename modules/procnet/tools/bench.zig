@@ -47,7 +47,7 @@
 //! WORST ratio over the rows. Arguments filter rows.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const procnet = @import("procnet");
 
 const bench_name = "bench-procnet";

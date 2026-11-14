@@ -51,7 +51,7 @@
 //! are equal on both sides.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const blobstore = @import("blobstore");
 const Store = blobstore.Store;
 

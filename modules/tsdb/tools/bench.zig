@@ -53,7 +53,7 @@
 //! workloads.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const tsdb = @import("tsdb");
 const kvtree = @import("kvtree");
 

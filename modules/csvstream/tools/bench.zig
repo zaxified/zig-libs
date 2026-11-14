@@ -49,7 +49,7 @@
 //! `write`) over the best time. Arguments filter workloads (substring).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const csvstream = @import("csvstream");
 
 const bench_name = "bench-csvstream";

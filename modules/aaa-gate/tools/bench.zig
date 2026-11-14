@@ -67,7 +67,7 @@
 //! net ratio over the five rows. Arguments filter rows.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const http = @import("http");
 const router = @import("router");
 const aaa = @import("aaa-gate");

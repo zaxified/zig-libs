@@ -43,7 +43,7 @@
 //! loaded into it, accept our ek and encapsulate to it (we decapsulate that),
 //! and hand us its own ek/dk, to which we encapsulate (it decapsulates that).
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it takes over
+//! Method (`benchkit`): each side doubles its batch until it takes over
 //! 100 ms and keeps the best of five; per workload the sides alternate for
 //! `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the spread printed
 //! is (worst round - best round) / best round per side. `/fast` is ours over the
@@ -52,7 +52,7 @@
 //! substring (no card line then).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const mlkem = @import("mlkem");
 
 const StdKem = std.crypto.kem.ml_kem;

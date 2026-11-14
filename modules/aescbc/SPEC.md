@@ -270,7 +270,7 @@ whole block of 0x11 is now refused by both unpadders.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-aescbc`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.20–0.77×, fastest 1.20×, against 0.19–0.83× before (bench repeated after the fix: the CTS rows (OpenSSL only: Go has no CTS) now count for `fastest`, not for the Go ratio — since `testkit.bench` (2026-10-17) they had gone into it, so the first 0.17 run read ref 0.21–1.21×). The card carries these figures.
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-aescbc`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.20–0.77×, fastest 1.20×, against 0.19–0.83× before (bench repeated after the fix: the CTS rows (OpenSSL only: Go has no CTS) now count for `fastest`, not for the Go ratio — since `benchkit` (2026-10-17) they had gone into it, so the first 0.17 run read ref 0.21–1.21×). The card carries these figures.
 
 ## Backlog / deferred
 

@@ -60,7 +60,7 @@
 //! it is also run with `parallel = 16`.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const traceroute = @import("traceroute");
 const icmp = @import("icmp");
 const echo = icmp.echo;

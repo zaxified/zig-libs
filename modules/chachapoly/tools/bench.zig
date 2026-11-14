@@ -30,7 +30,7 @@
 //! every side. Inputs are written into `.zig-cache/bench-chachapoly/`
 //! from fixed seeds.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it
+//! Method (`benchkit`): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
 //! alternate for `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the
 //! spread printed is (worst round − best round) / best round per side. Ratios
@@ -40,7 +40,7 @@
 //! must equal ours byte for byte. Arguments filter workloads by substring.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const chachapoly = @import("chachapoly");
 const Aead = chachapoly.ChaCha20Poly1305;

@@ -38,7 +38,7 @@
 //! it; what Go does that ours does not: allocate the result per message (GC).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const nl80211 = @import("nl80211");
 const netlink = @import("netlink");
 const codec = netlink.codec;

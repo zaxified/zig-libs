@@ -50,7 +50,7 @@
 //! Arguments filter workloads.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const dec = @import("decimal");
 const Decimal = dec.Decimal;
 const BigDecimal = dec.BigDecimal;

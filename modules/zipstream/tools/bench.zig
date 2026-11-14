@@ -45,7 +45,7 @@
 //! time; the verdict is the worst row. Arguments filter workloads (substring).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const zipstream = @import("zipstream");
 
 const bench_name = "bench-zipstream";

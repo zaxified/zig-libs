@@ -58,7 +58,7 @@
 //! encoder's `RTA_OIF` rule makes its count differ by construction).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const nl = @import("netlink");
 const codec = nl.codec;
 

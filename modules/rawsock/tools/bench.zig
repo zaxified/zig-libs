@@ -64,7 +64,7 @@
 //! WITHOUT it. Default rounds: 11 (`BENCH_ROUNDS`), best of each side.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const rawsock = @import("rawsock");
 const filter = rawsock.filter;
 const pcap = rawsock.pcap;

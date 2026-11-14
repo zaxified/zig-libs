@@ -8,7 +8,7 @@
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-hpke` runs it (always
 //! ReleaseFast); `zig build check-interop` compiles it. Needs `go` on PATH;
 //! the Go side is standard library only (no module is fetched). The Go side,
-//! `tools/go_bench/main.go`, is built in place by `testkit.bench.goBuild`
+//! `tools/go_bench/main.go`, is built in place by `benchkit.goBuild`
 //! (offline, `GOPROXY=off`). The OpenSSL side, `tools/c_bench/foreign_bench.c`,
 //! is built with `zig cc -O3 -march=native` against the system
 //! `libcrypto.so.3` (path below or `LIBCRYPTO_SO`; no headers needed). Run
@@ -55,7 +55,7 @@
 //! OpenSSL: the ref slot is AWS-LC 0.44.0 (aws-lc-sys, `tools/rust_bench`, built
 //! once with `cargo build --release --locked --offline` into
 //! `.zig-cache/bench-hpke/target`), `/ref` is ours / AWS-LC, no `alt`. A mode
-//! rather than a fourth column because `testkit.bench` has two foreign slots
+//! rather than a fourth column because `benchkit` has two foreign slots
 //! (ref, alt) and its verdict is ours / min of those two; a mode keeps the
 //! default run (Go + OpenSSL, no cargo needed) unchanged and gives a ratio that
 //! is exactly ours / AWS-LC, by user-mode cycles because both sides read the
@@ -67,7 +67,7 @@
 //! workload `x25519_ctxcopy` measures it). The same interop gate runs first:
 //! AWS-LC opens ours and we open AWS-LC's (files `awslc_*`), exports equal.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it takes over
+//! Method (`benchkit`): each side doubles its batch until it takes over
 //! 100 ms and keeps the best of five; per workload the sides alternate for
 //! `BENCH_ROUNDS` (default 3) rounds, each keeping its best; spread =
 //! (worst round − best round) / best round. The Go side has no cycle counter,
@@ -78,7 +78,7 @@
 //! must equal ours. Arguments filter workloads by substring.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const hpke = @import("hpke");
 const aesgcm = @import("aesgcm");

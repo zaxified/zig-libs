@@ -45,7 +45,7 @@
 //! against C and Go before any timing; Rust's crate is built without its
 //! serialization feature.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it takes over
+//! Method (`benchkit`): each side doubles its batch until it takes over
 //! 100 ms and keeps the best of five; the sides alternate for `BENCH_ROUNDS`
 //! (default 3) rounds, each keeping its best. The foreign sides count no
 //! cycles, so ratios are by wall time. A count that differs between sides
@@ -53,7 +53,7 @@
 //! with the Intel JCC-erratum padding too; Go's assembler pads by default.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const ls = @import("latency-stats");
 
 // Like this collection's libc-free executables (qap's), the driver installs

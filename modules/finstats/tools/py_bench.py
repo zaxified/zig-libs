@@ -5,7 +5,7 @@
 Reads `<work dir>/returns.f64` (the little-endian f64 series the Zig driver wrote)
 into a NumPy array and times ONLY the library call on it (the file read, the
 import and the array construction are outside the clock): double the batch until
-it takes over 100 ms, then the best of five batches, as testkit.bench.timeIt does
+it takes over 100 ms, then the best of five batches, as benchkit.timeIt does
 for the Zig side. Prints `name <TAB> ns/op <TAB> count` (count = series length,
 the sides must agree). The versions go to stderr as the banner.
 

@@ -20,10 +20,10 @@
 //! `std.crypto.auth.hmac.Hmac(sha2.H).create`, theirs: the one-shot `HMAC()`).
 //! Inputs are written into `.zig-cache/bench-sha2/` from a fixed seed.
 //! `sha2.Sha256T192` and the `Sha512T*` truncations have no OpenSSL twin and
-//! are not timed. `std.crypto.hash.sha2` is not timed either: `testkit.bench`
+//! are not timed. `std.crypto.hash.sha2` is not timed either: `benchkit`
 //! has no third in-process side, and adding one is not this program's job.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it
+//! Method (`benchkit`): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
 //! alternate for `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the
 //! spread printed is (worst round − best round) / best round per side. Ratios
@@ -48,7 +48,7 @@
 //!     BENCH_ROUNDS=5 .zig-cache/jcc/bench-sha2-jcc
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const sha2 = @import("sha2");
 const Hmac = std.crypto.auth.hmac.Hmac;

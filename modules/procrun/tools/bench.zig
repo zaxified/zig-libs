@@ -51,7 +51,7 @@
 //! the kernel's and the children's). Arguments filter workloads.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const procrun = @import("procrun");
 const Work = bench.Work(Op);
 

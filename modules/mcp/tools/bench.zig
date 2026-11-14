@@ -52,7 +52,7 @@
 //! ours / min(Go, rmcp) per workload, worst over the workloads.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const mcp = @import("mcp");
 
 const bench_name = "bench-mcp";

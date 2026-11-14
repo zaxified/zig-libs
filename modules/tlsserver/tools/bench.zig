@@ -46,7 +46,7 @@
 //! op). The certificates and keys are `tlsserver.test_fixtures`, written into
 //! `.zig-cache/bench-tlsserver/` as DER for OpenSSL.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it takes over
+//! Method (`benchkit`): each side doubles its batch until it takes over
 //! 100 ms and keeps the best of five; per workload the sides alternate for
 //! `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the spread
 //! printed is (worst round − best round) / best round per side. Ratios are
@@ -55,7 +55,7 @@
 //! filter workloads by substring (no card line then).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const tlsserver = @import("tlsserver");
 const tlsresume = @import("tlsresume");
 const rsa = @import("rsa");

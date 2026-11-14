@@ -20,7 +20,9 @@
 //!     shrinking of a failing seed (`shrink.zig`) and fault transports and
 //!     allocator drawn from the source (`fault.zig`).
 //!   - `stackprobe` — the dead-stack probe engine 55 modules had copied.
-//!   - `bench` — the comparison skeleton 38 `tools/bench.zig` had copied.
+//!   - (`bench`, the comparison skeleton, is its own module `benchkit` since
+//!     2026-11-14: no test imports it, and here every edit re-keyed 221
+//!     modules' tests.)
 //!   - `guard` — input/output buffers bounded by unreadable pages.
 //!   - `arbitrary` — typed values (structs, unions, slices, UTF-8 strings…) drawn
 //!     from the same choice source, so the tape shrinker shrinks them too.
@@ -38,7 +40,7 @@ const builtin = @import("builtin");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Test-only shared harness — deterministic fuzz driver with shrinking and drawn faults, dead-stack probe, guard-page buffers, bench comparison driver, hex KAT decoding, golden byte diff, skip conventions; wired via build.zig test_deps, absent from consumer imports",
+    .doc = "Test-only shared harness — deterministic fuzz driver with shrinking and drawn faults, dead-stack probe, guard-page buffers, hex KAT decoding, golden byte diff, skip conventions; wired via build.zig test_deps, absent from consumer imports",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -57,7 +59,6 @@ test {
     _ = fuzz.driver;
     _ = @import("golden.zig");
     _ = stackprobe;
-    _ = bench;
     _ = guard;
     _ = child;
     _ = @import("shrink.zig");
@@ -76,10 +77,6 @@ pub const fuzz = @import("fuzz.zig");
 /// Dead-stack residue probe: needle-free residue below the burn plus needles
 /// for secret inputs/outputs. See its doc comment.
 pub const stackprobe = @import("stackprobe.zig");
-
-/// The comparison driver behind a maturity card's `**Performance:**` line,
-/// for `tools/bench.zig` programs (38 of them carried it by hand).
-pub const bench = @import("bench.zig");
 
 /// Memory between two unreadable pages: a harness input whose overread
 /// faults instead of passing unseen.

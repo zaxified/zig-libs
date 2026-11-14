@@ -42,7 +42,7 @@
 //! Ratios are ours/theirs by wall time; the verdict is the WORST ratio.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const uci = @import("uci");
 
 const bench_name = "bench-uci";

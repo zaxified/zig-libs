@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: MIT
-//! The comparison driver behind a maturity card's `**Performance:**` line.
+//! benchkit — the comparison driver behind a maturity card's `**Performance:**`
+//! line. Bench-only: `build.zig` hands it to every `tools/bench.zig` program
+//! and to nothing a downstream user imports.
+//!
+//! It was `testkit.bench` until 2026-11-14. It moved out because testkit is a
+//! `test_dep` of 221 modules: every edit to this file re-keyed all their tests
+//! in every CI lane (8 of testkit's 31 changes in the six weeks before), and no
+//! test imports it. Here an edit re-keys the bench programs only.
 //!
 //! Eighteen `tools/bench.zig` programs carried the same ~200 lines by hand
 //! (counted 2026-10-17: `Cycles`, `Row`, `Side`, `timeIt`, `foreign`, `Work`,
@@ -28,6 +35,19 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Bench-only comparison driver — alternating rounds of ours / reference / fastest alternative in one run, user-mode cycle ratios with a wall-time fallback, foreign programs built and run capped and timed out; wired into tools/bench.zig only, absent from consumer imports",
+    .platform_note = "any (cycle counter: linux)",
+    .targets = .{.linux64},
+    .platform = .any,
+    .role = .util,
+    .concurrency = .single_owner,
+    .model_after = "criterion and Go's testing.B, reduced to the comparison a maturity card quotes",
+    .deps = .{},
+};
 
 /// One timed side: per-op wall time and user-mode cycles (0 = no counter).
 pub const Row = struct { ns: f64, cycles: f64 = 0, count: u64 };
@@ -356,7 +376,7 @@ fn roundsOf(run: Run) usize {
 /// caller's, and this runs in a ReleaseFast bench program, where an
 /// out-of-range index would be an unchecked read.
 fn exeAt(run: Run, i: usize) []const u8 {
-    if (i >= run.exes.len) @panic("testkit.bench: Work.ref_exe/alt_exe indexes past Run.exes");
+    if (i >= run.exes.len) @panic("benchkit: Work.ref_exe/alt_exe indexes past Run.exes");
     return run.exes[i];
 }
 
@@ -569,7 +589,7 @@ test "roundsOf: zero rounds means one (sweep TK-8)" {
 }
 
 test "exeAt: an index past Run.exes is a checked panic (sweep TK-8)" {
-    const child = @import("child.zig");
+    const child = @import("testkit").child;
     if (!child.supported) return error.SkipZigTest;
     const S = struct {
         fn over() u8 {

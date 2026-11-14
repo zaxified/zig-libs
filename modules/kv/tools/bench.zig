@@ -53,7 +53,7 @@
 //! except map_baseline. Arguments filter workloads.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const kv = @import("kv");
 const fastmem = @import("fastmem");
 

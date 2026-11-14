@@ -30,7 +30,7 @@
 //! OpenSSL and the card's Go ratio leaves them out).
 //! Inputs are written into `.zig-cache/bench-aescbc/` from fixed seeds.
 //!
-//! Method (`testkit.bench`, shared by every crypto module's bench):
+//! Method (`benchkit`, shared by every crypto module's bench):
 //! each side doubles its batch until it takes over 100 ms and keeps the best
 //! of five; per workload the sides alternate for `BENCH_ROUNDS` (default 3)
 //! rounds, each keeping its best. Ratios are ours/theirs by user-mode cycles
@@ -40,7 +40,7 @@
 //! over eight lengths must equal ours byte for byte.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const aescbc = @import("aescbc");
 const Aes256 = std.crypto.core.aes.Aes256;

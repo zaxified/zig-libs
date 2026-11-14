@@ -61,7 +61,7 @@
 //! fiber helmet} per row, worst over the rows. `BENCH_FAST=0` skips it.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const http = @import("http");
 const sh = @import("security-headers");
 

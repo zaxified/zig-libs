@@ -46,7 +46,7 @@
 //! the four shapes.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const validate = @import("validate");
 
 const bench_name = "bench-validate";

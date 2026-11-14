@@ -39,7 +39,7 @@
 //! {x/time/rate, governor} per row, worst over the rows.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const ratelimit = @import("ratelimit");
 
 const bench_name = "bench-ratelimit";

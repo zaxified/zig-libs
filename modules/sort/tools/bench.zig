@@ -35,7 +35,7 @@
 
 const std = @import("std");
 const sort = @import("sort");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 
 const bench_name = "bench-sort";
 const work_dir = ".zig-cache/bench-sort";

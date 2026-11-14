@@ -30,7 +30,7 @@
 
 const std = @import("std");
 const jwt = @import("jwt");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 
 const work_dir = ".zig-cache/interop-jwt";
 const go_dir = "modules/jwt/tools/go_oracle";

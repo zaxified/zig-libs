@@ -35,7 +35,7 @@
 //! filtered. The last line is `cases=N agree=N`.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const mlkem = @import("mlkem");
 
 const prog = "interop-mlkem";

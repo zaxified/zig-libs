@@ -42,7 +42,7 @@
 //! uid, gid or mtime): read_many and read_pax only.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const tar = @import("tar");
 
 const ref_short = "Go";

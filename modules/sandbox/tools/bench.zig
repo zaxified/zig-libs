@@ -52,7 +52,7 @@
 //! the cheapest program measured, each the worst of the three ratios. The
 //! `build` row (filter compile time) keeps its place in the `ref` range.
 //!
-//! Method (`testkit.bench`, with one addition for the `sys_` rows
+//! Method (`benchkit`, with one addition for the `sys_` rows
 //! -- `ours_foreign`): each side doubles its batch until it takes over 100 ms
 //! and keeps the best of five; per workload the sides alternate for
 //! `BENCH_ROUNDS` (default 3) rounds, each keeping its best. `build` is by
@@ -60,7 +60,7 @@
 //! by substring (no card line then).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const builtin = @import("builtin");
 const sandbox = @import("sandbox");

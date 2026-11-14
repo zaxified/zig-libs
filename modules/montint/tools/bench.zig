@@ -30,7 +30,7 @@
 //! their modulus context once (ours: the `Modint`/`DynModint` value, theirs:
 //! the `BN_MONT_CTX`); the result is `N / 8` bytes on both sides.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it
+//! Method (`benchkit`): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
 //! alternate for `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the
 //! spread printed is (worst round − best round) / best round per side. Ratios
@@ -40,7 +40,7 @@
 //! filter workloads by substring (no card line then).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const montint = @import("montint");
 

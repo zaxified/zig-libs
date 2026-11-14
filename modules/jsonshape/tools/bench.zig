@@ -47,7 +47,7 @@
 //! padding too; Go's assembler pads by default.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const js = @import("jsonshape");
 
 const ref_short = "theory/jsonpath";

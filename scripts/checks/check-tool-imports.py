@@ -23,7 +23,7 @@ relative `@import` inside `tools/`: each `@import("<name>")` that is not a file,
 
   interop    the module, deps, test_deps, interop_deps
   live       the module, deps, test_deps
-  bench      the module, deps, bench_deps, fastmem, testkit
+  bench      the module, deps, bench_deps, fastmem, testkit, benchkit
   sizeprobe  the module
 
 Keep the sets in step with build.zig; a set drifting the other way (build.zig
@@ -90,7 +90,7 @@ def main() -> int:
         kinds = {
             "interop": {m, *r["deps"], *r["test_deps"], *r["interop_deps"]},
             "live": {m, *r["deps"], *r["test_deps"]},
-            "bench": {m, *r["deps"], *r["bench_deps"], "fastmem", "testkit"},
+            "bench": {m, *r["deps"], *r["bench_deps"], "fastmem", "testkit", "benchkit"},
             "sizeprobe": {m},
         }
         for kind, allowed in kinds.items():

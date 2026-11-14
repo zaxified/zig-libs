@@ -31,12 +31,12 @@
 //!   `.proportional`; through `std.Random` it is 1.24×) / cenkalti
 //!   `ExponentialBackOff` Reset + 10 `NextBackOff`.
 //!
-//! Method: `testkit.bench` (same as every module's bench): each side
+//! Method: `benchkit` (same as every module's bench): each side
 //! doubles its batch past 100 ms, keeps the best of five, the sides alternate
 //! for `BENCH_ROUNDS` (default 3) rounds.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const resilience = @import("resilience");
 

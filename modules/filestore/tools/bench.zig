@@ -24,7 +24,7 @@
 //! The count is bytes written or read, or records found; the sides must agree.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const filestore = @import("filestore");
 
 const bench_name = "bench-filestore";

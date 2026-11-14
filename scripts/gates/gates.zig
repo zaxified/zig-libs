@@ -470,7 +470,7 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
         seen[i] = true;
         sp = 0;
         const has_bench = if (b.build_root.handle.access(io, b.fmt("modules/{s}/tools/bench.zig", .{m.name}), .{})) true else |_| false;
-        const implicit_bench = [_][]const u8{ "fastmem", "testkit" };
+        const implicit_bench = [_][]const u8{ "fastmem", "testkit", "benchkit" };
         for ([_][]const []const u8{ m.deps, m.test_deps, m.interop_deps, m.bench_deps, if (has_bench) &implicit_bench else &.{} }) |list| for (list) |d| {
             const j = moduleIndex(d) orelse return step.fail("module-fingerprints: {s} names unknown tools dep {s}", .{ m.name, d });
             if (!seen[j]) {

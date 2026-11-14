@@ -39,7 +39,7 @@
 //! skips it.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const http = @import("http");
 
 const bench_name = "bench-http";

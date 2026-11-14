@@ -23,7 +23,7 @@
 //
 // Usage: `libfuzzer_bench <work dir> <hex|alloc>`. Prints
 // `name \t ns/op \t count` (wall time) and a banner on stderr, then exits
-// from the callback. Timing as `testkit.bench.timeIt`: double the batch
+// from the callback. Timing as `benchkit.timeIt`: double the batch
 // until it takes over 100 ms, then the best of five.
 
 #include <stdint.h>

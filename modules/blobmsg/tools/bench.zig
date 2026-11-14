@@ -42,7 +42,7 @@
 //! Arguments filter workloads (a substring of `op.doc`). Not a card line when filtered.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const blobmsg = @import("blobmsg");
 const codec = blobmsg.codec;
 

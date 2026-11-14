@@ -48,7 +48,7 @@
 //! and its children per flow (GC) and refuse any unknown tuple child.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const conntrack = @import("conntrack");
 const netlink = @import("netlink");
 const netaddr = @import("netaddr");

@@ -55,7 +55,7 @@
 //! each of OpenSSL's, over the same signed content. The keys are the fixtures
 //! of `certverify_kat_vectors`.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it takes over
+//! Method (`benchkit`): each side doubles its batch until it takes over
 //! 100 ms and keeps the best of five; per workload the sides alternate for
 //! `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the spread
 //! printed is (worst round − best round) / best round per side. Ratios are
@@ -76,7 +76,7 @@
 //! OpenSSL and aws-lc-rs per row. aws-lc-rs does every row except the three FFDHE groups' (gen/srv/cli).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const tls13 = @import("tls13");
 const rsa = @import("rsa");
 

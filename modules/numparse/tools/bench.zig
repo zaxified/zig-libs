@@ -37,7 +37,7 @@
 //! ours / min(Babel, ICU) per workload, worst over the workloads.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const numparse = @import("numparse");
 
 const bench_name = "bench-numparse";

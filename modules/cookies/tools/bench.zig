@@ -43,7 +43,7 @@
 //! rows.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const cookies = @import("cookies");
 
 const bench_name = "bench-cookies";

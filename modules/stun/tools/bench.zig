@@ -50,7 +50,7 @@
 //! it.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const stun = @import("stun");
 const netaddr = @import("netaddr");
 

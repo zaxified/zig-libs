@@ -23,7 +23,7 @@
 //! already holds the cipher). Inputs are written into `.zig-cache/bench-aes192/`
 //! from fixed seeds.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it
+//! Method (`benchkit`): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
 //! alternate for `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the
 //! spread printed is (worst round − best round) / best round per side. Ratios
@@ -33,7 +33,7 @@
 //! byte. Arguments filter workloads by substring (no card line then).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const aes192 = @import("aes192");
 

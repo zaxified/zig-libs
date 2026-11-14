@@ -4,11 +4,11 @@
 verb over the tables `tools/bench.zig` wrote, one thread each.
 
 usage: bench_py.py <pandas|polars|duckdb> <work dir> <workload>
-stdout: `name TAB ns/op TAB count` (testkit.bench's format); stderr: the banner.
+stdout: `name TAB ns/op TAB count` (benchkit's format); stderr: the banner.
 
 Only the operation is timed: tables are loaded before the clock starts, and the
 result is forced to a materialized table (all three engines). Batch doubling
-over 100 ms, then best of five, as testkit.bench does for our side. The count
+over 100 ms, then best of five, as benchkit does for our side. The count
 is output rows + |floor(sum of one output column)|; values are multiples of
 0.25, so an exact sum agrees across engines or the run fails.
 

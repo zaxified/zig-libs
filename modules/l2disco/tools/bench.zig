@@ -63,7 +63,7 @@
 //! mandatory-TLV order, LLDP/CDP value lengths and DHCPv6 option framing strictly.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const l2 = @import("l2disco");
 
 const ref_short = "Go";

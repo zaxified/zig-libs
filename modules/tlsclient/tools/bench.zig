@@ -40,7 +40,7 @@
 //! cipher suite is the server's choice (Go server prefers AES-GCM with
 //! hardware support); the count is 1 per handshake.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it
+//! Method (`benchkit`): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
 //! alternate for `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the
 //! spread printed is (worst round − best round) / best round per side.
@@ -55,7 +55,7 @@
 //! (right name accepted with TLS 1.3, wrong name refused) before timing.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const tlsclient = @import("tlsclient");
 const Client = tlsclient.Client;

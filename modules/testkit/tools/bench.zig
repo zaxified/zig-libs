@@ -37,7 +37,7 @@
 
 const std = @import("std");
 const testkit = @import("testkit");
-const bench = testkit.bench;
+const bench = @import("benchkit");
 const driver = testkit.fuzz.driver;
 
 const bench_name = "bench-testkit";

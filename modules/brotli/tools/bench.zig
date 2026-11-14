@@ -40,7 +40,7 @@
 //! quality closest in size is printed too: a level whose closest quality is
 //! not its own is a ratio finding, not a pairing to change.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it
+//! Method (`benchkit`): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
 //! alternate for `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the
 //! spread printed is (worst round − best round) / best round per side. Ratios
@@ -50,7 +50,7 @@
 //! workloads by substring (no card line then).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const brotli = @import("brotli");
 

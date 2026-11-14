@@ -32,7 +32,7 @@
 //! filter workloads.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const accesslog = @import("accesslog");
 
 const bench_name = "bench-accesslog";

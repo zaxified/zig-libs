@@ -78,7 +78,7 @@
 //! filter workloads (substring).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const encoding = @import("encoding");
 
 const bench_name = "bench-encoding";

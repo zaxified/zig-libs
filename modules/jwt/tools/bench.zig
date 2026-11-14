@@ -25,7 +25,7 @@
 //! Keys and claims are written into `.zig-cache/bench-jwt/` from fixed seeds;
 //! the RSA key (2048 bits) is RFC 7520 §3.4's, as raw n/d/p/q for Go.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it
+//! Method (`benchkit`): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
 //! alternate for `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the
 //! spread printed is (worst round − best round) / best round per side. The Go
@@ -41,7 +41,7 @@
 //! Ed25519 keys are its own (see its header). `BENCH_FAST=0` skips it.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const jwt = @import("jwt");
 

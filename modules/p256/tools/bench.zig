@@ -25,7 +25,7 @@
 //!   keygen      `EcdsaP256Sha256.KeyPair.generate` vs `EVP_PKEY_keygen` (+ free)
 //! Inputs are written into `.zig-cache/bench-p256/` from fixed seeds.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it
+//! Method (`benchkit`): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
 //! alternate for `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the
 //! spread printed is (worst round − best round) / best round per side. Ratios
@@ -34,7 +34,7 @@
 //! must verify OpenSSL's. Arguments filter workloads by substring.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const p256 = @import("p256");
 const Ecdsa = p256.EcdsaP256Sha256;

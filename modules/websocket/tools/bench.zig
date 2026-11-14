@@ -61,7 +61,7 @@
 //! WebSocketProtocol parser over an in-memory buffer -- no socket loop).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const fastmem = @import("fastmem");
 const websocket = @import("websocket");
 

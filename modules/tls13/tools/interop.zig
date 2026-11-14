@@ -50,7 +50,7 @@
 //! line is `cases=N agree=N`.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const tls13 = @import("tls13");
 const rsa = @import("rsa");
 const p521 = @import("p521");

@@ -47,7 +47,7 @@
 //! expression and its byte slices (GC), keep an `AddRule` queue under a lock.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const nft = @import("nftables");
 const wire = nft.wire;
 const expr = nft.expr;

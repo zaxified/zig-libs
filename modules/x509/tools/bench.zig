@@ -43,7 +43,7 @@
 //! `verify_is_valid_for_subject_name`. The count is the verified path length
 //! from leaf to root (3) on every side.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it
+//! Method (`benchkit`): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
 //! alternate for `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the
 //! spread printed is (worst round − best round) / best round per side. Go has
@@ -52,7 +52,7 @@
 //! Arguments filter workloads by substring (no card line then).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const x509 = @import("x509");
 

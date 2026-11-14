@@ -48,7 +48,7 @@
 //! (`cargo fetch --manifest-path modules/datefmt/tools/rust_fast_bench/Cargo.toml`).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const datefmt = @import("datefmt");
 
 const ref_short = "Go";

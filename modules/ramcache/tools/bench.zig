@@ -62,7 +62,7 @@
 //! --manifest-path modules/ramcache/tools/rust_fast_bench/Cargo.toml`).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const ramcache = @import("ramcache");
 
 const Sharded = ramcache.Sharded;

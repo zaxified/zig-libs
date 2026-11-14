@@ -163,6 +163,7 @@ pub const Module = struct {
 pub const module_list = [_]Module{
     // Test-only harness. Consumers reach it through `test_deps`, never `deps`.
     .{ .name = "testkit", .libs = &.{"os"} },
+    .{ .name = "benchkit", .libs = &.{"os"}, .test_deps = &.{"testkit"} }, // bench-only: handed to every tools/bench.zig (was testkit.bench until 2026-11-14)
     .{ .name = "fastmem", .libs = &.{"os"} },
     .{ .name = "clock", .libs = &.{"os"} },
     .{ .name = "netaddr", .libs = &.{ "net", "web" }, .test_deps = &.{"testkit"}, .bench_deps = &.{"sort"}, .loopback = true },
@@ -294,7 +295,7 @@ pub const module_list = [_]Module{
     .{ .name = "pathmtu", .libs = &.{"net"}, .deps = &.{ "icmp", "netaddr" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "l2disco", .libs = &.{"net"}, .deps = &.{ "netaddr", "icmp" }, .test_deps = &.{"testkit"} },
     .{ .name = "upstream", .libs = &.{"web"}, .deps = &.{ "resilience", "probe" } },
-    .{ .name = "jwt", .libs = &.{"web"}, .deps = &.{ "http", "router", "p256", "p384", "p521", "rsa", "ct25519", "b64ct", "sha2", "keycodec", "clock" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "jwt", .libs = &.{"web"}, .deps = &.{ "http", "router", "p256", "p384", "p521", "rsa", "ct25519", "b64ct", "sha2", "keycodec", "clock" }, .test_deps = &.{"testkit"}, .interop_deps = &.{"benchkit"}, .loopback = true },
     .{ .name = "rbac", .libs = &.{"web"} },
     .{ .name = "xml", .libs = &.{ "web", "net" }, .test_deps = &.{"testkit"} },
     .{ .name = "xmldsig", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "p256" }, .test_deps = &.{"testkit"} },
@@ -352,7 +353,7 @@ pub const module_list = [_]Module{
     .{ .name = "stun", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "opcua", .libs = &.{"net"}, .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true, .live = true },
     .{ .name = "noise", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "aesgcm" }, .test_deps = &.{"testkit"} },
-    .{ .name = "x509", .libs = &.{ "crypto", "net" }, .deps = &.{ "rsa", "slhdsa", "p521", "p256", "netaddr" }, .test_deps = &.{"testkit"} },
+    .{ .name = "x509", .libs = &.{ "crypto", "net" }, .deps = &.{ "rsa", "slhdsa", "p521", "p256", "netaddr" }, .test_deps = &.{"testkit"}, .interop_deps = &.{"benchkit"} },
     .{ .name = "ocsp", .libs = &.{"crypto"}, .deps = &.{ "x509", "rsa", "p256", "datefmt" }, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "ocspcache", .libs = &.{"crypto"}, .deps = &.{ "ocsp", "http", "x509" }, .test_deps = &.{"testkit"}, .timing = true, .loopback = true },
     .{ .name = "dnssec", .libs = &.{"net"}, .deps = &.{ "dns", "rsa", "base32" }, .test_deps = &.{"testkit"} },
@@ -362,7 +363,7 @@ pub const module_list = [_]Module{
     .{ .name = "hqc", .libs = &.{"crypto"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly", "aesgcm", "tls13", "mlkem" }, .test_deps = &.{"testkit"} },
     .{ .name = "tlsclient", .libs = &.{ "crypto", "net" }, .deps = &.{ "x509", "p256", "p384", "p521", "rsa", "tlsresume", "ct25519", "mlkem" }, .test_deps = &.{"testkit"}, .loopback = true }, // x509: RFC 5280 chain verification + DER guard
-    .{ .name = "tls13", .libs = &.{"crypto"}, .deps = &.{ "rsa", "ct25519", "p256", "p384", "p521", "mlkem", "montint" }, .test_deps = &.{"testkit"} }, // shared TLS 1.3 core of dtls and (planned) tlsserver
+    .{ .name = "tls13", .libs = &.{"crypto"}, .deps = &.{ "rsa", "ct25519", "p256", "p384", "p521", "mlkem", "montint" }, .test_deps = &.{"testkit"}, .interop_deps = &.{"benchkit"} }, // shared TLS 1.3 core of dtls and (planned) tlsserver
     .{ .name = "tlsserver", .libs = &.{ "crypto", "net" }, .deps = &.{ "tls13", "aesgcm", "chachapoly", "netaddr", "x509", "rsa", "keycodec", "tlsresume", "p521", "hpke" }, .test_deps = &.{ "testkit", "tlsclient" }, .bench_deps = &.{"tlsclient"} }, // TLS 1.3 server (rustls scope incl. QUIC mode)
     .{ .name = "tlsresume", .libs = &.{"crypto"}, .deps = &.{"aesgcm"}, .test_deps = &.{"testkit"}, .interop_deps = &.{"tlsserver"} },
     .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "aesgcm" }, .test_deps = &.{"testkit"} },
@@ -385,7 +386,7 @@ pub const module_list = [_]Module{
     .{ .name = "oscore", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "spake2plus", .libs = &.{"crypto"}, .deps = &.{"p256"}, .test_deps = &.{"testkit"} },
     .{ .name = "ct25519", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .test_deps = &.{"testkit"} },
-    .{ .name = "mlkem", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .test_deps = &.{"testkit"} },
+    .{ .name = "mlkem", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .test_deps = &.{"testkit"}, .interop_deps = &.{"benchkit"} },
     .{ .name = "voprf", .libs = &.{"crypto"}, .deps = &.{ "ct25519", "decaf448", "p256", "p384", "p521" }, .test_deps = &.{"testkit"} },
     .{ .name = "opaque", .libs = &.{"crypto"}, .deps = &.{ "voprf", "ct25519" }, .test_deps = &.{"testkit"} },
     .{ .name = "bulletproofs", .libs = &.{"crypto"}, .deps = &.{"ct25519"}, .test_deps = &.{"testkit"} },
@@ -869,6 +870,9 @@ pub fn build(b: *std.Build) void {
             // `testkit` for every bench driver (2026-10-17): `testkit.bench` is
             // the timing/ratio skeleton 38 benches had copied by hand.
             if (!std.mem.eql(u8, m.name, "testkit")) bench_mod.addImport("testkit", fastModuleGraph(b, target, &fast_mods, "testkit"));
+            // `benchkit` for every bench driver (2026-11-14): the skeleton moved
+            // out of testkit, where each edit re-keyed 221 modules' tests.
+            if (!std.mem.eql(u8, m.name, "benchkit")) bench_mod.addImport("benchkit", fastModuleGraph(b, target, &fast_mods, "benchkit"));
 
             const bench_exe = if (!jcc_safe) b.addExecutable(.{
                 .name = b.fmt("bench-{s}", .{m.name}),

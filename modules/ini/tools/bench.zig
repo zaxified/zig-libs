@@ -51,7 +51,7 @@
 //! the verdict is the WORST ratio. Arguments filter workloads.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const ini = @import("ini");
 
 const ref_short = "go-ini";

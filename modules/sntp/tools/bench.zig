@@ -33,7 +33,7 @@
 //! Ratios are ours/Go by wall time; the verdict is the WORST ratio.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const sntp = @import("sntp");
 
 const ref_short = "Go";

@@ -32,7 +32,7 @@
 //! count is the bytes produced per op. The strike register (a hash set) and the
 //! 4-byte ticket codec have no OpenSSL counterpart and are not timed.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it
+//! Method (`benchkit`): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
 //! alternate for `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the
 //! spread printed is (worst round − best round) / best round per side. Ratios
@@ -48,7 +48,7 @@
 //! for byte too before timing; the ratio is ours / the faster of the two.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const tlsresume = @import("tlsresume");
 

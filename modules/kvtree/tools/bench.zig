@@ -55,7 +55,7 @@
 //! timed rows. `BENCH_LMDB=0` skips it.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const kvtree = @import("kvtree");
 const pagecache = @import("pagecache");
 

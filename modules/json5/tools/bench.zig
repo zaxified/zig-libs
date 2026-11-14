@@ -38,7 +38,7 @@
 //! faster of the two per workload, worst over the workloads.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const json5 = @import("json5");
 
 const bench_name = "bench-json5";

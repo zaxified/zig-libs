@@ -43,7 +43,7 @@
 //! ours/glibc by wall time; the verdict is the worst. Arguments filter workloads.
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const datefmt = @import("datefmt");
 const tz = @import("tz");
 

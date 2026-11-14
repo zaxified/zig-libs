@@ -28,14 +28,14 @@
 //! reproduce each payload from the reference's stream and our encoder must
 //! reproduce its bytes.
 //!
-//! Method (`testkit.bench`): each side doubles its batch until it takes over
+//! Method (`benchkit`): each side doubles its batch until it takes over
 //! 100 ms and keeps the best of five; per workload the sides alternate for
 //! `BENCH_ROUNDS` (default 3) rounds, each keeping its best. Ratios are ours /
 //! theirs by wall time (the C side counts no cycles). Arguments filter
 //! workloads by substring (no card line then).
 
 const std = @import("std");
-const bench = @import("testkit").bench;
+const bench = @import("benchkit");
 const Work = bench.Work(Op);
 const lzma = @import("lzma");
 
