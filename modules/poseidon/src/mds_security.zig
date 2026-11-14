@@ -546,3 +546,85 @@ test "isSecure mirrors generate_matrix's accept condition" {
         }
     }
 }
+
+test "generateVectorspace with round_num beyond t equals round_num = t (mutation audit)" {
+    var s = Sample{ .state = 31 };
+    const m = s.mat(4);
+    var a: [6]C.Vec = undefined;
+    var b: [6]C.Vec = undefined;
+    const da = C.generateVectorspace(&m, 4, 4, &a);
+    const db = C.generateVectorspace(&m, 4, 9, &b);
+    try testing.expectEqual(da, db);
+    for (0..da) |i| try testing.expect(std.mem.eql(u8, std.mem.asBytes(&a[i]), std.mem.asBytes(&b[i])));
+}
+
+test "algorithm_3 on a Jordan block: non-squarefree charpoly takes the literal path (mutation audit)" {
+    var j = L.zeroMat();
+    for (0..3) |i| j[i][i] = fe(2);
+    j[1][0] = fe(1);
+    j[2][1] = fe(1);
+    try testing.expect(C.algorithm2(&j, 3));
+    try testing.expect(C.algorithm3Literal(&j, 3));
+    try testing.expect(C.algorithm3(&j, 3));
+}
+
+test "isSecure needs observability as well as cyclicity (mutation audit)" {
+    // e_0 is cyclic (M e_0 = e_1) but row 0 of M is zero, so e_0^T M^k never
+    // leaves span{e_0^T}: algorithm_1 must reject although 2 and 3 accept.
+    var m = L.zeroMat();
+    m[1][0] = fe(1);
+    m[1][1] = fe(3);
+    try testing.expect(C.algorithm2(&m, 2));
+    try testing.expect(C.algorithm3(&m, 2));
+    try testing.expect(!(try C.algorithm1(&m, 2)).secure);
+    try testing.expect(!(try C.isSecure(&m, 2)));
+}
+
+const sf = @import("small_field.zig");
+
+test "algorithm_3 rejects an eigenvalue ratio of order exactly 2t+1 (mutation audit)" {
+    // GF(101), t = 2: eigenvalues 1 and w with w^5 = 1. Only r = 5 = 2t+1 breaks
+    // cyclicity, so the loop must start at 2t+1, not 2t+2.
+    const F = sf.SmallField(101);
+    const CS = Checks(F, &F.modulus_be, 4);
+    var w = F{ .v = 2 };
+    while (true) : (w.v += 1) {
+        var p = F.one;
+        for (0..5) |_| p = p.mul(w);
+        if (p.eql(F.one) and !w.eql(F.one)) break;
+    }
+    var m = CS.la.zeroMat();
+    m[0][1] = w.neg();
+    m[1][0] = F.one;
+    m[1][1] = F.one.add(w);
+    try testing.expect(CS.algorithm2(&m, 2));
+    try testing.expect(!CS.algorithm3Literal(&m, 2));
+    try testing.expect(!CS.algorithm3(&m, 2));
+}
+
+test "check_minpoly_condition range reaches i = 2t (mutation audit)" {
+    // GF(103), t = 2: find a companion matrix whose M^1..M^3 have irreducible
+    // characteristic polynomials and M^4 does not (lambda^(p-1) of order 4).
+    const F = sf.SmallField(103);
+    const CS = Checks(F, &F.modulus_be, 4);
+    const sm = CS.la.SmallInverses.init();
+    var found = false;
+    var s: u32 = 0;
+    search: while (s < 103) : (s += 1) {
+        var n: u32 = 1;
+        while (n < 103) : (n += 1) {
+            var m = CS.la.zeroMat();
+            m[0][1] = (F{ .v = n }).neg();
+            m[1][0] = F.one;
+            m[1][1] = F{ .v = s };
+            var irr: [4]bool = undefined;
+            for (0..4) |i| irr[i] = CS.la.polyIsIrreducible(CS.la.charPoly(&CS.la.matPow(&m, i + 1, 2), 2, &sm));
+            if (irr[0] and irr[1] and irr[2] and !irr[3]) {
+                try testing.expect(!CS.checkMinpolyCondition(&m, 2));
+                found = true;
+                break :search;
+            }
+        }
+    }
+    try testing.expect(found);
+}

@@ -1014,3 +1014,49 @@ test "polyFromPowerSums reconstructs charpoly(M^r) without forming M^r" {
         try testing.expect(got.eql(want));
     }
 }
+
+test "spanEql tells spans of different rank apart (mutation audit)" {
+    var a = La.Echelon.init(3);
+    var b = La.Echelon.init(3);
+    _ = a.add(La.basisVec(0));
+    _ = b.add(La.basisVec(0));
+    _ = b.add(La.basisVec(1));
+    // a is contained in b, so only the rank test can say "different".
+    try testing.expect(!La.spanEql(&a, &b));
+    try testing.expect(!La.spanEql(&b, &a));
+    try testing.expect(La.spanEql(&a, &a));
+}
+
+test "kernel with non-unit pivots vanishes on every constraint (mutation audit)" {
+    const rows = [_]La.Vec{
+        .{ fe(3), fe(0), fe(1), fe(0), fe(0), fe(0) },
+        .{ fe(0), fe(5), fe(2), fe(7), fe(0), fe(0) },
+    };
+    var out: [T]La.Vec = undefined;
+    const d = La.kernel(&rows, 4, &out);
+    try testing.expectEqual(@as(usize, 2), d);
+    for (out[0..d]) |v| {
+        for (rows) |r| {
+            var acc = TFr.zero;
+            for (0..4) |j| acc = acc.add(r[j].mul(v[j]));
+            try testing.expect(acc.isZero());
+        }
+    }
+}
+
+test "polynomial edge cases: add, scale by zero, divide below degree, monic of zero, powmod e=1, constants (mutation audit)" {
+    const one_p = La.polyConst(fe(1));
+    const x = La.polyX();
+    const x1 = La.polyFrom(&[_]TFr{ fe(1), fe(1) });
+    try testing.expect(La.polyAdd(one_p, x).eql(x1));
+    try testing.expect(La.polyAdd(x, one_p).eql(x1));
+    try testing.expect(La.polyScale(x1, TFr.zero).eql(La.polyZero()));
+    const x2 = La.polyFrom(&[_]TFr{ fe(0), fe(0), fe(1) });
+    try testing.expect(La.polyDivMonic(one_p, x2).eql(La.polyZero()));
+    const mz = try La.polyMakeMonic(La.polyZero());
+    try testing.expect(mz.isZero());
+    // x^2 mod (x + 3) = 9; with exponent 1 nothing else reduces the base.
+    const f = La.polyFrom(&[_]TFr{ fe(3), fe(1) });
+    try testing.expect(La.polyPowMod(x2, &[_]u8{1}, f).eql(La.polyConst(fe(9))));
+    try testing.expect(!La.polyIsIrreducible(La.polyConst(fe(5))));
+}
