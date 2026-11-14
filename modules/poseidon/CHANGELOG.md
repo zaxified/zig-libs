@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** card records the no-panic sweep and the first mutation run (113/128, 15 eq).
 - **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (128 mutants, 113 killed, 15 argued equivalent); 8 new tests pin the cases it found unpinned: `spanEql` rank, `kernel` with non-unit pivots, polynomial edge cases (add, scale by zero, divide below degree, monic of zero, power-mod with exponent 1, constant irreducibility), `generateVectorspace` beyond `t`, `algorithm_3` on a Jordan block and on an order-`2t+1` eigenvalue ratio, `check_minpoly_condition` at `i = 2t`, and `isSecure` on a cyclic but unobservable matrix.
 - **2026-11-14** — No-panic sweep: every `mds_security.Checks` entry point now rejects a state width outside `1..n_max` with a checked `@panic` (was out-of-bounds slice / UB in ReleaseFast, and `t - 1` underflow at `t = 0`); `grain.derive` turns a zero modulus or `n > 256` in a `Config` into a `@compileError` (was an endless rejection loop / silently truncated draws). No change for any valid input.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
