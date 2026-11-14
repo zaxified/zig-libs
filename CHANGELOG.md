@@ -37,6 +37,9 @@ directory.
   `mips32+soft_float` ReleaseSmall agent) links on 0.17.1 with its `noinline` workaround removed,
   and `chachapoly`'s mips32 ReleaseSafe test build, which failed the same way on 0.16, passed on
   0.17.0. The portability table keeps the "compiles, not links" caveat without the example.
+- **The README's Zig badge reads `build.zig.zon` (2026-11-14).** It was a static "0.17.1"; a
+  shields.io dynamic regex badge now shows `minimum_zig_version` on main, so it cannot go stale
+  at the next Zig move.
 - **Docs follow the 0.17.1 move (2026-11-11).** The root README states Zig 0.17.1 (status line,
   requirement, which older tags build with 0.17.0 / 0.16) and carries Zig-version, release and
   licence badges; the example apps' READMEs ask for 0.17.1 like their `init.sh`; the vendored

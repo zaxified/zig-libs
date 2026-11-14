@@ -1,7 +1,7 @@
 # zig-libs
 
 [![CI](https://github.com/zaxified/zig-libs/actions/workflows/ci.yml/badge.svg)](https://github.com/zaxified/zig-libs/actions/workflows/ci.yml)
-[![Zig 0.17.1](https://img.shields.io/badge/Zig-0.17.1-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/download/#release-0.17.1)
+[![Zig](https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzaxified%2Fzig-libs%2Fmain%2Fbuild.zig.zon&search=minimum_zig_version%20%3D%20%22(%5B0-9.%5D%2B)%22&replace=%241&label=Zig&color=f7a41d&logo=zig&logoColor=white)](https://ziglang.org/download/)
 [![Release](https://img.shields.io/github/v/release/zaxified/zig-libs?sort=date)](https://github.com/zaxified/zig-libs/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
