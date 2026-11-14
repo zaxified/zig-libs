@@ -238,8 +238,12 @@ echo "::group::interop: python oracles"
 # exactly what a golden-vs-live test exists to catch. A gate must go red for our
 # reasons, so this is pinned and bumped deliberately. `test.sh`'s capability
 # report compares the installed version against the golden's own header.
+# protobuf: the version protobuf's fixtures name in their header (4.21.12).
+# Pinned to 7.36.2 on 2026-11-14 for one run, the reference turned stricter on
+# two edge cases (`nonminimal_tag_stricter`, `field_number_out_of_range_stricter`,
+# full CI 43645078985) -- a moved oracle. A bump re-takes the fixtures with it.
 sudo pip3 install --break-system-packages -q --root-user-action=ignore \
-    "jinja2==3.1.6" "sympy==1.14.0" "brotli==1.2.1" "protobuf==7.36.2" >/dev/null 2>&1 || true
+    "jinja2==3.1.6" "sympy==1.14.0" "brotli==1.2.1" "protobuf==4.21.12" >/dev/null 2>&1 || true
 python3 - <<'PY' || true
 for mod, label in (("jinja2", "jinja2"), ("sympy", "sympy"),
                    ("brotli", "brotli"), ("google.protobuf", "protobuf")):

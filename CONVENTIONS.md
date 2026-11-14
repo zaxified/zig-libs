@@ -1153,6 +1153,17 @@ that reaches it can notice.
   produces. Mutation runners, probes for one finding, benchmarks of a fixed regression and
   snapshot copies of the module are **not** kept.
 
+  **The mutation kit is the exception that proves the rule** (amended 2026-11-14, CI/testkit
+  plan v3, E-W5). What rotted in 2026-09 was the part that anchors on a module's source
+  text: the mutant list, the module snapshot, the command line naming its deps. The rest —
+  inserting runtime-switched mutants from a list, running mutant 0 first under `ulimit -v`
+  and `setsid -w timeout`, the strict verdict — names no module, and every audit wave since
+  wrote it again from scratch (eleven waves in November alone). That half lives in
+  `scripts/mutation/` (`insert.py`, `run.sh`, a README with the recipe) and is kept; the
+  mutant list and the verdict table are still the audit's scratch and are deleted when it
+  closes. A kit change that anchors on any module's source is refused for the same reason
+  this bullet exists.
+
 **Why disposable, measured.** The 2026-09 campaign left its instruments in a droppable
 cache and then moved them into this tree (17 modules, ~15 000 lines). Every moved mutation
 runner had to be re-derived before it would run: a week after the audit, all of them had a
