@@ -13,6 +13,7 @@
 **Performance:** n/a — every call is a few dozen byte compares on a string of at most a few hundred bytes (an estimate from the code, tens of ns, not measured) guarding a process spawn, itself a syscall path orders of magnitude dearer; the shared-shape reference (go-playground, a regexp) is not what a user chooses this module over for speed, and the same-work comparison would only restate that. Precedent: `probe`, `icmp` ("the CPU per probe is not what a user picks it for"). (2026-11-02)
 
 **Evidence:** model — independent reference models for the shape predicates (exhaustive to length 5 + seeded mutation, `src/model_test.zig`) and frozen foreign verdicts for 6 319 hostile strings: POSIX sh (Python `shlex` + dash), the UCRT command-line rules (our transcription of Microsoft's documentation, not a Windows run), go-playground/validator v10.30.5, the Linux kernel interface-name check (`src/oracle_test.zig`, recipe `tools/oracle.py`); the older predicates keep their golden tables. Not model-fuzz: no fuzz driver compares against the models
+**Model:** src/model_test.zig · src/oracle_test.zig · tools/oracle.py
 
 **Known defects:** none recorded
 

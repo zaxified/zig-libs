@@ -13,6 +13,7 @@
 **Performance:** ref 0.02–1.04× libmpdec 4.0.1 (built -O2 from source; `zig build bench-decimal`: parse, add/sub chain, mul rounded to 12 and 2 places, divRound to 12, toString on 100k money values; BigDecimal add/mul/divPrec/sqrt at 28 and 200 digits; our BigDecimal results on a bump allocator rewound per batch, as libmpdec reuses its result) · fastest 2.39× worst vs the faster of libmpdec and rust_decimal 1.42.1 (parse; mul/divRound 0.4–1.0×) (measured 2026-10-20)
 
 **Evidence:** model — expected values from Python 3.14 decimal (frozen: `src/testdata/s2_oracle.vec`, 14 851 cases over every op added 2026-10-20, all 8 rounding modes, `tools/py_oracle.py`; and `src/testdata/conform_*.vec`, 17 979 cases over add/mul/quantize/div/divPrec/remainder/min/max/sqrt/pow, `tools/py_conform.py`) + random-bit-pattern float round trip; fuzz never-panic only
+**Model:** src/s2_test.zig:oracle · tools/py_oracle.py · tools/py_conform.py
 
 **Known defects:** none recorded
 

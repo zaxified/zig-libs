@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-09** — **NO CONSUMER-VISIBLE CHANGE:** `example/main.zig` (an idle timer on `Clock`, driven by `ManualClock`;
   timing and Unix stamps) — CONVENTIONS §7.2 requires one (`init` + 8 methods); push CI was red on `check-example-rule`.
 - **2026-11-08** — **Audit:** adversarial review of every entry point, 47-mutant schemata run (42 killed, 1

@@ -15,6 +15,7 @@
 **Performance:** ref 0.61–0.70× Rust std Instant::now/SystemTime::now · fastest ? (measured 2026-11-08)
 
 **Evidence:** model — every read is cross-checked against an independent reading of the same OS clock through `std.Io.Clock` (`awake`, `real`), plus invariants (monotonic never decreases, a sleep is seen with the right unit, saturation at both ends of every conversion)
+**Model:** src/root.zig:awake clock · src/root.zig:real clock · std:std.Io.Clock
 
 **Known defects:** none recorded
 

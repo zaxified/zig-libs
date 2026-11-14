@@ -15,6 +15,7 @@
 **Performance:** n/a — its references (fail2ban, a Python daemon; nginx limit_conn, a C directive) are not callable as libraries, so no like-for-like workload exists (2026-10-10)
 
 **Evidence:** model-fuzz — 300 seeded random operation sequences over the public Guard API (admit/close/record/ban/greylist/prefix bans/unbanAll/reconcile/snapshot-restore, greylist growth, dry run, injected clock) compared step by step — verdicts, state and the exact event stream — against a naive ordered-array reference model
+**Model:** src/root.zig:AgModel
 
 **Known defects:** none recorded
 

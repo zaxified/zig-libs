@@ -12,6 +12,7 @@
 **Performance:** not measured
 
 **Evidence:** model-fuzz — replay window compared to a reference set over a randomised trace; plus golden wire and never-panic fuzz
+**Model:** src/replay.zig:RefOracle
 
 **Known defects:** none recorded
 

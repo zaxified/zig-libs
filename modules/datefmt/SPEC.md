@@ -15,6 +15,7 @@
 **Performance:** ref 0.07–0.95× Go 1.26.8 time · fastest 1.18× jiff 0.2.38 (fmt_imf; every other task ≤ 1.07×, the fastest of httpdate, humantime, chrono, jiff per task) (measured 2026-10-25)
 
 **Evidence:** model-fuzz — differential fuzz against the Fliegel–Van Flandern Julian Day Number formula (years -4712..100000: epoch day both ways, weekday, Unix s/ns, addDays/diffInDays) plus the canned writers and the token engine read back by their parsers (`src/model_fuzz_test.zig`); also the exhaustive isoWeek inverse over 1900..2100
+**Model:** src/model_fuzz_test.zig
 
 **Known defects:** none recorded
 

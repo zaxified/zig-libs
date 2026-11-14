@@ -15,6 +15,7 @@
 **Performance:** ref 0.05–0.85× labstack/echo v5.4.0 · fastest 1.16× tower-http 0.7.1 (net, row no_credential; every other row 0.21–0.97× the fastest of fiber v2.52.16, fiber v3.6.1 and tower-http with the same hashed validator) (measured 2026-10-25)
 
 **Evidence:** model-fuzz — the decision table (`verify`/`verifyApiKey`/`verifyBasic` under add/remove rotation, verifier callbacks, open plane) against plain credential lists, and the denied-request throttle end to end on the wire against an array model of its documented rule (window, fold, idle sweep, LRU cap); 3 planted mutants all killed (2026-10-17)
+**Model:** src/model_test.zig:Model · src/model_test.zig:ThrottleModel
 
 **Known defects:** none recorded
 

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-10** — **FIX** (independent review of the parity waves, H1 HIGH): the static Binary check that runs at every node `compile` visits followed a list's element schema through `shapeOf`, which has no step budget, before `go` charged its visits; a shared `if_else` DAG under `list.first` was a 2^depth walk (test seen hanging without the fix). The element is followed for a column operand only, the check has a budget of its own (1024 steps), and `x + x` is typed in one walk.
 - **2026-11-10** — **FIX** (review M2, polars parity): an `if_else`, `coalesce` or `min`/`max` with a binary branch and a text or null one is Binary, as polars' supertype (`when(c).then(bin).otherwise(str)` probed); beside a number or a bool it is `error.BadExpr` (polars SchemaError). It was typed text and held bytes that are no UTF-8.
 - **2026-11-10** — **FIX** (review L1): `argWhere` returns its own allocation when the final shrink fails (it returned a shorter slice of it, which the caller then freed with the wrong length).

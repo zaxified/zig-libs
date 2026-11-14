@@ -17,6 +17,7 @@ Audit detail: Mutation delta 2026-11-07 (commits `c65d2d91`, `98cd9b0f`, `58d07a
 **Performance:** ref 0.42–0.60× codespan-reporting 0.13.1 (rich, ASCII; `zig build bench-diagnostics`: 10k single-label, 2k three-label, 1k five-line diagnostics over a 1 MB file, 200 on a 100 KB line; first 20 outputs byte-identical to codespan before timing) · fastest 0.88–0.94× worst vs the faster of codespan-reporting and annotate-snippets 0.12.17 (measured 2026-10-20)
 
 **Evidence:** model-fuzz — codespan-reporting 0.13.1 itself, live: `zig build interop-diagnostics` (`tools/interop.zig` + `tools/codespan_bench/src/bin/oracle.rs`) renders 20 000 seeded random cases (1–2 files of mixed ASCII/CJK/emoji/combining/CRLF text, 0–4 labels incl. empty, multi-line, overlapping, cross-file and end-of-file spans, notes, codes, random context lines) on both sides in both charsets: 39 862 renders byte-identical, 0 different, 138 not compared because codespan's order of 3+ equal-range labels is unspecified (2026-10-23; it found one port defect, `leadingSpace`, and fails again with it reverted); plus codespan's own snapshots replayed in-test (`src/codespan_test.zig`): all 16 cases byte-identical in both charsets (ASCII and box drawing); the width table is the unicode-width 0.2.3 crate's (Unicode 18.0.0), checked against it over all 1 112 064 code points
+**Model:** tools/interop.zig · tools/codespan_bench/src/bin/oracle.rs · src/codespan_test.zig
 
 **Known defects:** none recorded
 
