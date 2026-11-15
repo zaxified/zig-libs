@@ -84,7 +84,7 @@ separated, ≤ 255 bytes, which covers host names and IPv4 literals; otherwise t
 which is what glibc's `syslog()` sends and what receivers fill in from the peer. An IPv6 address
 belongs in RFC 5424's HOSTNAME, which rsyslogd reads intact.
 
-**Local delivery** (requested by ttydesk, 2026-09-28; `src/unix.zig`, Linux only — raw AF_UNIX
+**Local delivery** (requested by the terminal-UI consumer, 2026-09-28; `src/unix.zig`, Linux only — raw AF_UNIX
 syscalls, since `std.Io.net.UnixAddress` has no datagram-socket API, only `SOCK_STREAM`
 `connect`/`listen`). Two emitters, neither binding or listening — both dial a well-known path, same
 as every reference client named below:

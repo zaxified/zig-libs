@@ -149,7 +149,7 @@ def gen():
     out.append({'kind': 'journal', 'fields': [[h(b'MESSAGE'), h(b'many')]] + [[h(b'F%d' % k), h(b'%d' % k)] for k in range(60)]})
     out.append({'kind': 'journal', 'fields': [[h(b'MESSAGE'), h(b'long name')], [h(b'N' * 64), h(b'64')]]})
     out.append({'kind': 'journal', 'fields': [[h(b'MESSAGE'), h(b'\n')], [h(b'PRIORITY'), h(b'3')], [h(b'CODE_FILE'), h(b'a.zig')]]})
-    for msg, prio, ident in ((b'hello', 6, b'ttydesk'), (b'multi\nline', 3, None), (b'', None, b'x'), (b'\xff\x00', 0, b'a b'),
+    for msg, prio, ident in ((b'hello', 6, b'desktop'), (b'multi\nline', 3, None), (b'', None, b'x'), (b'\xff\x00', 0, b'a b'),
                              (b'prio only', 7, None)):
         out.append({'kind': 'jsend', 'message': h(msg), 'priority': prio, 'identifier': h(ident),
                     'fields': [[h(b'AUDIT_EVENT'), h(b'login')], [h(b'AUDIT_USER'), h(b'z\x01')]]})

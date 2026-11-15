@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: journald stderr detection (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `nowTimestamp` and the `Logger` default clock (duplicate-code pass) read `clock.realtimeMs()`; 0 on a failed read as before. The two monotonic reads that return null on failure (`unix.zig`, `transport.zig`) stay, because `clock` cannot signal failure. New dependency: `clock`.
 - **2026-11-02** — **FIX (blind review of the same day's surface):** `ReconnectingEmitter` backoff runs from the failure of a connect, not its start; `Logger` turns a sink's trailer byte into a space instead of having the record refused; `Options.max_line` has a floor of `min_line_limit` (128); a sink may forward to another logger (re-entry is per logger); one deadline over `journal.Emitter`'s memfd path, `memfd_create` failures mapped by cause. **DOCS:** the parity card.
@@ -52,7 +53,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   a budget shorter than the marker, a 108-byte unix socket path and `sendMessage` over
   `max_fields`.
 
-- **2026-09-28** — **New local delivery (Additive, requested by ttydesk)**: `UnixEmitter`
+- **2026-09-28** — **New local delivery (Additive, requested by the terminal-UI consumer)**: `UnixEmitter`
   (`src/unix.zig`) sends this module's existing RFC 5424/RFC 3164 encoders as one datagram to a
   unix `SOCK_DGRAM` socket, default `"/dev/log"` (`open`/`openDefault`, `send`/`sendBsd`, plus
   `sendRaw` for a caller with its own larger pre-formatted buffer — `error.NoSpaceLeft` rather
@@ -66,7 +67,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `sendmsg` scatter-gather list, so there is no internal size cap on a value; a datagram the kernel
   itself rejects as too large (`EMSGSIZE`) is `error.MessageTooLarge` — journald's own memfd/
   `SCM_RIGHTS` fallback past that limit is not implemented (optional per the request). Linux only
-  (raw `AF_UNIX` syscalls — `std.Io.net.UnixAddress` has no datagram-socket API). Lets ttydesk
+  (raw `AF_UNIX` syscalls — `std.Io.net.UnixAddress` has no datagram-socket API). Lets the terminal-UI consumer
   delete its own workaround (`src/audit.zig`'s `toJournal`/`field`/`sendDatagram`, marked
   `zig-libs request: syslog — local delivery`) once it switches over. Tested over a real kernel
   unix socket (no daemon needed — see SPEC.md's Verification section), not compile-checked only.
