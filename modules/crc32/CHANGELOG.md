@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** the ARMv8 run-time detection reads `std.elf.AT.HWCAP` (Zig 0.17 made `std.elf.AT` a per-OS namespace; `AT_HWCAP` is gone). Cross-built and run for aarch64-linux-musl under qemu.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC: 'no per-function target features' and codegen notes labelled as 0.16 measurements, not re-checked on 0.17; std CRC/memset facts updated for 0.17.0.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the test-only `ScriptSource` (the fuzz harness's cursor source) drops `pub` from its two methods; it was never reachable from outside, and the textual consumer-example trigger (CONVENTIONS.md §7.2) counted them as state methods.
@@ -22,12 +23,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-29** — Fix: a Debug build for a baseline x86_64 target (`-Dtarget=x86_64-linux`,
   or any CPU model without the instruction) failed to compile — Zig 0.16's self-hosted x86_64
   backend cannot encode the run-time-dispatched PCLMULQDQ path for such a CPU. That build now uses
-  the table; LLVM builds and targets that have the instruction are unchanged. Found by qap's
+  the table; LLVM builds and targets that have the instruction are unchanged. Found by the web-server consumer's
   portability check.
 - **2026-09-28** — New module: CRC-32 (IEEE 802.3 / gzip / zlib / PNG) with x86-64
   PCLMULQDQ folding and the ARMv8 `crc32x` instructions chosen at run time, and a
   slicing-by-8 fallback, against std's bytewise ~0.4 GB/s; `hash`, `extend`, `combine`,
   streaming `Crc32` (the shape of `std.hash.Crc32`), `backend`/`hashWith`. Anchored to the
   CRC catalogue check value and zlib-computed vectors, and differentially to
-  `std.hash.Crc32`. Requested by qap's audit: `http`'s gzip and `kvtree`'s page checksums
+  `std.hash.Crc32`. Requested by the web-server consumer's audit: `http`'s gzip and `kvtree`'s page checksums
   now use it.
