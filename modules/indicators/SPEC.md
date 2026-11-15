@@ -337,7 +337,7 @@ Result: SWAK_BP / HP / 2PHP, HT_TRENDLINE, HT_TRENDMODE, CEIL, FLOOR, SQRT, EXP,
 equal; HT_DCPERIOD (297 of 12718 values), HT_DCPHASE, HT_PHASOR, HT_SINE, MAMA and PERCENTB with MAMA differ as described under the Hilbert allowance above (largest column-relative distance 1.0e-15),
 ACOS / ASIN / ATAN / COSH / SINH / TANH by at most 1 ULP (2 for SINH / TANH). `max/colmax` is printed by the oracle.
 
-**Candlestick patterns (same oracle, 34310 records in all; the 61 patterns: 22443 records, 3.43 million compared values, all bitwise equal, no TA-Lib defect found):** every pattern at TA-Lib's default settings over lengths 1, 2, lookback-1 .. lookback+2, 40, 300 and
+**Candlestick patterns (same oracle, 41303 records in all with the other 176 functions; the 61 patterns: 22443 records, 3.43 million compared values, all bitwise equal, no TA-Lib defect found):** every pattern at TA-Lib's default settings over lengths 1, 2, lookback-1 .. lookback+2, 40, 300 and
 3000 (pattern-rich inputs, a 0.25 price grid for exact ties and a 1e-9 scale), f64 and `TA_S_*`; the seven penetration patterns at 0, 0.1, 0.3 / 0.5, 1, 3, 3e37 and the out-of-range / NaN values (BadParam on both sides); and four settings presets (every range type /
 period / factor moved, all periods 0, all periods 20 with doubled factors, rotated range types with 1-2 bar periods) driven into TA-Lib with `TA_SetCandleSettings` and into ours as `CandleSettings`, which shows each setting is honoured, not only
 the defaults. The oracle prints per pattern how many compared values had a nonzero TA-Lib answer: all 61 reach at least 29 (TRISTAR 29, KICKING 33, STICKSANDWICH 38, MATHOLD 46, ... CDLBELTHOLD about 16000), so no pattern is compared on zeros alone. Not covered: patterns on

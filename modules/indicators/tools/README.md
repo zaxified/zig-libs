@@ -31,4 +31,4 @@
 - Candlestick patterns (61 functions, ids 176..236 after the momentum wave, alphabetical): four series `ohlc`, one integer output compared as a double. `tools/candle_gen.zig` generates the inputs
   (single-bar shapes and multi-bar motifs, kind 1 = 0.25 price grid for exact ties, kind 2 = scale 1e-9) and the settings presets 1..4 (`TA_SetCandleSettings` through the record's candle-settings block: 11 x
   range type, averaging period, factor; the shim resets them after each record). `interop-indicators` prints, per pattern, how many compared values had a nonzero TA-Lib answer (a pattern compared only on zeros is not
-  verified; goal >= 20). The frozen vectors hold default settings only (the first records with a nonzero answer, 40 bars, f64 and f32 where found).
+  verified; goal >= 20). The frozen vectors hold default settings only (the first records with a nonzero answer, 40 bars, one f64 vector per pattern and an f32 one for every second pattern: the code is generic over the float type; the whole vector file stays under 2 MB).
