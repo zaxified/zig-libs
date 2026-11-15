@@ -80,7 +80,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `Options.non_finite = .reject`: `preprocess` returns `error.NonFiniteNumber` and fills
   `Options.diagnostic` (`line`, `col` in bytes, `offset`/`len` of the literal, a static end-user
   `message` and a separate integrator `hint`) — JSON has no such numbers and the main
-  consumer (bxp) rejects non-finite values everywhere else; `preprocessAnnotated` never fails, so it
+  consumer (the build-tool consumer) rejects non-finite values everywhere else; `preprocessAnnotated` never fails, so it
   passes the token through and `std.json` rejects it (the two entry points still agree on the
   verdict). Opt-in `.quoted` rewrites them to the JSON **strings** `"Infinity"`, `"-Infinity"`,
   `"NaN"` (`+Infinity` → `"Infinity"`, `±NaN` → `"NaN"`); `std.json` decodes a string into an `f64`
@@ -247,10 +247,10 @@ apostrophes and nesting (both entry points), and the 30-character cap on quoted 
 
 | # | Item | Effort | Decision |
 |---|---|---|---|
-| R1 | Error position in SOURCE coordinates for every syntax error (today `Diagnostic` is filled only for NonFiniteNumber/HexLiteralTooLarge; a std.json error points into the preprocessed text). bxp (`bxp-core/src/config.zig:2525`) and ttydesk (`json5span.zig`) both work around it | M | **DONE 2026-10-20** — `SourceMap` (opt-in `Options.source_map`), filled by `parseFromSlice` |
+| R1 | Error position in SOURCE coordinates for every syntax error (today `Diagnostic` is filled only for NonFiniteNumber/HexLiteralTooLarge; a std.json error points into the preprocessed text). The build-tool consumer (the build-tool consumer's `core/src/config.zig:2525`) and the terminal-UI consumer (`json5span.zig`) both work around it | M | **DONE 2026-10-20** — `SourceMap` (opt-in `Options.source_map`), filled by `parseFromSlice` |
 | R2 | Typed one-call parse: `parseFromSlice(T, gpa, json5_text, opts)` keeping the preprocessed buffer alive | S | **DONE 2026-10-20** — `parseFromSlice(T, gpa, text, ParseOptions)` |
-| R3 | `stringify` to JSON5 (indent, quote choice, unquoted identifier keys, trailing commas) — json5/json5, pyjson5, json5-rs have it; ttydesk hand-emits | M | **DONE 2026-10-20** — `stringify` |
-| R4 | Format-preserving span find/replace (ttydesk `json5span.zig`) | M | not parity (no reference has it) — owner call |
+| R3 | `stringify` to JSON5 (indent, quote choice, unquoted identifier keys, trailing commas) — json5/json5, pyjson5, json5-rs have it; the terminal-UI consumer hand-emits | M | **DONE 2026-10-20** — `stringify` |
+| R4 | Format-preserving span find/replace (the terminal-UI consumer `json5span.zig`) | M | not parity (no reference has it) — owner call |
 | R5 | Strict Unicode ID_Start/ID_Continue for unquoted keys | M | not doing (accepting a superset is harmless) |
 | R6 | Duplicate-key policy | S | **DONE** — `ParseOptions.json.duplicate_field_behavior` (std's) |
 | R7 | Depth limit for hostile input | S | `Options.max_depth` with R2 |
@@ -276,14 +276,14 @@ Full JSON5 spec gaps — **all struck through 2026-09-30, see the two DONE items
   (the reference refuses e.g. an emoji key; this module quotes it). Exact classes need Unicode
   general-category tables (Lu Ll Lt Lm Lo Nl / Mn Mc Nd Pc) — none in this module or a sibling.
   Effort: medium (a generated range table, pinned to one Unicode version). Fits §2.
-- **DONE 2026-10-17 — `Diagnostic` column + user-facing message** (request from bxp): `col`
+- **DONE 2026-10-17 — `Diagnostic` column + user-facing message** (request from the build-tool consumer): `col`
   (1-based, bytes from the line start), `offset`/`len` of the literal (sign included), and the
-  `Options` advice moved out of `message` into `hint`. Consumer workaround to delete: bxp
-  `bxp-core/src/config.zig` `diagPreprocessError` (`zig-libs request: json5 — Diagnostic ... no column`).
+  `Options` advice moved out of `message` into `hint`. Consumer workaround to delete: the build-tool consumer
+  the build-tool consumer's `core/src/config.zig` `diagPreprocessError` (`zig-libs request: json5 — Diagnostic ... no column`).
 - Formalizing `AnnotatedResult` against a future `diagnostics` module (currently a raw
   `{ out, next_id }` pair; no structured line/col/severity type yet).
 - **DONE 2026-09-30 — JSON5 numeric literals** *(survey 2026-09-30)*: rewrite hex (`0x1A`), leading/trailing-dot (`.5`, `5.`) and `+`-signed numbers to JSON numbers; `Infinity`/`NaN` decided 2026-09-30: **an error by default** (`+Infinity`, `-Infinity`, `NaN` refused with a
-  clear message — JSON has no such numbers, and the main consumer, bxp, rejects non-finite values
+  clear message — JSON has no such numbers, and the main consumer, the build-tool consumer, rejects non-finite values
   everywhere else as a safety rule), with an **opt-in `non_finite = .quoted`** that rewrites them to
   the strings `"Infinity"`, `"-Infinity"`, `"NaN"`: `std.json` decodes a string into an `f64` field
   through `std.fmt.parseFloat`, which reads exactly those, so a typed struct gets the same `inf`/`nan`

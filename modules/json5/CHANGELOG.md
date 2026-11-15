@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation run over the unquoted-key peek (both entry points), `skipJson5WsAndComments` and `atUnterminatedComment` after the unterminated-comment fix (56 mutants): 2 tests added: the helpers' contract (an unterminated `/*` stops the skip at its start; no read past the end) and the recovered shapes next to it (`{a /`, `{a / b: 1}`, `{a b*: 1}`) against the refused `{a /*`. No production code changed.
 - **2026-11-12** — **BEHAVIOUR CHANGE (LOW):** An unterminated block comment right after an unquoted key (`{a /* x`) is now refused by both entry points, as one after a value (`{a: 1} /* x`) always was; it used to go through the key-recovery layer and come out as a `$err_trace` entry, contrary to the doc comment. Terminated and `//` comments before the colon are unchanged. From the 2026-11-12 mutation run.
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Whole-module mutation run over `src/root.zig` and `src/stringify.zig`: 927 mutant-schemata switches (every guard, comparison, limit, escape, state transition and error mapping of `preprocess`, `preprocessAnnotated`, the single-pass `Value` reader, `SourceMap` and the stringifier), run once per mutant in one ReleaseSafe test binary. 877 killed, 49 equivalent (invariants in the audit paragraph), 1 unobservable (a `@memset(taken, false)` over memory the safe-mode allocator already fills with `undefined`), 0 undecided. The first run left 218 survivors; they became 33 tests (`SourceMap` point list, `isJsonNumber` as RFC 8259's grammar, the single-pass reader's refusals and `max_value_len` edges, `\u` escapes that spell whitespace in keys, every recovery-message fragment and line number, the `key_pos` reset after closers, lone commas, glued numbers, `diagnosticPrefix` edges, stringifier key/escape/enum edges). No production change.
@@ -39,7 +40,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `std.json.parseFromTokenSource` in one call, strings always copied (the intermediate JSON is freed).
   On a `std.json` error `ParseOptions.diagnostic` gets the line/column/offset in the JSON5 **source**
   (S2 R1) through the new `SourceMap` (`Options.source_map`, one point per emitted token; exact inside
-  verbatim text, the token start where the preprocessor rewrote it). bxp's and ttydesk's own
+  verbatim text, the token start where the preprocessor rewrote it). The build-tool consumer's and the terminal-UI consumer's own
   line/column computation can go after a repin. `Diagnostic` doc widened. Additive.
 - **2026-10-20** — `stringify` (S2 R3): a JSON5 writer — `writeValue` (a `std.json.Value`) and
   `write` (any Zig value, the `std.json.Stringify` type mapping), `Options{indent, quote: auto/double/
@@ -50,7 +51,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-10-17** — **BEHAVIOURAL:** `Diagnostic` gains `col` (1-based, bytes), `offset` and `len`
   of the refused literal, and `hint`; the `Options{ .non_finite = .quoted }` advice moved from
-  `message` (now end-user text only) into `hint`. Request from bxp (caret under the literal).
+  `message` (now end-user text only) into `hint`. Request from the build-tool consumer (caret under the literal).
 - **2026-10-09** — tests: deterministic fuzz driver `JSON5_FUZZ` over the existing harnesses.
 - **2026-10-06** — **BEHAVIOURAL:** `preprocessAnnotated` no longer recovers a bad bare word (`nul`,
   `tru`) or a single-quoted string broken by a newline OUTSIDE an object (top level, or inside an
