@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE (results bit-identical):** constant-time hardening. `isBasePointRepr` used a short-circuit `and` over `equivalent` on the coordinates of the point being multiplied, which branches on a secret point (voprf multiplies H(input)); it now folds the limbs of the three differences and compares once. The one remaining jump on its verdict ("is the point exactly G") is declassified for ctgrind. New ctgrind row `secpt` (tainted point, public scalar): 2 in-file before, 1 after (the product's `rejectIdentity` verdict, same class as `comb`'s 1). Bench: no measurable change.
 - **2026-11-08** — **NEW:** `sign.derToRawN(n, der)`, the strict `Ecdsa-Sig-Value` decoder generalized over the scalar length (`ocsp` had a copy for P-384); `sign.derToRaw` is `derToRawN(32, …)`, unchanged.
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of the § GP sweep (11/12 killed; the explicit identity reject in `ecdsaVerifyDigest` is equivalent — `mulDoubleBasePublic` rejects an identity Q first). New test: incremental `Signer.finalize` equals `sign` and verifies (r/s order).
@@ -14,7 +15,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   SHA-256/384/512 and SHA3-256, with and without noise), refusing a scalar outside [1, n − 1]
   with `error.IdentityElement`; burned and stack-probed. It skips the `d·G` a caller holding
   only the secret key paid through `KeyPair.fromSecretKeyInto` on every signature — 14 µs of a
-  326 µs qap TLS connection (`tls13.certverify`).
+  326 µs the web-server consumer TLS connection (`tls13.certverify`).
 
 - **2026-10-18** — Ported to Zig 0.17.0: `Fe.field_order` and `scalar.field_order` are now `comptime_int` like std (0.17 `Ecdsa` evaluates `2 * n` at comptime).
 - **2026-10-14** — perf (no API change): the Jacobian doubling and the CT mixed addition run as ONE generated asm block each (`src/point_asm.zig`: a comptime field program over a scratch frame — `fast_core`'s Montgomery multiply/square text rebased onto frame offsets, add/sub/half with memory operands, register forwarding between consecutive ops, stores only for slots read later), in nistz256's operation order: doubling 4M + 4S with 11 add/sub/half (was dbl-2001-b 3M + 5S + 16 add/sub; same polynomials, bit-identical), CT mixed addition madd-2004-hmv 8M + 3S + 7 add/sub (was madd-2007-bl 7M + 4S + 14; another Jacobian representative of the same point — the Zig `addMixedCtFormula` moved with it). The window's five doublings share one frame (`Jac.dblTimes`). New differential: both programs (and 5 chained doublings) == the Zig formulas bit for bit on random and edge coordinates. `bench-p256` vs OpenSSL 3.5.5: ecdh 1.24 → 1.05×, verify 1.04 → 0.94×, sign 1.06 → 0.99×, keygen 0.92 → 0.81× (card P3 → P2). ctgrind patterns `p256/comb`, `p256/sign` gain `point_asm.zig`.
@@ -60,7 +61,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   core, interleaved before/after, ReleaseFast. No API removed or changed; three
   additions. Profile first (`perf`, `--call-graph lbr`): a signature was 46 %
   fixed-base comb, **45 % `Scalar.invert`** (std's fiat divstep, one divstep per
-  5-limb call, 741 calls, ~40 µs — the same symbol is 9.7 % of a whole qap TLS
+  5-limb call, 741 calls, ~40 µs — the same symbol is 9.7 % of a whole the web-server consumer TLS
   handshake) and 13 % Fermat `Fe.invert`; a verify was 73 % the projective RCB
   double-base multiply. SPEC's "scalar field NOT on the critical path" was wrong
   by half a signature and is rewritten.

@@ -342,7 +342,7 @@ pub fn Ecdsa(comptime Hash: type) type {
         /// key, so this skips the `d·G` that `KeyPair.fromSecretKeyInto`
         /// computes for the public half — a server that signs once per
         /// handshake with a key it loaded once paid it every time (14 µs of
-        /// a 326 µs qap connection, 2026-10-21). `error.IdentityElement` for
+        /// a 326 µs the web-server consumer connection, 2026-10-21). `error.IdentityElement` for
         /// a scalar outside [1, n − 1]. Burned.
         pub fn signWithSecretKey(out: *Signature, secret_key: *const SecretKey, msg: []const u8, noise: ?*const [noise_length]u8) StdSignError!void {
             const r = signWithSecretKeyUnburned(out, secret_key, msg, noise);

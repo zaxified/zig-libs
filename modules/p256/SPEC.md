@@ -245,7 +245,7 @@ constant-time fiat scalar with the same public surface. ⭐ **The inverse is the
 exception, and this section claimed otherwise until 2026-09-28.** std's
 `Scalar.invert` is Bernstein–Yang too, but fiat's `divstep` is one divstep per
 call over the full 5-limb vectors, 741 calls: measured 40.7 µs against ~41 µs for
-the entire constant-time `k·G` — 45 % of a signature, and 9.7 % of a whole qap
+the entire constant-time `k·G` — 45 % of a signature, and 9.7 % of a whole the web-server consumer
 TLS handshake in `perf` (`p256_scalar_64.divstep`). `Scalar.invert` therefore
 runs `modinv.zig` (~3 µs), pinned to std's inverse by a differential. Unlike k256
 there are no GLV constants to own here.
@@ -491,7 +491,7 @@ was loaded by other sessions; best of two per row, so read them as ratios):
 | `mulDoubleBasePublic` (`G`, `Q`) | 212 µs | 125 µs | fixed-base `u1·G` + Jacobian wNAF `u2·Q` |
 | `sign.ecdsaSign` | 97.3 µs | 29.2 µs | |
 | `sign.ecdsaVerify` | 261 µs | 128 µs | |
-| `EcdsaP256Sha256.sign` (std generic over this group — qap TLS) | 94.5 µs | 37.1 µs | the 8 µs over `ecdsaSign` is std's nonce derivation + codecs |
+| `EcdsaP256Sha256.sign` (std generic over this group — the web-server consumer TLS) | 94.5 µs | 37.1 µs | the 8 µs over `ecdsaSign` is std's nonce derivation + codecs |
 | `EcdsaP256Sha256.verify` (std generic — two `mulPublic` + `add`) | 413 µs | 125 µs | `basePoint.mulPublic` redirect |
 
 Profile BEFORE (`perf record --call-graph lbr` + the component bench, same
@@ -501,7 +501,7 @@ session): a signature was `k·G` comb 41 µs (46 %) + **`Scalar.invert` 40 µs
 and recoding the rest) + `Scalar.invert` 40 µs + `Fe.invert` ~14 µs; SHA-256,
 SEC1 decoding and the scalar codecs were under 1 %. So the SPEC's earlier
 "scalar field NOT on the accel critical path" was wrong by half a signature —
-the same `p256_scalar_64.divstep` showed as 9.7 % of an entire qap TLS
+the same `p256_scalar_64.divstep` showed as 9.7 % of an entire the web-server consumer TLS
 handshake. `Fe.sq` costs the same as `Fe.mul` (30 vs 33 ns) because the
 word-shuffle reduction, not the product, dominates the asm core — which bounds
 what the point formulas can gain and is the largest remaining lever (backlog 8).
@@ -520,7 +520,7 @@ grew ~40 s → ~50 s (the comptime table build + one comptime batch inversion).
 
 - **Document a minimum stack size (review GP, 2026-10-30).** Every `mul`/`ecdh` burns 16 KiB of dead stack (`burn.mul_burn`) plus its frames (about 30 KiB for one ECDH), sign 8 KiB; no minimum is documented. Measure with the stackprobe tests and publish it in the README/`meta`.
 
-- **Self-hosted Debug does not compile (found 2026-10-22 from qap's test redesign).** `fast_core.zig:81`
+- **Self-hosted Debug does not compile (found 2026-10-22 from the web-server consumer's test redesign).** `fast_core.zig:81`
   says "No `movabsq` (rejected by the self-hosted assembler)", but `fast_core.zig:560/712/921/924/974`
   and the generated `point_asm.zig:185/211/232` use it; the self-hosted backend also reports "ran out of
   registers lowering inline asm" at `fast_core.zig:904/956`. Any consumer's `-fno-llvm` Debug build
@@ -609,7 +609,7 @@ Original proposals (2026-10-10, before the pass):
    windows, 151 KB table) ≈ −3 µs on sign for +63 KB; an addition chain for
    `sqrt` (compressed-key decoding, 10.5 µs) ≈ −2 µs; `mulCtWindowed` at w = 5
    ≈ −15 µs on the ECDH-style `P256.mul` (hpke/spake2plus/ctap2pin, not on the
-   qap/jwt path); std's `EcdsaP256Sha256.sign` spends ~8 µs over `ecdsaSign` in
+   web-server consumer/jwt path); std's `EcdsaP256Sha256.sign` spends ~8 µs over `ecdsaSign` in
    its generic nonce derivation and codecs, which this module cannot reach.
 10. ~~**Wycheproof ECDH (`ecdh_secp256r1_*`) vectors**~~ — **DONE 2026-10-13**: `ecdh`/`ecdhInto` (`src/ecdh.zig`, p384's shape) run against the 363 Wycheproof rows whose public key is a strict-DER SPKI naming secp256r1 (330 valid, 26 invalid, 7 acceptable; the 249 other rows test an ASN.1 parser) and the 25 CAVP CDH rows, and differentially against std on random and mutated SEC1 peers. Also done in the same pass: `Ecdsa(Hash)` with Wycheproof SHA-512 (DER + P1363) and SHA3-256 (DER) and CAVP SigVer/SigGen/KeyPair/PKV (`tools/gen_vectors.py`). *(Original note, survey 2026-09-30: variable-base `P256.mul` is what hpke/spake2plus/ctap2pin/jwe-ES use as ECDH, and only the ECDSA vectors were run; ECDH's invalid-curve and twist points are the classic P-256 failure.)*
 11. **aarch64 field core** *(survey 2026-09-30)*: the `MULX/ADX` core is amd64-only; ARM servers get the portable Solinas path, whose speed relative to `std`'s is unmeasured here. Effort: medium (a `umulh` product with the existing word-shuffle reduction). Fits §2.
