@@ -436,7 +436,7 @@ const Case = struct {
     ip: [6]i32 = @splat(0),
     dp: [8]f64 = @splat(0),
     xp: [6]i32 = @splat(0), // ints 6..11 of the prototype (KST, KSTEXT)
-    kind: u8 = 0, // input kind: 0 walk, 1 walk with flat runs, 2 walk scaled by 1e-9, 3 signed-zero ties
+    kind: u8 = 0, // input kind: 0 walk, 1 walk with flat runs, 2 walk scaled by 1e-9, 3 signed-zero ties, 4/5 math domains, 6..8 audit kinds (see genInput)
     seed: u64 = 0,
     bad: bool = false,
     emit: bool = false,
@@ -479,6 +479,21 @@ fn genInput(seed: u64, kind: u8, h: []f64, l: []f64, c: []f64) void {
                     else => -3.0,
                 },
                 else => if (pick == 0) 0.0 else -0.0,
+            };
+            hh.* = cc.*;
+            ll.* = cc.*;
+        }
+        return;
+    }
+    if (kind >= 6 and kind <= 8) {
+        // Audit kinds (2026-11-15): 6 mixes ~1e10 prices with values below 2^-40 (CG's three-limb sums), 7 holds
+        // values near 2^-940 (CG's capped scale), 8 a 3- to 5-bar cycle (the Hilbert period floor of 6 bars).
+        const per = 3.0 + r.float(f64) * 2.0;
+        for (h, l, c, 0..) |*hh, *ll, *cc, i| {
+            cc.* = switch (kind) {
+                6 => if (r.boolean()) 1e10 + r.float(f64) else r.float(f64) * 0x1p-40,
+                7 => (1.0 + r.float(f64)) * 0x1p-940,
+                else => 100.0 + 3.0 * @sin(@as(f64, @floatFromInt(i)) * 2.0 * std.math.pi / per),
             };
             hh.* = cc.*;
             ll.* = cc.*;
@@ -1307,6 +1322,22 @@ fn buildCandle(gpa: std.mem.Allocator, cases: *std.ArrayList(Case), f: Func, see
 /// Length of the frozen candle vectors.
 const candle_vec_n = 40;
 
+/// The extra frozen records (2026-11-15 mutation audit): flat runs, the math transforms' own domains, CG's
+/// extreme magnitudes, the Hilbert family's short cycles, and every unstable level where the output actually starts
+/// inside the vector. They draw their seeds from
+/// a space of their own, so the records frozen before them keep their inputs.
+const extra_vec_n = 40;
+/// Longest extra record.
+const extra_max_n = 160;
+const extra_tail = 12;
+/// Outputs of an extra flat-run record past its lookback (at least).
+const extra_flat_tail = 16;
+var extra_seed: u64 = 0x6578_7472_6100_0000;
+fn nextExtraSeed() u64 {
+    extra_seed += 1;
+    return extra_seed;
+}
+
 fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
     var seed: u64 = 0x7461_6c69_6221;
     for (std.enums.values(Func)) |f| {
@@ -1315,6 +1346,8 @@ fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
             continue;
         }
         const plist = try paramsOf(f, gpa);
+        // per unstable level (3 bars, AUTO4, AUTO8): whether a record with outputs is frozen yet
+        var u_frozen: [3]bool = @splat(false);
         for (plist, 0..) |pp, pi| {
             const base = Case{ .func = f, .n = 0, .ip = pp.ip, .dp = pp.dp, .xp = pp.xp };
             const lbo = probeLookback(gpa, base);
@@ -1363,6 +1396,42 @@ fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
                 ck.emit = n == vec_n and pi == 0;
                 try cases.append(gpa, ck);
             };
+            if (pi == 0) {
+                // flat runs (kind 1) at the defaults; the math transforms also inside their domains (4) and over
+                // a wide magnitude range (5)
+                const kinds: []const u8 = if (isMathTx(f)) &.{ 1, 4, 5 } else if (f == .cg) &.{ 1, 6, 7 } else if (isHt(f)) &.{ 1, 8 } else &.{1};
+                for (kinds) |k| {
+                    if (lb + extra_flat_tail > extra_max_n) break;
+                    var c = base;
+                    c.n = @intCast(@max(extra_vec_n, lb + extra_flat_tail));
+                    c.kind = k;
+                    c.seed = nextExtraSeed();
+                    c.emit = true;
+                    try cases.append(gpa, c);
+                }
+            }
+            if (unstableMatters(f) and pi < 6) {
+                // every unstable level, frozen once with outputs: the first parameter set whose lookback at that
+                // level leaves `extra_tail` outputs within `extra_max_n` bars
+                for ([_][2]u32{ .{ 0, 3 }, .{ 1, 0 }, .{ 2, 0 } }, 0..) |u, ui| {
+                    if (u_frozen[ui]) continue;
+                    var c = base;
+                    c.ukind = @intCast(u[0]);
+                    c.ubars = u[1];
+                    const lbu = probeLookback(gpa, c) orelse continue;
+                    if (lbu + extra_tail > extra_max_n) continue;
+                    // the n = 40 record of the first set already has outputs at 3 bars and AUTO4: not again
+                    if (u[0] != 2 and pi == 0 and lbu < vecLen(f)) {
+                        u_frozen[ui] = true;
+                        continue;
+                    }
+                    c.n = @intCast(lbu + extra_tail);
+                    c.seed = nextExtraSeed();
+                    c.emit = true;
+                    try cases.append(gpa, c);
+                    u_frozen[ui] = true;
+                }
+            }
             if (pi == 0 and f != .trange) {
                 var c32 = base;
                 c32.is32 = true;

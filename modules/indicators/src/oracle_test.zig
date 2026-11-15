@@ -12,7 +12,7 @@ const ind = @import("root.zig");
 const vecs = @import("testdata/talib_vectors.zig");
 const testing = std.testing;
 
-const max_n = 128;
+const max_n = 160; // the extra records (flat runs, unstable levels with outputs) run to at most 160 bars
 const n_overlap = 44; // functions 0..43: seed set and overlap studies
 const n_vs_end = 94; // functions 44..93: the volume / statistic waves; the cycle wave follows
 const n_cy_end = n_vs_end + 25; // functions 94..118: the cycle wave; the momentum wave follows

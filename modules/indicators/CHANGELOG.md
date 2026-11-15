@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — NO CONSUMER-VISIBLE CHANGE (tests, test data, oracle tool): second round of the mutation audit
+  for the six open survivors (now 463 mutants, 444 killed, 19 equivalent / unobservable, 0 undecided). Hand-built
+  inputs in `src/audit_test.zig` for KAMA's first-window zero-change count, MCGD's evaluation order, ER's clamp,
+  HT_DCPERIOD's period floor, MASS on a flat market, STC's seed, a doji's colour and a touching body gap;
+  `tools/interop.zig` freezes CG at extreme magnitudes and the Hilbert family over short cycles, drops the candle
+  price-grid records and duplicate unstable records and shortens the flat-run ones (frozen file 1098 records, 2.7 MB,
+  was 3.3 MB; earlier records unchanged; live oracle: all cases agree).
+- **2026-11-15** — NO CONSUMER-VISIBLE CHANGE (tests, test data, oracle tool): first whole-module mutation audit
+  and review (463 mutants, 439 killed, 18 equivalent / unobservable, 6 open survivors named in SPEC § Anchoring; no
+  defect). New `src/audit_test.zig` and tests in `smooth.zig` / `xmath.zig` for the rules surviving mutants showed
+  untested (signed-zero ties, flat-window and zero-volume rules, AUTO lookbacks, NaN skip on the close and in `peek`,
+  swapped periods, the atan fast path's rounding test near boundaries, HIKKAKE's confirmation window, candle pattern
+  conditions, ...). `tools/interop.zig` freezes extra records (flat runs per function, math-transform domains, a price
+  grid per candle pattern, every unstable level where its output starts within 160 bars); the frozen-vector file is
+  regenerated (1223 records, 3.3 MB; the earlier records unchanged) and `oracle_test.zig` replays up to 160 bars.
 - **2026-11-15** — NO CONSUMER-VISIBLE CHANGE (docs): SPEC § Benchmark, the card's Performance line, Compared with and Backlog carry the after-run of the P-gap work (114 workloads, 0.71x to 6.4x TA-Lib, 43 of 88 functions over 1.1x, was 23.0x and 53; streaming 0.29-0.59x), measured under concurrent load: ratios only until a quiet-machine re-measure.
 - **2026-11-15** — NO CONSUMER-VISIBLE CHANGE (performance): windowed batch paths, outputs bitwise unchanged (live oracle: identical per-function statistics; new test: WILLR / CCI batch against the stepped core on data with +0.0 / -0.0 ties, NaN and inf). MOM / ROC family: a branch-free steady step (`vs.run`, whose `steadyStep` now also receives the history source). CCI (f64): the typical prices are parked in the output and every window is summed as two contiguous runs in TA-Lib's circular-buffer slot order, no index wrap and one division per bar (3.9x -> 1.4x TA-Lib); f32 keeps the generic step. MIDPOINT: the cached-index extrema run in registers (`window.ExtCore.Run`, 4.0x -> 3.8x). MOM 1.55x -> 0.98x, ROC 1.06x -> 0.88x.
 - **2026-11-15** — NO CONSUMER-VISIBLE CHANGE (performance): batch paths without per-bar dispatch or warm-up branches, outputs bitwise unchanged (live oracle: identical per-function statistics; batch == stream tests and the frozen vectors pass). (a) `MaCore` is dispatched once per call, the loop runs over a by-value copy of the active variant: MA, APO / PPO, BBANDS, and MACDEXT when its three stages share an MA type. (b) Recurrence cores declare `steady()` plus a tight loop (`steadyRun`: EMA, DEMA / TEMA / T3, KAMA, ATR / NATR; MACD's three EMAs in `batch3`) or a branch-free `steadyStep` (`vs.run`: TRIX, TSI, APO / PPO over EMA) that the batch drivers switch to after the warm-up; NaN-skipping calls and the streaming types keep the generic step. TA-Lib ratios: APO 18.5x -> 1.23x, PPO 15.9x -> 1.47x, MA(EMA) 10.9x -> 1.00x, MACDEXT 3.88x -> 0.87x, EMA 1.87x -> 1.00x, MACD 3.5x -> 1.31x, T3 2.8x -> 1.00x, TEMA 3.76x -> 0.96x, KAMA 3.2x -> 1.12x, ATR 2.1x -> 1.01x, TRIX / TSI / DEMA -> 0.98-1.04x, BBANDS 3.8x -> 2.10x.
