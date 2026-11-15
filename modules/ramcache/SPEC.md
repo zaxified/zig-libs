@@ -385,7 +385,7 @@ every field, `rehashes` included, non-zero.
   holds for `Sharded.getOrLoad`: its waiters wait on the leader's flight by spinning/yielding, so a
   `Loader` that suspends in an `Io` shared with a waiter's thread would hang that waiter; the `io`
   option would turn the waiters' wait into an `Io` wait too. Item stays open.
-**Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/cache.zig` (thread-safe LRU with TTL and ref-counted entries) has no wire format, so it is not a byte oracle. Use it as a behavioural and benchmark reference: the same get/put/expire trace should give the same hit/miss sequence, then compare throughput. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
+**Differential oracle against karlseguin's library** — IDEA (2026-09-24, owner review of karlseguin's Zig libraries; not scheduled). `karlseguin/cache.zig` (thread-safe LRU with TTL and ref-counted entries) has no wire format, so it is not a byte oracle. Use it as a behavioural and benchmark reference: the same get/put/expire trace should give the same hit/miss sequence, then compare throughput. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
 None beyond what's already covered above. Persistence itself and keyed-hash hardening remain
 out of scope (unchanged); eviction callbacks + a dirty-set are now in (write-behind seam, see
