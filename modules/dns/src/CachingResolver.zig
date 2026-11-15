@@ -22,7 +22,13 @@
 //!    arguments.
 //!  - Only answers that came from DNS are cached (`canonical != null`). IP
 //!    literals, /etc/hosts entries and `.onion`/`.invalid` names pass through
-//!    uncached (`source = .network`): the hosts file can change.
+//!    uncached (`source = .network`): the hosts file can change. Literals and
+//!    `.onion`/`.invalid` names are answered before any accounting (no budget
+//!    token, no pool slot, no `network_lookups`); an /etc/hosts hit is found
+//!    out only by asking, so it is refunded afterwards (token and
+//!    `network_lookups` given back). A cached `canonical` keeps the letter
+//!    case of the caller that filled the entry; a rooted and an unrooted name
+//!    are separate entries.
 //!  - Positive answers keep `clamp(ttl_s, min_ttl_s, max_ttl_s)`, negative
 //!    ones (NXDOMAIN, NODATA; RFC 2308) `clamp(ttl_s, negative_min_ttl_s,
 //!    negative_max_ttl_s)`. An answer without a TTL (an empty one without
@@ -31,7 +37,13 @@
 //!  - Upstream failures (`Timeout`, `ServerFailed`, `NetworkFailed`,
 //!    `MalformedResponse`, `DohFailed`, `TlsFailed`) serve an expired entry
 //!    still inside `stale_s` (RFC 8767; off by default) and arm a per-key
-//!    exponential backoff during which the key is not asked again.
+//!    exponential backoff during which the key is not asked again. The
+//!    backoff is per key (a network outage arms every key that was asked);
+//!    `MalformedResponse`, which includes an RFC 5452 mismatch, arms it too.
+//!    `resetFailures` clears it for a caller that knows the network is back.
+//!    A failure of a concurrent miss never arms backoff on an entry that
+//!    holds a fresh answer: that answer is served. Evicting an entry drops its
+//!    backoff state.
 //!  - Thread-safe: one `std.Io.Mutex` guards the table and is never held
 //!    across a network lookup. The cache owns its `Resolver`s (a `Resolver` is
 //!    single-owner): it creates them lazily from the `Resolver.Options` given
@@ -39,14 +51,18 @@
 //!    takes a free one for the duration of its lookup (waiting, cancelable,
 //!    when all are busy). One slow name therefore never blocks a miss on
 //!    another. Two concurrent misses on the SAME key may both query (no
-//!    request coalescing yet).
-//!  - Memory: everything is under `gpa`, the table owns clones; an
+//!    request coalescing yet). An answer expires TTL seconds after the moment
+//!    the lookup was sent, not after it returned. `lookupIp` order is RFC 6724
+//!    as of the lookup time: a cache hit after a route change keeps the old order.
+//!  - Memory: everything is under `gpa` (which must be thread-safe: pool
+//!    threads allocate concurrently), the table owns clones; an
 //!    allocation failure while storing returns the answer uncached.
 
 const std = @import("std");
 const testkit = @import("testkit");
 const netaddr = @import("netaddr");
 const message = @import("message.zig");
+const config = @import("config.zig");
 const Resolver = @import("Resolver.zig");
 const net = std.Io.net;
 
@@ -227,7 +243,9 @@ const Entry = struct {
 /// `negative_min_ttl_s` > `negative_max_ttl_s`, a zero or inverted backoff,
 /// a budget with `per_s` or `burst` 0, `max_concurrent_lookups` 0. The slices
 /// inside `resolver_options` (servers, paths, EDNS options) must outlive the
-/// cache.
+/// cache. `gpa` must be thread-safe: concurrent lookups allocate from several
+/// threads at once (use `std.heap.smp_allocator` or the like, not an unlocked
+/// arena or a single-threaded allocator).
 pub fn init(gpa: std.mem.Allocator, io: std.Io, resolver_options: Resolver.Options, options: Options) error{InvalidOptions}!CachingResolver {
     const o = options;
     if (o.max_entries == 0) return error.InvalidOptions;
@@ -270,6 +288,25 @@ pub fn prune(c: *CachingResolver) void {
     }
 }
 
+/// Clears every key's failure backoff and keeps the answers: for a caller that
+/// knows the network came back (a link-up event), so keys are asked again at
+/// once instead of at the end of their backoff. Entries that carried nothing
+/// but failure state are removed.
+pub fn resetFailures(c: *CachingResolver) void {
+    c.mutex.lockUncancelable(c.io);
+    defer c.mutex.unlock(c.io);
+    var it = c.tail;
+    while (it) |e| {
+        it = e.prev;
+        if (e.payload == null) {
+            c.removeEntry(e);
+        } else {
+            e.fail_count = 0;
+            e.retry_at_s = 0;
+        }
+    }
+}
+
 /// Drops every entry (answers and failure state alike).
 pub fn clear(c: *CachingResolver) void {
     c.mutex.lockUncancelable(c.io);
@@ -295,7 +332,7 @@ pub fn stats(c: *CachingResolver) Stats {
 
 pub fn lookupIp(c: *CachingResolver, name: []const u8) Error!Answer(netaddr.Ip) {
     var buf: [key_buf_len]u8 = undefined;
-    return c.run(netaddr.Ip, nameKey(&buf, .ip, name), name, callIp);
+    return c.run(netaddr.Ip, nameKey(&buf, .ip, name), netaddr.parseIp(name) != null or config.isDnsAvoided(name), name, callIp);
 }
 
 pub fn reverse(c: *CachingResolver, ip: netaddr.Ip) Error!Answer([]const u8) {
@@ -313,33 +350,33 @@ pub fn reverse(c: *CachingResolver, ip: netaddr.Ip) Error!Answer([]const u8) {
             break :blk buf[0..18];
         },
     };
-    return c.run([]const u8, key, ip, callReverse);
+    return c.run([]const u8, key, false, ip, callReverse);
 }
 
 pub fn lookupMx(c: *CachingResolver, name: []const u8) Error!Answer(Resolver.Mx) {
     var buf: [key_buf_len]u8 = undefined;
-    return c.run(Resolver.Mx, nameKey(&buf, .mx, name), name, callMx);
+    return c.run(Resolver.Mx, nameKey(&buf, .mx, name), config.isDnsAvoided(name), name, callMx);
 }
 
 pub fn lookupNs(c: *CachingResolver, name: []const u8) Error!Answer([]const u8) {
     var buf: [key_buf_len]u8 = undefined;
-    return c.run([]const u8, nameKey(&buf, .ns, name), name, callNs);
+    return c.run([]const u8, nameKey(&buf, .ns, name), config.isDnsAvoided(name), name, callNs);
 }
 
 pub fn lookupTxt(c: *CachingResolver, name: []const u8) Error!Answer([]const u8) {
     var buf: [key_buf_len]u8 = undefined;
-    return c.run([]const u8, nameKey(&buf, .txt, name), name, callTxt);
+    return c.run([]const u8, nameKey(&buf, .txt, name), config.isDnsAvoided(name), name, callTxt);
 }
 
 pub fn lookupCname(c: *CachingResolver, name: []const u8) Error!Answer([]const u8) {
     var buf: [key_buf_len]u8 = undefined;
-    return c.run([]const u8, nameKey(&buf, .cname, name), name, callCname);
+    return c.run([]const u8, nameKey(&buf, .cname, name), config.isDnsAvoided(name), name, callCname);
 }
 
 pub fn lookupSrv(c: *CachingResolver, service: []const u8, proto: []const u8, name: []const u8) Error!Answer(Resolver.Srv) {
     var buf: [key_buf_len]u8 = undefined;
     const key = srvKey(&buf, service, proto, name);
-    return c.run(Resolver.Srv, key, SrvArgs{ .service = service, .proto = proto, .name = name }, callSrv);
+    return c.run(Resolver.Srv, key, config.isDnsAvoided(name), SrvArgs{ .service = service, .proto = proto, .name = name }, callSrv);
 }
 
 const SrvArgs = struct { service: []const u8, proto: []const u8, name: []const u8 };
@@ -397,10 +434,13 @@ fn run(
     c: *CachingResolver,
     comptime T: type,
     key: ?[]const u8,
+    /// An IP literal or a DNS-avoided name: answered before any accounting.
+    local: bool,
     ctx: anytype,
     comptime call: fn (*Resolver, @TypeOf(ctx)) Resolver.Error!Resolver.Lookup(T),
 ) Error!Answer(T) {
     const io = c.io;
+    if (local) return c.bypassLocal(T, ctx, call);
     const k = key orelse return c.bypass(T, ctx, call);
 
     c.mutex.lockUncancelable(io);
@@ -443,7 +483,16 @@ fn run(
     c.mutex.unlock(io);
     held = false;
 
-    const slot = try c.acquire();
+    const slot = c.acquire() catch |err| {
+        // Never reached the network: give the token and the count back.
+        c.mutex.lockUncancelable(io);
+        c.refundLocked();
+        c.mutex.unlock(io);
+        return err;
+    };
+    // The TTL runs from the moment the query is sent: an answer never outlives
+    // its TTL by the lookup's duration.
+    const t_call = c.now();
     const res = call(&slot.resolver, ctx);
     c.release(slot);
 
@@ -451,7 +500,27 @@ fn run(
     held = true;
     const t1 = c.now();
     var lk = res catch |err| return c.failed(T, k, err, t1);
-    return c.succeeded(T, k, &lk, t1);
+    return c.succeeded(T, k, &lk, t_call);
+}
+
+/// Gives back what a lookup took that turned out not to reach the network.
+/// Called with `mutex` held.
+fn refundLocked(c: *CachingResolver) void {
+    c.network_lookups -|= 1;
+    if (c.options.max_network_lookups) |b| c.tokens = @min(b.burst, c.tokens +| 1);
+}
+
+/// An IP literal or a DNS-avoided name: no budget token, no pool slot, no
+/// statistic. A throwaway Resolver, so it never waits behind a slow lookup.
+fn bypassLocal(
+    c: *CachingResolver,
+    comptime T: type,
+    ctx: anytype,
+    comptime call: fn (*Resolver, @TypeOf(ctx)) Resolver.Error!Resolver.Lookup(T),
+) Error!Answer(T) {
+    var r = Resolver.init(c.io, c.gpa, c.resolver_options);
+    defer r.deinit();
+    return .{ .lookup = try call(&r, ctx), .source = .network };
 }
 
 /// A key that does not fit the key buffer: straight to the resolver.
@@ -520,6 +589,14 @@ fn release(c: *CachingResolver, s: *Slot) void {
 /// serves what is still allowed to be served.
 fn failed(c: *CachingResolver, comptime T: type, k: []const u8, err: Resolver.Error, t: u64) Error!Answer(T) {
     if (!isUpstreamFailure(err)) return err;
+    // A concurrent miss of the same key may have stored a fresh answer while
+    // this lookup was failing: serve it, and leave the failure state alone.
+    if (c.map.get(k)) |cur| {
+        if (cur.payload != null and t < cur.expires_s) {
+            c.touch(cur);
+            return c.answerFrom(T, cur, .cache, @min(cur.expires_s -| t, cur.stored_ttl));
+        }
+    }
     const e = c.failureEntry(k) orelse return err;
     e.fail_count +|= 1;
     e.last_err = err;
@@ -533,7 +610,12 @@ fn failed(c: *CachingResolver, comptime T: type, k: []const u8, err: Resolver.Er
 
 /// Called with `mutex` held. Applies the TTL policy and keeps a clone.
 fn succeeded(c: *CachingResolver, comptime T: type, k: []const u8, lk: *Resolver.Lookup(T), t: u64) Answer(T) {
-    if (lk.canonical == null) return .{ .lookup = lk.*, .source = .network }; // literal / hosts: never cached
+    if (lk.canonical == null) {
+        // /etc/hosts (literals never get here): never cached, and it did not
+        // use the network.
+        c.refundLocked();
+        return .{ .lookup = lk.*, .source = .network };
+    }
     const ttl = c.effectiveTtl(lk.status, lk.ttl_s, lk.partial);
     lk.ttl_s = ttl;
     if (ttl == 0) {
@@ -741,6 +823,9 @@ const Stub = struct {
     /// `release_slow` is set: `stashed` says it is being held.
     stashed: std.atomic.Value(bool) = .init(false),
     release_slow: std.atomic.Value(bool) = .init(false),
+    /// When set, the clock advances by `bump_by` as the answer is sent.
+    bump_clock: ?*TestClock = null,
+    bump_by: std.atomic.Value(u32) = .init(0),
     pending: [1024]u8 = undefined,
     pending_len: usize = 0,
     pending_to: net.IpAddress = undefined,
@@ -850,6 +935,7 @@ const Stub = struct {
             st.stashed.store(true, .release);
             return;
         }
+        if (st.bump_clock) |ck| _ = @atomicRmw(u64, &ck.now, .Add, st.bump_by.load(.acquire), .monotonic);
         try st.sock.send(st.io, &in.from, w.buffered());
     }
 };
@@ -859,7 +945,7 @@ const TestClock = struct {
 
     fn read(ctx: ?*anyopaque) u64 {
         const s: *TestClock = @ptrCast(@alignCast(ctx.?));
-        return s.now;
+        return @atomicLoad(u64, &s.now, .monotonic);
     }
 
     fn clock(s: *TestClock) Clock {
@@ -2272,4 +2358,145 @@ test "every pooled Resolver is deinitialised with the cache" {
     defer c.deinit();
     dropAnswer(c.lookupIp("host.example.com"));
     try testing.expectEqual(@as(u16, 1), c.created);
+}
+
+test "F1: literals, DNS-avoided names and hosts hits spend no budget, slot or network stat" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const hosts_path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/hosts", .{&tmp.sub_path});
+    try std.Io.Dir.cwd().writeFile(h.io, .{ .sub_path = hosts_path, .data = "192.0.2.1 gw.example.com gw\n" });
+    h.ropts.use_hosts = true;
+    h.ropts.hosts_path = hosts_path;
+    var c = try h.cache(.{ .max_network_lookups = .{ .per_s = 1, .burst = 1 } });
+    defer c.deinit();
+
+    for (0..2) |_| {
+        var lit = try c.lookupIp("192.0.2.9");
+        defer lit.deinit();
+        var lit6 = try c.lookupIp("2001:db8::1");
+        defer lit6.deinit();
+        var onion = try c.lookupIp("x.onion");
+        defer onion.deinit();
+        var gw = try c.lookupIp("gw.example.com"); // /etc/hosts
+        defer gw.deinit();
+        try testing.expectEqual(@as(usize, 1), gw.lookup.items.len);
+        try testing.expectEqual(@as(?[]const u8, null), gw.lookup.canonical);
+    }
+    try testing.expectEqual(@as(u32, 0), h.queries());
+    const s = c.stats();
+    try testing.expectEqual(@as(u64, 0), s.network_lookups);
+    try testing.expectEqual(@as(u64, 0), s.budget_refused);
+    try testing.expectEqual(@as(usize, 0), s.entries);
+    try testing.expect(c.created <= 1); // only the hosts name needs a pooled Resolver
+    // The single token is still there for a real lookup.
+    var real = try c.lookupIp("real.example.com");
+    defer real.deinit();
+    try testing.expectEqual(@as(u64, 1), c.stats().network_lookups);
+}
+
+test "F3: the TTL runs from the moment the query was sent" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    h.stub.ttl.store(60, .release);
+    h.stub.bump_clock = &h.clock;
+    h.stub.bump_by.store(5, .release); // the lookup "takes" 5 s
+    var c = try h.cache(.{});
+    defer c.deinit();
+    var a = try c.lookupIp("slowish.example.com");
+    defer a.deinit();
+    h.stub.bump_by.store(0, .release);
+    // The query left at 1000: the answer expires at 1060, not 1065.
+    h.clock.now = 1059;
+    var hit = try c.lookupIp("slowish.example.com");
+    defer hit.deinit();
+    try testing.expectEqual(Source.cache, hit.source);
+    h.clock.now = 1060;
+    var again = try c.lookupIp("slowish.example.com");
+    defer again.deinit();
+    try testing.expectEqual(Source.network, again.source);
+}
+
+test "F4: a failure never arms backoff on an entry that holds a fresh answer" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{});
+    defer c.deinit();
+    var a = try c.lookupIp("host.example.com");
+    defer a.deinit();
+    // Another miss of the same key failed after the first one stored its answer.
+    var kbuf: [key_buf_len]u8 = undefined;
+    const k = nameKey(&kbuf, .ip, "host.example.com").?;
+    c.mutex.lockUncancelable(c.io);
+    var served = try c.failed(netaddr.Ip, k, error.Timeout, c.now());
+    c.mutex.unlock(c.io);
+    defer served.deinit();
+    try testing.expectEqual(Source.cache, served.source);
+    try testing.expectEqual(@as(usize, 1), served.lookup.items.len);
+    try testing.expectEqual(@as(u8, 0), c.map.get(k).?.fail_count);
+    var hit = try c.lookupIp("host.example.com");
+    defer hit.deinit();
+    try testing.expectEqual(Source.cache, hit.source);
+    try testing.expectEqual(@as(u32, 1), h.queries());
+}
+
+test "F5: a cancel while waiting for a pool slot gives the budget token back" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_concurrent_lookups = 1, .max_network_lookups = .{ .per_s = 1, .burst = 2 } });
+    defer c.deinit();
+
+    var slow: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+    var f1 = try h.io.concurrent(NamedLookup.run, .{&slow});
+    defer f1.await(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &h.stub.stashed);
+
+    var fast: NamedLookup = .{ .c = &c, .name = "fast.example.com" };
+    var f2 = try h.io.concurrent(NamedLookup.run, .{&fast});
+    var f2_live = true;
+    defer if (f2_live) f2.cancel(h.io);
+    try waitForWaiters(&c, 1); // it holds a token and waits for the slot
+    f2.cancel(h.io);
+    f2_live = false;
+    try testing.expect(!fast.ok.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), c.stats().network_lookups); // the slow one only
+
+    h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &slow.done);
+    var third = try c.lookupIp("third.example.com"); // needs the refunded token
+    defer third.deinit();
+    try testing.expectEqual(@as(u64, 2), c.stats().network_lookups);
+}
+
+test "F6: resetFailures clears every backoff and keeps the answers" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .failure_backoff_min_s = 100, .failure_backoff_max_s = 100 });
+    defer c.deinit();
+    var kept = try c.lookupIp("kept.example.com");
+    defer kept.deinit();
+    h.stub.mode.store(.servfail, .release);
+    try testing.expectError(error.ServerFailed, c.lookupIp("down.example.com"));
+    try testing.expectError(error.ServerFailed, c.lookupIp("down.example.com")); // backed off: no query
+    try testing.expectEqual(@as(u32, 2), h.queries());
+    h.stub.mode.store(.answer, .release);
+    try testing.expectError(error.ServerFailed, c.lookupIp("down.example.com")); // still armed
+    try testing.expectEqual(@as(u32, 2), h.queries());
+
+    c.resetFailures();
+    var up = try c.lookupIp("down.example.com");
+    defer up.deinit();
+    try testing.expectEqual(Source.network, up.source);
+    try testing.expectEqual(@as(u32, 3), h.queries());
+    var hit = try c.lookupIp("kept.example.com");
+    defer hit.deinit();
+    try testing.expectEqual(Source.cache, hit.source);
 }

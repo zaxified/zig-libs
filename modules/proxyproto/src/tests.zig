@@ -475,6 +475,42 @@ test "read: untrusted peers, and the empty list refuses everything" {
     try testing.expect((try pp.read(&f, &buf, .{ .peer = v4(192, 0, 2, 1) })) == null);
 }
 
+test "read: an untrusted peer's partial signature prefix is not an error" {
+    var buf: [pp.default_max_v2_len]u8 = undefined;
+    const other = v4(192, 0, 2, 1);
+    // "PRO" then EOF: not Truncated, bytes stay.
+    var a: std.Io.Reader = .fixed("PRO");
+    try testing.expect((try pp.read(&a, &buf, .{ .peer = other, .trusted = &.{lb} })) == null);
+    var abuf: [pp.default_max_v2_len]u8 = undefined;
+    var a1 = testkit.fuzz.ChunkedReader.init("PRO", .{}, &abuf);
+    try testing.expect((try pp.read(&a1.interface, &buf, .{ .peer = other, .trusted = &.{lb} })) == null);
+    try testing.expectEqual(@as(usize, 3), a1.interface.bufferedLen());
+    // The same prefix of the v2 signature.
+    var a2: std.Io.Reader = .fixed(sig[0..5]);
+    try testing.expect((try pp.read(&a2, &buf, .{ .peer = other })) == null);
+    try testing.expectEqual(@as(usize, 5), a2.bufferedLen());
+    // required still reports the missing header.
+    var a3: std.Io.Reader = .fixed("PRO");
+    try testing.expectError(error.Missing, pp.read(&a3, &buf, .{ .peer = other, .required = true }));
+    // A reader buffer of 3 bytes: not TooLarge for an untrusted peer ...
+    var rbuf: [3]u8 = undefined;
+    var cr = testkit.fuzz.ChunkedReader.init("PROXY TCP4 1.1.1.1 2.2.2.2 1 2\r\n", .{}, &rbuf);
+    try testing.expect((try pp.read(&cr.interface, &buf, .{ .peer = other })) == null);
+    // ... but still TooLarge for a trusted one.
+    var cr2 = testkit.fuzz.ChunkedReader.init("PROXY TCP4 1.1.1.1 2.2.2.2 1 2\r\n", .{}, &rbuf);
+    try testing.expectError(error.TooLarge, pp.read(&cr2.interface, &buf, trusted_opts));
+    // A trusted peer that stops inside the prefix stays Truncated.
+    var big: [pp.default_max_v2_len]u8 = undefined;
+    var t = testkit.fuzz.ChunkedReader.init("PRO", .{}, &big);
+    try testing.expectError(error.Truncated, pp.read(&t.interface, &buf, trusted_opts));
+    // A similar-looking protocol is not a header for anybody.
+    var h1: std.Io.Reader = .fixed("PROPFIND / HTTP/1.1\r\n");
+    try testing.expect((try pp.read(&h1, &buf, .{ .peer = other })) == null);
+    var h2: std.Io.Reader = .fixed("PROPFIND / HTTP/1.1\r\n");
+    try testing.expect((try pp.read(&h2, &buf, trusted_opts)) == null);
+    try testing.expectEqual(@as(usize, 21), h2.bufferedLen());
+}
+
 test "read: an IPv4-mapped peer matches an IPv4 prefix" {
     var buf: [pp.default_max_v2_len]u8 = undefined;
     var r: std.Io.Reader = .fixed("PROXY UNKNOWN\r\n");
@@ -549,6 +585,20 @@ test "writeV2: exact bytes" {
     w = .fixed(&out);
     try pp.writeV2(&w, .{ .command = .local }, "");
     try testing.expectEqualSlices(u8, &(sig ++ hex.literal("20000000")), w.buffered());
+}
+
+test "writeV2: a unix path with an embedded NUL does not round-trip, so it is refused" {
+    var out: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    const h: pp.Header = .{ .family = .unix_stream, .source = .{ .unix = "ab\x00cd" }, .destination = .{ .unix = "x" } };
+    try testing.expectError(error.InvalidHeader, pp.writeV2(&w, h, ""));
+    const h2: pp.Header = .{ .family = .unix_stream, .source = .{ .unix = "x" }, .destination = .{ .unix = "\x00" } };
+    try testing.expectError(error.InvalidHeader, pp.writeV2(&w, h2, ""));
+    // A clean path still round-trips.
+    const ok: pp.Header = .{ .family = .unix_stream, .source = .{ .unix = "/run/a" }, .destination = .{ .unix = "/run/b" } };
+    try pp.writeV2(&w, ok, "");
+    const p = try expectHeader(try pp.parse(w.buffered()));
+    try testing.expectEqualStrings("/run/a", p.h.source.?.unix);
 }
 
 test "writeV2: refusals" {

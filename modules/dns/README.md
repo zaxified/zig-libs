@@ -127,7 +127,8 @@ if (rcode != .no_error) return error.UpdateRefused;
 // TTL clamps, negative caching (RFC 2308), serve-stale (RFC 8767), per-key
 // failure backoff, a bounded LRU table; thread-safe. The cache owns its
 // Resolvers (made from the Options, at most `max_concurrent_lookups` = 8), so
-// misses on different names run in parallel.
+// misses on different names run in parallel. `gpa` must be thread-safe.
+// `cache.resetFailures()` clears every key's failure backoff (network is back).
 var cache = try dns.CachingResolver.init(gpa, io, .{}, .{ .stale_s = 3600 });
 defer cache.deinit();
 
