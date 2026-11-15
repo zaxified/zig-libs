@@ -10,3 +10,6 @@
   `src/ta_func/*.c`, `src/ta_common/*.c` (and the abstract layer files the archive needs) with your
   own `cc -O2 -I include -I src/ta_common -I src/ta_func -c`, never TA-Lib's CMake/configure, and
   `ar rcs libta-lib.a *.o`. Nothing foreign is vendored; the checkout stays outside the repository.
+- Wave I3 added the volume / volatility / price-transform / statistic / math-operator functions to the same oracle
+  (`seriesOf` in `interop.zig` names the input series of each function: o/h/l/c/v; two-series functions read close and open;
+  index-valued outputs are compared as integers). `LINEARREG_ANGLE` has a 2 ULP bound (libm `atan`, see SPEC).

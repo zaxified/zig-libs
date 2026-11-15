@@ -12,7 +12,12 @@ What was taken: algorithms and numerical recipes (source, not data), read from
 `src/ta_func/ta_{SMA,EMA,WMA,MA,MACD,MACDEXT,MACDFIX,RSI,BBANDS,VAR,STDDEV,
 TRANGE,ATR,NATR,STOCH,STOCHF,MAX,MIN,SUM}.c` and `include/ta_defs.h` of the
 `ta-lib-0.8.3` release tarball (sha256
-28b1179b178a0db15f3dad0d846ef77f18eb06db5dfc5b5a8ca153a9ea5d84e6). No TA-Lib
+28b1179b178a0db15f3dad0d846ef77f18eb06db5dfc5b5a8ca153a9ea5d84e6); wave I3 additionally
+`ta_{AD,ADOSC,CMF,EFI,EMV,KVO,MARKETFI,NVI,OBV,PVI,PVO,PVT,RVOL,VWAP,ADR,BBW,CVI,MASSI,
+PERCENTB,ROGERSSATCHELL,RVI,RVIR,AVGDEV,AVGPRICE,HA,MEDPRICE,TYPPRICE,WCLPRICE,BETA,
+CORREL,KURTOSIS,LINEARREG,LINEARREG_ANGLE,LINEARREG_INTERCEPT,LINEARREG_SLOPE,MEDIAN,
+PERCENTILE,PERCENTRANK,TSF,ADD,SUB,MULT,DIV,CUMSUM,MAXINDEX,MININDEX,MINMAX,
+MINMAXINDEX}.c`. No TA-Lib
 file is vendored, compiled or linked; nothing was copied verbatim except
 numeric constants and the structure of the recursions, rewritten in Zig.
 

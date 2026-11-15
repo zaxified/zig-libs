@@ -34,6 +34,12 @@ var bb = try ind.BbandsStream(f64).init(.{}, buf);
   process-global setting.
 - **Beyond TA-Lib:** `nan = .skip` on the recursive indicators (a NaN bar is ignored), `seed = .first`
   for EMA-based ones (pandas `ewm(adjust=False)`), no global state, no allocation on the batch path.
+- **Wave I3 (50 more functions):** volume (AD, ADOSC, CMF, EFI, EMV, KVO, MARKETFI, NVI, OBV, PVI, PVO, PVT, RVOL, VWAP),
+  volatility (ADR, BBW, CVI, MASSI, PERCENTB, ROGERSSATCHELL, RVI, RVIR), price transforms (AVGDEV, AVGPRICE, HA, MEDPRICE, TYPPRICE,
+  WCLPRICE), statistics (BETA, CORREL, KURTOSIS, LINEARREG and its ANGLE / INTERCEPT / SLOPE, MEDIAN, PERCENTILE, PERCENTRANK, STDDEV, TSF,
+  `variance`) and math operators (ADD, SUB, MULT, DIV, CUMSUM, MINMAX, MAXINDEX, MININDEX, MINMAXINDEX), all bitwise equal to TA-Lib
+  (LINEARREG_ANGLE within 2 ULP: `atan` of the C library). Multi-input streams take a struct, e.g.
+  `ind.AdStream(f64).init(.{})` then `update(.{ .high = h, .low = l, .close = c, .volume = v })`.
 - **Not built yet:** the moving-average types other than SMA, EMA, WMA (and the identity `.disabled`)
   answer `error.Unsupported`; the other 223 functions come in later waves. See SPEC.md.
 - **Model after:** TA-Lib C 0.8.3 (`kand`, Rust, is the speed candidate for a later benchmark).

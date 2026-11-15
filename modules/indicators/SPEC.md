@@ -89,6 +89,79 @@ Per-function notes from the C source (each read before it was ported):
   %D/slow lines are MAs cascading on the previous stage; the first stage reports from the last stage's first bar.
 - **MAX/MIN**: window extreme with index tracking and rescan on expiry (periods 2..); **SUM** period 2..
 
+### Volume, volatility, price-transform, statistic and math-operator functions (wave I3, `ind-volstat`)
+
+50 more functions, each read from its `ta_<NAME>.c` before it was ported, each with a batch form, a
+`<name>Lookback` and a streaming type, all verified bitwise against TA-Lib 0.8.3 (see Anchoring):
+
+- **Volume** (`src/volume.zig`): AD, ADOSC, CMF, EFI, EMV, KVO, MARKETFI, NVI, OBV, PVI, PVO, PVT, RVOL, VWAP.
+- **Volatility** (`src/volatility.zig`): ADR, BBW, CVI, MASSI, PERCENTB, ROGERSSATCHELL, RVI, RVIR.
+- **Price transform** (`src/pricetx.zig`): AVGDEV, AVGPRICE, HA, MEDPRICE, TYPPRICE, WCLPRICE.
+- **Statistic** (`src/statistic.zig`): BETA, CORREL, KURTOSIS, LINEARREG, LINEARREG_ANGLE, LINEARREG_INTERCEPT,
+  LINEARREG_SLOPE, MEDIAN, PERCENTILE, PERCENTRANK, STDDEV, TSF, VAR (named `variance`: `var` is a keyword).
+- **Math operators** (`src/mathops.zig`): ADD, SUB, MULT, DIV, CUMSUM, MINMAX, MAXINDEX, MININDEX, MINMAXINDEX.
+
+API additions (same rules as the seed set, see the design doc): OHLCV inputs are separate slices in the order of the
+TA-Lib prototype (`ad(T, high, low, close, volume, out)`), several outputs are one slice each (`kvo`, `ha`, `minmax`),
+the multi-input streaming types take a struct (`update(.{ .high = h, .low = l, .close = c, .volume = v })`; the
+single-series ones keep `update(x)`), functions without parameters have a `<name>Lookback()` without arguments and no
+`p`. Every function is a tuple core of `src/vs_kit.zig`: a by-value `step(src, in)` that reads older bars through
+`src.at(i)` (the caller's slices in batch, a ring of tuples in a caller buffer when streaming), so batch and
+streaming agree to the bit (tested for every function, `peek` included). Where the C keeps a ring of *derived* values
+(CVI's EMA, MASSI's ratio, EMV's and CMF's one-bar terms, ROGERSSATCHELL's terms) the value that leaves the window is
+recomputed from the input ring (CVI and MASSI run a second copy of the recursion `lag` bars behind): the same
+operations on the same inputs give the identical double, and nothing needs a scratch array. MEDIAN and PERCENTILE keep
+a sorted copy of the window and therefore take `gpa` (batch) or a larger caller buffer (stream, `bufLen`).
+
+Notes from the C sources:
+
+- **ADOSC**: both EMAs seed on the first A/D value; fast and slow are NOT swapped (ADOSC(10,3) = EMA10 - EMA3);
+  lookback `EMA_Lookback(slowest) +` the Auto offset `(15m + 3*sum_{k=1..16} min(M>>k, m) + 7)/8` (m, M = min/max period),
+  AUTO only. **KVO**: the 1997 factor `|2*(dm/cm) - 1|`, trend ties keep the previous trend, `cm` restarts on a trend change,
+  the three EMAs seed raw on the first volume force; lookback `1 + EMA_Lookback(longest)` + the Auto offset
+  `(21L+1)/2 - (10L+1)/2` (auto4) or `(33L+1)/2 - (19L+1)/2` (auto8). **EFI**: EMA (SMA seed) of `(close - previous close) * volume`.
+- **CMF / RVOL**: a window of zero volumes resets the sums to exactly 0 (the C's dead-window rule, #112). RVOL's baseline
+  excludes today (lookback = period). **EMV**: SMA of `(mid - previous mid) / (volume/divisor/range)`, 0 where range or the
+  box ratio is 0; divisor 1..3e37. **MARKETFI** `(high-low)/volume`, 0 for zero volume. **VWAP** is cumulative from the first
+  bar (the anchor is the caller's slice); a bar with a non-finite price or volume is skipped; 0 before any volume.
+  **NVI / PVI** are seeded at 1000, move only when the volume fell / rose and the previous close is not 0, and keep the last finite value.
+  **PVT**, **OBV**, **AD** as in the C. **PVO**: `(fast MA - slow MA) / slow MA * 100` of the volume, MA type default EMA, fast/slow
+  swapped when slow < fast; a slow MA within 1e-14 of 0 answers 0, and for the windowed MA types (SMA, WMA, TRIMA, HMA) so does a
+  window of `period` zero volumes.
+- **BBW / PERCENTB** are BBANDS' bands (same plan: MA of any supported type, population deviation, `fma` form when the two
+  multipliers differ); BBW = `(upper - lower)/middle*100` (0 for a zero middle), %B = `(x - lower)/(upper - lower)` (0.5 for a zero-width band).
+- **CVI**: `100 * ((E - E[-roc]) / E[-roc])` over the EMA of `high - low`, 0 for a lagged EMA of exactly 0; lookback `EMA_Lookback(p) + roc`.
+  **MASSI**: two stacked EMAs of `high - low` (the second starts at the callee's EMA lookback, which includes the unstable bars, so the
+  lookback shifts by 2u), ratio 1 for a zero second EMA, summed over `slow` bars. **ADR** = SMA of `high - low`.
+  **ROGERSSATCHELL**: `sqrt(A) * sqrt(mean of ln(H/C)ln(H/O) + ln(L/C)ln(L/O))`, a bar with a price <= 0 contributes 0, the running sum is
+  rebuilt below 1e-6 of its peak and every 32 windows; `sqrt(A)` stays a separate last factor. **RVI**: the variance step of `ta_VAR.c`
+  (anchored at bar 0), sigma credited to the up or down side by the close change, each side Wilder-smoothed with a mean seed, 50 when both are 0; lookback
+  `stddev - 1 + period - 1 + u` with `u` = bars, 10p (auto4), 19p (auto8; 0 at period 1). **RVIR** = `0.5 * (RVI(high) + RVI(low))`.
+- **AVGDEV** recomputes the window every bar (O(n*period), newest bar first, as the C). **HA**: haOpen `(O+C)/2` then `(haOpen+haClose)/2`,
+  haClose `(O+H+L+C)/4` (open first, unlike AVGPRICE's `((H+L)+C)+O`), haHigh/haLow by plain comparisons; lookback = unstable bars, AUTO 15 / 28.
+  **WCLPRICE** fuses the doubled close into the sum (`fma`).
+- **VAR** validates but ignores `nbdev` (as TA_VAR); **STDDEV** `sqrt(var) * nbdev` (`sqrt(var)` at exactly 1). **LINEARREG / SLOPE / ANGLE / INTERCEPT / TSF**
+  are one core: sums slid in O(1), rebuilt every 32 periods and when the departing value outweighs 100x the window's magnitude; `value = fma(m, p-1, b)`,
+  `forecast = fma(m, p, b)`, `angle = atan(m) * (180/pi)`. **CORREL / BETA / KURTOSIS** keep the C's shifted sums, re-anchor triggers
+  (1e-6 of the peak; BETA also when an outlier return leaves: 1000x), floors and clamps; KURTOSIS is G2 (period 4..10000), NaN for a flat window.
+  **MEDIAN / PERCENTILE / PERCENTRANK**: periods 2..10000; the median of an even window is the mean of the two central values; PERCENTILE is the nearest rank
+  `ceil(P*n/100)` clamped to 1..n; PERCENTRANK counts the previous `period` bars strictly below today (lookback = period).
+- **MINMAX / MAXINDEX / MININDEX / MINMAXINDEX**: periods 2..; the indices are absolute positions in the input slice (`outInteger`), a tie names the newest bar,
+  the lead of an index output is `no_index` (`maxInt(usize)`). **ADD / SUB / MULT / DIV / CUMSUM** are plain IEEE (division by zero gives inf / NaN as in C).
+
+Where this port differs from the C, and why:
+
+- LINEARREG_ANGLE calls libm's `atan`; TA-Lib uses the C library's, we use `std.math.atan`. Both are within an ULP of the exact value but round
+  differently, and the 180/pi scaling can stretch that to 2 ULP of the result (14 of 15066 compared values; the oracle's `ulp_bound` for this one
+  function is 2). Every other function, ROGERSSATCHELL's `log` and every `sqrt` included, is bitwise equal.
+- MEDIAN / PERCENTILE: TA-Lib picks linear or binary search by window size and has a 700-line optimised PERCENTILE kernel; we use one binary
+  search and the plain definition (equal values stay in age order, so zeros keep their sign, as the C documents). On finite data these agree bit for bit
+  (oracle); with NaN inputs the order inside the sorted copy is unspecified in both.
+- MINMAX: TA-Lib's batch uses a block (van Herk / Gil-Werman) scan, its streaming tier a per-bar automaton; we run the automaton of MAX / MIN for both,
+  so the sign of a tie between 0.0 and -0.0 can differ from the batch C (by reading, not measured). MAXINDEX & co tie to the newest bar like the C.
+- Per-call unstable period instead of a process-global one (as the seed set); `nan = .skip` is not offered on these functions.
+- The Auto levels (`unstable = .auto4 / .auto8`) are checked for ADOSC, EFI, KVO, CVI, MASSI, PVO(EMA), RVI, RVIR, HA, BBW and PERCENTB (EMA type).
+
 ## Limits and refusals
 
 - Periods 1..100000 (2.. where TA-Lib requires it: MAX, MIN, SUM, RSI, MACD fast and slow, BBANDS);
@@ -133,6 +206,13 @@ our own batch/stream definitions), the windowed functions with NaN input (TA-Lib
 unspecified; pinned by tests), the MA types after WMA, parameters beyond the grid, optimised modes.
 
 **Anchor grade:** class B · oracle EXTERNAL
+
+Wave I3 (the 50 functions above): the same oracle covers them, 4934 records in all (the seed set's 1999 plus 2935),
+f64 and `TA_S_*` f32 inputs, a parameter grid of defaults, edges, MA types SMA / EMA / WMA / DISABLED where a function takes one, out-of-range values
+(every one agrees on `TA_BAD_PARAM`), seeded random-walk OHLCV with flat-run and 1e-9-scaled kinds (volume 0..2000 with runs of zeros, zero on every flat bar), unstable
+0 / 3 / AUTO4 / AUTO8 where it matters, lengths 1, 2, period-1, period, period+1, lookback..lookback+2, 40, 300 and 5000. **Result: all compared values bitwise
+equal except LINEARREG_ANGLE (ULP bound 2, see above); no TA-Lib defect found.** Frozen vectors for these functions are in the same `talib_vectors.zig` (279 in all).
+Not covered: NaN inputs, MA types after WMA for PVO / BBW / PERCENTB (the coordinator widens the grid when those types exist), other toolchains.
 
 ## What is deliberately not done
 
