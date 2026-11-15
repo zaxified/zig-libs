@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** `bindingResponse` gets its first fuzz harness (`STUN_FUZZ_RESPOND`, 5,000,000 runs ReleaseSafe clean): requests with and without USERNAME, either MAC or both, attributes in front of and behind the MAC, server keys right and wrong, any tag, any buffer. The status of each response is computed in the harness from what the request was built with. 7 of 7 mutants of the credential checks, the covered-region rule and the tag fallback killed. Second read of the review round's production code found no defect.
 - **2026-11-03** — **BEHAVIOURAL, not breaking** (`looksLikeStun`; review round). ADDED, no existing signature or error set changed: `Message.addressCovered`, `mappedAddressCovered`, `uint32Covered` (an on-path attacker can append OTHER-ADDRESS & co. behind the MAC and the MAC still verifies; the plain accessors see them, the covered ones do not; README says which to use). `bindingResponse` takes `ResponderOptions.integrity_key_sha256` / `integrity_sha256_tag` (a bad tag length falls back to 32). `longTermKeySha256`, `userhash`, `Builder.addUserhash`, `Message.userhash`, `PasswordAlgorithm`, `Builder.addPasswordAlgorithm(s)`, `Message.passwordAlgorithm(s)`, `PasswordAlgorithmIterator`. BEHAVIOURAL: `looksLikeStun` now also requires the first byte < 4 and `20 + length == bytes.len` (RFC 7983, one datagram); it is two days old and unreleased. Tests: fuzz harnesses compare every accepted address with `address()` (XOR types and v6 included), reach per attribute type and a correct SHA-256 MAC; Python goldens for the 16-byte tag, USERHASH and the SHA-256 key; stack probe with a 100-byte key and a 16-byte tag (a mutant with `mi256_burn = 0` turns it red: dirty 1343 B); ctgrind `mi256` wired into `scripts/checks/ctgrind.sh` and pinned (stun pins re-taken, `mi`/`ltkey` output digests unchanged). Every previously "deferred" feature now has a verdict in SPEC.md.
 
@@ -30,7 +31,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   with another transaction id (or a non-STUN datagram) is discarded instead of failing at once;
   it is reported only if nothing better arrives before give-up. An error response now returns
   `error.ErrorResponse`. Every error name `query` could return before is still in its set, so
-  existing `switch`es compile (axp's included); with axp's `timeout_ms = 2000` a lost request is
+  existing `switch`es compile (the router-tool consumer's included); with the router-tool consumer's `timeout_ms = 2000` a lost request is
   now resent at 500 and 1500 ms. Self-review: the schedule saturates instead of overflowing at
   `max_requests = 255` (test added). Mutation: 31 mutants, all killed (1 after a new test).
 

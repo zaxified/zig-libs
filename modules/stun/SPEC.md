@@ -90,7 +90,7 @@ tag length is the only thing that varies, under its own dead-stack burn (`burn.m
 `InvalidTagLength` is not in `BuildError` (widening it would break exhaustive switches): the function
 returns `BuildError || error{InvalidTagLength}`. `looksLikeStun` is the RFC 7983 demultiplexing
 test (`decode` succeeds); `randomTransactionId(io)` draws a transaction id from `std.Io.randomSecure`
-and fails closed (`EntropyUnavailable`), which axp's fixed `0x42…` id does not.
+and fails closed (`EntropyUnavailable`), which the router-tool consumer's fixed `0x42…` id does not.
 
 ## Threat model / out of scope
 This is a client-side codec/utility, not a security boundary by itself: it does not authenticate a
@@ -133,7 +133,7 @@ last test).
 done: RFC 5780/ICE/TURN attribute types and typed address/uint32 accessors, covered-region variants of them, MESSAGE-INTEGRITY-SHA256 (build, verify, and in `bindingResponse`), `longTermKeySha256`, USERHASH, PASSWORD-ALGORITHM(S) codec, `looksLikeStun`, `randomTransactionId`.
 Rejected, each with its reason:
 - *Multiplexing `Agent`/`Client`* (pion): it owns timers, a socket and a goroutine per transaction, which is the caller's event-loop policy; this module is reentrant, so a caller runs one `query` or its own `Schedule` per transaction.
-- *TCP/TLS/DTLS transport*: a transport layer above a transport-agnostic codec; `tlsclient` and `dtls` are the modules that carry bytes, and `decode` already takes one framed message (RFC 8489 §6.2.2 framing is "20-byte header, then `length`"). `query` stays UDP because axp's one-shot needs nothing else.
+- *TCP/TLS/DTLS transport*: a transport layer above a transport-agnostic codec; `tlsclient` and `dtls` are the modules that carry bytes, and `decode` already takes one framed message (RFC 8489 §6.2.2 framing is "20-byte header, then `length`"). `query` stays UDP because the router-tool consumer's one-shot needs nothing else.
 - *SASLprep / OpaqueString (RFC 8265)*: needs the Unicode PRECIS property tables (hundreds of KB, paid by every consumer on an 8 MB-flash target) and belongs to a PRECIS module that does not exist in `ls modules`; credentials are ASCII in practice, and the `longTermKey*` / `userhash` doc comments state the precondition. Filing: a `precis` module is the owner of this gap (not scheduled).
 - *Server-side nonce/realm challenge flow* (RFC 8489 §9.2): nonce lifetime, the user database and the 401/438 policy are the application of a TURN/auth server; the pieces it needs (`longTermKey`, `longTermKeySha256`, `userhash`, `addErrorCode`, `addNonce`/`addRealm`, `addPasswordAlgorithms`) are all here.
 - *ICE and TURN*: separate protocols layered on STUN messages; the attribute types are named, the rest is their module (`turn`, `ice` do not exist and are not part of NAT discovery).
@@ -143,7 +143,7 @@ Speed rows outside the bench (`longTermKey*`, URI parsing, `bindingResponse`) ar
 - **2026-10-04:** retransmission, the Binding server and STUN URI parsing are **done**; the
   long-term mechanism is done as far as the key (`longTermKey`) — SASLprep (Unicode tables),
   SHA-256/PASSWORD-ALGORITHMS/USERHASH and a server-side nonce flow stayed deferred then (superseded by the 2026-11-03 verdicts above) until a TURN
-  consumer exists (axp only asks a server for its address).
+  consumer exists (the router-tool consumer only asks a server for its address).
 - **DONE 2026-10-04 — UDP retransmission in `query`** (survey 2026-09-30): RFC 8489 §6.2.1 has the client resend with RTO doubling; `pion/stun`'s Client does; here one datagram is sent and a lost packet is a `Timeout` (rg `retrans|rto|retry` over `src/root.zig` finds nothing). A user on a lossy link gets false failures. Effort: small. Fits CONVENTIONS §2.
 - **DONE 2026-10-04 — Server side (Binding responder)**, `bindingResponse` (survey 2026-09-30): `ztun` has one; needed for a self-hosted "what is my address" service. Effort: small for Binding only. Fits §2. (Currently listed as deferred, not as a deliberate refusal.)
 - **PARTLY DONE 2026-10-04 (`longTermKey`; see the bullet above for what stays deferred) — Long-term credential mechanism (RFC 8489 §9.2) + missing attribute types** (survey 2026-09-30): USERNAME/REALM/NONCE constants exist but no SASLprep/key derivation, PASSWORD-ALGORITHMS or USERHASH; ICE/TURN users (pion, coturn) need it. Effort: medium (SASLprep is the hard part, needs Unicode tables). Fits §2 (pure Zig).
