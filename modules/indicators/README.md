@@ -8,7 +8,7 @@ HMA, ALMA, MCGD, FRAMA, SWAK_BUTTER, SWAK_GAUSS, MAMA (moving averages; all of t
 trend state machines SAR, SAREXT, SUPERTREND, CKSP, ZIGZAG, and the 50 volume / volatility / price-transform / statistic /
 math-operator functions of the same wave (see below), and the cycle wave: the Hilbert-transform family HT_DCPERIOD / HT_DCPHASE /
 HT_PHASOR / HT_SINE / HT_TRENDLINE / HT_TRENDMODE, MAMA, the Swiss Army Knife rows SWAK_BP / SWAK_HP / SWAK_2PHP and the 15 math
-transforms (ACOS, ASIN, ATAN, CEIL, COS, COSH, EXP, FLOOR, LN, LOG10, SIN, SINH, SQRT, TAN, TANH). 119 of the 237 TA-Lib functions so far.
+transforms (ACOS, ASIN, ATAN, CEIL, COS, COSH, EXP, FLOOR, LN, LOG10, SIN, SINH, SQRT, TAN, TANH). The 61 candlestick patterns (`ind.candles`) bring it to 180 of the 237 TA-Lib functions so far.
 
 ```zig
 const ind = @import("indicators");
@@ -53,7 +53,10 @@ var bb = try ind.BbandsStream(f64).init(.{}, buf);
   `acos`, `asin`, `atan`, `ceil`, `cos`, `cosh`, `exp`, `floor`, `ln`, `log10`, `sin`, `sinh`, `sqrt`, `tan`, `tanh`. The Hilbert family runs a long warm-up
   (lookback 32 or 63 plus its unstable period); its streams are plain values. Against TA-Lib: SWAK_*, HT_TRENDLINE, HT_TRENDMODE, the exact and the exp / log / sin / cos /
   tan transforms are bitwise equal, the other functions are within a documented last-bit allowance (the C library's `atan` and hyperbolics round differently, SPEC.md).
-- **Not built yet:** the other 118 functions (momentum, candlesticks) come in later waves; MAVP has no streaming type. See SPEC.md.
+- **Candlestick patterns (61 functions, `ind.candles`):** every TA-Lib `CDL*` function: `ind.candles.cdldoji(f64, open, high, low, close, out, .{})` writes `i32` (0, +-100; +-80 and +-200 where TA-Lib does) and returns the lookback,
+  `cdldojiLookback`, `CdldojiStream(f64)` (`update(o, h, l, c)`, ring buffer from the caller); TA-Lib's process-global candle settings are the `settings` field of every call's params (`.default` is TA-Lib's table), the seven
+  penetration patterns also take `.penetration`. All 61 are bitwise equal to TA-Lib in the live oracle, with four settings presets and generated pattern-rich inputs. See SPEC.md.
+- **Not built yet:** the other 57 functions (momentum) come in later waves; MAVP has no streaming type. See SPEC.md.
 - **Model after:** TA-Lib C 0.8.3 (`kand`, Rust, is the speed candidate for a later benchmark).
 - **Platform:** any (pure logic). **Role:** util. **Concurrency:** reentrant (no shared state).
 - **Depends on:** nothing. Math is f64 for both `f32` and `f64` input.
