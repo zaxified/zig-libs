@@ -336,7 +336,7 @@ pub const FieldIterator = struct {
 /// Index of the first NUL byte of `s`, or `s.len`. Names and strings are short, where
 /// `std.mem.findScalar` (an out-of-line vector search) cost more than the scan (tools/bench.zig
 /// walk rows 1.2-1.4x -> 0.9-1.0x). Chosen by build mode, measured under qemu-user (a hint, wall
-/// time): ReleaseSmall (axp) takes the byte loop, which is the smallest code and on MIPS soft-float
+/// time): ReleaseSmall (the router-tool consumer) takes the byte loop, which is the smallest code and on MIPS soft-float
 /// as fast as any word version (40 vs 43 vs 52 ns per call); the speed modes take native-word
 /// SWAR, which beats the byte loop 1.5-2x on mips32 and arm and the u64 version on 32-bit targets.
 fn firstNul(s: []const u8) usize {

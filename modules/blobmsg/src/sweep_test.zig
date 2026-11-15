@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests (wave GY), findings BM-1 .. BM-5; see
-//! ~/CML/20261029-panic-sweep/blobmsg-sweep.report.md.
+//! the 2026-10-29 panic-sweep report for `blobmsg`.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
