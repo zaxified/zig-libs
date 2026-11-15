@@ -507,4 +507,5 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("goldens.zig");
     _ = @import("sweep_test.zig");
+    _ = @import("strict_test.zig");
 }

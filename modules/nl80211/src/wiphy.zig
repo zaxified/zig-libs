@@ -1218,3 +1218,142 @@ test "interface combinations and extended features: ceilings and replacement" {
     try testing.expect(!list[0].hasExtFeature(1));
     try testing.expect(!list[0].hasExtFeature(8));
 }
+
+// ── strict mutation re-audit (2026-11-15) ───────────────────────────────────
+
+fn bandMessage(gpa: std.mem.Allocator, m: *std.ArrayList(u8), attr_type: u16, data: []const u8) !void {
+    try codec.appendAttrU32(gpa, m, uapi.ATTR.WIPHY, 0);
+    const bands = try codec.nestBegin(gpa, m, uapi.ATTR.WIPHY_BANDS);
+    const band = try codec.nestBegin(gpa, m, 1);
+    try codec.appendAttr(gpa, m, attr_type, data);
+    try codec.nestEnd(m, band);
+    try codec.nestEnd(m, bands);
+}
+
+test "a band's HT and VHT flags are set by each of their capability attributes alone" {
+    const gpa = testing.allocator;
+    const Case = struct { attr: u16, len: usize, vht: bool };
+    const cases = [_]Case{
+        .{ .attr = uapi.BAND_ATTR.HT_CAPA, .len = 2, .vht = false },
+        .{ .attr = uapi.BAND_ATTR.HT_MCS_SET, .len = 16, .vht = false },
+        .{ .attr = uapi.BAND_ATTR.VHT_CAPA, .len = 4, .vht = true },
+        .{ .attr = uapi.BAND_ATTR.VHT_MCS_SET, .len = 8, .vht = true },
+    };
+    for (cases) |c| {
+        var p: Parser = .init(gpa);
+        defer p.deinit();
+        var m: std.ArrayList(u8) = .empty;
+        defer m.deinit(gpa);
+        const data: [16]u8 = @splat(0);
+        try bandMessage(gpa, &m, c.attr, data[0..c.len]);
+        try p.feed(m.items);
+        const list = try p.finish();
+        defer freeAll(gpa, list);
+        const b = list[0].band(1).?;
+        try testing.expectEqual(!c.vht, b.ht);
+        try testing.expectEqual(c.vht, b.vht);
+    }
+}
+
+test "HE MCS sets: 12 bytes are accepted and copied; a shorter later set clears the rest" {
+    const gpa = testing.allocator;
+    var p: Parser = .init(gpa);
+    defer p.deinit();
+    const mcs12 = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    const mcs4 = [_]u8{ 0xa, 0xb, 0xc, 0xd };
+    {
+        var m: std.ArrayList(u8) = .empty;
+        defer m.deinit(gpa);
+        try heMessage(gpa, &m, &.{.{ 0, .station, &mcs12 }});
+        try p.feed(m.items);
+    }
+    {
+        var q: Parser = .init(gpa);
+        defer q.deinit();
+        var m: std.ArrayList(u8) = .empty;
+        defer m.deinit(gpa);
+        try heMessage(gpa, &m, &.{.{ 0, .station, &mcs12 }});
+        try q.feed(m.items);
+        const l = try q.finish();
+        defer freeAll(gpa, l);
+        const s = l[0].band(1).?.heSets()[0];
+        try testing.expectEqual(@as(u8, 12), s.mcs_len);
+        try testing.expectEqualSlices(u8, &mcs12, s.mcs_set[0..12]);
+    }
+    {
+        var m: std.ArrayList(u8) = .empty;
+        defer m.deinit(gpa);
+        try heMessage(gpa, &m, &.{.{ 0, .station, &mcs4 }});
+        try p.feed(m.items);
+    }
+    const list = try p.finish();
+    defer freeAll(gpa, list);
+    const s = list[0].band(1).?.heSets()[0];
+    try testing.expectEqual(@as(u8, 4), s.mcs_len);
+    try testing.expectEqualSlices(u8, &mcs4, s.mcs_set[0..4]);
+    for (s.mcs_set[4..]) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "interface combinations are replaced, not appended, by a later message; ext features within the ceiling are not truncated" {
+    const gpa = testing.allocator;
+    var p: Parser = .init(gpa);
+    defer p.deinit();
+    for ([_]u16{ 2, 1 }) |n| {
+        var m: std.ArrayList(u8) = .empty;
+        defer m.deinit(gpa);
+        try codec.appendAttrU32(gpa, &m, uapi.ATTR.WIPHY, 0);
+        const nest = try codec.nestBegin(gpa, &m, uapi.ATTR.INTERFACE_COMBINATIONS);
+        var i: u16 = 0;
+        while (i < n) : (i += 1) {
+            const c = try codec.nestBegin(gpa, &m, i);
+            try codec.appendAttrU32(gpa, &m, uapi.IFACE_COMB.MAXNUM, 1);
+            try codec.nestEnd(&m, c);
+        }
+        try codec.nestEnd(&m, nest);
+        try p.feed(m.items);
+    }
+    var e: std.ArrayList(u8) = .empty;
+    defer e.deinit(gpa);
+    try codec.appendAttrU32(gpa, &e, uapi.ATTR.WIPHY, 0);
+    const full: [max_ext_feature_bytes]u8 = @splat(0);
+    try codec.appendAttr(gpa, &e, uapi.ATTR.EXT_FEATURES, &full);
+    try p.feed(e.items);
+    var nm: std.ArrayList(u8) = .empty;
+    defer nm.deinit(gpa);
+    try codec.appendAttrU32(gpa, &nm, uapi.ATTR.WIPHY, 0);
+    const nm_buf: [max_wiphy_name]u8 = @splat('x');
+    try codec.appendAttrString(gpa, &nm, uapi.ATTR.WIPHY_NAME, &nm_buf);
+    try p.feed(nm.items);
+    const list = try p.finish();
+    defer freeAll(gpa, list);
+    try testing.expectEqual(@as(usize, 1), list[0].ifaceCombinations().len);
+    try testing.expect(!list[0].capabilities_truncated);
+    try testing.expectEqual(@as(usize, max_wiphy_name), list[0].name().len);
+
+    var q: Parser = .init(gpa);
+    defer q.deinit();
+    var bad: std.ArrayList(u8) = .empty;
+    defer bad.deinit(gpa);
+    try codec.appendAttrU32(gpa, &bad, uapi.ATTR.WIPHY, 0);
+    const bad_buf: [max_wiphy_name + 1]u8 = @splat('x');
+    try codec.appendAttrString(gpa, &bad, uapi.ATTR.WIPHY_NAME, &bad_buf);
+    try testing.expectError(error.BadLength, q.feed(bad.items));
+}
+
+test "an interface-type number past 31 in the supported-iftypes nest is ignored, not shifted" {
+    const gpa = testing.allocator;
+    var p: Parser = .init(gpa);
+    defer p.deinit();
+    var m: std.ArrayList(u8) = .empty;
+    defer m.deinit(gpa);
+    try codec.appendAttrU32(gpa, &m, uapi.ATTR.WIPHY, 0);
+    const off = try codec.nestBegin(gpa, &m, uapi.ATTR.SUPPORTED_IFTYPES);
+    try codec.appendAttr(gpa, &m, @backingInt(uapi.Iftype.station), &.{});
+    try codec.appendAttr(gpa, &m, 32, &.{});
+    try codec.nestEnd(&m, off);
+    try p.feed(m.items);
+    const list = try p.finish();
+    defer freeAll(gpa, list);
+    try testing.expect(list[0].supportsIftype(.station));
+    try testing.expect(!list[0].supportsIftype(.ap));
+}
