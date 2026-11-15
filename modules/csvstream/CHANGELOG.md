@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GN sweep (20 mutants over the sweep diff): 18 killed (3 by new tests: comment-line counter saturation, doubled read clamped to `max_record_len` and to the file's remainder), 2 equivalent (a capacity sum bounded by the stat remainder / 64 KiB probe; a u64 diagnostic sum). Not a whole-module mutation score.
 - **2026-10-30** — **CONSUMER-VISIBLE:** a refill that finds no record end doubles the next read within the same `nextChunk` call (an unclosed quote with a small `chunk_size` and a large `max_record_len` rescanned ~M²/chunk_size bytes; now O(M log M)); normal chunk boundaries unchanged. The read after the file's stat size asks for at most 64 KiB, so a huge `chunk_size` no longer fails with `OutOfMemory` at EOF. **Fixes (no-panic sweep + blind review, § GN):** `chunk_size` near `maxInt` wrapped the capacity sum; `SpanScanner.scan` with `start` past the end sliced out of range; `LineIterator` counters saturate. New diagnostic field `ChunkReader.scanned`.
 - **2026-10-20** — Review fixes: `nextFieldsOpts` honours a caller `strict = true` and documents which
@@ -51,7 +52,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   its first physical line, flagged `unbalanced_quote`. Only a field-start quote opens a quoted field.
   New `LineSlice.spanned`, and the scanner itself as `SpanScanner`. `countFields` is now exported from
   the module root (it was `pub` in `line.zig` only, though the docs pointed callers at it). csv-spectrum:
-  11 of 12 fixtures now asserted in `.span` mode (was 8 of 12). For bxp's K6 `csv_multiline_quotes`.
+  11 of 12 fixtures now asserted in `.span` mode (was 8 of 12). For the build-tool consumer's K6 `csv_multiline_quotes`.
 
 - **2026-09-18** — **New `freeFields(line, fields, alloc)`** (additive). A split's
   escaped-quote fields are copies from `alloc`, and until now a caller with a
@@ -67,7 +68,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   chunk_size` (twice the chunk size by default), now `ChunkReader.capacityBound()`.
   The buffer's growth is capped at that bound; `ensureUnusedCapacity`'s ~1.5x growth
   could exceed it when a read ended just under it. Read sizes are unchanged, so every
-  chunk is byte-for-byte what it was (checked against `bxp`: its unit tests and all
+  chunk is byte-for-byte what it was (checked against the build-tool consumer: its unit tests and all
   10 dataset regressions, 14 output files identical). The SPEC's "a pathologically
   long line is not independently bounded" was stale since `RecordTooLong`.
 

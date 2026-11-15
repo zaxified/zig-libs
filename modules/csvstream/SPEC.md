@@ -178,22 +178,22 @@ after the record (bump allocator), long rows failing both arity checks, bytes ap
 Owner rule (2026-10-16): S2 = every SUBSTANTIAL feature of the leading competitors is present or
 deliberately excluded with a reason; speed rows go to Backlog, not a condition. Sources read:
 Go `encoding/csv` (BSD-3, stdlib; docs), rust-csv `csv` + `csv-core` (MIT OR Unlicense, source
-cloned 2026-10-20), Python `csv` (PSF, docs). bxp column: what `bxp` actually imports (verified with
-`rg`: only `LineIterator`, `LineSlice`, `ChunkReader`, `splitFields`, `splitFieldsOpts`; bxp does its own
-header / quote / decimal / encoding policy on top, so none of the R items is a bxp need unless stated).
+cloned 2026-10-20), Python `csv` (PSF, docs). The build-tool consumer column: what the build-tool consumer actually imports (verified with
+`rg`: only `LineIterator`, `LineSlice`, `ChunkReader`, `splitFields`, `splitFieldsOpts`; the build-tool consumer does its own
+header / quote / decimal / encoding policy on top, so none of the R items is a build-tool consumer need unless stated).
 Our existing features that already match the field: delimiter + quote bytes, borrowed (zero-copy,
 reuse-by-design) records, multi-line quoted fields (`.span`), lazy quotes, BOM, byte offsets, arity
 check, writer with CRLF/LF, header lookup.
 
-| # | Feature | Who has it | Effort | Recommendation | bxp |
+| # | Feature | Who has it | Effort | Recommendation | Consumer |
 |---|---|---|---|---|---|
 | R1 | Comment lines (`Comment` char: a line starting with it is skipped) | Go `Comment`; rust `comment(Some(b))` + csv-core; not Python | S | **DONE 2026-10-20** — do (reader option on `LineIterator`/`StreamReader`; must not apply inside a `.span` quote) | no |
-| R2 | Trim whitespace around fields (`TrimLeadingSpace`; rust `Trim::{Fields,Headers,All}`; Python `skipinitialspace`) | Go, rust, Python | S-M (a leading space before an opening quote must still open the quoted field, so the span scanner's field-start rule needs the option too) | **DONE 2026-10-20** — do (leading + trailing, `SplitOptions.trim`) | no (bxp trims at access time) |
+| R2 | Trim whitespace around fields (`TrimLeadingSpace`; rust `Trim::{Fields,Headers,All}`; Python `skipinitialspace`) | Go, rust, Python | S-M (a leading space before an opening quote must still open the quoted field, so the span scanner's field-start rule needs the option too) | **DONE 2026-10-20** — do (leading + trailing, `SplitOptions.trim`) | no (the build-tool consumer trims at access time) |
 | R3 | Separate escape char (`\"` dialects) and `doublequote = false` (reader) | rust `escape` + `double_quote`; Python `escapechar` + `doublequote`; csv-core; not Go | M (scanner, `splitFields`, `LineIterator`, span scanner) | **DONE 2026-10-20** — do (already open backlog item, now every competitor but Go has it) | no |
 | R4 | Writer quote styles: Always / Necessary (today) / NonNumeric / Never | rust `QuoteStyle`; Python `QUOTE_ALL/NONNUMERIC/NONE/STRINGS/NOTNULL`; Go: Necessary only (+ it also quotes a field with a leading space, verify against ours) | S | **DONE 2026-10-20** as `WriteOptions.quote_style` (necessary/always/never; NonNumeric not built, it needs a caller "is number" hint) — do (`WriteOptions.quoting`; `NonNumeric` needs a caller-supplied "is number" hint, so ship Always/Necessary/Never first) | no |
 | R5 | Writer escape char / `doublequote = false` | rust, Python; not Go | S after R3 | **DONE 2026-10-20** — do together with R3 | no |
 | R6 | Strict parse errors with position: bare quote in a non-quoted field, extraneous/missing quote (Go `ErrBareQuote`/`ErrQuote` when `LazyQuotes` is off; Python `strict`) | Go (default), Python | S-M (reader option `strict`; the flag `unbalanced_quote` exists, but a bare quote mid-field is silently literal) | **DONE 2026-10-20** — do (opt-in `strict`, default stays lazy, same rationale as the default-mode deviation) | no |
-| R7 | Field-count enforcement in the reader (Go `FieldsPerRecord` 0 / n / -1; rust `flexible(false)` is the default and errors `UnequalLengths`) | Go, rust | S (`FieldCheck` exists but is only the `.span` fallback heuristic; add `error.FieldCountMismatch` as a reader policy, with record number) | **DONE 2026-10-20** — do | no (bxp validates arity itself) |
+| R7 | Field-count enforcement in the reader (Go `FieldsPerRecord` 0 / n / -1; rust `flexible(false)` is the default and errors `UnequalLengths`) | Go, rust | S (`FieldCheck` exists but is only the `.span` fallback heuristic; add `error.FieldCountMismatch` as a reader policy, with record number) | **DONE 2026-10-20** — do | no (the build-tool consumer validates arity itself) |
 | R8 | Position API beyond the byte offset: line number, record number, column (Go `FieldPos`/`InputOffset`; rust `Position{byte,line,record}`; Python `line_num`) | Go, rust, Python | S (`LineSlice` gets `line`/`record`; both already derivable from the scanner) | **DONE 2026-10-20** — do | no |
 | R9 | Header row integrated into the reader (rust `has_headers`/`headers()`/`set_headers`; Python `DictReader`/`DictWriter` field names) | rust, Python | S (`StreamReader.readHeader()` returning a `Header`, optional; today `Header.init` over a manual first row) | **DONE 2026-10-20** — do | no |
 | R10 | Typed record to/from struct (rust serde `deserialize`/`serialize`; Go third-party `gocsv`/`csvutil`; Python `DictReader` is the dict analogue) | rust (first-class), Go (3rd party) | M (comptime reflection over `nextFields` and `writeRecord`, `Header` column names, `coerce`) | do-later (existing item; real value but not needed for parity with Go's stdlib) | no |
@@ -201,7 +201,7 @@ check, writer with CRLF/LF, header lookup.
 | R12 | Dialect sniffing (delimiter, quote, header guess) | Python `Sniffer`; DuckDB-style tools | M | do-later (nobody in the Go/Rust core does it; heuristic, off the parity path) | no |
 | R13 | Custom record terminator (rust `Terminator::Any(b)`; Python bare `\r`; csv-core) and multi-byte delimiter (Go `Comma` is a rune) | rust, Python, Go | M (record boundary = `\n` is what makes every chunk cut safe) | not-doing, reason: the `\n` record boundary is the module's chunk-cut and safe-resync design; a bare-CR file is re-terminated by the caller (or read with `.span` where CR stays inside the field). Delimiter stays one byte; a UTF-8 multi-byte delimiter is rare | no |
 | R14 | Incremental push parser over arbitrary partial buffers with no line guarantee (csv-core `read_record` state machine) | csv-core only | L | not-doing, reason: `ChunkReader` + `StreamReader` already bound memory over any `std.Io.Reader`; a resumable DFA duplicates the span scanner | no |
-| R15 | Input transcoding (UTF-16/Latin-1 CSV): Python via `open(encoding=)`; Go/rust through wrapper readers | all via composition | S | not-doing, reason: compose with the sibling `encoding` module (bxp does, in `pipeline.zig`) | indirectly |
+| R15 | Input transcoding (UTF-16/Latin-1 CSV): Python via `open(encoding=)`; Go/rust through wrapper readers | all via composition | S | not-doing, reason: compose with the sibling `encoding` module (the build-tool consumer does, in `pipeline.zig`) | indirectly |
 | R16 | Writer conveniences: `WriteAll`, `Flush` | Go | -- | not-doing, reason: `std.Io.Writer` owns buffering and flush; `writeRecord` per row is the API | no |
 | R17 | SIMD/accelerated scanning (zsv, csv-zero, simdcsv-style) | zsv (C, MIT), csv-zero (Zig) | M-L | partly DONE 2026-10-20 (32-byte vector event search in the `.span` scanner, the lazy record cut and quoted fields: multiline 2.37→0.89×, quoted 1.27→0.64× Go) — do-later, speed row (see P bench) | speed only |
 
@@ -239,31 +239,31 @@ automatic in `StreamReader.next`), header-row capture (`Header`), typed field co
 output), and field-count/arity validation (`Header.validateArity`/`validateArity`).
 
 - ~~**Multi-line quoted fields — design proposal (2026-09-30)**~~ — **DONE 2026-09-30** as `.span` mode
-  (see "Design & invariants"); the proposal is kept below as the record of why. bxp's K6 switch
+  (see "Design & invariants"); the proposal is kept below as the record of why. The build-tool consumer's K6 switch
   `csv_multiline_quotes` maps to `StreamReader.Options.quoted_newlines = .span` (+ `field_check =
   .first_record`). Proposal, as written before the build: replacing the survey item of the
-  same day. bxp tracks the consumer side as roadmap K6 ("opt-in `csv_multiline_quotes`").
+  same day. The build-tool consumer tracks the consumer side as roadmap K6 ("opt-in `csv_multiline_quotes`").
   **Why it has looked unsolvable.** Three things collide:
   1. **Chunk boundaries.** Every `\n` being a record boundary is what lets `ChunkReader` cut a
      chunk at its last `\n` without parsing.
   2. **Ambiguity.** An unbalanced quote is genuinely ambiguous: it is either the start of a
      multi-line field or a stray byte, and no local rule tells them apart.
-  3. **Silent row loss.** The one time bxp spanned lines, IMDb `title.basics.tsv` (12.5 M rows,
+  3. **Silent row loss.** The one time the build-tool consumer spanned lines, IMDb `title.basics.tsv` (12.5 M rows,
      2 stray quotes 255 866 lines apart) lost ~256 k rows silently, and the open quote grew the
      buffer without bound. Lazy quotes (2026-06-04) fixed that by giving up spanning.
 
   **Proposal: spanning as an opt-in mode here, the policy switch in the consumer.**
-  - *Where.* The capability goes here, not in bxp. The parser and `ChunkReader` live in this
+  - *Where.* The capability goes here, not in the build-tool consumer. The parser and `ChunkReader` live in this
     module, every competitor (Go `encoding/csv`, Python `csv`, rust-csv, both Zig peers) reads
-    such fields, and a second parser in a consumer is the dual-parser anti-pattern bxp already
-    removed once. bxp exposes it as the config switch `csv_multiline_quotes` (K6). The default
-    stays lazy quotes, which is bxp's safety choice and this module's default.
+    such fields, and a second parser in a consumer is the dual-parser anti-pattern the build-tool consumer already
+    removed once. The build-tool consumer exposes it as the config switch `csv_multiline_quotes` (K6). The default
+    stays lazy quotes, which is the build-tool consumer's safety choice and this module's default.
   - *API.* `Options.quoted_newlines: enum { end_record, span } = .end_record`, honoured by
     `LineIterator`, `ChunkReader` and `StreamReader`.
   - *Chunking in `.span` mode.* `ChunkReader` carries the quote state across chunks and cuts at
     the last newline that lies **outside** quotes: a forward scan (memchr for `"` and `\n`)
     instead of `lastIndexOfScalar`. This costs no parallelism, because chunks are cut serially
-    today anyway; bxp's workers evaluate records inside chunks that are already cut
+    today anyway; the build-tool consumer's workers evaluate records inside chunks that are already cut
     (`pipeline.zig`).
   - *Resolving the ambiguity: bounded lookahead with a local fallback.* A quoted field may
     span at most `max_quoted_lines` physical lines (default e.g. 64) and at most
@@ -272,7 +272,7 @@ output), and field-count/arity validation (`Header.validateArity`/`validateArity
     `unbalanced_quote`, and a warning is emitted. The damage an unbalanced quote can do is then
     capped at one record's look-ahead, never 256 k rows, and memory stays bounded.
   - *Second check.* When a `Header` is known, a spanned record whose field count differs from
-    the header's also falls back to the lazy reading. bxp found that a field-count check alone
+    the header's also falls back to the lazy reading. The build-tool consumer found that a field-count check alone
     does not catch a merge, but together with the line cap it rejects the re-balanced pair that
     fooled it.
   - *Tests.* The IMDb shape (two stray quotes far apart) must give 1:1 rows plus 2 warnings in

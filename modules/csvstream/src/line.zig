@@ -404,7 +404,7 @@ pub const FieldCheck = union(enum) {
 ///
 /// **Why a bound.** An opening quote is ambiguous: the start of a multi-line
 /// field, or a stray byte. No local rule tells them apart, and reading a stray
-/// quote as an opener swallows everything up to the next stray quote — bxp
+/// quote as an opener swallows everything up to the next stray quote — the build-tool consumer
 /// once lost ~256 k rows of IMDb `title.basics.tsv` to two of them. So a
 /// quoted field may contain at most `max_quoted_lines` newlines and the record
 /// at most `max_record_len` bytes; past either, the opening quote is declared
@@ -1741,7 +1741,7 @@ test "span: a quote inside an unquoted field is literal and opens nothing" {
 }
 
 test "span: the IMDb shape — two stray field-start quotes far apart give 1:1 rows and two flags" {
-    // bxp's `title.basics.tsv` failure: stray quotes 255 866 lines apart. Here
+    // the build-tool consumer's `title.basics.tsv` failure: stray quotes 255 866 lines apart. Here
     // 200 apart, well past the 64-line cap.
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
