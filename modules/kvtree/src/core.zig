@@ -140,7 +140,7 @@ pub const RecoverError = error{
 /// ⛔ A fresh arena per commit was the old shape. Once a commit's scratch
 /// outgrows the general-purpose allocator's size classes, every chunk is an
 /// `mmap` on the way in and a `munmap` on the way out, and every page of it
-/// faults again on the next commit. Measured in qap's `wdur` lane (durable
+/// faults again on the next commit. Measured in the web-server consumer's `wdur` lane (durable
 /// PUT, 2026-09-30): 1.69 minor faults per request (0.30 at the 09-28 pin,
 /// before this module's 09-29 changes grew the scratch), ~5 k kernel
 /// instructions each; retained, 0.001, and -7 % instructions per request.

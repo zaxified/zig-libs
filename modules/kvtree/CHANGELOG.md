@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Tests only: three more from the same mutation run: a branch of the bulk loader filled with its slots counted, a freelist chain that rots after open (count and entry at the high water) refused by the next commit, and a merge across siblings of different kinds ending in `Corrupt`.
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Tests only: 29 new tests from a whole-module mutation run over `root.zig`, `core.zig`, `format.zig`, `pager.zig` and `bulk.zig` (598 schemata mutants; the first run left 130 alive). They pin the exact geometry limits of node accessors and the `*ViewSafe` checks, `Meta.decode` with a valid CRC, `ovfPages` at exact multiples, balanced-split cuts and ties, the strict order check of the bulk loader and its bounded memory, the meta-slot alternation, open-time refusal of ids outside the version (root, branch children, overflow chains, freelist head and entries, full and two-page freelist chains), borrowed pages given back on every error and scan, cursor state after a failed `first`/`last`/step, every failed write, sync and truncate of a commit, and `copyTo` temp-file handling.
@@ -48,7 +49,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   fresh `ArenaAllocator` over the `Db`'s allocator per commit and freed it; once the scratch
   outgrew the allocator's size classes every chunk was an `mmap`/`munmap` pair and its pages
   faulted again on every commit. `Db` now owns `commit_scratch`, reset after each commit with
-  `retain_with_limit = commit_scratch_retain` (1 MiB). Measured in qap's durable PUT lane: minor
+  `retain_with_limit = commit_scratch_retain` (1 MiB). Measured in the web-server consumer's durable PUT lane: minor
   faults per request 1.69 -> 0.001, instructions per request -7 %, requests/s +4.7 %. No API
   change for `Db` users; `core.commit` takes the arena instead of an allocator.
 
@@ -71,7 +72,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-29** — Documented (and pinned by pagecache's interleaving tests): reads of the
   committed version (`get`, `getRef`, `snapshot`, `cursor`) are safe while a commit of the same
   `Db` is parked in its storage I/O on another fiber of the owner thread; a parked unpinned read
-  must end before the next commit begins. What qap's `Serial` needs to serve reads while a
+  must end before the next commit begins. What the web-server consumer's `Serial` needs to serve reads while a
   commit's fsync is in flight (research register H4).
 
 - **2026-09-28** — **NO CONSUMER-VISIBLE CHANGE:** the meta-page CRC-32 comes from the new
@@ -79,7 +80,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   unchanged. New dependency: `crc32`.
 
 - **2026-09-28** — **BEHAVIOURAL, not breaking: a node left empty by deletes leaves the tree**
-  (found adopting `tsdb` in ttydesk). A commit that empties a leaf drops it from its parent with its
+  (found adopting `tsdb` in the terminal-UI consumer). A commit that empties a leaf drops it from its parent with its
   separator, a branch left with no children goes too, and the root collapses while it is a branch
   with a single child; the pages go to the freelist under the usual reclaim gate. Before, emptied
   leaves stayed in the tree for good, so a key range that only moves forward (tsdb retention)
@@ -90,13 +91,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-22** — **`Txn.getRef`: a read inside a transaction without the
   copy.** A buffered change is lent from the txn's arena, anything else from
   the base tree exactly as `Db.getRef` lends it; release before the txn is
-  consumed. qap's kv-store checks `If-Match` inside a batch by hashing the
-  current value, and paid an allocation + copy + free per PUT for it (qap
+  consumed. The web-server consumer's kv-store checks `If-Match` inside a batch by hashing the
+  current value, and paid an allocation + copy + free per PUT for it (the web-server consumer
   perf audit F7). **BREAKING** only for code that reads `ValueRef.ref`
   directly: it is now `?kv.Storage.Ref` (null = a buffered value).
   `ValueRef.bytes` and `release` are unchanged.
 - **2026-09-21** — **Commit path halved: builders borrow, pages zero by vector.**
-  A qap perf audit profiled a PUT through `Serial` + kvtree on tmpfs and found
+  A web-server consumer perf audit profiled a PUT through `Serial` + kvtree on tmpfs and found
   67 % of the user-side cost in `applyRec` and 19 % in `compiler_rt.memset`:
   `@memset(page, 0)` without libc stores one byte at a time (5 600
   instructions per 4 KiB page), and every leaf or branch on the root→leaf path
@@ -106,7 +107,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   builders borrow from the page and the change list (the one copy left is the
   separator a split promotes to its parent), the branch rebuild reads the base
   page in one pass, and a node that does not split takes no lists. Measured
-  end to end (qap `examples/kv-store`, 128 B PUTs, one worker, tmpfs, c=8,
+  end to end (the web-server consumer `examples/kv-store`, 128 B PUTs, one worker, tmpfs, c=8,
   two runs each): **94 100 → 47 100 user instructions per PUT**, kernel
   150 k → 124 k, 13.5 k → 18.5 k req/s. Page images are byte-identical.
   Contract change: a builder's inputs must outlive its `encode`; the split
@@ -118,7 +119,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   nothing; `release` hands the page back. Held across a commit that rewrites
   the key, it keeps the bytes it was lent (pagecache parks them). A store that
   cannot lend answers `error.CannotLend` -- never a silent copy, the rule
-  `preadRef` keeps. For a server whose read path must not allocate (qap's
+  `preadRef` keeps. For a server whose read path must not allocate (the web-server consumer's
   `Dataset.lookup`). Tests here (CannotLend) and in pagecache (same bytes as
   `get` over 400 keys, stable across an overwrite, every borrow returned; red
   when `release` does not release).

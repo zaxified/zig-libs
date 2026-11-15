@@ -197,7 +197,7 @@ pub fn overflowData(page: *const [page_size]u8) *const [ovf_data]u8 {
 /// Not `@memset`: without libc that lowers to `compiler_rt.memset`, which in
 /// Zig 0.16 stores ONE BYTE at a time -- measured at ~5 600 instructions per
 /// 4 KiB page in ReleaseFast, 19 % of the user-side cost of a `kvtree` commit
-/// (qap perf audit, 2026-09-21). The vector loop is ~170. Volatile so LLVM's
+/// (the web-server consumer perf audit, 2026-09-21). The vector loop is ~170. Volatile so LLVM's
 /// loop-idiom pass cannot fold the loop back into that same `memset` call.
 pub fn zeroPage(page: *[page_size]u8) void {
     const V = @Vector(32, u8);
