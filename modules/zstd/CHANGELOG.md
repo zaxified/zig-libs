@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GL sweep (34 mutants over the sweep diff, ReleaseSafe schemata): 31 killed, 3 equivalent (argued: `checkContinuity`'s `broken` guard is unreachable since the zero-byte-write fix; dictionary FSE table logs ≤ 9 keep `freqFromFse` within the scale); 5 new tests in `src/sweep_*_test.zig`, among them a deterministic dictionary with a 12-bit Huffman code compressed at levels 16/19/22. Not a whole-module mutation score.
 - **2026-10-29** — **Behaviour change (fix):** no-panic sweep + blind review (§ GL). `Decompressor.decompress` with overlapping `dst`/`src` is a checked panic (was an aliased copy; in-place decoding is not supported, `decompressionMargin` is sizing only). `FrameWriter` / `StreamWriter` with an empty buffer work (unbuffered / own 128 KiB buffer) instead of an assert. Inputs that crashed now return existing errors: caller sequences with offset 2^32-3 (`ExternalSequencesInvalid`), `stable_in_buffer` with `pos` below the held-back input (`StabilityConditionNotRespected`), `compressSequencesAndLiterals` literals over the block size (`CannotProduceUncompressedBlock` earlier than libzstd), `copyFrom` onto itself (`StageWrong`), `decompressContinue` with an empty src after a frame (`SrcSizeWrong`), `SeekableStream.compressStream` with `pos` past `src` (`InvalidBuffer`), zdict content ≥ 4 GiB − 128 KiB (`DictionaryCreationFailed`). Fixed: a corrupt offset after the `DecompressStream` ring wraps (aliased `@memcpy`); a crafted full dictionary crashing the optimal parser (levels 16+); a zero-byte `decompressContinue` write moving the history (later blocks read bytes outside `dst`); dictionary trainer helpers dividing by zero; optimizer threads capped at 256; overflow guards in `readNCount`, zstdmt sizing (32-bit), seekable frame sizes. Output bytes unchanged for valid input.
 - **2026-10-27** — **Docs:** two speed leads measured and dropped (the prefetching sequence loop's rule re-measured over the assembly loop; libzstd's cmov address select in the double-fast match finder): findings in SPEC.md. No code change.
@@ -261,7 +262,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   sequences and more) are pinned by frames built byte by byte.
 
 - **2026-09-26** — `StreamWriter` serves frame after frame (SPEC backlog
-  Z14, asked for by qap): `reset(output, opts)` starts the next frame on
+  Z14, asked for by the web-server consumer): `reset(output, opts)` starts the next frame on
   the same stream, keeping its workspace (`ZSTD_CCtx_reset`);
   `initScratch` takes the caller's scratch buffer, and `initStatic` the
   caller's workspace, so nothing is allocated at all. The bytes do not
