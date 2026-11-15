@@ -6,7 +6,7 @@
 
 **Scope:** unsurveyed
 
-**Audit:** review none · mutation 2026-11-15 (50/56, 1 eq) · src 0c879690787ee1b4
+**Audit:** review none · mutation 2026-11-15 (50/56, 6 eq) · src 0c879690787ee1b4
 
 **Hardening:** fuzz n/a — the only input is a fixed-size kernel record read from a signalfd limited to the set; no parser · ct n/a — no secret is read or computed
 
@@ -91,7 +91,7 @@ injection it would need: the `else` arm of the failure mapping (an errno other t
 syscall fault injector); `EINTR` retries in `poll` and `read` (neither call can return `EINTR` on a ready,
 non-blocking-timeout fd; needs seccomp errno injection); `EAGAIN` after a ready `poll` (needs a second reader
 racing the first, which the contract forbids); the `nonblocking` hint of `wait` (matters only to an evented `Io`;
-`testing.io` is the threaded one). 50/56, 1 equivalent, 5 unobservable.
+`testing.io` is the threaded one). 50/56; the score counts the unobservable ones with the equivalents (6 eq): 1 equivalent, 5 unobservable.
 
 ## Anchoring
 

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card Audit score counts the unobservable mutation survivors with the equivalent ones, as the score format has no separate field.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation audit of `writeLogfmtValue`'s `max_len` and the whole of `async_sink.zig` (55 schemata mutants: 53 killed, 1 equivalent, 1 unobservable; new tests for a line logged after `deinit` began, a queue whose line cap binds first and the template path of `logEntry`).
 - **2026-11-15** — **Added (consumer request 2026-11-15):** `AsyncSink` (`async_sink.zig`), a non-blocking sibling of `Sink`: a bounded queue (`max_bytes`, `max_lines`, allocated once) drained by one writer task; `log`/`logEntry` never wait for the destination and drop-and-count when full (`dropped()`), `flush()`, `deinit()` drains. `writeLogfmtValue(w, s, .{ .max_len })` is now public (`LogfmtValueOptions`); default behaviour unchanged. `Sink` is unchanged.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: Sink drop-and-count overflow mode; public logfmt value writer (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).

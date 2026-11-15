@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — ill-formed UTF-8 becomes one U+FFFD per maximal subpart (Unicode §3.9, WHATWG; Python's `decode('utf-8', 'replace')` as the oracle), while Go encoding/json, log/slog, zerolog v1.35.1, zap v1.28.0 and phuslu/log v1.0.138 all write one per byte of a truncated sequence (`E1 80` → 2, `F0 9F 98` → 3) (test `lead: one U+FFFD per maximal subpart where five Go JSON loggers write one per byte`; `tools/go_utf8_probe`) (measured 2026-10-25) · speed — JSON Lines faster than every measured writer: 0.89× phuslu/log v1.0.138 (the fastest), 0.60× zerolog v1.35.1, 0.72× serde_json 1.0.150, 0.21× zap v1.28.0; logfmt 0.28× go-logfmt v0.6.1 (`zig build bench-accesslog`, `tools/go_fast_bench`, `tools/rust_fast_bench`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-15 (53/55, 1 eq) · src 619518d104a8b364
+**Audit:** review 2026-11-12 · mutation 2026-11-15 (53/55, 2 eq) · src 619518d104a8b364
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, ACCESSLOG_FUZZ) · ct n/a — log formatting, no keys (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point: no data-reachable panic; latency total for any injected clock)
 
@@ -417,7 +417,7 @@ that a test can reach. The two left: the wait on `writer_done` in `deinit` is EQ
 `group.await` right after it, which returns only once the task has finished); skipping the `group.await` itself
 is UNOBSERVABLE (the task is already past its last access to the sink once `writer_done` is seen, so only the
 reaping of the task handle differs; it needs a leak or ordering check inside the `Io` implementation).
-53/55, 1 equivalent, 1 unobservable.
+53/55; the score counts the unobservable one with the equivalents (2 eq): 1 equivalent, 1 unobservable.
 
 **Audit 2026-10-04 (mutation).** 33 schemata mutants over `utf8Step` (every second-byte
 range of Table 3-7, continuation checks, maximal-subpart lengths), `writeJsonString`
