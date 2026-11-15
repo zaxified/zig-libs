@@ -4,10 +4,11 @@ Technical-analysis indicators over plain slices, with **TA-Lib C 0.8.3** as the 
 SMA, EMA, WMA and an `ma` dispatcher over `MaType`, MACD (plus MACDEXT and MACDFIX), RSI,
 Bollinger bands, TRANGE / ATR / NATR, stochastic (slow and fast), and rolling MAX / MIN / SUM (the
 seed set, wave I2), plus the Overlap Studies of wave I3: DEMA, TEMA, T3, TRIMA, KAMA, ZLEMA, RMA, VIDYA,
-HMA, ALMA, MCGD, FRAMA, SWAK_BUTTER, SWAK_GAUSS (moving averages; all of them work in every `MaType` slot
-except MAMA), MIDPOINT, MIDPRICE, MAVP, VWMA, the channels ACCBANDS / DONCHIAN / KC / ICHIMOKU and the
+HMA, ALMA, MCGD, FRAMA, SWAK_BUTTER, SWAK_GAUSS, MAMA (moving averages; all of them work in every `MaType` slot), MIDPOINT, MIDPRICE, MAVP, VWMA, the channels ACCBANDS / DONCHIAN / KC / ICHIMOKU and the
 trend state machines SAR, SAREXT, SUPERTREND, CKSP, ZIGZAG, and the 50 volume / volatility / price-transform / statistic /
-math-operator functions of the same wave (see below). 94 of the 237 TA-Lib functions so far.
+math-operator functions of the same wave (see below), and the cycle wave: the Hilbert-transform family HT_DCPERIOD / HT_DCPHASE /
+HT_PHASOR / HT_SINE / HT_TRENDLINE / HT_TRENDMODE, MAMA, the Swiss Army Knife rows SWAK_BP / SWAK_HP / SWAK_2PHP and the 15 math
+transforms (ACOS, ASIN, ATAN, CEIL, COS, COSH, EXP, FLOOR, LN, LOG10, SIN, SINH, SQRT, TAN, TANH). 119 of the 237 TA-Lib functions so far.
 
 ```zig
 const ind = @import("indicators");
@@ -27,7 +28,7 @@ if (s.update(price)) |rsi| use(rsi);
 // several inputs and outputs: one slice per field / output; integer outputs are integer slices
 _ = try ind.supertrend(f64, &high, &low, &close, &line, &trend_i8, .{});
 _ = try ind.ichimoku(f64, &high, &low, &tenkan, &kijun, &span_a, &span_b, .{});
-_ = try ind.ma(f64, &closes, &out, .{ .period = 20, .kind = .hma }); // any MaType but MAMA
+_ = try ind.ma(f64, &closes, &out, .{ .period = 20, .kind = .hma }); // any MaType
 
 // streaming with history (windows) takes a caller buffer
 const buf = try gpa.alloc(f64, try ind.BbandsStream(f64).bufLen(.{}));
@@ -47,8 +48,12 @@ var bb = try ind.BbandsStream(f64).init(.{}, buf);
   `variance`) and math operators (ADD, SUB, MULT, DIV, CUMSUM, MINMAX, MAXINDEX, MININDEX, MINMAXINDEX), all bitwise equal to TA-Lib
   (LINEARREG_ANGLE within 2 ULP: `atan` of the C library). Multi-input streams take a struct, e.g.
   `ind.AdStream(f64).init(.{})` then `update(.{ .high = h, .low = l, .close = c, .volume = v })`.
-- **Not built yet:** MAMA (as a function and as an `MaType`, `error.Unsupported`) and the other 143 functions (momentum, cycle,
-  math transform, candlesticks) come in later waves; MAVP has no streaming type. See SPEC.md.
+- **Cycle wave (25 functions):** `ind.htDcperiod`, `htDcphase`, `htPhasor` (in-phase, quadrature), `htSine` (sine, lead sine), `htTrendline`, `htTrendmode`
+  (an `i8` slice, 1 trend / 0 cycle), `mama` (mama, fama; also `MaType.mama` everywhere a type is accepted), `swakBp`, `swakHp`, `swak2php`, and the element-wise
+  `acos`, `asin`, `atan`, `ceil`, `cos`, `cosh`, `exp`, `floor`, `ln`, `log10`, `sin`, `sinh`, `sqrt`, `tan`, `tanh`. The Hilbert family runs a long warm-up
+  (lookback 32 or 63 plus its unstable period); its streams are plain values. Against TA-Lib: SWAK_*, HT_TRENDLINE, HT_TRENDMODE, the exact and the exp / log / sin / cos /
+  tan transforms are bitwise equal, the other functions are within a documented last-bit allowance (the C library's `atan` and hyperbolics round differently, SPEC.md).
+- **Not built yet:** the other 118 functions (momentum, candlesticks) come in later waves; MAVP has no streaming type. See SPEC.md.
 - **Model after:** TA-Lib C 0.8.3 (`kand`, Rust, is the speed candidate for a later benchmark).
 - **Platform:** any (pure logic). **Role:** util. **Concurrency:** reentrant (no shared state).
 - **Depends on:** nothing. Math is f64 for both `f32` and `f64` input.
