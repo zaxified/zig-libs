@@ -215,8 +215,10 @@ Where this port differs from the C, and why:
 - MEDIAN / PERCENTILE: TA-Lib picks linear or binary search by window size and has a 700-line optimised PERCENTILE kernel; we use one binary
   search and the plain definition (equal values stay in age order, so zeros keep their sign, as the C documents). On finite data these agree bit for bit
   (oracle); with NaN inputs the order inside the sorted copy is unspecified in both.
-- MINMAX: TA-Lib's batch uses a block (van Herk / Gil-Werman) scan, its streaming tier a per-bar automaton; we run the automaton of MAX / MIN for both,
-  so the sign of a tie between 0.0 and -0.0 can differ from the batch C (by reading, not measured). MAXINDEX & co tie to the newest bar like the C.
+- MAX / MIN / MINMAX: TA-Lib's batch uses a block (van Herk / Gil-Werman) scan and its streaming tier a per-bar automaton, and they disagree on the sign of a tie between
+  0.0 and -0.0 (measured with the oracle's tie inputs, kind 3). The batch functions reproduce the block scan (`window.extBatch`, scratch-free); the streaming types
+  run the automaton, as TA-Lib's streaming tier does, so for such ties a batch call and a stream differ in the sign of the zero (and in where a NaN shows), as TA-Lib's two tiers do.
+  MAXINDEX & co tie to the newest bar like the C (oracle-checked on the same inputs).
 - Per-call unstable period instead of a process-global one (as the seed set); `nan = .skip` is not offered on these functions.
 - The Auto levels (`unstable = .auto4 / .auto8`) are checked for ADOSC, EFI, KVO, CVI, MASSI, PVO, RVI, RVIR, HA, BBW and PERCENTB.
 
@@ -290,10 +292,10 @@ Not covered: NaN inputs, other toolchains.
   `a*b - c*d` (BBANDS/VAR variance); we never contract. Re-run the oracle on aarch64 before claiming it there.
 - NaN semantics of the windowed indicators (SMA, WMA, SUM, BBANDS, STOCH): a NaN enters the running
   sums and stays there until a re-anchor (WMA every 8p outputs, the variance every 32 windows)
-  rebuilds them; pinned by tests, equal to TA-Lib's C by reading, not by running. MAX/MIN: a NaN never
-  wins a comparison and only shows when it opens a rescan; ties keep the OLDEST value on a rescan
-  (`>` / `<`) and the NEWEST on an incremental update (`>=` / `<=`), so 0.0 vs -0.0 follows that
-  rule (pinned).
+  rebuilds them; pinned by tests, equal to TA-Lib's C by reading, not by running. MAX/MIN/MINMAX batch: the block scan of
+  the C, so a NaN suffix of a block stays in the outputs that use it (pinned, by reading; the oracle has no NaN inputs);
+  streams: a NaN never wins a comparison and only shows when it opens a rescan; ties keep the OLDEST value on a rescan
+  (`>` / `<`) and the NEWEST on an incremental update (`>=` / `<=`) (pinned).
 
 ## Backlog / deferred
 
