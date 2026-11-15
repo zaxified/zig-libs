@@ -9,6 +9,11 @@
 #   usage: scripts/hooks/test-pre-commit.sh
 #   exit 0 = every case behaved; exit 1 = a case did not, and says which.
 set -u
+# The throwaway repo only works if no inherited GIT_DIR points git elsewhere:
+# run from a hook (which exports one), the calls below hit the real repository
+# (2026-11-15). Drop the caller's git environment first.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX GIT_NAMESPACE
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOK="$SCRIPT_DIR/pre-commit"

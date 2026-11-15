@@ -301,7 +301,13 @@ def self_test():
     expect("summary bounded", len(summary("x" * 500).encode()) <= 204)
     expect("summary keeps a multibyte tail valid", summary("é" * 300).endswith("…"))
 
-    # A whole range, in a throwaway repository.
+    # A whole range, in a throwaway repository. Drop the caller's git
+    # environment first: run from a hook (which exports GIT_DIR), `git add -A`
+    # and `commit` below wrote this scratch into the REAL repository's checked-out
+    # branch on 2026-11-15.
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+              "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_NAMESPACE"):
+        os.environ.pop(k, None)
     cwd = os.getcwd()
     with tempfile.TemporaryDirectory() as d:
         os.chdir(d)

@@ -14,6 +14,11 @@
 #   usage: scripts/lib/test-tag.sh
 #   exit 0 = every case behaved; exit 1 = a case did not, and says which.
 set -u
+# Every git call below must reach the throwaway repos, never the caller's: an
+# inherited GIT_DIR (any git hook exports one) redirected them into the real
+# repository on 2026-11-15 (core.bare=true, user t@t, scratch commits on main).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX GIT_NAMESPACE
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

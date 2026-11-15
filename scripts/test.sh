@@ -1920,9 +1920,11 @@ phase_checks_fast() {
 # are cheap enough to run before anything expensive starts, which is what makes
 # them a fail-fast gate rather than one more thing to wait for.
 phase_checks_fast_tail() {
-    step "hook self-test" ./scripts/hooks/test-pre-commit.sh
-    step "auto-release self-test" ./scripts/lib/test-tag.sh
-    step "release-notes self-test" python3 -I scripts/lib/release-notes.py --self-test
+    # The three self-tests that build throwaway git repos run under a decoy
+    # GIT_DIR, the way the pre-push hook starts them (lib/with-decoy-gitdir.sh).
+    step "hook self-test" ./scripts/lib/with-decoy-gitdir.sh ./scripts/hooks/test-pre-commit.sh
+    step "auto-release self-test" ./scripts/lib/with-decoy-gitdir.sh ./scripts/lib/test-tag.sh
+    step "release-notes self-test" ./scripts/lib/with-decoy-gitdir.sh python3 -I scripts/lib/release-notes.py --self-test
     step "ci-red-issue self-test" python3 -I scripts/lib/ci-red-issue.py --self-test
     step "check-ci-cache-keys" ./scripts/checks/check-ci-cache-keys.sh
     step "check-fingerprint-exempt" ./scripts/checks/fingerprint-exempt.py

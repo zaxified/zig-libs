@@ -20,6 +20,14 @@ if (( sends )) && [[ "${ZIGLIBS_SKIP_PREPUSH:-0}" != 1 ]]; then
     if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
         echo "pre-push: note: the working tree has uncommitted changes; checks-fast reads the tree, not the pushed commit." >&2
     fi
+    # Git exports GIT_DIR (and, from a worktree, the worktree's gitdir) to hooks.
+    # checks-fast runs self-tests that build throwaway repos; with GIT_DIR
+    # inherited, their `git init/config/commit` hit THIS repository: 2026-11-15
+    # a push from a worktree set core.bare=true and user t@t in .git/config and
+    # committed the self-tests' scratch onto main and the pushed branch. The
+    # checks need no git environment of the push; drop it.
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+        GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX GIT_NAMESPACE
     run=(scripts/test.sh checks-fast)
     command -v hw >/dev/null && run=(hw run --name zl-pre-push --quiet 300 -- "${run[@]}")
     if ! "${run[@]}" >/tmp/zl-pre-push.log 2>&1; then

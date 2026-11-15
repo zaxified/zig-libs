@@ -30,6 +30,7 @@ and CI; nobody runs these by hand in the ordinary course of things.
 | File | What it is |
 |------|------------|
 | `test-lib.sh` | The driver's shared shell library (steps, the memory cap, the netns set read from `module-graph`). |
+| `with-decoy-gitdir.sh` | Runs a self-test that builds throwaway git repos with `GIT_DIR` exported at a decoy repository, as the pre-push hook starts it, and fails when the decoy changed. `checks-fast` wraps the three such self-tests in it (2026-11-15: an inherited `GIT_DIR` let them write into the real repository). |
 | `test-tag.sh` | Self-test for `auto-release.sh`. Runs inside the driver, because a release tool whose refusal path is untested refuses nothing. |
 | `tag-lib.sh` | What cutting a tag means, sourced by `auto-release.sh`: the dry-run refusal, the tag's name, the pin rewrite and bump, the annotated tag with generated notes. |
 | `auto-release.sh` | The only route to a tag (a scheduled run, or a dispatch with `release: live`), called by CI's `since` and `release-*` jobs: `since` (any commit since the merge base with HEAD of the newest date tag that has a Release? Newer tags with none are named and turn the run red), `prepare` (read-only: tag on a child of the tested commit, as a git bundle), `verify-bundle` (no zig, no token: one commit on the tested one, its tree recomputed, its name derived, its message bounded), `finish` (pinned green: Release; anything else: delete the tag, only if it is the object this run verified). CONVENTIONS §8. |
@@ -187,7 +188,7 @@ from a diff against `BASE_REF` if you pass one (`scripts/test.sh changed main`).
 - `build.zig`, `build.zig.zon` → nothing extra: both are in every
   fingerprint, so the stamps already say what they re-keyed (see *Stamps*)
 - `.github/**` and any script the gate itself executes — `test.sh`,
-  `test-lib.sh`, `capped`, `dark-tests.sh`, `ci-environment.sh`, `test-tag.sh`,
+  `test-lib.sh`, `capped`, `dark-tests.sh`, `ci-environment.sh`, `test-tag.sh`, `with-decoy-gitdir.sh`,
   `ci-stamps.sh`, `check-ci-cache-keys.sh`, `hooks/**` → **a smoke set** — one
   plain and one netns module, end to end — to prove the driver itself works, the
   usual scoped checks, and then the modules with no green stamp as always. Every
