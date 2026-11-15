@@ -99,23 +99,46 @@ const Func = enum(u8) {
     ultosc,
     cmo,
     cmou,
+    // momentum wave, composites
+    cg,
+    apo,
+    ppo,
+    trix,
+    coppock,
+    eri,
+    dosc,
+    fisher,
+    pso,
+    smi,
+    tsi,
+    wavetrend,
+    // momentum wave, composites 2
+    kst,
+    kstext,
+    kdj,
+    stochrsi,
+    crsi,
+    stc,
+    sqzmom,
 };
 const func_names = [_][]const u8{
-    "SMA", "EMA",    "WMA", "MA",       "MACD",    "MACDEXT",  "MACDFIX", "RSI",   "BBANDS",   "TRANGE", "ATR", "NATR",  "STOCH",   "STOCHF",  "MAX",  "MIN",    "SUM",
-    "ADX", "ADXR",   "DX",  "MINUS_DI", "PLUS_DI", "MINUS_DM", "PLUS_DM", "AROON", "AROONOSC", "MOM",    "ROC", "ROCP",  "ROCR",    "ROCR100", "BOP",  "IBS",    "QSTICK",
-    "WAD", "ASI",    "SI",  "IMI",      "AO",      "AC",       "DPO",     "ER",    "FOSC",     "CTI",    "VHF", "WILLR", "FRACTAL", "CCI",     "CHOP", "CHOPTR", "VORTEX",
-    "MFI", "ULTOSC", "CMO", "CMOU",
+    "SMA",    "EMA",    "WMA",      "MA",       "MACD",    "MACDEXT",  "MACDFIX", "RSI",   "BBANDS",   "TRANGE", "ATR",  "NATR",   "STOCH",   "STOCHF",  "MAX",  "MIN",       "SUM",
+    "ADX",    "ADXR",   "DX",       "MINUS_DI", "PLUS_DI", "MINUS_DM", "PLUS_DM", "AROON", "AROONOSC", "MOM",    "ROC",  "ROCP",   "ROCR",    "ROCR100", "BOP",  "IBS",       "QSTICK",
+    "WAD",    "ASI",    "SI",       "IMI",      "AO",      "AC",       "DPO",     "ER",    "FOSC",     "CTI",    "VHF",  "WILLR",  "FRACTAL", "CCI",     "CHOP", "CHOPTR",    "VORTEX",
+    "MFI",    "ULTOSC", "CMO",      "CMOU",     "CG",      "APO",      "PPO",     "TRIX",  "COPPOCK",  "ERI",    "DOSC", "FISHER", "PSO",     "SMI",     "TSI",  "WAVETREND", "KST",
+    "KSTEXT", "KDJ",    "STOCHRSI", "CRSI",     "STC",     "SQZMOM",
 };
 const n_func = func_names.len;
 
 /// Allowed distance in ULPs, per function. Everything is expected to be bitwise:
 /// both sides do the same operations in the same order and neither contracts
 /// `a*b + c` outside the explicit `fma` calls. A nonzero entry must say why.
-const ulp_bound = [n_func]u64{
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0,
+const ulp_bound = blk: {
+    var b: [n_func]u64 = @splat(0);
+    // PSO: tanh(expm1). TA-Lib's glibc and Zig's `std.math.expm1` round a few results
+    // differently; measured: 16 of 20930 values differ, by at most 2 ULP.
+    b[@backingInt(Func.pso)] = 2;
+    break :blk b;
 };
 
 /// The input series of a function, in the order of its TA-Lib prototype:
@@ -129,6 +152,9 @@ fn seriesOf(f: Func) []const u8 {
         .qstick, .imi => "oc",
         .ibs, .wad, .willr, .cci, .chop, .choptr, .vortex, .ultosc => "hlc",
         .mfi => "hlcv",
+        .eri, .pso, .smi, .wavetrend => "hlc",
+        .fisher => "hl",
+        .kdj, .sqzmom => "hlc",
         else => "c",
     };
 }
@@ -138,7 +164,8 @@ fn nIn(f: Func) usize {
 fn nOut(f: Func) usize {
     return switch (f) {
         .macd, .macdext, .macdfix, .bbands => 3,
-        .stoch, .stochf, .aroon, .vortex, .fractal => 2,
+        .stoch, .stochf, .aroon, .vortex, .fractal, .eri, .fisher, .smi, .wavetrend, .kst, .kstext, .stochrsi, .sqzmom => 2,
+        .kdj => 3,
         else => 1,
     };
 }
@@ -305,6 +332,31 @@ fn runOurs(comptime T: type, gpa: std.mem.Allocator, cs: Case, h: []const T, l: 
         .ultosc => ind.ultosc(T, h, l, c, o[0], .{ .period1 = us(ip[0]), .period2 = us(ip[1]), .period3 = us(ip[2]) }),
         .cmo => ind.cmo(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
         .cmou => ind.cmou(T, c, o[0], .{ .period = us(ip[0]) }),
+        .cg => ind.cg(T, c, o[0], .{ .period = us(ip[0]) }),
+        .apo => ind.apo(T, c, o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]), .kind = mt(ip[2]), .unstable = un }),
+        .ppo => ind.ppo(T, c, o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]), .kind = mt(ip[2]), .unstable = un }),
+        .trix => ind.trix(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .coppock => ind.coppock(T, c, o[0], .{ .wma = us(ip[0]), .roc1 = us(ip[1]), .roc2 = us(ip[2]) }),
+        .eri => ind.eri(T, h, l, c, o[0], o[1], .{ .period = us(ip[0]), .unstable = un }),
+        .dosc => ind.dosc(T, gpa, c, o[0], .{ .period = us(ip[0]), .first = us(ip[1]), .second = us(ip[2]), .signal = us(ip[3]), .unstable = un }),
+        .fisher => ind.fisher(T, h, l, o[0], o[1], .{ .period = us(ip[0]), .unstable = un }),
+        .pso => ind.pso(T, h, l, c, o[0], .{ .fastk = us(ip[0]), .ema = us(ip[1]), .unstable = un }),
+        .smi => ind.smi(T, h, l, c, o[0], o[1], .{ .period = us(ip[0]), .fast = us(ip[1]), .slow = us(ip[2]), .signal = us(ip[3]), .unstable = un }),
+        .tsi => ind.tsi(T, c, o[0], .{ .first = us(ip[0]), .second = us(ip[1]), .unstable = un }),
+        .kst => ind.kst(T, gpa, c, o[0], o[1], .{ .roc1 = us(ip[0]), .roc2 = us(ip[1]), .roc3 = us(ip[2]), .roc4 = us(ip[3]), .sma1 = us(ip[4]), .sma2 = us(ip[5]), .sma3 = us(cs.xp[0]), .sma4 = us(cs.xp[1]), .signal = us(cs.xp[2]) }),
+        .kstext => ind.kstext(T, gpa, c, o[0], o[1], .{ .roc1 = us(ip[0]), .roc2 = us(ip[1]), .roc3 = us(ip[2]), .roc4 = us(ip[3]), .ma1 = us(ip[4]), .ma2 = us(ip[5]), .ma3 = us(cs.xp[0]), .ma4 = us(cs.xp[1]), .signal = us(cs.xp[2]), .roc_ma = mt(cs.xp[3]), .signal_ma = mt(cs.xp[4]) }),
+        .kdj => ind.kdj(T, gpa, h, l, c, o[0], o[1], o[2], .{ .fastk = us(ip[0]), .slowk = us(ip[1]), .slowk_ma = mt(ip[2]), .slowd = us(ip[3]), .slowd_ma = mt(ip[4]), .unstable = un }),
+        .stochrsi => ind.stochrsi(T, gpa, c, o[0], o[1], .{ .period = us(ip[0]), .fastk = us(ip[1]), .fastd = us(ip[2]), .fastd_ma = mt(ip[3]), .unstable = un }),
+        .crsi => ind.crsi(T, gpa, c, o[0], .{ .period = us(ip[0]), .streak = us(ip[1]), .rank = us(ip[2]), .unstable = un }),
+        .stc => ind.stc(T, gpa, c, o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]), .cycle = us(ip[2]), .unstable = un }),
+        .sqzmom => blk: {
+            const q = try gpa.alloc(i8, h.len);
+            defer gpa.free(q);
+            const lb = try ind.sqzmom(T, gpa, h, l, c, o[0], q, .{ .bb_period = us(ip[0]), .kc_period = us(ip[1]), .nb_dev = cs.dp[0], .factor_wide = cs.dp[1], .factor_normal = cs.xd[0], .factor_narrow = cs.xd[1] });
+            for (0..h.len) |i| o[1][i] = if (i < lb) std.math.nan(T) else @floatFromInt(q[i]);
+            break :blk lb;
+        },
+        .wavetrend => ind.wavetrend(T, gpa, h, l, c, o[0], o[1], .{ .channel = us(ip[0]), .average = us(ip[1]), .signal = us(ip[2]), .unstable = un }),
     };
 }
 
@@ -361,6 +413,42 @@ fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
         .ao => for ([_][2]i32{ .{ 5, 34 }, .{ 2, 3 }, .{ 34, 5 }, .{ 10, 10 }, .{ 2, 100 }, .{ 1, 34 }, .{ 5, 0 }, .{ 5, 100001 } }) |t| try l.append(gpa, pn(.{ t[0], t[1] })),
         .ac => for ([_][3]i32{ .{ 5, 34, 5 }, .{ 2, 3, 2 }, .{ 10, 20, 5 }, .{ 34, 5, 3 }, .{ 3, 3, 2 }, .{ 5, 34, 1 }, .{ 5, 34, 100001 } }) |t| try l.append(gpa, pn(.{ t[0], t[1], t[2] })),
         .ultosc => for ([_][3]i32{ .{ 7, 14, 28 }, .{ 1, 1, 1 }, .{ 3, 5, 10 }, .{ 10, 5, 3 }, .{ 5, 5, 5 }, .{ 1, 2, 3 }, .{ 14, 14, 28 }, .{ 0, 14, 28 }, .{ 7, 100001, 28 } }) |t| try l.append(gpa, pn(.{ t[0], t[1], t[2] })),
+        .cg => try l.appendSlice(gpa, &periods(&.{ 10, 2, 3, 5, 20, 40, 1, 0, 100001 })),
+        .apo, .ppo => {
+            for ([_][2]i32{ .{ 12, 26 }, .{ 2, 3 }, .{ 5, 14 }, .{ 26, 12 }, .{ 3, 3 }, .{ 10, 50 } }) |t| for (grid_ma) |k| try l.append(gpa, pn(.{ t[0], t[1], k }));
+            try l.append(gpa, pn(.{ 1, 26, 1 }));
+            try l.append(gpa, pn(.{ 12, 100001, 0 }));
+        },
+        .trix => try l.appendSlice(gpa, &periods(&.{ 30, 1, 2, 3, 5, 14, 0, 100001 })),
+        .coppock => for ([_][3]i32{ .{ 10, 11, 14 }, .{ 1, 2, 3 }, .{ 3, 5, 2 }, .{ 5, 1, 1 }, .{ 2, 14, 11 }, .{ 0, 11, 14 }, .{ 10, 0, 14 } }) |t| try l.append(gpa, pn(.{ t[0], t[1], t[2] })),
+        .eri => try l.appendSlice(gpa, &periods(&.{ 13, 1, 2, 3, 5, 30, 0, 100001 })),
+        .dosc => for ([_][4]i32{ .{ 14, 5, 3, 9 }, .{ 2, 2, 2, 2 }, .{ 3, 4, 5, 6 }, .{ 10, 3, 2, 12 }, .{ 14, 1, 3, 9 }, .{ 14, 5, 3, 1 } }) |t| try l.append(gpa, pn(.{ t[0], t[1], t[2], t[3] })),
+        .fisher => try l.appendSlice(gpa, &periods(&.{ 10, 2, 3, 5, 20, 1, 0, 100001 })),
+        .pso => for ([_][2]i32{ .{ 8, 5 }, .{ 1, 1 }, .{ 2, 2 }, .{ 3, 8 }, .{ 20, 3 }, .{ 5, 1 }, .{ 0, 5 }, .{ 8, 0 } }) |t| try l.append(gpa, pn(.{ t[0], t[1] })),
+        .smi => for ([_][4]i32{ .{ 13, 2, 25, 9 }, .{ 2, 2, 2, 2 }, .{ 5, 3, 7, 4 }, .{ 10, 4, 3, 2 }, .{ 20, 2, 10, 5 }, .{ 1, 2, 25, 9 }, .{ 13, 1, 25, 9 } }) |t| try l.append(gpa, pn(.{ t[0], t[1], t[2], t[3] })),
+        .tsi => for ([_][2]i32{ .{ 25, 13 }, .{ 2, 2 }, .{ 3, 5 }, .{ 10, 3 }, .{ 1, 13 }, .{ 25, 1 } }) |t| try l.append(gpa, pn(.{ t[0], t[1] })),
+        .wavetrend => for ([_][3]i32{ .{ 10, 21, 4 }, .{ 2, 1, 1 }, .{ 3, 2, 2 }, .{ 5, 8, 3 }, .{ 20, 5, 1 }, .{ 1, 21, 4 }, .{ 10, 0, 4 }, .{ 10, 21, 0 } }) |t| try l.append(gpa, pn(.{ t[0], t[1], t[2] })),
+        .kst => for ([_][9]i32{ .{ 10, 15, 20, 30, 10, 10, 10, 15, 9 }, .{ 1, 2, 3, 4, 1, 2, 3, 1, 1 }, .{ 2, 3, 4, 5, 2, 2, 3, 3, 2 }, .{ 5, 10, 15, 20, 5, 5, 5, 5, 3 }, .{ 30, 20, 15, 10, 15, 10, 10, 10, 9 }, .{ 0, 15, 20, 30, 10, 10, 10, 15, 9 }, .{ 10, 15, 20, 30, 10, 10, 10, 15, 0 } }) |t| try l.append(gpa, pn(t)),
+        .kstext => {
+            for ([_][2]i32{ .{ 0, 0 }, .{ 1, 1 }, .{ 2, 2 }, .{ 1, 0 }, .{ 0, 2 }, .{ 2, 1 }, .{ 10, 0 } }) |ty| for ([_][9]i32{ .{ 10, 15, 20, 30, 10, 10, 10, 15, 9 }, .{ 2, 3, 4, 5, 2, 2, 3, 3, 2 }, .{ 1, 2, 3, 4, 1, 2, 3, 1, 1 } }) |t|
+                try l.append(gpa, pn(t ++ ty));
+            try l.append(gpa, pn([_]i32{ 0, 15, 20, 30, 10, 10, 10, 15, 9, 0, 0 }));
+        },
+        .kdj => for ([_][5]i32{ .{ 9, 3, 0, 3, 0 }, .{ 5, 2, 1, 2, 2 }, .{ 3, 1, 2, 1, 0 }, .{ 14, 3, 10, 3, 0 }, .{ 1, 1, 0, 1, 0 }, .{ 9, 3, 1, 3, 1 }, .{ 0, 3, 0, 3, 0 } }) |t| try l.append(gpa, pn(t)),
+        .stochrsi => for ([_][4]i32{ .{ 14, 5, 3, 0 }, .{ 2, 1, 1, 0 }, .{ 5, 3, 2, 1 }, .{ 10, 4, 3, 2 }, .{ 3, 5, 2, 10 }, .{ 1, 5, 3, 0 }, .{ 14, 0, 3, 0 }, .{ 14, 5, 0, 0 } }) |t| try l.append(gpa, pn(t)),
+        .crsi => for ([_][3]i32{ .{ 3, 2, 100 }, .{ 2, 2, 2 }, .{ 5, 3, 10 }, .{ 14, 14, 20 }, .{ 2, 5, 3 }, .{ 2, 2, 10001 }, .{ 1, 2, 100 }, .{ 3, 1, 100 } }) |t| try l.append(gpa, pn(t)),
+        .stc => for ([_][3]i32{ .{ 23, 50, 10 }, .{ 2, 3, 2 }, .{ 5, 3, 2 }, .{ 10, 20, 5 }, .{ 12, 26, 4 }, .{ 1, 50, 10 }, .{ 23, 50, 1 } }) |t| try l.append(gpa, pn(t)),
+        .sqzmom => for ([_]P{
+            .{ .ip = .{ 20, 20, 0, 0, 0, 0 }, .dp = .{ 2, 2 }, .xd = .{ 1.5, 1 } },
+            .{ .ip = .{ 5, 5, 0, 0, 0, 0 }, .dp = .{ 2, 2 }, .xd = .{ 1.5, 1 } },
+            .{ .ip = .{ 2, 2, 0, 0, 0, 0 }, .dp = .{ 2, 2 }, .xd = .{ 1.5, 1 } },
+            .{ .ip = .{ 10, 4, 0, 0, 0, 0 }, .dp = .{ 1.5, 2.5 }, .xd = .{ 1.5, 0.5 } },
+            .{ .ip = .{ 20, 10, 0, 0, 0, 0 }, .dp = .{ 2, 3 }, .xd = .{ 2, 1 } },
+            .{ .ip = .{ 4, 10, 0, 0, 0, 0 }, .dp = .{ 0, 0 }, .xd = .{ 0, 0 } },
+            .{ .ip = .{ 20, 20, 0, 0, 0, 0 }, .dp = .{ 2, 1 }, .xd = .{ 1.5, 1 } },
+            .{ .ip = .{ 20, 20, 0, 0, 0, 0 }, .dp = .{ -1, 2 }, .xd = .{ 1.5, 1 } },
+            .{ .ip = .{ 1, 20, 0, 0, 0, 0 }, .dp = .{ 2, 2 }, .xd = .{ 1.5, 1 } },
+        }) |pp| try l.append(gpa, pp),
         .fractal => for ([_][2]i32{ .{ 2, 2 }, .{ 1, 1 }, .{ 3, 2 }, .{ 2, 5 }, .{ 1, 3 }, .{ 0, 2 }, .{ 2, 0 } }) |t| try l.append(gpa, pn(.{ t[0], t[1] })),
         .ma => {
             for ([_]i32{ 30, 1, 2, 5, 14 }) |per| for (grid_ma) |t| try l.append(gpa, pn(.{ per, t, 0, 0, 0, 0 }));
@@ -401,7 +489,7 @@ fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
 /// Functions on which the unstable period does anything.
 fn unstableMatters(f: Func) bool {
     return switch (f) {
-        .sma, .wma, .trange, .max, .min, .sum, .aroon, .aroonosc, .mom, .roc, .rocp, .rocr, .rocr100, .bop, .ibs, .qstick, .wad, .asi, .si, .imi, .ao, .ac, .dpo, .er, .fosc, .cti, .vhf, .willr, .fractal, .cci, .chop, .choptr, .vortex, .mfi, .ultosc, .cmou => false,
+        .sma, .wma, .trange, .max, .min, .sum, .cg, .coppock, .kst, .kstext, .sqzmom, .aroon, .aroonosc, .mom, .roc, .rocp, .rocr, .rocr100, .bop, .ibs, .qstick, .wad, .asi, .si, .imi, .ao, .ac, .dpo, .er, .fosc, .cti, .vhf, .willr, .fractal, .cci, .chop, .choptr, .vortex, .mfi, .ultosc, .cmou => false,
         else => true,
     };
 }
@@ -449,7 +537,7 @@ fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
                 c.n = n;
                 seed += 1;
                 c.seed = seed;
-                c.emit = n == vec_n and pi < 4;
+                c.emit = n == vec_n and pi < (if (@backingInt(f) >= 17) @as(usize, 2) else 4);
                 try cases.append(gpa, c);
                 if (n == 300 and pi < 4) for ([_]u8{ 1, 2 }) |k| {
                     var ck = c;

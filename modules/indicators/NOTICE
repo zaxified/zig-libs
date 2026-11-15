@@ -10,7 +10,7 @@ zig-libs — must keep this file with it.
 
 What was taken: algorithms and numerical recipes (source, not data), read from
 `src/ta_func/ta_{SMA,EMA,WMA,MA,MACD,MACDEXT,MACDFIX,RSI,BBANDS,VAR,STDDEV,
-TRANGE,ATR,NATR,STOCH,STOCHF,MAX,MIN,SUM}.c` and `include/ta_defs.h` of the
+TRANGE,ATR,NATR,STOCH,STOCHF,MAX,MIN,SUM}.c` and, for the momentum group, `ta_{ADX,ADXR,DX,PLUS_DI,MINUS_DI,PLUS_DM,MINUS_DM,AROON,AROONOSC,MOM,ROC,ROCP,ROCR,ROCR100,BOP,IBS,QSTICK,WAD,ASI,SI,IMI,AO,AC,DPO,ER,FOSC,CTI,VHF,WILLR,FRACTAL,CCI,CHOP,CHOPTR,VORTEX,MFI,ULTOSC,CMO,CMOU,CG,APO,PPO,TRIX,COPPOCK,ERI,DOSC,FISHER,PSO,SMI,TSI,WAVETREND,KST,KSTEXT,KDJ,STOCHRSI,CRSI,STC,SQZMOM,PERCENTRANK,LINEARREG,MIDPRICE}.c` and `include/ta_defs.h` of the
 `ta-lib-0.8.3` release tarball (sha256
 28b1179b178a0db15f3dad0d846ef77f18eb06db5dfc5b5a8ca153a9ea5d84e6). No TA-Lib
 file is vendored, compiled or linked; nothing was copied verbatim except

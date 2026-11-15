@@ -31,6 +31,8 @@ enum { F_SMA, F_EMA, F_WMA, F_MA, F_MACD, F_MACDEXT, F_MACDFIX, F_RSI, F_BBANDS,
        /* momentum wave */
        F_ADX, F_ADXR, F_DX, F_MINUS_DI, F_PLUS_DI, F_MINUS_DM, F_PLUS_DM, F_AROON, F_AROONOSC,
        F_MOM, F_ROC, F_ROCP, F_ROCR, F_ROCR100, F_BOP, F_IBS, F_QSTICK, F_WAD, F_ASI, F_SI, F_IMI, F_AO, F_AC, F_DPO, F_ER, F_FOSC, F_CTI, F_VHF, F_WILLR, F_FRACTAL, F_CCI, F_CHOP, F_CHOPTR, F_VORTEX, F_MFI, F_ULTOSC, F_CMO, F_CMOU,
+       F_CG, F_APO, F_PPO, F_TRIX, F_COPPOCK, F_ERI, F_DOSC, F_FISHER, F_PSO, F_SMI, F_TSI, F_WAVETREND,
+       F_KST, F_KSTEXT, F_KDJ, F_STOCHRSI, F_CRSI, F_STC, F_SQZMOM,
        F_COUNT };
 
 /* number of input series; the series themselves (open/high/low/close/volume) are
@@ -44,13 +46,15 @@ static int nin(int f) {
     case F_QSTICK: case F_IMI: case F_AO: case F_AC: case F_FRACTAL: return 2;
     case F_IBS: case F_WAD: case F_WILLR: case F_CCI: case F_CHOP: case F_CHOPTR: case F_VORTEX: case F_ULTOSC: return 3;
     case F_MFI: return 4;
+    case F_ERI: case F_PSO: case F_SMI: case F_WAVETREND: case F_KDJ: case F_SQZMOM: return 3;
+    case F_FISHER: return 2;
     default: return 1;
     }
 }
 static int nout(int f) {
     switch (f) {
-    case F_MACD: case F_MACDEXT: case F_MACDFIX: case F_BBANDS: return 3;
-    case F_STOCH: case F_STOCHF: case F_AROON: case F_VORTEX: case F_FRACTAL: return 2;
+    case F_MACD: case F_MACDEXT: case F_MACDFIX: case F_BBANDS: case F_KDJ: return 3;
+    case F_STOCH: case F_STOCHF: case F_AROON: case F_KST: case F_KSTEXT: case F_STOCHRSI: case F_SQZMOM: case F_VORTEX: case F_FRACTAL: case F_ERI: case F_FISHER: case F_SMI: case F_WAVETREND: return 2;
     default: return 1;
     }
 }
@@ -99,7 +103,9 @@ int main(int argc, char **argv) {
 #define O2 &beg, &nb, outs[0], outs[1]
 #define O3 &beg, &nb, outs[0], outs[1], outs[2]
 #define OI2 &beg, &nb, iouts[0], iouts[1]
+#define OD1I1 &beg, &nb, outs[0], iouts[0]
 #define MT(i) ((TA_MAType)ip[i])
+#define MT_X(i) ((TA_MAType)xp[i])
         switch (f) {
         case F_SMA: lb = TA_SMA_Lookback(ip[0]); R(TA_S_SMA(0, e, s0, ip[0], O1), TA_SMA(0, e, d0, ip[0], O1));
         case F_EMA: lb = TA_EMA_Lookback(ip[0]); R(TA_S_EMA(0, e, s0, ip[0], O1), TA_EMA(0, e, d0, ip[0], O1));
@@ -162,8 +168,35 @@ int main(int argc, char **argv) {
         case F_MFI: lb = TA_MFI_Lookback(ip[0]); R(TA_S_MFI(0, e, s0, s1, s2, s3, ip[0], O1), TA_MFI(0, e, d0, d1, d2, d3, ip[0], O1));
         case F_ULTOSC: lb = TA_ULTOSC_Lookback(ip[0], ip[1], ip[2]); R(TA_S_ULTOSC(0, e, s0, s1, s2, ip[0], ip[1], ip[2], O1), TA_ULTOSC(0, e, d0, d1, d2, ip[0], ip[1], ip[2], O1));
         case F_FRACTAL: lb = TA_FRACTAL_Lookback(ip[0], ip[1]); R(TA_S_FRACTAL(0, e, s0, s1, ip[0], ip[1], OI2), TA_FRACTAL(0, e, d0, d1, ip[0], ip[1], OI2));
+        // momentum wave, composites
+        case F_CG: lb = TA_CG_Lookback(ip[0]); R(TA_S_CG(0, e, s0, ip[0], O1), TA_CG(0, e, d0, ip[0], O1));
+        case F_APO: lb = TA_APO_Lookback(ip[0], ip[1], MT(2)); R(TA_S_APO(0, e, s0, ip[0], ip[1], MT(2), O1), TA_APO(0, e, d0, ip[0], ip[1], MT(2), O1));
+        case F_PPO: lb = TA_PPO_Lookback(ip[0], ip[1], MT(2)); R(TA_S_PPO(0, e, s0, ip[0], ip[1], MT(2), O1), TA_PPO(0, e, d0, ip[0], ip[1], MT(2), O1));
+        case F_TRIX: lb = TA_TRIX_Lookback(ip[0]); R(TA_S_TRIX(0, e, s0, ip[0], O1), TA_TRIX(0, e, d0, ip[0], O1));
+        case F_COPPOCK: lb = TA_COPPOCK_Lookback(ip[0], ip[1], ip[2]); R(TA_S_COPPOCK(0, e, s0, ip[0], ip[1], ip[2], O1), TA_COPPOCK(0, e, d0, ip[0], ip[1], ip[2], O1));
+        case F_ERI: lb = TA_ERI_Lookback(ip[0]); R(TA_S_ERI(0, e, s0, s1, s2, ip[0], O2), TA_ERI(0, e, d0, d1, d2, ip[0], O2));
+        case F_DOSC: lb = TA_DOSC_Lookback(ip[0], ip[1], ip[2], ip[3]); R(TA_S_DOSC(0, e, s0, ip[0], ip[1], ip[2], ip[3], O1), TA_DOSC(0, e, d0, ip[0], ip[1], ip[2], ip[3], O1));
+        case F_FISHER: lb = TA_FISHER_Lookback(ip[0]); R(TA_S_FISHER(0, e, s0, s1, ip[0], O2), TA_FISHER(0, e, d0, d1, ip[0], O2));
+        case F_PSO: lb = TA_PSO_Lookback(ip[0], ip[1]); R(TA_S_PSO(0, e, s0, s1, s2, ip[0], ip[1], O1), TA_PSO(0, e, d0, d1, d2, ip[0], ip[1], O1));
+        case F_SMI: lb = TA_SMI_Lookback(ip[0], ip[1], ip[2], ip[3]); R(TA_S_SMI(0, e, s0, s1, s2, ip[0], ip[1], ip[2], ip[3], O2), TA_SMI(0, e, d0, d1, d2, ip[0], ip[1], ip[2], ip[3], O2));
+        case F_TSI: lb = TA_TSI_Lookback(ip[0], ip[1]); R(TA_S_TSI(0, e, s0, ip[0], ip[1], O1), TA_TSI(0, e, d0, ip[0], ip[1], O1));
+        case F_WAVETREND: lb = TA_WAVETREND_Lookback(ip[0], ip[1], ip[2]); R(TA_S_WAVETREND(0, e, s0, s1, s2, ip[0], ip[1], ip[2], O2), TA_WAVETREND(0, e, d0, d1, d2, ip[0], ip[1], ip[2], O2));
+        // momentum wave, composites 2
+        case F_KST: lb = TA_KST_Lookback(ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], xp[0], xp[1], xp[2]);
+            R(TA_S_KST(0, e, s0, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], xp[0], xp[1], xp[2], O2), TA_KST(0, e, d0, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], xp[0], xp[1], xp[2], O2));
+        case F_KSTEXT: lb = TA_KSTEXT_Lookback(ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], xp[0], xp[1], xp[2], MT_X(3), MT_X(4));
+            R(TA_S_KSTEXT(0, e, s0, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], xp[0], xp[1], xp[2], MT_X(3), MT_X(4), O2), TA_KSTEXT(0, e, d0, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], xp[0], xp[1], xp[2], MT_X(3), MT_X(4), O2));
+        case F_KDJ: lb = TA_KDJ_Lookback(ip[0], ip[1], MT(2), ip[3], MT(4));
+            R(TA_S_KDJ(0, e, s0, s1, s2, ip[0], ip[1], MT(2), ip[3], MT(4), O3), TA_KDJ(0, e, d0, d1, d2, ip[0], ip[1], MT(2), ip[3], MT(4), O3));
+        case F_STOCHRSI: lb = TA_STOCHRSI_Lookback(ip[0], ip[1], ip[2], MT(3));
+            R(TA_S_STOCHRSI(0, e, s0, ip[0], ip[1], ip[2], MT(3), O2), TA_STOCHRSI(0, e, d0, ip[0], ip[1], ip[2], MT(3), O2));
+        case F_CRSI: lb = TA_CRSI_Lookback(ip[0], ip[1], ip[2]); R(TA_S_CRSI(0, e, s0, ip[0], ip[1], ip[2], O1), TA_CRSI(0, e, d0, ip[0], ip[1], ip[2], O1));
+        case F_STC: lb = TA_STC_Lookback(ip[0], ip[1], ip[2]); R(TA_S_STC(0, e, s0, ip[0], ip[1], ip[2], O1), TA_STC(0, e, d0, ip[0], ip[1], ip[2], O1));
+        case F_SQZMOM: lb = TA_SQZMOM_Lookback(ip[0], dp[0], ip[1], dp[1], xd[0], xd[1]);
+            R(TA_S_SQZMOM(0, e, s0, s1, s2, ip[0], dp[0], ip[1], dp[1], xd[0], xd[1], OD1I1), TA_SQZMOM(0, e, d0, d1, d2, ip[0], dp[0], ip[1], dp[1], xd[0], xd[1], OD1I1));
         default: break;
         }
+        if (f == F_SQZMOM) for (int i = 0; i < nb; i++) outs[1][i] = (double)iouts[0][i];
         if (f == F_FRACTAL) for (int q = 0; q < 2; q++) for (int i = 0; i < nb; i++) outs[q][i] = (double)iouts[q][i];
         (void)d1; (void)d2; (void)s1; (void)s2; (void)d3; (void)s3; (void)d4; (void)s4; (void)xp; (void)xd;
         int32_t head[4] = { ret, lb, beg, nb };

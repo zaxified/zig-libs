@@ -46,3 +46,9 @@ var bb = try ind.BbandsStream(f64).init(.{}, buf);
 Provenance: formulas, constants and operation order ported from the C source of TA-Lib 0.8.3
 (BSD-3-Clause, Mario Fortier); its notice and licence text are in [`NOTICE`](NOTICE). No TA-Lib
 code is vendored or linked.
+
+- **Momentum group:** ADX, ADXR, DX, PLUS_DI, MINUS_DI, PLUS_DM, MINUS_DM, AROON, AROONOSC, MOM, ROC, ROCP, ROCR,
+  ROCR100, BOP, IBS, QSTICK, WAD, ASI, SI, IMI, AO, AC, DPO, ER, FOSC, CTI, VHF, WILLR, FRACTAL, CCI, CHOP, CHOPTR,
+  VORTEX, MFI, ULTOSC, CMO, CMOU, CG, APO, PPO, TRIX, COPPOCK, ERI, DOSC, FISHER, PSO, SMI, TSI, WAVETREND, KST,
+  KSTEXT, KDJ, STOCHRSI, CRSI, STC, SQZMOM (57 functions, same API conventions; multi-input streams take a struct,
+  `update(.{ .high = h, .low = l, .close = c })`). All bitwise equal to TA-Lib 0.8.3 (PSO within 2 ULP of glibc's `tanh`).

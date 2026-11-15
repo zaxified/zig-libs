@@ -286,7 +286,7 @@ pub fn SwingCore(comptime accumulate: bool) type {
         sum: f64 = 0.0,
         pub fn validate(p: Params) Error!void {
             // TA-Lib: !(x >= 1e-8 && x <= TA_REAL_MAX) is out of range (NaN included)
-            if (!(p.limit_move >= 1e-8 and p.limit_move <= std.math.floatMax(f64))) return error.BadParam;
+            if (!(p.limit_move >= 1e-8 and p.limit_move <= 3.0e37)) return error.BadParam;
         }
         pub fn lookback(_: Params) usize {
             return if (accumulate) 0 else 1;

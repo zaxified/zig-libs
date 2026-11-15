@@ -87,7 +87,7 @@ fn replay(comptime T: type, v: vecs.Vec) !void {
 }
 
 test "frozen TA-Lib vectors: every seed function, f64 and f32, unstable levels" {
-    for (vecs.ulp_bound) |b| try testing.expectEqual(@as(u64, 0), b);
+    for (vecs.ulp_bound[0..17]) |b| try testing.expectEqual(@as(u64, 0), b);
     var seen: [17]usize = @splat(0);
     for (vecs.vectors) |v| {
         if (v.func >= 17) continue; // other waves: see mom_oracle_test.zig
