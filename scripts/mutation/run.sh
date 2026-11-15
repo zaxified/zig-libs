@@ -11,7 +11,7 @@
 #
 # One line per mutant on stdout, TSV:  <id> <verdict> <seconds> <reason>
 #   PASS       id 0 only; anything else for 0 stops the run (exit 2)
-#   KILLED     rc != 0 with a failing test, a panic or a signal in the log
+#   KILLED     rc != 0 with a failing test, a panic, a leak report or a signal in the log
 #   HANG       killed at MUT_TIMEOUT (counts as killed, reported apart)
 #   SURVIVED   rc 0
 #   UNCLEAR    rc != 0 with none of the above -- e.g. a build/link problem or an
