@@ -129,6 +129,8 @@ if (rcode != .no_error) return error.UpdateRefused;
 // Resolvers (made from the Options, at most `max_concurrent_lookups` = 8), so
 // misses on different names run in parallel. `gpa` must be thread-safe.
 // `cache.resetFailures()` clears every key's failure backoff (network is back).
+// `cache.forget(.ip, name)` / `forgetReverse` / `forgetSrv` drop one key (answer + backoff).
+// `.cache`/`.stale` `lookupIp` hits are re-sorted by RFC 6724 (`resort_ip_hits`).
 var cache = try dns.CachingResolver.init(gpa, io, .{}, .{ .stale_s = 3600 });
 defer cache.deinit();
 
@@ -136,6 +138,7 @@ var ans = try cache.lookupIp("example.com"); // also reverse/lookupMx/Ns/Txt/Cna
 defer ans.deinit(); // ans.lookup is the caller's own copy
 // ans.source: .network (asked just now), .cache, or .stale (the network failed);
 // ans.lookup.ttl_s: seconds of cache life left.
+// ans.stale_reason: ?Error, why a .stale answer was served (the stale window counts from expiry).
 std.debug.print("{d} addresses, {t}\n", .{ ans.lookup.items.len, ans.source });
 ```
 
