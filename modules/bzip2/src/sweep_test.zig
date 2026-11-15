@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! No-panic sweep tests (wave GU, findings BZ-1 .. BZ-4); see
-//! ~/CML/20261029-panic-sweep/bzip2-sweep.report.md.
+//! the 2026-10-29 panic-sweep report for `bzip2`.
 
 const std = @import("std");
 const testing = std.testing;
