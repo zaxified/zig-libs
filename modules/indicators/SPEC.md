@@ -376,17 +376,20 @@ TA-Lib quirks found in the C (all kept, each pinned by the oracle):
   VORTEX, CMOU** zero their running sums after a window of exactly flat bars (`nullRun`) so no residue is left;
   **FOSC, CTI, CG** re-anchor their regression sums (32 periods, or on cancellation); **CG** keeps the window
   sums as 2 or 3 exactly-added integer limbs and re-derives the scale when a value no longer fits.
-- **CRSI** needs PERCENTRANK, **SQZMOM** needs STDDEV / MIDPRICE / LINEARREG: implemented privately (`CRSI.step`,
-  `LinReg` in `mom_comp2.zig`, `bands.VarCore`), to be merged with the public versions of the statistic wave.
+- **CRSI** composes `statistic.PercentrankCore`, **SQZMOM** `bands.VarCore` (the variance core STDDEV and VAR
+  share), `overlap.MidpriceCore` and `statistic.LinearregCore`: the momentum wave's private copies are gone
+  (the oracle agreement is unchanged).
 - **APO / PPO** default to EMA (not SMA); PPO answers 0 when the slow MA is ~0 and, for windowed MA types, when the
   whole slow window is exactly zero. **KDJ** defaults to RMA (type 13): `error.Unsupported` until RMA is wired
   into `MaCore`.
-- **PSO**: `tanh` is fdlibm's (`expm1`-based) as in glibc; Zig's `std.math.tanh` is musl's and differs by an ULP.
-  The remaining 16 of 20930 values differ by at most 2 ULP (glibc's `expm1` against `std.math.expm1`): the
-  ULP bound of PSO is 2, every other function is bitwise.
+- **PSO**: `tanh` is `xmath.tanh` (fdlibm's `expm1`-based form, as in glibc; Zig's `std.math.tanh` is musl's and
+  differs by an ULP), the same function as the TANH transform. 16 of 20930 values differ from glibc by at most
+  2 ULP (glibc's `expm1` against `std.math.expm1`): the ULP bound of PSO is 2, every other function is bitwise.
+  (The momentum wave's private copy of the same formula had no NaN branch and gave 1 for NaN; it measured the
+  same 16 / 2 on PSO and 31878 of 31883 bitwise on TANH against `xmath.tanh`'s 31880, so it was dropped.)
 - ASI / SI refuse a limit move outside `[1e-8, 3e37]` (NaN included).
 
 Anchoring: the live oracle covers all 57 (grid in `tools/interop.zig`: defaults, edges, swaps, SMA / EMA / WMA /
 DISABLED where an MA type is a parameter, out-of-range values, unstable 0 / 3 / AUTO4 / AUTO8, lengths up to 5000,
-f64 and f32), frozen replay in `src/mom_oracle_test.zig`. Not covered: MA types after WMA (APO, PPO, KST EXT, KDJ,
+f64 and f32), frozen replay in `src/oracle_test.zig`. Not covered: MA types after WMA (APO, PPO, KST EXT, KDJ,
 STOCHRSI: the grid is widened after the overlap wave is merged), NaN input, other toolchains.

@@ -17,6 +17,7 @@ const smooth = @import("smooth.zig");
 const rsi_ = @import("rsi.zig");
 const vs = @import("vs_kit.zig");
 const mu = @import("mom_util.zig");
+const xmath = @import("xmath.zig");
 const Error = core.Error;
 const Unstable = core.Unstable;
 const MaType = core.MaType;
@@ -489,27 +490,6 @@ pub fn FisherStream(comptime T: type) type {
 
 // ── PSO (fast %K, smoothed twice by an EMA, squashed with tanh) ────────────
 
-/// fdlibm's `tanh` (what glibc ships) on top of `expm1`; Zig's `std.math.tanh`
-/// is musl's three-band variant, which rounds differently in the last bit for
-/// |x| between ~0.25 and 1.
-fn tanhFdlibm(x: f64) f64 {
-    const ax = @abs(x);
-    var z: f64 = undefined;
-    if (ax < 22.0) {
-        if (ax < 2.7755575615628914e-17) return x * (1.0 + x); // 2^-55
-        if (ax >= 1.0) {
-            const t = std.math.expm1(2.0 * ax);
-            z = 1.0 - 2.0 / (t + 2.0);
-        } else {
-            const t = std.math.expm1(-2.0 * ax);
-            z = -t / (t + 2.0);
-        }
-    } else {
-        z = 1.0;
-    }
-    return if (x < 0.0) -z else z;
-}
-
 pub const PsoParams = struct { fastk: usize = 8, ema: usize = 5, unstable: Unstable = core.no_unstable };
 
 pub const PSO = struct {
@@ -560,7 +540,7 @@ pub const PSO = struct {
         const nsk = 0.1 * (fast_k - 50.0);
         const a = self.e1.step(NoSrc{}, nsk) orelse return null;
         const c = self.e2.step(NoSrc{}, a) orelse return null;
-        return tanhFdlibm(0.5 * c);
+        return xmath.tanh(0.5 * c);
     }
 };
 pub fn psoLookback(p: PsoParams) Error!usize {

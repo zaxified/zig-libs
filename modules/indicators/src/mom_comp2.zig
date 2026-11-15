@@ -5,10 +5,9 @@
 //!
 //! KST / KSTEXT, STOCHRSI and KDJ are built from the seed cores (`MaCore`,
 //! `RsiCore`, the stochastic `KCore`, `stoch`); CRSI, STC and SQZMOM have
-//! their own cores. SQZMOM needs a standard deviation, a midprice and a linear
-//! regression (statistic / overlap groups of other waves): private helpers
-//! (`LinReg` below, `bands.VarCore`) keep this file independent of them; the
-//! coordinator may dedupe them at merge.
+//! their own cores. CRSI's percent rank is `statistic.PercentrankCore`; SQZMOM
+//! composes `bands.VarCore` (the standard deviation), `overlap.MidpriceCore` and
+//! `statistic.LinearregCore`.
 
 const std = @import("std");
 const core = @import("core.zig");
@@ -16,6 +15,8 @@ const smooth = @import("smooth.zig");
 const rsi_ = @import("rsi.zig");
 const stoch_ = @import("stoch.zig");
 const bands = @import("bands.zig");
+const stat = @import("statistic.zig");
+const overlap = @import("overlap.zig");
 const comp = @import("mom_comp.zig");
 const vs = @import("vs_kit.zig");
 const mu = @import("mom_util.zig");
@@ -400,7 +401,7 @@ pub const CRSI = struct {
     rsi: rsi_.RsiCore,
     srsi: rsi_.RsiCore,
     ring: mu.Ring,
-    rank: usize,
+    pr: stat.PercentrankCore,
     prev: f64 = 0.0,
     streak: f64 = 0.0,
     n: usize = 0,
@@ -429,7 +430,7 @@ pub const CRSI = struct {
             .rsi = try rsi_.RsiCore.init(.{ .period = p.period, .unstable = p.unstable }),
             .srsi = try rsi_.RsiCore.init(.{ .period = p.streak, .unstable = p.unstable }),
             .ring = mu.Ring.init(scratch[0 .. p.rank + 1]),
-            .rank = p.rank,
+            .pr = try stat.PercentrankCore.init(.{ .period = p.rank }),
         };
     }
     pub fn step(self: *Self, _: anytype, b: In) ?f64 {
@@ -453,14 +454,8 @@ pub const CRSI = struct {
         self.prev = close;
         const sr = self.srsi.step(NoSrc{}, self.streak);
         self.ring.push(rocp);
-        const m = self.ring.n - 1; // index of the current ROCP value
-        if (m < self.rank) return null;
-        var count: usize = 0;
-        var i = m - self.rank;
-        while (i < m) : (i += 1) {
-            if (self.ring.at(i) < rocp) count += 1;
-        }
-        const prank = pf(count) / pf(self.rank) * 100.0;
+        // percent rank of the ROCP value among the previous `rank` ones (the ring holds rank + 1)
+        const prank = self.pr.step(self.ring.view(), rocp) orelse return null;
         if (r == null or sr == null) return null;
         return (r.? + sr.? + prank) / 3.0;
     }
@@ -607,75 +602,6 @@ pub fn StcStream(comptime T: type) type {
 
 // ── SQZMOM (squeeze momentum) ───────────────────────────────────────────────
 
-/// TA_LINEARREG over an f64 series: the value of the least-squares line at the
-/// last bar, with TA-Lib's running sums and their re-anchoring. (Private copy:
-/// the statistic wave provides the public `linearreg`.)
-const LinReg = struct {
-    p: usize,
-    dp: f64,
-    sum_x: f64,
-    divisor: f64,
-    n: usize = 0,
-    sum_y: f64 = 0.0,
-    sum_xy: f64 = 0.0,
-    sum_abs: f64 = 0.0,
-    since: usize,
-    trailing: f64 = 0.0,
-    m: f64 = 0.0,
-    b: f64 = 0.0,
-
-    fn init(period: usize) LinReg {
-        const dp = pf(period);
-        const sum_x = dp * pf(period - 1) * 0.5;
-        const sum_x_sqr = dp * pf(period - 1) * pf(2 * period - 1) / 6.0;
-        return .{ .p = period, .dp = dp, .sum_x = sum_x, .divisor = sum_x * sum_x - dp * sum_x_sqr, .since = 32 * period };
-    }
-    fn fit(self: *LinReg) void {
-        self.m = (self.dp * self.sum_xy - self.sum_x * self.sum_y) / self.divisor;
-        self.b = (self.sum_y - self.m * self.sum_x) / self.dp;
-    }
-    fn step(self: *LinReg, src: anytype, x: f64) ?f64 {
-        const today = self.n;
-        self.n += 1;
-        const p = self.p;
-        if (today + 1 < p) return null;
-        if (today + 1 == p) {
-            var i: usize = p;
-            while (i > 0) {
-                i -= 1;
-                const v = src.at(today - i);
-                self.sum_y += v;
-                self.sum_xy += pf(i) * v;
-                self.sum_abs += @abs(v);
-            }
-        } else {
-            const weighted = self.dp * self.trailing;
-            self.sum_xy = self.sum_xy + self.sum_y - weighted;
-            self.sum_y = self.sum_y - self.trailing + x;
-            self.sum_abs = self.sum_abs - @abs(self.trailing) + @abs(x);
-            self.since -= 1;
-            if (self.since == 0 or @abs(weighted) > 100.0 * self.sum_abs) {
-                self.since = 32 * p;
-                self.sum_y = 0.0;
-                self.sum_xy = 0.0;
-                self.sum_abs = 0.0;
-                var w = pf(p - 1);
-                var j = today + 1 - p;
-                while (j <= today) : (j += 1) {
-                    const v = src.at(j);
-                    self.sum_y += v;
-                    self.sum_xy += w * v;
-                    self.sum_abs += @abs(v);
-                    w -= 1.0;
-                }
-            }
-        }
-        self.fit();
-        self.trailing = src.at(today + 1 - p);
-        return @mulAdd(f64, self.m, pf(p - 1), self.b);
-    }
-};
-
 fn closeFrom(s: anytype, off: usize) @TypeOf(vs.offset(vs.field(s, "close"), off)) {
     return vs.offset(vs.field(s, "close"), off);
 }
@@ -742,7 +668,8 @@ pub const SQZMOM = struct {
     sd: bands.VarCore,
     kcm: smooth.SmaCore,
     band: smooth.SmaCore,
-    lr: LinReg,
+    lr: stat.LinearregCore,
+    mp: overlap.MidpriceCore,
     dev: mu.Ring,
     n: usize = 0,
 
@@ -776,7 +703,8 @@ pub const SQZMOM = struct {
             .sd = bands.VarCore.init(p.bb_period),
             .kcm = try smooth.SmaCore.init(.{ .period = p.kc_period }),
             .band = try smooth.SmaCore.init(.{ .period = p.kc_period }),
-            .lr = LinReg.init(p.kc_period),
+            .lr = try stat.LinearregCore.init(.{ .period = p.kc_period }),
+            .mp = try overlap.MidpriceCore.init(.{ .period = p.kc_period }),
             .dev = mu.Ring.init(scratch[0..p.kc_period]),
         };
     }
@@ -796,17 +724,10 @@ pub const SQZMOM = struct {
         }
         var kcm_v: ?f64 = null;
         if (n >= l - 2 * kc1) kcm_v = self.kcm.step(close_at(src, l - 2 * kc1), b.close);
+        // midprice of the last kc bars (stepped on every bar: the extreme tracker keeps its own index)
+        const mp_v = self.mp.step(src, .{ .high = b.high, .low = b.low });
         if (n < stage) return null;
-        // midprice of the last kc bars
-        var hh = b.high;
-        var ll = b.low;
-        var i = n - kc1;
-        while (i < n) : (i += 1) {
-            const t = src.at(i);
-            if (t.high > hh) hh = t.high;
-            if (t.low < ll) ll = t.low;
-        }
-        const mp = (hh + ll) / 2.0;
+        const mp = mp_v.?;
         const dev = b.close - (mp + kcm_v.?) / 2.0;
         self.dev.push(dev);
         const mom = self.lr.step(self.dev.view(), dev);
