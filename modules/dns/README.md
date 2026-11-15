@@ -28,6 +28,7 @@ derivation was a bookkeeping error.
 | `src/message.zig` | Pure wire codec: encode query / decode response — header, question, RR sections, **name-compression pointers** (strictly-backwards rule + jump budget: loops impossible), A/AAAA/PTR/CNAME/NS/MX/TXT/SOA/SRV/CAA, EDNS(0) OPT. No I/O; golden-byte tested; fuzzed. |
 | `src/config.zig` | `/etc/resolv.conf` + `/etc/hosts` parsing, Go-`nameList` search expansion. Pure string logic, checked against glibc's own behaviour on the same files (`tools/config_oracle.py`). |
 | `src/Resolver.zig` | Blocking client: UDP (TC bit → TCP retry), TCP (2-byte length prefix), DoH POST/GET (`application/dns-message`), DoH-JSON (`application/dns-json`). |
+| `src/CachingResolver.zig` | Answer cache over the high-level lookups: key (kind, lowercased name), positive/negative TTL clamps, no-SOA and partial rules, serve-stale + failure recheck, per-key backoff, optional network budget, bounded LRU table, `std.Io.Mutex`. Loopback-stub tests with an injected clock. |
 | `src/update.zig` | RFC 2136 UPDATE: `Builder` (every prerequisite and update form of §2.4/§2.5, uncompressed, sections in order) + `send` (fresh id, optional TSIG, signed reply required). |
 | `src/tsig.zig` | RFC 8945 TSIG: `sign` / `verify` with HMAC-SHA1/224/256/384/512, request→response MAC chaining, BIND-style peer errors; secret handled under a dead-stack burn. |
 | `src/rdata.zig` | Typed views of TLSA (RFC 6698), SSHFP (RFC 4255), URI (RFC 7553), NAPTR (RFC 3403) and SVCB/HTTPS (RFC 9460) rdata: `dns.rdata.parse(T, arena, rec)` over `Record.data.unknown` (no new `Record.Data` variant, so `dnssec`'s switches are unchanged). SvcParams are validated (ascending keys, §7 value shapes, `mandatory` cross-check) and read through `alpn`/`port`/`ipv4hint`/`ipv6hint`/`ech`/`mandatory`. Golden vectors from dnspython (`tools/rdata_oracle.py` -> `src/rdata_vectors.zig`); fuzzed (`dns-rdata`). |
@@ -118,6 +119,23 @@ var primary = dns.Resolver.init(io, gpa, .{});
 defer primary.deinit();
 const rcode = try dns.update.send(&primary, primary_ip, &b, .{ .key = &key });
 if (rcode != .no_error) return error.UpdateRefused;
+```
+
+### Answer cache
+
+```zig
+// TTL clamps, negative caching (RFC 2308), serve-stale (RFC 8767), per-key
+// failure backoff, a bounded LRU table; thread-safe. The cache owns its
+// Resolvers (made from the Options, at most `max_concurrent_lookups` = 8), so
+// misses on different names run in parallel.
+var cache = try dns.CachingResolver.init(gpa, io, .{}, .{ .stale_s = 3600 });
+defer cache.deinit();
+
+var ans = try cache.lookupIp("example.com"); // also reverse/lookupMx/Ns/Txt/Cname/Srv
+defer ans.deinit(); // ans.lookup is the caller's own copy
+// ans.source: .network (asked just now), .cache, or .stale (the network failed);
+// ans.lookup.ttl_s: seconds of cache life left.
+std.debug.print("{d} addresses, {t}\n", .{ ans.lookup.items.len, ans.source });
 ```
 
 ### Typed rdata (TLSA, SSHFP, URI, NAPTR, SVCB/HTTPS)
