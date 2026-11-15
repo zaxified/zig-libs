@@ -849,3 +849,15 @@ test "re-audit 2026-10-28: Joiner.push takes a fragment that exactly fills the b
     try j2.push(&@as([7]u8, @splat(1)));
     try testing.expectError(error.HandshakeTooLarge, j2.push(&.{ 2, 3 }));
 }
+
+test "record_burn: installRx hands the flag to the protection, default on" {
+    const secret: [32]u8 = @splat(0x5a);
+    var in: Inbound = .init(&joiner_storage);
+    try testing.expect(in.record_burn);
+    try in.installRx(.aes_128_gcm_sha256, &secret);
+    try testing.expect(in.rx.burn_records);
+    in.record_burn = false;
+    try in.installRx(.aes_128_gcm_sha256, &secret);
+    try testing.expect(!in.rx.burn_records);
+    in.wipe();
+}
