@@ -6,7 +6,7 @@
 
 **Scope:** mvp — TA-Lib C 0.8.3, all 237 of its functions: the seed set (17), the Overlap Studies wave (27: every moving-average type, the bands / channels, SAR family, Supertrend, Ichimoku, Zig-Zag), the volume / volatility / price-transform / statistic / math-operator wave (50), the cycle wave (25: HT family, MAMA, three SWAK rows, 15 math transforms), the momentum wave (57: ADX family, AROON, ROC family, oscillators, KST / KDJ / STOCHRSI / CRSI / STC / SQZMOM, ...) and the 61 candlestick patterns (`candles.zig`). Remaining deviations from TA-Lib: MAVP has no streaming type; LINEARREG_ANGLE, PSO and the math transforms (ACOS ... TANH) carry a 2-ULP bound (libm `atan` / `tanh` rounding); the Hilbert family and MAMA a column-relative 1e-13 bound (`atan`); RSI answers NaN where TA-Lib's NaN-poisoned state reads 50; batch and streaming MAX / MIN differ in the sign of a 0.0 / -0.0 tie, as TA-Lib's two tiers do (surveyed 2026-11-15 against `ta_func.h` and the function sources of the 0.8.3 tarball)
 
-**Audit:** review 2026-11-15 · mutation 2026-11-15 (444/463, 19 eq) · src 5bcb52297d23a84b
+**Audit:** review 2026-11-15 · mutation 2026-11-15 (447/468, 21 eq) · src 790b3560d8b6182f
 
 **Hardening:** fuzz 2026-11-15 (1,080,000 runs clean in three verdicts of 4 jobs, INDICATORS_FUZZ, ReleaseSafe; reach on every function: all 237 entries x f64 / f32 x stream, per-function counts printed; the whole surface — every batch function, `Lookback`, every streaming type with `bufLen` / `init` / `update` / `peek` / `value` / `clone` — under NaN / inf / -0 / denormal / huge data, lengths 0 .. 600, parameters at and beyond every range, mismatched slice lengths, short buffers, a failing allocator and in-place calls; batch == stream, `peek` == `update`, the NaN lead == the lookback, no unwritten output slot; the harness checked by 11 planted mutants) · ct n/a — no secret enters an indicator · panic 2026-11-15 (every entry point and every `@intFromFloat` / `@intCast` / `unreachable` / `.?` / allocation site swept, all 237 functions called by the fuzz harness: MEDIAN / PERCENTILE no longer index out of the sorted copy when the data holds a NaN; BBW / PERCENTB streams keep a ring as long as their average needs (KAMA / ZLEMA / VIDYA were wrong and `peek` differed from `update`); ZIGZAG's `pivot_idx` saturates at 2^31 - 1 instead of trapping)
 
@@ -280,7 +280,7 @@ All 61 `CDL*` functions of TA-Lib 0.8.3 (Pattern Recognition), ported from each 
 - Wave I3 ranges are TA-Lib's: DEMA/TEMA/TRIMA/KAMA/ZLEMA/RMA/HMA/VWMA/VIDYA period 1.., MIDPOINT/MIDPRICE/MCGD/DONCHIAN/ACCBANDS/KC/ICHIMOKU/CKSP/SUPERTREND 2.., SWAK 2..10000,
   MAVP 1..10000 with `min <= max`, T3 vfactor [0,1], ALMA sigma [0.01, 3e37] offset [0,1], SAR/SAREXT parameters [0, 3e37] (start value ±3e37), ZIGZAG sensitivity [0,100], FRAMA even.
 - No streaming type for MAVP (a per-bar period needs one average per period: a bank of up to 10000 cores). Streams of CKSP take their scratch in the caller buffer;
-  `clone` of a stream re-binds it. CKSP and ALMA batch take an allocator first (CKSP: `2 * stop_period` f64 scratch, ALMA: the weight table above 64 weights).
+  `clone` of a stream re-binds it. CKSP and ALMA batch take an allocator first (CKSP: `2 * stop_period` f64 scratch, ALMA: the weight table above 64 weights; `MaCore`'s ALMA, which has no allocator, holds up to 64 inline and recomputes the weights per bar above that).
 - `nan = .skip` exists on the recursive functions that never read history (DEMA, TEMA, T3, RMA, MCGD, SWAK, SUPERTREND, KC); not on KAMA / ZLEMA / VIDYA (they read a window, as SMA).
 - Integer outputs (SUPERTREND `trend`, ZIGZAG `trend` and `pivot_idx`, HT_TRENDMODE `trend`) are integer slices, 0 in the lead.
 - Cycle wave ranges are TA-Lib's: the Hilbert family takes none, MAMA limits [0.01, 0.99] (NaN refused), SWAK_BP period 5..2000 and delta [0.05, 0.5], SWAK_HP 5..100000, SWAK_2PHP 2..10000. `nan = .skip` exists on all of them but the math transforms.
@@ -360,8 +360,7 @@ max with the larger t2) and its `variance < 1e-12` clamp (unreachable after the 
 anchor bar has variance >= t2 / p^2 unless it is exactly flat, which gives 0); SAR's clamp of the reversal value to
 the previous high (the extreme point already is the running maximum of the highs); the `peekRings` slot restore
 (the slot a peek clobbers holds bar n - len, which no step reads after pushing bar n); RISEFALL3METHODS'
-`color(4)` (equal to `color(0)` by the pattern's own conditions); `Stream1`'s `nan = .skip` branch (dead: no ring
-stream's parameters have `nan`); HT's `re != 0` and `|imag| <= 0.01` branches (reachable only with an exactly zero
+`color(4)` (equal to `color(0)` by the pattern's own conditions); HT's `re != 0` and `|imag| <= 0.01` branches (reachable only with an exactly zero
 component); and three precision-level choices of `xmath` (the e^-x term of the large-argument cosh/sinh below 45, the
 small-argument sinh and cosh formulas), which move a result by at most one ULP and are checked only by the live
 oracle under the math transforms' 2-ULP bound; and CG's `SCALE_CAP` on the two-limb scale (uncapped, that scale is
@@ -375,10 +374,9 @@ limbs), and MASS's 0 / 0 = 1 and STC's seeded second stochastic, which the trimm
 hand tests. **Review (same pass, adversarial):** no consumer-reachable panic, OOM or
 unbounded allocation found beyond what the 2026-11-15 sweep fixed (allocation is bounded by the input length or by
 `max_period`; streams take caller buffers); lookback sums stay below 2^32 even on 32-bit targets (at most three
-unstable counts of 2^30); batch and stream share every core. Notes, not defects: `Stream1` would answer null on a
-skipped NaN bar where every other wrapper answers the last output (dead today, see above); `MaCore.alma` (MA,
-MACDEXT, BBANDS, ... with `.alma`) recomputes the Gaussian weights per bar (`exp` per weight) where `alma()` uses a
-table — cost only; MAVP keeps a 10001-entry index table on the stack (about 90 KB per call). New tests:
+unstable counts of 2^30); batch and stream share every core. Notes (both closed in the same session, see below): `Stream1` had a NaN-skip branch that would answer null where every other wrapper answers the last output (dead: no ring stream's parameters have `nan`), and `MaCore.alma` (MA,
+MACDEXT, BBANDS, ... with `.alma`) recomputed the Gaussian weights per bar (`exp` per weight) where `alma()` uses a
+table — cost only. Not defects: MAVP keeps a 10001-entry index table on the stack (about 90 KB per call). **Third round (delta, 2026-11-15):** `Stream1`'s dead NaN-skip branch is deleted (and a `nan` parameter on a `Stream1` core is a compile error, so it cannot come back silently); `MaCore`'s ALMA variant (`AlmaTabCore`) keeps its weight table inline for periods up to 64 (a by-value union cannot hold a slice into itself; no allocator, bounded size) and recomputes above, bit for bit the same (measured `ma(.alma)` at 1e5 bars, 38x / 29x / 27x faster at periods 9 / 30 / 64; the table rows of the comparative benchmark do not use `.alma`). Six mutants on the changed lines: 3 killed (table not filled, the table/recompute switch flipped, the ring-slot count), 3 equivalent (the 64 bound off by one and the table bypass: the recompute gives the same bits, cost only; the period-1 table, never read because period 1 returns the input). New tests:
 `src/audit_test.zig` (signed-zero ties of the batch block scan and the streaming rescan, KAMA / VIDYA / CMOU / MFI flat
 rules on data with rounding residue, HMA as three public WMAs at odd periods, MCGD's drop of a non-finite update and
 its evaluation order, MACDEXT's swap of periods and types, ATR / KC NaN skip on the close and in `peek`, APO / AO

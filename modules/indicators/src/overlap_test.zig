@@ -205,6 +205,18 @@ test "ma dispatches every built type; MACDEXT / BBANDS / STOCH accept them" {
     _ = try ind.ma(f64, &xs, &a, .{ .period = 9, .kind = .alma });
     _ = try ind.alma(f64, testing.allocator, &xs, &b, .{});
     try th.expectSameBits(&a, &b);
+    // MaCore's inline weight table (periods <= 64) and the per-bar recompute (above) give the
+    // bits of the batch `alma` table, around the bound; the stream agrees too.
+    for ([_]usize{ 1, 2, 63, 64, 65, 80 }) |per| {
+        _ = try ind.ma(f64, &xs, &a, .{ .period = per, .kind = .alma });
+        _ = try ind.alma(f64, testing.allocator, &xs, &b, .{ .period = per });
+        try th.expectSameBits(&a, &b);
+        const S = ind.MaStream(f64);
+        const buf = try testing.allocator.alloc(f64, try S.bufLen(.{ .period = per, .kind = .alma }));
+        defer testing.allocator.free(buf);
+        var s = try S.init(.{ .period = per, .kind = .alma }, buf);
+        for (xs, b) |x, want| try testing.expect(th.sameOpt(s.update(x), want));
+    }
     // MAMA: the period is ignored, the output is the MAMA line with limits 0.5 / 0.05
     var fama: [n_bars]f64 = undefined;
     _ = try ind.ma(f64, &xs, &a, .{ .period = 9, .kind = .mama });
