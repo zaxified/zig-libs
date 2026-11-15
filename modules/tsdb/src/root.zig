@@ -141,7 +141,7 @@ pub const Db = struct {
     /// call (and across calls) instead of a fresh `alloc`/`free` every
     /// chunk of a long retention sweep.
     sweep_scratch: std.ArrayList([codec.point_key_len]u8) = .empty,
-    /// `range`'s block-cursor shortcut (ttydesk repin A/B, 2026-10-17): the
+    /// `range`'s block-cursor shortcut (the terminal-UI consumer repin A/B, 2026-10-17): the
     /// kvtree version (`Snapshot.txn_id`) at which the store was seen to hold
     /// NO compacted block at all. A snapshot at that same version skips the
     /// second cursor and its root-to-leaf seek; any commit, by this `Db` or
@@ -418,7 +418,7 @@ pub const Db = struct {
     /// labels are a SUPERSET of `filter` — every `(name, value)` pair in
     /// `filter` must be present with an equal value; the series may carry
     /// further labels `filter` says nothing about. For a reader that knows
-    /// the metric name but not every label value up front (ttydesk's own
+    /// the metric name but not every label value up front (the terminal-UI consumer's own
     /// `key`/`field` disambiguation: today it walks and decodes every series
     /// in the store to find the ones for one source, `src/diskhist.zig`,
     /// marked `zig-libs request: tsdb — list series`).
@@ -510,7 +510,7 @@ pub const Db = struct {
     /// pages, one for the meta swap that makes the commit durable — see
     /// `kvtree/src/core.zig`'s `commit`) — `appendBatch` is a CONSTANT number
     /// of commits (one) regardless of how many series are in `batches`, not
-    /// one per series. Replaces ttydesk's own per-series-transaction flush
+    /// one per series. Replaces the terminal-UI consumer's own per-series-transaction flush
     /// loop (`src/diskhist.zig`, marked `zig-libs request: tsdb — append
     /// points of many series in one transaction`).
     pub fn appendBatch(self: *Db, batches: []const SeriesBatch) Error!void {
@@ -1114,7 +1114,7 @@ pub const Db = struct {
     // already documents "merge-less deletes" and a non-shrinking file as
     // inherited kvtree caveats). So `liveSize`/`sweepToBudget` are
     // deliberately about LIVE data — the point entries retention can still
-    // reclaim — not `stat().size`, which a caller reads for itself (ttydesk's
+    // reclaim — not `stat().size`, which a caller reads for itself (the terminal-UI consumer's
     // own `fileSize()`, `src/diskhist.zig`) and which these two functions
     // cannot promise to shrink.
 
@@ -3191,7 +3191,7 @@ test "compact: a regular series packs into blocks, reads back bit-exact, and liv
 }
 
 test "range: no block cursor while the store has no block; a compact through another Db is seen at once" {
-    // ttydesk repin A/B (2026-10-17): every `range` used to seek a second
+    // the terminal-UI consumer repin A/B (2026-10-17): every `range` used to seek a second
     // cursor into the block keyspace, 1.37x task-clock on small scans of a
     // store never compacted. The shortcut is keyed on the kvtree version, so a
     // second `Db` over the same tree compacting must not make the first miss

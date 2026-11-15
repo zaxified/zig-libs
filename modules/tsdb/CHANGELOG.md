@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GN sweep (39 mutants over the sweep diff, ReleaseSafe schemata, one at a time): all 39 killed, 12 of them by 7 new tests in `src/sweep_test.zig` (early canonical bound, in-loop cap, series count across own/foreign commits and every own-commit site, retention chunk `>=`). Not a whole-module mutation score.
 - **2026-10-30** — **CONSUMER-VISIBLE:** `chunk_deletes` / `chunk_examines` of 0 now mean the default (before: an endless loop in `sweepToBudget`, one commit per key elsewhere); `deleteSeries` deletes a block whose header does not decode (counted as 0 samples) instead of failing on it; a retention chunk ends once its kept samples reach `chunk_deletes` (peak memory was up to ~256 MB). **Fixes (no-panic sweep + blind review, § GN):** a persisted series counter at `maxInt` → `CorruptIndex`; a stored series id 0 in a mixed `seriesIds` batch; caller asserts in `seriesIds`/`deleteSeries`/`compact`/`chunk.Writer`/`chunk.Reader.rebind` → total or checked panic; `canonicalize` refuses an over-long label list before copying and sorting it, `parseCanonical` before allocating; with `max_series`, the series count stays valid across this `Db`'s own commits (creating S series between appends rescanned the index S times). New diagnostic field `Db.series_recounts`.
@@ -21,8 +22,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `""`) via `findSeriesMatching` — **new dependency `regex`**; `deleteRange(series, from, to)` (straddling
   blocks re-encoded, one transaction, crash-swept in all four modes); `aggregate` (min/max/sum/count/
   last/avg per bucket, allocation-free). **Source-breaking** only for an exhaustive `switch` over
-  `tsdb.Error` (`TooManySeries`, `InvalidRegex`, `InvalidAggregate`); ttydesk and wgs have none.
-- **2026-10-17** — Perf: `range` on a store that holds no compacted block opens no block cursor (it seeked one per call: 1.37× task-clock on small scans of a never-compacted ttydesk store). Keyed on the kvtree version, so a compact by any `Db` over the same tree is seen at the next `range`. `Range.bcur` is now optional (`?kvtree.Cursor`) — only code reaching into that field notices.
+  `tsdb.Error` (`TooManySeries`, `InvalidRegex`, `InvalidAggregate`); the terminal-UI consumer and the analytics consumer have none.
+- **2026-10-17** — Perf: `range` on a store that holds no compacted block opens no block cursor (it seeked one per call: 1.37× task-clock on small scans of a never-compacted the terminal-UI consumer store). Keyed on the kvtree version, so a compact by any `Db` over the same tree is seen at the next `range`. `Range.bcur` is now optional (`?kvtree.Cursor`) — only code reaching into that field notices.
 - **2026-10-09** — tests: deterministic fuzz driver `TSDB_FUZZ` over the existing harnesses.
 
 - **2026-10-04** — ADDED, no format break: sample compression and series deletion (survey
@@ -33,7 +34,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   blocks and rewrites the one straddling the cutoff; `liveSize` counts block bytes;
   `sweepToBudget` deletes whole blocks oldest-first (its `max_deletes` counts samples and may be
   passed by less than one block). `Db.deleteSeries(id, opts)`. Measured on a copy of
-  ttydesk's history: 9.2× less live data. Stores written earlier need no migration (their samples
+  the terminal-UI consumer's history: 9.2× less live data. Stores written earlier need no migration (their samples
   stay raw until compacted). ⚠ Downgrade hazard: an OLDER tsdb opening a store that has been
   compacted does not see the `0x05` blocks — their samples are missing from its reads and never
   expire. Behaviour note: `SweepToBudgetResult.after` is now `before` minus the
@@ -42,7 +43,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-28** — Retention now bounds the file: with kvtree dropping emptied leaves (same day),
   appending and sweeping at the same rate reaches a steady file size instead of growing ~60 KiB
   per 1000 points. No tsdb code change; README/SPEC corrected and a test pins the steady size.
-- **2026-09-28** — Series listing, multi-series batches, a size budget — requested by ttydesk
+- **2026-09-28** — Series listing, multi-series batches, a size budget — requested by the terminal-UI consumer
   (2026-09-27), which worked around all three in `src/diskhist.zig` (each marked `zig-libs
   request: tsdb — …`; the new API lets that workaround be deleted). New: `Db.seriesIterator()`
   (every registered series, id order, id + parsed `Descriptor`, replacing a walk of ids `1, 2,

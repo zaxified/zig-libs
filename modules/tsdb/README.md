@@ -175,7 +175,7 @@ const c = try db.compact(now_ms - std.time.ms_per_hour, .{});
 _ = try db.deleteSeries(id, .{});
 ```
 
-Measured on copies of real stores (2026-10-04): ttydesk's history (16 series,
+Measured on copies of real stores (2026-10-04): the terminal-UI consumer's history (16 series,
 3080 samples) went from 25.0 to 2.72 bytes per sample of live data (9.2×,
 including the block keys); a regular 15 s gauge packs below 0.5 byte per sample
 inside a block. A series with only a handful of samples gains little — the
