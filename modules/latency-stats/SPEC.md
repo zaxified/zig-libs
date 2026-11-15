@@ -6,7 +6,7 @@
 
 **Scope:** parity — HdrHistogram_c 0.11.10 (percentiles, coordinated-omission correction, iterators, V2 interchange) and fping/ping summary statistics (moments) (surveyed 2026-09-30, re-surveyed and gaps closed 2026-11-02)
 
-**Audit:** review 2026-07-19 · mutation 2026-10-04 (19/21, 2 eq) · src ?
+**Audit:** review 2026-07-19 · mutation 2026-11-15 (40/54, 14 eq) · src ?
 
 **Hardening:** fuzz 2026-11-02 (`LATENCY_STATS_FUZZ=30000`, three harnesses, 30k seeds each clean, ReleaseSafe, every label reached: `wire.decode` with its specific refusals and iterators on hostile results, `recordCorrectedCount` against the one-by-one loop, `add`) · ct n/a — histogram statistics (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: histogram counts saturate, percentile cast in range, NaN p = 0, `add()` min/max only on merged counts; delta audit 11/13 + 2 eq)
 
@@ -87,6 +87,12 @@ against one stream (min/max/mean/stddev) and at the extremes; iterator invariant
 terminate); `wire` round trips, known varint bytes, every truncation, forged configuration (`TooLarge`/`InvalidConfig`), a run past
 the array, a total past u64, a count past i64; the decode fuzz harness (`src/fuzz_test.zig`, driver `LATENCY_STATS_FUZZ`) with an
 in-suite 600-seed reach test; interop with HdrHistogram_c and hdrhistogram-go in `tools/bench.zig`. Run: `zig build test-latency-stats`.
+
+**Audit 2026-11-15 (gap-wave delta).** 6 schemata mutants over `medianWith` (ReleaseSafe, one build, each mutant under
+`setsid -w timeout` and `ulimit -v`): `median` delegating with `.upper` instead of `.lower`, the empty guard dropped,
+the `.lower` rank taken as `n / 2` and as one too low, the `.upper` rank taken as `(n - 1) / 2` and as one too high.
+6 killed (the empty guard by an integer-overflow panic, one off-by-one by an out-of-bounds panic); no test needed.
+The Audit line's count is cumulative: 19/21 (2026-10-04) + 15/27 with 12 eq (the `median`/`select` delta below) + 6/6.
 
 **Audit 2026-11-15 (delta mutation).** 27 schemata mutants over `median`/`select` (the introselect), ReleaseSafe,
 one build, each mutant under `setsid -w timeout` and `ulimit -v`: the empty guard, the rank `(n-1)/2`, the depth budget
