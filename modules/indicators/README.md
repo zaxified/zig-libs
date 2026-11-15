@@ -40,6 +40,9 @@ var bb = try ind.BbandsStream(f64).init(.{}, buf);
 - **Platform:** any (pure logic). **Role:** util. **Concurrency:** reentrant (no shared state).
 - **Depends on:** nothing. Math is f64 for both `f32` and `f64` input.
 
+- **Evidence:** verified bit for bit against TA-Lib 0.8.3 itself: `zig build interop-indicators` (live oracle,
+  see `tools/README.md`) and frozen vectors replayed by `src/oracle_test.zig`.
+
 Provenance: formulas, constants and operation order ported from the C source of TA-Lib 0.8.3
 (BSD-3-Clause, Mario Fortier); its notice and licence text are in [`NOTICE`](NOTICE). No TA-Lib
 code is vendored or linked.

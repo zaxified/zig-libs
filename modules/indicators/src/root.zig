@@ -141,6 +141,7 @@ test {
     _ = bands;
     _ = stoch_;
     _ = @import("testhelp.zig");
+    _ = @import("oracle_test.zig");
 }
 
 test "root: the module doc example runs" {

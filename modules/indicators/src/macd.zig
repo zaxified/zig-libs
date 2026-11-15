@@ -100,10 +100,14 @@ pub const MacdCore = struct {
         try core.checkPeriod(p.signal, 1);
         try p.unstable.check();
         const first = p.seed == .first;
-        const fast_beta = 1.0 - 0.15;
-        const fast_k = 1.0 - fast_beta;
-        const slow_beta = 1.0 - 0.075;
-        const slow_k = 1.0 - slow_beta;
+        // Typed f64 on purpose: untyped float literals are folded at comptime with
+        // more than double precision and `1 - (1 - k)` would not be TA-Lib's value.
+        const k12: f64 = 0.15;
+        const k26: f64 = 0.075;
+        const fast_beta: f64 = 1.0 - k12;
+        const fast_k: f64 = 1.0 - fast_beta;
+        const slow_beta: f64 = 1.0 - k26;
+        const slow_k: f64 = 1.0 - slow_beta;
         const bg = EmaCore.betaK(p.signal);
         const us = EmaCore.unstableOf(26, p.unstable);
         const ug = EmaCore.unstableOf(p.signal, p.unstable);
@@ -509,10 +513,12 @@ test "macdfix uses 0.15 / 0.075, not 2/(p+1)" {
     slow /= 26.0;
     for (xs[14..26]) |v| fast += v;
     fast /= 12.0;
-    const fb = 1.0 - 0.15;
-    const fk = 1.0 - fb;
-    const sb = 1.0 - 0.075;
-    const sk = 1.0 - sb;
+    const k12: f64 = 0.15;
+    const k26: f64 = 0.075;
+    const fb: f64 = 1.0 - k12;
+    const fk: f64 = 1.0 - fb;
+    const sb: f64 = 1.0 - k26;
+    const sk: f64 = 1.0 - sb;
     var line_at: [80]f64 = undefined;
     line_at[25] = fast - slow;
     for (26..80) |i| {
