@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-07** — **FIX (MED, false accept):** `origin` refused only bracketed IPv6 as documented but accepted an unbracketed IPv6 literal when the authority ended in `:port` or a bare `:` (`http://::1:80`, `http://fe80::1:8080`, `http://1:::`): the port split left a host with colons, which `parseIp` took as IPv6. A host with a `:` after the split is now refused. Found by the mutation follow-up's differential check of the `isOrigin` equivalences.
 - **2026-11-07** — **NO CONSUMER-VISIBLE CHANGE:** Mutation-run follow-up, tests only. New tests decide the run's last open mutants: a captured cross-field member's copy is freed exactly once (a long string replaced by a duplicate's value, a digit run past i64), an escaped key's copy is freed, the 33rd key of an object finds a duplicate of the first, the one-pass decoder frees the unescaped copy it lends a fixed-size string, and the one-pass walker counts keys, scalars, objects and arrays inside a materialized subtree against `max_total_nodes` / `max_array_elements` / `max_depth` (no prescan on that path). Also pinned: a uuid3's position 19 takes hex digits only, the shortest (26-character) P2PKH addresses are valid, and an origin whose authority ends in a non-port after a colon (`http://::a`) is refused.
 
@@ -115,7 +116,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `validateQuery`'s decoding and coercion. Fields: bool, integers, floats, enums, `[]const u8`,
   `[N]u8`, `?U` of those -- anything else is a compile error; a field with a default is optional.
   One walk over the query; keys are compared as they decode, so `validateQuery` no longer
-  allocates a decoded copy of every key either. (qap M11.7.)
+  allocates a decoded copy of every key either. (the web-server consumer M11.7.)
 
 - **2026-09-26** — **`parseIntoLeaky` validates and decodes in one tokenization.** The streaming
   walker is push-shaped now (an explicit frame stack fed whole tokens), and `std.json`'s typed
@@ -125,7 +126,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   takes the old multi-pass path, so every invalid document is reported exactly as before; the two
   paths are pinned against each other on the corpus and in the differential fuzz target. A 33-byte
   two-field body: 7,357 → 5,034 instructions per parse (bare `parseFromSliceLeaky`: 2,221).
-  `validateJsonStreaming` runs on the same walker. No API change. (SPEC backlog, found by qap.)
+  `validateJsonStreaming` runs on the same walker. No API change. (SPEC backlog, found by the web-server consumer.)
 
 - **2026-09-22** — **New: `writeJsonSchema(rules, w)` / `writeJsonSchemaFor(T, w)`** — the
   rules as a JSON Schema 2020-12 document, for an API description (OpenAPI 3.1 embeds 2020-12
@@ -141,7 +142,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   report keeps at most `max_errors` errors (default and ceiling: the module's
   1000) and builds none past it; 0 counts as 1, so an invalid document is never
   reported valid. Honoured by `validateJsonLimited`, `parseIntoLimited` and the
-  streaming path. Why: a caller decoding into a fixed buffer (qap's typed bodies)
+  streaming path. Why: a caller decoding into a fixed buffer (the web-server consumer's typed bodies)
   found that aggregating the errors of a body wrong everywhere costs more than
   decoding it — 1500 wrong items overflowed a 4 KiB buffer, so the answer read
   "too large" instead of "invalid". Test pins each path, the 0→1 rule and the

@@ -7768,7 +7768,7 @@ test "case tables: sorted, disjoint runs whose stride divides their span; Go's v
 
 // ── pinned by the 2026-10-24 (wave 8) mutation audit ────────────────────────
 // Each assertion below kills a mutant of the new code that survived the rest
-// of the suite (report: ~/CML/20261024-wave8/validate-mut.report.md).
+// of the suite (report: the 2026-10-24 mutation report for `validate`).
 
 test "mutation wave 8: case tables -- ASCII upper in a lowercase string, the last run of each table" {
     try testing.expect(!validateFormat(.lowercase, "Z") and !validateFormat(.lowercase, "aZ"));
