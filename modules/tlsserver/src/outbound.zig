@@ -443,3 +443,16 @@ test "wave 3: write of nothing: past a full TLS buffer OutputFull, into a full Q
     try q.write(.handshake, "");
     try std.testing.expectEqualStrings("abcd", q.pending());
 }
+
+test "record_burn: installTx hands the flag to the protection, default on" {
+    const secret: [32]u8 = @splat(0x5a);
+    var b: [record.max_record_len]u8 = undefined;
+    var o: Outbound = .init(&b);
+    try std.testing.expect(o.record_burn);
+    try o.installTx(.aes_128_gcm_sha256, &secret);
+    try std.testing.expect(o.tx.burn_records);
+    o.record_burn = false;
+    try o.installTx(.aes_128_gcm_sha256, &secret);
+    try std.testing.expect(!o.tx.burn_records);
+    o.wipe();
+}

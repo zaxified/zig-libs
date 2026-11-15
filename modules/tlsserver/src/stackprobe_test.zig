@@ -60,6 +60,19 @@ test "STACKPROBE: with burn_records off the record entry points leave residue (t
     prot.burn_records = true;
     prot.seq = 0;
     _ = try P.run("seal, burn on", record.Protection.seal, .{ &prot, &buf, 32, .application_data, 0 }, &[_][]const u8{std.mem.asBytes(&prot.aead)}, .{});
+
+    // The same for `open` (it decrypts in place: reseal before each probe).
+    const open_len = record.header_len + 32 + 1 + record.tag_len;
+    prot.seq = 0;
+    _ = try record.Protection.seal(&prot, &buf, 32, .application_data, 0);
+    prot.burn_records = false;
+    prot.seq = 0;
+    try std.testing.expectError(error.DeadStackResidue, P.run("open, burn off (expected to fail)", record.Protection.open, .{ &prot, buf[0..open_len] }, &[_][]const u8{std.mem.asBytes(&prot.aead)}, .{ .quiet = true }));
+    prot.burn_records = true;
+    prot.seq = 0;
+    _ = try record.Protection.seal(&prot, &buf, 32, .application_data, 0);
+    prot.seq = 0;
+    _ = try P.run("open, burn on", record.Protection.open, .{ &prot, buf[0..open_len] }, &[_][]const u8{std.mem.asBytes(&prot.aead)}, .{});
 }
 
 // ── the key and IV derived from a traffic secret (wave 2 of the 2026-11-06 mutation run) ──

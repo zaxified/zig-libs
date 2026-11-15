@@ -432,6 +432,13 @@ test "burn_records off: records still round-trip; init resets the flag to on" {
         // Re-keying (init) restores the safe default.
         try tx.init(suite, s);
         try testing.expect(tx.burn_records);
+        // `initKeyIv` (the QUIC / KeyUpdate path) restores it too.
+        var key: [32]u8 = undefined;
+        var iv: [nonce_len]u8 = undefined;
+        const kl = try Protection.trafficKeyIv(suite, s, &key, &iv);
+        tx.burn_records = false;
+        try tx.initKeyIv(suite, key[0..kl], &iv);
+        try testing.expect(tx.burn_records);
     }
 }
 
