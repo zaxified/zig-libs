@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GQ sweep: Cache 34/37 + 3 eq, Sharded 17/17; 8 new killing tests (`src/sweep_test.zig` GQ-B1..B4, `src/sweep_sharded_test.zig` GQ-SH-1..4).
 - **2026-10-30** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GQ). New limits with safe defaults: `Options.max_key_len` (4096; longer keys are refused like an oversized value) and `Options.max_pinned_bytes` (null = `max_bytes`; `reserve`/the first `pin` return null past it — borrowed, unfilled and parked bytes were outside every cap); `Sharded.max_shards` = 65536 (larger requests clamp) and `Sharded.Options.max_key_len`. Fixes: `max_entries` near maxInt no longer overflows (falls back to plain LRU); pin counter ceiling instead of a wrap; double `release` ignored; re-entrant mutating calls from `on_evict`/`DirtyFn` are a checked panic instead of a use-after-free, `clear` fires hooks before freeing, a hook `get` no longer runs the hill climber (window queue corruption) nor drops a stale entry; `removeMatching` is linear; `Sharded.getOrLoad` same-thread re-entry returns `error.LoadFailed` instead of waiting for itself; `Sharded` callback re-entry on a contended shard panics instead of hanging; `shardStats` out of range returns zeros; Borrow/Fill misuse is a checked panic. Tests: `src/sweep_test.zig`, `src/sweep_sharded_test.zig`.
@@ -49,7 +50,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   flusher (a reservation is dirty from birth). Harmless while the producer fills before
   anyone else can look -- not when it parks on I/O in between (a fiber reading a page into
   the slot; pagecache's `preadRef` does). Unfilled entries are now a miss for all three.
-  Found for qap's research register H4.
+  Found for the web-server consumer's research register H4.
 
 - **2026-09-21** — **A cache under miss pressure no longer degrades to a
   whole-table probe per lookup.** std's open-addressing map leaves a tombstone
@@ -62,7 +63,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   per access at 64 / 256 / 1 024 entries -- 92 % in the probe loop -- against
   **30 000 at every size** once `maintain` rebuilds the index after removals
   reach a quarter of its capacity (`Stats.rehashes` counts them). Found by a
-  qap perf audit: a kv-store GET whose store outgrew its page cache cost
+  the web-server consumer perf audit: a kv-store GET whose store outgrew its page cache cost
   8x a hit. Test: 4 096 puts through a 64-entry cache rebuild at least once
   and the live keys still answer.
 
