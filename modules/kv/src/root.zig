@@ -3305,19 +3305,29 @@ pub const Db = struct {
         var pos = off + rec_fixed;
         while (pos < end) {
             const r = try self.batchRecord(df, win, pos, end, file_size) orelse return null;
+            // Each inner record also carries its own CRC (what `get` and
+            // merge verify later): one that does not hold refuses the
+            // whole envelope here, as a plain record's would.
+            const want = std.mem.readInt(u32, (try win.view(self.store, df.handle, file_size, pos, 4))[0..4], .little);
+            var inner = std.hash.Crc32.init();
             var done: u64 = 0;
             while (done < r.len) {
                 const n: usize = @intCast(@min(replay_window, r.len - done));
-                crc.update(try win.view(self.store, df.handle, file_size, pos + done, n));
+                const b = try win.view(self.store, df.handle, file_size, pos + done, n);
+                crc.update(b);
+                inner.update(if (done == 0) b[4..] else b); // n >= rec_fixed on the first view
                 done += n;
             }
+            if (inner.final() != want) return null;
             pos += r.len;
         }
         if (crc.final() != std.mem.readInt(u32, hdr[0..4], .little)) return null;
 
         pos = off + rec_fixed;
         while (pos < end) {
-            const r = (try self.batchRecord(df, win, pos, end, file_size)).?;
+            // Pass 1 accepted these bytes; they can only differ now if
+            // another process rewrote the file in between — refuse, never panic.
+            const r = try self.batchRecord(df, win, pos, end, file_size) orelse return error.Corrupt;
             const key = try self.gpa.alloc(u8, r.key_len);
             var key_owned = true;
             defer if (key_owned) self.gpa.free(key);
@@ -8870,6 +8880,11 @@ test "batch: forged envelopes with a valid CRC are not applied" {
     try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, &bad_op));
     try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, good[0 .. good.len - 1]));
     try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, &(good ++ [_]u8{0})));
+    // A well-formed record whose own CRC does not hold, under a valid
+    // envelope CRC (review 2026-11-15 F1: `get` and merge would refuse it later).
+    var bad_crc = good;
+    bad_crc[0] ^= 1;
+    try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, &bad_crc));
     // A record whose expiry field is cut by the end of the body; a record one
     // byte longer than the body that declares it, with a CRC over what is there.
     var exp_ok: [rec_fixed + exp_len + 1 + 1]u8 = undefined;

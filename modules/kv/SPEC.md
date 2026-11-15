@@ -8,7 +8,7 @@
 
 **Ahead:** feature — a read-only open beside a live writer in another process: kv's `Options.read_only` reads all 100 of 100 keys and, after `refresh`, the writer's later ones; rosedb, prologic/bitcask and nutsdb have no read-only open and refuse a second process (`directory is used by another process`, `database locked`, `the dir of db is locked`) (`tools/lead_probe`, probe P1) (measured 2026-10-25) · correctness — garbage appended to the active log (a write torn mid-record, 7 lengths × 20 seeds): kv opens with all 1000 keys and takes new writes in 140 of 140; rosedb v2.4.0 panics inside `Open` in 139 of 140 (`slice bounds out of range`, rosedblabs/wal segment.go:447), nutsdb refuses to open in 140 of 140 (`crc error`), prologic/bitcask without its close-time index file refuses in 140 of 140 (`unexpected EOF` / `key/value size is invalid`) (`tools/lead_probe`, probe P2) (measured 2026-10-25)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-15 (71/73, 2 eq) · src 91f5a3551cd7e064
+**Audit:** review 2026-11-15 · mutation 2026-11-15 (72/75, 3 eq) · src 929d9d4d16a1211f
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — key-value store (keyword review, 2026-10-07) · panic 2026-10-29 (hostile manifest/hint/data files: next_file_id and v1-active manifests Corrupt, hint expiry/size checked, replay allocates after the CRC, FsStorage handles total)
 
@@ -399,7 +399,13 @@ or not at all.
   itself happens outside that lock, as for `put`. *Poison:* any storage error during the append or
   its sync poisons the store, as for `put`; the keydir is then unchanged and the batch still holds
   its operations. An allocation failure before the write returns `OutOfMemory` with nothing written
-  and the store usable.
+  and the store usable — except when the commit needs a rotation first (the first batch into a
+  pre-batch active file, or a batch that does not fit): an allocation failure inside that rotation
+  poisons the store, as it does for a `put` that rotates.
+- **Replay checks** (independent review 2026-11-15 of the batch layer, read-only Sonnet: no finding above LOW; delta mutation of the two fixes: dropping the inner-CRC check is killed by `forged envelopes` case 8, the pass-2 `Corrupt` arm is unobservable without a second process rewriting the file): besides the envelope CRC and the tiling, every
+  inner record's own CRC must hold, or the whole envelope is refused (a forged inner record would
+  otherwise open, then fail `get` and every merge); and the second pass re-reading bytes the first
+  pass accepted answers `Corrupt` if another process changed them in between — never a panic.
 - **Semantics.** Operations apply in the order added; the last word on a key wins; a `delete`
   always writes its tombstone (the key may have been put earlier in the same batch), even for a key
   nobody holds (dead bytes, no live key — unlike `Db.delete`, which is a no-op for an absent key);
