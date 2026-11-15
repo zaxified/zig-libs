@@ -31,6 +31,19 @@
 //!   * `deinit` must run in the thread that called `init`.
 //!   * One reader per `StopSignals`: `poll`/`wait` from two threads at once
 //!     compete for the same queue.
+//!   * Two live instances with overlapping sets share the signals (whichever
+//!     reads first gets the record) and must be `deinit`ed last-in first-out: an
+//!     instance only unblocks what IT moved from unblocked to blocked.
+//!   * A signal the process started with ignored (`nohup` ignores SIGHUP, a shell
+//!     ignores SIGINT for a background job) is still queued while blocked, so it
+//!     IS delivered to `wait`/`poll` — the same as Go's `signal.Notify`, which
+//!     also overrides an inherited ignore. `deinit` restores the old mask; the
+//!     disposition itself is never touched.
+//!   * `wait` returns only signals of the set. A signal outside the set keeps its
+//!     usual disposition, and `wait` blocks (until cancelled) if none arrives.
+//!   * A second `deinit`, or `poll`/`wait` after one, is harmless (an error or a
+//!     no-op), but still a caller bug; a COPY of the struct holds the same fd
+//!     number and is not protected.
 //!
 //! Linux only (`error.Unsupported` elsewhere). Standard signals coalesce: two
 //! SIGTERMs sent before the first is read arrive as one.
@@ -161,7 +174,12 @@ pub const StopSignals = struct {
         if (builtin.os.tag != .linux) return;
         _ = linux.sigprocmask(linux.SIG.UNBLOCK, &self.newly_blocked, null);
         _ = linux.close(self.fd_);
-        self.* = undefined;
+        // Not `undefined`: a second `deinit` (or a `poll`/`wait`) on the dead value
+        // must hit a descriptor that is not open (-1 is always EBADF) and an empty
+        // mask, never close an unrelated fd that happened to get the old number.
+        self.fd_ = -1;
+        self.newly_blocked = linux.sigemptyset();
+        self.mask = linux.sigemptyset();
     }
 
     /// The signalfd, for a caller's own epoll/io_uring loop. Readable when a
@@ -182,6 +200,8 @@ pub const StopSignals = struct {
     /// Non-blocking: the next pending signal, or `null` when none is queued.
     /// The "flag form" for a loop that checks between units of work.
     pub fn poll(self: *const StopSignals) Error!?Signo {
+        if (builtin.os.tag != .linux) return error.Unsupported;
+        if (self.fd_ < 0) return error.Unexpected; // after `deinit`
         var pfd = [1]linux.pollfd{.{ .fd = self.fd_, .events = linux.POLL.IN }};
         while (true) {
             const rc = linux.poll(&pfd, 1, 0);
@@ -211,6 +231,7 @@ pub const StopSignals = struct {
     /// Block until a signal arrives and return it. The read goes through `io`,
     /// so cancelling the task returns `error.Canceled`.
     pub fn wait(self: *const StopSignals, io: std.Io) WaitError!Signo {
+        if (builtin.os.tag != .linux) return error.Unsupported;
         var info: linux.signalfd_siginfo = undefined;
         var bufs = [1][]u8{std.mem.asBytes(&info)};
         const file: std.Io.File = .{ .handle = self.fd_, .flags = .{ .nonblocking = false } };
@@ -328,6 +349,74 @@ test "deinit restores the mask, but keeps what the caller had blocked" {
 
 test "init refuses an empty set; deinit unblocks nothing then" {
     try testing.expectError(error.EmptySet, StopSignals.init(.{ .term = false, .int = false }));
+}
+
+test "init with every signal already blocked: nothing is newly blocked, deinit keeps them blocked" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var pre = linux.sigemptyset();
+    linux.sigaddset(&pre, .TERM);
+    linux.sigaddset(&pre, .INT);
+    _ = linux.sigprocmask(linux.SIG.BLOCK, &pre, null);
+    defer _ = linux.sigprocmask(linux.SIG.UNBLOCK, &pre, null);
+    var st = try StopSignals.init(.{});
+    const cm = st.childMask();
+    try testing.expect(!linux.sigismember(&cm, .TERM) and !linux.sigismember(&cm, .INT));
+    try sendSelf(.TERM);
+    try testing.expectEqual(Signo.term, try st.wait(testing.io));
+    st.deinit();
+    try testing.expect(isBlocked(.TERM) and isBlocked(.INT));
+}
+
+test "a pending signal outside the set is never returned" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var pre = linux.sigemptyset();
+    linux.sigaddset(&pre, .USR2);
+    _ = linux.sigprocmask(linux.SIG.BLOCK, &pre, null);
+    defer _ = linux.sigprocmask(linux.SIG.UNBLOCK, &pre, null);
+    var st = try StopSignals.init(.{ .term = false, .int = false, .usr1 = true });
+    defer st.deinit();
+    try sendSelf(.USR2); // blocked by the caller, not part of the set
+    try testing.expectEqual(@as(?Signo, null), try st.poll());
+    try sendSelf(.USR1);
+    try testing.expectEqual(@as(?Signo, .usr1), try st.poll());
+    try testing.expectEqual(@as(?Signo, null), try st.poll());
+    // It is still pending for the thread: drain it, or unblocking would terminate the test binary.
+    var drain = try StopSignals.init(.{ .term = false, .int = false, .usr2 = true });
+    defer drain.deinit();
+    try testing.expectEqual(@as(?Signo, .usr2), try drain.poll());
+}
+
+test "a signal ignored before init is still delivered; deinit leaves the disposition alone" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var ign = std.mem.zeroes(linux.Sigaction);
+    ign.handler = .{ .handler = linux.SIG.IGN };
+    var old = std.mem.zeroes(linux.Sigaction);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.sigaction(.HUP, &ign, &old)));
+    defer _ = linux.sigaction(.HUP, &old, null);
+    var st = try StopSignals.init(.{ .term = false, .int = false, .hup = true });
+    try sendSelf(.HUP);
+    try testing.expectEqual(@as(?Signo, .hup), try st.poll());
+    st.deinit();
+    var now = std.mem.zeroes(linux.Sigaction);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.sigaction(.HUP, null, &now)));
+    try testing.expect(now.handler.handler == linux.SIG.IGN);
+}
+
+test "deinit twice, and use after deinit, never touch another descriptor" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var st = try StopSignals.init(.{});
+    st.deinit();
+    // The old number is reused by the next open; a stale second deinit must not close it.
+    var p: [2]i32 = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&p, .{ .CLOEXEC = true })));
+    defer _ = linux.close(p[0]);
+    defer _ = linux.close(p[1]);
+    st.deinit();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(p[0], linux.F.GETFD, 0)));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(p[1], linux.F.GETFD, 0)));
+    try testing.expectError(error.Unexpected, st.poll());
+    try testing.expectError(error.Unexpected, st.wait(testing.io));
+    try testing.expect(!isBlocked(.TERM));
 }
 
 test "wait blocks until another thread sends" {

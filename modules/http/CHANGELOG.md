@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** test only: the `on_conn_closed` cancel test no longer relies on fixed `sleepMs(100)` waits; it waits (10 s deadline, failing loudly) for the connection's `.idle` state or for the response write to stop advancing, and for the accept loop to return after `shutdown` before canceling `serve`.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only. The card's audit `src` hash was already stale before this change (the h1 request wipe) and is left as it was.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of `Options.on_conn_closed` (ConnSummary, `connEnd`, the summary defer, the refusal paths, the request counters), 31/31 killed; new tests for the cancelation, write-stall, reset, h2c pre-preface and slab-refusal endings; no behaviour change.
