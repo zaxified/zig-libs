@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests for sntp, wave GV. Finding SN-1, see
-//! ~/CML/20261029-panic-sweep/sntp-sweep.report.md.
+//! the 2026-10-29 panic-sweep report for `sntp`.
 const std = @import("std");
 const testing = std.testing;
 const sntp = @import("root.zig");
