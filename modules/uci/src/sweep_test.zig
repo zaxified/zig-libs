@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests (wave GY), findings UC-1 .. UC-3; see
-//! ~/CML/20261029-panic-sweep/uci-sweep.report.md.
+//! the 2026-10-29 panic-sweep report for `uci`.
 const std = @import("std");
 const testing = std.testing;
 const uci = @import("root.zig");
