@@ -481,12 +481,12 @@ test "outbox end to end: a QoS 1 publish whose PUBACK was lost is resent to a pe
     // First connection: session created, publish reaches the broker, its PUBACK is lost.
     var sink1 = BrokerSink{};
     const conn1 = try b.accept(sink1.transport());
-    try c.connect(0, .{ .client_id = "egw", .clean_session = false });
+    try c.connect(0, .{ .client_id = "hub", .clean_session = false });
     try pump(&b, conn1, &wire, 0);
     try sink1.deliver(&c);
     var ev = (try c.poll(0)).?;
     try testing.expect(!ev.connack.session_present);
-    const id = (try c.publish(1, "egw/1/t", "20.5", .{ .qos = .at_least_once })).?;
+    const id = (try c.publish(1, "hub/1/t", "20.5", .{ .qos = .at_least_once })).?;
     try pump(&b, conn1, &wire, 1);
     sink1.len = 0; // the PUBACK never arrives
     try testing.expectEqual(@as(usize, 1), c.outboxLen());
@@ -496,7 +496,7 @@ test "outbox end to end: a QoS 1 publish whose PUBACK was lost is resent to a pe
     // Second connection: the broker still has the session; the client resends on its own.
     var sink2 = BrokerSink{};
     const conn2 = try b.accept(sink2.transport());
-    try c.connect(10, .{ .client_id = "egw", .clean_session = false });
+    try c.connect(10, .{ .client_id = "hub", .clean_session = false });
     try pump(&b, conn2, &wire, 10);
     try sink2.deliver(&c);
     ev = (try c.poll(10)).?; // CONNACK: the resend goes out here
