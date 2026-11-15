@@ -1244,6 +1244,15 @@ fn buildCandle(gpa: std.mem.Allocator, cases: *std.ArrayList(Case), f: Func, see
             c.seed = seed.*;
             try cases.append(gpa, c);
         }
+        if (pi == 0) {
+            // A frozen record on the 0.25 price grid (exact ties: doji bodies, equal opens / closes, touching gaps).
+            var c = base;
+            c.n = candle_extra_n;
+            c.kind = 1;
+            c.seed = nextExtraSeed();
+            c.emit = true;
+            try cases.append(gpa, c);
+        }
         if (pi != 0 and pi > 6) continue;
         // long runs: the pattern must actually fire (reported per function as "nonzero")
         for ([_]u8{ 0, 1, 2 }) |k| {
@@ -1307,6 +1316,21 @@ fn buildCandle(gpa: std.mem.Allocator, cases: *std.ArrayList(Case), f: Func, see
 /// Length of the frozen candle vectors.
 const candle_vec_n = 40;
 
+/// The extra frozen records (2026-11-15 mutation audit): flat runs / price-grid ties, the math transforms' own
+/// domains, and every unstable level where the output actually starts inside the vector. They draw their seeds from
+/// a space of their own, so the records frozen before them keep their inputs.
+const extra_vec_n = 48;
+/// Longest extra record (the file stays under 3.5 MB).
+const extra_max_n = 160;
+const extra_tail = 12;
+/// Length of the extra price-grid candle records.
+const candle_extra_n = 60;
+var extra_seed: u64 = 0x6578_7472_6100_0000;
+fn nextExtraSeed() u64 {
+    extra_seed += 1;
+    return extra_seed;
+}
+
 fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
     var seed: u64 = 0x7461_6c69_6221;
     for (std.enums.values(Func)) |f| {
@@ -1315,6 +1339,8 @@ fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
             continue;
         }
         const plist = try paramsOf(f, gpa);
+        // per unstable level (3 bars, AUTO4, AUTO8): whether a record with outputs is frozen yet
+        var u_frozen: [3]bool = @splat(false);
         for (plist, 0..) |pp, pi| {
             const base = Case{ .func = f, .n = 0, .ip = pp.ip, .dp = pp.dp, .xp = pp.xp };
             const lbo = probeLookback(gpa, base);
@@ -1363,6 +1389,37 @@ fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
                 ck.emit = n == vec_n and pi == 0;
                 try cases.append(gpa, ck);
             };
+            if (pi == 0) {
+                // flat runs (kind 1) at the defaults; the math transforms also inside their domains (4) and over
+                // a wide magnitude range (5)
+                const kinds: []const u8 = if (isMathTx(f)) &.{ 1, 4, 5 } else &.{1};
+                for (kinds) |k| {
+                    if (lb + 2 * extra_tail > extra_max_n) break;
+                    var c = base;
+                    c.n = @intCast(@max(extra_vec_n, lb + 2 * extra_tail));
+                    c.kind = k;
+                    c.seed = nextExtraSeed();
+                    c.emit = true;
+                    try cases.append(gpa, c);
+                }
+            }
+            if (unstableMatters(f) and pi < 6) {
+                // every unstable level, frozen once with outputs: the first parameter set whose lookback at that
+                // level leaves `extra_tail` outputs within `extra_max_n` bars
+                for ([_][2]u32{ .{ 0, 3 }, .{ 1, 0 }, .{ 2, 0 } }, 0..) |u, ui| {
+                    if (u_frozen[ui]) continue;
+                    var c = base;
+                    c.ukind = @intCast(u[0]);
+                    c.ubars = u[1];
+                    const lbu = probeLookback(gpa, c) orelse continue;
+                    if (lbu + extra_tail > extra_max_n) continue;
+                    c.n = @intCast(lbu + extra_tail);
+                    c.seed = nextExtraSeed();
+                    c.emit = true;
+                    try cases.append(gpa, c);
+                    u_frozen[ui] = true;
+                }
+            }
             if (pi == 0 and f != .trange) {
                 var c32 = base;
                 c32.is32 = true;

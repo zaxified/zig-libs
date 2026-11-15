@@ -826,6 +826,7 @@ test {
     _ = @import("vs_kit.zig");
     _ = @import("oracle_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("audit_test.zig");
 }
 
 test "root: the module doc example runs" {

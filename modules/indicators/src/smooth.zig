@@ -605,6 +605,22 @@ test "ema period 1 is an exact copy and keeps -0.0" {
     try testing.expectEqual(@as(f64, 3), out[2]);
 }
 
+test "ema period 1: a copy in batch and stream (-0.0 and inf pass through), unstable bars only delay it" {
+    const inf = std.math.inf(f64);
+    const in = [_]f64{ 1, inf, 2, -0.0, 3, -inf, 4, 5 };
+    var out: [in.len]f64 = undefined;
+    try testing.expectEqual(@as(usize, 0), try ema(f64, &in, &out, .{ .period = 1 }));
+    try th.expectSameBits(&in, &out);
+    var s = try EmaStream(f64).init(.{ .period = 1 });
+    for (in) |x| try testing.expect(th.sameBits(x, s.update(x).?));
+    // both auto levels are 0 at period 1, a bar count delays the copy
+    try testing.expectEqual(@as(usize, 0), try emaLookback(.{ .period = 1, .unstable = .auto4 }));
+    var xs: [60]f64 = undefined;
+    th.walk(&xs, 5);
+    try th.checkRec(EmaParams, EmaStream, ema, emaLookback, &xs, .{ .period = 1, .unstable = .{ .bars = 3 } });
+    try th.checkRec(mavg.DemaParams, mavg.DemaStream, mavg.dema, mavg.demaLookback, &xs, .{ .period = 1, .unstable = .{ .bars = 3 } });
+}
+
 test "ema unstable bars delay the output; auto levels use TA-Lib's constants" {
     try testing.expectEqual(@as(usize, 2 + 5), try emaLookback(.{ .period = 3, .unstable = .{ .bars = 5 } }));
     // auto4 = (10p+1)/2 = 15 for p=3; auto8 = (19p+1)/2 = 29.

@@ -450,7 +450,30 @@ test "atan fast path: table, error bound and bitwise agreement with the double-d
     }
 }
 
+test "atan fast path: Ziv's test declines every argument whose value lies near a rounding boundary" {
+    // The fast sum is within 2^-64 of atan (relative); when the double-double value lies within 2^-63 of the
+    // midpoint between two doubles, the sum may be on either side of it, so `fastRounds` must decline.
+    // About 1 argument in 1000 is that close; the sample holds about two hundred of them.
+    var prng = std.Random.DefaultPrng.init(0x21_7a_11);
+    const r = prng.random();
+    var close: usize = 0;
+    for (0..150_000) |_| {
+        const ax = std.math.exp2(r.float(f64) * 40.0 - 20.0);
+        const dd = atanPos(.{ .hi = ax, .lo = 0.0 });
+        const v = dd.hi + dd.lo;
+        const half_ulp = (std.math.nextAfter(f64, v, std.math.inf(f64)) - v) * 0.5;
+        const off = @abs((dd.hi - v) + dd.lo); // distance of the exact value from the double it rounds to
+        if (@abs(half_ulp - off) < 0x1p-63 * v) {
+            close += 1;
+            try testing.expect(fastRounds(atanFast(ax)) == null);
+        }
+    }
+    try testing.expect(close >= 50);
+}
+
 test "sinh, cosh, tanh: values and special cases" {
+    try testing.expect(std.math.isNan(sinh(std.math.nan(f64))));
+    try testing.expect(std.math.isNan(cosh(std.math.nan(f64))));
     try testing.expectEqual(@as(f64, 0.0), sinh(0.0));
     try testing.expect(std.math.signbit(sinh(-0.0)));
     try testing.expectEqual(@as(f64, 1.0), cosh(0.0));
