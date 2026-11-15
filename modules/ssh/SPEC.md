@@ -536,7 +536,7 @@ for the owner):
   and keyboard-interactive paths is the next audit step.
 - **▶ Go x/crypto/ssh parity — owner's goal (2026-10-09: "our ssh qualitatively at the level of the
   Go implementation").**
-  (CML workspace). This settles the two policy items below: the algorithm menu widens to Go's set and
+  (the owner's workspace). This settles the two policy items below: the algorithm menu widens to Go's set and
   becomes configurable, legacy algorithms come as explicit opt-ins (Go's `Insecure*`: DSA, CBC/3DES,
   RC4, DH-sha1, `ssh-rsa` SHA-1; off by default), GSSAPI is in scope. Phases:
   P1 ~~encrypted ed25519/ecdsa OpenSSH keys~~ (done 2026-10-09), ~~configurable algorithm lists~~
