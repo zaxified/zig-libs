@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 25 mutants over the changed code, 19 killed, 6 equivalent (the implicit cap at buf.len+1 or buf.len/4: an edge record is at least 5 bytes, so no built buffer decodes more than buf.len/5 nodes). Survivors became tests: topN with an explicit cap over a DAG buffer stays truncated, the search iterator is finished after Corrupt, an OOM on the first SortedBuilder insert poisons it. Checked panics are not mutated (a test cannot observe a panic in-process). Cumulative 43/50, 7 eq. Card A1 again.
 - **2026-10-28** — **Fix (no-panic sweep):** no consumer-reachable panic or UB (independent review of every pub entry point). The `max_visited == 0` forms (`prefixIterator`, `range`, `search`, `topN`, `opIterator`) stop with `error.Corrupt` after `buf.len` node decodes — a sub-1 KB DAG-shaped buffer `load` accepts enumerated 2^40+ keys; `Builder`/`SortedBuilder.insert` refuse a key past `max_key_len` (default `max_depth`, new `error.KeyTooLong`; ~350 B of frames per key byte); a `SortedBuilder` whose `insert` failed returns `Finished`; `Header.verifyBody` refuses a buffer cut before the footer; `trie.format` re-exports only what consumers use; `Header.encode` and `NodeView.edge` check their arguments in every build mode.
@@ -69,7 +70,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   path-compressed (a single-child chain is one node whose `tail` holds the
   merged bytes), compact leaves (no `subtree_best`, no edge count), children
   before parents with the root last and the metadata in a 24-byte footer. On
-  qap's RÚIAN address index: 397 MB → 70 MB (140 → 24.6 B/key), `topN` mean
+  the web-server consumer's RÚIAN address index: 397 MB → 70 MB (140 → 24.6 B/key), `topN` mean
   315 µs → 76 µs, every key cross-checked. Version-1 buffers still load and
   answer every query; `freezeWith(gpa, .v1)` still writes one.
   - **New:** `SortedBuilder` (streaming v2 writer over sorted keys to any

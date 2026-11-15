@@ -182,7 +182,7 @@ after a realloc), but both are safe at scale; see `SPEC.md` for the numbers.
 
 Version 2 (2026-10-04) compresses every single-child chain into one node, so
 an unshared key suffix costs about its own bytes instead of 16 bytes per byte.
-Measured on qap's real RÚIAN indexes (same keys, v1 → v2):
+Measured on the web-server consumer's real RÚIAN indexes (same keys, v1 → v2):
 
 | index | keys | v1 | v2 | v2 + ordinals |
 |---|---:|---:|---:|---:|
