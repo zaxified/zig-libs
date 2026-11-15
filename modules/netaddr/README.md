@@ -73,6 +73,7 @@ _ = ip.compare(other);               // v4 before v6, then numeric (Addr.Compare
 _ = ip.next(); _ = ip.prev();        // ?Ip, null at the family's ends
 _ = ip.isGlobalUnicast();            // + isLinkLocalMulticast, isInterfaceLocalMulticast
 _ = ip.prefix(24);                   // ?Prefix, masked (Addr.Prefix)
+_ = ip.key(64);                      // [16]u8 map key: v4 zero-padded, v6 masked to its /64
 
 // ipnet / Python ipaddress parity
 const net = netaddr.parsePrefix("192.0.2.0/24").?;

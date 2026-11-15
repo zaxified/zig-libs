@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — ill-formed UTF-8 becomes one U+FFFD per maximal subpart (Unicode §3.9, WHATWG; Python's `decode('utf-8', 'replace')` as the oracle), while Go encoding/json, log/slog, zerolog v1.35.1, zap v1.28.0 and phuslu/log v1.0.138 all write one per byte of a truncated sequence (`E1 80` → 2, `F0 9F 98` → 3) (test `lead: one U+FFFD per maximal subpart where five Go JSON loggers write one per byte`; `tools/go_utf8_probe`) (measured 2026-10-25) · speed — JSON Lines faster than every measured writer: 0.89× phuslu/log v1.0.138 (the fastest), 0.60× zerolog v1.35.1, 0.72× serde_json 1.0.150, 0.21× zap v1.28.0; logfmt 0.28× go-logfmt v0.6.1 (`zig build bench-accesslog`, `tools/go_fast_bench`, `tools/rust_fast_bench`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (1246/1314, 68 eq) · src 868c88a19ea23d8f
+**Audit:** review 2026-11-12 · mutation 2026-11-15 (1299/1369, 70 eq) · src 619518d104a8b364
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, ACCESSLOG_FUZZ) · ct n/a — log formatting, no keys (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point: no data-reachable panic; latency total for any injected clock)
 
@@ -337,7 +337,8 @@ not something this formatter can detect).
 - **`%{Name}i` for any request header** — `LogFormat` knows only `Referer` / `User-Agent`, because `Entry` carries no other header. Today: `Logger.extra_fn` copies the header into an extra field and the template prints it with `%{key}x`. Ideal: an optional header lookup passed to `LogFormat.write` (or a bounded `Entry.headers`). Effort: small-medium. Fits §2.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- **`Sink` non-blocking overflow mode (consumer request 2026-11-15; effort M).** `Sink` is group-commit: a full batch makes the caller wait for the flusher, so a server that must never block its accept loop on a stalled log destination (journald) builds its own bounded queue that drops and counts. Expected: zap/zerolog non-blocking writers with dropped-message counts, log4j `AsyncAppender` `blocking=false`. Proposed: `Sink.Options.overflow: enum{ block, drop_counted } = .block` plus `Sink.dropped() u64`; the dropping variant needs a flusher that is not a caller (a queue and a writer task or thread), which departs from today's allocation-free, task-free design, so decide whether it belongs in `Sink` or in a sibling `AsyncSink`. Second, smaller item (S): `writeLogfmtValue` is private (`src/root.zig` `fn writeLogfmtValue`); expose `writeLogfmtValue(w, s, .{ .max_len })` for non-HTTP logfmt lines that want the same quoting and escaping.
+- ~~**`Sink` non-blocking overflow mode**~~ *(consumer request 2026-11-15)* — DONE 2026-11-15 as a sibling, `AsyncSink` (`async_sink.zig`); `Sink` is unchanged (allocation-free, task-free, group commit, caller-flushed). `AsyncSink.init(self, gpa, io, writer, .{ .max_bytes, .max_lines, .format, .template })` allocates one byte ring and starts one writer task (`Io.Group.concurrent`; `error.ConcurrencyUnavailable` when `io` has none, `error.InvalidOptions` for a zero capacity). `log(line)` / `logEntry(entry)` never wait for the destination: the mutex is held for a memcpy only; a line that does not fit whole, a queue already at `max_lines`, a line over `max_bytes`, or a line logged after `deinit` began is dropped and counted (`dropped() u64`). `flush()` waits for what was accepted before the call; `deinit()` drains, stops the writer and frees. The writer takes everything queued as one batch (up to two `writeAll`s across the ring seam, one `flush`) and releases its space afterwards, so producers never overwrite it. Writer errors are swallowed and not counted as drops. **Left out:** a `drop_oldest` mode, per-level policies, a `blocking` mode (that is `Sink`).
+- ~~**`writeLogfmtValue` public**~~ *(consumer request 2026-11-15)* — DONE 2026-11-15: `writeLogfmtValue(w, s, .{ .max_len })` is `pub` with the unchanged quoting/escaping; `max_len` (default null) cuts the raw value to that many bytes before quoting, byte-wise, no marker.
 
 ## Design & invariants
 
@@ -398,6 +399,25 @@ into one `writeAll` where the old escaper wrote byte by byte), a valid-UTF-8 rec
 329.2 ns (−24.5 %), and a record whose fields are mostly ill-formed 363.4 → 456.9 ns (+25.7 %,
 i.e. +93 ns and only for records that actually carry bad bytes). Nothing is allocated and
 nothing is copied when the input is clean.
+
+**Audit 2026-11-15 (delta mutation).** 55 schemata mutants over the new code, ReleaseSafe, one build, each mutant
+under `setsid -w timeout` (15 s) and `ulimit -v`. `writeLogfmtValue`'s `max_len` (6): the limit ignored, one byte
+too many or too few, the cut applied after the quoting decision, the verbatim write or the escape loop reading the
+uncut value. `async_sink.zig`, whole file (49): `init`'s two option checks; `deinit`'s `closing`, wake, drain wait,
+reap and free; `log`'s empty-line check, newline detection and accounting, the `closing`/byte/line drop conditions
+(each dropped, each off by one) and counter, the ring offsets, the wrap-around split and both copies, the newline
+byte, `used`/`lines`/`accepted` updates and the wake; `logEntry`'s format and template choice and its drop count;
+`dropped`, `flush`'s target and exit condition; the writer task's wait, exit test, wrap split, both writes, the
+flush, and the `head`/`used`/`lines`/`completed` bookkeeping, both broadcasts and `writer_done`. 27 of the first
+run's kills were hangs (a missing wake, broadcast or exit flag), counted as kills. 6 survived: a line logged after
+`deinit` began was accepted instead of dropped, the line cap was one too generous (and, separately, absent) with
+the byte cap hiding it, and the template path of `logEntry` was never exercised; each got a test (a late `log`
+behind a stalled destination, a queue whose line cap binds first, a template sink) and the rerun killed all four
+that a test can reach. The two left: the wait on `writer_done` in `deinit` is EQUIVALENT (redundant with the
+`group.await` right after it, which returns only once the task has finished); skipping the `group.await` itself
+is UNOBSERVABLE (the task is already past its last access to the sink once `writer_done` is seen, so only the
+reaping of the task handle differs; it needs a leak or ordering check inside the `Io` implementation).
+53/55; the score counts the unobservable one with the equivalents (2 eq): 1 equivalent, 1 unobservable.
 
 **Audit 2026-10-04 (mutation).** 33 schemata mutants over `utf8Step` (every second-byte
 range of Table 3-7, continuation checks, maximal-subpart lengths), `writeJsonString`

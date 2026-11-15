@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — on 15 inputs whose validity the RFC 3339 §5.6 / RFC 5322 §3.3 grammar decides, ours answers as the grammar on every one, while humantime 2.4.0 departs on 2 (accepts an empty fraction `37.Z`, refuses the lower-case `t`/`z` the RFC allows), jiff 0.2.38 on 4 (accepts a `+24:00` offset, a time without seconds, zone `UTC`; refuses a 10-digit fraction) and chrono 0.4.45 on 1 (refuses the trailing CFWS RFC 5322 allows); outside the count, the leap second `:60` the crates take as `:59` is refused by design (test `lead: RFC 3339 / RFC 5322 grammar …`; `tools/rust_fast_bench --probe`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-07 · mutation 2026-11-07 (777/810, 33 eq) · src 38f04c3d30b11e40
+**Audit:** review 2026-11-07 · mutation 2026-11-15 (787/820, 33 eq) · src f6cb0df087ccb69c
 
 **Hardening:** fuzz 2026-10-25 (400,000 runs clean, DATEFMT_FUZZ; reach on every label) · ct n/a — date formatting (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point: no data-reachable panic; `isoWeek`, `isoWeekday` and `diffInYears` total at the i32/i64 edges)
 
@@ -112,6 +112,13 @@ and 400 generated mail dates, each row labelled `agree` / `reject` / `own` with 
 re-takes both. Run: `zig build test-datefmt` (also `-Doptimize=ReleaseFast`), `zig fmt --check
 modules/datefmt`.
 
+**Audit 2026-11-15 (delta mutation).** 10 schemata mutants over the 2026-11-15 additions, ReleaseSafe, one
+build, each mutant under `setsid -w timeout` and `ulimit -v`: `parseDuration`'s hand-off to `parseDurationExt`
+(each option forced on), the options reaching `durationUnit`, each unit's gate (forced open, forced shut), each
+unit's value (`d` as an hour, `w` as a day) and the unknown-unit result. 9 killed in the first run; 1 survived
+(`parseDuration` accepting `w`: the existing test compared the option-less call only against `d`) and got a test
+(`parseDuration("1d")`/`("1w")` refused); the rerun killed it. 10/10, 0 equivalent.
+
 **Audit 2026-10-04 (mutation).** 51 schemata mutants over the civil core (leap rule,
 `daysInMonth`, `validate`, ISO week-date bounds), the tokenizer cap, `parse` (YY pivot,
 1-2 digit fields, fraction width/scale, `e` range, AM/PM and 12-hour mapping, `ZZ` sign,
@@ -178,6 +185,7 @@ past the month end, `parseIsoDate` length, xsd separator/zone/digits, `MAX_TOKEN
 - ~~**Speed: 0.23–18.95× Go 1.26.0 time**~~ **DONE 2026-10-10/11 → 0.06–0.91×** *(`zig build bench-datefmt`, two 5-round runs, worst row `parse_imf` 0.90–0.91×)*: the format string was matched against the whole 30-entry token table at every position, `Tokenized{}` was memset byte by byte (1.5 KB, Zig 0.16 ReleaseFast), and `format` went through `print` into a growing writer. Now: first-character token lookup, no defaulted array, a bounded stack buffer with one allocation, `Layout` to tokenize once, and the canned RFC 3339 / IMF-fixdate functions. The 10-10 row `fmt_rfc3339` (1.7–1.8×) paired our token engine with Go's special-cased RFC 3339 layout; since 10-11 canned meets canned (`formatRfc3339` vs `Format(time.RFC3339)`, 0.53×) and the token engine meets a layout Go does not special-case (`fmt_rfc3339_tokens`, 0.70×).
 
 - ~~**General RFC 2822 parser, durations, nanosecond Unix time**~~ **DONE 2026-10-11** *(survey 2026-09-30, "Where we are behind")*: `parseRfc2822`/`bufRfc2822`, `parseDuration`/`bufDuration` (Go-exact), `partsToUnixNs`/`unixNsToParts`, `toUtc`; anchored on Go and Python (see *Verification*). Locale names, zone-aware values and calendar periods stay out of scope (*Threat model / out of scope*, with the reason).
+- ~~**Day and week units in duration text**~~ **DONE 2026-11-15** *(consumer request 2026-11-15)*: `parseDurationExt(s, .{ .days, .weeks })` accepts `d` (exactly 24 h) and `w` (7 d) on top of Go's grammar, both off by default; `parseDuration` is unchanged and stays exactly Go's. Overflow of `i64` nanoseconds is `error.InvalidDuration`. Go has no such units, so there is no oracle row; the tests pin the arithmetic and the boundary (106751 d fits, 106752 d does not).
 - ~~**Fractional seconds**~~ **DONE 2026-09-30** *(survey 2026-09-30)*: a sub-second field on `DateParts` (defaulted, so existing callers keep compiling) plus `SSS`/`SSSSSS`-style tokens in `parse` and `format`. Why: every chrono/Go/zeit user reads and writes timestamps with milliseconds (logs, JSON APIs, RFC 3339); today `format` cannot emit them and `parseXsdDateTime` throws them away. Effort: small–medium. Fits CONVENTIONS §2 (pure Zig).
 - ~~**ISO week number and week-year**~~ **DONE 2026-09-30** *(survey 2026-09-30)*: `isoWeek(parts) -> {year, week}` and `YYYY-Www-D` parse/format tokens. Why: reporting and scheduling code in Europe keys on ISO weeks; chrono and Go `time.ISOWeek` have it (the latter *(inferred)*). Effort: small (Hinnant-style arithmetic on the existing core). Fits §2.
 - ~~**Canned RFC 3339 and RFC 2822/1123 helpers**~~ **DONE 2026-10-11** *(survey 2026-09-30)*: `bufRfc3339`/`formatRfc3339` (0..9 fraction digits, `Z` or `±hh:mm` from `off_min`), `parseRfc3339` (offset required, kept in `off_min`), `bufImfFixdate`/`formatImfFixdate`/`parseImfFixdate` (RFC 9110 HTTP date, weekday checked). The `buf*` forms take a fixed-size array and never allocate -- what the web-server consumer `access.zig` and `http` `Server.zig` hand-roll today (candidates to switch). Not done: general RFC 2822 (numeric zones, comments, obsolete forms).

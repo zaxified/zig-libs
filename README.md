@@ -17,7 +17,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 261 modules (Zig 0.17.1, tests green in `ReleaseSafe` and `ReleaseFast`)
+**Status:** 262 modules (Zig 0.17.1, tests green in `ReleaseSafe` and `ReleaseFast`)
 · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -218,6 +218,7 @@ build.zig.zon  # one package manifest for the whole collection
 CHANGELOG.md   # per-release changes, grouped by module
 CONVENTIONS.md # naming + `meta` tag vocabulary + provenance/SPDX + versioning rules
 SURVEY-PLAYBOOK.md # how a module is surveyed against other implementations before it ships an example
+NEW-MODULES.md # accepted ideas for modules that do not exist yet
 modules/<name>/src/root.zig  # `// SPDX-License-Identifier: MIT`, `pub const meta`, API, tests
 modules/<name>/README.md     # what it is + a Provenance line
 modules/<name>/SPEC.md       # wire format, limits, anchoring, what is deliberately not done
@@ -292,7 +293,7 @@ those crypto and format modules are yours too without going looking.
 | `storage` | 17 | [`zstd`](modules/zstd/README.md) (format) · [`crc32`](modules/crc32/README.md) (format) · [`crc32c`](modules/crc32c/README.md) (format) · [`hashdigest`](modules/hashdigest/README.md) (crypto) |
 | `crypto` | 89 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
 | `format` | 29 | [`http`](modules/http/README.md) (web) · [`decimal`](modules/decimal/README.md) (storage) |
-| `os` | 15 | [`framing`](modules/framing/README.md) (format) |
+| `os` | 16 | [`framing`](modules/framing/README.md) (format) |
 <!-- END GENERATED: check-libs-table -->
 
 
@@ -302,7 +303,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 <!-- BEGIN GENERATED: check-portable-table (source: build.zig; regenerate with `zig build gen-portable-table`; do not hand-edit) -->
 ### Portability — claimed vs. verified
 
-Every one of the 261 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 261 modules — a linux64-only module has nothing further to show here.
+Every one of the 262 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 262 modules — a linux64-only module has nothing further to show here.
 
 47 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 57 declared pairs, 56 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 
@@ -377,7 +378,7 @@ Every one of the 261 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | [`cors`](modules/cors/README.md) | 1 | CORS preflight + header injection (secure defaults) | any | router, http |
 | [`grpc`](modules/grpc/README.md) | 4 (S) | gRPC client **and** server over HTTP/2 (over `protobuf`) — no code generation; all four call shapes (unary/streaming/bidi); untrusted declared length never sizes an allocation | any | http, protobuf, b64ct, clock |
 | [`health`](modules/health/README.md) | 1 | Liveness (`/healthz`) + readiness (`/readyz`) probe middleware — 200/503 from registered dependency checks (k8s probe contract) | any | router, http |
-| [`http`](modules/http/README.md) | 2 (A) | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32, b64ct |
+| [`http`](modules/http/README.md) | 1 | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32, b64ct |
 | [`idempotency`](modules/idempotency/README.md) | 1 | Idempotency-Key dedup of unsafe retries — middleware + store (ramcache, or a pluggable Backend; durable KvBackend) replaying a recorded response without re-running the handler | any | router, http, ramcache, kv, clock |
 | [`jwe`](modules/jwe/README.md) | 3 (S,P) | JSON Web Encryption (RFC 7516/7518) compact serialization — RSA-OAEP/AxxxKW/ECDH-ES key management + AES-GCM/CBC-HMAC content encryption, AES-128/192/256 throughout (AES-192 via the aes192/aesgcm modules) | any | rsa, p256, aescbc, aeskw, aes192, aesgcm |
 | [`jwt`](modules/jwt/README.md) | 1 | JWT/JWS + OIDC resource-server validator — parse/claims/verify (HS/ES/EdDSA/RSA and post-quantum ML-DSA per RFC 9964, alg-confusion-safe), JWKS-by-kid incl. kty:AKP, OIDC discovery, plus a router Bearer middleware | any | http, router, p256, p384, p521, rsa, ct25519, b64ct, sha2, keycodec, clock |
@@ -501,7 +502,7 @@ Every one of the 261 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
 | [`aesgcm`](modules/aesgcm/README.md) *(crypto)* | 2 (S,E,A,P) | AES-GCM (AES-128/192/256; any nonce length, SP 800-38D tag lengths) — stateful context caching the key schedule and GHASH powers, x86-64 AES-NI+PCLMULQDQ stitched one-pass kernel picked at run time, std fallback; std-shaped stateless API. | any (x86-64 AES-NI/PCLMULQDQ asm, run-time detected + std fallback) | aes192 |
-| [`http`](modules/http/README.md) *(web)* | 2 (A) | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32, b64ct |
+| [`http`](modules/http/README.md) *(web)* | 1 | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32, b64ct |
 | [`kvtree`](modules/kvtree/README.md) *(storage)* | 1 | Ordered transactional KV store — copy-on-write B-tree (LMDB/BoltDB lineage), MVCC snapshots, crash-safe range scans. | any | kv, crc32 |
 | [`ramcache`](modules/ramcache/README.md) *(storage)* | 2 (S,P) | Bounded in-memory cache — W-TinyLFU admission/eviction, TTL, generation invalidation; sharded thread-safe wrapper. | any | — |
 | [`resilience`](modules/resilience/README.md) *(web)* | 2 (S,A,P) | Circuit breaker (consecutive or failure-rate window) + retry/backoff + timeout + bulkhead for calling upstreams (generic, zero-alloc) | posix | clock |
@@ -642,7 +643,7 @@ Every one of the 261 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
 | [`aescbc`](modules/aescbc/README.md) *(web)* | 2 (S,E,A) | AES-CBC (NIST SP800-38A): one-shot, incremental, streaming with six paddings, ciphertext stealing CS1-3; zero-alloc; padding-oracle caveat — consumers own authenticate-before-unpad | any | — |
-| [`http`](modules/http/README.md) *(web)* | 2 (A) | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32, b64ct |
+| [`http`](modules/http/README.md) *(web)* | 1 | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32, b64ct |
 
 ### Serialization / formats
 
@@ -683,7 +684,7 @@ Every one of the 261 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
 | [`decimal`](modules/decimal/README.md) *(storage)* | 2 (S,E,A,P) | Exact i128 fixed-point decimal for money math with IEEE/GDA rounding modes and rescale — float-free arithmetic, f64 only at an explicit fromFloat/toFloat boundary. | any | — |
-| [`http`](modules/http/README.md) *(web)* | 2 (A) | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32, b64ct |
+| [`http`](modules/http/README.md) *(web)* | 1 | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32, b64ct |
 
 ### Host / OS / agent — process, sandboxing, IPC, and the agent-side glue
 
@@ -702,6 +703,7 @@ Every one of the 261 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | [`pollworker`](modules/pollworker/README.md) | 3 (S,E,H,P) | Single-owner `poll(2)` loop plus a lock-free fork/exec job table, for offloading blocking work off the loop thread. | **linux** | — |
 | [`procrun`](modules/procrun/README.md) | 2 (S,E,A,P) | Subprocess runner — reap-race-tolerant wait, deadlock-free capped stdio capture, timeout, streaming, and cancel. | any | argsafe, clock |
 | [`sandbox`](modules/sandbox/README.md) | 1 | Process self-hardening for an internet-facing server — privilege drop, `setrlimit`/no core dumps, Landlock fs allow-list, seccomp-bpf. | **linux** | — |
+| [`stopsignal`](modules/stopsignal/README.md) | 3? (E,A,H) | The process's own stop signals (SIGTERM/SIGINT/SIGHUP...) via blocked mask + signalfd: wait/poll/fd, no global handler (Go signal.NotifyContext, tokio signal::unix). | linux (signalfd); error.Unsupported elsewhere | — |
 | [`testkit`](modules/testkit/README.md) | 1 | Test-only shared harness — deterministic fuzz driver with shrinking and drawn faults, dead-stack probe, guard-page buffers, hex KAT decoding, golden byte diff, skip conventions; wired via build.zig test_deps, absent from consumer imports | any | — |
 | [`uci`](modules/uci/README.md) | 2 (S,A) | OpenWRT UCI config parser + serializer + typed model, with stable round-trip. | any (codec); Linux/POSIX file layer (`Store`, `Session`) | — |
 

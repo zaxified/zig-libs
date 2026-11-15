@@ -88,6 +88,19 @@ terminate); `wire` round trips, known varint bytes, every truncation, forged con
 the array, a total past u64, a count past i64; the decode fuzz harness (`src/fuzz_test.zig`, driver `LATENCY_STATS_FUZZ`) with an
 in-suite 600-seed reach test; interop with HdrHistogram_c and hdrhistogram-go in `tools/bench.zig`. Run: `zig build test-latency-stats`.
 
+**Audit 2026-11-15 (delta mutation).** 27 schemata mutants over `median`/`select` (the introselect), ReleaseSafe,
+one build, each mutant under `setsid -w timeout` and `ulimit -v`: the empty guard, the rank `(n-1)/2`, the depth budget
+(zeroed, never decremented, exhausted test), the range ends, the three-way partition (both comparisons, both swaps,
+both counter moves, the `gt == 0` guard, the scan step), the narrowing (`k < lt`, `k > gt`, `hi = lt - 1`, `lo = gt + 1`)
+and the return of the pivot and of `a[k]`. 15 killed (1 by a hang); no test needed. 12 are equivalent, each a
+change that only moves the cost or is an invariant: a zero budget (the sort fallback is correct, just not
+linear); `lo <= hi` (with one element left, `k == lo` and the pivot is that element); the budget never
+decremented, `mid = lo`, the first sample taken from `hi`, the pivot `x`, `<=` in place of `<` (all keep a pivot that
+is an element of the range and only cost partition quality; the budget bounds the damage and the fallback sorts);
+`hi = lt` and `lo = gt` (a superset of the needed range); `k >= gt` (when `k == gt` the slot already holds the pivot);
+the `gt == 0` guard (the pivot is an element of the range, so `i` stops before `gt` reaches 0); the final
+`return a[lo]` (the loop only exits with `lo == hi == k`). 15/27, 12 equivalent.
+
 **Audit 2026-10-04 (mutation).** 21 schemata mutants over `Stats.lossPct`, the
 `Accumulator` (min/max, Welford update, RFC 3550 jitter gain and previous sample,
 population stddev, `compute`'s losses) and the `Histogram` (config validation, `recordCount`,
@@ -112,7 +125,7 @@ Verdicts of the 2026-11-02 S2 re-survey (gaps from the 2026-09-30 survey and the
 - **V0/V1 decoding, the interval-log text format (`#[StartTime…]` lines), Go's packed/windowed histograms — rejected.** Legacy or tooling formats; V2 is what current writers produce, `decode` answers `error.Unsupported` for V0/V1 cookies.
 - **Exponential histograms / DDSketch / t-digest, windowing and decay — rejected,** a different algorithm family (see Threat model).
 - **`Accumulator` vs ping/fping:** min/avg/max/mdev/loss % match their summary line (population stddev, as fping and iputils print it); ping's median is not printed by either, `Histogram.valueAtPercentile(50)` gives it.
-- **`median(samples)` (consumer request 2026-11-15; effort S).** `Accumulator` keeps mean/variance/min/max and `Histogram` p50 is bounded-error (HdrHistogram resolution); there is no exact median of a small sample set (`rg median modules/latency-stats/src` finds only the internal bucket median-equivalent). Expected: Python `statistics.median`, numpy `median`. Proposed: `latency_stats.median(samples: []u64) ?u64` by in-place selection (nth_element, not a full sort; null when empty; even count returns the lower middle, documented, or `medianF64` for the average). Allocation-free.
+- ~~**`median(samples)` (consumer request 2026-11-15; effort S).** `Accumulator` keeps mean/variance/min/max and `Histogram` p50 is bounded-error (HdrHistogram resolution); there is no exact median of a small sample set (`rg median modules/latency-stats/src` finds only the internal bucket median-equivalent). Expected: Python `statistics.median`, numpy `median`. Proposed: `latency_stats.median(samples: []u64) ?u64` by in-place selection (nth_element, not a full sort; null when empty; even count returns the lower middle, documented, or `medianF64` for the average). Allocation-free.~~ **Done 2026-11-15:** `median(samples: []u64) ?u64`, introselect (median-of-3, three-way partition, depth budget `2*log2(n)` then `std.mem.sortUnstable` on the range). Reorders the slice, null when empty, even count = lower middle `(n-1)/2` (always a sample; no `medianF64`). Tested against a full sort, and on 100k sorted / reverse-sorted / all-equal / organ-pipe input.
 
 ## Status
 

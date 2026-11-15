@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation audit of `Ip.key` (14 schemata mutants, 13 killed, 1 equivalent; a test with an odd final byte now pins `key(128)`).
+- **2026-11-15** — **NEW:** `Ip.key(v6_bits) [16]u8`: a fixed-size per-client map key (IPv4 zero-padded, IPv6 masked to `v6_bits`, clamped to 128) (consumer request 2026-11-15).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: IPv6 /64 key helper (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-11** — **Tests:** whole-module mutation re-run over the production part of `src/root.zig` after the 0.17.1 move, the no-panic sweep and the duplicate-code pass (824 mutants: 783 killed, 38 equivalent, 3 unobservable, 0 undecided; the 2026-11-07 survivor decisions all hold). Two new audit tests for the survivors the re-run found: `IpSet` lookups with a v6 span that ends below a v4 query value (the bisection predicate must stay monotone across families) and `systemSource` closing its probe socket. No consumer-visible change.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `firstSpanEndingAtOrAfter` (duplicate-code pass) uses `std.sort.partitionPoint`; same index.

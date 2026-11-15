@@ -120,6 +120,7 @@ fn toUtc(parts) DateParts;                       // apply off_min: the same inst
 
 // Durations: i64 nanoseconds, Go's text ("1h2m3.5s", "300ms", "-1.5h")
 fn parseDuration(s) error{InvalidDuration}!i64;  // exactly Go's time.ParseDuration
+fn parseDurationExt(s, .{ .days = true, .weeks = true }) error{InvalidDuration}!i64;  // + `d` (24 h), `w` (7 d), opt-in
 fn bufDuration(buf: *[duration_max_len]u8, ns: i64) []u8;  // exactly Go's Duration.String
 fn formatDuration(alloc, ns: i64) ![]u8;
 fn truncateNs(ns: i64, unit: i64) i64;           // Go Time.Truncate: down, also before 1970

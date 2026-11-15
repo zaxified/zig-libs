@@ -156,6 +156,15 @@ pub const Spec = struct {
     /// pid, no separate id needs to be tracked. POSIX-only; has no effect on
     /// Windows (no process-group concept exposed here).
     new_process_group: bool = false,
+    /// Start the child with an EMPTY signal mask (default; Go's `os/exec` and
+    /// Rust's `Command` do the same) rather than the spawning thread's current
+    /// one. A program that blocks its own stop signals (`stopsignal`, a
+    /// signalfd loop) would otherwise hand a child SIGTERM/SIGINT blocked, and
+    /// `cancel_grace_ns`'s SIGTERM would stay pending until the SIGKILL.
+    /// `false` keeps the inherited mask. Linux vfork path only: std's fallback
+    /// spawn (other POSIX targets, or no readable `/proc/self/environ`) always
+    /// passes the current mask on. Signal dispositions are reset either way.
+    reset_signal_mask: bool = true,
     /// Parent descriptors the child keeps open across `exec` under the SAME
     /// descriptor number (Python's `pass_fds`). Implemented by std's
     /// `SpawnOptions.inherit_files`, which clears `FD_CLOEXEC` on the fd in
@@ -838,6 +847,7 @@ fn spawnVfork(
         .uid = spec.uid,
         .gid = spec.gid,
         .pgid = if (spec.new_process_group) 0 else null,
+        .reset_signal_mask = spec.reset_signal_mask,
     });
     return .{ .id = pid, .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
 }
@@ -3571,6 +3581,42 @@ test "a pid reaped out-of-band is not signalled: stillOurChild is the gate" {
 /// `got-term` and exits 0 (`honour`) or ignores it (`ignore`).
 const term_honouring_sh = "trap 'echo got-term; exit 0' TERM; echo ready; while :; do sleep 0.05; done";
 const term_ignoring_sh = "trap '' TERM; echo ready; while :; do sleep 0.05; done";
+
+fn sigBlkOf(status: []const u8) ?u64 {
+    var it = std.mem.splitScalar(u8, status, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "SigBlk:")) {
+            return std.fmt.parseInt(u64, std.mem.trim(u8, line["SigBlk:".len..], " \t"), 16) catch null;
+        }
+    }
+    return null;
+}
+
+test "reset_signal_mask: the child starts with an empty mask unless asked to inherit it" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!vfork_spawn.supported) return error.SkipZigTest;
+    const linux = std.os.linux;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Block SIGTERM in this (the spawning) thread, as a stop-signal loop does.
+    var term = linux.sigemptyset();
+    linux.sigaddset(&term, .TERM);
+    var old = linux.sigemptyset();
+    _ = linux.sigprocmask(linux.SIG.BLOCK, &term, &old);
+    defer _ = linux.sigprocmask(linux.SIG.SETMASK, &old, null);
+    const term_bit: u64 = @as(u64, 1) << (@backingInt(linux.SIG.TERM) - 1);
+
+    var reset = try run(testing.allocator, io, .{ .argv = &.{ "cat", "/proc/self/status" } }, "");
+    defer reset.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u64, 0), sigBlkOf(reset.stdout));
+
+    var kept = try run(testing.allocator, io, .{ .argv = &.{ "cat", "/proc/self/status" }, .reset_signal_mask = false }, "");
+    defer kept.deinit(testing.allocator);
+    const blk = sigBlkOf(kept.stdout) orelse return error.TestUnexpectedResult;
+    try testing.expect(blk & term_bit != 0);
+}
 
 test "cancel_grace_ns: a child that honours SIGTERM exits on its own within the grace" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;

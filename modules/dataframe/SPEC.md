@@ -576,6 +576,7 @@ the end cell with 0), and `tabular`'s row verbs as a re-derived oracle on genera
 
 ## Backlog / deferred
 
+- **2026-11-15 (consumer request, open):** no binary (de)serialization of a `Frame`. The planned `arrow` (IPC stream/file, every column type incl. list/struct/array and zoned timestamps) and `parquet` modules are now tracked in the root `NEW-MODULES.md`, not only in the scope sentence above; this module stays free of them (the adapter depends on the frame).
 - **2026-11-10 (independent review of the parity-close waves, open, MED/LOW):** (M1) `extract_many`/`find_many` with `overlapping` can hold ~200 MB per row (4M hits) and scan O(len × patterns × pattern length) — capped by `TooLarge` at 4M hits, no cap on the pattern count; (L2) `winCells` maps every error but OOM to `TooLarge`; (L3) `readFwf` keeps 8 bytes per character of a line for `starts`, outside `max_bytes`, and a blank line costs O(specs); (L4) with `parse_dates`, a column of `H:M` text (ratios, scores) is inferred as `.time` — polars does the same for `HH:MM`, check its 1-digit forms; (L5) `linearSpaces` allocates the widest row up front.
 - **2026-11-10 (W11, open, LOW):** (a) an expression past `expr.numType`'s 4096-node walk has no static type, so
   `mutate` falls back to typing by the cells (review L4, inferred, not reproduced); (b) `implode` declares a width

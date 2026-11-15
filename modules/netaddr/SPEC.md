@@ -8,7 +8,7 @@
 
 **Ahead:** feature — RFC 6724 destination ordering (§6) and source selection (§5), which neither Go net/netip nor netipx exposes, checked against glibc `getaddrinfo`'s order and the Linux kernel's source choice on every ordered pair (tests `rfc6724 oracle: destination order as glibc gives it …`, `rfc6724 oracle: IPv6 source as the kernel chooses it`; `tools/rfc6724_oracle.py`) (measured 2026-10-25) · correctness — netipx v0.0.0-20260823151212 `RemoveFreePrefix` answers ok with an invalid prefix in 227 of the oracle's cases; ours never does (test `netip oracle: IPSetBuilder ops, Prefixes, Ranges, probes, RemoveFreePrefix, Overlaps, Equal`; `tools/go_netip_oracle`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (783/824, 41 eq) · src 51991ffa4feef94c
+**Audit:** review 2026-11-12 · mutation 2026-11-15 (796/838, 42 eq) · src 750a5f950146d2ef
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, NETADDR_FUZZ, round-trip oracle) · ct n/a — IP address types (keyword review, 2026-10-07) · panic 2026-10-28 (independent sweep of every pub entry point: no data-reachable panic; `IpSetBuilder` alternation O(n log n), `Zone.slice`/`AddrIterator.next` total, `IpSet.rangeAt` checked)
 
@@ -124,11 +124,21 @@ substrate.
 - **Consumers converting `std.Io.net.IpAddress` by hand** (abuseguard, enip, http/proxy, probe,
   ratelimit, … — `rg '\.ip4 => \|a\| \.\{ \.v4 = a\.bytes'`): can switch to `Ip.fromStd` /
   `AddrPort.fromStd`. Cosmetic; do it when touching those modules.
-- **`Ip.key(v6_bits)` (consumer request 2026-11-15; effort S, low priority).** Rate-limit and per-viewer maps key IPv6 clients by their /64; `ip.prefix(64).?.network()` already works (`Ip.prefix` `src/root.zig`, `Prefix.network`) but call sites spell it differently and handle the v4 case separately. Expected: Go `netip.Prefix.Masked`. Proposed: `netaddr.Ip.key(self, v6_bits: u8) [16]u8` returning the v4-mapped/plain 4-byte form zero-padded for IPv4 and the masked first `v6_bits` for IPv6; as a pure convenience over `prefix().network()`, it may be rejected if the owner prefers no second spelling.
+- ~~**`Ip.key(v6_bits)` (consumer request 2026-11-15; effort S, low priority).** Rate-limit and per-viewer maps key IPv6 clients by their /64; `ip.prefix(64).?.network()` already works (`Ip.prefix` `src/root.zig`, `Prefix.network`) but call sites spell it differently and handle the v4 case separately. Expected: Go `netip.Prefix.Masked`. Proposed: `netaddr.Ip.key(self, v6_bits: u8) [16]u8` returning the v4-mapped/plain 4-byte form zero-padded for IPv4 and the masked first `v6_bits` for IPv6; as a pure convenience over `prefix().network()`, it may be rejected if the owner prefers no second spelling.~~ **Done 2026-11-15:** `Ip.key(self, v6_bits: u8) [16]u8`: IPv4 = its 4 bytes + 12 zero bytes (the bits argument is ignored); IPv6 masked to the first `v6_bits` bits. `v6_bits > 128` is clamped to 128 (the clamp `Prefix.masked` already uses), so there is no error path and no panic. Not unmapped: `::ffff:a.b.c.d` keys as a v6 address; an IPv6 `a.b.c.d::` collides with IPv4 `a.b.c.d`, documented on the function. Tested against `prefix(bits).?.network()` for every width 0..128.
 
 ## Status
 `extract · any · util · reentrant` + deps: none (std only; `systemSource` Linux-only) — canonical
 source is `pub const meta` in src/root.zig.
+
+**Audit 2026-11-15 (delta mutation).** 14 schemata mutants over `Ip.key`, ReleaseSafe, one build, each mutant
+under `setsid -w timeout` and `ulimit -v`: the IPv4 padding (non-zero, dropped), the clamp of `v6_bits` (dropped,
+127 instead of 128), the whole-byte count and the bit remainder (off by one), the `whole < 16` guard (widened, dropped),
+the mask (inverted, assignment skipped), the tail wipe (skipped, started one byte early, filled with 1) and the IPv6
+return value. 12 killed in the first run; 2 survived. Equivalent: dropping the clamp of `v6_bits`, because any width
+of 128 or more gives `whole >= 16`, which the `whole < 16` guard already turns into "return the address
+unchanged" (the clamp only documents the contract). The other, the clamp at 127, survived because the test address
+ended in an even byte, so clearing its last bit changed nothing; a test with an odd final byte (`key(128)` and
+`key(200)` keep it, `key(127)` clears it) killed it. 13/14, 1 equivalent.
 
 ## Anchoring
 

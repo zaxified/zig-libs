@@ -237,6 +237,10 @@ pub const Format = enum { json_lines, logfmt, combined };
 /// `sink.zig` and the module doc's "Writing lines from many threads".
 pub const Sink = @import("sink.zig").Sink;
 
+/// A non-blocking sibling of `Sink`: a bounded queue and one writer task,
+/// `log` never waits and counts what it drops -- see `async_sink.zig`.
+pub const AsyncSink = @import("async_sink.zig").AsyncSink;
+
 /// A parsed Apache `mod_log_config`-style line template -- see `logformat.zig`.
 pub const LogFormat = @import("logformat.zig").LogFormat;
 
@@ -371,46 +375,46 @@ pub fn writeLogfmt(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("ts={d}", .{entry.timestamp_ns});
     if (entry.remote_addr) |v| {
         try w.writeAll(" remote_addr=");
-        try writeLogfmtValue(w, v);
+        try writeLogfmtValue(w, v, .{});
     }
     if (entry.user) |v| {
         try w.writeAll(" user=");
-        try writeLogfmtValue(w, v);
+        try writeLogfmtValue(w, v, .{});
     }
     try w.writeAll(" method=");
-    try writeLogfmtValue(w, entry.method);
+    try writeLogfmtValue(w, entry.method, .{});
     try w.writeAll(" target=");
-    try writeLogfmtValue(w, entry.target);
+    try writeLogfmtValue(w, entry.target, .{});
     try w.writeAll(" protocol=");
-    try writeLogfmtValue(w, entry.protocol);
+    try writeLogfmtValue(w, entry.protocol, .{});
     try w.print(" status={d}", .{entry.status});
     if (entry.request_bytes) |v| try w.print(" request_bytes={d}", .{v});
     if (entry.response_bytes) |v| try w.print(" response_bytes={d}", .{v});
     if (entry.latency_ns) |v| try w.print(" latency_ns={d}", .{v});
     if (entry.user_agent) |v| {
         try w.writeAll(" user_agent=");
-        try writeLogfmtValue(w, v);
+        try writeLogfmtValue(w, v, .{});
     }
     if (entry.referer) |v| {
         try w.writeAll(" referer=");
-        try writeLogfmtValue(w, v);
+        try writeLogfmtValue(w, v, .{});
     }
     if (entry.request_id) |v| {
         try w.writeAll(" request_id=");
-        try writeLogfmtValue(w, v);
+        try writeLogfmtValue(w, v, .{});
     }
     if (entry.trace_id) |v| {
         try w.writeAll(" trace_id=");
-        try writeLogfmtValue(w, v);
+        try writeLogfmtValue(w, v, .{});
     }
     if (entry.span_id) |v| {
         try w.writeAll(" span_id=");
-        try writeLogfmtValue(w, v);
+        try writeLogfmtValue(w, v, .{});
     }
     for (entry.extra, 0..) |f, i| {
         if (!extraRenderable(entry.extra, i)) continue;
         try w.print(" {s}=", .{f.key});
-        try writeLogfmtValue(w, f.value);
+        try writeLogfmtValue(w, f.value, .{});
     }
     try w.writeByte('\n');
 }
@@ -428,14 +432,34 @@ fn logfmtNeedsQuote(s: []const u8) bool {
     return false;
 }
 
-fn writeLogfmtValue(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
-    if (!logfmtNeedsQuote(s)) {
-        // No byte in `s` needs escaping (that's exactly what
+/// Options for `writeLogfmtValue`.
+pub const LogfmtValueOptions = struct {
+    /// Write at most this many bytes of the value (cut BEFORE quoting and
+    /// escaping, byte-wise: logfmt is a byte-oriented format, so a multi-byte
+    /// UTF-8 sequence may be cut). No marker is added. A value cut to zero
+    /// bytes is the empty value `""`. null: no limit.
+    max_len: ?usize = null,
+};
+
+/// Write one logfmt VALUE with this module's quoting and escaping, for
+/// lines that are not HTTP entries (consumer request 2026-11-15).
+///
+/// A value with no byte needing escape is written verbatim; an empty one, or
+/// one holding a space, tab, `"`, `=`, backslash or any control byte, is
+/// written in double quotes with `"` and `\` backslash-escaped, `\n`/`\r`/`\t`
+/// as such and every other control byte (0x00-0x1F, 0x7F) as `\u00HH`. Bytes
+/// >= 0x80 pass through unchanged. The result is therefore always a single
+/// token with no raw newline: it cannot forge a second line or a second pair.
+/// `options.max_len` truncates first.
+pub fn writeLogfmtValue(w: *std.Io.Writer, s: []const u8, options: LogfmtValueOptions) std.Io.Writer.Error!void {
+    const v = if (options.max_len) |m| s[0..@min(m, s.len)] else s;
+    if (!logfmtNeedsQuote(v)) {
+        // No byte in `v` needs escaping (that's exactly what
         // `logfmtNeedsQuote` just proved) — verbatim passthrough.
-        return w.writeAll(s);
+        return w.writeAll(v);
     }
     try w.writeByte('"');
-    for (s) |c| switch (c) {
+    for (v) |c| switch (c) {
         '"' => try w.writeAll("\\\""),
         '\\' => try w.writeAll("\\\\"),
         '\n' => try w.writeAll("\\n"),
@@ -949,22 +973,63 @@ test "logfmt: benign field is unquoted verbatim (positive control)" {
 test "logfmt: a value containing only '=' is quoted (no ambiguous bare key=value split)" {
     var buf: [128]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeLogfmtValue(&w, "a=b");
+    try writeLogfmtValue(&w, "a=b", .{});
     try testing.expectEqualStrings("\"a=b\"", w.buffered());
 }
 
 test "logfmt: an empty value is quoted (an unquoted empty value would vanish, misreading as an absent key)" {
     var buf: [16]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeLogfmtValue(&w, "");
+    try writeLogfmtValue(&w, "", .{});
     try testing.expectEqualStrings("\"\"", w.buffered());
 }
 
 test "logfmt: control bytes escape to their own exact \\u00HH value, not just 'something'" {
     var buf: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeLogfmtValue(&w, "\x01\x1f\x7f");
+    try writeLogfmtValue(&w, "\x01\x1f\x7f", .{});
     try testing.expectEqualStrings("\"\\u0001\\u001f\\u007f\"", w.buffered());
+}
+
+test "writeLogfmtValue: public, default options keep the verbatim/quoted/escaped behaviour" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeLogfmtValue(&w, "plain", .{});
+    try testing.expectEqualStrings("plain", w.buffered());
+    w = .fixed(&buf);
+    try writeLogfmtValue(&w, "a \"b\\c\"\n\t\x00", .{});
+    try testing.expectEqualStrings("\"a \\\"b\\\\c\\\"\\n\\t\\u0000\"", w.buffered());
+}
+
+test "writeLogfmtValue: max_len cuts before quoting and escaping" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    // Cut inside a plain value: no quoting needed any more.
+    try writeLogfmtValue(&w, "abcdef", .{ .max_len = 3 });
+    try testing.expectEqualStrings("abc", w.buffered());
+    // The cut drops the byte that would have forced quoting.
+    w = .fixed(&buf);
+    try writeLogfmtValue(&w, "abc def", .{ .max_len = 3 });
+    try testing.expectEqualStrings("abc", w.buffered());
+    // ... and keeps one that still does.
+    w = .fixed(&buf);
+    try writeLogfmtValue(&w, "ab c", .{ .max_len = 3 });
+    try testing.expectEqualStrings("\"ab \"", w.buffered());
+    // max_len counts raw bytes, not escaped bytes: 2 quotes -> 4 escaped bytes.
+    w = .fixed(&buf);
+    try writeLogfmtValue(&w, "\"\"\"\"", .{ .max_len = 2 });
+    try testing.expectEqualStrings("\"\\\"\\\"\"", w.buffered());
+    // Zero: the empty value; a limit above the length changes nothing.
+    w = .fixed(&buf);
+    try writeLogfmtValue(&w, "abc", .{ .max_len = 0 });
+    try testing.expectEqualStrings("\"\"", w.buffered());
+    w = .fixed(&buf);
+    try writeLogfmtValue(&w, "abc", .{ .max_len = 99 });
+    try testing.expectEqualStrings("abc", w.buffered());
+    // A newline past the limit never appears.
+    w = .fixed(&buf);
+    try writeLogfmtValue(&w, "ok\nforged=1", .{ .max_len = 2 });
+    try testing.expectEqualStrings("ok", w.buffered());
 }
 
 test "combined: injection payload cannot forge a second line or break the quoted fields" {
@@ -2158,6 +2223,7 @@ test "logfmt/Combined pass ill-formed bytes through — byte-oriented formats, d
 test {
     _ = @import("bench.zig");
     _ = @import("sink.zig");
+    _ = @import("async_sink.zig");
     _ = @import("logformat.zig");
     _ = @import("middleware.zig");
     _ = @import("timefmt.zig");
@@ -2485,7 +2551,7 @@ test "escapers: every ASCII byte as a lone value and between letters -- JSON, lo
             else
                 try std.fmt.bufPrint(&full_l, "{s}{c}b", .{ pre, c });
             var lw: std.Io.Writer = .fixed(&out_buf);
-            try writeLogfmtValue(&lw, v);
+            try writeLogfmtValue(&lw, v, .{});
             try testing.expectEqualStrings(el, lw.buffered());
 
             // Combined escaper
@@ -2520,7 +2586,7 @@ test "escapers: every ASCII byte as a lone value and between letters -- JSON, lo
         const c: u8 = @intCast(b);
         var out_buf: [16]u8 = undefined;
         var lw: std.Io.Writer = .fixed(&out_buf);
-        try writeLogfmtValue(&lw, &.{ 'a', c, 'b' });
+        try writeLogfmtValue(&lw, &.{ 'a', c, 'b' }, .{});
         try testing.expectEqualSlices(u8, &.{ 'a', c, 'b' }, lw.buffered());
         var cw: std.Io.Writer = .fixed(&out_buf);
         try writeClfEscaped(&cw, &.{ 'a', c, 'b' });
@@ -2602,7 +2668,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
 test "mutation 2026-11-07: a quoted logfmt value keeps non-ASCII and ill-formed bytes raw" {
     var buf: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeLogfmtValue(&w, "a \xc3\xa9\x80\xff");
+    try writeLogfmtValue(&w, "a \xc3\xa9\x80\xff", .{});
     try testing.expectEqualStrings("\"a \xc3\xa9\x80\xff\"", w.buffered());
 }
 

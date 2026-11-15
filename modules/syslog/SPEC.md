@@ -240,6 +240,20 @@ black-box receiving oracle — its own parser's rendering was observed, no
 rsyslog source was read or consulted (root `NOTICE` §0, the same relationship
 as `icmp`/`genetlink`/`nftables`/`traceroute`).
 
+**Audit 2026-11-15 (delta mutation).** 19 schemata mutants over `journal.stderrIsJournal`/`fdIsJournalStream`/
+`parseDecimal`/`makedev`, ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`: the
+descriptor (2 as 1), the colon split and both slices, `AT_EMPTY_PATH`, the statx mask and error test, the verdict
+(`and` as `or`, each half dropped, the inode forced), the empty-string and digit-range checks of `parseDecimal`, and each
+term of `makedev`. 10 killed in the first run; 9 survived. Tests added: `makedev` against known glibc values
+(the old test computed the expected string with `makedev` itself, so a wrong encoding agreed with itself), a direct
+`parseDecimal` test (sign, underscore, hex, overflow, digit edges), and a `stderrIsJournal` test that points fd 2 at a
+pipe for its duration (stdout and stderr are often the same file in a harness, which hid fd 1 vs 2). 16 killed. Left: the
+empty-string check in `parseDecimal` is EQUIVALENT (`parseInt` refuses an empty string); dropping the statx mask is
+UNOBSERVABLE (the kernel returns the inode of a pipe or socket whatever the mask says; it needs a filesystem that
+fills `st_ino` only on request); ignoring a failed `statx` is UNOBSERVABLE (the kernel writes nothing on error, so
+the result depends on uninitialised stack; a test would have to pin the fill pattern, which is build-mode dependent).
+16/19, 1 equivalent, 2 unobservable.
+
 **Audit 2026-10-04 (mutation).** 33 schemata mutants over PRI, the timestamp range and
 offset rendering, header-field NILVALUE/length/printable rules, SD-NAME and SD-value
 escaping, the RFC 3164 encoder (sanitizing, TAG filter and cap, day padding), the UDP
@@ -262,7 +276,7 @@ Closed 2026-11-02: parser, `std.log` sink, reconnect, RFC 5425 seam, memfd, TCP 
 - **`UnixEmitter` and `connectUnix` with an abstract-namespace path** (review): the fixed `sockaddr_un` length cannot name one, a NUL in a path cuts it. Not refused today; nobody asked for them.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- **`journal.stderrIsJournal` (consumer request 2026-11-15; effort S).** Choosing between plain stderr lines and journald-native output needs systemd's documented `JOURNAL_STREAM=<dev>:<ino>` check against `fstat(2)` of fd 2; nothing in the repo does it (`rg JOURNAL_STREAM modules/syslog` is empty; `journal` in `src/unix.zig` is the datagram emitter only). Expected: sd_journal_stream / the systemd protocol, Go `go-systemd` `journal.StderrIsJournalStream`. Proposed: `syslog.journal.stderrIsJournal(io, journal_stream_env: ?[]const u8) bool` (env passed in, so the module reads no global state; false on any parse error or non-Linux).
+- ~~**`journal.stderrIsJournal` (consumer request 2026-11-15; effort S).** Choosing between plain stderr lines and journald-native output needs systemd's documented `JOURNAL_STREAM=<dev>:<ino>` check against `fstat(2)` of fd 2; nothing in the repo does it (`rg JOURNAL_STREAM modules/syslog` is empty; `journal` in `src/unix.zig` is the datagram emitter only). Expected: sd_journal_stream / the systemd protocol, Go `go-systemd` `journal.StderrIsJournalStream`. Proposed: `syslog.journal.stderrIsJournal(io, journal_stream_env: ?[]const u8) bool` (env passed in, so the module reads no global state; false on any parse error or non-Linux).~~ **Done 2026-11-15:** `journal.stderrIsJournal(journal_stream_env: ?[]const u8) bool` and `journal.fdIsJournalStream(fd, env)`. The `io` parameter of the proposal is dropped (the module is raw-syscall throughout; `statx(fd, "", AT_EMPTY_PATH)`). The env value is parsed strictly as `<decimal dev>:<decimal ino>` (glibc `makedev` encoding of `st_dev`); any malformed value or `statx` failure is `false`.
 
 ## Status
 `gap · any · client + codec · reentrant` + deps: `datefmt` — canonical source is

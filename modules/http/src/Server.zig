@@ -168,6 +168,41 @@ pub const ConnState = enum { new, active, idle, closed };
 /// when driven socket-free (`serveStream` without `StreamOptions.peer`).
 pub const ConnStateFn = *const fn (?*anyopaque, peer: ?net.IpAddress, state: ConnState) void;
 
+/// Why a socket-served connection ended — `ConnSummary.end`.
+pub const ConnEnd = enum {
+    /// The connection ended without a fault: the peer closed it, a
+    /// `Connection: close` / `max_requests_per_conn` / drain ended it, or an
+    /// h2 session finished (GOAWAY). A request answered with an error status
+    /// is still an answer, not an `errored` end.
+    normal,
+    /// A deadline cut it off — the same event `on_error` reports as
+    /// `ErrorKind.timed_out` (read/idle/head/body/write/response stall, the
+    /// h2c lifetime cap).
+    timed_out,
+    /// The socket failed under the connection (reset, broken pipe …) and no
+    /// deadline was involved.
+    errored,
+    /// Admitted by `on_connect` but never served: no working memory for it, or
+    /// no task to run it on. `requests` is 0.
+    refused,
+};
+
+/// What `Options.on_conn_closed` is told about one finished connection.
+pub const ConnSummary = struct {
+    /// The remote address; null only if unknown.
+    peer: ?net.IpAddress,
+    /// Requests of this connection whose first byte arrived (h1) or HTTP/2
+    /// streams handed to the handler; a request refused before the handler
+    /// ran still counts. 0 for a connection that sent nothing.
+    requests: u64,
+    /// Monotonic time from the start of serving to the end, nanoseconds.
+    duration_ns: u64,
+    end: ConnEnd,
+};
+
+/// Connection summary observer — see `Options.on_conn_closed`.
+pub const ConnClosedFn = *const fn (?*anyopaque, summary: ConnSummary) void;
+
 /// What `Options.on_error` is told about — the failures Go's `Server.ErrorLog`
 /// reports, plus the requests refused before a handler ran.
 pub const ErrorKind = enum {
@@ -478,6 +513,17 @@ pub const Options = struct {
     on_conn_state: ?ConnStateFn = null,
     /// Opaque pointer passed to `on_conn_state`.
     on_conn_state_ctx: ?*anyopaque = null,
+    /// Optional per-connection summary, fired exactly once for every
+    /// connection `on_connect` admitted (served over h1, h2c, or refused for
+    /// want of memory/a task), on the connection's task, AFTER `.closed` and
+    /// after the cause is known — a deadline that ended it is
+    /// `ConnEnd.timed_out` (`on_error` hears `ErrorKind.timed_out` just before).
+    /// Rejected connections fire nothing. Same threading rules as
+    /// `on_conn_state`; `ConnStateFn` is unchanged. Socket serving only:
+    /// `serveStream` driven by a caller fires none. Consumer request 2026-11-15.
+    on_conn_closed: ?ConnClosedFn = null,
+    /// Opaque pointer passed to `on_conn_closed`.
+    on_conn_closed_ctx: ?*anyopaque = null,
     /// Optional failure observer — Go's `Server.ErrorLog`, as a callback so
     /// the caller picks the logger: handler errors, refused requests,
     /// `accept` failures (see `ErrorKind`). Same threading rules as
@@ -1239,6 +1285,12 @@ fn acceptLoop(s: *Server, listener: *net.Server, group: *std.Io.Group) ServeErro
                     hook(s.options.on_conn_state_ctx, stream.socket.address, .new);
                     hook(s.options.on_conn_state_ctx, stream.socket.address, .closed);
                 }
+                if (s.options.on_conn_closed) |hook| hook(s.options.on_conn_closed_ctx, .{
+                    .peer = stream.socket.address,
+                    .requests = 0,
+                    .duration_ns = 0,
+                    .end = .refused,
+                });
                 stream.close(s.io);
             }
         };
@@ -1448,6 +1500,19 @@ fn connMain(s: *Server, stream: net.Stream) void {
     defer stream.close(s.io);
     defer _ = s.active_conns.fetchSub(1, .monotonic); // paired with serve()
 
+    // `Options.on_conn_closed`: declared first so it runs last, after `.closed`
+    // and after `reportTimeout`. Every exit below that has served something
+    // sets `end` / `requests`; the default is a connection that was dropped.
+    const started_ns = nowNs(s.io);
+    var sum_end: ConnEnd = .refused;
+    var sum_requests: u64 = 0;
+    defer if (s.options.on_conn_closed) |hook| hook(s.options.on_conn_closed_ctx, .{
+        .peer = stream.socket.address,
+        .requests = sum_requests,
+        .duration_ns = nowNs(s.io) -| started_ns,
+        .end = sum_end,
+    });
+
     // `on_connect` already admitted this connection up in the accept loop,
     // but `.new`/`.closed` are fired by the serving functions below — so
     // every exit that happens BEFORE one of them runs reports nothing at
@@ -1543,7 +1608,10 @@ fn connMain(s: *Server, stream: net.Stream) void {
     // connection as a whole still gets an absolute lifetime cap, armed once
     // below (A1 http F7).
     if (o.enable_h2c) {
-        const is_h2 = detectH2Preface(&tr.reader) catch return; // stalled/reset: drop
+        const is_h2 = detectH2Preface(&tr.reader) catch { // stalled/reset: drop
+            sum_end = connEnd(&tr, &tw);
+            return;
+        };
         if (is_h2) {
             served = true;
             tr.armConnection(o.max_h2c_connection_ms);
@@ -1580,6 +1648,8 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .dispatcher = o.h2_dispatcher,
             }, &tr.reader, &tw.writer);
             reportTimeout(o, stream, &tr, &tw, true);
+            sum_end = connEnd(&tr, &tw);
+            sum_requests = control.requests.load(.monotonic);
             lingerClose(s.io, stream, &tr.reader);
             return;
         }
@@ -1608,6 +1678,17 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .control = &control,
     }, &tr.reader, &tw.writer, bufs);
     reportTimeout(o, stream, &tr, &tw, false);
+    sum_end = connEnd(&tr, &tw);
+    sum_requests = control.requests.load(.monotonic);
+}
+
+/// How a served connection ended, from what its reader and writer recorded.
+fn connEnd(tr: *const TimeoutReader, tw: *const TimeoutWriter) ConnEnd {
+    if (tr.timed_out or tw.timed_out) return .timed_out;
+    // A canceled wait is the server shutting down, not a fault of the peer.
+    if (tr.src.err != null and !tr.canceled) return .errored;
+    if (tw.dst.err != null and !tw.canceled) return .errored;
+    return .normal;
 }
 
 /// `ErrorKind.timed_out` for a connection a deadline ended, naming the phase.
@@ -2077,6 +2158,9 @@ pub const ConnControl = struct {
     tr: ?*TimeoutReader = null,
     tw: ?*TimeoutWriter = null,
     response_timeout_ms: u32 = 0,
+    /// Requests (h1) / streams (h2) served so far — `ConnSummary.requests`.
+    /// Atomic: h2 workers may run on other threads.
+    requests: std.atomic.Value(u64) = .init(0),
     /// `idle` while the connection waits for a request (h1) or has no open
     /// stream (h2); `closing` once `shutdownGraceful`/`close` claimed it.
     /// The claim and the loop's own check are ordered the same way round as
@@ -2276,6 +2360,7 @@ fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers
         if (!streamReaderOk(in)) break;
         _ = in.peekByte() catch break;
         if (opts.control) |c| if (!c.leaveIdle()) break;
+        if (opts.control) |c| _ = c.requests.fetchAdd(1, .monotonic);
 
         if (serveStep(opts, in, out, bufs, req_index) == .close) break;
         req_index +|= 1; // saturating: an uncapped connection may outlive 2^32 requests
@@ -8655,6 +8740,338 @@ test "on_error: a client that stops reading is reported as WriteTimeout" {
     try expectOneTimeout(&log, error.WriteTimeout);
 }
 
+/// Records `Options.on_conn_closed` for the tests: how often it fired, and the
+/// last summary (written before the count, read after it).
+const SummaryRec = struct {
+    n: std.atomic.Value(u32) = .init(0),
+    sum: ConnSummary = undefined,
+    /// Filled in by the test after the connection ended: the monotonic time
+    /// since the test began, an upper bound for any `sum.duration_ns`.
+    bound_ns: u64 = 0,
+
+    fn record(ctx: ?*anyopaque, summary: ConnSummary) void {
+        const r: *SummaryRec = @ptrCast(@alignCast(ctx.?));
+        r.sum = summary;
+        _ = r.n.fetchAdd(1, .release);
+    }
+};
+
+const CloseHow = enum { server_cuts, client_closes, client_resets };
+
+/// One connection against a server with short timeouts and a summary hook:
+/// `send` is written, `responses` answers are read back, then the connection
+/// ends as `how` says. Returns the summary once the connection task finished.
+fn summaryFor(send: []const u8, responses: usize, how: CloseHow) !SummaryRec {
+    return summaryForOpts(send, responses, how, false);
+}
+
+fn summaryForOpts(send: []const u8, responses: usize, how: CloseHow, h2c: bool) !SummaryRec {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var rec: SummaryRec = .{};
+    const began_ns = nowNs(io);
+    {
+        var server = init(io, testing.allocator, .{
+            .handler = testHandler,
+            .enable_h2c = h2c,
+            .read_timeout_ms = 150,
+            .idle_timeout_ms = 150,
+            .request_timeout_ms = 20_000,
+            .on_conn_closed = SummaryRec.record,
+            .on_conn_closed_ctx = &rec,
+        });
+        defer server.deinit();
+        server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+        defer thread.join();
+        defer server.shutdown();
+
+        {
+            const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+                return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+            defer stream.close(io);
+            var rbuf: [1024]u8 = undefined;
+            var wbuf: [256]u8 = undefined;
+            var sr = stream.reader(io, &rbuf);
+            var sw = stream.writer(io, &wbuf);
+            try sw.interface.writeAll(send);
+            try sw.interface.flush();
+            for (0..responses) |_| try expectHelloResponse(&sr.interface);
+            switch (how) {
+                .server_cuts => _ = sr.interface.discardRemaining() catch {},
+                .client_closes => {},
+                .client_resets => {
+                    // Let the server accept and block in its read first: a reset
+                    // that lands before the accept leaves nothing to summarize.
+                    var waited: u32 = 0;
+                    while (server.activeConnections() == 0) : (waited += 10) {
+                        if (waited > 5000) return error.ConnectionNeverAccepted;
+                        try sleepMs(io, 10);
+                    }
+                    try sleepMs(io, 50);
+                    // SO_LINGER {on, 0}: the close below sends RST instead of FIN.
+                    const linger: extern struct { onoff: c_int, secs: c_int } = .{ .onoff = 1, .secs = 0 };
+                    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, &std.mem.toBytes(linger)) catch
+                        return testkit.loopbackSkip("SO_LINGER unavailable", .{});
+                },
+            }
+        }
+        try waitNoConns(io, &server);
+    }
+    rec.bound_ns = nowNs(io) - began_ns;
+    return rec;
+}
+
+/// The summary of one `/big` response that the client never reads: it either
+/// leaves the server's write to hit `write_timeout_ms`, or resets the socket
+/// while the server is blocked in that write.
+fn bigSummary(write_timeout_ms: u32, reset: bool) !SummaryRec {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var rec: SummaryRec = .{};
+    const began_ns = nowNs(io);
+    {
+        var server = init(io, testing.allocator, .{
+            .handler = bigHandler,
+            .write_timeout_ms = write_timeout_ms,
+            .on_conn_closed = SummaryRec.record,
+            .on_conn_closed_ctx = &rec,
+        });
+        defer server.deinit();
+        server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+        defer thread.join();
+        defer server.shutdown();
+        {
+            const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+                return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+            defer stream.close(io);
+            const small = std.mem.toBytes(@as(c_int, 2048));
+            std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &small) catch {};
+            var wbuf: [256]u8 = undefined;
+            var sw = stream.writer(io, &wbuf);
+            try sw.interface.writeAll("GET /big HTTP/1.1\r\nHost: t\r\n\r\n");
+            try sw.interface.flush();
+            while (server.activeConnections() == 0) try sleepMs(io, 5);
+            if (reset) {
+                // Let the server fill the socket buffers and block in its write.
+                try sleepMs(io, 100);
+                const linger: extern struct { onoff: c_int, secs: c_int } = .{ .onoff = 1, .secs = 0 };
+                std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, &std.mem.toBytes(linger)) catch
+                    return testkit.loopbackSkip("SO_LINGER unavailable", .{});
+            } else {
+                try waitNoConns(io, &server);
+            }
+        }
+        try waitNoConns(io, &server);
+    }
+    rec.bound_ns = nowNs(io) - began_ns;
+    return rec;
+}
+
+test "on_conn_closed: keep-alive with 3 requests then a client close is normal, requests 3" {
+    const get = "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n";
+    const rec = try summaryFor(get ++ get ++ get, 3, .client_closes);
+    try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.normal, rec.sum.end);
+    try testing.expectEqual(@as(u64, 3), rec.sum.requests);
+    try testing.expect(rec.sum.peer != null);
+    try testing.expect(rec.sum.duration_ns > 0);
+    try testing.expect(rec.sum.duration_ns <= rec.bound_ns);
+}
+
+test "on_conn_closed: Connection: close after one request is normal" {
+    const rec = try summaryFor("GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", 1, .server_cuts);
+    try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.normal, rec.sum.end);
+    try testing.expectEqual(@as(u64, 1), rec.sum.requests);
+}
+
+test "on_conn_closed: a deadline that ends the connection is timed_out, in every phase" {
+    const cases = [_]struct { send: []const u8, responses: usize, requests: u64 }{
+        .{ .send = "", .responses = 0, .requests = 0 },
+        .{ .send = "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", .responses = 1, .requests = 1 },
+        .{ .send = "GET /hello HTTP/1.1\r\nHo", .responses = 0, .requests = 1 },
+        .{ .send = "POST /hello HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\nabc", .responses = 0, .requests = 1 },
+    };
+    for (cases) |c| {
+        const rec = try summaryFor(c.send, c.responses, .server_cuts);
+        try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
+        try testing.expectEqual(ConnEnd.timed_out, rec.sum.end);
+        try testing.expectEqual(c.requests, rec.sum.requests);
+        // The deadline (150 ms) is what ended it: the duration spans it, and
+        // is measured from the start of serving, not from some epoch.
+        try testing.expect(rec.sum.duration_ns >= 100 * std.time.ns_per_ms);
+        try testing.expect(rec.sum.duration_ns <= rec.bound_ns);
+    }
+}
+
+test "on_conn_closed: h2c enabled, a peer that sends nothing is timed_out, one that resets is errored (requests 0)" {
+    const stalled = try summaryForOpts("", 0, .server_cuts, true);
+    try testing.expectEqual(@as(u32, 1), stalled.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.timed_out, stalled.sum.end);
+    try testing.expectEqual(@as(u64, 0), stalled.sum.requests);
+    const reset = try summaryForOpts("", 0, .client_resets, true);
+    try testing.expectEqual(@as(u32, 1), reset.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.errored, reset.sum.end);
+    try testing.expectEqual(@as(u64, 0), reset.sum.requests);
+}
+
+test "on_conn_closed: a write stall is timed_out; a reset during the write is errored" {
+    const stalled = try bigSummary(150, false);
+    try testing.expectEqual(@as(u32, 1), stalled.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.timed_out, stalled.sum.end);
+    try testing.expectEqual(@as(u64, 1), stalled.sum.requests);
+    const reset = try bigSummary(20_000, true);
+    try testing.expectEqual(@as(u32, 1), reset.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.errored, reset.sum.end);
+    try testing.expectEqual(@as(u64, 1), reset.sum.requests);
+}
+
+/// A server whose `serve` task is canceled while one connection waits in a
+/// read (`big` false: idle after one answer) or is stuck in a write (`big`
+/// true: a `/big` response the client never reads). The summary it reports.
+fn canceledSummary(big: bool) !SummaryRec {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var rec: SummaryRec = .{};
+    {
+        var server = init(io, testing.allocator, .{
+            .handler = if (big) bigHandler else testHandler,
+            .read_timeout_ms = 20_000,
+            .idle_timeout_ms = 20_000,
+            .write_timeout_ms = 20_000,
+            .on_conn_closed = SummaryRec.record,
+            .on_conn_closed_ctx = &rec,
+        });
+        defer server.deinit();
+        server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        var serving = try io.concurrent(serveWrap, .{&server});
+        const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+            serving.cancel(io);
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+        };
+        defer stream.close(io);
+        const small = std.mem.toBytes(@as(c_int, 2048));
+        std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &small) catch {};
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [256]u8 = undefined;
+        var sr = stream.reader(io, &rbuf);
+        var sw = stream.writer(io, &wbuf);
+        sw.interface.writeAll(if (big) "GET /big HTTP/1.1\r\nHost: t\r\n\r\n" else "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n") catch |err| {
+            serving.cancel(io);
+            return err;
+        };
+        sw.interface.flush() catch |err| {
+            serving.cancel(io);
+            return err;
+        };
+        if (!big) expectHelloResponse(&sr.interface) catch |err| {
+            serving.cancel(io);
+            return err;
+        };
+        try sleepMs(io, 100); // the server is now blocked in its read / write
+        // Stop the accept loop first: `serve` then waits for its connection
+        // tasks, and a cancelation arriving THERE cancels them (one consumed
+        // by the blocked `accept` would not reach them).
+        server.shutdown();
+        try sleepMs(io, 100);
+        serving.cancel(io);
+    }
+    return rec;
+}
+
+test "on_conn_closed: a server canceled under a blocked read or write ends the connection as normal, not errored" {
+    for ([_]bool{ false, true }) |big| {
+        const rec = try canceledSummary(big);
+        try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
+        try testing.expectEqual(ConnEnd.normal, rec.sum.end);
+        try testing.expectEqual(@as(u64, 1), rec.sum.requests);
+    }
+}
+
+test "on_conn_closed: a connection the server cannot size working memory for is refused (requests 0)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var rec: SummaryRec = .{};
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .on_conn_closed = SummaryRec.record,
+        .on_conn_closed_ctx = &rec,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    // `options` is a pub field: an overflowing layout is refused per connection
+    // (`slabSize` null), not only by `init`.
+    server.options.read_buffer_size = std.math.maxInt(usize);
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    {
+        const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+        defer stream.close(io);
+        var rbuf: [64]u8 = undefined;
+        var sr = stream.reader(io, &rbuf);
+        _ = sr.interface.discardRemaining() catch {};
+    }
+    try waitNoConns(io, &server);
+    var waited: u32 = 0;
+    while (rec.n.load(.acquire) == 0) : (waited += 10) {
+        if (waited > 5000) return error.SummaryNeverFired;
+        try sleepMs(io, 10);
+    }
+    try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.refused, rec.sum.end);
+    try testing.expectEqual(@as(u64, 0), rec.sum.requests);
+    try testing.expect(rec.sum.peer != null);
+}
+
+test "on_conn_closed: a reset socket is errored, not timed_out" {
+    const rec = try summaryFor("GET /hello HTTP/1.1\r\nHo", 0, .client_resets);
+    try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.errored, rec.sum.end);
+    try testing.expectEqual(@as(u64, 1), rec.sum.requests);
+}
+
+test "on_conn_closed: a silent HTTP/2 connection is timed_out (h2c, requests 0)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var rec: SummaryRec = .{};
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .enable_h2c = true,
+        .read_timeout_ms = 150,
+        .on_conn_closed = SummaryRec.record,
+        .on_conn_closed_ctx = &rec,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [512]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try sw.interface.flush();
+    _ = sr.interface.discardRemaining() catch {};
+    try waitNoConns(io, &server);
+    try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.timed_out, rec.sum.end);
+    try testing.expectEqual(@as(u64, 0), rec.sum.requests);
+}
+
 test "on_error: a silent HTTP/2 connection is reported as ReadTimeout" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -8696,12 +9113,15 @@ test "integration: a connection with no task to run on is dropped and reported, 
     const io = threaded.io();
     var log: ErrorLogForTest = .{};
     var states: ConnStateCount = .{};
+    var rec: SummaryRec = .{};
     var server = init(io, testing.allocator, .{
         .handler = testHandler,
         .read_timeout_ms = 0,
         .write_timeout_ms = 0,
         .request_timeout_ms = 0,
         .max_h2c_connection_ms = 0,
+        .on_conn_closed = SummaryRec.record,
+        .on_conn_closed_ctx = &rec,
         .on_error = ErrorLogForTest.record,
         .on_error_ctx = &log,
         .on_conn_state = ConnStateCount.record,
@@ -8745,6 +9165,12 @@ test "integration: a connection with no task to run on is dropped and reported, 
     // closed); the first connection is open, so it has only its `new`.
     try testing.expectEqual(@as(u32, 2), states.new.load(.monotonic));
     try testing.expectEqual(@as(u32, 1), states.closed.load(.monotonic));
+    // The summary: once, for the dropped connection only (the first is open).
+    try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.refused, rec.sum.end);
+    try testing.expectEqual(@as(u64, 0), rec.sum.requests);
+    try testing.expectEqual(@as(u64, 0), rec.sum.duration_ns);
+    try testing.expect(rec.sum.peer != null);
     // And it no longer counts as active.
     try testing.expectEqual(@as(usize, 1), server.activeConnections());
 

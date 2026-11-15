@@ -516,6 +516,47 @@ pub const journal = struct {
             try e.send(buf[0..n]);
         }
     };
+
+    /// Is stderr (fd 2) the journal's stream? systemd sets
+    /// `JOURNAL_STREAM=<dev>:<ino>` (decimal `st_dev`, `st_ino` of the stream
+    /// it connected to the service's stdout/stderr); a process that finds
+    /// that pair equal to `fstat(2)` of fd 2 knows its stderr goes to
+    /// journald and may switch to journald-native output (go-systemd
+    /// `journal.StderrIsJournalStream`, `sd_journal_stream_fd(3)` docs).
+    /// `journal_stream_env` is the caller's `JOURNAL_STREAM` value (null when
+    /// unset): the module reads no global state. False on any parse error
+    /// (not `<digits>:<digits>`, overflow, junk) and on any `statx` failure.
+    /// No `io` parameter: like the rest of this file it is a raw syscall.
+    pub fn stderrIsJournal(journal_stream_env: ?[]const u8) bool {
+        return fdIsJournalStream(2, journal_stream_env);
+    }
+
+    /// `stderrIsJournal` for an arbitrary descriptor (stdout is the other one
+    /// systemd connects).
+    pub fn fdIsJournalStream(fd: i32, journal_stream_env: ?[]const u8) bool {
+        const env = journal_stream_env orelse return false;
+        const colon = std.mem.indexOfScalar(u8, env, ':') orelse return false;
+        const dev = parseDecimal(env[0..colon]) orelse return false;
+        const ino = parseDecimal(env[colon + 1 ..]) orelse return false;
+        var sx: linux.Statx = undefined;
+        const at_empty_path: u32 = 0x1000;
+        if (linux.errno(linux.statx(fd, "", at_empty_path, .{ .INO = true }, &sx)) != .SUCCESS) return false;
+        return sx.ino == ino and makedev(sx.dev_major, sx.dev_minor) == dev;
+    }
+
+    /// Strictly digits, at least one, fits u64 (no sign, no whitespace).
+    fn parseDecimal(s: []const u8) ?u64 {
+        if (s.len == 0) return null;
+        for (s) |c| if (c < '0' or c > '9') return null;
+        return std.fmt.parseInt(u64, s, 10) catch null;
+    }
+
+    /// glibc's `makedev` encoding, the `st_dev` systemd prints.
+    fn makedev(major: u32, minor: u32) u64 {
+        const ma: u64 = major;
+        const mi: u64 = minor;
+        return ((ma & 0xfffff000) << 32) | ((ma & 0xfff) << 8) | ((mi & 0xffffff00) << 12) | (mi & 0xff);
+    }
 };
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -987,4 +1028,97 @@ test "FullQueueWait: the step doubles 1, 2, 4 ... 32 and then stays at 50 ms (sw
         try t.expect(w.sleepAt(0));
         try t.expectEqual(step, w.step_ms);
     }
+}
+
+test "journal.stderrIsJournal: JOURNAL_STREAM against fstat of the descriptor" {
+    var fds: [2]i32 = undefined;
+    try t.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+    var sx: linux.Statx = undefined;
+    try t.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(fds[1], "", 0x1000, .{ .INO = true }, &sx)));
+    var buf: [64]u8 = undefined;
+    const good = try std.fmt.bufPrint(&buf, "{d}:{d}", .{ journal.makedev(sx.dev_major, sx.dev_minor), sx.ino });
+    try t.expect(journal.fdIsJournalStream(fds[1], good));
+    // the other end of the pipe is the same inode
+    try t.expect(journal.fdIsJournalStream(fds[0], good));
+    var buf2: [64]u8 = undefined;
+    const wrong_ino = try std.fmt.bufPrint(&buf2, "{d}:{d}", .{ journal.makedev(sx.dev_major, sx.dev_minor), sx.ino + 1 });
+    try t.expect(!journal.fdIsJournalStream(fds[1], wrong_ino));
+    const wrong_dev = try std.fmt.bufPrint(&buf2, "{d}:{d}", .{ journal.makedev(sx.dev_major, sx.dev_minor) + 1, sx.ino });
+    try t.expect(!journal.fdIsJournalStream(fds[1], wrong_dev));
+    // a pair that names nothing
+    try t.expect(!journal.fdIsJournalStream(fds[1], "0:0"));
+}
+
+test "journal.stderrIsJournal: malformed or absent env is false" {
+    try t.expect(!journal.stderrIsJournal(null));
+    const bad = [_][]const u8{
+        "",      ":",                      "1",                      "1:",
+        ":1",    "a:b",                    "1:2:3",                  "-1:2",
+        "+1:2",  " 1:2",                   "1: 2",                   "1:2 ",
+        "0x1:2", "18446744073709551616:1", "1:18446744073709551616", "99999999999999999999999999:1",
+    };
+    for (bad) |env| {
+        try t.expect(!journal.stderrIsJournal(env));
+        try t.expect(!journal.fdIsJournalStream(0, env));
+    }
+    // a closed / invalid descriptor is false, not a panic
+    try t.expect(!journal.fdIsJournalStream(-1, "1:1"));
+    try t.expect(!journal.fdIsJournalStream(1 << 20, "1:1"));
+}
+
+test "journal.stderrIsJournal: reads descriptor 2, not 1 (mutation 2026-11-15)" {
+    // Point fd 2 at a fresh pipe for the duration (the harness may have stdout
+    // and stderr on the same file, which would hide an fd mix-up), then restore.
+    var fds: [2]i32 = undefined;
+    try t.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+    const saved: i32 = @intCast(linux.dup(2));
+    if (saved < 0) return error.SkipZigTest;
+    defer {
+        _ = linux.dup2(saved, 2);
+        closeFd(saved);
+    }
+    try t.expectEqual(linux.E.SUCCESS, linux.errno(linux.dup2(fds[1], 2)));
+    var sx: linux.Statx = undefined;
+    try t.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(fds[1], "", 0x1000, .{ .INO = true }, &sx)));
+    var buf: [64]u8 = undefined;
+    const good = try std.fmt.bufPrint(&buf, "{d}:{d}", .{ journal.makedev(sx.dev_major, sx.dev_minor), sx.ino });
+    try t.expect(journal.stderrIsJournal(good));
+    try t.expect(!journal.fdIsJournalStream(1, good));
+    var buf2: [64]u8 = undefined;
+    const bad = try std.fmt.bufPrint(&buf2, "{d}:{d}", .{ journal.makedev(sx.dev_major, sx.dev_minor), sx.ino + 1 });
+    try t.expect(!journal.stderrIsJournal(bad));
+    // a sign in front of a matching pair is refused (std parseInt would take it)
+    const signed = try std.fmt.bufPrint(&buf2, "+{s}", .{good});
+    try t.expect(!journal.stderrIsJournal(signed));
+}
+
+test "journal.parseDecimal: digits only, at least one, fits u64 (mutation 2026-11-15)" {
+    try t.expectEqual(@as(?u64, 0), journal.parseDecimal("0"));
+    try t.expectEqual(@as(?u64, 9), journal.parseDecimal("9"));
+    try t.expectEqual(@as(?u64, 7), journal.parseDecimal("007"));
+    try t.expectEqual(@as(?u64, 1234567890), journal.parseDecimal("1234567890"));
+    try t.expectEqual(@as(?u64, std.math.maxInt(u64)), journal.parseDecimal("18446744073709551615"));
+    try t.expectEqual(@as(?u64, null), journal.parseDecimal("18446744073709551616"));
+    for ([_][]const u8{ "", "+1", "-0", "-1", "1_0", "_1", " 1", "1 ", "0x10", "1e3", "/", ":" }) |s| {
+        try t.expectEqual(@as(?u64, null), journal.parseDecimal(s));
+    }
+}
+
+test "journal.makedev: glibc encoding against known values (mutation 2026-11-15)" {
+    const cases = [_]struct { u32, u32, u64 }{
+        .{ 0, 0, 0 },
+        .{ 8, 1, 2049 },
+        .{ 0x103, 0x41, 66369 },
+        .{ 0xfff, 0xff, 1048575 },
+        .{ 0x1, 0x100, 1048832 },
+        .{ 0x1000, 0, 17592186044416 },
+        .{ 0x12345678, 0x9abcdef0, 1311771985900370160 },
+        .{ 0xfffff000, 0xffffff00, 18446744073708503040 },
+        .{ 0xffffffff, 0xffffffff, 18446744073709551615 },
+    };
+    for (cases) |c| try t.expectEqual(c[2], journal.makedev(c[0], c[1]));
 }

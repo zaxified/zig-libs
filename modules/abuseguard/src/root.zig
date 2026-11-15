@@ -206,6 +206,17 @@ pub const Options = struct {
     /// the address stays allowlisted. Linear scan; the slice is borrowed and
     /// must outlive the Guard.
     allow: []const netaddr.Prefix = &.{},
+    /// Addresses exempt from the per-key connection cap ONLY (nginx
+    /// `limit_conn` with a `geo` exemption): a trusted reverse proxy that
+    /// carries every client would otherwise be held to `max_conns_per_ip`.
+    /// A member's connections are still counted — against `max_conns_total`
+    /// and in its entry's live count, so `connClosed` pairs as usual — and
+    /// every reputation verdict still applies (ban, greylist, strikes,
+    /// `default_deny`): exempting those is `allow`'s job. Matched like
+    /// `allow` (after `Ip.unmap`, canonical prefixes, so a v4 prefix covers
+    /// the v4-mapped form). Linear scan; the slice is borrowed and must
+    /// outlive the Guard. Consumer request 2026-11-15.
+    per_ip_cap_exempt: []const netaddr.Prefix = &.{},
     /// Default-deny (ipfilter's `BlockByDefault`): only `allow` members are
     /// admitted; every other peer is `.not_allowed` before any entry is
     /// looked up or made (no store churn, no strike). Resource caps still
@@ -536,7 +547,7 @@ pub const Guard = struct {
             }
         }
         if (deny == null) if (g.options.max_conns_per_ip) |max| {
-            if (e.active_conns >= max) deny = .per_ip_cap;
+            if (e.active_conns >= max and !inPrefixes(g.options.per_ip_cap_exempt, ip)) deny = .per_ip_cap;
         };
         // With no per-key cap the counter's own width is the cap (`reconcile`
         // can set any u32): refused even in a dry run, which cannot count
@@ -1024,12 +1035,7 @@ pub const Guard = struct {
     }
 
     fn isAllowed(g: *const Guard, ip: netaddr.Ip) bool {
-        const u = ip.unmap();
-        // Canonical like a ban prefix, so `::ffff:192.0.2.0/120` covers the
-        // v4 peers it names (a raw v4-mapped prefix never matches an
-        // unmapped peer).
-        for (g.options.allow) |p| if (canonicalPrefix(p).contains(u)) return true;
-        return false;
+        return inPrefixes(g.options.allow, ip);
     }
 
     fn inPrefixBan(g: *const Guard, ip: netaddr.Ip) bool {
@@ -1150,6 +1156,15 @@ pub const Guard = struct {
 /// Canonical form of a ban prefix: host bits zeroed, and a v4-mapped v6
 /// prefix of /96 or longer rewritten as the v4 prefix it denotes (the same
 /// unification the store applies to peers).
+/// Whether `ip` (unmapped) is in any of `list`. Canonical like a ban prefix,
+/// so `::ffff:192.0.2.0/120` covers the v4 peers it names (a raw v4-mapped
+/// prefix never matches an unmapped peer).
+fn inPrefixes(list: []const netaddr.Prefix, ip: netaddr.Ip) bool {
+    const u = ip.unmap();
+    for (list) |p| if (canonicalPrefix(p).contains(u)) return true;
+    return false;
+}
+
 fn canonicalPrefix(p: netaddr.Prefix) netaddr.Prefix {
     const m = p.masked();
     if (m.addr == .v6 and m.addr.isIpv4Mapped() and m.bits >= 96)
@@ -2687,6 +2702,54 @@ test "allowlist: exempt from record/ban/greylist/prefix ban, not from the per-ke
     // The v4-mapped form of a member is a member.
     try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("::ffff:192.0.2.77")));
     g.connClosed(friend);
+}
+
+test "per_ip_cap_exempt: members skip only the per-key cap; the global cap and bans still apply" {
+    var tc: TestClock = .{};
+    const exempt = [_]netaddr.Prefix{mkPrefix("192.0.2.0/24")};
+    var g = try Guard.init(testing.allocator, .{
+        .per_ip_cap_exempt = &exempt,
+        .max_conns_per_ip = 2,
+        .max_conns_total = 7,
+        .ban_threshold = 1,
+        .ban_after_offenses = 1,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    const proxy = mkIp("192.0.2.9");
+    const stranger = mkIp("198.51.100.1");
+
+    // The exempt peer opens more than max_conns_per_ip; the stranger cannot.
+    for (0..4) |_| try testing.expectEqual(AdmitVerdict.admitted, g.admit(proxy));
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(stranger));
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(stranger));
+    try testing.expectEqual(AdmitVerdict.per_ip_cap, g.admit(stranger));
+    // The v4-mapped form of a member is a member: 7th live connection fits,
+    // the 8th meets the global cap, which exemption does not lift.
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("::ffff:192.0.2.9")));
+    try testing.expectEqual(AdmitVerdict.total_cap, g.admit(proxy));
+    try testing.expectEqual(@as(usize, 7), g.totalConns());
+    try testing.expectEqual(@as(u32, 5), g.connCount(proxy));
+
+    // Closes release the exempt peer's slots like any other.
+    for (0..5) |_| g.connClosed(proxy);
+    g.connClosed(stranger);
+    g.connClosed(stranger);
+    try testing.expectEqual(@as(usize, 0), g.totalConns());
+
+    // Reputation is not exempted: the member can still be struck and banned.
+    g.record(proxy, 1);
+    try testing.expect(g.isBanned(proxy));
+    try testing.expectEqual(AdmitVerdict.banned, g.admit(proxy));
+}
+
+test "per_ip_cap_exempt: empty by default (the cap applies to everyone), dry run still reports a non-member" {
+    var tc: TestClock = .{};
+    var g = try Guard.init(testing.allocator, .{ .max_conns_per_ip = 1, .clock = tc.clock() });
+    defer g.deinit();
+    const ip = mkIp("192.0.2.9");
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(ip));
+    try testing.expectEqual(AdmitVerdict.per_ip_cap, g.admit(ip));
 }
 
 test "allowlist: the middleware's auto-strike is a no-op for a member" {

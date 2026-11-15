@@ -82,6 +82,7 @@ const allow = [_]netaddr.Prefix{ netaddr.parsePrefix("192.0.2.0/24").? }; // hea
 var guard = try abuseguard.Guard.init(gpa, .{
     .allow = &allow, // fail2ban ignoreip; borrowed, must outlive the Guard
     // .default_deny = true, // only `allow` members pass (ipfilter BlockByDefault): .not_allowed
+    // .per_ip_cap_exempt = &proxies, // skip only max_conns_per_ip (nginx limit_conn + geo)
     .ipv6_key_bits = 64, // default: one /64 = one client; 128 = per address
     .max_prefix_bans = 256,
 });
@@ -171,6 +172,11 @@ var guard2: abuseguard.Guard = .init(gpa, .{ .on_event = .{ .run = Fw.run } });
   auto-strike do nothing for it. Caps still apply (a cap is not
   reputation). A manual `ban`/`greylist` of a member is stored but ignored
   while it stays listed; `isBanned` reports the stored state.
+- **Per-IP-cap exemption (`Options.per_ip_cap_exempt`):** members of these
+  prefixes (a trusted reverse proxy carrying every client) skip only the
+  `max_conns_per_ip` check. Their connections still count against
+  `max_conns_total`, and bans, greylists and strikes still apply to them
+  (that is `allow`'s job). Borrowed slice, linear scan, like `allow`.
 - **Range bans:** `banPrefix` / `unbanPrefix` (at most `max_prefix_bans`,
   linear scan per admission, checked before any entry is created so a
   rejected peer costs no store slot). Independent of the key width.

@@ -315,6 +315,7 @@ pub const module_list = [_]Module{
     .{ .name = "diskusage", .libs = &.{"os"}, .test_deps = &.{"testkit"} },
     .{ .name = "conntrack", .libs = &.{"net"}, .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "procrun", .libs = &.{"os"}, .deps = &.{ "argsafe", "clock" }, .timing = true },
+    .{ .name = "stopsignal", .libs = &.{"os"} },
     .{ .name = "jsonshape", .libs = &.{"storage"}, .deps = &.{ "dataframe", "regex", "jsontext" }, .test_deps = &.{"testkit"} },
     .{ .name = "finstats", .libs = &.{"storage"}, .deps = &.{"datefmt"}, .test_deps = &.{"testkit"} },
     .{ .name = "indicators", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },

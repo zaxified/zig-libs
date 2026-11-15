@@ -8,7 +8,7 @@
 
 **Ahead:** feature — the per-IP cap holds a socket from accept, so connections parked mid-header (slowloris) fill it: nginx 1.28.3 `limit_conn perip 1` counts a connection only once its whole header is read — with 20 sockets parked on an unfinished header a full request on a 21st still gets 200, while a second request during one being served gets 503 (`tools/nginx_probe/run.sh`); here the parked socket alone takes the slot and the next connection is refused at accept (test "integration: a socket with an unfinished request header holds its per-IP slot") (measured 2026-10-23)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (440/455, 15 eq) · src 7fd3e91537c50738
+**Audit:** review 2026-11-12 · mutation 2026-11-15 (449/464, 15 eq) · src 10a297411b6782f0
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — abuse counters only (keyword review, 2026-10-07) · panic 2026-10-28 (sweep of every pub entry point: no data-reachable panic; `admit` refuses at `maxInt(u32)` live connections of one key, the server hooks check their context)
 
@@ -144,6 +144,14 @@ ban/unban, greylist TTL re-admit, record-driven escalation; (2) router auto-stri
 escalating a 404 path scanner to accept-time rejection, then TTL re-admits; (3) a socket parked on
 an unfinished request header holds the per-IP slot (the nginx `limit_conn` probe's shape).
 
+Audit 2026-11-15 (delta mutation): 9 schemata mutants over the new code, ReleaseSafe, one build, each mutant under
+`setsid -w timeout` (20 s) and `ulimit -v`. `per_ip_cap_exempt`'s check in `admit` (the exemption ignored, its
+verdict flipped, the `allow` list read in its place) and the shared `inPrefixes` helper (the unmap skipped,
+`canonicalPrefix` skipped, the match returned inverted, the no-match result inverted, the list scanned as empty), plus
+`isAllowed` reading the exempt list instead of `allow`. 9/9 killed on the first run (2 as hangs: an inverted result
+that never refuses a connection), 0 equivalent, 0 survivors; the earlier whole-module run (440/455) is unchanged for
+the code this wave did not touch.
+
 Audit 2026-10-23: Sonnet review (11 findings) + 57 schemata mutants over admit/close, reconcile,
 strike decay and escalation, TTL growth, ban/unban/unbanAll, prefix bans, the three-list store,
 snapshot/restore and the middleware's XFF choice — 57/57 killed after two tests were added (two XFF
@@ -191,7 +199,7 @@ on `Options.dry_run`). Not changed, with reason → Backlog.
 - ~~**Persist / restore bans**~~ — **done 2026-10-04** (`snapshot`/`restore`/`writeSnapshot`/`parseSnapshotLine`). Was: (survey 2026-09-30) — a restart clears every ban; fail2ban keeps a ban DB. Effort: small (export/import of the ban list, caller stores it). Fits §2: yes.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- **Per-IP connection-cap exemption (consumer request 2026-11-15; effort S).** `Options.allow` lifts reputation only ("resource caps still apply", `src/root.zig` Options.allow, `per_ip_cap` deny at the `active_conns >= max` check), so a loopback or otherwise trusted reverse proxy that carries every client is held to `max_conns_per_ip`; a consumer has to bypass the guard for that peer and keep its own global cap. Expected: nginx `limit_conn` with `geo`/`map` exemptions, HAProxy ACL-exempted `sc_conn_cur`; a proxy in front is the common deployment. Proposed: `Options.per_ip_cap_exempt: []const netaddr.Prefix = &.{}` (borrowed, linear scan like `allow`); members skip only the `per_ip_cap` check and stay counted against `max_conns_total`. Decide whether it should also exempt the strike/ban path (no: that is `allow`).
+- **DONE 2026-11-15 — per-IP connection-cap exemption (`Options.per_ip_cap_exempt`).** Members skip only the `per_ip_cap` check (`admitLocked`); they stay counted in `total_conns` / `max_conns_total` and in their entry's live count, and every reputation path is unchanged — it did not exempt the strike/ban path (that is `allow`). Shares `inPrefixes` with `allow`. Was: **Per-IP connection-cap exemption (consumer request 2026-11-15; effort S).** `Options.allow` lifts reputation only ("resource caps still apply", `src/root.zig` Options.allow, `per_ip_cap` deny at the `active_conns >= max` check), so a loopback or otherwise trusted reverse proxy that carries every client is held to `max_conns_per_ip`; a consumer has to bypass the guard for that peer and keep its own global cap. Expected: nginx `limit_conn` with `geo`/`map` exemptions, HAProxy ACL-exempted `sc_conn_cur`; a proxy in front is the common deployment. Proposed: `Options.per_ip_cap_exempt: []const netaddr.Prefix = &.{}` (borrowed, linear scan like `allow`); members skip only the `per_ip_cap` check and stay counted against `max_conns_total`. Decide whether it should also exempt the strike/ban path (no: that is `allow`).
 
 ## Status
 `gap · posix · server · threadsafe` + deps `http`, `netaddr`, `router` — canonical source is
