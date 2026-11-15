@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests (wave GV) for netlink's public API.
-//! Findings NL-1 .. NL-4, see ~/CML/20261029-panic-sweep/netlink-sweep.report.md.
+//! Findings NL-1 .. NL-4, see the 2026-10-29 panic-sweep report for `netlink`.
 //! Tests that need the private engines (`collectDumpPass`, `recvDatagramLimit`)
 //! sit at the end of root.zig.
 const std = @import("std");
