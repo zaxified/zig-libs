@@ -159,7 +159,19 @@ pub fn bbands(comptime T: type, in: []const T, upper: []T, middle: []T, lower: [
     core.checkFloat(T);
     try core.checkLen(in.len, &.{ upper.len, middle.len, lower.len });
     const plan = try Plan.make(p);
-    var cm = try MaCore.init(plan.ma);
+    const cm = try MaCore.init(plan.ma);
+    // One dispatch per call: a monomorphic loop over the active MA variant
+    // (a by-value copy the optimizer keeps in registers).
+    switch (cm) {
+        inline else => |v| {
+            var local = v;
+            bbLoop(T, &local, in, upper, middle, lower, p, plan);
+        },
+    }
+    return plan.lb;
+}
+
+fn bbLoop(comptime T: type, cm: anytype, in: []const T, upper: []T, middle: []T, lower: []T, p: BbandsParams, plan: Plan) void {
     var cv = VarCore.init(p.period);
     // TA_BBANDS calls TA_MA from bar 0 (the average clamps to its own lookback and is
     // realigned); only the deviation is started late. Matters when the average's
@@ -184,7 +196,6 @@ pub fn bbands(comptime T: type, in: []const T, upper: []T, middle: []T, lower: [
         m.* = b.middle;
         l.* = b.lower;
     }
-    return plan.lb;
 }
 
 /// Streaming BBANDS: a moving-average stage plus the variance window, rings in

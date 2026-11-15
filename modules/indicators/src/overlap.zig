@@ -47,6 +47,23 @@ pub const MidpointCore = struct {
         if (h == null or l == null) return null;
         return (h.? + l.?) / 2.0;
     }
+    /// The steady path of `smooth.runCore`: from the first output on.
+    pub fn steady(self: *const MidpointCore) bool {
+        return self.n + 1 >= self.hi.p;
+    }
+    pub fn steadyRun(self: *MidpointCore, comptime T: type, in: []const T, out: []T, i: usize) void {
+        var hr = MaxCore.Run.of(&self.hi);
+        var lr = MinCore.Run.of(&self.lo);
+        var n = i;
+        while (n < in.len) : (n += 1) {
+            const h = hr.bar(T, in, n);
+            const l = lr.bar(T, in, n);
+            out[n] = core.to(T, (h + l) / 2.0);
+        }
+        hr.store(&self.hi, in.len);
+        lr.store(&self.lo, in.len);
+        self.n = in.len;
+    }
 };
 
 pub fn midpointLookback(p: MidParams) Error!usize {

@@ -86,6 +86,16 @@ pub const TRIX = struct {
         const p = prev orelse return null;
         return if (p != 0.0) (d / p - 1.0) * 100.0 else 0.0;
     }
+    pub fn steady(self: *const Self) bool {
+        return self.prev != null and self.e1.steady() and self.e2.steady() and self.e3.steady();
+    }
+    pub inline fn steadyStep(self: *Self, _: anytype, b: In) f64 {
+        self.n += 1;
+        const d = self.e3.stepSteady(self.e2.stepSteady(self.e1.stepSteady(b.x)));
+        const p = self.prev.?;
+        self.prev = d;
+        return if (p != 0.0) (d / p - 1.0) * 100.0 else 0.0;
+    }
 };
 pub fn trixLookback(p: TrixParams) Error!usize {
     try TRIX.validate(p);
@@ -117,6 +127,13 @@ fn windowedKind(k: MaType) bool {
 /// over the slow MA, in percent, answering 0 when the slow MA is ~0 or (for the
 /// windowed MA types) when the whole slow window is exactly zero.
 pub fn ApoCore(comptime pct: bool) type {
+    return ApoGen(pct, smooth.MaCore);
+}
+
+/// `ApoCore` over a moving-average core type `M`: `smooth.MaCore` (the public
+/// type, streams), or one variant's payload type for the batch path, which
+/// switches on the MA type once per call instead of once per bar and stage.
+fn ApoGen(comptime pct: bool, comptime M: type) type {
     return struct {
         const Self = @This();
         pub const In = vs.X(f64);
@@ -129,8 +146,8 @@ pub fn ApoCore(comptime pct: bool) type {
         pub fn Outputs(comptime T: type) type {
             return T;
         }
-        fast: smooth.MaCore,
-        slow: smooth.MaCore,
+        fast: M,
+        slow: M,
         win: bool,
         slow_lb: usize,
         zero_run: usize = 0,
@@ -182,17 +199,44 @@ pub fn ApoCore(comptime pct: bool) type {
             if (isZero(sl.?)) return 0.0;
             return (f.? - sl.?) / sl.? * 100.0;
         }
+        /// The steady path of `vs.run`, for an MA core with a bare recurrence (EMA).
+        pub const has_steady = @hasDecl(M, "stepSteady");
+        pub fn steady(self: *const Self) bool {
+            return self.fast.steady() and self.slow.steady();
+        }
+        pub inline fn steadyStep(self: *Self, _: anytype, b: In) f64 {
+            self.n += 1;
+            const f = self.fast.stepSteady(b.x);
+            const sl = self.slow.stepSteady(b.x);
+            self.zero_run = if (@abs(b.x) <= 0.0) @min(self.zero_run + 1, self.slow_lb + 1) else 0;
+            if (!pct) return f - sl;
+            if (self.win and self.zero_run > self.slow_lb) return 0.0;
+            if (isZero(sl)) return 0.0;
+            return (f - sl) / sl * 100.0;
+        }
     };
 }
 pub const APO = ApoCore(false);
 pub const PPO = ApoCore(true);
+
+fn apoBatch(comptime T: type, comptime pct: bool, in: []const T, out: []T, p: ApoParams) Error!usize {
+    core.checkFloat(T);
+    var c = try ApoCore(pct).init(p);
+    switch (c.fast) {
+        inline else => |f, tag| if (std.meta.activeTag(c.slow) == tag) {
+            var m: ApoGen(pct, @TypeOf(f)) = .{ .fast = f, .slow = @field(c.slow, @tagName(tag)), .win = c.win, .slow_lb = c.slow_lb };
+            return vs.run(@TypeOf(m), &m, p, .{ .x = in }, .{out});
+        },
+    }
+    return vs.run(ApoCore(pct), &c, p, .{ .x = in }, .{out});
+}
 
 pub fn apoLookback(p: ApoParams) Error!usize {
     try APO.validate(p);
     return APO.lookback(p);
 }
 pub fn apo(comptime T: type, in: []const T, out: []T, p: ApoParams) Error!usize {
-    return vs.batch(T, APO, p, .{ .x = in }, .{out});
+    return apoBatch(T, false, in, out, p);
 }
 pub fn ApoStream(comptime T: type) type {
     return vs.SingleStream(T, APO);
@@ -202,7 +246,7 @@ pub fn ppoLookback(p: PpoParams) Error!usize {
     return PPO.lookback(p);
 }
 pub fn ppo(comptime T: type, in: []const T, out: []T, p: PpoParams) Error!usize {
-    return vs.batch(T, PPO, p, .{ .x = in }, .{out});
+    return apoBatch(T, true, in, out, p);
 }
 pub fn PpoStream(comptime T: type) type {
     return vs.SingleStream(T, PPO);
@@ -705,6 +749,17 @@ pub const TSI = struct {
         const c_d = self.d2.step(NoSrc{}, a_d.?);
         if (c_n == null or c_d == null) return null;
         return if (c_d.? > 0.0) 100.0 * c_n.? / c_d.? else 0.0;
+    }
+    pub fn steady(self: *const Self) bool {
+        return self.n >= 1 and self.n1.steady() and self.d1.steady() and self.n2.steady() and self.d2.steady();
+    }
+    pub inline fn steadyStep(self: *Self, _: anytype, b: In) f64 {
+        self.n += 1;
+        const mom = b.x - self.prev;
+        self.prev = b.x;
+        const c_n = self.n2.stepSteady(self.n1.stepSteady(mom));
+        const c_d = self.d2.stepSteady(self.d1.stepSteady(@abs(mom)));
+        return if (c_d > 0.0) 100.0 * c_n / c_d else 0.0;
     }
 };
 pub fn tsiLookback(p: TsiParams) Error!usize {
