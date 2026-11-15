@@ -182,7 +182,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   where Go reports an unexpected message and drops it (once `max_attempts` is reached the
   pending request is dropped unserved). A keyboard-interactive callback's `.accept`/`.partial`
   counts only after at least one completed round (else `error.InvalidAuthConfig`: an accept
-  without a dialogue is a policy bug), and the callback runs under `burn.kbd_burn` (its frames
+  without a dialogue is a policy bug), and the callback runs under `userauth.kbd_burn` (its frames
   hold the answers). A configuration that cannot work (no method, hook fields and `callbacks`
   mixed — even for different methods, since a hook-enabled method is active in step 1 and would
   let a client skip a `callbacks` chain — or a `partial` whose `next` enables nothing) is

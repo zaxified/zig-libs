@@ -83,9 +83,3 @@ pub const record_burn = 16 * 1024;
 /// its own frames (a hash, a constant-time compare, a lookup) are zeroed too.
 /// Once per password attempt; 16 KiB until measured in ReleaseFast.
 pub const password_burn = 16 * 1024;
-
-/// `serveUserauth`'s keyboard-interactive hooks (`KbdCallback.decideFn`,
-/// `KbdInteractiveCheck.checkFn`): the answers live in their frames, and a
-/// round's `sendPacket`/`recvPacket` runs under the same burn. Not measured;
-/// sized as the record burn plus the password burn, doubled (2026-11-15).
-pub const kbd_burn = 64 * 1024;

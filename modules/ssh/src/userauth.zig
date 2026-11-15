@@ -1193,7 +1193,7 @@ pub const PasswordCallback = struct {
 /// `.reject` — and whatever it returns, it does not authenticate. An
 /// `.accept` or `.partial` without one completed round is never honoured:
 /// `serveUserauth` returns `error.InvalidAuthConfig`. Runs under a burn
-/// (`burn.kbd_burn`): its frames hold the peer's answers.
+/// (`kbd_burn`): its frames hold the peer's answers.
 pub const KbdCallback = struct {
     ctx: *anyopaque = transport.no_context,
     decideFn: *const fn (ctx: *anyopaque, req: *const AuthRequest, prompter: *KbdPrompter) Decision,
@@ -1625,6 +1625,13 @@ const Step = union(enum) {
     abandoned: transport.Packet,
 };
 
+/// `serveUserauth`'s keyboard-interactive hooks (`KbdCallback.decideFn`,
+/// `KbdInteractiveCheck.checkFn`): the answers live in their frames, and a
+/// round's `sendPacket`/`recvPacket` runs under the same burn. Not measured;
+/// the record burn plus the password burn, doubled (2026-11-15). Kept here,
+/// not in `burn.zig`, whose digest pins ctgrind's `pem` row.
+const kbd_burn = 64 * 1024;
+
 fn kbdDecide(hook: KbdHook, req: *const AuthRequest, prompter: *KbdPrompter) Decision {
     switch (hook) {
         .check => |kbd| {
@@ -1653,7 +1660,7 @@ fn serveKbdInteractive(t: *transport.Transport, scratch: []u8, req: *const AuthR
     // The answers are the peer's secrets, held in the hook's frames: the
     // same burn as the password hooks, deeper because `challenge` runs a
     // packet round trip under it.
-    const d = burn.run(burn.kbd_burn, Decision, kbdDecide, .{ hook, req, &prompter });
+    const d = burn.run(kbd_burn, Decision, kbdDecide, .{ hook, req, &prompter });
     return switch (prompter.state) {
         // A dialogue that never completed a round authenticates nobody,
         // whatever the callback answered: an `.accept` without asking is a
