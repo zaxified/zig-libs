@@ -361,6 +361,30 @@ Re-measured on a quiet host 2026-10-22 (`22733ec8`, Zig 0.17, two runs of 7 roun
 ≤ 0.6 %, OpenSSL's up to 6 %): worst 1.088× (`signbl_2048`) / 1.084× (`decbl_2048`), 3072 and 4096
 ≤ 1.025×, verify 0.82–0.89×. The P2 bar (≤ 1.10×) holds; the 10-18 "1.12×" was the loaded host.
 
+### 2026-11-15: montint's almost-Montgomery ladder (loaded host)
+
+The L = 16 REDC lever named above was profiled before anything was changed (montint SPEC
+"Almost-Montgomery ladder"). Three findings:
+
+- The `u = w·n0inv` chain does not bind.
+- OpenSSL's CRT halves run its scalar MULX/ADX code here, not `rsaz_avx2`. This was measured
+  (perf + disassembly); the 10-14 entry had only inferred it.
+- Both sides run at the same IPC, and the 1024-bit modexp was already at parity.
+
+The change that paid was in montint's `powMont`: a top-only final subtract and in-place kernels,
+−2.8 % cycles at 1024 bits. `bench-rsa` 2048 compares base `4115cf211` against the new code,
+alternating builds, 5 rounds each. The host was shared with other jobs (spreads 3–17 %), so only
+the second pair is quoted:
+
+| | sign | signbl | signca | verify | dec | decbl | decca |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| base | 0.985 | 1.053 | 1.025 | 0.809 | 0.993 | 1.071 | 1.013 |
+| new | 0.960 | 1.036 | 0.987 | 0.797 | 0.959 | 1.038 | 0.949 |
+
+The first pair agrees on every row it did not lose to noise: new `sign` 0.962, `signbl` 1.007,
+`decbl` 0.993. The blinded `.csprng` rows still carry the stateless draw (the inverse and `r^e`) on
+top of the modexp; `.cached` brings them to the unblinded level.
+
 ## Performance posture — measured 2026-09-08, and deliberately not chased further
 
 Numbers are ReleaseFast on one desktop; treat them as ratios. OpenSSL 3.5.5 on the

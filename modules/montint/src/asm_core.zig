@@ -838,6 +838,44 @@ fn condSubText(comptime L: usize) []const u8 {
     }
 }
 
+/// The almost-Montgomery reduction (2026-11-15): `z ← top·B^L + src − top·m`,
+/// i.e. subtract `m` iff the carry word `top ∈ {0, 1}` is set, with no borrow
+/// pass. For a REDC of `A < R²` (both operands `< R = B^L`) the value is
+/// `< R + m`, so the result is `< R` — not necessarily `< m`. That is enough
+/// to feed the next almost-Montgomery multiply, and a final full multiply
+/// (`fromMontgomery`) makes the result canonical. Same masking as pass 2 of
+/// `condSubText` (`m << c << c`, `c = top ? 0 : 32`, flags untouched); the
+/// shift count is computed from `top` arithmetically, never branched on.
+fn condSubTopInto(comptime L: usize, z: *[L]u64, src: *const [L]u64, top: u64, m: *const [L]u64) void {
+    const text = comptime condSubTopText(L);
+    var d_top: u64 = undefined;
+    var d_cx: u64 = undefined;
+    asm volatile (text
+        : [t] "={rdx}" (d_top),
+          [c] "={rcx}" (d_cx),
+        : [z] "{rdi}" (z),
+          [src] "{r8}" (src),
+          [m] "{rsi}" (m),
+          [top] "{rdx}" (top),
+        : .{ .rax = true, .cc = true, .memory = true });
+}
+
+fn condSubTopText(comptime L: usize) []const u8 {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        var s: AsmText(160 * L + 128) = .{};
+        // c = (1 − top)·32: 0 keeps m (subtract), 32 shifts it out twice.
+        s.put(" movl $1, %%ecx\n subl %%edx, %%ecx\n shll $5, %%ecx\n");
+        s.put(" shlxq %%rcx, (%%rsi), %%rax\n shlxq %%rcx, %%rax, %%rax\n movq (%%r8), %%rdx\n subq %%rax, %%rdx\n movq %%rdx, (%%rdi)\n");
+        for (1..L) |i| {
+            const o = decStr(8 * i);
+            s.put(" shlxq %%rcx, " ++ o ++ "(%%rsi), %%rax\n shlxq %%rcx, %%rax, %%rax\n movq " ++ o ++ "(%%r8), %%rdx\n sbbq %%rax, %%rdx\n movq %%rdx, " ++ o ++ "(%%rdi)\n");
+        }
+        const out = s.buf[0..s.len].*;
+        return &out;
+    }
+}
+
 /// The portable-Zig form of `condSubFixed` — the oracle its test compares to.
 fn condSubFixedZig(comptime L: usize, z: *[L]u64, top: u64, m: *const [L]u64) void {
     var borrow: u1 = 0;
@@ -1280,6 +1318,19 @@ fn redcBlock(comptime L: usize, A: *[2 * L]u64, m: *const [L]u64, n0inv: u64) u6
 /// `z = a·b·R⁻¹ mod m` through the 8-row block engine (`L % 8 == 0`,
 /// `L >= block_min_limbs`); same contract as `montMulFixed`.
 pub fn montMulBlock(comptime L: usize, z: *[L]u64, a: *const [L]u64, b: *const [L]u64, m: *const [L]u64, n0inv: u64) void {
+    mulBlockImpl(L, false, z, a, b, m, n0inv);
+}
+
+/// `montMulBlock` with the almost-Montgomery final step (`condSubTopInto`):
+/// for `a, b < R` the result is `< R` and `≡ a·b·R⁻¹ (mod m)`, NOT
+/// necessarily `< m`. `z` may alias `a` or `b` (both are read in full
+/// before `z` is written). For `powMont`'s ladder, whose result a full
+/// `montMul` canonicalises at the end.
+pub fn montMulBlockLazy(comptime L: usize, z: *[L]u64, a: *const [L]u64, b: *const [L]u64, m: *const [L]u64, n0inv: u64) void {
+    mulBlockImpl(L, true, z, a, b, m, n0inv);
+}
+
+fn mulBlockImpl(comptime L: usize, comptime lazy: bool, z: *[L]u64, a: *const [L]u64, b: *const [L]u64, m: *const [L]u64, n0inv: u64) void {
     if (comptime supported) {
         comptime std.debug.assert(L % 8 == 0 and L >= block_min_limbs);
         var A: [2 * L]u64 = undefined;
@@ -1287,7 +1338,7 @@ pub fn montMulBlock(comptime L: usize, z: *[L]u64, a: *const [L]u64, b: *const [
         defer zeroWords(2 * L, &A);
         productBlock(L, &A, a, b);
         const top = redcBlock(L, &A, m, n0inv);
-        condSubInto(L, z, A[L..], top, m);
+        if (lazy) condSubTopInto(L, z, A[L..], top, m) else condSubInto(L, z, A[L..], top, m);
     } else {
         @panic(unsupported_msg); // guarded by every caller; see `mulRow`
     }
@@ -1297,6 +1348,17 @@ pub fn montMulBlock(comptime L: usize, z: *[L]u64, a: *const [L]u64, b: *const [
 /// diagonal, REDC. Same contract as `montSqrFixed`, any `L % 8 == 0`,
 /// `L >= block_min_limbs` (no code-size cap: every phase loops).
 pub fn montSqrBlock(comptime L: usize, z: *[L]u64, a: *const [L]u64, m: *const [L]u64, n0inv: u64) void {
+    sqrBlockImpl(L, false, z, a, m, n0inv);
+}
+
+/// `montSqrBlock` with the almost-Montgomery final step: for `a < R` the
+/// result is `< R` and `≡ a²·R⁻¹ (mod m)`; `z` may alias `a`. See
+/// `montMulBlockLazy`.
+pub fn montSqrBlockLazy(comptime L: usize, z: *[L]u64, a: *const [L]u64, m: *const [L]u64, n0inv: u64) void {
+    sqrBlockImpl(L, true, z, a, m, n0inv);
+}
+
+fn sqrBlockImpl(comptime L: usize, comptime lazy: bool, z: *[L]u64, a: *const [L]u64, m: *const [L]u64, n0inv: u64) void {
     if (comptime supported) {
         comptime std.debug.assert(L % 8 == 0 and L >= block_min_limbs);
         var A: [2 * L]u64 = undefined;
@@ -1305,7 +1367,7 @@ pub fn montSqrBlock(comptime L: usize, z: *[L]u64, a: *const [L]u64, m: *const [
         crossBlock(L, &A, a);
         doubleDiag(L, &A, a);
         const top = redcBlock(L, &A, m, n0inv);
-        condSubInto(L, z, A[L..], top, m);
+        if (lazy) condSubTopInto(L, z, A[L..], top, m) else condSubInto(L, z, A[L..], top, m);
     } else {
         @panic(unsupported_msg);
     }

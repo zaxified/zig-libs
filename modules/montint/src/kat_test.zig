@@ -185,6 +185,202 @@ test "differential: fixed-L asm kernels (mul, sqr) == portable CIOS (L = 2, 8, 1
     try fixedDiff(64, rand, 300);
 }
 
+// ── 2a'. almost-Montgomery block kernels (2026-11-15) ────────────────────────
+//
+// `montMulBlockLazy`/`montSqrBlockLazy` (what `powMont`'s ladder runs at
+// `L % 8 == 0`, `L >= 16`) take operands anywhere below `R = B^L` and return
+// `V − top·m` with `V = (a·b + U·m)/R` — `< R`, not necessarily `< m`. The
+// oracle is an exact word-serial model of that value (schoolbook product,
+// classic REDC with `u128` carries, then the top-only subtract), so the test
+// pins the top decision itself, not just the residue. Moduli: full width,
+// all-ones, high limbs all-ones (`m` close to `R`: the top word fires on most
+// near-`R` products) and a short top limb; operands random below `R`,
+// all-ones (`R − 1`), near `R`, and small.
+fn amModel(comptime L: usize, a: *const [L]u64, b: *const [L]u64, m: *const [L]u64, n0inv: u64, tops: *usize) [L]u64 {
+    var t: [2 * L + 1]u64 = @splat(0);
+    for (0..L) |i| {
+        var c: u64 = 0;
+        for (0..L) |j| {
+            const p = @as(u128, a[i]) * b[j] + t[i + j] + c;
+            t[i + j] = @truncate(p);
+            c = @intCast(p >> 64);
+        }
+        t[i + L] = c;
+    }
+    for (0..L) |i| {
+        const u = t[i] *% n0inv;
+        var c: u64 = 0;
+        for (0..L) |j| {
+            const p = @as(u128, u) * m[j] + t[i + j] + c;
+            t[i + j] = @truncate(p);
+            c = @intCast(p >> 64);
+        }
+        var k = i + L;
+        while (c != 0) : (k += 1) {
+            std.debug.assert(k <= 2 * L);
+            const s = @addWithOverflow(t[k], c);
+            t[k] = s[0];
+            c = s[1];
+        }
+    }
+    std.debug.assert(t[2 * L] <= 1);
+    var z: [L]u64 = t[L .. 2 * L].*;
+    if (t[2 * L] == 1) {
+        tops.* += 1;
+        var br: u1 = 0;
+        for (&z, m) |*zi, mi| {
+            const s = @subWithOverflow(zi.*, mi);
+            const s2 = @subWithOverflow(s[0], br);
+            zi.* = s2[0];
+            br = s[1] | s2[1];
+        }
+        std.debug.assert(br == 1); // cancels the top word: V − m < R
+    }
+    return z;
+}
+
+fn lazyBlockDiff(comptime L: usize, rand: std.Random, trials: usize) !void {
+    const M = Modint(L * 64);
+    var tops: usize = 0;
+    var above_m: usize = 0;
+    var t: usize = 0;
+    while (t < trials) : (t += 1) {
+        var mv: M.Elem = undefined;
+        for (&mv) |*w| w.* = rand.int(u64);
+        mv[0] |= 1;
+        switch (t % 8) {
+            0, 1, 2 => mv[L - 1] |= 1 << 63,
+            3 => mv = @splat(~@as(u64, 0)),
+            4, 5 => for (mv[L / 2 ..]) |*w| {
+                w.* = ~@as(u64, 0);
+            },
+            else => mv[L - 1] = 1 + (mv[L - 1] >> 63),
+        }
+        const m = try M.fromElem(mv);
+        var a: M.Elem = undefined;
+        var b: M.Elem = undefined;
+        for (&a, &b) |*x, *y| {
+            x.* = rand.int(u64);
+            y.* = rand.int(u64);
+        }
+        switch ((t / 8) % 4) {
+            0 => {},
+            1 => {
+                a = @splat(~@as(u64, 0));
+                b = a;
+            },
+            2 => {
+                for (a[L / 2 ..]) |*w| w.* = ~@as(u64, 0);
+                for (b[L / 2 ..]) |*w| w.* = ~@as(u64, 0);
+            },
+            else => {
+                b = @splat(0);
+                b[0] = 1 + (t & 1);
+            },
+        }
+        const want = amModel(L, &a, &b, &m.m, m.n0inv, &tops);
+        var got: M.Elem = undefined;
+        asm_core.montMulBlockLazy(L, &got, &a, &b, &m.m, m.n0inv);
+        try std.testing.expectEqualSlices(u64, &want, &got);
+        if (limbs.cmp(&got, &m.m) != .lt) above_m += 1;
+        // aliasing: z == a, then z == b
+        var z = a;
+        asm_core.montMulBlockLazy(L, &z, &z, &b, &m.m, m.n0inv);
+        try std.testing.expectEqualSlices(u64, &want, &z);
+        z = b;
+        asm_core.montMulBlockLazy(L, &z, &a, &z, &m.m, m.n0inv);
+        try std.testing.expectEqualSlices(u64, &want, &z);
+        // the square, in place
+        const want_sq = amModel(L, &a, &a, &m.m, m.n0inv, &tops);
+        z = a;
+        asm_core.montSqrBlockLazy(L, &z, &z, &m.m, m.n0inv);
+        try std.testing.expectEqualSlices(u64, &want_sq, &z);
+        // and the canonical kernel agrees with the lazy one modulo m whenever
+        // its own contract (b < m) holds
+        if (limbs.cmp(&b, &m.m) == .lt) {
+            asm_core.montMulBlock(L, &z, &a, &b, &m.m, m.n0inv);
+            var lz = got;
+            if (limbs.cmp(&lz, &m.m) != .lt) _ = limbs.subInto(&lz, &m.m);
+            if (limbs.cmp(&lz, &m.m) != .lt) _ = limbs.subInto(&lz, &m.m);
+            if (limbs.cmp(&lz, &m.m) == .lt) try std.testing.expectEqualSlices(u64, &z, &lz);
+        }
+    }
+    // The generator must reach both decisions the lazy subtract makes, and
+    // results the ladder carries at or above m.
+    try std.testing.expect(tops > trials / 8);
+    try std.testing.expect(above_m > trials / 16);
+}
+
+test "differential: almost-Montgomery block kernels == exact REDC model (L = 16, 24, 32, 48, 64)" {
+    if (!gate.asm_core_implemented) return error.SkipZigTest;
+    if (!asm_core.supported) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0xA1_0057_3017);
+    const rand = prng.random();
+    try lazyBlockDiff(16, rand, 3000);
+    try lazyBlockDiff(24, rand, 1000);
+    try lazyBlockDiff(32, rand, 1000);
+    try lazyBlockDiff(48, rand, 300);
+    try lazyBlockDiff(64, rand, 300);
+}
+
+// `powMont` (the lazy ladder where `lazy_ladder`) against a canonical
+// square-and-multiply over `montSqr`/`montMul`, every result `< m`.
+fn powLadderDiff(comptime L: usize, rand: std.Random, trials: usize) !void {
+    const M = Modint(L * 64);
+    var t: usize = 0;
+    while (t < trials) : (t += 1) {
+        var mv: M.Elem = undefined;
+        for (&mv) |*w| w.* = rand.int(u64);
+        mv[0] |= 1;
+        switch (t % 4) {
+            0 => mv[L - 1] |= 1 << 63,
+            1 => for (mv[L / 2 ..]) |*w| {
+                w.* = ~@as(u64, 0);
+            },
+            2 => mv = @splat(~@as(u64, 0)),
+            else => mv[L - 1] = 1 + (mv[L - 1] >> 63),
+        }
+        const m = try M.fromElem(mv);
+        var raw: M.Elem = undefined;
+        for (&raw) |*w| w.* = rand.int(u64);
+        if (t % 5 == 4) raw = mv; // base ≡ 0
+        const base = m.fromMontgomery(&m.toMontgomery(&raw));
+        var e: M.Elem = undefined;
+        for (&e) |*w| w.* = rand.int(u64);
+        if (t % 7 == 6) e = @splat(~@as(u64, 0));
+        // reference: canonical binary ladder
+        const bm = m.toMontgomery(&base);
+        var acc = m.one_mont;
+        var i: usize = L * 64;
+        while (i > 0) {
+            i -= 1;
+            acc = m.montSqr(&acc);
+            if ((e[i / 64] >> @intCast(i % 64)) & 1 == 1) acc = m.montMul(&acc, &bm);
+        }
+        const want = m.fromMontgomery(&acc);
+        const got = m.powMont(&base, &e);
+        try std.testing.expectEqualSlices(u64, &want, &got);
+        try std.testing.expect(limbs.cmp(&got, &m.m) == .lt);
+        const nb: usize = 1 + rand.uintLessThan(usize, L * 64);
+        var e_lo = e;
+        for (0..L) |w| {
+            if (w * 64 >= nb) e_lo[w] = 0 else if (w * 64 + 64 > nb) e_lo[w] &= (@as(u64, 1) << @intCast(nb - w * 64)) - 1;
+        }
+        try std.testing.expectEqualSlices(u64, &m.powMont(&base, &e_lo), &m.powMontBits(&base, &e, nb));
+    }
+}
+
+test "differential: powMont (almost-Montgomery ladder) == canonical ladder (L = 16, 24, 32, 48, 64)" {
+    var prng = std.Random.DefaultPrng.init(0x9A_DDE2_1115);
+    const rand = prng.random();
+    try std.testing.expect(Modint(1024).lazy_ladder == (asm_core.supported and gate.asm_core_implemented and montint.asm_unroll));
+    try powLadderDiff(16, rand, 24);
+    try powLadderDiff(24, rand, 8);
+    try powLadderDiff(32, rand, 8);
+    try powLadderDiff(48, rand, 4);
+    try powLadderDiff(64, rand, 4);
+}
+
 fn randBelow(comptime M: type, rand: std.Random, m: *const M.Elem) M.Elem {
     var v: M.Elem = undefined;
     for (&v) |*w| w.* = rand.int(u64);

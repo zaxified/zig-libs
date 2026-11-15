@@ -12,7 +12,7 @@ Audit detail: whole-src mutation run (schemata, 179 mutants over montint, limbs,
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MONTINT_FUZZ) · ct 2026-10-26 (ctgrind) · panic 2026-10-30 (sweep + blind review: caller-contract asserts → checked panics (limbs, asm_core, safegcd nbits, Field.pow, fromElemUncheckedBits), even modulus folded into the safegcd verdict branch-free, `sqrt` work capped (`error.SqrtWorkLimit`), `stack_bytes` documented and probed; delta audit 46/48 + eq/NA)
 
-**Performance:** ref 0.91–1.02× OpenSSL 3.5.5 BN (Montgomery mul, constant-time and public-exponent modexp, 1024–4096 bit) · fastest ? (measured 2026-10-20)
+**Performance:** ref 0.91–1.02× OpenSSL 3.5.5 BN (Montgomery mul, constant-time and public-exponent modexp, 1024–4096 bit) · fastest ? (measured 2026-10-20; since 2026-11-15 `powMont` −1.8…−2.9 % cycles, A/B on a loaded host, see "Almost-Montgomery ladder")
 
 **Evidence:** model-fuzz — CPython bignum KATs plus asm core vs portable oracle on random (a,b,N) differential
 **Model:** src/kat_test.zig
@@ -688,6 +688,57 @@ the front end: `mulx`/`adcx`/`adox` are 6 bytes each and the hot code exceeds th
 kernels — is exact for `a < R`, `b < m` (not only `a, b < m`): the result before
 the final subtract is `< a·b/R + m < 2m`. `reduceLimbs`/`reduceBytesBE` feed
 whole `L`-limb digits through `montMul(digit, R² mod m)` on that basis.
+
+### Almost-Montgomery ladder (2026-11-15) — what `powMont` runs at `L % 8 == 0`, `L >= 16`
+
+Profile first (bench host i7-7920HQ, `bench-montint exp_1024`, perf on both sides):
+
+- **IPC is the same on both sides:** ours 2.52 instructions/cycle (3.0 µops issued/cycle, 97 % from
+  legacy decode), OpenSSL 3.5.5 2.58 (3.2 µops/cycle, 79 % from the µop cache), with about the same
+  instructions per op. `exp_1024` is at parity (~1.0×).
+- **No port is saturated:** p0/p1/p5/p6 each run 56–64 % on both sides. Front-end starvation is
+  10 % of issue slots for us and 6 % for OpenSSL.
+- **OpenSSL's hot loop on this CPU is `mulx`/`adcx`/`adox`** (perf samples mapped to libcrypto
+  addresses and disassembled), not `rsaz_avx2`: its `rsaz_avx2_eligible` declines on a BMI2+ADX
+  CPU. That closes the inference recorded in the rsa SPEC 2026-10-14.
+- **The `u = w·n0inv` chain is not what limits the REDC.** The REDC block's first chunk (it computes
+  `u` row by row) costs the same per product as the later chunks (they reload the parked `u`):
+  25.3 % vs 25.4 % of `powMont` cycles for 64 products each. The REDC is ~50 % of the time because
+  it is 256 of the ~392 products of an L=16 square.
+
+What is left outside the products: the conditional subtract (~4.6 %), the copies of each returned
+`Elem` (vector loads right after `condSub`'s scalar stores), and the gather.
+
+The ladder now runs `asm_core.montMulBlockLazy`/`montSqrBlockLazy` **in place** (`Modint.lazy_ladder`;
+the default unrolled build only, not `-Dmontint-asm-unroll=false`).
+
+- **The bound.** With both operands `< R`, `(a·b + U·m)/R < R + m`. So one subtract of `m`, decided
+  by the REDC's carry word alone (`top ∈ {0, 1}`), leaves the result `< R`.
+- **What it drops.** The borrow pass and its keep-mask: the subtract is one `sub/sbb` pass with
+  `m << c << c`, `c = (1 − top)·32`, computed arithmetically (no branch, flags untouched).
+- **Canonical output.** Intermediates may sit at or above `m`. The ladder ends in `fromMontgomery`,
+  a full multiply by 1 (contract `a < R`, `b < m`), so `powMont`'s result is canonical as before.
+- **Tests.**
+  - `kat_test.zig` "almost-Montgomery block kernels == exact REDC model" (L = 16/24/32/48/64)
+    pins the value AND the top decision against a word-serial `u128` model, including aliasing. The
+    generator must hit the top word and results `≥ m`.
+  - "powMont (almost-Montgomery ladder) == canonical ladder" compares against a plain
+    square-and-multiply over `montSqr`/`montMul`, plus `powMontBits`.
+
+Measured (standalone ReleaseFast harness looping `Modint(bits).powMont`, base `4115cf211` vs new,
+pinned, interleaved, min of 10 runs, loaded host):
+
+| bits (L) | instructions | cycles (min of 10) |
+|---|--:|--:|
+| 1024 (16) | −2.0 % | −2.8 % |
+| 2048 (32) | −1.2 % | −1.8 % |
+| 4096 (64) | −1.1 % | −2.9 % |
+
+The products themselves are untouched. A faster scalar kernel would have to raise issue efficiency
+(µop-cache residency of a ~5–9 KiB hot body, or fewer µops per product). OpenSSL, which does run
+from the µop cache, gets no more from it, so the remaining scalar headroom looks small. An AVX2
+radix-2^29 kernel would compete against a MULX path that is already at parity, not against
+OpenSSL's AVX2 code.
 
 ## Threats / caveats
 
