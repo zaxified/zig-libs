@@ -203,6 +203,25 @@ Pass `.io` when the writer blocks in an `Io` that runs several tasks per thread 
 then parks instead of spinning). No `deinit`: when no `log` call is running, everything has been
 written and flushed. Write errors are swallowed — the log never fails a request.
 
+## Never block on the log — `AsyncSink`
+
+`Sink` makes a caller wait when its batch is full, so a stalled destination stalls requests.
+`AsyncSink` is the other trade: a bounded queue (`max_bytes`, `max_lines`, allocated once) and
+one writer task; `log`/`logEntry` never wait for the destination and, when the queue is full,
+drop the line and count it.
+
+```zig
+var q: accesslog.AsyncSink = undefined;
+try q.init(gpa, io, &file_writer.interface, .{ .max_bytes = 1 << 20, .max_lines = 4096 });
+defer q.deinit(); // drains, then stops the writer
+q.logEntry(entry); // or q.log("one line")
+const lost = q.dropped(); // lines dropped so far
+```
+
+`flush()` waits for what was queued so far. `init` fails with `error.ConcurrencyUnavailable` when
+`io` cannot run a concurrent task. For non-HTTP logfmt lines, `writeLogfmtValue(w, value,
+.{ .max_len = 256 })` applies this module's quoting and escaping to one value.
+
 ### With `metrics`
 
 `metrics.RequestMetrics` calls an `on_request` hook per request; its `AccessEntry` carries the
