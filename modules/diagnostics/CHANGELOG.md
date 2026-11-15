@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit re-recorded over the unicode-width 0.2.3 table (data-only source change, no guard moved).
 - **2026-11-13** — **CHANGED:** `charWidth` widths are unicode-width 0.2.3's (Unicode 18.0.0; were 0.2.2, Unicode 17.0.0): 1,027 code points new in 18.0 get their width (Jurchen and Khitan ideographs and new emoji two columns, new combining marks none), and U+FF9E / U+FF9F (halfwidth katakana sound marks) go from zero to one column, as the crate now gives them. `tools/unicode-width/gen.py` reads the 0.2.3 layout (`src/gen/tables.rs` + `lookup.rs`) and takes the extracted crate directory.
@@ -59,7 +60,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `writeLsp`/`writeLspArray` (range, severity 1..4, code, codeDescription, source, tags,
   relatedInformation from labels; `LspOptions.uri_prefix`), `fromLsp`; `lspCharacter`/`byteColumn` convert
   1-based byte columns to 0-based utf8/utf16/utf32 characters and back. New `Tag`, `Diagnostic.tags`.
-  **Source-breaking:** `Severity` gains `hint` — an exhaustive `switch` needs an arm (bxp at repin).
+  **Source-breaking:** `Severity` gains `hint` — an exhaustive `switch` needs an arm (the build-tool consumer at repin).
   `expr_off`/`expr_len` doc corrected: renderers ignore them.
 - **2026-10-20** — **Snippet layout = codespan-reporting 0.13.1's rich ASCII style** (S2 R1/R2; ported,
   Apache-2.0, NOTICE): several labels on one line share the quoted line, sorted; multi-line spans get
@@ -80,9 +81,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   insert); `snippet` quotes labels under ` ::: ` with `-` marks, `short` appends everything to the one line;
   `RenderOptions.color` (ANSI, off by default; finding text stays escaped). All new fields are null by default
   and omitted from JSON, so existing output is byte-identical. Mutation 13 mutants, 0 surviving. `hint`
-  severity deliberately deferred (it would break bxp's exhaustive switches).
+  severity deliberately deferred (it would break the build-tool consumer's exhaustive switches).
 
-- **2026-09-28** — Rendering, JSON and ordering (requested by ttydesk; previously listed as
+- **2026-09-28** — Rendering, JSON and ordering (requested by the terminal-UI consumer; previously listed as
   deferred): `Diagnostic.file` (optional, defaults to null — no existing literal breaks);
   `renderOne` / `Diagnostics.render` with `RenderOptions{ .style = .short | .snippet, .sources }`
   (compiler-style one line, or rustc-style with the quoted source line and carets; control
