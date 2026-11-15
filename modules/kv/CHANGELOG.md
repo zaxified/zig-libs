@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card src hash refreshed after the VOPR/shrinker test-harness change (`vopr.zig`, `shrink.zig` only; no production code changed, the audit covers it unchanged).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** VOPR trace capture, replay and the shrinker know `Db.merge`: `RecordedOp.merge` (a mask over the sealed files) is recorded under `Config.partial_merges`, replayed by the new `replayTraceOpts` (takes the run's `Options`, so the store really is multi-file) and shrunk as one op. Test-harness code only; tests: partial-merge traces replay clean and a sabotaged one is caught after a merge ran; a shrink test over such a trace.
 - **2026-11-15** — Atomic batch hardening from the independent review: replay also verifies every inner record's own CRC (a forged inner record is refused with its envelope instead of opening and failing `get`/merge later); the second replay pass answers `Corrupt` instead of a safety panic if the file changed between the passes; SPEC states that an allocation failure inside a commit's rotation poisons the store.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Card: Audit line after the delta mutation over the atomic batch (73 mutants, 71 killed, 2 equivalent; SPEC § Verification); the atomic-batch backlog item struck; "no atomic multi-put batch" removed from the "behind" list.
