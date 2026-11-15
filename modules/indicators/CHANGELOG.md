@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — NO CONSUMER-VISIBLE CHANGE (tests, test data, oracle tool): second round of the mutation audit
+  for the six open survivors (now 463 mutants, 444 killed, 19 equivalent / unobservable, 0 undecided). Hand-built
+  inputs in `src/audit_test.zig` for KAMA's first-window zero-change count, MCGD's evaluation order, ER's clamp,
+  HT_DCPERIOD's period floor, MASS on a flat market, STC's seed, a doji's colour and a touching body gap;
+  `tools/interop.zig` freezes CG at extreme magnitudes and the Hilbert family over short cycles, drops the candle
+  price-grid records and duplicate unstable records and shortens the flat-run ones (frozen file 1098 records, 2.7 MB,
+  was 3.3 MB; earlier records unchanged; live oracle: all cases agree).
 - **2026-11-15** — NO CONSUMER-VISIBLE CHANGE (tests, test data, oracle tool): first whole-module mutation audit
   and review (463 mutants, 439 killed, 18 equivalent / unobservable, 6 open survivors named in SPEC § Anchoring; no
   defect). New `src/audit_test.zig` and tests in `smooth.zig` / `xmath.zig` for the rules surviving mutants showed

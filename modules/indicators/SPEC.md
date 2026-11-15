@@ -6,7 +6,7 @@
 
 **Scope:** mvp — TA-Lib C 0.8.3, all 237 of its functions: the seed set (17), the Overlap Studies wave (27: every moving-average type, the bands / channels, SAR family, Supertrend, Ichimoku, Zig-Zag), the volume / volatility / price-transform / statistic / math-operator wave (50), the cycle wave (25: HT family, MAMA, three SWAK rows, 15 math transforms), the momentum wave (57: ADX family, AROON, ROC family, oscillators, KST / KDJ / STOCHRSI / CRSI / STC / SQZMOM, ...) and the 61 candlestick patterns (`candles.zig`). Remaining deviations from TA-Lib: MAVP has no streaming type; LINEARREG_ANGLE, PSO and the math transforms (ACOS ... TANH) carry a 2-ULP bound (libm `atan` / `tanh` rounding); the Hilbert family and MAMA a column-relative 1e-13 bound (`atan`); RSI answers NaN where TA-Lib's NaN-poisoned state reads 50; batch and streaming MAX / MIN differ in the sign of a 0.0 / -0.0 tie, as TA-Lib's two tiers do (surveyed 2026-11-15 against `ta_func.h` and the function sources of the 0.8.3 tarball)
 
-**Audit:** review 2026-11-15 · mutation 2026-11-15 (439/463, 18 eq) · src 335cd5473d03c82d
+**Audit:** review 2026-11-15 · mutation 2026-11-15 (444/463, 19 eq) · src 5bcb52297d23a84b
 
 **Hardening:** fuzz 2026-11-15 (1,080,000 runs clean in three verdicts of 4 jobs, INDICATORS_FUZZ, ReleaseSafe; reach on every function: all 237 entries x f64 / f32 x stream, per-function counts printed; the whole surface — every batch function, `Lookback`, every streaming type with `bufLen` / `init` / `update` / `peek` / `value` / `clone` — under NaN / inf / -0 / denormal / huge data, lengths 0 .. 600, parameters at and beyond every range, mismatched slice lengths, short buffers, a failing allocator and in-place calls; batch == stream, `peek` == `update`, the NaN lead == the lookback, no unwritten output slot; the harness checked by 11 planted mutants) · ct n/a — no secret enters an indicator · panic 2026-11-15 (every entry point and every `@intFromFloat` / `@intCast` / `unreachable` / `.?` / allocation site swept, all 237 functions called by the fuzz harness: MEDIAN / PERCENTILE no longer index out of the sorted copy when the data holds a NaN; BBW / PERCENTB streams keep a ring as long as their average needs (KAMA / ZLEMA / VIDYA were wrong and `peek` differed from `update`); ZIGZAG's `pivot_idx` saturates at 2^31 - 1 instead of trapping)
 
@@ -313,15 +313,18 @@ x86-64, our `cc` line). One disagreement was found on the first run and it was o
 `1 - (1 - 0.15)` differed from TA-Lib's double-by-double value by up to 6e7 ULP; fixed (typed `f64`
 constants), pinned by the oracle. Wave I3 brought one more, also ours (not TA-Lib's): BBANDS fed its moving average from the largest lookback, TA-Lib starts it at bar 0; the two agree unless the average's lookback is below the deviation's, which VIDYA is (see the BBANDS note); BBW and PERCENTB, which call BBANDS in TA-Lib, had inherited the same flaw and were fixed the same way when the merged oracle widened their MA grid to every type. The oracle found no defect in TA-Lib, so there is no "lead" to record.
 
-**External anchor, frozen:** `src/testdata/talib_vectors.zig` holds 1223 of those records (n = 40, the
+**External anchor, frozen:** `src/testdata/talib_vectors.zig` holds 1098 of those records (n = 40, the
 first parameter sets of each function, one f32 record per function, AUTO4 and bars unstable) as bit
 patterns of TA-Lib's answers; `src/oracle_test.zig` replays them in the ordinary test lane. Since the 2026-11-15
 mutation audit the file also freezes, from a seed space of their own (the earlier records keep their inputs), one
-flat-run record per function at its defaults (n = max(48, lookback + 24)), the math transforms inside their domains and
-over ten decades, one 0.25-price-grid record per candlestick pattern (n = 60), and every unstable level (3 bars, AUTO4,
-AUTO8) of every function where it matters, on the first parameter set whose lookback leaves 12 outputs within 160 bars:
-the n = 40 unstable records of a long lookback were all-NaN and AUTO8 was never frozen, so the ordinary lane did not see
-the AUTO constants or the stage alignment under an unstable period (3.3 MB, was 1.9 MB). Regenerate
+flat-run record per function at its defaults (n = max(40, lookback + 16)), the math transforms inside their domains and
+over ten decades, CG over a 2^33..2^-60 span and near 2^-940, the Hilbert family over 3- to 5-bar cycles, and every
+unstable level (3 bars, AUTO4, AUTO8) where the n = 40 record of the first parameter set has no outputs, on the first set
+whose lookback leaves 12 outputs within 160 bars: those n = 40 records of a long lookback were all-NaN and AUTO8 was never
+frozen, so the ordinary lane did not see the AUTO constants or the stage alignment under an unstable period. The file is
+2.7 MB (was 1.9 MB): the audit's trim (shorter flat records, no duplicate unstable records, the candle price grid replaced
+by hand-built bars) kept every kill; going further would drop records that are the only killers of a mutant (the flat
+runs of BBANDS / AD / PERCENTRANK / CRSI, the unstable levels of T3 / DEMA / MCGD / SWAK / HT, CG, HT cycles). Regenerate
 with `zig build interop-indicators -- --emit-vectors modules/indicators/src/testdata/talib_vectors.zig`, then `zig fmt` it.
 
 Not covered by the oracle: `nan = .skip` and `seed = .first` (options TA-Lib does not have; tested against
@@ -331,8 +334,8 @@ unspecified; pinned by tests), parameters beyond the grid, optimised modes, othe
 **Anchor grade:** class B · oracle EXTERNAL
 
 **Mutation + review (2026-11-15, whole module, first audit;** production code at `a3eb6bd33`, schemata in a detached
-copy, ReleaseSafe, strict verdict against M0, `IND_MUT=n`): 463 mutants, 439 killed, 18 equivalent / unobservable,
-6 survivors open (each with the input it needs named below); no defect. **Cut:** the shared cores exhaustively — `core.zig`, the
+copy, ReleaseSafe, strict verdict against M0, `IND_MUT=n`; two rounds, the second for the first round's six survivors): 463
+mutants, 444 killed, 19 equivalent / unobservable, 0 undecided; no defect. **Cut:** the shared cores exhaustively — `core.zig`, the
 drivers and SMA / EMA / WMA / `MaCore` / `Stage` of `smooth.zig`, `window.zig` (SUM, the streaming extreme automaton,
 its register `Run`, TA-Lib's block scan), every core of `mavg.zig` (DEMA/TEMA/T3, TRIMA, KAMA incl. `steadyRun`, ZLEMA,
 RMA, VIDYA, HMA, ALMA, MCGD, SWAK), `xmath.zig` (the double-double kernels, the atan fast path and Ziv's rounding
@@ -346,7 +349,7 @@ not mutated: test helpers, printing, the comptime tables themselves (their use s
 patterns (their conditions are the C's, transcribed; the engine they run on is covered). Kill sources: the frozen
 TA-Lib vectors (all lookback formulas, every value formula, the f32 path, unstable levels), batch == stream and
 `peek` == `update` (every ring / NaN-skip / steady-path mutant), the hand vectors, the fuzz harness's forced runs and
-the new `audit_test.zig`. **Equivalent / unobservable (18):** `Run.of` one index early (a rescan whose extreme is
+the new `audit_test.zig`. **Equivalent / unobservable (19):** `Run.of` one index early (a rescan whose extreme is
 the window's first bar returns that element); `asin` |x| > 1 guard (the double-double path gives NaN through
 `0 * inf`); MACD's `0.0 + line` seed quirk (an SMA-seeded EMA never produces -0.0, so the line is never -0.0);
 MACDFIX's fast unstable count (it only gates the fast EMA's own output, read only once the slow one answers); the
@@ -361,13 +364,15 @@ the previous high (the extreme point already is the running maximum of the highs
 stream's parameters have `nan`); HT's `re != 0` and `|imag| <= 0.01` branches (reachable only with an exactly zero
 component); and three precision-level choices of `xmath` (the e^-x term of the large-argument cosh/sinh below 45, the
 small-argument sinh and cosh formulas), which move a result by at most one ULP and are checked only by the live
-oracle under the math transforms' 2-ULP bound. **Open survivors (6):** KAMA's zero-change count carried out of the
-first window (needs a positive rounding residue in the first window's change sum at the trigger bar; the spiked
-test data gave none), MCGD's `r^2 * r^2` versus `((r*r)*r)*r` (no bit difference on 300 bars of +-70 % swings),
-ER's `t > 1` clamp (needs a change sum that rounds below the net change), the HT period floor 6 (needs a cycle
-shorter than 6 bars held long enough), CG's `width3` and `SCALE_CAP` caps (multi-limb exactness at extreme
-magnitudes). The live oracle (5000-bar runs, flat / tiny kinds) exercises all six regions; a frozen record or a
-hand vector for each is the remaining work. **Review (same pass, adversarial):** no consumer-reachable panic, OOM or
+oracle under the math transforms' 2-ULP bound; and CG's `SCALE_CAP` on the two-limb scale (uncapped, that scale is
+inf, fails the fit test, and the window takes the three-limb scale, capped on its own line, whose sums are exact as
+well: the frozen record near 2^-940 agrees with TA-Lib bit for bit either way). **Second round:** the first round's
+six survivors are killed by hand-built inputs found by search or construction (KAMA's zero-change count of the first
+window: a change-sum residue of 2^-53 and a following move of 2^-50; MCGD's `r^2 * r^2`: an input pair where
+`((r*r)*r)*r` differs; ER's clamp: three prices whose rounded change sum is below the net change; HT's period floor:
+3- to 5.5-bar cycles never answer below 6; CG's `width3` cap: the frozen 2^33..2^-60 span record, which needs three
+limbs), and MASS's 0 / 0 = 1 and STC's seeded second stochastic, which the trimmed flat records no longer reached, by
+hand tests. **Review (same pass, adversarial):** no consumer-reachable panic, OOM or
 unbounded allocation found beyond what the 2026-11-15 sweep fixed (allocation is bounded by the input length or by
 `max_period`; streams take caller buffers); lookback sums stay below 2^32 even on 32-bit targets (at most three
 unstable counts of 2^30); batch and stream share every core. Notes, not defects: `Stream1` would answer null on a
@@ -381,7 +386,9 @@ swapped periods, PPO zero tails batch and stream, TSI / COPPOCK / ROCR100 / WILL
 neutral answers, VWMA residue, ACCBANDS near-zero sums, +DM ties, BBW / PERCENTB against BBANDS' bands, the AUTO
 lookbacks of KAMA / RMA / VIDYA / PLUS_DI, FISHER's 0.999 clamp, WAVETREND's settled tail, KURTOSIS's 32p re-anchor,
 TANH = `xmath.tanh`, TRIX period 1, HIKKAKE's confirmation window and pre-warm, one load-bearing condition each of
-2CROWS / 3INSIDE / MORNINGSTAR / PIERCING / MATHOLD), EMA period 1 copies (-0.0, inf, unstable bars), the atan
+2CROWS / 3INSIDE / MORNINGSTAR / PIERCING / MATHOLD, the doji colour and the strict body gap; and from the second
+round KAMA's first-window count, MCGD's evaluation order on a crafted pair, ER's clamp, HT_DCPERIOD's floor, MASS on a
+flat market, STC's seed), EMA period 1 copies (-0.0, inf, unstable bars), the atan
 fast path's rounding test on arguments near a rounding boundary, sinh / cosh of NaN; and the extra frozen records
 above (`tools/interop.zig`).
 

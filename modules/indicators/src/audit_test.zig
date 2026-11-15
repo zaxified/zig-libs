@@ -521,3 +521,92 @@ test "trix period 1: the steady batch path copies like the stream (an inf input 
     var s = try ind.TrixStream(f64).init(.{ .period = 1 });
     try expectStreamEqualsBatch(@TypeOf(s), &s, &xs, &out);
 }
+
+test "kama: the zero-change count of the first window carries over (a residue 2^-53 left in the change sum)" {
+    // period 3 over 1, 0, -3*2^-53, then flat: the first window's changes are 1, 3*2^-53 and 0, summed to
+    // 1 + 2^-51; retiring 1 and then 3*2^-53 leaves 2^-53 > 0. The third zero change (bar 5) makes the
+    // efficiency ratio 1 although the sum still holds that residue.
+    const kmax: f64 = 2.0 / 31.0;
+    const two_thirds: f64 = 2.0 / 3.0;
+    const sc1 = @mulAdd(f64, 1.0, two_thirds - kmax, kmax);
+    // On the flat bars the line already equals the price; the move of 2^-50 at bar 6 shows the reset: with the
+    // sum emptied the move is the whole change sum (ratio 1), with the residue kept it would be 2^-50 / (2^-50 + 2^-53).
+    const z: f64 = -3.0 * 0x1p-53;
+    const up: f64 = 5.0 * 0x1p-53;
+    const xs = [_]f64{ 1, 0, z, z, z, z, up, up };
+    var out: [xs.len]f64 = undefined;
+    _ = try ind.kama(f64, &xs, &out, .{ .period = 3 });
+    for (5..xs.len) |n| try testing.expect(th.sameBits(@mulAdd(f64, xs[n] - out[n - 1], sc1 * sc1, out[n - 1]), out[n]));
+}
+
+test "mcgd: r^2 * r^2, not ((r*r)*r)*r (an input where the two differ)" {
+    const xs = [_]f64{ 0x1.e8951fbf70f67p+6, 0x1.56047f39fb1f9p+6 };
+    var out: [2]f64 = undefined;
+    _ = try ind.mcgd(f64, &xs, &out, .{ .period = 2 });
+    const r = xs[1] / xs[0];
+    try testing.expect(th.sameBits(xs[0] + (xs[1] - xs[0]) / (2.0 * (r * r * (r * r))), out[1]));
+    try testing.expect(!th.sameBits(xs[0] + (xs[1] - xs[0]) / (2.0 * (r * r * r * r)), out[1]));
+}
+
+test "er: a change sum that rounds below the net change is clamped to 1" {
+    // |x2 - x0| exceeds the rounded |x0 - x1| + |x1 - x2| here (found by search)
+    const xs = [_]f64{ 0x1.897d28cbcb17bp+33, 0x1.6e872541466c6p+26, 0x1.1e8d353c68a96p-2 };
+    const net = @abs(xs[2] - xs[0]);
+    try testing.expect(net > @abs(xs[0] - xs[1]) + @abs(xs[1] - xs[2]));
+    var out: [3]f64 = undefined;
+    _ = try ind.er(f64, &xs, &out, .{ .period = 2 });
+    try testing.expectEqual(@as(f64, 1.0), @abs(out[2]));
+}
+
+test "ht_dcperiod: the cycle period is floored at 6 bars (short cycles settle at or above 6)" {
+    // every period estimate is clamped to [6, 50] before it is smoothed, so once the zero start has decayed the
+    // output cannot fall below 6, whatever the input; 3- to 5.5-bar cycles push the raw estimate below it
+    var xs: [400]f64 = undefined;
+    var out: [400]f64 = undefined;
+    for ([_]f64{ 3.0, 3.5, 4.0, 4.5, 5.0, 5.5 }) |per| {
+        for (&xs, 0..) |*x, i| x.* = 100.0 + 3.0 * @sin(@as(f64, @floatFromInt(i)) * 2.0 * std.math.pi / per);
+        _ = try ind.htDcperiod(f64, &xs, &out, .{});
+        for (out[300..]) |v| try testing.expect(v >= 6.0 - 1e-9);
+    }
+}
+
+test "candle ties: an open == close bar is white, a body gap needs a strict gap" {
+    const C = ind.candles;
+    // 3BLACKCROWS after a doji: TA_CANDLECOLOR counts close >= open as white, so the doji opens the pattern
+    var s: ind.candles.CandleSettings = .default;
+    s.shadow_very_short = .{ .range = .high_low, .avg_period = 0, .factor = 0.1 };
+    const crows = [_]Cdl{
+        .{ .o = 10, .h = 12, .l = 9, .c = 10 },
+        .{ .o = 11.5, .h = 11.6, .l = 10.5, .c = 10.5 },
+        .{ .o = 11, .h = 11.1, .l = 9.5, .c = 9.5 },
+        .{ .o = 10, .h = 10.1, .l = 8.5, .c = 8.5 },
+    };
+    try testing.expectEqual(@as(i32, -100), try cdlRun(C.cdl3blackcrows, &crows, s));
+    // MATHOLD: a second candle whose body only touches the first one's (min(o, c) == c4) is no gap up
+    var sm: ind.candles.CandleSettings = .default;
+    sm.body_long = .{ .range = .real_body, .avg_period = 0, .factor = 0.5 };
+    sm.body_short = .{ .range = .real_body, .avg_period = 0, .factor = 2.0 };
+    const m0 = Cdl{ .o = 18.6, .h = 24.1, .l = 18.5, .c = 24 };
+    try testing.expectEqual(@as(i32, 100), try cdlRun(C.cdlmathold, &.{ bar(10, 20), bar(21, 20.5), bar(19.5, 19), bar(19, 18.5), m0 }, sm));
+    try testing.expectEqual(@as(i32, 0), try cdlRun(C.cdlmathold, &.{ bar(10, 20), bar(21, 20), bar(19.5, 19), bar(19, 18.5), m0 }, sm));
+}
+
+test "massi: a flat market is the ratio 1 per bar (0 / 0 answers 1), the index is `slow`" {
+    const k: [80]f64 = @splat(10.0);
+    var o: [80]f64 = undefined;
+    const lb = try ind.massi(f64, &k, &k, &o, .{ .fast = 3, .slow = 5 });
+    for (o[lb..]) |v| try testing.expectEqual(@as(f64, 5.0), v);
+}
+
+test "stc: the second stochastic is seeded with its first value (cycle 2: 0 or 100, never a blend)" {
+    var xs: [120]f64 = undefined;
+    var out: [120]f64 = undefined;
+    var hundreds: usize = 0;
+    for (0..16) |seed| {
+        th.walk(&xs, 500 + seed);
+        const lb = try ind.stc(f64, testing.allocator, &xs, &out, .{ .fast = 2, .slow = 3, .cycle = 2 });
+        try testing.expect(out[lb] == 0.0 or out[lb] == 100.0);
+        if (out[lb] == 100.0) hundreds += 1;
+    }
+    try testing.expect(hundreds > 0);
+}
