@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** SPEC/card: mutation 506/519 (13 equivalent, 0 unobservable) after the collector delta run (32/32 killed); Backlog item struck; the card's `src` hash follows the refactored `client.zig`.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** the reply collectors of `Nl80211.wiphys/interfaces/interfaceByIndex/stations/scanResults/regDomains/survey/powerSave/newInterface` and `EventSocket.waitForEvent` moved into transport-generic internal functions (`collect*`, `waitForEventStep`, `Dump` generic over the transport), the same way `dumpStep`/`awaitAckStep` are; scripted-socket tests now observe their `m.cmd` filters, appends and found-guards (the 16 formerly unobservable mutants, now killed: 32/32 in a delta run; module mutation 506/519, 13 equivalent).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** strict mutation re-audit (490/519 killed, 29 equivalent or unobservable; the 16 unobservable ones were closed later the same day, 506/519 and 13 equivalent). New tests only: `src/strict_test.zig` and sections at the end of `wiphy.zig` and `client.zig`; the card's `Audit:` line now records the src hash.
