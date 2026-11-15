@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of `Options.on_conn_closed` (ConnSummary, `connEnd`, the summary defer, the refusal paths, the request counters), 31/31 killed; new tests for the cancelation, write-stall, reset, h2c pre-preface and slab-refusal endings; no behaviour change.
 - **2026-11-15** — **FEATURE (server):** `Options.on_conn_closed` (+ `on_conn_closed_ctx`) — one `ConnSummary{peer, requests, duration_ns, end}` per admitted connection, fired after `.closed` and after the cause is known (`ConnEnd`: `normal`, `timed_out`, `errored`, `refused`), h1, h2c and the two early-refusal paths; `ConnStateFn` is unchanged. `requests` counts h1 requests and h2 streams served. Consumer request 2026-11-15. Tests in `Server.zig` (3 keep-alive requests, every timeout phase, a reset, h2c silence, the no-task refusal) and `h2_server.zig` (3 h2 streams).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: the PROXY protocol item moves to the planned module `proxyproto` (root `NEW-MODULES.md`; own module, optional dependency of the accept path).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: ConnState .closed carries no connection summary (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
