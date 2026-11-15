@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NEW:** `medianWith(samples: []u64, pick: enum { lower, upper }) ?u64`: `median` with the even-count middle chosen explicitly (`.upper` = element `n / 2` of the sorted order); `median` is unchanged and equals `.lower`.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation audit of `median`/`select` (27 schemata mutants: 15 killed, 12 equivalent by cost-only or invariant arguments); no test change.
 - **2026-11-15** — **NEW:** `median(samples: []u64) ?u64`: exact median by in-place introselect (not a full sort), null when empty, lower middle for an even count (consumer request 2026-11-15). Allocation-free.
