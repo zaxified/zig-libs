@@ -395,6 +395,26 @@ mkdir -p "$SODIUM_DIR" \
     && echo "libsodium codecs.c: 1.0.22" || { rm -f "$SODIUM_DIR/codecs.c"; echo "libsodium codecs.c: fetch or hash check failed"; }
 echo "::endgroup::"
 
+echo "::group::interop: TA-Lib C (indicators)"
+# indicators: tools/interop.zig links libta-lib.a and reads its headers at the
+# default paths below. The release tarball is pinned by hash (the pin is the
+# review: audited 2026-11-15, no I/O, process or network calls in the compiled
+# set); it is compiled with our own cc line, TA-Lib's CMake/configure never runs.
+TALIB_VER=0.8.3
+TALIB_SRC="$HOME/.local/share/zig-libs/oracles/ta-lib-$TALIB_VER"
+TALIB_OUT="$HOME/.local/share/zig-libs/oracle-bin/ta-lib-$TALIB_VER"
+mkdir -p "$TALIB_SRC/src" "$TALIB_OUT/obj" \
+    && curl -fsSL -o "$TALIB_SRC/ta-lib-$TALIB_VER-src.tar.gz" \
+        "https://github.com/TA-Lib/ta-lib/releases/download/v$TALIB_VER/ta-lib-$TALIB_VER-src.tar.gz" \
+    && echo "28b1179b178a0db15f3dad0d846ef77f18eb06db5dfc5b5a8ca153a9ea5d84e6  $TALIB_SRC/ta-lib-$TALIB_VER-src.tar.gz" | sha256sum -c --quiet \
+    && tar -xzf "$TALIB_SRC/ta-lib-$TALIB_VER-src.tar.gz" -C "$TALIB_SRC/src" \
+    && T="$TALIB_SRC/src/ta-lib-$TALIB_VER" \
+    && ls "$T"/src/ta_common/*.c "$T"/src/ta_func/*.c \
+        | xargs -P "$(nproc)" -I{} sh -c 'cc -O2 -fPIC -I"$1/include" -I"$1/src/ta_common" -I"$1/src/ta_func" -c "$2" -o "$3/obj/$(basename "$2" .c).o"' _ "$T" {} "$TALIB_OUT" \
+    && ar rcs "$TALIB_OUT/libta-lib.a" "$TALIB_OUT"/obj/*.o \
+    && echo "ta-lib: $TALIB_VER" || echo "ta-lib: fetch, hash check or build failed"
+echo "::endgroup::"
+
 echo "::group::interop: browser oracles (cors security-headers: bun + Chrome)"
 # bun lands in ~/.bun/bin, where tools/interop.zig looks after PATH. Chrome is
 # found on PATH; the hosted image ships google-chrome.
