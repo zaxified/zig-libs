@@ -27,13 +27,15 @@ pub fn batchBars(comptime T: type, comptime Core: type, hs: []const T, ls: []con
     try core.checkLen(hs.len, &.{ ls.len, cs.len, out.len });
     var c = try Core.init(p);
     const skip = nanSkip(p);
+    var last = std.math.nan(T);
     for (hs, ls, cs, out) |h, l, cl, *o| {
         const b = Bar(f64){ .high = h, .low = l, .close = cl };
         if (skip and barHasNan(b)) {
-            o.* = std.math.nan(T);
+            o.* = last;
             continue;
         }
         o.* = if (c.step(b)) |r| core.to(T, r) else std.math.nan(T);
+        last = o.*;
     }
     return Core.lookback(p);
 }
@@ -52,14 +54,14 @@ pub fn BarStream(comptime T: type, comptime Params: type, comptime Core: type) t
         }
         pub fn update(self: *Self, bar: Bar(T)) ?T {
             const b = core.to(Bar(f64), bar);
-            if (self.skip and barHasNan(b)) return null;
+            if (self.skip and barHasNan(b)) return self.last;
             const r = self.c.step(b) orelse return null;
             self.last = core.to(T, r);
             return self.last;
         }
         pub fn peek(self: *const Self, bar: Bar(T)) ?T {
             const b = core.to(Bar(f64), bar);
-            if (self.skip and barHasNan(b)) return null;
+            if (self.skip and barHasNan(b)) return self.last;
             var cc = self.c;
             const r = cc.step(b) orelse return null;
             return core.to(T, r);
@@ -336,7 +338,19 @@ test "atr nan skip ignores the bad bar" {
     const c = [_]f64{ 9, 10, 1, 14, 12.5 };
     var out: [5]f64 = undefined;
     _ = try atr(f64, &h, &l, &c, &out, .{ .period = 2, .nan = .skip });
-    try testing.expect(std.math.isNan(out[2]));
+    try testing.expect(std.math.isNan(out[2])); // skipped before the first output: still NaN
     try testing.expectEqual(@as(f64, 3.5), out[3]);
     try testing.expectEqual(@as(f64, 2.75), out[4]);
+    // a skipped bar after the first output carries the previous value
+    const h2 = [_]f64{ 10, 11, 15, nan, 13 };
+    const l2 = [_]f64{ 8, 9, 11, 1, 12 };
+    const c2 = [_]f64{ 9, 10, 14, 1, 12.5 };
+    _ = try atr(f64, &h2, &l2, &c2, &out, .{ .period = 2, .nan = .skip });
+    try testing.expectEqual(@as(f64, 3.5), out[2]);
+    try testing.expectEqual(@as(f64, 3.5), out[3]);
+    try testing.expectEqual(@as(f64, 2.75), out[4]);
+    _ = try natr(f64, &h2, &l2, &c2, &out, .{ .period = 2, .nan = .skip });
+    try testing.expectEqual(@as(f64, 25), out[2]);
+    try testing.expectEqual(@as(f64, 25), out[3]);
+    try testing.expectEqual(@as(f64, 22), out[4]);
 }

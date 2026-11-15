@@ -29,13 +29,15 @@ pub fn batch1(comptime T: type, comptime Core: type, in: []const T, out: []T, p:
     var c = try Core.init(p);
     const src = SliceSrc(T){ .xs = in };
     const skip = nanSkip(p);
+    var last = std.math.nan(T);
     for (in, out) |x, *o| {
         const xv: f64 = x;
         if (skip and core.isNan(xv)) {
-            o.* = std.math.nan(T);
+            o.* = last; // carry the previous output over the skipped bar
             continue;
         }
         o.* = if (c.step(src, xv)) |r| core.to(T, r) else std.math.nan(T);
+        last = o.*;
     }
     return Core.lookback(p);
 }
@@ -113,14 +115,14 @@ pub fn Rec1(comptime T: type, comptime Params: type, comptime Core: type) type {
         }
         pub fn update(self: *Self, x: T) ?T {
             const xv: f64 = x;
-            if (self.skip and core.isNan(xv)) return null;
+            if (self.skip and core.isNan(xv)) return self.last;
             const r = self.c.step(NoSrc{}, xv) orelse return null;
             self.last = core.to(T, r);
             return self.last;
         }
         pub fn peek(self: *const Self, x: T) ?T {
             const xv: f64 = x;
-            if (self.skip and core.isNan(xv)) return null;
+            if (self.skip and core.isNan(xv)) return self.last;
             var cc = self.c;
             const r = cc.step(NoSrc{}, xv) orelse return null;
             return core.to(T, r);
@@ -528,9 +530,9 @@ test "ema nan skip carries the state over" {
     const in = [_]f64{ 1, 2, 3, nan, 4, 5 };
     var out: [6]f64 = undefined;
     _ = try ema(f64, &in, &out, .{ .period = 3, .nan = .skip });
-    // Same as the series without the NaN bar: seed 2, then 3, then 4.
+    // Same as the series without the NaN bar: seed 2, then 3, then 4; the NaN bar carries 2.
     try testing.expectEqual(@as(f64, 2), out[2]);
-    try testing.expect(std.math.isNan(out[3]));
+    try testing.expectEqual(@as(f64, 2), out[3]);
     try testing.expectEqual(@as(f64, 3), out[4]);
     try testing.expectEqual(@as(f64, 4), out[5]);
     // propagate: the NaN poisons everything after it.
@@ -644,4 +646,30 @@ test "stream peek does not change the state, value reports the last output" {
     _ = s2.update(100.0);
     try testing.expect(s.value().? != s2.value().?);
     try testing.expectError(error.BadParam, SmaStream(f64).init(.{ .period = 5 }, buf[0..4]));
+}
+
+test "ema: nan skip equals the series without the NaN bars, outputs carry over" {
+    try th.checkSkip1(ema, EmaParams{ .period = 5, .nan = .skip }, EmaParams{ .period = 5 });
+    try th.checkSkip1(ema, EmaParams{ .period = 5, .nan = .skip, .unstable = .{ .bars = 4 }, .seed = .first }, EmaParams{ .period = 5, .unstable = .{ .bars = 4 }, .seed = .first });
+    // the stream agrees: update on a NaN bar answers the last output (null before any)
+    var s = try EmaStream(f64).init(.{ .period = 3, .nan = .skip });
+    const nan = std.math.nan(f64);
+    try testing.expectEqual(@as(?f64, null), s.update(nan));
+    _ = s.update(1);
+    _ = s.update(2);
+    const v = s.update(3).?;
+    try testing.expectEqual(@as(?f64, v), s.update(nan));
+    try testing.expectEqual(@as(?f64, v), s.peek(nan));
+}
+
+test "sma/wma: a NaN enters the running sums and poisons everything after it (as in TA-Lib)" {
+    const nan = std.math.nan(f64);
+    const in = [_]f64{ 1, 2, nan, 4, 5, 6 };
+    var out: [6]f64 = undefined;
+    _ = try sma(f64, &in, &out, .{ .period = 2 });
+    try testing.expectEqual(@as(f64, 1.5), out[1]);
+    for (out[2..]) |v| try testing.expect(std.math.isNan(v));
+    _ = try wma(f64, &in, &out, .{ .period = 2 });
+    try testing.expectApproxEqAbs(@as(f64, 5.0 / 3.0), out[1], 1e-15);
+    for (out[2..]) |v| try testing.expect(std.math.isNan(v));
 }

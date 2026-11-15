@@ -163,12 +163,13 @@ fn batch3(comptime T: type, comptime Core: type, in: []const T, o_macd: []T, o_s
     var c = try Core.init(p);
     const skip = nanSkip(p);
     const nan = std.math.nan(T);
+    var last = MacdOut(T){ .macd = nan, .signal = nan, .hist = nan };
     for (in, o_macd, o_sig, o_hist) |x, *a, *b, *h| {
         const xv: f64 = x;
         if (skip and core.isNan(xv)) {
-            a.* = nan;
-            b.* = nan;
-            h.* = nan;
+            a.* = last.macd; // carry the previous output over the skipped bar
+            b.* = last.signal;
+            h.* = last.hist;
             continue;
         }
         if (c.step(NoSrc{}, xv)) |r| {
@@ -176,6 +177,7 @@ fn batch3(comptime T: type, comptime Core: type, in: []const T, o_macd: []T, o_s
             a.* = o.macd;
             b.* = o.signal;
             h.* = o.hist;
+            last = o;
         } else {
             a.* = nan;
             b.* = nan;
@@ -198,14 +200,14 @@ fn Rec3(comptime T: type, comptime Params: type, comptime Core: type) type {
         }
         pub fn update(self: *Self, x: T) ?MacdOut(T) {
             const xv: f64 = x;
-            if (self.skip and core.isNan(xv)) return null;
+            if (self.skip and core.isNan(xv)) return self.last;
             const r = self.c.step(NoSrc{}, xv) orelse return null;
             self.last = core.to(MacdOut(T), r);
             return self.last;
         }
         pub fn peek(self: *const Self, x: T) ?MacdOut(T) {
             const xv: f64 = x;
-            if (self.skip and core.isNan(xv)) return null;
+            if (self.skip and core.isNan(xv)) return self.last;
             var cc = self.c;
             const r = cc.step(NoSrc{}, xv) orelse return null;
             return core.to(MacdOut(T), r);
@@ -303,7 +305,10 @@ pub fn macdextLookback(p: MacdextParams) Error!usize {
     return (try ExtPlan.make(p)).total();
 }
 
-pub fn macdext(comptime T: type, in: []const T, out_macd: []T, out_signal: []T, out_hist: []T, p: MacdextParams) Error!usize {
+/// MACDEXT. All intermediate series are f64 whatever `T` is: with `f64` the
+/// line is built in `out_macd` itself, with `f32` a scratch of `in.len` f64 is
+/// allocated from `gpa` and freed before returning.
+pub fn macdext(comptime T: type, gpa: std.mem.Allocator, in: []const T, out_macd: []T, out_signal: []T, out_hist: []T, p: MacdextParams) core.AllocError!usize {
     core.checkFloat(T);
     try core.checkLen(in.len, &.{ out_macd.len, out_signal.len, out_hist.len });
     const plan = try ExtPlan.make(p);
@@ -313,22 +318,28 @@ pub fn macdext(comptime T: type, in: []const T, out_macd: []T, out_signal: []T, 
     const skip_f = plan.lmax - plan.lb_fast;
     const skip_s = plan.lmax - plan.lb_slow;
     const nan = std.math.nan(T);
+    var owned: []f64 = &.{};
+    defer if (T != f64) gpa.free(owned);
+    const line: []f64 = if (T == f64) out_macd else blk: {
+        owned = try gpa.alloc(f64, in.len);
+        break :blk owned;
+    };
     @memset(out_macd, nan);
     @memset(out_signal, nan);
     @memset(out_hist, nan);
     const sf = SliceSrc(T){ .xs = in, .off = skip_f };
     const ss = SliceSrc(T){ .xs = in, .off = skip_s };
-    const sg = SliceSrc(T){ .xs = out_macd, .off = plan.lmax };
+    const sg = SliceSrc(f64){ .xs = line, .off = plan.lmax };
     for (in, 0..) |x, i| {
         const xv: f64 = x;
         const f = if (i >= skip_f) cf.step(sf, xv) else null;
         const s = if (i >= skip_s) cs.step(ss, xv) else null;
         if (f == null or s == null) continue;
-        out_macd[i] = core.to(T, f.? - s.?);
-        const line: f64 = out_macd[i];
-        const g = cg.step(sg, line) orelse continue;
+        line[i] = f.? - s.?;
+        const g = cg.step(sg, line[i]) orelse continue;
+        out_macd[i] = core.to(T, line[i]);
         out_signal[i] = core.to(T, g);
-        out_hist[i] = core.to(T, line - @as(f64, out_signal[i]));
+        out_hist[i] = core.to(T, line[i] - g);
     }
     // The line is defined from `lmax`, but TA-Lib outputs all three from the
     // signal's first bar: blank the earlier line values (the signal read them above).
@@ -396,6 +407,10 @@ pub fn MacdextStream(comptime T: type) type {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+fn macdextT(comptime T: type, in: []const T, a: []T, b: []T, h: []T, p: MacdextParams) core.AllocError!usize {
+    return macdext(T, testing.allocator, in, a, b, h, p);
+}
 
 fn check3(comptime Stream: anytype, comptime batch: anytype, comptime lbFn: anytype, xs: []const f64, p: anytype, comptime buffered: bool) !void {
     const S = Stream(f64);
@@ -517,7 +532,7 @@ test "macdext: SMA lines hand-check, swap, all-EMA equals macd, unsupported" {
     var a: [6]f64 = undefined;
     var b: [6]f64 = undefined;
     var h: [6]f64 = undefined;
-    try testing.expectEqual(@as(usize, 3), try macdext(f64, &in, &a, &b, &h, .{ .fast = 2, .slow = 3, .signal = 2 }));
+    try testing.expectEqual(@as(usize, 3), try macdext(f64, testing.allocator, &in, &a, &b, &h, .{ .fast = 2, .slow = 3, .signal = 2 }));
     try testing.expect(std.math.isNan(a[2]));
     try testing.expectApproxEqAbs(@as(f64, 0.5), a[3], 1e-14);
     try testing.expectApproxEqAbs(@as(f64, 0.5), b[3], 1e-14);
@@ -529,7 +544,7 @@ test "macdext: SMA lines hand-check, swap, all-EMA equals macd, unsupported" {
     var a2: [6]f64 = undefined;
     var b2: [6]f64 = undefined;
     var h2: [6]f64 = undefined;
-    _ = try macdext(f64, &in, &a2, &b2, &h2, .{ .fast = 3, .slow = 2, .signal = 2 });
+    _ = try macdext(f64, testing.allocator, &in, &a2, &b2, &h2, .{ .fast = 3, .slow = 2, .signal = 2 });
     try th.expectSameBits(&a, &a2);
     // all-EMA agrees with macd (TA-Lib delegates that case to MACD)
     var xs: [120]f64 = undefined;
@@ -541,11 +556,11 @@ test "macdext: SMA lines hand-check, swap, all-EMA equals macd, unsupported" {
     var e2: [120]f64 = undefined;
     var e3: [120]f64 = undefined;
     _ = try macd(f64, &xs, &m1, &m2, &m3, .{ .unstable = .{ .bars = 6 } });
-    _ = try macdext(f64, &xs, &e1, &e2, &e3, .{ .fast_ma = .ema, .slow_ma = .ema, .signal_ma = .ema, .unstable = .{ .bars = 6 } });
+    _ = try macdext(f64, testing.allocator, &xs, &e1, &e2, &e3, .{ .fast_ma = .ema, .slow_ma = .ema, .signal_ma = .ema, .unstable = .{ .bars = 6 } });
     try th.expectSameBits(&m1, &e1);
     try th.expectSameBits(&m2, &e2);
     try th.expectSameBits(&m3, &e3);
-    try testing.expectError(error.Unsupported, macdext(f64, &in, &a, &b, &h, .{ .fast = 2, .slow = 3, .fast_ma = .dema }));
+    try testing.expectError(error.Unsupported, macdext(f64, testing.allocator, &in, &a, &b, &h, .{ .fast = 2, .slow = 3, .fast_ma = .dema }));
 }
 
 test "macd family: BadParam" {
@@ -558,8 +573,8 @@ test "macd family: BadParam" {
     try testing.expectError(error.BadParam, macd(f64, &in, &a, &b, &h, .{ .signal = 0 }));
     try testing.expectError(error.BadParam, macd(f64, &in, &a, &b, h[0..5], .{}));
     try testing.expectError(error.BadParam, macdfix(f64, &in, &a, &b, &h, .{ .signal = 0 }));
-    try testing.expectError(error.BadParam, macdext(f64, &in, &a, &b, &h, .{ .fast = 1 }));
-    try testing.expectError(error.BadParam, macdext(f64, &in, &a, &b, &h, .{ .signal = 100001 }));
+    try testing.expectError(error.BadParam, macdext(f64, testing.allocator, &in, &a, &b, &h, .{ .fast = 1 }));
+    try testing.expectError(error.BadParam, macdext(f64, testing.allocator, &in, &a, &b, &h, .{ .signal = 100001 }));
     try testing.expectError(error.BadParam, macdextLookback(.{ .slow = 0 }));
 }
 
@@ -572,9 +587,9 @@ test "macd family: batch == streaming, lookback == leading NaN, f32" {
     try check3(MacdStream, macd, macdLookback, &xs, MacdParams{ .seed = .first, .unstable = .auto4 }, false);
     try check3(MacdfixStream, macdfix, macdfixLookback, &xs, MacdfixParams{}, false);
     try check3(MacdfixStream, macdfix, macdfixLookback, &xs, MacdfixParams{ .signal = 1, .unstable = .auto4 }, false);
-    try check3(MacdextStream, macdext, macdextLookback, &xs, MacdextParams{}, true);
-    try check3(MacdextStream, macdext, macdextLookback, &xs, MacdextParams{ .fast_ma = .wma, .slow_ma = .ema, .signal_ma = .sma, .fast = 5, .slow = 9, .signal = 4 }, true);
-    try check3(MacdextStream, macdext, macdextLookback, &xs, MacdextParams{ .fast = 9, .fast_ma = .ema, .slow = 5, .slow_ma = .wma, .signal = 1 }, true);
+    try check3(MacdextStream, macdextT, macdextLookback, &xs, MacdextParams{}, true);
+    try check3(MacdextStream, macdextT, macdextLookback, &xs, MacdextParams{ .fast_ma = .wma, .slow_ma = .ema, .signal_ma = .sma, .fast = 5, .slow = 9, .signal = 4 }, true);
+    try check3(MacdextStream, macdextT, macdextLookback, &xs, MacdextParams{ .fast = 9, .fast_ma = .ema, .slow = 5, .slow_ma = .wma, .signal = 1 }, true);
     var f32s: [100]f32 = undefined;
     for (&f32s, xs[0..100]) |*d, s| d.* = @floatCast(s);
     var a: [100]f32 = undefined;
@@ -582,6 +597,71 @@ test "macd family: batch == streaming, lookback == leading NaN, f32" {
     var h: [100]f32 = undefined;
     try testing.expectEqual(@as(usize, 33), try macd(f32, &f32s, &a, &b, &h, .{}));
     try testing.expectEqual(@as(usize, 33), try macdfix(f32, &f32s, &a, &b, &h, .{}));
-    try testing.expectEqual(@as(usize, 33), try macdext(f32, &f32s, &a, &b, &h, .{ .fast_ma = .ema, .slow_ma = .ema, .signal_ma = .ema }));
+    try testing.expectEqual(@as(usize, 33), try macdext(f32, testing.allocator, &f32s, &a, &b, &h, .{ .fast_ma = .ema, .slow_ma = .ema, .signal_ma = .ema }));
     try testing.expect(!std.math.isNan(h[40]));
+}
+
+fn checkSkip3(comptime batch: anytype, p_skip: anytype, p_prop: anytype) !void {
+    var xs: [100]f64 = undefined;
+    th.walk(&xs, 4321);
+    var ys = xs;
+    const nan_at = [_]usize{ 3, 50, 51, 80 };
+    for (nan_at) |i| ys[i] = std.math.nan(f64);
+    var clean: [100 - nan_at.len]f64 = undefined;
+    var j: usize = 0;
+    for (ys) |v| {
+        if (std.math.isNan(v)) continue;
+        clean[j] = v;
+        j += 1;
+    }
+    var o: [3][100]f64 = undefined;
+    var w: [3][100 - nan_at.len]f64 = undefined;
+    _ = try batch(f64, &ys, &o[0], &o[1], &o[2], p_skip);
+    _ = try batch(f64, &clean, &w[0], &w[1], &w[2], p_prop);
+    for (0..3) |q| {
+        var k: usize = 0;
+        var last = std.math.nan(f64);
+        for (ys, o[q]) |y, v| {
+            if (std.math.isNan(y)) {
+                try testing.expect(th.sameBits(v, last));
+            } else {
+                try testing.expect(th.sameBits(v, w[q][k]));
+                k += 1;
+            }
+            last = v;
+        }
+    }
+}
+
+test "macd/macdfix: nan skip equals the series without the NaN bars, outputs carry over" {
+    try checkSkip3(macd, MacdParams{ .fast = 4, .slow = 9, .signal = 3, .nan = .skip }, MacdParams{ .fast = 4, .slow = 9, .signal = 3 });
+    try checkSkip3(macdfix, MacdfixParams{ .signal = 3, .nan = .skip }, MacdfixParams{ .signal = 3 });
+    var s = try MacdStream(f64).init(.{ .fast = 2, .slow = 3, .signal = 2, .nan = .skip });
+    const nan = std.math.nan(f64);
+    try testing.expect(s.update(nan) == null);
+    for ([_]f64{ 1, 2, 3, 4, 6 }) |x| _ = s.update(x);
+    const v = s.value().?;
+    try testing.expectEqual(@as(?MacdOut(f64), v), s.update(nan));
+}
+
+test "macdext: f32 output is the f64 result of the f32-rounded input, rounded once" {
+    var xs: [150]f64 = undefined;
+    th.walk(&xs, 909);
+    var x32: [150]f32 = undefined;
+    var x6: [150]f64 = undefined;
+    for (&x32, &x6, xs) |*a, *b, s| {
+        a.* = @floatCast(s);
+        b.* = a.*;
+    }
+    var o32: [3][150]f32 = undefined;
+    var o64: [3][150]f64 = undefined;
+    const ps = [_]MacdextParams{ .{}, .{ .fast_ma = .wma, .slow_ma = .ema, .fast = 5, .slow = 9, .signal = 4 } };
+    for (ps) |p| {
+        const lb = try macdext(f32, testing.allocator, &x32, &o32[0], &o32[1], &o32[2], p);
+        _ = try macdext(f64, testing.allocator, &x6, &o64[0], &o64[1], &o64[2], p);
+        for (0..3) |q| for (0..150) |i| {
+            const want = if (i < lb) std.math.nan(f64) else @as(f64, @as(f32, @floatCast(o64[q][i])));
+            try testing.expect(th.sameBits(@as(f64, o32[q][i]), want));
+        };
+    }
 }

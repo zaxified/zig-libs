@@ -82,14 +82,14 @@ fn validK(period: usize) Error!void {
     try core.checkPeriod(period, 1);
 }
 
-/// Batch %K of every bar into `out` (NaN before `period - 1`).
-fn kSeries(comptime T: type, hs: []const T, ls: []const T, cs: []const T, out: []T, period: usize) void {
+/// Batch %K of every bar into the f64 series `out` (NaN before `period - 1`).
+fn kSeries(comptime T: type, hs: []const T, ls: []const T, cs: []const T, out: []f64, period: usize) void {
     var k = KCore.init(period);
     const sh = SliceSrc(T){ .xs = hs };
     const sl = SliceSrc(T){ .xs = ls };
     for (hs, ls, cs, out) |h, l, c, *o| {
         const r = k.step(sh, sl, .{ .high = h, .low = l, .close = c });
-        o.* = if (r) |v| core.to(T, v) else std.math.nan(T);
+        o.* = r orelse std.math.nan(f64);
     }
 }
 
@@ -122,21 +122,29 @@ pub fn stochfLookback(p: StochfParams) Error!usize {
     return plan.lb_k + plan.lb_d;
 }
 
-pub fn stochf(comptime T: type, high: []const T, low: []const T, close: []const T, out_k: []T, out_d: []T, p: StochfParams) Error!usize {
+/// STOCHF. Intermediate series are f64 whatever `T` is (see `macdext`); `gpa`
+/// is used only for `T = f32`.
+pub fn stochf(comptime T: type, gpa: std.mem.Allocator, high: []const T, low: []const T, close: []const T, out_k: []T, out_d: []T, p: StochfParams) core.AllocError!usize {
     core.checkFloat(T);
     try core.checkLen(high.len, &.{ low.len, close.len, out_k.len, out_d.len });
     const plan = try FPlan.make(p);
     const total = plan.lb_k + plan.lb_d;
     const nan = std.math.nan(T);
-    kSeries(T, high, low, close, out_k, p.fastk);
+    var owned: []f64 = &.{};
+    defer if (T != f64) gpa.free(owned);
+    const kb: []f64 = if (T == f64) out_k else blk: {
+        owned = try gpa.alloc(f64, high.len);
+        break :blk owned;
+    };
+    kSeries(T, high, low, close, kb, p.fastk);
     var cd = try MaCore.init(plan.d);
-    const sd = SliceSrc(T){ .xs = out_k, .off = plan.lb_k };
-    for (out_k, out_d, 0..) |kv, *o, i| {
+    const sd = SliceSrc(f64){ .xs = kb, .off = plan.lb_k };
+    for (kb, out_d, 0..) |kv, *o, i| {
         const r = if (i >= plan.lb_k) cd.step(sd, kv) else null;
         o.* = if (r) |v| core.to(T, v) else nan;
     }
     // %K is reported only from the first %D bar.
-    @memset(out_k[0..@min(total, out_k.len)], nan);
+    for (out_k, kb, 0..) |*o, kv, i| o.* = if (i < total) nan else core.to(T, kv);
     return total;
 }
 
@@ -218,35 +226,45 @@ pub fn stochLookback(p: StochParams) Error!usize {
     return (try SPlan.make(p)).total();
 }
 
-/// Outputs slow %K and slow %D. The two output slices double as the scratch for
-/// the intermediate series (raw %K, slow %K), so no allocation is needed.
-pub fn stoch(comptime T: type, high: []const T, low: []const T, close: []const T, out_k: []T, out_d: []T, p: StochParams) Error!usize {
+/// Outputs slow %K and slow %D. Intermediate series (raw %K, slow %K) are f64
+/// whatever `T` is: with `f64` the two output slices double as that scratch, with
+/// `f32` `2 * n` f64 are allocated from `gpa` and freed before returning.
+pub fn stoch(comptime T: type, gpa: std.mem.Allocator, high: []const T, low: []const T, close: []const T, out_k: []T, out_d: []T, p: StochParams) core.AllocError!usize {
     core.checkFloat(T);
     try core.checkLen(high.len, &.{ low.len, close.len, out_k.len, out_d.len });
     const plan = try SPlan.make(p);
     const total = plan.total();
     const nan = std.math.nan(T);
-    // 1. raw %K -> out_k
-    kSeries(T, high, low, close, out_k, p.fastk);
-    // 2. slow %K = MA(raw %K) -> out_d
+    const n = high.len;
+    var owned: []f64 = &.{};
+    defer if (T != f64) gpa.free(owned);
+    const a, const b = if (T == f64) .{ out_k, out_d } else blk: {
+        owned = try gpa.alloc(f64, 2 * n);
+        break :blk .{ owned[0..n], owned[n..] };
+    };
+    // 1. raw %K -> a
+    kSeries(T, high, low, close, a, p.fastk);
+    // 2. slow %K = MA(raw %K) -> b
     var ck = try MaCore.init(plan.sk);
-    const s1 = SliceSrc(T){ .xs = out_k, .off = plan.lb_k };
-    for (out_k, out_d, 0..) |kv, *o, i| {
+    const s1 = SliceSrc(f64){ .xs = a, .off = plan.lb_k };
+    for (a, b, 0..) |kv, *o, i| {
         const r = if (i >= plan.lb_k) ck.step(s1, kv) else null;
-        o.* = if (r) |v| core.to(T, v) else nan;
+        o.* = r orelse std.math.nan(f64);
     }
-    // 3. slow %D = MA(slow %K) -> out_k (the raw %K is no longer needed)
+    // 3. slow %D = MA(slow %K) -> a (the raw %K is no longer needed)
     var cd = try MaCore.init(plan.sd);
     const start = plan.lb_k + plan.lb_sk;
-    const s2 = SliceSrc(T){ .xs = out_d, .off = start };
-    for (out_k, out_d, 0..) |*o, sk, i| {
+    const s2 = SliceSrc(f64){ .xs = b, .off = start };
+    for (a, b, 0..) |*o, sk, i| {
         const r = if (i >= start) cd.step(s2, sk) else null;
-        o.* = if (r) |v| core.to(T, v) else nan;
+        o.* = r orelse std.math.nan(f64);
     }
-    // 4. out_k now holds slow %D and out_d slow %K: swap them back.
-    for (out_k, out_d) |*a, *b| std.mem.swap(T, a, b);
-    // 5. slow %K is reported only from the first slow %D bar.
-    @memset(out_k[0..@min(total, out_k.len)], nan);
+    // 4. a now holds slow %D and b slow %K. Slow %K is reported only from the
+    // first slow %D bar.
+    for (out_k, out_d, a, b, 0..) |*ok, *od, dv, kv, i| {
+        ok.* = if (i < total) nan else core.to(T, kv);
+        od.* = core.to(T, dv);
+    }
     return total;
 }
 
@@ -309,7 +327,7 @@ test "stochf hand-checked vector" {
     // fastk 3, fastd 2 (SMA): D at bar 3 = (85.714285714 + 58.333333333) / 2 = 72.023809524
     var k: [6]f64 = undefined;
     var d: [6]f64 = undefined;
-    try testing.expectEqual(@as(usize, 3), try stochf(f64, &t_h, &t_l, &t_c, &k, &d, .{ .fastk = 3, .fastd = 2 }));
+    try testing.expectEqual(@as(usize, 3), try stochf(f64, testing.allocator, &t_h, &t_l, &t_c, &k, &d, .{ .fastk = 3, .fastd = 2 }));
     try testing.expect(std.math.isNan(k[2]) and std.math.isNan(d[2]));
     try testing.expectApproxEqAbs(@as(f64, 350.0 / 6.0), k[3], 1e-12);
     try testing.expectApproxEqAbs(@as(f64, (600.0 / 7.0 + 350.0 / 6.0) / 2.0), d[3], 1e-12);
@@ -317,7 +335,7 @@ test "stochf hand-checked vector" {
     try testing.expectApproxEqAbs(@as(f64, 40), k[5], 1e-12);
     try testing.expectApproxEqAbs(@as(f64, 50), d[5], 1e-12);
     // fastd 1 is a copy: %D == %K, lookback 2
-    try testing.expectEqual(@as(usize, 2), try stochf(f64, &t_h, &t_l, &t_c, &k, &d, .{ .fastk = 3, .fastd = 1 }));
+    try testing.expectEqual(@as(usize, 2), try stochf(f64, testing.allocator, &t_h, &t_l, &t_c, &k, &d, .{ .fastk = 3, .fastd = 1 }));
     try testing.expectApproxEqAbs(@as(f64, 600.0 / 7.0), k[2], 1e-12);
     try testing.expectEqual(k[2], d[2]);
 }
@@ -328,7 +346,7 @@ test "stoch hand-checked vector" {
     //   slow %D: bar 4 = (72.0238 + 59.1667)/2 = 65.5952381, bar 5 = (59.1667 + 50)/2 = 54.58333
     var k: [6]f64 = undefined;
     var d: [6]f64 = undefined;
-    try testing.expectEqual(@as(usize, 4), try stoch(f64, &t_h, &t_l, &t_c, &k, &d, .{ .fastk = 3, .slowk = 2, .slowd = 2 }));
+    try testing.expectEqual(@as(usize, 4), try stoch(f64, testing.allocator, &t_h, &t_l, &t_c, &k, &d, .{ .fastk = 3, .slowk = 2, .slowd = 2 }));
     for (0..4) |i| try testing.expect(std.math.isNan(k[i]) and std.math.isNan(d[i]));
     try testing.expectApproxEqAbs(@as(f64, (350.0 / 6.0 + 60.0) / 2.0), k[4], 1e-12);
     try testing.expectApproxEqAbs(@as(f64, ((600.0 / 7.0 + 350.0 / 6.0) / 2.0 + (350.0 / 6.0 + 60.0) / 2.0) / 2.0), d[4], 1e-12);
@@ -342,7 +360,7 @@ test "stoch: a flat window answers 0, a close at the high answers 100" {
     const c = [_]f64{ 5, 5, 5, 6 };
     var k: [4]f64 = undefined;
     var d: [4]f64 = undefined;
-    _ = try stochf(f64, &h, &l, &c, &k, &d, .{ .fastk = 2, .fastd = 1 });
+    _ = try stochf(f64, testing.allocator, &h, &l, &c, &k, &d, .{ .fastk = 2, .fastd = 1 });
     try testing.expectEqual(@as(f64, 0), k[1]);
     try testing.expectEqual(@as(f64, 0), k[2]);
     try testing.expectEqual(@as(f64, 100), k[3]); // window (5..5, 6 / 5, 4): HH 6, LL 4, C 6
@@ -360,7 +378,14 @@ test "stoch family: lookback and BadParam" {
     try testing.expectError(error.Unsupported, stochLookback(.{ .slowd_ma = .t3 }));
     var k: [6]f64 = undefined;
     var d: [5]f64 = undefined;
-    try testing.expectError(error.BadParam, stoch(f64, &t_h, &t_l, &t_c, &k, &d, .{}));
+    try testing.expectError(error.BadParam, stoch(f64, testing.allocator, &t_h, &t_l, &t_c, &k, &d, .{}));
+}
+
+fn stochfT(comptime T: type, h: []const T, l: []const T, c: []const T, k: []T, d: []T, p: StochfParams) core.AllocError!usize {
+    return stochf(T, testing.allocator, h, l, c, k, d, p);
+}
+fn stochT(comptime T: type, h: []const T, l: []const T, c: []const T, k: []T, d: []T, p: StochParams) core.AllocError!usize {
+    return stoch(T, testing.allocator, h, l, c, k, d, p);
 }
 
 fn checkStoch(comptime Stream: anytype, comptime batch: anytype, comptime lbFn: anytype, h: []const f64, l: []const f64, c: []const f64, p: anytype) !void {
@@ -395,13 +420,13 @@ test "stoch family: batch == streaming, lookback == leading NaN, f32" {
     var l: [300]f64 = undefined;
     var c: [300]f64 = undefined;
     th.walkBars(&h, &l, &c, 111);
-    try checkStoch(StochfStream, stochf, stochfLookback, &h, &l, &c, StochfParams{});
-    try checkStoch(StochfStream, stochf, stochfLookback, &h, &l, &c, StochfParams{ .fastk = 1, .fastd = 1 });
-    try checkStoch(StochfStream, stochf, stochfLookback, &h, &l, &c, StochfParams{ .fastk = 9, .fastd = 4, .fastd_ma = .ema, .unstable = .{ .bars = 3 } });
-    try checkStoch(StochfStream, stochf, stochfLookback, &h, &l, &c, StochfParams{ .fastk = 4, .fastd = 5, .fastd_ma = .wma });
-    try checkStoch(StochStream, stoch, stochLookback, &h, &l, &c, StochParams{});
-    try checkStoch(StochStream, stoch, stochLookback, &h, &l, &c, StochParams{ .fastk = 6, .slowk = 4, .slowk_ma = .ema, .slowd = 5, .slowd_ma = .wma });
-    try checkStoch(StochStream, stoch, stochLookback, &h, &l, &c, StochParams{ .fastk = 2, .slowk = 1, .slowd = 1 });
+    try checkStoch(StochfStream, stochfT, stochfLookback, &h, &l, &c, StochfParams{});
+    try checkStoch(StochfStream, stochfT, stochfLookback, &h, &l, &c, StochfParams{ .fastk = 1, .fastd = 1 });
+    try checkStoch(StochfStream, stochfT, stochfLookback, &h, &l, &c, StochfParams{ .fastk = 9, .fastd = 4, .fastd_ma = .ema, .unstable = .{ .bars = 3 } });
+    try checkStoch(StochfStream, stochfT, stochfLookback, &h, &l, &c, StochfParams{ .fastk = 4, .fastd = 5, .fastd_ma = .wma });
+    try checkStoch(StochStream, stochT, stochLookback, &h, &l, &c, StochParams{});
+    try checkStoch(StochStream, stochT, stochLookback, &h, &l, &c, StochParams{ .fastk = 6, .slowk = 4, .slowk_ma = .ema, .slowd = 5, .slowd_ma = .wma });
+    try checkStoch(StochStream, stochT, stochLookback, &h, &l, &c, StochParams{ .fastk = 2, .slowk = 1, .slowd = 1 });
     var h32: [60]f32 = undefined;
     var l32: [60]f32 = undefined;
     var c32: [60]f32 = undefined;
@@ -412,7 +437,71 @@ test "stoch family: batch == streaming, lookback == leading NaN, f32" {
     }
     var k: [60]f32 = undefined;
     var d: [60]f32 = undefined;
-    try testing.expectEqual(@as(usize, 8), try stoch(f32, &h32, &l32, &c32, &k, &d, .{}));
-    try testing.expectEqual(@as(usize, 6), try stochf(f32, &h32, &l32, &c32, &k, &d, .{}));
+    try testing.expectEqual(@as(usize, 8), try stoch(f32, testing.allocator, &h32, &l32, &c32, &k, &d, .{}));
+    try testing.expectEqual(@as(usize, 6), try stochf(f32, testing.allocator, &h32, &l32, &c32, &k, &d, .{}));
     try testing.expect(k[20] >= 0 and k[20] <= 100);
+}
+
+test "stoch family: a NaN close poisons raw %K at its bar and the running-sum smoothing after it" {
+    var h: [10]f64 = undefined;
+    var l: [10]f64 = undefined;
+    var c: [10]f64 = undefined;
+    th.walkBars(&h, &l, &c, 5);
+    c[5] = std.math.nan(f64);
+    var k: [10]f64 = undefined;
+    var d: [10]f64 = undefined;
+    // fastk 3, fastd 1 (copy): only bar 5 is NaN
+    _ = try stochf(f64, testing.allocator, &h, &l, &c, &k, &d, .{ .fastk = 3, .fastd = 1 });
+    for (2..10) |i| try testing.expectEqual(i == 5, std.math.isNan(k[i]));
+    // fastd 2 (SMA running sum): %D is NaN from bar 5 on
+    _ = try stochf(f64, testing.allocator, &h, &l, &c, &k, &d, .{ .fastk = 3, .fastd = 2 });
+    try testing.expect(!std.math.isNan(d[4]));
+    for (5..10) |i| try testing.expect(std.math.isNan(d[i]));
+    // slow: the slow %K (SMA 2) is NaN from bar 5 on
+    _ = try stoch(f64, testing.allocator, &h, &l, &c, &k, &d, .{ .fastk = 3, .slowk = 2, .slowd = 2 });
+    try testing.expect(!std.math.isNan(k[4]));
+    for (5..10) |i| try testing.expect(std.math.isNan(k[i]) and std.math.isNan(d[i]));
+}
+
+test "stoch family: f32 output is the f64 result of the f32-rounded input, rounded once" {
+    var h: [120]f64 = undefined;
+    var l: [120]f64 = undefined;
+    var c: [120]f64 = undefined;
+    th.walkBars(&h, &l, &c, 77);
+    var h32: [120]f32 = undefined;
+    var l32: [120]f32 = undefined;
+    var c32: [120]f32 = undefined;
+    var h6: [120]f64 = undefined;
+    var l6: [120]f64 = undefined;
+    var c6: [120]f64 = undefined;
+    for (0..120) |i| {
+        h32[i] = @floatCast(h[i]);
+        l32[i] = @floatCast(l[i]);
+        c32[i] = @floatCast(c[i]);
+        h6[i] = h32[i];
+        l6[i] = l32[i];
+        c6[i] = c32[i];
+    }
+    var k32: [120]f32 = undefined;
+    var d32: [120]f32 = undefined;
+    var k64: [120]f64 = undefined;
+    var d64: [120]f64 = undefined;
+    const ps = [_]StochParams{ .{}, .{ .fastk = 6, .slowk = 4, .slowk_ma = .ema, .slowd = 5, .slowd_ma = .wma } };
+    for (ps) |p| {
+        const lb = try stoch(f32, testing.allocator, &h32, &l32, &c32, &k32, &d32, p);
+        _ = try stoch(f64, testing.allocator, &h6, &l6, &c6, &k64, &d64, p);
+        for (0..120) |i| {
+            try testing.expect(th.sameBits(@as(f64, k32[i]), if (i < lb) std.math.nan(f64) else @as(f64, @as(f32, @floatCast(k64[i])))));
+            try testing.expect(th.sameBits(@as(f64, d32[i]), if (i < lb) std.math.nan(f64) else @as(f64, @as(f32, @floatCast(d64[i])))));
+        }
+    }
+    const pf_ = [_]StochfParams{ .{}, .{ .fastk = 7, .fastd = 4, .fastd_ma = .ema } };
+    for (pf_) |p| {
+        const lb = try stochf(f32, testing.allocator, &h32, &l32, &c32, &k32, &d32, p);
+        _ = try stochf(f64, testing.allocator, &h6, &l6, &c6, &k64, &d64, p);
+        for (0..120) |i| {
+            try testing.expect(th.sameBits(@as(f64, k32[i]), if (i < lb) std.math.nan(f64) else @as(f64, @as(f32, @floatCast(k64[i])))));
+            try testing.expect(th.sameBits(@as(f64, d32[i]), if (i < lb) std.math.nan(f64) else @as(f64, @as(f32, @floatCast(d64[i])))));
+        }
+    }
 }

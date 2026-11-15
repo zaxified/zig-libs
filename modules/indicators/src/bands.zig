@@ -374,3 +374,14 @@ test "bbands: batch == streaming, lookback == leading NaN, f32" {
     try testing.expectEqual(@as(usize, 19), try bbands(f32, &f32s, &u, &m, &l, .{}));
     try testing.expect(u[30] > m[30] and m[30] > l[30]);
 }
+
+test "bbands: a NaN poisons the running sums and the variance (as in TA-Lib)" {
+    const nan = std.math.nan(f64);
+    const in = [_]f64{ 1, 2, nan, 4, 5, 6 };
+    var u: [6]f64 = undefined;
+    var m: [6]f64 = undefined;
+    var l: [6]f64 = undefined;
+    _ = try bbands(f64, &in, &u, &m, &l, .{ .period = 2 });
+    try testing.expect(!std.math.isNan(u[1]));
+    for (2..6) |i| try testing.expect(std.math.isNan(u[i]) and std.math.isNan(m[i]) and std.math.isNan(l[i]));
+}

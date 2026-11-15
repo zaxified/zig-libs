@@ -147,7 +147,7 @@ test "rsi: NaN propagates or is skipped" {
     _ = try rsi(f64, &in, &out, .{ .period = 2, .nan = .skip });
     var clean: [5]f64 = undefined;
     _ = try rsi(f64, &[_]f64{ 10, 11, 10, 12, 11 }, &clean, .{ .period = 2 });
-    try testing.expect(std.math.isNan(out[3]));
+    try testing.expectEqual(clean[2], out[3]); // carries the previous output
     try testing.expectEqual(clean[3], out[4]);
     try testing.expectEqual(clean[4], out[5]);
 }
@@ -163,4 +163,8 @@ test "rsi: batch == streaming, lookback == leading NaN, f32" {
     var o32: [100]f32 = undefined;
     try testing.expectEqual(@as(usize, 14), try rsi(f32, &f32s, &o32, .{}));
     try testing.expect(o32[14] >= 0 and o32[14] <= 100);
+}
+
+test "rsi: nan skip equals the series without the NaN bars, outputs carry over" {
+    try th.checkSkip1(rsi, RsiParams{ .period = 5, .nan = .skip }, RsiParams{ .period = 5 });
 }

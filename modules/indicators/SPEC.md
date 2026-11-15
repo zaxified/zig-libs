@@ -33,13 +33,13 @@ Technical-analysis indicators over caller slices, numerically faithful to TA-Lib
 formulas, same order of floating-point operations, same constants, same parameter ranges and
 lookbacks. Seed set: SMA, EMA, WMA, MA, MACD, MACDEXT, MACDFIX, RSI, BBANDS, TRANGE, ATR, NATR,
 STOCH, STOCHF, MAX, MIN, SUM. Every function has a batch form, a `Lookback` function and a
-streaming type; the batch and streaming forms run the same core step, so they agree to the bit
+streaming type (MACDEXT, STOCH and STOCHF additionally take an allocator first, used only for `f32` input, see Limits); the batch and streaming forms run the same core step, so they agree to the bit
 (tested).
 
 What a reader might expect and will not find: the other 223 TA-Lib functions (later waves, by
 group), the candlestick patterns (planned in `src/candles.zig`), the moving-average types after WMA
 (see Backlog), TA-Lib's `startIdx`/`endIdx` range arguments (a batch call covers the whole slice;
-`out[0..lookback]` is NaN), in-place calls (`out` must not alias `in`), and an abstract/function-table
+`out[0..lookback]` is NaN), in-place calls (`out` must not alias `in`; TA-Lib allows it, see Backlog), and an abstract/function-table
 interface.
 
 ## Wire format / algorithm
@@ -94,11 +94,17 @@ Per-function notes from the C source (each read before it was ported):
 - Periods 1..100000 (2.. where TA-Lib requires it: MAX, MIN, SUM, RSI, MACD fast and slow, BBANDS);
   `Unstable.bars <= 2^30`; BBANDS deviations within ±3e37 (TA-Lib's `TA_REAL_MAX`). Pinned by the
   `BadParam` tests of each file.
-- No allocation on the batch path; streaming types that keep a window take a caller buffer and refuse
-  a short one with `error.BadParam`. Batch of STOCH/STOCHF/MACDEXT use the output slices as scratch.
+- No allocation on the batch path except MACDEXT, STOCH and STOCHF with `f32` input; streaming types that keep a window take a caller buffer and refuse
+  a short one with `error.BadParam`. MACDEXT, STOCH and STOCHF keep their intermediate series (MACD line, raw %K, slow %K) in f64: with `f64` the output slices double as that scratch and nothing is allocated; with `f32` they allocate `n` (MACDEXT, STOCHF) or `2n` (STOCH) f64 from the `gpa` argument and free it before returning (`error.OutOfMemory`).
 - Deliberate differences from TA-Lib: per-call unstable period instead of a process-global one;
-  RSI answers NaN (not 50) when its state is NaN; `nan = .skip` exists only here; `f32` batch of a
-  composite (MACDEXT, STOCH, STOCHF) stores its intermediate series in `f32`.
+  RSI answers NaN (not 50) when its internal state is NaN: TA-Lib tests `gain + loss > 0` and a NaN
+  fails that test, so a poisoned RSI would read as the neutral 50, which looks like a valid
+  reading, while NaN says "no value" (batch and stream agree). `nan = .skip` exists only here: a NaN
+  bar leaves the state untouched and the OUTPUT at that bar carries the previous output (NaN while
+  there is none), like pandas `ewm(ignore_na=True)`; the bar does not count towards the lookback.
+  For `f32` input all intermediate series are f64 (as in TA-Lib's `TA_S_*`) and the result is
+  rounded once on writing `out` (tested: f32 output == `@floatCast` of the f64 output for the
+  f32-rounded input).
 
 ## Anchoring
 
@@ -125,15 +131,18 @@ target class, not the achieved one.
 - Frozen vectors and the live oracle (see Anchoring); bitwise agreement with TA-Lib is expected but
   unverified. In particular TA-Lib's C is compiled by an unknown toolchain: where it spells
   `a*b - c*d` a compiler may contract to an FMA (BBANDS/VAR variance); we never contract.
-- NaN semantics of the windowed indicators (SMA, WMA, SUM, BBANDS, MAX, MIN, STOCH): a NaN enters the
-  running sums and stays there, as in TA-Lib; MAX/MIN with NaN depend on the comparison order.
-- `nan = .skip` outputs NaN at the skipped bar and does not count the bar towards the lookback; the
-  design doc leaves the output of a skipped bar open.
+- NaN semantics of the windowed indicators (SMA, WMA, SUM, BBANDS, STOCH): a NaN enters the running
+  sums and stays there until a re-anchor (WMA every 8p outputs, the variance every 32 windows)
+  rebuilds them; pinned by tests, equal to TA-Lib's C by reading, not by running. MAX/MIN: a NaN never
+  wins a comparison and only shows when it opens a rescan; ties keep the OLDEST value on a rescan
+  (`>` / `<`) and the NEWEST on an incremental update (`>=` / `<=`), so 0.0 vs -0.0 follows that
+  rule (pinned).
 
 ## Backlog / deferred
 
 - Moving-average types: DEMA, TEMA, TRIMA, KAMA, MAMA (period ignored, lookback 32), T3, HMA, ZLEMA, RMA,
   VIDYA, ALMA — wire them into `MaCore` as the groups that own them are ported.
+- In-place calls (`out` aliasing `in`): TA-Lib allows them, the batch functions here do not.
 - `src/testdata/` frozen TA-Lib vectors and `tools/interop.zig` (owner's permission to build TA-Lib).
 - Streaming for the windowed indicators with a ring that is shared between components of one composite
   (BBANDS keeps two rings of the same window for SMA).

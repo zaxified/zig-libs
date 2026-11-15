@@ -22,6 +22,10 @@ pub const Error = error{
     Unsupported,
 };
 
+/// Error set of the composite batch functions that may need an f64 scratch
+/// series (only for `T = f32`; with `f64` they never allocate).
+pub const AllocError = Error || std.mem.Allocator.Error;
+
 /// TA-Lib's range for every `optInTimePeriod`-like parameter.
 pub const max_period: usize = 100000;
 /// Largest accepted `Unstable.bars`.

@@ -105,6 +105,39 @@ pub fn checkRec(
     }
 }
 
+/// `nan = .skip`: the output at a NaN bar is the previous output (NaN before the
+/// first one), every other bar equals the run over the series with the NaN bars
+/// removed. `batchFn(f64, in, out, p)`; `p_skip` has `.nan = .skip`.
+pub fn checkSkip1(comptime batchFn: anytype, p_skip: anytype, p_prop: anytype) !void {
+    var xs: [80]f64 = undefined;
+    walk(&xs, 1234);
+    var ys = xs;
+    const nan_at = [_]usize{ 2, 30, 31, 55 };
+    for (nan_at) |i| ys[i] = std.math.nan(f64);
+    var clean: [80 - nan_at.len]f64 = undefined;
+    var j: usize = 0;
+    for (ys) |v| {
+        if (std.math.isNan(v)) continue;
+        clean[j] = v;
+        j += 1;
+    }
+    var out: [80]f64 = undefined;
+    var want: [80 - nan_at.len]f64 = undefined;
+    _ = try batchFn(f64, &ys, &out, p_skip);
+    _ = try batchFn(f64, &clean, &want, p_prop);
+    var k: usize = 0;
+    var last = std.math.nan(f64);
+    for (ys, out) |y, o| {
+        if (std.math.isNan(y)) {
+            try testing.expect(sameBits(o, last));
+        } else {
+            try testing.expect(sameBits(o, want[k]));
+            k += 1;
+        }
+        last = o;
+    }
+}
+
 test "walk is deterministic and bars are ordered" {
     var a: [20]f64 = undefined;
     var b: [20]f64 = undefined;

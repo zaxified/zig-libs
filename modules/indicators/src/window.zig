@@ -212,3 +212,60 @@ test "window: batch == streaming, lookback == leading NaN, matches naive scan, f
     try testing.expectEqual(@as(usize, 4), try max(f32, &f32s, &o32, .{ .period = 5 }));
     try testing.expectEqual(@as(usize, 4), try min(f32, &f32s, &o32, .{ .period = 5 }));
 }
+
+test "sum: a NaN poisons the running sum" {
+    const nan = std.math.nan(f64);
+    const in = [_]f64{ 1, 2, nan, 4, 5, 6 };
+    var out: [6]f64 = undefined;
+    _ = try sum(f64, &in, &out, .{ .period = 2 });
+    try testing.expectEqual(@as(f64, 3), out[1]);
+    for (out[2..]) |v| try testing.expect(std.math.isNan(v));
+}
+
+test "max/min with NaN: a NaN never wins a comparison, so it only shows when it opens a rescan" {
+    const nan = std.math.nan(f64);
+    // max, period 3 over 1 2 NaN 0 0 0:
+    //  bar 2 rescan (1,2,NaN): 1 -> 2, NaN > 2 false -> 2; bar 3: 0 >= 2 false -> 2;
+    //  bar 4: the max (bar 1) left, rescan (NaN,0,0): starts at NaN, 0 > NaN false -> NaN;
+    //  bar 5: NaN's index left, rescan (0,0,0) -> 0.
+    const a = [_]f64{ 1, 2, nan, 0, 0, 0 };
+    var out: [6]f64 = undefined;
+    _ = try max(f64, &a, &out, .{ .period = 3 });
+    try testing.expectEqual(@as(f64, 2), out[2]);
+    try testing.expectEqual(@as(f64, 2), out[3]);
+    try testing.expect(std.math.isNan(out[4]));
+    try testing.expectEqual(@as(f64, 0), out[5]);
+    // min, period 3 over 5 4 NaN 9 9 9: 4, 4, NaN, 9
+    const b = [_]f64{ 5, 4, nan, 9, 9, 9 };
+    _ = try min(f64, &b, &out, .{ .period = 3 });
+    try testing.expectEqual(@as(f64, 4), out[2]);
+    try testing.expectEqual(@as(f64, 4), out[3]);
+    try testing.expect(std.math.isNan(out[4]));
+    try testing.expectEqual(@as(f64, 9), out[5]);
+}
+
+test "max/min ties: a rescan keeps the OLDEST of equal values, an incremental update the NEWEST (0.0 vs -0.0)" {
+    // The C code: rescan `tmp > highest` (strict, oldest stays); update `tmp >= highest` (newest wins).
+    // max, period 3 over -2 -0 -1 0 -0:
+    //  bar 2 rescan: -2 -> -0 (idx 1) -> stays; out -0.
+    //  bar 3: idx 1 still in window, 0.0 >= -0.0 -> newest wins: +0.
+    //  bar 4: -0.0 >= +0.0 -> newest wins: -0.
+    const nz = -0.0;
+    const a = [_]f64{ -2, nz, -1, 0.0, nz };
+    var out: [5]f64 = undefined;
+    _ = try max(f64, &a, &out, .{ .period = 3 });
+    try testing.expect(std.math.signbit(out[2]) and out[2] == 0);
+    try testing.expect(!std.math.signbit(out[3]) and out[3] == 0);
+    try testing.expect(std.math.signbit(out[4]) and out[4] == 0);
+    // min, period 3 over 2 +0 1 -0 +0: bar 2 -> +0; bar 3 (-0 <= +0) -> -0; bar 4 -> +0.
+    const b = [_]f64{ 2, 0.0, 1, nz, 0.0 };
+    _ = try min(f64, &b, &out, .{ .period = 3 });
+    try testing.expect(!std.math.signbit(out[2]) and out[2] == 0);
+    try testing.expect(std.math.signbit(out[3]) and out[3] == 0);
+    try testing.expect(!std.math.signbit(out[4]) and out[4] == 0);
+    // rescan: period 2 over -0 +0 -0: bar 1 window (-0,+0): oldest -0 stays; bar 2 rescan (+0,-0): +0 stays.
+    const c = [_]f64{ nz, 0.0, nz };
+    _ = try max(f64, &c, out[0..3], .{ .period = 2 });
+    try testing.expect(std.math.signbit(out[1]));
+    try testing.expect(!std.math.signbit(out[2]));
+}
