@@ -11,8 +11,9 @@
 //! HT_DCPHASE, HT_PHASOR, HT_SINE, HT_TRENDLINE, HT_TRENDMODE, MAMA (so `MaType.mama`
 //! works everywhere), SWAK_BP, SWAK_HP, SWAK_2PHP and the 15 math transforms ACOS ...
 //! TANH. Wave I3 (volume, volatility,
-//! price transform, statistic, math operators): 50 more functions, see SPEC.md. 119 of
-//! TA-Lib's 237 functions in all.
+//! price transform, statistic, math operators): 50 more functions, see SPEC.md. Wave I3
+//! (momentum): 57 more (ADX, AROON, MOM, ROC, CCI, MFI, APO, PPO, KST, KDJ, STOCHRSI, CRSI,
+//! STC, SQZMOM, ...). 176 of TA-Lib's 237 functions in all (the candlestick patterns are left).
 //!
 //! ```zig
 //! const ind = @import("indicators");
@@ -65,7 +66,7 @@ const mom_simple = @import("mom_simple.zig");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Technical-analysis indicators (TA-Lib parity): moving averages (SMA to T3, KAMA, HMA, ALMA), MACD, RSI, Bollinger / Keltner / Donchian bands, ATR, stochastic, SAR, Supertrend, Ichimoku, rolling max/min/sum, plus 50 volume, volatility, price-transform, statistic and math-operator functions (OBV, VWAP, CMF, KVO, BBW, LINEARREG, MEDIAN, ...), the Hilbert-transform cycle indicators with MAMA (HT_DCPERIOD, HT_SINE, HT_TRENDLINE, ...), three Swiss-Army-Knife filters and the 15 math transforms (SIN, LN, SQRT, ...); 119 of TA-Lib's 237.",
+    .doc = "Technical-analysis indicators (TA-Lib parity): moving averages (SMA to T3, KAMA, HMA, ALMA), MACD, RSI, Bollinger / Keltner / Donchian bands, ATR, stochastic, SAR, Supertrend, Ichimoku, rolling max/min/sum, plus 50 volume, volatility, price-transform, statistic and math-operator functions (OBV, VWAP, CMF, KVO, BBW, LINEARREG, MEDIAN, ...), the Hilbert-transform cycle indicators with MAMA (HT_DCPERIOD, HT_SINE, HT_TRENDLINE, ...), three Swiss-Army-Knife filters, the 15 math transforms (SIN, LN, SQRT, ...) and 57 momentum functions (ADX, AROON, ROC, CCI, MFI, TRIX, APO / PPO, KST, KDJ, STOCHRSI, ...); 176 of TA-Lib's 237.",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,

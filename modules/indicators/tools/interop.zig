@@ -1048,10 +1048,16 @@ fn probeLookback(gpa: std.mem.Allocator, cs_in: Case) ?usize {
 }
 
 /// How many parameter sets of a function get frozen vectors (the seed and
-/// overlap functions keep 4; the volume / statistic waves 2, to keep the frozen file small).
+/// overlap functions keep 3; the later waves 2, to keep the frozen file near 1.5 MB).
 fn emitSets(f: Func) usize {
     if (isMathTx(f)) return 1;
-    return if (@backingInt(f) < @backingInt(Func.ad)) 4 else 2;
+    return if (@backingInt(f) < @backingInt(Func.ad)) 3 else 2;
+}
+
+/// How many parameter sets of a function get frozen vectors at a non-default unstable period (the file stays near 1.5 MB).
+fn emitUnstableSets(f: Func) usize {
+    _ = f;
+    return 1;
 }
 
 /// Frozen-vector length: the Hilbert family and MAMA only start answering at bar 32 / 63, so their vectors are longer.
@@ -1164,7 +1170,7 @@ fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
                         c.n = @intCast(n);
                         seed += 1;
                         c.seed = seed;
-                        c.emit = n == vecLen(f) and pi < 2 and !(u[0] == 2) and !(u[0] == 0 and pi == 1);
+                        c.emit = n == vecLen(f) and pi < emitUnstableSets(f) and !(u[0] == 2) and !(u[0] == 0 and pi == 1);
                         try cases.append(gpa, c);
                         if (n == 300 and u[0] == 1 and pi < 3) {
                             var c32 = c;
