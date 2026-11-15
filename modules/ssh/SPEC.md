@@ -159,6 +159,42 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `server-sig-algs` is passed beside the key (`signWithHash`/`algorithmNameFor`), not by re-tagging
   a copy. Signing and loading run one frame down and zero the stack they dirtied (`burn.zig`);
   `stackprobe_test.zig` (ReleaseFast) checks every key type for 0 residue.
+- **Auth orchestration is a state machine in each role, shaped after Go `x/crypto/ssh`
+  (2026-11-15).** *Server* (`serveUserauth`): the enabled methods of the current step are an
+  `Active` set — each method either a yes/no hook (`AuthConfig.authorized_key`/`password`/
+  `keyboard_interactive`, unchanged) or a deciding callback (`AuthConfig.callbacks`, Go's
+  `ServerAuthCallbacks`) returning a `Decision`: `.reject`, `.accept` with `Permissions`, or
+  `.partial = *const AuthCallbacks` (Go `PartialSuccessError{Next}`). A partial success sends
+  FAILURE with `partial success` = TRUE listing only `next`'s methods, replaces the active set
+  with `next`, records the method in `AuthResult.completed`, locks the user name (a change is
+  `ProtocolError` + DISCONNECT, as in Go/OpenSSH) and costs no attempt. Permissions are not
+  carried across steps — the union makes "permissions with a partial" unrepresentable, which Go
+  checks at run time. Counting is Go's: a *failure* budget (`max_attempts`, default 6 =
+  OpenSSH `MaxAuthTries`, the client's first `none` free) and a *request* budget
+  (`max_auth_requests` = 128 over every USERAUTH_REQUEST, queries and partials included).
+  `none` succeeds only under `no_client_auth` (optionally decided by `no_client_auth_callback`)
+  and never after a partial success. Keyboard-interactive runs any number of rounds through a
+  `KbdPrompter` the callback drives (Go's `KeyboardInteractiveChallenge`); a round answered with
+  the wrong count, malformed, or past `max_kbd_rounds` makes `challenge` false and the attempt
+  a refusal whatever the callback returns. A client that sends a new USERAUTH_REQUEST instead of
+  an INFO_RESPONSE abandons the dialogue (RFC 4252 §5 "MUST abandon the previous attempt"): the
+  attempt counts as `wrong_answers`, no FAILURE is sent for it, and the new request is served —
+  where Go reports an unexpected message and drops it. A configuration that cannot work (no
+  method, a method both as hook and callback, a `partial` whose `next` enables nothing) is
+  `error.InvalidAuthConfig`. `Permissions` (critical options, extensions, `extra`) are borrowed
+  from the callback's `ctx` and travel `AuthResult.permissions` → `ServeConfig.permissions` →
+  `RequestInfo.permissions`; this module enforces none of them (Go acts only on
+  `source-address`, which needs the peer address this module never sees, and on
+  `no-touch-required` for security keys, which this module does not accept).
+  *Client* (`authenticateWith`, Go `clientAuthenticate`): `none` first; then the first of the
+  caller's `ClientMethod`s that the server's latest FAILURE lists and that has not failed
+  (caller's order, as Go `Auth` and OpenSSH `PreferredAuthentications`); a partial success does
+  not mark the method tried (OpenSSH `publickey,publickey` wants a second key). `publickey` walks
+  its keys, signs only after a PK_OK that names the same blob and a matching type, and stops when
+  the server no longer lists `publickey`; `retryable` repeats a plain failure up to `max_tries`
+  while the server still lists the method; `max_client_auth_steps` (64) bounds the loop.
+  `AuthProgress` reports allowed/partial/tried/succeeded. The FAILURE name-list is decoded into a
+  `MethodSet` (names this module does not implement are dropped), so no peer string is kept.
 - **Sequence numbers are `u32`** (RFC 4253 §6.4), one per direction, wrapping, carried on the
   `CipherState` payload (the plaintext `NoneState` included, so every packet of the initial
   exchange counts — a discarded wrongly-guessed KEX packet too). A rekey installs the next cipher
@@ -233,10 +269,12 @@ so the security properties below are in effect, not aspirational.
 ### Known limits of the userauth path (audited, deliberately not "fixed" here)
 
 - **`AuthConfig.max_attempts` is a credential budget, not a time or packet budget.** Only a
-  *rejected credential* consumes it. SSH_MSG_IGNORE, SSH_MSG_DEBUG and the RFC 4252 §7
+  *rejected credential* consumes it (default 6 since 2026-11-15, was 20). The RFC 4252 §7
   signature-less `publickey` *query* (answered SSH_MSG_USERAUTH_PK_OK — by definition not an
-  attempt) all loop `serveUserauth` without spending budget, so an unauthenticated peer can hold
-  the pre-auth state machine open for as long as it keeps sending bytes. There is deliberately no
+  attempt) and a partial success do not, but since 2026-11-15 every USERAUTH_REQUEST counts
+  against `max_auth_requests` (128, Go's backstop), so a peer can no longer loop on queries
+  forever. SSH_MSG_IGNORE and SSH_MSG_DEBUG still cost nothing, so an unauthenticated peer can
+  hold the pre-auth state machine open for as long as it keeps sending bytes. There is deliberately no
   OpenSSH-style `LoginGraceTime`: this module never owns the socket (see the transport-agnostic
   invariant above), so a read deadline can only be imposed by the caller that created the
   `std.Io.Reader`/`Writer`. **A server exposed to the internet must set one.**
@@ -336,6 +374,38 @@ environment with OpenSSH installed.
   sends an encrypted packet after NEWKEYS (sequence 4; mutation-checked: without counting the
   discarded guess it fails).
 
+- **Auth orchestration (2026-11-15).** Canned-stream units in `userauth.zig`, server: partial
+  success (password) → two keyboard-interactive rounds → `Permissions` on the result, the wire
+  checked (FAILURE partial=TRUE listing only `keyboard-interactive`, two INFO_REQUESTs, SUCCESS);
+  a wrong second-round answer; the user changing after a partial success (`ProtocolError`); an
+  abandoned keyboard-interactive served as the next request with no FAILURE between; `none`
+  under `no_client_auth`, its callback, the free first probe, a second probe charged, and `none`
+  refused after a partial success; `max_auth_requests` ending a stream of 130 queries;
+  `InvalidAuthConfig` for an empty config, a method set twice, a `partial` to nothing. Client:
+  none probe → partial success → keyboard-interactive (requests on the wire: none, password,
+  keyboard-interactive); the caller's order among listed methods; `retryable` (asked twice,
+  capped at `max_tries`, a plain method not retried, nested `retryable` refused); several keys
+  with only the PK_OK'd one signed, a PK_OK for another blob not signed, a server dropping
+  `publickey` ending the key walk. Loopback (`interop_test.zig`, our client ↔ our server over
+  TCP): an unauthorized key, the authorized one (partial), two keyboard-interactive rounds, a
+  `force-command` permission; the second factor wrong; `no_client_auth`; `max_attempts` = 3 ending
+  a retrying client (4 rejections: the free `none` + 3). **Live OpenSSH 10.2p1:** our client with
+  an unknown key first, then `sshd`'s; `sshd AuthenticationMethods=publickey,publickey` (partial
+  success, then the second key, then exec); `AuthenticationMethods=publickey,password` (partial
+  after the key, `password` tried because `sshd` now lists it — a non-root `sshd` without PAM
+  cannot check it, so the step fails as expected); a real `ssh` through our two-step server
+  (publickey → partial → two keyboard-interactive rounds via askpass, `force-command` reaching
+  the exec handler's `RequestInfo`). **Go `x/crypto/ssh`** (`zig build interop-ssh`,
+  `tools/go_kbdint partial <fingerprint>`): Go's `PublicKeyCallback` returns
+  `PartialSuccessError{Next: keyboard-interactive}`; our `authenticateWith` offers an unknown key
+  first, gets the partial success, answers two rounds, runs exec (Go's own log of the wrong-token
+  case: `no auth passed yet, unknown key, authenticated with partial success, wrong token`);
+  0 of 4 cases disagreed. **Fuzz:** `ssh-userauth` now drives both roles over the same stream
+  (server with a partial-success password, two-round keyboard-interactive and a `none` callback;
+  client `authenticateWith` with key/password/keyboard-interactive), corpus +5 entries (pinned:
+  17 payloads, 3 server logins, 456 reply octets), reach labels `client_failed`/
+  `client_authenticated`; verdict 4 × 60,000 runs (ReleaseSafe, SSH_FUZZ) clean.
+
   Both live tests were confirmed to actually execute (not silently skip) by poisoning their
   assertions and observing the failures. Caveat inherited from the pre-existing live-test harness:
   each picks a random loopback port and reports `error.SkipZigTest` if the spawned `sshd` never
@@ -409,8 +479,11 @@ for the owner):
 - **Userauth methods:** `hostbased` (RFC 4252 §9), the §8 password-*change* sub-protocol
   (SSH_MSG_USERAUTH_PASSWD_CHANGEREQ is rejected, not handled), SSH agent forwarding /
   `ssh-agent` client support, and OpenSSH certificate key types (`*-cert-v01@openssh.com`).
-  Server-side `keyboard-interactive` asks one round of prompts (`KbdInteractiveCheck`); a
-  multi-round server dialogue (PAM conversation) would need a stateful callback.
+  (Multi-round server-side `keyboard-interactive` is in since 2026-11-15: `KbdCallback`.)
+  Not here from Go's server: a per-connection `BannerCallback` (the banner is a static
+  `AuthConfig.banner`), `AuthLogCallback` for successes (`on_rejected` covers refusals),
+  `VerifiedPublicKeyCallback`, `PreAuthConnCallback`, and the `source-address` check (the module
+  never sees the peer address).
 - **Channel requests and types not served:** X11 forwarding, agent forwarding, and server-side
   TCP/IP forwarding (`direct-tcpip` opens and `tcpip-forward` global requests are refused with
   `unknown_channel_type` / REQUEST_FAILURE): honouring them means the server opening or listening
@@ -476,8 +549,12 @@ for the owner):
   in OpenSSH's order revoked → accept → same-type mismatch → unknown, wildcards/negation/`[host]:port`,
   hashed `|1|` entries byte-equal to `ssh-keygen -H`, `writeLine` plain or hashed, `KnownHosts` and
   `FixedHostKey` verifiers; not done: `@cert-authority` (needs certificates, P3), Go's `KeyError.Want`
-  host-key-algorithm preference, the CheckHostIP second lookup by address), auth
-  orchestration (none probe, multi-key, partial success, multi-round keyboard-interactive);
+  host-key-algorithm preference, the CheckHostIP second lookup by address), ~~auth
+  orchestration~~ (done 2026-11-15: client `authenticateWith` — none probe, the server's list in
+  the caller's order, several keys, partial success, `retryable`; server `AuthConfig.callbacks` →
+  `Decision` with `Permissions` and partial success, multi-round keyboard-interactive,
+  `no_client_auth`, `max_attempts` 6, `max_auth_requests`; live OpenSSH `AuthenticationMethods`
+  both roles, Go `PartialSuccessError`) — **P2 complete**;
   P3 server API in Go's shape (channels and requests to the app), streamlocal, Signer + ssh-agent,
   certificates, GSSAPI, legacy opt-ins.
 - **Legacy-compat algorithms (`aes128-ctr`, `hmac-sha2-512`, `ecdsa-sha2-nistp384/521`, `curve25519` variants, `ssh-rsa` opt-in)** *(survey 2026-09-30)*. Older network gear offers only CTR ciphers/HMAC-SHA1; russh offers "opt-in legacy". **Settled by the owner 2026-10-09** (Go parity item above): widen to Go's set, legacy as explicit opt-ins; the lists are configurable since 2026-10-09.

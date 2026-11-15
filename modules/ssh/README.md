@@ -34,6 +34,14 @@ as the server. No `@panic` stubs remain in this module.
   makes a real `ssh` willing to offer an **RSA** user key at all: an `ssh-rsa`
   blob names no hash, and a client that is not told will not guess. A server's
   `_BANNER` reaches the caller through `userauth.BannerHandler`.
+  **Auth orchestration in Go `x/crypto/ssh`'s shape**: the client's
+  `authenticateWith` probes with `none`, then tries the caller's methods the
+  server lists (several keys in order, retryable methods) through **partial
+  success** (multi-factor); the server's `AuthConfig.callbacks` return a
+  `Decision` — accept with `Permissions`, reject, or partial success naming
+  the next step — with multi-round keyboard-interactive, `no_client_auth` and
+  `max_attempts` (6). Live-tested against OpenSSH 10.2 (`AuthenticationMethods`
+  both roles) and Go (`PartialSuccessError`).
 - **Part 3 — connection protocol** (`connection.zig`): channels with real
   RFC 4254 §5.2 window/flow control, `CHANNEL_DATA` / `_EXTENDED_DATA`
   (stderr) / `_EOF` / `_CLOSE`; `"exec"` / `"subsystem"` / `"shell"` /
@@ -171,6 +179,20 @@ _ = .{ port, incoming };
 // try ssh.userauth.authenticateKeyboardInteractive(&t, gpa, "alice",
 //     .{ .ctx = &my_prompter, .respondFn = MyPrompter.respond }, .{});
 
+// ...or let the module pick, the way Go's `ClientConfig.Auth` and OpenSSH's
+// PreferredAuthentications do: a `none` probe, then the first of YOUR methods
+// the server lists, several keys in order, on through partial successes
+// (`AuthenticationMethods publickey,keyboard-interactive`) to SUCCESS.
+// Requests the ssh-userauth service itself (`.request_service = false` if
+// you already did).
+const otp: ssh.userauth.ClientMethod = .{ .keyboard_interactive = .{ .ctx = &my_prompter, .respondFn = MyPrompter.respond } };
+var progress: ssh.userauth.AuthProgress = .{}; // optional: how far it got
+try ssh.userauth.authenticateWith(&t, gpa, "alice", &.{
+    .{ .publickey = &.{ &work_key, &personal_key } },
+    .{ .retryable = .{ .method = &otp, .max_tries = 3 } }, // a mistyped code may be retried
+    .{ .password_prompt = .{ .ctx = &tty, .promptFn = Tty.askPassword } },
+}, .{ .banner = my_banner, .progress = &progress });
+
 // ── server: accept → authenticate → serve session channels ────────────────
 fn authorizedKey(ctx: *anyopaque, user: []const u8, algorithm: []const u8, key_blob: []const u8) bool {
     // caller's own authorized_keys policy, over caller's own state.
@@ -225,6 +247,38 @@ try ssh.connection.serveSession(&st, gpa, .{
 // });
 // Keyboard-interactive server side: `AuthConfig.keyboard_interactive` with
 // prompts and a check callback.
+
+// ── server: two-step login with permissions (Go `PartialSuccessError`) ────
+// `AuthConfig.callbacks` return a `Decision`: `.reject`, `.{ .accept =
+// permissions }`, or `.{ .partial = &next }` — "right, now also one of
+// `next`'s methods" (the client is told partial success, RFC 4252 §5.1).
+const Policy = struct {
+    second: ssh.userauth.AuthCallbacks,
+    opts: [1]ssh.userauth.Permissions.Option = .{.{ .name = "force-command", .value = "backup.sh" }},
+
+    fn key(ctx: *anyopaque, req: *const ssh.userauth.AuthRequest, _: []const u8, blob: []const u8) ssh.userauth.Decision {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (!isAuthorized(req.user, blob)) return .reject;
+        return .{ .partial = &self.second };
+    }
+    fn otp(ctx: *anyopaque, _: *const ssh.userauth.AuthRequest, p: *ssh.userauth.KbdPrompter) ssh.userauth.Decision {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        var a: [1][]const u8 = undefined; // as many rounds as you like
+        if (!p.challenge("", "", &.{.{ .text = "Code: ", .echo = true }}, &a)) return .reject;
+        if (!totpValid(a[0])) return .reject;
+        return .{ .accept = .{ .critical_options = &self.opts } };
+    }
+};
+var policy: Policy = .{ .second = .{ .keyboard_interactive = .{ .ctx = &policy, .decideFn = Policy.otp } } };
+const auth2 = try ssh.userauth.serveUserauth(&st, gpa, .{
+    .callbacks = .{ .publickey = .{ .ctx = &policy, .decideFn = Policy.key } },
+    .max_attempts = 6, // the default (OpenSSH MaxAuthTries); the first `none` probe is free
+});
+// auth2.completed = {publickey}, auth2.method = .keyboard_interactive;
+// the handlers see the permissions in `RequestInfo.permissions`:
+try ssh.connection.serveConnection(&st, gpa, .{ .user = auth2.user(), .permissions = auth2.permissions, .exec = handler });
+// `.no_client_auth = true` (+ optional `.no_client_auth_callback`) admits a
+// `none` request: Go's NoClientAuth.
 ```
 
 Top-level shortcuts: `ssh.authenticate` (client publickey auth),
