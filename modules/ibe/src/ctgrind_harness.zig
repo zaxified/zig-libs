@@ -23,7 +23,7 @@
 //!
 //! ## Why three targets, and why they are NOT symmetric
 //!
-//! A prior triage pass (`~/CML/20260901-zig-libs-audit/ctgrind-triage-3.md`)
+//! A prior triage pass (the 2026-09-01 audit ctgrind triage notes)
 //! looked at `ibe`'s three secret-consuming entry points and reached a
 //! per-entry-point, not per-module, verdict:
 //!
