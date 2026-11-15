@@ -125,12 +125,93 @@ fn finish(r: DD, x: f64) f64 {
 }
 
 /// atan(x), correctly rounded except for a ~1e-30 sliver around the rounding boundaries.
+///
+/// Ziv's strategy: `atanFast` answers `atan |x|` as an unevaluated sum `h + l`
+/// whose relative error is provably below 2^-64 (bound used: 2^-62); when every
+/// value within that bound of `h + l` rounds to the same double, that double is
+/// the correctly rounded atan and is returned. Otherwise (about 1 call in 500) the
+/// double-double evaluation `atanPos` decides, so the answer is the same double
+/// the double-double path alone gives, wherever that one is correctly rounded.
 pub fn atan(x: f64) f64 {
     if (std.math.isNan(x) or x == 0.0) return x;
     const ax = @abs(x);
     if (ax < 7.450580596923828e-9) return x; // 2^-27: atan x rounds to x
     if (std.math.isInf(ax)) return std.math.copysign(half_pi.hi, x);
+    const f = atanFast(ax);
+    if (fastRounds(f)) |r| return std.math.copysign(r, x);
     return finish(atanPos(.{ .hi = ax, .lo = 0.0 }), x);
+}
+
+// ── atan fast path ──────────────────────────────────────────────────────────
+//
+// For 0 <= y <= 1 pick c = i/64 (i = round(64 y)) and use
+//     atan y = atan c + atan t,   t = (y - c) / (1 + y c),   |t| <= 1/128,
+// with atan c from a 65-entry double-double table and atan t from its Taylor
+// series to t^9 (truncation t^11/11 <= 2^-73.5 |t|). y - c is exact (Sterbenz:
+// c/2 <= y <= 2c for i >= 1), t is a double-double (one division plus a
+// correction), the series' correction term t^3 Q(t^2) <= 2^-15.6 |t| is computed
+// in double (relative error a few 2^-53, i.e. <= 2^-66 |t| absolute; the 1/3
+// coefficient's own rounding adds 2^-69.6 |t|). Since |atan y| >= 0.78 |t| when
+// i >= 1 (and atan y ~ t when i = 0), the sum is within 2^-64 of atan y,
+// relative. For y > 1, atan y = pi/2 - atan(1/y) with 1/y as a double-double;
+// the subtraction cannot cancel (atan(1/y) <= pi/4). The bound `fast_err` is
+// 2^-62, four times the analysis; the test "atan fast path" checks the measured
+// distance to the double-double value against 2^-64 over a large sample.
+
+const fast_err: f64 = 0x1p-62;
+
+const atan_tbl: [65]DD = blk: {
+    @setEvalBranchQuota(10_000_000);
+    var t: [65]DD = undefined;
+    t[0] = .{ .hi = 0.0, .lo = 0.0 };
+    for (1..65) |i| t[i] = atanUnit(.{ .hi = @as(f64, @floatFromInt(i)) / 64.0, .lo = 0.0 });
+    break :blk t;
+};
+
+const Fast = struct { h: f64, l: f64 };
+
+/// atan of a double-double y = yh + yl in [0, 1] (yl tiny), as atan c + atan t.
+inline fn atanFastUnit(yh: f64, yl: f64) Fast {
+    const i: usize = @intFromFloat(@round(yh * 64.0));
+    const c: f64 = @as(f64, @floatFromInt(i)) * (1.0 / 64.0);
+    // numerator (y - c) as a double-double
+    const num = twoSum(yh - c, yl);
+    // denominator 1 + y c as a double-double
+    const p = yh * c;
+    const pe = @mulAdd(f64, yh, c, -p) + yl * c;
+    const d = quickTwoSum(1.0, p);
+    const dl = d.lo + pe;
+    // t = num / d
+    const th = num.hi / d.hi;
+    const r = @mulAdd(f64, -th, d.hi, num.hi) + num.lo - th * dl;
+    const tl = r / d.hi;
+    // atan t = t - t^3 (1/3 - z/5 + z^2/7 - z^3/9), z = t^2
+    const z = th * th;
+    const q = @mulAdd(f64, @mulAdd(f64, @mulAdd(f64, -1.0 / 9.0, z, 1.0 / 7.0), z, -1.0 / 5.0), z, 1.0 / 3.0);
+    const cubic = th * z * q;
+    const a = atan_tbl[i];
+    const s = twoSum(a.hi, th);
+    const l = s.lo + (a.lo + (tl - cubic));
+    return .{ .h = s.hi, .l = l };
+}
+
+/// atan of a finite ax >= 2^-27 as an unevaluated sum within 2^-64 (relative).
+fn atanFast(ax: f64) Fast {
+    if (ax <= 1.0) return atanFastUnit(ax, 0.0);
+    const yh = 1.0 / ax;
+    const yl = @mulAdd(f64, -yh, ax, 1.0) / ax;
+    const u = atanFastUnit(yh, yl);
+    const s = twoSum(half_pi.hi, -u.h);
+    return .{ .h = s.hi, .l = s.lo + (half_pi.lo - u.l) };
+}
+
+/// The correctly rounded double of `f`, or null when the error bound straddles a
+/// rounding boundary.
+inline fn fastRounds(f: Fast) ?f64 {
+    const n = quickTwoSum(f.h, f.l);
+    const e = @abs(n.hi) * fast_err;
+    if (n.hi + (n.lo + e) == n.hi and n.hi + (n.lo - e) == n.hi) return n.hi;
+    return null;
 }
 
 fn asinDD(ax: f64) DD {
@@ -296,6 +377,77 @@ test "atan, asin, acos agree with std.math within one ULP over a sweep, identiti
         try testing.expectEqual(-a, atan(-x));
     }
     try testing.expect(same > n * 9 / 10); // the std version is within one ULP, and right most of the time
+}
+
+/// The double-double path alone (what `atan` was before the fast path).
+fn atanDD(x: f64) f64 {
+    if (std.math.isNan(x) or x == 0.0) return x;
+    const ax = @abs(x);
+    if (ax < 7.450580596923828e-9) return x;
+    if (std.math.isInf(ax)) return std.math.copysign(half_pi.hi, x);
+    return finish(atanPos(.{ .hi = ax, .lo = 0.0 }), x);
+}
+
+/// Checks one argument: the fast sum is within 2^-64 of the double-double value
+/// (a quarter of the bound the rounding test assumes), and `atan` is bitwise the
+/// double-double answer. Returns whether the fast path decided.
+fn checkFast(x: f64) !bool {
+    const want = atanDD(x);
+    try testing.expectEqual(@as(u64, @bitCast(want)), @as(u64, @bitCast(atan(x))));
+    const ax = @abs(x);
+    if (!(ax >= 7.450580596923828e-9) or std.math.isInf(ax)) return true;
+    const f = atanFast(ax);
+    const dd = atanPos(.{ .hi = ax, .lo = 0.0 });
+    const dist = @abs((f.h - dd.hi) + (f.l - dd.lo));
+    if (!(dist <= 0x1p-64 * dd.hi)) {
+        std.debug.print("atan fast path off: x={e} dist/val={e}\n", .{ x, dist / dd.hi });
+        return error.TestUnexpectedResult;
+    }
+    return fastRounds(f) != null;
+}
+
+test "atan fast path: table, error bound and bitwise agreement with the double-double path" {
+    // the comptime table is the runtime double-double value
+    for (1..65) |i| {
+        const want = atanUnit(.{ .hi = @as(f64, @floatFromInt(i)) / 64.0, .lo = 0.0 });
+        try testing.expectEqual(want.hi, atan_tbl[i].hi);
+        try testing.expectEqual(want.lo, atan_tbl[i].lo);
+    }
+    var prng = std.Random.DefaultPrng.init(0x5eed_a7a);
+    const r = prng.random();
+    var decided: usize = 0;
+    const n = 30_000;
+    for (0..n) |_| {
+        // log-uniform magnitude over 2^-30 .. 2^60, both signs
+        const e = r.float(f64) * 90.0 - 30.0;
+        const mag = std.math.exp2(e);
+        const x = if (r.boolean()) mag else -mag;
+        if (try checkFast(x)) decided += 1;
+        // and a uniform draw in (-4, 4), where the indicators' ratios mostly land
+        _ = try checkFast((r.float(f64) - 0.5) * 8.0);
+    }
+    // the fast path decides all but a few in a thousand
+    try testing.expect(decided > n - n / 100);
+    // hard cases: the table nodes, their reciprocals and neighbours, the branch
+    // edges (1/128, 1, 2^-27), the extremes
+    for (0..65) |i| {
+        const c = @as(f64, @floatFromInt(i)) / 64.0;
+        for ([_]f64{ c, c + 1.0 / 128.0, c - 1.0 / 128.0 }) |b| {
+            if (!(b > 0.0)) continue;
+            var v = b;
+            for (0..4) |_| v = std.math.nextAfter(f64, v, 0.0);
+            for (0..9) |_| {
+                _ = try checkFast(v);
+                _ = try checkFast(-v);
+                _ = try checkFast(1.0 / v);
+                v = std.math.nextAfter(f64, v, std.math.inf(f64));
+            }
+        }
+    }
+    for ([_]f64{ 7.450580596923828e-9, 7.450580596923829e-9, 1e-8, 0.5, 1.0, 2.0, 1e15, 0x1p53, 1e300, std.math.floatMax(f64), std.math.floatMin(f64), 3.0, 0.1, 1.0 / 3.0 }) |v| {
+        _ = try checkFast(v);
+        _ = try checkFast(-v);
+    }
 }
 
 test "sinh, cosh, tanh: values and special cases" {

@@ -438,11 +438,11 @@ is fixed here (P-gap candidates, owner's call).
 | **FISHER** | · | 1.64 | · | 37.24 | 23.10 | 8% | a window extremum pair plus `ln` per bar |
 | **FRAMA** | · | 1.76 | · | 66.67 | 37.57 | 3% | two half-window extrema + a fractal-dimension log per bar |
 | **HMA** | · | 3.76 | · | 18.98 | 5.07 | 7% | three WMA cores + a ring through the generic path; TA-Lib's three WMA loops are tight |
-| **HT_DCPERIOD** | 14.7 | 14.7 | 14.8 | 765.02 | 52.14 | 1% | `xmath.atan` (double-double, correctly rounded) in the period estimate on every bar, 760 ns per bar against 52; libm `atan` is far cheaper |
-| **HT_DCPHASE** | · | 3.62 | · | 2014.74 | 560.53 | 5% | as HT_SINE: `atan` DD plus `sin` / `cos` |
-| **HT_PHASOR** | · | 14.7 | · | 764.25 | 52.39 | 0% | same Hilbert core as HT_DCPERIOD, same `xmath.atan` cost |
-| **HT_SINE** | · | 3.46 | · | 2079.32 | 610.27 | 4% | `atan` plus `sin` / `cos` per bar (both sides pay libm `sin` / `cos`, so the gap is mostly `atan`) |
-| **HT_TRENDLINE** | · | 8.12 | · | 850.76 | 104.60 | 3% | HT_DCPERIOD core inside (the `atan` cost) plus the trailing weighted smoothing |
+| **HT_DCPERIOD** | 1.46 | 1.45 | 1.48 | 75.87 | 51.84 | 8% | was 14.7x with the double-double `xmath.atan` on every bar; the Ziv fast path (2026-11-15) leaves the generic `?HBar` step driver and a ~25-cycle correctly rounded atan |
+| HT_DCPHASE | · | 1.05 | · | 607.23 | 585.15 | 11% | (was 3.6x: `atan` fast path; the rest is `sin` / `cos` on both sides) |
+| **HT_PHASOR** | · | 1.48 | · | 77.31 | 51.71 | 1% | same Hilbert core as HT_DCPERIOD (was 14.7x) |
+| HT_SINE | · | 1.05 | · | 656.82 | 629.97 | 5% | (was 3.5x: `atan` fast path) |
+| **HT_TRENDLINE** | · | 1.30 | · | 142.77 | 108.80 | 5% | HT_DCPERIOD core inside plus the trailing weighted smoothing (was 8.1x) |
 | **ICHIMOKU** | · | 3.07 | · | 39.10 | 19.66 | 4% | four windowed extrema (9 / 26 / 52) rescanned per bar |
 | **KAMA** | 3.35 | 3.15 | · | 12.63 | 4.02 | 9% | per-bar efficiency-ratio window sum plus a stepped state machine (3.4x); TA-Lib keeps the sum incrementally in a tight loop |
 | **KC** | · | 1.19 | · | 10.50 | 15.85 | 13% | EMA + ATR + band arithmetic, two stepped cores |
@@ -453,7 +453,7 @@ is fixed here (P-gap candidates, owner's call).
 | **MA_EMA** | · | 10.9 | · | 13.26 | 1.20 | 8% | `MaCore` union dispatch per bar vs the dedicated EMA loop (`ema` row: 1.9x) |
 | **MACD** | 3.98 | 3.51 | · | 6.52 | 1.84 | 11% | three recurrence stages (fast, slow, signal) as generic stepped cores; TA-Lib's fused EMA loops |
 | **MACDEXT** | · | 3.88 | · | 40.80 | 17.60 | 4% | as MACD (SMA-seeded stages through `MaCore` and a gpa scratch) |
-| **MAMA** | · | 23.0 | · | 1507.39 | 67.50 | 2% | Hilbert core with `xmath.atan` (double-double, correctly rounded) on every bar, twice (MAMA's own phase atan too); TA-Lib calls libm `atan` |
+| **MAMA** | · | 1.69 | · | 122.65 | 70.34 | 5% | Hilbert core plus MAMA's own phase `atan`, two fast-path atans per bar (was 23.0x) |
 | **MAX** | 0.90 | 1.19 | · | 2.33 | 1.98 | 10% | block scan with the NaN handling kept (1.2x at 1e5 only, 0.9x at 1e3) |
 | **MEDIAN** | · | 1.40 | · | 66.59 | 47.81 | 1% | window copy + selection into a gpa scratch (1.4x) |
 | **MFI** | 1.71 | 3.13 | · | 21.87 | 6.96 | 12% | per-bar window re-summation of positive / negative money flow through the generic source (1.7x at 1e3, 3.1x at 1e5: grows with n, so cache-visible) |
