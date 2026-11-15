@@ -121,8 +121,13 @@ pub const AsyncSink = struct {
     /// blocks on the destination: when the queue has no room for the whole
     /// line, or already holds `max_lines`, or the line is longer than
     /// `max_bytes`, the line is dropped and counted. Thread-safe.
-    pub fn log(self: *AsyncSink, line: []const u8) void {
-        if (line.len == 0) return;
+    ///
+    /// Returns true when the line was queued, false when it was dropped (and
+    /// counted in `dropped()`), so a caller that keeps its own per-class
+    /// counts can count the `false` returns. An empty `line` is ignored: it
+    /// returns true and is neither queued nor counted (nothing was lost).
+    pub fn log(self: *AsyncSink, line: []const u8) bool {
+        if (line.len == 0) return true;
         const need_nl = line[line.len - 1] != '\n';
         const need = line.len + @intFromBool(need_nl);
         const io = self.io;
@@ -130,7 +135,7 @@ pub const AsyncSink = struct {
         defer self.mutex.unlock(io);
         if (self.closing or need > self.ring.len - self.used or self.lines >= self.options.max_lines) {
             self.dropped_lines +|= 1;
-            return;
+            return false;
         }
         const cap = self.ring.len;
         const tail = (self.head + self.used) % cap;
@@ -142,21 +147,24 @@ pub const AsyncSink = struct {
         self.lines += 1;
         self.accepted += 1;
         self.wake.signal(io);
+        return true;
     }
 
     /// Format `entry` per `options.format`/`template` and queue it like
     /// `log`. A line the formatter cannot produce (more than
     /// `entry_line_max` bytes, or a template error) is dropped and counted.
-    pub fn logEntry(self: *AsyncSink, entry: Entry) void {
+    /// Returns true when queued, false when dropped (see `log`).
+    pub fn logEntry(self: *AsyncSink, entry: Entry) bool {
         var scratch: [entry_line_max]u8 = undefined;
         var fw: std.Io.Writer = .fixed(&scratch);
         const rendered = if (self.options.template) |t| t.write(entry, &fw) else root.write(entry, self.options.format, &fw);
         if (rendered) |_| {
-            self.log(fw.buffered());
+            return self.log(fw.buffered());
         } else |_| {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             self.dropped_lines +|= 1;
+            return false;
         }
     }
 
@@ -261,12 +269,12 @@ test "AsyncSink: nothing lost when the queue never fills; newline added; deinit 
     defer gw.deinit();
     var q: AsyncSink = undefined;
     try q.init(testing.allocator, testing.io, &gw.interface, .{ .max_bytes = 4096, .max_lines = 64 });
-    q.log("one");
-    q.log("two\n");
-    q.log("");
+    _ = q.log("one");
+    _ = q.log("two\n");
+    try testing.expect(q.log("")); // empty: ignored, not a drop
     q.flush();
     try testing.expectEqualStrings("one\ntwo\n", gw.out.items);
-    q.log("three");
+    _ = q.log("three");
     q.deinit(); // drains "three"
     try testing.expectEqualStrings("one\ntwo\nthree\n", gw.out.items);
 }
@@ -279,15 +287,15 @@ test "AsyncSink: a stalled destination makes log drop and count, never block; qu
     // 3 lines of 4 bytes ("aaa\n") fit by bytes; the line cap is 3 too.
     try q.init(testing.allocator, testing.io, &gw.interface, .{ .max_bytes = 12, .max_lines = 3 });
 
-    q.log("aaa");
+    try testing.expect(q.log("aaa"));
     // Wait for the writer to take line 1 and stall in the destination.
     while (!gw.entered.load(.acquire)) std.Thread.yield() catch {};
     // The taken batch still holds its space; two more lines fit, the rest drop.
-    q.log("bbb");
-    q.log("ccc"); // 3 lines, 12 bytes: queue exactly full
+    try testing.expect(q.log("bbb"));
+    try testing.expect(q.log("ccc")); // 3 lines, 12 bytes: queue exactly full
     try testing.expectEqual(@as(u64, 0), q.dropped());
-    q.log("ddd"); // full by lines and bytes
-    q.log("e"); // still full
+    try testing.expect(!q.log("ddd")); // full by lines and bytes
+    try testing.expect(!q.log("e")); // still full
     try testing.expectEqual(@as(u64, 2), q.dropped());
 
     gw.open.store(true, .release);
@@ -301,16 +309,16 @@ test "AsyncSink: byte capacity drops a line that does not fit whole; over-long l
     defer gw.deinit();
     var q: AsyncSink = undefined;
     try q.init(testing.allocator, testing.io, &gw.interface, .{ .max_bytes = 8, .max_lines = 100 });
-    q.log("123456789"); // 10 bytes with newline: never fits
-    q.log("1234567"); // 8 bytes with newline: exactly the capacity
+    try testing.expect(!q.log("123456789")); // 10 bytes with newline: never fits
+    try testing.expect(q.log("1234567")); // 8 bytes with newline: exactly the capacity
     q.flush();
     try testing.expectEqual(@as(u64, 1), q.dropped());
     // Wrap-around: head is now 8 % 8 == 0 again; push lines across the seam.
-    q.log("abc");
+    _ = q.log("abc");
     q.flush();
-    q.log("defg");
+    _ = q.log("defg");
     q.flush();
-    q.log("hi");
+    _ = q.log("hi");
     q.deinit();
     try testing.expectEqualStrings("1234567\nabc\ndefg\nhi\n", gw.out.items);
 }
@@ -321,10 +329,10 @@ test "AsyncSink: logEntry formats with the configured format; an unformattable l
     defer gw.deinit();
     var q: AsyncSink = undefined;
     try q.init(testing.allocator, testing.io, &gw.interface, .{ .format = .logfmt });
-    q.logEntry(.{ .timestamp_ns = 0, .method = "GET", .target = "/x", .status = 200 });
+    try testing.expect(q.logEntry(.{ .timestamp_ns = 0, .method = "GET", .target = "/x", .status = 200 }));
     var huge: [AsyncSink.entry_line_max + 16]u8 = undefined;
     @memset(&huge, 'a');
-    q.logEntry(.{ .timestamp_ns = 0, .method = "GET", .target = &huge, .status = 200 });
+    try testing.expect(!q.logEntry(.{ .timestamp_ns = 0, .method = "GET", .target = &huge, .status = 200 }));
     try testing.expectEqual(@as(u64, 1), q.dropped());
     q.deinit();
     try testing.expect(std.mem.find(u8, gw.out.items, "method=GET") != null);
@@ -353,7 +361,7 @@ test "AsyncSink: concurrent loggers, roomy queue: every line exactly once, per-t
     const Worker = struct {
         fn run(a: *AsyncSink, id: usize) void {
             var b: [32]u8 = undefined;
-            for (0..per) |seq| a.log(std.fmt.bufPrint(&b, "t{d} s{d}", .{ id, seq }) catch unreachable);
+            for (0..per) |seq| _ = a.log(std.fmt.bufPrint(&b, "t{d} s{d}", .{ id, seq }) catch unreachable);
         }
     };
     var pool: [threads]std.Thread = undefined;
@@ -388,7 +396,7 @@ test "AsyncSink: concurrent loggers on a tiny queue: accepted + dropped == logge
     const Worker = struct {
         fn run(a: *AsyncSink, id: usize) void {
             var b: [32]u8 = undefined;
-            for (0..per) |seq| a.log(std.fmt.bufPrint(&b, "t{d} s{d} end", .{ id, seq }) catch unreachable);
+            for (0..per) |seq| _ = a.log(std.fmt.bufPrint(&b, "t{d} s{d} end", .{ id, seq }) catch unreachable);
         }
     };
     var pool: [threads]std.Thread = undefined;
@@ -419,13 +427,13 @@ test "AsyncSink: the line cap binds before the byte cap (mutation 2026-11-15)" {
         gw.open.store(true, .release);
         q.deinit();
     };
-    q.log("a");
+    _ = q.log("a");
     while (!gw.entered.load(.acquire)) std.Thread.yield() catch {};
     // The batch being written still counts: one more line fits, the next does not.
-    q.log("b");
+    _ = q.log("b");
     try testing.expectEqual(@as(u64, 0), q.dropped());
-    q.log("c");
-    q.log("d");
+    _ = q.log("c");
+    _ = q.log("d");
     try testing.expectEqual(@as(u64, 2), q.dropped());
     stopped = true;
     gw.open.store(true, .release);
@@ -439,7 +447,7 @@ test "AsyncSink: a line logged once deinit has begun is dropped and counted, nev
     defer gw.deinit();
     var q: AsyncSink = undefined;
     try q.init(testing.allocator, testing.io, &gw.interface, .{ .max_bytes = 4096, .max_lines = 64 });
-    q.log("first");
+    _ = q.log("first");
     while (!gw.entered.load(.acquire)) std.Thread.yield() catch {};
     const closer = try std.Thread.spawn(.{}, struct {
         fn run(s: *AsyncSink) void {
@@ -454,7 +462,7 @@ test "AsyncSink: a line logged once deinit has begun is dropped and counted, nev
         if (c) break;
         std.Thread.yield() catch {};
     }
-    q.log("late");
+    try testing.expect(!q.log("late"));
     const lost = q.dropped();
     gw.open.store(true, .release);
     closer.join();
@@ -469,7 +477,22 @@ test "AsyncSink: logEntry renders through the template when one is set (mutation
     const tpl = try root.LogFormat.parse("%m %U %>s");
     var q: AsyncSink = undefined;
     try q.init(testing.allocator, testing.io, &gw.interface, .{ .format = .json_lines, .template = &tpl });
-    q.logEntry(.{ .timestamp_ns = 0, .method = "GET", .target = "/x", .status = 200 });
+    _ = q.logEntry(.{ .timestamp_ns = 0, .method = "GET", .target = "/x", .status = 200 });
     q.deinit();
     try testing.expectEqualStrings("GET /x 200\n", gw.out.items);
+}
+
+test "AsyncSink: log returns true exactly for queued lines; an empty line is ignored and not counted" {
+    var buf: [8]u8 = undefined;
+    var gw: GateWriter = .init(testing.allocator, &buf, true);
+    defer gw.deinit();
+    var q: AsyncSink = undefined;
+    try q.init(testing.allocator, testing.io, &gw.interface, .{ .max_bytes = 8, .max_lines = 100 });
+    try testing.expect(q.log(""));
+    try testing.expectEqual(@as(u64, 0), q.dropped());
+    try testing.expect(!q.log("123456789")); // over max_bytes
+    try testing.expectEqual(@as(u64, 1), q.dropped());
+    try testing.expect(q.log("ok"));
+    q.deinit();
+    try testing.expectEqualStrings("ok\n", gw.out.items);
 }

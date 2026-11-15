@@ -54,6 +54,8 @@ const s2 = ls.compute(&[_]?u64{ 10, null, 14, 16 });
 // exact median of a sample slice (reorders it; null when empty; even count = lower middle)
 var rtts = [_]u64{ 40, 10, 30, 20 };
 _ = ls.median(&rtts); // 20
+// the same with the even-count choice explicit: .lower (= median) or .upper
+_ = ls.medianWith(&rtts, .upper); // 30
 ```
 
 `stddev_ns` is the population stddev (divide-by-n), matching fping / ping

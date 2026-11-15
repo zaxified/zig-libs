@@ -213,8 +213,22 @@ pub fn compute(samples: []const ?u64) Stats {
 /// worst case. Samples that are not a probe's RTT (losses) are the caller's to
 /// filter out first.
 pub fn median(samples: []u64) ?u64 {
+    return medianWith(samples, .lower);
+}
+
+/// `median` with the choice for an even count made explicit: `.lower` is the
+/// lower middle, element `(n - 1) / 2` of the sorted order (what `median`
+/// returns); `.upper` is the upper middle, element `n / 2`. For an odd count
+/// both are the one middle element, and for a single sample both are that
+/// sample. Same selection algorithm, in-place reordering, null when empty and
+/// allocation-free as `median`.
+pub fn medianWith(samples: []u64, pick: enum { lower, upper }) ?u64 {
     if (samples.len == 0) return null;
-    return select(samples, (samples.len - 1) / 2, 2 * (@as(usize, @bitSizeOf(usize)) - @clz(samples.len)));
+    const k = switch (pick) {
+        .lower => (samples.len - 1) / 2,
+        .upper => samples.len / 2,
+    };
+    return select(samples, k, 2 * (@as(usize, @bitSizeOf(usize)) - @clz(samples.len)));
 }
 
 /// The element that would sit at index `k` (< `a.len`) after sorting `a`.
@@ -1258,6 +1272,58 @@ test "median: empty, one, two, odd, even (lower middle)" {
     try std.testing.expectEqual(@as(?u64, 20), median(&even));
     var ext = [_]u64{ std.math.maxInt(u64), 0, std.math.maxInt(u64), 0, 1 };
     try std.testing.expectEqual(@as(?u64, 1), median(&ext));
+}
+
+test "medianWith: lower equals median; upper is element n/2; odd and single counts agree" {
+    var e: [0]u64 = .{};
+    try std.testing.expectEqual(@as(?u64, null), medianWith(&e, .lower));
+    try std.testing.expectEqual(@as(?u64, null), medianWith(&e, .upper));
+    var one = [_]u64{7};
+    try std.testing.expectEqual(@as(?u64, 7), medianWith(&one, .lower));
+    try std.testing.expectEqual(@as(?u64, 7), medianWith(&one, .upper));
+    var two = [_]u64{ 9, 3 };
+    try std.testing.expectEqual(@as(?u64, 3), medianWith(&two, .lower));
+    two = .{ 9, 3 };
+    try std.testing.expectEqual(@as(?u64, 9), medianWith(&two, .upper));
+    var odd = [_]u64{ 5, 1, 4, 2, 3 };
+    try std.testing.expectEqual(@as(?u64, 3), medianWith(&odd, .lower));
+    odd = .{ 5, 1, 4, 2, 3 };
+    try std.testing.expectEqual(@as(?u64, 3), medianWith(&odd, .upper));
+    var even = [_]u64{ 40, 10, 30, 20 };
+    try std.testing.expectEqual(@as(?u64, 20), medianWith(&even, .lower));
+    even = .{ 40, 10, 30, 20 };
+    try std.testing.expectEqual(@as(?u64, 30), medianWith(&even, .upper));
+    var ext = [_]u64{ std.math.maxInt(u64), 0, std.math.maxInt(u64), 0 };
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), medianWith(&ext, .upper));
+    // Duplicates around the middle.
+    var dup = [_]u64{ 5, 5, 5, 9, 5, 9 };
+    try std.testing.expectEqual(@as(?u64, 5), medianWith(&dup, .lower));
+    dup = .{ 5, 5, 5, 9, 5, 9 };
+    try std.testing.expectEqual(@as(?u64, 5), medianWith(&dup, .upper));
+    dup = .{ 5, 9, 9, 9, 5, 9 };
+    try std.testing.expectEqual(@as(?u64, 9), medianWith(&dup, .upper));
+}
+
+test "medianWith: both picks match a full sort on random inputs" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x4d45_4457);
+    const rnd = prng.random();
+    var buf: [200]u64 = undefined;
+    for (0..300) |_| {
+        const n = rnd.uintAtMost(usize, buf.len);
+        const spread = rnd.uintAtMost(u64, 20) + 1;
+        for (buf[0..n]) |*x| x.* = rnd.uintLessThan(u64, spread);
+        const sorted = try gpa.dupe(u64, buf[0..n]);
+        defer gpa.free(sorted);
+        std.mem.sortUnstable(u64, sorted, {}, std.sort.asc(u64));
+        const lo: ?u64 = if (n == 0) null else sorted[(n - 1) / 2];
+        const hi: ?u64 = if (n == 0) null else sorted[n / 2];
+        var c1: [200]u64 = undefined;
+        @memcpy(c1[0..n], buf[0..n]);
+        try std.testing.expectEqual(lo, medianWith(c1[0..n], .lower));
+        @memcpy(c1[0..n], buf[0..n]);
+        try std.testing.expectEqual(hi, medianWith(c1[0..n], .upper));
+    }
 }
 
 test "median: matches a full sort on random inputs (incl. many duplicates)" {

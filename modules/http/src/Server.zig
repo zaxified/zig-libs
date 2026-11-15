@@ -187,6 +187,24 @@ pub const ConnEnd = enum {
     refused,
 };
 
+/// Which deadline ended a connection — `ConnSummary.timeout_phase`. The same
+/// distinction `on_error` makes in its `ErrorKind.timed_out` error name.
+pub const TimeoutPhase = enum {
+    /// Nothing arrived while waiting for a request: the keep-alive idle wait
+    /// (`error.IdleTimeout`) or a first request that never started
+    /// (`error.NoRequestTimeout`). Also what an HTTP/2 connection that stalls
+    /// or exceeds its lifetime cap reports (`error.ReadTimeout`; h2 has no head
+    /// or body phase at the connection level).
+    idle,
+    /// The request head did not complete in time (`error.HeadTimeout`).
+    head,
+    /// The request body stalled or ran past its deadline (`error.BodyTimeout`).
+    body,
+    /// The peer stopped reading the response (`error.WriteTimeout`), or the
+    /// whole-response deadline passed (`error.ResponseTimeout`).
+    write,
+};
+
 /// What `Options.on_conn_closed` is told about one finished connection.
 pub const ConnSummary = struct {
     /// The remote address; null only if unknown.
@@ -198,6 +216,10 @@ pub const ConnSummary = struct {
     /// Monotonic time from the start of serving to the end, nanoseconds.
     duration_ns: u64,
     end: ConnEnd,
+    /// Which deadline ended the connection; set exactly when `end ==
+    /// .timed_out`, null otherwise. Lets an observer join the summary with
+    /// `on_error`'s timeout without keeping state between the two hooks.
+    timeout_phase: ?TimeoutPhase = null,
 };
 
 /// Connection summary observer — see `Options.on_conn_closed`.
@@ -1506,11 +1528,13 @@ fn connMain(s: *Server, stream: net.Stream) void {
     const started_ns = nowNs(s.io);
     var sum_end: ConnEnd = .refused;
     var sum_requests: u64 = 0;
+    var sum_phase: ?TimeoutPhase = null;
     defer if (s.options.on_conn_closed) |hook| hook(s.options.on_conn_closed_ctx, .{
         .peer = stream.socket.address,
         .requests = sum_requests,
         .duration_ns = nowNs(s.io) -| started_ns,
         .end = sum_end,
+        .timeout_phase = if (sum_end == .timed_out) sum_phase else null,
     });
 
     // `on_connect` already admitted this connection up in the accept loop,
@@ -1610,6 +1634,9 @@ fn connMain(s: *Server, stream: net.Stream) void {
     if (o.enable_h2c) {
         const is_h2 = detectH2Preface(&tr.reader) catch { // stalled/reset: drop
             sum_end = connEnd(&tr, &tw);
+            // The peer never got past the protocol peek: no request began, so
+            // the reader's phase (still its initial one) says nothing; idle.
+            sum_phase = timeoutPhase(&tr, &tw, true);
             return;
         };
         if (is_h2) {
@@ -1649,6 +1676,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
             }, &tr.reader, &tw.writer);
             reportTimeout(o, stream, &tr, &tw, true);
             sum_end = connEnd(&tr, &tw);
+            sum_phase = timeoutPhase(&tr, &tw, true);
             sum_requests = control.requests.load(.monotonic);
             lingerClose(s.io, stream, &tr.reader);
             return;
@@ -1679,6 +1707,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
     }, &tr.reader, &tw.writer, bufs);
     reportTimeout(o, stream, &tr, &tw, false);
     sum_end = connEnd(&tr, &tw);
+    sum_phase = timeoutPhase(&tr, &tw, false);
     sum_requests = control.requests.load(.monotonic);
 }
 
@@ -1691,19 +1720,30 @@ fn connEnd(tr: *const TimeoutReader, tw: *const TimeoutWriter) ConnEnd {
     return .normal;
 }
 
+/// The deadline that ended the connection (null when none did), from what its
+/// reader and writer recorded. Shared by `reportTimeout` (the `on_error` error
+/// name) and `ConnSummary.timeout_phase`, so the two cannot disagree.
+fn timeoutPhase(tr: *const TimeoutReader, tw: *const TimeoutWriter, is_h2: bool) ?TimeoutPhase {
+    if (tw.timed_out) return .write;
+    if (!tr.timed_out) return null;
+    if (is_h2) return .idle;
+    return switch (tr.phase) {
+        .idle => .idle,
+        .head => .head,
+        .body => .body,
+    };
+}
+
 /// `ErrorKind.timed_out` for a connection a deadline ended, naming the phase.
 fn reportTimeout(o: *const Options, stream: net.Stream, tr: *const TimeoutReader, tw: *const TimeoutWriter, is_h2: bool) void {
     const hook = o.on_error orelse return;
-    const err: anyerror = if (tw.timed_out)
-        (if (tw.response_deadline_ns != 0 and nowNs(tw.io) >= tw.response_deadline_ns) error.ResponseTimeout else error.WriteTimeout)
-    else if (tr.timed_out)
-        (if (is_h2) error.ReadTimeout else switch (tr.phase) {
-            .idle => if (tr.keep_alive_wait) error.IdleTimeout else error.NoRequestTimeout,
-            .head => error.HeadTimeout,
-            .body => error.BodyTimeout,
-        })
-    else
-        return;
+    const phase = timeoutPhase(tr, tw, is_h2) orelse return;
+    const err: anyerror = switch (phase) {
+        .write => if (tw.response_deadline_ns != 0 and nowNs(tw.io) >= tw.response_deadline_ns) error.ResponseTimeout else error.WriteTimeout,
+        .idle => if (is_h2) error.ReadTimeout else if (tr.keep_alive_wait) error.IdleTimeout else error.NoRequestTimeout,
+        .head => error.HeadTimeout,
+        .body => error.BodyTimeout,
+    };
     hook(o.on_error_ctx, .timed_out, err, 0, stream.socket.address);
 }
 
@@ -8886,21 +8926,23 @@ test "on_conn_closed: Connection: close after one request is normal" {
     const rec = try summaryFor("GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", 1, .server_cuts);
     try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
     try testing.expectEqual(ConnEnd.normal, rec.sum.end);
+    try testing.expectEqual(@as(?TimeoutPhase, null), rec.sum.timeout_phase);
     try testing.expectEqual(@as(u64, 1), rec.sum.requests);
 }
 
 test "on_conn_closed: a deadline that ends the connection is timed_out, in every phase" {
-    const cases = [_]struct { send: []const u8, responses: usize, requests: u64 }{
-        .{ .send = "", .responses = 0, .requests = 0 },
-        .{ .send = "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", .responses = 1, .requests = 1 },
-        .{ .send = "GET /hello HTTP/1.1\r\nHo", .responses = 0, .requests = 1 },
-        .{ .send = "POST /hello HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\nabc", .responses = 0, .requests = 1 },
+    const cases = [_]struct { send: []const u8, responses: usize, requests: u64, phase: TimeoutPhase }{
+        .{ .send = "", .responses = 0, .requests = 0, .phase = .idle },
+        .{ .send = "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", .responses = 1, .requests = 1, .phase = .idle },
+        .{ .send = "GET /hello HTTP/1.1\r\nHo", .responses = 0, .requests = 1, .phase = .head },
+        .{ .send = "POST /hello HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\nabc", .responses = 0, .requests = 1, .phase = .body },
     };
     for (cases) |c| {
         const rec = try summaryFor(c.send, c.responses, .server_cuts);
         try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
         try testing.expectEqual(ConnEnd.timed_out, rec.sum.end);
         try testing.expectEqual(c.requests, rec.sum.requests);
+        try testing.expectEqual(@as(?TimeoutPhase, c.phase), rec.sum.timeout_phase);
         // The deadline (150 ms) is what ended it: the duration spans it, and
         // is measured from the start of serving, not from some epoch.
         try testing.expect(rec.sum.duration_ns >= 100 * std.time.ns_per_ms);
@@ -8912,10 +8954,12 @@ test "on_conn_closed: h2c enabled, a peer that sends nothing is timed_out, one t
     const stalled = try summaryForOpts("", 0, .server_cuts, true);
     try testing.expectEqual(@as(u32, 1), stalled.n.load(.acquire));
     try testing.expectEqual(ConnEnd.timed_out, stalled.sum.end);
+    try testing.expectEqual(@as(?TimeoutPhase, .idle), stalled.sum.timeout_phase);
     try testing.expectEqual(@as(u64, 0), stalled.sum.requests);
     const reset = try summaryForOpts("", 0, .client_resets, true);
     try testing.expectEqual(@as(u32, 1), reset.n.load(.acquire));
     try testing.expectEqual(ConnEnd.errored, reset.sum.end);
+    try testing.expectEqual(@as(?TimeoutPhase, null), reset.sum.timeout_phase);
     try testing.expectEqual(@as(u64, 0), reset.sum.requests);
 }
 
@@ -8923,10 +8967,12 @@ test "on_conn_closed: a write stall is timed_out; a reset during the write is er
     const stalled = try bigSummary(150, false);
     try testing.expectEqual(@as(u32, 1), stalled.n.load(.acquire));
     try testing.expectEqual(ConnEnd.timed_out, stalled.sum.end);
+    try testing.expectEqual(@as(?TimeoutPhase, .write), stalled.sum.timeout_phase);
     try testing.expectEqual(@as(u64, 1), stalled.sum.requests);
     const reset = try bigSummary(20_000, true);
     try testing.expectEqual(@as(u32, 1), reset.n.load(.acquire));
     try testing.expectEqual(ConnEnd.errored, reset.sum.end);
+    try testing.expectEqual(@as(?TimeoutPhase, null), reset.sum.timeout_phase);
     try testing.expectEqual(@as(u64, 1), reset.sum.requests);
 }
 
@@ -9124,6 +9170,7 @@ test "on_conn_closed: a reset socket is errored, not timed_out" {
     const rec = try summaryFor("GET /hello HTTP/1.1\r\nHo", 0, .client_resets);
     try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
     try testing.expectEqual(ConnEnd.errored, rec.sum.end);
+    try testing.expectEqual(@as(?TimeoutPhase, null), rec.sum.timeout_phase);
     try testing.expectEqual(@as(u64, 1), rec.sum.requests);
 }
 
@@ -9158,6 +9205,8 @@ test "on_conn_closed: a silent HTTP/2 connection is timed_out (h2c, requests 0)"
     try waitNoConns(io, &server);
     try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
     try testing.expectEqual(ConnEnd.timed_out, rec.sum.end);
+    // h2 reports its read stall as `error.ReadTimeout`; the phase is `.idle`.
+    try testing.expectEqual(@as(?TimeoutPhase, .idle), rec.sum.timeout_phase);
     try testing.expectEqual(@as(u64, 0), rec.sum.requests);
 }
 

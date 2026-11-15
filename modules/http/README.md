@@ -572,7 +572,8 @@ rejected connections fire nothing). `Options.on_conn_closed` is a
 second, optional callback fired once per admitted connection, after
 `.closed` and after the cause is known, with a `Server.ConnSummary`
 (`peer`, `requests`, `duration_ns`, `end`: `normal`, `timed_out`,
-`errored`, `refused`) — h1 and h2c alike. `Options.on_error` is Go's
+`errored`, `refused`, and `timeout_phase`: `idle`, `head`, `body` or `write`
+when `end` is `timed_out`, else null) — h1 and h2c alike. `Options.on_error` is Go's
 `ErrorLog` as a callback: a handler error (`handler_failed`, with the
 error), a request refused before its handler (`request_refused`, with the
 status), a server-side failure (`server_failed`: 503 no working memory, 500
