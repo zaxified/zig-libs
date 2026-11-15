@@ -8630,6 +8630,15 @@ fn forgeEnvelope(gpa: Allocator, op: u8, key_len: u32, body: []const u8) ![]u8 {
     return out;
 }
 
+/// `forgeEnvelope` with a length field that is not the body's length: the
+/// CRC covers what is there, as a forger who knows the format would make it.
+fn forgeEnvelopeDeclared(gpa: Allocator, declared: u32, body: []const u8) ![]u8 {
+    const out = try forgeEnvelope(gpa, op_batch, 0, body);
+    std.mem.writeInt(u32, out[9..13], declared, .little);
+    std.mem.writeInt(u32, out[0..4], std.hash.Crc32.hash(out[4..]), .little);
+    return out;
+}
+
 test "batch: puts, overwrites and deletes commit together and survive a reopen" {
     var sim = SimStorage.init(testing.allocator);
     defer sim.deinit();
@@ -8858,6 +8867,12 @@ test "batch: forged envelopes with a valid CRC are not applied" {
     try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, &bad_op));
     try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, good[0 .. good.len - 1]));
     try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, &(good ++ [_]u8{0})));
+    // A record whose expiry field is cut by the end of the body; a record one
+    // byte longer than the body that declares it, with a CRC over what is there.
+    var exp_ok: [rec_fixed + exp_len + 1 + 1]u8 = undefined;
+    encodeRecordExp(&exp_ok, op_put_exp, 5000, "e", "v");
+    try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, exp_ok[0 .. rec_fixed + 2]));
+    try cases.append(testing.allocator, try forgeEnvelopeDeclared(testing.allocator, good.len - 1, &good));
     for (cases.items, 0..) |env, i| {
         const forged = try std.mem.concat(testing.allocator, u8, &.{ base, env });
         defer testing.allocator.free(forged);
@@ -8901,6 +8916,80 @@ test "batch: op 3 in a version-1 or 2 file is a torn record, as op 2 is in versi
     try expectGet(&db, "k", null);
     try expectGet(&db, "a", "A");
     try testing.expectEqual(len, sim.fileContent("db").?.len);
+}
+
+test "batch: the size limit is exact, header bytes of the envelope not counted" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_batch_bytes = 100 });
+    defer db.close();
+    const v86 = &@as([86]u8, @splat('x'));
+    var b = db.batch();
+    defer b.deinit();
+    try b.put("a", v86); // 13 + 1 + 86 = 100
+    try testing.expectError(error.BatchTooLarge, b.delete("b"));
+    try b.commit();
+    try b.put("a", v30); // 44
+    try b.put("b", v86[0..42]); // 56: 100 in all
+    try testing.expectError(error.BatchTooLarge, b.delete("")); // 13 more
+    try b.commit();
+    try testing.expectError(error.BatchTooLarge, b.put("a", v86 ++ "xx")); // 101 alone
+    try testing.expectEqual(@as(usize, 2), db.count());
+}
+
+test "batch: records larger than the replay window, and many new keys at once" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const big_key = try testing.allocator.alloc(u8, 70_000);
+    defer testing.allocator.free(big_key);
+    @memset(big_key, 'k');
+    const big_val = try testing.allocator.alloc(u8, 150_000);
+    defer testing.allocator.free(big_val);
+    @memset(big_val, 'v');
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        var b = db.batch();
+        defer b.deinit();
+        for (0..200) |i| {
+            var kb: [8]u8 = undefined;
+            try b.put(std.mem.print(&kb, "n{d}", .{i}) catch unreachable, "v");
+        }
+        try b.put(big_key, big_val);
+        try b.putExpiring("e", big_val, std.math.maxInt(i64) - 1);
+        try b.commit();
+        try testing.expectEqual(@as(usize, 202), db.count());
+        try expectAccounting(&db);
+    }
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    try testing.expectEqual(@as(usize, 202), db.count());
+    try expectGet(&db, big_key, big_val);
+    try expectGet(&db, "e", big_val);
+    try expectGet(&db, "n199", "v");
+    try expectAccounting(&db);
+}
+
+test "batch: a reader that tries to commit changes nothing, even on a store without batches" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var w = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer w.close();
+        try w.put("a", "1");
+    }
+    const before = try testing.allocator.dupe(u8, sim.fileContent("db").?);
+    defer testing.allocator.free(before);
+    var r = try Db.open(testing.allocator, sim.storage(), "db", .{ .read_only = true });
+    defer r.close();
+    var b = r.batch();
+    defer b.deinit();
+    try b.put("x", "y");
+    try testing.expectError(error.AccessDenied, b.commit());
+    try testing.expectEqualSlices(u8, before, sim.fileContent("db").?); // no manifest
+    try testing.expect(sim.fileContent("db.0.data") == null);
+    try testing.expect(sim.fileContent("db.1.data") == null);
+    try testing.expectEqual(@as(usize, 1), b.len());
 }
 
 test "batch: BatchTooLarge leaves the batch as it was, memory stays bounded" {
