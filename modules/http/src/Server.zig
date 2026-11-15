@@ -409,7 +409,7 @@ pub const EncoderProvider = struct {
     /// The negotiation: `preferredBy` (what `init` sets), or the caller's
     /// own rule. Behind a pointer, and with no default, so that a server
     /// which never builds a provider links none of it -- the serving loops
-    /// are every embedder's codec. A qap absence check caught `conneg` in a
+    /// are every embedder's codec. A web-server consumer absence check caught `conneg` in a
     /// bare build twice: with a direct call, and with this field defaulting
     /// to `preferredBy` (a default value is compiled with the type).
     prefers: *const fn (p: *const EncoderProvider, accept_encoding: ?[]const u8) bool,
@@ -2080,7 +2080,7 @@ pub const ConnControl = struct {
     /// `idle` while the connection waits for a request (h1) or has no open
     /// stream (h2); `closing` once `shutdownGraceful`/`close` claimed it.
     /// The claim and the loop's own check are ordered the same way round as
-    /// in qap's connection registry: the loop publishes `idle` and THEN reads
+    /// in the web-server consumer's connection registry: the loop publishes `idle` and THEN reads
     /// `draining`, the shutdown sets `draining` and THEN claims `idle` — so
     /// one of the two always sees the other.
     state: std.atomic.Value(State) = .init(.active),
@@ -4502,7 +4502,7 @@ pub const ResponseWriter = struct {
     ///
     /// Before 2026-09-28 a streamed body (chunked, compressed, HTTP/1.0
     /// until-close) had no count at all, so exactly the largest responses
-    /// logged no size (accesslog, found by qap M11.5c). The h2 path frames
+    /// logged no size (accesslog, found by the web-server consumer M11.5c). The h2 path frames
     /// through the same sinks, so it is counted the same way.
     pub fn bodyBytesSent(rw: *const ResponseWriter) ?u64 {
         return switch (rw.body) {
@@ -4821,7 +4821,7 @@ pub const ResponseWriter = struct {
     /// the literal in the table. A GET-only server answering a POST 405 sets
     /// `Allow` that way, so one request from anyone was an assert (Debug,
     /// ReleaseSafe) or a write into .rodata (ReleaseFast) -- a dead process
-    /// either way. Found by qap, 2026-09-21.
+    /// either way. Found by the web-server consumer, 2026-09-21.
     fn lowerName(rw: *ResponseWriter, name: []const u8) Writer.Error![]const u8 {
         var upper = false;
         for (name) |c| {
@@ -4849,7 +4849,7 @@ pub const ResponseWriter = struct {
     /// It mirrors that function decision for decision -- the ETag weakening, the
     /// implicit Date/Server, the compression Vary -- because the two must put
     /// the same response on the wire in either protocol; the h2 test suite and
-    /// qap's conformance run are what hold them together.
+    /// the web-server consumer's conformance run are what hold them together.
     fn writeHeadToSink(rw: *ResponseWriter, sink: FieldSink, framing: Framing) Writer.Error!void {
         var saw_date = false;
         var saw_server = false;
@@ -5775,7 +5775,7 @@ test "serveStream: Expect: 100-continue is lazy -- a handler that never reads se
     var hits: Hits = .init(0);
     var out_buf: [4096]u8 = undefined;
     // `/hello` answers without touching the body. The client was never
-    // invited to send it, so what follows on the wire is not a request qap
+    // invited to send it, so what follows on the wire is not a request the web-server consumer
     // may parse: the second request must not be served.
     const got = runStream(&hits, "POST /hello HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);

@@ -10,7 +10,7 @@
 //! for **direct internet exposure** (peer address on requests, accept
 //! hook + connection accounting, 431/414/413 size limits, stall +
 //! whole-request + write timeouts — see `Server`); TLS termination is the
-//! caller's (a reverse proxy, qap's TLS layer, any Zig TLS server feeding
+//! caller's (a reverse proxy, the web-server consumer's TLS layer, any Zig TLS server feeding
 //! `serveByAlpn`); a native TLS server on our ianic/tls fork is planned
 //! after the zig-libs maturity goal (SPEC Backlog). Phase 2.2 adds
 //! negotiated gzip response compression (`Server.Options.compression`,

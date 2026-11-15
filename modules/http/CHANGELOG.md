@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only. The card's audit `src` hash was already stale before this change (the h1 request wipe) and is left as it was.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: ConnState .closed carries no connection summary (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-15** — **perf (h2): an h2 stream without a request body no longer zeroes `body_scratch`.** The 4 KiB wipe ran on every stream, GET included, although `body_scratch` is written only by a streaming or buffered request body; it now runs only when one exists. The wipe of a stream that had a body is unchanged.
 - **2026-11-15** — **SECURITY (defence in depth, h1): request bytes are zeroed when a request ends.** `Server.serveStep` (so `serveStream`, the socket loop and every `buffers_provider`, `PooledBuffers` included) now zeroes the used prefix of the head buffer (request line, `Authorization`, cookies), of the request-body scratch (a Content-Length body: at most its length; chunked: all of it) and of the trailer capture buffer through `zeroize.zeroize`, on every exit of the request (early 4xx, handler error, detached or upgraded response, close) and before the slab goes back to the pool or the caller reuses its buffers; a plain GET costs the length of its head, not the head buffer. Until a head has been read in full the whole head buffer is wiped. Not covered: the gunzip scratch and the caller's own `Reader` buffer. New tests `S4:` in `Server.zig` (pooled slab after a Content-Length and a chunked request, caller-owned buffers after `serveStep`, a 400 answered early).
@@ -47,7 +48,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** SPEC and README no longer call `tlsserver` a planned new module or put the TLS listener on the ianic/tls fork: `tlsserver` exists, the built-in listener over it is still planned.
 - **2026-11-01** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of `HostGuard`, the `reuse_port`/`reuse_address` bind mapping, the no-task drop path and the timeout reporting: 60 mutants, 54 killed, 6 equivalent; 8 new tests (`HostGuard.check`/`deny` had none; ResponseTimeout/WriteTimeout/h2 ReadTimeout reports; timeouts on a later keep-alive request), and the multicore test no longer turns a failed SO_REUSEPORT bind into a skip.
-- **2026-10-31** — **CONSUMER-VISIBLE (behaviour, from zpinger's move to `http.Server`):**
+- **2026-10-31** — **CONSUMER-VISIBLE (behaviour, from the network-monitor consumer's move to `http.Server`):**
   - `reuse_address` defaults to **true** and means SO_REUSEADDR only (Go's listener): a restart binds over TIME_WAIT, a second instance still gets `AddressInUse`. On Linux `bind` makes the socket itself, since std's `listen(.reuse_address)` sets SO_REUSEPORT too. New `reuse_port` (default false) is the old `reuse_address = true`; `accept_threads > 1` forces it.
   - `idle_timeout_ms` no longer bounds the wait for the first request: that wait is bounded by `read_timeout_ms`, and `read_header_timeout_ms` runs from the connection's start (Go's `IdleTimeout` / `ReadHeaderTimeout` split).
   - A connection whose task cannot be spawned (`Io.Group.concurrent` fails) is dropped and reported as `server_failed` with the error, no longer served on the accept loop (one keep-alive client held the only accept thread). `serve_inline_without_concurrency = true` keeps the old behaviour for an `Io` with no concurrency.
@@ -89,7 +90,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
-- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Docs: the planned native TLS-terminating server now comes from a new zig-libs module `tlsserver` (our own TLS 1.3 server, owner 2026-10-19), not from qap's ianic/tls fork.
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Docs: the planned native TLS-terminating server now comes from a new zig-libs module `tlsserver` (our own TLS 1.3 server, owner 2026-10-19), not from the web-server consumer's ianic/tls fork.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
@@ -315,7 +316,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   parameters must be on the offer — `text/html;level=1` no longer admits a bare `text/html`, and a
   range with parameters outranks the same range without (`MediaRange.specificity` can now return 3),
   exactly RFC 9110 §12.5.1's example table; offers may carry parameters; (3) `*/subtype` is refused as
-  a media range. No in-repo or known consumer negotiates media types (qap uses `encodingQuality` only).
+  a media range. No in-repo or known consumer negotiates media types (the web-server consumer uses `encodingQuality` only).
   `body.indexOfUnquoted` is now public. Gzip responses gained a LIVE anchor
   (`src/gzip_interop.zig`: curl/zlib, gzip(1), CPython decode levels 1/6/9 on HTTP/1.1 and h2c, and
   refuse a flipped CRC-32 or ISIZE).
@@ -402,7 +403,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   copied from -- and was 15,064 bytes. It is now cut from the front of the per-stream slab the
   scratch buffers already come from (no extra allocation) and initialised in place (`initAt`);
   the frame is 2,664 bytes. On a fiber-per-connection server every connection kept the stack
-  pages that frame had touched, dead between requests: measured in qap's h2 saturation lane,
+  pages that frame had touched, dead between requests: measured in the web-server consumer's h2 saturation lane,
   anon memory 49.2 -> 37.4 KiB per connection, requests/s +15.6 % (cycles/request -13 %, the
   6 KB copy and its cache footprint gone). No API change.
 
@@ -441,7 +442,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-29** — **h2 refuses a request `Content-Encoding` it cannot decode, as h1 does.**
   `h2_server` never looked at the request's `Content-Encoding`: a gzip PUT was a 415 on h1 and
   reached the handler over h2 as the compressed bytes with the header attached — two protocol
-  front-ends, two meanings for the same request (found from qap, research register H9). Now any
+  front-ends, two meanings for the same request (found from the web-server consumer, research register H9). Now any
   non-identity coding, a coding list, or two `content-encoding` fields answer 415 before the
   handler. h2 decodes nothing inbound, so `gzip` is refused there even where h1 would decode it
   (`max_decompressed_request_bytes`) — a refusal, never opaque bytes. Behaviour change for a
@@ -470,7 +471,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `flate.Decompress` never verified the gzip CRC, so there was nothing to speed up there.
 
 - **2026-09-28** — **Fix: `Options.inline_blocking` now keeps name resolution on the calling
-  thread too** (found by qap). std's `HostName.connect` starts the lookup and the connects as
+  thread too** (found by the web-server consumer). std's `HostName.connect` starts the lookup and the connects as
   tasks of the `Io`, so with `std.Io.Threaded` they ran on the pool — outside a per-thread sandbox
   — even with the option set. The client now resolves with `HostName.lookup` directly and tries
   the addresses one after another (no parallel connect in this mode). No API change.
@@ -478,7 +479,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   clients via `Options.shared_ca` (borrowed), and `Options.inline_blocking` (blocking phases on
   the calling thread, not the `Io` pool — for per-thread sandboxes; timeouts then only between
   phases). The module doc now warns that those phases run on pool threads. Additive. Wanted by
-  qap M11.8, which moved `ca_bundle`/`ca_scanned` between clients by hand.
+  the web-server consumer M11.8, which moved `ca_bundle`/`ca_scanned` between clients by hand.
 
 - **2026-09-28** — `ResponseWriter.bodyBytesSent`: body octets on the wire after any content
   coding, without chunk framing (`%b`), for every body mode incl. chunked, compressed and
@@ -488,7 +489,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-28** — New `http.url`: query-string parameters (`param`, `paramRaw`,
   `QueryIterator`, `decodeComponent`) and strict path percent-decoding (`decodePath` refuses
   `%2F`, `%00` and malformed escapes), over `Request.query`/`.path`, into caller buffers.
-  Additive only. Wanted by qap, which wrote its own (`src/inputs.zig`).
+  Additive only. Wanted by the web-server consumer, which wrote its own (`src/inputs.zig`).
 
 - **2026-09-27** — **`multipart.Reader`: `multipart/form-data` streamed part by part.** Over a
   `*std.Io.Reader` instead of a whole body in memory: `nextPart` yields the part's `name`,
@@ -498,7 +499,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   delimiter (`boundary.len + 4`; `init` refuses a boundary it cannot hold, or one RFC 2046 forbids).
   Same grammar, `Limits` and refusals as `parse`, plus `ReadFailed` for the underlying reader
   (`StreamError`); a failed body read sets `Reader.err`. Failures are sticky. `parse` is unchanged.
-  Found by qap (streamed form uploads, plan M11.5b).
+  Found by the web-server consumer (streamed form uploads, plan M11.5b).
 - **2026-09-27** — **h1 answers `Expect: 100-continue` lazily.** The interim `100 Continue` goes
   out on the handler's first `Request.reader()` call, not before the handler runs (Go's
   `expectContinueReader`), so a handler that refuses on its own terms -- a route's smaller body cap,
@@ -508,10 +509,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   with no body. New `ResponseWriter.initAt` (in-place `init`; the serving loop uses it -- `init`'s
   result went through a 6,192-byte temporary copy once the new state was added). Serving-frame
   budget 16 → 20 KiB: ReleaseSafe measured 16,384 B before (exactly on the line) and 16,400 B after.
-  Found by qap (per-route body caps, plan M11.5a).
+  Found by the web-server consumer (per-route body caps, plan M11.5a).
 - **2026-09-26** — **`EncoderProvider` negotiates through its own `prefers` pointer; build one with
   `EncoderProvider.init`.** The serving loops called `preferredBy` directly, which linked
-  `conneg` into every server that uses them, provider or not -- qap's precompressed absence check
+  `conneg` into every server that uses them, provider or not -- the web-server consumer's precompressed absence check
   found it in a bare build. The rule is now a field set by `init` (no default: a default value is
   compiled with the type, which the same check caught too). **BREAKING** for a provider built as a
   struct literal an hour after it shipped: add `.prefers = EncoderProvider.preferredBy`, or use
@@ -609,7 +610,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   call sites, `h2_server.zig`'s per-stream `body_scratch`, runs on *every*
   h2 stream, GET included, and regressed a downstream server's h2 GET path
   (no body to protect at all) by +13% total instructions, measured in a
-  same-day qap perf audit (F1). Replaced with this module's own `zeroize`
+  same-day the web-server consumer perf audit (F1). Replaced with this module's own `zeroize`
   (`src/zeroize.zig`): the same volatile, non-elidable stores, but 32
   bytes at a time — 169 instructions for the same 4096 B. No behaviour
   change; every site still zeroes the whole allocation it zeroed before,
@@ -631,7 +632,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   every name lived there. `setHeaderStatic` stores the caller's string literal
   instead, so the first such header on an h2 response was an assert failure
   (Debug, ReleaseSafe) or a write into read-only memory (ReleaseFast). Found by
-  qap, whose GET-only server answers a POST 405 with `setHeaderStatic("Allow", …)`:
+  the web-server consumer, whose GET-only server answers a POST 405 with `setHeaderStatic("Allow", …)`:
   one h2 POST from any client ended the process. A static name is now lowered
   into a copy in `header_buf`; a header table with no room left for it fails the
   head (`WriteFailed`) like the ETag weakening beside it. h1 is unaffected — it
@@ -654,11 +655,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `ResponseWriter` hands it to the h2 framer as (name, value) pairs through a new
   `FieldSink`, instead of formatting a head the framer parsed straight back. The
   wire is unchanged — the response heads of fourteen shapes (h2 and h1, HEAD,
-  gzip, 404, five routes) are byte-identical, all 186 h2 tests pass, and qap's
+  gzip, 404, five routes) are byte-identical, all 186 h2 tests pass, and the web-server consumer's
   conformance suite is 68/68 on both of its engines.
   - **Measured, per response:** h2 goes from 19,358 to 13,670 instructions of
     user-space code on a 480-byte body (**−29.4%**) and 25,094 → 19,123 on 32 KiB
-    (−23.8%); h2/h1 falls from 2.90x to 2.05x. On qap's `h2sat` lane (TLS, 256
+    (−23.8%); h2/h1 falls from 2.90x to 2.05x. On the web-server consumer's `h2sat` lane (TLS, 256
     connections, saturating) the earlier prototype of this measured
     **−13.1% instructions per request and +5.5% throughput**, with kernel
     instructions per request unchanged, as expected — the work removed was all
@@ -687,7 +688,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   allocated at the size its fields already imply rather than rebased as it
   grows, and `hpack.Decoder.decodeBlock` sizes its two per-block lists from the
   block length instead of doubling up from empty. Measured under callgrind on
-  qap's h2 path, ReleaseFast, per response: **−1,000 instructions on a 480-byte
+  the web-server consumer's h2 path, ReleaseFast, per response: **−1,000 instructions on a 480-byte
   response (−4.9% of the user-space cost of the request) and −532 on a 32 KiB
   one**; the h1 path is unchanged to within the instrument's ±0.2%.
   - A new test with it: **the CRLFCRLF that ends the staged response head may
@@ -707,7 +708,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   Since the A1 http F4 fix (2026-09-11), a bare `\n` line correctly stopped ending
   the head, but nothing rejected it either. `readHead` kept reading for a CRLF
   terminator that never came, so the server held the connection until a deadline.
-  Found by qap's conformance check `http/400-closes`, which is red on both of its
+  Found by the web-server consumer's conformance check `http/400-closes`, which is red on both of its
   engines. Nothing was ever served, so this is not a smuggling hole.
   - ⚠ **API: `h1.ReadHeadError` gains `MalformedHead`**, returned the moment a
     head line ends in a bare LF. A consumer with an exhaustive `switch` over
@@ -729,7 +730,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   builds an arena per request again, as it did before 2026-09-15. No API or wire change;
   `Session` loses `spare_arenas`/`spare_arena_count`/`reuse_arenas`, and the F14 bench and its
   tests go with them.
-  - **What it cost the only real consumer.** Measured 2026-09-18 on qap's h2 saturation lane
+  - **What it cost the only real consumer.** Measured 2026-09-18 on the web-server consumer's h2 saturation lane
     (480 B body over TLS, 256 connections, two samples per arm, product tree held constant and
     only the pool toggled): **+11.8 KiB of resident memory per connection** and **2.3× the
     memory still held three seconds after every connection closed** (2 304 → ~5 200 KiB).
