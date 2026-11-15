@@ -901,9 +901,29 @@ fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
             for ([_][2]i32{ .{ 0, 0 }, .{ 1, 1 }, .{ 2, 2 }, .{ 1, 0 }, .{ 0, 2 }, .{ 2, 1 }, .{ 10, 0 } }) |ty| for ([_][9]i32{ .{ 10, 15, 20, 30, 10, 10, 10, 15, 9 }, .{ 2, 3, 4, 5, 2, 2, 3, 3, 2 }, .{ 1, 2, 3, 4, 1, 2, 3, 1, 1 } }) |t|
                 try l.append(gpa, pn(t ++ ty));
             try l.append(gpa, pn([_]i32{ 0, 15, 20, 30, 10, 10, 10, 15, 9, 0, 0 }));
+            // every MaType in both slots (the first period set), alone and paired with a different type
+            for (grid_ma) |t| {
+                try l.append(gpa, pn([_]i32{ 10, 15, 20, 30, 10, 10, 10, 15, 9, t, t }));
+                try l.append(gpa, pn([_]i32{ 2, 3, 4, 5, 2, 2, 3, 3, 2, t, 1 }));
+                try l.append(gpa, pn([_]i32{ 2, 3, 4, 5, 2, 2, 3, 3, 2, 0, t }));
+            }
         },
-        .kdj => for ([_][5]i32{ .{ 9, 3, 0, 3, 0 }, .{ 5, 2, 1, 2, 2 }, .{ 3, 1, 2, 1, 0 }, .{ 14, 3, 10, 3, 0 }, .{ 1, 1, 0, 1, 0 }, .{ 9, 3, 1, 3, 1 }, .{ 0, 3, 0, 3, 0 } }) |t| try l.append(gpa, pn(t)),
-        .stochrsi => for ([_][4]i32{ .{ 14, 5, 3, 0 }, .{ 2, 1, 1, 0 }, .{ 5, 3, 2, 1 }, .{ 10, 4, 3, 2 }, .{ 3, 5, 2, 10 }, .{ 1, 5, 3, 0 }, .{ 14, 0, 3, 0 }, .{ 14, 5, 0, 0 } }) |t| try l.append(gpa, pn(t)),
+        .kdj => {
+            for ([_][5]i32{ .{ 9, 3, 0, 3, 0 }, .{ 5, 2, 1, 2, 2 }, .{ 3, 1, 2, 1, 0 }, .{ 14, 3, 10, 3, 0 }, .{ 1, 1, 0, 1, 0 }, .{ 9, 3, 1, 3, 1 }, .{ 0, 3, 0, 3, 0 } }) |t| try l.append(gpa, pn(t));
+            // every MaType in both slots (TA-Lib's default is RMA)
+            for (grid_ma) |t| {
+                try l.append(gpa, pn(.{ 9, 3, t, 3, t }));
+                try l.append(gpa, pn(.{ 5, 2, 0, 3, t }));
+                try l.append(gpa, pn(.{ 5, 3, t, 2, 1 }));
+            }
+        },
+        .stochrsi => {
+            for ([_][4]i32{ .{ 14, 5, 3, 0 }, .{ 2, 1, 1, 0 }, .{ 5, 3, 2, 1 }, .{ 10, 4, 3, 2 }, .{ 3, 5, 2, 10 }, .{ 1, 5, 3, 0 }, .{ 14, 0, 3, 0 }, .{ 14, 5, 0, 0 } }) |t| try l.append(gpa, pn(t));
+            for (grid_ma) |t| {
+                try l.append(gpa, pn(.{ 14, 5, 3, t }));
+                try l.append(gpa, pn(.{ 5, 3, 2, t }));
+            }
+        },
         .crsi => for ([_][3]i32{ .{ 3, 2, 100 }, .{ 2, 2, 2 }, .{ 5, 3, 10 }, .{ 14, 14, 20 }, .{ 2, 5, 3 }, .{ 2, 2, 10001 }, .{ 1, 2, 100 }, .{ 3, 1, 100 } }) |t| try l.append(gpa, pn(t)),
         .stc => for ([_][3]i32{ .{ 23, 50, 10 }, .{ 2, 3, 2 }, .{ 5, 3, 2 }, .{ 10, 20, 5 }, .{ 12, 26, 4 }, .{ 1, 50, 10 }, .{ 23, 50, 1 } }) |t| try l.append(gpa, pn(t)),
         .sqzmom => for ([_]P{

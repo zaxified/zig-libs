@@ -380,8 +380,8 @@ TA-Lib quirks found in the C (all kept, each pinned by the oracle):
   share), `overlap.MidpriceCore` and `statistic.LinearregCore`: the momentum wave's private copies are gone
   (the oracle agreement is unchanged).
 - **APO / PPO** default to EMA (not SMA); PPO answers 0 when the slow MA is ~0 and, for windowed MA types, when the
-  whole slow window is exactly zero. **KDJ** defaults to RMA (type 13): `error.Unsupported` until RMA is wired
-  into `MaCore`.
+  whole slow window is exactly zero. **KDJ** defaults to RMA (type 13, as in TA-Lib), and APO, PPO, KSTEXT, KDJ and
+  STOCHRSI accept every `MaType` (the overlap wave's types and MAMA included).
 - **PSO**: `tanh` is `xmath.tanh` (fdlibm's `expm1`-based form, as in glibc; Zig's `std.math.tanh` is musl's and
   differs by an ULP), the same function as the TANH transform. 16 of 20930 values differ from glibc by at most
   2 ULP (glibc's `expm1` against `std.math.expm1`): the ULP bound of PSO is 2, every other function is bitwise.
@@ -389,7 +389,5 @@ TA-Lib quirks found in the C (all kept, each pinned by the oracle):
   same 16 / 2 on PSO and 31878 of 31883 bitwise on TANH against `xmath.tanh`'s 31880, so it was dropped.)
 - ASI / SI refuse a limit move outside `[1e-8, 3e37]` (NaN included).
 
-Anchoring: the live oracle covers all 57 (grid in `tools/interop.zig`: defaults, edges, swaps, SMA / EMA / WMA /
-DISABLED where an MA type is a parameter, out-of-range values, unstable 0 / 3 / AUTO4 / AUTO8, lengths up to 5000,
-f64 and f32), frozen replay in `src/oracle_test.zig`. Not covered: MA types after WMA (APO, PPO, KST EXT, KDJ,
-STOCHRSI: the grid is widened after the overlap wave is merged), NaN input, other toolchains.
+Anchoring: the live oracle covers all 57 (grid in `tools/interop.zig`: defaults, edges, swaps, every `MaType` where one is a parameter (APO, PPO, KSTEXT in both slots, KDJ, STOCHRSI: all bitwise, MAMA in the slot included), out-of-range values, unstable 0 / 3 / AUTO4 / AUTO8, lengths up to 5000,
+f64 and f32), frozen replay in `src/oracle_test.zig`. Not covered: NaN input, other toolchains.

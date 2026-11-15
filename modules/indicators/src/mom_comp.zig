@@ -887,3 +887,10 @@ test "trix on a ramp" {
     try testing.expectEqual(@as(usize, 4), lb);
     try testing.expect(o[39] > 0.5 and o[39] < 1.0);
 }
+
+test "apo / ppo: every MaType, batch == streaming, lookback == NaN lead" {
+    inline for (comptime std.enums.values(MaType), 0..) |k, i| {
+        try mu.checkCore(APO, .{ .fast = 3, .slow = 7, .kind = k }, 120, 100 + i);
+        try mu.checkCore(PPO, .{ .fast = 3, .slow = 7, .kind = k }, 120, 200 + i);
+    }
+}

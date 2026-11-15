@@ -927,3 +927,27 @@ test "kdj: J = 3K - 2D, batch == streaming" {
     _ = try kdj(f32, gpa, &h32, &l32, &c32, &k32, &d32, &j32, p);
     try testing.expect(!std.math.isNan(j32[99]));
 }
+
+test "kstext / stochrsi / kdj: every MaType in every slot, KDJ defaults to RMA" {
+    inline for (comptime std.enums.values(core.MaType), 0..) |k, i| {
+        try mu.checkCore(KSTEXT, .{ .roc_ma = k, .signal_ma = k, .ma1 = 3, .ma2 = 4, .ma3 = 3, .ma4 = 5, .signal = 3, .roc1 = 2, .roc2 = 3, .roc3 = 4, .roc4 = 6 }, 120, 300 + i);
+        try mu.checkCore(STOCHRSI, .{ .period = 5, .fastk = 3, .fastd = 2, .fastd_ma = k }, 120, 400 + i);
+        const p = KdjParams{ .slowk_ma = k, .slowd_ma = k };
+        try testing.expectEqual(try stoch_.stochLookback(stochParams(p)), try kdjLookback(p));
+    }
+    const d = KdjParams{};
+    try testing.expectEqual(core.MaType.rma, d.slowk_ma);
+    try testing.expectEqual(core.MaType.rma, d.slowd_ma);
+    const gpa = testing.allocator;
+    const b = try mu.Bars.make(gpa, 80, 7);
+    defer b.free(gpa);
+    var k1: [80]f64 = undefined;
+    var d1: [80]f64 = undefined;
+    var j1: [80]f64 = undefined;
+    var k2: [80]f64 = undefined;
+    var d2: [80]f64 = undefined;
+    const lb = try kdj(f64, gpa, b.h, b.l, b.c, &k1, &d1, &j1, .{});
+    // the defaults are STOCH with RMA smoothing
+    try testing.expectEqual(lb, try stoch_.stoch(f64, gpa, b.h, b.l, b.c, &k2, &d2, .{ .fastk = 9, .slowk = 3, .slowk_ma = .rma, .slowd = 3, .slowd_ma = .rma }));
+    for (lb..80) |i| try testing.expectEqual(k2[i], k1[i]);
+}
