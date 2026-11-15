@@ -1038,6 +1038,9 @@ pub const RequestInfo = struct {
     env: []const EnvVar,
     /// Our number for the channel (distinct per concurrent channel).
     channel: u32,
+    /// What authentication granted (`ServeConfig.permissions`) — e.g. an
+    /// OpenSSH `force-command` critical option the handler must honour.
+    permissions: userauth.Permissions = .{},
 };
 
 /// Server policy hook: run `command` for `user`, appending output to
@@ -1147,6 +1150,10 @@ pub const ServeConfig = struct {
     /// The authenticated identity (`userauth.AuthResult.user()`), passed
     /// through to the handlers.
     user: []const u8 = "",
+    /// What authentication granted (`userauth.AuthResult.permissions`, Go's
+    /// `Conn.Permissions`), passed through to the handlers in
+    /// `RequestInfo.permissions`. This module enforces none of it.
+    permissions: userauth.Permissions = .{},
     /// Handler for §6.5 `"exec"`. `null` → every exec request is answered
     /// SSH_MSG_CHANNEL_FAILURE.
     exec: ?CommandHandler = null,
@@ -1615,6 +1622,7 @@ const Server = struct {
             .pty = sc.pty,
             .env = sc.env.items,
             .channel = sc.ch.local_id,
+            .permissions = srv.config.permissions,
         };
         const status = p.handler.runInfo(srv.gpa, &info, stdin, &out, &err_out) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,

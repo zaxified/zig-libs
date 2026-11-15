@@ -14,9 +14,17 @@
 //!     query→SSH_MSG_USERAUTH_PK_OK→signed-request flow,
 //!   - the `password` method (§8), without the password-change sub-protocol,
 //!   - the `keyboard-interactive` method (RFC 4256): any number of
-//!     challenge rounds client-side, one round of prompts server-side,
+//!     challenge rounds in both roles (server: `KbdCallback` +
+//!     `KbdPrompter`; the fixed one-round `KbdInteractiveCheck` stays),
 //!   - SSH_MSG_USERAUTH_FAILURE / _SUCCESS / _BANNER (the banner reaching the
-//!     caller through `BannerHandler`, not dropped).
+//!     caller through `BannerHandler`, not dropped),
+//!   - auth orchestration in Go `x/crypto/ssh`'s shape (2026-11-15): client
+//!     `authenticateWith` (the `none` probe, the server's method list, the
+//!     caller's method order, several keys, partial success, retryable
+//!     methods); server `AuthConfig.callbacks` returning a `Decision`
+//!     (accept with `Permissions`, reject, or partial success naming the
+//!     next step's callbacks), `no_client_auth`, `max_attempts` = 6 with the
+//!     first `none` free, and the `max_auth_requests` backstop.
 //!
 //! RFC 8308 is what decides which signature algorithm a `publickey` request
 //! names. The transport layer records the server's `server-sig-algs` on
@@ -100,7 +108,59 @@ pub const UserauthError = transport.TransportError || error{
     /// A peer-supplied user/service/key/signature string exceeded the
     /// corresponding `max_*_len` bound above.
     NameTooLong,
+    /// The caller's own configuration cannot work: a server with no method
+    /// enabled (and `no_client_auth` off), one method configured through both
+    /// its `AuthConfig` field and `AuthConfig.callbacks`, a partial success
+    /// that leaves no method to continue with, a `ClientMethod.retryable`
+    /// wrapping another `retryable`, or a `KbdPrompter.challenge` asked with
+    /// more prompts than `max_kbd_prompts` or a mismatched `answers` length.
+    InvalidAuthConfig,
 };
+
+/// The RFC 4252 methods this module speaks, by their wire names
+/// (`wireName`). `none` (§5.2) is the probe a client opens with; a server
+/// accepts it only under `AuthConfig.no_client_auth`.
+pub const AuthMethod = enum {
+    publickey,
+    password,
+    keyboard_interactive,
+    none,
+
+    pub fn wireName(m: AuthMethod) []const u8 {
+        return switch (m) {
+            .publickey => "publickey",
+            .password => "password",
+            .keyboard_interactive => "keyboard-interactive",
+            .none => "none",
+        };
+    }
+
+    /// `null` for a name this module does not implement (`hostbased`,
+    /// `gssapi-with-mic`, anything else).
+    pub fn fromWire(name: []const u8) ?AuthMethod {
+        inline for (comptime std.enums.values(AuthMethod)) |m| {
+            if (std.mem.eql(u8, name, comptime m.wireName())) return m;
+        }
+        return null;
+    }
+};
+
+/// A set of methods: the "authentications that can continue" of an
+/// SSH_MSG_USERAUTH_FAILURE (§5.1), the methods a server has accepted as a
+/// partial success, the methods a client has tried.
+pub const MethodSet = std.EnumSet(AuthMethod);
+
+/// Decode an RFC 4252 §5.1 name-list into the methods this module knows.
+/// Names it does not implement are dropped — a client cannot use them, and a
+/// set has no room for an unbounded peer string.
+pub fn parseMethodList(list: []const u8) MethodSet {
+    var set: MethodSet = .empty;
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |name| {
+        if (AuthMethod.fromWire(name)) |m| set.insert(m);
+    }
+    return set;
+}
 
 /// How many bytes of scratch a userauth exchange reads a packet into. Big
 /// enough for an rsa-4096 key blob + signature several times over.
@@ -246,6 +306,40 @@ pub fn authenticatePublickeyBoundTo(
     const scratch = try gpa.alloc(u8, scratch_len);
     defer gpa.free(scratch);
 
+    const r = try publickeyOne(t, gpa, scratch, user, key, opts.service, opts.banner, opts.probe_first, session_id);
+    if (r.outcome != .success) return error.AuthenticationFailed;
+}
+
+/// What one authentication request ended in, client side: SSH_MSG_USERAUTH_
+/// SUCCESS, a FAILURE with `partial success` set, or a plain FAILURE.
+/// `allowed` is the FAILURE's "authentications that can continue", `null`
+/// when no FAILURE carried one (a success, or a step that never reached the
+/// server).
+const Outcome = enum { success, partial, failure };
+const StepResult = struct {
+    outcome: Outcome,
+    allowed: ?MethodSet = null,
+
+    fn fromFailure(f: FailureReply) StepResult {
+        return .{ .outcome = if (f.partial) .partial else .failure, .allowed = f.allowed };
+    }
+};
+
+/// One key through RFC 4252 §7: the optional signature-less query, then the
+/// signed request. A query the server refuses — or answers with a PK_OK for
+/// another key or a key type this key is not (Go's `confirmKeyAck` and
+/// OpenSSH make the same check) — ends in `.failure` without signing.
+fn publickeyOne(
+    t: *transport.Transport,
+    gpa: std.mem.Allocator,
+    scratch: []u8,
+    user: []const u8,
+    key: *const AuthKey,
+    service: []const u8,
+    banner: ?BannerHandler,
+    probe_first: bool,
+    session_id: []const u8,
+) UserauthError!StepResult {
     // RFC 8308 §3.1: prefer a signature algorithm the server SAID it accepts
     // over the one this key happens to be pinned to. Only `ssh-rsa` keys have
     // a choice at all (their blob type names no hash), and `fromOpenSSH` pins
@@ -256,11 +350,11 @@ pub fn authenticatePublickeyBoundTo(
     const blob = try key.publicBlob(gpa);
     defer gpa.free(blob);
 
-    if (opts.probe_first) {
-        try sendPublickeyRequest(t, gpa, user, opts.service, algorithm, blob, null);
-        switch (try awaitAuthReply(t, scratch, opts.banner)) {
-            .pk_ok => {},
-            .failure => return error.AuthenticationFailed,
+    if (probe_first) {
+        try sendPublickeyRequest(t, gpa, user, service, algorithm, blob, null);
+        switch (try awaitAuthReply(t, scratch, banner)) {
+            .pk_ok => |body| if (!pkOkNamesKey(body, blob)) return .{ .outcome = .failure },
+            .failure => |f| return .{ .outcome = .failure, .allowed = f.allowed },
             // A server must not conclude authentication from a query that
             // carried no signature; treating it as success would let a
             // malicious server "authenticate" us without proof of key
@@ -271,19 +365,35 @@ pub fn authenticatePublickeyBoundTo(
 
     // Real request: sign `session_id || 50 || user || service || "publickey"
     // || TRUE || alg || blob` (RFC 4252 §7).
-    const to_sign = try gpa.alloc(u8, 1024 + blob.len + user.len + opts.service.len + algorithm.len + session_id.len);
+    const to_sign = try gpa.alloc(u8, 1024 + blob.len + user.len + service.len + algorithm.len + session_id.len);
     defer gpa.free(to_sign);
     var bw: std.Io.Writer = .fixed(to_sign);
-    try signedBlob(&bw, session_id, user, opts.service, algorithm, blob);
+    try signedBlob(&bw, session_id, user, service, algorithm, blob);
     const signature = try key.signWithHash(gpa, bw.buffered(), rsa_hash);
     defer gpa.free(signature);
 
-    try sendPublickeyRequest(t, gpa, user, opts.service, algorithm, blob, signature);
-    switch (try awaitAuthReply(t, scratch, opts.banner)) {
-        .success => return,
-        .failure => return error.AuthenticationFailed,
+    try sendPublickeyRequest(t, gpa, user, service, algorithm, blob, signature);
+    switch (try awaitAuthReply(t, scratch, banner)) {
+        .success => return .{ .outcome = .success },
+        .failure => |f| return .fromFailure(f),
         .pk_ok => return error.ProtocolError,
     }
+}
+
+/// SSH_MSG_USERAUTH_PK_OK (§7) is `string algorithm || string key blob`.
+/// The blob must be the one we asked about, and the algorithm one that
+/// signs with that blob's type: RFC 4252 says the algorithm is echoed, but
+/// some servers name the key type instead, which OpenSSH and Go both accept.
+fn pkOkNamesKey(body: []const u8, blob: []const u8) bool {
+    var c = Cursor{ .b = body };
+    const algorithm = c.string() catch return false;
+    const echoed = c.string() catch return false;
+    if (!std.mem.eql(u8, echoed, blob)) return false;
+    // A bare key type (`ssh-rsa`) names itself.
+    const want = transport.keyBlobTypeFor(algorithm) orelse algorithm;
+    var bc = Cursor{ .b = blob };
+    const blob_type = bc.string() catch return false;
+    return std.mem.eql(u8, want, blob_type);
 }
 
 /// The rsa-sha2 hash `key` signs with, chosen against the server's RFC 8308
@@ -339,6 +449,19 @@ pub fn authenticatePassword(
     const scratch = try gpa.alloc(u8, scratch_len);
     defer gpa.free(scratch);
 
+    const r = try passwordStep(t, gpa, scratch, user, password, opts.banner);
+    if (r.outcome != .success) return error.AuthenticationFailed;
+}
+
+fn passwordStep(
+    t: *transport.Transport,
+    gpa: std.mem.Allocator,
+    scratch: []u8,
+    user: []const u8,
+    password: []const u8,
+    banner: ?BannerHandler,
+) UserauthError!StepResult {
+    if (password.len > max_password_len) return error.NameTooLong;
     const buf = try gpa.alloc(u8, 512 + user.len + password.len);
     defer {
         std.crypto.secureZero(u8, buf);
@@ -353,9 +476,9 @@ pub fn authenticatePassword(
     try messages.writeString(&w, password);
     try t.sendPacket(w.buffered());
 
-    switch (try awaitAuthReply(t, scratch, opts.banner)) {
-        .success => return,
-        .failure => return error.AuthenticationFailed,
+    switch (try awaitAuthReply(t, scratch, banner)) {
+        .success => return .{ .outcome = .success },
+        .failure => |f| return .fromFailure(f),
         // SSH_MSG_USERAUTH_PASSWD_CHANGEREQ shares message number 60; the
         // change sub-protocol is deliberately not implemented.
         .pk_ok => return error.UnsupportedAuthMethod,
@@ -424,6 +547,22 @@ pub fn authenticateKeyboardInteractive(
         std.crypto.secureZero(u8, scratch);
         gpa.free(scratch);
     }
+    const r = try kbdStep(t, gpa, scratch, user, responder, opts.banner);
+    if (r.outcome != .success) return error.AuthenticationFailed;
+}
+
+/// RFC 4256 from the client's side: the request, then any number of
+/// INFO_REQUEST rounds answered through `responder`. A responder that gives
+/// up ends the step as a `.failure` with no FAILURE read — the server is
+/// still mid-dialogue, and RFC 4252 §5 lets the next request abandon it.
+fn kbdStep(
+    t: *transport.Transport,
+    gpa: std.mem.Allocator,
+    scratch: []u8,
+    user: []const u8,
+    responder: KbdResponder,
+    banner: ?BannerHandler,
+) UserauthError!StepResult {
     {
         var buf: [max_user_len + 128]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
@@ -442,15 +581,10 @@ pub fn authenticateKeyboardInteractive(
         const pkt = try t.recvPacket(scratch);
         const mt = msgType(pkt);
         switch (mt) {
-            @backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS) => return,
-            @backingInt(messages.MessageType.SSH_MSG_USERAUTH_FAILURE) => return error.AuthenticationFailed,
+            @backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS) => return .{ .outcome = .success },
+            @backingInt(messages.MessageType.SSH_MSG_USERAUTH_FAILURE) => return .fromFailure(try parseFailure(pkt.payload)),
             @backingInt(messages.MessageType.SSH_MSG_EXT_INFO) => try t.takeExtInfo(pkt.payload),
-            @backingInt(messages.MessageType.SSH_MSG_USERAUTH_BANNER) => {
-                var c = Cursor{ .b = pkt.payload[1..] };
-                const msg = try c.string();
-                if (msg.len > max_banner_len) return error.NameTooLong;
-                if (opts.banner) |h| h.show(msg, try c.string());
-            },
+            @backingInt(messages.MessageType.SSH_MSG_USERAUTH_BANNER) => try showBanner(pkt.payload, banner),
             messages.msg_userauth_info_request => {
                 rounds += 1;
                 if (rounds > max_kbd_rounds) return error.ProtocolError;
@@ -464,7 +598,7 @@ pub fn authenticateKeyboardInteractive(
                 for (prompts[0..n]) |*p| p.* = .{ .text = try c.string(), .echo = try c.boolean() };
                 var answers: [max_kbd_prompts][]const u8 = @splat("");
                 const challenge: KbdChallenge = .{ .name = name, .instruction = instruction, .prompts = prompts[0..n] };
-                if (!responder.respondFn(responder.ctx, &challenge, answers[0..n])) return error.AuthenticationFailed;
+                if (!responder.respondFn(responder.ctx, &challenge, answers[0..n])) return .{ .outcome = .failure };
 
                 var len: usize = 16;
                 for (answers[0..n]) |a| {
@@ -488,6 +622,225 @@ pub fn authenticateKeyboardInteractive(
         }
     }
     return error.ProtocolError;
+}
+
+// ── client: method orchestration (Go `ClientConfig.Auth`) ──────────────────
+
+/// Asks the caller for a password, at the moment one is needed (Go
+/// `PasswordCallback`): a terminal prompt, a secret store. `promptFn` writes
+/// it into `buf` (`max_password_len` bytes, owned and scrubbed by this
+/// module) and returns its length, or `null` to skip the method — no request
+/// is sent then, and the method counts as tried. `user` is borrowed.
+pub const PasswordPrompt = struct {
+    ctx: *anyopaque = transport.no_context,
+    promptFn: *const fn (ctx: *anyopaque, user: []const u8, buf: []u8) ?usize,
+};
+
+/// One way to authenticate, for `authenticateWith` (Go's `AuthMethod`).
+pub const ClientMethod = union(enum) {
+    /// RFC 4252 §7 with each key in turn (Go `PublicKeys`): query, and sign
+    /// only for a key the server answers PK_OK. Stops at the first success
+    /// or partial success, or once the server drops `publickey` from its
+    /// list. The keys are borrowed for the call.
+    publickey: []const *const AuthKey,
+    /// §8 with a fixed secret (Go `Password`).
+    password: []const u8,
+    /// §8 with a secret fetched when needed (Go `PasswordCallback`).
+    password_prompt: PasswordPrompt,
+    /// RFC 4256 (Go `KeyboardInteractive`).
+    keyboard_interactive: KbdResponder,
+    /// Go `RetryableAuthMethod`: try `method` again after a plain failure,
+    /// up to `max_tries` times in all (0: until `max_client_auth_steps`), as
+    /// long as the server still lists it — a mistyped password or code
+    /// otherwise takes the method out of the running. `method` must not be
+    /// another `retryable`.
+    retryable: Retryable,
+
+    pub const Retryable = struct {
+        method: *const ClientMethod,
+        max_tries: u32 = 3,
+    };
+
+    /// The RFC 4252 method this tries.
+    pub fn method(self: ClientMethod) AuthMethod {
+        return switch (self) {
+            .publickey => .publickey,
+            .password, .password_prompt => .password,
+            .keyboard_interactive => .keyboard_interactive,
+            .retryable => |r| switch (r.method.*) {
+                .retryable => .none, // refused by `authenticateWith` before use
+                else => r.method.method(),
+            },
+        };
+    }
+};
+
+/// Where `authenticateWith` got to — filled in however the call ends, for a
+/// log line or a test (Go's `ClientAuthContext` fields).
+pub const AuthProgress = struct {
+    /// The server's latest "authentications that can continue".
+    allowed: MethodSet = .empty,
+    /// Methods the server accepted as a partial success (§5.1).
+    partial: MethodSet = .empty,
+    /// Methods that failed (`none` included) and will not be tried again.
+    tried: MethodSet = .empty,
+    /// The method whose request the server answered SUCCESS.
+    succeeded: ?AuthMethod = null,
+    /// Authentication steps taken, the `none` probe included.
+    steps: u32 = 0,
+};
+
+pub const ClientAuthOptions = struct {
+    /// Where to deliver an SSH_MSG_USERAUTH_BANNER; `null` discards it.
+    banner: ?BannerHandler = null,
+    /// `publickey`: query before signing (see `PublickeyOptions`).
+    probe_first: bool = true,
+    /// Request the `ssh-userauth` service first (RFC 4252 §5, once per
+    /// connection). Off for a caller that already did.
+    request_service: bool = true,
+    /// Filled in on return, success or not.
+    progress: ?*AuthProgress = null,
+};
+
+/// Bound on the steps of one `authenticateWith` (Go `maxAuthClientTried`).
+pub const max_client_auth_steps = 64;
+
+/// Client: authenticate as `user` with whichever of `methods` the server
+/// lets us, the way Go's `ClientConfig.Auth` and OpenSSH's
+/// `PreferredAuthentications` do (RFC 4252 §5):
+///
+///   1. the `none` request (§5.2), which a server answers with the list of
+///      methods that can continue (or with SUCCESS, if it needs nothing);
+///   2. the first entry of `methods` that the server's latest list names and
+///      that has not failed yet, in the caller's order;
+///   3. on a FAILURE with `partial success` (§5.1 — the server needs more
+///      than one method, e.g. OpenSSH `AuthenticationMethods
+///      publickey,password`), on with the methods the server now lists; a
+///      method that partially succeeded may be used again (OpenSSH
+///      `publickey,publickey` wants a second key);
+///   4. until SUCCESS (returns), or nothing left to try
+///      (`error.AuthenticationFailed`, or `error.UnsupportedAuthMethod` when
+///      the last step ended on a password-change request).
+///
+/// Transport and protocol errors end the call at once. `opts.progress`
+/// says how far it got.
+// secret-api-ok: an orchestrator over authenticatePublickey/Password/KeyboardInteractive's steps; keys are signed through AuthKey.sign (sign_burn), passwords pass through scrubbed buffers.
+pub fn authenticateWith(
+    t: *transport.Transport,
+    gpa: std.mem.Allocator,
+    user: []const u8,
+    methods: []const ClientMethod,
+    opts: ClientAuthOptions,
+) UserauthError!void {
+    if (user.len > max_user_len) return error.NameTooLong;
+    for (methods) |m| switch (m) {
+        .retryable => |r| if (r.method.* == .retryable) return error.InvalidAuthConfig,
+        else => {},
+    };
+    const session_id = try sessionId(t);
+    const scratch = try gpa.alloc(u8, scratch_len);
+    defer {
+        std.crypto.secureZero(u8, scratch);
+        gpa.free(scratch);
+    }
+    var progress: AuthProgress = .{};
+    defer if (opts.progress) |p| {
+        p.* = progress;
+    };
+
+    if (opts.request_service) try t.requestService("ssh-userauth", scratch);
+
+    // §5.2: "none" — what can continue, or no authentication at all.
+    {
+        var buf: [max_user_len + 64]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+        try messages.writeString(&w, user);
+        try messages.writeString(&w, connection_service);
+        try messages.writeString(&w, "none");
+        try t.sendPacket(w.buffered());
+    }
+    var current: AuthMethod = .none;
+    var r: StepResult = switch (try awaitAuthReply(t, scratch, opts.banner)) {
+        .success => .{ .outcome = .success },
+        .failure => |f| .fromFailure(f),
+        .pk_ok => return error.ProtocolError,
+    };
+    var soft: ?UserauthError = null;
+    while (true) {
+        progress.steps += 1;
+        if (r.allowed) |a| progress.allowed = a;
+        switch (r.outcome) {
+            .success => {
+                progress.succeeded = current;
+                return;
+            },
+            .partial => progress.partial.insert(current),
+            .failure => progress.tried.insert(current),
+        }
+        if (progress.steps >= max_client_auth_steps) return error.AuthenticationFailed;
+        const next = for (methods) |*m| {
+            const name = m.method();
+            if (!progress.tried.contains(name) and progress.allowed.contains(name)) break m;
+        } else return soft orelse error.AuthenticationFailed;
+        current = next.method();
+        r = runMethod(t, gpa, scratch, user, next.*, opts, session_id, &progress) catch |e| switch (e) {
+            // The method ran and lost: try the next one, keep the reason.
+            error.UnsupportedAuthMethod => blk: {
+                soft = e;
+                break :blk .{ .outcome = .failure };
+            },
+            else => return e,
+        };
+    }
+}
+
+fn runMethod(
+    t: *transport.Transport,
+    gpa: std.mem.Allocator,
+    scratch: []u8,
+    user: []const u8,
+    m: ClientMethod,
+    opts: ClientAuthOptions,
+    session_id: []const u8,
+    progress: *AuthProgress,
+) UserauthError!StepResult {
+    switch (m) {
+        .publickey => |keys| {
+            var allowed: ?MethodSet = null;
+            for (keys) |key| {
+                const r = try publickeyOne(t, gpa, scratch, user, key, connection_service, opts.banner, opts.probe_first, session_id);
+                if (r.allowed) |a| allowed = a;
+                if (r.outcome != .failure) return .{ .outcome = r.outcome, .allowed = allowed };
+                // RFC 4252 §7 / Go: a server that no longer lists publickey
+                // is not offered another key.
+                if (allowed) |a| if (!a.contains(.publickey)) break;
+            }
+            return .{ .outcome = .failure, .allowed = allowed };
+        },
+        .password => |pw| return passwordStep(t, gpa, scratch, user, pw, opts.banner),
+        .password_prompt => |p| {
+            var buf: [max_password_len]u8 = undefined;
+            defer std.crypto.secureZero(u8, &buf);
+            const n = p.promptFn(p.ctx, user, &buf) orelse return .{ .outcome = .failure };
+            if (n > buf.len) return error.NameTooLong;
+            return passwordStep(t, gpa, scratch, user, buf[0..n], opts.banner);
+        },
+        .keyboard_interactive => |resp| return kbdStep(t, gpa, scratch, user, resp, opts.banner),
+        .retryable => |rt| {
+            const limit: u32 = if (rt.max_tries == 0) max_client_auth_steps else rt.max_tries;
+            var r: StepResult = .{ .outcome = .failure };
+            var i: u32 = 0;
+            while (i < limit) : (i += 1) {
+                if (i > 0) progress.steps += 1;
+                if (progress.steps >= max_client_auth_steps) break;
+                r = try runMethod(t, gpa, scratch, user, rt.method.*, opts, session_id, progress);
+                if (r.outcome != .failure) return r;
+                if (r.allowed) |a| if (!a.contains(rt.method.method())) return r;
+            }
+            return r;
+        },
+    }
 }
 
 fn sendPublickeyRequest(
@@ -514,7 +867,34 @@ fn sendPublickeyRequest(
     return t.sendPacket(w.buffered());
 }
 
-const AuthReply = enum { success, failure, pk_ok };
+const FailureReply = struct { allowed: MethodSet, partial: bool };
+
+const AuthReply = union(enum) {
+    success,
+    failure: FailureReply,
+    /// The PK_OK body after the message number (borrowed from the scratch;
+    /// for `password` the same number is PASSWD_CHANGEREQ).
+    pk_ok: []const u8,
+};
+
+/// SSH_MSG_USERAUTH_FAILURE (§5.1): `name-list authentications that can
+/// continue || boolean partial success`.
+fn parseFailure(payload: []const u8) UserauthError!FailureReply {
+    var c = Cursor{ .b = payload[1..] };
+    const list = try c.string();
+    const partial = try c.boolean();
+    return .{ .allowed = parseMethodList(list), .partial = partial };
+}
+
+/// §5.4: string message || string language tag. Bounded, then handed to the
+/// caller's seam if it has one — displaying it is still caller policy.
+fn showBanner(payload: []const u8, banner: ?BannerHandler) UserauthError!void {
+    var c = Cursor{ .b = payload[1..] };
+    const msg = try c.string();
+    if (msg.len > max_banner_len) return error.NameTooLong;
+    const language = try c.string();
+    if (banner) |h| h.show(msg, language);
+}
 
 /// Read packets until one is an authentication verdict, skipping the
 /// informational messages RFC 4252/4253 allow at any point (BANNER, IGNORE,
@@ -537,18 +917,12 @@ fn awaitAuthReply(t: *transport.Transport, scratch: []u8, banner: ?BannerHandler
                 continue;
             },
             .SSH_MSG_USERAUTH_BANNER => {
-                // §5.4: string message || string language tag. Bounded, then
-                // handed to the caller's seam if it has one — displaying it
-                // is still caller policy, but there is now a way to.
-                var c = Cursor{ .b = pkt.payload[1..] };
-                const msg = try c.string();
-                if (msg.len > max_banner_len) return error.NameTooLong;
-                if (banner) |h| h.show(msg, try c.string());
+                try showBanner(pkt.payload, banner);
                 continue;
             },
             .SSH_MSG_USERAUTH_SUCCESS => return .success,
-            .SSH_MSG_USERAUTH_FAILURE => return .failure,
-            .SSH_MSG_USERAUTH_PK_OK => return .pk_ok,
+            .SSH_MSG_USERAUTH_FAILURE => return .{ .failure = try parseFailure(pkt.payload) },
+            .SSH_MSG_USERAUTH_PK_OK => return .{ .pk_ok = pkt.payload[1..] },
             .SSH_MSG_DISCONNECT => return error.ProtocolError,
             else => return error.ProtocolError,
         }
@@ -716,29 +1090,254 @@ pub const RejectionHandler = struct {
     }
 };
 
+// ── server: Go-shaped decisions (multi-step, permissions) ───────────────────
+
+/// What an authentication callback grants a user (Go `Permissions`): the
+/// OpenSSH certificate vocabulary — critical options (`force-command`,
+/// `source-address`) and extensions (`permit-pty`, `permit-port-forwarding`)
+/// — plus `extra` for the application's own per-login state. This module
+/// enforces none of them; it carries them from the deciding callback to
+/// `AuthResult.permissions`, and from there (`connection.ServeConfig.
+/// permissions`) to every handler's `RequestInfo`. A server should refuse a
+/// critical option it does not understand.
+///
+/// ⚠ Borrowed, not copied: the slices and `extra` belong to the callback's
+/// `ctx` and must outlive the connection that serves them.
+pub const Permissions = struct {
+    pub const Option = struct { name: []const u8, value: []const u8 = "" };
+
+    critical_options: []const Option = &.{},
+    extensions: []const Option = &.{},
+    extra: ?*anyopaque = null,
+
+    pub fn criticalOption(self: Permissions, name: []const u8) ?[]const u8 {
+        return find(self.critical_options, name);
+    }
+
+    pub fn extension(self: Permissions, name: []const u8) ?[]const u8 {
+        return find(self.extensions, name);
+    }
+
+    fn find(options: []const Option, name: []const u8) ?[]const u8 {
+        for (options) |o| if (std.mem.eql(u8, o.name, name)) return o.value;
+        return null;
+    }
+};
+
+/// A deciding callback's verdict on one credential (Go: `(*Permissions,
+/// error)` with `PartialSuccessError`).
+pub const Decision = union(enum) {
+    /// Refused. The client is told SSH_MSG_USERAUTH_FAILURE, the attempt
+    /// counts against `AuthConfig.max_attempts`, and `AuthConfig.failure`
+    /// names the method's usual reason (`wrong_password`, …).
+    reject,
+    /// Authenticated, with these permissions.
+    accept: Permissions,
+    /// Right, but not enough (Go `PartialSuccessError{Next}`): the client is
+    /// told FAILURE with `partial success` set (RFC 4252 §5.1), and from now
+    /// on only the methods `next` enables can continue — with `next`'s
+    /// callbacks deciding. The user name may not change after this. `next`
+    /// is borrowed and must stay valid for the rest of `serveUserauth`; one
+    /// that enables no method ends the call with `error.InvalidAuthConfig`.
+    /// A partial success does not count as a failed attempt. Permissions
+    /// are not carried across steps: the step that finally accepts grants
+    /// them.
+    partial: *const AuthCallbacks,
+
+    pub const accepted: Decision = .{ .accept = .{} };
+};
+
+/// What every deciding callback is told about the request (part of Go's
+/// `ConnMetadata`). Borrowed for the call.
+pub const AuthRequest = struct {
+    user: []const u8,
+    /// Methods that already partially succeeded on this connection.
+    completed: MethodSet,
+    session_id: []const u8,
+};
+
+/// Go `PublicKeyCallback`: decide on `key_blob` (the wire blob) offered with
+/// signature algorithm `algorithm`. Called for the §7 query (anything but
+/// `.reject` answers PK_OK) and again for the signed request, whose verdict
+/// counts only once the signature verifies. Same borrowing as
+/// `AuthorizedKeyCheck`; it should be a pure function of its inputs.
+pub const PublickeyCallback = struct {
+    ctx: *anyopaque = transport.no_context,
+    decideFn: *const fn (ctx: *anyopaque, req: *const AuthRequest, algorithm: []const u8, key_blob: []const u8) Decision,
+};
+
+/// Go `PasswordCallback`. Same burn and borrowing as `PasswordCheck`.
+pub const PasswordCallback = struct {
+    ctx: *anyopaque = transport.no_context,
+    decideFn: *const fn (ctx: *anyopaque, req: *const AuthRequest, password: []const u8) Decision,
+
+    pub fn decide(self: PasswordCallback, req: *const AuthRequest, password: []const u8) Decision {
+        return burn.run(burn.password_burn, Decision, decideBody, .{ self, req, password });
+    }
+
+    fn decideBody(self: PasswordCallback, req: *const AuthRequest, password: []const u8) Decision {
+        return self.decideFn(self.ctx, req, password);
+    }
+};
+
+/// Go `KeyboardInteractiveCallback`: a dialogue of any number of rounds
+/// (a PAM conversation, a password then a one-time code), each one
+/// `prompter.challenge(...)`. A round the client did not answer properly
+/// makes `challenge` return false; the callback should then return
+/// `.reject` — and whatever it returns, it does not authenticate.
+pub const KbdCallback = struct {
+    ctx: *anyopaque = transport.no_context,
+    decideFn: *const fn (ctx: *anyopaque, req: *const AuthRequest, prompter: *KbdPrompter) Decision,
+};
+
+/// Go `NoClientAuthCallback`: decide on a `none` request (no credential at
+/// all) under `AuthConfig.no_client_auth`.
+pub const NoneCallback = struct {
+    ctx: *anyopaque = transport.no_context,
+    decideFn: *const fn (ctx: *anyopaque, req: *const AuthRequest) Decision,
+};
+
+/// The deciding callbacks for one step (Go `ServerAuthCallbacks`). A method
+/// is enabled when its field is set.
+pub const AuthCallbacks = struct {
+    publickey: ?PublickeyCallback = null,
+    password: ?PasswordCallback = null,
+    keyboard_interactive: ?KbdCallback = null,
+};
+
+/// The server's half of an RFC 4256 dialogue, handed to a `KbdCallback`
+/// (Go's `KeyboardInteractiveChallenge` argument).
+pub const KbdPrompter = struct {
+    t: *transport.Transport,
+    scratch: []u8,
+    rounds: u32 = 0,
+    state: State = .ok,
+    err: UserauthError = error.ProtocolError,
+    /// The message that arrived instead of an INFO_RESPONSE (`.abandoned`).
+    pending: ?transport.Packet = null,
+
+    const State = enum { ok, refused, abandoned, failed };
+
+    /// Ask one round: SSH_MSG_USERAUTH_INFO_REQUEST with `prompts`, then the
+    /// client's INFO_RESPONSE into `answers` (one per prompt, same length).
+    /// True: `answers` holds the client's answers — the peer's secrets,
+    /// borrowed until the next `challenge` or the callback's return, then
+    /// scrubbed. False: no usable answer — more answers or fewer than
+    /// prompts, a malformed response, more than `max_kbd_rounds` rounds, a
+    /// transport error, or a client that moved on to another request (RFC
+    /// 4252 §5 lets it abandon the dialogue; `serveUserauth` serves that
+    /// request next). After a false every further call is false.
+    pub fn challenge(
+        self: *KbdPrompter,
+        name: []const u8,
+        instruction: []const u8,
+        prompts: []const KbdPrompt,
+        answers: [][]const u8,
+    ) bool {
+        if (self.state != .ok) return false;
+        return self.challengeInner(name, instruction, prompts, answers) catch |e| {
+            self.state = .failed;
+            self.err = e;
+            return false;
+        };
+    }
+
+    fn challengeInner(
+        self: *KbdPrompter,
+        name: []const u8,
+        instruction: []const u8,
+        prompts: []const KbdPrompt,
+        answers: [][]const u8,
+    ) UserauthError!bool {
+        if (prompts.len > max_kbd_prompts or answers.len != prompts.len) return error.InvalidAuthConfig;
+        self.rounds += 1;
+        if (self.rounds > max_kbd_rounds) {
+            self.state = .refused;
+            return false;
+        }
+        {
+            var len: usize = 64 + name.len + instruction.len;
+            for (prompts) |p| len += 8 + p.text.len;
+            var buf: [8192]u8 = undefined;
+            if (len > buf.len) return error.NameTooLong;
+            var w: std.Io.Writer = .fixed(&buf);
+            try w.writeByte(messages.msg_userauth_info_request);
+            try messages.writeString(&w, name);
+            try messages.writeString(&w, instruction);
+            try messages.writeString(&w, ""); // language tag
+            var nb: [4]u8 = undefined;
+            std.mem.writeInt(u32, &nb, @intCast(prompts.len), .big);
+            try w.writeAll(&nb);
+            for (prompts) |p| {
+                try messages.writeString(&w, p.text);
+                try w.writeByte(@intFromBool(p.echo));
+            }
+            try self.t.sendPacket(w.buffered());
+        }
+        // Scrub the previous round's answers before the next lands.
+        std.crypto.secureZero(u8, self.scratch);
+        const pkt = try self.t.recvPacket(self.scratch);
+        if (msgType(pkt) != messages.msg_userauth_info_response) {
+            // A new USERAUTH_REQUEST (abandoning this dialogue), a
+            // DISCONNECT, or junk: `serveUserauth`'s loop decides which.
+            self.state = .abandoned;
+            self.pending = pkt;
+            return false;
+        }
+        var c = Cursor{ .b = pkt.payload[1..] };
+        const n = c.uint32() catch return self.refuse();
+        if (n != prompts.len) return self.refuse();
+        for (answers) |*a| {
+            a.* = c.string() catch return self.refuse();
+            if (a.len > max_password_len) return self.refuse();
+        }
+        if (!c.atEnd()) return self.refuse();
+        return true;
+    }
+
+    fn refuse(self: *KbdPrompter) bool {
+        self.state = .refused;
+        return false;
+    }
+};
+
 pub const AuthConfig = struct {
-    /// Enables the `publickey` method when set.
+    /// Enables the `publickey` method when set (a yes/no hook; for
+    /// permissions or a multi-step login use `callbacks.publickey`).
     authorized_key: ?AuthorizedKeyCheck = null,
-    /// Enables the `password` method when set.
+    /// Enables the `password` method when set (or `callbacks.password`).
     password: ?PasswordCheck = null,
-    /// Enables the RFC 4256 `keyboard-interactive` method when set.
+    /// Enables the RFC 4256 `keyboard-interactive` method with one fixed
+    /// round when set (or `callbacks.keyboard_interactive`, any number).
     keyboard_interactive: ?KbdInteractiveCheck = null,
+    /// The deciding callbacks of the first step (Go's `ServerConfig`
+    /// callbacks): they may grant `Permissions` and ask for another method
+    /// (`Decision.partial`). A method may be set here or in its field above,
+    /// not both (`error.InvalidAuthConfig`).
+    callbacks: AuthCallbacks = .{},
+    /// Accept the `none` method — no credential at all (Go `NoClientAuth`).
+    /// Never after a partial success.
+    no_client_auth: bool = false,
+    /// With `no_client_auth`: decide each `none` request instead of
+    /// accepting it (Go `NoClientAuthCallback`).
+    no_client_auth_callback: ?NoneCallback = null,
     /// Optional SSH_MSG_USERAUTH_BANNER (§5.4) sent once, before the first
     /// verdict.
     banner: ?[]const u8 = null,
     /// Rejected *credentials* tolerated before giving up with
-    /// `error.AuthenticationFailed`.
+    /// `error.AuthenticationFailed` (OpenSSH `MaxAuthTries` and Go's
+    /// default: 6). The client's first `none` probe is free, as in Go and
+    /// OpenSSH; a partial success is not a rejection.
     ///
-    /// This is a credential budget, not a time or packet budget: messages
-    /// that produce no verdict — SSH_MSG_IGNORE, SSH_MSG_DEBUG, and the
-    /// RFC 4252 §7 signature-less `publickey` *query* (which is answered
-    /// SSH_MSG_USERAUTH_PK_OK and is by definition not an attempt) — do not
-    /// consume it, so an unauthenticated peer can keep `serveUserauth`
-    /// looping for as long as it keeps sending. There is no OpenSSH-style
-    /// `LoginGraceTime` here and there cannot be: this module never owns the
-    /// socket (see SPEC.md → Threat model), so the read deadline belongs to
-    /// the caller that does.
-    max_attempts: u32 = 20,
+    /// This is a credential budget, not a time budget. Messages that
+    /// produce no verdict — SSH_MSG_IGNORE, SSH_MSG_DEBUG, the RFC 4252 §7
+    /// signature-less `publickey` query (answered PK_OK) — do not consume
+    /// it; every USERAUTH_REQUEST, those queries included, counts against
+    /// `max_auth_requests` (128, Go's backstop) instead. There is no
+    /// OpenSSH-style `LoginGraceTime` here and there cannot be: this module
+    /// never owns the socket (see SPEC.md → Threat model), so the read
+    /// deadline belongs to the caller that does.
+    max_attempts: u32 = 6,
     /// Optional out-pointer for why authentication failed — the same idiom
     /// `transport.HostKeyPolicy.failure` and `sntp`'s Kiss-o'-Death code use,
     /// because `error.AuthenticationFailed` cannot carry a payload. Written
@@ -760,8 +1359,10 @@ pub const AuthConfig = struct {
     on_rejected: ?RejectionHandler = null,
 };
 
-/// Which method actually succeeded.
-pub const AuthMethod = enum { publickey, password, keyboard_interactive };
+/// Every SSH_MSG_USERAUTH_REQUEST counts against this, whatever its outcome
+/// (Go `maxAuthServerAttempts`): the backstop against a client that loops
+/// without ever being refused (queries, partial successes).
+pub const max_auth_requests = 128;
 
 /// Outcome of a successful `serveUserauth`. The user name is copied into a
 /// fixed buffer (bounded by `max_user_len`) so the caller has no allocation
@@ -769,7 +1370,16 @@ pub const AuthMethod = enum { publickey, password, keyboard_interactive };
 pub const AuthResult = struct {
     user_buf: [max_user_len]u8 = undefined,
     user_len: usize = 0,
+    /// The method of the final, successful step (`.none` under
+    /// `AuthConfig.no_client_auth`).
     method: AuthMethod = .publickey,
+    /// Methods that partially succeeded before it, in a multi-step login
+    /// (`Decision.partial`); empty for a single-step one.
+    completed: MethodSet = .empty,
+    /// What the deciding callback granted (`Decision.accept`); empty for the
+    /// bool-returning hooks. Borrowed from the callback — see `Permissions`.
+    /// Hand it on with `connection.ServeConfig.permissions`.
+    permissions: Permissions = .{},
 
     pub fn user(self: *const AuthResult) []const u8 {
         return self.user_buf[0..self.user_len];
@@ -779,8 +1389,11 @@ pub const AuthResult = struct {
 /// Server: drive RFC 4252 to a verdict on `t`.
 ///
 /// Returns the authenticated identity on SSH_MSG_USERAUTH_SUCCESS. Every
-/// rejected attempt costs one of `config.max_attempts`; exhausting them (or
-/// receiving no acceptable method) yields `error.AuthenticationFailed`.
+/// rejected attempt costs one of `config.max_attempts`; exhausting them
+/// yields `error.AuthenticationFailed`. A deciding callback
+/// (`config.callbacks`) may answer `Decision.partial` to require another
+/// method first (RFC 4252 §5.1 partial success, Go `PartialSuccessError`);
+/// the result then lists the steps in `AuthResult.completed`.
 /// Receiving something that is not an SSH_MSG_USERAUTH_REQUEST at all —
 /// notably a client that tries to open a channel *before* authenticating —
 /// is `error.ProtocolError`: the connection protocol is unreachable until
@@ -794,6 +1407,9 @@ pub fn serveUserauth(
     config: AuthConfig,
 ) UserauthError!AuthResult {
     const sid = try sessionId(t);
+    var active = try Active.initial(config);
+    if (active.methods().count() == 0 and !config.no_client_auth) return error.InvalidAuthConfig;
+
     const scratch = try gpa.alloc(u8, scratch_len);
     // The §8 `password` method delivers the peer's plaintext secret straight
     // into this buffer, so the server half owes the same scrub the client
@@ -807,9 +1423,18 @@ pub fn serveUserauth(
     }
 
     var banner_sent = false;
-    var attempts: u32 = 0;
-    while (attempts < config.max_attempts) {
-        const pkt = try t.recvPacket(scratch);
+    var failures: u32 = 0;
+    var requests: u32 = 0;
+    var none_requests: u32 = 0;
+    var completed: MethodSet = .empty;
+    // After a partial success the user may not change (Go, OpenSSH).
+    var locked_user: [max_user_len]u8 = undefined;
+    var locked_len: ?usize = null;
+    var pending: ?transport.Packet = null;
+    while (true) {
+        if (failures >= config.max_attempts or requests >= max_auth_requests) break;
+        const pkt = if (pending) |p| p else try t.recvPacket(scratch);
+        pending = null;
         switch (@as(messages.MessageType, @fromBackingInt(@intCast(msgType(pkt))))) {
             .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => continue,
             .SSH_MSG_DISCONNECT => {
@@ -826,6 +1451,7 @@ pub fn serveUserauth(
                 return error.ProtocolError;
             },
         }
+        requests += 1;
 
         if (!banner_sent) {
             if (config.banner) |b| try sendBanner(t, b);
@@ -835,145 +1461,191 @@ pub fn serveUserauth(
         var c = Cursor{ .b = pkt.payload[1..] };
         const user = try c.string();
         const service = try c.string();
-        const method = try c.string();
+        const method_name = try c.string();
         if (user.len > max_user_len or service.len > max_service_len)
             return error.NameTooLong;
+        if (locked_len) |n| if (!std.mem.eql(u8, user, locked_user[0..n])) {
+            t.sendDisconnect(.protocol_error, "user changed after partial success") catch {};
+            return error.ProtocolError;
+        };
 
-        // §5: authenticating for any service other than the connection
-        // protocol is not something this module supports.
-        if (!std.mem.eql(u8, service, connection_service)) {
-            if (config.failure) |out| out.* = .no_acceptable_method;
-            if (config.on_rejected) |h| h.call(user, .no_acceptable_method);
-            attempts += 1;
-            try sendFailure(t, config);
-            continue;
-        }
+        // The user name, out of the scratch the next packet reuses
+        // (keyboard-interactive reads its answers there).
+        var res = AuthResult{ .completed = completed };
+        @memcpy(res.user_buf[0..user.len], user);
+        res.user_len = user.len;
+        const req: AuthRequest = .{ .user = res.user(), .completed = completed, .session_id = sid };
+        const method = AuthMethod.fromWire(method_name);
+        const is_none = method != null and method.? == .none;
+        if (is_none) none_requests += 1;
 
-        if (std.mem.eql(u8, method, "publickey") and config.authorized_key != null) {
-            switch (try servePublickey(t, &c, user, service, sid, config)) {
-                .success => {
-                    try sendSuccess(t);
-                    var res = AuthResult{ .method = .publickey };
-                    @memcpy(res.user_buf[0..user.len], user);
-                    res.user_len = user.len;
-                    return res;
-                },
-                // The query phase answered PK_OK; the client will now send
-                // the signed request. Not an attempt.
-                .pk_ok_sent => continue,
-                .failure => |why| {
-                    if (config.failure) |out| out.* = why;
-                    if (config.on_rejected) |h| h.call(user, why);
-                    attempts += 1;
-                    try sendFailure(t, config);
-                    continue;
-                },
-            }
-        }
+        const step: Step = blk: {
+            // §5: authenticating for any service other than the connection
+            // protocol is not something this module supports.
+            if (!std.mem.eql(u8, service, connection_service)) break :blk .{ .rejected = .no_acceptable_method };
+            const m = method orelse break :blk .{ .rejected = .no_acceptable_method };
+            break :blk switch (m) {
+                .publickey => if (active.pk) |hook|
+                    try servePublickey(t, &c, &req, service, hook)
+                else
+                    .{ .rejected = .no_acceptable_method },
+                .password => if (active.pw) |hook| pw: {
+                    const change = try c.boolean();
+                    const password = try c.string();
+                    if (password.len > max_password_len) return error.NameTooLong;
+                    // The §8 password-change sub-protocol is not served.
+                    if (change) break :pw .{ .rejected = .wrong_password };
+                    break :pw decided(switch (hook) {
+                        .check => |h| if (h.check(req.user, password)) Decision.accepted else .reject,
+                        .callback => |h| h.decide(&req, password),
+                    }, .wrong_password);
+                } else .{ .rejected = .no_acceptable_method },
+                .keyboard_interactive => if (active.kbd) |hook|
+                    try serveKbdInteractive(t, scratch, &req, hook)
+                else
+                    .{ .rejected = .no_acceptable_method },
+                // §5.2: the conventional way to ask what can continue; a
+                // login only under `no_client_auth`, never after a partial
+                // success.
+                .none => if (config.no_client_auth and locked_len == null)
+                    decided(if (config.no_client_auth_callback) |h| h.decideFn(h.ctx, &req) else Decision.accepted, .no_acceptable_method)
+                else
+                    .{ .rejected = .no_acceptable_method },
+            };
+        };
 
-        if (std.mem.eql(u8, method, "password") and config.password != null) {
-            const change = try c.boolean();
-            const password = try c.string();
-            if (password.len > max_password_len) return error.NameTooLong;
-            if (!change and config.password.?.check(user, password)) {
+        switch (step) {
+            .pk_ok_sent => continue,
+            .rejected, .abandoned => {
+                const why: AuthFailure = switch (step) {
+                    .rejected => |w| w,
+                    else => .wrong_answers,
+                };
+                if (config.failure) |out| out.* = why;
+                if (config.on_rejected) |h| h.call(res.user(), why);
+                // Go and OpenSSH: the client's first `none` probe is free.
+                if (failures > 0 or !is_none or none_requests != 1) failures += 1;
+                switch (step) {
+                    // The client moved on (RFC 4252 §5): no FAILURE for
+                    // the dialogue it dropped; serve what it sent instead.
+                    .abandoned => |p| pending = p,
+                    else => try sendFailure(t, active.methods(), false),
+                }
+            },
+            .accepted => |perms| {
                 try sendSuccess(t);
-                var res = AuthResult{ .method = .password };
-                @memcpy(res.user_buf[0..user.len], user);
-                res.user_len = user.len;
+                res.method = method.?;
+                res.permissions = perms;
                 return res;
-            }
-            if (config.failure) |out| out.* = .wrong_password;
-            if (config.on_rejected) |h| h.call(user, .wrong_password);
-            attempts += 1;
-            try sendFailure(t, config);
-            continue;
+            },
+            .partial => |next| {
+                completed.insert(method.?);
+                active = .from(next);
+                if (active.methods().count() == 0) return error.InvalidAuthConfig;
+                if (locked_len == null) {
+                    @memcpy(locked_user[0..res.user_len], res.user());
+                    locked_len = res.user_len;
+                }
+                try sendFailure(t, active.methods(), true);
+            },
         }
-
-        if (std.mem.eql(u8, method, "keyboard-interactive") and config.keyboard_interactive != null) {
-            // The answers arrive in `scratch`, over `user`: keep a copy.
-            var res = AuthResult{ .method = .keyboard_interactive };
-            @memcpy(res.user_buf[0..user.len], user);
-            res.user_len = user.len;
-            if (try serveKbdInteractive(t, scratch, res.user(), config.keyboard_interactive.?)) {
-                try sendSuccess(t);
-                return res;
-            }
-            if (config.failure) |out| out.* = .wrong_answers;
-            if (config.on_rejected) |h| h.call(res.user(), .wrong_answers);
-            attempts += 1;
-            try sendFailure(t, config);
-            continue;
-        }
-
-        // "none" (§5.2, the conventional way a client asks which methods are
-        // available) and anything unsupported both land here.
-        if (config.failure) |out| out.* = .no_acceptable_method;
-        if (config.on_rejected) |h| h.call(user, .no_acceptable_method);
-        attempts += 1;
-        try sendFailure(t, config);
     }
     t.sendDisconnect(.no_more_auth_methods_available, "too many authentication attempts") catch {};
     return error.AuthenticationFailed;
 }
 
-/// The `keyboard-interactive` half of `serveUserauth` (RFC 4256 §3.2-§3.4):
-/// one INFO_REQUEST, one INFO_RESPONSE, the caller's verdict. `user` must
-/// not point into `scratch` (the response is read there).
-fn serveKbdInteractive(t: *transport.Transport, scratch: []u8, user: []const u8, kbd: KbdInteractiveCheck) UserauthError!bool {
-    if (kbd.prompts.len > max_kbd_prompts) return error.NameTooLong;
-    {
-        var len: usize = 64 + kbd.name.len + kbd.instruction.len;
-        for (kbd.prompts) |p| len += 8 + p.text.len;
-        var buf: [8192]u8 = undefined;
-        if (len > buf.len) return error.NameTooLong;
-        var w: std.Io.Writer = .fixed(&buf);
-        try w.writeByte(messages.msg_userauth_info_request);
-        try messages.writeString(&w, kbd.name);
-        try messages.writeString(&w, kbd.instruction);
-        try messages.writeString(&w, ""); // language tag
-        var nb: [4]u8 = undefined;
-        std.mem.writeInt(u32, &nb, @intCast(kbd.prompts.len), .big);
-        try w.writeAll(&nb);
-        for (kbd.prompts) |p| {
-            try messages.writeString(&w, p.text);
-            try w.writeByte(@intFromBool(p.echo));
-        }
-        try t.sendPacket(w.buffered());
+/// The methods one step enables, each either a yes/no hook (`AuthConfig`'s
+/// own fields) or a deciding callback (`AuthCallbacks`).
+const Active = struct {
+    pk: ?PkHook = null,
+    pw: ?PwHook = null,
+    kbd: ?KbdHook = null,
+
+    fn initial(config: AuthConfig) UserauthError!Active {
+        const cb = config.callbacks;
+        if ((config.authorized_key != null and cb.publickey != null) or
+            (config.password != null and cb.password != null) or
+            (config.keyboard_interactive != null and cb.keyboard_interactive != null))
+            return error.InvalidAuthConfig;
+        var a: Active = .from(&cb);
+        if (config.authorized_key) |h| a.pk = .{ .check = h };
+        if (config.password) |h| a.pw = .{ .check = h };
+        if (config.keyboard_interactive) |h| a.kbd = .{ .check = h };
+        return a;
     }
-    const pkt = try t.recvPacket(scratch);
-    if (msgType(pkt) != messages.msg_userauth_info_response) {
-        t.sendDisconnect(.protocol_error, "expected SSH_MSG_USERAUTH_INFO_RESPONSE") catch {};
-        return error.ProtocolError;
+
+    fn from(cb: *const AuthCallbacks) Active {
+        return .{
+            .pk = if (cb.publickey) |h| .{ .callback = h } else null,
+            .pw = if (cb.password) |h| .{ .callback = h } else null,
+            .kbd = if (cb.keyboard_interactive) |h| .{ .callback = h } else null,
+        };
     }
-    var c = Cursor{ .b = pkt.payload[1..] };
-    const n = try c.uint32();
-    if (n != kbd.prompts.len) return false;
-    var answers: [max_kbd_prompts][]const u8 = undefined;
-    for (answers[0..n]) |*a| {
-        a.* = try c.string();
-        if (a.len > max_password_len) return error.NameTooLong;
+
+    fn methods(self: Active) MethodSet {
+        var s: MethodSet = .empty;
+        if (self.pk != null) s.insert(.publickey);
+        if (self.pw != null) s.insert(.password);
+        if (self.kbd != null) s.insert(.keyboard_interactive);
+        return s;
     }
-    return kbd.checkFn(kbd.ctx, user, answers[0..n]);
+};
+
+const PkHook = union(enum) { check: AuthorizedKeyCheck, callback: PublickeyCallback };
+const PwHook = union(enum) { check: PasswordCheck, callback: PasswordCallback };
+const KbdHook = union(enum) { check: KbdInteractiveCheck, callback: KbdCallback };
+
+/// How one request ended, server side.
+const Step = union(enum) {
+    accepted: Permissions,
+    partial: *const AuthCallbacks,
+    /// Refused, with the reason `AuthConfig.failure` records.
+    rejected: AuthFailure,
+    /// The §7 query was answered PK_OK; not an attempt.
+    pk_ok_sent,
+    /// A keyboard-interactive dialogue the client left for this packet.
+    abandoned: transport.Packet,
+};
+
+fn decided(d: Decision, why: AuthFailure) Step {
+    return switch (d) {
+        .reject => .{ .rejected = why },
+        .accept => |p| .{ .accepted = p },
+        .partial => |n| .{ .partial = n },
+    };
 }
 
-const PublickeyOutcome = union(enum) {
-    success,
-    /// Refused, with the reason `serveUserauth` records in
-    /// `AuthConfig.failure`.
-    failure: AuthFailure,
-    pk_ok_sent,
-};
+/// The `keyboard-interactive` half of `serveUserauth` (RFC 4256 §3.2-§3.4):
+/// the hook's rounds through a `KbdPrompter`, then its verdict.
+fn serveKbdInteractive(t: *transport.Transport, scratch: []u8, req: *const AuthRequest, hook: KbdHook) UserauthError!Step {
+    var prompter: KbdPrompter = .{ .t = t, .scratch = scratch };
+    const d: Decision = switch (hook) {
+        .check => |kbd| d: {
+            if (kbd.prompts.len > max_kbd_prompts) return error.NameTooLong;
+            var answers: [max_kbd_prompts][]const u8 = undefined;
+            const n = kbd.prompts.len;
+            if (!prompter.challenge(kbd.name, kbd.instruction, kbd.prompts, answers[0..n])) break :d .reject;
+            break :d if (kbd.checkFn(kbd.ctx, req.user, answers[0..n])) Decision.accepted else .reject;
+        },
+        .callback => |h| h.decideFn(h.ctx, req, &prompter),
+    };
+    return switch (prompter.state) {
+        .ok => decided(d, .wrong_answers),
+        .refused => .{ .rejected = .wrong_answers },
+        .abandoned => .{ .abandoned = prompter.pending.? },
+        .failed => prompter.err,
+    };
+}
 
 /// The `publickey` half of `serveUserauth`. `c` is positioned just after the
 /// method name.
 fn servePublickey(
     t: *transport.Transport,
     c: *Cursor,
-    user: []const u8,
+    req: *const AuthRequest,
     service: []const u8,
-    session_id: []const u8,
-    config: AuthConfig,
-) UserauthError!PublickeyOutcome {
+    hook: PkHook,
+) UserauthError!Step {
     const has_signature = try c.boolean();
     const algorithm = try c.string();
     const key_blob = try c.string();
@@ -984,13 +1656,18 @@ fn servePublickey(
     // name/`ssh-rsa` blob-type split). Rejecting a mismatch here stops an
     // "announce ed25519, present an RSA blob" style confusion at the door.
     const want_blob_type = transport.keyBlobTypeFor(algorithm) orelse
-        return .{ .failure = .unsupported_algorithm };
+        return .{ .rejected = .unsupported_algorithm };
     var kc = Cursor{ .b = key_blob };
-    const blob_type = kc.string() catch return .{ .failure = .algorithm_mismatch };
-    if (!std.mem.eql(u8, blob_type, want_blob_type)) return .{ .failure = .algorithm_mismatch };
+    const blob_type = kc.string() catch return .{ .rejected = .algorithm_mismatch };
+    if (!std.mem.eql(u8, blob_type, want_blob_type)) return .{ .rejected = .algorithm_mismatch };
 
-    if (!config.authorized_key.?.check(user, algorithm, key_blob))
-        return .{ .failure = .unauthorized_key };
+    // Decided before the signature is checked (a refused key is never
+    // verified); the verdict counts only once the signature verifies.
+    const d: Decision = switch (hook) {
+        .check => |h| if (h.check(req.user, algorithm, key_blob)) Decision.accepted else .reject,
+        .callback => |h| h.decideFn(h.ctx, req, algorithm, key_blob),
+    };
+    if (d == .reject) return .{ .rejected = .unauthorized_key };
 
     if (!has_signature) {
         // §7 query phase: SSH_MSG_USERAUTH_PK_OK || string alg || string blob.
@@ -1011,7 +1688,7 @@ fn servePublickey(
     // replay-prevention step (see the module doc comment).
     var to_sign: [max_key_blob_len + 2048]u8 = undefined;
     var bw: std.Io.Writer = .fixed(&to_sign);
-    signedBlob(&bw, session_id, user, service, algorithm, key_blob) catch
+    signedBlob(&bw, req.session_id, req.user, service, algorithm, key_blob) catch
         return error.NameTooLong;
 
     // `transport.verifySignature` dispatches on the KEY BLOB's type and, for
@@ -1019,15 +1696,15 @@ fn servePublickey(
     // blob announcing a different algorithm than the request did cannot slip
     // through: it either fails to verify or is an unsupported algorithm.
     var sc = Cursor{ .b = signature };
-    const sig_algorithm = sc.string() catch return .{ .failure = .bad_signature };
-    if (!std.mem.eql(u8, sig_algorithm, algorithm)) return .{ .failure = .algorithm_mismatch };
+    const sig_algorithm = sc.string() catch return .{ .rejected = .bad_signature };
+    if (!std.mem.eql(u8, sig_algorithm, algorithm)) return .{ .rejected = .algorithm_mismatch };
 
     transport.verifySignature(blob_type, key_blob, signature, bw.buffered()) catch |e| switch (e) {
-        error.HostKeyVerificationFailed, error.ProtocolError => return .{ .failure = .bad_signature },
-        error.UnsupportedAlgorithm => return .{ .failure = .unsupported_algorithm },
+        error.HostKeyVerificationFailed, error.ProtocolError => return .{ .rejected = .bad_signature },
+        error.UnsupportedAlgorithm => return .{ .rejected = .unsupported_algorithm },
         else => return e,
     };
-    return .success;
+    return decided(d, .unauthorized_key);
 }
 
 fn sendSuccess(t: *transport.Transport) UserauthError!void {
@@ -1035,28 +1712,21 @@ fn sendSuccess(t: *transport.Transport) UserauthError!void {
 }
 
 /// SSH_MSG_USERAUTH_FAILURE (§5.1): `name-list of methods that can continue
-/// || boolean partial success`. Partial success is always false — this
-/// module never requires a second method.
-fn sendFailure(t: *transport.Transport, config: AuthConfig) UserauthError!void {
-    var names: [3][]const u8 = undefined;
-    var n: usize = 0;
-    if (config.authorized_key != null) {
-        names[n] = "publickey";
-        n += 1;
-    }
-    if (config.password != null) {
-        names[n] = "password";
-        n += 1;
-    }
-    if (config.keyboard_interactive != null) {
-        names[n] = "keyboard-interactive";
-        n += 1;
-    }
+/// || boolean partial success`. `partial` is set only when a deciding
+/// callback answered `Decision.partial`.
+fn sendFailure(t: *transport.Transport, set: MethodSet, partial: bool) UserauthError!void {
     var buf: [128]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_FAILURE));
+    var names: [3][]const u8 = undefined;
+    var n: usize = 0;
+    for ([_]AuthMethod{ .publickey, .password, .keyboard_interactive }) |m| {
+        if (!set.contains(m)) continue;
+        names[n] = m.wireName();
+        n += 1;
+    }
     try messages.writeNameList(&w, names[0..n]);
-    try w.writeByte(0);
+    try w.writeByte(@intFromBool(partial));
     return t.sendPacket(w.buffered());
 }
 
@@ -1165,8 +1835,8 @@ fn framePackets(out: []u8, payloads: []const []const u8) ![]const u8 {
 const UserauthCorpus = struct {
     store: [8192]u8 = undefined,
     used: usize = 0,
-    entries: [7][]const u8 = undefined,
-    counts: [7]usize = undefined,
+    entries: [12][]const u8 = undefined,
+    counts: [12]usize = undefined,
     n: usize = 0,
 
     fn push(self: *UserauthCorpus, payloads: []const []const u8) void {
@@ -1251,6 +1921,29 @@ const UserauthCorpus = struct {
         // The single `0x00` payload the target replayed on every round.
         self.push(&.{&[_]u8{0}});
         self.push(&.{});
+        // 2026-11-15, auth orchestration. Server side: a password the
+        // policy calls a partial success, then two keyboard-interactive
+        // rounds (`FuzzPolicy`); and `none` for the one user the
+        // `no_client_auth` callback admits.
+        var m: [6]Msg = undefined;
+        self.push(&.{
+            m[0].password("alice", "partial").bytes(),
+            m[1].kbd("alice").bytes(),
+            m[2].infoResponse("a").bytes(),
+            m[3].infoResponse("b").bytes(),
+        });
+        self.push(&.{m[4].request("guest", "none").bytes()});
+        // Client side (the same stream read as the server's replies): the
+        // none probe's FAILURE, a password partial success, one
+        // INFO_REQUEST round, SUCCESS; and a bare SUCCESS to the probe.
+        var c: [4]Msg = undefined;
+        self.push(&.{
+            c[0].failure("password,keyboard-interactive", false).bytes(),
+            c[1].failure("keyboard-interactive", true).bytes(),
+            c[2].begin(messages.msg_userauth_info_request).str("").str("i").str("").int(1).str("Code: ").byte(1).bytes(),
+            c[3].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes(),
+        });
+        self.push(&.{m[5].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes()});
         return self.entries[0..self.n];
     }
 };
@@ -1269,7 +1962,7 @@ fn fuzzServeUserauth(_: void, smith: *std.testing.Smith) !void {
 }
 
 const fuzz_test = @import("fuzz_test.zig");
-const UserauthLabel = enum { failed, authenticated, replied };
+const UserauthLabel = enum { failed, authenticated, replied, client_failed, client_authenticated };
 const userauth_reach = fuzz_test.Reach(UserauthLabel);
 
 /// The harness body, generic over its source (`testing.fuzz` hands it a
@@ -1296,27 +1989,80 @@ fn serveUserauthHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
     var tr = transport.Transport.init(&r, &sink);
     tr.session_id = transport.SessionId.from("fuzz-session-id");
 
-    const res = serveUserauth(&tr, gpa, .{
-        .authorized_key = .{ .checkFn = struct {
-            fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
-                return true;
-            }
-        }.f },
-        .password = .{ .checkFn = struct {
-            fn f(_: *anyopaque, _: []const u8, _: []const u8) bool {
-                return true;
-            }
-        }.f },
-    }) catch {
-        userauth_reach.mark(.failed);
+    var policy: FuzzPolicy = .{};
+    server: {
+        const res = serveUserauth(&tr, gpa, policy.config()) catch {
+            userauth_reach.mark(.failed);
+            if (sink.buffered().len > 0) userauth_reach.mark(.replied);
+            break :server;
+        };
+        // A success must never carry a user name longer than the declared bound.
+        std.debug.assert(res.user().len <= max_user_len);
+        userauth_reach.mark(.authenticated);
         if (sink.buffered().len > 0) userauth_reach.mark(.replied);
-        return;
-    };
-    // A success must never carry a user name longer than the declared bound.
-    std.debug.assert(res.user().len <= max_user_len);
-    userauth_reach.mark(.authenticated);
-    if (sink.buffered().len > 0) userauth_reach.mark(.replied);
+    }
+
+    // The same stream as a SERVER's replies to our client: FAILURE
+    // name-lists and partial-success flags, PK_OK, INFO_REQUEST rounds,
+    // BANNER, through `authenticateWith`'s method choice.
+    var cr: std.Io.Reader = .fixed(framed);
+    var csink_buf: [8192]u8 = undefined;
+    var csink: std.Io.Writer = .fixed(&csink_buf);
+    var ct = transport.Transport.init(&cr, &csink);
+    ct.session_id = transport.SessionId.from("fuzz-session-id");
+    const key: AuthKey = .{ .ed25519 = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(5))) catch unreachable };
+    var answers: AnswerAll = .{ .answer = "a" };
+    var progress: AuthProgress = .{};
+    if (authenticateWith(&ct, gpa, "alice", &.{
+        .{ .publickey = &.{&key} },
+        .{ .password = "pw" },
+        .{ .keyboard_interactive = .{ .ctx = &answers, .respondFn = AnswerAll.respond } },
+    }, .{ .request_service = false, .progress = &progress })) |_| {
+        std.debug.assert(progress.succeeded != null);
+        userauth_reach.mark(.client_authenticated);
+    } else |_| {
+        std.debug.assert(progress.succeeded == null);
+        std.debug.assert(progress.steps <= max_client_auth_steps);
+        userauth_reach.mark(.client_failed);
+    }
 }
+
+/// The fuzz targets' server policy: every key and every password but one
+/// accepted (as before 2026-11-15); the password "partial" is a partial
+/// success that continues with two keyboard-interactive rounds ("a", "b");
+/// `none` admits the user "guest".
+const FuzzPolicy = struct {
+    next: AuthCallbacks = .{},
+
+    fn config(self: *FuzzPolicy) AuthConfig {
+        self.next = .{ .keyboard_interactive = .{ .decideFn = kbd } };
+        return .{
+            .authorized_key = .{ .checkFn = struct {
+                fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
+                    return true;
+                }
+            }.f },
+            .callbacks = .{ .password = .{ .ctx = self, .decideFn = password } },
+            .no_client_auth = true,
+            .no_client_auth_callback = .{ .decideFn = none },
+        };
+    }
+    fn password(ctx: *anyopaque, _: *const AuthRequest, pw: []const u8) Decision {
+        const self: *FuzzPolicy = @ptrCast(@alignCast(ctx));
+        return if (std.mem.eql(u8, pw, "partial")) .{ .partial = &self.next } else Decision.accepted;
+    }
+    fn kbd(_: *anyopaque, _: *const AuthRequest, p: *KbdPrompter) Decision {
+        for ([_][]const u8{ "a", "b" }) |want| {
+            var a: [1][]const u8 = undefined;
+            if (!p.challenge("", "", &.{.{ .text = "Code: ", .echo = true }}, &a)) return .reject;
+            if (!std.mem.eql(u8, a[0], want)) return .reject;
+        }
+        return Decision.accepted;
+    }
+    fn none(_: *anyopaque, req: *const AuthRequest) Decision {
+        return if (std.mem.eql(u8, req.user, "guest")) Decision.accepted else .reject;
+    }
+};
 
 fn driveUserauth(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var corpus: UserauthCorpus = .{};
@@ -1362,18 +2108,8 @@ test "corpus: the serveUserauth seeds deliver real requests, and the counts are 
         var sink: std.Io.Writer = .fixed(&sink_buf);
         var tr = transport.Transport.init(&r, &sink);
         tr.session_id = transport.SessionId.from("fuzz-session-id");
-        const res = serveUserauth(&tr, std.testing.allocator, .{
-            .authorized_key = .{ .checkFn = struct {
-                fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
-                    return true;
-                }
-            }.f },
-            .password = .{ .checkFn = struct {
-                fn f(_: *anyopaque, _: []const u8, _: []const u8) bool {
-                    return true;
-                }
-            }.f },
-        }) catch {
+        var policy: FuzzPolicy = .{};
+        const res = serveUserauth(&tr, std.testing.allocator, policy.config()) catch {
             reply_octets += sink.buffered().len;
             continue;
         };
@@ -1381,13 +2117,14 @@ test "corpus: the serveUserauth seeds deliver real requests, and the counts are 
         authenticated += 1;
         reply_octets += sink.buffered().len;
     }
-    try std.testing.expectEqual(@as(usize, 7), delivered);
-    try std.testing.expectEqual(@as(usize, 1), authenticated);
+    try std.testing.expectEqual(@as(usize, 17), delivered);
+    // The password, the partial-success two-step and `guest`'s `none`.
+    try std.testing.expectEqual(@as(usize, 3), authenticated);
     // 192 since the transport answers an unrecognized message number itself
     // (RFC 4253 §11.4): the `0x00` seed now earns one SSH_MSG_UNIMPLEMENTED
     // (16 octets framed) and the stream continues, where it used to end in
     // a 56-octet DISCONNECT.
-    try std.testing.expectEqual(@as(usize, 192), reply_octets);
+    try std.testing.expectEqual(@as(usize, 456), reply_octets);
 }
 
 test "serveUserauth: an oversize peer string is a typed error, not a panic" {
@@ -1578,17 +2315,15 @@ test "servePublickey: an ed25519 key blob, its OWN valid signature, wrapped in a
     var tr = transport.Transport.init(&dummy_in, &dummy_out);
 
     var c = Cursor{ .b = rw.buffered() };
-    const outcome = try servePublickey(&tr, &c, user, connection_service, session_id, .{
-        .authorized_key = .{ .checkFn = struct {
-            fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
-                return true;
-            }
-        }.f },
-    });
+    const outcome = try servePublickey(&tr, &c, &.{ .user = user, .completed = .empty, .session_id = session_id }, connection_service, .{ .check = .{ .checkFn = struct {
+        fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
+            return true;
+        }
+    }.f } });
     // Not merely "refused": refused for the RIGHT reason — the blob-type
     // cross-check, which is the one thing standing between this forged
     // request and a successful login.
-    try t.expectEqual(AuthFailure.algorithm_mismatch, outcome.failure);
+    try t.expectEqual(AuthFailure.algorithm_mismatch, outcome.rejected);
 }
 
 test "delivered DoS-limit defaults are pinned to their documented values" {
@@ -1604,7 +2339,9 @@ test "delivered DoS-limit defaults are pinned to their documented values" {
     try t.expectEqual(@as(usize, 4 * 1024), max_key_blob_len);
     try t.expectEqual(@as(usize, 4 * 1024), max_signature_len);
     try t.expectEqual(@as(usize, 8 * 1024), max_banner_len);
-    try t.expectEqual(@as(u32, 20), (AuthConfig{}).max_attempts);
+    try t.expectEqual(@as(u32, 6), (AuthConfig{}).max_attempts);
+    try t.expectEqual(@as(u32, 128), max_auth_requests);
+    try t.expectEqual(@as(u32, 64), max_client_auth_steps);
 }
 
 // ── the policy seam: caller context, and the reason a refusal happened ─────
@@ -1763,9 +2500,10 @@ test "serveUserauth reports WHY it refused, which the wire deliberately cannot" 
     // `authorized_key` hook installed), and the conventional §5.2 `"none"`
     // probe, are both "nothing you offered is on the menu".
     {
+        // Twice: the first `none` probe is free (Go, OpenSSH).
+        var m: [2]Msg = undefined;
         var wire: [512]u8 = undefined;
-        var payload: [256]u8 = undefined;
-        const framed = try frameAuthRequest(&wire, &payload, "none", "");
+        const framed = try framePackets(&wire, &.{ m[0].request("alice", "none").bytes(), m[1].request("alice", "none").bytes() });
         var why: AuthFailure = .bad_signature;
         try t.expectError(error.AuthenticationFailed, runServeUserauth(framed, .{
             .password = refusing.hook(),
@@ -1853,10 +2591,10 @@ test "AuthorizedKeyCheck: the caller's context decides, and its refusal is named
         var dummy_out: std.Io.Writer = .fixed(&dummy_out_buf);
         var tr = transport.Transport.init(&dummy_in, &dummy_out);
         var c = Cursor{ .b = rw.buffered() };
-        const outcome = try servePublickey(&tr, &c, "alice", connection_service, "session", .{
-            .authorized_key = .{ .ctx = &policy, .checkFn = KeyPolicy.f },
+        const outcome = try servePublickey(&tr, &c, &.{ .user = "alice", .completed = .empty, .session_id = "session" }, connection_service, .{
+            .check = .{ .ctx = &policy, .checkFn = KeyPolicy.f },
         });
-        try t.expectEqual(PublickeyOutcome.pk_ok_sent, outcome);
+        try t.expectEqual(Step.pk_ok_sent, outcome);
         try t.expectEqual(@as(usize, 1), policy.calls);
         // …and the hook was told who and with what, not just shown a blob.
         try t.expectEqualStrings("alice", policy.seen_user);
@@ -1870,9 +2608,554 @@ test "AuthorizedKeyCheck: the caller's context decides, and its refusal is named
         var dummy_out: std.Io.Writer = .fixed(&dummy_out_buf);
         var tr = transport.Transport.init(&dummy_in, &dummy_out);
         var c = Cursor{ .b = rw.buffered() };
-        const outcome = try servePublickey(&tr, &c, "alice", connection_service, "session", .{
-            .authorized_key = .{ .ctx = &policy, .checkFn = KeyPolicy.f },
+        const outcome = try servePublickey(&tr, &c, &.{ .user = "alice", .completed = .empty, .session_id = "session" }, connection_service, .{
+            .check = .{ .ctx = &policy, .checkFn = KeyPolicy.f },
         });
-        try t.expectEqual(AuthFailure.unauthorized_key, outcome.failure);
+        try t.expectEqual(AuthFailure.unauthorized_key, outcome.rejected);
     }
+}
+
+// ── auth orchestration: multi-step server, method-chaining client ──────────
+
+/// One hand-built message for a canned stream. Must not move after `begin`.
+const Msg = struct {
+    buf: [1024]u8 = undefined,
+    w: std.Io.Writer = undefined,
+
+    fn begin(self: *Msg, t: u8) *Msg {
+        self.w = .fixed(&self.buf);
+        self.w.writeByte(t) catch unreachable;
+        return self;
+    }
+    fn str(self: *Msg, s: []const u8) *Msg {
+        messages.writeString(&self.w, s) catch unreachable;
+        return self;
+    }
+    fn byte(self: *Msg, b: u8) *Msg {
+        self.w.writeByte(b) catch unreachable;
+        return self;
+    }
+    fn int(self: *Msg, v: u32) *Msg {
+        var nb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &nb, v, .big);
+        self.w.writeAll(&nb) catch unreachable;
+        return self;
+    }
+    fn bytes(self: *Msg) []const u8 {
+        return self.w.buffered();
+    }
+    /// SSH_MSG_USERAUTH_REQUEST header for `user`/`method`.
+    fn request(self: *Msg, user: []const u8, method: []const u8) *Msg {
+        return self.begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST))
+            .str(user).str(connection_service).str(method);
+    }
+    fn password(self: *Msg, user: []const u8, pw: []const u8) *Msg {
+        return self.request(user, "password").byte(0).str(pw);
+    }
+    fn kbd(self: *Msg, user: []const u8) *Msg {
+        return self.request(user, "keyboard-interactive").str("").str("");
+    }
+    fn infoResponse(self: *Msg, answer: []const u8) *Msg {
+        return self.begin(messages.msg_userauth_info_response).int(1).str(answer);
+    }
+    fn failure(self: *Msg, list: []const u8, partial: bool) *Msg {
+        return self.begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_FAILURE)).str(list).byte(@intFromBool(partial));
+    }
+};
+
+/// The payloads of the plaintext packets in `wire`, each in its own 512-byte
+/// slot of `store`.
+fn replyPayloads(wire: []const u8, store: [][512]u8) ![]const []const u8 {
+    const S = struct {
+        var out: [64][]const u8 = undefined;
+    };
+    var r: std.Io.Reader = .fixed(wire);
+    var cipher: transport.CipherState = .plaintext;
+    var n: usize = 0;
+    while (r.seek < r.end) : (n += 1) {
+        const p = try transport.readPacket(&r, &cipher, &store[n]);
+        S.out[n] = p.payload;
+    }
+    return S.out[0..n];
+}
+
+/// `serveUserauth` over `payloads`, the server's replies left in `sink`.
+fn serveCanned(payloads: []const []const u8, sink: *std.Io.Writer, config: AuthConfig) !AuthResult {
+    var wire: [32 * 1024]u8 = undefined;
+    const framed = try framePackets(&wire, payloads);
+    var r: std.Io.Reader = .fixed(framed);
+    var tr = transport.Transport.init(&r, sink);
+    tr.session_id = transport.SessionId.from("session");
+    return serveUserauth(&tr, std.testing.allocator, config);
+}
+
+const TwoStep = struct {
+    next: AuthCallbacks = .{},
+    perms: [1]Permissions.Option = .{.{ .name = "force-command", .value = "/bin/true" }},
+    kbd_saw_completed: bool = false,
+
+    fn init(self: *TwoStep) void {
+        self.next = .{ .keyboard_interactive = .{ .ctx = self, .decideFn = kbd } };
+    }
+    fn password(ctx: *anyopaque, _: *const AuthRequest, pw: []const u8) Decision {
+        const self: *TwoStep = @ptrCast(@alignCast(ctx));
+        if (!std.mem.eql(u8, pw, "hunter2")) return .reject;
+        return .{ .partial = &self.next };
+    }
+    fn kbd(ctx: *anyopaque, req: *const AuthRequest, p: *KbdPrompter) Decision {
+        const self: *TwoStep = @ptrCast(@alignCast(ctx));
+        self.kbd_saw_completed = req.completed.contains(.password);
+        var a1: [1][]const u8 = undefined;
+        if (!p.challenge("", "round one", &.{.{ .text = "Code: ", .echo = true }}, &a1)) return .reject;
+        if (!std.mem.eql(u8, a1[0], "111")) return .reject;
+        var a2: [1][]const u8 = undefined;
+        if (!p.challenge("", "round two", &.{.{ .text = "Again: ", .echo = false }}, &a2)) return .reject;
+        if (!std.mem.eql(u8, a2[0], "222")) return .reject;
+        return .{ .accept = .{ .critical_options = &self.perms } };
+    }
+    fn config(self: *TwoStep) AuthConfig {
+        return .{ .callbacks = .{ .password = .{ .ctx = self, .decideFn = password } } };
+    }
+};
+
+test "serveUserauth: partial success, then a two-round keyboard-interactive, grants the final step's permissions" {
+    const t = std.testing;
+    var two: TwoStep = .{};
+    two.init();
+    var m: [4]Msg = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    const res = try serveCanned(&.{
+        m[0].password("alice", "hunter2").bytes(),
+        m[1].kbd("alice").bytes(),
+        m[2].infoResponse("111").bytes(),
+        m[3].infoResponse("222").bytes(),
+    }, &sink, two.config());
+    try t.expectEqual(AuthMethod.keyboard_interactive, res.method);
+    try t.expect(res.completed.contains(.password));
+    try t.expectEqual(@as(usize, 1), res.completed.count());
+    try t.expectEqualStrings("/bin/true", res.permissions.criticalOption("force-command").?);
+    try t.expectEqual(@as(?[]const u8, null), res.permissions.extension("permit-pty"));
+    try t.expect(two.kbd_saw_completed);
+
+    // The wire: FAILURE(keyboard-interactive, partial=TRUE), two
+    // INFO_REQUESTs, SUCCESS.
+    var store: [8][512]u8 = undefined;
+    const replies = try replyPayloads(sink.buffered(), &store);
+    try t.expectEqual(@as(usize, 4), replies.len);
+    const f = try parseFailure(replies[0]);
+    try t.expect(f.partial);
+    try t.expect(f.allowed.contains(.keyboard_interactive) and f.allowed.count() == 1);
+    try t.expectEqual(messages.msg_userauth_info_request, replies[1][0]);
+    try t.expectEqual(messages.msg_userauth_info_request, replies[2][0]);
+    try t.expectEqual(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS), replies[3][0]);
+}
+
+test "serveUserauth: a wrong second-round answer refuses, and the user may not change after a partial success" {
+    const t = std.testing;
+    var two: TwoStep = .{};
+    two.init();
+    var why: AuthFailure = .peer_disconnected;
+    var cfg = two.config();
+    cfg.failure = &why;
+    cfg.max_attempts = 1;
+    {
+        var m: [4]Msg = undefined;
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try t.expectError(error.AuthenticationFailed, serveCanned(&.{
+            m[0].password("alice", "hunter2").bytes(),
+            m[1].kbd("alice").bytes(),
+            m[2].infoResponse("111").bytes(),
+            m[3].infoResponse("999").bytes(),
+        }, &sink, cfg));
+        try t.expectEqual(AuthFailure.wrong_answers, why);
+    }
+    {
+        var m: [2]Msg = undefined;
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try t.expectError(error.ProtocolError, serveCanned(&.{
+            m[0].password("alice", "hunter2").bytes(),
+            m[1].kbd("mallory").bytes(),
+        }, &sink, two.config()));
+    }
+}
+
+test "serveUserauth: a client that abandons keyboard-interactive for another request is served that request" {
+    // RFC 4252 §5: "the server MUST abandon the previous authentication
+    // attempt and continue with the new one". No FAILURE for the dropped
+    // dialogue; it counts as one failed attempt.
+    const t = std.testing;
+    var accepting: PasswordPolicy = .{ .accepts = "hunter2" };
+    var rec: RejectionRecorder = .{};
+    var m: [2]Msg = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    const res = try serveCanned(&.{
+        m[0].kbd("alice").bytes(),
+        m[1].password("alice", "hunter2").bytes(),
+    }, &sink, .{
+        .password = accepting.hook(),
+        .keyboard_interactive = .{ .prompts = &.{.{ .text = "Code: ", .echo = true }}, .checkFn = struct {
+            fn f(_: *anyopaque, _: []const u8, _: []const []const u8) bool {
+                return true;
+            }
+        }.f },
+        .on_rejected = rec.handler(),
+    });
+    try t.expectEqual(AuthMethod.password, res.method);
+    try t.expectEqual(@as(usize, 1), rec.calls);
+    try t.expectEqual(AuthFailure.wrong_answers, rec.last_reason.?);
+    var store: [4][512]u8 = undefined;
+    const replies = try replyPayloads(sink.buffered(), &store);
+    try t.expectEqual(@as(usize, 2), replies.len);
+    try t.expectEqual(messages.msg_userauth_info_request, replies[0][0]);
+    try t.expectEqual(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS), replies[1][0]);
+}
+
+test "serveUserauth: none — accepted only under no_client_auth, the first probe free, never after a partial success" {
+    const t = std.testing;
+    var accepting: PasswordPolicy = .{ .accepts = "hunter2" };
+    // NoClientAuth.
+    {
+        var m: [1]Msg = undefined;
+        var sink_buf: [1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        const res = try serveCanned(&.{m[0].request("alice", "none").bytes()}, &sink, .{ .no_client_auth = true });
+        try t.expectEqual(AuthMethod.none, res.method);
+        try t.expectEqualStrings("alice", res.user());
+    }
+    // NoClientAuthCallback refusing: the probe is then an ordinary miss.
+    {
+        var m: [2]Msg = undefined;
+        var sink_buf: [1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        const res = try serveCanned(&.{ m[0].request("alice", "none").bytes(), m[1].password("alice", "hunter2").bytes() }, &sink, .{
+            .password = accepting.hook(),
+            .no_client_auth = true,
+            .no_client_auth_callback = .{ .decideFn = struct {
+                fn f(_: *anyopaque, req: *const AuthRequest) Decision {
+                    return if (std.mem.eql(u8, req.user, "guest")) Decision.accepted else .reject;
+                }
+            }.f },
+            .max_attempts = 1,
+        });
+        try t.expectEqual(AuthMethod.password, res.method);
+    }
+    // The first `none` costs nothing (max_attempts = 1 still lets the
+    // password through); a second one does.
+    {
+        var m: [2]Msg = undefined;
+        var sink_buf: [1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        _ = try serveCanned(&.{ m[0].request("alice", "none").bytes(), m[1].password("alice", "hunter2").bytes() }, &sink, .{ .password = accepting.hook(), .max_attempts = 1 });
+    }
+    {
+        var m: [3]Msg = undefined;
+        var sink_buf: [1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try t.expectError(error.AuthenticationFailed, serveCanned(&.{
+            m[0].request("alice", "none").bytes(),
+            m[1].request("alice", "none").bytes(),
+            m[2].password("alice", "hunter2").bytes(),
+        }, &sink, .{ .password = accepting.hook(), .max_attempts = 1 }));
+    }
+    // After a partial success `none` is refused even under no_client_auth.
+    {
+        var two: TwoStep = .{};
+        two.init();
+        var cfg = two.config();
+        cfg.no_client_auth = true;
+        cfg.max_attempts = 1;
+        var m: [2]Msg = undefined;
+        var sink_buf: [1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        // Refused (the stream then ends), where before the partial success
+        // it would have logged in.
+        try t.expectError(error.EndOfStream, serveCanned(&.{
+            m[0].password("alice", "hunter2").bytes(),
+            m[1].request("alice", "none").bytes(),
+        }, &sink, cfg));
+    }
+}
+
+test "serveUserauth: every request counts against max_auth_requests, publickey queries included" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var blob_buf: [128]u8 = undefined;
+    const blob = UserauthCorpus.ed25519Blob(&blob_buf);
+    var m: Msg = undefined;
+    const query = m.request("alice", "publickey").byte(0).str("ssh-ed25519").str(blob).bytes();
+    const payloads = try gpa.alloc([]const u8, max_auth_requests + 2);
+    defer gpa.free(payloads);
+    for (payloads) |*p| p.* = query;
+    const wire = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(wire);
+    const framed = try framePackets(wire, payloads);
+    const sink_buf = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(sink_buf);
+    var sink: std.Io.Writer = .fixed(sink_buf);
+    var r: std.Io.Reader = .fixed(framed);
+    var tr = transport.Transport.init(&r, &sink);
+    tr.session_id = transport.SessionId.from("session");
+    try t.expectError(error.AuthenticationFailed, serveUserauth(&tr, gpa, .{ .authorized_key = .{ .checkFn = struct {
+        fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
+            return true;
+        }
+    }.f } }));
+    // Exactly max_auth_requests queries were answered; the rest unread.
+    try t.expect(r.seek < r.end);
+}
+
+test "serveUserauth: a configuration that cannot work is refused before reading" {
+    const t = std.testing;
+    var accepting: PasswordPolicy = .{ .accepts = "x" };
+    var sink_buf: [1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    try t.expectError(error.InvalidAuthConfig, serveCanned(&.{}, &sink, .{}));
+    try t.expectError(error.InvalidAuthConfig, serveCanned(&.{}, &sink, .{
+        .password = accepting.hook(),
+        .callbacks = .{ .password = .{ .decideFn = struct {
+            fn f(_: *anyopaque, _: *const AuthRequest, _: []const u8) Decision {
+                return .reject;
+            }
+        }.f } },
+    }));
+    // A partial success that leaves nothing to continue with.
+    const empty: AuthCallbacks = .{};
+    const Ctx = struct {
+        var next: *const AuthCallbacks = undefined;
+        fn f(_: *anyopaque, _: *const AuthRequest, _: []const u8) Decision {
+            return .{ .partial = next };
+        }
+    };
+    Ctx.next = &empty;
+    var m: [1]Msg = undefined;
+    try t.expectError(error.InvalidAuthConfig, serveCanned(&.{m[0].password("alice", "x").bytes()}, &sink, .{
+        .callbacks = .{ .password = .{ .decideFn = Ctx.f } },
+    }));
+}
+
+/// `authenticateWith` over canned server replies; the client's requests
+/// left in `sink`.
+fn clientCanned(replies: []const []const u8, sink: *std.Io.Writer, methods: []const ClientMethod, progress: *AuthProgress) UserauthError!void {
+    var wire: [16 * 1024]u8 = undefined;
+    const framed = framePackets(&wire, replies) catch unreachable;
+    var r: std.Io.Reader = .fixed(framed);
+    var tr = transport.Transport.init(&r, sink);
+    tr.session_id = transport.SessionId.from("session");
+    return authenticateWith(&tr, std.testing.allocator, "alice", methods, .{ .request_service = false, .progress = progress });
+}
+
+/// The method names of the USERAUTH_REQUESTs in `wire`.
+fn requestMethods(wire: []const u8, store: [][512]u8, out: [][]const u8) ![]const []const u8 {
+    const payloads = try replyPayloads(wire, store);
+    var n: usize = 0;
+    for (payloads) |p| {
+        if (p[0] != @backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST)) continue;
+        var c = Cursor{ .b = p[1..] };
+        _ = try c.string();
+        _ = try c.string();
+        out[n] = try c.string();
+        n += 1;
+    }
+    return out[0..n];
+}
+
+const AnswerAll = struct {
+    answer: []const u8,
+    rounds: usize = 0,
+    fn respond(ctx: *anyopaque, _: *const KbdChallenge, answers: [][]const u8) bool {
+        const self: *AnswerAll = @ptrCast(@alignCast(ctx));
+        self.rounds += 1;
+        for (answers) |*a| a.* = self.answer;
+        return true;
+    }
+};
+
+test "authenticateWith: none probe, then the server's list, partial success, then the next method" {
+    const t = std.testing;
+    var answers: AnswerAll = .{ .answer = "111" };
+    var m: [4]Msg = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var progress: AuthProgress = .{};
+    try clientCanned(&.{
+        m[0].failure("password,keyboard-interactive,hostbased", false).bytes(),
+        m[1].failure("keyboard-interactive", true).bytes(),
+        m[2].begin(messages.msg_userauth_info_request).str("").str("").str("").int(1).str("Code: ").byte(1).bytes(),
+        m[3].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes(),
+    }, &sink, &.{
+        .{ .password = "hunter2" },
+        .{ .keyboard_interactive = .{ .ctx = &answers, .respondFn = AnswerAll.respond } },
+    }, &progress);
+    try t.expectEqual(@as(?AuthMethod, .keyboard_interactive), progress.succeeded);
+    try t.expect(progress.partial.contains(.password));
+    try t.expect(progress.tried.contains(.none));
+    try t.expectEqual(@as(usize, 1), answers.rounds);
+    var store: [8][512]u8 = undefined;
+    var names: [8][]const u8 = undefined;
+    const sent = try requestMethods(sink.buffered(), &store, &names);
+    try t.expectEqual(@as(usize, 3), sent.len);
+    try t.expectEqualStrings("none", sent[0]);
+    try t.expectEqualStrings("password", sent[1]);
+    try t.expectEqualStrings("keyboard-interactive", sent[2]);
+}
+
+test "authenticateWith: the caller's order decides, among the methods the server lists" {
+    // Go `ClientConfig.Auth`, OpenSSH `PreferredAuthentications`: the
+    // server's list says what may be tried, the caller's list in what order.
+    const t = std.testing;
+    var answers: AnswerAll = .{ .answer = "111" };
+    var m: [3]Msg = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var progress: AuthProgress = .{};
+    try clientCanned(&.{
+        m[0].failure("password,keyboard-interactive", false).bytes(),
+        m[1].begin(messages.msg_userauth_info_request).str("").str("").str("").int(0).bytes(),
+        m[2].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes(),
+    }, &sink, &.{
+        .{ .keyboard_interactive = .{ .ctx = &answers, .respondFn = AnswerAll.respond } },
+        .{ .password = "hunter2" },
+    }, &progress);
+    try t.expectEqual(@as(?AuthMethod, .keyboard_interactive), progress.succeeded);
+    // A no-prompt round is answered with no answers.
+    try t.expectEqual(@as(usize, 1), answers.rounds);
+}
+
+const CountingPrompt = struct {
+    calls: usize = 0,
+    fn prompt(ctx: *anyopaque, _: []const u8, buf: []u8) ?usize {
+        const self: *CountingPrompt = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        const pw = "hunter2";
+        @memcpy(buf[0..pw.len], pw);
+        return pw.len;
+    }
+};
+
+test "authenticateWith: a retryable method is asked again after a plain failure, up to max_tries" {
+    const t = std.testing;
+    {
+        var p: CountingPrompt = .{};
+        const inner: ClientMethod = .{ .password_prompt = .{ .ctx = &p, .promptFn = CountingPrompt.prompt } };
+        var m: [3]Msg = undefined;
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var progress: AuthProgress = .{};
+        try clientCanned(&.{
+            m[0].failure("password", false).bytes(),
+            m[1].failure("password", false).bytes(),
+            m[2].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes(),
+        }, &sink, &.{.{ .retryable = .{ .method = &inner } }}, &progress);
+        try t.expectEqual(@as(usize, 2), p.calls);
+        try t.expectEqual(@as(?AuthMethod, .password), progress.succeeded);
+    }
+    {
+        var p: CountingPrompt = .{};
+        const inner: ClientMethod = .{ .password_prompt = .{ .ctx = &p, .promptFn = CountingPrompt.prompt } };
+        var m: [4]Msg = undefined;
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var progress: AuthProgress = .{};
+        try t.expectError(error.AuthenticationFailed, clientCanned(&.{
+            m[0].failure("password", false).bytes(),
+            m[1].failure("password", false).bytes(),
+            m[2].failure("password", false).bytes(),
+            m[3].failure("password", false).bytes(),
+        }, &sink, &.{.{ .retryable = .{ .method = &inner, .max_tries = 2 } }}, &progress));
+        try t.expectEqual(@as(usize, 2), p.calls);
+        try t.expect(progress.tried.contains(.password));
+    }
+    // Without the decorator a failed password is not tried again.
+    {
+        var m: [3]Msg = undefined;
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var progress: AuthProgress = .{};
+        try t.expectError(error.AuthenticationFailed, clientCanned(&.{
+            m[0].failure("password", false).bytes(),
+            m[1].failure("password", false).bytes(),
+            m[2].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes(),
+        }, &sink, &.{.{ .password = "x" }}, &progress));
+    }
+    // A retryable wrapping a retryable is refused up front.
+    {
+        const inner: ClientMethod = .{ .password = "x" };
+        const mid: ClientMethod = .{ .retryable = .{ .method = &inner } };
+        var sink_buf: [64]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var progress: AuthProgress = .{};
+        try t.expectError(error.InvalidAuthConfig, clientCanned(&.{}, &sink, &.{.{ .retryable = .{ .method = &mid } }}, &progress));
+    }
+}
+
+test "authenticateWith: several keys in order — only one the server answers PK_OK for is signed" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const k1: AuthKey = .{ .ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(1))) };
+    const k2: AuthKey = .{ .ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(2))) };
+    const blob1 = try k1.publicBlob(gpa);
+    defer gpa.free(blob1);
+    const blob2 = try k2.publicBlob(gpa);
+    defer gpa.free(blob2);
+    const pk_ok = @backingInt(messages.MessageType.SSH_MSG_USERAUTH_PK_OK);
+    const success = @backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS);
+    var store: [8][512]u8 = undefined;
+    var names: [8][]const u8 = undefined;
+    // Key 1 refused, key 2 accepted.
+    {
+        var m: [4]Msg = undefined;
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var progress: AuthProgress = .{};
+        try clientCanned(&.{
+            m[0].failure("publickey", false).bytes(),
+            m[1].failure("publickey", false).bytes(),
+            m[2].begin(pk_ok).str("ssh-ed25519").str(blob2).bytes(),
+            m[3].begin(success).bytes(),
+        }, &sink, &.{.{ .publickey = &.{ &k1, &k2 } }}, &progress);
+        try t.expectEqual(@as(?AuthMethod, .publickey), progress.succeeded);
+        try t.expectEqual(@as(usize, 4), (try requestMethods(sink.buffered(), &store, &names)).len);
+    }
+    // A PK_OK for another key is not a yes for this one: nothing is signed.
+    {
+        var m: [2]Msg = undefined;
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var progress: AuthProgress = .{};
+        try t.expectError(error.AuthenticationFailed, clientCanned(&.{
+            m[0].failure("publickey", false).bytes(),
+            m[1].begin(pk_ok).str("ssh-ed25519").str(blob2).bytes(),
+        }, &sink, &.{.{ .publickey = &.{&k1} }}, &progress));
+        try t.expectEqual(@as(usize, 2), (try requestMethods(sink.buffered(), &store, &names)).len);
+    }
+    // A server that drops publickey from its list is offered no further
+    // key; the next method on the list runs instead.
+    {
+        var m: [3]Msg = undefined;
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var progress: AuthProgress = .{};
+        try clientCanned(&.{
+            m[0].failure("publickey,password", false).bytes(),
+            m[1].failure("password", false).bytes(),
+            m[2].begin(success).bytes(),
+        }, &sink, &.{ .{ .publickey = &.{ &k1, &k2 } }, .{ .password = "x" } }, &progress);
+        try t.expectEqual(@as(?AuthMethod, .password), progress.succeeded);
+        const sent = try requestMethods(sink.buffered(), &store, &names);
+        try t.expectEqual(@as(usize, 3), sent.len);
+        try t.expectEqualStrings("password", sent[2]);
+    }
+}
+
+test "parseMethodList: known names only, unknown and empty ignored" {
+    const t = std.testing;
+    const s = parseMethodList("gssapi-with-mic,publickey,,keyboard-interactive,hostbased");
+    try t.expectEqual(@as(usize, 2), s.count());
+    try t.expect(s.contains(.publickey) and s.contains(.keyboard_interactive));
+    try t.expectEqual(@as(usize, 0), parseMethodList("").count());
+    for (std.enums.values(AuthMethod)) |m| try t.expectEqual(@as(?AuthMethod, m), AuthMethod.fromWire(m.wireName()));
 }

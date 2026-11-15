@@ -99,6 +99,12 @@ pub const SshdOptions = struct {
     authenticate: bool = true,
     /// `Transport.offer_strict_kex` for our client.
     strict: bool = true,
+    /// A second authorized client key (`Sshd.client_key2`), for
+    /// `AuthenticationMethods=publickey,publickey`.
+    second_key: bool = false,
+    /// `PasswordAuthentication=yes` (the base options say no; `sshd` keeps
+    /// the first value it reads, so an `extra` entry could not turn it on).
+    password_auth: bool = false,
 };
 
 /// A real `sshd` on a random loopback port and our client connected to it.
@@ -116,6 +122,7 @@ pub const Sshd = struct {
     t: transport.Transport = undefined,
     user: []const u8,
     client_key: userauth.AuthKey,
+    client_key2: userauth.AuthKey = undefined,
 
     pub fn start(gpa: std.mem.Allocator, io: std.Io, opts: SshdOptions) !*Sshd {
         const cwd = std.Io.Dir.cwd();
@@ -141,7 +148,24 @@ pub const Sshd = struct {
         defer gpa.free(ck_pub);
         const ak_path = try gpa.print("{s}/authorized_keys", .{dir_path});
         defer gpa.free(ak_path);
-        writeFile(io, ak_path, ck_pub) catch return error.SkipZigTest;
+        var client_key2: userauth.AuthKey = undefined;
+        if (opts.second_key) {
+            const ck2_path = try gpa.print("{s}/ck2", .{dir_path});
+            defer gpa.free(ck2_path);
+            try keygen(io, opts.client_key_type, ck2_path);
+            const ck2_pub_path = try gpa.print("{s}.pub", .{ck2_path});
+            defer gpa.free(ck2_pub_path);
+            const ck2_pub = cwd.readFileAlloc(io, ck2_pub_path, gpa, .limited(4096)) catch return error.SkipZigTest;
+            defer gpa.free(ck2_pub);
+            const both = try gpa.print("{s}{s}", .{ ck_pub, ck2_pub });
+            defer gpa.free(both);
+            writeFile(io, ak_path, both) catch return error.SkipZigTest;
+            const ck2_text = cwd.readFileAlloc(io, ck2_path, gpa, .limited(16384)) catch return error.SkipZigTest;
+            defer gpa.free(ck2_text);
+            userauth.AuthKey.fromOpenSSH(&client_key2, ck2_text, null) catch return error.SkipZigTest;
+        } else {
+            writeFile(io, ak_path, ck_pub) catch return error.SkipZigTest;
+        }
 
         const ck_text = cwd.readFileAlloc(io, ck_path, gpa, .limited(16384)) catch return error.SkipZigTest;
         defer gpa.free(ck_text);
@@ -170,7 +194,7 @@ pub const Sshd = struct {
             port_opt,                          "ListenAddress=127.0.0.1",
             "UsePAM=no",                       "StrictModes=no",
             "PidFile=none",                    "LogLevel=VERBOSE",
-            "PubkeyAuthentication=yes",        "PasswordAuthentication=no",
+            "PubkeyAuthentication=yes",        if (opts.password_auth) "PasswordAuthentication=yes" else "PasswordAuthentication=no",
             "KbdInteractiveAuthentication=no", ak_opt,
         };
         for (base) |o| try argv.appendSlice(gpa, &.{ "-o", o });
@@ -203,6 +227,7 @@ pub const Sshd = struct {
             .stream = stream,
             .user = user,
             .client_key = client_key,
+            .client_key2 = client_key2,
         };
         errdefer {
             self.stream.close(io);
@@ -259,6 +284,9 @@ pub const SshClientOptions = struct {
     /// answers each prompt by running this shell script (`$1` = the prompt)
     /// through `SSH_ASKPASS_REQUIRE=force`.
     askpass_script: ?[]const u8 = null,
+    /// The client's `-o` authentication options instead of the defaults
+    /// (publickey only, or keyboard-interactive only with `askpass_script`).
+    auth_options: ?[]const u8 = null,
 };
 
 /// A real `ssh` dialling our server; `start` returns after OUR server
@@ -328,7 +356,7 @@ pub const SshClient = struct {
             try fw.interface.flush();
             break :blk try std.mem.print(&auth_buf, "env SSH_ASKPASS={s} SSH_ASKPASS_REQUIRE=force", .{ap});
         } else "";
-        const methods = if (opts.askpass_script != null)
+        const methods = if (opts.auth_options) |o| o else if (opts.askpass_script != null)
             "-o PreferredAuthentications=keyboard-interactive -o BatchMode=no -o NumberOfPasswordPrompts=1"
         else
             "-o PreferredAuthentications=publickey -o BatchMode=yes";
@@ -982,6 +1010,7 @@ const info_handler: connection.CommandHandler = .{ .runInfoFn = struct {
         if (info.pty) |pty| try stdout.print(gpa, " pty={s}:{d}x{d}", .{ pty.term(), pty.cols, pty.rows });
         for (info.env) |e| try stdout.print(gpa, " env:{s}={s}", .{ e.name, e.value });
         if (stdin.len > 0) try stdout.print(gpa, " stdin={s}", .{stdin});
+        if (info.permissions.criticalOption("force-command")) |fc| try stdout.print(gpa, " force={s}", .{fc});
         try stdout.append(gpa, '\n');
         return 0;
     }
@@ -1249,4 +1278,304 @@ test "live: rekey_limit_bytes = 0 re-keys after every packet instead of looping"
     defer res.deinit(gpa);
     try std.testing.expectEqualStrings("zero", res.stdout);
     try std.testing.expect(fx.t.kex_count > 3);
+}
+
+// ── auth orchestration over loopback: our client ↔ our server ──────────────
+
+const LoopbackAuth = struct {
+    port: u16,
+    methods: []const userauth.ClientMethod,
+    progress: userauth.AuthProgress = .{},
+    err: ?anyerror = null,
+
+    fn run(self: *LoopbackAuth, io: std.Io) void {
+        self.client(io) catch |e| {
+            self.err = e;
+        };
+    }
+
+    fn client(self: *LoopbackAuth, io: std.Io) !void {
+        const gpa = std.testing.allocator;
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", self.port);
+        const stream = try addr.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        var rbuf: [32 * 1024]u8 = undefined;
+        var wbuf: [32 * 1024]u8 = undefined;
+        var sr = stream.reader(io, &rbuf);
+        var sw = stream.writer(io, &wbuf);
+        var t = try transport.connect(&sr.interface, &sw.interface, gpa, accept_any_host_key);
+        defer t.deinit();
+        try userauth.authenticateWith(&t, gpa, "alice", self.methods, .{ .progress = &self.progress });
+    }
+};
+
+const LoopbackAuthResult = struct {
+    progress: userauth.AuthProgress,
+    client_err: ?anyerror,
+    server: anyerror!userauth.AuthResult,
+};
+
+fn loopbackAuth(methods: []const userauth.ClientMethod, config: userauth.AuthConfig) !LoopbackAuthResult {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var port: u16 = 0;
+    var listener = try listenLoopback(io, &port);
+    defer listener.deinit(io);
+    var c: LoopbackAuth = .{ .port = port, .methods = methods };
+    const th = try std.Thread.spawn(.{}, LoopbackAuth.run, .{ &c, io });
+    var joined = false;
+    defer if (!joined) th.join();
+    const stream = try acceptBounded(io, &listener, 30_000);
+    var rbuf: [32 * 1024]u8 = undefined;
+    var wbuf: [32 * 1024]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    const keys = [_]server.HostKey{testHostKey(0x56)};
+    var t = server.accept(&sr.interface, &sw.interface, gpa, .{ .host_keys = &keys }) catch |e| {
+        stream.close(io);
+        return e;
+    };
+    const r = userauth.serveUserauth(&t, gpa, config);
+    t.deinit();
+    // Close before joining: a client still waiting for a reply after a
+    // refusal must see the end of the stream.
+    stream.close(io);
+    th.join();
+    joined = true;
+    return .{ .progress = c.progress, .client_err = c.err, .server = r };
+}
+
+/// Server policy: publickey with one key is a partial success; then two
+/// rounds of keyboard-interactive, granting a `force-command`.
+const TwoFactor = struct {
+    blob: []const u8,
+    kbd_next: userauth.AuthCallbacks = .{},
+    perms: [1]userauth.Permissions.Option = .{.{ .name = "force-command", .value = "uptime" }},
+
+    fn pk(ctx: *anyopaque, _: *const userauth.AuthRequest, _: []const u8, key_blob: []const u8) userauth.Decision {
+        const self: *TwoFactor = @ptrCast(@alignCast(ctx));
+        if (!std.mem.eql(u8, key_blob, self.blob)) return .reject;
+        return .{ .partial = &self.kbd_next };
+    }
+
+    fn kbd(ctx: *anyopaque, req: *const userauth.AuthRequest, p: *userauth.KbdPrompter) userauth.Decision {
+        const self: *TwoFactor = @ptrCast(@alignCast(ctx));
+        if (!req.completed.contains(.publickey)) return .reject;
+        var a: [1][]const u8 = undefined;
+        if (!p.challenge("", "first factor", &.{.{ .text = "Password: ", .echo = false }}, &a)) return .reject;
+        if (!std.mem.eql(u8, a[0], "correct horse")) return .reject;
+        if (!p.challenge("second factor", "", &.{.{ .text = "One-time code: ", .echo = true }}, &a)) return .reject;
+        if (!std.mem.eql(u8, a[0], "424242")) return .reject;
+        return .{ .accept = .{ .critical_options = &self.perms } };
+    }
+
+    fn config(self: *TwoFactor) userauth.AuthConfig {
+        self.kbd_next = .{ .keyboard_interactive = .{ .ctx = self, .decideFn = kbd } };
+        return .{ .callbacks = .{ .publickey = .{ .ctx = self, .decideFn = pk } } };
+    }
+};
+
+const TwoFactorAnswers = struct {
+    rounds: u32 = 0,
+    fn respond(ctx: *anyopaque, ch: *const userauth.KbdChallenge, answers: [][]const u8) bool {
+        const self: *TwoFactorAnswers = @ptrCast(@alignCast(ctx));
+        self.rounds += 1;
+        for (ch.prompts, answers) |p, *a| a.* = if (p.echo) "424242" else "correct horse";
+        return true;
+    }
+};
+
+test "loopback: partial success — a second key after a refused one, then two keyboard-interactive rounds" {
+    const gpa = std.testing.allocator;
+    const wrong = testHostKey(0x61);
+    const right = testHostKey(0x62);
+    const blob = try right.publicBlob(gpa);
+    defer gpa.free(blob);
+    var policy: TwoFactor = .{ .blob = blob };
+    var answers: TwoFactorAnswers = .{};
+    const r = try loopbackAuth(&.{
+        .{ .publickey = &.{ &wrong, &right } },
+        .{ .keyboard_interactive = .{ .ctx = &answers, .respondFn = TwoFactorAnswers.respond } },
+    }, policy.config());
+    if (r.client_err) |e| return e;
+    const res = try r.server;
+    try std.testing.expectEqual(userauth.AuthMethod.keyboard_interactive, res.method);
+    try std.testing.expect(res.completed.contains(.publickey));
+    try std.testing.expectEqualStrings("uptime", res.permissions.criticalOption("force-command").?);
+    try std.testing.expectEqual(@as(u32, 2), answers.rounds);
+    try std.testing.expect(r.progress.partial.contains(.publickey));
+    try std.testing.expectEqual(@as(?userauth.AuthMethod, .keyboard_interactive), r.progress.succeeded);
+}
+
+test "loopback: the second factor wrong — refused, and the client stops when nothing is left" {
+    const gpa = std.testing.allocator;
+    const right = testHostKey(0x62);
+    const blob = try right.publicBlob(gpa);
+    defer gpa.free(blob);
+    var policy: TwoFactor = .{ .blob = blob };
+    const Wrong = struct {
+        fn respond(_: *anyopaque, _: *const userauth.KbdChallenge, answers: [][]const u8) bool {
+            for (answers) |*a| a.* = "nope";
+            return true;
+        }
+    };
+    var cfg = policy.config();
+    var why: userauth.AuthFailure = .peer_disconnected;
+    cfg.failure = &why;
+    const r = try loopbackAuth(&.{
+        .{ .publickey = &.{&right} },
+        .{ .keyboard_interactive = .{ .respondFn = Wrong.respond } },
+    }, cfg);
+    try std.testing.expectEqual(@as(?anyerror, error.AuthenticationFailed), r.client_err);
+    try std.testing.expect(std.meta.isError(r.server));
+    try std.testing.expectEqual(userauth.AuthFailure.wrong_answers, why);
+    try std.testing.expect(r.progress.partial.contains(.publickey));
+    try std.testing.expect(r.progress.tried.contains(.keyboard_interactive));
+}
+
+test "loopback: no_client_auth — the none probe alone logs in" {
+    const r = try loopbackAuth(&.{}, .{ .no_client_auth = true });
+    if (r.client_err) |e| return e;
+    const res = try r.server;
+    try std.testing.expectEqual(userauth.AuthMethod.none, res.method);
+    try std.testing.expectEqual(@as(?userauth.AuthMethod, .none), r.progress.succeeded);
+}
+
+test "loopback: max_attempts ends a retrying client — the none probe is free, three wrong passwords are not" {
+    const Count = struct {
+        prompts: u32 = 0,
+        rejected: u32 = 0,
+        fn prompt(ctx: *anyopaque, _: []const u8, buf: []u8) ?usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.prompts += 1;
+            @memcpy(buf[0..5], "wrong");
+            return 5;
+        }
+        fn onRejected(ctx: *anyopaque, _: ?[]const u8, _: userauth.AuthFailure) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.rejected += 1;
+        }
+        fn check(_: *anyopaque, _: []const u8, _: []const u8) bool {
+            return false;
+        }
+    };
+    var count: Count = .{};
+    const inner: userauth.ClientMethod = .{ .password_prompt = .{ .ctx = &count, .promptFn = Count.prompt } };
+    const r = try loopbackAuth(&.{.{ .retryable = .{ .method = &inner, .max_tries = 0 } }}, .{
+        .password = .{ .checkFn = Count.check },
+        .max_attempts = 3,
+        .on_rejected = .{ .ctx = &count, .onFn = Count.onRejected },
+    });
+    try std.testing.expectError(error.AuthenticationFailed, r.server);
+    try std.testing.expect(r.client_err != null);
+    // none (free) + three passwords; the server stops reading after the third.
+    try std.testing.expectEqual(@as(u32, 4), count.rejected);
+    try std.testing.expect(count.prompts >= 3);
+}
+
+// ── auth orchestration against real OpenSSH ────────────────────────────────
+
+test "live: our client tries its keys in order — an unauthorized one first, then sshd's" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try Sshd.start(gpa, threaded.io(), .{ .authenticate = false });
+    defer fx.deinit();
+    const stranger = testHostKey(0x71);
+    var progress: userauth.AuthProgress = .{};
+    userauth.authenticateWith(&fx.t, gpa, fx.user, &.{.{ .publickey = &.{ &stranger, &fx.client_key } }}, .{ .progress = &progress }) catch |e| {
+        fx.dumpLog();
+        return e;
+    };
+    try std.testing.expectEqual(@as(?userauth.AuthMethod, .publickey), progress.succeeded);
+    // sshd answered the none probe with its list.
+    try std.testing.expect(progress.tried.contains(.none));
+    try std.testing.expect(progress.allowed.contains(.publickey));
+    var res = try connection.exec(&fx.t, gpa, "printf multikey", .{});
+    defer res.deinit(gpa);
+    try std.testing.expectEqualStrings("multikey", res.stdout);
+}
+
+test "live: sshd AuthenticationMethods=publickey,publickey — partial success, then the second key" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try Sshd.start(gpa, threaded.io(), .{
+        .authenticate = false,
+        .second_key = true,
+        .extra = &.{"AuthenticationMethods=publickey,publickey"},
+    });
+    defer fx.deinit();
+    var progress: userauth.AuthProgress = .{};
+    userauth.authenticateWith(&fx.t, gpa, fx.user, &.{.{ .publickey = &.{ &fx.client_key, &fx.client_key2 } }}, .{ .progress = &progress }) catch |e| {
+        fx.dumpLog();
+        return e;
+    };
+    try std.testing.expect(progress.partial.contains(.publickey));
+    try std.testing.expectEqual(@as(?userauth.AuthMethod, .publickey), progress.succeeded);
+    var res = try connection.exec(&fx.t, gpa, "printf twokeys", .{});
+    defer res.deinit(gpa);
+    try std.testing.expectEqualStrings("twokeys", res.stdout);
+}
+
+test "live: sshd AuthenticationMethods=publickey,password — the key is a partial success, the password is next" {
+    // A non-root sshd without PAM cannot check a password, so the second
+    // step fails here; what this pins is the protocol: sshd's FAILURE with
+    // partial success after the key, our client moving on to `password`
+    // because sshd now lists it, and a clean AuthenticationFailed at the end.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try Sshd.start(gpa, threaded.io(), .{
+        .authenticate = false,
+        .password_auth = true,
+        .extra = &.{"AuthenticationMethods=publickey,password"},
+    });
+    defer fx.deinit();
+    var progress: userauth.AuthProgress = .{};
+    const r = userauth.authenticateWith(&fx.t, gpa, fx.user, &.{
+        .{ .publickey = &.{&fx.client_key} },
+        .{ .password = "not-the-password" },
+    }, .{ .progress = &progress });
+    std.testing.expectError(error.AuthenticationFailed, r) catch |e| {
+        fx.dumpLog();
+        return e;
+    };
+    try std.testing.expect(progress.partial.contains(.publickey));
+    try std.testing.expect(progress.tried.contains(.password));
+    try std.testing.expect(progress.allowed.contains(.password));
+    try std.testing.expect(!progress.allowed.contains(.publickey));
+}
+
+test "live: a real ssh client through our two-step server — publickey (partial), then two keyboard-interactive rounds" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try SshClient.start(gpa, threaded.io(), .{
+        .askpass_script =
+        \\case "$1" in *Password*) echo 'correct horse';; *code*) echo 424242;; *) exit 1;; esac
+        ,
+        .auth_options = "-o PreferredAuthentications=publickey,keyboard-interactive -o BatchMode=no -o NumberOfPasswordPrompts=1",
+    });
+    defer fx.deinit();
+    var policy: TwoFactor = .{ .blob = fx.authorized_blob[0..fx.authorized_len] };
+    const auth = userauth.serveUserauth(&fx.t, gpa, policy.config()) catch |e| {
+        _ = fx.finish() catch null;
+        fx.dumpErr();
+        return e;
+    };
+    try std.testing.expectEqual(userauth.AuthMethod.keyboard_interactive, auth.method);
+    try std.testing.expect(auth.completed.contains(.publickey));
+    try connection.serveSession(&fx.t, gpa, .{
+        .user = auth.user(),
+        .permissions = auth.permissions,
+        .exec = info_handler,
+        .stdin_mode = .ignore,
+    });
+    const out = try fx.finish();
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "kind=exec cmd=uname -a"));
+    try std.testing.expect(std.mem.find(u8, out, " force=uptime") != null);
 }
