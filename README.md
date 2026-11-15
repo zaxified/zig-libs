@@ -17,7 +17,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 260 modules (Zig 0.17.1, tests green in `ReleaseSafe` and `ReleaseFast`)
+**Status:** 261 modules (Zig 0.17.1, tests green in `ReleaseSafe` and `ReleaseFast`)
 · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -289,7 +289,7 @@ those crypto and format modules are yours too without going looking.
 |---|---:|---|
 | `web` | 36 | [`netaddr`](modules/netaddr/README.md) (net) · [`zstd`](modules/zstd/README.md) (format) · [`entropy`](modules/entropy/README.md) (crypto) · [`rsa`](modules/rsa/README.md) (crypto) · [`regex`](modules/regex/README.md) (format) · [`protobuf`](modules/protobuf/README.md) (format) · [`p256`](modules/p256/README.md) (crypto) · [`keycodec`](modules/keycodec/README.md) (crypto) |
 | `net` | 75 | [`http`](modules/http/README.md) (web) · [`ramcache`](modules/ramcache/README.md) (storage) · [`resilience`](modules/resilience/README.md) (web) · [`kvtree`](modules/kvtree/README.md) (storage) · [`rsa`](modules/rsa/README.md) (crypto) · [`xml`](modules/xml/README.md) (web) · [`x509`](modules/x509/README.md) (crypto) · [`tlsclient`](modules/tlsclient/README.md) (crypto) · [`tlsserver`](modules/tlsserver/README.md) (crypto) · [`sphinx`](modules/sphinx/README.md) (crypto) · [`aesgcm`](modules/aesgcm/README.md) (crypto) |
-| `storage` | 16 | [`zstd`](modules/zstd/README.md) (format) · [`crc32`](modules/crc32/README.md) (format) · [`crc32c`](modules/crc32c/README.md) (format) · [`hashdigest`](modules/hashdigest/README.md) (crypto) |
+| `storage` | 17 | [`zstd`](modules/zstd/README.md) (format) · [`crc32`](modules/crc32/README.md) (format) · [`crc32c`](modules/crc32c/README.md) (format) · [`hashdigest`](modules/hashdigest/README.md) (crypto) |
 | `crypto` | 89 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
 | `format` | 29 | [`http`](modules/http/README.md) (web) · [`decimal`](modules/decimal/README.md) (storage) |
 | `os` | 15 | [`framing`](modules/framing/README.md) (format) |
@@ -302,7 +302,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 <!-- BEGIN GENERATED: check-portable-table (source: build.zig; regenerate with `zig build gen-portable-table`; do not hand-edit) -->
 ### Portability — claimed vs. verified
 
-Every one of the 260 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 260 modules — a linux64-only module has nothing further to show here.
+Every one of the 261 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 261 modules — a linux64-only module has nothing further to show here.
 
 47 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 57 declared pairs, 56 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 
@@ -529,6 +529,7 @@ Every one of the 260 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | [`kv`](modules/kv/README.md) | 1 | Crash-consistent embedded KV store, Bitcask-style log, with randomized fuzz-tested crash recovery. | any | clock |
 | [`kvtree`](modules/kvtree/README.md) | 1 | Ordered transactional KV store — copy-on-write B-tree (LMDB/BoltDB lineage), MVCC snapshots, crash-safe range scans. | any | kv, crc32 |
 | [`ramcache`](modules/ramcache/README.md) | 2 (S,P) | Bounded in-memory cache — W-TinyLFU admission/eviction, TTL, generation invalidation; sharded thread-safe wrapper. | any | — |
+| [`seglog`](modules/seglog/README.md) | 5 (H) | Segmented crash-consistent append-only log — CRC32C records with LSNs and timestamps, sealed closed segments, whole-segment retention. | any | kv, crc32c, zstd |
 | [`sort`](modules/sort/README.md) | 2 (P) | Fast in-place sorting: Rust's ipnsort as a drop-in for std.sort.pdq. | any (pure Zig, no allocation) | — |
 | [`trie`](modules/trie/README.md) | 1 | Prefix index for instant autocomplete over a large static string set. | any | — |
 | [`tsdb`](modules/tsdb/README.md) | 2 (S,A,P) | Time-series persistence over `kvtree` — ordered (series, timestamp) key codec, streaming range scans, Gorilla-compressed blocks, crash-safe retention by age or size budget. | any | kvtree, regex |
