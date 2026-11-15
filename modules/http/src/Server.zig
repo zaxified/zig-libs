@@ -8745,6 +8745,9 @@ test "on_error: a client that stops reading is reported as WriteTimeout" {
 const SummaryRec = struct {
     n: std.atomic.Value(u32) = .init(0),
     sum: ConnSummary = undefined,
+    /// Filled in by the test after the connection ended: the monotonic time
+    /// since the test began, an upper bound for any `sum.duration_ns`.
+    bound_ns: u64 = 0,
 
     fn record(ctx: ?*anyopaque, summary: ConnSummary) void {
         const r: *SummaryRec = @ptrCast(@alignCast(ctx.?));
@@ -8759,13 +8762,19 @@ const CloseHow = enum { server_cuts, client_closes, client_resets };
 /// `send` is written, `responses` answers are read back, then the connection
 /// ends as `how` says. Returns the summary once the connection task finished.
 fn summaryFor(send: []const u8, responses: usize, how: CloseHow) !SummaryRec {
+    return summaryForOpts(send, responses, how, false);
+}
+
+fn summaryForOpts(send: []const u8, responses: usize, how: CloseHow, h2c: bool) !SummaryRec {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
     var rec: SummaryRec = .{};
+    const began_ns = nowNs(io);
     {
         var server = init(io, testing.allocator, .{
             .handler = testHandler,
+            .enable_h2c = h2c,
             .read_timeout_ms = 150,
             .idle_timeout_ms = 150,
             .request_timeout_ms = 20_000,
@@ -8810,6 +8819,55 @@ fn summaryFor(send: []const u8, responses: usize, how: CloseHow) !SummaryRec {
         }
         try waitNoConns(io, &server);
     }
+    rec.bound_ns = nowNs(io) - began_ns;
+    return rec;
+}
+
+/// The summary of one `/big` response that the client never reads: it either
+/// leaves the server's write to hit `write_timeout_ms`, or resets the socket
+/// while the server is blocked in that write.
+fn bigSummary(write_timeout_ms: u32, reset: bool) !SummaryRec {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var rec: SummaryRec = .{};
+    const began_ns = nowNs(io);
+    {
+        var server = init(io, testing.allocator, .{
+            .handler = bigHandler,
+            .write_timeout_ms = write_timeout_ms,
+            .on_conn_closed = SummaryRec.record,
+            .on_conn_closed_ctx = &rec,
+        });
+        defer server.deinit();
+        server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+        defer thread.join();
+        defer server.shutdown();
+        {
+            const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+                return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+            defer stream.close(io);
+            const small = std.mem.toBytes(@as(c_int, 2048));
+            std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &small) catch {};
+            var wbuf: [256]u8 = undefined;
+            var sw = stream.writer(io, &wbuf);
+            try sw.interface.writeAll("GET /big HTTP/1.1\r\nHost: t\r\n\r\n");
+            try sw.interface.flush();
+            while (server.activeConnections() == 0) try sleepMs(io, 5);
+            if (reset) {
+                // Let the server fill the socket buffers and block in its write.
+                try sleepMs(io, 100);
+                const linger: extern struct { onoff: c_int, secs: c_int } = .{ .onoff = 1, .secs = 0 };
+                std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, &std.mem.toBytes(linger)) catch
+                    return testkit.loopbackSkip("SO_LINGER unavailable", .{});
+            } else {
+                try waitNoConns(io, &server);
+            }
+        }
+        try waitNoConns(io, &server);
+    }
+    rec.bound_ns = nowNs(io) - began_ns;
     return rec;
 }
 
@@ -8821,6 +8879,7 @@ test "on_conn_closed: keep-alive with 3 requests then a client close is normal, 
     try testing.expectEqual(@as(u64, 3), rec.sum.requests);
     try testing.expect(rec.sum.peer != null);
     try testing.expect(rec.sum.duration_ns > 0);
+    try testing.expect(rec.sum.duration_ns <= rec.bound_ns);
 }
 
 test "on_conn_closed: Connection: close after one request is normal" {
@@ -8842,7 +8901,134 @@ test "on_conn_closed: a deadline that ends the connection is timed_out, in every
         try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
         try testing.expectEqual(ConnEnd.timed_out, rec.sum.end);
         try testing.expectEqual(c.requests, rec.sum.requests);
+        // The deadline (150 ms) is what ended it: the duration spans it, and
+        // is measured from the start of serving, not from some epoch.
+        try testing.expect(rec.sum.duration_ns >= 100 * std.time.ns_per_ms);
+        try testing.expect(rec.sum.duration_ns <= rec.bound_ns);
     }
+}
+
+test "on_conn_closed: h2c enabled, a peer that sends nothing is timed_out, one that resets is errored (requests 0)" {
+    const stalled = try summaryForOpts("", 0, .server_cuts, true);
+    try testing.expectEqual(@as(u32, 1), stalled.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.timed_out, stalled.sum.end);
+    try testing.expectEqual(@as(u64, 0), stalled.sum.requests);
+    const reset = try summaryForOpts("", 0, .client_resets, true);
+    try testing.expectEqual(@as(u32, 1), reset.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.errored, reset.sum.end);
+    try testing.expectEqual(@as(u64, 0), reset.sum.requests);
+}
+
+test "on_conn_closed: a write stall is timed_out; a reset during the write is errored" {
+    const stalled = try bigSummary(150, false);
+    try testing.expectEqual(@as(u32, 1), stalled.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.timed_out, stalled.sum.end);
+    try testing.expectEqual(@as(u64, 1), stalled.sum.requests);
+    const reset = try bigSummary(20_000, true);
+    try testing.expectEqual(@as(u32, 1), reset.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.errored, reset.sum.end);
+    try testing.expectEqual(@as(u64, 1), reset.sum.requests);
+}
+
+/// A server whose `serve` task is canceled while one connection waits in a
+/// read (`big` false: idle after one answer) or is stuck in a write (`big`
+/// true: a `/big` response the client never reads). The summary it reports.
+fn canceledSummary(big: bool) !SummaryRec {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var rec: SummaryRec = .{};
+    {
+        var server = init(io, testing.allocator, .{
+            .handler = if (big) bigHandler else testHandler,
+            .read_timeout_ms = 20_000,
+            .idle_timeout_ms = 20_000,
+            .write_timeout_ms = 20_000,
+            .on_conn_closed = SummaryRec.record,
+            .on_conn_closed_ctx = &rec,
+        });
+        defer server.deinit();
+        server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        var serving = try io.concurrent(serveWrap, .{&server});
+        const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+            serving.cancel(io);
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+        };
+        defer stream.close(io);
+        const small = std.mem.toBytes(@as(c_int, 2048));
+        std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &small) catch {};
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [256]u8 = undefined;
+        var sr = stream.reader(io, &rbuf);
+        var sw = stream.writer(io, &wbuf);
+        sw.interface.writeAll(if (big) "GET /big HTTP/1.1\r\nHost: t\r\n\r\n" else "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n") catch |err| {
+            serving.cancel(io);
+            return err;
+        };
+        sw.interface.flush() catch |err| {
+            serving.cancel(io);
+            return err;
+        };
+        if (!big) expectHelloResponse(&sr.interface) catch |err| {
+            serving.cancel(io);
+            return err;
+        };
+        try sleepMs(io, 100); // the server is now blocked in its read / write
+        // Stop the accept loop first: `serve` then waits for its connection
+        // tasks, and a cancelation arriving THERE cancels them (one consumed
+        // by the blocked `accept` would not reach them).
+        server.shutdown();
+        try sleepMs(io, 100);
+        serving.cancel(io);
+    }
+    return rec;
+}
+
+test "on_conn_closed: a server canceled under a blocked read or write ends the connection as normal, not errored" {
+    for ([_]bool{ false, true }) |big| {
+        const rec = try canceledSummary(big);
+        try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
+        try testing.expectEqual(ConnEnd.normal, rec.sum.end);
+        try testing.expectEqual(@as(u64, 1), rec.sum.requests);
+    }
+}
+
+test "on_conn_closed: a connection the server cannot size working memory for is refused (requests 0)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var rec: SummaryRec = .{};
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .on_conn_closed = SummaryRec.record,
+        .on_conn_closed_ctx = &rec,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    // `options` is a pub field: an overflowing layout is refused per connection
+    // (`slabSize` null), not only by `init`.
+    server.options.read_buffer_size = std.math.maxInt(usize);
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    {
+        const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+        defer stream.close(io);
+        var rbuf: [64]u8 = undefined;
+        var sr = stream.reader(io, &rbuf);
+        _ = sr.interface.discardRemaining() catch {};
+    }
+    try waitNoConns(io, &server);
+    var waited: u32 = 0;
+    while (rec.n.load(.acquire) == 0) : (waited += 10) {
+        if (waited > 5000) return error.SummaryNeverFired;
+        try sleepMs(io, 10);
+    }
+    try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
+    try testing.expectEqual(ConnEnd.refused, rec.sum.end);
+    try testing.expectEqual(@as(u64, 0), rec.sum.requests);
+    try testing.expect(rec.sum.peer != null);
 }
 
 test "on_conn_closed: a reset socket is errored, not timed_out" {
@@ -8983,6 +9169,8 @@ test "integration: a connection with no task to run on is dropped and reported, 
     try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
     try testing.expectEqual(ConnEnd.refused, rec.sum.end);
     try testing.expectEqual(@as(u64, 0), rec.sum.requests);
+    try testing.expectEqual(@as(u64, 0), rec.sum.duration_ns);
+    try testing.expect(rec.sum.peer != null);
     // And it no longer counts as active.
     try testing.expectEqual(@as(usize, 1), server.activeConnections());
 
