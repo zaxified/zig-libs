@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of `ConnSummary.timeout_phase`, `timeoutPhase` and the refactored `reportTimeout` (27 schemata mutants: 25 killed, 2 equivalent); new test that a connection ending without a deadline reports no `on_error` `timed_out`.
 - **2026-11-15** — **FEATURE (server):** `ConnSummary.timeout_phase: ?TimeoutPhase` (new `pub enum { idle, head, body, write }`), set when `end == .timed_out` and null otherwise, so an `on_conn_closed` observer can tell which deadline ended the connection without joining it to `on_error`'s timeout through a thread-local. Additive; the `on_error` error names are unchanged (both now come from one helper).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** test only: the `on_conn_closed` cancel test no longer relies on fixed `sleepMs(100)` waits; it waits (10 s deadline, failing loudly) for the connection's `.idle` state or for the response write to stop advancing, and for the accept loop to return after `shutdown` before canceling `serve`.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).

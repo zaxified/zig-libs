@@ -8,11 +8,28 @@
 
 **Ahead:** speed — the HTTP/1.1 server codec is faster than every measured server on every workload of `zig build bench-http` (16 keep-alive requests per connection, socket-free: a browser-like GET, a 1 KiB POST, a chunked POST, a 64 KiB response, a 40-header proxied GET): 0.32–0.68× hyper 1.11.0 (Rust, the fastest measured, its `http1` server connection over the same wire in memory) and 0.12–0.27× Go 1.26 `net/http`'s request reader (`tools/rust_fast_bench`, `tools/go_bench`, 5 rounds) (measured 2026-10-25)
 
-**Audit:** review 2026-11-13 · mutation 2026-11-15 (59/60, 1 eq) · src 0acac8d19fb1f238
+**Audit:** review 2026-11-13 · mutation 2026-11-15 (84/87, 3 eq) · src 136f490f323f2233
 
 Audit detail (2026-11-13, client interceptors): a delta mutation run over every function commit `1a338774` touched — the dispatch at the top of `request`/`requestPlain`, `requestIntercepted`, `Chain.proceed`, `checkDeadline`, `totalDeadline` (schemata, ReleaseSafe, strict verdict): 29 mutants, 28 killed (6 by the hang cap), 1 equivalent (`checkDeadline`'s `<= 0` → `< 0`, different only at a remainder of exactly 0 ns — needs an injectable clock). Seven tests were added first, because the existing ones let mutants through: with a budget set, `runBounded` cancels a retrying chain before `Chain.proceed`'s own deadline check is ever needed, so that check is now pinned under `inline_blocking`, where it is the only bound; also method/url/options reaching the exchange incl. an interceptor rewriting them, an outer retry re-running inner interceptors, no budget keeping the chain on the caller's thread, `request` on the TLS-capable and `requestPlain` on the http-only exchange, invalid options refused before any interceptor runs, an interceptor's error crossing the bounded path. No defect. The 2026-11-13 HPACK delta and the 2026-11-12 halves below still cover the rest.
 
 Audit detail (2026-11-12): the SERVER half (Server, h2_server, h1, body, form, multipart, servecontent, sse, problem, crossorigin, hostguard, bufpool, zeroize) had a new whole-file run — 3827 mutants, ReleaseSafe schemata plus a ReleaseFast build for the `zeroize` sites, strict verdict: 3667 killed, 101 equivalent, 59 unobservable (bind/listen/accept errno mapping, the reader's expired-flag re-tests, clearing `control.tr`/`tw` after the loop — each needs fault or race injection), 0 undecided, no defect; four former line-range "equivalents" in `h1.zig` were not and are now killed. The CLIENT half changed by ~15 production lines since the clean 2026-11-07 run (h2 raw-buffer wipes, the proxy credential wipe, `url.hexVal`), so it had a DELTA run over the touched functions: 45 mutants, 44 killed (wipes in ReleaseFast with a test that counts freed blocks still holding header bytes; the h2 guards on an h2-only binary with a clean subset baseline), 1 equivalent (`beginAssembly` appends to an empty list: no old block to free), 0 undecided. A partial extra run over the client files (1635 of 5200 mutants) left 52 open test-gap candidates — Backlog. 2026-11-13: the HPACK decoded-value wipe (decoder storage growth and shrink, `HeaderList.deinit`, dynamic-table eviction and deinit, the two new `zeroize` helpers) had a DELTA run, 31 mutants in a ReleaseFast schemata build: 25 killed, 6 equivalent (cost-only growth boundaries, the `len == capacity` fast path, a double wipe of an empty result, a zero-length `alloc`), 0 undecided; one survivor of the first pass was a real test gap (an in-place shrink to zero freed the block unwiped) and is now killed. The 52 test-gap candidates of the partial client run are decided (Backlog). Comments citing a private audit path were reworded.
+
+**Audit 2026-11-15 (gap-wave delta).** 27 schemata mutants over `ConnSummary.timeout_phase` (ReleaseSafe, one build of the
+whole module with its tests, each mutant under `setsid -w timeout` and `ulimit -v`): the summary field's guard (dropped,
+inverted, arms swapped), the `sum_phase` initialiser, the three `timeoutPhase` call sites (skipped, `is_h2` flipped: the
+protocol-peek failure, the h2 path, the h1 path), and `timeoutPhase` itself (the write test dropped or returning another
+phase, the not-timed-out guard dropped and inverted, the h2 early return dropped or returning another phase, each of
+the three reader-phase arms returning another phase), plus the refactored `reportTimeout` (the `orelse return`, the
+`ResponseTimeout`/`WriteTimeout` choice and its deadline test, the h2 `ReadTimeout`, the keep-alive `IdleTimeout` /
+`NoRequestTimeout` choice, and the head and body error names). 25 killed. 2 are EQUIVALENT: the summary guard
+`sum_end == .timed_out` dropped, and `sum_phase` initialised to `.idle` instead of null. `sum_phase` is set only by
+the three sites that set `sum_end` from `connEnd`, and `timeoutPhase` is non-null exactly when `connEnd` is
+`.timed_out` (both read `tr.timed_out` / `tw.timed_out`); every other exit leaves `sum_end == .refused` with the null
+initial value, so the guard never changes the value. The first run also had 2 survivors that a test could reach
+(`timeoutPhase` without its not-timed-out guard, and `reportTimeout` without its `orelse return`): the summary's guard
+hid both, but `on_error` then reported `.timed_out` for every connection; each got a test (a connection that ends
+without a deadline, closed by the server or by the client, reports no `timed_out`), and the rerun killed both.
+The Audit line is cumulative: 59/60 with 1 eq + 25/27 with 2 eq.
 
 Audit detail (2026-11-15, `on_conn_closed`): a delta mutation run over the connection summary, 31 schemata mutants,
 ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`: the accept-failure refusal (hook
