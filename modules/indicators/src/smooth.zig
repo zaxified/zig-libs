@@ -5,6 +5,7 @@
 const std = @import("std");
 const core = @import("core.zig");
 const mavg = @import("mavg.zig");
+const cycle = @import("cycle.zig");
 const Error = core.Error;
 const Nan = core.Nan;
 const Seed = core.Seed;
@@ -364,9 +365,10 @@ pub const CopyCore = struct {
 };
 
 /// A moving average of any supported type. Period 1 and `.disabled` are an
-/// identity copy with lookback 0, for every type (TA_MA). `.mama` is not built
-/// yet (`error.Unsupported`); the types with a fixed side parameter use TA_MA's
-/// values (T3 vfactor 0.7, VIDYA CMO period (3p+2)/4, ALMA sigma 6.0 offset 0.85).
+/// identity copy with lookback 0, for every type (TA_MA). The types with a fixed
+/// side parameter use TA_MA's values (T3 vfactor 0.7, VIDYA CMO period (3p+2)/4,
+/// ALMA sigma 6.0 offset 0.85, MAMA limits 0.5 / 0.05: the period is ignored and
+/// the MAMA line is the output).
 pub const MaCore = union(enum) {
     copy: CopyCore,
     sma: SmaCore,
@@ -382,15 +384,11 @@ pub const MaCore = union(enum) {
     rma: mavg.RmaCore,
     vidya: mavg.VidyaCore,
     alma: mavg.AlmaCore,
+    mama: cycle.MamaMaCore,
 
     pub fn validate(p: MaParams) Error!void {
         try core.checkPeriod(p.period, 1);
         try p.unstable.check();
-        if (p.period == 1) return;
-        switch (p.kind) {
-            .mama => return error.Unsupported,
-            else => {},
-        }
     }
     pub fn isCopy(p: MaParams) bool {
         return p.period == 1 or p.kind == .disabled;
@@ -421,6 +419,7 @@ pub const MaCore = union(enum) {
             .zlema => mavg.ZlemaCore.lookback(.{ .period = p.period, .unstable = p.unstable }),
             .rma => mavg.RmaCore.lookback(.{ .period = p.period, .unstable = p.unstable }),
             .vidya => mavg.VidyaCore.lookback(vidyaOf(p)),
+            .mama => cycle.MamaMaCore.lookback(p.unstable),
             else => 0,
         };
     }
@@ -443,7 +442,8 @@ pub const MaCore = union(enum) {
             .rma => .{ .rma = try mavg.RmaCore.init(.{ .period = per, .unstable = un }) },
             .vidya => .{ .vidya = try mavg.VidyaCore.init(vidyaOf(p)) },
             .alma => .{ .alma = try mavg.AlmaCore.init(.{ .period = per }) },
-            else => unreachable, // validate() refused the rest
+            .mama => .{ .mama = try cycle.MamaMaCore.init(un) },
+            else => unreachable, // `disabled` is a copy
         };
     }
     /// Index of the bar being fed (the ring slot to write before `step`).
@@ -611,9 +611,12 @@ test "ma dispatches and refuses what is not built" {
     _ = try ma(f64, &in, &a, .{ .period = 3, .kind = .wma });
     _ = try wma(f64, &in, &b, .{ .period = 3 });
     try th.expectSameBits(&a, &b);
-    try testing.expectError(error.Unsupported, ma(f64, &in, &a, .{ .period = 3, .kind = .mama }));
-    try testing.expectError(error.Unsupported, maLookback(.{ .period = 3, .kind = .mama }));
-    // period 1 and .disabled copy, for every type, even an unsupported one.
+    // MAMA ignores the period (TA_MA: limits 0.5 / 0.05), its lookback is 32 plus the unstable period.
+    try testing.expectEqual(@as(usize, 32), try maLookback(.{ .period = 3, .kind = .mama }));
+    try testing.expectEqual(@as(usize, 32), try maLookback(.{ .period = 99, .kind = .mama }));
+    try testing.expectEqual(@as(usize, 32 + 320), try maLookback(.{ .period = 3, .kind = .mama, .unstable = .auto4 }));
+    try testing.expectEqual(@as(usize, 32 + 556), try maLookback(.{ .period = 3, .kind = .mama, .unstable = .auto8 }));
+    // period 1 and .disabled copy, for every type.
     _ = try ma(f64, &in, &a, .{ .period = 1, .kind = .mama });
     try th.expectSameBits(&a, &in);
     try testing.expectEqual(@as(usize, 0), try maLookback(.{ .period = 9, .kind = .disabled }));

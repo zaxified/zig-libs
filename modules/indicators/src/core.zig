@@ -18,7 +18,8 @@ pub const Error = error{
     /// A parameter is outside TA-Lib's documented range, or a slice length
     /// disagrees with the others.
     BadParam,
-    /// The requested moving-average type is not implemented yet (see SPEC).
+    /// A requested moving-average type is not implemented. Every `MaType` is built now
+    /// (MAMA came with the cycle wave), so nothing returns this today; kept for a future type.
     Unsupported,
 };
 

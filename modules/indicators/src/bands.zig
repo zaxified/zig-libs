@@ -315,7 +315,7 @@ test "bbands: lookback follows the MA type, BadParam" {
     try testing.expectEqual(@as(usize, 19), try bbandsLookback(.{}));
     try testing.expectEqual(@as(usize, 19 + 4), try bbandsLookback(.{ .ma = .ema, .unstable = .{ .bars = 4 } }));
     try testing.expectEqual(@as(usize, 19), try bbandsLookback(.{ .ma = .disabled }));
-    try testing.expectError(error.Unsupported, bbandsLookback(.{ .ma = .mama }));
+    try testing.expectEqual(@as(usize, 32), try bbandsLookback(.{ .ma = .mama })); // MAMA's lookback is 32 at any period
     try testing.expectError(error.BadParam, bbandsLookback(.{ .period = 1 }));
     try testing.expectError(error.BadParam, bbandsLookback(.{ .period = 100001 }));
     try testing.expectError(error.BadParam, bbandsLookback(.{ .dev_up = 4e37 }));

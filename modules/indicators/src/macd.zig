@@ -566,7 +566,8 @@ test "macdext: SMA lines hand-check, swap, all-EMA equals macd, unsupported" {
     try th.expectSameBits(&m1, &e1);
     try th.expectSameBits(&m2, &e2);
     try th.expectSameBits(&m3, &e3);
-    try testing.expectError(error.Unsupported, macdext(f64, testing.allocator, &in, &a, &b, &h, .{ .fast = 2, .slow = 3, .fast_ma = .mama }));
+    // MAMA (lookback 32, whatever the period) in the fast slot: 32 + the signal SMA(9)'s 8
+    try testing.expectEqual(@as(usize, 40), try macdextLookback(.{ .fast = 2, .slow = 3, .fast_ma = .mama }));
 }
 
 test "macd family: BadParam" {

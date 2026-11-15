@@ -6,9 +6,12 @@
 //! TRANGE, ATR, NATR, STOCH, STOCHF, MAX, MIN, SUM. Wave I3 (overlap studies):
 //! DEMA, TEMA, T3, TRIMA, KAMA, MIDPOINT, MIDPRICE, SAR, SAREXT, MAVP, ACCBANDS,
 //! ALMA, CKSP, DONCHIAN, FRAMA, HMA, ICHIMOKU, KC, MCGD, RMA, SUPERTREND,
-//! SWAK_BUTTER, SWAK_GAUSS, VIDYA, VWMA, ZIGZAG, ZLEMA; every `MaType` but MAMA
-//! now works in MA, MACDEXT, BBANDS, STOCH and STOCHF. Wave I3 (volume, volatility,
-//! price transform, statistic, math operators): 50 more functions, see SPEC.md. 94 of
+//! SWAK_BUTTER, SWAK_GAUSS, VIDYA, VWMA, ZIGZAG, ZLEMA; every `MaType`
+//! (MAMA with the cycle wave) works in MA, MACDEXT, BBANDS, STOCH and STOCHF. Wave I3 (cycle): HT_DCPERIOD,
+//! HT_DCPHASE, HT_PHASOR, HT_SINE, HT_TRENDLINE, HT_TRENDMODE, MAMA (so `MaType.mama`
+//! works everywhere), SWAK_BP, SWAK_HP, SWAK_2PHP and the 15 math transforms ACOS ...
+//! TANH. Wave I3 (volume, volatility,
+//! price transform, statistic, math operators): 50 more functions, see SPEC.md. 119 of
 //! TA-Lib's 237 functions in all.
 //!
 //! ```zig
@@ -25,8 +28,8 @@
 //! and a streaming type `<Name>Stream(T)` (`init`, `update`, `peek`, `value`).
 //! Streaming types that need history take a caller buffer (`bufLen`); the
 //! recursive ones are plain values and copy by value. Parameters outside
-//! TA-Lib's ranges are `error.BadParam`; a moving-average type that is not
-//! built yet (MAMA) is `error.Unsupported`. Nothing panics.
+//! TA-Lib's ranges are `error.BadParam` (`error.Unsupported` is kept for a
+//! future moving-average type; every `MaType` is built now). Nothing panics.
 
 const std = @import("std");
 const core = @import("core.zig");
@@ -42,6 +45,10 @@ const overlap = @import("overlap.zig");
 const trend_ = @import("trend.zig");
 const channels = @import("channels.zig");
 const hist = @import("hist.zig");
+// BEGIN cycle imports
+const cycle_ = @import("cycle.zig");
+const mathtx_ = @import("mathtx.zig");
+// END cycle imports
 // BEGIN vs imports
 const volume_ = @import("volume.zig");
 const volatility_ = @import("volatility.zig");
@@ -53,7 +60,7 @@ const mathops_ = @import("mathops.zig");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Technical-analysis indicators (TA-Lib parity): moving averages (SMA to T3, KAMA, HMA, ALMA), MACD, RSI, Bollinger / Keltner / Donchian bands, ATR, stochastic, SAR, Supertrend, Ichimoku, rolling max/min/sum, plus 50 volume, volatility, price-transform, statistic and math-operator functions (OBV, VWAP, CMF, KVO, BBW, LINEARREG, MEDIAN, ...); 94 of TA-Lib's 237.",
+    .doc = "Technical-analysis indicators (TA-Lib parity): moving averages (SMA to T3, KAMA, HMA, ALMA), MACD, RSI, Bollinger / Keltner / Donchian bands, ATR, stochastic, SAR, Supertrend, Ichimoku, rolling max/min/sum, plus 50 volume, volatility, price-transform, statistic and math-operator functions (OBV, VWAP, CMF, KVO, BBW, LINEARREG, MEDIAN, ...), the Hilbert-transform cycle indicators with MAMA (HT_DCPERIOD, HT_SINE, HT_TRENDLINE, ...), three Swiss-Army-Knife filters and the 15 math transforms (SIN, LN, SQRT, ...); 119 of TA-Lib's 237.",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
@@ -263,6 +270,95 @@ pub const IchimokuOut = channels.IchimokuOut;
 pub const ichimoku = channels.ichimoku;
 pub const ichimokuLookback = channels.ichimokuLookback;
 pub const IchimokuStream = channels.IchimokuStream;
+// BEGIN cycle exports
+
+// cycle: Hilbert-transform family, MAMA, Swiss Army Knife rows
+pub const HtParams = cycle_.HtParams;
+pub const PhasorOut = cycle_.PhasorOut;
+pub const SineOut = cycle_.SineOut;
+pub const htDcperiodLookback = cycle_.htDcperiodLookback;
+pub const htDcperiod = cycle_.htDcperiod;
+pub const HtDcperiodStream = cycle_.HtDcperiodStream;
+pub const htDcphaseLookback = cycle_.htDcphaseLookback;
+pub const htDcphase = cycle_.htDcphase;
+pub const HtDcphaseStream = cycle_.HtDcphaseStream;
+pub const htPhasorLookback = cycle_.htPhasorLookback;
+pub const htPhasor = cycle_.htPhasor;
+pub const HtPhasorStream = cycle_.HtPhasorStream;
+pub const htSineLookback = cycle_.htSineLookback;
+pub const htSine = cycle_.htSine;
+pub const HtSineStream = cycle_.HtSineStream;
+pub const htTrendlineLookback = cycle_.htTrendlineLookback;
+pub const htTrendline = cycle_.htTrendline;
+pub const HtTrendlineStream = cycle_.HtTrendlineStream;
+pub const htTrendmodeLookback = cycle_.htTrendmodeLookback;
+pub const htTrendmode = cycle_.htTrendmode;
+pub const HtTrendmodeStream = cycle_.HtTrendmodeStream;
+pub const MamaParams = cycle_.MamaParams;
+pub const MamaOut = cycle_.MamaOut;
+pub const mamaLookback = cycle_.mamaLookback;
+pub const mama = cycle_.mama;
+pub const MamaStream = cycle_.MamaStream;
+pub const SwakBpParams = cycle_.SwakBpParams;
+pub const swakBpLookback = cycle_.swakBpLookback;
+pub const swakBp = cycle_.swakBp;
+pub const SwakBpStream = cycle_.SwakBpStream;
+pub const SwakHpParams = cycle_.SwakHpParams;
+pub const swakHpLookback = cycle_.swakHpLookback;
+pub const swakHp = cycle_.swakHp;
+pub const SwakHpStream = cycle_.SwakHpStream;
+pub const Swak2phpParams = cycle_.Swak2phpParams;
+pub const swak2phpLookback = cycle_.swak2phpLookback;
+pub const swak2php = cycle_.swak2php;
+pub const Swak2phpStream = cycle_.Swak2phpStream;
+
+// math transforms (lookback 0, no parameters)
+pub const acosLookback = mathtx_.acosLookback;
+pub const acos = mathtx_.acos;
+pub const AcosStream = mathtx_.AcosStream;
+pub const asinLookback = mathtx_.asinLookback;
+pub const asin = mathtx_.asin;
+pub const AsinStream = mathtx_.AsinStream;
+pub const atanLookback = mathtx_.atanLookback;
+pub const atan = mathtx_.atan;
+pub const AtanStream = mathtx_.AtanStream;
+pub const ceilLookback = mathtx_.ceilLookback;
+pub const ceil = mathtx_.ceil;
+pub const CeilStream = mathtx_.CeilStream;
+pub const cosLookback = mathtx_.cosLookback;
+pub const cos = mathtx_.cos;
+pub const CosStream = mathtx_.CosStream;
+pub const coshLookback = mathtx_.coshLookback;
+pub const cosh = mathtx_.cosh;
+pub const CoshStream = mathtx_.CoshStream;
+pub const expLookback = mathtx_.expLookback;
+pub const exp = mathtx_.exp;
+pub const ExpStream = mathtx_.ExpStream;
+pub const floorLookback = mathtx_.floorLookback;
+pub const floor = mathtx_.floor;
+pub const FloorStream = mathtx_.FloorStream;
+pub const lnLookback = mathtx_.lnLookback;
+pub const ln = mathtx_.ln;
+pub const LnStream = mathtx_.LnStream;
+pub const log10Lookback = mathtx_.log10Lookback;
+pub const log10 = mathtx_.log10;
+pub const Log10Stream = mathtx_.Log10Stream;
+pub const sinLookback = mathtx_.sinLookback;
+pub const sin = mathtx_.sin;
+pub const SinStream = mathtx_.SinStream;
+pub const sinhLookback = mathtx_.sinhLookback;
+pub const sinh = mathtx_.sinh;
+pub const SinhStream = mathtx_.SinhStream;
+pub const sqrtLookback = mathtx_.sqrtLookback;
+pub const sqrt = mathtx_.sqrt;
+pub const SqrtStream = mathtx_.SqrtStream;
+pub const tanLookback = mathtx_.tanLookback;
+pub const tan = mathtx_.tan;
+pub const TanStream = mathtx_.TanStream;
+pub const tanhLookback = mathtx_.tanhLookback;
+pub const tanh = mathtx_.tanh;
+pub const TanhStream = mathtx_.TanhStream;
+// END cycle exports
 // BEGIN vs exports
 
 // volume (volume / volatility / price transform / statistic / math operator waves)
@@ -476,6 +572,11 @@ test {
     _ = channels;
     _ = hist;
     _ = @import("overlap_test.zig");
+    // BEGIN cycle tests
+    _ = cycle_;
+    _ = mathtx_;
+    _ = @import("xmath.zig");
+    // END cycle tests
     // BEGIN vs tests
     _ = volume_;
     _ = volatility_;

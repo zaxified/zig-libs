@@ -205,8 +205,11 @@ test "ma dispatches every built type; MACDEXT / BBANDS / STOCH accept them" {
     _ = try ind.ma(f64, &xs, &a, .{ .period = 9, .kind = .alma });
     _ = try ind.alma(f64, testing.allocator, &xs, &b, .{});
     try th.expectSameBits(&a, &b);
-    // MAMA is not built yet
-    try testing.expectError(error.Unsupported, ind.ma(f64, &xs, &a, .{ .period = 9, .kind = .mama }));
+    // MAMA: the period is ignored, the output is the MAMA line with limits 0.5 / 0.05
+    var fama: [n_bars]f64 = undefined;
+    _ = try ind.ma(f64, &xs, &a, .{ .period = 9, .kind = .mama });
+    _ = try ind.mama(f64, &xs, &b, &fama, .{});
+    try th.expectSameBits(&a, &b);
     // composites take them
     var o1: [n_bars]f64 = undefined;
     var o2: [n_bars]f64 = undefined;
@@ -444,7 +447,7 @@ test "mavp: equals the fixed-period average when every period is the same; per-b
     try testing.expectError(error.BadParam, ind.mavp(f64, &xs, &per, &a, .{ .min_period = 5, .max_period = 4 }));
     try testing.expectError(error.BadParam, ind.mavp(f64, &xs, &per, &a, .{ .min_period = 0 }));
     try testing.expectError(error.BadParam, ind.mavp(f64, &xs, &per, &a, .{ .max_period = 10001 }));
-    try testing.expectError(error.Unsupported, ind.mavp(f64, &xs, &per, &a, .{ .kind = .mama }));
+    _ = try ind.mavp(f64, &xs, &per, &a, .{ .kind = .mama });
 }
 
 test "f32 path of the multi-output functions rounds the f64 result once" {

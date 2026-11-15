@@ -932,7 +932,7 @@ test "volume: BadParam edges and lookbacks" {
     try testing.expectError(error.BadParam, kvo(f64, &z, &z, &z, &z, &out, &out, .{ .signal = 1 }));
     try testing.expectError(error.BadParam, rvol(f64, &z, &out, .{ .period = 0 }));
     try testing.expectError(error.BadParam, pvo(f64, &z, &out, .{ .fast = 1 }));
-    try testing.expectError(error.Unsupported, pvo(f64, &z, &out, .{ .ma = .mama }));
+    try testing.expect((try pvoLookback(.{ .ma = .mama })) >= 32);
     try testing.expectError(error.BadParam, ad(f64, &z, &z, &z, z[0..7], &out));
     try testing.expectError(error.BadParam, obv(f64, &z, &z, out[0..7]));
     try testing.expectEqual(@as(usize, 9), try adoscLookback(.{}));
