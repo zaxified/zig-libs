@@ -1,0 +1,76 @@
+# proxyproto — spec
+
+## Maturity
+
+**Grade:** *(written by `zig build gen-catalog` — never by hand)*
+
+**Scope:** core — pires/go-proxyproto v0.16.0 (surveyed 2026-11-15)
+
+**Audit:** review none · mutation none · src ?
+
+**Hardening:** fuzz 2026-11-15 (40,000,000 runs, clean, PROXYPROTO_FUZZ, all 17 reach labels hit) · ct n/a — the header is public data, no secret · panic 2026-11-15 (no-panic sweep, `tests.zig`: 20,000 hostile inputs through every pub entry point, safety checks on; plus the fuzz harness)
+
+**Performance:** not measured
+
+**Known defects:** none recorded
+
+**Downstream consumer:** no
+
+## Compared with
+
+Surveyed 2026-11-15 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date (GitHub API).
+
+| Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
+|---|---|---|--:|---|---|
+| [pires/go-proxyproto](https://github.com/pires/go-proxyproto) — **reference** | Go | Apache-2.0 | 626 | v0.16.0, push 2026-10-31 | Parses v1 and v2, wraps a `net.Listener`/`net.Conn`, policy callback per peer (`USE`/`REQUIRE`/`REJECT`/`SKIP`), TLV helpers incl. SSL and CRC32C. This module has the same parse surface and the trust rule as the default, but no listener wrapper (the caller does accept + `read`). |
+| [haproxy/haproxy](https://github.com/haproxy/haproxy) — the specification's home | C | GPL-2.0 with exceptions (NOASSERTION in the API) | 7.0k | push 2026-11-13 | Sends both versions (`send-proxy`, `send-proxy-v2`, `send-proxy-v2-ssl`), accepts them (`accept-proxy`). The authority for the wire format; not a library. |
+| [nginx/nginx](https://github.com/nginx/nginx) (`proxy_protocol`, `set_real_ip_from`) | C | BSD-2-Clause | 32.1k | push 2026-11-09 | Accepts v1 and v2 on `listen ... proxy_protocol`; the real address replaces the peer's only for trusted sources (`set_real_ip_from`); sends v1 to upstreams. Does not expose TLVs as a library. |
+| [tibordp/proxy-header](https://github.com/tibordp/proxy-header) | Rust | MIT | 8 | push 2026-09-23 | Parse and write v1/v2 with TLV access. Similar surface; no trust rule, since a Rust crate cannot know the peer. |
+
+**Where we are ahead:** the trust rule is part of `read`'s options and an empty list refuses every header, so "forgot to restrict the sources" cannot happen by omission; `parse` is pure and allocation-free, with `need_more`/`absent` so the caller never loses the bytes of a header-less stream; CRC32C is verified for the caller. **Where we are behind:** no listener/connection wrapper; no live interop run against HAProxy (§ Open).
+
+## What this module is, and what it is not
+
+A PROXY protocol codec for the server side (parse a header off an accepted stream, with the trust decision) and the proxy side (write one). It is I/O-agnostic: `parse` takes bytes, `read` takes a `std.Io.Reader`.
+
+Not here: a listener or connection wrapper (the accept path of whichever server uses this calls `read` once per connection); a policy callback (the options struct carries the two policies that matter, `trusted` and `required`); TLS-terminating-proxy behaviour (the SSL TLV is decoded, nothing is verified); the AWS/Azure/GCP TLVs are returned raw (first byte = provider sub-type), not decoded.
+
+## Wire format
+
+HAProxy `doc/proxy-protocol.txt`: § 2.1 (v1: `PROXY TCP4|TCP6|UNKNOWN ...\r\n`, at most 107 bytes) and § 2.2 (v2: the 12-byte signature, version/command byte, family/protocol byte, 16-bit length, address block, TLVs).
+
+Decisions where the specification leaves room:
+
+- **v1 is strict.** Single spaces only, CRLF (a bare LF is refused), IPv4/IPv6 text as `netaddr.parseIp4/6` accepts it (no leading zeros, no zone), ports 0-65535 without leading zeros, no extra fields. `UNKNOWN` ignores the rest of the line, as the specification requires; `UNKNOWNX` is refused.
+- **Detection.** A buffer that is a prefix of `PROXY ` or of the v2 signature asks for more; the first byte that cannot continue either is `.absent`. A buffer that matches the whole prefix has committed: later faults are errors, not `.absent`.
+- **LOCAL** discards the protocol block including the family byte, as the specification requires; the header has `command = .local`, no addresses and no TLVs. **PROXY with UNSPEC** likewise carries no addresses and no TLVs.
+- **TLV structure is validated at parse time** (every length fits the payload exactly); a malformed area is `error.Malformed`. Sub-TLVs of SSL are validated when read.
+- **CRC32C (0x03)**: when present, `parse` recomputes CRC-32C over the whole header (signature to the last TLV) with the 4 checksum bytes zeroed, compares big-endian, and returns `error.BadChecksum` on mismatch. A CRC TLV whose length is not 4, or a second one, is `Malformed`. A header with the CRC TLV removed by an attacker is, of course, still a valid header: the CRC detects damage, it does not authenticate.
+- **Writer**: `writeV1` writes TCP4/TCP6 (UNSPEC and LOCAL as `UNKNOWN`; UDP and unix are `error.Unsupported`). `writeV2` takes the raw TLV area as a parameter (`Header.tlvs` is ignored); `writeV2Crc` appends the CRC TLV. Address/family mismatch, a unix path over 108 bytes, a malformed TLV area, or a CRC TLV already in the area under `writeV2Crc` is `error.InvalidHeader`; a payload over 65535 is `error.TooLarge`.
+
+## Trust
+
+A PROXY header is a claim by the peer about someone else. `read` therefore takes `ReadOptions.peer` (the address of the connection's real peer, `null` for a non-IP peer) and `trusted` (`[]const netaddr.Prefix`, default **empty**). A header from a peer outside `trusted` is `error.UntrustedPeer`, nothing consumed; the same goes for a malformed one (an untrusted peer learns nothing about parsing). A stream that does not start with a header is not an error for an untrusted peer: `read` returns null and the bytes stay. An IPv4-mapped IPv6 peer is matched against IPv4 prefixes as well. `required` makes a missing header `error.Missing`. Whether to accept a header-less connection from a *trusted* balancer is `required`'s job; the module does not guess.
+
+## Limits and refusals
+
+- v1: 107 bytes including CRLF (spec § 2.1); a line with no LF in 107 bytes is `Malformed`.
+- v2: whole header (16 + length) at most `max_v2_len`, default **536**: the specification's own figure (a header must fit a 576-byte minimum IPv4 datagram after 20 bytes IP and 20 bytes TCP); a unix address block alone is 216. Over the cap is `error.TooLarge`, decided from the 16 fixed bytes, before any more is buffered (pinned by "v2: size cap, default 536").
+- `read` needs `r.buffer.len` at least the header it is to hold and `buf` at least its consumed length; otherwise `error.TooLarge`. A zero-capacity reader (a `Reader.fixed("")`) is therefore `TooLarge`, not "empty".
+
+## Anchoring
+
+Test vectors are built by hand from the spec's byte layouts (`src/tests.zig`); no other implementation's test data is used. They are the author's reading of the specification, so this is the weakest external grade. The writer-to-parser round trips share that reading.
+
+**Anchor grade:** class A · oracle SELF
+
+## What is deliberately not done
+
+- A connection wrapper: **not now**; it belongs with the accept path of a server and would give this module an I/O dependency.
+- Decoding the cloud-provider TLVs (AWS VPCE id, Azure LinkID, GCP): **not now**; the layouts are provider documentation, not the specification.
+- Accepting a header from an untrusted peer "but ignoring it": **never**; ignoring silently hides a misconfigured balancer, and an error is what a caller can act on.
+
+## Open
+
+- An interop run against HAProxy `send-proxy-v2` / `send-proxy-v2-ssl` (`tools/` oracle) has not been done; until it has, the oracle grade stays SELF.
+- No mutation run and no audit.
