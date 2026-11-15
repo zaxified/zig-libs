@@ -992,7 +992,7 @@ test "F4: a duplicate CAPABILITY name does not leak its own copy" {
     // updates the value -- a naive dupe-then-put per name orphans a second
     // allocation that `freeCaps` never finds. `testing.allocator` catches
     // any such leak at `deinit()` without any manual bookkeeping here.
-    // Measured pre-fix (`~/CML/20260901-zig-libs-audit/A1/imap.md` F4): 50
+    // Measured pre-fix (the A1 audit report for `imap` F4): 50
     // lines of 8,000x `DUP` left 1,199,850 B still allocated after deinit().
     var p: Peer = undefined;
     p.init("* OK [CAPABILITY IMAP4rev2] Service Ready\r\n" ++
