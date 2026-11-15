@@ -3,7 +3,7 @@
 //! `pchip`, `akima` (pandas 3.1 `Series.interpolate` through SciPy 1.18.1), `toLatex`
 //! `column_format` / `longtable` / `position` (pandas `to_latex`) and `binary + binary`
 //! (polars). Every expected value was produced by running the engine
-//! (`~/CML/20261110-df-parity/z1_probe.py`, `z2_probe.py`, `z3_probe.py`); hostile inputs
+//! (the 2026-11-10 parity probes z1, z2, z3); hostile inputs
 //! must give an error or a value and never a panic.
 
 const std = @import("std");
