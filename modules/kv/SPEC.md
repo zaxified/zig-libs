@@ -39,7 +39,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [xit-vcs/xitdb](https://github.com/xit-vcs/xitdb) | Zig | MIT | 109 | pushed 2026-09-17 (no releases) | The Zig alternative: immutable persistent structures (HAMT/array list), snapshot semantics. Zig, embedded; no pluggable storage seam or fault-injection sweep *(inferred from README)*. |
 | [LMDB](https://github.com/LMDB/lmdb) | C | OpenLDAP Public License 2.8 | 3.0k | pushed 2026-08 | The de-facto embedded KV; ordered, MVCC, ACID txns, zero-copy reads. Not Bitcask-shaped, so not the field (owner, 2026-10-25: the field is Bitcask-model stores): against LMDB 0.9.31 kv's get was 6× and its scan 120× slower (pread per value then), its unsynced puts 3–4× faster. Source not read. |
 
-**Where we are ahead:** the only entry with a deterministic fault-injection sweep over every storage side effect (crash-anywhere, torn, reordered writes, shrinker) built in and shipped as part of the module, now over rotation, migration, merges and hints too; an injectable `Storage` seam (used by `kvtree`, `seglog` and others); cross-process `flock` exclusion with a killed-holder test; fail-stop poisoning after a write error; per-key expiry (Bitcask has one global expiry); pure Zig, no C. **On par since 2026-10-14:** sync policies, multi-file log with rotation, partial merges planned by Bitcask's triggers/thresholds and run beside writers, hint files, snapshot iteration, read-only opens beside a live writer, readers never waiting for a writer's fsync. **Against the Go field, measured 2026-10-25** (the `**Ahead:**` line): the read-only open beside a writer is kv's alone, a torn tail never makes the store unopenable; the open is 0.27× the fastest (Performance), reads go through mmap (`FsStorage.initMmap`), as prologic/bitcask's sealed files do. **Where we are behind** (conscious, see Backlog): no background expiry or merge timer (the caller schedules both); no atomic multi-put batch (Bitcask has none either; rosedb does); a value whose record fails its CRC makes `open` refuse the whole store, where prologic/bitcask opens and fails that one key (the store's corruption policy).
+**Where we are ahead:** the only entry with a deterministic fault-injection sweep over every storage side effect (crash-anywhere, torn, reordered writes, shrinker) built in and shipped as part of the module, now over rotation, migration, merges and hints too; an injectable `Storage` seam (used by `kvtree`, `seglog` and others); cross-process `flock` exclusion with a killed-holder test; fail-stop poisoning after a write error; per-key expiry (Bitcask has one global expiry); pure Zig, no C. **On par since 2026-10-14:** sync policies, multi-file log with rotation, partial merges planned by Bitcask's triggers/thresholds and run beside writers, hint files, snapshot iteration, read-only opens beside a live writer, readers never waiting for a writer's fsync. **Added 2026-11-15:** atomic batch write (one record, one CRC, one sync; all of it or none after a crash; rosedb has batches, Bitcask does not), under the same fault sweep and VOPR. **Against the Go field, measured 2026-10-25** (the `**Ahead:**` line): the read-only open beside a writer is kv's alone, a torn tail never makes the store unopenable; the open is 0.27× the fastest (Performance), reads go through mmap (`FsStorage.initMmap`), as prologic/bitcask's sealed files do. **Where we are behind** (conscious, see Backlog): no background expiry or merge timer (the caller schedules both); a value whose record fails its CRC makes `open` refuse the whole store, where prologic/bitcask opens and fails that one key (the store's corruption policy).
 
 ## Design & invariants
 
@@ -341,6 +341,98 @@ sync error poisons like a write error.
   `.interval_ms` with an injected clock, `close`'s sync and poisoned `sync`. Mutants
   "`.none` syncs every write" and "close does not sync" each turn a test red (2026-10-14).
 
+## Atomic batch
+
+`Db.batch()` → `Batch` (`put`, `putTtl`, `putExpiring`, `delete`, `commit`, `clear`, `deinit`) and
+`Options.max_batch_bytes` (2026-11-15; survey 2026-09-30 "Atomic batch write", rosedb has it, Bitcask
+does not): several puts and deletes that commit together, with one sync, and that a crash keeps whole
+or not at all.
+
+- **Format: version 4, op 3.** A batch is ONE record, the *envelope*: the ordinary 13-byte record
+  header with op 3, `key_len` 0 and `value_len` = the body length, then the body — the batch's
+  operations as ordinary records (ops 0, 1, 2, each with its own CRC, exactly as `put`/`delete`
+  write them) — under one CRC over everything after the CRC field. Because the inner records are
+  ordinary, a keydir entry of a batched key is an ordinary `{file, offset}`: `get`, `iterator`,
+  `copyRecord`, `compact` and hints need no knowledge of batches. Op 3 is valid only in a file whose
+  header says version 4 (a v1/v2 file with op 3 ends replay like any corrupt op byte). The batch is
+  one `writeAll`, so under `SyncPolicy.always` it is one fsync.
+- **Recovery rule** (`replayBatch`): the batch is applied iff (1) the whole envelope is in the file,
+  (2) `key_len == 0` and the body is non-empty, (3) the records tile the body exactly, each an op the
+  module writes (0, 1 with no value, 2 with a real expiry; no batch inside a batch), and (4) the
+  CRC over header and body holds. Pass 1 checks all of that and allocates nothing; only pass 2 reads
+  keys and touches the keydir, so a torn or forged batch applies **nothing** (the 2026-10-29 rule
+  "allocate after the CRC" holds: the lengths are trusted only once the CRC matches). A failing
+  envelope is the torn tail: truncated in the active file (writer), the stopping point for a reader,
+  `Corrupt` in a sealed file (a sealed file was synced whole). The envelope header's 13 bytes count
+  as dead bytes (no dead key) so `expectAccounting` holds: every byte after a file header is a live
+  or dead record or an envelope header.
+- **Why not begin/commit markers.** Records between markers would be individually valid and
+  replay would have to buffer and discard; one CRC over one write makes "torn" = "CRC fails", the
+  same mechanism that already guards every record, and a reorder-unsynced crash keeps or drops the
+  one write whole.
+- **Compatibility.** A store without batches is read and written exactly as before. A data file
+  gets version 4 only when the first batch is committed into a store whose active file is older:
+  `appendVersioned` then seals the active file and starts a new version-4 file with `rotateLocked`
+  (atomic and already swept: a single-file store migrates to a manifest store, a multi-file one
+  adds a file) — the in-place header rewrite the append-only tripwire forbids is never needed. New
+  files created by rotation after that stay version 4 (a store that has batches does not flip back
+  per rotation); merge and `compact` outputs are version 2 and hold no envelope, so a full
+  compaction can make a store readable by older builds again until the next batch. **An older build
+  cannot open a store with a version-4 file** (it lists the file in the manifest and refuses
+  `Corrupt` because the version is unknown — before reading a record, so nothing is truncated); this
+  is the same trade as expiry's version 2 and the manifest's version 3, documented in the README.
+  `loadManifest` accepts 4 for any listed file, and requires the active one to be 2 or 4.
+- **Interactions.**
+  *Rotation:* a batch is appended as one record, so it never straddles files: if it does not fit
+  the active file, the file is sealed first, as for a big put, and a batch larger than
+  `max_file_size` gets a file of its own. *Merge/compact/hints:* the merge scan steps over an
+  envelope header (13 bytes) and copies the inner records like any others; outputs hold ordinary
+  records, hints list them; a hint is never written for a version-4 file, and a forged one is
+  checked by the unchanged tiling rule. *Expiry:* a batch carries one expiry per `putTtl`/
+  `putExpiring` op (the TTL is read from `Options.clock` when added); the clock is read at replay
+  once. *Sync policy:* a batch is one append; `.always` syncs it, `.none` leaves it to the next
+  barrier, `.interval_ms` as for a put — and under `.none` a crash recovers a prefix of the steps in
+  which a batch is one step (`SyncPolicy.none` batch sweep). *Readers:* a read-only opener (any
+  process) stops at an envelope that is incomplete or fails its CRC and so never sees half a batch;
+  in-process readers see the keydir change under ONE exclusive keydir lock (keys and room are
+  reserved first, so a batch that reached the disk cannot fail to reach the keydir) and the write
+  itself happens outside that lock, as for `put`. *Poison:* any storage error during the append or
+  its sync poisons the store, as for `put`; the keydir is then unchanged and the batch still holds
+  its operations. An allocation failure before the write returns `OutOfMemory` with nothing written
+  and the store usable.
+- **Semantics.** Operations apply in the order added; the last word on a key wins; a `delete`
+  always writes its tombstone (the key may have been put earlier in the same batch), even for a key
+  nobody holds (dead bytes, no live key — unlike `Db.delete`, which is a no-op for an absent key);
+  an expiry already past leaves the key absent at once, as `putExpiring` does. An empty batch
+  commits nothing (no I/O). After a successful commit the `Batch` is empty and reusable; after an
+  error it is unchanged.
+- **Bounds.** `Options.max_batch_bytes` (default 64 MiB, at most 4 GiB - 1, the envelope's length
+  field) caps the bytes a batch holds, headers included; `put`/`putTtl`/`putExpiring`/`delete` past
+  it return `error.BatchTooLarge` (a new `BatchError` set; `MutateError` is unchanged, so no
+  exhaustive switch of a consumer broke) and add nothing. Memory is the batch's own buffer plus a
+  per-put key copy at commit — never a panic.
+- **Tests.** Unit: puts/overwrites/deletes together + reopen + accounting; one sync for 21
+  operations and none for an empty batch; the batch's file cut at EVERY byte (state = before, or
+  all of it only at full length); every byte flipped; a sealed file with a damaged batch refused;
+  eight forged CRC-valid envelopes (key_len ≠ 0, empty, nested, expiry "none", delete with a value,
+  unknown op, short body, trailing byte) + a well-formed control; op 3 in a v1 file; the size
+  limit; rotation (one batch per file, a big one alone, plain puts after batches stay v4); merge
+  and compact over batched files; expiry per op and at replay; a read-only opener at every length
+  of a mid-write second batch; poison on a failing write; an OOM sweep over the commit. Sweeps
+  (`fault_test.zig`): `batch_script` (first batch = migration, overwrites, put-then-delete in one
+  batch, expiring ops, a 3000-byte value, a compact between batches) at every injection point × all
+  four crash modes (reorder over three seeds) single-file and with `max_file_size = 64`; a merge
+  script over files holding batches; `SyncPolicy.none` over both. The invariant is the existing
+  exact one — the recovered state equals the model before the step or after it — so a half batch
+  fails; counters assert crashes inside a commit were met and went BOTH ways (survived whole,
+  vanished); a test shows that every proper prefix of a batch's operations differs from both
+  candidates. VOPR: `Config.batches` adds batch operations to the random workload (recorded as
+  `RecordedOp.batch`, replayed and cloned by the shrinker as ONE operation — ddmin drops or keeps a
+  batch, it does not cut inside one), 500 seeds single- and multi-file with partial merges, teeth on
+  acknowledged / survived / dropped batches; the recorded traces replay clean and a sabotaged one
+  is caught. `Replayer` no longer appends a garbage tail to a manifest (a store with batches is a
+  manifest store; the live runner never did).
+
 ## Threat model / out of scope
 
 Reliability, not adversarial security:
@@ -485,7 +577,7 @@ What moved it (2026-10-25): `FsStorage.initMmap` (reads lent from a mapping of t
 - ~~**Key iteration / fold over the keydir**~~ *(survey 2026-09-30)* — **DONE 2026-09-30** as `keys(gpa, prefix)`: a sorted snapshot of the live keys, taken under the lock. A value fold (`fold` in Bitcask) is not built: `get` per listed key does the same without holding the lock across the caller's function.
 - **Hint files / fast open** *(survey 2026-09-30)* — `open` replays the whole log, so start time grows with store size; Bitcask's hint files exist for exactly this. Effort: medium (a second CRC'd file rewritten by `compact`, torn-hint fallback to replay, needs the VOPR sweep extended). Fits §2.
 - **Data-file rotation / multi-file log** *(survey 2026-09-30)* — one ever-growing file means compaction rewrites everything; Bitcask merges sealed files incrementally. Effort: large (format v2, manifest). Fits §2.
-- **Atomic batch write** *(survey 2026-09-30)* — several puts/deletes that commit together with one fsync (also cuts fsync cost). Effort: medium (batch record framing, recovery all-or-nothing). Fits §2.
+- ~~**Atomic batch write**~~ *(survey 2026-09-30)* — **DONE 2026-11-15**, see § "Atomic batch".
 - ~~**Per-key expiry (TTL)**~~ *(survey 2026-09-30)* — **DONE 2026-09-30**, see § "Key expiry". Not built: expiry in the background (a timer thread dropping keys) — `compact` is the caller's already, and an expired key costs only memory and disk until then.
 - ~~**Sync policy**~~ *(S2 survey 2026-10-14, R1)* — **DONE 2026-10-14**, see § "Sync policy".
 - ~~**Reader concurrency without a spinlock across fsync**~~ *(survey 2026-09-30)* — **DONE 2026-10-14 (in-process, S2 R5)**: writer mutex + keydir `RwLock`, exclusive only for the in-memory update. Tests: a reader answered (with the previous value) while a writer is parked inside fsync; readers alongside puts/deletes/compactions on the real filesystem, clean under ThreadSanitizer (`-fllvm -fsanitize-thread`; the self-hosted backend silently does not instrument — negative control needed it). Mutants: reader taking the writer lock (red), compaction swap without the exclusive lock (red + TSan races). Cross-process read-only open while a writer runs is the open half (S2 R5b).

@@ -251,6 +251,12 @@ pub const Config = struct {
     /// (`Db.merge`) whenever the store is multi-file. Live runner only — the
     /// trace capture/replay keeps `compact`.
     partial_merges: bool = false,
+    /// Some operations are atomic batches (`Db.batch`): 1..6 puts and
+    /// deletes committed together. A crash mid-commit must leave all of them
+    /// or none (`Inflight.batch` is one candidate state, not six). The extra
+    /// PRNG draws happen only with this set, so every other run keeps its
+    /// seeds.
+    batches: bool = false,
 };
 
 /// Aggregated across seeds by the caller; also the determinism witness.
@@ -274,6 +280,12 @@ pub const Stats = struct {
     multi_file_stores: usize = 0,
     /// `Db.merge` calls made by `Config.partial_merges` runs.
     partial_merges: usize = 0,
+    /// Batches acknowledged, and in-flight batches recovery kept whole
+    /// (`inflight_survived` counts those too) — the teeth witnesses of
+    /// `Config.batches`.
+    batches_acked: usize = 0,
+    batches_survived: usize = 0,
+    batches_dropped: usize = 0,
     /// Mix of each seed's final media CRC — byte-level determinism witness.
     fingerprint: u64 = 0,
 };
@@ -284,7 +296,45 @@ const Inflight = union(enum) {
     none,
     put: struct { key: usize, val: []const u8 },
     del: usize,
+    /// An atomic batch: recovery keeps every one of its operations or none.
+    batch: []const BatchOpRec,
 };
+
+/// One operation of a batch: put `val` at key index `key`, or delete it.
+pub const BatchOpRec = struct { key: usize, val: ?[]const u8 };
+
+/// Apply a batch's operations in order to a model.
+fn applyBatch(model: *[key_count]?[]const u8, ops: []const BatchOpRec) void {
+    for (ops) |o| model[o.key] = o.val;
+}
+
+/// Add `ops` to `b` and commit: the one place both runners do it.
+fn commitBatch(db: *Db, ops: []const BatchOpRec) anyerror!void {
+    var b = db.batch();
+    defer b.deinit();
+    for (ops) |o| {
+        var kb: [3]u8 = undefined;
+        if (o.val) |val| try b.put(keyName(&kb, o.key), val) else try b.delete(keyName(&kb, o.key));
+    }
+    try b.commit();
+}
+
+/// A random batch of 1..6 operations, values from `a`.
+fn genBatch(a: Allocator, prng: *Prng) Allocator.Error![]BatchOpRec {
+    const recs = try a.alloc(BatchOpRec, 1 + prng.below(6));
+    for (recs) |*r| {
+        r.key = prng.below(key_count);
+        if (prng.chance(1, 4)) {
+            r.val = null;
+        } else {
+            const vlen = if (prng.chance(1, 12)) prng.below(max_val_len + 1) else prng.below(80);
+            const val = try a.alloc(u8, vlen);
+            prng.fill(val);
+            r.val = val;
+        }
+    }
+    return recs;
+}
 
 pub const Event = struct {
     epoch: u16,
@@ -297,6 +347,8 @@ pub const Event = struct {
         open_fault,
         put_ok,
         put_fault,
+        batch_ok,
+        batch_fault,
         del_ok,
         del_fault,
         compact_ok,
@@ -399,6 +451,19 @@ const Vopr = struct {
         const op_total = 4 + v.prng.below(40);
         var op: usize = 0;
         while (op < op_total) : (op += 1) {
+            if (v.cfg.batches and v.prng.chance(1, 7)) {
+                const recs = try genBatch(v.arena, v.prng);
+                commitBatch(&db, recs) catch |e| {
+                    try v.event(.batch_fault, -1, @intCast(recs.len));
+                    try v.expectFault(e);
+                    return .{ .batch = recs };
+                };
+                applyBatch(&v.model, recs);
+                v.stats.acked_ops += recs.len;
+                v.stats.batches_acked += 1;
+                try v.event(.batch_ok, -1, @intCast(recs.len));
+                continue;
+            }
             const roll = v.prng.below(100);
             if (roll < 55) { // put
                 const k = v.prng.below(key_count);
@@ -525,6 +590,7 @@ const Vopr = struct {
         defer db.close();
 
         if (try v.matches(&db, &v.model)) {
+            if (inflight == .batch) v.stats.batches_dropped += 1;
             try v.event(.recover_exact, -1, 0);
         } else {
             // Candidate B: the in-flight op atomically survived.
@@ -534,10 +600,12 @@ const Vopr = struct {
                 .none => has_alt = false,
                 .put => |p| alt[p.key] = p.val,
                 .del => |k| alt[k] = null,
+                .batch => |ops| applyBatch(&alt, ops),
             }
             if (has_alt and try v.matches(&db, &alt)) {
                 v.model = alt;
                 v.stats.inflight_survived += 1;
+                if (inflight == .batch) v.stats.batches_survived += 1;
                 try v.event(.recover_inflight, -1, 0);
             } else {
                 return v.fail(
@@ -606,6 +674,7 @@ fn modelMatches(gpa: Allocator, db: *Db, model: *const [key_count]?[]const u8) !
 pub const RecordedOp = union(enum) {
     put: struct { key: usize, val: []const u8 },
     del: struct { key: usize },
+    batch: struct { ops: []const BatchOpRec },
     get: struct { key: usize },
     compact,
     census,
@@ -673,6 +742,10 @@ pub fn generateTrace(gpa: Allocator, seed: u64, cfg: Config) !RecordedTrace {
         const op_total = 4 + prng.below(40);
         const ops = try a.alloc(RecordedOp, op_total);
         for (ops) |*op| {
+            if (cfg.batches and prng.chance(1, 7)) {
+                op.* = .{ .batch = .{ .ops = try genBatch(a, &prng) } };
+                continue;
+            }
             const roll = prng.below(100);
             if (roll < 55) {
                 const k = prng.below(key_count);
@@ -800,6 +873,13 @@ const Replayer = struct {
                     };
                     r.model[d.key] = null;
                 },
+                .batch => |bo| {
+                    commitBatch(&db, bo.ops) catch |e| {
+                        try r.expectFault(e);
+                        return .{ .batch = bo.ops };
+                    };
+                    applyBatch(&r.model, bo.ops);
+                },
                 .get => |g| {
                     var kb: [3]u8 = undefined;
                     const got = db.get(r.gpa, keyName(&kb, g.key)) catch return error.InvariantViolation;
@@ -831,7 +911,9 @@ const Replayer = struct {
 
         if (garbage.len > 0) {
             if (r.sim.fileContent(db_name)) |c| {
-                if (c.len >= 8) try r.sim.appendDurable(db_name, garbage);
+                // A manifest is only ever replaced whole: no torn tail to model
+                // (a store holding batches is a manifest store).
+                if (c.len >= 8 and !isManifest(c)) try r.sim.appendDurable(db_name, garbage);
             }
         }
 
@@ -857,6 +939,7 @@ const Replayer = struct {
                 .none => has_alt = false,
                 .put => |p| alt[p.key] = p.val,
                 .del => |k| alt[k] = null,
+                .batch => |ops| applyBatch(&alt, ops),
             }
             if (has_alt and try modelMatches(r.gpa, &db, &alt)) {
                 r.model = alt;
@@ -988,6 +1071,75 @@ test "VOPR: multi-file stores — rotation, migration and merges under random fa
     try testing.expect(stats.acked_ops >= n * 10);
     try testing.expect(stats.multi_file_stores >= n / 2);
     try testing.expect(stats.partial_merges >= n / 4);
+}
+
+test "VOPR: atomic batches — all or nothing under random faults, single-file and multi-file" {
+    var stats: Stats = .{};
+    const n = seed_count / 4;
+    var seed: u64 = 1;
+    while (seed <= n) : (seed += 1) {
+        // Odd seeds: one growing file after the first batch's rotation;
+        // even seeds: small files, so batches also meet rotation and merges.
+        const cfg: Config = if (seed % 2 == 0)
+            .{ .batches = true, .options = .{ .max_file_size = 4096 }, .partial_merges = seed % 4 == 0 }
+        else
+            .{ .batches = true };
+        try runSeed(testing.allocator, seed, cfg, &stats);
+    }
+    try testing.expect(stats.crashes >= n / 2);
+    try testing.expect(stats.batches_acked >= n);
+    // Teeth: crashes inside a commit were met, and recovery went both ways —
+    // the whole batch survived in some, vanished in others, never half.
+    try testing.expect(stats.batches_survived > 0);
+    try testing.expect(stats.batches_dropped > 0);
+}
+
+test "VOPR: a half-applied batch is neither candidate state (the checker has teeth)" {
+    var model: [key_count]?[]const u8 = @splat(null);
+    model[1] = "old";
+    const ops = [_]BatchOpRec{ .{ .key = 1, .val = null }, .{ .key = 2, .val = "two" }, .{ .key = 3, .val = "three" } };
+    var after = model;
+    applyBatch(&after, &ops);
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), db_name, .{});
+    defer db.close();
+    try db.put("k01", "old");
+    try testing.expect(try modelMatches(testing.allocator, &db, &model));
+    try testing.expect(!try modelMatches(testing.allocator, &db, &after));
+    try commitBatch(&db, &ops);
+    try testing.expect(try modelMatches(testing.allocator, &db, &after));
+    // Every proper prefix of the batch's operations differs from both.
+    for (1..ops.len) |k| {
+        var part = model;
+        applyBatch(&part, ops[0..k]);
+        try testing.expect(!try modelMatches(testing.allocator, &db, &part));
+    }
+}
+
+test "record→replay: batch traces replay clean, and a sabotaged one is caught" {
+    var seed: u64 = 1;
+    var batches: usize = 0;
+    while (seed <= 40) : (seed += 1) {
+        var tr = try generateTrace(testing.allocator, seed, .{ .batches = true });
+        defer tr.deinit();
+        for (tr.epochs) |ep| for (ep.ops) |op| {
+            if (op == .batch) batches += 1;
+        };
+        try replayTrace(testing.allocator, tr.seed, tr.epochs);
+    }
+    try testing.expect(batches >= 40);
+    var caught = false;
+    seed = 1;
+    while (seed <= 64 and !caught) : (seed += 1) {
+        var tr = try generateTrace(testing.allocator, seed, .{ .batches = true, .sabotage = true });
+        defer tr.deinit();
+        if (replayTrace(testing.allocator, tr.seed, tr.epochs)) |_| {} else |e| {
+            try testing.expectEqual(error.InvariantViolation, e);
+            caught = true;
+        }
+    }
+    try testing.expect(caught);
 }
 
 test "VOPR: identical seed reproduces the identical run" {

@@ -167,6 +167,8 @@ const RwLock = struct {
 //   [4..8)  version u32 LE        [4]      op: 0 = put, 1 = del, 2 = put with expiry
 //           1 = ops 0 and 1       [5..9)   key_len   u32 LE
 //           2 = also op 2         [9..13)  value_len u32 LE (0 for del)
+//           4 = also op 3 (batch envelope: key_len 0, the value is a run of
+//               ordinary records, one CRC over all of it; SPEC § "Atomic batch")
 //                                 op 2 only: [13..21) expires_at i64 LE (ms since
 //                                            the Unix epoch, never `no_expiry`)
 //                                 then key bytes, then value bytes
@@ -179,6 +181,10 @@ const RwLock = struct {
 const file_magic = "ZKVL";
 const version_plain: u32 = 1;
 const version_expiry: u32 = 2;
+/// Also op 3, the atomic batch envelope (SPEC § "Atomic batch"). The number
+/// follows the manifest's 3 in the order the formats were added; a data file
+/// of version 4 is never a manifest.
+const version_batch: u32 = 4;
 /// The multi-file store's manifest at `<path>` (see SPEC § "Multi-file log").
 /// Carries the data-file magic on purpose: a build that knows only versions
 /// 1–2 refuses it with `UnsupportedVersion` instead of taking it for a data
@@ -210,6 +216,11 @@ const exp_len = 8;
 const op_put: u8 = 0;
 const op_del: u8 = 1;
 const op_put_exp: u8 = 2;
+/// Batch envelope (version-4 files): a record whose `key_len` is 0 and whose
+/// value is `value_len` bytes of ordinary records (ops 0..2), written by one
+/// `writeAll` under one CRC. Recovery applies the inner records only when the
+/// envelope's CRC holds.
+const op_batch: u8 = 3;
 
 /// The keydir's "this record has no expiry" marker. Never written to disk: an
 /// op-2 record carrying it is not one this module wrote, and reads as corrupt.
@@ -1151,6 +1162,13 @@ pub const Options = struct {
     /// store as of `open` until `refresh`; mutations return
     /// `error.AccessDenied`. See SPEC § "Read-only open".
     read_only: bool = false,
+
+    /// The most bytes one `Batch` may hold (its records, with their
+    /// headers); `Batch.put`/`putTtl`/`delete` past it return
+    /// `error.BatchTooLarge`. Bounds the memory a batch takes and the size of
+    /// the one append that commits it; replay allocates only after a batch's
+    /// CRC holds. Capped at the format's 4 GiB - 1.
+    max_batch_bytes: u64 = 64 << 20,
 };
 
 /// A key's expiry, as `expiresAt` reports it.
@@ -1219,6 +1237,12 @@ pub const GetError = Storage.Error || error{
 };
 
 pub const CompactError = MutateError || error{Corrupt};
+
+pub const BatchError = MutateError || error{
+    /// The batch would hold more than `Options.max_batch_bytes`; nothing was
+    /// added.
+    BatchTooLarge,
+};
 
 /// Embedded crash-consistent KV store. See the module doc for the durability
 /// contract, the corruption policy and the v0 concurrency model.
@@ -1635,15 +1659,15 @@ pub const Db = struct {
                 break :blk std.mem.eql(u8, hdr[0..4], file_magic);
             };
             const version = if (ok) std.mem.readInt(u32, hdr[4..8], .little) else 0;
-            if (!ok or (version != version_plain and version != version_expiry)) {
+            if (!ok or (version != version_plain and version != version_expiry and version != version_batch)) {
                 // Every listed file was created and synced, header included,
                 // before a manifest named it.
                 self.store.close(fh);
                 return error.Corrupt;
             }
-            if (last and version != version_expiry) {
-                // Every data file a multi-file store creates is version 2
-                // (`putExpiring` relies on it for the active file).
+            if (last and version != version_expiry and version != version_batch) {
+                // Every data file a multi-file store creates is version 2 or
+                // 4 (`putExpiring` relies on it for the active file).
                 self.store.close(fh);
                 return error.Corrupt;
             }
@@ -1936,13 +1960,104 @@ pub const Db = struct {
         self.gpa.free(@constCast(kv.key));
     }
 
+    /// Start an atomic batch (SPEC § "Atomic batch"): `put`/`putTtl`/
+    /// `delete` into it, then `commit` — the whole batch becomes durable and
+    /// visible together or, after a crash, not at all. The batch is private
+    /// to the caller until `commit` and takes no lock; release it with
+    /// `deinit`. A batch must not outlive its `Db`.
+    pub fn batch(self: *Db) Batch {
+        return .{ .db = self };
+    }
+
+    /// Append `b` as one envelope (one write, one sync under `.always`) and
+    /// apply its records to the keydir under one exclusive keydir lock.
+    /// Caller holds the writer lock. A delete in a batch always writes its
+    /// tombstone (the key may have been put earlier in the same batch).
+    fn commitBatchLocked(self: *Db, b: *Batch) MutateError!void {
+        if (self.poisoned) return error.Poisoned;
+        const ops = b.ops.items;
+        if (ops.len == 0) return;
+        const buf = b.buf.items;
+        const body_len = buf.len - rec_fixed;
+        buf[4] = op_batch;
+        std.mem.writeInt(u32, buf[5..9], 0, .little);
+        std.mem.writeInt(u32, buf[9..13], @intCast(body_len), .little);
+        std.mem.writeInt(u32, buf[0..4], std.hash.Crc32.hash(buf[4..]), .little);
+
+        // All keydir memory first, so that a batch that reached the disk can
+        // not fail to reach the keydir: one owned copy of each put's key (the
+        // ones an earlier operation of the batch or the keydir already holds
+        // are freed afterwards) and room for every one of them.
+        const dups = try self.gpa.alloc(?[]u8, ops.len);
+        defer self.gpa.free(dups);
+        @memset(dups, null);
+        defer for (dups) |d| if (d) |k| self.gpa.free(k);
+        var n_puts: usize = 0;
+        for (ops, dups) |op, *d| {
+            if (op.op == op_del) continue;
+            d.* = try self.gpa.dupe(u8, buf[op.rec_off + op.keyOff() ..][0..op.key_len]);
+            n_puts += 1;
+        }
+        {
+            // May rehash: readers must not be inside the map meanwhile.
+            self.rw.lock();
+            defer self.rw.unlock();
+            try self.keydir.ensureUnusedCapacity(self.gpa, @intCast(n_puts)); // ops <= 4 GiB / 13 bytes
+        }
+
+        const start = try self.appendVersioned(buf, version_batch);
+
+        self.rw.lock();
+        defer self.rw.unlock();
+        const act = self.active();
+        // The envelope's own header belongs to no key.
+        act.dead_bytes += rec_fixed;
+        self.dead_bytes += rec_fixed;
+        for (ops, dups) |op, *d| {
+            const key = buf[op.rec_off + op.keyOff() ..][0..op.key_len];
+            const rec_off = start + op.rec_off;
+            if (op.op == op_del) {
+                self.addDead(act, recordLen(op.key_len, 0));
+                if (self.keydir.getPtr(key)) |existing| {
+                    self.supersede(existing.*);
+                    if (existing.expires()) self.expiring -= 1;
+                    const kv = self.keydir.fetchRemove(key).?;
+                    self.gpa.free(@constCast(kv.key));
+                }
+                continue;
+            }
+            const entry = Entry{ .file = act, .off = rec_off, .key_len = op.key_len, .val_len = op.val_len, .expires_at = op.expires_at };
+            if (self.keydir.getPtr(key)) |existing| {
+                self.supersede(existing.*);
+                if (existing.expires()) self.expiring -= 1;
+                existing.* = entry;
+            } else {
+                self.keydir.putAssumeCapacity(d.*.?, entry);
+                d.* = null;
+            }
+            self.addLive(entry);
+            if (entry.expires()) self.expiring += 1;
+        }
+    }
+
     /// Append `rec` at the end of the log and sync it as `Options.sync`
     /// says. Poisons the store on any storage error. Caller holds the lock
     /// and advances `end` afterwards.
     /// Returns the record's offset in the (possibly new) active file.
     fn appendLocked(self: *Db, rec: []const u8) MutateError!u64 {
-        if (self.active().size > header_len and self.active().size + rec.len > self.options.max_file_size)
-            self.rotateLocked() catch |e| {
+        return self.appendVersioned(rec, version_plain);
+    }
+
+    /// `appendLocked` for a record that needs a file of at least `min_version`
+    /// (a batch envelope: `version_batch`): an older active file is sealed
+    /// and a new one started, the way a full one is. A new file keeps a
+    /// store that has batches on version 4, so that a rotation does not
+    /// make the next batch rotate again.
+    fn appendVersioned(self: *Db, rec: []const u8, min_version: u32) MutateError!u64 {
+        const cur = self.active();
+        const upgrade = cur.version < min_version;
+        if (upgrade or (cur.size > header_len and cur.size + rec.len > self.options.max_file_size))
+            self.rotateLocked(if (min_version >= version_batch or cur.version >= version_batch) version_batch else version_expiry) catch |e| {
                 self.poisoned = true;
                 return e;
             };
@@ -1968,7 +2083,7 @@ pub const Db = struct {
     /// Seal the active file and start a new one. A single-file store becomes
     /// a multi-file one here (migration). Caller holds the writer lock and
     /// poisons on error: the namespace may be half-changed until reopen.
-    fn rotateLocked(self: *Db) (Allocator.Error || Storage.Error)!void {
+    fn rotateLocked(self: *Db, version: u32) (Allocator.Error || Storage.Error)!void {
         // Seal: everything in the old file durable before a newer file can
         // exist — what lets `open` treat a bad record in a sealed file as rot.
         try self.store.sync(self.active().handle);
@@ -1989,7 +2104,7 @@ pub const Db = struct {
         var h_owned = true;
         defer if (h_owned) self.store.close(h);
         var hdr: [header_len]u8 = undefined;
-        writeHeader(&hdr, version_expiry);
+        writeHeader(&hdr, version);
         try self.store.writeAll(h, &hdr, 0);
         try self.store.sync(h);
 
@@ -2019,7 +2134,7 @@ pub const Db = struct {
         if (!self.multi) self.files.items[0].id = 0;
         self.multi = true;
         self.next_file_id = id + 1;
-        df.* = .{ .id = id, .handle = h, .size = header_len, .version = version_expiry };
+        df.* = .{ .id = id, .handle = h, .size = header_len, .version = version };
         self.files.appendAssumeCapacity(df);
         df_owned = false;
         h_owned = false;
@@ -2547,6 +2662,11 @@ pub const Db = struct {
                 var hdr: [rec_fixed + exp_len]u8 = undefined;
                 try self.store.preadFull(df.handle, hdr[0..rec_fixed], off);
                 const op = hdr[4];
+                // A batch envelope: its records follow, ordinary ones.
+                if (op == op_batch) {
+                    off += rec_fixed;
+                    continue;
+                }
                 const key_len = std.mem.readInt(u32, hdr[5..9], .little);
                 const val_len = std.mem.readInt(u32, hdr[9..13], .little);
                 const body: u64 = rec_fixed + @as(u64, if (op == op_put_exp) exp_len else 0);
@@ -3162,6 +3282,79 @@ pub const Db = struct {
     };
     const replay_window = 64 << 10;
 
+    /// One batch envelope at `off` (`hdr` its first `rec_fixed` bytes, at
+    /// least that many bytes remain in the file): null when it does not
+    /// check out — nothing of it is applied then, and replay treats the
+    /// place as the torn tail. Otherwise applies its records in order and
+    /// returns the envelope's length. Two passes: the first walks the
+    /// records, checks that they tile the body exactly and are records this
+    /// module writes, and the CRC over the whole; only the second allocates
+    /// and touches the keydir.
+    fn replayBatch(self: *Db, df: *DataFile, win: *ReplayWindow, off: u64, file_size: u64, hdr: [rec_fixed]u8, now: i64) OpenError!?u64 {
+        const key_len = std.mem.readInt(u32, hdr[5..9], .little);
+        const val_len = std.mem.readInt(u32, hdr[9..13], .little);
+        if (df.version < version_batch) return null; // not in a v1/v2 file
+        if (key_len != 0 or val_len == 0) return null;
+        if (val_len > file_size - off - rec_fixed) return null; // torn body
+        const end = off + rec_fixed + val_len;
+        var crc = std.hash.Crc32.init();
+        crc.update(hdr[4..]);
+        var pos = off + rec_fixed;
+        while (pos < end) {
+            const r = try self.batchRecord(df, win, pos, end, file_size) orelse return null;
+            var done: u64 = 0;
+            while (done < r.len) {
+                const n: usize = @intCast(@min(replay_window, r.len - done));
+                crc.update(try win.view(self.store, df.handle, file_size, pos + done, n));
+                done += n;
+            }
+            pos += r.len;
+        }
+        if (crc.final() != std.mem.readInt(u32, hdr[0..4], .little)) return null;
+
+        pos = off + rec_fixed;
+        while (pos < end) {
+            const r = (try self.batchRecord(df, win, pos, end, file_size)).?;
+            const key = try self.gpa.alloc(u8, r.key_len);
+            var key_owned = true;
+            defer if (key_owned) self.gpa.free(key);
+            if (r.key_len <= replay_window) {
+                @memcpy(key, try win.view(self.store, df.handle, file_size, pos + r.body, r.key_len));
+            } else {
+                try self.store.preadFull(df.handle, key, pos + r.body);
+            }
+            if (try self.applyRecord(df, r.op, key, pos, r.val_len, r.expires_at, now)) key_owned = false;
+            pos += r.len;
+        }
+        // The envelope's header belongs to no key.
+        df.dead_bytes += rec_fixed;
+        self.dead_bytes += rec_fixed;
+        return end - off;
+    }
+
+    const BatchRec = struct { op: u8, key_len: u32, val_len: u32, expires_at: i64, body: u64, len: u64 };
+
+    /// The record of a batch's body at `pos` (the body ends at `end`), or
+    /// null when it is not one this module writes or does not fit.
+    fn batchRecord(self: *Db, df: *DataFile, win: *ReplayWindow, pos: u64, end: u64, file_size: u64) OpenError!?BatchRec {
+        const left = end - pos;
+        if (left < rec_fixed) return null;
+        const f = try win.view(self.store, df.handle, file_size, pos, @intCast(@min(left, rec_fixed + exp_len)));
+        const op = f[4];
+        const key_len = std.mem.readInt(u32, f[5..9], .little);
+        const val_len = std.mem.readInt(u32, f[9..13], .little);
+        // Not a batch inside a batch, and no op a v2 file would not know.
+        if (op != op_put and op != op_del and op != op_put_exp) return null;
+        if (op == op_del and val_len != 0) return null;
+        const body: u64 = rec_fixed + @as(u64, if (op == op_put_exp) exp_len else 0);
+        if (body > left) return null;
+        if (@as(u64, key_len) + val_len > left - body) return null;
+        const expires_at: i64 = if (op == op_put_exp) std.mem.readInt(i64, f[rec_fixed..][0..exp_len], .little) else no_expiry;
+        // CRC-valid or not, never a record this module writes.
+        if (op == op_put_exp and expires_at == no_expiry) return null;
+        return .{ .op = op, .key_len = key_len, .val_len = val_len, .expires_at = expires_at, .body = body, .len = body + key_len + val_len };
+    }
+
     fn replay(self: *Db, df: *DataFile, start: u64, file_size: u64, tail: Tail) OpenError!void {
         // The clock is read once, and only for a file that can hold expiry.
         const now: i64 = if (df.version >= version_expiry) self.options.clock.now() else 0;
@@ -3175,6 +3368,12 @@ pub const Db = struct {
             const op = fixed[4];
             const key_len = std.mem.readInt(u32, fixed[5..9], .little);
             const val_len = std.mem.readInt(u32, fixed[9..13], .little);
+            if (op == op_batch) {
+                // A whole batch or nothing: applied only once its CRC holds.
+                const hdr: [rec_fixed]u8 = fixed[0..rec_fixed].*;
+                off += try self.replayBatch(df, &win, off, file_size, hdr, now) orelse break :scan;
+                continue :scan;
+            }
             if (op != op_put and op != op_del and op != op_put_exp) break; // corrupt op byte
             if (op == op_put_exp and df.version < version_expiry) break; // not in a v1 file
             if (op == op_del and val_len != 0) break;
@@ -3231,6 +3430,108 @@ pub const Db = struct {
             },
         };
         df.size = off;
+    }
+};
+
+/// An atomic batch of puts and deletes (`Db.batch`): `commit` writes them as
+/// one envelope — one append, one sync under `SyncPolicy.always` — and makes
+/// them visible to readers together. Operations apply in the order added, so
+/// the last word on a key wins, exactly as if each had been its own call.
+/// Not thread-safe by itself (one batch, one thread); different batches and
+/// the `Db`'s other calls may run concurrently.
+pub const Batch = struct {
+    db: *Db,
+    /// `rec_fixed` bytes of room for the envelope header (written at
+    /// commit), then the operations as ordinary records.
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    ops: std.ArrayListUnmanaged(Op) = .empty,
+
+    const Op = struct {
+        op: u8,
+        /// Offset of the record inside `buf`.
+        rec_off: usize,
+        key_len: u32,
+        val_len: u32,
+        expires_at: i64,
+
+        fn keyOff(o: Op) usize {
+            return rec_fixed + @as(usize, if (o.op == op_put_exp) exp_len else 0);
+        }
+    };
+
+    pub fn deinit(b: *Batch) void {
+        b.buf.deinit(b.db.gpa);
+        b.ops.deinit(b.db.gpa);
+        b.* = undefined;
+    }
+
+    /// Number of operations held.
+    pub fn len(b: *const Batch) usize {
+        return b.ops.items.len;
+    }
+
+    /// Drop every operation added so far.
+    pub fn clear(b: *Batch) void {
+        b.buf.clearRetainingCapacity();
+        b.ops.clearRetainingCapacity();
+    }
+
+    /// Add "set `key` to `value`" (as `Db.put`).
+    pub fn put(b: *Batch, key: []const u8, value: []const u8) BatchError!void {
+        return b.add(op_put, no_expiry, key, value);
+    }
+
+    /// Add `Db.putExpiring`.
+    pub fn putExpiring(b: *Batch, key: []const u8, value: []const u8, expires_at_ms: i64) BatchError!void {
+        return b.add(if (expires_at_ms == no_expiry) op_put else op_put_exp, expires_at_ms, key, value);
+    }
+
+    /// Add `Db.putTtl`; the instant is taken from `Options.clock` now.
+    pub fn putTtl(b: *Batch, key: []const u8, value: []const u8, ttl_ms: u64) BatchError!void {
+        const now = b.db.options.clock.now();
+        const ttl: i64 = std.math.cast(i64, ttl_ms) orelse std.math.maxInt(i64);
+        return b.putExpiring(key, value, now +| ttl);
+    }
+
+    /// Add "delete `key`". Unlike `Db.delete` it always writes its
+    /// tombstone, present key or not: an earlier operation of this batch may
+    /// have put it.
+    pub fn delete(b: *Batch, key: []const u8) BatchError!void {
+        return b.add(op_del, no_expiry, key, "");
+    }
+
+    fn add(b: *Batch, op: u8, expires_at: i64, key: []const u8, value: []const u8) BatchError!void {
+        if (key.len > std.math.maxInt(u32)) return error.KeyTooLong;
+        if (value.len > std.math.maxInt(u32)) return error.ValueTooLong;
+        const gpa = b.db.gpa;
+        const rec_len = recordLenExp(op == op_put_exp, key.len, value.len);
+        const held: u64 = if (b.buf.items.len == 0) 0 else b.buf.items.len - rec_fixed;
+        const limit = @min(b.db.options.max_batch_bytes, std.math.maxInt(u32));
+        // `held` and `rec_len` are each below 2^33 and 2^34: no overflow.
+        if (held + rec_len > limit) return error.BatchTooLarge;
+        try b.ops.ensureUnusedCapacity(gpa, 1);
+        if (b.buf.items.len == 0) try b.buf.appendNTimes(gpa, 0, rec_fixed);
+        const at = b.buf.items.len;
+        try b.buf.resize(gpa, at + @as(usize, @intCast(rec_len)));
+        encodeRecordExp(b.buf.items[at..], op, expires_at, key, value);
+        b.ops.appendAssumeCapacity(.{ .op = op, .rec_off = at, .key_len = @intCast(key.len), .val_len = @intCast(value.len), .expires_at = expires_at });
+    }
+
+    /// Make the batch durable and visible: all of its operations, or — if
+    /// this returns an error or the machine dies first — none. An empty
+    /// batch commits nothing. On success the batch is empty again; on error
+    /// it is unchanged (a storage error also poisons the `Db`, as for `put`).
+    ///
+    /// The first commit into a store whose active file predates batches
+    /// starts a new version-4 file (a single-file store becomes a manifest
+    /// store, SPEC § "Atomic batch"); older builds cannot open the result.
+    pub fn commit(b: *Batch) BatchError!void {
+        const db = b.db;
+        if (db.options.read_only) return error.AccessDenied;
+        db.lock.acquire();
+        defer db.lock.release();
+        try db.commitBatchLocked(b);
+        b.clear();
     }
 };
 
@@ -7701,9 +8002,9 @@ test "merge: a marker is kept only for a key that is gone, and an expired record
             var db = try Db.open(testing.allocator, sim.storage(), "db", options);
             defer db.close();
             try db.put("k", "old");
-            try db.rotateLocked();
+            try db.rotateLocked(version_expiry);
             try db.putExpiring("k", "new", 100);
-            try db.rotateLocked();
+            try db.rotateLocked(version_expiry);
             mc.now_ms = 200;
             try db.merge(&.{db.files.items[1].id});
             try expectGet(&db, "k", null);
@@ -7721,10 +8022,10 @@ test "merge: a marker is kept only for a key that is gone, and an expired record
         var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
         defer db.close();
         try db.put("x", "1");
-        try db.rotateLocked();
+        try db.rotateLocked(version_expiry);
         try db.put("a", "1");
         try db.delete("a");
-        try db.rotateLocked();
+        try db.rotateLocked(version_expiry);
         try db.put("a", "2");
         try testing.expectEqual(@as(usize, 3), db.files.items.len);
         try db.merge(&.{db.files.items[1].id});
@@ -8310,4 +8611,557 @@ test "replay: a CRC-valid record with an op byte this module never writes ends t
     try expectGet(&db, "bad", null);
     try testing.expectEqual(@as(usize, 1), db.count());
     try testing.expectEqual(good_len, sim.fileContent("db").?.len); // the tail was cut
+}
+
+// ── atomic batch (2026-11-15) ────────────────────────────────────────────────
+
+/// The v4 data file a first batch lands in (a fresh store: id 1).
+const batch_file = "db.1.data";
+
+/// An envelope with a valid CRC around `body` (any bytes): for forging what
+/// this module would never write.
+fn forgeEnvelope(gpa: Allocator, op: u8, key_len: u32, body: []const u8) ![]u8 {
+    const out = try gpa.alloc(u8, rec_fixed + body.len);
+    out[4] = op;
+    std.mem.writeInt(u32, out[5..9], key_len, .little);
+    std.mem.writeInt(u32, out[9..13], @intCast(body.len), .little);
+    @memcpy(out[rec_fixed..], body);
+    std.mem.writeInt(u32, out[0..4], std.hash.Crc32.hash(out[4..]), .little);
+    return out;
+}
+
+test "batch: puts, overwrites and deletes commit together and survive a reopen" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("old", "1");
+        try db.put("gone", "2");
+        var b = db.batch();
+        defer b.deinit();
+        try b.put("a", "A");
+        try b.put("b", "B");
+        try b.put("a", "A2"); // the last word wins
+        try b.delete("gone");
+        try b.delete("old");
+        try b.put("old", "again"); // delete, then put
+        try b.put("tmp", "x");
+        try b.delete("tmp"); // put, then delete: absent in the end
+        try b.delete("never-there"); // a tombstone for a key nobody holds
+        try testing.expectEqual(@as(usize, 9), b.len());
+        // Nothing is visible before the commit.
+        try expectGet(&db, "a", null);
+        try expectGet(&db, "gone", "2");
+        try b.commit();
+        try testing.expectEqual(@as(usize, 0), b.len());
+        try expectGet(&db, "a", "A2");
+        try expectGet(&db, "b", "B");
+        try expectGet(&db, "gone", null);
+        try expectGet(&db, "old", "again");
+        try expectGet(&db, "tmp", null);
+        try testing.expectEqual(@as(usize, 3), db.count());
+        try expectAccounting(&db);
+        // The batch is reusable.
+        try b.put("c", "C");
+        try b.commit();
+        try expectGet(&db, "c", "C");
+        try expectAccounting(&db);
+    }
+    // The batch's file is version 4 and the store a manifest store.
+    const f = sim.fileContent(batch_file).?;
+    try testing.expectEqual(version_batch, std.mem.readInt(u32, f[4..8], .little));
+    try testing.expectEqual(version_manifest, std.mem.readInt(u32, sim.fileContent("db").?[4..8], .little));
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    try expectGet(&db, "a", "A2");
+    try expectGet(&db, "b", "B");
+    try expectGet(&db, "gone", null);
+    try expectGet(&db, "old", "again");
+    try expectGet(&db, "c", "C");
+    try testing.expectEqual(@as(usize, 4), db.count());
+    try expectAccounting(&db);
+}
+
+test "batch: one sync for the whole batch, none for an empty one" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var spy: SpyStorage = .{ .inner = sim.storage() };
+    var db = try Db.open(testing.allocator, spy.storage(), "db", .{});
+    defer db.close();
+    try db.put("x", "1");
+    var b = db.batch();
+    defer b.deinit();
+    const w0 = sim.ops_seen;
+    try b.commit(); // empty
+    try testing.expectEqual(w0, sim.ops_seen);
+    try b.put("a", "1");
+    try b.commit(); // the first one starts the v4 file (rotation syncs)
+    var syncs = spy.syncs;
+    for (0..20) |i| {
+        var kb: [8]u8 = undefined;
+        try b.put(std.mem.print(&kb, "k{d}", .{i}) catch unreachable, v30);
+    }
+    try b.delete("a");
+    try b.commit();
+    try testing.expectEqual(syncs + 1, spy.syncs); // 21 operations, one fsync
+    syncs = spy.syncs;
+    try db.put("p", "1"); // a plain put is one sync, as before
+    try testing.expectEqual(syncs + 1, spy.syncs);
+}
+
+test "batch: a torn batch is dropped whole, at every cut of its bytes" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("p", "before");
+        var b = db.batch();
+        defer b.deinit();
+        try b.put("q", "first");
+        try b.commit(); // the v4 file exists, holds "q"
+    }
+    var before_len: usize = 0;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        before_len = sim.fileContent(batch_file).?.len;
+        var b = db.batch();
+        defer b.deinit();
+        try b.put("a", "A");
+        try b.put("b", v30);
+        try b.delete("p");
+        try b.putTtl("t", "ttl", 1000);
+        try b.commit();
+    }
+    const full = try testing.allocator.dupe(u8, sim.fileContent(batch_file).?);
+    defer testing.allocator.free(full);
+    try testing.expect(full.len > before_len + 40);
+    var cut: usize = before_len;
+    while (cut <= full.len) : (cut += 1) {
+        try sim.installFile(batch_file, full[0..cut]);
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        if (cut == full.len) {
+            try expectGet(&db, "a", "A");
+            try expectGet(&db, "b", v30);
+            try expectGet(&db, "p", null);
+            try expectGet(&db, "t", "ttl");
+            try testing.expectEqual(@as(usize, 4), db.count());
+        } else {
+            // Not one of its operations, and nothing else changed.
+            try expectGet(&db, "a", null);
+            try expectGet(&db, "b", null);
+            try expectGet(&db, "t", null);
+            try expectGet(&db, "p", "before");
+            try expectGet(&db, "q", "first");
+            try testing.expectEqual(@as(usize, 2), db.count());
+            // The torn tail was cut, so the next write lands on a clean log.
+            try testing.expectEqual(before_len, sim.fileContent(batch_file).?.len);
+        }
+        try expectAccounting(&db);
+    }
+}
+
+test "batch: a flipped bit anywhere in a committed batch drops it whole" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var start: usize = 0;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("p", "before");
+        var b = db.batch();
+        defer b.deinit();
+        try b.put("q", "first");
+        try b.commit();
+        start = sim.fileContent(batch_file).?.len;
+        try b.put("a", "A");
+        try b.put("b", "B");
+        try b.commit();
+    }
+    const full = try testing.allocator.dupe(u8, sim.fileContent(batch_file).?);
+    defer testing.allocator.free(full);
+    var at: usize = start;
+    while (at < full.len) : (at += 1) {
+        const bad = try testing.allocator.dupe(u8, full);
+        defer testing.allocator.free(bad);
+        bad[at] ^= 0x10;
+        try sim.installFile(batch_file, bad);
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try expectGet(&db, "a", null);
+        try expectGet(&db, "b", null);
+        try expectGet(&db, "q", "first");
+        try testing.expectEqual(@as(usize, 2), db.count());
+    }
+}
+
+test "batch: a sealed file holding a damaged batch is refused, not cut" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        var b = db.batch();
+        defer b.deinit();
+        try b.put("a", "A");
+        try b.put("b", "B");
+        try b.commit();
+        try db.rotateLocked(version_batch); // seal it
+        try db.put("z", "Z");
+    }
+    sim.flipByte(batch_file, header_len + 20);
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "db", .{}));
+}
+
+test "batch: forged envelopes with a valid CRC are not applied" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        var b = db.batch();
+        defer b.deinit();
+        try b.put("q", "first");
+        try b.commit();
+    }
+    const base = try testing.allocator.dupe(u8, sim.fileContent(batch_file).?);
+    defer testing.allocator.free(base);
+
+    var good: [rec_fixed + 1 + 1]u8 = undefined;
+    encodeRecord(&good, op_put, "k", "v");
+    var nested_inner: [rec_fixed + 1 + 1]u8 = undefined;
+    encodeRecord(&nested_inner, op_put, "n", "v");
+    const nested = try forgeEnvelope(testing.allocator, op_batch, 0, &nested_inner);
+    defer testing.allocator.free(nested);
+    var exp_rec: [rec_fixed + exp_len + 1 + 1]u8 = undefined;
+    encodeRecordExp(&exp_rec, op_put_exp, no_expiry, "e", "v");
+    var del_val: [rec_fixed + 1 + 1]u8 = undefined;
+    encodeRecord(&del_val, op_del, "d", "v"); // a delete that carries a value
+    var bad_op: [rec_fixed + 1 + 1]u8 = undefined;
+    encodeRecord(&bad_op, 7, "x", "v");
+    var cases: std.ArrayList([]u8) = .empty;
+    defer {
+        for (cases.items) |c| testing.allocator.free(c);
+        cases.deinit(testing.allocator);
+    }
+    // key_len != 0, an empty body, a batch inside a batch, an expiry that
+    // means "none", a delete with a value, an unknown op, a body that stops
+    // short of its last record, bytes left over after the last record.
+    try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 1, &good));
+    try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, ""));
+    try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, nested));
+    try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, &exp_rec));
+    try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, &del_val));
+    try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, &bad_op));
+    try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, good[0 .. good.len - 1]));
+    try cases.append(testing.allocator, try forgeEnvelope(testing.allocator, op_batch, 0, &(good ++ [_]u8{0})));
+    for (cases.items, 0..) |env, i| {
+        const forged = try std.mem.concat(testing.allocator, u8, &.{ base, env });
+        defer testing.allocator.free(forged);
+        try sim.installFile(batch_file, forged);
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        testing.expectEqual(@as(usize, 1), db.count()) catch |e| {
+            std.debug.print("forged case {d} was applied\n", .{i});
+            return e;
+        };
+        try expectGet(&db, "k", null);
+        try testing.expectEqual(base.len, sim.fileContent(batch_file).?.len);
+    }
+    // And the control: the same shape, well formed, is applied.
+    const ok = try forgeEnvelope(testing.allocator, op_batch, 0, &good);
+    defer testing.allocator.free(ok);
+    const forged = try std.mem.concat(testing.allocator, u8, &.{ base, ok });
+    defer testing.allocator.free(forged);
+    try sim.installFile(batch_file, forged);
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    try expectGet(&db, "k", "v");
+}
+
+test "batch: op 3 in a version-1 or 2 file is a torn record, as op 2 is in version 1" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try db.put("a", "A");
+    }
+    var inner: [rec_fixed + 1 + 1]u8 = undefined;
+    encodeRecord(&inner, op_put, "k", "v");
+    const env = try forgeEnvelope(testing.allocator, op_batch, 0, &inner);
+    defer testing.allocator.free(env);
+    const len = sim.fileContent("db").?.len;
+    try sim.appendDurable("db", env);
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    try expectGet(&db, "k", null);
+    try expectGet(&db, "a", "A");
+    try testing.expectEqual(len, sim.fileContent("db").?.len);
+}
+
+test "batch: BatchTooLarge leaves the batch as it was, memory stays bounded" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_batch_bytes = 100 });
+    defer db.close();
+    var b = db.batch();
+    defer b.deinit();
+    try b.put("a", v30); // 13 + 1 + 30 = 44
+    try b.put("b", v30); // 88
+    try testing.expectError(error.BatchTooLarge, b.put("c", v30)); // 132 > 100
+    try testing.expectError(error.BatchTooLarge, b.putTtl("c", "", 5)); // 22 + 88 > 100
+    try testing.expectEqual(@as(usize, 2), b.len());
+    try testing.expectError(error.BatchTooLarge, b.delete("c")); // 88 + 14 > 100
+    try b.commit();
+    try testing.expectEqual(@as(usize, 2), db.count());
+    // One record alone over the limit: refused, nothing held.
+    try testing.expectError(error.BatchTooLarge, b.put("x", &@as([100]u8, @splat('x'))));
+    try testing.expectEqual(@as(usize, 0), b.len());
+    try testing.expectEqual(@as(usize, 0), b.buf.items.len);
+}
+
+test "batch: rotation — a batch never straddles files, a big one gets a file of its own" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const options: Options = .{ .max_file_size = 200 };
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        var b = db.batch();
+        defer b.deinit();
+        for (0..6) |round| {
+            for (0..3) |i| {
+                var kb: [8]u8 = undefined;
+                try b.put(std.mem.print(&kb, "r{d}k{d}", .{ round, i }) catch unreachable, v30);
+            }
+            try b.commit();
+        }
+        // 3 x 44 bytes + the 13 of the envelope = 145: one batch per file at 200.
+        try testing.expect(db.files.items.len >= 6);
+        // (all but the migrated legacy file, which holds nothing)
+        for (db.files.items[1..]) |df| try testing.expectEqual(@as(u32, version_batch), df.version);
+        // A batch larger than the limit: a file of its own.
+        for (0..10) |i| {
+            var kb: [8]u8 = undefined;
+            try b.put(std.mem.print(&kb, "big{d}", .{i}) catch unreachable, v30);
+        }
+        try b.commit();
+        try testing.expectEqual(@as(usize, 28), db.count());
+        try expectAccounting(&db);
+        // Plain writes after batches stay on version 4 files.
+        try db.put("plain", v30);
+        try db.put("plain2", v30);
+        for (db.files.items[1..]) |df| try testing.expectEqual(@as(u32, version_batch), df.version);
+    }
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    defer db.close();
+    try testing.expectEqual(@as(usize, 30), db.count());
+    try expectGet(&db, "r5k2", v30);
+    try expectGet(&db, "big9", v30);
+    try expectAccounting(&db);
+}
+
+test "batch: merge and compact turn batched records into ordinary live entries" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 0 };
+    const options: Options = .{ .max_file_size = 150, .clock = mc.clock() };
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        var b = db.batch();
+        defer b.deinit();
+        try b.put("a", v30);
+        try b.put("b", v30);
+        try b.putTtl("t", v30, 100);
+        try b.commit();
+        try b.put("a", "A2");
+        try b.delete("b");
+        try b.put("c", v30);
+        try b.commit();
+        try b.put("d", v30);
+        try b.put("e", v30);
+        try b.commit();
+        try expectAccounting(&db);
+        // Merge the sealed files (all but the active one).
+        const stats = try db.fileStats(testing.allocator);
+        defer testing.allocator.free(stats);
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(testing.allocator);
+        for (stats) |st| if (!st.active) try ids.append(testing.allocator, st.id);
+        try testing.expect(ids.items.len >= 2);
+        try db.merge(ids.items);
+        try expectAccounting(&db);
+        try expectGet(&db, "a", "A2");
+        try expectGet(&db, "b", null);
+        try expectGet(&db, "t", v30);
+        try expectGet(&db, "c", v30);
+        mc.now_ms = 500; // "t" has expired
+        try db.compact();
+        try expectAccounting(&db);
+        try expectGet(&db, "t", null);
+        try expectGet(&db, "e", v30);
+        try testing.expectEqual(@as(u64, 0), db.deadBytes());
+    }
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    defer db.close();
+    try testing.expectEqual(@as(usize, 4), db.count());
+    try expectGet(&db, "a", "A2");
+    try expectGet(&db, "e", v30);
+    try expectAccounting(&db);
+}
+
+test "batch: per-op expiry, an op already past, and an expired key at replay" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 1000 };
+    const options: Options = .{ .clock = mc.clock() };
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+        defer db.close();
+        try db.put("k", "plain");
+        var b = db.batch();
+        defer b.deinit();
+        try b.putTtl("live", "v", 500);
+        try b.putExpiring("past", "v", 999);
+        try b.putExpiring("k", "x", 1200); // an expiring overwrite of a plain key
+        try b.putExpiring("forever", "v", no_expiry); // no expiry at all
+        try b.commit();
+        try testing.expectEqual(@as(usize, 3), db.count());
+        try expectGet(&db, "past", null);
+        try testing.expectEqual(Expiry{ .at_ms = 1500 }, db.expiresAt("live").?);
+        try testing.expectEqual(Expiry.never, db.expiresAt("forever").?);
+        try testing.expectEqual(@as(usize, 3), db.expiring); // "past" too, as `putExpiring` keeps it until a compact
+        mc.now_ms = 1300; // "k" is gone, "live" is not
+        try expectGet(&db, "k", null);
+        try expectGet(&db, "live", "v");
+    }
+    mc.now_ms = 1300;
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    defer db.close();
+    try testing.expectEqual(@as(usize, 2), db.count());
+    try expectGet(&db, "k", null);
+    try expectGet(&db, "live", "v");
+    try expectAccounting(&db);
+}
+
+test "batch: a read-only opener beside a live writer never sees half a batch" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var w = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer w.close();
+    try w.put("p", "before");
+    var b = w.batch();
+    defer b.deinit();
+    try b.put("a", "A");
+    try b.put("b", "B");
+    try b.commit();
+    const full = try testing.allocator.dupe(u8, sim.fileContent(batch_file).?);
+    defer testing.allocator.free(full);
+    try b.put("c", v30);
+    try b.put("d", v30);
+    try b.commit();
+    const longer = try testing.allocator.dupe(u8, sim.fileContent(batch_file).?);
+    defer testing.allocator.free(longer);
+    // The writer's second batch is mid-write at every length: the reader
+    // has the first batch whole and none of the second, and changes nothing.
+    var cut: usize = full.len;
+    while (cut <= longer.len) : (cut += 1) {
+        try sim.installFile(batch_file, longer[0..cut]);
+        var r = try Db.open(testing.allocator, sim.storage(), "db", .{ .read_only = true });
+        defer r.close();
+        try expectGet(&r, "a", "A");
+        try expectGet(&r, "b", "B");
+        if (cut == longer.len) {
+            try expectGet(&r, "c", v30);
+            try expectGet(&r, "d", v30);
+        } else {
+            try expectGet(&r, "c", null);
+            try expectGet(&r, "d", null);
+            try testing.expectEqual(cut, sim.fileContent(batch_file).?.len);
+        }
+    }
+    try testing.expectError(error.AccessDenied, blk: {
+        var r = try Db.open(testing.allocator, sim.storage(), "db", .{ .read_only = true });
+        defer r.close();
+        var rb = r.batch();
+        defer rb.deinit();
+        try rb.put("x", "y");
+        break :blk rb.commit();
+    });
+}
+
+test "batch: a storage error poisons the store and leaves the keydir as it was" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var spy: SpyStorage = .{ .inner = sim.storage() };
+    {
+        var db = try Db.open(testing.allocator, spy.storage(), "db", .{});
+        defer db.close();
+        try db.put("k", "old");
+        var b = db.batch();
+        defer b.deinit();
+        try b.put("a", "A"); // the first batch creates the v4 file
+        try b.commit();
+        try b.put("k", "new");
+        try b.put("b", "B");
+        spy.fail_write_in = 0;
+        try testing.expectError(error.InputOutput, b.commit());
+        try testing.expect(db.poisoned);
+        try testing.expectEqual(@as(usize, 2), b.len()); // unchanged
+        try expectGet(&db, "k", "old");
+        try expectGet(&db, "b", null);
+        try testing.expectError(error.Poisoned, b.commit());
+        try testing.expectError(error.Poisoned, db.put("z", "1"));
+    }
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    try expectGet(&db, "k", "old");
+    try expectGet(&db, "a", "A");
+    try expectGet(&db, "b", null);
+}
+
+test "batch: out of memory inside a commit leaves all or nothing, never a part" {
+    var fail_at: usize = 0;
+    while (fail_at < 60) : (fail_at += 1) {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+        {
+            var db = try Db.open(fa.allocator(), sim.storage(), "db", .{});
+            defer db.close();
+            try db.put("k", "old");
+            var b = db.batch();
+            defer b.deinit();
+            try b.put("k", "new");
+            try b.put("a", "A");
+            try b.delete("k");
+            try b.put("k", "newer");
+            fa.fail_index = fa.alloc_index + fail_at;
+            b.commit() catch |e| {
+                try testing.expectEqual(error.OutOfMemory, e);
+                if (!db.poisoned) {
+                    // Refused before anything was written: nothing changed.
+                    try expectGet(&db, "k", "old");
+                    try expectGet(&db, "a", null);
+                    try testing.expectEqual(@as(usize, 1), db.count());
+                    continue;
+                }
+            };
+        }
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        const applied = db.count() == 2;
+        if (applied) {
+            try expectGet(&db, "k", "newer");
+            try expectGet(&db, "a", "A");
+        } else {
+            try testing.expectEqual(@as(usize, 1), db.count());
+            try expectGet(&db, "k", "old");
+        }
+    }
 }
