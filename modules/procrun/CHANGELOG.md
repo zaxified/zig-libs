@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: the stop-signal helper item moved to the new module `stopsignal`; new item recorded — the child inherits the parent's blocked signal mask (spawner restores the parent's current mask, never resets it).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: Stop-signal helper for a daemon's own SIGTERM/SIGINT (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `monoNowNs` (duplicate-code pass), including its hand-written Windows QPC branch, is replaced by `clock.monotonicNs()` (same QPC math, no libc). New dependency: `clock`.
