@@ -42,8 +42,59 @@ const ta_bad_param: i32 = 2;
 const vec_n = 40;
 
 /// Same order as the C `F_*` enum.
-const Func = enum(u8) { sma, ema, wma, ma, macd, macdext, macdfix, rsi, bbands, trange, atr, natr, stoch, stochf, max, min, sum };
-const func_names = [_][]const u8{ "SMA", "EMA", "WMA", "MA", "MACD", "MACDEXT", "MACDFIX", "RSI", "BBANDS", "TRANGE", "ATR", "NATR", "STOCH", "STOCHF", "MAX", "MIN", "SUM" };
+const Func = enum(u8) {
+    sma,
+    ema,
+    wma,
+    ma,
+    macd,
+    macdext,
+    macdfix,
+    rsi,
+    bbands,
+    trange,
+    atr,
+    natr,
+    stoch,
+    stochf,
+    max,
+    min,
+    sum,
+    // wave I3
+    dema,
+    tema,
+    t3,
+    trima,
+    kama,
+    midpoint,
+    midprice,
+    sar,
+    sarext,
+    mavp,
+    accbands,
+    alma,
+    cksp,
+    donchian,
+    frama,
+    hma,
+    ichimoku,
+    kc,
+    mcgd,
+    rma,
+    supertrend,
+    swak_butter,
+    swak_gauss,
+    vidya,
+    vwma,
+    zigzag,
+    zlema,
+};
+const func_names = [_][]const u8{
+    "SMA",      "EMA",      "WMA",    "MA",     "MACD",       "MACDEXT",     "MACDFIX",    "RSI",   "BBANDS",   "TRANGE", "ATR",
+    "NATR",     "STOCH",    "STOCHF", "MAX",    "MIN",        "SUM",         "DEMA",       "TEMA",  "T3",       "TRIMA",  "KAMA",
+    "MIDPOINT", "MIDPRICE", "SAR",    "SAREXT", "MAVP",       "ACCBANDS",    "ALMA",       "CKSP",  "DONCHIAN", "FRAMA",  "HMA",
+    "ICHIMOKU", "KC",       "MCGD",   "RMA",    "SUPERTREND", "SWAK_BUTTER", "SWAK_GAUSS", "VIDYA", "VWMA",     "ZIGZAG", "ZLEMA",
+};
 const n_func = func_names.len;
 
 /// Allowed distance in ULPs, per function. Everything is expected to be bitwise:
@@ -51,18 +102,33 @@ const n_func = func_names.len;
 /// `a*b + c` outside the explicit `fma` calls. A nonzero entry must say why.
 const ulp_bound = [n_func]u64{
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 
-fn nIn(f: Func) usize {
+/// What the inputs are: close; high+low; high+low+close; close+volume; close+per-bar periods.
+const InKind = enum { c, hl, hlc, cv, cp };
+fn inKind(f: Func) InKind {
     return switch (f) {
-        .trange, .atr, .natr, .stoch, .stochf => 3,
-        else => 1,
+        .trange, .atr, .natr, .stoch, .stochf, .accbands, .cksp, .kc, .supertrend => .hlc,
+        .midprice, .sar, .sarext, .donchian, .frama, .ichimoku, .zigzag => .hl,
+        .vwma => .cv,
+        .mavp => .cp,
+        else => .c,
+    };
+}
+fn nIn(f: Func) usize {
+    return switch (inKind(f)) {
+        .c => 1,
+        .hl, .cv, .cp => 2,
+        .hlc => 3,
     };
 }
 fn nOut(f: Func) usize {
     return switch (f) {
-        .macd, .macdext, .macdfix, .bbands => 3,
-        .stoch, .stochf => 2,
+        .macd, .macdext, .macdfix, .bbands, .accbands, .donchian, .kc, .zigzag => 3,
+        .ichimoku => 4,
+        .stoch, .stochf, .cksp, .supertrend => 2,
         else => 1,
     };
 }
@@ -74,7 +140,7 @@ const Case = struct {
     ubars: u32 = 0,
     n: u32,
     ip: [6]i32 = @splat(0),
-    dp: [2]f64 = .{ 0, 0 },
+    dp: [8]f64 = @splat(0),
     kind: u8 = 0, // input kind: 0 walk, 1 walk with flat runs, 2 walk scaled by 1e-9
     seed: u64 = 0,
     bad: bool = false,
@@ -118,6 +184,47 @@ fn genInput(seed: u64, kind: u8, h: []f64, l: []f64, c: []f64) void {
     }
 }
 
+/// The second series of VWMA (volume, with zero stretches) and MAVP (per-bar
+/// periods, -1..15 with an occasional NaN, so both clamps are exercised).
+fn genAux(f: Func, seed: u64, kind: u8, a: []f64) void {
+    var prng = std.Random.DefaultPrng.init(seed ^ 0x5bd1_e995);
+    const r = prng.random();
+    var zero_run: usize = 0;
+    for (a) |*x| {
+        if (inKind(f) == .cp) {
+            x.* = if (kind == 1 and r.uintLessThan(u8, 40) == 0) std.math.nan(f64) else -1.0 + r.float(f64) * 16.0;
+        } else if (zero_run > 0) {
+            zero_run -= 1;
+            x.* = 0.0;
+        } else {
+            x.* = 100.0 + r.float(f64) * 900.0;
+            if (r.uintLessThan(u8, 25) == 0) x.* = 0.0;
+            if (kind == 1 and r.uintLessThan(u8, 6) == 0) zero_run = r.uintLessThan(usize, 12);
+        }
+    }
+}
+
+fn needsAux(f: Func) bool {
+    return switch (inKind(f)) {
+        .cv, .cp => true,
+        else => false,
+    };
+}
+
+/// Input `q` of function `f` out of the generated series.
+fn srcOf(comptime T: type, f: Func, q: usize, h: []const T, l: []const T, c: []const T, au: []const T) []const T {
+    return switch (inKind(f)) {
+        .c => c,
+        .hl => if (q == 0) h else l,
+        .hlc => switch (q) {
+            0 => h,
+            1 => l,
+            else => c,
+        },
+        .cv, .cp => if (q == 0) c else au,
+    };
+}
+
 // ── ours ────────────────────────────────────────────────────────────────────
 
 const OursError = ind.Error || std.mem.Allocator.Error;
@@ -129,8 +236,9 @@ fn us(x: i32) usize {
     return @intCast(x);
 }
 
-fn runOurs(comptime T: type, gpa: std.mem.Allocator, cs: Case, h: []const T, l: []const T, c: []const T, o: *[3][]T) OursError!usize {
+fn runOurs(comptime T: type, gpa: std.mem.Allocator, cs: Case, h: []const T, l: []const T, c: []const T, au: []const T, o: *[4][]T) OursError!usize {
     const ip = cs.ip;
+    const dp = cs.dp;
     const un = cs.unstable();
     return switch (cs.func) {
         .sma => ind.sma(T, c, o[0], .{ .period = us(ip[0]) }),
@@ -141,7 +249,7 @@ fn runOurs(comptime T: type, gpa: std.mem.Allocator, cs: Case, h: []const T, l: 
         .macdext => ind.macdext(T, gpa, c, o[0], o[1], o[2], .{ .fast = us(ip[0]), .fast_ma = mt(ip[1]), .slow = us(ip[2]), .slow_ma = mt(ip[3]), .signal = us(ip[4]), .signal_ma = mt(ip[5]), .unstable = un }),
         .macdfix => ind.macdfix(T, c, o[0], o[1], o[2], .{ .signal = us(ip[0]), .unstable = un }),
         .rsi => ind.rsi(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
-        .bbands => ind.bbands(T, c, o[0], o[1], o[2], .{ .period = us(ip[0]), .dev_up = cs.dp[0], .dev_dn = cs.dp[1], .ma = mt(ip[1]), .unstable = un }),
+        .bbands => ind.bbands(T, c, o[0], o[1], o[2], .{ .period = us(ip[0]), .dev_up = dp[0], .dev_dn = dp[1], .ma = mt(ip[1]), .unstable = un }),
         .trange => ind.trange(T, h, l, c, o[0]),
         .atr => ind.atr(T, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
         .natr => ind.natr(T, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
@@ -150,12 +258,56 @@ fn runOurs(comptime T: type, gpa: std.mem.Allocator, cs: Case, h: []const T, l: 
         .max => ind.max(T, c, o[0], .{ .period = us(ip[0]) }),
         .min => ind.min(T, c, o[0], .{ .period = us(ip[0]) }),
         .sum => ind.sum(T, c, o[0], .{ .period = us(ip[0]) }),
+        .dema => ind.dema(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .tema => ind.tema(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .t3 => ind.t3(T, c, o[0], .{ .period = us(ip[0]), .vfactor = dp[0], .unstable = un }),
+        .trima => ind.trima(T, c, o[0], .{ .period = us(ip[0]) }),
+        .kama => ind.kama(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .midpoint => ind.midpoint(T, c, o[0], .{ .period = us(ip[0]) }),
+        .midprice => ind.midprice(T, h, l, o[0], .{ .period = us(ip[0]) }),
+        .sar => ind.sar(T, h, l, o[0], .{ .acceleration = dp[0], .maximum = dp[1] }),
+        .sarext => ind.sarext(T, h, l, o[0], .{ .start_value = dp[0], .offset_on_reverse = dp[1], .af_init_long = dp[2], .af_long = dp[3], .af_max_long = dp[4], .af_init_short = dp[5], .af_short = dp[6], .af_max_short = dp[7] }),
+        .mavp => ind.mavp(T, c, au, o[0], .{ .min_period = us(ip[0]), .max_period = us(ip[1]), .kind = mt(ip[2]), .unstable = un }),
+        .accbands => ind.accbands(T, h, l, c, o[0], o[1], o[2], .{ .period = us(ip[0]) }),
+        .alma => ind.alma(T, gpa, c, o[0], .{ .period = us(ip[0]), .sigma = dp[0], .offset = dp[1] }),
+        .cksp => ind.cksp(T, gpa, h, l, c, o[0], o[1], .{ .period = us(ip[0]), .stop_period = us(ip[1]), .multiplier = dp[0], .unstable = un }),
+        .donchian => ind.donchian(T, h, l, o[0], o[1], o[2], .{ .period = us(ip[0]) }),
+        .frama => ind.frama(T, h, l, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .hma => ind.hma(T, c, o[0], .{ .period = us(ip[0]) }),
+        .ichimoku => ind.ichimoku(T, h, l, o[0], o[1], o[2], o[3], .{ .tenkan = us(ip[0]), .kijun = us(ip[1]), .senkou_b = us(ip[2]) }),
+        .kc => ind.kc(T, h, l, c, o[0], o[1], o[2], .{ .period = us(ip[0]), .atr_period = us(ip[1]), .nb_dev = dp[0], .unstable = un }),
+        .mcgd => ind.mcgd(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .rma => ind.rma(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .supertrend => blk: {
+            const tr = try gpa.alloc(i8, c.len);
+            const lb = try ind.supertrend(T, h, l, c, o[0], tr, .{ .period = us(ip[0]), .multiplier = dp[0], .unstable = un });
+            for (o[1][0..c.len], tr, 0..) |*d, t, i| d.* = if (i < lb) std.math.nan(T) else @floatFromInt(t);
+            break :blk lb;
+        },
+        .swak_butter => ind.swakButter(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .swak_gauss => ind.swakGauss(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .vidya => ind.vidya(T, c, o[0], .{ .period = us(ip[0]), .cmo_period = us(ip[1]), .unstable = un }),
+        .vwma => ind.vwma(T, c, au, o[0], .{ .period = us(ip[0]) }),
+        .zigzag => blk: {
+            const tr = try gpa.alloc(i8, c.len);
+            const pv = try gpa.alloc(i32, c.len);
+            const lb = try ind.zigzag(T, h, l, o[0], tr, pv, .{ .sensitivity = dp[0], .min_trend_length = us(ip[0]) });
+            for (o[1][0..c.len], o[2][0..c.len], tr, pv, 0..) |*d, *e, t, v, i| {
+                d.* = if (i < lb) std.math.nan(T) else @floatFromInt(t);
+                e.* = if (i < lb) std.math.nan(T) else @floatFromInt(v);
+            }
+            break :blk lb;
+        },
+        .zlema => ind.zlema(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
     };
 }
 
 // ── the case grid ───────────────────────────────────────────────────────────
 
-const P = struct { ip: [6]i32 = @splat(0), dp: [2]f64 = .{ 0, 0 } };
+const P = struct { ip: [6]i32 = @splat(0), dp: [8]f64 = @splat(0) };
+fn d2(a: f64, b: f64) [8]f64 {
+    return .{ a, b, 0, 0, 0, 0, 0, 0 };
+}
 fn p1(a: i32) P {
     return .{ .ip = .{ a, 0, 0, 0, 0, 0 } };
 }
@@ -169,8 +321,8 @@ fn periods(comptime ps: []const i32) [ps.len]P {
     return r;
 }
 
-/// MA types in the grid: SMA 0, EMA 1, WMA 2, DISABLED 10.
-const grid_ma = [_]i32{ 0, 1, 2, 10 };
+/// MA types in the grid: every built type (MAMA, 7, is not built).
+const grid_ma = [_]i32{ 0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 13, 14, 15 };
 
 fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
     var l: std.ArrayList(P) = .empty;
@@ -191,28 +343,74 @@ fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
         .macdfix => try l.appendSlice(gpa, &periods(&.{ 9, 1, 2, 3, 5, 20, 0, 100001 })),
         .macdext => {
             const per = [_][3]i32{ .{ 12, 26, 9 }, .{ 5, 8, 3 }, .{ 9, 4, 1 }, .{ 3, 3, 2 } };
-            const ty = [_][3]i32{ .{ 0, 0, 0 }, .{ 1, 1, 1 }, .{ 2, 2, 2 }, .{ 2, 1, 0 }, .{ 0, 1, 2 }, .{ 10, 0, 1 } };
+            const ty = [_][3]i32{ .{ 0, 0, 0 }, .{ 1, 1, 1 }, .{ 2, 2, 2 }, .{ 2, 1, 0 }, .{ 0, 1, 2 }, .{ 10, 0, 1 }, .{ 3, 4, 5 }, .{ 6, 8, 9 }, .{ 12, 13, 14 }, .{ 15, 3, 6 }, .{ 4, 4, 4 }, .{ 8, 8, 8 } };
             for (per) |a| for (ty) |t| try l.append(gpa, pn(.{ a[0], t[0], a[1], t[1], a[2], t[2] }));
             try l.append(gpa, pn(.{ 1, 0, 26, 0, 9, 0 }));
             try l.append(gpa, pn(.{ 12, 0, 26, 0, 100001, 0 }));
         },
         .bbands => {
-            for ([_]i32{ 20, 5, 2, 10, 3 }) |per| for (grid_ma) |t| try l.append(gpa, .{ .ip = .{ per, t, 0, 0, 0, 0 }, .dp = .{ 2, 2 } });
-            try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = .{ 1.5, 2.5 } });
-            try l.append(gpa, .{ .ip = .{ 9, 1, 0, 0, 0, 0 }, .dp = .{ 2.5, 0.5 } });
-            try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = .{ -1, -1 } });
-            try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = .{ 0, 0 } });
-            try l.append(gpa, .{ .ip = .{ 1, 0, 0, 0, 0, 0 }, .dp = .{ 2, 2 } });
-            try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = .{ 4e37, 2 } });
+            for ([_]i32{ 20, 5, 2, 10, 3 }) |per| for (grid_ma) |t| try l.append(gpa, .{ .ip = .{ per, t, 0, 0, 0, 0 }, .dp = d2(2, 2) });
+            try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = d2(1.5, 2.5) });
+            try l.append(gpa, .{ .ip = .{ 9, 1, 0, 0, 0, 0 }, .dp = d2(2.5, 0.5) });
+            try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = d2(-1, -1) });
+            try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = d2(0, 0) });
+            try l.append(gpa, .{ .ip = .{ 1, 0, 0, 0, 0, 0 }, .dp = d2(2, 2) });
+            try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = d2(4e37, 2) });
         },
         .stoch => {
-            for ([_][5]i32{ .{ 5, 3, 0, 3, 0 }, .{ 1, 1, 0, 1, 0 }, .{ 14, 3, 1, 3, 2 }, .{ 3, 2, 0, 5, 2 }, .{ 10, 5, 2, 1, 0 }, .{ 9, 1, 1, 4, 1 }, .{ 5, 3, 10, 3, 0 }, .{ 0, 3, 0, 3, 0 }, .{ 5, 0, 0, 3, 0 }, .{ 5, 3, 0, 100001, 0 } }) |t|
+            for ([_][5]i32{ .{ 5, 3, 0, 3, 0 }, .{ 1, 1, 0, 1, 0 }, .{ 14, 3, 1, 3, 2 }, .{ 3, 2, 0, 5, 2 }, .{ 10, 5, 2, 1, 0 }, .{ 9, 1, 1, 4, 1 }, .{ 5, 3, 10, 3, 0 }, .{ 0, 3, 0, 3, 0 }, .{ 5, 0, 0, 3, 0 }, .{ 5, 3, 0, 100001, 0 }, .{ 8, 4, 3, 3, 4 }, .{ 8, 4, 5, 5, 6 }, .{ 8, 4, 8, 3, 9 }, .{ 8, 4, 12, 3, 13 }, .{ 8, 4, 14, 3, 15 }, .{ 14, 6, 6, 4, 8 } }) |t|
                 try l.append(gpa, pn(.{ t[0], t[1], t[2], t[3], t[4], 0 }));
         },
         .stochf => {
-            for ([_][3]i32{ .{ 5, 3, 0 }, .{ 1, 1, 0 }, .{ 9, 4, 1 }, .{ 14, 3, 2 }, .{ 3, 5, 2 }, .{ 4, 1, 1 }, .{ 5, 3, 10 }, .{ 0, 3, 0 }, .{ 5, 0, 0 } }) |t|
+            for ([_][3]i32{ .{ 5, 3, 0 }, .{ 1, 1, 0 }, .{ 9, 4, 1 }, .{ 14, 3, 2 }, .{ 3, 5, 2 }, .{ 4, 1, 1 }, .{ 5, 3, 10 }, .{ 0, 3, 0 }, .{ 5, 0, 0 }, .{ 6, 4, 3 }, .{ 6, 4, 4 }, .{ 6, 5, 5 }, .{ 6, 4, 6 }, .{ 6, 4, 8 }, .{ 6, 5, 9 }, .{ 6, 4, 12 }, .{ 6, 4, 13 }, .{ 10, 6, 14 }, .{ 6, 4, 15 } }) |t|
                 try l.append(gpa, pn(.{ t[0], t[1], t[2], 0, 0, 0 }));
         },
+        .dema, .tema, .rma => try l.appendSlice(gpa, &periods(&.{ 30, 1, 2, 3, 5, 12, 26, 50, 100, 0, 100001 })),
+        .zlema => try l.appendSlice(gpa, &periods(&.{ 30, 1, 2, 3, 5, 14, 50, 0, 100001 })),
+        .trima => try l.appendSlice(gpa, &periods(&.{ 30, 1, 2, 3, 4, 5, 14, 50, 100, 0, 100001 })),
+        .kama => try l.appendSlice(gpa, &periods(&.{ 30, 1, 2, 3, 5, 10, 50, 0, 100001 })),
+        .midpoint, .midprice, .donchian, .accbands => try l.appendSlice(gpa, &periods(&.{ 14, 2, 3, 5, 20, 30, 100, 1, 0, 100001 })),
+        .mcgd => try l.appendSlice(gpa, &periods(&.{ 14, 2, 3, 5, 30, 100, 1, 0, 100001 })),
+        .hma => try l.appendSlice(gpa, &periods(&.{ 20, 1, 2, 3, 4, 5, 9, 16, 25, 36, 50, 100, 0, 100001 })),
+        .vwma => try l.appendSlice(gpa, &periods(&.{ 30, 1, 2, 3, 5, 14, 50, 0, 100001 })),
+        .frama => try l.appendSlice(gpa, &periods(&.{ 16, 2, 4, 10, 20, 6, 3, 0, 100001 })),
+        .swak_butter, .swak_gauss => try l.appendSlice(gpa, &periods(&.{ 20, 2, 3, 5, 10, 50, 100, 1, 0, 10001 })),
+        .t3 => for ([_][2]f64{ .{ 5, 0.7 }, .{ 1, 0.7 }, .{ 2, 0.7 }, .{ 3, 0 }, .{ 4, 1 }, .{ 10, 0.5 }, .{ 30, 0.7 }, .{ 5, 1.1 }, .{ 5, -0.1 }, .{ 0, 0.7 }, .{ 100001, 0.7 } }) |t|
+            try l.append(gpa, .{ .ip = .{ @intFromFloat(t[0]), 0, 0, 0, 0, 0 }, .dp = d2(t[1], 0) }),
+        .sar => for ([_][2]f64{ .{ 0.02, 0.2 }, .{ 0.01, 0.1 }, .{ 0.3, 0.2 }, .{ 0, 0 }, .{ 0.5, 0.5 }, .{ -1, 0.2 }, .{ 0.02, -1 } }) |t|
+            try l.append(gpa, .{ .dp = d2(t[0], t[1]) }),
+        .sarext => for ([_][8]f64{
+            .{ 0, 0, 0.02, 0.02, 0.2, 0.02, 0.02, 0.2 },
+            .{ 100, 0, 0.02, 0.02, 0.2, 0.02, 0.02, 0.2 },
+            .{ -100, 0.01, 0.02, 0.02, 0.2, 0.02, 0.02, 0.2 },
+            .{ 0, 0.02, 0.03, 0.04, 0.3, 0.05, 0.06, 0.1 },
+            .{ 0, 0, 0.5, 0.4, 0.2, 0.6, 0.5, 0.3 },
+            .{ 95, 0.005, 0.01, 0.01, 0.1, 0.01, 0.01, 0.1 },
+            .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .{ 0, -1, 0.02, 0.02, 0.2, 0.02, 0.02, 0.2 },
+            .{ 4e37, 0, 0.02, 0.02, 0.2, 0.02, 0.02, 0.2 },
+            .{ 0, 0, -0.1, 0.02, 0.2, 0.02, 0.02, 0.2 },
+        }) |t|
+            try l.append(gpa, .{ .dp = t }),
+        .mavp => {
+            for ([_]i32{ 0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 13, 14, 15 }) |t| try l.append(gpa, pn(.{ 2, 30, t, 0, 0, 0 }));
+            for ([_][3]i32{ .{ 2, 10, 0 }, .{ 5, 5, 1 }, .{ 1, 10, 0 }, .{ 3, 12, 4 }, .{ 2, 14, 6 }, .{ 2, 10, 8 }, .{ 2, 12, 9 }, .{ 1, 1, 0 }, .{ 5, 2, 0 }, .{ 0, 10, 0 }, .{ 2, 10001, 0 } }) |t|
+                try l.append(gpa, pn(.{ t[0], t[1], t[2], 0, 0, 0 }));
+        },
+        .alma => for ([_][3]f64{ .{ 9, 6, 0.85 }, .{ 1, 6, 0.85 }, .{ 2, 6, 0.85 }, .{ 5, 3, 0.5 }, .{ 30, 6, 0.85 }, .{ 10, 0.01, 0 }, .{ 10, 2, 1 }, .{ 50, 6, 0.85 }, .{ 9, 0.001, 0.5 }, .{ 9, 6, 1.5 }, .{ 0, 6, 0.85 }, .{ 100, 6, 0.85 } }) |t|
+            try l.append(gpa, .{ .ip = .{ @intFromFloat(t[0]), 0, 0, 0, 0, 0 }, .dp = d2(t[1], t[2]) }),
+        .cksp => for ([_][3]f64{ .{ 10, 9, 1 }, .{ 2, 1, 0 }, .{ 3, 2, 2 }, .{ 5, 7, 1.5 }, .{ 10, 1, 1 }, .{ 14, 5, 3 }, .{ 1, 9, 1 }, .{ 10, 0, 1 }, .{ 10, 9, -1 } }) |t|
+            try l.append(gpa, .{ .ip = .{ @intFromFloat(t[0]), @intFromFloat(t[1]), 0, 0, 0, 0 }, .dp = d2(t[2], 0) }),
+        .ichimoku => for ([_][3]i32{ .{ 3, 5, 8 }, .{ 2, 2, 2 }, .{ 5, 3, 8 }, .{ 9, 26, 52 }, .{ 9, 26, 4 }, .{ 1, 26, 52 }, .{ 9, 1, 52 }, .{ 9, 26, 1 } }) |t|
+            try l.append(gpa, pn(.{ t[0], t[1], t[2], 0, 0, 0 })),
+        .kc => for ([_][3]f64{ .{ 20, 10, 2 }, .{ 2, 1, 1 }, .{ 3, 12, 1.5 }, .{ 14, 14, 2 }, .{ 5, 3, -1 }, .{ 10, 20, 0.5 }, .{ 1, 10, 2 }, .{ 20, 0, 2 } }) |t|
+            try l.append(gpa, .{ .ip = .{ @intFromFloat(t[0]), @intFromFloat(t[1]), 0, 0, 0, 0 }, .dp = d2(t[2], 0) }),
+        .supertrend => for ([_][2]f64{ .{ 10, 3 }, .{ 2, 1 }, .{ 3, 0 }, .{ 5, 2.5 }, .{ 14, 3 }, .{ 1, 3 }, .{ 10, -1 } }) |t|
+            try l.append(gpa, .{ .ip = .{ @intFromFloat(t[0]), 0, 0, 0, 0, 0 }, .dp = d2(t[1], 0) }),
+        .vidya => for ([_][2]i32{ .{ 12, 9 }, .{ 1, 9 }, .{ 2, 2 }, .{ 5, 4 }, .{ 10, 9 }, .{ 30, 20 }, .{ 12, 1 }, .{ 0, 9 }, .{ 12, 100001 } }) |t|
+            try l.append(gpa, pn(.{ t[0], t[1], 0, 0, 0, 0 })),
+        .zigzag => for ([_][2]f64{ .{ 5, 1 }, .{ 1, 1 }, .{ 0.5, 3 }, .{ 10, 2 }, .{ 20, 5 }, .{ 0, 1 }, .{ 100, 1 }, .{ -1, 1 }, .{ 101, 1 }, .{ 5, 0 } }) |t|
+            try l.append(gpa, .{ .ip = .{ @intFromFloat(t[1]), 0, 0, 0, 0, 0 }, .dp = d2(t[0], 0) }),
     }
     return l.items;
 }
@@ -221,6 +419,7 @@ fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
 fn unstableMatters(f: Func) bool {
     return switch (f) {
         .sma, .wma, .trange, .max, .min, .sum => false,
+        .trima, .midpoint, .midprice, .sar, .sarext, .accbands, .alma, .donchian, .hma, .ichimoku, .vwma, .zigzag => false,
         else => true,
     };
 }
@@ -232,8 +431,9 @@ fn probeLookback(gpa: std.mem.Allocator, cs_in: Case) ?usize {
     var o0: [1]f64 = undefined;
     var o1: [1]f64 = undefined;
     var o2: [1]f64 = undefined;
-    var o: [3][]f64 = .{ &o0, &o1, &o2 };
-    return runOurs(f64, gpa, cs, &hh, &hh, &hh, &o) catch null;
+    var o3: [1]f64 = undefined;
+    var o: [4][]f64 = .{ &o0, &o1, &o2, &o3 };
+    return runOurs(f64, gpa, cs, &hh, &hh, &hh, &hh, &o) catch null;
 }
 
 fn addLen(gpa: std.mem.Allocator, ns: *std.ArrayList(u32), n: usize) !void {
@@ -375,18 +575,22 @@ fn checkCase(comptime T: type, c: *Ctx, arena: std.mem.Allocator, cs: Case, head
     const ls = try arena.alloc(f64, n);
     const cl = try arena.alloc(f64, n);
     genInput(cs.seed, cs.kind, hs, ls, cl);
+    const aux = try arena.alloc(f64, n);
+    if (needsAux(cs.func)) genAux(cs.func, cs.seed, cs.kind, aux);
     const h = try arena.alloc(T, n);
     const l = try arena.alloc(T, n);
     const cc = try arena.alloc(T, n);
+    const au = try arena.alloc(T, n);
     for (0..n) |i| {
         h[i] = @floatCast(hs[i]);
         l[i] = @floatCast(ls[i]);
         cc[i] = @floatCast(cl[i]);
+        au[i] = @floatCast(aux[i]);
     }
     const no = nOut(cs.func);
-    var o: [3][]T = undefined;
+    var o: [4][]T = undefined;
     for (&o) |*s| s.* = try arena.alloc(T, n);
-    const res = runOurs(T, c.gpa, cs, h, l, cc, &o);
+    const res = runOurs(T, c.gpa, cs, h, l, cc, au, &o);
     if (res) |lb| {
         if (head.ret != 0) {
             report(c, cs, "ours succeeded (lookback {d}), TA-Lib returned {d}", .{ lb, head.ret });
@@ -423,7 +627,7 @@ fn checkCase(comptime T: type, c: *Ctx, arena: std.mem.Allocator, cs: Case, head
                 }
             }
         }
-        if (cs.emit and !bad_here) try emitVector(c, cs, lb, nb, hs, ls, cl, h, l, cc, theirs, T);
+        if (cs.emit and !bad_here) try emitVector(c, cs, lb, nb, h, l, cc, au, theirs);
         return nb * 8 * no;
     } else |err| switch (err) {
         error.BadParam => {
@@ -441,26 +645,20 @@ fn hexBits(w: *std.Io.Writer, v: f64) !void {
     try w.print("0x{x}", .{@as(u64, @bitCast(v))});
 }
 
-fn emitVector(c: *Ctx, cs: Case, lb: usize, nb: usize, hs: []const f64, ls: []const f64, cl: []const f64, h: anytype, l: anytype, cc: anytype, theirs: []const u8, comptime T: type) !void {
-    _ = hs;
-    _ = ls;
-    _ = cl;
+fn emitVector(c: *Ctx, cs: Case, lb: usize, nb: usize, h: anytype, l: anytype, cc: anytype, au: anytype, theirs: []const u8) !void {
     const w = c.vec_out orelse return;
     c.vec_count += 1;
     try w.print("    .{{ .func = {d}, .f32 = {}, .ukind = {d}, .ubars = {d}, .n = {d}, .lb = {d}, .ip = .{{", .{ @backingInt(cs.func), cs.is32, cs.ukind, cs.ubars, cs.n, lb });
     for (cs.ip, 0..) |x, i| try w.print("{s}{d}", .{ if (i > 0) ", " else " ", x });
     try w.writeAll(" }, .dp = .{ ");
-    try hexBits(w, cs.dp[0]);
-    try w.writeAll(", ");
-    try hexBits(w, cs.dp[1]);
+    for (cs.dp, 0..) |d, i| {
+        if (i > 0) try w.writeAll(", ");
+        try hexBits(w, d);
+    }
     try w.writeAll(" },\n      .ins = &.{");
-    const ni = nIn(cs.func);
-    for (0..ni) |q| {
-        const src = if (ni == 1) cc else switch (q) {
-            0 => h,
-            1 => l,
-            else => cc,
-        };
+    const T = @typeInfo(@TypeOf(h)).pointer.child;
+    for (0..nIn(cs.func)) |q| {
+        const src = srcOf(T, cs.func, q, h, l, cc, au);
         try w.writeAll(" &.{");
         for (src, 0..) |v, i| {
             try w.writeAll(if (i > 0) ", " else " ");
@@ -479,7 +677,6 @@ fn emitVector(c: *Ctx, cs: Case, lb: usize, nb: usize, hs: []const f64, ls: []co
         try w.writeAll(" },");
     }
     try w.writeAll(" } },\n");
-    _ = T;
 }
 
 fn runAll(c: *Ctx, arena: std.mem.Allocator, cases: []const Case) !void {
@@ -497,13 +694,11 @@ fn runAll(c: *Ctx, arena: std.mem.Allocator, cases: []const Case) !void {
         const ls = try arena.alloc(f64, n);
         const cl = try arena.alloc(f64, n);
         genInput(cs.seed, cs.kind, hs, ls, cl);
+        const aux = try arena.alloc(f64, n);
+        if (needsAux(cs.func)) genAux(cs.func, cs.seed, cs.kind, aux);
         const ni = nIn(cs.func);
         for (0..ni) |q| {
-            const src = if (ni == 1) cl else switch (q) {
-                0 => hs,
-                1 => ls,
-                else => cl,
-            };
+            const src = srcOf(f64, cs.func, q, hs, ls, cl, aux);
             for (src) |v| {
                 if (cs.is32) {
                     const f: f32 = @floatCast(v);
@@ -604,7 +799,7 @@ pub fn main(init: std.process.Init) !u8 {
             \\    n: u32,
             \\    lb: u32,
             \\    ip: [6]i32,
-            \\    dp: [2]u64,
+            \\    dp: [8]u64,
             \\    ins: []const []const u64,
             \\    outs: []const []const u64,
             \\};
