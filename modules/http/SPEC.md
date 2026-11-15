@@ -693,7 +693,7 @@ against gzip (a tie goes to the provider, absent header admits nothing); acquire
 eligibility gate, released when the request is over, none free → gzip or identity. README
 "The serving loops negotiate one themselves".
 
-**Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/http.zig` (httpz) is an HTTP/1.1 server. Feed the same raw request bytes to both parsers and compare accept vs reject (smuggling-shaped framing, obs-fold, bad chunk sizes, over-long headers). It is also a reference point for the web-server consumer's h1 benchmark. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
+**Differential oracle against karlseguin's library** — IDEA (2026-09-24, owner review of karlseguin's Zig libraries; not scheduled). `karlseguin/http.zig` (httpz) is an HTTP/1.1 server. Feed the same raw request bytes to both parsers and compare accept vs reject (smuggling-shaped framing, obs-fold, bad chunk sizes, over-long headers). It is also a reference point for the web-server consumer's h1 benchmark. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
 **Query-string parameters and path percent-decoding** — DONE 2026-09-28 (found by the web-server consumer,
 2026-09-22): `http.url` — `param`/`paramRaw` (first match, keys compared decoded, `+` → space),

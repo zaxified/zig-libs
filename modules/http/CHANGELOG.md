@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only. The card's audit `src` hash was already stale before this change (the h1 request wipe) and is left as it was.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: ConnState .closed carries no connection summary (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-15** — **perf (h2): an h2 stream without a request body no longer zeroes `body_scratch`.** The 4 KiB wipe ran on every stream, GET included, although `body_scratch` is written only by a streaming or buffered request body; it now runs only when one exists. The wipe of a stream that had a body is unchanged.
