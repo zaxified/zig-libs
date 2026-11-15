@@ -488,7 +488,7 @@ var global_registry: Registry = .{};
 var global_mutex: Io.Mutex = .init;
 
 fn readSource(gpa: std.mem.Allocator, io: Io, root: Dir, path: []const u8) Error![]u8 {
-    return root.readFileAlloc(io, path, gpa, .limited(max_source)) catch |e| switch (e) {
+    return root.readFileAlloc(io, path, gpa, .limited(max_source + 1)) catch |e| switch (e) { // +1: readFileAlloc fails when the limit is reached, a file of exactly max_source bytes is allowed
         error.OutOfMemory => error.OutOfMemory,
         error.StreamTooLong => error.SnapshotTooLarge,
         error.FileNotFound => error.SnapshotSourceNotFound,
@@ -1580,4 +1580,457 @@ test "expectSnapshot passes on equal values (the passing path writes nothing)" {
         \\ca
         \\fe
     , &.{ 0xca, 0xfe });
+}
+
+// ── tests added by the 2026-11-15 delta mutation audit ───────────────────
+
+const builtin = @import("builtin");
+
+fn fakeSrc(file: [:0]const u8, line: u32, column: u32) std.builtin.SourceLocation {
+    return .{ .module = "t", .file = file, .fn_name = "t", .line = line, .column = column };
+}
+
+/// Replace the process environment seen by `envGet` for one test (POSIX).
+const EnvScope = struct {
+    saved: std.process.Environ,
+
+    fn set(block: [:null]const ?[*:0]const u8) EnvScope {
+        const s: EnvScope = .{ .saved = testing.environ };
+        testing.environ = .{ .block = .{ .slice = block } };
+        return s;
+    }
+
+    fn clear() EnvScope {
+        const s: EnvScope = .{ .saved = testing.environ };
+        testing.environ = .empty;
+        return s;
+    }
+
+    fn restore(s: EnvScope) void {
+        testing.environ = s.saved;
+    }
+};
+
+/// Point file descriptor 2 at `file` while alive, so `std.debug.print` output
+/// of the code under test can be read back instead of reaching the lane's stderr.
+const Stderr = struct {
+    saved: i32,
+
+    fn begin(file: std.Io.File) Stderr {
+        const s: i32 = @intCast(std.os.linux.dup(2));
+        _ = std.os.linux.dup2(file.handle, 2);
+        return .{ .saved = s };
+    }
+
+    fn end(c: Stderr) void {
+        _ = std.os.linux.dup2(c.saved, 2);
+        _ = std.os.linux.close(c.saved);
+    }
+};
+
+/// Change the working directory for one test; `leave` restores it.
+const Cwd = struct {
+    orig: Dir,
+
+    fn enter(dir: Dir, sub: []const u8) !Cwd {
+        var o = try Dir.cwd().openDir(testing.io, ".", .{});
+        errdefer o.close(testing.io);
+        var t = try dir.openDir(testing.io, sub, .{});
+        defer t.close(testing.io);
+        try std.process.setCurrentDir(testing.io, t);
+        return .{ .orig = o };
+    }
+
+    fn leave(c: *Cwd) void {
+        std.process.setCurrentDir(testing.io, c.orig) catch @panic("snapshot test: cannot restore the working directory");
+        c.orig.close(testing.io);
+    }
+};
+
+fn openFds() !usize {
+    var d = try Dir.cwd().openDir(testing.io, "/proc/self/fd", .{ .iterate = true });
+    defer d.close(testing.io);
+    var it = d.iterate();
+    var n: usize = 0;
+    while (try it.next(testing.io)) |_| n += 1;
+    return n;
+}
+
+fn expectContains(hay: []const u8, needle: []const u8) !void {
+    if (std.mem.find(u8, hay, needle) == null) {
+        std.debug.print("\nmissing {s} in:\n{s}\n", .{ needle, hay });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "lineFrom and offsetOf: the edges" {
+    try testing.expectEqualStrings("", lineFrom("abc", 9));
+    try testing.expectEqualStrings("cd", lineFrom("ab\ncd", 3));
+    try testing.expectEqualStrings("ab", lineFrom("ab\ncd", 0));
+    try testing.expectEqual(@as(?usize, 0), offsetOf("ab", 1, 1));
+    try testing.expectEqual(@as(?usize, 1), offsetOf("ab", 1, 2));
+    try testing.expectEqual(@as(?usize, null), offsetOf("ab", 1, 3));
+    try testing.expectEqual(@as(?usize, 2), offsetOf("a\nb", 2, 1));
+    try testing.expectEqual(@as(?usize, null), offsetOf("a\nb", 2, 2));
+    try testing.expectEqual(@as(?usize, null), offsetOf("a\nb", 3, 1));
+    try testing.expectEqual(@as(?usize, null), offsetOf("a\n", 2, 1));
+}
+
+test "shifted: negative results are null, zero is a position" {
+    try testing.expectEqual(@as(?usize, 8), shifted(5, 3));
+    try testing.expectEqual(@as(?usize, 0), shifted(5, -5));
+    try testing.expectEqual(@as(?usize, null), shifted(5, -6));
+    try testing.expectEqual(@as(?usize, 0), shifted(0, 0));
+}
+
+test "rewrite: a registry whose shift would move the call before the file start is refused" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = testing.allocator;
+    // Hand-built state: an earlier edit that claims to have shrunk the file by 2
+    // bytes before the call, and a file that now happens to start with `@src()`.
+    try put(tmp.dir, "t.zig", "@src()  , \"a\", x);\n");
+    var reg: Registry = .{};
+    defer reg.deinit(a);
+    try reg.files.append(a, .{ .path = try a.dupe(u8, "t.zig"), .orig = try a.dupe(u8, "x@src()   , \"a\", x);\n") });
+    try reg.files.items[0].edits.append(a, .{ .orig_start = 0, .orig_end = 2, .new_len = 0, .value = try a.dupe(u8, "z") });
+    try testing.expectError(error.SnapshotSourceChanged, rewrite(&reg, a, testing.io, tmp.dir, "t.zig", 1, 2, .text, "a", "b"));
+    const after = try slurp(tmp.dir, "t.zig");
+    defer a.free(after);
+    try testing.expectEqualStrings("@src()  , \"a\", x);\n", after);
+}
+
+test "Registry.deinit leaves an empty registry that can be deinitialised again" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try put(tmp.dir, "t.zig", "e(@src(), \"a\", x);\n");
+    var reg: Registry = .{};
+    try rewriteNth(&reg, tmp.dir, "t.zig", 0, .text, "a", "b");
+    reg.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), reg.files.items.len);
+    reg.deinit(testing.allocator);
+}
+
+test "rewrite: a source path that is a directory is an I/O error, a missing file is not" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "d.zig");
+    var reg: Registry = .{};
+    defer reg.deinit(testing.allocator);
+    try testing.expectError(error.SnapshotIo, rewrite(&reg, testing.allocator, testing.io, tmp.dir, "d.zig", 1, 1, .text, "", "x"));
+    try testing.expectError(error.SnapshotIo, writeAtomic(testing.io, tmp.dir, "nope.zig", "x"));
+}
+
+test "rewrite: a file of exactly max_source bytes is read and rewritten, one more byte is refused" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = testing.allocator;
+    const head = "e(@src(), \"a\", x);\n";
+    const body = try a.alloc(u8, max_source);
+    defer a.free(body);
+    @memset(body, '/');
+    @memcpy(body[0..head.len], head);
+    try put(tmp.dir, "t.zig", body);
+    {
+        // Same size: the result is exactly max_source, allowed.
+        var reg: Registry = .{};
+        defer reg.deinit(a);
+        try rewriteNth(&reg, tmp.dir, "t.zig", 0, .text, "a", "b");
+    }
+    {
+        // The rewritten file can be read again (the cap is symmetric) ...
+        var reg: Registry = .{};
+        defer reg.deinit(a);
+        // ... and one byte more is over the cap.
+        try testing.expectError(error.SnapshotTooLarge, rewriteNth(&reg, tmp.dir, "t.zig", 0, .text, "b", "bc"));
+        try rewriteNth(&reg, tmp.dir, "t.zig", 0, .text, "b", "");
+    }
+    // A file one byte over the cap is refused even when the result would fit.
+    const big = try a.alloc(u8, max_source + 1);
+    defer a.free(big);
+    @memset(big, '/');
+    @memcpy(big[0..head.len], head);
+    try put(tmp.dir, "u.zig", big);
+    var reg: Registry = .{};
+    defer reg.deinit(a);
+    try testing.expectError(error.SnapshotTooLarge, rewrite(&reg, a, testing.io, tmp.dir, "u.zig", 1, 3, .text, "a", ""));
+}
+
+test "locate: a comma that is not the one after @src(), a multiline ending in a comma at EOF, a final newline" {
+    try testing.expectError(error.SnapshotNotLiteral, locate("@src() x\"a\", y", 1, 1));
+    try testing.expectError(error.SnapshotNotLiteral, locate("@src(),\n  \\\\x,", 1, 1));
+    try testing.expectError(error.SnapshotNotLiteral, locate("@src(),\n  \\\\l1\n", 1, 1));
+}
+
+test "rewrite: one tab or three spaces of indentation are kept exactly; a last byte CR makes CRLF" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var reg: Registry = .{};
+    defer reg.deinit(testing.allocator);
+    try put(tmp.dir, "t.zig", "\te(@src(), \"a\", x);\n   e(@src(), \"b\", x);\n");
+    try rewriteNth(&reg, tmp.dir, "t.zig", 0, .text, "a", "p\nq");
+    try rewriteNth(&reg, tmp.dir, "t.zig", 1, .text, "b", "r\ns");
+    const after = try slurp(tmp.dir, "t.zig");
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings("\te(@src(),\n\t    \\\\p\n\t    \\\\q\n\t, x);\n   e(@src(),\n       \\\\r\n       \\\\s\n   , x);\n", after);
+
+    var reg2: Registry = .{};
+    defer reg2.deinit(testing.allocator);
+    try put(tmp.dir, "cr.zig", "e(@src(), \"a\", x);\r");
+    try rewriteNth(&reg2, tmp.dir, "cr.zig", 0, .text, "a", "p\nq");
+    const cr = try slurp(tmp.dir, "cr.zig");
+    defer testing.allocator.free(cr);
+    try testing.expectEqualStrings("e(@src(),\r\n    \\\\p\r\n    \\\\q\r\n, x);\r", cr);
+}
+
+test "the single-line form is always valid UTF-8, and a small hex byte keeps its leading zero" {
+    const a = testing.allocator;
+    var all: [256]u8 = undefined;
+    for (&all, 0..) |*c, i| c.* = @intCast(i);
+    var i: usize = 0;
+    while (i <= 256) : (i += 1) {
+        const value: []const u8 = if (i == 256) &all else all[i .. i + 1];
+        const region = try renderRegion(a, .text, value, "", "\n");
+        defer a.free(region);
+        try testing.expect(std.unicode.utf8ValidateSlice(region));
+    }
+    const h = try renderRegion(a, .hex, &.{ 0x01, 0x0a, 0x00 }, "", "\n");
+    defer a.free(h);
+    try testing.expectEqualStrings(" \"010a00\"", h);
+}
+
+test "failure message: the excerpt is cut at excerpt_len with an ellipsis, one byte more or less is not" {
+    const a = testing.allocator;
+    const xs: [excerpt_len]u8 = @splat('x');
+    var over: [excerpt_len + 1]u8 = @splat('x');
+    var over2 = over;
+    over2[0] = 'y';
+    var buf: [4096]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try writeReport(&w, .text, "t.zig", 1, 1, &over, &over2);
+    const want_e = try a.print("  expected: \"{s}\"...\n", .{&xs});
+    defer a.free(want_e);
+    try expectContains(w.buffered(), want_e);
+    const want_a = try a.print("  actual:   \"y{s}\"...\n", .{xs[1..]});
+    defer a.free(want_a);
+    try expectContains(w.buffered(), want_a);
+
+    // Exactly excerpt_len + 1 bytes after the first difference is cut, exactly excerpt_len is not.
+    w = .fixed(&buf);
+    try writeReport(&w, .text, "t.zig", 1, 1, over[0..excerpt_len], over2[0..excerpt_len]);
+    const none = try a.print("  actual:   \"y{s}\"\n", .{xs[1..]});
+    defer a.free(none);
+    try expectContains(w.buffered(), none);
+}
+
+test "failure message: a hex length mismatch shows the shorter side's window and the longer side's extra byte" {
+    var buf: [2048]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try writeReport(&w, .hex, "t.zig", 1, 1, "0001", &.{ 0, 1, 2 });
+    try expectContains(w.buffered(), "length mismatch: expected 2 bytes, got 3\n  offset 0..\n  expected:  00  01 \n  actual:    00  01 [02]\n");
+}
+
+test "resolve: a candidate whose literal does not decode never matches; symlinked modules and a file named modules are ignored" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const a = testing.allocator;
+    try tmp.dir.createDirPath(testing.io, "modules/m1/src");
+    var reg: Registry = .{};
+    defer reg.deinit(a);
+    try put(tmp.dir, "modules/m1/src/bad.zig", "e(@src(), \"\\q\", x);\n");
+    try testing.expectError(error.SnapshotSourceNotFound, resolve(&reg, a, testing.io, tmp.dir, null, "bad.zig", 1, 3, "x"));
+
+    try put(tmp.dir, "modules/m1/src/t.zig", "e(@src(), \"v\", x);\n");
+    tmp.dir.symLink(testing.io, "m1", "modules/alias", .{ .is_directory = true }) catch return error.SkipZigTest;
+    const p = try resolve(&reg, a, testing.io, tmp.dir, null, "t.zig", 1, 3, "v");
+    defer a.free(p);
+    try testing.expectEqualStrings("modules/m1/src/t.zig", p);
+
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    try put(tmp2.dir, "modules", "not a directory");
+    try testing.expectError(error.SnapshotSourceNotFound, resolve(&reg, a, testing.io, tmp2.dir, null, "t.zig", 1, 3, "v"));
+}
+
+test "rewrite and resolve close every file descriptor they open" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const a = testing.allocator;
+    try tmp.dir.createDirPath(testing.io, "modules/m1/src");
+    try put(tmp.dir, "modules/m1/src/t.zig", "e(@src(), \"v\", x);\n");
+    const before = try openFds();
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var reg: Registry = .{};
+        defer reg.deinit(a);
+        const p = try resolve(&reg, a, testing.io, tmp.dir, null, "t.zig", 1, 3, if (i == 0) "v" else "w");
+        defer a.free(p);
+        try rewrite(&reg, a, testing.io, tmp.dir, p, 1, 3, .text, if (i == 0) "v" else "w", "w");
+    }
+    try testing.expectEqual(before, try openFds());
+}
+
+test "check: compare mode prints the report on a mismatch and refuses a bad variable or a bad hex literal" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(testing.io, "err.txt", .{});
+    defer f.close(testing.io);
+    {
+        const env = EnvScope.clear();
+        defer env.restore();
+        const cap = Stderr.begin(f);
+        defer cap.end();
+        try testing.expectError(error.TestExpectedEqual, check(.text, fakeSrc("t.zig", 7, 3), "a", "b"));
+        try testing.expectError(error.InvalidCharacter, check(.hex, fakeSrc("t.zig", 8, 3), "zz", ""));
+        try check(.text, fakeSrc("t.zig", 9, 3), "same", "same");
+    }
+    {
+        const blk = [_:null]?[*:0]const u8{"TESTKIT_SNAPSHOT=bogus"};
+        const env = EnvScope.set(&blk);
+        defer env.restore();
+        const cap = Stderr.begin(f);
+        defer cap.end();
+        try testing.expectError(error.SnapshotModeUnknown, check(.text, fakeSrc("t.zig", 10, 3), "a", "a"));
+    }
+    const err = try slurp(tmp.dir, "err.txt");
+    defer testing.allocator.free(err);
+    try expectContains(err, "snapshot mismatch at t.zig:7:3\n");
+    try expectContains(err, "snapshot at t.zig:8:3: the hex literal is not valid hex (InvalidCharacter)");
+    try expectContains(err, "TESTKIT_SNAPSHOT must be unset or `update`");
+    try testing.expect(std.mem.find(u8, err, "t.zig:9") == null);
+}
+
+test "check in update mode: rewrites the literal, repairs a bad hex literal, reports what it did, and fails loudly" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "modules/me/src");
+    try put(tmp.dir, "build.zig", "");
+    try put(tmp.dir, "modules/me/src/up_d.zig", "e(@src(), \"zz\", x);\ne(@src(), \"old\", x);\n");
+    const f = try tmp.dir.createFile(testing.io, "err.txt", .{});
+    defer f.close(testing.io);
+    const blk = [_:null]?[*:0]const u8{"TESTKIT_SNAPSHOT=update"};
+    {
+        var cwd = try Cwd.enter(tmp.dir, ".");
+        defer cwd.leave();
+        const env = EnvScope.set(&blk);
+        defer env.restore();
+        const cap = Stderr.begin(f);
+        defer cap.end();
+        try check(.hex, fakeSrc("up_d.zig", 1, 3), "zz", &.{ 0xca, 0xfe });
+        try check(.text, fakeSrc("up_d.zig", 2, 3), "old", "new");
+        try testing.expectError(error.SnapshotSourceNotFound, check(.text, fakeSrc("missing.zig", 1, 3), "a", "b"));
+    }
+    const src = try slurp(tmp.dir, "modules/me/src/up_d.zig");
+    defer testing.allocator.free(src);
+    try testing.expectEqualStrings("e(@src(), \"cafe\", x);\ne(@src(), \"new\", x);\n", src);
+    const err = try slurp(tmp.dir, "err.txt");
+    defer testing.allocator.free(err);
+    try expectContains(err, "TESTKIT_SNAPSHOT=update: rewrote the snapshot at up_d.zig:1\n");
+    try expectContains(err, "TESTKIT_SNAPSHOT=update: rewrote the snapshot at up_d.zig:2\n");
+    try expectContains(err, "TESTKIT_SNAPSHOT=update: cannot rewrite the snapshot at missing.zig:1:3 (SnapshotSourceNotFound)");
+}
+
+test "updateSource: finds the repository root from any depth, honours TESTKIT_SNAPSHOT_ROOT, keeps no descriptor and no lock" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try put(tmp.dir, "build.zig", "");
+    const two = "e(@src(), \"old\", x);\ne(@src(), \"two\", y);\n";
+    try tmp.dir.createDirPath(testing.io, "modules/ma/src");
+    try tmp.dir.createDirPath(testing.io, "modules/mb/src");
+    try tmp.dir.createDirPath(testing.io, "modules/mc/src");
+    try tmp.dir.createDirPath(testing.io, "modules/md/src");
+    try put(tmp.dir, "modules/ma/src/up_a.zig", two);
+    try put(tmp.dir, "modules/mb/src/up_a.zig", two);
+    try put(tmp.dir, "modules/mc/src/up_b.zig", "e(@src(), \"old\", x);\n");
+    try put(tmp.dir, "modules/md/src/up_c.zig", "e(@src(), \"old\", x);\n");
+    const fds = try openFds();
+
+    const blk = [_:null]?[*:0]const u8{"TESTKIT_SNAPSHOT_ROOT=modules/ma/src"};
+    {
+        // Depth 2, the override names one of two identical modules.
+        var cwd = try Cwd.enter(tmp.dir, "modules/ma");
+        defer cwd.leave();
+        {
+            const env = EnvScope.set(&blk);
+            defer env.restore();
+            try updateSource(.text, fakeSrc("up_a.zig", 1, 3), "old", "new1");
+            try updateSource(.text, fakeSrc("up_a.zig", 2, 3), "two", "new2");
+        }
+        // Without it the same snapshot is ambiguous.
+        const env = EnvScope.clear();
+        defer env.restore();
+        try testing.expectError(error.SnapshotAmbiguous, updateSource(.text, fakeSrc("up_a.zig", 1, 3), "old", "new1"));
+    }
+    {
+        var cwd = try Cwd.enter(tmp.dir, ".");
+        defer cwd.leave();
+        const env = EnvScope.clear();
+        defer env.restore();
+        try updateSource(.text, fakeSrc("up_b.zig", 1, 3), "old", "B");
+    }
+    {
+        var cwd = try Cwd.enter(tmp.dir, "modules");
+        defer cwd.leave();
+        const env = EnvScope.clear();
+        defer env.restore();
+        try updateSource(.text, fakeSrc("up_c.zig", 1, 3), "old", "C");
+    }
+    try testing.expectEqual(fds, try openFds());
+    const want_a = "e(@src(), \"new1\", x);\ne(@src(), \"new2\", y);\n";
+    const files = [_]struct { p: []const u8, v: []const u8 }{
+        .{ .p = "modules/ma/src/up_a.zig", .v = want_a },
+        .{ .p = "modules/mb/src/up_a.zig", .v = two },
+        .{ .p = "modules/mc/src/up_b.zig", .v = "e(@src(), \"B\", x);\n" },
+        .{ .p = "modules/md/src/up_c.zig", .v = "e(@src(), \"C\", x);\n" },
+    };
+    for (files) |c| {
+        const got = try slurp(tmp.dir, c.p);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c.v, got);
+    }
+}
+
+test "rootDepth: counts the directories up to the one holding build.zig, gives up after eight" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try put(tmp.dir, "build.zig", "");
+    const deep = "d1/d2/d3/d4/d5/d6/d7/d8/d9";
+    try tmp.dir.createDirPath(testing.io, deep);
+    {
+        var cwd = try Cwd.enter(tmp.dir, ".");
+        defer cwd.leave();
+        try testing.expectEqual(@as(?usize, 0), rootDepth(testing.io));
+    }
+    {
+        var cwd = try Cwd.enter(tmp.dir, "d1");
+        defer cwd.leave();
+        try testing.expectEqual(@as(?usize, 1), rootDepth(testing.io));
+    }
+    {
+        var cwd = try Cwd.enter(tmp.dir, "d1/d2/d3/d4/d5/d6/d7/d8");
+        defer cwd.leave();
+        try testing.expectEqual(@as(?usize, 8), rootDepth(testing.io));
+    }
+    {
+        var cwd = try Cwd.enter(tmp.dir, deep);
+        defer cwd.leave();
+        try testing.expectEqual(@as(?usize, null), rootDepth(testing.io));
+        const env = EnvScope.clear();
+        defer env.restore();
+        try testing.expectError(error.SnapshotSourceNotFound, updateSource(.text, fakeSrc("t.zig", 1, 3), "a", "b"));
+    }
+}
+
+test "envGet reads the process environment" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const blk = [_:null]?[*:0]const u8{ "OTHER=1", "TESTKIT_SNAPSHOT=update" };
+    const env = EnvScope.set(&blk);
+    defer env.restore();
+    try testing.expectEqualStrings("update", envGet(env_name).?);
+    try testing.expect(envGet(root_env_name) == null);
 }
