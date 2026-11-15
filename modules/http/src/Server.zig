@@ -2337,7 +2337,7 @@ pub fn serveStep(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuf
 
     // Request bytes (request line, Authorization/Cookie, body, trailers) must
     // not outlive the request in a buffer that is reused or returned to a
-    // pool (qap S4). Declared AFTER the release `defer`, so it runs BEFORE
+    // pool. Declared AFTER the release `defer`, so it runs BEFORE
     // it, on every exit of this function -- `serveOne`'s early 4xx answers,
     // errors, detached and upgraded responses included. Only the prefixes
     // `serveOne` reports as touched are wiped (`RequestUsed`): a plain GET
