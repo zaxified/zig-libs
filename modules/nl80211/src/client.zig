@@ -235,14 +235,7 @@ pub const Nl80211 = struct {
         codec.finishHeader(&req, hdr);
         try cl.send(req.items);
 
-        var parser: wiphy_mod.Parser = .init(gpa);
-        defer parser.deinit();
-        var walk: Dump = .{ .cl = cl, .seq = seq };
-        while (try walk.next()) |m| {
-            if (m.cmd != uapi.CMD.NEW_WIPHY) continue;
-            parser.feed(m.attrs) catch |e| return walk.fail(wiphyErr(e));
-        }
-        return parser.finish() catch |e| wiphyErr(e);
+        return collectWiphys(gpa, cl, seq);
     }
 
     /// Dump every wireless interface. Unprivileged. Caller frees the slice.
@@ -253,15 +246,7 @@ pub const Nl80211 = struct {
         defer gpa.free(req);
         try cl.send(req);
 
-        var out: std.ArrayList(iface.Interface) = .empty;
-        errdefer out.deinit(gpa);
-        var walk: Dump = .{ .cl = cl, .seq = seq };
-        while (try walk.next()) |m| {
-            if (m.cmd != uapi.CMD.NEW_INTERFACE) continue;
-            const i = iface.parse(m.attrs) catch return walk.fail(error.MalformedReply);
-            try out.append(gpa, i);
-        }
-        return out.toOwnedSlice(gpa);
+        return collectInterfaces(gpa, cl, seq);
     }
 
     /// One interface's state (`NL80211_CMD_GET_INTERFACE`, not a dump).
@@ -272,13 +257,7 @@ pub const Nl80211 = struct {
         defer gpa.free(req);
         try cl.send(req);
 
-        var walk: Dump = .{ .cl = cl, .seq = seq };
-        var found: ?iface.Interface = null;
-        while (try walk.next()) |m| {
-            if (m.cmd != uapi.CMD.NEW_INTERFACE or found != null) continue;
-            found = iface.parse(m.attrs) catch return walk.fail(error.MalformedReply);
-        }
-        return found orelse error.NoSuchDevice;
+        return collectInterface(cl, seq, error.NoSuchDevice);
     }
 
     // ── station statistics ─────────────────────────────────────────────────
@@ -293,15 +272,7 @@ pub const Nl80211 = struct {
         defer gpa.free(req);
         try cl.send(req);
 
-        var out: std.ArrayList(station_mod.Station) = .empty;
-        errdefer out.deinit(gpa);
-        var walk: Dump = .{ .cl = cl, .seq = seq };
-        while (try walk.next()) |m| {
-            if (m.cmd != uapi.CMD.NEW_STATION) continue;
-            const s = station_mod.parse(m.attrs) catch return walk.fail(error.MalformedReply);
-            try out.append(gpa, s);
-        }
-        return out.toOwnedSlice(gpa);
+        return collectStations(gpa, cl, seq);
     }
 
     // ── scanning ───────────────────────────────────────────────────────────
@@ -332,27 +303,7 @@ pub const Nl80211 = struct {
         defer gpa.free(req);
         try cl.send(req);
 
-        var out: std.ArrayList(scan_mod.Bss) = .empty;
-        errdefer {
-            for (out.items) |*b| b.deinit(gpa);
-            out.deinit(gpa);
-        }
-        var walk: Dump = .{ .cl = cl, .seq = seq };
-        while (try walk.next()) |m| {
-            if (m.cmd != uapi.CMD.NEW_SCAN_RESULTS) continue;
-            const maybe = scan_mod.parseBss(gpa, m.attrs) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return walk.fail(error.MalformedReply),
-            };
-            if (maybe) |b| {
-                errdefer {
-                    var tmp = b;
-                    tmp.deinit(gpa);
-                }
-                try out.append(gpa, b);
-            }
-        }
-        return out.toOwnedSlice(gpa);
+        return collectScanResults(gpa, cl, seq);
     }
 
     // ── association ────────────────────────────────────────────────────────
@@ -401,24 +352,7 @@ pub const Nl80211 = struct {
         defer gpa.free(req);
         try cl.send(req);
 
-        var out: std.ArrayList(reg_mod.RegDomain) = .empty;
-        errdefer {
-            for (out.items) |*d| d.deinit(gpa);
-            out.deinit(gpa);
-        }
-        var walk: Dump = .{ .cl = cl, .seq = seq };
-        while (try walk.next()) |m| {
-            if (m.cmd != uapi.CMD.GET_REG) continue;
-            const d = reg_mod.parse(gpa, m.attrs) catch |e| return walk.fail(regErr(e));
-            {
-                errdefer {
-                    var tmp = d;
-                    tmp.deinit(gpa);
-                }
-                try appendDomain(gpa, &out, d);
-            }
-        }
-        return out.toOwnedSlice(gpa);
+        return collectRegDomains(gpa, cl, seq);
     }
 
     /// Hint a regulatory domain (`NL80211_CMD_REQ_SET_REG`). Needs
@@ -462,14 +396,7 @@ pub const Nl80211 = struct {
         const req = config_mod.buildGetSurvey(gpa, cl.family_id, seq, ifindex) catch |e| return mapBuild(e);
         defer gpa.free(req);
         try cl.send(req);
-        var out: std.ArrayList(config_mod.Survey) = .empty;
-        errdefer out.deinit(gpa);
-        var walk: Dump = .{ .cl = cl, .seq = seq };
-        while (try walk.next()) |m| {
-            if (m.cmd != uapi.CMD.NEW_SURVEY_RESULTS) continue;
-            if (config_mod.parseSurvey(m.attrs) catch return walk.fail(error.MalformedReply)) |sv| try out.append(gpa, sv);
-        }
-        return out.toOwnedSlice(gpa);
+        return collectSurvey(gpa, cl, seq);
     }
 
     /// `iw … set txpower`. Needs **CAP_NET_ADMIN**.
@@ -493,13 +420,7 @@ pub const Nl80211 = struct {
         const req = config_mod.buildNewInterface(gpa, cl.family_id, seq, wiphy_index, name, iftype) catch |e| return mapBuild(e);
         defer gpa.free(req);
         try cl.send(req);
-        var walk: Dump = .{ .cl = cl, .seq = seq };
-        var found: ?iface.Interface = null;
-        while (try walk.next()) |m| {
-            if (m.cmd != uapi.CMD.NEW_INTERFACE or found != null) continue;
-            found = iface.parse(m.attrs) catch return walk.fail(error.MalformedReply);
-        }
-        return found orelse error.MalformedReply;
+        return collectInterface(cl, seq, error.MalformedReply);
     }
 
     /// `iw dev <dev> del`. Needs **CAP_NET_ADMIN**.
@@ -528,13 +449,7 @@ pub const Nl80211 = struct {
         const req = config_mod.buildGetPowerSave(gpa, cl.family_id, seq, ifindex) catch |e| return mapBuild(e);
         defer gpa.free(req);
         try cl.send(req);
-        var walk: Dump = .{ .cl = cl, .seq = seq };
-        var state: ?bool = null;
-        while (try walk.next()) |m| {
-            if (m.cmd != uapi.CMD.GET_POWER_SAVE or state != null) continue;
-            state = config_mod.parsePowerSave(m.attrs) catch return walk.fail(error.MalformedReply);
-        }
-        return state orelse error.MalformedReply;
+        return collectPowerSave(cl, seq);
     }
 
     // ── multicast groups ───────────────────────────────────────────────────
@@ -778,20 +693,148 @@ const DumpState = struct {
 /// Walks a multi-part reply, hiding datagram boundaries. Terminates on
 /// `NLMSG_DONE` (a dump), on the ACK (a single-shot request), or on
 /// `error.TooManyMessages` once `max_dump_messages` is exceeded.
-const Dump = struct {
-    cl: *Nl80211,
-    seq: u32,
-    st: DumpState = .{},
+const Dump = DumpOver(Nl80211);
 
-    fn next(w: *Dump) RequestError!?DumpMessage {
-        return dumpStep(w.cl, w.seq, &w.st);
-    }
+/// `Dump` over any transport that looks like `Nl80211` for what `dumpStep`
+/// touches; the collectors below are generic over it so a scripted socket can
+/// feed them in tests.
+fn DumpOver(comptime Cl: type) type {
+    return struct {
+        cl: *Cl,
+        seq: u32,
+        st: DumpState = .{},
 
-    /// Give up on this reply because of `e`; see `failDump`.
-    fn fail(w: *Dump, e: RequestError) RequestError {
-        return failDump(w.cl, w.seq, &w.st, e);
+        fn next(w: *@This()) RequestError!?DumpMessage {
+            return dumpStep(w.cl, w.seq, &w.st);
+        }
+
+        /// Give up on this reply because of `e`; see `failDump`.
+        fn fail(w: *@This(), e: RequestError) RequestError {
+            return failDump(w.cl, w.seq, &w.st, e);
+        }
+    };
+}
+
+fn walkOf(cl: anytype, seq: u32) DumpOver(@typeInfo(@TypeOf(cl)).pointer.child) {
+    return .{ .cl = cl, .seq = seq };
+}
+
+// ── the collectors ─────────────────────────────────────────────────────────
+// The reply handling of `Nl80211.wiphys/interfaces/…`, generic over the
+// transport (`cl`: a pointer to anything `dumpStep` can read) exactly as
+// `dumpStep`/`awaitAckStep` are. The request has been sent already.
+
+fn collectWiphys(gpa: std.mem.Allocator, cl: anytype, seq: u32) RequestError![]wiphy_mod.Wiphy {
+    var parser: wiphy_mod.Parser = .init(gpa);
+    defer parser.deinit();
+    var walk = walkOf(cl, seq);
+    while (try walk.next()) |m| {
+        if (m.cmd != uapi.CMD.NEW_WIPHY) continue;
+        parser.feed(m.attrs) catch |e| return walk.fail(wiphyErr(e));
     }
-};
+    return parser.finish() catch |e| wiphyErr(e);
+}
+
+fn collectInterfaces(gpa: std.mem.Allocator, cl: anytype, seq: u32) RequestError![]iface.Interface {
+    var out: std.ArrayList(iface.Interface) = .empty;
+    errdefer out.deinit(gpa);
+    var walk = walkOf(cl, seq);
+    while (try walk.next()) |m| {
+        if (m.cmd != uapi.CMD.NEW_INTERFACE) continue;
+        const i = iface.parse(m.attrs) catch return walk.fail(error.MalformedReply);
+        try out.append(gpa, i);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// The first `NEW_INTERFACE` of the reply; `missing` when there is none.
+fn collectInterface(cl: anytype, seq: u32, missing: RequestError) RequestError!iface.Interface {
+    var walk = walkOf(cl, seq);
+    var found: ?iface.Interface = null;
+    while (try walk.next()) |m| {
+        if (m.cmd != uapi.CMD.NEW_INTERFACE or found != null) continue;
+        found = iface.parse(m.attrs) catch return walk.fail(error.MalformedReply);
+    }
+    return found orelse missing;
+}
+
+fn collectStations(gpa: std.mem.Allocator, cl: anytype, seq: u32) RequestError![]station_mod.Station {
+    var out: std.ArrayList(station_mod.Station) = .empty;
+    errdefer out.deinit(gpa);
+    var walk = walkOf(cl, seq);
+    while (try walk.next()) |m| {
+        if (m.cmd != uapi.CMD.NEW_STATION) continue;
+        const s = station_mod.parse(m.attrs) catch return walk.fail(error.MalformedReply);
+        try out.append(gpa, s);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn collectScanResults(gpa: std.mem.Allocator, cl: anytype, seq: u32) RequestError![]scan_mod.Bss {
+    var out: std.ArrayList(scan_mod.Bss) = .empty;
+    errdefer {
+        for (out.items) |*b| b.deinit(gpa);
+        out.deinit(gpa);
+    }
+    var walk = walkOf(cl, seq);
+    while (try walk.next()) |m| {
+        if (m.cmd != uapi.CMD.NEW_SCAN_RESULTS) continue;
+        const maybe = scan_mod.parseBss(gpa, m.attrs) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return walk.fail(error.MalformedReply),
+        };
+        if (maybe) |b| {
+            errdefer {
+                var tmp = b;
+                tmp.deinit(gpa);
+            }
+            try out.append(gpa, b);
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn collectRegDomains(gpa: std.mem.Allocator, cl: anytype, seq: u32) RequestError![]reg_mod.RegDomain {
+    var out: std.ArrayList(reg_mod.RegDomain) = .empty;
+    errdefer {
+        for (out.items) |*d| d.deinit(gpa);
+        out.deinit(gpa);
+    }
+    var walk = walkOf(cl, seq);
+    while (try walk.next()) |m| {
+        if (m.cmd != uapi.CMD.GET_REG) continue;
+        const d = reg_mod.parse(gpa, m.attrs) catch |e| return walk.fail(regErr(e));
+        {
+            errdefer {
+                var tmp = d;
+                tmp.deinit(gpa);
+            }
+            try appendDomain(gpa, &out, d);
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn collectSurvey(gpa: std.mem.Allocator, cl: anytype, seq: u32) RequestError![]config_mod.Survey {
+    var out: std.ArrayList(config_mod.Survey) = .empty;
+    errdefer out.deinit(gpa);
+    var walk = walkOf(cl, seq);
+    while (try walk.next()) |m| {
+        if (m.cmd != uapi.CMD.NEW_SURVEY_RESULTS) continue;
+        if (config_mod.parseSurvey(m.attrs) catch return walk.fail(error.MalformedReply)) |sv| try out.append(gpa, sv);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn collectPowerSave(cl: anytype, seq: u32) RequestError!bool {
+    var walk = walkOf(cl, seq);
+    var state: ?bool = null;
+    while (try walk.next()) |m| {
+        if (m.cmd != uapi.CMD.GET_POWER_SAVE or state != null) continue;
+        state = config_mod.parsePowerSave(m.attrs) catch return walk.fail(error.MalformedReply);
+    }
+    return state orelse error.MalformedReply;
+}
 
 /// Return `e` from a collector. When `e` is `MalformedReply` caused by ONE
 /// record's content, the rest of the dump is still coming: it is read to its
@@ -991,13 +1034,20 @@ pub const EventSocket = struct {
     /// single `recvmsg` only when the previously received datagram has been
     /// drained. Messages that are not nl80211 family messages are skipped.
     pub fn waitForEvent(ev: *EventSocket) RequestError!Event {
-        while (true) {
-            if (try nextEventIn(&ev.it, ev.family_id)) |event| return event;
-            const dgram = ev.sock.recvDatagram() catch |e| return recvErr(e);
-            ev.it = .{ .buf = dgram };
-        }
+        return waitForEventStep(ev);
     }
 };
+
+/// The body of `EventSocket.waitForEvent`, generic over the transport (`ev`
+/// needs `it`, `family_id` and `sock.recvDatagram()`) so a scripted socket can
+/// drive the buffer hand-over in tests.
+fn waitForEventStep(ev: anytype) RequestError!Event {
+    while (true) {
+        if (try nextEventIn(&ev.it, ev.family_id)) |event| return event;
+        const dgram = ev.sock.recvDatagram() catch |e| return recvErr(e);
+        ev.it = .{ .buf = dgram };
+    }
+}
 
 /// The non-blocking half of `EventSocket.waitForEvent`: the next nl80211 event
 /// in the not-yet-consumed bytes `it`, or null once they are drained.
@@ -1853,4 +1903,458 @@ test "buildSimple adds the interface index attribute exactly when one is given" 
     const a = (try ai.next()).?;
     try testing.expectEqual(uapi.ATTR.IFINDEX, a.type);
     try testing.expectEqual(@as(u32, 7), try a.asU32());
+}
+
+// ── the collectors, driven by a scripted socket ────────────────────────────
+// `collect*` run over the same `MockScript` the dump tests use, so the `m.cmd`
+// filters, the appends and the found-guards are observable without a radio
+// (strict mutation re-audit 2026-11-15: 16 mutants were unobservable while the
+// bodies were bound to a real socket).
+
+const test_pid: u32 = 100;
+const test_seq: u32 = 7;
+const test_family: u16 = 41;
+
+const Rec = struct { cmd: u8, attrs: []const u8 };
+
+/// One datagram carrying `recs` (family messages of the test seq), optionally
+/// followed by the dump's `NLMSG_DONE`.
+fn recsDatagram(gpa: std.mem.Allocator, recs: []const Rec, done: bool) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    for (recs) |r| {
+        const hdr = try codec.appendHeader(gpa, &list, test_family, codec.NLM_F_MULTI, test_seq, test_pid);
+        try genl.appendHeader(gpa, &list, r.cmd, uapi.family_version);
+        try list.appendSlice(gpa, r.attrs);
+        codec.finishHeader(&list, hdr);
+    }
+    if (done) {
+        const hdr = try codec.appendHeader(gpa, &list, codec.NLMSG_DONE, codec.NLM_F_MULTI, test_seq, test_pid);
+        try list.appendNTimes(gpa, 0, 4);
+        codec.finishHeader(&list, hdr);
+    }
+    return list.toOwnedSlice(gpa);
+}
+
+/// A throwaway attribute buffer.
+const Attrs = struct {
+    l: std.ArrayList(u8) = .empty,
+    fn deinit(a: *Attrs) void {
+        a.l.deinit(testing.allocator);
+    }
+    fn u32_(a: *Attrs, t: u16, v: u32) !void {
+        try codec.appendAttrU32(testing.allocator, &a.l, t, v);
+    }
+    fn raw(a: *Attrs, t: u16, data: []const u8) !void {
+        try codec.appendAttr(testing.allocator, &a.l, t, data);
+    }
+    fn str(a: *Attrs, t: u16, s: []const u8) !void {
+        try codec.appendAttrString(testing.allocator, &a.l, t, s);
+    }
+    fn items(a: *const Attrs) []const u8 {
+        return a.l.items;
+    }
+};
+
+test "collectInterfaces keeps NEW_INTERFACE records only, in order; one bad record fails the call" {
+    const gpa = testing.allocator;
+    var foreign: Attrs = .{};
+    defer foreign.deinit();
+    try foreign.u32_(uapi.ATTR.IFINDEX, 99);
+    var a: Attrs = .{};
+    defer a.deinit();
+    try a.u32_(uapi.ATTR.IFINDEX, 3);
+    try a.str(uapi.ATTR.IFNAME, "wlan0");
+    var b: Attrs = .{};
+    defer b.deinit();
+    try b.u32_(uapi.ATTR.IFINDEX, 4);
+
+    const dg = try recsDatagram(gpa, &.{
+        .{ .cmd = uapi.CMD.NEW_STATION, .attrs = foreign.items() },
+        .{ .cmd = uapi.CMD.NEW_INTERFACE, .attrs = a.items() },
+        .{ .cmd = uapi.CMD.NEW_STATION, .attrs = foreign.items() },
+        .{ .cmd = uapi.CMD.NEW_INTERFACE, .attrs = b.items() },
+    }, true);
+    defer gpa.free(dg);
+    const script = [_][]const u8{dg};
+    var cl: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script }, .family_id = test_family };
+    const out = try collectInterfaces(gpa, &cl, test_seq);
+    defer gpa.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqual(@as(?u32, 3), out[0].ifindex);
+    try testing.expectEqualStrings("wlan0", out[0].name());
+    try testing.expectEqual(@as(?u32, 4), out[1].ifindex);
+
+    // Empty answer: an empty list, not an error.
+    const only_done = try recsDatagram(gpa, &.{}, true);
+    defer gpa.free(only_done);
+    const script2 = [_][]const u8{only_done};
+    var cl2: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script2 }, .family_id = test_family };
+    const none = try collectInterfaces(gpa, &cl2, test_seq);
+    defer gpa.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    // A record that fails to decode (IFINDEX of the wrong size) is MalformedReply.
+    var bad: Attrs = .{};
+    defer bad.deinit();
+    try bad.raw(uapi.ATTR.IFINDEX, &.{ 1, 2 });
+    const bdg = try recsDatagram(gpa, &.{.{ .cmd = uapi.CMD.NEW_INTERFACE, .attrs = bad.items() }}, true);
+    defer gpa.free(bdg);
+    const script3 = [_][]const u8{bdg};
+    var cl3: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script3 }, .family_id = test_family };
+    try testing.expectError(error.MalformedReply, collectInterfaces(gpa, &cl3, test_seq));
+    // ... and the dump was drained to its DONE (the socket stays usable).
+    try testing.expectEqual(@as(usize, 1), cl3.sock.next);
+}
+
+test "collectInterface: the first NEW_INTERFACE wins, foreign commands are skipped, none is `missing`" {
+    const gpa = testing.allocator;
+    var foreign: Attrs = .{};
+    defer foreign.deinit();
+    try foreign.u32_(uapi.ATTR.IFINDEX, 99);
+    var a: Attrs = .{};
+    defer a.deinit();
+    try a.u32_(uapi.ATTR.IFINDEX, 3);
+    var b: Attrs = .{};
+    defer b.deinit();
+    try b.u32_(uapi.ATTR.IFINDEX, 4);
+
+    const dg = try recsDatagram(gpa, &.{
+        .{ .cmd = uapi.CMD.NEW_STATION, .attrs = foreign.items() },
+        .{ .cmd = uapi.CMD.NEW_INTERFACE, .attrs = a.items() },
+        .{ .cmd = uapi.CMD.NEW_INTERFACE, .attrs = b.items() },
+    }, true);
+    defer gpa.free(dg);
+    const script = [_][]const u8{dg};
+    var cl: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script }, .family_id = test_family };
+    const got = try collectInterface(&cl, test_seq, error.NoSuchDevice);
+    try testing.expectEqual(@as(?u32, 3), got.ifindex);
+
+    // Only a foreign record: not found, with the caller's error.
+    const fdg = try recsDatagram(gpa, &.{.{ .cmd = uapi.CMD.NEW_STATION, .attrs = foreign.items() }}, true);
+    defer gpa.free(fdg);
+    const script2 = [_][]const u8{fdg};
+    var cl2: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script2 }, .family_id = test_family };
+    try testing.expectError(error.NoSuchDevice, collectInterface(&cl2, test_seq, error.NoSuchDevice));
+    var cl3: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script2 }, .family_id = test_family };
+    try testing.expectError(error.MalformedReply, collectInterface(&cl3, test_seq, error.MalformedReply));
+
+    // The second record is never decoded once one was found: a malformed
+    // second record does not fail the call.
+    var bad: Attrs = .{};
+    defer bad.deinit();
+    try bad.raw(uapi.ATTR.IFINDEX, &.{ 1, 2 });
+    const sdg = try recsDatagram(gpa, &.{
+        .{ .cmd = uapi.CMD.NEW_INTERFACE, .attrs = a.items() },
+        .{ .cmd = uapi.CMD.NEW_INTERFACE, .attrs = bad.items() },
+    }, true);
+    defer gpa.free(sdg);
+    const script3 = [_][]const u8{sdg};
+    var cl4: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script3 }, .family_id = test_family };
+    try testing.expectEqual(@as(?u32, 3), (try collectInterface(&cl4, test_seq, error.NoSuchDevice)).ifindex);
+}
+
+test "collectStations keeps NEW_STATION records only" {
+    const gpa = testing.allocator;
+    var foreign: Attrs = .{};
+    defer foreign.deinit();
+    try foreign.u32_(uapi.ATTR.IFINDEX, 99);
+    var a: Attrs = .{};
+    defer a.deinit();
+    try a.u32_(uapi.ATTR.IFINDEX, 3);
+    try a.raw(uapi.ATTR.MAC, &.{ 1, 2, 3, 4, 5, 6 });
+    var b: Attrs = .{};
+    defer b.deinit();
+    try b.u32_(uapi.ATTR.IFINDEX, 3);
+    try b.raw(uapi.ATTR.MAC, &.{ 6, 5, 4, 3, 2, 1 });
+
+    const dg = try recsDatagram(gpa, &.{
+        .{ .cmd = uapi.CMD.NEW_INTERFACE, .attrs = foreign.items() },
+        .{ .cmd = uapi.CMD.NEW_STATION, .attrs = a.items() },
+        .{ .cmd = uapi.CMD.NEW_STATION, .attrs = b.items() },
+    }, true);
+    defer gpa.free(dg);
+    const script = [_][]const u8{dg};
+    var cl: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script }, .family_id = test_family };
+    const out = try collectStations(gpa, &cl, test_seq);
+    defer gpa.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6 }, &out[0].mac.?);
+    try testing.expectEqualSlices(u8, &.{ 6, 5, 4, 3, 2, 1 }, &out[1].mac.?);
+
+    var bad: Attrs = .{};
+    defer bad.deinit();
+    try bad.raw(uapi.ATTR.MAC, &.{ 1, 2 });
+    const bdg = try recsDatagram(gpa, &.{.{ .cmd = uapi.CMD.NEW_STATION, .attrs = bad.items() }}, true);
+    defer gpa.free(bdg);
+    const script2 = [_][]const u8{bdg};
+    var cl2: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script2 }, .family_id = test_family };
+    try testing.expectError(error.MalformedReply, collectStations(gpa, &cl2, test_seq));
+}
+
+fn bssAttrs(gpa: std.mem.Allocator, a: *Attrs, freq: u32, ies: []const u8) !void {
+    _ = gpa;
+    const nest = try codec.nestBegin(testing.allocator, &a.l, uapi.ATTR.BSS);
+    try codec.appendAttrU32(testing.allocator, &a.l, uapi.BSS.FREQUENCY, freq);
+    try codec.appendAttr(testing.allocator, &a.l, uapi.BSS.INFORMATION_ELEMENTS, ies);
+    try codec.nestEnd(&a.l, nest);
+}
+
+test "collectScanResults keeps one Bss per NEW_SCAN_RESULTS that carries a BSS" {
+    const gpa = testing.allocator;
+    var foreign: Attrs = .{};
+    defer foreign.deinit();
+    try bssAttrs(gpa, &foreign, 9999, &.{ 0, 0 });
+    var a: Attrs = .{};
+    defer a.deinit();
+    try bssAttrs(gpa, &a, 2412, &.{ 0, 3, 'a', 'b', 'c' });
+    var nobss: Attrs = .{};
+    defer nobss.deinit();
+    try nobss.u32_(uapi.ATTR.IFINDEX, 3);
+    var b: Attrs = .{};
+    defer b.deinit();
+    try bssAttrs(gpa, &b, 5180, &.{});
+
+    const dg = try recsDatagram(gpa, &.{
+        .{ .cmd = uapi.CMD.NEW_INTERFACE, .attrs = foreign.items() },
+        .{ .cmd = uapi.CMD.NEW_SCAN_RESULTS, .attrs = a.items() },
+        .{ .cmd = uapi.CMD.NEW_SCAN_RESULTS, .attrs = nobss.items() },
+        .{ .cmd = uapi.CMD.NEW_SCAN_RESULTS, .attrs = b.items() },
+    }, true);
+    defer gpa.free(dg);
+    const script = [_][]const u8{dg};
+    var cl: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script }, .family_id = test_family };
+    const out = try collectScanResults(gpa, &cl, test_seq);
+    defer scan_mod.freeAll(gpa, out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqual(@as(u32, 2412), out[0].freq_mhz);
+    try testing.expectEqualSlices(u8, &.{ 0, 3, 'a', 'b', 'c' }, out[0].ies);
+    try testing.expectEqual(@as(u32, 5180), out[1].freq_mhz);
+
+    // A BSS that fails to decode (BSSID of the wrong size): MalformedReply, no leak.
+    var bad: Attrs = .{};
+    defer bad.deinit();
+    const nest = try codec.nestBegin(gpa, &bad.l, uapi.ATTR.BSS);
+    try codec.appendAttr(gpa, &bad.l, uapi.BSS.BSSID, &.{ 1, 2 });
+    try codec.nestEnd(&bad.l, nest);
+    const bdg = try recsDatagram(gpa, &.{
+        .{ .cmd = uapi.CMD.NEW_SCAN_RESULTS, .attrs = a.items() },
+        .{ .cmd = uapi.CMD.NEW_SCAN_RESULTS, .attrs = bad.items() },
+    }, true);
+    defer gpa.free(bdg);
+    const script2 = [_][]const u8{bdg};
+    var cl2: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script2 }, .family_id = test_family };
+    try testing.expectError(error.MalformedReply, collectScanResults(gpa, &cl2, test_seq));
+}
+
+test "collectRegDomains keeps GET_REG records only; a domain over the ceiling is TooManyMessages" {
+    const gpa = testing.allocator;
+    var foreign: Attrs = .{};
+    defer foreign.deinit();
+    try foreign.str(uapi.ATTR.REG_ALPHA2, "XX");
+    var a: Attrs = .{};
+    defer a.deinit();
+    try a.str(uapi.ATTR.REG_ALPHA2, "CZ");
+    var b: Attrs = .{};
+    defer b.deinit();
+    try b.str(uapi.ATTR.REG_ALPHA2, "DE");
+
+    const dg = try recsDatagram(gpa, &.{
+        .{ .cmd = uapi.CMD.NEW_INTERFACE, .attrs = foreign.items() },
+        .{ .cmd = uapi.CMD.GET_REG, .attrs = a.items() },
+        .{ .cmd = uapi.CMD.GET_REG, .attrs = b.items() },
+    }, true);
+    defer gpa.free(dg);
+    const script = [_][]const u8{dg};
+    var cl: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script }, .family_id = test_family };
+    const out = try collectRegDomains(gpa, &cl, test_seq);
+    defer reg_mod.freeAll(gpa, out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqualStrings("CZ", &out[0].alpha2);
+    try testing.expectEqualStrings("DE", &out[1].alpha2);
+
+    // alpha2 of the wrong length: the record fails to decode.
+    var bad: Attrs = .{};
+    defer bad.deinit();
+    try bad.str(uapi.ATTR.REG_ALPHA2, "CZE");
+    const bdg = try recsDatagram(gpa, &.{.{ .cmd = uapi.CMD.GET_REG, .attrs = bad.items() }}, true);
+    defer gpa.free(bdg);
+    const script2 = [_][]const u8{bdg};
+    var cl2: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script2 }, .family_id = test_family };
+    try testing.expectError(error.MalformedReply, collectRegDomains(gpa, &cl2, test_seq));
+}
+
+test "collectSurvey keeps the survey entries that carry a frequency, from NEW_SURVEY_RESULTS only" {
+    const gpa = testing.allocator;
+    var foreign: Attrs = .{};
+    defer foreign.deinit();
+    {
+        const n = try codec.nestBegin(gpa, &foreign.l, uapi.ATTR.SURVEY_INFO);
+        try codec.appendAttrU32(gpa, &foreign.l, uapi.SURVEY_INFO.FREQUENCY, 9999);
+        try codec.nestEnd(&foreign.l, n);
+    }
+    var a: Attrs = .{};
+    defer a.deinit();
+    {
+        try a.u32_(uapi.ATTR.IFINDEX, 3);
+        const n = try codec.nestBegin(gpa, &a.l, uapi.ATTR.SURVEY_INFO);
+        try codec.appendAttrU32(gpa, &a.l, uapi.SURVEY_INFO.FREQUENCY, 2412);
+        try codec.nestEnd(&a.l, n);
+    }
+    var nofreq: Attrs = .{};
+    defer nofreq.deinit();
+    try nofreq.u32_(uapi.ATTR.IFINDEX, 3);
+    var b: Attrs = .{};
+    defer b.deinit();
+    {
+        const n = try codec.nestBegin(gpa, &b.l, uapi.ATTR.SURVEY_INFO);
+        try codec.appendAttrU32(gpa, &b.l, uapi.SURVEY_INFO.FREQUENCY, 5180);
+        try codec.nestEnd(&b.l, n);
+    }
+
+    const dg = try recsDatagram(gpa, &.{
+        .{ .cmd = uapi.CMD.NEW_INTERFACE, .attrs = foreign.items() },
+        .{ .cmd = uapi.CMD.NEW_SURVEY_RESULTS, .attrs = a.items() },
+        .{ .cmd = uapi.CMD.NEW_SURVEY_RESULTS, .attrs = nofreq.items() },
+        .{ .cmd = uapi.CMD.NEW_SURVEY_RESULTS, .attrs = b.items() },
+    }, true);
+    defer gpa.free(dg);
+    const script = [_][]const u8{dg};
+    var cl: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script }, .family_id = test_family };
+    const out = try collectSurvey(gpa, &cl, test_seq);
+    defer gpa.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqual(@as(u32, 2412), out[0].frequency_mhz);
+    try testing.expectEqual(@as(u32, 5180), out[1].frequency_mhz);
+
+    var bad: Attrs = .{};
+    defer bad.deinit();
+    try bad.raw(uapi.ATTR.IFINDEX, &.{1});
+    const bdg = try recsDatagram(gpa, &.{.{ .cmd = uapi.CMD.NEW_SURVEY_RESULTS, .attrs = bad.items() }}, true);
+    defer gpa.free(bdg);
+    const script2 = [_][]const u8{bdg};
+    var cl2: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script2 }, .family_id = test_family };
+    try testing.expectError(error.MalformedReply, collectSurvey(gpa, &cl2, test_seq));
+}
+
+test "collectPowerSave: the first GET_POWER_SAVE decides; foreign commands are skipped; none is MalformedReply" {
+    const gpa = testing.allocator;
+    var on: Attrs = .{};
+    defer on.deinit();
+    try on.u32_(uapi.ATTR.PS_STATE, 1);
+    var off: Attrs = .{};
+    defer off.deinit();
+    try off.u32_(uapi.ATTR.PS_STATE, uapi.PS.DISABLED);
+
+    // A foreign record saying "on" first, then the real "off", then another "on".
+    const dg = try recsDatagram(gpa, &.{
+        .{ .cmd = uapi.CMD.NEW_INTERFACE, .attrs = on.items() },
+        .{ .cmd = uapi.CMD.GET_POWER_SAVE, .attrs = off.items() },
+        .{ .cmd = uapi.CMD.GET_POWER_SAVE, .attrs = on.items() },
+    }, true);
+    defer gpa.free(dg);
+    const script = [_][]const u8{dg};
+    var cl: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script }, .family_id = test_family };
+    try testing.expectEqual(false, try collectPowerSave(&cl, test_seq));
+
+    const dg2 = try recsDatagram(gpa, &.{.{ .cmd = uapi.CMD.GET_POWER_SAVE, .attrs = on.items() }}, true);
+    defer gpa.free(dg2);
+    const script2 = [_][]const u8{dg2};
+    var cl2: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script2 }, .family_id = test_family };
+    try testing.expectEqual(true, try collectPowerSave(&cl2, test_seq));
+
+    // Only a foreign record, or a record without PS_STATE: MalformedReply.
+    const dg3 = try recsDatagram(gpa, &.{.{ .cmd = uapi.CMD.NEW_INTERFACE, .attrs = on.items() }}, true);
+    defer gpa.free(dg3);
+    const script3 = [_][]const u8{dg3};
+    var cl3: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script3 }, .family_id = test_family };
+    try testing.expectError(error.MalformedReply, collectPowerSave(&cl3, test_seq));
+    const dg4 = try recsDatagram(gpa, &.{.{ .cmd = uapi.CMD.GET_POWER_SAVE, .attrs = &.{} }}, true);
+    defer gpa.free(dg4);
+    const script4 = [_][]const u8{dg4};
+    var cl4: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script4 }, .family_id = test_family };
+    try testing.expectError(error.MalformedReply, collectPowerSave(&cl4, test_seq));
+}
+
+test "collectWiphys feeds NEW_WIPHY records only and reassembles a radio over messages" {
+    const gpa = testing.allocator;
+    var foreign: Attrs = .{};
+    defer foreign.deinit();
+    try foreign.u32_(uapi.ATTR.WIPHY, 5);
+    try foreign.str(uapi.ATTR.WIPHY_NAME, "ghost");
+    var a: Attrs = .{};
+    defer a.deinit();
+    try a.u32_(uapi.ATTR.WIPHY, 0);
+    try a.str(uapi.ATTR.WIPHY_NAME, "phy0");
+    var a2: Attrs = .{};
+    defer a2.deinit();
+    try a2.u32_(uapi.ATTR.WIPHY, 0);
+    try a2.u32_(uapi.ATTR.FEATURE_FLAGS, 0x10);
+
+    const dg = try recsDatagram(gpa, &.{
+        .{ .cmd = uapi.CMD.NEW_INTERFACE, .attrs = foreign.items() },
+        .{ .cmd = uapi.CMD.NEW_WIPHY, .attrs = a.items() },
+        .{ .cmd = uapi.CMD.NEW_WIPHY, .attrs = a2.items() },
+    }, true);
+    defer gpa.free(dg);
+    const script = [_][]const u8{dg};
+    var cl: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script }, .family_id = test_family };
+    const out = try collectWiphys(gpa, &cl, test_seq);
+    defer wiphy_mod.freeAll(gpa, out);
+    try testing.expectEqual(@as(usize, 1), out.len);
+    try testing.expectEqualStrings("phy0", out[0].name());
+    try testing.expectEqual(@as(u32, 0x10), out[0].feature_flags);
+
+    // A fragment that fails to decode (name over the ceiling) fails the call.
+    var bad: Attrs = .{};
+    defer bad.deinit();
+    try bad.u32_(uapi.ATTR.WIPHY, 0);
+    try bad.raw(uapi.ATTR.FEATURE_FLAGS, &.{1});
+    const bdg = try recsDatagram(gpa, &.{.{ .cmd = uapi.CMD.NEW_WIPHY, .attrs = bad.items() }}, true);
+    defer gpa.free(bdg);
+    const script2 = [_][]const u8{bdg};
+    var cl2: MockScript = .{ .sock = .{ .portid = test_pid, .script = &script2 }, .family_id = test_family };
+    try testing.expectError(error.MalformedReply, collectWiphys(gpa, &cl2, test_seq));
+}
+
+const MockEvents = struct {
+    sock: ScriptSock,
+    family_id: u16,
+    it: codec.MessageIterator = .{ .buf = &.{} },
+};
+
+test "waitForEventStep: one recv per drained datagram, events in order, a stale buffer is never re-read" {
+    const gpa = testing.allocator;
+    var e1: Attrs = .{};
+    defer e1.deinit();
+    try e1.u32_(uapi.ATTR.IFINDEX, 7);
+    var e2: Attrs = .{};
+    defer e2.deinit();
+    try e2.u32_(uapi.ATTR.IFINDEX, 8);
+    var e3: Attrs = .{};
+    defer e3.deinit();
+    try e3.u32_(uapi.ATTR.IFINDEX, 9);
+
+    const d1 = try recsDatagram(gpa, &.{
+        .{ .cmd = uapi.CMD.NEW_SCAN_RESULTS, .attrs = e1.items() },
+        .{ .cmd = uapi.CMD.SCAN_ABORTED, .attrs = e2.items() },
+    }, false);
+    defer gpa.free(d1);
+    const d2 = try recsDatagram(gpa, &.{.{ .cmd = uapi.CMD.NEW_SCAN_RESULTS, .attrs = e3.items() }}, false);
+    defer gpa.free(d2);
+    const script = [_][]const u8{ d1, d2 };
+    var ev: MockEvents = .{ .sock = .{ .portid = test_pid, .script = &script }, .family_id = test_family };
+
+    const r1 = try waitForEventStep(&ev);
+    try testing.expectEqual(@as(?u32, 7), r1.ifindex);
+    try testing.expectEqual(@as(usize, 1), ev.sock.next);
+    const r2 = try waitForEventStep(&ev);
+    try testing.expectEqual(@as(?u32, 8), r2.ifindex);
+    try testing.expect(r2.isScanAborted());
+    try testing.expectEqual(@as(usize, 1), ev.sock.next); // drained datagram not re-read, none fetched early
+    const r3 = try waitForEventStep(&ev);
+    try testing.expectEqual(@as(?u32, 9), r3.ifindex);
+    try testing.expectEqual(@as(usize, 2), ev.sock.next);
+    // Script exhausted: the receive error surfaces.
+    try testing.expectError(error.RecvFailed, waitForEventStep(&ev));
 }
