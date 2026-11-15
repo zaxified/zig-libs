@@ -202,6 +202,63 @@ pub fn compute(samples: []const ?u64) Stats {
     return acc.snapshot();
 }
 
+/// Exact median of `samples`, or null when empty. Reorders `samples` in place
+/// (selection, not a sort: expected O(n), worst case O(n log n)); allocation-free.
+/// With an even count the result is the LOWER middle, element `(n - 1) / 2` of
+/// the sorted order, so it is always one of the samples (the average of the two
+/// middles would need a float or a rounding rule; use `Accumulator` for means).
+/// Median-of-3 pivot with a three-way partition, so sorted, reverse-sorted and
+/// all-equal input stay linear; a depth budget of `2 * log2(n)` hands an
+/// adversarial range to `std.mem.sortUnstable` (introselect), which bounds the
+/// worst case. Samples that are not a probe's RTT (losses) are the caller's to
+/// filter out first.
+pub fn median(samples: []u64) ?u64 {
+    if (samples.len == 0) return null;
+    return select(samples, (samples.len - 1) / 2, 2 * (@as(usize, @bitSizeOf(usize)) - @clz(samples.len)));
+}
+
+/// The element that would sit at index `k` (< `a.len`) after sorting `a`.
+fn select(a: []u64, k: usize, depth_budget: usize) u64 {
+    var lo: usize = 0;
+    var hi: usize = a.len - 1;
+    var budget = depth_budget;
+    while (lo < hi) {
+        if (budget == 0) {
+            std.mem.sortUnstable(u64, a[lo .. hi + 1], {}, std.sort.asc(u64));
+            return a[k];
+        }
+        budget -= 1;
+        const mid = lo + (hi - lo) / 2;
+        const x = a[lo];
+        const y = a[mid];
+        const z = a[hi];
+        const pivot = @max(@min(x, y), @min(@max(x, y), z));
+        // Dutch national flag: a[lo..lt] < pivot, a[lt..i] == pivot, a[gt+1..hi] > pivot.
+        var lt = lo;
+        var i = lo;
+        var gt = hi;
+        while (i <= gt) {
+            if (a[i] < pivot) {
+                std.mem.swap(u64, &a[i], &a[lt]);
+                lt += 1;
+                i += 1;
+            } else if (a[i] > pivot) {
+                std.mem.swap(u64, &a[i], &a[gt]);
+                if (gt == 0) break;
+                gt -= 1;
+            } else {
+                i += 1;
+            }
+        }
+        if (k < lt) {
+            hi = lt - 1;
+        } else if (k > gt) {
+            lo = gt + 1;
+        } else return pivot;
+    }
+    return a[k];
+}
+
 // ── HdrHistogram-style percentile histogram ──────────────────────────────────
 
 /// Configuration for `Histogram.init`.
@@ -1178,4 +1235,77 @@ test "Histogram: wiring pattern alongside Accumulator" {
     try testing.expectEqual(@as(u64, 1100), p.p50); // 4th of 7, exact range
     try testing.expectEqual(@as(u64, 2000), p.p99);
     try testing.expectApproxEqAbs(s.mean_ns, hist.mean(), eps); // exact buckets here
+}
+
+fn medianOracle(gpa: std.mem.Allocator, a: []const u64) !?u64 {
+    if (a.len == 0) return null;
+    const c = try gpa.dupe(u64, a);
+    defer gpa.free(c);
+    std.mem.sort(u64, c, {}, std.sort.asc(u64));
+    return c[(c.len - 1) / 2];
+}
+
+test "median: empty, one, two, odd, even (lower middle)" {
+    var e: [0]u64 = .{};
+    try std.testing.expectEqual(@as(?u64, null), median(&e));
+    var one = [_]u64{7};
+    try std.testing.expectEqual(@as(?u64, 7), median(&one));
+    var two = [_]u64{ 9, 3 };
+    try std.testing.expectEqual(@as(?u64, 3), median(&two));
+    var odd = [_]u64{ 5, 1, 4, 2, 3 };
+    try std.testing.expectEqual(@as(?u64, 3), median(&odd));
+    var even = [_]u64{ 40, 10, 30, 20 };
+    try std.testing.expectEqual(@as(?u64, 20), median(&even));
+    var ext = [_]u64{ std.math.maxInt(u64), 0, std.math.maxInt(u64), 0, 1 };
+    try std.testing.expectEqual(@as(?u64, 1), median(&ext));
+}
+
+test "median: matches a full sort on random inputs (incl. many duplicates)" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6d656469616e);
+    const rnd = prng.random();
+    var buf: [300]u64 = undefined;
+    for (0..2000) |iter_no| {
+        const n = rnd.uintLessThan(usize, buf.len + 1);
+        const modulus: u64 = switch (iter_no % 3) {
+            0 => 3,
+            1 => 50,
+            else => std.math.maxInt(u64),
+        };
+        for (buf[0..n]) |*v| v.* = rnd.uintLessThan(u64, modulus);
+        const want = try medianOracle(gpa, buf[0..n]);
+        try std.testing.expectEqual(want, median(buf[0..n]));
+    }
+}
+
+test "median: 100k sorted, reverse-sorted, all-equal, organ-pipe input" {
+    const gpa = std.testing.allocator;
+    const n = 100_000;
+    const a = try gpa.alloc(u64, n);
+    defer gpa.free(a);
+    for (a, 0..) |*v, i| v.* = i;
+    try std.testing.expectEqual(@as(?u64, (n - 1) / 2), median(a));
+    for (a, 0..) |*v, i| v.* = n - i;
+    try std.testing.expectEqual(@as(?u64, (n - 1) / 2 + 1), median(a));
+    @memset(a, 42);
+    try std.testing.expectEqual(@as(?u64, 42), median(a));
+    for (a, 0..) |*v, i| v.* = if (i < n / 2) i else n - i;
+    const want = try medianOracle(gpa, a);
+    try std.testing.expectEqual(want, median(a));
+}
+
+test "median: the introselect fallback (budget 0 and 1) agrees with a sort" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(1);
+    const rnd = prng.random();
+    const a = try gpa.alloc(u64, 5000);
+    defer gpa.free(a);
+    for ([_]usize{ 0, 1 }) |budget| {
+        for (a) |*v| v.* = rnd.uintLessThan(u64, 1000);
+        const k = rnd.uintLessThan(usize, a.len);
+        const c = try gpa.dupe(u64, a);
+        defer gpa.free(c);
+        std.mem.sort(u64, c, {}, std.sort.asc(u64));
+        try std.testing.expectEqual(c[k], select(a, k, budget));
+    }
 }
