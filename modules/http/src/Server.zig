@@ -8930,6 +8930,78 @@ test "on_conn_closed: a write stall is timed_out; a reset during the write is er
     try testing.expectEqual(@as(u64, 1), reset.sum.requests);
 }
 
+/// What `canceledSummary` observes instead of sleeping. Each field is a fact
+/// the test waits for (with a deadline that fails loudly), never a guess.
+const CancelProbe = struct {
+    /// The accept loop has returned (after `shutdown`): from then on a
+    /// cancelation can only reach the connection tasks, never be consumed by
+    /// the blocked `accept`. Set by `serveObserved`.
+    accept_done: std.atomic.Value(bool) = .init(false),
+    /// `.idle` states seen: the connection answered and is about to wait for
+    /// its next request (`on_conn_state`).
+    idle: std.atomic.Value(u32) = .init(0),
+    /// 16 KiB chunks `slowBigHandler` has handed to the socket so far.
+    var chunks: std.atomic.Value(u32) = .init(0);
+
+    fn onState(ctx: ?*anyopaque, _: ?net.IpAddress, state: ConnState) void {
+        const p: *CancelProbe = @ptrCast(@alignCast(ctx.?));
+        if (state == .idle) _ = p.idle.fetchAdd(1, .release);
+    }
+};
+
+/// `bigHandler` that counts the chunks it has written, so a test can see the
+/// response stop advancing (the socket buffers are full and the write blocks).
+fn countingBigHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    _ = req;
+    const chunk: [16 * 1024]u8 = @splat('b');
+    for (0..256) |_| {
+        try rw.writeAll(&chunk);
+        _ = CancelProbe.chunks.fetchAdd(1, .release);
+    }
+}
+
+/// `serve`'s single-listener path (without the timeout reaper, which the test's
+/// 20 s limits never need), plus the one fact `serve` does not expose: that the
+/// accept loop has returned and the connection tasks are what is awaited.
+fn serveObserved(s: *Server, probe: *CancelProbe) void {
+    defer s.group.await(s.io) catch {};
+    s.acceptLoop(&s.listener.?, &s.group) catch {};
+    probe.accept_done.store(true, .release);
+}
+
+/// Poll `ready(ctx)` every 2 ms for at most 10 s; the test fails (printing
+/// `what`) when it never holds. A generous deadline, so load only slows the
+/// test and never decides its outcome.
+fn awaitCondition(io: std.Io, what: []const u8, ctx: anytype, comptime ready: fn (@TypeOf(ctx)) bool) !void {
+    var waited: u32 = 0;
+    while (!ready(ctx)) : (waited += 2) {
+        if (waited > 10_000) {
+            std.debug.print("awaitCondition: never saw: {s}\n", .{what});
+            return error.ConditionNeverHeld;
+        }
+        try sleepMs(io, 2);
+    }
+}
+
+fn probeIdle(p: *CancelProbe) bool {
+    return p.idle.load(.acquire) != 0;
+}
+
+fn probeAcceptDone(p: *CancelProbe) bool {
+    return p.accept_done.load(.acquire);
+}
+
+/// True once the response has stopped advancing for 60 ms (the write is
+/// blocked on a full socket) or has been written whole. Only the coverage of
+/// the test rides on this: a cancelation delivered a moment early meets the
+/// same write and ends the connection the same way.
+fn probeWriteBlocked(last: *u32) bool {
+    const now = CancelProbe.chunks.load(.acquire);
+    if (now == 256) return true;
+    defer last.* = now;
+    return now != 0 and now == last.*;
+}
+
 /// A server whose `serve` task is canceled while one connection waits in a
 /// read (`big` false: idle after one answer) or is stuck in a write (`big`
 /// true: a `/big` response the client never reads). The summary it reports.
@@ -8938,18 +9010,22 @@ fn canceledSummary(big: bool) !SummaryRec {
     defer threaded.deinit();
     const io = threaded.io();
     var rec: SummaryRec = .{};
+    var probe: CancelProbe = .{};
+    CancelProbe.chunks.store(0, .release);
     {
         var server = init(io, testing.allocator, .{
-            .handler = if (big) bigHandler else testHandler,
+            .handler = if (big) countingBigHandler else testHandler,
             .read_timeout_ms = 20_000,
             .idle_timeout_ms = 20_000,
             .write_timeout_ms = 20_000,
             .on_conn_closed = SummaryRec.record,
             .on_conn_closed_ctx = &rec,
+            .on_conn_state = CancelProbe.onState,
+            .on_conn_state_ctx = &probe,
         });
         defer server.deinit();
         server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
-        var serving = try io.concurrent(serveWrap, .{&server});
+        var serving = try io.concurrent(serveObserved, .{ &server, &probe });
         const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
             serving.cancel(io);
             return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
@@ -8973,12 +9049,25 @@ fn canceledSummary(big: bool) !SummaryRec {
             serving.cancel(io);
             return err;
         };
-        try sleepMs(io, 100); // the server is now blocked in its read / write
+        // The server is now blocked in its read (the `.idle` state fires right
+        // before the wait for the next request) / in its write.
+        const reached = if (big) blk: {
+            var last: u32 = 0;
+            break :blk awaitCondition(io, "the response write to block", &last, probeWriteBlocked);
+        } else awaitCondition(io, "the connection to go idle", &probe, probeIdle);
+        reached catch |err| {
+            serving.cancel(io);
+            return err;
+        };
         // Stop the accept loop first: `serve` then waits for its connection
         // tasks, and a cancelation arriving THERE cancels them (one consumed
-        // by the blocked `accept` would not reach them).
+        // by the blocked `accept` would not reach them). Wait until the loop
+        // has actually returned before canceling.
         server.shutdown();
-        try sleepMs(io, 100);
+        awaitCondition(io, "the accept loop to return after shutdown", &probe, probeAcceptDone) catch |err| {
+            serving.cancel(io);
+            return err;
+        };
         serving.cancel(io);
     }
     return rec;
