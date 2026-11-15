@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GQ). The exported C `memcpy`/`memset` unwrapped caller pointers with `.?` (undefined in ReleaseFast); a null pointer with a non-zero length now traps (SIGILL) in every build mode, a null pointer with length 0 stays a no-op as in C. The traps keep both functions frameless (`orelse @trap()` in memcpy, an inline-asm `ud2` in memset on x86-64; objdump-checked). Tests: `src/sweep_test.zig`.
 - **2026-10-26** — Audit of the `memcpy` source (independent review + 46-mutant
@@ -46,4 +47,4 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   compiler_rt's byte-at-a-time `memset` for every caller, std included:
   `@memset` 4 KiB 1 190 → 52 ns, `secureZero` 16 KiB 27× faster, std deflate
   level 6 on 16 KiB −27 % time. Opt-in; a compile error with libc linked.
-  Found by qap's std perf audit.
+  Found by the web-server consumer's std perf audit.

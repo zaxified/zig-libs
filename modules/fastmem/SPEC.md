@@ -6,7 +6,7 @@
 
 **Scope:** parity — musl libc `memset` and `memcpy` (MIT) (surveyed 2026-09-30; `memcpy` added 2026-10-26)
 
-**Audit:** review 2026-11-01 · mutation 2026-10-30 (40/49, 9 eq) · src 2683eade3bf99593
+**Audit:** review 2026-11-01 · mutation 2026-10-30 (40/49, 9 eq) · src 3198cdd641d8d598
 
 Audit detail: the 2026-11-01 review is a delta over `sweep_test.zig` only (full-CI fix: the dying sweep child's stderr goes to /dev/null); library source unchanged since the mutation run.
 
