@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation run on the current source (root, cookiestore, csrf, values, idhex, common): 522 ReleaseSafe mutants (the 520 of the 2026-11-06 run re-applied, plus the clock reads now routed through `clock`, `Store.iterate`'s `Unsupported`, `currentGen`, `KvStore`'s failed-write result, `iterateImpl`'s skip and closed-store check). 475 killed on the first run; of 47 survivors 44 are equivalent (the 2026-11-06 arguments, re-checked against the current source, plus the `clock` overflow clamp and the closed-store early return of `iterateImpl`) and 3 got tests: `iterate` over a `KvStore` holding junk keys before and after the sessions must visit every session (a junk key ended the walk), a hand-built blob with a duplicated key reads and removes the first entry, and a cookie name plus path that outgrow a Set-Cookie line are `InvalidCookieSize`, not `InvalidCookieOptions`. ReleaseFast burn mutants (the six `secureZero` defers): all killed; the Csrf safe-path wipe survives the schemata build (the instrumented frame moves) and is killed by a single-mutation build.
 
@@ -26,7 +27,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   change (fix):** a session whose data did not change is saved with the new optional `Store.touch`
   (same CAS, generation kept), so a concurrent request's data write is no longer the one dropped;
   `Session.persisted` says whether a save landed (the generation no longer moves on every save — a
-  caller that compared generations, as qap's `finish` does, must switch). `RamcacheStore` reports a
+  caller that compared generations, as the web-server consumer's `finish` does, must switch). `RamcacheStore` reports a
   write the cache dropped (OOM) as a failed save. `maxAgeSeconds` never rounds a sub-second idle
   timeout to `Max-Age=0`. Docs: `Csrf.session_cookie` must equal `Options.cookie_name`; what the
   token binds to. Test: a CSRF token longer than 64 digits is refused (mutation survivor). Tools: a gofiber/fiber v3.6.1
@@ -72,8 +73,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-28** — `Csrf`: the private header-then-query token extraction (`presentedToken`) is
   now public as `Csrf.presented(req)`, same extraction order, unchanged. Added
   `Csrf.check(req) bool` — the whole CSRF guard minus the middleware's 403 response: session
-  cookie present, a token `presented`, and it `verify`s. Requested by qap M11.4 (2026-09-27):
-  qap's own core-only sessions usage had to duplicate `presentedToken` to guard requests without
+  cookie present, a token `presented`, and it `verify`s. Requested by the web-server consumer M11.4 (2026-09-27):
+  the web-server consumer's own core-only sessions usage had to duplicate `presentedToken` to guard requests without
   going through `router`'s `Csrf.middleware`. `check` does **not** apply the middleware's
   safe-method exemption — it never reads `req.method` — so it cannot silently report a valid
   guard for an unchecked GET; only `middleware` special-cases safe methods. `middlewareRun` now
