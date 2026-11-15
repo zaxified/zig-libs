@@ -3271,6 +3271,9 @@ pub const Db = struct {
 
         /// `n` bytes at `off` (`n <= buf.len`, `off + n <= file_size`).
         fn view(w: *ReplayWindow, store: Storage, h: Storage.Handle, file_size: u64, off: u64, n: usize) ![]const u8 {
+            // The contract above: a view past the end would hand back bytes
+            // the window never read (a batch's length checks keep it so).
+            std.debug.assert(off + n <= file_size);
             if (off < w.start or off + n > w.start + w.len) {
                 w.start = off;
                 w.len = @intCast(@min(w.buf.len, file_size - off));
@@ -9253,4 +9256,61 @@ test "batch: out of memory inside a commit leaves all or nothing, never a part" 
             try expectGet(&db, "k", "old");
         }
     }
+}
+
+test "batch: deleting or overwriting an expiring key keeps the expiring counter exact" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 0 };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = mc.clock() });
+    defer db.close();
+    try db.putExpiring("e1", "v", 5000);
+    try db.putExpiring("e2", "v", 5000);
+    try db.putExpiring("e3", "v", 5000);
+    try testing.expectEqual(@as(usize, 3), db.expiring);
+    var b = db.batch();
+    defer b.deinit();
+    try b.delete("e1");
+    try b.put("e2", "plain");
+    try b.commit();
+    try testing.expectEqual(@as(usize, 1), db.expiring);
+    try b.putExpiring("e3", "w", 7000); // an expiring overwrite: still one
+    try b.putExpiring("e4", "w", 7000);
+    try b.delete("e4"); // put, then delete, in one batch
+    try b.commit();
+    try testing.expectEqual(@as(usize, 1), db.expiring);
+    try expectAccounting(&db);
+}
+
+test "batch: a record whose last chunk is one byte, flipped, drops the batch" {
+    // The replay CRC walks a record in window-sized pieces; a record of
+    // `replay_window + 1` bytes ends in a piece of one byte.
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const val = try testing.allocator.alloc(u8, Db.replay_window + 1 - rec_fixed - 1);
+    defer testing.allocator.free(val);
+    @memset(val, 'w');
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        var b = db.batch();
+        defer b.deinit();
+        try b.put("a", "A");
+        try b.put("w", val);
+        try b.commit();
+        try expectGet(&db, "w", val);
+    }
+    {
+        // Whole: applied (the CRC covers the one-byte piece too).
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+        defer db.close();
+        try expectGet(&db, "a", "A");
+        try expectGet(&db, "w", val);
+    }
+    const f = sim.fileContent(batch_file).?;
+    sim.flipByte(batch_file, f.len - 1);
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    try expectGet(&db, "a", null);
+    try testing.expectEqual(@as(usize, 0), db.count());
 }
