@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** no-panic sweep + blind review (§ GP) found nothing; `src/sweep_test.zig` pins the edge cases the sweep argued (`combine` with length 0 and the largest length; every backend on empty and 1-byte input at any alignment).
 - **2026-10-20** — **Changed (performance):** on x86-64 with LLVM the three-stream SSE4.2 loop is one inline-asm block behind `.p2align 5` (end-of-block bases, negative index, `add`+`jnz`), so Intel's JCC-erratum microcode no longer turns it into a code-layout lottery: bench-crc32c 0.45–1.38× → 0.38–0.98× Go `hash/crc32`. Same results (every-length test against std and the table path, `CRC32C_FUZZ=20000` ReleaseSafe clean); the self-hosted backend keeps the plain loop.
 
@@ -38,12 +39,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-29** — Fix: a Debug build for a baseline x86_64 target (`-Dtarget=x86_64-linux`,
   or any CPU model without the instruction) failed to compile — Zig 0.16's self-hosted x86_64
   backend cannot encode the run-time-dispatched SSE4.2 path for such a CPU. That build now uses
-  the table; LLVM builds and targets that have the instruction are unchanged. Found by qap's
+  the table; LLVM builds and targets that have the instruction are unchanged. Found by the web-server consumer's
   portability check.
 - **2026-09-27** — New module: CRC-32C with the SSE4.2 and ARMv8 CRC
   instructions chosen at run time (three interleaved streams, 7–20 GB/s) and a
   slicing-by-8 fallback (~1.9 GB/s), against std's bytewise ~0.45 GB/s; `hash`,
   `extend`, `combine`, streaming `Crc32c`, `backend`/`hashWith`. Anchored to
   RFC 3720 B.4 and the CRC catalogue check value, and differentially to
-  `std.hash.crc.Crc32Iscsi`. Requested by `seglog` (egw-hub), whose reads it
+  `std.hash.crc.Crc32Iscsi`. Requested by `seglog` (the ingest daemon), whose reads it
   bounded.
