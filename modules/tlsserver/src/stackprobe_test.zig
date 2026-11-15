@@ -48,6 +48,20 @@ test "STACKPROBE: no traffic secret, key state or IV residue after any record en
     try probeSuite("chacha", .chacha20_poly1305_sha256);
 }
 
+test "STACKPROBE: with burn_records off the record entry points leave residue (the burn is what cleans)" {
+    try sp.skipUnlessOptimized();
+    fill(&secret32, "record probe secret 32");
+    prot.wipe();
+    try record.Protection.init(&prot, .aes_128_gcm_sha256, &secret32);
+    prot.burn_records = false;
+    fill(buf[record.header_len..][0..32], "record probe content");
+    prot.seq = 0;
+    try std.testing.expectError(error.DeadStackResidue, P.run("seal, burn off (expected to fail)", record.Protection.seal, .{ &prot, &buf, 32, .application_data, 0 }, &[_][]const u8{std.mem.asBytes(&prot.aead)}, .{ .quiet = true }));
+    prot.burn_records = true;
+    prot.seq = 0;
+    _ = try P.run("seal, burn on", record.Protection.seal, .{ &prot, &buf, 32, .application_data, 0 }, &[_][]const u8{std.mem.asBytes(&prot.aead)}, .{});
+}
+
 // ── the key and IV derived from a traffic secret (wave 2 of the 2026-11-06 mutation run) ──
 
 var derived_key: [32]u8 = undefined;

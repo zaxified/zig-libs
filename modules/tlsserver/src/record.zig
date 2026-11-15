@@ -18,6 +18,7 @@
 const std = @import("std");
 const tls13 = @import("tls13");
 const burn = @import("burn.zig");
+const zeroize = @import("zeroize.zig");
 
 const Aes128Gcm = @import("aesgcm").Aes128Gcm;
 const Aes256Gcm = @import("aesgcm").Aes256Gcm;
@@ -145,6 +146,10 @@ pub const Protection = struct {
     /// The next record's sequence number (RFC 8446 §5.3). Public; the engine
     /// reads it to decide when to KeyUpdate.
     seq: u64 = 0,
+    /// Run `seal` / `open` under `burn.record_burn` (the default; `init` and
+    /// `initKeyIv` reset it to true). `Config.record_burn` turns it off for
+    /// the connection's protections; set after `init`.
+    burn_records: bool = true,
 
     const Aead = union(enum) {
         aes128: Aes128Gcm.Context,
@@ -183,6 +188,7 @@ pub const Protection = struct {
             _ => unreachable,
         }
         out.seq = 0;
+        out.burn_records = true;
     }
 
     /// RFC 8446 §7.3: the AEAD key and static IV `init` derives from
@@ -239,11 +245,12 @@ pub const Protection = struct {
         }
         out.iv = iv.*;
         out.seq = 0;
+        out.burn_records = true;
     }
 
     /// Zero the key state and IV. The protection is unusable afterwards.
     pub fn wipe(self: *Protection) void {
-        std.crypto.secureZero(u8, std.mem.asBytes(self));
+        zeroize.zeroize(std.mem.asBytes(self));
     }
 
     /// RFC 8446 §5.3: the 64-bit sequence number, big-endian, left-padded to
@@ -262,6 +269,7 @@ pub const Protection = struct {
     /// tag_len`, and the sequence number has advanced. `pad` zero octets of
     /// padding follow the content type (RFC 8446 §5.4).
     pub fn seal(self: *Protection, buf: []u8, content_len: usize, content_type: ContentType, pad: usize) SealError![]u8 {
+        if (!self.burn_records) return sealBody(self, buf, content_len, content_type, pad);
         return burn.run(burn.record_burn, SealError![]u8, sealBody, .{ self, buf, content_len, content_type, pad });
     }
 
@@ -295,6 +303,7 @@ pub const Protection = struct {
     /// type; padding is stripped. On `BadRecordMac` the ciphertext is zeroed.
     /// The sequence number advances only on success.
     pub fn open(self: *Protection, record: []u8) OpenError!Opened {
+        if (!self.burn_records) return openBody(self, record);
         return burn.run(burn.record_burn, OpenError!Opened, openBody, .{ self, record });
     }
 
@@ -400,6 +409,30 @@ test "RFC 8448 §3: the traffic secret derives the record key the RFC used" {
     var buf: [1024]u8 = undefined;
     @memcpy(buf[header_len..][0..v.plaintext.len], v.plaintext);
     try testing.expectEqualSlices(u8, v.record, try p.seal(&buf, v.plaintext.len, .handshake, 0));
+}
+
+test "burn_records off: records still round-trip; init resets the flag to on" {
+    for ([_]CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 }) |suite| {
+        var secret: [48]u8 = @splat(0x5c);
+        const s = secret[0..suite.hashLen().?];
+        var tx: Protection = undefined;
+        var rx: Protection = undefined;
+        try tx.init(suite, s);
+        try rx.init(suite, s);
+        defer tx.wipe();
+        defer rx.wipe();
+        try testing.expect(tx.burn_records and rx.burn_records);
+        tx.burn_records = false;
+        rx.burn_records = false;
+        var buf: [64]u8 = undefined;
+        @memcpy(buf[header_len..][0..5], "hello");
+        const rec = try tx.seal(&buf, 5, .application_data, 0);
+        const got = try rx.open(rec);
+        try testing.expectEqualStrings("hello", got.content);
+        // Re-keying (init) restores the safe default.
+        try tx.init(suite, s);
+        try testing.expect(tx.burn_records);
+    }
 }
 
 fn roundTrip(suite: CipherSuite, secret: []const u8) !void {

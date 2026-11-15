@@ -22,7 +22,8 @@
 //!   (`certverify.canSign`: a 1024-bit RSA key has no `rsa_pss_rsae_sha512`;
 //!   `handshake_failure` if none, or no `signature_algorithms` at all);
 //! - **cipher suite** the client's first that the server enables
-//!   (`Config.server_order`: the server's first that the client offers);
+//!   (`Config.server_suite_order` or `Config.server_order`: the server's
+//!   first that the client offers);
 //! - **group** the client's first `supported_groups` entry the server
 //!   enables (`Config.server_order`: the server's first the client
 //!   supports; no `supported_groups` or no `key_share` at all is
@@ -519,8 +520,22 @@ pub const Config = struct {
     /// `cipher_suites` and `groups` instead of the client's (BoringSSL
     /// `SSL_OP_CIPHER_SERVER_PREFERENCE`, which covers both; rustls
     /// `ignore_client_order`, suites only). A preferred group the client
-    /// supports without a share costs a HelloRetryRequest.
+    /// supports without a share costs a HelloRetryRequest. Implies
+    /// `server_suite_order`.
     server_order: bool = false,
+    /// Choose only the cipher suite in the order of `cipher_suites`
+    /// (rustls `ignore_client_order`, Go's suite preference); the group
+    /// still follows the client unless `server_order`, so no needless
+    /// HelloRetryRequest. `server_order` implies it.
+    server_suite_order: bool = false,
+    /// Seal and open every record under the dead-stack burn
+    /// (`burn.record_burn`, 4 KiB of zeroing, ~80 ns per record). It
+    /// protects against the AES key schedule and GHASH residue the AEAD
+    /// leaves in the dead stack below the caller between records. A caller
+    /// that scrubs the whole stack itself, e.g. at connection close, may turn
+    /// it off: the residue then lives until that scrub, for ~80 ns per
+    /// record. Handshake steps always burn. Default on.
+    record_burn: bool = true,
     /// The largest record content sent, in [`outbound.min_fragment`, 2^14]
     /// (rustls `max_fragment_size`, BoringSSL `SSL_set_max_send_fragment`);
     /// out of range is clamped. Records received may still be 2^14.
@@ -1488,8 +1503,10 @@ pub const Server = struct {
         var out: outbound.Outbound = .init(output_buf);
         out.max_fragment = fragmentLen(config);
         out.quic = config.quic != null;
+        out.record_burn = config.record_burn;
         var in: inbound.Inbound = .init(joiner_buf);
         in.quic = config.quic != null;
+        in.record_burn = config.record_burn;
         return .{
             .config = config,
             .inbound = in,
@@ -3040,7 +3057,7 @@ pub const Server = struct {
 
     /// The first suite in the deciding order that both sides enable.
     fn chooseSuite(cfg: *const Config, ch: *const hello.ClientHello) ?record.CipherSuite {
-        if (cfg.server_order) {
+        if (cfg.server_order or cfg.server_suite_order) {
             // An unknown enabled suite (the enum is open) is never chosen.
             for (cfg.cipher_suites) |c| if (c.hashLen() != null and ch.cipherSuites().contains(@backingInt(c))) return c;
             return null;
@@ -4564,6 +4581,51 @@ test "server_order: the suite and the group in the server's order, else the clie
     try testing.expectEqual(State.client_hello_retry, s.state);
     try testing.expectEqual(@as(u16, 0x0017), s.group);
     try testing.expect(s.usedHelloRetryRequest());
+}
+
+test "server_suite_order: the suite in the server's order, the group in the client's, no HelloRetryRequest" {
+    const h: Hello = .{
+        .suites = &.{ 0x1301, 0x1302 },
+        .groups = &.{ 0x001d, 0x0017 },
+        .shares = &.{.{ 0x001d, "" }},
+    };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    for ([_]bool{ false, true }) |suite_order| {
+        var prng = std.Random.DefaultPrng.init(1);
+        const cfg: Config = .{
+            .certificate = .{ .fixed = testKey() },
+            .cipher_suites = &.{ .aes_256_gcm_sha384, .aes_128_gcm_sha256 },
+            .groups = &.{ 0x0017, 0x001d },
+            .server_suite_order = suite_order,
+            .random = prng.random(),
+        };
+        var s: Server = undefined;
+        try accept(&s, &cfg, &joiner, &out, h);
+        defer s.deinit();
+        try testing.expectEqual(if (suite_order) record.CipherSuite.aes_256_gcm_sha384 else .aes_128_gcm_sha256, s.cipherSuite().?);
+        // The group follows the client either way: its first, with a share.
+        try testing.expectEqual(@as(u16, 0x001d), s.negotiatedGroup().?);
+        try testing.expect(!s.usedHelloRetryRequest());
+    }
+}
+
+test "record_burn: Config reaches both directions' protections, default on" {
+    const h: Hello = .{};
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    for ([_]bool{ true, false }) |burn_on| {
+        var prng = std.Random.DefaultPrng.init(1);
+        const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .record_burn = burn_on, .random = prng.random() };
+        var s: Server = undefined;
+        try accept(&s, &cfg, &joiner, &out, h);
+        defer s.deinit();
+        try testing.expect(s.out.protected and s.inbound.protected);
+        try testing.expectEqual(burn_on, s.out.tx.burn_records);
+        try testing.expectEqual(burn_on, s.inbound.rx.burn_records);
+    }
+    const dflt: Config = .{ .certificate = .{ .fixed = testKey() }, .random = undefined };
+    try testing.expect(dflt.record_burn and !dflt.server_suite_order);
 }
 
 test "CertifiedKey.signature_schemes restricts and orders the key's schemes" {
