@@ -548,7 +548,7 @@ The RED comes from the foreign corpus and from nothing else.
 
 ## Backlog / deferred
 
-**Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/websocket.zig` has a client and a server. Run it over the wire in both directions: its client against our server, our client against its server. Cover fragmentation, interleaved control frames, close codes and handshake rejections. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
+**Differential oracle against karlseguin's library** — IDEA (2026-09-24, owner review of karlseguin's Zig libraries; not scheduled). `karlseguin/websocket.zig` has a client and a server. Run it over the wire in both directions: its client against our server, our client against its server. Cover fragmentation, interleaved control frames, close codes and handshake rejections. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
 - No automatic keepalive/ping-interval scheduling — event-loop-specific, left to the caller (`Conn.ping` sends, `Options.hooks.on_pong` sees the answer, 2026-11-05).
 - **Context-takeover mode for permessage-deflate** — better ratio on small repetitive messages; costs a persistent 32 KiB window per connection and direction plus a compressor kept per connection (std's `flate.Compress` cannot be reset without forgetting history). Only if a consumer asks.
