@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: IPv6 /64 key helper (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-11** — **Tests:** whole-module mutation re-run over the production part of `src/root.zig` after the 0.17.1 move, the no-panic sweep and the duplicate-code pass (824 mutants: 783 killed, 38 equivalent, 3 unobservable, 0 undecided; the 2026-11-07 survivor decisions all hold). Two new audit tests for the survivors the re-run found: `IpSet` lookups with a v6 span that ends below a v4 query value (the bisection predicate must stay monotone across families) and `systemSource` closing its probe socket. No consumer-visible change.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `firstSpanEndingAtOrAfter` (duplicate-code pass) uses `std.sort.partitionPoint`; same index.
 - **2026-11-07** — **FIX (LOW):** `SubnetIterator.next` ends on `cur >= last` or when the next step would pass `last`, not only on `cur == last`: its fields are pub, and a hand-built iterator with `cur` past `last` overflowed `cur += step` (unreachable through `Prefix.subnets`). Found by the whole-module mutation run.

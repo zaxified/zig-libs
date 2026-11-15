@@ -112,6 +112,7 @@ Verdicts of the 2026-11-02 S2 re-survey (gaps from the 2026-09-30 survey and the
 - **V0/V1 decoding, the interval-log text format (`#[StartTime…]` lines), Go's packed/windowed histograms — rejected.** Legacy or tooling formats; V2 is what current writers produce, `decode` answers `error.Unsupported` for V0/V1 cookies.
 - **Exponential histograms / DDSketch / t-digest, windowing and decay — rejected,** a different algorithm family (see Threat model).
 - **`Accumulator` vs ping/fping:** min/avg/max/mdev/loss % match their summary line (population stddev, as fping and iputils print it); ping's median is not printed by either, `Histogram.valueAtPercentile(50)` gives it.
+- **`median(samples)` (consumer request 2026-11-15; effort S).** `Accumulator` keeps mean/variance/min/max and `Histogram` p50 is bounded-error (HdrHistogram resolution); there is no exact median of a small sample set (`rg median modules/latency-stats/src` finds only the internal bucket median-equivalent). Expected: Python `statistics.median`, numpy `median`. Proposed: `latency_stats.median(samples: []u64) ?u64` by in-place selection (nth_element, not a full sort; null when empty; even count returns the lower middle, documented, or `medianF64` for the average). Allocation-free.
 
 ## Status
 

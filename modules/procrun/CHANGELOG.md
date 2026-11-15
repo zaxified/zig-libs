@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: Stop-signal helper for a daemon's own SIGTERM/SIGINT (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `monoNowNs` (duplicate-code pass), including its hand-written Windows QPC branch, is replaced by `clock.monotonicNs()` (same QPC math, no libc). New dependency: `clock`.
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GO sweep: 32/38 killed, 6 argued equivalent (non-blocking write cap/EINTR, single waiter on the semaphore, one chunk of `wake` slack). Six new tests: Cancel bounds a stdin write held by a descendant; early-exit child still gives BrokenPipe; a Cancel kill returns the Output; output inside the idle grace is kept (timing margin ~100 ms — first suspect if it flakes under load); a live silent child is not cut; line mode returns after the grace.
