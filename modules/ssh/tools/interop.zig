@@ -6,6 +6,11 @@
 //! "Token: " with echo, the second round carrying its own instruction), then
 //! an `exec` the Go server answers with the user and command it saw. Second
 //! case: a wrong second answer must end in `error.AuthenticationFailed`.
+//! Third and fourth (2026-11-15, auth orchestration): the same dialogue as
+//! the SECOND step of a Go `PartialSuccessError` login — `publickey` first,
+//! with an unknown key offered before the right one — driven by our
+//! `userauth.authenticateWith` (none probe, key list, partial success, then
+//! keyboard-interactive); and that login with the wrong token.
 //! The hermetic half (our client against our own server over loopback) is in
 //! `src/interop_test.zig`; the OpenSSH live tests there cover the server role.
 //!
@@ -51,13 +56,25 @@ const accept_any: ssh.transport.HostKeyPolicy = .{
     .host = "127.0.0.1",
 };
 
-const Outcome = struct { rounds: u32, saw_instruction: bool, out: ?[]u8 };
+const Outcome = struct { rounds: u32, saw_instruction: bool, out: ?[]u8, partial: bool = false };
 
-fn runCase(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, port: u16, token: []const u8) !Outcome {
+fn testKey(seed_byte: u8) ssh.userauth.AuthKey {
+    return .{ .ed25519 = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(seed_byte)) catch unreachable };
+}
+
+fn runCase(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, port: u16, token: []const u8, partial: bool) !Outcome {
     var pbuf: [8]u8 = undefined;
     const port_s = try std.mem.print(&pbuf, "{d}", .{port});
+    const stranger = testKey(0x31);
+    const key = testKey(0x32);
+    var fp_buf: [ssh.keys.fingerprint_sha256_len]u8 = undefined;
+    const fp = blk: {
+        const blob = try key.publicBlob(gpa);
+        defer gpa.free(blob);
+        break :blk (try ssh.keys.PublicKey.parse(blob)).fingerprintSha256(&fp_buf);
+    };
     var child = std.process.spawn(io, .{
-        .argv = &.{ "go", "-C", tool, "run", ".", port_s },
+        .argv = if (partial) &.{ "go", "-C", tool, "run", ".", port_s, "partial", fp } else &.{ "go", "-C", tool, "run", ".", port_s },
         .stdout = .pipe,
         .stderr = .inherit,
         .environ_map = env,
@@ -82,16 +99,27 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.M
     var sw = stream.writer(io, &wbuf);
     var t = try ssh.transport.connect(&sr.interface, &sw.interface, gpa, accept_any);
     defer t.deinit();
-    var scratch: [4096]u8 = undefined;
-    try t.requestService("ssh-userauth", &scratch);
     var answers: Answers = .{ .token = token };
-    ssh.userauth.authenticateKeyboardInteractive(&t, gpa, "alice", .{ .ctx = &answers, .respondFn = Answers.respond }, .{}) catch |e| switch (e) {
-        error.AuthenticationFailed => return .{ .rounds = answers.rounds, .saw_instruction = answers.saw_instruction, .out = null },
-        else => return e,
-    };
+    var progress: ssh.userauth.AuthProgress = .{};
+    if (partial) {
+        ssh.userauth.authenticateWith(&t, gpa, "alice", &.{
+            .{ .publickey = &.{ &stranger, &key } },
+            .{ .keyboard_interactive = .{ .ctx = &answers, .respondFn = Answers.respond } },
+        }, .{ .progress = &progress }) catch |e| switch (e) {
+            error.AuthenticationFailed => return .{ .rounds = answers.rounds, .saw_instruction = answers.saw_instruction, .out = null, .partial = progress.partial.contains(.publickey) },
+            else => return e,
+        };
+    } else {
+        var scratch: [4096]u8 = undefined;
+        try t.requestService("ssh-userauth", &scratch);
+        ssh.userauth.authenticateKeyboardInteractive(&t, gpa, "alice", .{ .ctx = &answers, .respondFn = Answers.respond }, .{}) catch |e| switch (e) {
+            error.AuthenticationFailed => return .{ .rounds = answers.rounds, .saw_instruction = answers.saw_instruction, .out = null },
+            else => return e,
+        };
+    }
     const res = try ssh.exec(&t, gpa, "whoami", .{});
     gpa.free(res.stderr);
-    return .{ .rounds = answers.rounds, .saw_instruction = answers.saw_instruction, .out = res.stdout };
+    return .{ .rounds = answers.rounds, .saw_instruction = answers.saw_instruction, .out = res.stdout, .partial = progress.partial.contains(.publickey) };
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
@@ -107,7 +135,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     defer env.deinit();
 
     var bad: u32 = 0;
-    const good = try runCase(gpa, io, &env, 23471, "123456");
+    const good = try runCase(gpa, io, &env, 23471, "123456", false);
     defer if (good.out) |o| gpa.free(o);
     if (good.rounds != 2 or !good.saw_instruction or good.out == null or
         !std.mem.eql(u8, good.out.?, "kbd-ok user=alice cmd=whoami"))
@@ -115,12 +143,26 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         std.debug.print("FAIL good answers: rounds={d} instruction={} out={?s}\n", .{ good.rounds, good.saw_instruction, good.out });
         bad += 1;
     }
-    const wrong = try runCase(gpa, io, &env, 23472, "000000");
+    const wrong = try runCase(gpa, io, &env, 23472, "000000", false);
     defer if (wrong.out) |o| gpa.free(o);
     if (wrong.rounds != 2 or wrong.out != null) {
         std.debug.print("FAIL wrong token: rounds={d} out={?s} (must be refused after 2 rounds)\n", .{ wrong.rounds, wrong.out });
         bad += 1;
     }
-    std.debug.print("keyboard-interactive vs Go x/crypto/ssh: {d} of 2 cases disagreed\n", .{bad});
+    const two = try runCase(gpa, io, &env, 23473, "123456", true);
+    defer if (two.out) |o| gpa.free(o);
+    if (!two.partial or two.rounds != 2 or two.out == null or
+        !std.mem.eql(u8, two.out.?, "kbd-ok user=alice cmd=whoami"))
+    {
+        std.debug.print("FAIL publickey→partial→kbd: partial={} rounds={d} out={?s}\n", .{ two.partial, two.rounds, two.out });
+        bad += 1;
+    }
+    const two_wrong = try runCase(gpa, io, &env, 23474, "000000", true);
+    defer if (two_wrong.out) |o| gpa.free(o);
+    if (!two_wrong.partial or two_wrong.rounds != 2 or two_wrong.out != null) {
+        std.debug.print("FAIL publickey→partial→wrong token: partial={} rounds={d} out={?s} (must be refused after 2 rounds)\n", .{ two_wrong.partial, two_wrong.rounds, two_wrong.out });
+        bad += 1;
+    }
+    std.debug.print("keyboard-interactive + partial success vs Go x/crypto/ssh: {d} of 4 cases disagreed\n", .{bad});
     return if (bad == 0) 0 else 1;
 }

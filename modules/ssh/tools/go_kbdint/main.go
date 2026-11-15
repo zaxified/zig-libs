@@ -6,7 +6,12 @@
 // "Token: " (echo), with fixed answers; on success an "exec" request is
 // answered with "kbd-ok user=<user> cmd=<command>" and exit status 0.
 //
-//	go run . <port>    prints "READY" once listening; serves one connection
+// With "partial <SHA256 fingerprint>" the same dialogue becomes the SECOND
+// step: the first is publickey with exactly that key, answered with
+// PartialSuccessError (RFC 4252 §5.1 partial success) whose Next enables
+// only keyboard-interactive.
+//
+//	go run . <port> [partial <fingerprint>]    prints "READY" once listening; serves one connection
 package main
 
 import (
@@ -25,18 +30,27 @@ func main() {
 	must(err)
 	signer, err := ssh.NewSignerFromKey(priv)
 	must(err)
-	cfg := &ssh.ServerConfig{
-		KeyboardInteractiveCallback: func(md ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
-			a, err := client("", "round one", []string{"Password: "}, []bool{false})
-			if err != nil || len(a) != 1 || a[0] != "correct horse" {
-				return nil, fmt.Errorf("wrong password")
+	kbd := func(md ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+		a, err := client("", "round one", []string{"Password: "}, []bool{false})
+		if err != nil || len(a) != 1 || a[0] != "correct horse" {
+			return nil, fmt.Errorf("wrong password")
+		}
+		b, err := client("second factor", "round two", []string{"Token: "}, []bool{true})
+		if err != nil || len(b) != 1 || b[0] != "123456" {
+			return nil, fmt.Errorf("wrong token")
+		}
+		return nil, nil
+	}
+	cfg := &ssh.ServerConfig{KeyboardInteractiveCallback: kbd}
+	if len(os.Args) == 4 && os.Args[2] == "partial" {
+		want := os.Args[3]
+		cfg.KeyboardInteractiveCallback = nil
+		cfg.PublicKeyCallback = func(md ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if ssh.FingerprintSHA256(key) != want {
+				return nil, fmt.Errorf("unknown key")
 			}
-			b, err := client("second factor", "round two", []string{"Token: "}, []bool{true})
-			if err != nil || len(b) != 1 || b[0] != "123456" {
-				return nil, fmt.Errorf("wrong token")
-			}
-			return nil, nil
-		},
+			return nil, &ssh.PartialSuccessError{Next: ssh.ServerAuthCallbacks{KeyboardInteractiveCallback: kbd}}
+		}
 	}
 	cfg.AddHostKey(signer)
 
