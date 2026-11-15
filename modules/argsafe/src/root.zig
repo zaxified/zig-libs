@@ -494,7 +494,7 @@ pub const ParseError = error{
 /// `tokens` and `holes` are BORROWED, not copied — `parse` allocates nothing.
 /// This mirrors `Argv.push`'s "trusted = comptime/caller-owned" story: a
 /// config-loaded action definition already outlives every `fill` call made
-/// against it (ttydesk keeps its parsed `Action`s in an arena for the
+/// against it (the terminal-UI consumer keeps its parsed `Action`s in an arena for the
 /// process lifetime), so there is nothing to own here beyond what `fill`
 /// produces.
 ///
