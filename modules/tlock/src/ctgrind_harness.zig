@@ -12,7 +12,7 @@
 //!
 //! ## Verifying the lead before building on it
 //!
-//! A triage pass (`~/CML/20260901-zig-libs-audit/ctgrind-triage-3.md`)
+//! A triage pass (the 2026-09-01 audit ctgrind triage notes)
 //! reported "`tlock`/`ibe` both hand-roll a constant-time `Gt`
 //! exponentiation with careful reasoning but no empirical measurement".
 //! Checked directly against this tree: TRUE. `tlock.zig`'s private
