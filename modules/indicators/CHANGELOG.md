@@ -1,0 +1,8 @@
+# indicators — changelog
+
+Newest first. See the root [`CHANGELOG.md`](../../CHANGELOG.md) for which
+release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
+
+## Unreleased
+
+- **2026-11-15** — New module: technical-analysis indicators over slices with TA-Lib C 0.8.3 as the reference (formulas ported, see NOTICE). Seed set: SMA, EMA, WMA, MA, MACD, MACDEXT, MACDFIX, RSI, BBANDS, TRANGE, ATR, NATR, STOCH, STOCHF, MAX, MIN, SUM; each with a batch function over `f32`/`f64`, a `Lookback` function and a streaming type; per-call unstable period (`.bars`, `.auto4`, `.auto8`), `nan = .skip` and `seed = .first` options. Verified by hand-derived vectors and batch-equals-streaming tests only: frozen TA-Lib vectors and the live oracle are pending.

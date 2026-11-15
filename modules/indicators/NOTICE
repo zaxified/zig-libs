@@ -1,0 +1,47 @@
+indicators — third-party attribution
+====================================================================
+
+This module's own code is MIT (see the repository LICENSE). The formulas, the
+order of floating-point operations, the constants and the parameter ranges of
+the indicators were ported from the C source of TA-Lib 0.8.3 (a BSD-3-Clause
+licensed library), so TA-Lib's copyright notice and licence text must travel
+with every copy of this module. Redistributing it — alone or as part of
+zig-libs — must keep this file with it.
+
+What was taken: algorithms and numerical recipes (source, not data), read from
+`src/ta_func/ta_{SMA,EMA,WMA,MA,MACD,MACDEXT,MACDFIX,RSI,BBANDS,VAR,STDDEV,
+TRANGE,ATR,NATR,STOCH,STOCHF,MAX,MIN,SUM}.c` and `include/ta_defs.h` of the
+`ta-lib-0.8.3` release tarball (sha256
+28b1179b178a0db15f3dad0d846ef77f18eb06db5dfc5b5a8ca153a9ea5d84e6). No TA-Lib
+file is vendored, compiled or linked; nothing was copied verbatim except
+numeric constants and the structure of the recursions, rewritten in Zig.
+
+Upstream project: TA-Lib, https://ta-lib.org, copyright (c) 1999-2026 Mario
+Fortier. Licence (the text of its LICENSE file):
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+
+    1. Redistributions of source code must retain the above copyright notice, this
+       list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright notice,
+       this list of conditions and the following disclaimer in the documentation
+       and/or other materials provided with the distribution.
+
+    3. Neither the name of the copyright holder nor the names of its
+       contributors may be used to endorse or promote products derived from
+       this software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+    DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+    FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+    DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+    SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+    OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The name TA-Lib and its authors are not used to endorse this module.
