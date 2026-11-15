@@ -406,3 +406,70 @@ test "AsyncSink: concurrent loggers on a tiny queue: accepted + dropped == logge
     try testing.expect(count >= 1);
     try testing.expectEqual(@as(u64, threads * per), count + lost);
 }
+
+test "AsyncSink: the line cap binds before the byte cap (mutation 2026-11-15)" {
+    var buf: [8]u8 = undefined;
+    var gw: GateWriter = .init(testing.allocator, &buf, false);
+    defer gw.deinit();
+    var q: AsyncSink = undefined;
+    try q.init(testing.allocator, testing.io, &gw.interface, .{ .max_bytes = 4096, .max_lines = 2 });
+    var stopped = false;
+    // a failing expect must not leave the writer stalled behind the closed gate
+    defer if (!stopped) {
+        gw.open.store(true, .release);
+        q.deinit();
+    };
+    q.log("a");
+    while (!gw.entered.load(.acquire)) std.Thread.yield() catch {};
+    // The batch being written still counts: one more line fits, the next does not.
+    q.log("b");
+    try testing.expectEqual(@as(u64, 0), q.dropped());
+    q.log("c");
+    q.log("d");
+    try testing.expectEqual(@as(u64, 2), q.dropped());
+    stopped = true;
+    gw.open.store(true, .release);
+    q.deinit();
+    try testing.expectEqualStrings("a\nb\n", gw.out.items);
+}
+
+test "AsyncSink: a line logged once deinit has begun is dropped and counted, never queued (mutation 2026-11-15)" {
+    var buf: [8]u8 = undefined;
+    var gw: GateWriter = .init(testing.allocator, &buf, false);
+    defer gw.deinit();
+    var q: AsyncSink = undefined;
+    try q.init(testing.allocator, testing.io, &gw.interface, .{ .max_bytes = 4096, .max_lines = 64 });
+    q.log("first");
+    while (!gw.entered.load(.acquire)) std.Thread.yield() catch {};
+    const closer = try std.Thread.spawn(.{}, struct {
+        fn run(s: *AsyncSink) void {
+            s.deinit();
+        }
+    }.run, .{&q});
+    // Wait until deinit has set `closing`; the stalled writer keeps it from finishing.
+    while (true) {
+        q.mutex.lockUncancelable(q.io);
+        const c = q.closing;
+        q.mutex.unlock(q.io);
+        if (c) break;
+        std.Thread.yield() catch {};
+    }
+    q.log("late");
+    const lost = q.dropped();
+    gw.open.store(true, .release);
+    closer.join();
+    try testing.expectEqual(@as(u64, 1), lost);
+    try testing.expectEqualStrings("first\n", gw.out.items);
+}
+
+test "AsyncSink: logEntry renders through the template when one is set (mutation 2026-11-15)" {
+    var buf: [16]u8 = undefined;
+    var gw: GateWriter = .init(testing.allocator, &buf, true);
+    defer gw.deinit();
+    const tpl = try root.LogFormat.parse("%m %U %>s");
+    var q: AsyncSink = undefined;
+    try q.init(testing.allocator, testing.io, &gw.interface, .{ .format = .json_lines, .template = &tpl });
+    q.logEntry(.{ .timestamp_ns = 0, .method = "GET", .target = "/x", .status = 200 });
+    q.deinit();
+    try testing.expectEqualStrings("GET /x 200\n", gw.out.items);
+}

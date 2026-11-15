@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — ill-formed UTF-8 becomes one U+FFFD per maximal subpart (Unicode §3.9, WHATWG; Python's `decode('utf-8', 'replace')` as the oracle), while Go encoding/json, log/slog, zerolog v1.35.1, zap v1.28.0 and phuslu/log v1.0.138 all write one per byte of a truncated sequence (`E1 80` → 2, `F0 9F 98` → 3) (test `lead: one U+FFFD per maximal subpart where five Go JSON loggers write one per byte`; `tools/go_utf8_probe`) (measured 2026-10-25) · speed — JSON Lines faster than every measured writer: 0.89× phuslu/log v1.0.138 (the fastest), 0.60× zerolog v1.35.1, 0.72× serde_json 1.0.150, 0.21× zap v1.28.0; logfmt 0.28× go-logfmt v0.6.1 (`zig build bench-accesslog`, `tools/go_fast_bench`, `tools/rust_fast_bench`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (1246/1314, 68 eq) · src 868c88a19ea23d8f
+**Audit:** review 2026-11-12 · mutation 2026-11-15 (53/55, 1 eq) · src 619518d104a8b364
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, ACCESSLOG_FUZZ) · ct n/a — log formatting, no keys (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point: no data-reachable panic; latency total for any injected clock)
 
@@ -399,6 +399,25 @@ into one `writeAll` where the old escaper wrote byte by byte), a valid-UTF-8 rec
 329.2 ns (−24.5 %), and a record whose fields are mostly ill-formed 363.4 → 456.9 ns (+25.7 %,
 i.e. +93 ns and only for records that actually carry bad bytes). Nothing is allocated and
 nothing is copied when the input is clean.
+
+**Audit 2026-11-15 (delta mutation).** 55 schemata mutants over the new code, ReleaseSafe, one build, each mutant
+under `setsid -w timeout` (15 s) and `ulimit -v`. `writeLogfmtValue`'s `max_len` (6): the limit ignored, one byte
+too many or too few, the cut applied after the quoting decision, the verbatim write or the escape loop reading the
+uncut value. `async_sink.zig`, whole file (49): `init`'s two option checks; `deinit`'s `closing`, wake, drain wait,
+reap and free; `log`'s empty-line check, newline detection and accounting, the `closing`/byte/line drop conditions
+(each dropped, each off by one) and counter, the ring offsets, the wrap-around split and both copies, the newline
+byte, `used`/`lines`/`accepted` updates and the wake; `logEntry`'s format and template choice and its drop count;
+`dropped`, `flush`'s target and exit condition; the writer task's wait, exit test, wrap split, both writes, the
+flush, and the `head`/`used`/`lines`/`completed` bookkeeping, both broadcasts and `writer_done`. 27 of the first
+run's kills were hangs (a missing wake, broadcast or exit flag), counted as kills. 6 survived: a line logged after
+`deinit` began was accepted instead of dropped, the line cap was one too generous (and, separately, absent) with
+the byte cap hiding it, and the template path of `logEntry` was never exercised; each got a test (a late `log`
+behind a stalled destination, a queue whose line cap binds first, a template sink) and the rerun killed all four
+that a test can reach. The two left: the wait on `writer_done` in `deinit` is EQUIVALENT (redundant with the
+`group.await` right after it, which returns only once the task has finished); skipping the `group.await` itself
+is UNOBSERVABLE (the task is already past its last access to the sink once `writer_done` is seen, so only the
+reaping of the task handle differs; it needs a leak or ordering check inside the `Io` implementation).
+53/55, 1 equivalent, 1 unobservable.
 
 **Audit 2026-10-04 (mutation).** 33 schemata mutants over `utf8Step` (every second-byte
 range of Table 3-7, continuation checks, maximal-subpart lengths), `writeJsonString`
