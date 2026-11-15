@@ -6,7 +6,7 @@
 
 **Scope:** core — Go net resolver (reference) / c-ares / hickory-resolver / libunbound / dnspython / systemd-resolved / Node `dns` (surveyed 2026-11-15; parity -> core 2026-11-15: the answer cache is now `CachingResolver` (2026-11-15), but the API is blocking-only where every library but Go's is asynchronous — see "Where we are behind")
 
-**Audit:** review 2026-09-12 · mutation 2026-11-15 (49/49) · src 3ff1a8955bfda8cf
+**Audit:** review 2026-09-12 · mutation 2026-11-15 (240/257, 17 eq) · src 1887aff263fb9695
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DNS_FUZZ); 2026-11-02 `dns-query-roundtrip` (random QueryOptions incl. DO/AD/CD and EDNS options → encode → decode equal, or the documented refusal; 200,000 driver runs clean, ReleaseSafe) · ct n/a — public DNS codec (keyword review, 2026-10-07); TSIG (2026-10-16): std HMAC, MAC compared with `timing_safe.eql`, secret frames burned (stack probe) · panic 2026-10-31 (sweep + blind review: `RequestTooLarge` for > 65535 B, TSIG length guards, spoofed/QR-clear/undecodable UDP replies dropped to the same deadline, DoH body ≤ 65535, owner-name sharing 17.8 → 0.85 MB on a pointer flood; delta audit 28/31 + 3 eq)
 
@@ -276,6 +276,45 @@ no canonical); `clone` outliving its original; a search list whose NODATA candid
 NXDOMAIN ones; FORMERR as `ServerFailed`; 0x20 (the name arrives in mixed case; a server echoing
 it lower-cased is dropped to a timeout; the same server is accepted without the option);
 resolv.conf re-read after a change, not re-read with `null`, not re-stat'ed inside the interval.
+**Audit 2026-11-15 (delta mutation, CachingResolver).** 208 schemata mutants over the whole of
+`src/CachingResolver.zig` (everything above its tests): option validation (each guard dropped, each
+boundary), the key builders (kind byte, case folding, length prefixes, every size limit), the hit /
+stale / drop / remove decisions of `run`, the failure arming and backoff arithmetic, the clamps, the
+token bucket, the Resolver pool (reservation, free list, waiters, the cancel and OOM paths), the
+store/replace/supersede steps, `staleUsable`/`dead`, LRU eviction with its 16-entry scan, the
+intrusive list and `deinit`, ReleaseSafe, one build, each mutant under `setsid -w timeout` and
+`ulimit -v`. First run: 136 killed (8 by a hang), 72 survived. Each survivor ended as a test or an
+argued equivalent: new tests for options whose min equals max, `isUpstreamFailure` per error,
+`backoffDelay` with a saturated fail count, prune inside the stale window and at the exact end of a
+backoff, a payload past the stale window freed by the lookup path and by prune (allocator byte
+accounting) while the backoff is kept, a clock stepping back after the payload was dropped, the
+budget refusing an expired entry that was just removed, a payload-less failure entry never served
+stale, an answer without TTL superseding an expired one, a partial answer under `partial_ttl_s`, the
+bucket's refill rate, a clock at the end of `u64`, the 16-entry expiry scan at both edges, key
+separation (reverse against name keys, IPv6 addresses differing in the last byte, names differing in
+the last character, SRV name and part boundaries, an SRV key against an MX key, an undefined length
+byte), every key length limit, an allocation failure creating a Resolver (reservation returned, mutex
+released), a failure sweep over every allocation of a failing lookup (the upstream error survives a
+failed failure-entry allocation, no leak), a gate allocator failing the reservation while a second
+miss waits (the waiter is woken), the pool's free list (pop, push, chain, reuse), cancelling a parked
+miss, the expiry and backoff measured after a 30 s network call, a refreshed answer becoming the most
+recently used while another lookup finished, and the pooled Resolvers freed with the cache (a
+resolv.conf text only a Resolver's `deinit` frees). Rerun: all 55 killed (3 by a hang). 191 killed,
+17 not killed. EQUIVALENT, each with its invariant: the `refill_s` anchor at `init` (`tokens` starts
+at `burst` and the refill is capped at it); `prune`'s `payload != null` and `t >= expires_s` clauses
+(`dropPayload` on no payload is a no-op; `!staleUsable` already implies the expiry); the payload test
+before `dropPayload` in `run` (a payload-less entry always carries a failure count); the
+`fail_count > 0` clause before `retry_at_s` (both are zero together, `store` clears them); the
+`retry_at_s = 0` reset in `store` (only read behind `fail_count > 0`); `dead`'s `t >= expires_s`
+(a failure is armed only after the expiry); `takeToken`'s `<` against `<=` at a tie (adds nothing);
+`stored_ttl = 0` in `dropPayload` (read only with a payload, rewritten by `store`); the reverse key's
+address-family byte for IPv4 (the key length already separates it); the pool's `next_free = null` on
+pop (`release` overwrites it before the next read); the `prev`/`next` clears in `unlink` and the
+`prev` clear in `pushFront` (each redundant with the other, and `removeEntry` frees the entry);
+`touch`'s head early-return (cost only). UNOBSERVABLE, with the injection each needs: the SRV kind
+byte (an `undefined` key buffer holds 0xaa in a safe build, never 0..5; needs a ReleaseFast stack
+garbage value) and the `s < 0` guard of the default clock (an `Io` whose awake clock is negative).
+
 **Audit 2026-11-15 (delta mutation).** 49 schemata mutants over the new and changed code of
 `Resolver.zig` (status rank, `clone`/`cloneItem`, `localLookup`, `lookupIp`'s literal/hosts/
 `.onion` paths, candidate tally and `partial`, `judge`'s found/TTL/SOA/rcode/AD rules, `chainEnd`,

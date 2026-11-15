@@ -6,7 +6,7 @@
 
 **Scope:** core — Go `os/signal` (`NotifyContext`) and tokio `signal::unix`, with signal-hook, nix `signalfd`, Python `signal` and libuv `uv_signal_t` read for features (surveyed 2026-11-15)
 
-**Audit:** review 2026-11-15 · mutation 2026-11-15 (50/56, 6 eq) · src 0c879690787ee1b4
+**Audit:** review 2026-11-15 · mutation 2026-11-15 (60/70, 10 eq) · src 1360f7ee3ad60baa
 
 **Hardening:** fuzz n/a — the only input is a fixed-size kernel record read from a signalfd limited to the set; no parser · ct n/a — no secret is read or computed · panic 2026-11-15 (sweep of every pub entry point + blind review: no panic or UB reachable; a second `deinit` and use after `deinit` made harmless; `poll`/`wait` `Unsupported` off Linux instead of a compile error)
 
@@ -74,6 +74,17 @@ passes the mask on; a caller with its own spawn or pre-exec step unblocks
 - No panic is reachable from the public API: syscall failures are errors; an unknown
   signal number in a record (cannot happen for a signalfd limited to the set) is
   `error.Unexpected`.
+
+**Audit 2026-11-15 (delta mutation, hardening).** 14 schemata mutants over the lines changed by the
+hardening: the `deinit` hardening stores (fd, `newly_blocked`, `mask`) and its non-Linux early return,
+`poll`'s non-Linux return and its closed-descriptor guard (dropped, boundary, error value), `wait`'s
+non-Linux return, and `wait`'s unmodelled-errno mapping, ReleaseSafe, one build. First run: 9 killed,
+5 survived. One new test: a second `deinit` after another party blocked a signal must not unblock it
+(`newly_blocked` emptied); rerun killed it, 10 killed. Not killed, 4: the `mask` clear in `deinit`
+is EQUIVALENT (the field has no reader after `deinit`); UNOBSERVABLE, each with its injection: the
+error values of the two non-Linux returns (`Unsupported`; needs a non-Linux target) and `fd_ < 0`
+against `fd_ <= 0` (needs `init` to hand back descriptor 0, a process started with stdin closed).
+60/70 cumulative; 10 eq (6 + 4).
 
 **Audit 2026-11-15 (delta mutation, whole module).** 56 schemata mutants over `src/root.zig`, ReleaseSafe, one build, each
 mutant under `setsid -w timeout` and `ulimit -v`: `Set.any` (each member dropped), `init`'s empty-set refusal,

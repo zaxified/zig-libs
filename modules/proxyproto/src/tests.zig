@@ -697,3 +697,133 @@ fn findHostile(tlvs: []const u8) bool {
     _ = s.keyAlg() catch return false;
     return true;
 }
+
+// ── delta mutation audit 2026-11-15: tests the first schemata run asked for ──
+
+test "crc32cValue: a CRC TLV that is not 4 bytes is Malformed" {
+    const short: pp.Header = .{ .tlvs = &hex.literal("030002" ++ "0000") };
+    try testing.expectError(error.Malformed, short.crc32cValue());
+    const long: pp.Header = .{ .tlvs = &hex.literal("030005" ++ "0000000000") };
+    try testing.expectError(error.Malformed, long.crc32cValue());
+    const ok: pp.Header = .{ .tlvs = &hex.literal("030004" ++ "01020304") };
+    try testing.expectEqual(@as(?u32, 0x01020304), try ok.crc32cValue());
+}
+
+test "Ssl: every client flag bit is its own flag" {
+    const f1: pp.Ssl = .{ .client = 0x01, .verify = 0, .subtlvs = "" };
+    try testing.expect(f1.usesSsl() and !f1.certConn() and !f1.certSess());
+    const f2: pp.Ssl = .{ .client = 0x02, .verify = 0, .subtlvs = "" };
+    try testing.expect(!f2.usesSsl() and f2.certConn() and !f2.certSess());
+    const f4: pp.Ssl = .{ .client = 0x04, .verify = 1, .subtlvs = "" };
+    try testing.expect(!f4.usesSsl() and !f4.certConn() and f4.certSess());
+    try testing.expect(!f4.verified() and f1.verified());
+}
+
+test "v1: a port is digits only (the neighbours of '0' and '9' are refused)" {
+    const lines = [_][]const u8{
+        "PROXY TCP4 1.2.3.4 5.6.7.8 1/ 80\r\n",
+        "PROXY TCP4 1.2.3.4 5.6.7.8 1a 80\r\n",
+        "PROXY TCP4 1.2.3.4 5.6.7.8 1: 80\r\n",
+        "PROXY TCP4 1.2.3.4 5.6.7.8 / 80\r\n",
+        "PROXY TCP4 1.2.3.4 5.6.7.8 : 80\r\n",
+        "PROXY TCP4 1.2.3.4 5.6.7.8 80 a\r\n",
+    };
+    for (lines) |l| try testing.expectError(error.Malformed, pp.parse(l));
+}
+
+test "v1: the line ends in CRLF, a bare LF is Malformed" {
+    try testing.expectError(error.Malformed, pp.parse("PROXY TCP4 1.2.3.4 5.6.7.8 1 22\n"));
+}
+
+test "v1: missing fields are Malformed, and UNKNOWN is a version 1 header" {
+    try testing.expectError(error.Malformed, pp.parse("PROXY TCP4\r\n"));
+    try testing.expectError(error.Malformed, pp.parse("PROXY TCP4 1.2.3.4\r\n"));
+    try testing.expectError(error.Malformed, pp.parse("PROXY TCP4 1.2.3.4 5.6.7.8\r\n"));
+    try testing.expectError(error.Malformed, pp.parse("PROXY TCP4 1.2.3.4 5.6.7.8 9\r\n"));
+    const p = try expectHeader(try pp.parse("PROXY UNKNOWN\r\n"));
+    try testing.expectEqual(@as(u2, 1), p.h.version);
+}
+
+test "v2: a command above 1 is Malformed whatever its low bits are" {
+    var a = tcp4_hdr;
+    a[12] = 0x28; // version 2, command 8
+    try testing.expectError(error.Malformed, pp.parse(&a));
+}
+
+test "v2: the CRC32C also covers a TLV that follows the CRC TLV" {
+    var h = tlvHeader(&hex.literal("030004" ++ "00000000" ++ "040002" ++ "0000"));
+    const at = 16 + 12 + 3;
+    std.mem.writeInt(u32, h[at..][0..4], crc32c.hash(&h), .big);
+    const p = try expectHeader(try pp.parse(&h));
+    try testing.expectEqual(@as(usize, h.len), p.consumed);
+    h[h.len - 1] ^= 1; // the trailing NOOP's last byte
+    try testing.expectError(error.BadChecksum, pp.parse(&h));
+}
+
+test "read: an IPv4-mapped peer matches a prefix written in its IPv6 form" {
+    var buf: [pp.default_max_v2_len]u8 = undefined;
+    var r: std.Io.Reader = .fixed("PROXY UNKNOWN\r\n");
+    const mapped: netaddr.Ip = .{ .v6 = hex.literal("00000000000000000000ffff0a010203") };
+    const pre: netaddr.Prefix = .{ .addr = .{ .v6 = hex.literal("00000000000000000000ffff0a000000") }, .bits = 104 };
+    const h = (try pp.read(&r, &buf, .{ .peer = mapped, .trusted = &.{pre} })).?;
+    try testing.expectEqual(pp.Family.unspec, h.family);
+}
+
+test "read: opts.max_v2_len caps the header" {
+    var r: std.Io.Reader = .fixed(&tcp4_hdr);
+    var buf: [pp.default_max_v2_len]u8 = undefined;
+    try testing.expectError(error.TooLarge, pp.read(&r, &buf, .{ .peer = v4(10, 1, 2, 3), .trusted = &.{lb}, .max_v2_len = 20 }));
+}
+
+test "read: a reader buffer and a destination of exactly the header size suffice" {
+    var rbuf: [tcp4_hdr.len]u8 = undefined;
+    var buf: [tcp4_hdr.len]u8 = undefined;
+    var cr = testkit.fuzz.ChunkedReader.init(&tcp4_hdr, .{}, &rbuf);
+    const h = (try pp.read(&cr.interface, &buf, trusted_opts)).?;
+    try testing.expectEqual(pp.Family.tcp4, h.family);
+}
+
+test "read: asks the stream for no more bytes than the decision needs" {
+    var rbuf: [pp.default_max_v2_len]u8 = undefined;
+    var buf: [pp.default_max_v2_len]u8 = undefined;
+    // The transport fails right after the header: the header is still delivered.
+    var a = testkit.fuzz.ChunkedReader.init(&tcp4_hdr, .{ .fail_at = tcp4_hdr.len }, &rbuf);
+    try testing.expect((try pp.read(&a.interface, &buf, trusted_opts)) != null);
+    var v1 = testkit.fuzz.ChunkedReader.init("PROXY UNKNOWN\r\n", .{ .fail_at = 15 }, &rbuf);
+    try testing.expect((try pp.read(&v1.interface, &buf, trusted_opts)) != null);
+    // One byte that cannot start a header decides the stream: no second byte is asked for.
+    var b = testkit.fuzz.ChunkedReader.init("G", .{ .fail_at = 1 }, &rbuf);
+    try testing.expect((try pp.read(&b.interface, &buf, trusted_opts)) == null);
+}
+
+test "writeV2: a unix header needs both addresses, each at most 108 bytes" {
+    var out: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    const path: pp.Addr = .{ .unix = "/run/a.sock" };
+    try testing.expectError(error.InvalidHeader, pp.writeV2(&w, .{ .family = .unix_stream, .source = null, .destination = path }, ""));
+    try testing.expectError(error.InvalidHeader, pp.writeV2(&w, .{ .family = .unix_stream, .source = path, .destination = null }, ""));
+    var long: [109]u8 = undefined;
+    @memset(&long, 'x');
+    const too_long: pp.Addr = .{ .unix = &long };
+    try testing.expectError(error.InvalidHeader, pp.writeV2(&w, .{ .family = .unix_stream, .source = path, .destination = too_long }, ""));
+    try testing.expectError(error.InvalidHeader, pp.writeV2(&w, .{ .family = .unix_stream, .source = too_long, .destination = path }, ""));
+    const longest: pp.Addr = .{ .unix = long[0..108] };
+    try pp.writeV2(&w, .{ .family = .unix_stream, .source = longest, .destination = longest }, "");
+}
+
+test "writeV2: the payload length field holds 65535, not 65536" {
+    const out = try testing.allocator.alloc(u8, 70_000);
+    defer testing.allocator.free(out);
+    const tlvs = try testing.allocator.alloc(u8, 3 + 65_533);
+    defer testing.allocator.free(tlvs);
+    @memset(tlvs, 0);
+    tlvs[0] = pp.tlv_type.noop;
+    // A LOCAL header has no address block: the payload is all TLV.
+    std.mem.writeInt(u16, tlvs[1..3], 65_532, .big);
+    var w: std.Io.Writer = .fixed(out);
+    try pp.writeV2(&w, .{ .command = .local }, tlvs[0 .. 3 + 65_532]);
+    try testing.expectEqual(@as(usize, 16 + 65_535), w.buffered().len);
+    std.mem.writeInt(u16, tlvs[1..3], 65_533, .big);
+    w = .fixed(out);
+    try testing.expectError(error.TooLarge, pp.writeV2(&w, .{ .command = .local }, tlvs));
+}

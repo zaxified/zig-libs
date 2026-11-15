@@ -6,7 +6,7 @@
 
 **Scope:** core — pires/go-proxyproto v0.16.0 (surveyed 2026-11-15)
 
-**Audit:** review none · mutation none · src ?
+**Audit:** review none · mutation 2026-11-15 (220/224, 4 eq) · src 4129a9688cf9bb78
 
 **Hardening:** fuzz 2026-11-15 (40,000,000 runs, clean, PROXYPROTO_FUZZ, all 17 reach labels hit) · ct n/a — the header is public data, no secret · panic 2026-11-15 (no-panic sweep, `tests.zig`: 20,000 hostile inputs through every pub entry point, safety checks on; plus the fuzz harness)
 
@@ -63,6 +63,28 @@ A PROXY header is a claim by the peer about someone else. `read` therefore takes
 Test vectors are built by hand from the spec's byte layouts (`src/tests.zig`); no other implementation's test data is used. They are the author's reading of the specification, so this is the weakest external grade. The writer-to-parser round trips share that reading.
 
 **Anchor grade:** class A · oracle SELF
+
+**Audit 2026-11-15 (mutation, whole module).** 224 schemata mutants over `src/root.zig`, ReleaseSafe, one
+build, each mutant under `setsid -w timeout` and `ulimit -v` (the coverage-guided `testing.fuzz` entry
+point is skipped in the mutation copy: outside the build runner it never returns; the deterministic
+driver and the 600-seed harness stay in): the TLV iterator and `findTlv`, every typed accessor's TLV
+type, `Ssl.parse` and its flag bits, `parseOpts`' prefix and signature windows, `parsePort`, `parseV1`
+(limit, CRLF, protocol, field counts, address and port order, `UNKNOWN`), `checkTlvs`, `parseV2` (version
+and command, length and cap, every family code and block size, the CRC span and comparison, the source
+and destination offsets, unix paths), `read` (want arithmetic, buffer bounds, trust order, EOF and
+`Truncated`, the re-parse), `isTrusted`, and the writers (family checks, address and port order, block
+sizes, unix guards and padding, payload cap, the CRC TLV). Constants (`tlv_type`, signature, limits)
+are comptime values a runtime switch cannot reach; the tests pin them with hand-built wire bytes.
+First run: 197 killed (7 by a hang), 27 survived. Each survivor got a test or an argued equivalent;
+new tests: a CRC TLV that is not 4 bytes, each `Ssl` flag bit, the neighbours of `'0'` and `'9'` in a
+port, a bare LF line, missing v1 fields and the `UNKNOWN` version, a command above 1 with low bits
+clear, a CRC over a TLV following the CRC TLV, an IPv4-mapped peer against an IPv6-written prefix,
+`opts.max_v2_len`, buffers of exactly the header size, a stream that fails right after the header or
+after one non-header byte (no byte asked for beyond the decision), unix writer guards (missing and
+over-long addresses) and the 65535 / 65536 payload edge. Rerun: 23 killed. 220/224. EQUIVALENT, 4:
+`lf <= 7` against `lf < 7` (a line of `PROXY ` plus CRLF has an empty protocol and is Malformed
+either way); the first `split` element of the v1 line is never absent; the two arms after the
+re-parse in `read` (the same pure parse of the same bytes cannot change its answer).
 
 ## What is deliberately not done
 

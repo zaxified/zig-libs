@@ -419,6 +419,19 @@ test "deinit twice, and use after deinit, never touch another descriptor" {
     try testing.expect(!isBlocked(.TERM));
 }
 
+test "a stale second deinit does not unblock what someone else blocked since" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var st = try StopSignals.init(.{});
+    st.deinit();
+    try testing.expect(!isBlocked(.TERM));
+    var pre = linux.sigemptyset();
+    linux.sigaddset(&pre, .TERM);
+    _ = linux.sigprocmask(linux.SIG.BLOCK, &pre, null);
+    defer _ = linux.sigprocmask(linux.SIG.UNBLOCK, &pre, null);
+    st.deinit(); // the mask it would unblock was emptied by the first call
+    try testing.expect(isBlocked(.TERM));
+}
+
 test "wait blocks until another thread sends" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var st = try StopSignals.init(.{ .term = false, .int = false, .usr1 = true });
