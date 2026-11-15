@@ -2511,3 +2511,159 @@ test "F6: resetFailures clears every backoff and keeps the answers" {
     defer hit.deinit();
     try testing.expectEqual(Source.cache, hit.source);
 }
+
+test "every lookup kind answers a literal or a DNS-avoided name before the table, the budget and the pool" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_network_lookups = .{ .per_s = 1, .burst = 1 } });
+    defer c.deinit();
+    dropAnswer(c.lookupIp("real.example.com")); // spends the only token
+    const before = c.stats();
+    try testing.expectEqual(@as(u64, 1), before.misses);
+    try testing.expectEqual(@as(u64, 1), before.network_lookups);
+
+    // The budget is empty: anything that took a token would be BudgetExceeded.
+    for ([_][]const u8{ "192.0.2.9", "2001:db8::1", "x.onion", "x.invalid" }) |n| {
+        var a = try c.lookupIp(n);
+        a.deinit();
+    }
+    try testing.expectError(error.BadName, c.lookupMx("x.onion"));
+    try testing.expectError(error.BadName, c.lookupNs("x.onion"));
+    try testing.expectError(error.BadName, c.lookupTxt("x.onion"));
+    try testing.expectError(error.BadName, c.lookupCname("x.invalid"));
+    try testing.expectError(error.BadName, c.lookupSrv("ldap", "tcp", "x.onion"));
+
+    const s = c.stats();
+    try testing.expectEqual(before.misses, s.misses);
+    try testing.expectEqual(before.network_lookups, s.network_lookups);
+    try testing.expectEqual(@as(u64, 0), s.budget_refused);
+    try testing.expectEqual(@as(usize, 1), s.entries);
+    try testing.expectEqual(@as(u32, 1), h.queries());
+}
+
+test "the TTL runs from the moment the query was sent, also after waiting for a pool slot" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    h.stub.ttl.store(60, .release);
+    var c = try h.cache(.{ .max_concurrent_lookups = 1 });
+    defer c.deinit();
+
+    var slow: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+    var f1 = try h.io.concurrent(NamedLookup.run, .{&slow});
+    defer f1.await(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &h.stub.stashed);
+
+    var fast: NamedLookup = .{ .c = &c, .name = "fast.example.com" };
+    var f2 = try h.io.concurrent(NamedLookup.run, .{&fast});
+    defer f2.await(h.io);
+    try waitForWaiters(&c, 1); // fast read the clock (t0) and now waits for the only slot
+    const t_wait = h.clock.now;
+    h.clock.now += 40; // 40 s pass before its query can be sent
+    h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &fast.done);
+    try waitFor(h.io, &slow.done);
+    const e = c.map.get("\x00fast.example.com").?;
+    try testing.expectEqual(t_wait + 40 + 60, e.expires_s); // from the send, not from the first read
+}
+
+test "refundLocked gives back one count and one token, never above the burst" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_network_lookups = .{ .per_s = 1, .burst = 3 } });
+    defer c.deinit();
+    c.mutex.lockUncancelable(c.io);
+    defer c.mutex.unlock(c.io);
+    c.network_lookups = 5;
+    c.tokens = 1;
+    c.refundLocked();
+    try testing.expectEqual(@as(u64, 4), c.network_lookups);
+    try testing.expectEqual(@as(u32, 2), c.tokens);
+    c.tokens = 3; // a full bucket stays full
+    c.refundLocked();
+    try testing.expectEqual(@as(u64, 3), c.network_lookups);
+    try testing.expectEqual(@as(u32, 3), c.tokens);
+    c.network_lookups = 0; // the count saturates at zero
+    c.tokens = 0;
+    c.refundLocked();
+    try testing.expectEqual(@as(u64, 0), c.network_lookups);
+    try testing.expectEqual(@as(u32, 1), c.tokens);
+}
+
+test "the direct bypass counts a lookup that reached DNS and not one that did not" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{});
+    defer c.deinit();
+    var a = try c.bypass(netaddr.Ip, @as([]const u8, "host.example.com"), callIp);
+    a.deinit();
+    try testing.expectEqual(@as(u64, 1), c.stats().network_lookups);
+    var lit = try c.bypass(netaddr.Ip, @as([]const u8, "192.0.2.9"), callIp); // canonical == null: nothing was asked
+    lit.deinit();
+    try testing.expectEqual(@as(u64, 1), c.stats().network_lookups);
+    try testing.expectEqual(@as(u32, 1), h.queries());
+}
+
+test "a fresh answer served by a failure is aged, capped at its stored TTL and becomes the most recently used" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    h.stub.ttl.store(60, .release);
+    var c = try h.cache(.{ .max_entries = 2 });
+    defer c.deinit();
+    dropAnswer(c.lookupIp("a.example.com")); // stored at 1000, expires 1060
+    dropAnswer(c.lookupIp("b.example.com")); // b is now the most recently used
+    h.clock.now += 10;
+    var kbuf: [key_buf_len]u8 = undefined;
+    const ka = nameKey(&kbuf, .ip, "a.example.com").?;
+
+    c.mutex.lockUncancelable(c.io);
+    var aged = try c.failed(netaddr.Ip, ka, error.Timeout, c.now());
+    // an earlier `t` would give 70 s left: the stored TTL (60) is the ceiling
+    var capped = try c.failed(netaddr.Ip, ka, error.Timeout, c.now() - 20);
+    c.mutex.unlock(c.io);
+    defer aged.deinit();
+    defer capped.deinit();
+    try testing.expectEqual(@as(?u32, 50), aged.lookup.ttl_s);
+    try testing.expectEqual(@as(?u32, 60), capped.lookup.ttl_s);
+
+    dropAnswer(c.lookupIp("c.example.com")); // evicts the least recently used: b, because a was touched
+    var kb: [key_buf_len]u8 = undefined;
+    try testing.expect(c.map.get(nameKey(&kb, .ip, "b.example.com").?) == null);
+    try testing.expect(c.map.get(ka) != null);
+}
+
+test "resetFailures reaches every entry and clears the counters of the answers it keeps" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .stale_s = 1000, .failure_backoff_min_s = 100, .failure_backoff_max_s = 100 });
+    defer c.deinit();
+    h.stub.mode.store(.servfail, .release);
+    try testing.expectError(error.ServerFailed, c.lookupIp("down1.example.com"));
+    try testing.expectError(error.ServerFailed, c.lookupIp("down2.example.com"));
+    h.stub.mode.store(.answer, .release);
+    dropAnswer(c.lookupIp("kept.example.com")); // stored at 1000, expires 1060
+    h.clock.now += 100; // expired, inside the stale window
+    h.stub.mode.store(.servfail, .release);
+    var st = try c.lookupIp("kept.example.com"); // served stale: arms the key's failure state
+    st.deinit();
+    try testing.expectEqual(@as(u64, 1), c.stats().stale_served);
+    h.stub.mode.store(.answer, .release);
+    dropAnswer(c.lookupIp("ok.example.com")); // the most recently used entry carries no failure
+    var kbuf: [key_buf_len]u8 = undefined;
+    const kk = nameKey(&kbuf, .ip, "kept.example.com").?;
+    try testing.expect(c.map.get(kk).?.fail_count > 0);
+    try testing.expect(c.map.get(kk).?.retry_at_s > 0);
+
+    c.resetFailures();
+    const e = c.map.get(kk).?;
+    try testing.expect(e.payload != null);
+    try testing.expectEqual(@as(u8, 0), e.fail_count);
+    try testing.expectEqual(@as(u64, 0), e.retry_at_s);
+    try testing.expectEqual(@as(usize, 2), c.stats().entries); // down1 and down2 are gone
+}
