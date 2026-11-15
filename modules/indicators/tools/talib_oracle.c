@@ -10,8 +10,10 @@
  *   talib_oracle <cases.bin> <results.bin>
  *
  * cases.bin   u32 count, then per record (little endian, packed):
- *               u8 func, u8 is_f32, u8 unstable_kind (0 bars, 1 auto4, 2 auto8), u8 0,
+ *               u8 func, u8 is_f32, u8 unstable_kind (0 bars, 1 auto4, 2 auto8), u8 candle_settings,
  *               u32 unstable_bars, u32 n, i32 ip[6], f64 dp[8],
+ *               [when candle_settings != 0: 11 x (i32 range type, i32 avg period, f64 factor),
+ *                TA_SetCandleSettings for each, reset to the defaults after the record],
  *               then NIN arrays of n values (f64, or f32 when is_f32)
  * results.bin per record: i32 ret, i32 lookback, i32 outBegIdx, i32 outNBElement,
  *               then NOUT arrays of outNBElement f64 each
@@ -43,7 +45,72 @@ enum { F_SMA, F_EMA, F_WMA, F_MA, F_MACD, F_MACDEXT, F_MACDFIX, F_RSI, F_BBANDS,
        F_HT_DCPERIOD, F_HT_DCPHASE, F_HT_PHASOR, F_HT_SINE, F_HT_TRENDLINE, F_HT_TRENDMODE, F_MAMA,
        F_SWAK_BP, F_SWAK_HP, F_SWAK_2PHP,
        F_ACOS, F_ASIN, F_ATAN, F_CEIL, F_COS, F_COSH, F_EXP, F_FLOOR, F_LN, F_LOG10, F_SIN, F_SINH, F_SQRT, F_TAN, F_TANH,
+       /* candlestick patterns: alphabetical, 61 */
+       F_CDL2CROWS,
+       F_CDL3BLACKCROWS,
+       F_CDL3INSIDE,
+       F_CDL3LINESTRIKE,
+       F_CDL3OUTSIDE,
+       F_CDL3STARSINSOUTH,
+       F_CDL3WHITESOLDIERS,
+       F_CDLABANDONEDBABY,
+       F_CDLADVANCEBLOCK,
+       F_CDLBELTHOLD,
+       F_CDLBREAKAWAY,
+       F_CDLCLOSINGMARUBOZU,
+       F_CDLCONCEALBABYSWALL,
+       F_CDLCOUNTERATTACK,
+       F_CDLDARKCLOUDCOVER,
+       F_CDLDOJI,
+       F_CDLDOJISTAR,
+       F_CDLDRAGONFLYDOJI,
+       F_CDLENGULFING,
+       F_CDLEVENINGDOJISTAR,
+       F_CDLEVENINGSTAR,
+       F_CDLGAPSIDESIDEWHITE,
+       F_CDLGRAVESTONEDOJI,
+       F_CDLHAMMER,
+       F_CDLHANGINGMAN,
+       F_CDLHARAMI,
+       F_CDLHARAMICROSS,
+       F_CDLHIGHWAVE,
+       F_CDLHIKKAKE,
+       F_CDLHIKKAKEMOD,
+       F_CDLHOMINGPIGEON,
+       F_CDLIDENTICAL3CROWS,
+       F_CDLINNECK,
+       F_CDLINVERTEDHAMMER,
+       F_CDLKICKING,
+       F_CDLKICKINGBYLENGTH,
+       F_CDLLADDERBOTTOM,
+       F_CDLLONGLEGGEDDOJI,
+       F_CDLLONGLINE,
+       F_CDLMARUBOZU,
+       F_CDLMATCHINGLOW,
+       F_CDLMATHOLD,
+       F_CDLMORNINGDOJISTAR,
+       F_CDLMORNINGSTAR,
+       F_CDLONNECK,
+       F_CDLPIERCING,
+       F_CDLRICKSHAWMAN,
+       F_CDLRISEFALL3METHODS,
+       F_CDLSEPARATINGLINES,
+       F_CDLSHOOTINGSTAR,
+       F_CDLSHORTLINE,
+       F_CDLSPINNINGTOP,
+       F_CDLSTALLEDPATTERN,
+       F_CDLSTICKSANDWICH,
+       F_CDLTAKURI,
+       F_CDLTASUKIGAP,
+       F_CDLTHRUSTING,
+       F_CDLTRISTAR,
+       F_CDLUNIQUE3RIVER,
+       F_CDLUPSIDEGAP2CROWS,
+       F_CDLXSIDEGAP3METHODS,
        F_COUNT };
+
+#define CDL_PLAIN(X) X(CDL2CROWS) X(CDL3BLACKCROWS) X(CDL3INSIDE) X(CDL3LINESTRIKE) X(CDL3OUTSIDE) X(CDL3STARSINSOUTH) X(CDL3WHITESOLDIERS) X(CDLADVANCEBLOCK) X(CDLBELTHOLD) X(CDLBREAKAWAY) X(CDLCLOSINGMARUBOZU) X(CDLCONCEALBABYSWALL) X(CDLCOUNTERATTACK) X(CDLDOJI) X(CDLDOJISTAR) X(CDLDRAGONFLYDOJI) X(CDLENGULFING) X(CDLGAPSIDESIDEWHITE) X(CDLGRAVESTONEDOJI) X(CDLHAMMER) X(CDLHANGINGMAN) X(CDLHARAMI) X(CDLHARAMICROSS) X(CDLHIGHWAVE) X(CDLHIKKAKE) X(CDLHIKKAKEMOD) X(CDLHOMINGPIGEON) X(CDLIDENTICAL3CROWS) X(CDLINNECK) X(CDLINVERTEDHAMMER) X(CDLKICKING) X(CDLKICKINGBYLENGTH) X(CDLLADDERBOTTOM) X(CDLLONGLEGGEDDOJI) X(CDLLONGLINE) X(CDLMARUBOZU) X(CDLMATCHINGLOW) X(CDLONNECK) X(CDLPIERCING) X(CDLRICKSHAWMAN) X(CDLRISEFALL3METHODS) X(CDLSEPARATINGLINES) X(CDLSHOOTINGSTAR) X(CDLSHORTLINE) X(CDLSPINNINGTOP) X(CDLSTALLEDPATTERN) X(CDLSTICKSANDWICH) X(CDLTAKURI) X(CDLTASUKIGAP) X(CDLTHRUSTING) X(CDLTRISTAR) X(CDLUNIQUE3RIVER) X(CDLUPSIDEGAP2CROWS) X(CDLXSIDEGAP3METHODS)
+#define CDL_PEN(X) X(CDLABANDONEDBABY) X(CDLDARKCLOUDCOVER) X(CDLEVENINGDOJISTAR) X(CDLEVENINGSTAR) X(CDLMATHOLD) X(CDLMORNINGDOJISTAR) X(CDLMORNINGSTAR)
 
 static int nin(int f) {
     switch (f) {
@@ -57,6 +124,7 @@ static int nin(int f) {
     case F_ADR: case F_CVI: case F_MASSI: case F_RVIR: case F_MEDPRICE: return 2;
     case F_ROGERSSATCHELL: case F_AVGPRICE: case F_HA: return 4;
     case F_BETA: case F_CORREL: case F_ADD: case F_SUB: case F_MULT: case F_DIV: return 2;
+    case F_CDL2CROWS ... F_CDLXSIDEGAP3METHODS: return 4;
     default: return 1;
     }
 }
@@ -92,8 +160,15 @@ int main(int argc, char **argv) {
         int32_t ip[6];
         double dp[8];
         if (!rd(in, hdr, 4) || !rd(in, &ubars, 4) || !rd(in, &n, 4) || !rd(in, ip, sizeof ip) || !rd(in, dp, sizeof dp)) return 2;
-        int f = hdr[0], is32 = hdr[1];
+        int f = hdr[0], is32 = hdr[1], cset = hdr[3];
         if (f >= F_COUNT) return 2;
+        if (cset) { /* candle settings: 11 x (i32 range, i32 avg period, f64 factor) follow the parameters */
+            for (int k = 0; k < 11; k++) {
+                int32_t rt, ap; double fc;
+                if (!rd(in, &rt, 4) || !rd(in, &ap, 4) || !rd(in, &fc, 8)) return 2;
+                if (TA_SetCandleSettings((TA_CandleSettingType)k, (TA_RangeType)rt, ap, fc) != TA_SUCCESS) return 2;
+            }
+        }
         int ni = nin(f), no = nout(f);
         size_t esz = is32 ? 4 : 8;
         void *ins[5] = {0, 0, 0, 0, 0};
@@ -257,8 +332,13 @@ int main(int argc, char **argv) {
         case F_SQRT: lb = TA_SQRT_Lookback(); R(TA_S_SQRT(0, e, s0, O1), TA_SQRT(0, e, d0, O1));
         case F_TAN: lb = TA_TAN_Lookback(); R(TA_S_TAN(0, e, s0, O1), TA_TAN(0, e, d0, O1));
         case F_TANH: lb = TA_TANH_Lookback(); R(TA_S_TANH(0, e, s0, O1), TA_TANH(0, e, d0, O1));
+#define CDLC(N) case F_##N: lb = TA_##N##_Lookback(); R(TA_S_##N(0, e, s0, s1, s2, s3, OI1), TA_##N(0, e, d0, d1, d2, d3, OI1));
+#define CDLP(N) case F_##N: lb = TA_##N##_Lookback(dp[0]); R(TA_S_##N(0, e, s0, s1, s2, s3, dp[0], OI1), TA_##N(0, e, d0, d1, d2, d3, dp[0], OI1));
+        CDL_PLAIN(CDLC)
+        CDL_PEN(CDLP)
         default: break;
         }
+        if (cset) TA_RestoreCandleDefaultSettings(TA_AllCandleSettings);
         (void)d1; (void)d2; (void)d3; (void)s1; (void)s2; (void)s3;
         /* integer outputs travel as doubles: SUPERTREND trend, ZIGZAG trend and pivot index */
         if (ret == TA_SUCCESS && f == F_SUPERTREND) for (int i = 0; i < nb; i++) outs[1][i] = ib[0][i];
@@ -266,6 +346,7 @@ int main(int argc, char **argv) {
         if (ret == TA_SUCCESS && f == F_HT_TRENDMODE) for (int j = 0; j < nb; j++) outs[0][j] = (double)ib[0][j];
         if (ret == TA_SUCCESS && (f == F_MAXINDEX || f == F_MININDEX || f == F_MINMAXINDEX))
             for (int i = 0; i < no; i++) for (int j = 0; j < nb; j++) outs[i][j] = (double)ib[i][j];
+        if (ret == TA_SUCCESS && f >= F_CDL2CROWS && f <= F_CDLXSIDEGAP3METHODS) for (int j = 0; j < nb; j++) outs[0][j] = (double)ib[0][j];
         int32_t head[4] = { ret, lb, beg, nb };
         fwrite(head, 4, 4, out);
         if (ret == TA_SUCCESS) for (int i = 0; i < no; i++) fwrite(outs[i], 8, (size_t)nb, out);

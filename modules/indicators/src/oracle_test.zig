@@ -15,7 +15,8 @@ const testing = std.testing;
 const max_n = 128;
 const n_overlap = 44; // functions 0..43: seed set and overlap studies
 const n_vs_end = 94; // functions 44..93: the volume / statistic waves; the cycle wave follows
-const n_func = n_vs_end + 25;
+const n_cycle_end = n_vs_end + 25; // the cycle wave: functions 94..118; the candlestick patterns follow
+const n_func = n_cycle_end + ind.candles.names.len;
 
 fn mt(x: i32) ind.MaType {
     return @fromBackingInt(@intCast(@as(u8, @intCast(x))));
@@ -305,6 +306,26 @@ fn runCy(comptime T: type, v: vecs.Vec, c: []const T, o: *[4][]T) !usize {
     };
 }
 
+/// The 61 candlestick patterns (ids after the cycle wave, alphabetical = `ind.candles.names`): inputs open, high,
+/// low, close; the integer output is compared as a double with a NaN lead. Default settings (the oracle freezes
+/// only those; its settings presets run live), the penetration of the seven that take one is `dp[0]`.
+fn runCandle(comptime T: type, v: vecs.Vec, x: [4][]const T, o: *[4][]T) !usize {
+    const k = @as(usize, v.func) - n_cycle_end;
+    inline for (ind.candles.all, 0..) |Pat, j| {
+        if (k == j) {
+            const O = ind.candles.Op(Pat);
+            var out: [max_n]i32 = undefined;
+            const n = x[0].len;
+            var p: O.Params = .{};
+            if (@hasField(O.Params, "penetration")) p.penetration = @bitCast(v.dp[0]);
+            const lb = try O.run(T, x[0], x[1], x[2], x[3], out[0..n], p);
+            for (o[0][0..n], out[0..n], 0..) |*d, val, i| d.* = if (i < lb) std.math.nan(T) else @floatFromInt(val);
+            return lb;
+        }
+    }
+    return error.BadParam;
+}
+
 fn isIndexFunc(func: u8) bool {
     return func == @backingInt(Fv.maxindex) or func == @backingInt(Fv.minindex) or func == @backingInt(Fv.minmaxindex);
 }
@@ -353,6 +374,8 @@ fn replay(comptime T: type, v: vecs.Vec) !void {
             else => au = ib[1][0..n],
         }
         lb = try run(T, v, h, l, c, au, &o);
+    } else if (v.func >= n_cycle_end) {
+        lb = try runCandle(T, v, .{ ib[0][0..n], ib[1][0..n], ib[2][0..n], ib[3][0..n] }, &o);
     } else if (v.func >= n_vs_end) {
         lb = try runCy(T, v, ib[0][0..n], &o);
     } else {

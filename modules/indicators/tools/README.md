@@ -20,3 +20,7 @@
   difference carried by their recursion reads as thousands of ULPs on an output that is near zero. `interop-indicators` prints the
   measured maximum (`max/colmax`) next to the ULP maximum. TRENDMODE's integer output travels as doubles like SUPERTREND's; the
   Hilbert functions have a 100-bar frozen vector (their first output is bar 32 / 63) and an extra 700-bar run for their AUTO warm-up.
+- Candlestick patterns (61 functions, ids after the cycle wave, alphabetical): four series `ohlc`, one integer output compared as a double. `tools/candle_gen.zig` generates the inputs
+  (single-bar shapes and multi-bar motifs, kind 1 = 0.25 price grid for exact ties, kind 2 = scale 1e-9) and the settings presets 1..4 (`TA_SetCandleSettings` through the record's candle-settings block: 11 x
+  range type, averaging period, factor; the shim resets them after each record). `interop-indicators` prints, per pattern, how many compared values had a nonzero TA-Lib answer (a pattern compared only on zeros is not
+  verified; goal >= 20). The frozen vectors hold default settings only (the first records with a nonzero answer, 40 bars, f64 and f32 where found).
