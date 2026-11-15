@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — the Go SDK v1.8.0 (the speed reference) answers `prompts/get` for a prompt whose argument is declared required, with that argument left out, by calling the handler anyway and returning what it renders (`"Hello, !"`); prompts.mdx "Error Handling" says servers SHOULD answer missing required arguments with -32602, which this module does without calling the handler (test "lead: prompts/get without a required argument is -32602", probe `tools/go_lead`) (measured 2026-10-24)
 
-**Audit:** review 2026-11-13 · mutation 2026-11-13 (96/97, 1 eq) · src 023ba0d141eafb17
+**Audit:** review 2026-11-13 · mutation 2026-11-13 (96/97, 1 eq) · src 3aff7bfc56c5aa96
 
 Audit detail: the 2026-11-01 review is a delta over `src/root.zig` (the fuzz-driver test migrated from sequential `run` calls to one `driver.runAll`, same harnesses and options), test code only; the library source the mutation run scored is unchanged.
 
@@ -209,7 +209,7 @@ checked (no regex in the subset); cancellation over stdio only takes effect betw
   `elicitation:{}` meaning form-only for backwards compatibility) are enforced at the send seam.
   `negotiateVersion` returns one of **our** static literals, never the caller's slice — the request
   is parsed on a per-message arena, so echoing it back would dangle in `negotiated_version`.
-- **`clientInfo` is recorded per peer too — DONE 2026-09-28** (requested by ttydesk). `initialize`'s
+- **`clientInfo` is recorded per peer too — DONE 2026-09-28** (requested by the terminal-UI consumer). `initialize`'s
   `clientInfo` (`name`, `version`, optional `title`) is parsed by `ClientInfo.parse` and, unlike
   `capabilities`, treated **leniently**: it is self-reported metadata this module never gates a
   decision on, so a missing or malformed `clientInfo` records `PeerState.client = null` and never
@@ -477,7 +477,7 @@ coordinator's under the rule "parity with the reference, or safer":
 | R3 | One request context for prompts and resources too: progress, client capabilities/info, version, `_meta` | S | **DONE 2026-10-20** |
 | R4 | `_meta` on Tool/Resource/Template/Prompt; Resource `annotations` + `size`; `Info.description`/`websiteUrl`/`icons` | S | **DONE 2026-10-20** |
 | R5 | Inbound `notifications/cancelled` reaching a running tool (cancel flag on the call) | M | **DONE 2026-10-20** — `ToolCall.cancelled`, thread-safe `Server.cancelInflight`; `serve` stays serial (a stdio cancel lands after the call, ignored as the spec allows) |
-| R6 | `strArgChecked`/`requireStr` + typed `int/num/bool` accessors (bxp request) | S | **DONE 2026-10-20** |
+| R6 | `strArgChecked`/`requireStr` + typed `int/num/bool` accessors (the build-tool consumer request) | S | **DONE 2026-10-20** |
 | R7 | Tool input validated against `inputSchema` before the handler (documented JSON Schema subset) → `isError:true`, the TS convention | M | **DONE 2026-10-20** — `schema_check.zig` (2020-12 subset, JSON-Schema-Test-Suite 625 cases) |
 | R8 | `structuredContent` validated against `outputSchema`; a tool that declares one and prints non-JSON → `isError` | S after R7 | **DONE 2026-10-20** |
 | R9 | Custom request/notification handlers (vendor methods), `capabilities.extensions` + `experimental` | M | **DONE 2026-10-20** — `addMethod`/`addNotification`, `setCapabilityExtras`; Apps/Skills helpers later |
@@ -498,15 +498,15 @@ Beyond the S2 plan: sampling-with-tools stays the largest unbuilt piece (a multi
 (2026-10-20 bench): `tools/list` re-parses each registered schema on every call (`writeRawJson`) and is the
 worst row (0.46× Go); caching the compact text at `addTool` would cut it, no consumer needs it yet.
 
-- ~~**Requested (bxp, 2026-10-19): `ToolCall.strArg` cannot tell a missing argument from a wrong-typed
+- ~~**Requested (the build-tool consumer, 2026-10-19): `ToolCall.strArg` cannot tell a missing argument from a wrong-typed
   one** (`src/root.zig` `strArg`: null for both). A handler can only answer "missing 'config'" to
-  `"config": 5`; bxp works around it by inspecting `call.args` itself (`bxp-mcp/src/tools.zig`
+  `"config": 5`; the build-tool consumer works around it by inspecting `call.args` itself (the build-tool consumer's MCP server, `src/tools.zig`
   `wrongType`/`reqStr`, marked `zig-libs request: mcp`). Proposed: `ToolCall.strArgChecked(key)`
   returning `union(enum) { absent, value: []const u8, wrong_type }` (same on `PromptRequest`), and
   optionally `requireStr(key)` writing "'<key>' must be a string" / "missing '<key>'" via `fail`.
   JSON-Schema validators and other MCP SDKs report type errors apart from missing properties.~~
   **DONE 2026-10-20** (R6): `ToolCall.arg(T, key)` / `require(T, key)` / `strArgChecked`;
-  bxp can drop `wrongType`/`reqStr` after its repin.
+  the build-tool consumer can drop `wrongType`/`reqStr` after its repin.
 
 **Survey 2026-09-30 — missing and it matters** (all fit CONVENTIONS §2: pure Zig, std only):
 
@@ -540,8 +540,8 @@ worst row (0.46× Go); caching the compact text at `addTool` would cut it, no co
     - `extensions` in the capabilities; tasks move out of the core into the
       `io.modelcontextprotocol/tasks` extension; roots, sampling and logging are Deprecated
       (earliest removal on or after 2027-07-28).
-  - **Strategy: both revisions, negotiated per request — never a flag day.** Our consumers (bxp-mcp,
-    axp-mcp, ttydesk) are driven by clients we do not control. The rule:
+  - **Strategy: both revisions, negotiated per request — never a flag day.** Our consumers (the build-tool consumer's MCP server,
+    the router-tool consumer's MCP server, the terminal-UI consumer) are driven by clients we do not control. The rule:
     - a request whose `_meta` names 2026-07-28 is served statelessly;
     - an `initialize` naming 2025-11-25 or 2025-06-18 keeps today's session path;
     - `server/discover` answers both.
