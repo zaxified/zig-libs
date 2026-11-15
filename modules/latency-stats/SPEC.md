@@ -88,6 +88,19 @@ terminate); `wire` round trips, known varint bytes, every truncation, forged con
 the array, a total past u64, a count past i64; the decode fuzz harness (`src/fuzz_test.zig`, driver `LATENCY_STATS_FUZZ`) with an
 in-suite 600-seed reach test; interop with HdrHistogram_c and hdrhistogram-go in `tools/bench.zig`. Run: `zig build test-latency-stats`.
 
+**Audit 2026-11-15 (delta mutation).** 27 schemata mutants over `median`/`select` (the introselect), ReleaseSafe,
+one build, each mutant under `setsid -w timeout` and `ulimit -v`: the empty guard, the rank `(n-1)/2`, the depth budget
+(zeroed, never decremented, exhausted test), the range ends, the three-way partition (both comparisons, both swaps,
+both counter moves, the `gt == 0` guard, the scan step), the narrowing (`k < lt`, `k > gt`, `hi = lt - 1`, `lo = gt + 1`)
+and the return of the pivot and of `a[k]`. 15 killed (1 by a hang); no test needed. 12 are equivalent, each a
+change that only moves the cost or is an invariant: a zero budget (the sort fallback is correct, just not
+linear); `lo <= hi` (with one element left, `k == lo` and the pivot is that element); the budget never
+decremented, `mid = lo`, the first sample taken from `hi`, the pivot `x`, `<=` in place of `<` (all keep a pivot that
+is an element of the range and only cost partition quality; the budget bounds the damage and the fallback sorts);
+`hi = lt` and `lo = gt` (a superset of the needed range); `k >= gt` (when `k == gt` the slot already holds the pivot);
+the `gt == 0` guard (the pivot is an element of the range, so `i` stops before `gt` reaches 0); the final
+`return a[lo]` (the loop only exits with `lo == hi == k`). 15/27, 12 equivalent.
+
 **Audit 2026-10-04 (mutation).** 21 schemata mutants over `Stats.lossPct`, the
 `Accumulator` (min/max, Welford update, RFC 3550 jitter gain and previous sample,
 population stddev, `compute`'s losses) and the `Histogram` (config validation, `recordCount`,
