@@ -59,6 +59,9 @@ for i in $ids; do
     # "...not an arithmetic panic...OK" would otherwise label the reason.
     elif grep -qE "FAIL \(|[0-9]+ failed\.|panic: |Segmentation fault|reached unreachable|integer overflow|index out of bounds" "$log"; then
         v=KILLED; reason="$(grep -m1 -oE "FAIL \([A-Za-z0-9_]+\)|[0-9]+ failed\.|panic: .{0,60}|Segmentation fault|reached unreachable|integer overflow|index out of bounds" "$log")"
+    # The testing allocator's leak check fails a run with no failing test.
+    elif grep -qE "tests? leaked memory" "$log"; then
+        v=KILLED; reason="leak: $(grep -m1 -oE "[0-9]+ tests? leaked memory" "$log")"
     elif (( rc > 128 )); then
         v=KILLED; reason="signal $(( rc - 128 ))"
     else
