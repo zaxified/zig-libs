@@ -258,10 +258,10 @@ ReleaseSmall, stripped, `zig build-exe` of a program over `netlink` + `netaddr` 
 
 | program | mips32 BE before → after | arm before → after |
 |---|--:|--:|
-| `Socket.open` + `flush(.unspec)` (axp's use) | 30256 → 30256 bytes (byte-identical) | 11464 → 11464 (byte-identical) |
+| `Socket.open` + `flush(.unspec)` (the router-tool consumer's use) | 30256 → 30256 bytes (byte-identical) | 11464 → 11464 (byte-identical) |
 | `Socket.open` + `dump(.unspec)` + free | 34016 → 38560 (+4544, +13 %) | 12864 → 21056 (+8192, +64 %; the step is two 4 KiB pages) |
 
-"Before" is the module as of the commit preceding this survey. **The claim "axp pays nothing for the new API" holds for what axp calls today, open + flush, and only for that:** a consumer that dumps pays for the decoder, which now reads more attributes. Probe sources: `main.zig` = `var sock = conntrack.Socket.open(page_allocator) catch return 2; defer sock.close(); sock.flush(.unspec) catch return 3; return 0;`, and `main_dump.zig` = the same with `const flows = sock.dump(.unspec) catch return 3; defer gpa.free(flows); return @truncate(flows.len);`.
+"Before" is the module as of the commit preceding this survey. **The claim "the router-tool consumer pays nothing for the new API" holds for what the router-tool consumer calls today, open + flush, and only for that:** a consumer that dumps pays for the decoder, which now reads more attributes. Probe sources: `main.zig` = `var sock = conntrack.Socket.open(page_allocator) catch return 2; defer sock.close(); sock.flush(.unspec) catch return 3; return 0;`, and `main_dump.zig` = the same with `const flows = sock.dump(.unspec) catch return 3; defer gpa.free(flows); return @truncate(flows.len);`.
 
 ## Verification
 
