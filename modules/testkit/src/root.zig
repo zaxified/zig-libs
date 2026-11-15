@@ -14,6 +14,9 @@
 //!     differently and which is the one piece here that is *better* than what
 //!     it replaces (see its doc comment).
 //!
+//!   - `expectSnapshot` / `expectSnapshotHex` — inline snapshots: the expected
+//!     value is a literal at the call site, and `TESTKIT_SNAPSHOT=update`
+//!     rewrites it (insta-style accept; `snapshot.zig`).
 //!   - `loopbackSkip` — the "loopback bind failed, skipping" give-up ~25
 //!     modules spelled by hand, made a failure under `scripts/lib/netns-run`.
 //!   - `fuzz.driver` + `fuzz.Rng` — the deterministic fuzz verdict, with
@@ -58,6 +61,7 @@ test {
     _ = fuzz;
     _ = fuzz.driver;
     _ = @import("golden.zig");
+    _ = @import("snapshot.zig");
     _ = stackprobe;
     _ = guard;
     _ = child;
@@ -92,6 +96,12 @@ pub const ArbOptions = @import("arbitrary.zig").ArbOptions;
 
 pub const expectHex = @import("golden.zig").expectHex;
 pub const expectBytes = @import("golden.zig").expectBytes;
+
+/// Inline snapshots with an update workflow (`TESTKIT_SNAPSHOT=update`
+/// rewrites the literal at `@src()`). See `snapshot.zig`.
+pub const snapshot = @import("snapshot.zig");
+pub const expectSnapshot = snapshot.expectSnapshot;
+pub const expectSnapshotHex = snapshot.expectSnapshotHex;
 
 // ── skips ────────────────────────────────────────────────────────────────
 

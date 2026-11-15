@@ -26,7 +26,7 @@ fn check(cond: bool, comptime what: []const u8) !void {
     }
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -75,6 +75,42 @@ pub fn main() !void {
     try check(!testkit.verboseEnabled(""), "verboseEnabled(\"\") is off (FOO= clears, not enables)");
     try check(testkit.verboseEnabled("1"), "verboseEnabled(\"1\") is on");
 
+    // ── snapshots: what an update run does to a literal ─────────────────
+
+    // `expectSnapshot(@src(), "literal", actual)` is called from a test (see
+    // the `test` block below); under TESTKIT_SNAPSHOT=update a mismatch
+    // rewrites the literal in the source file. `main` has no test runner, so
+    // the same rewrite is driven here on a throwaway fixture file: the call
+    // site says "old", the value is now "new\nvalue" (two lines).
+    const io = init.io;
+    const cwd = std.Io.Dir.cwd();
+    const fixture_dir = ".zig-cache/testkit-example-snapshot";
+    try cwd.createDirPath(io, fixture_dir);
+    defer cwd.deleteDir(io, fixture_dir) catch {};
+    var dir = try cwd.openDir(io, fixture_dir, .{});
+    defer dir.close(io);
+    const fixture = "    try testkit.expectSnapshot(@src(), \"old\", got);\n";
+    try dir.writeFile(io, .{ .sub_path = "case.zig", .data = fixture });
+    defer dir.deleteFile(io, "case.zig") catch {};
+
+    // What a failing comparison prints (the pure half of `expectSnapshot`).
+    var msg: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&msg);
+    try testkit.snapshot.writeReport(&w, .text, "case.zig", 1, 32, "old", "new\nvalue");
+    try check(std.mem.find(u8, w.buffered(), "first difference: line 1, byte offset 0") != null, "snapshot failure message");
+
+    // The update: the literal at line 1, column of `@src()` becomes `\\` lines.
+    var reg: testkit.snapshot.Registry = .{};
+    defer reg.deinit(alloc);
+    const col: u32 = @intCast(std.mem.find(u8, fixture, "@src()").? + 1);
+    try testkit.snapshot.rewrite(&reg, alloc, io, dir, "case.zig", 1, col, .text, "old", "new\nvalue");
+    const rewritten = try dir.readFileAlloc(io, "case.zig", alloc, .limited(4096));
+    defer alloc.free(rewritten);
+    try check(std.mem.eql(u8, rewritten, "    try testkit.expectSnapshot(@src(),\n" ++
+        "        \\\\new\n" ++
+        "        \\\\value\n" ++
+        "    , got);\n"), "snapshot rewrite");
+
     std.debug.print("testkit example: all checks passed\n", .{});
 }
 
@@ -119,4 +155,16 @@ test "skip, getEnv and verboseSkip only make sense inside a real test binary" {
 
     const env_val = testkit.getEnv(testkit.verbose_skip_env);
     try std.testing.expectEqual(testkit.verboseEnabled(env_val), testkit.verboseSkip());
+}
+
+test "expectSnapshot: an inline literal, compared (TESTKIT_SNAPSHOT=update rewrites it)" {
+    // Single-line, multiline and hex forms. Run with TESTKIT_SNAPSHOT=update
+    // after changing what the code under test produces and the literals
+    // follow; review the result with `git diff`.
+    try testkit.expectSnapshot(@src(), "version 3", "version 3");
+    try testkit.expectSnapshot(@src(),
+        \\HTTP/1.1 200 OK
+        \\content-length: 0
+    , "HTTP/1.1 200 OK\ncontent-length: 0");
+    try testkit.expectSnapshotHex(@src(), "cafe babe", &.{ 0xca, 0xfe, 0xba, 0xbe });
 }
