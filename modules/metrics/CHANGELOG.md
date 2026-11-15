@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Second whole-module mutation run (after the `desc_index` removal): operator-generated schemata over `root.zig` and `summary.zig`; four new tests in `mutation_test.zig`: `registerCollector` refuses bad metric/label names and leaves nothing behind, a summary derives only `_sum`/`_count` (a sibling `_bucket` is free), summary quantiles 0 and 1 on a small sample, `Endpoint` with `max_in_flight` set still serves a GET and the 405 is `text/plain`.
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Dead state removed: `Family.desc_index` was written by `registerCollector` and never read. From the 2026-11-12 mutation run.

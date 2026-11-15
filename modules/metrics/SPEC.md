@@ -211,7 +211,7 @@ existing NOTICE for the vendored documentation excerpt is unrelated and unaffect
   2026-10-06 by removing `AccessLog`: access logging is the `accesslog` module's (`Sink`,
   goaccess-anchored Combined), fed from the `on_request` hook (`AccessEntry.req`/`.res`).
 
-**Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/metrics.zig` renders Prometheus text. Register the same counters, gauges and histograms (including label values that need escaping) in both and diff the exposition output byte by byte. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
+**Differential oracle against karlseguin's library** — IDEA (2026-09-24, owner review of karlseguin's Zig libraries; not scheduled). `karlseguin/metrics.zig` renders Prometheus text. Register the same counters, gauges and histograms (including label values that need escaping) in both and diff the exposition output byte by byte. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
 A bounded route-pattern label for the request middleware; `router` now exposes the matched
 pattern (`Ctx.matchedPattern()`), so it can be wired in (currently deliberately not labeled by raw path — cardinality risk). `metrics.handler(registry)
