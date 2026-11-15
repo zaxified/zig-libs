@@ -12,7 +12,7 @@ changes the type and nothing else, including under std's generic `Hmac` and
 
 - **Status:** gap — std's SHA-2 computes the message schedule with scalar code
   (on x86-64 without SHA-NI), which on the development notebook put it at
-  1.48× behind OpenSSL for both SHA-256 and SHA-384; qap's TLS handshake lane
+  1.48× behind OpenSSL for both SHA-256 and SHA-384; the web-server consumer's TLS handshake lane
   spent 15.9 % of its CPU in SHA-2 rounds.
 - **Model after:** FIPS 180-4; CRYPTOGAMS `sha512-x86_64.pl` (Andy Polyakov,
   the AVX2 code path, used as is: see [`NOTICE`](NOTICE)); for the pure-Zig

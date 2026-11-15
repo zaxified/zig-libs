@@ -430,7 +430,7 @@ vector schedule would save about one instruction per word.
 
 ## Open
 
-- The speed-up for qap's TLS handshake has not been measured. Transcript
+- The speed-up for the web-server consumer's TLS handshake has not been measured. Transcript
   updates and HMAC/HKDF calls are mostly lone blocks: 545 vs std's ~820
   cycles each. Measure there before claiming a handshake gain.
 
