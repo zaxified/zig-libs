@@ -13,6 +13,7 @@ const vecs = @import("testdata/talib_vectors.zig");
 const testing = std.testing;
 
 const max_n = 64;
+const n_func = 44;
 
 fn mt(x: i32) ind.MaType {
     return @fromBackingInt(@intCast(@as(u8, @intCast(x))));
@@ -21,17 +22,28 @@ fn us(x: i32) usize {
     return @intCast(x);
 }
 
+/// Inputs of function `f`: 0 close; 1 high+low; 2 high+low+close; 3 close+aux (volume or periods).
+fn inKind(f: u8) u8 {
+    return switch (f) {
+        9, 10, 11, 12, 13, 27, 29, 34, 37 => 2,
+        23, 24, 25, 30, 31, 33, 42 => 1,
+        41, 26 => 3,
+        else => 0,
+    };
+}
+
 /// Same table as the `Func` enum of tools/interop.zig.
-fn run(comptime T: type, v: vecs.Vec, h: []const T, l: []const T, c: []const T, o: *[3][]T) !usize {
+fn run(comptime T: type, v: vecs.Vec, h: []const T, l: []const T, c: []const T, au: []const T, o: *[4][]T) !usize {
     const ip = v.ip;
     const un: ind.Unstable = switch (v.ukind) {
         0 => .{ .bars = v.ubars },
         1 => .auto4,
         else => .auto8,
     };
-    const dp0: f64 = @bitCast(v.dp[0]);
-    const dp1: f64 = @bitCast(v.dp[1]);
+    var dp: [8]f64 = undefined;
+    for (&dp, v.dp) |*d, b| d.* = @bitCast(b);
     const a = testing.allocator;
+    const n = c.len;
     return switch (v.func) {
         0 => ind.sma(T, c, o[0], .{ .period = us(ip[0]) }),
         1 => ind.ema(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
@@ -41,7 +53,7 @@ fn run(comptime T: type, v: vecs.Vec, h: []const T, l: []const T, c: []const T, 
         5 => ind.macdext(T, a, c, o[0], o[1], o[2], .{ .fast = us(ip[0]), .fast_ma = mt(ip[1]), .slow = us(ip[2]), .slow_ma = mt(ip[3]), .signal = us(ip[4]), .signal_ma = mt(ip[5]), .unstable = un }),
         6 => ind.macdfix(T, c, o[0], o[1], o[2], .{ .signal = us(ip[0]), .unstable = un }),
         7 => ind.rsi(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
-        8 => ind.bbands(T, c, o[0], o[1], o[2], .{ .period = us(ip[0]), .dev_up = dp0, .dev_dn = dp1, .ma = mt(ip[1]), .unstable = un }),
+        8 => ind.bbands(T, c, o[0], o[1], o[2], .{ .period = us(ip[0]), .dev_up = dp[0], .dev_dn = dp[1], .ma = mt(ip[1]), .unstable = un }),
         9 => ind.trange(T, h, l, c, o[0]),
         10 => ind.atr(T, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
         11 => ind.natr(T, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
@@ -50,6 +62,47 @@ fn run(comptime T: type, v: vecs.Vec, h: []const T, l: []const T, c: []const T, 
         14 => ind.max(T, c, o[0], .{ .period = us(ip[0]) }),
         15 => ind.min(T, c, o[0], .{ .period = us(ip[0]) }),
         16 => ind.sum(T, c, o[0], .{ .period = us(ip[0]) }),
+        17 => ind.dema(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        18 => ind.tema(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        19 => ind.t3(T, c, o[0], .{ .period = us(ip[0]), .vfactor = dp[0], .unstable = un }),
+        20 => ind.trima(T, c, o[0], .{ .period = us(ip[0]) }),
+        21 => ind.kama(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        22 => ind.midpoint(T, c, o[0], .{ .period = us(ip[0]) }),
+        23 => ind.midprice(T, h, l, o[0], .{ .period = us(ip[0]) }),
+        24 => ind.sar(T, h, l, o[0], .{ .acceleration = dp[0], .maximum = dp[1] }),
+        25 => ind.sarext(T, h, l, o[0], .{ .start_value = dp[0], .offset_on_reverse = dp[1], .af_init_long = dp[2], .af_long = dp[3], .af_max_long = dp[4], .af_init_short = dp[5], .af_short = dp[6], .af_max_short = dp[7] }),
+        26 => ind.mavp(T, c, au, o[0], .{ .min_period = us(ip[0]), .max_period = us(ip[1]), .kind = mt(ip[2]), .unstable = un }),
+        27 => ind.accbands(T, h, l, c, o[0], o[1], o[2], .{ .period = us(ip[0]) }),
+        28 => ind.alma(T, a, c, o[0], .{ .period = us(ip[0]), .sigma = dp[0], .offset = dp[1] }),
+        29 => ind.cksp(T, a, h, l, c, o[0], o[1], .{ .period = us(ip[0]), .stop_period = us(ip[1]), .multiplier = dp[0], .unstable = un }),
+        30 => ind.donchian(T, h, l, o[0], o[1], o[2], .{ .period = us(ip[0]) }),
+        31 => ind.frama(T, h, l, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        32 => ind.hma(T, c, o[0], .{ .period = us(ip[0]) }),
+        33 => ind.ichimoku(T, h, l, o[0], o[1], o[2], o[3], .{ .tenkan = us(ip[0]), .kijun = us(ip[1]), .senkou_b = us(ip[2]) }),
+        34 => ind.kc(T, h, l, c, o[0], o[1], o[2], .{ .period = us(ip[0]), .atr_period = us(ip[1]), .nb_dev = dp[0], .unstable = un }),
+        35 => ind.mcgd(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        36 => ind.rma(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        37 => blk: {
+            var tr: [max_n]i8 = undefined;
+            const lb = try ind.supertrend(T, h, l, c, o[0], tr[0..n], .{ .period = us(ip[0]), .multiplier = dp[0], .unstable = un });
+            for (o[1][0..n], tr[0..n], 0..) |*d, t, i| d.* = if (i < lb) std.math.nan(T) else @floatFromInt(t);
+            break :blk lb;
+        },
+        38 => ind.swakButter(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        39 => ind.swakGauss(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        40 => ind.vidya(T, c, o[0], .{ .period = us(ip[0]), .cmo_period = us(ip[1]), .unstable = un }),
+        41 => ind.vwma(T, c, au, o[0], .{ .period = us(ip[0]) }),
+        42 => blk: {
+            var tr: [max_n]i8 = undefined;
+            var pv: [max_n]i32 = undefined;
+            const lb = try ind.zigzag(T, h, l, o[0], tr[0..n], pv[0..n], .{ .sensitivity = dp[0], .min_trend_length = us(ip[0]) });
+            for (o[1][0..n], o[2][0..n], tr[0..n], pv[0..n], 0..) |*d, *e, t, pp, i| {
+                d.* = if (i < lb) std.math.nan(T) else @floatFromInt(t);
+                e.* = if (i < lb) std.math.nan(T) else @floatFromInt(pp);
+            }
+            break :blk lb;
+        },
+        43 => ind.zlema(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
         else => error.BadParam,
     };
 }
@@ -58,17 +111,25 @@ fn replay(comptime T: type, v: vecs.Vec) !void {
     const n: usize = v.n;
     try testing.expect(n <= max_n);
     var ib: [3][max_n]T = undefined;
-    var ob: [3][max_n]T = undefined;
-    const ni = v.ins.len;
+    var ob: [4][max_n]T = undefined;
     for (v.ins, 0..) |col, q| for (col, 0..) |bits, i| {
         ib[q][i] = @floatCast(@as(f64, @bitCast(bits)));
     };
-    // single-input functions read the close = ins[0]; OHLC ones high, low, close
-    const c = if (ni == 1) ib[0][0..n] else ib[2][0..n];
-    const h = ib[0][0..n];
-    const l = if (ni == 3) ib[1][0..n] else ib[0][0..n];
-    var o: [3][]T = .{ ob[0][0..n], ob[1][0..n], ob[2][0..n] };
-    const lb = try run(T, v, h, l, c, &o);
+    const h: []const T = ib[0][0..n];
+    var l: []const T = ib[0][0..n];
+    var c: []const T = ib[0][0..n];
+    var au: []const T = ib[0][0..n];
+    switch (inKind(v.func)) {
+        0 => {},
+        1 => l = ib[1][0..n],
+        2 => {
+            l = ib[1][0..n];
+            c = ib[2][0..n];
+        },
+        else => au = ib[1][0..n],
+    }
+    var o: [4][]T = .{ ob[0][0..n], ob[1][0..n], ob[2][0..n], ob[3][0..n] };
+    const lb = try run(T, v, h, l, c, au, &o);
     try testing.expectEqual(@as(usize, v.lb), lb);
     for (v.outs, 0..) |col, q| {
         for (o[q][0..@min(lb, n)]) |x| try testing.expect(std.math.isNan(x));
@@ -86,9 +147,9 @@ fn replay(comptime T: type, v: vecs.Vec) !void {
     }
 }
 
-test "frozen TA-Lib vectors: every seed function, f64 and f32, unstable levels" {
+test "frozen TA-Lib vectors: every function, f64 and f32, unstable levels" {
     for (vecs.ulp_bound) |b| try testing.expectEqual(@as(u64, 0), b);
-    var seen: [17]usize = @splat(0);
+    var seen: [n_func]usize = @splat(0);
     for (vecs.vectors) |v| {
         if (v.f32) try replay(f32, v) else try replay(f64, v);
         for (v.outs) |col| seen[v.func] += col.len;

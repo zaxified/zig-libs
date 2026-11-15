@@ -161,7 +161,10 @@ pub fn bbands(comptime T: type, in: []const T, upper: []T, middle: []T, lower: [
     const plan = try Plan.make(p);
     var cm = try MaCore.init(plan.ma);
     var cv = VarCore.init(p.period);
-    const skip_m = plan.lb - plan.lb_ma;
+    // TA_BBANDS calls TA_MA from bar 0 (the average clamps to its own lookback and is
+    // realigned); only the deviation is started late. Matters when the average's
+    // lookback is below the deviation's (VIDYA, ALMA at small sizes, MAMA, DISABLED).
+    const skip_m: usize = 0;
     const skip_v = plan.lb - plan.lb_sd;
     const sm = SliceSrc(T){ .xs = in, .off = skip_m };
     const sv = SliceSrc(T){ .xs = in, .off = skip_v };
@@ -213,7 +216,7 @@ pub fn BbandsStream(comptime T: type) type {
                 .ma = ma,
                 .cv = VarCore.init(p.period),
                 .vring = core.carve(&rest, p.period),
-                .skip_m = plan.lb - plan.lb_ma,
+                .skip_m = 0, // see `bbands`: the average starts at bar 0
                 .skip_v = plan.lb - plan.lb_sd,
                 .up = p.dev_up,
                 .dn = p.dev_dn,
@@ -312,7 +315,7 @@ test "bbands: lookback follows the MA type, BadParam" {
     try testing.expectEqual(@as(usize, 19), try bbandsLookback(.{}));
     try testing.expectEqual(@as(usize, 19 + 4), try bbandsLookback(.{ .ma = .ema, .unstable = .{ .bars = 4 } }));
     try testing.expectEqual(@as(usize, 19), try bbandsLookback(.{ .ma = .disabled }));
-    try testing.expectError(error.Unsupported, bbandsLookback(.{ .ma = .kama }));
+    try testing.expectError(error.Unsupported, bbandsLookback(.{ .ma = .mama }));
     try testing.expectError(error.BadParam, bbandsLookback(.{ .period = 1 }));
     try testing.expectError(error.BadParam, bbandsLookback(.{ .period = 100001 }));
     try testing.expectError(error.BadParam, bbandsLookback(.{ .dev_up = 4e37 }));

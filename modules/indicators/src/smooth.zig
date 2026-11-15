@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const core = @import("core.zig");
+const mavg = @import("mavg.zig");
 const Error = core.Error;
 const Nan = core.Nan;
 const Seed = core.Seed;
@@ -363,47 +364,85 @@ pub const CopyCore = struct {
 };
 
 /// A moving average of any supported type. Period 1 and `.disabled` are an
-/// identity copy with lookback 0, for every type (TA_MA).
+/// identity copy with lookback 0, for every type (TA_MA). `.mama` is not built
+/// yet (`error.Unsupported`); the types with a fixed side parameter use TA_MA's
+/// values (T3 vfactor 0.7, VIDYA CMO period (3p+2)/4, ALMA sigma 6.0 offset 0.85).
 pub const MaCore = union(enum) {
     copy: CopyCore,
     sma: SmaCore,
     ema: EmaCore,
     wma: WmaCore,
+    dema: mavg.DemaCore,
+    tema: mavg.TemaCore,
+    trima: mavg.TrimaCore,
+    kama: mavg.KamaCore,
+    t3: mavg.T3Core,
+    hma: mavg.HmaCore,
+    zlema: mavg.ZlemaCore,
+    rma: mavg.RmaCore,
+    vidya: mavg.VidyaCore,
+    alma: mavg.AlmaCore,
 
     pub fn validate(p: MaParams) Error!void {
         try core.checkPeriod(p.period, 1);
         try p.unstable.check();
         if (p.period == 1) return;
         switch (p.kind) {
-            .sma, .ema, .wma, .disabled => {},
-            else => return error.Unsupported,
+            .mama => return error.Unsupported,
+            else => {},
         }
     }
     pub fn isCopy(p: MaParams) bool {
         return p.period == 1 or p.kind == .disabled;
     }
+    fn vidyaOf(p: MaParams) mavg.VidyaParams {
+        return .{ .period = p.period, .cmo_period = (3 * p.period + 2) / 4, .unstable = p.unstable };
+    }
     pub fn ringLen(p: MaParams) usize {
         if (isCopy(p)) return 0;
         return switch (p.kind) {
-            .sma, .wma => p.period,
+            .sma, .wma, .trima, .hma, .alma => p.period,
+            .kama => mavg.KamaCore.ringLen(.{ .period = p.period }),
+            .zlema => mavg.ZlemaCore.ringLen(.{ .period = p.period }),
+            .vidya => mavg.VidyaCore.ringLen(vidyaOf(p)),
             else => 0,
         };
     }
     pub fn lookback(p: MaParams) usize {
         if (isCopy(p)) return 0;
         return switch (p.kind) {
-            .sma, .wma => p.period - 1,
+            .sma, .wma, .trima, .alma => p.period - 1,
             .ema => EmaCore.lookbackOf(p.period, p.unstable, p.seed),
+            .dema => mavg.DemaCore.lookback(.{ .period = p.period, .unstable = p.unstable }),
+            .tema => mavg.TemaCore.lookback(.{ .period = p.period, .unstable = p.unstable }),
+            .t3 => mavg.T3Core.lookback(.{ .period = p.period, .unstable = p.unstable }),
+            .kama => mavg.KamaCore.lookback(.{ .period = p.period, .unstable = p.unstable }),
+            .hma => mavg.HmaCore.lookback(.{ .period = p.period }),
+            .zlema => mavg.ZlemaCore.lookback(.{ .period = p.period, .unstable = p.unstable }),
+            .rma => mavg.RmaCore.lookback(.{ .period = p.period, .unstable = p.unstable }),
+            .vidya => mavg.VidyaCore.lookback(vidyaOf(p)),
             else => 0,
         };
     }
     pub fn init(p: MaParams) Error!MaCore {
         try validate(p);
         if (isCopy(p)) return .{ .copy = .{} };
+        const per = p.period;
+        const un = p.unstable;
         return switch (p.kind) {
-            .sma => .{ .sma = try SmaCore.init(.{ .period = p.period }) },
-            .ema => .{ .ema = try EmaCore.init(.{ .period = p.period, .unstable = p.unstable, .seed = p.seed }) },
-            .wma => .{ .wma = try WmaCore.init(.{ .period = p.period }) },
+            .sma => .{ .sma = try SmaCore.init(.{ .period = per }) },
+            .ema => .{ .ema = try EmaCore.init(.{ .period = per, .unstable = un, .seed = p.seed }) },
+            .wma => .{ .wma = try WmaCore.init(.{ .period = per }) },
+            .dema => .{ .dema = try mavg.DemaCore.init(.{ .period = per, .unstable = un }) },
+            .tema => .{ .tema = try mavg.TemaCore.init(.{ .period = per, .unstable = un }) },
+            .trima => .{ .trima = try mavg.TrimaCore.init(.{ .period = per }) },
+            .kama => .{ .kama = try mavg.KamaCore.init(.{ .period = per, .unstable = un }) },
+            .t3 => .{ .t3 = try mavg.T3Core.init(.{ .period = per, .unstable = un }) },
+            .hma => .{ .hma = try mavg.HmaCore.init(.{ .period = per }) },
+            .zlema => .{ .zlema = try mavg.ZlemaCore.init(.{ .period = per, .unstable = un }) },
+            .rma => .{ .rma = try mavg.RmaCore.init(.{ .period = per, .unstable = un }) },
+            .vidya => .{ .vidya = try mavg.VidyaCore.init(vidyaOf(p)) },
+            .alma => .{ .alma = try mavg.AlmaCore.init(.{ .period = per }) },
             else => unreachable, // validate() refused the rest
         };
     }
@@ -572,10 +611,10 @@ test "ma dispatches and refuses what is not built" {
     _ = try ma(f64, &in, &a, .{ .period = 3, .kind = .wma });
     _ = try wma(f64, &in, &b, .{ .period = 3 });
     try th.expectSameBits(&a, &b);
-    try testing.expectError(error.Unsupported, ma(f64, &in, &a, .{ .period = 3, .kind = .kama }));
-    try testing.expectError(error.Unsupported, maLookback(.{ .period = 3, .kind = .t3 }));
+    try testing.expectError(error.Unsupported, ma(f64, &in, &a, .{ .period = 3, .kind = .mama }));
+    try testing.expectError(error.Unsupported, maLookback(.{ .period = 3, .kind = .mama }));
     // period 1 and .disabled copy, for every type, even an unsupported one.
-    _ = try ma(f64, &in, &a, .{ .period = 1, .kind = .kama });
+    _ = try ma(f64, &in, &a, .{ .period = 1, .kind = .mama });
     try th.expectSameBits(&a, &in);
     try testing.expectEqual(@as(usize, 0), try maLookback(.{ .period = 9, .kind = .disabled }));
 }

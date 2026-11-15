@@ -375,7 +375,7 @@ test "stoch family: lookback and BadParam" {
     try testing.expectError(error.BadParam, stochfLookback(.{ .fastd = 100001 }));
     try testing.expectError(error.BadParam, stochLookback(.{ .slowk = 0 }));
     try testing.expectError(error.BadParam, stochLookback(.{ .slowd = 0 }));
-    try testing.expectError(error.Unsupported, stochLookback(.{ .slowd_ma = .t3 }));
+    try testing.expectError(error.Unsupported, stochLookback(.{ .slowd_ma = .mama }));
     var k: [6]f64 = undefined;
     var d: [5]f64 = undefined;
     try testing.expectError(error.BadParam, stoch(f64, testing.allocator, &t_h, &t_l, &t_c, &k, &d, .{}));
