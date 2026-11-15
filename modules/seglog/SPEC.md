@@ -18,9 +18,9 @@
 
 **Downstream consumer:** no
 
-**Consumers:** energomonitor `egw-hub` (ingest daemon's primary store) — still builds its own copy under `egw-hub/seglog/` and has not switched to this module yet, so the card says `no` above.
+**Consumers:** an energy-monitoring consumer's ingest daemon (ingest daemon's primary store) — still builds its own copy under the ingest daemon's `seglog/` and has not switched to this module yet, so the card says `no` above.
 
-**Provenance (history before this module existed here).** `seglog` was written inside energomonitor's `egw-hub` as a "zig-libs module in waiting" and moved here unchanged on 2026-11-15 (the edits: `meta.deps` now names all three imports, `kv`, `crc32c`, `zstd`, `zig fmt` reformatted `root.zig`, `fault_test.zig` and `example/bench.zig`, `fuzz_test.zig`'s first draw became `value(u64) % 4` for check-fuzz-reach, and `example/main.zig` was added). What the energomonitor history records, and nothing more: format version 2 and migration from version 1 (2026-09-27); guard-removal mutation checks run by hand against the suite (2026-09-21, preallocation 13 of 13 on 2026-09-27, before the runners were deleted — see *Anchoring*); the fuzz driver (`SEGLOG_FUZZ`, 160 000 cases in about two minutes, per README); the `tools/crash-dm` dm-log-writes run on ext4 (2026-09-27, see *Anchoring*); an audit in energomonitor (`egw-audit-2026-09-27`, findings L1–L6 in `CHANGELOG.md`). None of these was re-run for the move, none is an audit of this tree in zig-libs' sense, so Audit stays `none` and Hardening `fuzz none` until a run is recorded here with a date.
+**Provenance (history before this module existed here).** `seglog` was written inside an energy-monitoring consumer's ingest daemon as a "zig-libs module in waiting" and moved here unchanged on 2026-11-15 (the edits: `meta.deps` now names all three imports, `kv`, `crc32c`, `zstd`, `zig fmt` reformatted `root.zig`, `fault_test.zig` and `example/bench.zig`, `fuzz_test.zig`'s first draw became `value(u64) % 4` for check-fuzz-reach, and `example/main.zig` was added). What the energy-monitoring consumer history records, and nothing more: format version 2 and migration from version 1 (2026-09-27); guard-removal mutation checks run by hand against the suite (2026-09-21, preallocation 13 of 13 on 2026-09-27, before the runners were deleted — see *Anchoring*); the fuzz driver (`SEGLOG_FUZZ`, 160 000 cases in about two minutes, per README); the `tools/crash-dm` dm-log-writes run on ext4 (2026-09-27, see *Anchoring*); an audit in the energy-monitoring consumer (`ingest-consumer audit 2026-09-27`, findings L1–L6 in `CHANGELOG.md`). None of these was re-run for the move, none is an audit of this tree in zig-libs' sense, so Audit stays `none` and Hardening `fuzz none` until a run is recorded here with a date.
 
 ## What this module is, and what it is not
 
@@ -70,7 +70,7 @@ or the log's clock's; they need not be monotonic.
 ⚠ **One absurd timestamp is permanent** (2026-09-27, audit finding L3): a
 segment's seal keeps only a running `min`/`max` of every `ts` ever added to
 it (`Tally`), with no bound of its own — so one caller mistake (a device
-clock badly stepped, cf. `egw-hub`'s own `t` validation, a different layer)
+clock badly stepped, cf. The ingest daemon's own `t` validation, a different layer)
 becomes the seal's `max_ts`/`min_ts` for good, once the segment is sealed.
 Two things then follow, both silent: `seekTime` — "the first record at which
 the newest timestamp so far reaches `t`" — matches that one record for every
@@ -163,7 +163,7 @@ record of a closed segment always lies exactly at its end — see
 writes a fresh `MANIFEST` naming each one's form (raw or compressed,
 `SegStore` reads either transparently). It cannot discover `ids` itself — the
 same missing directory listing this section already explains — so a caller
-that can list the directory supplies them (`egw-hub-tools manifest-rebuild
+that can list the directory supplies them (the ingest daemon's tools: `manifest-rebuild
 --dir LOG`, or an operator's `ls`). It refuses outright over a `MANIFEST` that
 still opens (not a way to override one `Log.open` accepts), and checks only
 each segment's own header and seal, never a data record's CRC or LSN sequence
@@ -277,7 +277,7 @@ journal commit's FUA write.
 
 ## Rotation
 
-By the caller — `rotate(id)`, any strictly increasing ids (egw-hub: UTC days)
+By the caller — `rotate(id)`, any strictly increasing ids (the ingest daemon: UTC days)
 — or by the log: `Options.auto_rotate = .{ .max_bytes, .max_age }` rotates to
 the newest id + 1 before an append that would take the active segment past
 `max_bytes`, or once it is `max_age` old by `Options.now` (its creation stamp
@@ -382,7 +382,7 @@ read decompressed.
 
 `Concurrent.compress` holds the lock throughout.
 
-**Measured on a real day of egw-hub** (2026-09-27, `bench-seglog -- realz`: segment
+**Measured on a real day of the ingest daemon** (2026-09-27, `bench-seglog -- realz`: segment
 20722, 62 656 records of 191 bytes average, 13.5 MB as a v2 segment;
 ReleaseFast, NVMe):
 
@@ -395,7 +395,7 @@ ReleaseFast, NVMe):
 
 (256 KiB frames; 64 KiB and 1 MiB differ by a few percent either way.) Larger
 frames buy little because every record carries a 4-byte CRC, which does not
-compress — a fifth of what is left. For egw-hub, compressing once a day,
+compress — a fifth of what is left. For the ingest daemon, compressing once a day,
 level 9: about 1.2 MB a day, 37 MB for 30 days.
 
 ## Format versions and migration
@@ -456,7 +456,7 @@ killed; two survive knowingly: the directory sync after a segment's rename
 (the manifest commit that follows syncs the directory anyway, before anything
 relies on the rename), and the payload-hash comparison of the read-back (the
 record CRCs catch any corruption a disk or RAM makes; the hash is there for a
-conversion bug that writes a different, well-formed record). On egw-hub's
+conversion bug that writes a different, well-formed record). On the ingest daemon's
 notebook log (a copy of it): 25 days, 1 492 944 records in 11 s, and the
 hub's decoded rows of the old and the new log identical (7 328 354).
 
@@ -641,7 +641,7 @@ The newest segment is never dropped.
   a directory that had none.
 - `open` walks the whole newest segment, linear in its size: 155 MB of
   155-byte records in 0.068 s (2026-09-27, hardware CRC, NVMe) — about 2.3 GB/s.
-  A day of egw-hub is some tens of MB. A "verified up to" mark written at a
+  A day of the ingest daemon is some tens of MB. A "verified up to" mark written at a
   clean close would make it constant; not needed yet.
 - Throughput: `tools/bench.zig` (`zig build bench-seglog`) against tidwall/wal and Prometheus's wlog
   (`tools/bench-go`); numbers in the plan until the final comparison lands in

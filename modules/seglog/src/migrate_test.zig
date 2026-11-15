@@ -87,7 +87,7 @@ fn appendRecord(b: *std.ArrayList(u8), typ: u8, p: []const u8) !void {
     std.mem.writeInt(u32, b.items[at..][0..4], crc(b.items[at + 4 ..]), .little);
 }
 
-/// Payloads start with their time, as egw-hub's do.
+/// Payloads start with their time, as the ingest daemon's do.
 pub fn tsOf(p: []const u8) i64 {
     return if (p.len >= 8) std.mem.readInt(i64, p[0..8], .little) else -1;
 }
