@@ -2819,8 +2819,10 @@ test "forget of an absent key is a no-op" {
     c.forget(.txt, "a.example.com");
     c.forgetReverse(.{ .v6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } });
     c.forgetSrv("x", "udp", "a.example.com");
-    const long: [300]u8 = @splat('a');
+    const long: [key_buf_len]u8 = @splat('a'); // longer than any key the cache can build
     c.forget(.ip, &long); // too long for a key: nothing could have been cached
+    const long_service: [256]u8 = @splat('s');
+    c.forgetSrv(&long_service, "udp", "a.example.com");
     try testing.expectEqual(@as(usize, 1), c.stats().entries);
     var a2 = try c.lookupIp("a.example.com");
     defer a2.deinit();
@@ -2921,5 +2923,105 @@ test "a changed route source reorders a cache hit; resort_ip_hits = false keeps 
     probe_calls = 0;
     var h3 = try c.lookupIp("dual.example.com");
     defer h3.deinit();
+    try testing.expectEqual(@as(u32, 0), probe_calls);
+}
+
+test "forget drops exactly the asked kind of a name: all five name kinds" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{});
+    defer c.deinit();
+    const name = "alias.example.com";
+    const kinds = [_]NameKind{ .ip, .mx, .ns, .txt, .cname };
+    for (kinds) |kind| {
+        // Everything cached, then one kind forgotten: only that one goes to the network.
+        inline for (kinds) |k2| try testing.expect(try lookupKind(&c, k2, name) != null);
+        c.forget(kind, name);
+        for (kinds) |k2| {
+            const src = try lookupKind(&c, k2, name);
+            try testing.expectEqual(if (k2 == kind) Source.network else Source.cache, src.?);
+        }
+    }
+}
+
+fn lookupKind(c: *CachingResolver, kind: NameKind, name: []const u8) Error!?Source {
+    switch (kind) {
+        .ip => {
+            var a = try c.lookupIp(name);
+            defer a.deinit();
+            return a.source;
+        },
+        .mx => {
+            var a = try c.lookupMx(name);
+            defer a.deinit();
+            return a.source;
+        },
+        .ns => {
+            var a = try c.lookupNs(name);
+            defer a.deinit();
+            return a.source;
+        },
+        .txt => {
+            var a = try c.lookupTxt(name);
+            defer a.deinit();
+            return a.source;
+        },
+        .cname => {
+            var a = try c.lookupCname(name);
+            defer a.deinit();
+            return a.source;
+        },
+    }
+}
+
+test "a stale IP answer is re-sorted like a cache hit; a network answer is left to the Resolver" {
+    var h: Harness = .{};
+    try h.start(.any);
+    defer h.stop();
+    var c = try h.cache(.{ .sort_source = probeSource, .stale_s = 1000, .stale_answer_ttl_s = 30 });
+    defer c.deinit();
+    probe_calls = 0;
+    probe_v6_reachable = false;
+    var a = try c.lookupIp("dual.example.com");
+    defer a.deinit();
+    try testing.expectEqual(Source.network, a.source);
+    try testing.expectEqual(@as(u32, 0), probe_calls); // the cache layer never re-sorts a network answer
+
+    h.stub.mode.store(.servfail, .release);
+    h.clock.now += 61;
+    var s1 = try c.lookupIp("dual.example.com"); // the upstream fails: stale
+    defer s1.deinit();
+    try testing.expectEqual(Source.stale, s1.source);
+    try testing.expect(s1.lookup.items[0] == .v4);
+
+    probe_v6_reachable = true;
+    var s2 = try c.lookupIp("dual.example.com"); // the backoff holds: stale again, routes changed
+    defer s2.deinit();
+    try testing.expectEqual(Source.stale, s2.source);
+    try testing.expect(s2.lookup.items[0] == .v6);
+}
+
+test "a hit of more than max_sort_candidates addresses keeps its order, and the default source is the system probe" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .sort_source = probeSource });
+    defer c.deinit();
+    comptime std.debug.assert(@TypeOf((Options{}).sort_source) == *const fn (netaddr.Ip) ?netaddr.Ip);
+    if (comptime builtin.os.tag == .linux) try testing.expect((Options{}).sort_source == &netaddr.systemSource);
+
+    var many: [netaddr.max_sort_candidates + 1]netaddr.Ip = undefined;
+    for (&many, 0..) |*ip, i| ip.* = .{ .v4 = .{ 198, 51, 100, @intCast(200 - i) } };
+    const src: Resolver.Lookup(netaddr.Ip) = .{ .arena = undefined, .items = &many, .status = .found, .ttl_s = 60, .canonical = null, .authenticated = false, .partial = false };
+    var buf: [key_buf_len]u8 = undefined;
+    c.store(netaddr.Ip, nameKey(&buf, .ip, "many.example.com").?, &src, c.now(), 60);
+
+    probe_calls = 0;
+    var hit = try c.lookupIp("many.example.com");
+    defer hit.deinit();
+    try testing.expectEqual(Source.cache, hit.source);
+    try testing.expectEqual(many.len, hit.lookup.items.len);
+    try testing.expectEqualSlices(netaddr.Ip, &many, hit.lookup.items); // unsorted: too many candidates
     try testing.expectEqual(@as(u32, 0), probe_calls);
 }
