@@ -11,7 +11,7 @@
  *
  * cases.bin   u32 count, then per record (little endian, packed):
  *               u8 func, u8 is_f32, u8 unstable_kind (0 bars, 1 auto4, 2 auto8), u8 0,
- *               u32 unstable_bars, u32 n, i32 ip[6], f64 dp[8],
+ *               u32 unstable_bars, u32 n, i32 ip[6], f64 dp[8], i32 xp[6] (ints beyond the first 6: KST, KSTEXT),
  *               then NIN arrays of n values (f64, or f32 when is_f32)
  * results.bin per record: i32 ret, i32 lookback, i32 outBegIdx, i32 outNBElement,
  *               then NOUT arrays of outNBElement f64 each
@@ -43,6 +43,11 @@ enum { F_SMA, F_EMA, F_WMA, F_MA, F_MACD, F_MACDEXT, F_MACDFIX, F_RSI, F_BBANDS,
        F_HT_DCPERIOD, F_HT_DCPHASE, F_HT_PHASOR, F_HT_SINE, F_HT_TRENDLINE, F_HT_TRENDMODE, F_MAMA,
        F_SWAK_BP, F_SWAK_HP, F_SWAK_2PHP,
        F_ACOS, F_ASIN, F_ATAN, F_CEIL, F_COS, F_COSH, F_EXP, F_FLOOR, F_LN, F_LOG10, F_SIN, F_SINH, F_SQRT, F_TAN, F_TANH,
+       /* momentum wave */
+       F_ADX, F_ADXR, F_DX, F_MINUS_DI, F_PLUS_DI, F_MINUS_DM, F_PLUS_DM, F_AROON, F_AROONOSC,
+       F_MOM, F_ROC, F_ROCP, F_ROCR, F_ROCR100, F_BOP, F_IBS, F_QSTICK, F_WAD, F_ASI, F_SI, F_IMI, F_AO, F_AC, F_DPO, F_ER, F_FOSC, F_CTI, F_VHF, F_WILLR, F_FRACTAL, F_CCI, F_CHOP, F_CHOPTR, F_VORTEX, F_MFI, F_ULTOSC, F_CMO, F_CMOU,
+       F_CG, F_APO, F_PPO, F_TRIX, F_COPPOCK, F_ERI, F_DOSC, F_FISHER, F_PSO, F_SMI, F_TSI, F_WAVETREND,
+       F_KST, F_KSTEXT, F_KDJ, F_STOCHRSI, F_CRSI, F_STC, F_SQZMOM,
        F_COUNT };
 
 static int nin(int f) {
@@ -57,6 +62,14 @@ static int nin(int f) {
     case F_ADR: case F_CVI: case F_MASSI: case F_RVIR: case F_MEDPRICE: return 2;
     case F_ROGERSSATCHELL: case F_AVGPRICE: case F_HA: return 4;
     case F_BETA: case F_CORREL: case F_ADD: case F_SUB: case F_MULT: case F_DIV: return 2;
+    case F_ADX: case F_ADXR: case F_DX: case F_MINUS_DI: case F_PLUS_DI: return 3;
+    case F_MINUS_DM: case F_PLUS_DM: case F_AROON: case F_AROONOSC: return 2;
+    case F_BOP: case F_ASI: case F_SI: return 4;
+    case F_QSTICK: case F_IMI: case F_AO: case F_AC: case F_FRACTAL: return 2;
+    case F_IBS: case F_WAD: case F_WILLR: case F_CCI: case F_CHOP: case F_CHOPTR: case F_VORTEX: case F_ULTOSC: return 3;
+    case F_MFI: return 4;
+    case F_ERI: case F_PSO: case F_SMI: case F_WAVETREND: case F_KDJ: case F_SQZMOM: return 3;
+    case F_FISHER: return 2;
     default: return 1;
     }
 }
@@ -67,6 +80,8 @@ static int nout(int f) {
     case F_ICHIMOKU: return 4;
     case F_STOCH: case F_STOCHF: case F_CKSP: case F_SUPERTREND: case F_KVO: case F_MINMAX: case F_MINMAXINDEX:
     case F_HT_PHASOR: case F_HT_SINE: case F_MAMA: return 2;
+    case F_AROON: case F_KST: case F_KSTEXT: case F_STOCHRSI: case F_SQZMOM: case F_VORTEX: case F_FRACTAL: case F_ERI: case F_FISHER: case F_SMI: case F_WAVETREND: return 2;
+    case F_KDJ: return 3;
     case F_HA: return 4;
     default: return 1;
     }
@@ -89,9 +104,9 @@ int main(int argc, char **argv) {
     for (uint32_t r = 0; r < count; r++) {
         uint8_t hdr[4];
         uint32_t ubars, n;
-        int32_t ip[6];
+        int32_t ip[6], xp[6];
         double dp[8];
-        if (!rd(in, hdr, 4) || !rd(in, &ubars, 4) || !rd(in, &n, 4) || !rd(in, ip, sizeof ip) || !rd(in, dp, sizeof dp)) return 2;
+        if (!rd(in, hdr, 4) || !rd(in, &ubars, 4) || !rd(in, &n, 4) || !rd(in, ip, sizeof ip) || !rd(in, dp, sizeof dp) || !rd(in, xp, sizeof xp)) return 2;
         int f = hdr[0], is32 = hdr[1];
         if (f >= F_COUNT) return 2;
         int ni = nin(f), no = nout(f);
@@ -119,6 +134,7 @@ int main(int argc, char **argv) {
 #define OI1 &beg, &nb, ib[0]
 #define OI2 &beg, &nb, ib[0], ib[1]
 #define MT(i) ((TA_MAType)ip[i])
+#define MT_X(i) ((TA_MAType)xp[i])
         switch (f) {
         case F_SMA: lb = TA_SMA_Lookback(ip[0]); R(TA_S_SMA(0, e, s0, ip[0], O1), TA_SMA(0, e, d0, ip[0], O1));
         case F_EMA: lb = TA_EMA_Lookback(ip[0]); R(TA_S_EMA(0, e, s0, ip[0], O1), TA_EMA(0, e, d0, ip[0], O1));
@@ -257,12 +273,80 @@ int main(int argc, char **argv) {
         case F_SQRT: lb = TA_SQRT_Lookback(); R(TA_S_SQRT(0, e, s0, O1), TA_SQRT(0, e, d0, O1));
         case F_TAN: lb = TA_TAN_Lookback(); R(TA_S_TAN(0, e, s0, O1), TA_TAN(0, e, d0, O1));
         case F_TANH: lb = TA_TANH_Lookback(); R(TA_S_TANH(0, e, s0, O1), TA_TANH(0, e, d0, O1));
+        /* momentum wave */
+        case F_ADX: lb = TA_ADX_Lookback(ip[0]); R(TA_S_ADX(0, e, s0, s1, s2, ip[0], O1), TA_ADX(0, e, d0, d1, d2, ip[0], O1));
+        case F_ADXR: lb = TA_ADXR_Lookback(ip[0]); R(TA_S_ADXR(0, e, s0, s1, s2, ip[0], O1), TA_ADXR(0, e, d0, d1, d2, ip[0], O1));
+        case F_DX: lb = TA_DX_Lookback(ip[0]); R(TA_S_DX(0, e, s0, s1, s2, ip[0], O1), TA_DX(0, e, d0, d1, d2, ip[0], O1));
+        case F_MINUS_DI: lb = TA_MINUS_DI_Lookback(ip[0]); R(TA_S_MINUS_DI(0, e, s0, s1, s2, ip[0], O1), TA_MINUS_DI(0, e, d0, d1, d2, ip[0], O1));
+        case F_PLUS_DI: lb = TA_PLUS_DI_Lookback(ip[0]); R(TA_S_PLUS_DI(0, e, s0, s1, s2, ip[0], O1), TA_PLUS_DI(0, e, d0, d1, d2, ip[0], O1));
+        case F_MINUS_DM: lb = TA_MINUS_DM_Lookback(ip[0]); R(TA_S_MINUS_DM(0, e, s0, s1, ip[0], O1), TA_MINUS_DM(0, e, d0, d1, ip[0], O1));
+        case F_PLUS_DM: lb = TA_PLUS_DM_Lookback(ip[0]); R(TA_S_PLUS_DM(0, e, s0, s1, ip[0], O1), TA_PLUS_DM(0, e, d0, d1, ip[0], O1));
+        case F_AROON: lb = TA_AROON_Lookback(ip[0]); R(TA_S_AROON(0, e, s0, s1, ip[0], O2), TA_AROON(0, e, d0, d1, ip[0], O2));
+        case F_AROONOSC: lb = TA_AROONOSC_Lookback(ip[0]); R(TA_S_AROONOSC(0, e, s0, s1, ip[0], O1), TA_AROONOSC(0, e, d0, d1, ip[0], O1));
+        // momentum wave
+        case F_MOM: lb = TA_MOM_Lookback(ip[0]); R(TA_S_MOM(0, e, s0, ip[0], O1), TA_MOM(0, e, d0, ip[0], O1));
+        case F_ROC: lb = TA_ROC_Lookback(ip[0]); R(TA_S_ROC(0, e, s0, ip[0], O1), TA_ROC(0, e, d0, ip[0], O1));
+        case F_ROCP: lb = TA_ROCP_Lookback(ip[0]); R(TA_S_ROCP(0, e, s0, ip[0], O1), TA_ROCP(0, e, d0, ip[0], O1));
+        case F_ROCR: lb = TA_ROCR_Lookback(ip[0]); R(TA_S_ROCR(0, e, s0, ip[0], O1), TA_ROCR(0, e, d0, ip[0], O1));
+        case F_ROCR100: lb = TA_ROCR100_Lookback(ip[0]); R(TA_S_ROCR100(0, e, s0, ip[0], O1), TA_ROCR100(0, e, d0, ip[0], O1));
+        case F_DPO: lb = TA_DPO_Lookback(ip[0]); R(TA_S_DPO(0, e, s0, ip[0], O1), TA_DPO(0, e, d0, ip[0], O1));
+        case F_ER: lb = TA_ER_Lookback(ip[0]); R(TA_S_ER(0, e, s0, ip[0], O1), TA_ER(0, e, d0, ip[0], O1));
+        case F_FOSC: lb = TA_FOSC_Lookback(ip[0]); R(TA_S_FOSC(0, e, s0, ip[0], O1), TA_FOSC(0, e, d0, ip[0], O1));
+        case F_CTI: lb = TA_CTI_Lookback(ip[0]); R(TA_S_CTI(0, e, s0, ip[0], O1), TA_CTI(0, e, d0, ip[0], O1));
+        case F_VHF: lb = TA_VHF_Lookback(ip[0]); R(TA_S_VHF(0, e, s0, ip[0], O1), TA_VHF(0, e, d0, ip[0], O1));
+        case F_CMO: lb = TA_CMO_Lookback(ip[0]); R(TA_S_CMO(0, e, s0, ip[0], O1), TA_CMO(0, e, d0, ip[0], O1));
+        case F_CMOU: lb = TA_CMOU_Lookback(ip[0]); R(TA_S_CMOU(0, e, s0, ip[0], O1), TA_CMOU(0, e, d0, ip[0], O1));
+        case F_BOP: lb = TA_BOP_Lookback(); R(TA_S_BOP(0, e, s0, s1, s2, s3, O1), TA_BOP(0, e, d0, d1, d2, d3, O1));
+        case F_IBS: lb = TA_IBS_Lookback(); R(TA_S_IBS(0, e, s0, s1, s2, O1), TA_IBS(0, e, d0, d1, d2, O1));
+        case F_WAD: lb = TA_WAD_Lookback(); R(TA_S_WAD(0, e, s0, s1, s2, O1), TA_WAD(0, e, d0, d1, d2, O1));
+        case F_QSTICK: lb = TA_QSTICK_Lookback(ip[0]); R(TA_S_QSTICK(0, e, s0, s1, ip[0], O1), TA_QSTICK(0, e, d0, d1, ip[0], O1));
+        case F_IMI: lb = TA_IMI_Lookback(ip[0]); R(TA_S_IMI(0, e, s0, s1, ip[0], O1), TA_IMI(0, e, d0, d1, ip[0], O1));
+        case F_ASI: lb = TA_ASI_Lookback(dp[0]); R(TA_S_ASI(0, e, s0, s1, s2, s3, dp[0], O1), TA_ASI(0, e, d0, d1, d2, d3, dp[0], O1));
+        case F_SI: lb = TA_SI_Lookback(dp[0]); R(TA_S_SI(0, e, s0, s1, s2, s3, dp[0], O1), TA_SI(0, e, d0, d1, d2, d3, dp[0], O1));
+        case F_AO: lb = TA_AO_Lookback(ip[0], ip[1]); R(TA_S_AO(0, e, s0, s1, ip[0], ip[1], O1), TA_AO(0, e, d0, d1, ip[0], ip[1], O1));
+        case F_AC: lb = TA_AC_Lookback(ip[0], ip[1], ip[2]); R(TA_S_AC(0, e, s0, s1, ip[0], ip[1], ip[2], O1), TA_AC(0, e, d0, d1, ip[0], ip[1], ip[2], O1));
+        case F_WILLR: lb = TA_WILLR_Lookback(ip[0]); R(TA_S_WILLR(0, e, s0, s1, s2, ip[0], O1), TA_WILLR(0, e, d0, d1, d2, ip[0], O1));
+        case F_CCI: lb = TA_CCI_Lookback(ip[0]); R(TA_S_CCI(0, e, s0, s1, s2, ip[0], O1), TA_CCI(0, e, d0, d1, d2, ip[0], O1));
+        case F_CHOP: lb = TA_CHOP_Lookback(ip[0]); R(TA_S_CHOP(0, e, s0, s1, s2, ip[0], O1), TA_CHOP(0, e, d0, d1, d2, ip[0], O1));
+        case F_CHOPTR: lb = TA_CHOPTR_Lookback(ip[0]); R(TA_S_CHOPTR(0, e, s0, s1, s2, ip[0], O1), TA_CHOPTR(0, e, d0, d1, d2, ip[0], O1));
+        case F_VORTEX: lb = TA_VORTEX_Lookback(ip[0]); R(TA_S_VORTEX(0, e, s0, s1, s2, ip[0], O2), TA_VORTEX(0, e, d0, d1, d2, ip[0], O2));
+        case F_MFI: lb = TA_MFI_Lookback(ip[0]); R(TA_S_MFI(0, e, s0, s1, s2, s3, ip[0], O1), TA_MFI(0, e, d0, d1, d2, d3, ip[0], O1));
+        case F_ULTOSC: lb = TA_ULTOSC_Lookback(ip[0], ip[1], ip[2]); R(TA_S_ULTOSC(0, e, s0, s1, s2, ip[0], ip[1], ip[2], O1), TA_ULTOSC(0, e, d0, d1, d2, ip[0], ip[1], ip[2], O1));
+        case F_FRACTAL: lb = TA_FRACTAL_Lookback(ip[0], ip[1]); R(TA_S_FRACTAL(0, e, s0, s1, ip[0], ip[1], OI2), TA_FRACTAL(0, e, d0, d1, ip[0], ip[1], OI2));
+        // momentum wave, composites
+        case F_CG: lb = TA_CG_Lookback(ip[0]); R(TA_S_CG(0, e, s0, ip[0], O1), TA_CG(0, e, d0, ip[0], O1));
+        case F_APO: lb = TA_APO_Lookback(ip[0], ip[1], MT(2)); R(TA_S_APO(0, e, s0, ip[0], ip[1], MT(2), O1), TA_APO(0, e, d0, ip[0], ip[1], MT(2), O1));
+        case F_PPO: lb = TA_PPO_Lookback(ip[0], ip[1], MT(2)); R(TA_S_PPO(0, e, s0, ip[0], ip[1], MT(2), O1), TA_PPO(0, e, d0, ip[0], ip[1], MT(2), O1));
+        case F_TRIX: lb = TA_TRIX_Lookback(ip[0]); R(TA_S_TRIX(0, e, s0, ip[0], O1), TA_TRIX(0, e, d0, ip[0], O1));
+        case F_COPPOCK: lb = TA_COPPOCK_Lookback(ip[0], ip[1], ip[2]); R(TA_S_COPPOCK(0, e, s0, ip[0], ip[1], ip[2], O1), TA_COPPOCK(0, e, d0, ip[0], ip[1], ip[2], O1));
+        case F_ERI: lb = TA_ERI_Lookback(ip[0]); R(TA_S_ERI(0, e, s0, s1, s2, ip[0], O2), TA_ERI(0, e, d0, d1, d2, ip[0], O2));
+        case F_DOSC: lb = TA_DOSC_Lookback(ip[0], ip[1], ip[2], ip[3]); R(TA_S_DOSC(0, e, s0, ip[0], ip[1], ip[2], ip[3], O1), TA_DOSC(0, e, d0, ip[0], ip[1], ip[2], ip[3], O1));
+        case F_FISHER: lb = TA_FISHER_Lookback(ip[0]); R(TA_S_FISHER(0, e, s0, s1, ip[0], O2), TA_FISHER(0, e, d0, d1, ip[0], O2));
+        case F_PSO: lb = TA_PSO_Lookback(ip[0], ip[1]); R(TA_S_PSO(0, e, s0, s1, s2, ip[0], ip[1], O1), TA_PSO(0, e, d0, d1, d2, ip[0], ip[1], O1));
+        case F_SMI: lb = TA_SMI_Lookback(ip[0], ip[1], ip[2], ip[3]); R(TA_S_SMI(0, e, s0, s1, s2, ip[0], ip[1], ip[2], ip[3], O2), TA_SMI(0, e, d0, d1, d2, ip[0], ip[1], ip[2], ip[3], O2));
+        case F_TSI: lb = TA_TSI_Lookback(ip[0], ip[1]); R(TA_S_TSI(0, e, s0, ip[0], ip[1], O1), TA_TSI(0, e, d0, ip[0], ip[1], O1));
+        case F_WAVETREND: lb = TA_WAVETREND_Lookback(ip[0], ip[1], ip[2]); R(TA_S_WAVETREND(0, e, s0, s1, s2, ip[0], ip[1], ip[2], O2), TA_WAVETREND(0, e, d0, d1, d2, ip[0], ip[1], ip[2], O2));
+        // momentum wave, composites 2
+        case F_KST: lb = TA_KST_Lookback(ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], xp[0], xp[1], xp[2]);
+            R(TA_S_KST(0, e, s0, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], xp[0], xp[1], xp[2], O2), TA_KST(0, e, d0, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], xp[0], xp[1], xp[2], O2));
+        case F_KSTEXT: lb = TA_KSTEXT_Lookback(ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], xp[0], xp[1], xp[2], MT_X(3), MT_X(4));
+            R(TA_S_KSTEXT(0, e, s0, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], xp[0], xp[1], xp[2], MT_X(3), MT_X(4), O2), TA_KSTEXT(0, e, d0, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], xp[0], xp[1], xp[2], MT_X(3), MT_X(4), O2));
+        case F_KDJ: lb = TA_KDJ_Lookback(ip[0], ip[1], MT(2), ip[3], MT(4));
+            R(TA_S_KDJ(0, e, s0, s1, s2, ip[0], ip[1], MT(2), ip[3], MT(4), O3), TA_KDJ(0, e, d0, d1, d2, ip[0], ip[1], MT(2), ip[3], MT(4), O3));
+        case F_STOCHRSI: lb = TA_STOCHRSI_Lookback(ip[0], ip[1], ip[2], MT(3));
+            R(TA_S_STOCHRSI(0, e, s0, ip[0], ip[1], ip[2], MT(3), O2), TA_STOCHRSI(0, e, d0, ip[0], ip[1], ip[2], MT(3), O2));
+        case F_CRSI: lb = TA_CRSI_Lookback(ip[0], ip[1], ip[2]); R(TA_S_CRSI(0, e, s0, ip[0], ip[1], ip[2], O1), TA_CRSI(0, e, d0, ip[0], ip[1], ip[2], O1));
+        case F_STC: lb = TA_STC_Lookback(ip[0], ip[1], ip[2]); R(TA_S_STC(0, e, s0, ip[0], ip[1], ip[2], O1), TA_STC(0, e, d0, ip[0], ip[1], ip[2], O1));
+        case F_SQZMOM: lb = TA_SQZMOM_Lookback(ip[0], dp[0], ip[1], dp[1], dp[2], dp[3]);
+            R(TA_S_SQZMOM(0, e, s0, s1, s2, ip[0], dp[0], ip[1], dp[1], dp[2], dp[3], O1, ib[0]), TA_SQZMOM(0, e, d0, d1, d2, ip[0], dp[0], ip[1], dp[1], dp[2], dp[3], O1, ib[0]));
         default: break;
         }
-        (void)d1; (void)d2; (void)d3; (void)s1; (void)s2; (void)s3;
+        (void)d1; (void)d2; (void)d3; (void)s1; (void)s2; (void)s3; (void)xp;
         /* integer outputs travel as doubles: SUPERTREND trend, ZIGZAG trend and pivot index */
         if (ret == TA_SUCCESS && f == F_SUPERTREND) for (int i = 0; i < nb; i++) outs[1][i] = ib[0][i];
         if (ret == TA_SUCCESS && f == F_ZIGZAG) for (int i = 0; i < nb; i++) { outs[1][i] = ib[0][i]; outs[2][i] = ib[1][i]; }
+        if (ret == TA_SUCCESS && f == F_SQZMOM) for (int i = 0; i < nb; i++) outs[1][i] = (double)ib[0][i];
+        if (ret == TA_SUCCESS && f == F_FRACTAL) for (int q = 0; q < 2; q++) for (int i = 0; i < nb; i++) outs[q][i] = (double)ib[q][i];
         if (ret == TA_SUCCESS && f == F_HT_TRENDMODE) for (int j = 0; j < nb; j++) outs[0][j] = (double)ib[0][j];
         if (ret == TA_SUCCESS && (f == F_MAXINDEX || f == F_MININDEX || f == F_MINMAXINDEX))
             for (int i = 0; i < no; i++) for (int j = 0; j < nb; j++) outs[i][j] = (double)ib[i][j];

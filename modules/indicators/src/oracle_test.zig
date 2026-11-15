@@ -15,7 +15,8 @@ const testing = std.testing;
 const max_n = 128;
 const n_overlap = 44; // functions 0..43: seed set and overlap studies
 const n_vs_end = 94; // functions 44..93: the volume / statistic waves; the cycle wave follows
-const n_func = n_vs_end + 25;
+const n_cy_end = n_vs_end + 25; // functions 94..118: the cycle wave; the momentum wave follows
+const n_func = n_cy_end + 57;
 
 fn mt(x: i32) ind.MaType {
     return @fromBackingInt(@intCast(@as(u8, @intCast(x))));
@@ -305,6 +306,182 @@ fn runCy(comptime T: type, v: vecs.Vec, c: []const T, o: *[4][]T) !usize {
     };
 }
 
+/// The momentum wave (ids after the 119 earlier functions), same order as the `Func` enum of tools/interop.zig.
+const Fm = enum(u8) {
+    adx = n_cy_end,
+    adxr,
+    dx,
+    minus_di,
+    plus_di,
+    minus_dm,
+    plus_dm,
+    aroon,
+    aroonosc,
+    mom,
+    roc,
+    rocp,
+    rocr,
+    rocr100,
+    bop,
+    ibs,
+    qstick,
+    wad,
+    asi,
+    si,
+    imi,
+    ao,
+    ac,
+    dpo,
+    er,
+    fosc,
+    cti,
+    vhf,
+    willr,
+    fractal,
+    cci,
+    chop,
+    choptr,
+    vortex,
+    mfi,
+    ultosc,
+    cmo,
+    cmou,
+    cg,
+    apo,
+    ppo,
+    trix,
+    coppock,
+    eri,
+    dosc,
+    fisher,
+    pso,
+    smi,
+    tsi,
+    wavetrend,
+    kst,
+    kstext,
+    kdj,
+    stochrsi,
+    crsi,
+    stc,
+    sqzmom,
+};
+
+/// The recorded input series of a function: letters o h l c v.
+fn seriesMo(f: Fm) []const u8 {
+    return switch (f) {
+        .adx, .adxr, .dx, .minus_di, .plus_di, .ibs, .wad, .willr, .cci, .chop, .choptr, .vortex, .ultosc, .eri, .pso, .smi, .wavetrend, .kdj, .sqzmom => "hlc",
+        .minus_dm, .plus_dm, .aroon, .aroonosc, .ao, .ac, .fractal, .fisher => "hl",
+        .bop, .asi, .si => "ohlc",
+        .qstick, .imi => "oc",
+        .mfi => "hlcv",
+        else => "c",
+    };
+}
+fn letterOf(ch: u8) usize {
+    return switch (ch) {
+        'o' => 0,
+        'h' => 1,
+        'l' => 2,
+        'c' => 3,
+        else => 4,
+    };
+}
+fn runMo(comptime T: type, f: Fm, v: vecs.Vec, s: [5][]const T, o: *[4][]T) !usize {
+    const ip = v.ip;
+    const xp = v.xp;
+    const un: ind.Unstable = switch (v.ukind) {
+        0 => .{ .bars = v.ubars },
+        1 => .auto4,
+        else => .auto8,
+    };
+    const dp0: f64 = @bitCast(v.dp[0]);
+    const dp1: f64 = @bitCast(v.dp[1]);
+    const dp2: f64 = @bitCast(v.dp[2]);
+    const dp3: f64 = @bitCast(v.dp[3]);
+    const op = s[0];
+    const h = s[1];
+    const l = s[2];
+    const c = s[3];
+    const vol = s[4];
+    const a = testing.allocator;
+    return switch (f) {
+        .adx => ind.adx(T, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .adxr => ind.adxr(T, a, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .dx => ind.dx(T, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .minus_di => ind.minusDi(T, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .plus_di => ind.plusDi(T, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .minus_dm => ind.minusDm(T, h, l, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .plus_dm => ind.plusDm(T, h, l, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .aroon => ind.aroon(T, h, l, o[0], o[1], .{ .period = us(ip[0]) }),
+        .aroonosc => ind.aroonosc(T, h, l, o[0], .{ .period = us(ip[0]) }),
+        .mom => ind.mom(T, c, o[0], .{ .period = us(ip[0]) }),
+        .roc => ind.roc(T, c, o[0], .{ .period = us(ip[0]) }),
+        .rocp => ind.rocp(T, c, o[0], .{ .period = us(ip[0]) }),
+        .rocr => ind.rocr(T, c, o[0], .{ .period = us(ip[0]) }),
+        .rocr100 => ind.rocr100(T, c, o[0], .{ .period = us(ip[0]) }),
+        .bop => ind.bop(T, op, h, l, c, o[0]),
+        .ibs => ind.ibs(T, h, l, c, o[0]),
+        .qstick => ind.qstick(T, op, c, o[0], .{ .period = us(ip[0]) }),
+        .wad => ind.wad(T, h, l, c, o[0]),
+        .asi => ind.asi(T, op, h, l, c, o[0], .{ .limit_move = dp0 }),
+        .si => ind.si(T, op, h, l, c, o[0], .{ .limit_move = dp0 }),
+        .imi => ind.imi(T, op, c, o[0], .{ .period = us(ip[0]) }),
+        .ao => ind.ao(T, h, l, o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]) }),
+        .ac => ind.ac(T, a, h, l, o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]), .signal = us(ip[2]) }),
+        .dpo => ind.dpo(T, c, o[0], .{ .period = us(ip[0]) }),
+        .er => ind.er(T, c, o[0], .{ .period = us(ip[0]) }),
+        .fosc => ind.fosc(T, c, o[0], .{ .period = us(ip[0]) }),
+        .cti => ind.cti(T, c, o[0], .{ .period = us(ip[0]) }),
+        .vhf => ind.vhf(T, c, o[0], .{ .period = us(ip[0]) }),
+        .willr => ind.willr(T, h, l, c, o[0], .{ .period = us(ip[0]) }),
+        .fractal => blk: {
+            var qa: [max_n]i8 = undefined;
+            var qb: [max_n]i8 = undefined;
+            const n = h.len;
+            const lb = try ind.fractal(T, a, h, l, qa[0..n], qb[0..n], .{ .left = us(ip[0]), .right = us(ip[1]) });
+            for (0..n) |i| {
+                o[0][i] = if (i < lb) std.math.nan(T) else @floatFromInt(qa[i]);
+                o[1][i] = if (i < lb) std.math.nan(T) else @floatFromInt(qb[i]);
+            }
+            break :blk lb;
+        },
+        .cci => ind.cci(T, h, l, c, o[0], .{ .period = us(ip[0]) }),
+        .chop => ind.chop(T, h, l, c, o[0], .{ .period = us(ip[0]) }),
+        .choptr => ind.choptr(T, h, l, c, o[0], .{ .period = us(ip[0]) }),
+        .vortex => ind.vortex(T, h, l, c, o[0], o[1], .{ .period = us(ip[0]) }),
+        .mfi => ind.mfi(T, h, l, c, vol, o[0], .{ .period = us(ip[0]) }),
+        .ultosc => ind.ultosc(T, h, l, c, o[0], .{ .period1 = us(ip[0]), .period2 = us(ip[1]), .period3 = us(ip[2]) }),
+        .cmo => ind.cmo(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .cmou => ind.cmou(T, c, o[0], .{ .period = us(ip[0]) }),
+        .cg => ind.cg(T, c, o[0], .{ .period = us(ip[0]) }),
+        .apo => ind.apo(T, c, o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]), .kind = mt(ip[2]), .unstable = un }),
+        .ppo => ind.ppo(T, c, o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]), .kind = mt(ip[2]), .unstable = un }),
+        .trix => ind.trix(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .coppock => ind.coppock(T, c, o[0], .{ .wma = us(ip[0]), .roc1 = us(ip[1]), .roc2 = us(ip[2]) }),
+        .eri => ind.eri(T, h, l, c, o[0], o[1], .{ .period = us(ip[0]), .unstable = un }),
+        .dosc => ind.dosc(T, a, c, o[0], .{ .period = us(ip[0]), .first = us(ip[1]), .second = us(ip[2]), .signal = us(ip[3]), .unstable = un }),
+        .fisher => ind.fisher(T, h, l, o[0], o[1], .{ .period = us(ip[0]), .unstable = un }),
+        .pso => ind.pso(T, h, l, c, o[0], .{ .fastk = us(ip[0]), .ema = us(ip[1]), .unstable = un }),
+        .smi => ind.smi(T, h, l, c, o[0], o[1], .{ .period = us(ip[0]), .fast = us(ip[1]), .slow = us(ip[2]), .signal = us(ip[3]), .unstable = un }),
+        .tsi => ind.tsi(T, c, o[0], .{ .first = us(ip[0]), .second = us(ip[1]), .unstable = un }),
+        .wavetrend => ind.wavetrend(T, a, h, l, c, o[0], o[1], .{ .channel = us(ip[0]), .average = us(ip[1]), .signal = us(ip[2]), .unstable = un }),
+        .kst => ind.kst(T, a, c, o[0], o[1], .{ .roc1 = us(ip[0]), .roc2 = us(ip[1]), .roc3 = us(ip[2]), .roc4 = us(ip[3]), .sma1 = us(ip[4]), .sma2 = us(ip[5]), .sma3 = us(xp[0]), .sma4 = us(xp[1]), .signal = us(xp[2]) }),
+        .kstext => ind.kstext(T, a, c, o[0], o[1], .{ .roc1 = us(ip[0]), .roc2 = us(ip[1]), .roc3 = us(ip[2]), .roc4 = us(ip[3]), .ma1 = us(ip[4]), .ma2 = us(ip[5]), .ma3 = us(xp[0]), .ma4 = us(xp[1]), .signal = us(xp[2]), .roc_ma = mt(xp[3]), .signal_ma = mt(xp[4]) }),
+        .kdj => ind.kdj(T, a, h, l, c, o[0], o[1], o[2], .{ .fastk = us(ip[0]), .slowk = us(ip[1]), .slowk_ma = mt(ip[2]), .slowd = us(ip[3]), .slowd_ma = mt(ip[4]), .unstable = un }),
+        .stochrsi => ind.stochrsi(T, a, c, o[0], o[1], .{ .period = us(ip[0]), .fastk = us(ip[1]), .fastd = us(ip[2]), .fastd_ma = mt(ip[3]), .unstable = un }),
+        .crsi => ind.crsi(T, a, c, o[0], .{ .period = us(ip[0]), .streak = us(ip[1]), .rank = us(ip[2]), .unstable = un }),
+        .stc => ind.stc(T, a, c, o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]), .cycle = us(ip[2]), .unstable = un }),
+        .sqzmom => blk: {
+            var q: [max_n]i8 = undefined;
+            const n = h.len;
+            const lb = try ind.sqzmom(T, a, h, l, c, o[0], q[0..n], .{ .bb_period = us(ip[0]), .kc_period = us(ip[1]), .nb_dev = dp0, .factor_wide = dp1, .factor_normal = dp2, .factor_narrow = dp3 });
+            for (0..n) |i| o[1][i] = if (i < lb) std.math.nan(T) else @floatFromInt(q[i]);
+            break :blk lb;
+        },
+    };
+}
+
 fn isIndexFunc(func: u8) bool {
     return func == @backingInt(Fv.maxindex) or func == @backingInt(Fv.minindex) or func == @backingInt(Fv.minmaxindex);
 }
@@ -353,6 +530,18 @@ fn replay(comptime T: type, v: vecs.Vec) !void {
             else => au = ib[1][0..n],
         }
         lb = try run(T, v, h, l, c, au, &o);
+    } else if (v.func >= n_cy_end) {
+        const f: Fm = @fromBackingInt(@intCast(v.func));
+        const letters = seriesMo(f);
+        try testing.expectEqual(letters.len, v.ins.len);
+        var s: [5][]const T = undefined;
+        for (&s) |*x| x.* = ib[0][0..n];
+        for (letters, v.ins) |ch, col| {
+            const q = letterOf(ch);
+            for (col, 0..) |bits, i| ib[q][i] = @floatCast(@as(f64, @bitCast(bits)));
+            s[q] = ib[q][0..n];
+        }
+        lb = try runMo(T, f, v, s, &o);
     } else if (v.func >= n_vs_end) {
         lb = try runCy(T, v, ib[0][0..n], &o);
     } else {
@@ -405,6 +594,9 @@ test "frozen TA-Lib vectors: every function, f64 and f32, unstable levels" {
     for (vecs.ulp_bound, 0..) |b, k| {
         const libm_fn = k >= @backingInt(Fc.acos) and k <= @backingInt(Fc.tanh) and k != @backingInt(Fc.ceil) and k != @backingInt(Fc.cos) and k != @backingInt(Fc.exp) and k != @backingInt(Fc.floor) and k != @backingInt(Fc.ln) and k != @backingInt(Fc.log10) and k != @backingInt(Fc.sin) and k != @backingInt(Fc.sqrt) and k != @backingInt(Fc.tan);
         if (k == @backingInt(Fv.linearreg_angle) or libm_fn) {
+            try testing.expectEqual(@as(u64, 2), b);
+        } else if (k == @backingInt(Fm.pso)) {
+            // tanh(expm1): glibc's against ours, measured 16 of 20930 values, at most 2 ULP
             try testing.expectEqual(@as(u64, 2), b);
         } else try testing.expectEqual(@as(u64, 0), b);
     }

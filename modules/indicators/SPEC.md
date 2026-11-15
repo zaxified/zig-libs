@@ -342,3 +342,51 @@ ACOS / ASIN / ATAN / COSH / SINH / TANH by at most 1 ULP (2 for SINH / TANH). `m
 - In-place calls (`out` aliasing `in`): TA-Lib allows them, the batch functions here do not.
 - Streaming for the windowed indicators with a ring that is shared between components of one composite
   (BBANDS keeps two rings of the same window for SMA).
+
+## Momentum group (wave ind-momentum)
+
+57 TA-Lib 0.8.3 momentum functions, each a core in the `vs_kit.zig` contract (input struct, `step(src, in)`,
+batch driver, streaming type with `update` / `peek` / `value`): ADX ADXR DX PLUS_DI MINUS_DI PLUS_DM MINUS_DM
+AROON AROONOSC MOM ROC ROCP ROCR ROCR100 BOP IBS QSTICK WAD ASI SI IMI AO AC DPO ER FOSC CTI VHF WILLR
+FRACTAL CCI CHOP CHOPTR VORTEX MFI ULTOSC CMO CMOU CG APO PPO TRIX COPPOCK ERI DOSC FISHER PSO SMI TSI
+WAVETREND KST KSTEXT KDJ STOCHRSI CRSI STC SQZMOM. Files: `mom_wilder.zig`, `mom_simple.zig`, `mom_cg.zig`,
+`mom_comp.zig`, `mom_comp2.zig`; plumbing `mom_util.zig` (scratch rings, `peek` for cores that own them) and
+`vs_kit.zig` (identical to the copy of the volume / statistic wave).
+
+API points beyond the seed: multi-input streams take a struct (`update(.{ .high, .low, .close })`), single-series
+ones `update(x)`; multi-output functions take one slice per output in TA-Lib's order (`aroon`: down, up;
+`vortex`: plus, minus; `kst`: kst, signal); parameterless functions (`bop`, `ibs`, `wad`) have
+`<name>Lookback()`; functions that keep derived-series history in scratch (ADXR, AC, DOSC, WAVETREND, KST,
+KSTEXT, STOCHRSI, CRSI, STC, SQZMOM) and the integer-output ones (FRACTAL, SQZMOM) take `gpa` first after `T`;
+FRACTAL / SQZMOM write `[]i8` (100 / 0, resp. -1..3) with 0 in the lead. A single `unstable` option drives every
+unstable id of one function (TA-Lib's process-global setting applies to all at once): the EMA / RSI stages
+and, for FISHER and STC, their own id with its AUTO constants (FISHER 40 / 63, STC `(5*10+1)/2 + 3(slow+1)` /
+`(5*19+1)/2 + 3(slow+1)`).
+
+TA-Lib quirks found in the C (all kept, each pinned by the oracle):
+
+- **ADX / ADXR / DX** use the two-stage `KEEP_IF_GT` selection and `dm -= dm/p; dm += dm1`; **±DI / ±DM** use
+  `max(decayed, decayed + dm1)` (a negative dm1 is dropped) and a separate period-1 branch (DI = dm / TR without the
+  factor 100). DX repeats its previous output when the true range is 0 or the DIs sum to ~0 (0.0 for the first
+  one); the unstable AUTO constants differ per id (ADX 16p / 25p, DX 10p / 19p, DM `(10(2p-1)+1)/2`).
+- **AO / AC / DPO / VORTEX / ULTOSC / KST / SQZMOM**: running sums start at the first window bar of the first
+  output, not at bar 0 (the doubles differ in the last bits otherwise); a core is fed `largest lookback - own
+  lookback` bars late, as for the seed composites.
+- **CCI** sums its window in slot order of TA-Lib's circular buffer, not chronologically; **ER, MFI, ULTOSC,
+  VORTEX, CMOU** zero their running sums after a window of exactly flat bars (`nullRun`) so no residue is left;
+  **FOSC, CTI, CG** re-anchor their regression sums (32 periods, or on cancellation); **CG** keeps the window
+  sums as 2 or 3 exactly-added integer limbs and re-derives the scale when a value no longer fits.
+- **CRSI** needs PERCENTRANK, **SQZMOM** needs STDDEV / MIDPRICE / LINEARREG: implemented privately (`CRSI.step`,
+  `LinReg` in `mom_comp2.zig`, `bands.VarCore`), to be merged with the public versions of the statistic wave.
+- **APO / PPO** default to EMA (not SMA); PPO answers 0 when the slow MA is ~0 and, for windowed MA types, when the
+  whole slow window is exactly zero. **KDJ** defaults to RMA (type 13): `error.Unsupported` until RMA is wired
+  into `MaCore`.
+- **PSO**: `tanh` is fdlibm's (`expm1`-based) as in glibc; Zig's `std.math.tanh` is musl's and differs by an ULP.
+  The remaining 16 of 20930 values differ by at most 2 ULP (glibc's `expm1` against `std.math.expm1`): the
+  ULP bound of PSO is 2, every other function is bitwise.
+- ASI / SI refuse a limit move outside `[1e-8, 3e37]` (NaN included).
+
+Anchoring: the live oracle covers all 57 (grid in `tools/interop.zig`: defaults, edges, swaps, SMA / EMA / WMA /
+DISABLED where an MA type is a parameter, out-of-range values, unstable 0 / 3 / AUTO4 / AUTO8, lengths up to 5000,
+f64 and f32), frozen replay in `src/mom_oracle_test.zig`. Not covered: MA types after WMA (APO, PPO, KST EXT, KDJ,
+STOCHRSI: the grid is widened after the overlap wave is merged), NaN input, other toolchains.
