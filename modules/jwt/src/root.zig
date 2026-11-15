@@ -965,7 +965,7 @@ fn verifyMlDsa(
 
 /// Token issuance, the inverse of `parseAndVerify` (`encode.zig`): a
 /// `SigningKey` whose variant fixes `alg`, and `encode`/`encodeJson` building
-/// the compact JWS. Wanted by qap (service tokens, and every test that needs
+/// the compact JWS. Wanted by the web-server consumer (service tokens, and every test that needs
 /// a token), 2026-09-22.
 pub const SigningKey = encode_mod.SigningKey;
 /// A private key loaded from PEM (`PrivateKey.fromPem`), for `SigningKey`.
@@ -981,7 +981,7 @@ const burn = @import("burn.zig");
 /// A bounded, thread-safe cache of tokens that verified, keyed by a MAC of
 /// the exact token bytes, the claim policy and the key set's `id`, and good
 /// until the token's `exp` (`cache.zig`). Opt-in: nothing else in the module
-/// uses it. Wanted by qap, where ES256/RS256 verification capped a JWT API at
+/// uses it. Wanted by the web-server consumer, where ES256/RS256 verification capped a JWT API at
 /// a few thousand requests per second per core.
 pub const VerifiedCache = cache_mod.VerifiedCache;
 pub const VerifiedCacheConfig = cache_mod.Config;
@@ -1945,7 +1945,7 @@ pub const RefreshError = error{
 ///   clock was stepped back: NTP, a VM restored from a snapshot) counts as
 ///   the interval having passed. Otherwise a step back of Δ froze both the
 ///   TTL re-fetch and the unknown-`kid` refresh for Δ, and a key rotated
-///   inside it was a 401 for Δ (found from qap, research register H6,
+///   inside it was a 401 for Δ (found from the web-server consumer, research register H6,
 ///   2026-09-29). A step FORWARD still expires the TTL early (one extra
 ///   fetch); `ProviderOptions.interval_clock = .boot` measures the
 ///   intervals on a clock that never steps, and leaves `now_s` to the
@@ -2841,7 +2841,7 @@ pub const Guard = struct {
         /// runs on several threads, `lock` below MUST be a real mutex.
         provider: ?*Provider = null,
         /// A static key set instead of a `Provider` (2026-09-28, requested
-        /// by qap): a resource server whose keys come from its own
+        /// by the web-server consumer): a resource server whose keys come from its own
         /// configuration gets the same Bearer extraction, `at+jwt` check,
         /// scope policy and RFC 6750 challenges without a fake fetcher.
         /// Must outlive every request. `claim_opts.issuer` must then be
@@ -6856,7 +6856,7 @@ test "Provider: key rotation refreshes once, rate limit stops a bogus-kid flood,
 }
 
 test "Provider: a clock stepped back does not freeze the TTL re-fetch or the rotation refresh" {
-    // qap research register H6: after a step back of 1 h, `now_s -
+    // the web-server consumer research register H6: after a step back of 1 h, `now_s -
     // fetched_at_s` stayed negative for the hour, so neither refresh could
     // fire and a token signed with a freshly rotated key was NoMatchingKey.
     const gpa = testing.allocator;

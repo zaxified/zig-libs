@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Tests only, from a second whole-module mutation run over the current source (after the `encodeJson` wrong-length-free fix): mutant schemata over the production code of `root.zig`, `cache.zig`, `ed25519.zig`, `encode.zig`, `pem.zig` and `burn.zig` (conditions, comparisons, limits, arithmetic, error mappings, switch arms, struct-field values, dropped calls/wipes/burns, `burn.run` frames). 1436 mutants after the compile-time/type-invalid variants were dropped (ReleaseSafe run plus a ReleaseFast run with STACKPROBE for the wipe and burn mutants, strict verdict): 1344 killed, 67 equivalent, 25 unobservable (wipes and burns with no probe), 0 undecided; no defect. 14 new tests close the survivors: the dots of a compact token are counted exactly (an adjacent dot is never skipped); only status 200 is a key document (100..199, 2xx, 3xx are `HttpStatus`); an RSA `modulus_len` above the real one is `InvalidKey`; the `Bearer` scheme needs a space (a control character or `!` is no separator) and a one-byte token is an invalid, not a missing, credential; a key set with id 1 caches and re-inserting a token reuses its slot; the policy digest stays length-delimited when a policy string embeds a field header; `Guard.challengeFor(OutOfMemory)` has no challenge; `AuthContext.hasScope`; a static-set `Guard` with `issuer = .any` accepts any issuer; SPKI ML-DSA-44/65/87 public keys read as their own parameter set; an RSA private key signs only RS*/PS*; a 2047-bit RSA key is below the signing floor (release lanes); `Provider.refresh` by issuer under every allocation failure is `OutOfMemory` or has its metadata and keys.
 - **2026-11-12** — **Fix (OOM path):** `encodeJson` (and `encode`, which calls it) no longer returns a token shorter than its allocation when the final shrinking `realloc` fails — the documented `gpa.free(token)` then freed with the wrong length (a panic under std's safe allocators, UB elsewhere). The token is now shrunk in place or copied into an exact block; if that copy fails the call is `error.OutOfMemory`. Test: every allocation index failing once with every resize refused, each success freed (red before the fix).
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Tests only, from a whole-module mutation run on the current source (mutant schemata over the production code of `root.zig`, `cache.zig`, `ed25519.zig`, `encode.zig`, `pem.zig`; one ReleaseSafe and one ReleaseFast build, the second for the wipe/burn mutants under STACKPROBE; strict verdict): 873 mutants, 816 killed, 35 equivalent, 22 unobservable (wipes and burns with no probe: PEM loading, in-frame wipes under `burn.run`), 0 undecided; no defect in the verification, claim or key-handling logic. 10 new tests close the survivors: an OKP `x` of 31 or 33 bytes is `invalid_key` (not sliced to 32); a JWK `use` other than `sig`/`enc` is `.other`; no `insufficient_scope` challenge unless scopes are required (`ResourceServer`, `Guard`); a 401 is `text/plain`; a failed `at+jwt` check is `invalid_token`; `resourceInvalidReason` for every error; `mapFetchError`; an allocation-failure sweep (std's failing allocator and a never-grow one) over `parse`, `parseJwks`, `discover`, `Provider.refresh`, `parseTokenResponse`, `parseOAuthError` and both request builders (OutOfMemory exactly, no leak); `VerifiedCache`: a set without identity evicts nothing from a full bucket, only a dot may follow the signing input, the policy strings are length-delimited; `encodeJson`: a non-object payload of any first byte is `InvalidClaims`, and OOM on the heap-header path is `OutOfMemory`.
@@ -96,7 +97,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   fetched_at_s` stayed negative for Δ: no TTL re-fetch, no unknown-`kid` refresh, and a key
   the issuer rotated inside that window was `NoMatchingKey` (a 401) for Δ. A `now_s` before a
   recorded mark now counts as the interval having passed; the refresh re-bases the mark.
-  Found from qap (research register H6), which had the same bug in its own refresher.
+  Found from the web-server consumer (research register H6), which had the same bug in its own refresher.
 
 - **2026-09-28** — **Verified-token cache** (opt-in): `VerifiedCache(Value)` remembers a token
   that verified until its `exp`, keyed by a SipHash-2-4-128 MAC (random per-cache key from
@@ -106,25 +107,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   halves. New `JwkSet.id` (process-unique, stamped by `parseJwks`/`fetchJwks`; 0 on a hand-built
   set, which is never cached) is what invalidates entries when a set is replaced. Additive:
   `validateClaims` behaves as before (its time checks moved into a shared helper). Wanted by
-  qap, whose ES256/RS256 verification capped a JWT API at a few thousand requests/s per core.
+  the web-server consumer, whose ES256/RS256 verification capped a JWT API at a few thousand requests/s per core.
 
 - **2026-09-28** — ⚠ **Plain-HTTP key sources are refused**: `discover`, `fetchJwks` and
   `Provider.refresh` return `error.InsecureKeySource` for an `http://` (or scheme-less) issuer or
   `jwks_uri`, including a `jwks_uri` named by an https discovery document. Opt out with the new
   `discoverWith`/`fetchJwksWith` (`KeySourceOptions.allow_plain_http`) or
   `ProviderOptions.allow_plain_http`. Signatures unchanged; the error sets gain
-  `InsecureKeySource`. Wanted by qap M11.8, which checked the scheme itself.
+  `InsecureKeySource`. Wanted by the web-server consumer M11.8, which checked the scheme itself.
 
 - **2026-09-28** — `Guard` over a static `JwkSet`: `Guard.Options.jwks` as an alternative to
   `provider` (now optional; exactly one must be set, `error.InvalidKeySource` otherwise). The
   guard's `provider` field became `source: Guard.KeySource`. `Guard.InitError` gains
   `InvalidKeySource` and `IssuerNotConfigured` (static set + `issuer = .provider`). Existing
-  `.provider = &p` callers compile unchanged. Wanted by qap.
+  `.provider = &p` callers compile unchanged. Wanted by the web-server consumer.
 
 - **2026-09-28** — **Token issuance**: `encode` (claims serialized by `std.json`) and `encodeJson`
   (a JSON object verbatim) over a new `SigningKey` (HS256/384/512, ES256, ES384, EdDSA,
   ML-DSA-44/65/87) whose variant fixes `alg`; `EncodeOptions` sets `typ`/`kid`. Short HMAC
-  secrets are refused (RFC 7518 §3.2). Additive. Wanted by qap, whose tests hand-rolled tokens.
+  secrets are refused (RFC 7518 §3.2). Additive. Wanted by the web-server consumer, whose tests hand-rolled tokens.
 
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The `HttpFetcher` body-read cancel test canceled after a fixed
   sleep. It now cancel once the client is inside the socket read under test (`ReadCueIo`, a

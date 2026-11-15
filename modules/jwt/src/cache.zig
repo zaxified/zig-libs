@@ -397,7 +397,7 @@ fn assertPlainData(comptime T: type, comptime what: []const u8) void {
 
 const testing = std.testing;
 
-/// What a resource server derives: an id and scope bits (qap's shape).
+/// What a resource server derives: an id and scope bits (the web-server consumer's shape).
 const TestValue = struct {
     id_buf: [32]u8 = @splat(0),
     id_len: u8 = 0,
