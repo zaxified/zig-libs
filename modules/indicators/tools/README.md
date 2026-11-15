@@ -26,5 +26,9 @@
   measured maximum (`max/colmax`) next to the ULP maximum. TRENDMODE's integer output travels as doubles like SUPERTREND's; the
   Hilbert functions have a 100-bar frozen vector (their first output is bar 32 / 63) and an extra 700-bar run for their AUTO warm-up.
 - Wire format beyond the first six integers: the record carries `xp`, six more integers (KST and KSTEXT take up to eleven); the
-  momentum wave's extra doubles of SQZMOM sit in `dp[2..3]`. One function-id space for all waves (0..175, the `Func` enum is the
-  table); the momentum functions are 119..175 and PSO has a 2 ULP bound (`tanh`, see SPEC).
+  momentum wave's extra doubles of SQZMOM sit in `dp[2..3]`. One function-id space for all waves (0..236, the `Func` enum is the
+  table); the momentum functions are 119..175, the candlestick patterns 176..236, and PSO has a 2 ULP bound (`tanh`, see SPEC). Header byte 3 of a record is the candle-settings preset flag (0 for every other function); when set, the 11-entry settings block follows `xp`.
+- Candlestick patterns (61 functions, ids 176..236 after the momentum wave, alphabetical): four series `ohlc`, one integer output compared as a double. `tools/candle_gen.zig` generates the inputs
+  (single-bar shapes and multi-bar motifs, kind 1 = 0.25 price grid for exact ties, kind 2 = scale 1e-9) and the settings presets 1..4 (`TA_SetCandleSettings` through the record's candle-settings block: 11 x
+  range type, averaging period, factor; the shim resets them after each record). `interop-indicators` prints, per pattern, how many compared values had a nonzero TA-Lib answer (a pattern compared only on zeros is not
+  verified; goal >= 20). The frozen vectors hold default settings only (the first records with a nonzero answer, 40 bars, f64 and f32 where found).

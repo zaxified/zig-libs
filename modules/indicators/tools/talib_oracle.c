@@ -10,8 +10,10 @@
  *   talib_oracle <cases.bin> <results.bin>
  *
  * cases.bin   u32 count, then per record (little endian, packed):
- *               u8 func, u8 is_f32, u8 unstable_kind (0 bars, 1 auto4, 2 auto8), u8 0,
+ *               u8 func, u8 is_f32, u8 unstable_kind (0 bars, 1 auto4, 2 auto8), u8 candle_settings,
  *               u32 unstable_bars, u32 n, i32 ip[6], f64 dp[8], i32 xp[6] (ints beyond the first 6: KST, KSTEXT),
+ *               [when candle_settings != 0: 11 x (i32 range type, i32 avg period, f64 factor),
+ *                TA_SetCandleSettings for each, reset to the defaults after the record],
  *               then NIN arrays of n values (f64, or f32 when is_f32)
  * results.bin per record: i32 ret, i32 lookback, i32 outBegIdx, i32 outNBElement,
  *               then NOUT arrays of outNBElement f64 each
@@ -48,7 +50,72 @@ enum { F_SMA, F_EMA, F_WMA, F_MA, F_MACD, F_MACDEXT, F_MACDFIX, F_RSI, F_BBANDS,
        F_MOM, F_ROC, F_ROCP, F_ROCR, F_ROCR100, F_BOP, F_IBS, F_QSTICK, F_WAD, F_ASI, F_SI, F_IMI, F_AO, F_AC, F_DPO, F_ER, F_FOSC, F_CTI, F_VHF, F_WILLR, F_FRACTAL, F_CCI, F_CHOP, F_CHOPTR, F_VORTEX, F_MFI, F_ULTOSC, F_CMO, F_CMOU,
        F_CG, F_APO, F_PPO, F_TRIX, F_COPPOCK, F_ERI, F_DOSC, F_FISHER, F_PSO, F_SMI, F_TSI, F_WAVETREND,
        F_KST, F_KSTEXT, F_KDJ, F_STOCHRSI, F_CRSI, F_STC, F_SQZMOM,
+       /* candlestick patterns: alphabetical, 61 */
+       F_CDL2CROWS,
+       F_CDL3BLACKCROWS,
+       F_CDL3INSIDE,
+       F_CDL3LINESTRIKE,
+       F_CDL3OUTSIDE,
+       F_CDL3STARSINSOUTH,
+       F_CDL3WHITESOLDIERS,
+       F_CDLABANDONEDBABY,
+       F_CDLADVANCEBLOCK,
+       F_CDLBELTHOLD,
+       F_CDLBREAKAWAY,
+       F_CDLCLOSINGMARUBOZU,
+       F_CDLCONCEALBABYSWALL,
+       F_CDLCOUNTERATTACK,
+       F_CDLDARKCLOUDCOVER,
+       F_CDLDOJI,
+       F_CDLDOJISTAR,
+       F_CDLDRAGONFLYDOJI,
+       F_CDLENGULFING,
+       F_CDLEVENINGDOJISTAR,
+       F_CDLEVENINGSTAR,
+       F_CDLGAPSIDESIDEWHITE,
+       F_CDLGRAVESTONEDOJI,
+       F_CDLHAMMER,
+       F_CDLHANGINGMAN,
+       F_CDLHARAMI,
+       F_CDLHARAMICROSS,
+       F_CDLHIGHWAVE,
+       F_CDLHIKKAKE,
+       F_CDLHIKKAKEMOD,
+       F_CDLHOMINGPIGEON,
+       F_CDLIDENTICAL3CROWS,
+       F_CDLINNECK,
+       F_CDLINVERTEDHAMMER,
+       F_CDLKICKING,
+       F_CDLKICKINGBYLENGTH,
+       F_CDLLADDERBOTTOM,
+       F_CDLLONGLEGGEDDOJI,
+       F_CDLLONGLINE,
+       F_CDLMARUBOZU,
+       F_CDLMATCHINGLOW,
+       F_CDLMATHOLD,
+       F_CDLMORNINGDOJISTAR,
+       F_CDLMORNINGSTAR,
+       F_CDLONNECK,
+       F_CDLPIERCING,
+       F_CDLRICKSHAWMAN,
+       F_CDLRISEFALL3METHODS,
+       F_CDLSEPARATINGLINES,
+       F_CDLSHOOTINGSTAR,
+       F_CDLSHORTLINE,
+       F_CDLSPINNINGTOP,
+       F_CDLSTALLEDPATTERN,
+       F_CDLSTICKSANDWICH,
+       F_CDLTAKURI,
+       F_CDLTASUKIGAP,
+       F_CDLTHRUSTING,
+       F_CDLTRISTAR,
+       F_CDLUNIQUE3RIVER,
+       F_CDLUPSIDEGAP2CROWS,
+       F_CDLXSIDEGAP3METHODS,
        F_COUNT };
+
+#define CDL_PLAIN(X) X(CDL2CROWS) X(CDL3BLACKCROWS) X(CDL3INSIDE) X(CDL3LINESTRIKE) X(CDL3OUTSIDE) X(CDL3STARSINSOUTH) X(CDL3WHITESOLDIERS) X(CDLADVANCEBLOCK) X(CDLBELTHOLD) X(CDLBREAKAWAY) X(CDLCLOSINGMARUBOZU) X(CDLCONCEALBABYSWALL) X(CDLCOUNTERATTACK) X(CDLDOJI) X(CDLDOJISTAR) X(CDLDRAGONFLYDOJI) X(CDLENGULFING) X(CDLGAPSIDESIDEWHITE) X(CDLGRAVESTONEDOJI) X(CDLHAMMER) X(CDLHANGINGMAN) X(CDLHARAMI) X(CDLHARAMICROSS) X(CDLHIGHWAVE) X(CDLHIKKAKE) X(CDLHIKKAKEMOD) X(CDLHOMINGPIGEON) X(CDLIDENTICAL3CROWS) X(CDLINNECK) X(CDLINVERTEDHAMMER) X(CDLKICKING) X(CDLKICKINGBYLENGTH) X(CDLLADDERBOTTOM) X(CDLLONGLEGGEDDOJI) X(CDLLONGLINE) X(CDLMARUBOZU) X(CDLMATCHINGLOW) X(CDLONNECK) X(CDLPIERCING) X(CDLRICKSHAWMAN) X(CDLRISEFALL3METHODS) X(CDLSEPARATINGLINES) X(CDLSHOOTINGSTAR) X(CDLSHORTLINE) X(CDLSPINNINGTOP) X(CDLSTALLEDPATTERN) X(CDLSTICKSANDWICH) X(CDLTAKURI) X(CDLTASUKIGAP) X(CDLTHRUSTING) X(CDLTRISTAR) X(CDLUNIQUE3RIVER) X(CDLUPSIDEGAP2CROWS) X(CDLXSIDEGAP3METHODS)
+#define CDL_PEN(X) X(CDLABANDONEDBABY) X(CDLDARKCLOUDCOVER) X(CDLEVENINGDOJISTAR) X(CDLEVENINGSTAR) X(CDLMATHOLD) X(CDLMORNINGDOJISTAR) X(CDLMORNINGSTAR)
 
 static int nin(int f) {
     switch (f) {
@@ -70,6 +137,7 @@ static int nin(int f) {
     case F_MFI: return 4;
     case F_ERI: case F_PSO: case F_SMI: case F_WAVETREND: case F_KDJ: case F_SQZMOM: return 3;
     case F_FISHER: return 2;
+    case F_CDL2CROWS ... F_CDLXSIDEGAP3METHODS: return 4;
     default: return 1;
     }
 }
@@ -107,8 +175,15 @@ int main(int argc, char **argv) {
         int32_t ip[6], xp[6];
         double dp[8];
         if (!rd(in, hdr, 4) || !rd(in, &ubars, 4) || !rd(in, &n, 4) || !rd(in, ip, sizeof ip) || !rd(in, dp, sizeof dp) || !rd(in, xp, sizeof xp)) return 2;
-        int f = hdr[0], is32 = hdr[1];
+        int f = hdr[0], is32 = hdr[1], cset = hdr[3];
         if (f >= F_COUNT) return 2;
+        if (cset) { /* candle settings: 11 x (i32 range, i32 avg period, f64 factor) follow the parameters */
+            for (int k = 0; k < 11; k++) {
+                int32_t rt, ap; double fc;
+                if (!rd(in, &rt, 4) || !rd(in, &ap, 4) || !rd(in, &fc, 8)) return 2;
+                if (TA_SetCandleSettings((TA_CandleSettingType)k, (TA_RangeType)rt, ap, fc) != TA_SUCCESS) return 2;
+            }
+        }
         int ni = nin(f), no = nout(f);
         size_t esz = is32 ? 4 : 8;
         void *ins[5] = {0, 0, 0, 0, 0};
@@ -339,8 +414,13 @@ int main(int argc, char **argv) {
         case F_STC: lb = TA_STC_Lookback(ip[0], ip[1], ip[2]); R(TA_S_STC(0, e, s0, ip[0], ip[1], ip[2], O1), TA_STC(0, e, d0, ip[0], ip[1], ip[2], O1));
         case F_SQZMOM: lb = TA_SQZMOM_Lookback(ip[0], dp[0], ip[1], dp[1], dp[2], dp[3]);
             R(TA_S_SQZMOM(0, e, s0, s1, s2, ip[0], dp[0], ip[1], dp[1], dp[2], dp[3], O1, ib[0]), TA_SQZMOM(0, e, d0, d1, d2, ip[0], dp[0], ip[1], dp[1], dp[2], dp[3], O1, ib[0]));
+#define CDLC(N) case F_##N: lb = TA_##N##_Lookback(); R(TA_S_##N(0, e, s0, s1, s2, s3, OI1), TA_##N(0, e, d0, d1, d2, d3, OI1));
+#define CDLP(N) case F_##N: lb = TA_##N##_Lookback(dp[0]); R(TA_S_##N(0, e, s0, s1, s2, s3, dp[0], OI1), TA_##N(0, e, d0, d1, d2, d3, dp[0], OI1));
+        CDL_PLAIN(CDLC)
+        CDL_PEN(CDLP)
         default: break;
         }
+        if (cset) TA_RestoreCandleDefaultSettings(TA_AllCandleSettings);
         (void)d1; (void)d2; (void)d3; (void)s1; (void)s2; (void)s3; (void)xp;
         /* integer outputs travel as doubles: SUPERTREND trend, ZIGZAG trend and pivot index */
         if (ret == TA_SUCCESS && f == F_SUPERTREND) for (int i = 0; i < nb; i++) outs[1][i] = ib[0][i];
@@ -350,6 +430,7 @@ int main(int argc, char **argv) {
         if (ret == TA_SUCCESS && f == F_HT_TRENDMODE) for (int j = 0; j < nb; j++) outs[0][j] = (double)ib[0][j];
         if (ret == TA_SUCCESS && (f == F_MAXINDEX || f == F_MININDEX || f == F_MINMAXINDEX))
             for (int i = 0; i < no; i++) for (int j = 0; j < nb; j++) outs[i][j] = (double)ib[i][j];
+        if (ret == TA_SUCCESS && f >= F_CDL2CROWS && f <= F_CDLXSIDEGAP3METHODS) for (int j = 0; j < nb; j++) outs[0][j] = (double)ib[0][j];
         int32_t head[4] = { ret, lb, beg, nb };
         fwrite(head, 4, 4, out);
         if (ret == TA_SUCCESS) for (int i = 0; i < no; i++) fwrite(outs[i], 8, (size_t)nb, out);

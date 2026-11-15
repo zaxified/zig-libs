@@ -33,6 +33,7 @@
 
 const std = @import("std");
 const ind = @import("indicators");
+const candle_gen = @import("candle_gen.zig");
 
 const work_dir = ".zig-cache/interop-indicators";
 const c_source = "modules/indicators/tools/talib_oracle.c";
@@ -223,24 +224,92 @@ const Func = enum(u8) {
     crsi,
     stc,
     sqzmom,
+    // candlestick patterns (alphabetical, same as `ind.candles.names`)
+    cdl2crows,
+    cdl3blackcrows,
+    cdl3inside,
+    cdl3linestrike,
+    cdl3outside,
+    cdl3starsinsouth,
+    cdl3whitesoldiers,
+    cdlabandonedbaby,
+    cdladvanceblock,
+    cdlbelthold,
+    cdlbreakaway,
+    cdlclosingmarubozu,
+    cdlconcealbabyswall,
+    cdlcounterattack,
+    cdldarkcloudcover,
+    cdldoji,
+    cdldojistar,
+    cdldragonflydoji,
+    cdlengulfing,
+    cdleveningdojistar,
+    cdleveningstar,
+    cdlgapsidesidewhite,
+    cdlgravestonedoji,
+    cdlhammer,
+    cdlhangingman,
+    cdlharami,
+    cdlharamicross,
+    cdlhighwave,
+    cdlhikkake,
+    cdlhikkakemod,
+    cdlhomingpigeon,
+    cdlidentical3crows,
+    cdlinneck,
+    cdlinvertedhammer,
+    cdlkicking,
+    cdlkickingbylength,
+    cdlladderbottom,
+    cdllongleggeddoji,
+    cdllongline,
+    cdlmarubozu,
+    cdlmatchinglow,
+    cdlmathold,
+    cdlmorningdojistar,
+    cdlmorningstar,
+    cdlonneck,
+    cdlpiercing,
+    cdlrickshawman,
+    cdlrisefall3methods,
+    cdlseparatinglines,
+    cdlshootingstar,
+    cdlshortline,
+    cdlspinningtop,
+    cdlstalledpattern,
+    cdlsticksandwich,
+    cdltakuri,
+    cdltasukigap,
+    cdlthrusting,
+    cdltristar,
+    cdlunique3river,
+    cdlupsidegap2crows,
+    cdlxsidegap3methods,
 };
 const func_names = [_][]const u8{
-    "SMA",                 "EMA",             "WMA",     "MA",          "MACD",        "MACDEXT",     "MACDFIX",     "RSI",        "BBANDS",         "TRANGE",    "ATR",
-    "NATR",                "STOCH",           "STOCHF",  "MAX",         "MIN",         "SUM",         "DEMA",        "TEMA",       "T3",             "TRIMA",     "KAMA",
-    "MIDPOINT",            "MIDPRICE",        "SAR",     "SAREXT",      "MAVP",        "ACCBANDS",    "ALMA",        "CKSP",       "DONCHIAN",       "FRAMA",     "HMA",
-    "ICHIMOKU",            "KC",              "MCGD",    "RMA",         "SUPERTREND",  "SWAK_BUTTER", "SWAK_GAUSS",  "VIDYA",      "VWMA",           "ZIGZAG",    "ZLEMA",
-    "AD",                  "ADOSC",           "CMF",     "EFI",         "EMV",         "KVO",         "MARKETFI",    "NVI",        "OBV",            "PVI",       "PVO",
-    "PVT",                 "RVOL",            "VWAP",    "ADR",         "BBW",         "CVI",         "MASSI",       "PERCENTB",   "ROGERSSATCHELL", "RVI",       "RVIR",
-    "AVGDEV",              "AVGPRICE",        "HA",      "MEDPRICE",    "TYPPRICE",    "WCLPRICE",    "BETA",        "CORREL",     "KURTOSIS",       "LINEARREG", "LINEARREG_ANGLE",
-    "LINEARREG_INTERCEPT", "LINEARREG_SLOPE", "MEDIAN",  "PERCENTILE",  "PERCENTRANK", "STDDEV",      "TSF",         "VAR",        "ADD",            "CUMSUM",    "DIV",
-    "MAXINDEX",            "MININDEX",        "MINMAX",  "MINMAXINDEX", "MULT",        "SUB",         "HT_DCPERIOD", "HT_DCPHASE", "HT_PHASOR",      "HT_SINE",   "HT_TRENDLINE",
-    "HT_TRENDMODE",        "MAMA",            "SWAK_BP", "SWAK_HP",     "SWAK_2PHP",   "ACOS",        "ASIN",        "ATAN",       "CEIL",           "COS",       "COSH",
-    "EXP",                 "FLOOR",           "LN",      "LOG10",       "SIN",         "SINH",        "SQRT",        "TAN",        "TANH",           "ADX",       "ADXR",
-    "DX",                  "MINUS_DI",        "PLUS_DI", "MINUS_DM",    "PLUS_DM",     "AROON",       "AROONOSC",    "MOM",        "ROC",            "ROCP",      "ROCR",
-    "ROCR100",             "BOP",             "IBS",     "QSTICK",      "WAD",         "ASI",         "SI",          "IMI",        "AO",             "AC",        "DPO",
-    "ER",                  "FOSC",            "CTI",     "VHF",         "WILLR",       "FRACTAL",     "CCI",         "CHOP",       "CHOPTR",         "VORTEX",    "MFI",
-    "ULTOSC",              "CMO",             "CMOU",    "CG",          "APO",         "PPO",         "TRIX",        "COPPOCK",    "ERI",            "DOSC",      "FISHER",
-    "PSO",                 "SMI",             "TSI",     "WAVETREND",   "KST",         "KSTEXT",      "KDJ",         "STOCHRSI",   "CRSI",           "STC",       "SQZMOM",
+    "SMA",                 "EMA",                 "WMA",                "MA",                  "MACD",               "MACDEXT",             "MACDFIX",           "RSI",              "BBANDS",             "TRANGE",             "ATR",
+    "NATR",                "STOCH",               "STOCHF",             "MAX",                 "MIN",                "SUM",                 "DEMA",              "TEMA",             "T3",                 "TRIMA",              "KAMA",
+    "MIDPOINT",            "MIDPRICE",            "SAR",                "SAREXT",              "MAVP",               "ACCBANDS",            "ALMA",              "CKSP",             "DONCHIAN",           "FRAMA",              "HMA",
+    "ICHIMOKU",            "KC",                  "MCGD",               "RMA",                 "SUPERTREND",         "SWAK_BUTTER",         "SWAK_GAUSS",        "VIDYA",            "VWMA",               "ZIGZAG",             "ZLEMA",
+    "AD",                  "ADOSC",               "CMF",                "EFI",                 "EMV",                "KVO",                 "MARKETFI",          "NVI",              "OBV",                "PVI",                "PVO",
+    "PVT",                 "RVOL",                "VWAP",               "ADR",                 "BBW",                "CVI",                 "MASSI",             "PERCENTB",         "ROGERSSATCHELL",     "RVI",                "RVIR",
+    "AVGDEV",              "AVGPRICE",            "HA",                 "MEDPRICE",            "TYPPRICE",           "WCLPRICE",            "BETA",              "CORREL",           "KURTOSIS",           "LINEARREG",          "LINEARREG_ANGLE",
+    "LINEARREG_INTERCEPT", "LINEARREG_SLOPE",     "MEDIAN",             "PERCENTILE",          "PERCENTRANK",        "STDDEV",              "TSF",               "VAR",              "ADD",                "CUMSUM",             "DIV",
+    "MAXINDEX",            "MININDEX",            "MINMAX",             "MINMAXINDEX",         "MULT",               "SUB",                 "HT_DCPERIOD",       "HT_DCPHASE",       "HT_PHASOR",          "HT_SINE",            "HT_TRENDLINE",
+    "HT_TRENDMODE",        "MAMA",                "SWAK_BP",            "SWAK_HP",             "SWAK_2PHP",          "ACOS",                "ASIN",              "ATAN",             "CEIL",               "COS",                "COSH",
+    "EXP",                 "FLOOR",               "LN",                 "LOG10",               "SIN",                "SINH",                "SQRT",              "TAN",              "TANH",               "ADX",                "ADXR",
+    "DX",                  "MINUS_DI",            "PLUS_DI",            "MINUS_DM",            "PLUS_DM",            "AROON",               "AROONOSC",          "MOM",              "ROC",                "ROCP",               "ROCR",
+    "ROCR100",             "BOP",                 "IBS",                "QSTICK",              "WAD",                "ASI",                 "SI",                "IMI",              "AO",                 "AC",                 "DPO",
+    "ER",                  "FOSC",                "CTI",                "VHF",                 "WILLR",              "FRACTAL",             "CCI",               "CHOP",             "CHOPTR",             "VORTEX",             "MFI",
+    "ULTOSC",              "CMO",                 "CMOU",               "CG",                  "APO",                "PPO",                 "TRIX",              "COPPOCK",          "ERI",                "DOSC",               "FISHER",
+    "PSO",                 "SMI",                 "TSI",                "WAVETREND",           "KST",                "KSTEXT",              "KDJ",               "STOCHRSI",         "CRSI",               "STC",                "SQZMOM",
+    "CDL2CROWS",           "CDL3BLACKCROWS",      "CDL3INSIDE",         "CDL3LINESTRIKE",      "CDL3OUTSIDE",        "CDL3STARSINSOUTH",    "CDL3WHITESOLDIERS", "CDLABANDONEDBABY", "CDLADVANCEBLOCK",    "CDLBELTHOLD",        "CDLBREAKAWAY",
+    "CDLCLOSINGMARUBOZU",  "CDLCONCEALBABYSWALL", "CDLCOUNTERATTACK",   "CDLDARKCLOUDCOVER",   "CDLDOJI",            "CDLDOJISTAR",         "CDLDRAGONFLYDOJI",  "CDLENGULFING",     "CDLEVENINGDOJISTAR", "CDLEVENINGSTAR",     "CDLGAPSIDESIDEWHITE",
+    "CDLGRAVESTONEDOJI",   "CDLHAMMER",           "CDLHANGINGMAN",      "CDLHARAMI",           "CDLHARAMICROSS",     "CDLHIGHWAVE",         "CDLHIKKAKE",        "CDLHIKKAKEMOD",    "CDLHOMINGPIGEON",    "CDLIDENTICAL3CROWS", "CDLINNECK",
+    "CDLINVERTEDHAMMER",   "CDLKICKING",          "CDLKICKINGBYLENGTH", "CDLLADDERBOTTOM",     "CDLLONGLEGGEDDOJI",  "CDLLONGLINE",         "CDLMARUBOZU",       "CDLMATCHINGLOW",   "CDLMATHOLD",         "CDLMORNINGDOJISTAR", "CDLMORNINGSTAR",
+    "CDLONNECK",           "CDLPIERCING",         "CDLRICKSHAWMAN",     "CDLRISEFALL3METHODS", "CDLSEPARATINGLINES", "CDLSHOOTINGSTAR",     "CDLSHORTLINE",      "CDLSPINNINGTOP",   "CDLSTALLEDPATTERN",  "CDLSTICKSANDWICH",   "CDLTAKURI",
+    "CDLTASUKIGAP",        "CDLTHRUSTING",        "CDLTRISTAR",         "CDLUNIQUE3RIVER",     "CDLUPSIDEGAP2CROWS", "CDLXSIDEGAP3METHODS",
 };
 const n_func = func_names.len;
 
@@ -307,6 +376,7 @@ fn inKind(f: Func) InKind {
 /// o(pen) h(igh) l(ow) c(lose) v(olume); x = the generated second series of
 /// VWMA (volume) and MAVP (periods). Two-series functions read close and open.
 fn seriesOf(f: Func) []const u8 {
+    if (isCandle(f)) return "ohlc";
     return switch (f) {
         .ad, .adosc, .cmf, .kvo, .vwap => "hlcv",
         .emv, .marketfi => "hlv",
@@ -333,6 +403,12 @@ fn seriesOf(f: Func) []const u8 {
         },
     };
 }
+/// The 61 candlestick patterns (ids from `cdl2crows` on): four input series, one integer output.
+fn isCandle(f: Func) bool {
+    return @backingInt(f) >= @backingInt(Func.cdl2crows);
+}
+const n_candle_first: usize = @backingInt(Func.cdl2crows);
+
 fn nIn(f: Func) usize {
     return seriesOf(f).len;
 }
@@ -364,6 +440,10 @@ const Case = struct {
     seed: u64 = 0,
     bad: bool = false,
     emit: bool = false,
+    /// Candle patterns: settings preset (0 = TA-Lib's table), see `candle_gen.presetSettings`.
+    cset: u8 = 0,
+    /// Candle patterns: freeze this record as a vector if it is the first with a nonzero answer for its function and width.
+    emit_nz: bool = false,
 
     fn unstable(self: Case) ind.Unstable {
         return switch (self.ukind) {
@@ -488,6 +568,12 @@ fn genSeries(arena: std.mem.Allocator, f: Func, seed: u64, kind: u8, n: usize) !
         .v = try arena.alloc(f64, n),
         .x = try arena.alloc(f64, n),
     };
+    if (isCandle(f)) {
+        candle_gen.genCandles(seed, kind, s.o, s.h, s.l, s.c);
+        @memset(s.v, 0);
+        @memset(s.x, 0);
+        return s;
+    }
     genInput(seed, kind, s.h, s.l, s.c);
     if (needsAux(f)) genAux(f, seed, kind, s.x) else @memset(s.x, 0);
     var prng = std.Random.DefaultPrng.init(seed ^ 0x6f76_6f6c_756d);
@@ -761,7 +847,26 @@ fn runOurs(comptime T: type, gpa: std.mem.Allocator, cs: Case, s: Ser(T), o: *[4
             break :blk lb;
         },
         .wavetrend => ind.wavetrend(T, gpa, h, l, c, o[0], o[1], .{ .channel = us(ip[0]), .average = us(ip[1]), .signal = us(ip[2]), .unstable = un }),
+        else => runCandle(T, gpa, cs, s, o),
     };
+}
+
+fn runCandle(comptime T: type, gpa: std.mem.Allocator, cs: Case, s: Ser(T), o: *[4][]T) OursError!usize {
+    const k = @as(usize, @backingInt(cs.func)) - n_candle_first;
+    inline for (ind.candles.all, 0..) |Pat, j| {
+        if (k == j) {
+            const O = ind.candles.Op(Pat);
+            const n = s.c.len;
+            const out = try gpa.alloc(i32, n);
+            defer gpa.free(out);
+            var p: O.Params = .{ .settings = candle_gen.presetSettings(cs.cset) };
+            if (@hasField(O.Params, "penetration")) p.penetration = cs.dp[0];
+            const lb = try O.run(T, s.o, s.h, s.l, s.c, out, p);
+            for (o[0][0..n], out, 0..) |*d, v, i| d.* = if (i < lb) std.math.nan(T) else @floatFromInt(v);
+            return lb;
+        }
+    }
+    unreachable;
 }
 
 // ── the case grid ───────────────────────────────────────────────────────────
@@ -1012,12 +1117,25 @@ fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
             try l.append(gpa, pn(.{ t[0], t[1], 0, 0, 0, 0 })),
         .zigzag => for ([_][2]f64{ .{ 5, 1 }, .{ 1, 1 }, .{ 0.5, 3 }, .{ 10, 2 }, .{ 20, 5 }, .{ 0, 1 }, .{ 100, 1 }, .{ -1, 1 }, .{ 101, 1 }, .{ 5, 0 } }) |t|
             try l.append(gpa, .{ .ip = .{ @intFromFloat(t[1]), 0, 0, 0, 0, 0 }, .dp = d2(t[0], 0) }),
+        else => {
+            // candlestick patterns: no integer parameters; the penetration ones take it in dp[0]
+            const k = @as(usize, @backingInt(f)) - n_candle_first;
+            inline for (ind.candles.all, 0..) |Pat, j| {
+                if (k == j) {
+                    if (@hasDecl(Pat, "pen_default")) {
+                        for ([_]f64{ Pat.pen_default, 0.0, 0.1, 0.5, 1.0, 3.0, 3e37, -0.1, 3.1e37, std.math.nan(f64) }) |pen|
+                            try l.append(gpa, .{ .dp = d2(pen, 0) });
+                    } else try l.append(gpa, .{});
+                }
+            }
+        },
     }
     return l.items;
 }
 
 /// Functions on which the unstable period does anything.
 fn unstableMatters(f: Func) bool {
+    if (isCandle(f)) return false;
     return switch (f) {
         .sma, .wma, .trange, .max, .min, .sum => false,
         .trima, .midpoint, .midprice, .sar, .sarext, .accbands, .alma, .donchian, .hma, .ichimoku, .vwma, .zigzag => false,
@@ -1099,9 +1217,99 @@ fn addLen(gpa: std.mem.Allocator, ns: *std.ArrayList(u32), n: usize) !void {
     try ns.append(gpa, @intCast(n));
 }
 
+/// The candlestick grid: every pattern at its default settings over short, edge and long inputs (kinds 0..2),
+/// f32 (TA_S_*), every penetration value for the seven that take one, BadParam, and the settings presets 1..4
+/// (TA_SetCandleSettings) over long inputs; plus candidate records for the frozen vectors.
+fn buildCandle(gpa: std.mem.Allocator, cases: *std.ArrayList(Case), f: Func, seed: *u64) !void {
+    const plist = try paramsOf(f, gpa);
+    for (plist, 0..) |pp, pi| {
+        const base = Case{ .func = f, .n = 0, .ip = pp.ip, .dp = pp.dp };
+        const lbo = probeLookback(gpa, base);
+        if (lbo == null) {
+            var c = base;
+            c.n = 300;
+            c.bad = true;
+            seed.* += 1;
+            c.seed = seed.*;
+            try cases.append(gpa, c);
+            continue;
+        }
+        const lb = lbo.?;
+        var ns: std.ArrayList(u32) = .empty;
+        for ([_]usize{ 1, 2, lb -| 1, lb, lb + 1, lb + 2, 40, 300 }) |n| try addLen(gpa, &ns, n);
+        for (ns.items) |n| {
+            var c = base;
+            c.n = n;
+            seed.* += 1;
+            c.seed = seed.*;
+            try cases.append(gpa, c);
+        }
+        if (pi != 0 and pi > 6) continue;
+        // long runs: the pattern must actually fire (reported per function as "nonzero")
+        for ([_]u8{ 0, 1, 2 }) |k| {
+            var c = base;
+            c.n = 3000;
+            c.kind = k;
+            seed.* += 1;
+            c.seed = seed.*;
+            try cases.append(gpa, c);
+        }
+        if (pi != 0) continue;
+        for ([_]u8{ 0, 1 }) |k| {
+            var c = base;
+            c.n = 3000;
+            c.kind = k;
+            c.is32 = true;
+            seed.* += 1;
+            c.seed = seed.*;
+            try cases.append(gpa, c);
+        }
+        for ([_]bool{ false, true }) |w32| for (0..160) |_| {
+            var c = base;
+            c.n = candle_vec_n;
+            c.is32 = w32;
+            // vector-size policy: one f64 vector per pattern, an f32 one only for every second pattern (the code is generic over T)
+            c.emit_nz = !w32 or (@backingInt(f) - n_candle_first) % 2 == 0;
+            seed.* += 1;
+            c.seed = seed.*;
+            try cases.append(gpa, c);
+        };
+        for ([_]u8{ 1, 2, 3, 4 }) |cset| {
+            var pc = base;
+            pc.cset = cset;
+            const plb = probeLookback(gpa, pc) orelse continue;
+            ns.clearRetainingCapacity();
+            for ([_]usize{ 1, plb, plb + 1, plb + 2, 300 }) |n| try addLen(gpa, &ns, n);
+            for (ns.items) |n| {
+                var c = pc;
+                c.n = n;
+                seed.* += 1;
+                c.seed = seed.*;
+                try cases.append(gpa, c);
+            }
+            for ([_]u8{ 0, 1 }) |k| {
+                var c = pc;
+                c.n = 3000;
+                c.kind = k;
+                c.is32 = cset == 1;
+                seed.* += 1;
+                c.seed = seed.*;
+                try cases.append(gpa, c);
+            }
+        }
+    }
+}
+
+/// Length of the frozen candle vectors.
+const candle_vec_n = 40;
+
 fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
     var seed: u64 = 0x7461_6c69_6221;
     for (std.enums.values(Func)) |f| {
+        if (isCandle(f)) {
+            try buildCandle(gpa, cases, f, &seed);
+            continue;
+        }
         const plist = try paramsOf(f, gpa);
         for (plist, 0..) |pp, pi| {
             const base = Case{ .func = f, .n = 0, .ip = pp.ip, .dp = pp.dp, .xp = pp.xp };
@@ -1209,6 +1417,8 @@ const Stat = struct {
     max_ulp: u64 = 0,
     /// Largest |ours - TA-Lib| over the largest |TA-Lib| value of the same output of the same record.
     max_scaled: f64 = 0.0,
+    /// Compared values whose TA-Lib answer is nonzero (a candle pattern compared only on zeros is not verified).
+    nonzero: usize = 0,
     bad: usize = 0,
     reported: usize = 0,
 };
@@ -1222,6 +1432,8 @@ const Ctx = struct {
     stats: [n_func]Stat = @splat(.{}),
     vec_out: ?*std.Io.Writer = null,
     vec_count: usize = 0,
+    /// Candle vectors already frozen, per function and width (f64, f32).
+    emitted: [n_func][2]bool = @splat(.{ false, false }),
 };
 
 fn report(c: *Ctx, cs: Case, comptime fmt: []const u8, args: anytype) void {
@@ -1279,6 +1491,7 @@ fn checkCase(comptime T: type, c: *Ctx, arena: std.mem.Allocator, cs: Case, head
             return nb * 8 * no;
         }
         var bad_here = false;
+        var rec_nz: usize = 0;
         for (0..no) |q| {
             var col_max: f64 = 0.0;
             if (!idx_out) for (0..nb) |i| {
@@ -1317,6 +1530,10 @@ fn checkCase(comptime T: type, c: *Ctx, arena: std.mem.Allocator, cs: Case, head
                     want_f = want;
                 }
                 st.values += 1;
+                if (!idx_out and want_f != 0.0 and !std.math.isNan(want_f)) {
+                    st.nonzero += 1;
+                    rec_nz += 1;
+                }
                 if (d == 0) st.bitwise += 1;
                 if (!idx_out and col_max > 0.0 and d != std.math.maxInt(u64)) st.max_scaled = @max(st.max_scaled, @abs(got_f - want_f) / col_max);
                 st.max_ulp = @max(st.max_ulp, d);
@@ -1328,7 +1545,12 @@ fn checkCase(comptime T: type, c: *Ctx, arena: std.mem.Allocator, cs: Case, head
                 }
             }
         }
-        if (cs.emit and !bad_here) try emitVector(c, cs, lb, nb, sT, theirs);
+        const slot = &c.emitted[@backingInt(cs.func)][@intFromBool(cs.is32)];
+        const nz_now = cs.emit_nz and rec_nz > 0 and !slot.*;
+        if ((cs.emit or nz_now) and !bad_here) {
+            if (nz_now) slot.* = true;
+            try emitVector(c, cs, lb, nb, sT, theirs);
+        }
         return nb * 8 * no;
     } else |err| switch (err) {
         error.BadParam => {
@@ -1386,12 +1608,21 @@ fn runAll(c: *Ctx, arena: std.mem.Allocator, cases: []const Case) !void {
     const w = &buf.writer;
     try w.writeInt(u32, @intCast(cases.len), .little);
     for (cases) |cs| {
-        try w.writeAll(&.{ @backingInt(cs.func), @intFromBool(cs.is32), cs.ukind, 0 });
+        try w.writeAll(&.{ @backingInt(cs.func), @intFromBool(cs.is32), cs.ukind, cs.cset });
         try w.writeInt(u32, cs.ubars, .little);
         try w.writeInt(u32, cs.n, .little);
         for (cs.ip) |x| try w.writeInt(i32, x, .little);
         for (cs.dp) |x| try w.writeInt(u64, @bitCast(x), .little);
         for (cs.xp) |x| try w.writeInt(i32, x, .little);
+        if (cs.cset != 0) {
+            const set = candle_gen.presetSettings(cs.cset);
+            inline for (comptime std.enums.values(ind.candles.SetId)) |id| {
+                const st = @field(set, @tagName(id));
+                try w.writeInt(i32, @backingInt(st.range), .little);
+                try w.writeInt(i32, @intCast(st.avg_period), .little);
+                try w.writeInt(u64, @bitCast(st.factor), .little);
+            }
+        }
         const n: usize = cs.n;
         const sr = try genSeries(arena, cs.func, cs.seed, cs.kind, n);
         for (seriesOf(cs.func)) |letter| {
@@ -1515,6 +1746,14 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("  {s:<8} {d:>8} {d:>10} {d:>10} {d:>8} {d:>5} {e:>10.1}\n", .{ name, st.records, st.values, st.bitwise, st.max_ulp, st.bad, st.max_scaled });
         if (st.bad != 0) failed = true;
     }
+    std.debug.print("  candlestick patterns, compared values with a nonzero TA-Lib answer (aim: >= 20 each):\n", .{});
+    var short: usize = 0;
+    for (func_names, ctx.stats, 0..) |name, st, k| {
+        if (k < n_candle_first) continue;
+        if (st.nonzero < 20) short += 1;
+        std.debug.print("  {s:<22} {d:>8}{s}\n", .{ name, st.nonzero, if (st.nonzero < 20) "   <-- short" else "" });
+    }
+    std.debug.print("  patterns under 20 nonzero compared values: {d}\n", .{short});
     if (failed) {
         std.debug.print("interop-indicators: DISAGREEMENT with {s}\n", .{version});
         return 1;

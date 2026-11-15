@@ -22,7 +22,8 @@ CORREL,KURTOSIS,LINEARREG,LINEARREG_ANGLE,LINEARREG_INTERCEPT,LINEARREG_SLOPE,ME
 PERCENTILE,PERCENTRANK,TSF,ADD,SUB,MULT,DIV,CUMSUM,MAXINDEX,MININDEX,MINMAX,
 MINMAXINDEX}.c`; the cycle wave `ta_{HT_DCPERIOD,HT_DCPHASE,HT_PHASOR,HT_SINE,HT_TRENDLINE,
 HT_TRENDMODE,MAMA,SWAK_BP,SWAK_HP,SWAK_2PHP,ACOS,ASIN,ATAN,CEIL,COS,COSH,EXP,FLOOR,LN,LOG10,
-SIN,SINH,SQRT,TAN,TANH}.c`. No TA-Lib
+SIN,SINH,SQRT,TAN,TANH}.c`; the 61 candlestick patterns `ta_CDL*.c` (CDL2CROWS .. CDLXSIDEGAP3METHODS) and the
+candle-setting defaults of `src/ta_common/ta_global.c`, `TA_CANDLERANGE` / `TA_CANDLEAVERAGE` of `ta_utility.h`. No TA-Lib
 file is vendored, compiled or linked; nothing was copied verbatim except
 numeric constants and the structure of the recursions, rewritten in Zig.
 
