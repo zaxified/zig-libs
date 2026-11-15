@@ -224,6 +224,7 @@ pub const module_list = [_]Module{
     .{ .name = "crc32c", .libs = &.{ "format", "storage" }, .test_deps = &.{"testkit"} },
     .{ .name = "kv", .libs = &.{"storage"}, .deps = &.{"clock"} },
     .{ .name = "kvtree", .libs = &.{ "storage", "net" }, .deps = &.{ "kv", "crc32" }, .test_deps = &.{"testkit"}, .bench_deps = &.{"pagecache"} },
+    .{ .name = "seglog", .libs = &.{"storage"}, .deps = &.{ "kv", "crc32c", "zstd" } }, // kv: the Storage seam + SimStorage crash sweep; crc32c: record checksums; zstd: seekable compression of closed segments
     .{ .name = "blobmsg", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "tar", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "latency-stats", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
