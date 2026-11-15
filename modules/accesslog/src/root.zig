@@ -1132,6 +1132,16 @@ test "writeLogfmtValue: cut_marker is appended only after an actual cut" {
     try expectLogfmtValue("\"abc\\x0a\"", "abcdef", .{ .max_len = 3, .cut_marker = "\n", .escape = .hex_x });
 }
 
+test "writeLogfmtValue: hex_x boundaries inside quotes, and a marker that only hex_x must quote (mutation 2026-11-15)" {
+    // 0x7e stays literal inside a quoted hex_x value (0x7f is the first escaped byte).
+    try expectLogfmtValue("\"a ~\"", "a ~", .{ .escape = .hex_x });
+    try expectLogfmtValue("\"~\\x7f\"", "~\x7f", .{ .escape = .hex_x });
+    // A marker with a byte >= 0x80 forces quoting under hex_x on its own...
+    try expectLogfmtValue("\"abc\\xe2\"", "abcdef", .{ .max_len = 3, .cut_marker = "\xe2", .escape = .hex_x });
+    // ...and passes bare under json_u.
+    try expectLogfmtValue("abc\xe2", "abcdef", .{ .max_len = 3, .cut_marker = "\xe2", .escape = .json_u });
+}
+
 test "writeLogfmtValue: quote, escape and cut_marker combined (the strict parser-contract form)" {
     const strict: LogfmtValueOptions = .{ .quote = .always, .escape = .hex_x, .max_len = 4, .cut_marker = "..." };
     try expectLogfmtValue("\"ok\"", "ok", strict);

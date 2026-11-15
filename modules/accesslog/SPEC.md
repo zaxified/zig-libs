@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — ill-formed UTF-8 becomes one U+FFFD per maximal subpart (Unicode §3.9, WHATWG; Python's `decode('utf-8', 'replace')` as the oracle), while Go encoding/json, log/slog, zerolog v1.35.1, zap v1.28.0 and phuslu/log v1.0.138 all write one per byte of a truncated sequence (`E1 80` → 2, `F0 9F 98` → 3) (test `lead: one U+FFFD per maximal subpart where five Go JSON loggers write one per byte`; `tools/go_utf8_probe`) (measured 2026-10-25) · speed — JSON Lines faster than every measured writer: 0.89× phuslu/log v1.0.138 (the fastest), 0.60× zerolog v1.35.1, 0.72× serde_json 1.0.150, 0.21× zap v1.28.0; logfmt 0.28× go-logfmt v0.6.1 (`zig build bench-accesslog`, `tools/go_fast_bench`, `tools/rust_fast_bench`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-15 (1299/1369, 70 eq) · src 619518d104a8b364
+**Audit:** review 2026-11-12 · mutation 2026-11-15 (1330/1400, 70 eq) · src cf1364e6fa27f4a2
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, ACCESSLOG_FUZZ) · ct n/a — log formatting, no keys (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point: no data-reachable panic; latency total for any injected clock)
 
@@ -401,6 +401,20 @@ into one `writeAll` where the old escaper wrote byte by byte), a valid-UTF-8 rec
 329.2 ns (−24.5 %), and a record whose fields are mostly ill-formed 363.4 → 456.9 ns (+25.7 %,
 i.e. +93 ns and only for records that actually carry bad bytes). Nothing is allocated and
 nothing is copied when the input is clean.
+
+**Audit 2026-11-15 (gap-wave delta).** 31 schemata mutants over the strict logfmt value options and the queued-or-dropped
+return values (ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`). `writeLogfmtValue` and
+`logfmtNeedsQuote` (25): the `.hex_x` high-byte trigger (dropped, always on, the 0x80 and 0xFF bytes excluded), the cut
+decision (`<=`, always, never), the marker (appended uncut, dropped), `quote = .always` (ignored, always), the
+empty-value test (marker length ignored, dropped), the two needs-quote checks (value, marker) dropped or given the wrong
+escape style, the verbatim writes of value and marker skipped, the two-part loop (marker, value dropped), the escape
+switch forced to `json_u`, the printable arm (dropped, 0x7e escaped), the `\xNN` arm (dropped, upper-case, one digit).
+`AsyncSink.log` / `logEntry` (6): the empty-line, dropped and queued results inverted, `logEntry` forwarding the
+queue's result (forced true, forced false) and its formatter-failure result. First run: 28 killed (2 by hangs), 3
+survived; each got a test: a marker that only `.hex_x` must quote (the needs-quote check for the marker had been
+passing the wrong escape style unseen), the 0x7e boundary inside a quoted `.hex_x` value, and a `logEntry` whose
+formatted line the queue drops (its `false` return was only reachable through the formatter-failure path before).
+Rerun: 31/31 killed. No equivalents, no unobservables; the Audit line is cumulative (1299/1369 + 31/31).
 
 **Audit 2026-11-15 (delta mutation).** 55 schemata mutants over the new code, ReleaseSafe, one build, each mutant
 under `setsid -w timeout` (15 s) and `ulimit -v`. `writeLogfmtValue`'s `max_len` (6): the limit ignored, one byte

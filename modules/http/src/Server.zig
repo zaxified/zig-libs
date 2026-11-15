@@ -8722,6 +8722,55 @@ test "timeouts: without an idle deadline the stall timeout ends a keep-alive wai
     try testing.expectEqual(@as(?anyerror, error.IdleTimeout), r.err);
 }
 
+/// One answered request on a server with `on_error` set; the connection then
+/// ends without any deadline (`close_header`: the server closes after the
+/// response; otherwise the client closes first). Returns how many
+/// `.timed_out` events `on_error` saw.
+fn timedOutEventsAfterCleanEnd(close_header: bool) !usize {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var log: ErrorLogForTest = .{};
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .read_timeout_ms = 8_000,
+        .on_error = ErrorLogForTest.record,
+        .on_error_ctx = &log,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    {
+        const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+        defer stream.close(io);
+        var rbuf: [512]u8 = undefined;
+        var wbuf: [256]u8 = undefined;
+        var sr = stream.reader(io, &rbuf);
+        var sw = stream.writer(io, &wbuf);
+        try sw.interface.writeAll(if (close_header)
+            "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+        else
+            "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+        try sw.interface.flush();
+        try expectHelloResponse(&sr.interface);
+        if (close_header) _ = sr.interface.discardRemaining() catch {};
+    }
+    try waitNoConns(io, &server);
+    var timed: usize = 0;
+    for (log.events[0..log.n]) |e| if (e.kind == .timed_out) {
+        timed += 1;
+    };
+    return timed;
+}
+
+test "on_error: a connection that ends without a deadline reports no timed_out (mutation 2026-11-15)" {
+    try testing.expectEqual(@as(usize, 0), try timedOutEventsAfterCleanEnd(true));
+    try testing.expectEqual(@as(usize, 0), try timedOutEventsAfterCleanEnd(false));
+}
+
 test "on_error: a response that outlives response_timeout_ms is reported as ResponseTimeout" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();

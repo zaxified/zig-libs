@@ -496,3 +496,17 @@ test "AsyncSink: log returns true exactly for queued lines; an empty line is ign
     q.deinit();
     try testing.expectEqualStrings("ok\n", gw.out.items);
 }
+
+test "AsyncSink: logEntry returns false when the formatted line is dropped by the queue (mutation 2026-11-15)" {
+    var buf: [8]u8 = undefined;
+    var gw: GateWriter = .init(testing.allocator, &buf, true);
+    defer gw.deinit();
+    const tpl = try root.LogFormat.parse("%m %U %>s");
+    var q: AsyncSink = undefined;
+    try q.init(testing.allocator, testing.io, &gw.interface, .{ .max_bytes = 8, .max_lines = 100, .template = &tpl });
+    // "GET /x 200" renders fine but is longer than max_bytes: the queue drops it.
+    try testing.expect(!q.logEntry(.{ .timestamp_ns = 0, .method = "GET", .target = "/x", .status = 200 }));
+    try testing.expectEqual(@as(u64, 1), q.dropped());
+    q.deinit();
+    try testing.expectEqualStrings("", gw.out.items);
+}
