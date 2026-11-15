@@ -39,6 +39,10 @@ enum { F_SMA, F_EMA, F_WMA, F_MA, F_MACD, F_MACDEXT, F_MACDFIX, F_RSI, F_BBANDS,
        F_BETA, F_CORREL, F_KURTOSIS, F_LINEARREG, F_LINEARREG_ANGLE, F_LINEARREG_INTERCEPT, F_LINEARREG_SLOPE,
        F_MEDIAN, F_PERCENTILE, F_PERCENTRANK, F_STDDEV, F_TSF, F_VAR,
        F_ADD, F_CUMSUM, F_DIV, F_MAXINDEX, F_MININDEX, F_MINMAX, F_MINMAXINDEX, F_MULT, F_SUB,
+       /* cycle wave: Hilbert transform family, MAMA, Swiss Army Knife rows, math transforms */
+       F_HT_DCPERIOD, F_HT_DCPHASE, F_HT_PHASOR, F_HT_SINE, F_HT_TRENDLINE, F_HT_TRENDMODE, F_MAMA,
+       F_SWAK_BP, F_SWAK_HP, F_SWAK_2PHP,
+       F_ACOS, F_ASIN, F_ATAN, F_CEIL, F_COS, F_COSH, F_EXP, F_FLOOR, F_LN, F_LOG10, F_SIN, F_SINH, F_SQRT, F_TAN, F_TANH,
        F_COUNT };
 
 static int nin(int f) {
@@ -61,7 +65,8 @@ static int nout(int f) {
     case F_MACD: case F_MACDEXT: case F_MACDFIX: case F_BBANDS:
     case F_ACCBANDS: case F_DONCHIAN: case F_KC: case F_ZIGZAG: return 3;
     case F_ICHIMOKU: return 4;
-    case F_STOCH: case F_STOCHF: case F_CKSP: case F_SUPERTREND: case F_KVO: case F_MINMAX: case F_MINMAXINDEX: return 2;
+    case F_STOCH: case F_STOCHF: case F_CKSP: case F_SUPERTREND: case F_KVO: case F_MINMAX: case F_MINMAXINDEX:
+    case F_HT_PHASOR: case F_HT_SINE: case F_MAMA: return 2;
     case F_HA: return 4;
     default: return 1;
     }
@@ -226,12 +231,39 @@ int main(int argc, char **argv) {
         case F_MININDEX: lb = TA_MININDEX_Lookback(ip[0]); R(TA_S_MININDEX(0, e, s0, ip[0], OI1), TA_MININDEX(0, e, d0, ip[0], OI1));
         case F_MINMAXINDEX: lb = TA_MINMAXINDEX_Lookback(ip[0]);
             R(TA_S_MINMAXINDEX(0, e, s0, ip[0], OI2), TA_MINMAXINDEX(0, e, d0, ip[0], OI2));
+        /* cycle */
+        case F_HT_DCPERIOD: lb = TA_HT_DCPERIOD_Lookback(); R(TA_S_HT_DCPERIOD(0, e, s0, O1), TA_HT_DCPERIOD(0, e, d0, O1));
+        case F_HT_DCPHASE: lb = TA_HT_DCPHASE_Lookback(); R(TA_S_HT_DCPHASE(0, e, s0, O1), TA_HT_DCPHASE(0, e, d0, O1));
+        case F_HT_PHASOR: lb = TA_HT_PHASOR_Lookback(); R(TA_S_HT_PHASOR(0, e, s0, O2), TA_HT_PHASOR(0, e, d0, O2));
+        case F_HT_SINE: lb = TA_HT_SINE_Lookback(); R(TA_S_HT_SINE(0, e, s0, O2), TA_HT_SINE(0, e, d0, O2));
+        case F_HT_TRENDLINE: lb = TA_HT_TRENDLINE_Lookback(); R(TA_S_HT_TRENDLINE(0, e, s0, O1), TA_HT_TRENDLINE(0, e, d0, O1));
+        case F_HT_TRENDMODE: lb = TA_HT_TRENDMODE_Lookback(); R(TA_S_HT_TRENDMODE(0, e, s0, OI1), TA_HT_TRENDMODE(0, e, d0, OI1));
+        case F_MAMA: lb = TA_MAMA_Lookback(dp[0], dp[1]); R(TA_S_MAMA(0, e, s0, dp[0], dp[1], O2), TA_MAMA(0, e, d0, dp[0], dp[1], O2));
+        case F_SWAK_BP: lb = TA_SWAK_BP_Lookback(ip[0], dp[0]); R(TA_S_SWAK_BP(0, e, s0, ip[0], dp[0], O1), TA_SWAK_BP(0, e, d0, ip[0], dp[0], O1));
+        case F_SWAK_HP: lb = TA_SWAK_HP_Lookback(ip[0]); R(TA_S_SWAK_HP(0, e, s0, ip[0], O1), TA_SWAK_HP(0, e, d0, ip[0], O1));
+        case F_SWAK_2PHP: lb = TA_SWAK_2PHP_Lookback(ip[0]); R(TA_S_SWAK_2PHP(0, e, s0, ip[0], O1), TA_SWAK_2PHP(0, e, d0, ip[0], O1));
+        case F_ACOS: lb = TA_ACOS_Lookback(); R(TA_S_ACOS(0, e, s0, O1), TA_ACOS(0, e, d0, O1));
+        case F_ASIN: lb = TA_ASIN_Lookback(); R(TA_S_ASIN(0, e, s0, O1), TA_ASIN(0, e, d0, O1));
+        case F_ATAN: lb = TA_ATAN_Lookback(); R(TA_S_ATAN(0, e, s0, O1), TA_ATAN(0, e, d0, O1));
+        case F_CEIL: lb = TA_CEIL_Lookback(); R(TA_S_CEIL(0, e, s0, O1), TA_CEIL(0, e, d0, O1));
+        case F_COS: lb = TA_COS_Lookback(); R(TA_S_COS(0, e, s0, O1), TA_COS(0, e, d0, O1));
+        case F_COSH: lb = TA_COSH_Lookback(); R(TA_S_COSH(0, e, s0, O1), TA_COSH(0, e, d0, O1));
+        case F_EXP: lb = TA_EXP_Lookback(); R(TA_S_EXP(0, e, s0, O1), TA_EXP(0, e, d0, O1));
+        case F_FLOOR: lb = TA_FLOOR_Lookback(); R(TA_S_FLOOR(0, e, s0, O1), TA_FLOOR(0, e, d0, O1));
+        case F_LN: lb = TA_LN_Lookback(); R(TA_S_LN(0, e, s0, O1), TA_LN(0, e, d0, O1));
+        case F_LOG10: lb = TA_LOG10_Lookback(); R(TA_S_LOG10(0, e, s0, O1), TA_LOG10(0, e, d0, O1));
+        case F_SIN: lb = TA_SIN_Lookback(); R(TA_S_SIN(0, e, s0, O1), TA_SIN(0, e, d0, O1));
+        case F_SINH: lb = TA_SINH_Lookback(); R(TA_S_SINH(0, e, s0, O1), TA_SINH(0, e, d0, O1));
+        case F_SQRT: lb = TA_SQRT_Lookback(); R(TA_S_SQRT(0, e, s0, O1), TA_SQRT(0, e, d0, O1));
+        case F_TAN: lb = TA_TAN_Lookback(); R(TA_S_TAN(0, e, s0, O1), TA_TAN(0, e, d0, O1));
+        case F_TANH: lb = TA_TANH_Lookback(); R(TA_S_TANH(0, e, s0, O1), TA_TANH(0, e, d0, O1));
         default: break;
         }
         (void)d1; (void)d2; (void)d3; (void)s1; (void)s2; (void)s3;
         /* integer outputs travel as doubles: SUPERTREND trend, ZIGZAG trend and pivot index */
         if (ret == TA_SUCCESS && f == F_SUPERTREND) for (int i = 0; i < nb; i++) outs[1][i] = ib[0][i];
         if (ret == TA_SUCCESS && f == F_ZIGZAG) for (int i = 0; i < nb; i++) { outs[1][i] = ib[0][i]; outs[2][i] = ib[1][i]; }
+        if (ret == TA_SUCCESS && f == F_HT_TRENDMODE) for (int j = 0; j < nb; j++) outs[0][j] = (double)ib[0][j];
         if (ret == TA_SUCCESS && (f == F_MAXINDEX || f == F_MININDEX || f == F_MINMAXINDEX))
             for (int i = 0; i < no; i++) for (int j = 0; j < nb; j++) outs[i][j] = (double)ib[i][j];
         int32_t head[4] = { ret, lb, beg, nb };

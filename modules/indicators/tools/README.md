@@ -15,3 +15,8 @@
   two-series functions (BETA, CORREL, ADD, ...) read close and open. Integer outputs (SUPERTREND trend, ZIGZAG trend and pivot
   index, MAXINDEX / MININDEX / MINMAXINDEX) travel as doubles; index outputs are compared as integers. The record layout carries 8
   parameter doubles (SAREXT has eight parameters). `LINEARREG_ANGLE` has a 2 ULP bound (libm `atan`, see SPEC).
+  The cycle wave adds a second allowance, `scaled_bound`: a distance as a fraction of the largest |value| of the same output of the
+  same record (1e-13 for the Hilbert family and MAMA, 1e-12 for any function whose MA slot is MAMA), because a last-bit `atan`
+  difference carried by their recursion reads as thousands of ULPs on an output that is near zero. `interop-indicators` prints the
+  measured maximum (`max/colmax`) next to the ULP maximum. TRENDMODE's integer output travels as doubles like SUPERTREND's; the
+  Hilbert functions have a 100-bar frozen vector (their first output is bar 32 / 63) and an extra 700-bar run for their AUTO warm-up.

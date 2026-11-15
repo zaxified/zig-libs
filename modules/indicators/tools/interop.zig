@@ -139,17 +139,45 @@ const Func = enum(u8) {
     minmaxindex,
     mult,
     sub,
+    // cycle wave
+    ht_dcperiod,
+    ht_dcphase,
+    ht_phasor,
+    ht_sine,
+    ht_trendline,
+    ht_trendmode,
+    mama,
+    swak_bp,
+    swak_hp,
+    swak_2php,
+    acos,
+    asin,
+    atan,
+    ceil,
+    cos,
+    cosh,
+    exp,
+    floor,
+    ln,
+    log10,
+    sin,
+    sinh,
+    sqrt,
+    tan,
+    tanh,
 };
 const func_names = [_][]const u8{
-    "SMA",                 "EMA",             "WMA",    "MA",          "MACD",        "MACDEXT",     "MACDFIX",    "RSI",      "BBANDS",         "TRANGE",    "ATR",
-    "NATR",                "STOCH",           "STOCHF", "MAX",         "MIN",         "SUM",         "DEMA",       "TEMA",     "T3",             "TRIMA",     "KAMA",
-    "MIDPOINT",            "MIDPRICE",        "SAR",    "SAREXT",      "MAVP",        "ACCBANDS",    "ALMA",       "CKSP",     "DONCHIAN",       "FRAMA",     "HMA",
-    "ICHIMOKU",            "KC",              "MCGD",   "RMA",         "SUPERTREND",  "SWAK_BUTTER", "SWAK_GAUSS", "VIDYA",    "VWMA",           "ZIGZAG",    "ZLEMA",
-    "AD",                  "ADOSC",           "CMF",    "EFI",         "EMV",         "KVO",         "MARKETFI",   "NVI",      "OBV",            "PVI",       "PVO",
-    "PVT",                 "RVOL",            "VWAP",   "ADR",         "BBW",         "CVI",         "MASSI",      "PERCENTB", "ROGERSSATCHELL", "RVI",       "RVIR",
-    "AVGDEV",              "AVGPRICE",        "HA",     "MEDPRICE",    "TYPPRICE",    "WCLPRICE",    "BETA",       "CORREL",   "KURTOSIS",       "LINEARREG", "LINEARREG_ANGLE",
-    "LINEARREG_INTERCEPT", "LINEARREG_SLOPE", "MEDIAN", "PERCENTILE",  "PERCENTRANK", "STDDEV",      "TSF",        "VAR",      "ADD",            "CUMSUM",    "DIV",
-    "MAXINDEX",            "MININDEX",        "MINMAX", "MINMAXINDEX", "MULT",        "SUB",
+    "SMA",                 "EMA",             "WMA",     "MA",          "MACD",        "MACDEXT",     "MACDFIX",     "RSI",        "BBANDS",         "TRANGE",    "ATR",
+    "NATR",                "STOCH",           "STOCHF",  "MAX",         "MIN",         "SUM",         "DEMA",        "TEMA",       "T3",             "TRIMA",     "KAMA",
+    "MIDPOINT",            "MIDPRICE",        "SAR",     "SAREXT",      "MAVP",        "ACCBANDS",    "ALMA",        "CKSP",       "DONCHIAN",       "FRAMA",     "HMA",
+    "ICHIMOKU",            "KC",              "MCGD",    "RMA",         "SUPERTREND",  "SWAK_BUTTER", "SWAK_GAUSS",  "VIDYA",      "VWMA",           "ZIGZAG",    "ZLEMA",
+    "AD",                  "ADOSC",           "CMF",     "EFI",         "EMV",         "KVO",         "MARKETFI",    "NVI",        "OBV",            "PVI",       "PVO",
+    "PVT",                 "RVOL",            "VWAP",    "ADR",         "BBW",         "CVI",         "MASSI",       "PERCENTB",   "ROGERSSATCHELL", "RVI",       "RVIR",
+    "AVGDEV",              "AVGPRICE",        "HA",      "MEDPRICE",    "TYPPRICE",    "WCLPRICE",    "BETA",        "CORREL",     "KURTOSIS",       "LINEARREG", "LINEARREG_ANGLE",
+    "LINEARREG_INTERCEPT", "LINEARREG_SLOPE", "MEDIAN",  "PERCENTILE",  "PERCENTRANK", "STDDEV",      "TSF",         "VAR",        "ADD",            "CUMSUM",    "DIV",
+    "MAXINDEX",            "MININDEX",        "MINMAX",  "MINMAXINDEX", "MULT",        "SUB",         "HT_DCPERIOD", "HT_DCPHASE", "HT_PHASOR",      "HT_SINE",   "HT_TRENDLINE",
+    "HT_TRENDMODE",        "MAMA",            "SWAK_BP", "SWAK_HP",     "SWAK_2PHP",   "ACOS",        "ASIN",        "ATAN",       "CEIL",           "COS",       "COSH",
+    "EXP",                 "FLOOR",           "LN",      "LOG10",       "SIN",         "SINH",        "SQRT",        "TAN",        "TANH",
 };
 const n_func = func_names.len;
 
@@ -165,8 +193,38 @@ const ulp_bound = blk: {
     // distance to 2 ULP of the result (measured: 14 of 15066 values, max 2). Every other
     // function, `log` of ROGERSSATCHELL and `sqrt` included, agrees bitwise.
     b[@backingInt(Func.linearreg_angle)] = 2;
+    // ACOS, ASIN, ATAN, SINH, COSH, TANH: Zig has no builtin for them, `xmath.zig` writes them (double-double
+    // inverse trigonometric functions, fdlibm hyperbolics with a double-double exponential from 22 up). Against
+    // the C library of the oracle (glibc) 0.01% to 1% of the results differ in the last bit (measured max 1 ULP,
+    // 2 for SINH and TANH): the C library is not correctly rounded, ours is except for the hyperbolics.
+    for ([_]Func{ .acos, .asin, .atan, .cosh, .sinh, .tanh }) |f| b[@backingInt(f)] = 2;
     break :blk b;
 };
+
+/// Allowed distance as a fraction of the largest |value| of the same output column of the same record, besides
+/// the ULP bound (either one passes). The Hilbert-transform family and MAMA run a recursion that feeds an
+/// `atan` of the C library back into itself: where glibc's `atan` rounds differently from ours (about one in
+/// 4000 arguments, measured on ATAN alone: 8 of 31883) the two runs differ by a last bit, which the filter
+/// carries along, a few ULP of the column maximum at the end (measured max 1e-15). In ULPs of an output that is
+/// near zero it reads like thousands, hence the column-relative form.
+const scaled_bound = blk: {
+    var b: [n_func]f64 = @splat(0.0);
+    for ([_]Func{ .ht_dcperiod, .ht_dcphase, .ht_phasor, .ht_sine, .mama }) |f| b[@backingInt(f)] = 1e-13;
+    break :blk b;
+};
+/// The same allowance for every function that takes a moving-average type, when that type is MAMA.
+const mama_slot_scaled: f64 = 1e-12;
+
+fn usesMama(cs: Case) bool {
+    const m: i32 = 7;
+    return switch (cs.func) {
+        .ma, .bbands, .bbw, .percentb => cs.ip[1] == m,
+        .macdext => cs.ip[1] == m or cs.ip[3] == m or cs.ip[5] == m,
+        .stoch => cs.ip[2] == m or cs.ip[4] == m,
+        .stochf, .mavp, .pvo => cs.ip[2] == m,
+        else => false,
+    };
+}
 
 /// What the inputs are: close; high+low; high+low+close; close+volume; close+per-bar periods.
 const InKind = enum { c, hl, hlc, cv, cp };
@@ -210,7 +268,7 @@ fn nOut(f: Func) usize {
     return switch (f) {
         .macd, .macdext, .macdfix, .bbands, .accbands, .donchian, .kc, .zigzag => 3,
         .ichimoku => 4,
-        .stoch, .stochf, .cksp, .supertrend, .kvo, .minmax, .minmaxindex => 2,
+        .stoch, .stochf, .cksp, .supertrend, .kvo, .minmax, .minmaxindex, .ht_phasor, .ht_sine, .mama => 2,
         .ha => 4,
         else => 1,
     };
@@ -264,6 +322,25 @@ fn genInput(seed: u64, kind: u8, h: []f64, l: []f64, c: []f64) void {
                 },
                 else => if (pick == 0) 0.0 else -0.0,
             };
+            hh.* = cc.*;
+            ll.* = cc.*;
+        }
+        return;
+    }
+    if (kind == 4 or kind == 5) {
+        // Math transforms: kind 4 stays inside [-1.2, 1.2] (ACOS / ASIN domain, small arguments) behind a head of
+        // edge values; kind 5 spans many decades of both signs (overflow and underflow of EXP / COSH / SINH, big
+        // trigonometric arguments).
+        const head = [_]f64{ 0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 1.0000000000000002, -1.0000000000000002, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64), 710.0, -745.0, 1e22, 1e-310 };
+        for (h, l, c, 0..) |*hh, *ll, *cc, i| {
+            if (i < head.len and kind == 4) {
+                cc.* = head[i];
+            } else if (kind == 4) {
+                cc.* = (r.float(f64) - 0.5) * 2.4;
+            } else {
+                const mag = std.math.pow(f64, 10.0, (r.float(f64) - 0.3) * 8.0);
+                cc.* = if (r.boolean()) mag else -mag;
+            }
             hh.* = cc.*;
             ll.* = cc.*;
         }
@@ -500,6 +577,37 @@ fn runOurs(comptime T: type, gpa: std.mem.Allocator, cs: Case, s: Ser(T), o: *[4
         .minindex => ind.minindex(T, c, io[0], .{ .period = us(ip[0]) }),
         .minmax => ind.minmax(T, c, o[0], o[1], .{ .period = us(ip[0]) }),
         .minmaxindex => ind.minmaxindex(T, c, io[0], io[1], .{ .period = us(ip[0]) }),
+        // cycle
+        .ht_dcperiod => ind.htDcperiod(T, c, o[0], .{ .unstable = un }),
+        .ht_dcphase => ind.htDcphase(T, c, o[0], .{ .unstable = un }),
+        .ht_phasor => ind.htPhasor(T, c, o[0], o[1], .{ .unstable = un }),
+        .ht_sine => ind.htSine(T, c, o[0], o[1], .{ .unstable = un }),
+        .ht_trendline => ind.htTrendline(T, c, o[0], .{ .unstable = un }),
+        .ht_trendmode => blk: {
+            const tr = try gpa.alloc(i8, c.len);
+            const lb = try ind.htTrendmode(T, c, tr, .{ .unstable = un });
+            for (o[0][0..c.len], tr, 0..) |*d, t, i| d.* = if (i < lb) std.math.nan(T) else @floatFromInt(t);
+            break :blk lb;
+        },
+        .mama => ind.mama(T, c, o[0], o[1], .{ .fast_limit = dp[0], .slow_limit = dp[1], .unstable = un }),
+        .swak_bp => ind.swakBp(T, c, o[0], .{ .period = us(ip[0]), .delta = dp[0], .unstable = un }),
+        .swak_hp => ind.swakHp(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .swak_2php => ind.swak2php(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .acos => ind.acos(T, c, o[0]),
+        .asin => ind.asin(T, c, o[0]),
+        .atan => ind.atan(T, c, o[0]),
+        .ceil => ind.ceil(T, c, o[0]),
+        .cos => ind.cos(T, c, o[0]),
+        .cosh => ind.cosh(T, c, o[0]),
+        .exp => ind.exp(T, c, o[0]),
+        .floor => ind.floor(T, c, o[0]),
+        .ln => ind.ln(T, c, o[0]),
+        .log10 => ind.log10(T, c, o[0]),
+        .sin => ind.sin(T, c, o[0]),
+        .sinh => ind.sinh(T, c, o[0]),
+        .sqrt => ind.sqrt(T, c, o[0]),
+        .tan => ind.tan(T, c, o[0]),
+        .tanh => ind.tanh(T, c, o[0]),
     };
 }
 
@@ -522,8 +630,8 @@ fn periods(comptime ps: []const i32) [ps.len]P {
     return r;
 }
 
-/// MA types in the grid: every built type (MAMA, 7, is not built).
-const grid_ma = [_]i32{ 0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 13, 14, 15 };
+/// MA types in the grid: every type.
+const grid_ma = [_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15 };
 
 fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
     var l: std.ArrayList(P) = .empty;
@@ -544,13 +652,13 @@ fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
         .macdfix => try l.appendSlice(gpa, &periods(&.{ 9, 1, 2, 3, 5, 20, 0, 100001 })),
         .macdext => {
             const per = [_][3]i32{ .{ 12, 26, 9 }, .{ 5, 8, 3 }, .{ 9, 4, 1 }, .{ 3, 3, 2 } };
-            const ty = [_][3]i32{ .{ 0, 0, 0 }, .{ 1, 1, 1 }, .{ 2, 2, 2 }, .{ 2, 1, 0 }, .{ 0, 1, 2 }, .{ 10, 0, 1 }, .{ 3, 4, 5 }, .{ 6, 8, 9 }, .{ 12, 13, 14 }, .{ 15, 3, 6 }, .{ 4, 4, 4 }, .{ 8, 8, 8 } };
+            const ty = [_][3]i32{ .{ 0, 0, 0 }, .{ 1, 1, 1 }, .{ 2, 2, 2 }, .{ 2, 1, 0 }, .{ 0, 1, 2 }, .{ 10, 0, 1 }, .{ 3, 4, 5 }, .{ 6, 8, 9 }, .{ 12, 13, 14 }, .{ 15, 3, 6 }, .{ 4, 4, 4 }, .{ 8, 8, 8 }, .{ 7, 7, 7 }, .{ 0, 7, 1 }, .{ 7, 0, 7 } };
             for (per) |a| for (ty) |t| try l.append(gpa, pn(.{ a[0], t[0], a[1], t[1], a[2], t[2] }));
             try l.append(gpa, pn(.{ 1, 0, 26, 0, 9, 0 }));
             try l.append(gpa, pn(.{ 12, 0, 26, 0, 100001, 0 }));
         },
         .bbands => {
-            for ([_]i32{ 20, 5, 2, 10, 3 }) |per| for (grid_ma) |t| try l.append(gpa, .{ .ip = .{ per, t, 0, 0, 0, 0 }, .dp = d2(2, 2) });
+            for ([_]i32{ 20, 5, 2, 10, 3, 34, 50 }) |per| for (grid_ma) |t| try l.append(gpa, .{ .ip = .{ per, t, 0, 0, 0, 0 }, .dp = d2(2, 2) });
             try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = d2(1.5, 2.5) });
             try l.append(gpa, .{ .ip = .{ 9, 1, 0, 0, 0, 0 }, .dp = d2(2.5, 0.5) });
             try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = d2(-1, -1) });
@@ -559,11 +667,11 @@ fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
             try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = d2(4e37, 2) });
         },
         .stoch => {
-            for ([_][5]i32{ .{ 5, 3, 0, 3, 0 }, .{ 1, 1, 0, 1, 0 }, .{ 14, 3, 1, 3, 2 }, .{ 3, 2, 0, 5, 2 }, .{ 10, 5, 2, 1, 0 }, .{ 9, 1, 1, 4, 1 }, .{ 5, 3, 10, 3, 0 }, .{ 0, 3, 0, 3, 0 }, .{ 5, 0, 0, 3, 0 }, .{ 5, 3, 0, 100001, 0 }, .{ 8, 4, 3, 3, 4 }, .{ 8, 4, 5, 5, 6 }, .{ 8, 4, 8, 3, 9 }, .{ 8, 4, 12, 3, 13 }, .{ 8, 4, 14, 3, 15 }, .{ 14, 6, 6, 4, 8 } }) |t|
+            for ([_][5]i32{ .{ 5, 3, 0, 3, 0 }, .{ 1, 1, 0, 1, 0 }, .{ 14, 3, 1, 3, 2 }, .{ 3, 2, 0, 5, 2 }, .{ 10, 5, 2, 1, 0 }, .{ 9, 1, 1, 4, 1 }, .{ 5, 3, 10, 3, 0 }, .{ 0, 3, 0, 3, 0 }, .{ 5, 0, 0, 3, 0 }, .{ 5, 3, 0, 100001, 0 }, .{ 8, 4, 3, 3, 4 }, .{ 8, 4, 5, 5, 6 }, .{ 8, 4, 8, 3, 9 }, .{ 8, 4, 12, 3, 13 }, .{ 8, 4, 14, 3, 15 }, .{ 8, 4, 7, 3, 7 }, .{ 14, 6, 6, 4, 8 } }) |t|
                 try l.append(gpa, pn(.{ t[0], t[1], t[2], t[3], t[4], 0 }));
         },
         .stochf => {
-            for ([_][3]i32{ .{ 5, 3, 0 }, .{ 1, 1, 0 }, .{ 9, 4, 1 }, .{ 14, 3, 2 }, .{ 3, 5, 2 }, .{ 4, 1, 1 }, .{ 5, 3, 10 }, .{ 0, 3, 0 }, .{ 5, 0, 0 }, .{ 6, 4, 3 }, .{ 6, 4, 4 }, .{ 6, 5, 5 }, .{ 6, 4, 6 }, .{ 6, 4, 8 }, .{ 6, 5, 9 }, .{ 6, 4, 12 }, .{ 6, 4, 13 }, .{ 10, 6, 14 }, .{ 6, 4, 15 } }) |t|
+            for ([_][3]i32{ .{ 5, 3, 0 }, .{ 1, 1, 0 }, .{ 9, 4, 1 }, .{ 14, 3, 2 }, .{ 3, 5, 2 }, .{ 4, 1, 1 }, .{ 5, 3, 10 }, .{ 0, 3, 0 }, .{ 5, 0, 0 }, .{ 6, 4, 3 }, .{ 6, 4, 4 }, .{ 6, 5, 5 }, .{ 6, 4, 6 }, .{ 6, 4, 8 }, .{ 6, 5, 9 }, .{ 6, 4, 12 }, .{ 6, 4, 13 }, .{ 6, 4, 7 }, .{ 10, 6, 14 }, .{ 6, 4, 15 } }) |t|
                 try l.append(gpa, pn(.{ t[0], t[1], t[2], 0, 0, 0 }));
         },
         .dema, .tema, .rma => try l.appendSlice(gpa, &periods(&.{ 30, 1, 2, 3, 5, 12, 26, 50, 100, 0, 100001 })),
@@ -581,13 +689,22 @@ fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
         .pvo => {
             for ([_][3]i32{ .{ 12, 26, 1 }, .{ 2, 3, 0 }, .{ 5, 3, 2 }, .{ 10, 20, 10 }, .{ 26, 12, 1 }, .{ 4, 9, 0 }, .{ 3, 3, 1 }, .{ 2, 5, 2 }, .{ 6, 12, 0 }, .{ 1, 26, 1 } }) |t|
                 try l.append(gpa, pn(.{ t[0], t[1], t[2], 0, 0, 0 }));
-            // every MaType but MAMA (7) in the smoothing slot
+            // every MaType in the smoothing slot
             for ([_][2]i32{ .{ 12, 26 }, .{ 3, 5 } }) |fs| for (grid_ma) |t| try l.append(gpa, pn(.{ fs[0], fs[1], t, 0, 0, 0 }));
         },
         .rvol => try l.appendSlice(gpa, &periods(&.{ 20, 1, 2, 3, 5, 10, 0, 100001 })),
+        // cycle wave
+        .ht_dcperiod, .ht_dcphase, .ht_phasor, .ht_sine, .ht_trendline, .ht_trendmode => try l.append(gpa, .{}),
+        .mama => for ([_][2]f64{ .{ 0.5, 0.05 }, .{ 0.25, 0.04 }, .{ 0.99, 0.01 }, .{ 0.01, 0.01 }, .{ 0.3, 0.6 }, .{ 0.7, 0.99 }, .{ 0.009, 0.05 }, .{ 0.5, 0.995 }, .{ 0.5, std.math.nan(f64) } }) |t|
+            try l.append(gpa, .{ .dp = d2(t[0], t[1]) }),
+        .swak_bp => for ([_][2]f64{ .{ 20, 0.1 }, .{ 5, 0.05 }, .{ 7, 0.5 }, .{ 2000, 0.3 }, .{ 50, 0.2 }, .{ 12, 0.4 }, .{ 4, 0.1 }, .{ 2001, 0.1 }, .{ 20, 0.04 }, .{ 20, 0.51 }, .{ 20, std.math.nan(f64) } }) |t|
+            try l.append(gpa, .{ .ip = .{ @intFromFloat(t[0]), 0, 0, 0, 0, 0 }, .dp = d2(t[1], 0) }),
+        .swak_hp => try l.appendSlice(gpa, &periods(&.{ 20, 5, 6, 7, 10, 50, 100, 1000, 4, 0, 100001 })),
+        .swak_2php => try l.appendSlice(gpa, &periods(&.{ 20, 2, 3, 5, 10, 50, 100, 1, 0, 10001 })),
+        .acos, .asin, .atan, .ceil, .cos, .cosh, .exp, .floor, .ln, .log10, .sin, .sinh, .sqrt, .tan, .tanh => try l.append(gpa, .{}),
         .adr => try l.appendSlice(gpa, &periods(&.{ 14, 1, 2, 3, 5, 30, 0, 100001 })),
         .bbw, .percentb => {
-            for ([_]i32{ 20, 5, 2, 10, 3 }) |per| for (grid_ma) |t| try l.append(gpa, .{ .ip = .{ per, t, 0, 0, 0, 0 }, .dp = d2(2, 2) });
+            for ([_]i32{ 20, 5, 2, 10, 3, 34, 50 }) |per| for (grid_ma) |t| try l.append(gpa, .{ .ip = .{ per, t, 0, 0, 0, 0 }, .dp = d2(2, 2) });
             try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = d2(1.5, 2.5) });
             try l.append(gpa, .{ .ip = .{ 9, 1, 0, 0, 0, 0 }, .dp = d2(2.5, 0.5) });
             try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = d2(-1, -1) });
@@ -641,7 +758,7 @@ fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
         }) |t|
             try l.append(gpa, .{ .dp = t }),
         .mavp => {
-            for ([_]i32{ 0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 13, 14, 15 }) |t| try l.append(gpa, pn(.{ 2, 30, t, 0, 0, 0 }));
+            for ([_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15 }) |t| try l.append(gpa, pn(.{ 2, 30, t, 0, 0, 0 }));
             for ([_][3]i32{ .{ 2, 10, 0 }, .{ 5, 5, 1 }, .{ 1, 10, 0 }, .{ 3, 12, 4 }, .{ 2, 14, 6 }, .{ 2, 10, 8 }, .{ 2, 12, 9 }, .{ 1, 1, 0 }, .{ 5, 2, 0 }, .{ 0, 10, 0 }, .{ 2, 10001, 0 } }) |t|
                 try l.append(gpa, pn(.{ t[0], t[1], t[2], 0, 0, 0 }));
         },
@@ -672,6 +789,7 @@ fn unstableMatters(f: Func) bool {
         .avgdev, .avgprice, .medprice, .typprice, .wclprice, .beta, .correl, .kurtosis => false,
         .linearreg, .linearreg_angle, .linearreg_intercept, .linearreg_slope, .median, .percentile, .percentrank => false,
         .stddev, .tsf, .@"var", .add, .sub, .mult, .div, .cumsum, .maxindex, .minindex, .minmax, .minmaxindex => false,
+        .acos, .asin, .atan, .ceil, .cos, .cosh, .exp, .floor, .ln, .log10, .sin, .sinh, .sqrt, .tan, .tanh => false,
         else => true,
     };
 }
@@ -695,13 +813,41 @@ fn probeLookback(gpa: std.mem.Allocator, cs_in: Case) ?usize {
 /// How many parameter sets of a function get frozen vectors (the seed and
 /// overlap functions keep 4; the volume / statistic waves 2, to keep the frozen file small).
 fn emitSets(f: Func) usize {
+    if (isMathTx(f)) return 1;
     return if (@backingInt(f) < @backingInt(Func.ad)) 4 else 2;
+}
+
+/// Frozen-vector length: the Hilbert family and MAMA only start answering at bar 32 / 63, so their vectors are longer.
+fn vecLen(f: Func) u32 {
+    return if (isHt(f)) 100 else vec_n;
+}
+
+/// The Hilbert-transform family and MAMA: a long warm-up (lookback 32 / 63 plus an unstable period of up to 556).
+fn isHt(f: Func) bool {
+    return switch (f) {
+        .ht_dcperiod, .ht_dcphase, .ht_phasor, .ht_sine, .ht_trendline, .ht_trendmode, .mama => true,
+        else => false,
+    };
+}
+
+/// The element-wise math transforms; they also get inputs inside their domains (kinds 4, 5).
+fn isMathTx(f: Func) bool {
+    return switch (f) {
+        .acos, .asin, .atan, .ceil, .cos, .cosh, .exp, .floor, .ln, .log10, .sin, .sinh, .sqrt, .tan, .tanh => true,
+        else => false,
+    };
 }
 
 /// Functions whose output is an input value (or its index) picked out of a window: a tie between
 /// equal values, 0.0 and -0.0 included, is decided by the scan order, so the sign / index can differ.
 fn hasZeroTies(f: Func) bool {
     return f == .max or f == .min or f == .minmax or f == .maxindex or f == .minindex or f == .minmaxindex;
+}
+
+/// Input kinds of the long case besides the plain walk: flat runs and tiny values, and for the math transforms
+/// values inside their domains (kind 4) and a wide magnitude range (kind 5).
+fn kindsOf(f: Func) []const u8 {
+    return if (isMathTx(f)) &.{ 1, 2, 4, 5 } else &.{ 1, 2 };
 }
 
 fn addLen(gpa: std.mem.Allocator, ns: *std.ArrayList(u32), n: usize) !void {
@@ -729,16 +875,16 @@ fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
             const lb = lbo.?;
             const per: usize = @intCast(@max(pp.ip[0], 1));
             var ns: std.ArrayList(u32) = .empty;
-            for ([_]usize{ 1, 2, per -| 1, per, per + 1, lb, lb + 1, lb + 2, vec_n, 300 }) |n| try addLen(gpa, &ns, n);
+            for ([_]usize{ 1, 2, per -| 1, per, per + 1, lb, lb + 1, lb + 2, vecLen(f), 300 }) |n| try addLen(gpa, &ns, n);
             if (pi == 0) try addLen(gpa, &ns, 5000);
             for (ns.items) |n| {
                 var c = base;
                 c.n = n;
                 seed += 1;
                 c.seed = seed;
-                c.emit = n == vec_n and pi < emitSets(f);
+                c.emit = n == vecLen(f) and pi < emitSets(f);
                 try cases.append(gpa, c);
-                if (n == 300 and pi < 4) for ([_]u8{ 1, 2 }) |k| {
+                if ((n == 300 or (n == 5000 and isMathTx(f))) and pi < 4) for (kindsOf(f)) |k| {
                     var ck = c;
                     ck.kind = k;
                     seed += 1;
@@ -765,7 +911,7 @@ fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
             if (pi == 0 and f != .trange) {
                 var c32 = base;
                 c32.is32 = true;
-                c32.n = vec_n;
+                c32.n = vecLen(f);
                 seed += 1;
                 c32.seed = seed;
                 c32.emit = true;
@@ -773,14 +919,15 @@ fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
             }
             if (unstableMatters(f) and pi < 6) {
                 for ([_][2]u32{ .{ 0, 3 }, .{ 1, 0 }, .{ 2, 0 } }) |u| {
-                    for ([_]usize{ lb + 1, vec_n, 300 }) |n| {
+                    for ([_]usize{ lb + 1, vecLen(f), 300, 700 }, 0..) |n, qi| {
+                        if (qi == 3 and !isHt(f)) continue; // the long run is for the Hilbert family's AUTO warm-up
                         var c = base;
                         c.ukind = @intCast(u[0]);
                         c.ubars = u[1];
                         c.n = @intCast(n);
                         seed += 1;
                         c.seed = seed;
-                        c.emit = n == vec_n and pi < 2 and !(u[0] == 2) and !(u[0] == 0 and pi == 1);
+                        c.emit = n == vecLen(f) and pi < 2 and !(u[0] == 2) and !(u[0] == 0 and pi == 1);
                         try cases.append(gpa, c);
                         if (n == 300 and u[0] == 1 and pi < 3) {
                             var c32 = c;
@@ -817,6 +964,8 @@ const Stat = struct {
     values: usize = 0,
     bitwise: usize = 0,
     max_ulp: u64 = 0,
+    /// Largest |ours - TA-Lib| over the largest |TA-Lib| value of the same output of the same record.
+    max_scaled: f64 = 0.0,
     bad: usize = 0,
     reported: usize = 0,
 };
@@ -888,6 +1037,11 @@ fn checkCase(comptime T: type, c: *Ctx, arena: std.mem.Allocator, cs: Case, head
         }
         var bad_here = false;
         for (0..no) |q| {
+            var col_max: f64 = 0.0;
+            if (!idx_out) for (0..nb) |i| {
+                const w64: f64 = @bitCast(std.mem.readInt(u64, theirs[(q * nb + i) * 8 ..][0..8], .little));
+                if (std.math.isFinite(w64)) col_max = @max(col_max, @abs(w64));
+            };
             const lead = @min(lb, n);
             if (idx_out) {
                 for (io[q][0..lead]) |v| if (v != ind.no_index) {
@@ -921,8 +1075,11 @@ fn checkCase(comptime T: type, c: *Ctx, arena: std.mem.Allocator, cs: Case, head
                 }
                 st.values += 1;
                 if (d == 0) st.bitwise += 1;
+                if (!idx_out and col_max > 0.0 and d != std.math.maxInt(u64)) st.max_scaled = @max(st.max_scaled, @abs(got_f - want_f) / col_max);
                 st.max_ulp = @max(st.max_ulp, d);
-                if (d > ulp_bound[@backingInt(cs.func)] and !bad_here) {
+                const sb: f64 = if (usesMama(cs)) mama_slot_scaled else scaled_bound[@backingInt(cs.func)];
+                const within_scaled = sb > 0.0 and @abs(got_f - want_f) <= sb * col_max;
+                if (d > ulp_bound[@backingInt(cs.func)] and !within_scaled and !bad_here) {
                     report(c, cs, "output {d} at {d}: ours {e} TA-Lib {e} ({d} ulp)", .{ q, lb + i, got_f, want_f, d });
                     bad_here = true;
                 }
@@ -1106,9 +1263,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     var failed = false;
     std.debug.print("interop-indicators: {s}, {d} records\n", .{ version, cases.items.len });
-    std.debug.print("  {s:<8} {s:>8} {s:>10} {s:>10} {s:>8} {s:>5}\n", .{ "func", "records", "values", "bitwise", "max ulp", "bad" });
+    std.debug.print("  {s:<8} {s:>8} {s:>10} {s:>10} {s:>8} {s:>5} {s:>10}\n", .{ "func", "records", "values", "bitwise", "max ulp", "bad", "max/colmax" });
     for (func_names, ctx.stats) |name, st| {
-        std.debug.print("  {s:<8} {d:>8} {d:>10} {d:>10} {d:>8} {d:>5}\n", .{ name, st.records, st.values, st.bitwise, st.max_ulp, st.bad });
+        std.debug.print("  {s:<8} {d:>8} {d:>10} {d:>10} {d:>8} {d:>5} {e:>10.1}\n", .{ name, st.records, st.values, st.bitwise, st.max_ulp, st.bad, st.max_scaled });
         if (st.bad != 0) failed = true;
     }
     if (failed) {
@@ -1118,6 +1275,8 @@ pub fn main(init: std.process.Init) !u8 {
     if (emit_path) |pth| {
         try vec.writer.writeAll("};\n\npub const ulp_bound = [_]u64{");
         for (ulp_bound, 0..) |b, k| try vec.writer.print("{s}{d}", .{ if (k > 0) ", " else " ", b });
+        try vec.writer.writeAll(" };\n\npub const scaled_bound = [_]f64{");
+        for (scaled_bound, 0..) |b, k| try vec.writer.print("{s}{e}", .{ if (k > 0) ", " else " ", b });
         try vec.writer.writeAll(" };\n");
         if (std.fs.path.dirname(pth)) |d| try cwd.createDirPath(io, d);
         try cwd.writeFile(io, .{ .sub_path = pth, .data = vec.written() });

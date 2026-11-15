@@ -12,9 +12,10 @@ const ind = @import("root.zig");
 const vecs = @import("testdata/talib_vectors.zig");
 const testing = std.testing;
 
-const max_n = 64;
+const max_n = 128;
 const n_overlap = 44; // functions 0..43: seed set and overlap studies
-const n_func = 94;
+const n_vs_end = 94; // functions 44..93: the volume / statistic waves; the cycle wave follows
+const n_func = n_vs_end + 25;
 
 fn mt(x: i32) ind.MaType {
     return @fromBackingInt(@intCast(@as(u8, @intCast(x))));
@@ -229,6 +230,81 @@ fn runVs(comptime T: type, v: vecs.Vec, x: [5][]const T, o: *[4][]T, io: *[2][]u
     };
 }
 
+/// The cycle wave (ids after the 94 earlier functions), same order as the `Func` enum of tools/interop.zig.
+const Fc = enum(u8) {
+    ht_dcperiod = n_vs_end,
+    ht_dcphase,
+    ht_phasor,
+    ht_sine,
+    ht_trendline,
+    ht_trendmode,
+    mama,
+    swak_bp,
+    swak_hp,
+    swak_2php,
+    acos,
+    asin,
+    atan,
+    ceil,
+    cos,
+    cosh,
+    exp,
+    floor,
+    ln,
+    log10,
+    sin,
+    sinh,
+    sqrt,
+    tan,
+    tanh,
+};
+
+/// One close series in, up to two outputs.
+fn runCy(comptime T: type, v: vecs.Vec, c: []const T, o: *[4][]T) !usize {
+    const ip = v.ip;
+    const un: ind.Unstable = switch (v.ukind) {
+        0 => .{ .bars = v.ubars },
+        1 => .auto4,
+        else => .auto8,
+    };
+    const dp0: f64 = @bitCast(v.dp[0]);
+    const dp1: f64 = @bitCast(v.dp[1]);
+    const f: Fc = @fromBackingInt(@intCast(v.func));
+    return switch (f) {
+        .ht_dcperiod => ind.htDcperiod(T, c, o[0], .{ .unstable = un }),
+        .ht_dcphase => ind.htDcphase(T, c, o[0], .{ .unstable = un }),
+        .ht_phasor => ind.htPhasor(T, c, o[0], o[1], .{ .unstable = un }),
+        .ht_sine => ind.htSine(T, c, o[0], o[1], .{ .unstable = un }),
+        .ht_trendline => ind.htTrendline(T, c, o[0], .{ .unstable = un }),
+        .ht_trendmode => blk: {
+            var tr: [max_n]i8 = undefined;
+            const n = c.len;
+            const lb = try ind.htTrendmode(T, c, tr[0..n], .{ .unstable = un });
+            for (o[0][0..n], tr[0..n], 0..) |*d, t, i| d.* = if (i < lb) std.math.nan(T) else @floatFromInt(t);
+            break :blk lb;
+        },
+        .mama => ind.mama(T, c, o[0], o[1], .{ .fast_limit = dp0, .slow_limit = dp1, .unstable = un }),
+        .swak_bp => ind.swakBp(T, c, o[0], .{ .period = us(ip[0]), .delta = dp0, .unstable = un }),
+        .swak_hp => ind.swakHp(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .swak_2php => ind.swak2php(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .acos => ind.acos(T, c, o[0]),
+        .asin => ind.asin(T, c, o[0]),
+        .atan => ind.atan(T, c, o[0]),
+        .ceil => ind.ceil(T, c, o[0]),
+        .cos => ind.cos(T, c, o[0]),
+        .cosh => ind.cosh(T, c, o[0]),
+        .exp => ind.exp(T, c, o[0]),
+        .floor => ind.floor(T, c, o[0]),
+        .ln => ind.ln(T, c, o[0]),
+        .log10 => ind.log10(T, c, o[0]),
+        .sin => ind.sin(T, c, o[0]),
+        .sinh => ind.sinh(T, c, o[0]),
+        .sqrt => ind.sqrt(T, c, o[0]),
+        .tan => ind.tan(T, c, o[0]),
+        .tanh => ind.tanh(T, c, o[0]),
+    };
+}
+
 fn isIndexFunc(func: u8) bool {
     return func == @backingInt(Fv.maxindex) or func == @backingInt(Fv.minindex) or func == @backingInt(Fv.minmaxindex);
 }
@@ -277,6 +353,8 @@ fn replay(comptime T: type, v: vecs.Vec) !void {
             else => au = ib[1][0..n],
         }
         lb = try run(T, v, h, l, c, au, &o);
+    } else if (v.func >= n_vs_end) {
+        lb = try runCy(T, v, ib[0][0..n], &o);
     } else {
         var x: [5][]const T = undefined;
         for (0..5) |q| x[q] = ib[q][0..n];
@@ -285,7 +363,14 @@ fn replay(comptime T: type, v: vecs.Vec) !void {
     try testing.expectEqual(@as(usize, v.lb), lb);
     const idx = isIndexFunc(v.func);
     const bound = vecs.ulp_bound[v.func];
+    const sbound = vecs.scaled_bound[v.func];
     for (v.outs, 0..) |col, q| {
+        // largest |value| of this output column, the unit of the scaled bound
+        var col_max: f64 = 0.0;
+        if (!idx) for (col) |bits| {
+            const w: f64 = @bitCast(bits);
+            if (std.math.isFinite(w)) col_max = @max(col_max, @abs(w));
+        };
         if (idx) {
             for (io[q][0..@min(lb, n)]) |x| try testing.expectEqual(ind.no_index, x);
         } else {
@@ -303,7 +388,8 @@ fn replay(comptime T: type, v: vecs.Vec) !void {
             const got = o[q][lb + i];
             const d = ulps(T, got, want);
             const same_zero_sign = std.math.signbit(got) == std.math.signbit(want) or std.math.isNan(want);
-            if (d > bound or (bound == 0 and !same_zero_sign)) {
+            const within_scaled = sbound > 0.0 and @abs(@as(f64, got) - @as(f64, want)) <= sbound * col_max;
+            if ((d > bound and !within_scaled) or (bound == 0 and sbound == 0.0 and !same_zero_sign)) {
                 std.debug.print("vector func {d} ip {any} n {d}: output {d} at {d}: ours {e} TA-Lib {e}\n", .{ v.func, v.ip, v.n, q, lb + i, got, want });
                 return error.TestExpectedEqual;
             }
@@ -313,11 +399,18 @@ fn replay(comptime T: type, v: vecs.Vec) !void {
 
 test "frozen TA-Lib vectors: every function, f64 and f32, unstable levels" {
     try testing.expectEqual(@as(usize, n_func), vecs.ulp_bound.len);
-    // a nonzero bound is applied as ULPs of the output type; the only one is LINEARREG_ANGLE's `atan`
+    // a nonzero bound is applied as ULPs of the output type: LINEARREG_ANGLE's `atan` and the six `xmath` functions
+    // (ACOS ... TANH) are the only ones; the Hilbert family and MAMA carry a column-relative bound instead
+    try testing.expectEqual(n_func, vecs.scaled_bound.len);
     for (vecs.ulp_bound, 0..) |b, k| {
-        if (k == @backingInt(Fv.linearreg_angle)) {
+        const libm_fn = k >= @backingInt(Fc.acos) and k <= @backingInt(Fc.tanh) and k != @backingInt(Fc.ceil) and k != @backingInt(Fc.cos) and k != @backingInt(Fc.exp) and k != @backingInt(Fc.floor) and k != @backingInt(Fc.ln) and k != @backingInt(Fc.log10) and k != @backingInt(Fc.sin) and k != @backingInt(Fc.sqrt) and k != @backingInt(Fc.tan);
+        if (k == @backingInt(Fv.linearreg_angle) or libm_fn) {
             try testing.expectEqual(@as(u64, 2), b);
         } else try testing.expectEqual(@as(u64, 0), b);
+    }
+    for (vecs.scaled_bound, 0..) |b, k| {
+        const hil = k >= @backingInt(Fc.ht_dcperiod) and k <= @backingInt(Fc.mama) and k != @backingInt(Fc.ht_trendline) and k != @backingInt(Fc.ht_trendmode);
+        try testing.expectEqual(if (hil) @as(f64, 1e-13) else 0.0, b);
     }
     var seen: [vecs.ulp_bound.len]usize = @splat(0);
     for (vecs.vectors) |v| {
