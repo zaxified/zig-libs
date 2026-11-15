@@ -579,7 +579,7 @@ test "bench (opt-in via SMTP_BENCH_F1): total decode cost does not depend on how
     // reply lines landing in `pending` at once) cost O(lines^2) inside that
     // one `next()` drain, while feeding it a few octets at a time — where
     // `pending` never holds more than about one line — stayed linear.
-    // Measured pre-fix (F1, `~/CML/20260901-zig-libs-audit/A1/smtp.md`):
+    // Measured pre-fix (F1, the A1 audit report for `smtp`):
     // 64 B feeds 22.3 ms vs 16 KiB feeds 524.6 ms over 8.4 MB of `250\r\n`
     // replies (28x); a 256 KiB single feed was 1,151x a 64 B one. Amortized
     // compact (halve-the-prefix rule) makes total cost O(bytes), independent

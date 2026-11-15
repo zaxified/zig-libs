@@ -1194,7 +1194,7 @@ test "the command buffer's spare capacity holds no AUTH line once AUTH succeeds 
 // `secureZero` calls exist (`auth.plainResponse` `defer`s one over its base64
 // staging buffer; `wipeOut` above zeroizes `self.out`), but nothing in the
 // suite read memory back before this test: deleting either call left the
-// whole suite green (F5, `~/CML/20260901-zig-libs-audit/A1/smtp.md`). Method:
+// whole suite green (F5, the A1 audit report for `smtp`). Method:
 // scrub a stack region with 0xAA, call the function under test AT THE SAME
 // CALL DEPTH so its frame lands inside that region, then re-enter a frame of
 // the same size and count occurrences of the plaintext password. A positive

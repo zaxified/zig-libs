@@ -625,7 +625,7 @@ test "Client.init rejects a body_chunk too small for Stuffer.finish's worst case
 // `error.SkipZigTest`, shown in the summary as "N skip", not folded into
 // "pass" — and it prints "SKIPPED: ..." only when ZIG_LIBS_VERBOSE_SKIP is
 // set, same as the live tests in `netconf`, `ssh` and `tc` (F12,
-// `~/CML/20260901-zig-libs-audit/A1/smtp.md`).
+// the A1 audit report for `smtp`).
 
 fn envVar(name: []const u8) ?[]const u8 {
     return std.process.Environ.getPosix(std.testing.environ, name);
