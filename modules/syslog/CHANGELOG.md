@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: journald stderr detection (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `nowTimestamp` and the `Logger` default clock (duplicate-code pass) read `clock.realtimeMs()`; 0 on a failed read as before. The two monotonic reads that return null on failure (`unix.zig`, `transport.zig`) stay, because `clock` cannot signal failure. New dependency: `clock`.
 - **2026-11-02** — **FIX (blind review of the same day's surface):** `ReconnectingEmitter` backoff runs from the failure of a connect, not its start; `Logger` turns a sink's trailer byte into a space instead of having the record refused; `Options.max_line` has a floor of `min_line_limit` (128); a sink may forward to another logger (re-entry is per logger); one deadline over `journal.Emitter`'s memfd path, `memfd_create` failures mapped by cause. **DOCS:** the parity card.
 
