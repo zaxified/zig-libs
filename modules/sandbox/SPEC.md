@@ -311,7 +311,7 @@ exercise the two root-gated tests).
 
 ## Backlog / deferred
 - **Delta audit 2026-10-29 (§ GK):** 7 mutants over the sweep + review fixes, 4 killed; 3 argued unobservable, counted eq: the EINTR retry in `threadCountFd` (not injectable on procfs) and the `maxInt` uid/gid refusals (unprivileged, `setuid` fails with EPERM anyway — a root/VM lane test would pin "no partial drop"). ReleaseSafe, unfiltered suite.
-- **No-panic sweep 2026-10-29 (§ GK):** SB-1 (`Ruleset.deinit` twice closed a reused fd) and SB-2 (`Threads:` past an 8 KiB `/proc/self/status` skipped the `MultipleThreads` guard) fixed. Blind review (4 LOW, report text in the CML wave log): `maxInt` ids refused before the first side effect, `SetIdFailed` documents the partial-drop state, `threadCountFd` retries EINTR instead of failing open, `deinit`/`initExact` doc notes. The `maxInt` pre-check and the EINTR retry have no killing test (not observable unprivileged / not injectable on procfs).
+- **No-panic sweep 2026-10-29 (§ GK):** SB-1 (`Ruleset.deinit` twice closed a reused fd) and SB-2 (`Threads:` past an 8 KiB `/proc/self/status` skipped the `MultipleThreads` guard) fixed. Blind review (4 LOW, report text in the owner's wave log): `maxInt` ids refused before the first side effect, `SetIdFailed` documents the partial-drop state, `threadCountFd` retries EINTR instead of failing open, `deinit`/`initExact` doc notes. The `maxInt` pre-check and the EINTR retry have no killing test (not observable unprivileged / not injectable on procfs).
 
 - ~~**General seccomp argument filtering / per-rule actions**~~ — **done 2026-10-04**:
   `seccomp.buildRules` (`Rule`, `ArgCmp` with `eq ne lt le gt ge masked_eq` and a required
