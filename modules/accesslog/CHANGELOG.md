@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: strict quoting mode for `writeLogfmtValue` (always quote, `\xNN`, cut marker) and per-caller drop counts for `AsyncSink`, found while moving a consumer onto both.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card Audit score counts the unobservable mutation survivors with the equivalent ones, as the score format has no separate field.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation audit of `writeLogfmtValue`'s `max_len` and the whole of `async_sink.zig` (55 schemata mutants: 53 killed, 1 equivalent, 1 unobservable; new tests for a line logged after `deinit` began, a queue whose line cap binds first and the template path of `logEntry`).
