@@ -531,7 +531,7 @@ pub const ZigzagCore = struct {
             self.pivot = if (x.high > self.pivot) x.high else self.pivot;
         }
         if (n < self.min_len) return null;
-        return .{ .zigzag = self.pivot, .trend = self.trend, .pivot_idx = @intCast(n - self.since) };
+        return .{ .zigzag = self.pivot, .trend = self.trend, .pivot_idx = std.math.cast(i32, n - self.since) orelse std.math.maxInt(i32) }; // saturates past 2^31 bars (TA-Lib's own int indices end there)
     }
 };
 
@@ -545,4 +545,23 @@ pub fn zigzag(comptime T: type, high: []const T, low: []const T, out: []T, trend
 }
 pub fn ZigzagStream(comptime T: type) type {
     return hist.Stream(T, ZigzagParams, ZigzagCore);
+}
+
+test "zigzag: a bar index past 2^31 saturates the i32 pivot index instead of trapping (sweep IND-3)" {
+    // A stream that has seen more than 2^31 bars (a tick feed, a few weeks) must keep answering.
+    var c = try ZigzagCore.init(.{});
+    c.n = std.math.maxInt(i32) + 1000;
+    c.since = 3;
+    c.trend = 1;
+    c.pivot = 10.0;
+    const r = c.step({}, .{ .high = 10.0, .low = 10.0 }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), r.pivot_idx);
+    // below the limit the index is the bar of the pivot, as before
+    var d = try ZigzagCore.init(.{});
+    d.n = 1000;
+    d.since = 3;
+    d.trend = 1;
+    d.pivot = 10.0;
+    const q = d.step({}, .{ .high = 10.0, .low = 10.0 }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i32, 1000), q.pivot_idx);
 }

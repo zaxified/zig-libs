@@ -136,8 +136,11 @@ pub fn BandCore(comptime pct: bool) type {
         pub fn validate(p: Params) Error!void {
             _ = try BandPlan.make(p);
         }
+        /// The ring serves both the deviation (`period` bars) and the average, which may read further
+        /// back (KAMA, ZLEMA, VIDYA keep `period + 1` or more).
         pub fn ringLen(p: Params) usize {
-            return p.period;
+            const plan = BandPlan.make(p) catch return p.period;
+            return @max(p.period, smooth.MaCore.ringLen(plan.ma));
         }
         pub fn lookback(p: Params) usize {
             return (BandPlan.make(p) catch return 0).lb;
@@ -727,6 +730,25 @@ test "volatility: batch == streaming, lookback == leading NaN" {
     try th.checkOne(RviParams, RviStream, rvi, rviLookback, &c, .{});
     try th.checkOne(RviParams, RviStream, rvi, rviLookback, &c, .{ .period = 1, .stddev = 2 });
     try th.checkOne(RviParams, RviStream, rvi, rviLookback, &c, .{ .period = 5, .stddev = 7, .unstable = .{ .bars = 6 } });
+}
+
+test "bbw, percentb: the stream ring serves an average that reads further back than the deviation (sweep IND-1)" {
+    var o: [120]f64 = undefined;
+    var h: [120]f64 = undefined;
+    var l: [120]f64 = undefined;
+    var c: [120]f64 = undefined;
+    var v: [120]f64 = undefined;
+    K.fillBars(&o, &h, &l, &c, &v, 29);
+    const x = .{ .x = &c };
+    // KAMA, ZLEMA and VIDYA keep more than `period` bars: the ring of the band core must be as long as theirs,
+    // else the current bar overwrites the one the average reads and the stream answers another number than
+    // the batch call (and `peek` another number than `update`).
+    inline for (.{ core.MaType.kama, core.MaType.zlema, core.MaType.vidya, core.MaType.hma, core.MaType.alma, core.MaType.mama }) |kind| {
+        try K.checkCore(BbwCore, .{ .period = 6, .ma = kind }, x);
+        try K.checkCore(BbwCore, .{ .period = 20, .ma = kind, .unstable = .{ .bars = 5 } }, x);
+        try K.checkCore(PercentbCore, .{ .period = 6, .ma = kind }, x);
+        try K.checkCore(PercentbCore, .{ .period = 20, .ma = kind, .dev_up = 1.5, .dev_dn = 2.5 }, x);
+    }
 }
 
 test "volatility: f32 inputs" {

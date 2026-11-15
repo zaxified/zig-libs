@@ -773,8 +773,11 @@ fn sortedInsert(s: []f64, len: usize, x: f64) void {
 /// Replace `old` (the first of its run of equals, i.e. the oldest) by `new`
 /// (after the equals of `new`) in the sorted `s` with one shift.
 fn sortedReplace(s: []f64, old: f64, new: f64) void {
+    if (s.len == 0) return;
     const pos = upperBound(s, new);
-    var j = lowerBound(s, old);
+    // `old` is in `s` unless a NaN has been compared into the order (`<` and `<=` are false for it, so
+    // the search can end at `s.len`): then the last slot goes, which keeps every index below in range.
+    var j = @min(lowerBound(s, old), s.len - 1);
     if (j < pos) {
         while (j + 1 < pos) : (j += 1) s[j] = s[j + 1];
         s[pos - 1] = new;
@@ -1027,6 +1030,25 @@ test "kurtosis and correl, beta: closed forms" {
     // beta of a series against itself is 1
     try testing.expectEqual(@as(usize, 4), try beta(f64, &xs, &xs, &out, .{ .period = 4 }));
     try testing.expectApproxEqAbs(@as(f64, 1), out[6], 1e-9);
+}
+
+test "median, percentile: a NaN in the data never takes an index out of the sorted copy (sweep IND-2)" {
+    var prng = std.Random.DefaultPrng.init(0x1d2);
+    const r = prng.random();
+    var xs: [160]f64 = undefined;
+    var out: [160]f64 = undefined;
+    for (0..300) |round| {
+        for (&xs) |*x| x.* = if (r.uintLessThan(u8, 6) == 0) std.math.nan(f64) else @floatFromInt(r.intRangeAtMost(i8, -4, 4));
+        const period = 2 + round % 11;
+        const lb = try median(f64, testing.allocator, &xs, &out, .{ .period = period });
+        try testing.expectEqual(period - 1, lb);
+        _ = try percentile(f64, testing.allocator, &xs, &out, .{ .period = period, .percentile = 40 });
+        const need = try MedianStream(f64).bufLen(.{ .period = period });
+        const buf = try testing.allocator.alloc(f64, need);
+        defer testing.allocator.free(buf);
+        var s = try MedianStream(f64).init(.{ .period = period }, buf);
+        for (xs) |x| _ = s.update(x);
+    }
 }
 
 test "statistic: BadParam edges" {
