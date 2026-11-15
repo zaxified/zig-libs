@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written hex-digit switch is replaced by `std.fmt.charToDigit(c, 16)` (same digits accepted, both cases, same results).
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged).
 - **2026-10-10** — tests: deterministic fuzz driver `OTP_FUZZ` (`src/fuzz_test.zig`): `otp-uri` (a formatted `KeyUri` round-trips field for field; a damaged copy never panics and whatever parses re-formats and re-parses to the same fields) and `otp-code` (hotp / totp / `totpVerify` against an independent enumeration of the skew window: genuine accepted, one off or outside the window refused; formatted codes are `digits` decimal characters that parse back). ReleaseSafe, clean.
