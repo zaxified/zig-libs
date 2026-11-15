@@ -1377,6 +1377,7 @@ test "at capacity an expired entry goes before a fresh one is evicted" {
     var cc = try c.lookupIp("c.example.com");
     defer cc.deinit();
     try testing.expectEqual(@as(u64, 0), c.stats().evictions);
+    try testing.expectEqual(@as(usize, 2), c.stats().entries); // the expired one was removed, not left beside the new one
     var b2 = try c.lookupIp("b.example.com");
     defer b2.deinit();
     try testing.expectEqual(Source.cache, b2.source);
@@ -1685,4 +1686,590 @@ test "with max_concurrent_lookups = 1 the second miss waits for the first" {
     try waitFor(h.io, &fast.done);
     try testing.expect(slow.ok.load(.acquire) and fast.ok.load(.acquire));
     try testing.expectEqual(@as(u32, 2), h.queries());
+    try testing.expectEqual(@as(u32, 0), c.pool_waiters); // the parked miss was counted out again
+}
+
+// ── delta mutation audit 2026-11-15: tests the first schemata run asked for ──
+
+fn dropAnswer(r: anytype) void {
+    if (r) |ans| {
+        var a = ans;
+        a.deinit();
+    } else |_| {}
+}
+
+fn freeCount(c: *CachingResolver) usize {
+    c.pool_mutex.lockUncancelable(c.io);
+    defer c.pool_mutex.unlock(c.io);
+    var n: usize = 0;
+    var it = c.free;
+    while (it) |s| : (it = s.next_free) n += 1;
+    return n;
+}
+
+fn waitUntilClear(io: std.Io, flag: *const std.atomic.Value(bool)) !void {
+    for (0..5000) |_| {
+        if (!flag.load(.acquire)) return;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    return error.TestTimeout;
+}
+
+test "options whose min equals max are valid" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const ok = [_]Options{
+        .{ .min_ttl_s = 5, .max_ttl_s = 5 },
+        .{ .negative_min_ttl_s = 5, .negative_max_ttl_s = 5 },
+        .{ .failure_backoff_min_s = 5, .failure_backoff_max_s = 5 },
+    };
+    for (ok) |o| {
+        var c = try CachingResolver.init(testing.allocator, threaded.io(), .{}, o);
+        c.deinit();
+    }
+}
+
+test "isUpstreamFailure names exactly the six upstream failures" {
+    const upstream = [_]Resolver.Error{ error.Timeout, error.ServerFailed, error.NetworkFailed, error.MalformedResponse, error.DohFailed, error.TlsFailed };
+    for (upstream) |e| try testing.expect(isUpstreamFailure(e));
+    const local = [_]Resolver.Error{ error.BadName, error.NameTooLong, error.OutOfMemory, error.Canceled };
+    for (local) |e| try testing.expect(!isUpstreamFailure(e));
+}
+
+test "backoffDelay doubles from min, stops at max, and a saturated fail count cannot wrap" {
+    var c: CachingResolver = undefined;
+    c.options = .{ .failure_backoff_min_s = 2, .failure_backoff_max_s = 300 };
+    const want = [_]u32{ 2, 4, 8, 16, 32, 64, 128, 256, 300 };
+    for (want, 1..) |w, fails| try testing.expectEqual(w, c.backoffDelay(@intCast(fails)));
+    for ([_]u8{ 33, 64, 65, 100, 255 }) |fails| try testing.expectEqual(@as(u32, 300), c.backoffDelay(fails));
+}
+
+test "prune inside the stale window keeps the payload servable" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .stale_s = 100 });
+    defer c.deinit();
+    var a = try c.lookupIp("a.example.com");
+    defer a.deinit();
+    h.clock.now += 100; // 40 s into the window
+    c.prune();
+    h.stub.mode.store(.servfail, .release);
+    var s = try c.lookupIp("a.example.com");
+    defer s.deinit();
+    try expectIp(&s, .stale, 30);
+}
+
+test "prune keeps failure state until the backoff has elapsed, not a second longer" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .failure_backoff_min_s = 10, .failure_backoff_max_s = 10 });
+    defer c.deinit();
+    h.stub.mode.store(.servfail, .release);
+    const base = h.clock.now;
+    try testing.expectError(error.ServerFailed, c.lookupIp("down.example.com")); // arms until base + 10
+    h.clock.now = base + 9;
+    c.prune();
+    try testing.expectEqual(@as(usize, 1), c.stats().entries);
+    try testing.expectError(error.ServerFailed, c.lookupIp("down.example.com"));
+    try testing.expectEqual(@as(u32, 1), h.queries()); // still backed off, nothing asked
+    h.clock.now = base + 10;
+    c.prune();
+    try testing.expectEqual(@as(usize, 0), c.stats().entries);
+}
+
+test "a payload past the stale window is freed at once, a live backoff is kept" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var c = try CachingResolver.init(fa.allocator(), h.io, h.ropts, .{ .stale_s = 10, .clock = h.clock.clock() });
+    defer c.deinit();
+    const base = h.clock.now;
+    dropAnswer(c.lookupIp("a.example.com"));
+    dropAnswer(c.lookupIp("b.example.com"));
+    h.stub.mode.store(.servfail, .release);
+    h.clock.now = base + 61; // expired, inside the window: stale, failure armed until base + 91
+    for ([_][]const u8{ "a.example.com", "b.example.com" }) |n| {
+        var s = try c.lookupIp(n);
+        s.deinit();
+    }
+    const q = h.queries();
+    h.clock.now = base + 75; // past the window, backoff still armed
+
+    var live = fa.allocated_bytes - fa.freed_bytes;
+    try testing.expectError(error.ServerFailed, c.lookupIp("b.example.com")); // the lookup path frees b
+    try testing.expectEqual(q, h.queries()); // and keeps the backoff: nothing asked
+    try testing.expect(fa.allocated_bytes - fa.freed_bytes < live);
+
+    live = fa.allocated_bytes - fa.freed_bytes;
+    c.prune(); // the prune path frees a
+    try testing.expect(fa.allocated_bytes - fa.freed_bytes < live);
+    try testing.expectEqual(@as(usize, 2), c.stats().entries); // both still carry failure state
+
+    // The clock steps back before the old expiry: the dropped payload is not served.
+    h.clock.now = base + 50;
+    try testing.expectError(error.ServerFailed, c.lookupIp("a.example.com"));
+    try testing.expectEqual(q, h.queries());
+}
+
+test "an expired entry is removed even when the budget then refuses the lookup" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    h.stub.ttl.store(1, .release);
+    var c = try h.cache(.{ .max_network_lookups = .{ .per_s = 1, .burst = 1 } });
+    defer c.deinit();
+    dropAnswer(c.lookupIp("a.example.com"));
+    h.clock.now += 1; // a expired, one token back
+    dropAnswer(c.lookupIp("b.example.com"));
+    try testing.expectError(error.BudgetExceeded, c.lookupIp("a.example.com"));
+    try testing.expectEqual(@as(usize, 1), c.stats().entries); // only b
+}
+
+test "a failure entry without a payload is never served stale" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .stale_s = 1_000_000 }); // wider than the clock value: 0 + stale_s > now
+    defer c.deinit();
+    h.stub.mode.store(.servfail, .release);
+    try testing.expectError(error.ServerFailed, c.lookupIp("never.example.com"));
+    try testing.expectEqual(@as(u64, 0), c.stats().stale_served);
+}
+
+test "a fresh answer without a TTL supersedes the expired one, which is then not served stale" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .stale_s = 1000 });
+    defer c.deinit();
+    dropAnswer(c.lookupIp("a.example.com"));
+    h.clock.now += 61;
+    h.stub.mode.store(.nxdomain_nosoa, .release);
+    var nx = try c.lookupIp("a.example.com");
+    defer nx.deinit();
+    try testing.expectEqual(Resolver.Status.nxdomain, nx.lookup.status);
+    h.stub.mode.store(.servfail, .release);
+    try testing.expectError(error.ServerFailed, c.lookupIp("a.example.com"));
+}
+
+test "a partial answer with a TTL under partial_ttl_s keeps the smaller one" {
+    var h: Harness = .{};
+    try h.start(.any);
+    defer h.stop();
+    h.stub.drop_aaaa.store(true, .release);
+    h.stub.ttl.store(10, .release);
+    var c = try h.cache(.{ .partial_ttl_s = 30 });
+    defer c.deinit();
+    var a = try c.lookupIp("dual.example.com");
+    defer a.deinit();
+    try testing.expect(a.lookup.partial);
+    try expectIp(&a, .network, 10);
+}
+
+test "the token bucket refills per_s tokens a second up to the burst" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_network_lookups = .{ .per_s = 3, .burst = 6 } });
+    defer c.deinit();
+    var buf: [32]u8 = undefined;
+    for (0..6) |i| dropAnswer(c.lookupIp(try std.fmt.bufPrint(&buf, "n{d}.example.com", .{i})));
+    try testing.expectError(error.BudgetExceeded, c.lookupIp("n6.example.com"));
+    h.clock.now += 2; // 2 s x 3 per second = the whole burst again
+    for (6..12) |i| dropAnswer(c.lookupIp(try std.fmt.bufPrint(&buf, "n{d}.example.com", .{i})));
+    try testing.expectError(error.BudgetExceeded, c.lookupIp("n12.example.com"));
+    try testing.expectEqual(@as(u64, 2), c.stats().budget_refused);
+}
+
+test "a clock at the end of u64 saturates instead of overflowing" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .failure_backoff_min_s = 100, .failure_backoff_max_s = 100 });
+    defer c.deinit();
+    h.clock.now = std.math.maxInt(u64) - 5;
+    dropAnswer(c.lookupIp("late.example.com")); // stored with 60 s: the expiry saturates
+    var a = try c.lookupIp("late.example.com");
+    defer a.deinit();
+    try expectIp(&a, .cache, 5);
+    h.stub.mode.store(.servfail, .release);
+    try testing.expectError(error.ServerFailed, c.lookupIp("down.example.com")); // retry_at saturates
+}
+
+test "scanning for an expired entry at capacity looks at the 16 least recently used" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var evictions: [2]u64 = undefined;
+    for ([_]usize{ 15, 16 }, 0..) |k, slot| {
+        var c = try h.cache(.{ .max_entries = 20 });
+        defer c.deinit();
+        var buf: [32]u8 = undefined;
+        for (0..20) |i| {
+            h.stub.ttl.store(if (i == k) 10 else 600, .release);
+            dropAnswer(c.lookupIp(try std.fmt.bufPrint(&buf, "n{d}.example.com", .{i})));
+        }
+        h.clock.now += 20; // only entry k has expired; entry i is i places from the LRU end
+        h.stub.ttl.store(600, .release);
+        dropAnswer(c.lookupIp("new.example.com"));
+        try testing.expectEqual(@as(usize, 20), c.stats().entries);
+        evictions[slot] = c.stats().evictions;
+    }
+    try testing.expectEqual(@as(u64, 0), evictions[0]); // the 16th from the end is found
+    try testing.expectEqual(@as(u64, 1), evictions[1]); // the 17th is not looked at: the LRU one goes
+}
+
+test "keys keep kinds, addresses, names and SRV parts apart" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{});
+    defer c.deinit();
+
+    // reverse key = {reverse, 4, 1, 2, 3, 4}: no name key may equal it.
+    dropAnswer(c.reverse(.{ .v4 = .{ 1, 2, 3, 4 } }));
+    dropAnswer(c.lookupIp("\x04\x01\x02\x03\x04"));
+    try testing.expectEqual(@as(u64, 0), c.stats().hits);
+
+    // two IPv6 addresses that differ only in the last byte
+    const x: netaddr.Ip = .{ .v6 = .{ 0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+    var y = x;
+    y.v6[15] = 2;
+    dropAnswer(c.reverse(x));
+    var ry = try c.reverse(y);
+    defer ry.deinit();
+    try testing.expectEqual(Source.network, ry.source);
+
+    // names that differ only in the last character
+    dropAnswer(c.lookupIp("ending.example.com"));
+    var n2 = try c.lookupIp("ending.example.con");
+    defer n2.deinit();
+    try testing.expectEqual(Source.network, n2.source);
+
+    // SRV: the name is part of the key, case-folded; the part boundaries are too
+    dropAnswer(c.lookupSrv("sip", "tcp", "One.Example.com"));
+    var s1 = try c.lookupSrv("sip", "tcp", "one.example.COM");
+    defer s1.deinit();
+    try testing.expectEqual(Source.cache, s1.source);
+    var s2 = try c.lookupSrv("sip", "tcp", "two.example.com");
+    defer s2.deinit();
+    try testing.expectEqual(Source.network, s2.source);
+    dropAnswer(c.lookupSrv("ab", "c", "x.example.com"));
+    var s3 = try c.lookupSrv("a", "bc", "x.example.com");
+    defer s3.deinit();
+    try testing.expectEqual(Source.network, s3.source);
+    // the kind of an SRV key: {len("ab"), "ab", len("tcp"), "tcp", name} equals the MX key of this name unless a kind byte leads
+    dropAnswer(c.lookupSrv("ab", "tcp", "example.com"));
+    const hits = c.stats().hits;
+    dropAnswer(c.lookupMx("ab\x03tcpexample.com"));
+    try testing.expectEqual(hits, c.stats().hits);
+    // an undefined length byte (0xaa in a safe build) must not stand in for the real one
+    dropAnswer(c.lookupSrv("a\xaa", "b", "y.example.com"));
+    const hits2 = c.stats().hits;
+    dropAnswer(c.lookupSrv("a", "\xaab", "y.example.com"));
+    try testing.expectEqual(hits2, c.stats().hits);
+}
+
+test "key length limits: the last name that fits is cached, the next bypasses the table" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{});
+    defer c.deinit();
+
+    var big: [key_buf_len]u8 = undefined;
+    @memset(&big, 'a');
+    var m = c.stats().misses;
+    dropAnswer(c.lookupIp(big[0 .. key_buf_len - 1])); // kind + name fills the buffer exactly
+    try testing.expectEqual(m + 1, c.stats().misses);
+    m = c.stats().misses;
+    dropAnswer(c.lookupIp(big[0..key_buf_len])); // one byte too long: straight to the resolver
+    try testing.expectEqual(m, c.stats().misses);
+    try testing.expectEqual(@as(u64, 2), c.stats().network_lookups);
+    try testing.expect(c.free != null); // the bypass returned its Resolver
+
+    var svc: [256]u8 = undefined;
+    @memset(&svc, 'a');
+    m = c.stats().misses;
+    dropAnswer(c.lookupSrv(svc[0..255], "tcp", "example.com")); // 255 is the longest part
+    try testing.expectEqual(m + 1, c.stats().misses);
+    dropAnswer(c.lookupSrv("sip", svc[0..255], "example.com"));
+    try testing.expectEqual(m + 2, c.stats().misses);
+    dropAnswer(c.lookupSrv(svc[0..256], "tcp", "example.com")); // 256 does not fit a length byte
+    dropAnswer(c.lookupSrv("sip", svc[0..256], "example.com"));
+    try testing.expectEqual(m + 2, c.stats().misses);
+    // 3 + 255 + 255 + 269 = key_buf_len: fits; one more does not
+    m = c.stats().misses;
+    dropAnswer(c.lookupSrv(svc[0..255], svc[0..255], big[0..269]));
+    try testing.expectEqual(m + 1, c.stats().misses);
+    dropAnswer(c.lookupSrv(svc[0..255], svc[0..255], big[0..270]));
+    try testing.expectEqual(m + 1, c.stats().misses);
+}
+
+test "an allocation failure creating a Resolver leaves the pool as it was" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var c = try CachingResolver.init(failing.allocator(), h.io, h.ropts, .{ .clock = h.clock.clock() });
+    defer c.deinit();
+    try testing.expectError(error.OutOfMemory, c.lookupIp("oom.example.com"));
+    try testing.expectEqual(@as(u16, 0), c.created);
+    try testing.expect(c.free == null and c.all == null);
+    // the table mutex was released (stats takes it) and the miss was counted
+    try testing.expectEqual(@as(u64, 1), c.stats().misses);
+    var huge: [key_buf_len + 100]u8 = undefined;
+    @memset(&huge, 'b');
+    try testing.expectError(error.OutOfMemory, c.lookupIp(&huge)); // the bypass path too
+    try testing.expectEqual(@as(u16, 0), c.created);
+    try testing.expectEqual(@as(u64, 2), c.stats().network_lookups);
+}
+
+test "an allocation failure while arming a failure entry still returns the upstream error" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    h.stub.mode.store(.servfail, .release);
+    var total: usize = 0;
+    {
+        var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+        var c = try CachingResolver.init(counting.allocator(), h.io, h.ropts, .{ .clock = h.clock.clock() });
+        defer c.deinit();
+        try testing.expectError(error.ServerFailed, c.lookupIp("down.example.com"));
+        try testing.expectEqual(@as(usize, 1), c.stats().entries);
+        total = counting.alloc_index;
+    }
+    // Fail every allocation in turn. Most positions fall inside the Resolver (an
+    // OutOfMemory from it); the entry, its key and the table slot are three
+    // positions where the answer is still the upstream error, with nothing armed.
+    var armed_ok: usize = 0;
+    for (0..total) |k| {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = k });
+        var c = try CachingResolver.init(failing.allocator(), h.io, h.ropts, .{ .clock = h.clock.clock() });
+        defer c.deinit();
+        if (c.lookupIp("down.example.com")) |ans| {
+            var x = ans;
+            x.deinit();
+            return error.TestUnexpectedResult;
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
+            error.ServerFailed => {
+                try testing.expectEqual(@as(usize, 0), c.stats().entries);
+                armed_ok += 1;
+            },
+            else => return err,
+        }
+    }
+    try testing.expect(armed_ok >= 3);
+}
+
+/// Fails its first allocation, but only once another task is parked in the
+/// Resolver pool waiting for that very allocation's reservation.
+const GateAllocator = struct {
+    child: std.mem.Allocator,
+    c: *CachingResolver,
+    armed: std.atomic.Value(bool) = .init(true),
+
+    fn allocator(g: *GateAllocator) std.mem.Allocator {
+        return .{ .ptr = g, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const g: *GateAllocator = @ptrCast(@alignCast(ctx));
+        if (g.armed.swap(false, .acq_rel)) {
+            for (0..5000) |_| {
+                g.c.pool_mutex.lockUncancelable(g.c.io);
+                const w = g.c.pool_waiters;
+                g.c.pool_mutex.unlock(g.c.io);
+                if (w >= 1) break;
+                g.c.io.sleep(.fromMilliseconds(2), .awake) catch {};
+            }
+            return null;
+        }
+        return g.child.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const g: *GateAllocator = @ptrCast(@alignCast(ctx));
+        return g.child.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const g: *GateAllocator = @ptrCast(@alignCast(ctx));
+        return g.child.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const g: *GateAllocator = @ptrCast(@alignCast(ctx));
+        g.child.rawFree(m, a, ra);
+    }
+};
+
+test "a failed Resolver allocation hands its reservation to the miss that is waiting for it" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var gate: GateAllocator = .{ .child = testing.allocator, .c = undefined };
+    var c = try CachingResolver.init(gate.allocator(), h.io, h.ropts, .{ .max_concurrent_lookups = 1, .clock = h.clock.clock() });
+    defer c.deinit();
+    gate.c = &c;
+
+    var l1: NamedLookup = .{ .c = &c, .name = "one.example.com" };
+    var l2: NamedLookup = .{ .c = &c, .name = "two.example.com" };
+    var f1 = try h.io.concurrent(NamedLookup.run, .{&l1});
+    defer f1.await(h.io);
+    var f2 = try h.io.concurrent(NamedLookup.run, .{&l2});
+    defer f2.await(h.io);
+    try waitFor(h.io, &l1.done);
+    try waitFor(h.io, &l2.done);
+    // One of them lost the allocation; the other was woken, created the Resolver and answered.
+    try testing.expect(l1.ok.load(.acquire) != l2.ok.load(.acquire));
+    try testing.expectEqual(@as(u16, 1), c.created);
+}
+
+test "the Resolver pool: a popped slot leaves the list, a pushed one keeps the chain, slots are reused" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_concurrent_lookups = 2 });
+    defer c.deinit();
+
+    dropAnswer(c.lookupIp("seq.example.com"));
+    try testing.expectEqual(@as(u16, 1), c.created);
+    try testing.expectEqual(@as(usize, 1), freeCount(&c));
+
+    for (0..2) |round| {
+        var slow: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+        var f = try h.io.concurrent(NamedLookup.run, .{&slow});
+        defer f.await(h.io);
+        errdefer h.stub.release_slow.store(true, .release);
+        try waitFor(h.io, &h.stub.stashed);
+        try testing.expectEqual(round, freeCount(&c)); // the slow miss popped one: none left in round 0, one in round 1
+        var fast_name: [24]u8 = undefined;
+        dropAnswer(c.lookupIp(try std.fmt.bufPrint(&fast_name, "fast{d}.example.com", .{round}))); // takes or creates the second
+        try testing.expectEqual(@as(u16, 2), c.created);
+        try testing.expectEqual(@as(usize, 1), freeCount(&c));
+        h.stub.release_slow.store(true, .release);
+        try waitFor(h.io, &slow.done);
+        try waitUntilClear(h.io, &h.stub.stashed);
+        h.stub.release_slow.store(false, .release);
+        try testing.expectEqual(@as(usize, 2), freeCount(&c)); // the chain survived the push
+        c.clear(); // the slow name is a miss again in the next round
+    }
+}
+
+test "a miss parked in the pool can be cancelled and leaves the pool consistent" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_concurrent_lookups = 1 });
+    defer c.deinit();
+
+    var slow: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+    var f1 = try h.io.concurrent(NamedLookup.run, .{&slow});
+    defer f1.await(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &h.stub.stashed);
+
+    var parked: NamedLookup = .{ .c = &c, .name = "parked.example.com" };
+    var f2 = try h.io.concurrent(NamedLookup.run, .{&parked});
+    var f2_over = false;
+    defer if (!f2_over) f2.cancel(h.io);
+    try waitForWaiters(&c, 1);
+    f2.cancel(h.io);
+    f2_over = true;
+    c.pool_mutex.lockUncancelable(c.io); // not left locked by the cancel path
+    const waiters = c.pool_waiters;
+    c.pool_mutex.unlock(c.io);
+    try testing.expectEqual(@as(u32, 0), waiters);
+    try testing.expect(!parked.ok.load(.acquire));
+
+    h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &slow.done);
+    try testing.expect(slow.ok.load(.acquire));
+    dropAnswer(c.lookupIp("after.example.com")); // the pool still works
+}
+
+test "the expiry and the backoff are measured after the network call, not before" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_concurrent_lookups = 2, .failure_backoff_min_s = 5, .failure_backoff_max_s = 5 });
+    defer c.deinit();
+
+    {
+        var slow: NamedLookup = .{ .c = &c, .name = "slow.a.example.com" };
+        var f = try h.io.concurrent(NamedLookup.run, .{&slow});
+        defer f.await(h.io);
+        errdefer h.stub.release_slow.store(true, .release);
+        try waitFor(h.io, &h.stub.stashed);
+        h.clock.now += 30; // the answer takes 30 s to arrive
+        h.stub.release_slow.store(true, .release);
+        try waitFor(h.io, &slow.done);
+        try waitUntilClear(h.io, &h.stub.stashed);
+        h.stub.release_slow.store(false, .release);
+        const e = c.map.get("\x00slow.a.example.com").?;
+        try testing.expectEqual(h.clock.now + 60, e.expires_s);
+    }
+    h.stub.mode.store(.servfail, .release);
+    {
+        var slow: NamedLookup = .{ .c = &c, .name = "slow.b.example.com" };
+        var f = try h.io.concurrent(NamedLookup.run, .{&slow});
+        defer f.await(h.io);
+        errdefer h.stub.release_slow.store(true, .release);
+        try waitFor(h.io, &h.stub.stashed);
+        h.clock.now += 30;
+        h.stub.release_slow.store(true, .release);
+        try waitFor(h.io, &slow.done);
+        try waitUntilClear(h.io, &h.stub.stashed);
+        h.stub.release_slow.store(false, .release);
+        const e = c.map.get("\x00slow.b.example.com").?;
+        try testing.expectEqual(h.clock.now + 5, e.retry_at_s);
+    }
+}
+
+test "a refreshed answer becomes the most recently used even if another lookup finished meanwhile" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_entries = 2, .max_concurrent_lookups = 2, .stale_s = 100 }); // the expired entry stays in the table
+    defer c.deinit();
+
+    h.stub.ttl.store(5, .release);
+    h.stub.release_slow.store(true, .release);
+    dropAnswer(c.lookupIp("slow.b.example.com")); // b, soon expired
+    try waitUntilClear(h.io, &h.stub.stashed);
+    h.stub.release_slow.store(false, .release);
+    h.stub.ttl.store(600, .release);
+    h.clock.now += 10;
+
+    var slow: NamedLookup = .{ .c = &c, .name = "slow.b.example.com" };
+    var f = try h.io.concurrent(NamedLookup.run, .{&slow});
+    defer f.await(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &h.stub.stashed); // b's refresh is under way (b is the most recently used)
+    dropAnswer(c.lookupIp("c.example.com")); // c finishes first: c is now the most recently used
+    h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &slow.done); // b's answer is stored: b must move in front of c
+    dropAnswer(c.lookupIp("d.example.com")); // evicts the least recently used, which is c
+    try testing.expectEqual(@as(u64, 1), c.stats().evictions);
+    var again = try c.lookupIp("slow.b.example.com");
+    defer again.deinit();
+    try testing.expectEqual(Source.cache, again.source);
+}
+
+test "every pooled Resolver is deinitialised with the cache" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const conf_path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/resolv.conf", .{&tmp.sub_path});
+    try std.Io.Dir.cwd().writeFile(h.io, .{ .sub_path = conf_path, .data = "search example.com\n" });
+    h.ropts.use_search = true; // the Resolver now keeps the resolv.conf text, freed by its deinit
+    h.ropts.resolv_conf_path = conf_path;
+    var c = try h.cache(.{});
+    defer c.deinit();
+    dropAnswer(c.lookupIp("host.example.com"));
+    try testing.expectEqual(@as(u16, 1), c.created);
 }
