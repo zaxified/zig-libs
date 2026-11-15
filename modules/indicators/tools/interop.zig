@@ -1264,12 +1264,16 @@ fn buildCandle(gpa: std.mem.Allocator, cases: *std.ArrayList(Case), f: Func, see
             c.seed = seed.*;
             try cases.append(gpa, c);
         }
-        for ([_]bool{ false, true }) |w32| for (0..160) |_| {
+        // COUNTERATTACK and 3STARSINSOUTH are rare on random 40-bar inputs: more tries until a nonzero answer is frozen
+        const tries: usize = if (f == .cdlcounterattack or f == .cdl3starsinsouth) 1600 else 160;
+        for ([_]bool{ false, true }) |w32| for (0..tries) |_| {
             var c = base;
             c.n = candle_vec_n;
             c.is32 = w32;
-            // vector-size policy: one f64 vector per pattern, an f32 one only for every second pattern (the code is generic over T)
-            c.emit_nz = !w32 or (@backingInt(f) - n_candle_first) % 2 == 0;
+            // vector-size policy: one f64 vector per pattern, an f32 one only for every second pattern (the code is generic
+            // over T) and for the two (3STARSINSOUTH, COUNTERATTACK) whose random 40-bar f64 runs found no nonzero answer
+            const ci = @backingInt(f) - n_candle_first;
+            c.emit_nz = !w32 or ci % 2 == 0 or f == .cdl3starsinsouth or f == .cdlcounterattack;
             seed.* += 1;
             c.seed = seed.*;
             try cases.append(gpa, c);
