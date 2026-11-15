@@ -7,7 +7,7 @@
 //
 // impl: tidwall (github.com/tidwall/wal), wlog (Prometheus tsdb/wlog, no
 // compression), wlog-zstd, wlog-snappy. Scenarios and the TSV line are those
-// of ../../example/bench.zig; every durable write is followed by the
+// of ../bench.zig; every durable write is followed by the
 // implementation's own sync (tidwall: NoSync off; wlog: Sync()).
 package main
 

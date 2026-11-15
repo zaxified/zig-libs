@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: MIT
 
-//! seglog-crash — the workload and the checker for the dm-log-writes crash
-//! test (`run.sh`, next to this file).
+//! interop-seglog — seglog on a real filesystem: the workload and the checker
+//! for the dm-log-writes crash test (`crash-dm/run.sh`), and a no-argument
+//! self-check that `zig build interop` runs.
 //!
-//!     seglog-crash write <dir> <records> [prealloc bytes]
-//!     seglog-crash check <dir>
+//!     zig build interop-seglog                          # self-check, no root
+//!     zig build install-interop-seglog -Doptimize=ReleaseSafe
+//!         # -> zig-out/interop/interop-seglog, what `crash-dm/run.sh` runs:
+//!     interop-seglog write <dir> <records> [prealloc bytes]
+//!     interop-seglog check <dir>
+//!
+//! The self-check writes 200 records into a scratch directory under
+//! `.zig-cache/` (compressing and rotating as `write` does), reads them back
+//! with `check`, and removes the directory.
 //!
 //! `write` creates a log in `<dir>` and appends `records` records with the
 //! default `.always` sync, rotating every 64 records and compressing each
@@ -30,30 +38,36 @@ fn payloadOf(buf: []u8, lsn: u64) []const u8 {
 pub fn main(init: std.process.Init.Minimal) u8 {
     var it = init.args.iterate();
     _ = it.next();
-    const cmd = it.next() orelse return usage();
-    const dir = it.next() orelse return usage();
     const gpa = std.heap.smp_allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
+    const cmd = it.next() orelse {
+        selfCheck(gpa, io) catch |err| {
+            std.debug.print("interop-seglog self-check: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+        return 0;
+    };
+    const dir = it.next() orelse return usage();
     const result = if (std.mem.eql(u8, cmd, "write")) blk: {
         const n = std.fmt.parseInt(u64, it.next() orelse return usage(), 10) catch return usage();
         const pa = if (it.next()) |s| std.fmt.parseInt(u64, s, 10) catch return usage() else 0;
-        break :blk write(gpa, io, dir, n, pa);
+        break :blk write(gpa, io, dir, n, pa, false);
     } else if (std.mem.eql(u8, cmd, "check")) check(gpa, io, dir) else return usage();
     result catch |err| {
-        std.debug.print("seglog-crash {s}: {s}\n", .{ cmd, @errorName(err) });
+        std.debug.print("interop-seglog {s}: {s}\n", .{ cmd, @errorName(err) });
         return 1;
     };
     return 0;
 }
 
 fn usage() u8 {
-    std.debug.print("usage: seglog-crash write <dir> <records> [prealloc] | check <dir>\n", .{});
+    std.debug.print("usage: interop-seglog [write <dir> <records> [prealloc] | check <dir>]\n", .{});
     return 2;
 }
 
-fn write(gpa: std.mem.Allocator, io: std.Io, path: []const u8, n: u64, prealloc: u64) !void {
+fn write(gpa: std.mem.Allocator, io: std.Io, path: []const u8, n: u64, prealloc: u64, quiet: bool) !void {
     const cwd = std.Io.Dir.cwd();
     cwd.createDir(io, path, .default_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
@@ -74,8 +88,10 @@ fn write(gpa: std.mem.Allocator, io: std.Io, path: []const u8, n: u64, prealloc:
     while (lsn <= n) : (lsn += 1) {
         const a = try log.appendAt(@intCast(lsn), payloadOf(&buf, lsn));
         if (a.lsn != lsn) return error.LsnMismatch;
-        try w.print("acked {d}\n", .{lsn});
-        try w.flush();
+        if (!quiet) {
+            try w.print("acked {d}\n", .{lsn});
+            try w.flush();
+        }
         if (lsn % 64 == 0) {
             seg += 1;
             try log.rotate(seg);
@@ -115,4 +131,16 @@ fn report(io: std.Io, n: u64) !void {
     var ow = std.Io.File.stdout().writerStreaming(io, &out_buf);
     try ow.interface.print("records {d}\n", .{n});
     try ow.interface.flush();
+}
+
+/// `zig build interop-seglog` with no argument: write, check, clean up.
+fn selfCheck(gpa: std.mem.Allocator, io: std.Io) !void {
+    const dir = ".zig-cache/seglog-interop";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, dir) catch {};
+    try cwd.createDirPath(io, dir);
+    defer cwd.deleteTree(io, dir) catch {};
+    const log_dir = dir ++ "/log";
+    try write(gpa, io, log_dir, 200, 0, true);
+    try check(gpa, io, log_dir);
 }

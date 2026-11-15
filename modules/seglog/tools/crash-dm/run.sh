@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 # seglog on a real filesystem, crashed at every flush and every FUA write: dm-log-writes.
 #
-#   zig build seglog-crash -Doptimize=ReleaseSafe        # as yourself, first
-#   sudo seglog/tools/crash-dm/run.sh [records] [fs]     # records 300, fs ext4
+#   zig build install-interop-seglog -Doptimize=ReleaseSafe   # as yourself, first
+#   sudo modules/seglog/tools/crash-dm/run.sh [records] [fs]  # records 300, fs ext4
 #
 # What it does. A 64 MiB filesystem is made on a dm-log-writes device, which
 # records every write, flush and FUA in order onto a log device. The workload
-# (`seglog-crash write`) appends `records` records with fsync each, rotating
+# (`interop-seglog write`) appends `records` records with fsync each, rotating
 # and compressing, once without and once with preallocation. Then replay-log
 # (xfstests) replays that log onto a fresh device and, after every flush —
 # every point a power cut could have left the disk in — the checker copies
 # the device, mounts the copy (the filesystem's own journal recovery runs),
-# and runs `seglog-crash check`: the log must open, hold 1, 2, 3 … with the
+# and runs `interop-seglog check`: the log must open, hold 1, 2, 3 … with the
 # right bytes and no gap, and `verify` clean. Across the points the count may
 # only grow, and at the end it must be every record the workload saw acked.
 #
 # Needs root for loop devices, device-mapper and mount; everything else is in
-# egw-hub/.zig-cache/crash-dm (on disk, not tmpfs), and the trap undoes the
+# .zig-cache/crash-dm (on disk, not tmpfs), and the trap undoes the
 # devices and mounts whatever happens. replay-log is GPL-2 test tooling from
 # xfstests: downloaded and built here, never committed or shipped.
 set -euo pipefail
@@ -24,14 +24,14 @@ set -euo pipefail
 N=${1:-300}
 FS=${2:-ext4}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-HUB=$(cd "$HERE/../../.." && pwd)
-BIN=$HUB/zig-out/bin/seglog-crash
-W=$HUB/.zig-cache/crash-dm
+ROOT=$(cd "$HERE/../../../.." && pwd) # the zig-libs checkout
+BIN=$ROOT/zig-out/interop/interop-seglog
+W=$ROOT/.zig-cache/crash-dm
 DM=seglog-lw
 OWNER=${SUDO_USER:-$(id -un)}
 
 [ "$(id -u)" = 0 ] || { echo "run.sh: needs root (sudo)" >&2; exit 2; }
-[ -x "$BIN" ] || { echo "run.sh: build $BIN first: zig build seglog-crash -Doptimize=ReleaseSafe" >&2; exit 2; }
+[ -x "$BIN" ] || { echo "run.sh: build $BIN first: zig build install-interop-seglog -Doptimize=ReleaseSafe" >&2; exit 2; }
 command -v "mkfs.$FS" >/dev/null || { echo "run.sh: no mkfs.$FS" >&2; exit 2; }
 mkdir -p "$W/mnt" "$W/snapmnt"
 
