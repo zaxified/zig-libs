@@ -394,7 +394,7 @@ test "fuzz harness: multi, 400 seeds, reaches every outcome" {
     try MultiMark.reach(fuzzMulti, "mqtt-broker-multi", 400);
 }
 
-/// The CML lesson behind this harness: `mqtt-broker-session` drives ONE
+/// The lesson behind this harness: `mqtt-broker-session` drives ONE
 /// client, 5.0 only, and its failing transport is the publisher's — so the
 /// teardown of a SUBSCRIBER whose write fails, a persistent session that
 /// outlives a connection and is resumed or taken over, delayed Wills and 3.1.1
