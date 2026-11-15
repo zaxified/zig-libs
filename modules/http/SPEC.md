@@ -705,15 +705,11 @@ never sees. Caller buffers, no allocation. `router` still matches raw bytes by d
 SPEC); if it ever decodes, `decodePath` is the rule to use. `validate.parseQueryLeaky` keeps its
 own lenient decoder for now.
 
-**PROXY protocol v1/v2 (server side)** — MOVED 2026-11-15 to the planned module `proxyproto` (root `NEW-MODULES.md`; decided: own module, `http` takes it as an optional dependency of its accept path). Original item (2026-09-24, found by qap plan M5.1): A server
-behind a load balancer learns the real client only from the haproxy PROXY header the balancer
-prepends to the connection; nginx (`proxy_protocol`), Go (`pires/go-proxyproto`) and HAProxy itself
-parse it on accept, and nothing in zig-libs does. qap wrote its own (`src/proxy_protocol.zig`: v2
-only, TCP4/TCP6/LOCAL, TLVs bounds-walked and skipped, a 536-byte header cap, and the trusted-peer
-check over `netaddr.Prefix`). Wanted here or as a small module of its own: a parser over a
-`std.Io.Reader` (peek + toss, so a missing optional header leaves the bytes for the codec), v1 text
-form too, TLV access (AWS/GCP ids, SSL info), and the "only from listed peers" rule as the API's
-default rather than the caller's discipline.
+**PROXY protocol v1/v2 (server side)** — MOVED 2026-11-15 to the planned module `proxyproto`
+(root `NEW-MODULES.md`, which carries the scope and parity bar; decided: own module, `http` takes it
+as an optional dependency of its accept path). Original item 2026-09-24: a server behind a load
+balancer learns the real client only from the PROXY header the balancer prepends; nginx, Go
+(`pires/go-proxyproto`) and HAProxy parse it on accept, and nothing in zig-libs did.
 
 **HTTP Upgrade from a handler** — DONE 2026-09-24 (qap plan M5.3): `ResponseWriter.upgrade`.
 
