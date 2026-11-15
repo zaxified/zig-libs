@@ -56,6 +56,10 @@ pub const config = @import("config.zig");
 /// The blocking resolver over UDP/TCP/DoT/DoH. See `Resolver.init`.
 pub const Resolver = @import("Resolver.zig");
 
+/// An answer cache over the high-level lookups of a `Resolver`: TTL clamps,
+/// negative caching, serve-stale, failure backoff, a bounded table.
+pub const CachingResolver = @import("CachingResolver.zig");
+
 /// RFC 2136 dynamic update: `update.Builder` + `update.send`.
 pub const update = @import("update.zig");
 
@@ -144,6 +148,7 @@ test {
     _ = message;
     _ = config;
     _ = Resolver;
+    _ = CachingResolver;
     _ = update;
     _ = tsig;
     _ = rdata;
