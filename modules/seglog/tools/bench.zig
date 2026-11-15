@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-//! seglog-bench — the measurement behind seglog's numbers, and the Zig half of
-//! the comparison with other logs (`../tools/bench-go` runs the same scenarios
+//! bench-seglog — the measurement behind seglog's numbers, and the Zig half of
+//! the comparison with other logs (`bench-go/` here runs the same scenarios
 //! against tidwall/wal and Prometheus's wlog).
 //!
-//!     seglog-bench <scenario> <dir> <payload bytes> <records> [batch] [prealloc]
+//!     zig build bench-seglog -- <scenario> <dir> <payload bytes> <records> [batch] [prealloc]
 //!
 //! `dir` must not exist; it is created, used and removed. Put it on the disk
 //! being measured, never on tmpfs, where fsync costs nothing.
@@ -25,7 +25,7 @@
 //! - `zread`   the same, then reopen and time a full scan of the compressed
 //!             segment
 //!
-//!     seglog-bench realz <dir> <payload file> <level> [frame bytes]
+//!     zig build bench-seglog -- realz <dir> <payload file> <level> [frame bytes]
 //!
 //! `realz`: real records — a file of `u32 length ++ payload`, each payload
 //! starting with its i64 timestamp (egw-hub's raw records) — appended, the

@@ -529,7 +529,7 @@ Every one of the 261 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | [`kv`](modules/kv/README.md) | 1 | Crash-consistent embedded KV store, Bitcask-style log, with randomized fuzz-tested crash recovery. | any | clock |
 | [`kvtree`](modules/kvtree/README.md) | 1 | Ordered transactional KV store — copy-on-write B-tree (LMDB/BoltDB lineage), MVCC snapshots, crash-safe range scans. | any | kv, crc32 |
 | [`ramcache`](modules/ramcache/README.md) | 2 (S,P) | Bounded in-memory cache — W-TinyLFU admission/eviction, TTL, generation invalidation; sharded thread-safe wrapper. | any | — |
-| [`seglog`](modules/seglog/README.md) | 5 (H) | Segmented crash-consistent append-only log — CRC32C records with LSNs and timestamps, sealed closed segments, whole-segment retention. | any | kv, crc32c, zstd |
+| [`seglog`](modules/seglog/README.md) | 4? (A) | Segmented crash-consistent append-only log — CRC32C records with LSNs and timestamps, sealed closed segments, whole-segment retention. | any | kv, crc32c, zstd |
 | [`sort`](modules/sort/README.md) | 2 (P) | Fast in-place sorting: Rust's ipnsort as a drop-in for std.sort.pdq. | any (pure Zig, no allocation) | — |
 | [`trie`](modules/trie/README.md) | 1 | Prefix index for instant autocomplete over a large static string set. | any | — |
 | [`tsdb`](modules/tsdb/README.md) | 2 (S,A,P) | Time-series persistence over `kvtree` — ordered (series, timestamp) key codec, streaming range scans, Gorilla-compressed blocks, crash-safe retention by age or size budget. | any | kvtree, regex |

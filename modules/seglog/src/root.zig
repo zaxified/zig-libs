@@ -157,7 +157,12 @@ const man_entry_len = 24;
 const man_crc_len = 4;
 /// A bound on how many segment ids a manifest may hold, so a corrupt size
 /// field cannot make `open` allocate without limit. 24 megabytes of entries.
-const max_manifest_ids = 1 << 20;
+const max_manifest_ids = if (@import("builtin").is_test) 256 else 1 << 20;
+/// The largest LSN a log accepts from disk. A manifest's first LSN or a
+/// record's LSN above it is `Corrupt`: no log reaches it (2^62 records of 25
+/// bytes are 10^20 bytes), and below it `base + count` and `lsn + 1` cannot
+/// overflow whatever bytes a file holds (sweep SL-3).
+const max_lsn: u64 = 1 << 62;
 
 const form_raw: u8 = 0;
 
@@ -256,10 +261,15 @@ const SparseIndex = struct {
     }
 };
 
+/// Test builds only: bytes checksummed so far, to show that `resync`'s work
+/// stays linear in the damaged segment (sweep SL-9).
+var test_crc_bytes: std.atomic.Value(u64) = .init(0);
+
 /// The one place the checksum is computed: with the CPU's CRC instructions
 /// where there are any (the std table version runs at about 0.45 GB/s and
 /// made reading CRC-bound).
 fn crc32c(bytes: []const u8) u32 {
+    if (@import("builtin").is_test) _ = test_crc_bytes.fetchAdd(bytes.len, .monotonic);
     return crc32c_mod.hash(bytes);
 }
 
@@ -340,6 +350,7 @@ const Tally = struct {
 
     /// Whether `lsn` may come next.
     fn fits(t: Tally, lsn: u64) bool {
+        if (lsn > max_lsn) return false;
         return if (t.compacted) lsn > t.last_lsn and lsn >= t.base else lsn == t.base + t.count;
     }
 
@@ -418,7 +429,9 @@ const Window = struct {
     /// `need` bytes at `start`, or null when fewer than that exist below
     /// `limit` (or in the file).
     fn get(w: *Window, gpa: Allocator, store: Storage, h: Storage.Handle, start: u64, need: u64, limit: u64) (Storage.Error || error{OutOfMemory})!?[]const u8 {
-        if (start + need > limit) return null;
+        // `need > limit - start` rather than `start + need > limit`: a caller's
+        // `Position.offset` may be anything (sweep SL-2).
+        if (start > limit or need > limit - start) return null;
         const have_end = w.off + w.buf.items.len;
         if (start >= w.off and start + need <= have_end) {
             const i: usize = @intCast(start - w.off);
@@ -556,7 +569,12 @@ const SegStore = struct {
             error.FileNotFound => if (mode == .read_only and isSegment(path)) return self.openZst(path) else return e,
             else => return e,
         };
-        std.debug.assert(h & zst_bit == 0);
+        // A backend whose handles use bit 31 would be mistaken for one of
+        // ours: refuse it (SL-10) instead of asserting on the backend's value.
+        if (h & zst_bit != 0) {
+            self.inner.close(h);
+            return error.HandleTableFull;
+        }
         return h;
     }
 
@@ -951,7 +969,10 @@ pub const SyncLatency = struct {
     /// `q` of the fsyncs fell: the bound of the first bucket that reaches it.
     pub fn quantileUpperUs(l: SyncLatency, q: f64) u64 {
         if (l.count == 0) return 0;
-        const want: u64 = @intFromFloat(@ceil(q * @as(f64, @floatFromInt(l.count))));
+        // Total for any `q`: NaN counts as 1, the rest is clamped to [0, 1]
+        // (`@intFromFloat` of NaN or an out-of-range value is illegal; SL-4).
+        const qc: f64 = if (std.math.isNan(q)) 1.0 else std.math.clamp(q, 0.0, 1.0);
+        const want: u64 = @intFromFloat(@ceil(qc * @as(f64, @floatFromInt(l.count))));
         var seen: u64 = 0;
         for (l.buckets, 0..) |n, i| {
             seen += n;
@@ -1286,6 +1307,8 @@ pub const AppendError = Storage.Error || error{
     /// See `RotateError.OrphanSegment` — `Options.auto_rotate` can reach it
     /// through `append` too.
     OrphanSegment,
+    /// See `RotateError.TooManySegments`.
+    TooManySegments,
     /// `Options.timestamps = .refuse` and a record's `ts` is outside its
     /// range (L3): nothing in the batch was written.
     TimestampOutOfRange,
@@ -1305,6 +1328,11 @@ pub const RotateError = Storage.Error || error{
     /// but lost `MANIFEST` — restore the whole state tree again, or repair
     /// `MANIFEST` by hand from SPEC.md's layout.
     OrphanSegment,
+    /// The manifest already names as many segments (live plus pending drops)
+    /// as one manifest can hold (2^20): `open` refuses a larger one, so
+    /// `rotate` refuses to write it. Nothing changed and the log is not
+    /// poisoned; `dropBefore` makes room (SL-8).
+    TooManySegments,
 };
 
 pub const DropError = Storage.Error || error{ Poisoned, ReadOnly };
@@ -1555,7 +1583,7 @@ pub const Log = struct {
             const flags = std.mem.readInt(u32, hdr[32..36], .little);
             if (flags & ~flag_compacted != 0) return error.UnsupportedVersion;
             // LSNs start at 1 and never go back (as `loadManifest` checks).
-            if (base_lsn == 0) return error.Corrupt;
+            if (base_lsn == 0 or base_lsn > max_lsn) return error.Corrupt;
             if (prev_last_lsn) |p| if (base_lsn != p +% 1) return error.Corrupt;
 
             // The seal, if this segment has one: the last record of a closed
@@ -1788,7 +1816,10 @@ pub const Log = struct {
     fn boundedTs(self: *const Log, ts: i64) i64 {
         return switch (self.opts.timestamps) {
             .unbounded, .refuse => ts,
-            .clamp => |c| std.math.clamp(ts, c.min, c.max),
+            // `@max(min, @min(ts, max))`, not `std.math.clamp`: that asserts
+            // min <= max, and `Range` is the caller's (SL-5). With min > max
+            // every ts becomes `min`.
+            .clamp => |c| @max(c.min, @min(ts, c.max)),
         };
     }
 
@@ -1972,6 +2003,8 @@ pub const Log = struct {
             }
         }
 
+        if (self.live.items.len + self.pending.items.len >= max_manifest_ids) return error.TooManySegments;
+
         // ⛔⛔ L1 fix (2026-09-27): a manifest that was just (re)created empty
         // by `open` (`Options.create`, no `MANIFEST` on disk — e.g. one lost
         // to a partial backup/restore while every segment file survived) has
@@ -2089,7 +2122,9 @@ pub const Log = struct {
                 error.Corrupt => {
                     try r.damage.ensureUnusedCapacity(gpa, 1);
                     try r.gaps.ensureUnusedCapacity(gpa, 1);
-                    r.damage.appendAssumeCapacity(it.damage().?);
+                    // `Corrupt` from a manifest refresh (a reader) sets no damage
+                    // record: nothing to describe, report it as it is (SL-1).
+                    r.damage.appendAssumeCapacity(it.damage() orelse return error.Corrupt);
                     r.gaps.appendAssumeCapacity((try it.resync()).?);
                     continue;
                 },
@@ -2531,7 +2566,10 @@ pub const Log = struct {
             ctx: @TypeOf(ctx),
             fn keep(n: @This(), r: Record) bool {
                 const key = keyOf(n.ctx, r.payload) orelse return true;
-                return n.latest.get(key).? == r.lsn;
+                // A `keyOf` that answers differently the second time breaks
+                // its contract; keep the record rather than panic (SL-6).
+                const latest_lsn = n.latest.get(key) orelse return true;
+                return latest_lsn == r.lsn;
             }
         };
         var total: CompactStats = .{};
@@ -2720,6 +2758,9 @@ pub const Log = struct {
         defer self.store.close(h);
         const size = try self.store.size(h);
         if (size < idx_fixed + man_crc_len or (size - idx_fixed - man_crc_len) % idx_entry_len != 0) return false;
+        // Entries have distinct offsets inside the segment, so a file with
+        // more of them is someone else's: refused before it is read (SL-7).
+        if ((size - idx_fixed - man_crc_len) / idx_entry_len > seg_size) return false;
         const buf = try self.gpa.alloc(u8, @intCast(size));
         defer self.gpa.free(buf);
         self.store.preadFull(h, buf, 0) catch |e| switch (e) {
@@ -2848,7 +2889,7 @@ pub const Log = struct {
             if (!std.mem.allEqual(u8, e[17..24], 0)) return error.Corrupt;
             if (self.newest()) |prev| if (id <= prev) return error.Corrupt;
             // LSNs start at 1 and never go back.
-            if (first == 0) return error.Corrupt;
+            if (first == 0 or first > max_lsn) return error.Corrupt;
             if (self.live_lsn.last()) |prev| if (first < prev) return error.Corrupt;
             self.live.appendAssumeCapacity(id);
             self.live_lsn.appendAssumeCapacity(first);
@@ -3186,7 +3227,7 @@ pub const Log = struct {
             if (raw.typ != rec_data) return null;
             v1 += legacy_rec_header_len + raw.payload.len;
             v2 += raw.len;
-            lsn = raw.lsn + 1;
+            lsn = std.math.add(u64, raw.lsn, 1) catch return null;
         }
     }
 
@@ -3742,6 +3783,7 @@ pub const Iterator = struct {
             it.damaged = null;
             switch (raw.typ) {
                 rec_data => {
+                    if (raw.lsn > max_lsn) return it.corrupt(seg, pos.offset, .lsn_out_of_sequence);
                     if (it.expect_lsn) |want| {
                         const bad = if (it.compacted) raw.lsn < want else raw.lsn != want;
                         if (bad) return it.corrupt(seg, pos.offset, .lsn_out_of_sequence);
@@ -3839,6 +3881,24 @@ pub const Iterator = struct {
         const next_first: ?u64 = if (it.following()) |n| it.log.segmentFirstLsn(n) else null;
         var off = d.offset + 1;
         while (off + rec_header_len <= bound) : (off += 1) {
+            // Cheap header test before the CRC over up to `max_record_len`
+            // bytes: only a header that could be accepted below is checked.
+            // Without it bytes crafted to show a plausible length at every
+            // offset made a scan cost a CRC per byte (SL-9).
+            const hdr = (try it.window.get(it.log.gpa, store, h, off, rec_header_len, bound)) orelse {
+                if (it.window.short_at) |end| if (off + rec_header_len > end) break;
+                continue;
+            };
+            switch (hdr[4]) {
+                rec_data => {
+                    const l = std.mem.readInt(u64, hdr[9..17], .little);
+                    if (l < floor or l == 0 or l > max_lsn) continue;
+                    if (next_first) |n| if (l >= n) continue;
+                },
+                rec_seal => if (std.mem.readInt(u32, hdr[5..9], .little) != seal_payload_len or
+                    std.mem.readInt(u64, hdr[9..17], .little) != 0 or std.mem.readInt(i64, hdr[17..25], .little) != 0) continue,
+                else => continue,
+            }
             const raw = switch (try parseAt(&it.window, it.log.gpa, store, h, off, bound, it.log.opts.max_record_len)) {
                 .record => |r| r,
                 else => {
@@ -6745,4 +6805,235 @@ test "a reader resumes from a position in a segment it has not heard of yet" {
     const pos = try w.append("b");
     _ = try w.append("c");
     try expectPayloads(&r, pos.pos, &.{ "b", "c" });
+}
+
+// ── no-panic sweep tests (SWEEP.md ids SL-n) ─────────────────────────────────
+
+fn resealManifest(sim: *SimStorage) void {
+    const c = sim.fileContent(manifest_name).?;
+    std.mem.writeInt(u32, c[c.len - 4 ..][0..4], crc32c(c[0 .. c.len - 4]), .little);
+}
+
+test "verify of a reader whose manifest went bad answers Corrupt (sweep SL-1)" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var w = try openSim(&sim);
+        w.close();
+    }
+    var rd = try Log.openReadOnly(testing.allocator, sim.storage(), .{});
+    defer rd.close();
+    sim.flipByte(manifest_name, 0);
+    try testing.expectError(error.Corrupt, rd.verify(testing.allocator));
+}
+
+test "an iterator started at a position with an absurd offset finds its record by LSN (sweep SL-2)" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try openSim(&sim);
+    defer log.close();
+    try log.rotate(1);
+    _ = try log.append("a");
+    _ = try log.append("b");
+    var it = log.iterator(.{ .segment = 1, .offset = std.math.maxInt(u64) - 3, .lsn = 2 });
+    defer it.deinit();
+    const r = (try it.next()).?;
+    try testing.expectEqual(@as(u64, 2), r.lsn);
+    try testing.expectEqualStrings("b", r.payload);
+}
+
+test "a manifest whose first LSN is beyond any log is Corrupt (sweep SL-3)" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var w = try openSim(&sim);
+        try w.rotate(1);
+        w.close();
+    }
+    // First LSN 2^64-1, in the manifest and in the segment's header.
+    const m = sim.fileContent(manifest_name).?;
+    std.mem.writeInt(u64, m[man_fixed + 8 ..][0..8], std.math.maxInt(u64), .little);
+    resealManifest(&sim);
+    const seg = sim.fileContent("seg-00000000000000000001.log").?;
+    std.mem.writeInt(u64, seg[16..24], std.math.maxInt(u64), .little);
+    std.mem.writeInt(u32, seg[36..40], crc32c(seg[0..36]), .little);
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), .{}));
+}
+
+test "a record whose LSN is beyond any log is Corrupt to the reader (sweep SL-3)" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var w = try openSim(&sim);
+        try w.rotate(1);
+        try w.rotate(2);
+        w.close();
+    }
+    // Segment 1 becomes a compacted segment holding one record with LSN 2^64-1.
+    var bytes: [segment_header_len + rec_header_len]u8 = undefined;
+    encodeHeaderFlags(bytes[0..segment_header_len], 1, 1, 0, flag_compacted);
+    encodeRecord(bytes[segment_header_len..], rec_data, std.math.maxInt(u64), 0, "");
+    try sim.installFile("seg-00000000000000000001.log", &bytes);
+    var log = try Log.open(testing.allocator, sim.storage(), .{});
+    defer log.close();
+    var it = log.iterator(null);
+    defer it.deinit();
+    try testing.expectError(error.Corrupt, it.next());
+    try testing.expectEqual(Damage.Reason.lsn_out_of_sequence, it.damage().?.reason);
+}
+
+test "quantileUpperUs is total in q (sweep SL-4)" {
+    var l: SyncLatency = .{};
+    l.record(5_000);
+    l.record(50_000);
+    l.record(500_000);
+    const inf = std.math.inf(f64);
+    try testing.expectEqual(l.quantileUpperUs(1.0), l.quantileUpperUs(std.math.nan(f64)));
+    try testing.expectEqual(l.quantileUpperUs(1.0), l.quantileUpperUs(1e300));
+    try testing.expectEqual(l.quantileUpperUs(1.0), l.quantileUpperUs(inf));
+    try testing.expectEqual(l.quantileUpperUs(0.0), l.quantileUpperUs(-1.0));
+    try testing.expectEqual(l.quantileUpperUs(0.0), l.quantileUpperUs(-inf));
+}
+
+test "a timestamp range with min above max does not panic (sweep SL-5)" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try Log.open(testing.allocator, sim.storage(), .{ .create = true, .timestamps = .{ .clamp = .{ .min = 10, .max = 5 } } });
+    defer log.close();
+    try log.rotate(1);
+    _ = try log.appendAt(100, "x");
+    var it = log.iterator(null);
+    defer it.deinit();
+    try testing.expectEqual(@as(i64, 10), (try it.next()).?.ts);
+}
+
+test "compactByKey survives a keyOf that changes its answer (sweep SL-6)" {
+    const Ctx = struct {
+        calls: usize = 0,
+        fn keyOf(c: *@This(), _: []const u8) ?[]const u8 {
+            c.calls += 1;
+            return if (c.calls <= 2) "k" else "z";
+        }
+    };
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try openSim(&sim);
+    defer log.close();
+    try log.rotate(1);
+    _ = try log.append("a");
+    _ = try log.append("b");
+    try log.rotate(2);
+    var ctx: Ctx = .{};
+    const st = try log.compactByKey(&.{1}, &ctx, Ctx.keyOf);
+    try testing.expectEqual(@as(u64, 2), st.kept);
+    try testing.expectEqual(@as(u64, 0), st.dropped);
+}
+
+test "an oversized index file is not read into memory (sweep SL-7)" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var buf: [64 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var log = try Log.open(fba.allocator(), sim.storage(), .{ .create = true });
+    defer log.close();
+    try log.rotate(1);
+    _ = try log.append("a");
+    _ = try log.append("b");
+    try log.rotate(2);
+    // An index file claiming 10 000 entries for a segment of ~100 bytes.
+    const n = 10_000;
+    const big = try testing.allocator.alloc(u8, idx_fixed + n * idx_entry_len + man_crc_len);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    var nb: [seg_name_len]u8 = undefined;
+    try sim.installFile(idxName(&nb, 1), big);
+    const pos = (try log.seek(2)).?;
+    try testing.expectEqual(@as(u64, 2), pos.lsn);
+}
+
+test "rotate refuses a segment the manifest could not hold, and the log still opens (sweep SL-8)" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var log = try openSim(&sim);
+        defer log.close();
+        var id: u64 = 1;
+        while (id <= max_manifest_ids) : (id += 1) try log.rotate(id);
+        try testing.expectError(error.TooManySegments, log.rotate(id));
+        try testing.expect(!log.isPoisoned());
+        _ = try log.append("still works");
+        // Room comes back by dropping.
+        try testing.expectEqual(@as(usize, 10), try log.dropBefore(11));
+        try log.rotate(id);
+    }
+    var log = try openSim(&sim);
+    defer log.close();
+    try testing.expectEqual(@as(usize, max_manifest_ids - 10 + 1), log.segments().len);
+}
+
+test "resync's work stays linear in the damaged bytes (sweep SL-9)" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try Log.open(testing.allocator, sim.storage(), .{ .create = true, .max_record_len = 4096, .index_interval = 0 });
+    defer log.close();
+    try log.rotate(1);
+    const payload: [100]u8 = @splat('x');
+    for (0..300) |_| _ = try log.append(&payload);
+    try log.rotate(2);
+    // 16 KiB of bytes that read as a length of 2048 at every fourth offset
+    // (and of 8 at another), none of them a record.
+    const seg = sim.fileContent("seg-00000000000000000001.log").?;
+    const region: usize = 16 * 1024;
+    for (seg[40..][0..region], 0..) |*b, i| b.* = if (i % 4 == 1) 8 else 0;
+    const before = test_crc_bytes.load(.monotonic);
+    var it = log.iterator(null);
+    defer it.deinit();
+    try testing.expectError(error.Corrupt, it.next());
+    const gap = (try it.resync()).?;
+    try testing.expect(gap.from_lsn != null);
+    const work = test_crc_bytes.load(.monotonic) - before;
+    try testing.expect(work < region);
+    // And it went on to a real record.
+    try testing.expect((try it.next()) != null);
+}
+
+test "a backend handle with bit 31 set is refused, not asserted on (sweep SL-10)" {
+    const Hi = struct {
+        var orig: *const Storage.VTable = undefined;
+        fn open(ctx: *anyopaque, path: []const u8, mode: Storage.OpenMode) Storage.Error!Storage.Handle {
+            return (try orig.open(ctx, path, mode)) | (1 << 31);
+        }
+        fn close(ctx: *anyopaque, h: Storage.Handle) void {
+            orig.close(ctx, h & ~@as(Storage.Handle, 1 << 31));
+        }
+    };
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const real = sim.storage();
+    Hi.orig = real.vtable;
+    var vt = real.vtable.*;
+    vt.open = Hi.open;
+    vt.close = Hi.close;
+    const st: Storage = .{ .ctx = real.ctx, .vtable = &vt };
+    try testing.expectError(error.HandleTableFull, Log.open(testing.allocator, st, .{ .create = true, .lock = .none }));
+}
+
+test "compress with any level or frame size refuses or works (sweep clean check)" {
+    const levels = [_]i32{ std.math.minInt(i32), -1000000, -1, 0, 1, 22, 23, 1000000, std.math.maxInt(i32) };
+    const frames = [_]u32{ 0, 1, 4, 4096, std.math.maxInt(u32) };
+    for (levels) |level| for (frames) |fs| {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var log = try Log.open(testing.allocator, sim.storage(), .{ .create = true, .compression = .{ .level = level, .frame_size = fs } });
+        defer log.close();
+        try log.rotate(1);
+        const body: [96]u8 = @splat('c');
+        for (0..20) |_| _ = try log.append(&body);
+        try log.rotate(2);
+        if (log.compress(1)) |_| {
+            var got = try readAll(&log, null);
+            defer freeAll(&got);
+            try testing.expectEqual(@as(usize, 20), got.items.len);
+        } else |e| try testing.expectEqual(error.BadCompressOptions, e);
+    };
 }

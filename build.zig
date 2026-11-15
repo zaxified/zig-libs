@@ -807,6 +807,18 @@ pub fn build(b: *std.Build) void {
             // without anyone hearing, and this repository has lost an anchor
             // that way before.
             if (in_group) check_interop.dependOn(&interop_exe.step);
+
+            // `zig build install-interop-<m>` puts the program at
+            // `zig-out/interop/interop-<m>`, for a script that runs it many
+            // times or as another user (seglog's `tools/crash-dm/run.sh`,
+            // under sudo, once per crash point). Reached only on request.
+            const interop_install = b.step(
+                b.fmt("install-interop-{s}", .{m.name}),
+                b.fmt("Install the {s} interop program into zig-out/interop/", .{m.name}),
+            );
+            interop_install.dependOn(&b.addInstallArtifact(interop_exe, .{
+                .dest_dir = .{ .override = .{ .custom = "interop" } },
+            }).step);
         }
 
         // The live-network program, discovered by existence exactly like the
