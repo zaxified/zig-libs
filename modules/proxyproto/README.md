@@ -1,0 +1,43 @@
+# proxyproto
+
+PROXY protocol v1 and v2 (HAProxy): what a server behind a load balancer reads first to learn the real client address, and what a proxy writes first to tell it.
+
+- **Status:** new (2026-11-15), core scope; see `SPEC.md` for the grade card.
+- **Model after:** HAProxy `doc/proxy-protocol.txt`; Go `pires/go-proxyproto`, nginx `proxy_protocol`.
+- **Deps:** `netaddr`, `crc32c`. No allocation anywhere.
+
+## Use
+
+```zig
+const pp = @import("proxyproto");
+
+// Server side: once per accepted connection, before the real protocol.
+var hbuf: [pp.default_max_v2_len]u8 = undefined;
+const hdr = try pp.read(reader, &hbuf, .{
+    .peer = peer_ip,              // the balancer's own address
+    .trusted = &.{balancer_net},  // EMPTY = every header refused
+    .required = true,             // optional: a connection without a header is an error
+});
+if (hdr) |h| {
+    if (h.source) |src| client = src.inet; // null for LOCAL / UNSPEC / UNKNOWN: use the real peer
+    const alpn = try h.alpn();
+}
+
+// Pure form, for a caller that manages its own buffer.
+switch (try pp.parse(bytes)) {
+    .need_more => |n| {},
+    .absent => {},            // not a header: hand `bytes` to the real protocol
+    .header => |p| {},        // p.h borrows `bytes`; p.consumed bytes are the header
+}
+
+// Proxy side.
+try pp.writeV2Crc(w, .{ .family = .tcp4, .source = ..., .destination = ... }, tlvs);
+```
+
+`read` consumes nothing unless it returns a header. A header from a peer outside `trusted` is `error.UntrustedPeer`; the empty default list trusts nobody.
+
+## Tests
+
+`zig build test-proxyproto`. Vectors are hand-built from the specification's byte layouts; a deterministic fuzz driver (`PROXYPROTO_FUZZ=<runs>`, `src/fuzz_test.zig`) and a no-panic sweep cover hostile bytes.
+
+Provenance: clean-room from HAProxy's `doc/proxy-protocol.txt` (versions 1 and 2), no third-party source ported or studied, so no `NOTICE` entry is required (root [`NOTICE`](../../NOTICE) §0).

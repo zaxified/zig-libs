@@ -38,18 +38,3 @@ set the parity bar), **Notes** (dependencies, open decisions, effort).
   pages, nested schemas through repetition/definition levels, statistics in the footer.
 - **Expected:** pyarrow `parquet`, polars `read_parquet`/`write_parquet`, parquet-rs.
 - **Notes:** after `arrow` (shares the type mapping). Effort XL.
-
-### proxyproto — PROXY protocol v1/v2 parser (HAProxy)
-- **Origin:** 2026-09-24, found while planning a server behind a load balancer, written up in
-  `http`'s Backlog; 2026-11-15 consumer request asks for a standalone module, since a plain
-  TCP proxy or any non-HTTP server needs it too and `http` should not grow a dependency for it.
-  Decision 2026-11-15: own module, `http` takes it as an optional dependency of its accept path.
-- **Scope:** parse on accept over a `std.Io.Reader` (peek + toss, so a missing optional
-  header leaves the bytes for the protocol codec), v1 text and v2 binary forms, TCP4/TCP6/
-  UNIX/LOCAL, TLV access (ALPN, authority, CRC32C, SSL sub-TLVs, AWS/GCP/Azure ids), a header
-  size cap, and the "accept the header only from listed peers" rule (`netaddr.Prefix` list) as
-  the API's default rather than the caller's discipline. A writer for the client side (a
-  proxy that prepends the header).
-- **Expected:** Go `pires/go-proxyproto`, nginx `proxy_protocol`, HAProxy's own spec
-  (`doc/proxy-protocol.txt`).
-- **Notes:** deps `netaddr`, `crc32c`. Effort M. Interop oracle: HAProxy `send-proxy-v2`.
