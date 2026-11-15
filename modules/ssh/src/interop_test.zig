@@ -1568,12 +1568,7 @@ test "live: a real ssh client through our two-step server — publickey (partial
     };
     try std.testing.expectEqual(userauth.AuthMethod.keyboard_interactive, auth.method);
     try std.testing.expect(auth.completed.contains(.publickey));
-    try connection.serveSession(&fx.t, gpa, .{
-        .user = auth.user(),
-        .permissions = auth.permissions,
-        .exec = info_handler,
-        .stdin_mode = .ignore,
-    });
+    try connection.serveSession(&fx.t, gpa, .fromAuth(&auth, .{ .exec = info_handler, .stdin_mode = .ignore }));
     const out = try fx.finish();
     defer gpa.free(out);
     try std.testing.expect(std.mem.startsWith(u8, out, "kind=exec cmd=uname -a"));

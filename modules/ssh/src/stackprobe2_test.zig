@@ -37,6 +37,22 @@ test "STACKPROBE: no password residue after PasswordCheck.check" {
     _ = try P.run("PasswordCheck.check", userauth.PasswordCheck.check, .{ check, @as([]const u8, "probe-user"), @as([]const u8, &password) }, &secrets, .{});
 }
 
+fn decideHook(ctx: *anyopaque, req: *const userauth.AuthRequest, pw: []const u8) userauth.Decision {
+    _ = ctx;
+    _ = req;
+    return if (hook(transport.no_context, "", pw)) userauth.Decision.accepted else .reject;
+}
+
+test "STACKPROBE: no password residue after PasswordCallback.decide" {
+    try sp.skipUnlessOptimized();
+    std.crypto.hash.sha2.Sha256.hash("ssh probe password 2", &password, .{});
+    expected = password;
+    const cb: userauth.PasswordCallback = .{ .decideFn = decideHook };
+    const req: userauth.AuthRequest = .{ .user = "probe-user", .completed = .empty, .session_id = "sid" };
+    const secrets = [_][]const u8{&password};
+    _ = try P.run("PasswordCallback.decide", userauth.PasswordCallback.decide, .{ cb, &req, @as([]const u8, &password) }, &secrets, .{});
+}
+
 // ── transport.connectInto ───────────────────────────────────────────────────
 //
 // `connectInto` is a client handshake, so it needs a server on the other end.

@@ -274,9 +274,16 @@ const auth2 = try ssh.userauth.serveUserauth(&st, gpa, .{
     .callbacks = .{ .publickey = .{ .ctx = &policy, .decideFn = Policy.key } },
     .max_attempts = 6, // the default (OpenSSH MaxAuthTries); the first `none` probe is free
 });
-// auth2.completed = {publickey}, auth2.method = .keyboard_interactive;
-// the handlers see the permissions in `RequestInfo.permissions`:
-try ssh.connection.serveConnection(&st, gpa, .{ .user = auth2.user(), .permissions = auth2.permissions, .exec = handler });
+// auth2.completed = {publickey}, auth2.method = .keyboard_interactive.
+// `ServeConfig.fromAuth` fills in BOTH the user and the permissions (setting
+// only `.user` would silently drop them); handlers see the permissions in
+// `RequestInfo.permissions`:
+try ssh.connection.serveConnection(&st, gpa, .fromAuth(&auth2, .{ .exec = handler }));
+// Use `callbacks` OR the yes/no hook fields (`authorized_key`, `password`,
+// `keyboard_interactive`), never both: a hook-enabled method is active in the
+// first step and would let a client skip the chain — `error.InvalidAuthConfig`.
+// A keyboard-interactive callback must complete at least one `challenge`
+// round before `.accept`/`.partial` counts.
 // `.no_client_auth = true` (+ optional `.no_client_auth_callback`) admits a
 // `none` request: Go's NoClientAuth.
 ```

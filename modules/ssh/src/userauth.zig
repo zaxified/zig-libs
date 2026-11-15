@@ -315,7 +315,12 @@ pub fn authenticatePublickeyBoundTo(
 /// `allowed` is the FAILURE's "authentications that can continue", `null`
 /// when no FAILURE carried one (a success, or a step that never reached the
 /// server).
-const Outcome = enum { success, partial, failure };
+/// `declined`: the caller's own prompt or responder gave up — a
+/// `password_prompt` returning null (nothing was sent) or a keyboard-
+/// interactive responder returning false (the dialogue is left for the next
+/// request to abandon). Counts as a failure, but `retryable` does not ask
+/// again: the human said no.
+const Outcome = enum { success, partial, failure, declined };
 const StepResult = struct {
     outcome: Outcome,
     allowed: ?MethodSet = null,
@@ -598,7 +603,7 @@ fn kbdStep(
                 for (prompts[0..n]) |*p| p.* = .{ .text = try c.string(), .echo = try c.boolean() };
                 var answers: [max_kbd_prompts][]const u8 = @splat("");
                 const challenge: KbdChallenge = .{ .name = name, .instruction = instruction, .prompts = prompts[0..n] };
-                if (!responder.respondFn(responder.ctx, &challenge, answers[0..n])) return .{ .outcome = .failure };
+                if (!responder.respondFn(responder.ctx, &challenge, answers[0..n])) return .{ .outcome = .declined };
 
                 var len: usize = 16;
                 for (answers[0..n]) |a| {
@@ -776,7 +781,7 @@ pub fn authenticateWith(
                 return;
             },
             .partial => progress.partial.insert(current),
-            .failure => progress.tried.insert(current),
+            .failure, .declined => progress.tried.insert(current),
         }
         if (progress.steps >= max_client_auth_steps) return error.AuthenticationFailed;
         const next = for (methods) |*m| {
@@ -822,7 +827,7 @@ fn runMethod(
         .password_prompt => |p| {
             var buf: [max_password_len]u8 = undefined;
             defer std.crypto.secureZero(u8, &buf);
-            const n = p.promptFn(p.ctx, user, &buf) orelse return .{ .outcome = .failure };
+            const n = p.promptFn(p.ctx, user, &buf) orelse return .{ .outcome = .declined };
             if (n > buf.len) return error.NameTooLong;
             return passwordStep(t, gpa, scratch, user, buf[0..n], opts.banner);
         },
@@ -835,6 +840,7 @@ fn runMethod(
                 if (i > 0) progress.steps += 1;
                 if (progress.steps >= max_client_auth_steps) break;
                 r = try runMethod(t, gpa, scratch, user, rt.method.*, opts, session_id, progress);
+                // Only a plain refusal is retried; a declined prompt is final.
                 if (r.outcome != .failure) return r;
                 if (r.allowed) |a| if (!a.contains(rt.method.method())) return r;
             }
@@ -1184,7 +1190,10 @@ pub const PasswordCallback = struct {
 /// (a PAM conversation, a password then a one-time code), each one
 /// `prompter.challenge(...)`. A round the client did not answer properly
 /// makes `challenge` return false; the callback should then return
-/// `.reject` — and whatever it returns, it does not authenticate.
+/// `.reject` — and whatever it returns, it does not authenticate. An
+/// `.accept` or `.partial` without one completed round is never honoured:
+/// `serveUserauth` returns `error.InvalidAuthConfig`. Runs under a burn
+/// (`burn.kbd_burn`): its frames hold the peer's answers.
 pub const KbdCallback = struct {
     ctx: *anyopaque = transport.no_context,
     decideFn: *const fn (ctx: *anyopaque, req: *const AuthRequest, prompter: *KbdPrompter) Decision,
@@ -1211,6 +1220,9 @@ pub const KbdPrompter = struct {
     t: *transport.Transport,
     scratch: []u8,
     rounds: u32 = 0,
+    /// Rounds the client answered properly. `.accept`/`.partial` from a
+    /// callback that never completed one is `error.InvalidAuthConfig`.
+    answered: u32 = 0,
     state: State = .ok,
     err: UserauthError = error.ProtocolError,
     /// The message that arrived instead of an INFO_RESPONSE (`.abandoned`).
@@ -1292,6 +1304,7 @@ pub const KbdPrompter = struct {
             if (a.len > max_password_len) return self.refuse();
         }
         if (!c.atEnd()) return self.refuse();
+        self.answered += 1;
         return true;
     }
 
@@ -1312,8 +1325,10 @@ pub const AuthConfig = struct {
     keyboard_interactive: ?KbdInteractiveCheck = null,
     /// The deciding callbacks of the first step (Go's `ServerConfig`
     /// callbacks): they may grant `Permissions` and ask for another method
-    /// (`Decision.partial`). A method may be set here or in its field above,
-    /// not both (`error.InvalidAuthConfig`).
+    /// (`Decision.partial`). Use either these callbacks or the hook fields
+    /// above, never both — not even for different methods
+    /// (`error.InvalidAuthConfig`): a hook-enabled method is active in the
+    /// first step and would let a client skip a partial-success chain.
     callbacks: AuthCallbacks = .{},
     /// Accept the `none` method — no credential at all (Go `NoClientAuth`).
     /// Never after a partial success.
@@ -1563,10 +1578,13 @@ const Active = struct {
 
     fn initial(config: AuthConfig) UserauthError!Active {
         const cb = config.callbacks;
-        if ((config.authorized_key != null and cb.publickey != null) or
-            (config.password != null and cb.password != null) or
-            (config.keyboard_interactive != null and cb.keyboard_interactive != null))
-            return error.InvalidAuthConfig;
+        // Hooks and callbacks never mix, not even for different methods: a
+        // hook-enabled method is always active in the first step, so beside
+        // a callback that starts a chain (`publickey` → partial → `password`)
+        // a `password` hook would log in alone, skipping the chain.
+        const any_hook = config.authorized_key != null or config.password != null or config.keyboard_interactive != null;
+        const any_callback = cb.publickey != null or cb.password != null or cb.keyboard_interactive != null;
+        if (any_hook and any_callback) return error.InvalidAuthConfig;
         var a: Active = .from(&cb);
         if (config.authorized_key) |h| a.pk = .{ .check = h };
         if (config.password) |h| a.pw = .{ .check = h };
@@ -1607,6 +1625,18 @@ const Step = union(enum) {
     abandoned: transport.Packet,
 };
 
+fn kbdDecide(hook: KbdHook, req: *const AuthRequest, prompter: *KbdPrompter) Decision {
+    switch (hook) {
+        .check => |kbd| {
+            var answers: [max_kbd_prompts][]const u8 = undefined;
+            const n = kbd.prompts.len;
+            if (!prompter.challenge(kbd.name, kbd.instruction, kbd.prompts, answers[0..n])) return .reject;
+            return if (kbd.checkFn(kbd.ctx, req.user, answers[0..n])) Decision.accepted else .reject;
+        },
+        .callback => |h| return h.decideFn(h.ctx, req, prompter),
+    }
+}
+
 fn decided(d: Decision, why: AuthFailure) Step {
     return switch (d) {
         .reject => .{ .rejected = why },
@@ -1618,19 +1648,17 @@ fn decided(d: Decision, why: AuthFailure) Step {
 /// The `keyboard-interactive` half of `serveUserauth` (RFC 4256 §3.2-§3.4):
 /// the hook's rounds through a `KbdPrompter`, then its verdict.
 fn serveKbdInteractive(t: *transport.Transport, scratch: []u8, req: *const AuthRequest, hook: KbdHook) UserauthError!Step {
+    if (hook == .check and hook.check.prompts.len > max_kbd_prompts) return error.NameTooLong;
     var prompter: KbdPrompter = .{ .t = t, .scratch = scratch };
-    const d: Decision = switch (hook) {
-        .check => |kbd| d: {
-            if (kbd.prompts.len > max_kbd_prompts) return error.NameTooLong;
-            var answers: [max_kbd_prompts][]const u8 = undefined;
-            const n = kbd.prompts.len;
-            if (!prompter.challenge(kbd.name, kbd.instruction, kbd.prompts, answers[0..n])) break :d .reject;
-            break :d if (kbd.checkFn(kbd.ctx, req.user, answers[0..n])) Decision.accepted else .reject;
-        },
-        .callback => |h| h.decideFn(h.ctx, req, &prompter),
-    };
+    // The answers are the peer's secrets, held in the hook's frames: the
+    // same burn as the password hooks, deeper because `challenge` runs a
+    // packet round trip under it.
+    const d = burn.run(burn.kbd_burn, Decision, kbdDecide, .{ hook, req, &prompter });
     return switch (prompter.state) {
-        .ok => decided(d, .wrong_answers),
+        // A dialogue that never completed a round authenticates nobody,
+        // whatever the callback answered: an `.accept` without asking is a
+        // policy bug, reported as such rather than honoured.
+        .ok => if (d != .reject and prompter.answered == 0) error.InvalidAuthConfig else decided(d, .wrong_answers),
         .refused => .{ .rejected = .wrong_answers },
         .abandoned => .{ .abandoned = prompter.pending.? },
         .failed => prompter.err,
@@ -2037,12 +2065,14 @@ const FuzzPolicy = struct {
     fn config(self: *FuzzPolicy) AuthConfig {
         self.next = .{ .keyboard_interactive = .{ .decideFn = kbd } };
         return .{
-            .authorized_key = .{ .checkFn = struct {
-                fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
-                    return true;
-                }
-            }.f },
-            .callbacks = .{ .password = .{ .ctx = self, .decideFn = password } },
+            .callbacks = .{
+                .publickey = .{ .decideFn = struct {
+                    fn f(_: *anyopaque, _: *const AuthRequest, _: []const u8, _: []const u8) Decision {
+                        return Decision.accepted;
+                    }
+                }.f },
+                .password = .{ .ctx = self, .decideFn = password },
+            },
             .no_client_auth = true,
             .no_client_auth_callback = .{ .decideFn = none },
         };
@@ -3158,4 +3188,135 @@ test "parseMethodList: known names only, unknown and empty ignored" {
     try t.expect(s.contains(.publickey) and s.contains(.keyboard_interactive));
     try t.expectEqual(@as(usize, 0), parseMethodList("").count());
     for (std.enums.values(AuthMethod)) |m| try t.expectEqual(@as(?AuthMethod, m), AuthMethod.fromWire(m.wireName()));
+}
+
+// ── review fixes 2026-11-15 ────────────────────────────────────────────────
+
+test "authenticateWith: a declined prompt or responder is not asked again by retryable, and nothing is sent" {
+    const t = std.testing;
+    const Decline = struct {
+        calls: usize = 0,
+        fn prompt(ctx: *anyopaque, _: []const u8, _: []u8) ?usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return null;
+        }
+        fn respond(ctx: *anyopaque, _: *const KbdChallenge, _: [][]const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return false;
+        }
+    };
+    var store: [8][512]u8 = undefined;
+    var names: [8][]const u8 = undefined;
+    {
+        var d: Decline = .{};
+        const inner: ClientMethod = .{ .password_prompt = .{ .ctx = &d, .promptFn = Decline.prompt } };
+        var m: [1]Msg = undefined;
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var progress: AuthProgress = .{};
+        try t.expectError(error.AuthenticationFailed, clientCanned(&.{
+            m[0].failure("password", false).bytes(),
+        }, &sink, &.{.{ .retryable = .{ .method = &inner, .max_tries = 0 } }}, &progress));
+        try t.expectEqual(@as(usize, 1), d.calls);
+        try t.expect(progress.tried.contains(.password));
+        const sent = try requestMethods(sink.buffered(), &store, &names);
+        try t.expectEqual(@as(usize, 1), sent.len); // the none probe only
+    }
+    {
+        var d: Decline = .{};
+        const inner: ClientMethod = .{ .keyboard_interactive = .{ .ctx = &d, .respondFn = Decline.respond } };
+        var m: [2]Msg = undefined;
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var progress: AuthProgress = .{};
+        try t.expectError(error.AuthenticationFailed, clientCanned(&.{
+            m[0].failure("keyboard-interactive", false).bytes(),
+            m[1].begin(messages.msg_userauth_info_request).str("").str("").str("").int(1).str("Code: ").byte(1).bytes(),
+        }, &sink, &.{.{ .retryable = .{ .method = &inner, .max_tries = 5 } }}, &progress));
+        try t.expectEqual(@as(usize, 1), d.calls);
+    }
+}
+
+test "serveUserauth: a keyboard-interactive callback that accepts without asking is never honoured" {
+    const t = std.testing;
+    const Lazy = struct {
+        fn decide(_: *anyopaque, _: *const AuthRequest, _: *KbdPrompter) Decision {
+            return Decision.accepted;
+        }
+    };
+    var m: [1]Msg = undefined;
+    var sink_buf: [1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    try t.expectError(error.InvalidAuthConfig, serveCanned(&.{m[0].kbd("alice").bytes()}, &sink, .{
+        .callbacks = .{ .keyboard_interactive = .{ .decideFn = Lazy.decide } },
+    }));
+    // And no SUCCESS reached the wire.
+    var store: [4][512]u8 = undefined;
+    const replies = try replyPayloads(sink.buffered(), &store);
+    for (replies) |r| try t.expect(r[0] != @backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS));
+}
+
+/// publickey (any key) is a partial success continuing with `password`.
+const KeyThenPassword = struct {
+    next: AuthCallbacks = .{},
+    fn key(ctx: *anyopaque, _: *const AuthRequest, _: []const u8, _: []const u8) Decision {
+        const self: *KeyThenPassword = @ptrCast(@alignCast(ctx));
+        return .{ .partial = &self.next };
+    }
+    fn password(_: *anyopaque, _: *const AuthRequest, pw: []const u8) Decision {
+        return if (std.mem.eql(u8, pw, "hunter2")) Decision.accepted else .reject;
+    }
+    fn callbacks(self: *KeyThenPassword) AuthCallbacks {
+        self.next = .{ .password = .{ .decideFn = password } };
+        return .{ .publickey = .{ .ctx = self, .decideFn = key } };
+    }
+};
+
+test "serveUserauth: hooks and callbacks never mix, so a chain cannot be skipped" {
+    // Review 2026-11-15: `callbacks.publickey` → partial → password, plus a
+    // `password` hook, made the hook active in step 1 — the password alone
+    // logged in.
+    const t = std.testing;
+    var accepting: PasswordPolicy = .{ .accepts = "hunter2" };
+    var chain: KeyThenPassword = .{};
+    var m: [1]Msg = undefined;
+    var sink_buf: [1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    try t.expectError(error.InvalidAuthConfig, serveCanned(&.{m[0].password("alice", "hunter2").bytes()}, &sink, .{
+        .callbacks = chain.callbacks(),
+        .password = accepting.hook(),
+    }));
+    // The chain alone: the right password first is refused (only publickey
+    // is enabled in step 1).
+    var why: AuthFailure = .peer_disconnected;
+    sink = .fixed(&sink_buf);
+    try t.expectError(error.AuthenticationFailed, serveCanned(&.{m[0].password("alice", "hunter2").bytes()}, &sink, .{
+        .callbacks = chain.callbacks(),
+        .max_attempts = 1,
+        .failure = &why,
+    }));
+    try t.expectEqual(AuthFailure.no_acceptable_method, why);
+}
+
+test "serveUserauth: the request that abandoned keyboard-interactive is dropped once max_attempts is reached" {
+    const t = std.testing;
+    var accepting: PasswordPolicy = .{ .accepts = "hunter2" };
+    var m: [2]Msg = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    try t.expectError(error.AuthenticationFailed, serveCanned(&.{
+        m[0].kbd("alice").bytes(),
+        m[1].password("alice", "hunter2").bytes(),
+    }, &sink, .{
+        .password = accepting.hook(),
+        .keyboard_interactive = .{ .prompts = &.{.{ .text = "Code: ", .echo = true }}, .checkFn = struct {
+            fn f(_: *anyopaque, _: []const u8, _: []const []const u8) bool {
+                return true;
+            }
+        }.f },
+        .max_attempts = 1,
+    }));
+    try t.expectEqual(@as(usize, 0), accepting.calls);
 }

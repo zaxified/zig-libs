@@ -1217,7 +1217,33 @@ pub const ServeConfig = struct {
     /// today's behavior exactly: `serveSession` refuses on the wire either
     /// way, this only adds an optional server-side observability seam.
     on_channel_open_refused: ?ChannelOpenRejectedHandler = null,
+
+    /// `base` with the authenticated identity AND what authentication
+    /// granted filled in from `auth` — so a `Permissions` returned by a
+    /// deciding callback cannot be dropped by setting only `.user`.
+    /// `auth` is borrowed (`user` points into it): keep it alive while the
+    /// config is in use.
+    ///
+    ///     const auth = try ssh.userauth.serveUserauth(&st, gpa, cfg);
+    ///     try ssh.connection.serveConnection(&st, gpa, .fromAuth(&auth, .{ .exec = handler }));
+    pub fn fromAuth(auth: *const userauth.AuthResult, base: ServeConfig) ServeConfig {
+        var c = base;
+        c.user = auth.user();
+        c.permissions = auth.permissions;
+        return c;
+    }
 };
+
+test "ServeConfig.fromAuth carries the user and the permissions" {
+    const opts = [_]userauth.Permissions.Option{.{ .name = "force-command", .value = "uptime" }};
+    var auth: userauth.AuthResult = .{ .permissions = .{ .critical_options = &opts } };
+    @memcpy(auth.user_buf[0..5], "alice");
+    auth.user_len = 5;
+    const c: ServeConfig = .fromAuth(&auth, .{ .max_sessions = 3 });
+    try std.testing.expectEqualStrings("alice", c.user);
+    try std.testing.expectEqualStrings("uptime", c.permissions.criticalOption("force-command").?);
+    try std.testing.expectEqual(@as(u32, 3), c.max_sessions);
+}
 
 /// Server: accept and serve exactly one `"session"` channel, then return.
 ///

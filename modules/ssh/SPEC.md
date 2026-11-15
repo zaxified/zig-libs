@@ -179,9 +179,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   a refusal whatever the callback returns. A client that sends a new USERAUTH_REQUEST instead of
   an INFO_RESPONSE abandons the dialogue (RFC 4252 §5 "MUST abandon the previous attempt"): the
   attempt counts as `wrong_answers`, no FAILURE is sent for it, and the new request is served —
-  where Go reports an unexpected message and drops it. A configuration that cannot work (no
-  method, a method both as hook and callback, a `partial` whose `next` enables nothing) is
-  `error.InvalidAuthConfig`. `Permissions` (critical options, extensions, `extra`) are borrowed
+  where Go reports an unexpected message and drops it (once `max_attempts` is reached the
+  pending request is dropped unserved). A keyboard-interactive callback's `.accept`/`.partial`
+  counts only after at least one completed round (else `error.InvalidAuthConfig`: an accept
+  without a dialogue is a policy bug), and the callback runs under `burn.kbd_burn` (its frames
+  hold the answers). A configuration that cannot work (no method, hook fields and `callbacks`
+  mixed — even for different methods, since a hook-enabled method is active in step 1 and would
+  let a client skip a `callbacks` chain — or a `partial` whose `next` enables nothing) is
+  `error.InvalidAuthConfig`. `ServeConfig.fromAuth` copies user and permissions together. `Permissions` (critical options, extensions, `extra`) are borrowed
   from the callback's `ctx` and travel `AuthResult.permissions` → `ServeConfig.permissions` →
   `RequestInfo.permissions`; this module enforces none of them (Go acts only on
   `source-address`, which needs the peer address this module never sees, and on
@@ -192,7 +197,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   not mark the method tried (OpenSSH `publickey,publickey` wants a second key). `publickey` walks
   its keys, signs only after a PK_OK that names the same blob and a matching type, and stops when
   the server no longer lists `publickey`; `retryable` repeats a plain failure up to `max_tries`
-  while the server still lists the method; `max_client_auth_steps` (64) bounds the loop.
+  while the server still lists the method, but never after a *declined* step (a
+  `password_prompt` returning null — nothing sent — or a responder giving up);
+  `max_client_auth_steps` (64) bounds the loop.
   `AuthProgress` reports allowed/partial/tried/succeeded. The FAILURE name-list is decoded into a
   `MethodSet` (names this module does not implement are dropped), so no peer string is kept.
 - **Sequence numbers are `u32`** (RFC 4253 §6.4), one per direction, wrapping, carried on the
