@@ -1568,7 +1568,10 @@ pub const Mtr = struct {
     }
 
     /// The hops worth showing: up to the end of the path when known, else up
-    /// to the last TTL that ever answered (none before the first answer).
+    /// to the last TTL that ever answered and, as mtr shows it (its `???`
+    /// row), the probed TTL after it: a destination that does not answer
+    /// shows where the path goes quiet instead of ending at the last router.
+    /// Before any answer that is TTL 1 alone, once probed; none before.
     pub fn hops(m: *const Mtr) []const MtrHop {
         return m.hop_buf[0..m.shown()];
     }
@@ -1584,6 +1587,7 @@ pub const Mtr = struct {
         for (m.hop_buf, 0..) |h, i| {
             if (h.received > 0) n = i + 1;
         }
+        if (n < m.hop_buf.len and m.hop_buf[n].sent > 0) n += 1; // the silent TTL
         return n;
     }
 
@@ -4751,6 +4755,40 @@ test "Mtr: a silent hop is all loss; a late answer belongs to no round" {
     try testing.expectEqual(@as(u32, 4), hs[2].received);
     try testing.expectEqual(@as(?u64, null), hs[1].avgNs());
     try testing.expectEqual(@as(?u64, null), hs[1].jitterNs());
+}
+
+test "Mtr: a destination that never answers shows one silent TTL after the last router, like mtr" {
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .drop, .drop, .drop } };
+    defer f.deinit();
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 6 });
+    defer m.deinit();
+    for (0..2) |_| try m.round(f.transport());
+    try testing.expect(!m.reached());
+    const hs = m.hops();
+    try testing.expectEqual(@as(usize, 3), hs.len);
+    try testing.expectEqual(@as(u8, 3), hs[2].ttl);
+    try testing.expectEqual(@as(u32, 2), hs[2].sent);
+    try testing.expectEqual(@as(u32, 0), hs[2].received);
+    try testing.expectEqual(@as(?netaddr.Ip, null), hs[2].address);
+    try testing.expectEqual(@as(usize, 3), m.lastRound().len);
+
+    // Nothing answers at all: TTL 1 alone, once probed.
+    var g: FakeTransport = .{ .behaviors = &.{.drop} };
+    defer g.deinit();
+    var q = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 4 });
+    defer q.deinit();
+    try testing.expectEqual(@as(usize, 0), q.hops().len);
+    try q.round(g.transport());
+    try testing.expectEqual(@as(usize, 1), q.hops().len);
+    try testing.expectEqual(@as(u32, 0), q.hops()[0].received);
+
+    // Every TTL up to max_hops answered by routers: nothing past it to show.
+    var r: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b } } };
+    defer r.deinit();
+    var full = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 2 });
+    defer full.deinit();
+    try full.round(r.transport());
+    try testing.expectEqual(@as(usize, 2), full.hops().len);
 }
 
 test "Mtr: the path grows and shrinks; Destination Unreachable ends it" {
