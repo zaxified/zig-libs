@@ -113,6 +113,12 @@ try jrnl.send(&.{
     .{ .name = "MESSAGE", .value = "multi-line\nvalues switch to the binary form automatically" },
     .{ .name = "PRIORITY", .value = "6" },
 });
+
+// Is stderr already the journal's stream (systemd sets JOURNAL_STREAM=<dev>:<ino>)?
+// The caller passes the env value; false when unset or malformed.
+if (syslog.journal.stderrIsJournal(env_map.get("JOURNAL_STREAM"))) {
+    // log journald-native, no timestamps/prefix of our own
+}
 ```
 
 ## Wire format (RFC 5424 §6)
