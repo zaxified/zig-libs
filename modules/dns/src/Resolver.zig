@@ -75,6 +75,15 @@ dot_ca: DotCa = if (dot_enabled) .{} else {},
 /// resolv.conf, loaded lazily on first use (do not copy the Resolver after).
 conf: ?config.ResolvConf,
 conf_text: ?[]u8,
+/// Identity of the resolv.conf `conf` was read from (null: it could not be
+/// stat'ed), compared by `refreshConfig`.
+conf_stamp: ?ConfStamp = null,
+/// When `refreshConfig` last stat'ed resolv.conf.
+conf_checked: ?std.Io.Clock.Timestamp = null,
+/// A public call is running: set by the OUTERMOST one (`beginCall`), so a
+/// nested call (`lookupIp` → `query`, the parallel family's copy) neither
+/// moves the call budget nor reloads resolv.conf under its caller.
+in_call: bool = false,
 /// Servers that refused an EDNS query (FORMERR without OPT, or BADVERS) and
 /// are asked without OPT from then on (RFC 6891 §7). Bounded: the oldest
 /// entry is replaced when full; dropped with the Resolver.
@@ -145,13 +154,13 @@ pub const Options = struct {
     /// system CA bundle and the name; `.insecure_no_verify` is RFC 7858
     /// opportunistic privacy -- encrypted against a passive observer only.
     dot_tls: http.Client.TlsOptions = .{},
-    /// Which address families `lookupIp`/`lookupIpTtl` ask for (Go's
+    /// Which address families `lookupIp` asks for (Go's
     /// "ip4"/"ip6" networks, hickory's `ip_strategy`). `.v4` sends no AAAA
     /// query at all; literals and /etc/hosts entries of the other family are
     /// left out. At `.any`, resolv.conf `options no-aaaa` (when resolv.conf is
     /// read) means `.v4`.
     family: Family = .any,
-    /// Ask A and AAAA at the same time in `lookupIp`/`lookupIpTtl`, as Go,
+    /// Ask A and AAAA at the same time in `lookupIp`, as Go,
     /// glibc and c-ares do: a server that drops AAAA then costs one timeout,
     /// not timeout + the A query. false = one after the other (glibc
     /// `single-request`); left true, resolv.conf `options single-request`
@@ -175,7 +184,7 @@ pub const Options = struct {
     /// set once at `init` from this field and never revisited.
     timeout_ms: u32 = default_timeout_ms,
     /// Budget for ONE public call (`resolve`, `query`, `lookupIp`,
-    /// `lookupIpTtl`, `reverse`, `exchange`, `queryJson`): every attempt,
+    /// `reverse`, the typed `lookup*`, `exchange`, `queryJson`): every attempt,
     /// server, search-list candidate and family together — Go's `ctx`
     /// deadline. When it runs out the call ends with `error.Timeout` (a reply
     /// already in hand is still returned). Each attempt waits for the earlier
@@ -209,6 +218,25 @@ pub const Options = struct {
     /// EDNS options sent with every query (cookie, NSID, padding …), at most
     /// `message.max_edns_options_len` bytes; else `InvalidOptions`.
     edns_options: []const message.EdnsOption = &.{},
+    /// DNS 0x20 (draft-vixie-dnsext-dns0x20; c-ares `ARES_FLAG_DNS0X20`,
+    /// hickory `case_randomization`): every UDP query spells its name with
+    /// randomly mixed ASCII case, and a reply must echo the question in
+    /// EXACTLY that case or it is dropped like a spoofed datagram -- one more
+    /// bit per letter an off-path forger must guess, on top of the id and
+    /// the source port. Off by default, as everywhere: a server or forwarder
+    /// that does not preserve the case of the question makes every UDP
+    /// query time out. Not applied to TCP/DoT/DoH (no blind spoofing there;
+    /// DoH caches key on the name) nor to `exchange`; the TCP retry of a
+    /// truncated reply re-sends the same mixed-case query and checks it too.
+    case_randomization: bool = false,
+    /// How often a public call re-checks resolv.conf (inode, size, mtime)
+    /// and re-reads it when it changed, before the call starts: Go checks at
+    /// most every 5 s, glibc ≥ 2.26 on every call, c-ares and getdns watch
+    /// it. 0 = on every call; null = read once, never again (the behaviour
+    /// before 2026-11-15). A failed re-read keeps the old settings. Matters
+    /// only where resolv.conf is read at all (no explicit `servers`, or the
+    /// search list in use).
+    resolv_conf_recheck_ms: ?u32 = 5000,
     hosts_path: []const u8 = "/etc/hosts",
     resolv_conf_path: []const u8 = "/etc/resolv.conf",
 };
@@ -230,11 +258,13 @@ pub const Error = error{
     /// `Options` is left at its own struct defaults and no explicit
     /// `Options.servers` bypasses resolv.conf) — the "5 s, 2 attempts" above
     /// is the fallback, not a promise resolv.conf can't shorten.
-    /// `lookupIp`/`lookupIpTtl` only: every server answered with a failure
-    /// rcode (SERVFAIL, REFUSED, NOTIMP — `serverFailed`) and nothing else
-    /// answered. Go's "server misbehaving": an outage, not "no such host".
-    ServerFailed,
     Timeout,
+    /// The high-level lookups (`lookupIp`, `reverse`, `lookup*`) only: the
+    /// reply carried an rcode that is neither NOERROR nor NXDOMAIN —
+    /// SERVFAIL, REFUSED, NOTIMP once every server said so (`serverFailed`),
+    /// FORMERR, YXDOMAIN … — and nothing else answered. Go's "server
+    /// misbehaving": an outage, not "no such host".
+    ServerFailed,
     /// Socket-level failure (bind/send/connect/read).
     NetworkFailed,
     /// The response did not decode, or its id/QR did not match the query.
@@ -336,50 +366,149 @@ pub fn resolve(r: *Resolver, name: []const u8, ty: message.Type) Error!message.M
     return bad_name orelse error.BadName; // only an empty/over-long name yields no candidate
 }
 
-/// All IPv4 + IPv6 addresses for `name`: IP literals pass through, /etc/hosts
-/// is consulted first (when enabled), then A and AAAA queries per search-list
-/// candidate. On Linux the result is ordered by RFC 6724 destination rules
-/// (netaddr) like getaddrinfo. Returns an empty slice when the servers
-/// answered but nothing resolves (NXDOMAIN, no records). When no address was
-/// found and a query failed (timeout, network, malformed answer), returns the
-/// last such error, as Go does — an outage is not "no such host". One family
-/// failing while the other answers is tolerated. Caller frees with `gpa.free`.
-pub fn lookupIp(r: *Resolver, name: []const u8) Error![]netaddr.Ip {
-    const owns_call = r.beginCall();
-    defer r.endCall(owns_call);
-    return (try r.lookupIpTtl(name)).ips;
-}
+/// What a high-level lookup learned about the name, at the rcode level (RFC
+/// 2308 §1 terms) -- "does the host exist" without reading a `Message`.
+pub const Status = enum {
+    /// Records of the asked type answered the name. `items` can still be
+    /// empty when every such record says "none" (an RFC 7505 null MX, an RFC
+    /// 2782 "." SRV target) -- the name declares it has no such service.
+    /// Also an IP literal or an /etc/hosts entry.
+    found,
+    /// NXDOMAIN (RCODE 3): the name does not exist (RFC 8020: nor does
+    /// anything below it). For a search-list lookup: no candidate exists.
+    /// After a CNAME, it is the alias TARGET that does not exist (RFC 6604).
+    nxdomain,
+    /// NODATA (RFC 2308 §2.2): the name exists (NOERROR) but has no record of
+    /// the asked type. For a search-list lookup: no candidate had one and at
+    /// least one exists -- NODATA outranks NXDOMAIN, as in glibc's
+    /// `res_search` (`got_nodata`).
+    nodata,
 
-/// `lookupIpTtl`'s answer. Free `ips` with `gpa.free`.
-pub const IpLookup = struct {
-    ips: []netaddr.Ip,
-    /// How long the answer may be cached, in seconds: the smallest TTL of the
-    /// records it was built from (the CNAME chain included, RFC 1035 §3.2.1);
-    /// for an empty answer the negative-caching TTL, the smaller of the SOA
-    /// record's TTL and its MINIMUM (RFC 2308 §5). Null when there is none to
-    /// go by: an IP literal, an /etc/hosts entry, an empty answer without SOA.
-    ttl_s: ?u32,
-    /// One address family's query failed (a timeout, a server failure) while
-    /// the other answered: `ips` holds that family only. A caller keeping an
-    /// address of the missing family should not take this as its replacement.
-    partial: bool = false,
+    fn rank(s: Status) u2 {
+        return switch (s) {
+            .nxdomain => 0,
+            .nodata => 1,
+            .found => 2,
+        };
+    }
 };
 
-/// `lookupIp`, and how long its answer may be cached (`IpLookup.ttl_s`) —
-/// what a caller that keeps addresses between lookups needs (a monitor that
-/// re-resolves its targets only when the answer expires). Only the answers
-/// of the search-list candidate that produced the addresses count; an empty
-/// result takes the smallest negative TTL over every candidate asked.
-pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
+/// The result of every high-level lookup -- `lookupIp`, `reverse`,
+/// `lookupCname`, `lookupMx`/`Ns`/`Txt`/`Srv`: the items plus what every
+/// mature resolver returns with them. Everything (items, their strings,
+/// `canonical`) lives in `arena`; free the whole result with `deinit`.
+pub fn Lookup(comptime T: type) type {
+    return struct {
+        arena: *std.heap.ArenaAllocator,
+        items: []const T,
+        status: Status,
+        /// How long this answer may be cached, in seconds from the moment the
+        /// call returned (a relative TTL as received; nothing here ages it --
+        /// a cache stores the receive time beside it): the smallest TTL
+        /// of the records it was built from, the CNAMEs on the way to them
+        /// included (RFC 1035 §3.2.1; RFC 2317 classless reverse delegation
+        /// is such a chain); for `lookupIp` over both families, the smaller
+        /// of the two (the absent family's negative TTL included). For an
+        /// empty answer (NXDOMAIN / NODATA) the negative-caching TTL,
+        /// `min(SOA TTL, SOA MINIMUM)` of the authority section's SOA (RFC
+        /// 2308 §5), bounded by a CNAME that was followed. Null when there is
+        /// nothing to go by: an IP literal, an /etc/hosts entry, an empty
+        /// answer without SOA.
+        ttl_s: ?u32,
+        /// The end of the CNAME chain of the name that answered (RFC 1034
+        /// §3.6.2 canonical name; getaddrinfo `AI_CANONNAME`, c-ares
+        /// `ai_cname`, hickory `Lookup::query`): the search-list candidate
+        /// itself (without a root dot) when it has no CNAME. For an empty
+        /// answer, that of the candidate that decided `status`. Null when no
+        /// DNS answer was read: an IP literal, an /etc/hosts entry, a
+        /// `.onion`/`.invalid` name.
+        canonical: ?[]const u8,
+        /// Every reply the result was built from had the AD bit set (RFC
+        /// 4035 §3.2.3: the resolver validated it with DNSSEC). Only ever
+        /// true with `Options.authentic_data` -- without it the AD bit of a
+        /// reply is cleared on arrival (RFC 6840 §5.7, glibc `trust-ad`),
+        /// because AD from an unauthenticated path proves nothing: set the
+        /// option only for a validating resolver reached over a path you
+        /// trust (loopback, DoT, DoH). False for literals and /etc/hosts.
+        /// This module does not validate; the sibling `dnssec` does.
+        authenticated: bool,
+        /// `lookupIp` only: one address family's query failed (a timeout, a
+        /// server failure) while the other answered, so `items` holds that
+        /// family only. A caller keeping an address of the missing family
+        /// should not take this as its replacement. Always false elsewhere.
+        partial: bool,
+
+        /// A deep copy in its own arena over `gpa` -- what a cache keeps after
+        /// the original is freed. Owns nothing of the Resolver's.
+        pub fn clone(l: *const @This(), gpa: std.mem.Allocator) error{OutOfMemory}!@This() {
+            var out = try newLookup(T, gpa);
+            errdefer out.deinit();
+            const a = out.arena.allocator();
+            const items = try a.alloc(T, l.items.len);
+            for (items, l.items) |*dst, src| dst.* = try cloneItem(T, a, src);
+            out.items = items;
+            out.status = l.status;
+            out.ttl_s = l.ttl_s;
+            out.canonical = if (l.canonical) |c| try a.dupe(u8, c) else null;
+            out.authenticated = l.authenticated;
+            out.partial = l.partial;
+            return out;
+        }
+
+        pub fn deinit(l: *@This()) void {
+            const gpa = l.arena.child_allocator;
+            l.arena.deinit();
+            gpa.destroy(l.arena);
+            l.* = undefined;
+        }
+    };
+}
+
+/// One item of a `Lookup`, its strings duplicated into `a`.
+fn cloneItem(comptime T: type, a: std.mem.Allocator, v: T) error{OutOfMemory}!T {
+    return switch (T) {
+        netaddr.Ip => v,
+        []const u8 => try a.dupe(u8, v),
+        Mx => .{ .preference = v.preference, .host = try a.dupe(u8, v.host) },
+        Srv => .{ .priority = v.priority, .weight = v.weight, .port = v.port, .target = try a.dupe(u8, v.target) },
+        else => @compileError("Lookup.clone: no copy rule for " ++ @typeName(T)),
+    };
+}
+
+fn newLookup(comptime T: type, gpa: std.mem.Allocator) error{OutOfMemory}!Lookup(T) {
+    const arena = try gpa.create(std.heap.ArenaAllocator);
+    arena.* = .init(gpa);
+    return .{ .arena = arena, .items = &.{}, .status = .nxdomain, .ttl_s = null, .canonical = null, .authenticated = false, .partial = false };
+}
+
+/// A local answer (literal, /etc/hosts): found, no TTL, no canonical name.
+fn localLookup(comptime T: type, gpa: std.mem.Allocator, items: []const T) error{OutOfMemory}!Lookup(T) {
+    var lk = try newLookup(T, gpa);
+    errdefer lk.deinit();
+    lk.items = try lk.arena.allocator().dupe(T, items);
+    lk.status = if (items.len > 0) .found else .nodata;
+    return lk;
+}
+
+/// All IPv4 + IPv6 addresses for `name`: IP literals pass through, /etc/hosts
+/// is consulted first (when enabled), then A and AAAA queries per search-list
+/// candidate; the first candidate with an address is the answer. On Linux the
+/// items are ordered by RFC 6724 destination rules (netaddr) like
+/// getaddrinfo. Nothing resolves (NXDOMAIN, NODATA): empty `items`, `status`
+/// says which. When no address was found and a query failed (timeout,
+/// network, malformed answer, a failure rcode -- `error.ServerFailed`), that
+/// error, as Go does: an outage is not "no such host". One family failing
+/// while the other answers is tolerated and marked `partial`. A `.onion` /
+/// `.invalid` name not in /etc/hosts is NXDOMAIN without a query (RFC 7686,
+/// RFC 6761). Free with `deinit`.
+pub fn lookupIp(r: *Resolver, name: []const u8) Error!Lookup(netaddr.Ip) {
     const owns_call = r.beginCall();
     defer r.endCall(owns_call);
-    var list: std.ArrayList(netaddr.Ip) = .empty;
-    errdefer list.deinit(r.gpa);
 
     if (netaddr.parseIp(name)) |ip| {
         // A literal of the other family than `Options.family` asks for: none.
-        if (familyAllows(r.options.family, ip)) try list.append(r.gpa, ip);
-        return .{ .ips = try list.toOwnedSlice(r.gpa), .ttl_s = null };
+        const one = [1]netaddr.Ip{ip};
+        return localLookup(netaddr.Ip, r.gpa, if (familyAllows(r.options.family, ip)) &one else &.{});
     }
 
     if (r.options.use_hosts) hosts: {
@@ -389,16 +518,24 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
         const n = config.hostsIpsForName(content, name, &ips);
         // /etc/hosts filtered to `Options.family` (resolv.conf `no-aaaa`
         // limits the DNS queries only, as in glibc).
-        for (ips[0..n]) |ip| if (familyAllows(r.options.family, ip)) try list.append(r.gpa, ip);
-        if (list.items.len > 0) {
-            sortIps(list.items);
-            return .{ .ips = try list.toOwnedSlice(r.gpa), .ttl_s = null };
+        var kept: usize = 0;
+        for (ips[0..n]) |ip| if (familyAllows(r.options.family, ip)) {
+            ips[kept] = ip;
+            kept += 1;
+        };
+        if (kept > 0) {
+            sortIps(ips[0..kept]);
+            return localLookup(netaddr.Ip, r.gpa, ips[0..kept]);
         }
     }
 
+    var lk = try newLookup(netaddr.Ip, r.gpa);
+    errdefer lk.deinit();
+    const arena = lk.arena.allocator();
+
     // RFC 7686 / 6761: after /etc/hosts, `.onion` and `.invalid` are not
     // asked of DNS; nothing resolves (Go's `avoidDNS`, `errNoSuchHost`).
-    if (config.isDnsAvoided(name)) return .{ .ips = try list.toOwnedSlice(r.gpa), .ttl_s = null };
+    if (config.isDnsAvoided(name)) return lk;
 
     var search: []const []const u8 = &.{};
     var ndots: u8 = 1;
@@ -420,14 +557,17 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
             else => return error.TlsFailed,
         };
 
+    var list: std.ArrayList(netaddr.Ip) = .empty;
     var candidate_buf: [message.max_name_text_len]u8 = undefined;
     var it = config.NameIterator.init(name, search, ndots);
     var last_err: ?Error = null;
-    // The winning candidate's TTL, or the smallest negative one so far.
-    var ttl: ?u32 = null;
+    // `won`: the candidate that produced the addresses; `neg`: every
+    // candidate asked, while none has.
+    var won: Tally = .{};
+    var neg: Tally = .{};
     var partial = false;
     while (it.next(&candidate_buf)) |candidate| {
-        var candidate_ttl: ?u32 = null;
+        var cand: Tally = .{};
         partial = false;
         families: {
             const fam = r.effectiveFamily();
@@ -455,8 +595,8 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
                 r.rotate_next = r6.rotate_next;
                 defer if (res4) |*m| m.deinit() else |_| {};
                 defer if (res6) |*m| m.deinit() else |_| {};
-                try r.takeFamily(&list, candidate, &res4, &candidate_ttl, &last_err, &partial);
-                try r.takeFamily(&list, candidate, &res6, &candidate_ttl, &last_err, &partial);
+                try takeFamily(arena, &list, candidate, .a, &res4, &cand, &last_err, &partial);
+                try takeFamily(arena, &list, candidate, .aaaa, &res6, &cand, &last_err, &partial);
                 break :families;
             }
             const types: []const message.Type = switch (fam) {
@@ -467,15 +607,15 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
             for (types) |ty| {
                 var res = r.query(candidate, ty);
                 defer if (res) |*m| m.deinit() else |_| {};
-                try r.takeFamily(&list, candidate, &res, &candidate_ttl, &last_err, &partial);
+                try takeFamily(arena, &list, candidate, ty, &res, &cand, &last_err, &partial);
             }
             break :families;
         }
         if (list.items.len > 0) { // first useful candidate wins
-            ttl = candidate_ttl;
+            won = cand;
             break;
         }
-        ttl = minTtl(ttl, candidate_ttl);
+        neg.merge(&cand);
     }
 
     // Found by simio's dns pilot (2026-10-01): with the server down, both
@@ -483,7 +623,10 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
     // from a name that has no addresses.
     if (list.items.len == 0) if (last_err) |err| return err;
     sortIps(list.items);
-    return .{ .ips = try list.toOwnedSlice(r.gpa), .ttl_s = ttl, .partial = partial };
+    lk.items = list.items;
+    lk.partial = partial and list.items.len > 0;
+    try (if (list.items.len > 0) &won else &neg).fill(arena, &lk.status, &lk.ttl_s, &lk.canonical, &lk.authenticated);
+    return lk;
 }
 
 fn minTtl(a: ?u32, b: ?u32) ?u32 {
@@ -492,91 +635,135 @@ fn minTtl(a: ?u32, b: ?u32) ?u32 {
     return @min(x, y);
 }
 
-/// The TTL one response contributes to `lookupIpTtl`: with addresses taken
-/// from it (`found`), the smallest TTL of the address and CNAME records on
-/// `qname`'s chain — the records `collectAddresses` used; without, the
-/// negative TTL from the authority section's SOA (RFC 2308 §5), bounded by
-/// any CNAME the chain did follow.
-fn answerTtl(answers: []const message.Record, authorities: []const message.Record, qname: []const u8, found: bool) ?u32 {
-    var chain: OwnerChain = .init(qname);
-    chain.follow(answers);
-    var ttl: ?u32 = null;
-    for (answers) |rec| {
-        if (rec.class != .in or !chain.contains(rec.name)) continue;
-        if (rec.data == .cname or dns.recordIp(rec) != null) ttl = minTtl(ttl, rec.ttl);
-    }
-    if (found) return ttl;
-    for (authorities) |rec| if (rec.data == .soa) return minTtl(ttl, @min(rec.ttl, rec.data.soa.minimum));
-    return ttl;
-}
-
-test "answerTtl: smallest TTL on the chain; negative answers from the SOA" {
-    const a = message.Record{ .name = "www.example.com", .ty = .a, .class = .in, .ttl = 300, .data = .{ .a = .{ 192, 0, 2, 1 } } };
-    const cname = message.Record{ .name = "example.com", .ty = .cname, .class = .in, .ttl = 120, .data = .{ .cname = "www.example.com" } };
-    const stray = message.Record{ .name = "other.example", .ty = .a, .class = .in, .ttl = 5, .data = .{ .a = .{ 203, 0, 113, 66 } } };
-    const soa = message.Record{ .name = "example.com", .ty = .soa, .class = .in, .ttl = 3600, .data = .{ .soa = .{
-        .mname = "ns.example.com",
-        .rname = "admin.example.com",
-        .serial = 1,
-        .refresh = 0,
-        .retry = 0,
-        .expire = 0,
-        .minimum = 900,
-    } } };
-    // The CNAME bounds the address behind it; a record off the chain does not count.
-    try testing.expectEqual(@as(?u32, 120), answerTtl(&.{ cname, a, stray }, &.{}, "example.com", true));
-    try testing.expectEqual(@as(?u32, 300), answerTtl(&.{ a, stray }, &.{}, "www.example.com", true));
-    // Nothing found: min(SOA TTL, MINIMUM), bounded by a followed CNAME; no SOA, no TTL.
-    try testing.expectEqual(@as(?u32, 900), answerTtl(&.{}, &.{soa}, "nx.example.com", false));
-    try testing.expectEqual(@as(?u32, 120), answerTtl(&.{cname}, &.{soa}, "example.com", false));
-    try testing.expectEqual(@as(?u32, null), answerTtl(&.{}, &.{}, "nx.example.com", false));
-    try testing.expectEqual(@as(?u32, 7), minTtl(7, null));
-    try testing.expectEqual(@as(?u32, 3), minTtl(7, 3));
-}
-
-/// PTR lookup: /etc/hosts first (when enabled), then a reverse query for the
-/// `in-addr.arpa`/`ip6.arpa` name built via netaddr. Returns the host names
-/// (possibly empty); free with `freeNames`. `reverseTtl` also says how long
-/// the answer may be cached.
-pub fn reverse(r: *Resolver, ip: netaddr.Ip) Error![]const []const u8 {
-    const owns_call = r.beginCall();
-    defer r.endCall(owns_call);
-    return (try r.reverseTtl(ip)).names;
-}
-
-/// `reverseTtl`'s answer. Free `names` with `freeNames`. There is no
-/// `partial` as in `IpLookup`: a reverse lookup is one query, so it either
-/// answers or fails as a whole.
-pub const ReverseLookup = struct {
-    names: []const []const u8,
-    /// How long the answer may be cached, in seconds: the smallest TTL of the
-    /// PTR records it was built from and of the CNAMEs on the way to them
-    /// (RFC 2317 classless delegation answers through a CNAME; RFC 1035
-    /// §3.2.1); for an empty answer (NXDOMAIN, NODATA) the negative-caching
-    /// TTL, the smaller of the SOA record's TTL and its MINIMUM (RFC 2308
-    /// §5). Null when there is none to go by: an /etc/hosts entry, an empty
-    /// answer without SOA.
+/// What one reply says about `qname`/`ty` -- the caller has already set
+/// replies with a failure rcode aside (`isAnswerRcode`). Pure, so the rules
+/// are testable offline.
+const Verdict = struct {
+    status: Status,
+    /// See `Lookup.ttl_s`: with a record of the type on the chain, the
+    /// smallest TTL over those records and the chain's CNAMEs; without, the
+    /// SOA's negative TTL (RFC 2308 §5), bounded by the CNAMEs followed.
     ttl_s: ?u32,
+    /// End of `qname`'s CNAME chain; points into the message or at `qname`.
+    canonical: []const u8,
+    authenticated: bool,
 };
 
-/// `reverse`, and how long its answer may be cached (`ReverseLookup.ttl_s`),
-/// for a caller that keeps host names between lookups (as `lookupIpTtl`).
-pub fn reverseTtl(r: *Resolver, ip: netaddr.Ip) Error!ReverseLookup {
+fn judge(msg: *const message.Message, qname: []const u8, ty: message.Type) Verdict {
+    var chain: OwnerChain = .init(qname);
+    chain.follow(msg.answers);
+    var found = false;
+    var ttl: ?u32 = null;
+    for (msg.answers) |rec| {
+        if (rec.class != .in or !chain.contains(rec.name)) continue;
+        if (rec.ty == ty) found = true;
+        if (rec.ty == ty or rec.data == .cname) ttl = minTtl(ttl, rec.ttl);
+    }
+    if (!found) for (msg.authorities) |rec| if (rec.data == .soa) {
+        ttl = minTtl(ttl, @min(rec.ttl, rec.data.soa.minimum));
+        break;
+    };
+    return .{
+        .status = if (found) .found else if (msg.rcode() == .nx_domain) .nxdomain else .nodata,
+        .ttl_s = ttl,
+        .canonical = chainEnd(msg.answers, qname),
+        .authenticated = msg.header.authentic_data,
+    };
+}
+
+/// Walks `qname`'s CNAME chain in `answers` (first matching CNAME per hop, at
+/// most `OwnerChain.max_cname_chain` hops) and returns where it ends -- the
+/// canonical name; `qname` without its root dot when there is no CNAME.
+fn chainEnd(answers: []const message.Record, qname: []const u8) []const u8 {
+    var cur = stripRootDot(qname);
+    var hops: usize = 0;
+    walk: while (hops < OwnerChain.max_cname_chain) : (hops += 1) {
+        for (answers) |rec| {
+            if (rec.class != .in or rec.data != .cname or !namesEqual(rec.name, cur)) continue;
+            cur = rec.data.cname;
+            continue :walk;
+        }
+        break;
+    }
+    return cur;
+}
+
+/// NOERROR and NXDOMAIN are answers; any other rcode a high-level lookup
+/// reads is the server's failure (`error.ServerFailed`): SERVFAIL, NOTIMP and
+/// REFUSED once every server said so (`query` moves on), FORMERR (even
+/// without EDNS), YXDOMAIN and the rest -- none of them says anything about
+/// the name, so none may read as "no such name".
+fn isAnswerRcode(rc: message.Rcode) bool {
+    return rc == .no_error or rc == .nx_domain;
+}
+
+/// Verdicts folded into one: the best status (found > NODATA > NXDOMAIN),
+/// the smallest TTL, AD only if every reply had it, and the canonical name of
+/// the first reply with the best status (copied: the replies are freed).
+const Tally = struct {
+    seen: bool = false,
+    status: Status = .nxdomain,
+    ttl_s: ?u32 = null,
+    authenticated: bool = true,
+    canonical_buf: [message.max_name_text_len]u8 = undefined,
+    canonical_len: usize = 0,
+
+    fn add(t: *Tally, v: Verdict) void {
+        if (!t.seen or v.status.rank() > t.status.rank()) {
+            t.status = v.status;
+            // Decoded names and stripped candidates are at most 253 bytes.
+            t.canonical_len = @min(v.canonical.len, t.canonical_buf.len);
+            @memcpy(t.canonical_buf[0..t.canonical_len], v.canonical[0..t.canonical_len]);
+        }
+        t.ttl_s = minTtl(t.ttl_s, v.ttl_s);
+        t.authenticated = t.authenticated and v.authenticated;
+        t.seen = true;
+    }
+
+    fn merge(t: *Tally, other: *const Tally) void {
+        if (!other.seen) return;
+        t.add(.{
+            .status = other.status,
+            .ttl_s = other.ttl_s,
+            .canonical = other.canonical_buf[0..other.canonical_len],
+            .authenticated = other.authenticated,
+        });
+    }
+
+    /// Writes the tally into a result. Nothing seen (no candidate was ever
+    /// asked): NXDOMAIN, nothing else known.
+    fn fill(t: *const Tally, arena: std.mem.Allocator, status: *Status, ttl_s: *?u32, canonical: *?[]const u8, authenticated: *bool) error{OutOfMemory}!void {
+        if (!t.seen) return;
+        status.* = t.status;
+        ttl_s.* = t.ttl_s;
+        canonical.* = try arena.dupe(u8, t.canonical_buf[0..t.canonical_len]);
+        authenticated.* = t.authenticated;
+    }
+};
+
+/// PTR lookup: /etc/hosts first (when enabled), then a reverse query for the
+/// `in-addr.arpa`/`ip6.arpa` name built via netaddr. `items` are the host
+/// names (owner-chain checked: a PTR for another owner is not this answer,
+/// an RFC 2317 CNAME delegation is followed); `canonical` is the end of that
+/// chain. A failure rcode is `error.ServerFailed`. One query, so `partial` is
+/// always false. Free with `deinit`.
+pub fn reverse(r: *Resolver, ip: netaddr.Ip) Error!Lookup([]const u8) {
     const owns_call = r.beginCall();
     defer r.endCall(owns_call);
-    var names: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (names.items) |n| r.gpa.free(n);
-        names.deinit(r.gpa);
-    }
 
     if (r.options.use_hosts) hosts: {
         const content = r.readHosts() orelse break :hosts;
         defer r.gpa.free(content);
         var name_buf: [message.max_name_text_len]u8 = undefined;
         if (config.hostsNameForIp(content, ip, &name_buf)) |name| {
-            try names.append(r.gpa, try r.gpa.dupe(u8, name));
-            return .{ .names = try names.toOwnedSlice(r.gpa), .ttl_s = null };
+            var lk = try localLookup([]const u8, r.gpa, &.{});
+            errdefer lk.deinit();
+            const a = lk.arena.allocator();
+            const one = try a.alloc([]const u8, 1);
+            one[0] = try a.dupe(u8, name);
+            lk.items = one;
+            lk.status = .found;
+            return lk;
         }
     }
 
@@ -586,24 +773,18 @@ pub fn reverseTtl(r: *Resolver, ip: netaddr.Ip) Error!ReverseLookup {
     const rev = dns.reverseName(ip, &rev_buf) catch unreachable;
     var msg = try r.query(rev, .ptr);
     defer msg.deinit();
-    try collectPtrNames(r.gpa, &names, &msg, rev);
-    const ttl = ptrTtl(&msg, rev, names.items.len > 0);
-    return .{ .names = try names.toOwnedSlice(r.gpa), .ttl_s = ttl };
-}
+    if (!isAnswerRcode(msg.rcode())) return error.ServerFailed;
 
-/// The TTL of a reverse answer, as `answerTtl` is for addresses: with names
-/// taken (`found`), the smallest TTL of the PTR and CNAME records on `rev`'s
-/// chain — the records `collectPtrNames` used; without, the negative TTL
-/// from the authority section's SOA (RFC 2308 §5), bounded by any CNAME the
-/// chain did follow.
-fn ptrTtl(msg: *const message.Message, rev: []const u8, found: bool) ?u32 {
-    var chain: OwnerChain = .init(rev);
-    chain.follow(msg.answers);
-    var used: ?u32 = null;
-    for (msg.answers) |rec| {
-        if (rec.class == .in and rec.data == .ptr and chain.contains(rec.name)) used = minTtl(used, rec.ttl);
-    }
-    return typedTtl(msg, &chain, used, found);
+    var lk = try newLookup([]const u8, r.gpa);
+    errdefer lk.deinit();
+    const a = lk.arena.allocator();
+    var names: std.ArrayList([]const u8) = .empty;
+    try collectPtrNames(a, &names, &msg, rev);
+    lk.items = names.items;
+    var t: Tally = .{};
+    t.add(judge(&msg, rev, .ptr));
+    try t.fill(a, &lk.status, &lk.ttl_s, &lk.canonical, &lk.authenticated);
+    return lk;
 }
 
 // ── typed lookups (R5 / G2): MX, NS, TXT, CNAME, SRV ─────────────────────────
@@ -614,39 +795,31 @@ pub const Mx = struct { preference: u16, host: []const u8 };
 /// One SRV record (RFC 2782). `target` "" or "." is "decidedly not available".
 pub const Srv = struct { priority: u16, weight: u16, port: u16, target: []const u8 };
 
-/// One result set of a typed lookup; every string lives in `arena` (free the
-/// whole set with `deinit`).
-pub fn Lookup(comptime T: type) type {
-    return struct {
-        arena: *std.heap.ArenaAllocator,
-        items: []const T,
-        /// The smallest TTL of the records used (the CNAME chain they were
-        /// reached through included); for an empty set the negative-caching
-        /// TTL from the SOA (RFC 2308 §5), null when there is none to go by.
-        ttl_s: ?u32,
-
-        pub fn deinit(l: *@This()) void {
-            const gpa = l.arena.child_allocator;
-            l.arena.deinit();
-            gpa.destroy(l.arena);
-            l.* = undefined;
-        }
-    };
-}
-
-/// `resolve`'s answer plus the search-list candidate that produced it (`qname`
-/// points into the caller's buffer or at the caller's `name`).
+/// `resolveNamed`'s answer: the reply that decided it with the candidate it
+/// answered (`qname` points into the caller's buffer or at the caller's
+/// `name`), or no reply when every candidate came back empty; `tally` is
+/// what goes into the result's status/TTL/canonical/authenticated.
 const Answered = struct {
-    msg: message.Message,
+    msg: ?message.Message,
     qname: []const u8,
+    tally: Tally,
 };
 
-/// `resolve` that also reports WHICH candidate answered — the typed lookups
-/// accept only records whose owner is in that candidate's `OwnerChain`. A
-/// failure rcode (SERVFAIL, REFUSED, NOTIMP) from every candidate that
-/// produced no answer is `error.ServerFailed` (an outage, not "no such
-/// name"), as in `lookupIpTtl`. NXDOMAIN / NODATA return the last reply.
-fn resolveNamed(r: *Resolver, name: []const u8, ty: message.Type, buf: *[message.max_name_text_len]u8) Error!Answered {
+/// When a candidate's reply ends the search-list walk.
+const Decisive = enum {
+    /// A record of the asked type on the chain (`Status.found`).
+    found,
+    /// That, or a CNAME on the chain (`lookupCname`: the alias is the answer
+    /// even when its target has no record of the type asked).
+    found_or_alias,
+};
+
+/// The search-list walk of the typed lookups: candidates in Go `nameList`
+/// order until one is decisive. A failure rcode from a candidate (see
+/// `isAnswerRcode`) with no decisive reply anywhere is `error.ServerFailed`
+/// (an outage, not "no such name"), as in `lookupIp`. Every candidate empty:
+/// no message, the tally of all of them.
+fn resolveNamed(r: *Resolver, name: []const u8, ty: message.Type, buf: *[message.max_name_text_len]u8, decisive: Decisive) Error!Answered {
     if (config.isDnsAvoided(name)) return error.BadName;
     var search: []const []const u8 = &.{};
     var ndots: u8 = 1;
@@ -656,54 +829,40 @@ fn resolveNamed(r: *Resolver, name: []const u8, ty: message.Type, buf: *[message
         ndots = r.conf.?.ndots;
     }
     var it = config.NameIterator.init(name, search, ndots);
-    var last: ?Answered = null;
-    errdefer if (last) |*a| a.msg.deinit();
+    var neg: Tally = .{};
     var bad_name: ?Error = null;
     var failed = false;
     while (it.next(buf)) |candidate| {
-        const msg = r.query(candidate, ty) catch |err| switch (err) {
+        var msg = r.query(candidate, ty) catch |err| switch (err) {
             error.BadName, error.NameTooLong => {
                 if (bad_name == null) bad_name = err;
                 continue;
             },
             else => |e| return e,
         };
-        if (serverFailed(msg.rcode())) failed = true;
-        if (msg.rcode() == .no_error and msg.answers.len > 0) {
-            if (last) |*a| a.msg.deinit();
-            last = null;
-            return .{ .msg = msg, .qname = candidate };
+        if (!isAnswerRcode(msg.rcode())) {
+            failed = true;
+            msg.deinit();
+            continue;
         }
-        if (last) |*a| a.msg.deinit();
-        last = .{ .msg = msg, .qname = candidate };
+        const v = judge(&msg, candidate, ty);
+        const aliased = decisive == .found_or_alias and !namesEqual(v.canonical, candidate);
+        if (v.status == .found or aliased) {
+            var t: Tally = .{};
+            t.add(v);
+            return .{ .msg = msg, .qname = candidate, .tally = t };
+        }
+        neg.add(v);
+        msg.deinit();
     }
     if (failed) return error.ServerFailed;
-    if (last) |a| return a;
-    return bad_name orelse error.BadName;
-}
-
-fn newLookup(comptime T: type, gpa: std.mem.Allocator) error{OutOfMemory}!Lookup(T) {
-    const arena = try gpa.create(std.heap.ArenaAllocator);
-    arena.* = .init(gpa);
-    return .{ .arena = arena, .items = &.{}, .ttl_s = null };
-}
-
-/// The TTL of a typed answer: `used` (the smallest TTL of the records taken)
-/// bounded by the CNAMEs on the chain; with nothing found, the SOA's negative
-/// TTL (RFC 2308 §5).
-fn typedTtl(msg: *const message.Message, chain: *const OwnerChain, used: ?u32, found: bool) ?u32 {
-    var ttl = used;
-    for (msg.answers) |rec| {
-        if (rec.class == .in and rec.data == .cname and chain.contains(rec.name)) ttl = minTtl(ttl, rec.ttl);
-    }
-    if (found) return ttl;
-    for (msg.authorities) |rec| if (rec.data == .soa) return minTtl(ttl, @min(rec.ttl, rec.data.soa.minimum));
-    return ttl;
+    if (!neg.seen) return bad_name orelse error.BadName;
+    return .{ .msg = null, .qname = "", .tally = neg };
 }
 
 /// Builds the result set from the records of `ans` that `convert` accepts
-/// (null = not this type) and whose owner is in the answering candidate's
-/// chain, class IN.
+/// (null = not this type, or a "none" record) and whose owner is in the
+/// answering candidate's chain, class IN.
 fn collectTyped(
     comptime T: type,
     r: *Resolver,
@@ -713,18 +872,18 @@ fn collectTyped(
     var lk = try newLookup(T, r.gpa);
     errdefer lk.deinit();
     const a = lk.arena.allocator();
-    var chain: OwnerChain = .init(ans.qname);
-    chain.follow(ans.msg.answers);
-    var list: std.ArrayList(T) = .empty;
-    var used: ?u32 = null;
-    for (ans.msg.answers) |*rec| {
-        if (rec.class != .in or !chain.contains(rec.name)) continue;
-        const item = (try convert(a, rec)) orelse continue;
-        try list.append(a, item);
-        used = minTtl(used, rec.ttl);
+    if (ans.msg) |*msg| {
+        var chain: OwnerChain = .init(ans.qname);
+        chain.follow(msg.answers);
+        var list: std.ArrayList(T) = .empty;
+        for (msg.answers) |*rec| {
+            if (rec.class != .in or !chain.contains(rec.name)) continue;
+            const item = (try convert(a, rec)) orelse continue;
+            try list.append(a, item);
+        }
+        lk.items = list.items;
     }
-    lk.items = list.items;
-    lk.ttl_s = typedTtl(&ans.msg, &chain, used, list.items.len > 0);
+    try ans.tally.fill(a, &lk.status, &lk.ttl_s, &lk.canonical, &lk.authenticated);
     return lk;
 }
 
@@ -842,14 +1001,15 @@ pub fn orderSrv(items: []Srv, rng: anytype) void {
 
 /// MX records of `name`, sorted by preference; equal preferences in random
 /// order (RFC 5321 §5.1). Only records owned by the name that answered (or by
-/// a CNAME target chained from it) count. An empty set for NXDOMAIN / NODATA;
-/// `error.ServerFailed` when the servers failed. Free with `Lookup.deinit`.
+/// a CNAME target chained from it) count. NXDOMAIN / NODATA: empty `items`,
+/// `status` says which; `error.ServerFailed` when the servers failed. A null
+/// MX (RFC 7505) is `found` with no item. Free with `Lookup.deinit`.
 pub fn lookupMx(r: *Resolver, name: []const u8) Error!Lookup(Mx) {
     const owns_call = r.beginCall();
     defer r.endCall(owns_call);
     var buf: [message.max_name_text_len]u8 = undefined;
-    var ans = try r.resolveNamed(name, .mx, &buf);
-    defer ans.msg.deinit();
+    var ans = try r.resolveNamed(name, .mx, &buf, .found);
+    defer if (ans.msg) |*m| m.deinit();
     const lk = try collectTyped(Mx, r, &ans, mxItem);
     const items: []Mx = @constCast(lk.items);
     orderMx(items, IoRng{ .io = r.io });
@@ -861,8 +1021,8 @@ pub fn lookupNs(r: *Resolver, name: []const u8) Error!Lookup([]const u8) {
     const owns_call = r.beginCall();
     defer r.endCall(owns_call);
     var buf: [message.max_name_text_len]u8 = undefined;
-    var ans = try r.resolveNamed(name, .ns, &buf);
-    defer ans.msg.deinit();
+    var ans = try r.resolveNamed(name, .ns, &buf, .found);
+    defer if (ans.msg) |*m| m.deinit();
     return collectTyped([]const u8, r, &ans, nsItem);
 }
 
@@ -873,40 +1033,53 @@ pub fn lookupTxt(r: *Resolver, name: []const u8) Error!Lookup([]const u8) {
     const owns_call = r.beginCall();
     defer r.endCall(owns_call);
     var buf: [message.max_name_text_len]u8 = undefined;
-    var ans = try r.resolveNamed(name, .txt, &buf);
-    defer ans.msg.deinit();
+    var ans = try r.resolveNamed(name, .txt, &buf, .found);
+    defer if (ans.msg) |*m| m.deinit();
     return collectTyped([]const u8, r, &ans, txtItem);
 }
 
-/// The canonical name of `name`: the end of its CNAME chain (at most
-/// `OwnerChain.max_cname_chain` hops), or `name` itself when it has no CNAME
-/// (or nothing resolves). The chain is read from an A answer — a recursive
-/// resolver returns the whole chain there — so a name with only AAAA records
-/// and a CNAME still reports its CNAME. Caller frees with `gpa.free`.
-pub fn lookupCname(r: *Resolver, name: []const u8) Error![]u8 {
+/// The CNAME chain of `name` (Go `LookupCNAME`), read from an A query -- a
+/// recursive resolver returns the whole chain there, so a name with only
+/// AAAA records and a CNAME still reports its CNAME. `items` are the alias
+/// targets in chain order (at most `OwnerChain.max_cname_chain` hops),
+/// `canonical` the last of them, or the name itself when it has none.
+/// `status` is that of a CNAME question: `found` with at least one alias,
+/// `nodata` for a name that exists without one, `nxdomain` for none. Every
+/// other lookup already reports `canonical`, so a caller that also wants the
+/// addresses calls `lookupIp` alone. Free with `deinit`.
+pub fn lookupCname(r: *Resolver, name: []const u8) Error!Lookup([]const u8) {
     const owns_call = r.beginCall();
     defer r.endCall(owns_call);
     var buf: [message.max_name_text_len]u8 = undefined;
-    var ans = try r.resolveNamed(name, .a, &buf);
-    defer ans.msg.deinit();
+    var ans = try r.resolveNamed(name, .a, &buf, .found_or_alias);
+    defer if (ans.msg) |*m| m.deinit();
+    var lk = try newLookup([]const u8, r.gpa);
+    errdefer lk.deinit();
+    const a = lk.arena.allocator();
+    try ans.tally.fill(a, &lk.status, &lk.ttl_s, &lk.canonical, &lk.authenticated);
+    // No reply decided it: every candidate was NXDOMAIN / NODATA, as tallied.
+    const msg = if (ans.msg) |*m| m else return lk;
+    var aliases: std.ArrayList([]const u8) = .empty;
     var cur = ans.qname;
-    var hops: usize = 0;
-    walk: while (hops < OwnerChain.max_cname_chain) : (hops += 1) {
-        for (ans.msg.answers) |rec| {
+    walk: while (aliases.items.len < OwnerChain.max_cname_chain) {
+        for (msg.answers) |rec| {
             if (rec.class != .in or rec.data != .cname or !namesEqual(rec.name, cur)) continue;
             cur = rec.data.cname;
+            try aliases.append(a, try a.dupe(u8, cur));
             continue :walk;
         }
         break;
     }
-    return r.gpa.dupe(u8, if (hops == 0) name else cur);
+    lk.items = aliases.items;
+    lk.status = if (aliases.items.len > 0) .found else .nodata;
+    return lk;
 }
 
 /// SRV targets of `_service._proto.name` (RFC 2782) in connection order:
 /// ascending priority, weighted-random within a priority (`orderSrv`). Empty
 /// `service` and `proto` query `name` as given (Go semantics). A "." target =
-/// service not available = empty set. `error.NameTooLong` when the built name
-/// does not fit. Same rules as `lookupMx` otherwise.
+/// service not available = `found` with no item. `error.NameTooLong` when the
+/// built name does not fit. Same rules as `lookupMx` otherwise.
 pub fn lookupSrv(r: *Resolver, service: []const u8, proto: []const u8, name: []const u8) Error!Lookup(Srv) {
     const owns_call = r.beginCall();
     defer r.endCall(owns_call);
@@ -916,24 +1089,24 @@ pub fn lookupSrv(r: *Resolver, service: []const u8, proto: []const u8, name: []c
     else
         std.fmt.bufPrint(&name_buf, "_{s}._{s}.{s}", .{ service, proto, name }) catch return error.NameTooLong;
     var buf: [message.max_name_text_len]u8 = undefined;
-    var ans = try r.resolveNamed(full, .srv, &buf);
-    defer ans.msg.deinit();
+    var ans = try r.resolveNamed(full, .srv, &buf, .found);
+    defer if (ans.msg) |*m| m.deinit();
     const lk = try collectTyped(Srv, r, &ans, srvItem);
     const items: []Srv = @constCast(lk.items);
     orderSrv(items, IoRng{ .io = r.io });
     return lk;
 }
 
-/// Appends (gpa-duped) the PTR targets in `msg.answers` that answer `rev` —
+/// Appends (`a`-duped) the PTR targets in `msg.answers` that answer `rev` —
 /// owner equal to the reverse name or to a CNAME target chained from it
 /// (RFC 2317 classless in-addr.arpa delegation is exactly such a chain),
 /// class IN. A PTR for some other owner is not this answer. Pure over the
 /// decoded message; the `reverse` counterpart of `collectAddresses`.
-fn collectPtrNames(gpa: std.mem.Allocator, names: *std.ArrayList([]const u8), msg: *const message.Message, rev: []const u8) error{OutOfMemory}!void {
+fn collectPtrNames(a: std.mem.Allocator, names: *std.ArrayList([]const u8), msg: *const message.Message, rev: []const u8) error{OutOfMemory}!void {
     var chain: OwnerChain = .init(rev);
     chain.follow(msg.answers);
     for (msg.answers) |rec| switch (rec.data) {
-        .ptr => |name| if (rec.class == .in and chain.contains(rec.name)) try names.append(gpa, try gpa.dupe(u8, name)),
+        .ptr => |name| if (rec.class == .in and chain.contains(rec.name)) try names.append(a, try a.dupe(u8, name)),
         else => {},
     };
 }
@@ -995,22 +1168,17 @@ const OwnerChain = struct {
     }
 };
 
-/// Appends the A/AAAA addresses in `msg.answers` that answer `qname` — owner
-/// equal to `qname` or to a CNAME target chained from it (see `OwnerChain`),
-/// class IN. Pure over the decoded message, so it is testable offline.
-fn collectAddresses(gpa: std.mem.Allocator, list: *std.ArrayList(netaddr.Ip), msg: *const message.Message, qname: []const u8) error{OutOfMemory}!void {
+/// Appends the addresses of type `ty` (A or AAAA) in `msg.answers` that
+/// answer `qname` — owner equal to `qname` or to a CNAME target chained from
+/// it (see `OwnerChain`), class IN. Pure over the decoded message, so it is
+/// testable offline.
+fn collectAddresses(a: std.mem.Allocator, list: *std.ArrayList(netaddr.Ip), msg: *const message.Message, qname: []const u8, ty: message.Type) error{OutOfMemory}!void {
     var chain: OwnerChain = .init(qname);
     chain.follow(msg.answers);
     for (msg.answers) |rec| {
-        if (rec.class != .in or !chain.contains(rec.name)) continue;
-        if (dns.recordIp(rec)) |ip| try list.append(gpa, ip);
+        if (rec.class != .in or rec.ty != ty or !chain.contains(rec.name)) continue;
+        if (dns.recordIp(rec)) |ip| try list.append(a, ip);
     }
-}
-
-/// Free a slice returned by `reverse`.
-pub fn freeNames(r: *Resolver, names: []const []const u8) void {
-    for (names) |n| r.gpa.free(n);
-    r.gpa.free(names);
 }
 
 /// One-shot query for exactly `name` (no search list, no hosts file) over
@@ -1033,7 +1201,7 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
         const packet = try r.encodeChecked(&qbuf, name, ty, 0);
         const raw = try r.dohExchange(packet);
         defer r.gpa.free(raw);
-        return r.decodeResponse(raw, 0, name, ty);
+        return r.decodeResponse(raw, 0, name, ty, false);
     }
 
     // Built without DoT: refuse, never quietly ask plain DNS instead.
@@ -1094,7 +1262,12 @@ fn askServer(r: *Resolver, server: netaddr.Ip, name: []const u8, ty: message.Typ
     var id_bytes: [2]u8 = undefined;
     r.io.random(&id_bytes);
     const id = std.mem.readInt(u16, &id_bytes, .big);
-    const packet = try r.encodeFor(qbuf, name, ty, id, edns);
+    // DNS 0x20 (`Options.case_randomization`), UDP only: the name goes out in
+    // random case and the reply must echo exactly that spelling.
+    var mixed_buf: [message.max_name_text_len + 1]u8 = undefined;
+    const exact = r.options.case_randomization and !r.useTcp();
+    const sent = if (exact) r.mixCase(name, &mixed_buf) else name;
+    const packet = try r.encodeFor(qbuf, sent, ty, id, edns);
 
     if (r.useTcp()) {
         const raw = r.streamExchange(server, packet) catch |err| switch (err) {
@@ -1105,10 +1278,10 @@ fn askServer(r: *Resolver, server: netaddr.Ip, name: []const u8, ty: message.Typ
             },
         };
         defer r.gpa.free(raw);
-        return try r.decodeResponse(raw, id, name, ty);
+        return try r.decodeResponse(raw, id, name, ty, false);
     }
 
-    const udp = r.udpExchange(server, packet, id, rbuf, .{ .name = name, .ty = ty }) catch |err| switch (err) {
+    const udp = r.udpExchange(server, packet, id, rbuf, .{ .name = sent, .ty = ty, .exact_case = exact }) catch |err| switch (err) {
         error.Canceled, error.OutOfMemory => |e| return e,
         else => {
             last_err.* = err;
@@ -1132,9 +1305,23 @@ fn askServer(r: *Resolver, server: netaddr.Ip, name: []const u8, ty: message.Typ
             },
         };
         defer r.gpa.free(traw);
-        return try r.decodeResponse(traw, id, name, ty);
+        return try r.decodeResponse(traw, id, sent, ty, exact);
     }
-    return try r.decodeResponse(raw, id, name, ty);
+    return try r.decodeResponse(raw, id, sent, ty, exact);
+}
+
+/// `name` in random ASCII case (one random bit per byte; non-letters stay),
+/// written into `buf`. `name` was already validated (≤ 253 chars + a root
+/// dot), so it fits; anything longer is cut, and then refused by the encoder.
+fn mixCase(r: *Resolver, name: []const u8, buf: *[message.max_name_text_len + 1]u8) []const u8 {
+    var bits: [(message.max_name_text_len + 1 + 7) / 8]u8 = undefined;
+    r.io.random(&bits);
+    const n = @min(name.len, buf.len);
+    for (name[0..n], buf[0..n], 0..) |c, *o, i| {
+        const flip = std.ascii.isAlphabetic(c) and (bits[i / 8] >> @intCast(i % 8)) & 1 != 0;
+        o.* = if (flip) c ^ 0x20 else c;
+    }
+    return buf[0..n];
 }
 
 /// FORMERR with no OPT in the reply, or BADVERS: the server refused the
@@ -1264,7 +1451,8 @@ fn encodeFor(r: *const Resolver, buf: []u8, name: []const u8, ty: message.Type, 
 /// Before the question check an off-path attacker needed only the 16-bit id
 /// and the source port; a reply whose question section named some other
 /// name, or had no question section at all, was taken as the answer to ours.
-fn decodeResponse(r: *Resolver, raw: []const u8, id: u16, name: []const u8, ty: message.Type) Error!message.Message {
+/// `exact_case` (DNS 0x20): the echoed name must also match byte for byte.
+fn decodeResponse(r: *Resolver, raw: []const u8, id: u16, name: []const u8, ty: message.Type, exact_case: bool) Error!message.Message {
     var msg = message.decode(r.gpa, raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedResponse,
@@ -1274,6 +1462,7 @@ fn decodeResponse(r: *Resolver, raw: []const u8, id: u16, name: []const u8, ty: 
     if (msg.questions.len != 1) return error.MalformedResponse;
     const q = msg.questions[0];
     if (q.ty != ty or q.class != .in or !namesEqual(q.name, name)) return error.MalformedResponse;
+    if (exact_case and !std.mem.eql(u8, stripRootDot(q.name), stripRootDot(name))) return error.MalformedResponse;
     // RFC 6840 §5.7 / glibc `trust-ad`: AD passes only when asked for.
     if (!r.options.authentic_data) msg.header.authentic_data = false;
     return msg;
@@ -1287,10 +1476,11 @@ const default_servers = [_]netaddr.Ip{
     .{ .v6 = @as([15]u8, @splat(0)) ++ [_]u8{1} },
 };
 
-/// One family's query result folded into `lookupIpTtl`'s state: addresses
-/// collected (owner-chain checked), TTL, and failures remembered — a failed
-/// family is tolerated (Go aggregates too) but marks the result `partial`.
-fn takeFamily(r: *Resolver, list: *std.ArrayList(netaddr.Ip), candidate: []const u8, res: *Error!message.Message, candidate_ttl: *?u32, last_err: *?Error, partial: *bool) Error!void {
+/// One family's query result folded into `lookupIp`'s state: addresses
+/// collected (owner-chain checked, into the result's arena `a`), the reply's
+/// verdict tallied, and failures remembered — a failed family is tolerated
+/// (Go aggregates too) but marks the result `partial`.
+fn takeFamily(a: std.mem.Allocator, list: *std.ArrayList(netaddr.Ip), candidate: []const u8, ty: message.Type, res: *Error!message.Message, cand: *Tally, last_err: *?Error, partial: *bool) Error!void {
     const msg = res.* catch |err| switch (err) {
         error.Canceled, error.OutOfMemory => |e| return e,
         else => {
@@ -1301,14 +1491,13 @@ fn takeFamily(r: *Resolver, list: *std.ArrayList(netaddr.Ip), candidate: []const
     };
     // A failure rcode is the server's outage, not an empty answer (`query`
     // returns it once every server failed that way).
-    if (serverFailed(msg.rcode())) {
+    if (!isAnswerRcode(msg.rcode())) {
         last_err.* = error.ServerFailed;
         partial.* = true;
         return;
     }
-    const before = list.items.len;
-    try collectAddresses(r.gpa, list, &msg, candidate);
-    candidate_ttl.* = minTtl(candidate_ttl.*, answerTtl(msg.answers, msg.authorities, candidate, list.items.len > before));
+    try collectAddresses(a, list, &msg, candidate, ty);
+    cand.add(judge(&msg, candidate, ty));
 }
 
 fn queryInto(r: *Resolver, name: []const u8, ty: message.Type, out: *(Error!message.Message)) void {
@@ -1369,7 +1558,7 @@ fn useTcp(r: *const Resolver) bool {
     return if (r.conf) |c| c.use_vc else false;
 }
 
-/// The family `lookupIpTtl` asks for: `Options.family`, or `.v4` for
+/// The family `lookupIp` asks for: `Options.family`, or `.v4` for
 /// resolv.conf `no-aaaa` when the option was left `.any`.
 fn effectiveFamily(r: *const Resolver) Family {
     if (r.options.family != .any) return r.options.family;
@@ -1400,6 +1589,9 @@ fn serverList(r: *Resolver) Error![]const netaddr.Ip {
 
 fn ensureConfig(r: *Resolver) Error!void {
     if (r.conf != null) return;
+    // Stamped BEFORE the read: a file replaced in between is seen as changed
+    // by the next check (one extra reload), never as unchanged.
+    const stamp = r.confStamp();
     const text = std.Io.Dir.cwd().readFileAlloc(
         r.io,
         r.options.resolv_conf_path,
@@ -1411,6 +1603,47 @@ fn ensureConfig(r: *Resolver) Error!void {
     };
     r.conf_text = text;
     r.conf = config.parseResolvConf(text);
+    r.conf_stamp = stamp;
+    r.conf_checked = std.Io.Clock.Timestamp.now(r.io, .awake);
+}
+
+/// What identifies one version of resolv.conf: an editor's atomic rename
+/// changes the inode, an in-place rewrite the mtime -- and the size, which
+/// catches a rewrite inside the same coarse mtime tick.
+const ConfStamp = struct {
+    inode: std.Io.File.INode,
+    size: u64,
+    mtime_ns: i96,
+
+    fn same(a: ?ConfStamp, b: ?ConfStamp) bool {
+        const x = a orelse return b == null;
+        const y = b orelse return false;
+        return x.inode == y.inode and x.size == y.size and x.mtime_ns == y.mtime_ns;
+    }
+};
+
+/// Null when resolv.conf cannot be stat'ed (missing: glibc-style defaults).
+fn confStamp(r: *Resolver) ?ConfStamp {
+    const st = std.Io.Dir.cwd().statFile(r.io, r.options.resolv_conf_path, .{}) catch return null;
+    return .{ .inode = st.inode, .size = st.size, .mtime_ns = st.mtime.nanoseconds };
+}
+
+/// `Options.resolv_conf_recheck_ms`: at the start of an outermost public
+/// call, at most once per interval, re-stat resolv.conf and drop the parsed
+/// copy when it changed, so the call's `ensureConfig` reads the new one. Only
+/// here, never inside a call: the search list and the server list are slices
+/// into `conf_text` for the whole call (and the parallel family's copy of the
+/// Resolver shares it).
+fn refreshConfig(r: *Resolver) void {
+    const every = r.options.resolv_conf_recheck_ms orelse return;
+    if (r.conf == null) return; // never read yet: the first use reads it
+    const now = std.Io.Clock.Timestamp.now(r.io, .awake);
+    if (r.conf_checked) |t| if (t.durationTo(now).raw.toMilliseconds() < every) return;
+    r.conf_checked = now;
+    if (ConfStamp.same(r.confStamp(), r.conf_stamp)) return;
+    if (r.conf_text) |t| r.gpa.free(t);
+    r.conf_text = null;
+    r.conf = null;
 }
 
 fn readHosts(r: *Resolver) ?[]u8 {
@@ -1453,17 +1686,25 @@ fn attemptDeadline(r: *Resolver) std.Io.Timeout {
     };
 }
 
-/// Start the `call_timeout_ms` budget if no outer call already did; returns
-/// whether this call owns it (pass to `endCall`).
+/// Start a public call: the outermost one (no call running yet) owns it --
+/// it re-checks resolv.conf (`refreshConfig`) and starts the
+/// `call_timeout_ms` budget; a nested call does neither. Returns whether this
+/// call owns it (pass to `endCall`).
 fn beginCall(r: *Resolver) bool {
-    if (r.call_deadline != null or r.options.call_timeout_ms == 0) return false;
-    const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(r.options.call_timeout_ms), .clock = .awake } };
-    r.call_deadline = t.toTimestamp(r.io);
+    if (r.in_call) return false;
+    r.in_call = true;
+    r.refreshConfig();
+    if (r.options.call_timeout_ms != 0) {
+        const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(r.options.call_timeout_ms), .clock = .awake } };
+        r.call_deadline = t.toTimestamp(r.io);
+    }
     return true;
 }
 
 fn endCall(r: *Resolver, owns: bool) void {
-    if (owns) r.call_deadline = null;
+    if (!owns) return;
+    r.in_call = false;
+    r.call_deadline = null;
 }
 
 /// The call budget is spent: no further attempt may start.
@@ -1602,7 +1843,7 @@ const UdpResult = struct {
 };
 
 /// What `query` asked, for `udpExchange` to recognise its answer by.
-const Expect = struct { name: []const u8, ty: message.Type };
+const Expect = struct { name: []const u8, ty: message.Type, exact_case: bool = false };
 
 /// One UDP round-trip. Datagrams from the wrong peer, with the wrong id, that
 /// are no response or (with `expect`) no answer to the question are ignored
@@ -1644,7 +1885,7 @@ fn udpExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8, id: u16, rb
         // A truncated reply is not decoded here, it goes to TCP.
         if (incoming.data[2] & 0x80 == 0) continue;
         if (expect) |e| if (!incoming.flags.trunc and incoming.data[2] & 0x02 == 0) {
-            var m = r.decodeResponse(incoming.data, id, e.name, e.ty) catch |err| switch (err) {
+            var m = r.decodeResponse(incoming.data, id, e.name, e.ty, e.exact_case) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => continue,
             };
@@ -2024,16 +2265,16 @@ test "decodeResponse rejects id mismatch and non-response packets (anti-spoofing
     const good = "\x12\x34" ++ "\x80\x00" ++ "\x00\x01\x00\x00\x00\x00\x00\x00" ++
         "\x07example\x03com\x00" ++ "\x00\x01" ++ "\x00\x01";
 
-    var msg = try r.decodeResponse(good, 0x1234, "example.com", .a);
+    var msg = try r.decodeResponse(good, 0x1234, "example.com", .a, false);
     msg.deinit();
 
     // Same packet, wrong expected id: rejected, not silently accepted.
-    try testing.expectError(error.MalformedResponse, r.decodeResponse(good, 0x1235, "example.com", .a));
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(good, 0x1235, "example.com", .a, false));
 
     // QR=0 (a query, not a response) with the matching id: also rejected.
     var not_response = good.*;
     not_response[2] = 0x00;
-    try testing.expectError(error.MalformedResponse, r.decodeResponse(&not_response, 0x1234, "example.com", .a));
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(&not_response, 0x1234, "example.com", .a, false));
 }
 
 test "decodeResponse: AD in a reply reaches the caller only with Options.authentic_data (RFC 6840 \u{a7}5.7, glibc trust-ad)" {
@@ -2048,11 +2289,11 @@ test "decodeResponse: AD in a reply reaches the caller only with Options.authent
     // QR | RD | RA | AD, id 0x1234, our question.
     const ad_reply = "\x12\x34" ++ "\x81\xa0" ++ "\x00\x01\x00\x00\x00\x00\x00\x00" ++
         "\x07example\x03com\x00" ++ "\x00\x01" ++ "\x00\x01";
-    var m1 = try r.decodeResponse(ad_reply, 0x1234, "example.com", .a);
+    var m1 = try r.decodeResponse(ad_reply, 0x1234, "example.com", .a, false);
     try testing.expect(!m1.header.authentic_data);
     m1.deinit();
     r.options.authentic_data = true;
-    var m2 = try r.decodeResponse(ad_reply, 0x1234, "example.com", .a);
+    var m2 = try r.decodeResponse(ad_reply, 0x1234, "example.com", .a, false);
     try testing.expect(m2.header.authentic_data);
     m2.deinit();
 }
@@ -2093,27 +2334,34 @@ test "decodeResponse: the echoed question must be OUR question — name, type, c
 
     // (a) a different name
     const other_name = head ++ "\x00\x01\x00\x00\x00\x00\x00\x00" ++ "\x08attacker\x07example\x00" ++ "\x00\x01" ++ "\x00\x01";
-    try testing.expectError(error.MalformedResponse, r.decodeResponse(other_name, 0x1234, "example.com", .a));
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(other_name, 0x1234, "example.com", .a, false));
     // (b) no question section at all
     const no_question = head ++ "\x00\x00\x00\x00\x00\x00\x00\x00";
-    try testing.expectError(error.MalformedResponse, r.decodeResponse(no_question, 0x1234, "example.com", .a));
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(no_question, 0x1234, "example.com", .a, false));
     // (c) two questions
     const two = head ++ "\x00\x02\x00\x00\x00\x00\x00\x00" ++ "\x07example\x03com\x00\x00\x01\x00\x01" ++ "\x07example\x03com\x00\x00\x01\x00\x01";
-    try testing.expectError(error.MalformedResponse, r.decodeResponse(two, 0x1234, "example.com", .a));
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(two, 0x1234, "example.com", .a, false));
     // (d) our name, wrong type
     const wrong_type = head ++ "\x00\x01\x00\x00\x00\x00\x00\x00" ++ "\x07example\x03com\x00" ++ "\x00\x10" ++ "\x00\x01";
-    try testing.expectError(error.MalformedResponse, r.decodeResponse(wrong_type, 0x1234, "example.com", .a));
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(wrong_type, 0x1234, "example.com", .a, false));
     // (e) our name and type, class CH
     const wrong_class = head ++ "\x00\x01\x00\x00\x00\x00\x00\x00" ++ "\x07example\x03com\x00" ++ "\x00\x01" ++ "\x00\x03";
-    try testing.expectError(error.MalformedResponse, r.decodeResponse(wrong_class, 0x1234, "example.com", .a));
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(wrong_class, 0x1234, "example.com", .a, false));
 
     // Accepted: case differences (RFC 4343 — 0x20 randomization echoes the
     // query's case, other servers normalize) and our own trailing root dot.
     const upper = head ++ "\x00\x01\x00\x00\x00\x00\x00\x00" ++ "\x07EXAMPLE\x03Com\x00" ++ "\x00\x01" ++ "\x00\x01";
-    var m1 = try r.decodeResponse(upper, 0x1234, "example.com", .a);
+    var m1 = try r.decodeResponse(upper, 0x1234, "example.com", .a, false);
     m1.deinit();
-    var m2 = try r.decodeResponse(upper, 0x1234, "Example.COM.", .a);
+    var m2 = try r.decodeResponse(upper, 0x1234, "Example.COM.", .a, false);
     m2.deinit();
+
+    // DNS 0x20 (`case_randomization`): only the exact spelling sent passes;
+    // the root dot still does not count.
+    var m3 = try r.decodeResponse(upper, 0x1234, "EXAMPLE.Com.", .a, true);
+    m3.deinit();
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(upper, 0x1234, "EXAMPLE.com", .a, true));
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(upper, 0x1234, "example.com", .a, true));
 }
 
 // ── the hermetic half of the loopback question-check anchor (audit F20) ──────
@@ -2158,7 +2406,7 @@ test "decodeResponse: the replies `interop-dns` captured off a real socket — h
     // check has its own test above.
     for ([_][]const u8{ wrong_question, no_question }) |frame| {
         const id = std.mem.readInt(u16, frame[0..2], .big);
-        try testing.expectError(error.MalformedResponse, r.decodeResponse(frame, id, "example.com", .a));
+        try testing.expectError(error.MalformedResponse, r.decodeResponse(frame, id, "example.com", .a, false));
     }
 
     // ⭐ Positive control, without which the two lines above stay green against
@@ -2166,13 +2414,13 @@ test "decodeResponse: the replies `interop-dns` captured off a real socket — h
     // decayed into garbage: the honest capture decodes, and the off-bailiwick
     // record it also carries is dropped one layer up rather than here.
     const honest_id = std.mem.readInt(u16, honest[0..2], .big);
-    var msg = try r.decodeResponse(honest, honest_id, "example.com", .a);
+    var msg = try r.decodeResponse(honest, honest_id, "example.com", .a, false);
     defer msg.deinit();
     try testing.expectEqual(@as(usize, 2), msg.answers.len);
 
     var list: std.ArrayList(netaddr.Ip) = .empty;
     defer list.deinit(testing.allocator);
-    try collectAddresses(testing.allocator, &list, &msg, "example.com");
+    try collectAddresses(testing.allocator, &list, &msg, "example.com", .a);
     try testing.expectEqual(@as(usize, 1), list.items.len);
     try testing.expect(list.items[0].eql(netaddr.parseIp("192.0.2.1").?)); // never 203.0.113.66
 }
@@ -2203,14 +2451,24 @@ test "collectAddresses: only the queried owner and its CNAME chain count (bailiw
 
     var list: std.ArrayList(netaddr.Ip) = .empty;
     defer list.deinit(testing.allocator);
-    try collectAddresses(testing.allocator, &list, &msg, "example.com");
+    try collectAddresses(testing.allocator, &list, &msg, "example.com", .a);
     try testing.expectEqual(@as(usize, 2), list.items.len);
     try testing.expect(list.items[0].eql(netaddr.parseIp("198.51.100.7").?));
     try testing.expect(list.items[1].eql(netaddr.parseIp("192.0.2.9").?));
+    // The same chain read for AAAA: no address of THAT type, so none at all.
+    list.clearRetainingCapacity();
+    try collectAddresses(testing.allocator, &list, &msg, "example.com", .aaaa);
+    try testing.expectEqual(@as(usize, 0), list.items.len);
+    // What the result says around those addresses: the chain's end is the
+    // canonical name, out of order and case notwithstanding.
+    const v = judge(&msg, "example.com", .a);
+    try testing.expectEqual(Status.found, v.status);
+    try testing.expectEqualStrings("cdn.example.net", v.canonical);
+    try testing.expectEqual(@as(?u32, 60), v.ttl_s);
 
     // Asked about the victim instead, only its own record qualifies.
     list.clearRetainingCapacity();
-    try collectAddresses(testing.allocator, &list, &msg, "victim.test.");
+    try collectAddresses(testing.allocator, &list, &msg, "victim.test.", .a);
     try testing.expectEqual(@as(usize, 1), list.items.len);
     try testing.expect(list.items[0].eql(netaddr.parseIp("203.0.113.66").?));
 }
@@ -2446,15 +2704,22 @@ test "toNetAddress maps netaddr.Ip to std.Io.net.IpAddress" {
 /// `answers` raw records. Test-only — the module publishes no response
 /// encoder, and the stubs here need to LIE in controlled ways.
 fn stubResponse(buf: []u8, query_bytes: []const u8, flags: u16, question: []const u8, answers: []const u8, ancount: u16) []u8 {
+    return stubResponseAuth(buf, query_bytes, flags, question, answers, ancount, "", 0);
+}
+
+/// `stubResponse` with an authority section (`nscount` raw records) -- the
+/// SOA a negative answer carries (RFC 2308 §3).
+fn stubResponseAuth(buf: []u8, query_bytes: []const u8, flags: u16, question: []const u8, answers: []const u8, ancount: u16, authority: []const u8, nscount: u16) []u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.writeAll(query_bytes[0..2]) catch unreachable;
     w.writeInt(u16, flags, .big) catch unreachable;
     w.writeInt(u16, if (question.len == 0) 0 else 1, .big) catch unreachable;
     w.writeInt(u16, ancount, .big) catch unreachable;
-    w.writeInt(u16, 0, .big) catch unreachable;
+    w.writeInt(u16, nscount, .big) catch unreachable;
     w.writeInt(u16, 0, .big) catch unreachable;
     w.writeAll(question) catch unreachable;
     w.writeAll(answers) catch unreachable;
+    w.writeAll(authority) catch unreachable;
     return w.buffered();
 }
 
@@ -2577,12 +2842,15 @@ test "call_timeout_ms: a silent server ends the whole call at the budget, not af
 }
 
 test "call_timeout_ms: nested public calls share the outer budget; 0 sets none" {
-    var r: Resolver = .{ .io = undefined, .gpa = testing.allocator, .options = .{}, .http_client = null, .conf = null, .conf_text = null };
-    try testing.expect(!r.beginCall()); // 0 = no budget
-    try testing.expect(r.call_deadline == null);
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
-    r.io = threaded.io();
+    var r: Resolver = .{ .io = threaded.io(), .gpa = testing.allocator, .options = .{}, .http_client = null, .conf = null, .conf_text = null };
+    const zero = r.beginCall(); // the outermost call owns it even without a budget
+    try testing.expect(zero and r.in_call);
+    try testing.expect(r.call_deadline == null); // 0 = no budget
+    try testing.expect(!r.beginCall()); // nested
+    r.endCall(zero);
+    try testing.expect(!r.in_call);
     r.options.call_timeout_ms = 1000;
     const outer = r.beginCall();
     try testing.expect(outer);
@@ -2591,9 +2859,9 @@ test "call_timeout_ms: nested public calls share the outer budget; 0 sets none" 
     try testing.expect(!inner); // the inner call does not move it
     try testing.expect(r.call_deadline.?.compare(.eq, d));
     r.endCall(inner);
-    try testing.expect(r.call_deadline != null);
+    try testing.expect(r.call_deadline != null and r.in_call);
     r.endCall(outer);
-    try testing.expect(r.call_deadline == null);
+    try testing.expect(r.call_deadline == null and !r.in_call);
 }
 
 test "lookupIp/resolve: .onion and .invalid never reach the server (RFC 7686 \u{a7}2, RFC 6761 \u{a7}6.4)" {
@@ -2615,9 +2883,12 @@ test "lookupIp/resolve: .onion and .invalid never reach the server (RFC 7686 \u{
     defer r.deinit();
     const t0 = std.Io.Clock.Timestamp.now(io, .awake);
     for ([_][]const u8{ "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion", "x.ONION.", "host.invalid" }) |n| {
-        const found = try r.lookupIpTtl(n);
-        defer testing.allocator.free(found.ips);
-        try testing.expectEqual(@as(usize, 0), found.ips.len);
+        var found = try r.lookupIp(n);
+        defer found.deinit();
+        try testing.expectEqual(@as(usize, 0), found.items.len);
+        try testing.expectEqual(Status.nxdomain, found.status); // Go: errNoSuchHost
+        try testing.expectEqual(@as(?[]const u8, null), found.canonical);
+        try testing.expectEqual(@as(?u32, null), found.ttl_s);
         try testing.expectError(error.BadName, r.resolve(n, .a));
     }
     try testing.expect(t0.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds() < 500);
@@ -2667,13 +2938,15 @@ test "lookupIp: an answer record the question never asked about is ignored (bail
     r.options.parallel_families = false;
     // The stub answers the A query; the AAAA query times out (1.5 s) and
     // lookupIp tolerates one family failing.
-    const found = try r.lookupIpTtl("example.com");
-    const ips = found.ips;
-    defer testing.allocator.free(ips);
+    var found = try r.lookupIp("example.com");
+    defer found.deinit();
+    const ips = found.items;
     try testing.expectEqual(@as(usize, 1), ips.len);
     try testing.expect(ips[0].eql(netaddr.parseIp("192.0.2.1").?)); // never 203.0.113.66
     try testing.expectEqual(@as(?u32, 60), found.ttl_s); // the A record's TTL, over the wire
     try testing.expect(found.partial); // the AAAA query timed out
+    try testing.expectEqual(Status.found, found.status);
+    try testing.expectEqualStrings("example.com", found.canonical.?);
 }
 
 /// RFC 6891 §7 fallback stub: answers `max` datagrams for `example.com A`,
@@ -2849,6 +3122,9 @@ const EchoStub = struct {
         servfail,
         /// A as `a_only`; AAAA: SERVFAIL.
         aaaa_servfail,
+        /// The second query: NOERROR, no answer (NODATA); every other one:
+        /// NXDOMAIN.
+        nodata_second_only,
     };
 
     const a_honest = "\xc0\x0c" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xc0\x00\x02\x01";
@@ -2888,6 +3164,10 @@ const EchoStub = struct {
                     continue;
                 },
                 .drop_first => if (n == 0) continue,
+                .nodata_second_only => {
+                    try st.sock.send(st.io, &incoming.from, stubResponse(&first, q, if (n == 1) 0x8180 else 0x8183, question, "", 0));
+                    continue;
+                },
                 .servfail, .aaaa_servfail => if (st.mode == .servfail or !is_a) {
                     try st.sock.send(st.io, &incoming.from, stubResponse(&first, q, 0x8182, question, "", 0));
                     continue;
@@ -3056,7 +3336,7 @@ test "resolve: a NODATA answer for one search candidate moves on to the next" {
     try expectOnlyHonestA(&msg);
 }
 
-test "lookupIpTtl: a SERVFAIL is an outage, not an empty answer; one family failing is partial" {
+test "lookupIp: a SERVFAIL is an outage, not an empty answer; one family failing is partial" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -3066,7 +3346,7 @@ test "lookupIpTtl: a SERVFAIL is an outage, not an empty answer; one family fail
         var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .use_search = false });
         defer r.deinit();
         var fut = try io.concurrent(EchoStub.run, .{&stub});
-        const res = r.lookupIpTtl("example.com");
+        const res = r.lookupIp("example.com");
         fut.await(io);
         try testing.expectError(error.ServerFailed, res);
     }
@@ -3076,11 +3356,11 @@ test "lookupIpTtl: a SERVFAIL is an outage, not an empty answer; one family fail
         var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .use_search = false });
         defer r.deinit();
         var fut = try io.concurrent(EchoStub.run, .{&stub});
-        const res = r.lookupIpTtl("example.com");
+        const res = r.lookupIp("example.com");
         fut.await(io);
-        const found = try res;
-        defer testing.allocator.free(found.ips);
-        try testing.expectEqual(@as(usize, 1), found.ips.len);
+        var found = try res;
+        defer found.deinit();
+        try testing.expectEqual(@as(usize, 1), found.items.len);
         try testing.expect(found.partial);
         try testing.expectEqual(@as(?u32, 60), found.ttl_s);
     }
@@ -3105,10 +3385,11 @@ test "lookupIp: the first search candidate with an address wins, later ones are 
     var fut = try io.concurrent(EchoStub.run, .{&stub});
     const res = r.lookupIp("host");
     fut.await(io);
-    const ips = try res;
-    defer testing.allocator.free(ips);
-    try testing.expectEqual(@as(usize, 1), ips.len);
+    var found = try res;
+    defer found.deinit();
+    try testing.expectEqual(@as(usize, 1), found.items.len);
     try testing.expectEqual(@as(usize, 2), stub.served); // A + AAAA for host.s1.test only
+    try testing.expectEqualStrings("host.s1.test", found.canonical.?); // the candidate that answered
 }
 
 /// A plain-HTTP loopback "DoH server" that answers every request with
@@ -3576,19 +3857,20 @@ test "family: .v4 sends no AAAA query, .v6 no A; a literal of the other family i
 
     var r4 = familyResolver(io, testing.allocator, &stub, .{ .family = .v4 });
     defer r4.deinit();
-    const a = try r4.lookupIp("example.com.");
-    defer testing.allocator.free(a);
-    try testing.expectEqual(@as(usize, 1), a.len);
-    try testing.expect(a[0] == .v4);
+    var a = try r4.lookupIp("example.com.");
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 1), a.items.len);
+    try testing.expect(a.items[0] == .v4);
     var r6 = familyResolver(io, testing.allocator, &stub, .{ .family = .v6 });
     defer r6.deinit();
-    const b = try r6.lookupIp("example.com.");
-    defer testing.allocator.free(b);
-    try testing.expectEqual(@as(usize, 1), b.len);
-    try testing.expect(b[0] == .v6);
-    const lit = try r6.lookupIp("192.0.2.7");
-    defer testing.allocator.free(lit);
-    try testing.expectEqual(@as(usize, 0), lit.len);
+    var b = try r6.lookupIp("example.com.");
+    defer b.deinit();
+    try testing.expectEqual(@as(usize, 1), b.items.len);
+    try testing.expect(b.items[0] == .v6);
+    var lit = try r6.lookupIp("192.0.2.7");
+    defer lit.deinit();
+    try testing.expectEqual(@as(usize, 0), lit.items.len);
+    try testing.expectEqual(Status.nodata, lit.status);
     try testing.expectEqualSlices(u16, &.{ 1, 28 }, stub.types[0..2]); // one A, then one AAAA, nothing else
     try testing.expectEqual(@as(usize, 2), stub.n);
 }
@@ -3609,18 +3891,18 @@ test "parallel_families: A and AAAA leave together (~1 x the server's delay), se
     var rp = familyResolver(io, arena.allocator(), &stub, .{});
     defer rp.deinit();
     const t0 = std.Io.Clock.Timestamp.now(io, .awake);
-    const both = try rp.lookupIpTtl("example.com.");
+    const both = try rp.lookupIp("example.com.");
     const par_ms = t0.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds();
-    try testing.expectEqual(@as(usize, 2), both.ips.len);
+    try testing.expectEqual(@as(usize, 2), both.items.len);
     try testing.expect(!both.partial);
 
     var rs = familyResolver(io, testing.allocator, &stub, .{ .parallel_families = false });
     defer rs.deinit();
     const t1 = std.Io.Clock.Timestamp.now(io, .awake);
-    const seq = try rs.lookupIpTtl("example.com.");
-    defer testing.allocator.free(seq.ips);
+    var seq = try rs.lookupIp("example.com.");
+    defer seq.deinit();
     const seq_ms = t1.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds();
-    try testing.expectEqual(@as(usize, 2), seq.ips.len);
+    try testing.expectEqual(@as(usize, 2), seq.items.len);
     if (!(par_ms < 500 and seq_ms >= 550)) {
         std.debug.print("parallel {d} ms, sequential {d} ms\n", .{ par_ms, seq_ms });
         return error.NotParallel;
@@ -3653,8 +3935,8 @@ test "resolv.conf: no-aaaa asks A only, single-request goes sequential, rotate s
     try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, log.slice()); // rotate: each query starts at the next server
     try testing.expectEqual(Family.v4, r.effectiveFamily()); // no-aaaa
     try testing.expect(!r.parallelFamilies()); // single-request
-    const ips = try r.lookupIp("probe.example.");
-    defer testing.allocator.free(ips);
+    var ips = try r.lookupIp("probe.example.");
+    defer ips.deinit();
     try testing.expectEqual(@as(usize, 4), log.slice().len); // one query (A) for lookupIp, no AAAA
 }
 
@@ -3676,19 +3958,19 @@ test "review X: the parallel path on a fresh Resolver loads resolv.conf ONCE (no
     // testing.allocator: a second, never-freed resolv.conf text (the copy's) fails the test.
     var r = Resolver.init(io, testing.allocator, .{ .resolv_conf_path = plain, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .use_search = false });
     defer r.deinit();
-    const both = try r.lookupIp("example.com.");
-    defer testing.allocator.free(both);
-    try testing.expectEqual(@as(usize, 2), both.len);
+    var both = try r.lookupIp("example.com.");
+    defer both.deinit();
+    try testing.expectEqual(@as(usize, 2), both.items.len);
 
     var p2: [256]u8 = undefined;
     try tmp.dir.writeFile(io, .{ .sub_path = "b.conf", .data = "nameserver 127.0.0.1\noptions no-aaaa\n" });
     const noaaaa = try std.mem.print(&p2, ".zig-cache/tmp/{s}/b.conf", .{&tmp.sub_path});
     var r4 = Resolver.init(io, testing.allocator, .{ .resolv_conf_path = noaaaa, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .use_search = false });
     defer r4.deinit();
-    const v4 = try r4.lookupIp("example.com.");
-    defer testing.allocator.free(v4);
-    try testing.expectEqual(@as(usize, 1), v4.len); // first lookup already honours no-aaaa
-    try testing.expect(v4[0] == .v4);
+    var v4 = try r4.lookupIp("example.com.");
+    defer v4.deinit();
+    try testing.expectEqual(@as(usize, 1), v4.items.len); // first lookup already honours no-aaaa
+    try testing.expect(v4.items[0] == .v4);
 }
 
 test "review X: a null MX (RFC 7505, exchange \".\") is no mail host" {
@@ -4107,10 +4389,19 @@ const WireBuf = struct {
         rd.put(&addr);
         b.rr(owner, .a, ttl, &rd);
     }
+
+    fn soaRr(b: *WireBuf, owner: []const u8, ttl: u32, minimum: u32) void {
+        var rd: WireBuf = .{};
+        rd.putName("ns.example.com");
+        rd.putName("admin.example.com");
+        for ([_]u32{ 1, 7200, 900, 1209600, minimum }) |v| rd.putInt(u32, v); // serial refresh retry expire minimum
+        b.rr(owner, .soa, ttl, &rd);
+    }
 };
 
-/// Answers every query with the same canned answer section, echoing the
-/// question it was asked.
+/// Answers every query with the same canned answer (and authority) section,
+/// echoing the question it was asked -- in lower case with `fold_question`,
+/// as a server that does not preserve the query's case would.
 const TypedStub = struct {
     io: std.Io,
     sock: net.Socket,
@@ -4118,8 +4409,14 @@ const TypedStub = struct {
     answers: []const u8,
     ancount: u16,
     max: usize,
+    authority: []const u8 = "",
+    nscount: u16 = 0,
+    fold_question: bool = false,
     idle_ms: i64 = 3000,
     served: usize = 0,
+    /// The question section of the last query, as it arrived.
+    last_question: [message.max_query_len]u8 = undefined,
+    last_question_len: usize = 0,
 
     fn run(st: *TypedStub) void {
         while (st.served < st.max) st.serveOne() catch return;
@@ -4134,8 +4431,14 @@ const TypedStub = struct {
         while (p < q.len and q[p] != 0) p += @as(usize, q[p]) + 1;
         p += 5; // root label, type, class
         if (p > q.len) return error.BadQuery;
+        const question = q[12..p];
+        @memcpy(st.last_question[0..question.len], question);
+        st.last_question_len = question.len;
+        if (st.fold_question) for (question) |*c| {
+            c.* = std.ascii.toLower(c.*);
+        };
         var out: [2048]u8 = undefined;
-        const resp = stubResponse(&out, q, st.flags, q[12..p], st.answers, st.ancount);
+        const resp = stubResponseAuth(&out, q, st.flags, question, st.answers, st.ancount, st.authority, st.nscount);
         // Counted before the reply leaves: a test reads `served` as soon as it has the reply.
         st.served += 1;
         try st.sock.send(st.io, &incoming.from, resp);
@@ -4145,6 +4448,14 @@ const TypedStub = struct {
 const TypedRig = struct {
     stub: TypedStub,
     r: Resolver,
+
+    /// The SOA (`soa_ttl`, `minimum`) every reply also carries in its
+    /// authority section.
+    fn withSoa(rg: *TypedRig, auth: *WireBuf, soa_ttl: u32, minimum: u32) void {
+        auth.soaRr("example.com", soa_ttl, minimum);
+        rg.stub.authority = auth.bytes[0..auth.len];
+        rg.stub.nscount = auth.count;
+    }
 
     fn init(io: std.Io, r_io: std.Io, gpa: std.mem.Allocator, wb: *const WireBuf, flags: u16, max: usize) !TypedRig {
         const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -4279,10 +4590,17 @@ fn cnameChainLookup(io: std.Io, hops: usize, last_buf: *[64]u8) ![]const u8 {
     var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
     const res = rg.r.lookupCname("n0.example.com");
     fut.await(io);
-    const got = try res;
-    defer testing.allocator.free(got);
-    @memcpy(last_buf[0..got.len], got);
-    return last_buf[0..got.len];
+    var got = try res;
+    defer got.deinit();
+    // The items are the aliases in order; `canonical` is the last of them.
+    try testing.expectEqual(@min(hops, OwnerChain.max_cname_chain), got.items.len);
+    try testing.expectEqual(if (hops == 0) Status.nodata else Status.found, got.status);
+    if (got.items.len > 0) try testing.expectEqualStrings(got.items[got.items.len - 1], got.canonical.?);
+    // The first CNAME's TTL (200) bounds everything behind it.
+    try testing.expectEqual(@as(?u32, if (hops == 0) 900 else 200), got.ttl_s);
+    const c = got.canonical.?;
+    @memcpy(last_buf[0..c.len], c);
+    return last_buf[0..c.len];
 }
 
 test "lookupCname: the end of a chain of 3, a chain cut at 8 hops, a name without CNAME" {
@@ -4295,15 +4613,17 @@ test "lookupCname: the end of a chain of 3, a chain cut at 8 hops, a name withou
     try testing.expectEqualStrings("n0.example.com", try cnameChainLookup(io, 0, &buf));
 }
 
-test "typed lookups: SERVFAIL is ServerFailed, NXDOMAIN is an empty set" {
+test "typed lookups: SERVFAIL and FORMERR are ServerFailed, NXDOMAIN is an empty set" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const wb: WireBuf = .{};
-    {
-        var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8182, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    // SERVFAIL; FORMERR (asked again without EDNS, FORMERR again: final).
+    for ([_]u16{ 0x8182, 0x8181 }) |flags| {
+        var rg = TypedRig.init(io, io, testing.allocator, &wb, flags, 2) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
         defer rg.stub.sock.close(io);
         defer rg.r.deinit();
+        rg.stub.idle_ms = 500;
         var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
         const res = rg.r.lookupMx("example.com");
         fut.await(io);
@@ -4319,14 +4639,203 @@ test "typed lookups: SERVFAIL is ServerFailed, NXDOMAIN is an empty set" {
         var lk = try res;
         defer lk.deinit();
         try testing.expectEqual(@as(usize, 0), lk.items.len);
-        try testing.expectEqual(@as(?u32, null), lk.ttl_s);
+        try testing.expectEqual(Status.nxdomain, lk.status);
+        try testing.expectEqual(@as(?u32, null), lk.ttl_s); // no SOA to go by
+        try testing.expectEqualStrings("example.com", lk.canonical.?);
     }
 }
 
 const ptr_test_ip: netaddr.Ip = .{ .v4 = .{ 192, 0, 2, 1 } };
 const ptr_test_rev = "1.2.0.192.in-addr.arpa";
 
-test "reverseTtl: the smallest PTR TTL; a PTR for another owner does not count; reverse is the same answer" {
+/// The fields every high-level result shares, as a test expects them.
+const Shape = struct {
+    status: Status,
+    ttl_s: ?u32,
+    canonical: ?[]const u8,
+    authenticated: bool = false,
+    items: usize,
+};
+
+fn expectShape(comptime T: type, want: Shape, got: *const Lookup(T)) !void {
+    errdefer std.debug.print("want {any}\ngot  status={t} ttl={?d} canonical={?s} ad={} items={d}\n", .{ want, got.status, got.ttl_s, got.canonical, got.authenticated, got.items.len });
+    try testing.expectEqual(want.status, got.status);
+    try testing.expectEqual(want.ttl_s, got.ttl_s);
+    try testing.expectEqual(want.authenticated, got.authenticated);
+    try testing.expectEqual(want.items, got.items.len);
+    if (want.canonical) |c| try testing.expectEqualStrings(c, got.canonical.?) else try testing.expectEqual(@as(?[]const u8, null), got.canonical);
+}
+
+/// A TypedRig whose stub answers with `flags`, plus an SOA (TTL 3600,
+/// MINIMUM 50) in the authority section when `soa`.
+const RigCase = struct {
+    flags: u16,
+    soa: bool,
+    authentic_data: bool = false,
+};
+
+fn rigFor(io: std.Io, wb: *const WireBuf, auth: *WireBuf, c: RigCase, max: usize) !TypedRig {
+    var rg = try TypedRig.init(io, io, testing.allocator, wb, c.flags, max);
+    if (c.soa) rg.withSoa(auth, 3600, 50);
+    rg.r.options.authentic_data = c.authentic_data;
+    rg.stub.idle_ms = 1000;
+    return rg;
+}
+
+test "every high-level lookup: TTL over the CNAME chain, canonical name, status, AD" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // www.example.com CNAME (TTL 100) host.example.com, then a record of each
+    // kind owned by host.example.com; one more record off the chain.
+    var wb: WireBuf = .{};
+    wb.nameRr("www.example.com", .cname, 100, "host.example.com");
+    wb.aRr("host.example.com", 300, .{ 192, 0, 2, 1 });
+    wb.mxRr("host.example.com", 400, 10, "mx.example.com");
+    wb.nameRr("host.example.com", .ns, 500, "ns.example.com");
+    wb.txtRr("host.example.com", 600, &.{"v=1"});
+    wb.srvRr("host.example.com", 700, 1, 1, 443, "t.example.com");
+    wb.aRr("stray.example.com", 5, .{ 203, 0, 113, 66 });
+    // AD (0x0020) set by the server: reaches the result only when asked for.
+    for ([_]bool{ false, true }) |ad| {
+        const c: RigCase = .{ .flags = 0x81a0, .soa = true, .authentic_data = ad };
+        var auth: WireBuf = .{};
+        {
+            // A found (300, bounded by the CNAME's 100); AAAA NODATA, whose
+            // negative TTL min(3600, 50) = 50 bounds the pair.
+            var rg = rigFor(io, &wb, &auth, c, 2) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+            defer rg.stub.sock.close(io);
+            defer rg.r.deinit();
+            rg.r.options.parallel_families = false;
+            var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+            const res = rg.r.lookupIp("www.example.com");
+            fut.await(io);
+            var lk = try res;
+            defer lk.deinit();
+            try expectShape(netaddr.Ip, .{ .status = .found, .ttl_s = 50, .canonical = "host.example.com", .authenticated = ad, .items = 1 }, &lk);
+            try testing.expect(!lk.partial);
+            var copy = try lk.clone(testing.allocator);
+            defer copy.deinit();
+            try testing.expect(copy.items[0].eql(lk.items[0]));
+        }
+        inline for (.{ .mx, .ns, .txt, .srv }) |kind| {
+            var rg = rigFor(io, &wb, &auth, c, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+            defer rg.stub.sock.close(io);
+            defer rg.r.deinit();
+            var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+            const res = if (kind == .mx)
+                rg.r.lookupMx("www.example.com")
+            else if (kind == .ns)
+                rg.r.lookupNs("www.example.com")
+            else if (kind == .txt)
+                rg.r.lookupTxt("www.example.com")
+            else
+                rg.r.lookupSrv("", "", "www.example.com");
+            var lk = res catch |err| {
+                fut.await(io);
+                return err;
+            };
+            fut.await(io);
+            defer lk.deinit();
+            // Every record kind has its own TTL above 100: the CNAME bounds it.
+            const T = @typeInfo(@TypeOf(lk.items)).pointer.child;
+            const want: Shape = .{ .status = .found, .ttl_s = 100, .canonical = "host.example.com", .authenticated = ad, .items = 1 };
+            try expectShape(T, want, &lk);
+            var copy = try lk.clone(testing.allocator);
+            defer copy.deinit();
+            try expectShape(T, want, &copy);
+        }
+        {
+            var rg = rigFor(io, &wb, &auth, c, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+            defer rg.stub.sock.close(io);
+            defer rg.r.deinit();
+            var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+            const res = rg.r.lookupCname("www.example.com");
+            fut.await(io);
+            var lk = try res;
+            defer lk.deinit();
+            try expectShape([]const u8, .{ .status = .found, .ttl_s = 100, .canonical = "host.example.com", .authenticated = ad, .items = 1 }, &lk);
+        }
+    }
+}
+
+test "every high-level lookup: NXDOMAIN and NODATA told apart, negative TTL from the SOA (RFC 2308)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const empty: WireBuf = .{};
+    const Case = struct { flags: u16, soa: bool, status: Status, ttl: ?u32 };
+    const cases = [_]Case{
+        .{ .flags = 0x8183, .soa = true, .status = .nxdomain, .ttl = 50 },
+        .{ .flags = 0x8180, .soa = true, .status = .nodata, .ttl = 50 },
+        .{ .flags = 0x8183, .soa = false, .status = .nxdomain, .ttl = null },
+        .{ .flags = 0x8180, .soa = false, .status = .nodata, .ttl = null },
+    };
+    for (cases) |cs| {
+        const c: RigCase = .{ .flags = cs.flags, .soa = cs.soa };
+        var auth: WireBuf = .{};
+        {
+            var rg = rigFor(io, &empty, &auth, c, 2) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+            defer rg.stub.sock.close(io);
+            defer rg.r.deinit();
+            var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+            const res = rg.r.lookupIp("nx.example.com");
+            fut.await(io);
+            var lk = try res;
+            defer lk.deinit();
+            try expectShape(netaddr.Ip, .{ .status = cs.status, .ttl_s = cs.ttl, .canonical = "nx.example.com", .items = 0 }, &lk);
+        }
+        {
+            var rg = rigFor(io, &empty, &auth, c, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+            defer rg.stub.sock.close(io);
+            defer rg.r.deinit();
+            var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+            const res = rg.r.reverse(ptr_test_ip);
+            fut.await(io);
+            var lk = try res;
+            defer lk.deinit();
+            try expectShape([]const u8, .{ .status = cs.status, .ttl_s = cs.ttl, .canonical = ptr_test_rev, .items = 0 }, &lk);
+        }
+        inline for (.{ .mx, .cname }) |kind| {
+            var rg = rigFor(io, &empty, &auth, c, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+            defer rg.stub.sock.close(io);
+            defer rg.r.deinit();
+            var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+            var lk = (if (kind == .mx) rg.r.lookupMx("nx.example.com") else rg.r.lookupCname("nx.example.com")) catch |err| {
+                fut.await(io);
+                return err;
+            };
+            fut.await(io);
+            defer lk.deinit();
+            try expectShape(@typeInfo(@TypeOf(lk.items)).pointer.child, .{ .status = cs.status, .ttl_s = cs.ttl, .canonical = "nx.example.com", .items = 0 }, &lk);
+        }
+    }
+}
+
+test "search list: NODATA for one candidate outranks NXDOMAIN for the others (glibc res_search)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const conf_path = try searchConf(io, &tmp, &path_buf);
+    // host.s1.test NXDOMAIN, host.s2.test NODATA, host NXDOMAIN.
+    var stub = bindEchoStub(io, .nodata_second_only, 3) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer stub.sock.close(io);
+    var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .resolv_conf_path = conf_path });
+    defer r.deinit();
+    var fut = try io.concurrent(EchoStub.run, .{&stub});
+    const res = r.lookupTxt("host");
+    fut.await(io);
+    var lk = try res;
+    defer lk.deinit();
+    try testing.expectEqual(@as(usize, 3), stub.served);
+    try testing.expectEqual(Status.nodata, lk.status);
+    try testing.expectEqualStrings("host.s2.test", lk.canonical.?); // the candidate that exists
+}
+
+test "reverse: the smallest PTR TTL; a PTR for another owner does not count" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -4334,29 +4843,23 @@ test "reverseTtl: the smallest PTR TTL; a PTR for another owner does not count; 
     wb.nameRr(ptr_test_rev, .ptr, 300, "a.example.com");
     wb.nameRr(ptr_test_rev, .ptr, 120, "b.example.com");
     wb.nameRr("2.2.0.192.in-addr.arpa", .ptr, 5, "other.example.com"); // not the owner asked
-    inline for (.{ true, false }) |with_ttl| {
-        var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8180, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
-        defer rg.stub.sock.close(io);
-        defer rg.r.deinit();
-        var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
-        if (with_ttl) {
-            const res = rg.r.reverseTtl(ptr_test_ip);
-            fut.await(io);
-            const found = try res;
-            defer rg.r.freeNames(found.names);
-            try expectStrings(&.{ "a.example.com", "b.example.com" }, found.names);
-            try testing.expectEqual(@as(?u32, 120), found.ttl_s);
-        } else {
-            const res = rg.r.reverse(ptr_test_ip);
-            fut.await(io);
-            const names = try res;
-            defer rg.r.freeNames(names);
-            try expectStrings(&.{ "a.example.com", "b.example.com" }, names);
-        }
-    }
+    var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8180, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer rg.stub.sock.close(io);
+    defer rg.r.deinit();
+    var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+    const res = rg.r.reverse(ptr_test_ip);
+    fut.await(io);
+    var original = try res;
+    // `clone` owns everything: the original (and the Resolver) can go first.
+    var found = try original.clone(testing.allocator);
+    defer found.deinit();
+    original.deinit();
+    try expectStrings(&.{ "a.example.com", "b.example.com" }, found.items);
+    try expectShape([]const u8, .{ .status = .found, .ttl_s = 120, .canonical = ptr_test_rev, .items = 2 }, &found);
+    try testing.expect(!found.partial);
 }
 
-test "reverseTtl: an RFC 2317 CNAME on the chain bounds the TTL" {
+test "reverse: an RFC 2317 CNAME on the chain bounds the TTL and is the canonical name" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -4367,47 +4870,137 @@ test "reverseTtl: an RFC 2317 CNAME on the chain bounds the TTL" {
     defer rg.stub.sock.close(io);
     defer rg.r.deinit();
     var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
-    const res = rg.r.reverseTtl(ptr_test_ip);
+    const res = rg.r.reverse(ptr_test_ip);
     fut.await(io);
-    const found = try res;
-    defer rg.r.freeNames(found.names);
-    try expectStrings(&.{"host.example.com"}, found.names);
-    try testing.expectEqual(@as(?u32, 60), found.ttl_s);
+    var found = try res;
+    defer found.deinit();
+    try expectStrings(&.{"host.example.com"}, found.items);
+    try expectShape([]const u8, .{ .status = .found, .ttl_s = 60, .canonical = "1.0-127.2.0.192.in-addr.arpa", .items = 1 }, &found);
 }
 
-test "reverseTtl: NXDOMAIN and NODATA without an SOA have no TTL; /etc/hosts has none either" {
+test "/etc/hosts and literals: found, no TTL, no canonical name, not authenticated" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const wb: WireBuf = .{};
-    for ([_]u16{ 0x8183, 0x8180 }) |flags| { // NXDOMAIN, NODATA (no error, no answer)
-        var rg = TypedRig.init(io, io, testing.allocator, &wb, flags, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
-        defer rg.stub.sock.close(io);
-        defer rg.r.deinit();
-        var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
-        const res = rg.r.reverseTtl(ptr_test_ip);
-        fut.await(io);
-        const found = try res;
-        defer rg.r.freeNames(found.names);
-        try testing.expectEqual(@as(usize, 0), found.names.len);
-        try testing.expectEqual(@as(?u32, null), found.ttl_s);
-    }
-
-    // /etc/hosts: answered without a query (the server is a closed port).
+    // Answered without a query: the server is a closed port.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [256]u8 = undefined;
     const hosts_path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/hosts", .{&tmp.sub_path});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = hosts_path, .data = "192.0.2.1 gw.example.com gw\n" });
-    var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = 1, .timeout_ms = 100, .attempts = 1, .use_hosts = true, .hosts_path = hosts_path, .use_search = false });
+    var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = 1, .timeout_ms = 100, .attempts = 1, .use_hosts = true, .hosts_path = hosts_path, .use_search = false, .authentic_data = true });
     defer r.deinit();
-    const found = try r.reverseTtl(ptr_test_ip);
-    defer r.freeNames(found.names);
-    try expectStrings(&.{"gw.example.com"}, found.names);
-    try testing.expectEqual(@as(?u32, null), found.ttl_s);
+    {
+        var found = try r.reverse(ptr_test_ip);
+        defer found.deinit();
+        try expectStrings(&.{"gw.example.com"}, found.items);
+        try expectShape([]const u8, .{ .status = .found, .ttl_s = null, .canonical = null, .items = 1 }, &found);
+    }
+    {
+        var found = try r.lookupIp("gw");
+        defer found.deinit();
+        try expectShape(netaddr.Ip, .{ .status = .found, .ttl_s = null, .canonical = null, .items = 1 }, &found);
+    }
+    {
+        var found = try r.lookupIp("2001:db8::7");
+        defer found.deinit();
+        try expectShape(netaddr.Ip, .{ .status = .found, .ttl_s = null, .canonical = null, .items = 1 }, &found);
+    }
 }
 
-test "ptrTtl: negative TTL from the SOA (RFC 2308 section 5), bounded by a followed CNAME" {
+test "case_randomization: the query goes out in mixed case; a reply echoing another case is dropped (DNS 0x20)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // 36 letters: the chance that the random spelling is all lower case is 2^-36.
+    const name = "abcdefghijklmnopqrstuvwxyz.example.com";
+    var wb: WireBuf = .{};
+    wb.aRr(name, 60, .{ 192, 0, 2, 1 });
+    var wire: WireBuf = .{};
+    wire.putName(name);
+    {
+        var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8180, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        defer rg.stub.sock.close(io);
+        defer rg.r.deinit();
+        rg.r.options.case_randomization = true;
+        rg.r.options.family = .v4;
+        var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+        const res = rg.r.lookupIp(name);
+        fut.await(io);
+        var lk = try res;
+        defer lk.deinit();
+        try testing.expectEqual(@as(usize, 1), lk.items.len);
+        const asked = rg.stub.last_question[0..wire.len];
+        try testing.expect(std.ascii.eqlIgnoreCase(wire.bytes[0..wire.len], asked));
+        try testing.expect(!std.mem.eql(u8, wire.bytes[0..wire.len], asked));
+        // The canonical name is the name asked, not its random spelling.
+        try testing.expectEqualStrings(name, lk.canonical.?);
+    }
+    {
+        // A server that lower-cases the question: its (only) reply is dropped
+        // like a spoofed one, and the query times out.
+        var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8180, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        defer rg.stub.sock.close(io);
+        defer rg.r.deinit();
+        rg.stub.fold_question = true;
+        rg.stub.idle_ms = 1000;
+        rg.r.options.case_randomization = true;
+        rg.r.options.family = .v4;
+        rg.r.options.timeout_ms = 300;
+        var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+        const res = rg.r.lookupIp(name);
+        fut.await(io);
+        try testing.expectError(error.Timeout, res);
+        try testing.expectEqual(@as(usize, 1), rg.stub.served); // it did answer
+        // Without the option the same server's reply is accepted.
+        rg.r.options.case_randomization = false;
+        rg.stub.served = 0;
+        var fut2 = try io.concurrent(TypedStub.run, .{&rg.stub});
+        const res2 = rg.r.lookupIp(name);
+        fut2.await(io);
+        var lk = try res2;
+        defer lk.deinit();
+        try testing.expectEqual(@as(usize, 1), lk.items.len);
+    }
+}
+
+test "resolv.conf is re-read when it changes (resolv_conf_recheck_ms); not with null; at most once per interval" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/resolv.conf", .{&tmp.sub_path});
+    try tmp.dir.writeFile(io, .{ .sub_path = "resolv.conf", .data = "search one.test\n" });
+    var stub = bindEchoStub(io, .a_only, 3) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer stub.sock.close(io);
+    var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .family = .v4, .resolv_conf_path = path, .resolv_conf_recheck_ms = 0 });
+    defer r.deinit();
+    var fut = try io.concurrent(EchoStub.run, .{&stub});
+    defer fut.await(io);
+    const want = [_][]const u8{ "host.one.test", "host.second.test", "host.second.test" };
+    const write = [_]?[]const u8{ "search second.test\n", "search third-domain.test\n", null };
+    for (want, write, 0..) |w, next, i| {
+        var lk = try r.lookupIp("host");
+        defer lk.deinit();
+        try testing.expectEqualStrings(w, lk.canonical.?);
+        if (next) |text| try tmp.dir.writeFile(io, .{ .sub_path = "resolv.conf", .data = text });
+        if (i == 1) r.options.resolv_conf_recheck_ms = null; // read once, never again
+    }
+    // Throttled: checked less than a minute ago, so not even stat'ed.
+    r.options.resolv_conf_recheck_ms = 60_000;
+    var owns = r.beginCall();
+    r.endCall(owns);
+    try testing.expect(r.conf != null);
+    // Due: the file changed since it was read, so the parsed copy is dropped.
+    r.conf_checked = null;
+    owns = r.beginCall();
+    r.endCall(owns);
+    try testing.expect(r.conf == null and r.conf_text == null);
+}
+
+test "judge: negative TTL from the SOA (RFC 2308 section 5), bounded by a followed CNAME; status from the rcode" {
     const ptr = message.Record{ .name = ptr_test_rev, .ty = .ptr, .class = .in, .ttl = 300, .data = .{ .ptr = "host.example.com" } };
     const stray = message.Record{ .name = "2.2.0.192.in-addr.arpa", .ty = .ptr, .class = .in, .ttl = 5, .data = .{ .ptr = "other.example.com" } };
     const cname = message.Record{ .name = ptr_test_rev, .ty = .cname, .class = .in, .ttl = 45, .data = .{ .cname = "1.0-127.2.0.192.in-addr.arpa" } };
@@ -4422,19 +5015,25 @@ test "ptrTtl: negative TTL from the SOA (RFC 2308 section 5), bounded by a follo
     } } };
     var soa_small = soa_big;
     soa_small.ttl = 200; // the SOA's own TTL is the smaller one
-    const Case = struct { answers: []const message.Record, authorities: []const message.Record, found: bool, want: ?u32 };
+    var header: message.Header = .{};
+    const Case = struct { answers: []const message.Record, authorities: []const message.Record, rcode: u4, want: ?u32, status: Status, canonical: []const u8 = ptr_test_rev };
     const cases = [_]Case{
-        .{ .answers = &.{}, .authorities = &.{soa_big}, .found = false, .want = 900 }, // NXDOMAIN: MINIMUM < SOA TTL
-        .{ .answers = &.{}, .authorities = &.{soa_small}, .found = false, .want = 200 }, // NODATA: SOA TTL < MINIMUM
-        .{ .answers = &.{stray}, .authorities = &.{soa_big}, .found = false, .want = 900 }, // stray PTR is not the answer
-        .{ .answers = &.{cname}, .authorities = &.{soa_big}, .found = false, .want = 45 }, // dangling CNAME bounds it
-        .{ .answers = &.{}, .authorities = &.{}, .found = false, .want = null }, // no SOA, no TTL
-        .{ .answers = &.{ptr}, .authorities = &.{soa_small}, .found = true, .want = 300 }, // SOA is for empty answers only
-        .{ .answers = &.{ cname, ptr }, .authorities = &.{}, .found = true, .want = 45 },
+        .{ .answers = &.{}, .authorities = &.{soa_big}, .rcode = 3, .want = 900, .status = .nxdomain }, // MINIMUM < SOA TTL
+        .{ .answers = &.{}, .authorities = &.{soa_small}, .rcode = 0, .want = 200, .status = .nodata }, // SOA TTL < MINIMUM
+        .{ .answers = &.{stray}, .authorities = &.{soa_big}, .rcode = 0, .want = 900, .status = .nodata }, // stray PTR is not the answer
+        .{ .answers = &.{cname}, .authorities = &.{soa_big}, .rcode = 3, .want = 45, .status = .nxdomain, .canonical = "1.0-127.2.0.192.in-addr.arpa" }, // dangling CNAME bounds it
+        .{ .answers = &.{}, .authorities = &.{}, .rcode = 3, .want = null, .status = .nxdomain }, // no SOA, no TTL
+        .{ .answers = &.{ptr}, .authorities = &.{soa_small}, .rcode = 0, .want = 300, .status = .found }, // SOA is for empty answers only
+        .{ .answers = &.{ cname, ptr }, .authorities = &.{}, .rcode = 0, .want = 45, .status = .found, .canonical = "1.0-127.2.0.192.in-addr.arpa" }, // the CNAME bounds the PTR next to it
     };
-    for (cases) |c| {
-        const msg: message.Message = .{ .arena = undefined, .header = undefined, .questions = &.{}, .answers = c.answers, .authorities = c.authorities, .additionals = &.{} };
-        try testing.expectEqual(c.want, ptrTtl(&msg, ptr_test_rev, c.found));
+    for (cases, 0..) |c, i| {
+        header.rcode = c.rcode;
+        const msg: message.Message = .{ .arena = undefined, .header = header, .questions = &.{}, .answers = c.answers, .authorities = c.authorities, .additionals = &.{} };
+        const v = judge(&msg, ptr_test_rev, .ptr);
+        errdefer std.debug.print("case {d}: ttl={?d} status={t} canonical={s}\n", .{ i, v.ttl_s, v.status, v.canonical });
+        try testing.expectEqual(c.want, v.ttl_s);
+        try testing.expectEqual(c.status, v.status);
+        try testing.expectEqualStrings(c.canonical, v.canonical);
     }
 }
 

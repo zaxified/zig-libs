@@ -20,10 +20,12 @@
 //! ```zig
 //! var resolver = dns.Resolver.init(io, gpa, .{});
 //! defer resolver.deinit();
-//! const ips = try resolver.lookupIp("example.com");      // hosts + A/AAAA
+//! var ips = try resolver.lookupIp("example.com");        // hosts + A/AAAA
+//! defer ips.deinit();      // .items, .status, .ttl_s, .canonical, .authenticated
 //! var msg = try resolver.resolve("example.com", .mx);    // any record type
 //! defer msg.deinit();
-//! const names = try resolver.reverse(ip);                // PTR
+//! var names = try resolver.reverse(ip);                  // PTR, same result shape
+//! defer names.deinit();
 //! ```
 
 const std = @import("std");

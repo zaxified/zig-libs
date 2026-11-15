@@ -154,10 +154,10 @@ const Names = struct {
     }
 
     fn ask(n: *Names, r: *dns.Resolver, ip: netaddr.Ip) ?[]const u8 {
-        const answers = r.reverse(ip) catch return null;
-        defer r.freeNames(answers);
-        if (answers.len == 0) return null;
-        const raw = std.mem.trimEnd(u8, answers[0], ".");
+        var answers = r.reverse(ip) catch return null;
+        defer answers.deinit();
+        if (answers.items.len == 0) return null;
+        const raw = std.mem.trimEnd(u8, answers.items[0], ".");
         if (raw.len == 0) return null;
         const out = n.gpa.alloc(u8, raw.len) catch return null;
         return view.sanitize(out, raw);
@@ -429,10 +429,13 @@ fn resolveTarget(io: Io, gpa: std.mem.Allocator, c: cli.Config) netaddr.Ip {
         },
     });
     defer r.deinit();
-    const ips = r.lookupIp(c.target) catch |err| fail("cannot resolve the host: {t}", .{err});
-    defer gpa.free(ips);
-    if (ips.len == 0) fail("the host has no address", .{});
-    return ips[0];
+    var ips = r.lookupIp(c.target) catch |err| fail("cannot resolve the host: {t}", .{err});
+    defer ips.deinit();
+    if (ips.items.len == 0) switch (ips.status) {
+        .nxdomain => fail("no such host", .{}),
+        else => fail("the host has no address", .{}),
+    };
+    return ips.items[0];
 }
 
 fn openMtr(gpa: std.mem.Allocator, ip: netaddr.Ip, opts: traceroute.MtrOptions) traceroute.LiveMtr {
