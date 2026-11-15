@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests for tar (wave GW). Findings TA-1 .. TA-3, see
-//! ~/CML/20261029-panic-sweep/tar-sweep.report.md. The hostile-archive tests at
+//! the 2026-10-29 panic-sweep report for `tar`. The hostile-archive tests at
 //! the end pin the reader's "clean" verdicts (they pass without any fix).
 const std = @import("std");
 const builtin = @import("builtin");

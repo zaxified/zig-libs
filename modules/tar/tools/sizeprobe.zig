@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! Size probe for the `small` lane (CONVENTIONS §4.2): what axp uses of tar, a
-//! `Reader` walk and a `Writer` that re-emits each entry (axp-vault's backup
-//! ingest and axp-core's packer). Built at ReleaseSmall under `-Dprofile=default`
+//! Size probe for the `small` lane (CONVENTIONS §4.2): what the router-tool consumer uses of tar, a
+//! `Reader` walk and a `Writer` that re-emits each entry (the router-tool consumer's backup vault backup
+//! ingest and the router-tool consumer's core packer). Built at ReleaseSmall under `-Dprofile=default`
 //! and `-Dprofile=small` by `scripts/checks/small-sizes.sh`; the difference is the
 //! sparse reader (`-Dtar-sparse`), held to its floor in
 //! `scripts/checks/small-size-expected.tsv`.

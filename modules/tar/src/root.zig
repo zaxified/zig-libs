@@ -911,7 +911,7 @@ pub const Reader = struct {
 
     /// Skip `n` bytes in steps of at most 256 MiB. `std.Io.Reader.discardAll64`
     /// hands `discardShort` a `maxInt(usize)` limit, and on a 32-bit target
-    /// (axp's mips / arm) `seek + n` overflows: a declared size of a few GiB
+    /// (the router-tool consumer's mips / arm) `seek + n` overflows: a declared size of a few GiB
     /// in a header panicked the reader under qemu-mips (2026-11-04, the
     /// corpus test's 8 GiB claim). Found by running the tests there; a
     /// workaround here, not an upstream report.
