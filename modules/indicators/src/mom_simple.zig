@@ -86,6 +86,9 @@ pub fn RocCore(comptime kind: RocKind) type {
             if (n < self.p) return null;
             const x = b.x;
             const prior = src.at(n - self.p).x;
+            return formula(x, prior);
+        }
+        inline fn formula(x: f64, prior: f64) f64 {
             switch (kind) {
                 .mom => return x - prior,
                 .roc => return if (prior != 0.0) (x / prior - 1.0) * 100.0 else 0.0,
@@ -93,6 +96,15 @@ pub fn RocCore(comptime kind: RocKind) type {
                 .rocr => return if (prior != 0.0) x / prior else 0.0,
                 .rocr100 => return if (prior != 0.0) x / prior * 100.0 else 0.0,
             }
+        }
+        /// The steady path of `vs.run` (every bar from `period` on has an output).
+        pub fn steady(self: *const Self) bool {
+            return self.n >= self.p;
+        }
+        pub inline fn steadyStep(self: *Self, src: anytype, b: In) f64 {
+            const n = self.n;
+            self.n += 1;
+            return formula(b.x, src.at(n - self.p).x);
         }
     };
 }
@@ -1056,8 +1068,11 @@ pub const WILLR = struct {
             if (t.high > highest) highest = t.high;
             if (t.low < lowest) lowest = t.low;
         }
+        return value(highest, lowest, b.close);
+    }
+    inline fn value(highest: f64, lowest: f64, close: f64) f64 {
         if (zeroScaled(highest - lowest, @abs(highest) + @abs(lowest))) return 0.0;
-        var t = (highest - b.close) / (highest - lowest) * -100.0;
+        var t = (highest - close) / (highest - lowest) * -100.0;
         if (t > 0.0) {
             t = 0.0;
         } else if (t < -100.0) {
@@ -1215,7 +1230,39 @@ pub fn cciLookback(p: CciParams) Error!usize {
     return CCI.lookback(p);
 }
 pub fn cci(comptime T: type, high: []const T, low: []const T, close: []const T, out: []T, p: CciParams) Error!usize {
-    return vs.batch(T, CCI, p, .{ .high = high, .low = low, .close = close }, .{out});
+    if (T != f64) return vs.batch(T, CCI, p, .{ .high = high, .low = low, .close = close }, .{out});
+    core.checkFloat(T);
+    _ = try CCI.init(p);
+    const n = high.len;
+    if (low.len != n or close.len != n or out.len != n) return error.BadParam;
+    const per = p.period;
+    // The typical prices are parked in `out` (forward), then every output is
+    // computed from the ones below it (backward, so none is overwritten before
+    // its last reader). Same arithmetic as `CCI.step`: each window is summed in
+    // TA-Lib's circular-buffer slot order, which is bars `n-cur .. n`, then bars
+    // `n-p+1 .. n-cur-1` (`cur = n % p`), as two contiguous runs.
+    for (high, low, close, out) |h, l, c, *o| o.* = CCI.tp(.{ .high = h, .low = l, .close = c });
+    var i = n;
+    while (i >= per) {
+        i -= 1;
+        const cur = i % per;
+        const a = out[i - cur .. i + 1];
+        const b = out[i + 1 - per .. i - cur];
+        const last = out[i];
+        var avg: f64 = 0;
+        for (a) |v| avg += v;
+        for (b) |v| avg += v;
+        avg /= pf(per);
+        var dev: f64 = 0;
+        for (a) |v| dev += @abs(v - avg);
+        for (b) |v| dev += @abs(v - avg);
+        dev /= pf(per);
+        const t = last - avg;
+        const scale = @abs(avg);
+        out[i] = if (!zeroScaled(t, scale) and !zeroScaled(dev, scale) and 0.015 * dev != 0.0) t / (0.015 * dev) else 0.0;
+    }
+    @memset(out[0..@min(per - 1, n)], std.math.nan(f64));
+    return CCI.lookback(p);
 }
 pub fn CciStream(comptime T: type) type {
     return vs.Stream(T, CCI);
@@ -1890,4 +1937,56 @@ test "fractal: batch == streaming" {
         }
     }
     try testing.expect(any);
+}
+
+test "willr / cci batch equal the stepped core bit for bit (zero ties, NaN, inf)" {
+    const th_ = @import("testhelp.zig");
+    var prng = std.Random.DefaultPrng.init(0xc1a5);
+    const r = prng.random();
+    const n = 400;
+    var h: [n]f64 = undefined;
+    var l: [n]f64 = undefined;
+    var c: [n]f64 = undefined;
+    for (0..n) |i| {
+        // a coarse grid around zero (many +0.0 / -0.0 ties), some NaN and inf
+        const pick = r.uintLessThan(u32, 40);
+        const base: f64 = (@as(f64, @floatFromInt(r.uintLessThan(u32, 5))) - 2.0) * 0.5;
+        h[i] = switch (pick) {
+            0 => std.math.nan(f64),
+            1 => std.math.inf(f64),
+            2 => -0.0,
+            3 => 0.0,
+            else => base + 0.5,
+        };
+        l[i] = switch (r.uintLessThan(u32, 40)) {
+            0 => std.math.nan(f64),
+            1 => -std.math.inf(f64),
+            2 => 0.0,
+            3 => -0.0,
+            else => base - 0.5,
+        };
+        c[i] = if (r.boolean()) base else -0.0;
+    }
+    // stretches without NaN, so the cached path is taken too
+    for (100..250) |i| {
+        if (std.math.isNan(h[i])) h[i] = 1.0;
+        if (std.math.isNan(l[i])) l[i] = -1.0;
+    }
+    for ([_]usize{ 2, 3, 5, 14 }) |per| {
+        var out: [n]f64 = undefined;
+        _ = try willr(f64, &h, &l, &c, &out, .{ .period = per });
+        var s = WILLR.init(.{ .period = per }) catch unreachable;
+        const src = vs.SliceSrc(WILLR.In, struct { high: []const f64, low: []const f64, close: []const f64 }){ .ins = .{ .high = &h, .low = &l, .close = &c } };
+        for (0..n) |i| {
+            const want = s.step(src, src.at(i));
+            if (want) |w| try testing.expect(th_.sameBits(w, out[i])) else try testing.expect(std.math.isNan(out[i]));
+        }
+        var out2: [n]f64 = undefined;
+        _ = try cci(f64, &h, &l, &c, &out2, .{ .period = per });
+        var s2 = CCI.init(.{ .period = per }) catch unreachable;
+        for (0..n) |i| {
+            const want = s2.step(src, src.at(i));
+            if (want) |w| try testing.expect(th_.sameBits(w, out2[i])) else try testing.expect(std.math.isNan(out2[i]));
+        }
+    }
 }

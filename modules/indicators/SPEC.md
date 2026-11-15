@@ -418,7 +418,7 @@ is fixed here (P-gap candidates, owner's call).
 | **BBANDS** | 2.44 | 2.10 | · | 12.25 | 6.11 | 69% | was 3.8x: MA dispatch hoisted; the variance window (re-anchor checks, `sqrt`, three outputs) is still the generic step |
 | BETA | · | 0.87 | · | 10.19 | 11.63 | 4% |  |
 | BOP | · | 0.94 | · | 1.33 | 1.42 | 16% |  |
-| **CCI** | 3.91 | 3.85 | · | 115.74 | 28.26 | 7% | 109 ns per bar against 28: the window mean-deviation pass reads through the generic window source (index wrap per element), which TA-Lib's contiguous loop vectorizes |
+| **CCI** | 1.39 | 1.41 | · | 39.05 | 27.84 | 4% | was 3.9x: f64 batch parks the typical prices in the output, then sums each window as two contiguous runs in TA-Lib's slot order (no index wrap, one `tp` per bar); f32 keeps the generic step |
 | CDL3WHITESOLDIERS | · | 0.97 | · | 23.26 | 23.77 | 9% |  |
 | CDLDOJI | · | 1.01 | · | 2.98 | 2.97 | 7% |  |
 | CDLENGULFING | 0.95 | 0.91 | · | 7.75 | 8.50 | 14% |  |
@@ -457,17 +457,17 @@ is fixed here (P-gap candidates, owner's call).
 | **MAX** | 0.90 | 1.19 | · | 2.33 | 1.98 | 10% | block scan with the NaN handling kept (1.2x at 1e5 only, 0.9x at 1e3) |
 | **MEDIAN** | · | 1.40 | · | 66.59 | 47.81 | 1% | window copy + selection into a gpa scratch (1.4x) |
 | **MFI** | 1.71 | 3.13 | · | 21.87 | 6.96 | 12% | per-bar window re-summation of positive / negative money flow through the generic source (1.7x at 1e3, 3.1x at 1e5: grows with n, so cache-visible) |
-| **MIDPOINT** | · | 4.00 | · | 11.60 | 2.91 | 8% | rescans the window each bar (O(period)); TA-Lib tracks the extremum and its index (MAX / MIN rows: 1.2x) |
+| **MIDPOINT** | · | 3.83 | · | 10.69 | 2.86 | 11% | was 4.0x: cached-index extrema held in registers (`ExtCore.Run`); the remaining gap is the rescan whenever the extremum leaves the window (random walk: often), with TA-Lib's tie and NaN rules kept |
 | **MIN** | 0.98 | 1.26 | · | 2.50 | 2.05 | 18% | block scan with the NaN handling kept (1.2-1.3x at 1e5 only, 0.98x at 1e3: cache-visible) |
 | **MINMAX** | · | 1.52 | · | 4.81 | 3.12 | 6% | two extremum scans per bar where TA-Lib shares one block scan |
-| **MOM** | · | 1.55 | · | 0.88 | 0.57 | 2% | 1.55x on a one-line subtraction: the generic window source (index into a ring) instead of `in[i] - in[i - p]` |
+| MOM | · | 0.98 | · | 0.76 | 0.82 | 8% | was 1.55x: a branch-free steady step after the warm-up (`vs.run`) |
 | NATR | · | 0.96 | · | 2.15 | 2.23 | 23% | (steady loop as ATR) |
 | OBV | 1.01 | 0.99 | · | 5.18 | 5.27 | 9% |  |
 | **PERCENTILE** | · | 2.36 | · | 95.53 | 41.01 | 5% | window copy + selection per bar into a gpa scratch (2.4x); TA-Lib's sorted insertion |
 | PERCENTRANK | · | 1.07 | · | 75.63 | 68.73 | 2% |  |
 | PLUS_DI | · | 0.94 | · | 5.07 | 5.40 | 2% |  |
 | **PPO** | · | 1.47 | · | 2.78 | 1.87 | 9% | was 15.9x, as APO; the rest is the per-bar division and the near-zero test |
-| ROC | · | 1.06 | · | 1.38 | 1.30 | 6% |  |
+| ROC | · | 0.88 | · | 1.49 | 1.87 | 12% | (steady step as MOM) |
 | RSI | 1.06 | 1.04 | 1.05 | 4.38 | 4.52 | 27% |  |
 | **RVI** | · | 1.92 | · | 17.70 | 9.11 | 5% | two recurrences (std dev and Wilder smoothing) through generic cores |
 | SAR | · | 1.07 | · | 6.93 | 6.49 | 2% |  |
@@ -491,7 +491,7 @@ is fixed here (P-gap candidates, owner's call).
 | VIDYA | · | 1.07 | · | 5.97 | 5.63 | 12% |  |
 | VWAP | · | 0.91 | · | 2.87 | 3.13 | 7% |  |
 | **WAVETREND** | · | 1.63 | · | 11.95 | 7.40 | 10% | EMA / absolute-deviation / SMA chain of four stages, gpa scratch |
-| **WILLR** | · | 2.15 | · | 10.98 | 5.16 | 8% | windowed high / low rescanned per bar, as STOCH |
+| **WILLR** | · | 2.15 | · | 10.98 | 5.16 | 8% | windowed high / low rescanned per bar, as STOCH (tried 2026-11-15 and reverted: a cached-index batch measured 2.9x, a vector reduction per window 6.7x) |
 | WMA | 1.04 | 1.01 | · | 2.73 | 2.69 | 7% |  |
 
 Streaming, 99 900 updates after an `Open`/`init` over 100 bars (`EmaStream.update` against `TA_EMA_Update`, and the same for RSI and ATR),

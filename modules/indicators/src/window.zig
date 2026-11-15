@@ -118,6 +118,45 @@ pub fn ExtCore(comptime is_max: bool) type {
             }
             return self.val;
         }
+        /// `step` over the bars `n..` of a slice once the output has started
+        /// (`n + 1 >= p`), as one inlined update per bar: the same rescan and the
+        /// same tie rule, the index kept as `idx + 1` (0 = none) in a register.
+        pub const Run = struct {
+            p: usize,
+            idx1: usize,
+            val: f64,
+            pub fn of(c: *const Self) Run {
+                return .{ .p = c.p, .idx1 = if (c.idx) |v| v + 1 else 0, .val = c.val };
+            }
+            pub fn store(r: Run, c: *Self, n: usize) void {
+                c.n = n;
+                c.idx = if (r.idx1 == 0) null else r.idx1 - 1;
+                c.val = r.val;
+            }
+            pub inline fn bar(r: *Run, comptime T: type, xs: []const T, n: usize) f64 {
+                const trailing = n + 1 - r.p;
+                const x: f64 = xs[n];
+                if (r.idx1 <= trailing) {
+                    var idx = trailing;
+                    var val: f64 = xs[trailing];
+                    var i = trailing;
+                    while (i < n) {
+                        i += 1;
+                        const t: f64 = xs[i];
+                        if (better(t, val)) {
+                            idx = i;
+                            val = t;
+                        }
+                    }
+                    r.idx1 = idx + 1;
+                    r.val = val;
+                } else if (betterEq(x, r.val)) {
+                    r.idx1 = n + 1;
+                    r.val = x;
+                }
+                return r.val;
+            }
+        };
     };
 }
 

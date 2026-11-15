@@ -89,7 +89,7 @@ pub const TRIX = struct {
     pub fn steady(self: *const Self) bool {
         return self.prev != null and self.e1.steady() and self.e2.steady() and self.e3.steady();
     }
-    pub inline fn steadyStep(self: *Self, b: In) f64 {
+    pub inline fn steadyStep(self: *Self, _: anytype, b: In) f64 {
         self.n += 1;
         const d = self.e3.stepSteady(self.e2.stepSteady(self.e1.stepSteady(b.x)));
         const p = self.prev.?;
@@ -204,7 +204,7 @@ fn ApoGen(comptime pct: bool, comptime M: type) type {
         pub fn steady(self: *const Self) bool {
             return self.fast.steady() and self.slow.steady();
         }
-        pub inline fn steadyStep(self: *Self, b: In) f64 {
+        pub inline fn steadyStep(self: *Self, _: anytype, b: In) f64 {
             self.n += 1;
             const f = self.fast.stepSteady(b.x);
             const sl = self.slow.stepSteady(b.x);
@@ -753,7 +753,7 @@ pub const TSI = struct {
     pub fn steady(self: *const Self) bool {
         return self.n >= 1 and self.n1.steady() and self.d1.steady() and self.n2.steady() and self.d2.steady();
     }
-    pub inline fn steadyStep(self: *Self, b: In) f64 {
+    pub inline fn steadyStep(self: *Self, _: anytype, b: In) f64 {
         self.n += 1;
         const mom = b.x - self.prev;
         self.prev = b.x;

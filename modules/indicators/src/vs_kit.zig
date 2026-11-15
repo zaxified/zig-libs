@@ -194,7 +194,7 @@ pub fn run(comptime Core: type, c: *Core, p: Core.Params, ins: anytype, outs: an
     inline for (0..outs.len) |k| if (outs[k].len != n) return error.BadParam;
     const src = SliceSrc(Core.In, @TypeOf(ins)){ .ins = ins };
     // A core may declare `steady()` (every further `step` is its bare recurrence,
-    // with an output) and `steadyStep(in) Out` (that step without the warm-up
+    // with an output) and `steadyStep(src, in) Out` (that step without the warm-up
     // branches, bitwise `step`); `has_steady = false` switches that off for an
     // instantiation. The loop then leaves the generic step once steady.
     const fast = comptime @hasDecl(Core, "steadyStep") and (!@hasDecl(Core, "has_steady") or Core.has_steady);
@@ -210,7 +210,7 @@ pub fn run(comptime Core: type, c: *Core, p: Core.Params, ins: anytype, outs: an
     }
     if (fast) {
         while (i < n) : (i += 1) {
-            const r = c.steadyStep(src.at(i));
+            const r = c.steadyStep(src, src.at(i));
             inline for (0..outs.len) |k| outs[k][i] = core.to(Child(@TypeOf(outs[k])), outAt(r, k));
         }
     }
