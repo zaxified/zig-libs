@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit re-recorded over the Unicode 18.0.0 tables (data-only source change, no guard moved).
 - **2026-11-13** — **CHANGED:** Unicode tables and case folding moved from 17.0.0 to **18.0.0** (`unicode_version`): `\p{Jurchen}`, `\p{Proto_Cuneiform}`, `\p{Seal}`, `\p{Age=18.0}` and the 13,007 new code points in their categories; `(?i)` gains the orbits {U+0277, U+A7DD}, {U+027C, U+A7E2}, {U+AB4B, U+AB6C}, {U+AB4C, U+AB6D}, 16 Latin Extended-G pairs, and U+1DF95 joins {ß, ẞ}. The Go replay's pinned UNICODE_VERSION count is 17 (five input code points 18.0 assigned).
 - **2026-11-12** — **TEST:** closing the last mutation survivors: the wide-code-point caches of the lazy DFA start empty from a dirty allocator (`wideCaches`), bytes mode on a four-byte code point (the Pike VM's `rem`-keyed lists need 4n entries), case folding of a class through the whole four-member orbit (both grammars), `expand` going on after a `$` that starts no variable, and a lead byte whose sequence does not decode ending a name. From the mutation run (ids 200992, 201619, 150083, 550002, 550007). NO CONSUMER-VISIBLE CHANGE.
@@ -17,7 +18,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** README notes that `replaceN` follows Rust `replacen` in limit and empty matches, but its template syntax is Go's.
 - **2026-11-05** — **Tests:** delta audit of `replaceN`: `a*` over "baaac" at every limit (Rust/Go `-b-c-`), `maxInt` limit, literal form, empty input, and allocation failure at every point leaving no leak (mutants 11/11 killed).
 - **2026-11-05** — **Added:** Rust's `replace`/`replacen`: `Matcher.replaceN`/`replaceNLiteral` (to a writer) and `Regex.replaceFirst`/`replaceN`/`replaceNLiteral` (allocating) replace only the first `limit` matches (null: all, 0: none, as `split`). `replaceAll`/`replaceAllLiteral` now call them with null. Grade probe core gap.
-- **2026-11-02** — **Fixed**: the module did not compile for 32-bit targets (wasm32, mips) since the forward + backward lazy DFA: a shift amount computed through `log2_int(usize, …)` overflowed `u5`. The hash and the table size are unchanged. `meta.targets` now declares `.linux32`, `.windows` and `.wasm32`, so `check-portable` holds them; two tests that spawn a thread are skipped on a single-threaded target. Request from bxp, whose wasm32 playground was held back at `8b5872fc`.
+- **2026-11-02** — **Fixed**: the module did not compile for 32-bit targets (wasm32, mips) since the forward + backward lazy DFA: a shift amount computed through `log2_int(usize, …)` overflowed `u5`. The hash and the table size are unchanged. `meta.targets` now declares `.linux32`, `.windows` and `.wasm32`, so `check-portable` holds them; two tests that spawn a thread are skipped on a single-threaded target. Request from the build-tool consumer, whose wasm32 playground was held back at `8b5872fc`.
 - **2026-10-28** — Card: the no-panic sweep recorded on the Hardening line (`· panic 2026-10-28`), the first module to carry it.
 
 - **2026-10-28** — **Fixed** (no-panic audit): an unbuffered `std.Io.Reader` (`buffer.len == 0`) through the reader functions tripped std's assert in `takeByte` — it is read through `stream` now; a Rust-grammar pattern repeating a body that emits nothing a hundred thousand times (`(?:(?:)…){100000}`) compiled for seconds — each compile's emission is budgeted (`syntax.max_emit_work`, 16M steps) and past it `error.PatternTooLarge`. Documented: `Regex` fields other than `longest` are read-only; `Span.slice` takes the input the span came from. Audit recorded: review, mutation 47/48 (one equivalent).
@@ -91,7 +92,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   NFA engines reused the closure's visited marks from the position where the last threads died,
   so an assertion that had failed there (`\b`, `^`, `$`) was never walked at the new position.
   `isMatch` answered false for programs over 128 instructions (the lazy DFA's limit, so
-  `runSetOn` answered), e.g. `a?\b+(  *((xxxxa+)xx|()+){2}){1,3}` on `"a1 "` (reported by bxp's
+  `runSetOn` answered), e.g. `a?\b+(  *((xxxxa+)xx|()+){2}){1,3}` on `"a1 "` (reported by the build-tool consumer's
   differential driver vs Go, 1 in ~20 M inputs). `find`/`captures`/the iterator missed matches
   wherever the Pike VM ran — every leftmost-longest (POSIX, `Longest`) search, and leftmost-first
   once the backtracker hands over — e.g. POSIX `(a?^[a-][^a])` on `" a \nabÉ"` (Go: [4 6]). The
@@ -151,7 +152,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   (`BuilderOf(small_capacity)`) and falls back to the full one; no whole-table initialisation per
   compile or per `isMatch`; `Matcher.init` makes one allocation; a pattern anchored at `\A` is
   tried at the start only, and a first-byte prefilter skips ahead while no thread is alive. On a
-  bxp-like per-row workload compile + match went from 44 µs to 0.48 µs per row, compile +
+  build-tool-consumer-like per-row workload compile + match went from 44 µs to 0.48 µs per row, compile +
   captures from 45 µs to 0.80 µs. New public: `Regex.prefilter` (`Prefilter`), with a default;
   nothing breaks.
 - **2026-10-07** — Tests: a fuzz harness (`src/fuzz_test.zig`, `testing.fuzz` + the deterministic

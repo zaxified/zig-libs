@@ -4520,7 +4520,7 @@ test "the backtracker and the Pike VM agree on long texts, past the bit budget a
 }
 
 test "isMatch past the DFA's size: a prefilter skip starts with a fresh closure" {
-    // bxp 2026-10-19 (differential driver vs Go): 129 instructions, so `runSetOn`
+    // the build-tool consumer 2026-10-19 (differential driver vs Go): 129 instructions, so `runSetOn`
     // answers. The threads die after `a` with `\b` visited (it fails between
     // `a` and `1`); the skip to ` ` reused that `seen` and never walked `\b`
     // again, where it holds. Go: MatchString true, FindIndex [2 3].

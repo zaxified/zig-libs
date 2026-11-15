@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — Go 1.26 `regexp` refuses the 46 multi-word script names it documents (`\p{Old_Persian}`, `\p{SignWriting}`: an underscore or an inner capital); here they match their scripts (test `go oracle: crafted syntax cases and random patterns answer as Go regexp`, GO_DEFECT 46) (measured 2026-10-28) · feature — Rust's grammar, its bytes mode and `RegexSet` beside Go's whole API (Unicode `\b \w`, `\b{start}`, class set operations, `\p{scx=…}` and binary properties, non-UTF-8 haystacks, many patterns in one pass), none of which Go has; Rust has no POSIX leftmost-longest and no reader API (tests `rust oracle: the crate's answers to the Rust grammar`, `rust oracle: bytes mode (regex::bytes)`, `rust oracle: RegexSet`) (measured 2026-10-28) · feature — Unicode 18.0 classes and case folding where Go 1.26 has 15.0 and Rust `regex` 1.13.1 16.0: `\p{Lo}` matches U+323B0 (CJK Extension J) here, not in Go (test `go oracle: …`, UNICODE_VERSION 17) (measured 2026-10-28; count re-pinned 2026-11-13 on 18.0) · feature — compile-time compilation: `comptimeCompile` turns a bad pattern into a compile error and matches with no allocator, where Go's `MustCompile` panics at run time (test `fullMatch takes any way through, comptimeCompile matches compile`) (measured 2026-10-28)
 
-**Audit:** review 2026-11-02 · mutation 2026-11-12 (4773/5014, 241 eq) · src c5acd39672801fcc
+**Audit:** review 2026-11-02 · mutation 2026-11-12 (4773/5014, 241 eq) · src 43c51d2aca2cf42f
 
 Audit detail: the 2026-11-02 review is a delta over the 32-bit compile fix: `Wide.slot` shifts by the same 22 as before, from a constant (a wrong shift could only cost collisions in this direct-mapped cache, or trip the bounds check), `meta.targets`, and two single-threaded test skips; no mutation run for it. The 2026-11-01 review is a delta over `go_oracle_test.zig` only (full-CI fix: the `(Reader)`/`(Longest)` tags print only for a real disagreement; a `global-alloc-ok` marker on the cached fixture); library source unchanged since the mutation run. Mutation delta 2026-11-07 (commits `e042ea5b`, `8012bc70`: `replaceN`, `replaceNLiteral`, `replaceFirst`, the `replaceAll*` forwarding; schemata, ReleaseSafe, the two replace tests): 18 mutants, 18 killed, 0 equivalent (limit default, `left != 0` bound, the decrement, `null` forwarded as `1`, template not expanded, capture slice one short, every limit forwarded or swapped between the literal and template forms in `Regex.*` and `Matcher.*`). Two survived the first run (`replaceNLiteral` with `null`, `replaceAllLiteral` over several matches: only the oracle files covered them); one test block added to `root.zig`. 2026-11-13: the source changed only by regenerating the Unicode tables for 18.0.0 (data arrays and version constants from the generator; no guard, branch or arithmetic changed), so the mutation run above still covers every guard and no delta mutants exist; the tables themselves are anchored by the oracles in the verification table.
 
@@ -84,10 +84,10 @@ names, counts to 100,000, its nest limit); `regex::bytes` → `.utf8 = false`; `
 `find_at`/`captures_at` → `Matcher.find`/`captures` with `from`; RE2's `ANCHOR_START` /
 regex-automata's `Input::anchored` → `Matcher.findAnchored`/`capturesAnchored`; `Regex::new` → `compileOptions`,
 no `RegexBuilder` knobs beyond `Options`. Not here: RE2's `ANCHOR_BOTH` (= `fullMatch` of the rest; Rust has none), RE2's Latin-1 mode (bytes
-mode covers non-UTF-8 text), `FilteredRE2` and `PossibleMatchRange` (niche, nobody else). **Head-to-head with quangdn42/regex.zig** (bxp's engine, commit `a22a2e68`, both through
+mode covers non-UTF-8 text), `FilteredRE2` and `PossibleMatchRange` (niche, nobody else). **Head-to-head with quangdn42/regex.zig** (the build-tool consumer's engine, commit `a22a2e68`, both through
 their public APIs, re-run 2026-10-07 night after the backtracker, the literal prefilter, the DFA and
 the window, x86-64 ReleaseFast, same answers on every case): per row with the pattern compiled per
-call (bxp's REGEX_MATCH / REGEX_EXTRACT, nine template patterns × eight memo rows) ours/quangd =
+call (the build-tool consumer's REGEX_MATCH / REGEX_EXTRACT, nine template patterns × eight memo rows) ours/quangd =
 0.27 (0.19–0.40 per case); precompiled find-all over 83 KiB = 0.09 overall (0.02–0.55; the former
 loss `#([0-9]+)` 1.80 is now 0.55).
 
@@ -435,10 +435,10 @@ single timings swing 5–10 % with layout and load.
   capture engine runs; dense long-text find-all is already 0.24–0.32 of Go's time, so speed only.
   Would need caller-owned (`Matcher`) cache scratch.
 - **An ASCII bitmap per class, a one-pass engine** *(2026-10-07)* — smaller constant factors.
-- **Per-call compile + match in ReleaseSafe** *(bxp request 2026-10-19)* — 1.1–3.7× slower than
+- **Per-call compile + match in ReleaseSafe** *(the build-tool consumer request 2026-10-19)* — 1.1–3.7× slower than
   quangd/regex.zig in ReleaseSafe (≈70 % `compiler_rt.memset`: safety fills `undefined` of the
   ~9 KiB `Builder` and the DFA scratch), 2–7× faster in ReleaseFast/ReleaseSmall. Matters only to
-  consumers that ship ReleaseSafe and compile per call (bxp ships ReleaseSmall); a fix would keep
+  consumers that ship ReleaseSafe and compile per call (the build-tool consumer ships ReleaseSmall); a fix would keep
   those scratches out of safety's `undefined` fill. Not measured here yet.
 - **The next Unicode version** — `tools/ucd_unicode/fetch.sh <v>` and `gen.py --ucd data/<v> -out
   src`; re-run the Go replay (its UNICODE_VERSION count moves) and check new binary properties or
