@@ -541,3 +541,127 @@ fn zeroWords(comptime n: usize, p: *[n]u64) void {
     const asm_core = @import("asm_core.zig");
     if (comptime asm_core.supported) asm_core.zeroWords(n, p) else std.crypto.secureZero(u64, p);
 }
+
+// ── direct tests of the update/normalize steps (2026-11-15 delta audit) ─────
+//
+// The inversion tests above only see states a real divstep chain reaches, and
+// there `updateDE`'s sign corrections and `normalize`'s first conditional add
+// never decide a result (mutation 2026-11-01: three survivors). These tests
+// drive both steps directly at the edges of their documented range
+// `(−2m, m)`, against an exact `i512` model.
+
+fn s62Int(comptime K: usize, v: *const [K]i64, k: usize) i512 {
+    var r: i512 = 0;
+    var i = k;
+    while (i > 0) {
+        i -= 1;
+        r = (r << 62) + v[i];
+    }
+    return r;
+}
+
+fn intS62(comptime K: usize, x: i512, k: usize) [K]i64 {
+    var out: [K]i64 = @splat(0);
+    for (0..k) |i| {
+        const sh: u9 = @intCast(62 * i);
+        const limb: i512 = x >> sh;
+        out[i] = if (i + 1 == k) @intCast(limb) else @intCast(limb & M62i);
+    }
+    return out;
+}
+
+/// A value of the range `(−2m, m)` that stresses a limb-wise sign/carry
+/// decision: the edges, `0`, `−1`, `−m`, or uniform.
+fn edgeValue(rand: std.Random, m: i512, pick: usize) i512 {
+    const small: i512 = rand.uintLessThan(u32, 1 << 12);
+    return switch (pick % 8) {
+        0 => -2 * m + 1 + small,
+        1 => m - 1 - small,
+        2 => -m - small,
+        3 => -m + small,
+        4 => -small,
+        5 => small,
+        else => blk: {
+            var w: i512 = 0;
+            for (0..5) |_| w = (w << 62) | rand.int(u62);
+            // 0 ≤ w < 2^310, fold into (−2m, m): w mod 3m, then shift by −2m
+            break :blk @mod(w, 3 * m) - 2 * m + (if (@mod(w, 3 * m) == 0) @as(i512, 1) else 0);
+        },
+    };
+}
+
+fn randomModulus(rand: std.Random, comptime bits: usize, t: usize) i512 {
+    var m: i512 = 0;
+    for (0..(bits + 61) / 62) |_| m = (m << 62) | rand.int(u62);
+    m &= (@as(i512, 1) << bits) - 1;
+    switch (t % 4) {
+        0 => m |= @as(i512, 1) << (bits - 1),
+        1 => m |= (@as(i512, 3) << (bits - 2)),
+        2 => m = (@as(i512, 1) << bits) - 1, // all ones
+        else => m = (m >> 70) | 1, // a much shorter modulus under the same k
+    }
+    m |= 1;
+    if (m < 3) m = 3;
+    return m;
+}
+
+test "safegcd updateDE: d, e stay in (−2m, m) and d'·2^62 = u·d + v·e (mod m) from edge states (all four sign terms)" {
+    const G = Inverter(256);
+    const k: usize = 6;
+    var prng = std.Random.DefaultPrng.init(0x5AF3_6CD0_DE11);
+    const rand = prng.random();
+    var checked: usize = 0;
+    for (0..12000) |t| {
+        const m = randomModulus(rand, 256, t);
+        const mm = intS62(G.K, m, k);
+        const m0: u64 = @truncate(@as(u512, @intCast(m)));
+        var minv: u64 = m0;
+        for (0..5) |_| minv *%= 2 -% m0 *% minv;
+        // Every fourth trial puts BOTH values at the bottom edge `−2m`: that is
+        // where a dropped sign term pushes the result out of `(−2m, m)`.
+        const low = t % 4 == 0;
+        const dv = if (low) -2 * m + 1 + @as(i512, rand.uintLessThan(u16, 4096)) else edgeValue(rand, m, t / 3);
+        const ev = if (low) -2 * m + 1 + @as(i512, rand.uintLessThan(u16, 4096)) else edgeValue(rand, m, t / 5 + t);
+        var d = intS62(G.K, dv, k);
+        var e = intS62(G.K, ev, k);
+        const f0: u64 = rand.int(u64) | 1;
+        // g with many trailing zeros keeps `u` near 2^62 (the "identity" entry of
+        // the transition matrix): the `u & sd` / `q & sd` terms only decide when
+        // the matrix is that lopsided.
+        const lopsided = t % 8 < 4;
+        const g0: u64 = if (!lopsided) rand.int(u64) else rand.int(u64) << @intCast(rand.uintLessThan(u8, 64));
+        const zeta0: i64 = if (!lopsided) -1 - @as(i64, rand.uintLessThan(u8, 60)) else @as(i64, rand.uintLessThan(u8, 121)) - 60;
+        const ds = G.divsteps59(zeta0, f0, g0);
+        const tr = ds.t;
+        G.updateDE(&d, &e, tr, &mm, minv & M62, k);
+        const d2 = s62Int(G.K, &d, k);
+        const e2 = s62Int(G.K, &e, k);
+        try std.testing.expect(-2 * m < d2 and d2 < m);
+        try std.testing.expect(-2 * m < e2 and e2 < m);
+        const wd = @as(i512, tr.u) * dv + @as(i512, tr.v) * ev;
+        const we = @as(i512, tr.q) * dv + @as(i512, tr.r) * ev;
+        try std.testing.expectEqual(@as(i512, 0), @rem((d2 << 62) - wd, m));
+        try std.testing.expectEqual(@as(i512, 0), @rem((e2 << 62) - we, m));
+        checked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 12000), checked);
+}
+
+test "safegcd normalize: (−2m, m) → [0, m), negated first iff sign < 0" {
+    const G = Inverter(256);
+    const k: usize = 6;
+    var prng = std.Random.DefaultPrng.init(0x5AF3_6CD0_0A11);
+    const rand = prng.random();
+    for (0..4000) |t| {
+        const m = randomModulus(rand, 256, t);
+        const mm = intS62(G.K, m, k);
+        const rv = edgeValue(rand, m, t);
+        for ([_]i64{ 0, -1, 1, std.math.minInt(i64) }) |sign| {
+            var r = intS62(G.K, rv, k);
+            G.normalize(&r, sign, &mm, k);
+            const want = @mod(if (sign < 0) -rv else rv, m);
+            try std.testing.expectEqual(want, s62Int(G.K, &r, k));
+            for (r[0..k]) |l| try std.testing.expect(l >= 0 and l <= M62i);
+        }
+    }
+}

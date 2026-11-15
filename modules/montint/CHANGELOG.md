@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **Tests:** delta mutation audit of the almost-Montgomery ladder (`bfbac27b8`): 48 schemata mutants (lazy block kernels, the masked top-only subtract template, ladder glue, `lazy_ladder` gate variants) plus the three open 2026-11-01 survivors: 43 killed, 5 equivalent (cost-only or commutative), 0 undecided. Two new direct tests in `src/safegcd.zig` (`updateDE` range/congruence from edge states, `normalize` over the whole `(-2m, m)` input range) close the `updateDE` e-sign and `normalize` first-add survivors; the `slotFor` mutant is killed by the existing slot-boundary test. SPEC "Mutation 2026-11-15".
+
 - **2026-11-15** — **Performance:** `powMont`/`powMontBits` (so `DynModint.pow`/`powBits`, every RSA/Paillier/threshold-ECDSA private modexp) run an almost-Montgomery ladder at `L % 8 == 0`, `L >= 16`: new `asm_core.montMulBlockLazy`/`montSqrBlockLazy`, in place, final subtract decided by the REDC carry word alone (one masked `sub/sbb` pass, no borrow pass); intermediates `< R`, result still canonical (final `fromMontgomery`). Cycles −2.8 / −1.8 / −2.9 % at 1024/2048/4096 bits (min of 10, pinned A/B). Same results, constant-time shape unchanged (ctgrind in-file contexts unchanged); new exact-model differential tests. Not under `-Dmontint-asm-unroll=false`. SPEC "Almost-Montgomery ladder".
 
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
