@@ -530,12 +530,20 @@ fn bypass(
     ctx: anytype,
     comptime call: fn (*Resolver, @TypeOf(ctx)) Resolver.Error!Resolver.Lookup(T),
 ) Error!Answer(T) {
-    c.mutex.lockUncancelable(c.io);
-    c.network_lookups += 1;
-    c.mutex.unlock(c.io);
+    // Counted only once a Resolver is held: a failed `acquire` (Canceled,
+    // OutOfMemory) sent nothing (review F5, here as in the cached path).
+    // Like the cached path, an answer that did not come from DNS
+    // (`canonical == null`: /etc/hosts, a name the Resolver refused locally)
+    // is not a network lookup. No budget token is taken here to give back.
     const slot = try c.acquire();
     defer c.release(slot);
-    return .{ .lookup = try call(&slot.resolver, ctx), .source = .network };
+    const lk = try call(&slot.resolver, ctx);
+    if (lk.canonical != null) {
+        c.mutex.lockUncancelable(c.io);
+        c.network_lookups += 1;
+        c.mutex.unlock(c.io);
+    }
+    return .{ .lookup = lk, .source = .network };
 }
 
 /// A free pooled Resolver, a new one while fewer than `max_concurrent_lookups`
@@ -2074,7 +2082,8 @@ test "key length limits: the last name that fits is cached, the next bypasses th
     m = c.stats().misses;
     dropAnswer(c.lookupIp(big[0..key_buf_len])); // one byte too long: straight to the resolver
     try testing.expectEqual(m, c.stats().misses);
-    try testing.expectEqual(@as(u64, 2), c.stats().network_lookups);
+    // neither name is valid DNS (over 253 bytes): nothing went to the network
+    try testing.expectEqual(@as(u64, 0), c.stats().network_lookups);
     try testing.expect(c.free != null); // the bypass returned its Resolver
 
     var svc: [256]u8 = undefined;
@@ -2111,7 +2120,8 @@ test "an allocation failure creating a Resolver leaves the pool as it was" {
     @memset(&huge, 'b');
     try testing.expectError(error.OutOfMemory, c.lookupIp(&huge)); // the bypass path too
     try testing.expectEqual(@as(u16, 0), c.created);
-    try testing.expectEqual(@as(u64, 2), c.stats().network_lookups);
+    // neither lookup got a Resolver, so neither counts as a network lookup
+    try testing.expectEqual(@as(u64, 0), c.stats().network_lookups);
 }
 
 test "an allocation failure while arming a failure entry still returns the upstream error" {
@@ -2275,7 +2285,7 @@ test "a miss parked in the pool can be cancelled and leaves the pool consistent"
     dropAnswer(c.lookupIp("after.example.com")); // the pool still works
 }
 
-test "the expiry and the backoff are measured after the network call, not before" {
+test "the expiry is measured from before the network call (an answer never outlives its TTL)" {
     var h: Harness = .{ .timeout_ms = 10_000 };
     try h.start(.v4);
     defer h.stop();
@@ -2294,7 +2304,8 @@ test "the expiry and the backoff are measured after the network call, not before
         try waitUntilClear(h.io, &h.stub.stashed);
         h.stub.release_slow.store(false, .release);
         const e = c.map.get("\x00slow.a.example.com").?;
-        try testing.expectEqual(h.clock.now + 60, e.expires_s);
+        // the TTL counts from before the call: the 30 s it took are already spent
+        try testing.expectEqual(h.clock.now - 30 + 60, e.expires_s);
     }
     h.stub.mode.store(.servfail, .release);
     {
