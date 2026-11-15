@@ -6,7 +6,8 @@ Bollinger bands, TRANGE / ATR / NATR, stochastic (slow and fast), and rolling MA
 seed set, wave I2), plus the Overlap Studies of wave I3: DEMA, TEMA, T3, TRIMA, KAMA, ZLEMA, RMA, VIDYA,
 HMA, ALMA, MCGD, FRAMA, SWAK_BUTTER, SWAK_GAUSS (moving averages; all of them work in every `MaType` slot
 except MAMA), MIDPOINT, MIDPRICE, MAVP, VWMA, the channels ACCBANDS / DONCHIAN / KC / ICHIMOKU and the
-trend state machines SAR, SAREXT, SUPERTREND, CKSP, ZIGZAG. 44 of the 240 TA-Lib functions so far.
+trend state machines SAR, SAREXT, SUPERTREND, CKSP, ZIGZAG, and the 50 volume / volatility / price-transform / statistic /
+math-operator functions of the same wave (see below). 94 of the 237 TA-Lib functions so far.
 
 ```zig
 const ind = @import("indicators");
@@ -40,8 +41,14 @@ var bb = try ind.BbandsStream(f64).init(.{}, buf);
   process-global setting.
 - **Beyond TA-Lib:** `nan = .skip` on the recursive indicators (a NaN bar is ignored), `seed = .first`
   for EMA-based ones (pandas `ewm(adjust=False)`), no global state, no allocation on the batch path.
-- **Not built yet:** MAMA (as a function and as an `MaType`, `error.Unsupported`) and the other 196 functions
-  come in later waves; MAVP has no streaming type. See SPEC.md.
+- **Wave I3, volume and statistics (50 more functions):** volume (AD, ADOSC, CMF, EFI, EMV, KVO, MARKETFI, NVI, OBV, PVI, PVO, PVT, RVOL, VWAP),
+  volatility (ADR, BBW, CVI, MASSI, PERCENTB, ROGERSSATCHELL, RVI, RVIR), price transforms (AVGDEV, AVGPRICE, HA, MEDPRICE, TYPPRICE,
+  WCLPRICE), statistics (BETA, CORREL, KURTOSIS, LINEARREG and its ANGLE / INTERCEPT / SLOPE, MEDIAN, PERCENTILE, PERCENTRANK, STDDEV, TSF,
+  `variance`) and math operators (ADD, SUB, MULT, DIV, CUMSUM, MINMAX, MAXINDEX, MININDEX, MINMAXINDEX), all bitwise equal to TA-Lib
+  (LINEARREG_ANGLE within 2 ULP: `atan` of the C library). Multi-input streams take a struct, e.g.
+  `ind.AdStream(f64).init(.{})` then `update(.{ .high = h, .low = l, .close = c, .volume = v })`.
+- **Not built yet:** MAMA (as a function and as an `MaType`, `error.Unsupported`) and the other 143 functions (momentum, cycle,
+  math transform, candlesticks) come in later waves; MAVP has no streaming type. See SPEC.md.
 - **Model after:** TA-Lib C 0.8.3 (`kand`, Rust, is the speed candidate for a later benchmark).
 - **Platform:** any (pure logic). **Role:** util. **Concurrency:** reentrant (no shared state).
 - **Depends on:** nothing. Math is f64 for both `f32` and `f64` input.

@@ -124,12 +124,61 @@ pub fn ExtCore(comptime is_max: bool) type {
 pub const MaxCore = ExtCore(true);
 pub const MinCore = ExtCore(false);
 
+/// TA-Lib 0.8.3's batch MAX / MIN: a Van Herk / Gil-Werman block scan (ta_MAX.c), reproduced
+/// operation for operation, because it decides ties differently from the streaming automaton
+/// of `ExtCore`: only the sign of an equal pair 0.0 / -0.0 (and where a NaN shows) can tell them apart.
+/// Blocks are `period` bars; the output at a block's last bar is the block's suffix extremum
+/// (scanned backward, a strict comparison, so the LATER of equal values stays); the other outputs
+/// combine the suffix extremum of the older block's remainder with the running prefix extremum of the
+/// newer block (scanned forward, strict, the EARLIEST stays), the suffix side winning a tie. TA-Lib keeps
+/// two scratch arrays; here the suffix extrema of a block are parked in the output slots that block is
+/// about to fill (`out[b + period - 1 + m]`), each read once before it is overwritten, so nothing is allocated.
+/// `out` must not alias `in`. The streaming types still run `ExtCore` (TA-Lib's streaming tier does too).
+pub fn extBatch(comptime T: type, comptime is_max: bool, in: []const T, out: []T, p: WindowParams) Error!usize {
+    core.checkFloat(T);
+    try core.checkPeriod(p.period, 2);
+    try core.checkLen(in.len, &.{out.len});
+    const per = p.period;
+    const n = in.len;
+    const lb = per - 1;
+    const nan = std.math.nan(T);
+    for (out[0..@min(lb, n)]) |*o| o.* = nan;
+    var b: usize = 0; // block start; the block is [b, b + per - 1]
+    while (b + per <= n) : (b += per) {
+        const first = b + per - 1; // output slot of suf[0]
+        var ext = in[first];
+        if (first + per - 1 < n) out[first + per - 1] = ext;
+        var m = per - 1;
+        while (m > 0) {
+            m -= 1;
+            const t = in[b + m];
+            if (if (is_max) t > ext else t < ext) ext = t;
+            if (first + m < n) out[first + m] = ext;
+        }
+        // out[first] now holds suf[0]: the block's own output. The rest combine with the next block's prefix.
+        const next = b + per;
+        if (next >= n) break;
+        const avail = @min(per - 1, n - next);
+        var pre = in[next];
+        var j: usize = 1;
+        while (j <= avail) : (j += 1) {
+            if (j > 1) {
+                const t = in[next + j - 1];
+                if (if (is_max) t > pre else t < pre) pre = t;
+            }
+            const slot = &out[first + j];
+            if (if (is_max) pre > slot.* else pre < slot.*) slot.* = pre;
+        }
+    }
+    return lb;
+}
+
 pub fn maxLookback(p: MaxParams) Error!usize {
     try MaxCore.validate(p);
     return MaxCore.lookback(p);
 }
 pub fn max(comptime T: type, in: []const T, out: []T, p: MaxParams) Error!usize {
-    return smooth.batch1(T, MaxCore, in, out, p);
+    return extBatch(T, true, in, out, p);
 }
 pub fn MaxStream(comptime T: type) type {
     return smooth.Stream1(T, MaxParams, MaxCore);
@@ -139,7 +188,7 @@ pub fn minLookback(p: MinParams) Error!usize {
     return MinCore.lookback(p);
 }
 pub fn min(comptime T: type, in: []const T, out: []T, p: MinParams) Error!usize {
-    return smooth.batch1(T, MinCore, in, out, p);
+    return extBatch(T, false, in, out, p);
 }
 pub fn MinStream(comptime T: type) type {
     return smooth.Stream1(T, MinParams, MinCore);
@@ -222,50 +271,65 @@ test "sum: a NaN poisons the running sum" {
     for (out[2..]) |v| try testing.expect(std.math.isNan(v));
 }
 
-test "max/min with NaN: a NaN never wins a comparison, so it only shows when it opens a rescan" {
+test "max/min with NaN: a NaN never wins a comparison; the batch block scan and the streaming automaton show it at different bars" {
     const nan = std.math.nan(f64);
-    // max, period 3 over 1 2 NaN 0 0 0:
-    //  bar 2 rescan (1,2,NaN): 1 -> 2, NaN > 2 false -> 2; bar 3: 0 >= 2 false -> 2;
-    //  bar 4: the max (bar 1) left, rescan (NaN,0,0): starts at NaN, 0 > NaN false -> NaN;
-    //  bar 5: NaN's index left, rescan (0,0,0) -> 0.
+    // max, period 3 over 1 2 NaN 0 0 0, BATCH (TA-Lib's block scan, by reading of ta_MAX.c; the oracle has no NaN inputs):
+    //  block [1 2 NaN] scanned backward starts at NaN and nothing beats it: out[2] NaN, and the
+    //  suffix NaN stays in the combined outputs 3 and 4; block [0 0 0] gives out[5] = 0.
     const a = [_]f64{ 1, 2, nan, 0, 0, 0 };
     var out: [6]f64 = undefined;
     _ = try max(f64, &a, &out, .{ .period = 3 });
-    try testing.expectEqual(@as(f64, 2), out[2]);
-    try testing.expectEqual(@as(f64, 2), out[3]);
+    try testing.expect(std.math.isNan(out[2]));
+    try testing.expect(std.math.isNan(out[3]));
     try testing.expect(std.math.isNan(out[4]));
     try testing.expectEqual(@as(f64, 0), out[5]);
-    // min, period 3 over 5 4 NaN 9 9 9: 4, 4, NaN, 9
+    // min, period 3 over 5 4 NaN 9 9 9: NaN, NaN, NaN, 9
     const b = [_]f64{ 5, 4, nan, 9, 9, 9 };
     _ = try min(f64, &b, &out, .{ .period = 3 });
-    try testing.expectEqual(@as(f64, 4), out[2]);
-    try testing.expectEqual(@as(f64, 4), out[3]);
+    try testing.expect(std.math.isNan(out[2]));
+    try testing.expect(std.math.isNan(out[3]));
     try testing.expect(std.math.isNan(out[4]));
     try testing.expectEqual(@as(f64, 9), out[5]);
+    // STREAMING (the automaton): max over 1 2 NaN 0 0 0:
+    //  bar 2 rescan (1,2,NaN): 1 -> 2, NaN > 2 false -> 2; bar 3: 0 >= 2 false -> 2;
+    //  bar 4: the max (bar 1) left, rescan (NaN,0,0): starts at NaN, 0 > NaN false -> NaN;
+    //  bar 5: NaN's index left, rescan (0,0,0) -> 0.
+    var sbuf: [3]f64 = undefined;
+    var s = try MaxStream(f64).init(.{ .period = 3 }, &sbuf);
+    var got: [6]?f64 = undefined;
+    for (a, &got) |x, *g| g.* = s.update(x);
+    try testing.expectEqual(@as(f64, 2), got[2].?);
+    try testing.expectEqual(@as(f64, 2), got[3].?);
+    try testing.expect(std.math.isNan(got[4].?));
+    try testing.expectEqual(@as(f64, 0), got[5].?);
 }
 
-test "max/min ties: a rescan keeps the OLDEST of equal values, an incremental update the NEWEST (0.0 vs -0.0)" {
-    // The C code: rescan `tmp > highest` (strict, oldest stays); update `tmp >= highest` (newest wins).
-    // max, period 3 over -2 -0 -1 0 -0:
-    //  bar 2 rescan: -2 -> -0 (idx 1) -> stays; out -0.
-    //  bar 3: idx 1 still in window, 0.0 >= -0.0 -> newest wins: +0.
-    //  bar 4: -0.0 >= +0.0 -> newest wins: -0.
+test "max/min batch is TA-Lib's block scan; the streaming automaton decides ties differently (0.0 vs -0.0)" {
     const nz = -0.0;
+    // Batch, max, period 3 over -2 -0 -1 +0 -0 (block [0..2], then the next block's prefix):
+    //  out[2] = suffix max of the block, the later of equals stays: -0 (from -2, -0, -1)
+    //  out[3] = combine(suf[1] = -0, pre = +0): the prefix must be strictly greater to win: -0
+    //  out[4] = combine(suf[2] = -1, pre = max(+0, -0) with the earlier staying = +0): +0
     const a = [_]f64{ -2, nz, -1, 0.0, nz };
     var out: [5]f64 = undefined;
     _ = try max(f64, &a, &out, .{ .period = 3 });
     try testing.expect(std.math.signbit(out[2]) and out[2] == 0);
-    try testing.expect(!std.math.signbit(out[3]) and out[3] == 0);
-    try testing.expect(std.math.signbit(out[4]) and out[4] == 0);
-    // min, period 3 over 2 +0 1 -0 +0: bar 2 -> +0; bar 3 (-0 <= +0) -> -0; bar 4 -> +0.
+    try testing.expect(std.math.signbit(out[3]) and out[3] == 0);
+    try testing.expect(!std.math.signbit(out[4]) and out[4] == 0);
+    // Batch, min, period 3 over 2 +0 1 -0 +0: out[2] = suf[0] = min(2, +0, 1) = +0;
+    //  out[3] = combine(suf[1] = +0 (min of +0, 1), pre = -0): -0 < +0 is false: +0; out[4] = combine(suf[2] = 1, pre = -0 (the earlier of -0, +0)): -0.
     const b = [_]f64{ 2, 0.0, 1, nz, 0.0 };
     _ = try min(f64, &b, &out, .{ .period = 3 });
     try testing.expect(!std.math.signbit(out[2]) and out[2] == 0);
-    try testing.expect(std.math.signbit(out[3]) and out[3] == 0);
-    try testing.expect(!std.math.signbit(out[4]) and out[4] == 0);
-    // rescan: period 2 over -0 +0 -0: bar 1 window (-0,+0): oldest -0 stays; bar 2 rescan (+0,-0): +0 stays.
-    const c = [_]f64{ nz, 0.0, nz };
-    _ = try max(f64, &c, out[0..3], .{ .period = 2 });
-    try testing.expect(std.math.signbit(out[1]));
-    try testing.expect(!std.math.signbit(out[2]));
+    try testing.expect(!std.math.signbit(out[3]) and out[3] == 0);
+    try testing.expect(std.math.signbit(out[4]) and out[4] == 0);
+    // Streaming: a rescan keeps the OLDEST of equal values, an incremental update the NEWEST.
+    //  max, period 3 over -2 -0 -1 +0 -0: bar 2 rescan -> -0; bar 3: +0 >= -0 -> +0; bar 4: -0 >= +0 -> -0.
+    var sbuf: [3]f64 = undefined;
+    var s = try MaxStream(f64).init(.{ .period = 3 }, &sbuf);
+    var got: [5]?f64 = undefined;
+    for (a, &got) |x, *g| g.* = s.update(x);
+    try testing.expect(std.math.signbit(got[2].?));
+    try testing.expect(!std.math.signbit(got[3].?));
+    try testing.expect(std.math.signbit(got[4].?));
 }

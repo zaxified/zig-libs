@@ -7,7 +7,9 @@
 //! DEMA, TEMA, T3, TRIMA, KAMA, MIDPOINT, MIDPRICE, SAR, SAREXT, MAVP, ACCBANDS,
 //! ALMA, CKSP, DONCHIAN, FRAMA, HMA, ICHIMOKU, KC, MCGD, RMA, SUPERTREND,
 //! SWAK_BUTTER, SWAK_GAUSS, VIDYA, VWMA, ZIGZAG, ZLEMA; every `MaType` but MAMA
-//! now works in MA, MACDEXT, BBANDS, STOCH and STOCHF.
+//! now works in MA, MACDEXT, BBANDS, STOCH and STOCHF. Wave I3 (volume, volatility,
+//! price transform, statistic, math operators): 50 more functions, see SPEC.md. 94 of
+//! TA-Lib's 237 functions in all.
 //!
 //! ```zig
 //! const ind = @import("indicators");
@@ -40,11 +42,18 @@ const overlap = @import("overlap.zig");
 const trend_ = @import("trend.zig");
 const channels = @import("channels.zig");
 const hist = @import("hist.zig");
+// BEGIN vs imports
+const volume_ = @import("volume.zig");
+const volatility_ = @import("volatility.zig");
+const pricetx_ = @import("pricetx.zig");
+const statistic_ = @import("statistic.zig");
+const mathops_ = @import("mathops.zig");
+// END vs imports
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Technical-analysis indicators (TA-Lib parity): moving averages (SMA to T3, KAMA, HMA, ALMA), MACD, RSI, Bollinger / Keltner / Donchian bands, ATR, stochastic, SAR, Supertrend, Ichimoku, rolling max/min/sum.",
+    .doc = "Technical-analysis indicators (TA-Lib parity): moving averages (SMA to T3, KAMA, HMA, ALMA), MACD, RSI, Bollinger / Keltner / Donchian bands, ATR, stochastic, SAR, Supertrend, Ichimoku, rolling max/min/sum, plus 50 volume, volatility, price-transform, statistic and math-operator functions (OBV, VWAP, CMF, KVO, BBW, LINEARREG, MEDIAN, ...); 94 of TA-Lib's 237.",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
@@ -254,6 +263,203 @@ pub const IchimokuOut = channels.IchimokuOut;
 pub const ichimoku = channels.ichimoku;
 pub const ichimokuLookback = channels.ichimokuLookback;
 pub const IchimokuStream = channels.IchimokuStream;
+// BEGIN vs exports
+
+// volume (volume / volatility / price transform / statistic / math operator waves)
+pub const adLookback = volume_.adLookback;
+pub const ad = volume_.ad;
+pub const AdStream = volume_.AdStream;
+pub const AdoscParams = volume_.AdoscParams;
+pub const adoscLookback = volume_.adoscLookback;
+pub const adosc = volume_.adosc;
+pub const AdoscStream = volume_.AdoscStream;
+pub const CmfParams = volume_.CmfParams;
+pub const cmfLookback = volume_.cmfLookback;
+pub const cmf = volume_.cmf;
+pub const CmfStream = volume_.CmfStream;
+pub const EfiParams = volume_.EfiParams;
+pub const efiLookback = volume_.efiLookback;
+pub const efi = volume_.efi;
+pub const EfiStream = volume_.EfiStream;
+pub const EmvParams = volume_.EmvParams;
+pub const emvLookback = volume_.emvLookback;
+pub const emv = volume_.emv;
+pub const EmvStream = volume_.EmvStream;
+pub const KvoParams = volume_.KvoParams;
+pub const KvoOut = volume_.KvoOut;
+pub const kvoLookback = volume_.kvoLookback;
+pub const kvo = volume_.kvo;
+pub const KvoStream = volume_.KvoStream;
+pub const marketfiLookback = volume_.marketfiLookback;
+pub const marketfi = volume_.marketfi;
+pub const MarketfiStream = volume_.MarketfiStream;
+pub const nviLookback = volume_.nviLookback;
+pub const nvi = volume_.nvi;
+pub const NviStream = volume_.NviStream;
+pub const pviLookback = volume_.pviLookback;
+pub const pvi = volume_.pvi;
+pub const PviStream = volume_.PviStream;
+pub const obvLookback = volume_.obvLookback;
+pub const obv = volume_.obv;
+pub const ObvStream = volume_.ObvStream;
+pub const pvtLookback = volume_.pvtLookback;
+pub const pvt = volume_.pvt;
+pub const PvtStream = volume_.PvtStream;
+pub const vwapLookback = volume_.vwapLookback;
+pub const vwap = volume_.vwap;
+pub const VwapStream = volume_.VwapStream;
+pub const RvolParams = volume_.RvolParams;
+pub const rvolLookback = volume_.rvolLookback;
+pub const rvol = volume_.rvol;
+pub const RvolStream = volume_.RvolStream;
+pub const PvoParams = volume_.PvoParams;
+pub const pvoLookback = volume_.pvoLookback;
+pub const pvo = volume_.pvo;
+pub const PvoStream = volume_.PvoStream;
+
+// volatility (volume / volatility / price transform / statistic / math operator waves)
+pub const AdrParams = volatility_.AdrParams;
+pub const adrLookback = volatility_.adrLookback;
+pub const adr = volatility_.adr;
+pub const AdrStream = volatility_.AdrStream;
+pub const BbwParams = volatility_.BbwParams;
+pub const PercentbParams = volatility_.PercentbParams;
+pub const bbwLookback = volatility_.bbwLookback;
+pub const bbw = volatility_.bbw;
+pub const BbwStream = volatility_.BbwStream;
+pub const percentbLookback = volatility_.percentbLookback;
+pub const percentb = volatility_.percentb;
+pub const PercentbStream = volatility_.PercentbStream;
+pub const CviParams = volatility_.CviParams;
+pub const cviLookback = volatility_.cviLookback;
+pub const cvi = volatility_.cvi;
+pub const CviStream = volatility_.CviStream;
+pub const MassiParams = volatility_.MassiParams;
+pub const massiLookback = volatility_.massiLookback;
+pub const massi = volatility_.massi;
+pub const MassiStream = volatility_.MassiStream;
+pub const RogersSatchellParams = volatility_.RogersSatchellParams;
+pub const rogerssatchellLookback = volatility_.rogerssatchellLookback;
+pub const rogerssatchell = volatility_.rogerssatchell;
+pub const RogersSatchellStream = volatility_.RogersSatchellStream;
+pub const RviParams = volatility_.RviParams;
+pub const rviLookback = volatility_.rviLookback;
+pub const rvi = volatility_.rvi;
+pub const RviStream = volatility_.RviStream;
+pub const rvirLookback = volatility_.rvirLookback;
+pub const rvir = volatility_.rvir;
+pub const RvirStream = volatility_.RvirStream;
+
+// pricetx (volume / volatility / price transform / statistic / math operator waves)
+pub const AvgdevParams = pricetx_.AvgdevParams;
+pub const avgdevLookback = pricetx_.avgdevLookback;
+pub const avgdev = pricetx_.avgdev;
+pub const AvgdevStream = pricetx_.AvgdevStream;
+pub const avgpriceLookback = pricetx_.avgpriceLookback;
+pub const avgprice = pricetx_.avgprice;
+pub const AvgpriceStream = pricetx_.AvgpriceStream;
+pub const medpriceLookback = pricetx_.medpriceLookback;
+pub const medprice = pricetx_.medprice;
+pub const MedpriceStream = pricetx_.MedpriceStream;
+pub const typpriceLookback = pricetx_.typpriceLookback;
+pub const typprice = pricetx_.typprice;
+pub const TyppriceStream = pricetx_.TyppriceStream;
+pub const wclpriceLookback = pricetx_.wclpriceLookback;
+pub const wclprice = pricetx_.wclprice;
+pub const WclpriceStream = pricetx_.WclpriceStream;
+pub const HaParams = pricetx_.HaParams;
+pub const HaOut = pricetx_.HaOut;
+pub const haLookback = pricetx_.haLookback;
+pub const ha = pricetx_.ha;
+pub const HaStream = pricetx_.HaStream;
+
+// statistic (volume / volatility / price transform / statistic / math operator waves)
+pub const VarianceParams = statistic_.VarianceParams;
+pub const StddevParams = statistic_.StddevParams;
+pub const varianceLookback = statistic_.varianceLookback;
+pub const variance = statistic_.variance;
+pub const VarianceStream = statistic_.VarianceStream;
+pub const stddevLookback = statistic_.stddevLookback;
+pub const stddev = statistic_.stddev;
+pub const StddevStream = statistic_.StddevStream;
+pub const LinearregParams = statistic_.LinearregParams;
+pub const LrMode = statistic_.LrMode;
+pub const linearregLookback = statistic_.linearregLookback;
+pub const linearreg = statistic_.linearreg;
+pub const LinearregStream = statistic_.LinearregStream;
+pub const linearregSlopeLookback = statistic_.linearregSlopeLookback;
+pub const linearregSlope = statistic_.linearregSlope;
+pub const LinearregSlopeStream = statistic_.LinearregSlopeStream;
+pub const linearregAngleLookback = statistic_.linearregAngleLookback;
+pub const linearregAngle = statistic_.linearregAngle;
+pub const LinearregAngleStream = statistic_.LinearregAngleStream;
+pub const linearregInterceptLookback = statistic_.linearregInterceptLookback;
+pub const linearregIntercept = statistic_.linearregIntercept;
+pub const LinearregInterceptStream = statistic_.LinearregInterceptStream;
+pub const tsfLookback = statistic_.tsfLookback;
+pub const tsf = statistic_.tsf;
+pub const TsfStream = statistic_.TsfStream;
+pub const PercentrankParams = statistic_.PercentrankParams;
+pub const percentrankLookback = statistic_.percentrankLookback;
+pub const percentrank = statistic_.percentrank;
+pub const PercentrankStream = statistic_.PercentrankStream;
+pub const KurtosisParams = statistic_.KurtosisParams;
+pub const kurtosisLookback = statistic_.kurtosisLookback;
+pub const kurtosis = statistic_.kurtosis;
+pub const KurtosisStream = statistic_.KurtosisStream;
+pub const CorrelParams = statistic_.CorrelParams;
+pub const correlLookback = statistic_.correlLookback;
+pub const correl = statistic_.correl;
+pub const CorrelStream = statistic_.CorrelStream;
+pub const BetaParams = statistic_.BetaParams;
+pub const betaLookback = statistic_.betaLookback;
+pub const beta = statistic_.beta;
+pub const BetaStream = statistic_.BetaStream;
+pub const MedianParams = statistic_.MedianParams;
+pub const medianLookback = statistic_.medianLookback;
+pub const median = statistic_.median;
+pub const MedianStream = statistic_.MedianStream;
+pub const PercentileParams = statistic_.PercentileParams;
+pub const percentileLookback = statistic_.percentileLookback;
+pub const percentile = statistic_.percentile;
+pub const PercentileStream = statistic_.PercentileStream;
+
+// mathops (volume / volatility / price transform / statistic / math operator waves)
+pub const no_index = mathops_.no_index;
+pub const addLookback = mathops_.addLookback;
+pub const add = mathops_.add;
+pub const AddStream = mathops_.AddStream;
+pub const subLookback = mathops_.subLookback;
+pub const sub = mathops_.sub;
+pub const SubStream = mathops_.SubStream;
+pub const multLookback = mathops_.multLookback;
+pub const mult = mathops_.mult;
+pub const MultStream = mathops_.MultStream;
+pub const divLookback = mathops_.divLookback;
+pub const div = mathops_.div;
+pub const DivStream = mathops_.DivStream;
+pub const cumsumLookback = mathops_.cumsumLookback;
+pub const cumsum = mathops_.cumsum;
+pub const CumsumStream = mathops_.CumsumStream;
+pub const MinmaxParams = mathops_.MinmaxParams;
+pub const MaxindexParams = mathops_.MaxindexParams;
+pub const MinindexParams = mathops_.MinindexParams;
+pub const MinmaxindexParams = mathops_.MinmaxindexParams;
+pub const MinmaxOut = mathops_.MinmaxOut;
+pub const minmaxLookback = mathops_.minmaxLookback;
+pub const minmax = mathops_.minmax;
+pub const MinmaxStream = mathops_.MinmaxStream;
+pub const maxindexLookback = mathops_.maxindexLookback;
+pub const maxindex = mathops_.maxindex;
+pub const MaxindexStream = mathops_.MaxindexStream;
+pub const minindexLookback = mathops_.minindexLookback;
+pub const minindex = mathops_.minindex;
+pub const MinindexStream = mathops_.MinindexStream;
+pub const MinmaxindexOut = mathops_.MinmaxindexOut;
+pub const minmaxindexLookback = mathops_.minmaxindexLookback;
+pub const minmaxindex = mathops_.minmaxindex;
+pub const MinmaxindexStream = mathops_.MinmaxindexStream;
+// END vs exports
 
 test {
     _ = core;
@@ -270,7 +476,15 @@ test {
     _ = channels;
     _ = hist;
     _ = @import("overlap_test.zig");
+    // BEGIN vs tests
+    _ = volume_;
+    _ = volatility_;
+    _ = pricetx_;
+    _ = statistic_;
+    _ = mathops_;
+    // END vs tests
     _ = @import("testhelp.zig");
+    _ = @import("vs_kit.zig");
     _ = @import("oracle_test.zig");
 }
 
