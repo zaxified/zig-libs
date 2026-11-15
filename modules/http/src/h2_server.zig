@@ -1654,6 +1654,7 @@ const Session = struct {
     }
 
     fn serveJob(s: *Session, id: u31, req_index: u32) Disposition {
+        if (s.opts.control) |c| _ = c.requests.fetchAdd(1, .monotonic);
         s.lock();
         const job = s.jobs.getPtr(id).?;
         job.dispatched = true;
@@ -5392,6 +5393,72 @@ test "h2c integration: the same handler serves HTTP/1.1 and HTTP/2 over loopback
         try testing.expect(std.mem.startsWith(u8, meta.body.items, "127.0.0.1:"));
         try testing.expect(std.mem.endsWith(u8, meta.body.items, " #1 host=t"));
     }
+}
+
+const ConnSummaryRec = struct {
+    n: std.atomic.Value(u32) = .init(0),
+    sum: Server.ConnSummary = undefined,
+
+    fn record(ctx: ?*anyopaque, summary: Server.ConnSummary) void {
+        const r: *ConnSummaryRec = @ptrCast(@alignCast(ctx.?));
+        r.sum = summary;
+        _ = r.n.fetchAdd(1, .release);
+    }
+};
+
+test "h2c integration: on_conn_closed fires once per connection, with the stream count and a normal end" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec: ConnSummaryRec = .{};
+    var server = Server.init(io, gpa, .{
+        .handler = testHandler,
+        .enable_h2c = true,
+        .on_conn_closed = ConnSummaryRec.record,
+        .on_conn_closed_ctx = &rec,
+    });
+    defer server.deinit();
+    try bindOrSkip(&server);
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    {
+        const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+        };
+        defer stream.close(io);
+        var rbuf: [8192]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var sr = stream.reader(io, &rbuf);
+        var sw = stream.writer(io, &wbuf);
+
+        var peer: TestPeer = .init(gpa, .{});
+        defer peer.deinit();
+        try peer.conn.sendPreface(&peer.wire);
+        const sid_a = try peer.conn.startStream(&peer.wire, &get_fields, true);
+        const sid_b = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/meta"), true);
+        const sid_c = try peer.conn.startStream(&peer.wire, &get_fields, true);
+        try peer.sendWire(&sw.interface);
+        while (peer.resps.getPtr(sid_c) == null or !peer.resp(sid_a).end or
+            !peer.resp(sid_b).end or !peer.resp(sid_c).end)
+        {
+            try peer.pumpSocket(&sr.interface);
+            try peer.sendWire(&sw.interface);
+        }
+        // Not yet: the connection is still open.
+        try testing.expectEqual(@as(u32, 0), rec.n.load(.acquire));
+    }
+    var waited: u32 = 0;
+    while (rec.n.load(.acquire) == 0) : (waited += 10) {
+        if (waited > 5000) return error.SummaryNeverFired;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try testing.expectEqual(@as(u32, 1), rec.n.load(.acquire));
+    try testing.expectEqual(@as(u64, 3), rec.sum.requests);
+    try testing.expectEqual(Server.ConnEnd.normal, rec.sum.end);
+    try testing.expect(rec.sum.duration_ns > 0);
 }
 
 test "h2c integration: response body honors the client's flow-control window" {
