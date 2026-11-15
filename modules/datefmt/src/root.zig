@@ -3376,6 +3376,9 @@ test "parseDurationExt: d and w are opt-in, 24 h and 7 d" {
         const b = parseDurationExt(in, .{});
         if (a) |av| try t.expectEqual(av, try b) else |_| try t.expectError(error.InvalidDuration, b);
     }
+    // plain parseDuration is Go's grammar: neither d nor w (mutation 2026-11-15)
+    try t.expectError(error.InvalidDuration, parseDuration("1d"));
+    try t.expectError(error.InvalidDuration, parseDuration("1w"));
     // a bare number still needs a unit; a lone sign too
     try t.expectError(error.InvalidDuration, parseDurationExt("1", .{ .days = true }));
     try t.expectError(error.InvalidDuration, parseDurationExt("d", .{ .days = true }));

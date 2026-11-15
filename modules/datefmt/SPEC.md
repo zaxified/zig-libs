@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — on 15 inputs whose validity the RFC 3339 §5.6 / RFC 5322 §3.3 grammar decides, ours answers as the grammar on every one, while humantime 2.4.0 departs on 2 (accepts an empty fraction `37.Z`, refuses the lower-case `t`/`z` the RFC allows), jiff 0.2.38 on 4 (accepts a `+24:00` offset, a time without seconds, zone `UTC`; refuses a 10-digit fraction) and chrono 0.4.45 on 1 (refuses the trailing CFWS RFC 5322 allows); outside the count, the leap second `:60` the crates take as `:59` is refused by design (test `lead: RFC 3339 / RFC 5322 grammar …`; `tools/rust_fast_bench --probe`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-07 · mutation 2026-11-07 (777/810, 33 eq) · src 9837769e94ff03c3
+**Audit:** review 2026-11-07 · mutation 2026-11-15 (10/10) · src b8c63058f5f68cbe
 
 **Hardening:** fuzz 2026-10-25 (400,000 runs clean, DATEFMT_FUZZ; reach on every label) · ct n/a — date formatting (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point: no data-reachable panic; `isoWeek`, `isoWeekday` and `diffInYears` total at the i32/i64 edges)
 
@@ -111,6 +111,13 @@ and 400 generated mail dates, each row labelled `agree` / `reject` / `own` with 
 (`src/mail_date_vectors.zig`, from `tools/mail_date_oracle.py`). `zig build interop-datefmt -- --check`
 re-takes both. Run: `zig build test-datefmt` (also `-Doptimize=ReleaseFast`), `zig fmt --check
 modules/datefmt`.
+
+**Audit 2026-11-15 (delta mutation).** 10 schemata mutants over the 2026-11-15 additions, ReleaseSafe, one
+build, each mutant under `setsid -w timeout` and `ulimit -v`: `parseDuration`'s hand-off to `parseDurationExt`
+(each option forced on), the options reaching `durationUnit`, each unit's gate (forced open, forced shut), each
+unit's value (`d` as an hour, `w` as a day) and the unknown-unit result. 9 killed in the first run; 1 survived
+(`parseDuration` accepting `w`: the existing test compared the option-less call only against `d`) and got a test
+(`parseDuration("1d")`/`("1w")` refused); the rerun killed it. 10/10, 0 equivalent.
 
 **Audit 2026-10-04 (mutation).** 51 schemata mutants over the civil core (leap rule,
 `daysInMonth`, `validate`, ISO week-date bounds), the tokenizer cap, `parse` (YY pivot,
