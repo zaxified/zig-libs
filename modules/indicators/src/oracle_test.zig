@@ -54,31 +54,195 @@ fn run(comptime T: type, v: vecs.Vec, h: []const T, l: []const T, c: []const T, 
     };
 }
 
+/// Function ids of the later waves, same order as the `Func` enum of tools/interop.zig.
+const Fv = enum(u8) {
+    ad = 17,
+    adosc,
+    cmf,
+    efi,
+    emv,
+    kvo,
+    marketfi,
+    nvi,
+    obv,
+    pvi,
+    pvo,
+    pvt,
+    rvol,
+    vwap,
+    adr,
+    bbw,
+    cvi,
+    massi,
+    percentb,
+    rogerssatchell,
+    rvi,
+    rvir,
+    avgdev,
+    avgprice,
+    ha,
+    medprice,
+    typprice,
+    wclprice,
+    beta,
+    correl,
+    kurtosis,
+    linearreg,
+    linearreg_angle,
+    linearreg_intercept,
+    linearreg_slope,
+    median,
+    percentile,
+    percentrank,
+    stddev,
+    tsf,
+    @"var",
+    add,
+    cumsum,
+    div,
+    maxindex,
+    minindex,
+    minmax,
+    minmaxindex,
+    mult,
+    sub,
+};
+
+/// The later waves: `x[k]` is the k-th input series in the order of the C
+/// prototype (see `seriesOf` in tools/interop.zig: o/h/l/c/v letters).
+fn runVs(comptime T: type, v: vecs.Vec, x: [5][]const T, o: *[4][]T, io: *[2][]usize) !usize {
+    const ip = v.ip;
+    const un: ind.Unstable = switch (v.ukind) {
+        0 => .{ .bars = v.ubars },
+        1 => .auto4,
+        else => .auto8,
+    };
+    const dp0: f64 = @bitCast(v.dp[0]);
+    const dp1: f64 = @bitCast(v.dp[1]);
+    const a = testing.allocator;
+    const f: Fv = @fromBackingInt(@intCast(v.func));
+    return switch (f) {
+        .ad => ind.ad(T, x[0], x[1], x[2], x[3], o[0]),
+        .adosc => ind.adosc(T, x[0], x[1], x[2], x[3], o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]), .unstable = un }),
+        .cmf => ind.cmf(T, x[0], x[1], x[2], x[3], o[0], .{ .period = us(ip[0]) }),
+        .efi => ind.efi(T, x[0], x[1], o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .emv => ind.emv(T, x[0], x[1], x[2], o[0], .{ .period = us(ip[0]), .divisor = dp0 }),
+        .kvo => ind.kvo(T, x[0], x[1], x[2], x[3], o[0], o[1], .{ .fast = us(ip[0]), .slow = us(ip[1]), .signal = us(ip[2]), .unstable = un }),
+        .marketfi => ind.marketfi(T, x[0], x[1], x[2], o[0]),
+        .nvi => ind.nvi(T, x[0], x[1], o[0]),
+        .obv => ind.obv(T, x[0], x[1], o[0]),
+        .pvi => ind.pvi(T, x[0], x[1], o[0]),
+        .pvo => ind.pvo(T, x[0], o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]), .ma = mt(ip[2]), .unstable = un }),
+        .pvt => ind.pvt(T, x[0], x[1], o[0]),
+        .rvol => ind.rvol(T, x[0], o[0], .{ .period = us(ip[0]) }),
+        .vwap => ind.vwap(T, x[0], x[1], x[2], x[3], o[0]),
+        .adr => ind.adr(T, x[0], x[1], o[0], .{ .period = us(ip[0]) }),
+        .bbw => ind.bbw(T, x[0], o[0], .{ .period = us(ip[0]), .dev_up = dp0, .dev_dn = dp1, .ma = mt(ip[1]), .unstable = un }),
+        .cvi => ind.cvi(T, x[0], x[1], o[0], .{ .period = us(ip[0]), .roc = us(ip[1]), .unstable = un }),
+        .massi => ind.massi(T, x[0], x[1], o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]), .unstable = un }),
+        .percentb => ind.percentb(T, x[0], o[0], .{ .period = us(ip[0]), .dev_up = dp0, .dev_dn = dp1, .ma = mt(ip[1]), .unstable = un }),
+        .rogerssatchell => ind.rogerssatchell(T, x[0], x[1], x[2], x[3], o[0], .{ .period = us(ip[0]), .annualization = dp0 }),
+        .rvi => ind.rvi(T, x[0], o[0], .{ .period = us(ip[0]), .stddev = us(ip[1]), .unstable = un }),
+        .rvir => ind.rvir(T, x[0], x[1], o[0], .{ .period = us(ip[0]), .stddev = us(ip[1]), .unstable = un }),
+        .avgdev => ind.avgdev(T, x[0], o[0], .{ .period = us(ip[0]) }),
+        .avgprice => ind.avgprice(T, x[0], x[1], x[2], x[3], o[0]),
+        .ha => ind.ha(T, x[0], x[1], x[2], x[3], o[0], o[1], o[2], o[3], .{ .unstable = un }),
+        .medprice => ind.medprice(T, x[0], x[1], o[0]),
+        .typprice => ind.typprice(T, x[0], x[1], x[2], o[0]),
+        .wclprice => ind.wclprice(T, x[0], x[1], x[2], o[0]),
+        .beta => ind.beta(T, x[0], x[1], o[0], .{ .period = us(ip[0]) }),
+        .correl => ind.correl(T, x[0], x[1], o[0], .{ .period = us(ip[0]) }),
+        .kurtosis => ind.kurtosis(T, x[0], o[0], .{ .period = us(ip[0]) }),
+        .linearreg => ind.linearreg(T, x[0], o[0], .{ .period = us(ip[0]) }),
+        .linearreg_angle => ind.linearregAngle(T, x[0], o[0], .{ .period = us(ip[0]) }),
+        .linearreg_intercept => ind.linearregIntercept(T, x[0], o[0], .{ .period = us(ip[0]) }),
+        .linearreg_slope => ind.linearregSlope(T, x[0], o[0], .{ .period = us(ip[0]) }),
+        .median => ind.median(T, a, x[0], o[0], .{ .period = us(ip[0]) }),
+        .percentile => ind.percentile(T, a, x[0], o[0], .{ .period = us(ip[0]), .percentile = dp0 }),
+        .percentrank => ind.percentrank(T, x[0], o[0], .{ .period = us(ip[0]) }),
+        .stddev => ind.stddev(T, x[0], o[0], .{ .period = us(ip[0]), .nbdev = dp0 }),
+        .tsf => ind.tsf(T, x[0], o[0], .{ .period = us(ip[0]) }),
+        .@"var" => ind.variance(T, x[0], o[0], .{ .period = us(ip[0]), .nbdev = dp0 }),
+        .add => ind.add(T, x[0], x[1], o[0]),
+        .sub => ind.sub(T, x[0], x[1], o[0]),
+        .mult => ind.mult(T, x[0], x[1], o[0]),
+        .div => ind.div(T, x[0], x[1], o[0]),
+        .cumsum => ind.cumsum(T, x[0], o[0]),
+        .maxindex => ind.maxindex(T, x[0], io[0], .{ .period = us(ip[0]) }),
+        .minindex => ind.minindex(T, x[0], io[0], .{ .period = us(ip[0]) }),
+        .minmax => ind.minmax(T, x[0], o[0], o[1], .{ .period = us(ip[0]) }),
+        .minmaxindex => ind.minmaxindex(T, x[0], io[0], io[1], .{ .period = us(ip[0]) }),
+    };
+}
+
+fn isIndexFunc(func: u8) bool {
+    return func == @backingInt(Fv.maxindex) or func == @backingInt(Fv.minindex) or func == @backingInt(Fv.minmaxindex);
+}
+
+/// Distance in ULPs of the output type (NaN against NaN is 0).
+fn ulps(comptime T: type, a: T, b: T) u64 {
+    if (std.math.isNan(a) and std.math.isNan(b)) return 0;
+    if (std.math.isNan(a) or std.math.isNan(b)) return std.math.maxInt(u64);
+    const U = if (T == f32) u32 else u64;
+    const I = if (T == f32) i32 else i64;
+    const key = struct {
+        fn of(x: T) i64 {
+            const bits: U = @bitCast(x);
+            const sign = @as(U, 1) << (@bitSizeOf(U) - 1);
+            if (bits & sign != 0) return -@as(i64, @as(I, @intCast(bits & ~sign)));
+            return @as(i64, @as(I, @intCast(bits)));
+        }
+    }.of;
+    return @abs(key(a) - key(b));
+}
+
 fn replay(comptime T: type, v: vecs.Vec) !void {
     const n: usize = v.n;
     try testing.expect(n <= max_n);
-    var ib: [3][max_n]T = undefined;
-    var ob: [3][max_n]T = undefined;
+    var ib: [5][max_n]T = undefined;
+    var ob: [4][max_n]T = undefined;
+    var ub: [2][max_n]usize = undefined;
     const ni = v.ins.len;
     for (v.ins, 0..) |col, q| for (col, 0..) |bits, i| {
         ib[q][i] = @floatCast(@as(f64, @bitCast(bits)));
     };
-    // single-input functions read the close = ins[0]; OHLC ones high, low, close
-    const c = if (ni == 1) ib[0][0..n] else ib[2][0..n];
-    const h = ib[0][0..n];
-    const l = if (ni == 3) ib[1][0..n] else ib[0][0..n];
-    var o: [3][]T = .{ ob[0][0..n], ob[1][0..n], ob[2][0..n] };
-    const lb = try run(T, v, h, l, c, &o);
+    var o: [4][]T = .{ ob[0][0..n], ob[1][0..n], ob[2][0..n], ob[3][0..n] };
+    var io: [2][]usize = .{ ub[0][0..n], ub[1][0..n] };
+    var lb: usize = undefined;
+    if (v.func < 17) {
+        // single-input functions read the close = ins[0]; OHLC ones high, low, close
+        const c = if (ni == 1) ib[0][0..n] else ib[2][0..n];
+        const h = ib[0][0..n];
+        const l = if (ni == 3) ib[1][0..n] else ib[0][0..n];
+        var o3: [3][]T = .{ o[0], o[1], o[2] };
+        lb = try run(T, v, h, l, c, &o3);
+    } else {
+        var x: [5][]const T = undefined;
+        for (0..5) |q| x[q] = ib[q][0..n];
+        lb = try runVs(T, v, x, &o, &io);
+    }
     try testing.expectEqual(@as(usize, v.lb), lb);
+    const idx = isIndexFunc(v.func);
+    const bound = vecs.ulp_bound[v.func];
     for (v.outs, 0..) |col, q| {
-        for (o[q][0..@min(lb, n)]) |x| try testing.expect(std.math.isNan(x));
+        if (idx) {
+            for (io[q][0..@min(lb, n)]) |x| try testing.expectEqual(ind.no_index, x);
+        } else {
+            for (o[q][0..@min(lb, n)]) |x| try testing.expect(std.math.isNan(x));
+        }
         try testing.expectEqual(if (n > lb) n - lb else 0, col.len);
         for (col, 0..) |bits, i| {
-            const want: T = @floatCast(@as(f64, @bitCast(bits)));
+            const want64: f64 = @bitCast(bits);
+            if (idx) {
+                const got: f64 = @floatFromInt(io[q][lb + i]);
+                try testing.expectEqual(want64, got);
+                continue;
+            }
+            const want: T = @floatCast(want64);
             const got = o[q][lb + i];
-            if (std.math.isNan(want)) {
-                try testing.expect(std.math.isNan(got));
-            } else if (got != want or std.math.signbit(got) != std.math.signbit(want)) {
+            const d = ulps(T, got, want);
+            const same_zero_sign = std.math.signbit(got) == std.math.signbit(want) or std.math.isNan(want);
+            if (d > bound or (bound == 0 and !same_zero_sign)) {
                 std.debug.print("vector func {d} ip {any} n {d}: output {d} at {d}: ours {e} TA-Lib {e}\n", .{ v.func, v.ip, v.n, q, lb + i, got, want });
                 return error.TestExpectedEqual;
             }
@@ -86,9 +250,14 @@ fn replay(comptime T: type, v: vecs.Vec) !void {
     }
 }
 
-test "frozen TA-Lib vectors: every seed function, f64 and f32, unstable levels" {
-    for (vecs.ulp_bound) |b| try testing.expectEqual(@as(u64, 0), b);
-    var seen: [17]usize = @splat(0);
+test "frozen TA-Lib vectors: every function, f64 and f32, unstable levels" {
+    // a nonzero bound is applied as ULPs of the output type; the only one is LINEARREG_ANGLE's `atan`
+    for (vecs.ulp_bound, 0..) |b, k| {
+        if (k == @backingInt(Fv.linearreg_angle)) {
+            try testing.expectEqual(@as(u64, 2), b);
+        } else try testing.expectEqual(@as(u64, 0), b);
+    }
+    var seen: [vecs.ulp_bound.len]usize = @splat(0);
     for (vecs.vectors) |v| {
         if (v.f32) try replay(f32, v) else try replay(f64, v);
         for (v.outs) |col| seen[v.func] += col.len;

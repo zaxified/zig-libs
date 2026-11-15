@@ -42,29 +42,128 @@ const ta_bad_param: i32 = 2;
 const vec_n = 40;
 
 /// Same order as the C `F_*` enum.
-const Func = enum(u8) { sma, ema, wma, ma, macd, macdext, macdfix, rsi, bbands, trange, atr, natr, stoch, stochf, max, min, sum };
-const func_names = [_][]const u8{ "SMA", "EMA", "WMA", "MA", "MACD", "MACDEXT", "MACDFIX", "RSI", "BBANDS", "TRANGE", "ATR", "NATR", "STOCH", "STOCHF", "MAX", "MIN", "SUM" };
+const Func = enum(u8) {
+    sma,
+    ema,
+    wma,
+    ma,
+    macd,
+    macdext,
+    macdfix,
+    rsi,
+    bbands,
+    trange,
+    atr,
+    natr,
+    stoch,
+    stochf,
+    max,
+    min,
+    sum,
+    // volume / volatility / price transform / statistic / math operator waves
+    ad,
+    adosc,
+    cmf,
+    efi,
+    emv,
+    kvo,
+    marketfi,
+    nvi,
+    obv,
+    pvi,
+    pvo,
+    pvt,
+    rvol,
+    vwap,
+    adr,
+    bbw,
+    cvi,
+    massi,
+    percentb,
+    rogerssatchell,
+    rvi,
+    rvir,
+    avgdev,
+    avgprice,
+    ha,
+    medprice,
+    typprice,
+    wclprice,
+    beta,
+    correl,
+    kurtosis,
+    linearreg,
+    linearreg_angle,
+    linearreg_intercept,
+    linearreg_slope,
+    median,
+    percentile,
+    percentrank,
+    stddev,
+    tsf,
+    @"var",
+    add,
+    cumsum,
+    div,
+    maxindex,
+    minindex,
+    minmax,
+    minmaxindex,
+    mult,
+    sub,
+};
+const func_names = [_][]const u8{
+    "SMA",             "EMA",      "WMA",            "MA",          "MACD",   "MACDEXT", "MACDFIX",  "RSI", "BBANDS",   "TRANGE",   "ATR",      "NATR",     "STOCH",  "STOCHF",      "MAX",       "MIN",             "SUM",
+    "AD",              "ADOSC",    "CMF",            "EFI",         "EMV",    "KVO",     "MARKETFI", "NVI", "OBV",      "PVI",      "PVO",      "PVT",      "RVOL",   "VWAP",        "ADR",       "BBW",             "CVI",
+    "MASSI",           "PERCENTB", "ROGERSSATCHELL", "RVI",         "RVIR",   "AVGDEV",  "AVGPRICE", "HA",  "MEDPRICE", "TYPPRICE", "WCLPRICE", "BETA",     "CORREL", "KURTOSIS",    "LINEARREG", "LINEARREG_ANGLE", "LINEARREG_INTERCEPT",
+    "LINEARREG_SLOPE", "MEDIAN",   "PERCENTILE",     "PERCENTRANK", "STDDEV", "TSF",     "VAR",      "ADD", "CUMSUM",   "DIV",      "MAXINDEX", "MININDEX", "MINMAX", "MINMAXINDEX", "MULT",      "SUB",
+};
 const n_func = func_names.len;
 
 /// Allowed distance in ULPs, per function. Everything is expected to be bitwise:
 /// both sides do the same operations in the same order and neither contracts
 /// `a*b + c` outside the explicit `fma` calls. A nonzero entry must say why.
-const ulp_bound = [n_func]u64{
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+const ulp_bound = blk: {
+    var b: [n_func]u64 = @splat(0);
+    // LINEARREG_ANGLE is the one function that calls a libm routine we do not
+    // control: `atan` (TA-Lib's, i.e. the C library the archive links, glibc's) against
+    // Zig's `std.math.atan` (a port of musl's). Both are within an ULP or so of the exact
+    // arctangent but are different roundings; the scaling by 180/pi can stretch the
+    // distance to 2 ULP of the result (measured: 14 of 15066 values, max 2). Every other
+    // function, `log` of ROGERSSATCHELL and `sqrt` included, agrees bitwise.
+    b[@backingInt(Func.linearreg_angle)] = 2;
+    break :blk b;
 };
 
-fn nIn(f: Func) usize {
+/// The input series of a function, in the order of its TA-Lib prototype:
+/// o(pen) h(igh) l(ow) c(lose) v(olume). Two-series functions read close and open.
+fn seriesOf(f: Func) []const u8 {
     return switch (f) {
-        .trange, .atr, .natr, .stoch, .stochf => 3,
-        else => 1,
+        .trange, .atr, .natr, .stoch, .stochf => "hlc",
+        .ad, .adosc, .cmf, .kvo, .vwap => "hlcv",
+        .emv, .marketfi => "hlv",
+        .efi, .nvi, .obv, .pvi, .pvt => "cv",
+        .pvo, .rvol => "v",
+        .adr, .cvi, .massi, .rvir, .medprice => "hl",
+        .rogerssatchell, .avgprice, .ha => "ohlc",
+        .typprice, .wclprice => "hlc",
+        .beta, .correl, .add, .sub, .mult, .div => "co",
+        else => "c",
     };
+}
+fn nIn(f: Func) usize {
+    return seriesOf(f).len;
 }
 fn nOut(f: Func) usize {
     return switch (f) {
         .macd, .macdext, .macdfix, .bbands => 3,
-        .stoch, .stochf => 2,
+        .stoch, .stochf, .kvo, .minmax, .minmaxindex => 2,
+        .ha => 4,
         else => 1,
     };
+}
+fn isIndex(f: Func) bool {
+    return f == .maxindex or f == .minindex or f == .minmaxindex;
 }
 
 const Case = struct {
@@ -118,6 +217,48 @@ fn genInput(seed: u64, kind: u8, h: []f64, l: []f64, c: []f64) void {
     }
 }
 
+const Series = struct { o: []f64, h: []f64, l: []f64, c: []f64, v: []f64 };
+
+/// OHLCV of one case. High, low and close come from `genInput` unchanged; the
+/// open (inside the bar) and the volume (0..2000, with runs of zeros, and zero
+/// on every flat bar of kind 1) come from a generator of their own, so the
+/// seed functions' records do not move.
+fn genSeries(arena: std.mem.Allocator, seed: u64, kind: u8, n: usize) !Series {
+    const s: Series = .{
+        .o = try arena.alloc(f64, n),
+        .h = try arena.alloc(f64, n),
+        .l = try arena.alloc(f64, n),
+        .c = try arena.alloc(f64, n),
+        .v = try arena.alloc(f64, n),
+    };
+    genInput(seed, kind, s.h, s.l, s.c);
+    var prng = std.Random.DefaultPrng.init(seed ^ 0x6f76_6f6c_756d);
+    const r = prng.random();
+    var zero_run: usize = 0;
+    for (s.o, s.h, s.l, s.v) |*oo, hh, ll, *vv| {
+        oo.* = ll + (hh - ll) * r.float(f64);
+        if (zero_run > 0) {
+            zero_run -= 1;
+            vv.* = 0.0;
+        } else {
+            vv.* = @floor(r.float(f64) * 2000.0);
+            if (r.uintLessThan(usize, 25) == 0) zero_run = r.uintLessThan(usize, 12);
+        }
+        if (kind == 1 and hh == ll) vv.* = 0.0;
+    }
+    return s;
+}
+
+fn seriesSlice(s: Series, letter: u8) []const f64 {
+    return switch (letter) {
+        'o' => s.o,
+        'h' => s.h,
+        'l' => s.l,
+        'c' => s.c,
+        else => s.v,
+    };
+}
+
 // ── ours ────────────────────────────────────────────────────────────────────
 
 const OursError = ind.Error || std.mem.Allocator.Error;
@@ -129,9 +270,17 @@ fn us(x: i32) usize {
     return @intCast(x);
 }
 
-fn runOurs(comptime T: type, gpa: std.mem.Allocator, cs: Case, h: []const T, l: []const T, c: []const T, o: *[3][]T) OursError!usize {
+fn Ser(comptime T: type) type {
+    return struct { o: []const T, h: []const T, l: []const T, c: []const T, v: []const T };
+}
+
+fn runOurs(comptime T: type, gpa: std.mem.Allocator, cs: Case, s: Ser(T), o: *[4][]T, io: *[2][]usize) OursError!usize {
     const ip = cs.ip;
     const un = cs.unstable();
+    const h = s.h;
+    const l = s.l;
+    const c = s.c;
+    const dp = cs.dp;
     return switch (cs.func) {
         .sma => ind.sma(T, c, o[0], .{ .period = us(ip[0]) }),
         .ema => ind.ema(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
@@ -141,7 +290,7 @@ fn runOurs(comptime T: type, gpa: std.mem.Allocator, cs: Case, h: []const T, l: 
         .macdext => ind.macdext(T, gpa, c, o[0], o[1], o[2], .{ .fast = us(ip[0]), .fast_ma = mt(ip[1]), .slow = us(ip[2]), .slow_ma = mt(ip[3]), .signal = us(ip[4]), .signal_ma = mt(ip[5]), .unstable = un }),
         .macdfix => ind.macdfix(T, c, o[0], o[1], o[2], .{ .signal = us(ip[0]), .unstable = un }),
         .rsi => ind.rsi(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
-        .bbands => ind.bbands(T, c, o[0], o[1], o[2], .{ .period = us(ip[0]), .dev_up = cs.dp[0], .dev_dn = cs.dp[1], .ma = mt(ip[1]), .unstable = un }),
+        .bbands => ind.bbands(T, c, o[0], o[1], o[2], .{ .period = us(ip[0]), .dev_up = dp[0], .dev_dn = dp[1], .ma = mt(ip[1]), .unstable = un }),
         .trange => ind.trange(T, h, l, c, o[0]),
         .atr => ind.atr(T, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
         .natr => ind.natr(T, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
@@ -150,6 +299,61 @@ fn runOurs(comptime T: type, gpa: std.mem.Allocator, cs: Case, h: []const T, l: 
         .max => ind.max(T, c, o[0], .{ .period = us(ip[0]) }),
         .min => ind.min(T, c, o[0], .{ .period = us(ip[0]) }),
         .sum => ind.sum(T, c, o[0], .{ .period = us(ip[0]) }),
+        // volume
+        .ad => ind.ad(T, h, l, c, s.v, o[0]),
+        .adosc => ind.adosc(T, h, l, c, s.v, o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]), .unstable = un }),
+        .cmf => ind.cmf(T, h, l, c, s.v, o[0], .{ .period = us(ip[0]) }),
+        .efi => ind.efi(T, c, s.v, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .emv => ind.emv(T, h, l, s.v, o[0], .{ .period = us(ip[0]), .divisor = dp[0] }),
+        .kvo => ind.kvo(T, h, l, c, s.v, o[0], o[1], .{ .fast = us(ip[0]), .slow = us(ip[1]), .signal = us(ip[2]), .unstable = un }),
+        .marketfi => ind.marketfi(T, h, l, s.v, o[0]),
+        .nvi => ind.nvi(T, c, s.v, o[0]),
+        .obv => ind.obv(T, c, s.v, o[0]),
+        .pvi => ind.pvi(T, c, s.v, o[0]),
+        .pvo => ind.pvo(T, s.v, o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]), .ma = mt(ip[2]), .unstable = un }),
+        .pvt => ind.pvt(T, c, s.v, o[0]),
+        .rvol => ind.rvol(T, s.v, o[0], .{ .period = us(ip[0]) }),
+        .vwap => ind.vwap(T, h, l, c, s.v, o[0]),
+        // volatility
+        .adr => ind.adr(T, h, l, o[0], .{ .period = us(ip[0]) }),
+        .bbw => ind.bbw(T, c, o[0], .{ .period = us(ip[0]), .dev_up = dp[0], .dev_dn = dp[1], .ma = mt(ip[1]), .unstable = un }),
+        .cvi => ind.cvi(T, h, l, o[0], .{ .period = us(ip[0]), .roc = us(ip[1]), .unstable = un }),
+        .massi => ind.massi(T, h, l, o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]), .unstable = un }),
+        .percentb => ind.percentb(T, c, o[0], .{ .period = us(ip[0]), .dev_up = dp[0], .dev_dn = dp[1], .ma = mt(ip[1]), .unstable = un }),
+        .rogerssatchell => ind.rogerssatchell(T, s.o, h, l, c, o[0], .{ .period = us(ip[0]), .annualization = dp[0] }),
+        .rvi => ind.rvi(T, c, o[0], .{ .period = us(ip[0]), .stddev = us(ip[1]), .unstable = un }),
+        .rvir => ind.rvir(T, h, l, o[0], .{ .period = us(ip[0]), .stddev = us(ip[1]), .unstable = un }),
+        // price transform
+        .avgdev => ind.avgdev(T, c, o[0], .{ .period = us(ip[0]) }),
+        .avgprice => ind.avgprice(T, s.o, h, l, c, o[0]),
+        .ha => ind.ha(T, s.o, h, l, c, o[0], o[1], o[2], o[3], .{ .unstable = un }),
+        .medprice => ind.medprice(T, h, l, o[0]),
+        .typprice => ind.typprice(T, h, l, c, o[0]),
+        .wclprice => ind.wclprice(T, h, l, c, o[0]),
+        // statistic
+        .beta => ind.beta(T, c, s.o, o[0], .{ .period = us(ip[0]) }),
+        .correl => ind.correl(T, c, s.o, o[0], .{ .period = us(ip[0]) }),
+        .kurtosis => ind.kurtosis(T, c, o[0], .{ .period = us(ip[0]) }),
+        .linearreg => ind.linearreg(T, c, o[0], .{ .period = us(ip[0]) }),
+        .linearreg_angle => ind.linearregAngle(T, c, o[0], .{ .period = us(ip[0]) }),
+        .linearreg_intercept => ind.linearregIntercept(T, c, o[0], .{ .period = us(ip[0]) }),
+        .linearreg_slope => ind.linearregSlope(T, c, o[0], .{ .period = us(ip[0]) }),
+        .median => ind.median(T, gpa, c, o[0], .{ .period = us(ip[0]) }),
+        .percentile => ind.percentile(T, gpa, c, o[0], .{ .period = us(ip[0]), .percentile = dp[0] }),
+        .percentrank => ind.percentrank(T, c, o[0], .{ .period = us(ip[0]) }),
+        .stddev => ind.stddev(T, c, o[0], .{ .period = us(ip[0]), .nbdev = dp[0] }),
+        .tsf => ind.tsf(T, c, o[0], .{ .period = us(ip[0]) }),
+        .@"var" => ind.variance(T, c, o[0], .{ .period = us(ip[0]), .nbdev = dp[0] }),
+        // math operators
+        .add => ind.add(T, c, s.o, o[0]),
+        .sub => ind.sub(T, c, s.o, o[0]),
+        .mult => ind.mult(T, c, s.o, o[0]),
+        .div => ind.div(T, c, s.o, o[0]),
+        .cumsum => ind.cumsum(T, c, o[0]),
+        .maxindex => ind.maxindex(T, c, io[0], .{ .period = us(ip[0]) }),
+        .minindex => ind.minindex(T, c, io[0], .{ .period = us(ip[0]) }),
+        .minmax => ind.minmax(T, c, o[0], o[1], .{ .period = us(ip[0]) }),
+        .minmaxindex => ind.minmaxindex(T, c, io[0], io[1], .{ .period = us(ip[0]) }),
     };
 }
 
@@ -213,6 +417,49 @@ fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
             for ([_][3]i32{ .{ 5, 3, 0 }, .{ 1, 1, 0 }, .{ 9, 4, 1 }, .{ 14, 3, 2 }, .{ 3, 5, 2 }, .{ 4, 1, 1 }, .{ 5, 3, 10 }, .{ 0, 3, 0 }, .{ 5, 0, 0 } }) |t|
                 try l.append(gpa, pn(.{ t[0], t[1], t[2], 0, 0, 0 }));
         },
+        // ── volume / volatility / price transform / statistic / math operator waves ──
+        .ad, .marketfi, .nvi, .obv, .pvi, .pvt, .vwap, .avgprice, .ha, .medprice, .typprice, .wclprice, .add, .sub, .mult, .div, .cumsum => try l.append(gpa, .{}),
+        .adosc => for ([_][2]i32{ .{ 3, 10 }, .{ 2, 2 }, .{ 5, 3 }, .{ 12, 26 }, .{ 2, 60 }, .{ 40, 2 }, .{ 1, 10 }, .{ 3, 100001 } }) |t|
+            try l.append(gpa, pn(.{ t[0], t[1], 0, 0, 0, 0 })),
+        .cmf => try l.appendSlice(gpa, &periods(&.{ 20, 2, 3, 5, 50, 1, 0, 100001 })),
+        .efi => try l.appendSlice(gpa, &periods(&.{ 13, 1, 2, 3, 5, 30, 0, 100001 })),
+        .emv => for ([_]struct { p: i32, d: f64 }{ .{ .p = 14, .d = 10000 }, .{ .p = 1, .d = 1 }, .{ .p = 2, .d = 10000 }, .{ .p = 5, .d = 1 }, .{ .p = 10, .d = 1e6 }, .{ .p = 14, .d = 0.5 }, .{ .p = 14, .d = 4e37 }, .{ .p = 0, .d = 10000 } }) |t|
+            try l.append(gpa, .{ .ip = .{ t.p, 0, 0, 0, 0, 0 }, .dp = .{ t.d, 0 } }),
+        .kvo => for ([_][3]i32{ .{ 34, 55, 13 }, .{ 2, 2, 2 }, .{ 5, 9, 3 }, .{ 10, 5, 2 }, .{ 3, 3, 3 }, .{ 20, 12, 7 }, .{ 1, 55, 13 }, .{ 34, 55, 1 } }) |t|
+            try l.append(gpa, pn(.{ t[0], t[1], t[2], 0, 0, 0 })),
+        .pvo => for ([_][3]i32{ .{ 12, 26, 1 }, .{ 2, 3, 0 }, .{ 5, 3, 2 }, .{ 10, 20, 10 }, .{ 26, 12, 1 }, .{ 4, 9, 0 }, .{ 3, 3, 1 }, .{ 2, 5, 2 }, .{ 6, 12, 0 }, .{ 1, 26, 1 } }) |t|
+            try l.append(gpa, pn(.{ t[0], t[1], t[2], 0, 0, 0 })),
+        .rvol => try l.appendSlice(gpa, &periods(&.{ 20, 1, 2, 3, 5, 10, 0, 100001 })),
+        .adr => try l.appendSlice(gpa, &periods(&.{ 14, 1, 2, 3, 5, 30, 0, 100001 })),
+        .bbw, .percentb => {
+            for ([_]i32{ 20, 5, 2, 10, 3 }) |per| for (grid_ma) |t| try l.append(gpa, .{ .ip = .{ per, t, 0, 0, 0, 0 }, .dp = .{ 2, 2 } });
+            try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = .{ 1.5, 2.5 } });
+            try l.append(gpa, .{ .ip = .{ 9, 1, 0, 0, 0, 0 }, .dp = .{ 2.5, 0.5 } });
+            try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = .{ -1, -1 } });
+            try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = .{ 0, 0 } });
+            try l.append(gpa, .{ .ip = .{ 1, 0, 0, 0, 0, 0 }, .dp = .{ 2, 2 } });
+            try l.append(gpa, .{ .ip = .{ 5, 0, 0, 0, 0, 0 }, .dp = .{ 4e37, 2 } });
+        },
+        .cvi => for ([_][2]i32{ .{ 10, 10 }, .{ 2, 1 }, .{ 3, 5 }, .{ 20, 3 }, .{ 5, 1 }, .{ 10, 50 }, .{ 1, 10 }, .{ 10, 0 } }) |t|
+            try l.append(gpa, pn(.{ t[0], t[1], 0, 0, 0, 0 })),
+        .massi => for ([_][2]i32{ .{ 9, 25 }, .{ 2, 2 }, .{ 3, 10 }, .{ 5, 2 }, .{ 20, 40 }, .{ 2, 50 }, .{ 1, 25 }, .{ 9, 1 } }) |t|
+            try l.append(gpa, pn(.{ t[0], t[1], 0, 0, 0, 0 })),
+        .rogerssatchell => for ([_]struct { p: i32, a: f64 }{ .{ .p = 10, .a = 252 }, .{ .p = 1, .a = 252 }, .{ .p = 2, .a = 1 }, .{ .p = 5, .a = 0 }, .{ .p = 20, .a = 365 }, .{ .p = 10, .a = -1 }, .{ .p = 0, .a = 252 }, .{ .p = 10, .a = 4e37 } }) |t|
+            try l.append(gpa, .{ .ip = .{ t.p, 0, 0, 0, 0, 0 }, .dp = .{ t.a, 0 } }),
+        .rvi, .rvir => for ([_][2]i32{ .{ 14, 10 }, .{ 1, 2 }, .{ 2, 2 }, .{ 3, 5 }, .{ 5, 3 }, .{ 10, 10 }, .{ 1, 10 }, .{ 14, 1 }, .{ 0, 10 } }) |t|
+            try l.append(gpa, pn(.{ t[0], t[1], 0, 0, 0, 0 })),
+        .avgdev => try l.appendSlice(gpa, &periods(&.{ 14, 2, 3, 5, 30, 50, 1, 0, 100001 })),
+        .beta => try l.appendSlice(gpa, &periods(&.{ 5, 1, 2, 3, 10, 30, 0, 100001 })),
+        .correl => try l.appendSlice(gpa, &periods(&.{ 30, 1, 2, 3, 5, 10, 0, 100001 })),
+        .kurtosis => try l.appendSlice(gpa, &periods(&.{ 30, 4, 5, 6, 10, 100, 3, 10001 })),
+        .linearreg, .linearreg_angle, .linearreg_intercept, .linearreg_slope, .tsf => try l.appendSlice(gpa, &periods(&.{ 14, 2, 3, 5, 30, 100, 1, 100001 })),
+        .median => try l.appendSlice(gpa, &periods(&.{ 30, 2, 3, 4, 5, 10, 127, 128, 200, 1, 10001 })),
+        .percentile => for ([_]struct { p: i32, q: f64 }{ .{ .p = 100, .q = 50 }, .{ .p = 2, .q = 50 }, .{ .p = 5, .q = 0 }, .{ .p = 5, .q = 100 }, .{ .p = 10, .q = 25 }, .{ .p = 10, .q = 75 }, .{ .p = 20, .q = 99.9 }, .{ .p = 30, .q = 0.001 }, .{ .p = 129, .q = 90 }, .{ .p = 1, .q = 50 }, .{ .p = 10, .q = 101 }, .{ .p = 10, .q = -1 } }) |t|
+            try l.append(gpa, .{ .ip = .{ t.p, 0, 0, 0, 0, 0 }, .dp = .{ t.q, 0 } }),
+        .percentrank => try l.appendSlice(gpa, &periods(&.{ 100, 2, 3, 5, 20, 1, 10001 })),
+        .stddev, .@"var" => for ([_]struct { p: i32, d: f64 }{ .{ .p = 5, .d = 1 }, .{ .p = 2, .d = 1 }, .{ .p = 3, .d = 2 }, .{ .p = 10, .d = 0.5 }, .{ .p = 30, .d = 1 }, .{ .p = 1, .d = 1 }, .{ .p = 5, .d = 4e37 }, .{ .p = 0, .d = 1 } }) |t|
+            try l.append(gpa, .{ .ip = .{ t.p, 0, 0, 0, 0, 0 }, .dp = .{ t.d, 0 } }),
+        .maxindex, .minindex, .minmax, .minmaxindex => try l.appendSlice(gpa, &periods(&.{ 30, 2, 3, 5, 14, 100, 1, 0, 100001 })),
     }
     return l.items;
 }
@@ -220,8 +467,9 @@ fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
 /// Functions on which the unstable period does anything.
 fn unstableMatters(f: Func) bool {
     return switch (f) {
-        .sma, .wma, .trange, .max, .min, .sum => false,
-        else => true,
+        .adosc, .efi, .kvo, .cvi, .massi, .pvo, .rvi, .rvir, .ha => true,
+        .macd, .macdext, .macdfix, .rsi, .atr, .natr, .ema, .ma, .bbands, .stoch, .stochf, .bbw, .percentb => true,
+        else => false,
     };
 }
 
@@ -232,14 +480,25 @@ fn probeLookback(gpa: std.mem.Allocator, cs_in: Case) ?usize {
     var o0: [1]f64 = undefined;
     var o1: [1]f64 = undefined;
     var o2: [1]f64 = undefined;
-    var o: [3][]f64 = .{ &o0, &o1, &o2 };
-    return runOurs(f64, gpa, cs, &hh, &hh, &hh, &o) catch null;
+    var o3: [1]f64 = undefined;
+    var ix0: [1]usize = undefined;
+    var ix1: [1]usize = undefined;
+    var o: [4][]f64 = .{ &o0, &o1, &o2, &o3 };
+    var io: [2][]usize = .{ &ix0, &ix1 };
+    const sr = Ser(f64){ .o = &hh, .h = &hh, .l = &hh, .c = &hh, .v = &hh };
+    return runOurs(f64, gpa, cs, sr, &o, &io) catch null;
 }
 
 fn addLen(gpa: std.mem.Allocator, ns: *std.ArrayList(u32), n: usize) !void {
     if (n < 1) return;
     for (ns.items) |x| if (x == n) return;
     try ns.append(gpa, @intCast(n));
+}
+
+/// How many parameter sets of a function get frozen vectors (the seed functions
+/// keep 4; later waves 2, to keep the frozen file small).
+fn emitSets(f: Func) usize {
+    return if (@backingInt(f) < 17) 4 else 2;
 }
 
 fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
@@ -268,7 +527,7 @@ fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
                 c.n = n;
                 seed += 1;
                 c.seed = seed;
-                c.emit = n == vec_n and pi < 4;
+                c.emit = n == vec_n and pi < emitSets(f);
                 try cases.append(gpa, c);
                 if (n == 300 and pi < 4) for ([_]u8{ 1, 2 }) |k| {
                     var ck = c;
@@ -365,28 +624,33 @@ fn report(c: *Ctx, cs: Case, comptime fmt: []const u8, args: anytype) void {
 
 const Head = struct { ret: i32, lb: i32, beg: i32, nb: i32 };
 
+fn conv(arena: std.mem.Allocator, comptime T: type, xs: []const f64) ![]T {
+    const r = try arena.alloc(T, xs.len);
+    for (r, xs) |*d, x| d.* = @floatCast(x);
+    return r;
+}
+
 /// Runs ours for one case against what TA-Lib answered; returns the number of
 /// bytes of `theirs` consumed.
 fn checkCase(comptime T: type, c: *Ctx, arena: std.mem.Allocator, cs: Case, head: Head, theirs: []const u8) !usize {
     const st = &c.stats[@backingInt(cs.func)];
     st.records += 1;
     const n: usize = cs.n;
-    const hs = try arena.alloc(f64, n);
-    const ls = try arena.alloc(f64, n);
-    const cl = try arena.alloc(f64, n);
-    genInput(cs.seed, cs.kind, hs, ls, cl);
-    const h = try arena.alloc(T, n);
-    const l = try arena.alloc(T, n);
-    const cc = try arena.alloc(T, n);
-    for (0..n) |i| {
-        h[i] = @floatCast(hs[i]);
-        l[i] = @floatCast(ls[i]);
-        cc[i] = @floatCast(cl[i]);
-    }
+    const sr = try genSeries(arena, cs.seed, cs.kind, n);
+    const sT = Ser(T){
+        .o = try conv(arena, T, sr.o),
+        .h = try conv(arena, T, sr.h),
+        .l = try conv(arena, T, sr.l),
+        .c = try conv(arena, T, sr.c),
+        .v = try conv(arena, T, sr.v),
+    };
     const no = nOut(cs.func);
-    var o: [3][]T = undefined;
-    for (&o) |*s| s.* = try arena.alloc(T, n);
-    const res = runOurs(T, c.gpa, cs, h, l, cc, &o);
+    const idx_out = isIndex(cs.func);
+    var o: [4][]T = undefined;
+    for (&o) |*sl| sl.* = try arena.alloc(T, n);
+    var io: [2][]usize = undefined;
+    for (&io) |*sl| sl.* = try arena.alloc(usize, n);
+    const res = runOurs(T, c.gpa, cs, sT, &o, &io);
     if (res) |lb| {
         if (head.ret != 0) {
             report(c, cs, "ours succeeded (lookback {d}), TA-Lib returned {d}", .{ lb, head.ret });
@@ -405,25 +669,44 @@ fn checkCase(comptime T: type, c: *Ctx, arena: std.mem.Allocator, cs: Case, head
         var bad_here = false;
         for (0..no) |q| {
             const lead = @min(lb, n);
-            for (o[q][0..lead]) |v| if (!std.math.isNan(v)) {
-                report(c, cs, "ours has a non-NaN value in the lead of output {d}", .{q});
-                bad_here = true;
-                break;
-            };
+            if (idx_out) {
+                for (io[q][0..lead]) |v| if (v != ind.no_index) {
+                    report(c, cs, "ours has an index in the lead of output {d}", .{q});
+                    bad_here = true;
+                    break;
+                };
+            } else {
+                for (o[q][0..lead]) |v| if (!std.math.isNan(v)) {
+                    report(c, cs, "ours has a non-NaN value in the lead of output {d}", .{q});
+                    bad_here = true;
+                    break;
+                };
+            }
             for (0..nb) |i| {
-                const want: T = @floatCast(@as(f64, @bitCast(std.mem.readInt(u64, theirs[(q * nb + i) * 8 ..][0..8], .little))));
-                const got = o[q][lb + i];
-                const d = ulpDist(T, got, want);
+                const want64: f64 = @bitCast(std.mem.readInt(u64, theirs[(q * nb + i) * 8 ..][0..8], .little));
+                var d: u64 = undefined;
+                var got_f: f64 = undefined;
+                var want_f: f64 = want64;
+                if (idx_out) {
+                    got_f = @floatFromInt(io[q][lb + i]);
+                    d = if (got_f == want64) 0 else std.math.maxInt(u64);
+                } else {
+                    const want: T = @floatCast(want64);
+                    const got = o[q][lb + i];
+                    d = ulpDist(T, got, want);
+                    got_f = got;
+                    want_f = want;
+                }
                 st.values += 1;
                 if (d == 0) st.bitwise += 1;
                 st.max_ulp = @max(st.max_ulp, d);
                 if (d > ulp_bound[@backingInt(cs.func)] and !bad_here) {
-                    report(c, cs, "output {d} at {d}: ours {e} TA-Lib {e} ({d} ulp)", .{ q, lb + i, got, want, d });
+                    report(c, cs, "output {d} at {d}: ours {e} TA-Lib {e} ({d} ulp)", .{ q, lb + i, got_f, want_f, d });
                     bad_here = true;
                 }
             }
         }
-        if (cs.emit and !bad_here) try emitVector(c, cs, lb, nb, hs, ls, cl, h, l, cc, theirs, T);
+        if (cs.emit and !bad_here) try emitVector(c, cs, lb, nb, sT, theirs);
         return nb * 8 * no;
     } else |err| switch (err) {
         error.BadParam => {
@@ -441,10 +724,7 @@ fn hexBits(w: *std.Io.Writer, v: f64) !void {
     try w.print("0x{x}", .{@as(u64, @bitCast(v))});
 }
 
-fn emitVector(c: *Ctx, cs: Case, lb: usize, nb: usize, hs: []const f64, ls: []const f64, cl: []const f64, h: anytype, l: anytype, cc: anytype, theirs: []const u8, comptime T: type) !void {
-    _ = hs;
-    _ = ls;
-    _ = cl;
+fn emitVector(c: *Ctx, cs: Case, lb: usize, nb: usize, sT: anytype, theirs: []const u8) !void {
     const w = c.vec_out orelse return;
     c.vec_count += 1;
     try w.print("    .{{ .func = {d}, .f32 = {}, .ukind = {d}, .ubars = {d}, .n = {d}, .lb = {d}, .ip = .{{", .{ @backingInt(cs.func), cs.is32, cs.ukind, cs.ubars, cs.n, lb });
@@ -454,12 +734,13 @@ fn emitVector(c: *Ctx, cs: Case, lb: usize, nb: usize, hs: []const f64, ls: []co
     try w.writeAll(", ");
     try hexBits(w, cs.dp[1]);
     try w.writeAll(" },\n      .ins = &.{");
-    const ni = nIn(cs.func);
-    for (0..ni) |q| {
-        const src = if (ni == 1) cc else switch (q) {
-            0 => h,
-            1 => l,
-            else => cc,
+    for (seriesOf(cs.func)) |letter| {
+        const src = switch (letter) {
+            'o' => sT.o,
+            'h' => sT.h,
+            'l' => sT.l,
+            'c' => sT.c,
+            else => sT.v,
         };
         try w.writeAll(" &.{");
         for (src, 0..) |v, i| {
@@ -479,7 +760,6 @@ fn emitVector(c: *Ctx, cs: Case, lb: usize, nb: usize, hs: []const f64, ls: []co
         try w.writeAll(" },");
     }
     try w.writeAll(" } },\n");
-    _ = T;
 }
 
 fn runAll(c: *Ctx, arena: std.mem.Allocator, cases: []const Case) !void {
@@ -493,18 +773,9 @@ fn runAll(c: *Ctx, arena: std.mem.Allocator, cases: []const Case) !void {
         for (cs.ip) |x| try w.writeInt(i32, x, .little);
         for (cs.dp) |x| try w.writeInt(u64, @bitCast(x), .little);
         const n: usize = cs.n;
-        const hs = try arena.alloc(f64, n);
-        const ls = try arena.alloc(f64, n);
-        const cl = try arena.alloc(f64, n);
-        genInput(cs.seed, cs.kind, hs, ls, cl);
-        const ni = nIn(cs.func);
-        for (0..ni) |q| {
-            const src = if (ni == 1) cl else switch (q) {
-                0 => hs,
-                1 => ls,
-                else => cl,
-            };
-            for (src) |v| {
+        const sr = try genSeries(arena, cs.seed, cs.kind, n);
+        for (seriesOf(cs.func)) |letter| {
+            for (seriesSlice(sr, letter)) |v| {
                 if (cs.is32) {
                     const f: f32 = @floatCast(v);
                     try w.writeInt(u32, @bitCast(f), .little);
