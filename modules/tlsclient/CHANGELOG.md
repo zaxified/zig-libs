@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-13** — **BEHAVIOURAL:** a TLS 1.3 ServerHello or HelloRetryRequest carrying an extension only TLS 1.2 defines there (ALPN, status_request, SCT, extended_master_secret, SessionTicket, renegotiation_info) ends the handshake with `error.TlsIllegalParameter`, as Go's client refuses it; before, the ALPN answer there was taken and the others ignored. No real TLS 1.3 server sends them (interop with Go unchanged).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit recorded from the delta mutation run over TLS 1.2 resumption (182 mutants: 160 killed, 22 equivalent or unobservable).

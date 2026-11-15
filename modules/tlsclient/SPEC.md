@@ -22,7 +22,7 @@ Audit detail: the 2026-11-01 mutation run is a delta from `da5c973a` (the 2026-1
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Re-surveyed 2026-10-13 for S2: Go's client API mapped from `go doc crypto/tls.{Config,ConnectionState,Conn}` (go1.26.0; no Go source read), identifier by identifier, against this module (plan and mapping table in the CML survey report `20261013-tlsclient-s2`). Competitor feature claims are *(inferred)* unless marked as read; ianic/tls.zig's README was read.
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Re-surveyed 2026-10-13 for S2: Go's client API mapped from `go doc crypto/tls.{Config,ConnectionState,Conn}` (go1.26.0; no Go source read), identifier by identifier, against this module (plan and mapping table in the owner's survey report `20261013-tlsclient-s2`). Competitor feature claims are *(inferred)* unless marked as read; ianic/tls.zig's README was read.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
