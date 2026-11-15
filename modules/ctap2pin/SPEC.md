@@ -95,7 +95,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   again with `prk` as the key on every `expand`. This module's `secureZero`
   reaches its own `prk` variable; it cannot reach a copy `std.crypto.hmac`
   made two frames deeper and never erased. Same class of gap as
-  `zig_std_crypto_leaves_key_schedules_on_stack` (CML memory) — vendoring
+  `zig_std_crypto_leaves_key_schedules_on_stack` (owner notes) — vendoring
   a scrubbing HMAC would fork a small, well-reviewed piece of `std` and
   has to track every future Zig release, which this module's design
   section rules out for the same reason `sealedbox` H2/M4 did. No fix in
