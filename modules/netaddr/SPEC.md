@@ -124,6 +124,7 @@ substrate.
 - **Consumers converting `std.Io.net.IpAddress` by hand** (abuseguard, enip, http/proxy, probe,
   ratelimit, … — `rg '\.ip4 => \|a\| \.\{ \.v4 = a\.bytes'`): can switch to `Ip.fromStd` /
   `AddrPort.fromStd`. Cosmetic; do it when touching those modules.
+- **`Ip.key(v6_bits)` (consumer request 2026-11-15; effort S, low priority).** Rate-limit and per-viewer maps key IPv6 clients by their /64; `ip.prefix(64).?.network()` already works (`Ip.prefix` `src/root.zig`, `Prefix.network`) but call sites spell it differently and handle the v4 case separately. Expected: Go `netip.Prefix.Masked`. Proposed: `netaddr.Ip.key(self, v6_bits: u8) [16]u8` returning the v4-mapped/plain 4-byte form zero-padded for IPv4 and the masked first `v6_bits` for IPv6; as a pure convenience over `prefix().network()`, it may be rejected if the owner prefers no second spelling.
 
 ## Status
 `extract · any · util · reentrant` + deps: none (std only; `systemSource` Linux-only) — canonical
