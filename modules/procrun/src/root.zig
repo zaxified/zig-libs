@@ -1473,7 +1473,7 @@ fn runKilled(
     // (deadline or cancel) is not a failure: the caller gets the Output with
     // `timed_out`/`canceled` set and the captured data (sweep D9; Python's
     // `communicate` does the same). A child that exits early on its own still
-    // surfaces `error.BrokenPipe` (documented, bxp relies on it).
+    // surfaces `error.BrokenPipe` (documented, the build-tool consumer relies on it).
     if (pumps.in_err) |e| {
         if (e == error.BrokenPipe and (timed_out.load(.acquire) or canceled.load(.acquire))) pumps.in_err = null;
     }

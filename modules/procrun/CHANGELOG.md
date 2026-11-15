@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: Stop-signal helper for a daemon's own SIGTERM/SIGINT (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `monoNowNs` (duplicate-code pass), including its hand-written Windows QPC branch, is replaced by `clock.monotonicNs()` (same QPC math, no libc). New dependency: `clock`.
@@ -67,7 +68,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   bounded by a 250 ms grace even if a descendant holds a pipe; a token requested before the
   call spawns nothing and returns `error.Canceled`. One token may stop many concurrent runs.
   Both new fields default (`null`, `false`), so existing callers are unchanged. Wanted by
-  ttydesk (quit without waiting out the slowest fetch).
+  the terminal-UI consumer (quit without waiting out the slowest fetch).
 
 - **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** `killerLoop` gains a
   test-only wakeup counter (`void` outside a test build, so the increment
