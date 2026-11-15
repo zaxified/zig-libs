@@ -1530,7 +1530,10 @@ tlsserver	ReleaseFast	ticket	1	78	3ac15557a1962841	915935a402728fb8
 # server flight (2026-10-22 review).
 # 2026-11-01 — ech 384 -> 388 (--stacks diff against 1eb591f0; 389 with the committed hpke dhkem.zig, -1 more with the working-tree change that moves hpke X25519 onto ct25519, which drops std curve25519.zig:77 `isZero` identity verdict of dhkem.X25519Kem.decapBody): +6 netaddr.parseIp (netaddr octetAt/byteAt bounds-checked octet reads, called from hello.zig:402 parseServerName's IP-literal test on the decrypted inner hello's SNI: public work on the decrypted inner hello, the isDnsName class); +1 hpke schedule.zig `readyAead` (timing_safe.eql of the cached expanded AEAD key against the schedule key, 70207995: a verdict, no branch on a key octet; its aesgcm open frame merely re-inlined, net 0); +2 tls13 transcript.zig `writeHeader` length guard in serverFlight / sendRetry (public message length, as dtls hs); -4 std ecdsa contexts of signEcdsaP256 (p256 declassify fix). Everything else is renaming (ech.reconstruct struct id, kex.hybridEncaps).
 # 2026-11-01 — ech 388 -> 384 after tls13/hpke moved to `mlkem` (0b84d2aa) and FFDHE landed; the -4 is matched by count to dropped std ml_kem frames, NOT read by --stacks (re-pinned from full CI 41323098008, owner rule: no local ctgrind re-runs). hs/app/ticket digest only.
-tlsserver	ReleaseFast	ech	1	384	3ac15557a1962841	c257fcbb1b68d8df
+# 2026-11-15 — ech 384 -> 381 after `Protection.wipe` moved to a vector zeroize and the record_burn /
+# server_suite_order knobs landed (2810fced1); -3, matched by count, NOT read by --stacks (re-pinned from
+# full CI 43679781095's ctgrind lane, owner rule: ctgrind re-pins come from full CI). No increase on any row.
+tlsserver	ReleaseFast	ech	1	381	3ac15557a1962841	c257fcbb1b68d8df
 # quic-crypto (2026-10-10) — aes / chacha: a 1-RTT traffic secret tainted
 # through derivePacketKeys, advanceKeys, Protection.seal/open and header
 # protection (computeMask*, apply, remove). In-file 4 each, none a branch on a
