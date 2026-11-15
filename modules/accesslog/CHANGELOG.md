@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: Sink drop-and-count overflow mode; public logfmt value writer (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Second whole-module mutation run (operator-generated schemata over the production code of `root.zig`, `logformat.zig`, `middleware.zig`, `sink.zig`, `timefmt.zig`, `filewriter.zig`; tests only): six new tests pin what the run left alive: `end:` formats with no latency add nothing (not even one nanosecond before a second boundary), one-letter strftime tokens (`%u`, `%p`) directly after another token, the `%C` century divisor (1999 and 2100), `RotatingFile` holding one descriptor with `max_backups = 0` and two with a positive one, a record over `max_size` rotating a file that holds a single byte on both write paths, a `Sink` line of exactly `direct_line_max` bytes written whole (one write, not streamed), and `RotatingFile` slices before a huge splat saturating the byte count.
 
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the JSON string escaper and its UTF-8 classifier (`writeJsonString`, `utf8Step`) moved to the new `jsontext` module; `writeJsonString` is now a call to `jsontext.writeString(w, s, .{})` and the output bytes are identical. The two `utf8Step` tests moved with it; ReleaseFast bench (`ACCESSLOG_BENCH=1`) ASCII row 271.4 → 273.9 ns. New dependency: `jsontext`.
