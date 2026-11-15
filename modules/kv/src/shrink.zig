@@ -304,6 +304,11 @@ fn cloneTrace(gpa: Allocator, seed: u64, cfg: vopr.Config, epochs: []const vopr.
         for (src_ep.ops, ops) |so, *dop| {
             dop.* = switch (so) {
                 .put => |p| .{ .put = .{ .key = p.key, .val = try a.dupe(u8, p.val) } },
+                .batch => |bo| blk: {
+                    const recs = try a.alloc(vopr.BatchOpRec, bo.ops.len);
+                    for (bo.ops, recs) |src, *d| d.* = .{ .key = src.key, .val = if (src.val) |x| try a.dupe(u8, x) else null };
+                    break :blk .{ .batch = .{ .ops = recs } };
+                },
                 else => so,
             };
         }

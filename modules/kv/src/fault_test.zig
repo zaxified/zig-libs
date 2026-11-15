@@ -49,6 +49,15 @@ const Step = union(enum) {
     merge_newer,
     /// `Db.merge` of every sealed file.
     merge_sealed,
+    /// One atomic batch (`Db.batch`): every operation, or none.
+    batch: []const BatchOp,
+};
+
+/// One operation of a `Step.batch`.
+const BatchOp = union(enum) {
+    put: struct { k: []const u8, v: []const u8 },
+    del: []const u8,
+    put_exp: struct { k: []const u8, v: []const u8, at: i64 },
 };
 
 /// The sweep's wall clock never moves: an expiry is either past or future
@@ -123,6 +132,15 @@ const Model = struct {
             else {
                 _ = m.map.swapRemove(p.k);
             },
+            .batch => |ops| for (ops) |o| switch (o) {
+                .put => |p| try m.map.put(gpa, p.k, p.v),
+                .del => |k| _ = m.map.swapRemove(k),
+                .put_exp => |p| if (p.at > test_now)
+                    try m.map.put(gpa, p.k, p.v)
+                else {
+                    _ = m.map.swapRemove(p.k);
+                },
+            },
         };
     }
 };
@@ -163,6 +181,7 @@ fn runStepsWith(sim: *SimStorage, steps: []const Step, options: kv.Options) RunO
             .sync => db.sync(),
             .merge_newer => mergeSealed(&db, 1),
             .merge_sealed => mergeSealed(&db, 0),
+            .batch => |ops| commitOps(&db, ops),
         };
         result catch |e| switch (e) {
             error.Crashed => return .{ .completed = i, .crashed = true },
@@ -170,6 +189,18 @@ fn runStepsWith(sim: *SimStorage, steps: []const Step, options: kv.Options) RunO
         };
     }
     return .{ .completed = steps.len, .crashed = false };
+}
+
+/// Commit `ops` as one batch.
+fn commitOps(db: *Db, ops: []const BatchOp) anyerror!void {
+    var b = db.batch();
+    defer b.deinit();
+    for (ops) |o| switch (o) {
+        .put => |p| try b.put(p.k, p.v),
+        .del => |k| try b.delete(k),
+        .put_exp => |p| try b.putExpiring(p.k, p.v, p.at),
+    };
+    return b.commit();
 }
 
 /// Merge the sealed files of `db` after skipping the `skip` oldest.
@@ -218,11 +249,14 @@ fn verifyStepsWith(sim: *SimStorage, steps: []const Step, outcome: RunOutcome, o
     defer before.deinit(testing.allocator);
     try before.apply(testing.allocator, steps[0..outcome.completed]);
     var ok = try matchesModel(&db, &before);
+    const in_flight_batch = outcome.crashed and outcome.completed < steps.len and steps[outcome.completed] == .batch;
+    if (ok and in_flight_batch) batch_seen.dropped += 1;
     if (!ok and outcome.crashed and outcome.completed < steps.len) {
         var after: Model = .{};
         defer after.deinit(testing.allocator);
         try after.apply(testing.allocator, steps[0 .. outcome.completed + 1]);
         ok = try matchesModel(&db, &after);
+        if (ok and in_flight_batch) batch_seen.survived += 1;
     }
     try testing.expect(ok);
 
@@ -232,6 +266,12 @@ fn verifyStepsWith(sim: *SimStorage, steps: []const Step, outcome: RunOutcome, o
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("alive", got);
 }
+
+/// Teeth for the batch sweeps: how crashes inside a `Step.batch` ended —
+/// the recovered state is the whole batch or none of it (`matchesModel` is
+/// exact, so a half batch fails the sweep); a sweep where only one of the
+/// two ever happened would prove nothing about atomicity.
+var batch_seen: struct { survived: usize = 0, dropped: usize = 0 } = .{};
 
 // ── the sweep ────────────────────────────────────────────────────────────────
 
@@ -391,14 +431,18 @@ test "fault-injection sweep: SyncPolicy.none over rotations — a sealed file is
 }
 
 fn sweepNoSync(options: kv.Options) !void {
+    return sweepNoSyncSteps(&nosync_script, options);
+}
+
+fn sweepNoSyncSteps(steps: []const Step, options: kv.Options) !void {
     var total: usize = 0;
     {
         var sim = SimStorage.init(testing.allocator);
         defer sim.deinit();
-        const out = runStepsWith(&sim, &nosync_script, options);
+        const out = runStepsWith(&sim, steps, options);
         try testing.expect(!out.crashed);
         total = sim.ops_seen;
-        try testing.expectEqual(nosync_script.len, try verifyPrefix(&sim, &nosync_script, out, options));
+        try testing.expectEqual(steps.len, try verifyPrefix(&sim, steps, out, options));
     }
     try testing.expect(total >= 30);
 
@@ -417,12 +461,12 @@ fn sweepNoSync(options: kv.Options) !void {
                 sim.crash_mode = mode;
                 sim.reorder_seed = seed;
                 sim.ops_until_crash = point;
-                const out = runStepsWith(&sim, &nosync_script, options);
+                const out = runStepsWith(&sim, steps, options);
                 // The last point is `close`'s best-effort sync: it crashes
                 // after every step has returned.
                 try testing.expect(out.crashed or sim.crashed);
                 holes += sim.holes_punched;
-                const got = verifyPrefix(&sim, &nosync_script, out, options) catch |e| {
+                const got = verifyPrefix(&sim, steps, out, options) catch |e| {
                     std.debug.print(
                         "no-sync sweep FAILED: mode={t} seed={d} crash_point={d}/{d} completed_steps={d}\n",
                         .{ mode, seed, point, total, out.completed },
@@ -571,6 +615,143 @@ test "fault-injection sweep: non-contiguous (reordered) unsynced persistence" {
     // Teeth: the reorder collapse must have punched genuine non-contiguous
     // holes in the compact windows (else this mode tested nothing new).
     try testing.expect(holes > 0);
+}
+
+/// Atomic batches: a plain store takes its first batch (a new version-4 file,
+/// the migration to a manifest), then batches with overwrites, deletes of keys
+/// put in the same batch, expiring ops and a large value, between plain
+/// writes and compactions. A crash anywhere, mid-envelope included, must
+/// leave each batch whole or absent.
+const batch_script = [_]Step{
+    .{ .put = .{ .k = "alpha", .v = "1" } },
+    .{ .put = .{ .k = "beta", .v = "two" } },
+    .{ .batch = &.{
+        .{ .put = .{ .k = "gamma", .v = "3" } },
+        .{ .del = "beta" },
+        .{ .put = .{ .k = "alpha", .v = "1-batched" } },
+        .{ .put_exp = .{ .k = "sess", .v = "live", .at = test_now + 60_000 } },
+    } },
+    .{ .put = .{ .k = "delta", .v = "4" } },
+    .{
+        .batch = &.{
+            .{ .put = .{ .k = "gamma", .v = "3b" } },
+            .{ .put = .{ .k = "eps", .v = big_value } },
+            .{ .del = "gamma" }, // put, then delete, in one batch
+            .{ .del = "absent" }, // a tombstone for nothing
+            .{ .put_exp = .{ .k = "gone", .v = "stale", .at = test_now - 1 } },
+        },
+    },
+    .{ .batch = &.{.{ .put = .{ .k = "beta", .v = "back" } }} },
+    .compact,
+    .{ .batch = &.{
+        .{ .del = "alpha" },
+        .{ .put = .{ .k = "zeta", .v = "z" } },
+        .{ .put = .{ .k = "", .v = "empty-key" } },
+    } },
+    .{ .put = .{ .k = "eta", .v = "7" } },
+};
+
+fn expectBatchTeeth() !void {
+    try testing.expect(batch_seen.survived > 0);
+    try testing.expect(batch_seen.dropped > 0);
+}
+
+test "fault-injection sweep: atomic batches — first batch, torn envelopes, every point and mode" {
+    batch_seen = .{};
+    {
+        // Teeth: the uncrashed run really holds version-4 data and a manifest.
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        const out = runStepsWith(&sim, &batch_script, test_options);
+        try testing.expect(!out.crashed);
+        const m = sim.fileContent(db_name).?;
+        try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, m[4..8], .little));
+        // The compaction rewrote the store; its last output is version 2 and
+        // the batch after it started a version-4 file again.
+        var found4 = false;
+        for ([_][]const u8{ db_name ++ ".1.data", db_name ++ ".2.data", db_name ++ ".3.data", db_name ++ ".4.data" }) |n| {
+            if (sim.fileContent(n)) |f| {
+                if (std.mem.readInt(u32, f[4..8], .little) == 4) found4 = true;
+            }
+        }
+        try testing.expect(found4);
+    }
+    try testing.expect(try sweepAll(&batch_script, test_options, "batch") > 0);
+    try expectBatchTeeth();
+}
+
+test "fault-injection sweep: atomic batches over rotations and merges" {
+    batch_seen = .{};
+    try testing.expect(try sweepAll(&batch_script, multi_options, "batch multi-file") > 0);
+    try expectBatchTeeth();
+}
+
+const batch_merge_script = [_]Step{
+    .{ .batch = &.{
+        .{ .put = .{ .k = "a", .v = "1" } },
+        .{ .put = .{ .k = "b", .v = "2" } },
+    } },
+    .{ .batch = &.{
+        .{ .put = .{ .k = "a", .v = "1b" } },
+        .{ .del = "b" },
+        .{ .put = .{ .k = "c", .v = "3" } },
+    } },
+    .{ .put = .{ .k = "d", .v = "4" } },
+    .merge_newer,
+    .{ .batch = &.{
+        .{ .put = .{ .k = "b", .v = "2b" } },
+        .{ .put_exp = .{ .k = "c", .v = "dies", .at = test_now - 1 } },
+    } },
+    .merge_sealed,
+    .{ .batch = &.{.{ .put = .{ .k = "e", .v = "5" } }} },
+};
+
+test "fault-injection sweep: merges of files that hold batches" {
+    batch_seen = .{};
+    _ = try sweepAll(&batch_merge_script, multi_options, "batch merge");
+    try expectBatchTeeth();
+}
+
+test "fault-injection sweep: SyncPolicy.none — a batch is one step of the prefix" {
+    batch_seen = .{};
+    const steps = [_]Step{
+        .{ .put = .{ .k = "alpha", .v = "1" } },
+        .{ .batch = &.{ .{ .put = .{ .k = "beta", .v = "two" } }, .{ .put = .{ .k = "gamma", .v = big_value } } } },
+        .sync,
+        .{ .batch = &.{ .{ .del = "beta" }, .{ .put = .{ .k = "alpha", .v = "1b" } }, .{ .put = .{ .k = "eps", .v = "5" } } } },
+        .{ .put = .{ .k = "zeta", .v = "z" } },
+        .{ .batch = &.{ .{ .put = .{ .k = "beta", .v = "back" } }, .{ .del = "gamma" } } },
+        .compact,
+        .{ .batch = &.{ .{ .put = .{ .k = "theta", .v = "8" } }, .{ .put = .{ .k = "iota", .v = "9" } } } },
+    };
+    try sweepNoSyncSteps(&steps, .{ .clock = test_clock, .sync = .none });
+    try sweepNoSyncSteps(&steps, .{ .clock = test_clock, .sync = .none, .max_file_size = 64 });
+}
+
+test "fault sweep: a half-applied batch is not a legal recovery (the checker has teeth)" {
+    // The invariant above is "exactly the model before or after the batch":
+    // build every proper prefix of a batch's operations and show that the
+    // exact comparison refuses each as the state after the batch.
+    const ops = [_]BatchOp{
+        .{ .put = .{ .k = "g", .v = "3" } },
+        .{ .del = "b" },
+        .{ .put = .{ .k = "a", .v = "9" } },
+    };
+    const base = [_]Step{ .{ .put = .{ .k = "a", .v = "1" } }, .{ .put = .{ .k = "b", .v = "2" } } };
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), db_name, test_options);
+    defer db.close();
+    try db.put("a", "1");
+    try db.put("b", "2");
+    try commitOps(&db, &ops);
+    for (0..ops.len + 1) |k| {
+        var m: Model = .{};
+        defer m.deinit(testing.allocator);
+        try m.apply(testing.allocator, &base);
+        try m.apply(testing.allocator, &.{.{ .batch = ops[0..k] }});
+        try testing.expectEqual(k == ops.len, try matchesModel(&db, &m));
+    }
 }
 
 test "fault sweep: a contended lock blocks recovery without touching the crashed store" {

@@ -64,6 +64,14 @@ var it = try db.iterator(gpa, "user:");
 defer it.deinit();
 while (try it.next()) |p| _ = .{ p.key, p.value };   // slices valid until the next call
 
+// An atomic batch: one append, one fsync; all of it survives a crash or none of it.
+var batch = db.batch();
+defer batch.deinit();
+try batch.put("a", "1");
+try batch.putTtl("b", "2", 60_000);
+try batch.delete("c");
+try batch.commit();            // visible to readers all at once; empty again afterwards
+
 // Listing: sorted copies of the live keys under a prefix ("" = all).
 const ks = try db.keys(gpa, "user:");
 defer ks.deinit(gpa);
@@ -100,6 +108,19 @@ them as waste. Nothing expires in the background: memory and disk are freed by
 the next `compact` (or restart). A store that never writes an expiring key never
 reads the clock and keeps `count` O(1).
 
+`Db.batch()` → `Batch` (`put`, `putTtl`, `putExpiring`, `delete`, `commit`,
+`deinit`): the operations apply in the order added and are written as ONE
+record with ONE CRC by one append and one fsync, so recovery finds all of them
+or none, and readers (also a read-only opener beside the writer) never see half.
+`Options.max_batch_bytes` (default 64 MiB) bounds a batch: past it `put`/`delete`
+return `error.BatchTooLarge`. A batch is never split over two data files; one
+larger than `max_file_size` gets a file of its own. A `delete` in a batch always
+writes its tombstone. ⚠ The first batch into a store makes it a version-4,
+multi-file store (a new data file is started, a single-file store gets its
+manifest): an older `kv` build refuses it (`error.Corrupt`: it does not know the
+data file's version) rather than truncating at op 3 — do not downgrade a store that holds batches.
+See SPEC § "Atomic batch".
+
 Options: `read_verify` (default true) re-checks the whole record CRC on every
 `get`, so even post-`open` file rot is caught — corrupt data is **never**
 served. `lock` (default `.exclusive`) takes the cross-process lock described
@@ -114,9 +135,11 @@ single file into a manifest + data files, and `compact` then merges files.
 ## On-disk format (little-endian)
 
 ```
-header:  "ZKVL" | version:u32            (8 bytes; 1, or 2 once a key has expired-capable records)
-record:  crc32:u32 | op:u8 (0=put 1=del 2=put-with-expiry) | key_len:u32 | val_len:u32
+header:  "ZKVL" | version:u32            (8 bytes; 1, 2 once a key has expired-capable records, 4 once a batch was written)
+record:  crc32:u32 | op:u8 (0=put 1=del 2=put-with-expiry 3=batch) | key_len:u32 | val_len:u32
          | [expires_at:i64, op 2 only] | key | value
+batch (op 3, version-4 files only): key_len = 0, the value is a run of ordinary records (ops 0-2),
+         the CRC covers all of it — recovery applies the records only if it holds
 ```
 
 A multi-file store (after its first rotation, see `max_file_size`) keeps a
@@ -281,8 +304,8 @@ extras sit on top of it:
 ## Noted phases (deliberately not in v0)
 
 Full randomized VOPR at scale; immutable/MVCC on-disk structure
-(HAMT/B-tree) with lockless readers; ordered/ranged scans; transactions and
-batches; secondary indexes; automatic compaction thresholds; in-memory value
+(HAMT/B-tree) with lockless readers; ordered/ranged scans; transactions
+(atomic batches exist, see above); secondary indexes; automatic compaction thresholds; in-memory value
 cache (compose with `ramcache`); shared/reader locks (the store is
 single-writer, so the cross-process lock is exclusive-only). The v0 keydir
 is an unordered hash map.

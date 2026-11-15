@@ -34,6 +34,16 @@ pub fn main() !void {
     try db.put("session:carol", "role=viewer");
     try db.delete("session:carol"); // Carol logged out.
 
+    // An atomic batch: both changes become durable with one fsync and — after
+    // a crash — either both exist or neither does.
+    var batch = db.batch();
+    defer batch.deinit();
+    try batch.put("session:dave", "role=editor");
+    try batch.putTtl("session:erin", "role=guest", 15 * 60 * 1000);
+    try batch.delete("session:bob");
+    try batch.put("session:bob", "role=viewer"); // the last word on a key wins
+    try batch.commit();
+
     // Caller-owned copy: the module hands back memory the caller must free.
     const role = (try db.get(gpa, "session:alice")) orelse return error.MissingKey;
     defer gpa.free(role);
