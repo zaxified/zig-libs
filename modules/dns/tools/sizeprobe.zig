@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Size probe for the `small` lane (CONVENTIONS §4.2): a minimal consumer of
-//! the resolver — one PTR lookup, the shape of zpinger's trace hop names (the
+//! the resolver — one PTR lookup, the shape of the network-monitor consumer's trace hop names (the
 //! request that added `dns-doh`). Built at ReleaseSmall under
 //! `-Dprofile=default` and `-Dprofile=small` by `scripts/checks/small-sizes.sh`;
 //! the size difference is held to its floor in

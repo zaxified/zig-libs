@@ -23,7 +23,7 @@
 //!               rdata names compressed.
 //!   dec_big     a ~4 KB answer: 20 answers (4 MX, 8 TXT of 2 x 220 bytes,
 //!               4 SRV, 4 NS), 8 glue A + OPT, heavy compression.
-//!   dec_ptr     a PTR answer (reverse name, one record), the zpinger trace path.
+//!   dec_ptr     a PTR answer (reverse name, one record), the network-monitor consumer trace path.
 //!   names_deep  names of up to 127 labels reached through 8-10 chained
 //!               compression pointers (Go refuses more than 10 jumps).
 //! The dec_* ops decode each message completely. Ours `decode` (all strings
