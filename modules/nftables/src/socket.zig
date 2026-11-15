@@ -2013,3 +2013,407 @@ test "set-element GET: every NEWSETELEM of a multi-key request is kept, the ACK 
     try testing.expect(!partial.done);
     try testing.expectEqual(@as(usize, 2), items2.items.len);
 }
+
+// ── strict mutation re-audit (2026-11-15) ───────────────────────────────────
+
+test "EventIterator: a framing error is returned once and abandons the rest of the datagram" {
+    // A header claiming 200 bytes in a 16-byte buffer.
+    var buf: [16]u8 = @splat(0);
+    std.mem.writeInt(u32, buf[0..4], 200, builtin.cpu.arch.endian());
+    var it: EventIterator = .{ .msgs = .{ .buf = &buf } };
+    try testing.expect(std.meta.isError(it.next()));
+    try testing.expectEqual(@as(?wire.Event, null), try it.next());
+}
+
+test "appendElems copies every borrowed field out of the reply payload" {
+    var b = try wire.Batch.init(testing.allocator, 1, .{});
+    defer b.deinit();
+    const verdict_el: wire.SetElem = .{ .key = "vk", .verdict = expr.Verdict.jumpTo("target") };
+    const elems = [_]wire.SetElem{
+        .{ .key = "key-one", .key_end = "key-end", .userdata = "usr", .expr = .{ .counter = .{} } },
+        .{ .key = "key-two", .data = "dat" },
+        verdict_el,
+    };
+    try b.addSetElems(.inet, "t", "s", null, &elems);
+    const bytes = try b.finish();
+    var mi: nl.MessageIterator = .{ .buf = bytes };
+    var payload: []const u8 = &.{};
+    while (try mi.next()) |m| if (m.type == wire.nftMsg(wire.NFT_MSG.NEWSETELEM)) {
+        payload = m.payload;
+    };
+    const owned = try testing.allocator.dupe(u8, payload);
+    defer testing.allocator.free(owned);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var list: std.ArrayList(wire.SetElemInfo) = .empty;
+    try appendElems(arena.allocator(), &list, owned);
+    @memset(owned, 0xAA); // whatever still borrows from the payload now reads 0xAA
+    try testing.expectEqual(@as(usize, 3), list.items.len);
+    try testing.expectEqualStrings("key-one", list.items[0].key);
+    try testing.expectEqualStrings("key-end", list.items[0].key_end.?);
+    try testing.expectEqualStrings("usr", list.items[0].userdata);
+    try testing.expectEqualStrings("counter", list.items[0].expr.?.name);
+    try testing.expectEqualStrings("key-two", list.items[1].key);
+    try testing.expectEqualStrings("dat", list.items[1].data.?);
+    try testing.expectEqualStrings("vk", list.items[2].key);
+    try testing.expectEqualStrings("target", list.items[2].verdict.?.chain.?);
+}
+
+test "recordFailure attributes by the reply's seq, falls back to the echoed request seq, names BATCH_BEGIN" {
+    var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer sock.close();
+    var b = try wire.Batch.init(testing.allocator, 10, .{});
+    defer b.deinit();
+    try b.addTable(.{ .family = .inet, .name = "a" });
+    try b.addTable(.{ .family = .inet, .name = "b" });
+    _ = try b.finish();
+
+    const mk = struct {
+        fn payload(buf: *[4 + nl.header_len]u8, echoed: u32) []const u8 {
+            @memset(buf, 0);
+            std.mem.writeInt(i32, buf[0..4], -2, builtin.cpu.arch.endian());
+            std.mem.writeInt(u32, buf[4 + 8 ..][0..4], echoed, builtin.cpu.arch.endian());
+            return buf;
+        }
+    };
+    var pl: [4 + nl.header_len]u8 = undefined;
+
+    // reply seq wins when non-zero, even though the echoed one names command 0
+    var m: nl.Message = .{ .type = nl.NLMSG_ERROR, .flags = 0, .seq = 12, .pid = 0, .payload = mk.payload(&pl, 11) };
+    sock.recordFailure(&b, m, -2);
+    try testing.expectEqual(@as(u32, 12), sock.lastFailure().?.seq);
+    try testing.expectEqual(@as(?usize, 1), sock.lastFailure().?.index);
+
+    // seq 0: the echoed request header decides
+    m.seq = 0;
+    m.payload = mk.payload(&pl, 11);
+    sock.recordFailure(&b, m, -2);
+    try testing.expectEqual(@as(u32, 11), sock.lastFailure().?.seq);
+    try testing.expectEqual(@as(?usize, 0), sock.lastFailure().?.index);
+
+    // a seq of no command: BATCH_BEGIN when it is the first seq, "?" otherwise
+    m.seq = 10;
+    sock.recordFailure(&b, m, -2);
+    try testing.expectEqualStrings("BATCH_BEGIN", sock.lastFailure().?.command);
+    m.seq = 99;
+    sock.recordFailure(&b, m, -2);
+    try testing.expectEqualStrings("?", sock.lastFailure().?.command);
+}
+
+test "acked: a seq-0 error echoing OUR request is attributed to us (sweep strict audit)" {
+    var b = try oneCommandBatch(true);
+    defer b.deinit();
+    const ours = cannedErrorEmbedded(-22, 0, 7, 101);
+    var t: Scripted = .{ .script = &.{&ours}, .pid = 7, .next = 100 };
+    try testing.expectError(error.InvalidRequest, awaitBatchOver(&t, &b, 50));
+    try testing.expectEqual(@as(i32, -22), t.failed_code);
+}
+
+test "un-acked: an own zero ACK is not a verdict; a later error in the same datagram still fails the batch" {
+    var b = try oneCommandBatch(false);
+    defer b.deinit();
+    const ack0 = cannedError(0, 101, 7);
+    const real = cannedError(-22, 101, 7);
+    var both: [ack0.len + real.len]u8 = undefined;
+    @memcpy(both[0..ack0.len], &ack0);
+    @memcpy(both[ack0.len..], &real);
+    var t: Scripted = .{ .script = &.{&both}, .pid = 7, .next = 100 };
+    try testing.expectError(error.InvalidRequest, awaitBatchOver(&t, &b, 50));
+}
+
+fn primeState(sock: *Socket) void {
+    sock.failure = .{ .stage = .message, .seq = 1, .index = 0, .command = "X", .code = -1, .message = "m" };
+    @memcpy(sock.nl.ext_ack_buf[0..3], "xyz");
+    sock.nl.ext_ack_len = 3;
+}
+
+fn expectFailureClear(sock: *const Socket) !void {
+    try testing.expect(sock.lastFailure() == null);
+}
+
+fn expectStateClear(sock: *const Socket) !void {
+    try expectFailureClear(sock);
+    try testing.expectEqual(@as(usize, 0), sock.lastErrorMessage().len);
+}
+
+fn skipIfRefused(sock: *Socket, what: []const u8, res: anytype) !void {
+    res catch |err| switch (err) {
+        error.KernelRejected, error.AccessDenied, error.NotSupported, error.WouldBlock => {
+            skipUnprivileged(sock, what, err);
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+}
+
+fn findTable(tl: anytype, name: []const u8) ?wire.TableInfo {
+    for (tl.items) |t| if (std.mem.eql(u8, t.name, name)) return t;
+    return null;
+}
+
+test "live: dump results own their strings; reads reset what they claim to; every call clears the previous failure (strict audit)" {
+    var sock = try liveSocket("strict");
+    defer sock.close();
+    dropTestTable(&sock);
+    dropTable(&sock, .netdev, test_table);
+
+    // ── a netdev table with chains bound by `dev` and by `devs` ────────────
+    {
+        var b = try sock.beginBatch(.{});
+        defer b.deinit();
+        try b.addTable(.{ .family = .netdev, .name = test_table });
+        try b.addChain(.{ .family = .netdev, .table = test_table, .name = "one_dev", .chain_type = .filter, .hook = .ingress, .prio = 0, .dev = "lo" });
+        try b.addChain(.{ .family = .netdev, .table = test_table, .name = "many_dev", .chain_type = .filter, .hook = .ingress, .prio = 0, .devs = &.{"lo"} });
+        primeState(&sock);
+        try skipIfRefused(&sock, "strict", sock.commit(&b));
+        try expectStateClear(&sock); // commit starts from a clean slate…
+        // …and keeps the socket's counter past everything the batch consumed.
+        try testing.expectEqual(b.next_seq, sock.nextSeq());
+    }
+    defer dropTable(&sock, .netdev, test_table);
+
+    // ── an inet table: base + regular chain, sets, a rule, objects ─────────
+    var seeded = [_]expr.Expr{
+        .{ .counter = .{ .packets = 3, .bytes = 400 } },
+        .{ .immediate = .{ .dreg = .verdict, .data = .{ .verdict = .{ .code = 1 } } } },
+    };
+    {
+        var b = try sock.beginBatch(.{});
+        defer b.deinit();
+        try b.addTable(.{ .family = .inet, .name = test_table });
+        try b.addChain(.{ .family = .inet, .table = test_table, .name = "input", .chain_type = .filter, .hook = .input, .prio = 0, .policy = .accept });
+        try b.addChain(.{ .family = .inet, .table = test_table, .name = "plain" });
+        try b.addSet(.{ .family = .inet, .table = test_table, .name = "blocked", .key_type = .ipv4_addr, .id = 1 });
+        try b.addSetElems(.inet, test_table, "blocked", 1, &.{
+            .{ .key = &.{ 198, 51, 100, 7 }, .userdata = "ud" },
+            .{ .key = &.{ 198, 51, 100, 8 } },
+        });
+        try b.addSet(.{ .family = .inet, .table = test_table, .name = "mapped", .key_type = .ipv4_addr, .id = 2, .data = .{ .value = .ipv4_addr } });
+        try b.addSetElems(.inet, test_table, "mapped", 2, &.{
+            .{ .key = &.{ 10, 0, 0, 1 }, .data = &.{ 192, 0, 2, 1 } },
+        });
+        try b.addRule(.{ .family = .inet, .table = test_table, .chain = "input", .exprs = &seeded });
+        try b.addObject(.{ .family = .inet, .table = test_table, .name = "cnt1", .obj = .{ .counter = .{ .packets = 5, .bytes = 100 } } });
+        try skipIfRefused(&sock, "strict", sock.commit(&b));
+    }
+    defer dropTestTable(&sock);
+
+    // ── tables, chains, sets, objects, rules: strings survive a scribbled buffer
+    primeState(&sock);
+    var tl = try sock.listTables(null);
+    defer tl.deinit();
+    try expectFailureClear(&sock);
+    @memset(sock.nl.buf, 0xAA);
+    try testing.expect(findTable(tl, test_table) != null);
+
+    var cl = try sock.listChains(.netdev);
+    defer cl.deinit();
+    @memset(sock.nl.buf, 0xAA);
+    var saw_one = false;
+    var saw_many = false;
+    for (cl.items) |c| {
+        if (!std.mem.eql(u8, c.table, test_table)) continue;
+        try testing.expectEqualStrings("filter", c.chain_type.?);
+        if (std.mem.eql(u8, c.name, "one_dev")) {
+            try testing.expectEqualStrings("lo", c.dev.?);
+            saw_one = true;
+        } else {
+            try testing.expectEqualStrings("many_dev", c.name);
+            var di = c.devices();
+            try testing.expectEqualStrings("lo", (try di.next()).?);
+            saw_many = true;
+        }
+    }
+    try testing.expect(saw_one and saw_many);
+
+    var cl2 = try sock.listChains(.inet);
+    defer cl2.deinit();
+    @memset(sock.nl.buf, 0xAA);
+    var saw_plain = false;
+    for (cl2.items) |c| {
+        if (!std.mem.eql(u8, c.table, test_table)) continue;
+        if (std.mem.eql(u8, c.name, "plain")) {
+            try testing.expect(c.chain_type == null);
+            saw_plain = true;
+        } else {
+            try testing.expectEqualStrings("input", c.name);
+            try testing.expectEqualStrings("filter", c.chain_type.?);
+        }
+    }
+    try testing.expect(saw_plain);
+
+    primeState(&sock);
+    var sl = try sock.listSets(.inet);
+    defer sl.deinit();
+    try expectFailureClear(&sock);
+    @memset(sock.nl.buf, 0xAA);
+    var nsets: usize = 0;
+    for (sl.items) |s| {
+        if (!std.mem.eql(u8, s.table, test_table)) continue;
+        try testing.expect(std.mem.eql(u8, s.name, "blocked") or std.mem.eql(u8, s.name, "mapped"));
+        nsets += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), nsets);
+
+    var el = try sock.listSetElems(.inet, test_table, "blocked");
+    defer el.deinit();
+    @memset(sock.nl.buf, 0xAA);
+    try testing.expectEqual(@as(usize, 2), el.items.len);
+    var saw_ud = false;
+    for (el.items) |e| {
+        try testing.expectEqual(@as(usize, 4), e.key.len);
+        try testing.expectEqual(@as(u8, 198), e.key[0]);
+        if (std.mem.eql(u8, e.userdata, "ud")) saw_ud = true;
+    }
+    try testing.expect(saw_ud);
+    var ml = try sock.listSetElems(.inet, test_table, "mapped");
+    defer ml.deinit();
+    @memset(sock.nl.buf, 0xAA);
+    try testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, ml.items[0].data.?);
+
+    var ol = try sock.listObjects(.inet);
+    defer ol.deinit();
+    @memset(sock.nl.buf, 0xAA);
+    var obj_handle_ok = false;
+    for (ol.items) |o| {
+        if (!std.mem.eql(u8, o.table, test_table)) continue;
+        try testing.expectEqualStrings("cnt1", o.name);
+        const st = (try o.state()).?;
+        try testing.expectEqual(@as(u64, 5), st.counter.packets);
+        obj_handle_ok = true;
+    }
+    try testing.expect(obj_handle_ok);
+
+    var rl = try sock.listRules(.inet, test_table, "input");
+    defer rl.deinit();
+    @memset(sock.nl.buf, 0xAA);
+    try testing.expectEqual(@as(usize, 1), rl.items.len);
+    try testing.expectEqualStrings(test_table, rl.items[0].table);
+    try testing.expectEqualStrings("input", rl.items[0].chain);
+    var rit = rl.items[0].exprIterator();
+    const first = (try rit.next()).?;
+    try testing.expectEqualStrings("counter", first.name);
+    try testing.expectEqual(@as(u64, 3), (try expr.decodeCounter(first.data)).?.packets);
+    const handle = rl.items[0].handle;
+    // a plain list does not zero counters: reading twice gives the same value
+    var rl_again = try sock.listRules(.inet, test_table, "input");
+    defer rl_again.deinit();
+    var rit_again = rl_again.items[0].exprIterator();
+    try testing.expectEqual(@as(u64, 3), (try expr.decodeCounter((try rit_again.next()).?.data)).?.packets);
+
+    // ── single-reply getters ───────────────────────────────────────────────
+    primeState(&sock);
+    const gen = try sock.getGenId();
+    try expectStateClear(&sock);
+    try testing.expect(gen != 0);
+
+    primeState(&sock);
+    var one = try sock.getRule(.inet, test_table, "input", handle);
+    defer one.deinit();
+    try expectStateClear(&sock);
+    @memset(sock.nl.buf, 0xAA);
+    try testing.expectEqual(@as(usize, 1), one.items.len);
+    try testing.expectEqualStrings(test_table, one.items[0].table);
+    try testing.expectEqualStrings("input", one.items[0].chain);
+    try testing.expectEqual(handle, one.items[0].handle);
+    var oit = one.items[0].exprIterator();
+    try testing.expectEqualStrings("counter", (try oit.next()).?.name);
+    try testing.expectError(error.NotFound, sock.getRule(.inet, test_table, "input", handle + 1000));
+
+    primeState(&sock);
+    var ge = try sock.getSetElems(.inet, test_table, "blocked", &.{&.{ 198, 51, 100, 7 }});
+    defer ge.deinit();
+    try expectStateClear(&sock);
+    @memset(sock.nl.buf, 0xAA);
+    try testing.expectEqual(@as(usize, 1), ge.items.len);
+    try testing.expectEqualStrings("ud", ge.items[0].userdata);
+    try testing.expectError(error.NotFound, sock.getSetElems(.inet, test_table, "blocked", &.{&.{ 1, 2, 3, 4 }}));
+
+    // an allocation failure inside the reply scan is OutOfMemory, never a "malformed reply"
+    {
+        var fa = testing.FailingAllocator.init(testing.allocator, .{});
+        var fs = try Socket.open(fa.allocator());
+        defer fs.close();
+        fs.setRecvTimeout(5000) catch {};
+        for (0..16) |n| {
+            fa.fail_index = fa.alloc_index + n;
+            if (fs.getSetElems(.inet, test_table, "blocked", &.{&.{ 198, 51, 100, 7 }})) |r| {
+                var rr = r;
+                rr.deinit();
+            } else |e| try testing.expect(e == error.OutOfMemory);
+            fa.fail_index = std.math.maxInt(usize);
+        }
+    }
+
+    // ── a failed batch, then every other entry point starts clean ──────────
+    {
+        var bad = try sock.beginBatch(.{ .gen_id = gen +% 1000 });
+        defer bad.deinit();
+        try bad.addTable(.{ .family = .inet, .name = "zig_nftables_live_never" });
+        try testing.expect(std.meta.isError(sock.commit(&bad)));
+        try testing.expectEqualStrings("BATCH_BEGIN", sock.lastFailure().?.command);
+    }
+    primeState(&sock);
+    var t2 = try sock.listTables(.inet);
+    t2.deinit();
+    try expectFailureClear(&sock);
+
+    // ── counters zeroed as they are read ───────────────────────────────────
+    var rr = try sock.resetRules(.inet, test_table, "input");
+    rr.deinit();
+    var rl2 = try sock.listRules(.inet, test_table, "input");
+    defer rl2.deinit();
+    var rit2 = rl2.items[0].exprIterator();
+    try testing.expectEqual(@as(u64, 0), (try expr.decodeCounter((try rit2.next()).?.data)).?.packets);
+
+    var ro = try sock.resetObjects(.inet);
+    ro.deinit();
+    var ol2 = try sock.listObjects(.inet);
+    defer ol2.deinit();
+    for (ol2.items) |o| if (std.mem.eql(u8, o.table, test_table)) {
+        try testing.expectEqual(@as(u64, 0), (try o.state()).?.counter.packets);
+    };
+
+    // ── a set whose elements carry counters, when this kernel will take one ─
+    var sb = try sock.beginBatch(.{});
+    defer sb.deinit();
+    try sb.addSet(.{ .family = .inet, .table = test_table, .name = "cset", .key_type = .ipv4_addr, .id = 9, .raw_flags = wire.NFT_SET_F.EXPR, .expr = .{ .counter = .{} } });
+    try sb.addSetElems(.inet, test_table, "cset", 9, &.{.{ .key = &.{ 10, 9, 9, 9 }, .expr = .{ .counter = .{ .packets = 3, .bytes = 4 } } }});
+    if (sock.commit(&sb)) {
+        const elemCounter = struct {
+            fn of(l: anytype) !u64 {
+                return (try expr.decodeCounter(l.items[0].expr.?.data)).?.packets;
+            }
+        }.of;
+        var c1 = try sock.listSetElems(.inet, test_table, "cset");
+        defer c1.deinit();
+        var c2 = try sock.listSetElems(.inet, test_table, "cset");
+        defer c2.deinit();
+        try testing.expectEqual(@as(u64, 3), try elemCounter(c2)); // a plain list does not reset
+        var c3 = try sock.resetSetElems(.inet, test_table, "cset");
+        defer c3.deinit();
+        var c4 = try sock.listSetElems(.inet, test_table, "cset");
+        defer c4.deinit();
+        try testing.expectEqual(@as(u64, 0), try elemCounter(c4));
+    } else |_| {}
+
+    // ── a flowtable, when this kernel will take one ────────────────────────
+    var fb = try sock.beginBatch(.{});
+    defer fb.deinit();
+    try fb.addFlowtable(.{ .family = .inet, .table = test_table, .name = "ft", .devs = &.{"lo"} });
+    if (sock.commit(&fb)) {
+        var fl = try sock.listFlowtables(.inet);
+        defer fl.deinit();
+        @memset(sock.nl.buf, 0xAA);
+        var saw = false;
+        for (fl.items) |f| {
+            if (!std.mem.eql(u8, f.table, test_table)) continue;
+            try testing.expectEqualStrings("ft", f.name);
+            var di = f.devices();
+            try testing.expectEqualStrings("lo", (try di.next()).?);
+            saw = true;
+        }
+        try testing.expect(saw);
+    } else |_| {}
+}

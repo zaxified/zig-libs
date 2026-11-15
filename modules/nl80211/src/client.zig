@@ -1691,3 +1691,166 @@ test "a flagged ACK ends an interrupted walk with DumpInterrupted; an unflagged 
 test "the per-dump item ceiling keeps its magnitude (sweep audit GX-NL3)" {
     try testing.expectEqual(@as(u32, 65536), max_dump_items);
 }
+
+// ── strict mutation re-audit (2026-11-15) ───────────────────────────────────
+
+/// One datagram holding one message of `msg_type` with a 4-byte payload.
+fn msgDatagram(gpa: std.mem.Allocator, msg_type: u16, pid: u32, seq: u32, code: i32) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, msg_type, 0, seq, pid);
+    var p: [4]u8 = undefined;
+    std.mem.writeInt(i32, &p, code, @import("builtin").cpu.arch.endian());
+    try list.appendSlice(gpa, &p);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+test "awaitAckStep: only an NLMSG_ERROR of our pid and seq decides; its errno maps, 0 is the ACK" {
+    const pid: u32 = 100;
+    const seq: u32 = 5;
+    const fam: u16 = 41;
+    const wrong_pid = try msgDatagram(testing.allocator, codec.NLMSG_ERROR, pid + 1, seq, -1);
+    defer testing.allocator.free(wrong_pid);
+    const wrong_seq = try msgDatagram(testing.allocator, codec.NLMSG_ERROR, pid, seq + 1, -1);
+    defer testing.allocator.free(wrong_seq);
+    const not_error = try msgDatagram(testing.allocator, fam, pid, seq, -1);
+    defer testing.allocator.free(not_error);
+    const ack = try msgDatagram(testing.allocator, codec.NLMSG_ERROR, pid, seq, 0);
+    defer testing.allocator.free(ack);
+    const denied = try msgDatagram(testing.allocator, codec.NLMSG_ERROR, pid, seq, -1);
+    defer testing.allocator.free(denied);
+
+    var cl: MockScript = .{ .sock = .{ .portid = pid, .script = &.{ wrong_pid, wrong_seq, not_error, ack } }, .family_id = fam };
+    try awaitAckStep(&cl, seq);
+    var cl2: MockScript = .{ .sock = .{ .portid = pid, .script = &.{denied} }, .family_id = fam };
+    try testing.expectError(error.AccessDenied, awaitAckStep(&cl2, seq));
+}
+
+test "awaitAckStep: the datagram budget is exactly max_dump_messages, counted per datagram" {
+    const pid: u32 = 100;
+    const seq: u32 = 5;
+    const fam: u16 = 41;
+    const foreign = try nonTerminatingDatagram(testing.allocator, pid + 1, seq + 1, fam);
+    defer testing.allocator.free(foreign);
+    const ack = try msgDatagram(testing.allocator, codec.NLMSG_ERROR, pid, seq, 0);
+    defer testing.allocator.free(ack);
+    const script = try testing.allocator.alloc([]const u8, max_dump_messages + 1);
+    defer testing.allocator.free(script);
+    @memset(script, foreign);
+    // the ACK is the datagram after the budget: refused
+    script[max_dump_messages] = ack;
+    var cl: MockScript = .{ .sock = .{ .portid = pid, .script = script }, .family_id = fam };
+    try testing.expectError(error.TooManyMessages, awaitAckStep(&cl, seq));
+    // …one earlier it is the last datagram read: accepted
+    script[max_dump_messages - 1] = ack;
+    var cl2: MockScript = .{ .sock = .{ .portid = pid, .script = script }, .family_id = fam };
+    try awaitAckStep(&cl2, seq);
+}
+
+test "awaitAckStep: the byte budget is inclusive of exactly max_dump_bytes" {
+    const pid: u32 = 100;
+    const seq: u32 = 5;
+    const fam: u16 = 41;
+    const ack = try msgDatagram(testing.allocator, codec.NLMSG_ERROR, pid, seq, 0);
+    defer testing.allocator.free(ack);
+    // one foreign message sized so that it plus the ACK is exactly the budget
+    const big_len: usize = max_dump_bytes - ack.len;
+    const big = try testing.allocator.alloc(u8, big_len);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    const E = @import("builtin").cpu.arch.endian();
+    std.mem.writeInt(u32, big[0..4], @intCast(big_len), E);
+    std.mem.writeInt(u16, big[4..6], fam +% 1, E);
+    std.mem.writeInt(u32, big[8..12], seq + 1, E);
+    std.mem.writeInt(u32, big[12..16], pid + 1, E);
+    var cl: MockScript = .{ .sock = .{ .portid = pid, .script = &.{ big, ack } }, .family_id = fam };
+    try awaitAckStep(&cl, seq);
+    // one byte more is over
+    var cl2: MockScript = .{ .sock = .{ .portid = pid, .script = &.{ big, ack, ack } }, .family_id = fam };
+    cl2.sock.script = &.{ big, ack };
+    const big1 = try testing.allocator.alloc(u8, big_len + 4);
+    defer testing.allocator.free(big1);
+    @memcpy(big1[0..big_len], big);
+    @memset(big1[big_len..], 0);
+    std.mem.writeInt(u32, big1[0..4], @intCast(big_len + 4), E);
+    var cl3: MockScript = .{ .sock = .{ .portid = pid, .script = &.{ big1, ack } }, .family_id = fam };
+    try testing.expectError(error.TooManyMessages, awaitAckStep(&cl3, seq));
+}
+
+test "dumpStep: the datagram and byte budgets are exact, and a record of another pid or seq is skipped" {
+    const pid: u32 = 100;
+    const seq: u32 = 5;
+    const fam: u16 = 41;
+    const done = try doneDatagram(testing.allocator, pid, seq, 0);
+    defer testing.allocator.free(done);
+
+    var cl: MockScript = .{ .sock = .{ .portid = pid, .script = &.{done} }, .family_id = fam };
+    var st: DumpState = .{ .msgs = max_dump_messages };
+    try testing.expectError(error.TooManyMessages, dumpStep(&cl, seq, &st));
+    var cl1: MockScript = .{ .sock = .{ .portid = pid, .script = &.{done} }, .family_id = fam };
+    var st1: DumpState = .{ .msgs = max_dump_messages - 1 };
+    try testing.expectEqual(@as(?DumpMessage, null), try dumpStep(&cl1, seq, &st1));
+
+    var cl2: MockScript = .{ .sock = .{ .portid = pid, .script = &.{done} }, .family_id = fam };
+    var st2: DumpState = .{ .bytes = max_dump_bytes - done.len };
+    try testing.expectEqual(@as(?DumpMessage, null), try dumpStep(&cl2, seq, &st2));
+    var cl3: MockScript = .{ .sock = .{ .portid = pid, .script = &.{done} }, .family_id = fam };
+    var st3: DumpState = .{ .bytes = max_dump_bytes - done.len + 1 };
+    try testing.expectError(error.TooManyMessages, dumpStep(&cl3, seq, &st3));
+
+    // family-typed records of a foreign pid or seq are not ours
+    const foreign_pid = try msgDatagram(testing.allocator, fam, pid + 1, seq, 0);
+    defer testing.allocator.free(foreign_pid);
+    const foreign_seq = try msgDatagram(testing.allocator, fam, pid, seq + 1, 0);
+    defer testing.allocator.free(foreign_seq);
+    var cl4: MockScript = .{ .sock = .{ .portid = pid, .script = &.{ foreign_pid, foreign_seq, done } }, .family_id = fam };
+    var st4: DumpState = .{};
+    try testing.expectEqual(@as(?DumpMessage, null), try dumpStep(&cl4, seq, &st4));
+}
+
+// `Nl80211` is a plain struct over a generic-netlink socket and a family id, so
+// the kernel's always-present control family (nlctrl) can stand in for nl80211
+// in the paths that do not depend on nl80211's own commands.
+fn nlctrlClient() !Nl80211 {
+    var sock = genl.Socket.open(testing.allocator) catch return error.SkipZigTest;
+    sock.setRecvTimeout(5000) catch {};
+    return .{ .sock = sock, .family_id = genl.GENL_ID_CTRL };
+}
+
+test "raw: header, flags and attributes reach the kernel as given (answered by nlctrl)" {
+    var cl = try nlctrlClient();
+    defer cl.close();
+    // dump: every family, each reply carrying attributes
+    const all = try cl.raw(.{ .cmd = genl.CTRL_CMD_GETFAMILY, .version = 1, .dump = true });
+    defer Nl80211.freeRawReplies(testing.allocator, all);
+    try testing.expect(all.len >= 1);
+    for (all) |r| {
+        try testing.expectEqual(genl.CTRL_CMD_NEWFAMILY, r.cmd);
+        try testing.expect(r.attrs.len > 0);
+    }
+    // single request: the attribute bytes are what selects the family
+    var attrs: std.ArrayList(u8) = .empty;
+    defer attrs.deinit(testing.allocator);
+    try codec.appendAttrString(testing.allocator, &attrs, genl.CTRL_ATTR_FAMILY_NAME, "nlctrl");
+    const one = try cl.raw(.{ .cmd = genl.CTRL_CMD_GETFAMILY, .version = 1, .attrs = attrs.items });
+    defer Nl80211.freeRawReplies(testing.allocator, one);
+    try testing.expectEqual(@as(usize, 1), one.len);
+    try testing.expect(one[0].attrs.len > 0);
+}
+
+test "buildSimple adds the interface index attribute exactly when one is given" {
+    var cl = try nlctrlClient();
+    defer cl.close();
+    const without = try cl.buildSimple(1, uapi.CMD.GET_INTERFACE, false, null);
+    defer testing.allocator.free(without);
+    const with = try cl.buildSimple(1, uapi.CMD.GET_INTERFACE, false, 7);
+    defer testing.allocator.free(with);
+    try testing.expectEqual(without.len + 8, with.len);
+    var it: codec.MessageIterator = .{ .buf = with };
+    const m = (try it.next()).?;
+    var ai = try m.attrs(genl.header_len);
+    const a = (try ai.next()).?;
+    try testing.expectEqual(uapi.ATTR.IFINDEX, a.type);
+    try testing.expectEqual(@as(u32, 7), try a.asU32());
+}

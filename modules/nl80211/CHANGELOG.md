@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** strict mutation re-audit (490/519 killed, 29 equivalent or unobservable). New tests only: `src/strict_test.zig` and sections at the end of `wiphy.zig` and `client.zig`; the card's `Audit:` line now records the src hash.
 - **2026-11-07** — **FIXED (review of the same day's wave, nothing released carried it):** `HtCaps.txMaxStreams` condition inverted; oversized capability tables (combinations > 32, limits > 8, HE sets > 8, EXT_FEATURES > 32 bytes) no longer fail the whole wiphy dump — truncated, flagged by the new `Wiphy.capabilities_truncated` / `Band.he_truncated`; `buildConnect` and `Client.connect` wipe the request (PMK, WEP keys) and leave no copy in a freed buffer (this one predates the wave); `pmkFromPassphrase(out, passphrase, ssid)` writes through a pointer; `WiphyParams.coverage_class` accepts any u8 like `iw`. Fuzz corpus seeds for the capability decoders.
 - **2026-11-07** — docs + grade: SPEC survey (iw 6.17, mdlayher/wifi v0.10.0, wl-nl80211) with a verdict for every feature, Scope `parity`, Performance measured (`bench-nl80211`: 0.07–0.10× mdlayher/wifi on interface and station decode); README covers the new API; catalog grade 3 → 2.
 
