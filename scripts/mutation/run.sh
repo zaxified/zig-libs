@@ -54,9 +54,11 @@ for i in $ids; do
     elif (( rc == 124 || rc == 137 )); then
         v=HANG; reason="killed at ${TIMEOUT}s"
     # A test binary run directly reports `<n>/<m> <name>...FAIL (<Err>)` and
-    # `<k> failed.`; a panic or a safety check names itself.
-    elif grep -qE "FAIL \(|[0-9]+ failed\.|panic|Segmentation fault|reached unreachable|integer overflow|index out of bounds" "$log"; then
-        v=KILLED; reason="$(grep -m1 -oE "FAIL \([A-Za-z0-9_]+\)|[0-9]+ failed\.|panic.{0,60}|Segmentation fault|reached unreachable|integer overflow|index out of bounds" "$log")"
+    # `<k> failed.`; a panic or a safety check names itself. Match `panic: `
+    # (the runtime's own wording), not a bare `panic`: test names such as
+    # "...not an arithmetic panic...OK" would otherwise label the reason.
+    elif grep -qE "FAIL \(|[0-9]+ failed\.|panic: |Segmentation fault|reached unreachable|integer overflow|index out of bounds" "$log"; then
+        v=KILLED; reason="$(grep -m1 -oE "FAIL \([A-Za-z0-9_]+\)|[0-9]+ failed\.|panic: .{0,60}|Segmentation fault|reached unreachable|integer overflow|index out of bounds" "$log")"
     elif (( rc > 128 )); then
         v=KILLED; reason="signal $(( rc - 128 ))"
     else
