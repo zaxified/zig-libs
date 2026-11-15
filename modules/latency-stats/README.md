@@ -50,6 +50,10 @@ _ = s.lossPct();          // f64 in [0,100]
 
 // one-shot over a slice (null = lost probe)
 const s2 = ls.compute(&[_]?u64{ 10, null, 14, 16 });
+
+// exact median of a sample slice (reorders it; null when empty; even count = lower middle)
+var rtts = [_]u64{ 40, 10, 30, 20 };
+_ = ls.median(&rtts); // 20
 ```
 
 `stddev_ns` is the population stddev (divide-by-n), matching fping / ping

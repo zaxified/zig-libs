@@ -225,6 +225,33 @@ pub const Ip = union(enum) {
         return (Prefix{ .addr = ip, .bits = bits }).masked();
     }
 
+    /// A fixed-size map key for per-client state (rate limits, per-viewer
+    /// maps): IPv4 is its 4 bytes followed by 12 zero bytes; IPv6 is the
+    /// address masked to its first `v6_bits` bits (`key(64)` keys a client by
+    /// its /64). `v6_bits` is clamped to 128 (no error, no panic; the same
+    /// clamp `Prefix.masked` applies) and is ignored for IPv4. A convenience
+    /// over `prefix(bits).?.network()` that needs no family branch at the
+    /// call site. The families can collide only for an IPv6 address whose
+    /// first four bytes are an IPv4 address and the rest are zero (`a.b.c.d::`);
+    /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is NOT unmapped, call `unmap()` first
+    /// if the two spellings of one client must share a key.
+    pub fn key(ip: Ip, v6_bits: u8) [16]u8 {
+        switch (ip) {
+            .v4 => |q| return q ++ @as([12]u8, @splat(0)),
+            .v6 => |b| {
+                const bits: usize = @min(v6_bits, 128);
+                var out = b;
+                const whole = bits / 8;
+                const rem: u3 = @intCast(bits % 8);
+                if (whole < 16) {
+                    out[whole] &= ~(@as(u8, 0xff) >> rem);
+                    @memset(out[whole + 1 ..], 0);
+                }
+                return out;
+            },
+        }
+    }
+
     /// The raw bytes: 4 for v4, 16 for v6 (Go `AsSlice`; with `fromSlice`
     /// the binary form Go's `MarshalBinary` writes for a zone-less address).
     /// Borrows: the slice points into `ip.*`, so call it on a variable that
@@ -3193,4 +3220,37 @@ test "resolveLog: a removal as the first logged operation applies (hand-built lo
     try std.testing.expectEqual(@as(usize, 2), s.rangeCount());
     try std.testing.expectEqual(@as(u128, 11), s.spans[0].to);
     try std.testing.expectEqual(@as(u128, 15), s.spans[1].from);
+}
+
+test "Ip.key: v4 zero-padded, v6 masked to v6_bits, bits clamped" {
+    const v4 = Ip{ .v4 = .{ 192, 0, 2, 77 } };
+    const want4 = [_]u8{ 192, 0, 2, 77 } ++ @as([12]u8, @splat(0));
+    try std.testing.expectEqualSlices(u8, &want4, &v4.key(64));
+    try std.testing.expectEqualSlices(u8, &want4, &v4.key(0));
+    try std.testing.expectEqualSlices(u8, &want4, &v4.key(255));
+
+    const v6 = parseIp("2001:db8:1:2:3:4:5:6").?;
+    const b = v6.v6;
+    const k64 = v6.key(64);
+    try std.testing.expectEqualSlices(u8, b[0..8], k64[0..8]);
+    try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(0)), k64[8..]);
+    // same /64, different host part: same key; different /64: different key
+    try std.testing.expectEqualSlices(u8, &k64, &parseIp("2001:db8:1:2:ffff::9").?.key(64));
+    try std.testing.expect(!std.mem.eql(u8, &k64, &parseIp("2001:db8:1:3::").?.key(64)));
+    // agrees with prefix().network() for every width, including non-byte ones
+    var bits: u8 = 0;
+    while (bits <= 128) : (bits += 1) {
+        try std.testing.expectEqualSlices(u8, &v6.prefix(bits).?.network().v6, &v6.key(bits));
+    }
+    // 0 bits: all zero; 128: unchanged; past 128 (and 255): clamped, no panic
+    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), &v6.key(0));
+    try std.testing.expectEqualSlices(u8, &b, &v6.key(128));
+    try std.testing.expectEqualSlices(u8, &b, &v6.key(129));
+    try std.testing.expectEqualSlices(u8, &b, &v6.key(255));
+    // a mid-byte cut: /68 keeps the high nibble of byte 8
+    var hi = b;
+    hi[8] = 0xAB;
+    const k68 = (Ip{ .v6 = hi }).key(68);
+    try std.testing.expectEqual(@as(u8, 0xA0), k68[8]);
+    try std.testing.expectEqual(@as(u8, 0), k68[9]);
 }
