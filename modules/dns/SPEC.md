@@ -141,7 +141,7 @@ capped at 1 h), RFC 2308 (negative caching), RFC 8767 (serve-stale). Each `Answe
 | rule | behaviour | source of the default |
 |---|---|---|
 | key | (lookup kind, name ASCII-lowercased); a trailing root dot is part of the key (the Resolver skips the search list for a rooted name); `reverse` keys by family + address bytes, `lookupSrv` by the three arguments | RFC 4343 |
-| what is cached | only DNS answers (`canonical != null`); IP literals, /etc/hosts entries and `.onion`/`.invalid` names pass through uncached, because the hosts file can change | — |
+| what is cached | only DNS answers (`canonical != null`); IP literals, /etc/hosts entries and `.onion`/`.invalid` names pass through uncached, because the hosts file can change. Literals and `.onion`/`.invalid` names are answered before any accounting (no budget token, no pool slot, no `network_lookups`, no `misses`); an /etc/hosts hit is only known after asking, so its token and `network_lookups` count are given back. The cached `canonical` keeps the letter case of the caller that filled the entry; `x.example.com` and `x.example.com.` are separate entries | — |
 | positive TTL | `clamp(ttl_s, min_ttl_s = 0, max_ttl_s = 86 400)` | hickory `positive_max_ttl` default 1 day |
 | negative TTL | NXDOMAIN / NODATA: `clamp(ttl_s, negative_min_ttl_s = 0, negative_max_ttl_s = 3600)`; the TTL is the SOA's `min(TTL, MINIMUM)` | RFC 2308 §5 allows 3 h; c-ares 1 h |
 | no TTL | an empty answer without SOA: `no_ttl_s` (default 0 = not cached), taken as is, not clamped | RFC 2308 §5: without SOA there is nothing to cache by |
@@ -149,9 +149,10 @@ capped at 1 h), RFC 2308 (negative caching), RFC 8767 (serve-stale). Each `Answe
 | partial | a `lookupIp` answer with `partial` is kept at most `partial_ttl_s = 30` | one family is missing; short retry |
 | serve-stale | `stale_s` (default 0 = off): an expired entry inside the window is served with `ttl_s = stale_answer_ttl_s = 30` when the network fails, the key is backed off or the budget is spent | RFC 8767 §4–5 (30 s; its 1–3 day window is opt-in here) |
 | failure recheck | a key served stale is not asked again for `stale_answer_ttl_s` | RFC 8767 §4 |
-| upstream failure | `Timeout`, `ServerFailed`, `NetworkFailed`, `MalformedResponse`, `DohFailed`, `TlsFailed` arm a per-key backoff `failure_backoff_min_s = 1`, doubling to `failure_backoff_max_s = 300`; a success resets it. While armed a miss returns the stale entry if any, else the last error, without a query. Other errors (`BadName`, `NameTooLong`, `OutOfMemory`, `Canceled`, `NoDotSupport`, …) pass through and arm nothing | RFC 8767 §4 (failure recheck), hickory/unbound server backoff |
+| upstream failure | `Timeout`, `ServerFailed`, `NetworkFailed`, `MalformedResponse`, `DohFailed`, `TlsFailed` arm a per-key backoff `failure_backoff_min_s = 1`, doubling to `failure_backoff_max_s = 300`; a success resets it; `resetFailures()` clears every key's backoff at once (answers stay) for a caller that knows the network is back. Backoff is per key, so an outage arms every key that was asked; `MalformedResponse` (which includes an RFC 5452 source/ID mismatch) arms it too; evicting an entry drops its backoff. A failure of a concurrent miss never arms backoff on an entry that holds a fresh answer: that answer is served as `.cache` and the failure state is left alone. While armed a miss returns the stale entry if any, else the last error, without a query. Other errors (`BadName`, `NameTooLong`, `OutOfMemory`, `Canceled`, `NoDotSupport`, …) pass through and arm nothing | RFC 8767 §4 (failure recheck), hickory/unbound server backoff |
 | budget | `max_network_lookups = .{ .per_s, .burst }`, a token bucket over network lookups; a miss without a token is served stale if possible, else `error.BudgetExceeded` | optional, off by default |
 | bound | `max_entries = 4096`; at capacity an expired entry among the 16 least recently used goes first, else the least recently used one (`stats().evictions`); `prune()` drops every expired entry | hickory `cache_size` 32 (ours holds clones, 4096 is cheap) |
+| expiry | an answer expires `ttl` seconds after the moment its query was sent (the clock is read after a pool slot is held, before the call), not after it returned: it never outlives its TTL by the lookup's duration. `lookupIp` order is RFC 6724 as of the lookup time: a hit after a route change keeps the old order | — |
 | time | whole seconds from a monotonic clock (`Options.clock` is the test seam); ages saturate, a clock going backwards neither underflows nor reports more than the stored TTL | — |
 
 `Answer.lookup.ttl_s` is what is left of the cache TTL: the clamped TTL for `.network`, that
@@ -167,12 +168,12 @@ the miss waits (cancelable through `io`). A slow name (timeout × attempts × se
 therefore blocks only its own caller, up to the pool size. Two concurrent misses on the SAME key may
 both query — no coalescing in this wave. Learned per-Resolver state (the no-EDNS server memory) is
 not shared between the pooled Resolvers. The table owns clones under `gpa`; an allocation failure while storing returns the answer uncached;
-`deinit` frees everything. No `pub` entry can panic: the key buffer is bounded and a name that
+`gpa` must be thread-safe: pooled lookups allocate from several threads at once. The budget token and `network_lookups` are taken when a miss goes to the network and given back if no pool slot could be had (cancel, out of memory); `deinit` frees everything. No `pub` entry can panic: the key buffer is bounded and a name that
 does not fit is passed to the Resolver uncached.
 
 Tests (`src/CachingResolver.zig`, a loopback UDP stub that counts queries, an injected clock):
 hit/expiry/aging, both clamps, NXDOMAIN and NODATA with their clamps, no-SOA, partial,
-literal/`.onion` pass-through, case folding and rooted names, serve-stale on SERVFAIL and on a
+literal/`.onion` pass-through (and no budget/slot/stat spent on literals, `.onion`, hosts hits), TTL from query send time, a failure on a fresh entry, token refund on cancel, `resetFailures`, case folding and rooted names, serve-stale on SERVFAIL and on a
 timeout with the recheck interval, stale off by default, backoff doubling/cap/reset, pass-through
 errors, budget refusal/refill/stale-under-budget, LRU eviction, expired-first eviction, prune
 (with a stale window), `InvalidOptions`, a backwards clock, a failing allocator, all seven
