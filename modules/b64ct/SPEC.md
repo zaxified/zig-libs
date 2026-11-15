@@ -171,7 +171,7 @@ non-LLVM backends and on the error paths, which ctgrind has not measured.
 - **A shared module for the four copies — superseded.** Until 2026-10-17
   acme, dns, smtp and megolm each carried a `b64ct.zig` ("a copy rather than a
   shared module, as with every other small helper"); the cross-module dedupe
-  audit (CML § DB) made this the module they use instead.
+  audit (owner notes § DB) made this the module they use instead.
 - **Streaming encoder/decoder** (base64ct's `Encoder`/`Decoder`) — not now:
   every consumer encodes a key or a credential in one piece.
 - **Password-hash alphabets** (bcrypt `./A–Za–z0–9`, crypt, sha-crypt) — not
