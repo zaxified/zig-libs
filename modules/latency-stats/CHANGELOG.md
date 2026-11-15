@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: Exact median over a sample slice (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-02** — **Fixes (independent review):** `recordCorrectedCount` took the run's first value as the minimum, wrong when `lowest` is not a power of two (the lowest slot reaches below it) or the total ran out mid-run; now the last value actually recorded, clamped. A saturated `add` raised `max()` (and lowered `min()`) for slots it dropped; now only taken slots count. `valueAtPercentile(100)` is the last sample for totals past 2^53 (the f64 rank lost it). `wire.decode` refuses a compressed stream whose declared payload exceeds deflate's 1032:1 bound before allocating it; encode of a compressed stream over i32 is `OutputTooLarge`. Docs: `min`/`max` after `decode` are slot bounds. Tests: parity widened, fuzz harnesses for `recordCorrectedCount` and `add`, and 32-bit portability fixed in a test (`1 << 40` as usize).
