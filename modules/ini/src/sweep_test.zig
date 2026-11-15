@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests (wave GY). Finding IN-1, see
-//! ~/CML/20261029-panic-sweep/ini-sweep.report.md.
+//! the 2026-10-29 panic-sweep report for `ini`.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;

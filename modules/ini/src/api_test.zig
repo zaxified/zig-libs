@@ -592,8 +592,8 @@ test "interpolation: a billion laughs stops at the limits, cheaply and cleanly" 
 
 // ── the consumer ─────────────────────────────────────────────────────────────
 
-test "ttydesk's use keeps compiling: its options, its exhaustive switch over parse's errors" {
-    // ~/workspace/ttydesk/src/themes.zig, `skin_ini` and `readSkin`, as they are:
+test "desktop's use keeps compiling: its options, its exhaustive switch over parse's errors" {
+    // src/themes.zig, `skin_ini` and `readSkin`, as they are:
     // a new error in `ParseError` must show here before it breaks that build.
     const skin_ini: ini.Options = blk: {
         var o = ini.Options.desktop;
