@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card src hash refreshed after the VOPR/shrinker test-harness change (`vopr.zig`, `shrink.zig` only; no production code changed, the audit covers it unchanged).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** VOPR trace capture, replay and the shrinker know `Db.merge`: `RecordedOp.merge` (a mask over the sealed files) is recorded under `Config.partial_merges`, replayed by the new `replayTraceOpts` (takes the run's `Options`, so the store really is multi-file) and shrunk as one op. Test-harness code only; tests: partial-merge traces replay clean and a sabotaged one is caught after a merge ran; a shrink test over such a trace.
 - **2026-11-15** — Atomic batch hardening from the independent review: replay also verifies every inner record's own CRC (a forged inner record is refused with its envelope instead of opening and failing `get`/merge later); the second replay pass answers `Corrupt` instead of a safety panic if the file changed between the passes; SPEC states that an allocation failure inside a commit's rotation poisons the store.
@@ -74,7 +75,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   owned `Storage.Listing`; `null` from a backend that cannot list (new optional
   `VTable.list`, default `null`). `FsStorage` and `SimStorage` implement it (the simulator lists
   its volatile namespace, a pure read). For recovery and tooling — `Db` never lists
-  (requested by egw-hub's `seglog` manifest rebuild).
+  (requested by the ingest daemon's `seglog` manifest rebuild).
 
 - **2026-09-28** — `Storage.OpenMode.create_new`: create the file or fail with the new
   `error.PathAlreadyExists` (`O_CREAT|O_EXCL`), atomically, never emptying an existing

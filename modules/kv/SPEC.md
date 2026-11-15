@@ -462,7 +462,7 @@ torn/partial writes, short reads, garbage tails, and crash points ×4 modes (inc
 out-of-order durability, see below) over chained epochs; min-fault-count asserts + the sabotage
 self-test (≥10/12 runs catch a data-losing recovery). Run: `zig build test-kv`.
 
-- **`OpenMode.create_new`** (2026-09-28, requested by egw-hub seglog, audit L1): create the
+- **`OpenMode.create_new`** (2026-09-28, requested by the ingest daemon seglog, audit L1): create the
   file, refuse with `error.PathAlreadyExists` if the path exists — `O_CREAT|O_EXCL` in
   `FsStorage`, so the check and the creation are one atomic step and of concurrent creators
   exactly one wins; an existing file is never emptied. `SimStorage` refuses any name present in
@@ -580,7 +580,7 @@ What moved it (2026-10-25): `FsStorage.initMmap` (reads lent from a mapping of t
   `sync` (crash at/after the rename has no un-synced window), so recovery never depends on intra-file
   write ordering. No product-code change was required — the temp-then-atomic-rename discipline was
   already sound; the deliverable is the harness coverage that proves it.
-- **`Storage` directory listing** — DONE (2026-09-29, requested by egw-hub `seglog`
+- **`Storage` directory listing** — DONE (2026-09-29, requested by the ingest daemon `seglog`
   `manifestRebuild`, audit L4). See § "Optional directory listing".
 - ~~**Key iteration / fold over the keydir**~~ *(survey 2026-09-30)* — **DONE 2026-09-30** as `keys(gpa, prefix)`: a sorted snapshot of the live keys, taken under the lock. A value fold (`fold` in Bitcask) is not built: `get` per listed key does the same without holding the lock across the caller's function.
 - **Hint files / fast open** *(survey 2026-09-30)* — `open` replays the whole log, so start time grows with store size; Bitcask's hint files exist for exactly this. Effort: medium (a second CRC'd file rewritten by `compact`, torn-hint fallback to replay, needs the VOPR sweep extended). Fits §2.
