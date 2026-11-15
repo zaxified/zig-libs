@@ -332,7 +332,7 @@ pub fn mulBase(s: [32]u8) Edwards25519 {
 /// Whether the fixed-base scalar multiplications (`mulBase`,
 /// `mulRistrettoBase`, `X25519.recoverPublicKey`) use the comb.
 ///
-/// **Consumer build option** (CONVENTIONS §4.2; axp request 2026-10-17):
+/// **Consumer build option** (CONVENTIONS §4.2; the router-tool consumer request 2026-10-17):
 /// `-Dct25519-base-comb=false`, or `-Dprofile=small`, drops the comb — its
 /// 43 008-byte table and the select/recode code — and runs those on `mul`'s
 /// window ladder over `base_pc` instead: the same results for every 256-bit
@@ -387,7 +387,7 @@ pub fn mulRistretto(p: Ristretto255, s: [32]u8) Ristretto255 {
 // the base point `u = 9` — 255 ladder steps, the same work as a shared-secret
 // computation against a peer's point. A TLS server pays both per handshake
 // (ephemeral key pair, then the shared secret), so the base-point half was
-// measured at ~28 %/2 of a qap ECDHE handshake's CPU (2026-09-28). The base
+// measured at ~28 %/2 of a web-server consumer ECDHE handshake's CPU (2026-09-28). The base
 // point is fixed, and the fixed-base comb above already computes `s·B` on
 // Edwards25519 in a third of the ladder's time; Montgomery `u = 9` IS
 // Edwards `B` under the birational map (RFC 7748 §4.1), so the X25519
@@ -438,11 +438,11 @@ pub const X25519 = struct {
 
         /// Deterministically derive a key pair from a cryptographically
         /// secure secret seed — std's `generateDeterministic`, on the comb.
-        /// std's shape (qap's TLS shim swaps this type in for std's): the
+        /// std's shape (the web-server consumer's TLS shim swaps this type in for std's): the
         /// seed goes in by value and the key pair comes back in an error
         /// union, so the caller's frame keeps a copy of both. A caller that
         /// owns its frame should use `generateDeterministicInto`.
-        // secret-api-ok: std.crypto.dh.X25519 shape (qap's TLS shim swaps this type in for std's); `generateDeterministicInto` is the pointer twin and the body runs under its burn
+        // secret-api-ok: std.crypto.dh.X25519 shape (the web-server consumer's TLS shim swaps this type in for std's); `generateDeterministicInto` is the pointer twin and the body runs under its burn
         pub fn generateDeterministic(seed: [seed_length]u8) IdentityElementError!KeyPair {
             var kp: KeyPair = undefined;
             try generateDeterministicInto(&kp, &seed);
@@ -458,7 +458,7 @@ pub const X25519 = struct {
         }
 
         /// Generate a new, random key pair.
-        // secret-api-ok: std.crypto.dh.X25519 shape (qap's TLS shim swaps this type in for std's); `generateInto` is the pointer twin
+        // secret-api-ok: std.crypto.dh.X25519 shape (the web-server consumer's TLS shim swaps this type in for std's); `generateInto` is the pointer twin
         pub fn generate(io: std.Io) KeyPair {
             var kp: KeyPair = undefined;
             generateInto(&kp, io);
@@ -472,7 +472,7 @@ pub const X25519 = struct {
             while (true) {
                 // Fail-closed (CONVENTIONS.md §2.2): `io.random` silently
                 // degrades to a guessable seed when the kernel has no entropy,
-                // and this seed IS the private key (an ECDHE share under qap's
+                // and this seed IS the private key (an ECDHE share under the web-server consumer's
                 // TLS shim). `generate` mirrors std's infallible shape, so the
                 // draw aborts instead of returning an error (audit 2026-10-19).
                 entropy.fill(io, &random_seed);
@@ -487,7 +487,7 @@ pub const X25519 = struct {
 
     /// Compute the public key for a given private key — `clamp(sk)·B` as the
     /// Montgomery `u`-coordinate, byte-exact with std's `recoverPublicKey`.
-    // secret-api-ok: std.crypto.dh.X25519 shape (qap's TLS shim swaps this type in for std's); `recoverPublicKeyInto` is the pointer twin
+    // secret-api-ok: std.crypto.dh.X25519 shape (the web-server consumer's TLS shim swaps this type in for std's); `recoverPublicKeyInto` is the pointer twin
     pub fn recoverPublicKey(secret_key: [secret_length]u8) IdentityElementError![public_length]u8 {
         var out: [public_length]u8 = undefined;
         try recoverPublicKeyInto(&out, &secret_key);
@@ -520,7 +520,7 @@ pub const X25519 = struct {
     /// Burned (`burn.zig`): the ladder left the shared secret on the dead
     /// stack twice per call (`stackprobe_test.zig`, 2026-10-08).
     ///
-    /// std's shape is a contract (qap's TLS shim swaps this type in for
+    /// std's shape is a contract (the web-server consumer's TLS shim swaps this type in for
     /// std's): the key goes in by value and the secret comes back in an error
     /// union, so the caller's frame keeps a copy of both (measured by
     /// `stackprobe_test.zig`, 2026-10-08) — the body's own frames are burned.
@@ -558,7 +558,7 @@ pub const X25519 = struct {
 
 // ── X25519 shared secret: a 4×64-bit field core in MULX/ADX assembly (P6) ─
 //
-// qap's TLS churn lane (2026-09-29) had the shared-secret ladder as its
+// the web-server consumer's TLS churn lane (2026-09-29) had the shared-secret ladder as its
 // largest single item, 18.65 % of CPU. std's field is 5×51-bit limbs with
 // u128 products (25 multiplies per field multiplication); on x86-64 with
 // BMI2 the natural representation is 4×64-bit limbs, 16 `mulx` per
@@ -2867,7 +2867,7 @@ test "P6 fe64: invert is z^(p-2) — z·z⁻¹ ≡ 1, and 0, p ↦ 0" {
     }
 }
 
-test "P6 X25519: scalarmult keeps std's signature (drop-in for qap's TLS shim)" {
+test "P6 X25519: scalarmult keeps std's signature (drop-in for the web-server consumer's TLS shim)" {
     try testing.expectEqual(@TypeOf(std.crypto.dh.X25519.scalarmult), @TypeOf(X25519.scalarmult));
 }
 

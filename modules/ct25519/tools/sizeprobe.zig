@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Size probe for the `small` lane (CONVENTIONS §4.2): one X25519 keygen, the
-//! shape of axp-agent's enrollment (the request that added
+//! shape of the router-tool consumer's agent enrollment (the request that added
 //! `ct25519-base-comb`). Built at ReleaseSmall under `-Dprofile=default` and
 //! `-Dprofile=small` by `scripts/checks/small-sizes.sh`; the size difference
 //! is held to its floor in `scripts/checks/small-size-expected.tsv`.
