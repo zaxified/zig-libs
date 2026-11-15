@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** `example/main.zig` (CONVENTIONS §7.2: `init` plus five methods): a work loop that checks `poll` between units and stops on SIGTERM, then a `wait` on SIGINT; the signals are sent to the example's own thread so it ends on its own.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card Audit score counts the unobservable mutation survivors with the equivalent ones, as the score format has no separate field.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Whole-module mutation audit (56 schemata mutants: 50 killed, 1 equivalent, 5 unobservable; new tests for close-on-exec and close by `deinit`, `childMask`, an fd limit refusal, pipe-fed records `poll`/`wait` must refuse, and a cancelled `wait`).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** docs: procrun now starts children with an empty signal mask (`procrun.Spec.reset_signal_mask`), so the fork/exec finding names only std's spawn as passing the blocked set on.
