@@ -624,7 +624,7 @@ pub fn Modint(comptime max_bits: comptime_int) type {
             table[1] = base_mont;
             var k: usize = 2;
             while (k < table_len) : (k += 1) {
-                table[k] = self.montMul(&table[k - 1], &base_mont);
+                self.ladderMul(&table[k], &table[k - 1], &base_mont);
             }
 
             var acc = self.one_mont;
@@ -636,7 +636,7 @@ pub fn Modint(comptime max_bits: comptime_int) type {
                 win -= 1;
                 // square w times (no-op on the very first, acc == 1).
                 var s: usize = 0;
-                while (s < w) : (s += 1) acc = self.montSqr(&acc);
+                while (s < w) : (s += 1) self.ladderSqr(&acc);
                 var digit = getBits(exp, win * w, w);
                 // Bits at or above `total_bits` (public) belong to no window.
                 if (win * w + w > total_bits) digit &= (@as(usize, 1) << @intCast(total_bits - win * w)) - 1;
@@ -647,9 +647,38 @@ pub fn Modint(comptime max_bits: comptime_int) type {
                 // secret-indexed jump table (see `blackBox`). Every entry is
                 // read and blended unconditionally, in constant work.
                 const g = gather(&table, digit);
-                acc = self.montMul(&acc, &g);
+                self.ladderMul(&acc, &acc, &g);
             }
+            // A full multiply (operand contract `a < R`, `b = 1 < m`): the
+            // result is canonical even when the lazy ladder left `acc ≥ m`.
             return self.fromMontgomery(&acc);
+        }
+
+        /// Whether `powMontBits`' ladder runs the almost-Montgomery block
+        /// kernels (`asm_core.montMulBlockLazy`/`montSqrBlockLazy`, in place):
+        /// every intermediate stays `< R` instead of `< m`, which drops the
+        /// borrow pass of the final subtract (one `sub/sbb` pass per multiply
+        /// instead of two) and the copy of each result. Measured 2026-11-15,
+        /// see SPEC "Almost-Montgomery ladder".
+        pub const lazy_ladder = asm_active and asm_unroll and L % 8 == 0 and L >= asm_core.block_min_limbs;
+
+        /// `z = a·b·R⁻¹` for the ladder: `< R` and congruent under
+        /// `lazy_ladder` (inputs `< R`), else `montMul` (`< m`). `z` may alias.
+        inline fn ladderMul(self: *const Self, z: *Elem, a: *const Elem, b: *const Elem) void {
+            if (comptime lazy_ladder) {
+                asm_core.montMulBlockLazy(L, z, a, b, &self.m, self.n0inv);
+            } else {
+                z.* = self.montMul(a, b);
+            }
+        }
+
+        /// `acc = acc²·R⁻¹` for the ladder (see `ladderMul`).
+        inline fn ladderSqr(self: *const Self, acc: *Elem) void {
+            if (comptime lazy_ladder) {
+                asm_core.montSqrBlockLazy(L, acc, acc, &self.m, self.n0inv);
+            } else {
+                acc.* = self.montSqr(acc);
+            }
         }
 
         // ── internal CT helpers ─────────────────────────────────────────────
