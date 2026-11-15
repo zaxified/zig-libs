@@ -202,6 +202,8 @@ pub const Inbound = struct {
     rx: record.Protection = undefined,
     /// A receive key is installed: records must be protected.
     protected: bool = false,
+    /// `Config.record_burn`: open records under the stack burn.
+    record_burn: bool = true,
     /// A protected record has been opened under some key.
     decrypted_any: bool = false,
     /// A handshake message has been delivered (the first ClientHello).
@@ -248,6 +250,7 @@ pub const Inbound = struct {
         // Not "protected" by a wiped (all-zero) key if `init` refuses.
         self.protected = false;
         try self.rx.init(suite, traffic_secret);
+        self.rx.burn_records = self.record_burn;
         self.protected = true;
     }
 

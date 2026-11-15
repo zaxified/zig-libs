@@ -45,6 +45,8 @@ pub const Outbound = struct {
     len: usize = 0,
     tx: record.Protection = undefined,
     protected: bool = false,
+    /// `Config.record_burn`: seal records under the stack burn.
+    record_burn: bool = true,
     /// The largest record content sent (rustls `max_fragment_size`,
     /// BoringSSL `SSL_set_max_send_fragment`); set it before the first
     /// `slot`, within [`min_fragment`, 2^14].
@@ -207,6 +209,7 @@ pub const Outbound = struct {
         // Not "protected" by a wiped (all-zero) key if `init` refuses.
         self.protected = false;
         try self.tx.init(suite, traffic_secret);
+        self.tx.burn_records = self.record_burn;
         self.protected = true;
     }
 
