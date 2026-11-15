@@ -1977,6 +1977,25 @@ fn putIntLeft(buf: []u8, w_end: usize, v: u64) usize {
 /// fraction digits past `u63` precision are ignored, and anything outside
 /// `i64` is an error (`-2562047h47m16.854775808s`, the minimum, is not).
 pub fn parseDuration(s: []const u8) error{InvalidDuration}!i64 {
+    return parseDurationExt(s, .{});
+}
+
+/// Which units beyond Go's `parseDurationExt` accepts; both off is exactly
+/// `parseDuration`.
+pub const DurationExtOptions = struct {
+    /// `d`: a day of exactly 24 hours (no calendar, no DST).
+    days: bool = false,
+    /// `w`: a week of exactly 7 days.
+    weeks: bool = false,
+};
+
+/// `parseDuration` with the optional `d` (24 h) and `w` (7 d) units, for
+/// config values like `"7d"` or `"1w2d12h"`. Same grammar, sign, fraction
+/// handling (`1.5d` is 36 h) and overflow rule as `parseDuration`: anything
+/// outside `i64` nanoseconds is `error.InvalidDuration`. With both options
+/// off a `d` or `w` is an unknown unit, as in Go. Go itself has no such
+/// units, so the extension is checked only against its own arithmetic.
+pub fn parseDurationExt(s: []const u8, opts: DurationExtOptions) error{InvalidDuration}!i64 {
     const limit: u64 = 1 << 63; // the magnitude of minInt(i64)
     var rest = s;
     var neg = false;
@@ -2028,7 +2047,7 @@ pub fn parseDuration(s: []const u8) error{InvalidDuration}!i64 {
         i = 0;
         while (i < rest.len and rest[i] != '.' and !std.ascii.isDigit(rest[i])) i += 1;
         if (i == 0) return error.InvalidDuration; // no unit
-        const unit = durationUnit(rest[0..i]) orelse return error.InvalidDuration;
+        const unit = durationUnit(rest[0..i], opts) orelse return error.InvalidDuration;
         rest = rest[i..];
         if (v > limit / unit) return error.InvalidDuration;
         v *= unit;
@@ -2046,7 +2065,7 @@ pub fn parseDuration(s: []const u8) error{InvalidDuration}!i64 {
     return @intCast(total);
 }
 
-fn durationUnit(u: []const u8) ?u64 {
+fn durationUnit(u: []const u8, opts: DurationExtOptions) ?u64 {
     const units = [_]struct { []const u8, u64 }{
         .{ "ns", 1 },
         .{ "us", std.time.ns_per_us },
@@ -2058,6 +2077,8 @@ fn durationUnit(u: []const u8) ?u64 {
         .{ "h", std.time.ns_per_hour },
     };
     for (units) |e| if (std.mem.eql(u8, u, e[0])) return e[1];
+    if (opts.days and std.mem.eql(u8, u, "d")) return std.time.ns_per_day;
+    if (opts.weeks and std.mem.eql(u8, u, "w")) return std.time.ns_per_week;
     return null;
 }
 
@@ -3333,4 +3354,43 @@ test "parseRfc2822: an hour, minute or second is exactly two digits (mutation 20
     try testing.expectError(ParseError.InvalidFormat, parseRfc2822("Fri, 21 Nov 1997 09:055:06 -0600"));
     try testing.expectError(ParseError.InvalidFormat, parseRfc2822("Fri, 21 Nov 1997 09:55:006 -0600"));
     _ = try parseRfc2822("Fri, 21 Nov 1997 09:55:06 -0600");
+}
+
+test "parseDurationExt: d and w are opt-in, 24 h and 7 d" {
+    const t = std.testing;
+    const day: i64 = 24 * std.time.ns_per_hour;
+    try t.expectEqual(day, try parseDurationExt("1d", .{ .days = true }));
+    try t.expectEqual(7 * day, try parseDurationExt("1w", .{ .weeks = true }));
+    try t.expectEqual(7 * day + 2 * day + 12 * std.time.ns_per_hour, try parseDurationExt("1w2d12h", .{ .days = true, .weeks = true }));
+    try t.expectEqual(day + day / 2, try parseDurationExt("1.5d", .{ .days = true }));
+    try t.expectEqual(-day, try parseDurationExt("-1d", .{ .days = true }));
+    try t.expectEqual(day + 30 * std.time.ns_per_min, try parseDurationExt("1d30m", .{ .days = true }));
+    // each unit is gated separately
+    try t.expectError(error.InvalidDuration, parseDurationExt("1d", .{ .weeks = true }));
+    try t.expectError(error.InvalidDuration, parseDurationExt("1w", .{ .days = true }));
+    try t.expectError(error.InvalidDuration, parseDurationExt("1d", .{}));
+    try t.expectError(error.InvalidDuration, parseDurationExt("1w", .{}));
+    // options off is parseDuration, byte for byte on Go's grammar
+    for ([_][]const u8{ "1h30m", "-1.5h", "0", "300ms", ".5s", "", "1", "1x", "1d", "9223372036854775807ns", "9223372036854775808ns" }) |in| {
+        const a = parseDuration(in);
+        const b = parseDurationExt(in, .{});
+        if (a) |av| try t.expectEqual(av, try b) else |_| try t.expectError(error.InvalidDuration, b);
+    }
+    // a bare number still needs a unit; a lone sign too
+    try t.expectError(error.InvalidDuration, parseDurationExt("1", .{ .days = true }));
+    try t.expectError(error.InvalidDuration, parseDurationExt("d", .{ .days = true }));
+    try t.expectError(error.InvalidDuration, parseDurationExt("1D", .{ .days = true }));
+    // overflow is an error, the boundary is exact
+    const max_days: u64 = std.math.maxInt(i64) / std.time.ns_per_day; // 106751
+    var buf: [40]u8 = undefined;
+    const ok = try std.fmt.bufPrint(&buf, "{d}d", .{max_days});
+    try t.expectEqual(@as(i64, @intCast(max_days * std.time.ns_per_day)), try parseDurationExt(ok, .{ .days = true }));
+    const over = try std.fmt.bufPrint(&buf, "{d}d", .{max_days + 1});
+    try t.expectError(error.InvalidDuration, parseDurationExt(over, .{ .days = true }));
+    try t.expectError(error.InvalidDuration, parseDurationExt("999999999999999999w", .{ .weeks = true }));
+    try t.expectError(error.InvalidDuration, parseDurationExt("18446744073709551616d", .{ .days = true }));
+    try t.expectError(error.InvalidDuration, parseDurationExt("15250w1w", .{ .weeks = true }));
+    try t.expectError(error.InvalidDuration, parseDurationExt("106751d106751d", .{ .days = true }));
+    // the minimum is reachable only through the sign, as in Go
+    try t.expectEqual(@as(i64, -106751 * day), try parseDurationExt("-106751d", .{ .days = true }));
 }
