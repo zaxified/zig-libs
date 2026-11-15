@@ -150,3 +150,50 @@ test "walk is deterministic and bars are ordered" {
     walkBars(&h, &l, &c, 9);
     for (h, l, c) |hh, ll, cc| try testing.expect(ll <= cc and cc <= hh);
 }
+
+/// Seeded OHLC bars with candlestick structure: a mix of ordinary, doji,
+/// long-body, marubozu and gapping bars (a plain random walk forms almost no
+/// patterns). Always low <= min(open, close) and high >= max(open, close).
+pub fn candleBars(os: []f64, hs: []f64, ls: []f64, cs: []f64, seed: u64) void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    var p: f64 = 100.0;
+    for (os, hs, ls, cs) |*o, *h, *l, *c| {
+        const kind = r.uintLessThan(u32, 12);
+        const dir: f64 = if (r.boolean()) 1.0 else -1.0;
+        var op = p;
+        var cl: f64 = undefined;
+        var up: f64 = r.float(f64) * 0.8;
+        var dn: f64 = r.float(f64) * 0.8;
+        switch (kind) {
+            0, 1 => { // doji: open == close (or nearly), long shadows
+                cl = op + (r.float(f64) - 0.5) * 0.02;
+                up = 0.5 + r.float(f64) * 2.0;
+                dn = 0.5 + r.float(f64) * 2.0;
+            },
+            2, 3 => { // long body
+                cl = op + dir * (3.0 + r.float(f64) * 3.0);
+            },
+            4 => { // marubozu
+                cl = op + dir * (3.0 + r.float(f64) * 3.0);
+                up = 0.0;
+                dn = 0.0;
+            },
+            5, 6 => { // gap, then a body
+                op = p + dir * (1.5 + r.float(f64) * 2.0);
+                cl = op + (r.float(f64) - 0.5) * 3.0;
+            },
+            7 => { // hammer / shooting-star shapes
+                cl = op + (r.float(f64) - 0.5) * 0.6;
+                if (r.boolean()) up = 0.0 else dn = 0.0;
+                if (up == 0.0) dn = 1.5 + r.float(f64) * 2.0 else up = 1.5 + r.float(f64) * 2.0;
+            },
+            else => cl = op + (r.float(f64) - 0.5) * 2.5,
+        }
+        o.* = op;
+        c.* = cl;
+        h.* = @max(op, cl) + up;
+        l.* = @min(op, cl) - dn;
+        p = cl;
+    }
+}

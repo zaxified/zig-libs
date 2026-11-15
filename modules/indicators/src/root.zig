@@ -11,7 +11,8 @@
 //! HT_DCPHASE, HT_PHASOR, HT_SINE, HT_TRENDLINE, HT_TRENDMODE, MAMA (so `MaType.mama`
 //! works everywhere), SWAK_BP, SWAK_HP, SWAK_2PHP and the 15 math transforms ACOS ...
 //! TANH. Wave I3 (volume, volatility,
-//! price transform, statistic, math operators): 50 more functions, see SPEC.md. 119 of
+//! price transform, statistic, math operators): 50 more functions, see SPEC.md. The 61 candlestick patterns
+//! (`candles`: CDL2CROWS ... CDLXSIDEGAP3METHODS, `[]i32` output, settings per call) bring it to 180 of
 //! TA-Lib's 237 functions in all.
 //!
 //! ```zig
@@ -49,6 +50,9 @@ const hist = @import("hist.zig");
 const cycle_ = @import("cycle.zig");
 const mathtx_ = @import("mathtx.zig");
 // END cycle imports
+// BEGIN candles imports
+const candles_ = @import("candles.zig");
+// END candles imports
 // BEGIN vs imports
 const volume_ = @import("volume.zig");
 const volatility_ = @import("volatility.zig");
@@ -60,7 +64,7 @@ const mathops_ = @import("mathops.zig");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Technical-analysis indicators (TA-Lib parity): moving averages (SMA to T3, KAMA, HMA, ALMA), MACD, RSI, Bollinger / Keltner / Donchian bands, ATR, stochastic, SAR, Supertrend, Ichimoku, rolling max/min/sum, plus 50 volume, volatility, price-transform, statistic and math-operator functions (OBV, VWAP, CMF, KVO, BBW, LINEARREG, MEDIAN, ...), the Hilbert-transform cycle indicators with MAMA (HT_DCPERIOD, HT_SINE, HT_TRENDLINE, ...), three Swiss-Army-Knife filters and the 15 math transforms (SIN, LN, SQRT, ...); 119 of TA-Lib's 237.",
+    .doc = "Technical-analysis indicators (TA-Lib parity): moving averages (SMA to T3, KAMA, HMA, ALMA), MACD, RSI, Bollinger / Keltner / Donchian bands, ATR, stochastic, SAR, Supertrend, Ichimoku, rolling max/min/sum, plus 50 volume, volatility, price-transform, statistic and math-operator functions (OBV, VWAP, CMF, KVO, BBW, LINEARREG, MEDIAN, ...), the Hilbert-transform cycle indicators with MAMA (HT_DCPERIOD, HT_SINE, HT_TRENDLINE, ...), three Swiss-Army-Knife filters and the 15 math transforms (SIN, LN, SQRT, ...), and the 61 candlestick patterns (CDLDOJI, CDLENGULFING, CDLHIKKAKE, ... with TA-Lib's candle settings as a per-call parameter); 180 of TA-Lib's 237.",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
@@ -556,6 +560,10 @@ pub const minmaxindexLookback = mathops_.minmaxindexLookback;
 pub const minmaxindex = mathops_.minmaxindex;
 pub const MinmaxindexStream = mathops_.MinmaxindexStream;
 // END vs exports
+// BEGIN candles exports
+/// The 61 candlestick-pattern functions (`candles.cdldoji(...)`), see candles.zig.
+pub const candles = candles_;
+// END candles exports
 
 test {
     _ = core;
@@ -584,6 +592,11 @@ test {
     _ = statistic_;
     _ = mathops_;
     // END vs tests
+    // BEGIN candles tests
+    _ = candles_;
+    _ = @import("candles_core.zig");
+    _ = @import("candles_test.zig");
+    // END candles tests
     _ = @import("testhelp.zig");
     _ = @import("vs_kit.zig");
     _ = @import("oracle_test.zig");
