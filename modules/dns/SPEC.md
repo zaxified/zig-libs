@@ -159,10 +159,14 @@ minus the entry's age for `.cache`, `stale_answer_ttl_s` for `.stale`. Literal a
 null.
 
 Threading and memory. One `std.Io.Mutex` guards the table and is never held across a network
-lookup; the wrapped `Resolver` is single-owner, so its calls are serialized behind a second mutex
-(the caller must not use that `Resolver` directly while the cache is shared). Two misses on one
-key therefore both query, one after the other — no coalescing in this wave. The table owns
-clones under `gpa`; an allocation failure while storing returns the answer uncached;
+lookup. A `Resolver` is single-owner, so the cache owns its own: `init` takes the
+`Resolver.Options` (not a `Resolver`), creates Resolvers lazily, at most
+`Options.max_concurrent_lookups = 8` of them (0 = `InvalidOptions`), and a miss takes a free one
+for the duration of its lookup — an `Io.Mutex` + `Io.Condition` around the free list; when all are busy
+the miss waits (cancelable through `io`). A slow name (timeout × attempts × servers can be minutes)
+therefore blocks only its own caller, up to the pool size. Two concurrent misses on the SAME key may
+both query — no coalescing in this wave. Learned per-Resolver state (the no-EDNS server memory) is
+not shared between the pooled Resolvers. The table owns clones under `gpa`; an allocation failure while storing returns the answer uncached;
 `deinit` frees everything. No `pub` entry can panic: the key buffer is bounded and a name that
 does not fit is passed to the Resolver uncached.
 
@@ -172,7 +176,8 @@ literal/`.onion` pass-through, case folding and rooted names, serve-stale on SER
 timeout with the recheck interval, stale off by default, backoff doubling/cap/reset, pass-through
 errors, budget refusal/refill/stale-under-budget, LRU eviction, expired-first eviction, prune
 (with a stale window), `InvalidOptions`, a backwards clock, a failing allocator, all seven
-lookup kinds, four threads on one cache.
+lookup kinds, four threads on one cache, a held-back slow answer not blocking another name (and
+waiting with `max_concurrent_lookups = 1`).
 
 ## Threat model / out of scope
 Not a validating resolver: **no DNSSEC**, so answers are trusted as far as the transport is. UDP is
@@ -350,7 +355,7 @@ names over PTR, no DoH):
 - ✅ **Closed 2026-11-15 (`Options.case_randomization`):** 0x20 query-name case randomization, opt-in, UDP only, exact-case echo required (c-ares `ARES_FLAG_DNS0x20`, hickory `case_randomization`).
 - ✅ **Closed 2026-11-15:** TTL, canonical name, NXDOMAIN/NODATA status and the AD flag on every high-level result (`Lookup(T)`); resolv.conf re-read on change (`resolv_conf_recheck_ms`).
 - ✅ **Closed 2026-11-15 (`CachingResolver`): Caching resolver (hickory `CachingClient` parity)** (survey 2026-11-15) — the next wave: a `dns.Cache` over `Lookup(T)` (`clone` + `ttl_s` relative to receipt): per-answer TTL clamp {min, max, default}, serve-stale (RFC 8767), negative caching (RFC 2308) with failure backoff, bounded entries with expiry pruning. c-ares caches by default, hickory/unbound/resolved too: the gap that keeps the scope at `core`. Not done in the API wave because it is its own policy surface (clamps, staleness, memory bound). Effort: medium. Fits §2.
-- **Request coalescing for the cache** (hickory and unbound merge in-flight queries for one key): `CachingResolver` lets two concurrent misses on a key both query (one after the other, behind the Resolver's mutex). A per-key in-flight marker with a waiters list would make the second wait for the first. Small-to-medium.
+- **Request coalescing for the cache** (hickory and unbound merge in-flight queries for one key): `CachingResolver` lets two concurrent misses on a key both query (on separate pooled Resolvers). A per-key in-flight marker with a waiters list would make the second wait for the first. Small-to-medium.
 - **Prefetch** (unbound `prefetch`, `serve-expired` refresh): re-query an entry in its last N % of TTL on a hit, so hot names never expire. Needs a background task or a caller-driven `refresh()`; medium.
 - **Per-RRset TTL in the cache**: the cache keeps one TTL per answer (the minimum, as `Lookup.ttl_s`); a lookup over both families (`lookupIp`) re-queries both when the shorter expires. Caching A and AAAA separately would save the longer one's query. Medium.
 - **Asynchronous API** (survey 2026-11-15): c-ares, hickory, unbound, dnspython, Node have one. Blocking calls on `std.Io` already run concurrently on an `Io` that schedules them (the parallel A/AAAA path does), so the gap is an event-driven many-queries-per-thread interface, which `std.Io` does not yet make portable. Deferred until `std.Io` settles.

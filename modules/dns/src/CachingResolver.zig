@@ -7,9 +7,7 @@
 //! failure backoff).
 //!
 //! ```zig
-//! var resolver = dns.Resolver.init(io, gpa, .{});
-//! defer resolver.deinit();
-//! var cache = try dns.CachingResolver.init(gpa, io, &resolver, .{ .stale_s = 3600 });
+//! var cache = try dns.CachingResolver.init(gpa, io, .{}, .{ .stale_s = 3600 });
 //! defer cache.deinit();
 //! var ans = try cache.lookupIp("example.com");
 //! defer ans.deinit();                     // ans.lookup is the caller's own copy
@@ -35,10 +33,13 @@
 //!    still inside `stale_s` (RFC 8767; off by default) and arm a per-key
 //!    exponential backoff during which the key is not asked again.
 //!  - Thread-safe: one `std.Io.Mutex` guards the table and is never held
-//!    across a network lookup. The `Resolver` itself is single-owner, so its
-//!    calls are serialized behind a second mutex; the caller must not use the
-//!    wrapped `Resolver` directly while the cache is shared. Two misses on one
-//!    key therefore both query, one after the other (no coalescing yet).
+//!    across a network lookup. The cache owns its `Resolver`s (a `Resolver` is
+//!    single-owner): it creates them lazily from the `Resolver.Options` given
+//!    to `init`, at most `Options.max_concurrent_lookups` of them, and a miss
+//!    takes a free one for the duration of its lookup (waiting, cancelable,
+//!    when all are busy). One slow name therefore never blocks a miss on
+//!    another. Two concurrent misses on the SAME key may both query (no
+//!    request coalescing yet).
 //!  - Memory: everything is under `gpa`, the table owns clones; an
 //!    allocation failure while storing returns the answer uncached.
 
@@ -53,12 +54,18 @@ const CachingResolver = @This();
 
 gpa: std.mem.Allocator,
 io: std.Io,
-resolver: *Resolver,
+resolver_options: Resolver.Options,
 options: Options,
-/// Guards everything below; never held across a call into `resolver`.
+/// Guards everything from `map` on; never held across a Resolver call.
 mutex: std.Io.Mutex = .init,
-/// Serializes calls into `resolver` (single-owner).
-net_mutex: std.Io.Mutex = .init,
+/// Resolver pool: the free list and creation count, with the condition a miss
+/// waits on when `max_concurrent_lookups` Resolvers are all busy.
+pool_mutex: std.Io.Mutex = .init,
+pool_cond: std.Io.Condition = .init,
+free: ?*Slot = null,
+all: ?*Slot = null,
+created: u16 = 0,
+pool_waiters: u32 = 0,
 map: std.StringHashMapUnmanaged(*Entry) = .empty,
 /// Most / least recently used end of the intrusive list.
 head: ?*Entry = null,
@@ -112,6 +119,16 @@ pub const Options = struct {
     max_network_lookups: ?Budget = null,
     /// Test seam; default = the `Io` awake clock.
     clock: ?Clock = null,
+    /// Most `Resolver`s (hence network lookups) in flight at once; created on
+    /// demand. A miss beyond that waits for one to be returned. 0 is invalid.
+    max_concurrent_lookups: u16 = 8,
+};
+
+/// One pooled Resolver (heap-pinned: a Resolver must not move once used).
+const Slot = struct {
+    resolver: Resolver,
+    next_free: ?*Slot = null,
+    next_all: ?*Slot = null,
 };
 
 pub const Error = Resolver.Error || error{BudgetExceeded};
@@ -208,21 +225,29 @@ const Entry = struct {
 
 /// `error.InvalidOptions`: `max_entries` 0, `min_ttl_s` > `max_ttl_s`,
 /// `negative_min_ttl_s` > `negative_max_ttl_s`, a zero or inverted backoff,
-/// a budget with `per_s` or `burst` 0.
-pub fn init(gpa: std.mem.Allocator, io: std.Io, resolver: *Resolver, options: Options) error{InvalidOptions}!CachingResolver {
+/// a budget with `per_s` or `burst` 0, `max_concurrent_lookups` 0. The slices
+/// inside `resolver_options` (servers, paths, EDNS options) must outlive the
+/// cache.
+pub fn init(gpa: std.mem.Allocator, io: std.Io, resolver_options: Resolver.Options, options: Options) error{InvalidOptions}!CachingResolver {
     const o = options;
     if (o.max_entries == 0) return error.InvalidOptions;
     if (o.min_ttl_s > o.max_ttl_s or o.negative_min_ttl_s > o.negative_max_ttl_s) return error.InvalidOptions;
     if (o.failure_backoff_min_s == 0 or o.failure_backoff_min_s > o.failure_backoff_max_s) return error.InvalidOptions;
     if (o.max_network_lookups) |b| if (b.per_s == 0 or b.burst == 0) return error.InvalidOptions;
-    var c: CachingResolver = .{ .gpa = gpa, .io = io, .resolver = resolver, .options = o };
+    if (o.max_concurrent_lookups == 0) return error.InvalidOptions;
+    var c: CachingResolver = .{ .gpa = gpa, .io = io, .resolver_options = resolver_options, .options = o };
     if (o.max_network_lookups) |b| c.tokens = b.burst;
     c.refill_s = c.now();
     return c;
 }
 
-/// Frees every entry. No lookup may be running.
+/// Frees every entry and Resolver. No lookup may be running.
 pub fn deinit(c: *CachingResolver) void {
+    while (c.all) |slot| {
+        c.all = slot.next_all;
+        slot.resolver.deinit();
+        c.gpa.destroy(slot);
+    }
     c.removeAll();
     c.map.deinit(c.gpa);
     c.* = undefined;
@@ -418,9 +443,9 @@ fn run(
     c.mutex.unlock(io);
     held = false;
 
-    c.net_mutex.lockUncancelable(io);
-    const res = call(c.resolver, ctx);
-    c.net_mutex.unlock(io);
+    const slot = try c.acquire();
+    const res = call(&slot.resolver, ctx);
+    c.release(slot);
 
     c.mutex.lockUncancelable(io);
     held = true;
@@ -439,9 +464,56 @@ fn bypass(
     c.mutex.lockUncancelable(c.io);
     c.network_lookups += 1;
     c.mutex.unlock(c.io);
-    c.net_mutex.lockUncancelable(c.io);
-    defer c.net_mutex.unlock(c.io);
-    return .{ .lookup = try call(c.resolver, ctx), .source = .network };
+    const slot = try c.acquire();
+    defer c.release(slot);
+    return .{ .lookup = try call(&slot.resolver, ctx), .source = .network };
+}
+
+/// A free pooled Resolver, a new one while fewer than `max_concurrent_lookups`
+/// exist, else wait (cancelable) for one to come back. `mutex` must not be held.
+fn acquire(c: *CachingResolver) Error!*Slot {
+    const io = c.io;
+    try c.pool_mutex.lock(io);
+    while (true) {
+        if (c.free) |s| {
+            c.free = s.next_free;
+            s.next_free = null;
+            c.pool_mutex.unlock(io);
+            return s;
+        }
+        if (c.created < c.options.max_concurrent_lookups) {
+            c.created += 1; // reserved; the allocation happens outside the lock
+            c.pool_mutex.unlock(io);
+            const s = c.gpa.create(Slot) catch {
+                c.pool_mutex.lockUncancelable(io);
+                c.created -= 1;
+                c.pool_cond.signal(io);
+                c.pool_mutex.unlock(io);
+                return error.OutOfMemory;
+            };
+            s.* = .{ .resolver = Resolver.init(io, c.gpa, c.resolver_options) };
+            c.pool_mutex.lockUncancelable(io);
+            s.next_all = c.all;
+            c.all = s;
+            c.pool_mutex.unlock(io);
+            return s;
+        }
+        c.pool_waiters += 1;
+        c.pool_cond.wait(io, &c.pool_mutex) catch |err| {
+            c.pool_waiters -= 1;
+            c.pool_mutex.unlock(io); // `wait` returns with the mutex held
+            return err;
+        };
+        c.pool_waiters -= 1;
+    }
+}
+
+fn release(c: *CachingResolver, s: *Slot) void {
+    c.pool_mutex.lockUncancelable(c.io);
+    s.next_free = c.free;
+    c.free = s;
+    c.pool_cond.signal(c.io);
+    c.pool_mutex.unlock(c.io);
 }
 
 /// Called with `mutex` held. An upstream failure arms the key's backoff and
@@ -665,10 +737,21 @@ const Stub = struct {
     mode: std.atomic.Value(Mode) = .init(.answer),
     ttl: std.atomic.Value(u32) = .init(60),
     drop_aaaa: std.atomic.Value(bool) = .init(false),
+    /// The answer to a name starting with "slow" is held back until
+    /// `release_slow` is set: `stashed` says it is being held.
+    stashed: std.atomic.Value(bool) = .init(false),
+    release_slow: std.atomic.Value(bool) = .init(false),
+    pending: [1024]u8 = undefined,
+    pending_len: usize = 0,
+    pending_to: net.IpAddress = undefined,
 
     fn run(st: *Stub) void {
         var rbuf: [message.max_query_len]u8 = undefined;
         while (!st.stop.load(.acquire)) {
+            if (st.stashed.load(.acquire) and st.release_slow.load(.acquire)) {
+                st.sock.send(st.io, &st.pending_to, st.pending[0..st.pending_len]) catch return;
+                st.stashed.store(false, .release);
+            }
             const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } };
             const incoming = st.sock.receiveTimeout(st.io, &rbuf, t.toDeadline(st.io)) catch |err| switch (err) {
                 error.Timeout => continue,
@@ -760,6 +843,13 @@ const Stub = struct {
         try w.writeAll(q[12 .. i + 5]);
         try w.writeAll(aw.buffered());
         try w.writeAll(sw.buffered());
+        if (q[12] == 4 and std.ascii.eqlIgnoreCase(q[13..17], "slow")) {
+            @memcpy(st.pending[0..w.buffered().len], w.buffered());
+            st.pending_len = w.buffered().len;
+            st.pending_to = in.from;
+            st.stashed.store(true, .release);
+            return;
+        }
         try st.sock.send(st.io, &in.from, w.buffered());
     }
 };
@@ -785,8 +875,9 @@ const Harness = struct {
     io: std.Io = undefined,
     stub: Stub = undefined,
     fut: std.Io.Future(void) = undefined,
-    resolver: Resolver = undefined,
+    ropts: Resolver.Options = undefined,
     clock: TestClock = .{},
+    timeout_ms: u32 = 150,
 
     fn start(h: *Harness, family: Resolver.Family) !void {
         h.threaded = .init(testing.allocator, .{});
@@ -802,30 +893,29 @@ const Harness = struct {
             h.threaded.deinit();
             return err;
         };
-        h.resolver = Resolver.init(h.io, testing.allocator, .{
+        h.ropts = .{
             .servers = &loopback_servers,
             .port = sock.address.getPort(),
-            .timeout_ms = 150,
+            .timeout_ms = h.timeout_ms,
             .attempts = 1,
             .use_hosts = false,
             .use_search = false,
             .family = family,
             .parallel_families = false,
-        });
+        };
     }
 
     fn stop(h: *Harness) void {
         h.stub.stop.store(true, .release);
         h.fut.await(h.io);
         h.stub.sock.close(h.io);
-        h.resolver.deinit();
         h.threaded.deinit();
     }
 
     fn cache(h: *Harness, options: Options) !CachingResolver {
         var o = options;
         o.clock = h.clock.clock();
-        return CachingResolver.init(testing.allocator, h.io, &h.resolver, o);
+        return CachingResolver.init(testing.allocator, h.io, h.ropts, o);
     }
 
     fn queries(h: *Harness) u32 {
@@ -1311,8 +1401,6 @@ test "prune keeps entries inside the stale window" {
 test "InvalidOptions" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
-    var r = Resolver.init(threaded.io(), testing.allocator, .{});
-    defer r.deinit();
     const bad = [_]Options{
         .{ .max_entries = 0 },
         .{ .min_ttl_s = 10, .max_ttl_s = 5 },
@@ -1321,9 +1409,10 @@ test "InvalidOptions" {
         .{ .failure_backoff_min_s = 10, .failure_backoff_max_s = 5 },
         .{ .max_network_lookups = .{ .per_s = 0, .burst = 1 } },
         .{ .max_network_lookups = .{ .per_s = 1, .burst = 0 } },
+        .{ .max_concurrent_lookups = 0 },
     };
-    for (bad) |o| try testing.expectError(error.InvalidOptions, CachingResolver.init(testing.allocator, threaded.io(), &r, o));
-    var ok = try CachingResolver.init(testing.allocator, threaded.io(), &r, .{});
+    for (bad) |o| try testing.expectError(error.InvalidOptions, CachingResolver.init(testing.allocator, threaded.io(), .{}, o));
+    var ok = try CachingResolver.init(testing.allocator, threaded.io(), .{}, .{});
     ok.deinit();
 }
 
@@ -1349,8 +1438,20 @@ test "an allocation failure while storing returns the answer uncached" {
     var h: Harness = .{};
     try h.start(.v4);
     defer h.stop();
-    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    var c = try CachingResolver.init(failing.allocator(), h.io, &h.resolver, .{ .clock = h.clock.clock() });
+    // Measure the allocations of one uncached-then-stored lookup, then fail
+    // the last of them (inside the store) on an identical run.
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var total: usize = 0;
+    {
+        var c = try CachingResolver.init(counting.allocator(), h.io, h.ropts, .{ .clock = h.clock.clock() });
+        defer c.deinit();
+        var a = try c.lookupIp("oom.example.com");
+        a.deinit();
+        try testing.expectEqual(@as(usize, 1), c.stats().entries);
+        total = counting.alloc_index;
+    }
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = total - 1 });
+    var c = try CachingResolver.init(failing.allocator(), h.io, h.ropts, .{ .clock = h.clock.clock() });
     defer c.deinit();
     var a = try c.lookupIp("oom.example.com");
     defer a.deinit();
@@ -1494,4 +1595,94 @@ test "four threads share one cache: no leak, consistent stats" {
     try testing.expectEqual(s.misses, s.network_lookups);
     try testing.expectEqual(@as(u64, h.queries()), s.network_lookups);
     try testing.expectEqual(@as(usize, 3), s.entries);
+}
+
+/// Runs one lookup on its own task and reports when it is done.
+const NamedLookup = struct {
+    c: *CachingResolver,
+    name: []const u8,
+    started: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    ok: std.atomic.Value(bool) = .init(false),
+
+    fn run(w: *NamedLookup) void {
+        w.started.store(true, .release);
+        if (w.c.lookupIp(w.name)) |ans| {
+            var a = ans;
+            w.ok.store(a.lookup.items.len == 1, .release);
+            a.deinit();
+        } else |_| {}
+        w.done.store(true, .release);
+    }
+};
+
+/// Bounded wait for a flag another task sets (a test, not a library, spins).
+fn waitFor(io: std.Io, flag: *const std.atomic.Value(bool)) !void {
+    for (0..5000) |_| {
+        if (flag.load(.acquire)) return;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    return error.TestTimeout;
+}
+
+fn waitForWaiters(c: *CachingResolver, n: u32) !void {
+    for (0..5000) |_| {
+        c.pool_mutex.lockUncancelable(c.io);
+        const w = c.pool_waiters;
+        c.pool_mutex.unlock(c.io);
+        if (w >= n) return;
+        try c.io.sleep(.fromMilliseconds(2), .awake);
+    }
+    return error.TestTimeout;
+}
+
+test "a slow name does not block a miss on another name" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_concurrent_lookups = 2 });
+    defer c.deinit();
+
+    var slow: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+    var fut = try h.io.concurrent(NamedLookup.run, .{&slow});
+    defer fut.await(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &h.stub.stashed); // the stub holds the slow name's answer
+
+    var fast = try c.lookupIp("fast.example.com"); // answered at once
+    defer fast.deinit();
+    try testing.expectEqual(Source.network, fast.source);
+    try testing.expect(!slow.done.load(.acquire)); // the slow one cannot have finished: its answer is still held
+
+    h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &slow.done);
+    try testing.expect(slow.ok.load(.acquire));
+    try testing.expectEqual(@as(u32, 2), h.queries());
+}
+
+test "with max_concurrent_lookups = 1 the second miss waits for the first" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_concurrent_lookups = 1 });
+    defer c.deinit();
+
+    var slow: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+    var f1 = try h.io.concurrent(NamedLookup.run, .{&slow});
+    defer f1.await(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &h.stub.stashed);
+
+    var fast: NamedLookup = .{ .c = &c, .name = "fast.example.com" };
+    var f2 = try h.io.concurrent(NamedLookup.run, .{&fast});
+    defer f2.await(h.io);
+    try waitForWaiters(&c, 1); // the second is parked in the pool
+    try testing.expect(!fast.done.load(.acquire));
+    try testing.expectEqual(@as(u32, 1), h.queries()); // and has sent nothing
+
+    h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &slow.done);
+    try waitFor(h.io, &fast.done);
+    try testing.expect(slow.ok.load(.acquire) and fast.ok.load(.acquire));
+    try testing.expectEqual(@as(u32, 2), h.queries());
 }
