@@ -277,6 +277,14 @@ POSIX-only) · util · reentrant` + deps: `argsafe` (opt-in argv sanitization vi
 `buildValidatedArgv`; every other entry point is std-only) — canonical source is `pub const meta`
 in src/root.zig.
 
+**Audit 2026-11-15 (delta mutation).** 9 schemata mutants over the `reset_signal_mask` path, ReleaseSafe, one build, each
+mutant under `setsid -w timeout` and `ulimit -v`: the plumbing (`Spec` to `Options` to the child's arguments: forced
+true, forced false), the child's choice (flag inverted, always empty, always inherited), the `rt_sigprocmask` call skipped,
+the empty set replaced by a full one. All 9 killed by the existing signal-mask test; no test needed. The two
+defaults (`Spec.reset_signal_mask = true` and the internal `Options` one) cannot sit behind a runtime switch: the
+`Spec` default is exercised by that same test (it runs a child without naming the field and expects an empty mask), but
+was not mutated by a run; the `Options` default is never relied on, since `procrun` always passes the field. 9/9.
+
 ## Anchoring
 
 **Anchor grade:** class C · oracle n/a
