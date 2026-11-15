@@ -22,7 +22,7 @@ Audit detail: the review is an independent read-only pass over poly, sample, kec
 
 ## Compared with
 
-Surveyed 2026-11-01 per `SURVEY-PLAYBOOK.md` (full report with a URL per claim: the CML
+Surveyed 2026-11-01 per `SURVEY-PLAYBOOK.md` (full report with a URL per claim: the owner's
 workspace's `20261101-mlkem/E.report.md`); stars and activity as of that date.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
