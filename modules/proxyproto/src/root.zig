@@ -410,6 +410,16 @@ fn isTrusted(peer: ?netaddr.Ip, list: []const netaddr.Prefix) bool {
 /// success the header's bytes are copied into `buf` (the result borrows it)
 /// and consumed from `r`. On any error nothing is consumed.
 ///
+/// ⚠ With `required = false`, a trusted peer that sends no header makes the
+/// CLIENT's first bytes the candidate header: a client that opens with a valid
+/// PROXY line would then pick its own address. Set `required = true` when the
+/// balancer always sends a header.
+///
+/// For an untrusted peer a stream that only starts like a header (a byte
+/// prefix of a signature, then EOF or a buffer too small to see more) is not an
+/// error: `read` returns null (`error.Missing` when `required`) and the bytes
+/// stay. A complete header is `error.UntrustedPeer`.
+///
 /// `r.buffer` must hold the largest header expected (`opts.max_v2_len`, 536 by
 /// default): a reader whose buffer is smaller than a header needs gets
 /// `error.TooLarge`. `buf` likewise.
@@ -417,7 +427,12 @@ pub fn read(r: *std.Io.Reader, buf: []u8, opts: ReadOptions) ReadError!?Header {
     const popts: Options = .{ .max_v2_len = opts.max_v2_len };
     var want: usize = 1;
     while (true) {
-        if (want > r.buffer.len) return error.TooLarge;
+        if (want > r.buffer.len) {
+            // An untrusted peer's partial prefix is not an error: no complete
+            // header was seen (SPEC.md § Trust).
+            if (!isTrusted(opts.peer, opts.trusted)) return if (opts.required) error.Missing else null;
+            return error.TooLarge;
+        }
         var eof = false;
         r.fill(want) catch |e| switch (e) {
             error.ReadFailed => return error.ReadFailed,
@@ -432,7 +447,7 @@ pub fn read(r: *std.Io.Reader, buf: []u8, opts: ReadOptions) ReadError!?Header {
             .absent => return if (opts.required) error.Missing else null,
             .need_more => |n| {
                 if (eof) {
-                    if (data.len != 0) return error.Truncated;
+                    if (data.len != 0 and isTrusted(opts.peer, opts.trusted)) return error.Truncated;
                     return if (opts.required) error.Missing else null;
                 }
                 want = data.len + n;
@@ -536,6 +551,8 @@ fn writeV2Impl(w: *std.Io.Writer, h: Header, tlvs: []const u8, with_crc: bool) W
                 const d = h.destination orelse return error.InvalidHeader;
                 if (s != .unix or d != .unix) return error.InvalidHeader;
                 if (s.unix.len > unix_path_len or d.unix.len > unix_path_len) return error.InvalidHeader;
+                // The parser stops at the first NUL: such a path would not round-trip.
+                if (std.mem.indexOfScalar(u8, s.unix, 0) != null or std.mem.indexOfScalar(u8, d.unix, 0) != null) return error.InvalidHeader;
                 @memset(head[16..232], 0);
                 @memcpy(head[16..][0..s.unix.len], s.unix);
                 @memcpy(head[16 + unix_path_len ..][0..d.unix.len], d.unix);
