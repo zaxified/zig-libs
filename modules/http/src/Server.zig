@@ -104,6 +104,7 @@ const gzip = @import("gzip.zig");
 const crc32 = @import("crc32");
 const conneg = @import("conneg.zig");
 const bufpool = @import("bufpool.zig");
+const zeroize = @import("zeroize.zig");
 // The branchless civil-from-days calendar, for the `Date` header. std has one
 // too, and it walks a year at a time from 1970 -- see `formatHttpDate`.
 const datefmt = @import("datefmt");
@@ -2334,8 +2335,32 @@ pub fn serveStep(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuf
         if (lent) |l| p.release(p.ctx, l);
     };
 
-    return serveOne(opts, in, out, use, req_index, force_close);
+    // Request bytes (request line, Authorization/Cookie, body, trailers) must
+    // not outlive the request in a buffer that is reused or returned to a
+    // pool (qap S4). Declared AFTER the release `defer`, so it runs BEFORE
+    // it, on every exit of this function -- `serveOne`'s early 4xx answers,
+    // errors, detached and upgraded responses included. Only the prefixes
+    // `serveOne` reports as touched are wiped (`RequestUsed`): a plain GET
+    // costs its head's length, not the 8 KiB head buffer.
+    var used: RequestUsed = .{ .head = use.head.len };
+    defer {
+        zeroize.zeroize(use.head[0..used.head]);
+        zeroize.zeroize(use.request_body[0..used.request_body]);
+        zeroize.zeroize(use.trailers[0..used.trailers]);
+    }
+
+    return serveOne(opts, in, out, use, req_index, force_close, &used);
 }
+
+/// How much of each request buffer one request may have written, reported by
+/// `serveOne` to `serveStep`'s wipe. Starts conservative (the whole head
+/// buffer: until `readHead` succeeds, a partial line may sit anywhere in it)
+/// and narrows as the request is understood.
+const RequestUsed = struct {
+    head: usize = 0,
+    request_body: usize = 0,
+    trailers: usize = 0,
+};
 
 pub const ConnDisposition = enum { keep_alive, close };
 
@@ -2399,7 +2424,7 @@ fn streamReaderOk(in: *const Reader) bool {
     return !(in.buffer.len == 0 and in.vtable.rebase == &Reader.defaultRebase);
 }
 
-fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers, req_index: u32, force_close: bool) ConnDisposition {
+fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers, req_index: u32, force_close: bool, used: *RequestUsed) ConnDisposition {
     if (!streamArgsOk(opts, in, bufs)) {
         _ = respondError(opts, out, null, 500);
         return .close;
@@ -2415,6 +2440,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         error.MalformedHead => return respondError(opts, out, date, 400),
         error.ReadFailed, error.ConnectionClosed => return .close,
     };
+    used.head = block.len;
     if (opts.control) |c| c.headRead();
     fireConnState(&opts, .active);
 
@@ -2575,6 +2601,15 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         return respondError(opts, out, date, 415);
 
     const has_body = head.chunked or (head.content_length orelse 0) != 0;
+    // The body scratch is touched only when there is a body, and a
+    // Content-Length body cannot put more than that into it; a chunked one
+    // may fill all of it and the trailer capture.
+    if (head.chunked) {
+        used.request_body = bufs.request_body.len;
+        used.trailers = bufs.trailers.len;
+    } else if (has_body) {
+        used.request_body = @intCast(@min(head.content_length.?, bufs.request_body.len));
+    }
 
     var body: RequestBody = if (opts.max_body_bytes) |max|
         .initCappedWithTrailers(&head, in, bufs.request_body, max, bufs.trailers)
@@ -9762,6 +9797,121 @@ test "serveStep: one turn of the loop, wait owned by the caller" {
     try testing.expectEqual(ConnDisposition.close, serveStep(capped, &in2, &out2, bufs, 0));
     try testing.expect(std.mem.find(u8, out2.buffered(), "connection: close") != null or
         std.mem.find(u8, out2.buffered(), "Connection: close") != null);
+}
+
+/// Wire for the S4 wipe tests: every request-borne secret carries a marker
+/// that `containsAnyMarker` looks for.
+const s4_markers = [_][]const u8{ "Bearer S4SECRETTOKEN", "S4COOKIEVALUE", "S4BODYBYTES", "S4TRAILERVAL", "/s4-path-marker" };
+const s4_wire = "POST /s4-path-marker HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer S4SECRETTOKEN\r\n" ++
+    "Cookie: sid=S4COOKIEVALUE\r\nContent-Length: 11\r\n\r\nS4BODYBYTES" ++
+    "POST /s4-path-marker HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer S4SECRETTOKEN\r\n" ++
+    "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n" ++
+    "B\r\nS4BODYBYTES\r\n0\r\nX-T: S4TRAILERVAL\r\n\r\n";
+
+fn containsAnyMarker(hay: []const u8) bool {
+    for (s4_markers) |m| if (std.mem.find(u8, hay, m) != null) return true;
+    return false;
+}
+
+fn s4Handler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    // Read the body (and, for the chunked request, its trailers) like a real
+    // handler would, so the scratch buffers really are filled.
+    var sink: [64]u8 = undefined;
+    const r = req.reader();
+    while (true) {
+        const n = r.readSliceShort(&sink) catch break;
+        if (n < sink.len) break;
+    }
+    try rw.writeAll("ok");
+}
+
+test "S4: a pooled slab is wiped of request bytes before it is released" {
+    var layout: PooledBuffers = .{
+        .pool = undefined,
+        .head_len = 1024,
+        .request_body_len = 256,
+        .response_body_len = 64,
+        .chunk_len = 128,
+        .trailers_len = 64,
+    };
+    var pool: bufpool.BufferPool = try .init(testing.allocator, layout.slabSize(), 4);
+    defer pool.deinit();
+    layout.pool = &pool;
+
+    var in: Reader = .fixed(s4_wire);
+    var out_buf: [4096]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var none: [0]u8 = undefined;
+    serveStream(.{
+        .handler = s4Handler,
+        .server_name = "test",
+        .now = null,
+        .buffers_provider = try layout.provider(),
+    }, &in, &out, .{ .head = &none, .request_body = &none, .response_body = &none, .chunk = &none });
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out.buffered(), "ok"));
+
+    // The next connection to acquire sees the same slab.
+    try testing.expectEqual(@as(usize, 1), pool.allocCount());
+    const slab = try pool.acquire();
+    defer pool.release(slab);
+    try testing.expect(!containsAnyMarker(slab));
+}
+
+test "S4: caller-owned buffers are wiped of request bytes when serveStep returns" {
+    var in: Reader = .fixed(s4_wire);
+    var out_buf: [4096]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    var trailer_buf: [64]u8 = undefined;
+    // Poison first: a wipe of `used` bytes must not be satisfied by buffers
+    // that never held anything.
+    @memset(&head_buf, 0);
+    @memset(&request_body_buf, 0);
+    @memset(&trailer_buf, 0);
+    const bufs: StreamBuffers = .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+        .trailers = &trailer_buf,
+    };
+    const opts: StreamOptions = .{ .handler = s4Handler, .server_name = "test", .now = null };
+
+    var served: u32 = 0;
+    while (true) {
+        _ = in.peekByte() catch break;
+        const d = serveStep(opts, &in, &out, bufs, served);
+        try testing.expect(!containsAnyMarker(&head_buf));
+        try testing.expect(!containsAnyMarker(&request_body_buf));
+        try testing.expect(!containsAnyMarker(&trailer_buf));
+        served += 1;
+        if (d == .close) break;
+    }
+    try testing.expectEqual(@as(u32, 2), served);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out.buffered(), "ok"));
+}
+
+test "S4: an early 4xx answer wipes the head too" {
+    var in: Reader = .fixed("GET /s4-path-marker HTTP/1.1\r\nAuthorization: Bearer S4SECRETTOKEN\r\n\r\n");
+    var out_buf: [4096]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    @memset(&head_buf, 0);
+    const d = serveStep(.{ .handler = s4Handler, .server_name = "test", .now = null }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    }, 0);
+    try testing.expectEqual(ConnDisposition.close, d); // no Host: 400
+    try testing.expect(std.mem.find(u8, out.buffered(), "400") != null);
+    try testing.expect(!containsAnyMarker(&head_buf));
 }
 
 test "buffers_provider: nothing is borrowed while the connection waits" {
