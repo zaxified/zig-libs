@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-13** — **BEHAVIOURAL:** a TLS 1.3 ServerHello or HelloRetryRequest carrying an extension only TLS 1.2 defines there (ALPN, status_request, SCT, extended_master_secret, SessionTicket, renegotiation_info) ends the handshake with `error.TlsIllegalParameter`, as Go's client refuses it; before, the ALPN answer there was taken and the others ignored. No real TLS 1.3 server sends them (interop with Go unchanged).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit recorded from the delta mutation run over TLS 1.2 resumption (182 mutants: 160 killed, 22 equivalent or unobservable).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation audit of the TLS 1.2 session-ticket resumption (every function the three resumption commits touched, whole, plus the guards that read the state they write: 182 mutants, each run against the whole test binary). New tests: the verification hook and `did_resume` on a resumption (kept chain, refusal before our Finished, entry dropped), an entry replaced by another connection during the handshake (neither overwritten by our ticket nor dropped by our failure), a 2048-byte ticket kept, the exporter of a resumed session (RFC 5705 over the cached master; unavailable without EMS), NewSessionTicket placement (before the Certificate, twice) and a ChangeCipherSpec early in a full handshake, no ticket extension without a server name, offer-time re-check of the stored chain (no-verification entry under a bundle, host not covered by the leaf, no chain, `.self_signed` leaf, new fixture `selfsigned.pem`), every offered TLS 1.2 suite resumable and no value spanning two list entries, our Finished flushed before `init` returns, our Finished being record 0 (`write_seq`), the Finished length bytes, the resumed group; against openssl: a TLS 1.2 full handshake then two resumptions on the stored ticket, a server without tickets leaving a cached session alone, the half-made entry at the Certificate (unusable until the ticket is in, not filled once replaced, dropped by a refusal), a TLS 1.3 handshake replacing a cached TLS 1.2 session; `SessionCache.find`/`reserve` key guards, `hello.write` exact-fit. Survivors are equivalents or unobservable, argued per mutant in the audit table; no production code changed.
@@ -21,7 +22,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-10-28** — **No-panic sweep** (owner rule for grade 1–2; independent review, report outside the repo). **Fix (data loss):** `flush` (and so `end`) sealed what fit `output`'s free space once and cleared the buffer, so a `write_buffer` larger than that lost the rest without an error (inherited from std); it now writes record by record until empty. **Fix (caller contract, UB in ReleaseFast):** an `input` under `min_buffer_len` was an assert, an `output` under it that cannot grow (a socket writer) asserted at the first application record, a `read_buffer` under a record failed every big record — all `error.BufferTooSmall` at `init` now (`Writer.Allocating` still fine); `realtime_now` outside i64 milliseconds failed an `@intCast` here and in std's `toSeconds` (`error.RealtimeInvalid`, new); `ClientSession.fresh` subtracts checked. **Fix (RFC 8446 §5.1):** a KeyUpdate followed by anything in the same record is `TlsUnexpectedMessage` (before the key changes); this also bounds the work a record can cost (~3,270 KeyUpdates per 16 KiB record before). Documented: the ~400 KiB stack `init` needs, the `SessionCache` outliving its clients. The fuzz harness's 8 KiB `Discarding` output was one of the too-small outputs. Tests: "flush: a write_buffer larger…", "init: input or output buffer…", "init: a realtime_now…", "KeyUpdate: one ends its record…", "ClientSession.fresh: an extreme clock…".
 
-- **2026-10-28** — Card: `Downstream consumer: yes` — qap imports it (it has since the TLS move of 2026-10-19; the card was not updated).
+- **2026-10-28** — Card: `Downstream consumer: yes` — the web-server consumer imports it (it has since the TLS move of 2026-10-19; the card was not updated).
 
 - **2026-10-26** — **Fix (security, Go's rule):** a TLS 1.3 session made without certificate verification (`ca = .no_verification` or `.self_signed`) was resumed by a later connection verifying with a bundle through a shared `SessionCache` -- a resumption skips the Certificate, so a man in the middle of the first connection could impersonate the server on the second. A session is now resumed only under the verification it was made with, or with none (Go: a session without verified chains is not resumed by a verifying config). A cache shared between different bundles is still one trust domain (documented). Test "resumableUnder: …". Found by the audit's review (F2).
 
@@ -134,12 +135,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   by `testkit.fuzz.seedInto`. `Smith.slice` reads a 4-byte length first, so
   the raw seeds lost their first bytes and never reached the verifier. The
   corpus test now reads the seeds back through `Smith`, as the fuzzer does
-  (raw seeds fail it). Reported by qap.
+  (raw seeds fail it). Reported by the web-server consumer.
 - **2026-09-25** — New module: Zig 0.16's `std.crypto.tls.Client` with the
   server chain verified by `x509.verifyChain` (RFC 5280: basicConstraints,
   keyUsage, pathLen, nameConstraints, extKeyUsage serverAuth) and every peer
   certificate guarded by `x509.safe` -- closes ziglang/zig #35877, where any
   certificate holder could impersonate any host. Anchored against
   `openssl s_server` (honest chain accepted, forged chain refused, std's own
-  client still accepting it as the retirement tripwire). Found by qap's
+  client still accepting it as the retirement tripwire). Found by the web-server consumer's
   M6.2 security review.
