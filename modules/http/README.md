@@ -234,6 +234,7 @@ var server = http.Server.init(threaded.io(), gpa, .{
     // .max_request_line_bytes = 8 * 1024, .max_body_bytes = 1 << 20,
     // .on_connect = myGate, .on_connect_ctx = &gate,   // accept/reject
     // .on_conn_state = myMetrics,                      // Go ConnState-style
+    // .on_conn_closed = mySummary,                     // one ConnSummary per connection
     // .compression = .{},   // negotiated gzip; off when omitted (see below)
 });
 defer server.deinit();
@@ -567,7 +568,11 @@ count of admitted, not-yet-closed connections — the enforcement input for
 a global cap. `Options.on_conn_state` optionally observes
 `new / active / idle / closed` per connection (Go ConnState-style;
 `active` fires when a request head arrived, not on the first byte;
-rejected connections fire nothing). `Options.on_error` is Go's
+rejected connections fire nothing). `Options.on_conn_closed` is a
+second, optional callback fired once per admitted connection, after
+`.closed` and after the cause is known, with a `Server.ConnSummary`
+(`peer`, `requests`, `duration_ns`, `end`: `normal`, `timed_out`,
+`errored`, `refused`) — h1 and h2c alike. `Options.on_error` is Go's
 `ErrorLog` as a callback: a handler error (`handler_failed`, with the
 error), a request refused before its handler (`request_refused`, with the
 status), a server-side failure (`server_failed`: 503 no working memory, 500
