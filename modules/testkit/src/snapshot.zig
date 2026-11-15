@@ -117,7 +117,7 @@ fn check(kind: Kind, src: std.builtin.SourceLocation, expected: []const u8, actu
         std.debug.print("\n{s} must be unset or `update`\n", .{env_name});
         return e;
     };
-    const same = matches(std.heap.page_allocator, kind, expected, actual) catch |e| switch (e) {
+    const same = matches(std.heap.page_allocator, kind, expected, actual) catch |e| switch (e) { // global-alloc-ok: called only from `test` blocks via expectSnapshot*; the compare holds no state past the call
         // A malformed or missing hex literal is repaired by an update; compared, it is an error.
         error.InvalidCharacter, error.InvalidLength => blk: {
             if (mode == .compare) {
@@ -241,10 +241,10 @@ fn writeExcerpt(w: *Io.Writer, s: []const u8) Io.Writer.Error!void {
 fn writeHexDiff(w: *Io.Writer, expected_hex: []const u8, actual: []const u8) Io.Writer.Error!void {
     // The decode already succeeded in `check`; a failure here (a hand-built
     // call of this function) is shown rather than hidden.
-    const expected = hexBytes(std.heap.page_allocator, expected_hex) catch |e| {
+    const expected = hexBytes(std.heap.page_allocator, expected_hex) catch |e| { // global-alloc-ok: failure-report path of expectSnapshotHex, called only from `test` blocks
         return w.print("  the hex literal does not decode ({t})\n", .{e});
     };
-    defer std.heap.page_allocator.free(expected);
+    defer std.heap.page_allocator.free(expected); // global-alloc-ok: frees the line-244 decode
     const m = golden.diff(expected, actual) orelse return;
     const at = switch (m) {
         .length => |l| @min(l.expected, l.actual),
@@ -716,7 +716,7 @@ fn envGet(name: []const u8) ?[]const u8 {
 /// variable set.
 fn updateSource(kind: Kind, src: std.builtin.SourceLocation, expected: []const u8, actual: []const u8) Error!void {
     const io = std.testing.io;
-    const gpa = std.heap.page_allocator;
+    const gpa = std.heap.page_allocator; // global-alloc-ok: the update registry lives for the whole test process (one per run), no caller to take one from
     const depth = rootDepth(io) orelse return error.SnapshotSourceNotFound;
     var up: [64]u8 = undefined;
     var n: usize = 0;
