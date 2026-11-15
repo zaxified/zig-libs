@@ -167,7 +167,7 @@ every method, against the topology, and `mtr -r` agrees for ICMP, UDP and TCP.
 ## TCP method (2026-11-02)
 
 A connection attempt per probe, non-blocking, with the probe's TTL and `IP_RECVERR`: traceroute(8)'s
-`tcpconn` shape, not half-open raw SYN. It needs no privilege, which is what zpinger runs with, and the
+`tcpconn` shape, not half-open raw SYN. It needs no privilege, which is what the network-monitor consumer runs with, and the
 kernel matches any ICMP error to the connection by its quoted sequence number before queueing it, a
 stronger check than the 16 bits the other methods have. The cost: on an open port the handshake
 completes, so the application behind it sees a connection (reset at once: `SO_LINGER` 0, no
@@ -292,7 +292,7 @@ is a bounded blocking call over the same `Transport` seam, offline-testable on a
 
 ## Many destinations: `MtrSet` (2026-10-31)
 
-**Why.** A consumer that runs several live traces (zpinger: one per watched host) used to run one
+**Why.** A consumer that runs several live traces (the network-monitor consumer: one per watched host) used to run one
 `LiveMtr` each: every trace probed its own TTL 1, 2, … — the same home gateway and ISP routers —
 once a second. Routers limit the ICMP errors they generate per source (Linux: `icmp_ratelimit`,
 about one Time Exceeded a second, with a small burst; hardware routers police their control plane
