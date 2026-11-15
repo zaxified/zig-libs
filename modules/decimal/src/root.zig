@@ -324,7 +324,7 @@ pub const Decimal = struct {
     }
 
     /// Remainder of the **truncated** division, `a - b·trunc(a/b)`: the sign of
-    /// the dividend, like Python `Decimal % Decimal`, GDA `remainder` and bxp's
+    /// the dividend, like Python `Decimal % Decimal`, GDA `remainder` and the build-tool consumer's
     /// MOD (`-7 rem 3 = -1`, `7 rem -3 = 1`). Exact; `|result| < |b|`, so it
     /// never overflows. `error.DivisionByZero` on `b = 0`.
     pub fn rem(a: Decimal, b: Decimal) error{DivisionByZero}!Decimal {
@@ -362,7 +362,7 @@ pub const Decimal = struct {
         return .{ .raw = @intCast(r) };
     }
 
-    /// Round to the nearest multiple of `m` with `mode` — bxp's MROUND, Excel
+    /// Round to the nearest multiple of `m` with `mode` — the build-tool consumer's MROUND, Excel
     /// `MROUND`/`CEILING`/`FLOOR` in one: `roundToMultiple(0.075, 0.05,
     /// .half_up)` is `0.1`, `(12.37, 0.05, .half_even)` is `12.35`. The sign of
     /// `m` is ignored (only the step size matters); the sign of `x` is kept

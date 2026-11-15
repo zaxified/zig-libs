@@ -76,10 +76,10 @@ fn isZero(self) bool;
 fn signum(self) i8;
 fn min(a, b) Decimal;   fn max(a, b) Decimal;
 fn minMag(a, b) Decimal;  fn maxMag(a, b) Decimal;       // GDA min/max-magnitude
-fn rem(a, b) error{DivisionByZero}!Decimal;              // sign of the dividend (Python %, bxp MOD)
+fn rem(a, b) error{DivisionByZero}!Decimal;              // sign of the dividend (Python %, the build-tool consumer MOD)
 fn divideInteger(a, b) error{ Overflow, DivisionByZero }!i128;   // truncated a // b
 fn remainderNear(a, b) error{DivisionByZero}!Decimal;    // GDA remainder-near, ties to even
-fn roundToMultiple(x, m, mode) error{ Overflow, DivisionByZero }!Decimal;   // bxp MROUND, any mode
+fn roundToMultiple(x, m, mode) error{ Overflow, DivisionByZero }!Decimal;   // the build-tool consumer MROUND, any mode
 fn pow(self, allocator, n: i32) PowError!Decimal;        // exact, rounded once half_even; Overflow / ResultTooLarge
 fn sqrt(self) error{NegativeOperand}!Decimal;            // correctly rounded to 12 places, no allocation
 fn toStringFixed(self, buf: []u8, places: u32, mode) error{NoSpaceLeft}![]const u8;  // "2.500", "0.00"
