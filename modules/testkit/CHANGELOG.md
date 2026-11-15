@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **Fix (consumer-visible, edge):** `testkit.snapshot` update mode read source files with `.limited(max_source)`, and `readFileAlloc` fails when the limit is reached, so a source file of exactly `max_source` (4 MiB) bytes was refused with `SnapshotTooLarge` although the documented cap and the write check allow it; it now reads up to `max_source` bytes. Delta mutation audit of `snapshot.zig` (315 mutants: 302 killed, 10 equivalent, 3 unobservable) and the tests it needed: edges of `lineFrom`/`offsetOf`/`shifted`, exact `max_source` files, a directory as source path, descriptor-leak count, symlinked modules, and the real-environment path (`check`, `updateSource`, `rootDepth`, `envGet`) driven by a replaced `std.testing.environ`, a changed working directory and a redirected fd 2.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** `snapshot.zig`'s process-global allocator uses carry `global-alloc-ok` reasons (check-global-alloc); the fixture reader in its tests reads up to `max_source`.

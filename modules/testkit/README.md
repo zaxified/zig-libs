@@ -71,7 +71,7 @@ place to put things a test might one day want.
 | `fuzz.driver.run` / `fuzz.Rng` / `fuzz.driver.hit` | the deterministic fuzz driver, copied by hand into seglog and zstd (2026-09-27) before the web-server consumer needed it a third time |
 | `stackprobe.Probe` | the dead-stack probe engine, copied into 55 modules' `stackprobe_test.zig` (27.8k lines, 2026-10-09) with hand-derived needles for every intermediate secret; this one needs none — residue below the burn is found without needles, and only secret inputs/`out` buffers are needles |
 | ~~`bench`~~ | moved to [`benchkit`](../benchkit/README.md) 2026-11-14. Was: the comparison driver behind the `**Performance:**` line: 18 crypto-style `tools/bench.zig` carried the same ~200 lines (`Cycles`, `timeIt`, `foreign`, `drive`, …) and 20 Go-stdlib benches a ~80-line `timeIt`/`goBuild`/`goRun` (2026-10-17) |
-| `guard.Guarded` | brotli's input-at-a-PROT_NONE-page buffer (2026-10-15), the instrument the guard-page fuzz rule (CML) asks every `[*]`-reading decoder for |
+| `guard.Guarded` | brotli's input-at-a-PROT_NONE-page buffer (2026-10-15), the instrument the guard-page fuzz rule (owner rule) asks every `[*]`-reading decoder for |
 
 Three pieces are here because the evidence asked for them rather than because they were copied: **shrinking** (every fuzz FAIL was diagnosed by hand from a whole random input), the **fault transports and allocator** (mqtt 2026-10-17: a double free visible only with a transport that fails halfway), and the shrinker's forked-child runner.
 
