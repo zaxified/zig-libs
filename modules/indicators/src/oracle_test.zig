@@ -90,6 +90,7 @@ test "frozen TA-Lib vectors: every seed function, f64 and f32, unstable levels" 
     for (vecs.ulp_bound) |b| try testing.expectEqual(@as(u64, 0), b);
     var seen: [17]usize = @splat(0);
     for (vecs.vectors) |v| {
+        if (v.func >= 17) continue; // other waves: see mom_oracle_test.zig
         if (v.f32) try replay(f32, v) else try replay(f64, v);
         for (v.outs) |col| seen[v.func] += col.len;
     }

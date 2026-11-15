@@ -42,8 +42,70 @@ const ta_bad_param: i32 = 2;
 const vec_n = 40;
 
 /// Same order as the C `F_*` enum.
-const Func = enum(u8) { sma, ema, wma, ma, macd, macdext, macdfix, rsi, bbands, trange, atr, natr, stoch, stochf, max, min, sum };
-const func_names = [_][]const u8{ "SMA", "EMA", "WMA", "MA", "MACD", "MACDEXT", "MACDFIX", "RSI", "BBANDS", "TRANGE", "ATR", "NATR", "STOCH", "STOCHF", "MAX", "MIN", "SUM" };
+const Func = enum(u8) {
+    sma,
+    ema,
+    wma,
+    ma,
+    macd,
+    macdext,
+    macdfix,
+    rsi,
+    bbands,
+    trange,
+    atr,
+    natr,
+    stoch,
+    stochf,
+    max,
+    min,
+    sum,
+    // momentum wave (ind-momentum)
+    adx,
+    adxr,
+    dx,
+    minus_di,
+    plus_di,
+    minus_dm,
+    plus_dm,
+    aroon,
+    aroonosc,
+    mom,
+    roc,
+    rocp,
+    rocr,
+    rocr100,
+    bop,
+    ibs,
+    qstick,
+    wad,
+    asi,
+    si,
+    imi,
+    ao,
+    ac,
+    dpo,
+    er,
+    fosc,
+    cti,
+    vhf,
+    willr,
+    fractal,
+    cci,
+    chop,
+    choptr,
+    vortex,
+    mfi,
+    ultosc,
+    cmo,
+    cmou,
+};
+const func_names = [_][]const u8{
+    "SMA", "EMA",    "WMA", "MA",       "MACD",    "MACDEXT",  "MACDFIX", "RSI",   "BBANDS",   "TRANGE", "ATR", "NATR",  "STOCH",   "STOCHF",  "MAX",  "MIN",    "SUM",
+    "ADX", "ADXR",   "DX",  "MINUS_DI", "PLUS_DI", "MINUS_DM", "PLUS_DM", "AROON", "AROONOSC", "MOM",    "ROC", "ROCP",  "ROCR",    "ROCR100", "BOP",  "IBS",    "QSTICK",
+    "WAD", "ASI",    "SI",  "IMI",      "AO",      "AC",       "DPO",     "ER",    "FOSC",     "CTI",    "VHF", "WILLR", "FRACTAL", "CCI",     "CHOP", "CHOPTR", "VORTEX",
+    "MFI", "ULTOSC", "CMO", "CMOU",
+};
 const n_func = func_names.len;
 
 /// Allowed distance in ULPs, per function. Everything is expected to be bitwise:
@@ -51,18 +113,32 @@ const n_func = func_names.len;
 /// `a*b + c` outside the explicit `fma` calls. A nonzero entry must say why.
 const ulp_bound = [n_func]u64{
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0,
 };
 
-fn nIn(f: Func) usize {
+/// The input series of a function, in the order of its TA-Lib prototype:
+/// o(pen) h(igh) l(ow) c(lose) v(olume).
+fn seriesOf(f: Func) []const u8 {
     return switch (f) {
-        .trange, .atr, .natr, .stoch, .stochf => 3,
-        else => 1,
+        .trange, .atr, .natr, .stoch, .stochf => "hlc",
+        .adx, .adxr, .dx, .minus_di, .plus_di => "hlc",
+        .minus_dm, .plus_dm, .aroon, .aroonosc, .ao, .ac, .fractal => "hl",
+        .bop, .asi, .si => "ohlc",
+        .qstick, .imi => "oc",
+        .ibs, .wad, .willr, .cci, .chop, .choptr, .vortex, .ultosc => "hlc",
+        .mfi => "hlcv",
+        else => "c",
     };
+}
+fn nIn(f: Func) usize {
+    return seriesOf(f).len;
 }
 fn nOut(f: Func) usize {
     return switch (f) {
         .macd, .macdext, .macdfix, .bbands => 3,
-        .stoch, .stochf => 2,
+        .stoch, .stochf, .aroon, .vortex, .fractal => 2,
         else => 1,
     };
 }
@@ -75,6 +151,8 @@ const Case = struct {
     n: u32,
     ip: [6]i32 = @splat(0),
     dp: [2]f64 = .{ 0, 0 },
+    xp: [6]i32 = @splat(0), // ints 6..11 of the prototype (KST, KSTEXT)
+    xd: [2]f64 = .{ 0, 0 }, // doubles 2..3 (SQZMOM)
     kind: u8 = 0, // input kind: 0 walk, 1 walk with flat runs, 2 walk scaled by 1e-9
     seed: u64 = 0,
     bad: bool = false,
@@ -118,6 +196,34 @@ fn genInput(seed: u64, kind: u8, h: []f64, l: []f64, c: []f64) void {
     }
 }
 
+/// Open (inside the bar) and volume (0..2000, runs of zeros) of a case; high, low
+/// and close come from `genInput` unchanged.
+fn genOV(seed: u64, h: []const f64, l: []const f64, o: []f64, v: []f64) void {
+    var prng = std.Random.DefaultPrng.init(seed +% 777);
+    const r = prng.random();
+    var zero_run: usize = 0;
+    for (h, l, o, v) |hh, ll, *oo, *vv| {
+        oo.* = ll + (hh - ll) * r.float(f64);
+        if (zero_run > 0) {
+            zero_run -= 1;
+            vv.* = 0.0;
+        } else {
+            vv.* = @floor(r.float(f64) * 2000.0);
+            if (r.uintLessThan(usize, 25) == 0) zero_run = r.uintLessThan(usize, 12);
+        }
+    }
+}
+
+fn letterIdx(ch: u8) usize {
+    return switch (ch) {
+        'o' => 0,
+        'h' => 1,
+        'l' => 2,
+        'c' => 3,
+        else => 4,
+    };
+}
+
 // ── ours ────────────────────────────────────────────────────────────────────
 
 const OursError = ind.Error || std.mem.Allocator.Error;
@@ -129,7 +235,7 @@ fn us(x: i32) usize {
     return @intCast(x);
 }
 
-fn runOurs(comptime T: type, gpa: std.mem.Allocator, cs: Case, h: []const T, l: []const T, c: []const T, o: *[3][]T) OursError!usize {
+fn runOurs(comptime T: type, gpa: std.mem.Allocator, cs: Case, h: []const T, l: []const T, c: []const T, op: []const T, vol: []const T, o: *[3][]T) OursError!usize {
     const ip = cs.ip;
     const un = cs.unstable();
     return switch (cs.func) {
@@ -150,17 +256,71 @@ fn runOurs(comptime T: type, gpa: std.mem.Allocator, cs: Case, h: []const T, l: 
         .max => ind.max(T, c, o[0], .{ .period = us(ip[0]) }),
         .min => ind.min(T, c, o[0], .{ .period = us(ip[0]) }),
         .sum => ind.sum(T, c, o[0], .{ .period = us(ip[0]) }),
+        .adx => ind.adx(T, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .adxr => ind.adxr(T, gpa, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .dx => ind.dx(T, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .minus_di => ind.minusDi(T, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .plus_di => ind.plusDi(T, h, l, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .minus_dm => ind.minusDm(T, h, l, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .plus_dm => ind.plusDm(T, h, l, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .aroon => ind.aroon(T, h, l, o[0], o[1], .{ .period = us(ip[0]) }),
+        .aroonosc => ind.aroonosc(T, h, l, o[0], .{ .period = us(ip[0]) }),
+        .mom => ind.mom(T, c, o[0], .{ .period = us(ip[0]) }),
+        .roc => ind.roc(T, c, o[0], .{ .period = us(ip[0]) }),
+        .rocp => ind.rocp(T, c, o[0], .{ .period = us(ip[0]) }),
+        .rocr => ind.rocr(T, c, o[0], .{ .period = us(ip[0]) }),
+        .rocr100 => ind.rocr100(T, c, o[0], .{ .period = us(ip[0]) }),
+        .bop => ind.bop(T, op, h, l, c, o[0]),
+        .ibs => ind.ibs(T, h, l, c, o[0]),
+        .qstick => ind.qstick(T, op, c, o[0], .{ .period = us(ip[0]) }),
+        .wad => ind.wad(T, h, l, c, o[0]),
+        .asi => ind.asi(T, op, h, l, c, o[0], .{ .limit_move = cs.dp[0] }),
+        .si => ind.si(T, op, h, l, c, o[0], .{ .limit_move = cs.dp[0] }),
+        .imi => ind.imi(T, op, c, o[0], .{ .period = us(ip[0]) }),
+        .ao => ind.ao(T, h, l, o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]) }),
+        .ac => ind.ac(T, gpa, h, l, o[0], .{ .fast = us(ip[0]), .slow = us(ip[1]), .signal = us(ip[2]) }),
+        .dpo => ind.dpo(T, c, o[0], .{ .period = us(ip[0]) }),
+        .er => ind.er(T, c, o[0], .{ .period = us(ip[0]) }),
+        .fosc => ind.fosc(T, c, o[0], .{ .period = us(ip[0]) }),
+        .cti => ind.cti(T, c, o[0], .{ .period = us(ip[0]) }),
+        .vhf => ind.vhf(T, c, o[0], .{ .period = us(ip[0]) }),
+        .willr => ind.willr(T, h, l, c, o[0], .{ .period = us(ip[0]) }),
+        .fractal => blk: {
+            const a = try gpa.alloc(i8, h.len);
+            defer gpa.free(a);
+            const b = try gpa.alloc(i8, h.len);
+            defer gpa.free(b);
+            const lb = try ind.fractal(T, gpa, h, l, a, b, .{ .left = us(ip[0]), .right = us(ip[1]) });
+            for (0..h.len) |i| {
+                o[0][i] = if (i < lb) std.math.nan(T) else @floatFromInt(a[i]);
+                o[1][i] = if (i < lb) std.math.nan(T) else @floatFromInt(b[i]);
+            }
+            break :blk lb;
+        },
+        .cci => ind.cci(T, h, l, c, o[0], .{ .period = us(ip[0]) }),
+        .chop => ind.chop(T, h, l, c, o[0], .{ .period = us(ip[0]) }),
+        .choptr => ind.choptr(T, h, l, c, o[0], .{ .period = us(ip[0]) }),
+        .vortex => ind.vortex(T, h, l, c, o[0], o[1], .{ .period = us(ip[0]) }),
+        .mfi => ind.mfi(T, h, l, c, vol, o[0], .{ .period = us(ip[0]) }),
+        .ultosc => ind.ultosc(T, h, l, c, o[0], .{ .period1 = us(ip[0]), .period2 = us(ip[1]), .period3 = us(ip[2]) }),
+        .cmo => ind.cmo(T, c, o[0], .{ .period = us(ip[0]), .unstable = un }),
+        .cmou => ind.cmou(T, c, o[0], .{ .period = us(ip[0]) }),
     };
 }
 
 // ── the case grid ───────────────────────────────────────────────────────────
 
-const P = struct { ip: [6]i32 = @splat(0), dp: [2]f64 = .{ 0, 0 } };
+const P = struct { ip: [6]i32 = @splat(0), dp: [2]f64 = .{ 0, 0 }, xp: [6]i32 = @splat(0), xd: [2]f64 = .{ 0, 0 } };
 fn p1(a: i32) P {
     return .{ .ip = .{ a, 0, 0, 0, 0, 0 } };
 }
-fn pn(a: [6]i32) P {
-    return .{ .ip = a };
+/// Up to 12 ints: the first six into `ip`, the rest into `xp`.
+fn pn(a: anytype) P {
+    var r = P{};
+    inline for (a, 0..) |x, i| {
+        if (i < 6) r.ip[i] = x else r.xp[i - 6] = x;
+    }
+    return r;
 }
 
 fn periods(comptime ps: []const i32) [ps.len]P {
@@ -181,6 +341,27 @@ fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
         .rsi => try l.appendSlice(gpa, &periods(&.{ 14, 2, 3, 5, 30, 1, 0, 100001 })),
         .atr, .natr => try l.appendSlice(gpa, &periods(&.{ 14, 1, 2, 3, 5, 30, 0, 100001 })),
         .trange => try l.append(gpa, .{}),
+        .adx, .adxr, .dx => try l.appendSlice(gpa, &periods(&.{ 14, 2, 3, 5, 10, 30, 1, 0, 100001 })),
+        .minus_di, .plus_di, .minus_dm, .plus_dm => try l.appendSlice(gpa, &periods(&.{ 14, 1, 2, 3, 5, 10, 30, 0, 100001 })),
+        .aroon, .aroonosc => try l.appendSlice(gpa, &periods(&.{ 14, 2, 3, 5, 25, 1, 0, 100001 })),
+        .mom, .roc, .rocp, .rocr, .rocr100 => try l.appendSlice(gpa, &periods(&.{ 10, 1, 2, 3, 5, 30, 0, 100001 })),
+        .qstick => try l.appendSlice(gpa, &periods(&.{ 10, 1, 2, 3, 5, 30, 0, 100001 })),
+        .imi => try l.appendSlice(gpa, &periods(&.{ 14, 2, 3, 5, 20, 0, 1, 100001 })),
+        .dpo => try l.appendSlice(gpa, &periods(&.{ 20, 2, 3, 4, 5, 10, 30, 0, 1, 100001 })),
+        .er => try l.appendSlice(gpa, &periods(&.{ 10, 2, 3, 5, 20, 0, 1, 100001 })),
+        .fosc => try l.appendSlice(gpa, &periods(&.{ 5, 2, 3, 10, 40, 1, 0, 100001 })),
+        .cti => try l.appendSlice(gpa, &periods(&.{ 20, 2, 3, 5, 40, 1, 0, 100001 })),
+        .vhf => try l.appendSlice(gpa, &periods(&.{ 28, 2, 3, 5, 0, 1, 100001 })),
+        .willr, .cci, .chop, .choptr => try l.appendSlice(gpa, &periods(&.{ 14, 2, 3, 5, 30, 1, 0, 100001 })),
+        .vortex => try l.appendSlice(gpa, &periods(&.{ 14, 1, 2, 3, 5, 30, 0, 100001 })),
+        .mfi => try l.appendSlice(gpa, &periods(&.{ 14, 2, 3, 5, 30, 1, 0, 100001 })),
+        .cmo, .cmou => try l.appendSlice(gpa, &periods(&.{ 14, 2, 3, 5, 30, 1, 0, 100001 })),
+        .bop, .ibs, .wad => try l.append(gpa, .{}),
+        .asi, .si => for ([_]f64{ 3, 0.5, 1e-8, 100, 7.25, 0, -1, 1e-9 }) |d| try l.append(gpa, .{ .dp = .{ d, 0 } }),
+        .ao => for ([_][2]i32{ .{ 5, 34 }, .{ 2, 3 }, .{ 34, 5 }, .{ 10, 10 }, .{ 2, 100 }, .{ 1, 34 }, .{ 5, 0 }, .{ 5, 100001 } }) |t| try l.append(gpa, pn(.{ t[0], t[1] })),
+        .ac => for ([_][3]i32{ .{ 5, 34, 5 }, .{ 2, 3, 2 }, .{ 10, 20, 5 }, .{ 34, 5, 3 }, .{ 3, 3, 2 }, .{ 5, 34, 1 }, .{ 5, 34, 100001 } }) |t| try l.append(gpa, pn(.{ t[0], t[1], t[2] })),
+        .ultosc => for ([_][3]i32{ .{ 7, 14, 28 }, .{ 1, 1, 1 }, .{ 3, 5, 10 }, .{ 10, 5, 3 }, .{ 5, 5, 5 }, .{ 1, 2, 3 }, .{ 14, 14, 28 }, .{ 0, 14, 28 }, .{ 7, 100001, 28 } }) |t| try l.append(gpa, pn(.{ t[0], t[1], t[2] })),
+        .fractal => for ([_][2]i32{ .{ 2, 2 }, .{ 1, 1 }, .{ 3, 2 }, .{ 2, 5 }, .{ 1, 3 }, .{ 0, 2 }, .{ 2, 0 } }) |t| try l.append(gpa, pn(.{ t[0], t[1] })),
         .ma => {
             for ([_]i32{ 30, 1, 2, 5, 14 }) |per| for (grid_ma) |t| try l.append(gpa, pn(.{ per, t, 0, 0, 0, 0 }));
             try l.append(gpa, pn(.{ 0, 0, 0, 0, 0, 0 }));
@@ -220,7 +401,7 @@ fn paramsOf(f: Func, gpa: std.mem.Allocator) ![]const P {
 /// Functions on which the unstable period does anything.
 fn unstableMatters(f: Func) bool {
     return switch (f) {
-        .sma, .wma, .trange, .max, .min, .sum => false,
+        .sma, .wma, .trange, .max, .min, .sum, .aroon, .aroonosc, .mom, .roc, .rocp, .rocr, .rocr100, .bop, .ibs, .qstick, .wad, .asi, .si, .imi, .ao, .ac, .dpo, .er, .fosc, .cti, .vhf, .willr, .fractal, .cci, .chop, .choptr, .vortex, .mfi, .ultosc, .cmou => false,
         else => true,
     };
 }
@@ -233,7 +414,7 @@ fn probeLookback(gpa: std.mem.Allocator, cs_in: Case) ?usize {
     var o1: [1]f64 = undefined;
     var o2: [1]f64 = undefined;
     var o: [3][]f64 = .{ &o0, &o1, &o2 };
-    return runOurs(f64, gpa, cs, &hh, &hh, &hh, &o) catch null;
+    return runOurs(f64, gpa, cs, &hh, &hh, &hh, &hh, &hh, &o) catch null;
 }
 
 fn addLen(gpa: std.mem.Allocator, ns: *std.ArrayList(u32), n: usize) !void {
@@ -247,7 +428,7 @@ fn buildCases(gpa: std.mem.Allocator, cases: *std.ArrayList(Case)) !void {
     for (std.enums.values(Func)) |f| {
         const plist = try paramsOf(f, gpa);
         for (plist, 0..) |pp, pi| {
-            const base = Case{ .func = f, .n = 0, .ip = pp.ip, .dp = pp.dp };
+            const base = Case{ .func = f, .n = 0, .ip = pp.ip, .dp = pp.dp, .xp = pp.xp, .xd = pp.xd };
             const lbo = probeLookback(gpa, base);
             if (lbo == null) {
                 var c = base;
@@ -371,22 +552,27 @@ fn checkCase(comptime T: type, c: *Ctx, arena: std.mem.Allocator, cs: Case, head
     const st = &c.stats[@backingInt(cs.func)];
     st.records += 1;
     const n: usize = cs.n;
-    const hs = try arena.alloc(f64, n);
-    const ls = try arena.alloc(f64, n);
-    const cl = try arena.alloc(f64, n);
-    genInput(cs.seed, cs.kind, hs, ls, cl);
-    const h = try arena.alloc(T, n);
-    const l = try arena.alloc(T, n);
-    const cc = try arena.alloc(T, n);
-    for (0..n) |i| {
-        h[i] = @floatCast(hs[i]);
-        l[i] = @floatCast(ls[i]);
-        cc[i] = @floatCast(cl[i]);
+    var sf: [5][]f64 = undefined; // o h l c v as f64 (the f32 case widens them)
+    for (&sf) |*q| q.* = try arena.alloc(f64, n);
+    genInput(cs.seed, cs.kind, sf[1], sf[2], sf[3]);
+    genOV(cs.seed, sf[1], sf[2], sf[0], sf[4]);
+    var st5: [5][]T = undefined;
+    for (&st5, sf) |*d, src| {
+        d.* = try arena.alloc(T, n);
+        for (d.*, src) |*x, y| x.* = @floatCast(y);
     }
+    for (sf, st5) |dst, src| {
+        for (dst, src) |*x, y| x.* = y;
+    }
+    const op = st5[0];
+    const h = st5[1];
+    const l = st5[2];
+    const cc = st5[3];
+    const vol = st5[4];
     const no = nOut(cs.func);
     var o: [3][]T = undefined;
     for (&o) |*s| s.* = try arena.alloc(T, n);
-    const res = runOurs(T, c.gpa, cs, h, l, cc, &o);
+    const res = runOurs(T, c.gpa, cs, h, l, cc, op, vol, &o);
     if (res) |lb| {
         if (head.ret != 0) {
             report(c, cs, "ours succeeded (lookback {d}), TA-Lib returned {d}", .{ lb, head.ret });
@@ -423,7 +609,7 @@ fn checkCase(comptime T: type, c: *Ctx, arena: std.mem.Allocator, cs: Case, head
                 }
             }
         }
-        if (cs.emit and !bad_here) try emitVector(c, cs, lb, nb, hs, ls, cl, h, l, cc, theirs, T);
+        if (cs.emit and !bad_here) try emitVector(c, cs, lb, nb, sf, theirs);
         return nb * 8 * no;
     } else |err| switch (err) {
         error.BadParam => {
@@ -441,30 +627,27 @@ fn hexBits(w: *std.Io.Writer, v: f64) !void {
     try w.print("0x{x}", .{@as(u64, @bitCast(v))});
 }
 
-fn emitVector(c: *Ctx, cs: Case, lb: usize, nb: usize, hs: []const f64, ls: []const f64, cl: []const f64, h: anytype, l: anytype, cc: anytype, theirs: []const u8, comptime T: type) !void {
-    _ = hs;
-    _ = ls;
-    _ = cl;
+fn emitVector(c: *Ctx, cs: Case, lb: usize, nb: usize, sf: [5][]const f64, theirs: []const u8) !void {
     const w = c.vec_out orelse return;
     c.vec_count += 1;
     try w.print("    .{{ .func = {d}, .f32 = {}, .ukind = {d}, .ubars = {d}, .n = {d}, .lb = {d}, .ip = .{{", .{ @backingInt(cs.func), cs.is32, cs.ukind, cs.ubars, cs.n, lb });
     for (cs.ip, 0..) |x, i| try w.print("{s}{d}", .{ if (i > 0) ", " else " ", x });
+    try w.writeAll(" }, .xp = .{");
+    for (cs.xp, 0..) |x, i| try w.print("{s}{d}", .{ if (i > 0) ", " else " ", x });
     try w.writeAll(" }, .dp = .{ ");
     try hexBits(w, cs.dp[0]);
     try w.writeAll(", ");
     try hexBits(w, cs.dp[1]);
+    try w.writeAll(" }, .xd = .{ ");
+    try hexBits(w, cs.xd[0]);
+    try w.writeAll(", ");
+    try hexBits(w, cs.xd[1]);
     try w.writeAll(" },\n      .ins = &.{");
-    const ni = nIn(cs.func);
-    for (0..ni) |q| {
-        const src = if (ni == 1) cc else switch (q) {
-            0 => h,
-            1 => l,
-            else => cc,
-        };
+    for (seriesOf(cs.func)) |ch| {
         try w.writeAll(" &.{");
-        for (src, 0..) |v, i| {
+        for (sf[letterIdx(ch)], 0..) |v, i| {
             try w.writeAll(if (i > 0) ", " else " ");
-            try hexBits(w, @floatCast(v));
+            try hexBits(w, v);
         }
         try w.writeAll(" },");
     }
@@ -479,7 +662,6 @@ fn emitVector(c: *Ctx, cs: Case, lb: usize, nb: usize, hs: []const f64, ls: []co
         try w.writeAll(" },");
     }
     try w.writeAll(" } },\n");
-    _ = T;
 }
 
 fn runAll(c: *Ctx, arena: std.mem.Allocator, cases: []const Case) !void {
@@ -492,18 +674,15 @@ fn runAll(c: *Ctx, arena: std.mem.Allocator, cases: []const Case) !void {
         try w.writeInt(u32, cs.n, .little);
         for (cs.ip) |x| try w.writeInt(i32, x, .little);
         for (cs.dp) |x| try w.writeInt(u64, @bitCast(x), .little);
+        for (cs.xp) |x| try w.writeInt(i32, x, .little);
+        for (cs.xd) |x| try w.writeInt(u64, @bitCast(x), .little);
         const n: usize = cs.n;
-        const hs = try arena.alloc(f64, n);
-        const ls = try arena.alloc(f64, n);
-        const cl = try arena.alloc(f64, n);
-        genInput(cs.seed, cs.kind, hs, ls, cl);
-        const ni = nIn(cs.func);
-        for (0..ni) |q| {
-            const src = if (ni == 1) cl else switch (q) {
-                0 => hs,
-                1 => ls,
-                else => cl,
-            };
+        var sf: [5][]f64 = undefined;
+        for (&sf) |*q| q.* = try arena.alloc(f64, n);
+        genInput(cs.seed, cs.kind, sf[1], sf[2], sf[3]);
+        genOV(cs.seed, sf[1], sf[2], sf[0], sf[4]);
+        for (seriesOf(cs.func)) |ch| {
+            const src = sf[letterIdx(ch)];
             for (src) |v| {
                 if (cs.is32) {
                     const f: f32 = @floatCast(v);
@@ -604,7 +783,9 @@ pub fn main(init: std.process.Init) !u8 {
             \\    n: u32,
             \\    lb: u32,
             \\    ip: [6]i32,
+            \\    xp: [6]i32,
             \\    dp: [2]u64,
+            \\    xd: [2]u64,
             \\    ins: []const []const u64,
             \\    outs: []const []const u64,
             \\};
