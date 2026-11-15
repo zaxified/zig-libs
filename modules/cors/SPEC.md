@@ -94,7 +94,7 @@ the one path that genuinely varies: a preflight with `allow_headers = null` echo
 `allow_headers` and the posture is constant end to end and emits no `Vary` at all. Surface: `StaticOptions` + `applyActualStatic` /
 `applyPreflightStatic` / `isPreflight` — no `Cors`, no `init`, no allocator. `allow_credentials`
 is structurally absent: a constant grant with credentials is the combination `Cors.init` rejects,
-so the knob does not exist. First consumer: qap (its `Config.cors` is this type).
+so the knob does not exist. First consumer: the web-server consumer (its `Config.cors` is this type).
 
 ## Unconditional wildcard CORS (deliberate deviation, opt-in)
 
