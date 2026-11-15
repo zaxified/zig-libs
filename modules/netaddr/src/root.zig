@@ -3247,6 +3247,11 @@ test "Ip.key: v4 zero-padded, v6 masked to v6_bits, bits clamped" {
     try std.testing.expectEqualSlices(u8, &b, &v6.key(128));
     try std.testing.expectEqualSlices(u8, &b, &v6.key(129));
     try std.testing.expectEqualSlices(u8, &b, &v6.key(255));
+    // the last bit survives /128 (an odd final byte; /127 would clear it)
+    const odd = parseIp("2001:db8::1").?;
+    try std.testing.expectEqualSlices(u8, &odd.v6, &odd.key(128));
+    try std.testing.expectEqualSlices(u8, &odd.v6, &odd.key(200));
+    try std.testing.expectEqual(@as(u8, 0), odd.key(127)[15]);
     // a mid-byte cut: /68 keeps the high nibble of byte 8
     var hi = b;
     hi[8] = 0xAB;

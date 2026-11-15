@@ -6,7 +6,7 @@
 
 **Scope:** unsurveyed
 
-**Audit:** review none · mutation none · src ?
+**Audit:** review none · mutation 2026-11-15 (50/56, 6 eq) · src 0c879690787ee1b4
 
 **Hardening:** fuzz n/a — the only input is a fixed-size kernel record read from a signalfd limited to the set; no parser · ct n/a — no secret is read or computed
 
@@ -74,6 +74,24 @@ passes the mask on; a caller with its own spawn or pre-exec step unblocks
 - No panic is reachable from the public API: syscall failures are errors; an unknown
   signal number in a record (cannot happen for a signalfd limited to the set) is
   `error.Unexpected`.
+
+**Audit 2026-11-15 (delta mutation, whole module).** 56 schemata mutants over `src/root.zig`, ReleaseSafe, one build, each
+mutant under `setsid -w timeout` and `ulimit -v`: `Set.any` (each member dropped), `init`'s empty-set refusal,
+each `sigaddset` (dropped, wrong signal), `Signo.sig` (each arm swapped), `fromRaw`, the mask arithmetic
+(`newly_blocked` as the whole mask, the subtraction inverted or skipped), the `sigprocmask` result, `SFD_CLOEXEC`,
+the signalfd failure path (guard, unblock, both error mappings), `deinit` (unblock skipped, wrong operation, close
+skipped, poisoning skipped), `childMask`, the `mask` field, `poll` (events, timeout, ready test, size, error arms) and
+`wait` (blocking hint, short read, unmodelled number, both error arms). The tests written with the list (close-on-exec
+and closed by `deinit`, `childMask` against `mask` with a signal blocked beforehand, an fd limit refusal giving
+`SystemResources` with the mask restored) plus two found by the first run: a pipe-fed `poll`/`wait` that injects
+records the kernel never delivers (a modelled signal, an unmodelled one, a short read whose first four bytes name a
+signal, a closed descriptor) and a cancelled `wait` giving `error.Canceled`. Rerun: 50 killed (2 by a hang).
+Left: poisoning `*self` in `deinit` is EQUIVALENT (a hardening store nothing reads). UNOBSERVABLE, each with the
+injection it would need: the `else` arm of the failure mapping (an errno other than the resource ones, needs a
+syscall fault injector); `EINTR` retries in `poll` and `read` (neither call can return `EINTR` on a ready,
+non-blocking-timeout fd; needs seccomp errno injection); `EAGAIN` after a ready `poll` (needs a second reader
+racing the first, which the contract forbids); the `nonblocking` hint of `wait` (matters only to an evented `Io`;
+`testing.io` is the threaded one). 50/56; the score counts the unobservable ones with the equivalents (6 eq): 1 equivalent, 5 unobservable.
 
 ## Anchoring
 

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation audit of `parseDurationExt` (10 schemata mutants, 9 killed at once, 1 survivor killed by a new test that plain `parseDuration` refuses `w`).
 - **2026-11-15** — **NEW:** `parseDurationExt(s, .{ .days, .weeks })` and `DurationExtOptions`: `parseDuration` plus opt-in `d` (24 h) and `w` (7 d) units, overflow is `error.InvalidDuration` (consumer request 2026-11-15). `parseDuration` is unchanged.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-07** — **NO CONSUMER-VISIBLE CHANGE:** Whole-module mutation run (810 schemata mutants over `root.zig`): 757 killed by the existing tests, 53 survivors decided: 20 killed by new tests (day-count saturation at both limits, `parsePrefix` lengths, wildcard in front of `FFF`/`ZZ`, `parseUint` overflow, `FFF` with no digits, max fraction, min-year saturation, `startOfDay` month, fifth-from-last weekday, year 0 `formatBuf`, RFC 850 trailing bytes, RFC 2822 three-digit time fields), 32 equivalent, 1 unobservable (isoWeek lower clamp, out-of-range month only). Card keeps its Audit line (not edited here).

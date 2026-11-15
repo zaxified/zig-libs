@@ -240,6 +240,20 @@ black-box receiving oracle — its own parser's rendering was observed, no
 rsyslog source was read or consulted (root `NOTICE` §0, the same relationship
 as `icmp`/`genetlink`/`nftables`/`traceroute`).
 
+**Audit 2026-11-15 (delta mutation).** 19 schemata mutants over `journal.stderrIsJournal`/`fdIsJournalStream`/
+`parseDecimal`/`makedev`, ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`: the
+descriptor (2 as 1), the colon split and both slices, `AT_EMPTY_PATH`, the statx mask and error test, the verdict
+(`and` as `or`, each half dropped, the inode forced), the empty-string and digit-range checks of `parseDecimal`, and each
+term of `makedev`. 10 killed in the first run; 9 survived. Tests added: `makedev` against known glibc values
+(the old test computed the expected string with `makedev` itself, so a wrong encoding agreed with itself), a direct
+`parseDecimal` test (sign, underscore, hex, overflow, digit edges), and a `stderrIsJournal` test that points fd 2 at a
+pipe for its duration (stdout and stderr are often the same file in a harness, which hid fd 1 vs 2). 16 killed. Left: the
+empty-string check in `parseDecimal` is EQUIVALENT (`parseInt` refuses an empty string); dropping the statx mask is
+UNOBSERVABLE (the kernel returns the inode of a pipe or socket whatever the mask says; it needs a filesystem that
+fills `st_ino` only on request); ignoring a failed `statx` is UNOBSERVABLE (the kernel writes nothing on error, so
+the result depends on uninitialised stack; a test would have to pin the fill pattern, which is build-mode dependent).
+16/19, 1 equivalent, 2 unobservable.
+
 **Audit 2026-10-04 (mutation).** 33 schemata mutants over PRI, the timestamp range and
 offset rendering, header-field NILVALUE/length/printable rules, SD-NAME and SD-value
 escaping, the RFC 3164 encoder (sanitizing, TAG filter and cap, day padding), the UDP
