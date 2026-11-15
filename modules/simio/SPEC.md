@@ -145,8 +145,8 @@ consumer's to remove.
 - **Routed paths.** netsim delivers only between direct neighbours; simio hosts talk
   by IP across a topology. A packet follows the shortest path over netsim links; its
   latency is the sum of the edge latencies along it (jitter drawn per edge), and a
-  down edge or partition anywhere on it breaks the path. This generalizes axp-sim's
-  tree model (`axp-sim/src/fleet.zig` `treePath`/`pathLatencyMs`: walk to the lowest
+  down edge or partition anywhere on it breaks the path. This generalizes the router-tool consumer's simulator
+  tree model (the router-tool consumer's simulator (`src/fleet.zig`) `treePath`/`pathLatencyMs`: walk to the lowest
   common ancestor and back, summing edge latencies) to any graph.
 - **Network model.** Links, latency, jitter, loss, duplication, reorder, bandwidth,
   partitions and clock skew come from netsim's vocabulary. Streams are reliable
@@ -220,21 +220,21 @@ consumer's to remove.
 
 ## Prior art in our own projects
 
-Checked 2026-10-01 at the user's request ("axp solves similar things — don't reinvent,
-axp can pull it back from the module later"):
+Checked 2026-10-01 at the user's request ("the router-tool consumer solves similar things — don't reinvent,
+the router-tool consumer can pull it back from the module later"):
 
-- **axp `axp-sim`** (branch `demo-fleet-map`): a demo swarm of ~55 virtual devices,
-  one OS thread each, speaking the real device wire to a real `axp-central` over real
+- **The router-tool consumer the router-tool consumer's simulator** (branch `demo-fleet-map`): a demo swarm of ~55 virtual devices,
+  one OS thread each, speaking the real device wire to a real router-tool consumer central server over real
   TCP in real time. Its pieces map onto simio as follows — the routed-path latency
   model (adopted above), and the reboot/churn "down windows" with reconnect backoff
   (= simio host crash/restart; same semantics: the session drops, the peer sees a
   reset, the device re-dials after a delay). It has no fibers, no virtual time and no
   deterministic `Io`, so the scheduler and vtable are new here.
-- **Pull-back:** once simio has M3, axp can run the swarm plus `axp-central` as simio
+- **Pull-back:** once simio has M3, the router-tool consumer can run the swarm plus the central server as simio
   hosts in one process, deterministically, instead of a thread per device with
-  wall-clock sleeps. That is axp's session's work (zig-libs is a pinned upstream there).
+  wall-clock sleeps. That is the router-tool consumer's session's work (zig-libs is a pinned upstream there).
 - `fleetsim` (zig-libs): in-process device responders on netsim — the synthetic-device
-  half of axp-sim's job, already here; complementary, not a substitute for simio.
+  half of the router-tool consumer's simulator job, already here; complementary, not a substitute for simio.
 
 ## Mutation run (2026-10-01)
 

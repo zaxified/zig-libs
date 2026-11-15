@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** the dns pilot follows `dns.Resolver.lookupIp`'s new result (`Lookup(netaddr.Ip)`, `.items`, `deinit`).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-08** — **FIX:** the simulated ICMPv4 checksum (`icmp4ChecksumOk`, `setIcmp4Checksum`) accumulated in `u32` and overflowed past ~131 KB of `0xffff` words; it now uses `icmp.checksum` (`u64` accumulator). Results for smaller messages are identical. New dependency: `icmp`.
