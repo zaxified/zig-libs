@@ -357,3 +357,111 @@ test "fd is pollable and childMask names the blocked set" {
     try testing.expect(linux.sigismember(&cm, .TERM) and linux.sigismember(&cm, .INT));
     try testing.expect(!linux.sigismember(&cm, .HUP));
 }
+
+test "the signalfd is close-on-exec, and deinit closes it (mutation 2026-11-15)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var st = try StopSignals.init(.{});
+    const raw = st.fd();
+    const flags = linux.fcntl(raw, linux.F.GETFD, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(flags));
+    try testing.expect(flags & linux.FD_CLOEXEC != 0);
+    st.deinit();
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(raw, linux.F.GETFD, 0)));
+}
+
+test "childMask is what this instance blocked; mask is the whole set (mutation 2026-11-15)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var pre = linux.sigemptyset();
+    linux.sigaddset(&pre, .TERM);
+    _ = linux.sigprocmask(linux.SIG.BLOCK, &pre, null);
+    defer _ = linux.sigprocmask(linux.SIG.UNBLOCK, &pre, null);
+    var st = try StopSignals.init(.{});
+    defer st.deinit();
+    const cm = st.childMask();
+    try testing.expect(linux.sigismember(&cm, .INT));
+    try testing.expect(!linux.sigismember(&cm, .TERM)); // blocked before init: not ours to unblock
+    try testing.expect(linux.sigismember(&st.mask, .INT));
+    try testing.expect(linux.sigismember(&st.mask, .TERM));
+    try testing.expect(!linux.sigismember(&st.mask, .HUP));
+}
+
+test "an fd limit refusal is SystemResources and leaves the mask as it was (mutation 2026-11-15)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try testing.expect(!isBlocked(.TERM));
+    var old: linux.rlimit = undefined;
+    if (linux.errno(linux.getrlimit(.NOFILE, &old)) != .SUCCESS) return error.SkipZigTest;
+    const tight: linux.rlimit = .{ .cur = 0, .max = old.max };
+    if (linux.errno(linux.setrlimit(.NOFILE, &tight)) != .SUCCESS) return error.SkipZigTest;
+    const res = StopSignals.init(.{});
+    _ = linux.setrlimit(.NOFILE, &old);
+    try testing.expectError(error.SystemResources, res);
+    try testing.expect(!isBlocked(.TERM));
+    try testing.expect(!isBlocked(.INT));
+}
+
+/// A `StopSignals` whose descriptor is the read end of a pipe holding `bytes`
+/// (then EOF): lets a test feed `poll`/`wait` records the kernel never would.
+fn pipeFed(bytes: []const u8) !StopSignals {
+    var p: [2]i32 = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&p, .{ .CLOEXEC = true })));
+    if (bytes.len != 0) try testing.expectEqual(bytes.len, linux.write(p[1], bytes.ptr, bytes.len));
+    _ = linux.close(p[1]);
+    return .{ .fd_ = p[0], .mask = linux.sigemptyset(), .newly_blocked = linux.sigemptyset() };
+}
+
+fn record(signo: u32) linux.signalfd_siginfo {
+    var r = std.mem.zeroes(linux.signalfd_siginfo);
+    r.signo = signo;
+    return r;
+}
+
+test "poll and wait read exactly one whole record and refuse anything else (mutation 2026-11-15)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // a well-formed record of a modelled signal is returned
+    const term = record(@backingInt(linux.SIG.TERM));
+    var a = try pipeFed(std.mem.asBytes(&term));
+    try testing.expectEqual(@as(?Signo, .term), try a.poll());
+    _ = linux.close(a.fd_);
+    var b = try pipeFed(std.mem.asBytes(&term));
+    try testing.expectEqual(Signo.term, try b.wait(testing.io));
+    _ = linux.close(b.fd_);
+
+    // a record of a signal the module does not model is an error, not a guess
+    const kill = record(@backingInt(linux.SIG.KILL));
+    var c = try pipeFed(std.mem.asBytes(&kill));
+    try testing.expectError(error.Unexpected, c.poll());
+    _ = linux.close(c.fd_);
+    var d = try pipeFed(std.mem.asBytes(&kill));
+    try testing.expectError(error.Unexpected, d.wait(testing.io));
+    _ = linux.close(d.fd_);
+
+    // a short read is an error, even when the bytes that did arrive name a signal
+    var e = try pipeFed(std.mem.asBytes(&term)[0..4]);
+    try testing.expectError(error.Unexpected, e.poll());
+    _ = linux.close(e.fd_);
+    var f = try pipeFed(std.mem.asBytes(&term)[0..4]);
+    try testing.expectError(error.Unexpected, f.wait(testing.io));
+    _ = linux.close(f.fd_);
+
+    // a descriptor that is not open at all
+    var g = try pipeFed("");
+    _ = linux.close(g.fd_);
+    try testing.expectError(error.Unexpected, g.wait(testing.io));
+}
+
+test "Signo.fromRaw: every modelled number maps back, others are null (mutation 2026-11-15)" {
+    inline for (.{ Signo.term, Signo.int, Signo.hup, Signo.quit, Signo.usr1, Signo.usr2 }) |s| {
+        try testing.expectEqual(@as(?Signo, s), Signo.fromRaw(@backingInt(s.sig())));
+    }
+    for ([_]linux.SIG{ .KILL, .CHLD, .STOP, .PIPE }) |s| try testing.expectEqual(@as(?Signo, null), Signo.fromRaw(@backingInt(s)));
+    try testing.expectEqual(@as(?Signo, null), Signo.fromRaw(0));
+    try testing.expectEqual(@as(?Signo, null), Signo.fromRaw(std.math.maxInt(u32)));
+}
+
+test "wait reports error.Canceled when its task is canceled (mutation 2026-11-15)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var st = try StopSignals.init(.{ .term = false, .int = false, .usr1 = true });
+    defer st.deinit();
+    var fut = testing.io.concurrent(StopSignals.wait, .{ &st, testing.io }) catch return error.SkipZigTest;
+    try testing.expectError(error.Canceled, fut.cancel(testing.io));
+}
