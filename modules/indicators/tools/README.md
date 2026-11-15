@@ -8,8 +8,13 @@
   headers `TALIB_INC`. Recipe, kept out of the repo build: unpack the audited `ta-lib-0.8.3` tarball
   (sha256 `28b1179b178a0db15f3dad0d846ef77f18eb06db5dfc5b5a8ca153a9ea5d84e6`), compile every
   `src/ta_func/*.c`, `src/ta_common/*.c` (and the abstract layer files the archive needs) with your
-  own `cc -O2 -I include -I src/ta_common -I src/ta_func -c`, never TA-Lib's CMake/configure, and
+  own `cc -O2 -ffp-contract=off -fno-math-errno -I include -I src/ta_common -I src/ta_func -c`, never TA-Lib's CMake/configure, and
   `ar rcs libta-lib.a *.o`. Nothing foreign is vendored; the checkout stays outside the repository.
+  ⚠ `-ffp-contract=off` is load-bearing, exactly as in TA-Lib's own CMakeLists/configure: TA-Lib marks
+  its fused functions `target_clones("default","fma")`, and GCC's default `-ffp-contract=fast` would
+  contract every `a*b+c` inside the fma clone, so the reference would depend on the CPU it runs on
+  (2026-11-15: bitwise on one host, 7 functions off by up to 144 ULP on a CI runner). With it off,
+  explicit `fma()` is the only fusion and both clones agree. `-fno-math-errno` is value-neutral.
 - Inputs per function: `seriesOf` in `interop.zig` names them as letters in the order of the TA-Lib prototype: o(pen) h(igh)
   l(ow) c(lose) v(olume), and x, the generated second series of VWMA (volume) and MAVP (per-bar periods, `genAux`);
   two-series functions (BETA, CORREL, ADD, ...) read close and open. Integer outputs (SUPERTREND trend, ZIGZAG trend and pivot
@@ -20,3 +25,6 @@
   difference carried by their recursion reads as thousands of ULPs on an output that is near zero. `interop-indicators` prints the
   measured maximum (`max/colmax`) next to the ULP maximum. TRENDMODE's integer output travels as doubles like SUPERTREND's; the
   Hilbert functions have a 100-bar frozen vector (their first output is bar 32 / 63) and an extra 700-bar run for their AUTO warm-up.
+- Wire format beyond the first six integers: the record carries `xp`, six more integers (KST and KSTEXT take up to eleven); the
+  momentum wave's extra doubles of SQZMOM sit in `dp[2..3]`. One function-id space for all waves (0..175, the `Func` enum is the
+  table); the momentum functions are 119..175 and PSO has a 2 ULP bound (`tanh`, see SPEC).

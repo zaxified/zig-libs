@@ -410,7 +410,7 @@ mkdir -p "$TALIB_SRC/src" "$TALIB_OUT/obj" \
     && tar -xzf "$TALIB_SRC/ta-lib-$TALIB_VER-src.tar.gz" -C "$TALIB_SRC/src" \
     && T="$TALIB_SRC/src/ta-lib-$TALIB_VER" \
     && ls "$T"/src/ta_common/*.c "$T"/src/ta_func/*.c \
-        | xargs -P "$(nproc)" -I{} sh -c 'cc -O2 -fPIC -I"$1/include" -I"$1/src/ta_common" -I"$1/src/ta_func" -c "$2" -o "$3/obj/$(basename "$2" .c).o"' _ "$T" {} "$TALIB_OUT" \
+        | xargs -P "$(nproc)" -I{} sh -c 'cc -O2 -ffp-contract=off -fno-math-errno -fPIC -I"$1/include" -I"$1/src/ta_common" -I"$1/src/ta_func" -c "$2" -o "$3/obj/$(basename "$2" .c).o"' _ "$T" {} "$TALIB_OUT" \
     && ar rcs "$TALIB_OUT/libta-lib.a" "$TALIB_OUT"/obj/*.o \
     && echo "ta-lib: $TALIB_VER" || echo "ta-lib: fetch, hash check or build failed"
 echo "::endgroup::"
