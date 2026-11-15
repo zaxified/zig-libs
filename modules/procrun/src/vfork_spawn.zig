@@ -66,6 +66,9 @@ pub const Options = struct {
     uid: ?posix.uid_t = null,
     gid: ?posix.gid_t = null,
     pgid: ?posix.pid_t = null,
+    /// Start the child with an empty signal mask (Go's `os/exec`, Rust's
+    /// `Command`) instead of the spawning thread's current one.
+    reset_signal_mask: bool = true,
 };
 
 pub const Error = std.process.SpawnError;
@@ -136,6 +139,7 @@ const ChildArgs = struct {
     gid: ?posix.gid_t,
     pgid: ?posix.pid_t,
     old_mask: linux.sigset_t,
+    reset_signal_mask: bool,
 };
 
 /// The kernel's `struct sigaction` for rt_sigaction on x86_64 and aarch64
@@ -212,6 +216,7 @@ pub fn spawn(gpa: std.mem.Allocator, opts: Options) Error!posix.pid_t {
         .gid = opts.gid,
         .pgid = opts.pgid,
         .old_mask = linux.sigfillset(), // overwritten below; never garbage
+        .reset_signal_mask = opts.reset_signal_mask,
     };
     for ([_]Stdio{ opts.stdin, opts.stdout, opts.stderr }, 0..) |s, i| switch (s) {
         .inherit => {},
@@ -402,7 +407,11 @@ fn childMain(arg: usize) callconv(.c) u8 {
         else => bail(a, .unexpected),
     };
 
-    _ = linux.sigprocmask(linux.SIG.SETMASK, &a.old_mask, null);
+    // The exec'd program starts with an empty mask unless the caller asked to
+    // pass the spawning thread's mask on (a blocked SIGTERM would otherwise
+    // stay pending in the child and only SIGKILL could stop it).
+    const empty = linux.sigemptyset();
+    _ = linux.sigprocmask(linux.SIG.SETMASK, if (a.reset_signal_mask) &empty else &a.old_mask, null);
 
     // argv[0] with a `/` is a path (relative to the new cwd); otherwise it is
     // searched on PATH, keeping std's precedence: AccessDenied from any

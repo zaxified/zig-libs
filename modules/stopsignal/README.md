@@ -36,8 +36,9 @@ while (true) {
 - `deinit()` — closes the fd and unblocks what `init` blocked (not what the caller
   had blocked before). Same thread as `init`.
 - `childMask()` — the signals this instance blocked; a child inherits the blocked
-  mask across `fork`/`exec` (procrun's spawner does not reset it), so a program that
-  spawns children and wants them stoppable unblocks this set in the child before `exec`.
+  mask across `fork`/`exec`. procrun's Linux spawner resets it by default
+  (`Spec.reset_signal_mask`); a program with its own spawn or pre-exec step unblocks
+  this set in the child before `exec`.
 
 Not Linux: `init` returns `error.Unsupported`. Details and refusals: [SPEC.md](SPEC.md).
 

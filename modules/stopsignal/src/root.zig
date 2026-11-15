@@ -25,9 +25,9 @@
 //!   * **A blocked mask is inherited across `fork`/`exec`.** A child started
 //!     while the stop signals are blocked cannot be stopped by them either:
 //!     SIGTERM stays pending in the child until it unblocks. `procrun`'s
-//!     spawner restores the parent's CURRENT mask in the child (it does not
-//!     reset it), so a child spawned by a program that holds a `StopSignals`
-//!     inherits the blocked set. See `childMask`.
+//!     Linux spawner starts children with an empty mask by default
+//!     (`Spec.reset_signal_mask`); std's `process.spawn` does not, so a child
+//!     spawned through it inherits the blocked set. See `childMask`.
 //!   * `deinit` must run in the thread that called `init`.
 //!   * One reader per `StopSignals`: `poll`/`wait` from two threads at once
 //!     compete for the same queue.
@@ -174,7 +174,7 @@ pub const StopSignals = struct {
     /// The set of signals blocked by this instance, for a caller that starts
     /// children with its own pre-exec code and wants to unblock them there
     /// (`rt_sigprocmask(SIG_UNBLOCK, &mask, null)` before `exec`). procrun
-    /// cannot do this for the caller today (see SPEC.md).
+    /// does this itself (`Spec.reset_signal_mask`, default on).
     pub fn childMask(self: *const StopSignals) linux.sigset_t {
         return self.newly_blocked;
     }

@@ -53,18 +53,16 @@ Not provided, and why:
   and `poll` reads only after a zero-timeout `poll(2)` says data is ready; a second
   reader taking the record in between would make `poll` block.
 
-## Finding: the blocked mask crosses `fork`/`exec` and procrun does not reset it
+## Finding: the blocked mask crosses `fork`/`exec`
 
-`modules/procrun/src/vfork_spawn.zig` blocks every signal across the `clone`, resets
-handled signals to `SIG_DFL` and then restores `old_mask` — the mask the parent had at
-spawn time — in the child before `execve`. `std.process.spawn` (fork path) does not
-touch the mask either. So a child spawned by a program holding a `StopSignals` starts
-with SIGTERM/SIGINT blocked and cannot be stopped by them: procrun's own
-`cancel_grace_ns` SIGTERM stays pending in the child, and only the follow-up SIGKILL
-works. This module cannot fix that from outside (the window between spawn and the
-caller's own code has no hook). Recorded for procrun in its Backlog (spawn option to
-reset the child's mask); until then `childMask()` gives the set a caller with its own
-pre-exec step must unblock.
+A child inherits the spawning thread's signal mask across `fork`/`exec`, so a child
+spawned by a program holding a `StopSignals` would start with SIGTERM/SIGINT blocked
+and could be stopped only by SIGKILL. Found 2026-11-15 in procrun's vfork spawner,
+which restored the parent's mask in the child; fixed there the same day:
+`procrun.Spec.reset_signal_mask` (default `true`, as Go's `os/exec` and Rust's
+`Command`) starts the child with an empty mask. `std.process.spawn` (fork path) still
+passes the mask on; a caller with its own spawn or pre-exec step unblocks
+`childMask()` there.
 
 ## Limits and refusals
 

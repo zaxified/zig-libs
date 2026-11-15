@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **BEHAVIOUR CHANGE (Linux):** a spawned child starts with an empty signal mask (`Spec.reset_signal_mask`, default `true`, as Go's `os/exec` and Rust's `Command`). Before, the vfork spawner passed on the spawning thread's mask, so a program that blocks SIGTERM for a signalfd loop (`stopsignal`) started children with SIGTERM blocked and `cancel_grace_ns`'s SIGTERM stayed pending until the SIGKILL. `.reset_signal_mask = false` keeps the old behaviour. std's fallback spawn (other POSIX targets, no readable `/proc/self/environ`) is unchanged.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: the stop-signal helper item moved to the new module `stopsignal`; new item recorded — the child inherits the parent's blocked signal mask (spawner restores the parent's current mask, never resets it).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: Stop-signal helper for a daemon's own SIGTERM/SIGINT (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
