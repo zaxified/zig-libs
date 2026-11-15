@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `auth`'s credential scan takes its zero-byte mask from `b64ct.eqMask`.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE** (but see the extreme-range note): `Date` header calendar (`civilFromUnix`) comes from `datefmt` (new dependency) instead of a private copy; only `|unix|` beyond ~9.5e13 s (year > 3 million, never a real date) now saturates the year at the `i32` range instead of printing it exactly.
