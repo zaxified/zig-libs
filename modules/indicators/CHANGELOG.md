@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — ALMA through `MaCore` (MA, MACDEXT, BBANDS, ... with `.alma`) uses a precomputed weight table for periods up to 64
+  (inline in the core, no allocator; larger periods keep the per-bar recompute): 27-38x faster on a 1e5-bar series, output bit for bit
+  unchanged. `Stream1`'s dead NaN-skip branch is removed (a ring core with a `nan` parameter is now a compile error). Delta mutation: 6
+  mutants on the changed lines, 3 killed, 3 equivalent (cost only / unobservable); live oracle all agree.
 - **2026-11-15** — NO CONSUMER-VISIBLE CHANGE (tests, test data, oracle tool): second round of the mutation audit
   for the six open survivors (now 463 mutants, 444 killed, 19 equivalent / unobservable, 0 undecided). Hand-built
   inputs in `src/audit_test.zig` for KAMA's first-window zero-change count, MCGD's evaluation order, ER's clamp,

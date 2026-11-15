@@ -73,11 +73,12 @@ fn countOf(comptime Core: type, c: *const Core) usize {
 /// buffer; `clone` copies it.
 pub fn Stream1(comptime T: type, comptime Params: type, comptime Core: type) type {
     core.checkFloat(T);
+    // A NaN-skip parameter would need the `Rec1` carry-over; no ring core has one.
+    if (@hasField(Params, "nan")) @compileError("Stream1: use Rec1 for a core with a `nan` parameter");
     return struct {
         const Self = @This();
         c: Core,
         buf: []f64,
-        skip: bool,
         last: ?T = null,
 
         /// Number of f64 the caller must provide to `init`.
@@ -88,12 +89,11 @@ pub fn Stream1(comptime T: type, comptime Params: type, comptime Core: type) typ
         pub fn init(p: Params, buf: []f64) Error!Self {
             const need = try bufLen(p);
             if (buf.len < need) return error.BadParam;
-            return .{ .c = try Core.init(p), .buf = buf[0..need], .skip = nanSkip(p) };
+            return .{ .c = try Core.init(p), .buf = buf[0..need] };
         }
         /// Feed one bar; null until the lookback is satisfied.
         pub fn update(self: *Self, x: T) ?T {
             const xv: f64 = x;
-            if (self.skip and core.isNan(xv)) return null;
             if (self.buf.len != 0) self.buf[countOf(Core, &self.c) % self.buf.len] = xv;
             const r = self.c.step(RingSrc{ .buf = self.buf }, xv) orelse return null;
             self.last = core.to(T, r);
@@ -102,7 +102,6 @@ pub fn Stream1(comptime T: type, comptime Params: type, comptime Core: type) typ
         /// What `update(x)` would answer, without changing the state.
         pub fn peek(self: *const Self, x: T) ?T {
             const xv: f64 = x;
-            if (self.skip and core.isNan(xv)) return null;
             var cc = self.c;
             const r = cc.step(PeekSrc{ .buf = self.buf, .n = countOf(Core, &self.c), .x = xv }, xv) orelse return null;
             return core.to(T, r);
@@ -432,7 +431,7 @@ pub const MaCore = union(enum) {
     zlema: mavg.ZlemaCore,
     rma: mavg.RmaCore,
     vidya: mavg.VidyaCore,
-    alma: mavg.AlmaCore,
+    alma: mavg.AlmaTabCore,
     mama: cycle.MamaMaCore,
 
     pub fn validate(p: MaParams) Error!void {
@@ -490,7 +489,7 @@ pub const MaCore = union(enum) {
             .zlema => .{ .zlema = try mavg.ZlemaCore.init(.{ .period = per, .unstable = un }) },
             .rma => .{ .rma = try mavg.RmaCore.init(.{ .period = per, .unstable = un }) },
             .vidya => .{ .vidya = try mavg.VidyaCore.init(vidyaOf(p)) },
-            .alma => .{ .alma = try mavg.AlmaCore.init(.{ .period = per }) },
+            .alma => .{ .alma = try mavg.AlmaTabCore.init(.{ .period = per }) },
             .mama => .{ .mama = try cycle.MamaMaCore.init(un) },
             else => unreachable, // `disabled` is a copy
         };
@@ -498,6 +497,7 @@ pub const MaCore = union(enum) {
     /// Index of the bar being fed (the ring slot to write before `step`).
     pub fn count(self: *const MaCore) usize {
         return switch (self.*) {
+            .alma => |*c| c.c.n,
             inline else => |*c| c.n,
         };
     }

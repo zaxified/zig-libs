@@ -815,6 +815,11 @@ pub const AlmaCore = struct {
         for (w[0..self.p], 0..) |*o, j| o.* = self.raw(j) / self.norm;
     }
     pub fn step(self: *AlmaCore, src: anytype, x: f64) ?f64 {
+        return self.stepW(src, x, self.weights);
+    }
+    /// `step` with an explicit weight table: used when `weights.len == p`,
+    /// otherwise every weight is recomputed (same bits).
+    fn stepW(self: *AlmaCore, src: anytype, x: f64, weights: []const f64) ?f64 {
         const n = self.n;
         self.n += 1;
         // A dot product seeded with 0.0 would turn a -0.0 input into +0.0.
@@ -822,12 +827,36 @@ pub const AlmaCore = struct {
         if (n + 1 < self.p) return null;
         const b = n + 1 - self.p;
         var sum: f64 = 0.0;
-        if (self.weights.len == self.p) {
-            for (self.weights, 0..) |w, j| sum += w * src.at(b + j);
+        if (weights.len == self.p) {
+            for (weights, 0..) |w, j| sum += w * src.at(b + j);
         } else {
             for (0..self.p) |j| sum += (self.raw(j) / self.norm) * src.at(b + j);
         }
         return sum;
+    }
+};
+
+/// Largest period whose weight table `AlmaTabCore` keeps inline.
+pub const alma_tab_max = 64;
+
+/// `AlmaCore` for the by-value `MaCore` union: owns the weight table inline
+/// (a slice into itself would dangle on a copy), so no allocator is needed and
+/// the size stays bounded. Periods above `alma_tab_max` keep the per-bar
+/// recompute (same bits, slower); the table is a pure cache of `raw(j) / norm`.
+pub const AlmaTabCore = struct {
+    c: AlmaCore,
+    tab: [alma_tab_max]f64 = undefined,
+    tabbed: bool,
+
+    pub fn init(p: AlmaParams) Error!AlmaTabCore {
+        const c = try AlmaCore.init(p);
+        var r: AlmaTabCore = .{ .c = c, .tabbed = p.period > 1 and p.period <= alma_tab_max };
+        if (r.tabbed) r.c.fillWeights(r.tab[0..p.period]);
+        return r;
+    }
+    pub fn step(self: *AlmaTabCore, src: anytype, x: f64) ?f64 {
+        const w: []const f64 = if (self.tabbed) self.tab[0..self.c.p] else &.{};
+        return self.c.stepW(src, x, w);
     }
 };
 
