@@ -84,7 +84,7 @@ pub const fixed_min_limbs: usize = 16;
 /// `montMulBlock`, `montSqrFixed`, `montSqrBlock`: rows unrolled at comptime
 /// for each `L`) from `fixed_min_limbs` up.
 ///
-/// **Consumer build option** (CONVENTIONS §4.2; wgs request 2026-10-17):
+/// **Consumer build option** (CONVENTIONS §4.2; the analytics consumer request 2026-10-17):
 /// `-Dmontint-asm-unroll=false`, or `-Dprofile=small`, routes every
 /// `L >= fixed_min_limbs` on an asm-capable target to the ONE looped asm
 /// kernel instead (`asm_core.montMul`/`montSqr`, runtime `n`: the same MULX/
