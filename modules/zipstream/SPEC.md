@@ -177,7 +177,7 @@ output clamped to the declared size, `toUnix` month 0 / second 60 / 2100-02-29 /
 
 ## Build options
 
-Consumer build options (CONVENTIONS §4.2), added 2026-11-02 at bxp's request (a CLI that reads Store
+Consumer build options (CONVENTIONS §4.2), added 2026-11-02 at the build-tool consumer's request (a CLI that reads Store
 and Deflate and never writes):
 
 | option | values | default | `-Dprofile=small` |
@@ -191,7 +191,7 @@ and Deflate and never writes):
 - **Gain** (read-only probe `tools/sizeprobe.zig`, ReleaseSmall, x86_64): 512 512 -> 197 632 B.
 - **Independent of the option:** reading links no compressor at all, since the fallback table holds
   decoders only (same probe, before that split: 1 269 136 B in ReleaseSmall, 15.6 -> 5.5 MB in
-  ReleaseSafe; bxp-cli ReleaseSmall 2.80 -> 2.05 MB).
+  ReleaseSafe; the build-tool consumer's CLI ReleaseSmall 2.80 -> 2.05 MB).
 
 ## Backlog / deferred
 
@@ -204,14 +204,14 @@ deliberately excluded with a reason; speed rows go to Backlog, not a condition. 
 `archive/zip` (BSD-3, stdlib docs), zip2 (MIT, cloned 2026-10-20: README support table, `write.rs` /
 `read/*.rs` API surface), Python `zipfile` (PSF, docs), libzip (BSD-3, docs/man pages), minizip-ng
 (zlib licence, README feature list; not cloned). Items marked *(inferred)* come from documentation
-recollection, not from a source read this run. bxp column: bxp uses only `Archive`, `Entry`,
+recollection, not from a source read this run. The build-tool consumer column: the build-tool consumer uses only `Archive`, `Entry`,
 `EntryReader` (xlsx ingest and the parallel `zipPrePass`), read side, Store + Deflate; it opens one
 independent `Archive` per worker because the module is single-cursor.
 
-| # | Feature | Who has it | Effort | Recommendation | bxp |
+| # | Feature | Who has it | Effort | Recommendation | Consumer |
 |---|---|---|---|---|---|
 | R1 | Reader over any random-access source, not only `std.Io.File`: in-memory slice, `ReaderAt` + size | Go `NewReader(ReaderAt, size)`, Python (file-like), zip2 (`Read + Seek`), libzip sources | S-M (a small `Source` vtable: `readAt(offset, buf)`; the File case stays the default) | **DONE 2026-10-20** (`Source` / `FileSource` / `MemorySource`, `Archive.initSource`) — do | yes (xlsx from memory, network buffers, tests without files) |
-| R2 | Several entries open at once / thread-safe positional reads (Go's `ReaderAt` design lets concurrent `Open`s share one `Reader`) | Go, libzip (via sources) *(inferred)* | M (follows from R1: `EntryReader` carries its own offset instead of the shared cursor; today bxp's `zipPrePass` re-opens the file once per worker) | **DONE 2026-10-20** (each `EntryReader` its own cursor; threads tested) — do (with R1) | yes |
+| R2 | Several entries open at once / thread-safe positional reads (Go's `ReaderAt` design lets concurrent `Open`s share one `Reader`) | Go, libzip (via sources) *(inferred)* | M (follows from R1: `EntryReader` carries its own offset instead of the shared cursor; today the build-tool consumer's `zipPrePass` re-opens the file once per worker) | **DONE 2026-10-20** (each `EntryReader` its own cursor; threads tested) — do (with R1) | yes |
 | R3 | Zstandard (method 93) read + write | zip2, libzip, minizip-ng; Python 3.14 *(inferred)* | S-M glue over sibling `zstd` (adds a module dependency; streaming API check needed) | **DONE 2026-10-20** (`.zstd` via the `zstd` module, read and write) — do | no |
 | R4 | zip64 **writing** (> 4 GiB, > 65535 entries; the zip64 extra in local + central header, EOCD64 + locator) | Go, zip2, Python (`allowZip64`, `force_zip64`), libzip, minizip-ng | M | **DONE 2026-10-20** (automatic + `force_zip64`, `allow_zip64`) — do (needed together with R5, since an unknown size forces the zip64 decision up front) | no |
 | R5 | Streaming writes with data descriptors (general-purpose bit 3): the entry is written as the producer delivers bytes, sizes and CRC follow; `ArchiveWriter.beginEntry() -> *std.Io.Writer`, no buffered compressed copy | Go `Create`, Python `open(name, "w")`, zip2 `start_file` + `Write`, libzip (via sources), minizip-ng | M | **DONE 2026-10-20** (`beginEntry` / `endEntry`, data descriptor) — do | no |
@@ -247,7 +247,7 @@ compile with `cc -O3` from a pinned clone under `.zig-cache`) wrapped by a minim
 `c_bench/driver.c`, or `libzip` (BSD-3) with zlib-ng if the toolchain has it (pattern
 `modules/decimal/tools/mpdec_bench`); zip2 (Rust) optional behind a pinned clone. Rows, all on one
 generated archive set (seeded): (1) xlsx-shaped archive: 12 entries, one 200 MB sheet of repetitive XML
-at deflate level 6, stream-extract the large entry (inflate + CRC bound: the row bxp feels; shows
+at deflate level 6, stream-extract the large entry (inflate + CRC bound: the row the build-tool consumer feels; shows
 `std.compress.flate` against libdeflate and Go); (2) the same entry Stored, 1 GiB (CRC bound; shows R26);
 (3) central-directory open: 100 k tiny entries, time to `Archive.init` + `find` (Go `NewReader`, zip2);
 (4) many small entries streamed one by one (per-entry setup cost); (5) writer: 256 MiB text into Deflate

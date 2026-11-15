@@ -5,10 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-10** — **NO CONSUMER-VISIBLE CHANGE** (Zig 0.17.1 migration): the mtime narrowing is `std.math.cast(u32, t)` again; the i64 → u64 → u32 detour was the Zig 0.17.0 `trunc nsw` workaround (ziglang/zig#37131, fixed in 0.17.1; `build.zig` now refuses older compilers).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private civil-calendar helpers (`daysFromCivil`, `civilFromDays`, `daysInMonth`, `isLeap`) are gone; `DosDateTime` uses `datefmt` (new dependency).
-- **2026-11-02** — **New build option** `-Dzipstream-builtin-decoders` (default `true`; `-Dprofile=small` picks `false`): `false` leaves `Archive` with Store and Deflate and saves 315 KB in a read-only binary; other methods are refused with `UnsupportedCompressionMethod` unless plugged in through `Options.codecs`. Request from bxp.
-- **2026-11-02** — **Fixed** (size): reading no longer links any compressor. `Archive`'s fallback table named `zstd_codec` & co., whose `open_writer` pulled in the whole zstd, bzip2 and LZMA encoders; a read-only probe drops from 1.27 to 0.51 MB in ReleaseSmall and from 15.6 to 5.5 MB in ReleaseSafe. No API change. Request from bxp.
+- **2026-11-02** — **New build option** `-Dzipstream-builtin-decoders` (default `true`; `-Dprofile=small` picks `false`): `false` leaves `Archive` with Store and Deflate and saves 315 KB in a read-only binary; other methods are refused with `UnsupportedCompressionMethod` unless plugged in through `Options.codecs`. Request from the build-tool consumer.
+- **2026-11-02** — **Fixed** (size): reading no longer links any compressor. `Archive`'s fallback table named `zstd_codec` & co., whose `open_writer` pulled in the whole zstd, bzip2 and LZMA encoders; a read-only probe drops from 1.27 to 0.51 MB in ReleaseSmall and from 15.6 to 5.5 MB in ReleaseSafe. No API change. Request from the build-tool consumer.
 - **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of the § GZ change: a test pins that the LZMA codec reader opens lzma with no output cap of its own (`max_entry` rules).
 - **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** the LZMA/xz codec reader passes `.max_output = null`, so lzma's new 256 MiB default bomb guard does not override the entry cap zipstream already enforces (`max_entry`), as for bzip2.
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** the bzip2 codec reader passes `.max_output = null`, so bzip2's new 256 MiB default bomb guard does not override the entry cap zipstream already enforces (`max_entry`, default 1 GiB).
@@ -62,7 +63,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   end record is `error.ZipNoEndRecord` (new member of `Error`, same name std used). Anchor grade
   MIXED → EXTERNAL. **Consumer note:** code that caught `UnsupportedCompressionMethod` (or std's
   `ZipEncryptionUnsupported`) from `Archive.init` to skip a whole archive now gets it from
-  `EntryReader.init` for that one entry instead (bxp `pipeline.zig` does the former).
+  `EntryReader.init` for that one entry instead (the build-tool consumer `pipeline.zig` does the former).
 
 - **2026-10-04** — **Tests:** mutation run (37 schemata mutants, 36 killed, 1 equivalent;
   7 new tests). Pins the central-directory pre-check's exact edge and its own errors (bad

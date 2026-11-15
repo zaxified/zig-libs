@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Size probe for the `small` lane (CONVENTIONS §4.2): a consumer that only
-//! reads, the shape of bxp-cli (the request that split the codec table and added
+//! reads, the shape of the build-tool consumer's CLI (the request that split the codec table and added
 //! `zipstream-builtin-decoders`). Built at ReleaseSmall under `-Dprofile=default`
 //! and `-Dprofile=small` by `scripts/checks/small-sizes.sh`; the size difference
 //! is held to its floor in `scripts/checks/small-size-expected.tsv`.
