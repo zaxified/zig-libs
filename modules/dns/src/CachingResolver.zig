@@ -43,7 +43,16 @@
 //!    `resetFailures` clears it for a caller that knows the network is back.
 //!    A failure of a concurrent miss never arms backoff on an entry that
 //!    holds a fresh answer: that answer is served. Evicting an entry drops its
-//!    backoff state.
+//!    backoff state. `forget`/`forgetReverse`/`forgetSrv` drop one key (answer
+//!    and backoff) so its next lookup asks the network; `clear` drops all.
+//!  - The serve-stale window counts from EXPIRY (RFC 8767), not from the last
+//!    good answer: a key stays servable for `ttl + stale_s` seconds after it was
+//!    stored. A caller who wants "keep the last answer N seconds" sets `stale_s`
+//!    to N minus the TTL it saw, or simply to N as an upper bound (the answer is
+//!    then kept a little longer than N). A stale answer says why in
+//!    `Answer.stale_reason`. Negative answers (NXDOMAIN, NODATA) live for the SOA
+//!    TTL (RFC 2308), clamped by the `negative_*` options; they get no
+//!    doubling backoff (that is only for upstream failures).
 //!  - Thread-safe: one `std.Io.Mutex` guards the table and is never held
 //!    across a network lookup. The cache owns its `Resolver`s (a `Resolver` is
 //!    single-owner): it creates them lazily from the `Resolver.Options` given
@@ -53,12 +62,14 @@
 //!    another. Two concurrent misses on the SAME key may both query (no
 //!    request coalescing yet). An answer expires TTL seconds after the moment
 //!    the lookup was sent, not after it returned. `lookupIp` order is RFC 6724
-//!    as of the lookup time: a cache hit after a route change keeps the old order.
+//!    as of the lookup time; a hit is re-sorted on the way out (see
+//!    `Options.resort_ip_hits`), so a route change shows in the order.
 //!  - Memory: everything is under `gpa` (which must be thread-safe: pool
 //!    threads allocate concurrently), the table owns clones; an
 //!    allocation failure while storing returns the answer uncached.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testkit = @import("testkit");
 const netaddr = @import("netaddr");
 const message = @import("message.zig");
@@ -138,7 +149,26 @@ pub const Options = struct {
     /// Most `Resolver`s (hence network lookups) in flight at once; created on
     /// demand. A miss beyond that waits for one to be returned. 0 is invalid.
     max_concurrent_lookups: u16 = 8,
+    /// Re-order the items of a `lookupIp` hit (`.cache` or `.stale`) with RFC
+    /// 6724 destination selection as of NOW, so a hit served after the host's
+    /// routes changed does not keep the order of the lookup that filled the
+    /// entry. Cost: one route query (a UDP connect, no packet sent) per item
+    /// per hit, on the caller's clone after the table mutex is released. `false`
+    /// keeps the stored order (that of the filling lookup). A `.network` answer
+    /// is sorted by the Resolver itself and is never re-sorted here.
+    resort_ip_hits: bool = true,
+    /// Source-address probe used by `resort_ip_hits`; a test seam. Null
+    /// result = unreachable. Default `netaddr.systemSource` (Linux; elsewhere
+    /// a probe that finds no route, i.e. no re-sorting).
+    sort_source: *const fn (netaddr.Ip) ?netaddr.Ip = defaultSortSource,
 };
+
+fn noSource(_: netaddr.Ip) ?netaddr.Ip {
+    return null;
+}
+
+const defaultSortSource: *const fn (netaddr.Ip) ?netaddr.Ip =
+    if (builtin.os.tag == .linux) &netaddr.systemSource else &noSource;
 
 /// One pooled Resolver (heap-pinned: a Resolver must not move once used).
 const Slot = struct {
@@ -167,6 +197,11 @@ pub fn Answer(comptime T: type) type {
         /// `Options.stale_answer_ttl_s`. Literals and hosts answers keep null.
         lookup: Resolver.Lookup(T),
         source: Source,
+        /// Set on `.stale`: the error that made the cache serve the expired
+        /// answer instead of asking the network: the upstream failure just
+        /// seen, the error the key's backoff is holding, or
+        /// `error.BudgetExceeded`. Null for `.network` and `.cache`.
+        stale_reason: ?Error = null,
 
         pub fn deinit(a: *@This()) void {
             a.lookup.deinit();
@@ -307,6 +342,46 @@ pub fn resetFailures(c: *CachingResolver) void {
     }
 }
 
+/// The lookup kinds keyed by a single name (`reverse` and `lookupSrv` have
+/// their own `forget*`).
+pub const NameKind = enum { ip, mx, ns, txt, cname };
+
+/// Drops the entry of one key (answer and failure backoff) so its next lookup
+/// goes to the network, without touching any other key: for a caller that
+/// knows one name's answer is wrong now. No-op when the key is absent. A
+/// lookup of the same key already in flight may still store its answer
+/// afterwards.
+pub fn forget(c: *CachingResolver, kind: NameKind, name: []const u8) void {
+    var buf: [key_buf_len]u8 = undefined;
+    const k: Kind = switch (kind) {
+        .ip => .ip,
+        .mx => .mx,
+        .ns => .ns,
+        .txt => .txt,
+        .cname => .cname,
+    };
+    c.forgetKey(nameKey(&buf, k, name));
+}
+
+/// `forget` for `reverse(ip)`.
+pub fn forgetReverse(c: *CachingResolver, ip: netaddr.Ip) void {
+    var buf: [key_buf_len]u8 = undefined;
+    c.forgetKey(reverseKey(&buf, ip));
+}
+
+/// `forget` for `lookupSrv(service, proto, name)`.
+pub fn forgetSrv(c: *CachingResolver, service: []const u8, proto: []const u8, name: []const u8) void {
+    var buf: [key_buf_len]u8 = undefined;
+    c.forgetKey(srvKey(&buf, service, proto, name));
+}
+
+fn forgetKey(c: *CachingResolver, key: ?[]const u8) void {
+    const k = key orelse return; // too long to ever have been cached
+    c.mutex.lockUncancelable(c.io);
+    defer c.mutex.unlock(c.io);
+    if (c.map.get(k)) |e| c.removeEntry(e);
+}
+
 /// Drops every entry (answers and failure state alike).
 pub fn clear(c: *CachingResolver) void {
     c.mutex.lockUncancelable(c.io);
@@ -337,8 +412,12 @@ pub fn lookupIp(c: *CachingResolver, name: []const u8) Error!Answer(netaddr.Ip) 
 
 pub fn reverse(c: *CachingResolver, ip: netaddr.Ip) Error!Answer([]const u8) {
     var buf: [key_buf_len]u8 = undefined;
+    return c.run([]const u8, reverseKey(&buf, ip), false, ip, callReverse);
+}
+
+fn reverseKey(buf: *[key_buf_len]u8, ip: netaddr.Ip) []const u8 {
     buf[0] = @backingInt(Kind.reverse);
-    const key: []const u8 = switch (ip) {
+    return switch (ip) {
         .v4 => |b| blk: {
             buf[1] = 4;
             @memcpy(buf[2..6], &b);
@@ -350,7 +429,6 @@ pub fn reverse(c: *CachingResolver, ip: netaddr.Ip) Error!Answer([]const u8) {
             break :blk buf[0..18];
         },
     };
-    return c.run([]const u8, key, false, ip, callReverse);
 }
 
 pub fn lookupMx(c: *CachingResolver, name: []const u8) Error!Answer(Resolver.Mx) {
@@ -439,6 +517,24 @@ fn run(
     ctx: anytype,
     comptime call: fn (*Resolver, @TypeOf(ctx)) Resolver.Error!Resolver.Lookup(T),
 ) Error!Answer(T) {
+    const ans = try c.runLocked(T, key, local, ctx, call);
+    // The table mutex is released by now: the clone is the caller's own, so
+    // sorting it (route queries) never holds the table.
+    if (T == netaddr.Ip and c.options.resort_ip_hits and ans.source != .network) {
+        const items: []netaddr.Ip = @constCast(ans.lookup.items); // the clone's arena memory
+        netaddr.sortDestinations(items, c.options.sort_source) catch {}; // too many candidates: order kept
+    }
+    return ans;
+}
+
+fn runLocked(
+    c: *CachingResolver,
+    comptime T: type,
+    key: ?[]const u8,
+    local: bool,
+    ctx: anytype,
+    comptime call: fn (*Resolver, @TypeOf(ctx)) Resolver.Error!Resolver.Lookup(T),
+) Error!Answer(T) {
     const io = c.io;
     if (local) return c.bypassLocal(T, ctx, call);
     const k = key orelse return c.bypass(T, ctx, call);
@@ -468,14 +564,14 @@ fn run(
     const stale_entry: ?*Entry = if (entry) |e| (if (c.staleUsable(e, t0)) e else null) else null;
     if (entry) |e| {
         if (e.fail_count > 0 and t0 < e.retry_at_s) {
-            if (stale_entry) |s| return c.staleAnswer(T, s);
+            if (stale_entry) |s| return c.staleAnswer(T, s, e.last_err);
             return e.last_err;
         }
     }
     if (c.options.max_network_lookups) |b| {
         if (!c.takeToken(b, t0)) {
             c.budget_refused += 1;
-            if (stale_entry) |s| return c.staleAnswer(T, s);
+            if (stale_entry) |s| return c.staleAnswer(T, s, error.BudgetExceeded);
             return error.BudgetExceeded;
         }
     }
@@ -612,7 +708,7 @@ fn failed(c: *CachingResolver, comptime T: type, k: []const u8, err: Resolver.Er
     const stale_ok = c.staleUsable(e, t);
     if (stale_ok) delay = @max(delay, c.options.stale_answer_ttl_s);
     e.retry_at_s = t +| delay;
-    if (stale_ok) return c.staleAnswer(T, e);
+    if (stale_ok) return c.staleAnswer(T, e, err);
     return err;
 }
 
@@ -655,8 +751,9 @@ fn answerFrom(c: *CachingResolver, comptime T: type, e: *Entry, source: Source, 
     return .{ .lookup = lk, .source = source };
 }
 
-fn staleAnswer(c: *CachingResolver, comptime T: type, e: *Entry) error{OutOfMemory}!Answer(T) {
-    const a = try c.answerFrom(T, e, .stale, c.options.stale_answer_ttl_s);
+fn staleAnswer(c: *CachingResolver, comptime T: type, e: *Entry, reason: Error) error{OutOfMemory}!Answer(T) {
+    var a = try c.answerFrom(T, e, .stale, c.options.stale_answer_ttl_s);
+    a.stale_reason = reason;
     c.stale_served += 1;
     return a;
 }
@@ -2666,4 +2763,163 @@ test "resetFailures reaches every entry and clears the counters of the answers i
     try testing.expectEqual(@as(u8, 0), e.fail_count);
     try testing.expectEqual(@as(u64, 0), e.retry_at_s);
     try testing.expectEqual(@as(usize, 2), c.stats().entries); // down1 and down2 are gone
+}
+
+test "forget drops one key: the next lookup asks the network, the others stay cached" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{});
+    defer c.deinit();
+
+    var a = try c.lookupIp("a.example.com");
+    defer a.deinit();
+    var b = try c.lookupIp("b.example.com");
+    defer b.deinit();
+    var m = try c.lookupMx("a.example.com");
+    defer m.deinit();
+    var r = try c.reverse(.{ .v4 = .{ 192, 0, 2, 1 } });
+    defer r.deinit();
+    var s = try c.lookupSrv("sip", "tcp", "a.example.com");
+    defer s.deinit();
+    try testing.expectEqual(@as(u32, 5), h.queries());
+
+    c.forget(.ip, "A.Example.COM"); // keyed like a lookup: case folded
+    var a2 = try c.lookupIp("a.example.com");
+    defer a2.deinit();
+    try testing.expectEqual(Source.network, a2.source);
+    try testing.expectEqual(@as(u32, 6), h.queries());
+    var b2 = try c.lookupIp("b.example.com");
+    defer b2.deinit();
+    try testing.expectEqual(Source.cache, b2.source);
+    var m2 = try c.lookupMx("a.example.com"); // another kind of the same name
+    defer m2.deinit();
+    try testing.expectEqual(Source.cache, m2.source);
+
+    c.forgetReverse(.{ .v4 = .{ 192, 0, 2, 1 } });
+    var r2 = try c.reverse(.{ .v4 = .{ 192, 0, 2, 1 } });
+    defer r2.deinit();
+    try testing.expectEqual(Source.network, r2.source);
+    c.forgetSrv("sip", "tcp", "a.example.com");
+    var s2 = try c.lookupSrv("sip", "tcp", "a.example.com");
+    defer s2.deinit();
+    try testing.expectEqual(Source.network, s2.source);
+    try testing.expectEqual(@as(u32, 8), h.queries());
+}
+
+test "forget of an absent key is a no-op" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{});
+    defer c.deinit();
+    var a = try c.lookupIp("a.example.com");
+    defer a.deinit();
+    c.forget(.ip, "never.example.com");
+    c.forget(.txt, "a.example.com");
+    c.forgetReverse(.{ .v6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } });
+    c.forgetSrv("x", "udp", "a.example.com");
+    const long: [300]u8 = @splat('a');
+    c.forget(.ip, &long); // too long for a key: nothing could have been cached
+    try testing.expectEqual(@as(usize, 1), c.stats().entries);
+    var a2 = try c.lookupIp("a.example.com");
+    defer a2.deinit();
+    try testing.expectEqual(Source.cache, a2.source);
+}
+
+test "forget during backoff clears it: the key is asked again at once" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .failure_backoff_min_s = 100, .failure_backoff_max_s = 100 });
+    defer c.deinit();
+    h.stub.mode.store(.servfail, .release);
+    try testing.expectError(error.ServerFailed, c.lookupIp("down.example.com"));
+    try testing.expectError(error.ServerFailed, c.lookupIp("down.example.com")); // held by the backoff
+    try testing.expectEqual(@as(u32, 1), h.queries());
+
+    h.stub.mode.store(.answer, .release);
+    c.forget(.ip, "down.example.com");
+    try testing.expectEqual(@as(usize, 0), c.stats().entries);
+    var ok = try c.lookupIp("down.example.com");
+    defer ok.deinit();
+    try testing.expectEqual(Source.network, ok.source);
+    try testing.expectEqual(@as(u32, 2), h.queries());
+}
+
+test "stale_reason: the upstream failure, the backoff's error, the budget" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .stale_s = 1000, .stale_answer_ttl_s = 30, .max_network_lookups = .{ .per_s = 1, .burst = 2 } });
+    defer c.deinit();
+    var prime = try c.lookupIp("s.example.com"); // token 1
+    defer prime.deinit();
+    try testing.expectEqual(@as(?Error, null), prime.stale_reason);
+    var hit = try c.lookupIp("s.example.com");
+    defer hit.deinit();
+    try testing.expectEqual(@as(?Error, null), hit.stale_reason);
+
+    h.stub.mode.store(.servfail, .release);
+    h.clock.now += 61;
+    var s1 = try c.lookupIp("s.example.com"); // token 2 (plus 61 s refill, capped at 2): the upstream says no
+    defer s1.deinit();
+    try expectIp(&s1, .stale, 30);
+    try testing.expectEqual(@as(?Error, error.ServerFailed), s1.stale_reason);
+
+    var s2 = try c.lookupIp("s.example.com"); // inside the recheck: the backoff holds the error
+    defer s2.deinit();
+    try expectIp(&s2, .stale, 30);
+    try testing.expectEqual(@as(?Error, error.ServerFailed), s2.stale_reason);
+    try testing.expectEqual(@as(u32, 2), h.queries());
+
+    // Budget: the recheck is over and no token is left.
+    h.clock.now += 30;
+    c.tokens = 0;
+    c.refill_s = c.now();
+    var s3 = try c.lookupIp("s.example.com");
+    defer s3.deinit();
+    try expectIp(&s3, .stale, 30);
+    try testing.expectEqual(@as(?Error, error.BudgetExceeded), s3.stale_reason);
+}
+
+var probe_calls: u32 = 0;
+var probe_v6_reachable: bool = false;
+
+fn probeSource(dst: netaddr.Ip) ?netaddr.Ip {
+    probe_calls += 1;
+    return switch (dst) {
+        .v4 => if (probe_v6_reachable) null else dst,
+        .v6 => if (probe_v6_reachable) dst else null,
+    };
+}
+
+test "a changed route source reorders a cache hit; resort_ip_hits = false keeps the stored order" {
+    var h: Harness = .{};
+    try h.start(.any);
+    defer h.stop();
+    var c = try h.cache(.{ .sort_source = probeSource });
+    defer c.deinit();
+    var a = try c.lookupIp("dual.example.com");
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 2), a.lookup.items.len);
+
+    probe_v6_reachable = false;
+    var h1 = try c.lookupIp("dual.example.com");
+    defer h1.deinit();
+    try testing.expectEqual(Source.cache, h1.source);
+    try testing.expect(h1.lookup.items[0] == .v4);
+
+    probe_v6_reachable = true; // the host's routes changed
+    var h2 = try c.lookupIp("dual.example.com");
+    defer h2.deinit();
+    try testing.expectEqual(Source.cache, h2.source);
+    try testing.expect(h2.lookup.items[0] == .v6);
+
+    // The stored copy is untouched by either re-sort: the option off serves it as stored.
+    c.options.resort_ip_hits = false;
+    probe_calls = 0;
+    var h3 = try c.lookupIp("dual.example.com");
+    defer h3.deinit();
+    try testing.expectEqual(@as(u32, 0), probe_calls);
 }
