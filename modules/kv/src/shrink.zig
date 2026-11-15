@@ -19,6 +19,7 @@
 //! the reduction only when the SAME invariant violation still reproduces.
 
 const std = @import("std");
+const kv = @import("root.zig");
 const vopr = @import("vopr.zig");
 const Allocator = std.mem.Allocator;
 
@@ -91,7 +92,7 @@ pub fn shrink(gpa: Allocator, failing: *const FailingRun) ShrinkError!ShrinkResu
     const before = vopr.opCount(src.epochs);
 
     // The captured full trace must reproduce the SAME failure before we cut.
-    if (!failsSame(gpa, failing.err, src.seed, src.epochs)) return error.CannotReproduce;
+    if (!failsSame(gpa, failing.err, src.seed, src.cfg.options, src.epochs)) return error.CannotReproduce;
 
     // ── flatten every op into one list, tagged with its epoch ────────────────
     const flat = try gpa.alloc(FlatOp, before);
@@ -107,7 +108,7 @@ pub fn shrink(gpa: Allocator, failing: *const FailingRun) ShrinkError!ShrinkResu
     }
 
     // ── Pass A: ddmin over the flat op list ──────────────────────────────────
-    var ops_ctx = OpsCtx{ .gpa = gpa, .target = failing.err, .seed = src.seed, .src = src.epochs, .flat = flat };
+    var ops_ctx = OpsCtx{ .gpa = gpa, .target = failing.err, .seed = src.seed, .options = src.cfg.options, .src = src.epochs, .flat = flat };
     const kept_ops = try ddmin(gpa, before, &ops_ctx, OpsCtx.keeps);
     defer gpa.free(kept_ops);
 
@@ -116,7 +117,7 @@ pub fn shrink(gpa: Allocator, failing: *const FailingRun) ShrinkError!ShrinkResu
     defer freeBuiltEpochs(gpa, ops_min);
 
     // ── Pass B: ddmin over whole epochs ──────────────────────────────────────
-    var ep_ctx = EpochCtx{ .gpa = gpa, .target = failing.err, .seed = src.seed, .src = ops_min };
+    var ep_ctx = EpochCtx{ .gpa = gpa, .target = failing.err, .seed = src.seed, .options = src.cfg.options, .src = ops_min };
     const kept_eps = try ddmin(gpa, ops_min.len, &ep_ctx, EpochCtx.keeps);
     defer gpa.free(kept_eps);
 
@@ -125,7 +126,7 @@ pub fn shrink(gpa: Allocator, failing: *const FailingRun) ShrinkError!ShrinkResu
     for (kept_eps, 0..) |ei, i| kept[i] = ops_min[ei]; // shares op arrays with ops_min
 
     // ── Pass C: neutralize each surviving epoch's fault + garbage tail ───────
-    neutralize(gpa, failing.err, src.seed, kept);
+    neutralize(gpa, failing.err, src.seed, src.cfg.options, kept);
 
     // ── clone the minimized program into a self-owned trace ──────────────────
     var out = try cloneTrace(gpa, src.seed, src.cfg, kept);
@@ -140,8 +141,8 @@ const FlatOp = struct { epoch: usize, op: vopr.RecordedOp };
 /// Does replaying `epochs` reproduce EXACTLY `target` (not merely *some*
 /// failure)? The delta-debugging oracle. Any other outcome (pass, or a
 /// different error such as an unexpected OOM) counts as "not reproduced".
-fn failsSame(gpa: Allocator, target: anyerror, seed: u64, epochs: []const vopr.RecordedEpoch) bool {
-    if (vopr.replayTrace(gpa, seed, epochs)) |_| {
+fn failsSame(gpa: Allocator, target: anyerror, seed: u64, options: kv.Options, epochs: []const vopr.RecordedEpoch) bool {
+    if (vopr.replayTraceOpts(gpa, seed, epochs, options, null)) |_| {
         return false;
     } else |e| {
         return e == target;
@@ -197,13 +198,14 @@ const OpsCtx = struct {
     gpa: Allocator,
     target: anyerror,
     seed: u64,
+    options: kv.Options,
     src: []const vopr.RecordedEpoch,
     flat: []const FlatOp,
 
     fn keeps(ctx: *OpsCtx, subset: []const usize) Allocator.Error!bool {
         const epochs = try buildEpochsFromSubset(ctx.gpa, ctx.src, ctx.flat, subset);
         defer freeBuiltEpochs(ctx.gpa, epochs);
-        return failsSame(ctx.gpa, ctx.target, ctx.seed, epochs);
+        return failsSame(ctx.gpa, ctx.target, ctx.seed, ctx.options, epochs);
     }
 };
 
@@ -211,13 +213,14 @@ const EpochCtx = struct {
     gpa: Allocator,
     target: anyerror,
     seed: u64,
+    options: kv.Options,
     src: []const vopr.RecordedEpoch,
 
     fn keeps(ctx: *EpochCtx, subset: []const usize) Allocator.Error!bool {
         const epochs = try ctx.gpa.alloc(vopr.RecordedEpoch, subset.len);
         defer ctx.gpa.free(epochs); // shares op arrays with ctx.src — not freed here
         for (subset, 0..) |ei, i| epochs[i] = ctx.src[ei];
-        return failsSame(ctx.gpa, ctx.target, ctx.seed, epochs);
+        return failsSame(ctx.gpa, ctx.target, ctx.seed, ctx.options, epochs);
     }
 };
 
@@ -273,20 +276,20 @@ fn freeBuiltEpochs(gpa: Allocator, epochs: []vopr.RecordedEpoch) void {
 /// `.clean` and dropping its garbage tail, keeping the simplification only if
 /// the failure still reproduces (so a crash/error/garbage that the failure did
 /// not actually need is removed).
-fn neutralize(gpa: Allocator, target: anyerror, seed: u64, epochs: []vopr.RecordedEpoch) void {
+fn neutralize(gpa: Allocator, target: anyerror, seed: u64, options: kv.Options, epochs: []vopr.RecordedEpoch) void {
     for (epochs) |*ep| {
         switch (ep.fault) {
             .clean => {},
             else => {
                 const saved = ep.fault;
                 ep.fault = .clean;
-                if (!failsSame(gpa, target, seed, epochs)) ep.fault = saved;
+                if (!failsSame(gpa, target, seed, options, epochs)) ep.fault = saved;
             },
         }
         if (ep.garbage.len > 0) {
             const saved = ep.garbage;
             ep.garbage = &.{};
-            if (!failsSame(gpa, target, seed, epochs)) ep.garbage = saved;
+            if (!failsSame(gpa, target, seed, options, epochs)) ep.garbage = saved;
         }
     }
 }
@@ -549,4 +552,25 @@ test "shrink: the minimized trace is self-contained (survives freeing the source
     // scratch, so the reproduction is stable.
     try testing.expectError(error.InvariantViolation, vopr.replayTrace(testing.allocator, result.trace.seed, result.trace.epochs));
     try testing.expectError(error.InvariantViolation, vopr.replayTrace(testing.allocator, result.trace.seed, result.trace.epochs));
+}
+
+test "shrink: a failing trace with partial merges shrinks under the run's options" {
+    const cfg: vopr.Config = .{ .sabotage = true, .quiet = true, .batches = true, .partial_merges = true, .options = .{ .max_file_size = 4096 } };
+    var seed: u64 = 1;
+    const failing_seed = while (seed <= 64) : (seed += 1) {
+        var tr = try vopr.generateTrace(testing.allocator, seed, cfg);
+        defer tr.deinit();
+        if (vopr.replayTraceOpts(testing.allocator, tr.seed, tr.epochs, cfg.options, null)) |_| {} else |e| {
+            if (e == error.InvariantViolation) break seed;
+        }
+    } else return error.NoFailingSeed;
+    var fr = FailingRun{ .seed = failing_seed, .cfg = cfg, .trace = .empty, .stats = .{}, .err = error.InvariantViolation };
+    defer fr.deinit(testing.allocator);
+    var result = try shrink(testing.allocator, &fr);
+    defer result.deinit();
+    try testing.expect(result.ops_after < result.ops_before);
+    try testing.expectError(
+        error.InvariantViolation,
+        vopr.replayTraceOpts(testing.allocator, result.trace.seed, result.trace.epochs, cfg.options, null),
+    );
 }

@@ -248,8 +248,10 @@ pub const Config = struct {
     /// multi-file stores.
     options: kv.Options = .{},
     /// The compaction op merges a random subset of the sealed files instead
-    /// (`Db.merge`) whenever the store is multi-file. Live runner only — the
-    /// trace capture/replay keeps `compact`.
+    /// (`Db.merge`) whenever the store is multi-file. Recorded as
+    /// `RecordedOp.merge` by `generateTrace` (replay it with
+    /// `replayTraceOpts` and the same `options`, else the store never gets
+    /// a second file and the op degrades to `compact`).
     partial_merges: bool = false,
     /// Some operations are atomic batches (`Db.batch`): 1..6 puts and
     /// deletes committed together. A crash mid-commit must leave all of them
@@ -677,6 +679,13 @@ pub const RecordedOp = union(enum) {
     batch: struct { ops: []const BatchOpRec },
     get: struct { key: usize },
     compact,
+    /// `Db.merge` of a subset of the sealed files (`Config.partial_merges`).
+    /// File ids cannot be known when the trace is captured (no store runs
+    /// then), so the subset is a mask over the sealed (non-active) files in
+    /// store order: bit `i % 64` set = the i-th sealed file is merged. Valid
+    /// for any store state, so ddmin may drop other ops freely. A store with
+    /// one file runs `compact` instead, as the live runner does.
+    merge: struct { pick: u64 },
     census,
 };
 
@@ -758,7 +767,7 @@ pub fn generateTrace(gpa: Allocator, seed: u64, cfg: Config) !RecordedTrace {
             } else if (roll < 92) {
                 op.* = .{ .get = .{ .key = prng.below(key_count) } };
             } else if (roll < 97) {
-                op.* = .compact;
+                op.* = if (cfg.partial_merges) .{ .merge = .{ .pick = prng.next() } } else .compact;
             } else {
                 op.* = .census;
             }
@@ -794,12 +803,20 @@ pub fn generateTrace(gpa: Allocator, seed: u64, cfg: Config) !RecordedTrace {
 /// written media; they are re-derived from a dedicated `Prng(seed)` so replay
 /// stays deterministic.
 pub fn replayTrace(gpa: Allocator, seed: u64, epochs: []const RecordedEpoch) !void {
+    return replayTraceOpts(gpa, seed, epochs, .{}, null);
+}
+
+/// `replayTrace` with the `kv.Options` of the run the trace was captured for
+/// (`RecordedTrace.cfg.options`; a small `max_file_size` is what makes the
+/// store multi-file and a `RecordedOp.merge` a real partial merge).
+/// `merges_out`, when set, counts the `Db.merge` calls made.
+pub fn replayTraceOpts(gpa: Allocator, seed: u64, epochs: []const RecordedEpoch, options: kv.Options, merges_out: ?*usize) !void {
     var prng = Prng.init(seed);
     var sim = SimStorage.init(gpa);
     defer sim.deinit();
     var faults = FaultStorage{ .inner = sim.storage(), .prng = &prng };
 
-    var r = Replayer{ .gpa = gpa, .sim = &sim, .faults = &faults, .st = faults.storage() };
+    var r = Replayer{ .gpa = gpa, .sim = &sim, .faults = &faults, .st = faults.storage(), .options = options, .merges = merges_out };
     for (epochs, 0..) |ep, i| {
         r.epoch = i;
         faults.fired = false;
@@ -833,6 +850,8 @@ const Replayer = struct {
     faults: *FaultStorage,
     st: Storage,
     model: [key_count]?[]const u8 = @splat(null),
+    options: kv.Options = .{},
+    merges: ?*usize = null,
 
     fn liveCount(r: *const Replayer) usize {
         var n: usize = 0;
@@ -849,7 +868,7 @@ const Replayer = struct {
     }
 
     fn runEpochOps(r: *Replayer, ops: []const RecordedOp) !Inflight {
-        var db = Db.open(r.gpa, r.st, db_name, .{}) catch |e| {
+        var db = Db.open(r.gpa, r.st, db_name, r.options) catch |e| {
             if (e == error.Crashed or r.faults.fired) return .none;
             return error.InvariantViolation;
         };
@@ -897,12 +916,40 @@ const Replayer = struct {
                     };
                     if (r.sim.crashed) return .none; // see `Vopr.runEpoch`
                 },
+                .merge => |m| {
+                    const res = if (db.multi) r.mergePicked(&db, m.pick) else db.compact();
+                    res catch |e| {
+                        try r.expectFault(e);
+                        return .none;
+                    };
+                    if (r.sim.crashed) return .none; // see `Vopr.runEpoch`
+                },
                 .census => {
                     if (db.count() != r.liveCount()) return error.InvariantViolation;
                 },
             }
         }
         return .none;
+    }
+
+    /// `Db.merge` of the sealed files selected by `pick` (see `RecordedOp.merge`).
+    fn mergePicked(r: *Replayer, db: *Db, pick: u64) anyerror!void {
+        const stats = try db.fileStats(r.gpa);
+        defer r.gpa.free(stats);
+        const ids = try r.gpa.alloc(u32, stats.len);
+        defer r.gpa.free(ids);
+        var n: usize = 0;
+        var ord: usize = 0;
+        for (stats) |st| {
+            if (st.active) continue;
+            if ((pick >> @intCast(ord % 64)) & 1 == 1) {
+                ids[n] = st.id;
+                n += 1;
+            }
+            ord += 1;
+        }
+        if (r.merges) |c| c.* += 1;
+        return db.merge(ids[0..n]);
     }
 
     fn recoverAndVerify(r: *Replayer, garbage: []const u8, sabotage: bool, inflight: Inflight) !void {
@@ -927,7 +974,7 @@ const Replayer = struct {
             }
         }
 
-        var db = Db.open(r.gpa, r.st, db_name, .{}) catch return error.InvariantViolation;
+        var db = Db.open(r.gpa, r.st, db_name, r.options) catch return error.InvariantViolation;
         defer db.close();
 
         if (try modelMatches(r.gpa, &db, &r.model)) {
@@ -1137,6 +1184,44 @@ test "record→replay: batch traces replay clean, and a sabotaged one is caught"
         if (replayTrace(testing.allocator, tr.seed, tr.epochs)) |_| {} else |e| {
             try testing.expectEqual(error.InvariantViolation, e);
             caught = true;
+        }
+    }
+    try testing.expect(caught);
+}
+
+test "record→replay: partial merges are recorded, replay clean, and a sabotaged one is caught" {
+    const cfg: Config = .{ .batches = true, .options = .{ .max_file_size = 4096 }, .partial_merges = true };
+    var recorded: usize = 0;
+    var executed: usize = 0;
+    var seed: u64 = 1;
+    while (seed <= 60) : (seed += 1) {
+        var tr = try generateTrace(testing.allocator, seed, cfg);
+        defer tr.deinit();
+        for (tr.epochs) |ep| for (ep.ops) |op| {
+            if (op == .merge) recorded += 1;
+            try testing.expect(op != .compact); // partial_merges replaces compact
+        };
+        try replayTraceOpts(testing.allocator, tr.seed, tr.epochs, tr.cfg.options, &executed);
+        // Replays identically a second time (the pick mask is data, not a draw).
+        try replayTraceOpts(testing.allocator, tr.seed, tr.epochs, tr.cfg.options, null);
+    }
+    try testing.expect(recorded >= 20);
+    // Teeth: merges really ran on multi-file stores in replay.
+    try testing.expect(executed >= 10);
+
+    // Positive control: the same kind of trace with the sabotage is caught
+    // AFTER merges ran, so a replay that skipped them would show it.
+    var caught = false;
+    seed = 1;
+    while (seed <= 64 and !caught) : (seed += 1) {
+        var scfg = cfg;
+        scfg.sabotage = true;
+        var tr = try generateTrace(testing.allocator, seed, scfg);
+        defer tr.deinit();
+        var m: usize = 0;
+        if (replayTraceOpts(testing.allocator, tr.seed, tr.epochs, tr.cfg.options, &m)) |_| {} else |e| {
+            try testing.expectEqual(error.InvariantViolation, e);
+            if (m > 0) caught = true; // caught after a real partial merge ran
         }
     }
     try testing.expect(caught);
