@@ -6,7 +6,7 @@
 
 **Scope:** core — Go net resolver (reference) / c-ares / hickory-resolver / libunbound / dnspython / systemd-resolved / Node `dns` (surveyed 2026-11-15; parity -> core 2026-11-15: the answer cache is now `CachingResolver` (2026-11-15), but the API is blocking-only where every library but Go's is asynchronous — see "Where we are behind")
 
-**Audit:** review 2026-09-12 · mutation 2026-11-15 (276/295, 19 eq) · src 133fbfc916b68280
+**Audit:** review 2026-09-12 · mutation 2026-11-16 (300/319, 19 eq) · src a0b9875b25d7af0f
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DNS_FUZZ); 2026-11-02 `dns-query-roundtrip` (random QueryOptions incl. DO/AD/CD and EDNS options → encode → decode equal, or the documented refusal; 200,000 driver runs clean, ReleaseSafe) · ct n/a — public DNS codec (keyword review, 2026-10-07); TSIG (2026-10-16): std HMAC, MAC compared with `timing_safe.eql`, secret frames burned (stack probe) · panic 2026-10-31 (sweep + blind review: `RequestTooLarge` for > 65535 B, TSIG length guards, spoofed/QR-clear/undecodable UDP replies dropped to the same deadline, DoH body ≤ 65535, owner-name sharing 17.8 → 0.85 MB on a pointer flood; delta audit 28/31 + 3 eq)
 
@@ -353,6 +353,25 @@ needs: the `r.deinit()` of `bypassLocal` (a local-only lookup never reads resolv
 DoH client, so the Resolver holds nothing to free; needs a local lookup that allocates) and the
 `payload != null` clause of the fresh-payload guard in `failed` (a payload-less entry always has
 `expires_s <= t` on a monotonic clock; needs a clock stepping back after the payload was dropped).
+
+**Audit 2026-11-16 (cache-gap delta).** 24 schemata mutants over the non-test lines of the
+`forget` / `forgetReverse` / `forgetSrv` / `Answer.stale_reason` / `resort_ip_hits` change in
+`src/CachingResolver.zig`: each arm of `forget`'s kind switch (swapped for another kind), the key
+handed to `forgetKey` by all three entry points (dropped), `forgetKey` itself (the null-key early
+return, the `unlock`, the `removeEntry`), `reverseKey` (the address copy and the key length of both
+families), `run`'s re-sort (the option flipped, `Source.stale` skipped, `Source.network` sorted too,
+the probe replaced by a no-route one, the `TooManyCandidates` arm turned into a trap) and the reason
+handed to `staleAnswer` at its three call sites plus the assignment of `stale_reason` itself. First
+run: 16 killed, 8 survived. New tests: `forget` over all five name kinds (only the asked kind goes
+back to the network, whichever kind was forgotten); the "absent key" test now really reaches the
+too-long-key path (its 300-byte name fitted the key buffer) for `forget` and for `forgetSrv` with a
+256-byte service; a stale IP answer re-sorted by a changed route and a network answer never probed by
+the cache layer; a stored 65-address answer served unsorted (above `max_sort_candidates`) with no
+probe, plus the default `sort_source` equal to `netaddr.systemSource` on Linux. Rerun: 24 killed
+(one by timeout), 0 equivalent. Not mutated: the non-Linux default `noSource` and the
+`builtin.os.tag` choice of `defaultSortSource` (UNOBSERVABLE: comptime, needs a non-Linux host) and
+the `T == netaddr.Ip` guard of the re-sort (comptime: the other element types do not compile
+without it); the Linux half is pinned by the new default-probe assertion.
 
 **Audit 2026-10-04 (mutation).** 54 schemata mutants over the wire codec (name length and
 label caps, pointer direction and jump budget, section-count pre-checks, RDLENGTH/RDATA
