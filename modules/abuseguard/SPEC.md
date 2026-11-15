@@ -8,7 +8,7 @@
 
 **Ahead:** feature — the per-IP cap holds a socket from accept, so connections parked mid-header (slowloris) fill it: nginx 1.28.3 `limit_conn perip 1` counts a connection only once its whole header is read — with 20 sockets parked on an unfinished header a full request on a 21st still gets 200, while a second request during one being served gets 503 (`tools/nginx_probe/run.sh`); here the parked socket alone takes the slot and the next connection is refused at accept (test "integration: a socket with an unfinished request header holds its per-IP slot") (measured 2026-10-23)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (440/455, 15 eq) · src 46ae9d16f4f0959f
+**Audit:** review 2026-11-12 · mutation 2026-11-15 (9/9, 0 eq) · src fa2bd0fd1db5343f
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — abuse counters only (keyword review, 2026-10-07) · panic 2026-10-28 (sweep of every pub entry point: no data-reachable panic; `admit` refuses at `maxInt(u32)` live connections of one key, the server hooks check their context)
 
@@ -143,6 +143,14 @@ is unavailable): (1) concurrent keep-alive conns, next rejected at accept, close
 ban/unban, greylist TTL re-admit, record-driven escalation; (2) router auto-strike middleware
 escalating a 404 path scanner to accept-time rejection, then TTL re-admits; (3) a socket parked on
 an unfinished request header holds the per-IP slot (the nginx `limit_conn` probe's shape).
+
+Audit 2026-11-15 (delta mutation): 9 schemata mutants over the new code, ReleaseSafe, one build, each mutant under
+`setsid -w timeout` (20 s) and `ulimit -v`. `per_ip_cap_exempt`'s check in `admit` (the exemption ignored, its
+verdict flipped, the `allow` list read in its place) and the shared `inPrefixes` helper (the unmap skipped,
+`canonicalPrefix` skipped, the match returned inverted, the no-match result inverted, the list scanned as empty), plus
+`isAllowed` reading the exempt list instead of `allow`. 9/9 killed on the first run (2 as hangs: an inverted result
+that never refuses a connection), 0 equivalent, 0 survivors; the earlier whole-module run (440/455) is unchanged for
+the code this wave did not touch.
 
 Audit 2026-10-23: Sonnet review (11 findings) + 57 schemata mutants over admit/close, reconcile,
 strike decay and escalation, TTL growth, ban/unban/unbanAll, prefix bans, the three-list store,

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of `per_ip_cap_exempt` and the shared `inPrefixes` helper, 9/9 killed; Audit line and SPEC paragraph updated, no code change.
 - **2026-11-15** — **Added:** `Options.per_ip_cap_exempt: []const netaddr.Prefix = &.{}` — members skip only the `max_conns_per_ip` check (a trusted reverse proxy carrying every client); they stay counted against `max_conns_total` and bans/greylists/strikes still apply to them. Borrowed slice, linear scan, matched like `allow`. Consumer request 2026-11-15. Tests: an exempt peer opens past the cap while a stranger is refused, the global cap still sheds the exempt peer, closes release its slots, the exempt peer can still be banned; default empty.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: Per-IP-cap exemption for a trusted reverse proxy (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
