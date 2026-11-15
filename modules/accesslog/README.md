@@ -214,13 +214,15 @@ drop the line and count it.
 var q: accesslog.AsyncSink = undefined;
 try q.init(gpa, io, &file_writer.interface, .{ .max_bytes = 1 << 20, .max_lines = 4096 });
 defer q.deinit(); // drains, then stops the writer
-q.logEntry(entry); // or q.log("one line")
+const queued = q.logEntry(entry); // or q.log("one line"); false = dropped and counted
+_ = queued; // a caller with per-class drop counts counts the `false` returns
 const lost = q.dropped(); // lines dropped so far
 ```
 
 `flush()` waits for what was queued so far. `init` fails with `error.ConcurrencyUnavailable` when
 `io` cannot run a concurrent task. For non-HTTP logfmt lines, `writeLogfmtValue(w, value,
-.{ .max_len = 256 })` applies this module's quoting and escaping to one value.
+.{ .max_len = 256 })` applies this module's quoting and escaping to one value; `.quote = .always`,
+`.escape = .hex_x` (printable ASCII only, `\xNN`) and `.cut_marker = "..."` give the strict form.
 
 ### With `metrics`
 

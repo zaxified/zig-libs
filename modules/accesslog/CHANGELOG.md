@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **BREAKING (minor) + Added:** `AsyncSink.log` and `AsyncSink.logEntry` return `bool` (true = queued, false = dropped and counted; an empty line is ignored and returns true), so a caller can keep per-class drop counts; a caller that ignored the old `void` result must now discard it (`_ = q.log(...)`). `LogfmtValueOptions` gains `quote` (`.when_needed` | `.always`), `escape` (`.json_u` | `.hex_x`, every byte outside printable ASCII as `\xNN`) and `cut_marker` (appended after a `max_len` cut); defaults keep today's output.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: strict quoting mode for `writeLogfmtValue` (always quote, `\xNN`, cut marker) and per-caller drop counts for `AsyncSink`, found while moving a consumer onto both.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card Audit score counts the unobservable mutation survivors with the equivalent ones, as the score format has no separate field.

@@ -419,14 +419,15 @@ pub fn writeLogfmt(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeByte('\n');
 }
 
-/// True when `s` must be quoted in a logfmt value: empty, or contains a
-/// byte from the trigger set (space/tab/`"`/`=`/backslash/any control
-/// byte). Kept in exact lockstep with the escape set in `writeLogfmtValue`
-/// — see that function's doc.
-fn logfmtNeedsQuote(s: []const u8) bool {
-    if (s.len == 0) return true;
+/// True when `s` must be quoted in a logfmt value: contains a byte from the
+/// trigger set (space/tab/`"`/`=`/backslash/any control byte; with
+/// `.hex_x` also every byte >= 0x80, which that mode escapes). Kept in exact
+/// lockstep with the escape set in `writeLogfmtValue` — see that function's
+/// doc. The empty value is handled by the caller (it checks the total length).
+fn logfmtNeedsQuote(s: []const u8, escape: LogfmtValueOptions.Escape) bool {
     for (s) |c| switch (c) {
         ' ', '"', '=', '\\', 0x00...0x1F, 0x7F => return true,
+        0x80...0xFF => if (escape == .hex_x) return true,
         else => {},
     };
     return false;
@@ -434,39 +435,82 @@ fn logfmtNeedsQuote(s: []const u8) bool {
 
 /// Options for `writeLogfmtValue`.
 pub const LogfmtValueOptions = struct {
+    pub const Quote = enum {
+        /// Quote only a value that needs it (empty, or holding a trigger byte).
+        when_needed,
+        /// Always write the value in double quotes.
+        always,
+    };
+    pub const Escape = enum {
+        /// `\n`/`\r`/`\t` as such, other control bytes (0x00-0x1F, 0x7F) as
+        /// `\u00HH`; bytes >= 0x80 pass through unchanged.
+        json_u,
+        /// Every byte outside printable ASCII (0x20..0x7e) as `\xNN` (two
+        /// lower-case hex digits; this includes `\n`, `\r`, `\t`, DEL and all
+        /// bytes >= 0x80), so the output is pure printable ASCII. `"` and `\`
+        /// stay `\"` and `\\` in both modes.
+        hex_x,
+    };
+
     /// Write at most this many bytes of the value (cut BEFORE quoting and
     /// escaping, byte-wise: logfmt is a byte-oriented format, so a multi-byte
-    /// UTF-8 sequence may be cut). No marker is added. A value cut to zero
-    /// bytes is the empty value `""`. null: no limit.
+    /// UTF-8 sequence may be cut). A value cut to zero bytes (and no
+    /// `cut_marker`) is the empty value `""`. null: no limit.
     max_len: ?usize = null,
+    /// Quoting policy (default: only when needed).
+    quote: Quote = .when_needed,
+    /// Escape style inside the quotes (default: `\u00HH`).
+    escape: Escape = .json_u,
+    /// Appended to the value when `max_len` actually cut it (not when the
+    /// value fits). It is part of the value: it goes through the same
+    /// quoting decision and escaping, and counts as value bytes. The
+    /// pre-escape size of the value is therefore `<= max_len + marker.len`.
+    /// null: no marker.
+    cut_marker: ?[]const u8 = null,
 };
 
 /// Write one logfmt VALUE with this module's quoting and escaping, for
 /// lines that are not HTTP entries (consumer request 2026-11-15).
 ///
-/// A value with no byte needing escape is written verbatim; an empty one, or
-/// one holding a space, tab, `"`, `=`, backslash or any control byte, is
-/// written in double quotes with `"` and `\` backslash-escaped, `\n`/`\r`/`\t`
-/// as such and every other control byte (0x00-0x1F, 0x7F) as `\u00HH`. Bytes
-/// >= 0x80 pass through unchanged. The result is therefore always a single
-/// token with no raw newline: it cannot forge a second line or a second pair.
-/// `options.max_len` truncates first.
+/// With the default options a value with no byte needing escape is written
+/// verbatim; an empty one, or one holding a space, tab, `"`, `=`, backslash
+/// or any control byte, is written in double quotes with `"` and `\`
+/// backslash-escaped, `\n`/`\r`/`\t` as such and every other control byte
+/// (0x00-0x1F, 0x7F) as `\u00HH`. Bytes >= 0x80 pass through unchanged. The
+/// result is therefore always a single token with no raw newline: it cannot
+/// forge a second line or a second pair. `options.max_len` truncates first
+/// (then `options.cut_marker` is appended if a cut happened);
+/// `options.quote = .always` quotes every value; `options.escape = .hex_x`
+/// switches the escape style to pure printable ASCII (see `LogfmtValueOptions`).
 pub fn writeLogfmtValue(w: *std.Io.Writer, s: []const u8, options: LogfmtValueOptions) std.Io.Writer.Error!void {
+    const cut = if (options.max_len) |m| m < s.len else false;
     const v = if (options.max_len) |m| s[0..@min(m, s.len)] else s;
-    if (!logfmtNeedsQuote(v)) {
-        // No byte in `v` needs escaping (that's exactly what
-        // `logfmtNeedsQuote` just proved) — verbatim passthrough.
-        return w.writeAll(v);
+    const marker: []const u8 = if (cut) (options.cut_marker orelse "") else "";
+    const quoted = options.quote == .always or v.len + marker.len == 0 or
+        logfmtNeedsQuote(v, options.escape) or logfmtNeedsQuote(marker, options.escape);
+    if (!quoted) {
+        // No byte needs escaping (that's exactly what `logfmtNeedsQuote`
+        // just proved) — verbatim passthrough.
+        try w.writeAll(v);
+        return w.writeAll(marker);
     }
     try w.writeByte('"');
-    for (v) |c| switch (c) {
+    for ([2][]const u8{ v, marker }) |part| for (part) |c| switch (c) {
         '"' => try w.writeAll("\\\""),
         '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => try w.print("\\u{x:0>4}", .{c}),
-        else => try w.writeByte(c),
+        else => switch (options.escape) {
+            .json_u => switch (c) {
+                '\n' => try w.writeAll("\\n"),
+                '\r' => try w.writeAll("\\r"),
+                '\t' => try w.writeAll("\\t"),
+                0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => try w.print("\\u{x:0>4}", .{c}),
+                else => try w.writeByte(c),
+            },
+            .hex_x => switch (c) {
+                0x20...0x7E => try w.writeByte(c),
+                else => try w.print("\\x{x:0>2}", .{c}),
+            },
+        },
     };
     try w.writeByte('"');
 }
@@ -1030,6 +1074,72 @@ test "writeLogfmtValue: max_len cuts before quoting and escaping" {
     w = .fixed(&buf);
     try writeLogfmtValue(&w, "ok\nforged=1", .{ .max_len = 2 });
     try testing.expectEqualStrings("ok", w.buffered());
+}
+
+fn expectLogfmtValue(expected: []const u8, s: []const u8, options: LogfmtValueOptions) !void {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeLogfmtValue(&w, s, options);
+    try testing.expectEqualStrings(expected, w.buffered());
+}
+
+test "writeLogfmtValue: quote = always quotes plain, empty and cut values" {
+    try expectLogfmtValue("\"plain\"", "plain", .{ .quote = .always });
+    try expectLogfmtValue("\"\"", "", .{ .quote = .always });
+    try expectLogfmtValue("\"ab\"", "abcd", .{ .quote = .always, .max_len = 2 });
+    // Needed-quote values are unchanged by `.always`.
+    try expectLogfmtValue("\"a b\"", "a b", .{ .quote = .always });
+    // `.when_needed` is the default.
+    try expectLogfmtValue("plain", "plain", .{ .quote = .when_needed });
+}
+
+test "writeLogfmtValue: escape = hex_x writes printable ASCII only, quoting what it escapes" {
+    // Every control byte, DEL and >= 0x80 become \xNN; the value is quoted.
+    try expectLogfmtValue("\"a\\x0ab\\x09\\x00\\x7f\\xc3\\xa9\\xff\"", "a\nb\t\x00\x7f\xc3\xa9\xff", .{ .escape = .hex_x });
+    // `"` and backslash keep their json_u spelling.
+    try expectLogfmtValue("\"q\\\"\\\\\"", "q\"\\", .{ .escape = .hex_x });
+    // A lone >= 0x80 byte forces quoting under hex_x (json_u passes it bare).
+    try expectLogfmtValue("\"\\x80\"", "\x80", .{ .escape = .hex_x });
+    try expectLogfmtValue("\x80", "\x80", .{ .escape = .json_u });
+    // Printable ASCII boundaries 0x20 and 0x7e: space needs quotes, tilde does not.
+    try expectLogfmtValue("\" \"", " ", .{ .escape = .hex_x });
+    try expectLogfmtValue("~", "~", .{ .escape = .hex_x });
+    try expectLogfmtValue("\"\\x1f\"", "\x1f", .{ .escape = .hex_x });
+    try expectLogfmtValue("plain", "plain", .{ .escape = .hex_x });
+    try expectLogfmtValue("\"\"", "", .{ .escape = .hex_x });
+    // json_u still spells the same byte \u001f.
+    try expectLogfmtValue("\"\\u001f\"", "\x1f", .{ .escape = .json_u });
+}
+
+test "writeLogfmtValue: cut_marker is appended only after an actual cut" {
+    const m: LogfmtValueOptions = .{ .max_len = 3, .cut_marker = "..." };
+    try expectLogfmtValue("abc...", "abcdef", m);
+    // Exactly max_len bytes: no cut, no marker. Shorter: likewise.
+    try expectLogfmtValue("abc", "abc", m);
+    try expectLogfmtValue("ab", "ab", m);
+    // No max_len: never cut.
+    try expectLogfmtValue("abcdef", "abcdef", .{ .cut_marker = "..." });
+    // max_len 0 with a marker: the marker alone (not the empty value).
+    try expectLogfmtValue("...", "abc", .{ .max_len = 0, .cut_marker = "..." });
+    // Without a marker the cut is silent, as before.
+    try expectLogfmtValue("abc", "abcdef", .{ .max_len = 3 });
+    // Empty marker equals none.
+    try expectLogfmtValue("abc", "abcdef", .{ .max_len = 3, .cut_marker = "" });
+    // The total is max_len + marker.len before escaping.
+    try expectLogfmtValue("\"a b...\"", "a bcd", m);
+    // The marker goes through quoting/escaping like the value.
+    try expectLogfmtValue("\"abc ~\"", "abcdef", .{ .max_len = 3, .cut_marker = " ~" });
+    try expectLogfmtValue("\"abc\\x0a\"", "abcdef", .{ .max_len = 3, .cut_marker = "\n", .escape = .hex_x });
+}
+
+test "writeLogfmtValue: quote, escape and cut_marker combined (the strict parser-contract form)" {
+    const strict: LogfmtValueOptions = .{ .quote = .always, .escape = .hex_x, .max_len = 4, .cut_marker = "..." };
+    try expectLogfmtValue("\"ok\"", "ok", strict);
+    try expectLogfmtValue("\"abcd...\"", "abcdefgh", strict);
+    try expectLogfmtValue("\"a\\x0a\\xc3\\xa9...\"", "a\n\xc3\xa9zz", strict);
+    try expectLogfmtValue("\"\"", "", strict);
+    // max_len 0: only the marker, quoted.
+    try expectLogfmtValue("\"...\"", "x", .{ .quote = .always, .escape = .hex_x, .max_len = 0, .cut_marker = "..." });
 }
 
 test "combined: injection payload cannot forge a second line or break the quoted fields" {
