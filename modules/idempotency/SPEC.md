@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — `@node-idempotency/core` 1.1.0, the most used Idempotency-Key library on npm (64k downloads a month), has no way to release a reservation: a request whose handler throws never reaches `onResponse`, so the key stays `IN_PROGRESS` and every retry is refused `REQUEST_IN_PROGRESS` (409) until the 24 h TTL — measured 0 ms and 2 s after (`tools/lead_probe/run.sh`); this module releases the reservation when the handler fails and the retry runs (test "a handler that fails releases the reservation: the retry runs, it is not a 409") (measured 2026-10-23)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (329/335, 6 eq) · src 741add2965b58eb3
+**Audit:** review 2026-11-12 · mutation 2026-11-12 (329/335, 6 eq) · src 87085c7eb1c9e4f1
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — request dedup keys (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point: no request- or record-reachable panic; lease age saturating under clock jumps; a Store without cache or backend panics with a message, deinit total)
 

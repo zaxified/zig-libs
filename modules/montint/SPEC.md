@@ -6,7 +6,7 @@
 
 **Scope:** parity — Zig std.crypto.ff 0.16.0 (API), crypto-bigint 0.7.5, `filippo.io/bigmod` and OpenSSL BN 4.0.3 on the constant-time modular-arithmetic core: run-time and comptime moduli, modmul/modexp (secret and public exponent), element predicates and `compare`, CT inversion (batched safegcd; also of the modulus mod an even `n`), square root mod a prime, gcd/lcm/exact division, Miller-Rabin (surveyed 2026-10-05 and 2026-10-14, gaps closed 2026-10-14); Baillie-PSW, little-endian/primitive helpers and an aarch64 asm path are out (see Backlog)
 
-**Audit:** review 2026-11-01 · mutation 2026-11-15 (197/224, 27 eq) · src 4f5c370fdceaf8f1
+**Audit:** review 2026-11-01 · mutation 2026-11-15 (197/224, 27 eq) · src 0a39ee3b419607e4
 
 Audit detail: whole-src mutation run (schemata, 179 mutants over montint, limbs, dyn, nt, safegcd, field and the Zig glue of asm_core; inline-asm template text is out of scope) with 4 new tests in `src/sweep_test.zig` (`Modint`/`Field` per-limb `eql`/`isZero`/`neg`, `DynModint` slot boundary, `safegcd` gcd 2^62+1 verdict); 22 equivalents are argued in the audit report; three are NOT closed: `DynModint.slotFor` `n < slot` (landed on a comment line in the run, new test unverified against it), and `safegcd` `updateDE` without the `e`-sign term and `normalize` without its first add (survive all exhaustive/random inversions, no constructed input yet).
 
@@ -819,7 +819,7 @@ OpenSSL's AVX2 code.
 
 ## Build options
 
-Consumer build options (CONVENTIONS §4.2), added 2026-10-18 at wgs's request:
+Consumer build options (CONVENTIONS §4.2), added 2026-10-18 at the analytics consumer's request:
 
 | option | values | default | `-Dprofile=small` |
 |---|---|---|---|
@@ -845,13 +845,13 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18 at wgs's request:
   asm squaring and must not be called from outside. (3) The `unreachable`→`@panic` change of the off-x86 `asm_core` wrappers is
   not testable on an x86 host.
 
-- **Self-hosted Debug does not compile `zeroWords` (found 2026-10-22 from qap's test redesign).** The
+- **Self-hosted Debug does not compile `zeroWords` (found 2026-10-22 from the web-server consumer's test redesign).** The
   self-hosted backend rejects `asm_core.zig:1185`'s generated store (`unknown size: '0(%%rdi)'`: AT&T
   needs the `q` suffix the generated text leaves out), so a consumer's `-fno-llvm` Debug build fails,
   although `asm_core.zig:252/407` take care to support that backend. Fix the generator (`movq`), and
   add a self-hosted compile to the module's checks. p256 has the same gap (its SPEC backlog).
 
-- **`DynModint` code size — slot policy (DEFAULT) + build option `montint-asm-unroll`** (wgs request 2026-10-17; decisions
+- **`DynModint` code size — slot policy (DEFAULT) + build option `montint-asm-unroll`** (the analytics consumer request 2026-10-17; decisions
   of the user 2026-10-17). Every `DynModint` operation dispatches on the slot through `inline while (s <= max_limbs) : (s += step)`
   with `step = min_limbs = 4`, so `DynModint(8192)` instantiates 32 `Modint(64·L)` slots, and on an ADX/BMI2 CPU each slot's
   `montMulFixed`/`montMulBlock` is straight-line asm generated per `L` (`ciosFixedBody(L)`). **Measured** (http sizeprobe =

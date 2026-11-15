@@ -322,7 +322,7 @@ pub fn parseESearch(d: *wire.Decoder) Error!Result {
     // search-return-data)` -- both the correlator and every return-data item
     // are individually optional, so `* ESEARCH` alone, `* ESEARCH COUNT 5`
     // (no correlator) and `* ESEARCH (TAG "x") COUNT 5` (both) are all
-    // legal. F10 (`~/CML/20260901-zig-libs-audit/A1/imap.md`): the caller
+    // legal. F10 (the A1 audit report for `imap`): the caller
     // used to consume this SP unconditionally before ever reaching here,
     // which worked for the "has correlator" case but left the no-correlator
     // case one SP short at the check below -- `COUNT 5` was mistaken for

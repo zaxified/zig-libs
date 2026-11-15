@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit recorded from the delta mutation run over the typed tools (97 mutants: 96 killed, 1 equivalent).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation run over the typed-tools decoder (`typed.zig` `parse`/`decode` every arm, `ToolCall.argsAs`/`writeJson`): 91 mutants, 90 killed, 1 equivalent (`bad` resetting a pointer `parse` already cleared). New tests: hostile floats (1e300, inf, NaN, -0.0, 2^63 edges), integer bound edges, wrong JSON types per arm, full JSON Pointer paths through arrays/structs, optional elements and `null` as absent with defaults, exact unknown-property matching and 64-byte truncation, failure-record reset, and OOM that fails one allocation only (pointer and message untouched, no "invalid arguments" text). No defect found.
 - **2026-11-13** — **New:** typed tools. `mcp.schemaOf(T)` derives a tool's JSON Schema text from a Zig struct at compile time (ints bounded by width and +-(2^53-1), enums, optionals, slices, arrays, nested structs, `mcp_descriptions`), `ToolCall.argsAs(T)` decodes the arguments into it with a JSON-Pointer error, `ToolCall.writeJson(v)` writes a struct result. Checked against google/jsonschema-go's verdicts (`tools/typed_oracle`).
@@ -123,7 +124,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-10-20** — S2 work, first batch (survey R-list in SPEC Backlog). **Additive, no wire change for
   existing servers.**
   - `ToolCall.arg(T, key)` → `Arg(T)` (`absent` / `value` / `wrong_type`) for `[]const u8`, `i64`, `f64`,
-    `bool`; `require(T, key)`/`requireStr` write "missing 'k'" or "'k' must be …" (bxp request 10-19);
+    `bool`; `require(T, key)`/`requireStr` write "missing 'k'" or "'k' must be …" (the build-tool consumer request 10-19);
     `PromptRequest.strArgChecked`.
   - `ProtocolError` + `failWith`/`failProtocol` on tools, resources and prompts: a handler answers with
     its own JSON-RPC error (`code`, `message`, `data`) instead of a result; it wins over `input.ask`.
@@ -187,7 +188,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   Session-path replies are byte-identical to before.
 
 - **2026-09-28** — `initialize`'s `clientInfo` (`name`, `version`, optional `title`) is now
-  recorded per peer, requested by ttydesk (2026-09-27): previously only `capabilities` and the
+  recorded per peer, requested by the terminal-UI consumer (2026-09-27): previously only `capabilities` and the
   negotiated version were kept in `PeerState`, so a server that wants to name which client made
   a call had to re-parse the `initialize` line itself. New `pub const ClientInfo` (`name`,
   `version`, `title: ?[]const u8`), `PeerState.client: ?ClientInfo`, `Server.clientInfo(peer)` and

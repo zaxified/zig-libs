@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation run over `resolveForServe` after the test-only counter fix (44 mutants): 1 test added: a followed file link that leaves the root answers 403 and gives its descriptor back. No production code changed.
 - **2026-11-12** — **FIX (LOW):** The A1 F11 test counter `test_f11_leaf_dir_opens` exists and is incremented in test builds only; it was a plain global written on every directory request in production builds, a data race between concurrent serves of a `shared_read` handler (benign, but a TSan report). From the 2026-11-12 mutation run.
 - **2026-11-11** — **NO CONSUMER-VISIBLE CHANGE:** Whole-module mutation run over the production code of `src/root.zig` (387 mutants), plus 21 tests for the survivors: descriptor accounting on every `Handler`/`resolveFile`/`openWithinRoot`/`Snapshot.open` route, symlinked directories at depth with `follow_symlinks` off and on (a link to the root itself, an index linking inside the root), `resolveFile`'s dotfile policy, `Options.mime_overrides`/`default_mime`, the `.zst` switch, the SPA fallback's last-segment rule, known-answer ETags and content tag, `contentTag` bounded by `size`, `Snapshot.serve` HEAD/405/414, `Vary`/`Content-Encoding` refused under header-table exhaustion, `Live` restart/deinit/rescan cadence, segments over NAME_MAX. No production code changed.
@@ -57,11 +58,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   counters + a per-generation hold count; retired generations freed unheld and oldest first).
   `SnapshotOptions.fingerprint` (default **on**): a strong `ETag` from the file's SHA-256 instead of
   size+mtime — `If-Range` now resumes; `Snapshot.open` reads every file once. New
-  `Handler.sendFileTagged`. Found by qap (static files changeable at runtime, plan M11.6).
+  `Handler.sendFileTagged`. Found by the web-server consumer (static files changeable at runtime, plan M11.6).
 - **2026-09-27** — **`Snapshot`: a root opened once, served without filesystem calls.** `open` walks
   the root and opens every regular file through `openWithinRoot`; `serve(io, req, rw, raw_path)` is
   `sanitizePath` + a table lookup + `sendFile` — no `openat`/`stat`/`getdents` per request, for
-  Landlock-sandboxed processes and io_uring loops (found by qap, plan M11.6). Precompressed siblings
+  Landlock-sandboxed processes and io_uring loops (found by the web-server consumer, plan M11.6). Precompressed siblings
   (`.br`, `.zst`, `.gz`) served by `Accept-Encoding` with `Content-Encoding` + `Vary`. Symlinks are
   absent (404) rather than refused; no listing; `max_files`/`max_depth` bounds. Tested side by side
   with `Handler` over the fixture tree. `Handler` is unchanged.

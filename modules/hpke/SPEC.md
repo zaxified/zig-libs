@@ -248,7 +248,7 @@ caller's stack; `Context.seal`/`open`/`exportSecret` and `keySchedule` need 8 Ki
 plus their body. Budget about 64 KiB of free stack for a call into hpke.
 A caller on a small thread or coroutine stack (below roughly 48 KiB free)
 overflows with no guard page check from this module. Not measured against
-the stack sizes of the consumers (qap's TLS handshake thread, axp tasks);
+the stack sizes of the consumers (the web-server consumer's TLS handshake thread, the router-tool consumer tasks);
 whoever runs hpke on a custom stack must check.
 `src/stackprobe_test.zig` (ReleaseFast) checks every DHKEM operation of all
 three KEMs, `setupBaseR`, `Context.seal`/`exportSecret`, `sealBase`/`openBase`

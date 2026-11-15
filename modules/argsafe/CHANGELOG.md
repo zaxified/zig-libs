@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-02** — **New API:** `isSafeHostname` (RFC 1123), `isSafeUint`, `isSafePort`, `isSafeIfname`. **Tests/tools:** reference-model comparison (`src/model_test.zig`) and frozen foreign verdicts (`src/oracle_test.zig`, `src/oracle_vectors.zig`; recipe `tools/oracle.py`, `tools/go_oracle/`); no accepted-but-unsafe value found among the existing predicates. Docs: which predicates are one-word-safe for sh and `CommandLineToArgvW`; shell and Windows quoting rejected with reasons.
 - **2026-10-30** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GS). `Argv` is poisoned when an append fails (a swallowed OutOfMemory could ship a short argv); `isSafeCidrList` refuses a separator that is a control byte, space or non-ASCII (it let that byte through); `isSafeBase64` refuses the empty string; `Template.fill` on a template `parse` did not accept is a checked panic (was `.?`). Docs: `isSafeUrl` passes 0x80–0xFF and curl glob characters `[]{}` (callees need `-g`); `isSafeKvValue` passes a leading `@` and `,`/`=`. Tests: `src/sweep_test.zig`.
@@ -15,7 +16,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   No code change.
 
 - **2026-09-28** — New `Template`/`Hole`/`Filled`/`Refusal`/`FillOutcome` and
-  `CharClass.explain`/`CharClass.Reason`, requested by ttydesk (2026-09-27): an
+  `CharClass.explain`/`CharClass.Reason`, requested by the terminal-UI consumer (2026-09-27): an
   argv shape from a **trusted config** (`["systemctl", "restart", "{unit}"]`)
   with named `{name}` holes filled from **untrusted** run-time values, each
   checked against its own `Hole.class` — the same `CharClass.check` rules
@@ -29,7 +30,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   rather than a separate hand-written copy of the same rules, so `explain`
   and `check` cannot drift apart. Literal `{`/`}` in a token is written
   doubled (`{{`/`}}`), matching `std.fmt`/`str.format`'s convention. Lets
-  ttydesk (`src/actions.zig`, marked `zig-libs request: argsafe — argv
+  the terminal-UI consumer (`src/actions.zig`, marked `zig-libs request: argsafe — argv
   template`) delete its own hand-rolled `reason()`/`fill()`. Purely additive
   — no existing predicate, `Argv` method, or `CharClass` field changed
   behavior. `fill` returns `error.ValueCountMismatch` (a `FillError`) when `values` does not match the holes.

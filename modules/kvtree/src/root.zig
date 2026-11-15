@@ -399,7 +399,7 @@ pub const Db = struct {
     /// rule for the caller: a `get`/`getRef` that is itself parked must end
     /// before the NEXT commit begins. That commit may recycle the pages the
     /// one before it freed, which are this read's tree; a `snapshot` or
-    /// `cursor` pins its version and is exempt. qap's `Serial` keeps the rule
+    /// `cursor` pins its version and is exempt. The web-server consumer's `Serial` keeps the rule
     /// by running such reads on the owner fiber, which starts every commit.
     pub fn getRef(self: *Db, key: []const u8) GetRefError!?ValueRef {
         if (!self.pager.store.canLend()) return error.CannotLend;
@@ -2159,7 +2159,7 @@ test "getRef on a store that cannot lend is CannotLend, never a silent copy" {
 // A delete that empties a leaf drops it from its parent, a branch left with
 // no children goes the same way, and a root left with one child collapses.
 // Before this, emptied leaves stayed in the tree for good: a key range that
-// only moves forward (tsdb's series, found adopting tsdb in ttydesk) never
+// only moves forward (tsdb's series, found adopting tsdb in the terminal-UI consumer) never
 // wrote to them again, so retention deleted data and the file kept growing.
 
 /// A key long enough that a branch holds ~10 separators and a leaf ~9

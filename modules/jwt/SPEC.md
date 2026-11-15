@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — six tokens golang-jwt v5.3.1 accepts and this module refuses, each on an RFC rule: a `crit` naming an extension the recipient does not process, a `crit` naming a registered parameter, an empty `crit` (RFC 7515 §4.1.11), a signature and a payload segment whose unused base64url bits are set (RFC 7515 §2 with RFC 4648 §3.5: two strings for one token), and duplicate claim names (RFC 7519 §4: reject or take the last; golang-jwt takes the last, this module rejects); out of 81 rows `zig build interop-jwt` judges against golang-jwt, the other 75 agree (test `lead: crit, non-canonical base64url and duplicate claims -- golang-jwt v5.3.1 accepts six tokens this module refuses`, `src/go_oracle_vectors.zig`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (1344/1436, 92 eq) · src 2241f287fcd826bc
+**Audit:** review 2026-11-12 · mutation 2026-11-12 (1344/1436, 92 eq) · src 09cd392d3e37fab4
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWT_FUZZ) · ct 2026-10-13 (ctgrind: HMAC secrets HS256/384/512 sign + verify accept/reject, ES256/ES384/ES512/EdDSA signing keys, RS256/PS256 rsa secret members tainted; hmac 0 in-file, ec 9 in-file = ES256 8 delegated p256/std signer contexts (9 until 2026-10-13, when p256's `rejectIdentity` went from two jumps to one) (ES384 via p384 and ES512 via p521: 0) + 1 jwt-own `rejectIdentity` on R in the EdDSA signer, rsa 3 in-file = the rsa module's F3 fault-check verdict, one per signature, plus PS256's blinding redraw verdict (rsa, since 2026-10-14); itemised in scripts/checks/ctgrind-expected.tsv) · panic 2026-10-28 (independent sweep of every pub entry point: token length cap, `crit` list cap, failed-refresh throttle, total `Claims.claim`, checked panics for `Provider.init` and `VerifiedCache` after deinit)
 
@@ -69,7 +69,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   for parsing, signature verification and `iss`/`aud`/`exp`/`nbf` — the OIDC-specific `azp`/`nonce`
   checks are the only new logic, layered on top of the returned `ParsedToken`.
 
-- **Token issuance** (2026-09-28, requested by qap): `encode(gpa, claims, key, opts)` /
+- **Token issuance** (2026-09-28, requested by the web-server consumer): `encode(gpa, claims, key, opts)` /
   `encodeJson(gpa, claims_json, key, opts)` in `encode.zig` build the compact JWS. The key is a
   `SigningKey` whose variant fixes `alg` (RFC 8725 §2.1: never the caller's word alone; `none` is
   unrepresentable); `SigningKey.verificationKey()` gives the matching `Key`. HMAC secrets shorter
@@ -81,7 +81,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   the HMAC compare of `verify` for HS256/384/512 does too (`burn.zig`); `stackprobe_test.zig`
   (ReleaseFast) asserts 0 residue of the keys, nonces and keyed HMAC state, with NEG/POS controls.
 
-- **Verified-token cache** (2026-09-28, requested by qap): `VerifiedCache(Value)` in
+- **Verified-token cache** (2026-09-28, requested by the web-server consumer): `VerifiedCache(Value)` in
   `cache.zig`, opt-in. See § "Verified-token cache" below for the argument that a hit answers
   exactly what verifying again would.
 
@@ -189,7 +189,7 @@ This is the security core; the defenses are the point:
 ## Verified-token cache
 
 `VerifiedCache(Value)` remembers a token that verified until its `exp`, so a repeat skips the
-signature. Measured motive (qap audit): ES256 through `p256` ~1.6 k verifications/s per core
+signature. Measured motive (the web-server consumer audit): ES256 through `p256` ~1.6 k verifications/s per core
 under load (~4 k quiet), RS256 slower through std's bignum — a JWT API is capped at a few
 thousand requests per second per core by verification alone, while a client sends the same
 access token on every request.
@@ -252,7 +252,7 @@ hits for cached principals until their `exp`. (2) Timing: a hit is faster, so so
 already present a token can tell whether it was recently verified; learning that needs the token
 itself. (3) Residency: each cached token's tag and derived `Value` stay in memory until evicted or
 `deinit` (both wipe); the token itself is never stored. (4) Staleness of the key *source* stays
-the caller's: a remote set too old to use must still be refused before the lookup (qap's
+the caller's: a remote set too old to use must still be refused before the lookup (the web-server consumer's
 `Remote.acquire` returns null), exactly as before. None of these changes an accept/refuse
 decision, so a consumer may enable the cache by default; one whose threat model counts a memory
 disclosure as survivable for bearer tokens not currently in flight should leave it off.
@@ -448,7 +448,7 @@ Worst row 0.99× → P2.
   ML-DSA/Ed25519 *key generation* in the caller's frame (std); ES384 key generation burns inside p384, but the returned `KeyPair` still lands in the caller's frame. `buildTokenRequest`'s
   `client_secret` is a borrowed slice and only copied into the request body.
 - ~~`Provider` measures its JWKS intervals on the wall clock~~ — **fixed 2026-09-29** without an
-  API change (qap research register H6): a `now_s` before the recorded fetch/attempt counts as the
+  API change (the web-server consumer research register H6): a `now_s` before the recorded fetch/attempt counts as the
   interval having passed, so a backward step triggers one re-fetch that re-bases the marks instead
   of freezing both refreshes for the step's size. ~~A separate interval clock so a FORWARD step does
   not expire the TTL early~~ — **DONE 2026-09-29**: `ProviderOptions.interval_clock` (opt-in, null =
@@ -474,7 +474,7 @@ Worst row 0.99× → P2.
 - ~~**RS\* signing**~~ — DONE 2026-10-13 (`SigningKey.rs256/384/512`, through the `rsa` module; RFC 7520 §4.1 reproduced byte for byte). Was: `encode` does not offer RS256/384/512: std has no RSA signing, and the
   `rsa` module's `signPkcs1v15` would become a new dependency of jwt (a root `build.zig`
   change). Add it when a consumer needs RSA-issued tokens. Still open.
-- ~~**`Guard` over a static `JwkSet`**~~ — DONE 2026-09-28 (found by qap): `Guard.Options.jwks`
+- ~~**`Guard` over a static `JwkSet`**~~ — DONE 2026-09-28 (found by the web-server consumer): `Guard.Options.jwks`
   (exactly one of `provider`/`jwks`, else `error.InvalidKeySource`) runs the same Bearer
   extraction, `at+jwt` check, scope policy and RFC 6750 challenges over a caller-held set;
   nothing is fetched, so an unknown `kid` is refused at once. A static set has no issuer to
@@ -486,7 +486,7 @@ Worst row 0.99× → P2.
   `VerifiedCache.verifyJwks` with its current set. Add it when a consumer of those types asks.
 - No other module-local backlog recorded (README has no Deferred section).
 
-- ~~**Refuse a plain-HTTP key source**~~ — DONE 2026-09-28 (from qap M11.8): `discover`,
+- ~~**Refuse a plain-HTTP key source**~~ — DONE 2026-09-28 (from the web-server consumer M11.8): `discover`,
   `fetchJwks` and `Provider` refuse an `http://` (or scheme-less) issuer, discovered `jwks_uri` or
   configured `jwks_uri` with `error.InsecureKeySource`, before any fetch — anyone on a plain-HTTP
   path could serve their own keys and mint any token. `KeySourceOptions.allow_plain_http` /

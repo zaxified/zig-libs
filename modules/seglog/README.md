@@ -6,8 +6,8 @@ record keeps its `Position` until its segment is dropped, and a consumer can
 persist a position and resume from it after a restart. Every record also has
 an **LSN** — 1, 2, 3 … across the whole log, never reused — and a timestamp.
 
-**Status:** a zig-libs module since 2026-11-15, moved from energomonitor's
-`egw-hub/seglog/` (its first consumer, which has not switched to this copy
+**Status:** a zig-libs module since 2026-11-15, moved from the energy-monitoring consumer's
+the ingest daemon's `seglog/` (its first consumer, which has not switched to this copy
 yet; ⚠ it meets `error.TooManySegments` in `RotateError` and `AppendError`, new
 2026-11-15, when it does: a `switch` over those sets needs the arm). Depends on `kv` (the `Storage` seam and `SimStorage` crash simulator),
 `crc32c` and `zstd`.
@@ -84,7 +84,7 @@ past the data read as its end.
 **Compression.** `log.compress(id)` turns a closed segment into the zstd
 seekable format (`seg-<id>.zst`): the same bytes, so positions, LSNs and the
 index do not change, reads decode only the frames they touch, and
-`zstd -d` gives the segment back. On a real day of egw-hub records: 9.4× at
+`zstd -d` gives the segment back. On a real day of the ingest daemon records: 9.4× at
 level 3 in 0.06 s, 11× at level 9 in 0.22 s.
 
 **Stats.** `log.stats()` counts appends, records, bytes, fsyncs, rotations,
@@ -125,7 +125,7 @@ a small wrapper that lists the directory — `kv.Storage` has none), it reads
 each one's own header and seal and writes a fresh manifest, refusing if they
 disagree with each other or a manifest is already there. Run `Log.verify`
 afterwards: this checks headers and seals, not every data record.
-`egw-hub-tools manifest-rebuild --dir LOG` is the wrapper: it does the
+the ingest daemon's tools: `manifest-rebuild --dir LOG` is the wrapper: it does the
 directory listing (`std.Io.Dir`, since this is an offline recovery tool, not
 the online path the "no listing" reasoning above is about) and calls
 `rebuildManifest`.

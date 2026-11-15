@@ -4,7 +4,7 @@
 //!
 //! A log is a sequence of **segments**; a segment is one file of
 //! length-prefixed, CRC32C-checked records. The caller names each segment
-//! with a strictly increasing `u64` (egw-hub uses the UTC day number), appends
+//! with a strictly increasing `u64` (the ingest daemon uses the UTC day number), appends
 //! to the newest one, and deletes old ones whole. Nothing is ever rewritten in
 //! place: a record, once `append` has returned, stays at its `Position` until
 //! its segment is dropped.
@@ -1091,11 +1091,11 @@ pub const Options = struct {
     max_record_len: u32 = 1 << 20,
     /// The clock `append` and `appendMany` stamp records with, and `rotate`
     /// stamps a segment's creation with. Null stamps 0; `appendAt` takes the
-    /// caller's own time. The unit is the caller's (egw-hub: epoch seconds).
+    /// caller's own time. The unit is the caller's (the ingest daemon: epoch seconds).
     /// Times need not be monotonic: a seal records their range, not order.
     now: ?*const fn () i64 = null,
     /// How far `append`/`appendAt`/`appendMany`/`appendEntries` trust a
-    /// timestamp (L3, egw-audit-2026-09-27): one absurd value — a caller's
+    /// timestamp (L3, ingest-consumer audit 2026-09-27): one absurd value — a caller's
     /// bug, not necessarily a crash — otherwise becomes the segment's
     /// permanent seal `max_ts`/`min_ts` (a plain running min/max has no way
     /// to un-see it), which makes `seekTime` match that one record for every
@@ -1140,7 +1140,7 @@ pub const Options = struct {
     /// record gets the one it returns for its payload; without it, 0.
     legacy_ts: ?*const fn (payload: []const u8) i64 = null,
     /// Told after each migrated segment, for a caller that shows progress:
-    /// a large log takes a while (egw-hub: 285 MB in about 15 s).
+    /// a large log takes a while (the ingest daemon: 285 MB in about 15 s).
     on_migration_progress: ?*const fn (ctx: ?*anyopaque, p: MigrationProgress) void = null,
     migration_ctx: ?*anyopaque = null,
     /// Filled by `open` whenever it migrates or refuses to, success or not —
@@ -1479,7 +1479,7 @@ pub const Log = struct {
     }
 
     /// Rebuild a lost or unreadable `MANIFEST` from `ids`' own segment
-    /// headers and seals (audit finding L4, egw-audit-2026-09-27: a torn or
+    /// headers and seals (audit finding L4, ingest-consumer audit 2026-09-27: a torn or
     /// corrupt `MANIFEST` otherwise has no recovery path in the library or
     /// its tools — every other kind of damage does). `ids`, ascending, are
     /// the segments to include, in the order they form the log. `kv.Storage`
@@ -1488,7 +1488,7 @@ pub const Log = struct {
     /// work around, since a log that derived its segments from file names
     /// would adopt any stray file that looked like one), so this cannot
     /// discover `ids` by itself; a caller that can list the directory (an
-    /// operator's `ls seg-*.log seg-*.zst`, or `egw-hub`'s
+    /// operator's `ls seg-*.log seg-*.zst`, or the ingest daemon's
     /// `seglog_cli.manifestRebuild`) supplies them.
     ///
     /// Every id but the last must be a closed segment: its header already
@@ -4181,7 +4181,7 @@ test "L1: a manifest lost while its segments survive refuses instead of truncati
     defer sim.deinit();
     {
         var log = try openSim(&sim);
-        try log.rotate(20722); // a day id, as egw-hub uses
+        try log.rotate(20722); // a day id, as the ingest daemon uses
         _ = try log.append("alpha");
         _ = try log.append("beta");
         log.close();

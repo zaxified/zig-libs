@@ -98,15 +98,15 @@ try ulog.send(&msg); // or .sendBsd(&bmsg)
 
 // systemd journal native protocol, default
 // "/run/systemd/journal/socket" -- structured fields stay queryable
-// (`journalctl TTYDESK_ACTION=unit.restart`) instead of being flattened
+// (`journalctl DESKTOP_ACTION=unit.restart`) instead of being flattened
 // into free text.
 var jrnl = try syslog.journal.Emitter.openDefault();
 defer jrnl.close();
 try jrnl.sendMessage(.{
     .message = "unit restarted",
     .priority = .notice, // journal PRIORITY=5
-    .identifier = "ttydesk", // SYSLOG_IDENTIFIER=ttydesk
-    .fields = &.{.{ .name = "TTYDESK_ACTION", .value = "unit.restart" }},
+    .identifier = "desktop", // SYSLOG_IDENTIFIER=the terminal-UI consumer
+    .fields = &.{.{ .name = "DESKTOP_ACTION", .value = "unit.restart" }},
 });
 // or build the field list yourself for full control:
 try jrnl.send(&.{

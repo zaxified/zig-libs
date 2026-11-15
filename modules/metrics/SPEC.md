@@ -22,7 +22,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 
 ## Compared with
 
-Surveyed 2026-09-30, re-surveyed 2026-10-17 per `SURVEY-PLAYBOOK.md` (report: CML `20261017-qap-grade2/metrics-survey.report.md`); stars and activity as of 2026-10-17. client_golang (Apache-2.0) and beorn7/perks (MIT) source was read as behaviour reference — no code taken; byte-exactness is pinned by goldens printed by client_golang itself (`tools/go_golden`) and perks (`tools/go_summary_oracle`).
+Surveyed 2026-09-30, re-surveyed 2026-10-17 per `SURVEY-PLAYBOOK.md` (report: the 2026-10-17 survey report for `metrics`); stars and activity as of 2026-10-17. client_golang (Apache-2.0) and beorn7/perks (MIT) source was read as behaviour reference — no code taken; byte-exactness is pinned by goldens printed by client_golang itself (`tools/go_golden`) and perks (`tools/go_summary_oracle`).
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|

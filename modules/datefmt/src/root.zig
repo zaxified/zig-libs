@@ -1387,7 +1387,7 @@ pub fn formatIsoDate(alloc: std.mem.Allocator, parts: DateParts) ![]const u8 {
 // ---------------------------------------------------------------------------
 //
 // Fixed-shape writers with no format string to read and, in the `buf*` form,
-// no allocator: what an HTTP server or a log line needs on every request (qap
+// no allocator: what an HTTP server or a log line needs on every request (the web-server consumer
 // `access.zig` and `http` `Server.zig` hand-rolled both before these existed).
 // Unlike `format`, they validate: a field out of range or a year outside
 // 0000..9999 (four digits is all either grammar can say) is an error, never

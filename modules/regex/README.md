@@ -180,7 +180,7 @@ ahead on all 18):
 | short-string find / submatches (anchored, pair, email) | 0.58–0.88 |
 | compile + submatch per call | 0.39 |
 
-Against quangdn42/regex.zig on bxp's workload: ~3.7× faster per row with the pattern compiled per
+Against quangdn42/regex.zig on the build-tool consumer's workload: ~3.7× faster per row with the pattern compiled per
 call, ~11× on precompiled find-all (SPEC "Compared with").
 
 ## Verification

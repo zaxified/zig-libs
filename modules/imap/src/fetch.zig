@@ -639,7 +639,7 @@ test "F3: fetch.Options.max_depth's delivered default is pinned" {
     // Pre-fix, mutating `max_depth: usize = 64` to `100000000` left the
     // suite green: every depth-related test set `.max_depth` explicitly
     // rather than checking what `Options{}` ships with
-    // (`~/CML/20260901-zig-libs-audit/A1/imap.md` F3). The mechanism itself
+    // (the A1 audit report for `imap` F3). The mechanism itself
     // (`if (p.depth > p.opts.max_depth) return error.BodyTooDeep;`) WAS
     // already covered -- only the shipped VALUE was not.
     try testing.expectEqual(@as(usize, 64), (Options{}).max_depth);
@@ -663,7 +663,7 @@ test "Message.find returns the first item carrying the requested tag" {
 
 test "F13: an error while parsing a flag list ELEMENT does not leak Decoder.depth" {
     // `defer it.deinit()` was missing on six of the seven `expectList()`
-    // call sites (`~/CML/20260901-zig-libs-audit/A1/imap.md` F13) --
+    // call sites (the A1 audit report for `imap` F13) --
     // `flagList` was one of them. An error thrown while parsing an element
     // BETWEEN `next()` calls never reaches the list's own clean `)` close,
     // so without the safety net the outer list's depth slot is never

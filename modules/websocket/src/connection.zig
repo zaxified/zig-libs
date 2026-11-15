@@ -17,7 +17,7 @@ const frame = @import("frame.zig");
 const deflate = @import("deflate.zig");
 
 /// Incremental (streaming) UTF-8 validator (RFC 6455 §8.1/§5.6, "Fail-fast
-/// UTF-8 across fragments" — found by qap's Autobahn lane, 2026-09-26; fixed
+/// UTF-8 across fragments" — found by the web-server consumer's Autobahn lane, 2026-09-26; fixed
 /// 2026-09-28). Carries at most the state of one partially-consumed
 /// multi-byte sequence across calls, which is what lets a text message's
 /// UTF-8 be checked one fragment at a time instead of only once the whole
@@ -563,7 +563,7 @@ pub const Connection = struct {
     }
 
     /// "Fail fast on invalid UTF-8 within one frame" (Autobahn §6.4.3-4,
-    /// found by qap's Autobahn lane, 2026-09-28). `buf` holds a frame that
+    /// found by the web-server consumer's Autobahn lane, 2026-09-28). `buf` holds a frame that
     /// has not fully arrived; if it is text -- a new text frame, or a
     /// continuation of a text message -- the payload bytes that did arrive
     /// are validated now, so a byte that can never be valid UTF-8 fails the
@@ -1309,7 +1309,7 @@ test "a message ending mid-code-point (FIN with a pending sequence) is rejected 
 
 // ── fail fast on invalid UTF-8 within one frame (2026-09-28) ───────────────
 //
-// Autobahn §6.4.3-4, from qap's lane: one text frame delivered in TCP chops,
+// Autobahn §6.4.3-4, from the web-server consumer's lane: one text frame delivered in TCP chops,
 // invalid from an early chop. `receive` used to validate only once the frame
 // was complete, so the rest of the frame was read first (NON-STRICT);
 // autobahn-python and gorilla fail at the chop.

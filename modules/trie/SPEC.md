@@ -342,7 +342,7 @@ file at a higher layer if producer authenticity matters.
   `SortedBuilder`. The corrupt-buffer sweep and both fuzz harnesses
   (`runQueries`) also drain `search` (four automata) and all four operations on
   the damaged buffers.
-- **Real data (2026-10-04):** qap's RÚIAN address index (2 835 455 keys) converted
+- **Real data (2026-10-04):** The web-server consumer's RÚIAN address index (2 835 455 keys) converted
   v1 → v2 by `SortedBuilder`; every key's `lookup` and `ordinal` and every 97th
   `keyAt` agree, and `topN` on 1 416 sampled prefixes returns the same ranking
   (mean 315 µs v1 → 76 µs v2).

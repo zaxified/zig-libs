@@ -56,7 +56,7 @@ const std = @import("std");
 const bench = @import("benchkit");
 const ls = @import("latency-stats");
 
-// Like this collection's libc-free executables (qap's), the driver installs
+// Like this collection's libc-free executables (the web-server consumer's), the driver installs
 // fastmem's memset/memcpy: Zig's compiler_rt memset is byte-wise, and `reset`
 // (a 184 KB memset here) and `merge` would otherwise measure that, not the
 // module. Stated on the card.

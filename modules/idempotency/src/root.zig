@@ -367,7 +367,7 @@ pub const Store = struct {
     /// request's SHA-256 body fingerprint, computed by the caller before the
     /// lock is taken (hashing never happens under the lock).
     ///
-    /// Public for a server that has no `router` (qap): build the key with
+    /// Public for a server that has no `router` (the web-server consumer): build the key with
     /// `scopeKey`, fingerprint the body, `begin`; on `.reserved` run the side
     /// effect, `record` its answer, and `finish` -- or pass `request` to have
     /// `current` find the reservation from inside the handler.

@@ -6,7 +6,7 @@
 
 **Scope:** parity — curve25519-dalek 5.0 (secret-scalar group operations), not a full curve25519 library: point and scalar types are `std`'s (surveyed 2026-10-10)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-13 (117/126, 9 eq) · src 3b579849135ddc53
+**Audit:** review 2026-09-15 · mutation 2026-11-13 (117/126, 9 eq) · src b01eee5cb2431d7f
 
 Audit detail: the 2026-11-01 mutation run (first scored run) covers the X25519 ladder and fe64 asm, the Edwards comb, Ed25519 verify, point decoding, wNAF/MSM and encodings: 11 survivors closed by new tests (the portable 4-bit comb was never executed on BMI2 hosts, a `mul121665` carry at ~2^-47, `combRecode5` digit range, `wipeState`, an identity-R forgery against `verifyEd25519Strict`); the last survivor — dropping `mul`'s scalar wipe, visible only to a ReleaseFast stack probe — was run on 2026-11-13 and is killed: `STACKPROBE: no scalar or shared-secret residue …` finds 2 images of the scalar after both `mul` and `mulRistretto` (M0 44/47 clean under the same `modtest -Doptimize=ReleaseFast`). Delta 2026-11-13 over P9 (`cswap_asm`, `addsub_asm`), one build per mutant: 10 mutants — the swap mask dropped, one side not swapped, the top limb not swapped; the sum's and the difference's first fold constant (38 → 37), second fold dropped, top carry/borrow ignored, the difference's top limb not stored — all killed; the two second-fold mutants survived the first run (no test drove both inputs near 2^256 through `addsub`) and are killed by `addsub` added to the `P6 fe64` edges × edges differential, every output aliasing. 2026-11-13: since that run the source changed only in test code (`fuzz_test.zig` and a test-only `hex32` helper in `root.zig` now come from `testkit.hex`, duplicate-code pass); no production line moved, so the run above still covers every guard and no delta mutants exist.
 
@@ -287,7 +287,7 @@ mismatch panics: an error union is the shape this module refuses, and
 
 ## X25519 key generation on the comb (2026-09-28)
 
-**Why.** qap's TLS server profile (churn lane, `perf record`, 2026-09-28) had
+**Why.** The web-server consumer's TLS server profile (churn lane, `perf record`, 2026-09-28) had
 X25519 at ~28 % of the handshake's CPU, split evenly between the ephemeral
 key pair and the shared secret: `std.crypto.dh.X25519.recoverPublicKey` runs
 the same 255-step Montgomery ladder over `u = 9` as `scalarmult` runs over a
@@ -309,7 +309,7 @@ Here the result is returned unconditionally: for a clamped scalar
 `k ∈ [2^254, 2^255)` with `8 | k`, `k·B = O` iff `L | k`, and the multiples
 of `L` in that range are `4L..7L`, none divisible by 8. The
 `IdentityElementError` in the signatures is std's shape kept for drop-in use
-(qap's TLS fork binds the type by one declaration); it is never produced.
+(the web-server consumer's TLS fork binds the type by one declaration); it is never produced.
 
 **Evidence.**
 - `X25519: RFC 7748 §6.1's published key pairs and shared secret` — Alice's
@@ -339,7 +339,7 @@ takes them from std.
 
 ## P6 — X25519 shared secret on a 4×64-bit field core in MULX/ADX assembly (2026-09-29)
 
-**Why.** qap's TLS churn lane (2026-09-29, after the comb took key
+**Why.** The web-server consumer's TLS churn lane (2026-09-29, after the comb took key
 generation) had `X25519.scalarmult` — the shared-secret ladder over the
 peer's `u` — as its largest single item, **18.65 % of CPU**. std's ladder is
 RFC 7748 §5 on a 5×51-bit field with `u128` products: 25 multiplies per
@@ -380,14 +380,14 @@ from those descriptions and the arithmetic itself:
 | build | `X25519.scalarmult` |
 |---|---|
 | x86-64, LLVM backend, target has `bmi2` and `adx` | `mulx` + two carry chains (`adcx` on CF, `adox` on OF) in the multiplication and its reduction; squaring, add/sub as below |
-| x86-64, LLVM backend, `bmi2` without `adx` — e.g. qap's `accel-amd64` = `x86_64_v3+aes+pclmul` | `mulx` with single `adc` carry chains everywhere (the row product is formed as five words first, then added; three finished product words are parked in the output slot to free registers) |
+| x86-64, LLVM backend, `bmi2` without `adx` — e.g. The web-server consumer's `accel-amd64` = `x86_64_v3+aes+pclmul` | `mulx` with single `adc` carry chains everywhere (the row product is formed as five words first, then added; three finished product words are parked in the output slot to free registers) |
 | anything else: baseline `x86_64`, other architectures, the self-hosted backend | std's `std.crypto.dh.X25519.scalarmult`, unchanged |
 
 The asm is compiled only where the LLVM backend emits it
 (`builtin.zig_backend == .stage2_llvm`, `.claude/rules/zig-pitfalls.md`),
 and only with the feature in the build target — there is no run-time
 detection, so a binary never executes an instruction its target does not
-promise. The MULX-only path exists because qap's deployment target has BMI2
+promise. The MULX-only path exists because the web-server consumer's deployment target has BMI2
 and not ADX (x86-64-v3 does not include ADX); on this Kaby Lake it runs at
 the same ratio to std as the ADX path. `test_hooks.forced` (test builds
 only, empty otherwise — the `sha2` pattern) lets one test run hold every
@@ -407,7 +407,7 @@ compiled path to std.
   `cmov` needed. Carry folds are `sbb r,r; and $38,r; add r,…`.
 - *The one branch:* std's API returns `error.IdentityElement` for an
   all-zero shared secret, and `scalarmult` keeps that shape (drop-in for
-  qap's TLS shim, which binds the function type). The zero flag is an OR
+  the web-server consumer's TLS shim, which binds the function type). The zero flag is an OR
   over the output bytes; the branch on it depends on the PUBLIC point only:
   a clamped `k = 8·m ∈ [2^254, 2^255)`, and `k·P = O` iff the order of `P`
   divides `k`. On the curve (order `8L`) the prime part `L` would need
@@ -459,7 +459,7 @@ compiled path to std.
   |---|---|---|---|---|
   | native (MULX+ADX), tainted | 4 | **0** | 4 | `result=` and `shared=` prints — taint reached the shared secret |
   | native, untainted / no `-fvalgrind` | 0 / 0 | 0 | 0 | control / trap |
-  | `-mcpu=x86_64_v3` (MULX only, qap's path), tainted | 4 | **0** | 4 | built by hand, same harness |
+  | `-mcpu=x86_64_v3` (MULX only, the web-server consumer's path), tainted | 4 | **0** | 4 | built by hand, same harness |
   | positive control: declassify removed | 5 | **1** | 4 | at `if (acc == 0)` in `sharedSecret` |
   | positive control: `cswap` as `if (swap != 0) swap(…)`, native | 3 | **1** | 2 | at the mutated line; `shared=` no longer tainted (the data no longer carries the bit) |
   | same, `-mcpu=x86_64_v3` | 3 | **1** | 2 | the MULX-only build is seen too |
@@ -482,7 +482,7 @@ spread says so), 7 interleaved rounds each, µs/op CPU time, median
 |---|---|---|---|---|---|---|
 | MULX+ADX (this machine's default) | 1 | 43.9 [41.9..50.6] | 53.9 [51.1..62.1] | **1.23×** | 1.18..1.27 | 1.22× |
 | MULX+ADX | 2 | 45.7 [44.9..46.8] | 56.1 [53.1..58.2] | **1.23×** | 1.15..1.28 | 1.18× |
-| MULX only (qap's `x86_64_v3` path) | 1 | 46.6 [45.6..47.4] | 57.4 [54.4..68.9] | **1.23×** | 1.18..1.48 | 1.19× |
+| MULX only (the web-server consumer's `x86_64_v3` path) | 1 | 46.6 [45.6..47.4] | 57.4 [54.4..68.9] | **1.23×** | 1.18..1.48 | 1.19× |
 | MULX only | 2 | 47.2 [45.6..48.6] | 54.9 [51.8..56.0] | **1.16×** | 1.12..1.21 | 1.14× |
 
 The runtime-point control pair (unchanged code on both sides) read 1.00× and
@@ -490,7 +490,7 @@ The runtime-point control pair (unchanged code on both sides) read 1.00× and
 cycles) the new ladder is ~130 k cycles against std's ~160 k; the published
 MULX/ADX ladders report ~95–110 k on Skylake-class cores (see the backlog).
 
-**Why the gain outweighs the new code.** 18.65 % of qap's churn-lane CPU was this ladder; 1.16–1.23× on it is
+**Why the gain outweighs the new code.** 18.65 % of the web-server consumer's churn-lane CPU was this ladder; 1.16–1.23× on it is
 ~3 % of that lane's CPU, on the one operation every TLS 1.3 / ECDHE
 handshake performs with a secret, without a change to the API, the bytes or
 the constant-time evidence (the ctgrind target now covers it, with positive
@@ -507,7 +507,7 @@ to begin with.
   against ~130 k here). Not planned: it trades ~200 lines of reviewable asm
   per operation for one ~1 000-line block, for an estimated further 10–25 %.
 - ADX in the squaring (the doubling and the diagonal as two chains); helps
-  only the ADX build, which qap's target is not.
+  only the ADX build, which the web-server consumer's target is not.
 - `meta.doc` still describes only the comb; mentioning the shared secret
   needs `zig build gen-catalog` (root README), outside a module-only change.
 
@@ -872,7 +872,7 @@ row 1.09× → P2, with a thin margin under the 1.1× tolerance -- a noisy run c
 
 ## Build options
 
-Consumer build options (CONVENTIONS §4.2), added 2026-10-17 at axp's request:
+Consumer build options (CONVENTIONS §4.2), added 2026-10-17 at the router-tool consumer's request:
 
 | option | values | default | `-Dprofile=small` |
 |---|---|---|---|
@@ -895,7 +895,7 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-17 at axp's request:
 
 - **Document a minimum stack size (review GP, 2026-10-30).** `mulMulti*` reserves 8 x 16 `Edwards25519` (about 21.5 KiB) in `strausChunk` and burns `msm_burn` (32 KiB); `recoverPublicKey` burns 16 KiB. Publish a minimum stack in the README/`meta`; optionally size the Straus tables by `points.len`.
 
-- ~~**Build option: `ct25519-base-comb`**~~ ✅ DONE 2026-10-17 (axp request) — see § Build options.
+- ~~**Build option: `ct25519-base-comb`**~~ ✅ DONE 2026-10-17 (the router-tool consumer request) — see § Build options.
 - ~~**Performance: the X25519 shared secret, 1.09× libsodium / 1.21× OpenSSL**~~ — DONE 2026-10-31 (P7: 0.82× / 0.92×). *(bench
   2026-10-10, `zig build bench-ct25519`)*: the only row above 1.0 by more than noise, and the
   one between P2 and P1. OpenSSL's `x25519-x86_64` runs the same 4×64 MULX/ADX radix, so the

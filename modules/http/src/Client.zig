@@ -3149,7 +3149,7 @@ fn connectStreamBlocking(c: *Client, url: http.Url) Error!net.Stream {
 /// std's `HostName.connect` does not run where it is called: it starts the
 /// lookup and one connect per address as tasks (`io.async` + an `Io.Group`),
 /// so with `std.Io.Threaded` they run on the pool -- outside a sandbox the
-/// calling thread is in, whatever `runBounded` does (found by qap's jwks
+/// calling thread is in, whatever `runBounded` does (found by the web-server consumer's jwks
 /// probe: a Landlocked refresh thread still read `/etc/hosts`). Here the
 /// lookup is called directly (`Threaded`'s resolver is synchronous: hosts
 /// file, then DNS over a socket) into a local queue, and the addresses are
@@ -6733,7 +6733,7 @@ const TaskCountingIo = struct {
 };
 
 test "inline_blocking: resolving and connecting a host name starts no task on the Io" {
-    // qap's jwks probe (2026-09-28): with `inline_blocking`, a Landlocked
+    // the web-server consumer's jwks probe (2026-09-28): with `inline_blocking`, a Landlocked
     // thread still resolved a name it had no grant for, because std's
     // `HostName.connect` runs the lookup and the connects as tasks. Counted
     // here instead of sandboxed: zero task starts is "all on this thread".

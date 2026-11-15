@@ -6,7 +6,7 @@
 
 **Scope:** parity — Caffeine 3.3.0 (W-TinyLFU) (surveyed 2026-09-30, gaps closed 2026-10-11)
 
-**Audit:** review 2026-11-01 · mutation 2026-10-30 (460/486, 26 eq) · src 910fac97c67687ff
+**Audit:** review 2026-11-01 · mutation 2026-10-30 (460/486, 26 eq) · src 8af969673a84ad77
 
 Audit detail: the 2026-11-01 review is a delta over `sweep_sharded_test.zig` only (full-CI fix: the dying sweep child's stderr goes to /dev/null); library source unchanged since the mutation run.
 
@@ -395,15 +395,15 @@ above) — no longer listed as a gap.
 - ~~**Time-to-idle (expire after last access)** *(survey 2026-09-30)* — session-like caches want it; today only write-time TTL exists. Effort: small (second deadline refreshed on hit, feeds the existing expiry heap). Fits §2.~~ **DONE 2026-10-11** — `Options.idle_ttl_ns`; see Design.
 - ~~**Adaptive admission window** *(survey 2026-09-30)* — Caffeine tunes the window/main split by hit-rate climbing, which helps recency-skewed workloads; fixed split is measurably worse there. Effort: medium plus benchmarks. Fits §2. Low priority.~~ **DONE 2026-10-11** — `Options.adaptive_window` (opt-in hill climber); see Design.
 - **Typed values** *(survey 2026-09-30)* — **REJECTED 2026-10-11:** values are bytes by design: `pin`/`reserve` hand out zero-copy borrows and the write-behind seam (`drainDirty`) flushes bytes; a typed layer is the caller's codec.
-- **Hash the key once per operation** *(qap perf audit 2026-09-21, re-read 2026-09-30)* — a miss
+- **Hash the key once per operation** *(the web-server consumer perf audit 2026-09-21, re-read 2026-09-30)* — a miss
   (`pin` -> `reserve` -> fill) hashes the key many times: the map lookup, the frequency sketch's
   two Wyhashes, `getOrPut`, the admission comparison (candidate and victim), the victim's
-  `fetchRemove`, and in `Sharded` the shard hash. Profiled under qap's durable store 09-21:
+  `fetchRemove`, and in `Sharded` the shard hash. Profiled under the web-server consumer's durable store 09-21:
   ~30 k instructions per miss inside ramcache, 30 % of it Wyhash, ~11 key hashes -- not
   re-measured since. Shape: compute one 64-bit hash at the entry point and pass it down
   (adapted map context, both sketch indices derived from it, the shard from its high bits).
   Effort: small-medium, no API change. Secondary (the store's commit dominates a PUT).
-  **Re-measured 2026-09-30, not worth doing now:** qap `wdur` (kv-store, shield smoke, `perf
+  **Re-measured 2026-09-30, not worth doing now:** The web-server consumer `wdur` (kv-store, shield smoke, `perf
   record`): every `ramcache` symbol together is 4.7 % of server CPU, explicit `Wyhash.hash`
   0.3 %; the server is 85 % kernel (fsync). Hashing once saves ~1 % CPU, below the lane's
   noise floor. On a hit the sketch's first Wyhash (seed 0) equals the map's own

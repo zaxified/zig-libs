@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** tests only, from the whole-module mutation run on current source (335 mutants, 329 killed, 6 equivalent, 0 undecided): the whole fingerprint is compared (a digest differing in one byte, ramcache and `KvBackend`), the whole body is fingerprinted (long shared prefix), a record that cannot be encoded is dropped without a panic, `Clock.monotonic` advances, a quoted key with a byte above 0x7e is refused, a response whose sink failed part-way is refused by capture even when the handler swallowed the error, and `Options.header_name` / `replay_header` are honoured.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `monoNs` OS read behind `Clock.monotonic` (duplicate-code pass) now calls `clock.monotonicNs()` (clamped to `i64`); `Clock` keeps its `i64` shape. A negative timespec field now maps to 0 instead of tripping `@intCast`. New dependency: `clock`.
@@ -25,9 +26,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-10-18** — Ported to Zig 0.17.0. `max_body_bytes` boundary: the body probe no longer reads `max_body_bytes + 1` (0.16 `allocRemaining` failed at its limit; 0.17 accepts exactly the limit), so exactly the cap is fingerprinted and one byte over is 413 as documented (existing boundary test passes); `maxInt` cap maps to `.unlimited` (`+1` would overflow). Model-fuzz reach check uses `field_names`.
 - **2026-10-12** — **Breaking (source):** `scopeKey` takes the method name (`[]const u8`,
   `Request.methodName()`) instead of `http.Method`: since http R9 every extension method is
-  `.other`, and two of them must not share a cached result. qap calls it once.
+  `.other`, and two of them must not share a cached result. The web-server consumer calls it once.
 
-- **2026-10-12** — **Pluggable record store (S3 → S2).** `Backend` (type-erased: `lookupOrReserve` / `put` / `release`, contract on the type) set through `Store.backend`; **Breaking (source):** `Store.cache` is now optional (`?*ramcache.Cache`, the in-process default, unchanged behaviour) — `store.cache.alloc` becomes `store.alloc()` (qap `src/root.zig` reads it twice; initialising with `.cache = &cache` still compiles); `Store.lease_ns`; `Store.alloc()`. `KvBackend`: durable records over `kv.Db` (`putTtl`, survive a restart), in-memory reservations with lease takeover, fail-closed 409 on an unreadable record. New dep `kv`. The sequence model-fuzz also runs over `KvBackend`; its single clock nudge became a loop (a second record could land on the TTL edge).
+- **2026-10-12** — **Pluggable record store (S3 → S2).** `Backend` (type-erased: `lookupOrReserve` / `put` / `release`, contract on the type) set through `Store.backend`; **Breaking (source):** `Store.cache` is now optional (`?*ramcache.Cache`, the in-process default, unchanged behaviour) — `store.cache.alloc` becomes `store.alloc()` (the web-server consumer `src/root.zig` reads it twice; initialising with `.cache = &cache` still compiles); `Store.lease_ns`; `Store.alloc()`. `KvBackend`: durable records over `kv.Db` (`putTtl`, survive a restart), in-memory reservations with lease takeover, fail-closed 409 on an unreadable record. New dep `kv`. The sequence model-fuzz also runs over `KvBackend`; its single clock nudge became a loop (a second record could land on the TTL edge).
 - **2026-10-11** — tests: seeded model-fuzz comparing random request sequences (methods, keys, bodies, callers, clock) with a linear-scan reference model of the documented decision order, plus random-input checks of `validKey`/`scopeKey`/`principalTag`/`decode`. No API or behaviour change.
 
 - **2026-10-10** — Card Performance `n/a` with the reason (no timeable reference implementation). Docs only.
@@ -35,7 +36,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-21** — `decode` and `RecordedResponse` are public: a server without
   `router` reads a `Store.begin` `.replay` blob itself (status, content type,
   body) to answer the replay.
-- **2026-09-21** — **A1 audit (for qap's write layer): three findings fixed, API
+- **2026-09-21** — **A1 audit (for the web-server consumer's write layer): three findings fixed, API
   changed.**
   - **F1 (HIGH): one record namespace for every caller.** Keys were scoped by
     method + path + the client's key only, so two clients picking the same key

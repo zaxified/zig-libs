@@ -13,7 +13,7 @@
 //! Both sides are a server on an in-memory connection: reads come from a
 //! buffer holding the client's frames, writes go to a discarding writer
 //! (ours: `Connection.receive` over a copy of the wire -- the copy stands for
-//! the read from the socket that coder's bufio reader does, and is how qap
+//! the read from the socket that coder's bufio reader does, and is how the web-server consumer
 //! reads, an accumulator in front of `Connection`; coder: `Accept` over a
 //! `net.Conn` whose reads cycle over the same bytes). No socket in either
 //! number. Measured 2026-10-26 and NOT the card's number: `conn.Conn` over a
@@ -68,7 +68,7 @@ const websocket = @import("websocket");
 // std 0.16's `flate.Compress.writeBlock` resets its 96 KiB token list with a
 // memset once per message, and Zig 0.16's compiler_rt memset is byte-wise
 // (no libc): write_deflate is 2.0x coder with it, 0.93x without
-// (2026-10-11). Deployed libc-free executables here install fastmem (qap's
+// (2026-10-11). Deployed libc-free executables here install fastmem (the web-server consumer's
 // do), so this one does too; the card records both numbers.
 comptime {
     fastmem.exportSymbols();

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-13** — **PERFORMANCE:** the X25519 shared secret is about 5 % faster on x86-64 with MULX/ADX: the ladder's conditional swap is asm with 64-bit loads (LLVM's vectorised swap could not be store-forwarded from the field blocks' 64-bit stores) and the three sum/difference pairs of a ladder step are one asm block each. Same results, same constant-time shape (ctgrind counts unchanged).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** the 2026-11-01 mutation run's last undecided mutant (`mul`'s scalar wipe dropped) run under the ReleaseFast stack probe: killed.
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit re-recorded; since the 2026-11-01 mutation run only test code changed (no production line moved).
@@ -17,7 +18,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-10-19** — **Fix:** `X25519.KeyPair.generate`/`generateInto` draw the seed with `entropy.fill` (fail-closed: aborts when no entropy is available) instead of `io.random`, which degrades to a guessable seed on `error.EntropyUnavailable` — the seed is the private key (CONVENTIONS.md §2.2). New dependency: `entropy`. Signatures unchanged (audit 2026-10-19).
 
 - **2026-10-18** — Ported to Zig 0.17.0: tests/bench: std `X25519.recoverPublicKey`/`generateDeterministic` no longer return error unions.
-- **2026-10-17** — **Added: build option `ct25519-base-comb`** (CONVENTIONS §4.2; axp request): `false` (or `-Dprofile=small`) runs `mulBase`/`mulRistrettoBase`/`X25519.recoverPublicKey` on the window ladder instead of the fixed-base comb — same results, no 43 KB table (X25519 keygen probe, ReleaseSmall: 57.7 → 17.2 KB), keygen 2.4× slower. Default unchanged (comb). ctgrind under `.small` clean; SPEC § Build options.
+- **2026-10-17** — **Added: build option `ct25519-base-comb`** (CONVENTIONS §4.2; the router-tool consumer request): `false` (or `-Dprofile=small`) runs `mulBase`/`mulRistrettoBase`/`X25519.recoverPublicKey` on the window ladder instead of the fixed-base comb — same results, no 43 KB table (X25519 keygen probe, ReleaseSmall: 57.7 → 17.2 KB), keygen 2.4× slower. Default unchanged (comb). ctgrind under `.small` clean; SPEC § Build options.
 - **2026-10-10** — **Additive API:** `mulMulti(scalars, points)` — constant-time `Σ s_i·P_i`
   on Edwards25519 points (std's `mulMulti` is variable-time), the Straus pass of
   `mulMultiRistretto` made generic over the point type; burned like it. Bit-exact vs the
@@ -26,18 +27,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   secret-scalar surface, item by item, SPEC "Compared with").
 
 - **2026-10-10** — tools: comparative benchmark `tools/bench.zig` + `tools/c_bench/foreign_bench.c` (`zig build bench-ct25519`) against libsodium 1.0.18 (stand-in reference; dalek not installed) and OpenSSL 3.5.5 for X25519; card Performance filled (0.58–1.09×, fastest 1.21× OpenSSL), SPEC "Performance — bench-ct25519" section.
-- **2026-10-09** — **Additive API + burn:** `X25519.recoverPublicKey` now runs under a burn (new `recoverPublicKeyInto(out, secret_key *const)`); new pointer twins `KeyPair.generateDeterministicInto` and `KeyPair.generateInto`. The std-shaped by-value `recoverPublicKey` / `generateDeterministic` / `generate` stay (qap's TLS shim swaps the type in for std's) and call the twins. Probe: `src/stackprobe2_test.zig`.
+- **2026-10-09** — **Additive API + burn:** `X25519.recoverPublicKey` now runs under a burn (new `recoverPublicKeyInto(out, secret_key *const)`); new pointer twins `KeyPair.generateDeterministicInto` and `KeyPair.generateInto`. The std-shaped by-value `recoverPublicKey` / `generateDeterministic` / `generate` stay (the web-server consumer's TLS shim swaps the type in for std's) and call the twins. Probe: `src/stackprobe2_test.zig`.
 - **2026-10-08** — **FIX (secrets on the dead stack, MEDIUM) + additive API:** the new ReleaseFast
   stack probe (`src/stackprobe_test.zig`, all secret-scalar entry points) found every scalar in dead
   frames after `mulMultiRistretto` and the shared secret after `X25519.scalarmult`; `mul`, `mulBase`,
   `mulRistretto`, `mulRistrettoBase` and `recoverPublicKey` measured clean. Both now burn their stack
-  (`burn.zig`). `X25519` keeps std's shape (qap's TLS shim swaps it in for std's), which leaves the
+  (`burn.zig`). `X25519` keeps std's shape (the web-server consumer's TLS shim swaps it in for std's), which leaves the
   key and the result in the caller's frame; the new `X25519.scalarmultInto(out, sk: *const, pk)`
   leaves neither.
 - **2026-09-29** — **`X25519.scalarmult` on a 4×64-bit field core in x86-64
   MULX/ADX assembly (P6).** No API change: same signature, same bytes,
   `error.IdentityElement` on an all-zero result as std. Dispatch at compile
-  time: BMI2+ADX → `mulx` with `adcx`/`adox` carry chains; BMI2 only (qap's
+  time: BMI2+ADX → `mulx` with `adcx`/`adox` carry chains; BMI2 only (the web-server consumer's
   `x86_64_v3` target) → `mulx` with `adc` chains; anything else, or the
   self-hosted backend → std's ladder. Constant-time: straight-line asm, fixed
   offsets from one state pointer, masked swap and folds, fixed inversion
@@ -48,7 +49,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `x25519` target extended to the shared secret — 4 witness / 0 in-module on
   both asm paths, positive controls 1 in-module each. ReleaseFast bench, same
   process: MULX+ADX 1.23× std (43.9–45.7 vs 53.9–56.1 µs), MULX only
-  1.16–1.23×. First consumer: qap's TLS fork, where the shared secret was
+  1.16–1.23×. First consumer: the web-server consumer's TLS fork, where the shared secret was
   18.65 % of the churn lane.
 - **2026-09-28** — **New `X25519`: std's `X25519` shape with key generation
   on the C3 comb.** Additive API. `recoverPublicKey` = `clamp(sk)·B` on the
@@ -56,7 +57,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   is std's ladder re-exported. No identity branch (unreachable for a clamped
   scalar, proof in `SPEC.md`). Bit-exact with std over RFC 7748 §6.1 and 512
   raw seeds; ctgrind target `x25519` 2 contexts / 0 in-module, as `comb`.
-  ReleaseFast bench: public key 51.6 → 21.8 µs (2.36×). First consumer: qap's
+  ReleaseFast bench: public key 51.6 → 21.8 µs (2.36×). First consumer: the web-server consumer's
   TLS fork (`-Dfast-x25519`), where the ephemeral key pair was half of X25519's
   ~28 % of a handshake.
 - **2026-09-15** — **New `mulMultiRistretto`: constant-time `Σ s_i·P_i` by

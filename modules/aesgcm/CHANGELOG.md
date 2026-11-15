@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of the § GP sweep (10/11 mutants killed; the 2 call-site survivors only matter above 2^36 − 32 bytes, their helpers are pinned). New test: a length mismatch wins over too-long on the input side too.
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GP). The length contract of `encrypt`/`decrypt` (stateless and `Context`) was `std.debug.assert` (out-of-bounds write or a wrapped 32-bit GCM counter in ReleaseFast) and is now a checked panic in every build mode for `c.len != m.len` and for encrypting more than 2^36 − 32 bytes; decrypting a ciphertext longer than that zeroes `m` and returns `error.AuthenticationFailed` (no message can be that long). `max_message_len` is public and documented. Tests: `src/sweep_test.zig`.
@@ -50,7 +51,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-29** — Fix: a Debug build for a baseline x86_64 target (`-Dtarget=x86_64-linux`,
   or any CPU model without the instruction) failed to compile — Zig 0.16's self-hosted x86_64
   backend cannot encode the run-time-dispatched AES-NI kernel for such a CPU. That build now uses
-  `.generic`; LLVM builds and targets that have the instruction are unchanged. Found by qap's
+  `.generic`; LLVM builds and targets that have the instruction are unchanged. Found by the web-server consumer's
   portability check.
 - **2026-09-28** — **NO CONSUMER-VISIBLE CHANGE:** a ctgrind harness
   (`src/ctgrind_harness.zig`, a separate program, not part of the API)
@@ -64,4 +65,4 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   one-pass kernel chosen at run time, std's primitives elsewhere; 1.6–1.8× std
   at 16 KiB, 2.0–2.2× at 480 bytes, ~3× at 64 bytes. Anchored to the McGrew–Viega
   GCM test cases and to OpenSSL-generated long-message vectors, differentially
-  to std. Requested by qap's TLS record path.
+  to std. Requested by the web-server consumer's TLS record path.

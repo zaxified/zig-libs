@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — a damaged file (1 to 8 bytes flipped in one random non-meta page, or anywhere in the file; 3 000 trials each, one process per trial): kvtree panicked, crashed or hung in 0 of 6 000, read through plain `FsStorage` and again through `FsStorage.initMmap`; bbolt v1.5.0 panicked in 234 (slice bounds, SIGSEGV in its mmap), LMDB 0.9.31 crashed in 292 (238 SIGSEGV, 54 SIGBUS). None of the three detects most such damage — node pages carry no checksum on any side — so the lead is "a damaged file never takes the process down", not detection (`tools/corrupt_probe`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (549/598, 49 eq) · src e7cdb6adce11f276
+**Audit:** review 2026-11-12 · mutation 2026-11-12 (549/598, 49 eq) · src 286d7ad0b162661a
 
 Audit detail: the 2026-11-01 review is a delta over `core.zig` (the `fuzz driver: KVTREE_FUZZ` test moved from chained `fuzz_driver.run` calls to `fuzz_driver.runAll`, same prefix, names and harnesses; a skipped harness no longer ends the test before the next one), test code only; the library source the mutation run scored is unchanged.
 
@@ -320,7 +320,7 @@ for lockless readers, and crash-recovery to a committed prefix — under the sam
 `fsync`-honesty caveat `kv` documents (a lying drive/hypervisor is below this
 library). Cross-process: one writer per store (an exclusive `flock` on `<path>.lock`), or any number of read-only openers (a shared one) — never both at once.
 
-**Emptied nodes leave the tree** (2026-09-28, found adopting tsdb in ttydesk). A
+**Emptied nodes leave the tree** (2026-09-28, found adopting tsdb in the terminal-UI consumer). A
 leaf that a commit's deletes leave with no entries is not written back: `applyRec`
 returns no pieces for it and the parent drops the child together with its
 separator (when the dropped child was the leftmost, the next surviving child

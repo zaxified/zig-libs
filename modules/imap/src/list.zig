@@ -3,7 +3,7 @@
 //! `LIST` / `LSUB` (RFC 9051 §6.3.9, §6.3.10) and `STATUS` (§6.3.11) — the
 //! mailbox-listing and mailbox-info commands.
 //!
-//! Audit A1 F6 (`~/CML/20260901-zig-libs-audit/A1/imap.md`): this module had
+//! Audit A1 F6 (the A1 audit report for `imap`): this module had
 //! no parser for any of the three at all. `wire.expectMailbox` — which does
 //! the UTF-7 decoding and `INBOX` canonicalisation a mailbox NAME needs — had
 //! exactly one caller, and it was this module's own tests; `client.zig` had

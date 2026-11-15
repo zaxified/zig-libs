@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **CONSUMER-VISIBLE (fix):** `Mtr.hops()` / `lastRound()` (and `MtrSet` members) of a path whose destination has not answered now end one probed TTL after the last that answered, as mtr shows its `???` row: a silent destination showed nothing past the last router, as if the path ended there. Before any answer that is TTL 1 alone, once probed. A reached path or a Destination Unreachable end is unchanged. Found on a live target that stopped answering (its trace ended at hop 18).
 - **2026-11-11** — **NO CONSUMER-VISIBLE CHANGE:** `tools/kernel_oracle.py` runs its ~93 cases in 8 parallel `unshare -rmn` shards and merges them in the old order; `zig build interop-traceroute` 489 s → 74 s locally, same 109 traces and verdicts.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** private `onesSum` (duplicate-code pass) calls `icmp.checksum.sum`; same results.
@@ -69,7 +70,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   on real kernel replies from a veth router sandbox and an MPLS extension tcpdump decodes as
   "checksum … (correct)". FIXED (test only): the live ICMP test failed instead of skipping in a
   fresh netns with `lo` down. ⚠ `LinuxTransport.OpenError` (and so `LiveTraceError`) gained
-  `UdpSocketFailed` — only an exhaustive `switch` notices (axp's has `else`). Mutation: 29
+  `UdpSocketFailed` — only an exhaustive `switch` notices (the router-tool consumer's has `else`). Mutation: 29
   mutants, all killed (13 after new, rule-isolating tests).
 
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** A1 fix campaign, follow-up closing the

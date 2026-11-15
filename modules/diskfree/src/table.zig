@@ -23,7 +23,7 @@ const mountinfo = @import("mountinfo.zig");
 /// Types GNU df 9.7 hides from its default listing on the development host
 /// (squashfs loop mounts, devtmpfs; measured, `tools/df-where-diff.sh`), though
 /// they hold real blocks. NOT the default here: OpenWrt's root is squashfs and
-/// a consumer like axp lists it. Pass as `Options.skip_fs_types` for `df`'s view.
+/// a consumer like the router-tool consumer lists it. Pass as `Options.skip_fs_types` for `df`'s view.
 pub const df_default_skip = [_][]const u8{ "squashfs", "devtmpfs" };
 
 pub const Options = struct {

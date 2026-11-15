@@ -621,7 +621,7 @@ pub const journal = [_]JournalCase{
 };
 
 pub const journal_send = [_]JournalSend{
-    .{ .opts = .{ .message = "hello", .priority = .info, .identifier = "ttydesk", .fields = &.{ .{ .name = "AUDIT_EVENT", .value = "login" }, .{ .name = "AUDIT_USER", .value = "z\x01" } } }, .datagram = "MESSAGE=hello\x0aPRIORITY=6\x0aSYSLOG_IDENTIFIER=ttydesk\x0aAUDIT_EVENT=login\x0aAUDIT_USER=z\x01\x0a", .ok = true },
+    .{ .opts = .{ .message = "hello", .priority = .info, .identifier = "desktop", .fields = &.{ .{ .name = "AUDIT_EVENT", .value = "login" }, .{ .name = "AUDIT_USER", .value = "z\x01" } } }, .datagram = "MESSAGE=hello\x0aPRIORITY=6\x0aSYSLOG_IDENTIFIER=desktop\x0aAUDIT_EVENT=login\x0aAUDIT_USER=z\x01\x0a", .ok = true },
     .{ .opts = .{ .message = "multi\x0aline", .priority = .err, .fields = &.{ .{ .name = "AUDIT_EVENT", .value = "login" }, .{ .name = "AUDIT_USER", .value = "z\x01" } } }, .datagram = "MESSAGE\x0a\x0a\x00\x00\x00\x00\x00\x00\x00multi\x0aline\x0aPRIORITY=3\x0aAUDIT_EVENT=login\x0aAUDIT_USER=z\x01\x0a", .ok = true },
     .{ .opts = .{ .message = "", .identifier = "x", .fields = &.{ .{ .name = "AUDIT_EVENT", .value = "login" }, .{ .name = "AUDIT_USER", .value = "z\x01" } } }, .datagram = "MESSAGE=\x0aSYSLOG_IDENTIFIER=x\x0aAUDIT_EVENT=login\x0aAUDIT_USER=z\x01\x0a", .ok = true },
     .{ .opts = .{ .message = "\xff\x00", .priority = .emerg, .identifier = "a b", .fields = &.{ .{ .name = "AUDIT_EVENT", .value = "login" }, .{ .name = "AUDIT_USER", .value = "z\x01" } } }, .datagram = "MESSAGE=\xff\x00\x0aPRIORITY=0\x0aSYSLOG_IDENTIFIER=a b\x0aAUDIT_EVENT=login\x0aAUDIT_USER=z\x01\x0a", .ok = true },

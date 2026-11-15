@@ -262,7 +262,7 @@
    ],
    "stdin": "pipe",
    "stdin_len": 4194304,
-   "diff": "procrun surfaces a stdin write that hit a closed pipe as error.BrokenPipe (bxp's runPhaseLabel relies on it); Python and Go swallow EPIPE and return the child's result",
+   "diff": "procrun surfaces a stdin write that hit a closed pipe as error.BrokenPipe (the build-tool consumer's runPhaseLabel relies on it); Python and Go swallow EPIPE and return the child's result",
    "procrun_override": {
     "kind": "error",
     "err": "BrokenPipe"
@@ -277,7 +277,7 @@
    ],
    "stdin": "pipe",
    "stdin_len": 1048576,
-   "diff": "procrun surfaces a stdin write that hit a closed pipe as error.BrokenPipe (bxp's runPhaseLabel relies on it); Python and Go swallow EPIPE and return the child's result",
+   "diff": "procrun surfaces a stdin write that hit a closed pipe as error.BrokenPipe (the build-tool consumer's runPhaseLabel relies on it); Python and Go swallow EPIPE and return the child's result",
    "procrun_override": {
     "kind": "error",
     "err": "BrokenPipe"

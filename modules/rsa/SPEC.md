@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 4.0 RSA and Go `crypto/rsa` + the `crypto/x509` RSA key codecs: PKCS#1 v1.5 and PSS sign/verify (run-time hash, prehashed digests, PSS salt recovery, decoupled MGF1), OAEP, key generation, PKCS#1/PKCS#8/SPKI/PEM read and write including encrypted PKCS#8 (PBES2/PBKDF2/AES-CBC), OpenSSH private keys, moduli up to 8192 bits (surveyed 2026-09-30 and 2026-10-14, gaps closed 2026-10-14); RSAES-PKCS1-v1_5, multi-prime keys, scrypt/PBES1/legacy-PEM encryption and > 8192-bit moduli are out (see "What is deliberately not done")
 
-**Audit:** review 2026-11-13 · mutation 2026-11-13 (162/198, 36 eq) · src d376b221f3629c9c
+**Audit:** review 2026-11-13 · mutation 2026-11-13 (162/198, 36 eq) · src 94c4e1d71a774ccc
 
 *Delta mutation runs 2026-11-13 (restore A1 after the same day's changes):* branch-free `decryptOaepHNoFail` 35 mutants, 33 killed, 2 equivalent (`found_sep` forced to 1 — with no separator `len_ok` is already 0; the `& 1` before `@truncate` — every other term of `valid` is 0/1); bounded `drawBlindingPair` + `BlindingCache.next` 11/11 killed. The whole-module figure on the Audit line is the earlier run; the src hash covers both deltas.
 
@@ -412,7 +412,7 @@ does the same verification in **388 µs** — 10.8× slower than this module.
 
 ### Why neither is being chased
 
-⭐ **Both hot consumers hold a WARM key, so they never pay this.** `qap` builds its
+⭐ **Both hot consumers hold a WARM key, so they never pay this.** The web-server consumer builds its
 `SecretKey` once when its certificate store loads and then only signs; `iec62351`'s GOOSE
 verifier carries an already-built `PublicKey` and verifies per frame. The setup cost
 lands only on **cold, one-shot** users — `x509` chain validation, `dtls` handshakes, and
@@ -430,7 +430,7 @@ Two routes exist and both were measured, not guessed:
    `paillier`, `threshold_ecdsa` and `vdf`.
 
 **Owner decision, 2026-09-08: neither is done here.** They are optimisations without a
-consumer that feels them, and the consumer who would (`qap`) is expected to solve its own
+consumer that feels them, and the consumer who would (the web-server consumer) is expected to solve its own
 performance question first and push the result back. This section exists so that arrives
 as a measurement rather than a rediscovery.
 

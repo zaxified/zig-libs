@@ -38,7 +38,7 @@
 //! temp file.
 //!
 //! WHICH ROW IS WHICH. Every row but `put_rc` uses `Options.refcount = false`:
-//! that is what axp runs (it never deletes through the store) and the only
+//! that is what the router-tool consumer runs (it never deletes through the store) and the only
 //! configuration whose work equals flatfs's, so those rows make the verdict.
 //! `put_rc` is the DEFAULT store (`refcount = true`): each put also writes a
 //! `.rc` sidecar through its own temp + fsync + rename + directory fsync, work

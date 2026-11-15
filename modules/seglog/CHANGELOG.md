@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — Tools wired into zig-libs (they still named the old consumer's
   paths and build steps): `example/bench.zig` is now `tools/bench.zig`, so `zig build
   bench-seglog -- <scenario> <dir> ...` builds and runs it (ReleaseFast, as for
@@ -18,7 +19,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `crash-dm/run.sh` (needs root and dm-log-writes) and the Go benchmark.
 
 - **2026-11-15** — **CONSUMER-VISIBLE:** `error.TooManySegments` is new in
-  `RotateError` and `AppendError` (egw-hub's own copy will meet it when it
+  `RotateError` and `AppendError` (the ingest daemon's own copy will meet it when it
   switches to this module; an exhaustive `switch` over either set needs the
   arm). `rotate` refuses, before writing anything, a segment that would take
   the manifest past 2^20 ids (live plus pending drops): `open` refuses such a
@@ -37,13 +38,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   byte); a backend handle with bit 31 set is `HandleTableFull`, not an assert.
   `fuzz_test.zig` counts and prints what it reached (`REACH ...`). Card:
   Hardening records the fuzz verdict and the sweep.
-- **2026-11-15** — New module: moved here from energomonitor's `egw-hub/seglog/`
+- **2026-11-15** — New module: moved here from an energy-monitoring consumer's ingest daemon (`seglog/`)
   (segmented, crash-consistent, append-only log; format v2). `meta.deps` now lists
   all three imports (`kv`, `crc32c`, `zstd`). Other changes the repo gates required: `zig fmt` (whitespace) on `root.zig`,
   `fault_test.zig`, `example/bench.zig`; `fuzz_test.zig`'s first draw is now
   `value(u64) % 4` instead of a ranged draw (check-fuzz-reach R1: a ranged `Smith`
   draw returns its minimum for almost every seed); new `example/main.zig` (64 `pub fn`
-  owe a consumer example). History below is the energomonitor one.
+  owe a consumer example). History below is the energy-monitoring consumer one.
 - **2026-09-28** — A compressed segment reuses the decoder the last one closed
   (`zstd.seekable.Seekable.reset`, zig-libs Z28 `bf865f4c`) instead of allocating
   2 × 128 KiB of buffers and a decoder per open (audit L6).
@@ -54,16 +55,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `error.OrphanSegment` before the manifest names the segment. A name taken by an
   empty file is adopted as before.
 - **2026-09-27** — `Log.rebuildManifest(gpa, store, ids)`: a lost or torn `MANIFEST` now
-  has a recovery path (audit finding L4, egw-audit-2026-09-27) — every other kind of
+  has a recovery path (audit finding L4, ingest-consumer audit 2026-09-27) — every other kind of
   damage already did. Given the segments' ids (ascending; `kv.Storage` still has no
-  directory listing, so the caller supplies them — `egw-hub`'s `seglog_cli.manifestRebuild`
+  directory listing, so the caller supplies them — the ingest daemon's `seglog_cli.manifestRebuild`
   lists the directory itself), it reads each segment's own header and seal, cross-checks
   consecutive LSN ranges, and writes a fresh manifest naming each segment's form. Refuses
   over a manifest that still opens, or over segments that disagree with each other
   (`error.Corrupt`) rather than guess. Checks headers and seals only — run `Log.verify`
   after a rebuild for the data records themselves.
 - **2026-09-27** — Lowering `Options.max_record_len` below records already written no
-  longer risks silent, irreversible loss (audit finding L5, egw-audit-2026-09-27): a
+  longer risks silent, irreversible loss (audit finding L5, ingest-consumer audit 2026-09-27): a
   writer's `open` now refuses with `error.RecordTooLongForOptions` instead of treating
   such a record in the *active* segment as a torn tail and truncating it. Reading one
   in a closed segment still `error.Corrupt` (no on-disk field records what limit was in
@@ -72,14 +73,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-27** — `Options.timestamps` bounds `append`/`appendAt`/`appendMany`/
   `appendEntries`: `.refuse` rejects an out-of-range `ts` before anything is written
   (`error.TimestampOutOfRange`); `.clamp` pulls it into range first. Default
-  `.unbounded`, unchanged from before (audit finding L3, egw-audit-2026-09-27) — one
+  `.unbounded`, unchanged from before (audit finding L3, ingest-consumer audit 2026-09-27) — one
   out-of-range `ts` otherwise becomes a segment's seal `max_ts`/`min_ts` for good,
   which makes `seekTime` match that record for every later query and can wedge
   `enforceRetention`'s age policy on that segment (and every older one behind it)
   forever.
 - **2026-09-27** — `Log.compress` decodes the `.zst` it just wrote back and compares it
   byte for byte against the raw segment before renaming over it or deleting the raw
-  file (audit finding L2/E13, egw-audit-2026-09-27) — the read-back-and-compare
+  file (audit finding L2/E13, ingest-consumer audit 2026-09-27) — the read-back-and-compare
   `migrate` already ran on its own conversion, now on this one too. A mismatch is
   `error.CompressVerifyFailed` (counted, `Stats.compress_verify_failed`); the raw
   segment and the manifest are untouched, only `COMPRESS.tmp` is deleted.
@@ -172,7 +173,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `OpenMode.read_only`.
 - **2026-09-21** — New module: a segmented, crash-consistent append-only log —
   CRC32C records, sealed closed segments, a manifest as the only record of
-  which segments exist, retention by whole segment. Built in egw-hub, to move
+  which segments exist, retention by whole segment. Built in the ingest daemon, to move
   into zig-libs once the hub has used it. Verified by `kv`'s `SimStorage`
   swept over every side effect in four crash models, plus a second sweep that
   crashes inside the recovering `open`; 16 guards mutation-checked.

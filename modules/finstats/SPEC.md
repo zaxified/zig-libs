@@ -140,7 +140,7 @@ shows at 1e-4 or more):
   `tradeStats`, answers NaN for the whole result (previously `riskMetrics` mixed finite and NaN
   cells, because `@min` and `<` skip a NaN). A return below -1 is not a return: the compounding
   functions AND `riskMetrics` (whole row; it printed a drawdown of -150 % before) answer NaN.
-  This reaches wgs, which feeds `twr_daily` into `risk_metrics`: bad flow data that makes a
+  This reaches the analytics consumer, which feeds `twr_daily` into `risk_metrics`: bad flow data that makes a
   daily TWR drop below -1 now yields a NaN row instead of plausible numbers.
 - Long series keep their accuracy: the compounded level is renormalised (`levelOf`), so 80 000
   periods of -1 % give the right CAGR instead of -1, and a level past the f64 range no longer

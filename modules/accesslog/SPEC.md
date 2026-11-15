@@ -321,7 +321,7 @@ not something this formatter can detect).
 - **No-panic sweep 2026-10-29:** request fields, `LogFormat.parse`, writers and `Sink` clean; fixed `Logger.run` latency `end - start` overflowing i64 for a clock spanning minInt..maxInt (AL-1). Left: `extraRenderable` deduplicates `Entry.extra` in O(n²) under the sink lock — `Logger` caps extras at 8 and no request input sets the count; a consumer passing thousands of request-derived extras directly would pay quadratic time (candidate: hash-based dedup above a threshold).
 - ~~**logfmt anchoring**~~ — DONE 2026-10-05: go-logfmt reads every line back (Anchoring).
 
-- ~~**`response_bytes` for a streamed body**~~ — DONE 2026-09-28 (from qap M11.5c): `http`'s new
+- ~~**`response_bytes` for a streamed body**~~ — DONE 2026-09-28 (from the web-server consumer M11.5c): `http`'s new
   `ResponseWriter.bodyBytesSent` counts the body octets of a chunked, compressed (after coding)
   or HTTP/1.0 until-close body, without chunk framing (`%b`), on h1 and h2 alike;
   `entryFromRequest` reads it, so a streamed export or a compressed answer logs its size instead

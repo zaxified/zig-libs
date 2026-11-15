@@ -9,7 +9,7 @@
 //! to the ordinary `memset` intrinsic -- doing so would let the optimizer
 //! treat the write as droppable or reorderable, which is exactly what
 //! `volatile` forbids -- so every build, including ReleaseFast, emits a
-//! scalar loop that stores one `T` at a time. Measured (qap perf audit
+//! scalar loop that stores one `T` at a time. Measured (the web-server consumer perf audit
 //! 2026-09-21, finding F1): zeroing 4096 B this way costs 5657
 //! instructions, 2048 B costs 2841. `h2_server.zig`'s per-stream
 //! `body_scratch` zeroing (added in 60a08442) runs on *every* h2 stream,

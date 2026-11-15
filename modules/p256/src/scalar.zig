@@ -18,7 +18,7 @@
 //! opposite until 2026-09-28.** std's `Scalar.invert` is Bernstein–Yang, but
 //! fiat's `divstep` does ONE divstep per call over the full 5-limb vectors,
 //! 741 calls: measured 40.7 µs on the i7-7920HQ, against ~41 µs for the whole
-//! constant-time `k·G` — 45 % of a signature, and 9.7 % of an entire qap TLS
+//! constant-time `k·G` — 45 % of a signature, and 9.7 % of an entire the web-server consumer TLS
 //! handshake in `perf`. `invert` therefore goes through `modinv.zig`'s
 //! 62-bit-batched safegcd (~3 µs), pinned to std's inverse by the
 //! differential below. The gate `fast_invert_implemented` restores std's.

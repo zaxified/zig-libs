@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** audit of the CRYPTOGAMS paths and the run-time dispatch (SPEC § Audit 2026-10-26). The audit found no defect. 25 mutants, all killed, run natively and under `qemu-x86_64 -cpu max` (SHA-NI). New test: `detectCpuPaths` agrees with std's native CPU detection, because a wrong AVX2 or SHA CPUID bit had passed every other test. The audit's source fingerprint now covers `src/asm/*.s`.
 
 - **2026-10-26** — New backends `.cryptogams_shani` (SHA-256/224) and `.cryptogams_avx2` (all): CRYPTOGAMS' SHA-extension and AVX2 block functions (Andy Polyakov's perlasm, the code OpenSSL ships, BSD-style licence: see the new `NOTICE`), embedded as module-level assembly on x86-64 ELF under LLVM and chosen at run time (CPUID SHA + SSSE3, or AVX2 + BMI1 + BMI2 with XGETBV YMM state). A baseline-x86-64 build now takes the fast path. Speed, Kaby Lake (AVX2): 0.40–0.99× OpenSSL 3.5.5 on every row, HMAC 0.52–0.54×, 1.4–1.6× std. The SHA-NI path is verified under `qemu-x86_64 -cpu max` (tests and the 302 000-case OpenSSL oracle); its speed is not measured. Output unchanged. Found on the way: CRYPTOGAMS' SHA-256 AVX2 code ends its loop on a 32-bit pointer compare, so a single call whose remaining input is a multiple of 4 GiB gave a wrong digest. Calls are capped at 2^20 blocks (opt-in regression test `SHA2_BIG=1`). **Consumer-visible:** `Backend` gains two members, so an exhaustive `switch` over it must add them, and `backend()` may return them. New tests: whole-block runs against guard pages, every backend; 40 000 blocks and 2^20 + 3 blocks in one call. Recipe: `tools/gen_cryptogams.sh` (pinned commit and SHA-256s).
@@ -30,4 +31,4 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   std on x86-64 without SHA-NI, a portable scalar path elsewhere, and std's own
   hardware path for SHA-256 where the target has SHA-NI or ARMv8 `sha2`. Anchored to
   the FIPS 180-4 / NIST example vectors, RFC 4231 (HMAC) and RFC 5869 (HKDF), and
-  differentially to std. Requested by qap's performance audit (candidate P3).
+  differentially to std. Requested by the web-server consumer's performance audit (candidate P3).

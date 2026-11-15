@@ -81,13 +81,13 @@ than by these tests alone).
 ## Backlog / deferred
 
 **S2 plan — survey 2026-10-20** (Sonnet, read-only; reference tzcode/glibc; Python zoneinfo, Go time,
-chrono-tz, jiff, cctz, ICU, Hinnant date). Consumers (bxp expr.zig:4836/4906/4978, wgs datemath.zig:43)
-use only `find` + `offsetAt`; ⚠ bxp hand-rolls local→UTC (expr.zig:4943-4945, a wall time read as UTC —
+chrono-tz, jiff, cctz, ICU, Hinnant date). Consumers (the build-tool consumer expr.zig:4836/4906/4978, the analytics consumer datemath.zig:43)
+use only `find` + `offsetAt`; ⚠ the build-tool consumer hand-rolls local→UTC (expr.zig:4943-4945, a wall time read as UTC —
 wrong within ~2 h of a transition) instead of `localToUtc`.
 
 | # | Item | Effort | Decision |
 |---|---|---|---|
-| R1 | `localToUnix(zone, y, m, d, hh, mm, ss, Disambiguation)` parts-based wrapper (promised at 2026-09-30) | S | **DONE 2026-10-20**; bxp moves onto it at repin |
+| R1 | `localToUnix(zone, y, m, d, hh, mm, ss, Disambiguation)` parts-based wrapper (promised at 2026-09-30) | S | **DONE 2026-10-20**; the build-tool consumer moves onto it at repin |
 | R2 | Zone abbreviations (`CET`/`CEST`/`+05`, angle-bracket form) per transition and from the footer | M | **DONE 2026-10-20** — `abbrevAt`; data +27 % source, +24 KB in a stripped ReleaseSmall exe |
 | R3 | Pre-1970 history as an opt-in build option (default keeps today's size; document that `init_off` folds it) | M | **DONE 2026-10-20** — `tz.full.find`/`tz.full.zones` over the generated `tz_data_full.zig` (+78 KB, only in a program that references `full`); one shared abbreviation table, so its zones go through every function. No build option needed |
 | R4 | `nextTransition` / `prevTransition` | S | **DONE 2026-10-20** |
@@ -156,12 +156,12 @@ eras, local→UTC with gaps/folds under each policy, `find`.
 - **Zone abbreviations** *(survey 2026-09-30)*: `Offset.abbr` (`CET`/`CEST`, `+05`). Why: log and report output shows `Europe/Prague` times as `CEST`; zeit's `%Z` and Go's `Zone()` provide it. Needs the generator to emit an abbreviation index per transition plus a string table (size cost to be measured); the footer already carries the names. Effort: medium (generator + data). Fits §2.
 - ~~**Pre-1970 history**~~ — DONE 2026-10-20 as `tz.full` (R3; paid only by a program that references it) *(survey 2026-09-30; decided 2026-09-30)*: *not now*, for size. The
   table folds everything before 1970 into `init_off`, so a pre-1970 instant gets the 1970
-  offset. The trim is deliberate: the tables cost bxp +347 KB in ReleaseSmall (862 → 1209 KB,
+  offset. The trim is deliberate: the tables cost the build-tool consumer +347 KB in ReleaseSmall (862 → 1209 KB,
   +40 %) when they landed there (2026-07-01), and full `zic -b fat` history would add to that
   for every consumer. If a consumer needs history, it comes as a **build option selecting a
   fuller table**, so size-sensitive consumers keep today's default.
 - **Halve the tables: store transition times as `i32` deltas from a per-zone epoch (or a
-  varint)** *(carried over from bxp, 2026-07-01, "try in the future")*: the tables are almost
+  varint)** *(carried over from the build-tool consumer, 2026-07-01, "try in the future")*: the tables are almost
   all `i64` absolute times at 16 B per entry after alignment. Touches `scripts/gen/tz-gen`
   (emit deltas) and `offsetAt` (rebuild the absolute time inside the binary search); a pure
   size win, to be measured against the decode cost. It would also make the history option

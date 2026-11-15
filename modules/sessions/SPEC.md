@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — alexedwards/scs v2.9.0 (with its memstore), the reference, has no cross-request guard: a request that loaded the session before a concurrent request logged it out (`Destroy`) or rotated it (`RenewToken`) re-commits it under the OLD token when it finishes (`LoadAndSave` commits every `Modified` session, `Load` marks every loaded session `Modified` once `IdleTimeout > 0`, `Commit` and `MemStore.Commit` are blind writes), so the logged-out or rotated-away cookie works again — with an idle timeout even after a read-only request (`tools/lead_probe`, 4 of 4 interleavings resurrect; the no-idle read-only control does not); here every save is a generation compare-and-swap and both are refused (tests "cross-request race: a stale save cannot resurrect a session destroyed by a concurrent request", "cross-request race: a logout after the live record was EVICTED still wins over a stale save", "cross-request race: a stale save cannot resurrect a session rotated by a concurrent regenerate") (measured 2026-10-24)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (484/528, 44 eq) · src 4a43c6ec90efc864
+**Audit:** review 2026-11-12 · mutation 2026-11-12 (484/528, 44 eq) · src 494749252606ed4b
 
 Audit detail: the 2026-11-01 review is a delta over `src/root.zig` (the fuzz-driver test migrated from sequential `run` calls to one `driver.runAll`, same harnesses and options), test code only; the library source the mutation run scored is unchanged.
 
@@ -236,7 +236,7 @@ say `writeCookie` staged the value in a **threadlocal** buffer, unsafe under a f
 multiplexes connections on one thread. The code no longer does: `writeCookie` and `Csrf.issue`
 format into a stack local and hand it to `ResponseWriter.addSetCookie`, which copies the value into
 the writer's own header storage (`rw.dupe`) before returning. Nothing outlives the call, so any
-`Io` scheduling model is safe. Verified by reading both call sites before qap (a fiber-per-
+`Io` scheduling model is safe. Verified by reading both call sites before the web-server consumer (a fiber-per-
 connection server) built its `Config.sessions` on them.
 
 ## Verification
@@ -399,7 +399,7 @@ bump (the stale `persist` would succeed); `hash_id_in_store…RamcacheStore` if 
   concurrent data writes.
 - **Automatic CSRF body form-field extraction** — deliberately not done in the middleware (see
   design notes); callers use `Csrf.verify` directly.
-- ~~**Public `Csrf.presented(req)`**~~ — **DONE 2026-09-28** (requested by qap M11.4). The
+- ~~**Public `Csrf.presented(req)`**~~ — **DONE 2026-09-28** (requested by the web-server consumer M11.4). The
   header-then-query token extraction that used to be the private `presentedToken` is now
   `pub fn presented(c: *const Csrf, req) ?[]const u8` — same extraction order (header, then the
   query-param fallback), so a caller driving the core `Csrf` API without `router`'s `middleware`

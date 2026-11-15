@@ -37,7 +37,7 @@ Surveyed 2026-09-30, re-surveyed for S2 on 2026-11-04 per `SURVEY-PLAYBOOK.md` a
 - **pax 'g' global headers**: rejected, skipped (Go does not apply them [V]; no consumer).
 - **uname/gname**: done (fix round 2026-11-04), `Entry.uname`/`gname` on read (ustar fields or a pax record up to 255 bytes, stored in the Reader, no allocation) and write (`.gnu`: up to 32 bytes else `FieldOutOfRange`; `.pax`: a pax record beyond). **Arbitrary pax records** (xattrs, ACLs): rejected, parsed past: surfacing them needs an unbounded allocation per entry, which the Reader avoids by design (bounded memory).
 - **Reading .tar.gz / .tar.zst / .tar.xz**: owned by siblings (`zstd`, `lzma`, `bzip2`, `brotli` modules and `std.compress.flate`): `Reader` takes any `*std.Io.Reader`. Verified present with `ls modules`.
-- **Hostile input**: sparse map, pax and GNU long records bounded (`max_sparse_segments`, `max_sparse_size`, `max_pax_len`, `max_name_len`); 32-bit targets (axp's mips / arm) checked under qemu, which found and fixed a size-overflow panic in the skip path.
+- **Hostile input**: sparse map, pax and GNU long records bounded (`max_sparse_segments`, `max_sparse_size`, `max_pax_len`, `max_name_len`); 32-bit targets (the router-tool consumer's mips / arm) checked under qemu, which found and fixed a size-overflow panic in the skip path.
 
 **Where we are ahead:** over `std.tar`: uid/gid/uname/gname/mtime preserved both ways, sparse expansion, hard links, GNU 'L'/'K' writing, streaming gzip packer, `packDir` with real `statx` attributes, `Entry.dupe`, offline GNU tar 1.35 golden archives, extraction checks · **Where we are behind:** no sparse writing; no xattrs or arbitrary pax records; no extractor.
 
@@ -192,7 +192,7 @@ and the 8 GiB octal/base-256/pax-`size` boundary.
 
 ## Build options
 
-Consumer build options (CONVENTIONS §4.2), added 2026-11-04 because axp-vault copies `Entry.size` bytes
+Consumer build options (CONVENTIONS §4.2), added 2026-11-04 because the router-tool consumer's backup vault copies `Entry.size` bytes
 of a member to disk and a sparse header of a few hundred bytes can declare a large one:
 
 | option | values | default | `-Dprofile=small` |
@@ -224,7 +224,7 @@ Beyond the documented out-of-scope list (pax 'g' and records beyond
 `path`/`linkpath`/`size`/`uid`/`gid`/`mtime`/`GNU.sparse.*`, sparse writing, per-file compression, encryption/signing, special files).
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 6 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- (sweep GW 2026-10-31, fix round) **`packDir` limits left as documented**: a file that shrinks, is replaced or fails to read while packed is now zero-padded to its header size and counted in `skipped` (GNU tar behaviour); a refused DIRECTORY (uid/gid/mtime out of ustar range) is counted once in `skipped` whatever its subtree holds, and one whose `openDir` fails keeps its header and is not counted (open fds: one per stack frame, RLIMIT_NOFILE); the walk neither stays on one device nor avoids pseudo filesystems (`/proc/kcore`, bind-mount loops can make the tree effectively infinite) -- a `same_device` / `max_entries` / `max_bytes` option is the fix; stored names are the given paths (a root `../x` yields an escaping archive). The module has no extractor: path-escape checks belong to whoever extracts (axp-core only packs; axp-vault ingest only re-hashes content).
+- (sweep GW 2026-10-31, fix round) **`packDir` limits left as documented**: a file that shrinks, is replaced or fails to read while packed is now zero-padded to its header size and counted in `skipped` (GNU tar behaviour); a refused DIRECTORY (uid/gid/mtime out of ustar range) is counted once in `skipped` whatever its subtree holds, and one whose `openDir` fails keeps its header and is not counted (open fds: one per stack frame, RLIMIT_NOFILE); the walk neither stays on one device nor avoids pseudo filesystems (`/proc/kcore`, bind-mount loops can make the tree effectively infinite) -- a `same_device` / `max_entries` / `max_bytes` option is the fix; stored names are the given paths (a root `../x` yields an escaping archive). The module has no extractor: path-escape checks belong to whoever extracts (the router-tool consumer's core only packs; the router-tool consumer's backup vault ingest only re-hashes content).
 
 ## Status
 `extract · any (packDir: linux) · both (reader+writer) · reentrant` + deps: none (std only —

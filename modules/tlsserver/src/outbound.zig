@@ -52,7 +52,7 @@ pub const Outbound = struct {
     /// `slot`, within [`min_fragment`, 2^14].
     max_fragment: u16 = record.max_plaintext_len,
     /// Every octet past it is untouched since `init` or the last `wipe`:
-    /// `wipe` zeroes `buf[0..dirty]`, not the whole buffer (qap's is
+    /// `wipe` zeroes `buf[0..dirty]`, not the whole buffer (the web-server consumer's is
     /// 48 KiB; a connection's flight is a few KiB).
     dirty: usize = 0,
     /// QUIC (RFC 9001 §4): no records. Handshake messages are kept as they

@@ -11,7 +11,7 @@ into GHASH, where std makes two passes. 1.6–1.8× std on 16 KiB records, 2.0�
 480-byte ones, ~3× on 64-byte ones; on par with OpenSSL's AES-NI code on the
 development machine (table below).
 
-- **Status:** gap — std's AES-GCM is two-pass and stateless; in qap's TLS
+- **Status:** gap — std's AES-GCM is two-pass and stateless; in the web-server consumer's TLS
   server it was ~35 % of all CPU on 32 KiB responses (CTR 20–22 %, GHASH
   13–14 %), and ~5 % on 480-byte ones, much of that per-record setup.
 - **Model after:** OpenSSL/BoringSSL `aesni-gcm` (the stitched loop), the

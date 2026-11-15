@@ -7,7 +7,7 @@
 //!
 //! Both `Protection.seal` and `Protection.open` work IN PLACE over one
 //! buffer: the content sits at `buf[header_len..]`, the header in front of
-//! it, the tag after it. That is the layout qap's zero-copy record codecs
+//! it, the tag after it. That is the layout the web-server consumer's zero-copy record codecs
 //! write and read (`docs: reuse-map §1`), and it means a record never needs
 //! a second buffer.
 //!

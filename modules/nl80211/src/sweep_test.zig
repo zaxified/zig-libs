@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests (wave GX, gx1-a) for nl80211's public parsers.
-//! Findings NL-1 .. NL-6, see ~/CML/20261029-panic-sweep/nl80211-sweep.report.md.
+//! Findings NL-1 .. NL-6, see the 2026-10-29 panic-sweep report for `nl80211`.
 //! Tests that need private engines (`dumpStep`, `nextEventIn`, error maps) sit
 //! at the end of client.zig.
 const std = @import("std");

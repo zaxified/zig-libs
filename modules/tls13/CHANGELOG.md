@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog: the RSA-PSS sign gap is not `rsaz_avx2` (measured: OpenSSL runs its MULX/ADX path here); what remains is mostly the per-call `.csprng` blinding; row re-measured (1.041× → 1.050×, within noise).
 
 - **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** Audit line refreshed after the `EntropyFailure` delta mutation run (2/2 killed by the new test).
@@ -78,7 +79,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   coordinate), `serverExchange`; new `scalarLen(group)` (the private prefix a group uses). The NIST
   arms are one generic body for P-256 and P-384. Anchor: `cryptography` 46.0.5 / OpenSSL 3.5.5
   ECDH, both sides. Burn `kex_p384_burn` 112 KiB (measured 27 / 67 / 40 KiB), probed. For
-  `tlsserver`, whose qap predecessor serves P-384 by default.
+  `tlsserver`, whose the web-server consumer predecessor serves P-384 by default.
 - **2026-10-20** — Fix: `certverify.sign` / `verify` no longer require the transcript hash to
   be as long as the signature scheme's hash (`HashLengthMismatch` is gone). RFC 8446 §4.4.3 signs
   the cipher suite's Transcript-Hash: an `ecdsa_secp256r1_sha256` certificate under

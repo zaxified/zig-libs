@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests (wave GT, findings HQ-1 .. HQ-4), see
-//! ~/CML/20261029-panic-sweep/hqc-sweep.report.md.
+//! the 2026-10-29 panic-sweep report for `hqc`.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;

@@ -6,7 +6,7 @@
 //!
 //! `std.crypto.secureZero` is a `@memset` over a `[]volatile u8`, which
 //! never lowers to `memset`: every build emits a loop of single-byte stores
-//! (~3 B/ns without libc). Wiping qap's 48 KiB output buffer that way on
+//! (~3 B/ns without libc). Wiping the web-server consumer's 48 KiB output buffer that way on
 //! every connection cost ~16 µs of a ~285 µs handshake (2026-10-21).
 //! `zeroize` stores volatile 32-byte vectors over the aligned middle and
 //! volatile bytes over the unaligned head and tail: nothing can be folded

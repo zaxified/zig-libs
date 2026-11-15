@@ -370,7 +370,7 @@ fn autoTextEncoding(body: []const u8, max_line: usize) Encoding {
 /// Shared by every parameter that lands inside a **quoted** header value
 /// (`charset="…"`, `boundary="…"`, `Content-Type: …` itself): a bare `"` lets
 /// the caller's value close the quote early and append parameters the caller
-/// never asked for (F4 — `~/CML/20260901-zig-libs-audit/A1/smtp.md`), on top
+/// never asked for (F4 — the A1 audit report for `smtp`), on top
 /// of the CR/LF/NUL header-injection check every other field already gets.
 fn checkQuotedParam(s: []const u8) RenderError!void {
     for (s) |c| if (c == '\r' or c == '\n' or c == 0 or c == '"') return error.ControlCharacterInHeader;

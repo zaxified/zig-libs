@@ -1460,7 +1460,7 @@ test "readHead refuses a bare-LF line instead of waiting for a CRLF that never c
     // Every line ends in a bare LF, so there is no CRLF terminator anywhere.
     // Before this, `readHead` read straight past all of it looking for one:
     // on a fixed reader that is `ConnectionClosed`, on a live connection it
-    // was no answer until a deadline (qap conformance `http/400-closes`).
+    // was no answer until a deadline (the web-server consumer conformance `http/400-closes`).
     var buf: [256]u8 = undefined;
     var all_lf: Reader = .fixed("GET /q HTTP/1.1\nHost: x\n\nNEXT");
     try testing.expectError(error.MalformedHead, readHead(&all_lf, &buf));

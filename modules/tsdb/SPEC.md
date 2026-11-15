@@ -195,10 +195,10 @@ forever, so it stops instead.
 
 ## 5a. Series listing, multi-series batches, a size budget — DONE 2026-09-28
 
-Requested by ttydesk (2026-09-27), which worked around all three (`src/diskhist.zig`, each marked
+Requested by the terminal-UI consumer (2026-09-27), which worked around all three (`src/diskhist.zig`, each marked
 `zig-libs request: tsdb — …`); the new API lets that workaround be deleted.
 
-**Series listing (`Db.seriesIterator`, `Db.findSeries`).** ttydesk resolved "what series exist"
+**Series listing (`Db.seriesIterator`, `Db.findSeries`).** The terminal-UI consumer resolved "what series exist"
 by walking ids `1, 2, 3, …` via `seriesCanonical` until one was missing — correct only because ids
 happen to be dense today. `seriesIterator` reads the REVERSE index (`tag_series_rev`) directly, in
 id order, decoding each entry's canonical bytes into a `Descriptor` — no assumption about id
@@ -209,7 +209,7 @@ labels)`) sharing the SAME `name` share an identical byte PREFIX (`tag | u16(nam
 regardless of their labels — so a single bounded range scan from that prefix, stopping the instant
 a key stops matching it, visits exactly the series registered under `name` and nothing else. Each
 match is then filtered by `filter: []const Label` — a SUPERSET check (every `filter` label must be
-present with an equal value; extra labels on the series are fine) — covering ttydesk's own
+present with an equal value; extra labels on the series are fine) — covering the terminal-UI consumer's own
 `key`/`field` disambiguation without it decoding every series in the store. Both return a
 `SeriesIterator` (streaming, MVCC-snapshotted like `Range`); each `next()` call fully OWNS its
 `SeriesEntry` (a fresh `canon` copy the descriptor's slices point into) rather than borrowing from
@@ -219,7 +219,7 @@ call — unlike `Range.next()`'s `Sample`, which carries no slices and has no su
 **Multi-series batches (`Db.appendBatch`).** `appendMany` commits once per series; flushing N
 series is N kvtree transactions, each with kvtree's own two-`fsync` COW commit protocol
 (`kvtree/src/core.zig`'s `commit`: one `fsync` for the written pages, one for the meta-page swap
-that is the linearization point) — so N series cost 2N fsyncs, not N as ttydesk's own comment
+that is the linearization point) — so N series cost 2N fsyncs, not N as the terminal-UI consumer's own comment
 assumed. `appendBatch([]const struct{ series, points })` wraps every series' points in ONE
 transaction: a CONSTANT number of fsyncs (kvtree's fixed per-commit cost) regardless of how many
 series are in the batch, and — the atomicity property that actually matters — a crash or an error
@@ -315,8 +315,8 @@ model check, extended with budget sweeps and overwrites of existing timestamps, 
 budget must stop exactly between the two entries) — measured, so stated.
 
 **Measured** (2026-10-04, a one-off program over copies of the consumers' stores, not kept in
-the repo — the stores are the users' data): ttydesk 16 series / 3080 samples,
-25.0 → 2.72 bytes per sample of live data (9.2×, block keys included); wgs 23 series / 69
+the repo — the stores are the users' data): the terminal-UI consumer: 16 series / 3080 samples,
+25.0 → 2.72 bytes per sample of live data (9.2×, block keys included); the analytics consumer: 23 series / 69
 samples, 25.0 → 20.1 (a block per series with ~3 samples: the key dominates). A 1000-sample 15 s
 gauge encodes to 458 bytes in one block (`chunk.zig` size test). Old stores need no migration —
 their samples are raw until `compact` runs.
@@ -449,7 +449,7 @@ section is its citation.
 
 ~~**Series listing, multi-series batches, a size budget**~~ — **DONE 2026-09-28**, see §5a above.
 Precedent this design followed: Prometheus TSDB label matchers and
-`--storage.tsdb.retention.size`, VictoriaMetrics/InfluxDB multi-series writes; the wgs lesson
+`--storage.tsdb.retention.size`, VictoriaMetrics/InfluxDB multi-series writes; the analytics consumer lesson
 (13 GB in an afternoon) is why the size budget exists at all.
 
 Named as scope decisions, not omissions.
@@ -482,7 +482,7 @@ Named as scope decisions, not omissions.
 
 **S2 plan — survey 2026-10-20** (Sonnet, read-only; reference Prometheus tsdb v3.15.0, Apache-2.0; also
 VictoriaMetrics, InfluxDB 3, QuestDB, TimescaleDB (Apache part only), nakabonne/tstorage). Key finding:
-`compact` (9.2× on ttydesk data) is called by NEITHER consumer — both run on raw 25 B/sample keys; wgs
+`compact` (9.2× on the terminal-UI consumer data) is called by NEITHER consumer — both run on raw 25 B/sample keys; the analytics consumer
 also bypasses `appendBatch` with raw `codec` calls (history.zig:185-215).
 
 | # | Item | Effort | Decision |
@@ -497,7 +497,7 @@ also bypasses `appendBatch` with raw `codec` calls (history.zig:185-215).
 | R11 | Consistent snapshot copy while writing | S-M | belongs to kvtree; document |
 | R13 | `deleteRange(series, from, to)` | S | **DONE 2026-10-20** — one transaction, crash-swept |
 | R14 | Coalesce small compacted blocks (sparse series: 25 → 20 B/sample only) | M | later (internal space optimisation, no API) |
-| R16 | `seriesIds` — register many series in one transaction (bench W1: 1000 commits → 1; wgs bypasses `appendBatch` with raw `codec` calls for this) | S | **DONE 2026-10-20** |
+| R16 | `seriesIds` — register many series in one transaction (bench W1: 1000 commits → 1; the analytics consumer bypasses `appendBatch` with raw `codec` calls for this) | S | **DONE 2026-10-20** |
 | — | WAL replay, exemplars, native histograms, PromQL, per-series retention, mmap | – | not doing (reasons in the survey; mmap is kvtree's) |
 
 Ahead: reader-during-writer via MVCC, crash sweeps at every storage side effect, out-of-order/overwrite
@@ -510,11 +510,11 @@ query, matcher select, compaction size; equality by an FNV hash of (labels, ts, 
 - ~~**Series deletion**~~ — **done 2026-10-04** (`Db.deleteSeries`).
 - **Label matchers beyond exact/superset** *(survey 2026-09-30)*: `findSeries` (§5a) covers "name +
   these labels"; Prometheus users also expect `!=`, regex and a cross-metric-name lookup. Effort
-  M (the inverted-index partition §9 already sketches). Fits §2. No consumer asks yet (ttydesk
-  and wgs look series up by exact labels).
+  M (the inverted-index partition §9 already sketches). Fits §2. No consumer asks yet (the terminal-UI consumer
+  and the analytics consumer look series up by exact labels).
 - **Downsampling / rollups, per-series retention** — §9; no consumer asks.
 - **A resume record for `sweepToBudget`** — §5a; would make an interrupted budget sweep linear.
-- ~~**`range` pays for blocks a store never had**~~ ✅ DONE 2026-10-17 *(ttydesk repin A/B)*: measured 25.3 → 34.6 ms task-clock (1.37×) on a never-compacted `history.kvt` because every `range` seeked a second cursor into the block keyspace. The proposed fix — a flag found once at `init` — was rejected: a second `Db` over the same tree compacting would leave it stale and `range` would silently skip blocks. Done instead: `Db.no_blocks_at` remembers the kvtree version (`Snapshot.txn_id`) at which the store held no block, so a `range` at that same version opens no block cursor; any commit re-checks (one seek per version), and once blocks are seen (`blocks_seen`) `range` behaves as before. Test: a second `Db` compacting is seen at once (a version-blind mutant fails it).
+- ~~**`range` pays for blocks a store never had**~~ ✅ DONE 2026-10-17 *(the terminal-UI consumer repin A/B)*: measured 25.3 → 34.6 ms task-clock (1.37×) on a never-compacted `history.kvt` because every `range` seeked a second cursor into the block keyspace. The proposed fix — a flag found once at `init` — was rejected: a second `Db` over the same tree compacting would leave it stale and `range` would silently skip blocks. Done instead: `Db.no_blocks_at` remembers the kvtree version (`Snapshot.txn_id`) at which the store held no block, so a `range` at that same version opens no block cursor; any commit re-checks (one seek per version), and once blocks are seen (`blocks_seen`) `range` behaves as before. Test: a second `Db` compacting is seen at once (a version-blind mutant fails it).
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
 

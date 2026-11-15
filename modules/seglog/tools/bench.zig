@@ -28,7 +28,7 @@
 //!     zig build bench-seglog -- realz <dir> <payload file> <level> [frame bytes]
 //!
 //! `realz`: real records — a file of `u32 length ++ payload`, each payload
-//! starting with its i64 timestamp (egw-hub's raw records) — appended, the
+//! starting with its i64 timestamp (the ingest daemon's raw records) — appended, the
 //! segment closed and compressed; prints two lines: `compress` (its time,
 //! compressed bytes per record) and `zread` (a full scan of the compressed
 //! segment).
@@ -306,11 +306,11 @@ fn runRealz(gpa: std.mem.Allocator, io: std.Io, path: []const u8, file: []const 
     try w.flush();
 }
 
-/// A meter reading as text, `buf.len` bytes: what egw-hub's records look
+/// A meter reading as text, `buf.len` bytes: what the ingest daemon's records look
 /// like to a compressor — repeated field names, slowly moving numbers.
 fn meterText(buf: []u8, i: u64, rnd: std.Random) void {
     var w: std.Io.Writer = .fixed(buf);
-    w.print("{{\"dev\":\"egw-{x:0>4}\",\"ts\":{d},\"p\":{d}.{d:0>3},\"e\":{d}", .{
+    w.print("{{\"dev\":\"hub-{x:0>4}\",\"ts\":{d},\"p\":{d}.{d:0>3},\"e\":{d}", .{
         i % 37, 1_790_000_000 + i / 37, rnd.intRangeAtMost(u32, 0, 4000), rnd.intRangeAtMost(u32, 0, 999), 1_000_000 + i / 3,
     }) catch {};
     var k: u32 = 0;

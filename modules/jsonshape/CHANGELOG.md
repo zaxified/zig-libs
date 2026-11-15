@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-10** — **CHANGED**: a column declared as dataframe's new fixed-size `.array` is refused with `error.UnsupportedColumnType`, as `.list` and `.struct` are (the conversion switch would otherwise reach `unreachable`).
 - **2026-11-10** — **ADDED**: a `.binary` column (dataframe's new Binary) reads a JSON string as base64, the form dataframe's writers emit (`dataframe.parseBinary`); anything else null.
 - **2026-11-10** — **ADDED**: a `.time` column (dataframe's new time of day) reads `"HH:MM:SS"` text or microseconds since midnight by `Value.cast(.time)`, as `.timestamp`/`.duration` read theirs; outside one day null.
@@ -40,7 +41,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     where `x` is missing (it used to fail every comparison), and a cross-type `!=`
     (`@.n != "a"` on a number) holds; `[?…]` now also filters an object's member values; an index
     or number literal with a leading zero, a sign other than `-`, or beyond ±(2^53 − 1) is not
-    well-formed (selects nothing). No wgs config uses a filter (checked).
+    well-formed (selects nothing). No analytics consumer config uses a filter (checked).
   - Mutation 2026-10-04: 42 mutants, 39 killed, 2 equivalent (reasoned in SPEC), 1 removed with
     the dead guard it pointed at; 2 tests added.
 

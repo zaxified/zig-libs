@@ -733,7 +733,7 @@ new memory ordering.)*
   bounded per-node reclamation latency (see §2). Would slot in beside `ebr.zig`
   behind the same `Retired` callback shape.
 *(Removed 2026-10-06: "Bounded ring MPMC" — implemented as `BoundedQueue`, §4b,
-with the drop-on-full push, in-place fill and single-consumer fast path that qap's
+with the drop-on-full push, in-place fill and single-consumer fast path that the web-server consumer's
 own copy (`src/bounded_ring.zig`, marked `zig-libs request: lockfree`) asked for.)*
 - **Linearizability history check** — the current oracle is multiset-equality
   against a coarse-locked queue (sound for the "no lost/dup/corrupt" properties).

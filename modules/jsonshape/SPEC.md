@@ -122,7 +122,7 @@ Every gap, with its verdict:
   hostile pattern over a hostile subject has no backtracking to exploit. Cost: it adds 347,296
   bytes to a stripped ReleaseFast program whose only use of this module is `shape` (349,256 →
   696,552; ReleaseSafe 463,592 → 780,520), mostly Unicode tables and the engine, whether or not a
-  path uses them (a size probe of wgs's one call, measured 2026-11-02; wgs itself not rebuilt).
+  path uses them (a size probe of the analytics consumer's one call, measured 2026-11-02; the analytics consumer itself not rebuilt).
 - **Column keys as paths (2026-10-04).** `JsonCol.key` / `x` / `y` containing `.` or `[`: the item's
   own field of exactly that name first (v1 behaviour, so a key like `"a.b"` naming a real field is
   unchanged), else the key parsed once as a path and evaluated from the item (`$…` from the root),
@@ -153,7 +153,7 @@ Every gap, with its verdict:
   so a 1 MB key under many children ends in `WorkLimit` at `max_work` bytes at most, plus one path.
   `query`'s default `max_work` is a fixed 2^28: a tree does not say how long its text was.
 - **Refusals a consumer can see.** A document deeper than 64 levels under a descent or a long path is
-  `error.DepthLimit`, where before 2026-10-31 the deeper matches silently went missing; wgs's http connector
+  `error.DepthLimit`, where before 2026-10-31 the deeper matches silently went missing; the analytics consumer's http connector
   returns it as its own error (`src/source.zig`: `jsonshape.Error` is in its error set). A `count()` over a query selecting more than `max_matches` is
   `error.TooManyMatches` rather than a number. Both stay refusals, on purpose.
 - **Missing path → empty frame, not an error.** If the path doesn't resolve to any array/item
@@ -241,7 +241,7 @@ Run: `zig build test-jsonshape`.
   `match()`/`search()` and the compliance suite **done 2026-11-02**.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- (sweep GW 2026-10-31, fix round) **std.json amplification, not ours to fix**: `std.json.Value` costs ~28-30x the input bytes (`[{},{},...]`: 40 B per 3-byte element, plus arena growth that is never freed); `max_depth` caps nesting only, the feed's byte cap is the caller's (wgs: 16 MiB, i.e. up to ~0.5-1 GB per call). A node-count cap in `checkDepth`'s pre-scan would bound it. std.json hashes object keys with a fixed-seed Wyhash, so a feed of colliding keys can make the parse quadratic before any limit of ours runs. Non-finite floats can enter a `.float` column from a JSON string (`"nan"`, `"inf"`) or an overflowing literal (`1e999`); `dataframe` orders and serializes them (null in JSON). The legacy dot-path ignores `max_matches` (unchanged); its rows and cells are bounded by the work budget instead. The path-depth cap (64) now fails with `error.DepthLimit` instead of silently dropping deeper matches.
+- (sweep GW 2026-10-31, fix round) **std.json amplification, not ours to fix**: `std.json.Value` costs ~28-30x the input bytes (`[{},{},...]`: 40 B per 3-byte element, plus arena growth that is never freed); `max_depth` caps nesting only, the feed's byte cap is the caller's (the analytics consumer: 16 MiB, i.e. up to ~0.5-1 GB per call). A node-count cap in `checkDepth`'s pre-scan would bound it. std.json hashes object keys with a fixed-seed Wyhash, so a feed of colliding keys can make the parse quadratic before any limit of ours runs. Non-finite floats can enter a `.float` column from a JSON string (`"nan"`, `"inf"`) or an overflowing literal (`1e999`); `dataframe` orders and serializes them (null in JSON). The legacy dot-path ignores `max_matches` (unchanged); its rows and cells are bounded by the work budget instead. The path-depth cap (64) now fails with `error.DepthLimit` instead of silently dropping deeper matches.
 
 ## Status
 

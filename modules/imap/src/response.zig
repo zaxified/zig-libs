@@ -686,7 +686,7 @@ test "FETCH, SEARCH and ESEARCH now come back parsed, not as raw text" {
 
 test "F10: ESEARCH without a correlator, which the ABNF allows, is not rejected" {
     // Pre-fix, all three of these were `error.UnexpectedByte`
-    // (`~/CML/20260901-zig-libs-audit/A1/imap.md` F10): `parseESearch` was
+    // (the A1 audit report for `imap` F10): `parseESearch` was
     // called after the caller had already consumed the one leading SP, so
     // the "no correlator" branch's own SP check ran one SP short and
     // mistook "COUNT 5" for "nothing follows here".

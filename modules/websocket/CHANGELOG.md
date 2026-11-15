@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-07** — **API change (no consumer-reachable panic):** the four caller-contract checked panics are errors. `conn.Conn.init` returns `conn.InitError!Conn` (`error.MissingMaskRandom`: a client without `opts.mask_random`; `error.BufferTooSmall`: `opts.deflate.compressed_buf` not longer than `deflate.inflate_tail.len`) — call it with `try`. `Conn.writeMessage` returns the new `conn.WriteMessageError` (`WriteError || error{InvalidOpcode}`) for a control or continuation opcode, writing nothing; `conn.WriteError` / `frame.WriteError` are unchanged. `connection.Connection.enableDeflate` returns `error{BufferTooSmall}!void` (deflate stays off). `deflate.inflate` returns `error.BufferTooSmall` (new in `InflateError`) for a `buf` without `len + inflate_tail.len` bytes; `Connection.Error` is unchanged (the case cannot arise inside `Connection`). Callers in this module updated; no other module calls these.
 - **2026-11-07** — **FIX (mutation run F1, LOW):** `Connection.receive` of a partial text continuation no longer overflows (integer-overflow panic in safe builds) once `fragment_count` has saturated at `maxInt(u32)` — reachable with `max_fragments = maxInt(u32)` after 2^32 − 1 frames of one message; `checkPartialText` now adds with `+|` like every other counter use. Test.
 - **2026-11-07** — **Tests:** whole-module mutation run (425 mutant schemata over `frame`, `connection`, `conn`, `deflate`, `handshake`, one ReleaseSafe binary): 400 killed, 23 equivalent, 2 unobservable (`ZeroPadded.stream`, which std's raw `flate.Decompress` never calls). 20 new tests in `audit_test.zig` for the survivors: `pongFor`'s opcode, `encodeCloseBody`'s short out, a compressed message's first frame counted toward `max_fragments`, a first fragment / partial text frame exactly the size of `message_buf`, a compressed text message cut mid-code-point, the automatic pong and close echo flushed, `peer_close`'s reason outliving the reader's buffer, `min_size - 1` sent uncompressed, `close`'s `ReasonTooLong`, the extension grammar (no space after a comma, a malformed first element, quoted-string edge cases, window-bit values), `inflate` refusing padding consumption and padding with zeros, `compressMessage`'s no-room case and closing byte after a stored block, a request without `Sec-WebSocket-Version`, `respond` naming permessage-deflate, `generateKey`'s randomness, `writeRequest` without protocols. No production change.
@@ -75,7 +76,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   browsers compare exactly). Now such a peer gets no subprotocol negotiated; and `verifyResponse`
   fails the handshake (`error.UnexpectedSubprotocol`) on a differently-cased answer instead of
   accepting it. Also tests from a mutation schemata run (69 mutants, 68 killed, 1 equivalent).
-- **2026-09-28** — **BEHAVIOURAL, not breaking** (found by qap's Autobahn lane): invalid UTF-8 is
+- **2026-09-28** — **BEHAVIOURAL, not breaking** (found by the web-server consumer's Autobahn lane): invalid UTF-8 is
   now refused **within one frame** that has not fully arrived. When `Connection.receive` returns
   `.need_more` for an incomplete text frame (or a continuation of a text message), the payload
   bytes that did arrive have been validated; an invalid one is `error.InvalidUtf8` (close 1007) at
@@ -86,7 +87,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   earlier. New public `frame.parseHeader` / `frame.Header` / `frame.HeaderResult` (the header
   half of `parseFrame`, payload untouched).
 
-- **2026-09-28** — **BEHAVIOURAL, not breaking** (found by qap's Autobahn lane, 2026-09-26):
+- **2026-09-28** — **BEHAVIOURAL, not breaking** (found by the web-server consumer's Autobahn lane, 2026-09-26):
   `Connection.receive` now validates a text message's UTF-8 (§5.6) incrementally, per fragment, via
   the new `IncrementalUtf8` (`connection.zig`) — invalid UTF-8 in an early fragment is now refused
   (`error.InvalidUtf8`, close 1007) at that fragment, not only once the whole message has been
@@ -108,7 +109,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   mid-code-point was already caught at `FIN` by the old whole-message check and still is; that case
   is unchanged. See SPEC.md's "Connection" paragraph for the design and equivalence argument.
 
-- **2026-09-28** — **BEHAVIOURAL, not breaking** (requested by qap security review M6.2,
+- **2026-09-28** — **BEHAVIOURAL, not breaking** (requested by the web-server consumer security review M6.2,
   2026-09-24): `acceptHandshake` now checks the request's `Origin` header.
   `ServerAcceptOptions` gains `origins: []const []const u8 = &.{}` (new field with a default, so
   every existing call site — including `bacnet`'s `sc_ws.serverAccept`, which never sends an

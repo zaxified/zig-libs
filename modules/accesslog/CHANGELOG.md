@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: Sink drop-and-count overflow mode; public logfmt value writer (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Second whole-module mutation run (operator-generated schemata over the production code of `root.zig`, `logformat.zig`, `middleware.zig`, `sink.zig`, `timefmt.zig`, `filewriter.zig`; tests only): six new tests pin what the run left alive: `end:` formats with no latency add nothing (not even one nanosecond before a second boundary), one-letter strftime tokens (`%u`, `%p`) directly after another token, the `%C` century divisor (1999 and 2100), `RotatingFile` holding one descriptor with `max_backups = 0` and two with a positive one, a record over `max_size` rotating a file that holds a single byte on both write paths, a `Sink` line of exactly `direct_line_max` bytes written whole (one write, not streamed), and `RotatingFile` slices before a huge splat saturating the byte count.
 
@@ -63,7 +64,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-09-28** — `response_bytes` is now known for streamed responses (chunked, compressed,
   HTTP/1.0 until-close), from `http`'s `ResponseWriter.bodyBytesSent`; they logged `-` before.
-  Wanted by qap M11.5c.
+  Wanted by the web-server consumer M11.5c.
 
 - **2026-09-25** — **New `Entry.user`: the authenticated caller.** Combined writes it as `%u`
   (was always `-`); JSON Lines and logfmt gain a `user` key. `%u` is unquoted, so a space, `"`,

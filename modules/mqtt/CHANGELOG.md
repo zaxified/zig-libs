@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GM sweep (56 mutants over the sweep diff, ReleaseSafe schemata, one at a time): 46 killed (20 by new tests in `src/sweep_session_test.zig`: TcpServer full-buffer drop, write deadline disarmed after a write, keep-alive on complete packets, trie node budget edges, one Subscription Identifier per owner, clock saturation at the i64 ends), 10 decided (equivalent, unreachable guard, or performance-only below a ratio test's resolution). The keep-alive test's kill is argued, not rerun. Not a whole-module mutation score.
 - **2026-10-29** — **CONSUMER-VISIBLE (new defaults, safe by default):** `TcpServer.write_timeout_ms` (default 10 000; 0 = off): a subscriber that stops reading is disconnected once one write has been pending that long — before, it blocked every publisher whose messages matched it, indefinitely with keep-alive 0. `Config.max_subscription_nodes` (default 1 << 20): a SUBSCRIBE whose filter would exceed the topic-trie node budget gets SUBACK 0x97 (5.0) / 0x80 (3.1.1); existing subscriptions keep working (a 128-level filter costs ~128 nodes, the old memory doc missed this). The per-connection watchdog (connect timeout, keep-alive, write deadline) runs on the monotonic clock. **Behaviour change:** a Subscription Identifier of a subscription skipped for No Local is no longer carried on the client's copy (MQTT 5 §3.3.4). **Fixes (no-panic sweep + blind review, § GM):** `fanout` owner collapse and Subscription Identifier gather were O(owners × matches) under the broker lock — now one pass; `process` / `Client.poll` compacted the receive buffer after every packet (quadratic); `TcpServer` dropped a pipelining client whose partial packet plus one read exceeded the receive buffer; the bridge wedged on a remote burst larger than the local receive buffer; bridge empty Response Topic, bridge and client clock overflows, broker i64 clock arithmetic saturates; accept loop backs off on persistent errors (EMFILE); expired retained messages swept in one pass. Aggregate memory bounds documented as formulas on `Config`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
@@ -18,7 +19,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-10-18** — Ported to Zig 0.17.0. Non-mechanical: `Properties.isEmpty`, a packet test and `tools/bench.zig` reflect with `field_names`/`field_types`/`field_values`; the session fuzz `reach` loop gives every seed its own `SafeAllocator` (0.17 `testing.allocator` never reuses memory; same as testkit's driver).
 - **2026-10-18** — Constant time: the `$7$` verifier decode (`acl.parseHash`) and `formatHash` use `b64ct` instead of `std.base64` (new dep `b64ct`; same accepted/rejected inputs, new malformed salt/hash test).
 - **2026-10-18** — Backlog: the ACL verifier decode is std base64 (low; pre-tag constant-time sweep).
-- **2026-10-17** — **BREAKING:** `Broker.qos1Drops()` removed — it has counted nothing since the clean-session window queue (same day); use `queueDrops()`, which counts every QoS 1/2 delivery dropped for want of queue room, persistent or clean session. **Fix:** a clean-session delivery lost because its queue could not be allocated now counts in `$SYS/broker/publish/messages/dropped` too (it bumped `queueDrops` only); both counters move through one function. Docs of `queueDrops`, `Stats.publish_dropped`, `publishSys` corrected. Found verifying energomonitor's repin note.
+- **2026-10-17** — **BREAKING:** `Broker.qos1Drops()` removed — it has counted nothing since the clean-session window queue (same day); use `queueDrops()`, which counts every QoS 1/2 delivery dropped for want of queue room, persistent or clean session. **Fix:** a clean-session delivery lost because its queue could not be allocated now counts in `$SYS/broker/publish/messages/dropped` too (it bumped `queueDrops` only); both counters move through one function. Docs of `queueDrops`, `Stats.publish_dropped`, `publishSys` corrected. Found verifying the energy-monitoring consumer's repin note.
 - **2026-10-17** — Review fixes, client side (independent review): the bridge queues QoS 1/2 when the remote window is full instead of dropping; a quota error during the CONNACK-time resubscribe / notification no longer tears the link down (`SubscriptionSet.resubscribeFrom` with a cursor); QoS 2 receive ids cleared on Session Present = 0; `bridge.Config.connack_timeout_ms` and `session_expiry_s`; the Response Topic gets the prefix rewrite (dropped outside the rules); outbox entries that break the new connection's limits (RETAIN without Retain Available, a Topic Alias above the new maximum, a protocol version change) are dropped and counted; `acl` deny patterns fail closed on an unusable `%u`/`%c`, an unknown user costs the table's highest PBKDF2 iteration count (a table mixing counts still leaks which count a user has — `mosquitto_passwd` writes 1000 for all).
 - **2026-10-17** — Review fixes (independent review of the S2 broker work): **FIX** a double free of the saved CONNECT when the transport failed mid extended-auth or the second CONNECT pass failed (found by review, reproduced by the `mqtt-broker-session` fuzz harness with a failing transport); `ExtAuthResult.success_as { principal, data }` — the identity used for session ownership and ACL (a token hook must return one); a retained Will with `retain_available = false` refused 0x9A; client PUBLISH and Wills under `$SYS/` refused (0x87 / dropped); restored queued messages sanitised; the saved CONNECT wiped before it is freed; AUTH without a method is a protocol error; the delivery ACL re-checked when a resumed session's queue is pumped. SPEC "S2 parity" section.
 - **2026-10-17** — Bridge: a bounded FIFO queue while the remote link is down (`Buffers.queue`/`queue_entries`, oldest dropped and counted, QoS 0 only with `queue_qos0`), 5.0 properties forwarded both ways over a 5.0 remote, `error.LoopProneRule` for a `both` rule over 3.1.1 with equal prefixes. Broker: a shared-subscription member the delivery ACL denies is skipped for the next one (PUBACK 0x10 counts only real deliveries); an empty client id is assigned once across the extended-auth passes. Tests: fuzz harnesses `mqtt-acl-parse` and `mqtt-broker-session` (random 5.0 packet streams with extended auth, ACL, limits and a slow subscriber); ctgrind target `pwverify` (`acl.Passwords.verify`, 0 in-file contexts).
@@ -167,7 +168,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   thread a spinning waiter starved a writer suspended in its socket forever, and `remove`
   spun the same way waiting for fan-out references. `Transport` gained `io: ?std.Io = null`
   (set by `TcpServer`'s socket transport); with it, `tx_lock` is an `std.Io.Mutex` and `remove`
-  waits through the `Io`. Transports without an `Io` (egw-hub's, the offline tests) behave as
+  waits through the `Io`. Transports without an `Io` (the ingest daemon's, the offline tests) behave as
   before. Found by the spinlock audit that followed the simio kv pilot.
 - **2026-10-01** — `TcpServer` runs on `std.Io` alone: the per-connection
   read loop no longer polls the raw socket (`std.posix.poll`) or reads the
@@ -183,13 +184,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-29** — Broker: `Config.tap_wills` (off by default) hands a Will to the publish tap
   (`onPublishFn`) when an ungraceful end publishes it, so a recorder or bridge built on the tap
   no longer loses Wills; the verdict is honoured (`.consume`/`.refuse` keep it from subscribers
-  and the retained store). Requested by egw-proxy.
+  and the retained store). Requested by the MQTT-proxy consumer.
 
 - **2026-09-29** — `Broker.rxRoom(conn)` and `Client.rxRoom()`: how many bytes `feed` takes now
   (the receive buffer's room after compaction), so a reader in fixed chunks feeds what fits,
-  processes, and feeds the rest instead of hitting `RxBufferFull` (requested by egw-hub).
+  processes, and feeds the rest instead of hitting `RxBufferFull` (requested by the ingest daemon).
 
-- **2026-09-28** — Broker, egw audit S1 fixes. **The Will is ACL-checked**: `authorizeFn` sees
+- **2026-09-28** — Broker, ingest-consumer audit S1 fixes. **The Will is ACL-checked**: `authorizeFn` sees
   the Will topic as a publish at CONNECT, and a denial refuses the CONNECT (`not_authorized`);
   `AuthRequest.will` (new `WillInfo`) carries it to authentication. **Retained store bounded in
   bytes**: `Config.max_retained_store_bytes` (64 MiB default), `retainedRefusals()`,
@@ -204,7 +205,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   offline (null while online), on the caller's clock, i.e. what `expireSessions` measures from.
   Handed back as `restoreSession`'s last argument (renamed from `now`, same meaning) it carries
   the expiry clock over a server restart instead of restarting it. Defaults to null, so a
-  `SessionState` built by hand still compiles. Wanted by the egw-hub audit (R5).
+  `SessionState` built by hand still compiles. Wanted by the ingest daemon audit (R5).
 
 - **2026-09-22** — Broker hooks: `AclRequest.retain` carries the PUBLISH's RETAIN flag (false for
   SUBSCRIBE), so an ACL can deny a retained publish — e.g. to a command topic, where a stored
@@ -212,7 +213,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   the same flag. New `PublishVerdict.consume`: PUBACK, but no retained store and no fan-out, for a
   PUBLISH addressed to the broker's host (a request it answers on another topic). ⚠ An exhaustive
   `switch` over `PublishVerdict` needs the new arm. `AclRequest.retain` defaults to false, so a
-  struct literal built by hand still compiles. Wanted by the egw-hub audit.
+  struct literal built by hand still compiles. Wanted by the ingest daemon audit.
 
 - **2026-09-21** — Broker: sessions can be **kept across a server restart** by the server that
   holds the broker. New `Broker.sessionStates(arena)` (every session: client id, subscriptions

@@ -3,7 +3,7 @@
 //! tlsfuzzer (GPL-2.0, executed only, never linked or copied) against
 //! `tlsserver` over loopback TCP: `interop-tlsserver --tlsfuzzer DIR`, DIR a
 //! tlsfuzzer checkout with a Python that has tlslite-ng and ecdsa (by
-//! default `DIR/../venv/bin/python`, the layout qap's
+//! default `DIR/../venv/bin/python`, the layout the web-server consumer's
 //! `scripts/fetch-conformance-tools.sh tlsfuzzer` leaves).
 //!
 //! The server: every connection on its own thread, a `Connection` whose
@@ -218,7 +218,7 @@ fn summaryCount(out: []const u8, label: []const u8) ?u32 {
 /// NOTE. `update`: rewrite the counts of the baseline lines that ran.
 pub fn run(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, dir: []const u8, python_opt: ?[]const u8, only: []const []const u8, update: bool, env: *const std.process.Environ.Map) !u8 {
     const abs_dir = root.realPathFileAlloc(io, dir, gpa) catch {
-        std.debug.print("no tlsfuzzer checkout at {s} (qap: scripts/fetch-conformance-tools.sh tlsfuzzer)\n", .{dir});
+        std.debug.print("no tlsfuzzer checkout at {s} (the web-server consumer: scripts/fetch-conformance-tools.sh tlsfuzzer)\n", .{dir});
         return 2;
     };
     const python = python_opt orelse try std.fs.path.join(gpa, &.{ abs_dir, "../venv/bin/python" });
@@ -250,7 +250,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, dir: []const u8
     try rsa.SecretKey.fromDer(&rsa_key, &certs.rsa2048_pkcs1);
     const chains = [4][1][]const u8{ .{&certs.rsa2048_cert}, .{&certs.p256_cert}, .{&certs.p384_cert}, .{&certs.ed25519_cert} };
     // RSA first: most scripts offer RSA schemes beside the ECDSA ones and
-    // assume an RSA server (qap's rig does the same).
+    // assume an RSA server (the web-server consumer's rig does the same).
     shared.keys = .{
         .{ .chain = &chains[0], .key = .{ .rsa = &rsa_key } },
         .{ .chain = &chains[1], .key = .{ .ecdsa_p256 = &p256 } },

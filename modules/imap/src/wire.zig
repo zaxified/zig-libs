@@ -297,7 +297,7 @@ pub const Decoder = struct {
             // response line". Same accounting -- `charge` still runs before
             // bytes are kept, so a run over `max_line` is still refused, not
             // truncated and kept. Measured 8.3-10.2x on 8000-byte quoted
-            // strings (`~/CML/20260901-zig-libs-audit/A1/imap.md` F7).
+            // strings (the A1 audit report for `imap` F7).
             var n: usize = 0;
             while (n < buf.len and buf[n] != '"' and buf[n] != '\\') n += 1;
             if (n > 0) {
@@ -552,7 +552,7 @@ test "quoted string: escapes, and only the two that exist" {
 }
 
 test "F7: quoted() takes a buffered run in one chunk, not one reader call per byte" {
-    // F7 (`~/CML/20260901-zig-libs-audit/A1/imap.md`): `quoted` did
+    // F7 (the A1 audit report for `imap`): `quoted` did
     // `charge` + `takeByte` + `append` per BYTE while `run` (used by every
     // atom and by `text`) already batched a buffered window into one
     // `appendSlice`. Measured there: 8.3-10.2x on 8000-byte quoted strings.
@@ -636,7 +636,7 @@ test "literal: F2 -- many small literals on one line are bounded in total, not j
     // Each literal alone is well under `max_literal`, so the per-literal
     // check never fires; before `max_literal_total`, nothing bounded the SUM
     // (measured pre-fix: 1,000 x 64 KiB literals on one line, 73.7 MB, all
-    // accepted -- `~/CML/20260901-zig-libs-audit/A1/imap.md` F2).
+    // accepted -- the A1 audit report for `imap` F2).
     const gpa = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
@@ -708,7 +708,7 @@ test "F3: max_literal and max_depth's delivered defaults are pinned too" {
     // `max_depth: usize = 1000` -> `100000000`) left the suite green,
     // because every test that used a small value did so by setting it
     // explicitly rather than checking what `Options{}` ships with
-    // (`~/CML/20260901-zig-libs-audit/A1/imap.md` F3).
+    // (the A1 audit report for `imap` F3).
     try testing.expectEqual(@as(u32, 8 << 20), (Options{}).max_literal);
     try testing.expectEqual(@as(usize, 1000), (Options{}).max_depth);
 }

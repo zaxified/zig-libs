@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — content-addressed blobs (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: `uniqSafe` (temp name ≤ 255 B), fanout validated everywhere, put ≤ 64 MiB and exactly 64 MiB readable, gc mtime/keep casts; delta audit 23/25 + 2 eq)
 
-**Performance:** ref 0.41–0.83× go-ds-flatfs v0.6.1 · fastest 2.04× diskv v3.0.1 (measured 2026-11-03 on the final code; `zig build bench-blobstore`, 7 rounds on both sides, each side keeps its best, wall time, ReleaseFast. THE ROWS THAT MAKE THE VERDICT use `Options.refcount = false`, which is what axp runs and the only configuration whose work equals flatfs's. ours/ref and ours/fastest on ext4 with real fsyncs: `put` 16 x 4 KiB 0.80×/2.04×, `put_64k` 0.81×/1.95×, `get` 0.44×/0.44×, `has` 0.41×/0.45×; on tmpfs (fsync a no-op, so CPU and syscall cost): 0.83×/1.10×, 0.77×/0.85×, 0.54×/0.54×, 0.61×/0.71×. THE DEFAULT STORE (`refcount = true`, a `.rc` sidecar per put through its own temp + fsync + rename + directory fsync, work no Go side does) is the info row `put_rc`: **1.51× flatfs, 3.95× diskv on ext4; 1.28×/1.67× on tmpfs**, not in the verdict. Pairing: `put` is SHA-256 + temp + fsync + rename + directory fsync, and since 2026-11-03 also the fsync of the parent of every directory the put creates, as flatfs's `makeDir` does; diskv is the fastest only because it does not fsync the directory, so its crash guarantee is weaker, and that fsync is the whole 2× on disk. The host was shared: single-row spreads 3–40 %, ratios stable across runs)
+**Performance:** ref 0.41–0.83× go-ds-flatfs v0.6.1 · fastest 2.04× diskv v3.0.1 (measured 2026-11-03 on the final code; `zig build bench-blobstore`, 7 rounds on both sides, each side keeps its best, wall time, ReleaseFast. THE ROWS THAT MAKE THE VERDICT use `Options.refcount = false`, which is what the router-tool consumer runs and the only configuration whose work equals flatfs's. ours/ref and ours/fastest on ext4 with real fsyncs: `put` 16 x 4 KiB 0.80×/2.04×, `put_64k` 0.81×/1.95×, `get` 0.44×/0.44×, `has` 0.41×/0.45×; on tmpfs (fsync a no-op, so CPU and syscall cost): 0.83×/1.10×, 0.77×/0.85×, 0.54×/0.54×, 0.61×/0.71×. THE DEFAULT STORE (`refcount = true`, a `.rc` sidecar per put through its own temp + fsync + rename + directory fsync, work no Go side does) is the info row `put_rc`: **1.51× flatfs, 3.95× diskv on ext4; 1.28×/1.67× on tmpfs**, not in the verdict. Pairing: `put` is SHA-256 + temp + fsync + rename + directory fsync, and since 2026-11-03 also the fsync of the parent of every directory the put creates, as flatfs's `makeDir` does; diskv is the fastest only because it does not fsync the directory, so its crash guarantee is weaker, and that fsync is the whole 2× on disk. The host was shared: single-row spreads 3–40 %, ratios stable across runs)
 
 **Evidence:** model — an in-tree reference model (digest → present / refcount) compared with the store after every step of 12 seeded 250-step sequences (fanout 1..3: put, delete, gc with random keep sets, planted garbage sidecars, restarts, bounded puts), plus crash injection after every step of six write sequences with the directory checked as the killed process left it and again after a retry plus gc (2026-11-03; a mutant that reads a missing sidecar as 0 references in the dedup branch is killed by 3 of the 60 tests); not differenced against another implementation (no peer shares the refcount/gc semantics)
 **Model:** src/crash_test.zig:Model
@@ -54,7 +54,7 @@ hang the caller); bounded-memory listing (`names`); a name-addressed raw layer a
 records in the same store; built and tested for big-endian MIPS32 and ARM. **Where we are
 behind:** SHA-256 only (cacache: multi-hash), no compression, no packing or delta, no
 chunking/encryption (restic's domain), POSIX only. Each is a verdict in Backlog (rejected with a
-reason); none is something axp or a flatfs user asks of a block store.
+reason); none is something the router-tool consumer or a flatfs user asks of a block store.
 
 ## Design & invariants
 - **Layout:** `<base>/cas/<hh...>/<hex>` (content-addressed, dedup, `hh...` = `Options.fanout`
@@ -177,7 +177,7 @@ reason); none is something axp or a flatfs user asks of a block store.
   namespace's process with the same PID and counter) costs one draw of the next counter value, at most 64
   draws, then `PathAlreadyExists`. The earlier text claimed truncation made a clash harmless; it did not:
   two writers shared one file and a mixture was renamed under a hash it does not match. `casCreateTemp(uniq)`
-  and `createTemp` do the same, with the caller's name as a label only: axp-vault builds `uniq` from device,
+  and `createTemp` do the same, with the caller's name as a label only: the router-tool consumer's backup vault builds `uniq` from device,
   key and index, so a client retrying a running upload shared the first upload's file, and `casCommit` trusts
   the caller's hash. `scratchCreate` keeps the caller's name; a scratch file is never committed. **The cost:**
   a crash's temp is never reused, so each crash leaves one until `gc` reaps it (24 h by default). A store whose
@@ -229,7 +229,7 @@ reason); none is something axp or a flatfs user asks of a block store.
   of through its temp is killed by the count-of-12 test. What it cannot show: that `fsync`
   actually orders the writes on a given disk.
 - **32-bit targets (2026-11-03):** `ingest_counter` was a `u64` atomic, which does not compile on
-  mips32 or 32-bit arm (the module did not build for axp's own target); it is a `usize`. The tests
+  mips32 or 32-bit arm (the module did not build for the router-tool consumer's own target); it is a `usize`. The tests
   that need a 64-bit slice length or 64-bit `time_t` skip themselves there.
 - Reentrant — shared state (refcounts, gc) is coordinated via the advisory ingest flock, not
   in-process synchronization. Posix (atomic-rename visibility, flock; filesystem via `std.Io`).
@@ -297,7 +297,7 @@ by design, `meta.platform = .posix`).
   blocks (done, see Design). `lockIngest` still blocks for as long as another process holds the flock
   (no timeout; `gc` holds it for its whole walk): a bounded `try_lock` retry would be the fix.
   Deferred on purpose: the safe default is to wait (a holder that dies releases the lock), a timeout is
-  a policy the caller should choose, and nothing in axp-vault calls `gc` while another writer works.
+  a policy the caller should choose, and nothing in the router-tool consumer's backup vault calls `gc` while another writer works.
 
 **Survey verdicts (2026-11-02), one per substantial gap:**
 - *Multiple hash algorithms* (cacache): **rejected.** One store has one address algorithm; the hex

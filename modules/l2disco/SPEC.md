@@ -79,7 +79,7 @@ Surveyed 2026-09-30, re-surveyed 2026-11-04 per `SURVEY-PLAYBOOK.md`; stars and 
   DSCP(6).
 - **DHCP 82, 119 and 121** are validated lazily, by their iterators (sub-option framing; RFC 3442
   width 0-32 and the significant-octet count; RFC 1035 labels), never by `Message.parse`: a
-  malformed sub-structure must not hide the rest of the message — axp's rogue-DHCP check needs the
+  malformed sub-structure must not hide the rest of the message — the router-tool consumer's rogue-DHCP check needs the
   server id of an OFFER whose option 121 is garbage (a review finding against this change's first
   draft, which failed the whole parse). `DomainSearchIterator`'s whose compression pointers must point strictly
   backwards (no loop is possible) and whose names are bounded at 253 characters (255 octets on the wire, RFC 1035 §2.3.4; the bound was 254 before 2026-11-04). The builders
@@ -132,7 +132,7 @@ alone here. Revisit only on a fresh, explicit ask; do not fold it into `tolerant
 "while we're at it."
 
 - **2026-10-04:** the three survey items below are **done**, except DHCPv6 (deferred: a separate
-  message format and option space, roughly the size of the DHCPv4 codec; no consumer asks — axp's
+  message format and option space, roughly the size of the DHCPv4 codec; no consumer asks — the router-tool consumer's
   rogue-DHCP check is DHCPv4). Also deferred: LLDP-MED location content (civic-address CAtypes,
   coordinate LCI) — returned as `format` + bytes; builders for power/location/inventory TLVs
   (`Builder.addOrgSpecific` takes the raw info).

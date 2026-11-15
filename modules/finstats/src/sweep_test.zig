@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests for finstats, wave GW. Findings FI1..FI8, see
-//! ~/CML/20261029-panic-sweep/finstats-sweep.report.md.
+//! the 2026-10-29 panic-sweep report for `finstats`.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;

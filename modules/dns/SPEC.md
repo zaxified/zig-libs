@@ -6,7 +6,7 @@
 
 **Scope:** core — Go net resolver (reference) / c-ares / hickory-resolver / libunbound / dnspython / systemd-resolved / Node `dns` (surveyed 2026-11-15; parity -> core 2026-11-15: the answer cache that c-ares (on by default), hickory, unbound and systemd-resolved ship is missing, and the API is blocking-only where every library but Go's is asynchronous — see "Where we are behind")
 
-**Audit:** review 2026-09-12 · mutation 2026-11-15 (49/49) · src 76006a5f8069de87
+**Audit:** review 2026-09-12 · mutation 2026-11-15 (49/49) · src 3ff1a8955bfda8cf
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DNS_FUZZ); 2026-11-02 `dns-query-roundtrip` (random QueryOptions incl. DO/AD/CD and EDNS options → encode → decode equal, or the documented refusal; 200,000 driver runs clean, ReleaseSafe) · ct n/a — public DNS codec (keyword review, 2026-10-07); TSIG (2026-10-16): std HMAC, MAC compared with `timing_safe.eql`, secret frames burned (stack probe) · panic 2026-10-31 (sweep + blind review: `RequestTooLarge` for > 65535 B, TSIG length guards, spoofed/QR-clear/undecodable UDP replies dropped to the same deadline, DoH body ≤ 65535, owner-name sharing 17.8 → 0.85 MB on a pointer flood; delta audit 28/31 + 3 eq)
 
@@ -258,7 +258,7 @@ JSON path.
 
 ## Build options
 
-Consumer build options (CONVENTIONS §4.2), added 2026-10-31 at zpinger's request (trace hop
+Consumer build options (CONVENTIONS §4.2), added 2026-10-31 at the network-monitor consumer's request (trace hop
 names over PTR, no DoH):
 
 | option | values | default | `-Dprofile=small` |
@@ -274,7 +274,7 @@ names over PTR, no DoH):
 - **What it buys** (size probe `tools/sizeprobe.zig`: `Resolver.init` + one `reverse`;
   ReleaseSmall, native x86_64, stripped): **1 811 032 → 175 160 B**. The field alone was enough to
   pull `http.Client` in: a runtime-optional client is compiled whether or not it is ever set.
-  zpinger (ReleaseSafe, not stripped): 17.5 MB with DoH vs 5.5 MB before it used `dns`.
+  the network-monitor consumer (ReleaseSafe, not stripped): 17.5 MB with DoH vs 5.5 MB before it used `dns`.
 - **What the consumer loses:** DoH (RFC 8484 wire and DoH-JSON). UDP/TCP, `/etc/hosts`,
   resolv.conf, `update`/TSIG are unaffected.
 - **`dns-dot=false`** (2026-11-02): `Resolver.dot_enabled` is false and `tlsclient` is not analysed;
@@ -284,7 +284,7 @@ names over PTR, no DoH):
 
 ## Backlog / deferred
 
-- ✅ **Closed 2026-10-31 (`Error.ServerFailed`, for zpinger's serve-stale cache):** **`lookupIp` reads a SERVFAIL / REFUSED reply as "no addresses"** *(found 2026-10-16 by acmedns's
+- ✅ **Closed 2026-10-31 (`Error.ServerFailed`, for the network-monitor consumer's serve-stale cache):** **`lookupIp` reads a SERVFAIL / REFUSED reply as "no addresses"** *(found 2026-10-16 by acmedns's
   review)*: `query` returns a server-failure reply as a message once every server failed, and
   `lookupIp` collects addresses from it — an empty list, indistinguishable from NODATA (the
   2026-10-01 fix covered timeouts only). Go returns an error ("server misbehaving"). Fix: record a

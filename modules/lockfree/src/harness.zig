@@ -653,7 +653,7 @@ test "BOUNDED MPSC: N×1 stress over a small ring through the CAS-free single-co
 }
 
 test "BOUNDED drop-on-full: every accepted item arrives exactly once, in order; every refusal is counted" {
-    // qap's shape: producers never wait, one consumer drains in place.
+    // the web-server consumer's shape: producers never wait, one consumer drains in place.
     const alloc = testing.allocator;
     const Q = bounded.BoundedQueue(u64, 256, .{ .consumers = .single });
     const q = try alloc.create(Q);

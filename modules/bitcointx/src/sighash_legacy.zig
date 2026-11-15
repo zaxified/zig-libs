@@ -515,7 +515,7 @@ test "SerializeScriptCode: an empty scriptCode is a bare zero length" {
 // `GetScriptOp`/`SerializeScriptCode` output for the given scriptCode,
 // independently cross-checked with a Python transliteration of `getOp` run
 // over the same 500-row corpus (0 divergences) — see
-// `~/CML/20260901-zig-libs-audit/A1/repro/bitcointx/getop_probe.py`.
+// the A1 audit repro script for `bitcointx` (`getop_probe.py`).
 
 test "getOp boundary: OP_PUSHDATA4 (opcode == 0x4e) still takes the push branch" {
     // `<push4 len=1: 0xab> OP_1`. Mutating `opcode <= 0x4e` to `< 0x4e` drops

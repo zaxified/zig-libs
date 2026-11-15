@@ -322,7 +322,7 @@ pub fn encodeFromUtf8Opts(alloc: std.mem.Allocator, utf8: []const u8, enc: Encod
 // UTF-16 is deliberately NOT a member of `Encoding`. Every `Encoding` is
 // ASCII-compatible: a byte below 0x80 is that ASCII character in every one,
 // which is what lets a caller transcode a CSV cell by cell and write its
-// delimiters as plain bytes (bxp does). UTF-16 breaks that — `,` is `2c 00` —
+// delimiters as plain bytes (the build-tool consumer does). UTF-16 breaks that — `,` is `2c 00` —
 // so it gets its own entry points and cannot be picked by accident through
 // `Encoding.parse` or an enum listing.
 
@@ -1464,7 +1464,7 @@ test "Decoder: fatal stops at the first error and stays failed; lenient is reusa
 }
 
 test "Encoding stays ASCII-compatible: UTF-16 is not one of its members" {
-    // bxp transcodes CSV cell by cell and writes delimiters as raw bytes, which
+    // the build-tool consumer transcodes CSV cell by cell and writes delimiters as raw bytes, which
     // is only sound because every `Encoding` maps bytes < 0x80 to ASCII.
     inline for (@typeInfo(Encoding).@"enum".field_values) |fv| {
         const e: Encoding = @fromBackingInt(@intCast(fv));

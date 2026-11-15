@@ -52,7 +52,7 @@
 //! key (`MontParams`), so no per-operation setup cost is paid.
 //!
 //! ⚠ That last clause is a claim about the CALLER, and it is worth reading as
-//! one. It holds for a consumer that builds a key and reuses it — `qap` builds
+//! one. It holds for a consumer that builds a key and reuses it — the web-server consumer builds
 //! its `SecretKey` when its certificate store loads and then only signs;
 //! `iec62351`'s GOOSE verifier carries a built `PublicKey` and verifies per
 //! frame. It does NOT hold for certificate path validation, which builds a

@@ -106,7 +106,7 @@ killed child's own descendants (e.g. a shell's `&`-backgrounded jobs) are reacha
 only covers descendants that stayed in the group the kernel assigns at fork; a descendant that
 calls `setsid`/`setpgid` itself escapes it, same as any POSIX process-group signal.
 
-**Cancelling a blocking run (2026-09-28, requested by ttydesk).** `Spec.cancel` borrows a
+**Cancelling a blocking run (2026-09-28, requested by the terminal-UI consumer).** `Spec.cancel` borrows a
 `Cancel` token; `Cancel.request` (any thread, sticky, one token may serve many concurrent runs)
 makes every run carrying it SIGKILL its child — the group with `new_process_group` — and return
 the captured output with `Output.canceled` set. A token already requested at the call spawns
@@ -174,10 +174,10 @@ and `uid`/`gid` exist.
 |---|---|---|---|
 | R1 | `Spec.pass_fds` via std's `inherit_files` (same fd number in the child, as Python) | S | **DONE 2026-10-20** |
 | R2 | `uid`/`gid` pass-through | S | **DONE 2026-10-20** (no setgroups, documented) |
-| R3 | Default stdin `.close` → `/dev/null` (Go's default; a closed fd 0 is reused by the child's first open) | S | **DONE 2026-10-20** — breaking default; ttydesk (`source.zig:121`, `data.zig:194`) used it and gets the safer one, bxp sets `.close` explicitly |
+| R3 | Default stdin `.close` → `/dev/null` (Go's default; a closed fd 0 is reused by the child's first open) | S | **DONE 2026-10-20** — breaking default; the terminal-UI consumer (`source.zig:121`, `data.zig:194`) used it and gets the safer one, the build-tool consumer sets `.close` explicitly |
 | R4 | Core-dump flag next to `Term` | S | **DONE 2026-10-20** — `Output.core_dumped` (host policy: a piped core_pattern sets it even under `ulimit -c 0`) |
 | — | `rusage` via std's `request_resource_usage_statistics` | S | **DONE 2026-10-20** — `Output.rusage` |
-| — | EPIPE on stdin when the child stops reading: Python and Go swallow it, we return `error.BrokenPipe` | – | kept — bxp's `runPhaseLabel` depends on it; a listed oracle difference |
+| — | EPIPE on stdin when the child stops reading: Python and Go swallow it, we return `error.BrokenPipe` | – | kept — the build-tool consumer's `runPhaseLabel` depends on it; a listed oracle difference |
 | — | Review 2026-10-20 of `vfork_spawn` (Sonnet): no HIGH; M1 `.inherit` without a readable /proc/self/environ now falls back to std's spawn (never an empty env); M2 capture pipes 256 KiB, not 1 MiB (user pipe-page quota); L1–L3 fixed (fd leak on a failed lift, error mapping, signal-mask init) | – | **FIXED 2026-10-20** |
 | — | Zig 0.17 std leaks the parent's pipe ends when `processSpawnPosix` fails (found by the fd invariant) | – | worked around: `.pipe` streams are made by procrun (`PipeEnds`) and closed on error, POSIX |
 | R10 | pidfd signalling (PID-reuse window) | M | do if time allows |
@@ -262,8 +262,8 @@ Rust std::process as fastest; spawn+wait ×2000, 8 concurrent spawners, 100 MB c
 **No-panic sweep § GO leftovers (2026-10-30)** — not fixed, with reasons:
 - `Handle.writeStdin` blocks the calling thread until the child reads (documented); there is no deadline variant. A caller that needs one writes from its own thread.
 - `run` without `runTimeout`/`Spec.cancel` waits for pipe EOF without bound (documented); a descendant holding the pipe holds `run`.
-- A child that exits on its own without reading all of `stdin_body` makes `run`/`runTimeout` return `error.BrokenPipe` and drop the captured output (documented, bxp relies on it; not a crash). When procrun itself kills the child (deadline/cancel) the EPIPE is swallowed and the `Output` returned with `timed_out`/`canceled` (D9, 2026-10-30).
-- REV-PR-1 (D7, caller contract, documented 2026-10-30): streaming `Handle.wait` does not close stdin or lift backpressure on entry (bxp and ttydesk call it on a waiter thread while another thread acks); a child that reads stdin to EOF needs `closeStdin` first, and the consumer must keep acking while `wait` runs.
+- A child that exits on its own without reading all of `stdin_body` makes `run`/`runTimeout` return `error.BrokenPipe` and drop the captured output (documented, the build-tool consumer relies on it; not a crash). When procrun itself kills the child (deadline/cancel) the EPIPE is swallowed and the `Output` returned with `timed_out`/`canceled` (D9, 2026-10-30).
+- REV-PR-1 (D7, caller contract, documented 2026-10-30): streaming `Handle.wait` does not close stdin or lift backpressure on entry (the build-tool consumer and the terminal-UI consumer call it on a waiter thread while another thread acks); a child that reads stdin to EOF needs `closeStdin` first, and the consumer must keep acking while `wait` runs.
 - REV-PR-2 (D8, 2026-10-30): `Handle.wait` observes the child's exit without reaping (`waitid WNOWAIT`, Linux), then readers stop once the pipe has been idle 250 ms (`default_pump_grace_ns`, not configurable; idle = inside `poll` only, never during callbacks or backpressure parking). Join-before-reap and `on_exit`-after-last-chunk unchanged. A descendant that keeps writing keeps the stream alive (remedy: `new_process_group` + `killGroup`). Before the exit the readers wait in 500 ms `poll` slices. Windows: unchanged.
 - **Refcounted `Handle` for watchdog threads** (D10): `Handle.kill`/`cancel`/`signal*`/`terminate` from another thread racing `Handle.wait` is a use-after-free of the context (`wait` frees it); documented as not allowed. A refcounted handle would lift that.
 - NUL bytes inside `argv`/`env` strings truncate the C string silently on the vfork path (`argv` is trusted-by-construction; use `runValidated` for untrusted input).

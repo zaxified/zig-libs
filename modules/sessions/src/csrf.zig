@@ -127,8 +127,8 @@ pub const Csrf = struct {
     /// query-parameter fallback. Both trimmed; empty counts as absent. Public
     /// so a caller driving the core `Csrf`/`sessions` API directly — without
     /// `router`'s `middleware` — can extract the token the same way the
-    /// middleware does instead of copying this logic (requested for qap
-    /// M11.4, 2026-09-27: qap's own `src/sessions.zig` had a private
+    /// middleware does instead of copying this logic (requested for the web-server consumer
+    /// M11.4, 2026-09-27: the web-server consumer's own `src/sessions.zig` had a private
     /// `presentedToken` duplicate). `middlewareRun` and `check` both call this
     /// one implementation, so they cannot drift apart.
     pub fn presented(c: *const Csrf, req: *const http.Server.Request) ?[]const u8 {

@@ -1137,7 +1137,7 @@ pub const Cache = struct {
     /// and `drainDirty`: its bytes are uninitialized, and the producer may
     /// have to wait for them -- a fiber reading a page from disk into the
     /// slot parks there, and another fiber on the same thread may look the
-    /// key up meanwhile (found from qap's research register H4, 2026-09-29:
+    /// key up meanwhile (found from the web-server consumer's research register H4, 2026-09-29:
     /// `pagecache.preadRef` does exactly that). The reader then fetches for
     /// itself; whichever `put`/`reserve` lands later replaces the other, and
     /// a borrow of the replaced one keeps its bytes (the doomed-entry rule).
@@ -2929,7 +2929,7 @@ test "fuzz: arbitrary borrow-seam operation sequences keep every structural inva
 }
 
 test "borrow: a reservation is a miss until it is committed, for get, pin and drainDirty" {
-    // qap research register H4: the producer of a reservation may park
+    // the web-server consumer research register H4: the producer of a reservation may park
     // mid-fill (a fiber reading the page from disk into the slot), and a
     // second fiber on the same thread may look the key up meanwhile. Before
     // this, `get` answered a HIT on the uninitialized bytes and `pin` lent

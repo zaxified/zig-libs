@@ -604,7 +604,7 @@ var frame_test_enabled: bool = @import("builtin").mode != .debug;
 test "a read waits under a shallow frame: the handshake and the signer stay out of line" {
     // A parked connection keeps the stack down to where its read waits: an
     // inlined `onHandshake` (through `feed`) or `sign` made `step` 22.7 KiB,
-    // 3 resident pages per idle connection in qap. Measured here: from a
+    // 3 resident pages per idle connection in the web-server consumer. Measured here: from a
     // caller's frame to the reader's `stream`, through `handshake` and `step`.
     if (!@as(*volatile bool, &frame_test_enabled).*) return error.SkipZigTest;
     const Probe = struct {
@@ -899,7 +899,7 @@ const ParkedSend = enum { write_all, flush, key_update, close };
 /// A writer blocked in sending (a fiber parked on a full socket, here a
 /// thread) and a reader that needs input: without the guard the reader
 /// sends the same queued records again, and the client sees a corrupt stream
-/// (qap's HTTP/2 streams on fibers, 2026-10-22). `write_all` sends a payload
+/// (the web-server consumer's HTTP/2 streams on fibers, 2026-10-22). `write_all` sends a payload
 /// through `writeAll`; the others queue one with `Server.write` first and
 /// block in `flush`, `keyUpdate` or `close`. Not through `writer()`: it
 /// buffers outside the guard, which only fibers of one thread make safe (the

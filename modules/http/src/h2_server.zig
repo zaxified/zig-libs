@@ -1853,7 +1853,7 @@ const Session = struct {
         // set; any other non-identity coding -- and `gzip` with decoding
         // off -- is 415. Two fields are a coding list (RFC 9110 §5.3), which
         // h1 refuses too. Before the refusal the same gzip PUT was a 415 on
-        // h1 and a stored compressed blob on h2 (qap research register H9,
+        // h1 and a stored compressed blob on h2 (the web-server consumer research register H9,
         // 2026-09-29).
         const req_encoding: gzip.RequestEncoding = if (content_encodings > 1)
             .unsupported
@@ -1920,7 +1920,7 @@ const Session = struct {
         // few hundred bytes, and as a local it made this frame 15 KB: on a
         // fiber-per-connection server every connection kept the pages that
         // frame had touched -- spread over five, all dead between requests,
-        // measured in qap under h2 saturation (2026-09-30). In the arena it
+        // measured in the web-server consumer under h2 saturation (2026-09-30). In the arena it
         // goes back after every stream and the next stream reuses it warm.
         const RW = Server.ResponseWriter;
         const scratch_len = 4096;
@@ -4471,7 +4471,7 @@ test "h2: a server_name that cannot go on the wire is dropped once, not sent and
     var out_buf: [8192]u8 = undefined;
     try runOffline(&peer, .{
         .handler = testHandler,
-        .server_name = "qap\r\nx-injected: yes",
+        .server_name = "app\r\nx-injected: yes",
     }, &out_buf);
 
     const c = peer.resps.getPtr(sid) orelse return error.NoResponse;
@@ -4538,7 +4538,7 @@ test "h2: a mixed-case name set with setHeaderStatic reaches the wire lowercased
     // The head lowers names in the writer's own storage. A static name is NOT
     // in that storage -- it is a string literal, read-only memory -- and the
     // first version asserted it never would be: one POST to a GET-only server
-    // (whose 405 sets `Allow` this way) took a qap process down, an assert in
+    // (whose 405 sets `Allow` this way) took a web-server consumer process down, an assert in
     // Debug and a write into .rodata in ReleaseFast.
     const gpa = testing.allocator;
     var peer: TestPeer = .init(gpa, .{});

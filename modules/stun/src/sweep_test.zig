@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests for stun, wave GV. Findings ST-1 .. ST-3, see
-//! ~/CML/20261029-panic-sweep/stun-sweep.report.md.
+//! the 2026-10-29 panic-sweep report for `stun`.
 const std = @import("std");
 const testing = std.testing;
 const stun = @import("root.zig");

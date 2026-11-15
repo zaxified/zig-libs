@@ -40,7 +40,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std.http` | Zig | MIT | — | Zig 0.16.0 | `Client` (TLS, redirects, pooling) and an HTTP/1.1 `Server` with `upgradeRequested`/`respondWebSocket`; no HTTP/2, no range/conditional/multipart/conneg helpers, no proxy (checked in 0.16.0's `lib/std/http/`). |
 | [tardy-org/zzz](https://github.com/tardy-org/zzz) | Zig | MPL-2.0 (source not read) | 790 | v0.3.2 (2026-06-13) | Alpha framework: HTTP and HTTPS server on the tardy runtime. Copyleft-file licence, so source is off limits here. |
 
-**Where we are ahead:** the only pure-Zig stack here with HTTP/2 on **both** client and server, h2c and BYO-TLS/ALPN (`serveStream`, `connectH2Over`), a reverse proxy over h1/h2, trailers in both directions and both protocols, streaming multipart, SSE, range/conditional/conneg/gzip/problem helpers, and a socket-free `serveStream` that makes every one of them testable offline; interop tests against curl and an h11 oracle. **Where we are behind:** no native TLS server yet (Go, dusty, zzz have one; here it is the caller's, and qap does exactly that — planned over the sibling `tlsserver` module, see Backlog), no HTTP/3, no PROXY-protocol parsing (→ Backlog; Go's stdlib has neither). The client cookie jar (`Client.Options.cookie_jar`, sibling `cookies.Jar` with the public-suffix list, 2026-10-05) and an outbound proxy (forward and `CONNECT`, Go's environment rules, 2026-10-05) are in. The 2026-10-11 S2 survey (`go doc` of net/http, httputil, cookiejar, httptest against this module) listed gaps R1–R10, all closed 2026-10-12 (Backlog); still behind Go: one exchange per h2 client connection (no multiplexing) and no CONNECT over h2.
+**Where we are ahead:** the only pure-Zig stack here with HTTP/2 on **both** client and server, h2c and BYO-TLS/ALPN (`serveStream`, `connectH2Over`), a reverse proxy over h1/h2, trailers in both directions and both protocols, streaming multipart, SSE, range/conditional/conneg/gzip/problem helpers, and a socket-free `serveStream` that makes every one of them testable offline; interop tests against curl and an h11 oracle. **Where we are behind:** no native TLS server yet (Go, dusty, zzz have one; here it is the caller's, and the web-server consumer does exactly that — planned over the sibling `tlsserver` module, see Backlog), no HTTP/3, no PROXY-protocol parsing (→ Backlog; Go's stdlib has neither). The client cookie jar (`Client.Options.cookie_jar`, sibling `cookies.Jar` with the public-suffix list, 2026-10-05) and an outbound proxy (forward and `CONNECT`, Go's environment rules, 2026-10-05) are in. The 2026-10-11 S2 survey (`go doc` of net/http, httputil, cookiejar, httptest against this module) listed gaps R1–R10, all closed 2026-10-12 (Backlog); still behind Go: one exchange per h2 client connection (no multiplexing) and no CONNECT over h2.
 
 ## Design & invariants
 Submodules: `Client` / `Server` (h1), `h1` (parser), `hpack` + `h2` + `h2_server` + `h2_client`
@@ -458,18 +458,18 @@ directly-exposed parser.
   answer 400 (client fault) instead of 500.
 
 - ~~**Constant time: header bytes go through tables**~~ — DONE 2026-10-18 for the h1 value check (vector/SWAR, faster than the table) and the HPACK encoder (credentials never indexed + raw by default, `Encoder.Options.default_sensitive`); the HPACK **decoder** still walks a Huffman-coded secret per bit — RFC-mandated input, cannot be refused, documented. Was (found 2026-10-18, pre-tag sweep; owner decision — hot path): `h1.zig` `isValidFieldValue` indexes a 256-entry table by every header-value byte (h1.zig ~221/246), and HPACK's Huffman encoder indexes `huff_codes[b]` by each byte and its decoder walks a tree per bit (hpack.zig ~342-373, ~410-426, ~511-514) — both over `Authorization`, `Cookie` and API-key values (llmclient's `x-api-key` too). Options: an arithmetic range check in `isValidFieldValue` (cost to measure on the h1 bench); for HPACK, emit sensitive fields (`authorization`, `cookie`, `proxy-authorization`, a caller list) as raw never-indexed literals (RFC 7541 §7.1.3 recommends never-indexed for them; Huffman stays for the rest) — the decoder side cannot be helped the same way. Severity low-medium (local cache side channel).
-- **HPACK encoder: fast path for a field repeated from the previous block** *(2026-10-18, qap repin A/B)* —
+- **HPACK encoder: fast path for a field repeated from the previous block** *(2026-10-18, the web-server consumer repin A/B)* —
   static response headers (comptime slices in rodata: `setHeaderStatic`, `security-headers` `applyStatic`,
   `error_headers`) are the same `(name.ptr, value.ptr)` on every response of a connection, yet `Encoder.findField`
   re-derives the index each time: `static_names` lookup, `hashName` + `hashPair` over the bytes, then `mem.eql`
-  verification. Measured in qap over h2/TLS (perf, security layer armed with 11 headers vs bare): `findField` +
+  verification. Measured in the web-server consumer over h2/TLS (perf, security layer armed with 11 headers vs bare): `findField` +
   `mem.eql` ≈ +4000 cycles/request, ~450 per header that ends up as a ONE-byte §6.1 index. Idea: remember per
   encoder the last block's field `i` -> table seq and, when field `i` of the next block matches it and the seq is
   still in the table (eviction check is O(1) on `seq`), emit the index without the map probes. ⚠ Pointer identity
   alone is NOT proof for a runtime buffer (same address, new bytes): trust it only for fields the writer knows are
   immutable (`setHeaderStatic`'s rodata -- a `static` flag on `hpack.Field`), verify anything else with one
   `mem.eql` against the cached entry (still no hashing). Misses take today's path, so the output is
-  byte-identical (RFC 7541 vectors + h2spec stay the anchors). Measure with instruction counts (callgrind or qap's h2sat `instructions/req`), not req/s. Effort: small.
+  byte-identical (RFC 7541 vectors + h2spec stay the anchors). Measure with instruction counts (callgrind or the web-server consumer's h2sat `instructions/req`), not req/s. Effort: small.
 **`interop-http` on CI: Go oracle verdicts differ from the committed vectors** — DONE 2026-10-07 (`GOTOOLCHAIN=go1.26.0` in the environment `tools/interop.zig` hands the Go oracle; h2spec v2.2.1 and the SSE venv installed by ci-environment's interop role; the CI interop lane re-took all three phases green, probe run 37556035597). Was: OPEN (2026-10-07, CI interop lane). The runner's `go` produced a different `go_oracle_vectors.zig` than the committed one, which a local go1.26.0 reproduces byte for byte — the oracle moved, not our parser. Before http leaves the lane's local-only list: pin the toolchain (`toolchain go1.26.0` in the oracle's go.mod, so `go` fetches that one), install h2spec and the oracle venv in ci-environment's interop role, then diff the verdicts once more.
 
 - **From the Go oracle (2026-10-05), judged** — each was a recorded divergence in
@@ -493,7 +493,7 @@ decisions the same day: every gap a Go user notices is implemented, TLS server p
 - R1 graceful lifecycle — DONE 2026-10-12: `shutdownGraceful(timeout_ms)`, `close`, `isDraining`,
   `setKeepAlivesEnabled`, `registerOnShutdown` (8 hooks). Every socket connection registers a
   `ConnControl` (renamed from R2's `Deadlines`) with an atomic `active/idle/closing` state; the loop
-  publishes `idle` then reads `draining`, the shutdown sets `draining` then claims `idle` — qap's
+  publishes `idle` then reads `draining`, the shutdown sets `draining` then claims `idle` — the web-server consumer's
   `Conns` ordering, so neither side can miss the other. Idle claims shut only the read side, so h2
   can still send its GOAWAY. h2: GOAWAY NO_ERROR once draining, streams above its last-stream-id
   refused (before, `goaway_sent` was recorded but never enforced — a peer could keep a closing
@@ -503,7 +503,7 @@ decisions the same day: every gap a Go user notices is implemented, TLS server p
   GOAWAY → the h2c test fails.
 - R2 timeouts Go has — DONE 2026-10-12: `read_header_timeout_ms`, `idle_timeout_ms`,
   `response_timeout_ms` as ABSOLUTE phase deadlines (a peer dribbling one byte per period defeats an
-  inactivity timer; qap measured 75 s against a 10 s one), `Request.setReadDeadline` /
+  inactivity timer; the web-server consumer measured 75 s against a 10 s one), `Request.setReadDeadline` /
   `setWriteDeadline` (Go `ResponseController`). The connection's phase (idle → head → body) lives in
   `TimeoutReader`, moved by `StreamOptions.deadlines` (`Deadlines`). Behaviour change:
   `request_timeout_ms` starts at the request's first byte, as Go's `ReadTimeout` — counting the
@@ -636,7 +636,7 @@ decisions the same day: every gap a Go user notices is implemented, TLS server p
   bounded (`max_output_bytes`, overrun = `error.OutputTooLarge`, never a cut recording). h1 only.
   Negative control: HEAD given a body, chunked left undecoded, tunnel ignored — each fails a test.
   Consumers' hand-rolled `runWire`/`headerValue`/`bodyOf` helpers (sessions, idempotency,
-  ratelimit, throttle, aaa-gate, router, qap) can move to it at their own pace.
+  ratelimit, throttle, aaa-gate, router, the web-server consumer) can move to it at their own pace.
 - The survey's "optional, not S2" items — DONE 2026-10-12 (owner: what the competition has gets
   implemented): `serveByAlpn` (Go `ServeTLS`'s h2-or-h1 choice over a terminated connection),
   `sniff.detectContentType` (Go `DetectContentType`; WHATWG MIME Sniffing tables, clean-room from
@@ -669,33 +669,33 @@ decisions the same day: every gap a Go user notices is implemented, TLS server p
   behaviour change — refuses bodies accepted before this). See the design note above and
   `gzip.skipGzipHeader` / `gzip.checkTrailer`.
 
-- ~~**Streaming multipart**~~ — **DONE 2026-09-27** (`multipart.Reader`, from qap M11.5b). The
+- ~~**Streaming multipart**~~ — **DONE 2026-09-27** (`multipart.Reader`, from the web-server consumer M11.5b). The
   buffered `parse` needs the whole body in memory; `Reader` reads a `*std.Io.Reader` part by part,
   each part body a reader that ends at the next delimiter (Go's `mime/multipart.Reader` shape).
   Same grammar, limits and refusals as `parse` — one pair differs by design: a header block over the
   cap that never ends is `HeadersTooLarge` (the reader stops at the cap), `MalformedBody` to `parse`.
 
-- ~~**Lazy `100 Continue` on h1**~~ — **DONE 2026-09-27** (`Request.reader` sends it; unread → the response closes). Was: (from qap M11.5a, 2026-09-27) — `Server.serveStream` writes
+- ~~**Lazy `100 Continue` on h1**~~ — **DONE 2026-09-27** (`Request.reader` sends it; unread → the response closes). Was: (from the web-server consumer M11.5a, 2026-09-27) — `Server.serveStream` writes
   `HTTP/1.1 100 Continue` right after the head checks, before the handler runs
   (`Server.zig`, the `head.expect_continue` block after the 415 check). A handler that refuses the
   request on its own terms — a per-route body cap below `max_body_bytes`, auth, a 415 of its own —
   then answers after the client was already invited to send the body. Go's `net/http` sends it on
   the handler's first body read (`expectContinueReader`); do the same: the request body reader
   writes the interim line on its first read, and a handler that answers without reading never
-  sends it (RFC 9110 §10.1.1 allows either). qap works around nothing today — its small-route 413
-  on a declared length follows the interim 100 (`qap/src/stream_test.zig` pins `interim == 1`,
+  sends it (RFC 9110 §10.1.1 allows either). The web-server consumer works around nothing today — its small-route 413
+  on a declared length follows the interim 100 (the web-server consumer's `src/stream_test.zig` pins `interim == 1`,
   comment `zig-libs request: http — lazy 100-continue`).
 
-~~**zstd/br negotiated by the serving loops**~~ — DONE 2026-09-26 (found by qap):
+~~**zstd/br negotiated by the serving loops**~~ — DONE 2026-09-26 (found by the web-server consumer):
 `Server.EncoderProvider` (`acquire`/`release` per response, no codec linked here) in `Options`,
 `StreamOptions` and `h2_server.Options` as `encoder_provider`; `preferredBy` is the q-value choice
 against gzip (a tie goes to the provider, absent header admits nothing); acquired only past the
 eligibility gate, released when the request is over, none free → gzip or identity. README
 "The serving loops negotiate one themselves".
 
-**Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/http.zig` (httpz) is an HTTP/1.1 server. Feed the same raw request bytes to both parsers and compare accept vs reject (smuggling-shaped framing, obs-fold, bad chunk sizes, over-long headers). It is also a reference point for qap's h1 benchmark. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
+**Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/http.zig` (httpz) is an HTTP/1.1 server. Feed the same raw request bytes to both parsers and compare accept vs reject (smuggling-shaped framing, obs-fold, bad chunk sizes, over-long headers). It is also a reference point for the web-server consumer's h1 benchmark. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
-**Query-string parameters and path percent-decoding** — DONE 2026-09-28 (found by qap,
+**Query-string parameters and path percent-decoding** — DONE 2026-09-28 (found by the web-server consumer,
 2026-09-22): `http.url` — `param`/`paramRaw` (first match, keys compared decoded, `+` → space),
 `QueryIterator` (every raw pair, nothing decoded), `decodeComponent`, and a strict `decodePath`
 that refuses a decoded `/` or NUL and any malformed escape, so an encoded separator can never
@@ -705,19 +705,19 @@ never sees. Caller buffers, no allocation. `router` still matches raw bytes by d
 SPEC); if it ever decodes, `decodePath` is the rule to use. `validate.parseQueryLeaky` keeps its
 own lenient decoder for now.
 
-**PROXY protocol v1/v2 (server side)** — BACKLOG (2026-09-24, found by qap plan M5.1). A server
+**PROXY protocol v1/v2 (server side)** — BACKLOG (2026-09-24, found by the web-server consumer plan M5.1). A server
 behind a load balancer learns the real client only from the haproxy PROXY header the balancer
 prepends to the connection; nginx (`proxy_protocol`), Go (`pires/go-proxyproto`) and HAProxy itself
-parse it on accept, and nothing in zig-libs does. qap wrote its own (`src/proxy_protocol.zig`: v2
+parse it on accept, and nothing in zig-libs does. The web-server consumer wrote its own (`src/proxy_protocol.zig`: v2
 only, TCP4/TCP6/LOCAL, TLVs bounds-walked and skipped, a 536-byte header cap, and the trusted-peer
 check over `netaddr.Prefix`). Wanted here or as a small module of its own: a parser over a
 `std.Io.Reader` (peek + toss, so a missing optional header leaves the bytes for the codec), v1 text
 form too, TLV access (AWS/GCP ids, SSL info), and the "only from listed peers" rule as the API's
 default rather than the caller's discipline.
 
-**HTTP Upgrade from a handler** — DONE 2026-09-24 (qap plan M5.3): `ResponseWriter.upgrade`.
+**HTTP Upgrade from a handler** — DONE 2026-09-24 (the web-server consumer plan M5.3): `ResponseWriter.upgrade`.
 
-**h2 server concurrency for fibers** — DONE 2026-09-23 (qap plan M4.7a): `Dispatcher.io`. With it
+**h2 server concurrency for fibers** — DONE 2026-09-23 (the web-server consumer plan M4.7a): `Dispatcher.io`. With it
 set, the session lock is a `std.Io.Mutex` and `waitForPeer`/the drain park on a `std.Io.Condition`
 (`Session.moved`) that `pump`, a retiring handler and the connection task's exit broadcast; a
 `progress` counter sampled under the lock makes the wait immune to a wakeup that lands between the
@@ -739,7 +739,7 @@ candidate consumers layered on top of `http`'s server template, not gaps in `htt
 termination stays BYO (reverse proxy today)
 pending a native std TLS server.
 
-- ~~**`Client`: hand a CA bundle loaded earlier to another client**~~ — DONE 2026-09-28 (from qap
+- ~~**`Client`: hand a CA bundle loaded earlier to another client**~~ — DONE 2026-09-28 (from the web-server consumer
   M11.8): `Client.loadCaBundle()` loads eagerly; `Client.CaBundle` (bundle + its own lock, `load`,
   `deinit`) is shared through `Options.shared_ca`, borrowed and never freed by a client. A shared
   object rather than the `*const Bundle` first sketched, because `tlsclient` may write a
@@ -750,7 +750,7 @@ pending a native std TLS server.
   cannot interrupt a blocked phase).
 
 - ~~**BUG: `Options.inline_blocking` does not keep the work on the calling thread**~~ — FIXED
-  2026-09-28 (found by qap's jwks hardening probe: a Landlocked refresh thread still resolved a
+  2026-09-28 (found by the web-server consumer's jwks hardening probe: a Landlocked refresh thread still resolved a
   name it had no `/etc/hosts` grant for). std's `Io.net.HostName.connect` starts the lookup and one
   connect per address as tasks (`io.async` + `Io.Group`), so skipping `runBounded` was not enough.
   With `inline_blocking` the client now calls `HostName.lookup` directly — `Threaded`'s resolver
@@ -762,13 +762,13 @@ pending a native std TLS server.
   connecting a host name starts no task on the Io` (an `Io` whose vtable counts every task start:
   0 with the option, >0 without; 4 before the fix).
 
-- **Native TLS-terminating server** *(survey 2026-09-30)* — Go, dusty and zzz serve HTTPS directly; here TLS is the caller's (`serveStream` + ALPN). A user without a fronting proxy or qap-style TLS layer cannot deploy the server alone. Effort: large (needs a pure-Zig TLS server, `std.crypto.tls` has only the client; qap's TLS fork is the candidate source). Fits CONVENTIONS §2 (pure Zig) once a TLS server exists. **PLANNED (owner, 2026-10-19; replaces the 2026-10-11 plan):** not an S2 blocker (the BYO-TLS seam is the design). The server comes from a new zig-libs module `tlsserver` -- our own TLS 1.3 server built from the TLS 1.3 parts `dtls`, `tlsclient` and `tlsresume` already have, with qap's ianic/tls fork as a differential oracle and as a source of ported pieces (MIT, with NOTICE). Work starts after qap's move to Zig 0.17; this module then gets a TLS listener over `serveStream` + ALPN. **Status 2026-11-05:** `tlsserver` exists and qap runs it; the listener here is not wired yet.
+- **Native TLS-terminating server** *(survey 2026-09-30)* — Go, dusty and zzz serve HTTPS directly; here TLS is the caller's (`serveStream` + ALPN). A user without a fronting proxy or web-server-consumer-style TLS layer cannot deploy the server alone. Effort: large (needs a pure-Zig TLS server, `std.crypto.tls` has only the client; the web-server consumer's TLS fork is the candidate source). Fits CONVENTIONS §2 (pure Zig) once a TLS server exists. **PLANNED (owner, 2026-10-19; replaces the 2026-10-11 plan):** not an S2 blocker (the BYO-TLS seam is the design). The server comes from a new zig-libs module `tlsserver` -- our own TLS 1.3 server built from the TLS 1.3 parts `dtls`, `tlsclient` and `tlsresume` already have, with the web-server consumer's ianic/tls fork as a differential oracle and as a source of ported pieces (MIT, with NOTICE). Work starts after the web-server consumer's move to Zig 0.17; this module then gets a TLS listener over `serveStream` + ALPN. **Status 2026-11-05:** `tlsserver` exists and the web-server consumer runs it; the listener here is not wired yet.
 - ~~**Client cookie jar**~~ — DONE 2026-10-05 (`Client.Options.cookie_jar`, consulted on every request and redirect hop; the implementation is the sibling `cookies.Jar` with a public-suffix list). This line said "exists in neither" until the 2026-10-11 survey caught it.
 - **HTTP/3 (QUIC)** *(survey 2026-09-30)* — Go's stdlib has none either, hyper needs separate crates; listed only so the gap is on record. Effort: very large; pure Zig possible but no consumer. Not a priority.
-- **`ResponseWriter.header_buf` as a 4 KiB inline hole** *(qap R4, 2026-09-30)* — the writer is
+- **`ResponseWriter.header_buf` as a 4 KiB inline hole** *(the web-server consumer R4, 2026-09-30)* — the writer is
   ~6 KB, 4 KiB of it `header_buf`, of which a small response touches a few dozen bytes. On a
   fiber-per-connection server the untouched tail sits between touched frames and costs a stack
-  page per connection: measured in qap h1 saturation, `header_copy_bytes` 4096 -> 512 took
+  page per connection: measured in the web-server consumer h1 saturation, `header_copy_bytes` 4096 -> 512 took
   `serveStep`'s frame 10,232 -> 6,648 B and the resident stack 8 -> 7 pages (-4 KiB/conn). The h2
   side is fixed differently (writer in the stream arena, 2026-09-30). Shape of a fix: the copy
   budget as a caller-provided slice (e.g. from `StreamBuffers` / the pool slab) instead of an

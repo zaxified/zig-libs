@@ -60,7 +60,7 @@ const works = [_]Work{
 };
 
 const small_config =
-    \\// service configuration -- ttydesk / bxp shape
+    \\// service configuration -- the terminal-UI consumer / the build-tool consumer shape
     \\{
     \\  name: 'edge-gateway',
     \\  "version": 3, // trailing comment

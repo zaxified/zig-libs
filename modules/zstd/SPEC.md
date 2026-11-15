@@ -3450,8 +3450,8 @@ level-22/LDM port (≈ 500 lines of Zig with its goldens, diff runs and
 mutation sweep). Every item that changes output is anchored the same way as
 today: byte-identical to libzstd 1.5.7 through `tools/zref.c`, extended for
 the API in question, plus goldens and a mutation sweep. Consumers as of
-2026-09-22: **egw-hub** compresses CSV backups (one-shot suffices today);
-**qap** wants HTTP `Content-Encoding: zstd` (Z1a now, Z1 later);
+2026-09-22: **the ingest daemon** compresses CSV backups (one-shot suffices today);
+**The web-server consumer** wants HTTP `Content-Encoding: zstd` (Z1a now, Z1 later);
 dictionaries are undecided.
 
 - ~~**Z1 — Streaming compression, byte-identical to `ZSTD_compressStream2`.**~~
@@ -3562,7 +3562,7 @@ dictionaries are undecided.
   `ZSTD_CCtx_reset`. With dictionaries (Z4) reuse matters again: a
   `CDict` attached or copied into a reused context.
 - ~~**Z14 — A `StreamWriter` that serves many frames without allocating.**~~
-  Done 2026-09-26 (found by qap), see *Algorithm* (`StreamWriter`):
+  Done 2026-09-26 (found by the web-server consumer), see *Algorithm* (`StreamWriter`):
   `StreamWriter.reset(output, opts)`, the caller's scratch
   (`initScratch`) and no allocator at all (`initStatic`).
 
@@ -3697,7 +3697,7 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   2 × 128 KiB buffers and a `DecompressStream` per open of a compressed
   segment, most of a fuzz run's time): `Seekable.reset(src)`, see *Seekable
   format*. seglog can keep closed readers and reset one on the next open
-  (`egw-hub/seglog/src/root.zig`, `SegStore.openZst`).
+  (the ingest daemon's `seglog/src/root.zig`, `SegStore.openZst`).
 - ~~**Z24 — Adaptive level**~~ Done 2026-09-28: the module's part is
   `Stream.setLevel` (*Multithreading*, "The level changed during a
   frame"); the adaptation itself -- `FIO_compressZstdFrame`'s statistics

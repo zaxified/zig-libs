@@ -20,7 +20,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. The yardstick is fping's engine (a library counterpart of its `main_loop`); fping's CLI-only features (`-f` file, `-g` range generation, `-n` reverse lookup, output formats) belong to the consumer `zig-fping` and to the siblings `netaddr`/`dns`, not to this module.
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. The yardstick is fping's engine (a library counterpart of its `main_loop`); fping's CLI-only features (`-f` file, `-g` range generation, `-n` reverse lookup, output formats) belong to the ping-tool consumer and to the siblings `netaddr`/`dns`, not to this module.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|

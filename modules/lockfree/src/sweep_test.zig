@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! No-panic sweep tests (wave GU, findings LF-1 .. LF-5); see
-//! ~/CML/20261029-panic-sweep/lockfree-sweep.report.md. Misuse is a checked
+//! the 2026-10-29 panic-sweep report for `lockfree`. Misuse is a checked
 //! panic with a message: each one runs in a forked child whose stderr is
 //! captured.
 

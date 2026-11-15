@@ -145,7 +145,7 @@ pub const ServerAcceptOptions = struct {
     /// subprotocol negotiation happens and `ServerAccept.protocol` is
     /// always null.
     protocols: []const []const u8 = &.{},
-    /// `Origin` allow-list (qap security review M6.2, 2026-09-28). RFC 6455
+    /// `Origin` allow-list (the web-server consumer security review M6.2, 2026-09-28). RFC 6455
     /// requires every browser to send `Origin` on a WebSocket handshake
     /// (§1.3) but the base protocol enforces nothing about its value —
     /// unlike an ordinary cross-origin HTTP request, CORS never applies to a
@@ -705,7 +705,7 @@ test "acceptHandshake: no protocols offered -> no negotiation, always null" {
     try testing.expectEqual(@as(?[]const u8, null), accept.protocol);
 }
 
-// ── ServerAcceptOptions.origins (qap security review M6.2, 2026-09-28) ────
+// ── ServerAcceptOptions.origins (the web-server consumer security review M6.2, 2026-09-28) ────
 //
 // Each test would pass vacuously if the `originAllowed` check were deleted
 // (every request here is otherwise a valid RFC 6455 upgrade), so the assert

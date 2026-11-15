@@ -8,7 +8,7 @@
 
 **Ahead:** feature — the per-IP cap holds a socket from accept, so connections parked mid-header (slowloris) fill it: nginx 1.28.3 `limit_conn perip 1` counts a connection only once its whole header is read — with 20 sockets parked on an unfinished header a full request on a 21st still gets 200, while a second request during one being served gets 503 (`tools/nginx_probe/run.sh`); here the parked socket alone takes the slot and the next connection is refused at accept (test "integration: a socket with an unfinished request header holds its per-IP slot") (measured 2026-10-23)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (440/455, 15 eq) · src 46ae9d16f4f0959f
+**Audit:** review 2026-11-12 · mutation 2026-11-12 (440/455, 15 eq) · src 7fd3e91537c50738
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — abuse counters only (keyword review, 2026-10-07) · panic 2026-10-28 (sweep of every pub entry point: no data-reachable panic; `admit` refuses at `maxInt(u32)` live connections of one key, the server hooks check their context)
 
@@ -168,8 +168,8 @@ on `Options.dry_run`). Not changed, with reason → Backlog.
   abuseguard does not depend on ratelimit.
 - **No-panic sweep 2026-10-28:** nothing data-reachable; fixed `admit` overflow after `reconcile(ip, maxInt(u32))` with no per-IP cap (AG-2) and a checked panic for a hook wired without its context (AG-1).
 - ~~Fail-closed store as a lockout~~ — **done 2026-09-29**: `Options.on_store_full =
-  .admit_untracked` (qap research register H5). No init assertion when `max_conns_total` is null
-  with `.admit_untracked` — **rejected 2026-10-04**: qap's default runs exactly that way on
+  .admit_untracked` (the web-server consumer research register H5). No init assertion when `max_conns_total` is null
+  with `.admit_untracked` — **rejected 2026-10-04**: the web-server consumer's default runs exactly that way on
   purpose (documented in its config, H5), so an assert would turn a deliberate deployment
   choice into a crash; the check stays the consumer's configuration validation.
 - Otherwise none found beyond the pre-public security/similarity review pass (repo-wide, not

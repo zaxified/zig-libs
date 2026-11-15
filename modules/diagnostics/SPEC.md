@@ -92,7 +92,7 @@ read back by `std.json`; append + count/countBySeverity accounting across severi
 pattern (arena-lifetime append then read), and structural field coverage (path/line/col/end/
 byte-offset/code/message/suggest all round-trip through `items`). Run: `zig build test-diagnostics`.
 
-**Rendering, JSON, order** (2026-09-28, requested by ttydesk, which rendered findings itself and
+**Rendering, JSON, order** (2026-09-28, requested by the terminal-UI consumer, which rendered findings itself and
 smuggled the file name into `path` as `file:path`). `Diagnostic.file` (optional) names the source.
 `renderOne`/`Diagnostics.render` write `short` (one compiler-style line: `file:line:col:
 severity[code]: message (at path); suggestion`) or `snippet` (rustc style: header, `-->` location,
@@ -178,7 +178,7 @@ Survey 2026-09-30 — missing and it matters (pure Zig, all fit CONVENTIONS §2)
 
 - ~~Several labelled spans~~, ~~colour~~, ~~secondary notes~~, ~~code URL / structured fix-it~~ — **done
   2026-10-04**.
-- **`hint` severity** — *not now* (decided 2026-10-04): it adds an enum member, and bxp, the main consumer,
+- **`hint` severity** — *not now* (decided 2026-10-04): it adds an enum member, and the build-tool consumer, the main consumer,
   has four exhaustive `switch (d.severity)` sites that would stop compiling at its next repin, for a level it
   would render like `info`. Reopen when a consumer needs LSP's fourth level; then coordinate the repin.
 - **Same-line label merging and multi-line span drawing** *(re-check 2026-10-04)*: codespan/ariadne draw

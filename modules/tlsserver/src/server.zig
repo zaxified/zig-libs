@@ -1141,7 +1141,7 @@ const TicketerRing = struct {
 };
 
 /// Records sealed under one send key before the server turns it over with
-/// a KeyUpdate (RFC 8446 §5.5: AES-GCM's limit is 2^24.5 full records; qap
+/// a KeyUpdate (RFC 8446 §5.5: AES-GCM's limit is 2^24.5 full records; the web-server consumer
 /// rekeys at 2^23).
 pub const max_records_per_key: u64 = 1 << 23;
 

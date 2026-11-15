@@ -19,7 +19,7 @@
 //!
 //! Paths: the shortest path over the links that are up (Dijkstra by latency,
 //! ties broken by host id), latency summed and faults drawn per link — the
-//! generalization of axp-sim's tree model. Reachability is checked again on
+//! generalization of the router-tool consumer's simulator tree model. Reachability is checked again on
 //! arrival, so a link that fails while a packet is in flight drops it.
 //!
 //! Every draw comes from the network's own seeded stream, so changing a link

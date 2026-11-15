@@ -1,12 +1,12 @@
 # tlsfuzzer scripts `interop-tlsserver --tlsfuzzer DIR` runs (tools/tlsfuzzer.zig)
 # and the counts tlsserver gives. More failures than listed = FAIL; fewer, or
 # another PASS count = NOTE, update the line ("PASS *": any number). The note says what the remaining
-# failures are and what qap's fork of ianic/tls.zig gives
-# (qap scripts/conformance-baseline/tlsfuzzer.tsv): the M2 gate is "no script
+# failures are and what the web-server consumer's fork of ianic/tls.zig gives
+# (the web-server consumer scripts/conformance-baseline/tlsfuzzer.tsv): the M2 gate is "no script
 # worse than the fork", except two deliberate divergences named in their notes
 # (connection-abort: no tickets without psk_key_exchange_modes; obsolete-curves:
 # JDK 11 compatibility). Scripts that sample their cases run with -n 0.
-# Not run: test-tls13-mlkem.py (needs the kyber-py package, which qap's venv
+# Not run: test-tls13-mlkem.py (needs the kyber-py package, which the web-server consumer's venv
 # lacks; X25519MLKEM768 is covered by the OpenSSL / Go interop and BoGo),
 # test-tls13-mldsa-in-certificate-verify.py and
 # test-tls13-ecdsa-brainpool-in-certificate-verify.py (client keys of kinds

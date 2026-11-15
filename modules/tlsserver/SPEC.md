@@ -8,7 +8,7 @@
 
 **Ahead:** feature — Encrypted Client Hello server, RFC 9849: 45 BoGo ECH-Server tests, Go 1.26's ECH client live and replayed (measured 2026-10-22) · feature — offloaded asynchronous CertificateVerify signing for HSM/KMS or a signing thread: BoGo's 49 Async tests through it (measured 2026-10-22) · feature — delegated credentials, RFC 9345: BoGo's DelegatedCredentials server tests (measured 2026-10-22) · feature — sealed connection migration to another process, serialize and deserialize (measured 2026-10-22) · feature — 0-RTT on stateless tickets with a replay guard (measured 2026-10-22) · feature — RFC 8449 record_size_limit: tlsfuzzer test-record-size-limit, every TLS 1.3 case (measured 2026-10-22) · feature — dynamic record sizing with an idle reset (measured 2026-10-22) · feature — the JA4 client fingerprint (measured 2026-10-22)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-15 (1671/1773, 102 eq) · src 7a433422e8982b85
+**Audit:** review 2026-11-12 · mutation 2026-11-15 (1671/1773, 102 eq) · src 7f1cdc3692cc5f1e
 
 Audit detail: the FFDHE delta of the same day (from abdc66c5: `ffdhe_groups` and `supported_groups` in `server.zig`, the only library lines of that commit; 8 mutants, all killed; 2 new tests pin the exact code points and order, and serve every group alone) is added to the totals, which also carry the earlier 2026-11-01 delta below. The 2026-11-01 delta (from da5c973a) covers the prepared Ed25519 signer in `keys.zig` (`ed25519_signer`, `prepareSigner`, `certifiedKey`, `deinit`): 8 mutants, 5 killed, 3 equivalent (the unreachable `Ed25519Signer.init` failure, and the two `deinit` wipes of the signer, which `self.* = undefined` overwrites in every checked build); 1 new test (`fromPemDelegated` prepares the signer for every key kind, killing the missing `prepareSigner` call there); the totals add the delta to the 2026-10-28 run.
 
@@ -64,7 +64,7 @@ certificate; every secret compared with the client's) (2026-10-22). SCT stapling
 (RFC 6962) is beyond rustls, which dropped it; BoringSSL and OpenSSL have it.
 **tlsfuzzer (M2 exit gate, 2026-10-21):** 50 of its TLS 1.3 scripts run
 (`interop-tlsserver -- --tlsfuzzer DIR`, counts in `tools/tlsfuzzer/baseline.tsv`); against
-the 17 scripts qap's fork of ianic/tls.zig is held to, none is worse except two deliberate
+the 17 scripts the web-server consumer's fork of ianic/tls.zig is held to, none is worse except two deliberate
 divergences (`connection-abort`: no tickets for a client without `psk_key_exchange_modes`;
 `obsolete-curves`: JDK 11 compatibility), three are better (`signature-algorithms` 278/4
 over all its cases, `ecdsa-support` with a P-384 key, `eddsa` with an Ed25519 key), and
@@ -75,7 +75,7 @@ over all its cases, `ecdsa-support` with a P-384 key, `eddsa` with an Ed25519 ke
 A TLS 1.3 (RFC 8446) server for the collection, built as a buffer-driven (sans-I/O) core with
 a blocking wrapper on top, on the `tls13` handshake building blocks (key schedule,
 CertificateVerify, key exchange, transcript) and the collection's AEADs (`aesgcm`,
-`chachapoly`). It is being built to replace qap's fork of a third-party TLS server, milestone by
+`chachapoly`). It is being built to replace the web-server consumer's fork of a third-party TLS server, milestone by
 milestone.
 
 **Today:** `Server`, a sans-I/O full handshake — ClientHello → ServerHello, compatibility CCS,
@@ -96,7 +96,7 @@ application-data records (rustls, BoringSSL). With `Config.tickets` it issues Ne
 and resumes them (below). With `Config.client_auth` it asks for a client certificate, verifies
 the chain (`ClientCertVerifier`; `X509Verifier` = `x509.verifyChain` with clientAuth) and the
 client's CertificateVerify, and reports the leaf (`peerCertificate`), resumptions included. It
-is not yet the server qap runs (M3: qap's seams and performance).
+is not yet the server the web-server consumer runs (M3: the web-server consumer's seams and performance).
 
 **Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** kTLS itself (the
 record keys can be handed over to it: `Server.extractSecrets`) and post-handshake client authentication (*What is deliberately not
@@ -349,7 +349,7 @@ outcome, ECH, the client's record size limit, JA4 — sealed into a blob under t
 32-octet key and to a `context` the caller names (AES-256-GCM, a random nonce, the AAD
 "tlsserver connection v1" ‖ version ‖ context; `serializedLen` / `blobLen`), so a
 restart, an upgrade or another process takes the connection over without the client
-noticing (qap: zero-downtime reload with the socket handed over). Unlike s2n's plaintext
+noticing (the web-server consumer: zero-downtime reload with the socket handed over). Unlike s2n's plaintext
 blob, which its documentation tells the caller to encrypt and MAC, this one is sealed
 already; a flipped octet, a wrong key, another context or another version is `BadBlob`.
 **A blob is single-use:** two live copies seal different records under one key and
@@ -479,7 +479,7 @@ RFC 8446 §5, record layer over a byte stream:
   | TLS_CHACHA20_POLY1305_SHA256 | 0x1303 | SHA-256 | 32 | `chachapoly.ChaCha20Poly1305` |
 
   The AES suites keep an expanded `aesgcm` context per direction, so a record pays no key
-  schedule (the fork's per-direction context, which qap measured at 1.6–1.8× std at 16 KiB).
+  schedule (the fork's per-direction context, which the web-server consumer measured at 1.6–1.8× std at 16 KiB).
 - **Receive side** (`inbound.Inbound.next`), sans-I/O: takes the received octets, returns one
   event — a whole handshake message, application data, `peer_closed` or `need_more` — and how
   many octets it is done with. Protected records are opened in place, so application data is a
@@ -543,7 +543,7 @@ RFC 8446 §5, record layer over a byte stream:
   too long for its length prefix is `FieldTooLong`, a short buffer `BufferTooSmall`.
 - **In place:** `seal` takes the content at `buf[5..]` and writes type, padding, tag and header
   around it; `open` decrypts over the ciphertext and returns a slice of the same buffer. That is
-  the layout qap's zero-copy record codecs read and write.
+  the layout the web-server consumer's zero-copy record codecs read and write.
 
 ## Constant-time contract
 
@@ -588,7 +588,7 @@ buffer. A `writeSlot` not yet committed counts in full; `abandonWrite(n)` (what
 `Connection.deinit` calls) narrows it to the `n` octets written. An encoder that fails
 (`OutputFull`, `InternalError`) marks the whole buffer. Every per-connection wipe of a buffer
 uses `zeroize` (volatile 32-byte stores): `std.crypto.secureZero` stores a byte at a time, and
-wiping qap's 48 KiB output that way cost ~16 µs a connection.
+wiping the web-server consumer's 48 KiB output that way cost ~16 µs a connection.
 
 ## Limits and refusals
 
@@ -604,7 +604,7 @@ The receive side's refusals are the table under *Wire format*. Record protection
 - An inner plaintext that is all zeros: `MissingContentType` (§5.4, `unexpected_message`).
 - Sequence number 2^64 − 1: both directions refuse (`SequenceExhausted`); the engine must
   KeyUpdate first (§5.3). When to KeyUpdate earlier, at the AEAD's usage limit (§5.5), is the
-  engine's policy: `Server` rekeys at `max_records_per_key` (2^23), qap's bound.
+  engine's policy: `Server` rekeys at `max_records_per_key` (2^23), the web-server consumer's bound.
 - Records sent carry at most `Config.max_fragment_len` octets of content (2^14 by default,
   clamped to [512, 2^14]: rustls `max_fragment_size`, BoringSSL `SSL_set_max_send_fragment`);
   `minOutputLen` counts the extra records a smaller size makes. Records received may be 2^14.
@@ -941,7 +941,7 @@ are larger), so a small-stack worker must be sized for the keys and groups it en
 - **0-RTT without a replay guard:** `EarlyData.replay` is mandatory (BoringSSL takes early
   data with none and leaves anti-replay to the application). What early data may do is still
   the application's call (RFC 8470 for HTTP): the module only marks it (`early_data` events).
-- **kTLS:** not driven by this module — measured in qap at 41 % slower than userspace records.
+- **kTLS:** not driven by this module — measured in the web-server consumer at 41 % slower than userspace records.
   `Config.enable_secret_extraction` + `Server.extractSecrets` hand both directions' keys, IVs
   and sequence numbers to a caller that sets the socket up (rustls `enable_secret_extraction` /
   `dangerous_extract_secrets`, added 2026-10-21); like rustls, no traffic secrets, so a
@@ -971,7 +971,7 @@ swapping a short reader in after `init`, and the client hearing `internal_error`
 or missing signer — which first showed `tlsclient` reporting any alert under the handshake key
 as an unexpected message (fixed there). Final 15/16 over src `b8c33ee96363892a` (`581c2c366e89c392` after rewording one test comment, carried over: a mechanical change); the one left is
 equivalent in this module's binaries: `onHandshake` inlined into `feed` reaches `step`'s frame
-only where the optimizer also inlines `feed` into `step` — it did in qap's ReleaseFast build,
+only where the optimizer also inlines `feed` into `step` — it did in the web-server consumer's ReleaseFast build,
 not in this module's ReleaseSafe or ReleaseFast test binary (the depth test passes there with
 the mutant). ctgrind re-run: in-file counts unchanged (hs 28, app 8, ticket 77, ech 384; re-pinned 2026-11-01 to hs 22, app 8, ticket 78, ech 388: p256 signature declassified, Ed25519 on ct25519, and the public guards `transcript.writeHeader` length, `psk.checkContext` nonce length, `netaddr.parseIp` on the decrypted SNI, hpke `readyAead` verdict; ech 388 → 384 again by full CI 41323098008 after tls13/hpke moved to `mlkem`, matched by count, not read by stack; see the comments in `ctgrind-expected.tsv`),
 source digests re-pinned.
@@ -1051,7 +1051,7 @@ handshake sends nothing more, `extractSecrets`/`commitWrite`/`abandonWrite` refu
 overflow is `internal_error` for `quicAlert`), 21 mutants of its own and the `tlsserver-quic`
 fuzz harness: final run 97/99 over src `85b081da243a31ea` — the 2 equivalent ones change which
 secret `installRx` gets in QUIC mode, where it installs none.
-The `Connection` guard (2026-10-22, found from qap: a read sends what is queued before it waits,
+The `Connection` guard (2026-10-22, found from the web-server consumer: a read sends what is queued before it waits,
 so a writer parked mid-send — an HTTP/2 stream on a fiber — and the reader sent the same records
 twice): its own review found one MEDIUM, fixed — a writer could open a record while the reader
 waited for input, and what `feed` then queued (a KeyUpdate reply, an alert) landed over it;
@@ -1205,9 +1205,9 @@ records (the per-record 4 KiB burn).
 - **Client certificates, later:** raw public keys (RFC 7250, rustls has them), the whole client
   chain kept for the application (rustls `peer_certificates`; here the leaf), P-521 and ML-DSA
   client keys (with `tls13.certverify`), post-handshake authentication (not in rustls either). **M3:** the differential run against the fork and
-  qap on a branch; the seams are in (2026-10-21: one send buffer, `Connection.reader()`/`writer()`
-  in place, `Server.writeSlot`/`commitWrite`; the fork's atomics are not needed — qap reads and
-  writes a connection from one fiber, and the rekey bound is `max_records_per_key`, 2^23 as qap's);
+  the web-server consumer on a branch; the seams are in (2026-10-21: one send buffer, `Connection.reader()`/`writer()`
+  in place, `Server.writeSlot`/`commitWrite`; the fork's atomics are not needed — the web-server consumer reads and
+  writes a connection from one fiber, and the rekey bound is `max_records_per_key`, 2^23 as the web-server consumer's);
   the curve arithmetic moved to `ct25519`/`p256`/`p384` on 2026-10-21 (through `tls13`).
   Server-side handshakes per second, replayed recordings (`TLSSERVER_BENCH`, ReleaseFast, one
   core, this host, best of 5 × 0.4 s): P-256 certificate + X25519 + TLS_AES_256_GCM_SHA384 2,012

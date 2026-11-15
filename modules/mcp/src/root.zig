@@ -7068,7 +7068,7 @@ test "definitions: _meta, resource annotations/size and Implementation extras on
     );
 }
 
-test "ToolCall.arg: absent, null, wrong type and each value type apart (bxp request 2026-10-19)" {
+test "ToolCall.arg: absent, null, wrong type and each value type apart (the build-tool consumer request 2026-10-19)" {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
         \\{"s":"x","n":null,"i":5,"f":2.5,"fi":5.0,"b":true,"big":123456789012345678901234567890,"huge":1e300}
     , .{});

@@ -78,7 +78,7 @@ and `toFloat`; `BigDecimal` additionally has `fromFloatExact` (no scale, no mode
   arithmetic, parse, format, rounding or comparison path calls them, and even inside them there is
   no floating-point *arithmetic*: the `f64` is bit-inspected on the way in (`f64Binary`) or its
   shortest digits read from `std.fmt.float.render` (`f64Shortest`), and on the way out only
-  `std.fmt.parseFloat` produces the float. A consumer that wants a float-free pipeline (bxp) keeps
+  `std.fmt.parseFloat` produces the float. A consumer that wants a float-free pipeline (the build-tool consumer) keeps
   it by not calling the three entry points. Checked with `rg -n 'fromFloat|toFloat' src` (no hit
   outside the definitions and tests).
 - Tests: expected values come from Python's `decimal` (`Decimal(0.1)`, `.quantize` in all seven
@@ -251,13 +251,13 @@ skipped and more than 15 significant digits is `Overflow`).
 ## Backlog / deferred
 
 **S2 plan — survey 2026-10-20** (Sonnet, read-only; Python decimal/libmpdec, cockroachdb/apd, shopspring,
-rust_decimal, bigdecimal-rs, Java BigDecimal). bxp hand-rolls MOD/MROUND/TRUNC/SIGN/POWER/SQRT on raw
-values (bxp expr.zig:2806-2989, 4705) — the module lacks them.
+rust_decimal, bigdecimal-rs, Java BigDecimal). The build-tool consumer hand-rolls MOD/MROUND/TRUNC/SIGN/POWER/SQRT on raw
+values (the build-tool consumer expr.zig:2806-2989, 4705) — the module lacks them.
 
 | # | Item | Effort | Decision |
 |---|---|---|---|
 | R1 | `BigDecimal.roundToPrecision(prec, mode)` + `divPrec(a, b, prec, mode)` returning `{value, inexact, rounded}` | M | **DONE 2026-10-20** |
-| R2 | `Decimal.rem`, `roundToMultiple`, `pow(i32)`, `sqrt`, `signum`, `min`/`max` | S each | **DONE 2026-10-20** (bxp can drop its raw MOD/MROUND/SIGN/POWER/SQRT at repin) |
+| R2 | `Decimal.rem`, `roundToMultiple`, `pow(i32)`, `sqrt`, `signum`, `min`/`max` | S each | **DONE 2026-10-20** (the build-tool consumer can drop its raw MOD/MROUND/SIGN/POWER/SQRT at repin) |
 | R3 | Fixed-places output `toStringFixed(places)`; `BigDecimal.format` | S | **DONE 2026-10-20** |
 | R4 | Scientific / engineering output; zero with scale | S (display) | **DONE 2026-10-20** (`toSci`/`toEng`; no signed zero) |
 | R5 | `ROUND_05UP` (8th GDA mode) | S | **DONE 2026-10-20** — `round_05up`; no consumer has an exhaustive switch |

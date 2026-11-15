@@ -327,7 +327,7 @@ test "Decimal.rem / divideInteger / remainderNear: signs and the i128 corner" {
     try testing.expectError(error.Overflow, min.divideInteger(Decimal{ .raw = -1 }));
 }
 
-test "Decimal.roundToMultiple: bxp MROUND semantics, any mode" {
+test "Decimal.roundToMultiple: the build-tool consumer MROUND semantics, any mode" {
     // MROUND(0.075, 0.05) = 0.1 (halves away), MROUND(12.37, 0.05) = 12.35, the sign of m is ignored.
     try expectD("0.1", try d("0.075").roundToMultiple(d("0.05"), .half_up));
     try expectD("0.1", try d("0.075").roundToMultiple(d("-0.05"), .half_up));

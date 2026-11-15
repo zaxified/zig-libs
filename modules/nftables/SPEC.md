@@ -6,7 +6,7 @@
 
 **Scope:** parity — nft / libnftables, google/nftables v0.3.0, nftables-rs (surveyed 2026-11-07; every substantial feature of the native backend and of the JSON schema is built or rejected with a reason, see "Compared with"; open items are small: `ct timeout` typed decode, a live lane for the 2026-11-07 additions)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-15 (774/783, 9 eq) · src 798f639e1f1dbb80
+**Audit:** review 2026-10-04 · mutation 2026-11-15 (774/783, 9 eq) · src b2de5fc0c5988024
 
 **Hardening:** fuzz 2026-11-07 (`NFTABLES_FUZZ=200000` per harness, ReleaseSafe, clean; the expression and wire harnesses now start from the kernel's own dump bytes and reach typed expressions, flowtables, typed objects, events and catch-all elements, all labels hit and the seed counts pinned) · ct n/a — firewall rules via netlink (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: commit/dump budgets → `TooManyMessages` (was an endless spin), batch seq window incl. wraparound, un-acked foreign-only datagrams, DUMP_INTR drain + fresh seq, DONE errno, `errorFromErrno(minInt)`; delta audit 38/41 + 2 eq, 1 live-only wiring)
 

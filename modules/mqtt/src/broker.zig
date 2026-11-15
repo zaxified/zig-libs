@@ -1197,7 +1197,7 @@ pub const Config = struct {
     /// Hard cap on the bytes (topic + payload) the retained store holds.
     /// `max_retained` counts topics only, so it bounded nothing once
     /// `max_packet_size` was raised: 8192 Wills of 60 KB took a hub from
-    /// 2 MB to 494 MB RSS (egw audit S1). Past the cap a new topic is
+    /// 2 MB to 494 MB RSS (ingest-consumer audit S1). Past the cap a new topic is
     /// refused, and an update that would cross it REMOVES the topic's old
     /// value rather than keep one its publisher has since replaced. Both
     /// count in `Broker.retainedRefusals()`, as does a topic refused by
@@ -1296,7 +1296,7 @@ pub const Config = struct {
     /// Will's), once the connection is authenticated: a Will is a message
     /// the broker publishes on the client's behalf later, and without the
     /// check any account could publish anything, retained, anywhere by
-    /// dropping its socket (egw audit S1 R1). A denied Will refuses the
+    /// dropping its socket (ingest-consumer audit S1 R1). A denied Will refuses the
     /// CONNECT with `not_authorized`, as mosquitto does — refusing it at
     /// death instead would tell the client nothing. The decision is taken
     /// once, at CONNECT.
@@ -1363,7 +1363,7 @@ pub const Config = struct {
     ///
     /// Without it a recorder or bridge built on the tap — the tap's documented
     /// purpose — loses every Will unless it also subscribes: the broker
-    /// publishes a Will from `remove`, through fan-out only. egw-proxy's ring
+    /// publishes a Will from `remove`, through fan-out only. The MQTT-proxy consumer's ring
     /// recorded a gateway's `status = connected` 17 times and its
     /// `disconnected` Will never.
     ///
@@ -3209,7 +3209,7 @@ pub const Broker = struct {
                 return .close;
             }
             const existing = b.findSession(conn.clientId());
-            // ⛔ A client id is not an identity (egw audit S1 R3): another
+            // ⛔ A client id is not an identity (ingest-consumer audit S1 R3): another
             // account that knows it would otherwise resume the session —
             // its subscriptions and queue, never ACL-checked for this
             // account — take over the live connection, or discard it all
@@ -6022,15 +6022,15 @@ test "a persistent session keeps its subscriptions and queues QoS 1 while away" 
     var t1 = TestTransport{};
     const s1 = try connectSession(&b, &t1, "web", false, 0);
     try testing.expect(!s1.present); // nothing to resume the first time
-    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "egw/#", .qos = .at_least_once }});
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "hub/#", .qos = .at_least_once }});
     try testing.expect((try t1.next()).? == .suback);
     try feedDisconnect(&b, s1.conn);
     b.remove(s1.conn);
 
     // Away: the subscription is still counted, and both messages wait.
     try testing.expectEqual(@as(usize, 1), b.subscriptionCount());
-    try b.publish("egw/1/t", "20.5", .at_least_once, false);
-    try b.publish("egw/1/t", "20.6", .at_least_once, false);
+    try b.publish("hub/1/t", "20.5", .at_least_once, false);
+    try b.publish("hub/1/t", "20.6", .at_least_once, false);
     try testing.expectEqual(@as(?usize, 2), b.sessionQueued("web"));
 
     var t2 = TestTransport{};
@@ -6045,7 +6045,7 @@ test "a persistent session keeps its subscriptions and queues QoS 1 while away" 
     try testing.expect(m1.packet_id != m2.packet_id);
     try testing.expectEqual(@as(?usize, 0), b.sessionQueued("web"));
     // No SUBSCRIBE was needed: a live publish reaches it directly.
-    try b.publish("egw/1/t", "20.7", .at_least_once, false);
+    try b.publish("hub/1/t", "20.7", .at_least_once, false);
     try testing.expectEqualStrings("20.7", (try t2.next()).?.publish.payload);
 }
 
@@ -6342,10 +6342,10 @@ test "sessionStates reports subscriptions, queue, flight and drops of every sess
 test "a restored session queues from the start, and its client resumes it" {
     var b = Broker.init(testing.allocator, .{});
     defer b.deinit();
-    try b.restoreSession("web", null, &.{ .{ .filter = "egw/#", .qos = .at_least_once }, .{ .filter = "q0", .qos = .at_most_once } }, 100);
+    try b.restoreSession("web", null, &.{ .{ .filter = "hub/#", .qos = .at_least_once }, .{ .filter = "q0", .qos = .at_most_once } }, 100);
     try testing.expectEqual(@as(usize, 1), b.sessionCount());
     try testing.expectEqual(@as(usize, 2), b.subscriptionCount());
-    try b.publish("egw/1/t", "20.5", .at_least_once, false);
+    try b.publish("hub/1/t", "20.5", .at_least_once, false);
     try b.publish("q0", "gone", .at_least_once, false); // QoS 0 grant: nothing kept offline
     try testing.expectEqual(@as(?usize, 1), b.sessionQueued("web"));
 
@@ -6462,7 +6462,7 @@ fn connectSessionAs(b: *Broker, tt: *TestTransport, client_id: []const u8, usern
 test "a restored session keeps its owner" {
     var b = Broker.init(testing.allocator, .{});
     defer b.deinit();
-    try b.restoreSession("web", "hub-reader", &.{.{ .filter = "egw/#", .qos = .at_least_once }}, 0);
+    try b.restoreSession("web", "hub-reader", &.{.{ .filter = "hub/#", .qos = .at_least_once }}, 0);
     var t1: TestTransport = .{};
     try testing.expectError(error.Refused, connectRaw(&b, &t1, .{ .client_id = "web", .username = "other", .clean_session = false }));
     var t2: TestTransport = .{};

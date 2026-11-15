@@ -351,7 +351,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     if (posix) genAltPosix(S, src, &g, 0) else genAlt(S, src, &g, 0, mode);
     // A share padded past the lazy DFA's size with a dead alternative (`q` is
     // not in the input alphabet): the same language, but `isMatch` runs the
-    // NFA set simulation (bxp 2026-10-19: a stale closure after a prefilter
+    // NFA set simulation (the build-tool consumer 2026-10-19: a stale closure after a prefilter
     // skip lived only there; repeating the whole pattern instead hid it —
     // 0 of 200 000 seeds). Half of them start with an assertion reachable
     // both from the start and after a consumed code point (`a?\b`): when the

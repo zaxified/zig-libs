@@ -313,7 +313,7 @@ const X86 = struct {
     /// behind `.p2align 5`. Intel's JCC erratum (Skylake…Cascade Lake
     /// microcode) sends a fused `cmp`+`jb` that crosses a 32-byte boundary to
     /// the legacy decoder: the compiled loop ran 13–30 % slower depending only
-    /// on where the linker put it (2026-10-19, `~/CML/zig-017/jcc/REPORT.md`;
+    /// on where the linker put it (2026-10-19, the 2026-10 jcc investigation report;
     /// bench-crc32c 1.38× Go on 0.17, 2026-10-20). Here the ends of the three
     /// blocks are the bases and a negative index counts up to 0, so `add`+`jnz`
     /// fuse with no `cmp` and the 27-byte body sits inside one 32-byte window.

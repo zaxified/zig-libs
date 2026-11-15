@@ -317,7 +317,7 @@ pub const journal = struct {
     /// fixed-size (this module allocates nowhere). Each field costs 3
     /// `iovec` entries (header, value, trailing newline); `max_fields * 3`
     /// stays far under Linux's `IOV_MAX` (1024). Comfortably above any
-    /// realistic single record (ttydesk's own audit trail sends ~12).
+    /// realistic single record (the terminal-UI consumer's own audit trail sends ~12).
     pub const max_fields = 64;
 
     /// Per-field header glue: the name, then either `=` (text form) or a
@@ -674,7 +674,7 @@ test "UnixEmitter: PathTooLong instead of a silently truncated (wrong) path" {
 
 test "journal.validFieldName: sd_journal's rules" {
     try journal.validFieldName("MESSAGE");
-    try journal.validFieldName("TTYDESK_ACTION");
+    try journal.validFieldName("DESKTOP_ACTION");
     try journal.validFieldName("A");
     try journal.validFieldName("A0");
     try t.expectError(error.FieldNameEmpty, journal.validFieldName(""));
@@ -755,14 +755,14 @@ test "journal.Emitter.sendMessage: MESSAGE/PRIORITY/SYSLOG_IDENTIFIER convenienc
     try emitter.sendMessage(.{
         .message = "unit restarted",
         .priority = .notice,
-        .identifier = "ttydesk",
-        .fields = &.{.{ .name = "TTYDESK_ACTION", .value = "unit.restart" }},
+        .identifier = "desktop",
+        .fields = &.{.{ .name = "DESKTOP_ACTION", .value = "unit.restart" }},
     });
 
     var recv_buf: [256]u8 = undefined;
     const got = try recv.recv(&recv_buf);
     try t.expectEqualStrings(
-        "MESSAGE=unit restarted\nPRIORITY=5\nSYSLOG_IDENTIFIER=ttydesk\nTTYDESK_ACTION=unit.restart\n",
+        "MESSAGE=unit restarted\nPRIORITY=5\nSYSLOG_IDENTIFIER=desktop\nDESKTOP_ACTION=unit.restart\n",
         got,
     );
 }

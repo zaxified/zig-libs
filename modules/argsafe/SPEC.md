@@ -58,7 +58,7 @@ Surveyed 2026-09-30, re-surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md`; stars and 
     implementation detail and only ever go through `push`/`pushChecked`/`pushIf`/`slice`/`deinit`. A
     future refactor should consider a stronger encapsulation (e.g. an opaque handle plus an
     accessor in a separate file) to make the invariant harder to violate by accident.
-- **`CharClass.explain(s) ?Reason` — DONE 2026-09-28** (requested by ttydesk). `check` is now
+- **`CharClass.explain(s) ?Reason` — DONE 2026-09-28** (requested by the terminal-UI consumer). `check` is now
   `explain(s) == null`, not a second hand-written copy of the same conditions — the two cannot
   drift apart because there is only one implementation. `Reason` names which condition failed
   (`too_short`, `too_long`, `nul_byte`, `leading_dash`, `forbidden_substring`, `bad_first_char`,
@@ -66,7 +66,7 @@ Surveyed 2026-09-30, re-surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md`; stars and 
   (a UI, a config-validation error) can say *why* a value was rejected without re-implementing
   `check`'s rules.
 - **`Template` — an argv shape from a trusted config, holes filled from untrusted values — DONE
-  2026-09-28** (requested by ttydesk, ideal API sketched in the former backlog entry below).
+  2026-09-28** (requested by the terminal-UI consumer, ideal API sketched in the former backlog entry below).
   `Template.parse(tokens, holes: []const Hole{ name, class })` validates a template
   (`["systemctl", "restart", "{unit}"]`-shaped) up front, allocating nothing (`tokens`/`holes` are
   borrowed — the template is config, trusted to outlive every `fill`). It fails closed on a config

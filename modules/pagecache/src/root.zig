@@ -62,13 +62,13 @@
 //!
 //! **Fiber-reentrant on one thread.** Single-owner means one thread, not one
 //! call at a time: when the inner `Storage` parks the calling fiber on its
-//! I/O (qap's io_uring owner ring does), another fiber on the same thread may
+//! I/O (the web-server consumer's io_uring owner ring does), another fiber on the same thread may
 //! call in meanwhile. Every inner call is made with the cache in a state a
 //! second caller may see: a write reaches media before the cache is touched,
 //! and a page being read into its slot is a miss for everyone else until it
 //! is filled (ramcache hides unfilled reservations) -- so the second caller
 //! reads it for itself and never sees the unfilled bytes. Found and pinned
-//! for qap's research register H4 (2026-09-29): a kvtree reader and a commit
+//! for the web-server consumer's research register H4 (2026-09-29): a kvtree reader and a commit
 //! interleaved at every storage call, both directions.
 
 const std = @import("std");
@@ -1883,7 +1883,7 @@ test "a write that FAILS never leaves the cache holding bytes media does not hav
 
 /// An inner `Storage` whose `pread` first runs `hook` once -- what another
 /// fiber on the same thread does while the reading fiber is parked on its
-/// disk read (qap's `Serial` owner ring suspends exactly there). The hook
+/// disk read (the web-server consumer's `Serial` owner ring suspends exactly there). The hook
 /// re-enters the SAME `PageCache`, so the test sees every cache state that a
 /// read in flight leaves visible.
 const YieldStorage = struct {
@@ -1970,7 +1970,7 @@ const YieldStorage = struct {
 };
 
 test "fiber-reentrant: a read of a page whose fill is in flight gets the page, never the unfilled slot" {
-    // qap research register H4 (2026-09-29): `preadRef`'s miss reserves the
+    // the web-server consumer research register H4 (2026-09-29): `preadRef`'s miss reserves the
     // cache slot and then reads into it. A reader that suspends in that read
     // (a fiber) lets a second one in; before ramcache hid unfilled entries,
     // the second one got a HIT on the uninitialized slot -- and a kvtree
@@ -2033,7 +2033,7 @@ test "fiber-reentrant: a read of a page whose fill is in flight gets the page, n
 }
 
 test "fiber-reentrant: kvtree reads the committed version at every point a commit parks" {
-    // The contract qap's `Serial` relies on to serve reads while a commit's
+    // The contract the web-server consumer's `Serial` relies on to serve reads while a commit's
     // fsync is in flight (research register H4): with the Db's commit parked
     // in ANY of its storage calls -- a base-page read, a page write, either
     // fsync -- a second fiber on the same thread may read, and reads the last

@@ -8,7 +8,7 @@
 
 **Ahead:** feature — scan resistance: after ONE full sequential scan of a 2000-page file through a 200-page cache, a 100-page hot set costs 0 backend reads here (W-TinyLFU admission via `ramcache`) and 100 of 100 in SQLite 3.46.1, whose pcache1 is LRU (the scan evicts the whole hot set); with a 180-page hot set 2 vs 184 (`tools/scan_probe`, backend reads counted per phase, SQLite side by `strace -e trace=pread64` with `mmap_size=0`) (measured 2026-10-24)
 
-**Audit:** review 2026-10-30 · mutation 2026-10-30 (41/46, 5 eq) · src 91b2890eb7408e4f
+**Audit:** review 2026-10-30 · mutation 2026-10-30 (41/46, 5 eq) · src e87bf3f54a2bc06a
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — page cache (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: `init` option contracts are named panics; a sub-page write drops only the pages it touches; all-borrowed cache documented)
 
@@ -379,7 +379,7 @@ internal and was driven through its public SQL API, not called directly.
 - **Delta audit 2026-10-29 (no-panic sweep § GI):** 3 mutants over `dropSpan` (empty-span return dropped, span cut to its first page, always the whole-file sweep): 3/3 killed on the first run. Unfiltered ReleaseSafe suite.
 - **No-panic sweep 2026-10-29 (§ GI), left as LOW**: R-pagecache-2 a last close / truncating open / rename / delete runs ramcache `removeMatching`, a scan of the resident map; R-pagecache-3 read-ahead's scratch buffer is up to the cache budget per sequential miss (caller option, documented); R-pagecache-4 `findByPath`/`findById` are linear in open files; R-pagecache-5 a double `releasePage` or one after `deinit` is undetected (ramcache assert; documented on `preadRef`, a generation token would close it).
 - ~~Not fiber-reentrant: a reserved page is visible before it is filled~~ -- **fixed 2026-09-29**
-  (qap H4): ramcache now treats an unfilled reservation as a miss for `get`/`pin`/`drainDirty`; the
+  (the web-server consumer H4): ramcache now treats an unfilled reservation as a miss for `get`/`pin`/`drainDirty`; the
   module doc states the contract ("fiber-reentrant on one thread") and two tests interleave a
   second caller at every inner call (`YieldStorage`), including a kvtree commit running while a
   reader is parked mid-fill of the root page.

@@ -141,7 +141,7 @@ const next_due = manager.maintain();
 
 - **Your clock or ours.** `maintain` is one step and returns the epoch second
   it next has work; `run` is the loop. A server that already has a timer
-  (qap does) calls `maintain` from it.
+  (the web-server consumer does) calls `maintain` from it.
 - **Storage** is an interface: `DirStorage` on disk, `MemStorage` in memory,
   or your own (a database, a key-value service). Layout:
   `certificates/<name>.pem` (key + chain, one atomic write), `accounts/<issuer>/account.key`,

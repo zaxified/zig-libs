@@ -820,7 +820,7 @@ test "evaluate: `*` asks whether the representation exists, not whether it has a
     try testing.expectEqual(Outcome.precondition_failed, evalWith(.put, "If-None-Match: *\r\n", lm_only));
     try testing.expectEqual(Outcome.not_modified, evalWith(.get, "If-None-Match: *\r\n", lm_only));
     // No validator at all = no representation: the create-only PUT proceeds
-    // (what qap's `precondition` relies on), If-Match: * fails.
+    // (what the web-server consumer's `precondition` relies on), If-Match: * fails.
     try testing.expectEqual(Outcome.proceed, evalWith(.put, "If-None-Match: *\r\n", .{}));
     try testing.expectEqual(Outcome.precondition_failed, evalWith(.put, "If-Match: *\r\n", .{}));
     // `exists` overrides the inference both ways.

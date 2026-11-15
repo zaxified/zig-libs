@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests for blobstore (wave GW). Findings BS-1 .. BS-4, see
-//! ~/CML/20261029-panic-sweep/blobstore-sweep.report.md.
+//! the 2026-10-29 panic-sweep report for `blobstore`.
 const std = @import("std");
 const t = std.testing;
 const root = @import("root.zig");
@@ -89,7 +89,7 @@ test "casCreateTemp: uniq may not leave its path component, nothing else is refu
     const edge = try store.casCreateTemp(&longest, &tb);
     edge.file.close(t.io);
     store.discardTemp(edge.tmp);
-    // axp-vault's shape "{device}-{key}-{idx}" with device 128 + key 100 chars (> 128 overall)
+    // the router-tool consumer's backup vault shape "{device}-{key}-{idx}" with device 128 + key 100 chars (> 128 overall)
     const device: [128]u8 = @splat('d');
     const key: [100]u8 = @splat('k');
     var ub: [300]u8 = undefined;

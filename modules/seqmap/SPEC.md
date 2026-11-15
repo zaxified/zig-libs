@@ -28,7 +28,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [schweikert/fping](https://github.com/schweikert/fping) `seqmap` — **reference** | C | BSD-style custom (COPYING; API: NOASSERTION) | 1.2k | v5.5 (2025-12-31) | Internal 16-bit sequence to (host, ping index, send time) table used by the probe loop; not exported as a library. *(inferred)* |
 | [prometheus-community/pro-bing](https://github.com/prometheus-community/pro-bing) | Go | MIT | 508 | v0.9.1 (2026-06-29) | Ping library whose README talks of sequence numbers for duplicate detection; correlation is internal to a `Pinger`. |
 | [kolapapa/surge-ping](https://github.com/kolapapa/surge-ping) | Rust | MIT | 99 | push 2026-09-16 | Async ping crate; its README says replies are matched by `(address, identifier, sequence)` through registered waiters. |
-| Zig ecosystem | Zig | — | — | — | Nothing comparable found (`gh search repos fping --language zig`: only our own `zig-fping`). |
+| Zig ecosystem | Zig | — | — | — | Nothing comparable found (`gh search repos fping --language zig`: only a consumer's own ping tool). |
 
 **Where we are ahead:** a standalone, allocation-free-after-init, O(1) 65 536-slot table with round-robin id reuse that maximises the stale-reply detection window, `answered` duplicate flag, idempotent `release`, and a never-panics guarantee on foreign ids; usable by any 16-bit-id protocol. **Where we are behind:** the table is 16-bit only (no 32-bit or `(address, id, seq)` keys), no built-in expiry (deliberate: "the map itself has no notion of time"), no anti-spoofing token (out of scope per SPEC).
 

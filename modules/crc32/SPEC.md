@@ -219,7 +219,7 @@ table.
   so no lane will build under it. The class can come back unnoticed; it only affects a Debug
   build that emits a binary with the self-hosted backend. Measured 2026-09-29
   over the 13 modules with inline asm: only these three failed. Was:
-- **Baseline x86_64 Debug build fails (found 2026-09-29 by qap's
+- **Baseline x86_64 Debug build fails (found 2026-09-29 by the web-server consumer's
   `scripts/check-portable.sh`, `-Dtarget=x86_64-linux`).** The PCLMUL path is
   chosen at run time (`cpuidPclmul`), so `pclmulUpdate`'s inline
   `pclmulqdq` is compiled for every x86_64 target; Zig 0.16's self-hosted

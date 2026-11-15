@@ -38,7 +38,7 @@
 //!   *connection* is exactly the resource being defended).
 //!   That default is itself a lockout vector: N addresses each holding one
 //!   idle connection under every cap fill the store, and every NEW address
-//!   is refused while the holders are served (measured from qap, 2026-09-29:
+//!   is refused while the holders are served (measured from the web-server consumer, 2026-09-29:
 //!   4096 loopback addresses; over IPv6 per /64 a free /48 is 65 536 keys).
 //!   `Options.on_store_full = .admit_untracked` is the opt-out: such a
 //!   connection skips the per-IP cap and reputation, but it is still
@@ -191,7 +191,7 @@ pub const Options = struct {
     /// the lockout is worse than an uncapped address — and then set
     /// `max_conns_total`, the one bound left on those connections. `init`
     /// does not insist on it: a consumer may knowingly run without a global
-    /// cap (qap's default does, and documents it), so that check belongs to
+    /// cap (the web-server consumer's default does, and documents it), so that check belongs to
     /// the consumer's configuration validation.
     on_store_full: StoreFull = .reject,
     /// Addresses exempt from every reputation verdict (fail2ban `ignoreip`):
@@ -1883,7 +1883,7 @@ test "bounded store: live connections are never evicted; store_full rejects; emp
 }
 
 test "store full, on_store_full = .admit_untracked: admitted with no entry, still under max_conns_total" {
-    // The lockout the fail-closed default allows (qap research register H5):
+    // The lockout the fail-closed default allows (the web-server consumer research register H5):
     // every entry holds a live connection, so a new address is untrackable.
     var tc: TestClock = .{};
     var g = try Guard.init(testing.allocator, .{

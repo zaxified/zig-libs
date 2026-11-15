@@ -5,9 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep (§ GK): 7 mutants over the GK fixes, 7/7 after one new test. Card A1 again.
-- **2026-10-29** — **Behaviour change:** `Options.max_queued` defaults to `default_max_queued` = 1 << 20 (was 0 = unbounded): past 1 Mi queued, not-yet-started jobs `submit` returns `error.QueueFull`; `max_queued = 0` is the explicit unbounded opt-in (owner rule: safe default, configurable). Consumers checked: writebehind nacks and retries, qap `offload` maps to `Busy`. **Behaviour change (fix):** `drain`, `shutdownNow` (on a running pool) and `deinit` called from one of the pool's own jobs panic in every mode, like `wait` — they joined their own thread (deadlock / UB). A double `Submitter.deinit` is a checked panic (was: the counter wrapped and `registerSubmitter` failed forever). No-panic sweep + blind review (§ GK).
+- **2026-10-29** — **Behaviour change:** `Options.max_queued` defaults to `default_max_queued` = 1 << 20 (was 0 = unbounded): past 1 Mi queued, not-yet-started jobs `submit` returns `error.QueueFull`; `max_queued = 0` is the explicit unbounded opt-in (owner rule: safe default, configurable). Consumers checked: writebehind nacks and retries, the web-server consumer `offload` maps to `Busy`. **Behaviour change (fix):** `drain`, `shutdownNow` (on a running pool) and `deinit` called from one of the pool's own jobs panic in every mode, like `wait` — they joined their own thread (deadlock / UB). A double `Submitter.deinit` is a checked panic (was: the counter wrapped and `registerSubmitter` failed forever). No-panic sweep + blind review (§ GK).
 - **2026-10-25** — **CONSUMER-VISIBLE:** `Options.spin_ns` defaults to 50 µs (was 0): a worker that finds the queue empty, and now also a `wait` caller that finds the pool busy, keep looking for up to 50 µs before they park (owner's decision; an idle pool spends 50 µs of CPU per worker after its last job, then sleeps). With it the pool is faster than rayon-core, threadpool and ants on every bench row; `.spin_ns = 0` restores the old behaviour. **Fixes:** a job submitted after `pause()` returned could still start (`pause` now waits for a worker between its pause check and its dequeue); a `wait` that saw a submit in flight stayed parked on an idle pool when that submit failed with `SubmitFailed` (the rollback now wakes waiters). Grade 1: model-fuzz harness (`src/model_fuzz_test.zig`, `WORKERPOOL_FUZZ`), the field measured (`tools/rust_fast_bench`, `tools/go_fast_bench`), the audit's tests (`src/audit_test.zig`, `src/lead_test.zig`). Needs `testkit` for its tests.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that Zig has no io-less blocking mutex / `std.Thread` primitives re-checked against the 0.17.0 std (still true).
@@ -27,7 +28,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `workingCount`, `queuedCount`, and an opt-in bounded queue — `Options.max_queued` (default 0 =
   unbounded, behaviour unchanged) with `SubmitError.QueueFull`, admission by a CAS counter reserved
   before the box allocation and released on dequeue and on every rollback (SPEC §5). **Breaking
-  for exhaustive `switch`es over `SubmitError`** (a new member): `qap/src/offload.zig` has one.
+  for exhaustive `switch`es over `SubmitError`** (a new member): the web-server consumer's `src/offload.zig` has one.
   Adds `tools/bench.zig` + `tools/c_bench/main.c` (comparative benchmark against the pinned
   thpool; `zig build bench-workerpool`). Rejected with reasons: result handle, panic isolation,
   dynamic resizing (SPEC §6b/§7).

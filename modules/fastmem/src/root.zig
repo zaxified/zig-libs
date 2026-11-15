@@ -10,7 +10,7 @@
 //! and every `std.crypto.secureZero`, ends in compiler_rt's `memset`, which in
 //! Zig 0.16 stores **one byte per iteration**: measured 3.2 GB/s on an
 //! i7-7920HQ, against 65–96 GB/s for compiler_rt's own `memcpy` on the same
-//! core (qap audit, 2026-09-28). A 4 KiB clear costs ~1.25 µs where it should
+//! core (the web-server consumer audit, 2026-09-28). A 4 KiB clear costs ~1.25 µs where it should
 //! cost ~50 ns, and the callers are not only ours: std's deflate clears a
 //! 64 KiB hash table per gzip response, TLS libraries scrub record buffers
 //! per handshake.
