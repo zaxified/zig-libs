@@ -16,7 +16,7 @@ blocking (`Connection`), certificate and key from PEM (`keys`). The rustls parit
 with BoGo: the 305 TLS 1.3 server tests rustls passes that apply all pass here (131 more are
 disabled with a reason, 0 gaps; `SPEC.md`).
 
-- **Status:** the collection's TLS 1.3 server (with `tlsclient` and `dtls`); qap runs it behind
+- **Status:** the collection's TLS 1.3 server (with `tlsclient` and `dtls`); the web-server consumer runs it behind
   `-Dtls-engine=tlsserver` while its fork of a third-party server is still the default.
 - **Model after:** RFC 8446; rustls `ServerConnection` for scope and the buffer-driven split.
 - **Platform:** any (pure computation; `Connection` uses std.Io). **Role:** server.
@@ -80,7 +80,7 @@ zeroed; the engine answers it with the matching alert.
 and server messages byte-exact; OpenSSL 3.5 `s_client` and Go 1.26 crypto/tls client sessions
 (`zig build interop-tlsserver`, replayed byte-exact in the tests); BoringSSL's BoGo suite
 (`-- --bogo`, 370 pass, with the rustls parity report); tlsfuzzer's TLS 1.3 scripts
-(`-- --tlsfuzzer DIR`, a checkout such as qap's `scripts/tools/tlsfuzzer`; counts held in
+(`-- --tlsfuzzer DIR`, a checkout such as the web-server consumer's `scripts/tools/tlsfuzzer`; counts held in
 `tools/tlsfuzzer/baseline.tsv`); handshakes against Zig std's
 client and the collection's `tlsclient`; keys in every PEM form
 the OpenSSL command line writes (`tools/key_vectors.py`). Fuzz: `TLSSERVER_FUZZ=<runs>` drives

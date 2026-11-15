@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-15** — **Tests:** delta mutation audit of `2810fced1` (`Config.record_burn`, `Config.server_suite_order`, vector-`zeroize` `Protection.wipe`): 22 mutants, 22 killed; new tests for `initKeyIv` resetting `burn_records`, the burn-off stack probe for `open` (it covered `seal` only) and `Inbound` / `Outbound` handing `record_burn` to their protections. No production change.
 - **2026-11-15** — **Added:** `Config.record_burn` (default `true`): `false` skips the 4 KiB dead-stack burn around every record `seal` / `open` (~80 ns per record; handshake burns stay) for a caller that scrubs the whole stack itself, e.g. at connection close; the flag reaches the record layer as `Protection.burn_records`, set where the server installs its keys (handshake, KeyUpdate, resumption, early data) and reset to true by `Protection.init` / `initKeyIv`. `Config.server_suite_order` (default `false`): choose the cipher suite in `cipher_suites` order while the group still follows the client (no needless HelloRetryRequest); `server_order` keeps meaning both. `Protection.wipe` zeroes with the module's vector `zeroize` (volatile stores) instead of `std.crypto.secureZero`'s byte loop. Tests: round trip with the burn off, `Config` reaching both directions, the suite/group order cases, a ReleaseFast stack probe that shows residue with the burn off and none with it on.
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Tests only, closing the last 8 open mutants of the whole-module mutation run: an EC leaf without named-curve parameters is `KeyMismatch` (not `MalformedCertificate`), `Connection.writeAll` seals what `writer()` holds before its own data, `keyUpdate` into an output that cannot hold it even empty is `OutputFull`, a Certificate that does not fit the output is `OutputFull` at every output size, and a key that bypassed `check` is `InternalError` at the ClientHello. The ML-DSA `both` copy wipe is covered by the burn around `mlDsaExpand` (equivalent); two ReleaseFast stack probes (`provideSignature`, `serialize`, the latter with a distinct-octet blob key) were added for the `handshake_burn` steps, and the mutants that drop those two burns are unobservable to them (no secret the needles can see is left in either frame layout); the `certificateMessage` FieldTooLong/InvalidStaples mapping is unreachable after `check` and left as defensive code.
@@ -27,7 +28,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-10-28** — **Fixed** (no consumer-reachable panic, CONVENTIONS.md §8; independent sweep): a server with ECH keys none of which is a retry key and no `setEchBuffer` hit an out-of-bounds write on any outer ECH offer (GREASE included) — `retryConfigs` refuses a buffer under 2 octets; `findShare` was O(key shares × supported groups) per ClientHello — one bitset pass now. Caller-contract checks that were asserts (UB in ReleaseFast) are total or errors: `Outbound.discard` clamps, `max_fragment` is clamped to [1, 2^14], `Joiner` with a too-small buffer refuses (and `push` checks room), `Protection.seal` saturates `content_len + 1 + pad` into `RecordOverflow`, `commitWrite` past the slot is `OutputFull` and seals nothing, `setQuicResumptionData` over 255 octets is `error.ResumptionDataTooLong`, `deserialize` refuses a record limit outside [64, 65535] (`BadBlob`), `certificateDigest` returns null for a length its field cannot hold, `delegated.issue` refuses an SPKI over 2^24 - 1 (`ValueTooLong`); `setPeerBuffer`/`setEchBuffer` after the first `feed` and `Connection.init` over a non-empty writer are checked panics. `fromPemDelegated` zeroes `out` on its early errors too, as documented. Ticket-age subtractions saturate on an extreme clock.
 
-- **2026-10-28** — Card: `Downstream consumer: yes` (qap, since 2026-10-19). `exportKeyingMaterial` follows `tls13`'s, which now returns its bound errors (the same `LabelTooLong`/`OutputTooLong` this one already checked).
+- **2026-10-28** — Card: `Downstream consumer: yes` (the web-server consumer, since 2026-10-19). `exportKeyingMaterial` follows `tls13`'s, which now returns its bound errors (the same `LabelTooLong`/`OutputTooLong` this one already checked).
 
 - **2026-10-23** — **Tests:** the re-audit after the frame change (15/16 mutants, 1 equivalent):
   a read's frame from `handshake` down to the reader stays under 4 KiB (optimized builds), a
@@ -40,7 +41,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-10-23** — **Performance:** `Connection.step` no longer inlines the handshake
   (`Server.onHandshake` via `feed`, and `sign` with its 4.6 KiB signature buffer): its frame
   was 22.7 KiB on the path of every read, and an idle connection parks below it. Now under
-  0.5 KiB. qap, 200 held TLS connections after 2 requests each: resident fiber stack
+  0.5 KiB. The web-server consumer, 200 held TLS connections after 2 requests each: resident fiber stack
   10 → 7 pages per connection (−12 KiB), worker anon RSS 9.2 → 6.8 MB. No API change.
 - **2026-10-22** — **Fixed:** `serialize` on a server without a peer buffer (no client
   authentication) sliced past it and panicked (`peerLeaf`); found by the mutation run's new
@@ -142,7 +143,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   replay). Card: fastest 1.02× worst (sending a 16 KiB record), P2 → P1.
 
 - **2026-10-22** — **Fixed:** a `Connection` read sends what the server queued before it
-  waits, so a writer parked mid-send (an HTTP/2 stream on a fiber of the same thread, qap's
+  waits, so a writer parked mid-send (an HTTP/2 stream on a fiber of the same thread, the web-server consumer's
   `Config.h2_concurrency`) and the reader sent the same records twice — a corrupt stream, or
   the `outbound.discard` assertion. **Added:** `Connection.guard` (`Connection.Guard`: a lock
   the caller's scheduler parks on), held wherever the connection changes or sends its output
@@ -193,7 +194,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   in `scripts/checks/ctgrind-expected.tsv`); the card's Hardening line gains its ct entry.
   **NO CONSUMER-VISIBLE CHANGE.**
 
-- **2026-10-21** — **Performance:** the qap churn lane (X25519, ECDSA P-256) is at the ianic
+- **2026-10-21** — **Performance:** The web-server consumer churn lane (X25519, ECDSA P-256) is at the ianic
   fork's rate: 3,379 / 3,343 vs 3,291 / 3,333 connections/s, 187–193 vs 189–190 µs of user CPU
   per connection (before: 2,971 / 2,989, 231 µs). From a profile by function against the fork:
   the P-256 public key recomputed per signature (14 µs, `tls13`/`p256`), the dead-stack burns
@@ -269,7 +270,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `internal_error` at the ClientHello. `Server` loses its inline 4 KiB `peer_buf`; tickets are
   built and opened around the leaf in that buffer and sealed straight into the output (no
   ticket-sized stack arrays). `clientauth.checkLeafKeyUsage(der, scratch)` copies into
-  `scratch` (the peer buffer). Asked for by qap (`Tls.max_client_cert_bytes` up to 16384).
+  `scratch` (the peer buffer). Asked for by the web-server consumer (`Tls.max_client_cert_bytes` up to 16384).
   BoGo `Server-Verify-ML-DSA-65/87` and `Server-InvalidSignature-ML-DSA-65/87` re-enabled.
 - **2026-10-21** — **Fix (HIGH, in pushed code):** `hello.Opaque8Iter` computed `1 + n` in u8 —
   a 255-octet ALPN name or PSK binder panicked in safe builds and looped forever in ReleaseFast
@@ -285,23 +286,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   on a P-521 and an ML-DSA-65 certificate, the latter over ML-KEM-1024 (51 recorded sessions).
   `test_key_vectors` / `testKeyVector` exported.
 - **2026-10-21** — M3 step 3, the per-connection wipe. `Outbound.wipe` zeroed the whole output
-  buffer with `std.crypto.secureZero` (a byte at a time: ~16 µs for qap's 48 KiB, on every
+  buffer with `std.crypto.secureZero` (a byte at a time: ~16 µs for the web-server consumer's 48 KiB, on every
   connection); it now zeroes up to the high-water mark of what was written (`Outbound.dirty`,
   `Outbound.touch`), with volatile 32-byte stores (`src/zeroize.zig`, copied from `http`). The
   joiner reset and the ticket/PSK scratch use the same store. New `Server.abandonWrite(n)`
   (`Connection.deinit` calls it for a half-written record). Tests: every path that writes the
   output is zero after `wipe`; a slot written and never committed is zero after `deinit`.
 - **2026-10-21** — SPEC backlog only: the client leaf's cap (`clientauth.max_leaf_len`, 4096) as
-  a caller-supplied buffer, asked for by qap's tlsserver branch (`Tls.max_client_cert_bytes`
+  a caller-supplied buffer, asked for by the web-server consumer's tlsserver branch (`Tls.max_client_cert_bytes`
   goes up to 16384). No code change.
-- **2026-10-21** — M3 step 2, qap's zero-copy seams. **BREAKING** `Connection.init(config,
+- **2026-10-21** — M3 step 2, the web-server consumer's zero-copy seams. **BREAKING** `Connection.init(config,
   input, output, joiner_buf)`: no output buffer of its own — records are sealed in the
   transport writer's buffer (size it with `minOutputLen`; it must be stream-shaped, `flush`
   emptying it in place), so a connection holds one send buffer instead of two and nothing is
   copied. New `Connection.reader()` / `writer()`: a `std.Io.Reader` over the record just opened
   where it lies in the input, a `std.Io.Writer` whose buffer is the next record's content in the
   output (sealed in place; a short write topped up, not sent alone); cross-record contiguity is
-  `error.RecordBoundary` (qap's `RecordReader`/`RecordWriter` contract, without their stepping
+  `error.RecordBoundary` (the web-server consumer's `RecordReader`/`RecordWriter` contract, without their stepping
   aside for KeyUpdates — the server handles those). `Connection.flush`, `Connection.err`. New
   `Server.writeSlot()` / `commitWrite(n)`; `Server.write` is built on them. Evidence: the 49
   recorded sessions replay byte-exact through `reader()`/`writer()` too; record layout, ordering
@@ -324,7 +325,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   optional client certificates, echo — a key per client scheme list through the new
   `server.firstUsableKey`, tickets, the `GET /keyupdate` convention) and holds their counts
   in `tools/tlsfuzzer/baseline.tsv` (`--tlsfuzzer-update` rewrites them, notes kept). Against
-  qap's fork none of its 17 scripts is worse but two deliberate divergences, three are better.
+  the web-server consumer's fork none of its 17 scripts is worse but two deliberate divergences, three are better.
   Found and fixed: a `legacy_version` below 0x0301 beside 0x0304 is now `protocol_version`
   (legacy-version 2/8 → 10/0); a key_share for a group not in `supported_groups`, or for an
   obsolete one, is `illegal_parameter`; `Server.write` no longer cuts a record short to fit
@@ -464,7 +465,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   caught; an independent review's MEDIUM — an EC scalar ≥ the order accepted — and LOWs
   fixed before the first commit). New dependencies: `x509`, `rsa` (was test-only), `b64ct`.
 - **2026-10-20** — secp384r1 key exchange (through `tls13.kex`) and ECDSA P-384 certificates.
-  **BEHAVIOURAL:** `default_groups` gains secp384r1 (last), as qap's fork serves it. Interop with
+  **BEHAVIOURAL:** `default_groups` gains secp384r1 (last), as the web-server consumer's fork serves it. Interop with
   OpenSSL `s_client` grows to ten sessions (P-256 over secp384r1, a P-384 certificate over
   secp384r1), recaptured with freshly generated test certificates (`tools/test_certs.py` adds
   P-384).
