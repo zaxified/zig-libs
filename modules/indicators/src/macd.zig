@@ -140,6 +140,10 @@ pub const MacdCore = struct {
         }
         return .{ .macd = line, .signal = sg, .hist = line - sg };
     }
+    /// True once `step` is the three bare recurrences with an output.
+    fn steady(self: *const MacdCore) bool {
+        return self.n >= self.skip_fast and !self.sig_first and self.slow.steady() and self.fast.steady() and self.sig.steady();
+    }
 };
 
 /// Adapter so MACDFIX has the same `init(p)` / `lookback(p)` shape.
@@ -168,6 +172,27 @@ fn batch3(comptime T: type, comptime Core: type, in: []const T, o_macd: []T, o_s
     const skip = nanSkip(p);
     const nan = std.math.nan(T);
     var last = MacdOut(T){ .macd = nan, .signal = nan, .hist = nan };
+    if (!skip) {
+        // Step through the warm-up, then the three recurrences as one tight loop.
+        var i: usize = 0;
+        while (i < in.len and !c.steady()) : (i += 1) {
+            const o = if (c.step(NoSrc{}, in[i])) |r| core.to(MacdOut(T), r) else last;
+            o_macd[i] = o.macd;
+            o_sig[i] = o.signal;
+            o_hist[i] = o.hist;
+        }
+        c.n += in.len - i;
+        for (in[i..], o_macd[i..], o_sig[i..], o_hist[i..]) |x, *a, *b, *h| {
+            const xv: f64 = x;
+            const line = c.fast.stepSteady(xv) - c.slow.stepSteady(xv);
+            const sg = c.sig.stepSteady(line);
+            const o = core.to(MacdOut(T), Out64{ .macd = line, .signal = sg, .hist = line - sg });
+            a.* = o.macd;
+            b.* = o.signal;
+            h.* = o.hist;
+        }
+        return Core.lookback(p);
+    }
     for (in, o_macd, o_sig, o_hist) |x, *a, *b, *h| {
         const xv: f64 = x;
         if (skip and core.isNan(xv)) {
@@ -331,9 +356,32 @@ pub fn macdext(comptime T: type, gpa: std.mem.Allocator, in: []const T, out_macd
     @memset(out_macd, nan);
     @memset(out_signal, nan);
     @memset(out_hist, nan);
+    // One dispatch per call when the three stages share an MA type (the default
+    // and the usual case): a monomorphic loop. Mixed types step the union.
+    done: {
+        switch (cf) {
+            inline else => |f, tag| if (std.meta.activeTag(cs) == tag and std.meta.activeTag(cg) == tag) {
+                const name = @tagName(tag);
+                // by-value copies of the payloads, so the optimizer keeps them in registers
+                var lf = f;
+                var ls = @field(cs, name);
+                var lg = @field(cg, name);
+                extLoop(T, &lf, &ls, &lg, in, line, out_macd, out_signal, out_hist, skip_f, skip_s, plan.lmax);
+                break :done;
+            },
+        }
+        extLoop(T, &cf, &cs, &cg, in, line, out_macd, out_signal, out_hist, skip_f, skip_s, plan.lmax);
+    }
+    // The line is defined from `lmax`, but TA-Lib outputs all three from the
+    // signal's first bar: blank the earlier line values (the signal read them above).
+    @memset(out_macd[@min(plan.lmax, in.len)..@min(plan.total(), in.len)], nan);
+    return plan.total();
+}
+
+fn extLoop(comptime T: type, cf: anytype, cs: anytype, cg: anytype, in: []const T, line: []f64, out_macd: []T, out_signal: []T, out_hist: []T, skip_f: usize, skip_s: usize, lmax: usize) void {
     const sf = SliceSrc(T){ .xs = in, .off = skip_f };
     const ss = SliceSrc(T){ .xs = in, .off = skip_s };
-    const sg = SliceSrc(f64){ .xs = line, .off = plan.lmax };
+    const sg = SliceSrc(f64){ .xs = line, .off = lmax };
     for (in, 0..) |x, i| {
         const xv: f64 = x;
         const f = if (i >= skip_f) cf.step(sf, xv) else null;
@@ -345,10 +393,6 @@ pub fn macdext(comptime T: type, gpa: std.mem.Allocator, in: []const T, out_macd
         out_signal[i] = core.to(T, g);
         out_hist[i] = core.to(T, line[i] - g);
     }
-    // The line is defined from `lmax`, but TA-Lib outputs all three from the
-    // signal's first bar: blank the earlier line values (the signal read them above).
-    @memset(out_macd[@min(plan.lmax, in.len)..@min(plan.total(), in.len)], nan);
-    return plan.total();
 }
 
 /// Streaming MACDEXT. The three stages keep rings of their own in the

@@ -27,6 +27,16 @@ pub fn batchBars(comptime T: type, comptime Core: type, hs: []const T, ls: []con
     try core.checkLen(hs.len, &.{ ls.len, cs.len, out.len });
     var c = try Core.init(p);
     const skip = nanSkip(p);
+    if (@hasDecl(Core, "steadyRun") and !skip) {
+        // Step through the warm-up, then the core's tight loop (bitwise `step`).
+        var i: usize = 0;
+        while (i < hs.len and !c.steady()) : (i += 1) {
+            const b = Bar(f64){ .high = hs[i], .low = ls[i], .close = cs[i] };
+            out[i] = if (c.step(b)) |r| core.to(T, r) else std.math.nan(T);
+        }
+        c.steadyRun(T, hs, ls, cs, out, i);
+        return Core.lookback(p);
+    }
     var last = std.math.nan(T);
     for (hs, ls, cs, out) |h, l, cl, *o| {
         const b = Bar(f64){ .high = h, .low = l, .close = cl };
@@ -177,8 +187,39 @@ pub fn AtrCore(comptime normalize: bool) type {
                 self.prev = @mulAdd(f64, self.beta, self.prev, self.alpha * t);
             }
             if (self.k < self.p + self.u) return null;
+            return self.output(b.close);
+        }
+        inline fn output(self: *const Self, close: f64) f64 {
             if (!normalize or self.p <= 1) return self.prev;
-            return if (b.close != 0.0) self.prev / b.close * 100.0 else 0.0;
+            return if (close != 0.0) self.prev / close * 100.0 else 0.0;
+        }
+        /// True once `step` is the bare Wilder recurrence with an output.
+        pub fn steady(self: *const Self) bool {
+            return self.tr.has and self.k >= self.p and self.k + 1 >= self.p + self.u;
+        }
+        /// Bars `i..` as one tight loop (see `batchBars`), bitwise `step`.
+        pub fn steadyRun(self: *Self, comptime T: type, hs: []const T, ls: []const T, cs: []const T, out: []T, i: usize) void {
+            const beta = self.beta;
+            const alpha = self.alpha;
+            var prev = self.prev;
+            var cy = self.tr.prev_close;
+            var j = i;
+            while (j < hs.len) : (j += 1) {
+                const h: f64 = hs[j];
+                const l: f64 = ls[j];
+                const cl: f64 = cs[j];
+                var greatest = h - l;
+                const v2 = @abs(cy - h);
+                if (v2 > greatest) greatest = v2;
+                const v3 = @abs(cy - l);
+                if (v3 > greatest) greatest = v3;
+                cy = cl;
+                prev = @mulAdd(f64, beta, prev, alpha * greatest);
+                self.prev = prev;
+                out[j] = core.to(T, self.output(cl));
+            }
+            self.k += hs.len - i;
+            self.tr.prev_close = cy;
         }
     };
 }

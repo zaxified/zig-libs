@@ -410,12 +410,12 @@ is fixed here (P-gap candidates, owner's call).
 | ADOSC | · | 0.95 | · | 2.95 | 3.13 | 7% |  |
 | ADX | 0.76 | 0.77 | · | 7.09 | 9.14 | 9% |  |
 | **ALMA** | · | 2.11 | · | 4.93 | 2.29 | 5% | weighted dot product read through the generic window source, weights + scratch from the gpa |
-| **APO** | · | 18.5 | · | 25.60 | 1.37 | 4% | generic `MaCore` (tagged-union dispatch + ring bookkeeping per bar) instead of a direct EMA loop; `ma(.ema)` costs 6x `ema()` |
+| **APO** | · | 1.23 | · | 1.57 | 1.27 | 22% | was 18.5x: the MA type is dispatched once per call (monomorphic loop), the EMA pair runs its bare recurrence after the warm-up |
 | AROON | · | 0.71 | · | 11.46 | 16.33 | 3% |  |
 | AROONOSC | · | 0.75 | · | 11.04 | 14.57 | 5% |  |
-| **ATR** | 2.15 | 2.08 | 1.39 | 3.02 | 1.46 | 13% | stepped recurrence with a true-range core per bar (2.1x at 1e3-1e5, 1.4x at 1e6: memory-bound there) |
+| ATR | 0.96 | 1.01 | 1.03 | 1.41 | 1.41 | 36% | was 2.1x: true range + Wilder recurrence as one steady loop |
 | AVGDEV | · | 1.03 | · | 21.68 | 20.69 | 2% |  |
-| **BBANDS** | 4.05 | 3.77 | · | 20.95 | 5.49 | 17% | SMA and variance as separate per-bar cores (state machine, `?f64` returns, a `sqrt` per bar, 3 outputs); TA-Lib's one tight loop |
+| **BBANDS** | 2.44 | 2.10 | · | 12.25 | 6.11 | 69% | was 3.8x: MA dispatch hoisted; the variance window (re-anchor checks, `sqrt`, three outputs) is still the generic step |
 | BETA | · | 0.87 | · | 10.19 | 11.63 | 4% |  |
 | BOP | · | 0.94 | · | 1.33 | 1.42 | 16% |  |
 | **CCI** | 3.91 | 3.85 | · | 115.74 | 28.26 | 7% | 109 ns per bar against 28: the window mean-deviation pass reads through the generic window source (index wrap per element), which TA-Lib's contiguous loop vectorizes |
@@ -430,11 +430,11 @@ is fixed here (P-gap candidates, owner's call).
 | CMO | · | 0.91 | · | 3.80 | 4.18 | 4% |  |
 | CORREL | · | 0.90 | · | 9.45 | 10.81 | 10% |  |
 | **CRSI** | · | 3.74 | · | 348.79 | 108.64 | 35% | three cores (RSI, streak RSI, percent rank O(period)) composed per bar with a gpa scratch |
-| **DEMA** | · | 1.64 | · | 2.68 | 1.60 | 11% | two chained EMA cores, stepped state machine (see EMA) |
+| DEMA | · | 1.00 | · | 1.45 | 1.48 | 6% | was 1.64x: steady loop |
 | **DONCHIAN** | · | 1.24 | · | 12.71 | 10.33 | 2% | two extremum scans per bar plus the midline |
 | DX | · | 0.76 | · | 6.30 | 8.39 | 53% |  |
 | EFI | · | 1.06 | · | 1.36 | 1.25 | 11% |  |
-| **EMA** | 1.81 | 1.87 | 1.55 | 2.30 | 1.21 | 17% | 7.6 against 4.1 cycles per bar: the batch loop runs a per-bar branchy state machine (`?f64`, the `n` counter in memory) around a 4-cycle FMA chain; `EmaStream.update` alone is 1.2 ns per bar against the batch's 2.2, so it is the wrapper, not the math |
+| EMA | 1.04 | 1.00 | 1.00 | 1.11 | 1.11 | 1% | was 1.87x: the batch steps the warm-up, then a tight `fma` loop (`steadyRun`) |
 | **FISHER** | · | 1.64 | · | 37.24 | 23.10 | 8% | a window extremum pair plus `ln` per bar |
 | **FRAMA** | · | 1.76 | · | 66.67 | 37.57 | 3% | two half-window extrema + a fractal-dimension log per bar |
 | **HMA** | · | 3.76 | · | 18.98 | 5.07 | 7% | three WMA cores + a ring through the generic path; TA-Lib's three WMA loops are tight |
@@ -444,15 +444,15 @@ is fixed here (P-gap candidates, owner's call).
 | HT_SINE | · | 1.05 | · | 656.82 | 629.97 | 5% | (was 3.5x: `atan` fast path) |
 | **HT_TRENDLINE** | · | 1.30 | · | 142.77 | 108.80 | 5% | HT_DCPERIOD core inside plus the trailing weighted smoothing (was 8.1x) |
 | **ICHIMOKU** | · | 3.07 | · | 39.10 | 19.66 | 4% | four windowed extrema (9 / 26 / 52) rescanned per bar |
-| **KAMA** | 3.35 | 3.15 | · | 12.63 | 4.02 | 9% | per-bar efficiency-ratio window sum plus a stepped state machine (3.4x); TA-Lib keeps the sum incrementally in a tight loop |
+| **KAMA** | 1.15 | 1.12 | · | 4.14 | 3.88 | 39% | was 3.2x: the sliding efficiency ratio as one steady loop over the input slice |
 | **KC** | · | 1.19 | · | 10.50 | 15.85 | 13% | EMA + ATR + band arithmetic, two stepped cores |
 | **KDJ** | · | 2.63 | · | 42.10 | 16.03 | 4% | as STOCH (RMA smoothing through `MaCore`) |
 | KURTOSIS | · | 1.04 | · | 9.21 | 8.91 | 8% |  |
 | KVO | · | 1.00 | · | 9.57 | 9.54 | 4% |  |
 | **LINEARREG** | 1.14 | 1.16 | · | 4.14 | 3.53 | 20% | two sliding sums with a re-anchor every 32 periods (1.1-1.16x) |
-| **MA_EMA** | · | 10.9 | · | 13.26 | 1.20 | 8% | `MaCore` union dispatch per bar vs the dedicated EMA loop (`ema` row: 1.9x) |
-| **MACD** | 3.98 | 3.51 | · | 6.52 | 1.84 | 11% | three recurrence stages (fast, slow, signal) as generic stepped cores; TA-Lib's fused EMA loops |
-| **MACDEXT** | · | 3.88 | · | 40.80 | 17.60 | 4% | as MACD (SMA-seeded stages through `MaCore` and a gpa scratch) |
+| MA_EMA | · | 1.00 | · | 1.13 | 1.13 | 1% | was 10.9x: one dispatch per call, then the EMA's steady loop |
+| **MACD** | 1.78 | 1.31 | · | 2.36 | 1.82 | 55% | was 3.5x: three EMAs in one steady loop after the warm-up; 1.8x at 1e3 is the stepped warm-up |
+| MACDEXT | · | 0.87 | · | 8.73 | 16.26 | 3% | was 3.88x: one dispatch per call when the three stages share an MA type (mixed types step the union) |
 | **MAMA** | · | 1.69 | · | 122.65 | 70.34 | 5% | Hilbert core plus MAMA's own phase `atan`, two fast-path atans per bar (was 23.0x) |
 | **MAX** | 0.90 | 1.19 | · | 2.33 | 1.98 | 10% | block scan with the NaN handling kept (1.2x at 1e5 only, 0.9x at 1e3) |
 | **MEDIAN** | · | 1.40 | · | 66.59 | 47.81 | 1% | window copy + selection into a gpa scratch (1.4x) |
@@ -461,12 +461,12 @@ is fixed here (P-gap candidates, owner's call).
 | **MIN** | 0.98 | 1.26 | · | 2.50 | 2.05 | 18% | block scan with the NaN handling kept (1.2-1.3x at 1e5 only, 0.98x at 1e3: cache-visible) |
 | **MINMAX** | · | 1.52 | · | 4.81 | 3.12 | 6% | two extremum scans per bar where TA-Lib shares one block scan |
 | **MOM** | · | 1.55 | · | 0.88 | 0.57 | 2% | 1.55x on a one-line subtraction: the generic window source (index into a ring) instead of `in[i] - in[i - p]` |
-| NATR | · | 1.06 | · | 2.79 | 2.57 | 63% |  |
+| NATR | · | 0.96 | · | 2.15 | 2.23 | 23% | (steady loop as ATR) |
 | OBV | 1.01 | 0.99 | · | 5.18 | 5.27 | 9% |  |
 | **PERCENTILE** | · | 2.36 | · | 95.53 | 41.01 | 5% | window copy + selection per bar into a gpa scratch (2.4x); TA-Lib's sorted insertion |
 | PERCENTRANK | · | 1.07 | · | 75.63 | 68.73 | 2% |  |
 | PLUS_DI | · | 0.94 | · | 5.07 | 5.40 | 2% |  |
-| **PPO** | · | 15.9 | · | 30.91 | 1.91 | 13% | same as APO: two `MaCore` stages dispatched per bar |
+| **PPO** | · | 1.47 | · | 2.78 | 1.87 | 9% | was 15.9x, as APO; the rest is the per-bar division and the near-zero test |
 | ROC | · | 1.06 | · | 1.38 | 1.30 | 6% |  |
 | RSI | 1.06 | 1.04 | 1.05 | 4.38 | 4.52 | 27% |  |
 | **RVI** | · | 1.92 | · | 17.70 | 9.11 | 5% | two recurrences (std dev and Wilder smoothing) through generic cores |
@@ -479,13 +479,13 @@ is fixed here (P-gap candidates, owner's call).
 | **STOCHRSI** | · | 2.05 | · | 50.21 | 29.89 | 16% | RSI core, then a stochastic window and a smoothing stage per bar, gpa scratch |
 | SUM | · | 1.00 | · | 2.38 | 2.37 | 0% |  |
 | SWAK_BUTTER | · | 0.84 | · | 1.32 | 1.59 | 6% |  |
-| **T3** | 2.99 | 2.80 | 2.78 | 10.66 | 3.76 | 13% | six chained EMA stages, stepped state machine per stage |
-| **TEMA** | · | 3.76 | · | 7.57 | 1.97 | 14% | three chained EMA cores, each a stepped state machine; DEMA 1.6x, T3 2.8x, so the cost grows with the chain |
+| T3 | 1.05 | 1.00 | 1.00 | 3.39 | 3.44 | 4% | was 2.8x: six EMA stages in one steady loop |
+| TEMA | · | 0.96 | · | 1.89 | 1.99 | 10% | was 3.76x: steady loop |
 | TRANGE | · | 0.82 | · | 1.16 | 1.43 | 6% |  |
 | TRIMA | · | 0.98 | · | 3.61 | 3.66 | 2% |  |
-| **TRIX** | · | 1.75 | · | 4.20 | 2.43 | 4% | three chained EMA cores plus a rate of change (1.75x) |
+| TRIX | · | 0.98 | · | 2.38 | 2.35 | 36% | was 1.75x: steady step of the three EMAs |
 | **TSF** | · | 1.23 | · | 4.41 | 3.57 | 12% | LINEARREG's sums with the re-anchor every 32 periods |
-| **TSI** | · | 2.16 | · | 5.74 | 2.69 | 15% | double EMA smoothing of the momentum and its absolute value, four stepped stages |
+| TSI | · | 1.04 | · | 2.39 | 2.25 | 8% | was 2.16x: steady step of the four EMAs |
 | **ULTOSC** | · | 1.35 | · | 12.67 | 9.37 | 3% | three windowed sums of buying pressure / true range, re-summed per bar |
 | **VAR** | · | 2.08 | · | 7.45 | 3.56 | 13% | re-anchors its sums every 32 windows (O(period) rebuild) and divides per bar; TA-Lib slides two sums only |
 | VIDYA | · | 1.07 | · | 5.97 | 5.63 | 12% |  |

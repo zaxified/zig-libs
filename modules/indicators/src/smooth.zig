@@ -29,8 +29,29 @@ pub fn batch1(comptime T: type, comptime Core: type, in: []const T, out: []T, p:
     core.checkFloat(T);
     try core.checkLen(in.len, &.{out.len});
     var c = try Core.init(p);
+    runCore(T, &c, in, out, nanSkip(p));
+    return Core.lookback(p);
+}
+
+/// The loop of `batch1` over an initialised core `c` (any type with `step(src, x)`).
+///
+/// A core may declare `steady()` (true once every further `step` is its plain
+/// recurrence, with an output) and `steadyRun(T, in, out, i)` (that recurrence as
+/// a tight loop over bars `i..`, bitwise what `step` answers, `n` advanced; bar
+/// `j` of the core is `in[j]`). Without NaN skipping the loop then steps only
+/// until `steady()` and hands the rest to `steadyRun`.
+pub fn runCore(comptime T: type, c: anytype, in: []const T, out: []T, skip: bool) void {
+    const C = @typeInfo(@TypeOf(c)).pointer.child;
+    if (@hasDecl(C, "steadyRun") and !skip) {
+        const src = SliceSrc(T){ .xs = in };
+        var i: usize = 0;
+        while (i < in.len and !c.steady()) : (i += 1) {
+            out[i] = if (c.step(src, in[i])) |r| core.to(T, r) else std.math.nan(T);
+        }
+        c.steadyRun(T, in, out, i);
+        return;
+    }
     const src = SliceSrc(T){ .xs = in };
-    const skip = nanSkip(p);
     var last = std.math.nan(T);
     for (in, out) |x, *o| {
         const xv: f64 = x;
@@ -41,7 +62,6 @@ pub fn batch1(comptime T: type, comptime Core: type, in: []const T, out: []T, p:
         o.* = if (c.step(src, xv)) |r| core.to(T, r) else std.math.nan(T);
         last = o.*;
     }
-    return Core.lookback(p);
 }
 
 fn countOf(comptime Core: type, c: *const Core) usize {
@@ -260,6 +280,35 @@ pub const EmaCore = struct {
         }
         return if (n + 1 >= self.p + self.u) self.prev else null;
     }
+    /// True once `step` is the bare recurrence with an output (see `runCore`).
+    pub fn steady(self: *const EmaCore) bool {
+        if (self.p == 1) return self.n >= self.u;
+        if (self.first) return self.n >= @max(self.u, 1);
+        return self.n >= self.p and self.n + 1 >= self.p + self.u;
+    }
+    /// One steady bar: what `step` does once `steady()` holds.
+    pub inline fn stepSteady(self: *EmaCore, x: f64) f64 {
+        self.n += 1;
+        if (self.p == 1) return x;
+        self.prev = @mulAdd(f64, self.beta, self.prev, self.k * x);
+        return self.prev;
+    }
+    /// The steady recurrence over a run of bars (see `runCore`).
+    pub fn steadyRun(self: *EmaCore, comptime T: type, in: []const T, out: []T, i: usize) void {
+        self.n += in.len - i;
+        if (self.p == 1) {
+            for (in[i..], out[i..]) |x, *o| o.* = core.to(T, @as(f64, x));
+            return;
+        }
+        const beta = self.beta;
+        const k = self.k;
+        var prev = self.prev;
+        for (in[i..], out[i..]) |x, *o| {
+            prev = @mulAdd(f64, beta, prev, k * @as(f64, x));
+            o.* = core.to(T, prev);
+        }
+        self.prev = prev;
+    }
 };
 
 pub fn emaLookback(p: EmaParams) Error!usize {
@@ -464,7 +513,17 @@ pub fn maLookback(p: MaParams) Error!usize {
     return MaCore.lookback(p);
 }
 pub fn ma(comptime T: type, in: []const T, out: []T, p: MaParams) Error!usize {
-    return batch1(T, MaCore, in, out, p);
+    core.checkFloat(T);
+    try core.checkLen(in.len, &.{out.len});
+    const c = try MaCore.init(p);
+    // One dispatch per call, a monomorphic loop over the active variant.
+    switch (c) {
+        inline else => |v| {
+            var local = v; // a by-value core the optimizer keeps in registers
+            runCore(T, &local, in, out, false);
+        },
+    }
+    return MaCore.lookback(p);
 }
 pub fn MaStream(comptime T: type) type {
     return Stream1(T, MaParams, MaCore);

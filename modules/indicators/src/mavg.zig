@@ -131,12 +131,39 @@ pub fn ChainCore(comptime kind: ChainKind) type {
                 v = self.prev[j];
             }
             if (n < self.lb) return null;
-            const e = self.prev;
+            return self.combine(self.prev);
+        }
+        inline fn combine(self: *const Self, e: [K]f64) f64 {
             return switch (kind) {
                 .dema => 2.0 * e[0] - e[1],
                 .tema => e[2] + (3.0 * e[0] - 3.0 * e[1]),
                 .t3 => @mulAdd(f64, self.c4, e[2], @mulAdd(f64, self.c3, e[3], @mulAdd(f64, self.c1, e[5], self.c2 * e[4]))),
             };
+        }
+        /// True once every stage is past its seed and the output has started.
+        pub fn steady(self: *const Self) bool {
+            if (self.p == 1) return self.n >= self.lb;
+            return self.n >= (K - 1) * self.gap + self.p and self.n >= self.lb;
+        }
+        /// The K recurrences as one tight loop (see `smooth.runCore`).
+        pub fn steadyRun(self: *Self, comptime T: type, in: []const T, out: []T, i: usize) void {
+            self.n += in.len - i;
+            if (self.p == 1) {
+                for (in[i..], out[i..]) |x, *o| o.* = core.to(T, @as(f64, x));
+                return;
+            }
+            const beta = self.beta;
+            const k = self.k;
+            var e = self.prev;
+            for (in[i..], out[i..]) |x, *o| {
+                var v: f64 = x;
+                inline for (0..K) |j| {
+                    e[j] = @mulAdd(f64, beta, e[j], k * v);
+                    v = e[j];
+                }
+                o.* = core.to(T, self.combine(e));
+            }
+            self.prev = e;
         }
     };
 }
@@ -357,6 +384,51 @@ pub const KamaCore = struct {
             self.prev = @mulAdd(f64, x - self.prev, sc, self.prev);
         }
         return if (n >= p + self.u) self.prev else null;
+    }
+    /// True once `step` is the sliding update with an output.
+    pub fn steady(self: *const KamaCore) bool {
+        if (self.p == 1) return self.n >= self.u;
+        return self.n > self.p and self.n >= self.p + self.u;
+    }
+    /// The sliding update as a tight loop over the caller's slice (see `smooth.runCore`).
+    pub fn steadyRun(self: *KamaCore, comptime T: type, in: []const T, out: []T, i: usize) void {
+        self.n += in.len - i;
+        const p = self.p;
+        if (p == 1) {
+            for (in[i..], out[i..]) |x, *o| o.* = core.to(T, @as(f64, x));
+            return;
+        }
+        var sum_roc = self.sum_roc;
+        var null_run = self.null_run;
+        var prev = self.prev;
+        var trailing = self.trailing;
+        var j = i;
+        while (j < in.len) : (j += 1) {
+            const x: f64 = in[j];
+            const t2: f64 = in[j - p];
+            const roc = x - t2;
+            const yesterday: f64 = in[j - 1];
+            sum_roc -= @abs(trailing - t2);
+            sum_roc += @abs(x - yesterday);
+            null_run = if (@abs(x - yesterday) <= 0.0) null_run + 1 else 0;
+            var er: f64 = undefined;
+            if (null_run >= p) {
+                null_run = p;
+                sum_roc = 0.0;
+                er = 1.0;
+            } else {
+                er = ratio(sum_roc, roc);
+            }
+            trailing = t2;
+            var sc = @mulAdd(f64, er, kama_diff, kama_max);
+            sc *= sc;
+            prev = @mulAdd(f64, x - prev, sc, prev);
+            out[j] = core.to(T, prev);
+        }
+        self.sum_roc = sum_roc;
+        self.null_run = null_run;
+        self.prev = prev;
+        self.trailing = trailing;
     }
 };
 

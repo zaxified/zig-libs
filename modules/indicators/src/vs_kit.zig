@@ -185,18 +185,33 @@ fn outAt(r: anytype, comptime k: usize) OutAt(@TypeOf(r), k) {
     return r;
 }
 
-fn run(comptime Core: type, c: *Core, p: Core.Params, ins: anytype, outs: anytype) Error!usize {
+/// The batch loop over an initialised core `c` (also for cores built by hand,
+/// e.g. with a moving-average variant fixed at comptime).
+pub fn run(comptime Core: type, c: *Core, p: Core.Params, ins: anytype, outs: anytype) Error!usize {
     const InNames = comptime fieldNames(Core.In);
     const n = @field(ins, InNames[0]).len;
     inline for (InNames) |nm| if (@field(ins, nm).len != n) return error.BadParam;
     inline for (0..outs.len) |k| if (outs[k].len != n) return error.BadParam;
     const src = SliceSrc(Core.In, @TypeOf(ins)){ .ins = ins };
-    for (0..n) |i| {
+    // A core may declare `steady()` (every further `step` is its bare recurrence,
+    // with an output) and `steadyStep(in) Out` (that step without the warm-up
+    // branches, bitwise `step`); `has_steady = false` switches that off for an
+    // instantiation. The loop then leaves the generic step once steady.
+    const fast = comptime @hasDecl(Core, "steadyStep") and (!@hasDecl(Core, "has_steady") or Core.has_steady);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (fast and c.steady()) break;
         const b = src.at(i);
         if (c.step(src, b)) |r| {
             inline for (0..outs.len) |k| outs[k][i] = core.to(Child(@TypeOf(outs[k])), outAt(r, k));
         } else {
             inline for (0..outs.len) |k| outs[k][i] = nullOf(Child(@TypeOf(outs[k])));
+        }
+    }
+    if (fast) {
+        while (i < n) : (i += 1) {
+            const r = c.steadyStep(src.at(i));
+            inline for (0..outs.len) |k| outs[k][i] = core.to(Child(@TypeOf(outs[k])), outAt(r, k));
         }
     }
     return Core.lookback(p);
