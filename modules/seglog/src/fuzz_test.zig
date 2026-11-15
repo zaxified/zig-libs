@@ -63,6 +63,41 @@ const Rng = struct {
 // `FAIL seed=N`; a panic leaves its seed in the seed file. Any seed replays
 // with `SEGLOG_FUZZ=1,N`.
 
+/// What a run reached, counted over the whole driver run and printed at its
+/// end: a verdict is only as good as the classes it actually exercised.
+const Reach = enum {
+    migration,
+    migration_refused,
+    append,
+    rotate,
+    compact_ok,
+    compress_ok,
+    prealloc_on,
+    zero_tail,
+    flip,
+    flip_tail,
+    truncate,
+    junk,
+    damaged_log_file,
+    damaged_idx_file,
+    damaged_zst_file,
+    damaged_manifest,
+    open_refused,
+    verify_found_damage,
+    resync,
+    reader_opened,
+    reader_refused,
+    seek_found,
+    seek_time_found,
+};
+var reach: [std.enums.values(Reach).len]std.atomic.Value(u64) = @splat(.init(0));
+fn hit(r: Reach) void {
+    _ = reach[@backingInt(r)].fetchAdd(1, .monotonic);
+}
+fn printReach() void {
+    for (std.enums.values(Reach)) |r| std.debug.print("REACH {s}={d}\n", .{ @tagName(r), reach[@backingInt(r)].load(.monotonic) });
+}
+
 var current_seed = std.atomic.Value(u64).init(0);
 var current_start = std.atomic.Value(u64).init(0);
 
@@ -156,6 +191,7 @@ test "fuzz driver: deterministic seeds, a limit per input (SEGLOG_FUZZ)" {
             std.debug.print("runs={d} of {d} ({d}/s)\n", .{ done, runs, done * std.time.ns_per_s / (now - t0) });
         }
     }
+    printReach();
     std.debug.print("DONE runs={d} in {d} ms\n", .{ runs, (nowNs() - t0) / std.time.ns_per_ms });
 }
 
@@ -177,7 +213,10 @@ fn fileName(buf: *[40]u8, which: u8, seg: u64) []const u8 {
 fn fuzzOne(comptime S: type, smith: *S) !void {
     // The first draw is a full-width `value(u64)`, not a ranged one: a ranged draw
     // on `Smith` returns its minimum for almost every seed (check-fuzz-reach R1).
-    if (smith.value(u64) % 4 == 0) return fuzzMigration(S, smith);
+    if (smith.value(u64) % 4 == 0) {
+        hit(.migration);
+        return fuzzMigration(S, smith);
+    }
     return fuzzReadDamaged(S, smith);
 }
 
@@ -241,6 +280,7 @@ fn fuzzMigration(comptime S: type, smith: *S) !void {
     var rep: seglog.MigrationReport = .{};
     var log = Log.open(gpa, sim.storage(), .{ .legacy_ts = migrate_test.tsOf, .migration_report = &rep }) catch |e| switch (e) {
         error.MigrationFailed => {
+            hit(.migration_refused);
             if (!damaged) return error.UndamagedLogRefused;
             try testing.expect(rep.failure != null);
             for (files, 0..) |n, k| try testing.expectEqualSlices(u8, before[k], sim.fileContent(n) orelse "");
@@ -278,6 +318,7 @@ fn fuzzReadDamaged(comptime S: type, smith: *S) !void {
         .compression = .{ .frame_size = 256 },
         .preallocate = if (smith.valueRangeAtMost(u8, 0, 1) == 1) 512 else 0,
     };
+    if (opts.preallocate != 0) hit(.prealloc_on);
 
     // 1. A valid log.
     var appended: u64 = 0;
@@ -291,19 +332,20 @@ fn fuzzReadDamaged(comptime S: type, smith: *S) !void {
             switch (smith.valueRangeAtMost(u8, 0, 9)) {
                 0 => {
                     segs += 1;
+                    hit(.rotate);
                     try log.rotate(segs);
                 },
                 1 => if (segs >= 2) {
-                    _ = log.compact(segs - 1, {}, dropOdd) catch |e| switch (e) {
+                    if (log.compact(segs - 1, {}, dropOdd)) |_| hit(.compact_ok) else |e| switch (e) {
                         error.NotCompactable => {},
                         else => return e,
-                    };
+                    }
                 },
                 2 => if (segs >= 2) {
-                    _ = log.compress(smith.valueRangeAtMost(u64, 1, segs - 1)) catch |e| switch (e) {
+                    if (log.compress(smith.valueRangeAtMost(u64, 1, segs - 1))) |_| hit(.compress_ok) else |e| switch (e) {
                         error.NotCompressible => {},
                         else => return e,
-                    };
+                    }
                 },
                 else => {
                     if (segs == 0) {
@@ -314,6 +356,7 @@ fn fuzzReadDamaged(comptime S: type, smith: *S) !void {
                     smith.bytes(payload[0..n]);
                     _ = try log.appendAt(smith.value(i16), payload[0..n]);
                     appended += 1;
+                    hit(.append);
                 },
             }
         }
@@ -326,6 +369,7 @@ fn fuzzReadDamaged(comptime S: type, smith: *S) !void {
         var nb: [40]u8 = undefined;
         const name = fileName(&nb, 0, segs);
         if (sim.fileContent(name) != null) {
+            hit(.zero_tail);
             var zeros: [64]u8 = @splat(0);
             try sim.appendDurable(name, zeros[0..smith.valueRangeAtMost(u8, 1, zeros.len)]);
         }
@@ -337,15 +381,26 @@ fn fuzzReadDamaged(comptime S: type, smith: *S) !void {
         const name = fileName(&nb, smith.value(u8), seg);
         const content = sim.fileContent(name) orelse continue;
         if (content.len == 0) continue;
+        hit(switch (name[name.len - 1]) {
+            'g' => .damaged_log_file,
+            'x' => .damaged_idx_file,
+            't' => .damaged_zst_file,
+            else => .damaged_manifest,
+        });
         switch (smith.valueRangeAtMost(u8, 0, 3)) {
-            0 => content[smith.index(content.len)] ^= smith.valueRangeAtMost(u8, 1, 255),
+            0 => {
+                hit(.flip);
+                content[smith.index(content.len)] ^= smith.valueRangeAtMost(u8, 1, 255);
+            },
             // Near the end, where the structure is: a seal, a seek table, a
             // manifest's CRC. Random offsets almost never land there.
             3 => {
+                hit(.flip_tail);
                 const tail = @min(content.len, 64);
                 content[content.len - tail + smith.index(tail)] ^= smith.valueRangeAtMost(u8, 1, 255);
             },
             1 => {
+                hit(.truncate);
                 const st = sim.storage();
                 const h = try st.open(name, .open_or_create);
                 defer st.close(h);
@@ -353,6 +408,7 @@ fn fuzzReadDamaged(comptime S: type, smith: *S) !void {
                 try st.sync(h);
             },
             else => {
+                hit(.junk);
                 var junk: [16]u8 = undefined;
                 smith.bytes(&junk);
                 try sim.appendDurable(name, junk[0..smith.valueRangeAtMost(u8, 1, junk.len)]);
@@ -364,10 +420,11 @@ fn fuzzReadDamaged(comptime S: type, smith: *S) !void {
     try readEverything(&sim, opts, damages == 0, appended);
     // A reader beside nothing: the same files, read-only.
     var r = Log.openReadOnly(gpa, sim.storage(), .{ .max_record_len = opts.max_record_len }) catch |e| switch (e) {
-        error.Corrupt, error.NotFound, error.UnsupportedVersion => return,
+        error.Corrupt, error.NotFound, error.UnsupportedVersion => return hit(.reader_refused),
         else => return e,
     };
     defer r.close();
+    hit(.reader_opened);
     try walk(&r, smith);
 }
 
@@ -378,6 +435,7 @@ fn readEverything(sim: *SimStorage, opts: seglog.Options, clean: bool, appended:
         // `scanTail`). The harness missed it from 2026-09-27 until the
         // driver's seed 755 found it (2026-10-19, same on Zig 0.16).
         error.Corrupt, error.NotFound, error.UnsupportedVersion, error.RecordTooLongForOptions => {
+            hit(.open_refused);
             if (clean) return e; // an undamaged log always opens
             return;
         },
@@ -392,6 +450,7 @@ fn readEverything(sim: *SimStorage, opts: seglog.Options, clean: bool, appended:
         else => return e,
     };
     defer report.deinit(gpa);
+    if (!report.clean()) hit(.verify_found_damage);
     if (clean) {
         try testing.expect(report.clean());
         // Compaction dropped some; never more than were appended.
@@ -406,6 +465,7 @@ fn walk(log: *Log, smith: anytype) !void {
     while (steps < 10_000) : (steps += 1) {
         const rec = it.next() catch |e| switch (e) {
             error.Corrupt => {
+                hit(.resync);
                 _ = try it.resync();
                 continue;
             },
@@ -416,13 +476,17 @@ fn walk(log: *Log, smith: anytype) !void {
     }
     try testing.expect(steps < 10_000); // resync always moves forward
     for (0..4) |_| {
-        _ = log.seek(smith.valueRangeAtMost(u64, 1, 64)) catch |e| switch (e) {
+        if (log.seek(smith.valueRangeAtMost(u64, 1, 64))) |p| {
+            if (p != null) hit(.seek_found);
+        } else |e| switch (e) {
             error.Corrupt, error.SegmentGone, error.InvalidPosition, error.UnsupportedVersion => {},
             else => return e,
-        };
-        _ = log.seekTime(smith.value(i16)) catch |e| switch (e) {
+        }
+        if (log.seekTime(smith.value(i16))) |p| {
+            if (p != null) hit(.seek_time_found);
+        } else |e| switch (e) {
             error.Corrupt, error.SegmentGone, error.InvalidPosition, error.UnsupportedVersion => {},
             else => return e,
-        };
+        }
     }
 }

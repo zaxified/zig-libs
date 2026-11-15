@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **CONSUMER-VISIBLE:** `error.TooManySegments` is new in
+  `RotateError` and `AppendError` (egw-hub's own copy will meet it when it
+  switches to this module; an exhaustive `switch` over either set needs the
+  arm). `rotate` refuses, before writing anything, a segment that would take
+  the manifest past 2^20 ids (live plus pending drops): `open` refuses such a
+  manifest, so the log used to become unopenable. No-panic sweep (SL-1 .. SL-10, all
+  with a test that fails without the fix): `Log.verify` on a reader whose
+  manifest went bad returns `Corrupt` instead of unwrapping a null damage;
+  `Window.get` no longer overflows on a `Position.offset` near 2^64 (the
+  iterator finds the record by LSN, or answers `Corrupt`); LSNs above 2^62
+  (manifest first LSN, record LSN) are `Corrupt` so `base + count` / `lsn + 1`
+  cannot overflow; `SyncLatency.quantileUpperUs` is total in `q`;
+  `TimestampPolicy.clamp` with min above max no longer trips `std.math.clamp`'s
+  assert (every ts becomes min); `compactByKey` keeps a record whose key `keyOf`
+  no longer answers; an `.idx` file with more entries than the segment has bytes
+  is not read into memory; `resync` skips the CRC at an offset whose header
+  cannot be accepted (a damaged segment cost a CRC of up to `max_record_len` per
+  byte); a backend handle with bit 31 set is `HandleTableFull`, not an assert.
+  `fuzz_test.zig` counts and prints what it reached (`REACH ...`). Card:
+  Hardening records the fuzz verdict and the sweep.
 - **2026-11-15** — New module: moved here from energomonitor's `egw-hub/seglog/`
   (segmented, crash-consistent, append-only log; format v2). `meta.deps` now lists
   all three imports (`kv`, `crc32c`, `zstd`). Other changes the repo gates required: `zig fmt` (whitespace) on `root.zig`,

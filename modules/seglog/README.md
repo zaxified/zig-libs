@@ -8,7 +8,8 @@ an **LSN** — 1, 2, 3 … across the whole log, never reused — and a timestam
 
 **Status:** a zig-libs module since 2026-11-15, moved from energomonitor's
 `egw-hub/seglog/` (its first consumer, which has not switched to this copy
-yet). Depends on `kv` (the `Storage` seam and `SimStorage` crash simulator),
+yet; ⚠ it meets `error.TooManySegments` in `RotateError` and `AppendError`, new
+2026-11-15, when it does: a `switch` over those sets needs the arm). Depends on `kv` (the `Storage` seam and `SimStorage` crash simulator),
 `crc32c` and `zstd`.
 
 **Model after:** the LevelDB log format and the Prometheus TSDB WAL for the
@@ -139,7 +140,7 @@ LSN) and a future format change moves nothing for you.
 
 ## How it compares
 
-Same machine, same scenarios (`example/bench.zig`; the Go side in
+Same machine, same scenarios (`tools/bench.zig`, `zig build bench-seglog`; the Go side in
 `tools/bench-go`: tidwall/wal v1.2, Prometheus `wlog` v0.315, each with its own
 sync), 2026-09-27, NVMe ext4, best of three rounds:
 
