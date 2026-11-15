@@ -3,7 +3,11 @@
 //! 0.8.3 as the reference (formulas ported from its BSD-3 C source, see NOTICE).
 //!
 //! Seed set (wave I2): SMA, EMA, WMA, MA, MACD, MACDEXT, MACDFIX, RSI, BBANDS,
-//! TRANGE, ATR, NATR, STOCH, STOCHF, MAX, MIN, SUM.
+//! TRANGE, ATR, NATR, STOCH, STOCHF, MAX, MIN, SUM. Wave I3 (overlap studies):
+//! DEMA, TEMA, T3, TRIMA, KAMA, MIDPOINT, MIDPRICE, SAR, SAREXT, MAVP, ACCBANDS,
+//! ALMA, CKSP, DONCHIAN, FRAMA, HMA, ICHIMOKU, KC, MCGD, RMA, SUPERTREND,
+//! SWAK_BUTTER, SWAK_GAUSS, VIDYA, VWMA, ZIGZAG, ZLEMA; every `MaType` but MAMA
+//! now works in MA, MACDEXT, BBANDS, STOCH and STOCHF.
 //!
 //! ```zig
 //! const ind = @import("indicators");
@@ -20,7 +24,7 @@
 //! Streaming types that need history take a caller buffer (`bufLen`); the
 //! recursive ones are plain values and copy by value. Parameters outside
 //! TA-Lib's ranges are `error.BadParam`; a moving-average type that is not
-//! built yet is `error.Unsupported`. Nothing panics.
+//! built yet (MAMA) is `error.Unsupported`. Nothing panics.
 
 const std = @import("std");
 const core = @import("core.zig");
@@ -31,11 +35,16 @@ const range = @import("range.zig");
 const macd_ = @import("macd.zig");
 const bands = @import("bands.zig");
 const stoch_ = @import("stoch.zig");
+const mavg = @import("mavg.zig");
+const overlap = @import("overlap.zig");
+const trend_ = @import("trend.zig");
+const channels = @import("channels.zig");
+const hist = @import("hist.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Technical-analysis indicators (TA-Lib parity): moving averages, MACD, RSI, Bollinger bands, ATR, stochastic, rolling max/min/sum.",
+    .doc = "Technical-analysis indicators (TA-Lib parity): moving averages (SMA to T3, KAMA, HMA, ALMA), MACD, RSI, Bollinger / Keltner / Donchian bands, ATR, stochastic, SAR, Supertrend, Ichimoku, rolling max/min/sum.",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
@@ -131,6 +140,121 @@ pub const bbands = bands.bbands;
 pub const bbandsLookback = bands.bbandsLookback;
 pub const BbandsStream = bands.BbandsStream;
 
+// moving averages, wave I3 (also dispatched by `ma` / every `MaType` slot)
+pub const DemaParams = mavg.DemaParams;
+pub const dema = mavg.dema;
+pub const demaLookback = mavg.demaLookback;
+pub const DemaStream = mavg.DemaStream;
+pub const TemaParams = mavg.TemaParams;
+pub const tema = mavg.tema;
+pub const temaLookback = mavg.temaLookback;
+pub const TemaStream = mavg.TemaStream;
+pub const T3Params = mavg.T3Params;
+pub const t3 = mavg.t3;
+pub const t3Lookback = mavg.t3Lookback;
+pub const T3Stream = mavg.T3Stream;
+pub const TrimaParams = mavg.TrimaParams;
+pub const trima = mavg.trima;
+pub const trimaLookback = mavg.trimaLookback;
+pub const TrimaStream = mavg.TrimaStream;
+pub const KamaParams = mavg.KamaParams;
+pub const kama = mavg.kama;
+pub const kamaLookback = mavg.kamaLookback;
+pub const KamaStream = mavg.KamaStream;
+pub const ZlemaParams = mavg.ZlemaParams;
+pub const zlema = mavg.zlema;
+pub const zlemaLookback = mavg.zlemaLookback;
+pub const ZlemaStream = mavg.ZlemaStream;
+pub const RmaParams = mavg.RmaParams;
+pub const rma = mavg.rma;
+pub const rmaLookback = mavg.rmaLookback;
+pub const RmaStream = mavg.RmaStream;
+pub const VidyaParams = mavg.VidyaParams;
+pub const vidya = mavg.vidya;
+pub const vidyaLookback = mavg.vidyaLookback;
+pub const VidyaStream = mavg.VidyaStream;
+pub const HmaParams = mavg.HmaParams;
+pub const hma = mavg.hma;
+pub const hmaLookback = mavg.hmaLookback;
+pub const HmaStream = mavg.HmaStream;
+pub const AlmaParams = mavg.AlmaParams;
+pub const alma = mavg.alma;
+pub const almaLookback = mavg.almaLookback;
+pub const AlmaStream = mavg.AlmaStream;
+pub const McgdParams = mavg.McgdParams;
+pub const mcgd = mavg.mcgd;
+pub const mcgdLookback = mavg.mcgdLookback;
+pub const McgdStream = mavg.McgdStream;
+pub const SwakParams = mavg.SwakParams;
+pub const swakButter = mavg.swakButter;
+pub const swakButterLookback = mavg.swakButterLookback;
+pub const SwakButterStream = mavg.SwakButterStream;
+pub const swakGauss = mavg.swakGauss;
+pub const swakGaussLookback = mavg.swakGaussLookback;
+pub const SwakGaussStream = mavg.SwakGaussStream;
+
+// overlap studies, wave I3
+pub const MidParams = overlap.MidParams;
+pub const midpoint = overlap.midpoint;
+pub const midpointLookback = overlap.midpointLookback;
+pub const MidpointStream = overlap.MidpointStream;
+pub const midprice = overlap.midprice;
+pub const midpriceLookback = overlap.midpriceLookback;
+pub const MidpriceStream = overlap.MidpriceStream;
+pub const FramaParams = overlap.FramaParams;
+pub const frama = overlap.frama;
+pub const framaLookback = overlap.framaLookback;
+pub const FramaStream = overlap.FramaStream;
+pub const VwmaParams = overlap.VwmaParams;
+pub const vwma = overlap.vwma;
+pub const vwmaLookback = overlap.vwmaLookback;
+pub const VwmaStream = overlap.VwmaStream;
+pub const MavpParams = overlap.MavpParams;
+pub const mavp = overlap.mavp;
+pub const mavpLookback = overlap.mavpLookback;
+
+pub const SarParams = trend_.SarParams;
+pub const sar = trend_.sar;
+pub const sarLookback = trend_.sarLookback;
+pub const SarStream = trend_.SarStream;
+pub const SarextParams = trend_.SarextParams;
+pub const sarext = trend_.sarext;
+pub const sarextLookback = trend_.sarextLookback;
+pub const SarextStream = trend_.SarextStream;
+pub const SupertrendParams = trend_.SupertrendParams;
+pub const SupertrendOut = trend_.SupertrendOut;
+pub const supertrend = trend_.supertrend;
+pub const supertrendLookback = trend_.supertrendLookback;
+pub const SupertrendStream = trend_.SupertrendStream;
+pub const CkspParams = trend_.CkspParams;
+pub const CkspOut = trend_.CkspOut;
+pub const cksp = trend_.cksp;
+pub const ckspLookback = trend_.ckspLookback;
+pub const CkspStream = trend_.CkspStream;
+pub const ZigzagParams = trend_.ZigzagParams;
+pub const ZigzagOut = trend_.ZigzagOut;
+pub const zigzag = trend_.zigzag;
+pub const zigzagLookback = trend_.zigzagLookback;
+pub const ZigzagStream = trend_.ZigzagStream;
+
+pub const AccbandsParams = channels.AccbandsParams;
+pub const accbands = channels.accbands;
+pub const accbandsLookback = channels.accbandsLookback;
+pub const AccbandsStream = channels.AccbandsStream;
+pub const DonchianParams = channels.DonchianParams;
+pub const donchian = channels.donchian;
+pub const donchianLookback = channels.donchianLookback;
+pub const DonchianStream = channels.DonchianStream;
+pub const KcParams = channels.KcParams;
+pub const kc = channels.kc;
+pub const kcLookback = channels.kcLookback;
+pub const KcStream = channels.KcStream;
+pub const IchimokuParams = channels.IchimokuParams;
+pub const IchimokuOut = channels.IchimokuOut;
+pub const ichimoku = channels.ichimoku;
+pub const ichimokuLookback = channels.ichimokuLookback;
+pub const IchimokuStream = channels.IchimokuStream;
+
 test {
     _ = core;
     _ = smooth;
@@ -140,6 +264,12 @@ test {
     _ = macd_;
     _ = bands;
     _ = stoch_;
+    _ = mavg;
+    _ = overlap;
+    _ = trend_;
+    _ = channels;
+    _ = hist;
+    _ = @import("overlap_test.zig");
     _ = @import("testhelp.zig");
     _ = @import("oracle_test.zig");
 }
