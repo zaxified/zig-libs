@@ -1760,6 +1760,7 @@ test {
     _ = @import("expr_decode_test.zig");
     _ = @import("kernel_dumps.zig");
     _ = @import("goldens2.zig");
+    _ = @import("strict_test.zig");
     if (builtin.os.tag == .linux) {
         _ = native;
         _ = @import("consistency.zig");
