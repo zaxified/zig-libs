@@ -523,7 +523,7 @@ Every one of the 260 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | [`finstats`](modules/finstats/README.md) | 2 (S,E,A,P) | Portfolio/financial statistics over plain slices — XIRR, TWR, risk, beta, Monte-Carlo, correlation, drawdowns. | any | datefmt |
 | [`fuzzysearch`](modules/fuzzysearch/README.md) | 3 (S,H,P) | Bounded-edit-distance typo-tolerant lookup over a static string set — DoS-bounded, the typo-tolerant sibling of `trie`. | any | trie |
 | [`geoindex`](modules/geoindex/README.md) | 4 (S) | Static spatial index for bbox and nearest-neighbour queries over a large fixed geo-point set — DoS-bounded, zero-copy. | any | — |
-| [`indicators`](modules/indicators/README.md) | 5 (H) | Technical-analysis indicators (TA-Lib parity): moving averages, MACD, RSI, Bollinger bands, ATR, stochastic, rolling max/min/sum. | any | — |
+| [`indicators`](modules/indicators/README.md) | 5 (H) | Technical-analysis indicators (TA-Lib parity): moving averages (SMA to T3, KAMA, HMA, ALMA), MACD, RSI, Bollinger / Keltner / Donchian bands, ATR, stochastic, SAR, Supertrend, Ichimoku, rolling max/min/sum. | any | — |
 | [`jobqueue`](modules/jobqueue/README.md) | 3 (S,H,P) | Durable background-job queue over `kv` — lease/retry/dead-letter queue, per-partition FIFO under priority. | posix | kv, clock |
 | [`jsonshape`](modules/jsonshape/README.md) | 2 (S,E,A,P) | JSON → `dataframe.Frame` reshaping and RFC 9535 JSONPath queries — path to items, typed column projection, Normalized Paths. | any | dataframe, regex, jsontext |
 | [`kv`](modules/kv/README.md) | 1 | Crash-consistent embedded KV store, Bitcask-style log, with randomized fuzz-tested crash recovery. | any | clock |
