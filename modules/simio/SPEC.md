@@ -65,7 +65,7 @@ in one OS thread, under virtual time, over a simulated network and file system, 
 that code **unchanged** — deterministically, as a pure function of a seed, with
 netsim's fault schedule, replay and minimizer on top.
 
-Decided by the user 2026-10-01 (CML session): "grow our own" rather than point
+Decided by the user 2026-10-01: "grow our own" rather than point
 consumers at `sb2bg/marionette`; a **new module over netsim** (netsim stays pure and
 platform-free); file system and storage faults **in scope from the start**.
 
