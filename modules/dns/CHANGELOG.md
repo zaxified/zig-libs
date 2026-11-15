@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **CONSUMER-VISIBLE (additive):** `Resolver.reverseTtl` → `ReverseLookup{ names, ttl_s }`: `reverse` plus how long the answer may be cached — the smallest TTL of the PTR records and the CNAMEs on their chain (RFC 2317 delegation), or for an empty answer the SOA's negative TTL, `min(TTL, MINIMUM)` (RFC 2308 §5); null for /etc/hosts or an empty answer without SOA. Free `names` with `freeNames`. No `partial` (one query). `reverse` unchanged (now a wrapper). For callers that cache PTR answers like address lookups (zpinger). **Tests:** PTR TTL minimum, CNAME chain, NXDOMAIN/NODATA negative TTL table, hosts, `reverse` parity.
 - **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** three test stubs counted a query after sending its reply, and a test reads the count as soon as it has the reply: `expected 2, found 1` in full CI 41660835693, reproduced with a 50 ms delay in the stub. Tests only.
 - **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE:** the bailiwick loopback test sends its queries in turn: its stub answers one datagram with an A question, so with parallel families an AAAA arriving first failed the test (full CI 41400687116).
 

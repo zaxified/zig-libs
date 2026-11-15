@@ -89,6 +89,14 @@ section (at most 8 hops; a loop cannot extend the chain), are returned. An A rec
 now ignored. `resolve`/`query` return the whole message untouched — a caller reading `answers`
 itself owns that check.
 
+`lookupIpTtl` and `reverseTtl` also return how long the answer may be cached (`ttl_s`): the smallest
+TTL over the address / PTR records used and the CNAMEs on their chain (RFC 1035 §3.2.1; RFC 2317
+classless reverse delegation is such a chain), for an empty answer (NXDOMAIN / NODATA) the SOA's
+negative TTL, `min(SOA TTL, MINIMUM)` (RFC 2308 §5), bounded by a CNAME that was followed; null for
+a literal, an /etc/hosts entry, or an empty answer without SOA. `ReverseLookup` has no `partial`
+(`IpLookup.partial` marks one of the two parallel family queries failing; a reverse lookup is one
+query). `reverse` is `reverseTtl(...).names`.
+
 Decoded names are dotted text without the trailing root dot and with no `\DDD` escape handling —
 labels are raw bytes, so a label containing `.` is indistinguishable from two labels in the text
 form and `writeName` is not its inverse; callers displaying them must escape, and callers that

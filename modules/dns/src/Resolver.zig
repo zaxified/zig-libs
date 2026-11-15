@@ -536,8 +536,32 @@ test "answerTtl: smallest TTL on the chain; negative answers from the SOA" {
 
 /// PTR lookup: /etc/hosts first (when enabled), then a reverse query for the
 /// `in-addr.arpa`/`ip6.arpa` name built via netaddr. Returns the host names
-/// (possibly empty); free with `freeNames`.
+/// (possibly empty); free with `freeNames`. `reverseTtl` also says how long
+/// the answer may be cached.
 pub fn reverse(r: *Resolver, ip: netaddr.Ip) Error![]const []const u8 {
+    const owns_call = r.beginCall();
+    defer r.endCall(owns_call);
+    return (try r.reverseTtl(ip)).names;
+}
+
+/// `reverseTtl`'s answer. Free `names` with `freeNames`. There is no
+/// `partial` as in `IpLookup`: a reverse lookup is one query, so it either
+/// answers or fails as a whole.
+pub const ReverseLookup = struct {
+    names: []const []const u8,
+    /// How long the answer may be cached, in seconds: the smallest TTL of the
+    /// PTR records it was built from and of the CNAMEs on the way to them
+    /// (RFC 2317 classless delegation answers through a CNAME; RFC 1035
+    /// §3.2.1); for an empty answer (NXDOMAIN, NODATA) the negative-caching
+    /// TTL, the smaller of the SOA record's TTL and its MINIMUM (RFC 2308
+    /// §5). Null when there is none to go by: an /etc/hosts entry, an empty
+    /// answer without SOA.
+    ttl_s: ?u32,
+};
+
+/// `reverse`, and how long its answer may be cached (`ReverseLookup.ttl_s`),
+/// for a caller that keeps host names between lookups (as `lookupIpTtl`).
+pub fn reverseTtl(r: *Resolver, ip: netaddr.Ip) Error!ReverseLookup {
     const owns_call = r.beginCall();
     defer r.endCall(owns_call);
     var names: std.ArrayList([]const u8) = .empty;
@@ -552,7 +576,7 @@ pub fn reverse(r: *Resolver, ip: netaddr.Ip) Error![]const []const u8 {
         var name_buf: [message.max_name_text_len]u8 = undefined;
         if (config.hostsNameForIp(content, ip, &name_buf)) |name| {
             try names.append(r.gpa, try r.gpa.dupe(u8, name));
-            return names.toOwnedSlice(r.gpa);
+            return .{ .names = try names.toOwnedSlice(r.gpa), .ttl_s = null };
         }
     }
 
@@ -563,7 +587,23 @@ pub fn reverse(r: *Resolver, ip: netaddr.Ip) Error![]const []const u8 {
     var msg = try r.query(rev, .ptr);
     defer msg.deinit();
     try collectPtrNames(r.gpa, &names, &msg, rev);
-    return names.toOwnedSlice(r.gpa);
+    const ttl = ptrTtl(&msg, rev, names.items.len > 0);
+    return .{ .names = try names.toOwnedSlice(r.gpa), .ttl_s = ttl };
+}
+
+/// The TTL of a reverse answer, as `answerTtl` is for addresses: with names
+/// taken (`found`), the smallest TTL of the PTR and CNAME records on `rev`'s
+/// chain — the records `collectPtrNames` used; without, the negative TTL
+/// from the authority section's SOA (RFC 2308 §5), bounded by any CNAME the
+/// chain did follow.
+fn ptrTtl(msg: *const message.Message, rev: []const u8, found: bool) ?u32 {
+    var chain: OwnerChain = .init(rev);
+    chain.follow(msg.answers);
+    var used: ?u32 = null;
+    for (msg.answers) |rec| {
+        if (rec.class == .in and rec.data == .ptr and chain.contains(rec.name)) used = minTtl(used, rec.ttl);
+    }
+    return typedTtl(msg, &chain, used, found);
 }
 
 // ── typed lookups (R5 / G2): MX, NS, TXT, CNAME, SRV ─────────────────────────
@@ -4280,6 +4320,121 @@ test "typed lookups: SERVFAIL is ServerFailed, NXDOMAIN is an empty set" {
         defer lk.deinit();
         try testing.expectEqual(@as(usize, 0), lk.items.len);
         try testing.expectEqual(@as(?u32, null), lk.ttl_s);
+    }
+}
+
+const ptr_test_ip: netaddr.Ip = .{ .v4 = .{ 192, 0, 2, 1 } };
+const ptr_test_rev = "1.2.0.192.in-addr.arpa";
+
+test "reverseTtl: the smallest PTR TTL; a PTR for another owner does not count; reverse is the same answer" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wb: WireBuf = .{};
+    wb.nameRr(ptr_test_rev, .ptr, 300, "a.example.com");
+    wb.nameRr(ptr_test_rev, .ptr, 120, "b.example.com");
+    wb.nameRr("2.2.0.192.in-addr.arpa", .ptr, 5, "other.example.com"); // not the owner asked
+    inline for (.{ true, false }) |with_ttl| {
+        var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8180, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        defer rg.stub.sock.close(io);
+        defer rg.r.deinit();
+        var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+        if (with_ttl) {
+            const res = rg.r.reverseTtl(ptr_test_ip);
+            fut.await(io);
+            const found = try res;
+            defer rg.r.freeNames(found.names);
+            try expectStrings(&.{ "a.example.com", "b.example.com" }, found.names);
+            try testing.expectEqual(@as(?u32, 120), found.ttl_s);
+        } else {
+            const res = rg.r.reverse(ptr_test_ip);
+            fut.await(io);
+            const names = try res;
+            defer rg.r.freeNames(names);
+            try expectStrings(&.{ "a.example.com", "b.example.com" }, names);
+        }
+    }
+}
+
+test "reverseTtl: an RFC 2317 CNAME on the chain bounds the TTL" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wb: WireBuf = .{};
+    wb.nameRr(ptr_test_rev, .cname, 60, "1.0-127.2.0.192.in-addr.arpa");
+    wb.nameRr("1.0-127.2.0.192.in-addr.arpa", .ptr, 300, "host.example.com");
+    var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8180, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer rg.stub.sock.close(io);
+    defer rg.r.deinit();
+    var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+    const res = rg.r.reverseTtl(ptr_test_ip);
+    fut.await(io);
+    const found = try res;
+    defer rg.r.freeNames(found.names);
+    try expectStrings(&.{"host.example.com"}, found.names);
+    try testing.expectEqual(@as(?u32, 60), found.ttl_s);
+}
+
+test "reverseTtl: NXDOMAIN and NODATA without an SOA have no TTL; /etc/hosts has none either" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const wb: WireBuf = .{};
+    for ([_]u16{ 0x8183, 0x8180 }) |flags| { // NXDOMAIN, NODATA (no error, no answer)
+        var rg = TypedRig.init(io, io, testing.allocator, &wb, flags, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        defer rg.stub.sock.close(io);
+        defer rg.r.deinit();
+        var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+        const res = rg.r.reverseTtl(ptr_test_ip);
+        fut.await(io);
+        const found = try res;
+        defer rg.r.freeNames(found.names);
+        try testing.expectEqual(@as(usize, 0), found.names.len);
+        try testing.expectEqual(@as(?u32, null), found.ttl_s);
+    }
+
+    // /etc/hosts: answered without a query (the server is a closed port).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const hosts_path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/hosts", .{&tmp.sub_path});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = hosts_path, .data = "192.0.2.1 gw.example.com gw\n" });
+    var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = 1, .timeout_ms = 100, .attempts = 1, .use_hosts = true, .hosts_path = hosts_path, .use_search = false });
+    defer r.deinit();
+    const found = try r.reverseTtl(ptr_test_ip);
+    defer r.freeNames(found.names);
+    try expectStrings(&.{"gw.example.com"}, found.names);
+    try testing.expectEqual(@as(?u32, null), found.ttl_s);
+}
+
+test "ptrTtl: negative TTL from the SOA (RFC 2308 section 5), bounded by a followed CNAME" {
+    const ptr = message.Record{ .name = ptr_test_rev, .ty = .ptr, .class = .in, .ttl = 300, .data = .{ .ptr = "host.example.com" } };
+    const stray = message.Record{ .name = "2.2.0.192.in-addr.arpa", .ty = .ptr, .class = .in, .ttl = 5, .data = .{ .ptr = "other.example.com" } };
+    const cname = message.Record{ .name = ptr_test_rev, .ty = .cname, .class = .in, .ttl = 45, .data = .{ .cname = "1.0-127.2.0.192.in-addr.arpa" } };
+    const soa_big = message.Record{ .name = "2.0.192.in-addr.arpa", .ty = .soa, .class = .in, .ttl = 3600, .data = .{ .soa = .{
+        .mname = "ns.example.com",
+        .rname = "admin.example.com",
+        .serial = 1,
+        .refresh = 0,
+        .retry = 0,
+        .expire = 0,
+        .minimum = 900,
+    } } };
+    var soa_small = soa_big;
+    soa_small.ttl = 200; // the SOA's own TTL is the smaller one
+    const Case = struct { answers: []const message.Record, authorities: []const message.Record, found: bool, want: ?u32 };
+    const cases = [_]Case{
+        .{ .answers = &.{}, .authorities = &.{soa_big}, .found = false, .want = 900 }, // NXDOMAIN: MINIMUM < SOA TTL
+        .{ .answers = &.{}, .authorities = &.{soa_small}, .found = false, .want = 200 }, // NODATA: SOA TTL < MINIMUM
+        .{ .answers = &.{stray}, .authorities = &.{soa_big}, .found = false, .want = 900 }, // stray PTR is not the answer
+        .{ .answers = &.{cname}, .authorities = &.{soa_big}, .found = false, .want = 45 }, // dangling CNAME bounds it
+        .{ .answers = &.{}, .authorities = &.{}, .found = false, .want = null }, // no SOA, no TTL
+        .{ .answers = &.{ptr}, .authorities = &.{soa_small}, .found = true, .want = 300 }, // SOA is for empty answers only
+        .{ .answers = &.{ cname, ptr }, .authorities = &.{}, .found = true, .want = 45 },
+    };
+    for (cases) |c| {
+        const msg: message.Message = .{ .arena = undefined, .header = undefined, .questions = &.{}, .answers = c.answers, .authorities = c.authorities, .additionals = &.{} };
+        try testing.expectEqual(c.want, ptrTtl(&msg, ptr_test_rev, c.found));
     }
 }
 

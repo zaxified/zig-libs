@@ -81,6 +81,12 @@ defer gpa.free(canonical);
 const names = try resolver.reverse(netaddr.parseIp("8.8.8.8").?);
 defer resolver.freeNames(names);
 
+// The same, plus how long it may be cached: the smallest PTR/CNAME TTL (RFC 2317
+// delegation answers through a CNAME), or the SOA's negative TTL for an empty
+// answer; null for /etc/hosts.
+const rev = try resolver.reverseTtl(netaddr.parseIp("8.8.8.8").?);
+defer resolver.freeNames(rev.names);
+
 // DNS-over-HTTPS (RFC 8484) — same API, different transport:
 var doh = dns.Resolver.init(io, gpa, .{ .doh_url = "https://dns.google/dns-query" });
 defer doh.deinit();
