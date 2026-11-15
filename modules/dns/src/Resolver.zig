@@ -4390,6 +4390,12 @@ const WireBuf = struct {
         b.rr(owner, .a, ttl, &rd);
     }
 
+    fn aaaaRr(b: *WireBuf, owner: []const u8, ttl: u32, addr: [16]u8) void {
+        var rd: WireBuf = .{};
+        rd.put(&addr);
+        b.rr(owner, .aaaa, ttl, &rd);
+    }
+
     fn soaRr(b: *WireBuf, owner: []const u8, ttl: u32, minimum: u32) void {
         var rd: WireBuf = .{};
         rd.putName("ns.example.com");
@@ -4411,6 +4417,8 @@ const TypedStub = struct {
     max: usize,
     authority: []const u8 = "",
     nscount: u16 = 0,
+    /// Header flags for an AAAA question, when they differ from `flags`.
+    aaaa_flags: ?u16 = null,
     fold_question: bool = false,
     idle_ms: i64 = 3000,
     served: usize = 0,
@@ -4432,13 +4440,15 @@ const TypedStub = struct {
         p += 5; // root label, type, class
         if (p > q.len) return error.BadQuery;
         const question = q[12..p];
+        const is_aaaa = std.mem.readInt(u16, question[question.len - 4 ..][0..2], .big) == @backingInt(message.Type.aaaa);
+        const flags = if (is_aaaa) st.aaaa_flags orelse st.flags else st.flags;
         @memcpy(st.last_question[0..question.len], question);
         st.last_question_len = question.len;
         if (st.fold_question) for (question) |*c| {
             c.* = std.ascii.toLower(c.*);
         };
         var out: [2048]u8 = undefined;
-        const resp = stubResponseAuth(&out, q, st.flags, question, st.answers, st.ancount, st.authority, st.nscount);
+        const resp = stubResponseAuth(&out, q, flags, question, st.answers, st.ancount, st.authority, st.nscount);
         // Counted before the reply leaves: a test reads `served` as soon as it has the reply.
         st.served += 1;
         try st.sock.send(st.io, &incoming.from, resp);
@@ -4908,6 +4918,81 @@ test "/etc/hosts and literals: found, no TTL, no canonical name, not authenticat
     }
 }
 
+test "lookupIp: each family takes its own records; TTL is the smaller set's, AD needs both replies" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // One answer section for both questions: the A query must not take the
+    // AAAA record (nor the AAAA query the A record), and the A set's TTL (30)
+    // bounds the pair whichever reply is read last.
+    var wb: WireBuf = .{};
+    wb.aRr("example.com", 30, .{ 192, 0, 2, 1 });
+    wb.aaaaRr("example.com", 300, .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0)));
+    var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8180, 2) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer rg.stub.sock.close(io);
+    defer rg.r.deinit();
+    rg.stub.aaaa_flags = 0x81a0; // only the AAAA reply carries AD
+    rg.r.options.authentic_data = true;
+    rg.r.options.parallel_families = false;
+    var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+    const res = rg.r.lookupIp("example.com");
+    fut.await(io);
+    var lk = try res;
+    defer lk.deinit();
+    try expectShape(netaddr.Ip, .{ .status = .found, .ttl_s = 30, .canonical = "example.com", .authenticated = false, .items = 2 }, &lk);
+}
+
+test "lookupCname: a CNAME whose target has no A record is still the answer" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wb: WireBuf = .{};
+    wb.nameRr("alias.example.com", .cname, 120, "v6only.example.com");
+    var auth: WireBuf = .{};
+    var rg = rigFor(io, &wb, &auth, .{ .flags = 0x8180, .soa = true }, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer rg.stub.sock.close(io);
+    defer rg.r.deinit();
+    var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+    const res = rg.r.lookupCname("alias.example.com");
+    fut.await(io);
+    var lk = try res;
+    defer lk.deinit();
+    // The A question is NODATA at the target (negative TTL 50), the alias is found.
+    try expectShape([]const u8, .{ .status = .found, .ttl_s = 50, .canonical = "v6only.example.com", .items = 1 }, &lk);
+}
+
+test "reverse: a SERVFAIL is ServerFailed, not an empty list" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const wb: WireBuf = .{};
+    var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8182, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer rg.stub.sock.close(io);
+    defer rg.r.deinit();
+    var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+    const res = rg.r.reverse(ptr_test_ip);
+    fut.await(io);
+    try testing.expectError(error.ServerFailed, res);
+}
+
+test "lookupIp: /etc/hosts entries are filtered to Options.family" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const hosts_path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/hosts", .{&tmp.sub_path});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = hosts_path, .data = "192.0.2.1 dual\n2001:db8::1 dual\n" });
+    var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = 1, .timeout_ms = 100, .attempts = 1, .hosts_path = hosts_path, .use_search = false, .family = .v6 });
+    defer r.deinit();
+    var lk = try r.lookupIp("dual");
+    defer lk.deinit();
+    try testing.expectEqual(@as(usize, 1), lk.items.len);
+    try testing.expect(lk.items[0] == .v6);
+    try testing.expectEqual(Status.found, lk.status);
+}
+
 test "case_randomization: the query goes out in mixed case; a reply echoing another case is dropped (DNS 0x20)" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -4998,6 +5083,29 @@ test "resolv.conf is re-read when it changes (resolv_conf_recheck_ms); not with 
     owns = r.beginCall();
     r.endCall(owns);
     try testing.expect(r.conf == null and r.conf_text == null);
+
+    // Unchanged: checked, and the parsed copy is kept.
+    try r.ensureConfig();
+    const text = r.conf_text.?;
+    r.conf_checked = null;
+    owns = r.beginCall();
+    r.endCall(owns);
+    try testing.expect(r.conf_text != null and r.conf_text.?.ptr == text.ptr);
+
+    // A rewrite inside one mtime tick (same inode, same mtime): only the size
+    // tells it apart. The mtime is pinned by hand to make the tick exact.
+    const tick: std.Io.Timestamp = .{ .nanoseconds = 1_700_000_000 * std.time.ns_per_s };
+    try tmp.dir.setTimestamps(io, "resolv.conf", .{ .modify_timestamp = .{ .new = tick } });
+    r.conf_checked = null;
+    owns = r.beginCall(); // stamp moved: dropped, read again below
+    r.endCall(owns);
+    try r.ensureConfig();
+    try tmp.dir.writeFile(io, .{ .sub_path = "resolv.conf", .data = "search fourth-and-longer.test\n" });
+    try tmp.dir.setTimestamps(io, "resolv.conf", .{ .modify_timestamp = .{ .new = tick } });
+    r.conf_checked = null;
+    owns = r.beginCall();
+    r.endCall(owns);
+    try testing.expect(r.conf == null);
 }
 
 test "judge: negative TTL from the SOA (RFC 2308 section 5), bounded by a followed CNAME; status from the rcode" {
