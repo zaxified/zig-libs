@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **CONSUMER-VISIBLE (fix):** `Mtr.hops()` / `lastRound()` (and `MtrSet` members) of a path whose destination has not answered now end one probed TTL after the last that answered, as mtr shows its `???` row: a silent destination showed nothing past the last router, as if the path ended there. Before any answer that is TTL 1 alone, once probed. A reached path or a Destination Unreachable end is unchanged. Found on a live target that stopped answering (its trace ended at hop 18).
 - **2026-11-11** — **NO CONSUMER-VISIBLE CHANGE:** `tools/kernel_oracle.py` runs its ~93 cases in 8 parallel `unshare -rmn` shards and merges them in the old order; `zig build interop-traceroute` 489 s → 74 s locally, same 109 traces and verdicts.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** private `onesSum` (duplicate-code pass) calls `icmp.checksum.sum`; same results.
 - **2026-11-02** — **CONSUMER-VISIBLE (additive, one fix):** `Mtr.on_answer` reports each answer as `round` accepts it, for a live display (`example-apps/tiny-mtr`). `Mtr.reset` now zeroes `rounds`, as its comment always said; a caller showing `rounds` after a reset sees the new count.
