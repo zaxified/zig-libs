@@ -44,14 +44,23 @@ var resolver = dns.Resolver.init(io, gpa, .{});
 defer resolver.deinit();
 
 // getaddrinfo-like: /etc/hosts first, then A + AAAA with the search list,
-// RFC 6724-ordered on Linux.
-const ips = try resolver.lookupIp("example.com");
-defer gpa.free(ips);
-
-// The same, plus how long it may be cached: the smallest record TTL, or the
-// SOA's negative TTL for an empty answer; null for a literal or /etc/hosts.
-const found = try resolver.lookupIpTtl("example.com");
-defer gpa.free(found.ips);
+// RFC 6724-ordered on Linux. Every high-level lookup returns the same shape,
+// `Lookup(T)`: items + status + ttl_s + canonical + authenticated (+ partial).
+var ips = try resolver.lookupIp("example.com");
+defer ips.deinit();
+for (ips.items) |ip| std.debug.print("{f}\n", .{ip});
+switch (ips.status) {
+    .found => {},
+    .nxdomain => std.debug.print("no such host\n", .{}), // RCODE 3
+    .nodata => std.debug.print("exists, no address\n", .{}), // NOERROR, empty
+}
+// How long it may be cached (smallest record/CNAME TTL, or the SOA's negative
+// TTL for an empty answer; null for a literal or /etc/hosts), where the CNAME
+// chain ends, and -- only with `.authentic_data = true` towards a validating
+// resolver you trust -- whether every reply carried AD.
+_ = .{ ips.ttl_s, ips.canonical, ips.authenticated };
+// `partial`: one family (A or AAAA) failed while the other answered.
+if (ips.partial) std.debug.print("one family missing\n", .{});
 
 // Any record type; caller inspects rcode/answers, message owns its memory.
 var msg = try resolver.resolve("example.com", .mx);
@@ -62,24 +71,28 @@ for (msg.answers) |rec| switch (rec.data) {
 };
 
 // Typed lookups (Go's net.LookupMX / LookupNS / LookupTXT / LookupCNAME /
-// LookupSRV): only records owned by the name that answered (or by a CNAME
-// target chained from it) count. MX is sorted by preference (equal ones in
-// random order, RFC 5321 §5.1); SRV is in RFC 2782 order (priority, then
-// weighted random), a "." target = service not available = empty set; TXT
-// joins the strings of each record. Empty set for NXDOMAIN/NODATA,
-// error.ServerFailed when the servers failed. Strings live in the set's arena.
+// LookupSRV), same result shape: only records owned by the name that answered
+// (or by a CNAME target chained from it) count. MX is sorted by preference
+// (equal ones in random order, RFC 5321 §5.1); SRV is in RFC 2782 order
+// (priority, then weighted random), a "." target = service not available =
+// `found` with no item; TXT joins the strings of each record.
+// error.ServerFailed for any rcode but NOERROR/NXDOMAIN.
 var mx = try resolver.lookupMx("example.com");
 defer mx.deinit();
 for (mx.items) |m| std.debug.print("{d} {s}\n", .{ m.preference, m.host });
 var srv = try resolver.lookupSrv("sip", "tcp", "example.com"); // _sip._tcp.example.com
 defer srv.deinit();
-const canonical = try resolver.lookupCname("www.example.com"); // gpa.free
-defer gpa.free(canonical);
-// lookupNs / lookupTxt return Lookup([]const u8); `.ttl_s` is the cache TTL.
+var cname = try resolver.lookupCname("www.example.com"); // .items = aliases, .canonical = the end
+defer cname.deinit();
 
 // Reverse (PTR): hosts file first, then in-addr.arpa / ip6.arpa via netaddr.
-const names = try resolver.reverse(netaddr.parseIp("8.8.8.8").?);
-defer resolver.freeNames(names);
+var names = try resolver.reverse(netaddr.parseIp("8.8.8.8").?);
+defer names.deinit();
+for (names.items) |n| std.debug.print("{s} (ttl {?d})\n", .{ n, names.ttl_s });
+
+// A copy independent of the resolver and the original (what a cache keeps).
+var kept = try names.clone(gpa);
+defer kept.deinit();
 
 // DNS-over-HTTPS (RFC 8484) — same API, different transport:
 var doh = dns.Resolver.init(io, gpa, .{ .doh_url = "https://dns.google/dns-query" });
@@ -130,7 +143,16 @@ everything it returns lives in `arena`.
   (audit F7) — slices into `Record.name`, populated for every decoded
   record; empty on a hand-built `Record` that never set it.
 - `resolve` returns the last response even on NXDOMAIN/empty — inspect
-  `Message.rcode()`; `lookupIp` returns an empty slice when nothing resolves.
+  `Message.rcode()`; the high-level lookups return empty `items` with
+  `status` `.nxdomain` / `.nodata` when nothing resolves (search list: NODATA
+  if any candidate exists, as glibc), and `error.ServerFailed` for any other
+  rcode.
+- resolv.conf is re-checked (inode, size, mtime) at most every
+  `resolv_conf_recheck_ms` (5 s, Go's interval) at the start of a call and
+  re-read when it changed; `null` reads it once.
+- `case_randomization = true` (DNS 0x20, off by default as in c-ares and
+  hickory): UDP queries go out in random case and a reply must echo it
+  exactly; a server that folds case then times out every query.
 - EDNS(0) advertises a 1232-byte UDP payload by default (DNS flag day 2020);
   set `edns_udp_size = null` for plain RFC 1035 queries.
 - DoH uses query id 0 (RFC 8484 §4.1 cache friendliness).

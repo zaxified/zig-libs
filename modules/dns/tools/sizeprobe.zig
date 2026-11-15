@@ -13,7 +13,7 @@ pub fn main(init: std.process.Init) void {
     const pid: u32 = @bitCast(std.os.linux.getpid());
     var r = dns.Resolver.init(init.io, init.gpa, .{ .timeout_ms = 1, .attempts = 1 });
     defer r.deinit();
-    const names = r.reverse(.{ .v4 = .{ 192, 0, 2, @truncate(pid) } }) catch std.os.linux.exit(2);
-    defer r.freeNames(names);
-    std.os.linux.exit(@intCast(names.len & 1));
+    var names = r.reverse(.{ .v4 = .{ 192, 0, 2, @truncate(pid) } }) catch std.os.linux.exit(2);
+    defer names.deinit();
+    std.os.linux.exit(@intCast(names.items.len & 1));
 }

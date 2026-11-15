@@ -124,19 +124,20 @@ fn lookupIp(io: std.Io, gpa: std.mem.Allocator) !void {
     var r = dns.Resolver.init(io, gpa, .{ .timeout_ms = 3000 });
     defer r.deinit();
 
-    const ips = try r.lookupIp("example.com");
-    defer gpa.free(ips);
-    if (ips.len == 0) return error.NoAddresses;
+    var ips = try r.lookupIp("example.com");
+    defer ips.deinit();
+    if (ips.items.len == 0) return error.NoAddresses;
+    if (ips.ttl_s == null or ips.canonical == null) return error.NoAnswerMetadata;
 }
 
 fn reversePtr(io: std.Io, gpa: std.mem.Allocator) !void {
     var r = dns.Resolver.init(io, gpa, .{ .timeout_ms = 3000 });
     defer r.deinit();
 
-    const names = try r.reverse(netaddr.parseIp("8.8.8.8").?);
-    defer r.freeNames(names);
-    if (names.len == 0) return error.NoPtrRecords;
-    if (std.mem.find(u8, names[0], "dns.google") == null) return error.UnexpectedPtrName;
+    var names = try r.reverse(netaddr.parseIp("8.8.8.8").?);
+    defer names.deinit();
+    if (names.items.len == 0) return error.NoPtrRecords;
+    if (std.mem.find(u8, names.items[0], "dns.google") == null) return error.UnexpectedPtrName;
 }
 
 fn dohPost(io: std.Io, gpa: std.mem.Allocator) !void {

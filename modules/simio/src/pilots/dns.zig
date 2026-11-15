@@ -100,7 +100,7 @@ fn tcpServer(io: Io, b: *Behaviour) !void {
 }
 
 const Lookup = struct {
-    result: ?anyerror![]netaddr.Ip = null,
+    result: ?anyerror!dns.Resolver.Lookup(netaddr.Ip) = null,
     took_ns: u64 = 0,
 };
 
@@ -113,10 +113,10 @@ fn lookup(io: Io, sim: *Sim, options: dns.Resolver.Options, out: *Lookup) void {
 }
 
 fn expectAnswer(l: *const Lookup) !void {
-    const ips = try l.result.?;
-    defer testing.allocator.free(ips);
-    try testing.expectEqual(@as(usize, 1), ips.len);
-    try testing.expectEqualSlices(u8, &answer_ip, &ips[0].v4);
+    var ips = try l.result.?;
+    defer ips.deinit();
+    try testing.expectEqual(@as(usize, 1), ips.items.len);
+    try testing.expectEqualSlices(u8, &answer_ip, &ips.items[0].v4);
 }
 
 const World = struct { sim: Sim, client: *Host, server: *Host };
@@ -147,13 +147,13 @@ test "pilot dns: lookupIp reads resolv.conf from the simulated disk and retries 
         _ = w.sim.runFor(60 * ns_per_s);
         // A and AAAA each needed at least one answer; more means retries.
         if (b.served_udp > 2) retried = true;
-        const ips = l.result.? catch |err| {
+        var ips = l.result.? catch |err| {
             // Six attempts can all be lost at 25% each way; then Timeout is right.
             try testing.expectEqual(error.Timeout, err);
             continue;
         };
-        defer testing.allocator.free(ips);
-        try testing.expectEqualSlices(u8, &answer_ip, &ips[0].v4);
+        defer ips.deinit();
+        try testing.expectEqualSlices(u8, &answer_ip, &ips.items[0].v4);
     }
     try testing.expect(retried);
 }
