@@ -877,7 +877,7 @@ pub fn build(b: *std.Build) void {
             // `fastmem` for every bench driver (2026-10-11): a bench that
             // exercises std code which memsets large blocks installs
             // `fastmem.exportSymbols()`, as this collection's libc-free
-            // executables do (qap's), so the ratio measures the module and
+            // executables do (the web-server consumer's), so the ratio measures the module and
             // not Zig 0.16's byte-wise compiler_rt memset. A bench that does
             // so says it on its card; the module itself never imports it.
             if (!std.mem.eql(u8, m.name, "fastmem")) bench_mod.addImport("fastmem", fastModuleGraph(b, target, &fast_mods, "fastmem"));

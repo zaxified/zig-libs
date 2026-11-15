@@ -79,7 +79,7 @@ line at `unsurveyed` has not finished.
 ## Standing rules
 
 - Mark every claim as verified or inferred. An unmarked guess is worse than a gap.
-- Prefer a **reference tool we can diff against** (`fping` is why `zig-fping`'s tests
+- Prefer a **reference tool we can diff against** (`fping` is why a consumer ping tool's tests
   are strong). If the module has one, name it — it becomes the application's oracle.
 - Check whether the module's own SPEC/README still tells the truth; the pilot found
   stale test counts in both files it looked at.
