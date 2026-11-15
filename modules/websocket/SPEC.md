@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — RFC 6455 §8.1 makes invalid UTF-8 in a text message fail the connection (1007); coder/websocket v1.8.15 and gorilla/websocket v1.5.3 echo it back, whole or split across fragments, this module closes 1007 (rows `raw-utf8-*` of `zig build interop-websocket`) (measured 2026-10-26) · correctness — RFC 6455 §5.2 "the minimal number of bytes MUST be used to encode the length": both read a 16-bit or 64-bit length of 5, this module closes 1002 (rows `raw-length-nonminimal-*`) (measured 2026-10-26) · correctness — the opening handshake per RFC 6455 §4.1/§11.3.1/§11.3.5: both upgrade a request with two `Sec-WebSocket-Version` lines, gorilla also one with two `Sec-WebSocket-Key` lines and an HTTP/1.0 request; this module answers 400 (rows `raw-hs-duplicate-*`, `raw-hs-http-1.0`) (measured 2026-10-26) · correctness — RFC 7692 §6.1 and RFC 6455 §5.5.1: gorilla ignores RSV1 on a continuation or a ping and reads a 1-byte close body as a close without a code, coder accepts a close reason that is not UTF-8; this module fails each (rows `raw-deflate-rsv1-on-*`, `raw-close-1-byte-body`, `raw-close-reason-invalid-utf8`) (measured 2026-10-26)
 
-**Audit:** review 2026-11-07 · mutation 2026-11-07 (400/425, 25 eq) · src d2ad102bcfaa6218
+**Audit:** review 2026-11-07 · mutation 2026-11-07 (400/425, 25 eq) · src da360c5502de81d6
 
 Audit detail: the 2026-11-01 review is a delta over `src/frame.zig` and `src/handshake.zig` (the fuzz-driver test migrated from sequential `run` calls to one `driver.runAll`, same harnesses and options), test code only; the library source the mutation run scored is unchanged.
 
@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [karlseguin/websocket.zig](https://github.com/karlseguin/websocket.zig) | Zig | MIT | 522 | no release (push 2026-08-23) | Zig client **and** server with its own listener and per-connection handler; optional compression (its README option `compression`, disabled by default); README says it does **not** validate UTF-8 text ("expensive and most apps don't care"). Autobahn status not stated *(inferred)*. |
 | Zig `std.http.Server.WebSocket` | Zig | MIT | — | Zig 0.16.0 | Handshake detection (`upgradeRequested`, `respondWebSocket`) plus `readSmallMessage` / `writeMessage`; no fragmentation reassembly beyond small messages, no client, no extensions (checked in 0.16.0's `lib/std/http/Server.zig`). |
 | [denoland/fastwebsockets](https://github.com/denoland/fastwebsockets) — **fastest** | Rust | Apache-2.0 | 1.1k | v0.10.0 (crates.io; push 2026-07-31) | Deno's frame layer, async, SIMD UTF-8 (`simdutf8`). No permessage-deflate ("not supported yet"). Its reader does not check the masking direction or the minimal length encoding (read in `lib.rs` 2026-10-26). Measured here 2026-10-26 (`tools/rust_fast_bench`): the fastest reader of 64 KiB binary messages, 1.12× faster than this module there (1.19× before `fastmem` exported `memcpy`); slower on small, fragmented and every write row. |
-| [crossbario/autobahn-testsuite](https://github.com/crossbario/autobahn-testsuite) | Python | Apache-2.0 | 1.7k | push 2026-09-29 | Not a competitor: the conformance oracle. This module's SPEC records that qap's Autobahn lane found the two UTF-8 timing defects fixed 2026-09-28. Source not read. |
+| [crossbario/autobahn-testsuite](https://github.com/crossbario/autobahn-testsuite) | Python | Apache-2.0 | 1.7k | push 2026-09-29 | Not a competitor: the conformance oracle. This module's SPEC records that the web-server consumer's Autobahn lane found the two UTF-8 timing defects fixed 2026-09-28. Source not read. |
 
 **Where we are ahead:** strictness the Zig alternatives skip: incremental UTF-8 validation that fails at the fragment (and inside one frame across TCP chops) as gorilla and autobahn-python do, close-code validation per §7.4.1, duplicate-handshake-header refusal, an `Origin` allow-list with same-host default, a bound on fragment count, request-field injection checks on the client, every error mapped to a close code; RFC 6455 §1.3/§5.7 byte-exact vectors plus Go and Python oracles under `tools/`; allocation-free, transport-agnostic. **Where we are behind:** permessage-deflate only without context takeover (coder also offers the context-takeover mode, which compresses repetitive small messages better at 32 KiB of window per connection and direction); no keepalive scheduling (`Conn` gives `ping`, the timer is the caller's); no Wasm/browser target. **Closed 2026-10-11:** permessage-deflate (RFC 7692) and a ready read/write loop (`conn.Conn`) — the two gaps a coder/gorilla user noticed.
 
@@ -64,7 +64,7 @@ convention), and `verifyResponse` recomputes the expected accept value and rejec
 cache, proxy, or non-WebSocket-aware server that answered `101` without actually understanding the
 protocol.
 
-**`Origin` allow-list** (requested by qap security review M6.2, 2026-09-28). RFC 6455 requires
+**`Origin` allow-list** (requested by the web-server consumer security review M6.2, 2026-09-28). RFC 6455 requires
 every browser to send `Origin` on a WebSocket handshake (§1.3) but the base protocol enforces
 nothing about its value: unlike an ordinary cross-origin HTTP request, CORS never applies to a
 WebSocket upgrade, so a server that leans on ambient browser credentials (a session cookie, a TLS
@@ -113,7 +113,7 @@ one-frame message could walk past would not be a budget at all. Control frames (
 close) are dispatched before fragmentation state is even consulted, which is what makes
 interleaving them mid-fragmentation "just work" — no special-casing needed. UTF-8 validation
 (§5.6, required for `text`/`.continuation`-reassembled-as-text) is **incremental, checked per
-fragment as it arrives** (`IncrementalUtf8`, 2026-09-28 — found by qap's Autobahn lane, 2026-09-26;
+fragment as it arrives** (`IncrementalUtf8`, 2026-09-28 — found by the web-server consumer's Autobahn lane, 2026-09-26;
 before this date it ran once, against the reassembled whole, only once `FIN` arrived, which
 Autobahn|Testsuite scores §6.4.1-4 NON-STRICT: RFC 6455 §8.1 requires the failure, not its timing,
 but every other library checked — autobahn-python, gorilla, tungstenite — fails at the fragment
@@ -134,7 +134,7 @@ point of each, rather than only the one hand-picked split ("A€B" cut mid-codep
 used to rely on as its sole proof that deferred validation doesn't false-positive on legitimate
 fragmentation — an attacker choosing where to split a message is not obliged to pick that split.
 
-**Within one frame, too** (2026-09-28, from qap's Autobahn lane: §6.4.3-4 — one text frame
+**Within one frame, too** (2026-09-28, from the web-server consumer's Autobahn lane: §6.4.3-4 — one text frame
 delivered in TCP chops, invalid from an early chop — were still NON-STRICT after the per-fragment
 fix, because `receive` consumes whole frames only; autobahn-python and gorilla fail at the chop).
 When `parseFrame` says `.need_more` with the header complete and the frame is text (a new text
@@ -187,7 +187,7 @@ seeds; the 500-seed reach test is the regression (it crashed before the reader e
 **Speed (2026-10-11, `zig build bench-websocket`).** 0.04–0.88× coder/websocket on seven
 workloads (reads of small/fragmented/64 KiB/compressed messages, writes of small/64 KiB/compressed
 ones), ours validating UTF-8 where coder does not. ⚠ The bench binary installs `fastmem`'s memset,
-as this collection's libc-free executables do (qap's): std 0.16's `flate.Compress.writeBlock`
+as this collection's libc-free executables do (the web-server consumer's): std 0.16's `flate.Compress.writeBlock`
 resets its 96 KiB token list once per compressed message, and with Zig 0.16's byte-wise
 compiler_rt memset `write_deflate` measured 2.0× coder (0.93× with a vectorized memset). A
 libc-free binary that sends compressed messages without `fastmem` pays ~30 µs per message for it.
@@ -538,7 +538,7 @@ The RED comes from the foreign corpus and from nothing else.
 
 ## Performance
 
-**Fastest in the field, measured 2026-10-26** (`zig build bench-websocket`, `BENCH_ROUNDS=5`, ReleaseFast, load average ~2–3 from other sessions, largest spread 12.5 %): every serious candidate on the same wire bytes — coder 1.26.8-built, gorilla v1.5.3 (`tools/go_bench/gorilla`), fastwebsockets 0.10.0 and tungstenite 0.30.0 (`tools/rust_fast_bench`; neither has permessage-deflate, so their deflate rows are n/a). Ours against the fastest per row: read_text_small 0.29× (fastwebsockets), read_text_fragmented 0.62× (gorilla), **read_binary_64k 1.19× (fastwebsockets)**, read_deflate 0.75× (gorilla), write_text_small 0.68×, write_binary_64k 0.94× (fastwebsockets), write_deflate 0.91× (gorilla). The one row over 1.0 is close to the P1 bound (1.25): a noisy 3-round run on 2026-10-26 gave 1.25. Its cost is the copy and the unmask of 256 KiB, nothing else (perf: `memcpy` 58 %, `applyMask` 40 %): compiler_rt's `memcpy` in a libc-free binary, and the harness copying the whole wire before parsing (as qap's accumulator does) where fastwebsockets reserves `payload + 14` bytes and reads one frame at a time, unmasking it while it is in cache. `conn.Conn` over a `std.Io.Reader` is slower there (1.44×): the reader fills greedily, so every other 64 KiB frame is half in the buffer and copied twice — reading exactly a frame needs a buffer the reader does not offer (Backlog). fastwebsockets also skips two checks this module makes (masking direction, minimal length).
+**Fastest in the field, measured 2026-10-26** (`zig build bench-websocket`, `BENCH_ROUNDS=5`, ReleaseFast, load average ~2–3 from other sessions, largest spread 12.5 %): every serious candidate on the same wire bytes — coder 1.26.8-built, gorilla v1.5.3 (`tools/go_bench/gorilla`), fastwebsockets 0.10.0 and tungstenite 0.30.0 (`tools/rust_fast_bench`; neither has permessage-deflate, so their deflate rows are n/a). Ours against the fastest per row: read_text_small 0.29× (fastwebsockets), read_text_fragmented 0.62× (gorilla), **read_binary_64k 1.19× (fastwebsockets)**, read_deflate 0.75× (gorilla), write_text_small 0.68×, write_binary_64k 0.94× (fastwebsockets), write_deflate 0.91× (gorilla). The one row over 1.0 is close to the P1 bound (1.25): a noisy 3-round run on 2026-10-26 gave 1.25. Its cost is the copy and the unmask of 256 KiB, nothing else (perf: `memcpy` 58 %, `applyMask` 40 %): compiler_rt's `memcpy` in a libc-free binary, and the harness copying the whole wire before parsing (as the web-server consumer's accumulator does) where fastwebsockets reserves `payload + 14` bytes and reads one frame at a time, unmasking it while it is in cache. `conn.Conn` over a `std.Io.Reader` is slower there (1.44×): the reader fills greedily, so every other 64 KiB frame is half in the buffer and copied twice — reading exactly a frame needs a buffer the reader does not offer (Backlog). fastwebsockets also skips two checks this module makes (masking direction, minimal length).
 
 **Re-measured 2026-10-26 after `fastmem` began exporting `memcpy`** (same command, load average ~2.5, largest spread 27 % on a 69 ns row); the card carries this run: read_text_small 0.31×, read_text_fragmented 0.59×, **read_binary_64k 1.12×** (fastwebsockets; was 1.19×), read_deflate 0.75×, write_text_small 0.60×, write_binary_64k 0.89×, write_deflate 0.88×; ours/coder 0.03–0.86×. What is left in that row is `applyMask` and the whole-wire copy of the harness.
 

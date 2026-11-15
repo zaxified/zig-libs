@@ -23,7 +23,7 @@
 //!   so must what the server recorded about each connection (close code it
 //!   saw, messages echoed, subprotocol, permessage-deflate).
 //! - `server`: the coder and gorilla clients against this module's server
-//!   (`http.Server` + `handshake.respondUpgraded` + `conn.Conn`, the way qap
+//!   (`http.Server` + `handshake.respondUpgraded` + `conn.Conn`, the way the web-server consumer
 //!   serves it). The judge is the same Go client against its own library's
 //!   server: same client line, same server record.
 //! - `raw`: fixed handshake and frame bytes (valid traffic, every class of
