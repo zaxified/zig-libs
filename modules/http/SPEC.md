@@ -783,6 +783,7 @@ pending a native std TLS server.
   anyway (e.g. bump-allocating from a buffer the request already dirtied); none is obvious.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 5 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **Connection summary on `.closed` (consumer request 2026-11-15; effort S-M).** `ConnState` (`src/Server.zig`) is a bare enum and `on_conn_state` gets `(ctx, peer, state)` only, so an observer that logs "connection closed: N requests, M ms, reason" keeps its own per-connection map plus a thread-local to join `.closed` with a later `ErrorKind.timed_out` (which fires after `.closed`). Expected: Go `http.Server.ConnState` + `ConnContext`, nginx `$connection_requests` / `$request_time`, envoy connection access logs. Proposed: either a second callback `on_conn_closed(ctx, ConnSummary{ requests, duration_ns, end: enum{ normal, timed_out, errored } })` (keeps `ConnStateFn` source-compatible) or deliver `timed_out` before `.closed`. Prefer the second callback; changing `ConnStateFn` breaks every user.
 
 ## Status
 `extract+gap · any · both · single_owner` · deps: `netaddr`, `datefmt`, `tlsclient`, `crc32` (+ `std.Io.net`,
