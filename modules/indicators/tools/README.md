@@ -4,6 +4,9 @@
   `zig build interop-indicators` (compiled by `check-interop`); header comment says what it needs.
   `-- --emit-vectors modules/indicators/src/testdata/talib_vectors.zig` regenerates the frozen
   vectors `src/oracle_test.zig` replays.
+- `bench.zig` + `bench_talib.c` + `bench_rows.h`: the comparative benchmark against the same TA-Lib archive (`zig build bench-indicators`; 88 batch rows plus 3 streams,
+  ratios by user-mode cycles, a pre-check that both sides agree; table and method in SPEC § Benchmark). The C driver is linked by the system `cc`, never `zig cc` (compiler-rt's
+  software `fma` would make TA-Lib 5-20x slower). Env `CC`, `TALIB_A`, `TALIB_INC`, `BENCH_ROUNDS`, `BENCH_CHECK_ONLY`; arguments filter rows.
 - Oracle archive: `TALIB_A` (default `~/.local/share/zig-libs/oracle-bin/ta-lib-0.8.3/libta-lib.a`) and
   headers `TALIB_INC`. Recipe, kept out of the repo build: unpack the audited `ta-lib-0.8.3` tarball
   (sha256 `28b1179b178a0db15f3dad0d846ef77f18eb06db5dfc5b5a8ca153a9ea5d84e6`), compile every
