@@ -705,7 +705,7 @@ never sees. Caller buffers, no allocation. `router` still matches raw bytes by d
 SPEC); if it ever decodes, `decodePath` is the rule to use. `validate.parseQueryLeaky` keeps its
 own lenient decoder for now.
 
-**PROXY protocol v1/v2 (server side)** — BACKLOG (2026-09-24, found by qap plan M5.1). A server
+**PROXY protocol v1/v2 (server side)** — MOVED 2026-11-15 to the planned module `proxyproto` (root `NEW-MODULES.md`; decided: own module, `http` takes it as an optional dependency of its accept path). Original item (2026-09-24, found by qap plan M5.1): A server
 behind a load balancer learns the real client only from the haproxy PROXY header the balancer
 prepends to the connection; nginx (`proxy_protocol`), Go (`pires/go-proxyproto`) and HAProxy itself
 parse it on accept, and nothing in zig-libs does. qap wrote its own (`src/proxy_protocol.zig`: v2

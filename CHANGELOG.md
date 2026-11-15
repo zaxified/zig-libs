@@ -26,6 +26,7 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
+- **`NEW-MODULES.md` (2026-11-15):** accepted ideas for modules that do not exist yet (`arrow`, `parquet`, `proxyproto`) have a file of their own instead of being parked in an unrelated module's Backlog.
 - **Zig 0.17.1 or newer is required (2026-11-10) — BREAKING for consumers still on 0.17.0.** Zig 0.17.0
   lowers a signed → narrower-unsigned `@intCast`/`std.math.cast` as LLVM `trunc nsw`
   (ziglang/zig#37131), which lets ReleaseSafe/ReleaseFast delete range checks on the upper half of
