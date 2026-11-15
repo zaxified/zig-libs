@@ -1948,7 +1948,11 @@ const Session = struct {
         // `std.crypto.secureZero` -- this runs on every h2 stream, GET
         // included, and secureZero's byte-at-a-time store showed up as a
         // measured regression on the no-body path (see `zeroize.zig`).
-        defer zeroize.zeroize(body_scratch);
+        // Only when a body exists: without one the request body is `.none`
+        // below and nothing ever writes `body_scratch`, so a GET pays no
+        // 4 KiB wipe of bytes it never touched.
+        const body_present = streaming or buffered_body.len != 0;
+        defer if (body_present) zeroize.zeroize(body_scratch);
         defer zeroize.zeroize(stream_scratch);
         const body_buf = slab[cut..][0..s.opts.response_buffer_size];
         cut += s.opts.response_buffer_size;
