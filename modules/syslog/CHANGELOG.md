@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation audit of `journal.stderrIsJournal` and helpers (19 schemata mutants: 16 killed, 1 equivalent, 2 unobservable; new tests for the `makedev` encoding against known values, `parseDecimal` edges and fd 2 vs fd 1).
 - **2026-11-15** — **NEW:** `journal.stderrIsJournal(env)` and `journal.fdIsJournalStream(fd, env)`: systemd's `JOURNAL_STREAM=<dev>:<ino>` check against `statx` of the descriptor (consumer request 2026-11-15). The caller passes the env value; false on any parse error or syscall failure.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: journald stderr detection (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `nowTimestamp` and the `Logger` default clock (duplicate-code pass) read `clock.realtimeMs()`; 0 on a failed read as before. The two monotonic reads that return null on failure (`unix.zig`, `transport.zig`) stay, because `clock` cannot signal failure. New dependency: `clock`.

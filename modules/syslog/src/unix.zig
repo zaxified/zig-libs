@@ -1067,3 +1067,58 @@ test "journal.stderrIsJournal: malformed or absent env is false" {
     try t.expect(!journal.fdIsJournalStream(-1, "1:1"));
     try t.expect(!journal.fdIsJournalStream(1 << 20, "1:1"));
 }
+
+test "journal.stderrIsJournal: reads descriptor 2, not 1 (mutation 2026-11-15)" {
+    // Point fd 2 at a fresh pipe for the duration (the harness may have stdout
+    // and stderr on the same file, which would hide an fd mix-up), then restore.
+    var fds: [2]i32 = undefined;
+    try t.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+    const saved: i32 = @intCast(linux.dup(2));
+    if (saved < 0) return error.SkipZigTest;
+    defer {
+        _ = linux.dup2(saved, 2);
+        closeFd(saved);
+    }
+    try t.expectEqual(linux.E.SUCCESS, linux.errno(linux.dup2(fds[1], 2)));
+    var sx: linux.Statx = undefined;
+    try t.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(fds[1], "", 0x1000, .{ .INO = true }, &sx)));
+    var buf: [64]u8 = undefined;
+    const good = try std.fmt.bufPrint(&buf, "{d}:{d}", .{ journal.makedev(sx.dev_major, sx.dev_minor), sx.ino });
+    try t.expect(journal.stderrIsJournal(good));
+    try t.expect(!journal.fdIsJournalStream(1, good));
+    var buf2: [64]u8 = undefined;
+    const bad = try std.fmt.bufPrint(&buf2, "{d}:{d}", .{ journal.makedev(sx.dev_major, sx.dev_minor), sx.ino + 1 });
+    try t.expect(!journal.stderrIsJournal(bad));
+    // a sign in front of a matching pair is refused (std parseInt would take it)
+    const signed = try std.fmt.bufPrint(&buf2, "+{s}", .{good});
+    try t.expect(!journal.stderrIsJournal(signed));
+}
+
+test "journal.parseDecimal: digits only, at least one, fits u64 (mutation 2026-11-15)" {
+    try t.expectEqual(@as(?u64, 0), journal.parseDecimal("0"));
+    try t.expectEqual(@as(?u64, 9), journal.parseDecimal("9"));
+    try t.expectEqual(@as(?u64, 7), journal.parseDecimal("007"));
+    try t.expectEqual(@as(?u64, 1234567890), journal.parseDecimal("1234567890"));
+    try t.expectEqual(@as(?u64, std.math.maxInt(u64)), journal.parseDecimal("18446744073709551615"));
+    try t.expectEqual(@as(?u64, null), journal.parseDecimal("18446744073709551616"));
+    for ([_][]const u8{ "", "+1", "-0", "-1", "1_0", "_1", " 1", "1 ", "0x10", "1e3", "/", ":" }) |s| {
+        try t.expectEqual(@as(?u64, null), journal.parseDecimal(s));
+    }
+}
+
+test "journal.makedev: glibc encoding against known values (mutation 2026-11-15)" {
+    const cases = [_]struct { u32, u32, u64 }{
+        .{ 0, 0, 0 },
+        .{ 8, 1, 2049 },
+        .{ 0x103, 0x41, 66369 },
+        .{ 0xfff, 0xff, 1048575 },
+        .{ 0x1, 0x100, 1048832 },
+        .{ 0x1000, 0, 17592186044416 },
+        .{ 0x12345678, 0x9abcdef0, 1311771985900370160 },
+        .{ 0xfffff000, 0xffffff00, 18446744073708503040 },
+        .{ 0xffffffff, 0xffffffff, 18446744073709551615 },
+    };
+    for (cases) |c| try t.expectEqual(c[2], journal.makedev(c[0], c[1]));
+}
