@@ -6,7 +6,7 @@
 
 **Scope:** core — pires/go-proxyproto v0.16.0 (surveyed 2026-11-15)
 
-**Audit:** review none · mutation 2026-11-15 (220/224, 4 eq) · src 4129a9688cf9bb78
+**Audit:** review none · mutation 2026-11-15 (232/236, 4 eq) · src 503922b31391b8d0
 
 **Hardening:** fuzz 2026-11-15 (40,000,000 runs, clean, PROXYPROTO_FUZZ, all 17 reach labels hit) · ct n/a — the header is public data, no secret · panic 2026-11-15 (no-panic sweep, `tests.zig`: 20,000 hostile inputs through every pub entry point, safety checks on; plus the fuzz harness)
 
@@ -85,6 +85,14 @@ over-long addresses) and the 65535 / 65536 payload edge. Rerun: 23 killed. 220/2
 `lf <= 7` against `lf < 7` (a line of `PROXY ` plus CRLF has an empty protocol and is Malformed
 either way); the first `split` element of the v1 line is never absent; the two arms after the
 re-parse in `read` (the same pure parse of the same bytes cannot change its answer).
+
+**Audit 2026-11-15 (review-fix delta).** 12 schemata mutants over the two review fixes in
+`src/root.zig`: the untrusted prefix handling in `read` (the buffer-size boundary `>` against `>=`, the
+trust test dropped, the `required` choice flipped, the error kind, the arm taken, and the `Truncated`
+rule's length and trust clauses and error kind) and the NUL check of `writeV2` for unix paths (the
+source and the destination clause each dropped, the error kind). ReleaseSafe, one build, the
+coverage-guided fuzz test skipped in the copy. All 12 killed by the tests the fix commit already
+carried; no new test, 0 equivalent.
 
 ## What is deliberately not done
 

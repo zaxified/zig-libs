@@ -6,7 +6,7 @@
 
 **Scope:** core — Go net resolver (reference) / c-ares / hickory-resolver / libunbound / dnspython / systemd-resolved / Node `dns` (surveyed 2026-11-15; parity -> core 2026-11-15: the answer cache is now `CachingResolver` (2026-11-15), but the API is blocking-only where every library but Go's is asynchronous — see "Where we are behind")
 
-**Audit:** review 2026-09-12 · mutation 2026-11-15 (240/257, 17 eq) · src 1887aff263fb9695
+**Audit:** review 2026-09-12 · mutation 2026-11-15 (276/295, 19 eq) · src 133fbfc916b68280
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DNS_FUZZ); 2026-11-02 `dns-query-roundtrip` (random QueryOptions incl. DO/AD/CD and EDNS options → encode → decode equal, or the documented refusal; 200,000 driver runs clean, ReleaseSafe) · ct n/a — public DNS codec (keyword review, 2026-10-07); TSIG (2026-10-16): std HMAC, MAC compared with `timing_safe.eql`, secret frames burned (stack probe) · panic 2026-10-31 (sweep + blind review: `RequestTooLarge` for > 65535 B, TSIG length guards, spoofed/QR-clear/undecodable UDP replies dropped to the same deadline, DoH body ≤ 65535, owner-name sharing 17.8 → 0.85 MB on a pointer flood; delta audit 28/31 + 3 eq)
 
@@ -327,6 +327,27 @@ under `setsid -w timeout` and `ulimit -v`: 43 killed in the first run, 6 survive
 filter, the TTL and AD folds of two family replies, `reverse` reading SERVFAIL as empty, the conf
 stamp not stored, the size not compared) and got a test each; the rerun killed all six. 49/49,
 0 equivalent.
+
+**Audit 2026-11-15 (review-fix delta).** 38 schemata mutants over the non-test lines the review fixes
+added to `src/CachingResolver.zig`: the `local` flag of every lookup kind (the literal clause, each
+`isDnsAvoided` call, the reverse constant) and `run`'s `bypassLocal` branch, `bypassLocal` itself
+(the result source, the Resolver's `deinit`), `refundLocked` (the count, the bucket guard, the cap at
+`burst`, the amount), both refund call sites (a failed `acquire`, an /etc/hosts answer in `succeeded`),
+the `t_call` read and the times handed to `succeeded` and `failed`, the `bypass` counting (the
+`canonical != null` test, the increment and its amount), the fresh-payload guard in `failed` (each
+clause, the `touch`, both caps of the served TTL, the source) and `resetFailures` (the payload
+test, the removal, both counter resets, the step and the starting end of the walk). First run: 15
+killed, 23 survived. New tests: every lookup kind answering a literal or a DNS-avoided name with the
+budget empty and without a miss, a statistic or a table entry; the expiry measured from the send
+after the miss waited 40 s for a pool slot; `refundLocked` on a full, a half and an empty bucket and
+a zero count; the direct `bypass` counting a DNS answer and not a literal; a failure serving a fresh
+entry aged by 10 s, capped at its stored TTL when `t` is earlier, and moving it to the front of the
+LRU; `resetFailures` over two failure-only entries behind a kept stale answer with the most recently
+used entry carrying no failure. Rerun: 36 killed, 2 not. UNOBSERVABLE, with the injection each
+needs: the `r.deinit()` of `bypassLocal` (a local-only lookup never reads resolv.conf or opens a
+DoH client, so the Resolver holds nothing to free; needs a local lookup that allocates) and the
+`payload != null` clause of the fresh-payload guard in `failed` (a payload-less entry always has
+`expires_s <= t` on a monotonic clock; needs a clock stepping back after the payload was dropped).
 
 **Audit 2026-10-04 (mutation).** 54 schemata mutants over the wire codec (name length and
 label caps, pointer direction and jump budget, section-count pre-checks, RDLENGTH/RDATA
