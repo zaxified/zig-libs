@@ -31,6 +31,8 @@ pub const Mechanism = enum {
     xoauth2,
     /// RFC 7628 (`auth.oauthbearerResponse`).
     oauthbearer,
+    /// RFC 5802/7677, no channel binding (`auth.ScramClient`).
+    scram_sha_256,
 
     pub fn name(self: Mechanism) []const u8 {
         return switch (self) {
@@ -38,18 +40,20 @@ pub const Mechanism = enum {
             .login => "LOGIN",
             .xoauth2 => "XOAUTH2",
             .oauthbearer => "OAUTHBEARER",
+            .scram_sha_256 => "SCRAM-SHA-256",
         };
     }
 };
 
 /// Which mechanisms the server offered. `other` is true when it offered
-/// something we do not implement (CRAM-MD5, GSSAPI, SCRAM, …) — useful for a
+/// something we do not implement (CRAM-MD5, GSSAPI, SCRAM-SHA-1, SCRAM-SHA-256-PLUS, …) — useful for a
 /// caller's diagnostics, never for a decision.
 pub const AuthSet = struct {
     plain: bool = false,
     login: bool = false,
     xoauth2: bool = false,
     oauthbearer: bool = false,
+    scram_sha_256: bool = false,
     other: bool = false,
 
     pub fn supports(self: AuthSet, m: Mechanism) bool {
@@ -58,11 +62,12 @@ pub const AuthSet = struct {
             .login => self.login,
             .xoauth2 => self.xoauth2,
             .oauthbearer => self.oauthbearer,
+            .scram_sha_256 => self.scram_sha_256,
         };
     }
 
     pub fn any(self: AuthSet) bool {
-        return self.plain or self.login or self.xoauth2 or self.oauthbearer;
+        return self.plain or self.login or self.xoauth2 or self.oauthbearer or self.scram_sha_256;
     }
 };
 
@@ -242,6 +247,8 @@ fn parseAuthList(caps: *Capabilities, list: []const u8) void {
             caps.auth.xoauth2 = true;
         } else if (std.ascii.eqlIgnoreCase(m, "OAUTHBEARER")) {
             caps.auth.oauthbearer = true;
+        } else if (std.ascii.eqlIgnoreCase(m, "SCRAM-SHA-256")) {
+            caps.auth.scram_sha_256 = true;
         } else {
             caps.auth.other = true;
         }
@@ -334,10 +341,21 @@ test "the legacy AUTH= form is understood" {
 
 test "AUTH with only mechanisms we cannot perform" {
     const gpa = testing.allocator;
-    var caps = try parse(gpa, "srv\nAUTH GSSAPI CRAM-MD5 SCRAM-SHA-256", .{});
+    var caps = try parse(gpa, "srv\nAUTH GSSAPI CRAM-MD5 SCRAM-SHA-256-PLUS SCRAM-SHA-1", .{});
     defer caps.deinit();
     try testing.expect(!caps.auth.any());
     try testing.expect(caps.auth.other);
+}
+
+test "AUTH SCRAM-SHA-256 is recognised, -PLUS is not the same mechanism" {
+    const gpa = testing.allocator;
+    var caps = try parse(gpa, "srv\nAUTH scram-sha-256 SCRAM-SHA-256-PLUS", .{});
+    defer caps.deinit();
+    try testing.expect(caps.auth.scram_sha_256 and caps.auth.supports(.scram_sha_256));
+    try testing.expect(caps.auth.other and caps.auth.any());
+    var c2 = try parse(gpa, "srv\nAUTH SCRAM-SHA-256-PLUS", .{});
+    defer c2.deinit();
+    try testing.expect(!c2.auth.scram_sha_256 and !c2.auth.any());
 }
 
 test "AUTH XOAUTH2 and OAUTHBEARER are recognised, case-insensitively" {

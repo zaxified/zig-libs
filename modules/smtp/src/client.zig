@@ -303,6 +303,11 @@ const FakeServer = struct {
     tls_upgrades: usize = 0,
     /// `received.len` at the moment of the (simulated) TLS handshake.
     upgrade_at: ?usize = null,
+    /// BDAT: octets of the current chunk still owed, whether it is the last,
+    /// and the message assembled so far.
+    bdat_need: usize = 0,
+    bdat_last: bool = false,
+    bdat_msg: std.ArrayList(u8) = .empty,
 
     fn init(gpa: std.mem.Allocator, replies: []const []const u8) FakeServer {
         return .{ .gpa = gpa, .replies = replies };
@@ -314,6 +319,7 @@ const FakeServer = struct {
         if (self.unstuffer) |*u| u.deinit();
         for (self.messages.items) |m| self.gpa.free(m);
         self.messages.deinit(self.gpa);
+        self.bdat_msg.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -345,10 +351,25 @@ const FakeServer = struct {
         self.handle(bytes) catch return error.WriteFailed;
     }
 
+    fn bdatChunkDone(self: *FakeServer) !void {
+        if (self.bdat_last) {
+            try self.messages.append(self.gpa, try self.bdat_msg.toOwnedSlice(self.gpa));
+        }
+        try self.pushNextReply();
+    }
+
     fn handle(self: *FakeServer, bytes: []const u8) !void {
         try self.received.appendSlice(self.gpa, bytes);
         var rest = bytes;
         while (rest.len != 0) {
+            if (self.bdat_need != 0) {
+                const n = @min(rest.len, self.bdat_need);
+                try self.bdat_msg.appendSlice(self.gpa, rest[0..n]);
+                self.bdat_need -= n;
+                rest = rest[n..];
+                if (self.bdat_need == 0) try self.bdatChunkDone();
+                continue;
+            }
             if (self.in_data) {
                 const u = &self.unstuffer.?;
                 // Feed byte-wise so the terminator is found exactly.
@@ -369,6 +390,13 @@ const FakeServer = struct {
             const nl = std.mem.find(u8, rest, "\r\n") orelse return;
             const line = rest[0..nl];
             rest = rest[nl + 2 ..];
+            if (std.ascii.startsWithIgnoreCase(line, "BDAT ")) {
+                var it = std.mem.tokenizeScalar(u8, line[5..], ' ');
+                self.bdat_need = try std.fmt.parseInt(usize, it.next() orelse return error.BadBdat, 10);
+                self.bdat_last = it.next() != null;
+                if (self.bdat_need == 0) try self.bdatChunkDone();
+                continue;
+            }
             try self.pushNextReply();
             if (std.ascii.startsWithIgnoreCase(line, "DATA")) {
                 self.in_data = true;
@@ -382,6 +410,32 @@ fn upgradeStub(ctx: *anyopaque) TransportError!Transport {
     const self: *FakeServer = @ptrCast(@alignCast(ctx));
     self.tls_upgrades += 1;
     return self.transport();
+}
+
+test "BDAT through the Client: the server receives the message, the bytes are not dot-stuffed" {
+    const gpa = testing.allocator;
+    var srv = FakeServer.init(gpa, &.{
+        "250-mail.example.com Hello\r\n250-PIPELINING\r\n250 CHUNKING\r\n", // EHLO
+        "250 2.1.0 Ok\r\n", // MAIL
+        "250 2.1.5 Ok\r\n", // RCPT
+        "250 chunk 1\r\n",
+        "250 chunk 2\r\n",
+        "250 chunk 3\r\n",
+        "250 2.0.0 queued\r\n", // BDAT LAST
+        "221 2.0.0 Bye\r\n", // QUIT
+    });
+    defer srv.deinit();
+    try srv.outbox.appendSlice(gpa, "220 mail.example.com ESMTP\r\n");
+    var c = try Client.init(gpa, srv.transport(), .{ .session = .{ .tls = .disabled, .bdat = true, .bdat_chunk = 10 } });
+    defer c.deinit();
+    try c.connect();
+    const body = "Subject: bdat\r\n\r\n.leading dot\r\nend\r\n";
+    try c.sendEnvelope(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = body });
+    try c.quit();
+    try testing.expectEqual(@as(usize, 1), srv.messages.items.len);
+    try testing.expectEqualStrings(body, srv.messages.items[0]);
+    try testing.expect(std.mem.find(u8, srv.received.items, "DATA\r\n") == null);
+    try testing.expect(std.mem.find(u8, srv.received.items, " LAST\r\n") != null);
 }
 
 test "a whole conversation over the fake server, and the received message matches" {

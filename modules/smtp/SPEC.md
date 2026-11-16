@@ -389,8 +389,9 @@ Honest list of what this module does **not** do:
   `Envelope.dsn`, gated on the advertised capability); the null reverse-path `<>` that bounces
   require is supported. Not done: a `multipart/report` composer, and RFC 6533 `utf-8` ORCPT
   address types (refused, since their encoding is not xtext).
-* **BDAT / CHUNKING / BINARYMIME (RFC 3030).** Advertised capabilities are reported;
-  transmission is always `DATA`.
+* **BINARYMIME (RFC 3030).** Reported, never sent: `BODY=BINARYMIME` is not offered to
+  callers. BDAT itself is implemented (opt-in `Options.bdat`); the body is still normalised
+  to CRLF line endings and the 998-octet line limit still applies.
 * **A server side.** Client only. `data.Unstuffer` is the receive half of DATA and is fully
   tested (it is how the sender is verified), and `reply.zig` would serve a server's writer,
   but nothing here listens or answers.
@@ -398,8 +399,9 @@ Honest list of what this module does **not** do:
   caller's. Consequently the STARTTLS path has **no live verification** — see above.
   Implicit TLS on port 465 (RFC 8314) needs no code here at all: hand the client an
   already-encrypted `Transport` and set `tls = .disabled`.
-* **SASL beyond PLAIN, LOGIN, XOAUTH2 and OAUTHBEARER.** No CRAM-MD5 (obsolete and requires storing
-  password-equivalent material), no SCRAM, no GSSAPI. Token acquisition/refresh for the OAuth
+* **SASL beyond PLAIN, LOGIN, XOAUTH2, OAUTHBEARER and SCRAM-SHA-256.** SCRAM-SHA-256 is client side only, without channel binding (no `-PLUS`),
+  and with no SASLprep: a non-ASCII user name or password is refused. No CRAM-MD5 (obsolete and requires storing
+  password-equivalent material), no SCRAM-SHA-1, no GSSAPI. Token acquisition/refresh for the OAuth
   mechanisms is the caller's. `Capabilities.auth.other`
   reports that the server offered something else so a caller can say why it gave up.
 * **IMAP, POP3, message *parsing*.** This composes and sends. Reading mailboxes and parsing
@@ -433,9 +435,9 @@ Honest list of what this module does **not** do:
 Survey findings; `## Deferred` above remains the prose list of what is not done.
 
 - **SASL XOAUTH2 / OAUTHBEARER (RFC 7628)** ✅ DONE 2026-11-16 (`auth.xoauth2Response`/`oauthbearerResponse`, `Mechanism.xoauth2`/`.oauthbearer`, `Credentials.token`, 334 error challenge acknowledged and the JSON kept in `Session.authErrorJson`) *(survey 2026-09-30)*. Gmail and Microsoft 365 are retiring password auth, so a mail sender against them cannot log in without it; lettre and curl have it *(inferred)*. Effort: small (one-shot initial response, JSON error round trip); token acquisition stays the caller's. Fits CONVENTIONS §2. Currently `Capabilities.auth.other` only reports it (SPEC "Deferred" lists it as not done).
-- **SCRAM-SHA-256 (RFC 5802/7677)** *(survey 2026-09-30)*. The non-obsolete password-hash mechanism; curl has it *(inferred)*. Effort: small-medium (HMAC/PBKDF2 are in `std`). Fits §2.
+- **SCRAM-SHA-256 (RFC 5802/7677)** ✅ DONE 2026-11-16 (`auth.ScramClient`, `Mechanism.scram_sha_256`, `AuthSet.scram_sha_256`, `Options.scram_random`; client side, no channel binding, ASCII credentials only — no SASLprep, `error.NonAsciiCredential`; iteration count 4096..600000; server signature verified in constant time) *(survey 2026-09-30)*. The non-obsolete password-hash mechanism; curl has it *(inferred)*. Effort: small-medium (HMAC/PBKDF2 are in `std`). Fits §2.
 - **DSN parameters `RET`/`ENVID`/`NOTIFY`/`ORCPT` (RFC 3461)** ✅ DONE 2026-11-16 (`Envelope.dsn`, `command.MailParams.ret/envid`, `RcptParams.notify/orcpt`, `command.xtext`, capability-gated) *(survey 2026-09-30)*. Delivery receipts are a normal request from a mail-sending application. Effort: small (MAIL/RCPT parameters; capability already parsed). Fits §2.
-- **BDAT/CHUNKING (RFC 3030)** *(survey 2026-09-30)*. Removes dot-stuffing and enables BINARYMIME; rare on the public Internet. Effort: small-medium. Fits §2.
+- **BDAT/CHUNKING (RFC 3030)** ✅ DONE 2026-11-16 (`Options.bdat`/`bdat_chunk`, opt-in, used when CHUNKING is advertised; `command.bdat`, `data.Stuffer.initChunked`; each chunk acknowledged, a refused chunk ends the stream and is followed by RSET; BINARYMIME is still not sent) *(survey 2026-09-30)*. Removes dot-stuffing and enables BINARYMIME; rare on the public Internet. Effort: small-medium. Fits §2.
 - **DKIM signing (RFC 6376)** *(survey 2026-09-30)*. Bulk senders need it; mail-send bundles it *(inferred)*. Effort: medium, best as its own module (SPEC "Deferred" already says so). Fits §2 (RSA/Ed25519 exist in the repo).
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 6 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).

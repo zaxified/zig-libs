@@ -26,6 +26,9 @@
 //! base64 of "Username:" and "Password:"). It is implemented because a large
 //! minority of servers offer nothing else, and it is chosen only after PLAIN.
 //!
+//! SCRAM-SHA-256 (RFC 5802, RFC 7677) is client side only, without channel
+//! binding (GS2 header `n,,`), see `ScramClient`.
+//!
 //! Credentials are validated before they are encoded: a NUL byte inside a
 //! PLAIN credential would forge the field separators of RFC 4616, and a CR or
 //! LF anywhere would forge a whole SMTP command line.
@@ -43,6 +46,16 @@ pub const AuthError = error{
     MalformedChallenge,
     /// The server sent a challenge we do not understand for this mechanism.
     UnexpectedChallenge,
+    /// SCRAM: a credential with an octet above 127. SASLprep (RFC 4013, the
+    /// RFC 5802 §2.2 normalisation) is NOT implemented; guessing at it would
+    /// derive a key the server does not, so the login is refused instead.
+    NonAsciiCredential,
+    /// SCRAM: the server's iteration count is outside
+    /// `scram_min_iterations..scram_max_iterations`.
+    ScramIterationsOutOfRange,
+    /// SCRAM: the server's `v=` signature is wrong or absent. The server does
+    /// not know the password's verifier; the login must fail.
+    ServerSignatureMismatch,
 };
 
 const b64 = std.base64.standard;
@@ -248,7 +261,317 @@ fn asciiContains(hay: []const u8, needle: []const u8) bool {
     return false;
 }
 
+// ── SCRAM-SHA-256 ──────────────────────────────────────────────────────────
+
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+/// RFC 7677 §4 / RFC 5802 §5.1 want a minimum of 4096; a server asking for less
+/// is weakening the verifier and is refused.
+pub const scram_min_iterations: u32 = 4096;
+/// Ceiling on the server's PBKDF2 iteration count. The server picks the work
+/// the client does; without a cap a hostile server is a CPU-exhaustion lever.
+/// 600 000 is the OWASP 2023 figure for PBKDF2-HMAC-SHA256, well above the
+/// 4096 that most SMTP servers use (Cyrus/Dovecot 4096..10000).
+pub const scram_max_iterations: u32 = 600_000;
+/// Longest decoded salt accepted.
+pub const scram_max_salt_len: usize = 256;
+
+/// Plain-ASCII check for a SCRAM credential, one verdict per call (no branch
+/// per byte: the password is secret). Non-ASCII octets are
+/// `error.NonAsciiCredential` (no SASLprep); ASCII controls are refused
+/// because SASLprep prohibits them (RFC 4013 §2.3) and they would otherwise be
+/// silently kept.
+fn checkScramCredential(s: []const u8) AuthError!void {
+    var non_ascii: u8 = 0;
+    var ctl: u8 = 0;
+    for (s) |c| {
+        non_ascii |= c >> 7;
+        // c < 0x20: 16-bit borrow of c - 0x20, bit 15; c == 0x7f via isZero.
+        const lt: u16 = (@as(u16, c) -% 0x20) >> 15;
+        ctl |= @as(u8, @intCast(lt)) | isZero(c ^ 0x7f);
+    }
+    if (non_ascii != 0) return error.NonAsciiCredential;
+    if (ctl != 0) return error.InvalidCredential;
+}
+
+fn validNonceByte(c: u8) bool {
+    return c >= 0x21 and c <= 0x7e and c != ',';
+}
+
+/// Client side of SCRAM-SHA-256 (RFC 5802, RFC 7677), no channel binding, no
+/// authorization identity (GS2 header `n,,`; base64 `biws`).
+///
+///     var sc = try ScramClient.init(gpa, user, nonce);
+///     defer sc.deinit();
+///     const first = try sc.clientFirst(&buf);                // raw; AUTH base64s it
+///     const final = try sc.clientFinal(&buf2, server_first, password);
+///     try sc.verifyServerFinal(server_final);                // MUST be checked
+///
+/// Not implemented, and refused with an error rather than guessed at: SASLprep
+/// of non-ASCII credentials (`error.NonAsciiCredential`), channel binding
+/// (SCRAM-SHA-256-PLUS), an authorization identity. The password is never
+/// copied; SaltedPassword, ClientKey, StoredKey, ClientSignature and the proof
+/// are wiped before `clientFinal` returns (std's PBKDF2 internals are not ours
+/// to wipe). The server signature is compared in constant time.
+pub const ScramClient = struct {
+    gpa: std.mem.Allocator,
+    /// `n=<escaped user>,r=<client nonce>` (client-first-message-bare), owned.
+    first_bare: []u8,
+    /// The client nonce is the last `nonce_len` octets of `first_bare`.
+    nonce_len: usize,
+    /// Expected `v=` value, set by `clientFinal`.
+    server_sig: [Sha256.digest_length]u8 = @splat(0),
+    have_sig: bool = false,
+
+    /// `nonce` must be non-empty printable ASCII without ',' (RFC 5802 §5.1);
+    /// the caller supplies the randomness (see `Options.scram_random`).
+    pub fn init(gpa: std.mem.Allocator, username: []const u8, nonce: []const u8) (AuthError || std.mem.Allocator.Error)!ScramClient {
+        try checkScramCredential(username);
+        if (nonce.len == 0) return error.InvalidCredential;
+        for (nonce) |c| if (!validNonceByte(c)) return error.InvalidCredential;
+        var n: usize = "n=".len + ",r=".len + nonce.len;
+        for (username) |c| n += if (c == ',' or c == '=') @as(usize, 3) else 1;
+        const fb = try gpa.alloc(u8, n);
+        var w: RawWriter = .{ .out = fb };
+        w.put("n=");
+        for (username) |c| switch (c) {
+            ',' => w.put("=2C"),
+            '=' => w.put("=3D"),
+            else => w.put(&.{c}),
+        };
+        w.put(",r=");
+        w.put(nonce);
+        return .{ .gpa = gpa, .first_bare = fb, .nonce_len = nonce.len };
+    }
+
+    pub fn deinit(self: *ScramClient) void {
+        std.crypto.secureZero(u8, &self.server_sig);
+        self.gpa.free(self.first_bare);
+        self.* = undefined;
+    }
+
+    /// Raw length of `clientFirst`.
+    pub fn clientFirstLen(self: *const ScramClient) usize {
+        return "n,,".len + self.first_bare.len;
+    }
+
+    /// client-first-message: `n,,n=<user>,r=<nonce>` (raw, before base64).
+    pub fn clientFirst(self: *const ScramClient, out: []u8) AuthError![]const u8 {
+        const n = self.clientFirstLen();
+        if (n > out.len) return error.NoSpaceLeft;
+        @memcpy(out[0..3], "n,,");
+        @memcpy(out[3..n], self.first_bare);
+        return out[0..n];
+    }
+
+    /// Raw length of `clientFinal`'s output for a server-first with a combined
+    /// nonce of `combined_nonce_len` octets.
+    pub fn clientFinalLen(combined_nonce_len: usize) usize {
+        return "c=biws,r=".len + combined_nonce_len + ",p=".len + b64.Encoder.calcSize(Sha256.digest_length);
+    }
+
+    /// Parse the server-first-message, derive the keys and write the
+    /// client-final-message `c=biws,r=<nonce>,p=<proof>` (raw) to `out`. Refuses
+    /// a nonce that does not extend ours, a malformed message, a salt that is
+    /// not base64 or longer than `scram_max_salt_len`, and an iteration count
+    /// outside `scram_min_iterations..scram_max_iterations` — all before any
+    /// key derivation.
+    pub fn clientFinal(self: *ScramClient, out: []u8, server_first: []const u8, password: []const u8) AuthError![]const u8 {
+        try checkScramCredential(password);
+        var it = std.mem.splitScalar(u8, server_first, ',');
+        const r_attr = it.next() orelse return error.UnexpectedChallenge;
+        const s_attr = it.next() orelse return error.UnexpectedChallenge;
+        const i_attr = it.next() orelse return error.UnexpectedChallenge;
+        // A leading `m=` is a mandatory extension we do not know (RFC 5802 §5.1).
+        if (!std.mem.startsWith(u8, r_attr, "r=") or !std.mem.startsWith(u8, s_attr, "s=") or
+            !std.mem.startsWith(u8, i_attr, "i=")) return error.UnexpectedChallenge;
+        const nonce = r_attr[2..];
+        const my_nonce = self.first_bare[self.first_bare.len - self.nonce_len ..];
+        if (nonce.len <= self.nonce_len or !std.mem.startsWith(u8, nonce, my_nonce)) return error.UnexpectedChallenge;
+        for (nonce) |c| if (!validNonceByte(c)) return error.UnexpectedChallenge;
+
+        const iter_txt = i_attr[2..];
+        if (iter_txt.len == 0 or iter_txt.len > 10) return error.UnexpectedChallenge;
+        for (iter_txt) |c| if (c < '0' or c > '9') return error.UnexpectedChallenge;
+        const iters = std.fmt.parseInt(u32, iter_txt, 10) catch return error.ScramIterationsOutOfRange;
+        if (iters < scram_min_iterations or iters > scram_max_iterations) return error.ScramIterationsOutOfRange;
+
+        var salt_buf: [scram_max_salt_len]u8 = undefined;
+        const salt_txt = s_attr[2..];
+        const salt_n = b64.Decoder.calcSizeForSlice(salt_txt) catch return error.MalformedChallenge;
+        if (salt_n == 0 or salt_n > salt_buf.len) return error.MalformedChallenge;
+        b64.Decoder.decode(salt_buf[0..salt_n], salt_txt) catch return error.MalformedChallenge;
+        const salt = salt_buf[0..salt_n];
+
+        if (clientFinalLen(nonce.len) > out.len) return error.NoSpaceLeft;
+
+        var salted: [32]u8 = undefined;
+        var client_key: [32]u8 = undefined;
+        var stored_key: [32]u8 = undefined;
+        var client_sig: [32]u8 = undefined;
+        var proof: [32]u8 = undefined;
+        var server_key: [32]u8 = undefined;
+        defer {
+            std.crypto.secureZero(u8, &salted);
+            std.crypto.secureZero(u8, &client_key);
+            std.crypto.secureZero(u8, &stored_key);
+            std.crypto.secureZero(u8, &client_sig);
+            std.crypto.secureZero(u8, &proof);
+            std.crypto.secureZero(u8, &server_key);
+        }
+        // Only reachable errors: WeakParameters (iters >= 4096, no) and
+        // OutputTooLong (32 bytes, no).
+        std.crypto.pwhash.pbkdf2(&salted, password, salt, iters, HmacSha256) catch return error.UnexpectedChallenge;
+        HmacSha256.create(&client_key, "Client Key", &salted);
+        Sha256.hash(&client_key, &stored_key, .{});
+        HmacSha256.create(&server_key, "Server Key", &salted);
+
+        // AuthMessage = client-first-bare "," server-first "," client-final-without-proof
+        const without_proof_len = "c=biws,r=".len + nonce.len;
+        var w: RawWriter = .{ .out = out };
+        w.put("c=biws,r=");
+        w.put(nonce);
+        const cfwp = out[0..without_proof_len];
+
+        var mac = HmacSha256.init(&stored_key);
+        mac.update(self.first_bare);
+        mac.update(",");
+        mac.update(server_first);
+        mac.update(",");
+        mac.update(cfwp);
+        mac.final(&client_sig);
+        for (&proof, client_key, client_sig) |*p, a, b_| p.* = a ^ b_;
+
+        var smac = HmacSha256.init(&server_key);
+        smac.update(self.first_bare);
+        smac.update(",");
+        smac.update(server_first);
+        smac.update(",");
+        smac.update(cfwp);
+        smac.final(&self.server_sig);
+        self.have_sig = true;
+
+        w.put(",p=");
+        var enc: [44]u8 = undefined;
+        w.put(b64ct.encode(&enc, &proof));
+        return out[0..w.i];
+    }
+
+    /// Check the server-final-message. Anything but a correct `v=` is an error;
+    /// the comparison is constant time. `server_final` may carry trailing
+    /// `,extension` attributes (ignored).
+    pub fn verifyServerFinal(self: *const ScramClient, server_final: []const u8) AuthError!void {
+        if (!self.have_sig) return error.UnexpectedChallenge;
+        // `e=` is the server's error attribute (RFC 5802 §7): a failure.
+        if (!std.mem.startsWith(u8, server_final, "v=")) return error.ServerSignatureMismatch;
+        const rest = server_final[2..];
+        const end = std.mem.findScalar(u8, rest, ',') orelse rest.len;
+        const txt = rest[0..end];
+        const sig_n = b64.Decoder.calcSizeForSlice(txt) catch return error.MalformedChallenge;
+        if (sig_n != Sha256.digest_length) return error.ServerSignatureMismatch;
+        var got: [Sha256.digest_length]u8 = undefined;
+        b64.Decoder.decode(&got, txt) catch return error.MalformedChallenge;
+        if (!std.crypto.timing_safe.eql([Sha256.digest_length]u8, got, self.server_sig)) return error.ServerSignatureMismatch;
+    }
+};
+
 // ── tests ──────────────────────────────────────────────────────────────────
+
+const rfc7677_nonce = "rOprNGfwEbeRWgbNEkqO";
+const rfc7677_server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+const rfc7677_client_final = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=";
+const rfc7677_server_final = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=";
+
+test "SCRAM-SHA-256: RFC 7677 §3 exchange, byte for byte" {
+    var sc = try ScramClient.init(testing.allocator, "user", rfc7677_nonce);
+    defer sc.deinit();
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("n,,n=user,r=rOprNGfwEbeRWgbNEkqO", try sc.clientFirst(&buf));
+    const fin = try sc.clientFinal(&buf, rfc7677_server_first, "pencil");
+    try testing.expectEqualStrings(rfc7677_client_final, fin);
+    try sc.verifyServerFinal(rfc7677_server_final);
+    // trailing extension attributes are ignored
+    try sc.verifyServerFinal(rfc7677_server_final ++ ",x=1");
+}
+
+test "SCRAM-SHA-256: a wrong or missing server signature fails" {
+    var sc = try ScramClient.init(testing.allocator, "user", rfc7677_nonce);
+    defer sc.deinit();
+    var buf: [256]u8 = undefined;
+    // before clientFinal there is nothing to compare with
+    try testing.expectError(error.UnexpectedChallenge, sc.verifyServerFinal(rfc7677_server_final));
+    _ = try sc.clientFinal(&buf, rfc7677_server_first, "pencil");
+    // one flipped character, a short signature, an error attribute, garbage
+    try testing.expectError(error.ServerSignatureMismatch, sc.verifyServerFinal("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95H4="));
+    try testing.expectError(error.ServerSignatureMismatch, sc.verifyServerFinal("v=AAAA"));
+    try testing.expectError(error.ServerSignatureMismatch, sc.verifyServerFinal("e=invalid-proof"));
+    try testing.expectError(error.ServerSignatureMismatch, sc.verifyServerFinal(""));
+    try testing.expectError(error.MalformedChallenge, sc.verifyServerFinal("v=!!!"));
+    // the wrong password derives a different signature too
+    var sc2 = try ScramClient.init(testing.allocator, "user", rfc7677_nonce);
+    defer sc2.deinit();
+    _ = try sc2.clientFinal(&buf, rfc7677_server_first, "wrong");
+    try testing.expectError(error.ServerSignatureMismatch, sc2.verifyServerFinal(rfc7677_server_final));
+}
+
+test "SCRAM-SHA-256: server-first is validated before any key is derived" {
+    var buf: [256]u8 = undefined;
+    const cases = [_]struct { sf: []const u8, err: AuthError }{
+        // nonce that does not extend ours, and one that merely equals ours
+        .{ .sf = "r=XXXXXXXXXXXXXXXXXXXXserver,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", .err = error.UnexpectedChallenge },
+        .{ .sf = "r=rOprNGfwEbeRWgbNEkqO,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", .err = error.UnexpectedChallenge },
+        // missing / reordered attributes, a mandatory extension
+        .{ .sf = "r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==", .err = error.UnexpectedChallenge },
+        .{ .sf = "s=W22ZaJ0SNY7soEsUEjb6gQ==,r=rOprNGfwEbeRWgbNEkqOx,i=4096", .err = error.UnexpectedChallenge },
+        .{ .sf = "m=ext,r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", .err = error.UnexpectedChallenge },
+        .{ .sf = "", .err = error.UnexpectedChallenge },
+        // iteration count: both bounds, one past each, junk, overflow
+        .{ .sf = "r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4095", .err = error.ScramIterationsOutOfRange },
+        .{ .sf = "r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=0", .err = error.ScramIterationsOutOfRange },
+        .{ .sf = "r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=600001", .err = error.ScramIterationsOutOfRange },
+        .{ .sf = "r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=99999999999", .err = error.UnexpectedChallenge },
+        .{ .sf = "r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096x", .err = error.UnexpectedChallenge },
+        .{ .sf = "r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=-4096", .err = error.UnexpectedChallenge },
+        .{ .sf = "r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=", .err = error.UnexpectedChallenge },
+        // salt: not base64, empty
+        .{ .sf = "r=rOprNGfwEbeRWgbNEkqOx,s=!!!!,i=4096", .err = error.MalformedChallenge },
+        .{ .sf = "r=rOprNGfwEbeRWgbNEkqOx,s=,i=4096", .err = error.MalformedChallenge },
+    };
+    for (cases) |c| {
+        var sc = try ScramClient.init(testing.allocator, "user", rfc7677_nonce);
+        defer sc.deinit();
+        try testing.expectError(c.err, sc.clientFinal(&buf, c.sf, "pencil"));
+        try testing.expect(!sc.have_sig);
+    }
+    // the accepted edges: 4096 and 600000 pass the checks (600000 is not run
+    // here: PBKDF2 at that count would only slow the test down)
+    var sc = try ScramClient.init(testing.allocator, "user", rfc7677_nonce);
+    defer sc.deinit();
+    var tiny: [10]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, sc.clientFinal(&tiny, rfc7677_server_first, "pencil"));
+}
+
+test "SCRAM-SHA-256: no SASLprep, so non-ASCII and control octets are refused" {
+    var buf: [256]u8 = undefined;
+    try testing.expectError(error.NonAsciiCredential, ScramClient.init(testing.allocator, "us\xc3\xa9r", rfc7677_nonce));
+    var sc = try ScramClient.init(testing.allocator, "user", rfc7677_nonce);
+    defer sc.deinit();
+    try testing.expectError(error.NonAsciiCredential, sc.clientFinal(&buf, rfc7677_server_first, "p\xc3\xa9ncil"));
+    try testing.expectError(error.InvalidCredential, sc.clientFinal(&buf, rfc7677_server_first, "pen\x00cil"));
+    try testing.expectError(error.InvalidCredential, sc.clientFinal(&buf, rfc7677_server_first, "pen\ncil"));
+    try testing.expectError(error.InvalidCredential, sc.clientFinal(&buf, rfc7677_server_first, "pen\x7fcil"));
+    try testing.expect(!sc.have_sig);
+    // bad nonces and a name that needs RFC 5802 escaping
+    try testing.expectError(error.InvalidCredential, ScramClient.init(testing.allocator, "u", ""));
+    try testing.expectError(error.InvalidCredential, ScramClient.init(testing.allocator, "u", "a,b"));
+    try testing.expectError(error.InvalidCredential, ScramClient.init(testing.allocator, "u", "a b"));
+    var esc = try ScramClient.init(testing.allocator, "a,b=c", "nonce");
+    defer esc.deinit();
+    try testing.expectEqualStrings("n,,n=a=2Cb=3Dc,r=nonce", try esc.clientFirst(&buf));
+    var small: [4]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, esc.clientFirst(&small));
+}
 
 test "RFC 4616 §4 worked example" {
     // The RFC's own example: authzid empty, authcid "tim", passwd "tanstaaftanstaaf".

@@ -76,6 +76,9 @@ pub const Credentials = struct {
     authzid: []const u8 = "",
     /// Preference order. The first mechanism the server also offers wins.
     /// `.xoauth2` and `.oauthbearer` are opt-in: list them (and set `token`).
+    /// `.scram_sha_256` is opt-in too: list it and set `Options.scram_random`.
+    /// It needs a printable-ASCII `username` and `password` (no SASLprep:
+    /// anything else is `error.NonAsciiCredential`) and an empty `authzid`.
     mechanisms: []const Mechanism = &.{ .plain, .login },
 };
 
@@ -103,6 +106,24 @@ pub const Options = struct {
     /// them bare. `.newline = .strict` refuses such a body instead, for bytes
     /// that must reach the server unchanged (a message signed elsewhere).
     data: data_mod.Options = .{},
+    /// Randomness for the SCRAM client nonce (RFC 5802 §5.1: unpredictable).
+    /// Required when `Credentials.mechanisms` lists `.scram_sha_256` and the
+    /// server offers it: without it the AUTH fails with
+    /// `error.ScramNoRandomSource` before any byte is sent. Pass a CSPRNG
+    /// (`std.Random` over the OS entropy source), never a seeded PRNG.
+    scram_random: ?std.Random = null,
+    /// TEST SEAM: use exactly this client nonce instead of `scram_random`.
+    /// A fixed nonce voids SCRAM's replay protection; production leaves it
+    /// null. Printable ASCII, no ','.
+    scram_nonce: ?[]const u8 = null,
+    /// Send the message with BDAT (RFC 3030) instead of DATA when the server
+    /// advertises CHUNKING: no dot-stuffing, each chunk acknowledged. Off by
+    /// default (it changes the wire format of every message to such servers);
+    /// a server without CHUNKING still gets DATA.
+    bdat: bool = false,
+    /// Target BDAT chunk size in octets of the normalised message (a chunk may
+    /// run up to one CRLF over). The last chunk is `BDAT n LAST`. Minimum 1.
+    bdat_chunk: usize = 64 * 1024,
 };
 
 pub const Envelope = struct {
@@ -178,6 +199,8 @@ pub const SessionError = error{
     SmtpUtf8NotSupported,
     /// DSN parameters requested but the server did not advertise DSN.
     DsnNotSupported,
+    /// SCRAM chosen but neither `Options.scram_random` nor `scram_nonce` set.
+    ScramNoRandomSource,
     /// More recipients than `Options.max_recipients`.
     TooManyRecipients,
     /// A call used out of order (`beginTransaction` before the handshake, a
@@ -218,12 +241,23 @@ pub const State = enum {
     /// XOAUTH2/OAUTHBEARER: the server answered with a 334 error challenge;
     /// the empty acknowledgement goes out next, then the failure reply.
     auth_oauth_error,
+    /// SCRAM: client-first sent, the server-first (334) arrived; the
+    /// client-final goes out next.
+    auth_scram_final,
+    /// SCRAM: the server signature verified; the empty response that
+    /// completes the exchange goes out next, then the 235.
+    auth_scram_ack,
     /// Handshake complete; idle, waiting for a transaction or QUIT.
     ready,
     /// MAIL/RCPT/DATA in flight.
     transaction,
     /// 354 received; the body goes out next.
     body,
+    /// RFC 3030: the next BDAT command line and its chunk go out.
+    bdat,
+    /// A BDAT chunk failed: RSET goes out, its reply is consumed, then the
+    /// recorded error is returned.
+    bdat_rset,
     quit,
     /// QUIT acknowledged, or the session was abandoned.
     closed,
@@ -268,6 +302,21 @@ pub const Session = struct {
     /// The JSON error document of a failed XOAUTH2/OAUTHBEARER exchange
     /// (decoded from the server's 334 challenge), owned.
     auth_error: ?[]u8 = null,
+    /// SCRAM exchange state, alive from client-first to the final reply.
+    scram: ?auth_mod.ScramClient = null,
+
+    // BDAT state (valid while `tx_bdat`)
+    /// This transaction uses BDAT (CHUNKING advertised and `Options.bdat`).
+    tx_bdat: bool = false,
+    bdat_stuffer: data_mod.Stuffer = .init(.{}),
+    /// Offset into `env.body` already consumed by the stuffer.
+    bdat_off: usize = 0,
+    /// The chunk in flight, owned.
+    bdat_chunk_buf: []u8 = &.{},
+    bdat_last: bool = false,
+    /// The BDAT line of the current chunk has been handed out; its octets follow.
+    bdat_line_sent: bool = false,
+    bdat_error: ?SessionError = null,
 
     pub fn init(gpa: std.mem.Allocator, opts: Options) Session {
         return .{ .gpa = gpa, .opts = opts, .caps = .empty(gpa) };
@@ -279,6 +328,8 @@ pub const Session = struct {
         self.out.deinit(self.gpa);
         self.rcpts.deinit(self.gpa);
         if (self.auth_error) |e| self.gpa.free(e);
+        self.scramDone();
+        self.gpa.free(self.bdat_chunk_buf);
         if (self.last) |*l| l.deinit(self.gpa);
         self.* = undefined;
     }
@@ -380,6 +431,19 @@ pub const Session = struct {
                 // error challenge so the server can send its final failure.
                 const ack: []const u8 = if (self.mechanism == .oauthbearer) auth_mod.oauthbearer_error_ack else "";
                 try self.emit(command.authContinue(try self.buf(), ack, self.opts.cmd_limits));
+                return self.sent();
+            },
+            .auth_scram_final => return self.emitScramFinal() catch |e| {
+                self.scramAbort();
+                return e;
+            },
+            .auth_scram_ack => {
+                try self.emit(command.authContinue(try self.buf(), "", self.opts.cmd_limits));
+                return self.sent();
+            },
+            .bdat => return self.emitBdat(),
+            .bdat_rset => {
+                try self.emit(command.rset(try self.buf(), self.opts.cmd_limits));
                 return self.sent();
             },
             .ready => {
@@ -501,6 +565,21 @@ pub const Session = struct {
             // Whatever follows our acknowledgement is the end: even a 235
             // here is not a login we asked for.
             .auth_oauth_error => return self.authFailed(r),
+            .auth_scram_final => try self.onScramFinal(r),
+            .auth_scram_ack => {
+                if (r.code != 235) return self.authFailed(r);
+                self.authOk();
+            },
+            .bdat => try self.onBdatReply(r),
+            .bdat_rset => {
+                // Whatever RSET answers, the chunk's failure is what we report.
+                self.state = .ready;
+                self.phase = .emit;
+                self.env = null;
+                const e = self.bdat_error orelse error.UnexpectedReply;
+                self.bdat_error = null;
+                return e;
+            },
             .ready => return error.InvalidState,
             .transaction => try self.onTransactionReply(r),
             .body => {
@@ -604,8 +683,85 @@ pub const Session = struct {
             },
             .login => try self.emit(command.auth(try self.buf(), "LOGIN", null, self.opts.cmd_limits)),
             .xoauth2, .oauthbearer => try self.emitOauthInitial(c),
+            .scram_sha_256 => self.emitScramInitial(c) catch |e| {
+                self.scramAbort();
+                return e;
+            },
         }
         return self.sent();
+    }
+
+    /// SCRAM client-first as the AUTH initial response (RFC 4954 §4).
+    fn emitScramInitial(self: *Session, c: Credentials) SessionError!void {
+        if (c.authzid.len != 0) return error.InvalidCredential; // GS2 header is `n,,`
+        var nonce_buf: [24]u8 = undefined;
+        const nonce: []const u8 = if (self.opts.scram_nonce) |n| n else blk: {
+            const rnd = self.opts.scram_random orelse return error.ScramNoRandomSource;
+            var raw: [18]u8 = undefined;
+            rnd.bytes(&raw);
+            break :blk std.base64.standard.Encoder.encode(&nonce_buf, &raw);
+        };
+        self.scramDone();
+        self.scram = try auth_mod.ScramClient.init(self.gpa, c.username, nonce);
+        var raw: [1024]u8 = undefined;
+        const first = try self.scram.?.clientFirst(&raw);
+        var enc: [1400]u8 = undefined;
+        const ir = try auth_mod.loginResponse(&enc, first);
+        try self.emit(command.auth(try self.buf(), "SCRAM-SHA-256", ir, self.opts.cmd_limits));
+    }
+
+    /// client-final from the server-first the last 334 carried.
+    fn emitScramFinal(self: *Session) SessionError!Step {
+        const c = self.opts.credentials.?;
+        const sc = &self.scram.?;
+        const text = (self.last orelse return error.InvalidState).reply.text;
+        var sf_buf: [4096]u8 = undefined;
+        const sf = try auth_mod.decodeChallenge(&sf_buf, text);
+        var raw: [4608]u8 = undefined;
+        defer std.crypto.secureZero(u8, &raw);
+        const fin = try sc.clientFinal(&raw, sf, c.password);
+        var enc: [6200]u8 = undefined;
+        defer std.crypto.secureZero(u8, &enc);
+        const ir = try auth_mod.loginResponse(&enc, fin);
+        var lim = self.opts.cmd_limits;
+        lim.max_command_line = @max(lim.max_command_line, 12288);
+        self.wipeOut();
+        try self.out.resize(self.gpa, ir.len + 64);
+        try self.emit(command.authContinue(self.out.items, ir, lim));
+        return self.sent();
+    }
+
+    /// The server's final message, in the 334 (normal) or in the 235 (RFC 4954
+    /// §4 additional data). A signature that does not verify fails the AUTH.
+    fn onScramFinal(self: *Session, r: reply_mod.Reply) SessionError!void {
+        if (r.code != 334 and r.code != 235) return self.authFailed(r);
+        self.verifyScramFinal(r.text) catch |e| {
+            self.scramAbort();
+            // A 235 whose text is not a signature (the usual "2.7.0 ok") is a
+            // server that never proved itself, not a malformed challenge.
+            return if (r.code == 235) error.ServerSignatureMismatch else e;
+        };
+        if (r.code == 235) return self.authOk();
+        self.state = .auth_scram_ack;
+        self.phase = .emit;
+    }
+
+    fn verifyScramFinal(self: *Session, text: []const u8) SessionError!void {
+        var buf_: [512]u8 = undefined;
+        const dec = try auth_mod.decodeChallenge(&buf_, text);
+        try self.scram.?.verifyServerFinal(dec);
+    }
+
+    fn scramDone(self: *Session) void {
+        if (self.scram) |*sc| sc.deinit();
+        self.scram = null;
+    }
+
+    /// A SCRAM exchange that cannot continue: the session is over.
+    fn scramAbort(self: *Session) void {
+        self.scramDone();
+        self.wipeOut();
+        self.state = .closed;
     }
 
     /// The OAuth initial response. Bearer tokens routinely exceed the 512-octet
@@ -658,6 +814,15 @@ pub const Session = struct {
                 },
                 else => return self.authFailed(r),
             },
+            .scram_sha_256 => switch (r.code) {
+                334 => {
+                    self.state = .auth_scram_final;
+                    self.phase = .emit;
+                },
+                // Success before any proof was exchanged: nothing verified the
+                // server, so it is not a login we asked for.
+                else => return self.authFailed(r),
+            },
             .login => switch (r.code) {
                 334 => {
                     // Trust the ORDER, not the challenge text: servers vary.
@@ -676,6 +841,7 @@ pub const Session = struct {
     }
 
     fn authOk(self: *Session) void {
+        self.scramDone();
         self.authenticated = true;
         self.wipeOut();
         self.state = .ready;
@@ -683,6 +849,7 @@ pub const Session = struct {
     }
 
     fn authFailed(self: *Session, r: reply_mod.Reply) SessionError {
+        self.scramDone();
         self.wipeOut();
         self.state = .closed;
         // 454 is "temporary authentication failure" — a caller may retry, so
@@ -713,6 +880,23 @@ pub const Session = struct {
         // point where `.strict` refuses a bare LF/CR, before MAIL FROM.
         const size = try data_mod.messageSize(env.body, self.opts.data);
         if (self.caps.sizeExceeded(size)) return error.MessageTooLarge;
+        const use_bdat = self.opts.bdat and self.esmtp and self.caps.chunking;
+        if (use_bdat) {
+            // BDAT cannot be abandoned half way the way a refused body can be
+            // replaced by an empty one, so everything the stuffer would refuse
+            // (an over-long line) is found now, before MAIL FROM.
+            var sink_buf: [64]u8 = undefined;
+            var sink: std.Io.Writer.Discarding = .init(&sink_buf);
+            var st: data_mod.Stuffer = .initChunked(self.opts.data);
+            st.write(&sink.writer, env.body) catch |e| switch (e) {
+                error.WriteFailed => unreachable, // Discarding never fails
+                else => |x| return x,
+            };
+            st.finishChunked(&sink.writer) catch |e| switch (e) {
+                error.WriteFailed => unreachable,
+                else => |x| return x,
+            };
+        }
 
         // Validate every path BEFORE a single byte goes out: a rejected
         // recipient discovered halfway leaves the server holding a half-built
@@ -737,6 +921,7 @@ pub const Session = struct {
         self.tx_index = 0;
         self.tx_sent = 0;
         self.tx_error = null;
+        self.tx_bdat = use_bdat;
         self.state = .transaction;
         self.phase = .emit;
     }
@@ -751,7 +936,8 @@ pub const Session = struct {
     }
 
     fn txCount(self: *const Session) usize {
-        return 2 + self.rcpts.items.len; // MAIL + n×RCPT + DATA
+        // MAIL + n×RCPT + DATA (BDAT has no DATA command to wait on)
+        return (if (self.tx_bdat) @as(usize, 1) else 2) + self.rcpts.items.len;
     }
 
     fn emitTransaction(self: *Session) SessionError!Step {
@@ -771,7 +957,7 @@ pub const Session = struct {
             var line: [1024]u8 = undefined;
             const bytes = if (i == 0)
                 try command.mail(&line, env.from, self.mailParams(env), self.opts.cmd_limits)
-            else if (i < total - 1)
+            else if (i < self.rcptEnd())
                 try command.rcpt(&line, self.rcpts.items[i - 1].addr, self.rcptParams(env, i - 1), self.opts.cmd_limits, env.smtputf8 and self.caps.smtputf8)
             else
                 try command.data(&line, self.opts.cmd_limits);
@@ -780,6 +966,11 @@ pub const Session = struct {
         self.tx_sent = stop;
         self.phase = .wait;
         return .{ .send = self.out.items };
+    }
+
+    /// Index one past the last RCPT in the command sequence.
+    fn rcptEnd(self: *const Session) usize {
+        return if (self.tx_bdat) self.txCount() else self.txCount() - 1;
     }
 
     fn mailParams(self: *const Session, env: Envelope) command.MailParams {
@@ -816,7 +1007,7 @@ pub const Session = struct {
             // MAIL FROM
             r.check() catch |e| self.recordTxError(e);
             if (r.code != 250 and self.tx_error == null) self.recordTxError(error.UnexpectedReply);
-        } else if (i < total - 1) {
+        } else if (i < self.rcptEnd()) {
             var st = &self.rcpts.items[i - 1];
             st.code = r.code;
             st.accepted = r.code / 100 == 2;
@@ -863,6 +1054,22 @@ pub const Session = struct {
             self.phase = if (self.tx_sent > self.tx_index) .wait else .emit;
             return;
         }
+        if (self.tx_bdat) {
+            var any = false;
+            for (self.rcpts.items) |st| any = any or st.accepted;
+            if (!any) self.recordTxError(error.AllRecipientsRejected);
+            // As for DATA: a lone `require_all_recipients` complaint still
+            // delivers to the recipients that were accepted.
+            if (any and (self.tx_error == null or self.tx_error.? == error.RecipientRejected)) {
+                self.bdat_stuffer = .initChunked(self.opts.data);
+                self.bdat_off = 0;
+                self.bdat_last = false;
+                self.bdat_line_sent = false;
+                self.state = .bdat;
+                self.phase = .emit;
+                return;
+            }
+        }
         // Group finished without reaching data mode.
         self.env = null;
         self.state = .ready;
@@ -871,6 +1078,67 @@ pub const Session = struct {
             self.tx_error = null;
             return e;
         }
+    }
+
+    /// Cut the next chunk out of the body (normalised, not dot-stuffed).
+    fn nextChunk(self: *Session) SessionError!void {
+        const body = (self.env orelse return error.InvalidState).body;
+        const want = @max(self.opts.bdat_chunk, 1);
+        var aw: std.Io.Writer.Allocating = .init(self.gpa);
+        errdefer aw.deinit();
+        const st = &self.bdat_stuffer;
+        while (aw.written().len < want and self.bdat_off < body.len) {
+            st.write(&aw.writer, body[self.bdat_off..][0..1]) catch |e| switch (e) {
+                error.WriteFailed => return error.OutOfMemory,
+                else => |x| return x,
+            };
+            self.bdat_off += 1;
+        }
+        self.bdat_last = self.bdat_off >= body.len;
+        if (self.bdat_last) st.finishChunked(&aw.writer) catch |e| switch (e) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => |x| return x,
+        };
+        self.gpa.free(self.bdat_chunk_buf);
+        self.bdat_chunk_buf = &.{};
+        self.bdat_chunk_buf = try aw.toOwnedSlice();
+    }
+
+    /// `BDAT n [LAST]` first, then the chunk's octets as a second `send`.
+    fn emitBdat(self: *Session) SessionError!Step {
+        if (self.bdat_line_sent) {
+            self.bdat_line_sent = false;
+            self.phase = .wait;
+            return .{ .send = self.bdat_chunk_buf };
+        }
+        try self.nextChunk();
+        try self.emit(command.bdat(try self.buf(), self.bdat_chunk_buf.len, self.bdat_last, self.opts.cmd_limits));
+        self.bdat_line_sent = true;
+        return .{ .send = self.out.items }; // phase stays `.emit`: the chunk follows
+    }
+
+    /// The reply to one chunk (RFC 3030 §3, §4.3). Nothing is pipelined past a
+    /// chunk, so a failure here means no later chunk was sent; RSET then clears
+    /// the server's BDAT state before the error is reported.
+    fn onBdatReply(self: *Session, r: reply_mod.Reply) SessionError!void {
+        if (r.code == 250) {
+            if (!self.bdat_last) {
+                self.phase = .emit;
+                return;
+            }
+            self.env = null;
+            self.state = .ready;
+            self.phase = .emit;
+            if (self.tx_error) |e| {
+                self.tx_error = null;
+                return e;
+            }
+            return;
+        }
+        const err: SessionError = if (r.check()) |_| error.UnexpectedReply else |e| e;
+        self.bdat_error = err;
+        self.state = .bdat_rset;
+        self.phase = .emit;
     }
 
     fn recordTxError(self: *Session, e: SessionError) void {
@@ -1889,4 +2157,294 @@ test "DSN parameters are refused locally without the DSN capability, and bad one
     try testing.expectError(error.InvalidDsnParameter, d.beginTransaction(.{ .from = "a@example.com", .to = to, .body = "x", .dsn = .{ .envid = "" } }));
     try testing.expectError(error.InvalidDsnParameter, d.beginTransaction(.{ .from = "a@example.com", .to = to, .body = "x", .dsn = .{ .orcpt = &.{ null, null } } }));
     try testing.expectEqual(State.ready, d.state);
+}
+
+// ── SCRAM-SHA-256 (RFC 5802/7677) ──────────────────────────────────────────
+
+fn b64lit(comptime s: []const u8) *const [std.base64.standard.Encoder.calcSize(s.len)]u8 {
+    const r = comptime blk: {
+        var out: [std.base64.standard.Encoder.calcSize(s.len)]u8 = undefined;
+        _ = std.base64.standard.Encoder.encode(&out, s);
+        break :blk out;
+    };
+    return &r;
+}
+
+const scram_ehlo = "250-mail.example.com\r\n250 AUTH SCRAM-SHA-256 PLAIN\r\n";
+const scram_sf = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+const scram_cf = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=";
+const scram_sv = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=";
+
+fn scramOpts(password: []const u8) Options {
+    return .{
+        .tls = .disabled,
+        .allow_plaintext_auth = true,
+        .credentials = .{ .username = "user", .password = password, .mechanisms = &.{ .scram_sha_256, .plain } },
+        .scram_nonce = "rOprNGfwEbeRWgbNEkqO", // test seam
+    };
+}
+
+test "SCRAM-SHA-256 login: the RFC 7677 §3 exchange on the wire" {
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, scramOpts("pencil"));
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{
+        "220 ready\r\n",
+        scram_ehlo,
+        "334 " ++ b64lit(scram_sf) ++ "\r\n",
+        "334 " ++ b64lit(scram_sv) ++ "\r\n",
+        "235 2.7.0 ok\r\n",
+    } };
+    defer sc.deinit();
+    try sc.run(&s);
+    try testing.expect(s.authenticated);
+    try testing.expectEqual(State.ready, s.state);
+    try testing.expect(s.scram == null);
+    try testing.expectEqualStrings(
+        "EHLO localhost\r\nAUTH SCRAM-SHA-256 " ++ b64lit("n,,n=user,r=rOprNGfwEbeRWgbNEkqO") ++ "\r\n" ++
+            b64lit(scram_cf) ++ "\r\n" ++ "\r\n",
+        sc.sent.items,
+    );
+}
+
+test "SCRAM-SHA-256: a wrong server signature fails the AUTH and closes the session" {
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, scramOpts("pencil"));
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{
+        "220 ready\r\n",
+        scram_ehlo,
+        "334 " ++ b64lit(scram_sf) ++ "\r\n",
+        "334 " ++ b64lit("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95H4=") ++ "\r\n",
+        "235 2.7.0 ok\r\n",
+    } };
+    defer sc.deinit();
+    try testing.expectError(error.ServerSignatureMismatch, sc.run(&s));
+    try testing.expect(!s.authenticated);
+    try testing.expectEqual(State.closed, s.state);
+    // the completing empty line was never sent
+    try testing.expect(!std.mem.endsWith(u8, sc.sent.items, "\r\n\r\n"));
+    // a server that skips the proof and says 235 at once is no better
+    var s2: Session = .init(gpa, scramOpts("pencil"));
+    defer s2.deinit();
+    var sc2: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", scram_ehlo, "334 " ++ b64lit(scram_sf) ++ "\r\n", "235 2.7.0 ok\r\n" } };
+    defer sc2.deinit();
+    try testing.expectError(error.ServerSignatureMismatch, sc2.run(&s2));
+    try testing.expect(!s2.authenticated);
+    var s3: Session = .init(gpa, scramOpts("pencil"));
+    defer s3.deinit();
+    var sc3: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", scram_ehlo, "235 2.7.0 ok\r\n" } };
+    defer sc3.deinit();
+    try testing.expectError(error.AuthenticationFailed, sc3.run(&s3));
+    try testing.expect(!s3.authenticated);
+}
+
+test "SCRAM-SHA-256: the signature in the 235 additional data is verified too" {
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, scramOpts("pencil"));
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", scram_ehlo, "334 " ++ b64lit(scram_sf) ++ "\r\n", "235 " ++ b64lit(scram_sv) ++ "\r\n" } };
+    defer sc.deinit();
+    try sc.run(&s);
+    try testing.expect(s.authenticated);
+}
+
+test "SCRAM-SHA-256: rejected proof, bad iteration count, non-ASCII password" {
+    const gpa = testing.allocator;
+    {
+        var s: Session = .init(gpa, scramOpts("wrong"));
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", scram_ehlo, "334 " ++ b64lit(scram_sf) ++ "\r\n", "535 5.7.8 Authentication failed\r\n" } };
+        defer sc.deinit();
+        try testing.expectError(error.PermanentFailure, sc.run(&s));
+        try testing.expect(!s.authenticated);
+        try testing.expectEqual(State.closed, s.state);
+    }
+    {
+        var s: Session = .init(gpa, scramOpts("pencil"));
+        defer s.deinit();
+        const low = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=100";
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", scram_ehlo, "334 " ++ b64lit(low) ++ "\r\n" } };
+        defer sc.deinit();
+        try testing.expectError(error.ScramIterationsOutOfRange, sc.run(&s));
+        try testing.expectEqual(State.closed, s.state);
+    }
+    {
+        var s: Session = .init(gpa, scramOpts("p\xc3\xa9ncil"));
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", scram_ehlo, "334 " ++ b64lit(scram_sf) ++ "\r\n" } };
+        defer sc.deinit();
+        try testing.expectError(error.NonAsciiCredential, sc.run(&s));
+        try testing.expectEqual(State.closed, s.state);
+    }
+}
+
+test "SCRAM-SHA-256: the nonce comes from scram_random, and without a source nothing is sent" {
+    const gpa = testing.allocator;
+    var o = scramOpts("pencil");
+    o.scram_nonce = null;
+    var s: Session = .init(gpa, o);
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", scram_ehlo } };
+    defer sc.deinit();
+    try testing.expectError(error.ScramNoRandomSource, sc.run(&s));
+    try testing.expectEqualStrings("EHLO localhost\r\n", sc.sent.items);
+
+    var prng = std.Random.DefaultPrng.init(7);
+    o.scram_random = prng.random();
+    var s2: Session = .init(gpa, o);
+    defer s2.deinit();
+    var sc2: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", scram_ehlo } };
+    defer sc2.deinit();
+    // runs out of scripted replies after the AUTH line: that is the point we stop
+    try testing.expectError(error.InvalidState, sc2.run(&s2));
+    const line = std.mem.trimEnd(u8, sc2.sent.items["EHLO localhost\r\n".len..], "\r\n");
+    try testing.expect(std.mem.startsWith(u8, line, "AUTH SCRAM-SHA-256 "));
+    var dec: [128]u8 = undefined;
+    const raw = try auth_mod.decodeChallenge(&dec, line["AUTH SCRAM-SHA-256 ".len..]);
+    try testing.expect(std.mem.startsWith(u8, raw, "n,,n=user,r="));
+    try testing.expectEqual(@as(usize, "n,,n=user,r=".len + 24), raw.len);
+}
+
+// ── BDAT / CHUNKING (RFC 3030) ─────────────────────────────────────────────
+
+const ehlo_chunking =
+    "250-mail.example.com Hello\r\n" ++
+    "250-PIPELINING\r\n" ++
+    "250-CHUNKING\r\n" ++
+    "250 SIZE 10240000\r\n";
+
+fn bdatSession(gpa: std.mem.Allocator, chunk: usize, sc: *Script) !Session {
+    var s: Session = .init(gpa, .{ .tls = .disabled, .bdat = true, .bdat_chunk = chunk });
+    errdefer s.deinit();
+    sc.replies = &.{ "220 ready\r\n", ehlo_chunking };
+    try sc.run(&s);
+    return s;
+}
+
+test "BDAT: chunks of the normalised message, no dot-stuffing, the last one is LAST" {
+    const gpa = testing.allocator;
+    var sc: Script = .{ .gpa = gpa, .replies = &.{} };
+    defer sc.deinit();
+    var s = try bdatSession(gpa, 8, &sc);
+    defer s.deinit();
+    sc.sent.clearRetainingCapacity();
+    try s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "Subject: x\n.dot\nend" });
+    sc.idx = 0;
+    sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "250 c1\r\n", "250 c2\r\n", "250 queued\r\n" };
+    try sc.run(&s);
+    try testing.expectEqual(@as(usize, 5), sc.idx);
+    try testing.expectEqual(State.ready, s.state);
+    try testing.expectEqualStrings(
+        "MAIL FROM:<a@example.com> SIZE=23\r\nRCPT TO:<b@example.net>\r\n" ++
+            "BDAT 8\r\nSubject:" ++ "BDAT 8\r\n x\r\n.dot" ++ "BDAT 7 LAST\r\n\r\nend\r\n",
+        sc.sent.items,
+    );
+    try testing.expectEqual(@as(usize, 0), sc.bodies.items.len); // DATA was never used
+}
+
+test "BDAT: an empty body is one BDAT 0 LAST, and a big chunk sends the message at once" {
+    const gpa = testing.allocator;
+    var sc: Script = .{ .gpa = gpa, .replies = &.{} };
+    defer sc.deinit();
+    var s = try bdatSession(gpa, 64 * 1024, &sc);
+    defer s.deinit();
+    sc.sent.clearRetainingCapacity();
+    try s.beginTransaction(.{ .from = null, .to = &.{"b@example.net"}, .body = "" });
+    sc.idx = 0;
+    sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "250 queued\r\n" };
+    try sc.run(&s);
+    try testing.expectEqualStrings("MAIL FROM:<> SIZE=0\r\nRCPT TO:<b@example.net>\r\nBDAT 0 LAST\r\n", sc.sent.items);
+
+    sc.sent.clearRetainingCapacity();
+    try s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "a\r\n.b\r\n" });
+    sc.idx = 0;
+    sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "250 queued\r\n" };
+    try sc.run(&s);
+    try testing.expect(std.mem.endsWith(u8, sc.sent.items, "BDAT 7 LAST\r\na\r\n.b\r\n"));
+}
+
+test "BDAT: a refused chunk stops the stream, RSET follows, the error is the server's" {
+    const gpa = testing.allocator;
+    var sc: Script = .{ .gpa = gpa, .replies = &.{} };
+    defer sc.deinit();
+    var s = try bdatSession(gpa, 8, &sc);
+    defer s.deinit();
+    sc.sent.clearRetainingCapacity();
+    try s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "Subject: x\n.dot\nend" });
+    sc.idx = 0;
+    sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "250 c1\r\n", "552 5.3.4 too big\r\n", "250 reset\r\n" };
+    try testing.expectError(error.PermanentFailure, sc.run(&s));
+    try testing.expectEqual(@as(usize, 5), sc.idx); // every reply consumed
+    try testing.expectEqual(State.ready, s.state);
+    try testing.expect(std.mem.endsWith(u8, sc.sent.items, "BDAT 8\r\n x\r\n.dotRSET\r\n"));
+    try testing.expect(std.mem.find(u8, sc.sent.items, "LAST") == null); // chunk 3 never sent
+
+    // usable again afterwards
+    sc.sent.clearRetainingCapacity();
+    try s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "ok" });
+    sc.idx = 0;
+    sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "250 queued\r\n" };
+    try sc.run(&s);
+    try testing.expect(std.mem.endsWith(u8, sc.sent.items, "BDAT 4 LAST\r\nok\r\n"));
+
+    // a transient refusal of the LAST chunk keeps its class
+    try s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "ok" });
+    sc.idx = 0;
+    sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "451 4.3.0 later\r\n", "250 reset\r\n" };
+    try testing.expectError(error.TransientFailure, sc.run(&s));
+}
+
+test "BDAT: all recipients rejected sends no chunk; a lone-policy rejection still delivers" {
+    const gpa = testing.allocator;
+    var sc: Script = .{ .gpa = gpa, .replies = &.{} };
+    defer sc.deinit();
+    var s = try bdatSession(gpa, 64, &sc);
+    defer s.deinit();
+    sc.sent.clearRetainingCapacity();
+    try s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "x" });
+    sc.idx = 0;
+    sc.replies = &.{ "250 ok\r\n", "550 5.1.1 no\r\n" };
+    try testing.expectError(error.AllRecipientsRejected, sc.run(&s));
+    try testing.expect(std.mem.find(u8, sc.sent.items, "BDAT") == null);
+    try testing.expectEqual(State.ready, s.state);
+}
+
+test "BDAT: used only when asked for and advertised; an over-long line is refused before MAIL" {
+    const gpa = testing.allocator;
+    // advertised but not requested: DATA
+    var s: Session = .init(gpa, .{ .tls = .disabled });
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", ehlo_chunking } };
+    defer sc.deinit();
+    try sc.run(&s);
+    try s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "x\r\n" });
+    sc.idx = 0;
+    sc.replies = &.{ "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 q\r\n" };
+    try sc.run(&s);
+    try testing.expect(std.mem.find(u8, sc.sent.items, "BDAT") == null);
+    try testing.expect(std.mem.find(u8, sc.sent.items, "DATA\r\n") != null);
+
+    // requested but not advertised: DATA
+    var s2: Session = .init(gpa, .{ .tls = .disabled, .bdat = true });
+    defer s2.deinit();
+    var sc2: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", ehlo_full } };
+    defer sc2.deinit();
+    try sc2.run(&s2);
+    try s2.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "x\r\n" });
+    sc2.idx = 0;
+    sc2.replies = &.{ "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 q\r\n" };
+    try sc2.run(&s2);
+    try testing.expect(std.mem.find(u8, sc2.sent.items, "BDAT") == null);
+
+    // both: the line that cannot be sent is found before any command goes out
+    var sc3: Script = .{ .gpa = gpa, .replies = &.{} };
+    defer sc3.deinit();
+    var s3 = try bdatSession(gpa, 64, &sc3);
+    defer s3.deinit();
+    const long = try gpa.alloc(u8, 1500);
+    defer gpa.free(long);
+    @memset(long, 'a');
+    try testing.expectError(error.LineTooLong, s3.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = long }));
+    try testing.expectEqual(State.ready, s3.state);
 }
