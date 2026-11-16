@@ -58,7 +58,10 @@ try genetlink.appendHeader(gpa, &list, my_cmd, my_version); // after the nlmsghd
 Socket: `open`/`close`, `handle` (= the `fd` field, for poll/epoll and
 `setsockopt`), `setRecvTimeout`, `nextSeq`, `send`, `recvDatagram` /
 `recvDatagramStrict`, `lastErrorMessage`, `resolveFamily`,
-`resolveMcastGroup`.
+`resolveMcastGroup`, `getFamily` (id, name, version, header size, max attribute),
+`listFamilies` (every registered family; free the slice with `gpa.free`).
+Pure: `Family`, `parseFamily`, `buildListFamiliesRequest`,
+`CTRL_ATTR_VERSION`/`HDRSIZE`/`MAXATTR`.
 
 Low-level, for building custom family requests (all `pub`): `header_len`
 (sizeof `genlmsghdr`), `GENL_ID_CTRL`/`CTRL_CMD_GETFAMILY`/

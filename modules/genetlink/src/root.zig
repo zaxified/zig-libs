@@ -86,6 +86,11 @@ pub const CTRL_CMD_GETFAMILY: u8 = 3;
 /// nlctrl attributes (CTRL_ATTR_*).
 pub const CTRL_ATTR_FAMILY_ID: u16 = 1;
 pub const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+/// Family version, header size (family-specific header between `genlmsghdr`
+/// and the attributes) and highest attribute type — `u32` each.
+pub const CTRL_ATTR_VERSION: u16 = 3;
+pub const CTRL_ATTR_HDRSIZE: u16 = 4;
+pub const CTRL_ATTR_MAXATTR: u16 = 5;
 /// Nest of one sub-nest per multicast group the family publishes.
 pub const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
 
@@ -206,6 +211,80 @@ pub fn findMcastGroupId(attr_bytes: []const u8, want: []const u8) codec.Error!?u
     return null;
 }
 
+// ── family metadata + listing (pure half) ──────────────────────────────────
+
+/// What one `CTRL_CMD_NEWFAMILY` record says about a family. The name is
+/// stored inline (a family name is shorter than `GENL_NAMSIZ`), so a
+/// `[]Family` from `Socket.listFamilies` is one allocation, freed with one
+/// `gpa.free`, and a `Family` is a plain value.
+pub const Family = struct {
+    /// Dynamic message-type id, in `[GENL_ID_CTRL, GENL_MAX_ID]`.
+    id: u16,
+    /// `CTRL_ATTR_VERSION` — the family's own protocol version (0 if the
+    /// record carried none).
+    version: u32 = 0,
+    /// `CTRL_ATTR_HDRSIZE` — bytes of family-specific header after the
+    /// `genlmsghdr` (0 if absent).
+    hdrsize: u32 = 0,
+    /// `CTRL_ATTR_MAXATTR` — the highest attribute type the family's policy
+    /// knows (0 if absent).
+    maxattr: u32 = 0,
+    name_buf: [GENL_NAMSIZ]u8 = @splat(0),
+    name_len: u8 = 0,
+
+    /// The family name (no NUL). Borrows `self`.
+    pub fn name(self: *const Family) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
+/// Decode one `CTRL_CMD_NEWFAMILY` record's attribute bytes (the nlctrl
+/// payload past its `genlmsghdr`) into a `Family`. Pure.
+///
+/// `CTRL_ATTR_FAMILY_NAME` (non-empty, shorter than `GENL_NAMSIZ`) and
+/// `CTRL_ATTR_FAMILY_ID` (inside `[GENL_ID_CTRL, GENL_MAX_ID]`) are required;
+/// `VERSION`/`HDRSIZE`/`MAXATTR` default to 0 when absent. A wrong-sized
+/// attribute, a bad id or name, or a truncated attribute list is
+/// `error.MalformedReply`. Other attributes (ops, groups, policy) are ignored.
+pub fn parseFamily(attr_bytes: []const u8) error{MalformedReply}!Family {
+    var fam: Family = .{ .id = 0 };
+    var have_name = false;
+    var have_id = false;
+    var it: codec.AttrIterator = .{ .buf = attr_bytes };
+    while (it.next() catch return error.MalformedReply) |a| switch (a.type) {
+        CTRL_ATTR_FAMILY_NAME => {
+            const n = a.asString();
+            if (n.len == 0 or n.len >= GENL_NAMSIZ) return error.MalformedReply;
+            @memcpy(fam.name_buf[0..n.len], n);
+            fam.name_len = @intCast(n.len);
+            have_name = true;
+        },
+        CTRL_ATTR_FAMILY_ID => {
+            fam.id = a.asU16() catch return error.MalformedReply;
+            have_id = true;
+        },
+        CTRL_ATTR_VERSION => fam.version = a.asU32() catch return error.MalformedReply,
+        CTRL_ATTR_HDRSIZE => fam.hdrsize = a.asU32() catch return error.MalformedReply,
+        CTRL_ATTR_MAXATTR => fam.maxattr = a.asU32() catch return error.MalformedReply,
+        else => {},
+    };
+    if (!have_name or !have_id) return error.MalformedReply;
+    if (fam.id < GENL_ID_CTRL or fam.id > GENL_MAX_ID) return error.MalformedReply;
+    return fam;
+}
+
+/// Build a complete `CTRL_CMD_GETFAMILY` **dump** request (`NLM_F_DUMP`, no
+/// attributes): the kernel answers with one `CTRL_CMD_NEWFAMILY` record per
+/// registered family, then `NLMSG_DONE`. Caller frees the returned buffer.
+pub fn buildListFamiliesRequest(gpa: std.mem.Allocator, seq: u32) std.mem.Allocator.Error![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, GENL_ID_CTRL, codec.NLM_F_REQUEST | codec.NLM_F_DUMP, seq, 0);
+    try appendHeader(gpa, &list, CTRL_CMD_GETFAMILY, 1);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
 // ── socket transport ────────────────────────────────────────────────────────
 
 pub const OpenError = error{
@@ -250,6 +329,11 @@ pub const ResolveError = error{
     /// forever.
     TooManyMessages,
 };
+
+/// `ResolveError` plus `DumpInterrupted`: `Socket.listFamilies` saw the
+/// kernel flag the dump `NLM_F_DUMP_INTR` (the family table changed
+/// mid-dump) on every one of its `max_dump_attempts` tries.
+pub const ListFamiliesError = ResolveError || error{DumpInterrupted};
 
 /// `ResolveError` plus the one outcome that is specific to group resolution:
 /// the family exists but publishes no group under that name (a kernel too old
@@ -451,6 +535,59 @@ pub const Socket = struct {
         _ = try self.ctrlGetFamily(family, .{ .many_groups = .{ .names = names, .out = out } });
     }
 
+    /// Look a family up by name and return everything its `nlctrl` record
+    /// says: id, version, header size and highest attribute type (one
+    /// `CTRL_CMD_GETFAMILY` round trip, same as `resolveFamily`). Unprivileged.
+    /// `error.FamilyNotFound` = no such family. A client can compare
+    /// `version` against what it was written for.
+    pub fn getFamily(self: *Socket, name: []const u8) ResolveError!Family {
+        if (name.len >= GENL_NAMSIZ) return error.NameTooLong;
+
+        var t = self.transport();
+        defer self.sync(t);
+        t.ext_ack_len = 0;
+
+        const seq = t.nextSeq();
+        const req = try buildGetFamilyRequest(t.gpa, seq, name);
+        defer t.gpa.free(req);
+        try t.send(req);
+
+        var list: std.ArrayList(Family) = .empty;
+        defer list.deinit(t.gpa);
+        _ = try collectFamilies(&t, t.gpa, name, seq, &list);
+        if (list.items.len != 1) return error.MalformedReply;
+        return list.items[0];
+    }
+
+    /// Every family the kernel has registered (`CTRL_CMD_GETFAMILY` with
+    /// `NLM_F_DUMP`) — how a tool discovers what a kernel offers.
+    /// Unprivileged. Caller frees the slice with `gpa.free` (the socket's
+    /// allocator). A dump the kernel flags `NLM_F_DUMP_INTR` is restarted up
+    /// to `max_dump_attempts` times, then `error.DumpInterrupted`.
+    pub fn listFamilies(self: *Socket) ListFamiliesError![]Family {
+        var attempt: u8 = 0;
+        while (attempt < max_dump_attempts) : (attempt += 1) {
+            var t = self.transport();
+            defer self.sync(t);
+            t.ext_ack_len = 0;
+
+            const seq = t.nextSeq();
+            const req = try buildListFamiliesRequest(t.gpa, seq);
+            defer t.gpa.free(req);
+            try t.send(req);
+
+            var list: std.ArrayList(Family) = .empty;
+            errdefer list.deinit(t.gpa);
+            const interrupted = try collectFamilies(&t, t.gpa, null, seq, &list);
+            if (interrupted) {
+                list.deinit(t.gpa);
+                continue;
+            }
+            return list.toOwnedSlice(t.gpa);
+        }
+        return error.DumpInterrupted;
+    }
+
     /// What one `CTRL_CMD_GETFAMILY` round trip is being asked to extract
     /// from the resolved family's reply, besides the family's own identity
     /// (name and id), which `ctrlGetFamilyOver` verifies unconditionally.
@@ -629,6 +766,57 @@ fn scanFamilyReplies(
                             }
                         },
                     }
+                },
+            }
+        }
+    }
+}
+
+/// Dump restarts `Socket.listFamilies` tolerates before `DumpInterrupted`.
+const max_dump_attempts: u8 = 3;
+
+/// The receive half of `Socket.getFamily` (`want` = the requested name) and
+/// `Socket.listFamilies` (`want == null`): append one `Family` per
+/// `CTRL_CMD_NEWFAMILY` record to `list` until `NLMSG_DONE`/a bare ACK, an
+/// error, or `max_reply_messages` datagrams (`error.TooManyMessages`, F1).
+/// Returns whether any reply carried `NLM_F_DUMP_INTR` (such a record is not
+/// trusted and not collected). With `want`, every record must name exactly
+/// that family (F2). The family count is capped at `GENL_MAX_ID` (the id
+/// space), beyond which a stream is `error.TooManyMessages`. `transport` has
+/// the same shape as for `ctrlGetFamilyOver`.
+fn collectFamilies(
+    transport: anytype,
+    gpa: std.mem.Allocator,
+    want: ?[]const u8,
+    seq: u32,
+    list: *std.ArrayList(Family),
+) (ResolveError)!bool {
+    var interrupted = false;
+    var msgs: u32 = 0;
+    while (true) {
+        if (msgs >= max_reply_messages) return error.TooManyMessages;
+        const dgram = try transport.recvDatagram();
+        msgs += 1;
+        var it: codec.MessageIterator = .{ .buf = dgram };
+        while (it.next() catch return error.MalformedReply) |m| {
+            switch (codec.classifyDumpMessage(m, transport.portId(), seq)) {
+                .skip => {},
+                .restart => interrupted = true,
+                .done => return interrupted,
+                .failed => |code| {
+                    transport.captureExtAck(m);
+                    return resolveErrorFromCode(code);
+                },
+                .overrun => return error.SystemResources,
+                .malformed => return error.MalformedReply,
+                .record => |rec| {
+                    if (rec.type != GENL_ID_CTRL) continue;
+                    const p = splitPayload(rec.payload) catch return error.MalformedReply;
+                    if (p.cmd != CTRL_CMD_NEWFAMILY) return error.MalformedReply;
+                    const fam = try parseFamily(p.attrs);
+                    if (want) |w| if (!std.mem.eql(u8, fam.name(), w)) return error.MalformedReply;
+                    if (list.items.len >= GENL_MAX_ID) return error.TooManyMessages;
+                    try list.append(gpa, fam);
                 },
             }
         }
@@ -1800,4 +1988,253 @@ test "a group reply whose family id is exactly GENL_ID_CTRL or GENL_MAX_ID is ac
         _ = try ctrlGetFamilyOver(&t, "nlctrl", .{ .many_groups = .{ .names = &.{"notify"}, .out = &out } }, 42);
         try testing.expectEqual(@as(?u32, 5), out[0]);
     }
+}
+
+// ── family metadata + ListFamilies (offline: real kernel records) ──────────
+
+/// Decode the hex of one captured datagram of `kernel_families` into `buf`.
+fn capturedReply(buf: []u8, family: []const u8) ![]const u8 {
+    for (kernel_families.exchanges) |x| {
+        if (std.mem.eql(u8, x.family, family)) return std.fmt.hexToBytes(buf, x.datagrams[0]);
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn appendDone(gpa: std.mem.Allocator, list: *std.ArrayList(u8), seq: u32, pid: u32) !void {
+    const h = try codec.appendHeader(gpa, list, codec.NLMSG_DONE, codec.NLM_F_MULTI, seq, pid);
+    try list.appendSlice(gpa, &.{ 0, 0, 0, 0 });
+    codec.finishHeader(list, h);
+}
+
+test "golden: buildListFamiliesRequest is a bare GETFAMILY dump" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const req = try buildListFamiliesRequest(testing.allocator, 9);
+    defer testing.allocator.free(req);
+    try testing.expectEqualSlices(u8, &.{
+        0x14, 0x00, 0x00, 0x00, // nlmsg_len = 20
+        0x10, 0x00, // GENL_ID_CTRL
+        0x01, 0x03, // NLM_F_REQUEST | NLM_F_DUMP (0x300)
+        0x09, 0x00, 0x00, 0x00, // seq
+        0x00, 0x00, 0x00, 0x00, // pid
+        0x03, 0x01, 0x00, 0x00, // GETFAMILY, version 1
+    }, req);
+}
+
+test "parseFamily: version/hdrsize/maxattr of real kernel records (second-decoder values)" {
+    if (native_endian != .little) return error.SkipZigTest;
+    // (family, id, version, maxattr) read from the captured kernel bytes
+    // (CTRL_ATTR_VERSION/HDRSIZE/MAXATTR); hdrsize is 0 for all of them.
+    const want = [_]struct { name: []const u8, id: u16, version: u32, maxattr: u32 }{
+        .{ .name = "netdev", .id = 22, .version = 1, .maxattr = 0 },
+        .{ .name = "nl80211", .id = 41, .version = 1, .maxattr = 350 },
+        .{ .name = "thermal", .id = 20, .version = 2, .maxattr = 27 },
+        .{ .name = "mptcp_pm", .id = 35, .version = 1, .maxattr = 0 },
+    };
+    for (want) |w| {
+        var raw: [8192]u8 = undefined;
+        const dg = try capturedReply(&raw, w.name);
+        var it: codec.MessageIterator = .{ .buf = dg };
+        const m = (try it.next()).?;
+        const p = try splitPayload(m.payload);
+        const fam = try parseFamily(p.attrs);
+        try testing.expectEqualStrings(w.name, fam.name());
+        try testing.expectEqual(w.id, fam.id);
+        try testing.expectEqual(w.version, fam.version);
+        try testing.expectEqual(@as(u32, 0), fam.hdrsize);
+        try testing.expectEqual(w.maxattr, fam.maxattr);
+    }
+}
+
+test "parseFamily: nlctrl's own captured record" {
+    // The attribute bytes of the "golden: real nlctrl" reply: id 0x10, version 2.
+    const attrs = [_]u8{
+        0x0b, 0x00, 0x02, 0x00, 'n',  'l',  'c',  't',  'r',  'l',  0x00, 0x00,
+        0x06, 0x00, 0x01, 0x00, 0x10, 0x00, 0x00, 0x00, 0x08, 0x00, 0x03, 0x00,
+        0x02, 0x00, 0x00, 0x00, 0x08, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x08, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    if (native_endian != .little) return error.SkipZigTest;
+    const fam = try parseFamily(&attrs);
+    try testing.expectEqualStrings("nlctrl", fam.name());
+    try testing.expectEqual(GENL_ID_CTRL, fam.id);
+    try testing.expectEqual(@as(u32, 2), fam.version);
+}
+
+test "parseFamily: absent metadata defaults to 0; missing name/id, bad id/name/size are MalformedReply" {
+    const gpa = testing.allocator;
+    var l: std.ArrayList(u8) = .empty;
+    defer l.deinit(gpa);
+
+    try codec.appendAttrString(gpa, &l, CTRL_ATTR_FAMILY_NAME, "x");
+    try codec.appendAttrU16(gpa, &l, CTRL_ATTR_FAMILY_ID, 30);
+    const f = try parseFamily(l.items);
+    try testing.expectEqual(@as(u32, 0), f.version);
+    try testing.expectEqual(@as(u32, 0), f.hdrsize);
+    try testing.expectEqual(@as(u32, 0), f.maxattr);
+
+    // Empty input, name only, id only.
+    try testing.expectError(error.MalformedReply, parseFamily(&.{}));
+    l.clearRetainingCapacity();
+    try codec.appendAttrString(gpa, &l, CTRL_ATTR_FAMILY_NAME, "x");
+    try testing.expectError(error.MalformedReply, parseFamily(l.items));
+    l.clearRetainingCapacity();
+    try codec.appendAttrU16(gpa, &l, CTRL_ATTR_FAMILY_ID, 30);
+    try testing.expectError(error.MalformedReply, parseFamily(l.items));
+
+    // Out-of-range ids (both sides) and the two bad names.
+    const cases = [_]struct { name: []const u8, id: u16 }{
+        .{ .name = "x", .id = GENL_ID_CTRL - 1 },
+        .{ .name = "x", .id = GENL_MAX_ID + 1 },
+        .{ .name = "", .id = 30 },
+        .{ .name = "0123456789abcdef", .id = 30 }, // 16 chars, no room for NUL
+    };
+    for (cases) |c| {
+        l.clearRetainingCapacity();
+        try codec.appendAttrString(gpa, &l, CTRL_ATTR_FAMILY_NAME, c.name);
+        try codec.appendAttrU16(gpa, &l, CTRL_ATTR_FAMILY_ID, c.id);
+        try testing.expectError(error.MalformedReply, parseFamily(l.items));
+    }
+
+    // A wrong-sized VERSION, and a truncated attribute list.
+    l.clearRetainingCapacity();
+    try codec.appendAttrString(gpa, &l, CTRL_ATTR_FAMILY_NAME, "x");
+    try codec.appendAttrU16(gpa, &l, CTRL_ATTR_FAMILY_ID, 30);
+    try codec.appendAttrU16(gpa, &l, CTRL_ATTR_VERSION, 1);
+    try testing.expectError(error.MalformedReply, parseFamily(l.items));
+    try testing.expectError(error.MalformedReply, parseFamily(l.items[0 .. l.items.len - 3]));
+}
+
+test "collectFamilies: getFamily path over a captured reply, then ACK" {
+    var raw: [8192]u8 = undefined;
+    const rec = try capturedReply(&raw, "thermal");
+    var pid: u32 = undefined;
+    for (kernel_families.exchanges) |x| if (std.mem.eql(u8, x.family, "thermal")) {
+        pid = x.pid;
+    };
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    try list.appendSlice(testing.allocator, rec);
+    try appendBareAck(testing.allocator, &list, 1, pid);
+
+    var out: std.ArrayList(Family) = .empty;
+    defer out.deinit(testing.allocator);
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = pid };
+    try testing.expect(!try collectFamilies(&t, testing.allocator, "thermal", 1, &out));
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqual(@as(u16, 20), out.items[0].id);
+
+    // The same record answering a request for another family is rejected.
+    out.clearRetainingCapacity();
+    t = .{ .script = &.{list.items}, .pid = pid };
+    try testing.expectError(error.MalformedReply, collectFamilies(&t, testing.allocator, "netdev", 1, &out));
+}
+
+test "collectFamilies: a dump of real kernel records, spread over datagrams, ends at NLMSG_DONE" {
+    var raw: [3][8192]u8 = undefined;
+    const names = [_][]const u8{ "netdev", "nl80211", "thermal" };
+    var pid: u32 = 0;
+    for (kernel_families.exchanges) |x| pid = x.pid;
+
+    // netdev + nl80211 in one datagram, thermal + DONE in the next.
+    var d0: std.ArrayList(u8) = .empty;
+    defer d0.deinit(testing.allocator);
+    var d1: std.ArrayList(u8) = .empty;
+    defer d1.deinit(testing.allocator);
+    try d0.appendSlice(testing.allocator, try capturedReply(&raw[0], names[0]));
+    try d0.appendSlice(testing.allocator, try capturedReply(&raw[1], names[1]));
+    try d1.appendSlice(testing.allocator, try capturedReply(&raw[2], names[2]));
+    try appendDone(testing.allocator, &d1, 1, pid);
+
+    var out: std.ArrayList(Family) = .empty;
+    defer out.deinit(testing.allocator);
+    var t: GenlScripted = .{ .script = &.{ d0.items, d1.items }, .pid = pid };
+    try testing.expect(!try collectFamilies(&t, testing.allocator, null, 1, &out));
+    try testing.expectEqual(@as(usize, 3), out.items.len);
+    try testing.expectEqualStrings("netdev", out.items[0].name());
+    try testing.expectEqual(@as(u16, 41), out.items[1].id);
+    try testing.expectEqual(@as(u32, 350), out.items[1].maxattr);
+    try testing.expectEqualStrings("thermal", out.items[2].name());
+}
+
+test "collectFamilies: empty dump, foreign seq skipped, interrupted flag, errors" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(Family) = .empty;
+    defer out.deinit(gpa);
+
+    // Empty dump: just DONE.
+    var done: std.ArrayList(u8) = .empty;
+    defer done.deinit(gpa);
+    try appendDone(gpa, &done, 5, 7);
+    var t: GenlScripted = .{ .script = &.{done.items}, .pid = 7 };
+    try testing.expect(!try collectFamilies(&t, gpa, null, 5, &out));
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+
+    // A record for another seq is skipped; DUMP_INTR is reported and the
+    // flagged record is not collected.
+    var l: std.ArrayList(u8) = .empty;
+    defer l.deinit(gpa);
+    try buildFamilyReply(gpa, &l, CTRL_CMD_NEWFAMILY, 99, 7, "nlctrl", GENL_ID_CTRL);
+    const h = try codec.appendHeader(gpa, &l, GENL_ID_CTRL, codec.NLM_F_DUMP_INTR, 5, 7);
+    try appendHeader(gpa, &l, CTRL_CMD_NEWFAMILY, 2);
+    try codec.appendAttrString(gpa, &l, CTRL_ATTR_FAMILY_NAME, "nlctrl");
+    try codec.appendAttrU16(gpa, &l, CTRL_ATTR_FAMILY_ID, GENL_ID_CTRL);
+    codec.finishHeader(&l, h);
+    try appendDone(gpa, &l, 5, 7);
+    t = .{ .script = &.{l.items}, .pid = 7 };
+    try testing.expect(try collectFamilies(&t, gpa, null, 5, &out));
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+
+    // A DELFAMILY record, a malformed record, an NLMSG_ERROR(ENOENT).
+    var bad: std.ArrayList(u8) = .empty;
+    defer bad.deinit(gpa);
+    try buildFamilyReply(gpa, &bad, 2, 5, 7, "nlctrl", GENL_ID_CTRL);
+    t = .{ .script = &.{bad.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, collectFamilies(&t, gpa, null, 5, &out));
+    bad.clearRetainingCapacity();
+    try buildFamilyReply(gpa, &bad, CTRL_CMD_NEWFAMILY, 5, 7, "nlctrl", null);
+    t = .{ .script = &.{bad.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, collectFamilies(&t, gpa, null, 5, &out));
+    bad.clearRetainingCapacity();
+    const eh = try codec.appendHeader(gpa, &bad, codec.NLMSG_ERROR, 0, 5, 7);
+    try bad.appendSlice(gpa, &.{ 0xfe, 0xff, 0xff, 0xff }); // -ENOENT
+    codec.finishHeader(&bad, eh);
+    t = .{ .script = &.{bad.items}, .pid = 7 };
+    try testing.expectError(error.FamilyNotFound, collectFamilies(&t, gpa, "x", 5, &out));
+}
+
+test "collectFamilies: a dump that never ends is bounded" {
+    const gpa = testing.allocator;
+    var l: std.ArrayList(u8) = .empty;
+    defer l.deinit(gpa);
+    try buildFamilyReply(gpa, &l, CTRL_CMD_NEWFAMILY, 5, 7, "nlctrl", GENL_ID_CTRL);
+    var out: std.ArrayList(Family) = .empty;
+    defer out.deinit(gpa);
+    var t: GenlScripted = .{ .filler = l.items, .pid = 7 };
+    // The same record forever: the family-count cap (GENL_MAX_ID) trips
+    // long before the datagram budget.
+    try testing.expectError(error.TooManyMessages, collectFamilies(&t, gpa, null, 5, &out));
+    try testing.expectEqual(@as(usize, GENL_MAX_ID), out.items.len);
+}
+
+test "integration: listFamilies and getFamily against the live kernel" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer sock.close();
+
+    const all = try sock.listFamilies();
+    defer testing.allocator.free(all);
+    var saw_ctrl = false;
+    for (all) |*f| {
+        if (std.mem.eql(u8, f.name(), "nlctrl")) {
+            saw_ctrl = true;
+            try testing.expectEqual(GENL_ID_CTRL, f.id);
+        }
+    }
+    try testing.expect(saw_ctrl);
+
+    const one = try sock.getFamily("nlctrl");
+    try testing.expectEqual(GENL_ID_CTRL, one.id);
+    try testing.expect(one.version >= 1);
+    try testing.expectError(error.FamilyNotFound, sock.getFamily("zig-libs-nope"));
+    try testing.expectError(error.NameTooLong, sock.getFamily("a-family-name-way-too-long"));
 }
