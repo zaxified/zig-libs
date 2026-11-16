@@ -158,6 +158,46 @@ pub fn parseDs(rdata: []const u8) ParseError!Ds {
     };
 }
 
+// ── CDS / CDNSKEY (RFC 7344 §3, RFC 8078 §4) ───────────────────────────────
+
+/// A CDS record (RFC 7344 §3.1): the child's desired DS, wire-identical to DS.
+/// `ds` is the ordinary DS decode; `isDeleteSignal` recognises the RFC 8078 §4
+/// "remove the DS RRset" form. Parsing only: no trust or policy decision.
+pub const Cds = struct {
+    ds: Ds,
+
+    /// RFC 8078 §4 delete signal: `0 0 0 00` (key tag 0, algorithm 0, digest
+    /// type 0, a single zero octet of digest).
+    pub fn isDeleteSignal(c: Cds) bool {
+        return c.ds.key_tag == 0 and c.ds.algorithm == 0 and c.ds.digest_type == 0 and
+            c.ds.digest.len == 1 and c.ds.digest[0] == 0;
+    }
+};
+
+/// Parse a CDS RDATA (RFC 7344 §3.1); same layout and errors as `parseDs`.
+pub fn parseCds(rdata: []const u8) ParseError!Cds {
+    return .{ .ds = try parseDs(rdata) };
+}
+
+/// A CDNSKEY record (RFC 7344 §3.2): the child's desired DNSKEY, wire-identical
+/// to DNSKEY.
+pub const Cdnskey = struct {
+    key: Dnskey,
+
+    /// RFC 8078 §4 delete signal: `0 3 0 AA==` (flags 0, protocol 3, algorithm
+    /// 0, a single zero octet of key material).
+    pub fn isDeleteSignal(c: Cdnskey) bool {
+        return c.key.flags == 0 and c.key.protocol == 3 and c.key.algorithm == 0 and
+            c.key.public_key.len == 1 and c.key.public_key[0] == 0;
+    }
+};
+
+/// Parse a CDNSKEY RDATA (RFC 7344 §3.2); same layout and errors as
+/// `parseDnskey`.
+pub fn parseCdnskey(rdata: []const u8) ParseError!Cdnskey {
+    return .{ .key = try parseDnskey(rdata) };
+}
+
 // ── Type Bit Maps (RFC 4034 §4.1.2, shared by NSEC and NSEC3) ──────────────
 
 /// A parsed-but-not-copied Type Bit Maps field: a sequence of windows
@@ -386,6 +426,39 @@ test "parseDnskey: flags/protocol/algorithm/public_key split" {
     try testing.expectEqual(@as(u8, 3), k.protocol);
     try testing.expectEqual(@as(u8, 8), k.algorithm);
     try testing.expectEqualSlices(u8, "\xde\xad\xbe\xef", k.public_key);
+}
+
+test "parseCds: DS shape, delete signal recognised" {
+    const c = try parseCds("\x9c\x91\x08\x02\xaa\xbb");
+    try testing.expectEqual(@as(u16, 0x9c91), c.ds.key_tag);
+    try testing.expectEqual(@as(u8, 2), c.ds.digest_type);
+    try testing.expectEqualSlices(u8, "\xaa\xbb", c.ds.digest);
+    try testing.expect(!c.isDeleteSignal());
+    try testing.expect((try parseCds("\x00\x00\x00\x00\x00")).isDeleteSignal());
+    // near misses are not delete signals
+    try testing.expect(!(try parseCds("\x00\x00\x00\x00\x01")).isDeleteSignal());
+    try testing.expect(!(try parseCds("\x00\x00\x00\x00")).isDeleteSignal());
+    try testing.expect(!(try parseCds("\x00\x00\x00\x00\x00\x00")).isDeleteSignal());
+    try testing.expect(!(try parseCds("\x00\x01\x00\x00\x00")).isDeleteSignal());
+    try testing.expect(!(try parseCds("\x00\x00\x08\x00\x00")).isDeleteSignal());
+    try testing.expect(!(try parseCds("\x00\x00\x00\x02\x00")).isDeleteSignal());
+    try testing.expectError(error.Truncated, parseCds("\x00\x00\x00"));
+}
+
+test "parseCdnskey: DNSKEY shape, delete signal recognised" {
+    const c = try parseCdnskey("\x01\x01\x03\x08\xde\xad");
+    try testing.expectEqual(@as(u16, 0x0101), c.key.flags);
+    try testing.expectEqual(@as(u8, 8), c.key.algorithm);
+    try testing.expectEqualSlices(u8, "\xde\xad", c.key.public_key);
+    try testing.expect(!c.isDeleteSignal());
+    try testing.expect((try parseCdnskey("\x00\x00\x03\x00\x00")).isDeleteSignal());
+    try testing.expect(!(try parseCdnskey("\x00\x00\x03\x00\x01")).isDeleteSignal());
+    try testing.expect(!(try parseCdnskey("\x00\x00\x03\x00")).isDeleteSignal());
+    try testing.expect(!(try parseCdnskey("\x00\x00\x03\x00\x00\x00")).isDeleteSignal());
+    try testing.expect(!(try parseCdnskey("\x01\x00\x03\x00\x00")).isDeleteSignal());
+    try testing.expect(!(try parseCdnskey("\x00\x00\x04\x00\x00")).isDeleteSignal());
+    try testing.expect(!(try parseCdnskey("\x00\x00\x03\x08\x00")).isDeleteSignal());
+    try testing.expectError(error.Truncated, parseCdnskey("\x00\x00\x03"));
 }
 
 test "parseDnskey: truncated errors" {
