@@ -87,6 +87,17 @@ var near: [10]geoindex.Neighbor = undefined;
 var scratch: [4096]geoindex.HeapEntry = undefined; // or size via knnScratchLen(k, fanout, item_count)
 const kr = try f.knn(49.2, 16.6, 10, &near, &scratch, .{});
 // kr.items ranked nearest-first; kr.status: .complete / .truncated_budget
+
+// within — everything within `radius` of (lat, lon), unordered, with dist2.
+// The radius is in the kNN ranking metric (degrees of latitude, longitude scaled
+// by cos(query lat)), NOT metres: the module has no great-circle distance.
+var around: [256]geoindex.Neighbor = undefined;
+const wr = try f.within(49.2, 16.6, 0.05, &around, .{}); // wr.status as for bbox
+
+// filter — a predicate applied during bbox / within / knn; knn still returns
+// the k nearest points that PASS. `ctx` is passed back to `func`.
+// const flt = geoindex.Filter{ .ctx = &state, .func = myPredicate }; // fn(?*anyopaque, Match) bool
+// _ = try f.knn(49.2, 16.6, 10, &near, &scratch, .{ .filter = flt });
 ```
 
 `Match`/`Neighbor` carry the stored `value` and exact `lat`/`lon`; nothing

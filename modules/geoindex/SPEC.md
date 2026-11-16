@@ -298,8 +298,8 @@ authenticity matters.
 
 ## Backlog / deferred
 
-- (survey 2026-09-30) **Radius / max-distance query** — `kdbush.within`, geoflatbush `maxDistance`; "everything within 500 m" is the most common geo lookup and kNN with a guessed `k` is a poor substitute. Effort: small (best-first walk with a distance cap). Fits CONVENTIONS §2.
+- (survey 2026-09-30) ✅ DONE 2026-11-16 (`Frozen.within(lat, lon, radius, out, opts)`: planar-in-ranking-metric radius, degrees, NOT metres/great-circle since the module has none; results carry `dist2`, unordered; status as bbox) **Radius / max-distance query** — `kdbush.within`, geoflatbush `maxDistance`; "everything within 500 m" is the most common geo lookup and kNN with a guessed `k` is a poor substitute. Effort: small (best-first walk with a distance cap). Fits CONVENTIONS §2.
 - (survey 2026-09-30) **Great-circle (haversine) kNN and results in metres** — `Neighbor.dist2` is an unscaled proxy that degrades away from the query latitude and near the poles; geoflatbush returns km. Effort: medium (spherical box lower bound, already listed under *Deliberately deferred*). Fits §2.
 - (survey 2026-09-30) **Rectangle items (extents)** — Flatbush indexes boxes as its main case (footprints, tiles); this index holds points. Effort: medium-large (format change: leaf boxes). Fits §2.
 - (survey 2026-09-30) **Antimeridian-wrapping bbox** — a query crossing ±180 must be split by the caller. Effort: small (split inside `bbox`). Fits §2 (already listed above).
-- (survey 2026-09-30) **Filter callback / predicate on kNN and bbox** — geoflatbush `filterFn`; the caller currently over-fetches. Effort: small. Fits §2.
+- (survey 2026-09-30) ✅ DONE 2026-11-16 (`QueryOptions.filter: ?Filter{ctx, func(ctx, Match) bool}` applied in bbox, within and knn; knn still returns k passing items) **Filter callback / predicate on kNN and bbox** — geoflatbush `filterFn`; the caller currently over-fetches. Effort: small. Fits §2.
