@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 4.0 Ed448/X448 (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-18 · mutation 2026-10-04 (56/58, 2 eq) · src ?
+**Audit:** review 2026-07-18 · mutation 2026-10-04 (56/58, 2 eq) · src 21dcdf9acf36dd37
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean per harness, ED448_FUZZ) · ct 2026-11-13 (ctgrind: full 3, ladder 0, decaf448 scalarmul 0 — unchanged; select masks laundered) · panic 2026-11-13 (sweep of every pub entry point of field/scalar/ed448/x448: `Point.toBytes` of a `z = 0` point is total instead of `unreachable`; `Fe.random` redraws at most 64 times, so a broken `io` no longer hangs it; a hand-built `Fe` with a limb over 2^57 is a documented contract violation)
 
@@ -371,6 +371,10 @@ final swap, `z = 0`, top bit); field canonical check, the fold rounds,
   the last `swap` is always 0); `reduceAfterFold`'s third round (by the bound
   argument in its doc comment, round 2's fold never pushes a limb past
   2^56 − 1, so round 3 never changes a limb).
+
+**Audit 2026-11-17.** Tests added only (RFC 8032 + Wycheproof), production code unchanged: no mutants were run
+for this commit; the 2026-10-04 mutation counts stand and the card's `src` hash is refreshed over the tree that
+now holds the new vectors.
 
 ## Performance
 
