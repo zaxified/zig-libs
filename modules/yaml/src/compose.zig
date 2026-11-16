@@ -804,7 +804,14 @@ fn resolveTagged(alloc: std.mem.Allocator, text: []const u8, tag: []const u8) Er
         // is the float 1.0 without a separate integer path.
         return parseFloat(text) orelse error.BadTaggedScalar;
     }
-    if (std.mem.eql(u8, tag, yaml11_binary)) return .{ .string = try decodeBinary(alloc, text) };
+    if (std.mem.eql(u8, tag, yaml11_binary)) {
+        // Validated, then kept as its base64 text, as the suite expects
+        // (565N's in.json); `decodeBinary` gives the bytes. Keeping the text
+        // also keeps `.string` printable for `emit`.
+        const bytes = try decodeBinary(alloc, text);
+        alloc.free(bytes);
+        return .{ .string = text };
+    }
     if (std.mem.eql(u8, tag, yaml11_timestamp)) {
         // Validated, then kept as its text (the `Value` model has no
         // timestamp variant); `parseTimestamp` gives the fields.
@@ -820,9 +827,11 @@ const yaml11_binary = "tag:yaml.org,2002:binary";
 const yaml11_timestamp = "tag:yaml.org,2002:timestamp";
 
 /// `!!binary`: standard base64 (padding required) with ASCII whitespace
-/// (space, tab, CR, LF) ignored anywhere, per the YAML 1.1 type spec. The
-/// decoded bytes are the `.string` value. Bad base64 is `BadTaggedScalar`.
-fn decodeBinary(alloc: std.mem.Allocator, text: []const u8) Error![]const u8 {
+/// (space, tab, CR, LF) ignored anywhere, per the YAML 1.1 type spec. Returns
+/// the decoded bytes, owned by the caller (`alloc`); bad base64 is
+/// `BadTaggedScalar`. A `!!binary` scalar's `.string` is its text, checked by
+/// this on load.
+pub fn decodeBinary(alloc: std.mem.Allocator, text: []const u8) Error![]const u8 {
     const clean = try alloc.alloc(u8, text.len);
     defer alloc.free(clean);
     var n: usize = 0;
@@ -1201,11 +1210,17 @@ test "a core tag whose body does not match is rejected" {
     try testing.expectError(error.BadTaggedScalar, single("x: !!bool maybe\n"));
 }
 
-test "!!binary decodes base64, ignoring whitespace" {
+test "!!binary keeps its text; decodeBinary gives the bytes, ignoring whitespace" {
     const r = try single("a: !!binary |\n  R0lG\n  ODlh\nb: !!binary \"aGVs bG8=\"\nc: !!binary \"\"\n");
     defer r.deinit();
-    try testing.expectEqualStrings("GIF89a", r.root.get("a").?.string);
-    try testing.expectEqualStrings("hello", r.root.get("b").?.string);
+    try testing.expectEqualStrings("R0lG\nODlh\n", r.root.get("a").?.string);
+    try testing.expectEqualStrings("aGVs bG8=", r.root.get("b").?.string);
+    const a = try decodeBinary(testing.allocator, r.root.get("a").?.string);
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("GIF89a", a);
+    const b = try decodeBinary(testing.allocator, r.root.get("b").?.string);
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("hello", b);
     try testing.expectEqualStrings("", r.root.get("c").?.string);
 }
 
