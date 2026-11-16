@@ -161,6 +161,7 @@ structure checks, and ext-value charsets other than UTF-8 (RFC 8187 reserves the
   (Searched: `rg -n 'media|anchor' modules/linkheader/src/root.zig` finds them in doc comments and tests only, never in `Link`.)
 - **`title*` extended notation (RFC 8187) and a helper to unescape quoted values** *(survey 2026-09-30)*: RFC 8288 §3.4.1's
   encoded title (non-ASCII text) is not decoded, and `\"` escapes stay in the returned slice. Effort: small (percent-decode into a caller buffer). Fits §2: yes.
+  ✅ DONE 2026-11-16 (already built 2026-10-04, backlog line was stale: `decodeExtValue(out, raw)` percent-decodes UTF-8 ext-values into a caller buffer (`InvalidExtValue`/`InvalidUtf8`/`NoSpaceLeft`; other charsets are `UnsupportedCharset`, RFC 8187 §3.2.1), `unquote(out, value)` removes quoted-string `\` escapes, `Link.preferredTitle(out)` combines both; tests at `src/root.zig` "unquote", "RFC 8187", "preferredTitle").
 - **Relative-reference targets** *(survey 2026-09-30)*: URIs pass through verbatim and are never resolved against a base
   (RFC 8288 §3.1); a client following `rel="next"` must resolve by hand, likely with `http`/a URI module. Effort: depends on a URI-resolution module in the catalog (not checked). Low priority.
 
