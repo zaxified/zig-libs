@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Batch speed (third round, bit for bit unchanged, NaN inputs included): PERCENTILE and MEDIAN find their
+  positions in the sorted window by counting with four-lane compares (`<=` and `<`, one pass for the new and the leaving value,
+  the position shared by the answer and the shift) instead of binary searches whose probes mispredict, and shift with
+  `@memmove`; once a NaN has entered a window the order is broken and the cores keep the searches for good, so their answers
+  there are unchanged too — PERCENTILE 2.5x TA-Lib before, 1.19x now; MEDIAN 1.34x -> 0.64x.
 - **2026-11-16** — Batch speed (third round, bit for bit unchanged): the variance window `bands.VarCore` gains `steadyStep` (the
   full-window step without the warm-up tests and the `?f64`, its running-peak update a vector select instead of the branch LLVM
   made of the ternary); VAR and STDDEV run it as a `steadyRun` loop, BBANDS from its first output on — VAR 2.1x TA-Lib before,

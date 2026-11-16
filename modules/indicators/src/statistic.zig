@@ -789,27 +789,79 @@ fn lowerBound(s: []const f64, x: f64) usize {
     }
     return lo;
 }
-/// Insert `x` into the sorted prefix `s[0..len]` (after its equals).
-fn sortedInsert(s: []f64, len: usize, x: f64) void {
-    var j = upperBound(s[0..len], x);
-    const pos = j;
-    j = len;
-    while (j > pos) : (j -= 1) s[j] = s[j - 1];
+/// How many values of `s` are `<= x` (`le`) or `< x`: on a sorted `s` without NaN that is `upperBound` /
+/// `lowerBound`, found by one pass of four-lane compares instead of a search whose every probe is a branch a
+/// random walk mispredicts half the time. Only for a NaN-free `s` (a NaN breaks the order, and then the search's
+/// answer depends on its probe sequence: the callers keep the searches for that case).
+fn countCmp(s: []const f64, x: f64, comptime le: bool) usize {
+    const L = 4;
+    const V = @Vector(L, f64);
+    const U = @Vector(L, u64);
+    const xv: V = @splat(x);
+    const one: U = @splat(1);
+    const zero: U = @splat(0);
+    var acc: U = zero;
+    var i: usize = 0;
+    while (i + L <= s.len) : (i += L) {
+        const v: V = s[i..][0..L].*;
+        acc += @select(u64, if (le) v <= xv else v < xv, one, zero);
+    }
+    var c: usize = @reduce(.Add, acc);
+    while (i < s.len) : (i += 1) c += @intFromBool(if (le) s[i] <= x else s[i] < x);
+    return c;
+}
+/// `upperBound(s, x)` and `lowerBound(s, old)` of a sorted, NaN-free `s` in one pass of `countCmp`'s compares.
+fn countBoth(s: []const f64, x: f64, old: f64) [2]usize {
+    const L = 4;
+    const V = @Vector(L, f64);
+    const U = @Vector(L, u64);
+    const xv: V = @splat(x);
+    const ov: V = @splat(old);
+    const one: U = @splat(1);
+    const zero: U = @splat(0);
+    var le: U = zero;
+    var lt: U = zero;
+    var i: usize = 0;
+    while (i + L <= s.len) : (i += L) {
+        const v: V = s[i..][0..L].*;
+        le += @select(u64, v <= xv, one, zero);
+        lt += @select(u64, v < ov, one, zero);
+    }
+    var a: usize = @reduce(.Add, le);
+    var b: usize = @reduce(.Add, lt);
+    while (i < s.len) : (i += 1) {
+        a += @intFromBool(s[i] <= x);
+        b += @intFromBool(s[i] < old);
+    }
+    return .{ a, b };
+}
+/// `upperBound`, by `countCmp` while `clean` (no NaN has entered `s`).
+inline fn upperIdx(s: []const f64, x: f64, clean: bool) usize {
+    return if (clean) countCmp(s, x, true) else upperBound(s, x);
+}
+/// Insert `x` into the sorted prefix `s[0..len]` (after its equals). `clean`: no NaN in `s[0..len]` nor `x`.
+fn sortedInsert(s: []f64, len: usize, x: f64, clean: bool) void {
+    const pos = upperIdx(s[0..len], x, clean);
+    @memmove(s[pos + 1 .. len + 1], s[pos..len]);
     s[pos] = x;
 }
 /// Replace `old` (the first of its run of equals, i.e. the oldest) by `new`
 /// (after the equals of `new`) in the sorted `s` with one shift.
 fn sortedReplace(s: []f64, old: f64, new: f64) void {
     if (s.len == 0) return;
-    const pos = upperBound(s, new);
     // `old` is in `s` unless a NaN has been compared into the order (`<` and `<=` are false for it, so
     // the search can end at `s.len`): then the last slot goes, which keeps every index below in range.
-    var j = @min(lowerBound(s, old), s.len - 1);
+    replaceAt(s, upperBound(s, new), lowerBound(s, old), new);
+}
+/// The shift of `sortedReplace` once its two positions are known: `pos` = `upperBound(s, new)`, `low` =
+/// `lowerBound(s, old)` (clamped here to the last slot).
+fn replaceAt(s: []f64, pos: usize, low: usize, new: f64) void {
+    const j = @min(low, s.len - 1);
     if (j < pos) {
-        while (j + 1 < pos) : (j += 1) s[j] = s[j + 1];
+        @memmove(s[j .. pos - 1], s[j + 1 .. pos]);
         s[pos - 1] = new;
     } else {
-        while (j > pos) : (j -= 1) s[j] = s[j - 1];
+        @memmove(s[pos + 1 .. j + 1], s[pos..j]);
         s[pos] = new;
     }
 }
@@ -834,6 +886,8 @@ pub const MedianCore = struct {
     n: usize = 0,
     p: usize,
     sorted: []f64,
+    /// No NaN has entered the window yet, so `sorted` is ordered and the searches can be counts.
+    clean: bool = true,
 
     pub fn validate(p: Params) Error!void {
         if (p.period < 2 or p.period > 10000) return error.BadParam;
@@ -854,7 +908,11 @@ pub const MedianCore = struct {
     }
     fn compute(self: *const MedianCore, x: f64) f64 {
         const retained = self.sorted[0 .. self.p - 1];
-        const pos = upperBound(retained, x);
+        return self.computeAt(x, upperIdx(retained, x, self.clean and !std.math.isNan(x)));
+    }
+    /// `compute` with `pos = upperBound(retained, x)` given.
+    fn computeAt(self: *const @This(), x: f64, pos: usize) f64 {
+        const retained = self.sorted[0 .. self.p - 1];
         const lo_idx = (self.p - 1) / 2;
         const hi_idx = self.p / 2;
         const lower = if (lo_idx < pos) retained[lo_idx] else if (lo_idx == pos) x else retained[lo_idx - 1];
@@ -869,12 +927,23 @@ pub const MedianCore = struct {
     pub fn step(self: *MedianCore, src: anytype, b: In) ?f64 {
         const n = self.n;
         self.n += 1;
+        if (std.math.isNan(b.x)) self.clean = false; // for good: a NaN may stay in `sorted` (see sortedReplace)
         if (n + 1 < self.p) {
-            sortedInsert(self.sorted, n, b.x);
+            sortedInsert(self.sorted, n, b.x, self.clean);
             return null;
         }
+        const retained = self.sorted[0 .. self.p - 1];
+        const old = src.at(n + 1 - self.p).x;
+        if (retained.len == 0) return self.compute(b.x);
+        if (self.clean) {
+            // One pass gives both positions; `upperBound(retained, x)` serves the answer and the shift.
+            const pos, const low = countBoth(retained, b.x, old);
+            const out = self.computeAt(b.x, pos);
+            replaceAt(retained, pos, low, b.x);
+            return out;
+        }
         const out = self.compute(b.x);
-        sortedReplace(self.sorted[0 .. self.p - 1], src.at(n + 1 - self.p).x, b.x);
+        sortedReplace(retained, old, b.x);
         return out;
     }
 };
@@ -910,6 +979,8 @@ pub const PercentileCore = struct {
     p: usize,
     rank: usize,
     sorted: []f64,
+    /// As `MedianCore.clean`.
+    clean: bool = true,
 
     pub fn validate(p: Params) Error!void {
         if (p.period < 2 or p.period > 10000) return error.BadParam;
@@ -933,7 +1004,11 @@ pub const PercentileCore = struct {
     }
     fn compute(self: *const PercentileCore, x: f64) f64 {
         const retained = self.sorted[0 .. self.p - 1];
-        const pos = upperBound(retained, x);
+        return self.computeAt(x, upperIdx(retained, x, self.clean and !std.math.isNan(x)));
+    }
+    /// `compute` with `pos = upperBound(retained, x)` given.
+    fn computeAt(self: *const @This(), x: f64, pos: usize) f64 {
+        const retained = self.sorted[0 .. self.p - 1];
         const k = self.rank - 1;
         if (k < pos) return retained[k];
         if (k == pos) return x;
@@ -946,12 +1021,23 @@ pub const PercentileCore = struct {
     pub fn step(self: *PercentileCore, src: anytype, b: In) ?f64 {
         const n = self.n;
         self.n += 1;
+        if (std.math.isNan(b.x)) self.clean = false; // for good: a NaN may stay in `sorted` (see sortedReplace)
         if (n + 1 < self.p) {
-            sortedInsert(self.sorted, n, b.x);
+            sortedInsert(self.sorted, n, b.x, self.clean);
             return null;
         }
+        const retained = self.sorted[0 .. self.p - 1];
+        const old = src.at(n + 1 - self.p).x;
+        if (retained.len == 0) return self.compute(b.x);
+        if (self.clean) {
+            // One pass gives both positions; `upperBound(retained, x)` serves the answer and the shift.
+            const pos, const low = countBoth(retained, b.x, old);
+            const out = self.computeAt(b.x, pos);
+            replaceAt(retained, pos, low, b.x);
+            return out;
+        }
         const out = self.compute(b.x);
-        sortedReplace(self.sorted[0 .. self.p - 1], src.at(n + 1 - self.p).x, b.x);
+        sortedReplace(retained, old, b.x);
         return out;
     }
 };
