@@ -781,6 +781,17 @@ pub const V3Client = struct {
         return .{ .client = c, .root = root, .current = root };
     }
 
+    /// GetBulk-driven subtree walk, v3 flavour. Uses
+    /// `client_mod.default_max_repetitions`.
+    pub fn bulkWalker(c: *V3Client, root: Oid) BulkWalker {
+        return c.bulkWalkerWith(root, client_mod.default_max_repetitions);
+    }
+
+    /// As `bulkWalker` with an explicit max-repetitions (>= 1).
+    pub fn bulkWalkerWith(c: *V3Client, root: Oid, max_repetitions: u16) BulkWalker {
+        return .{ .client = c, .root = root, .current = root, .max_repetitions = max_repetitions };
+    }
+
     // ── counters ────────────────────────────────────────────────────────────
 
     fn allocMsgId(c: *V3Client) i32 {
@@ -833,6 +844,54 @@ pub const Walker = struct {
         }
         w.current = vb.name;
         return vb;
+    }
+};
+
+/// GetBulk-driven subtree iterator over a `V3Client` — the v3 twin of
+/// `client.BulkWalker`, with the same stop rules and OID-increase guard.
+pub const BulkWalker = struct {
+    client: *V3Client,
+    root: Oid,
+    current: Oid,
+    max_repetitions: u16,
+    batch: ?message.VarBindList.Iterator = null,
+    batch_yielded: bool = false,
+    finished: bool = false,
+
+    pub const WalkError = Error || error{ OidNotIncreasing, RequestFailed, InvalidMaxRepetitions };
+
+    // secret-api-ok: iterator over `V3Client.getBulk`; the keys are used only inside the burned usm/priv calls that request makes.
+    pub fn next(w: *BulkWalker) WalkError!?VarBind {
+        return w.step() catch |err| {
+            w.finished = true; // never loop on a failing agent
+            return err;
+        };
+    }
+
+    fn step(w: *BulkWalker) WalkError!?VarBind {
+        while (true) {
+            if (w.finished) return null;
+            if (w.batch == null) {
+                if (w.max_repetitions == 0) return error.InvalidMaxRepetitions;
+                const resp = try w.client.getBulk(0, w.max_repetitions, &.{w.current});
+                if (resp.error_status != .no_error) return error.RequestFailed;
+                w.batch = resp.varbinds.iterator();
+                w.batch_yielded = false;
+            }
+            const vb = (try w.batch.?.next()) orelse {
+                if (!w.batch_yielded) w.finished = true;
+                w.batch = null;
+                continue;
+            };
+            if (vb.value == .end_of_mib_view or !vb.name.startsWith(&w.root)) {
+                w.finished = true;
+                return null;
+            }
+            if (vb.name.order(&w.current) != .gt) return error.OidNotIncreasing;
+            w.current = vb.name;
+            w.batch_yielded = true;
+            return vb;
+        }
     }
 };
 
@@ -1623,6 +1682,69 @@ test "walker: subtree walk over v3 stops at the boundary" {
     }
     try testing.expectEqual(@as(usize, 2), seen);
     try testing.expectEqual(@as(?VarBind, null), try w.next());
+}
+
+test "bulkWalker: subtree walk over v3 in batches, stops at the boundary" {
+    const BulkWalkAgent = struct {
+        inner: FakeAgent,
+        table: []const VarBind,
+        calls: usize = 0,
+        buf: [8]VarBind = undefined,
+
+        fn exchangeFn(ctx: *anyopaque, req: []const u8, reply_buf: []u8) client_mod.TransportError!usize {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            const m = v3.decode(req) catch return error.TransportFailed;
+            if (m.data == .plaintext) {
+                const sp = m.data.plaintext;
+                if (sp.pdu == .get_bulk_request) {
+                    s.calls += 1;
+                    const bp = sp.pdu.get_bulk_request;
+                    var it = bp.varbinds.iterator();
+                    if (it.next() catch null) |asked| {
+                        var n: usize = 0;
+                        for (s.table) |e| {
+                            if (n >= bp.max_repetitions) break;
+                            if (e.name.order(&asked.name) == .gt) {
+                                s.buf[n] = e;
+                                n += 1;
+                            }
+                        }
+                        if (n == 0) {
+                            s.buf[0] = .{ .name = asked.name, .value = .end_of_mib_view };
+                            n = 1;
+                        }
+                        s.inner.values = s.buf[0..n];
+                    }
+                }
+            }
+            return FakeAgent.exchangeFn(&s.inner, req, reply_buf);
+        }
+    };
+    const table = [_]VarBind{
+        .{ .name = try Oid.parse("1.3.6.1.2.1.2.2.1.2.1"), .value = .{ .octet_string = "lo" } },
+        .{ .name = try Oid.parse("1.3.6.1.2.1.2.2.1.2.2"), .value = .{ .octet_string = "eth0" } },
+        .{ .name = try Oid.parse("1.3.6.1.2.1.2.2.1.2.3"), .value = .{ .octet_string = "eth1" } },
+        .{ .name = try Oid.parse("1.3.6.1.2.1.31.1.1.1.1.1"), .value = .{ .octet_string = "lo" } },
+    };
+    var wa: BulkWalkAgent = .{ .inner = .{ .user = .{ .name = "plain" } }, .table = &table };
+    var c = V3Client.init(
+        .{ .ctx = &wa, .exchangeFn = BulkWalkAgent.exchangeFn },
+        .{ .name = "plain" },
+        .{},
+    );
+    try c.discover();
+    var w = c.bulkWalkerWith(try Oid.parse("1.3.6.1.2.1.2.2.1.2"), 2);
+    var seen: usize = 0;
+    while (try w.next()) |vb| {
+        seen += 1;
+        try testing.expect(vb.value == .octet_string);
+    }
+    try testing.expectEqual(@as(usize, 3), seen);
+    try testing.expectEqual(@as(usize, 2), wa.calls);
+    try testing.expectEqual(@as(?VarBind, null), try w.next());
+
+    var w0 = c.bulkWalkerWith(try Oid.parse("1.3.6.1.2.1.2.2.1.2"), 0);
+    try testing.expectError(error.InvalidMaxRepetitions, w0.next());
 }
 
 test "too many oids -> TooManyOids without touching the transport" {

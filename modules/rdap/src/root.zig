@@ -66,32 +66,59 @@ pub const max_url_len = 2048;
 
 // ── query URL construction (RFC 9082/7482) ──────────────────────────────────
 
-/// The five RDAP lookup path segments (RFC 9082 §3.1).
+/// The RDAP query kinds: the five lookups of RFC 9082 §3.1, plus `.help`
+/// (§3.1.6 "help" path) and `.tld`.
 pub const QueryType = enum {
     domain,
     ip,
     autnum,
     nameserver,
     entity,
+    /// Server help: path `help`; takes no value (any value passed is
+    /// ignored, so "" is fine).
+    help,
+    /// A top-level-domain query: the same `domain/<tld>` path as `.domain`,
+    /// meant for a *root* RDAP server (icann-rdap's TLD query). The value is
+    /// the TLD label ("com"); one leading "." is dropped (".com" -> "com").
+    tld,
 
-    /// The URL path segment, e.g. `.domain` → "domain".
+    /// The URL path segment, e.g. `.domain` -> "domain", `.tld` -> "domain".
     pub fn segment(t: QueryType) []const u8 {
-        return @tagName(t);
+        return switch (t) {
+            .tld => "domain",
+            else => @tagName(t),
+        };
     }
 };
 
 pub const PathError = error{ PathTooLong, EmptyQuery };
 pub const UrlError = error{ UrlTooLong, EmptyQuery, BadBase };
 
-/// Build the query path `<segment>/<percent-encoded value>` into `buf`.
-/// Unreserved characters (RFC 3986 §2.3) and `:` (IPv6 literals) pass
-/// through; everything else — including the `/` of a CIDR — is
-/// percent-encoded.
+/// The value actually encoded for `t`: "" for `.help`, the TLD without one
+/// leading dot for `.tld`, `value` otherwise. Empty result = no value
+/// (an error for every type but `.help`).
+fn queryValue(t: QueryType, value: []const u8) []const u8 {
+    return switch (t) {
+        .help => "",
+        .tld => if (value.len > 0 and value[0] == '.') value[1..] else value,
+        else => value,
+    };
+}
+
+/// Build the query path `<segment>/<percent-encoded value>` into `buf`
+/// (`help`: just "help"). Unreserved characters (RFC 3986 §2.3) and `:`
+/// (IPv6 literals) pass through; everything else — including the `/` of a
+/// CIDR — is percent-encoded.
 pub fn buildPath(buf: []u8, query_type: QueryType, value: []const u8) PathError![]const u8 {
-    if (value.len == 0) return error.EmptyQuery;
+    const v = queryValue(query_type, value);
     var w: std.Io.Writer = .fixed(buf);
+    if (query_type == .help) {
+        w.writeAll("help") catch return error.PathTooLong;
+        return w.buffered();
+    }
+    if (v.len == 0) return error.EmptyQuery;
     w.print("{s}/", .{query_type.segment()}) catch return error.PathTooLong;
-    writeEncoded(&w, value) catch return error.PathTooLong;
+    writeEncoded(&w, v) catch return error.PathTooLong;
     return w.buffered();
 }
 
@@ -104,12 +131,17 @@ pub fn buildUrl(
     value: []const u8,
 ) UrlError![]const u8 {
     if (base.len == 0) return error.BadBase;
-    if (value.len == 0) return error.EmptyQuery;
+    const v = queryValue(query_type, value);
+    if (v.len == 0 and query_type != .help) return error.EmptyQuery;
     var w: std.Io.Writer = .fixed(buf);
     w.writeAll(base) catch return error.UrlTooLong;
     if (base[base.len - 1] != '/') w.writeByte('/') catch return error.UrlTooLong;
+    if (query_type == .help) {
+        w.writeAll("help") catch return error.UrlTooLong;
+        return w.buffered();
+    }
     w.print("{s}/", .{query_type.segment()}) catch return error.UrlTooLong;
-    writeEncoded(&w, value) catch return error.UrlTooLong;
+    writeEncoded(&w, v) catch return error.UrlTooLong;
     return w.buffered();
 }
 
@@ -1289,6 +1321,32 @@ test "Accept header carries the RDAP media type (RFC 7480 §4.2)" {
     try testing.expectEqualStrings("application/rdap+json", media_type);
     try testing.expectEqualStrings("Accept", accept_header.name);
     try testing.expectEqualStrings(media_type, accept_header.value);
+}
+
+test "help and TLD queries (root-server paths)" {
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("help", try buildPath(&buf, .help, ""));
+    try testing.expectEqualStrings("help", try buildPath(&buf, .help, "ignored"));
+    try testing.expectEqualStrings("domain/com", try buildPath(&buf, .tld, "com"));
+    try testing.expectEqualStrings("domain/com", try buildPath(&buf, .tld, ".com"));
+    try testing.expectEqualStrings("domain/xn--p1ai", try buildPath(&buf, .tld, "xn--p1ai"));
+    try testing.expectEqualStrings("domain/%D1%80%D1%84", try buildPath(&buf, .tld, "\xd1\x80\xd1\x84"));
+    try testing.expectError(error.EmptyQuery, buildPath(&buf, .tld, ""));
+    try testing.expectError(error.EmptyQuery, buildPath(&buf, .tld, "."));
+    try testing.expectEqualStrings(
+        "https://root.rdap.example/help",
+        try buildUrl(&buf, "https://root.rdap.example", .help, ""),
+    );
+    try testing.expectEqualStrings(
+        "https://root.rdap.example/domain/org",
+        try buildUrl(&buf, "https://root.rdap.example/", .tld, ".org"),
+    );
+    try testing.expectError(error.EmptyQuery, buildUrl(&buf, "https://r.example/", .tld, "."));
+    try testing.expectError(error.BadBase, buildUrl(&buf, "", .help, ""));
+    var tiny: [3]u8 = undefined;
+    try testing.expectError(error.PathTooLong, buildPath(&tiny, .help, ""));
+    try testing.expectError(error.UrlTooLong, buildUrl(&tiny, "https://r.example/", .help, ""));
+    try testing.expectError(error.UrlTooLong, buildUrl(&tiny, "https://r.example/", .tld, "com"));
 }
 
 test "buildUrl joins base with and without trailing slash" {
