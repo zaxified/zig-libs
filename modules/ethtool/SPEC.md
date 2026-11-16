@@ -6,7 +6,7 @@
 
 **Scope:** core — ethtool(8) 6.19 (surveyed 2026-09-30); raised from mvp 2026-09-30 with `-i` drvinfo and `-S` driver stats over ioctl
 
-**Audit:** review 2026-09-02 · mutation 2026-11-17 (36/42, 6 eq) · src ?
+**Audit:** review 2026-09-02 · mutation 2026-11-17 (36/42, 6 eq) · src 332ff252c0f96dc6
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ETHTOOL_FUZZ) · ct n/a — netlink ethtool queries (keyword review, 2026-10-07)
 

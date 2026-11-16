@@ -6,7 +6,7 @@
 
 **Scope:** mvp — iproute2 tc 6.19 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-17 (70/70) · src ?
+**Audit:** review 2026-09-15 · mutation 2026-11-17 (70/70) · src fd8da86adbef3dd6
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, TC_FUZZ) · ct n/a — traffic control netlink (keyword review, 2026-10-07)
 
