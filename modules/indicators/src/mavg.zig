@@ -762,6 +762,13 @@ pub const HmaCore = struct {
             return;
         }
         if (i >= in.len) return;
+        // Every average at least 2 bars long (period >= 4): the first bar steps as below, the rest as one TA-Lib
+        // shaped loop (`flatRun`).
+        if (self.p >= 4 and i + 1 < in.len) {
+            self.steadyRun(T, in[0 .. i + 1], out, i);
+            self.flatRun(T, in, out, i + 1);
+            return;
+        }
         const Off = struct {
             xs: []const T,
             off: usize,
@@ -806,7 +813,123 @@ pub const HmaCore = struct {
             if (ri == self.s) ri = 0;
         }
     }
+    /// `steadyRun` over bars `i..` when all three averages are at least 2 bars long and bar `i - 1` was stepped:
+    /// the same operations in the same order as the three `WmaCore.steadyStep`s, with the state in locals and no
+    /// per-bar bookkeeping of the cores. The value each average drops (its `trailing`) is the one it dropped
+    /// from the window a bar earlier, so it is re-read from the input (the ring slot about to be overwritten, for
+    /// the outer average) instead of being carried; a re-anchor is due at a bar number instead of a count-down.
+    fn flatRun(self: *HmaCore, comptime T: type, in: []const T, out: []T, i: usize) void {
+        const P = self.full.p;
+        const H = self.half.p;
+        const S = self.s;
+        const pf_p = pf(P);
+        const pf_h = pf(H);
+        const pf_s = pf(S);
+        const div_f = self.full.divider;
+        const div_h = self.half.divider;
+        const div_o = self.outer.divider;
+        var sum_f = self.full.sum;
+        var sub_f = self.full.sub;
+        var sum_h = self.half.sum;
+        var sub_h = self.half.sub;
+        var sum_o = self.outer.sum;
+        var sub_o = self.outer.sub;
+        // `since` counts down to the re-anchor on the step where it reaches 0: from bar `i` that is bar `i + since - 1`.
+        var due_f = i + self.full.since - 1;
+        var due_h = i + self.half.since - 1;
+        var due_o = i + self.outer.since - 1;
+        const dring = &self.dring;
+        var ri = (i - (self.p - 1)) % S; // slot of the outer average's current bar
+        const Win = struct {
+            xs: []const T,
+            b: usize,
+            pub inline fn at(w: @This(), k: usize) f64 {
+                return w.xs[w.b + k];
+            }
+        };
+        const RWin = struct {
+            buf: *const [hma_max_ring]f64,
+            s: usize,
+            first: usize, // slot of the oldest value
+            pub inline fn at(w: @This(), k: usize) f64 {
+                const j = w.first + k;
+                return w.buf[if (j >= w.s) j - w.s else j];
+            }
+        };
+        var n = i;
+        while (n < in.len) : (n += 1) {
+            const x: f64 = in[n];
+            // full average (period P over `in`)
+            sub_f += x;
+            sub_f -= @as(f64, in[n - P]);
+            sum_f += x * pf_p;
+            if (n == due_f) {
+                due_f += 8 * P;
+                sub_f, sum_f = wmaRebuild(Win{ .xs = in, .b = n + 1 - P }, P);
+            }
+            const f = sum_f / div_f;
+            sum_f -= sub_f;
+            // half average (period H, the window `in[n + 1 - H .. n]`)
+            sub_h += x;
+            sub_h -= @as(f64, in[n - H]);
+            sum_h += x * pf_h;
+            if (n == due_h) {
+                due_h += 8 * H;
+                sub_h, sum_h = wmaRebuild(Win{ .xs = in, .b = n + 1 - H }, H);
+            }
+            const h = sum_h / div_h;
+            sum_h -= sub_h;
+            // outer average (period S over the de-lagged values in `dring`)
+            const diff = 2.0 * h - f;
+            const old = dring[ri];
+            dring[ri] = diff;
+            sub_o += diff;
+            sub_o -= old;
+            sum_o += diff * pf_s;
+            if (n == due_o) {
+                due_o += 8 * S;
+                sub_o, sum_o = wmaRebuild(RWin{ .buf = dring, .s = S, .first = if (ri + 1 == S) 0 else ri + 1 }, S);
+            }
+            out[n] = core.to(T, sum_o / div_o);
+            sum_o -= sub_o;
+            ri += 1;
+            if (ri == S) ri = 0;
+        }
+        // Hand the state back as the cores would hold it after stepping every bar (batch only reads `n`, but a
+        // core is a core).
+        const steps = in.len - i;
+        const last = in.len - 1;
+        self.full.n += steps;
+        self.half.n += steps;
+        self.outer.n += steps;
+        self.full.since = due_f - in.len + 1;
+        self.half.since = due_h - in.len + 1;
+        self.outer.since = due_o - in.len + 1;
+        self.full.sum = sum_f;
+        self.full.sub = sub_f;
+        self.full.trailing = in[last + 1 - P];
+        self.half.sum = sum_h;
+        self.half.sub = sub_h;
+        self.half.trailing = in[last + 1 - H];
+        self.outer.sum = sum_o;
+        self.outer.sub = sub_o;
+        self.outer.trailing = dring[ri]; // the oldest value of the window, the slot the next bar overwrites
+    }
 };
+
+/// One re-anchor of a `WmaCore` (`steadyStep`'s rebuild): the plain and the weighted sum of `win` in order.
+inline fn wmaRebuild(win: anytype, len: usize) [2]f64 {
+    var sub: f64 = 0.0;
+    var sum: f64 = 0.0;
+    var rw: f64 = 1.0;
+    for (0..len) |k| {
+        const t = win.at(k);
+        sub += t;
+        sum += t * rw;
+        rw += 1.0;
+    }
+    return .{ sub, sum };
+}
 
 pub fn hmaLookback(p: HmaParams) Error!usize {
     try HmaCore.validate(p);
