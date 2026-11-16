@@ -419,7 +419,7 @@ here.
   table, and the announce round refuses a peer's (`StaleAuxMaterial`, culprit named) —
   `threshold_ecdsa.aux_info.reusesMaterial` against every old entry. Keygen frames are kept out of
   a refresh by the run tag (F7); the announcement's proof context keeps one format for both.
-- **Echo-broadcast helper** (2026-09-30): the per-participant API assumes reliable broadcast; a small echo/hash-compare layer would let a plain point-to-point transport carry it. Effort: small-medium.
+- **Echo-broadcast helper** (2026-09-30) ✅ DONE 2026-11-16 (`echo.EchoBroadcast`: caller-slot accumulator `init/addReceived/missing/digest/check/firstMismatch`, domain-separated SHA-256 transcript digest; a mismatch names the disagreeing peer, not necessarily the equivocator).
 - **Serialisable in-flight state** (2026-09-30): a party that restarts mid-run starts over; a snapshot codec for `Participant`/`ReshareReceiver` would remove that. Effort: small-medium; must never persist secrets unwrapped.
 - ~~Aux-parameter exchange with correctness proofs~~ — done 2026-10-02 (`EcdsaKeygen`: Πprm/Πmod on Ñ, Πmod + Πfac on N, per party, before GJKR).
 - ~~**Context-bound Πprm/Πmod over Ñ**~~ ✅ 2026-10-02 (in `threshold_ecdsa`: `proveWellFormedBound`/`verifyWellFormedBound`, own FS domains): the announcement's Ñ proofs are bound to `session id || index`, so a copied `Ñ` with its proofs fails `verifyAnnouncement`; `findDuplicate` is now the second line.

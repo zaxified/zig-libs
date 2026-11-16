@@ -127,6 +127,11 @@ pub const ecdsa_refresh = @import("ecdsa_refresh.zig");
 pub const EcdsaRefresh = ecdsa_refresh.EcdsaRefresh;
 pub const EcdsaRefreshPhase = ecdsa_refresh.Phase;
 
+/// Echo-broadcast helper: hash-compare layer that lets a point-to-point
+/// transport carry the reliable broadcast the round APIs assume.
+pub const echo = @import("echo.zig");
+pub const EchoBroadcast = echo.EchoBroadcast;
+
 const protocol = @import("protocol.zig");
 pub const Corruption = protocol.Corruption;
 pub const DriverError = protocol.DriverError;
@@ -369,5 +374,6 @@ test {
     _ = wire;
     _ = participant;
     _ = reshare;
+    _ = echo;
     _ = @import("stackprobe_test.zig");
 }

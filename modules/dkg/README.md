@@ -43,6 +43,13 @@ params). `EcdsaKeygen` / `EcdsaRefresh` wrap the same machine into a full dealer
 correctness proofs (see `SPEC.md`). Out of scope: CGGMP21 signing-phase **identifiable abort** and distributed
 **aux-parameter** generation. See `SPEC.md`.
 
+## Echo broadcast over point-to-point
+
+`dkg.EchoBroadcast` (caller-provided `[]dkg.echo.Slot`, no allocation): after a broadcast round feed
+it the bytes received from each sender (`addReceived`), send `digest()` to every other party and
+`check(peer, digest)` / `firstMismatch` theirs; `error.Equivocation` means some sender gave
+different parties different bytes (it names the disagreeing peer, not necessarily the equivocator).
+
 ## One party over a real network
 
 ```zig
