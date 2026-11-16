@@ -439,7 +439,7 @@ consulted (root `NOTICE` §0).
 Survey findings (survey 2026-09-30), all fit CONVENTIONS §2 (pure, allocation-bounded); SPEC "Deliberately deferred" above stays authoritative for what is refused by design.
 
 - **FDB enumeration (survey 2026-09-30)** ✅ DONE 2026-11-16 (`Table.fdbIterator(isid, now)`, allocation-free, `{mac, pe, age, static, quarantined, expired}`) — an iterator or `dump(isid, out)` over `{mac, pe, age, static}`; the Linux bridge exposes this as `bridge fdb show` and every operator/debug tool needs it (today only point `lookup`, `fdbCount` exist). Effort: small.
-- **Learn/move/quarantine counters or event hook (survey 2026-09-30)** — the bridge and EVPN daemons notify on FDB change; here only the per-call `LearnOutcome` reports it. Effort: small.
+- ✅ **DONE 2026-11-16 (counters: `Table.learnStats()` / `resetLearnStats()`, one total per `LearnOutcome` plus each refusal; no event hook — the per-call `LearnOutcome` already is one):** **Learn/move/quarantine counters or event hook (survey 2026-09-30)** — the bridge and EVPN daemons notify on FDB change; here only the per-call `LearnOutcome` reports it. Effort: small.
 - **Local-port dimension (survey 2026-09-30)** — learning which *access* port a MAC sits behind, so a PE with several customer ports can unicast locally instead of delivering to all access circuits; a bridge does this natively. Effort: medium; changes the `Decision` shape (ask before starting).
 - **IGMP/MLD snooping (survey 2026-09-30)** — multicast currently floods like broadcast (`isBumAddress`); snooping limits it to interested PEs. Effort: large; probably belongs in a separate module.
 

@@ -398,6 +398,23 @@ const IsidEntry = struct {
     }
 };
 
+/// Running totals of `Table.learn`'s outcomes and refusals — what a bridge or
+/// EVPN daemon exports as FDB-change counters (learn, move, duplicate-MAC
+/// quarantine), for an operator who does not log every `LearnOutcome`.
+/// Saturating; `Table.resetLearnStats` zeroes them.
+pub const LearnStats = struct {
+    outcomes: std.enums.EnumArray(LearnOutcome, u64) = .initFill(0),
+    invalid_source_mac: u64 = 0,
+    unknown_isid: u64 = 0,
+    fdb_full: u64 = 0,
+    out_of_memory: u64 = 0,
+
+    /// How many `learn` calls ended in `outcome`.
+    pub fn count(s: LearnStats, outcome: LearnOutcome) u64 {
+        return s.outcomes.get(outcome);
+    }
+};
+
 /// The per-PE E-LAN forwarding table. `single_owner`: one thread/loop owns an
 /// instance; it holds no internal lock. Create with `init`, free with `deinit`.
 pub const Table = struct {
@@ -406,6 +423,8 @@ pub const Table = struct {
     /// drive once per frame — a test asserts on it rather than on a wall-clock
     /// ratio, which reads much the same with and without the fix.
     prune_sweeps: u64 = 0,
+    /// See `LearnStats`; read with `learnStats`.
+    learn_stats: LearnStats = .{},
     alloc: Allocator,
     options: Options,
     isids: std.AutoHashMapUnmanaged(Isid, IsidEntry) = .empty,
@@ -511,6 +530,30 @@ pub const Table = struct {
     /// The returned `LearnOutcome` is the caller's only notification of a MAC
     /// hijack; ignoring it (`_ = try …`) is choosing to run without one.
     pub fn learn(self: *Table, isid: Isid, src_mac: Mac, src_pe: PeId, now: Time) LearnError!LearnOutcome {
+        const st = &self.learn_stats;
+        const outcome = self.learnInner(isid, src_mac, src_pe, now) catch |e| {
+            switch (e) {
+                error.InvalidSourceMac => st.invalid_source_mac +|= 1,
+                error.UnknownIsid => st.unknown_isid +|= 1,
+                error.FdbFull => st.fdb_full +|= 1,
+                error.OutOfMemory => st.out_of_memory +|= 1,
+            }
+            return e;
+        };
+        st.outcomes.set(outcome, st.outcomes.get(outcome) +| 1);
+        return outcome;
+    }
+
+    /// Totals of every `learn` since `init` or the last `resetLearnStats`.
+    pub fn learnStats(self: *const Table) LearnStats {
+        return self.learn_stats;
+    }
+
+    pub fn resetLearnStats(self: *Table) void {
+        self.learn_stats = .{};
+    }
+
+    fn learnInner(self: *Table, isid: Isid, src_mac: Mac, src_pe: PeId, now: Time) LearnError!LearnOutcome {
         // IEEE 802.1D's learning process, and the Linux bridge
         // (`is_valid_ether_addr` in `br_handle_frame`), both refuse a frame
         // whose SOURCE is a group or all-zero address — the kernel drops it
@@ -2055,4 +2098,31 @@ test "external anchor: our MAC-move defaults are RFC 7432 §15.1's stated N and 
     const d: Options = .{};
     try testing.expectEqual(@as(u8, 5), d.max_mac_moves);
     try testing.expectEqual(@as(Time, 180), d.mac_move_window);
+}
+
+test "learnStats counts every learn outcome and refusal" {
+    var t = Table.init(testing.allocator, .{ .max_mac_moves = 2, .mac_move_window = 100, .max_macs_per_isid = 1 });
+    defer t.deinit();
+    try t.addIsid(1);
+    try testing.expectEqual(LearnOutcome.learned, try t.learn(1, macOf(1), 2, 0));
+    try testing.expectEqual(LearnOutcome.refreshed, try t.learn(1, macOf(1), 2, 1));
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(1, macOf(1), 3, 2));
+    try testing.expectEqual(LearnOutcome.duplicate_detected, try t.learn(1, macOf(1), 2, 3));
+    try testing.expectEqual(LearnOutcome.denied_duplicate, try t.learn(1, macOf(1), 3, 4));
+    try testing.expectError(error.FdbFull, t.learn(1, macOf(2), 2, 5));
+    try testing.expectError(error.UnknownIsid, t.learn(9, macOf(1), 2, 5));
+    try testing.expectError(error.InvalidSourceMac, t.learn(1, .{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, 2, 5));
+
+    const s = t.learnStats();
+    try testing.expectEqual(@as(u64, 1), s.count(.learned));
+    try testing.expectEqual(@as(u64, 1), s.count(.refreshed));
+    try testing.expectEqual(@as(u64, 1), s.count(.moved));
+    try testing.expectEqual(@as(u64, 1), s.count(.duplicate_detected));
+    try testing.expectEqual(@as(u64, 1), s.count(.denied_duplicate));
+    try testing.expectEqual(@as(u64, 0), s.count(.static_pinned));
+    try testing.expectEqual(@as(u64, 1), s.fdb_full);
+    try testing.expectEqual(@as(u64, 1), s.unknown_isid);
+    try testing.expectEqual(@as(u64, 1), s.invalid_source_mac);
+    t.resetLearnStats();
+    try testing.expectEqual(@as(u64, 0), t.learnStats().count(.learned));
 }
