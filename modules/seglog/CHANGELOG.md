@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Review LOW-6 and LOW-8: an `OutOfMemory` in `dropBefore` (or before `compress`'s rename) no longer
+  leaves `segments()` ahead of the manifest on disk with the log unpoisoned (a retry found nothing to drop); every
+  allocation now happens before the view changes. `Stats.compress_verify_failed` counts only a real read-back mismatch.
+  Two failing-allocator sweeps.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** documentation only (review LOW-10): the README backup warning now
   describes `OrphanSegment` and `rebuildManifest` instead of a truncated segment, SPEC lists manifest form 2 (a migration
   under way) and that `compact` verifies a recompressed segment, the module doc lists every file in the directory, and

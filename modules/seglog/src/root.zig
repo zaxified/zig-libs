@@ -2216,7 +2216,13 @@ pub const Log = struct {
         while (k + 1 < n and self.live.items[k] < id) k += 1;
         if (k == 0) return 0;
 
-        try self.pending.appendSlice(self.gpa, self.live.items[0..k]);
+        // Every allocation before the view changes: an OutOfMemory in
+        // `commitManifest` (before its poisoning part) would leave
+        // `segments()` ahead of the disk, and a retry would find nothing
+        // left to drop (review LOW-6).
+        try self.pending.ensureUnusedCapacity(self.gpa, k);
+        try self.scratch.ensureTotalCapacity(self.gpa, manifestSize(n - k, self.pending.items.len + k));
+        self.pending.appendSliceAssumeCapacity(self.live.items[0..k]);
         std.mem.copyForwards(u64, self.live.items[0 .. n - k], self.live.items[k..n]);
         self.live.shrinkRetainingCapacity(n - k);
         std.mem.copyForwards(u64, self.live_lsn.items[0 .. n - k], self.live_lsn.items[k..n]);
@@ -2378,11 +2384,19 @@ pub const Log = struct {
         // compression: decode `COMPRESS.tmp` and compare it byte for byte
         // against the raw segment before the rename that starts deleting it.
         self.verifyCompressed(inner, src, size) catch |e| {
-            self.counters.compress_verify_failed += 1;
+            // Only a real mismatch: an OutOfMemory or a storage error out of
+            // the read-back is not an encoder bug (review LOW-8).
+            if (e == error.CompressVerifyFailed) self.counters.compress_verify_failed += 1;
             self.store.delete(compress_tmp) catch {};
             return e;
         };
 
+        // The manifest's buffer before anything changes: an OutOfMemory in the
+        // commit below would leave the view's form ahead of the disk (LOW-6).
+        self.scratch.ensureTotalCapacity(self.gpa, manifestSize(self.live.items.len, self.pending.items.len)) catch |e| {
+            self.store.delete(compress_tmp) catch {};
+            return e;
+        };
         // From here the segment's files change: a failure leaves this process
         // unsure which one is on disk.
         self.store.rename(compress_tmp, zstName(&nb, id)) catch |e| return self.poison(e);
@@ -3414,10 +3428,14 @@ pub const Log = struct {
     }
 
     /// Replace `MANIFEST` with the current `live` and `pending` lists.
+    fn manifestSize(nl: usize, np: usize) usize {
+        return man_fixed + man_entry_len * nl + 8 * np + man_crc_len;
+    }
+
     fn commitManifest(self: *Log) Storage.Error!void {
         const nl = self.live.items.len;
         const np = self.pending.items.len;
-        const size = man_fixed + man_entry_len * nl + 8 * np + man_crc_len;
+        const size = manifestSize(nl, np);
         try self.scratch.resize(self.gpa, size);
         const b = self.scratch.items;
         @memset(b, 0);
@@ -5057,6 +5075,40 @@ test "dropBefore deletes old segments and never the newest" {
     try expectPayloads(&log, null, &.{ "r4", "r4b" });
 }
 
+test "LOW-6: an OutOfMemory in dropBefore leaves the view as it was, and a retry drops" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var log = try openSim(&sim);
+        defer log.close();
+        for ([_]u64{ 1, 2, 3, 4 }) |id| {
+            try log.rotate(id);
+            _ = try log.append("r");
+        }
+    }
+    var j: usize = 0;
+    var failed: usize = 0;
+    while (true) : (j += 1) {
+        // A freshly opened log: its manifest buffer is not sized yet.
+        var fa = testing.FailingAllocator.init(testing.allocator, .{});
+        var log = try Log.open(fa.allocator(), sim.storage(), .{});
+        defer log.close();
+        fa.fail_index = fa.alloc_index + j;
+        fa.resize_fail_index = fa.resize_index; // no in-place growth: every growth allocates
+        if (log.dropBefore(3)) |k| {
+            try testing.expectEqual(@as(usize, 2), k);
+            try testing.expectEqualSlices(u64, &.{ 3, 4 }, log.segments());
+            break;
+        } else |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            failed += 1;
+            try testing.expect(!log.isPoisoned());
+            try testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4 }, log.segments());
+        }
+    }
+    try testing.expect(failed >= 2); // the pending list and the manifest buffer
+}
+
 test "a position in a dropped segment is SegmentGone; a later one still resumes" {
     var sim = SimStorage.init(testing.allocator);
     defer sim.deinit();
@@ -5635,6 +5687,36 @@ test "L2: the read-back-and-compare refuses a well-formed but wrong .zst, and to
     // check alone, as called here, does not.)
     try testing.expectEqualSlices(u8, raw, logFile(&sim, 1).?);
     log.store.delete(compress_tmp) catch {};
+}
+
+test "LOW-8: an OutOfMemory in compress is not counted as a verify failure" {
+    var j: usize = 0;
+    var failed: usize = 0;
+    while (true) : (j += 1) {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var fa = testing.FailingAllocator.init(testing.allocator, .{});
+        var log = try Log.open(fa.allocator(), sim.storage(), .{ .create = true });
+        defer log.close();
+        try log.rotate(1);
+        for (0..200) |i| {
+            var b: [16]u8 = undefined;
+            _ = try log.append(try std.mem.print(&b, "rec {d}", .{i}));
+        }
+        try log.rotate(2);
+        fa.fail_index = fa.alloc_index + j;
+        fa.resize_fail_index = fa.resize_index;
+        if (log.compress(1)) |_| {
+            try testing.expectEqual(@as(u64, 1), log.stats().compressions);
+            break;
+        } else |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            failed += 1;
+            try testing.expectEqual(@as(u64, 0), log.stats().compress_verify_failed);
+            try testing.expectEqualSlices(u64, &.{ 1, 2 }, log.segments());
+        }
+    }
+    try testing.expect(failed > 0);
 }
 
 test "L6: compressed segments read one after another share one decoder, and read right" {
