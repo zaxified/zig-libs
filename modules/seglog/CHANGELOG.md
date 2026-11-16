@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** scope survey and independent review recorded in `SPEC.md`: `**Scope:**` is `core` (reference tidwall/wal v1.2.1, shape model Kafka's log layer), new `## Compared with` table and `## Backlog / deferred` (four gaps proposed for implementation: `dropBeforeLsn`, `firstLsn`/`lastLsn`/`get`, `Concurrent` pass-throughs, a dump tool; plus the review's unfixed defects). No code changed; `zig build gen-catalog` not yet run.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — Tools wired into zig-libs (they still named the old consumer's
   paths and build steps): `example/bench.zig` is now `tools/bench.zig`, so `zig build
