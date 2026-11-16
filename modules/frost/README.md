@@ -109,6 +109,7 @@ frost.verifySignatureShare(allocator, identifier, verifying_share, comm_i, sig_s
 frost.verify(msg, sig: Signature, group_public_key: GroupPublicKey) bool
 frost.trustedDealerKeygen(allocator, secret_key: Scalar, coefficients: []const Scalar, max_participants: u16, min_participants: u16) !TrustedDealerKeygenResult
 frost.secretShareCombine(shares: []const ParticipantShare) !Scalar
+frost.vssVerify(share: *const ParticipantShare, vss_commitment: []const Element) !bool   // RFC 9591 C.2
 ```
 
 ## Usage

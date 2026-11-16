@@ -394,6 +394,56 @@ test "trustedDealerKeygen at t = 3: every share passes the Feldman check against
     try std.testing.expectEqualSlices(u8, &secret_key.toBytes(.big), &got.toBytes(.big));
 }
 
+test "vssVerify: dealt shares verify (RFC E.5 vector and t = 3), tampered share/commitment/identifier fail" {
+    const gpa = std.testing.allocator;
+    // RFC 9591 Appendix E.5: published shares against the commitment that
+    // trustedDealerKeygen derives from the published secret + coefficient.
+    const secret_key = scalarFromHex(v.group.secret_key);
+    const coefficients = [_]frost.Scalar{scalarFromHex(v.group.coefficient_1)};
+    const dealt = try frost.trustedDealerKeygen(gpa, secret_key, &coefficients, 3, 2);
+    defer gpa.free(dealt.shares);
+    defer gpa.free(dealt.vss_commitment);
+    try std.testing.expectEqualSlices(u8, &hexN(33, v.group.public_key), &dealt.vss_commitment[0].toBytes());
+    const published = [_][]const u8{ v.participant_shares.p1, v.participant_shares.p2, v.participant_shares.p3 };
+    for (published, 1..) |hexs, i| {
+        const sh: frost.ParticipantShare = .{ .identifier = identifierFromU16(@intCast(i)), .signing_share = signingShareFromHex(hexs) };
+        try std.testing.expect(try frost.vssVerify(&sh, dealt.vss_commitment));
+        // flipped share
+        var bad = sh;
+        bad.signing_share.bytes[31] ^= 1;
+        try std.testing.expect(!(try frost.vssVerify(&bad, dealt.vss_commitment)));
+        // wrong identifier (another participant's evaluation point)
+        var wrong_id = sh;
+        wrong_id.identifier = identifierFromU16(@intCast(i + 10));
+        try std.testing.expect(!(try frost.vssVerify(&wrong_id, dealt.vss_commitment)));
+    }
+    // a flipped commitment element (replace C_1 by the generator-derived group key)
+    var tampered = [_]frost.Element{ dealt.vss_commitment[0], dealt.vss_commitment[0] };
+    const p1: frost.ParticipantShare = .{ .identifier = identifierFromU16(1), .signing_share = signingShareFromHex(v.participant_shares.p1) };
+    try std.testing.expect(!(try frost.vssVerify(&p1, &tampered)));
+    // zero share: never valid
+    var zero = p1;
+    zero.signing_share.bytes = @splat(0);
+    try std.testing.expect(!(try frost.vssVerify(&zero, dealt.vss_commitment)));
+    // empty commitment is an error
+    try std.testing.expectError(error.InvalidParameters, frost.vssVerify(&p1, &.{}));
+
+    // t = 3 with distinct coefficients (sees the Horner order)
+    const c3 = [_]frost.Scalar{
+        frost.Scalar.fromBytes48(@as([48]u8, @splat(0x31)), .big),
+        frost.Scalar.fromBytes48(@as([48]u8, @splat(0x47)), .big),
+    };
+    const d3 = try frost.trustedDealerKeygen(gpa, secret_key, &c3, 5, 3);
+    defer gpa.free(d3.shares);
+    defer gpa.free(d3.vss_commitment);
+    for (d3.shares) |*sh| try std.testing.expect(try frost.vssVerify(sh, d3.vss_commitment));
+    // commitments in the wrong order fail (at x = 1 the order is invisible, so use x = 2)
+    var rev = [_]frost.Element{ d3.vss_commitment[2], d3.vss_commitment[1], d3.vss_commitment[0] };
+    try std.testing.expect(!(try frost.vssVerify(&d3.shares[1], &rev)));
+    // a truncated commitment (degree too low) fails
+    try std.testing.expect(!(try frost.vssVerify(&d3.shares[1], d3.vss_commitment[0..2])));
+}
+
 test "secretShareCombine refuses a single share and a repeated identifier" {
     // Appendix C.1's "invalid parameters". A repeated identifier makes a
     // Lagrange denominator zero (and invert(0) = 0): a garbage "secret", not
