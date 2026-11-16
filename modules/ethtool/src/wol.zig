@@ -42,7 +42,7 @@ pub fn wipe(bytes: []u8) void {
 pub const Wol = struct {
     device: header.Device = .{},
     /// Value = wake-up modes enabled, mask = modes the device supports. Bit
-    /// indices are `uapi.WAKE`; a verbose reply names them (`"magic"`, …).
+    /// indices are `uapi.wake_bit`; a verbose reply names them (`"magic"`, …).
     modes: ?bitset.Bitset = null,
     /// The SecureOn password, when the driver reports one. **A secret.**
     sopass: ?[uapi.sopass_len]u8 = null,
@@ -53,7 +53,7 @@ pub const Wol = struct {
         w.* = .{};
     }
 
-    /// Is wake-up mode `wake_bit` (`uapi.WAKE.*`) enabled?
+    /// Is wake-up mode `wake_bit` (`uapi.wake_bit.*`) enabled?
     pub fn enabled(w: Wol, wake_bit: u32) bool {
         const m = w.modes orelse return false;
         return m.isSet(wake_bit);
@@ -87,7 +87,7 @@ pub fn parseWol(gpa: std.mem.Allocator, attr_bytes: []const u8) Error!Wol {
 
 /// `ETHTOOL_MSG_WOL_SET` parameters.
 pub const WolSet = struct {
-    /// Wake-up modes to switch on or off (a delta), by index (`uapi.WAKE.*`)
+    /// Wake-up modes to switch on or off (a delta), by index (`uapi.wake_bit.*`)
     /// **or** by name (`"magic"`, …), not both (`InvalidRequest`).
     modes: []const bitset.IndexedValue = &.{},
     mode_names: []const bitset.NamedValue = &.{},
@@ -169,18 +169,18 @@ test "WOL reply: modes as (enabled, supported), SOPASS decoded" {
     defer list.deinit(gpa);
     try header.append(gpa, &list, uapi.WOL.HEADER, .{ .target = .byIndex(2) });
     // supported: phy, ucast, bcast, magic, magicsecure; enabled: magic.
-    const sup: u32 = (1 << uapi.WAKE.phy) | (1 << uapi.WAKE.ucast) | (1 << uapi.WAKE.bcast) |
-        (1 << uapi.WAKE.magic) | (1 << uapi.WAKE.magicsecure);
-    try bitset.appendCompact(gpa, &list, uapi.WOL.MODES, 8, &.{1 << uapi.WAKE.magic}, &.{sup});
+    const sup: u32 = (1 << uapi.wake_bit.phy) | (1 << uapi.wake_bit.ucast) | (1 << uapi.wake_bit.bcast) |
+        (1 << uapi.wake_bit.magic) | (1 << uapi.wake_bit.magicsecure);
+    try bitset.appendCompact(gpa, &list, uapi.WOL.MODES, 8, &.{1 << uapi.wake_bit.magic}, &.{sup});
     try codec.appendAttr(gpa, &list, uapi.WOL.SOPASS, &pw);
 
     var w = try parseWol(gpa, list.items);
     defer w.deinit(gpa);
     try testing.expectEqual(@as(?u32, 2), w.device.index);
-    try testing.expect(w.enabled(uapi.WAKE.magic));
-    try testing.expect(!w.enabled(uapi.WAKE.phy));
-    try testing.expect(w.supports(uapi.WAKE.phy));
-    try testing.expect(!w.supports(uapi.WAKE.arp));
+    try testing.expect(w.enabled(uapi.wake_bit.magic));
+    try testing.expect(!w.enabled(uapi.wake_bit.phy));
+    try testing.expect(w.supports(uapi.wake_bit.phy));
+    try testing.expect(!w.supports(uapi.wake_bit.arp));
     try testing.expectEqualSlices(u8, &pw, &w.sopass.?);
 }
 
@@ -203,7 +203,7 @@ test "WOL reply: absent attributes stay null; wrong SOPASS length is an error" {
     var w = try parseWol(gpa, &.{});
     defer w.deinit(gpa);
     try testing.expect(w.modes == null and w.sopass == null);
-    try testing.expect(!w.enabled(uapi.WAKE.magic) and !w.supports(uapi.WAKE.magic));
+    try testing.expect(!w.enabled(uapi.wake_bit.magic) and !w.supports(uapi.wake_bit.magic));
 
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
@@ -236,7 +236,7 @@ test "WOL_GET request: command, device, compact flag" {
 test "WOL_SET request: modes by index and the SOPASS, in a well-formed frame" {
     const gpa = testing.allocator;
     const msg = try buildSetWol(gpa, 23, 5, .byName("enp0s31f6"), .{
-        .modes = &.{ .{ .index = uapi.WAKE.magic, .on = true }, .{ .index = uapi.WAKE.arp, .on = false } },
+        .modes = &.{ .{ .index = uapi.wake_bit.magic, .on = true }, .{ .index = uapi.wake_bit.arp, .on = false } },
         .sopass = pw,
     });
     defer {
@@ -252,9 +252,9 @@ test "WOL_SET request: modes by index and the SOPASS, in a well-formed frame" {
     try testing.expectEqual(uapi.WOL.MODES, modes.type & codec.NLA_TYPE_MASK);
     var bs = try bitset.parse(gpa, modes.data);
     defer bs.deinit(gpa);
-    try testing.expect(bs.isSet(uapi.WAKE.magic));
-    try testing.expect(!bs.isSet(uapi.WAKE.arp));
-    try testing.expect(bs.inMask(uapi.WAKE.arp));
+    try testing.expect(bs.isSet(uapi.wake_bit.magic));
+    try testing.expect(!bs.isSet(uapi.wake_bit.arp));
+    try testing.expect(bs.inMask(uapi.wake_bit.arp));
     const sp = (try it.next()).?;
     try testing.expectEqual(uapi.WOL.SOPASS, sp.type);
     try testing.expectEqualSlices(u8, &pw, sp.data);

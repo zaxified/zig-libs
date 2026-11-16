@@ -533,7 +533,7 @@ pub const FEC = struct {
 
 pub const WOL = struct {
     pub const HEADER: u16 = 1;
-    /// Bitset of wake-up modes (`ETH_SS_WOL_MODES`, see `WAKE`).
+    /// Bitset of wake-up modes (`ETH_SS_WOL_MODES`, see `wake_bit`).
     pub const MODES: u16 = 2;
     /// Binary, `sopass_len` bytes: the SecureOn password. A secret.
     pub const SOPASS: u16 = 3;
@@ -543,7 +543,10 @@ pub const WOL = struct {
 pub const sopass_len = 6;
 
 /// Bit indices of the `ETH_SS_WOL_MODES` string set (`WAKE_*` is `1 << index`).
-pub const WAKE = struct {
+/// Named `wake_bit`, not `WAKE`: these are bit INDICES (`WAKE_MAGIC` is
+/// `1 << wake_bit.magic`), so they must not be compared with the kernel's
+/// `WAKE_*` masks (check-uapi).
+pub const wake_bit = struct {
     pub const phy: u32 = 0;
     pub const ucast: u32 = 1;
     pub const mcast: u32 = 2;

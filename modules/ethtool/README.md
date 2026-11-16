@@ -103,7 +103,7 @@ defer fc.deinit(gpa);
 try et.setFec(dev, .{ .auto = false, .mode_names = &.{.{ .name = "RS", .on = true }} });
 var w = try et.wol(dev, .verbose);           // needs CAP_NET_ADMIN; w.sopass is a secret
 defer w.deinit(gpa);                         // ...and deinit wipes it
-try et.setWol(dev, .{ .modes = &.{.{ .index = ethtool.uapi.WAKE.magic, .on = true }} });
+try et.setWol(dev, .{ .modes = &.{.{ .index = ethtool.uapi.wake_bit.magic, .on = true }} });
 var pf = try et.privflags(dev, .verbose);    // driver-specific names
 defer pf.deinit(gpa);
 try et.setPrivflags(dev, .{ .flags = &.{.{ .name = "legacy-rx", .on = true }} });
