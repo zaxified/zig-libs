@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the coalescing, prefetch and `lookupIpMany` code in
+  `CachingResolver`, 77/80 killed, 3 equivalent or unobservable; ten new tests (every key kind renewed by `refreshDue`, its
+  order and cancelation, the prefetch boundary, refused and failed refreshes, waiters of a canceled lead), and the test Stub
+  counts SRV query names.
+- **2026-11-16** — `CachingResolver` review fixes (same day, before any release): a waiter whose coalesced lead left nothing in
+  the table asks itself in parallel instead of queueing behind the next waiter (TTL-0 / non-cacheable answers were serialised);
+  a failed prefetch refresh arms the key's backoff while the old answer keeps being served (it retried a dead upstream on every
+  refresh); a refresh refused by backoff or budget no longer counts as a stale answer.
+- **2026-11-16** — `CachingResolver`: **request coalescing** (concurrent misses on one key share one network lookup; waiters read
+  the lead's answer or its failure through the backoff; a canceled lead wakes them and one asks in turn; `Stats.coalesced`),
+  **prefetch** (`Options.prefetch_pct`, off by default, ≤ 99 else `InvalidOptions`; `refreshDue(max)` refreshes the keys a late
+  hit marked, caller-driven; `Stats.prefetches`) and **`lookupIpMany(names, results)`** (concurrent `lookupIp` over a
+  `std.Io.Group`, one `IpResult` per name, every result set on cancel; `error.LengthMismatch`). `Stats` gains two fields
+  (a consumer that builds `Stats` literals must add them). Scope core -> parity.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the CachingResolver tests' clock uses 64-bit atomics only where the target has them, so `check-portable` compiles the tests for linux32 (mips32) again; the card's src hash re-recorded for this test-only change.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the `forget*` / `stale_reason` / `resort_ip_hits` code in `CachingResolver` (24 schemata mutants, all killed); 3 new tests (`forget` over all five name kinds, a stale IP answer re-sorted and a network answer not probed, a 65-address hit served unsorted with the default `sort_source` pinned) and the "absent key" test now reaches the too-long-key path.
 - **2026-11-15** — **CONSUMER-VISIBLE (additive, FEATURE):** `CachingResolver` gaps for callers that refresh single names. `forget(kind, name)` (`NameKind`: `.ip .mx .ns .txt .cname`), `forgetReverse(ip)` and `forgetSrv(service, proto, name)` drop one key's answer and backoff so its next lookup goes to the network (absent key: no-op). `Options.resort_ip_hits` (default true): a `lookupIp` `.cache`/`.stale` hit is re-sorted with RFC 6724 destination selection as of the hit, on the caller's clone after the mutex is released (one route query per item per hit; `false` keeps the stored order), with `Options.sort_source` (default `netaddr.systemSource`) as a test seam. `Answer.stale_reason: ?Error` says why a `.stale` answer was served (the upstream failure, the error the backoff holds, `error.BudgetExceeded`). Behaviour change: hits of `lookupIp` are now re-ordered by default. Docs: the stale window counts from expiry (RFC 8767) and how to express "keep the last answer N seconds"; negative answers follow the SOA TTL (RFC 2308), not the failure backoff. **Tests:** forget per kind, absent key, forget during backoff, `stale_reason` for each of the three causes, a changed source reorders a hit, the option off skips the probe.

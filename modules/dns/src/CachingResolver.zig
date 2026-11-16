@@ -59,8 +59,13 @@
 //!    to `init`, at most `Options.max_concurrent_lookups` of them, and a miss
 //!    takes a free one for the duration of its lookup (waiting, cancelable,
 //!    when all are busy). One slow name therefore never blocks a miss on
-//!    another. Two concurrent misses on the SAME key may both query (no
-//!    request coalescing yet). An answer expires TTL seconds after the moment
+//!    another. Concurrent misses on the SAME key are coalesced (hickory, unbound):
+//!    the first asks the network, the others wait for it (cancelable) and then
+//!    read the table it filled — its answer as `.cache`, or its failure through
+//!    the usual backoff / serve-stale rules; an outcome that left nothing in the
+//!    table (a canceled lead, a non-cacheable answer, a local error) makes each
+//!    of them ask itself, in parallel, as without coalescing. `Stats.coalesced`
+//!    counts the waits. An answer expires TTL seconds after the moment
 //!    the lookup was sent, not after it returned. `lookupIp` order is RFC 6724
 //!    as of the lookup time; a hit is re-sorted on the way out (see
 //!    `Options.resort_ip_hits`), so a route change shows in the order.
@@ -105,6 +110,22 @@ stale_served: u64 = 0,
 evictions: u64 = 0,
 network_lookups: u64 = 0,
 budget_refused: u64 = 0,
+coalesced: u64 = 0,
+prefetches: u64 = 0,
+/// Keys with a network lookup in flight (request coalescing), under `mutex`.
+inflight: std.StringHashMapUnmanaged(*Flight) = .empty,
+/// Misses parked behind an in-flight lookup of their key (a test observable).
+flight_waiters: u32 = 0,
+
+/// One network lookup in flight for a key; later misses of that key wait on
+/// `cond` (with `mutex`) until the leader sets `done`. Freed by whoever leaves
+/// last: the leader when nobody waits, else the last waiter.
+const Flight = struct {
+    key: []u8,
+    cond: std.Io.Condition = .init,
+    done: bool = false,
+    waiters: u32 = 0,
+};
 
 /// The clock seam: seconds on a monotonic scale (only differences matter).
 pub const Clock = struct {
@@ -161,6 +182,12 @@ pub const Options = struct {
     /// result = unreachable. Default `netaddr.systemSource` (Linux; elsewhere
     /// a probe that finds no route, i.e. no re-sorting).
     sort_source: *const fn (netaddr.Ip) ?netaddr.Ip = defaultSortSource,
+    /// Prefetch (unbound `prefetch`): a hit on an entry with less than this
+    /// percentage of its stored TTL left is served from the table and marks
+    /// the key due for a refresh, once; `refreshDue` performs the refreshes.
+    /// 0 = off (the default), at most 99. No background task: the caller drives
+    /// `refreshDue`, e.g. from a timer task on its `Io`.
+    prefetch_pct: u8 = 0,
 };
 
 fn noSource(_: netaddr.Ip) ?netaddr.Ip {
@@ -218,6 +245,16 @@ pub const Stats = struct {
     evictions: u64,
     network_lookups: u64,
     budget_refused: u64,
+    /// Misses that waited for a concurrent lookup of the same key instead of
+    /// asking the network themselves (request coalescing); a wait that was
+    /// canceled counts too. A wait whose lead left nothing in the table
+    /// (canceled, not cacheable, a local error) is followed by a network lookup
+    /// of its own, uncoalesced and in parallel with the other waiters', and
+    /// counts in both.
+    coalesced: u64,
+    /// Refreshes `refreshDue` attempted (a network lookup, a wait for one, or a
+    /// refresh the key's backoff or the budget refused).
+    prefetches: u64,
 };
 
 const Kind = enum(u8) { ip, reverse, mx, ns, txt, cname, srv };
@@ -272,11 +309,15 @@ const Entry = struct {
     fail_count: u8 = 0,
     retry_at_s: u64 = 0,
     last_err: Resolver.Error = error.Timeout,
+    /// Marked by a hit late in the TTL (`Options.prefetch_pct`); cleared by
+    /// `refreshDue` taking it and by a new answer being stored.
+    prefetch_due: bool = false,
 };
 
 /// `error.InvalidOptions`: `max_entries` 0, `min_ttl_s` > `max_ttl_s`,
 /// `negative_min_ttl_s` > `negative_max_ttl_s`, a zero or inverted backoff,
-/// a budget with `per_s` or `burst` 0, `max_concurrent_lookups` 0. The slices
+/// a budget with `per_s` or `burst` 0, `max_concurrent_lookups` 0,
+/// `prefetch_pct` over 99. The slices
 /// inside `resolver_options` (servers, paths, EDNS options) must outlive the
 /// cache. `gpa` must be thread-safe: concurrent lookups allocate from several
 /// threads at once (use `std.heap.smp_allocator` or the like, not an unlocked
@@ -288,6 +329,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, resolver_options: Resolver.Optio
     if (o.failure_backoff_min_s == 0 or o.failure_backoff_min_s > o.failure_backoff_max_s) return error.InvalidOptions;
     if (o.max_network_lookups) |b| if (b.per_s == 0 or b.burst == 0) return error.InvalidOptions;
     if (o.max_concurrent_lookups == 0) return error.InvalidOptions;
+    if (o.prefetch_pct > 99) return error.InvalidOptions;
     var c: CachingResolver = .{ .gpa = gpa, .io = io, .resolver_options = resolver_options, .options = o };
     if (o.max_network_lookups) |b| c.tokens = b.burst;
     c.refill_s = c.now();
@@ -303,6 +345,8 @@ pub fn deinit(c: *CachingResolver) void {
     }
     c.removeAll();
     c.map.deinit(c.gpa);
+    std.debug.assert(c.inflight.count() == 0); // "no lookup may be running"
+    c.inflight.deinit(c.gpa);
     c.* = undefined;
 }
 
@@ -400,6 +444,8 @@ pub fn stats(c: *CachingResolver) Stats {
         .evictions = c.evictions,
         .network_lookups = c.network_lookups,
         .budget_refused = c.budget_refused,
+        .coalesced = c.coalesced,
+        .prefetches = c.prefetches,
     };
 }
 
@@ -459,6 +505,112 @@ pub fn lookupSrv(c: *CachingResolver, service: []const u8, proto: []const u8, na
 
 const SrvArgs = struct { service: []const u8, proto: []const u8, name: []const u8 };
 
+/// Refreshes up to `max` keys that `Options.prefetch_pct` marked due, newest
+/// use first, each through the normal miss path (so concurrent lookups of the
+/// key wait for it, and the budget and backoff apply); returns how many it
+/// ran. A refresh that fails keeps the old answer (and arms the backoff as any
+/// failure does). The refreshed entry's `canonical` is the key's ASCII
+/// lower-case form. Blocking: call it from a task of its own (for example a
+/// timer loop on the cache's `Io`) so a lookup never waits behind it.
+/// Cancelable: `error.Canceled` stops it between or inside refreshes.
+pub fn refreshDue(c: *CachingResolver, max: usize) error{Canceled}!usize {
+    var done: usize = 0;
+    while (done < max) {
+        var buf: [key_buf_len]u8 = undefined;
+        const k = c.takeDue(&buf) orelse break;
+        done += 1;
+        c.mutex.lockUncancelable(c.io);
+        c.prefetches += 1;
+        c.mutex.unlock(c.io);
+        c.refreshKey(k) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {}, // kept: the old answer, the backoff
+        };
+    }
+    return done;
+}
+
+/// The most recently used due key, copied into `buf`, its mark cleared.
+fn takeDue(c: *CachingResolver, buf: *[key_buf_len]u8) ?[]const u8 {
+    c.mutex.lockUncancelable(c.io);
+    defer c.mutex.unlock(c.io);
+    var it = c.head;
+    while (it) |e| : (it = e.next) {
+        if (!e.prefetch_due) continue;
+        e.prefetch_due = false;
+        @memcpy(buf[0..e.key.len], e.key);
+        return buf[0..e.key.len];
+    }
+    return null;
+}
+
+fn refreshKey(c: *CachingResolver, k: []const u8) Error!void {
+    const kind: Kind = std.enums.fromInt(Kind, k[0]) orelse return;
+    const body = k[1..];
+    switch (kind) {
+        .ip => try settle(c.runLocked(netaddr.Ip, k, false, true, body, callIp)),
+        .mx => try settle(c.runLocked(Resolver.Mx, k, false, true, body, callMx)),
+        .ns => try settle(c.runLocked([]const u8, k, false, true, body, callNs)),
+        .txt => try settle(c.runLocked([]const u8, k, false, true, body, callTxt)),
+        .cname => try settle(c.runLocked([]const u8, k, false, true, body, callCname)),
+        .reverse => {
+            const ip: netaddr.Ip = switch (body[0]) {
+                4 => .{ .v4 = body[1..5].* },
+                else => .{ .v6 = body[1..17].* },
+            };
+            try settle(c.runLocked([]const u8, k, false, true, ip, callReverse));
+        },
+        .srv => {
+            const sl = body[0];
+            const service = body[1..][0..sl];
+            const pl = body[1 + sl];
+            const proto = body[2 + sl ..][0..pl];
+            const name = body[2 + sl + pl ..];
+            try settle(c.runLocked(Resolver.Srv, k, false, true, SrvArgs{ .service = service, .proto = proto, .name = name }, callSrv));
+        },
+    }
+}
+
+/// A refresh's answer is not wanted (the table has it); only cancelation stops `refreshDue`.
+fn settle(r: anytype) error{Canceled}!void {
+    if (r) |ans| {
+        var a = ans;
+        a.deinit();
+    } else |err| if (err == error.Canceled) return error.Canceled;
+}
+
+/// One `lookupIp` result of `lookupIpMany`: the caller's own answer (free with
+/// `deinit`) or the lookup's error.
+pub const IpResult = Error!Answer(netaddr.Ip);
+
+/// `lookupIp` for every name at once: the lookups run concurrently on the
+/// cache's `Io` (a `std.Io.Group`; the network side is bounded by
+/// `max_concurrent_lookups`, the rest wait for a pooled Resolver, and misses
+/// of one key coalesce; hits are served at once), `results[i]` for `names[i]`. Every result is
+/// set when this returns, also on `error.Canceled` (a lookup that was cut short
+/// holds `error.Canceled`); the caller frees each answer.
+/// `error.LengthMismatch`: `results.len != names.len` (nothing was looked up).
+/// The c-ares / hickory "many queries in flight" use; a single lookup can be
+/// made concurrent the same way with `io.async(CachingResolver.lookupIp, ...)`.
+pub fn lookupIpMany(c: *CachingResolver, names: []const []const u8, results: []IpResult) error{ Canceled, LengthMismatch }!void {
+    if (names.len != results.len) return error.LengthMismatch;
+    for (results) |*r| r.* = error.Canceled;
+    var g: std.Io.Group = .init;
+    for (names, results) |n, *r| g.async(c.io, manyOne, .{ c, n, r });
+    try g.await(c.io);
+}
+
+fn manyOne(c: *CachingResolver, name: []const u8, out: *IpResult) void {
+    out.* = c.lookupIp(name);
+}
+
+fn dropAnswer(r: anytype) void {
+    if (r) |ans| {
+        var a = ans;
+        a.deinit();
+    } else |_| {}
+}
+
 fn callIp(r: *Resolver, name: []const u8) Resolver.Error!Resolver.Lookup(netaddr.Ip) {
     return r.lookupIp(name);
 }
@@ -517,7 +669,7 @@ fn run(
     ctx: anytype,
     comptime call: fn (*Resolver, @TypeOf(ctx)) Resolver.Error!Resolver.Lookup(T),
 ) Error!Answer(T) {
-    const ans = try c.runLocked(T, key, local, ctx, call);
+    const ans = try c.runLocked(T, key, local, false, ctx, call);
     // The table mutex is released by now: the clone is the caller's own, so
     // sorting it (route queries) never holds the table.
     if (T == netaddr.Ip and c.options.resort_ip_hits and ans.source != .network) {
@@ -532,6 +684,8 @@ fn runLocked(
     comptime T: type,
     key: ?[]const u8,
     local: bool,
+    /// A `refreshDue` refresh: a fresh entry is no hit, and the miss is not counted.
+    refresh: bool,
     ctx: anytype,
     comptime call: fn (*Resolver, @TypeOf(ctx)) Resolver.Error!Resolver.Lookup(T),
 ) Error!Answer(T) {
@@ -543,47 +697,82 @@ fn runLocked(
     var held = true;
     defer if (held) c.mutex.unlock(io);
 
-    const t0 = c.now();
-    var entry: ?*Entry = c.map.get(k);
-    if (entry) |e| {
-        c.touch(e);
-        if (e.payload != null and t0 < e.expires_s) {
-            const ans = try c.answerFrom(T, e, .cache, @min(e.expires_s -| t0, e.stored_ttl));
-            c.hits += 1;
-            return ans;
-        }
-        if (e.payload != null and !c.staleUsable(e, t0)) {
-            dropPayload(e);
-            if (e.fail_count == 0) {
-                c.removeEntry(e);
-                entry = null;
+    var counted = refresh;
+    var force = refresh;
+    // Set once this miss has waited for a lead: if the table still has nothing for it, it asks the network
+    // itself, uncoalesced, instead of queueing behind the next waiter's lookup (which would serialise them).
+    var waited = false;
+    while (true) {
+        const t0 = c.now();
+        var entry: ?*Entry = c.map.get(k);
+        if (entry) |e| {
+            c.touch(e);
+            if (e.payload != null and t0 < e.expires_s and !force) {
+                const left = e.expires_s - t0;
+                const ans = try c.answerFrom(T, e, .cache, @min(left, e.stored_ttl));
+                if (!counted) c.hits += 1;
+                const pct = c.options.prefetch_pct;
+                if (pct != 0 and !e.prefetch_due and @as(u64, left) * 100 < @as(u64, pct) * e.stored_ttl) e.prefetch_due = true;
+                return ans;
+            }
+            if (e.payload != null and !c.staleUsable(e, t0)) {
+                dropPayload(e);
+                if (e.fail_count == 0) {
+                    c.removeEntry(e);
+                    entry = null;
+                }
             }
         }
-    }
-    c.misses += 1;
-    const stale_entry: ?*Entry = if (entry) |e| (if (c.staleUsable(e, t0)) e else null) else null;
-    if (entry) |e| {
-        if (e.fail_count > 0 and t0 < e.retry_at_s) {
-            if (stale_entry) |s| return c.staleAnswer(T, s, e.last_err);
-            return e.last_err;
+        if (!counted) c.misses += 1;
+        counted = true;
+        const stale_entry: ?*Entry = if (entry) |e| (if (c.staleUsable(e, t0)) e else null) else null;
+        if (entry) |e| {
+            if (e.fail_count > 0 and t0 < e.retry_at_s) {
+                if (refresh) return e.last_err; // nobody reads a refresh's answer: no stale clone, no stale count
+                if (stale_entry) |s| return c.staleAnswer(T, s, e.last_err);
+                return e.last_err;
+            }
         }
-    }
-    if (c.options.max_network_lookups) |b| {
-        if (!c.takeToken(b, t0)) {
-            c.budget_refused += 1;
-            if (stale_entry) |s| return c.staleAnswer(T, s, error.BudgetExceeded);
-            return error.BudgetExceeded;
+        // Another task is asking the network for this key: wait for it, then read the table again.
+        if (!waited) if (c.inflight.get(k)) |f| {
+            c.coalesced += 1;
+            f.waiters += 1;
+            c.flight_waiters += 1;
+            var wait_err: ?std.Io.Cancelable = null;
+            while (!f.done) f.cond.wait(io, &c.mutex) catch |err| {
+                wait_err = err;
+                break;
+            };
+            f.waiters -= 1;
+            c.flight_waiters -= 1;
+            if (f.done and f.waiters == 0) c.destroyFlight(f);
+            if (wait_err) |err| return err;
+            force = false; // what the lead stored is the refresh
+            waited = true;
+            continue;
+        };
+        if (c.options.max_network_lookups) |b| {
+            if (!c.takeToken(b, t0)) {
+                c.budget_refused += 1;
+                if (refresh) return error.BudgetExceeded;
+                if (stale_entry) |s| return c.staleAnswer(T, s, error.BudgetExceeded);
+                return error.BudgetExceeded;
+            }
         }
+        break;
     }
     c.network_lookups += 1;
+    // Lead the lookup; without memory for the record it simply goes uncoalesced.
+    const flight: ?*Flight = if (waited) null else c.startFlight(k);
+    defer if (flight) |f| c.endFlight(f); // `mutex` is held again on every return below
     c.mutex.unlock(io);
     held = false;
 
     const slot = c.acquire() catch |err| {
         // Never reached the network: give the token and the count back.
         c.mutex.lockUncancelable(io);
+        held = true;
         c.refundLocked();
-        c.mutex.unlock(io);
         return err;
     };
     // The TTL runs from the moment the query is sent: an answer never outlives
@@ -595,8 +784,40 @@ fn runLocked(
     c.mutex.lockUncancelable(io);
     held = true;
     const t1 = c.now();
-    var lk = res catch |err| return c.failed(T, k, err, t1);
+    var lk = res catch |err| return c.failed(T, k, err, t1, refresh);
     return c.succeeded(T, k, &lk, t_call);
+}
+
+/// Registers this miss as the key's network lookup. Called with `mutex` held.
+fn startFlight(c: *CachingResolver, k: []const u8) ?*Flight {
+    const f = c.gpa.create(Flight) catch return null;
+    const key = c.gpa.dupe(u8, k) catch {
+        c.gpa.destroy(f);
+        return null;
+    };
+    f.* = .{ .key = key };
+    c.inflight.put(c.gpa, key, f) catch {
+        c.gpa.free(key);
+        c.gpa.destroy(f);
+        return null;
+    };
+    return f;
+}
+
+/// The leader's outcome is in the table: wake the waiters. Called with `mutex` held.
+fn endFlight(c: *CachingResolver, f: *Flight) void {
+    _ = c.inflight.remove(f.key);
+    f.done = true;
+    if (f.waiters == 0) {
+        c.destroyFlight(f);
+    } else {
+        f.cond.broadcast(c.io);
+    }
+}
+
+fn destroyFlight(c: *CachingResolver, f: *Flight) void {
+    c.gpa.free(f.key);
+    c.gpa.destroy(f);
 }
 
 /// Gives back what a lookup took that turned out not to reach the network.
@@ -691,8 +912,17 @@ fn release(c: *CachingResolver, s: *Slot) void {
 
 /// Called with `mutex` held. An upstream failure arms the key's backoff and
 /// serves what is still allowed to be served.
-fn failed(c: *CachingResolver, comptime T: type, k: []const u8, err: Resolver.Error, t: u64) Error!Answer(T) {
+fn failed(c: *CachingResolver, comptime T: type, k: []const u8, err: Resolver.Error, t: u64, refresh: bool) Error!Answer(T) {
     if (!isUpstreamFailure(err)) return err;
+    if (refresh) {
+        // A prefetch refresh failed: the old answer stays (fresh hits ignore the failure state), but the key's
+        // backoff is armed, so the next refresh of a dead upstream waits for it instead of retrying at once.
+        const e = c.map.get(k) orelse return err;
+        e.fail_count +|= 1;
+        e.last_err = err;
+        e.retry_at_s = t +| c.backoffDelay(e.fail_count);
+        return err;
+    }
     // A concurrent miss of the same key may have stored a fresh answer while
     // this lookup was failing: serve it, and leave the failure state alone.
     if (c.map.get(k)) |cur| {
@@ -743,6 +973,7 @@ fn store(c: *CachingResolver, comptime T: type, k: []const u8, lk: *const Resolv
     e.expires_s = t +| ttl;
     e.fail_count = 0;
     e.retry_at_s = 0;
+    e.prefetch_due = false;
 }
 
 fn answerFrom(c: *CachingResolver, comptime T: type, e: *Entry, source: Source, ttl: u32) error{OutOfMemory}!Answer(T) {
@@ -928,6 +1159,8 @@ const Stub = struct {
     /// `release_slow` is set: `stashed` says it is being held.
     stashed: std.atomic.Value(bool) = .init(false),
     release_slow: std.atomic.Value(bool) = .init(false),
+    /// Queries asked for exactly `_sip._tcp.example.com` (the wire name, case-blind).
+    sip_queries: std.atomic.Value(u32) = .init(0),
     /// When set, the clock advances by `bump_by` as the answer is sent.
     bump_clock: ?*TestClock = null,
     bump_by: std.atomic.Value(u32) = .init(0),
@@ -961,6 +1194,7 @@ const Stub = struct {
         if (i + 5 > q.len) return;
         const qtype = std.mem.readInt(u16, q[i + 1 ..][0..2], .big);
         if (qtype == 28 and st.drop_aaaa.load(.acquire)) return;
+        if (std.ascii.eqlIgnoreCase(q[12 .. i + 1], "\x04_sip\x04_tcp\x07example\x03com\x00")) _ = st.sip_queries.fetchAdd(1, .acq_rel);
         const ttl = st.ttl.load(.acquire);
         const alias = q.len > 18 and std.ascii.eqlIgnoreCase(q[13..][0..@min(@as(usize, q[12]), 5)], "alias");
 
@@ -1793,7 +2027,10 @@ test "four threads share one cache: no leak, consistent stats" {
     try testing.expectEqual(@as(u32, 0), failures);
     const s = c.stats();
     try testing.expectEqual(@as(u64, 4 * iterations), s.hits + s.misses);
-    try testing.expectEqual(s.misses, s.network_lookups);
+    // Every miss either asked the network or waited for the lookup of its key (coalescing), so with
+    // cacheable answers each of the three names is asked exactly once, however the threads interleave.
+    try testing.expectEqual(s.misses, s.network_lookups + s.coalesced);
+    try testing.expectEqual(@as(u64, 3), s.network_lookups);
     try testing.expectEqual(@as(u64, h.queries()), s.network_lookups);
     try testing.expectEqual(@as(usize, 3), s.entries);
 }
@@ -1889,14 +2126,285 @@ test "with max_concurrent_lookups = 1 the second miss waits for the first" {
     try testing.expectEqual(@as(u32, 0), c.pool_waiters); // the parked miss was counted out again
 }
 
-// ── delta mutation audit 2026-11-15: tests the first schemata run asked for ──
+// ── request coalescing ──
 
-fn dropAnswer(r: anytype) void {
-    if (r) |ans| {
-        var a = ans;
-        a.deinit();
-    } else |_| {}
+fn waitForFlightWaiters(c: *CachingResolver, n: u32) !void {
+    for (0..5000) |_| {
+        c.mutex.lockUncancelable(c.io);
+        const w = c.flight_waiters;
+        c.mutex.unlock(c.io);
+        if (w >= n) return;
+        try c.io.sleep(.fromMilliseconds(2), .awake);
+    }
+    return error.TestTimeout;
 }
+
+fn inflightCount(c: *CachingResolver) usize {
+    c.mutex.lockUncancelable(c.io);
+    defer c.mutex.unlock(c.io);
+    return c.inflight.count();
+}
+
+test "concurrent misses on one key share one network lookup (request coalescing)" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_concurrent_lookups = 4 });
+    defer c.deinit();
+
+    var ws: [4]NamedLookup = undefined;
+    var fs: [4]std.Io.Future(void) = undefined;
+    var started: usize = 0;
+    defer for (fs[0..started]) |*f| f.await(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    for (&ws, &fs, 0..) |*w, *f, i| {
+        w.* = .{ .c = &c, .name = "slow.example.com" };
+        f.* = try h.io.concurrent(NamedLookup.run, .{w});
+        started += 1;
+        if (i == 0) try waitFor(h.io, &h.stub.stashed); // the lead's answer is held
+    }
+    try waitForFlightWaiters(&c, 3); // the other three wait for it
+    try testing.expectEqual(@as(u32, 1), h.queries()); // and sent nothing
+
+    h.stub.release_slow.store(true, .release);
+    for (&ws) |*w| try waitFor(h.io, &w.done);
+    for (&ws) |*w| try testing.expect(w.ok.load(.acquire));
+    const st = c.stats();
+    try testing.expectEqual(@as(u64, 1), st.network_lookups);
+    try testing.expectEqual(@as(u64, 3), st.coalesced);
+    try testing.expectEqual(@as(u64, 4), st.misses);
+    try testing.expectEqual(@as(u64, 0), st.hits);
+    try testing.expectEqual(@as(u32, 1), h.queries());
+    try testing.expectEqual(@as(u32, 0), c.flight_waiters);
+    try testing.expectEqual(@as(usize, 0), inflightCount(&c));
+}
+
+test "coalesced misses share the lead's upstream failure: one lookup, no retry storm" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_concurrent_lookups = 4 });
+    defer c.deinit();
+    h.stub.mode.store(.servfail, .release); // the held answer is a SERVFAIL
+
+    var ws: [3]NamedLookup = undefined;
+    var fs: [3]std.Io.Future(void) = undefined;
+    var started: usize = 0;
+    defer for (fs[0..started]) |*f| f.await(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    for (&ws, &fs, 0..) |*w, *f, i| {
+        w.* = .{ .c = &c, .name = "slow.example.com" };
+        f.* = try h.io.concurrent(NamedLookup.run, .{w});
+        started += 1;
+        if (i == 0) try waitFor(h.io, &h.stub.stashed);
+    }
+    try waitForFlightWaiters(&c, 2);
+    h.stub.release_slow.store(true, .release);
+    for (&ws) |*w| try waitFor(h.io, &w.done);
+    for (&ws) |*w| try testing.expect(!w.ok.load(.acquire)); // all three see the failure
+    const st = c.stats();
+    try testing.expectEqual(@as(u64, 1), st.network_lookups); // the waiters read the lead's backoff, not the network
+    try testing.expectEqual(@as(u64, 2), st.coalesced);
+    try testing.expectEqual(@as(usize, 0), inflightCount(&c));
+}
+
+test "a miss waiting for its key's lookup can be cancelled; the lead still finishes" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_concurrent_lookups = 4 });
+    defer c.deinit();
+
+    var lead: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+    var f1 = try h.io.concurrent(NamedLookup.run, .{&lead});
+    defer f1.await(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &h.stub.stashed);
+
+    var waiter: NamedLookup = .{ .c = &c, .name = "SLOW.example.com" }; // same key: case folded
+    var f2 = try h.io.concurrent(NamedLookup.run, .{&waiter});
+    var f2_over = false;
+    defer if (!f2_over) f2.cancel(h.io);
+    try waitForFlightWaiters(&c, 1);
+    f2.cancel(h.io);
+    f2_over = true;
+    try testing.expect(!waiter.ok.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), c.flight_waiters);
+
+    h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &lead.done);
+    try testing.expect(lead.ok.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), inflightCount(&c));
+    try testing.expectEqual(@as(u64, 1), c.stats().network_lookups);
+}
+
+test "a cancelled lead does not strand its waiters: one of them asks in turn" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_concurrent_lookups = 4 });
+    defer c.deinit();
+
+    var lead: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+    var f1 = try h.io.concurrent(NamedLookup.run, .{&lead});
+    var f1_over = false;
+    defer if (!f1_over) f1.cancel(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &h.stub.stashed);
+
+    var waiter: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+    var f2 = try h.io.concurrent(NamedLookup.run, .{&waiter});
+    defer f2.await(h.io);
+    try waitForFlightWaiters(&c, 1);
+    f1.cancel(h.io); // the lead gives up while its answer is held
+    f1_over = true;
+    try testing.expect(!lead.ok.load(.acquire));
+
+    // The waiter wakes to an empty table and asks itself: a second query reaches the stub.
+    for (0..5000) |_| {
+        if (h.queries() >= 2) break;
+        try h.io.sleep(.fromMilliseconds(2), .awake);
+    } else return error.TestTimeout;
+    h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &waiter.done);
+    try testing.expect(waiter.ok.load(.acquire));
+    const st = c.stats();
+    try testing.expectEqual(@as(u64, 2), st.network_lookups);
+    try testing.expectEqual(@as(u64, 1), st.coalesced);
+    try testing.expectEqual(@as(usize, 0), inflightCount(&c));
+}
+
+// ── prefetch and many lookups ──
+
+test "prefetch is off by default: a hit late in the TTL marks nothing" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{});
+    defer c.deinit();
+    dropAnswer(c.lookupIp("pf.example.com"));
+    h.clock.add(59); // 1 s of 60 left
+    dropAnswer(c.lookupIp("pf.example.com"));
+    try testing.expectEqual(@as(usize, 0), try c.refreshDue(10));
+    try testing.expectEqual(@as(u32, 1), h.queries());
+    try testing.expectEqual(@as(u64, 0), c.stats().prefetches);
+}
+
+test "prefetch: a hit in the last prefetch_pct of the TTL marks the key once; refreshDue renews it" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .prefetch_pct = 20 });
+    defer c.deinit();
+    dropAnswer(c.lookupIp("pf.example.com")); // stored for 60 s
+    h.clock.add(40); // 20 s left = 33 %: not yet
+    dropAnswer(c.lookupIp("pf.example.com"));
+    try testing.expectEqual(@as(usize, 0), try c.refreshDue(10));
+    h.clock.add(10); // 10 s left = 16 %: due
+    var hit = try c.lookupIp("pf.example.com");
+    try testing.expectEqual(Source.cache, hit.source); // served from the table all the same
+    hit.deinit();
+    dropAnswer(c.lookupIp("pf.example.com")); // a second late hit does not mark it twice
+    try testing.expectEqual(@as(u32, 1), h.queries());
+    try testing.expectEqual(@as(usize, 1), try c.refreshDue(10));
+    try testing.expectEqual(@as(u32, 2), h.queries());
+    try testing.expectEqual(@as(usize, 0), try c.refreshDue(10)); // taken
+    h.clock.add(30); // past the old expiry (60 s), inside the renewed one
+    var after = try c.lookupIp("pf.example.com");
+    defer after.deinit();
+    try testing.expectEqual(Source.cache, after.source);
+    try testing.expectEqual(@as(u32, 2), h.queries());
+    const st = c.stats();
+    try testing.expectEqual(@as(u64, 1), st.prefetches);
+    try testing.expectEqual(@as(u64, 1), st.misses); // the refresh is no miss
+}
+
+test "a failed prefetch refresh keeps the old answer and arms the key's backoff (no retry storm)" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .prefetch_pct = 20 });
+    defer c.deinit();
+    dropAnswer(c.lookupIp("pf.example.com")); // stored for 60 s
+    h.clock.add(50);
+    dropAnswer(c.lookupIp("pf.example.com")); // marks it due
+    h.stub.mode.store(.servfail, .release);
+    try testing.expectEqual(@as(usize, 1), try c.refreshDue(10));
+    const sent = h.queries();
+    try testing.expect(sent >= 2);
+    var hit = try c.lookupIp("pf.example.com"); // the old answer is still served, and marks it again
+    try testing.expectEqual(Source.cache, hit.source);
+    hit.deinit();
+    try testing.expectEqual(@as(usize, 1), try c.refreshDue(10)); // attempted ...
+    try testing.expectEqual(sent, h.queries()); // ... but held by the backoff: nothing sent
+    const st = c.stats();
+    try testing.expectEqual(@as(u64, 0), st.stale_served);
+    try testing.expectEqual(@as(u64, 2), st.prefetches);
+}
+
+test "prefetch_pct over 99 is refused" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    try testing.expectError(error.InvalidOptions, h.cache(.{ .prefetch_pct = 100 }));
+}
+
+test "lookupIpMany: one result per name, successes and failures, in order" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_concurrent_lookups = 2 });
+    defer c.deinit();
+    const long_label: [64]u8 = @splat('a'); // over 63 bytes: refused locally
+    const names = [_][]const u8{ "m1.example.com", "m2.example.com", long_label ++ ".example.com", "m1.example.com", "192.0.2.7" };
+    var results: [names.len]IpResult = undefined;
+    try c.lookupIpMany(&names, &results);
+    defer for (&results) |*r| dropAnswer(r.*);
+    for ([_]usize{ 0, 1, 3, 4 }) |i| {
+        const a = try results[i];
+        try testing.expectEqual(@as(usize, 1), a.lookup.items.len);
+    }
+    try testing.expect(std.meta.isError(results[2]));
+    try testing.expectEqual(@as(u32, 2), h.queries()); // m1 once (cached or coalesced), m2 once; the bad name sent nothing
+    var short: [1]IpResult = undefined;
+    try testing.expectError(error.LengthMismatch, c.lookupIpMany(&names, &short));
+}
+
+const ManyRun = struct {
+    c: *CachingResolver,
+    names: []const []const u8,
+    results: []IpResult,
+    err: ?anyerror = null,
+    fn run(m: *ManyRun) void {
+        m.c.lookupIpMany(m.names, m.results) catch |e| {
+            m.err = e;
+        };
+    }
+};
+
+test "lookupIpMany can be cancelled: every result is set, the cut-short one to error.Canceled" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_concurrent_lookups = 4 });
+    defer c.deinit();
+    const names = [_][]const u8{ "fast.example.com", "slow.example.com" };
+    var results: [names.len]IpResult = undefined;
+    var m: ManyRun = .{ .c = &c, .names = &names, .results = &results };
+    var f = try h.io.concurrent(ManyRun.run, .{&m});
+    var over = false;
+    defer if (!over) f.cancel(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &h.stub.stashed);
+    f.cancel(h.io);
+    over = true;
+    defer for (&results) |*r| dropAnswer(r.*);
+    try testing.expectError(error.Canceled, results[1]);
+    if (results[0]) |a| try testing.expectEqual(@as(usize, 1), a.lookup.items.len) else |e| try testing.expectEqual(error.Canceled, e);
+    try testing.expectEqual(@as(usize, 0), inflightCount(&c));
+}
+
+// ── delta mutation audit 2026-11-15: tests the first schemata run asked for ──
 
 fn freeCount(c: *CachingResolver) usize {
     c.pool_mutex.lockUncancelable(c.io);
@@ -2280,7 +2788,9 @@ const GateAllocator = struct {
     }
     fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
         const g: *GateAllocator = @ptrCast(@alignCast(ctx));
-        if (g.armed.swap(false, .acq_rel)) {
+        // Only the pooled Resolver's allocation is failed (other allocations, e.g. the coalescing
+        // record taken under the table mutex, pass): that is the path this gate is for.
+        if (len == @sizeOf(Slot) and g.armed.swap(false, .acq_rel)) {
             for (0..5000) |_| {
                 g.c.pool_mutex.lockUncancelable(g.c.io);
                 const w = g.c.pool_waiters;
@@ -2550,7 +3060,7 @@ test "F4: a failure never arms backoff on an entry that holds a fresh answer" {
     var kbuf: [key_buf_len]u8 = undefined;
     const k = nameKey(&kbuf, .ip, "host.example.com").?;
     c.mutex.lockUncancelable(c.io);
-    var served = try c.failed(netaddr.Ip, k, error.Timeout, c.now());
+    var served = try c.failed(netaddr.Ip, k, error.Timeout, c.now(), false);
     c.mutex.unlock(c.io);
     defer served.deinit();
     try testing.expectEqual(Source.cache, served.source);
@@ -2728,9 +3238,9 @@ test "a fresh answer served by a failure is aged, capped at its stored TTL and b
     const ka = nameKey(&kbuf, .ip, "a.example.com").?;
 
     c.mutex.lockUncancelable(c.io);
-    var aged = try c.failed(netaddr.Ip, ka, error.Timeout, c.now());
+    var aged = try c.failed(netaddr.Ip, ka, error.Timeout, c.now(), false);
     // an earlier `t` would give 70 s left: the stored TTL (60) is the ceiling
-    var capped = try c.failed(netaddr.Ip, ka, error.Timeout, c.now() - 20);
+    var capped = try c.failed(netaddr.Ip, ka, error.Timeout, c.now() - 20, false);
     c.mutex.unlock(c.io);
     defer aged.deinit();
     defer capped.deinit();
@@ -3033,4 +3543,304 @@ test "a hit of more than max_sort_candidates addresses keeps its order, and the 
     try testing.expectEqual(many.len, hit.lookup.items.len);
     try testing.expectEqualSlices(netaddr.Ip, &many, hit.lookup.items); // unsorted: too many candidates
     try testing.expectEqual(@as(u32, 0), probe_calls);
+}
+
+// ── delta mutation audit 2026-11-16 (coalescing, prefetch, lookupIpMany): tests the first schemata run asked for ──
+
+fn expectSource(r: anytype, want: Source) !void {
+    var a = try r;
+    defer a.deinit();
+    try testing.expectEqual(want, a.source);
+}
+
+fn dueFlag(c: *CachingResolver, kind: Kind, name: []const u8) bool {
+    var buf: [key_buf_len]u8 = undefined;
+    const k = nameKey(&buf, kind, name).?;
+    c.mutex.lockUncancelable(c.io);
+    defer c.mutex.unlock(c.io);
+    return c.map.get(k).?.prefetch_due;
+}
+
+test "refreshDue renews every kind of key: each key survives the round trip through its own bytes" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .prefetch_pct = 50 });
+    defer c.deinit();
+    const v4: netaddr.Ip = .{ .v4 = .{ 192, 0, 2, 1 } };
+    const v6: netaddr.Ip = .{ .v6 = .{ 0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+    for (0..2) |round| {
+        // Round 0 stores eight answers (60 s); after 40 s round 1 hits them late in the TTL and marks them.
+        dropAnswer(c.lookupIp("pk.example.com"));
+        dropAnswer(c.reverse(v4));
+        dropAnswer(c.reverse(v6));
+        dropAnswer(c.lookupMx("example.com"));
+        dropAnswer(c.lookupNs("example.com"));
+        dropAnswer(c.lookupTxt("example.com"));
+        dropAnswer(c.lookupCname("alias.example.com"));
+        dropAnswer(c.lookupSrv("sip", "tcp", "example.com"));
+        if (round == 0) h.clock.add(40);
+    }
+    try testing.expectEqual(@as(u32, 8), h.queries());
+    try testing.expectEqual(@as(usize, 8), try c.refreshDue(100));
+    try testing.expectEqual(@as(u32, 16), h.queries()); // one network lookup per key
+    try testing.expectEqual(@as(u32, 2), h.stub.sip_queries.load(.acquire)); // the SRV refresh asked for the same name again
+    try testing.expectEqual(@as(usize, 0), try c.refreshDue(100));
+    h.clock.add(30); // 70 s after the first answers: past their TTL, inside the renewed one
+    try expectSource(c.lookupIp("pk.example.com"), .cache);
+    try expectSource(c.reverse(v4), .cache);
+    try expectSource(c.reverse(v6), .cache);
+    try expectSource(c.lookupMx("example.com"), .cache);
+    try expectSource(c.lookupNs("example.com"), .cache);
+    try expectSource(c.lookupTxt("example.com"), .cache);
+    try expectSource(c.lookupCname("alias.example.com"), .cache);
+    try expectSource(c.lookupSrv("sip", "tcp", "example.com"), .cache);
+    try testing.expectEqual(@as(u32, 16), h.queries());
+    const st = c.stats();
+    try testing.expectEqual(@as(u64, 8), st.prefetches);
+    try testing.expectEqual(@as(u64, 8), st.misses); // the refreshes are no misses
+}
+
+test "refreshDue takes at most max keys, the most recently used first, each key once" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .prefetch_pct = 50 });
+    defer c.deinit();
+    dropAnswer(c.lookupIp("old.example.com"));
+    dropAnswer(c.lookupIp("new.example.com"));
+    h.clock.add(40);
+    dropAnswer(c.lookupIp("old.example.com")); // marks both, the newer use last
+    dropAnswer(c.lookupIp("new.example.com"));
+    try testing.expect(dueFlag(&c, .ip, "old.example.com") and dueFlag(&c, .ip, "new.example.com"));
+    try testing.expectEqual(@as(usize, 0), try c.refreshDue(0));
+    try testing.expectEqual(@as(usize, 1), try c.refreshDue(1));
+    try testing.expect(dueFlag(&c, .ip, "old.example.com")); // the newer use went first
+    try testing.expect(!dueFlag(&c, .ip, "new.example.com"));
+    try testing.expectEqual(@as(u32, 3), h.queries());
+    try testing.expectEqual(@as(usize, 1), try c.refreshDue(1)); // the older one is still found behind the newer
+    try testing.expect(!dueFlag(&c, .ip, "old.example.com"));
+    try testing.expectEqual(@as(usize, 0), try c.refreshDue(1));
+    try testing.expectEqual(@as(u32, 4), h.queries());
+}
+
+const RefreshRun = struct {
+    c: *CachingResolver,
+    res: ?(error{Canceled}!usize) = null,
+    done: std.atomic.Value(bool) = .init(false),
+    fn run(r: *RefreshRun) void {
+        r.res = r.c.refreshDue(10);
+        r.done.store(true, .release);
+    }
+};
+
+test "refreshDue can be cancelled: the cancel stops it instead of being counted as a failed refresh" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .prefetch_pct = 50 });
+    defer c.deinit();
+    var first: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+    var f1 = try h.io.concurrent(NamedLookup.run, .{&first});
+    defer f1.await(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &h.stub.stashed);
+    h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &first.done);
+    try testing.expect(first.ok.load(.acquire));
+    h.stub.release_slow.store(false, .release);
+    h.clock.add(40);
+    try expectSource(c.lookupIp("slow.example.com"), .cache); // late in the TTL: marked
+
+    var r: RefreshRun = .{ .c = &c };
+    var f2 = try h.io.concurrent(RefreshRun.run, .{&r});
+    var f2_over = false;
+    defer if (!f2_over) f2.cancel(h.io);
+    for (0..5000) |_| {
+        if (h.queries() >= 2) break;
+        try h.io.sleep(.fromMilliseconds(2), .awake);
+    } else return error.TestTimeout;
+    f2.cancel(h.io); // the refresh's answer is held
+    f2_over = true;
+    try testing.expectError(error.Canceled, r.res.?);
+    try testing.expectEqual(@as(usize, 0), inflightCount(&c));
+    h.stub.release_slow.store(true, .release);
+}
+
+test "the prefetch mark: strictly less than prefetch_pct of the stored TTL left, exactly (20 % and 99 % of 60 s)" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .prefetch_pct = 20 });
+    defer c.deinit();
+    dropAnswer(c.lookupIp("edge.example.com")); // stored for 60 s
+    h.clock.add(48); // 12 s left: 12 * 100 is not below 20 * 60
+    dropAnswer(c.lookupIp("edge.example.com"));
+    try testing.expect(!dueFlag(&c, .ip, "edge.example.com"));
+    h.clock.add(1); // 11 s left
+    dropAnswer(c.lookupIp("edge.example.com"));
+    try testing.expect(dueFlag(&c, .ip, "edge.example.com"));
+
+    var c99 = try h.cache(.{ .prefetch_pct = 99 });
+    defer c99.deinit();
+    dropAnswer(c99.lookupIp("edge.example.com")); // stored for 60 s
+    dropAnswer(c99.lookupIp("edge.example.com")); // 60 s left: 6000 is not below 99 * 60
+    try testing.expect(!dueFlag(&c99, .ip, "edge.example.com"));
+    h.clock.add(1); // 59 s left: 5900 is below 5940, and 59 * 101 is not
+    dropAnswer(c99.lookupIp("edge.example.com"));
+    try testing.expect(dueFlag(&c99, .ip, "edge.example.com"));
+}
+
+fn waitForQueries(h: *Harness, n: u32) !void {
+    for (0..5000) |_| {
+        if (h.queries() >= n) return;
+        try h.io.sleep(.fromMilliseconds(2), .awake);
+    }
+    return error.TestTimeout;
+}
+
+/// Stores `slow.example.com` (the stub holds the answer until released), leaving the stub holding nothing.
+fn primeSlow(h: *Harness, c: *CachingResolver) !void {
+    var prime: NamedLookup = .{ .c = c, .name = "slow.example.com" };
+    var f = try h.io.concurrent(NamedLookup.run, .{&prime});
+    defer f.await(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &h.stub.stashed);
+    h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &prime.done);
+    try testing.expect(prime.ok.load(.acquire));
+    h.stub.release_slow.store(false, .release);
+}
+
+test "a refresh the budget refuses keeps the answer and serves nothing stale" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .prefetch_pct = 50, .stale_s = 300, .max_network_lookups = .{ .per_s = 1, .burst = 1 } });
+    defer c.deinit();
+    dropAnswer(c.lookupIp("bg.example.com")); // spends the token
+    h.clock.add(40);
+    dropAnswer(c.lookupIp("bg.example.com")); // late in the TTL: marked
+    h.clock.add(25); // expired, inside the stale window; the bucket is full again
+    dropAnswer(c.lookupIp("other.example.com")); // spends the token
+    try testing.expectEqual(@as(usize, 1), try c.refreshDue(1));
+    const st = c.stats();
+    try testing.expectEqual(@as(u64, 1), st.budget_refused);
+    try testing.expectEqual(@as(u64, 0), st.stale_served); // nobody reads a refresh's answer
+    try testing.expectEqual(@as(u64, 2), st.network_lookups);
+}
+
+test "a new answer clears the prefetch mark an expired one carried" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .prefetch_pct = 50, .stale_s = 300 });
+    defer c.deinit();
+    dropAnswer(c.lookupIp("mk.example.com"));
+    h.clock.add(40);
+    dropAnswer(c.lookupIp("mk.example.com"));
+    try testing.expect(dueFlag(&c, .ip, "mk.example.com"));
+    h.clock.add(25); // expired, inside the stale window: the entry stays
+    try expectSource(c.lookupIp("mk.example.com"), .network);
+    try testing.expect(!dueFlag(&c, .ip, "mk.example.com"));
+    try testing.expectEqual(@as(usize, 0), try c.refreshDue(10));
+    try testing.expectEqual(@as(u32, 2), h.queries());
+}
+
+test "a failed refresh remembers its error: the next lookup inside the backoff gets it" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .prefetch_pct = 20, .failure_backoff_min_s = 100, .failure_backoff_max_s = 300 });
+    defer c.deinit();
+    dropAnswer(c.lookupIp("le.example.com"));
+    h.clock.add(50);
+    dropAnswer(c.lookupIp("le.example.com")); // marked
+    h.stub.mode.store(.servfail, .release);
+    try testing.expectEqual(@as(usize, 1), try c.refreshDue(1));
+    const sent = h.queries();
+    h.clock.add(11); // expired (61 s), 11 s into the 100 s backoff
+    try testing.expectError(error.ServerFailed, c.lookupIp("le.example.com"));
+    try testing.expectEqual(sent, h.queries());
+}
+
+test "a failed refresh of a key forgotten meanwhile leaves no failure entry behind" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .prefetch_pct = 50 });
+    defer c.deinit();
+    try primeSlow(&h, &c);
+    h.clock.add(40);
+    try expectSource(c.lookupIp("slow.example.com"), .cache); // marked
+    h.stub.mode.store(.servfail, .release);
+    var r: RefreshRun = .{ .c = &c };
+    var f = try h.io.concurrent(RefreshRun.run, .{&r});
+    defer f.await(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &h.stub.stashed); // the refresh's SERVFAIL is held
+    c.forget(.ip, "slow.example.com");
+    h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &r.done);
+    try testing.expectEqual(@as(usize, 1), try r.res.?);
+    try testing.expectEqual(@as(usize, 0), c.stats().entries);
+}
+
+test "a refresh parked behind a user lookup of its key reads what that lookup stored" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .prefetch_pct = 50, .stale_s = 300 });
+    defer c.deinit();
+    try primeSlow(&h, &c);
+    h.clock.add(40);
+    try expectSource(c.lookupIp("slow.example.com"), .cache); // marked
+    h.clock.add(25); // expired, inside the stale window: the mark stays with the entry
+
+    var user: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+    var f1 = try h.io.concurrent(NamedLookup.run, .{&user});
+    defer f1.await(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &h.stub.stashed); // the user's miss is in flight, its answer held
+    var r: RefreshRun = .{ .c = &c };
+    var f2 = try h.io.concurrent(RefreshRun.run, .{&r});
+    defer f2.await(h.io);
+    try waitForFlightWaiters(&c, 1);
+    h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &user.done);
+    try waitFor(h.io, &r.done);
+    try testing.expectEqual(@as(usize, 1), try r.res.?);
+    try testing.expectEqual(@as(u32, 2), h.queries()); // the prime and the user's lookup: the refresh asked nobody
+    try testing.expectEqual(@as(u64, 2), c.stats().network_lookups);
+}
+
+test "waiters of a cancelled lead ask the network themselves, and a newcomer is not parked behind them" {
+    var h: Harness = .{ .timeout_ms = 10_000 };
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_concurrent_lookups = 8 });
+    defer c.deinit();
+    var lead: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+    var f1 = try h.io.concurrent(NamedLookup.run, .{&lead});
+    var f1_over = false;
+    defer if (!f1_over) f1.cancel(h.io);
+    errdefer h.stub.release_slow.store(true, .release);
+    try waitFor(h.io, &h.stub.stashed);
+
+    var w1: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+    var w2: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+    var f2 = try h.io.concurrent(NamedLookup.run, .{&w1});
+    defer f2.cancel(h.io);
+    var f3 = try h.io.concurrent(NamedLookup.run, .{&w2});
+    defer f3.cancel(h.io);
+    try waitForFlightWaiters(&c, 2);
+    f1.cancel(h.io); // the lead gives up
+    f1_over = true;
+    try waitForQueries(&h, 3); // both waiters ask at once; neither queues behind the other
+
+    var late: NamedLookup = .{ .c = &c, .name = "slow.example.com" };
+    var f4 = try h.io.concurrent(NamedLookup.run, .{&late});
+    defer f4.cancel(h.io);
+    try waitForQueries(&h, 4); // an uncoalesced lookup is no flight to park behind
+    try testing.expectEqual(@as(u32, 0), c.flight_waiters);
 }
