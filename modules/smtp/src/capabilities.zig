@@ -27,32 +27,42 @@ const testing = std.testing;
 pub const Mechanism = enum {
     plain,
     login,
+    /// Google/Microsoft OAuth 2 bearer token (`auth.xoauth2Response`).
+    xoauth2,
+    /// RFC 7628 (`auth.oauthbearerResponse`).
+    oauthbearer,
 
     pub fn name(self: Mechanism) []const u8 {
         return switch (self) {
             .plain => "PLAIN",
             .login => "LOGIN",
+            .xoauth2 => "XOAUTH2",
+            .oauthbearer => "OAUTHBEARER",
         };
     }
 };
 
 /// Which mechanisms the server offered. `other` is true when it offered
-/// something we do not implement (CRAM-MD5, GSSAPI, XOAUTH2, …) — useful for a
+/// something we do not implement (CRAM-MD5, GSSAPI, SCRAM, …) — useful for a
 /// caller's diagnostics, never for a decision.
 pub const AuthSet = struct {
     plain: bool = false,
     login: bool = false,
+    xoauth2: bool = false,
+    oauthbearer: bool = false,
     other: bool = false,
 
     pub fn supports(self: AuthSet, m: Mechanism) bool {
         return switch (m) {
             .plain => self.plain,
             .login => self.login,
+            .xoauth2 => self.xoauth2,
+            .oauthbearer => self.oauthbearer,
         };
     }
 
     pub fn any(self: AuthSet) bool {
-        return self.plain or self.login;
+        return self.plain or self.login or self.xoauth2 or self.oauthbearer;
     }
 };
 
@@ -228,6 +238,10 @@ fn parseAuthList(caps: *Capabilities, list: []const u8) void {
             caps.auth.plain = true;
         } else if (std.ascii.eqlIgnoreCase(m, "LOGIN")) {
             caps.auth.login = true;
+        } else if (std.ascii.eqlIgnoreCase(m, "XOAUTH2")) {
+            caps.auth.xoauth2 = true;
+        } else if (std.ascii.eqlIgnoreCase(m, "OAUTHBEARER")) {
+            caps.auth.oauthbearer = true;
         } else {
             caps.auth.other = true;
         }
@@ -320,10 +334,21 @@ test "the legacy AUTH= form is understood" {
 
 test "AUTH with only mechanisms we cannot perform" {
     const gpa = testing.allocator;
-    var caps = try parse(gpa, "srv\nAUTH GSSAPI CRAM-MD5 XOAUTH2", .{});
+    var caps = try parse(gpa, "srv\nAUTH GSSAPI CRAM-MD5 SCRAM-SHA-256", .{});
     defer caps.deinit();
     try testing.expect(!caps.auth.any());
     try testing.expect(caps.auth.other);
+}
+
+test "AUTH XOAUTH2 and OAUTHBEARER are recognised, case-insensitively" {
+    const gpa = testing.allocator;
+    var caps = try parse(gpa, "srv\nAUTH xoauth2 OAuthBearer", .{});
+    defer caps.deinit();
+    try testing.expect(caps.auth.xoauth2 and caps.auth.oauthbearer);
+    try testing.expect(!caps.auth.other and !caps.auth.plain);
+    try testing.expect(caps.auth.any());
+    try testing.expect(caps.auth.supports(.xoauth2) and caps.auth.supports(.oauthbearer));
+    try testing.expect(!caps.auth.supports(.plain));
 }
 
 test "an empty reply text and a greeting-only reply" {

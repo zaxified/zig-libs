@@ -37,6 +37,10 @@ pub const CommandError = error{
     NonAsciiAddress,
     /// The EHLO/HELO argument is neither a `Domain` nor an address literal.
     InvalidDomain,
+    /// A DSN parameter (RFC 3461) that is empty, over its ceiling, or
+    /// contradicts itself (`NOTIFY=NEVER` together with another condition, an
+    /// `ORCPT` address type that is not an atom).
+    InvalidDsnParameter,
 };
 
 pub const Limits = struct {
@@ -76,9 +80,100 @@ pub const MailParams = struct {
     body: ?BodyType = null,
     /// RFC 6531 `SMTPUTF8`.
     smtputf8: bool = false,
+    /// RFC 3461 §4.3 `RET=` — what a failure DSN returns of the message.
+    ret: ?DsnRet = null,
+    /// RFC 3461 §4.4 `ENVID=` — the sender's envelope identifier, raw bytes
+    /// (xtext-encoded here, at most 100 encoded characters).
+    envid: ?[]const u8 = null,
 };
 
-pub const RcptParams = struct {};
+/// RFC 3461 §4.3 `RET=` value.
+pub const DsnRet = enum {
+    full,
+    hdrs,
+
+    pub fn text(self: DsnRet) []const u8 {
+        return switch (self) {
+            .full => "FULL",
+            .hdrs => "HDRS",
+        };
+    }
+};
+
+/// RFC 3461 §4.1 `NOTIFY=`. All-false means "not specified" (the parameter is
+/// omitted). `never` excludes the other three.
+pub const DsnNotify = struct {
+    never: bool = false,
+    success: bool = false,
+    failure: bool = false,
+    delay: bool = false,
+
+    pub fn isEmpty(self: DsnNotify) bool {
+        return !(self.never or self.success or self.failure or self.delay);
+    }
+};
+
+/// RFC 3461 §4.2 `ORCPT=` — the original recipient as the sender first wrote
+/// it. `address` is raw bytes, xtext-encoded on the wire.
+pub const DsnOrcpt = struct {
+    /// An atom naming the address syntax, `rfc822` for an ordinary mailbox.
+    /// `utf-8` (RFC 6533, a different encoding) is refused.
+    addr_type: []const u8 = "rfc822",
+    address: []const u8,
+};
+
+pub const RcptParams = struct {
+    /// RFC 3461 `NOTIFY=`.
+    notify: DsnNotify = .{},
+    /// RFC 3461 `ORCPT=`.
+    orcpt: ?DsnOrcpt = null,
+};
+
+/// RFC 3461 §4 `ENVID` is at most 100 characters (of its xtext form).
+pub const max_envid_len: usize = 100;
+
+fn xtextPlain(c: u8) bool {
+    return c >= 33 and c <= 126 and c != '+' and c != '=';
+}
+
+/// Length of `xtext(s)`.
+pub fn xtextLen(s: []const u8) usize {
+    var n: usize = 0;
+    for (s) |c| n += if (xtextPlain(c)) @as(usize, 1) else 3;
+    return n;
+}
+
+/// RFC 3461 §4 xtext: every octet outside 33..126, and '+' and '=', becomes
+/// `+` followed by two uppercase hex digits. Returns a slice of `buf`.
+pub fn xtext(buf: []u8, s: []const u8) error{NoSpaceLeft}![]const u8 {
+    if (xtextLen(s) > buf.len) return error.NoSpaceLeft;
+    const hex = "0123456789ABCDEF";
+    var i: usize = 0;
+    for (s) |c| {
+        if (xtextPlain(c)) {
+            buf[i] = c;
+            i += 1;
+        } else {
+            buf[i] = '+';
+            buf[i + 1] = hex[c >> 4];
+            buf[i + 2] = hex[c & 15];
+            i += 3;
+        }
+    }
+    return buf[0..i];
+}
+
+fn validAtom(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        const ok = switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '-' => true,
+            else => false,
+        };
+        if (!ok) return false;
+    }
+    return true;
+}
 
 fn checkArg(s: []const u8) CommandError!void {
     for (s) |c| {
@@ -232,6 +327,12 @@ const Builder = struct {
         self.len += s.len;
     }
 
+    fn putXtext(self: *Builder, s: []const u8) CommandError!void {
+        const rest = self.buf[self.len..];
+        const out = xtext(rest, s) catch return error.CommandTooLong;
+        self.len += out.len;
+    }
+
     fn print(self: *Builder, comptime fmt: []const u8, args: anytype) CommandError!void {
         const rest = self.buf[self.len..];
         const out = std.mem.print(rest, fmt, args) catch return error.CommandTooLong;
@@ -281,16 +382,47 @@ pub fn mail(buf: []u8, from: ?[]const u8, p: MailParams, limits: Limits) Command
     if (p.size) |s| try b.print(" SIZE={d}", .{s});
     if (p.body) |t| try b.print(" BODY={s}", .{t.text()});
     if (p.smtputf8) try b.put(" SMTPUTF8");
+    if (p.ret) |r| try b.print(" RET={s}", .{r.text()});
+    if (p.envid) |e| {
+        if (e.len == 0 or xtextLen(e) > max_envid_len) return error.InvalidDsnParameter;
+        try b.put(" ENVID=");
+        try b.putXtext(e);
+    }
     return b.finish();
 }
 
 /// `RCPT TO:<path>` — RFC 5321 §4.1.1.3. The null path is NOT legal here.
-pub fn rcpt(buf: []u8, to: []const u8, _: RcptParams, limits: Limits, smtputf8: bool) CommandError![]const u8 {
+pub fn rcpt(buf: []u8, to: []const u8, p: RcptParams, limits: Limits, smtputf8: bool) CommandError![]const u8 {
     try validateMailbox(to, limits, smtputf8);
     var b: Builder = .{ .buf = buf, .limits = limits };
     try b.put("RCPT TO:<");
     try b.put(to);
     try b.put(">");
+    const n = p.notify;
+    if (!n.isEmpty()) {
+        if (n.never and (n.success or n.failure or n.delay)) return error.InvalidDsnParameter;
+        try b.put(" NOTIFY=");
+        if (n.never) {
+            try b.put("NEVER");
+        } else {
+            var first = true;
+            inline for (.{ .{ n.success, "SUCCESS" }, .{ n.failure, "FAILURE" }, .{ n.delay, "DELAY" } }) |e| {
+                if (e[0]) {
+                    if (!first) try b.put(",");
+                    try b.put(e[1]);
+                    first = false;
+                }
+            }
+        }
+    }
+    if (p.orcpt) |o| {
+        if (!validAtom(o.addr_type) or std.ascii.eqlIgnoreCase(o.addr_type, "utf-8")) return error.InvalidDsnParameter;
+        if (o.address.len == 0) return error.InvalidDsnParameter;
+        try b.put(" ORCPT=");
+        try b.put(o.addr_type);
+        try b.put(";");
+        try b.putXtext(o.address);
+    }
     return b.finish();
 }
 
@@ -366,6 +498,56 @@ pub fn authContinue(buf: []u8, payload: []const u8, limits: Limits) CommandError
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
+
+test "RFC 3461 xtext: '+', '=', space and bytes outside 33..126" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("abc", try xtext(&buf, "abc"));
+    try testing.expectEqualStrings("a+2Bb+3Dc", try xtext(&buf, "a+b=c"));
+    try testing.expectEqualStrings("+20+00+7F+80+FF", try xtext(&buf, " \x00\x7f\x80\xff"));
+    try testing.expectEqualStrings("~!", try xtext(&buf, "~!"));
+    try testing.expectEqualStrings("+0D+0A", try xtext(&buf, "\r\n"));
+    try testing.expectEqualStrings("", try xtext(&buf, ""));
+    var tiny: [2]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, xtext(&tiny, "+"));
+    try testing.expectEqual(@as(usize, 6), xtextLen("\r\n"));
+}
+
+test "RFC 3461 MAIL parameters RET and ENVID" {
+    var buf: [600]u8 = undefined;
+    try testing.expectEqualStrings(
+        "MAIL FROM:<a@example.com> RET=HDRS ENVID=QQXD2+3D5xyz+2B\r\n",
+        try mail(&buf, "a@example.com", .{ .ret = .hdrs, .envid = "QQXD2=5xyz+" }, .{}),
+    );
+    try testing.expectEqualStrings("MAIL FROM:<> RET=FULL\r\n", try mail(&buf, null, .{ .ret = .full }, .{}));
+    try testing.expectError(error.InvalidDsnParameter, mail(&buf, null, .{ .envid = "" }, .{}));
+    const long = strRepeat("x", 101);
+    try testing.expectError(error.InvalidDsnParameter, mail(&buf, null, .{ .envid = long }, .{ .max_command_line = 1000 }));
+    // 100 xtext characters are legal; encoded length is what counts.
+    _ = try mail(&buf, null, .{ .envid = long[0..100] }, .{ .max_command_line = 1000 });
+    try testing.expectError(error.InvalidDsnParameter, mail(&buf, null, .{ .envid = strRepeat("+", 34) }, .{ .max_command_line = 1000 }));
+    // Control characters are encoded, never forwarded.
+    try testing.expectEqualStrings("MAIL FROM:<> ENVID=a+0D+0Ab\r\n", try mail(&buf, null, .{ .envid = "a\r\nb" }, .{}));
+}
+
+test "RFC 3461 RCPT parameters NOTIFY and ORCPT" {
+    var buf: [600]u8 = undefined;
+    try testing.expectEqualStrings(
+        "RCPT TO:<b@example.net> NOTIFY=SUCCESS,FAILURE,DELAY ORCPT=rfc822;b+2Bx@example.net\r\n",
+        try rcpt(&buf, "b@example.net", .{
+            .notify = .{ .success = true, .failure = true, .delay = true },
+            .orcpt = .{ .address = "b+x@example.net" },
+        }, .{}, false),
+    );
+    try testing.expectEqualStrings("RCPT TO:<b@example.net> NOTIFY=NEVER\r\n", try rcpt(&buf, "b@example.net", .{ .notify = .{ .never = true } }, .{}, false));
+    try testing.expectEqualStrings("RCPT TO:<b@example.net> NOTIFY=FAILURE\r\n", try rcpt(&buf, "b@example.net", .{ .notify = .{ .failure = true } }, .{}, false));
+    try testing.expectEqualStrings("RCPT TO:<b@example.net>\r\n", try rcpt(&buf, "b@example.net", .{}, .{}, false));
+    try testing.expectError(error.InvalidDsnParameter, rcpt(&buf, "b@example.net", .{ .notify = .{ .never = true, .delay = true } }, .{}, false));
+    try testing.expectError(error.InvalidDsnParameter, rcpt(&buf, "b@example.net", .{ .orcpt = .{ .addr_type = "rfc 822", .address = "x" } }, .{}, false));
+    try testing.expectError(error.InvalidDsnParameter, rcpt(&buf, "b@example.net", .{ .orcpt = .{ .addr_type = "", .address = "x" } }, .{}, false));
+    try testing.expectError(error.InvalidDsnParameter, rcpt(&buf, "b@example.net", .{ .orcpt = .{ .addr_type = "UTF-8", .address = "x" } }, .{}, false));
+    try testing.expectError(error.InvalidDsnParameter, rcpt(&buf, "b@example.net", .{ .orcpt = .{ .address = "" } }, .{}, false));
+    try testing.expectEqualStrings("RCPT TO:<b@example.net> ORCPT=X-custom;a+3Db+00c\r\n", try rcpt(&buf, "b@example.net", .{ .orcpt = .{ .addr_type = "X-custom", .address = "a=b\x00c" } }, .{}, false));
+}
 
 test "the RFC 5321 §4.1.1 command shapes, byte for byte" {
     var buf: [600]u8 = undefined;

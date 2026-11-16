@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **ADDITIVE:** SASL XOAUTH2 and OAUTHBEARER (RFC 7628): `auth.xoauth2Response`/`oauthbearerResponse` (+ `*RawLen`, `oauthbearer_error_ack`), `Mechanism.xoauth2`/`.oauthbearer`, `AuthSet.xoauth2`/`.oauthbearer` (these were `other` before; `AuthSet.any()` now counts them), `Credentials.token` (`password` now defaults to empty). Opt-in via `Credentials.mechanisms`, offered only when advertised; refused on a plaintext link like PLAIN; token buffers wiped; AUTH line ceiling 12288 for long tokens; on a 334 error challenge the empty/`\x01` response is sent and the JSON is kept (`Session.authErrorJson`, `Client.authErrorJson`). DSN (RFC 3461): `Envelope.dsn` (`session.Dsn`: `RET`/`ENVID`/`NOTIFY`/`ORCPT`), `command.MailParams.ret/envid`, `RcptParams.notify/orcpt`, `command.xtext`, `CommandError.InvalidDsnParameter`, `SessionError.DsnNotSupported`; sent only when DSN was advertised, validated before MAIL FROM.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `auth`'s credential scan takes its zero-byte mask from `b64ct.eqMask`.
