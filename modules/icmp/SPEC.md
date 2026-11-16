@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [kolapapa/surge-ping](https://github.com/kolapapa/surge-ping) | Rust | MIT | 99 | not fetched | Async ICMP ping crate, one client shared across targets *(inferred; README not read)*. |
 | Zig `std` / Zig ecosystem | Zig | — | — | — | Zig `std` has no ICMP (this module's README). A GitHub search (`icmp ping`, language Zig, by stars) turned up no ICMP prober library. |
 
-**Where we are ahead:** the only Zig ICMP library found, and against the Go/Rust crates the only one built as a scheduler for many targets (global pacing, in-flight cap, per-subnet spacing, batched syscalls, kernel receive timestamps), with a pure codec anchored on real kernel captures, source-address checking and both address families. **Where we are behind:** no Windows/macOS/BSD (a deliberate ceiling, SPEC "Backlog"), and no standard deviation in `Stats` (pro-bing has it; fping's own summary does not). Neither is a gap against the reference's Linux behavior.
+**Where we are ahead:** the only Zig ICMP library found, and against the Go/Rust crates the only one built as a scheduler for many targets (global pacing, in-flight cap, per-subnet spacing, batched syscalls, kernel receive timestamps), with a pure codec anchored on real kernel captures, source-address checking and both address families. **Where we are behind:** no Windows/macOS/BSD (a deliberate ceiling, SPEC "Backlog"), and (until 2026-11-16) no standard deviation in `Stats` (pro-bing has it; fping's own summary does not). Neither was a gap against the reference's Linux behavior.
 
 ## Design & invariants
 Layered, codec is pure: `echo` — build/parse + internet checksum, bounds-checked, never panics on
@@ -95,7 +95,7 @@ can be opened. Run: `zig build test-icmp`.
 None beyond the accepted Linux-only platform ceiling (raw-syscall nature, shared with rawsock/
 netlink/wireguard/l2disco/procnet — a deliberate scope decision, not a gap).
 - **`ErrInfo` lacks `ee_info`** (requested by pathmtu, 2026-11-03): the next-hop MTU of a Frag-Needed, which `IP_RECVERR` delivers. Without it pathmtu's ping-socket lane bisects, about 11 probes per narrowing, where the hint would give one. Results are exact either way. Additive field.
-- **Standard deviation / jitter in `Stats`** (survey 2026-09-30): pro-bing reports `StdDevRtt`; `Stats` keeps min/max/total/last only, so a caller feeding results through the callback must accumulate its own sum of squares (rg `min_ns|total_ns` in `src/pinger.zig`). Effort: small. Fits CONVENTIONS §2.
+- ✅ DONE 2026-11-16 (`Stats.stddevNs()` population std dev via Welford, `Stats.jitterNs()` mean absolute consecutive difference, additive fields) **Standard deviation / jitter in `Stats`** (survey 2026-09-30): pro-bing reports `StdDevRtt`; `Stats` keeps min/max/total/last only, so a caller feeding results through the callback must accumulate its own sum of squares (rg `min_ns|total_ns` in `src/pinger.zig`). Effort: small. Fits CONVENTIONS §2.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 7 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
 

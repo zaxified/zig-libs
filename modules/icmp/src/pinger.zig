@@ -191,6 +191,14 @@ pub const Stats = struct {
     max_ns: u64 = 0,
     total_ns: u64 = 0,
     last_ns: u64 = 0,
+    /// Welford running mean of the received RTTs (ns). Internal state of
+    /// `stddevNs`; read the accessor instead. No samples are stored.
+    rtt_mean: f64 = 0,
+    /// Welford running sum of squared deviations from `rtt_mean`.
+    rtt_m2: f64 = 0,
+    /// Sum of |rtt - previous rtt| over consecutive received probes (ns,
+    /// saturating); the numerator of `jitterNs`.
+    jitter_sum_ns: u64 = 0,
 
     pub fn alive(s: Stats) bool {
         return s.recv > 0;
@@ -210,6 +218,45 @@ pub const Stats = struct {
     pub fn avgNs(s: Stats) ?u64 {
         if (s.recv == 0) return null;
         return s.total_ns / s.recv;
+    }
+
+    /// Population standard deviation of the received RTTs in ns, the same
+    /// definition as pro-bing's `StdDevRtt` (sqrt(E[x^2] - E[x]^2), divisor
+    /// n), computed online with Welford's method (no stored samples).
+    /// `null` before the first reply; 0 after exactly one.
+    pub fn stddevNs(s: Stats) ?u64 {
+        if (s.recv == 0) return null;
+        const v = s.rtt_m2 / @as(f64, @floatFromInt(s.recv));
+        if (!(v > 0)) return 0;
+        const r = @sqrt(v);
+        if (r >= 18446744073709551615.0) return std.math.maxInt(u64);
+        return @intFromFloat(r);
+    }
+
+    /// Jitter in ns: the mean absolute difference of consecutive received
+    /// RTTs (arrival order), i.e. sum |rtt_i - rtt_(i-1)| / (recv - 1). This
+    /// is the plain mean, not the RFC 3550 exponentially smoothed estimator.
+    /// `null` until two replies have arrived.
+    pub fn jitterNs(s: Stats) ?u64 {
+        if (s.recv < 2) return null;
+        return s.jitter_sum_ns / (s.recv - 1);
+    }
+
+    /// One reply's RTT into `recv`, `last_ns` and the stddev / jitter
+    /// state (the reply path's update; `total_ns`, `min_ns`, `max_ns` stay
+    /// with the caller).
+    fn noteReply(s: *Stats, rtt: u64) void {
+        const had_prev = s.recv > 0;
+        s.recv +|= 1;
+        if (had_prev) {
+            const d = if (rtt > s.last_ns) rtt - s.last_ns else s.last_ns - rtt;
+            s.jitter_sum_ns +|= d;
+        }
+        const x: f64 = @floatFromInt(rtt);
+        const delta = x - s.rtt_mean;
+        s.rtt_mean += delta / @as(f64, @floatFromInt(s.recv));
+        s.rtt_m2 += delta * (x - s.rtt_mean);
+        s.last_ns = rtt;
     }
 };
 
@@ -1226,8 +1273,7 @@ pub const Pinger = struct {
                 self.inflight -= 1;
 
                 const s = &t.stats;
-                s.recv +|= 1;
-                s.last_ns = rtt;
+                s.noteReply(rtt);
                 s.total_ns += rtt;
                 if (s.min_ns == 0 or rtt < s.min_ns) s.min_ns = rtt;
                 if (rtt > s.max_ns) s.max_ns = rtt;
@@ -1501,6 +1547,34 @@ test "stats helpers" {
     try std.testing.expectEqual(@as(u32, 1), s.lost());
     try std.testing.expectEqual(@as(u32, 250), s.lossPermille());
     try std.testing.expectEqual(@as(u64, 1_000_000), s.avgNs().?);
+}
+
+test "stats stddev and jitter: online accumulation" {
+    // The reply path's own update (`noteReply`).
+    var s: Stats = .{};
+    try std.testing.expectEqual(@as(?u64, null), s.stddevNs());
+    try std.testing.expectEqual(@as(?u64, null), s.jitterNs());
+    const rtts = [_]u64{ 10_000, 20_000, 40_000, 20_000 };
+    for (rtts, 0..) |rtt, i| {
+        s.noteReply(rtt);
+        if (i == 0) {
+            try std.testing.expectEqual(@as(?u64, 0), s.stddevNs());
+            try std.testing.expectEqual(@as(?u64, null), s.jitterNs());
+        }
+    }
+    // mean 22500; population variance = ((12.5)^2 + (2.5)^2 + (17.5)^2 + (2.5)^2) e6 / 4 = 118.75e6
+    const sd = s.stddevNs().?;
+    try std.testing.expect(sd >= 10_897 and sd <= 10_898);
+    // |10->20| + |20->40| + |40->20| = 10+20+20 = 50 us over 3 gaps.
+    try std.testing.expectEqual(@as(u64, 16_666), s.jitterNs().?);
+}
+
+test "stats stddev: identical RTTs give 0 and saturated sums stay finite" {
+    var s: Stats = .{ .recv = 3, .rtt_m2 = 0, .jitter_sum_ns = std.math.maxInt(u64) };
+    try std.testing.expectEqual(@as(?u64, 0), s.stddevNs());
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64) / 2), s.jitterNs().?);
+    s.rtt_m2 = 1e300;
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), s.stddevNs());
 }
 
 test "stats helpers: no probes sent yet" {

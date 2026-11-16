@@ -46,7 +46,7 @@ const id = try pinger.addTarget("192.0.2.1");   // numeric v4/v6 (+ "%zone")
 _ = try pinger.addTargetIp(some_netaddr_ip);    // straight from `dns`
 pinger.setResultCallback(ctx, onOutcome);       // per-probe reply/timeout/dup
 try pinger.run();                                // or prepare()/step()/pollFds()
-const st = pinger.stats(id);                     // sent/recv/loss, min/avg/max RTT
+const st = pinger.stats(id);                     // sent/recv/loss, min/avg/max RTT, stddevNs()/jitterNs()
 
 // The codec — pure, no I/O.
 var pkt: [icmp.echo.echo_header_len + 56]u8 = @splat(0);
