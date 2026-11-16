@@ -106,6 +106,10 @@ defer gpa.free(xml);
 // Apply the binding yourself: deflate + base64 + URL-encode for HTTP-Redirect.
 ```
 
+An IdP with `AuthnRequestsSigned="true"` over the POST binding wants the signature inside the request:
+`saml.buildSignedAuthnRequest(gpa, opts, .{ .rsa = &sp_secret_key })` takes the same options and embeds an
+enveloped RSA-SHA256 `<ds:Signature>` after `<Issuer>` (for Redirect, sign the query with `buildSignedRedirectQuery`).
+
 Further AuthnRequest options (all default to "not emitted"):
 
 ```zig

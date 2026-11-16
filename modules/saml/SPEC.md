@@ -793,7 +793,7 @@ AuthnRequest options `ForceAuthn`/`IsPassive`/`RequestedAuthnContext`/
 `AttributeConsumingServiceIndex`/`ProtocolBinding` (HTTP-Artifact; HTTP-Redirect is
 forbidden for the Response by SAMLProf §4.1.2, so it is deliberately not offered).
 
-- **Embedded signature on a POST-binding AuthnRequest** (`AuthnRequestsSigned` over POST).
+- ✅ **DONE 2026-11-16 (`buildSignedAuthnRequest(alloc, opts, key)`, a separate function so `buildAuthnRequest`'s error set does not widen):** **Embedded signature on a POST-binding AuthnRequest** (`AuthnRequestsSigned` over POST).
   Redirect-binding requests are already signable via `buildSignedRedirectQuery`; the POST
   form needs `sign_with` on `AuthnRequestOptions`, which widens `buildAuthnRequest`'s error
   set (BREAKING for exhaustive switches). Effort: small. Fits §2: yes.

@@ -509,3 +509,53 @@ fn b64(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
     _ = e.encode(out, data);
     return out;
 }
+
+// ── buildSignedAuthnRequest ──────────────────────────────────────────────────
+
+test "buildSignedAuthnRequest: enveloped signature after Issuer verifies; body equals the unsigned build" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xA07_0001);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
+    const opts: saml.AuthnRequestOptions = .{
+        .id = "_authn_signed_01",
+        .issue_instant = "2024-06-01T12:00:00Z",
+        .issuer = "https://sp.example.org/metadata",
+        .destination = "https://idp.example.org/sso",
+        .acs_url = "https://sp.example.org/acs",
+        .name_id_format = "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
+    };
+    const signed = try saml.buildSignedAuthnRequest(alloc, opts, .{ .rsa = &kp.secret_key });
+    defer alloc.free(signed);
+    const plain = try saml.buildAuthnRequest(alloc, opts);
+    defer alloc.free(plain);
+
+    var doc = try xml.parse(alloc, signed, .{ .id_attr_names = &.{"ID"} });
+    defer doc.deinit();
+    const sig = findChild(doc.root, ds_ns, "Signature").?;
+    // Placed right after <Issuer> (SAMLCore §5.4.2 / the schema's order).
+    const first = firstElementChild(doc.root).?;
+    try testing.expectEqualStrings("Issuer", first.local);
+    var res = try xmldsig.verify(alloc, &doc, sig, .{ .key = .{ .rsa = kp.public_key }, .id_attr = "ID", .max_references = 1 });
+    defer res.deinit(alloc);
+    try testing.expect(res.valid);
+
+    // Without the signature the bytes are the unsigned build's.
+    const s0 = std.mem.find(u8, signed, "<ds:Signature").?;
+    const s1 = std.mem.find(u8, signed, "</ds:Signature>").? + "</ds:Signature>".len;
+    const stripped = try std.mem.concat(alloc, u8, &.{ signed[0..s0], signed[s1..] });
+    defer alloc.free(stripped);
+    try testing.expectEqualStrings(plain, stripped);
+
+    // A tampered ACS URL no longer verifies.
+    const bad = try alloc.dupe(u8, signed);
+    defer alloc.free(bad);
+    const at = std.mem.find(u8, bad, "sp.example.org/acs").?;
+    bad[at] = 'S';
+    var doc2 = try xml.parse(alloc, bad, .{ .id_attr_names = &.{"ID"} });
+    defer doc2.deinit();
+    const sig2 = findChild(doc2.root, ds_ns, "Signature").?;
+    var res2 = try xmldsig.verify(alloc, &doc2, sig2, .{ .key = .{ .rsa = kp.public_key }, .id_attr = "ID", .max_references = 1 });
+    defer res2.deinit(alloc);
+    try testing.expect(!res2.valid);
+}

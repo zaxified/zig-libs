@@ -2040,7 +2040,40 @@ pub const RequestedAuthnContext = struct {
 pub fn buildAuthnRequest(alloc: std.mem.Allocator, opts: AuthnRequestOptions) std.mem.Allocator.Error![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
-    const w = &buf;
+    try appendAuthnRequestOpen(alloc, &buf, opts);
+    try appendAuthnRequestIssuer(alloc, &buf, opts);
+    try appendAuthnRequestRest(alloc, &buf, opts);
+    try buf.appendSlice(alloc, "</samlp:AuthnRequest>");
+    return buf.toOwnedSlice(alloc);
+}
+
+/// `buildAuthnRequest` with an enveloped `<ds:Signature>` (RSA-SHA256,
+/// exclusive C14N) right after `<Issuer>`, referencing `opts.id` — what an IdP
+/// with `AuthnRequestsSigned="true"` expects over the HTTP-POST binding. For
+/// the Redirect binding build the unsigned request and sign the query string
+/// with `buildSignedRedirectQuery` instead. `opts.id` must be an NCName (the
+/// signature's `URI="#id"`), as for the other signed messages.
+pub fn buildSignedAuthnRequest(alloc: std.mem.Allocator, opts: AuthnRequestOptions, key: SigningKey) ProtocolMessageBuildError![]u8 {
+    var open: std.ArrayList(u8) = .empty;
+    errdefer open.deinit(alloc);
+    try appendAuthnRequestOpen(alloc, &open, opts);
+    var issuer_buf: std.ArrayList(u8) = .empty;
+    errdefer issuer_buf.deinit(alloc);
+    try appendAuthnRequestIssuer(alloc, &issuer_buf, opts);
+    var rest: std.ArrayList(u8) = .empty;
+    errdefer rest.deinit(alloc);
+    try appendAuthnRequestRest(alloc, &rest, opts);
+
+    const root_open = try open.toOwnedSlice(alloc);
+    defer alloc.free(root_open);
+    const issuer_xml = try issuer_buf.toOwnedSlice(alloc);
+    defer alloc.free(issuer_xml);
+    const rest_xml = try rest.toOwnedSlice(alloc);
+    defer alloc.free(rest_xml);
+    return signProtocolMessage(alloc, root_open, issuer_xml, rest_xml, "</samlp:AuthnRequest>", opts.id, key);
+}
+
+fn appendAuthnRequestOpen(alloc: std.mem.Allocator, w: *std.ArrayList(u8), opts: AuthnRequestOptions) std.mem.Allocator.Error!void {
     try w.appendSlice(alloc, "<samlp:AuthnRequest xmlns:samlp=\"");
     try w.appendSlice(alloc, samlp_ns);
     try w.appendSlice(alloc, "\" xmlns:saml=\"");
@@ -2070,9 +2103,15 @@ pub fn buildAuthnRequest(alloc: std.mem.Allocator, opts: AuthnRequestOptions) st
         try w.appendSlice(alloc, "\"");
     }
     try w.appendSlice(alloc, ">");
+}
+
+fn appendAuthnRequestIssuer(alloc: std.mem.Allocator, w: *std.ArrayList(u8), opts: AuthnRequestOptions) std.mem.Allocator.Error!void {
     try w.appendSlice(alloc, "<saml:Issuer>");
     try appendTextEscaped(alloc, w, opts.issuer);
     try w.appendSlice(alloc, "</saml:Issuer>");
+}
+
+fn appendAuthnRequestRest(alloc: std.mem.Allocator, w: *std.ArrayList(u8), opts: AuthnRequestOptions) std.mem.Allocator.Error!void {
     if (opts.name_id_format) |f| {
         try w.appendSlice(alloc, "<samlp:NameIDPolicy Format=\"");
         try appendAttrEscaped(alloc, w, f);
@@ -2083,8 +2122,6 @@ pub fn buildAuthnRequest(alloc: std.mem.Allocator, opts: AuthnRequestOptions) st
     if (opts.requested_authn_context) |rac| {
         if (rac.class_refs.len > 0) try appendRequestedAuthnContext(alloc, w, rac);
     }
-    try w.appendSlice(alloc, "</samlp:AuthnRequest>");
-    return buf.toOwnedSlice(alloc);
 }
 
 fn appendRequestedAuthnContext(alloc: std.mem.Allocator, w: *std.ArrayList(u8), rac: RequestedAuthnContext) std.mem.Allocator.Error!void {

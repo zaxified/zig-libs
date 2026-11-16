@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — `buildSignedAuthnRequest(alloc, opts, key)`: an AuthnRequest with an enveloped RSA-SHA256 signature
+  after `<Issuer>` for the HTTP-POST binding (`AuthnRequestsSigned`). `buildAuthnRequest` is unchanged (same bytes, same
+  error set); both share one builder.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** `parseIdpMetadataFor` takes its XML options from a helper
   (`untrustedAggregateXmlOptions`), so the TEETH check that every untrusted parse goes through one holds again.
 - **2026-11-16** — ADDED (additive): `parseIdpMetadataFor(alloc, xml, entity_id, AggregateOptions)` picks one IdP from an `<md:EntitiesDescriptor>` aggregate (nested groups, bounded nesting/entity count/parse elements; `EntityNotFound`, `AmbiguousEntity`; no signature check, as for `parseIdpMetadata`), and `IdpMetadata.ui_info` carries `mdui:UIInfo` DisplayName / Description / Logo with `xml:lang` (new `UiInfo`, `UiString`, `UiLogo`, `mdui_ns`, `max_ui_entries`). `parseIdpMetadata` behaves as before apart from filling `ui_info`.
