@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — Call-site `*args` / `**kwargs` (D9 part 1) for macros, `{% call %}`, filters, tests and the built-in globals: `f(1, *xs, k=2, **d)`. Grammar and errors follow Jinja2 3.1.6's `parse_call_args` (one `*` before any `**`, `**` last, keywords may follow `*xs`, positionals may not; a repeated keyword, literal or via `**`, a non-iterable after `*`, a non-mapping or non-string key after `**` are errors). `ast.Args` gains `star`/`dstar`. 39 new `d9_*` cases captured from the real reference; the transcript is 470 cases. Line statements and custom delimiters remain open.
+
 - **2026-11-16** — New globals `cycler(*items)` (`.next()`, `.current`, `.reset()`) and `joiner(sep=", ")` ("" on the first call, `sep` after), as in Jinja2 3.1; new stateful `Value.gadget` variant (`jinja.Gadget`). Both used to be a render error. `lipsum` is still absent.
 - **2026-11-16** — New tests `filter` and `test` (true when the environment, custom registrations included, has a filter / test of that name; non-strings are false) and the symbolic test names `==` `!=` `>` `>=` `<` `<=` (aliases of `eq` `ne` `gt` `ge` `lt` `le`, reachable through `select`/`reject` like in Jinja2 3.1; `x is >= 2` stays a syntax error as there). `filters.Ctx` gained `hasFilter`/`hasTest` (defaulted).
 

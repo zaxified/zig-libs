@@ -49,7 +49,7 @@ pub const golden_json = @embedFile("testdata/golden.json");
 /// (`tools/corpus.zig`), so this is the module's own floor on how much of the
 /// anchor it is allowed to hold. Raise it when the corpus grows; it may not
 /// fall without a CHANGELOG entry saying which cases went and why.
-const min_cases = 351;
+const min_cases = 470;
 
 fn parseGolden(gpa: std.mem.Allocator) !std.json.Parsed(std.json.Value) {
     return std.json.parseFromSlice(std.json.Value, gpa, golden_json, .{});

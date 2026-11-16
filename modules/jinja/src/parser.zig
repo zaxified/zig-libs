@@ -584,6 +584,8 @@ fn nodeMentions(n: Node, name: []const u8) bool {
 fn argsMention(a: ast.Args, name: []const u8) bool {
     for (a.positional) |p| if (exprMentions(p, name)) return true;
     for (a.keyword) |k| if (exprMentions(k.value, name)) return true;
+    if (a.star) |e| if (exprMentions(e, name)) return true;
+    if (a.dstar) |e| if (exprMentions(e, name)) return true;
     return false;
 }
 
@@ -1062,24 +1064,39 @@ const Stream = struct {
         defer self.unnest();
         var positional: std.ArrayList(*const Expr) = .empty;
         var keyword: std.ArrayList(ast.Kwarg) = .empty;
+        var star: ?*const Expr = null;
+        var dstar: ?*const Expr = null;
+        const bad = "invalid syntax for function call expression";
         while (!self.eat(.rparen)) {
-            if (positional.items.len + keyword.items.len != 0)
+            if (positional.items.len + keyword.items.len != 0 or star != null or dstar != null)
                 _ = try self.expect(.comma, line, "expected `,` between arguments");
             if (self.eat(.rparen)) break;
-            if (self.peek() != null and (self.peek().?.kind == .mul or self.peek().?.kind == .pow))
-                return self.p.failAt(line, "`*args`/`**kwargs` are not implemented (see SPEC.md)");
             const t = self.peek() orelse return self.p.failAt(line, "unterminated argument list");
-            if (t.kind == .name and self.peekAt(1) != null and self.peekAt(1).?.kind == .assign) {
+            // Jinja2's parse_call_args: one `*` (before any `**`), one `**`
+            // (last); keywords may follow `*xs`, positionals may not.
+            if (t.kind == .mul) {
+                if (star != null or dstar != null) return self.p.failAt(line, bad);
+                self.i += 1;
+                star = try self.parseExpression(line, true);
+            } else if (t.kind == .pow) {
+                if (dstar != null) return self.p.failAt(line, bad);
+                self.i += 1;
+                dstar = try self.parseExpression(line, true);
+            } else if (t.kind == .name and self.peekAt(1) != null and self.peekAt(1).?.kind == .assign) {
+                if (dstar != null) return self.p.failAt(line, bad);
+                for (keyword.items) |k|
+                    if (std.mem.eql(u8, k.name, t.text)) return self.p.failAt(line, "keyword argument repeated");
                 self.i += 2;
                 const v = try self.parseExpression(line, true);
                 try keyword.append(self.p.arena, .{ .name = t.text, .value = v });
             } else {
                 if (keyword.items.len != 0)
                     return self.p.failAt(line, "positional argument after a keyword argument");
+                if (star != null or dstar != null) return self.p.failAt(line, bad);
                 try positional.append(self.p.arena, try self.parseExpression(line, true));
             }
         }
-        return .{ .positional = positional.items, .keyword = keyword.items };
+        return .{ .positional = positional.items, .keyword = keyword.items, .star = star, .dstar = dstar };
     }
 
     /// `| filter` and `is test`, the tightest-binding postfix layer.

@@ -1041,11 +1041,34 @@ const Renderer = struct {
     }
 
     fn evalArgs(self: *Renderer, a: ast.Args, line: usize) Error!filters.Args {
-        const pos = try self.arena.alloc(Value, a.positional.len);
-        for (a.positional, 0..) |p, i| pos[i] = try self.eval(p, line);
-        const kw = try self.arena.alloc(filters.Kwarg, a.keyword.len);
-        for (a.keyword, 0..) |k, i| kw[i] = .{ .name = k.name, .value = try self.eval(k.value, line) };
-        return .{ .pos = pos, .kw = kw };
+        var pos: std.ArrayList(Value) = .empty;
+        for (a.positional) |p| try pos.append(self.arena, try self.eval(p, line));
+        if (a.star) |e| {
+            const v = try self.eval(e, line);
+            // Jinja2 iterates an undefined value as empty; strict raises.
+            const items: []const Value = if (v == .undef and self.opts.undefined_policy != .strict)
+                &.{}
+            else
+                value.iterate(self.arena, v) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return self.fail(line, "value after * must be an iterable", .{}, error.BadCall),
+                };
+            try pos.appendSlice(self.arena, items);
+        }
+        var kw: std.ArrayList(filters.Kwarg) = .empty;
+        for (a.keyword) |k| try kw.append(self.arena, .{ .name = k.name, .value = try self.eval(k.value, line) });
+        if (a.dstar) |e| {
+            const v = try self.eval(e, line);
+            if (v != .map) return self.fail(line, "argument after ** must be a mapping", .{}, error.BadCall);
+            for (v.map.pairs) |p| {
+                if (p.key != .string) return self.fail(line, "keywords must be strings", .{}, error.BadCall);
+                const name = p.key.string.bytes;
+                for (kw.items) |k| if (std.mem.eql(u8, k.name, name))
+                    return self.fail(line, "got multiple values for keyword argument '{s}'", .{name}, error.BadCall);
+                try kw.append(self.arena, .{ .name = name, .value = p.value });
+            }
+        }
+        return .{ .pos = pos.items, .kw = kw.items };
     }
 
     fn filterCtx(self: *Renderer) filters.Ctx {

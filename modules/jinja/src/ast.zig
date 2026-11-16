@@ -18,6 +18,10 @@ pub const Kwarg = struct {
 pub const Args = struct {
     positional: []const *const Expr = &.{},
     keyword: []const Kwarg = &.{},
+    /// `f(*xs)`: appended after `positional` at call time.
+    star: ?*const Expr = null,
+    /// `f(**d)`: merged after `keyword` at call time; a repeated name is an error.
+    dstar: ?*const Expr = null,
 };
 
 pub const DictEntry = struct {
