@@ -5,7 +5,7 @@
 //!
 //! KST / KSTEXT, STOCHRSI and KDJ are built from the seed cores (`MaCore`,
 //! `RsiCore`, the stochastic `KCore`, `stoch`); CRSI, STC and SQZMOM have
-//! their own cores. CRSI's percent rank is `statistic.PercentrankCore`; SQZMOM
+//! their own cores. CRSI counts its percent rank itself (`countBelow`); SQZMOM
 //! composes `bands.VarCore` (the standard deviation), `overlap.MidpriceCore` and
 //! `statistic.LinearregCore`.
 
@@ -401,7 +401,7 @@ pub const CRSI = struct {
     rsi: rsi_.RsiCore,
     srsi: rsi_.RsiCore,
     ring: mu.Ring,
-    pr: stat.PercentrankCore,
+    rank: usize,
     prev: f64 = 0.0,
     streak: f64 = 0.0,
     n: usize = 0,
@@ -430,7 +430,7 @@ pub const CRSI = struct {
             .rsi = try rsi_.RsiCore.init(.{ .period = p.period, .unstable = p.unstable }),
             .srsi = try rsi_.RsiCore.init(.{ .period = p.streak, .unstable = p.unstable }),
             .ring = mu.Ring.init(scratch[0 .. p.rank + 1]),
-            .pr = try stat.PercentrankCore.init(.{ .period = p.rank }),
+            .rank = p.rank,
         };
     }
     pub fn step(self: *Self, _: anytype, b: In) ?f64 {
@@ -454,8 +454,11 @@ pub const CRSI = struct {
         self.prev = close;
         const sr = self.srsi.step(NoSrc{}, self.streak);
         self.ring.push(rocp);
-        // percent rank of the ROCP value among the previous `rank` ones (the ring holds rank + 1)
-        const prank = self.pr.step(self.ring.view(), rocp) orelse return null;
+        // Percent rank of the ROCP value among the previous `rank` ones (`statistic.PercentrankCore`'s formula). The
+        // ring holds exactly those plus the value itself, which is never below itself, so the count runs over the
+        // whole buffer as one contiguous slice, in any order (an integer count). The first `rank` values have no rank.
+        if (self.ring.n <= self.rank) return null;
+        const prank = pf(countBelow(self.ring.buf, rocp)) / pf(self.rank) * 100.0;
         if (r == null or sr == null) return null;
         return (r.? + sr.? + prank) / 3.0;
     }
@@ -463,6 +466,24 @@ pub const CRSI = struct {
         return mu.peekRings(Self, self, src, b);
     }
 };
+/// How many values of `buf` are below `x` (a NaN on either side is not), eight lanes at a time.
+fn countBelow(buf: []const f64, x: f64) usize {
+    const L = 8;
+    const V = @Vector(L, f64);
+    const U = @Vector(L, u32);
+    const xv: V = @splat(x);
+    const one: U = @splat(1);
+    const zero: U = @splat(0);
+    var acc: U = zero;
+    var i: usize = 0;
+    while (i + L <= buf.len) : (i += L) {
+        const v: V = buf[i..][0..L].*;
+        acc += @select(u32, v < xv, one, zero);
+    }
+    var c: usize = @reduce(.Add, acc);
+    while (i < buf.len) : (i += 1) c += @intFromBool(buf[i] < x);
+    return c;
+}
 pub fn crsiLookback(p: CrsiParams) Error!usize {
     try CRSI.validate(p);
     return CRSI.lookback(p);

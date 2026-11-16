@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Batch speed (P-gap work, third round; every output bit for bit unchanged, NaN inputs included): CRSI counts its
+  percent rank over the ring buffer as one contiguous slice with eight-lane compares (an integer count, so in any order) instead of
+  a `%`-indexed `src.at` per window value — 3.4x TA-Lib before, 0.42x now.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the last open delta mutant (STC `r1 >= 0.0`) confirmed killed; card 597/642.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the second P-gap round (block-scan extremes,
   MFI flow ring, STC `BlockWin`, HMA fused loop), 149/174 killed, 24 equivalent or unobservable, 1 open; new tests:
