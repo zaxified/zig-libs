@@ -99,7 +99,7 @@ boundaries, not TODOs).
   Whether a spreadsheet evaluates a cell led by them is unsettled (OWASP lists neither), so this is a hardening
   question, not a proven hole: decide with the user whether to follow the union of the ecosystem's lead sets (over-guarding
   a `%`-led value like `%20` changes data). Effort: small. Fits §2: yes.
-- **Guard + quote in one call for a `csvstream` writer** *(survey 2026-09-30)*: today the caller chains `writeSafe` and
+- ✅ **DONE 2026-11-16 (`writeField` / `writeRecord` over `csvstream.WriteOptions`, a differential test against `csvstream.writeRecord` of the guarded fields):** **Guard + quote in one call for a `csvstream` writer** *(survey 2026-09-30)*: today the caller chains `writeSafe` and
   `csvstream.writeField` by hand and must get the order right; `go-safe-csv-writer` ships them together. Effort: small
   (a `csvstream` option or a thin function; note the dependency direction between the two modules). Fits §2: yes.
 

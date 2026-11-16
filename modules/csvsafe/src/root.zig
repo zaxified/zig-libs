@@ -22,11 +22,14 @@
 //! separator — i.e. only when it is actually a formula/comment lead
 //! (`+SUM(...)`, `-- comment`, a lone `+`).
 //!
-//! Scope is deliberately ONE concern. This module does NOT quote (RFC 4180)
-//! and does NOT remap decimal separators — those belong to the CSV writer /
-//! csvstream consumer. See README "DEFER".
+//! Scope is deliberately ONE concern. The guard itself does NOT quote
+//! (RFC 4180) and does NOT remap decimal separators — those belong to the CSV
+//! writer. `writeField` / `writeRecord` chain the guard and `csvstream`'s
+//! quoting in the right order (guard first) for a caller who writes CSV with
+//! `csvstream`. See README "DEFER".
 
 const std = @import("std");
+const csvstream = @import("csvstream");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -41,7 +44,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant,
     .model_after = "OWASP CSV Injection prevention",
-    .deps = .{},
+    .deps = .{"csvstream"},
 };
 
 /// The byte prepended to a dangerous cell to neutralize it. An apostrophe is
@@ -119,6 +122,81 @@ pub fn writeSafeSep(
 ) std.Io.Writer.Error!void {
     if (needsGuardSep(value, decimal_sep)) try writer.writeByte(guard_char);
     try writer.writeAll(value);
+}
+
+/// Options of the guarded CSV writer: the `csvstream` dialect it quotes for,
+/// and the decimal separator that tells a signed number from a formula.
+pub const WriteOptions = struct {
+    csv: csvstream.WriteOptions = .{},
+    decimal_sep: u8 = default_decimal_sep,
+};
+
+/// Guard, then quote, in that order (go-safe-csv-writer's `Write`): the
+/// field `csvstream.writeField` would write for `guard_char ++ value` when
+/// `value` needs the guard, else for `value` itself. Nothing is allocated.
+pub fn writeField(w: *std.Io.Writer, value: []const u8, opts: WriteOptions) std.Io.Writer.Error!void {
+    if (!needsGuardSep(value, opts.decimal_sep)) return csvstream.writeField(w, value, opts.csv);
+    return writeGuarded(w, value, opts.csv);
+}
+
+/// One record through `writeField`, joined and terminated like
+/// `csvstream.writeRecord` (its single-empty-field and comment rules
+/// included): byte for byte what `csvstream.writeRecord` writes for the
+/// guarded fields.
+pub fn writeRecord(w: *std.Io.Writer, fields: []const []const u8, opts: WriteOptions) std.Io.Writer.Error!void {
+    const c = opts.csv;
+    // An empty field is never guarded: csvstream's own rule applies as is.
+    if (fields.len == 1 and fields[0].len == 0) return csvstream.writeRecord(w, fields, c);
+    for (fields, 0..) |field, i| {
+        if (i != 0) try w.writeByte(c.delimiter);
+        const guarded = needsGuardSep(field, opts.decimal_sep);
+        const lead: u8 = if (guarded) guard_char else if (field.len != 0) field[0] else 0;
+        var o = c;
+        // csvstream quotes a first field that starts with the comment byte.
+        if (i == 0 and c.comment != 0 and c.quote != 0 and c.quote_style != .never and
+            (guarded or field.len != 0) and lead == c.comment) o.quote_style = .always;
+        if (guarded) try writeGuarded(w, field, o) else try csvstream.writeField(w, field, o);
+    }
+    try w.writeAll(switch (c.line_terminator) {
+        .crlf => "\r\n",
+        .lf => "\n",
+    });
+}
+
+/// `csvstream.writeField` of `guard_char ++ value`, without building it.
+/// Kept in step with csvstream by the differential test below.
+fn writeGuarded(w: *std.Io.Writer, value: []const u8, opts: csvstream.WriteOptions) std.Io.Writer.Error!void {
+    const quoted = opts.quote != 0 and switch (opts.quote_style) {
+        .always => true,
+        .never => false,
+        .necessary => blk: {
+            if (guard_char == opts.delimiter or guard_char == opts.quote) break :blk true;
+            for (value) |b| {
+                if (b == opts.delimiter or b == opts.quote or b == '\r' or b == '\n') break :blk true;
+            }
+            break :blk false;
+        },
+    };
+    if (!quoted) {
+        try w.writeByte(guard_char);
+        return w.writeAll(value);
+    }
+    try w.writeByte(opts.quote);
+    const escape = if (opts.escape == opts.quote) 0 else opts.escape;
+    const one = [1]u8{guard_char};
+    for ([_][]const u8{ &one, value }) |part| {
+        var start: usize = 0;
+        for (part, 0..) |b, i| {
+            if (b == opts.quote or (escape != 0 and b == escape)) {
+                try w.writeAll(part[start..i]);
+                try w.writeByte(if (escape != 0) escape else opts.quote);
+                try w.writeByte(b);
+                start = i + 1;
+            }
+        }
+        try w.writeAll(part[start..]);
+    }
+    try w.writeByte(opts.quote);
 }
 
 /// Allocates and returns a guarded copy of `value`. The result is either an
@@ -359,4 +437,62 @@ test "signed number tail: digit-grouping '.' and ',' never make a number suspici
     // ...while one formula-capable byte anywhere in the tail guards it.
     try testing.expect(needsGuardSep("-1,000+1", '.'));
     try testing.expect(needsGuardSep("-1.000;1", ','));
+}
+
+test "writeRecord equals csvstream.writeRecord over the guarded fields (differential)" {
+    var prng = std.Random.DefaultPrng.init(0x5afe_c5f);
+    const r = prng.random();
+    const alphabet = "=+-@\t\r\n|%'\"\\,;#a1. ";
+    const dialect_bytes = ",;'\"#\\|";
+    var fbuf: [6][8]u8 = undefined;
+    var fields: [6][]const u8 = undefined;
+    var want: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer want.deinit();
+    var got: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer got.deinit();
+    for (0..20_000) |_| {
+        const n = r.intRangeAtMost(usize, 1, fields.len);
+        for (fields[0..n], fbuf[0..n]) |*f, *b| {
+            const len = r.uintAtMost(usize, b.len);
+            for (b[0..len]) |*ch| ch.* = alphabet[r.uintLessThan(usize, alphabet.len)];
+            f.* = b[0..len];
+        }
+        const pick = struct {
+            fn f(rr: std.Random, bytes: []const u8, zero_ok: bool) u8 {
+                if (zero_ok and rr.boolean()) return 0;
+                return bytes[rr.uintLessThan(usize, bytes.len)];
+            }
+        }.f;
+        const opts: WriteOptions = .{
+            .csv = .{
+                .delimiter = pick(r, dialect_bytes, false),
+                .quote = pick(r, dialect_bytes, true),
+                .escape = pick(r, dialect_bytes, true),
+                .comment = pick(r, dialect_bytes, true),
+                .quote_style = r.enumValue(csvstream.QuoteStyle),
+                .line_terminator = if (r.boolean()) .crlf else .lf,
+            },
+            .decimal_sep = if (r.boolean()) '.' else ',',
+        };
+        var guarded: [6][]u8 = undefined;
+        for (fields[0..n], guarded[0..n]) |f, *g| g.* = try guardSep(testing.allocator, f, opts.decimal_sep);
+        defer for (guarded[0..n]) |g| testing.allocator.free(g);
+        var gconst: [6][]const u8 = undefined;
+        for (guarded[0..n], gconst[0..n]) |g, *c| c.* = g;
+        want.clearRetainingCapacity();
+        got.clearRetainingCapacity();
+        try csvstream.writeRecord(&want.writer, gconst[0..n], opts.csv);
+        try writeRecord(&got.writer, fields[0..n], opts);
+        try testing.expectEqualStrings(want.written(), got.written());
+    }
+}
+
+test "writeRecord: a guarded field that needs quoting is guarded inside the quotes" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeRecord(&out.writer, &.{ "=HYPERLINK(\"x\")", "ok", "@a,b" }, .{});
+    try testing.expectEqualStrings("\"'=HYPERLINK(\"\"x\"\")\",ok,\"'@a,b\"\r\n", out.written());
+    out.clearRetainingCapacity();
+    try writeField(&out.writer, "-1,5", .{ .csv = .{ .delimiter = ';' }, .decimal_sep = ',' });
+    try testing.expectEqualStrings("-1,5", out.written());
 }

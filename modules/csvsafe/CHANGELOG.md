@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — `writeField` / `writeRecord` (+ `WriteOptions`): guard and `csvstream` quoting in one call, guard first,
+  byte for byte `csvstream.writeRecord` of the guarded fields (a 20,000-record differential test over random dialects).
+  New dependency: `csvstream`.
 - **2026-10-04** — Tests: first mutation run (27 mutants, 27 killed after 3 tests were added; 0 equivalent):
   `guard` with the default separator, a custom separator inside a signed number's tail, and
   grouping `.`/`,` under either locale. No source change.

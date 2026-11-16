@@ -66,6 +66,8 @@ zig fmt --check modules/csvsafe
 - **RFC 4180 quoting** — wrapping a cell that contains the delimiter, the quote
   char, CR or LF, and doubling internal quotes. Left to the CSV writer /
   `csvstream` (it owns the delimiter and quote char; the guard does not).
+  `csvsafe.writeField` / `writeRecord` do both for a `csvstream` dialect, guard
+  first (go-safe-csv-writer's order).
 - **Decimal-separator remapping** — converting `.` → `,` for numeric outputs.
   Also a writer/locale concern; `csvsafe` only *reads* the separator to spot a
   signed number, it never rewrites it.

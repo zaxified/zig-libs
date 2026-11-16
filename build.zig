@@ -342,7 +342,7 @@ pub const module_list = [_]Module{
     .{ .name = "pollworker", .libs = &.{"os"} },
     .{ .name = "ipcbus", .libs = &.{"os"}, .deps = &.{"framing"} },
     .{ .name = "csvstream", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
-    .{ .name = "csvsafe", .libs = &.{"format"} },
+    .{ .name = "csvsafe", .libs = &.{"format"}, .deps = &.{"csvstream"} },
     .{ .name = "numparse", .libs = &.{"format"}, .deps = &.{"decimal"} },
     .{ .name = "argsafe", .libs = &.{"os"} },
     .{ .name = "sessions", .libs = &.{"web"}, .deps = &.{ "router", "http", "cookies", "ramcache", "entropy", "kv", "clock" }, .test_deps = &.{"testkit"} },
