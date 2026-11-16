@@ -83,6 +83,11 @@ pub const encodeSignedInvoiceRequest = bolt12.encodeSignedInvoiceRequest;
 pub const Bolt12Invoice = bolt12.Invoice;
 pub const decodeInvoice = bolt12.decodeInvoice;
 pub const encodeSignedInvoice = bolt12.encodeSignedInvoice;
+pub const invoiceRequestIsRefund = bolt12.invoiceRequestIsRefund;
+// BOLT#12 invoice_error (bare TLV stream).
+pub const InvoiceError = bolt12.InvoiceError;
+pub const decodeInvoiceError = bolt12.decodeInvoiceError;
+pub const encodeInvoiceError = bolt12.encodeInvoiceError;
 
 // Dark-tests aggregator (CONVENTIONS.md §6): a bare re-export does NOT pull
 // a submodule's tests into the test binary on its own.

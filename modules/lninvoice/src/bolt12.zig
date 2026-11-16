@@ -723,6 +723,131 @@ pub fn encodeSignedInvoice(
     return bech32raw.encodeNoChecksum(allocator, "lni", quintets);
 }
 
+// ── refunds (invoice_request without an offer) ───────────────────────────
+
+/// BOLT#12 offer-range TLV types: 1..79 are `offer_*` fields (80..159 are
+/// `invreq_*`, 160..239 `invoice_*`).
+const OFFER_RANGE_LAST: u64 = 79;
+
+/// True if `ir` is a *refund* request: an `invoice_request` that carries no
+/// `offer_*` field at all (it is not a response to an offer; the payee is
+/// meant to answer it with an `invoice` paying the payer). A refund is the
+/// same `lnr1...` wire object as an ordinary request, so decode / verify /
+/// `encodeSignedInvoiceRequest` already handle it; this only classifies it.
+/// Needs the allocator because it re-walks `ir.raw` (the typed struct keeps
+/// only a subset of the offer fields). Unknown odd types are ignored, as
+/// everywhere else in the module.
+pub fn invoiceRequestIsRefund(allocator: Allocator, ir: InvoiceRequest) (lnwire.tlv.StreamError || Allocator.Error)!bool {
+    var parsed = try lnwire.parseTlvStream(allocator, ir.raw, &known_invreq_types);
+    defer parsed.deinit(allocator);
+    for (parsed.records) |rec| {
+        if (rec.type >= 1 and rec.type <= OFFER_RANGE_LAST) return false;
+    }
+    return true;
+}
+
+// ── invoice_error (BOLT#12 "Invoice Errors") ─────────────────────────────
+
+const IERR_ERRONEOUS_FIELD: u64 = 1;
+const IERR_SUGGESTED_VALUE: u64 = 3;
+const IERR_ERROR: u64 = 5;
+
+const known_invoice_error_types = [_]u64{ IERR_ERRONEOUS_FIELD, IERR_SUGGESTED_VALUE, IERR_ERROR };
+
+/// A decoded `invoice_error`: a bare TLV stream (no bech32 string) sent as an
+/// onion-message reply to an `invoice_request` or `invoice`. `error_message`
+/// borrows nothing: `deinit` frees the copies.
+pub const InvoiceError = struct {
+    /// `erroneous_field` (type 1, `tu64`): the TLV type number of the
+    /// offending field of the message being answered.
+    erroneous_field: ?u64,
+    /// `suggested_value` (type 3): a replacement value for that field,
+    /// opaque bytes whose meaning depends on `erroneous_field`. Only present
+    /// together with `erroneous_field`.
+    suggested_value: ?[]u8,
+    /// `error` (type 5): the human-readable explanation, valid UTF-8,
+    /// required, non-empty.
+    error_message: []u8,
+
+    pub fn deinit(self: *InvoiceError, allocator: Allocator) void {
+        if (self.suggested_value) |v| allocator.free(v);
+        allocator.free(self.error_message);
+        self.* = undefined;
+    }
+};
+
+pub const InvoiceErrorError = lnwire.tlv.StreamError || Allocator.Error || error{
+    /// The mandatory `error` field (type 5) is absent or empty.
+    MissingError,
+    /// `error` is not valid UTF-8.
+    BadErrorUtf8,
+    /// `erroneous_field` is not a minimal `tu64`.
+    BadErroneousField,
+    /// `suggested_value` present without `erroneous_field` (BOLT#12: a writer
+    /// MUST NOT set it then; refused on read too, it has no meaning alone).
+    SuggestedValueWithoutField,
+};
+
+/// Decode an `invoice_error` TLV stream (the onion-message payload bytes).
+/// Strict per BOLT#1/#12: types must be strictly increasing, an unknown EVEN
+/// type is refused, an unknown ODD type is ignored; `error` is mandatory and
+/// valid UTF-8; `erroneous_field` is a minimal `tu64`; a duplicate of a
+/// known type is a `NotStrictlyIncreasing` stream error.
+pub fn decodeInvoiceError(allocator: Allocator, bytes: []const u8) InvoiceErrorError!InvoiceError {
+    var parsed = try lnwire.parseTlvStream(allocator, bytes, &known_invoice_error_types);
+    defer parsed.deinit(allocator);
+
+    var field: ?u64 = null;
+    var suggested: ?[]const u8 = null;
+    var msg: ?[]const u8 = null;
+    for (parsed.records) |rec| {
+        switch (rec.type) {
+            IERR_ERRONEOUS_FIELD => field = lnwire.tlv.decodeTruncated(u64, rec.value) catch return error.BadErroneousField,
+            IERR_SUGGESTED_VALUE => suggested = rec.value,
+            IERR_ERROR => msg = rec.value,
+            else => unreachable, // parseTlvStream only returns known types
+        }
+    }
+    const m = msg orelse return error.MissingError;
+    if (m.len == 0) return error.MissingError;
+    if (!std.unicode.utf8ValidateSlice(m)) return error.BadErrorUtf8;
+    if (suggested != null and field == null) return error.SuggestedValueWithoutField;
+
+    const msg_copy = try allocator.dupe(u8, m);
+    errdefer allocator.free(msg_copy);
+    const sugg_copy: ?[]u8 = if (suggested) |v| try allocator.dupe(u8, v) else null;
+    return .{ .erroneous_field = field, .suggested_value = sugg_copy, .error_message = msg_copy };
+}
+
+/// Encode an `invoice_error` as its TLV stream (types 1, 3, 5 ascending).
+/// Refuses what `decodeInvoiceError` would refuse (empty or non-UTF-8
+/// `error_message`, `suggested_value` without `erroneous_field`), so output
+/// always decodes. Caller owns the result.
+pub fn encodeInvoiceError(allocator: Allocator, e: InvoiceError) InvoiceErrorError![]u8 {
+    if (e.error_message.len == 0) return error.MissingError;
+    if (!std.unicode.utf8ValidateSlice(e.error_message)) return error.BadErrorUtf8;
+    if (e.suggested_value != null and e.erroneous_field == null) return error.SuggestedValueWithoutField;
+
+    var tbuf: [8]u8 = undefined;
+    var records: [3]lnwire.RawRecord = undefined;
+    var n: usize = 0;
+    if (e.erroneous_field) |f| {
+        records[n] = .{ .type = IERR_ERRONEOUS_FIELD, .value = lnwire.tlv.encodeTruncated(u64, f, &tbuf) catch unreachable };
+        n += 1;
+    }
+    if (e.suggested_value) |v| {
+        records[n] = .{ .type = IERR_SUGGESTED_VALUE, .value = v };
+        n += 1;
+    }
+    records[n] = .{ .type = IERR_ERROR, .value = e.error_message };
+    n += 1;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try lnwire.tlv.appendStream(&out, allocator, records[0..n]);
+    return out.toOwnedSlice(allocator);
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -2174,4 +2299,115 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+// ── refund + invoice_error tests ─────────────────────────────────────────
+// No external vector anchors these: bolts' bolt12 vectors cover offers,
+// format strings and signatures, not invoice_error or refunds. Fixtures are
+// hand-built from the spec's TLV layout (type 1 tu64, 3 opaque, 5 UTF-8).
+
+test "refund: an offer-less invoice_request round-trips and is classified as a refund" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const sk = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(0x11)));
+    var kp: bip340.KeyPair = undefined;
+    try bip340.KeyPair.fromSecretKey(&kp, &sk);
+    var payer_id: [33]u8 = undefined;
+    payer_id[0] = 0x02;
+    payer_id[1..33].* = kp.public.x;
+    const metadata = @as([8]u8, @splat(0xab));
+
+    const refund_recs = [_]lnwire.RawRecord{
+        .{ .type = IREQ_METADATA, .value = &metadata },
+        .{ .type = INVREQ_AMOUNT, .value = &.{ 0x03, 0xe8 } },
+        .{ .type = INVREQ_PAYER_ID, .value = &payer_id },
+    };
+    const lnr = try encodeSignedInvoiceRequest(allocator, &refund_recs, &sk, @as([32]u8, @splat(0)), io);
+    defer allocator.free(lnr);
+    var ir = try decodeInvoiceRequest(allocator, lnr);
+    defer ir.deinit(allocator);
+    try testing.expect(try ir.verify(allocator));
+    try testing.expectEqual(@as(?u64, 1000), ir.invreq_amount);
+    try testing.expect(try invoiceRequestIsRefund(allocator, ir));
+
+    // Reject-tooth: the same request carrying an offer field is not a refund.
+    const offer_recs = [_]lnwire.RawRecord{
+        .{ .type = IREQ_METADATA, .value = &metadata },
+        .{ .type = TYPE_DESCRIPTION, .value = "x" },
+        .{ .type = INVREQ_PAYER_ID, .value = &payer_id },
+    };
+    const lnr2 = try encodeSignedInvoiceRequest(allocator, &offer_recs, &sk, @as([32]u8, @splat(0)), io);
+    defer allocator.free(lnr2);
+    var ir2 = try decodeInvoiceRequest(allocator, lnr2);
+    defer ir2.deinit(allocator);
+    try testing.expect(!try invoiceRequestIsRefund(allocator, ir2));
+}
+
+test "invoice_error: byte-exact fixture, full and minimal" {
+    const allocator = testing.allocator;
+    // erroneous_field=0x0102 (type1 len2), suggested_value=aa bb (type3 len2), error="bad" (type5 len3)
+    const full = [_]u8{ 0x01, 0x02, 0x01, 0x02, 0x03, 0x02, 0xaa, 0xbb, 0x05, 0x03, 'b', 'a', 'd' };
+    var e = try decodeInvoiceError(allocator, &full);
+    defer e.deinit(allocator);
+    try testing.expectEqual(@as(?u64, 0x0102), e.erroneous_field);
+    try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, e.suggested_value.?);
+    try testing.expectEqualStrings("bad", e.error_message);
+    const enc = try encodeInvoiceError(allocator, e);
+    defer allocator.free(enc);
+    try testing.expectEqualSlices(u8, &full, enc);
+
+    // Minimal: only `error` (type 5).
+    const min = [_]u8{ 0x05, 0x02, 'n', 'o' };
+    var m = try decodeInvoiceError(allocator, &min);
+    defer m.deinit(allocator);
+    try testing.expectEqual(@as(?u64, null), m.erroneous_field);
+    try testing.expect(m.suggested_value == null);
+    const enc2 = try encodeInvoiceError(allocator, m);
+    defer allocator.free(enc2);
+    try testing.expectEqualSlices(u8, &min, enc2);
+
+    // erroneous_field = 0 encodes as a zero-length tu64 and round-trips.
+    var z: InvoiceError = .{ .erroneous_field = 0, .suggested_value = null, .error_message = @constCast("e") };
+    const enc3 = try encodeInvoiceError(allocator, z);
+    defer allocator.free(enc3);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x00, 0x05, 0x01, 'e' }, enc3);
+    z = try decodeInvoiceError(allocator, enc3);
+    defer z.deinit(allocator);
+    try testing.expectEqual(@as(?u64, 0), z.erroneous_field);
+}
+
+test "invoice_error: hostile streams are refused" {
+    const allocator = testing.allocator;
+    // missing error
+    try testing.expectError(error.MissingError, decodeInvoiceError(allocator, &.{}));
+    try testing.expectError(error.MissingError, decodeInvoiceError(allocator, &.{ 0x01, 0x01, 0x07 }));
+    // empty error
+    try testing.expectError(error.MissingError, decodeInvoiceError(allocator, &.{ 0x05, 0x00 }));
+    // non-UTF-8 error
+    try testing.expectError(error.BadErrorUtf8, decodeInvoiceError(allocator, &.{ 0x05, 0x01, 0xff }));
+    // non-minimal tu64 erroneous_field
+    try testing.expectError(error.BadErroneousField, decodeInvoiceError(allocator, &.{ 0x01, 0x02, 0x00, 0x07, 0x05, 0x01, 'x' }));
+    // oversize tu64
+    try testing.expectError(error.BadErroneousField, decodeInvoiceError(allocator, &.{ 0x01, 0x09, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0x05, 0x01, 'x' }));
+    // suggested_value without erroneous_field
+    try testing.expectError(error.SuggestedValueWithoutField, decodeInvoiceError(allocator, &.{ 0x03, 0x01, 0xaa, 0x05, 0x01, 'x' }));
+    // unknown EVEN type (type 2) refused; unknown ODD type (7) ignored
+    try testing.expectError(error.UnknownEvenType, decodeInvoiceError(allocator, &.{ 0x02, 0x00, 0x05, 0x01, 'x' }));
+    var ok = try decodeInvoiceError(allocator, &.{ 0x05, 0x01, 'x', 0x07, 0x01, 0x99 });
+    ok.deinit(allocator);
+    // out of order and duplicate
+    try testing.expectError(error.NotStrictlyIncreasing, decodeInvoiceError(allocator, &.{ 0x05, 0x01, 'x', 0x01, 0x00 }));
+    try testing.expectError(error.NotStrictlyIncreasing, decodeInvoiceError(allocator, &.{ 0x05, 0x01, 'x', 0x05, 0x01, 'y' }));
+    // truncated record
+    try testing.expectError(error.Truncated, decodeInvoiceError(allocator, &.{ 0x05, 0x04, 'x' }));
+}
+
+test "invoice_error: encode refuses what decode would refuse" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.MissingError, encodeInvoiceError(allocator, .{ .erroneous_field = null, .suggested_value = null, .error_message = @constCast("") }));
+    try testing.expectError(error.BadErrorUtf8, encodeInvoiceError(allocator, .{ .erroneous_field = null, .suggested_value = null, .error_message = @constCast("\xff") }));
+    try testing.expectError(error.SuggestedValueWithoutField, encodeInvoiceError(allocator, .{ .erroneous_field = null, .suggested_value = @constCast("v"), .error_message = @constCast("e") }));
 }
