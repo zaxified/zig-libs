@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** SPEC benchmark re-measured on a quiet machine after the second P-gap round
+  (0.68x to 3.4x TA-Lib, 39 of 88 functions over 1.1x, worst CRSI), the table regenerated from the run, the P-gap Backlog
+  rewritten from the profile.
 - **2026-11-16** — Batch speed (P-gap work, second round; every output on NaN-free data bit for bit unchanged):
   MIDPOINT, MIDPRICE, WILLR and ICHIMOKU (f64) run TA-Lib's block scan of the window extremes (`ta_MIDPOINT.c`,
   `ta_WILLR.c`, three `TA_MIDPRICE` calls; new `window.hiLoBlocks`, stack scratch up to period 256, the automaton
