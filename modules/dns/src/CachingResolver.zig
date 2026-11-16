@@ -913,6 +913,12 @@ fn release(c: *CachingResolver, s: *Slot) void {
 /// Called with `mutex` held. An upstream failure arms the key's backoff and
 /// serves what is still allowed to be served.
 fn failed(c: *CachingResolver, comptime T: type, k: []const u8, err: Resolver.Error, t: u64, refresh: bool) Error!Answer(T) {
+    if (isLocalRefusal(err)) {
+        // Refused before anything was sent: not a network lookup, and the
+        // budget token goes back (the `bypass` path never counted these).
+        c.refundLocked();
+        return err;
+    }
     if (!isUpstreamFailure(err)) return err;
     if (refresh) {
         // A prefetch refresh failed: the old answer stays (fresh hits ignore the failure state), but the key's
@@ -987,6 +993,16 @@ fn staleAnswer(c: *CachingResolver, comptime T: type, e: *Entry, reason: Error) 
     a.stale_reason = reason;
     c.stale_served += 1;
     return a;
+}
+
+/// Errors the Resolver returns before sending a query: the name or the
+/// options cannot become one. OutOfMemory and Canceled are not here: either
+/// can come after a query went out.
+fn isLocalRefusal(err: Resolver.Error) bool {
+    return switch (err) {
+        error.NameTooLong, error.BadName, error.RequestTooLarge, error.InvalidOptions, error.NoDotSupport, error.NoDohEndpoint => true,
+        else => false,
+    };
 }
 
 fn isUpstreamFailure(err: Resolver.Error) bool {
@@ -1721,6 +1737,24 @@ test "errors that are not upstream failures pass through and arm nothing" {
     }
     try testing.expectEqual(@as(usize, 0), c.stats().entries);
     try testing.expectEqual(@as(u32, 0), h.queries());
+    // Nothing was sent, so nothing counts as a network lookup.
+    try testing.expectEqual(@as(u64, 0), c.stats().network_lookups);
+}
+
+test "a local refusal takes no budget token" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .max_network_lookups = .{ .per_s = 1, .burst = 1 } });
+    defer c.deinit();
+    for (0..3) |_| try testing.expectError(error.BadName, c.lookupIp("a..b.example.com"));
+    try testing.expectEqual(@as(u64, 0), c.stats().budget_refused);
+    // The one token of the burst is still there for a real lookup.
+    var ok = try c.lookupIp("a.example.com");
+    defer ok.deinit();
+    try testing.expectEqual(Source.network, ok.source);
+    try testing.expectEqual(@as(u64, 1), c.stats().network_lookups);
+    try testing.expectEqual(@as(u64, 0), c.stats().budget_refused);
 }
 
 test "network budget: refusal, refill, and stale under budget" {

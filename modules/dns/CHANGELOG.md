@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — `CachingResolver`: a lookup the Resolver refuses before sending anything (`BadName`, `NameTooLong`,
+  `RequestTooLarge`, `InvalidOptions`, `NoDotSupport`, `NoDohEndpoint`) no longer counts in `Stats.network_lookups` and gives
+  its `max_network_lookups` token back, as the table-bypass path already did. Two tests.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the coalescing, prefetch and `lookupIpMany` code in
   `CachingResolver`, 77/80 killed, 3 equivalent or unobservable; ten new tests (every key kind renewed by `refreshDue`, its
   order and cancelation, the prefetch boundary, refused and failed refreshes, waiters of a canceled lead), and the test Stub
