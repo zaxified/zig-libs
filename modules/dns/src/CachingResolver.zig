@@ -1040,7 +1040,7 @@ const Stub = struct {
             st.stashed.store(true, .release);
             return;
         }
-        if (st.bump_clock) |ck| _ = @atomicRmw(u64, &ck.now, .Add, st.bump_by.load(.acquire), .monotonic);
+        if (st.bump_clock) |ck| ck.add(st.bump_by.load(.acquire));
         try st.sock.send(st.io, &in.from, w.buffered());
     }
 };
@@ -1048,9 +1048,18 @@ const Stub = struct {
 const TestClock = struct {
     now: u64 = 1000,
 
+    /// 64-bit atomics where the target has them. A 32-bit target without
+    /// them (mips32) only COMPILES these tests (`check-portable` runs no
+    /// binary), so a plain access there is never executed.
+    const atomic64 = @bitSizeOf(usize) >= 64;
+
     fn read(ctx: ?*anyopaque) u64 {
         const s: *TestClock = @ptrCast(@alignCast(ctx.?));
-        return @atomicLoad(u64, &s.now, .monotonic);
+        return if (atomic64) @atomicLoad(u64, &s.now, .monotonic) else s.now;
+    }
+
+    fn add(s: *TestClock, by: u64) void {
+        if (atomic64) _ = @atomicRmw(u64, &s.now, .Add, by, .monotonic) else s.now += by;
     }
 
     fn clock(s: *TestClock) Clock {
