@@ -125,7 +125,8 @@ last = base − 1, and both times 0.
 **`MANIFEST`**: magic `SGLM`, version 2, live count, pending count (u32
 each); per live segment 24 bytes — id (u64, strictly increasing), first LSN
 (u64, never decreasing), form (u8, 0 = raw `seg-<id>.log`, 1 = compressed
-`seg-<id>.zst`; anything else is `UnsupportedVersion`), 7 zero bytes; the pending ids
+`seg-<id>.zst`, 2 = still in the version-1 format, a migration under way that
+`open` finishes; anything else is `UnsupportedVersion`), 7 zero bytes; the pending ids
 (u64); then a CRC32C over everything before it. Replaced whole:
 `MANIFEST.tmp`, fsync, rename, directory fsync.
 
@@ -404,7 +405,9 @@ manifest names the segment's form as compressed; then the `.log` is deleted.
 A verification mismatch (`error.CompressVerifyFailed`, counted in
 `Stats.compress_verify_failed`) deletes `COMPRESS.tmp` and returns without
 touching the raw segment or the manifest — nothing durable has changed yet, so
-the segment stays raw and is compressible again later. `open` removes
+the segment stays raw and is compressible again later. `compact` of a
+compressed segment makes the same check on its rewritten `.zst` (2026-11-16,
+review MED-4) and returns the same error, the old segment untouched. `open` removes
 `COMPRESS.tmp` and, of each live segment, the file that is not of its form —
 a `.zst` renamed before the manifest said so, a `.log` not yet deleted after.
 The crash sweep runs a script of compressions (and a compaction of a
@@ -726,4 +729,4 @@ From the 2026-11-16 survey (`## Compared with`) and the independent review of th
 - ✅ 2026-11-16 LOW-9: `seek(0)` is the first record (LSNs start at 1); on a log whose first live segment starts above 1 it is `SegmentGone` like any LSN below the first.
 - ✅ 2026-11-16 mutation finding 46: a storage error in the second or a later frame of one read of a compressed segment is returned as that error, not as a short read the iterator turns into `Corrupt`.
 - ✅ 2026-11-16 found while testing `get`: `seek` of an LSN that compaction removed from the end of a compacted segment returned `Corrupt` when the next segment starts above it; it now lands on that segment's first record.
-- Still open: LOW-6 (`dropBefore` mutates the view before a commit that can fail without poisoning), LOW-7 (reader seek cache, above), LOW-8 (`compress_verify_failed` counts any verify error), and the stale README / SPEC / module-doc text of LOW-10 (the backup warning, the manifest `form` table, the directory's file list).
+- Still open: LOW-6 (`dropBefore` mutates the view before a commit that can fail without poisoning), LOW-7 (reader seek cache, above), LOW-8 (`compress_verify_failed` counts any verify error). LOW-10 closed 2026-11-16: the README backup warning (`OrphanSegment`, `rebuildManifest`), the manifest `form` 2, the directory's file list in the module doc, the `CompressError` doc comment and *Compression*'s note that `compact` verifies too.

@@ -75,9 +75,11 @@
 //! larger record), not one `pread` per record — the recovery walk of `open`
 //! and every iterator alike.
 //!
-//! All files live directly in the backend's directory: `MANIFEST`,
-//! `MANIFEST.tmp`, `LOCK`, and `seg-<id, 20 decimal digits>.log`. One log per
-//! directory.
+//! All files live directly in the backend's directory: `MANIFEST`, `LOCK`,
+//! the segments `seg-<id, 20 decimal digits>.log` (raw) or `.zst`
+//! (compressed), their time indexes `seg-<id>.idx`, and the temporary files
+//! `MANIFEST.tmp`, `COMPACT.tmp`, `COMPRESS.tmp` and `MIGRATE.tmp`, each
+//! renamed into place or removed. One log per directory.
 
 const std = @import("std");
 const kv = @import("kv");
@@ -1068,7 +1070,7 @@ pub const CompactError = IterError || error{
     NotCompactable,
 };
 
-/// What `compact` did.
+/// Why `compress` failed.
 pub const CompressError = Storage.Error || error{
     OutOfMemory,
     Poisoned,
@@ -1379,8 +1381,8 @@ pub const RotateError = Storage.Error || error{
     /// in the first place (`NonMonotonic` catches that). The log is poisoned:
     /// this is not a transient failure to retry, since retrying finds the
     /// same orphan file. Most likely a partial restore that copied segments
-    /// but lost `MANIFEST` — restore the whole state tree again, or repair
-    /// `MANIFEST` by hand from SPEC.md's layout.
+    /// but lost `MANIFEST` — restore the whole state tree again, or rebuild
+    /// `MANIFEST` with `Log.rebuildManifest`.
     OrphanSegment,
     /// The manifest already names as many segments (live plus pending drops)
     /// as one manifest can hold (2^20): `open` refuses a larger one, so

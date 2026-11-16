@@ -113,8 +113,10 @@ A backup needs neither: a segment file is append-only, so a plain copy of it
 is always a valid prefix. ⚠ A backup that copies segment files but misses
 `MANIFEST` (or restores it separately, out of order) leaves the log looking
 empty — `open` with `Options.create` then treats that as "nothing here yet",
-and the next same-day `rotate` truncates a real segment: back both up, or
-neither, in one step.
+and the first `rotate` that reaches a restored segment's name refuses with
+`error.OrphanSegment` and poisons the log (it never overwrites the file).
+Back both up, or neither, in one step; a lost `MANIFEST` is rebuilt with
+`Log.rebuildManifest` (below).
 
 **Recovering a lost `MANIFEST`.** Every other kind of damage already has a
 path back (a torn tail is repaired on `open`, `resync`/`skipSegment` step

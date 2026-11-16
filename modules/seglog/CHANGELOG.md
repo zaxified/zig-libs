@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** documentation only (review LOW-10): the README backup warning now
+  describes `OrphanSegment` and `rebuildManifest` instead of a truncated segment, SPEC lists manifest form 2 (a migration
+  under way) and that `compact` verifies a recompressed segment, the module doc lists every file in the directory, and
+  `CompressError` no longer carries `compact`'s doc comment.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the two independent reviews of the day recorded on the card.
 - **2026-11-16** — NO CONSUMER-VISIBLE CHANGE: delta mutation audit of the day's review fixes and survey additions, 104/111 killed, 6 equivalent, 1 unobservable (SPEC, *Audit 2026-11-16 (delta mutation)*); seven new tests and three extended ones in `src/root.zig` and `src/migrate_test.zig`, no library change.
 - **2026-11-16** — Review fixes to the same day's changes (before any release): `rebuildManifest` refuses a MANIFEST of an
