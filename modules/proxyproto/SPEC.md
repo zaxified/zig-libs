@@ -6,7 +6,7 @@
 
 **Scope:** core — pires/go-proxyproto v0.16.0 (surveyed 2026-11-15)
 
-**Audit:** review none · mutation 2026-11-15 (232/236, 4 eq) · src 503922b31391b8d0
+**Audit:** review 2026-11-16 · mutation 2026-11-16 (234/238, 4 eq) · src 503922b31391b8d0
 
 **Hardening:** fuzz 2026-11-15 (40,000,000 runs, clean, PROXYPROTO_FUZZ, all 17 reach labels hit) · ct n/a — the header is public data, no secret · panic 2026-11-15 (no-panic sweep, `tests.zig`: 20,000 hostile inputs through every pub entry point, safety checks on; plus the fuzz harness)
 
@@ -55,7 +55,11 @@ A PROXY header is a claim by the peer about someone else. `read` therefore takes
 ## Limits and refusals
 
 - v1: 107 bytes including CRLF (spec § 2.1); a line with no LF in 107 bytes is `Malformed`.
-- v2: whole header (16 + length) at most `max_v2_len`, default **536**: the specification's own figure (a header must fit a 576-byte minimum IPv4 datagram after 20 bytes IP and 20 bytes TCP); a unix address block alone is 216. Over the cap is `error.TooLarge`, decided from the 16 fixed bytes, before any more is buffered (pinned by "v2: size cap, default 536").
+- v2: whole header (16 + length) at most `max_v2_len`, default **16 + 4096** (go-proxyproto's payload cap; until the 2026-11-16 review it was the specification's 536, which is a sender's guideline for headers without extra TLVs — a TLV-heavy `send-proxy-v2-ssl-cn` header can pass it, so a receiver capped there drops legitimate connections); a unix address block alone is 216. Over the cap is `error.TooLarge`, decided from the 16 fixed bytes, before any more is buffered (pinned by "v2: size cap, default 16 + 4096"). A caller that wants the tighter bound sets `max_v2_len = 536`.
+- The writer (`writeV2`, `writeV2Crc`) accepts any payload up to 65535: a header over the reader's `max_v2_len` is refused by a reader with that cap, ours included. `writeV2` writes a caller's TLV area as given — a CRC32C TLV already in it is neither checked nor recomputed (use `writeV2Crc` for a computed one).
+- LOCAL and UNSPEC: the protocol block after the family byte is discarded unchecked (the specification tells a receiver to ignore it), including any TLVs and a CRC32C among them.
+- `uniqueId()` refuses a value over 128 bytes (`max_unique_id_len`, the specification's limit) with `error.Malformed`; the raw `tlv()` returns any length.
+- `read` bounds the bytes it buffers, not the time: a peer that trickles a header holds the call. Put a read deadline on the accepted stream before `read`.
 - `read` needs `r.buffer.len` at least the header it is to hold and `buf` at least its consumed length; otherwise `error.TooLarge` (for an untrusted peer: null, see § Trust). A zero-capacity reader (a `Reader.fixed("")`) is therefore `TooLarge`, not "empty".
 
 ## Anchoring
@@ -122,7 +126,16 @@ carried; no new test, 0 equivalent.
 - Decoding the cloud-provider TLVs (AWS VPCE id, Azure LinkID, GCP): **not now**; the layouts are provider documentation, not the specification.
 - Accepting a header from an untrusted peer "but ignoring it": **never**; ignoring silently hides a misconfigured balancer, and an error is what a caller can act on.
 
+**Review 2026-11-16 (independent, read-only).** No HIGH, no input-reachable panic; the eight documented differences
+against go-proxyproto judged defensible against the specification. MED: the 536-byte default cap refused legitimate
+TLV-heavy headers (now 16 + 4096); the writer could produce headers the default reader refuses (documented, and the
+gap is now 65535 vs 4112 instead of vs 536). LOW: LOCAL/UNSPEC blocks discarded unchecked (documented), UNIQUE_ID
+over 128 bytes (refused by `uniqueId`), no read-time bound (documented), `writeV2` TLV area raw (documented); the
+`required = false` default and the newer SSL sub-TLV codes 0x26/0x27 (reachable through `tlv`) stay as they are.
+Delta mutation over the fix: the `uniqueId` bound dropped and `>` → `>=`, both killed by "uniqueId: the specification's
+128 bytes pass, 129 are refused" (run by hand, the mutant applied to the source and reverted); the new default cap is
+pinned at both edges by "v2: size cap, default 16 + 4096".
+
 ## Open
 
 - An interop run against HAProxy `send-proxy-v2` / `send-proxy-v2-ssl` itself has not been done (the oracle above is a second implementation, go-proxyproto, not the specification's home).
-- No independent review yet (the mutation audit of 2026-11-15 is recorded above; `Audit: review none` on the card).
