@@ -6,7 +6,7 @@
 
 **Scope:** mvp — TA-Lib C 0.8.3, all 237 of its functions: the seed set (17), the Overlap Studies wave (27: every moving-average type, the bands / channels, SAR family, Supertrend, Ichimoku, Zig-Zag), the volume / volatility / price-transform / statistic / math-operator wave (50), the cycle wave (25: HT family, MAMA, three SWAK rows, 15 math transforms), the momentum wave (57: ADX family, AROON, ROC family, oscillators, KST / KDJ / STOCHRSI / CRSI / STC / SQZMOM, ...) and the 61 candlestick patterns (`candles.zig`). Remaining deviations from TA-Lib: MAVP has no streaming type; LINEARREG_ANGLE, PSO and the math transforms (ACOS ... TANH) carry a 2-ULP bound (libm `atan` / `tanh` rounding); the Hilbert family and MAMA a column-relative 1e-13 bound (`atan`); RSI answers NaN where TA-Lib's NaN-poisoned state reads 50; batch and streaming MAX / MIN / MINMAX / MIDPOINT / MIDPRICE / WILLR / ICHIMOKU differ in the sign of a 0.0 / -0.0 tie and where a NaN is in the window, as TA-Lib's two tiers do (the batch is its block scan, the stream its automaton) (surveyed 2026-11-15 against `ta_func.h` and the function sources of the 0.8.3 tarball)
 
-**Audit:** review 2026-11-15 · mutation 2026-11-16 (596/642, 45 eq) · src 050f3b1c48e9290e
+**Audit:** review 2026-11-15 · mutation 2026-11-16 (597/642, 45 eq) · src 050f3b1c48e9290e
 
 **Hardening:** fuzz 2026-11-15 (1,080,000 runs clean in three verdicts of 4 jobs, INDICATORS_FUZZ, ReleaseSafe; reach on every function: all 237 entries x f64 / f32 x stream, per-function counts printed; the whole surface — every batch function, `Lookback`, every streaming type with `bufLen` / `init` / `update` / `peek` / `value` / `clone` — under NaN / inf / -0 / denormal / huge data, lengths 0 .. 600, parameters at and beyond every range, mismatched slice lengths, short buffers, a failing allocator and in-place calls; batch == stream, `peek` == `update`, the NaN lead == the lookback, no unwritten output slot; the harness checked by 11 planted mutants) · ct n/a — no secret enters an indicator · panic 2026-11-15 (every entry point and every `@intFromFloat` / `@intCast` / `unreachable` / `.?` / allocation site swept, all 237 functions called by the fuzz harness: MEDIAN / PERCENTILE no longer index out of the sorted copy when the data holds a NaN; BBW / PERCENTB streams keep a ring as long as their average needs (KAMA / ZLEMA / VIDYA were wrong and `peek` differed from `update`); ZIGZAG's `pivot_idx` saturates at 2^31 - 1 instead of trapping)
 
@@ -43,9 +43,10 @@ read); `HmaCore.steady` with `p == 1` guarded away (`n >= 0` holds anyway) and o
 same work); `WmaCore.step`'s `p != 1` guard (`n + 1 < 1` is false anyway); a committing `peekStep` (the real step
 rewrites the ring slot it touched and never reads the suffix slot a block-end commit rebuilds). UNOBSERVABLE: the
 write-backs of `HmaCore.steadyRun` and `vs_kit.run`'s local copy, and `HmaCore.n` (every caller discards the core; they
-need a caller that keeps stepping the same core after the loop). Not closed (1): `r1 >= 0.0` in STC's first fraction
-(0 / 0 = NaN sticks in the smoothing when a flat start is followed by movement; the all-zero-start test is written and
-passes on the original, it was not run against this mutant).
+need a caller that keeps stepping the same core after the loop). `r1 >= 0.0` in STC's first fraction (0 / 0 = NaN sticks
+in the smoothing when a flat start is followed by movement) is killed by the all-zero-start rescan test, checked by hand
+on the coordinator's run (the mutant applied to the source, `modtest indicators` failing on that test, reverted): 174 of
+174 resolved.
 
 ## Compared with
 

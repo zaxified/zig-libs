@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the last open delta mutant (STC `r1 >= 0.0`) confirmed killed; card 597/642.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the second P-gap round (block-scan extremes,
   MFI flow ring, STC `BlockWin`, HMA fused loop), 149/174 killed, 24 equivalent or unobservable, 1 open; new tests:
   signed-zero ties and refusals of `hiLoBlocks`, short inputs of the block-scan batches, HMA and MFI against their streams,
