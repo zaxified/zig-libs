@@ -21,11 +21,14 @@ pub const Encapsulated = struct {
     body: []const u8,
 };
 
+/// One message read by `readMessage`: its bytes and its decoded envelope.
+pub const Read = struct { enc: Encapsulated, msg: schema.Message };
+
 /// Reads the encapsulated message starting at `buf[pos.*]` and advances `pos`.
 /// `error.EndOfStream` at the end-of-stream marker (or at the end of `buf`, or
 /// at a pre-0.15 zero length). Accepts the legacy framing without the
 /// continuation marker. Every length is checked against `buf`.
-pub fn readMessage(buf: []const u8, pos: *usize) Error!struct { enc: Encapsulated, msg: schema.Message } {
+pub fn readMessage(buf: []const u8, pos: *usize) Error!Read {
     var p = pos.*;
     if (p == buf.len) return error.EndOfStream;
     if (buf.len - p < 4) return error.Malformed;

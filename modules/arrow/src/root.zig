@@ -5,12 +5,14 @@
 //! `writeStream` / `readStream` turn a whole frame into an Arrow IPC stream and
 //! back (waves A2 + A3 of the plan in SPEC.md). Underneath: the FlatBuffers layer
 //! (`fb`) Arrow's metadata is written in, the schema tables (`schema`) and the
-//! message framing (`ipc`). The file format and body compression follow.
+//! message framing (`ipc`). `writeFile` / `readFile` / `openFile` do the same for the
+//! IPC file format (wave A4), with random access to a record batch. Body compression
+//! follows.
 
 const std = @import("std");
 
 pub const meta = .{
-    .doc = "Apache Arrow IPC stream and file format for dataframe frames (in progress: stream format done, file format and compression to come)",
+    .doc = "Apache Arrow IPC stream and file format for dataframe frames (in progress: stream and file format done, compression to come)",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
@@ -36,6 +38,13 @@ pub const ReadOptions = stream.ReadOptions;
 pub const writeStream = stream.writeStream;
 /// An Arrow IPC stream as a frame allocated from an arena.
 pub const readStream = stream.readStream;
+/// The frame as an Arrow IPC file (caller frees the bytes).
+pub const writeFile = stream.writeFile;
+/// Every batch of an Arrow IPC file as a frame allocated from an arena.
+pub const readFile = stream.readFile;
+/// Opens an Arrow IPC file for random access to its record batches.
+pub const openFile = stream.openFile;
+pub const File = stream.File;
 
 test {
     _ = fb;

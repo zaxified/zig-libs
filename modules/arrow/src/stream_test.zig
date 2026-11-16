@@ -498,3 +498,108 @@ test "reader: every truncation and byte flip of a multi-batch stream is an error
         }
     }
 }
+
+// ── the file format ─────────────────────────────────────────────────────────
+
+/// `got` holds rows `off..off + got.len` of `want`.
+fn expectRows(want: df.Frame, off: usize, got: df.Frame) !void {
+    try testing.expectEqual(want.columns.len, got.columns.len);
+    for (want.columns, 0..) |wc, ci| {
+        try expectSameType(wc, got.columns[ci]);
+        for (0..got.len) |r| {
+            const x = want.columnAt(ci).get(off + r);
+            const y = got.columnAt(ci).get(r);
+            if (std.meta.activeTag(x) != std.meta.activeTag(y) or (x != .null and !x.eql(y))) {
+                std.debug.print("column {s} row {d}: want {any} got {any}\n", .{ wc.name, off + r, x, y });
+                return error.TestExpectedEqual;
+            }
+        }
+    }
+}
+
+test "file: round trip, both ARROW1 marks, random access to each batch" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const f = try sampleFrame(a);
+    const bytes = try stream.writeFile(gpa, f, .{ .rows_per_batch = 2 });
+    defer gpa.free(bytes);
+    try testing.expectEqualStrings("ARROW1", bytes[0..6]);
+    try testing.expectEqualStrings("ARROW1", bytes[bytes.len - 6 ..]);
+    try expectSameFrame(f, try stream.readFile(a, bytes, .{}));
+
+    var file = try stream.openFile(a, bytes, .{});
+    try testing.expectEqual(@as(usize, 3), file.batchCount());
+    try testing.expectEqual(@as(usize, 1), file.batchRows(2));
+    // Out of order, each batch alone.
+    for ([_]usize{ 2, 0, 1 }) |i| {
+        const got = try file.readBatch(i);
+        try testing.expectEqual(file.batchRows(i), got.len);
+        try expectRows(f, i * 2, got);
+    }
+    try testing.expectError(error.Unsupported, file.readBatch(3));
+    try expectSameFrame(f, try file.readAll());
+
+    // An empty frame: no record batch, the schema and the (empty) dictionaries only.
+    const empty: df.Frame = .{ .columns = f.columns, .data = &.{}, .len = 0 };
+    const eb = try stream.writeFile(gpa, empty, .{});
+    defer gpa.free(eb);
+    var ef = try stream.openFile(a, eb, .{});
+    try testing.expectEqual(@as(usize, 0), ef.batchCount());
+    try expectSameFrame(empty, try ef.readAll());
+}
+
+test "file: bad marks, footer and blocks are errors; every truncation and byte flip is an error or a frame" {
+    const gpa = testing.allocator;
+    var keep = std.heap.ArenaAllocator.init(gpa);
+    defer keep.deinit();
+    const full = try sampleFrame(keep.allocator());
+    const pick = [_][]const u8{ "i64", "s", "cat", "l", "arr", "st" };
+    var cols: [pick.len]Column = undefined;
+    var data: [pick.len]ColumnData = undefined;
+    for (pick, 0..) |p, i| {
+        const ci = full.columnIndex(p).?;
+        cols[i] = full.columns[ci];
+        data[i] = full.data[ci];
+    }
+    const f: df.Frame = .{ .columns = &cols, .data = &data, .len = full.len };
+    const good = try stream.writeFile(gpa, f, .{ .rows_per_batch = 2 });
+    defer gpa.free(good);
+    const sbytes = try stream.writeStream(gpa, f, .{});
+    defer gpa.free(sbytes);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const opts: stream.ReadOptions = .{ .max_rows = 1 << 12 };
+    try expectSameFrame(f, try stream.readFile(a, good, opts));
+
+    // A stream is not a file.
+    try testing.expectError(error.Malformed, stream.readFile(a, sbytes, opts));
+    const copy = try gpa.alloc(u8, good.len);
+    defer gpa.free(copy);
+    // The trailing mark; the footer length past the start, zero, negative.
+    @memcpy(copy, good);
+    copy[copy.len - 1] = '2';
+    try testing.expectError(error.Malformed, stream.readFile(a, copy, opts));
+    for ([_]i32{ std.math.maxInt(i32), 0, -8, @intCast(good.len - 10) }) |bad| {
+        @memcpy(copy, good);
+        std.mem.writeInt(i32, copy[copy.len - 10 ..][0..4], bad, .little);
+        try testing.expectError(error.Malformed, stream.readFile(a, copy, opts));
+    }
+
+    for (0..good.len) |n| {
+        _ = arena_state.reset(.retain_capacity);
+        _ = stream.readFile(arena_state.allocator(), good[0..n], opts) catch {};
+    }
+    for (0..good.len) |i| {
+        for ([_]u8{ 0x00, 0x01, 0x7f, 0x80, 0xff }) |v| {
+            @memcpy(copy, good);
+            copy[i] = v;
+            _ = arena_state.reset(.retain_capacity);
+            var file = stream.openFile(arena_state.allocator(), copy, opts) catch continue;
+            for (0..file.batchCount()) |b| _ = file.readBatch(b) catch {};
+        }
+    }
+}

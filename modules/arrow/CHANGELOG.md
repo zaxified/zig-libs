@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Wave A4: the Arrow IPC file format — `arrow.writeFile`, `arrow.readFile`, and `arrow.openFile`
+  with `File.readBatch(i)` for random access to one record batch (footer with dictionary and record batch blocks);
+  a Time32/Time64 value outside the day now reads as `error.Unsupported` (a value `dataframe` cannot hold) rather
+  than `Malformed`.
 - **2026-11-16** — Waves A2 + A3: `arrow.writeStream` / `arrow.readStream` turn a whole `dataframe.Frame` into an
   Arrow IPC stream and back — every column type (widths, decimal, text/binary with Large offsets, date, timestamp
   with zone, duration, time, categorical as a dictionary, list, fixed-size array, struct), nulls, rows per batch,

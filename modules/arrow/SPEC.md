@@ -136,7 +136,11 @@ someone's afternoon.
 Apache Arrow columnar format 1.x, metadata version V5: `Schema.fbs`, `Message.fbs` (FlatBuffers, `src/fb.zig`,
 `src/schema.zig`), the encapsulated message framing (continuation marker `0xFFFFFFFF`, metadata length, metadata
 padded to 8, body; `src/ipc.zig`) and the stream format: `Schema`, then the `DictionaryBatch`es, then the
-`RecordBatch`es, then the end-of-stream marker (`src/stream.zig`). Buffers are written 64-byte aligned and padded;
+`RecordBatch`es, then the end-of-stream marker (`src/stream.zig`). The file format (wave A4) is `ARROW1` and two
+zero bytes, the same stream, then a `Footer` table (`File.fbs`: version, schema, a `Block` per dictionary and per
+record batch — offset of the message's framing, framing + padded metadata length, body length; 24-byte structs),
+its `int32` length and `ARROW1`; `openFile` reads the footer's schema, decodes the dictionaries and checks every
+batch's metadata, and `File.readBatch(i)` decodes one batch on demand. Buffers are written 64-byte aligned and padded;
 any 8-byte layout is read. Validity bitmaps are LSB-first, a buffer of length 0 when the array has no null.
 
 **Type mapping (wave A2).** The writer maps the column's DECLARED `ColumnType` and reads the cells through
@@ -152,7 +156,7 @@ any 8-byte layout is read. Validity bitmaps are LSB-first, a buffer of length 0 
 | `date` (ISO text) | Date32 (days) | Date64 (ms, floored to the day); years outside 0000–9999 → `Unsupported` |
 | `timestamp` (+ `time_zone`) | Timestamp(us, zone) | s / ms / ns (ns floored to us); a zone `tz` does not know → `Unsupported` |
 | `duration` | Duration(us) | s / ms / ns |
-| `time` | Time64(us) | Time32(s, ms), Time64(ns); a value outside the day → `Malformed` |
+| `time` | Time64(us) | Time32(s, ms), Time64(ns); a value outside `[0, 24h)` → `Unsupported` |
 | `categorical` | Utf8, dictionary-encoded, Int32 indices, `ordered` kept | any integer index type; an unordered dictionary is deduplicated and sorted lexically (the `CatColumn` invariant), an ordered one deduplicated in its order; null dictionary entries read as null rows |
 | `list` (`inner[0]`) | List (Int32 offsets) | LargeList; null rows with elements and offsets not starting at 0 are compacted |
 | `array` (`array_width`) | FixedSizeList(width) | — |
@@ -225,8 +229,16 @@ get confused constantly.
 
 ## Open
 
-- No external anchor yet: every test is a self round trip or a hand-assembled stream from our reading of the spec.
-  Next: the apache/arrow-testing integration golden files (`data/arrow-ipc-stream/integration/*`) as data.
+- No external anchor committed yet: every test is a self round trip or a hand-assembled stream from our reading of
+  the spec. A one-off probe (2026-11-16, not kept) read the apache/arrow-testing `1.0.0-littleendian` integration
+  files, `.stream` and `.arrow_file`, written by Arrow C++: `primitive`, `primitive_large_offsets`,
+  `primitive_no_batches`, `primitive_zerolength`, `nested`, `nested_large_offsets`, `recursive_nested`, `null`,
+  `null_trivial`, `dictionary`, `dictionary_unsigned`, `custom_metadata`, `duplicate_fieldnames`, `extension` decode,
+  stream and file agree, rewriting ours reads back equal, and spot-checked cells match the JSON. `datetime`
+  (Time32 86400 s = 24:00:00), `decimal` (precision 38 at scale 2 overflows 12 digits in i128), `decimal256`,
+  `interval`, `map`, `map_non_canonical`, `nested_dictionary`, `union` are `Unsupported`. Next: commit those files
+  with their JSON as data (Apache-2.0: a third-party attribution NOTICE) and a reader comparing to the JSON —
+  owner decision.
 - The reader copies every buffer (no zero-copy views over the input) and text is not checked for UTF-8.
 - Performance not measured.
 
@@ -240,6 +252,6 @@ pyarrow round trip is an owner decision. Out: the C data interface, Flight, comp
 | A1 | FlatBuffers layer; Schema / Field / type tables, the Message envelope | done 2026-11-16 |
 | A2 | Type mapping `dataframe` ↔ Arrow (table above); `boxed` refused | done 2026-11-16 |
 | A3 | IPC stream: framing, Schema / DictionaryBatch / RecordBatch, end of stream, `rows_per_batch`; `writeStream` / `readStream` | done 2026-11-16 |
-| A4 | IPC file: `ARROW1`, footer with blocks, random access to a batch | open |
+| A4 | IPC file: `ARROW1`, footer with blocks, random access to a batch; `writeFile` / `readFile` / `openFile` | done 2026-11-16 |
 | A5 | ZSTD body compression; LZ4_FRAME `Unsupported` until an `lz4` module exists | open |
 | A6 | Golden oracle, fuzz driver, no-panic sweep, mutation, example, survey | open |

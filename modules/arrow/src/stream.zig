@@ -245,8 +245,10 @@ const Writer = struct {
         return f;
     }
 
-    /// One message holding `fields` over the rows `sel` (a DictionaryBatch when `dict_id` is set).
-    fn emit(w: *Writer, out: *std.ArrayList(u8), fields: []const WField, sel: []const usize, dict_id: ?usize) Error!void {
+    /// One message holding `fields` over the rows `sel` (a DictionaryBatch when `dict_id` is
+    /// set); returns where it landed in `out`.
+    fn emit(w: *Writer, out: *std.ArrayList(u8), fields: []const WField, sel: []const usize, dict_id: ?usize) Error!Block {
+        const at = out.items.len;
         var bo: BatchOut = .{};
         defer bo.deinit(w.gpa);
         for (fields) |*f| try w.writeArray(&bo, f, sel);
@@ -259,6 +261,8 @@ const Writer = struct {
         else
             try ipc.encodeRecordBatchMessage(&b, rb, body_len);
         try ipc.writeMessage(w.gpa, out, meta, bo.body.bytes.items);
+        const body = bo.body.bytes.items.len;
+        return .{ .offset = @intCast(at), .meta_len = @intCast(out.items.len - at - body), .body_len = @intCast(body) };
     }
 
     fn pushNode(w: *Writer, bo: *BatchOut, n: usize, bits: Bits) Error!void {
@@ -527,6 +531,22 @@ fn putOff(offs: []u8, i: usize, wide: bool, v: usize) void {
 
 /// The frame as an Arrow IPC stream (caller frees with `gpa`).
 pub fn writeStream(gpa: Allocator, f: df.Frame, opts: WriteOptions) Error![]u8 {
+    return write(gpa, f, opts, false);
+}
+
+/// The frame as an Arrow IPC file (`ARROW1`, the stream, a footer locating every
+/// dictionary and record batch); caller frees with `gpa`.
+pub fn writeFile(gpa: Allocator, f: df.Frame, opts: WriteOptions) Error![]u8 {
+    return write(gpa, f, opts, true);
+}
+
+const magic = "ARROW1";
+
+/// A message's place in a file (`File.fbs` `Block`): `meta_len` counts the framing
+/// prefix and the padded metadata.
+const Block = struct { offset: i64, meta_len: i32, body_len: i64 };
+
+fn write(gpa: Allocator, f: df.Frame, opts: WriteOptions, file: bool) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     var tmp_state = std.heap.ArenaAllocator.init(gpa);
@@ -540,25 +560,56 @@ pub fn writeStream(gpa: Allocator, f: df.Frame, opts: WriteOptions) Error![]u8 {
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
+    if (file) try out.appendSlice(gpa, magic ++ "\x00\x00");
     {
         var b = fb.Builder.init(gpa);
         defer b.deinit();
         try ipc.writeMessage(gpa, &out, try schema.encodeSchemaMessage(&b, .{ .fields = sfields }), &.{});
     }
+    var dict_blocks: std.ArrayList(Block) = .empty;
+    var batch_blocks: std.ArrayList(Block) = .empty;
     for (w.dicts.items, 0..) |*d, id| {
-        try w.emit(&out, (&d.values)[0..1], try iota(w.tmp, 0, d.len), id);
+        try dict_blocks.append(w.arena, try w.emit(&out, (&d.values)[0..1], try iota(w.tmp, 0, d.len), id));
         _ = tmp_state.reset(.retain_capacity);
     }
     const per = if (opts.rows_per_batch == 0) f.len else opts.rows_per_batch;
     var start: usize = 0;
     while (start < f.len) {
         const end = start + @min(per, f.len - start);
-        try w.emit(&out, fields, try iota(w.tmp, start, end), null);
+        try batch_blocks.append(w.arena, try w.emit(&out, fields, try iota(w.tmp, start, end), null));
         _ = tmp_state.reset(.retain_capacity);
         start = end;
     }
     try ipc.writeEos(gpa, &out);
+    if (file) {
+        var b = fb.Builder.init(gpa);
+        defer b.deinit();
+        const sref = try schema.encodeSchema(&b, .{ .fields = sfields });
+        const dv = try blockVector(&b, w.tmp, dict_blocks.items);
+        const rv = try blockVector(&b, w.tmp, batch_blocks.items);
+        b.startTable();
+        try b.addScalarForce(0, schema.MetadataVersion, .v5);
+        try b.addOffset(1, sref);
+        try b.addOffset(2, dv);
+        try b.addOffset(3, rv);
+        const footer = try b.finish(try b.endTable());
+        const flen = std.math.cast(i32, footer.len) orelse return error.Unsupported;
+        try out.appendSlice(gpa, footer);
+        try out.appendSlice(gpa, &std.mem.toBytes(std.mem.nativeToLittle(i32, flen)));
+        try out.appendSlice(gpa, magic);
+    }
     return out.toOwnedSlice(gpa);
+}
+
+fn blockVector(b: *fb.Builder, a: Allocator, blocks: []const Block) Error!fb.Ref {
+    const bytes = try a.alloc(u8, blocks.len * 24);
+    @memset(bytes, 0);
+    for (blocks, 0..) |x, i| {
+        std.mem.writeInt(i64, bytes[i * 24 ..][0..8], x.offset, .little);
+        std.mem.writeInt(i32, bytes[i * 24 + 8 ..][0..4], x.meta_len, .little);
+        std.mem.writeInt(i64, bytes[i * 24 + 16 ..][0..8], x.body_len, .little);
+    }
+    return b.createStructVector(bytes, 24, 8);
 }
 
 fn iota(a: Allocator, start: usize, end: usize) Error![]usize {
@@ -746,6 +797,54 @@ const Reader = struct {
         return rf;
     }
 
+    fn planAll(r: *Reader, s: schema.Schema) Error!Top {
+        var ctr: Counter = .{};
+        const fields = try r.a.alloc(RField, s.fields.len);
+        for (fields, s.fields) |*rf, f| rf.* = try r.plan(f, &ctr, 0, false);
+        return .{ .fields = fields, .ctr = ctr };
+    }
+
+    fn takeBatch(r: *Reader, top: *const Top, msg: schema.Message, body: []const u8) Error!Chunk {
+        const h = msg.header orelse return error.Malformed;
+        const rb = ipc.decodeRecordBatch(r.a, h, body.len) catch |e| return noEos(e);
+        try r.checkBatch(rb, top.ctr, top.fields);
+        return .{ .rb = rb, .body = body };
+    }
+
+    fn takeDict(r: *Reader, msg: schema.Message, body: []const u8) Error!void {
+        const h = msg.header orelse return error.Malformed;
+        const db = ipc.decodeDictionaryBatch(r.a, h, body.len) catch |e| return noEos(e);
+        const d = for (r.dicts.items) |x| {
+            if (x.id == db.id) break x;
+        } else return error.Malformed;
+        if (!db.is_delta and d.chunks.items.len > 0) return error.Unsupported; // replacement
+        try r.checkBatch(db.data, .{ .nodes = d.nodes, .bufs = d.bufs }, (&d.value)[0..1]);
+        try d.chunks.append(r.a, .{ .rb = db.data, .body = body });
+    }
+
+    fn finishDicts(r: *Reader) Error!void {
+        for (r.dicts.items) |d| {
+            var n: u64 = 0;
+            for (d.chunks.items) |c| n += @intCast(c.rb.length);
+            if (n > r.opts.max_rows) return error.LimitExceeded;
+            d.len = @intCast(n);
+            d.data = try r.decode(&d.value, d.chunks.items);
+        }
+    }
+
+    fn frame(r: *Reader, top: *const Top, chunks: []const Chunk) Error!df.Frame {
+        var total: u64 = 0;
+        for (chunks) |c| total += @intCast(c.rb.length);
+        if (total > r.opts.max_rows) return error.LimitExceeded;
+        const columns = try r.a.alloc(Column, top.fields.len);
+        const data = try r.a.alloc(ColumnData, top.fields.len);
+        for (columns, data, top.fields) |*c, *dd, *rf| {
+            c.* = rf.col;
+            dd.* = try r.decode(rf, chunks);
+        }
+        return .{ .columns = columns, .data = data, .len = @intCast(total) };
+    }
+
     /// A batch's shape against the schema: node and buffer counts, every length within
     /// `max_rows`, every top-level column as long as the batch.
     fn checkBatch(r: *const Reader, rb: ipc.RecordBatch, ctr: Counter, top: []const RField) Error!void {
@@ -805,7 +904,7 @@ const Reader = struct {
                 } else @memcpy(v, try r.raw(i64, rf, chunks, n, valid));
                 for (v) |*x| {
                     x.* = try toMicros(x.*, rf.unit);
-                    if (x.* < 0 or x.* >= us_per_day) return error.Malformed;
+                    if (x.* < 0 or x.* >= us_per_day) return error.Unsupported; // 24:00:00 and beyond: no `.time` value
                 }
                 break :blk typed("int", v, valid, n);
             },
@@ -1322,59 +1421,107 @@ fn noEos(e: ipc.Error) Error {
 pub fn readStream(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!df.Frame {
     var r: Reader = .{ .a = arena, .opts = opts };
     var pos: usize = 0;
-    const first = ipc.readMessage(bytes, &pos) catch |e| return switch (e) {
-        error.EndOfStream => error.Malformed, // no schema
-        else => |x| x,
-    };
+    const first = ipc.readMessage(bytes, &pos) catch |e| return noEos(e); // no schema
     if (first.msg.header_type != .schema) return error.Malformed;
     const s = try schema.decodeSchema(arena, first.msg.header orelse return error.Malformed);
-
-    var ctr: Counter = .{};
-    const fields = try arena.alloc(RField, s.fields.len);
-    for (fields, s.fields) |*rf, f| rf.* = try r.plan(f, &ctr, 0, false);
+    const top = try r.planAll(s);
 
     var batches: std.ArrayList(Chunk) = .empty;
-    var total: u64 = 0;
     while (true) {
         const m = ipc.readMessage(bytes, &pos) catch |e| switch (e) {
             error.EndOfStream => break,
             else => |x| return x,
         };
-        const h = m.msg.header orelse return error.Malformed;
         switch (m.msg.header_type) {
-            .record_batch => {
-                const rb = ipc.decodeRecordBatch(arena, h, m.enc.body.len) catch |e| return noEos(e);
-                try r.checkBatch(rb, ctr, fields);
-                total += @intCast(rb.length);
-                if (total > opts.max_rows) return error.LimitExceeded;
-                try batches.append(arena, .{ .rb = rb, .body = m.enc.body });
-            },
-            .dictionary_batch => {
-                const db = ipc.decodeDictionaryBatch(arena, h, m.enc.body.len) catch |e| return noEos(e);
-                const d = for (r.dicts.items) |x| {
-                    if (x.id == db.id) break x;
-                } else return error.Malformed;
-                if (!db.is_delta and d.chunks.items.len > 0) return error.Unsupported; // replacement
-                try r.checkBatch(db.data, .{ .nodes = d.nodes, .bufs = d.bufs }, (&d.value)[0..1]);
-                try d.chunks.append(arena, .{ .rb = db.data, .body = m.enc.body });
-            },
+            .record_batch => try batches.append(arena, try r.takeBatch(&top, m.msg, m.enc.body)),
+            .dictionary_batch => try r.takeDict(m.msg, m.enc.body),
             .schema => return error.Malformed, // a second schema
             else => return error.Unsupported, // tensors
         }
     }
-
-    for (r.dicts.items) |d| {
-        var n: u64 = 0;
-        for (d.chunks.items) |c| n += @intCast(c.rb.length);
-        if (n > opts.max_rows) return error.LimitExceeded;
-        d.len = @intCast(n);
-        d.data = try r.decode(&d.value, d.chunks.items);
-    }
-    const columns = try arena.alloc(Column, fields.len);
-    const data = try arena.alloc(ColumnData, fields.len);
-    for (columns, data, fields) |*c, *dd, *rf| {
-        c.* = rf.col;
-        dd.* = try r.decode(rf, batches.items);
-    }
-    return .{ .columns = columns, .data = data, .len = @intCast(total) };
+    try r.finishDicts();
+    return r.frame(&top, batches.items);
 }
+
+/// An Arrow IPC file opened for random access to its record batches. Everything is
+/// allocated from the arena given to `openFile`; nothing borrows the file's bytes
+/// after a batch is read.
+pub const File = struct {
+    r: Reader,
+    top: Top,
+    batches: []const Chunk,
+
+    pub fn batchCount(self: *const File) usize {
+        return self.batches.len;
+    }
+
+    /// The rows of batch `i` (`i < batchCount()`).
+    pub fn batchRows(self: *const File, i: usize) usize {
+        return @intCast(self.batches[i].rb.length);
+    }
+
+    /// Batch `i` alone as a frame; `error.Unsupported` past the last batch.
+    pub fn readBatch(self: *File, i: usize) Error!df.Frame {
+        if (i >= self.batches.len) return error.Unsupported;
+        return self.r.frame(&self.top, self.batches[i..][0..1]);
+    }
+
+    /// Every batch, in file order, as one frame.
+    pub fn readAll(self: *File) Error!df.Frame {
+        return self.r.frame(&self.top, self.batches);
+    }
+};
+
+/// Opens an Arrow IPC file: checks both `ARROW1` marks, reads the footer's schema,
+/// decodes every dictionary and checks every record batch's metadata (not its data,
+/// which `File.readBatch` decodes on demand).
+pub fn openFile(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!File {
+    if (bytes.len < 8 + 10) return error.Malformed;
+    if (!std.mem.eql(u8, bytes[0..6], magic) or !std.mem.eql(u8, bytes[bytes.len - 6 ..], magic)) return error.Malformed;
+    const fend = bytes.len - 10;
+    const flen = std.mem.readInt(i32, bytes[fend..][0..4], .little);
+    if (flen <= 0 or @as(usize, @intCast(flen)) > fend - 8) return error.Malformed;
+    const fstart = fend - @as(usize, @intCast(flen));
+    const footer = try fb.root(bytes[fstart..fend]);
+    var r: Reader = .{ .a = arena, .opts = opts };
+    const s = try schema.decodeSchema(arena, try footer.table(1) orelse return error.Malformed);
+    const top = try r.planAll(s);
+
+    // The messages live between the leading mark and the footer.
+    const region = bytes[0..fstart];
+    if (try footer.vector(2)) |v| for (0..v.len) |i| {
+        const m = try readBlock(region, try v.structAt(i, 24));
+        if (m.msg.header_type != .dictionary_batch) return error.Malformed;
+        try r.takeDict(m.msg, m.enc.body);
+    };
+    var batches: []Chunk = &.{};
+    if (try footer.vector(3)) |v| {
+        batches = try arena.alloc(Chunk, v.len);
+        var total: u64 = 0;
+        for (batches, 0..) |*c, i| {
+            const m = try readBlock(region, try v.structAt(i, 24));
+            if (m.msg.header_type != .record_batch) return error.Malformed;
+            c.* = try r.takeBatch(&top, m.msg, m.enc.body);
+            total += @intCast(c.rb.length);
+            if (total > opts.max_rows) return error.LimitExceeded;
+        }
+    }
+    try r.finishDicts();
+    return .{ .r = r, .top = top, .batches = batches };
+}
+
+/// Every record batch of an Arrow IPC file as one frame (`openFile` + `File.readAll`).
+pub fn readFile(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!df.Frame {
+    var f = try openFile(arena, bytes, opts);
+    return f.readAll();
+}
+
+fn readBlock(region: []const u8, raw: []const u8) Error!ipc.Read {
+    const off = std.mem.readInt(i64, raw[0..8], .little);
+    if (off < 8 or off >= region.len) return error.Malformed;
+    var pos: usize = @intCast(off);
+    return ipc.readMessage(region, &pos) catch |e| return noEos(e);
+}
+
+/// The planned top-level columns and the node/buffer counts a record batch must have.
+const Top = struct { fields: []RField, ctr: Counter };
