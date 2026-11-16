@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Explicit `!!binary` (base64, whitespace ignored; decoded bytes as the string value) and `!!timestamp` (YAML 1.1 grammar, validated, kept as text) tags; new public `yaml.Timestamp` / `yaml.parseTimestamp`. Malformed bodies are `error.BadTaggedScalar`. **Behaviour change:** these two tags used to leave the literal text. Untagged scalars unchanged.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written hex-digit switch is replaced by `std.fmt.charToDigit(c, 16)` (same digits accepted, both cases, same results).
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 

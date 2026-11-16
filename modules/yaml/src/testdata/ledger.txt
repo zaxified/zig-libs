@@ -84,7 +84,7 @@
 52DL      event   json
 54T7      event   json
 55WF      reject  none
-565N      event   json
+565N      event   fail    !!binary is decoded to its bytes (YAML 1.1 type, explicit tag) while in.json keeps the base64 text; intended difference
 57H4      event   json
 58MP      event   json
 5BVJ      event   json
