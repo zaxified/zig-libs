@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **Additive + behaviour change:** RFC 8624 algorithm policy (`policy.zig`: `Policy`, `.rfc8624` default, `.permissive`, `withAlgorithm`/`withDigest`, `algorithmLevel`/`digestLevel`). `ValidateOptions.policy` (default `.rfc8624`) and new `chain.validateDnskeySetPolicy`; `validateDnskeySet` uses the default. A trust anchor (DS or pinned key) whose algorithm is a MUST NOT row (0, 1, 3, 6) or not implemented here, or a DS whose digest type is 0 or not implemented (e.g. GOST 3), now yields `.insecure` (RFC 4035 §5.2) instead of `.bogus`. RFC 5011 stays in the backlog.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** SPEC's "where we are behind" no longer lists CDS/CDNSKEY parsing.
 - **2026-11-16** — New: `rdata.parseCds`/`Cds` and `rdata.parseCdnskey`/`Cdnskey` (RFC 7344), built on `parseDs`/`parseDnskey`, with `isDeleteSignal()` for the RFC 8078 §4 delete forms (CDS `0 0 0 00`, CDNSKEY `0 3 0 AA==`). Parsing only.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the three private `stripDot` copies (`nsec`, `nsec3`, `canonical`) are one `canonical.stripDot`. (duplicate-code pass)

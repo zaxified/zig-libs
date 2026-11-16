@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [rthalley/dnspython](https://github.com/rthalley/dnspython) | Python | ISC | 2.7k | v2.8.0 (2025-09-07) | `dns.dnssec` validates RRSIGs and can sign; no chain walking or denial proofs *(inferred)*. |
 | Zig `std` / Zig ecosystem | Zig | MIT (std) | — | Zig 0.16.0 | `std` has no DNSSEC. Only unrelated hit on GitHub search "dnssec language:zig" was a 3-star repo (`jackboykin/hark`, MIT), not a comparable library. Nothing to compare against in Zig. |
 
-**Where we are ahead:** the only DNSSEC validation core in Zig; unlike the Go and Python libraries it ships the NSEC and NSEC3 denial-of-existence proofs (opt-out, wildcard, NODATA, insecure delegation) and the RFC 9276 iteration cap (`nsec3.max_nsec3_iterations`), oracle-checked against `ldns` for algorithms 8/13/14/15 · **Where we are behind:** no delegation-chain walker from a root anchor and no RFC 5011 (Unbound, Hickory do), no RFC 8624 algorithm policy, no Ed448 (algorithm 16), no zone signing or key generation (miekg/dns, ldns, dnspython have it), no dedicated parser *(searched: `rg -i 'cds|cdnskey|ed448' src/`)* (→ Backlog).
+**Where we are ahead:** the only DNSSEC validation core in Zig; unlike the Go and Python libraries it ships the NSEC and NSEC3 denial-of-existence proofs (opt-out, wildcard, NODATA, insecure delegation) and the RFC 9276 iteration cap (`nsec3.max_nsec3_iterations`), oracle-checked against `ldns` for algorithms 8/13/14/15 · **Where we are behind:** no delegation-chain walker from a root anchor and no RFC 5011 (Unbound, Hickory do), no Ed448 (algorithm 16), no zone signing or key generation (miekg/dns, ldns, dnspython have it), no dedicated parser *(searched: `rg -i 'cds|cdnskey|ed448' src/`)* (→ Backlog).
 
 ## Design & invariants
 
@@ -56,9 +56,8 @@ built (`nsec.proveDenial`: RFC 4035 §5.4 gap coverage over the RFC 4034 §6.1
 canonical name order, NODATA, wildcard, and insecure-delegation), unit-tested
 but not yet `ldns`-oracle-verified the way the NSEC3 proof is.
 
-Out of scope in this module (see "Threat model" below): RFC 8624
-algorithm-downgrade policy and the
-multi-zone-cut resolver orchestration.
+Out of scope in this module (see "Threat model" below): the
+multi-zone-cut resolver orchestration. (RFC 8624's algorithm policy is `policy.zig`.)
 
 - **Bounds-checked, no panics on attacker input.** `rdata.zig`/`wire.zig`
   follow the same discipline as `dns.message`: malformed RDATA is a typed
@@ -102,10 +101,12 @@ The `.secure`/`.bogus` verdict IS attackable now, so:
   `rsa.verifyPkcs1v15` already commits to constant-time, full-encoding
   comparison — see `rsa`'s own SPEC.md).
 - **Still out of scope, must land before production use as a resolver:**
-  - **Algorithm-downgrade resistance (RFC 8624).** `validate` verifies the
-    RRSIG it is handed; it does not enforce a policy that rejects a
-    weak/deprecated algorithm when a stronger one is present in the same
-    DNSKEY set. A consumer must apply RFC 8624 algorithm selection.
+  - **Algorithm-downgrade resistance (RFC 8624), partly done 2026-11-16.**
+    `policy.zig` refuses MUST NOT algorithms/digests on the caller's trust
+    anchor (zone becomes `.insecure`, RFC 4035 §5.2). Still not done:
+    `validate` verifies the single RRSIG it is handed; it does not reject a
+    weak algorithm when a stronger one is present in the same DNSKEY set
+    (RFC 6840 §5.11 selection is the resolver's job).
   - ~~NSEC3 iteration-count DoS (RFC 9276).~~ **Fixed.** `nsec3.proveDenial`
     rejects (`.insecure`, before any hashing work) any set whose iteration
     count exceeds `max_nsec3_iterations` (100, RFC 9276 §3.2's recommended
@@ -191,7 +192,8 @@ independent cross-check.
 ## Backlog / deferred
 
 - **Chain walker root → leaf with a bundled root trust anchor** *(survey 2026-09-30)*. Unbound and Hickory validate the whole delegation chain; here the caller must call `chain.validateDnskeySet` once per cut and keep the DS/DNSKEY state (`chain.zig` header draws the line on purpose). A user of a validating library expects "give me answer + records, get secure/insecure/bogus". Effort: medium (state machine over `dns` messages, ~1–2 sittings). Fits CONVENTIONS §2 (pure Zig); needs the caller to fetch records (a transport seam like the other modules).
-- **RFC 8624 algorithm policy and RFC 5011 trust-anchor rollover** *(survey 2026-09-30)*. Both are in the resolvers above; `SPEC.md` "Threat model" already lists 8624 as needed before production use. Effort: small (policy table) and medium (5011 state machine with clock). Fits §2.
+- ✅ DONE 2026-11-16 (`policy.zig`: `Policy` consulted by `validate` and `chain.validateDnskeySetPolicy`, default refuses the RFC 8624 §3.1/§3.3 validation MUST NOT rows, overridable) **RFC 8624 algorithm policy** *(survey 2026-09-30)*.
+- **RFC 5011 trust-anchor rollover** *(survey 2026-09-30)*. In Unbound and Hickory. Effort: medium (state machine with clock). Fits §2.
 - **Zone/RRset signing (`rrsig` creation, DS from DNSKEY, key-tag) for algorithms 8/13/14/15** *(survey 2026-09-30)*. miekg/dns, ldns and dnspython sign; someone building an authoritative tool or a test-zone generator needs it. Effort: medium; std has the ECDSA/Ed25519 signers, RSA signing in the `rsa` sibling *(inferred, not checked)*. Fits §2.
 - ✅ DONE 2026-11-16 (`rdata.parseCds`/`Cds`, `parseCdnskey`/`Cdnskey` reusing the DS/DNSKEY decoders, `isDeleteSignal` for the RFC 8078 §4 forms) **CDS/CDNSKEY (RFC 7344/8078) parsing** (only the type numbers exist, `rdata.zig:359`) *(survey 2026-09-30)*. Same wire shape as DS/DNSKEY; needed for automated DS updates. Effort: small. Fits §2.
 - **Ed448 (algorithm 16, RFC 8080)** *(survey 2026-09-30)*. Unbound supports it; rare in the wild. `std` has no Ed448, but the sibling `ed448` module has `verify` (RFC 8032), so this is a key-decode plus dispatch entry in `keys.zig`, not a new primitive. Effort: small-medium. Fits §2.

@@ -29,6 +29,7 @@ const ds_mod = @import("ds.zig");
 const keys = @import("keys.zig");
 const canonical = @import("canonical.zig");
 const nsec = @import("nsec.zig");
+const policy_mod = @import("policy.zig");
 
 /// Number of labels in a dotted name, per RFC 4034 §3.1.3 (the root has 0).
 /// Duplicated from `root.zig`'s `ownerLabelCount` (private to that file, and
@@ -55,6 +56,21 @@ pub const TrustAnchor = union(enum) {
     dnskey_rdata: []const u8,
 };
 
+/// Whether `policy` leaves `trust_anchor` unusable: a DS naming an algorithm
+/// or digest type the policy (or this module) does not support, or a pinned
+/// DNSKEY of an unsupported algorithm. RFC 4035 §5.2: such an anchor makes the
+/// zone insecure, not bogus. The anchor is configured by the caller, so this
+/// is not attacker-influenced (it never inspects the candidate DNSKEY).
+pub fn anchorUnsupported(policy: policy_mod.Policy, trust_anchor: TrustAnchor) bool {
+    switch (trust_anchor) {
+        .ds => |d| return !policy.isAlgorithmSupported(d.algorithm) or !policy.isDigestSupported(d.digest_type),
+        .dnskey_rdata => |raw| {
+            const k = rdata.parseDnskey(raw) catch return false;
+            return !policy.isAlgorithmSupported(k.algorithm);
+        },
+    }
+}
+
 pub const ChainResult = enum { secure, insecure, bogus, indeterminate };
 
 pub const ChainError = error{OutOfMemory};
@@ -79,7 +95,23 @@ pub fn validateDnskeySet(
     dnskey_rrsig: rdata.Rrsig,
     trust_anchor: TrustAnchor,
 ) ChainError!ChainResult {
+    return validateDnskeySetPolicy(gpa, zone_name, dnskey_rrset, dnskey_rrsig, trust_anchor, .rfc8624);
+}
+
+/// `validateDnskeySet` under an explicit RFC 8624 `policy` (see
+/// `policy.zig`). A trust anchor whose algorithm or DS digest type the policy
+/// does not support returns `.insecure` (RFC 4035 §5.2). `validateDnskeySet`
+/// is this with `Policy.rfc8624`.
+pub fn validateDnskeySetPolicy(
+    gpa: std.mem.Allocator,
+    zone_name: []const u8,
+    dnskey_rrset: []const []const u8,
+    dnskey_rrsig: rdata.Rrsig,
+    trust_anchor: TrustAnchor,
+    policy: policy_mod.Policy,
+) ChainError!ChainResult {
     if (dnskey_rrset.len == 0) return .bogus;
+    if (anchorUnsupported(policy, trust_anchor)) return .insecure;
     // RFC 4035 §5.3.1, the two guards `root.zig`'s `validate` applies to
     // every other RRset type but this entry point skipped for the DNSKEY
     // RRset itself: the RRSIG must cover the DNSKEY type (not some other
@@ -323,4 +355,35 @@ test "regression: DNSKEY RRSIG with the wrong labels count is not authenticated 
     const rrset = [_][]const u8{&rig.raw};
     const anchor: TrustAnchor = .{ .dnskey_rdata = &rig.raw };
     try testing.expectEqual(ChainResult.bogus, try validateDnskeySet(testing.allocator, zone, &rrset, rrsig, anchor));
+}
+
+test "validateDnskeySet: RFC 8624 policy makes a MUST NOT / unsupported anchor insecure; overridable" {
+    const zone = "example.com";
+    var raw: [12]u8 = undefined;
+    raw = .{ 0x01, 0x01, 3, 1 } ++ @as([8]u8, @splat(9)); // algorithm 1 (RSAMD5)
+    const rrset = [_][]const u8{&raw};
+    const rrsig: rdata.Rrsig = .{
+        .type_covered = rdata.rr_type.dnskey,
+        .algorithm = 1,
+        .labels = 2,
+        .original_ttl = 1,
+        .expiration = 2000,
+        .inception = 0,
+        .key_tag = 0,
+        .signer_name = zone,
+        .signature = "",
+    };
+    const pinned: TrustAnchor = .{ .dnskey_rdata = &raw };
+    try testing.expectEqual(ChainResult.insecure, try validateDnskeySet(testing.allocator, zone, &rrset, rrsig, pinned));
+    // DS with digest type 0 (NULL, MUST NOT) for a supported algorithm.
+    const ds0: TrustAnchor = .{ .ds = .{ .key_tag = 1, .algorithm = 8, .digest_type = 0, .digest = "" } };
+    try testing.expectEqual(ChainResult.insecure, try validateDnskeySet(testing.allocator, zone, &rrset, rrsig, ds0));
+    // A supported pinned algorithm (RSASHA1) is validated by default (no
+    // verifying signature -> bogus) and insecure once the caller refuses it.
+    raw[3] = 5;
+    var sig5 = rrsig;
+    sig5.algorithm = 5;
+    try testing.expectEqual(ChainResult.bogus, try validateDnskeySet(testing.allocator, zone, &rrset, sig5, pinned));
+    const strict = policy_mod.Policy.rfc8624.withAlgorithm(5, false);
+    try testing.expectEqual(ChainResult.insecure, try validateDnskeySetPolicy(testing.allocator, zone, &rrset, sig5, pinned, strict));
 }

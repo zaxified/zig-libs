@@ -82,6 +82,10 @@ pub const ds = @import("ds.zig");
 /// oracle-verified.
 pub const canonical = @import("canonical.zig");
 
+/// RFC 8624 algorithm / DS-digest policy (`Policy`), consulted by `validate`
+/// and `chain.validateDnskeySetPolicy`.
+pub const policy = @import("policy.zig");
+
 /// DS-to-DNSKEY delegation-chain link — real, oracle-verified.
 pub const chain = @import("chain.zig");
 
@@ -94,6 +98,7 @@ test {
     _ = ds;
     _ = canonical;
     _ = chain;
+    _ = policy;
     _ = @import("oracle_test.zig");
 }
 
@@ -156,6 +161,11 @@ pub const ValidateOptions = struct {
     /// in a security-critical deployment; that caveat is the resolver's
     /// concern, not this module's.
     now: u32,
+    /// RFC 8624 algorithm / digest policy. A trust anchor it does not support
+    /// (a DS with a refused algorithm or digest type, or a pinned key of a
+    /// refused algorithm) yields `.insecure` (RFC 4035 §5.2) instead of an
+    /// attempt to validate. Default: RFC 8624's MUST NOT rows refused.
+    policy: policy.Policy = .rfc8624,
 };
 
 pub const ValidateError = error{OutOfMemory};
@@ -184,6 +194,9 @@ pub fn validate(
     opts: ValidateOptions,
 ) ValidateError!ValidationResult {
     if (rrset.len == 0) return .bogus;
+    // RFC 8624 / RFC 4035 §5.2: an anchor of an unsupported algorithm or
+    // digest makes the zone insecure. Checked on the caller's anchor only.
+    if (chain.anchorUnsupported(opts.policy, trust_anchor)) return .insecure;
     if (!rrsigTimeValid(rrsig, opts.now)) return .bogus;
     if (rrsig.type_covered != @backingInt(rrset[0].ty)) return .bogus;
     if (!dnskey.isZoneKey()) return .bogus;
@@ -438,4 +451,84 @@ test "regression: rrsig.labels greater than the owner's own label count is rejec
     const anchor: chain.TrustAnchor = .{ .dnskey_rdata = &raw };
     const r = try validate(testing.allocator, &rrset, rrsig, owner, dnskey, anchor, .{ .now = 1000 });
     try testing.expectEqual(ValidationResult.bogus, r);
+}
+
+// ── RFC 8624 policy ─────────────────────────────────────────────────────────
+
+/// `validate` over a junk key/signature of algorithm `alg`, anchored at `anchor`
+/// (a DS or pinned key built by the caller from `raw`).
+fn policyVerdict(alg: u8, ds_digest_type: ?u8, opts_policy: policy.Policy) !ValidationResult {
+    var raw: [4 + 8]u8 = .{ 0x01, 0x00, 3, alg } ++ @as([8]u8, @splat(7));
+    const dnskey = try rdata.parseDnskey(&raw);
+    const owner = "example.com";
+    const rrset = [_]dns.Record{.{
+        .name = owner,
+        .ty = @fromBackingInt(@intCast(rdata.rr_type.dnskey)),
+        .class = .in,
+        .ttl = 3600,
+        .data = .{ .unknown = &raw },
+    }};
+    const rrsig: rdata.Rrsig = .{
+        .type_covered = rdata.rr_type.dnskey,
+        .algorithm = alg,
+        .labels = 2,
+        .original_ttl = 3600,
+        .expiration = 2000,
+        .inception = 0,
+        .key_tag = 0,
+        .signer_name = owner,
+        .signature = &@as([64]u8, @splat(0)),
+    };
+    const anchor: chain.TrustAnchor = if (ds_digest_type) |dt|
+        .{ .ds = .{ .key_tag = rdata.keyTag(&raw, alg), .algorithm = alg, .digest_type = dt, .digest = &@as([20]u8, @splat(0)) } }
+    else
+        .{ .dnskey_rdata = &raw };
+    return validate(testing.allocator, &rrset, rrsig, owner, dnskey, anchor, .{ .now = 1000, .policy = opts_policy });
+}
+
+test "RFC 8624: an anchor of a MUST NOT algorithm (1, 3, 6, 0) is insecure, pinned or DS" {
+    for ([_]u8{ 0, 1, 3, 6 }) |alg| {
+        try testing.expectEqual(ValidationResult.insecure, try policyVerdict(alg, null, .rfc8624));
+        try testing.expectEqual(ValidationResult.insecure, try policyVerdict(alg, 2, .rfc8624));
+    }
+}
+
+test "RFC 8624: a DS with a MUST NOT digest (0) or an unimplemented one (GOST 3) is insecure" {
+    try testing.expectEqual(ValidationResult.insecure, try policyVerdict(8, 0, .rfc8624));
+    try testing.expectEqual(ValidationResult.insecure, try policyVerdict(8, 3, .rfc8624));
+}
+
+test "RFC 8624: a supported anchor is still validated (junk signature is bogus, not insecure)" {
+    for ([_]u8{ 5, 7, 8, 10, 13, 14, 15 }) |alg|
+        try testing.expectEqual(ValidationResult.bogus, try policyVerdict(alg, null, .rfc8624));
+}
+
+test "RFC 8624: caller override refuses RSASHA1 / SHA-1 digest; default keeps them" {
+    try testing.expectEqual(ValidationResult.bogus, try policyVerdict(5, null, .rfc8624));
+    const strict = policy.Policy.rfc8624.withAlgorithm(5, false);
+    try testing.expectEqual(ValidationResult.insecure, try policyVerdict(5, null, strict));
+    try testing.expectEqual(ValidationResult.bogus, try policyVerdict(8, 1, .rfc8624));
+    const nosha1 = policy.Policy.rfc8624.withDigest(1, false);
+    try testing.expectEqual(ValidationResult.insecure, try policyVerdict(8, 1, nosha1));
+}
+
+test "RFC 8624: structural failures of an attacker's RRSIG are not downgraded to insecure" {
+    // Policy is checked on the caller's anchor only: a supported anchor with a
+    // mismatched RRSIG algorithm stays bogus.
+    var raw: [12]u8 = .{ 0x01, 0x00, 3, 8 } ++ @as([8]u8, @splat(7));
+    const dnskey = try rdata.parseDnskey(&raw);
+    const rrset = [_]dns.Record{.{ .name = "example.com", .ty = @fromBackingInt(@intCast(rdata.rr_type.dnskey)), .class = .in, .ttl = 1, .data = .{ .unknown = &raw } }};
+    const rrsig: rdata.Rrsig = .{
+        .type_covered = rdata.rr_type.dnskey,
+        .algorithm = 1, // attacker claims RSAMD5
+        .labels = 2,
+        .original_ttl = 1,
+        .expiration = 2000,
+        .inception = 0,
+        .key_tag = 0,
+        .signer_name = "example.com",
+        .signature = "",
+    };
+    const anchor: chain.TrustAnchor = .{ .dnskey_rdata = &raw };
+    try testing.expectEqual(ValidationResult.bogus, try validate(testing.allocator, &rrset, rrsig, "example.com", dnskey, anchor, .{ .now = 1000 }));
 }
