@@ -6,7 +6,7 @@
 
 **Scope:** core — Jinja2 3.1.6 (surveyed 2026-09-30, S3 pass 2026-11-13): faithful core and oracle-checked, now with `format`, `groupby`, `wordwrap`, `filesizeformat`, Unicode case mapping and the `sameas`/`callable` tests; remaining gaps listed in §6 and the builtin table in §6.1 (`urlize`, `pprint`, `random`, `attr`, `cycler`/`joiner`/`lipsum`, the `filter`/`test` tests, `{% trans %}`)
 
-**Audit:** review 2026-09-02 · mutation 2026-10-06 (36/38, 2 eq) · src ?
+**Audit:** review 2026-09-02 · mutation 2026-11-17 (71/74, 3 eq) · src ?
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JINJA_FUZZ) · ct n/a — template engine (keyword review, 2026-10-07)
 
@@ -450,6 +450,22 @@ or ReleaseSafe build.
 of: compile-time name resolution, diagnostics and line numbers, custom
 filters/tests, `valueFrom` reflection, template reuse, `renderTo`, and the
 output/`range()` ceilings.
+
+**Audit 2026-11-17 (delta mutation).** 36 schemata mutants over the call-site `*args`/`**kwargs` added the same
+day (`parseCallArgs`, `argsMention` in `parser.zig`; `evalArgs` in `render.zig`), ReleaseSafe, one build, each
+mutant under `setsid -w timeout` and `ulimit -v`: the comma rule after a splat, every duplicate / order guard
+(second `*`, `*` after `**`, positional after either, keyword after `**`, repeated keyword), the token steps and
+the stored `star`/`dstar`, the name-mention scan through both, the `*` expansion (skipped, undefined handling for
+lenient and strict, the error mapping), the keyword and `**` merge (skipped, non-mapping, non-string key,
+duplicate) and the error kind of each. First run: 21 killed, 15 survived: the goldens decide only ok versus error,
+and several wrongly accepted calls still failed later in the macro call, so the guards, the error identity
+(`BadCall`), the comma message and the strict-undefined case were not pinned. Six tests added (the grammar
+violations on callees that would render if accepted, the messages, `BadCall` for each bad operand, undefined as
+empty when lenient and an error when strict, `varargs`/`kwargs` found only inside a splat, an out-of-memory
+sweep); the rerun killed 14. 1 is UNOBSERVABLE: `error.OutOfMemory` from `value.iterate` mapped to `BadCall`
+needs an allocator that fails exactly at that call, but the render arena serves it from a chunk it already holds
+(the sweep reaches only chunk boundaries). 35 killed + 1 unobservable = 36; the card's counts are cumulative with
+the 2026-10-06 run (36/38, 2 eq), the unobservable one counted with the equivalents.
 
 ## 8. Threat model
 

@@ -931,3 +931,91 @@ test "joiner: error paths" {
     try expectFails("{% set j = joiner() %}{{ j(1) }}");
     try expectFails("{% set j = joiner() %}{{ j.next() }}");
 }
+
+// ── call-site *args / **kwargs: delta mutation audit 2026-11-17 ─────────────
+// The reference goldens decide ok-versus-error; these pin what they cannot:
+// which error, which message, names used only inside a splat, an out-of-memory
+// that must stay out-of-memory, and the grammar cases where a wrongly accepted
+// call would still render something.
+
+const empty_ctx: jinja.Value = .{ .map = .{ .pairs = &.{} } };
+
+test "splat: grammar violations whose acceptance would still render are syntax errors" {
+    const gpa = testing.allocator;
+    for ([_][]const u8{
+        "{{ range(*[1], *[3])|list }}", // a second `*`
+        "{{ range(**{}, *[3])|list }}", // `*` after `**`
+        "{{ range(*[1], 3)|list }}", // a positional after `*`
+        "{{ range(**{}, 3)|list }}", // a positional after `**`
+        "{{ [1]|join(d='-', d='+') }}", // a repeated keyword
+        "{{ dict(**{}, a=1) }}", // a keyword after `**`
+        "{{ dict(**{}, **{}) }}", // a second `**`
+    }) |src| {
+        try testing.expectError(error.TemplateSyntaxError, renderWith(gpa, .{}, src, empty_ctx));
+    }
+}
+
+test "splat: the message says what was wrong" {
+    const gpa = testing.allocator;
+    var env = try jinja.Environment.init(gpa, .{});
+    defer env.deinit();
+    const cases = [_]struct { src: []const u8, msg: []const u8 }{
+        .{ .src = "{{ f(**d x) }}", .msg = "expected `,`" },
+        .{ .src = "{{ f(*d x) }}", .msg = "expected `,`" },
+        .{ .src = "{{ f(*a, *b) }}", .msg = "invalid syntax for function call" },
+        .{ .src = "{{ f(**a, b=1) }}", .msg = "invalid syntax for function call" },
+        .{ .src = "{{ f(a=1, a=2) }}", .msg = "repeated" },
+    };
+    for (cases) |c| {
+        var diag: jinja.Diagnostic = .{};
+        try testing.expectError(error.TemplateSyntaxError, env.compile(c.src, &diag));
+        try testing.expect(std.mem.find(u8, diag.message(), c.msg) != null);
+    }
+}
+
+test "splat: a bad operand is BadCall, not some other error" {
+    const gpa = testing.allocator;
+    for ([_][]const u8{
+        "{{ range(*5)|list }}", // not iterable
+        "{{ dict(**[1]) }}", // not a mapping
+        "{{ dict(**{1: 2}) }}", // a key that is not a string
+        "{{ dict(a=1, **{'a': 2}) }}", // a name given twice
+    }) |src| {
+        try testing.expectError(error.BadCall, renderWith(gpa, .{}, src, empty_ctx));
+    }
+}
+
+test "splat: an undefined value is empty when lenient, an error when strict" {
+    const gpa = testing.allocator;
+    const src = "{% macro f(a=7) %}{{ a }}{% endmacro %}{{ f(*nothing) }}";
+    const out = try renderWith(gpa, .{ .undefined_policy = .lenient }, src, empty_ctx);
+    defer gpa.free(out);
+    try testing.expectEqualStrings("7", out);
+    try testing.expectError(error.BadCall, renderWith(gpa, .{}, src, empty_ctx));
+}
+
+test "splat: a name used only inside a splat still makes the macro collect it" {
+    const gpa = testing.allocator;
+    const a = try renderWith(gpa, .{}, "{% macro m() %}{{ range(*varargs)|list }}{% endmacro %}{{ m(2) }}", empty_ctx);
+    defer gpa.free(a);
+    try testing.expectEqualStrings("[0, 1]", a);
+    const b = try renderWith(gpa, .{}, "{% macro m() %}{{ dict(**kwargs) }}{% endmacro %}{{ m(a=1) }}", empty_ctx);
+    defer gpa.free(b);
+    try testing.expectEqualStrings("{'a': 1}", b);
+}
+
+test "splat: running out of memory while expanding stays OutOfMemory" {
+    const src = "{% macro f(a,b,c) %}{{a}}{{b}}{{c}}{% endmacro %}{{ f(*'xyz') }}{{ dict(**{'k': 1}) }}";
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        const out = renderWith(fa.allocator(), .{}, src, empty_ctx) catch |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            continue;
+        };
+        defer fa.allocator().free(out);
+        try testing.expectEqualStrings("xyz{'k': 1}", out);
+        break;
+    }
+    try testing.expect(i < 200);
+}
