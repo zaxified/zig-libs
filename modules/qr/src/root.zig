@@ -96,6 +96,18 @@ pub const Options = struct {
     /// writes none, which is what a reader expects for ISO-8859-1 / UTF-8
     /// sniffing and is smallest.
     eci: ?u32 = null,
+    /// Opt in to mixed-mode segmentation: the text is split into numeric /
+    /// alphanumeric / byte segments by an exact dynamic program (the approach of
+    /// nayuki's `makeSegmentsOptimally`; mode indicator, character-count width of
+    /// the version range and per-mode data bits all counted), so a payload like
+    /// `"HELLO WORLD 2026"` or a URL with a long digit run can come out smaller
+    /// or in a lower version. Never larger than the single-mode default, whose
+    /// segmentation is one of the candidates. Off by default so the default
+    /// output stays byte-identical. Cannot be combined with a forced `mode` or an
+    /// `eci` (both pin a single byte/forced segment): that is `error.ModeMismatch`.
+    /// `encodeSequence` ignores it (each chunk of a sequence keeps one mode).
+    /// Text longer than 7089 bytes (the most any symbol holds) is `error.TooLong`.
+    optimize_segments: bool = false,
 };
 
 /// Largest ECI assignment number (ISO/IEC 18004 §7.4.2.2: six decimal digits).
@@ -319,10 +331,19 @@ fn resolveMode(text: []const u8, opts: Options) Error!Mode {
 }
 
 fn encodeOne(out: *Matrix, text: []const u8, opts: Options, seq: ?Sequence) Error!void {
-    const mode = try resolveMode(text, opts);
+    const mixed = opts.optimize_segments and seq == null and text.len > 0;
+    if (mixed and (opts.eci != null or opts.mode != null)) return Error.ModeMismatch;
+    const mode = if (mixed) Mode.byte else try resolveMode(text, opts);
 
+    var plan_buf: [max_mixed]u8 = undefined;
+    var plan: ?[]const u8 = null;
     const extra: usize = (if (seq == null) @as(usize, 0) else sequence_header_bits) + eciBits(opts.eci);
-    const version = if (opts.version) |v| blk: {
+    const version = if (mixed) blk: {
+        if (text.len > max_mixed) return Error.TooLong;
+        const v = try pickMixedVersion(text, opts.ecc, opts.version, &plan_buf);
+        plan = plan_buf[0..text.len];
+        break :blk v;
+    } else if (opts.version) |v| blk: {
         if (v < 1 or v > 40) return Error.BadVersion;
         if (extra + dataBits(mode, text.len, v) > dataCapacityBits(v, opts.ecc)) return Error.TooLong;
         break :blk v;
@@ -330,7 +351,7 @@ fn encodeOne(out: *Matrix, text: []const u8, opts: Options, seq: ?Sequence) Erro
 
     var codewords: [max_codewords]u8 = undefined;
     const total = totalCodewords(version);
-    buildCodewords(codewords[0..total], mode, text, version, opts.ecc, seq, opts.eci);
+    buildCodewords(codewords[0..total], mode, text, version, opts.ecc, seq, opts.eci, plan);
 
     out.* = .{ .size = sideFor(version), .version = version, .ecc = opts.ecc };
     @memset(&out.bits, 0);
@@ -611,6 +632,97 @@ fn pickVersion(mode: Mode, len: usize, ecc: Ecc, extra_bits: usize) ?u6 {
     return null;
 }
 
+/// Most characters any symbol can hold (version 40, ECC low, numeric).
+const max_mixed: usize = 7089;
+const mixed_modes = [3]Mode{ .numeric, .alphanumeric, .byte };
+
+/// Optimal segmentation of `text` for the character-count widths of
+/// `rep_version`'s range (1-9 / 10-26 / 27-40): an exact shortest path over the
+/// three modes, costs in sixths of a bit (numeric 20, alphanumeric 33, byte 48
+/// per character; every segment end rounds up to a whole bit, which is exactly
+/// the 4/7-bit and 6-bit remainders). Leaves the mode index of every character
+/// in `buf[0..text.len]` and returns the total data bits, headers included.
+fn planSegments(text: []const u8, rep_version: u6, buf: []u8) usize {
+    const inf = std.math.maxInt(u32);
+    const char_cost = [3]u32{ 20, 33, 48 };
+    var head: [3]u32 = undefined;
+    for (mixed_modes, 0..) |m, k| head[k] = (4 + @as(u32, countBits(m, rep_version))) * 6;
+
+    var cost = [3]u32{ inf, inf, inf };
+    for (text, 0..) |c, i| {
+        const allowed = [3]bool{ c >= '0' and c <= '9', alnumValue(c) != null, true };
+        var next = [3]u32{ inf, inf, inf };
+        var packed_from: u8 = 0;
+        for (0..3) |m| {
+            if (!allowed[m]) continue;
+            if (i == 0) {
+                next[m] = head[m] + char_cost[m];
+                continue;
+            }
+            var best: u32 = inf;
+            var from: u8 = @intCast(m);
+            if (cost[m] != inf) best = cost[m] + char_cost[m];
+            for (0..3) |j| {
+                if (j == m or cost[j] == inf) continue;
+                const cand = (cost[j] + 5) / 6 * 6 + head[m] + char_cost[m];
+                if (cand < best) {
+                    best = cand;
+                    from = @intCast(j);
+                }
+            }
+            next[m] = best;
+            packed_from |= from << @intCast(2 * m);
+        }
+        buf[i] = packed_from;
+        cost = next;
+    }
+
+    var cur: u8 = 2;
+    for (0..2) |m| if (cost[m] < cost[cur]) {
+        cur = @intCast(m);
+    };
+    var i = text.len;
+    while (i > 0) {
+        i -= 1;
+        const pr = buf[i];
+        buf[i] = cur;
+        if (i > 0) cur = (pr >> @intCast(2 * cur)) & 3;
+    }
+
+    var bits: usize = 0;
+    var s: usize = 0;
+    while (s < text.len) {
+        var e = s + 1;
+        while (e < text.len and buf[e] == buf[s]) e += 1;
+        const m = mixed_modes[buf[s]];
+        if (e - s >= @as(usize, 1) << countBits(m, rep_version)) return std.math.maxInt(usize);
+        bits += dataBits(m, e - s, rep_version);
+        s = e;
+    }
+    return bits;
+}
+
+/// Smallest version (or the forced one) that holds the optimal segmentation;
+/// leaves that segmentation in `buf`.
+fn pickMixedVersion(text: []const u8, ecc: Ecc, forced: ?u6, buf: []u8) Error!u6 {
+    if (forced) |v| {
+        if (v < 1 or v > 40) return Error.BadVersion;
+        const bits = planSegments(text, v, buf);
+        if (bits > dataCapacityBits(v, ecc)) return Error.TooLong;
+        return v;
+    }
+    const reps = [3]u6{ 1, 10, 27 };
+    const ends = [3]u6{ 9, 26, 40 };
+    for (reps, ends) |first, last| {
+        const bits = planSegments(text, first, buf);
+        var v = first;
+        while (v <= last) : (v += 1) {
+            if (bits <= dataCapacityBits(v, ecc)) return v;
+        }
+    }
+    return Error.TooLong;
+}
+
 const BitWriter = struct {
     buf: []u8,
     bit: usize = 0,
@@ -632,7 +744,7 @@ const BitWriter = struct {
 };
 
 /// Bitstream → blocks → EC → interleave, all in one pass over `out`.
-fn buildCodewords(out: []u8, mode: Mode, text: []const u8, version: u6, ecc: Ecc, seq: ?Sequence, eci: ?u32) void {
+fn buildCodewords(out: []u8, mode: Mode, text: []const u8, version: u6, ecc: Ecc, seq: ?Sequence, eci: ?u32, plan: ?[]const u8) void {
     const spec = ecSpec(version, ecc);
     const data_len = out.len - @as(usize, spec.ec_per_block) * spec.blocks;
 
@@ -652,6 +764,30 @@ fn buildCodewords(out: []u8, mode: Mode, text: []const u8, version: u6, ecc: Ecc
 
     if (eci) |e| putEci(&w, e);
 
+    if (plan) |p| {
+        var s: usize = 0;
+        while (s < text.len) {
+            var e = s + 1;
+            while (e < text.len and p[e] == p[s]) e += 1;
+            putSegment(&w, mixed_modes[p[s]], text[s..e], version);
+            s = e;
+        }
+    } else putSegment(&w, mode, text, version);
+
+    // Terminator: up to four zero bits, short if the capacity ends sooner.
+    const cap_bits = data_len * 8;
+    const term = @min(@as(u6, 4), @as(u6, @intCast(@min(@as(usize, 4), cap_bits - w.bit))));
+    w.put(0, term);
+    // Pad to a byte boundary, then alternate the two specified pad codewords.
+    while (w.bit % 8 != 0) w.put(0, 1);
+    var pad: u8 = 0xEC;
+    while (w.bit < cap_bits) : (pad = if (pad == 0xEC) 0x11 else 0xEC) w.put(pad, 8);
+
+    buildBlocks(out, data[0..data_len], spec);
+}
+
+/// One segment: mode indicator, character count, data.
+fn putSegment(w: *BitWriter, mode: Mode, text: []const u8, version: u6) void {
     w.put(@backingInt(mode), 4);
     w.put(text.len, countBits(mode, version));
     switch (mode) {
@@ -677,16 +813,11 @@ fn buildCodewords(out: []u8, mode: Mode, text: []const u8, version: u6, ecc: Ecc
         },
         .byte => for (text) |c| w.put(c, 8),
     }
+}
 
-    // Terminator: up to four zero bits, short if the capacity ends sooner.
-    const cap_bits = data_len * 8;
-    const term = @min(@as(u6, 4), @as(u6, @intCast(@min(@as(usize, 4), cap_bits - w.bit))));
-    w.put(0, term);
-    // Pad to a byte boundary, then alternate the two specified pad codewords.
-    while (w.bit % 8 != 0) w.put(0, 1);
-    var pad: u8 = 0xEC;
-    while (w.bit < cap_bits) : (pad = if (pad == 0xEC) 0x11 else 0xEC) w.put(pad, 8);
-
+/// Data codewords → blocks → EC → interleave into `out`.
+fn buildBlocks(out: []u8, data: []const u8, spec: EcSpec) void {
+    const data_len = data.len;
     // Split into blocks: the last `long` blocks carry one extra data codeword.
     const short = data_len / spec.blocks;
     const long = data_len % spec.blocks;
@@ -2864,5 +2995,110 @@ test "ECI decode: 1/2/3-byte forms, refusals" {
         c.put(eci_mode, 4);
         c.put(26, 8);
         try std.testing.expectError(DecodeError.BadData, parseSegments(c.bytes(), 1, &out, &seq, &eci));
+    }
+}
+
+// ── mixed-mode segments (Options.optimize_segments) ─────────────────────────
+
+test "mixed: exact bit count against a hand count" {
+    const t = std.testing;
+    // "HELLO" + 30 digits. Single alphanumeric (v1-9 widths): 4 + 9 + 17*11 + 6 = 206.
+    // Mixed: alnum "HELLO" = 4 + 9 + 2*11 + 6 = 41, numeric 30 digits = 4 + 10 + 10*10 = 114 -> 155.
+    const text = "HELLO123456789012345678901234567890";
+    var buf: [max_mixed]u8 = undefined;
+    try t.expectEqual(@as(usize, 206), dataBits(.alphanumeric, text.len, 1));
+    try t.expectEqual(@as(usize, 155), planSegments(text, 1, &buf));
+    for (buf[0..5]) |m| try t.expectEqual(@as(u8, 1), m);
+    for (buf[5..text.len]) |m| try t.expectEqual(@as(u8, 0), m);
+    // Lower-case head: byte "hello" = 4 + 8 + 40 = 52, plus 114 -> 166 vs 292 single byte.
+    try t.expectEqual(@as(usize, 166), planSegments("hello123456789012345678901234567890", 1, &buf));
+    // A pure payload stays one segment at the single-mode cost.
+    try t.expectEqual(dataBits(.numeric, 7, 1), planSegments("1234567", 1, &buf));
+    try t.expectEqual(dataBits(.alphanumeric, 5, 1), planSegments("AB CD", 1, &buf));
+}
+
+test "mixed: smaller version than the single-mode default, decoder reads the segment list" {
+    const t = std.testing;
+    const text = "HELLO123456789012345678901234567890";
+    var a: Matrix = undefined;
+    var b: Matrix = undefined;
+    try encode(&a, text, .{ .ecc = .quartile });
+    try encode(&b, text, .{ .ecc = .quartile, .optimize_segments = true });
+    try t.expectEqual(@as(u6, 3), a.version);
+    try t.expectEqual(@as(u6, 2), b.version);
+    var out: [64]u8 = undefined;
+    try t.expectEqualStrings(text, try decode(&b, &out));
+    // Mixed + digits/upper/bytes at v1: "HELLO WORLD 2026" never worse than default.
+    try encode(&a, "HELLO WORLD 2026", .{});
+    try encode(&b, "HELLO WORLD 2026", .{ .optimize_segments = true });
+    try t.expect(b.version <= a.version);
+    try t.expectEqualStrings("HELLO WORLD 2026", try decode(&b, &out));
+}
+
+test "mixed: default output is untouched and the option conflicts are refused" {
+    const t = std.testing;
+    var a: Matrix = undefined;
+    var b: Matrix = undefined;
+    try encode(&a, "12345", .{});
+    try encode(&b, "12345", .{ .optimize_segments = false });
+    try t.expectEqualSlices(u8, &a.bits, &b.bits);
+    // A pure payload under mixed encodes to the very same symbol.
+    try encode(&b, "12345", .{ .optimize_segments = true });
+    try t.expectEqualSlices(u8, &a.bits, &b.bits);
+    try t.expectError(Error.ModeMismatch, encode(&b, "12345", .{ .optimize_segments = true, .mode = .numeric }));
+    try t.expectError(Error.ModeMismatch, encode(&b, "12345", .{ .optimize_segments = true, .eci = 26 }));
+    try t.expectError(Error.BadVersion, encode(&b, "A1", .{ .optimize_segments = true, .version = 41 }));
+    try t.expectError(Error.TooLong, encode(&b, "HELLO123456789012345678901234567890", .{ .optimize_segments = true, .version = 1 }));
+    // Empty text falls back to the default path.
+    try encode(&b, "", .{ .optimize_segments = true });
+}
+
+test "mixed: a payload that only fits with mixing" {
+    const t = std.testing;
+    var text: [4500]u8 = undefined;
+    @memset(text[0..1500], 'a');
+    @memset(text[1500..], '7');
+    var m: Matrix = undefined;
+    try t.expectError(Error.TooLong, encode(&m, &text, .{ .ecc = .low }));
+    try encode(&m, &text, .{ .ecc = .low, .optimize_segments = true });
+    try t.expect(m.version >= 38);
+    var out: [4600]u8 = undefined;
+    try t.expectEqualSlices(u8, &text, try decode(&m, &out));
+    // Over the absolute maximum.
+    var big: [max_mixed + 1]u8 = undefined;
+    @memset(&big, '1');
+    try t.expectError(Error.TooLong, encode(&m, &big, .{ .ecc = .low, .optimize_segments = true }));
+}
+
+test "mixed: random digit/upper/byte payloads round-trip, never a larger version" {
+    const t = std.testing;
+    var prng = std.Random.DefaultPrng.init(0x51c0de);
+    const rnd = prng.random();
+    const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+    var m: Matrix = undefined;
+    var d: Matrix = undefined;
+    var out: [512]u8 = undefined;
+    for ([_]Ecc{ .low, .medium, .quartile, .high }) |ecc| {
+        for (0..40) |_| {
+            var text: [200]u8 = undefined;
+            const len = rnd.uintLessThan(usize, 120) + 1;
+            var i: usize = 0;
+            while (i < len) {
+                const run = @min(len - i, rnd.uintLessThan(usize, 14) + 1);
+                const kind = rnd.uintLessThan(u8, 3);
+                for (0..run) |k| text[i + k] = switch (kind) {
+                    0 => '0' + rnd.uintLessThan(u8, 10),
+                    1 => upper[rnd.uintLessThan(usize, upper.len)],
+                    else => rnd.int(u8),
+                };
+                i += run;
+            }
+            const s = text[0..len];
+            try encode(&m, s, .{ .ecc = ecc, .optimize_segments = true });
+            try t.expectEqualSlices(u8, s, try decode(&m, &out));
+            if (encode(&d, s, .{ .ecc = ecc })) |_| {
+                try t.expect(m.version <= d.version);
+            } else |_| {}
+        }
     }
 }

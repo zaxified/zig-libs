@@ -362,7 +362,7 @@ claim that used to justify it.
 
 - **Kanji mode, Micro QR** (ECI done 2026-11-16) — separable additions, none foreclosed by this
   design. See README "Not implemented" for why none is scheduled.
-- **Segment mixing.** A single mode is chosen for the whole input, so
+- ✅ DONE 2026-11-16 (`Options.optimize_segments`) **Segment mixing.** A single mode is chosen for the whole input, so
   `"HELLO WORLD 2026"` pays alphanumeric rates throughout rather than switching
   to numeric for the tail. The standard allows mixed segments and the optimal
   split is a shortest-path problem over three modes; worth doing only if a
@@ -371,7 +371,7 @@ claim that used to justify it.
   masks over the whole symbol, which is eight full passes at version 40. Fine for
   anything interactive; if a consumer ever generates codes in bulk, the scoring
   can be made incremental.
-- (survey 2026-09-30) **Mixed-mode segments** — `"HELLO WORLD 2026"` is coded entirely in one mode; libqrencode / nayuki (manual list) / qrcode-rust *(inferred)* can switch mode mid-message. Users notice a larger version for mixed digit/letter payloads (few percent, up to one version). Effort: small-medium (shortest-path over three modes). Fits CONVENTIONS §2 (pure Zig). Already listed above as *Segment mixing*.
+- ✅ DONE 2026-11-16 (opt-in `Options.optimize_segments`: exact three-mode DP, same version-range loop; refused with a forced `mode`/`eci` as `ModeMismatch`, ignored by `encodeSequence`) (survey 2026-09-30) **Mixed-mode segments** — `"HELLO WORLD 2026"` is coded entirely in one mode; libqrencode / nayuki (manual list) / qrcode-rust *(inferred)* can switch mode mid-message. Users notice a larger version for mixed digit/letter payloads (few percent, up to one version). Effort: small-medium (shortest-path over three modes). Fits CONVENTIONS §2 (pure Zig). Already listed above as *Segment mixing*.
 - ✅ DONE 2026-11-16 (`Options.eci` writes the 8/16/24-bit designator before a byte segment, counted in capacity/version choice and in every structured-append symbol; `Part.eci` reports it, decode accepts 1/2/3-byte forms, refuses truncated/reserved/out-of-range/repeated/late designators; the external segno oracle fixtures do not cover ECI, tests are spec-derived bit vectors + round trips) (survey 2026-09-30) **ECI segments** — declare a non-default character set (UTF-8 marker); some readers mis-decode non-ASCII bytes without it. Effort: small (header + decode of the ECI segment, currently `BadData`). Fits §2.
 - (survey 2026-09-30) **Kanji mode** — 13 bits per Japanese character versus 24 in UTF-8 bytes; matters to Japanese-text users, the original QR audience. Needs a Shift-JIS table (a `charset`-style sibling or embedded JIS X 0208 table). Effort: medium. Fits §2 if the table is generated/embedded; README argues it is deliberately not scheduled.
 - (survey 2026-09-30) **Micro QR (M1–M4)** — small labels; libqrencode (experimental) and qrcode-rust have it. Effort: medium (separate symbol geometry, masks, format info). Fits §2.

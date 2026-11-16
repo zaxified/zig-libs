@@ -121,6 +121,13 @@ mode and needs a larger symbol.
 `Options.mode` forces one, and returns `error.ModeMismatch` rather than silently
 widening if the input cannot be expressed that way.
 
+`Options.optimize_segments = true` (opt-in; the default output is unchanged) instead
+splits the text into numeric / alphanumeric / byte segments with an exact
+shortest-path search, so `"HELLO"` followed by thirty digits needs 155 bits rather
+than 206 and can land in a smaller version. It is never larger than the
+single-mode result. It cannot be combined with `mode` or `eci`
+(`error.ModeMismatch`), and `encodeSequence` ignores it.
+
 ## Not implemented
 
 **Kanji mode.** It encodes Shift-JIS double-byte values, so a caller would have
