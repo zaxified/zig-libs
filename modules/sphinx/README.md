@@ -86,6 +86,12 @@ if (result.next_packet) |next| {
 } else {
     // this node is the final recipient
 }
+
+// Replay protection (BOLT#4): `result.replay_tag` is SHA256(shared secret).
+// Keep a log of tags yourself, or let `processWithHook` ask your log after
+// the HMAC check (`hook.check(ctx, &tag)` returns false to refuse; the call
+// then returns `error.Replayed`). The module stores nothing.
+const r2 = try sphinx.processWithHook(&node_privkey, pkt, associated_data, .{ .ctx = &log, .check = myCheck });
 ```
 
 ## Verify

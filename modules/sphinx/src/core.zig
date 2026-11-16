@@ -359,6 +359,29 @@ pub const ProcessError = SharedSecretError || hopframe.FrameError || error{
     MalformedPayload,
 };
 
+/// `processWithHook`'s error set: `process`'s plus the replay refusal.
+pub const ProcessHookError = ProcessError || error{
+    /// BOLT#4 "Onion Decryption": the hop's replay tag was already seen
+    /// (the caller's `ReplayHook` refused it). The packet is NOT unwrapped.
+    Replayed,
+};
+
+/// A caller-supplied replay log probe for `processWithHook`. `check` is
+/// called with this hop's replay tag (`ProcessResult.replay_tag`) once the
+/// packet's HMAC has been verified (so a forger without the hop key cannot
+/// fill the log) and before anything is returned. It returns `true` to
+/// accept the packet (and should record the tag, atomically with the test,
+/// if the caller keeps a log) and `false` to refuse it as a replay. The
+/// module stores nothing itself. `check` must not panic or reenter
+/// `process`.
+pub const ReplayHook = struct {
+    ctx: ?*anyopaque = null,
+    check: *const fn (ctx: ?*anyopaque, tag: *const [replay_tag_len]u8) bool,
+};
+
+/// Length of a hop's replay tag.
+pub const replay_tag_len: usize = 32;
+
 /// One hop's `process` result: this hop's own `payload` (borrowed from
 /// `payload_buf`), and either the packet to forward to the NEXT hop, or
 /// `null` if `next_hmac` was all-zero (BOLT#4: "this is the final
@@ -371,6 +394,13 @@ pub const ProcessResult = struct {
     payload_buf: [hop_payloads_len]u8,
     payload_len: usize,
     next_packet: ?OnionPacket,
+    /// BOLT#4's per-hop replay tag, `SHA256(ss)` with `ss` this hop's shared
+    /// secret. It is a function of the packet's ephemeral key and this
+    /// node's key only, so the same onion yields the same tag every time,
+    /// and a replayed packet is detectable by remembering tags. Safe to
+    /// store: the hash does not reveal `ss`. Compare as an opaque
+    /// identifier (lnd truncates it to 20 bytes in its log).
+    replay_tag: [replay_tag_len]u8,
 
     pub fn payload(self: *const ProcessResult) []const u8 {
         return self.payload_buf[0..self.payload_len];
@@ -439,10 +469,21 @@ pub const ProcessResult = struct {
 /// (this module ships the first-hop KAT only — see `kat_test.zig`).
 pub fn process(node_privkey: *const [32]u8, pkt: OnionPacket, associated_data: []const u8) ProcessError!ProcessResult {
     defer burnStack();
-    return processBody(node_privkey, pkt, associated_data);
+    return processBody(node_privkey, pkt, associated_data, null) catch |e| switch (e) {
+        error.Replayed => unreachable, // no hook, never produced
+        else => |pe| pe,
+    };
 }
 
-noinline fn processBody(node_privkey: *const [32]u8, pkt: OnionPacket, associated_data: []const u8) ProcessError!ProcessResult {
+/// `process`, consulting `hook` with the hop's replay tag after the HMAC
+/// check passes: a refused tag returns `error.Replayed` and the packet is
+/// not unwrapped. See `ReplayHook`.
+pub fn processWithHook(node_privkey: *const [32]u8, pkt: OnionPacket, associated_data: []const u8, hook: ReplayHook) ProcessHookError!ProcessResult {
+    defer burnStack();
+    return processBody(node_privkey, pkt, associated_data, hook);
+}
+
+noinline fn processBody(node_privkey: *const [32]u8, pkt: OnionPacket, associated_data: []const u8, hook: ?ReplayHook) ProcessHookError!ProcessResult {
     // Step 1: ECDH, receiver direction (private scalar x public point).
     const ephemeral_point = Secp256k1.fromSec1(&pkt.public_key) catch
         return error.InvalidPublicKey;
@@ -465,6 +506,13 @@ noinline fn processBody(node_privkey: *const [32]u8, pkt: OnionPacket, associate
     mac.final(&expected_hmac);
     if (!std.crypto.timing_safe.eql([hmac_len]u8, expected_hmac, pkt.hmac))
         return error.IntegrityCheckFailed;
+
+    // BOLT#4 replay tag: SHA256(ss). Consulted only after the HMAC verified.
+    var replay_tag: [replay_tag_len]u8 = undefined;
+    Sha256.hash(&shared_secret, &replay_tag, .{});
+    if (hook) |h| {
+        if (!h.check(h.ctx, &replay_tag)) return error.Replayed;
+    }
 
     // Steps 5-6: deobfuscate `hop_payloads ‖ 0^1300` with a full 2600-byte
     // rho stream — the zero-padded second half becomes raw keystream, i.e.
@@ -494,6 +542,7 @@ noinline fn processBody(node_privkey: *const [32]u8, pkt: OnionPacket, associate
         .payload_buf = undefined,
         .payload_len = frame.payload.len,
         .next_packet = null,
+        .replay_tag = replay_tag,
     };
     @memcpy(result.payload_buf[0..frame.payload.len], frame.payload);
     @memset(result.payload_buf[frame.payload.len..], 0);
@@ -630,7 +679,7 @@ test "HopSecret / ProcessResult field shapes" {
     try std.testing.expectEqual(@as(usize, 32), hs.shared_secret.len);
     try std.testing.expectEqual(@as(usize, pubkey_len), hs.ephemeral_pubkey.len);
 
-    var pr = ProcessResult{ .payload_buf = @as([hop_payloads_len]u8, @splat(0)), .payload_len = 3, .next_packet = null };
+    var pr = ProcessResult{ .payload_buf = @as([hop_payloads_len]u8, @splat(0)), .payload_len = 3, .next_packet = null, .replay_tag = @as([32]u8, @splat(0)) };
     @memcpy(pr.payload_buf[0..3], &[_]u8{ 1, 2, 3 });
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, pr.payload());
 }
@@ -710,4 +759,67 @@ fn fuzzProcess(_: void, smith: *std.testing.Smith) !void {
 }
 test "fuzz process never panics on an arbitrary parsed packet" {
     try std.testing.fuzz({}, fuzzProcess, .{});
+}
+
+// ── replay tag / hook ────────────────────────────────────────────────────
+
+const TestLog = struct {
+    seen: [4][replay_tag_len]u8 = undefined,
+    n: usize = 0,
+    calls: usize = 0,
+
+    fn check(ctx: ?*anyopaque, tag: *const [replay_tag_len]u8) bool {
+        const self: *TestLog = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        for (self.seen[0..self.n]) |t| if (std.mem.eql(u8, &t, tag)) return false;
+        self.seen[self.n] = tag.*;
+        self.n += 1;
+        return true;
+    }
+    fn hook(self: *TestLog) ReplayHook {
+        return .{ .ctx = self, .check = check };
+    }
+};
+
+test "replay_tag: SHA256 of the hop's shared secret, stable per packet, distinct across packets" {
+    const node_privkey = @as([32]u8, @splat(0x42));
+    const node_pub = (try Secp256k1.combMulBase(node_privkey, .big)).toCompressedSec1();
+    const k1 = @as([32]u8, @splat(0x41));
+    const k2 = @as([32]u8, @splat(0x43));
+    const o1 = try construct(&k1, &.{node_pub}, &.{&[_]u8{ 1, 2, 3 }}, "ad");
+    const o2 = try construct(&k2, &.{node_pub}, &.{&[_]u8{ 1, 2, 3 }}, "ad");
+    const a = try process(&node_privkey, o1, "ad");
+    const b = try process(&node_privkey, o1, "ad");
+    const c = try process(&node_privkey, o2, "ad");
+    try std.testing.expectEqualSlices(u8, &a.replay_tag, &b.replay_tag);
+    try std.testing.expect(!std.mem.eql(u8, &a.replay_tag, &c.replay_tag));
+    // Definition: SHA256(ss) with ss from the sender-side derivation.
+    var hs: [1]HopSecret = undefined;
+    try deriveHopSecrets(&k1, &.{node_pub}, &hs);
+    var want: [32]u8 = undefined;
+    Sha256.hash(&hs[0].shared_secret, &want, .{});
+    try std.testing.expectEqualSlices(u8, &want, &a.replay_tag);
+}
+
+test "processWithHook: a log refuses the second pass of the same packet" {
+    const node_privkey = @as([32]u8, @splat(0x42));
+    const node_pub = (try Secp256k1.combMulBase(node_privkey, .big)).toCompressedSec1();
+    const o1 = try construct(&@as([32]u8, @splat(0x41)), &.{node_pub}, &.{&[_]u8{ 9, 9 }}, "ad");
+    const o2 = try construct(&@as([32]u8, @splat(0x43)), &.{node_pub}, &.{&[_]u8{ 9, 9 }}, "ad");
+    var log: TestLog = .{};
+    const r = try processWithHook(&node_privkey, o1, "ad", log.hook());
+    try std.testing.expectEqualSlices(u8, &.{ 9, 9 }, r.payload());
+    try std.testing.expectError(error.Replayed, processWithHook(&node_privkey, o1, "ad", log.hook()));
+    _ = try processWithHook(&node_privkey, o2, "ad", log.hook());
+    try std.testing.expectEqual(@as(usize, 2), log.n);
+}
+
+test "processWithHook: not consulted for a packet that fails its HMAC" {
+    const node_privkey = @as([32]u8, @splat(0x42));
+    const node_pub = (try Secp256k1.combMulBase(node_privkey, .big)).toCompressedSec1();
+    var o = try construct(&@as([32]u8, @splat(0x41)), &.{node_pub}, &.{&[_]u8{ 9, 9 }}, "ad");
+    o.hmac[0] ^= 1;
+    var log: TestLog = .{};
+    try std.testing.expectError(error.IntegrityCheckFailed, processWithHook(&node_privkey, o, "ad", log.hook()));
+    try std.testing.expectEqual(@as(usize, 0), log.calls);
 }
