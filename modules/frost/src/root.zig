@@ -1399,6 +1399,47 @@ pub fn trustedDealerKeygen(
     };
 }
 
+pub const VssVerifyError = error{
+    /// `vss_commitment` is empty (a Feldman commitment has one element per
+    /// polynomial coefficient, at least the constant term).
+    InvalidParameters,
+};
+
+/// RFC 9591 Appendix C.2 `vss_verify`: does `share` lie on the polynomial the
+/// dealer committed to in `vss_commitment`?
+///
+/// ```text
+/// (i, sk_i) = share
+/// S_i  = ScalarBaseMult(sk_i)
+/// S_i' = sum over j of ScalarMult(vss_commitment[j], i^j)
+/// return S_i == S_i'
+/// ```
+///
+/// A participant calls it on the share the dealer sent it (from
+/// `trustedDealerKeygen` or any other Feldman dealer) with the broadcast
+/// `vss_commitment`. `false` on any mismatch, a malformed commitment element, a
+/// zero share (the identity is never a valid verifying share) or a sum that
+/// is the identity; only an empty `vss_commitment` is an error. Takes the
+/// share by pointer (no extra copy of the secret). The secret share only
+/// enters `Secp256k1.combMulBase` (constant time, as in `verifySignatureShare`
+/// and `verify`); everything else (commitments, the identifier powers) is
+/// public data and uses the variable-time public multiplication. The sum is
+/// evaluated by Horner's rule, equal to the RFC's sum of `C_j * i^j`.
+pub fn vssVerify(share: *const ParticipantShare, vss_commitment: []const Element) VssVerifyError!bool {
+    if (vss_commitment.len == 0) return error.InvalidParameters;
+    const x_bytes = share.identifier.scalar().toBytes(.big);
+    var j: usize = vss_commitment.len - 1;
+    var acc = vss_commitment[j].point() catch return false;
+    while (j > 0) : (j -= 1) {
+        // acc = acc * x + C_{j-1}  (Horner)
+        const c = vss_commitment[j - 1].point() catch return false;
+        const scaled = acc.mulPublic(x_bytes, .big) catch return false;
+        acc = scaled.add(c);
+    }
+    const lhs = Secp256k1.combMulBase(share.signing_share.toBytes(), .big) catch return false;
+    return lhs.equivalent(acc);
+}
+
 pub const SecretShareCombineError = error{
     /// Fewer than 2 shares given, or duplicate/invalid identifiers among
     /// them (RFC 9591 Appendix C.1's `"invalid parameters"` on

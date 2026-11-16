@@ -76,6 +76,14 @@ pub const PublicKey = [Suite.DHLEN]u8;
 /// context. Versioned so a future wire change is a different transcript.
 pub const prologue_label = "tenantkex/v1 Noise_IK_25519_ChaChaPoly_SHA256";
 
+/// Prologue label of the opt-in PSK mode (`Noise_IKpsk2`); a distinct transcript
+/// from `prologue_label`, so a PSK handshake can never be confused with a plain one.
+pub const prologue_label_psk = "tenantkex/v1 Noise_IKpsk2_25519_ChaChaPoly_SHA256";
+
+/// The Noise pattern of the PSK mode: IK with a `psk` token at the end of
+/// message 2 (`IKpsk2`, as WireGuard).
+const IKpsk2 = noise.patterns.withPsk(noise.patterns.IK, &.{2});
+
 /// The fabric context bound into the Noise prologue. Both PEs MUST agree on
 /// every field or the handshake's first encrypted token fails its AEAD tag —
 /// which is exactly what scopes a completed session to one tenant.
@@ -93,16 +101,28 @@ pub const FabricContext = struct {
     /// Serialized prologue length in bytes.
     pub const prologue_len = prologue_label.len + 3 + 4 + 4;
 
-    /// Serialize the prologue into `buf`. Deterministic and fixed-width; the
-    /// same `FabricContext` on both sides yields identical bytes.
-    pub fn writePrologue(self: FabricContext, buf: *[prologue_len]u8) void {
-        @memcpy(buf[0..prologue_label.len], prologue_label);
-        var o: usize = prologue_label.len;
+    /// Serialized prologue length in bytes in PSK mode.
+    pub const prologue_len_psk = prologue_label_psk.len + 3 + 4 + 4;
+
+    /// As `writePrologue`, with `prologue_label_psk` (the PSK mode's transcript).
+    pub fn writeProloguePsk(self: FabricContext, buf: *[prologue_len_psk]u8) void {
+        self.writeBody(prologue_label_psk, buf);
+    }
+
+    fn writeBody(self: FabricContext, comptime label: []const u8, buf: *[label.len + 11]u8) void {
+        @memcpy(buf[0..label.len], label);
+        var o: usize = label.len;
         std.mem.writeInt(u24, buf[o..][0..3], self.isid, .big);
         o += 3;
         std.mem.writeInt(u32, buf[o..][0..4], self.initiator_pe, .big);
         o += 4;
         std.mem.writeInt(u32, buf[o..][0..4], self.responder_pe, .big);
+    }
+
+    /// Serialize the prologue into `buf`. Deterministic and fixed-width; the
+    /// same `FabricContext` on both sides yields identical bytes.
+    pub fn writePrologue(self: FabricContext, buf: *[prologue_len]u8) void {
+        self.writeBody(prologue_label, buf);
     }
 };
 
@@ -179,7 +199,9 @@ fn fillKeys(comptime is_initiator: bool, pair: *const [2]Suite.CipherState, h: [
 /// Wipe every secret this module copied into a `noise` handshake state:
 /// the static and ephemeral secret keys plus the symmetric chaining/cipher
 /// keys. See `Initiator.wipe` for why this layer owns the static-key wipe.
-fn wipeHandshake(hs: *HS) void {
+fn wipeHandshake(hs: *HS, psk: *[32]u8) void {
+    std.crypto.secureZero(u8, psk);
+    hs.psks = &.{};
     if (hs.s != null) std.crypto.secureZero(u8, &hs.s.?.secret_key);
     if (hs.e != null) std.crypto.secureZero(u8, &hs.e.?.secret_key);
     std.crypto.secureZero(u8, &hs.symmetric_state.ck);
@@ -192,6 +214,11 @@ fn wipeHandshake(hs: *HS) void {
 pub const Initiator = struct {
     hs: HS,
     state: State = .start,
+    /// Private copy of the optional PSK (the `noise` state only borrows a slice);
+    /// re-bound to `hs.psks` before every handshake call so a moved struct stays
+    /// valid. Wiped by `wipe`.
+    psk: [32]u8 = @splat(0),
+    use_psk: bool = false,
 
     const State = enum { start, awaiting_msg2, done };
 
@@ -213,7 +240,29 @@ pub const Initiator = struct {
         ctx: FabricContext,
         ephemeral: ?*const KeyPair,
     ) void {
-        burn.run(burn.hs_burn, void, initiatorInitBody, .{ self, static_kp, responder_static, ctx, ephemeral });
+        burn.run(burn.hs_burn, void, initiatorInitBody, .{ self, static_kp, responder_static, ctx, ephemeral, null });
+    }
+
+    /// Opt-in PSK mode: `Noise_IKpsk2` (the `psk` token ends message 2, as in
+    /// WireGuard) with the 32-byte pre-shared secret `psk` — a hedge on top of the
+    /// X25519 exchange. Both sides must use the same `psk` AND the PSK mode: a
+    /// wrong or missing PSK makes `readMessage2` fail `DecryptionFailed` (a plain-IK
+    /// peer already fails the responder's `readMessage1`). `psk` is copied in and
+    /// wiped by `wipe`; wipe the caller's copy yourself. Wire lengths equal IK's.
+    pub fn initPsk(self: *Initiator, static_kp: *const KeyPair, responder_static: PublicKey, ctx: FabricContext, psk: *const [32]u8) void {
+        self.initPskEphemeral(static_kp, responder_static, ctx, psk, null);
+    }
+
+    /// As `initPsk`, with an explicit ephemeral keypair (KAT/testing hook).
+    pub fn initPskEphemeral(
+        self: *Initiator,
+        static_kp: *const KeyPair,
+        responder_static: PublicKey,
+        ctx: FabricContext,
+        psk: *const [32]u8,
+        ephemeral: ?*const KeyPair,
+    ) void {
+        burn.run(burn.hs_burn, void, initiatorInitBody, .{ self, static_kp, responder_static, ctx, ephemeral, psk });
     }
 
     fn initiatorInitBody(
@@ -222,15 +271,33 @@ pub const Initiator = struct {
         responder_static: PublicKey,
         ctx: FabricContext,
         ephemeral: ?*const KeyPair,
+        psk: ?*const [32]u8,
     ) void {
         self.* = .{ .hs = .{} };
-        var pbuf: [FabricContext.prologue_len]u8 = undefined;
-        ctx.writePrologue(&pbuf);
-        self.hs.initialize(noise.patterns.IK, true, &pbuf, &.{
-            .s = static_kp,
-            .e = ephemeral,
-            .rs = responder_static,
-        });
+        if (psk) |k| {
+            self.psk = k.*;
+            self.use_psk = true;
+            var pbuf: [FabricContext.prologue_len_psk]u8 = undefined;
+            ctx.writeProloguePsk(&pbuf);
+            self.hs.initialize(IKpsk2, true, &pbuf, &.{
+                .s = static_kp,
+                .e = ephemeral,
+                .rs = responder_static,
+                .psks = @as(*const [1][32]u8, @ptrCast(&self.psk)),
+            });
+        } else {
+            var pbuf: [FabricContext.prologue_len]u8 = undefined;
+            ctx.writePrologue(&pbuf);
+            self.hs.initialize(noise.patterns.IK, true, &pbuf, &.{
+                .s = static_kp,
+                .e = ephemeral,
+                .rs = responder_static,
+            });
+        }
+    }
+
+    fn bindPsk(self: *Initiator) void {
+        self.hs.psks = if (self.use_psk) @as(*const [1][32]u8, @ptrCast(&self.psk)) else &.{};
     }
 
     /// Destroy the private key material this initiator holds — the copy of the
@@ -244,7 +311,7 @@ pub const Initiator = struct {
     /// ours to do. Call it once the handshake is done with (the `SessionKeys`
     /// are a separate copy and survive; wipe those with `SessionKeys.wipe`).
     pub fn wipe(self: *Initiator) void {
-        wipeHandshake(&self.hs);
+        wipeHandshake(&self.hs, &self.psk);
     }
 
     /// Emit msg1 into `out` (needs `message1Len(payload.len)` bytes),
@@ -257,6 +324,7 @@ pub const Initiator = struct {
 
     fn writeMessage1Body(self: *Initiator, random: std.Random, payload: []const u8, out: []u8) WriteError!usize {
         if (self.state != .start) return error.WrongState;
+        self.bindPsk();
         var pair: [2]Suite.CipherState = undefined;
         const step = try self.hs.writeMessage(random, payload, out, &pair);
         if (step.complete) return error.UnexpectedHandshakeCompletion; // msg1 never completes IK
@@ -278,6 +346,7 @@ pub const Initiator = struct {
 
     fn readMessage2Body(self: *Initiator, message: []const u8, payload_out: []u8, keys: *SessionKeys) ReadError!usize {
         if (self.state != .awaiting_msg2) return error.WrongState;
+        self.bindPsk();
         var pair: [2]Suite.CipherState = undefined;
         const step = try self.hs.readMessage(message, payload_out, &pair);
         if (!step.complete) return error.HandshakeNotComplete; // msg2 completes IK
@@ -295,6 +364,9 @@ pub const Responder = struct {
     /// provisioned key of `ctx.initiator_pe`.
     expected_initiator: PublicKey,
     state: State = .start,
+    /// See `Initiator.psk`.
+    psk: [32]u8 = @splat(0),
+    use_psk: bool = false,
 
     const State = enum { start, awaiting_write2, done, failed };
 
@@ -319,24 +391,51 @@ pub const Responder = struct {
 
     /// As `init`, with an explicit ephemeral keypair (KAT/testing hook).
     pub fn initEphemeral(self: *Responder, static_kp: *const KeyPair, initiator_static: PublicKey, ctx: FabricContext, ephemeral: ?*const KeyPair) void {
-        burn.run(burn.hs_burn, void, responderInitBody, .{ self, static_kp, initiator_static, ctx, ephemeral });
+        burn.run(burn.hs_burn, void, responderInitBody, .{ self, static_kp, initiator_static, ctx, ephemeral, null });
     }
 
-    fn responderInitBody(self: *Responder, static_kp: *const KeyPair, initiator_static: PublicKey, ctx: FabricContext, ephemeral: ?*const KeyPair) void {
+    /// Opt-in PSK mode (`Noise_IKpsk2`), the responder side of
+    /// `Initiator.initPsk`; same contract.
+    pub fn initPsk(self: *Responder, static_kp: *const KeyPair, initiator_static: PublicKey, ctx: FabricContext, psk: *const [32]u8) void {
+        self.initPskEphemeral(static_kp, initiator_static, ctx, psk, null);
+    }
+
+    /// As `initPsk`, with an explicit ephemeral keypair (KAT/testing hook).
+    pub fn initPskEphemeral(self: *Responder, static_kp: *const KeyPair, initiator_static: PublicKey, ctx: FabricContext, psk: *const [32]u8, ephemeral: ?*const KeyPair) void {
+        burn.run(burn.hs_burn, void, responderInitBody, .{ self, static_kp, initiator_static, ctx, ephemeral, psk });
+    }
+
+    fn responderInitBody(self: *Responder, static_kp: *const KeyPair, initiator_static: PublicKey, ctx: FabricContext, ephemeral: ?*const KeyPair, psk: ?*const [32]u8) void {
         self.* = .{ .hs = .{}, .expected_initiator = initiator_static };
-        var pbuf: [FabricContext.prologue_len]u8 = undefined;
-        ctx.writePrologue(&pbuf);
         // The responder learns the initiator's static from msg1 (no `rs`).
-        self.hs.initialize(noise.patterns.IK, false, &pbuf, &.{
-            .s = static_kp,
-            .e = ephemeral,
-        });
+        if (psk) |k| {
+            self.psk = k.*;
+            self.use_psk = true;
+            var pbuf: [FabricContext.prologue_len_psk]u8 = undefined;
+            ctx.writeProloguePsk(&pbuf);
+            self.hs.initialize(IKpsk2, false, &pbuf, &.{
+                .s = static_kp,
+                .e = ephemeral,
+                .psks = @as(*const [1][32]u8, @ptrCast(&self.psk)),
+            });
+        } else {
+            var pbuf: [FabricContext.prologue_len]u8 = undefined;
+            ctx.writePrologue(&pbuf);
+            self.hs.initialize(noise.patterns.IK, false, &pbuf, &.{
+                .s = static_kp,
+                .e = ephemeral,
+            });
+        }
+    }
+
+    fn bindPsk(self: *Responder) void {
+        self.hs.psks = if (self.use_psk) @as(*const [1][32]u8, @ptrCast(&self.psk)) else &.{};
     }
 
     /// Destroy the private key material this responder holds — see
     /// `Initiator.wipe` (same rule, same ownership argument).
     pub fn wipe(self: *Responder) void {
-        wipeHandshake(&self.hs);
+        wipeHandshake(&self.hs, &self.psk);
     }
 
     /// Consume msg1, decrypting any initiator payload into `payload_out` and
@@ -352,13 +451,14 @@ pub const Responder = struct {
 
     fn readMessage1Body(self: *Responder, message: []const u8, payload_out: []u8) ReadError!usize {
         if (self.state != .start) return error.WrongState;
+        self.bindPsk();
         var pair: [2]Suite.CipherState = undefined;
         const step = try self.hs.readMessage(message, payload_out, &pair);
         if (step.complete) return error.UnexpectedHandshakeCompletion; // msg1 never completes IK
         const got = self.hs.rs orelse unreachable; // IK's msg1 always carries `s`
         if (!std.crypto.timing_safe.eql(PublicKey, got, self.expected_initiator)) {
             std.crypto.secureZero(u8, payload_out[0..step.len]);
-            wipeHandshake(&self.hs);
+            wipeHandshake(&self.hs, &self.psk);
             self.state = .failed;
             return error.UnknownInitiator;
         }
@@ -376,6 +476,7 @@ pub const Responder = struct {
 
     fn writeMessage2Body(self: *Responder, random: std.Random, payload: []const u8, out: []u8, keys: *SessionKeys) WriteError!usize {
         if (self.state != .awaiting_write2) return error.WrongState;
+        self.bindPsk();
         var pair: [2]Suite.CipherState = undefined;
         const step = try self.hs.writeMessage(random, payload, out, &pair);
         if (!step.complete) return error.HandshakeNotComplete; // msg2 completes IK
@@ -1021,6 +1122,179 @@ test "wipe mid-handshake clears the ephemeral secret and the chaining key" {
     try testing.expectError(error.UnknownInitiator, rsp.readMessage1(m1[0..n1], &pl));
     try testing.expect(std.mem.allEqual(u8, &rsp.hs.symmetric_state.ck, 0));
     try testing.expect(std.mem.allEqual(u8, &rsp.hs.s.?.secret_key, 0));
+}
+
+// ── PSK mode (IKpsk2) ──────────────────────────────────────────────────────
+
+const test_psk: [32]u8 = @splat(0x5a);
+const other_psk: [32]u8 = blk: {
+    var k: [32]u8 = @splat(0x5a);
+    k[31] ^= 1;
+    break :blk k;
+};
+
+const PskMode = union(enum) { none, psk: [32]u8 };
+
+fn startIni(ini: *Initiator, is: KeyPair, rs_pub: PublicKey, mode: PskMode, eph: ?KeyPair) void {
+    const e: ?*const KeyPair = if (eph) |*k| k else null;
+    switch (mode) {
+        .none => ini.initEphemeral(&is, rs_pub, demo_ctx, e),
+        .psk => |*k| ini.initPskEphemeral(&is, rs_pub, demo_ctx, k, e),
+    }
+}
+fn startRsp(rsp: *Responder, rs: KeyPair, is_pub: PublicKey, mode: PskMode, eph: ?KeyPair) void {
+    const e: ?*const KeyPair = if (eph) |*k| k else null;
+    switch (mode) {
+        .none => rsp.initEphemeral(&rs, is_pub, demo_ctx, e),
+        .psk => |*k| rsp.initPskEphemeral(&rs, is_pub, demo_ctx, k, e),
+    }
+}
+
+const PskOutcome = union(enum) { ok: struct { i: SessionKeys, r: SessionKeys }, msg1_failed: ReadError, msg2_failed: ReadError };
+
+fn runPsk(mi: PskMode, mr: PskMode) !PskOutcome {
+    const is = kp(init_static_priv);
+    const rs = kp(resp_static_priv);
+    var ini: Initiator = undefined;
+    var rsp: Responder = undefined;
+    startIni(&ini, is, rs.public_key, mi, null);
+    startRsp(&rsp, rs, is.public_key, mr, null);
+    var prng = testRandom(0x9999);
+    var m1: [256]u8 = undefined;
+    var m2: [256]u8 = undefined;
+    var pl: [64]u8 = undefined;
+    const n1 = try ini.writeMessage1(prng.random(), "a", m1[0..message1Len(1)]);
+    const r1 = rsp.readMessage1(m1[0..n1], &pl) catch |e| return .{ .msg1_failed = e };
+    _ = r1;
+    var rk: SessionKeys = undefined;
+    const n2 = try rsp.writeMessage2(prng.random(), "b", m2[0..message2Len(1)], &rk);
+    var ik: SessionKeys = undefined;
+    _ = ini.readMessage2(m2[0..n2], &pl, &ik) catch |e| return .{ .msg2_failed = e };
+    return .{ .ok = .{ .i = ik, .r = rk } };
+}
+
+test "PSK mode: matching PSK completes with crossed keys, differing from plain IK" {
+    const out = (try runPsk(.{ .psk = test_psk }, .{ .psk = test_psk })).ok;
+    try testing.expectEqualSlices(u8, &out.i.send_key, &out.r.recv_key);
+    try testing.expectEqualSlices(u8, &out.i.recv_key, &out.r.send_key);
+    try testing.expectEqualSlices(u8, &out.i.transcript_hash, &out.r.transcript_hash);
+    const plain = try runHandshake(demo_ctx, demo_ctx);
+    try testing.expect(!std.mem.eql(u8, &plain.i.send_key, &out.i.send_key));
+    // A different PSK gives different (but again matching) keys.
+    const o2 = (try runPsk(.{ .psk = other_psk }, .{ .psk = other_psk })).ok;
+    try testing.expect(!std.mem.eql(u8, &o2.i.send_key, &out.i.send_key));
+    try testing.expectEqualSlices(u8, &o2.i.send_key, &o2.r.recv_key);
+}
+
+test "PSK mode: a wrong PSK fails the initiator's msg2 decrypt (psk mixes into msg2)" {
+    const o = try runPsk(.{ .psk = test_psk }, .{ .psk = other_psk });
+    try testing.expectEqual(ReadError.DecryptionFailed, o.msg2_failed);
+    const o2 = try runPsk(.{ .psk = other_psk }, .{ .psk = test_psk });
+    try testing.expectEqual(ReadError.DecryptionFailed, o2.msg2_failed);
+}
+
+test "PSK mode: PSK on only one side fails (different protocol name and prologue)" {
+    const a = try runPsk(.{ .psk = test_psk }, .none);
+    try testing.expectEqual(ReadError.DecryptionFailed, a.msg1_failed);
+    const b = try runPsk(.none, .{ .psk = test_psk });
+    try testing.expectEqual(ReadError.DecryptionFailed, b.msg1_failed);
+}
+
+test "PSK mode: an all-zero PSK is a valid PSK, not 'absent'" {
+    const zero: [32]u8 = @splat(0);
+    const o = (try runPsk(.{ .psk = zero }, .{ .psk = zero })).ok;
+    try testing.expectEqualSlices(u8, &o.i.send_key, &o.r.recv_key);
+    const plain = try runHandshake(demo_ctx, demo_ctx);
+    try testing.expect(!std.mem.eql(u8, &plain.i.send_key, &o.i.send_key));
+    const mism = try runPsk(.{ .psk = zero }, .none);
+    try testing.expectEqual(ReadError.DecryptionFailed, mism.msg1_failed);
+}
+
+test "PSK mode survives moving the handshake structs after init" {
+    const is = kp(init_static_priv);
+    const rs = kp(resp_static_priv);
+    var ini0: Initiator = undefined;
+    var rsp0: Responder = undefined;
+    ini0.initPsk(&is, rs.public_key, demo_ctx, &test_psk);
+    rsp0.initPsk(&rs, is.public_key, demo_ctx, &test_psk);
+    var ini = ini0; // copy: the borrowed noise slice would dangle without re-binding
+    var rsp = rsp0;
+    ini0.wipe();
+    rsp0.wipe();
+    var prng = testRandom(0x4242);
+    var m1: [256]u8 = undefined;
+    var m2: [256]u8 = undefined;
+    var pl: [64]u8 = undefined;
+    const n1 = try ini.writeMessage1(prng.random(), "", m1[0..message1Len(0)]);
+    _ = try rsp.readMessage1(m1[0..n1], &pl);
+    var rk: SessionKeys = undefined;
+    const n2 = try rsp.writeMessage2(prng.random(), "", m2[0..message2Len(0)], &rk);
+    var ik: SessionKeys = undefined;
+    _ = try ini.readMessage2(m2[0..n2], &pl, &ik);
+    try testing.expectEqualSlices(u8, &ik.send_key, &rk.recv_key);
+}
+
+test "PSK mode: wipe destroys the PSK copy; unknown initiator still refused" {
+    const is = kp(init_static_priv);
+    const rs = kp(resp_static_priv);
+    var ini: Initiator = undefined;
+    ini.initPsk(&is, rs.public_key, demo_ctx, &test_psk);
+    try testing.expect(std.mem.eql(u8, &ini.psk, &test_psk));
+    ini.wipe();
+    try testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0))), &ini.psk);
+
+    const attacker = kp(@as([32]u8, @splat(0x77)));
+    var a: Initiator = undefined;
+    a.initPsk(&attacker, rs.public_key, demo_ctx, &test_psk);
+    var rsp: Responder = undefined;
+    rsp.initPsk(&rs, is.public_key, demo_ctx, &test_psk);
+    var prng = testRandom(0x7878);
+    var m1: [256]u8 = undefined;
+    var pl: [64]u8 = undefined;
+    const n1 = try a.writeMessage1(prng.random(), "x", m1[0..message1Len(1)]);
+    try testing.expectError(error.UnknownInitiator, rsp.readMessage1(m1[0..n1], &pl));
+    try testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0))), &rsp.psk);
+}
+
+test "KAT (noise as oracle): PSK mode == raw Noise_IKpsk2 over the PSK prologue, byte-exact" {
+    const is = kp(init_static_priv);
+    const rs = kp(resp_static_priv);
+    const ie = kp(init_eph_priv);
+    const re = kp(resp_eph_priv);
+    var pbuf: [FabricContext.prologue_len_psk]u8 = undefined;
+    demo_ctx.writeProloguePsk(&pbuf);
+    const psks = [_][32]u8{test_psk};
+    var rini: HS = .{};
+    var rrsp: HS = .{};
+    rini.initialize(IKpsk2, true, &pbuf, &.{ .s = &is, .e = &ie, .rs = rs.public_key, .psks = &psks });
+    rrsp.initialize(IKpsk2, false, &pbuf, &.{ .s = &rs, .e = &re, .psks = &psks });
+    var no_rng = testRandom(0);
+    var ref_m1: [256]u8 = undefined;
+    var ref_m2: [256]u8 = undefined;
+    var ref_pl: [64]u8 = undefined;
+    var ref_pair: [2]Suite.CipherState = undefined;
+    var ref_scratch: [2]Suite.CipherState = undefined;
+    const rw1 = try rini.writeMessage(no_rng.random(), "p1", &ref_m1, &ref_scratch);
+    _ = try rrsp.readMessage(ref_m1[0..rw1.len], &ref_pl, &ref_scratch);
+    const rw2 = try rrsp.writeMessage(no_rng.random(), "p2", &ref_m2, &ref_scratch);
+    _ = try rini.readMessage(ref_m2[0..rw2.len], &ref_pl, &ref_pair);
+
+    var ini: Initiator = undefined;
+    var rsp: Responder = undefined;
+    startIni(&ini, is, rs.public_key, .{ .psk = test_psk }, ie);
+    startRsp(&rsp, rs, is.public_key, .{ .psk = test_psk }, re);
+    var m1: [256]u8 = undefined;
+    var m2: [256]u8 = undefined;
+    var pl: [64]u8 = undefined;
+    const n1 = try ini.writeMessage1(no_rng.random(), "p1", m1[0..message1Len(2)]);
+    _ = try rsp.readMessage1(m1[0..n1], &pl);
+    const fin_r = try write2(&rsp, no_rng.random(), "p2", m2[0..message2Len(2)]);
+    const fin_i = try read2(&ini, m2[0..fin_r.len], &pl);
+    try testing.expectEqualSlices(u8, ref_m1[0..rw1.len], m1[0..n1]);
+    try testing.expectEqualSlices(u8, ref_m2[0..rw2.len], m2[0..fin_r.len]);
+    try testing.expectEqualSlices(u8, &ref_pair[0].k, &fin_i.keys.send_key);
+    try testing.expectEqualSlices(u8, &ref_pair[1].k, &fin_r.keys.send_key);
+    try testing.expectEqualSlices(u8, &rrsp.symmetric_state.getHandshakeHash(), &fin_i.keys.transcript_hash);
 }
 
 test {
