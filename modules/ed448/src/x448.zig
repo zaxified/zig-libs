@@ -27,6 +27,7 @@ const std = @import("std");
 const entropy = @import("entropy");
 const field = @import("field.zig");
 const burn = @import("burn.zig");
+const ed448 = @import("ed448.zig");
 const Fe = field.Fe;
 
 pub const meta = .{
@@ -204,6 +205,23 @@ pub fn recoverPublicKey(secret_key: *const [scalar_length]u8) field.FieldError![
     return pk;
 }
 
+pub const EdConversionError = ed448.Point.DecodeError || error{IdentityElement};
+
+/// The X448 public key (Montgomery `u`) of an Ed448 public key, through
+/// RFC 7748 §4.2's 4-isogeny `u = y²/x²`. That map sends the Ed448 base point
+/// to `u = 5`, so the image of `[s]B` is `X448(s, 5)` (tested below). A
+/// public key that does not decode is refused as Ed448 refuses it; one with
+/// `x = 0` (the identity and `(0, -1)`, whose image is the point at infinity
+/// or of order 2) is `IdentityElement`. Public data: not constant-time.
+pub fn publicKeyFromEd448(ed_public_key: [57]u8) EdConversionError![public_length]u8 {
+    const p = try ed448.Point.fromBytes(ed_public_key);
+    const z_inv = p.z.invert() catch return error.IdentityElement;
+    const x = p.x.mul(z_inv);
+    const y = p.y.mul(z_inv);
+    const x2_inv = x.square().invert() catch return error.IdentityElement;
+    return y.square().mul(x2_inv).toBytes();
+}
+
 /// An X448 key pair.
 pub const KeyPair = struct {
     public_key: [public_length]u8,
@@ -238,6 +256,29 @@ pub const KeyPair = struct {
         // point can never itself trigger that error.
         defer std.crypto.secureZero(u8, &seed);
         generateDeterministic(out, &seed) catch unreachable;
+    }
+
+    /// The X448 key pair of an Ed448 key pair (libdecaf
+    /// `convert_private_key_to_x448`, the analogue of std's
+    /// `X25519.KeyPair.fromEd25519`): the secret is the first 56 bytes of
+    /// `SHAKE256(seed, 114)` — the bytes Ed448 clamps into its scalar `s`,
+    /// which X448's own clamping turns into the same `s` — and the public key
+    /// is `publicKeyFromEd448` of the Ed448 one, equal to
+    /// `X448(secret, 5)`. The digest is wiped and the derivation burned.
+    ///
+    /// Using one key for both signing and key agreement is a protocol
+    /// decision this only makes possible; prefer separate keys.
+    pub fn fromEd448(out: *KeyPair, ed: *const ed448.KeyPair) EdConversionError!void {
+        try fromEd448Unburned(out, ed);
+        burn.stack(burn.x448_burn);
+    }
+
+    noinline fn fromEd448Unburned(out: *KeyPair, ed: *const ed448.KeyPair) EdConversionError!void {
+        out.public_key = try publicKeyFromEd448(ed.public_key.bytes);
+        var h: [114]u8 = undefined;
+        defer std.crypto.secureZero(u8, &h);
+        std.crypto.hash.sha3.Shake256.hash(&ed.secret_key.bytes, &h, .{});
+        out.secret_key = h[0..scalar_length].*;
     }
 
     /// Zeroize `secret_key` in place; `public_key` is left untouched (it
@@ -356,4 +397,43 @@ test "RNG seam: KeyPair.generate really draws entropy, and round-trips end to en
     var bob_shared: [shared_length]u8 = undefined;
     try scalarmult(&bob_shared, &bob.secret_key, alice.public_key);
     try std.testing.expectEqualSlices(u8, &alice_shared, &bob_shared);
+}
+
+test "the 4-isogeny sends the Ed448 base point to u = 5" {
+    const B = ed448.Point.basePoint;
+    const u = B.y.square().mul(try B.x.square().invert());
+    var five: [public_length]u8 = @splat(0);
+    five[0] = 5;
+    try std.testing.expectEqualSlices(u8, &five, &u.toBytes());
+}
+
+test "KeyPair.fromEd448: public key equals X448(secret, 5), and DH agrees" {
+    // RFC 8032 §7.4's first Ed448 seed, and a second key for the exchange.
+    var seed_a: [57]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&seed_a, "6c82a562cb808d10d632be89c8513ebf6c929f34ddfa8c9f63c9960ef6e348a3528c8a3fcc2f044e39a3fc5b94492f8f032e7549a20098f95b");
+    var seed_b: [57]u8 = @splat(0x42);
+    const ed_a = ed448.KeyPair.create(&seed_a);
+    const ed_b = ed448.KeyPair.create(&seed_b);
+    var xa: KeyPair = undefined;
+    var xb: KeyPair = undefined;
+    try KeyPair.fromEd448(&xa, &ed_a);
+    try KeyPair.fromEd448(&xb, &ed_b);
+    try std.testing.expectEqualSlices(u8, &(try recoverPublicKey(&xa.secret_key)), &xa.public_key);
+    try std.testing.expectEqualSlices(u8, &(try recoverPublicKey(&xb.secret_key)), &xb.public_key);
+    var s1: [shared_length]u8 = undefined;
+    var s2: [shared_length]u8 = undefined;
+    try scalarmult(&s1, &xa.secret_key, xb.public_key);
+    try scalarmult(&s2, &xb.secret_key, xa.public_key);
+    try std.testing.expectEqualSlices(u8, &s1, &s2);
+}
+
+test "publicKeyFromEd448 refuses the identity and an undecodable key" {
+    try std.testing.expectError(error.IdentityElement, publicKeyFromEd448(ed448.Point.identityElement.toBytes()));
+    var bad: [57]u8 = @splat(0xff);
+    if (publicKeyFromEd448(bad)) |_| return error.TestUnexpectedResult else |e| switch (e) {
+        error.NonCanonical, error.InvalidEncoding => {},
+        else => return e,
+    }
+    bad = ed448.Point.basePoint.toBytes();
+    _ = try publicKeyFromEd448(bad);
 }
