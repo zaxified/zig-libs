@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** new offline tool `tools/seglog-dump` (`zig build install-dump-seglog`): `segments`, `verify`, `seek --lsn|--time`, `get --lsn [--hex]` and `rebuild-manifest` over a log directory, read-only except the last; public API only, no library change. Smoke script `tools/seglog-dump/smoke.sh`.
 - **2026-11-16** — Review LOW-6 and LOW-8: an `OutOfMemory` in `dropBefore` (or before `compress`'s rename) no longer
   leaves `segments()` ahead of the manifest on disk with the log unpoisoned (a retry found nothing to drop); every
   allocation now happens before the view changes. `Stats.compress_verify_failed` counts only a real read-back mismatch.

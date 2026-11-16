@@ -140,6 +140,14 @@ done. Readers are told to wait meanwhile. Back the directory up before an
 upgrade: the old files are not kept. Save whole `Position`s (they carry the
 LSN) and a future format change moves nothing for you.
 
+## Inspecting a log offline
+
+`tools/seglog-dump` (`zig build install-dump-seglog` puts it at `zig-out/dump/seglog-dump`) reads a log
+directory read-only, beside a running writer: `segments <dir>` (id, raw or zst, first LSN, size),
+`verify <dir>`, `seek <dir> --lsn N | --time T`, `get <dir> --lsn N [--hex]` (one record: lsn, timestamp,
+length, payload) and `rebuild-manifest <dir>` (the only one that writes: `Log.rebuildManifest` over the segment
+files it finds). `tools/seglog-dump/smoke.sh` runs every command against a fresh log.
+
 ## How it compares
 
 Same machine, same scenarios (`tools/bench.zig`, `zig build bench-seglog`; the Go side in

@@ -922,6 +922,33 @@ pub fn build(b: *std.Build) void {
             if (in_group) check_interop.dependOn(&bench_exe.step);
         }
 
+        // An offline inspection program, `modules/<m>/tools/<m>-dump/main.zig`
+        // (seglog-dump), discovered by existence like the programs above. It
+        // links only the module and its dependency closure; never run by a
+        // lane, but compiled on the rot-guard lane so it keeps building.
+        // `zig build install-dump-<m>` puts it at `zig-out/dump/<m>-dump`.
+        if (configureExists(b, b.fmt("modules/{s}/tools/{s}-dump/main.zig", .{ m.name, m.name }))) {
+            const dump_mod = b.createModule(.{
+                .root_source_file = b.path(b.fmt("modules/{s}/tools/{s}-dump/main.zig", .{ m.name, m.name })),
+                .target = target,
+                .optimize = if (m.heavy) heavy_optimize else optimize,
+            });
+            dump_mod.addImport(m.name, mod);
+            for (m.deps) |dep| dump_mod.addImport(dep, mods.get(dep).?);
+            const dump_exe = b.addExecutable(.{
+                .name = b.fmt("{s}-dump", .{m.name}),
+                .root_module = dump_mod,
+                .use_llvm = use_llvm,
+            });
+            b.step(
+                b.fmt("install-dump-{s}", .{m.name}),
+                b.fmt("Install the {s} offline inspection program into zig-out/dump/", .{m.name}),
+            ).dependOn(&b.addInstallArtifact(dump_exe, .{
+                .dest_dir = .{ .override = .{ .custom = "dump" } },
+            }).step);
+            if (in_group) check_interop.dependOn(&dump_exe.step);
+        }
+
         // The size probe (CONVENTIONS §4.2, 2026-10-17): a minimal consumer of a
         // module that has consumer build options, over the PUBLISHED module, so
         // `-Dprofile` / `-D<module>-<knob>` reach it exactly as they reach an
