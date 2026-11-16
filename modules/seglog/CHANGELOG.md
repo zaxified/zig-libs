@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** documentation: the audit line and the whole-module
+  mutation audit (355 mutants, 301 killed, 46 equivalent, 7 unobservable, 1 finding) recorded in SPEC.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** tests only: sharper tests for the read window's
   short-read memory, a reader meeting a torn segment header, a manifest first LSN of 0, and `resync`
   past a record whose LSN is beyond any log (mutation audit, second pass).
