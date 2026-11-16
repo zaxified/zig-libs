@@ -1217,3 +1217,201 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── grpc.health.v1 ──────────────────────────────────────────────────────────
+
+const health_mod = @import("health.zig");
+
+fn healthCall(
+    peer: *TestPeer,
+    router: *server.Router,
+    method: []const u8,
+    service: []const u8,
+) !u31 {
+    const req = try pb.encodeAlloc(testing.allocator, health_mod.HealthCheckRequest{ .service = service }, .{});
+    defer testing.allocator.free(req);
+    var path: [64]u8 = undefined;
+    const sid = try startCall(peer, try std.mem.print(&path, "/grpc.health.v1.Health/{s}", .{method}), &.{req});
+    try runOffline(peer, router);
+    return sid;
+}
+
+fn healthStatuses(r: *const Collected, out: *std.ArrayList(health_mod.ServingStatus)) !void {
+    const gpa = testing.allocator;
+    var msgs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (msgs.items) |m| gpa.free(m);
+        msgs.deinit(gpa);
+    }
+    try r.messages(gpa, &msgs);
+    for (msgs.items) |m| {
+        var d = try pb.decode(health_mod.HealthCheckResponse, gpa, m, .{});
+        defer d.deinit();
+        try out.append(gpa, d.value.status);
+    }
+}
+
+test "health: wire encoding of the standard messages (field numbers and enum values)" {
+    const gpa = testing.allocator;
+    const req = try pb.encodeAlloc(gpa, health_mod.HealthCheckRequest{ .service = "a" }, .{});
+    defer gpa.free(req);
+    try testing.expectEqualSlices(u8, &.{ 0x0a, 0x01, 'a' }, req);
+    const rep = try pb.encodeAlloc(gpa, health_mod.HealthCheckResponse{ .status = .service_unknown }, .{});
+    defer gpa.free(rep);
+    try testing.expectEqualSlices(u8, &.{ 0x08, 0x03 }, rep);
+}
+
+test "health: Check answers overall, known and unknown services" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var h = health_mod.Health.init(threaded.io(), gpa);
+    defer h.deinit();
+    try h.set("echo.Echo", .serving);
+    try h.set("db", .not_serving);
+
+    var router: server.Router = .{
+        .gpa = gpa,
+        .context = &h,
+        .services = &.{ health_mod.service_from_context, echo_service },
+    };
+    const Case = struct { svc: []const u8, want: ?health_mod.ServingStatus };
+    for ([_]Case{
+        .{ .svc = "", .want = .serving }, // overall starts SERVING
+        .{ .svc = "echo.Echo", .want = .serving },
+        .{ .svc = "db", .want = .not_serving },
+        .{ .svc = "nope", .want = null }, // NOT_FOUND
+    }) |cs| {
+        var peer: TestPeer = .init(gpa);
+        defer peer.deinit();
+        try peer.conn.sendPreface(&peer.wire);
+        const sid = try healthCall(&peer, &router, "Check", cs.svc);
+        const r = peer.resp(sid);
+        if (cs.want) |w| {
+            try testing.expectEqualStrings("0", r.trailer("grpc-status").?);
+            var got: std.ArrayList(health_mod.ServingStatus) = .empty;
+            defer got.deinit(gpa);
+            try healthStatuses(r, &got);
+            try testing.expectEqualSlices(health_mod.ServingStatus, &.{w}, got.items);
+        } else {
+            try testing.expect(r.isTrailersOnly());
+            try testing.expectEqualStrings("5", r.header("grpc-status").?); // NOT_FOUND
+        }
+    }
+
+    // Overall status changes, and a removed service is NOT_FOUND again.
+    try h.set("", .not_serving);
+    try testing.expectEqual(@as(?health_mod.ServingStatus, .not_serving), h.get(""));
+    h.remove("db");
+    try testing.expectEqual(@as(?health_mod.ServingStatus, null), h.get("db"));
+    h.remove("");
+    try testing.expectEqual(@as(?health_mod.ServingStatus, .serving), h.get(""));
+}
+
+const WatchDriver = struct {
+    h: *health_mod.Health,
+    fn waitDelivered(d: *WatchDriver, n: u64) void {
+        while (true) {
+            d.h.mutex.lockUncancelable(d.h.io);
+            const got = d.h.delivered;
+            d.h.mutex.unlock(d.h.io);
+            if (got >= n) return;
+            d.h.io.sleep(.fromMilliseconds(1), .awake) catch return;
+        }
+    }
+    fn run(d: *WatchDriver) void {
+        d.waitDelivered(1); // initial SERVING went out
+        d.h.set("svc", .not_serving) catch return;
+        d.waitDelivered(2);
+        d.h.set("svc", .serving) catch return;
+        d.waitDelivered(3);
+        d.h.shutdown();
+    }
+};
+
+test "health: Watch streams the current status, then each change, then ends on shutdown" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var h = health_mod.Health.init(threaded.io(), gpa);
+    defer h.deinit();
+    try h.set("svc", .serving);
+    var router: server.Router = .{
+        .gpa = gpa,
+        .context = &h,
+        .services = &.{health_mod.service_from_context},
+    };
+    var peer: TestPeer = .init(gpa);
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+
+    var drv: WatchDriver = .{ .h = &h };
+    const t = try std.Thread.spawn(.{}, WatchDriver.run, .{&drv});
+    const sid = try healthCall(&peer, &router, "Watch", "svc");
+    t.join();
+
+    const r = peer.resp(sid);
+    try testing.expect(!r.isTrailersOnly());
+    try testing.expectEqualStrings("0", r.trailer("grpc-status").?);
+    var got: std.ArrayList(health_mod.ServingStatus) = .empty;
+    defer got.deinit(gpa);
+    try healthStatuses(r, &got);
+    // serving, the change to not_serving, back to serving, then shutdown's
+    // NOT_SERVING; one message per distinct status, none repeated.
+    try testing.expectEqualSlices(health_mod.ServingStatus, &.{
+        .serving, .not_serving, .serving, .not_serving,
+    }, got.items);
+}
+
+test "health: Watch of an unregistered service streams SERVICE_UNKNOWN, not an error" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var h = health_mod.Health.init(threaded.io(), gpa);
+    defer h.deinit();
+    var router: server.Router = .{
+        .gpa = gpa,
+        .context = &h,
+        .services = &.{health_mod.service_from_context},
+    };
+    var peer: TestPeer = .init(gpa);
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+
+    const Stopper = struct {
+        h: *health_mod.Health,
+        fn run(s: *@This()) void {
+            var d: WatchDriver = .{ .h = s.h };
+            d.waitDelivered(1);
+            s.h.shutdown();
+        }
+    };
+    var st: Stopper = .{ .h = &h };
+    const t = try std.Thread.spawn(.{}, Stopper.run, .{&st});
+    const sid = try healthCall(&peer, &router, "Watch", "ghost");
+    t.join();
+
+    const r = peer.resp(sid);
+    try testing.expectEqualStrings("0", r.trailer("grpc-status").?);
+    var got: std.ArrayList(health_mod.ServingStatus) = .empty;
+    defer got.deinit(gpa);
+    try healthStatuses(r, &got);
+    // First message SERVICE_UNKNOWN; shutdown does not register "ghost", so
+    // it stays SERVICE_UNKNOWN (no second message).
+    try testing.expectEqualSlices(health_mod.ServingStatus, &.{.service_unknown}, got.items);
+}
+
+test "health: set after shutdown is ignored" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var h = health_mod.Health.init(threaded.io(), gpa);
+    defer h.deinit();
+    try h.set("a", .serving);
+    h.shutdown();
+    try h.set("a", .serving);
+    try h.set("b", .serving);
+    try testing.expectEqual(@as(?health_mod.ServingStatus, .not_serving), h.get("a"));
+    try testing.expectEqual(@as(?health_mod.ServingStatus, null), h.get("b"));
+    try testing.expectEqual(@as(?health_mod.ServingStatus, .not_serving), h.get(""));
+}

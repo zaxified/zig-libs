@@ -78,6 +78,7 @@ const frame_mod = @import("frame.zig");
 const status_mod = @import("status.zig");
 const metadata_mod = @import("metadata.zig");
 const server_mod = @import("server.zig");
+const health_mod = @import("health.zig");
 
 // ── status ──────────────────────────────────────────────────────────────────
 
@@ -281,6 +282,12 @@ pub const Clock = server_mod.Clock;
 /// `http.Server.Handler` for a `Router` — installed by `Router.httpOptions`.
 pub const handleHttp = server_mod.handleHttp;
 
+/// The standard `grpc.health.v1.Health` service (Check/Watch) and its status
+/// registry. See `health.zig`.
+pub const health = health_mod;
+pub const Health = health_mod.Health;
+pub const ServingStatus = health_mod.ServingStatus;
+
 test {
     // Every submodule's tests, explicitly — a `pub const` re-export does not
     // pull them in (CONVENTIONS.md §6.3, the dark-tests rule).
@@ -291,5 +298,6 @@ test {
     _ = @import("call_test.zig");
     _ = @import("adversarial.zig");
     _ = server_mod;
+    _ = health_mod;
     _ = @import("reference_replay.zig");
 }
