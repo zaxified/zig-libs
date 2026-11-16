@@ -12,7 +12,7 @@ RFC 6238 Appendix B table (all 6 times × 3 hash functions).** See
 
 | File | Contents |
 |---|---|
-| `src/root.zig` | `Algorithm`, `dynamicTruncate`, `hotp`/`hotpFmt`, `timeStep`, `totp`/`totpFmt`, `totpVerify`, `fmtCode` |
+| `src/root.zig` | `Algorithm`, `dynamicTruncate`, `hotp`/`hotpFmt`, `timeStep`, `totp`/`totpFmt`, `totpVerify`, `hotpVerify`, `hotpResync`, `fmtCode` |
 | `src/otpauth.zig` | `otpauth://` provisioning URIs: `parse`, `format`, `KeyUri` (+ `totpCode`/`hotpCode`) |
 | `src/kat_vectors.zig` | RFC 4226 Appendix D + RFC 6238 Appendix B tables, embedded |
 | `src/kat_test.zig` | Full KAT assertions + verify-window tests |
@@ -43,6 +43,8 @@ pub fn dynamicTruncate(comptime alg: Algorithm, key: []const u8, counter: u64) u
 pub fn timeStep(unix_time: u64, period: u32, t0: u64) u64;
 pub fn totp(comptime alg: Algorithm, key: []const u8, unix_time: u64, period: u32, t0: u64, digits: u5) u32;
 pub fn totpFmt(comptime alg: Algorithm, key: []const u8, unix_time: u64, period: u32, t0: u64, digits: u5, out: []u8) FmtCodeError![]u8;
+pub fn hotpVerify(comptime alg: Algorithm, key: []const u8, counter: u64, digits: u5, code: u32, window: u32) error{WindowTooLarge}!?u64; // matched counter; store +1
+pub fn hotpResync(comptime alg: Algorithm, key: []const u8, counter: u64, digits: u5, code1: u32, code2: u32, window: u32) error{WindowTooLarge}!?u64;
 pub fn totpVerify(comptime alg: Algorithm, key: []const u8, unix_time: u64, period: u32, t0: u64, digits: u5, code: u32, skew_steps: u32) bool;
 
 // Zero-left-padded ASCII rendering of a code

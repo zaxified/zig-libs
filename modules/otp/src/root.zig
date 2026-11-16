@@ -239,6 +239,81 @@ pub fn totpVerify(comptime alg: Algorithm, key: []const u8, unix_time: u64, peri
     return matched == 1;
 }
 
+// ── HOTP verification with look-ahead (RFC 4226 §7.4–7.5) ───────────────────
+
+/// Hard upper bound on the look-ahead window of `hotpVerify` / `hotpResync`.
+/// RFC 4226 §7.4 wants a small window; every extra position is one more HMAC
+/// and one more online-guessing chance (§7.3), so a caller cannot ask for an
+/// unbounded sweep (`error.WindowTooLarge`).
+pub const max_hotp_window: u32 = 1000;
+
+pub const HotpVerifyError = error{
+    /// `window > max_hotp_window`.
+    WindowTooLarge,
+};
+
+/// Constant-time equality of two codes.
+fn eqCode(a: u32, b: u32) bool {
+    return std.crypto.timing_safe.eql([4]u8, @bitCast(a), @bitCast(b));
+}
+
+/// Verify a submitted HOTP `code` against the counters `counter ..
+/// counter + window` (RFC 4226 §7.4 look-ahead window; `window = 0` means
+/// the exact counter only). `counter` is the server's stored next-expected
+/// counter. Returns the matched counter, or null when none matches; on a
+/// match the caller must store `matched + 1` as the new counter (§7.2) and
+/// should rate-limit failures (§7.3). If several positions produce the same
+/// code, the lowest is returned.
+///
+/// The whole window is always evaluated (no early exit on a match), so the
+/// HMAC count does not leak which position matched, and each code is compared
+/// with `std.crypto.timing_safe.eql`; the matched counter is picked by mask.
+/// The counter `maxInt(u64)` is never a candidate, so `matched + 1` cannot
+/// overflow; candidates beyond it are skipped (a public condition). `window >
+/// max_hotp_window` is `error.WindowTooLarge`.
+pub fn hotpVerify(comptime alg: Algorithm, key: []const u8, counter: u64, digits: u5, code: u32, window: u32) HotpVerifyError!?u64 {
+    if (window > max_hotp_window) return error.WindowTooLarge;
+    var hit: u64 = 0; // all-ones once a match was taken
+    var found: u64 = 0;
+    var i: u64 = 0;
+    while (i <= window) : (i += 1) {
+        if (counter > std.math.maxInt(u64) - 1 - i) break; // counter + i would reach maxInt(u64)
+        const c = counter + i;
+        const eq = eqCode(hotp(alg, key, c, digits), code);
+        const take: u64 = (0 -% @as(u64, @intFromBool(eq))) & ~hit;
+        found = (found & ~take) | (c & take);
+        hit |= take;
+    }
+    return if (hit != 0) found else null;
+}
+
+/// RFC 4226 §7.4 resynchronisation: the user presses the token twice and
+/// submits two consecutive codes. Looks for a position `c` in `counter ..
+/// counter + window` with `HOTP(c) == code1` and `HOTP(c + 1) == code2`, and
+/// returns `c + 1` (the counter of the second code — store `result + 1` as
+/// the new counter, as for `hotpVerify`), or null. Same bounds, constant-HMAC
+/// count and constant-time compares as `hotpVerify`; the lowest matching `c`
+/// wins and neither `c` nor `c + 1` may be `maxInt(u64)`.
+pub fn hotpResync(comptime alg: Algorithm, key: []const u8, counter: u64, digits: u5, code1: u32, code2: u32, window: u32) HotpVerifyError!?u64 {
+    if (window > max_hotp_window) return error.WindowTooLarge;
+    var hit: u64 = 0;
+    var found: u64 = 0;
+    var prev_eq = false; // HOTP(counter + i - 1) == code1
+    var i: u64 = 0;
+    while (i <= @as(u64, window) + 1) : (i += 1) {
+        if (counter > std.math.maxInt(u64) - 1 - i) break;
+        const c = counter + i;
+        const cur = hotp(alg, key, c, digits);
+        // i == 0 has no predecessor: prev_eq is false there.
+        const both = prev_eq and eqCode(cur, code2);
+        const take: u64 = (0 -% @as(u64, @intFromBool(both))) & ~hit;
+        found = (found & ~take) | (c & take);
+        hit |= take;
+        prev_eq = eqCode(cur, code1);
+    }
+    return if (hit != 0) found else null;
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 test "fmtCode zero-pads" {
@@ -287,6 +362,68 @@ test "totpVerify accepts the correct code and rejects wrong ones (constant-time 
     // dependency so a refactor cannot silently drop it.
     try std.testing.expect(std.crypto.timing_safe.eql([4]u8, @as([4]u8, @bitCast(correct)), @as([4]u8, @bitCast(correct))));
     try std.testing.expect(!std.crypto.timing_safe.eql([4]u8, @as([4]u8, @bitCast(correct)), @as([4]u8, @bitCast(correct +% 1))));
+}
+
+const rfc4226_codes = [_]u32{ 755224, 287082, 359152, 969429, 338314, 254676, 287922, 162583, 399871, 520489 };
+const rfc4226_key = "12345678901234567890";
+
+test "hotpVerify: RFC 4226 Appendix D, exact and look-ahead" {
+    // window 0: only the exact counter.
+    for (rfc4226_codes, 0..) |code, n| {
+        try std.testing.expectEqual(@as(?u64, n), try hotpVerify(.sha1, rfc4226_key, n, 6, code, 0));
+    }
+    try std.testing.expectEqual(@as(?u64, null), try hotpVerify(.sha1, rfc4226_key, 0, 6, rfc4226_codes[1], 0));
+    // The server is at 2, the token drifted to 7: needs window >= 5.
+    try std.testing.expectEqual(@as(?u64, null), try hotpVerify(.sha1, rfc4226_key, 2, 6, rfc4226_codes[7], 4));
+    try std.testing.expectEqual(@as(?u64, 7), try hotpVerify(.sha1, rfc4226_key, 2, 6, rfc4226_codes[7], 5));
+    try std.testing.expectEqual(@as(?u64, 9), try hotpVerify(.sha1, rfc4226_key, 0, 6, rfc4226_codes[9], 100));
+    // A counter behind the server's is never accepted (replay).
+    try std.testing.expectEqual(@as(?u64, null), try hotpVerify(.sha1, rfc4226_key, 5, 6, rfc4226_codes[4], 100));
+    // Wrong code across the window.
+    try std.testing.expectEqual(@as(?u64, null), try hotpVerify(.sha1, rfc4226_key, 0, 6, 123456, 50));
+}
+
+test "hotpVerify: window cap, lowest match, counter ceiling" {
+    try std.testing.expectEqual(@as(?u64, 0), try hotpVerify(.sha1, rfc4226_key, 0, 6, rfc4226_codes[0], max_hotp_window));
+    try std.testing.expectError(error.WindowTooLarge, hotpVerify(.sha1, rfc4226_key, 0, 6, rfc4226_codes[0], max_hotp_window + 1));
+    try std.testing.expectError(error.WindowTooLarge, hotpVerify(.sha1, rfc4226_key, 0, 6, 0, std.math.maxInt(u32)));
+    // 1-digit codes collide inside a window: the lowest counter wins.
+    const one = hotp(.sha1, rfc4226_key, 3, 1);
+    const m = (try hotpVerify(.sha1, rfc4226_key, 0, 1, one, 100)).?;
+    try std.testing.expect(m <= 3);
+    try std.testing.expectEqual(one, hotp(.sha1, rfc4226_key, m, 1));
+    for (0..m) |c| try std.testing.expect(hotp(.sha1, rfc4226_key, c, 1) != one);
+    // Near the u64 ceiling: window is clipped, maxInt itself is never accepted, no overflow.
+    const top = std.math.maxInt(u64);
+    const c1 = hotp(.sha1, rfc4226_key, top - 1, 6);
+    try std.testing.expectEqual(@as(?u64, top - 1), try hotpVerify(.sha1, rfc4226_key, top - 3, 6, c1, 10));
+    const c2 = hotp(.sha1, rfc4226_key, top, 6);
+    try std.testing.expectEqual(@as(?u64, null), try hotpVerify(.sha1, rfc4226_key, top - 3, 6, c2, 10));
+    try std.testing.expectEqual(@as(?u64, null), try hotpVerify(.sha1, rfc4226_key, top, 6, c2, 10));
+}
+
+test "hotpResync: two consecutive RFC 4226 codes" {
+    // Consecutive pairs found; result is the counter of the second code.
+    try std.testing.expectEqual(@as(?u64, 8), try hotpResync(.sha1, rfc4226_key, 2, 6, rfc4226_codes[7], rfc4226_codes[8], 10));
+    try std.testing.expectEqual(@as(?u64, 1), try hotpResync(.sha1, rfc4226_key, 0, 6, rfc4226_codes[0], rfc4226_codes[1], 0));
+    try std.testing.expectEqual(@as(?u64, 9), try hotpResync(.sha1, rfc4226_key, 0, 6, rfc4226_codes[8], rfc4226_codes[9], 8));
+    // First code at the window's last position is allowed; one further is not.
+    try std.testing.expectEqual(@as(?u64, 8), try hotpResync(.sha1, rfc4226_key, 2, 6, rfc4226_codes[7], rfc4226_codes[8], 5));
+    try std.testing.expectEqual(@as(?u64, null), try hotpResync(.sha1, rfc4226_key, 2, 6, rfc4226_codes[7], rfc4226_codes[8], 4));
+    // Non-consecutive, reversed, and behind-the-counter pairs are refused.
+    try std.testing.expectEqual(@as(?u64, null), try hotpResync(.sha1, rfc4226_key, 0, 6, rfc4226_codes[3], rfc4226_codes[5], 20));
+    try std.testing.expectEqual(@as(?u64, null), try hotpResync(.sha1, rfc4226_key, 0, 6, rfc4226_codes[4], rfc4226_codes[3], 20));
+    try std.testing.expectEqual(@as(?u64, null), try hotpResync(.sha1, rfc4226_key, 5, 6, rfc4226_codes[3], rfc4226_codes[4], 20));
+    // Same code twice is not a pair unless the sequence really repeats.
+    try std.testing.expectEqual(@as(?u64, null), try hotpResync(.sha1, rfc4226_key, 0, 6, rfc4226_codes[2], rfc4226_codes[2], 20));
+    try std.testing.expectError(error.WindowTooLarge, hotpResync(.sha1, rfc4226_key, 0, 6, 0, 0, max_hotp_window + 1));
+    // maxInt(u64) is never part of a pair.
+    const top = std.math.maxInt(u64);
+    const a = hotp(.sha1, rfc4226_key, top - 1, 6);
+    const b = hotp(.sha1, rfc4226_key, top, 6);
+    try std.testing.expectEqual(@as(?u64, null), try hotpResync(.sha1, rfc4226_key, top - 2, 6, a, b, 10));
+    const z = hotp(.sha1, rfc4226_key, top - 2, 6);
+    try std.testing.expectEqual(@as(?u64, top - 1), try hotpResync(.sha1, rfc4226_key, top - 3, 6, z, a, 10));
 }
 
 test {
