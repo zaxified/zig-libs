@@ -141,6 +141,8 @@ pub const CakeAtmMode = qdisc.CakeAtmMode;
 pub const CakeAckFilter = qdisc.CakeAckFilter;
 pub const Qdisc = qdisc.Qdisc;
 pub const Class = qdisc.Class;
+pub const Stats = qdisc.Stats;
+pub const FqCodelXstats = qdisc.FqCodelXstats;
 pub const TCA = qdisc.TCA;
 pub const TCA_NETEM = qdisc.TCA_NETEM;
 pub const TCA_HTB = qdisc.TCA_HTB;
@@ -1274,6 +1276,10 @@ test "integration: qdiscs() on lo needs no privilege and reports a root qdisc" {
     for (list) |q| {
         try testing.expectEqual(lo, q.ifindex);
         try testing.expect(q.kind().len > 0); // "noqueue" by default on lo
+        // The kernel attaches TCA_STATS2 to every qdisc in a dump
+        // (`tc -s qdisc show dev lo` prints "Sent 0 bytes 0 pkt" even for
+        // noqueue), so real bytes must decode to non-null stats.
+        try testing.expect(q.stats != null);
     }
 }
 

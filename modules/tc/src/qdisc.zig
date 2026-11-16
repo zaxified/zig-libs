@@ -49,6 +49,20 @@ pub const TCA = struct {
     pub const EGRESS_BLOCK: u16 = 14;
 };
 
+/// Generic statistics attribute types (linux/gen_stats.h `TCA_STATS_*`),
+/// nested inside `TCA_STATS2`.
+pub const TCA_STATS2 = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const BASIC: u16 = 1;
+    pub const RATE_EST: u16 = 2;
+    pub const QUEUE: u16 = 3;
+    pub const APP: u16 = 4;
+    pub const RATE_EST64: u16 = 5;
+    pub const PAD: u16 = 6;
+    pub const BASIC_HW: u16 = 7;
+    pub const PKT64: u16 = 8;
+};
+
 /// netem extended attribute types (linux/pkt_sched.h `TCA_NETEM_*`).
 pub const TCA_NETEM = struct {
     pub const UNSPEC: u16 = 0;
@@ -1126,6 +1140,140 @@ pub const ClassSpec = union(enum) {
 /// longest real qdisc name is "pfifo_head_drop" at 15).
 pub const kind_max = 16;
 
+/// The counters a dumped qdisc or class carries (`tc -s`). Decoded from
+/// `TCA_STATS2` (`gnet_stats_basic`, `_queue`, `_rate_est[64]`, the 64-bit
+/// `PKT64` packet count when present) or, when the kernel sent no `STATS2`,
+/// from the legacy `TCA_STATS` (`struct tc_stats`, which has no `requeues`).
+/// A sub-attribute shorter than its struct is ignored (like per-action stats).
+pub const Stats = struct {
+    bytes: u64 = 0,
+    packets: u64 = 0,
+    /// `TCA_STATS_BASIC_HW`: what the hardware offload counted.
+    hw_bytes: u64 = 0,
+    hw_packets: u64 = 0,
+    qlen: u32 = 0,
+    backlog: u32 = 0,
+    drops: u32 = 0,
+    requeues: u32 = 0,
+    overlimits: u32 = 0,
+    /// Rate estimator (`RATE_EST64` wins over `RATE_EST`).
+    bps: u64 = 0,
+    pps: u64 = 0,
+};
+
+/// `struct tc_fq_codel_qd_stats` (the qdisc half of `TCA_XSTATS`, type
+/// `TCA_FQ_CODEL_XSTATS_QDISC`).
+pub const FqCodelXstats = struct {
+    maxpacket: u32,
+    drop_overlimit: u32,
+    ecn_mark: u32,
+    new_flow_count: u32,
+    new_flows_len: u32,
+    old_flows_len: u32,
+    ce_mark: u32,
+    memory_usage: u32,
+    drop_overmemory: u32,
+};
+
+const fq_codel_xstats_qdisc: u32 = 0; // TCA_FQ_CODEL_XSTATS_QDISC
+const fq_codel_xstats_len = 4 + 9 * 4; // type + tc_fq_codel_qd_stats
+const tc_stats_len = 36; // struct tc_stats, without its tail padding
+
+fn rd32(d: []const u8, off: usize) u32 {
+    return std.mem.readInt(u32, d[off..][0..4], native_endian);
+}
+
+fn rd64(d: []const u8, off: usize) u64 {
+    return std.mem.readInt(u64, d[off..][0..8], native_endian);
+}
+
+/// Decode a `TCA_STATS2` nest; null when it held no usable basic/queue/rate
+/// counter.
+fn parseStats2(data: []const u8) codec.Error!?Stats {
+    var s: Stats = .{};
+    var seen = false;
+    var have_pkt64 = false;
+    var have_rate64 = false;
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| switch (a.type) {
+        // struct gnet_stats_basic { u64 bytes; u32 packets; } (16 on the wire,
+        // tail padding).
+        TCA_STATS2.BASIC => if (a.data.len >= 12) {
+            s.bytes = rd64(a.data, 0);
+            if (!have_pkt64) s.packets = rd32(a.data, 8);
+            seen = true;
+        },
+        TCA_STATS2.BASIC_HW => if (a.data.len >= 12) {
+            s.hw_bytes = rd64(a.data, 0);
+            s.hw_packets = rd32(a.data, 8);
+        },
+        // struct gnet_stats_queue { qlen, backlog, drops, requeues, overlimits }
+        TCA_STATS2.QUEUE => if (a.data.len >= 20) {
+            s.qlen = rd32(a.data, 0);
+            s.backlog = rd32(a.data, 4);
+            s.drops = rd32(a.data, 8);
+            s.requeues = rd32(a.data, 12);
+            s.overlimits = rd32(a.data, 16);
+            seen = true;
+        },
+        TCA_STATS2.RATE_EST => if (a.data.len >= 8 and !have_rate64) {
+            s.bps = rd32(a.data, 0);
+            s.pps = rd32(a.data, 4);
+            seen = true;
+        },
+        TCA_STATS2.RATE_EST64 => if (a.data.len >= 16) {
+            s.bps = rd64(a.data, 0);
+            s.pps = rd64(a.data, 8);
+            have_rate64 = true;
+            seen = true;
+        },
+        // 64-bit packet counter: authoritative whatever the attribute order.
+        TCA_STATS2.PKT64 => if (a.data.len >= 8) {
+            s.packets = rd64(a.data, 0);
+            have_pkt64 = true;
+        },
+        else => {},
+    };
+    return if (seen) s else null;
+}
+
+/// Decode the legacy `TCA_STATS` (`struct tc_stats`).
+fn parseLegacyStats(data: []const u8) ?Stats {
+    if (data.len < tc_stats_len) return null;
+    return .{
+        .bytes = rd64(data, 0),
+        .packets = rd32(data, 8),
+        .drops = rd32(data, 12),
+        .overlimits = rd32(data, 16),
+        .bps = rd32(data, 20),
+        .pps = rd32(data, 24),
+        .qlen = rd32(data, 28),
+        .backlog = rd32(data, 32),
+    };
+}
+
+/// `TCA_STATS2` if it decoded to something, else the legacy `TCA_STATS`.
+fn pickStats(stats2: ?[]const u8, legacy: ?[]const u8) codec.Error!?Stats {
+    if (stats2) |d| if (try parseStats2(d)) |s| return s;
+    if (legacy) |d| return parseLegacyStats(d);
+    return null;
+}
+
+fn parseFqCodelXstats(data: []const u8) ?FqCodelXstats {
+    if (data.len < fq_codel_xstats_len or rd32(data, 0) != fq_codel_xstats_qdisc) return null;
+    return .{
+        .maxpacket = rd32(data, 4),
+        .drop_overlimit = rd32(data, 8),
+        .ecn_mark = rd32(data, 12),
+        .new_flow_count = rd32(data, 16),
+        .new_flows_len = rd32(data, 20),
+        .old_flows_len = rd32(data, 24),
+        .ce_mark = rd32(data, 28),
+        .memory_usage = rd32(data, 32),
+        .drop_overmemory = rd32(data, 36),
+    };
+}
+
 /// One qdisc, as read back by an `RTM_GETQDISC` dump. At most one of the
 /// option fields is non-null — whichever matches `kind()`; a kind this module
 /// does not model still reports its ifindex/handle/parent/kind.
@@ -1140,6 +1288,11 @@ pub const Qdisc = struct {
     tbf: ?TbfWire = null,
     fq_codel: ?FqCodelWire = null,
     cake: ?CakeWire = null,
+    /// Counters (`tc -s`); null when the kernel sent none (API addition).
+    stats: ?Stats = null,
+    /// `TCA_XSTATS` of an `fq_codel` qdisc. Other kinds' private statistics
+    /// are not decoded (their raw bytes are not kept either).
+    fq_codel_xstats: ?FqCodelXstats = null,
 
     /// The qdisc kind string ("netem", "noqueue", "fq_codel", …).
     pub fn kind(q: *const Qdisc) []const u8 {
@@ -1155,6 +1308,8 @@ pub const Class = struct {
     kind_buf: [kind_max]u8 = @splat(0),
     kind_len: u8 = 0,
     htb: ?HtbClassWire = null,
+    /// Counters (`tc -s`); null when the kernel sent none (API addition).
+    stats: ?Stats = null,
 
     pub fn kind(c: *const Class) []const u8 {
         return c.kind_buf[0..c.kind_len];
@@ -1180,11 +1335,21 @@ pub fn parseQdisc(payload: []const u8) codec.Error!Qdisc {
         .parent = Handle.fromRaw(std.mem.readInt(u32, payload[12..16], native_endian)),
     };
     var options_data: ?[]const u8 = null;
+    var stats2: ?[]const u8 = null;
+    var legacy: ?[]const u8 = null;
+    var xstats: ?[]const u8 = null;
     var it: codec.AttrIterator = .{ .buf = payload[tcmsg_len..] };
     while (try it.next()) |a| switch (a.type) {
         TCA.KIND => try copyKind(&q.kind_buf, &q.kind_len, a.asString()),
         TCA.OPTIONS => options_data = a.data,
+        TCA.STATS2 => stats2 = a.data,
+        TCA.STATS => legacy = a.data,
+        TCA.XSTATS => xstats = a.data,
         else => {},
+    };
+    q.stats = try pickStats(stats2, legacy);
+    if (xstats) |x| if (std.mem.eql(u8, q.kind(), kind_fq_codel)) {
+        q.fq_codel_xstats = parseFqCodelXstats(x);
     };
     if (options_data) |opt| {
         const k = q.kind();
@@ -1212,12 +1377,17 @@ pub fn parseClass(payload: []const u8) codec.Error!Class {
         .parent = Handle.fromRaw(std.mem.readInt(u32, payload[12..16], native_endian)),
     };
     var options_data: ?[]const u8 = null;
+    var stats2: ?[]const u8 = null;
+    var legacy: ?[]const u8 = null;
     var it: codec.AttrIterator = .{ .buf = payload[tcmsg_len..] };
     while (try it.next()) |a| switch (a.type) {
         TCA.KIND => try copyKind(&c.kind_buf, &c.kind_len, a.asString()),
         TCA.OPTIONS => options_data = a.data,
+        TCA.STATS2 => stats2 = a.data,
+        TCA.STATS => legacy = a.data,
         else => {},
     };
+    c.stats = try pickStats(stats2, legacy);
     if (options_data) |opt| {
         if (std.mem.eql(u8, c.kind(), kind_htb)) {
             c.htb = try parseHtbClassOptions(opt);
@@ -1873,4 +2043,183 @@ test "corpus: every option seed reaches the parsers, and the decoded counts are 
     try testing.expectEqual(@as(usize, 8), netem);
     try testing.expectEqual(@as(usize, 8), kinds);
     try testing.expectEqual(@as(usize, 65), optionals);
+}
+
+// ── statistics decoding ─────────────────────────────────────────────────────
+
+fn statsFixture(gpa: std.mem.Allocator, list: *std.ArrayList(u8), kind_s: []const u8) !void {
+    var hdr: [tcmsg_len]u8 = @splat(0);
+    std.mem.writeInt(i32, hdr[4..8], 7, native_endian);
+    try codec.appendPadded(gpa, list, &hdr);
+    try codec.appendAttrString(gpa, list, TCA.KIND, kind_s);
+}
+
+fn le32(buf: []u8, off: usize, v: u32) void {
+    std.mem.writeInt(u32, buf[off..][0..4], v, native_endian);
+}
+
+fn le64(buf: []u8, off: usize, v: u64) void {
+    std.mem.writeInt(u64, buf[off..][0..8], v, native_endian);
+}
+
+fn stats2Nest(gpa: std.mem.Allocator, pkt64: bool, truncate: ?u16) !std.ArrayList(u8) {
+    var n: std.ArrayList(u8) = .empty;
+    var basic: [16]u8 = @splat(0);
+    le64(&basic, 0, 123_456_789_012);
+    le32(&basic, 8, 1000);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.BASIC, if (truncate == TCA_STATS2.BASIC) basic[0..11] else &basic);
+    var rate: [8]u8 = @splat(0);
+    le32(&rate, 0, 5);
+    le32(&rate, 4, 6);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.RATE_EST, &rate);
+    var queue: [20]u8 = @splat(0);
+    for (0..5) |i| le32(&queue, i * 4, @intCast(10 + i)); // qlen..overlimits
+    try codec.appendAttr(gpa, &n, TCA_STATS2.QUEUE, if (truncate == TCA_STATS2.QUEUE) queue[0..19] else &queue);
+    if (pkt64) {
+        var p: [8]u8 = undefined;
+        le64(&p, 0, 5_000_000_000);
+        try codec.appendAttr(gpa, &n, TCA_STATS2.PKT64, &p);
+    }
+    return n;
+}
+
+test "stats: TCA_STATS2 full, PKT64 overrides the u32 packet count" {
+    const gpa = testing.allocator;
+    var n = try stats2Nest(gpa, true, null);
+    defer n.deinit(gpa);
+    var m: std.ArrayList(u8) = .empty;
+    defer m.deinit(gpa);
+    try statsFixture(gpa, &m, "htb");
+    try codec.appendAttr(gpa, &m, TCA.STATS2, n.items);
+    const q = try parseQdisc(m.items);
+    const s = q.stats.?;
+    try testing.expectEqual(@as(u64, 123_456_789_012), s.bytes);
+    try testing.expectEqual(@as(u64, 5_000_000_000), s.packets);
+    try testing.expectEqual(@as(u32, 10), s.qlen);
+    try testing.expectEqual(@as(u32, 11), s.backlog);
+    try testing.expectEqual(@as(u32, 12), s.drops);
+    try testing.expectEqual(@as(u32, 13), s.requeues);
+    try testing.expectEqual(@as(u32, 14), s.overlimits);
+    try testing.expectEqual(@as(u64, 5), s.bps);
+    try testing.expectEqual(@as(u64, 6), s.pps);
+    const c = try parseClass(m.items);
+    try testing.expectEqual(@as(u64, 123_456_789_012), c.stats.?.bytes);
+}
+
+test "stats: TCA_STATS2 without PKT64 keeps the u32 packet count" {
+    const gpa = testing.allocator;
+    var n = try stats2Nest(gpa, false, null);
+    defer n.deinit(gpa);
+    var m: std.ArrayList(u8) = .empty;
+    defer m.deinit(gpa);
+    try statsFixture(gpa, &m, "noqueue");
+    try codec.appendAttr(gpa, &m, TCA.STATS2, n.items);
+    try testing.expectEqual(@as(u64, 1000), (try parseQdisc(m.items)).stats.?.packets);
+}
+
+test "stats: legacy TCA_STATS is the fallback, STATS2 wins when both are present" {
+    const gpa = testing.allocator;
+    var legacy: [40]u8 = @splat(0);
+    le64(&legacy, 0, 777);
+    le32(&legacy, 8, 7);
+    le32(&legacy, 12, 3); // drops
+    le32(&legacy, 16, 4); // overlimits
+    le32(&legacy, 20, 8); // bps
+    le32(&legacy, 24, 9); // pps
+    le32(&legacy, 28, 1); // qlen
+    le32(&legacy, 32, 2); // backlog
+    var m: std.ArrayList(u8) = .empty;
+    defer m.deinit(gpa);
+    try statsFixture(gpa, &m, "pfifo");
+    try codec.appendAttr(gpa, &m, TCA.STATS, &legacy);
+    const s = (try parseQdisc(m.items)).stats.?;
+    try testing.expectEqual(@as(u64, 777), s.bytes);
+    try testing.expectEqual(@as(u64, 7), s.packets);
+    try testing.expectEqual(@as(u32, 3), s.drops);
+    try testing.expectEqual(@as(u32, 4), s.overlimits);
+    try testing.expectEqual(@as(u64, 8), s.bps);
+    try testing.expectEqual(@as(u64, 9), s.pps);
+    try testing.expectEqual(@as(u32, 1), s.qlen);
+    try testing.expectEqual(@as(u32, 2), s.backlog);
+    try testing.expectEqual(@as(u32, 0), s.requeues);
+
+    var n = try stats2Nest(gpa, false, null);
+    defer n.deinit(gpa);
+    try codec.appendAttr(gpa, &m, TCA.STATS2, n.items);
+    try testing.expectEqual(@as(u64, 123_456_789_012), (try parseQdisc(m.items)).stats.?.bytes);
+}
+
+test "stats: none sent -> null; short or empty attributes -> null or partial, never an error" {
+    const gpa = testing.allocator;
+    var m: std.ArrayList(u8) = .empty;
+    defer m.deinit(gpa);
+    try statsFixture(gpa, &m, "noqueue");
+    try testing.expect((try parseQdisc(m.items)).stats == null);
+    try testing.expect((try parseClass(m.items)).stats == null);
+
+    // Truncated BASIC: the queue half still decodes, bytes stay 0.
+    var n = try stats2Nest(gpa, false, TCA_STATS2.BASIC);
+    defer n.deinit(gpa);
+    var m2: std.ArrayList(u8) = .empty;
+    defer m2.deinit(gpa);
+    try statsFixture(gpa, &m2, "htb");
+    try codec.appendAttr(gpa, &m2, TCA.STATS2, n.items);
+    const s = (try parseQdisc(m2.items)).stats.?;
+    try testing.expectEqual(@as(u64, 0), s.bytes);
+    try testing.expectEqual(@as(u32, 12), s.drops);
+
+    // Truncated QUEUE: basic decodes, queue counters stay 0.
+    var n3 = try stats2Nest(gpa, false, TCA_STATS2.QUEUE);
+    defer n3.deinit(gpa);
+    var m3: std.ArrayList(u8) = .empty;
+    defer m3.deinit(gpa);
+    try statsFixture(gpa, &m3, "htb");
+    try codec.appendAttr(gpa, &m3, TCA.STATS2, n3.items);
+    const s3 = (try parseQdisc(m3.items)).stats.?;
+    try testing.expectEqual(@as(u64, 123_456_789_012), s3.bytes);
+    try testing.expectEqual(@as(u32, 0), s3.drops);
+
+    // Only truncated parts, or an empty nest, or a short legacy struct -> null.
+    var only: std.ArrayList(u8) = .empty;
+    defer only.deinit(gpa);
+    try codec.appendAttr(gpa, &only, TCA_STATS2.BASIC, &@as([11]u8, @splat(1)));
+    try codec.appendAttr(gpa, &only, TCA_STATS2.QUEUE, &@as([19]u8, @splat(1)));
+    var m4: std.ArrayList(u8) = .empty;
+    defer m4.deinit(gpa);
+    try statsFixture(gpa, &m4, "htb");
+    try codec.appendAttr(gpa, &m4, TCA.STATS2, only.items);
+    try codec.appendAttr(gpa, &m4, TCA.STATS, &@as([35]u8, @splat(1)));
+    try testing.expect((try parseQdisc(m4.items)).stats == null);
+    // A malformed nest (attr header claims more than is there) is an error, not a panic.
+    var m5: std.ArrayList(u8) = .empty;
+    defer m5.deinit(gpa);
+    try statsFixture(gpa, &m5, "htb");
+    try codec.appendAttr(gpa, &m5, TCA.STATS2, &[_]u8{ 0xff, 0, 1, 0 });
+    try testing.expectError(error.Truncated, parseQdisc(m5.items));
+}
+
+test "stats: fq_codel TCA_XSTATS (qdisc half) decodes, a short or class-typed one is ignored" {
+    const gpa = testing.allocator;
+    var x: [40]u8 = @splat(0);
+    for (1..10) |i| le32(&x, i * 4, @intCast(i * 100));
+    var m: std.ArrayList(u8) = .empty;
+    defer m.deinit(gpa);
+    try statsFixture(gpa, &m, kind_fq_codel);
+    try codec.appendAttr(gpa, &m, TCA.XSTATS, &x);
+    const xs = (try parseQdisc(m.items)).fq_codel_xstats.?;
+    try testing.expectEqual(@as(u32, 100), xs.maxpacket);
+    try testing.expectEqual(@as(u32, 400), xs.new_flow_count);
+    try testing.expectEqual(@as(u32, 900), xs.drop_overmemory);
+
+    var m2: std.ArrayList(u8) = .empty;
+    defer m2.deinit(gpa);
+    try statsFixture(gpa, &m2, kind_fq_codel);
+    try codec.appendAttr(gpa, &m2, TCA.XSTATS, x[0..39]);
+    try testing.expect((try parseQdisc(m2.items)).fq_codel_xstats == null);
+    le32(&x, 0, 1); // TCA_FQ_CODEL_XSTATS_CLASS
+    var m3: std.ArrayList(u8) = .empty;
+    defer m3.deinit(gpa);
+    try statsFixture(gpa, &m3, kind_fq_codel);
+    try codec.appendAttr(gpa, &m3, TCA.XSTATS, &x);
+    try testing.expect((try parseQdisc(m3.items)).fq_codel_xstats == null);
 }

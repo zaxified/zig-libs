@@ -35,8 +35,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 the psched rate tables done the way `tc` does (byte-exact goldens diffed against the real `tc`
 6.19), the standalone action table, hexadecimal handles and 64-bit rates; and it is the only
 Zig option. **Where we are behind:** `ingress`/`clsact` and the common classic qdiscs, `matchall`/`bpf`
-classifiers, `pedit`/`tunnel_key`/`connmark`, and — for anyone doing `tc -s` — statistics on
-qdisc/class dumps (→ Backlog; all reachable via the `raw` escape hatches).
+classifiers and `pedit`/`tunnel_key`/`connmark` (→ Backlog; all reachable via the `raw`
+escape hatches). Statistics on qdisc/class dumps (`tc -s`) are decoded since 2026-11-17.
 
 ## Design & invariants
 
@@ -445,9 +445,9 @@ caller-supplied rate/size can panic in ReleaseSafe or wrap in ReleaseFast.
 - **`TCA_STAB`** (size tables / per-packet overhead outside the rate table) and the
   `linklayer atm` path: `LinkLayer.atm` is implemented and unit-tested against the SAR
   formula, but has no iproute2 golden.
-- **Statistics**: `TCA_STATS`/`STATS2`/`XSTATS` are ignored on **qdisc/class/filter**
-  dumps — no byte/packet counters, no per-class backlog. (Per-*action* `TCA_ACT_STATS`
-  *is* decoded.)
+- **Statistics** (qdisc/class): done 2026-11-17 (backlog 2). Still not decoded: filter
+  statistics, `TCA_XSTATS` of kinds other than `fq_codel` qdiscs (and fq_codel *class* xstats),
+  `TCA_STATS_APP`. (Per-*action* `TCA_ACT_STATS` is decoded separately.)
 - **netem's GI/GE loss models** (`TCA_NETEM_LOSS`), `TCA_NETEM_DELAY_DIST`,
   `TCA_NETEM_SLOT*`, `TCA_NETEM_RATE64`, `TCA_NETEM_ECN` — unchanged from v1.
 - **Multicast rtnetlink events** — no notification/monitoring, matching `netlink`'s scope.
@@ -458,7 +458,7 @@ Survey findings (survey 2026-09-30), ranked by how soon a `tc` user hits them; a
 reachable through `raw` today:
 
 1. **`ingress` / `clsact` qdiscs** (survey 2026-09-30) — the attach point for every ingress filter and for BPF (`tc filter ... direct-action`); without a typed spec a user cannot do ingress policing at all without hand-encoding. Effort: small (option-less, like `mq`).
-2. **Statistics on qdisc/class dumps** (survey 2026-09-30) — `TCA_STATS2`/`XSTATS` (bytes, packets, drops, backlog, requeues); `tc -s` is the first thing anyone runs, and go-tc and netlink-packet-route decode them. Effort: small-medium.
+2. ✅ 2026-11-17 **Statistics on qdisc/class dumps** (survey 2026-09-30) — `Qdisc.stats`/`Class.stats: ?Stats` from `TCA_STATS2` (basic, queue, rate estimators, `PKT64`, `BASIC_HW`) with the legacy `TCA_STATS` as fallback; `Qdisc.fq_codel_xstats` from `TCA_XSTATS`. A sub-attribute shorter than its struct is skipped like other optional attributes (stats stay null if nothing valid decoded); a malformed nest is a codec error. Layouts from the local UAPI headers.
 3. **`matchall` and `bpf` classifiers** (survey 2026-09-30) — `matchall` is the standard "everything" filter; `bpf` is how eBPF programs are attached (pairs with the `ebpf` module). Effort: small each.
 4. **`pedit`, `tunnel_key`, `connmark`, `csum`, `sample`, `ct`** (survey 2026-09-30) — header rewrite and tunnel actions used by most SDN-style setups; vishvananda has them. Effort: medium each (`pedit` largest).
 5. **Classic qdiscs `prio`, `sfq`, `hfsc`, `red`, `codel`, `fq`, `pfifo`/`bfifo`** (survey 2026-09-30) — Effort: small each.
