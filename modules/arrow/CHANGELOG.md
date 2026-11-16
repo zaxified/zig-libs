@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Waves A2 + A3: `arrow.writeStream` / `arrow.readStream` turn a whole `dataframe.Frame` into an
+  Arrow IPC stream and back — every column type (widths, decimal, text/binary with Large offsets, date, timestamp
+  with zone, duration, time, categorical as a dictionary, list, fixed-size array, struct), nulls, rows per batch,
+  dictionary deltas; the reader also takes other units, decimal scales, Float16, any dictionary index type and
+  offsets not starting at 0, and refuses every malformed stream with an error. Depends on `dataframe`.
 - **2026-11-16** — Wave A3 part 1: IPC framing (`arrow.ipc`): encapsulated messages (continuation marker, legacy framing
   read, 8-byte padding), end of stream, `RecordBatch` / `DictionaryBatch` metadata both ways with every node and buffer
   checked against the body, a body builder with 64-byte buffer alignment.

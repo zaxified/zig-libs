@@ -133,9 +133,35 @@ someone's afternoon.
 
 ## Wire format / algorithm
 
-The construction, in enough detail that a second implementation could agree
-with this one byte for byte. Cite the RFC, paper or published vectors by
-section number, not by name alone.
+Apache Arrow columnar format 1.x, metadata version V5: `Schema.fbs`, `Message.fbs` (FlatBuffers, `src/fb.zig`,
+`src/schema.zig`), the encapsulated message framing (continuation marker `0xFFFFFFFF`, metadata length, metadata
+padded to 8, body; `src/ipc.zig`) and the stream format: `Schema`, then the `DictionaryBatch`es, then the
+`RecordBatch`es, then the end-of-stream marker (`src/stream.zig`). Buffers are written 64-byte aligned and padded;
+any 8-byte layout is read. Validity bitmaps are LSB-first, a buffer of length 0 when the array has no null.
+
+**Type mapping (wave A2).** The writer maps the column's DECLARED `ColumnType` and reads the cells through
+`ColumnData.get`, so storage of another kind that holds values of the declared type is written too:
+
+| `dataframe` | Arrow written | Arrow also read |
+|---|---|---|
+| `int` / `int8`..`int32` / `uint8`..`uint64` | Int64 / Int8..Int32 / UInt8..UInt64 | — |
+| `float` / `float32` | Float64 / Float32 | Float16 → `float32` |
+| `bool` | Bool (bit-packed) | — |
+| `decimal` (i128, 12 digits) | Decimal128(38, 12) | Decimal128(p, s) rescaled to 12 digits; inexact → `Unsupported` |
+| `text` / `binary` | Utf8 / Binary; Large* from `WriteOptions.large_from` bytes (default 2^31) | LargeUtf8 / LargeBinary; FixedSizeBinary → `binary` |
+| `date` (ISO text) | Date32 (days) | Date64 (ms, floored to the day); years outside 0000–9999 → `Unsupported` |
+| `timestamp` (+ `time_zone`) | Timestamp(us, zone) | s / ms / ns (ns floored to us); a zone `tz` does not know → `Unsupported` |
+| `duration` | Duration(us) | s / ms / ns |
+| `time` | Time64(us) | Time32(s, ms), Time64(ns); a value outside the day → `Malformed` |
+| `categorical` | Utf8, dictionary-encoded, Int32 indices, `ordered` kept | any integer index type; an unordered dictionary is deduplicated and sorted lexically (the `CatColumn` invariant), an ordered one deduplicated in its order; null dictionary entries read as null rows |
+| `list` (`inner[0]`) | List (Int32 offsets) | LargeList; null rows with elements and offsets not starting at 0 are compacted |
+| `array` (`array_width`) | FixedSizeList(width) | — |
+| `struct` (`inner`) | Struct | — |
+| `.nulls` storage with no declaration (a list's elements) | Null | Null → `text` with no storage (what `readJson` gives an all-null column) |
+| `boxed` storage | `Unsupported` (no Arrow type short of a dense union) | — |
+
+A dictionary over a non-text type (Int64 values, say) is read as a plain column of that type. Each dictionary-encoded
+column gets its own id, its whole dictionary written once before the first record batch.
 
 ## Constant-time contract
 
@@ -150,9 +176,18 @@ instead. Those are different grades of evidence and must not be written alike.
 
 ## Limits and refusals
 
-Every hard bound the code enforces, with the number and where it comes from.
-A limit derived from a spec cites the spec; a limit chosen by us says so and
-says why. If a constant is pinned by a test, name the test.
+- `ReadOptions.max_rows` (default 2^27, ours): the most rows any one array may claim — the frame's rows summed over
+  the batches, a list's elements, a dictionary's entries. It bounds what a few bytes of hostile stream can make the
+  reader allocate where a length is not backed by bytes (a Null column, a list of nulls, a struct without fields):
+  roughly 16 bytes per claimed row at worst. `error.LimitExceeded`.
+- Nesting deeper than `schema.max_depth` (64) is refused on both sides.
+- `dataframe` keeps list offsets in `u32`: more than 2^32 − 1 elements in one list column → `Unsupported`; the
+  writer's Int32 list offsets refuse more than 2^31 − 1 elements in one batch.
+- Refused on read (`Unsupported`): body compression (wave A5), a dictionary replaced mid-stream (deltas are
+  appended), a dictionary nested in a dictionary's values, Decimal32/64/256, Interval, Union, Map, the view types,
+  tensors. Every structural defect — a buffer shorter than its node, offsets running backwards or past the data, an
+  index outside its dictionary, node or buffer counts not matching the schema, a column length not the batch's —
+  is `error.Malformed`. Tests: `src/stream_test.zig` "targeted corruptions", "every truncation and byte flip".
 
 ## Anchoring
 
@@ -190,16 +225,21 @@ get confused constantly.
 
 ## Open
 
-What is known to be missing or unverified. An honest gap here is worth more
-than a claim that does not hold.
+- No external anchor yet: every test is a self round trip or a hand-assembled stream from our reading of the spec.
+  Next: the apache/arrow-testing integration golden files (`data/arrow-ipc-stream/integration/*`) as data.
+- The reader copies every buffer (no zero-copy views over the input) and text is not checked for UTF-8.
+- Performance not measured.
 
 ## Plan
 
-Waves (2026-11-16): A1 FlatBuffers layer + Schema tables (done: the layer); A2 the type mapping dataframe ↔
-Arrow (Int8..UInt64, Float32/64, Bool, Decimal128, Utf8 / LargeUtf8, categorical → dictionary Utf8, List /
-LargeList, Struct, Null, timestamps with unit and zone, Date, Duration, Binary, FixedSizeList; `boxed` refused);
-A3 IPC stream (encapsulated messages, Schema / RecordBatch / DictionaryBatch, validity bitmaps, 64-byte aligned
-buffers on write); A4 IPC file (`ARROW1`, footer, random access); A5 ZSTD body compression (LZ4_FRAME refused
-until an `lz4` module exists); A6 fuzz driver, no-panic sweep, mutation, example, survey. Oracle: the
-apache/arrow-testing integration golden files with their JSON descriptions (data only, Apache-2.0); a live
+Oracle: the apache/arrow-testing integration golden files with their JSON descriptions (data only, Apache-2.0); a live
 pyarrow round trip is an owner decision. Out: the C data interface, Flight, compute kernels.
+
+| Wave | Content | Status |
+|---|---|---|
+| A1 | FlatBuffers layer; Schema / Field / type tables, the Message envelope | done 2026-11-16 |
+| A2 | Type mapping `dataframe` ↔ Arrow (table above); `boxed` refused | done 2026-11-16 |
+| A3 | IPC stream: framing, Schema / DictionaryBatch / RecordBatch, end of stream, `rows_per_batch`; `writeStream` / `readStream` | done 2026-11-16 |
+| A4 | IPC file: `ARROW1`, footer with blocks, random access to a batch | open |
+| A5 | ZSTD body compression; LZ4_FRAME `Unsupported` until an `lz4` module exists | open |
+| A6 | Golden oracle, fuzz driver, no-panic sweep, mutation, example, survey | open |
