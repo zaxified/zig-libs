@@ -188,10 +188,10 @@ Survey 2026-09-30 — missing and it matters (pure Zig, all fit CONVENTIONS §2)
   the headline feature of codespan-reporting/ariadne. Why: "duplicate key defined here / first defined here" is the
   commonest config-validation shape; today a caller must emit two findings. Effort: medium (new `Label` slice on
   `Diagnostic`, snippet layout for overlapping/multi-line labels).
-- (survey 2026-09-30) **Colour output** for `renderOne`/`render` (opt-in, ANSI, caller decides by tty/NO_COLOR).
+- ✅ (found implemented 2026-11-17: `RenderOptions.color` in `renderOne`, src/root.zig) (survey 2026-09-30) **Colour output** for `renderOne`/`render` (opt-in, ANSI, caller decides by tty/NO_COLOR).
   Why: every competitor above does it and terminal users expect red/yellow. Effort: small-medium; the escape
   handling of quoted text must keep working.
-- (survey 2026-09-30) **Secondary notes / related findings** (LSP `relatedInformation`, rustc `note:`/`help:`
+- ✅ (found implemented 2026-11-17: `Diagnostic.notes` / `Note` in src/root.zig) (survey 2026-09-30) **Secondary notes / related findings** (LSP `relatedInformation`, rustc `note:`/`help:`
   beyond the single `suggest`). Effort: small.
 - (survey 2026-09-30) **`hint` severity** (LSP has four levels; `Severity` has three). Effort: trivial but changes
   the enum (breaking for exhaustive switches).

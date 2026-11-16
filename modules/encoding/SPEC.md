@@ -165,7 +165,7 @@ planned — no further backlog item recorded. The module README's "Out of scope"
 canonical statement of this boundary.
 - ~~UTF-16 (LE/BE) with BOM detection~~, ~~streaming decoder~~, ~~strict/fatal mode~~ — **done
   2026-10-04**.
-- (historical) **UTF-16 (LE/BE) with BOM detection** *(survey 2026-09-30)*: add `utf16le`/`utf16be` to `Encoding` (decode and encode) and an optional BOM sniff. Why: Excel "Unicode Text" and many Windows exports are UTF-16LE; encoding_rs and the Standard cover it, and `std.unicode` already has the LE conversion. Effort: small. Fits CONVENTIONS §2.
+- ✅ (found implemented 2026-11-17: `decodeUtf16`/`encodeUtf16`/`sniffBom` in src/root.zig) (historical) **UTF-16 (LE/BE) with BOM detection** *(survey 2026-09-30)*: add `utf16le`/`utf16be` to `Encoding` (decode and encode) and an optional BOM sniff. Why: Excel "Unicode Text" and many Windows exports are UTF-16LE; encoding_rs and the Standard cover it, and `std.unicode` already has the LE conversion. Effort: small. Fits CONVENTIONS §2.
 - **More single-byte pages (windows-1251, KOI8-R/U, windows-1253..1258, ISO-8859-3..16)** —
   *not now* (decided 2026-09-30): no consumer has needed them — the build-tool consumer, the main user, has not — and
   every table ships in every consumer's binary, which the build-tool consumer watches in ReleaseSmall. When one is

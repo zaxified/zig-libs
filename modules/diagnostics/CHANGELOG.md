@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** 2026-11-17: SPEC backlog: marked colour output and secondary notes done (already implemented). No code change.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit re-recorded over the unicode-width 0.2.3 table (data-only source change, no guard moved).

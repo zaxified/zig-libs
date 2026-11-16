@@ -168,9 +168,9 @@ separate module's job), durable cross-process leases (needs a cross-process lock
 worker runtime (a separate module composing `jobqueue` + `workerpool`), weighted partitions, and a
 TTL on unique keys (no consumer asked; ack/cancel release them).
 
-- (survey 2026-09-30) **Dead-letter requeue / discard and job cancel** — every peer lets an operator retry a dead job from the UI or API; here `deadLetterList` is read-only. Effort: small. Fits CONVENTIONS §2.
-- (survey 2026-09-30) **Lease extension (heartbeat)** — a job that outlives its visibility timeout is re-leased while still running (`StaleLease` on ack); Sidekiq/Asynq handle long jobs with timeouts and extension. Effort: small. Fits §2.
-- (survey 2026-09-30) **Unique / de-duplicated jobs** — asynq README lists it as a headline feature; here a double enqueue is two jobs. Effort: small-medium (key index in the in-memory map). Fits §2.
+- ✅ (found implemented 2026-11-17: `Queue.cancel`/`Queue.requeueDead` in src/root.zig) (survey 2026-09-30) **Dead-letter requeue / discard and job cancel** — every peer lets an operator retry a dead job from the UI or API; here `deadLetterList` is read-only. Effort: small. Fits CONVENTIONS §2.
+- ✅ (found implemented 2026-11-17: `Queue.extendLease` in src/root.zig) (survey 2026-09-30) **Lease extension (heartbeat)** — a job that outlives its visibility timeout is re-leased while still running (`StaleLease` on ack); Sidekiq/Asynq handle long jobs with timeouts and extension. Effort: small. Fits §2.
+- ✅ (found implemented 2026-11-17: `EnqueueOptions.unique_key` in src/root.zig) (survey 2026-09-30) **Unique / de-duplicated jobs** — asynq README lists it as a headline feature; here a double enqueue is two jobs. Effort: small-medium (key index in the in-memory map). Fits §2.
 - (survey 2026-09-30) **Cron / repeating schedules** — `apalis-cron`, BullMQ repeatables, Sidekiq's scheduler; listed above as deferred. Effort: medium (needs a cron-expression parser; check for a sibling module first). Fits §2.
 - (survey 2026-09-30) **Durable, cross-process leases** — multiple worker processes need a shared queue; a lease is in-memory, single-process (listed above). Effort: large (needs a cross-process lock in `kv`). Fits §2.
 - (survey 2026-09-30) **Worker runtime (concurrency, graceful shutdown, handler dispatch by job type)** — Sidekiq/Asynq ship it; here the caller writes the loop (`workerpool` exists as a sibling). Effort: medium, likely a separate module composing `jobqueue` + `workerpool`. Fits §2.

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** 2026-11-17: SPEC backlog: marked surface every parameter done (already implemented). No code change.
 - **2026-11-16** — docs: SPEC backlog line for `title*` decoding and quoted-string unescape marked done (it shipped 2026-10-04 as `decodeExtValue`/`unquote`/`preferredTitle`). No code change.
 - **2026-10-10** — tests: deterministic fuzz driver `LINKHEADER_FUZZ` over the parse harness (generic over its choice source) plus a write-to-parse roundtrip oracle and a helpers harness (`decodeExtValue`/`unquote`/`resolve` never panic, `encodeExtValue` roundtrips). No code change.
 - **2026-10-04** — **mvp → core.** Every param of a parsed link: `Link.params()`

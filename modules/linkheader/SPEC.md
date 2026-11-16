@@ -154,7 +154,7 @@ fields, `extra`, `decodeExtValue`/`encodeExtValue`/`preferredTitle`, `unquote`) 
 allocator or a caller-sized table; `find` covers the use without either), Language-Tag (RFC 5646)
 structure checks, and ext-value charsets other than UTF-8 (RFC 8187 reserves them).
 
-- **Surface every parameter (an iterator over `name`/`value` pairs on `Link`, or at least `anchor`, `media`, `as`, `rev`)** *(survey 2026-09-30)*:
+- ✅ (found implemented 2026-11-17: `Link.params`/`ParamIterator` in src/root.zig) **Surface every parameter (an iterator over `name`/`value` pairs on `Link`, or at least `anchor`, `media`, `as`, `rev`)** *(survey 2026-09-30)*:
   the parser recognises them for grammar purposes (`Iterator`, `src/root.zig:124`) and throws them away. Web-Linking users
   read `as`/`crossorigin` (preload hints), `anchor`, `media`, and API-specific parameters; requests' `links` and
   parse-link-header return them all. Effort: small-medium (a borrowed param iterator keeps the allocation-free contract). Fits §2: yes.

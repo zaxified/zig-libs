@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** 2026-11-17: SPEC backlog: marked timestamped schemes, base64/SHA-1/SHA-512, Ed25519 done (already implemented). No code change.
 - **2026-11-13** — **API (error set):** `Verifier.init` is now total. Its error set grows from `error{OutOfMemory}` to `error{ OutOfMemory, InvalidOptions }`: every option contract (empty secret, no key, more than `max_keys` secrets or public keys, a timestamped scheme without a `clock`, an undecoded `whsec_` secret, an empty header name) returns `error.InvalidOptions` instead of the checked `@panic` the previous entry introduced (sweep WHS-1). Callers that `try` need no change; one that switches exhaustively over the error set adds the new case. One test per contract.
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** constant-time evidence: `src/ctgrind_harness.zig` (HMAC secret under verify and sign, `whsec_` key text, Ed25519 `whsk_`), recorded in SPEC § Constant-time; no module code changed.
 - **2026-11-13** — **Fix (no-panic sweep):** `Verifier.init`'s precondition checks on its options (empty secret, no key, more than `max_keys` secrets or public keys, a timestamped scheme without a `clock`, an undecoded `whsec_` secret, an empty header name) were `std.debug.assert`, undefined behaviour in ReleaseFast; they are now a checked `@panic("webhooksig: …")` in every build mode. No accepted configuration changed.
