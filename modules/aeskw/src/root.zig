@@ -31,10 +31,10 @@
 //! ships no AES-192; that module adds only the key expansion and reuses std's
 //! round primitive). Byte-exact against RFC 3394 §4.2/§4.4 for 192.
 //!
-//! **RFC 5649 (AES Key Wrap with Padding) is deferred, not implemented.**
-//! This module covers only the unpadded RFC 3394 construction (plaintext
-//! key data must already be an 8-byte multiple, >= 16 bytes) — see
-//! SPEC.md.
+//! **RFC 5649 (AES Key Wrap with Padding)** is `wrapPad`/`unwrapPad`: key
+//! data of any length 1..2^32-1 bytes, zero-padded to a semiblock multiple
+//! under the alternative IV `A65959A6 || MLI`. `wrap`/`unwrap` stay the
+//! unpadded RFC 3394 construction (key data an 8-byte multiple, >= 16 bytes).
 
 const std = @import("std");
 const aes = std.crypto.core.aes;
@@ -67,7 +67,9 @@ pub const default_iv = [8]u8{ 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6 };
 
 pub const Error = error{
     /// `plaintext`/`ciphertext` isn't an 8-byte multiple, or is shorter than
-    /// the RFC's minimum (16 bytes to wrap, 24 to unwrap).
+    /// the RFC's minimum (16 bytes to wrap, 24 to unwrap). For the padded
+    /// pair: empty or > 2^32-1 byte plaintext (`wrapPad`), a ciphertext that
+    /// is not a multiple of 8 or shorter than 16 bytes (`unwrapPad`).
     InvalidLength,
     BufferTooSmall,
     /// The KEK is not an AES key: anything other than 16 (AES-128), 24
@@ -90,16 +92,20 @@ pub fn wrap(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8 {
 fn wrapBody(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8 {
     if (plaintext.len < 16 or plaintext.len % 8 != 0) return error.InvalidLength;
     if (kek.len != 16 and kek.len != 24 and kek.len != 32) return error.UnsupportedKeyLength;
-    const n = plaintext.len / 8;
     const total = plaintext.len + 8;
     if (out.len < total) return error.BufferTooSmall;
-
-    // R[1..n] = plaintext blocks; A = IV. Registers live in `out` as
-    // A(8) || R1 || R2 ... so the shifting operates in place.
-    var a: [8]u8 = default_iv;
     @memcpy(out[8..total], plaintext);
-    const r = out[8..total];
+    try wrapInPlace(kek, default_iv, out[0..total]);
+    return out[0..total];
+}
 
+/// RFC 3394 §2.2.1 recurrence over `buf = (unused 8) || R1 .. Rn` (n >= 2),
+/// in place; writes the final `A` into `buf[0..8]`. The KEK width must already
+/// be validated.
+fn wrapInPlace(kek: []const u8, iv: [8]u8, buf: []u8) error{UnsupportedKeyLength}!void {
+    const n = buf.len / 8 - 1;
+    var a: [8]u8 = iv;
+    const r = buf[8..];
     var j: usize = 0;
     while (j < 6) : (j += 1) {
         var i: usize = 0;
@@ -116,7 +122,54 @@ fn wrapBody(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8 {
             @memcpy(r[i * 8 ..][0..8], block[8..16]);
         }
     }
-    @memcpy(out[0..8], &a);
+    @memcpy(buf[0..8], &a);
+}
+
+/// RFC 5649 §3 alternative-IV prefix (the "AIV" high half); the low half is
+/// the 32-bit big-endian message length indicator (MLI).
+const aiv_prefix = [4]u8{ 0xA6, 0x59, 0x59, 0xA6 };
+
+/// AES Key Wrap with Padding (RFC 5649 §4.1) — key data of any length from 1
+/// to 2^32-1 bytes. The key data is zero-padded to a multiple of 8 (n =
+/// ceil(len/8) semiblocks) and wrapped under the alternative IV
+/// `A65959A6 || MLI`: n = 1 is one AES block encryption of `AIV || P`, n >= 2
+/// is the RFC 3394 recurrence with that IV. Always writes `8 * n + 8` bytes to
+/// `out` and returns that slice. `kek.len` selects AES-128/192/256 as in `wrap`.
+///
+/// **Empty plaintext is refused** (`error.InvalidLength`): RFC 5649 §4.1 allows
+/// it only in principle (MLI = 0 cannot satisfy §4.2's `8(n-1) < MLI`), and
+/// RustCrypto `aes-kw` and OpenSSL refuse it too.
+///
+/// KAT: RFC 5649 §6 (this file's tests below).
+pub fn wrapPad(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8 {
+    return burn.run(burn.wrap_burn, Error![]u8, wrapPadBody, .{ kek, plaintext, out });
+}
+
+fn wrapPadBody(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8 {
+    if (plaintext.len == 0 or plaintext.len > std.math.maxInt(u32)) return error.InvalidLength;
+    if (kek.len != 16 and kek.len != 24 and kek.len != 32) return error.UnsupportedKeyLength;
+    const n = (plaintext.len + 7) / 8;
+    const total = n * 8 + 8;
+    if (out.len < total) return error.BufferTooSmall;
+
+    var iv: [8]u8 = undefined;
+    iv[0..4].* = aiv_prefix;
+    std.mem.writeInt(u32, iv[4..8], @intCast(plaintext.len), .big);
+
+    // Padded key data lives in out[8..total], zero-filled after the key.
+    @memcpy(out[8..][0..plaintext.len], plaintext);
+    @memset(out[8 + plaintext.len .. total], 0);
+
+    if (n == 1) {
+        // §4.1 step 1: a single block, C[0..1] = ENC(K, AIV || P[1]).
+        var block: [16]u8 = undefined;
+        @memcpy(block[0..8], &iv);
+        @memcpy(block[8..16], out[8..16]);
+        try encBlock(kek, &block);
+        @memcpy(out[0..16], &block);
+    } else {
+        try wrapInPlace(kek, iv, out[0..total]);
+    }
     return out[0..total];
 }
 
@@ -142,9 +195,37 @@ fn unwrapBody(kek: []const u8, ciphertext: []const u8, out: []u8) Error![]u8 {
     const n = ciphertext.len / 8 - 1;
     if (out.len < n * 8) return error.BufferTooSmall;
 
-    var a: [8]u8 = ciphertext[0..8].*;
     const r = out[0 .. n * 8];
-    @memcpy(r, ciphertext[8..]);
+    const a = try unwrapInto(kek, ciphertext, r);
+    // Constant-time integrity check against the default IV (§2.2.3); an
+    // early-exit compare here would be a timing oracle. Fail closed AND
+    // clean: never hand back partially-recovered key material.
+    if (!std.crypto.timing_safe.eql([8]u8, a, default_iv)) {
+        std.crypto.secureZero(u8, r);
+        return error.Unauthentic;
+    }
+    return r;
+}
+
+/// RFC 3394 §2.2.2 inverse recurrence: `ciphertext` is `A || C1 .. Cn`
+/// (n >= 1; n = 1 is the single-block RFC 5649 case, one AES decryption),
+/// `r.len == 8 * n` receives the recovered registers and the recovered `A` is
+/// returned for the caller's integrity check. A failure wipes `r`.
+fn unwrapInto(kek: []const u8, ciphertext: []const u8, r: []u8) error{UnsupportedKeyLength}![8]u8 {
+    const n = r.len / 8;
+    var a: [8]u8 = ciphertext[0..8].*;
+    @memcpy(r, ciphertext[8..][0..r.len]);
+
+    if (n == 1) {
+        var block: [16]u8 = ciphertext[0..16].*;
+        decBlock(kek, &block) catch |err| {
+            std.crypto.secureZero(u8, r);
+            return err;
+        };
+        @memcpy(&a, block[0..8]);
+        @memcpy(r[0..8], block[8..16]);
+        return a;
+    }
 
     var j: usize = 6;
     while (j > 0) {
@@ -165,14 +246,48 @@ fn unwrapBody(kek: []const u8, ciphertext: []const u8, out: []u8) Error![]u8 {
             @memcpy(r[i * 8 ..][0..8], block[8..16]);
         }
     }
-    // Constant-time integrity check against the default IV (§2.2.3); an
-    // early-exit compare here would be a timing oracle. Fail closed AND
-    // clean: never hand back partially-recovered key material.
-    if (!std.crypto.timing_safe.eql([8]u8, a, default_iv)) {
+    return a;
+}
+
+/// AES Key Unwrap with Padding (RFC 5649 §4.2) — the inverse of `wrapPad`.
+/// `ciphertext.len` must be a multiple of 8 and >= 16 (`8n + 8`, n >= 1);
+/// `out` must hold `8n` bytes (`ciphertext.len - 8`, the padded length: the
+/// recovery runs in `out`). Returns the first MLI bytes of `out`, the original
+/// key data. Every §4.2 check — the AIV prefix `A65959A6`, `8(n-1) < MLI <= 8n`,
+/// and the `8n - MLI` padding bytes being zero — is folded into ONE verdict
+/// without early exit; any failure is `error.Unauthentic` and the whole `out[0..8n]` is zeroed, as in
+/// `unwrap`. Zeroization posture as `unwrap`.
+pub fn unwrapPad(kek: []const u8, ciphertext: []const u8, out: []u8) Error![]u8 {
+    return burn.run(burn.wrap_burn, Error![]u8, unwrapPadBody, .{ kek, ciphertext, out });
+}
+
+fn unwrapPadBody(kek: []const u8, ciphertext: []const u8, out: []u8) Error![]u8 {
+    if (ciphertext.len < 16 or ciphertext.len % 8 != 0) return error.InvalidLength;
+    const n = ciphertext.len / 8 - 1;
+    if (out.len < n * 8) return error.BufferTooSmall;
+
+    const r = out[0 .. n * 8];
+    const a = try unwrapInto(kek, ciphertext, r);
+
+    const mli: u64 = std.mem.readInt(u32, a[4..8], .big);
+    const lo: u64 = 8 * (@as(u64, n) - 1);
+    const prefix_ok = @intFromBool(std.crypto.timing_safe.eql([4]u8, a[0..4].*, aiv_prefix));
+    const range_ok = @intFromBool(mli > lo) & @intFromBool(mli <= lo + 8);
+    // Padding: bytes of the last semiblock at index >= MLI must be zero. When
+    // the range check fails MLI is garbage, but the verdict is already no;
+    // the loop stays branch-free in the data either way.
+    var pad_acc: u8 = 0;
+    for (0..8) |k| {
+        const idx: u64 = lo + k;
+        const is_pad: u8 = @intFromBool(idx >= mli);
+        pad_acc |= r[@intCast(idx)] & (0 -% is_pad);
+    }
+    const pad_ok = @intFromBool(pad_acc == 0);
+    if (prefix_ok & range_ok & pad_ok != 1) {
         std.crypto.secureZero(u8, r);
         return error.Unauthentic;
     }
-    return r;
+    return r[0..@intCast(mli)];
 }
 
 fn encBlock(kek: []const u8, block: *[16]u8) error{UnsupportedKeyLength}!void {
@@ -291,6 +406,115 @@ test "unwrap fails closed: wrong KEK / corrupted ciphertext -> Unauthentic, outp
     out = undefined;
     try std.testing.expectError(error.Unauthentic, unwrap(&kek, &corrupt, &out));
     try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), &out);
+}
+
+test "RFC 5649 §6 KAT — 192-bit KEK, 20-byte key data (n=3), byte-exact both directions" {
+    const kek = hexToBytes("5840df6e29b02af1ab493b705bf16ea1ae8338f4dcc176a8");
+    const key_data = hexToBytes("c37b7e6492584340bed12207808941155068f738");
+    const ciphertext = hexToBytes("138bdeaa9b8fa7fc61f97742e72248ee5ae6ae5360d1ae6a5f54f373fa543b6a");
+
+    var out: [32]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &ciphertext, try wrapPad(&kek, &key_data, &out));
+    var back: [24]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &key_data, try unwrapPad(&kek, &ciphertext, &back));
+}
+
+test "RFC 5649 §6 KAT — 192-bit KEK, 7-byte key data (n=1, single AES block), byte-exact both directions" {
+    const kek = hexToBytes("5840df6e29b02af1ab493b705bf16ea1ae8338f4dcc176a8");
+    const key_data = hexToBytes("466f7250617369");
+    const ciphertext = hexToBytes("afbeb0f07dfbf5419200f2ccb50bb24f");
+
+    var out: [16]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &ciphertext, try wrapPad(&kek, &key_data, &out));
+    var back: [8]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &key_data, try unwrapPad(&kek, &ciphertext, &back));
+}
+
+test "wrapPad/unwrapPad round trip over lengths 1..64 and all KEK sizes" {
+    const kek_all = @as([32]u8, @splat(0x3c));
+    var pt: [64]u8 = undefined;
+    for (&pt, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
+    for ([_]usize{ 16, 24, 32 }) |kl| {
+        for (1..65) |len| {
+            var ct: [72]u8 = undefined;
+            const wrapped = try wrapPad(kek_all[0..kl], pt[0..len], &ct);
+            try std.testing.expectEqual(((len + 7) / 8) * 8 + 8, wrapped.len);
+            var back: [64]u8 = undefined;
+            try std.testing.expectEqualSlices(u8, pt[0..len], try unwrapPad(kek_all[0..kl], wrapped, &back));
+        }
+    }
+}
+
+test "wrapPad/unwrapPad refusals: tamper, wrong MLI, non-zero padding, bad lengths, wiped output" {
+    const kek = @as([16]u8, @splat(0x11));
+    const zero = @as([24]u8, @splat(0));
+
+    // n = 1 and n = 3 shapes: a flipped ciphertext byte anywhere is refused.
+    inline for (.{ 7, 20 }) |len| {
+        const pt = @as([20]u8, @splat(0x5a));
+        var ct: [32]u8 = undefined;
+        const wrapped = try wrapPad(&kek, pt[0..len], &ct);
+        for (0..wrapped.len) |i| {
+            var bad: [32]u8 = ct;
+            bad[i] ^= 0x01;
+            var out = @as([24]u8, @splat(0xEE));
+            try std.testing.expectError(error.Unauthentic, unwrapPad(&kek, bad[0..wrapped.len], &out));
+            try std.testing.expectEqualSlices(u8, zero[0 .. wrapped.len - 8], out[0 .. wrapped.len - 8]);
+        }
+        var out: [24]u8 = undefined;
+        try std.testing.expectError(error.Unauthentic, unwrapPad(&@as([16]u8, @splat(0x12)), wrapped, &out)); // wrong KEK
+    }
+
+    // Hand-forged blocks, each encrypted under the right KEK with a bad AIV
+    // or payload, so only the §4.2 checks (not the AES layer) can refuse them.
+    const forge = struct {
+        fn make(k: []const u8, mli: u32, prefix: [4]u8, body: [8]u8, out: *[16]u8) void {
+            var block: [16]u8 = undefined;
+            block[0..4].* = prefix;
+            std.mem.writeInt(u32, block[4..8], mli, .big);
+            block[8..16].* = body;
+            aes.Aes128.initEnc(k[0..16].*).encrypt(&block, &block);
+            out.* = block;
+        }
+    };
+    var ct: [16]u8 = undefined;
+    var out: [8]u8 = undefined;
+    // Positive control: MLI 7, one pad byte zero.
+    forge.make(&kek, 7, aiv_prefix, .{ 1, 2, 3, 4, 5, 6, 7, 0 }, &ct);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7 }, try unwrapPad(&kek, &ct, &out));
+    // Non-zero padding byte.
+    forge.make(&kek, 7, aiv_prefix, .{ 1, 2, 3, 4, 5, 6, 7, 9 }, &ct);
+    try std.testing.expectError(error.Unauthentic, unwrapPad(&kek, &ct, &out));
+    try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(0)), &out);
+    // MLI out of range for n = 1: 0 and 9.
+    forge.make(&kek, 0, aiv_prefix, @splat(0), &ct);
+    try std.testing.expectError(error.Unauthentic, unwrapPad(&kek, &ct, &out));
+    forge.make(&kek, 9, aiv_prefix, @splat(1), &ct);
+    try std.testing.expectError(error.Unauthentic, unwrapPad(&kek, &ct, &out));
+    // Wrong AIV prefix (the RFC 3394 default IV, i.e. a plain `wrap` block).
+    forge.make(&kek, 8, .{ 0xA6, 0xA6, 0xA6, 0xA6 }, @splat(1), &ct);
+    try std.testing.expectError(error.Unauthentic, unwrapPad(&kek, &ct, &out));
+    // MLI 8 with a full last block is legal (no padding).
+    forge.make(&kek, 8, aiv_prefix, @splat(1), &ct);
+    try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(1)), try unwrapPad(&kek, &ct, &out));
+
+    // Length and buffer errors.
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(error.InvalidLength, wrapPad(&kek, "", &buf)); // empty plaintext
+    try std.testing.expectError(error.InvalidLength, unwrapPad(&kek, buf[0..8], &buf)); // too short
+    try std.testing.expectError(error.InvalidLength, unwrapPad(&kek, buf[0..0], &buf));
+    try std.testing.expectError(error.InvalidLength, unwrapPad(&kek, buf[0..17], &buf)); // not a multiple of 8
+    try std.testing.expectError(error.InvalidLength, unwrapPad(&kek, buf[0..25], &buf));
+    try std.testing.expectError(error.BufferTooSmall, wrapPad(&kek, "1234567", buf[0..15]));
+    try std.testing.expectError(error.BufferTooSmall, wrapPad(&kek, "12345678", buf[0..15]));
+    try std.testing.expectError(error.BufferTooSmall, wrapPad(&kek, "123456789", buf[0..23]));
+    try std.testing.expectError(error.BufferTooSmall, unwrapPad(&kek, buf[0..16], buf[0..7]));
+    try std.testing.expectError(error.UnsupportedKeyLength, wrapPad(buf[0..20], "x", &buf));
+    try std.testing.expectError(error.UnsupportedKeyLength, unwrapPad(buf[0..20], buf[0..16], &buf));
+    // KEK width is validated before the plaintext is copied into `out`.
+    var clean = @as([16]u8, @splat(0));
+    try std.testing.expectError(error.UnsupportedKeyLength, wrapPad(buf[0..20], "secret", &clean));
+    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), &clean);
 }
 
 // ── fuzz: `unwrap` on an attacker-controlled ciphertext ─────────────────────
