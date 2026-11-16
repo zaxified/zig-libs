@@ -255,6 +255,44 @@ pub const ReassemblerConfig = struct {
     /// fragment for a datagram past this age starts a new one, same as
     /// the idle check) and by `expireOlderThan`.
     max_lifetime_ns: ?u64 = null,
+    /// Aggregate cap, in bytes, on the reassembly buffers held across ALL
+    /// in-flight datagrams (the sum of the per-datagram buffer sizes; the
+    /// interval lists are not counted). Without it the table is bounded only
+    /// by `max_inflight * max_frame_len`. `null` (the default) means no extra
+    /// cap: behaviour is exactly as before. When a fragment would push the
+    /// total past the cap, the reassembler first reclaims expired datagrams
+    /// (new datagrams only), and if that is not enough REFUSES the fragment
+    /// with `error.BudgetExceeded` — it never evicts a live datagram. A
+    /// refused new datagram leaves no state; a refused growth of an existing
+    /// datagram drops that datagram (frees its bytes). Must be at least 1
+    /// when set.
+    max_total_bytes: ?usize = null,
+};
+
+/// Monotonic tallies of what a `Reassembler` has accepted and refused, for an
+/// operator's dashboard. Every field saturates at `maxInt(u64)`. Returned by
+/// value from `Reassembler.stats()`.
+pub const Stats = struct {
+    /// Frames returned as `.complete`.
+    completed: u64 = 0,
+    /// Datagrams dropped for idleness or lifetime (inline and via
+    /// `expireOlderThan`).
+    expired: u64 = 0,
+    /// Fragments rejected as `OverlappingFragment`.
+    overlap: u64 = 0,
+    /// Fragments rejected as `OutOfBounds`.
+    out_of_bounds: u64 = 0,
+    /// Fragments rejected as `ProtocolViolation`.
+    protocol_violation: u64 = 0,
+    /// Fragments rejected as `TooManyFragments`.
+    too_many_fragments: u64 = 0,
+    /// Fragments rejected as `TableFull`.
+    table_full: u64 = 0,
+    /// Fragments rejected as `BudgetExceeded`.
+    budget_exceeded: u64 = 0,
+    /// Fragments rejected as malformed on the wire (`Truncated`,
+    /// `InvalidHeader`, `LengthMismatch`, `EmptyNonFinalFragment`).
+    malformed: u64 = 0,
 };
 
 pub const InsertResult = union(enum) {
@@ -304,6 +342,9 @@ pub const InsertError = Header.DecodeError || error{
     /// reclaimed (all still within their timeout window) — this fragment
     /// is dropped without creating new state.
     TableFull,
+    /// Accepting this fragment would exceed `config.max_total_bytes` and
+    /// nothing could be reclaimed. Only returned when that cap is set.
+    BudgetExceeded,
 } || Allocator.Error;
 
 /// Order `offset` against `item.offset`, for `std.sort.lowerBound` over a
@@ -330,10 +371,20 @@ var test_f8_bytes_allocated: usize = 0;
 /// Bounded, stateful reassembler for `fragment()`'s wire format. The free
 /// functions above are reentrant; a `Reassembler` instance itself is
 /// single-owner — one caller drives `insert`/`expireOlderThan` at a time.
+///
+/// **One instance per peer.** `frag_id` is the only key: the table has no
+/// notion of who sent a fragment, so two peers feeding one `Reassembler` can
+/// collide on an id (mixing or dropping each other's datagrams) and one peer
+/// can poison or exhaust the other's slots. Keep a separate `Reassembler`
+/// (with its own `max_inflight` / `max_total_bytes`) for every peer and route
+/// each peer's fragments only to its own.
 pub const Reassembler = struct {
     allocator: Allocator,
     config: ReassemblerConfig,
     entries: std.AutoHashMapUnmanaged(u16, Entry) = .empty,
+    /// Sum of `buf.len` over `entries` (checked against `max_total_bytes`).
+    total_bytes: usize = 0,
+    tally: Stats = .{},
 
     const Interval = struct { offset: u16, length: u16 };
 
@@ -366,10 +417,13 @@ pub const Reassembler = struct {
         /// `Allocator.realloc` preserves the existing bytes up to the
         /// smaller of the old/new lengths, so already-written fragment
         /// data survives a grow.
-        fn ensureCapacity(self: *Entry, allocator: Allocator, needed: usize, cap: usize) Allocator.Error!void {
+        fn ensureCapacity(self: *Entry, allocator: Allocator, needed: usize, cap: usize, room: usize) (Allocator.Error || error{BudgetExceeded})!void {
             if (self.buf.len >= needed) return;
             const doubled = self.buf.len * 2;
-            const new_len = @min(cap, @max(needed, doubled));
+            // `room` (aggregate-budget headroom) trims the amortised
+            // doubling, but never below what is strictly needed.
+            const new_len = @min(cap, @max(needed, @min(doubled, self.buf.len +| room)));
+            if (new_len - self.buf.len > room) return error.BudgetExceeded;
             self.buf = try allocator.realloc(self.buf, new_len);
             test_f8_bytes_allocated += new_len; // A1 F8 measurement
         }
@@ -400,6 +454,9 @@ pub const Reassembler = struct {
             @panic("ReassemblerConfig.max_frame_len must be at least 1 and at most max_frame_len");
         if (config.max_fragments_per_datagram < 1)
             @panic("ReassemblerConfig.max_fragments_per_datagram must be at least 1");
+        if (config.max_total_bytes) |m| {
+            if (m < 1) @panic("ReassemblerConfig.max_total_bytes must be at least 1 when set");
+        }
         return .{ .allocator = allocator, .config = config };
     }
 
@@ -416,9 +473,29 @@ pub const Reassembler = struct {
         return self.entries.count();
     }
 
+    /// Counters accumulated since `init` (or the last `resetStats`).
+    pub fn stats(self: *const Reassembler) Stats {
+        return self.tally;
+    }
+
+    pub fn resetStats(self: *Reassembler) void {
+        self.tally = .{};
+    }
+
+    /// Bytes currently held in reassembly buffers (what `max_total_bytes`
+    /// bounds).
+    pub fn totalBytes(self: *const Reassembler) usize {
+        return self.total_bytes;
+    }
+
+    fn bump(field: *u64) void {
+        field.* +|= 1;
+    }
+
     fn dropEntry(self: *Reassembler, id: u16) void {
         if (self.entries.fetchRemove(id)) |kv| {
             var e = kv.value;
+            self.total_bytes -= e.buf.len;
             e.deinit(self.allocator);
         }
     }
@@ -453,6 +530,7 @@ pub const Reassembler = struct {
             }
         }
         for (doomed.items) |id| self.dropEntry(id);
+        self.tally.expired +|= doomed.items.len;
         return doomed.items.len;
     }
 
@@ -482,6 +560,24 @@ pub const Reassembler = struct {
     }
 
     pub fn insert(self: *Reassembler, wire_bytes: []const u8, now_ns: u64) InsertError!InsertResult {
+        const res = self.insertInner(wire_bytes, now_ns) catch |err| {
+            switch (err) {
+                error.Truncated, error.InvalidHeader, error.LengthMismatch, error.EmptyNonFinalFragment => bump(&self.tally.malformed),
+                error.OutOfBounds => bump(&self.tally.out_of_bounds),
+                error.OverlappingFragment => bump(&self.tally.overlap),
+                error.TooManyFragments => bump(&self.tally.too_many_fragments),
+                error.ProtocolViolation => bump(&self.tally.protocol_violation),
+                error.TableFull => bump(&self.tally.table_full),
+                error.BudgetExceeded => bump(&self.tally.budget_exceeded),
+                error.OutOfMemory => {},
+            }
+            return err;
+        };
+        if (res == .complete) bump(&self.tally.completed);
+        return res;
+    }
+
+    fn insertInner(self: *Reassembler, wire_bytes: []const u8, now_ns: u64) InsertError!InsertResult {
         const hdr = try Header.decode(wire_bytes);
         const payload = wire_bytes[header_len..];
         if (payload.len != hdr.length) return error.LengthMismatch;
@@ -505,13 +601,24 @@ pub const Reassembler = struct {
         // `expireOlderThan` callers directly) — that path an incumbent
         // cannot keep triggering on itself.
         if (self.entries.getPtr(hdr.frag_id)) |e| {
-            if (now_ns -| e.last_seen_ns > self.config.timeout_ns) self.dropEntry(hdr.frag_id);
+            if (now_ns -| e.last_seen_ns > self.config.timeout_ns) {
+                self.dropEntry(hdr.frag_id);
+                bump(&self.tally.expired);
+            }
         }
 
         if (!self.entries.contains(hdr.frag_id) and self.entries.count() >= self.config.max_inflight) {
             _ = self.expireOlderThan(now_ns);
             if (!self.entries.contains(hdr.frag_id) and self.entries.count() >= self.config.max_inflight) {
                 return guardTableFull();
+            }
+        }
+
+        if (self.config.max_total_bytes) |cap| {
+            if (!self.entries.contains(hdr.frag_id)) {
+                const need: usize = if (hdr.length > 0) frag_end else 0;
+                if (self.total_bytes +| need > cap) _ = self.expireOlderThan(now_ns);
+                if (self.total_bytes +| need > cap) return error.BudgetExceeded;
             }
         }
 
@@ -526,6 +633,7 @@ pub const Reassembler = struct {
                 return err;
             };
             test_f8_bytes_allocated += initial_len; // A1 F8 measurement
+            self.total_bytes += initial_len;
             gop.value_ptr.* = .{ .buf = buf, .last_seen_ns = now_ns, .created_ns = now_ns };
         }
         const entry = gop.value_ptr;
@@ -629,10 +737,16 @@ pub const Reassembler = struct {
         }
 
         if (hdr.length > 0) {
-            entry.ensureCapacity(self.allocator, frag_end, self.config.max_frame_len) catch |err| {
+            // Room left under the aggregate cap for this entry's growth
+            // (unbounded when no cap is set). Growth that cannot fit even
+            // exactly is refused and the datagram dropped.
+            const room: usize = if (self.config.max_total_bytes) |cap| cap -| self.total_bytes else std.math.maxInt(usize);
+            const before = entry.buf.len;
+            entry.ensureCapacity(self.allocator, frag_end, self.config.max_frame_len, room) catch |err| {
                 self.dropEntry(hdr.frag_id);
                 return err;
             };
+            self.total_bytes += entry.buf.len - before;
             @memcpy(entry.buf[hdr.offset..frag_end], payload);
         }
         entry.intervals.insert(self.allocator, idx, .{ .offset = hdr.offset, .length = hdr.length }) catch |err| {
@@ -1806,4 +1920,111 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+// ── aggregate byte budget and counters (2026-11-16) ─────────────────────────
+
+fn testWire(buf: []u8, id: u16, offset: u16, payload_len: u16, more: bool) []u8 {
+    (Header{ .frag_id = id, .offset = offset, .length = payload_len, .more = more }).encode(buf[0..header_len]);
+    @memset(buf[header_len..][0..payload_len], 'q');
+    return buf[0 .. header_len + payload_len];
+}
+
+test "max_total_bytes: null keeps the unbounded behaviour" {
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 8, .timeout_ns = 1000 });
+    defer r.deinit();
+    var buf: [header_len + 100]u8 = undefined;
+    var i: u16 = 0;
+    while (i < 8) : (i += 1) {
+        try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, i, 0, 100, true), 0));
+    }
+    try testing.expectEqual(@as(usize, 800), r.totalBytes());
+    try testing.expectEqual(@as(u64, 0), r.stats().budget_exceeded);
+}
+
+test "max_total_bytes: refuses a new datagram that would exceed the cap, keeps live ones" {
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 8, .timeout_ns = 1000, .max_total_bytes = 250 });
+    defer r.deinit();
+    var buf: [header_len + 100]u8 = undefined;
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 100, true), 0));
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 2, 0, 100, true), 0));
+    // 300 > 250: refused, no state created, the two live datagrams survive.
+    try testing.expectError(error.BudgetExceeded, r.insert(testWire(&buf, 3, 0, 100, true), 1));
+    try testing.expectEqual(@as(usize, 2), r.inflightCount());
+    try testing.expectEqual(@as(usize, 200), r.totalBytes());
+    // A 50-byte datagram still fits exactly.
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 4, 0, 50, true), 1));
+    try testing.expectEqual(@as(usize, 250), r.totalBytes());
+    // Once the old ones expire, the refused id is accepted.
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 3, 0, 100, true), 5000));
+    try testing.expectEqual(@as(u64, 1), r.stats().budget_exceeded);
+}
+
+test "max_total_bytes: growth of an existing datagram over the cap drops it" {
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 8, .timeout_ns = 1000, .max_total_bytes = 150 });
+    defer r.deinit();
+    var buf: [header_len + 200]u8 = undefined;
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 100, true), 0));
+    // Needs buf of 300 > 150.
+    try testing.expectError(error.BudgetExceeded, r.insert(testWire(&buf, 1, 100, 200, true), 1));
+    try testing.expectEqual(@as(usize, 0), r.inflightCount());
+    try testing.expectEqual(@as(usize, 0), r.totalBytes());
+    // Growth that fits exactly is accepted (doubling is trimmed to the room).
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 2, 0, 60, true), 2));
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 2, 60, 90, true), 2));
+    try testing.expectEqual(@as(usize, 150), r.totalBytes());
+}
+
+test "max_total_bytes: completing a frame releases its bytes" {
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 8, .timeout_ns = 1000, .max_total_bytes = 100 });
+    defer r.deinit();
+    var buf: [header_len + 100]u8 = undefined;
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 40, true), 0));
+    const res = try r.insert(testWire(&buf, 1, 40, 40, false), 0);
+    testing.allocator.free(res.complete);
+    try testing.expectEqual(@as(usize, 0), r.totalBytes());
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 2, 0, 100, true), 0));
+}
+
+test "stats: every error class is tallied, resetStats clears" {
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 1, .max_frame_len = 64, .max_fragments_per_datagram = 2, .timeout_ns = 1000 });
+    defer r.deinit();
+    var buf: [header_len + 100]u8 = undefined;
+
+    try testing.expectError(error.Truncated, r.insert(buf[0..3], 0));
+    try testing.expectError(error.OutOfBounds, r.insert(testWire(&buf, 1, 0, 65, true), 0));
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 8, true), 0));
+    try testing.expectError(error.TableFull, r.insert(testWire(&buf, 2, 0, 8, true), 1));
+    try testing.expectError(error.OverlappingFragment, r.insert(testWire(&buf, 1, 4, 8, true), 1));
+    // Overlap dropped datagram 1; start again for the fragment-count and violation cases.
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 8, true), 2));
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 8, 8, true), 2));
+    try testing.expectError(error.TooManyFragments, r.insert(testWire(&buf, 1, 16, 8, true), 2));
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 8, 8, false), 3));
+    try testing.expectError(error.ProtocolViolation, r.insert(testWire(&buf, 1, 0, 4, false), 3));
+    // Idle expiry (inline), then a completion.
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 8, true), 4));
+    const res = try r.insert(testWire(&buf, 1, 8, 8, false), 5000); // idle-expired: starts afresh, incomplete
+    try testing.expectEqual(InsertResult.incomplete, res);
+    try testing.expectEqual(@as(usize, 1), r.expireOlderThan(100_000));
+
+    const s = r.stats();
+    try testing.expectEqual(@as(u64, 1), s.malformed);
+    try testing.expectEqual(@as(u64, 1), s.out_of_bounds);
+    try testing.expectEqual(@as(u64, 1), s.table_full);
+    try testing.expectEqual(@as(u64, 1), s.overlap);
+    try testing.expectEqual(@as(u64, 1), s.too_many_fragments);
+    try testing.expectEqual(@as(u64, 1), s.protocol_violation);
+    try testing.expectEqual(@as(u64, 2), s.expired);
+    try testing.expectEqual(@as(u64, 0), s.completed);
+
+    r.resetStats();
+    try testing.expectEqual(Stats{}, r.stats());
+
+    // completed
+    const frags = try fragment(testing.allocator, "hello", 7, 1500, 0);
+    defer freeFragments(testing.allocator, frags);
+    const out = (try r.insert(frags[0].bytes, 200_000)).complete;
+    testing.allocator.free(out);
+    try testing.expectEqual(@as(u64, 1), r.stats().completed);
 }

@@ -194,10 +194,13 @@ Survey findings (survey 2026-09-30), all low priority and all fit CONVENTIONS §
 - **Aggregate byte budget** (survey 2026-09-30) — the table is bounded by `max_inflight * max_frame_len` plus interval
   lists; the kernel and lwIP cap total bytes. A user who lowers `max_frame_len` sees the bound widen (see
   Design). Effort: small (`max_total_bytes` in `ReassemblerConfig`, evict-oldest or refuse).
+  ✅ DONE 2026-11-16 (`ReassemblerConfig.max_total_bytes: ?usize = null`; expired datagrams are reclaimed first, then the fragment is refused with `error.BudgetExceeded`, never evicting a live datagram; `Reassembler.totalBytes()`).
 - **Drop/eviction counters** (survey 2026-09-30) — per-error tallies (overlap, timeout, table full) for an operator's
   dashboard; today each is only an error return. Effort: small.
+  ✅ DONE 2026-11-16 (`Reassembler.stats()` / `resetStats()` returning `Stats`: completed, expired, overlap, out_of_bounds, protocol_violation, too_many_fragments, table_full, budget_exceeded, malformed; saturating u64).
 - **Documented per-peer keying** (survey 2026-09-30) — `frag_id` is the only key, so two peers sharing a `Reassembler` can
   collide or poison each other; the README should say one instance per peer, or the API should take a peer key. Effort: small.
+  ✅ DONE 2026-11-16 (documented: one `Reassembler` per peer, in README and the type's doc comment; API unchanged).
 
 Earlier note: No Fable-tier piece was needed — every requirement (overlap/duplicate/timeout
 rejection, resource bounds, teardrop-class hardening) is protocol/state-machine logic
