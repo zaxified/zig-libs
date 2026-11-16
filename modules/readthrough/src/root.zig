@@ -106,6 +106,15 @@ pub const Loader = struct {
     load: *const fn (ctx: ?*anyopaque, key: []const u8) anyerror!LoadOutcome,
 };
 
+/// Optional per-entry TTL chooser (Caffeine `Expiry`, ttlcache per-item TTL).
+/// Called once per successful positive load, on the loader's thread, OUTSIDE the
+/// lock, right after the loader returned `value` (borrowed, as for the loader).
+/// Return `null` to use `Options.ttl_ns`; otherwise the TTL in ns for this
+/// entry (`<= 0` = never expire by time). Same contract as the loader: it MUST
+/// NOT call back into the same `Cache` and MUST NOT panic. Negative entries keep
+/// `negative_ttl_ns`.
+pub const TtlFn = *const fn (ctx: ?*anyopaque, key: []const u8, value: []const u8) ?i64;
+
 /// Injectable clock, for deterministic TTL tests (drive time by hand — never
 /// sleep). Production callers leave `Options.clock` null and the cache reads the
 /// monotonic `std.Io` "awake" clock instead.
@@ -209,6 +218,10 @@ pub const Options = struct {
     loader: Loader,
     /// TTL for a positively-loaded value, in ns. `<= 0` = never expire by time.
     ttl_ns: i64 = 0,
+    /// Optional per-entry TTL chooser for positive loads; null = every entry uses
+    /// `ttl_ns`. See `TtlFn`. `ttl_ctx` is passed to it.
+    ttl_fn: ?TtlFn = null,
+    ttl_ctx: ?*anyopaque = null,
     /// TTL for a negative (missing / error) entry, in ns. `<= 0` disables
     /// negative caching entirely (every miss re-hits the loader).
     negative_ttl_ns: i64 = 0,
@@ -229,6 +242,8 @@ pub const Cache = struct {
     io: std.Io,
     loader: Loader,
     ttl_ns: i64,
+    ttl_fn: ?TtlFn,
+    ttl_ctx: ?*anyopaque,
     negative_ttl_ns: i64,
     cache_loader_errors: bool,
     clock: ?Clock,
@@ -248,6 +263,8 @@ pub const Cache = struct {
             .io = options.io,
             .loader = options.loader,
             .ttl_ns = options.ttl_ns,
+            .ttl_fn = options.ttl_fn,
+            .ttl_ctx = options.ttl_ctx,
             .negative_ttl_ns = options.negative_ttl_ns,
             .cache_loader_errors = options.cache_loader_errors,
             .clock = options.clock,
@@ -363,6 +380,16 @@ pub const Cache = struct {
 
         // The one backend fetch, off the lock.
         const outcome = self.loader.load(self.loader.ctx, key);
+        // Per-entry TTL, also off the lock (`bytes` is still borrowed here).
+        var entry_ttl = self.ttl_ns;
+        if (self.ttl_fn) |f| {
+            if (outcome) |oc| switch (oc) {
+                .value => |bytes| {
+                    if (f(self.ttl_ctx, key, bytes)) |t| entry_ttl = t;
+                },
+                .missing => {},
+            } else |_| {}
+        }
 
         self.lock.lock();
         // Unregister so late arrivals go to the cache (now populated) or start a
@@ -384,7 +411,7 @@ pub const Cache = struct {
                 // The store is independent of the copy and still worth doing:
                 // it is fail-soft, and a populated cache makes the next get
                 // succeed. It does not paper over the error above.
-                if (!poisoned) self.storeLocked(key, tag_value, bytes, self.ttl_ns);
+                if (!poisoned) self.storeLocked(key, tag_value, bytes, entry_ttl);
             },
             .missing => {
                 call.result = .missing;
@@ -661,6 +688,7 @@ const Rig = struct {
     }
     fn open(rig: *Rig, opts: struct {
         ttl_ns: i64 = 0,
+        ttl_fn: ?TtlFn = null,
         negative_ttl_ns: i64 = 0,
         cache_loader_errors: bool = false,
         max_entries: usize = 64,
@@ -670,6 +698,7 @@ const Rig = struct {
             .loader = rig.ldr.loader(),
             .clock = rig.clock.clock(),
             .ttl_ns = opts.ttl_ns,
+            .ttl_fn = opts.ttl_fn,
             .negative_ttl_ns = opts.negative_ttl_ns,
             .cache_loader_errors = opts.cache_loader_errors,
             .max_bytes = 1 << 20,
@@ -1298,4 +1327,56 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+fn testTtl(_: ?*anyopaque, key: []const u8, _: []const u8) ?i64 {
+    if (std.mem.eql(u8, key, "short")) return 100;
+    if (std.mem.eql(u8, key, "long")) return 10_000;
+    if (std.mem.eql(u8, key, "forever")) return 0;
+    return null; // default
+}
+
+test "per-key TTL: entries chosen by ttl_fn expire independently; null = default; <= 0 = never" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    for ([_][]const u8{ "short", "long", "forever", "dflt" }) |k| try rig.ldr.put(testing.allocator, k, "v");
+    rig.clock.t = 1000;
+    var c = rig.open(.{ .ttl_ns = 500, .ttl_fn = testTtl });
+    defer c.deinit();
+    for ([_][]const u8{ "short", "long", "forever", "dflt" }) |k| c.free(try c.get(k));
+    try testing.expectEqual(@as(u64, 4), rig.ldr.calls.load(.monotonic));
+    rig.clock.t = 1101; // short (100) expired; dflt (500), long, forever fresh
+    for ([_][]const u8{ "long", "forever", "dflt" }) |k| c.free(try c.get(k));
+    try testing.expectEqual(@as(u64, 4), rig.ldr.calls.load(.monotonic));
+    c.free(try c.get("short"));
+    try testing.expectEqual(@as(u64, 5), rig.ldr.calls.load(.monotonic));
+    rig.clock.t = 1501 + 1; // dflt (inserted 1000, ttl 500) expired; long still fresh
+    c.free(try c.get("long"));
+    c.free(try c.get("forever"));
+    try testing.expectEqual(@as(u64, 5), rig.ldr.calls.load(.monotonic));
+    c.free(try c.get("dflt"));
+    try testing.expectEqual(@as(u64, 6), rig.ldr.calls.load(.monotonic));
+    rig.clock.t = 1000 + 10_001; // long expired, forever never
+    c.free(try c.get("forever"));
+    try testing.expectEqual(@as(u64, 6), rig.ldr.calls.load(.monotonic));
+    c.free(try c.get("long"));
+    try testing.expectEqual(@as(u64, 7), rig.ldr.calls.load(.monotonic));
+}
+
+test "per-key TTL: negative entries keep negative_ttl_ns, ttl_fn not consulted for them" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.clock.t = 0;
+    var c = rig.open(.{ .ttl_fn = testTtl, .negative_ttl_ns = 50 });
+    defer c.deinit();
+    // "short" is absent from the table -> .missing, cached with 50 (not 100).
+    c.free(try c.get("short"));
+    rig.clock.t = 40;
+    c.free(try c.get("short"));
+    try testing.expectEqual(@as(u64, 1), rig.ldr.calls.load(.monotonic));
+    rig.clock.t = 51;
+    c.free(try c.get("short"));
+    try testing.expectEqual(@as(u64, 2), rig.ldr.calls.load(.monotonic));
 }

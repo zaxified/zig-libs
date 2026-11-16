@@ -37,7 +37,7 @@ source consulted or copied). The W-TinyLFU store underneath is
   other caller for that key ("followers") blocks on an `std.Io` futex and shares
   the leader's one result — no thundering herd. Proven under real threads
   (`loads == 1`, `coalesced == N-1`).
-- **TTL:** each positive entry carries `ttl_ns` (`<= 0` = never expire by time);
+- **TTL:** each positive entry carries `ttl_ns` (`<= 0` = never expire by time), or the value from the optional `Options.ttl_fn` callback (per-key TTL; null = `ttl_ns`);
   a fresh get past the TTL reloads. Time is injectable (`Options.clock`) so TTL
   is testable without sleeping; production reads the monotonic `std.Io` clock.
 - **Invalidation:** `invalidate(key)` forces the next `get(key)` to reload;
