@@ -230,7 +230,7 @@ store and lookup, so every age is unchanged). No source defects found.
   left to the consumer's observability layer.
 - (survey 2026-09-30) Stale-while-revalidate / `refreshAfterWrite` (already the first item above): the feature of Caffeine that its users reach for first, since it removes synchronous misses for hot keys. Effort: medium; fits CONVENTIONS §2 if the refresh runs on the caller's thread or a caller-supplied executor.
 - (survey 2026-09-30) Bulk `getAll(keys)` with one loader call for the missing subset (Caffeine `loadAll`). Effort: small-medium; fits §2.
-- (survey 2026-09-30) Per-key TTL (Caffeine `Expiry`, ttlcache per-item TTL). Effort: small; fits §2.
+- ✅ DONE 2026-11-16 (survey 2026-09-30) Per-key TTL (Caffeine `Expiry`, ttlcache per-item TTL): `Options.ttl_fn` / `ttl_ctx` (`TtlFn`), a per-loaded-entry TTL chooser; null = `ttl_ns`, `<= 0` = never expire; negative entries unchanged.
 
 ## Anchoring
 

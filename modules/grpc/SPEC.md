@@ -37,8 +37,8 @@ against Python `grpcio` (recorded replay plus live oracle); offline frame-level 
 Trailers-Only vs Trailers distinction; a decoded-size bound on every message (declared length
 never sizes an allocation), pure Zig with no C core, typed struct messages with no codegen step.
 **Where we are behind:** no compression, retries, name resolution/load balancing, interceptors,
-keepalive, `grpc-status-details-bin`, gRPC-Web, and no standard `grpc.health.v1` /
-reflection services; the server is sequential per connection unless the application installs
+keepalive, `grpc-status-details-bin`, gRPC-Web, and no reflection service (the standard
+`grpc.health.v1` health service exists since 2026-11-16); the server is sequential per connection unless the application installs
 the `http` dispatcher (→ Backlog).
 
 See [README.md](README.md) for what this module is and how to use it.
@@ -509,8 +509,8 @@ bytes.
   readable today as ordinary `-bin` metadata.
 - **gRPC-Web.** Same LPM envelope over HTTP/1.1 with trailers folded into the body; `grpc.frame`
   is the reusable half and the rest is a different transport.
-- **Reflection, health and channelz services.** Ordinary services, expressible with what is
-  here; not protocol.
+- **Reflection and channelz services.** Ordinary services, expressible with what is
+  here; not protocol. (`grpc.health.v1` is provided: `health.zig`.)
 - **Concurrent server handlers** and **preemptive deadline cancellation.** Both are properties of
   `h2_server`'s scheduling, not of this module; see "What the server does not do" above.
 
@@ -530,7 +530,7 @@ Every item below is also listed under *Not implemented, and why*; the survey tag
 typical grpc-go/tonic user hits in ordinary use.
 
 - **(survey 2026-09-30) Message compression (gzip, deflate)** — a peer that mandates gzip cannot be talked to, and `grpc-accept-encoding: identity` only is unusual next to grpc-go/tonic. Needs a decompressed-size bound (second instance of invariant 1). Effort: medium (gzip decoder already exists in `http`; the bound is the design work). Fits §2: yes.
-- **(survey 2026-09-30) Standard `grpc.health.v1` service** (Check/Watch) — Kubernetes gRPC probes and load balancers expect it; the `health` module is HTTP-only. Effort: small (a service definition over `Methods`, plus a status registry). Fits §2: yes.
+- ✅ DONE 2026-11-16 (`grpc.Health` registry + `grpc.health.Service(getFn)` / `grpc.health.service_from_context` over `Methods`: `Check`, `Watch`; unknown service = NOT_FOUND in Check, SERVICE_UNKNOWN in Watch; `shutdown()` drains watchers; src/health.zig) **(survey 2026-09-30) Standard `grpc.health.v1` service** (Check/Watch) — Kubernetes gRPC probes and load balancers expect it; the `health` module is HTTP-only. Effort: small (a service definition over `Methods`, plus a status registry). Fits §2: yes.
 - **(survey 2026-09-30) Interceptors / middleware hooks** (auth, logging, metrics on client and server) — a grpc-go/tonic staple; absent, every caller wraps calls by hand. Effort: medium (needs an API decision). Fits §2: yes.
 - **(survey 2026-09-30) Default server concurrency** — a connection's streams run sequentially unless the application installs the `h2_server` dispatcher; a slow handler blocks the connection. Effort: small–medium (wire a pool option into `grpc.Server`). Fits §2: yes.
 - **(survey 2026-09-30) Retries/hedging, name resolution and load balancing, keepalive, `grpc-status-details-bin`, gRPC-Web** — client-architecture features; medium to large each. Fit §2: yes, but they need a channel that owns its connections.

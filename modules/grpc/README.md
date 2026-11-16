@@ -187,6 +187,15 @@ try call.finish();
 
 ## Server
 
+**Health checking.** `grpc.Health` is a thread-safe status registry and
+`grpc.health.service_from_context` the standard `grpc.health.v1.Health` service
+(`Check`, `Watch`) over it: set `Router.context = &health`, add the service to
+`services`, then `try health.set("pkg.Svc", .serving)` (`""` = overall, starts
+`SERVING`). `Check` of an unregistered name is `NOT_FOUND`, `Watch` streams
+`SERVICE_UNKNOWN`; `health.shutdown()` flips everything to `NOT_SERVING` and
+ends open watches. `grpc.health.Service(getFn)` takes the registry from your own
+context instead.
+
 ```zig
 const M = grpc.Methods(EchoRequest, EchoReply);
 
@@ -311,6 +320,6 @@ Trailers-Only distinction, since both shapes use the same field names.
 Message **compression** (`grpc-encoding` other than `identity`) — a compressed frame is refused
 rather than handed to the decoder as if it were plaintext. **Retries**, **channel load balancing
 / name resolution**, **`grpc-status-details-bin`** (the `google.rpc.Status` detail payload),
-**gRPC-Web** framing, and **reflection/health** services. On the server: concurrent handlers (`h2_server`
+**gRPC-Web** framing, and **reflection** services (the standard health service is provided, see Server). On the server: concurrent handlers (`h2_server`
 has the dispatch seam, but `grpc.Server` installs no pool of its own — the default stays
 sequential per connection) and preemptive deadline cancellation. See SPEC.md for why each.
