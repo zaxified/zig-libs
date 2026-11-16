@@ -263,7 +263,66 @@ pub fn framaLookback(p: FramaParams) Error!usize {
     return FramaCore.lookback(p);
 }
 pub fn frama(comptime T: type, high: []const T, low: []const T, out: []T, p: FramaParams) Error!usize {
+    if (T == f64 and p.nan != .skip) {
+        try FramaCore.validate(p);
+        try core.checkLen(high.len, &.{ low.len, out.len });
+        framaRun(high, low, out, p);
+        return FramaCore.lookback(p);
+    }
     return hist.batch(T, FramaCore, .{ high, low }, .{out}, p, &.{});
+}
+
+/// The f64 batch of `FramaCore.step`, bitwise. The core's older half-window extremes (`hi2`, `lo2`) are the same
+/// automaton as the newer ones fed the same bars `half` bars later, so here all four run as `ExtCore.Run` over the
+/// slices, the older pair at bar `n - half`; the state stays in registers, and the extremes of the whole window
+/// are one two-lane vector select ({highest, -lowest}; negation is exact) instead of two ternaries LLVM turns into
+/// branches.
+fn framaRun(high: []const f64, low: []const f64, out: []f64, p: FramaParams) void {
+    const n = high.len;
+    const per = p.period;
+    const half = per / 2;
+    const lb = FramaCore.lookback(p);
+    const V = @Vector(2, f64);
+    var h1 = MaxCore.Run{ .p = half, .idx1 = 0, .val = 0.0 };
+    var l1 = MinCore.Run{ .p = half, .idx1 = 0, .val = 0.0 };
+    var h2 = MaxCore.Run{ .p = half, .idx1 = 0, .val = 0.0 };
+    var l2 = MinCore.Run{ .p = half, .idx1 = 0, .val = 0.0 };
+    var prev: f64 = 0.0;
+    const warm = @min(n, per);
+    for (0..warm) |i| {
+        // The automatons answer from their window's last bar on; every bar after that must be stepped.
+        if (i + 1 >= half) {
+            _ = h1.bar(f64, high, i);
+            _ = l1.bar(f64, low, i);
+        }
+        if (i + 1 >= per) {
+            _ = h2.bar(f64, high, i - half);
+            _ = l2.bar(f64, low, i - half);
+            prev = (high[i] + low[i]) / 2.0;
+        }
+        out[i] = std.math.nan(f64);
+    }
+    var i = warm;
+    while (i < n) : (i += 1) {
+        const hi1 = h1.bar(f64, high, i);
+        const lo1 = l1.bar(f64, low, i);
+        const hi2 = h2.bar(f64, high, i - half);
+        const lo2 = l2.bar(f64, low, i - half);
+        const price = (high[i] + low[i]) / 2.0;
+        const r1 = hi1 - lo1;
+        const r2 = hi2 - lo2;
+        const e1: V = .{ hi1, -lo1 };
+        const e2: V = .{ hi2, -lo2 };
+        const e = @select(f64, e1 > e2, e1, e2);
+        const r = e[0] - (-e[1]);
+        if (r1 > 0.0 and r2 > 0.0 and r1 + r2 > r) {
+            const alpha = @exp(frama_scale * @log((r1 + r2) / r));
+            prev = @mulAdd(f64, 1.0 - alpha, prev, alpha * price);
+        } else {
+            prev = price;
+        }
+        out[i] = if (i >= lb) prev else std.math.nan(f64);
+    }
 }
 pub fn FramaStream(comptime T: type) type {
     return hist.Stream(T, FramaParams, FramaCore);
