@@ -852,7 +852,9 @@ fn manifestDecodes(gpa: Allocator, store: Storage, h: Storage.Handle) (Storage.E
     if (crc32c(body) != std.mem.readInt(u32, buf[buf.len - man_crc_len ..][0..4], .little)) return false;
     if (!std.mem.eql(u8, buf[0..4], man_magic)) return false;
     const version = std.mem.readInt(u32, buf[4..8], .little);
-    if (version != format_version) return version == legacy_version;
+    // Any other version with a good CRC is a manifest this build cannot read, not a damaged one: refuse
+    // to overwrite it (a newer writer's pending drops and fields would be lost), as `open` refuses it.
+    if (version != format_version) return true;
     const nl = std.mem.readInt(u32, buf[8..12], .little);
     const np = std.mem.readInt(u32, buf[12..16], .little);
     if (@as(u64, nl) + np > max_manifest_ids) return false;
@@ -1045,7 +1047,8 @@ pub const SeekError = IterError || error{OutOfMemory};
 
 pub const GetError = SeekError || error{
     /// The log has no record with that LSN: it is not written yet, or
-    /// compaction dropped it, or the LSN is 0.
+    /// compaction dropped it. (LSN 0 and an LSN retention dropped answer as
+    /// `seek` does: the first record, or `SegmentGone` once a drop happened.)
     NotFound,
     /// The record's payload is longer than the caller's buffer.
     BufferTooSmall,
@@ -1367,6 +1370,9 @@ pub const RotateError = Storage.Error || error{
     ReadOnly,
     /// Segment ids only grow, and a sealed segment never reopens.
     NonMonotonic,
+    /// The log has used every LSN (2^62): a new segment would start at an
+    /// LSN no manifest can hold. Nothing was written.
+    LsnExhausted,
     /// A file already sits under the name this id would rotate to, and it is
     /// not empty. Only reachable on a manifest `open` just (re)created empty
     /// (L1): a normal manifest never lets an already-used id reach `rotate`
@@ -1912,35 +1918,33 @@ pub const Log = struct {
         return self.appendBatch(Batch{ .ts = ts, .payloads = payloads });
     }
 
-    /// `appendMany` with each record's own timestamp: an import of records
-    /// that already have one, batched into one write and one `fsync`.
     /// The lowest LSN `seek` accepts: the first LSN of the oldest live
     /// segment (a compacted segment may have lost its first records; `seek`
-    /// then lands on the first one left). Null when the log holds no record.
-    /// Of a writer only, like `nextLsn`: a log opened read-only has no append
-    /// state and answers null.
+    /// then lands on the first one left). Null when the log holds no record,
+    /// and on a log opened read-only, which has no append state (use `seek`).
     pub fn firstLsn(self: *const Log) ?u64 {
-        if (self.isEmpty()) return null;
+        if (self.isEmpty() orelse true) return null;
         return self.live_lsn.items[0];
     }
 
-    /// The LSN of the last record appended, null when the log holds none.
-    /// Not necessarily durable (`durableLsn`). Of a writer only.
+    /// The LSN of the last record appended, null when the log holds none and
+    /// on a log opened read-only. Not necessarily durable (`durableLsn`).
     pub fn lastLsn(self: *const Log) ?u64 {
-        if (self.isEmpty()) return null;
+        if (self.isEmpty() orelse true) return null;
         return self.next_lsn - 1;
     }
 
-    /// Whether the log holds no record. Of a writer only: a log opened
-    /// read-only has no append state and says `true`; use `seek` there.
-    pub fn isEmpty(self: *const Log) bool {
+    /// Whether the log holds no record; null on a log opened read-only, which
+    /// has no append state to tell (use `seek` there).
+    pub fn isEmpty(self: *const Log) ?bool {
+        if (self.read_only) return null;
         if (self.live_lsn.items.len == 0) return true;
         return self.next_lsn <= self.live_lsn.items[0];
     }
 
     /// Record `lsn`'s payload, copied into `buf`: one `seek` and one read.
     /// Returns the filled part of `buf`. `error.NotFound` when there is no
-    /// such record (LSN 0, not written yet, dropped by compaction),
+    /// such record (not written yet, dropped by compaction),
     /// `error.SegmentGone` when retention took it, `error.BufferTooSmall`
     /// when the payload does not fit. For many records in a row, `iterator`
     /// from a `seek` is the way: this opens the segment each time.
@@ -1972,6 +1976,8 @@ pub const Log = struct {
         return self.dropBefore(self.live.items[k]);
     }
 
+    /// `appendMany` with each record's own timestamp: an import of records
+    /// that already have one, batched into one write and one `fsync`.
     pub fn appendEntries(self: *Log, entries: []const Entry) AppendError!Appended {
         const Batch = struct {
             entries: []const Entry,
@@ -2109,6 +2115,7 @@ pub const Log = struct {
     pub fn rotate(self: *Log, id: u64) RotateError!void {
         if (self.read_only) return error.ReadOnly;
         if (self.poisoned) return error.Poisoned;
+        if (self.next_lsn > max_lsn) return error.LsnExhausted;
         if (self.newest()) |last| {
             if (id < last) return error.NonMonotonic;
             if (id == last) {
@@ -3779,7 +3786,7 @@ pub const Concurrent = struct {
         return c.log.lastLsn();
     }
 
-    pub fn isEmpty(c: *Concurrent) bool {
+    pub fn isEmpty(c: *Concurrent) ?bool {
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
         return c.log.isEmpty();
@@ -8783,6 +8790,27 @@ test "F2: rebuildManifest replaces a MANIFEST that does not decode, and refuses 
     defer testing.allocator.free(before);
     try testing.expectError(error.ManifestPresent, Log.rebuildManifest(testing.allocator, st, &.{ 1, 2 }));
     try testing.expectEqualSlices(u8, before, sim.fileContent(manifest_name).?);
+    // So is one of a format version this build does not know, CRC intact: a newer writer's, not damage.
+    {
+        const m = sim.fileContent(manifest_name).?;
+        std.mem.writeInt(u32, m[4..8], format_version + 7, .little);
+        std.mem.writeInt(u32, m[m.len - man_crc_len ..][0..4], crc32c(m[0 .. m.len - man_crc_len]), .little);
+    }
+    const newer = try testing.allocator.dupe(u8, sim.fileContent(manifest_name).?);
+    defer testing.allocator.free(newer);
+    try testing.expectError(error.ManifestPresent, Log.rebuildManifest(testing.allocator, st, &.{ 1, 2 }));
+    try testing.expectEqualSlices(u8, newer, sim.fileContent(manifest_name).?);
+}
+
+test "isEmpty / firstLsn / lastLsn answer null on a log opened read-only" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try rebuildFixture(&sim);
+    var ro = try Log.openReadOnly(testing.allocator, sim.storage(), .{});
+    defer ro.close();
+    try testing.expect(ro.isEmpty() == null);
+    try testing.expect(ro.firstLsn() == null);
+    try testing.expect(ro.lastLsn() == null);
 }
 
 /// A `Storage` over a `SimStorage` that can make a second kind of fault than
@@ -8994,6 +9022,8 @@ test "F6: an append that would pass LSN 2^62 is refused whole, and the log reope
         try testing.expectError(error.LsnExhausted, log.append("c"));
         try testing.expectError(error.LsnExhausted, log.appendMany(&.{"c"}));
         try testing.expectEqual(max_lsn + 1, log.nextLsn());
+        // A rotate would open a segment at an LSN no manifest can hold: refused too.
+        try testing.expectError(error.LsnExhausted, log.rotate(2));
         try testing.expect(!log.isPoisoned());
         try expectPayloads(&log, null, &.{ "a", "b" });
     }
@@ -9024,14 +9054,14 @@ test "G1: firstLsn, lastLsn and isEmpty follow the log through appends and drops
     defer sim.deinit();
     var log = try openSim(&sim);
     defer log.close();
-    try testing.expect(log.isEmpty());
+    try testing.expect(log.isEmpty().?);
     try testing.expectEqual(@as(?u64, null), log.firstLsn());
     try testing.expectEqual(@as(?u64, null), log.lastLsn());
     try log.rotate(1);
-    try testing.expect(log.isEmpty()); // a segment with no record is still no record
+    try testing.expect(log.isEmpty().?); // a segment with no record is still no record
     try testing.expectEqual(@as(?u64, null), log.lastLsn());
     _ = try log.append("p1");
-    try testing.expect(!log.isEmpty());
+    try testing.expect(!log.isEmpty().?);
     try testing.expectEqual(@as(?u64, 1), log.firstLsn());
     try testing.expectEqual(@as(?u64, 1), log.lastLsn());
     try log.rotate(2);
@@ -9046,7 +9076,7 @@ test "G1: firstLsn, lastLsn and isEmpty follow the log through appends and drops
     log = try openSim(&sim);
     try testing.expectEqual(@as(?u64, 2), log.firstLsn());
     try testing.expectEqual(@as(?u64, 3), log.lastLsn());
-    try testing.expect(!log.isEmpty());
+    try testing.expect(!log.isEmpty().?);
 }
 
 test "G1: get returns one record's payload, and says why when it cannot" {
@@ -9121,10 +9151,10 @@ test "G2: Concurrent passes through what Log answers, under the lock" {
     defer sim.deinit();
     var c = try Concurrent.open(testing.allocator, sim.storage(), testing.io, .{ .create = true });
     defer c.close();
-    try testing.expect(c.isEmpty());
+    try testing.expect(c.isEmpty().?);
     try testing.expectEqual(@as(?u64, null), c.firstLsn());
     try threeSegments(&c);
-    try testing.expect(!c.isEmpty());
+    try testing.expect(!c.isEmpty().?);
     try testing.expectEqual(@as(?u64, 1), c.firstLsn());
     try testing.expectEqual(@as(?u64, 7), c.lastLsn());
     try testing.expect(!c.isPoisoned());
