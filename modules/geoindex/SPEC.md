@@ -148,14 +148,14 @@ Each 39-byte record:
   scale.
 - **Ranges:** `lat ∈ [-90, 90]`, `lon ∈ [-180, 180]`, inclusive. Rejected at
   build with `error.OutOfRange`; NaN/inf with `error.NotFinite`.
-- **Antimeridian (v1 restriction).** The bbox query treats the rectangle as a
-  simple `min ≤ coord ≤ max` interval on each axis, so it **cannot express a
-  rectangle that wraps across ±180°**. A caller needing a ±180-spanning window
-  splits it into two queries (`[…, 180]` and `[-180, …]`) and unions the results.
-  The kNN metric likewise measures raw longitude difference, so a query point and
-  a candidate on opposite sides of the antimeridian are treated as far apart even
-  if geographically near. Both are documented limitations, not silent wrong
-  answers. Full antimeridian handling is deferred.
+- **Antimeridian.** `bbox` with `min_lon > max_lon` is a rectangle wrapping across
+  ±180° and is answered as `[min_lon, 180] ∪ [-180, max_lon]` (two disjoint
+  passes: no duplicates; shared output buffer, visit budget and filter; status of
+  the first truncating pass). Behaviour change 2026-11-16: it used to match
+  nothing. `within` and the kNN metric take no rectangle and still measure raw
+  longitude difference, so a query point and a candidate on opposite sides of the
+  antimeridian are treated as far apart even if geographically near — a documented
+  limitation, not a silent wrong answer; wrap-aware distance stays deferred.
 - **Hilbert grid.** Points are mapped into a 65536×65536 grid spanning the data's
   overall bounding box for the Hilbert sort. A zero-width axis (all points share
   a latitude/longitude) collapses to grid column/row 0 — no divide-by-zero. The
@@ -272,8 +272,8 @@ authenticity matters.
 ## Deliberately deferred
 
 - **Great-circle / haversine kNN** with a spherical box lower-bound (see above).
-- **Full antimeridian handling** — a ±180-wrapping bbox and a wrap-aware kNN
-  metric; today the caller splits such queries.
+- **Wrap-aware kNN/`within` metric** — the ±180-wrapping `bbox` is done (2026-11-16);
+  distance queries still use raw longitude difference.
 - **STR (Sort-Tile-Recursive) bulk-load** — tiles the plane before the Hilbert
   pass for slightly tighter leaf boxes; the current single-axis Hilbert order is
   simpler and already gives good locality.
@@ -301,5 +301,5 @@ authenticity matters.
 - (survey 2026-09-30) ✅ DONE 2026-11-16 (`Frozen.within(lat, lon, radius, out, opts)`: planar-in-ranking-metric radius, degrees, NOT metres/great-circle since the module has none; results carry `dist2`, unordered; status as bbox) **Radius / max-distance query** — `kdbush.within`, geoflatbush `maxDistance`; "everything within 500 m" is the most common geo lookup and kNN with a guessed `k` is a poor substitute. Effort: small (best-first walk with a distance cap). Fits CONVENTIONS §2.
 - (survey 2026-09-30) **Great-circle (haversine) kNN and results in metres** — `Neighbor.dist2` is an unscaled proxy that degrades away from the query latitude and near the poles; geoflatbush returns km. Effort: medium (spherical box lower bound, already listed under *Deliberately deferred*). Fits §2.
 - (survey 2026-09-30) **Rectangle items (extents)** — Flatbush indexes boxes as its main case (footprints, tiles); this index holds points. Effort: medium-large (format change: leaf boxes). Fits §2.
-- (survey 2026-09-30) **Antimeridian-wrapping bbox** — a query crossing ±180 must be split by the caller. Effort: small (split inside `bbox`). Fits §2 (already listed above).
+- (survey 2026-09-30) **Antimeridian-wrapping bbox** ✅ DONE 2026-11-16 (`bbox` splits `min_lon > max_lon` into two passes; `within`/kNN stay raw-longitude by design) — a query crossing ±180 must be split by the caller. Effort: small (split inside `bbox`). Fits §2 (already listed above).
 - (survey 2026-09-30) ✅ DONE 2026-11-16 (`QueryOptions.filter: ?Filter{ctx, func(ctx, Match) bool}` applied in bbox, within and knn; knn still returns k passing items) **Filter callback / predicate on kNN and bbox** — geoflatbush `filterFn`; the caller currently over-fetches. Effort: small. Fits §2.

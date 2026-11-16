@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **BEHAVIOUR CHANGE:** `Frozen.bbox` with `min_lon > max_lon` now answers the antimeridian-wrapping rectangle (`[min_lon, 180] ∪ [-180, max_lon]`, two disjoint passes: no duplicates, shared output buffer, visit budget and filter, capacity/budget statuses preserved); it used to match nothing. Non-wrapping queries are unchanged. `within`/kNN stay raw-longitude (they take no rectangle). Tests against a brute-force scan incl. lon = ±180 exactly.
 - **2026-11-16** — **New:** `Frozen.within(lat, lon, radius, out, opts)` radius query (kdbush `within`; radius in the kNN equirectangular ranking metric, degrees, not metres) and `QueryOptions.filter` (`Filter{ctx, func}` predicate applied during `bbox`/`within`/`knn`, so kNN still returns k passing points). Additive; tests against a brute-force scan.
 
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).

@@ -20,8 +20,8 @@
 //! rationale (vs a Z-order array or a grid).
 //!
 //! Coordinates: `lat` in [-90, 90], `lon` in [-180, 180] degrees; out-of-range
-//! and non-finite inputs are rejected at build time. A query rectangle must not
-//! cross the antimeridian in v1 (documented in SPEC.md). Coordinates are stored
+//! and non-finite inputs are rejected at build time. A `bbox` with
+//! `min_lon > max_lon` wraps across the antimeridian; `within`/kNN do not. Coordinates are stored
 //! as f64 and returned byte-identical — no quantization.
 
 const std = @import("std");

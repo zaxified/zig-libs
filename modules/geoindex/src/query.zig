@@ -123,12 +123,18 @@ pub const Frozen = struct {
     // Edge contract: the rectangle is CLOSED — a point exactly on an edge or
     // corner (lat == min_lat/max_lat, or lon == min_lon/max_lon) is INCLUDED.
     // A zero-area rectangle (min == max on both axes) is a valid point query.
-    // The caller must pass min <= max on each axis (an inverted rectangle simply
-    // matches nothing); the rectangle must not cross the antimeridian in v1
-    // (see SPEC.md).
+    // An inverted LATITUDE range (min_lat > max_lat) matches nothing.
+    //
+    // Antimeridian: `min_lon > max_lon` means the rectangle wraps across ±180°
+    // and is answered as the union of `[min_lon, 180]` and `[-180, max_lon]`
+    // (two disjoint passes, so no point is reported twice). Both passes share
+    // `out`, the visit budget (`max_visited` counts both) and the filter; the
+    // status is that of the first pass that truncated. Before 2026-11-16 such a
+    // rectangle silently matched nothing. NaN bounds still match nothing.
 
     /// All indexed points inside the closed rectangle
-    /// `[min_lat,max_lat] × [min_lon,max_lon]`, written into `out`. No
+    /// `[min_lat,max_lat] × [min_lon,max_lon]` (or, if `min_lon > max_lon`, the
+    /// antimeridian-wrapping one, see above), written into `out`. No
     /// allocation. Returns the filled prefix of `out` and a status distinguishing
     /// a complete answer from one truncated by buffer capacity or the visit
     /// budget.
@@ -144,13 +150,39 @@ pub const Frozen = struct {
         if (self.header.item_count == 0 or out.len == 0)
             return .{ .items = out[0..0], .status = if (out.len == 0 and self.header.item_count != 0) .truncated_capacity else .complete };
 
+        var visited: usize = 0;
+        if (!(min_lon > max_lon)) {
+            const r = try self.bboxPass(min_lat, max_lat, min_lon, max_lon, out, opts, &visited);
+            return r;
+        }
+        // Wrapping rectangle: east part, then west part into the rest of `out`.
+        const east = try self.bboxPass(min_lat, max_lat, min_lon, 180, out, opts, &visited);
+        if (east.status != .complete) return east;
+        const n1 = east.items.len;
+        const west = try self.bboxPass(min_lat, max_lat, -180, max_lon, out[n1..], opts, &visited);
+        return .{ .items = out[0 .. n1 + west.items.len], .status = west.status };
+    }
+
+    /// One non-wrapping pass; `visited` accumulates across passes so the budget
+    /// is shared. `out` may be empty (a match then reports `truncated_capacity`).
+    fn bboxPass(
+        self: Frozen,
+        min_lat: f64,
+        max_lat: f64,
+        min_lon: f64,
+        max_lon: f64,
+        out: []Match,
+        opts: QueryOptions,
+        visited_total: *usize,
+    ) QueryError!BboxResult {
         var stack: [max_stack]u32 = undefined;
         var sp: usize = 0;
         stack[sp] = self.header.root_index;
         sp += 1;
 
         var n_out: usize = 0;
-        var visited: usize = 0;
+        var visited: usize = visited_total.*;
+        defer visited_total.* = visited;
 
         while (sp > 0) {
             sp -= 1;
@@ -501,6 +533,103 @@ test "bbox: closed rectangle includes edge and corner points" {
     var mask: u8 = 0;
     for (r.items) |m| mask |= @as(u8, 1) << @intCast(m.value - 1);
     try testing.expectEqual(@as(u8, 0b0111), mask); // values 1,2,3
+}
+
+fn wrapOracle(pts: []const builder.Point, min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64, hit: []bool) usize {
+    var n: usize = 0;
+    for (pts, 0..) |p, i| {
+        const lat_ok = p.lat >= min_lat and p.lat <= max_lat;
+        const lon_ok = if (min_lon > max_lon) (p.lon >= min_lon or p.lon <= max_lon) else (p.lon >= min_lon and p.lon <= max_lon);
+        hit[i] = lat_ok and lon_ok;
+        if (hit[i]) n += 1;
+    }
+    return n;
+}
+
+test "bbox: antimeridian-wrapping rectangle equals a brute-force scan (incl. lon = +-180 exactly)" {
+    var prng = std.Random.DefaultPrng.init(0x180);
+    const rnd = prng.random();
+    var pts: [400]builder.Point = undefined;
+    for (&pts, 0..) |*p, i| {
+        // Quantised longitudes so that +-180 and the query edges are hit exactly.
+        const lon_q: i32 = rnd.intRangeAtMost(i32, -36, 36);
+        p.* = .{ .lat = @floatFromInt(rnd.intRangeAtMost(i32, -9, 9) * 10), .lon = @as(f64, @floatFromInt(lon_q)) * 5, .value = @intCast(i) };
+    }
+    pts[0].lon = 180;
+    pts[1].lon = -180;
+    const buf = try build(&pts);
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    var out: [400]Match = undefined;
+    var hit: [400]bool = undefined;
+    const lons = [_][2]f64{ .{ 170, -170 }, .{ 180, -180 }, .{ 180, 180 }, .{ -180, 180 }, .{ 175, 175 }, .{ 100, -100 }, .{ 0, -5 }, .{ -180, -180 }, .{ 90, 80 } };
+    for (lons) |lr| {
+        for ([_][2]f64{ .{ -90, 90 }, .{ -30, 30 }, .{ 20, 20 }, .{ 40, -40 } }) |la| {
+            const want = wrapOracle(&pts, la[0], la[1], lr[0], lr[1], &hit);
+            const r = try f.bbox(la[0], la[1], lr[0], lr[1], &out, .{});
+            try testing.expectEqual(BboxStatus.complete, r.status);
+            try testing.expectEqual(want, r.items.len);
+            var seen: [400]bool = @splat(false);
+            for (r.items) |m| {
+                try testing.expect(hit[m.value]); // matches the oracle
+                try testing.expect(!seen[m.value]); // no duplicate
+                seen[m.value] = true;
+            }
+        }
+    }
+    // The two extremes are reported by a wrapping query that spans them.
+    const r = try f.bbox(-90, 90, 179, -179, &out, .{});
+    var got180 = false;
+    var got_m180 = false;
+    for (r.items) |m| {
+        if (m.value == 0) got180 = true;
+        if (m.value == 1) got_m180 = true;
+    }
+    try testing.expect(got180 and got_m180);
+}
+
+test "bbox: wrapping rectangle shares capacity, budget and filter across both halves" {
+    const buf = try build(&.{
+        .{ .lat = 0, .lon = 179, .value = 1 }, // east half
+        .{ .lat = 0, .lon = -179, .value = 2 }, // west half
+        .{ .lat = 0, .lon = 0, .value = 3 }, // outside the wrap
+        .{ .lat = 0, .lon = 178, .value = 4 }, // east half
+    });
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    var out: [8]Match = undefined;
+    const all = try f.bbox(-1, 1, 170, -170, &out, .{});
+    try testing.expectEqual(BboxStatus.complete, all.status);
+    try testing.expectEqual(@as(usize, 3), all.items.len);
+    // Capacity: 3 matches across both halves into 2 slots.
+    const cap = try f.bbox(-1, 1, 170, -170, out[0..2], .{});
+    try testing.expectEqual(BboxStatus.truncated_capacity, cap.status);
+    try testing.expectEqual(@as(usize, 2), cap.items.len);
+    // Exactly full, nothing left over: complete (3 slots, 3 matches).
+    const exact = try f.bbox(-1, 1, 170, -170, out[0..3], .{});
+    try testing.expectEqual(BboxStatus.complete, exact.status);
+    try testing.expectEqual(@as(usize, 3), exact.items.len);
+    // Only the west half matches, into one slot: fine.
+    const west = try f.bbox(-1, 1, 179.5, -170, out[0..1], .{});
+    try testing.expectEqual(BboxStatus.complete, west.status);
+    try testing.expectEqual(@as(u32, 2), west.items[0].value);
+    // Budget is shared: a single visit cannot finish even one pass.
+    const bud = try f.bbox(-1, 1, 170, -170, &out, .{ .max_visited = 1 });
+    try testing.expectEqual(BboxStatus.truncated_budget, bud.status);
+    // ... and a generous budget over a tiny index completes.
+    try testing.expectEqual(BboxStatus.complete, (try f.bbox(-1, 1, 170, -170, &out, .{ .max_visited = 1000 })).status);
+    // Filter applies to both halves.
+    const F = struct {
+        fn evenOnly(_: ?*anyopaque, m: Match) bool {
+            return m.value % 2 == 0;
+        }
+    };
+    const fl = try f.bbox(-1, 1, 170, -170, &out, .{ .filter = .{ .func = F.evenOnly } });
+    try testing.expectEqual(BboxStatus.complete, fl.status);
+    try testing.expectEqual(@as(usize, 2), fl.items.len); // values 2 and 4
+    // NaN and inverted latitude still match nothing.
+    try testing.expectEqual(@as(usize, 0), (try f.bbox(1, -1, 170, -170, &out, .{})).items.len);
+    try testing.expectEqual(@as(usize, 0), (try f.bbox(-1, 1, std.math.nan(f64), -170, &out, .{})).items.len);
 }
 
 test "bbox: zero-area rectangle is a point query" {
