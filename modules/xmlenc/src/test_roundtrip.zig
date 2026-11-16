@@ -19,6 +19,8 @@ const testing = std.testing;
 const aes = std.crypto.core.aes;
 const Sha1 = std.crypto.hash.Sha1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha384 = std.crypto.hash.sha2.Sha384;
+const Sha512 = std.crypto.hash.sha2.Sha512;
 const Aes256Gcm = @import("aesgcm").Aes256Gcm;
 const Aes128Gcm = @import("aesgcm").Aes128Gcm;
 const Aes192 = @import("aes192").Aes192;
@@ -295,10 +297,8 @@ test "teeth: xenc11 rsa-oaep with a genuinely unrecognized MGF algorithm -> Unsu
     defer a.free(cek_b64);
     const content_b64 = try b64(a, content);
     defer a.free(content_b64);
-    // A real xenc11 MGF Algorithm URI is required to be mgf1sha1/mgf1sha256/
-    // mgf1sha384/mgf1sha512; this module only implements mgf1sha1/mgf1sha256
-    // (sha384/512 would need new comptime hash arms), so an unrecognized MGF
-    // URI must still be refused, confirming the allow-list gate still works.
+    // An MGF URI outside mgf1sha1/256/384/512 must still be refused,
+    // confirming the allow-list gate still works.
     const doc_src = try a.print(
         \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}" xmlns:x11="{s}">
         \\  <xenc:EncryptionMethod Algorithm="{s}aes256-gcm"/>
@@ -306,7 +306,7 @@ test "teeth: xenc11 rsa-oaep with a genuinely unrecognized MGF algorithm -> Unsu
         \\    <xenc:EncryptedKey>
         \\      <xenc:EncryptionMethod Algorithm="{s}">
         \\        <ds:DigestMethod Algorithm="{s}sha256"/>
-        \\        <x11:MGF Algorithm="{s}mgf1sha512"/>
+        \\        <x11:MGF Algorithm="{s}mgf1sha999"/>
         \\      </xenc:EncryptionMethod>
         \\      <xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>
         \\    </xenc:EncryptedKey>
@@ -911,12 +911,16 @@ const fuzz_key_algs = [_][]const u8{
 const fuzz_digest_algs = [_][]const u8{
     ds_ns ++ "sha1",
     xenc_ns ++ "sha256",
+    "http://www.w3.org/2001/04/xmldsig-more#sha384",
+    xenc_ns ++ "sha512",
     "urn:not-a-digest",
 };
 
 const fuzz_mgf_algs = [_][]const u8{
     xenc11_ns ++ "mgf1sha1",
     xenc11_ns ++ "mgf1sha256",
+    xenc11_ns ++ "mgf1sha384",
+    xenc11_ns ++ "mgf1sha512",
     "urn:not-an-mgf",
 };
 
@@ -1620,4 +1624,84 @@ test "decryptDataToDocument: the returned document does not point into freed mem
     defer inner.deinit(a);
     try testing.expectEqualStrings("root-with-a-name", inner.doc.root.local);
     try testing.expectEqualStrings(big.items, inner.doc.source);
+}
+
+// OAEP with SHA-384/512 digest and MGF1-SHA384/512 (all 16 digest x MGF
+// pairings). No external vector: keys and ciphertexts are generated in-test
+// through `rsa.encryptOaepH`.
+fn oaepDoc(a: std.mem.Allocator, digest_uri: []const u8, mgf_uri: []const u8, cek_b64: []const u8, content_b64: []const u8) ![]u8 {
+    return a.print(
+        \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}" xmlns:x11="{s}">
+        \\  <xenc:EncryptionMethod Algorithm="{s}aes256-gcm"/>
+        \\  <ds:KeyInfo>
+        \\    <xenc:EncryptedKey>
+        \\      <xenc:EncryptionMethod Algorithm="{s}rsa-oaep">
+        \\        <ds:DigestMethod Algorithm="{s}"/>
+        \\        <x11:MGF Algorithm="{s}"/>
+        \\      </xenc:EncryptionMethod>
+        \\      <xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>
+        \\    </xenc:EncryptedKey>
+        \\  </ds:KeyInfo>
+        \\  <xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>
+        \\</xenc:EncryptedData>
+    , .{ xenc_ns, ds_ns, xenc11_ns, xenc_ns, xenc11_ns, digest_uri, mgf_uri, cek_b64, content_b64 });
+}
+
+test "round-trip: xenc11 rsa-oaep, every SHA-1/256/384/512 digest x MGF1 pairing" {
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x384_512);
+    var kp: rsa.KeyPair = undefined;
+    // 2048 bits: OAEP-SHA-512 needs k >= 2*64+2 (a 1024-bit key is refused, see below).
+    try rsa.generate(&kp, prng.random(), 2048, 65537);
+    const cek = @as([32]u8, @splat(0x77));
+    const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
+    defer a.free(content);
+    const content_b64 = try b64(a, content);
+    defer a.free(content_b64);
+
+    const digest_uris = [_][]const u8{ ds_ns ++ "sha1", xenc_ns ++ "sha256", "http://www.w3.org/2001/04/xmldsig-more#sha384", xenc_ns ++ "sha512" };
+    const mgf_uris = [_][]const u8{ xenc11_ns ++ "mgf1sha1", xenc11_ns ++ "mgf1sha256", xenc11_ns ++ "mgf1sha384", xenc11_ns ++ "mgf1sha512" };
+    const types = .{ Sha1, Sha256, Sha384, Sha512 };
+    var wrap_buf: [256]u8 = undefined;
+    inline for (types, 0..) |D, di| {
+        inline for (types, 0..) |M, mi| {
+            const wrapped = try rsa.encryptOaepH(kp.public_key, D, M, prng.random(), &cek, "", wrap_buf[0..256]);
+            const cek_b64 = try b64(a, wrapped);
+            defer a.free(cek_b64);
+            const doc_src = try oaepDoc(a, digest_uris[di], mgf_uris[mi], cek_b64, content_b64);
+            defer a.free(doc_src);
+            var doc = try xml.parse(a, doc_src, .{});
+            defer doc.deinit();
+            const out = try xmlenc.decryptData(a, doc.root, &kp.secret_key, .{});
+            defer a.free(out);
+            try std.testing.expectEqualStrings(plaintext_assertion, out);
+
+            // Teeth: a wrapped key made for a different (digest, MGF) pairing
+            // must not decrypt under this document's declaration.
+            const other_d = (di + 1) % 4;
+            const doc2 = try oaepDoc(a, digest_uris[other_d], mgf_uris[mi], cek_b64, content_b64);
+            defer a.free(doc2);
+            var d2 = try xml.parse(a, doc2, .{});
+            defer d2.deinit();
+            try std.testing.expectError(error.DecryptionError, xmlenc.decryptData(a, d2.root, &kp.secret_key, .{}));
+        }
+    }
+}
+
+test "teeth: OAEP-SHA-512 on a 1024-bit key (k < 2*hLen+2) -> DecryptionError, no panic" {
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const cek = @as([32]u8, @splat(0x78));
+    const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
+    defer a.free(content);
+    const content_b64 = try b64(a, content);
+    defer a.free(content_b64);
+    // Any 128-byte block: the size precondition fires before the RSA operation.
+    const cek_b64 = try b64(a, &@as([128]u8, @splat(1)));
+    defer a.free(cek_b64);
+    const doc_src = try oaepDoc(a, xenc_ns ++ "sha512", xenc11_ns ++ "mgf1sha512", cek_b64, content_b64);
+    defer a.free(doc_src);
+    var doc = try xml.parse(a, doc_src, .{});
+    defer doc.deinit();
+    try std.testing.expectError(error.DecryptionError, xmlenc.decryptData(a, doc.root, &kp.secret_key, .{}));
 }

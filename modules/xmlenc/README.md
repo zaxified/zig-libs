@@ -17,7 +17,7 @@ specifications. No third-party XML-Enc implementation was consulted, so no
 
 ## Supported algorithms
 
-- **Key transport:** `rsa-oaep-mgf1p` (SHA-1), xenc11 `rsa-oaep` (SHA-1/SHA-256,
+- **Key transport:** `rsa-oaep-mgf1p` (SHA-1), xenc11 `rsa-oaep` (SHA-1/256/384/512,
   DigestMethod and MGF resolved INDEPENDENTLY, MGF defaulting to MGF1-SHA1
   when the element is absent whatever the digest is), and — gated behind `allow_weak_rsa15` —
   `rsa-1_5`. Optional `kw-aes128`/`kw-aes192`/`kw-aes256` symmetric key wrap (RFC 3394) when
