@@ -51,6 +51,12 @@ try engine.assignRole("alice", "viewer");   // error.ConflictingRole on an SoD v
 const decision = engine.check("alice", "read", "doc"); // -> Decision
 if (decision.isPermit()) { ... }
 
+// Opt-in pattern permissions (Casbin keyMatch style): `*` matches any run of bytes, `/` included.
+//   var pe = rbac.Engine.initWithMatch(allocator, .key_match);
+//   try pe.addPermission("api", .{ .action = "read:*", .resource = "/api/*" });
+// `rbac.keyMatch(pattern, text)` is the matcher (linear-ish, no exponential backtracking).
+// The default `init` stays exact-string: `*` is then an ordinary byte.
+
 // Revoke / remove (NIST DeassignUser / RevokePermission / DeleteRole). Absent relation ->
 // `false` (no-op); unknown role -> error.UnknownRole. Removal frees memory (no tombstones).
 _ = try engine.unassignRole("alice", "viewer");                          // error{UnknownRole}!bool
