@@ -125,4 +125,4 @@ carried; no new test, 0 equivalent.
 ## Open
 
 - An interop run against HAProxy `send-proxy-v2` / `send-proxy-v2-ssl` itself has not been done (the oracle above is a second implementation, go-proxyproto, not the specification's home).
-- No mutation run and no audit.
+- No independent review yet (the mutation audit of 2026-11-15 is recorded above; `Audit: review none` on the card).
