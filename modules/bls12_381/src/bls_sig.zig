@@ -167,13 +167,36 @@ pub fn keyGen(out: *SecretKey, ikm: []const u8, key_info: []const u8) BlsError!v
         return error.IkmTooShort;
     }
     std.debug.assert(key_info.len <= 254);
-    burn.run(burn.keygen_burn, void, keyGenBody, .{ out, ikm, key_info });
+    burn.run(burn.keygen_burn, void, keyGenBody, .{ out, ikm, key_info, false });
 }
 
-fn keyGenBody(out: *SecretKey, ikm: []const u8, key_info: []const u8) void {
+/// The draft -04-compatible `KeyGen(IKM, key_info)`: blst's default
+/// `SecretKey::key_gen` and EIP-2333's `HKDF_mod_r`. The same loop as
+/// `keyGen` except that the salt is hashed BEFORE the first round too
+/// (`salt = H("BLS-SIG-KEYGEN-SALT-")`), so the same IKM gives a different
+/// key than `keyGen`. For porting keys made with blst's default or
+/// another -04 implementation. Same contract as `keyGen` (IKM >= 32 bytes,
+/// `key_info.len <= 254`, `out` zeroed on error, frames burned).
+///
+/// Anchored byte-exact to blst's `key_gen` (`blst_interop_test.zig`, the
+/// `sk` column of every case).
+pub fn keyGenV4(out: *SecretKey, ikm: []const u8, key_info: []const u8) BlsError!void {
+    if (ikm.len < 32) {
+        out.deinit();
+        return error.IkmTooShort;
+    }
+    std.debug.assert(key_info.len <= 254);
+    burn.run(burn.keygen_burn, void, keyGenBody, .{ out, ikm, key_info, true });
+}
+
+fn keyGenBody(out: *SecretKey, ikm: []const u8, key_info: []const u8, prehash_salt: bool) void {
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
     var salt_buf: [32]u8 = undefined;
     var salt: []const u8 = default_salt;
+    if (prehash_salt) {
+        std.crypto.hash.sha2.Sha256.hash(default_salt, &salt_buf, .{});
+        salt = &salt_buf;
+    }
 
     while (true) {
         var prk_state = Hkdf.extractInit(salt);

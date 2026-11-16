@@ -45,6 +45,11 @@ fn checkSuite(comptime S: type, comptime suite: v.Suite, comptime pop: bool) !vo
         try testing.expectEqual(try unhex(32, c.sk_v5), sk_bytes);
         var sk: bls_sig.SecretKey = undefined;
         try bls_sig.SecretKey.fromBytes(&sk, &try unhex(32, c.sk));
+        // draft -04-compatible KeyGen against blst's default key_gen.
+        var sk_v4: bls_sig.SecretKey = undefined;
+        try bls_sig.keyGenV4(&sk_v4, ikm, "");
+        sk_v4.toBytes(&sk_bytes);
+        try testing.expectEqual(try unhex(32, c.sk), sk_bytes);
 
         const pk = S.skToPk(&sk);
         try testing.expectEqual(try unhex(S.PublicKey.encoded_bytes, c.pk), pk.toBytes());

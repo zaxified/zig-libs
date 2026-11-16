@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — `bls_sig.keyGenV4(out, ikm, key_info)`: the draft -04-compatible KeyGen (salt hashed before the first
+  round), blst's default `key_gen` and EIP-2333's `HKDF_mod_r`; checked byte for byte against blst's `sk` vectors.
 - **2026-11-16** — `Fr.randomInto(out, io)`: a random scalar written into the caller's slot, the drawn bytes wiped, so a
   nonce or key is never returned by value through the caller's frame.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
