@@ -716,7 +716,7 @@ From the 2026-11-16 survey (`## Compared with`) and the independent review of th
 - Torn-tail evidence (review MED-2): `open` cuts every record after a mid-segment bad CRC in the newest segment, CRC-valid acknowledged ones included. Keep the cut bytes in a side file, or `Options.torn_tail = .cut | .keep_and_cut | .refuse`. A design decision (the Prometheus rule), not a defect, so it waits for the owner; kept as Prometheus's wlog does it; a side file is Backlog.
 - A context for `Options.now` / `monotonic_ns` (bare function pointers today; a clock that needs an `Io` needs a global). API change.
 - Non-Linux targets: `meta.targets` is `.linux64` because `Storage.allocate` / `syncData` are raw Linux syscalls in `kv`'s `FsStorage`; tidwall/wal and rosedb are portable. Belongs to `kv`.
-- A reader-side cache for the newest segment's index: a read-only `seek` / `seekTime` there re-walks the segment on every call (review LOW-7).
+- ✅ 2026-11-16 A reader-side cache for the newest segment's index (review LOW-7): a read-only `Log` keeps the index it rebuilt, keyed by (segment id, first LSN, the bytes it covers, the CRC of the last record walked), and a seek walks only the bytes appended since; refresh drops it when the newest segment changes, a shrunk or rewritten segment rebuilds it.
 
 **Deliberately not done** (the competition has it, the module does not want it): a consumer-offset / checkpoint store (Kafka `__consumer_offsets`, okaywal checkpoints: the caller saves the `Position`); many logs in one shared stream (raft-engine); a JSON log format (tidwall `LogFormat`); encryption at rest (none of the compared logs ships it).
 
@@ -731,4 +731,4 @@ From the 2026-11-16 survey (`## Compared with`) and the independent review of th
 - ✅ 2026-11-16 found while testing `get`: `seek` of an LSN that compaction removed from the end of a compacted segment returned `Corrupt` when the next segment starts above it; it now lands on that segment's first record.
 - ✅ 2026-11-16 LOW-6: `dropBefore` reserves the pending list and the manifest buffer before it changes the view, and `compress` the manifest buffer before its rename: an `OutOfMemory` leaves `segments()` as the disk has it, the log not poisoned, and a retry drops.
 - ✅ 2026-11-16 LOW-8: `Stats.compress_verify_failed` counts only `CompressVerifyFailed`, not an `OutOfMemory` or storage error out of the read-back.
-- Still open: LOW-7 (reader seek cache, above). LOW-10 closed 2026-11-16: the README backup warning (`OrphanSegment`, `rebuildManifest`), the manifest `form` 2, the directory's file list in the module doc, the `CompressError` doc comment and *Compression*'s note that `compact` verifies too.
+- ✅ 2026-11-16 LOW-7 (reader seek cache, above). LOW-10 closed 2026-11-16: the README backup warning (`OrphanSegment`, `rebuildManifest`), the manifest `form` 2, the directory's file list in the module doc, the `CompressError` doc comment and *Compression*'s note that `compact` verifies too.
