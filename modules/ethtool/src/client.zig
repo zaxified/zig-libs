@@ -53,6 +53,10 @@ const params = @import("params.zig");
 const features_mod = @import("features.zig");
 const stats_mod = @import("stats.zig");
 const moduleinfo = @import("moduleinfo.zig");
+const eee_fec = @import("eee_fec.zig");
+const wol_mod = @import("wol.zig");
+const privflags_mod = @import("privflags.zig");
+const tsinfo_mod = @import("tsinfo.zig");
 
 /// `NETLINK_ADD_MEMBERSHIP` / `NETLINK_DROP_MEMBERSHIP` (linux/netlink.h) —
 /// used by `EventSocket` below.
@@ -518,6 +522,110 @@ pub const Ethtool = struct {
         return moduleinfo.parseEeprom(gpa, reply.attrs) catch |e| return mapParse(e);
     }
 
+    // ── EEE / FEC / WOL / PRIVFLAGS / TSINFO ───────────────────────────────
+
+    /// `ETHTOOL_MSG_EEE_GET` — Energy-Efficient Ethernet state. Unprivileged.
+    /// Free with `deinit`.
+    pub fn eee(cl: *Ethtool, target: header.Target, form: BitsetForm) RequestError!eee_fec.Eee {
+        const seq = cl.sock.nextSeq();
+        const msg = try eee_fec.buildEee(cl.allocator(), cl.family_id, seq, target, form);
+        var reply = try cl.exchangeGet(msg, seq, uapi.EEE.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return eee_fec.parseEee(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
+    }
+
+    /// `ETHTOOL_MSG_EEE_SET`. Needs **CAP_NET_ADMIN**.
+    pub fn setEee(cl: *Ethtool, target: header.Target, set: eee_fec.EeeSet) RequestError!void {
+        const seq = cl.sock.nextSeq();
+        const msg = try eee_fec.buildSetEee(cl.allocator(), cl.family_id, seq, target, set);
+        try cl.exchangeAck(msg, seq, uapi.EEE.HEADER, target);
+    }
+
+    /// `ETHTOOL_MSG_FEC_GET` — forward error correction. Unprivileged. Free
+    /// with `deinit`.
+    pub fn fec(cl: *Ethtool, target: header.Target, form: BitsetForm) RequestError!eee_fec.Fec {
+        const seq = cl.sock.nextSeq();
+        const msg = try eee_fec.buildFec(cl.allocator(), cl.family_id, seq, target, form);
+        var reply = try cl.exchangeGet(msg, seq, uapi.FEC.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return eee_fec.parseFec(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
+    }
+
+    /// `ETHTOOL_MSG_FEC_SET`. Needs **CAP_NET_ADMIN**.
+    pub fn setFec(cl: *Ethtool, target: header.Target, set: eee_fec.FecSet) RequestError!void {
+        const seq = cl.sock.nextSeq();
+        const msg = try eee_fec.buildSetFec(cl.allocator(), cl.family_id, seq, target, set);
+        try cl.exchangeAck(msg, seq, uapi.FEC.HEADER, target);
+    }
+
+    /// `ETHTOOL_MSG_WOL_GET` — Wake-on-LAN modes and SecureOn password. Needs
+    /// **CAP_NET_ADMIN** even to read. Free with `deinit`.
+    ///
+    /// The reply may carry the SOPASS secret: the reply copy and the socket's
+    /// receive buffer are zeroed before this returns, on every path
+    /// (`wol.zig`'s header).
+    pub fn wol(cl: *Ethtool, target: header.Target, form: BitsetForm) RequestError!wol_mod.Wol {
+        const gpa = cl.allocator();
+        const seq = cl.sock.nextSeq();
+        const msg = try wol_mod.buildWol(gpa, cl.family_id, seq, target, form);
+        defer wol_mod.wipe(cl.sock.buf);
+        var reply = try cl.exchangeGet(msg, seq, uapi.WOL.HEADER, target);
+        defer {
+            wol_mod.wipe(reply.attrs);
+            reply.deinit(gpa);
+        }
+        return wol_mod.parseWol(gpa, reply.attrs) catch |e| return mapParse(e);
+    }
+
+    /// `ETHTOOL_MSG_WOL_SET`. Needs **CAP_NET_ADMIN**. The datagram carrying
+    /// `set.sopass` is zeroed after it is sent; the caller's own `set` is the
+    /// caller's to wipe.
+    pub fn setWol(cl: *Ethtool, target: header.Target, set: wol_mod.WolSet) RequestError!void {
+        const seq = cl.sock.nextSeq();
+        const msg = try wol_mod.buildSetWol(cl.allocator(), cl.family_id, seq, target, set);
+        defer wol_mod.wipe(cl.sock.buf); // an error reply may echo the request
+        try cl.sendBuiltSecret(msg);
+        var reply = try cl.collect(seq);
+        if (reply) |*r| {
+            defer {
+                wol_mod.wipe(r.attrs);
+                r.deinit(cl.allocator());
+            }
+            try cl.checkReplyEcho(r.attrs, uapi.WOL.HEADER, target);
+        }
+    }
+
+    /// `ETHTOOL_MSG_PRIVFLAGS_GET` — the driver's private flags. Unprivileged.
+    /// Free with `deinit`.
+    pub fn privflags(cl: *Ethtool, target: header.Target, form: BitsetForm) RequestError!privflags_mod.Privflags {
+        const seq = cl.sock.nextSeq();
+        const msg = try privflags_mod.buildPrivflags(cl.allocator(), cl.family_id, seq, target, form);
+        var reply = try cl.exchangeGet(msg, seq, uapi.PRIVFLAGS.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return privflags_mod.parsePrivflags(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
+    }
+
+    /// `ETHTOOL_MSG_PRIVFLAGS_SET`. Needs **CAP_NET_ADMIN**.
+    pub fn setPrivflags(
+        cl: *Ethtool,
+        target: header.Target,
+        set: privflags_mod.PrivflagsSet,
+    ) RequestError!void {
+        const seq = cl.sock.nextSeq();
+        const msg = try privflags_mod.buildSetPrivflags(cl.allocator(), cl.family_id, seq, target, set);
+        try cl.exchangeAck(msg, seq, uapi.PRIVFLAGS.HEADER, target);
+    }
+
+    /// `ETHTOOL_MSG_TSINFO_GET` — timestamping capabilities and the PTP
+    /// hardware clock (`ethtool -T`). Unprivileged. Free with `deinit`.
+    pub fn tsInfo(cl: *Ethtool, target: header.Target, form: BitsetForm) RequestError!tsinfo_mod.TsInfo {
+        const seq = cl.sock.nextSeq();
+        const msg = try tsinfo_mod.buildTsInfo(cl.allocator(), cl.family_id, seq, target, form);
+        var reply = try cl.exchangeGet(msg, seq, uapi.TSINFO.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return tsinfo_mod.parseTsInfo(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
+    }
+
     // ── multicast groups ───────────────────────────────────────────────────
 
     /// Resolve the family's `monitor` multicast group to its dynamic id.
@@ -533,7 +641,7 @@ pub const Ethtool = struct {
 
     /// A command this module does not model, with attributes the caller
     /// encoded itself. Everything the ethtool family can do that is not in the
-    /// typed API above — WOL, EEE, FEC, PRIVFLAGS, TSINFO, cable tests, RSS,
+    /// typed API above — cable tests, RSS,
     /// PLCA, and the all-device dump form — is reachable through this.
     pub const RawRequest = struct {
         cmd: u8,
@@ -591,9 +699,23 @@ pub const Ethtool = struct {
     /// matching `build*` encoder in the topic files, never from a second copy
     /// of the header assembly here.
     fn sendBuilt(cl: *Ethtool, msg: []u8) RequestError!void {
-        defer cl.allocator().free(msg);
+        return cl.sendOwned(msg, false);
+    }
+
+    /// The one funnel behind `sendBuilt` and `sendBuiltSecret`.
+    fn sendOwned(cl: *Ethtool, msg: []u8, secret: bool) RequestError!void {
+        defer {
+            if (secret) wol_mod.wipe(msg);
+            cl.allocator().free(msg);
+        }
         cl.sock.ext_ack_len = 0;
         try cl.send(msg);
+    }
+
+    /// `sendBuilt` for a datagram that carries a secret: zeroed before it is
+    /// freed.
+    fn sendBuiltSecret(cl: *Ethtool, msg: []u8) RequestError!void {
+        return cl.sendOwned(msg, true);
     }
 
     /// Send an already-encoded device GET and return its one reply message,

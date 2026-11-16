@@ -35,9 +35,9 @@ against this module's — no `ethtool` source consulted, studied or ported. DATA
 
 | | |
 |---|---|
-| **Implemented** | `LINKINFO_GET`/`SET`, `LINKMODES_GET`/`SET`, `LINKSTATE_GET`, `RINGS_GET`/`SET`, `COALESCE_GET`/`SET`, `PAUSE_GET`/`SET`, `CHANNELS_GET`/`SET`, `FEATURES_GET`/`SET`, `STATS_GET`, `STRSET_GET`, `MODULE_GET`/`SET`, `MODULE_EEPROM_GET`, the `monitor` multicast group |
+| **Implemented** | `LINKINFO_GET`/`SET`, `LINKMODES_GET`/`SET`, `LINKSTATE_GET`, `RINGS_GET`/`SET`, `COALESCE_GET`/`SET`, `PAUSE_GET`/`SET`, `CHANNELS_GET`/`SET`, `FEATURES_GET`/`SET`, `STATS_GET`, `STRSET_GET`, `MODULE_GET`/`SET`, `MODULE_EEPROM_GET`, `EEE_GET`/`SET`, `FEC_GET`/`SET`, `WOL_GET`/`SET` (SOPASS wiped), `PRIVFLAGS_GET`/`SET`, `TSINFO_GET`, the `monitor` multicast group |
 | **Escape hatch** | `Ethtool.raw` — any command, caller-encoded attributes, replies handed back as attribute bytes |
-| **Deferred** | WOL, EEE, FEC, PRIVFLAGS, DEBUG, TSINFO/TSCONFIG, cable test, RSS, PLCA, MM, PSE, PHY, tunnel info, module firmware flash, and the all-devices dump form — all reachable through `raw`; see `SPEC.md` |
+| **Deferred** | DEBUG, TSCONFIG, cable test, RSS, PLCA, MM, PSE, PHY, tunnel info, module firmware flash, and the all-devices dump form — all reachable through `raw`; see `SPEC.md` |
 | **Two ioctls, nothing more** | `ioctl.drvinfo()` (`ethtool -i`: driver/version/firmware/bus info) and `ioctl.driverStats()` (plain `ethtool -S`: the driver's private counter array) over `SIOCETHTOOL` — there is no netlink message for either. No other legacy ioctl command is or will be here. See "The two ioctl calls" below. |
 
 ## API
@@ -93,6 +93,22 @@ if (s.group(.eth_mac)) |g| _ = .{ g.stats, g.hist_rx, g.value(0) };
 var sets = try et.stringSet(null, &.{ .features, .stats_eth_mac });
 defer sets.deinit(gpa);
 _ = sets.byId(.features).?.get(16);          // bit 16's kernel name
+
+// ── EEE / FEC / WOL / PRIVFLAGS / TSINFO ─────────────────────────────────
+var ee = try et.eee(dev, .verbose);          // ours: value = advertised, mask = supported
+defer ee.deinit(gpa);
+try et.setEee(dev, .{ .enabled = true, .tx_lpi_timer = 17 });
+var fc = try et.fec(dev, .verbose);          // fc.active is a bit index; fc.activeName()
+defer fc.deinit(gpa);
+try et.setFec(dev, .{ .auto = false, .mode_names = &.{.{ .name = "RS", .on = true }} });
+var w = try et.wol(dev, .verbose);           // needs CAP_NET_ADMIN; w.sopass is a secret
+defer w.deinit(gpa);                         // ...and deinit wipes it
+try et.setWol(dev, .{ .modes = &.{.{ .index = ethtool.uapi.WAKE.magic, .on = true }} });
+var pf = try et.privflags(dev, .verbose);    // driver-specific names
+defer pf.deinit(gpa);
+try et.setPrivflags(dev, .{ .flags = &.{.{ .name = "legacy-rx", .on = true }} });
+var ts = try et.tsInfo(dev, .verbose);       // ts.phc_index null = no PTP clock
+defer ts.deinit(gpa);
 
 // ── pluggable transceiver ────────────────────────────────────────────────
 const mi = try et.moduleInfo(dev);           // EOPNOTSUPP on a fixed-PHY NIC
