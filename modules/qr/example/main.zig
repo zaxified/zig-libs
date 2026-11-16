@@ -404,7 +404,7 @@ fn runSingle(gpa: Allocator, io: std.Io, opts: Options) !u8 {
 }
 
 /// Every branch of `qr.Error` by name — CONVENTIONS.md §7.2 asks an example to
-/// handle at least one, and here all three are worth distinguishing: they mean
+/// handle at least one, and here every one is worth distinguishing: they mean
 /// three different things to whoever typed the command.
 fn reportEncodeError(err: qr.Error, opts: Options) u8 {
     switch (err) {
@@ -431,6 +431,9 @@ fn reportEncodeError(err: qr.Error, opts: Options) u8 {
         // version from somewhere else gets a distinct error rather than
         // `TooLong`, and the example should not pretend the branch is not there.
         error.BadVersion => std.debug.print("qr-demo: --version must be 1..40\n", .{}),
+        // Unreachable from this CLI too (it sets no `eci`): an ECI assignment
+        // number above `qr.max_eci` (999999).
+        error.BadEci => std.debug.print("qr-demo: the ECI number must be at most {d}\n", .{qr.max_eci}),
     }
     return 1;
 }
