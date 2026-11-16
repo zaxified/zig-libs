@@ -146,10 +146,8 @@ comptime {
 /// otherwise, rather than silently proceeding on weak input). `key_info`
 /// defaults to the empty string in the draft; here it is an explicit
 /// (possibly-empty) slice, matching this module's other explicit-
-/// parameter style. `key_info.len` is bounded to fit a fixed 256-byte
-/// stack buffer (`key_info.len <= 254`) — generous for every realistic
-/// caller (the draft imposes no upper bound itself); widen the buffer
-/// if a longer `key_info` caller ever appears.
+/// parameter style. `key_info` may be any length (the draft sets no bound;
+/// it streams into the HMAC, nothing is copied).
 ///
 /// Anchored byte-exact to blst's `key_gen_v5` (`blst_interop_test.zig`)
 /// and to an independent recomputation of the -05 text: the draft's own
@@ -166,7 +164,6 @@ pub fn keyGen(out: *SecretKey, ikm: []const u8, key_info: []const u8) BlsError!v
         out.deinit();
         return error.IkmTooShort;
     }
-    std.debug.assert(key_info.len <= 254);
     burn.run(burn.keygen_burn, void, keyGenBody, .{ out, ikm, key_info, false });
 }
 
@@ -176,7 +173,7 @@ pub fn keyGen(out: *SecretKey, ikm: []const u8, key_info: []const u8) BlsError!v
 /// (`salt = H("BLS-SIG-KEYGEN-SALT-")`), so the same IKM gives a different
 /// key than `keyGen`. For porting keys made with blst's default or
 /// another -04 implementation. Same contract as `keyGen` (IKM >= 32 bytes,
-/// `key_info.len <= 254`, `out` zeroed on error, frames burned).
+/// any `key_info`, `out` zeroed on error, frames burned).
 ///
 /// Anchored byte-exact to blst's `key_gen` (`blst_interop_test.zig`, the
 /// `sk` column of every case).
@@ -185,7 +182,6 @@ pub fn keyGenV4(out: *SecretKey, ikm: []const u8, key_info: []const u8) BlsError
         out.deinit();
         return error.IkmTooShort;
     }
-    std.debug.assert(key_info.len <= 254);
     burn.run(burn.keygen_burn, void, keyGenBody, .{ out, ikm, key_info, true });
 }
 
@@ -205,15 +201,27 @@ fn keyGenBody(out: *SecretKey, ikm: []const u8, key_info: []const u8, prehash_sa
         var prk: [Hkdf.prk_length]u8 = undefined;
         prk_state.final(&prk);
 
-        var ctx_buf: [256]u8 = undefined;
-        @memcpy(ctx_buf[0..key_info.len], key_info);
-        std.mem.writeInt(u16, ctx_buf[key_info.len..][0..2], @intCast(l_bytes), .big); // I2OSP(L, 2)
-        const ctx = ctx_buf[0 .. key_info.len + 2];
+        // HKDF-Expand(PRK, key_info || I2OSP(L, 2), L) (RFC 5869 §2.3),
+        // written out so `key_info` streams into the HMAC: any length, no
+        // context buffer. L = 48 is two blocks: T(1) || T(2)[0..16].
+        var len_be: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len_be, @intCast(l_bytes), .big);
+        const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+        var okm: [2 * Hmac.mac_length]u8 = undefined;
+        var t1 = Hmac.init(&prk);
+        t1.update(key_info);
+        t1.update(&len_be);
+        t1.update(&[_]u8{1});
+        t1.final(okm[0..32]);
+        var t2 = Hmac.init(&prk);
+        t2.update(okm[0..32]);
+        t2.update(key_info);
+        t2.update(&len_be);
+        t2.update(&[_]u8{2});
+        t2.final(okm[32..64]);
+        std.crypto.secureZero(u8, okm[l_bytes..]);
 
-        var okm: [l_bytes]u8 = undefined;
-        Hkdf.expand(&okm, ctx, prk);
-
-        out.scalar = Fr.reduceWide(&okm);
+        out.scalar = Fr.reduceWide(okm[0..l_bytes]);
         if (!out.scalar.isZero()) return;
 
         std.crypto.hash.sha2.Sha256.hash(salt, &salt_buf, .{});
@@ -291,6 +299,30 @@ test "SecretKey/PublicKey/Signature byte codecs round-trip through Part-1-3 mach
     try std.testing.expectEqual(@as(usize, 96), sig_bytes.len);
     const sig2 = try Signature.fromBytes(sig_bytes);
     try std.testing.expect(sig2.point.x.eql(g2.Affine.generator.x));
+}
+
+test "keyGen: a key_info of any length equals std HKDF over the concatenated context" {
+    const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
+    const ikm = @as([32]u8, @splat(0x5c));
+    var long_info: [1000]u8 = undefined;
+    for (&long_info, 0..) |*b, i| b.* = @truncate(i *% 31);
+    for ([_]usize{ 0, 1, 254, 255, 1000 }) |n| {
+        const info = long_info[0..n];
+        var sk: SecretKey = undefined;
+        try keyGen(&sk, &ikm, info);
+        // Reference: the draft's first round with std's HKDF-Expand.
+        var st = Hkdf.extractInit(default_salt);
+        st.update(&ikm);
+        st.update(&[_]u8{0});
+        var prk: [Hkdf.prk_length]u8 = undefined;
+        st.final(&prk);
+        var ctx: [1002]u8 = undefined;
+        @memcpy(ctx[0..n], info);
+        std.mem.writeInt(u16, ctx[n..][0..2], l_bytes, .big);
+        var okm: [l_bytes]u8 = undefined;
+        Hkdf.expand(&okm, ctx[0 .. n + 2], prk);
+        try std.testing.expect(sk.scalar.eql(Fr.reduceWide(&okm)));
+    }
 }
 
 test "keyGen rejects IKM shorter than 32 bytes" {

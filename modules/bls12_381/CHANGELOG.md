@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — `keyGen` / `keyGenV4` take a `key_info` of any length: HKDF-Expand is written out so `key_info`
+  streams into the HMAC. Before, a `key_info` over 254 bytes hit a `std.debug.assert` (a consumer-reachable panic, UB in
+  ReleaseFast). Same keys for every length that worked before (differential test against std's HKDF).
 - **2026-11-16** — `bls_sig.keyGenV4(out, ikm, key_info)`: the draft -04-compatible KeyGen (salt hashed before the first
   round), blst's default `key_gen` and EIP-2333's `HKDF_mod_r`; checked byte for byte against blst's `sk` vectors.
 - **2026-11-16** — `Fr.randomInto(out, io)`: a random scalar written into the caller's slot, the drawn bytes wiped, so a
