@@ -7037,3 +7037,1343 @@ test "compress with any level or frame size refuses or works (sweep clean check)
         } else |e| try testing.expectEqual(error.BadCompressOptions, e);
     };
 }
+
+// ── audit 2026-11-16 (mutation): the internals, tested directly ───────────────
+
+/// A `Storage` over `sim` that counts `pread`s.
+const PreadCount = struct {
+    var orig: *const Storage.VTable = undefined;
+    var n: usize = 0;
+    fn pread(ctx: *anyopaque, h: Storage.Handle, buf: []u8, off: u64) Storage.Error!usize {
+        n += 1;
+        return orig.pread(ctx, h, buf, off);
+    }
+    fn wrap(sim: *SimStorage, vt: *Storage.VTable) Storage {
+        const real = sim.storage();
+        orig = real.vtable;
+        vt.* = real.vtable.*;
+        vt.pread = pread;
+        n = 0;
+        return .{ .ctx = real.ctx, .vtable = vt };
+    }
+};
+
+test "SparseIndex.note takes an entry exactly an interval past the last one, not before" {
+    var ix: SparseIndex = .{};
+    defer ix.deinit(testing.allocator);
+    try ix.entries.ensureTotalCapacity(testing.allocator, 8);
+    ix.note(100, .{ .lsn = 1, .offset = 40, .max_before = 0 });
+    ix.note(100, .{ .lsn = 2, .offset = 139, .max_before = 0 });
+    try testing.expectEqual(@as(usize, 1), ix.entries.items.len);
+    ix.note(100, .{ .lsn = 3, .offset = 140, .max_before = 0 });
+    try testing.expectEqual(@as(usize, 2), ix.entries.items.len);
+    try testing.expectEqual(@as(u64, 3), ix.entries.items[1].lsn);
+}
+
+test "SparseIndex.byLsn and byTime pick the last entry at or before, strictly older for time" {
+    const e = [_]IndexEntry{
+        .{ .lsn = 10, .offset = 40, .max_before = std.math.minInt(i64) },
+        .{ .lsn = 20, .offset = 90, .max_before = 5 },
+        .{ .lsn = 30, .offset = 140, .max_before = 9 },
+    };
+    try testing.expectEqual(@as(?IndexEntry, null), SparseIndex.byLsn(&e, 9));
+    try testing.expectEqual(@as(u64, 10), SparseIndex.byLsn(&e, 10).?.lsn);
+    try testing.expectEqual(@as(u64, 10), SparseIndex.byLsn(&e, 19).?.lsn);
+    try testing.expectEqual(@as(u64, 20), SparseIndex.byLsn(&e, 20).?.lsn);
+    try testing.expectEqual(@as(u64, 30), SparseIndex.byLsn(&e, 1000).?.lsn);
+    // The last entry whose records before it are all older than t: max_before < t.
+    try testing.expectEqual(@as(?IndexEntry, null), SparseIndex.byTime(&e, std.math.minInt(i64)));
+    try testing.expectEqual(@as(u64, 10), SparseIndex.byTime(&e, 5).?.lsn);
+    try testing.expectEqual(@as(u64, 20), SparseIndex.byTime(&e, 6).?.lsn);
+    try testing.expectEqual(@as(u64, 20), SparseIndex.byTime(&e, 9).?.lsn);
+    try testing.expectEqual(@as(u64, 30), SparseIndex.byTime(&e, 10).?.lsn);
+}
+
+test "Tally: which LSN may come next, and what the seal it makes says" {
+    var t = Tally.init(10, false);
+    try testing.expect(t.fits(10) and !t.fits(11) and !t.fits(9));
+    try testing.expectEqual(@as(i64, std.math.minInt(i64)), t.maxOrMin());
+    t.add(5, 10);
+    t.add(3, 11);
+    t.add(9, 12);
+    try testing.expect(t.fits(13) and !t.fits(12) and !t.fits(14));
+    try testing.expectEqual(@as(u64, 3), t.count);
+    try testing.expectEqual(@as(u64, 13), t.nextLsn());
+    try testing.expectEqual(@as(u64, 12), t.last_lsn);
+    try testing.expectEqual(@as(i64, 3), t.min_ts);
+    try testing.expectEqual(@as(i64, 9), t.max_ts);
+    try testing.expectEqual(@as(i64, 9), t.maxOrMin());
+    const s = t.seal(777);
+    try testing.expectEqual(Seal{ .count = 3, .offset = 777, .first_lsn = 10, .last_lsn = 12, .min_ts = 3, .max_ts = 9 }, s);
+    // The seal of nothing: last = first - 1, and the sentinel times.
+    const z = Tally.init(10, false).seal(40);
+    try testing.expectEqual(@as(u64, 9), z.last_lsn);
+    // No LSN above max_lsn is believed, and max_lsn itself still is.
+    try testing.expect(Tally.init(max_lsn, false).fits(max_lsn));
+    try testing.expect(!Tally.init(max_lsn, false).fits(max_lsn + 1));
+    try testing.expect(Tally.init(1, true).fits(max_lsn) and !Tally.init(1, true).fits(max_lsn + 1));
+}
+
+test "Tally of a compacted segment: LSNs only rise, from the base on" {
+    var t = Tally.init(10, true);
+    try testing.expect(!t.fits(9));
+    try testing.expect(t.fits(10) and t.fits(500));
+    t.add(1, 15);
+    try testing.expect(!t.fits(15) and !t.fits(14) and t.fits(16) and t.fits(500));
+}
+
+test "Seal encodes every field in its own place, and decodes only its exact length" {
+    const s: Seal = .{ .count = 1, .offset = 2, .first_lsn = 3, .last_lsn = 4, .min_ts = -5, .max_ts = 6 };
+    var b: [seal_payload_len]u8 = undefined;
+    s.encode(&b);
+    try testing.expectEqual(s, Seal.decode(&b).?);
+    try testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, b[8..16], .little));
+    try testing.expectEqual(@as(i64, -5), std.mem.readInt(i64, b[32..40], .little));
+    try testing.expectEqual(@as(?Seal, null), Seal.decode(b[0 .. seal_payload_len - 1]));
+    var longer: [seal_payload_len + 1]u8 = @splat(0);
+    try testing.expectEqual(@as(?Seal, null), Seal.decode(&longer));
+}
+
+test "Window.get answers like a slice of the file, in any order of calls and limits" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var data: [300]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 7 +% 3);
+    try sim.installFile("f", &data);
+    const st = sim.storage();
+    const h = try st.open("f", .read_only);
+    defer st.close(h);
+    var prng = std.Random.DefaultPrng.init(0x5e61);
+    const rnd = prng.random();
+    for ([_]usize{ 1, 7, 16, 64, 512 }) |block| {
+        var w: Window = .{ .block = block };
+        defer w.deinit(testing.allocator);
+        for (0..4000) |_| {
+            const limit = rnd.uintAtMost(u64, 330);
+            // Sequential and random starts both, so the window extends and reloads.
+            const start = if (rnd.boolean()) w.off + w.buf.items.len -| rnd.uintAtMost(u64, 3) else rnd.uintAtMost(u64, 330);
+            const need = 1 + rnd.uintAtMost(u64, 40);
+            const got = try w.get(testing.allocator, st, h, start, need, limit);
+            if (start + need > @min(limit, data.len)) {
+                try testing.expectEqual(@as(?[]const u8, null), got);
+            } else {
+                try testing.expectEqualSlices(u8, data[@intCast(start)..][0..@intCast(need)], got.?);
+            }
+        }
+    }
+}
+
+test "Window: a short read is remembered per limit and forgotten by forget" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var data: [100]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i);
+    try sim.installFile("f", &data);
+    var vt: Storage.VTable = undefined;
+    const st = PreadCount.wrap(&sim, &vt);
+    const h = try st.open("f", .read_only);
+    defer st.close(h);
+    var w: Window = .{ .block = 16 };
+    defer w.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(?[]const u8, null), try w.get(testing.allocator, st, h, 90, 20, 200));
+    const reads = PreadCount.n;
+    // Nothing lies there yet: the same question under the same limit reads nothing.
+    try testing.expectEqual(@as(?[]const u8, null), try w.get(testing.allocator, st, h, 90, 20, 200));
+    try testing.expectEqual(reads, PreadCount.n);
+    try sim.appendDurable("f", &@as([100]u8, @splat(0xAB)));
+    // Still the remembered answer: bytes below what the log treats as written never change.
+    try testing.expectEqual(@as(?[]const u8, null), try w.get(testing.allocator, st, h, 90, 20, 200));
+    try testing.expectEqual(reads, PreadCount.n);
+    // Another limit is another question.
+    const other = (try w.get(testing.allocator, st, h, 90, 20, 150)).?;
+    try testing.expectEqual(@as(u8, 0xAB), other[10]);
+    // And forget drops the memory (a reader must not trust what was still arriving).
+    var w2: Window = .{ .block = 16 };
+    defer w2.deinit(testing.allocator);
+    try testing.expectEqual(@as(?[]const u8, null), try w2.get(testing.allocator, st, h, 190, 20, 400));
+    try sim.appendDurable("f", &@as([100]u8, @splat(0xCD)));
+    w2.forget(190);
+    const again = (try w2.get(testing.allocator, st, h, 190, 20, 400)).?;
+    try testing.expectEqual(@as(u8, 0xAB), again[0]);
+    try testing.expectEqual(@as(u8, 0xCD), again[15]);
+}
+
+test "Window: asking past the end of a file again and again costs one read, not one per byte" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const data: [200]u8 = @splat(7);
+    try sim.installFile("f", &data);
+    var vt: Storage.VTable = undefined;
+    const st = PreadCount.wrap(&sim, &vt);
+    const h = try st.open("f", .read_only);
+    defer st.close(h);
+    var w: Window = .{ .block = 64 };
+    defer w.deinit(testing.allocator);
+    var off: u64 = 180;
+    while (off < 200) : (off += 1) {
+        try testing.expectEqual(@as(?[]const u8, null), try w.get(testing.allocator, st, h, off, 25, 200));
+    }
+    try testing.expect(PreadCount.n <= 3);
+}
+
+const seg_1 = "seg-00000000000000000001.log";
+const seg_2 = "seg-00000000000000000002.log";
+
+/// Segment 1 closed with one record, segment 2 active with one, on `sim`.
+fn twoSegmentsOnDisk(sim: *SimStorage) !void {
+    var log = try openSim(sim);
+    defer log.close();
+    try log.rotate(1);
+    _ = try log.appendAt(100, "x");
+    try log.rotate(2);
+    _ = try log.appendAt(200, "y");
+}
+
+/// Re-seal `hdr`'s CRC after a hand edit.
+fn reCrcHeader(hdr: []u8) void {
+    std.mem.writeInt(u32, hdr[36..40], crc32c(hdr[0..36]), .little);
+}
+
+test "a closed segment with eight bytes of a newer format is refused, not taken for a torn header" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoSegmentsOnDisk(&sim);
+    {
+        const st = sim.storage();
+        const h = try st.open(seg_1, .open_or_create);
+        defer st.close(h);
+        try st.truncate(h, 8);
+    }
+    sim.fileContent(seg_1).?[4] = 3; // version 3
+    var log = try openSim(&sim);
+    defer log.close();
+    {
+        var it = log.iterator(null);
+        defer it.deinit();
+        try testing.expectError(error.UnsupportedVersion, it.next());
+    }
+    // Eight bytes of something that is not a segment at all.
+    sim.fileContent(seg_1).?[0] = 'Z';
+    sim.fileContent(seg_1).?[4] = 2;
+    var it = log.iterator(null);
+    defer it.deinit();
+    try testing.expectError(error.Corrupt, it.next());
+}
+
+test "a newest segment with a torn header of 20 bytes is cut and finished" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoSegmentsOnDisk(&sim);
+    {
+        const st = sim.storage();
+        const h = try st.open(seg_2, .open_or_create);
+        defer st.close(h);
+        try st.truncate(h, 20);
+        try st.sync(h);
+    }
+    var log = try Log.open(testing.allocator, sim.storage(), .{});
+    defer log.close();
+    try testing.expectEqual(@as(u64, 20), log.bytesCutOnOpen());
+    try testing.expectEqual(@as(?u64, 2), log.activeSegment());
+}
+
+test "a header with a good CRC but the wrong magic, or an unknown flag, is refused" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoSegmentsOnDisk(&sim);
+    const c = sim.fileContent(seg_2).?;
+    c[3] = 'X'; // "SGLX"
+    reCrcHeader(c[0..40]);
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), .{}));
+    c[3] = 'S';
+    std.mem.writeInt(u32, c[32..36], 2, .little); // a flag this version does not know
+    reCrcHeader(c[0..40]);
+    try testing.expectError(error.UnsupportedVersion, Log.open(testing.allocator, sim.storage(), .{}));
+    std.mem.writeInt(u32, c[32..36], 0, .little);
+    reCrcHeader(c[0..40]);
+    var log = try Log.open(testing.allocator, sim.storage(), .{});
+    log.close();
+}
+
+test "a flipped byte in a header's creation stamp is caught by the header CRC" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoSegmentsOnDisk(&sim);
+    sim.fileContent(seg_1).?[26] ^= 0x40;
+    var log = try Log.open(testing.allocator, sim.storage(), .{});
+    defer log.close();
+    var it = log.iterator(null);
+    defer it.deinit();
+    try testing.expectError(error.Corrupt, it.next());
+    try testing.expectEqual(Damage.Reason.bad_header, it.damage().?.reason);
+}
+
+test "a reader's seek and seekTime each see a segment the writer rotated to since" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var w = try openSim(&sim);
+    defer w.close();
+    try w.rotate(1);
+    _ = try w.appendAt(100, "a");
+    var r1 = try Log.openReadOnly(testing.allocator, sim.storage(), .{});
+    defer r1.close();
+    var r2 = try Log.openReadOnly(testing.allocator, sim.storage(), .{});
+    defer r2.close();
+    try w.rotate(2);
+    const b = try w.appendAt(200, "b");
+    try testing.expectEqual(b.pos, (try r1.seek(2)).?);
+    try testing.expectEqual(b.pos, (try r2.seekTime(150)).?);
+}
+
+test "seek and seekTime on a newest segment that was left sealed answer null past its end" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var log = try openSim(&sim);
+        defer log.close();
+        try log.rotate(1);
+        _ = try log.appendAt(-50, "x");
+        try log.seal(&log.active.?);
+        log.store.close(log.active.?.handle);
+        log.active.?.index.deinit(testing.allocator);
+        log.active = null;
+    }
+    var log = try openSim(&sim);
+    defer log.close();
+    try testing.expectEqual(@as(?u64, null), log.activeSegment());
+    try testing.expectEqual(@as(?Position, null), try log.seek(2));
+    try testing.expectEqual(@as(?Position, null), try log.seekTime(-10));
+    try testing.expectEqual(@as(u64, 40), (try log.seek(1)).?.offset);
+    try testing.expectEqual(@as(u64, 40), (try log.seekTime(-60)).?.offset);
+}
+
+test "seek finds only what is durable under a manual sync policy" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try Log.open(testing.allocator, sim.storage(), .{ .create = true, .sync = .manual });
+    defer log.close();
+    try log.rotate(1);
+    _ = try log.append("a");
+    try log.sync();
+    const p2 = try log.append("b");
+    try testing.expectEqual(@as(?Position, null), try log.seek(2));
+    try log.sync();
+    try testing.expectEqual(p2.pos, (try log.seek(2)).?);
+}
+
+test "a closed segment with a torn header makes seekTime Corrupt instead of skipping it" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoSegmentsOnDisk(&sim);
+    {
+        const st = sim.storage();
+        const h = try st.open(seg_1, .open_or_create);
+        defer st.close(h);
+        try st.truncate(h, 20);
+        try st.sync(h);
+    }
+    var log = try openSim(&sim);
+    defer log.close();
+    try testing.expectError(error.Corrupt, log.seekTime(50));
+}
+
+test "seek refuses a closed segment that holds a record above the one asked for" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var second: Position = undefined;
+    {
+        var log = try openSim(&sim);
+        defer log.close();
+        try log.rotate(1);
+        _ = try log.appendAt(1, "r0");
+        second = (try log.appendAt(2, "r1")).pos;
+        _ = try log.appendAt(3, "r2");
+        try log.rotate(2);
+        _ = try log.appendAt(4, "z");
+    }
+    // The second record claims LSN 5, with a good CRC: a gap, not a torn write.
+    const c = sim.fileContent(seg_1).?;
+    const off: usize = @intCast(second.offset);
+    std.mem.writeInt(u64, c[off + 9 ..][0..8], 5, .little);
+    std.mem.writeInt(u32, c[off..][0..4], crc32c(c[off + 4 .. off + rec_header_len + 2]), .little);
+    var log = try openSim(&sim);
+    defer log.close();
+    try testing.expectError(error.Corrupt, log.seek(3));
+}
+
+/// A `Storage` over `sim` that records the durability-relevant calls, one
+/// letter each: w writeAll, s sync, S syncData, t truncate, r rename, d delete,
+/// D syncDir, a allocate. `expectTrace` takes the trace since the last call.
+const OpTrace = struct {
+    var orig: *const Storage.VTable = undefined;
+    var buf: [512]u8 = undefined;
+    var len: usize = 0;
+    fn push(c: u8) void {
+        if (len < buf.len) {
+            buf[len] = c;
+            len += 1;
+        }
+    }
+    fn writeAll(ctx: *anyopaque, h: Storage.Handle, bytes: []const u8, off: u64) Storage.Error!void {
+        push('w');
+        return orig.writeAll(ctx, h, bytes, off);
+    }
+    fn sync(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
+        push('s');
+        return orig.sync(ctx, h);
+    }
+    fn syncData(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
+        push('S');
+        return orig.syncData.?(ctx, h);
+    }
+    fn truncate(ctx: *anyopaque, h: Storage.Handle, n: u64) Storage.Error!void {
+        push('t');
+        return orig.truncate(ctx, h, n);
+    }
+    fn rename(ctx: *anyopaque, a: []const u8, b: []const u8) Storage.Error!void {
+        push('r');
+        return orig.rename(ctx, a, b);
+    }
+    fn delete(ctx: *anyopaque, p: []const u8) Storage.Error!void {
+        push('d');
+        return orig.delete(ctx, p);
+    }
+    fn syncDir(ctx: *anyopaque) Storage.Error!void {
+        push('D');
+        return orig.syncDir(ctx);
+    }
+    fn allocate(ctx: *anyopaque, h: Storage.Handle, n: u64) Storage.Error!bool {
+        push('a');
+        return orig.allocate.?(ctx, h, n);
+    }
+    fn wrap(sim: *SimStorage, vt: *Storage.VTable) Storage {
+        const real = sim.storage();
+        orig = real.vtable;
+        vt.* = real.vtable.*;
+        vt.writeAll = writeAll;
+        vt.sync = sync;
+        vt.syncData = syncData;
+        vt.truncate = truncate;
+        vt.rename = rename;
+        vt.delete = delete;
+        vt.syncDir = syncDir;
+        vt.allocate = allocate;
+        len = 0;
+        return .{ .ctx = real.ctx, .vtable = vt };
+    }
+    /// The trace since the last call, and start a new one.
+    fn take() []const u8 {
+        const out = buf[0..len];
+        len = 0;
+        return out;
+    }
+};
+
+fn expectTrace(want: []const u8) !void {
+    const got = OpTrace.take();
+    testing.expectEqualStrings(want, got) catch |e| {
+        std.debug.print("op trace: want {s}, got {s}\n", .{ want, got });
+        return e;
+    };
+}
+
+fn expectTraceEnds(want_suffix: []const u8) !void {
+    const got = OpTrace.take();
+    if (!std.mem.endsWith(u8, got, want_suffix)) {
+        std.debug.print("op trace: want ...{s}, got {s}\n", .{ want_suffix, got });
+        return error.TestExpectedEqual;
+    }
+}
+
+test "the durability protocol, call by call: open, rotate, append, reopen, drop" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var vt: Storage.VTable = undefined;
+    const st = OpTrace.wrap(&sim, &vt);
+    {
+        var log = try Log.open(testing.allocator, st, .{ .create = true });
+        defer log.close();
+        // A fresh manifest: write, sync, rename, sync the directory; then the two stray-file deletes.
+        try expectTrace("wsrDdd");
+        try log.rotate(1);
+        // The manifest naming the segment first, then the header written and synced, then the directory.
+        try expectTrace("wsrDwsD");
+        _ = try log.append("a");
+        try expectTrace("wS");
+        try log.rotate(2);
+        // The seal (write, sync), the sparse index, the manifest, the new header, the directory.
+        try expectTrace("wswwsrDwsD");
+        _ = try log.append("b");
+        _ = try log.append("c");
+        _ = OpTrace.take();
+        try log.rotate(3);
+        _ = OpTrace.take();
+        try testing.expectEqual(@as(usize, 2), try log.dropBefore(3));
+        // The manifest first (the segments leave the log), then the files, then the pending list is cleared.
+        try expectTrace("wsrD" ++ "dddddd" ++ "wsrD");
+    }
+    // Reopen: the two temp files and the stray of the one live segment are deleted, and the newest segment is synced before it is trusted.
+    {
+        var log = try Log.open(testing.allocator, st, .{});
+        defer log.close();
+        try expectTrace("ddds");
+    }
+}
+
+test "the durability protocol: a torn tail is cut, synced, and the log synced again before it is trusted" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoSegmentsOnDisk(&sim);
+    try sim.appendDurable(seg_2, "\x01\x02\x03");
+    var vt: Storage.VTable = undefined;
+    const st = OpTrace.wrap(&sim, &vt);
+    var log = try Log.open(testing.allocator, st, .{});
+    defer log.close();
+    try expectTrace("ddddtss");
+    try testing.expectEqual(@as(u64, 3), log.bytesCutOnOpen());
+}
+
+test "the durability protocol: a manual sync policy writes without syncing until sync" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var vt: Storage.VTable = undefined;
+    const st = OpTrace.wrap(&sim, &vt);
+    var log = try Log.open(testing.allocator, st, .{ .create = true, .sync = .manual });
+    defer log.close();
+    try log.rotate(1);
+    _ = OpTrace.take();
+    _ = try log.append("a");
+    try expectTrace("w");
+    try log.sync();
+    try expectTrace("S");
+    try log.sync(); // nothing is waiting
+    try expectTrace("");
+}
+
+test "the durability protocol: compact, compress, and a manifest rebuild" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var vt: Storage.VTable = undefined;
+    const st = OpTrace.wrap(&sim, &vt);
+    var log = try Log.open(testing.allocator, st, .{ .create = true });
+    defer log.close();
+    try log.rotate(1);
+    for (0..3) |i| _ = try log.append(if (i == 1) "xdrop" else "keep");
+    try log.rotate(2);
+    try log.rotate(3);
+    _ = OpTrace.take();
+    // The new segment: header, records, seal; synced; renamed over the old; the directory; the old index deleted.
+    _ = try log.compact(1, {}, struct {
+        fn keep(_: void, r: Record) bool {
+            return !std.mem.startsWith(u8, r.payload, "x");
+        }
+    }.keep);
+    try expectTrace("wwwsrDd");
+    _ = try log.compress(2);
+    // The compressed file synced, renamed into place, the directory, the manifest, the raw file deleted.
+    try expectTraceEnds("srDwsrDd");
+}
+
+test "the durability protocol: rebuildManifest writes, syncs, renames and syncs the directory" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoSegmentsOnDisk(&sim);
+    var vt: Storage.VTable = undefined;
+    const st = OpTrace.wrap(&sim, &vt);
+    try testing.expectError(error.ManifestPresent, Log.rebuildManifest(testing.allocator, st, &.{ 1, 2 }));
+    try st.delete(manifest_name);
+    _ = OpTrace.take();
+    try Log.rebuildManifest(testing.allocator, st, &.{ 1, 2 });
+    try expectTrace("wsrD");
+}
+
+const IdxDamage = enum { none, magic, version, id, seg_size, count, same_lsn, at_end };
+
+/// The first segment of `sim` (three records r0 r1 r2, then closed), with its
+/// index file replaced by one whose only defect is `damage`, and CRC good.
+/// Every file it writes would, if believed, send `seek(2)` to the third
+/// record, which has a higher LSN.
+fn seekWithBadIndex(sim: *SimStorage, pos: [3]Position, damage: IdxDamage) !?Position {
+    var log = try openSim(sim);
+    defer log.close();
+    const size = sim.fileContent(seg_1).?.len;
+    var one = [_]IndexEntry{.{ .lsn = 2, .offset = pos[2].offset, .max_before = 0 }};
+    var two = [_]IndexEntry{
+        .{ .lsn = 1, .offset = segment_header_len, .max_before = std.math.minInt(i64) },
+        .{ .lsn = 1, .offset = pos[2].offset, .max_before = 0 },
+    };
+    var tail = [_]IndexEntry{.{ .lsn = 2, .offset = size, .max_before = 0 }};
+    const entries: []const IndexEntry = switch (damage) {
+        .same_lsn => &two,
+        .at_end => &tail,
+        else => &one,
+    };
+    log.writeIndexFile(1, size, entries);
+    var nb: [seg_name_len]u8 = undefined;
+    const c = sim.fileContent(idxName(&nb, 1)).?;
+    switch (damage) {
+        .magic => c[0] = 'X',
+        .version => c[4] = 9,
+        .id => c[8] = 99,
+        .seg_size => c[16] +%= 1,
+        .count => c[24] = 2,
+        .none, .same_lsn, .at_end => {},
+    }
+    std.mem.writeInt(u32, c[c.len - 4 ..][0..4], crc32c(c[0 .. c.len - 4]), .little);
+    return log.seek(2);
+}
+
+test "an index file with a good CRC is refused for any field that is wrong, and a good one is believed" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var pos: [3]Position = undefined;
+    {
+        var log = try openSim(&sim);
+        defer log.close();
+        try log.rotate(1);
+        for (&pos, 0..) |*p, i| p.* = (try log.appendAt(@intCast(i), "r?")).pos;
+        try log.rotate(2);
+        _ = try log.append("z");
+    }
+    // The control: an index that fits its segment is believed, and this one lies.
+    try testing.expectError(error.Corrupt, seekWithBadIndex(&sim, pos, .none));
+    for ([_]IdxDamage{ .magic, .version, .id, .seg_size, .count, .same_lsn, .at_end }) |d| {
+        const got = seekWithBadIndex(&sim, pos, d) catch |e| {
+            std.debug.print("index damage {s}: {s}\n", .{ @tagName(d), @errorName(e) });
+            return e;
+        };
+        try testing.expectEqual(pos[1].offset, got.?.offset);
+    }
+}
+
+fn reCrcManifest(c: []u8) void {
+    std.mem.writeInt(u32, c[c.len - 4 ..][0..4], crc32c(c[0 .. c.len - 4]), .little);
+}
+
+test "a manifest of exactly the largest size opens" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var log = try openSim(&sim);
+        defer log.close();
+        var id: u64 = 1;
+        while (id <= max_manifest_ids) : (id += 1) try log.rotate(id);
+    }
+    try testing.expectEqual(@as(usize, man_fixed + man_entry_len * max_manifest_ids + man_crc_len), sim.fileContent(manifest_name).?.len);
+    var log = try openSim(&sim);
+    defer log.close();
+    try testing.expectEqual(@as(usize, max_manifest_ids), log.segments().len);
+}
+
+test "a manifest with a flipped byte or the wrong magic is Corrupt, even when the rest parses" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoSegmentsOnDisk(&sim);
+    const c = sim.fileContent(manifest_name).?;
+    // The id of the newest segment, 2 -> 3: the manifest still parses; only the CRC knows.
+    c[man_fixed + man_entry_len] = 3;
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), .{}));
+    c[man_fixed + man_entry_len] = 2;
+    c[3] = 'X';
+    reCrcManifest(c);
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), .{}));
+    c[3] = 'M';
+    reCrcManifest(c);
+    var log = try Log.open(testing.allocator, sim.storage(), .{});
+    log.close();
+}
+
+test "an empty MANIFEST is no log: NotFound without create, created with it" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try sim.installFile(manifest_name, "");
+    try testing.expectError(error.NotFound, Log.open(testing.allocator, sim.storage(), .{}));
+    try testing.expectEqual(@as(usize, 0), sim.fileContent(manifest_name).?.len);
+    try testing.expectError(error.NotFound, Log.openReadOnly(testing.allocator, sim.storage(), .{}));
+    try testing.expectEqual(@as(usize, 0), sim.fileContent(manifest_name).?.len);
+    var log = try openSim(&sim);
+    defer log.close();
+    try testing.expectEqual(@as(?u64, null), log.newest());
+    try testing.expect(sim.fileContent(manifest_name).?.len >= man_fixed + man_crc_len);
+}
+
+test "with the index switched off no index file is ever written" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try Log.open(testing.allocator, sim.storage(), .{ .create = true, .index_interval = 0 });
+    defer log.close();
+    try log.rotate(1);
+    _ = try log.append("a");
+    try log.rotate(2);
+    var nb: [seg_name_len]u8 = undefined;
+    try testing.expect(sim.fileContent(idxName(&nb, 1)) == null);
+    // ... and seeking still works, by walking.
+    try testing.expectEqual(@as(u64, 40), (try log.seek(1)).?.offset);
+}
+
+fn fixedNow() i64 {
+    return 1_700_000_000_123;
+}
+
+fn le(comptime T: type, bytes: []const u8) T {
+    return std.mem.readInt(T, bytes[0..@sizeOf(T)], .little);
+}
+
+test "the on-disk layout, byte by byte: segment header, record, seal, manifest" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try Log.open(testing.allocator, sim.storage(), .{ .create = true, .now = fixedNow });
+    defer log.close();
+    try log.rotate(7);
+    _ = try log.appendAt(-42, "hello");
+    try log.rotate(9);
+    const crc = std.hash.crc.@"CRC-32/ISCSI".hash;
+    const c = sim.fileContent("seg-00000000000000000007.log").?;
+    try testing.expectEqual(@as(usize, 40 + 30 + 73), c.len);
+    // header
+    try testing.expectEqualSlices(u8, "SGLS", c[0..4]);
+    try testing.expectEqual(@as(u32, 2), le(u32, c[4..]));
+    try testing.expectEqual(@as(u64, 7), le(u64, c[8..]));
+    try testing.expectEqual(@as(u64, 1), le(u64, c[16..]));
+    try testing.expectEqual(@as(i64, 1_700_000_000_123), le(i64, c[24..]));
+    try testing.expectEqual(@as(u32, 0), le(u32, c[32..]));
+    try testing.expectEqual(crc(c[0..36]), le(u32, c[36..]));
+    // data record
+    const r = c[40..70];
+    try testing.expectEqual(crc(r[4..]), le(u32, r));
+    try testing.expectEqual(@as(u8, 1), r[4]);
+    try testing.expectEqual(@as(u32, 5), le(u32, r[5..]));
+    try testing.expectEqual(@as(u64, 1), le(u64, r[9..]));
+    try testing.expectEqual(@as(i64, -42), le(i64, r[17..]));
+    try testing.expectEqualSlices(u8, "hello", r[25..]);
+    // seal
+    const s = c[70..];
+    try testing.expectEqual(crc(s[4..]), le(u32, s));
+    try testing.expectEqual(@as(u8, 2), s[4]);
+    try testing.expectEqual(@as(u32, 48), le(u32, s[5..]));
+    try testing.expectEqual(@as(u64, 0), le(u64, s[9..]));
+    try testing.expectEqual(@as(i64, 0), le(i64, s[17..]));
+    const p = s[25..];
+    try testing.expectEqual(@as(u64, 1), le(u64, p[0..])); // count
+    try testing.expectEqual(@as(u64, 70), le(u64, p[8..])); // its own offset
+    try testing.expectEqual(@as(u64, 1), le(u64, p[16..])); // first LSN
+    try testing.expectEqual(@as(u64, 1), le(u64, p[24..])); // last LSN
+    try testing.expectEqual(@as(i64, -42), le(i64, p[32..])); // min ts
+    try testing.expectEqual(@as(i64, -42), le(i64, p[40..])); // max ts
+    // manifest
+    const m = sim.fileContent("MANIFEST").?;
+    try testing.expectEqual(@as(usize, 16 + 2 * 24 + 4), m.len);
+    try testing.expectEqualSlices(u8, "SGLM", m[0..4]);
+    try testing.expectEqual(@as(u32, 2), le(u32, m[4..]));
+    try testing.expectEqual(@as(u32, 2), le(u32, m[8..])); // live
+    try testing.expectEqual(@as(u32, 0), le(u32, m[12..])); // pending
+    try testing.expectEqual(@as(u64, 7), le(u64, m[16..]));
+    try testing.expectEqual(@as(u64, 1), le(u64, m[24..]));
+    try testing.expectEqual(@as(u8, 0), m[32]);
+    try testing.expectEqual(@as(u64, 9), le(u64, m[40..]));
+    try testing.expectEqual(@as(u64, 2), le(u64, m[48..]));
+    try testing.expectEqual(crc(m[0 .. m.len - 4]), le(u32, m[m.len - 4 ..]));
+    // the index of the closed segment
+    var nb: [seg_name_len]u8 = undefined;
+    const ix = sim.fileContent(idxName(&nb, 7)).?;
+    try testing.expectEqualSlices(u8, "SGLI", ix[0..4]);
+    try testing.expectEqual(@as(u32, 1), le(u32, ix[4..]));
+    try testing.expectEqual(@as(u64, 7), le(u64, ix[8..]));
+    try testing.expectEqual(@as(u64, c.len), le(u64, ix[16..]));
+    try testing.expectEqual(@as(u32, 1), le(u32, ix[24..]));
+    try testing.expectEqual(@as(u64, 1), le(u64, ix[28..])); // entry: LSN
+    try testing.expectEqual(@as(u64, 40), le(u64, ix[36..])); // offset
+    try testing.expectEqual(@as(i64, std.math.minInt(i64)), le(i64, ix[44..])); // max_before
+    try testing.expectEqual(crc(ix[0 .. ix.len - 4]), le(u32, ix[ix.len - 4 ..]));
+}
+
+const ManEntry = struct { id: u64, first: u64, form: u8 = 0, pad: u8 = 0 };
+
+fn putLe(b: *std.ArrayList(u8), comptime T: type, v: T) !void {
+    var tmp: [8]u8 = undefined;
+    std.mem.writeInt(T, tmp[0..@sizeOf(T)], v, .little);
+    try b.appendSlice(testing.allocator, tmp[0..@sizeOf(T)]);
+}
+
+/// A MANIFEST built by hand, with a good CRC, replacing whatever is in `sim`.
+/// `np_field` overrides the pending count the header claims.
+fn installManifest(sim: *SimStorage, live: []const ManEntry, pending: []const u64, np_field: ?u32) !void {
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(testing.allocator);
+    try b.appendSlice(testing.allocator, "SGLM");
+    try putLe(&b, u32, format_version);
+    try putLe(&b, u32, @intCast(live.len));
+    try putLe(&b, u32, np_field orelse @intCast(pending.len));
+    for (live) |e| {
+        try putLe(&b, u64, e.id);
+        try putLe(&b, u64, e.first);
+        try b.append(testing.allocator, e.form);
+        try b.appendNTimes(testing.allocator, e.pad, 7);
+    }
+    for (pending) |p| try putLe(&b, u64, p);
+    try putLe(&b, u32, crc32c(b.items));
+    sim.storage().delete(manifest_name) catch {};
+    try sim.installFile(manifest_name, b.items);
+}
+
+/// A segment file holding only a header with `base`.
+fn installHeaderOnly(sim: *SimStorage, id: u64, base: u64) !void {
+    var hdr: [segment_header_len]u8 = undefined;
+    encodeHeader(&hdr, id, base, 0);
+    var nb: [seg_name_len]u8 = undefined;
+    try sim.installFile(segName(&nb, id), &hdr);
+}
+
+test "a manifest is refused for any field that is wrong, though its CRC is good" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try installHeaderOnly(&sim, 1, 5);
+    try installHeaderOnly(&sim, 2, 3);
+    const o: Options = .{};
+    // The control: two segments whose first LSNs do not run backwards open.
+    try installManifest(&sim, &.{ .{ .id = 1, .first = 5 }, .{ .id = 2, .first = 5 } }, &.{}, null);
+    {
+        try installHeaderOnly(&sim, 2, 5);
+        var log = try Log.open(testing.allocator, sim.storage(), o);
+        log.close();
+    }
+    // ... and one whose second first LSN is below the first's does not.
+    try installHeaderOnly(&sim, 2, 3);
+    try installManifest(&sim, &.{ .{ .id = 1, .first = 5 }, .{ .id = 2, .first = 3 } }, &.{}, null);
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), o));
+    // The same id twice.
+    try installManifest(&sim, &.{ .{ .id = 1, .first = 5 }, .{ .id = 1, .first = 5 } }, &.{}, null);
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), o));
+    // A first LSN of 0.
+    try installManifest(&sim, &.{.{ .id = 1, .first = 0 }}, &.{}, null);
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), o));
+    // A form that does not exist, and bytes after it that must be zero.
+    try installManifest(&sim, &.{.{ .id = 1, .first = 5, .form = 5 }}, &.{}, null);
+    try testing.expectError(error.UnsupportedVersion, Log.open(testing.allocator, sim.storage(), o));
+    try installManifest(&sim, &.{.{ .id = 1, .first = 5, .pad = 1 }}, &.{}, null);
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), o));
+    // A pending id that is also live.
+    try installManifest(&sim, &.{.{ .id = 1, .first = 5 }}, &.{1}, null);
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), o));
+    // A pending count the file does not hold.
+    try installManifest(&sim, &.{.{ .id = 1, .first = 5 }}, &.{}, 1);
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), o));
+    // More ids than a manifest may hold, all of them pending.
+    var many: [max_manifest_ids + 1]u64 = undefined;
+    for (&many, 0..) |*p, i| p.* = 100 + i;
+    try installManifest(&sim, &.{}, &many, null);
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), o));
+}
+
+test "a first LSN of exactly max_lsn is a log, and the one above it is not" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try installHeaderOnly(&sim, 1, max_lsn);
+    try Log.rebuildManifest(testing.allocator, sim.storage(), &.{1});
+    {
+        var log = try Log.open(testing.allocator, sim.storage(), .{});
+        defer log.close();
+        try testing.expectEqual(max_lsn, log.nextLsn());
+        // A record may carry max_lsn itself.
+        try testing.expectEqual(max_lsn, (try log.append("z")).lsn);
+        var it = log.iterator(null);
+        defer it.deinit();
+        try testing.expectEqual(max_lsn, (try it.next()).?.lsn);
+    }
+    try installManifest(&sim, &.{.{ .id = 1, .first = max_lsn + 1 }}, &.{}, null);
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), .{}));
+    try sim.storage().delete(manifest_name);
+    try installHeaderOnly(&sim, 1, max_lsn + 1);
+    try testing.expectError(error.Corrupt, Log.rebuildManifest(testing.allocator, sim.storage(), &.{1}));
+}
+
+fn nowA() i64 {
+    return 1111;
+}
+
+fn nowB() i64 {
+    return 2222;
+}
+
+test "reopening a newest segment that holds only its header keeps it as it is" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var log = try Log.open(testing.allocator, sim.storage(), .{ .create = true, .now = nowA });
+        defer log.close();
+        try log.rotate(1);
+    }
+    {
+        var log = try Log.open(testing.allocator, sim.storage(), .{ .now = nowB });
+        defer log.close();
+        try testing.expectEqual(@as(u64, 0), log.bytesCutOnOpen());
+        try testing.expectEqual(@as(?u64, 1), log.activeSegment());
+    }
+    // Not rewritten: it still carries the stamp of its creation.
+    try testing.expectEqual(@as(i64, 1111), le(i64, sim.fileContent(seg_1).?[24..]));
+}
+
+test "the durability protocol: a torn header is cut, rewritten and synced, with its directory" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoSegmentsOnDisk(&sim);
+    {
+        const st = sim.storage();
+        const h = try st.open(seg_2, .open_or_create);
+        defer st.close(h);
+        try st.truncate(h, 8);
+        try st.sync(h);
+    }
+    var vt: Storage.VTable = undefined;
+    const st = OpTrace.wrap(&sim, &vt);
+    var log = try Log.open(testing.allocator, st, .{});
+    defer log.close();
+    try expectTrace("dddd" ++ "t" ++ "ws" ++ "D");
+}
+
+test "a rotate makes everything before it durable, whatever the sync policy" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try Log.open(testing.allocator, sim.storage(), .{ .create = true, .sync = .manual });
+    defer log.close();
+    try log.rotate(1);
+    _ = try log.append("a");
+    _ = try log.append("b");
+    try testing.expectEqual(@as(u64, 1), log.durableLsn());
+    try log.rotate(2);
+    try testing.expectEqual(@as(u64, 3), log.durableLsn());
+    try testing.expectEqual(@as(u64, 3), log.nextLsn());
+}
+
+test "auto-rotation by age: a reopened segment keeps the age it had, not the age of the epoch" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    test_clock = 1000;
+    const opts: Options = .{ .create = true, .now = testClock, .auto_rotate = .{ .max_age = 60 } };
+    {
+        var log = try Log.open(testing.allocator, sim.storage(), opts);
+        defer log.close();
+        _ = try log.append("a");
+    }
+    test_clock = 1050;
+    var log = try Log.open(testing.allocator, sim.storage(), opts);
+    defer log.close();
+    try testing.expectEqual(@as(u64, 1), (try log.append("b")).pos.segment);
+}
+
+test "a newest segment whose seal is wrong, or whose record is of no known kind, is Corrupt, never cut" {
+    { // a seal with a good CRC and the wrong count
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        {
+            var log = try openSim(&sim);
+            defer log.close();
+            try log.rotate(1);
+            _ = try log.append("x");
+            try log.seal(&log.active.?);
+            log.store.close(log.active.?.handle);
+            log.active.?.index.deinit(testing.allocator);
+            log.active = null;
+        }
+        const c = sim.fileContent(seg_1).?;
+        const seal = c.len - (rec_header_len + seal_payload_len);
+        c[seal + rec_header_len] = 9; // count
+        std.mem.writeInt(u32, c[seal..][0..4], crc32c(c[seal + 4 ..]), .little);
+        try testing.expectError(error.Corrupt, openSim(&sim));
+    }
+    { // a record of type 3, whole and checksummed
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        try twoSegmentsOnDisk(&sim);
+        var rec: [rec_header_len + 1]u8 = undefined;
+        encodeRecord(&rec, 3, 3, 0, "?");
+        try sim.appendDurable(seg_2, &rec);
+        const before = sim.fileContent(seg_2).?.len;
+        try testing.expectError(error.Corrupt, openSim(&sim));
+        try testing.expectEqual(before, sim.fileContent(seg_2).?.len);
+    }
+}
+
+test "Concurrent.appendEntries returns only when its records are durable" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var c = try Concurrent.open(testing.allocator, sim.storage(), testing.io, .{ .create = true });
+    defer c.close();
+    try c.rotate(1);
+    const es = [_]Entry{ .{ .ts = 5, .payload = "a" }, .{ .ts = 6, .payload = "b" } };
+    const first = try c.appendEntries(&es);
+    try testing.expectEqual(@as(u64, 1), first.lsn);
+    try testing.expectEqual(@as(u64, 3), c.nextLsn());
+    try testing.expectEqual(@as(u64, 3), c.durableLsn());
+    _ = try c.appendMany(&.{"c"});
+    try testing.expectEqual(c.nextLsn(), c.durableLsn());
+}
+
+test "every field of a seal is checked against what its segment holds, compacted or not" {
+    // Where each field sits in the seal record: its header's LSN and time, then the payload.
+    const fields = [_]struct { name: []const u8, at: usize }{
+        .{ .name = "header lsn", .at = 9 },
+        .{ .name = "header ts", .at = 17 },
+        .{ .name = "count", .at = 25 },
+        .{ .name = "offset", .at = 33 },
+        .{ .name = "first lsn", .at = 41 },
+        .{ .name = "last lsn", .at = 49 },
+        .{ .name = "min ts", .at = 57 },
+        .{ .name = "max ts", .at = 65 },
+    };
+    for ([_]bool{ false, true }) |compacted| for (fields) |f| {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        {
+            var log = try openSim(&sim);
+            defer log.close();
+            try log.rotate(1);
+            _ = try log.appendAt(10, "a");
+            _ = try log.appendAt(20, "b");
+            _ = try log.appendAt(30, "c");
+            try log.rotate(2);
+            _ = try log.appendAt(40, "z");
+            if (compacted) _ = try log.compact(1, {}, keepAll);
+        }
+        const c = sim.fileContent(seg_1).?;
+        const seal = c.len - (rec_header_len + seal_payload_len);
+        c[seal + f.at] ^= 1;
+        std.mem.writeInt(u32, c[seal..][0..4], crc32c(c[seal + 4 ..]), .little);
+        var log = try openSim(&sim);
+        defer log.close();
+        var it = log.iterator(null);
+        defer it.deinit();
+        var got: ?Damage = null;
+        while (true) {
+            if (it.next()) |r| {
+                if (r == null) break;
+            } else |e| {
+                try testing.expectEqual(error.Corrupt, e);
+                got = it.damage();
+                break;
+            }
+        }
+        testing.expect(got != null and got.?.reason == .bad_seal) catch |e| {
+            std.debug.print("seal field {s}, compacted {}\n", .{ f.name, compacted });
+            return e;
+        };
+    };
+}
+
+test "bytes after a closed segment's seal are named as such, and a corrupt header that is repaired reads on" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoSegmentsOnDisk(&sim);
+    try sim.appendDurable(seg_1, "\x01\x02");
+    {
+        var log = try openSim(&sim);
+        defer log.close();
+        var it = log.iterator(null);
+        defer it.deinit();
+        try testing.expectEqualStrings("x", (try it.next()).?.payload);
+        try testing.expectError(error.Corrupt, it.next());
+        try testing.expectEqual(Damage.Reason.bytes_after_seal, it.damage().?.reason);
+    }
+    var sim2 = SimStorage.init(testing.allocator);
+    defer sim2.deinit();
+    try twoSegmentsOnDisk(&sim2);
+    var log = try openSim(&sim2);
+    defer log.close();
+    var it = log.iterator(null);
+    defer it.deinit();
+    sim2.fileContent(seg_1).?[26] ^= 0x40;
+    try testing.expectError(error.Corrupt, it.next());
+    try testing.expect(it.damage() != null);
+    sim2.fileContent(seg_1).?[26] ^= 0x40;
+    try testing.expectEqualStrings("x", (try it.next()).?.payload);
+    try testing.expectEqual(@as(?Damage, null), it.damage());
+}
+
+/// Segment 1 with records r1..r5 (LSNs 1..5, times 1..5), closed; segment 2 with "z" (LSN 6).
+/// Returns where each of the five starts.
+fn fiveRecords(sim: *SimStorage) ![5]u64 {
+    var offs: [5]u64 = undefined;
+    var log = try openSim(sim);
+    defer log.close();
+    try log.rotate(1);
+    const names = [_][]const u8{ "r1", "r2", "r3", "r4", "r5" };
+    for (names, 0..) |n, i| offs[i] = (try log.appendAt(@intCast(i + 1), n)).pos.offset;
+    try log.rotate(2);
+    _ = try log.appendAt(6, "z");
+    return offs;
+}
+
+/// Give the two-byte-payload record at `off` this LSN, with its CRC made good again.
+fn setRecordLsn(c: []u8, off: u64, lsn: u64) void {
+    const o: usize = @intCast(off);
+    std.mem.writeInt(u64, c[o + 9 ..][0..8], lsn, .little);
+    std.mem.writeInt(u32, c[o..][0..4], crc32c(c[o + 4 .. o + rec_header_len + 2]), .little);
+}
+
+fn payloadOf(it: *Iterator) ![]const u8 {
+    return (try it.next()).?.payload;
+}
+
+test "resync passes over records that cannot be the next one: an LSN already read, or beyond any log" {
+    for ([_]u64{ 1, max_lsn + 1 }) |r4_lsn| {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        const offs = try fiveRecords(&sim);
+        const c = sim.fileContent(seg_1).?;
+        c[@intCast(offs[2] + rec_header_len)] ^= 0x40; // r3: a bad CRC
+        setRecordLsn(c, offs[3], r4_lsn);
+        var log = try openSim(&sim);
+        defer log.close();
+        var it = log.iterator(null);
+        defer it.deinit();
+        try testing.expectEqualStrings("r1", try payloadOf(&it));
+        try testing.expectEqualStrings("r2", try payloadOf(&it));
+        try testing.expectError(error.Corrupt, it.next());
+        const gap = (try it.resync()).?;
+        try testing.expectEqual(@as(?u64, 3), gap.from_lsn);
+        try testing.expectEqual(@as(?u64, 4), gap.to_lsn);
+        try testing.expectEqualStrings("r5", try payloadOf(&it));
+        try testing.expectEqualStrings("z", try payloadOf(&it));
+    }
+}
+
+test "resync starts after the damaged record, even when that record is whole but out of sequence" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const offs = try fiveRecords(&sim);
+    setRecordLsn(sim.fileContent(seg_1).?, offs[2], 5); // r3 claims LSN 5
+    var log = try openSim(&sim);
+    defer log.close();
+    var it = log.iterator(null);
+    defer it.deinit();
+    _ = try payloadOf(&it);
+    _ = try payloadOf(&it);
+    try testing.expectError(error.Corrupt, it.next());
+    try testing.expectEqual(Damage.Reason.lsn_out_of_sequence, it.damage().?.reason);
+    const gap = (try it.resync()).?;
+    try testing.expectEqual(@as(?u64, 3), gap.from_lsn);
+    try testing.expectEqual(@as(?u64, 3), gap.to_lsn);
+    try testing.expectEqualStrings("r4", try payloadOf(&it));
+}
+
+test "resync finds an empty record that ends the segment, and a seal that does not fit is no seal" {
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var log = try openSim(&sim);
+        defer log.close();
+        try log.rotate(1);
+        _ = try log.appendAt(1, "aa");
+        const p2 = try log.appendAt(2, "bb");
+        _ = try log.appendAt(3, "");
+        sim.fileContent(seg_1).?[@intCast(p2.pos.offset + rec_header_len)] ^= 0x40;
+        var it = log.iterator(null);
+        defer it.deinit();
+        try testing.expectEqualStrings("aa", try payloadOf(&it));
+        try testing.expectError(error.Corrupt, it.next());
+        const gap = (try it.resync()).?;
+        try testing.expectEqual(@as(?u64, 2), gap.from_lsn);
+        try testing.expectEqual(@as(?u64, 2), gap.to_lsn);
+        const r = (try it.next()).?;
+        try testing.expectEqual(@as(u64, 3), r.lsn);
+        try testing.expectEqualStrings("", r.payload);
+    }
+    { // r2 damaged, and the seal that follows names a wrong offset for itself
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        {
+            var log = try openSim(&sim);
+            defer log.close();
+            try log.rotate(1);
+            _ = try log.appendAt(1, "aa");
+            _ = try log.appendAt(2, "bb");
+            try log.rotate(2);
+            _ = try log.appendAt(3, "z");
+        }
+        const c = sim.fileContent(seg_1).?;
+        c[40 + 27 + rec_header_len] ^= 0x40;
+        const seal = c.len - (rec_header_len + seal_payload_len);
+        c[seal + 33] ^= 1; // the seal's own offset
+        std.mem.writeInt(u32, c[seal..][0..4], crc32c(c[seal + 4 ..]), .little);
+        var log = try openSim(&sim);
+        defer log.close();
+        var it = log.iterator(null);
+        defer it.deinit();
+        _ = try payloadOf(&it);
+        try testing.expectError(error.Corrupt, it.next());
+        const gap = (try it.resync()).?;
+        try testing.expectEqual(@as(?u64, 2), gap.from_lsn);
+        try testing.expectEqual(@as(?u64, 2), gap.to_lsn);
+        try testing.expectEqualStrings("z", try payloadOf(&it));
+    }
+}
+
+test "a writer's resync never goes past what is durable" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try Log.open(testing.allocator, sim.storage(), .{ .create = true, .sync = .manual });
+    defer log.close();
+    try log.rotate(1);
+    _ = try log.appendAt(1, "aa");
+    const p2 = try log.appendAt(2, "bb");
+    try log.sync();
+    _ = try log.appendAt(3, "cc"); // not durable
+    sim.fileContent(seg_1).?[@intCast(p2.pos.offset + rec_header_len)] ^= 0x40;
+    var it = log.iterator(null);
+    defer it.deinit();
+    _ = try payloadOf(&it);
+    try testing.expectError(error.Corrupt, it.next());
+    const gap = (try it.resync()).?;
+    try testing.expectEqual(@as(?u64, 2), gap.from_lsn);
+    try testing.expectEqual(@as(?u64, null), gap.to_lsn);
+    try testing.expectEqual(@as(?Record, null), try it.next());
+}
+
+test "skipSegment forgets the start position, so a bad header at it is stepped over" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoSegmentsOnDisk(&sim);
+    sim.fileContent(seg_1).?[26] ^= 0x40;
+    var log = try openSim(&sim);
+    defer log.close();
+    var it = log.iterator(.{ .segment = 1, .offset = segment_header_len });
+    defer it.deinit();
+    try testing.expectError(error.Corrupt, it.next());
+    const gap = it.skipSegment().?;
+    try testing.expectEqual(@as(?u64, 1), gap.from_lsn);
+    try testing.expectEqualStrings("y", try payloadOf(&it));
+}
+
+test "an iterator started inside a segment still checks the seal's last LSN against what it read" {
+    for ([_]u64{ 2, 5 }) |last| {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var second: Position = undefined;
+        {
+            var log = try openSim(&sim);
+            defer log.close();
+            try log.rotate(1);
+            _ = try log.appendAt(1, "r1");
+            second = (try log.appendAt(2, "r2")).pos;
+            _ = try log.appendAt(3, "r3");
+            try log.rotate(2);
+            _ = try log.appendAt(4, "z");
+        }
+        const c = sim.fileContent(seg_1).?;
+        const seal = c.len - (rec_header_len + seal_payload_len);
+        std.mem.writeInt(u64, c[seal + 49 ..][0..8], last, .little);
+        std.mem.writeInt(u32, c[seal..][0..4], crc32c(c[seal + 4 ..]), .little);
+        var log = try openSim(&sim);
+        defer log.close();
+        var it = log.iterator(second);
+        defer it.deinit();
+        try testing.expectEqualStrings("r2", try payloadOf(&it));
+        try testing.expectEqualStrings("r3", try payloadOf(&it));
+        try testing.expectError(error.Corrupt, it.next());
+        try testing.expectEqual(Damage.Reason.bad_seal, it.damage().?.reason);
+    }
+}
+
+test "resync takes a seal only if it does not end before what was read, and leaves no damage behind" {
+    for ([_]struct { last: u64, to: u64 }{ .{ .last = 1, .to = 3 }, .{ .last = 2, .to = 2 } }) |cs| {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        {
+            var log = try openSim(&sim);
+            defer log.close();
+            try log.rotate(1);
+            _ = try log.appendAt(1, "r1");
+            _ = try log.appendAt(2, "r2");
+            _ = try log.appendAt(3, "r3");
+            try log.rotate(2);
+            _ = try log.appendAt(4, "z");
+        }
+        const c = sim.fileContent(seg_1).?;
+        c[40 + 27 + 27 + rec_header_len] ^= 0x40; // r3
+        const seal = c.len - (rec_header_len + seal_payload_len);
+        std.mem.writeInt(u64, c[seal + 49 ..][0..8], cs.last, .little);
+        std.mem.writeInt(u32, c[seal..][0..4], crc32c(c[seal + 4 ..]), .little);
+        var log = try openSim(&sim);
+        defer log.close();
+        var it = log.iterator(null);
+        defer it.deinit();
+        _ = try payloadOf(&it);
+        _ = try payloadOf(&it);
+        try testing.expectError(error.Corrupt, it.next());
+        const gap = (try it.resync()).?;
+        try testing.expectEqual(@as(?u64, 3), gap.from_lsn);
+        try testing.expectEqual(@as(?u64, cs.to), gap.to_lsn);
+        try testing.expectEqual(@as(?Damage, null), it.damage());
+        try testing.expectEqualStrings("z", try payloadOf(&it));
+    }
+}
+
+test "a position whose LSN is not the record at its offset is found by LSN, and one at a seal with LSN 0 is gone" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const offs = try fiveRecords(&sim);
+    var log = try openSim(&sim);
+    defer log.close();
+    {
+        var it = log.iterator(.{ .segment = 1, .offset = offs[0], .lsn = 3 });
+        defer it.deinit();
+        try testing.expectEqualStrings("r3", try payloadOf(&it));
+    }
+    {
+        const seal_at = sim.fileContent(seg_1).?.len - (rec_header_len + seal_payload_len);
+        var it = log.iterator(.{ .segment = 1, .offset = seal_at, .lsn = 0 });
+        defer it.deinit();
+        try testing.expectError(error.SegmentGone, it.next());
+    }
+    {
+        // The live end of the active segment, claiming an LSN that is not the next.
+        var it = log.iterator(.{ .segment = 2, .offset = log.end().?.offset, .lsn = 1 });
+        defer it.deinit();
+        try testing.expectEqualStrings("r1", try payloadOf(&it));
+    }
+}
+
+test "Position.eql compares the place, not the LSN" {
+    const a: Position = .{ .segment = 1, .offset = 40, .lsn = 7 };
+    try testing.expect(a.eql(.{ .segment = 1, .offset = 40 }));
+    try testing.expect(!a.eql(.{ .segment = 1, .offset = 41, .lsn = 7 }));
+    try testing.expect(!a.eql(.{ .segment = 2, .offset = 40, .lsn = 7 }));
+}
+
+test "SyncLatency buckets by the power of two of the microseconds, and its quantiles are upper bounds" {
+    var l: SyncLatency = .{};
+    try testing.expectEqual(@as(u64, 0), l.quantileUpperUs(0.5));
+    l.record(500); // under a microsecond: bucket 0
+    l.record(1_500); // 1 us: bucket 1
+    l.record(5_000); // 5 us: bucket 3
+    l.record(70_000); // 70 us: bucket 7
+    try testing.expectEqual(@as(u64, 4), l.count);
+    try testing.expectEqual(@as(u64, 77_000), l.total_ns);
+    try testing.expectEqual(@as(u64, 70_000), l.max_ns);
+    for ([_]usize{ 0, 1, 3, 7 }) |i| try testing.expectEqual(@as(u64, 1), l.buckets[i]);
+    try testing.expectEqual(@as(u64, 1), l.quantileUpperUs(0.25));
+    try testing.expectEqual(@as(u64, 2), l.quantileUpperUs(0.5));
+    try testing.expectEqual(@as(u64, 128), l.quantileUpperUs(1.0));
+    try testing.expectEqual(@as(u64, 1), l.quantileUpperUs(0.0));
+}
+
+test "a read of a compressed segment that runs past its end returns what there is" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try openSim(&sim);
+    defer log.close();
+    try log.rotate(1);
+    for (0..10) |_| _ = try log.append("compress me, compress me");
+    try log.rotate(2);
+    _ = try log.compress(1);
+    var nb: [seg_name_len]u8 = undefined;
+    const h = try log.store.open(segName(&nb, 1), .read_only);
+    defer log.store.close(h);
+    const size = try log.store.size(h);
+    var buf: [4096]u8 = undefined;
+    try testing.expect(size > 100 and size < buf.len);
+    try testing.expectEqual(@as(usize, @intCast(size)), try log.store.pread(h, &buf, 0));
+    try testing.expectEqual(@as(usize, 5), try log.store.pread(h, &buf, size - 5));
+    try testing.expectEqual(@as(usize, 0), try log.store.pread(h, &buf, size));
+}

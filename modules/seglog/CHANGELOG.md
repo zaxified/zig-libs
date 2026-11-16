@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** tests only, from the whole-module mutation audit
+  (SPEC *Anchoring*): unit tests for the sparse index, the tally, the seal codec and the read window;
+  the on-disk layout byte by byte (header, record, seal, manifest, index); the durability protocol as
+  a call-by-call trace of the storage seam (which writes, syncs, renames, truncates, deletes and
+  directory syncs each operation makes); every field of the manifest, the index file and a seal
+  refused when wrong with a good CRC; seek and `resync` edge cases; a migration whose converted
+  segment is well formed and wrong.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — Tools wired into zig-libs (they still named the old consumer's
   paths and build steps): `example/bench.zig` is now `tools/bench.zig`, so `zig build
