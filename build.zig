@@ -300,7 +300,7 @@ pub const module_list = [_]Module{
     .{ .name = "jwt", .libs = &.{"web"}, .deps = &.{ "http", "router", "p256", "p384", "p521", "rsa", "ct25519", "b64ct", "sha2", "keycodec", "clock" }, .test_deps = &.{"testkit"}, .interop_deps = &.{"benchkit"}, .loopback = true },
     .{ .name = "rbac", .libs = &.{"web"} },
     .{ .name = "xml", .libs = &.{ "web", "net" }, .test_deps = &.{"testkit"} },
-    .{ .name = "xmldsig", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "p256" }, .test_deps = &.{"testkit"} },
+    .{ .name = "xmldsig", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "p256", "p384", "p521" }, .test_deps = &.{"testkit"} },
     .{ .name = "saml", .libs = &.{"web"}, .deps = &.{ "xmldsig", "xml", "xmlenc", "rsa", "x509", "datefmt" }, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "xmlenc", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm" }, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "aescbc", .libs = &.{ "web", "crypto" }, .test_deps = &.{ "testkit", "aes192" } }, // aes192: the AES-192 KAT/fuzz cases (the API is generic over the cipher type)

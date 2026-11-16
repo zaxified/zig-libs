@@ -34,7 +34,10 @@
 //!   an attack surface, not implemented at all.
 //! - Digest: SHA-256 (primary), SHA-384, SHA-512; SHA-1 only when
 //!   `Options.allow_weak_sha1` is set (flagged weak).
-//! - Signature: RSA-SHA256 (primary), RSA-SHA384, RSA-SHA512, ECDSA-P256-SHA256;
+//! - Signature: RSA-SHA256 (primary), RSA-SHA384, RSA-SHA512, ECDSA-P256-SHA256,
+//!   ECDSA-P384-SHA384, ECDSA-P521-SHA512, RSA-PSS (RFC 9231 fixed profile
+//!   `sha256/384/512-rsa-MGF1`, salt = digest length, no parameter elements),
+//!   HMAC-SHA256 (full-length MAC only; any `HMACOutputLength` is refused);
 //!   RSA-SHA1 only when `Options.allow_weak_sha1`.
 //!
 //! Never panics on malformed signature XML: every failure is a typed error.
@@ -43,6 +46,8 @@ const std = @import("std");
 const xml = @import("xml");
 const rsa = @import("rsa");
 const p256 = @import("p256");
+const p384 = @import("p384");
+const p521 = @import("p521");
 
 pub const c14n = @import("c14n.zig");
 
@@ -59,7 +64,7 @@ pub const meta = .{
     .role = .util, // pure verification logic over a parsed tree — no I/O, no wire framing
     .concurrency = .reentrant,
     .model_after = "W3C XML Signature Syntax and Processing (xmldsig-core 1.1) + Exclusive/Canonical XML 1.0",
-    .deps = .{ "xml", "rsa", "p256" },
+    .deps = .{ "xml", "rsa", "p256", "p384", "p521" },
 };
 
 // ── namespace + algorithm identifiers ───────────────────────────────────────
@@ -88,6 +93,14 @@ const sig_rsa_sha256 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
 const sig_rsa_sha384 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384";
 const sig_rsa_sha512 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512";
 const sig_ecdsa_sha256 = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256";
+const sig_ecdsa_sha384 = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384";
+const sig_ecdsa_sha512 = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512";
+// RFC 9231 §2.1.1: RSASSA-PSS with a fixed profile (MGF1 over the same hash,
+// salt length = digest length, trailer 0xBC), no parameter elements.
+const sig_rsa_pss_sha256 = "http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1";
+const sig_rsa_pss_sha384 = "http://www.w3.org/2007/05/xmldsig-more#sha384-rsa-MGF1";
+const sig_rsa_pss_sha512 = "http://www.w3.org/2007/05/xmldsig-more#sha512-rsa-MGF1";
+const sig_hmac_sha256 = "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256";
 
 // ── public types ────────────────────────────────────────────────────────────
 
@@ -99,6 +112,15 @@ pub const VerifyKey = union(enum) {
     /// A P-256 public key as a SEC1-encoded point (33-byte compressed or
     /// 65-byte uncompressed).
     ecdsa_p256_sec1: []const u8,
+    /// A P-384 public key as a SEC1-encoded point (49-byte compressed or
+    /// 97-byte uncompressed); used with `ecdsa-sha384`.
+    ecdsa_p384_sec1: []const u8,
+    /// A P-521 public key as a SEC1-encoded point (67-byte compressed or
+    /// 133-byte uncompressed); used with `ecdsa-sha512`.
+    ecdsa_p521_sec1: []const u8,
+    /// A shared HMAC secret (`hmac-sha256`). SECRET: the caller owns and
+    /// scrubs it. An empty secret is refused (`KeyAlgorithmMismatch`).
+    hmac: []const u8,
 };
 
 pub const Options = struct {
@@ -227,7 +249,19 @@ pub const VerifyError = error{
 // ── internal algorithm enums ────────────────────────────────────────────────
 
 const DigestAlg = enum { sha1, sha256, sha384, sha512 };
-const SigAlg = enum { rsa_sha1, rsa_sha256, rsa_sha384, rsa_sha512, ecdsa_sha256 };
+const SigAlg = enum {
+    rsa_sha1,
+    rsa_sha256,
+    rsa_sha384,
+    rsa_sha512,
+    ecdsa_sha256,
+    ecdsa_sha384,
+    ecdsa_sha512,
+    rsa_pss_sha256,
+    rsa_pss_sha384,
+    rsa_pss_sha512,
+    hmac_sha256,
+};
 
 fn mapC14n(uri: []const u8) ?c14n.Mode {
     if (std.mem.eql(u8, uri, alg_exc_c14n)) return .exclusive;
@@ -251,6 +285,12 @@ fn mapSig(uri: []const u8) ?SigAlg {
     if (std.mem.eql(u8, uri, sig_rsa_sha512)) return .rsa_sha512;
     if (std.mem.eql(u8, uri, sig_ecdsa_sha256)) return .ecdsa_sha256;
     if (std.mem.eql(u8, uri, sig_rsa_sha1)) return .rsa_sha1;
+    if (std.mem.eql(u8, uri, sig_ecdsa_sha384)) return .ecdsa_sha384;
+    if (std.mem.eql(u8, uri, sig_ecdsa_sha512)) return .ecdsa_sha512;
+    if (std.mem.eql(u8, uri, sig_rsa_pss_sha256)) return .rsa_pss_sha256;
+    if (std.mem.eql(u8, uri, sig_rsa_pss_sha384)) return .rsa_pss_sha384;
+    if (std.mem.eql(u8, uri, sig_rsa_pss_sha512)) return .rsa_pss_sha512;
+    if (std.mem.eql(u8, uri, sig_hmac_sha256)) return .hmac_sha256;
     return null;
 }
 
@@ -396,6 +436,17 @@ pub fn verify(
     const sm_uri = sm.attr("", "Algorithm") orelse return error.MalformedSignature;
     const sig_alg = mapSig(sm_uri) orelse return error.UnsupportedAlgorithm;
     if (sig_alg == .rsa_sha1 and !options.allow_weak_sha1) return error.UnsupportedAlgorithm;
+    // The PSS (fixed RFC 9231 profile) and HMAC methods take no parameter
+    // elements here. For HMAC the only legal child is `HMACOutputLength`
+    // (truncation; CVE-2009-0217: a 1-bit "MAC" verifies against anything) and
+    // it is refused, never honoured, as is any other child.
+    switch (sig_alg) {
+        .rsa_pss_sha256, .rsa_pss_sha384, .rsa_pss_sha512, .hmac_sha256 => for (sm.children) |c| switch (c.content) {
+            .element => return error.UnsupportedAlgorithm,
+            else => {},
+        },
+        else => {},
+    }
 
     // ── Reference validation ────────────────────────────────────────────────
     var refs: std.ArrayList(RefResult) = .empty;
@@ -699,6 +750,58 @@ fn verifySignature(alg: SigAlg, key: VerifyKey, signed_info_canon: []const u8, s
             var rs: [64]u8 = undefined;
             @memcpy(&rs, sig[0..64]);
             return p256.sign.ecdsaVerify(sec1, signed_info_canon, rs);
+        },
+        .ecdsa_sha384 => {
+            const sec1 = switch (key) {
+                .ecdsa_p384_sec1 => |s| s,
+                else => return error.KeyAlgorithmMismatch,
+            };
+            if (sig.len != p384.EcdsaP384Sha384.Signature.encoded_length) return false;
+            const pk = p384.EcdsaP384Sha384.PublicKey.fromSec1(sec1) catch return false;
+            const sg = p384.EcdsaP384Sha384.Signature.fromBytes(sig[0..p384.EcdsaP384Sha384.Signature.encoded_length].*);
+            sg.verify(signed_info_canon, pk) catch return false;
+            return true;
+        },
+        .ecdsa_sha512 => {
+            const sec1 = switch (key) {
+                .ecdsa_p521_sec1 => |s| s,
+                else => return error.KeyAlgorithmMismatch,
+            };
+            if (sig.len != p521.EcdsaP521Sha512.Signature.encoded_length) return false;
+            const pk = p521.EcdsaP521Sha512.PublicKey.fromSec1(sec1) catch return false;
+            const sg = p521.EcdsaP521Sha512.Signature.fromBytes(sig[0..p521.EcdsaP521Sha512.Signature.encoded_length].*);
+            sg.verify(signed_info_canon, pk) catch return false;
+            return true;
+        },
+        .rsa_pss_sha256, .rsa_pss_sha384, .rsa_pss_sha512 => {
+            const pk = switch (key) {
+                .rsa => |p| p,
+                else => return error.KeyAlgorithmMismatch,
+            };
+            // Salt length = digest length (RFC 9231 §2.1.1); any failure is
+            // the generic "did not verify".
+            const res = switch (alg) {
+                .rsa_pss_sha256 => rsa.verifyPss(pk, std.crypto.hash.sha2.Sha256, signed_info_canon, sig, 32),
+                .rsa_pss_sha384 => rsa.verifyPss(pk, std.crypto.hash.sha2.Sha384, signed_info_canon, sig, 48),
+                .rsa_pss_sha512 => rsa.verifyPss(pk, std.crypto.hash.sha2.Sha512, signed_info_canon, sig, 64),
+                else => unreachable,
+            };
+            res catch return false;
+            return true;
+        },
+        .hmac_sha256 => {
+            const secret = switch (key) {
+                .hmac => |k| k,
+                else => return error.KeyAlgorithmMismatch,
+            };
+            if (secret.len == 0) return error.KeyAlgorithmMismatch;
+            const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+            var mac: [Hmac.mac_length]u8 = undefined;
+            Hmac.create(&mac, signed_info_canon, secret);
+            defer std.crypto.secureZero(u8, &mac);
+            // Full-length MAC only: a truncated SignatureValue is a mismatch.
+            if (sig.len != Hmac.mac_length) return false;
+            return std.crypto.timing_safe.eql([Hmac.mac_length]u8, mac, sig[0..Hmac.mac_length].*);
         },
     }
 }
@@ -1930,7 +2033,7 @@ const fuzz_c14n_algs = [_][]const u8{
     alg_exc_c14n, alg_exc_c14n_wc, alg_c14n, alg_c14n_wc, "urn:not-a-c14n",
 };
 const fuzz_sig_algs = [_][]const u8{
-    sig_rsa_sha256, sig_rsa_sha384, sig_rsa_sha512, sig_rsa_sha1, sig_ecdsa_sha256, "urn:not-a-sig",
+    sig_rsa_sha256, sig_rsa_sha384, sig_rsa_sha512, sig_rsa_sha1, sig_ecdsa_sha256, sig_ecdsa_sha384, sig_ecdsa_sha512, sig_rsa_pss_sha256, sig_hmac_sha256, "urn:not-a-sig",
 };
 const fuzz_digest_algs = [_][]const u8{
     dig_sha256, dig_sha384, dig_sha512, dig_sha1, "urn:not-a-digest",
@@ -2508,4 +2611,223 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+// ── ECDSA P-384/P-521, RSA-PSS and HMAC-SHA256 signature methods ─────────────
+
+/// Build an enveloped-signed document whose SignatureMethod is `alg_uri` (with
+/// `sm_inner` as its children). `signer.sign(si_canon, buf)` produces the
+/// SignatureValue octets over the canonical SignedInfo.
+fn buildSignedWith(a: std.mem.Allocator, alg_uri: []const u8, sm_inner: []const u8, signer: anytype) ![]u8 {
+    const tmpl =
+        "<Envelope ID=\"obj-1\" xmlns=\"urn:demo\"><Data>content</Data>" ++
+        "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:SignedInfo>" ++
+        "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+        "<ds:SignatureMethod Algorithm=\"{s}\">{s}</ds:SignatureMethod>" ++
+        "<ds:Reference URI=\"\"><ds:Transforms>" ++
+        "<ds:Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>" ++
+        "<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/></ds:Transforms>" ++
+        "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>" ++
+        "<ds:DigestValue>{s}</ds:DigestValue></ds:Reference></ds:SignedInfo>" ++
+        "<ds:SignatureValue>{s}</ds:SignatureValue></ds:Signature></Envelope>";
+    const t0 = try a.print(tmpl, .{ alg_uri, sm_inner, "", "" });
+    defer a.free(t0);
+    var d0 = try xml.parse(a, t0, .{});
+    defer d0.deinit();
+    const ref_canon = try c14n.canonicalize(a, d0.root, .{ .mode = .exclusive, .omit = childByName(d0.root, "Signature").? });
+    defer a.free(ref_canon);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(ref_canon, &digest, .{});
+    var db64: [64]u8 = undefined;
+    const dig_b64 = std.base64.standard.Encoder.encode(&db64, &digest);
+    const t1 = try a.print(tmpl, .{ alg_uri, sm_inner, dig_b64, "" });
+    defer a.free(t1);
+    var d1 = try xml.parse(a, t1, .{});
+    defer d1.deinit();
+    const si = childByName(childByName(d1.root, "Signature").?, "SignedInfo").?;
+    const si_canon = try c14n.canonicalize(a, si, .{ .mode = .exclusive });
+    defer a.free(si_canon);
+    var sbuf: [1024]u8 = undefined;
+    const sig_raw = signer.sign(si_canon, &sbuf);
+    var b64: [1400]u8 = undefined;
+    const sig_b64 = std.base64.standard.Encoder.encode(&b64, sig_raw);
+    return a.print(tmpl, .{ alg_uri, sm_inner, dig_b64, sig_b64 });
+}
+
+fn verifyBuilt(a: std.mem.Allocator, xml_text: []const u8, key: VerifyKey) !bool {
+    var doc = try xml.parse(a, xml_text, .{});
+    defer doc.deinit();
+    var res = try verify(a, &doc, childByName(doc.root, "Signature").?, .{ .key = key });
+    defer res.deinit(a);
+    return res.valid;
+}
+
+/// Flip one character of the first `<Data>` content: breaks the reference
+/// digest, so use `tamperSignedInfo` to hit the signature check itself.
+fn tamperSignedInfo(a: std.mem.Allocator, xml_text: []const u8) ![]u8 {
+    // Change the (signed) reference URI attribute value's context: add a
+    // second, harmless-looking attribute to the SignatureMethod.
+    const needle = "<ds:SignatureMethod ";
+    const i = std.mem.find(u8, xml_text, needle).? + needle.len;
+    return std.mem.concat(a, u8, &.{ xml_text[0..i], "x=\"1\" ", xml_text[i..] });
+}
+
+fn EcSigner(comptime Ecdsa: type) type {
+    return struct {
+        kp: Ecdsa.KeyPair,
+        fn sign(self: @This(), msg: []const u8, buf: []u8) []const u8 {
+            const sg = self.kp.sign(msg, null) catch unreachable;
+            const raw = sg.toBytes();
+            @memcpy(buf[0..raw.len], &raw);
+            return buf[0..raw.len];
+        }
+    };
+}
+
+test "verify: ECDSA-P384-SHA384 round-trips; tampered SignedInfo, wrong key and key-type mismatch refused" {
+    const a = testing.allocator;
+    const E = p384.EcdsaP384Sha384;
+    const kp = try E.KeyPair.generateDeterministic(@splat(0x31));
+    const other = try E.KeyPair.generateDeterministic(@splat(0x32));
+    const doc = try buildSignedWith(a, sig_ecdsa_sha384, "", EcSigner(E){ .kp = kp });
+    defer a.free(doc);
+    const pub_u = kp.public_key.toUncompressedSec1();
+    const pub_c = kp.public_key.toCompressedSec1();
+    try testing.expect(try verifyBuilt(a, doc, .{ .ecdsa_p384_sec1 = &pub_u }));
+    try testing.expect(try verifyBuilt(a, doc, .{ .ecdsa_p384_sec1 = &pub_c }));
+    const other_pub = other.public_key.toUncompressedSec1();
+    try testing.expect(!try verifyBuilt(a, doc, .{ .ecdsa_p384_sec1 = &other_pub }));
+    try testing.expect(!try verifyBuilt(a, doc, .{ .ecdsa_p384_sec1 = "garbage" }));
+    const tampered = try tamperSignedInfo(a, doc);
+    defer a.free(tampered);
+    try testing.expect(!try verifyBuilt(a, tampered, .{ .ecdsa_p384_sec1 = &pub_u }));
+    // A P-256 key (or any other family) with the P-384 URI is a typed error.
+    const p256_pub = (try p256.P256.combMulBase(@as([32]u8, @splat(0x11)), .big)).toUncompressedSec1();
+    try testing.expectError(error.KeyAlgorithmMismatch, verifyBuilt(a, doc, .{ .ecdsa_p256_sec1 = &p256_pub }));
+    // ... and the P-384 key with the P-256 URI.
+    const doc256 = try std.mem.replaceOwned(u8, a, doc, "ecdsa-sha384", "ecdsa-sha256");
+    defer a.free(doc256);
+    try testing.expectError(error.KeyAlgorithmMismatch, verifyBuilt(a, doc256, .{ .ecdsa_p384_sec1 = &pub_u }));
+    // Wrong-length SignatureValue is "did not verify".
+    const short = try std.mem.replaceOwned(u8, a, doc, "<ds:SignatureValue>", "<ds:SignatureValue>AAAA");
+    defer a.free(short);
+    try testing.expect(!try verifyBuilt(a, short, .{ .ecdsa_p384_sec1 = &pub_u }));
+}
+
+test "verify: ECDSA-P521-SHA512 round-trips; wrong key and mismatches refused" {
+    const a = testing.allocator;
+    const E = p521.EcdsaP521Sha512;
+    const kp = try E.KeyPair.generateDeterministic(@splat(0x41));
+    const other = try E.KeyPair.generateDeterministic(@splat(0x42));
+    const doc = try buildSignedWith(a, sig_ecdsa_sha512, "", EcSigner(E){ .kp = kp });
+    defer a.free(doc);
+    const pub_u = kp.public_key.toUncompressedSec1();
+    try testing.expect(try verifyBuilt(a, doc, .{ .ecdsa_p521_sec1 = &pub_u }));
+    const other_pub = other.public_key.toUncompressedSec1();
+    try testing.expect(!try verifyBuilt(a, doc, .{ .ecdsa_p521_sec1 = &other_pub }));
+    const tampered = try tamperSignedInfo(a, doc);
+    defer a.free(tampered);
+    try testing.expect(!try verifyBuilt(a, tampered, .{ .ecdsa_p521_sec1 = &pub_u }));
+    try testing.expectError(error.KeyAlgorithmMismatch, verifyBuilt(a, doc, .{ .ecdsa_p384_sec1 = &pub_u }));
+}
+
+const PssSigner = struct {
+    sk: *const rsa.SecretKey,
+    fn sign(self: @This(), msg: []const u8, buf: []u8) []const u8 {
+        var prng = std.Random.DefaultPrng.init(7);
+        return rsa.signPss(self.sk, std.crypto.hash.sha2.Sha256, prng.random(), msg, 32, buf) catch unreachable;
+    }
+};
+
+test "verify: RSA-PSS (sha256-rsa-MGF1) round-trips; tampering, wrong salt, parameters and EC key refused" {
+    const a = testing.allocator;
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&sk, test_rsa_priv_pem);
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+    const doc = try buildSignedWith(a, sig_rsa_pss_sha256, "", PssSigner{ .sk = &sk });
+    defer a.free(doc);
+    try testing.expect(try verifyBuilt(a, doc, .{ .rsa = pk }));
+    const tampered = try tamperSignedInfo(a, doc);
+    defer a.free(tampered);
+    try testing.expect(!try verifyBuilt(a, tampered, .{ .rsa = pk }));
+    // A PKCS#1 v1.5 URI over the same PSS octets does not verify.
+    const v15 = try std.mem.replaceOwned(u8, a, doc, "http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1", sig_rsa_sha256);
+    defer a.free(v15);
+    try testing.expect(!try verifyBuilt(a, v15, .{ .rsa = pk }));
+    // The sha384 URI over a SHA-256 PSS signature does not verify either.
+    const s384 = try std.mem.replaceOwned(u8, a, doc, "#sha256-rsa-MGF1", "#sha384-rsa-MGF1");
+    defer a.free(s384);
+    try testing.expect(!try verifyBuilt(a, s384, .{ .rsa = pk }));
+    // A different salt length (0) than the profile's: refused.
+    const Salt0 = struct {
+        sk: *const rsa.SecretKey,
+        fn sign(self: @This(), msg: []const u8, buf: []u8) []const u8 {
+            var prng = std.Random.DefaultPrng.init(7);
+            return rsa.signPss(self.sk, std.crypto.hash.sha2.Sha256, prng.random(), msg, 0, buf) catch unreachable;
+        }
+    };
+    const doc0 = try buildSignedWith(a, sig_rsa_pss_sha256, "", Salt0{ .sk = &sk });
+    defer a.free(doc0);
+    try testing.expect(!try verifyBuilt(a, doc0, .{ .rsa = pk }));
+    // Parameter elements are not accepted (fixed profile).
+    const withp = try buildSignedWith(a, sig_rsa_pss_sha256, "<ds:Foo/>", PssSigner{ .sk = &sk });
+    defer a.free(withp);
+    try testing.expectError(error.UnsupportedAlgorithm, verifyBuilt(a, withp, .{ .rsa = pk }));
+    // Key-type mismatch.
+    const ec = (try p256.P256.combMulBase(@as([32]u8, @splat(0x11)), .big)).toUncompressedSec1();
+    try testing.expectError(error.KeyAlgorithmMismatch, verifyBuilt(a, doc, .{ .ecdsa_p256_sec1 = &ec }));
+}
+
+const HmacSigner = struct {
+    key: []const u8,
+    fn sign(self: @This(), msg: []const u8, buf: []u8) []const u8 {
+        const H = std.crypto.auth.hmac.sha2.HmacSha256;
+        H.create(buf[0..H.mac_length], msg, self.key);
+        return buf[0..H.mac_length];
+    }
+};
+
+test "verify: HMAC-SHA256 round-trips; wrong key, tampering, truncation, HMACOutputLength and key-type mismatch refused" {
+    const a = testing.allocator;
+    const secret = "0123456789abcdef0123456789abcdef";
+    const doc = try buildSignedWith(a, sig_hmac_sha256, "", HmacSigner{ .key = secret });
+    defer a.free(doc);
+    try testing.expect(try verifyBuilt(a, doc, .{ .hmac = secret }));
+    try testing.expect(!try verifyBuilt(a, doc, .{ .hmac = "0123456789abcdef0123456789abcdeg" }));
+    const tampered = try tamperSignedInfo(a, doc);
+    defer a.free(tampered);
+    try testing.expect(!try verifyBuilt(a, tampered, .{ .hmac = secret }));
+    // Empty secret is a typed error, not a quiet false.
+    try testing.expectError(error.KeyAlgorithmMismatch, verifyBuilt(a, doc, .{ .hmac = "" }));
+    // CVE-2009-0217: HMACOutputLength is refused whatever the value, so a
+    // truncated MAC can never be what verified.
+    const trunc = "<ds:HMACOutputLength>8</ds:HMACOutputLength>";
+    const dt = try buildSignedWith(a, sig_hmac_sha256, trunc, HmacSigner{ .key = secret });
+    defer a.free(dt);
+    try testing.expectError(error.UnsupportedAlgorithm, verifyBuilt(a, dt, .{ .hmac = secret }));
+    const full = "<ds:HMACOutputLength>256</ds:HMACOutputLength>";
+    const df = try buildSignedWith(a, sig_hmac_sha256, full, HmacSigner{ .key = secret });
+    defer a.free(df);
+    try testing.expectError(error.UnsupportedAlgorithm, verifyBuilt(a, df, .{ .hmac = secret }));
+    // A SignatureValue shorter than the full MAC (even a true prefix) fails.
+    const Prefix = struct {
+        key: []const u8,
+        fn sign(self: @This(), msg: []const u8, buf: []u8) []const u8 {
+            return (HmacSigner{ .key = self.key }).sign(msg, buf)[0..16];
+        }
+    };
+    const dp = try buildSignedWith(a, sig_hmac_sha256, "", Prefix{ .key = secret });
+    defer a.free(dp);
+    try testing.expect(!try verifyBuilt(a, dp, .{ .hmac = secret }));
+    // Key-type mismatch both ways.
+    const ec = (try p256.P256.combMulBase(@as([32]u8, @splat(0x11)), .big)).toUncompressedSec1();
+    try testing.expectError(error.KeyAlgorithmMismatch, verifyBuilt(a, doc, .{ .ecdsa_p256_sec1 = &ec }));
+    const rsadoc = try std.mem.replaceOwned(u8, a, doc, "ecdsa-sha256", "hmac-sha256");
+    defer a.free(rsadoc);
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+    try testing.expectError(error.KeyAlgorithmMismatch, verifyBuilt(a, rsadoc, .{ .rsa = pk }));
+    // An RSA-signature URI with an HMAC key is a mismatch too.
+    const asrsa = try std.mem.replaceOwned(u8, a, doc, sig_hmac_sha256, sig_rsa_sha256);
+    defer a.free(asrsa);
+    try testing.expectError(error.KeyAlgorithmMismatch, verifyBuilt(a, asrsa, .{ .hmac = secret }));
 }

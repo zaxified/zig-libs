@@ -39,7 +39,7 @@ that is verification-only *by design* with a closed algorithm allow-list, unique
 parser-index and the `id_attr` branch) and KeyInfo never trusted; no C, no libxml2, no OpenSSL. The C14N
 worked examples of both W3C specs are byte-exact, and verification is cross-checked against two independent tools
 (xmlsec1, signxml) for enveloped and enveloping RSA-SHA256 and enveloped ECDSA-P256. **Where we are behind:** no
-signing (by design, SP side only), no ECDSA-P384/P521, no HMAC, no RSA-PSS, no XPath/XSLT transforms (by
+signing (by design, SP side only), no XPath/XSLT transforms (by
 design), no X.509 chain validation (left to the caller / `x509` module).
 
 ## Purpose & scope
@@ -307,13 +307,13 @@ namespace; an RSA method with an EC key (`KeyAlgorithmMismatch`, not a quiet `fa
 
 **Missing and it matters** *(survey 2026-09-30)*:
 
-- **ECDSA-SHA384 / P-384 (and P-521) signatures** *(survey 2026-09-30)*: xmlsec and signxml accept them and some
+- ✅ DONE 2026-11-16 (`VerifyKey.ecdsa_p384_sec1` / `ecdsa_p521_sec1` with `ecdsa-sha384` / `ecdsa-sha512`, via sibling `p384` / `p521`) **ECDSA-SHA384 / P-384 (and P-521) signatures** *(survey 2026-09-30)*: xmlsec and signxml accept them and some
   SAML IdPs / eIDAS profiles sign with P-384; today `UnsupportedAlgorithm`. Needs a P-384 verifier (std has one; no
   sibling `p384` module in the catalog). Effort: small-medium. Fits §2: yes.
   (Searched: `rg -i 'p384|ecdsa' modules/xmldsig/src/root.zig`: only `ecdsa_sha256` exists.)
-- **RSA-PSS (`rsa-pss-sha256`, xmldsig-more) *(xmlsec support inferred)*** *(survey 2026-09-30)*: emitted by some modern signers; rare in SAML today.
+- ✅ DONE 2026-11-16 (RFC 9231 fixed-profile URIs `sha256/384/512-rsa-MGF1`, salt = digest length, no parameter elements, via `rsa.verifyPss`; the general RFC 6931 `rsa-pss` URI with `RSAPSSParams` stays unsupported) **RSA-PSS (`rsa-pss-sha256`, xmldsig-more) *(xmlsec support inferred)*** *(survey 2026-09-30)*: emitted by some modern signers; rare in SAML today.
   Effort: small — sibling `rsa` already has `verifyPss` (`modules/rsa/src/root.zig:1601`), only the URI + parameters wiring is missing. Fits §2: yes. Low priority.
-- **HMAC-SHA256 signature method** *(survey 2026-09-30)*: shared-secret XML-DSig (WS-Security style); not used in SAML. Effort: small. Fits §2: yes. Low priority.
+- ✅ DONE 2026-11-16 (`VerifyKey.hmac`, constant-time full-length compare, any `HMACOutputLength` refused with `UnsupportedAlgorithm`) **HMAC-SHA256 signature method** *(survey 2026-09-30)*: shared-secret XML-DSig (WS-Security style); not used in SAML. Effort: small. Fits §2: yes. Low priority.
 - **Signing (enveloped) for the IdP side and for tests/tools** *(survey 2026-09-30)*: goxmldsig and signxml sign;
   a user building an IdP or metadata signer cannot. The SPEC's out-of-scope list makes this a scope decision, not a
   gap: raised as a question, not filed as a commitment. **Decided 2026-09-30 (user): not now** — stays here without priority. Effort: medium. Fits §2: yes.

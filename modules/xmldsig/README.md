@@ -36,7 +36,9 @@ you can pin / compare it against your configured cert.
 - C14N / transforms: exclusive & inclusive C14N (both comment variants),
   enveloped-signature. XPath / XSLT / base64 / other transforms → rejected.
 - Digest: SHA-256, SHA-384, SHA-512 (SHA-1 only with `allow_weak_sha1`).
-- Signature: RSA-SHA256/384/512 (PKCS#1 v1.5), ECDSA-P256-SHA256
+- Signature: RSA-SHA256/384/512 (PKCS#1 v1.5), ECDSA-P256-SHA256, ECDSA-P384-SHA384,
+  ECDSA-P521-SHA512, RSA-PSS (RFC 9231 `sha256/384/512-rsa-MGF1`, fixed profile),
+  HMAC-SHA256 (`VerifyKey.hmac`; `HMACOutputLength` refused)
   (RSA-SHA1 only with `allow_weak_sha1`).
 
 ## Usage
