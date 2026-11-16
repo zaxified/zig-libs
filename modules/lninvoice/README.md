@@ -46,7 +46,9 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup and exact
 - **BOLT#12 offer decode** (`decodeOffer`) — the `lno1...` checksum-less bech32-style TLV payload,
   every scalar `offer_*` field; and `invoice_request`/`invoice` both ways with BIP-340 Merkle-tree
   signing (`decodeInvoiceRequest`/`encodeSignedInvoiceRequest`, `decodeInvoice`/`encodeSignedInvoice`,
-  byte-exact KATs in `SPEC.md`).
+  byte-exact KATs in `SPEC.md`). **Refunds** are offer-less `invoice_request`s: the same codec
+  (`invoiceRequestIsRefund` classifies one). **`invoice_error`** (`decodeInvoiceError`/
+  `encodeInvoiceError`, a bare TLV stream: `erroneous_field`/`suggested_value`/`error`).
 
 ## Use
 

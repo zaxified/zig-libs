@@ -360,7 +360,7 @@ canonical source is `pub const meta` in `src/root.zig`.
 
 - **Typed BOLT#12 blinded paths and payment info** *(survey 2026-09-30)* — `offer_paths`/`invoice_paths`/`invoice_blindedpay` are raw; paying an offer over a blinded path needs them decoded (LDK does). Effort: medium (needs BOLT#4 route-blinding structure, sibling `sphinx` gap); fits §2.
 - **Offer builder and BOLT#12 validity rules** *(survey 2026-09-30)* — encode an unsigned `offer`, check that an `invoice_request`/`invoice` matches its offer (currency, amount, quantity, chain, expiry). Users who issue offers need it. Effort: medium; fits §2.
-- **`invoice_error` and refunds** *(survey 2026-09-30)* — the remaining BOLT#12 message types. Effort: small; fits §2.
+- **`invoice_error` and refunds** *(survey 2026-09-30)* — ✅ DONE 2026-11-16 (`decodeInvoiceError`/`encodeInvoiceError` over the TLV stream types 1/3/5, strict: `error` mandatory UTF-8, minimal `tu64`, unknown even refused, `suggested_value` only with `erroneous_field`; refunds were already encodable/decodable as offer-less `invoice_request`s, added `invoiceRequestIsRefund`; no external vector exists for either, tests are hand-built byte fixtures + round-trips).
 
 ## Anchoring
 
