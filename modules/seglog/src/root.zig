@@ -649,7 +649,9 @@ const SegStore = struct {
 
     /// Frame by frame, so that a read reaching a frame that does not decode
     /// returns what came before it (a short read), and that frame then reads
-    /// as nothing — the bytes up to damage, as from a truncated file.
+    /// as nothing — the bytes up to damage, as from a truncated file. A
+    /// storage error is the exception: it is returned as the error, in any
+    /// frame of the read.
     fn pread(ctx: *anyopaque, h: Storage.Handle, buf: []u8, off: u64) Storage.Error!usize {
         const self = cast(ctx);
         const z = self.zstOf(h) orelse return self.inner.pread(h, buf, off);
@@ -664,12 +666,16 @@ const SegStore = struct {
             const n = sk.decompress(buf[done..][0..want], at) catch |e| {
                 // Start the frame over next time: its decoder stopped mid-way.
                 sk.cur_frame = std.math.maxInt(u32);
+                // F4: a storage error (or an allocation failure) in a later
+                // frame is that error, whatever this call had decoded before
+                // it. Handed back as a short read it would end the window
+                // early and the iterator would call a healthy segment
+                // `Corrupt`; the caller drops the partial bytes either way.
                 if (z.io_err) |ie| {
                     z.io_err = null;
-                    if (done > 0) return done;
                     return ie;
                 }
-                if (e == error.OutOfMemory) return if (done > 0) done else error.OutOfMemory;
+                if (e == error.OutOfMemory) return error.OutOfMemory;
                 try z.bad.append(self.gpa, f);
                 break;
             };
@@ -825,6 +831,32 @@ fn checkHeaderFlags(store: Storage, h: Storage.Handle, id: u64, base_lsn: u64, f
     if (f & ~flag_compacted != 0) return .unsupported;
     flags.* = f;
     return .ok;
+}
+
+/// Whether the `MANIFEST` open as `h` is a manifest a `Log` could read: the
+/// size a manifest has, a good CRC, the magic, a version this module knows,
+/// and (for the current version) counts that account for every byte. Used by
+/// `rebuildManifest` to tell a manifest to keep from one to replace; the
+/// entries themselves are `loadManifest`'s to judge.
+fn manifestDecodes(gpa: Allocator, store: Storage, h: Storage.Handle) (Storage.Error || error{OutOfMemory})!bool {
+    const size = try store.size(h);
+    const max_size = man_fixed + man_entry_len * max_manifest_ids + man_crc_len;
+    if (size < man_fixed + man_crc_len or size > max_size) return false;
+    const buf = try gpa.alloc(u8, @intCast(size));
+    defer gpa.free(buf);
+    store.preadFull(h, buf, 0) catch |e| switch (e) {
+        error.Corrupt => return false,
+        else => |x| return x,
+    };
+    const body = buf[0 .. buf.len - man_crc_len];
+    if (crc32c(body) != std.mem.readInt(u32, buf[buf.len - man_crc_len ..][0..4], .little)) return false;
+    if (!std.mem.eql(u8, buf[0..4], man_magic)) return false;
+    const version = std.mem.readInt(u32, buf[4..8], .little);
+    if (version != format_version) return version == legacy_version;
+    const nl = std.mem.readInt(u32, buf[8..12], .little);
+    const np = std.mem.readInt(u32, buf[12..16], .little);
+    if (@as(u64, nl) + np > max_manifest_ids) return false;
+    return body.len == man_fixed + man_entry_len * @as(usize, nl) + 8 * @as(usize, np);
 }
 
 // ── public API ───────────────────────────────────────────────────────────────
@@ -1011,12 +1043,24 @@ pub const Stats = struct {
 
 pub const SeekError = IterError || error{OutOfMemory};
 
+pub const GetError = SeekError || error{
+    /// The log has no record with that LSN: it is not written yet, or
+    /// compaction dropped it, or the LSN is 0.
+    NotFound,
+    /// The record's payload is longer than the caller's buffer.
+    BufferTooSmall,
+};
+
 pub const CompactError = IterError || error{
     OutOfMemory,
     Poisoned,
     ReadOnly,
     /// Rewriting a compressed segment: see `CompressError`.
     BadCompressOptions,
+    /// Rewriting a compressed segment: the new `.zst` did not decode back to
+    /// the compacted bytes. The old segment is untouched
+    /// (`Stats.compress_verify_failed` counts it).
+    CompressVerifyFailed,
     /// Not a live segment, or the newest.
     NotCompactable,
 };
@@ -1281,8 +1325,8 @@ pub const RebuildError = Storage.Error || error{
     NoSegments,
     /// More ids than one manifest can name (`max_manifest_ids`).
     TooManySegments,
-    /// A `MANIFEST` already opens here: `rebuildManifest` never overwrites
-    /// one `Log.open` could still read.
+    /// A `MANIFEST` that decodes already sits here: `rebuildManifest` never
+    /// overwrites one `Log.open` could still read.
     ManifestPresent,
     /// A named id has neither `seg-<id>.log` nor `seg-<id>.zst`.
     SegmentGone,
@@ -1312,6 +1356,10 @@ pub const AppendError = Storage.Error || error{
     /// `Options.timestamps = .refuse` and a record's `ts` is outside its
     /// range (L3): nothing in the batch was written.
     TimestampOutOfRange,
+    /// The batch would give a record an LSN above 2^62, the largest this
+    /// format reads back. Nothing was written; the log is not poisoned and
+    /// stays readable and reopenable.
+    LsnExhausted,
 };
 
 pub const RotateError = Storage.Error || error{
@@ -1502,8 +1550,10 @@ pub const Log = struct {
     /// writer's own still-active segment (no seal expected there).
     ///
     /// Refuses outright (`error.ManifestPresent`) if a `MANIFEST` already
-    /// opens here — this is for a directory `Log.open` cannot read, not a
-    /// way to override one it can. Writes nothing else: no `.idx` files (the
+    /// decodes here (a good CRC, a known version, counts that fit) — this is
+    /// for a directory `Log.open` cannot read, not a way to override one it
+    /// can. A `MANIFEST` that does not decode (empty, truncated, failed CRC)
+    /// is replaced, atomically, by the rebuilt one. Writes nothing else: no `.idx` files (the
     /// next `open`'s walk rebuilds one that is missing or wrong regardless),
     /// no pending drops (a rebuild cannot know what a crash left mid-drop; a
     /// leftover file from one just outlives this log instead of being swept
@@ -1517,10 +1567,13 @@ pub const Log = struct {
         if (ids.len > max_manifest_ids) return error.TooManySegments;
         for (ids[1..], ids[0 .. ids.len - 1]) |b, a| if (b <= a) return error.Corrupt;
 
-        // Never overwrite a manifest `Log.open` could still read.
+        // Never overwrite a manifest `Log.open` could still read. One that
+        // does not decode (empty, truncated, a failed CRC, not a manifest)
+        // is exactly what this exists for, and the atomic replace at the
+        // end takes its place.
         if (store.open(manifest_name, .read_only)) |h| {
-            store.close(h);
-            return error.ManifestPresent;
+            defer store.close(h);
+            if (try manifestDecodes(gpa, store, h)) return error.ManifestPresent;
         } else |e| switch (e) {
             error.FileNotFound => {},
             else => |x| return x,
@@ -1861,6 +1914,64 @@ pub const Log = struct {
 
     /// `appendMany` with each record's own timestamp: an import of records
     /// that already have one, batched into one write and one `fsync`.
+    /// The lowest LSN `seek` accepts: the first LSN of the oldest live
+    /// segment (a compacted segment may have lost its first records; `seek`
+    /// then lands on the first one left). Null when the log holds no record.
+    /// Of a writer only, like `nextLsn`: a log opened read-only has no append
+    /// state and answers null.
+    pub fn firstLsn(self: *const Log) ?u64 {
+        if (self.isEmpty()) return null;
+        return self.live_lsn.items[0];
+    }
+
+    /// The LSN of the last record appended, null when the log holds none.
+    /// Not necessarily durable (`durableLsn`). Of a writer only.
+    pub fn lastLsn(self: *const Log) ?u64 {
+        if (self.isEmpty()) return null;
+        return self.next_lsn - 1;
+    }
+
+    /// Whether the log holds no record. Of a writer only: a log opened
+    /// read-only has no append state and says `true`; use `seek` there.
+    pub fn isEmpty(self: *const Log) bool {
+        if (self.live_lsn.items.len == 0) return true;
+        return self.next_lsn <= self.live_lsn.items[0];
+    }
+
+    /// Record `lsn`'s payload, copied into `buf`: one `seek` and one read.
+    /// Returns the filled part of `buf`. `error.NotFound` when there is no
+    /// such record (LSN 0, not written yet, dropped by compaction),
+    /// `error.SegmentGone` when retention took it, `error.BufferTooSmall`
+    /// when the payload does not fit. For many records in a row, `iterator`
+    /// from a `seek` is the way: this opens the segment each time.
+    pub fn get(self: *Log, lsn: u64, buf: []u8) GetError![]u8 {
+        const pos = (try self.seek(lsn)) orelse return error.NotFound;
+        if (pos.lsn != lsn) return error.NotFound;
+        var it = self.iterator(pos);
+        defer it.deinit();
+        const rec = (try it.next()) orelse return error.NotFound;
+        if (rec.lsn != lsn) return error.NotFound;
+        if (rec.payload.len > buf.len) return error.BufferTooSmall;
+        @memcpy(buf[0..rec.payload.len], rec.payload);
+        return buf[0..rec.payload.len];
+    }
+
+    /// Drop the closed segments whose every record is below `lsn` — those
+    /// whose successor's first LSN is at or below it — through `dropBefore`
+    /// (pending list, manifest, delete). Whole segments only: records of
+    /// the segment that holds `lsn` survive with it, so the oldest record
+    /// left can be below `lsn`. The newest segment is never dropped.
+    /// Returns how many segments went.
+    pub fn dropBeforeLsn(self: *Log, lsn: u64) DropError!usize {
+        if (self.read_only) return error.ReadOnly;
+        if (self.poisoned) return error.Poisoned;
+        const n = self.live.items.len;
+        var k: usize = 0;
+        while (k + 1 < n and self.live_lsn.items[k + 1] <= lsn) k += 1;
+        if (k == 0) return 0;
+        return self.dropBefore(self.live.items[k]);
+    }
+
     pub fn appendEntries(self: *Log, entries: []const Entry) AppendError!Appended {
         const Batch = struct {
             entries: []const Entry,
@@ -1900,6 +2011,9 @@ pub const Log = struct {
                 if (ts < r.min or ts > r.max) return error.TimestampOutOfRange;
             },
         }
+        // F6: the last LSN of the batch must be one `open` and the readers
+        // still believe (`max_lsn`); refused before anything is written.
+        if (n != 0 and (self.next_lsn > max_lsn or n > max_lsn - self.next_lsn + 1)) return error.LsnExhausted;
         if (self.opts.auto_rotate) |ar| try self.autoRotate(ar, total);
         const a: *Active = if (self.active) |*act| act else return error.NoActiveSegment;
         const first: Appended = .{ .pos = .{ .segment = a.id, .offset = a.end, .lsn = self.next_lsn }, .lsn = self.next_lsn };
@@ -2508,14 +2622,25 @@ pub const Log = struct {
             const inner = self.segs.?.inner;
             const raw = try inner.open(compact_tmp, .read_only);
             defer inner.close(raw);
-            out_off = self.writeCompressed(inner, raw, out_off) catch |e| return switch (e) {
+            const raw_size = out_off;
+            out_off = self.writeCompressed(inner, raw, raw_size) catch |e| return switch (e) {
                 error.NotCompressible, error.SegmentGone => unreachable,
-                // L2: `writeCompressed` only ever encodes here — the
-                // read-back-and-compare is `verifyCompressed`'s, called only
-                // from `compress`, never from this recompression of an
-                // already-compressed segment during `compact`.
+                // `writeCompressed` only ever encodes: the read-back is the
+                // next step's.
                 error.CompressVerifyFailed => unreachable,
                 else => |x| x,
+            };
+            // F3: the same read-back `compress` does. After the rename the
+            // survivors exist only in the new `.zst`, so a wrong-but-
+            // well-formed stream must not get that far: the old `.zst` stays
+            // untouched, both temp files go.
+            self.verifyCompressed(inner, raw, raw_size) catch |e| {
+                if (e == error.CompressVerifyFailed) self.counters.compress_verify_failed += 1;
+                self.store.delete(compress_tmp) catch {};
+                return switch (e) {
+                    error.NotCompressible => unreachable,
+                    else => |x| x,
+                };
             };
         }
 
@@ -2587,9 +2712,19 @@ pub const Log = struct {
     /// record `lsn` itself unless compaction dropped it: the segment from the
     /// manifest, the place in it from the segment's sparse index, then a
     /// short walk. Null when the log has no such record yet (for the writer:
-    /// none durable); `error.SegmentGone` when retention took `lsn`. Hand the
+    /// none durable); `error.SegmentGone` when retention took `lsn`. LSNs
+    /// start at 1, so `seek(0)` means the beginning: the first record, unless
+    /// the log's first segment starts above 1 (something was dropped), when
+    /// it is `SegmentGone` like any other LSN below the first. Hand the
     /// result to `iterator` to read on from there.
     pub fn seek(self: *Log, lsn: u64) SeekError!?Position {
+        return self.seekExact(if (lsn == 0) 1 else lsn);
+    }
+
+    /// `seek` for an LSN taken as it is: an iterator's start position that
+    /// carries LSN 0 (a seal's, a hand-made one) names no record, and is
+    /// `SegmentGone`, not "the beginning".
+    fn seekExact(self: *Log, lsn: u64) SeekError!?Position {
         if (self.read_only) try self.refreshForSeek();
         const live = self.live.items;
         if (live.len == 0) return null;
@@ -2598,6 +2733,9 @@ pub const Log = struct {
         var i: usize = live.len;
         while (i > 0 and self.live_lsn.items[i - 1] > lsn) i -= 1;
         i -= 1;
+        // Set once a compacted segment ended below `lsn`: the next segment's
+        // first record may then be above it (the LSN was compacted away).
+        var skipped_gap = false;
         while (i < self.live.items.len) : (i += 1) {
             const id = self.live.items[i];
             var seg = try self.openForSeek(id, false);
@@ -2616,9 +2754,10 @@ pub const Log = struct {
                     // without holding it: the next one has what follows.
                     if (seg.is_newest) return null;
                     if (!seg.compacted) return error.Corrupt;
+                    skipped_gap = true;
                     break;
                 }
-                if (raw.lsn == lsn or (raw.lsn > lsn and seg.compacted)) return .{ .segment = id, .offset = off, .lsn = raw.lsn };
+                if (raw.lsn == lsn or (raw.lsn > lsn and (seg.compacted or skipped_gap))) return .{ .segment = id, .offset = off, .lsn = raw.lsn };
                 if (raw.lsn > lsn) return error.Corrupt;
                 off += raw.len;
             }
@@ -3382,6 +3521,20 @@ pub const Log = struct {
         self.synced_next_lsn = self.next_lsn;
     }
 
+    /// Start the newest segment's file over with a fresh header: the file is
+    /// named in the manifest and `rotate` did not finish it. `cut` is the
+    /// number of non-zero bytes thrown away (for `bytesCutOnOpen`). Truncates
+    /// first: a torn header's surviving bytes are durable, and rewriting them
+    /// in place is not an append.
+    fn restartHeader(self: *Log, h: Storage.Handle, id: u64, base: u64, cut: u64) OpenError!void {
+        try self.store.truncate(h, 0);
+        const created = self.stamp();
+        try self.writeHeader(h, id, base, created);
+        try self.store.syncDir();
+        self.cut_on_open = cut;
+        self.active = .{ .id = id, .handle = h, .end = segment_header_len, .synced = segment_header_len, .reserved = segment_header_len, .tally = Tally.init(base, false), .created = created };
+    }
+
     /// Open the newest segment for appending, repairing its tail. Leaves
     /// `active` null when the newest segment is sealed. Sets `next_lsn`.
     fn openNewest(self: *Log) OpenError!void {
@@ -3397,14 +3550,7 @@ pub const Log = struct {
         const size = try self.store.size(h);
         if (size < segment_header_len) {
             // Named in the manifest, but `rotate` did not get to write it.
-            // Truncate first: a torn header's surviving bytes are durable,
-            // and rewriting them in place is not an append.
-            try self.store.truncate(h, 0);
-            const created = self.stamp();
-            try self.writeHeader(h, id, base, created);
-            try self.store.syncDir();
-            self.cut_on_open = size;
-            self.active = .{ .id = id, .handle = h, .end = segment_header_len, .synced = segment_header_len, .reserved = segment_header_len, .tally = Tally.init(base, false), .created = created };
+            try self.restartHeader(h, id, base, size);
             keep = true;
             return;
         }
@@ -3412,7 +3558,18 @@ pub const Log = struct {
         switch (try checkHeaderFlags(self.store, h, id, base, &flags)) {
             .ok => {},
             .unsupported => return error.UnsupportedVersion,
-            .short, .mismatch => return error.Corrupt,
+            .short, .mismatch => {
+                // F1: a header that is nothing but zeros is the same
+                // unfinished creation: `rotate` preallocated the file (a
+                // size-extending `fallocate`) and the machine died before
+                // the header's data reached the disk, while the allocation
+                // did. Nothing was ever written to it. Any non-zero byte in
+                // a bad header is not that, and stays `Corrupt`.
+                if (try lastNonZero(self.store, h, 0, size) != 0) return error.Corrupt;
+                try self.restartHeader(h, id, base, 0);
+                keep = true;
+                return;
+            },
         }
 
         var index: SparseIndex = .{};
@@ -3608,6 +3765,98 @@ pub const Concurrent = struct {
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
         return c.log.enforceRetention(r, now);
+    }
+
+    pub fn firstLsn(c: *Concurrent) ?u64 {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.log.firstLsn();
+    }
+
+    pub fn lastLsn(c: *Concurrent) ?u64 {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.log.lastLsn();
+    }
+
+    pub fn isEmpty(c: *Concurrent) bool {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.log.isEmpty();
+    }
+
+    /// `Log.get`, holding the lock throughout.
+    pub fn get(c: *Concurrent, lsn: u64, buf: []u8) GetError![]u8 {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.log.get(lsn, buf);
+    }
+
+    pub fn dropBeforeLsn(c: *Concurrent, lsn: u64) DropError!usize {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.log.dropBeforeLsn(lsn);
+    }
+
+    /// `Log.compactByKey`, holding the lock throughout.
+    pub fn compactByKey(c: *Concurrent, ids: []const u64, ctx: anytype, comptime keyOf: fn (@TypeOf(ctx), []const u8) ?[]const u8) CompactError!CompactStats {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.log.compactByKey(ids, ctx, keyOf);
+    }
+
+    /// `Log.verify`, holding the lock throughout (it reads the whole log).
+    pub fn verify(c: *Concurrent, gpa: Allocator) (IterError || error{OutOfMemory})!VerifyReport {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.log.verify(gpa);
+    }
+
+    /// `Log.segments` as a copy: the live ids at this moment, owned by the
+    /// caller (`gpa.free`). `Log.segments` points into the log, which the
+    /// next `rotate` or `dropBefore` changes, so it cannot be handed out
+    /// from behind the lock.
+    pub fn segmentsAlloc(c: *Concurrent, gpa: Allocator) error{OutOfMemory}![]u64 {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return gpa.dupe(u64, c.log.segments());
+    }
+
+    pub fn segmentFirstLsn(c: *Concurrent, id: u64) ?u64 {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.log.segmentFirstLsn(id);
+    }
+
+    pub fn end(c: *Concurrent) ?Position {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.log.end();
+    }
+
+    pub fn bytesCutOnOpen(c: *Concurrent) u64 {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.log.bytesCutOnOpen();
+    }
+
+    pub fn isPoisoned(c: *Concurrent) bool {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.log.isPoisoned();
+    }
+
+    pub fn migration(c: *Concurrent) ?MigrationReport {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.log.migration();
+    }
+
+    /// `Log.translatePosition`, holding the lock throughout.
+    pub fn translatePosition(c: *Concurrent, old: Position) (IterError || error{OutOfMemory})!?Position {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        return c.log.translatePosition(old);
     }
 
     pub fn nextLsn(c: *Concurrent) u64 {
@@ -4003,7 +4252,7 @@ pub const Iterator = struct {
         if (it.start) |s| if (s.lsn) |want| {
             if (!try it.startStillValid(h, target, offset, want)) {
                 store.close(h);
-                const moved = it.log.seek(want) catch |e| switch (e) {
+                const moved = it.log.seekExact(want) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => |x| return x,
                 };
@@ -8421,4 +8670,500 @@ test "resync, with no later segment, still passes over a record whose LSN is bey
     try testing.expectEqual(@as(?u64, 2), gap.from_lsn);
     try testing.expectEqual(@as(?u64, 3), gap.to_lsn);
     try testing.expectEqualStrings("dd", try payloadOf(&it));
+}
+
+// ── 2026-11-16 review fixes (F1-F6) ──────────────────────────────────────────
+
+fn segSize(sim: *SimStorage, id: u64) !u64 {
+    var nb: [seg_name_len]u8 = undefined;
+    const st = sim.storage();
+    const h = try st.open(segName(&nb, id), .read_only);
+    defer st.close(h);
+    return st.size(h);
+}
+
+test "F1: a newest segment whose header is all zeros opens like an unfinished creation" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const o: Options = .{ .create = true, .preallocate = 4096 };
+    {
+        var log = try Log.open(testing.allocator, sim.storage(), o);
+        defer log.close();
+        try log.rotate(1);
+    }
+    // `rotate` with preallocation reserves the file before it writes the
+    // header; the allocation reached the disk, the header did not: a file of
+    // its full size, every byte zero (the simulator cannot split the two, so
+    // the state is made here).
+    try testing.expect((try segSize(&sim, 1)) >= segment_header_len);
+    @memset(logFile(&sim, 1).?, 0);
+    {
+        var log = try Log.open(testing.allocator, sim.storage(), o);
+        defer log.close();
+        try testing.expectEqual(@as(u64, 0), log.bytesCutOnOpen());
+        try testing.expectEqual(@as(u64, 1), log.nextLsn());
+        _ = try log.append("a");
+        _ = try log.append("b");
+    }
+    var log = try Log.open(testing.allocator, sim.storage(), o);
+    defer log.close();
+    try expectPayloads(&log, null, &.{ "a", "b" });
+    var r = try log.verify(testing.allocator);
+    defer r.deinit(testing.allocator);
+    try testing.expect(r.clean());
+}
+
+test "F1: a bad header with any non-zero byte stays Corrupt" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const o: Options = .{ .create = true, .preallocate = 4096 };
+    {
+        var log = try Log.open(testing.allocator, sim.storage(), o);
+        defer log.close();
+        try log.rotate(1);
+    }
+    const f = logFile(&sim, 1).?;
+    @memset(f, 0);
+    f[f.len - 1] = 1; // zeros, but not only zeros: not an unfinished creation
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), o));
+    @memset(f, 0);
+    f[5] = 7; // a half-written header
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), o));
+}
+
+fn rebuildFixture(sim: *SimStorage) !void {
+    var log = try openSim(sim);
+    defer log.close();
+    try log.rotate(1);
+    _ = try log.append("a");
+    try log.rotate(2);
+    _ = try log.append("b");
+}
+
+fn expectRebuilt(sim: *SimStorage) !void {
+    try Log.rebuildManifest(testing.allocator, sim.storage(), &.{ 1, 2 });
+    var log = try openSim(sim);
+    defer log.close();
+    try expectPayloads(&log, null, &.{ "a", "b" });
+    var r = try log.verify(testing.allocator);
+    defer r.deinit(testing.allocator);
+    try testing.expect(r.clean());
+}
+
+test "F2: rebuildManifest replaces a MANIFEST that does not decode, and refuses one that does" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try rebuildFixture(&sim);
+    const st = sim.storage();
+
+    // One byte shorter.
+    {
+        const h = try st.open(manifest_name, .open_or_create);
+        defer st.close(h);
+        try st.truncate(h, try st.size(h) - 1);
+    }
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, st, .{}));
+    try expectRebuilt(&sim);
+    // One byte flipped.
+    sim.fileContent(manifest_name).?[9] ^= 0x10;
+    try testing.expectError(error.Corrupt, Log.open(testing.allocator, st, .{}));
+    try expectRebuilt(&sim);
+    // Empty.
+    {
+        const h = try st.open(manifest_name, .open_or_create);
+        defer st.close(h);
+        try st.truncate(h, 0);
+    }
+    try expectRebuilt(&sim);
+    // Not a manifest at all, and longer than any.
+    try sim.installFile(manifest_name, "this is not a manifest");
+    try expectRebuilt(&sim);
+    // A manifest that decodes is still refused, and left as it was.
+    const before = try testing.allocator.dupe(u8, sim.fileContent(manifest_name).?);
+    defer testing.allocator.free(before);
+    try testing.expectError(error.ManifestPresent, Log.rebuildManifest(testing.allocator, st, &.{ 1, 2 }));
+    try testing.expectEqualSlices(u8, before, sim.fileContent(manifest_name).?);
+}
+
+/// A `Storage` over a `SimStorage` that can make a second kind of fault than
+/// a crash: a byte of `COMPRESS.tmp` flipped when it is opened for the
+/// read-back, and storage errors on a compressed segment's file.
+const FlakyZst = struct {
+    inner: Storage,
+    sim: *SimStorage,
+    corrupt_compress_tmp: bool = false,
+    /// Reads of the `.zst` at or above this offset fail with `InputOutput`.
+    fail_zst_from: ?u64 = null,
+    zst_handle: ?Storage.Handle = null,
+
+    fn storage(self: *FlakyZst) Storage {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+    const vtable: Storage.VTable = .{
+        .open = open_,
+        .size = size_,
+        .pread = pread_,
+        .writeAll = writeAll_,
+        .sync = sync_,
+        .truncate = truncate_,
+        .close = close_,
+        .rename = rename_,
+        .delete = delete_,
+        .syncDir = syncDir_,
+        .tryLockExclusive = lock_,
+        .allocate = allocate_,
+        .syncData = syncData_,
+    };
+    fn c(ctx: *anyopaque) *FlakyZst {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn open_(ctx: *anyopaque, p: []const u8, m: Storage.OpenMode) Storage.Error!Storage.Handle {
+        const s = c(ctx);
+        if (s.corrupt_compress_tmp and m == .read_only and std.mem.eql(u8, p, compress_tmp)) {
+            const f = s.sim.fileContent(compress_tmp).?;
+            f[f.len / 2] ^= 0xFF;
+        }
+        const h = try s.inner.open(p, m);
+        if (std.mem.endsWith(u8, p, ".zst")) s.zst_handle = h;
+        return h;
+    }
+    fn size_(ctx: *anyopaque, h: Storage.Handle) Storage.Error!u64 {
+        return c(ctx).inner.size(h);
+    }
+    fn pread_(ctx: *anyopaque, h: Storage.Handle, b: []u8, off: u64) Storage.Error!usize {
+        const s = c(ctx);
+        if (s.fail_zst_from) |from| if (s.zst_handle == h and off >= from) return error.InputOutput;
+        return s.inner.pread(h, b, off);
+    }
+    fn writeAll_(ctx: *anyopaque, h: Storage.Handle, b: []const u8, off: u64) Storage.Error!void {
+        return c(ctx).inner.writeAll(h, b, off);
+    }
+    fn sync_(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
+        return c(ctx).inner.sync(h);
+    }
+    fn truncate_(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
+        return c(ctx).inner.truncate(h, len);
+    }
+    fn close_(ctx: *anyopaque, h: Storage.Handle) void {
+        c(ctx).inner.close(h);
+    }
+    fn rename_(ctx: *anyopaque, a: []const u8, b: []const u8) Storage.Error!void {
+        return c(ctx).inner.rename(a, b);
+    }
+    fn delete_(ctx: *anyopaque, p: []const u8) Storage.Error!void {
+        return c(ctx).inner.delete(p);
+    }
+    fn syncDir_(ctx: *anyopaque) Storage.Error!void {
+        return c(ctx).inner.syncDir();
+    }
+    fn lock_(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+        return c(ctx).inner.tryLockExclusive(h);
+    }
+    fn allocate_(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!bool {
+        return c(ctx).inner.allocate(h, len);
+    }
+    fn syncData_(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
+        return c(ctx).inner.syncData(h);
+    }
+};
+
+fn keepEvenLsn(_: void, r: Record) bool {
+    return r.lsn % 2 == 0;
+}
+
+/// Segment 1 (`n` compressible records) compressed, segment 2 active.
+fn compressedFixture(flaky: *FlakyZst, n: usize) !Log {
+    var log = try Log.open(testing.allocator, flaky.storage(), small_frames);
+    errdefer log.close();
+    try log.rotate(1);
+    for (0..n) |i| {
+        var buf: [64]u8 = undefined;
+        _ = try log.appendAt(@intCast(1000 + i), std.mem.print(&buf, "reading {d:0>6} kWh 0.{d}", .{ i, i % 10 }) catch unreachable);
+    }
+    try log.rotate(2);
+    _ = try log.append("live");
+    _ = try log.compress(1);
+    return log;
+}
+
+test "F3: compact of a compressed segment verifies the new .zst and keeps the old one when it is wrong" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var flaky: FlakyZst = .{ .inner = sim.storage(), .sim = &sim };
+    var log = try compressedFixture(&flaky, 300);
+    defer log.close();
+    var nb: [seg_name_len]u8 = undefined;
+    const old = try testing.allocator.dupe(u8, sim.fileContent(zstName(&nb, 1)).?);
+    defer testing.allocator.free(old);
+
+    flaky.corrupt_compress_tmp = true;
+    try testing.expectError(error.CompressVerifyFailed, log.compact(1, {}, keepEvenLsn));
+    try testing.expectEqual(@as(u64, 1), log.stats().compress_verify_failed);
+    try testing.expect(!log.isPoisoned());
+    // The old segment is untouched and no temp file is left.
+    try testing.expectEqualSlices(u8, old, sim.fileContent(zstName(&nb, 1)).?);
+    try testing.expect(sim.fileContent(compress_tmp) == null);
+    try testing.expect(sim.fileContent(compact_tmp) == null);
+    var all = try readAll(&log, null);
+    defer freeAll(&all);
+    try testing.expectEqual(@as(usize, 301), all.items.len);
+
+    // Without the fault the same compaction goes through.
+    flaky.corrupt_compress_tmp = false;
+    const st = try log.compact(1, {}, keepEvenLsn);
+    try testing.expectEqual(@as(u64, 150), st.dropped);
+    try testing.expectEqual(@as(u64, 1), log.stats().compress_verify_failed);
+    var after = try readAll(&log, null);
+    defer freeAll(&after);
+    try testing.expectEqual(@as(usize, 151), after.items.len);
+}
+
+test "F4: a storage error in a later frame of a compressed segment is that error, not Corrupt" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var flaky: FlakyZst = .{ .inner = sim.storage(), .sim = &sim };
+    var log = try compressedFixture(&flaky, 300);
+    defer log.close();
+
+    // Where the second frame starts in the compressed file.
+    var nb: [seg_name_len]u8 = undefined;
+    var sk = try zstd.seekable.Seekable.init(testing.allocator, .{ .bytes = sim.fileContent(zstName(&nb, 1)).? });
+    defer sk.deinit();
+    try testing.expect(sk.table.entries.len > 3);
+    const second_frame = sk.table.entries[1].c_offset;
+
+    // One read across frames 0..2 (the first decodes, the second fails).
+    {
+        const h = try log.store.open(segName(&nb, 1), .read_only);
+        defer log.store.close(h);
+        flaky.fail_zst_from = second_frame;
+        var buf: [2500]u8 = undefined;
+        try testing.expectError(error.InputOutput, log.store.pread(h, &buf, 0));
+        // A read inside the first frame still works.
+        try testing.expectEqual(@as(usize, 100), try log.store.pread(h, buf[0..100], 0));
+    }
+    // And through the iterator: the segment is healthy, the disk is not.
+    var it = log.iterator(null);
+    defer it.deinit();
+    const err = while (true) {
+        const r = it.next() catch |e| break e;
+        if (r == null) break error.NoErrorSeen;
+    };
+    try testing.expectEqual(error.InputOutput, err);
+    // The disk comes back, the same iterator's log reads everything.
+    flaky.fail_zst_from = null;
+    var all = try readAll(&log, null);
+    defer freeAll(&all);
+    try testing.expectEqual(@as(usize, 301), all.items.len);
+}
+
+test "F5: seek(0) is the first record of a log that never dropped anything" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try openSim(&sim);
+    defer log.close();
+    try testing.expectEqual(@as(?Position, null), try log.seek(0));
+    try log.rotate(1);
+    const a = try log.append("a");
+    _ = try log.append("b");
+    try testing.expectEqual(@as(?Position, a.pos), try log.seek(0));
+    try testing.expectEqual(try log.seek(1), try log.seek(0));
+    try log.rotate(2);
+    _ = try log.append("c");
+    try testing.expectEqual(@as(?Position, a.pos), try log.seek(0));
+    // After a drop, LSN 0 is below the first live LSN like any other.
+    try testing.expectEqual(@as(usize, 1), try log.dropBefore(2));
+    try testing.expectError(error.SegmentGone, log.seek(0));
+    try testing.expectError(error.SegmentGone, log.seek(1));
+    try testing.expect((try log.seek(3)) != null);
+}
+
+test "F6: an append that would pass LSN 2^62 is refused whole, and the log reopens" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try installHeaderOnly(&sim, 1, max_lsn - 1);
+    try Log.rebuildManifest(testing.allocator, sim.storage(), &.{1});
+    {
+        var log = try Log.open(testing.allocator, sim.storage(), .{});
+        defer log.close();
+        // Two records fit (max_lsn - 1 and max_lsn); a batch of three does not.
+        try testing.expectError(error.LsnExhausted, log.appendMany(&.{ "x", "y", "z" }));
+        try testing.expectEqual(max_lsn - 1, log.nextLsn());
+        try testing.expectEqual(max_lsn - 1, (try log.append("a")).lsn);
+        try testing.expectEqual(max_lsn, (try log.append("b")).lsn);
+        try testing.expectError(error.LsnExhausted, log.append("c"));
+        try testing.expectError(error.LsnExhausted, log.appendMany(&.{"c"}));
+        try testing.expectEqual(max_lsn + 1, log.nextLsn());
+        try testing.expect(!log.isPoisoned());
+        try expectPayloads(&log, null, &.{ "a", "b" });
+    }
+    var log = try Log.open(testing.allocator, sim.storage(), .{});
+    defer log.close();
+    try expectPayloads(&log, null, &.{ "a", "b" });
+    try testing.expectError(error.LsnExhausted, log.append("c"));
+}
+
+// ── 2026-11-16 survey gaps (G1, G2) ──────────────────────────────────────────
+
+/// Segments 1 (LSN 1-3), 2 (LSN 4-6) and 3 (LSN 7, active), payloads "p1"…"p7".
+fn threeSegments(log: anytype) !void {
+    var buf: [8]u8 = undefined;
+    var n: usize = 0;
+    for ([_]u64{ 1, 2, 3 }) |seg| {
+        try log.rotate(seg);
+        const count: usize = if (seg == 3) 1 else 3;
+        for (0..count) |_| {
+            n += 1;
+            _ = try log.append(std.mem.print(&buf, "p{d}", .{n}) catch unreachable);
+        }
+    }
+}
+
+test "G1: firstLsn, lastLsn and isEmpty follow the log through appends and drops" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try openSim(&sim);
+    defer log.close();
+    try testing.expect(log.isEmpty());
+    try testing.expectEqual(@as(?u64, null), log.firstLsn());
+    try testing.expectEqual(@as(?u64, null), log.lastLsn());
+    try log.rotate(1);
+    try testing.expect(log.isEmpty()); // a segment with no record is still no record
+    try testing.expectEqual(@as(?u64, null), log.lastLsn());
+    _ = try log.append("p1");
+    try testing.expect(!log.isEmpty());
+    try testing.expectEqual(@as(?u64, 1), log.firstLsn());
+    try testing.expectEqual(@as(?u64, 1), log.lastLsn());
+    try log.rotate(2);
+    _ = try log.appendMany(&.{ "p2", "p3" });
+    try testing.expectEqual(@as(?u64, 1), log.firstLsn());
+    try testing.expectEqual(@as(?u64, 3), log.lastLsn());
+    try testing.expectEqual(@as(usize, 1), try log.dropBefore(2));
+    try testing.expectEqual(@as(?u64, 2), log.firstLsn());
+    try testing.expectEqual(@as(?u64, 3), log.lastLsn());
+    // The same answers after a reopen.
+    log.close();
+    log = try openSim(&sim);
+    try testing.expectEqual(@as(?u64, 2), log.firstLsn());
+    try testing.expectEqual(@as(?u64, 3), log.lastLsn());
+    try testing.expect(!log.isEmpty());
+}
+
+test "G1: get returns one record's payload, and says why when it cannot" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try openSim(&sim);
+    defer log.close();
+    try threeSegments(&log);
+    var buf: [16]u8 = undefined;
+    for (1..8) |lsn| {
+        var want: [8]u8 = undefined;
+        const w = std.mem.print(&want, "p{d}", .{lsn}) catch unreachable;
+        try testing.expectEqualStrings(w, try log.get(lsn, &buf));
+    }
+    try testing.expectError(error.NotFound, log.get(0, &buf));
+    try testing.expectError(error.NotFound, log.get(8, &buf));
+    try testing.expectError(error.BufferTooSmall, log.get(4, buf[0..1]));
+    try testing.expectEqual(@as(usize, 0), (try log.get(4, buf[0..2])).len - 2);
+    // An empty payload is a record.
+    _ = try log.append("");
+    try testing.expectEqual(@as(usize, 0), (try log.get(8, buf[0..0])).len);
+    // A dropped record is SegmentGone, as for `seek`.
+    _ = try log.dropBeforeLsn(4);
+    try testing.expectError(error.SegmentGone, log.get(1, &buf));
+    try testing.expectEqualStrings("p4", try log.get(4, &buf));
+}
+
+test "G1: get does not return a neighbour when compaction dropped the record" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try openSim(&sim);
+    defer log.close();
+    try threeSegments(&log);
+    _ = try log.compact(1, {}, keepEvenLsn); // keeps LSN 2 only
+    var buf: [8]u8 = undefined;
+    try testing.expectError(error.NotFound, log.get(1, &buf));
+    try testing.expectEqualStrings("p2", try log.get(2, &buf));
+    try testing.expectError(error.NotFound, log.get(3, &buf));
+}
+
+test "G1: dropBeforeLsn drops whole closed segments below the LSN, never the newest" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try openSim(&sim);
+    defer log.close();
+    try threeSegments(&log);
+    try testing.expectEqual(@as(usize, 0), try log.dropBeforeLsn(0));
+    try testing.expectEqual(@as(usize, 0), try log.dropBeforeLsn(1));
+    // LSN 3 is inside segment 1 (LSN 1-3): it stays whole.
+    try testing.expectEqual(@as(usize, 0), try log.dropBeforeLsn(3));
+    try testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, log.segments());
+    // LSN 4 is where segment 2 starts: segment 1 is entirely below it.
+    try testing.expectEqual(@as(usize, 1), try log.dropBeforeLsn(4));
+    try testing.expectEqualSlices(u64, &.{ 2, 3 }, log.segments());
+    try testing.expectEqual(@as(?u64, 4), log.firstLsn());
+    var nb: [seg_name_len]u8 = undefined;
+    try testing.expect(sim.fileContent(segName(&nb, 1)) == null);
+    // Far above everything: the newest segment still stays.
+    try testing.expectEqual(@as(usize, 1), try log.dropBeforeLsn(1000));
+    try testing.expectEqualSlices(u64, &.{3}, log.segments());
+    try testing.expectEqual(@as(usize, 0), try log.dropBeforeLsn(1000));
+    _ = try log.append("p8");
+    try expectPayloads(&log, null, &.{ "p7", "p8" });
+    // A reader may not drop.
+    var r = try openReader(&sim);
+    defer r.close();
+    try testing.expectError(error.ReadOnly, r.dropBeforeLsn(8));
+}
+
+test "G2: Concurrent passes through what Log answers, under the lock" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var c = try Concurrent.open(testing.allocator, sim.storage(), testing.io, .{ .create = true });
+    defer c.close();
+    try testing.expect(c.isEmpty());
+    try testing.expectEqual(@as(?u64, null), c.firstLsn());
+    try threeSegments(&c);
+    try testing.expect(!c.isEmpty());
+    try testing.expectEqual(@as(?u64, 1), c.firstLsn());
+    try testing.expectEqual(@as(?u64, 7), c.lastLsn());
+    try testing.expect(!c.isPoisoned());
+    try testing.expectEqual(@as(u64, 0), c.bytesCutOnOpen());
+    try testing.expectEqual(@as(?MigrationReport, null), c.migration());
+    try testing.expectEqual(@as(?u64, 4), c.segmentFirstLsn(2));
+    try testing.expectEqual(@as(?u64, null), c.segmentFirstLsn(9));
+    const e = c.end().?;
+    try testing.expectEqual(@as(u64, 3), e.segment);
+    try testing.expectEqual(@as(u64, 8), e.lsn);
+    const ids = try c.segmentsAlloc(testing.allocator);
+    defer testing.allocator.free(ids);
+    try testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, ids);
+
+    var buf: [8]u8 = undefined;
+    try testing.expectEqualStrings("p5", try c.get(5, &buf));
+    try testing.expectError(error.NotFound, c.get(0, &buf));
+
+    var rep = try c.verify(testing.allocator);
+    defer rep.deinit(testing.allocator);
+    try testing.expect(rep.clean());
+    try testing.expectEqual(@as(u64, 7), rep.records);
+
+    // translatePosition on a position of a log that never migrated: nothing
+    // to translate from, it finds the first record boundary of that segment.
+    const p = (try c.seek(1)).?;
+    _ = try c.translatePosition(p);
+
+    // compactByKey: records p1..p3 have keys "k", "k", "j"; the older "k" goes.
+    const ids2 = [_]u64{1};
+    const st = try c.compactByKey(&ids2, {}, keyOfPayload);
+    try testing.expectEqual(@as(u64, 1), st.dropped);
+
+    try testing.expectEqual(@as(usize, 1), try c.dropBeforeLsn(4));
+    try testing.expectEqual(@as(?u64, 4), c.firstLsn());
+}
+
+fn keyOfPayload(_: void, payload: []const u8) ?[]const u8 {
+    // "p1" and "p2" share a key, the rest have their own.
+    if (std.mem.eql(u8, payload, "p1") or std.mem.eql(u8, payload, "p2")) return "k";
+    return payload;
 }
