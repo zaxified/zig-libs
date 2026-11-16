@@ -602,6 +602,7 @@ pub const Node = struct {
             .entries = self.kernel_buf.items,
             .leader_commit = a.leader_commit,
         };
+        const term_before = self.term;
         // THE KERNEL: consistency check + conflict-only truncation + commit.
         var out = safety.handleAppendEntries(self.term, &self.log, self.commit, req);
         if (self.injected_bug == .naive_truncation and out.success) {
@@ -625,11 +626,47 @@ pub const Node = struct {
             }
             if (out.new_commit_index > self.commit) self.commit = out.new_commit_index;
         }
-        try self.send(from, .{ .append_resp = .{
+        var resp: message.AppendResp = .{
             .term = self.term,
             .success = out.success,
             .index = if (out.success) out.match_index else self.lastIndex(),
-        } });
+        };
+        // §5.3 conflict-term hint on a log mismatch (not on a stale-term refusal).
+        if (!out.success and a.term >= term_before) {
+            if (self.log.termAt(a.prev_log_index)) |ct| {
+                resp.conflict_term = ct;
+                resp.conflict_index = self.firstIndexOfTerm(a.prev_log_index, ct);
+            } else {
+                resp.conflict_index = self.lastIndex() + 1;
+            }
+        }
+        try self.send(from, .{ .append_resp = resp });
+    }
+
+    /// The first index of term `t` in this log, given that `hi` holds term
+    /// `t` (terms never decrease along the log: binary search, O(log n)).
+    fn firstIndexOfTerm(self: *const Node, hi_index: LogIndex, t: Term) LogIndex {
+        var lo: LogIndex = 1; // answer in [lo, hi]
+        var hi: LogIndex = hi_index;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.log.termAt(mid).? < t) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+
+    /// The last index holding term `t`, or null if this log has no entry of
+    /// that term (same monotonicity; O(log n)).
+    fn lastIndexOfTerm(self: *const Node, t: Term) ?LogIndex {
+        var lo: LogIndex = 1; // first index whose term is > t, in [1, last+1]
+        var hi: LogIndex = self.lastIndex() + 1;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.log.termAt(mid).? <= t) lo = mid + 1 else hi = mid;
+        }
+        const last = lo - 1; // last index with term <= t
+        if (last == 0 or self.log.termAt(last).? != t) return null;
+        return last;
     }
 
     fn onAppendResp(self: *Node, from: NodeId, a: message.AppendResp) Allocator.Error!void {
@@ -655,7 +692,16 @@ pub const Node = struct {
             // Walk back — straight past the follower's end if its hint says
             // so — but never below what it has already confirmed (a stale
             // rejection arriving after a success).
-            const lowered = @min(self.next[from] -| 1, a.index +| 1);
+            // With a conflict-term hint (§5.3) it skips a whole term at once:
+            // past our last entry of the follower's conflicting term if we
+            // have that term, else to the first index of it on the follower.
+            const resume_at: LogIndex = if (a.conflict_index == 0)
+                a.index +| 1
+            else if (a.conflict_term != 0)
+                (if (self.lastIndexOfTerm(a.conflict_term)) |li| li + 1 else a.conflict_index)
+            else
+                a.conflict_index;
+            const lowered = @min(self.next[from] -| 1, resume_at);
             const next = @max(self.match[from] + 1, lowered);
             // Retry at once only if the rejection moved us: a follower that
             // keeps rejecting at `match + 1` (it cannot, honestly) would
@@ -984,6 +1030,118 @@ test "a rejection's hint skips the follower's gap in one round trip, but never b
     try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = false, .index = 2 } } });
     try testing.expectEqual(@as(LogIndex, 11), node.next[1]);
     try testing.expectEqual(before, node.msgs.items.len);
+}
+
+/// Drive a leader (term 201, log of 8 terms x 25 entries) against one
+/// follower holding a 300-entry divergent tail, delivering frames directly;
+/// returns the rejections the follower sent before the logs matched.
+/// `strip_hint` removes the conflict-term hint, i.e. a legacy follower.
+fn divergentRoundTrips(gpa: Allocator, strip_hint: bool) !usize {
+    var lent: [200]Entry = undefined;
+    for (&lent, 0..) |*e, i| e.* = .{ .index = i + 1, .term = 1 + i / 25 };
+    var fent: [350]Entry = undefined;
+    // Shares indices 1..50 (terms 1, 2) with the leader, then 10 own terms.
+    for (&fent, 0..) |*e, i| e.* = .{ .index = i + 1, .term = if (i < 50) 1 + i / 25 else 90 + (i - 50) / 30 };
+    var leader = try Node.init(gpa, .{ .id = 0, .cluster_size = 3, .election_ticks = 2, .election_jitter_ticks = 0, .seed = 0, .max_append_entries = 8 }, .{ .hard_state = .{ .term = 200 }, .entries = &lent });
+    defer leader.deinit();
+    var follower = try Node.init(gpa, .{ .id = 1, .cluster_size = 3, .election_ticks = 1000, .election_jitter_ticks = 0, .seed = 1 }, .{ .hard_state = .{ .term = 99 }, .entries = &fent });
+    defer follower.deinit();
+    for (0..2) |_| try leader.tick();
+    try leader.step(.{ .from = 1, .to = 0, .body = .{ .vote_resp = .{ .term = 201, .granted = true } } });
+    try testing.expectEqual(Role.leader, leader.role);
+
+    var rejections: usize = 0;
+    var rounds: usize = 0;
+    while (leader.match[1] < leader.lastIndex()) : (rounds += 1) {
+        try testing.expect(rounds < 1000);
+        var frames: std.ArrayList([]u8) = .empty;
+        defer {
+            for (frames.items) |f| gpa.free(f);
+            frames.deinit(gpa);
+        }
+        const rd = try leader.ready();
+        for (rd.messages) |m| if (m.to == 1 and m.body == .append_req) try frames.append(gpa, try m.encodeAlloc(gpa));
+        try leader.advance();
+        for (frames.items) |f| {
+            try follower.stepBytes(0, f);
+            const frd = try follower.ready();
+            for (frd.messages) |m| {
+                if (m.body != .append_resp) continue;
+                if (!m.body.append_resp.success) rejections += 1;
+                var reply = m;
+                if (strip_hint) {
+                    reply.body.append_resp.conflict_index = 0;
+                    reply.body.append_resp.conflict_term = 0;
+                }
+                const bytes = try reply.encodeAlloc(gpa);
+                defer gpa.free(bytes);
+                try leader.stepBytes(1, bytes);
+            }
+            try follower.advance();
+        }
+    }
+    try testing.expectEqual(leader.lastIndex(), follower.lastIndex());
+    for (1..leader.lastIndex() + 1) |i| try testing.expectEqual(leader.log.termAt(i), follower.log.termAt(i));
+    return rejections;
+}
+
+test "conflict-term hint: a long divergent tail converges in O(terms) round trips, not O(tail)" {
+    const with_hint = try divergentRoundTrips(testing.allocator, false);
+    const legacy = try divergentRoundTrips(testing.allocator, true);
+    // 10 follower terms to skip, plus the probe that finds the shared prefix.
+    try testing.expect(with_hint <= 12);
+    // A follower without the hint (index-gap hint only) walks back one entry
+    // per round trip, past the leader's whole divergent tail.
+    try testing.expect(legacy > 100);
+}
+
+test "conflict-term hint: leader uses its own last entry of the conflicting term" {
+    const gpa = testing.allocator;
+    var node = try testLeader(gpa, 19); // 20 entries, all term 1
+    defer node.deinit();
+    node.next[1] = 21;
+    // The follower says its entry at the probe has term 1, first at index 4:
+    // the leader has term 1 through index 20, so it resumes at 21... which
+    // cannot be higher than next - 1, so it steps back by one.
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = false, .index = 50, .conflict_term = 1, .conflict_index = 4 } } });
+    try testing.expectEqual(@as(LogIndex, 20), node.next[1]);
+    // A conflict term the leader lacks: resume at the follower's first index of it.
+    node.next[1] = 20;
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = false, .index = 50, .conflict_term = 7, .conflict_index = 6 } } });
+    try testing.expectEqual(@as(LogIndex, 6), node.next[1]);
+    // Past the follower's end (term 0): its length + 1.
+    node.next[1] = 20;
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = false, .index = 3, .conflict_term = 0, .conflict_index = 4 } } });
+    try testing.expectEqual(@as(LogIndex, 4), node.next[1]);
+}
+
+test "conflict-term hint: the follower reports term and first index, or its end" {
+    const gpa = testing.allocator;
+    const ents = [_]Entry{
+        .{ .index = 1, .term = 1 }, .{ .index = 2, .term = 2 }, .{ .index = 3, .term = 2 }, .{ .index = 4, .term = 2 },
+    };
+    var f = try Node.init(gpa, .{ .id = 1, .cluster_size = 3, .election_ticks = 1000, .election_jitter_ticks = 0, .seed = 1 }, .{ .hard_state = .{ .term = 2 }, .entries = &ents });
+    defer f.deinit();
+    // prev (4, term 3) mismatches the follower's term 2 at 4: hint = (2, first index of 2 = 2).
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .append_req = .{ .term = 3, .prev_log_index = 4, .prev_log_term = 3, .leader_commit = 0, .entries = &.{} } } });
+    var rd = try f.ready();
+    var r = rd.messages[rd.messages.len - 1].body.append_resp;
+    try testing.expect(!r.success);
+    try testing.expectEqual(@as(Term, 2), r.conflict_term);
+    try testing.expectEqual(@as(LogIndex, 2), r.conflict_index);
+    try f.advance();
+    // prev past the end: no term, one past the last index.
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .append_req = .{ .term = 3, .prev_log_index = 9, .prev_log_term = 3, .leader_commit = 0, .entries = &.{} } } });
+    rd = try f.ready();
+    r = rd.messages[rd.messages.len - 1].body.append_resp;
+    try testing.expectEqual(@as(Term, 0), r.conflict_term);
+    try testing.expectEqual(@as(LogIndex, 5), r.conflict_index);
+    try f.advance();
+    // A stale leader gets no hint.
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .append_req = .{ .term = 1, .prev_log_index = 9, .prev_log_term = 1, .leader_commit = 0, .entries = &.{} } } });
+    rd = try f.ready();
+    r = rd.messages[rd.messages.len - 1].body.append_resp;
+    try testing.expectEqual(@as(LogIndex, 0), r.conflict_index);
 }
 
 test "H1: a leader deposed before its next ready sends no AppendEntries under the new term" {

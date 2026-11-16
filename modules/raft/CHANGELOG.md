@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NEW (conflict-term hint, §5.3):** `message.AppendResp` gains `conflict_term` and `conflict_index` (default 0 = no hint, so struct literals still compile). A `Node` follower rejecting on a log mismatch reports the term of its entry at `prevLogIndex` and the first index of that term (or, past its end, term 0 and one past its last index); the leader resumes after its own last entry of that term, else at `conflict_index` (never above one step back, never below `matchIndex + 1`). Wire: a rejection with a hint is a 34-byte frame; the 18-byte frame still decodes (no hint), but an OLD decoder refuses the 34-byte frame, so upgrade leaders before followers. Tests: a 350-entry divergent tail converges in at most 12 rejections instead of over 100.
+
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card evidence `model` → `unclassified` (E2 → E3): the tests check invariants, and no independent model exists to name in `**Model:**`. The grade is unchanged (limited by other axes).
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
