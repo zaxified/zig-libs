@@ -47,6 +47,16 @@ pub const Ctx = struct {
     user: *const anyopaque,
     callFilter: *const fn (ctx: *Ctx, name: []const u8, input: Value, args: Args) Error!Value,
     callTest: *const fn (ctx: *Ctx, name: []const u8, input: Value, args: Args) Error!bool,
+    /// Whether the environment has a filter / test of that name (the `filter`
+    /// and `test` tests). Outside a render there is no environment: false.
+    hasFilter: *const fn (ctx: *Ctx, name: []const u8) bool = noName,
+    hasTest: *const fn (ctx: *Ctx, name: []const u8) bool = noName,
+
+    fn noName(ctx: *Ctx, name: []const u8) bool {
+        _ = ctx;
+        _ = name;
+        return false;
+    }
 
     /// `str(v)`, refusing undefined when the policy is strict. This is the one
     /// place the undefined policy reaches the filter library.
@@ -1844,6 +1854,20 @@ fn tSameas(ctx: *Ctx, input: Value, args: Args) Error!bool {
     };
 }
 
+/// `is filter` / `is test` (Jinja2 3.1): true when the environment has a
+/// filter / test of that name. Only a string can name one; any other value is
+/// false (Python: `value in environment.filters`).
+fn tFilter(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = args;
+    if (input != .string) return false;
+    return ctx.hasFilter(ctx, input.string.bytes);
+}
+fn tTest(ctx: *Ctx, input: Value, args: Args) Error!bool {
+    _ = args;
+    if (input != .string) return false;
+    return ctx.hasTest(ctx, input.string.bytes);
+}
+
 fn tIn(ctx: *Ctx, input: Value, args: Args) Error!bool {
     _ = ctx;
     const container = args.get(0, "seq") orelse return error.BadArgument;
@@ -1855,11 +1879,20 @@ pub const builtin_tests = [_]TestEntry{
     .{ .name = "callable", .func = tCallable },
     .{ .name = "defined", .func = tDefined },
     .{ .name = "divisibleby", .func = tDivisibleby },
+    // Symbolic spellings are registered like Jinja2's TESTS table, so
+    // `select(">", 2)` finds them; `x is >` stays a syntax error, as there.
+    .{ .name = "==", .func = cmpTest(.eq) },
+    .{ .name = "!=", .func = cmpTest(.ne) },
+    .{ .name = ">", .func = cmpTest(.gt) },
+    .{ .name = ">=", .func = cmpTest(.ge) },
+    .{ .name = "<", .func = cmpTest(.lt) },
+    .{ .name = "<=", .func = cmpTest(.le) },
     .{ .name = "eq", .func = cmpTest(.eq) },
     .{ .name = "equalto", .func = cmpTest(.eq) },
     .{ .name = "escaped", .func = tEscaped },
     .{ .name = "even", .func = tEven },
     .{ .name = "false", .func = tFalse },
+    .{ .name = "filter", .func = tFilter },
     .{ .name = "float", .func = tFloatTest },
     .{ .name = "ge", .func = cmpTest(.ge) },
     .{ .name = "greaterthan", .func = cmpTest(.gt) },
@@ -1879,6 +1912,7 @@ pub const builtin_tests = [_]TestEntry{
     .{ .name = "sameas", .func = tSameas },
     .{ .name = "sequence", .func = tSequence },
     .{ .name = "string", .func = tString },
+    .{ .name = "test", .func = tTest },
     .{ .name = "true", .func = tTrue },
     .{ .name = "undefined", .func = tUndefined },
     .{ .name = "upper", .func = tUpperTest },

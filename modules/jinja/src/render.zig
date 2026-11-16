@@ -1056,7 +1056,19 @@ const Renderer = struct {
             .user = self,
             .callFilter = callFilterThunk,
             .callTest = callTestThunk,
+            .hasFilter = hasFilterThunk,
+            .hasTest = hasTestThunk,
         };
+    }
+
+    fn hasFilterThunk(ctx: *filters.Ctx, name: []const u8) bool {
+        const self: *Renderer = @ptrCast(@alignCast(@constCast(ctx.user)));
+        return self.lookup.filter(self.lookup.ctx, name) != null;
+    }
+
+    fn hasTestThunk(ctx: *filters.Ctx, name: []const u8) bool {
+        const self: *Renderer = @ptrCast(@alignCast(@constCast(ctx.user)));
+        return self.lookup.test_fn(self.lookup.ctx, name) != null;
     }
 
     fn callFilterThunk(ctx: *filters.Ctx, name: []const u8, input: Value, args: filters.Args) filters.Error!Value {

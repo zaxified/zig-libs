@@ -272,7 +272,7 @@ or a documented, tested behaviour.
 | D4 | ~~`upper`/`lower`/`capitalize`/`title` ASCII-only~~ **Closed 2026-11-13:** `upper`, `lower`, `capitalize`, `title`, `is upper`/`is lower`, and the case folding of `sort`/`min`/`max`/`unique`/`groupby` use `unitext` (CPython `str` semantics: ß → SS, Final_Sigma, no Turkish tailoring). Ill-formed UTF-8 passes through unchanged instead of failing. The `title` *filter* keeps Jinja's own word rule (split on `-`, whitespace, `(`, `{`, `[`, `<`; each piece `item[0].upper() + item[1:].lower()`), the `.title()` *method* is Python's `str.title` (any non-cased character ends a word). The string methods `isdigit`/`isalpha` and `wordcount` stay ASCII/byte-based (D18) | closed |
 | D5 | `map`/`select`/`reject`/`selectattr`/`rejectattr`/`items`/`dictsort`/`batch`/`slice` return lists, not generators, so rendering one directly prints `[…]` where the reference prints `<generator object …>` | silent, strictly more useful |
 | D6 | Filters absent: `attr`, `pprint`, `random`, `urlize` (`filesizeformat`, `format`, `groupby`, `wordwrap` landed 2026-11-13, §6.1) | **compile error** |
-| D7 | Tests absent: `filter`, `test`, and the symbolic aliases (`is ==`, `is >`, …) — the named forms `eq`, `gt`, … are present | **compile error** |
+| D7 | ✅ DONE 2026-11-16: tests `filter`, `test` and the symbolic aliases (`==` `!=` `>` `>=` `<` `<=`, usable via `select`/`reject`; `x is >=` is a syntax error in Jinja2 too) | — |
 | D8 | Globals absent: `lipsum`, `cycler`, `joiner` (callable *objects* need a `Value` kind with state and a method-call path on non-name callees) | **runtime error** |
 | D9 | `*args`/`**kwargs` *at a call site*, line statements/comments, and custom delimiters (macro `varargs`/`kwargs` on the receiving side are implemented) | **compile error** |
 | D10 | `{% do %}` and `{% with %}` need no extension to be enabled | superset |
@@ -678,7 +678,7 @@ makes these bound tests rather than "it errored eventually" tests.
 
 **Missing and it matters** *(survey 2026-09-30; `format`/`groupby`/`wordwrap`/`filesizeformat`/Unicode case closed 2026-11-13)*:
 
-- **Call-site `*args` / `**kwargs` (D9), `cycler`/`joiner`/`lipsum` (D8), the `filter`/`test` tests and the symbolic test aliases (D7)**:
+- **Call-site `*args` / `**kwargs` (D9), `cycler`/`joiner`/`lipsum` (D8)**; the `filter`/`test` tests and the symbolic test aliases (D7) ✅ DONE 2026-11-16 (`is filter`/`is test` via `Ctx.hasFilter`/`hasTest`; symbolic names registered in `builtin_tests`):
   each hit occasionally by Jinja2 code ported as-is; today all are compile or render errors. `cycler`/`joiner` need a stateful
   callable value (`cycler.next()`, `joiner()`), the others small parser work. Effort: small to medium each.
 - **Arbitrary-precision integers (D3)** *(survey 2026-09-30)*: Python grows, we raise `OutOfRange`; only matters for
