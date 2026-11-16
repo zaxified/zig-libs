@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — New: bulk loading. `Options.bulk_loader` (`BulkLoader`) + `Cache.getAll(keys)` / `freeAll`: hits served from the cache, keys already in flight awaited (coalesced), the remaining distinct keys fetched in ONE bulk loader call, stored under the usual TTL/negative rules (`ttl_fn` included); keys the loader omits become negative entries; without a bulk loader each missing key uses the single loader. Default behaviour unchanged.
+
 - **2026-11-16** — New: per-key TTL. `Options.ttl_fn` (`TtlFn`) + `ttl_ctx` choose the TTL of each positively loaded entry (null = `ttl_ns`, `<= 0` = never expire); default behaviour unchanged.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 

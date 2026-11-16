@@ -106,6 +106,22 @@ pub const Loader = struct {
     load: *const fn (ctx: ?*anyopaque, key: []const u8) anyerror!LoadOutcome,
 };
 
+/// Optional bulk backend fetch for `Cache.getAll` (Caffeine `loadAll`). Called
+/// once per `getAll` with exactly the keys that were neither fresh in the cache
+/// nor already being loaded by another caller (distinct, in request order), on
+/// the caller's thread, OUTSIDE the coordinator lock. `out.len == keys.len` and
+/// every element is pre-set to `.missing`: set `out[i] = .{ .value = v }` for
+/// each key found and leave the rest (a key the loader does not return is a
+/// negative result, exactly like a single loader's `.missing`). The value
+/// slices must stay valid until `getAll` returns (the cache copies them after
+/// the call). Returning an error fails the load of every key in `keys`. Same
+/// contract as `Loader`: MUST NOT call back into the same `Cache` for these keys
+/// and MUST NOT panic.
+pub const BulkLoader = struct {
+    ctx: ?*anyopaque = null,
+    load: *const fn (ctx: ?*anyopaque, keys: []const []const u8, out: []LoadOutcome) anyerror!void,
+};
+
 /// Optional per-entry TTL chooser (Caffeine `Expiry`, ttlcache per-item TTL).
 /// Called once per successful positive load, on the loader's thread, OUTSIDE the
 /// lock, right after the loader returned `value` (borrowed, as for the loader).
@@ -216,6 +232,9 @@ pub const Options = struct {
     io: std.Io,
     /// The backend fetch. See `Loader`.
     loader: Loader,
+    /// Optional bulk loader used by `Cache.getAll` for its missing subset. Null =
+    /// `getAll` falls back to `loader` once per missing key.
+    bulk_loader: ?BulkLoader = null,
     /// TTL for a positively-loaded value, in ns. `<= 0` = never expire by time.
     ttl_ns: i64 = 0,
     /// Optional per-entry TTL chooser for positive loads; null = every entry uses
@@ -241,6 +260,7 @@ pub const Cache = struct {
     gpa: Allocator,
     io: std.Io,
     loader: Loader,
+    bulk_loader: ?BulkLoader,
     ttl_ns: i64,
     ttl_fn: ?TtlFn,
     ttl_ctx: ?*anyopaque,
@@ -262,6 +282,7 @@ pub const Cache = struct {
             .gpa = gpa,
             .io = options.io,
             .loader = options.loader,
+            .bulk_loader = options.bulk_loader,
             .ttl_ns = options.ttl_ns,
             .ttl_fn = options.ttl_fn,
             .ttl_ctx = options.ttl_ctx,
@@ -430,6 +451,242 @@ pub const Cache = struct {
         self.io.futexWake(u32, &call.done.raw, std.math.maxInt(u32));
 
         return self.finish(call);
+    }
+
+    // ── bulk read path ────────────────────────────────────────────────────────
+
+    /// Read many keys at once (Caffeine `getAll`). Returns one `Loaded` per
+    /// requested key, in order (`.missing` for a key absent at the backend); free
+    /// the result with `freeAll`. Fresh hits (positive and negative) are served
+    /// from the cache; the rest go to `Options.bulk_loader` in ONE call with
+    /// exactly the missing keys (distinct, request order), and are stored under
+    /// the usual TTL rules (`ttl_ns` / `ttl_fn`; a key the loader leaves out is a
+    /// negative entry per `negative_ttl_ns`). Without a bulk loader each missing
+    /// key goes through the single `loader` (via `get`).
+    ///
+    /// Coalescing is the same as for `get`: a key that another caller is already
+    /// loading is awaited, not loaded again, and a key this call loads is
+    /// visible to concurrent `get`s as in flight. Duplicate keys in `keys` are
+    /// loaded once. If any key fails (loader error, a cached loader error,
+    /// out-of-memory) the whole call returns that error and nothing is leaked;
+    /// values loaded for the other keys are still cached.
+    pub fn getAll(self: *Cache, keys: []const []const u8) anyerror![]Loaded {
+        const n = keys.len;
+        const out = try self.gpa.alloc(Loaded, n);
+        @memset(out, .missing);
+        const bulk = self.bulk_loader orelse {
+            for (keys, 0..) |k, i| {
+                out[i] = self.get(k) catch |e| {
+                    self.freeAll(out);
+                    return e;
+                };
+            }
+            return out;
+        };
+        if (n == 0) return out;
+
+        const Slot = union(enum) { resolved, lead: *Call, follow: *Call, dup: usize };
+        const slots = self.gpa.alloc(Slot, n) catch {
+            self.gpa.free(out);
+            return error.OutOfMemory;
+        };
+        defer self.gpa.free(slots);
+        const lkeys = self.gpa.alloc([]const u8, n) catch {
+            self.gpa.free(out);
+            return error.OutOfMemory;
+        };
+        defer self.gpa.free(lkeys);
+        const outcomes = self.gpa.alloc(LoadOutcome, n) catch {
+            self.gpa.free(out);
+            return error.OutOfMemory;
+        };
+        defer self.gpa.free(outcomes);
+        const ttls = self.gpa.alloc(i64, n) catch {
+            self.gpa.free(out);
+            return error.OutOfMemory;
+        };
+        defer self.gpa.free(ttls);
+        @memset(slots, .resolved);
+        var first: std.StringHashMapUnmanaged(usize) = .empty;
+        defer first.deinit(self.gpa);
+
+        // Phase 1 (locked): serve hits, join in-flight loads, register leads.
+        var m: usize = 0; // number of led keys
+        var err: ?anyerror = null;
+        var upto: usize = 0; // slots[0..upto] may hold a reference
+        self.lock.lock();
+        phase1: for (keys, 0..) |key, i| {
+            upto = i + 1;
+            if (first.get(key)) |j| {
+                slots[i] = .{ .dup = j };
+                continue;
+            }
+            first.put(self.gpa, key, i) catch {
+                err = error.OutOfMemory;
+                break :phase1;
+            };
+            if (self.decodeFreshLocked(key)) |dec| {
+                self.stats.hits += 1;
+                switch (dec) {
+                    .value => |v| out[i] = .{ .value = self.gpa.dupe(u8, v) catch {
+                        err = error.OutOfMemory;
+                        break :phase1;
+                    } },
+                    .missing => self.stats.negative_hits += 1,
+                    .err => {
+                        self.stats.negative_hits += 1;
+                        err = error.CachedLoaderError;
+                        break :phase1;
+                    },
+                    .corrupt => {
+                        err = error.CorruptEntry;
+                        break :phase1;
+                    },
+                }
+                continue;
+            }
+            self.stats.misses += 1;
+            if (self.in_flight.get(key)) |call| {
+                call.refs += 1;
+                self.stats.coalesced += 1;
+                slots[i] = .{ .follow = call };
+                continue;
+            }
+            const call = self.gpa.create(Call) catch {
+                err = error.OutOfMemory;
+                break :phase1;
+            };
+            call.* = .{};
+            const kdup = self.gpa.dupe(u8, key) catch {
+                self.gpa.destroy(call);
+                err = error.OutOfMemory;
+                break :phase1;
+            };
+            self.in_flight.put(self.gpa, kdup, call) catch {
+                self.gpa.free(kdup);
+                self.gpa.destroy(call);
+                err = error.OutOfMemory;
+                break :phase1;
+            };
+            slots[i] = .{ .lead = call };
+            lkeys[m] = key;
+            m += 1;
+        }
+        if (err) |e| {
+            // Nobody can have joined our leads yet (the lock was held throughout):
+            // unregister and free them; drop the references taken as follower.
+            for (slots[0..upto], 0..) |sl, i| switch (sl) {
+                .lead => |call| {
+                    if (self.in_flight.fetchRemove(keys[i])) |kv| self.gpa.free(kv.key);
+                    self.gpa.destroy(call);
+                },
+                .follow => |call| self.releaseLocked(call),
+                else => {},
+            };
+            self.lock.unlock();
+            self.freeAll(out);
+            return e;
+        }
+        if (m > 0) self.stats.loads += 1;
+        self.lock.unlock();
+
+        // Phase 2 (unlocked): the one bulk fetch, then per-entry TTLs.
+        var bulk_err: ?anyerror = null;
+        if (m > 0) {
+            @memset(outcomes[0..m], .missing);
+            bulk.load(bulk.ctx, lkeys[0..m], outcomes[0..m]) catch |e| {
+                bulk_err = e;
+            };
+            for (lkeys[0..m], outcomes[0..m], ttls[0..m]) |k, oc, *t| {
+                t.* = self.ttl_ns;
+                if (bulk_err == null and self.ttl_fn != null) switch (oc) {
+                    .value => |bytes| if (self.ttl_fn.?(self.ttl_ctx, k, bytes)) |x| {
+                        t.* = x;
+                    },
+                    .missing => {},
+                };
+            }
+        }
+
+        // Phase 3 (locked): publish each led key like `get`'s leader does.
+        if (m > 0) {
+            self.lock.lock();
+            var li: usize = 0;
+            for (slots, 0..) |sl, i| switch (sl) {
+                .lead => |call| {
+                    const key = keys[i];
+                    const oc = outcomes[li];
+                    const entry_ttl = ttls[li];
+                    li += 1;
+                    if (self.in_flight.fetchRemove(key)) |kv| self.gpa.free(kv.key);
+                    const poisoned = call.poisoned;
+                    if (bulk_err) |e| {
+                        call.result = .{ .err = e };
+                        if (!poisoned and self.cache_loader_errors and self.negative_ttl_ns > 0)
+                            self.storeLocked(key, tag_error, "", self.negative_ttl_ns);
+                    } else switch (oc) {
+                        .value => |bytes| {
+                            if (self.gpa.dupe(u8, bytes)) |copy| {
+                                call.result = .{ .value = copy };
+                            } else |e| {
+                                call.result = .{ .err = e };
+                            }
+                            if (!poisoned) self.storeLocked(key, tag_value, bytes, entry_ttl);
+                        },
+                        .missing => {
+                            call.result = .missing;
+                            if (!poisoned and self.negative_ttl_ns > 0)
+                                self.storeLocked(key, tag_missing, "", self.negative_ttl_ns);
+                        },
+                    }
+                    call.done.store(1, .release);
+                },
+                else => {},
+            };
+            self.lock.unlock();
+            for (slots) |sl| switch (sl) {
+                .lead => |call| self.io.futexWake(u32, &call.done.raw, std.math.maxInt(u32)),
+                else => {},
+            };
+        }
+
+        // Phase 4: collect led and followed results (every reference is released
+        // even after a failure), then fill duplicates.
+        var first_err: ?anyerror = null;
+        for (slots, 0..) |sl, i| {
+            const call = switch (sl) {
+                .lead => |c| c,
+                .follow => |c| c,
+                else => continue,
+            };
+            const r = if (sl == .follow) self.awaitCall(call) else self.finish(call);
+            if (r) |ld| out[i] = ld else |e| {
+                if (first_err == null) first_err = e;
+            }
+        }
+        if (first_err == null) {
+            for (slots, 0..) |sl, i| switch (sl) {
+                .dup => |j| switch (out[j]) {
+                    .value => |v| out[i] = .{ .value = self.gpa.dupe(u8, v) catch {
+                        first_err = error.OutOfMemory;
+                        break;
+                    } },
+                    .missing => {},
+                },
+                else => {},
+            };
+        }
+        if (first_err) |e| {
+            self.freeAll(out);
+            return e;
+        }
+        return out;
+    }
+
+    /// Free a result of `getAll` (every value and the slice itself).
+    pub fn freeAll(self: *Cache, results: []Loaded) void {
+        for (results) |r| self.free(r);
+        self.gpa.free(results);
     }
 
     /// Zero-allocation hit fast-path. If `key` is a fresh POSITIVE hit, invoke
@@ -1379,4 +1636,205 @@ test "per-key TTL: negative entries keep negative_ttl_ns, ttl_fn not consulted f
     rig.clock.t = 51;
     c.free(try c.get("short"));
     try testing.expectEqual(@as(u64, 2), rig.ldr.calls.load(.monotonic));
+}
+
+const BulkRec = struct {
+    calls: u64 = 0,
+    last_keys: [8][]const u8 = undefined,
+    last_n: usize = 0,
+    fail: bool = false,
+    table: *CountingLoader,
+    fn loadFn(ctx: ?*anyopaque, keys: []const []const u8, out: []LoadOutcome) anyerror!void {
+        const self: *BulkRec = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        self.last_n = keys.len;
+        for (keys, 0..) |k, i| self.last_keys[i] = k;
+        if (self.fail) return error.BackendDown;
+        for (keys, out) |k, *o| {
+            if (self.table.table.get(k)) |v| o.* = .{ .value = v };
+        }
+    }
+};
+
+fn openBulk(rig: *Rig, rec: *BulkRec, opts: struct { ttl_fn: ?TtlFn = null, negative_ttl_ns: i64 = 0, cache_loader_errors: bool = false }) Cache {
+    return Cache.init(testing.allocator, .{
+        .io = rig.threaded.io(),
+        .loader = rig.ldr.loader(),
+        .bulk_loader = .{ .ctx = rec, .load = BulkRec.loadFn },
+        .clock = rig.clock.clock(),
+        .ttl_ns = 500,
+        .ttl_fn = opts.ttl_fn,
+        .negative_ttl_ns = opts.negative_ttl_ns,
+        .cache_loader_errors = opts.cache_loader_errors,
+        .max_bytes = 1 << 20,
+        .max_entries = 64,
+    });
+}
+
+test "getAll: all hits never call either loader" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.ldr.put(testing.allocator, "a", "1");
+    try rig.ldr.put(testing.allocator, "b", "2");
+    var rec: BulkRec = .{ .table = &rig.ldr };
+    var c = openBulk(&rig, &rec, .{});
+    defer c.deinit();
+    c.free(try c.get("a"));
+    c.free(try c.get("b"));
+    const single_calls = rig.ldr.calls.load(.monotonic);
+    const r = try c.getAll(&.{ "b", "a" });
+    defer c.freeAll(r);
+    try testing.expectEqualStrings("2", r[0].value);
+    try testing.expectEqualStrings("1", r[1].value);
+    try testing.expectEqual(@as(u64, 0), rec.calls);
+    try testing.expectEqual(single_calls, rig.ldr.calls.load(.monotonic));
+    const e = try c.getAll(&.{});
+    defer c.freeAll(e);
+    try testing.expectEqual(@as(usize, 0), e.len);
+}
+
+test "getAll: mixed hits and misses call the bulk loader once with exactly the misses" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    for ([_][]const u8{ "a", "b", "c", "d" }) |k| try rig.ldr.put(testing.allocator, k, k);
+    var rec: BulkRec = .{ .table = &rig.ldr };
+    var c = openBulk(&rig, &rec, .{});
+    defer c.deinit();
+    c.free(try c.get("b"));
+    const r = try c.getAll(&.{ "a", "b", "c", "a", "d" });
+    defer c.freeAll(r);
+    try testing.expectEqual(@as(u64, 1), rec.calls);
+    try testing.expectEqual(@as(usize, 3), rec.last_n); // a, c, d (b hit, second a deduped)
+    try testing.expectEqualStrings("a", rec.last_keys[0]);
+    try testing.expectEqualStrings("c", rec.last_keys[1]);
+    try testing.expectEqualStrings("d", rec.last_keys[2]);
+    for (r, [_][]const u8{ "a", "b", "c", "a", "d" }) |got, want| try testing.expectEqualStrings(want, got.value);
+    // single loader only served the earlier get("b"); loaded keys are now cached
+    try testing.expectEqual(@as(u64, 1), rig.ldr.calls.load(.monotonic));
+    const again = try c.getAll(&.{ "a", "c", "d" });
+    defer c.freeAll(again);
+    try testing.expectEqual(@as(u64, 1), rec.calls);
+}
+
+test "getAll: bulk-loaded entries follow the per-key TTL rules" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    for ([_][]const u8{ "short", "long", "dflt" }) |k| try rig.ldr.put(testing.allocator, k, "v");
+    var rec: BulkRec = .{ .table = &rig.ldr };
+    rig.clock.t = 1000;
+    var c = openBulk(&rig, &rec, .{ .ttl_fn = testTtl });
+    defer c.deinit();
+    c.freeAll(try c.getAll(&.{ "short", "long", "dflt" }));
+    rig.clock.t = 1101; // short (100) expired; dflt (500) and long fresh
+    c.freeAll(try c.getAll(&.{ "long", "dflt" }));
+    try testing.expectEqual(@as(u64, 1), rec.calls);
+    c.freeAll(try c.getAll(&.{ "short", "long" }));
+    try testing.expectEqual(@as(u64, 2), rec.calls);
+    try testing.expectEqual(@as(usize, 1), rec.last_n);
+}
+
+test "getAll: a key the loader omits is missing and negatively cached" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.ldr.put(testing.allocator, "a", "1");
+    var rec: BulkRec = .{ .table = &rig.ldr };
+    var c = openBulk(&rig, &rec, .{ .negative_ttl_ns = 50 });
+    defer c.deinit();
+    const r = try c.getAll(&.{ "a", "nope" });
+    defer c.freeAll(r);
+    try testing.expectEqualStrings("1", r[0].value);
+    try testing.expect(r[1] == .missing);
+    const r2 = try c.getAll(&.{ "a", "nope" });
+    defer c.freeAll(r2);
+    try testing.expectEqual(@as(u64, 1), rec.calls); // negative entry served from cache
+    try testing.expect(r2[1] == .missing);
+    rig.clock.t = 51;
+    c.freeAll(try c.getAll(&.{"nope"}));
+    try testing.expectEqual(@as(u64, 2), rec.calls);
+}
+
+test "getAll: bulk loader error fails the call, leaks nothing, caches nothing" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.ldr.put(testing.allocator, "a", "1");
+    try rig.ldr.put(testing.allocator, "b", "2");
+    var rec: BulkRec = .{ .table = &rig.ldr, .fail = true };
+    var c = openBulk(&rig, &rec, .{});
+    defer c.deinit();
+    c.free(try c.get("a"));
+    try testing.expectError(error.BackendDown, c.getAll(&.{ "a", "b" }));
+    try testing.expectEqual(@as(u64, 1), rec.calls);
+    rec.fail = false;
+    const r = try c.getAll(&.{ "a", "b" }); // retried: b was not cached as an error
+    defer c.freeAll(r);
+    try testing.expectEqualStrings("2", r[1].value);
+    try testing.expectEqual(@as(u64, 2), rec.calls);
+    try testing.expectEqual(@as(usize, 1), rec.last_n);
+}
+
+test "getAll: cache_loader_errors caches a bulk error per key" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.ldr.put(testing.allocator, "b", "2");
+    var rec: BulkRec = .{ .table = &rig.ldr, .fail = true };
+    var c = openBulk(&rig, &rec, .{ .negative_ttl_ns = 50, .cache_loader_errors = true });
+    defer c.deinit();
+    try testing.expectError(error.BackendDown, c.getAll(&.{"b"}));
+    try testing.expectError(error.CachedLoaderError, c.getAll(&.{"b"}));
+    try testing.expectEqual(@as(u64, 1), rec.calls);
+}
+
+test "getAll: without a bulk loader each missing key uses the single loader" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.ldr.put(testing.allocator, "a", "1");
+    try rig.ldr.put(testing.allocator, "b", "2");
+    var c = rig.open(.{});
+    defer c.deinit();
+    c.free(try c.get("a"));
+    const r = try c.getAll(&.{ "a", "b", "zz", "b" });
+    defer c.freeAll(r);
+    try testing.expectEqualStrings("1", r[0].value);
+    try testing.expectEqualStrings("2", r[1].value);
+    try testing.expect(r[2] == .missing);
+    try testing.expectEqualStrings("2", r[3].value);
+    try testing.expectEqual(@as(u64, 3), rig.ldr.calls.load(.monotonic)); // a, b, zz
+    rig.ldr.fail = true;
+    try testing.expectError(error.BackendDown, c.getAll(&.{ "a", "q" }));
+}
+
+test "getAll: a key already in flight is awaited via its Call, not loaded again" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.ldr.put(testing.allocator, "a", "1");
+    try rig.ldr.put(testing.allocator, "b", "2");
+    var rec: BulkRec = .{ .table = &rig.ldr };
+    var c = openBulk(&rig, &rec, .{});
+    defer c.deinit();
+    // Simulate another caller's finished-but-unreleased leader for "a".
+    const call = try testing.allocator.create(Call);
+    call.* = .{ .result = .{ .value = try testing.allocator.dupe(u8, "1") } };
+    call.done.store(1, .release);
+    const kdup = try testing.allocator.dupe(u8, "a");
+    try c.in_flight.put(testing.allocator, kdup, call);
+    const r = try c.getAll(&.{ "a", "b" });
+    defer c.freeAll(r);
+    try testing.expectEqualStrings("1", r[0].value);
+    try testing.expectEqualStrings("2", r[1].value);
+    try testing.expectEqual(@as(usize, 1), rec.last_n); // only "b" was loaded
+    try testing.expectEqual(@as(u64, 1), c.getStats().coalesced);
+    // the leader's own reference is still ours to drop
+    _ = c.in_flight.fetchRemove("a");
+    testing.allocator.free(kdup);
+    c.lock.lock();
+    c.releaseLocked(call);
+    c.lock.unlock();
 }

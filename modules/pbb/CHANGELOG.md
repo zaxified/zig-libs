@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — added `peekCustomerTags(customer_data)`: read-only report of the customer frame's outer (and, for QinQ, inner) 802.1Q/802.1ad tag (TPID, PCP, DEI, VID); null when untagged or a tag is truncated. Does not modify or copy `customer_data`. New types `CustomerTag`, `CustomerTags`, const `ctag_tpid`.
+
 - **2026-10-10** — tests: deterministic fuzz driver `PBB_FUZZ` over the decode harness (generic over its choice source) plus an encode/decode roundtrip oracle (an issued frame decodes to its fields and customer data; a prefix holding the header decodes to the matching customer prefix; a cut inside the header is refused). No code change.
 - **2026-10-04** — Tests: first mutation run (44 mutants, 44 killed); added a test for the error class at the exact boundary lengths of the tag-region EtherType and the B-Tag + next-EtherType checks.
 

@@ -170,7 +170,7 @@ separate layer (802.1AE MACsec on the backbone, or the WireGuard tunnel in the
 - **Multiple stacked I-TAGs** — one I-TAG per frame; nested backbone service
   layering is out of scope.
 - **Customer-tag parsing (C-VLAN / S-VLAN inside `customer_data`)** — the carried
-  customer bytes are opaque; mapping a customer 802.1Q VID to an I-SID is a
+  customer bytes stay opaque (only the read-only `peekCustomerTags` looks at them); mapping a customer 802.1Q VID to an I-SID is a
   provisioning decision above this codec.
 - **802.1ah management / OUI-scoped TLVs** and any control-plane signalling.
 - **Forwarding / FDB / MAC learning** — backbone next-hop selection and the
@@ -249,7 +249,7 @@ state lives in `l2forward`.
 Survey 2026-09-30 found no capability of the reference dissector or of other packet libraries that this codec lacks and
 that SPEC "Deliberately deferred" has not already refused. Optional, low priority (both fit CONVENTIONS §2):
 
-- **C-VLAN/S-VLAN peek helper (survey 2026-09-30)** — a read-only accessor that reports the customer tag's VID without changing the opaque `customer_data` contract; Wireshark shows it, and I-SID mapping code otherwise re-parses it. Effort: small.
+- **C-VLAN/S-VLAN peek helper (survey 2026-09-30)** — ✅ DONE 2026-11-16 (`peekCustomerTags(customer_data) ?CustomerTags`: outer + optional inner tag, TPID 0x8100/0x88A8, PCP/DEI/VID; null when untagged or a tag is truncated; read-only, no copy). Original text: a read-only accessor that reports the customer tag's VID without changing the opaque `customer_data` contract. Effort: small.
 - **I-SID to group B-MAC helper (survey 2026-09-30)** — the 01-1E-83 + I-SID derivation used for SPB multicast B-DAs *(inferred from vendor practice, unverified)*; SPEC currently calls it a provisioning concern. Ask before adding. Effort: small.
 
 ## Status

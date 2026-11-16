@@ -40,6 +40,7 @@ source consulted or copied). The W-TinyLFU store underneath is
 - **TTL:** each positive entry carries `ttl_ns` (`<= 0` = never expire by time), or the value from the optional `Options.ttl_fn` callback (per-key TTL; null = `ttl_ns`);
   a fresh get past the TTL reloads. Time is injectable (`Options.clock`) so TTL
   is testable without sleeping; production reads the monotonic `std.Io` clock.
+- **Bulk `getAll(keys)`:** serves hits from the cache and loads the missing distinct keys with ONE call to the optional `Options.bulk_loader` (omitted keys = negative entries; same TTL / coalescing rules); without a bulk loader it falls back to the single loader per key. Free with `freeAll`.
 - **Invalidation:** `invalidate(key)` forces the next `get(key)` to reload;
   `invalidateAll()` invalidates every entry at once via a `ramcache` generation
   bump (O(1), no sweep — stale entries drop lazily). An invalidation *during* an

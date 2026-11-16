@@ -106,6 +106,7 @@ _ = dec.fields.b_da; _ = dec.fields.c_sa;// backbone / customer MACs
 _ = dec.fields.bvid();                   // ?u12 — flattens the optional B-Tag
 _ = dec.fields.hasBTag();                // bool
 _ = dec.customer_data;                   // opaque bytes after the I-TAG
+_ = pbb.peekCustomerTags(dec.customer_data); // ?CustomerTags: read-only outer/inner VLAN tag peek
 ```
 
 `Fields` exposes the I-SID, UCA, and all four MACs as public fields (idiomatic
