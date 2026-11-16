@@ -42,7 +42,7 @@ direct pairing check, not `bls_sig.verify` (see [SPEC.md](SPEC.md)).
 |---|---|---|---|---|
 | `bls-unchained-g1-rfc9380` (quicknet) | `G1` (48 B) | `G2` (96 B) | `H1(SHA-256(round_be))`, RFC-9380 `_NUL_` DST | **parse + verify** |
 | `pedersen-bls-chained` (default network) | `G2` (96 B) | `G1` (48 B) | `H2(SHA-256(prev_sig ‖ round_be))`, RFC-9380 `G2` `_NUL_` DST | **parse + verify** (since 2026-10-06) |
-| `bls-unchained-on-g1` (deprecated) | `G1` | `G2` | non-conformant DST reuse | parse only → `error.UnsupportedScheme` |
+| `bls-unchained-on-g1` (deprecated) | `G1` (48 B) | `G2` (96 B) | `H1(SHA-256(round_be))` under the `G2` `_NUL_` DST (non-conformant reuse) | **parse + verify** (since 2026-11-16; self-consistency tests only, no external vector) |
 
 ## Import
 

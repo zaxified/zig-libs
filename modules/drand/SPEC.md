@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [drand/kyber](https://github.com/drand/kyber) | Go | MPL-2.0 (`LICENSE` header; source NOT read) | 12 | v1.3.2 (2025-12-15) | The BLS/pairing library drand's Go code uses; not a client. |
 | Zig ecosystem | Zig | — | — | — | No Zig drand client found by GitHub search (2026-09-30). |
 
-**Where we are ahead:** the only Zig drand verifier: pure functions over caller-fetched bytes, `parseInfo` re-derives and checks the chain hash, rejects non-subgroup keys/signatures and `period == 0`, fuzz-tested, KAT against live quicknet data plus a Go oracle driver in `tools/`. **Where we are even:** both League-of-Entropy mainnet networks verify — quicknet (`bls-unchained-g1-rfc9380`) and, since 2026-10-06, the chained default network (`pedersen-bls-chained`), anchored on three genuine default-chain beacons. **Where we are behind:** the deprecated `bls-unchained-on-g1` parses but returns `UnsupportedScheme`; no `/group` parsing; no transport (deliberate, caller-owned per CONVENTIONS §2).
+**Where we are ahead:** the only Zig drand verifier: pure functions over caller-fetched bytes, `parseInfo` re-derives and checks the chain hash, rejects non-subgroup keys/signatures and `period == 0`, fuzz-tested, KAT against live quicknet data plus a Go oracle driver in `tools/`. **Where we are even:** both League-of-Entropy mainnet networks verify — quicknet (`bls-unchained-g1-rfc9380`) and, since 2026-10-06, the chained default network (`pedersen-bls-chained`), anchored on three genuine default-chain beacons. **Where we are behind:** no `/group` parsing; no transport (deliberate, caller-owned per CONVENTIONS §2).
 
 Re-assessed 2026-10-06 (no new web survey; the table above is unchanged): with the chained default network verified, what a user of the two live mainnet chains needs is covered; what remains (the deprecated scheme, `/group`) is Backlog-grade, so Scope moved mvp -> core.
 
@@ -99,10 +99,25 @@ period 30 s, genesis 1595431050).
   forged `previous_signature` fails the equation); a caller walking the
   chain can additionally compare it with the round it verified before.
 
-### `bls-unchained-on-g1` (recognized, not verified)
+### `bls-unchained-on-g1` (deprecated; verified since 2026-11-16)
 
-- The deprecated pre-RFC-9380 unchained scheme, which reuses the G2 DST
-  for G1 hashing (a known non-conformance). Recognized, not verified.
+- The deprecated pre-RFC-9380 unchained scheme, kept by drand-client and
+  drand/kyber for old networks. Same shape as quicknet: signature in
+  **G1** (48 B), key in **G2** (96 B, decoded and `KeyValidate`d by
+  `parseInfo` into `pubkey_g2`), message `beaconId(round) =
+  SHA-256(I2OSP(round, 8))`. The non-conformance: the message is hashed to
+  G1 under the **G2** tag `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_`
+  (`verify.deprecated_unchained_dst`) instead of the G1 tag.
+- `verifyRound` dispatches to `verifyDeprecatedUnchainedPoints`:
+  `QuicknetSuite.coreAggregateVerify` (explicit DST, so `KeyValidate` of
+  both operands still runs) over that DST. Same errors as quicknet.
+- **No external anchor.** The repository holds no genuine beacon of such a
+  network; the tests are self-consistency (a known secret signs through
+  `bls12_381.hash_to_curve` and a scalar multiply, `verifyRound` checks),
+  plus the cross-checks that a signature under either DST is refused under
+  the other scheme and that quicknet's genuine round 1000 is refused here.
+  A misreading of drand shared by code and tests would not be caught;
+  a genuine beacon of an old network would close this (see backlog).
 
 ## The verification algorithm
 
@@ -330,8 +345,6 @@ Go source) and reused here.
 
 ## Deliberately deferred
 
-- **`bls-unchained-on-g1`** (deprecated non-conformant DST): recognized,
-  not verified.
 - **HTTP / TLS transport, retries, endpoint discovery, gossip/libp2p**:
   out of scope by design (caller-supplied bytes).
 - **Group file / DKG / distributed-key parsing** (`/group`): not parsed;
@@ -341,7 +354,7 @@ Go source) and reused here.
 
 - ~~**Chained-scheme verification (`pedersen-bls-chained`)**~~ — DONE 2026-10-06 (see "chained — `pedersen-bls-chained`"); the DST turned out to be the standard RFC 9380 G2 tag, not a legacy one.
 - **Live re-check of the chained fixtures** *(2026-10-06)* — `tools/fetch_chained.py live` was not run (api.drand.sh blocked from the committing session); the fixtures come from two published packages. Extending `tools/go/main.go` to the chained scheme would add the Go differential. Effort: small.
-- **`bls-unchained-on-g1`** *(survey 2026-09-30)* — deprecated non-conformant DST; only for retro-compatibility. Effort: small; fits §2; low priority.
+- ~~**`bls-unchained-on-g1`** *(survey 2026-09-30)* — deprecated non-conformant DST; only for retro-compatibility.~~ ✅ DONE 2026-11-16 — verified through `QuicknetSuite.coreAggregateVerify` under the G2 `_NUL_` DST (see "`bls-unchained-on-g1`"). Open follow-up: no genuine beacon of an old `bls-unchained-on-g1` network is in the repo, so the tests are self-consistency only; add a real vector when one is available.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
 

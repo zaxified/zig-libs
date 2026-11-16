@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **BEHAVIOURAL, API ADDED:** the deprecated `bls-unchained-on-g1` scheme now verifies. `Scheme.isVerifiable` is true for it, `parseInfo` decodes and `KeyValidate`s its 96-byte `G2` key into `pubkey_g2` (a 48-byte key under that label is now `InvalidLength`; before, any key parsed), and `verifyRound` returns the usual typed errors instead of `UnsupportedScheme`. New `verify.deprecated_unchained_dst` (the `G2` `_NUL_` tag hashed to `G1`, drand's known non-conformance) and `verify.verifyDeprecatedUnchainedPoints(pk_g2, round, sig_g1)`. Tests are self-consistency only (no external vector for this scheme is in the repo); they pin that the two DSTs are not interchangeable.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-10** — tests: deterministic fuzz driver `DRAND_FUZZ` over the existing harnesses (`drand-parse`, `drand-verify`, `drand-verify-chained`), now generic over their choice source, with reach labels (genuine accepted / damaged refused at parse / damaged refused at verify). No code change in `src/` outside tests.

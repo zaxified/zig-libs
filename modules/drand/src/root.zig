@@ -22,8 +22,9 @@
 //! `tlock` also targets — and the chained **default** network's
 //! `pedersen-bls-chained` (signatures in `G2`, key in `G1`, message
 //! `H2(SHA-256(previous_signature ‖ round_be))` under the RFC-9380 `G2`
-//! `_NUL_` DST). The deprecated `bls-unchained-on-g1` is RECOGNIZED and
-//! parsed but not verified (`error.UnsupportedScheme`); see `SPEC.md`.
+//! `_NUL_` DST). The deprecated `bls-unchained-on-g1` (quicknet's
+//! shape, but hashed to `G1` under the `G2` `_NUL_` DST) verifies too;
+//! its tests are self-consistency only, see `SPEC.md`.
 //!
 //! ## Layout
 //!
