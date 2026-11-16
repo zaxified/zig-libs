@@ -1094,8 +1094,8 @@ tfhe	ReleaseFast	noise	1	0	70ff09c65f907b6b	57f844d8aeb1660a
 # inlined into `Dkg.run` and merged into one call chain are now distinct call
 # chains (verifyFeldmanShare 3 -> 5, its SEC1 decoding 6 -> 11). Bound moved to
 # the measurement.
-dkg	ReleaseFast	coeffs	1	<=110	f7f3b05928e3236e	ace23d0e40b2c8f5
-dkg	ReleaseFast	combine	1	0	89feb80b007daf9a	6407896882d3491c
+dkg	ReleaseFast	coeffs	1	<=110	d0f7b9b20d483edd	ace23d0e40b2c8f5
+dkg	ReleaseFast	combine	1	0	72af3881e13dc2ca	6407896882d3491c
 # aescbc — the two padding strippers, the only place this module does its own
 # arithmetic over a secret. ⭐ The claim these rows test is NOT "zero": both
 # functions END in `if (invalid != 0) return error.InvalidPadding` and return
