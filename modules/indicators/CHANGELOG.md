@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Batch speed (third round, bit for bit unchanged): the variance window `bands.VarCore` gains `steadyStep` (the
+  full-window step without the warm-up tests and the `?f64`, its running-peak update a vector select instead of the branch LLVM
+  made of the ternary); VAR and STDDEV run it as a `steadyRun` loop, BBANDS from its first output on — VAR 2.1x TA-Lib before,
+  0.94x now; STDDEV 1.4x -> 0.62x; BBANDS 2.3x -> 1.28x (1.41x at 1e3).
 - **2026-11-16** — Batch speed (third round, bit for bit unchanged): ALMA (f64, period > 1) runs eight bars side by side as two
   four-lane accumulators, each lane one bar's dot product with the scalar loop's operations in its order (seed 0.0, separate
   multiply and add, weight order) — 2.5x TA-Lib before, 0.52x now.

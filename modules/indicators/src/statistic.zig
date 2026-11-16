@@ -60,6 +60,17 @@ pub const VarianceCore = struct {
         self.n += 1;
         return self.v.step(src, x);
     }
+    pub fn steady(self: *const VarianceCore) bool {
+        return self.v.steady();
+    }
+    /// `step` over bars `i..` once `steady()`: `VarCore.steadyStep` in a loop over the slice.
+    pub fn steadyRun(self: *VarianceCore, comptime T: type, in: []const T, out: []T, i: usize) void {
+        var v = self.v;
+        const src = core.SliceSrc(T){ .xs = in };
+        for (in[i..], out[i..]) |x, *o| o.* = core.to(T, v.steadyStep(src, x));
+        self.v = v;
+        self.n = in.len;
+    }
 };
 pub fn varianceLookback(p: VarianceParams) Error!usize {
     try VarianceCore.validate(p);
@@ -96,6 +107,22 @@ pub const StddevCore = struct {
         const vr = self.v.step(src, x) orelse return null;
         if (self.nbdev != 1.0) return @sqrt(vr) * self.nbdev;
         return @sqrt(vr);
+    }
+    pub fn steady(self: *const StddevCore) bool {
+        return self.v.steady();
+    }
+    /// `step` over bars `i..` once `steady()`, as `VarianceCore.steadyRun`.
+    pub fn steadyRun(self: *StddevCore, comptime T: type, in: []const T, out: []T, i: usize) void {
+        var v = self.v;
+        const src = core.SliceSrc(T){ .xs = in };
+        if (self.nbdev != 1.0) {
+            const k = self.nbdev;
+            for (in[i..], out[i..]) |x, *o| o.* = core.to(T, @sqrt(v.steadyStep(src, x)) * k);
+        } else {
+            for (in[i..], out[i..]) |x, *o| o.* = core.to(T, @sqrt(v.steadyStep(src, x)));
+        }
+        self.v = v;
+        self.n = in.len;
     }
 };
 pub fn stddevLookback(p: StddevParams) Error!usize {

@@ -51,11 +51,25 @@ pub const VarCore = struct {
             return null;
         }
         if (n + 1 == self.p) self.peak = self.t2;
+        self.n = n; // `steadyStep` counts the bar itself
+        return self.steadyStep(src, x);
+    }
+    /// True once every further `step` is `steadyStep` (the window is full and the peak set).
+    pub fn steady(self: *const VarCore) bool {
+        return self.n >= self.p;
+    }
+    /// `step` with a full window (`n + 1 >= p`, the peak set when `n + 1 == p`): always a variance.
+    pub inline fn steadyStep(self: *VarCore, src: anytype, x: f64) f64 {
+        const n = self.n;
+        self.n += 1;
         var d = x - self.shift;
         self.t1 += d;
         d *= d;
         self.t2 += d;
-        self.peak = if (self.t2 > self.peak) self.t2 else self.peak;
+        // `if (t2 > peak) t2 else peak` as a vector select: LLVM turns the scalar ternary into a branch.
+        const tv: @Vector(2, f64) = @splat(self.t2);
+        const pv: @Vector(2, f64) = @splat(self.peak);
+        self.peak = @select(f64, tv > pv, tv, pv)[0];
         var mean = self.t1 * self.inv;
         var variance = self.t2 * self.inv - mean * mean;
         const ws = n + 1 - self.p;
@@ -181,7 +195,9 @@ fn bbLoop(comptime T: type, cm: anytype, in: []const T, upper: []T, middle: []T,
     const sm = SliceSrc(T){ .xs = in, .off = skip_m };
     const sv = SliceSrc(T){ .xs = in, .off = skip_v };
     const nan = std.math.nan(T);
-    for (in, upper, middle, lower, 0..) |x, *u, *m, *l, i| {
+    // Bars up to the first output step both cores; from the next on the variance window is steady (`steadyStep`).
+    const head = @min(in.len, plan.lb + 1);
+    for (in[0..head], upper[0..head], middle[0..head], lower[0..head], 0..) |x, *u, *m, *l, i| {
         const xv: f64 = x;
         const mv = if (i >= skip_m) cm.step(sm, xv) else null;
         const vv = if (i >= skip_v) cv.step(sv, xv) else null;
@@ -192,6 +208,22 @@ fn bbLoop(comptime T: type, cm: anytype, in: []const T, upper: []T, middle: []T,
             continue;
         }
         const b = core.to(BbandsOut(T), bands(mv.?, vv.?, p.dev_up, p.dev_dn));
+        u.* = b.upper;
+        m.* = b.middle;
+        l.* = b.lower;
+    }
+    for (in[head..], upper[head..], middle[head..], lower[head..]) |x, *u, *m, *l| {
+        const xv: f64 = x;
+        const mv = cm.step(sm, xv);
+        std.debug.assert(cv.steady());
+        const vv = cv.steadyStep(sv, xv);
+        if (mv == null) {
+            u.* = nan;
+            m.* = nan;
+            l.* = nan;
+            continue;
+        }
+        const b = core.to(BbandsOut(T), bands(mv.?, vv, p.dev_up, p.dev_dn));
         u.* = b.upper;
         m.* = b.middle;
         l.* = b.lower;
