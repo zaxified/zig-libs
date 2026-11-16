@@ -3661,3 +3661,13 @@ test "parseIsoDuration: mutated and random bytes are an error or a value, never 
         _ = parseIsoDurationUnits(buf[0..len], 1_000_000) catch {};
     }
 }
+
+test "parseIsoDuration: junk before the P, and a unit letter that does not exist, are refused" {
+    const t = std.testing;
+    // Delta mutation audit 2026-11-17: a start that is not [+-]P must not be skipped over,
+    // and an unknown letter in the date or the time part must not count as a zero unit.
+    for ([_][]const u8{ "X1D", "XT1S", "?P1D", "1PT1S", "PT1X", "PT1D", "PT1W", "P1H", "P1S", "P1X" }) |bad| {
+        try t.expectError(error.InvalidDuration, parseIsoDuration(bad));
+        try t.expectError(error.InvalidDuration, parseIsoDurationUnits(bad, 1_000_000));
+    }
+}

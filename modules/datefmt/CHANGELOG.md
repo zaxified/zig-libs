@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: delta mutation audit of the ISO 8601 duration functions, 72/74 killed, 2 equivalent; one test added (junk before `P`, unknown unit letters).
 - **2026-11-17** — **NEW:** `parseIsoDuration`/`formatIsoDuration` (ISO 8601 `PT1H30M`, `P1DT2H`, `-P2W`; nanoseconds; fixed units only, years and months refused), `parseIsoDurationUnits`/`formatIsoDurationUnits` (comptime units per second) and `max_iso_duration_len`, moved out of dataframe (duplicate-code pass 2026-11-08). Overflow and garbage are `error.InvalidDuration`.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation audit of `parseDurationExt` (10 schemata mutants, 9 killed at once, 1 survivor killed by a new test that plain `parseDuration` refuses `w`).

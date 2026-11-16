@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — on 15 inputs whose validity the RFC 3339 §5.6 / RFC 5322 §3.3 grammar decides, ours answers as the grammar on every one, while humantime 2.4.0 departs on 2 (accepts an empty fraction `37.Z`, refuses the lower-case `t`/`z` the RFC allows), jiff 0.2.38 on 4 (accepts a `+24:00` offset, a time without seconds, zone `UTC`; refuses a 10-digit fraction) and chrono 0.4.45 on 1 (refuses the trailing CFWS RFC 5322 allows); outside the count, the leap second `:60` the crates take as `:59` is refused by design (test `lead: RFC 3339 / RFC 5322 grammar …`; `tools/rust_fast_bench --probe`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-07 · mutation 2026-11-15 (787/820, 33 eq) · src f6cb0df087ccb69c
+**Audit:** review 2026-11-07 · mutation 2026-11-17 (859/894, 35 eq) · src f6cb0df087ccb69c
 
 **Hardening:** fuzz 2026-10-25 (400,000 runs clean, DATEFMT_FUZZ; reach on every label) · ct n/a — date formatting (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point: no data-reachable panic; `isoWeek`, `isoWeekday` and `diffInYears` total at the i32/i64 edges)
 
@@ -111,6 +111,21 @@ and 400 generated mail dates, each row labelled `agree` / `reject` / `own` with 
 (`src/mail_date_vectors.zig`, from `tools/mail_date_oracle.py`). `zig build interop-datefmt -- --check`
 re-takes both. Run: `zig build test-datefmt` (also `-Doptimize=ReleaseFast`), `zig fmt --check
 modules/datefmt`.
+
+**Audit 2026-11-17 (delta mutation).** 74 schemata mutants over the ISO 8601 duration functions moved in from
+`dataframe` the same day (`parseIsoDurationUnits`, `isoDigits`, `isoFraction`, `formatIsoDurationUnits` and the two
+nanosecond wrappers), ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`: the sign and
+`P` prefix handling, the `T` switch and its once-only rule, the digit, fraction and unit steps, every unit's value
+and rank, the duplicate/order and fraction-on-seconds rules, the `any` flag, the `i64` cast, the digit and
+fraction loop bounds and overflow guards, the fraction width and scaling, and in the writer the zero and sign
+cases, the integer/fraction split, the trailing-zero trim and the `.`/`S` bytes. First run: 70 killed, 4
+survived. One test added (junk before the `P` and an unknown unit letter in the date or the time part are
+refused) and killed 2; 2 are EQUIVALENT: skipping the `continue` after the `T` marker (the next iteration, whether
+it starts with `T`, digits or the end, gets the same verdict from the code that follows) and a failed `+ digit`
+in `isoDigits` leaving the digits read so far (a value past `i64` becomes at least 9.2e18 and is multiplied by a
+unit of at least 10, so the `i64` cast refuses it with the same error). `isoUnitDigits` and `max_iso_duration_len`
+are comptime-only (a compile error is their failure mode) and are not mutated. 72 killed + 2 eq = 74; the card's
+counts are cumulative with the 2026-11-15 and earlier runs.
 
 **Audit 2026-11-15 (delta mutation).** 10 schemata mutants over the 2026-11-15 additions, ReleaseSafe, one
 build, each mutant under `setsid -w timeout` and `ulimit -v`: `parseDuration`'s hand-off to `parseDurationExt`
