@@ -59,6 +59,15 @@ wire** — hold **22,767 bytes live** (39×; measured 2026-09-17, tracking alloc
 per-entry cost — the interval list scales with the number of fragments an attacker
 sends too, Audit F4).
 
+**One `Reassembler` per peer.** `frag_id` is the only key, so two peers sharing an
+instance can collide on an id or exhaust each other's slots; keep one instance per
+peer. `config.max_total_bytes` (default `null` = no extra cap) bounds the reassembly
+buffers summed over all in-flight datagrams: a fragment that would exceed it is
+refused with `error.BudgetExceeded` (expired datagrams are reclaimed first; live ones
+are never evicted). `r.stats()` returns saturating counters (`completed`, `expired`,
+`overlap`, `out_of_bounds`, `protocol_violation`, `too_many_fragments`, `table_full`,
+`budget_exceeded`, `malformed`); `r.resetStats()` clears them.
+
 `now_ns` is caller-supplied on every call — the idle timeout that reclaims
 abandoned datagrams never reads a clock itself, so a test can drive it (and
 `expireOlderThan` sweeps explicitly when no fragment arrives to trigger it).
