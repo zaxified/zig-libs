@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog: the Payload Format validation and `$SYS` statistics items were already implemented (2026-10-17) and are now marked done; no code change.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GM sweep (56 mutants over the sweep diff, ReleaseSafe schemata, one at a time): 46 killed (20 by new tests in `src/sweep_session_test.zig`: TcpServer full-buffer drop, write deadline disarmed after a write, keep-alive on complete packets, trie node budget edges, one Subscription Identifier per owner, clock saturation at the i64 ends), 10 decided (equivalent, unreachable guard, or performance-only below a ratio test's resolution). The keep-alive test's kill is argued, not rerun. Not a whole-module mutation score.
