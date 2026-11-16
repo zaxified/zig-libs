@@ -432,7 +432,7 @@ const OurVerdict = union(enum) {
 /// it only needs to be consistent WITHIN one capture's fragments, which it
 /// is.
 fn replayCapture(gpa: std.mem.Allocator, cap: Capture) !OurVerdict {
-    var r = ethfrag.Reassembler.init(gpa, .{
+    var r = try ethfrag.Reassembler.init(gpa, .{
         .max_inflight = 4,
         .timeout_ns = std.math.maxInt(u64), // never time out mid-replay
     });

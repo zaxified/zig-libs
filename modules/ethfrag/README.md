@@ -40,7 +40,7 @@ const ethfrag = @import("ethfrag");
 const frags = try ethfrag.fragment(gpa, inner_frame, frag_id, carrier_mtu, header_overhead);
 defer ethfrag.freeFragments(gpa, frags);
 
-var r = ethfrag.Reassembler.init(gpa, .{ .max_inflight = 64, .timeout_ns = 2 * std.time.ns_per_s });
+var r = try ethfrag.Reassembler.init(gpa, .{ .max_inflight = 64, .timeout_ns = 2 * std.time.ns_per_s });
 defer r.deinit();
 switch (try r.insert(wire_bytes, now_ns)) {
     .incomplete => {},

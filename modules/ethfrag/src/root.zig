@@ -437,25 +437,22 @@ pub const Reassembler = struct {
         return config.max_lifetime_ns orelse (8 *| config.timeout_ns);
     }
 
-    pub fn init(allocator: Allocator, config: ReassemblerConfig) Reassembler {
-        // Audit F7: these three used to be `std.debug.assert`, which is
-        // compiled OUT of ReleaseFast entirely — so an invalid config there
-        // was not a controlled panic but undefined behaviour (measured:
-        // SIGSEGV). An unconditional `if`+`@panic` runs — and traps — in
-        // every build mode, Debug through ReleaseFast alike. This also adds
-        // the ONE config-shaped field that had no check at all before:
-        // `max_fragments_per_datagram == 0` used to pass `init` silently in
-        // every mode and only bite on the first `insert` (allocating and
-        // immediately freeing the full `max_frame_len` buffer forever,
-        // Audit F7's second half).
-        if (config.max_inflight < 1)
-            @panic("ReassemblerConfig.max_inflight must be at least 1");
-        if (config.max_frame_len < 1 or config.max_frame_len > max_frame_len)
-            @panic("ReassemblerConfig.max_frame_len must be at least 1 and at most max_frame_len");
-        if (config.max_fragments_per_datagram < 1)
-            @panic("ReassemblerConfig.max_fragments_per_datagram must be at least 1");
+    pub const InitError = error{
+        /// `max_inflight`, `max_fragments_per_datagram` or a set
+        /// `max_total_bytes` is 0, or `max_frame_len` is 0 or above the
+        /// module's `max_frame_len`.
+        InvalidConfig,
+    };
+
+    /// A reassembler for one peer. An invalid `config` is
+    /// `error.InvalidConfig` (2026-11-16; before, a `@panic` — audit F7 had
+    /// already replaced the `assert`s that were UB in ReleaseFast).
+    pub fn init(allocator: Allocator, config: ReassemblerConfig) InitError!Reassembler {
+        if (config.max_inflight < 1) return error.InvalidConfig;
+        if (config.max_frame_len < 1 or config.max_frame_len > max_frame_len) return error.InvalidConfig;
+        if (config.max_fragments_per_datagram < 1) return error.InvalidConfig;
         if (config.max_total_bytes) |m| {
-            if (m < 1) @panic("ReassemblerConfig.max_total_bytes must be at least 1 when set");
+            if (m < 1) return error.InvalidConfig;
         }
         return .{ .allocator = allocator, .config = config };
     }
@@ -774,7 +771,7 @@ pub const Reassembler = struct {
 const testing = std.testing;
 
 fn reassembleAll(gpa: Allocator, cfg: ReassemblerConfig, frags: []const Fragment) !?[]u8 {
-    var r = Reassembler.init(gpa, cfg);
+    var r = try Reassembler.init(gpa, cfg);
     defer r.deinit();
     var result: ?[]u8 = null;
     for (frags, 0..) |f, i| {
@@ -792,7 +789,7 @@ test "smoke: single-fragment (no-frag) frame reassembles immediately" {
     defer freeFragments(testing.allocator, frags);
     try testing.expectEqual(@as(usize, 1), frags.len);
 
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1_000_000_000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1_000_000_000 });
     defer r.deinit();
     const res = try r.insert(frags[0].bytes, 0);
     switch (res) {
@@ -843,7 +840,7 @@ test "reordered delivery still reassembles correctly" {
     try testing.expect(frags.len >= 4);
 
     // Reverse order.
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
     defer r.deinit();
     var out: ?[]u8 = null;
     var i: usize = frags.len;
@@ -901,7 +898,7 @@ test "fragment: exceeding max_fragments_per_frame is rejected" {
 }
 
 test "reassembler rejects overlapping fragments and drops the whole datagram" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
     defer r.deinit();
 
     var buf1: [header_len + 10]u8 = undefined;
@@ -921,7 +918,7 @@ test "reassembler rejects overlapping fragments and drops the whole datagram" {
 }
 
 test "reassembler rejects an exact-duplicate fragment the same as any other overlap" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
     defer r.deinit();
 
     var buf: [header_len + 8]u8 = undefined;
@@ -935,7 +932,7 @@ test "reassembler rejects an exact-duplicate fragment the same as any other over
 }
 
 test "reassembler rejects a fragment extending past a claimed final length (teardrop-style)" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
     defer r.deinit();
 
     var last: [header_len + 5]u8 = undefined;
@@ -968,7 +965,7 @@ test "reassembler rejects a fragment retroactively found to exceed a LATER-estab
     // Confirmed via reproduction before the fix: the returned "complete"
     // 100-byte frame was 30 bytes of 'D', 50 bytes of allocator poison
     // (0xaa, from the never-written gap), then 20 bytes of 'C'.
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 200, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 200, .timeout_ns = 1000 });
     defer r.deinit();
 
     // Fragment A: offset=150, length=50, more=true -- arrives while
@@ -999,7 +996,7 @@ test "reassembler rejects a fragment retroactively found to exceed a LATER-estab
 }
 
 test "reassembler rejects contradictory more=false total-length claims" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
     defer r.deinit();
 
     // Non-final first fragment: doesn't establish a total length yet.
@@ -1021,7 +1018,7 @@ test "reassembler rejects contradictory more=false total-length claims" {
 }
 
 test "reassembler enforces max_frame_len (oversized reassembled length)" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 20, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 20, .timeout_ns = 1000 });
     defer r.deinit();
 
     var over: [header_len + 5]u8 = undefined;
@@ -1037,7 +1034,7 @@ test "insert() itself evicts a stale entry before accepting a fresh fragment (no
     // "is this tracked entry already stale?" check (right at the top of
     // insert(), before getOrPut) is never exercised. Here no sweep is
     // called — the second insert() call must detect the staleness itself.
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 100 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 100 });
     defer r.deinit();
 
     // First fragment of frag_id=50: bytes [0,5) = 'A'*5, non-final.
@@ -1078,7 +1075,7 @@ test "insert() itself evicts a stale entry before accepting a fresh fragment (no
 }
 
 test "gap then timeout: incomplete datagram is pruned and never published" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 100 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 100 });
     defer r.deinit();
 
     var a: [header_len + 5]u8 = undefined;
@@ -1100,7 +1097,7 @@ test "gap then timeout: incomplete datagram is pruned and never published" {
 }
 
 test "tiny-fragment flood is bounded by max_fragments_per_datagram" {
-    var r = Reassembler.init(testing.allocator, .{
+    var r = try Reassembler.init(testing.allocator, .{
         .max_inflight = 4,
         .max_fragments_per_datagram = 4,
         .timeout_ns = 1_000_000,
@@ -1136,7 +1133,7 @@ test "A1 F9: overlap-check work grows near-linearithmically with fragment count,
     const Case = struct { n: u16, checks: usize };
     var cases: [2]Case = .{ .{ .n = 256, .checks = 0 }, .{ .n = 4096, .checks = 0 } };
     for (&cases) |*c| {
-        var r = Reassembler.init(testing.allocator, .{
+        var r = try Reassembler.init(testing.allocator, .{
             .max_inflight = 1,
             .max_fragments_per_datagram = @as(usize, c.n) + 1,
             .max_frame_len = @as(usize, c.n) + 1,
@@ -1181,7 +1178,7 @@ test "A1 F8: repeated overlap-drop churn allocates the fragment's OWN size, not 
     // allocate-then-immediately-free churn, because every entry ate the
     // full `max_frame_len` (65535 B) regardless of the fragment's own
     // 9-byte size -- a 3648x amplification.
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1_000_000_000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1_000_000_000 });
     defer r.deinit();
 
     var buf: [header_len + 9]u8 = undefined;
@@ -1209,7 +1206,7 @@ test "A1 F8: repeated overlap-drop churn allocates the fragment's OWN size, not 
 }
 
 test "resource-cap exhaustion: max_inflight bounds concurrent datagrams" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 2, .timeout_ns = 1_000_000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 2, .timeout_ns = 1_000_000 });
     defer r.deinit();
 
     var i: u16 = 0;
@@ -1244,7 +1241,7 @@ test "malformed header: nonzero reserved bits are rejected, never panics" {
 }
 
 test "truncated wire bytes are rejected" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
     defer r.deinit();
     var short: [header_len - 1]u8 = @splat(0);
     try testing.expectError(error.Truncated, r.insert(&short, 0));
@@ -1252,7 +1249,7 @@ test "truncated wire bytes are rejected" {
 }
 
 test "length mismatch between header and actual payload is rejected" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
     defer r.deinit();
 
     var buf: [header_len + 3]u8 = undefined;
@@ -1263,7 +1260,7 @@ test "length mismatch between header and actual payload is rejected" {
 }
 
 test "out-of-bounds offset+length beyond max_frame_len is rejected" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 16, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 16, .timeout_ns = 1000 });
     defer r.deinit();
 
     var buf: [header_len + 10]u8 = undefined;
@@ -1275,7 +1272,7 @@ test "out-of-bounds offset+length beyond max_frame_len is rejected" {
 // ── audit regressions: F1, F2, F3 boundaries, F14 ──────────────────────────
 
 test "F1/A3: a non-final zero-length fragment is rejected outright, not silently accepted" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
     defer r.deinit();
 
     var buf: [header_len]u8 = undefined;
@@ -1285,7 +1282,7 @@ test "F1/A3: a non-final zero-length fragment is rejected outright, not silently
 }
 
 test "F1/A3b: the same zero-length fragment resent 6 times is rejected every time, not accepted every time" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1_000_000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1_000_000 });
     defer r.deinit();
 
     var buf: [header_len]u8 = undefined;
@@ -1305,7 +1302,7 @@ test "F1/A21: two final zero-length fragments claiming the same end are not both
     // zero-length-vs-zero-length comparison (an empty range never
     // intersects an identical empty range), so before the fix the second
     // one was accepted right alongside the first.
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
     defer r.deinit();
 
     var first: [header_len]u8 = undefined;
@@ -1323,7 +1320,7 @@ test "F1/A29 (no regression): a zero-length fragment at an offset a later real f
     // The fix must not turn this legitimate sequence into a false-positive
     // overlap: a length-0 point at offset 0 carries no bytes, so it cannot
     // truly conflict with a REAL fragment that later claims [0, 50).
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
     defer r.deinit();
 
     var zero: [header_len]u8 = undefined;
@@ -1354,7 +1351,7 @@ test "F2: an absolute lifetime cap reclaims an entry that a steady trickle of ac
     // apart -- always well inside `timeout_ns = 100` -- total 1000ns
     // elapsed, which crosses the default absolute cap (8 * timeout_ns =
     // 800ns) even though idle time never once did.
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 1, .timeout_ns = 100 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 1, .timeout_ns = 100 });
     defer r.deinit();
 
     var now: u64 = 0;
@@ -1380,7 +1377,7 @@ test "F2: an absolute lifetime cap reclaims an entry that a steady trickle of ac
 }
 
 test "F3/M8-shape: overlap is checked against every interval, not just the most recently accepted one" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
     defer r.deinit();
 
     var first: [header_len + 10]u8 = undefined;
@@ -1404,7 +1401,7 @@ test "F3/M8-shape: overlap is checked against every interval, not just the most 
 }
 
 test "F3/M1-shape: a one-byte overlap is rejected, not just a large one" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
     defer r.deinit();
 
     var first: [header_len + 10]u8 = undefined;
@@ -1421,7 +1418,7 @@ test "F3/M1-shape: a one-byte overlap is rejected, not just a large one" {
 }
 
 test "F3/M2b-shape: frag_end exactly at max_frame_len is accepted, one past it is rejected" {
-    var accepted = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 16, .timeout_ns = 1000 });
+    var accepted = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 16, .timeout_ns = 1000 });
     defer accepted.deinit();
     var at_limit: [header_len + 6]u8 = undefined;
     (Header{ .frag_id = 1, .offset = 10, .length = 6, .more = true }).encode(at_limit[0..header_len]);
@@ -1430,7 +1427,7 @@ test "F3/M2b-shape: frag_end exactly at max_frame_len is accepted, one past it i
     try testing.expectEqual(InsertResult.incomplete, try accepted.insert(&at_limit, 0));
     try testing.expectEqual(@as(usize, 1), accepted.inflightCount());
 
-    var rejected = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 16, .timeout_ns = 1000 });
+    var rejected = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 16, .timeout_ns = 1000 });
     defer rejected.deinit();
     var over_limit: [header_len + 7]u8 = undefined;
     (Header{ .frag_id = 1, .offset = 10, .length = 7, .more = true }).encode(over_limit[0..header_len]);
@@ -1446,7 +1443,7 @@ test "F14: trailing bytes beyond the header's declared length are rejected, the 
     // existing test drove the too-few direction. `payload.len != hdr.length`
     // is already symmetric in the code; this closes the coverage gap the
     // doc promise had, in both directions at once.
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
     defer r.deinit();
 
     // Header claims 3 payload bytes; 10 are actually present.
@@ -1469,7 +1466,7 @@ test "F3/M4b-shape: idle time exactly equal to timeout_ns has not yet expired" {
     // non-overlapping fragments for the same id, the second arriving
     // exactly timeout_ns after the first, must land in the SAME entry (and
     // so go on to complete the datagram) rather than starting a fresh one.
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 100 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 100 });
     defer r.deinit();
 
     var a: [header_len + 5]u8 = undefined;
@@ -1496,7 +1493,7 @@ test "F16: the sweep's idle check has the same strict boundary as insert's" {
     // in `expireOlderThan`; the test above only reaches the copy in
     // `insert`. A gap of exactly timeout_ns must not expire here either,
     // and one nanosecond more must.
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 100 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 100 });
     defer r.deinit();
 
     var a: [header_len + 5]u8 = undefined;
@@ -1516,7 +1513,7 @@ test "F3/M6-shape: a retroactively-checked interval that lands exactly at the ne
     // exact boundary the retroactive check (`iv.offset + iv.length >
     // frag_end`) draws: landing exactly AT the newly-established end must
     // be accepted, one byte past it must not.
-    var fits = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 200, .timeout_ns = 1000 });
+    var fits = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 200, .timeout_ns = 1000 });
     defer fits.deinit();
     // A: [150, 200) -- arrives before total_len is known.
     var a1: [header_len + 50]u8 = undefined;
@@ -1533,7 +1530,7 @@ test "F3/M6-shape: a retroactively-checked interval that lands exactly at the ne
     try testing.expectEqual(InsertResult.incomplete, try fits.insert(&c1, 1));
     try testing.expectEqual(@as(usize, 1), fits.inflightCount());
 
-    var overshoots = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 300, .timeout_ns = 1000 });
+    var overshoots = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 300, .timeout_ns = 1000 });
     defer overshoots.deinit();
     // A: [150, 201) -- one byte past where C below will establish the end.
     var a2: [header_len + 51]u8 = undefined;
@@ -1552,7 +1549,7 @@ test "F3/M7-shape: a second more=false claiming a SMALLER end is rejected too, n
     // already symmetric in the code; this pins the other direction so a
     // one-sided mutation (`frag_end > t` instead of `frag_end != t`) would
     // be caught.
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
     defer r.deinit();
 
     var a: [header_len + 5]u8 = undefined;
@@ -1600,7 +1597,7 @@ test "property: any valid split of any frame reassembles byte-identical, seeded 
         for (order, 0..) |*o, i| o.* = i;
         rand.shuffle(usize, order);
 
-        var r = Reassembler.init(testing.allocator, .{
+        var r = try Reassembler.init(testing.allocator, .{
             .max_inflight = 4,
             .max_fragments_per_datagram = max_fragments_per_frame,
             .timeout_ns = std.math.maxInt(u64),
@@ -1807,7 +1804,7 @@ fn fuzzReassemblerSmith(_: void, smith: *std.testing.Smith) !void {
 
 fn fuzzReassembler(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const max_inflight: usize = 4;
-    var r = Reassembler.init(gpa, .{
+    var r = try Reassembler.init(gpa, .{
         .max_inflight = max_inflight,
         .max_frame_len = 512,
         .max_fragments_per_datagram = 16,
@@ -1866,7 +1863,7 @@ test "corpus: every script drives the reassembler, and the counts are pinned" {
         const n: usize = smith.slice(&script);
         var cur: tkfuzz.Cursor = .{ .bytes = script[0..n] };
 
-        var r = Reassembler.init(testing.allocator, .{
+        var r = try Reassembler.init(testing.allocator, .{
             .max_inflight = max_inflight,
             .max_frame_len = 512,
             .max_fragments_per_datagram = 16,
@@ -1931,7 +1928,7 @@ fn testWire(buf: []u8, id: u16, offset: u16, payload_len: u16, more: bool) []u8 
 }
 
 test "max_total_bytes: null keeps the unbounded behaviour" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 8, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 8, .timeout_ns = 1000 });
     defer r.deinit();
     var buf: [header_len + 100]u8 = undefined;
     var i: u16 = 0;
@@ -1943,7 +1940,7 @@ test "max_total_bytes: null keeps the unbounded behaviour" {
 }
 
 test "max_total_bytes: refuses a new datagram that would exceed the cap, keeps live ones" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 8, .timeout_ns = 1000, .max_total_bytes = 250 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 8, .timeout_ns = 1000, .max_total_bytes = 250 });
     defer r.deinit();
     var buf: [header_len + 100]u8 = undefined;
     try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 100, true), 0));
@@ -1961,7 +1958,7 @@ test "max_total_bytes: refuses a new datagram that would exceed the cap, keeps l
 }
 
 test "max_total_bytes: growth of an existing datagram over the cap drops it" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 8, .timeout_ns = 1000, .max_total_bytes = 150 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 8, .timeout_ns = 1000, .max_total_bytes = 150 });
     defer r.deinit();
     var buf: [header_len + 200]u8 = undefined;
     try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 100, true), 0));
@@ -1976,7 +1973,7 @@ test "max_total_bytes: growth of an existing datagram over the cap drops it" {
 }
 
 test "max_total_bytes: completing a frame releases its bytes" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 8, .timeout_ns = 1000, .max_total_bytes = 100 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 8, .timeout_ns = 1000, .max_total_bytes = 100 });
     defer r.deinit();
     var buf: [header_len + 100]u8 = undefined;
     try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 40, true), 0));
@@ -1987,7 +1984,7 @@ test "max_total_bytes: completing a frame releases its bytes" {
 }
 
 test "stats: every error class is tallied, resetStats clears" {
-    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 1, .max_frame_len = 64, .max_fragments_per_datagram = 2, .timeout_ns = 1000 });
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 1, .max_frame_len = 64, .max_fragments_per_datagram = 2, .timeout_ns = 1000 });
     defer r.deinit();
     var buf: [header_len + 100]u8 = undefined;
 
@@ -2027,4 +2024,18 @@ test "stats: every error class is tallied, resetStats clears" {
     const out = (try r.insert(frags[0].bytes, 200_000)).complete;
     testing.allocator.free(out);
     try testing.expectEqual(@as(u64, 1), r.stats().completed);
+}
+
+test "init: every invalid config is error.InvalidConfig, never a panic" {
+    const a = std.testing.allocator;
+    const bad = [_]ReassemblerConfig{
+        .{ .max_inflight = 0, .timeout_ns = 1 },
+        .{ .max_inflight = 1, .timeout_ns = 1, .max_frame_len = 0 },
+        .{ .max_inflight = 1, .timeout_ns = 1, .max_frame_len = max_frame_len + 1 },
+        .{ .max_inflight = 1, .timeout_ns = 1, .max_fragments_per_datagram = 0 },
+        .{ .max_inflight = 1, .timeout_ns = 1, .max_total_bytes = 0 },
+    };
+    for (bad) |cfg| try std.testing.expectError(error.InvalidConfig, Reassembler.init(a, cfg));
+    var ok = try Reassembler.init(a, .{ .max_inflight = 1, .timeout_ns = 1, .max_frame_len = max_frame_len, .max_total_bytes = 1 });
+    ok.deinit();
 }

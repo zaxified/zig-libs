@@ -35,7 +35,7 @@ pub fn main() !void {
     std.debug.print("split {d}-byte frame into {d} fragment(s)\n", .{ inner_frame.len, frags.len });
 
     // Receive side: bounded reassembler, caller-clocked timeout.
-    var r = ethfrag.Reassembler.init(gpa, .{
+    var r = try ethfrag.Reassembler.init(gpa, .{
         .max_inflight = 64,
         .timeout_ns = 2 * std.time.ns_per_s,
     });
@@ -76,7 +76,7 @@ pub fn main() !void {
     // which is why it printed "unexpectedly accepted" every run instead of
     // exercising the overlap-rejection path at all. Forcing a small MTU
     // here keeps the datagram incomplete when the duplicate arrives.
-    var r2 = ethfrag.Reassembler.init(gpa, .{ .max_inflight = 4, .timeout_ns = 1_000_000_000 });
+    var r2 = try ethfrag.Reassembler.init(gpa, .{ .max_inflight = 4, .timeout_ns = 1_000_000_000 });
     defer r2.deinit();
 
     const replay_id: u16 = 0x1234;
