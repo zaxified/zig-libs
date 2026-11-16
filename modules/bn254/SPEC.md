@@ -910,7 +910,7 @@ role.
 
 ## Backlog
 
-- **`Fr.randomInto(out: *Fr, io)`** *(sweep 2026-10-09)*: `Fr.random` returns the
+- ✅ **DONE 2026-11-16 (`Fr.randomInto`, the drawn bytes wiped):** **`Fr.randomInto(out: *Fr, io)`** *(sweep 2026-10-09)*: `Fr.random` returns the
   fresh scalar by value, so a prover's `r`/`s` or a key made from it is copied into the
   caller's frame. `bls12_381` has the same item (its backlog item 0). Effort: small.
 - Part 3 (`G1`/`G2` group arithmetic — Jacobian/affine points,

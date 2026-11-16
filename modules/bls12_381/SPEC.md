@@ -1185,7 +1185,8 @@ panics, Debug AND ReleaseFast.
    value and `scalarMul`/`msm` take scalars by value: a consumer that draws a nonce or blinding
    factor and multiplies with it outside these entry points (bbs, coconut, ibe, tlock) leaves it
    in its own frames. Fixed per consumer in its sweep; an `Fr.randomInto(out, io)` twin is the
-   likely first need.
+   likely first need. ✅ 2026-11-16: `Fr.randomInto` exists (the drawn bytes wiped); the by-value
+   `scalarMul`/`msm` part stays open.
 1. **The Miller-loop sparse-multiplication optimization** — a freshly
    computed line value is structurally sparse (3 nonzero `Fp2`
    coefficients out of 6 — the "014" shape `lineValue` documents); the

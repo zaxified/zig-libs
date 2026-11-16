@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — `Fr.randomInto(out, io)`: a random scalar written into the caller's slot, the drawn bytes wiped, so a
+  nonce or key is never returned by value through the caller's frame.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
 - **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE (licence clean-up of the tests):** the precompile KATs no longer embed go-ethereum's `bn256*.json` tables (LGPL-3.0); `src/precompile_vectors.zig` is generated over our own inputs by `tools/gen_precompile_vectors.py` (independent affine BN254 arithmetic, pairing truth by bilinearity). The Groth16 KAT no longer embeds the unlicensed darkforest-v0.3 proof; it uses the snarkjs proof over `groth16`'s own test circuit. NOTICE items 5–6 rewritten.
 

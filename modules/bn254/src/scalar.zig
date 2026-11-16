@@ -161,6 +161,20 @@ pub const Fr = struct {
             return Fr.fromBytes(buf) catch continue; // >= r: reject, redraw
         }
     }
+
+    /// `random` written straight into `out`, the drawn bytes wiped: a
+    /// prover's nonce or a key drawn here is never returned by value through
+    /// the caller's frame, so a consumer that burns its own frames has only
+    /// `out` to wipe.
+    pub fn randomInto(out: *Fr, io: std.Io) void {
+        var buf: [encoded_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &buf);
+        while (true) {
+            io.random(&buf);
+            out.* = Fr.fromBytes(buf) catch continue; // >= r: reject, redraw
+            return;
+        }
+    }
 };
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -276,5 +290,18 @@ test "Fr.random produces canonical, distinct draws" {
     const a = Fr.random(io);
     const b = Fr.random(io);
     _ = try Fr.fromBytes(a.toBytes());
+    try std.testing.expect(!a.eql(b));
+}
+
+test "Fr.randomInto produces canonical, distinct draws in place" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var a: Fr = undefined;
+    var b: Fr = undefined;
+    Fr.randomInto(&a, io);
+    Fr.randomInto(&b, io);
+    _ = try Fr.fromBytes(a.toBytes());
+    _ = try Fr.fromBytes(b.toBytes());
     try std.testing.expect(!a.eql(b));
 }
