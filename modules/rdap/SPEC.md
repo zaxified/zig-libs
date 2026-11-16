@@ -28,7 +28,7 @@ Re-run 2026-09-30 per `SURVEY-PLAYBOOK.md` (first pass: the 2026-08-22 pilot, wh
 | [icann/icann-rdap](https://github.com/icann/icann-rdap) | Rust | Apache-2.0 | 461 | v1.0.0 (2026-09-16) | Its README: CLI with domain, TLD, IP and CIDR queries, RIR search, ASN, GeoFeed, direct URL; client, common and server crates, SemVer policy. Broader (TLD queries, RIR search, GeoFeed, a server implementation). |
 | Zig `std` / Zig ecosystem | Zig | — | — | — | `std` has none; GitHub search `rdap language:zig` returned no repository on 2026-09-30. |
 
-**Where we are ahead:** the only RDAP client in Zig (search above); offline-testable by design (Fetcher seam), a `DestinationPolicy` SSRF gate on the primary URL, the `related` hop and every redirect (default-deny special-use space, https only), which neither README above mentions · **Where we are behind:** search queries (deliberate non-goal, see Threat model), `help` and TLD queries, `secureDNS`, no built-in bootstrap fetch/cache (the caller downloads the IANA file), no client-certificate auth, no output formatters (→ Backlog).
+**Where we are ahead:** the only RDAP client in Zig (search above); offline-testable by design (Fetcher seam), a `DestinationPolicy` SSRF gate on the primary URL, the `related` hop and every redirect (default-deny special-use space, https only), which neither README above mentions · **Where we are behind:** search queries (deliberate non-goal, see Threat model), `help` and TLD queries, no built-in bootstrap fetch/cache (the caller downloads the IANA file), no client-certificate auth, no output formatters (→ Backlog).
 
 ## Design & invariants
 
@@ -111,19 +111,13 @@ names a loopback/RFC 1918 host — never dialed). Run: `zig build test-rdap`.
 
 ## Backlog / deferred
 
-- **`secureDNS` (delegationSigned/dsData, RFC 9083 §5.3) is not modeled.** Considered during the
-  2026-08-22 competitive-survey sweep (the real captured golden carries it) and dismissed: unlike
-  `redacted`/`publicIds`/`rdapConformance`/nested entities/nameserver glue addresses (all reused
-  existing string/string-list/nested-object helpers), `secureDNS` needs a boolean-field helper this
-  module has never needed before plus a new nested numeric-record family (`dsData[]`: keyTag,
-  algorithm, digest, digestType) — DNSSEC zone-security posture, not identity/contact data, which is
-  what every other field in this sweep serves. A legitimate future addition, not a v1 gap.
+- **`secureDNS` (delegationSigned/dsData, RFC 9083 §5.3)** ✅ DONE 2026-11-16 (see the `secureDNS` model line below).
 - Otherwise none beyond the explicit out-of-scope list above (RDAP search, auth extensions, full
   schema validation are deliberate non-goals, not v1 gaps).
 
 - **Bootstrap fetch + cache helper** *(survey 2026-09-30)*. openrdap ships "automatic server detection" with an optional cache; here the user downloads the IANA `dns.json`/`ipv4.json`/`ipv6.json`/`asn.json` files, calls `parseBootstrap`, then `lookup*`, then `Client.query`. Every first-time user writes this glue, and a naive one re-downloads the file per query (IANA asks clients to cache *(inferred)*). Effort: small-medium (a `Resolver` over `Fetcher` with caller-supplied clock for TTL; file cache stays the caller's). Fits CONVENTIONS §2.
 - **`help` query and TLD query (`domain/<tld>` on the root server)** *(survey 2026-09-30)*. In openrdap (`help`) and icann-rdap (TLD queries); low use. Effort: small (`QueryType` variants). Fits §2. ✅ DONE 2026-11-16 (`QueryType.help` -> path `help`, value ignored; `QueryType.tld` -> `domain/<tld>`, one leading dot dropped, for a root server; `buildPath`/`buildUrl` goldens)
-- **`secureDNS` model** *(survey 2026-09-30)*. Already recorded above (kept as "legitimate future addition"); it matters to anyone showing DNSSEC posture from RDAP. Effort: small-medium. Fits §2.
+- **`secureDNS` model** *(survey 2026-09-30)*. Already recorded above (kept as "legitimate future addition"); it matters to anyone showing DNSSEC posture from RDAP. Effort: small-medium. Fits §2. ✅ DONE 2026-11-16 (`Object.secure_dns: ?SecureDns` with zone_signed/delegation_signed/max_sig_life, `ds_data[]` (key_tag/algorithm/digest/digest_type + events/links) and `key_data[]` (flags/protocol/public_key/algorithm + events/links); lenient like the rest: wrong-typed or out-of-u32-range members read as null, non-object entries skipped, each record list capped at `max_secure_dns_records` = 64; goldens + hand-built tests)
 
 ## Status
 

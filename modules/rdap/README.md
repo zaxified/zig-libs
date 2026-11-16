@@ -51,6 +51,7 @@ switch (parsed.document) {
         _ = registrar.entityWithRole("abuse"); // an entity's own nested entities (RFC 9083 §5.1)
         _ = o.linkHref("related");          // registry → registrar link
         _ = o.redacted;                     // GDPR disclosures (RFC 9537)
+        _ = o.secure_dns;                   // ?SecureDns: DNSSEC posture, dsData[]/keyData[] (RFC 9083 §5.3)
     },
     .rdap_error => |e| _ = e.error_code,    // RFC 7480 §5.3 typed error
 }

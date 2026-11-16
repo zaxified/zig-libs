@@ -338,6 +338,19 @@ test "golden: real iana.org RDAP response (Public Interest Registry, 2026-08-01)
     try testing.expectEqual(@as(usize, 4), o.rdap_conformance.len);
     try testing.expectEqualStrings("redacted", o.rdap_conformance[3]);
 
+    // secureDNS (RFC 9083 §5.3) — the real DS record.
+    const sd = o.secure_dns.?;
+    try testing.expectEqual(@as(?bool, true), sd.delegation_signed);
+    try testing.expectEqual(@as(?i64, 1), sd.max_sig_life);
+    try testing.expectEqual(@as(usize, 1), sd.ds_data.len);
+    try testing.expectEqual(@as(?u32, 2234), sd.ds_data[0].key_tag);
+    try testing.expectEqual(@as(?u32, 13), sd.ds_data[0].algorithm);
+    try testing.expectEqual(@as(?u32, 2), sd.ds_data[0].digest_type);
+    try testing.expectEqualStrings(
+        "005b228ce3dad3486f713ebb9bb6f96a53839bd0e2f5a999d3400e1b7355ce8c",
+        sd.ds_data[0].digest,
+    );
+
     // redacted[] (RFC 9537) — the disclosure for the handle removal above.
     try testing.expectEqual(@as(usize, 1), o.redacted.len);
     try testing.expectEqualStrings("Registry Domain ID", o.redacted[0].name.?);
