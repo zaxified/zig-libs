@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Explicit `!!set` (mapping, all values null) and `!!omap` (sequence of single-pair mappings, no repeated key) are validated; malformed is `error.BadTaggedScalar`. The composed value is unchanged (mapping / sequence). **Behaviour change:** these tags with a wrong shape used to load silently.
 - **2026-11-16** — `!!binary` keeps its base64 text as the `.string` value (validated on load), as yaml-test-suite 565N
   expects; the bytes come from the new `yaml.decodeBinary`. Supersedes the same day's entry below, which decoded it in place.
 - **2026-11-16** — Explicit `!!binary` (base64, whitespace ignored; decoded bytes as the string value) and `!!timestamp` (YAML 1.1 grammar, validated, kept as text) tags; new public `yaml.Timestamp` / `yaml.parseTimestamp`. Malformed bodies are `error.BadTaggedScalar`. **Behaviour change:** these two tags used to leave the literal text. Untagged scalars unchanged.

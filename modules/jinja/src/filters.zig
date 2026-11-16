@@ -1491,7 +1491,7 @@ fn jsonWrite(ctx: *Ctx, w: *std.Io.Writer, v: Value, indent: ?usize, depth: usiz
             if (pairs.len != 0 and indent != null) try jsonSep(w, indent, depth, true);
             w.writeAll("}") catch return error.OutOfMemory;
         },
-        .loop, .macro => return error.BadArgument,
+        .loop, .macro, .gadget => return error.BadArgument,
     }
 }
 
@@ -1829,7 +1829,7 @@ fn tCallable(ctx: *Ctx, input: Value, args: Args) Error!bool {
     _ = args;
     // A macro (and the `loop` object, whose `__call__` always exists) are the
     // only callables a value can be here.
-    return input == .macro or input == .loop;
+    return input == .macro or input == .loop or (input == .gadget and input.gadget.kind == .joiner);
 }
 
 /// `is sameas`: Python `is`. `None`, booleans and small scalars are
@@ -1850,6 +1850,7 @@ fn tSameas(ctx: *Ctx, input: Value, args: Args) Error!bool {
         .map => |m| m.pairs.len != 0 and other == .map and m.pairs.ptr == other.map.pairs.ptr and m.pairs.len == other.map.pairs.len,
         .namespace => |n| other == .namespace and n == other.namespace,
         .loop => |n| other == .loop and n == other.loop,
+        .gadget => |g| other == .gadget and g == other.gadget,
         .macro => |m| other == .macro and m.impl == other.macro.impl,
     };
 }

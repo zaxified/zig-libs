@@ -881,3 +881,53 @@ test "`is filter` / `is test` see custom registrations" {
     defer gpa.free(out);
     try testing.expectEqualStrings("TrueFalse", out);
 }
+
+fn expectRendered(expected: []const u8, src: []const u8) !void {
+    const out = try renderWith(testing.allocator, .{}, src, .{ .map = .{ .pairs = &.{} } });
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(expected, out);
+}
+
+fn expectFails(src: []const u8) !void {
+    const r = renderWith(testing.allocator, .{}, src, .{ .map = .{ .pairs = &.{} } });
+    if (r) |out| {
+        testing.allocator.free(out);
+        return error.ExpectedFailure;
+    } else |_| {}
+}
+
+test "cycler: next/current/reset as in the Jinja2 docs" {
+    try expectRendered("odd even odd even odd", "{% set row_class = cycler('odd', 'even') %}{% for i in range(5) %}{{ row_class.next() }}{% if not loop.last %} {% endif %}{% endfor %}");
+    try expectRendered("a|a|b|b|a|a", "{% set c = cycler('a', 'b') %}{{ c.current }}|{{ c.next() }}|{{ c.current }}|{{ c.next() }}|{{ c.current }}|{{ c.next() }}");
+    try expectRendered("1 2 1 None 1", "{% set c = cycler(1, 2) %}{{ c.next() }} {{ c.next() }} {{ c.next() }} {{ c.reset() }} {{ c.next() }}");
+    try expectRendered("x x x", "{% set c = cycler('x') %}{{ c.next() }} {{ c.next() }} {{ c.current }}");
+}
+
+test "cycler: separate instances do not share state; inside a loop it persists" {
+    try expectRendered("a a b", "{% set c = cycler('a', 'b') %}{% set d = cycler('a', 'b') %}{{ c.next() }} {{ d.next() }} {{ c.next() }}");
+    try expectRendered("a,b,a,", "{% set c = cycler('a', 'b') %}{% for i in range(3) %}{{ c.next() }},{% endfor %}");
+}
+
+test "cycler: error paths" {
+    try expectFails("{{ cycler() }}");
+    try expectFails("{{ cycler(a=1) }}");
+    try expectFails("{% set c = cycler(1) %}{{ c() }}");
+    try expectFails("{% set c = cycler(1) %}{{ c.bogus() }}");
+    try expectFails("{% set c = cycler(1) %}{{ c.next(1) }}");
+}
+
+test "joiner: empty first, separator afterwards" {
+    try expectRendered("a, b, c", "{% set pipe = joiner() %}{% for x in ['a','b','c'] %}{{ pipe() }}{{ x }}{% endfor %}");
+    try expectRendered("a | b | c", "{% set pipe = joiner(' | ') %}{% for x in ['a','b','c'] %}{{ pipe() }}{{ x }}{% endfor %}");
+    try expectRendered("a-b", "{% set j = joiner(sep='-') %}{{ j() }}a{{ j() }}b");
+    try expectRendered("[][, ][, ]", "{% set j = joiner() %}[{{ j() }}][{{ j() }}][{{ j() }}]");
+    try expectRendered("true false", "{{ (joiner() is callable)|lower }} {{ (cycler(1) is callable)|lower }}");
+}
+
+test "joiner: error paths" {
+    try expectFails("{{ joiner(1) }}");
+    try expectFails("{{ joiner(',', ';') }}");
+    try expectFails("{{ joiner(x=',') }}");
+    try expectFails("{% set j = joiner() %}{{ j(1) }}");
+    try expectFails("{% set j = joiner() %}{{ j.next() }}");
+}

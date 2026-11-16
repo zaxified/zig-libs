@@ -1117,7 +1117,10 @@ const Renderer = struct {
             if (std.mem.eql(u8, name, "range")) return self.globalRange(args, c.line);
             if (std.mem.eql(u8, name, "dict")) return self.globalDict(args);
             if (std.mem.eql(u8, name, "namespace")) return self.globalNamespace(args);
-            if (std.mem.eql(u8, name, "lipsum") or std.mem.eql(u8, name, "cycler") or std.mem.eql(u8, name, "joiner"))
+            if (bound == .gadget) return self.callGadget(bound.gadget, args, c.line);
+            if (std.mem.eql(u8, name, "cycler")) return self.globalCycler(args, c.line);
+            if (std.mem.eql(u8, name, "joiner")) return self.globalJoiner(args, c.line);
+            if (std.mem.eql(u8, name, "lipsum"))
                 return self.fail(c.line, "global '{s}' is not implemented (see SPEC.md)", .{name}, error.NotCallable);
             return self.fail(c.line, "'{s}' is not callable", .{name}, error.NotCallable);
         }
@@ -1173,6 +1176,62 @@ const Renderer = struct {
         return .{ .map = .{ .pairs = pairs } };
     }
 
+    /// `cycler(*items)`: needs at least one item (the reference raises
+    /// `RuntimeError` otherwise); keyword arguments are not accepted.
+    fn globalCycler(self: *Renderer, args: filters.Args, line: usize) Error!Value {
+        if (args.kw.len != 0 or args.pos.len == 0)
+            return self.fail(line, "cycler() takes at least one positional item and no keywords", .{}, error.BadArgument);
+        const g = try self.arena.create(value.Gadget);
+        g.* = .{ .kind = .cycler, .items = try self.arena.dupe(Value, args.pos) };
+        return .{ .gadget = g };
+    }
+
+    /// `joiner(sep=", ")`: `sep` positional or keyword, a string.
+    fn globalJoiner(self: *Renderer, args: filters.Args, line: usize) Error!Value {
+        if (args.pos.len > 1 or args.kw.len > 1 or (args.pos.len == 1 and args.kw.len == 1))
+            return self.fail(line, "joiner() takes one optional argument, sep", .{}, error.BadArgument);
+        const g = try self.arena.create(value.Gadget);
+        g.* = .{ .kind = .joiner };
+        const given: ?Value = if (args.pos.len == 1) args.pos[0] else if (args.kw.len == 1) blk: {
+            if (!std.mem.eql(u8, args.kw[0].name, "sep"))
+                return self.fail(line, "joiner() got an unexpected keyword '{s}'", .{args.kw[0].name}, error.BadArgument);
+            break :blk args.kw[0].value;
+        } else null;
+        if (given) |s| {
+            if (s != .string) return self.fail(line, "joiner(): sep must be a string", .{}, error.TypeMismatch);
+            g.sep = s.string;
+        }
+        return .{ .gadget = g };
+    }
+
+    /// Calling a joiner: "" the first time, `sep` afterwards.
+    fn callGadget(self: *Renderer, g: *value.Gadget, args: filters.Args, line: usize) Error!Value {
+        if (g.kind != .joiner)
+            return self.fail(line, "a cycler is not callable; use .next()", .{}, error.NotCallable);
+        if (args.pos.len != 0 or args.kw.len != 0)
+            return self.fail(line, "a joiner takes no arguments", .{}, error.BadArgument);
+        if (!g.used) {
+            g.used = true;
+            return Value.empty_string;
+        }
+        return .{ .string = g.sep };
+    }
+
+    fn gadgetMethod(self: *Renderer, g: *value.Gadget, name: []const u8, args: filters.Args, line: usize) Error!Value {
+        if (g.kind == .cycler and args.pos.len == 0 and args.kw.len == 0) {
+            if (std.mem.eql(u8, name, "next")) {
+                const cur = g.items[g.pos];
+                g.pos = (g.pos + 1) % g.items.len;
+                return cur;
+            }
+            if (std.mem.eql(u8, name, "reset")) {
+                g.pos = 0;
+                return .none;
+            }
+        }
+        return self.fail(line, "'{s}' objects have no method '{s}' (or it takes no arguments)", .{ Value.typeName(.{ .gadget = g }), name }, error.NotCallable);
+    }
+
     fn globalNamespace(self: *Renderer, args: filters.Args) Error!Value {
         const ns = try self.arena.create(value.Namespace);
         ns.* = .{};
@@ -1199,6 +1258,10 @@ const Renderer = struct {
             .namespace => |ns| return ns.get(name) orelse .{ .undef = .{ .name = name } },
             .loop => |l| return self.loopAttr(l, name),
             .macro => |m| return self.macroAttr(m, name),
+            .gadget => |g| {
+                if (g.kind == .cycler and std.mem.eql(u8, name, "current")) return g.items[g.pos];
+                return .{ .undef = .{ .name = name } };
+            },
             .tuple => |t| return filters.groupAttr(t, name) orelse .{ .undef = .{ .name = name } },
             else => return .{ .undef = .{ .name = name } },
         }
@@ -1297,6 +1360,7 @@ const Renderer = struct {
             },
             else => {},
         }
+        if (obj == .gadget) return self.gadgetMethod(obj.gadget, name, args, line);
         if (obj == .loop) {
             const l = obj.loop;
             if (std.mem.eql(u8, name, "cycle")) {
