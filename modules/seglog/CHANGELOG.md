@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — NO CONSUMER-VISIBLE CHANGE: delta mutation audit of the day's review fixes and survey additions, 104/111 killed, 6 equivalent, 1 unobservable (SPEC, *Audit 2026-11-16 (delta mutation)*); seven new tests and three extended ones in `src/root.zig` and `src/migrate_test.zig`, no library change.
 - **2026-11-16** — Review fixes to the same day's changes (before any release): `rebuildManifest` refuses a MANIFEST of an
   unknown format version with a good CRC (`ManifestPresent`) instead of overwriting a newer writer's; `rotate` returns the new
   `RotateError.LsnExhausted` once every LSN is used (it could still write an unreopenable manifest); `isEmpty` now returns

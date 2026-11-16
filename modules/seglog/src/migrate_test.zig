@@ -908,3 +908,14 @@ test "migration: a segment larger than a block comes across whole" {
     defer v.deinit(gpa);
     try testing.expect(v.clean());
 }
+
+test "migration: Concurrent.migration reports what its open migrated" {
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    try writeV1(&sim, &fixture, &.{}, null);
+    var c = try seglog.Concurrent.open(gpa, sim.storage(), testing.io, .{ .legacy_ts = tsOf });
+    defer c.close();
+    const m = c.migration().?;
+    try testing.expectEqual(@as(u64, 3), m.segments);
+    try testing.expectEqual(@as(u64, 7), m.records);
+}
