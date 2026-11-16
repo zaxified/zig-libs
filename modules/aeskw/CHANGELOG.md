@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe covers `wrapPad` / `unwrapPad` (no KEK or key-data
+  residue, ReleaseFast).
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** a fuzz harness for `unwrapPad` (genuine, flipped, wrong KEK, truncated,
   damaged, small buffer; AESKW_PAD_FUZZ driver, 200,000 runs clean).
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the ctgrind harness also drives `wrapPad` / `unwrapPad` / a tampered
