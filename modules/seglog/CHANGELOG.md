@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** tests only: sharper tests for the read window's
+  short-read memory, a reader meeting a torn segment header, a manifest first LSN of 0, and `resync`
+  past a record whose LSN is beyond any log (mutation audit, second pass).
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** tests only, from the whole-module mutation audit
   (SPEC *Anchoring*): unit tests for the sparse index, the tally, the seal codec and the read window;
   the on-disk layout byte by byte (header, record, seal, manifest, index); the durability protocol as

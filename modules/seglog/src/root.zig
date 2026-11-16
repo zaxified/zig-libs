@@ -7149,10 +7149,11 @@ test "Window.get answers like a slice of the file, in any order of calls and lim
         var w: Window = .{ .block = block };
         defer w.deinit(testing.allocator);
         for (0..4000) |_| {
-            const limit = rnd.uintAtMost(u64, 330);
+            const limit: u64 = if (rnd.boolean()) 330 else rnd.uintAtMost(u64, 330);
             // Sequential and random starts both, so the window extends and reloads.
             const start = if (rnd.boolean()) w.off + w.buf.items.len -| rnd.uintAtMost(u64, 3) else rnd.uintAtMost(u64, 330);
-            const need = 1 + rnd.uintAtMost(u64, 40);
+            // Often exactly to the end of the file: where a remembered short read must not be trusted too far.
+            const need: u64 = if (start < data.len and rnd.uintLessThan(u8, 4) == 0) data.len - start else 1 + rnd.uintAtMost(u64, 40);
             const got = try w.get(testing.allocator, st, h, start, need, limit);
             if (start + need > @min(limit, data.len)) {
                 try testing.expectEqual(@as(?[]const u8, null), got);
@@ -7193,10 +7194,10 @@ test "Window: a short read is remembered per limit and forgotten by forget" {
     defer w2.deinit(testing.allocator);
     try testing.expectEqual(@as(?[]const u8, null), try w2.get(testing.allocator, st, h, 190, 20, 400));
     try sim.appendDurable("f", &@as([100]u8, @splat(0xCD)));
-    w2.forget(190);
-    const again = (try w2.get(testing.allocator, st, h, 190, 20, 400)).?;
+    w2.forget(195); // inside the window, so only the short-read memory is at stake
+    const again = (try w2.get(testing.allocator, st, h, 195, 20, 400)).?;
     try testing.expectEqual(@as(u8, 0xAB), again[0]);
-    try testing.expectEqual(@as(u8, 0xCD), again[15]);
+    try testing.expectEqual(@as(u8, 0xCD), again[10]);
 }
 
 test "Window: asking past the end of a file again and again costs one read, not one per byte" {
@@ -7845,9 +7846,11 @@ test "a manifest is refused for any field that is wrong, though its CRC is good"
     // The same id twice.
     try installManifest(&sim, &.{ .{ .id = 1, .first = 5 }, .{ .id = 1, .first = 5 } }, &.{}, null);
     try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), o));
-    // A first LSN of 0.
+    // A first LSN of 0 (the segment agrees, so only the manifest check can refuse it).
+    try installHeaderOnly(&sim, 1, 0);
     try installManifest(&sim, &.{.{ .id = 1, .first = 0 }}, &.{}, null);
     try testing.expectError(error.Corrupt, Log.open(testing.allocator, sim.storage(), o));
+    try installHeaderOnly(&sim, 1, 5);
     // A form that does not exist, and bytes after it that must be zero.
     try installManifest(&sim, &.{.{ .id = 1, .first = 5, .form = 5 }}, &.{}, null);
     try testing.expectError(error.UnsupportedVersion, Log.open(testing.allocator, sim.storage(), o));
@@ -8376,4 +8379,46 @@ test "a read of a compressed segment that runs past its end returns what there i
     try testing.expectEqual(@as(usize, @intCast(size)), try log.store.pread(h, &buf, 0));
     try testing.expectEqual(@as(usize, 5), try log.store.pread(h, &buf, size - 5));
     try testing.expectEqual(@as(usize, 0), try log.store.pread(h, &buf, size));
+}
+
+test "a reader waits for a segment whose header is torn at twenty bytes" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try twoSegmentsOnDisk(&sim);
+    {
+        const st = sim.storage();
+        const h = try st.open(seg_2, .open_or_create);
+        defer st.close(h);
+        try st.truncate(h, 20);
+        try st.sync(h);
+    }
+    var r = try Log.openReadOnly(testing.allocator, sim.storage(), .{});
+    defer r.close();
+    var it = r.iterator(null);
+    defer it.deinit();
+    try testing.expectEqualStrings("x", try payloadOf(&it));
+    try testing.expectEqual(@as(?Record, null), try it.next());
+}
+
+test "resync, with no later segment, still passes over a record whose LSN is beyond any log" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var log = try openSim(&sim);
+    defer log.close();
+    try log.rotate(1);
+    _ = try log.appendAt(1, "aa");
+    const p2 = try log.appendAt(2, "bb");
+    const p3 = try log.appendAt(3, "cc");
+    _ = try log.appendAt(4, "dd");
+    const c = sim.fileContent(seg_1).?;
+    c[@intCast(p2.pos.offset + rec_header_len)] ^= 0x40;
+    setRecordLsn(c, p3.pos.offset, max_lsn + 1);
+    var it = log.iterator(null);
+    defer it.deinit();
+    _ = try payloadOf(&it);
+    try testing.expectError(error.Corrupt, it.next());
+    const gap = (try it.resync()).?;
+    try testing.expectEqual(@as(?u64, 2), gap.from_lsn);
+    try testing.expectEqual(@as(?u64, 3), gap.to_lsn);
+    try testing.expectEqualStrings("dd", try payloadOf(&it));
 }
