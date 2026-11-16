@@ -126,3 +126,27 @@ Montgomery ladder, `ed448.zig`'s `Point` curve operations, and
 secret-input paths; `kat_vectors.zig`/`kat_test.zig` validate the whole
 stack byte-exact against RFC 7748 §5.2/§6.2 and RFC 8032 §7.4/§7.5 in
 both Debug and ReleaseFast.
+
+Wycheproof test vectors (Apache-2.0)
+------------------------------------
+
+`src/wycheproof_vectors.zig` reproduces all 87 test cases of
+`testvectors_v1/ed448_test.json` from the Wycheproof project
+(https://github.com/C2SP/wycheproof, generator `google-wycheproof` 0.9rc5), fetched
+2026-11-17 from https://raw.githubusercontent.com/C2SP/wycheproof/main/testvectors_v1/ed448_test.json.
+Wycheproof is offered under the Apache License 2.0; Apache-2.0 §4 is discharged as for the
+sibling `p256` module (see `../p256/NOTICE`): the licence travels with the repository, this
+paragraph is the statement of changes, and the upstream notice is retained below.
+
+    Copyright 2016-2026 The Wycheproof Authors, offered under the
+    Apache License 2.0.
+
+Statement of changes (Apache-2.0 §4(b)): the JSON was re-encoded as Zig struct literals by a
+throwaway script (not committed). All 87 cases are kept in file order with `tcId`, public key,
+message, signature, `result` and the flag names unchanged; the only edit to a field is
+that a `"` in a `comment` would be written as `'` (none occurs in this file). No hex
+payload differs from upstream.
+
+`src/rfc8032_vectors.zig` holds the RFC 8032 §7.4/§7.5 vectors, extracted by script from the
+RFC text (a public specification's published test data; no attribution entry is required, see
+Provenance above).

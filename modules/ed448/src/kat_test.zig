@@ -149,3 +149,145 @@ test "RFC 8032 §7.4: Ed448 plain 'verify' rejects a signature made for Ed448ph,
     const sig_ph = try ed448.signPh(&kp, vec.msg, vec.ctx);
     try std.testing.expectError(error.SignatureVerificationFailed, ed448.verify(sig_ph, vec.msg, vec.ctx, kp.public_key));
 }
+
+// ── every RFC 8032 §7.4/§7.5 vector (rfc8032_vectors.zig) ───────────────
+
+const rfc = @import("rfc8032_vectors.zig");
+const wp = @import("wycheproof_vectors.zig");
+
+fn unhex(gpa: std.mem.Allocator, hex: []const u8) ![]u8 {
+    const out = try gpa.alloc(u8, hex.len / 2);
+    errdefer gpa.free(out);
+    _ = try std.fmt.hexToBytes(out, hex);
+    return out;
+}
+
+test "RFC 8032 §7.4/§7.5: every vector (9 Ed448 incl. 1023 octets, 2 Ed448ph) — keygen, sign, verify, tamper" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 11), rfc.vectors.len);
+    var n_ph: usize = 0;
+    for (rfc.vectors) |vec| {
+        const sk = try unhex(gpa, vec.sk);
+        defer gpa.free(sk);
+        const pk = try unhex(gpa, vec.pk);
+        defer gpa.free(pk);
+        const msg = try unhex(gpa, vec.msg);
+        defer gpa.free(msg);
+        const ctx = try unhex(gpa, vec.ctx);
+        defer gpa.free(ctx);
+        const sig_bytes = try unhex(gpa, vec.sig);
+        defer gpa.free(sig_bytes);
+
+        const kp = ed448.KeyPair.create(sk[0..57]);
+        try std.testing.expectEqualSlices(u8, pk, &kp.public_key.bytes);
+
+        const sig = if (vec.ph) try ed448.signPh(&kp, msg, ctx) else try ed448.sign(&kp, msg, ctx);
+        try std.testing.expectEqualSlices(u8, sig_bytes, &sig.toBytes());
+
+        // Verify the RFC's own signature bytes, not only ours.
+        const rfc_sig = try ed448.Signature.fromBytes(sig_bytes[0..114].*);
+        if (vec.ph) {
+            n_ph += 1;
+            try ed448.verifyPh(rfc_sig, msg, ctx, kp.public_key);
+            try std.testing.expectError(error.SignatureVerificationFailed, ed448.verify(rfc_sig, msg, ctx, kp.public_key));
+        } else {
+            try ed448.verify(rfc_sig, msg, ctx, kp.public_key);
+            try std.testing.expectError(error.SignatureVerificationFailed, ed448.verifyPh(rfc_sig, msg, ctx, kp.public_key));
+        }
+        // A flipped bit in R or S must not verify (S may become non-canonical).
+        for ([_]usize{ 0, 56, 57, 100 }) |pos| {
+            var bad = sig_bytes[0..114].*;
+            bad[pos] ^= 0x01;
+            const bs = ed448.Signature.fromBytes(bad) catch continue;
+            const r = if (vec.ph) ed448.verifyPh(bs, msg, ctx, kp.public_key) else ed448.verify(bs, msg, ctx, kp.public_key);
+            try std.testing.expect(std.meta.isError(r));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), n_ph);
+}
+
+// ── Wycheproof ed448_test.json (wycheproof_vectors.zig) ─────────────────
+
+/// Our verdict on one Wycheproof case: true = accepted. A wrong-length
+/// signature or public key is rejected by the caller before the API
+/// (the API takes fixed-size arrays).
+fn wycheproofAccepts(gpa: std.mem.Allocator, vec: wp.Vector) !bool {
+    const pk = try unhex(gpa, vec.pk);
+    defer gpa.free(pk);
+    const msg = try unhex(gpa, vec.msg);
+    defer gpa.free(msg);
+    const sig_bytes = try unhex(gpa, vec.sig);
+    defer gpa.free(sig_bytes);
+    if (pk.len != 57 or sig_bytes.len != 114) return false;
+    const sig = ed448.Signature.fromBytes(sig_bytes[0..114].*) catch return false;
+    ed448.verify(sig, msg, "", ed448.PublicKey.fromBytes(pk[0..57].*)) catch return false;
+    return true;
+}
+
+test "Wycheproof Ed448: all 87 cases agree with the expected result (17 valid, 70 invalid, 0 acceptable)" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 87), wp.vectors.len);
+    var n_valid: usize = 0;
+    var n_invalid: usize = 0;
+    var n_acceptable: usize = 0;
+    for (wp.vectors) |vec| {
+        const ok = try wycheproofAccepts(gpa, vec);
+        switch (vec.result) {
+            .valid => {
+                n_valid += 1;
+                if (!ok) {
+                    std.debug.print("Wycheproof tcId {d} ({s}) must verify\n", .{ vec.tc_id, vec.comment });
+                    return error.TestUnexpectedResult;
+                }
+            },
+            .invalid => {
+                n_invalid += 1;
+                if (ok) {
+                    std.debug.print("Wycheproof tcId {d} ({s}) must be rejected\n", .{ vec.tc_id, vec.comment });
+                    return error.TestUnexpectedResult;
+                }
+            },
+            // The file has none; a future refresh that adds some must
+            // decide per case, so fail loudly rather than record silently.
+            .acceptable => {
+                n_acceptable += 1;
+                std.debug.print("Wycheproof tcId {d} is 'acceptable': we answer {}\n", .{ vec.tc_id, ok });
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 17), n_valid);
+    try std.testing.expectEqual(@as(usize, 70), n_invalid);
+    try std.testing.expectEqual(@as(usize, 0), n_acceptable);
+}
+
+test "Wycheproof Ed448: the error class for each invalid kind (non-canonical S, non-canonical R/A, small order, wrong length)" {
+    // Records WHICH check rejects, so a regression that rejects for the wrong
+    // reason (or accepts) shows. Counts are what the code answers today.
+    const gpa = std.testing.allocator;
+    var wrong_len: usize = 0;
+    var s_noncanonical: usize = 0;
+    var other: usize = 0;
+    for (wp.vectors) |vec| {
+        if (vec.result != .invalid) continue;
+        const pk = try unhex(gpa, vec.pk);
+        defer gpa.free(pk);
+        const msg = try unhex(gpa, vec.msg);
+        defer gpa.free(msg);
+        const sig_bytes = try unhex(gpa, vec.sig);
+        defer gpa.free(sig_bytes);
+        if (sig_bytes.len != 114) {
+            wrong_len += 1;
+            continue;
+        }
+        const sig = ed448.Signature.fromBytes(sig_bytes[0..114].*) catch {
+            s_noncanonical += 1;
+            continue;
+        };
+        try std.testing.expect(std.meta.isError(ed448.verify(sig, msg, "", ed448.PublicKey.fromBytes(pk[0..57].*))));
+        other += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 12), wrong_len);
+    try std.testing.expectEqual(@as(usize, 16), s_noncanonical);
+    try std.testing.expectEqual(@as(usize, 42), other);
+}
