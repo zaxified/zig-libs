@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-11-15 (1,080,000 runs clean in three verdicts of 4 jobs, INDICATORS_FUZZ, ReleaseSafe; reach on every function: all 237 entries x f64 / f32 x stream, per-function counts printed; the whole surface — every batch function, `Lookback`, every streaming type with `bufLen` / `init` / `update` / `peek` / `value` / `clone` — under NaN / inf / -0 / denormal / huge data, lengths 0 .. 600, parameters at and beyond every range, mismatched slice lengths, short buffers, a failing allocator and in-place calls; batch == stream, `peek` == `update`, the NaN lead == the lookback, no unwritten output slot; the harness checked by 11 planted mutants) · ct n/a — no secret enters an indicator · panic 2026-11-15 (every entry point and every `@intFromFloat` / `@intCast` / `unreachable` / `.?` / allocation site swept, all 237 functions called by the fuzz harness: MEDIAN / PERCENTILE no longer index out of the sorted copy when the data holds a NaN; BBW / PERCENTB streams keep a ring as long as their average needs (KAMA / ZLEMA / VIDYA were wrong and `peek` differed from `update`); ZIGZAG's `pivot_idx` saturates at 2^31 - 1 instead of trapping)
 
-**Performance:** ref 0.68–3.4× TA-Lib 0.8.3 batch API (114 workloads over 88 functions, 1e3–1e6 bars, f64; worst CRSI 3.4×, STOCH 2.7×, PERCENTILE 2.6×, KDJ 2.5×, ALMA 2.5×, HMA 2.4×; 39 of 88 functions over 1.1×; streaming 0.36–0.67×; i7-7920HQ, by cycles, measured 2026-11-16 after the second P-gap round, quiet machine apart from one single-core mutation job) · fastest ? (measured 2026-11-16)
+**Performance:** ref 0.43–1.9× TA-Lib 0.8.3 batch API (114 workloads over 88 functions, 1e3–1e6 bars, f64; worst STC 1.9×, FRAMA 1.9×, RVI 1.8×, FISHER 1.8×, MAMA 1.8×; 31 of 88 functions over 1.1×; streaming 0.36–0.67×; i7-7920HQ, by cycles; the 18 rows of the third P-gap round re-measured 2026-11-16 under load 3-4 against both sides in the same run, the rest from the second round's run of the same day) · fastest ? (measured 2026-11-16)
 
 **Known defects:** none recorded
 
@@ -57,7 +57,7 @@ Surveyed 2026-11-15 per `SURVEY-PLAYBOOK.md`; stars and activity were not fetche
 | [TA-Lib/ta-lib](https://github.com/TA-Lib/ta-lib) — **reference** | C | BSD-3-Clause | n/a | 0.8.3 (2026-10-25) | 237 functions, all of them here; process-global unstable period and candle settings, all functions batch plus a streaming API |
 | [kand](https://github.com/kand-ta/kand) | Rust | Apache-2.0 / MIT | n/a | not fetched | speed candidate for the benchmark wave (I4), not compared yet |
 
-**Where we are ahead:** nothing claimed yet · **Where we are behind:** batch speed against TA-Lib: 0.71–6.4×, 43 of 88 functions over 1.1× (→ Benchmark); no streaming MAVP (→ Backlog). **Ahead:** streaming updates 0.29–0.59× TA-Lib's `_Update` (not claimed on the card: the grade reads the worst batch row).
+**Where we are ahead:** nothing claimed yet · **Where we are behind:** batch speed against TA-Lib: 0.43–1.9×, 31 of 88 functions over 1.1× (→ Benchmark); no streaming MAVP (→ Backlog). **Ahead:** streaming updates 0.29–0.59× TA-Lib's `_Update` (not claimed on the card: the grade reads the worst batch row).
 
 ## What this module is, and what it is not
 
@@ -444,7 +444,8 @@ inputs with NaN or infinite bars, settings with factors above 2 or periods above
 ## What is deliberately not done
 
 - Not now: `nan = .skip` on the windowed indicators; a streaming MAVP.
-- Not now: SIMD fast paths, benchmark against `kand` (TA-Lib is measured, see Benchmark).
+- Not now: SIMD fast paths that change the arithmetic (the vector code of the batch loops only runs bars or counts side
+  by side, every lane the scalar operations in their order), benchmark against `kand` (TA-Lib is measured, see Benchmark).
 - Never: process-global configuration (unstable period, candle settings) — options are per call.
 
 ## Open
@@ -466,7 +467,8 @@ inputs with NaN or infinite bars, settings with factors above 2 or periods above
 `zig build bench-indicators` (`tools/bench.zig`, C side `tools/bench_talib.c` with the rows in `tools/bench_rows.h`; kept
 instrument kind 3, CONVENTIONS.md §9). Reference: TA-Lib C 0.8.3, the module's own model; no other candidate is timed yet
 (`kand`, the speed candidate, is not timed yet: see Compared with). Table measured 2026-11-16 on a quiet machine (one single-core mutation job beside it), after the second P-gap round;
-rows the P-gap work changed name their ratio before it.
+the rows of the third round (marked "3rd") re-measured the same day after it, under load average 3-4 (ratios by cycles, both sides in
+the same run); rows the P-gap work changed name their ratio before it.
 
 **Method.** Both sides run one BATCH call over the first n bars of the same seeded random-walk OHLCV series (f64, file
 `ohlcv.bin` written by the bench; close moves by up to 1 % a bar), into preallocated output buffers, one thread: ours
@@ -491,11 +493,18 @@ Shared machine: load average 4-6 from other sessions' test runs during the runs;
 does not enter, cache and SMT contention does (largest spread 63 % on one 100 000-bar NATR row of the 4-round repeat, typically 1-12 %;
 the table's spread is the larger of the two sides' best-to-worst over the rounds). Ratios under 1.0 are ours faster.
 
-**Result.** (2026-11-16, after the second P-gap round.) 114 batch workloads over 88 functions: ours / TA-Lib **0.68x to 3.4x**
-(2026-11-15: 0.71x to 6.4x, 43 functions over 1.1x; before the first round 23.0x, 53); 37 workloads are at or under 1.0x, 39 of the
-88 functions have a workload over 1.1x (the P2 line, `p2_ref_tolerance`). Worst: CRSI 3.4x, STOCH 2.7x, PERCENTILE 2.6x, KDJ 2.5x,
-ALMA 2.5x, HMA 2.4x, BBANDS 2.2x, FRAMA 2.0x. Best: ICHIMOKU 0.68x, AROON 0.70x, DX / ADX 0.75-0.78x, MIDPOINT 0.78x, AROONOSC
-0.80x. The second round (2026-11-16) ported TA-Lib's block scan of the window extremes (MIDPOINT, MIDPRICE, WILLR, ICHIMOKU and,
+**Result.** (2026-11-16, after the third P-gap round.) 114 batch workloads over 88 functions: ours / TA-Lib **0.43x to 1.9x**
+(after the second round 0.68x to 3.4x, 39 functions over 1.1x; 2026-11-15: 0.71x to 6.4x, 43; before the first round 23.0x, 53); 44
+workloads are at or under 1.0x, 31 of the 88 functions have a workload over 1.1x (the P2 line, `p2_ref_tolerance`). Worst: STC 1.9x,
+FRAMA 1.9x, RVI 1.8x, FISHER 1.8x, MAMA 1.8x, WAVETREND 1.6x, PPO 1.6x. Best: CRSI 0.43x, ALMA 0.48x, STDDEV 0.66-0.68x, ICHIMOKU
+0.68x, AROON 0.70x, MEDIAN 0.62x. The third round (2026-11-16) was profiled first (`perf`: cycles, instructions, branch misses per
+symbol) and kept every output bit for bit, NaN inputs included: CRSI counts its percent rank over the ring as one contiguous vector
+count; STOCH / STOCHF / KDJ run the extremum automatons as `ExtCore.Run` and each MA stage as one dispatch per call; STOCHRSI runs as
+three series passes; ALMA computes eight bars side by side as vector lanes (each lane the scalar dot product); PERCENTILE / MEDIAN
+find their sorted-window positions by vector counts while no NaN has entered (the binary searches mispredicted); HMA runs one loop
+with the three WMA states in locals (it had executed 2.4x TA-Lib's instructions); VAR / STDDEV / BBANDS step the variance window
+without warm-up tests; FRAMA runs its four automatons in registers; MINMAX shares one block scan. FRAMA and FISHER are left at
+1.8-1.9x by `exp` / `log` (Zig's per call 1.5-2.5x glibc's, which TA-Lib links; the results must stay the same bits). The second round (2026-11-16) ported TA-Lib's block scan of the window extremes (MIDPOINT, MIDPRICE, WILLR, ICHIMOKU and,
 online, STC's two stochastic windows), took MFI's leaving flow from a stack ring with branchless flow selects, and fused HMA's
 steady loop; it was profiled (`perf`, cycles / instructions / branch misses per symbol, PEBS for the branch sites): MFI's and STC's
 remaining gaps were branch mispredictions on LLVM-lowered ternaries (a random walk's step sign), fixed with vector selects. The first
@@ -506,7 +515,7 @@ NaN-free data stayed bitwise what it was. Streaming (below) is ahead.
 Ratio per size (ours / TA-Lib), ns per bar at 1e5 for both, spread; bold = a workload over 1.1x, with its P-gap hypothesis. The
 hypotheses come from the numbers and from reading the structure (a batch function loops a generic per-bar `step` core that returns
 `?f64` and reads its history through a source adapter, unless it declares a steady-state path; TA-Lib has hand-written steady-state
-loops); none was profiled. Rows marked "was" were changed by the P-gap work and name their ratio before it.
+loops); the third-round rows were profiled. Rows marked "was" were changed by the P-gap work and name their ratio before it.
 
 | row | 1e3 | 1e5 | 1e6 | ours ns/bar (1e5) | TA-Lib ns/bar (1e5) | spread | P-gap hypothesis (unverified) |
 |---|--:|--:|--:|--:|--:|--:|---|
@@ -514,13 +523,13 @@ loops); none was profiled. Rows marked "was" were changed by the P-gap work and 
 | AD | · | 0.99 | · | 1.64 | 1.66 | 22% |  |
 | ADOSC | · | 1.01 | · | 2.83 | 2.83 | 6% |  |
 | ADX | 0.77 | 0.78 | · | 6.73 | 8.65 | 3% |  |
-| **ALMA** | · | 2.54 | · | 5.37 | 2.21 | 4% | weighted dot product read through the generic window source, weights + scratch from the gpa |
+| ALMA | · | 0.48 | · | 1.10 | 2.28 | 6% | 3rd, was 2.54x: eight bars per step as two 4-lane accumulators, each lane the scalar dot product in its order |
 | APO | · | 1.02 | · | 1.36 | 1.33 | 2% | was 18.5x: the MA type is dispatched once per call (monomorphic loop), the EMA pair runs its bare recurrence after the warm-up |
 | AROON | · | 0.70 | · | 10.87 | 15.42 | 2% |  |
 | AROONOSC | · | 0.80 | · | 11.71 | 14.42 | 1% |  |
 | ATR | 0.99 | 0.95 | 0.94 | 1.30 | 1.36 | 7% | was 2.1x: true range + Wilder recurrence as one steady loop |
 | AVGDEV | · | 1.02 | · | 20.82 | 20.16 | 3% |  |
-| **BBANDS** | 2.19 | 1.99 | · | 10.75 | 5.35 | 6% | was 3.8x: MA dispatch hoisted; the variance window (re-anchor checks, `sqrt`, three outputs) is still the generic step |
+| **BBANDS** | 1.41 | 1.28 | · | 6.53 | 5.11 | 11% | 3rd, was 2.19 / 1.99x: `VarCore.steadyStep` after the first output; left: the SMA middle's generic step, `sqrt`, three stores |
 | BETA | · | 0.88 | · | 9.56 | 11.01 | 8% |  |
 | BOP | · | 0.99 | · | 1.29 | 1.30 | 6% |  |
 | **CCI** | 1.42 | 1.41 | · | 38.89 | 27.70 | 3% | was 3.9x: f64 batch parks the typical prices in the output, then sums each window as two contiguous runs in TA-Lib's slot order (no index wrap, one `tp` per bar); f32 keeps the generic step |
@@ -534,15 +543,15 @@ loops); none was profiled. Rows marked "was" were changed by the P-gap work and 
 | **CMF** | · | 1.23 | · | 5.03 | 4.06 | 5% | two windowed sums through the generic window source |
 | CMO | · | 0.92 | · | 3.65 | 3.99 | 1% |  |
 | CORREL | · | 0.93 | · | 8.54 | 9.13 | 3% |  |
-| **CRSI** | · | 3.36 | · | 289.79 | 96.95 | 2% | three cores (RSI, streak RSI, percent rank O(period)) composed per bar with a gpa scratch |
+| CRSI | · | 0.43 | · | 36.35 | 96.91 | 2% | 3rd, was 3.36x: the percent rank counted over the ring buffer as one contiguous 8-lane compare (was a `%`-indexed `src.at` per value) |
 | DEMA | · | 0.99 | · | 1.48 | 1.52 | 1% | was 1.64x: steady loop |
 | **DONCHIAN** | · | 1.25 | · | 12.68 | 10.15 | 3% | two extremum scans per bar plus the midline |
 | DX | · | 0.75 | · | 5.69 | 7.50 | 4% |  |
 | **EFI** | · | 1.40 | · | 1.71 | 1.22 | 5% | unchanged code (1.06x before): 1.3 ns per bar, the load of the after run is the likely difference |
 | EMA | 1.03 | 1.00 | 1.02 | 1.18 | 1.18 | 1% | was 1.87x: the batch steps the warm-up, then a tight `fma` loop (`steadyRun`) |
 | **FISHER** | · | 1.81 | · | 36.25 | 20.03 | 5% | a window extremum pair plus `ln` per bar |
-| **FRAMA** | · | 1.97 | · | 63.88 | 32.93 | 6% | two half-window extrema + a fractal-dimension log per bar |
-| **HMA** | · | 2.43 | · | 11.45 | 4.75 | 4% | was 3.9x: fused steady loop without `%`; left: register pressure of three WMA states with their own counters (profiled 2026-11-16: spills, not branches) |
+| **FRAMA** | · | 1.88 | · | 61.11 | 33.27 | 6% | 3rd, was 1.97x: four `ExtCore.Run` automatons in registers (the older half is the newer one `half` bars later); left: `exp` + `log` per bar, Zig's `exp` ~2.5x glibc's cycles (profiled) |
+| HMA | · | 1.03 | · | 5.23 | 4.99 | 5% | 3rd, was 2.43x: one TA-Lib-shaped loop, the WMA states in locals, trailing values re-read, re-anchors due by bar number (profiled: 2.4x TA_HMA's instructions, spills) |
 | **HT_DCPERIOD** | 1.43 | 1.44 | 1.45 | 74.08 | 51.29 | 1% | was 14.7x with the double-double `xmath.atan` on every bar; the Ziv fast path (2026-11-15) leaves the generic `?HBar` step driver and a ~25-cycle correctly rounded atan |
 | HT_DCPHASE | · | 1.04 | · | 550.94 | 534.60 | 6% | (was 3.6x: `atan` fast path; the rest is `sin` / `cos` on both sides) |
 | **HT_PHASOR** | · | 1.45 | · | 73.08 | 50.81 | 1% | same Hilbert core as HT_DCPERIOD (was 14.7x) |
@@ -551,7 +560,7 @@ loops); none was profiled. Rows marked "was" were changed by the P-gap work and 
 | ICHIMOKU | · | 0.68 | · | 8.27 | 18.66 | 3% | was 3.1x: three block-scan midprices aligned on the common lookback, as TA_ICHIMOKU |
 | **KAMA** | 1.13 | 1.08 | · | 3.84 | 3.55 | 7% | was 3.2x: the sliding efficiency ratio as one steady loop over the input slice |
 | **KC** | · | 1.33 | · | 9.26 | 13.21 | 12% | EMA + ATR + band arithmetic, two stepped cores |
-| **KDJ** | · | 2.55 | · | 39.44 | 15.50 | 6% | as STOCH (RMA smoothing through `MaCore`) |
+| **KDJ** | · | 1.11 | · | 16.83 | 15.23 | 4% | 3rd, was 2.55x: as STOCH (RMA stages) |
 | KURTOSIS | · | 1.01 | · | 8.62 | 8.38 | 2% |  |
 | KVO | · | 1.03 | · | 9.70 | 9.32 | 2% |  |
 | **LINEARREG** | 1.26 | 1.27 | · | 4.49 | 3.51 | 6% | two sliding sums with a re-anchor every 32 periods (1.1-1.16x) |
@@ -560,15 +569,15 @@ loops); none was profiled. Rows marked "was" were changed by the P-gap work and 
 | MACDEXT | · | 0.93 | · | 9.32 | 16.22 | 12% | was 3.88x: one dispatch per call when the three stages share an MA type (mixed types step the union) |
 | **MAMA** | · | 1.76 | · | 113.11 | 65.89 | 1% | Hilbert core plus MAMA's own phase `atan`, two fast-path atans per bar (was 23.0x) |
 | **MAX** | 0.90 | 1.25 | · | 2.27 | 1.78 | 5% | block scan with the NaN handling kept (1.2x at 1e5 only, 0.9x at 1e3) |
-| **MEDIAN** | · | 1.34 | · | 59.29 | 45.07 | 33% | window copy + selection into a gpa scratch (1.4x) |
+| MEDIAN | · | 0.62 | · | 28.79 | 46.34 | 33% | 3rd, was 1.34x: sorted-window positions by vector counts while NaN-free, `@memmove` shifts |
 | **MFI** | 1.48 | 1.47 | · | 9.90 | 6.81 | 3% | was 3.3x: leaving flow from a stack ring, flows selected without branches (LLVM had emitted unpredictable branches: 65 % of the run's branch misses, profiled 2026-11-16); left: the generic `vs` per-bar driver |
 | MIDPOINT | · | 0.78 | · | 2.18 | 2.76 | 7% | was 3.5x: TA-Lib's block scan of the window extremes (`window.hiLoBlocks`), not the automaton with its rescans |
 | **MIN** | 1.00 | 1.28 | · | 2.25 | 1.80 | 4% | block scan with the NaN handling kept (1.2-1.3x at 1e5 only, 0.98x at 1e3: cache-visible) |
-| **MINMAX** | · | 1.59 | · | 4.71 | 2.93 | 2% | two extremum scans per bar where TA-Lib shares one block scan |
+| MINMAX | · | 0.81 | · | 2.34 | 2.93 | 5% | 3rd, was 1.59x: both extremes from one `hiLoBlocks` scan |
 | **MOM** | · | 1.11 | · | 0.61 | 0.55 | 1% | was 1.55x: a branch-free steady step after the warm-up (`vs.run`); 0.98x in the quieter phase-4 run, 0.6 ns per bar either way |
 | NATR | · | 1.01 | · | 2.24 | 2.20 | 122% | (steady loop as ATR) |
 | OBV | 1.00 | 0.99 | · | 5.14 | 5.12 | 2% |  |
-| **PERCENTILE** | · | 2.57 | · | 94.00 | 37.80 | 20% | window copy + selection per bar into a gpa scratch (2.4x); TA-Lib's sorted insertion |
+| **PERCENTILE** | · | 1.18 | · | 44.76 | 37.67 | 6% | 3rd, was 2.57x: sorted insertion (already), the two positions by one pass of vector counts while NaN-free (the binary searches mispredicted), `@memmove` shifts |
 | PERCENTRANK | · | 1.03 | · | 69.15 | 67.06 | 2% |  |
 | PLUS_DI | · | 1.00 | · | 4.92 | 4.90 | 4% |  |
 | **PPO** | · | 1.60 | · | 2.96 | 1.87 | 4% | was 15.9x, as APO; the rest is the per-bar division and the near-zero test |
@@ -578,10 +587,10 @@ loops); none was profiled. Rows marked "was" were changed by the P-gap work and 
 | SAR | · | 1.09 | · | 6.72 | 6.16 | 2% |  |
 | SMA | 1.02 | 1.03 | 1.01 | 2.41 | 2.33 | 1% |  |
 | **STC** | · | 1.91 | · | 17.90 | 9.63 | 3% | was 6.4x: TA-Lib's online block scan of both stochastic windows, branchless (no `%` ring reads, no rescans); the rest is state kept in memory across the per-bar `step` (profiled 2026-11-16) |
-| **STDDEV** | 1.42 | 1.40 | · | 7.31 | 5.23 | 0% | as VAR (re-anchored sums, `sqrt`) |
-| **STOCH** | 2.68 | 2.22 | · | 36.28 | 16.22 | 4% | windowed extrema through generic cores plus smoothing and a gpa scratch for the raw %K; TA-Lib's block scan with a cached extremum index |
-| **STOCHF** | · | 1.73 | · | 24.59 | 14.21 | 4% | as STOCH |
-| **STOCHRSI** | · | 1.90 | · | 34.17 | 24.49 | 4% | RSI core, then a stochastic window and a smoothing stage per bar, gpa scratch |
+| STDDEV | 0.68 | 0.66 | · | 3.56 | 5.27 | 13% | 3rd, was 1.42 / 1.40x: as VAR |
+| **STOCH** | 1.09 | 1.15 | · | 17.98 | 15.61 | 2% | 3rd, was 2.68 / 2.22x: raw %K by `ExtCore.Run` over the slices, each MA stage one dispatch per call (`maStage`) |
+| **STOCHF** | · | 1.17 | · | 15.91 | 13.63 | 17% | 3rd, was 1.73x: as STOCH |
+| STOCHRSI | · | 1.06 | · | 18.36 | 23.73 | 6% | 3rd, was 1.90x: three series passes (RSI, `kSeries`, `maStage`) instead of three cores per bar |
 | SUM | · | 1.00 | · | 2.33 | 2.33 | 0% |  |
 | SWAK_BUTTER | · | 0.85 | · | 1.28 | 1.49 | 4% |  |
 | T3 | 1.05 | 1.00 | 0.99 | 3.56 | 3.54 | 4% | was 2.8x: six EMA stages in one steady loop |
@@ -592,7 +601,7 @@ loops); none was profiled. Rows marked "was" were changed by the P-gap work and 
 | **TSF** | · | 1.31 | · | 4.66 | 3.49 | 9% | LINEARREG's sums with the re-anchor every 32 periods |
 | TSI | · | 0.99 | · | 2.36 | 2.40 | 2% | was 2.16x: steady step of the four EMAs |
 | **ULTOSC** | · | 1.41 | · | 11.95 | 8.69 | 10% | three windowed sums of buying pressure / true range, re-summed per bar |
-| **VAR** | · | 1.93 | · | 6.55 | 3.37 | 5% | re-anchors its sums every 32 windows (O(period) rebuild) and divides per bar; TA-Lib slides two sums only |
+| VAR | · | 0.94 | · | 3.16 | 3.35 | 6% | 3rd, was 1.93x: `VarCore.steadyStep` (no warm-up tests, the peak update a vector select) in a `steadyRun` loop |
 | VIDYA | · | 1.02 | · | 5.48 | 5.35 | 2% |  |
 | VWAP | · | 0.94 | · | 2.77 | 3.00 | 5% |  |
 | **WAVETREND** | · | 1.63 | · | 11.61 | 7.02 | 4% | EMA / absolute-deviation / SMA chain of four stages, gpa scratch |
@@ -620,7 +629,7 @@ after the pre-check).
 
 ## Backlog / deferred
 
-- P gaps left after the 2026-11-16 round (see Benchmark): CRSI 3.4x (percent rank O(period) per bar), STOCH / KDJ / STOCHF / STOCHRSI 1.8-2.7x (extrema + `MaCore` stages per bar; TA-Lib runs the same automaton, so the gap is the per-bar driver, not the algorithm), PERCENTILE 2.6x, ALMA 2.5x, HMA 2.4x (register pressure of three WMA states: rewrite as one TA-Lib-shaped loop with shared counters), BBANDS 2.0-2.2x and VAR / STDDEV 1.4-1.9x (the variance window is still the generic step), FRAMA 2.0x, FISHER 1.7x and PSO / CKSP (TA-Lib uses the block scan there too: `window.hiLoBlocks`), STC 1.9x (state kept in memory across the per-bar `step`), MFI 1.5x (the generic `vs` driver), MAMA 1.8x and the Hilbert family 1.4x, DONCHIAN 1.2x (TA-Lib runs the automaton too; a block scan would change NaN windows against the reference), MAX / MIN 1.2-1.3x (the suffix extrema parked in the output: measure against two stack arrays). `kand` is not timed.
+- P gaps left after the third 2026-11-16 round (see Benchmark): STC 1.9x (state kept in memory across the per-bar `step`), FRAMA 1.9x and FISHER 1.8x (`exp` / `log` per bar: Zig's are 1.5-2.5x glibc's per call and the bits must stay; FISHER's window rescan through vector selects, also as two chains, measured no faster, 2026-11-16), RVI 1.8x (two recurrences through generic cores), MAMA 1.8x and the Hilbert family 1.4x, WAVETREND 1.6x, PPO 1.6x, MFI 1.5x (the generic `vs` driver), CHOP 1.45x, ULTOSC / CCI 1.4x, BBANDS 1.3-1.4x (the SMA middle's generic step, `sqrt`, three stores), KC 1.3x, LINEARREG / TSF 1.3x, DONCHIAN 1.2x (TA-Lib runs the automaton too; a block scan would change NaN windows against the reference), MAX / MIN 1.2-1.3x at 1e5 (`hiLoBlocks` with its stack suffix arrays measured the same as `extBatch` on MINMAX, so the parked suffixes are not the cost), PERCENTILE 1.2x (the `@memmove` call per bar), STOCH / STOCHF / KDJ 1.1-1.2x. PSO and CKSP have no benchmark row. `kand` is not timed.
 
 - A streaming MAVP (bank of averages, caller buffer): TA-Lib 0.8 has a streaming API for every function, MAVP included, so this is a gap against the reference, not only a design choice.
 - In-place calls (`out` aliasing `in`): TA-Lib allows them, the batch functions here do not.

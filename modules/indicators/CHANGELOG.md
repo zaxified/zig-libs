@@ -5,7 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-16** — Batch speed (third round, bit for bit unchanged): MINMAX (period <= 256) takes both extremes from one block\n  scan (`window.hiLoBlocks`, `extBatch`'s comparisons) instead of two `extBatch` passes — 1.59x TA-Lib before, 0.77x now.\n- **2026-11-16** — Batch speed (third round, bit for bit unchanged): FRAMA (f64, no NaN skipping) runs its four extremum\n  automatons as `ExtCore.Run` over the slices (the older half window is the same automaton fed `half` bars later) and joins\n  the whole window's extremes in one two-lane vector select — 2.0x TA-Lib before, 1.85x now; the rest is `exp` and `log` per bar\n  (profiled: Zig's `exp` takes about 2.5x the cycles of glibc's per call).\n- **2026-11-16** — Batch speed (third round, bit for bit unchanged): STOCHRSI (f64) runs as three passes over series instead of\n  three cores per bar: the RSI, the stochastic of the RSI values (`stoch.kSeries`, the same automaton) and its average\n  (`stoch.maStage`, one dispatch per call), the outputs swapped and blanked before the first %D — 2.0x TA-Lib before, 1.03x now.\n- **2026-11-16** — Batch speed (third round, bit for bit unchanged): HMA (period >= 4) runs its three weighted averages as one
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** SPEC benchmark rows of the third P-gap round re-measured (0.43x to 1.9x TA-Lib,
+  31 of 88 functions over 1.1x, worst STC / FRAMA), Performance line, Result and the P-gap Backlog updated; this file's three
+  previous entries had literal `\n` escapes, now line breaks.
+- **2026-11-16** — Batch speed (third round, bit for bit unchanged): MINMAX (period <= 256) takes both extremes from one block
+  scan (`window.hiLoBlocks`, `extBatch`'s comparisons) instead of two `extBatch` passes — 1.59x TA-Lib before, 0.77x now.
+- **2026-11-16** — Batch speed (third round, bit for bit unchanged): FRAMA (f64, no NaN skipping) runs its four extremum
+  automatons as `ExtCore.Run` over the slices (the older half window is the same automaton fed `half` bars later) and joins
+  the whole window's extremes in one two-lane vector select — 2.0x TA-Lib before, 1.85x now; the rest is `exp` and `log` per bar
+  (profiled: Zig's `exp` takes about 2.5x the cycles of glibc's per call).
+- **2026-11-16** — Batch speed (third round, bit for bit unchanged): STOCHRSI (f64) runs as three passes over series instead of
+  three cores per bar: the RSI, the stochastic of the RSI values (`stoch.kSeries`, the same automaton) and its average
+  (`stoch.maStage`, one dispatch per call), the outputs swapped and blanked before the first %D — 2.0x TA-Lib before, 1.03x now.
+- **2026-11-16** — Batch speed (third round, bit for bit unchanged): HMA (period >= 4) runs its three weighted averages as one
   TA-Lib shaped loop with the sums in locals, the value each average drops re-read from the input (from the ring slot about to
   be overwritten, for the outer one) instead of carried, and each re-anchor due at a bar number instead of three count-downs
   in memory (profiled: 2.4x the instructions of TA_HMA, spilled counters, no branch misses) — 2.4x TA-Lib before, 1.03x now.
