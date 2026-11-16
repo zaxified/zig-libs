@@ -47,6 +47,10 @@ pub const TransportError = error{
     AcceptFailed,
     WriteFailed,
     ReadFailed,
+    /// An operation with a timeout (`Options.timeout_ms`) did not finish in time.
+    Timeout,
+    /// `getsockopt(SO_PEERCRED)` failed (not a unix socket, or closed fd).
+    PeerCredFailed,
     /// The peer closed the connection before the expected bytes arrived.
     EndOfStream,
 };
@@ -101,10 +105,81 @@ pub fn listenUnix(path: [:0]const u8) TransportError!Fd {
     return fd;
 }
 
+/// Per-call options for `Client.requestWithOptions` / `Server.handleOneWithOptions`.
+pub const Options = struct {
+    /// Total budget in milliseconds for the whole call after the connection
+    /// exists (client: write request + read reply; server: read request,
+    /// dispatch is NOT counted but the reply write is, from the same start).
+    /// `null` (default) = block forever, the pre-timeout behaviour. A budget
+    /// that runs out returns `error.Timeout`, never a hang.
+    timeout_ms: ?u32 = null,
+};
+
+/// A monotonic-clock deadline; `end_ns == null` means "never".
+const Deadline = struct {
+    end_ns: ?u64 = null,
+
+    fn nowNs() u64 {
+        var ts: linux.timespec = undefined;
+        if (linux.errno(linux.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
+        return @as(u64, @intCast(ts.sec)) *% 1_000_000_000 +% @as(u64, @intCast(ts.nsec));
+    }
+
+    fn after(timeout_ms: ?u32) Deadline {
+        const ms = timeout_ms orelse return .{};
+        return .{ .end_ns = nowNs() +| @as(u64, ms) * 1_000_000 };
+    }
+
+    /// Milliseconds left, rounded up, as a `poll` timeout (-1 = infinite).
+    fn pollMs(self: Deadline) i32 {
+        const end = self.end_ns orelse return -1;
+        const now = nowNs();
+        if (now >= end) return 0;
+        const left = (end - now + 999_999) / 1_000_000;
+        return @intCast(@min(left, std.math.maxInt(i32)));
+    }
+};
+
+/// Wait until `fd` is ready for `events` (a hang-up/error also counts as
+/// ready: the following read/write reports it). `error.Timeout` on expiry.
+fn waitReady(fd: Fd, events: i16, deadline: Deadline) TransportError!void {
+    while (true) {
+        var pfd = [1]linux.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
+        const rc = linux.poll(&pfd, 1, deadline.pollMs());
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return error.ReadFailed,
+        }
+        if (rc == 0) {
+            if (deadline.end_ns == null) continue; // cannot happen with -1
+            return error.Timeout;
+        }
+        return;
+    }
+}
+
 /// Write every byte of `bytes` to `fd`, retrying short writes and `EINTR`.
 pub fn writeAllFd(fd: Fd, bytes: []const u8) TransportError!void {
+    return writeAllFdDeadline(fd, bytes, .{});
+}
+
+fn writeAllFdDeadline(fd: Fd, bytes: []const u8, deadline: Deadline) TransportError!void {
     var off: usize = 0;
     while (off < bytes.len) {
+        if (deadline.end_ns != null) {
+            // Never block in write(2): wait for room, then send without blocking.
+            waitReady(fd, linux.POLL.OUT, deadline) catch |e| return if (e == error.Timeout) e else error.WriteFailed;
+            const rc = linux.sendto(fd, bytes.ptr + off, bytes.len - off, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL, null, 0);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR, .AGAIN => continue,
+                else => return error.WriteFailed,
+            }
+            if (rc == 0) return error.WriteFailed;
+            off += rc;
+            continue;
+        }
         const rc = linux.write(fd, bytes.ptr + off, bytes.len - off);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
@@ -114,6 +189,25 @@ pub fn writeAllFd(fd: Fd, bytes: []const u8) TransportError!void {
         if (rc == 0) return error.WriteFailed;
         off += rc;
     }
+}
+
+/// Credentials of the process that connected to a unix socket (`SO_PEERCRED`),
+/// as recorded by the kernel at `connect` time.
+pub const PeerCred = struct {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+};
+
+/// Peer credentials of the connected unix-socket `fd` (a socket from
+/// `Server.acceptOne`, `connectUnix` or `socketpair`). Linux `SO_PEERCRED`.
+pub fn peerCred(fd: Fd) TransportError!PeerCred {
+    const Ucred = extern struct { pid: i32, uid: u32, gid: u32 };
+    var uc: Ucred = undefined;
+    var len: linux.socklen_t = @sizeOf(Ucred);
+    const rc = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.PEERCRED, @ptrCast(&uc), &len);
+    if (linux.errno(rc) != .SUCCESS or len != @sizeOf(Ucred)) return error.PeerCredFailed;
+    return .{ .pid = uc.pid, .uid = uc.uid, .gid = uc.gid };
 }
 
 /// Fill `buf` completely from `fd`, retrying short reads and `EINTR`. Returns
@@ -141,6 +235,10 @@ pub fn readExact(fd: Fd, buf: []u8) TransportError!void {
 pub const FdReader = struct {
     fd: Fd,
     interface: std.Io.Reader,
+    /// Optional deadline; once it passes a read fails with `error.ReadFailed`
+    /// and `timed_out` is set (std.Io.Reader cannot carry a custom error).
+    deadline: Deadline = .{},
+    timed_out: bool = false,
 
     pub fn init(fd: Fd, buffer: []u8) FdReader {
         return .{
@@ -158,6 +256,12 @@ pub const FdReader = struct {
         const self: *FdReader = @alignCast(@fieldParentPtr("interface", io_r));
         const dest = limit.slice(try io_w.writableSliceGreedy(1));
         while (true) {
+            if (self.deadline.end_ns != null) {
+                waitReady(self.fd, linux.POLL.IN, self.deadline) catch |e| {
+                    if (e == error.Timeout) self.timed_out = true;
+                    return error.ReadFailed;
+                };
+            }
             const rc = linux.read(self.fd, dest.ptr, dest.len);
             switch (linux.errno(rc)) {
                 .SUCCESS => {
@@ -176,6 +280,9 @@ pub const FdReader = struct {
 pub const FdWriter = struct {
     fd: Fd,
     interface: std.Io.Writer,
+    /// Optional deadline; see `FdReader.deadline`.
+    deadline: Deadline = .{},
+    timed_out: bool = false,
 
     pub fn init(fd: Fd, buffer: []u8) FdWriter {
         return .{
@@ -187,20 +294,27 @@ pub const FdWriter = struct {
         };
     }
 
+    fn put(self: *FdWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        writeAllFdDeadline(self.fd, bytes, self.deadline) catch |e| {
+            if (e == error.Timeout) self.timed_out = true;
+            return error.WriteFailed;
+        };
+    }
+
     fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *FdWriter = @alignCast(@fieldParentPtr("interface", io_w));
         const buffered = io_w.buffered();
-        writeAllFd(self.fd, buffered) catch return error.WriteFailed;
+        try self.put(buffered);
         var extra: usize = 0;
         if (data.len > 0) {
             for (data[0 .. data.len - 1]) |bytes| {
-                writeAllFd(self.fd, bytes) catch return error.WriteFailed;
+                try self.put(bytes);
                 extra += bytes.len;
             }
             const pattern = data[data.len - 1];
             var i: usize = 0;
             while (i < splat) : (i += 1) {
-                writeAllFd(self.fd, pattern) catch return error.WriteFailed;
+                try self.put(pattern);
                 extra += pattern.len;
             }
         }
@@ -265,19 +379,45 @@ pub const Server = struct {
         gpa: std.mem.Allocator,
         limits: framing.Limits,
     ) !void {
+        return handleOneWithOptions(conn_fd, ctx, dispatch, gpa, limits, .{});
+    }
+
+    /// `handleOne` with `Options`: with `timeout_ms` set, a peer that never
+    /// sends (or never drains) its frame makes this return `error.Timeout`
+    /// (and close `conn_fd`) instead of blocking the accept loop. The budget
+    /// covers the read of the request and the write of the reply (each polled
+    /// against one deadline started on entry); time spent inside `dispatch`
+    /// is the callback's own business and is not interrupted.
+    ///
+    /// To authenticate the caller, call `peerCred(conn_fd)` on the fd from
+    /// `acceptOne` before handing it to this function.
+    pub fn handleOneWithOptions(
+        conn_fd: Fd,
+        ctx: anytype,
+        comptime dispatch: fn (@TypeOf(ctx), []const u8, std.mem.Allocator) anyerror![]const u8,
+        gpa: std.mem.Allocator,
+        limits: framing.Limits,
+        opts: Options,
+    ) !void {
         defer closeFd(conn_fd);
+        const deadline = Deadline.after(opts.timeout_ms);
 
         var rbuf: [io_buf_size]u8 = undefined;
         var fr = FdReader.init(conn_fd, &rbuf);
-        const req = try framing.readFrameAlloc(&fr.interface, gpa, limits);
+        fr.deadline = deadline;
+        const req = framing.readFrameAlloc(&fr.interface, gpa, limits) catch |e|
+            return if (fr.timed_out) error.Timeout else e;
         defer gpa.free(req);
 
         const reply = try dispatch(ctx, req, gpa);
 
         var wbuf: [io_buf_size]u8 = undefined;
         var fw = FdWriter.init(conn_fd, &wbuf);
-        try framing.writeFrame(&fw.interface, reply, limits);
-        try fw.interface.flush();
+        fw.deadline = deadline;
+        framing.writeFrame(&fw.interface, reply, limits) catch |e|
+            return if (fw.timed_out) error.Timeout else e;
+        fw.interface.flush() catch |e|
+            return if (fw.timed_out) error.Timeout else e;
     }
 };
 
@@ -296,17 +436,38 @@ pub const Client = struct {
         reply_buf: []u8,
         limits: framing.Limits,
     ) ![]u8 {
+        return requestWithOptions(path, req, reply_buf, limits, .{});
+    }
+
+    /// `request` with `Options`: with `timeout_ms` set, a silent or stalled
+    /// server makes this return `error.Timeout` once the budget (write of the
+    /// request + read of the reply, one deadline from the moment the
+    /// connection exists) is spent. `connect` on a unix socket does not wait
+    /// for the peer to `accept` while the backlog has room, so it is not timed.
+    pub fn requestWithOptions(
+        path: [:0]const u8,
+        req: []const u8,
+        reply_buf: []u8,
+        limits: framing.Limits,
+        opts: Options,
+    ) ![]u8 {
         const fd = try connectUnix(path);
         defer closeFd(fd);
+        const deadline = Deadline.after(opts.timeout_ms);
 
         var wbuf: [io_buf_size]u8 = undefined;
         var fw = FdWriter.init(fd, &wbuf);
-        try framing.writeFrame(&fw.interface, req, limits);
-        try fw.interface.flush();
+        fw.deadline = deadline;
+        framing.writeFrame(&fw.interface, req, limits) catch |e|
+            return if (fw.timed_out) error.Timeout else e;
+        fw.interface.flush() catch |e|
+            return if (fw.timed_out) error.Timeout else e;
 
         var rbuf: [io_buf_size]u8 = undefined;
         var fr = FdReader.init(fd, &rbuf);
-        return framing.readFrame(&fr.interface, reply_buf, limits);
+        fr.deadline = deadline;
+        return framing.readFrame(&fr.interface, reply_buf, limits) catch |e|
+            return if (fr.timed_out) error.Timeout else e;
     }
 };
 
@@ -658,6 +819,115 @@ test "FdWriter.drain writes every slice and the splatted pattern, and reports th
         len += rc;
     }
     try testing.expectEqualStrings("abccc", got[0..len]);
+}
+
+test "Client.requestWithOptions: a silent peer times out within a bound" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path); // listens, never accepts/replies
+    defer srv.deinit();
+
+    var reply: [16]u8 = undefined;
+    const t0 = Deadline.nowNs();
+    try testing.expectError(error.Timeout, Client.requestWithOptions(path, "ping", &reply, .{}, .{ .timeout_ms = 100 }));
+    const el = Deadline.nowNs() - t0;
+    try testing.expect(el >= 90_000_000);
+    try testing.expect(el < 3_000_000_000);
+}
+
+test "Client.requestWithOptions: a generous timeout still completes a round-trip" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    const th = try std.Thread.spawn(.{}, echoServerLoop, .{ &srv, 1 });
+    defer th.join();
+    var reply: [16]u8 = undefined;
+    const got = try Client.requestWithOptions(path, "pong", &reply, .{}, .{ .timeout_ms = 5000 });
+    try testing.expectEqualStrings("pong", got);
+}
+
+test "Server.handleOneWithOptions: a peer that never writes times out and the fd is closed" {
+    var fds: [2]i32 = undefined;
+    try testing.expect(linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds)) == .SUCCESS);
+    defer closeFd(fds[0]);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t0 = Deadline.nowNs();
+    try testing.expectError(error.Timeout, Server.handleOneWithOptions(fds[1], {}, echoDispatch, arena.allocator(), .{}, .{ .timeout_ms = 100 }));
+    const el = Deadline.nowNs() - t0;
+    try testing.expect(el >= 90_000_000);
+    try testing.expect(el < 3_000_000_000);
+    try testing.expectError(error.BadFd, isCloexec(fds[1]));
+}
+
+test "Server.handleOneWithOptions: a peer that sends a partial frame times out; a peer that never reads the reply times out" {
+    var fds: [2]i32 = undefined;
+    try testing.expect(linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds)) == .SUCCESS);
+    defer closeFd(fds[0]);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var hdr: [4]u8 = undefined;
+    std.mem.writeInt(u32, &hdr, 10, .little);
+    try writeAllFd(fds[0], &hdr);
+    try writeAllFd(fds[0], "abc");
+    try testing.expectError(error.Timeout, Server.handleOneWithOptions(fds[1], {}, echoDispatch, arena.allocator(), .{}, .{ .timeout_ms = 100 }));
+
+    // Reply write: the request is complete but the reply (bigger than the
+    // socket buffer) is never drained by the peer.
+    var fds2: [2]i32 = undefined;
+    try testing.expect(linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds2)) == .SUCCESS);
+    defer closeFd(fds2[0]);
+    const big = try testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer testing.allocator.free(big);
+    @memset(big, 'z');
+    const lim: framing.Limits = .{ .max_frame = 8 * 1024 * 1024 };
+    var wbuf: [64]u8 = undefined;
+    var fw = FdWriter.init(fds2[0], &wbuf);
+    // Writer side only sends a small request; dispatch returns the big blob.
+    try framing.writeFrame(&fw.interface, "x", lim);
+    try fw.interface.flush();
+    const Big = struct {
+        fn d(b: []const u8, _: []const u8, _: std.mem.Allocator) anyerror![]const u8 {
+            return b;
+        }
+    };
+    try testing.expectError(error.Timeout, Server.handleOneWithOptions(fds2[1], @as([]const u8, big), Big.d, arena.allocator(), lim, .{ .timeout_ms = 150 }));
+}
+
+test "peerCred: socketpair and a real connection report our own pid/uid/gid" {
+    var fds: [2]i32 = undefined;
+    try testing.expect(linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds)) == .SUCCESS);
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+    const me = linux.getpid();
+    const pc = try peerCred(fds[0]);
+    try testing.expectEqual(me, pc.pid);
+    try testing.expectEqual(linux.getuid(), pc.uid);
+    try testing.expectEqual(linux.getgid(), pc.gid);
+
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    const c = try connectUnix(path);
+    defer closeFd(c);
+    const a = try srv.acceptOne();
+    defer closeFd(a);
+    const pa = try peerCred(a);
+    try testing.expectEqual(me, pa.pid);
+    try testing.expectEqual(linux.getuid(), pa.uid);
+    try testing.expectEqual(linux.getgid(), pa.gid);
+}
+
+test "peerCred: a non-socket fd is an error, not UB" {
+    var fds: [2]i32 = undefined;
+    try testing.expect(linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) == .SUCCESS);
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+    try testing.expectError(error.PeerCredFailed, peerCred(fds[0]));
+    try testing.expectError(error.PeerCredFailed, peerCred(-1));
 }
 
 test "handleOne closes the connection fd it was given" {
