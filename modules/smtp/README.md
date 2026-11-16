@@ -14,7 +14,7 @@ builds `multipart/mixed` and `multipart/alternative` trees with attachments.
   do not). RFC 3463 enhanced status codes are parsed when the server sends them.
 - **ESMTP negotiation.** The EHLO reply is resolved into a capability set — `STARTTLS`,
   `AUTH`, `PIPELINING`, `SIZE`, `8BITMIME`, `SMTPUTF8`, `ENHANCEDSTATUSCODES`,
-  `CHUNKING`/`BINARYMIME` (reported, not implemented) and `DSN` (reported; parameters below) — with unknown keywords kept
+  `CHUNKING` (BDAT, opt-in below) and `BINARYMIME` (reported, not sent) and `DSN` (reported; parameters below) — with unknown keywords kept
   verbatim rather than rejected, and a `HELO` fallback for a server that refuses EHLO.
 - **STARTTLS is a seam, not an implementation** (CONVENTIONS.md §2). The module negotiates
   it, the caller performs the handshake and returns the upgraded transport. The pre-TLS
@@ -31,6 +31,17 @@ builds `multipart/mixed` and `multipart/alternative` trees with attachments.
   caller obtains the token. The token is wiped from every buffer that held it, the AUTH
   line limit is 12288 (RFC 4954 §4) so long tokens fit, and after a failed login the
   server's JSON error is `Session.authErrorJson()` / `Client.authErrorJson()`.
+- **SCRAM-SHA-256** (RFC 5802/7677), opt-in: `Credentials{ .mechanisms = &.{.scram_sha_256,
+  .plain} }` plus `Options.scram_random` (a CSPRNG for the client nonce). Client side, no
+  channel binding, ASCII user name and password only (no SASLprep: otherwise
+  `error.NonAsciiCredential`), the server's iteration count must be 4096..600000, and a
+  wrong or missing server signature fails the AUTH (constant-time compare). Pure pieces in
+  `auth.ScramClient`.
+- **BDAT / CHUNKING (RFC 3030),** opt-in: `Options{ .bdat = true, .bdat_chunk = 65536 }`.
+  When the server advertises CHUNKING the message goes as `BDAT n` chunks (the last one
+  `BDAT n LAST`), without dot-stuffing; each chunk is answered before the next is sent, and
+  a refused chunk stops the stream, sends RSET and returns the server's error. Otherwise
+  DATA, as before.
 - **DSN parameters (RFC 3461).** `Envelope.dsn = .{ .ret, .envid, .notify, .orcpt }` adds
   `RET=`/`ENVID=` to MAIL FROM and `NOTIFY=`/`ORCPT=` to each RCPT TO, xtext-encoded
   (`command.xtext`), only when the server advertised DSN (otherwise

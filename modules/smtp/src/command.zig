@@ -432,6 +432,15 @@ pub fn data(buf: []u8, limits: Limits) CommandError![]const u8 {
     return b.finish();
 }
 
+/// RFC 3030 §2: `BDAT <size>` or `BDAT <size> LAST`. The `size` octets of the
+/// chunk follow the line directly, with no terminator and no dot-stuffing.
+pub fn bdat(buf: []u8, size: u64, last: bool, limits: Limits) CommandError![]const u8 {
+    var b: Builder = .{ .buf = buf, .limits = limits };
+    try b.print("BDAT {d}", .{size});
+    if (last) try b.put(" LAST");
+    return b.finish();
+}
+
 pub fn rset(buf: []u8, limits: Limits) CommandError![]const u8 {
     var b: Builder = .{ .buf = buf, .limits = limits };
     try b.put("RSET");
@@ -639,6 +648,14 @@ test "address grammar: what is a Mailbox and what is not" {
             return error.TestUnexpectedResult;
         };
     }
+}
+
+test "BDAT command lines (RFC 3030 §2)" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("BDAT 100\r\n", try bdat(&buf, 100, false, .{}));
+    try testing.expectEqualStrings("BDAT 0 LAST\r\n", try bdat(&buf, 0, true, .{}));
+    var tiny: [6]u8 = undefined;
+    try testing.expectError(error.CommandTooLong, bdat(&tiny, 100, true, .{}));
 }
 
 test "RFC 5321 §4.5.3.1 size ceilings" {

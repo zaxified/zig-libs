@@ -60,9 +60,19 @@ pub const Stuffer = struct {
     pending_cr: bool = false,
     /// Octets already written on the current line.
     line_len: usize = 0,
+    /// False for BDAT (RFC 3030): the same newline handling and line-length
+    /// check, no doubled leading dot and no terminator (`finishChunked`).
+    dot_stuff: bool = true,
 
     pub fn init(opts: Options) Stuffer {
         return .{ .opts = opts };
+    }
+
+    /// A `Stuffer` for RFC 3030 BDAT: line endings are normalised exactly as
+    /// for DATA, but a leading `.` is not doubled and the stream is ended with
+    /// `finishChunked`, not `finish`.
+    pub fn initChunked(opts: Options) Stuffer {
+        return .{ .opts = opts, .dot_stuff = false };
     }
 
     pub fn write(self: *Stuffer, w: *std.Io.Writer, bytes: []const u8) (StuffError || std.Io.Writer.Error)!void {
@@ -99,7 +109,7 @@ pub const Stuffer = struct {
             },
             else => {},
         }
-        if (self.at_line_start and c == '.') {
+        if (self.dot_stuff and self.at_line_start and c == '.') {
             // §4.5.2: the sender doubles a leading period. The doubled dot IS
             // part of the transmitted line §4.5.3.1.6's 998-octet limit
             // covers, so it must be checked and charged against `line_len`
@@ -116,6 +126,20 @@ pub const Stuffer = struct {
         try w.writeByte(c);
         self.line_len += 1;
         self.at_line_start = false;
+    }
+
+    /// End a BDAT stream (`initChunked`): complete a partial last line (and a
+    /// trailing lone CR), and nothing else — BDAT LAST ends the message.
+    pub fn finishChunked(self: *Stuffer, w: *std.Io.Writer) (StuffError || std.Io.Writer.Error)!void {
+        if (self.pending_cr) {
+            self.pending_cr = false;
+            if (self.opts.newline == .strict) return error.BareCarriageReturn;
+            try w.writeAll("\r\n");
+            self.at_line_start = true;
+        }
+        if (!self.at_line_start) try w.writeAll("\r\n");
+        self.at_line_start = true;
+        self.line_len = 0;
     }
 
     /// Close the data stream: terminate a partial line, then emit `.CRLF`.
@@ -181,6 +205,26 @@ pub fn messageSize(body: []const u8, opts: Options) StuffError!u64 {
     }
     if (!at_line_start) n += 2;
     return n;
+}
+
+test "chunked stuffer: newline handling and line limit as for DATA, no dot doubling, no terminator" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    var st: Stuffer = .initChunked(.{});
+    try st.write(&aw.writer, ".a\n..b\rc\r");
+    try st.finishChunked(&aw.writer);
+    try testing.expectEqualStrings(".a\r\n..b\r\nc\r\n", aw.written());
+    // the same body through DATA doubles both leading dots and ends with ".\r\n"
+    const via_data = try stuffAlloc(testing.allocator, ".a\n..b\rc\r", .{});
+    defer testing.allocator.free(via_data);
+    try testing.expectEqualStrings("..a\r\n...b\r\nc\r\n.\r\n", via_data);
+
+    var strict: Stuffer = .initChunked(.{ .newline = .strict });
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    try testing.expectError(error.BareLineFeed, strict.write(&sink.writer, "a\nb"));
+    var long: Stuffer = .initChunked(.{ .max_line = 4 });
+    try testing.expectError(error.LineTooLong, long.write(&sink.writer, "abcde"));
 }
 
 // ── receive side ───────────────────────────────────────────────────────────
