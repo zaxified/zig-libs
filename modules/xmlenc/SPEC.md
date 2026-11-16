@@ -38,7 +38,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 RSA-OAEP with decoupled digest/MGF1 (incl. the SHA-256 + MGF1-SHA-1 shape real IdPs emit), `rsa-1_5` gated
 off by default, AES-KW, AES-128/256 CBC and GCM; generic error collapse plus a decoy CEK against unwrap-side timing
 (measured, see *Constant-time posture*); ciphertext cap; CipherReference refused before any crypto. **Where we are
-behind:** decrypt only (by design), no MGF1-SHA384/512 or OAEP SHA-384/512, no
+behind:** decrypt only (by design), no
 3DES, no ECDH-ES key agreement.
 
 ## Scope
@@ -64,7 +64,7 @@ Also out of scope, and actively rejected:
 | URI | Meaning | Gate |
 |-----|---------|------|
 | `…2001/04/xmlenc#rsa-oaep-mgf1p` | RSAES-OAEP, MGF1-SHA1, label-hash SHA-1 | default |
-| `…2009/xmlenc11#rsa-oaep` | RSAES-OAEP, DigestMethod ∈ {SHA-1, SHA-256} and MGF ∈ {MGF1-SHA-1, MGF1-SHA-256} resolved **independently** — MGF defaults to MGF1-SHA1 when absent, whatever the digest is (RFC 8017 treats them as separate parameters, and real xenc11 configs pair SHA-256 with MGF1-SHA-1) | default |
+| `…2009/xmlenc11#rsa-oaep` | RSAES-OAEP, DigestMethod ∈ {SHA-1, SHA-256, SHA-384, SHA-512} and MGF ∈ {MGF1-SHA-1, MGF1-SHA-256, MGF1-SHA-384, MGF1-SHA-512} resolved **independently** — MGF defaults to MGF1-SHA1 when absent, whatever the digest is (RFC 8017 treats them as separate parameters, and real xenc11 configs pair SHA-256 with MGF1-SHA-1) | default |
 | `…2001/04/xmlenc#rsa-1_5` | RSAES-PKCS#1 v1.5 | **gated** by `allow_weak_rsa15` |
 | `…2001/04/xmlenc#kw-aes128` | RFC 3394 AES-128 key wrap | needs `Options.kek` (16 B) |
 | `…2001/04/xmlenc#kw-aes192` | RFC 3394 AES-192 key wrap (since 2026-10-10) | needs `Options.kek` (24 B) |
@@ -82,11 +82,10 @@ parameters (RFC 8017 §7.1.2 does not couple them). This module resolves both
 independently from the EncryptedKey's `ds:DigestMethod` and xenc11 `MGF`
 elements and dispatches to `decryptOaepH` with whichever pair was requested —
 `rsa-oaep-mgf1p` is SHA-1/SHA-1 fixed; xenc11 `rsa-oaep` supports any of
-{SHA-1, SHA-256} for DigestMethod crossed with any of {MGF1-SHA1, MGF1-SHA256}
+{SHA-1, SHA-256, SHA-384, SHA-512} for DigestMethod crossed with any of {MGF1-SHA1/256/384/512}
 for MGF, **including a mismatched pair** (e.g. DigestMethod=SHA-256 with
 MGF1=SHA-1 — a real-world interop shape some IdPs emit). Only a genuinely
-unrecognized digest or MGF algorithm URI (not SHA-1/SHA-256, or MGF1-SHA384/
-SHA512, which this module does not implement) returns `UnsupportedAlgorithm`.
+unrecognized digest or MGF algorithm URI (not one of the SHA-1/256/384/512 digests or MGF1 variants) returns `UnsupportedAlgorithm`.
 When xenc11 `rsa-oaep` omits the `MGF` element, the MGF defaults to the
 xenc11-spec default MGF1-SHA1 (not "assumed to match the digest" — that
 assumption is no longer needed now that the hashes are decoupled).
@@ -326,7 +325,7 @@ respective sibling modules. Base64 remains from std.
 
 **Missing and it matters** *(survey 2026-09-30)*:
 
-- **OAEP with SHA-384/512 digest and MGF1-SHA384/512** *(survey 2026-09-30)*: xmlenc11 allows them and xmlsec
+- ✅ DONE 2026-11-16 (DigestMethod sha384/sha512 and MGF mgf1sha384/mgf1sha512 URIs, all 16 pairings, via `rsa.decryptOaepHNoFail`; no external vector, round trips only) **OAEP with SHA-384/512 digest and MGF1-SHA384/512** *(survey 2026-09-30)*: xmlenc11 allows them and xmlsec
   implements them *(inferred)*; today `UnsupportedAlgorithm` (see *Key transport* table). Sibling `rsa.decryptOaepH`
   takes a `LabelHash`/`MgfHash` pair — check that it covers 384/512 first. Effort: small. Fits §2: yes.
 - **ECDH-ES key agreement (`xenc11:ECDH-ES`, Concat KDF) for EncryptedKey** *(survey 2026-09-30)*: used by newer

@@ -79,7 +79,7 @@ switch (verdict.status) {
 - **Deferred, by design:** OCSP *stapling* wire integration (the TLS server's
   job), CRL-based revocation (separate mechanism), full delegated-responder
   path building beyond the single issuer→responder link RFC 6960 requires, and
-  Ed25519/P-521 responder signatures. See `SPEC.md`.
+  P-521 responder signatures (Ed25519 is supported). See `SPEC.md`.
 
 Provenance: clean-room from RFC 6960 (a public IETF specification). See
 `SPEC.md` and `NOTICE`.

@@ -334,7 +334,7 @@ pub const module_list = [_]Module{
     .{ .name = "cbor", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "protobuf", .libs = &.{ "format", "web" }, .test_deps = &.{"testkit"} },
     .{ .name = "grpc", .libs = &.{"web"}, .deps = &.{ "http", "protobuf", "b64ct", "clock" }, .test_deps = &.{"testkit"} },
-    .{ .name = "webauthn", .libs = &.{"crypto"}, .deps = &.{ "cbor", "rsa", "p256", "x509" }, .test_deps = &.{"testkit"} },
+    .{ .name = "webauthn", .libs = &.{"crypto"}, .deps = &.{ "cbor", "rsa", "p256", "p384", "p521", "x509" }, .test_deps = &.{"testkit"} },
     .{ .name = "zipstream", .libs = &.{"format"}, .deps = &.{ "zstd", "bzip2", "lzma", "aes192", "encoding", "crc32", "datefmt" }, .test_deps = &.{"testkit"} },
     .{ .name = "qr", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "qrscan", .libs = &.{"format"}, .deps = &.{"qr"}, .test_deps = &.{"testkit"} },

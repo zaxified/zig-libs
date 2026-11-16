@@ -34,6 +34,8 @@ const aeskw = @import("aeskw");
 
 const Sha1 = std.crypto.hash.Sha1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha384 = std.crypto.hash.sha2.Sha384;
+const Sha512 = std.crypto.hash.sha2.Sha512;
 const Aes128 = std.crypto.core.aes.Aes128;
 const Aes256 = std.crypto.core.aes.Aes256;
 const Aes128Gcm = @import("aesgcm").Aes128Gcm;
@@ -90,10 +92,14 @@ const alg_kw_aes256 = xenc_ns ++ "kw-aes256";
 // Digest methods (for OAEP).
 const alg_sha1 = ds_ns ++ "sha1";
 const alg_sha256 = xenc_ns ++ "sha256";
+const alg_sha384 = "http://www.w3.org/2001/04/xmldsig-more#sha384";
+const alg_sha512 = xenc_ns ++ "sha512";
 
 // MGF (xenc11 rsa-oaep).
 const alg_mgf1sha1 = xenc11_ns ++ "mgf1sha1";
 const alg_mgf1sha256 = xenc11_ns ++ "mgf1sha256";
+const alg_mgf1sha384 = xenc11_ns ++ "mgf1sha384";
+const alg_mgf1sha512 = xenc11_ns ++ "mgf1sha512";
 
 // ── options & errors ────────────────────────────────────────────────────────
 
@@ -364,7 +370,7 @@ fn classifyContent(alg: []const u8) Error!ContentAlg {
 
 // ── CEK unwrap (key transport / key wrap) ───────────────────────────────────
 
-const OaepHash = enum { sha1, sha256 };
+const OaepHash = enum { sha1, sha256, sha384, sha512 };
 
 /// Unwrap the content-encryption key from an `<xenc:EncryptedKey>`. Returns a
 /// subslice of `out` holding the CEK. Never trusts any KeyInfo inside the
@@ -463,6 +469,15 @@ fn unwrapCek(
 /// is expressible; see SPEC.md.
 const OaepHashes = struct { digest: OaepHash, mgf: OaepHash };
 
+fn oaepHashType(comptime h: OaepHash) type {
+    return switch (h) {
+        .sha1 => Sha1,
+        .sha256 => Sha256,
+        .sha384 => Sha384,
+        .sha512 => Sha512,
+    };
+}
+
 /// Resolve the OAEP digest + MGF1 hash for an xenc11 `rsa-oaep`
 /// EncryptionMethod.
 fn oaepHashFromMethod(method: *const xml.Element) Error!OaepHashes {
@@ -474,6 +489,10 @@ fn oaepHashFromMethod(method: *const xml.Element) Error!OaepHashes {
             digest = .sha1;
         } else if (eq(da, alg_sha256)) {
             digest = .sha256;
+        } else if (eq(da, alg_sha384)) {
+            digest = .sha384;
+        } else if (eq(da, alg_sha512)) {
+            digest = .sha512;
         } else return error.UnsupportedAlgorithm;
     }
     // MGF defaults to mgf1sha1 (the xenc11 spec default) when absent.
@@ -484,6 +503,10 @@ fn oaepHashFromMethod(method: *const xml.Element) Error!OaepHashes {
             mgf = .sha1;
         } else if (eq(ma, alg_mgf1sha256)) {
             mgf = .sha256;
+        } else if (eq(ma, alg_mgf1sha384)) {
+            mgf = .sha384;
+        } else if (eq(ma, alg_mgf1sha512)) {
+            mgf = .sha512;
         } else return error.UnsupportedAlgorithm;
     }
     return .{ .digest = digest, .mgf = mgf };
@@ -519,15 +542,17 @@ fn rsaOaepUnwrap(
     defer std.crypto.secureZero(u8, &msg_buf);
     var raw_buf: [rsa.max_modulus_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &raw_buf);
-    const r = switch (hashes.digest) {
-        .sha1 => switch (hashes.mgf) {
-            .sha1 => rsa.decryptOaepHNoFail(sk, Sha1, Sha1, .none, wrapped, label, want, &msg_buf, &raw_buf),
-            .sha256 => rsa.decryptOaepHNoFail(sk, Sha1, Sha256, .none, wrapped, label, want, &msg_buf, &raw_buf),
-        },
-        .sha256 => switch (hashes.mgf) {
-            .sha1 => rsa.decryptOaepHNoFail(sk, Sha256, Sha1, .none, wrapped, label, want, &msg_buf, &raw_buf),
-            .sha256 => rsa.decryptOaepHNoFail(sk, Sha256, Sha256, .none, wrapped, label, want, &msg_buf, &raw_buf),
-        },
+    const r = blk: {
+        // 4 x 4 comptime (LabelHash, MgfHash) pairs; both selectors are public
+        // (they come from the algorithm URIs).
+        inline for (.{ .sha1, .sha256, .sha384, .sha512 }) |d| {
+            inline for (.{ .sha1, .sha256, .sha384, .sha512 }) |m| {
+                if (hashes.digest == d and hashes.mgf == m) {
+                    break :blk rsa.decryptOaepHNoFail(sk, oaepHashType(d), oaepHashType(m), .none, wrapped, label, want, &msg_buf, &raw_buf);
+                }
+            }
+        }
+        unreachable;
     } catch |e| switch (e) {
         // BufferTooSmall is a structural/public-data precondition (`want` vs
         // this function's own fixed-size buffers) -- not a padding-decode

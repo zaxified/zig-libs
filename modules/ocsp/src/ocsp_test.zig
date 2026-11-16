@@ -29,6 +29,7 @@ const next_update = "20271231000000Z";
 
 // OIDs used to hand-build fixtures.
 const oid_sha256_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b };
+const oid_ed25519 = [_]u8{ 0x2b, 0x65, 0x70 };
 const oid_ecdsa_sha256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 };
 const oid_ec_public_key = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
 const oid_p256_curve = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
@@ -178,6 +179,8 @@ const RespSpec = struct {
     sign_rsa: ?rsa.SecretKey = null,
     /// signer: p256 secret key (ECDSA SHA-256).
     sign_ecdsa: ?[32]u8 = null,
+    /// signer: Ed25519 seed (id-Ed25519, RFC 8410).
+    sign_ed25519: ?[32]u8 = null,
     /// W2-A2/ocsp-F3: flip a byte of the CertID's issuerNameHash so it no
     /// longer matches the real issuer, leaving issuerKeyHash and serial
     /// correct — isolates the name-hash comparison from the other two.
@@ -316,6 +319,10 @@ fn buildResponseImpl(gpa: std.mem.Allocator, spec: RespSpec, with_decoy: bool) !
         const rs = try p256.sign.ecdsaSign(&sk, tbs, &(@as([32]u8, @splat(0x2b))));
         signature = try ecdsaRsToDer(b, rs);
         sig_alg = try b.seq(&.{try b.oid(&oid_ecdsa_sha256)});
+    } else if (spec.sign_ed25519) |seed| {
+        const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+        signature = try b.a.dupe(u8, &(try kp.sign(tbs, null)).toBytes());
+        sig_alg = try b.seq(&.{try b.oid(&oid_ed25519)});
     } else return error.NoSigner;
 
     // BasicOCSPResponse
@@ -1845,4 +1852,159 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+// ── Ed25519 responder signatures (2026-11-16) ──────────────────────────────
+// No external vector: key, certificate and response are built in-test with
+// std's Ed25519 (RFC 8032 itself is std's concern); the module's own verifier
+// is what is exercised.
+
+/// Minimal Ed25519 issuer cert (SPKI = id-Ed25519, no parameters); its own
+/// signature is never checked by `ocsp.verify`.
+fn buildEdIssuerCert(gpa: std.mem.Allocator, pk: [32]u8, name: []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const b: der_writer.Builder = .{ .a = arena.allocator() };
+    const version = try b.explicit(0, try b.integerU64(2));
+    const serial = try b.integerU64(4);
+    const sig_alg = try b.seq(&.{try b.oid(&oid_ed25519)});
+    const validity = try b.seq(&.{
+        try b.tlv(0x17, "200101000000Z"),
+        try b.tlv(0x17, "400101000000Z"),
+    });
+    const spki = try b.seq(&.{ try b.seq(&.{try b.oid(&oid_ed25519)}), try b.bitString(&pk) });
+    const tbs = try b.seq(&.{ version, serial, sig_alg, name, validity, name, spki });
+    const cert = try b.seq(&.{ tbs, sig_alg, try b.bitString(&@as([64]u8, @splat(0))) });
+    return gpa.dupe(u8, cert);
+}
+
+const EdCase = struct {
+    issuer: []u8,
+    leaf: []u8,
+    bits: IssuerBits,
+    serial: []const u8,
+    kp: std.crypto.sign.Ed25519.KeyPair,
+    seed: [32]u8,
+    rsa_fx: RsaFixture,
+
+    fn deinit(self: *EdCase, gpa: std.mem.Allocator) void {
+        gpa.free(self.issuer);
+        gpa.free(self.leaf);
+        self.rsa_fx.deinit(gpa);
+    }
+};
+
+fn makeEdCase(gpa: std.mem.Allocator) !EdCase {
+    const seed: [32]u8 = @splat(0x5d);
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const nb: der_writer.Builder = .{ .a = arena.allocator() };
+    const name = try buildName(nb, "Ed25519 OCSP CA");
+    const issuer = try buildEdIssuerCert(gpa, kp.public_key.toBytes(), name);
+    errdefer gpa.free(issuer);
+    var fx = try makeRsaFixture(gpa);
+    errdefer fx.deinit(gpa);
+    const bits = try extractBits(issuer);
+    const subject = try extractBits(fx.subject_der);
+    const leaf = try buildLeafCert(gpa, fx.kp.secret_key, bits.subject_name, try spkiOf(fx.subject_der), "leaf.example.com", subject.serial);
+    return .{ .issuer = issuer, .leaf = leaf, .bits = bits, .serial = subject.serial, .kp = kp, .seed = seed, .rsa_fx = fx };
+}
+
+test "verify: Ed25519 direct-issuer signature accepted" {
+    const gpa = testing.allocator;
+    var c = try makeEdCase(gpa);
+    defer c.deinit(gpa);
+    const resp = try buildResponse(gpa, .{
+        .issuer = c.bits,
+        .subject_serial = c.serial,
+        .responder_by_name = c.bits.subject_name,
+        .sign_ed25519 = c.seed,
+    });
+    defer gpa.free(resp);
+    const v = try ocsp.verify(try ocsp.parseResponse(resp), c.issuer, c.leaf, defaultOpts());
+    try testing.expect(v.status == .good);
+    try testing.expect(!v.delegated);
+}
+
+test "verify: Ed25519 tampered signed byte and tampered signature are SignatureInvalid" {
+    const gpa = testing.allocator;
+    var c = try makeEdCase(gpa);
+    defer c.deinit(gpa);
+    const resp = try buildResponse(gpa, .{
+        .issuer = c.bits,
+        .subject_serial = c.serial,
+        .responder_by_name = c.bits.subject_name,
+        .sign_ed25519 = c.seed,
+    });
+    defer gpa.free(resp);
+
+    const tampered = try gpa.dupe(u8, resp);
+    defer gpa.free(tampered);
+    const at = std.mem.find(u8, tampered, "20270101").?;
+    tampered[at + 7] = '2'; // thisUpdate day 01 -> 02, still a valid time
+    try testing.expectError(error.SignatureInvalid, ocsp.verify(try ocsp.parseResponse(tampered), c.issuer, c.leaf, defaultOpts()));
+
+    // The response signature BIT STRING: 03 41 00 <64 bytes>, right after the
+    // id-Ed25519 AlgorithmIdentifier 30 05 06 03 2b 65 70.
+    const sig = try gpa.dupe(u8, resp);
+    defer gpa.free(sig);
+    const alg = [_]u8{ 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70 };
+    const sa = std.mem.find(u8, sig, &alg).? + alg.len;
+    try testing.expectEqual(@as(u8, 0x03), sig[sa]);
+    sig[sa + 3 + 5] ^= 0x01;
+    try testing.expectError(error.SignatureInvalid, ocsp.verify(try ocsp.parseResponse(sig), c.issuer, c.leaf, defaultOpts()));
+}
+
+test "verify: Ed25519 signature by a different key is SignatureInvalid" {
+    const gpa = testing.allocator;
+    var c = try makeEdCase(gpa);
+    defer c.deinit(gpa);
+    const resp = try buildResponse(gpa, .{
+        .issuer = c.bits,
+        .subject_serial = c.serial,
+        .responder_by_name = c.bits.subject_name,
+        .sign_ed25519 = @as([32]u8, @splat(0x5e)),
+    });
+    defer gpa.free(resp);
+    try testing.expectError(error.SignatureInvalid, ocsp.verify(try ocsp.parseResponse(resp), c.issuer, c.leaf, defaultOpts()));
+}
+
+test "verify: key/algorithm mismatch is refused (Ed25519 signature under a P-256 key, ECDSA signature under an Ed25519 key)" {
+    const gpa = testing.allocator;
+    // (1) Ed25519 signatureAlgorithm, responder (issuer) key is P-256.
+    {
+        var fx = try makeRsaFixture(gpa);
+        defer fx.deinit(gpa);
+        const subject = try extractBits(fx.subject_der);
+        const kp = try p256.EcdsaP256Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x77)));
+        const sec1 = kp.public_key.toUncompressedSec1();
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const nb: der_writer.Builder = .{ .a = arena.allocator() };
+        const ec_issuer = try buildEcIssuerCert(gpa, &sec1, try buildName(nb, "ECDSA OCSP CA"));
+        defer gpa.free(ec_issuer);
+        const ec_bits = try extractBits(ec_issuer);
+        const leaf = try buildLeafCert(gpa, fx.kp.secret_key, ec_bits.subject_name, try spkiOf(fx.subject_der), "leaf.example.com", subject.serial);
+        defer gpa.free(leaf);
+        const resp = try buildResponse(gpa, .{ .issuer = ec_bits, .subject_serial = subject.serial, .responder_by_name = ec_bits.subject_name, .sign_ed25519 = @as([32]u8, @splat(1)) });
+        defer gpa.free(resp);
+        try testing.expectError(error.UnsupportedSignatureAlgorithm, ocsp.verify(try ocsp.parseResponse(resp), ec_issuer, leaf, defaultOpts()));
+    }
+    // (2) ecdsa-with-SHA256 signatureAlgorithm, responder key is Ed25519.
+    {
+        var c = try makeEdCase(gpa);
+        defer c.deinit(gpa);
+        const resp = try buildResponse(gpa, .{ .issuer = c.bits, .subject_serial = c.serial, .responder_by_name = c.bits.subject_name, .sign_ecdsa = @as([32]u8, @splat(0x33)) });
+        defer gpa.free(resp);
+        try testing.expectError(error.UnsupportedSignatureAlgorithm, ocsp.verify(try ocsp.parseResponse(resp), c.issuer, c.leaf, defaultOpts()));
+    }
+    // (3) RSA signatureAlgorithm, responder key is Ed25519.
+    {
+        var c = try makeEdCase(gpa);
+        defer c.deinit(gpa);
+        const resp = try buildResponse(gpa, .{ .issuer = c.bits, .subject_serial = c.serial, .responder_by_name = c.bits.subject_name, .sign_rsa = c.rsa_fx.kp.secret_key });
+        defer gpa.free(resp);
+        try testing.expectError(error.UnsupportedSignatureAlgorithm, ocsp.verify(try ocsp.parseResponse(resp), c.issuer, c.leaf, defaultOpts()));
+    }
 }

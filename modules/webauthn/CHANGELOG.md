@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — ES384 / ES512 (COSE -35 / -36) credential keys: `verifySignature` (hence `verifyAssertion` and self attestation) verifies ECDSA P-384/SHA-384 and P-521/SHA-512 through the sibling `p384` / `p521` modules; `webauthn` gains `p384` and `p521` dependencies. A crv/alg mismatch stays `UnsupportedAlgorithm`. Packed x5c leaf-certificate verification is unchanged (P-256 only). Previously these keys were `UnsupportedAlgorithm`. No external vector (in-test keys).
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0 (no source change needed beyond the codemod).

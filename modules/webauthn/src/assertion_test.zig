@@ -372,3 +372,101 @@ test "reject: require_user_verification with UV clear -> UserNotVerified" {
         opts,
     ));
 }
+
+// ── ES384 / ES512 (COSE -35 / -36), 2026-11-16 ─────────────────────────────
+// No external vector: the W3C §16 set has no P-384/P-521 credential. Keys and
+// signatures are generated in-test through the sibling `p384` / `p521`
+// modules (whose own verifiers are KAT/Wycheproof-anchored there).
+
+const p384 = @import("p384");
+const p521 = @import("p521");
+
+fn ec2Key(alg: i64, crv: i64, sec1: []const u8) webauthn.CoseKey {
+    const n = (sec1.len - 1) / 2;
+    return .{ .ec2 = .{ .alg = alg, .crv = crv, .x = sec1[1..][0..n], .y = sec1[1 + n ..][0..n] } };
+}
+
+test "verifySignature: ES384 (P-384) round trip, tampering and mismatches" {
+    const kp = try p384.EcdsaP384Sha384.KeyPair.generateDeterministic(@as([48]u8, @splat(0x21)));
+    const sec1 = kp.public_key.toUncompressedSec1();
+    const key = ec2Key(cbor.cose.alg_es384, cbor.cose.crv_p384, &sec1);
+    const msg = "authenticatorData || clientDataHash";
+    var dbuf: [p384.EcdsaP384Sha384.Signature.der_encoded_length_max]u8 = undefined;
+    const sig = (try kp.sign(msg, null)).toDer(&dbuf);
+    try webauthn.verifySignature(key, cbor.cose.alg_es384, msg, sig);
+
+    // wrong message / flipped signature byte / truncated signature
+    try testing.expectError(error.BadSignature, webauthn.verifySignature(key, cbor.cose.alg_es384, "other", sig));
+    var bad: [dbuf.len]u8 = dbuf;
+    bad[sig.len - 3] ^= 1;
+    try testing.expectError(error.BadSignature, webauthn.verifySignature(key, cbor.cose.alg_es384, msg, bad[0..sig.len]));
+    try testing.expectError(error.InvalidSignature, webauthn.verifySignature(key, cbor.cose.alg_es384, msg, sig[0..3]));
+
+    // algorithm confusion: alg/crv must pair exactly
+    try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifySignature(key, cbor.cose.alg_es256, msg, sig));
+    try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifySignature(key, cbor.cose.alg_es512, msg, sig));
+    const wrong_crv = ec2Key(cbor.cose.alg_es384, cbor.cose.crv_p256, &sec1);
+    try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifySignature(wrong_crv, cbor.cose.alg_es384, msg, sig));
+    const wrong_crv2 = ec2Key(cbor.cose.alg_es384, cbor.cose.crv_p521, &sec1);
+    try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifySignature(wrong_crv2, cbor.cose.alg_es384, msg, sig));
+
+    // coordinates of the wrong length, and a point not on the curve
+    var short = key;
+    short.ec2.x = sec1[1..47];
+    try testing.expectError(error.InvalidKey, webauthn.verifySignature(short, cbor.cose.alg_es384, msg, sig));
+    var off = sec1;
+    off[97 - 1] ^= 1;
+    try testing.expectError(error.InvalidKey, webauthn.verifySignature(ec2Key(cbor.cose.alg_es384, cbor.cose.crv_p384, &off), cbor.cose.alg_es384, msg, sig));
+}
+
+test "verifySignature: ES512 (P-521) round trip, tampering and mismatches" {
+    const kp = try p521.EcdsaP521Sha512.KeyPair.generateDeterministic(@as([66]u8, @splat(0x22)));
+    const sec1 = kp.public_key.toUncompressedSec1();
+    const key = ec2Key(cbor.cose.alg_es512, cbor.cose.crv_p521, &sec1);
+    const msg = "authenticatorData || clientDataHash";
+    var dbuf: [p521.EcdsaP521Sha512.Signature.der_encoded_length_max]u8 = undefined;
+    const sig = (try kp.sign(msg, null)).toDer(&dbuf);
+    try webauthn.verifySignature(key, cbor.cose.alg_es512, msg, sig);
+
+    try testing.expectError(error.BadSignature, webauthn.verifySignature(key, cbor.cose.alg_es512, "other", sig));
+    var bad: [dbuf.len]u8 = dbuf;
+    bad[sig.len - 3] ^= 1;
+    try testing.expectError(error.BadSignature, webauthn.verifySignature(key, cbor.cose.alg_es512, msg, bad[0..sig.len]));
+
+    try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifySignature(key, cbor.cose.alg_es384, msg, sig));
+    try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifySignature(key, cbor.cose.alg_es256, msg, sig));
+    const wrong_crv = ec2Key(cbor.cose.alg_es512, cbor.cose.crv_p384, &sec1);
+    try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifySignature(wrong_crv, cbor.cose.alg_es512, msg, sig));
+    var short = key;
+    short.ec2.y = sec1[67..130];
+    try testing.expectError(error.InvalidKey, webauthn.verifySignature(short, cbor.cose.alg_es512, msg, sig));
+}
+
+test "verifyAssertion: ES384 credential, built assertion accepted; tampered authData refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const kp = try p384.EcdsaP384Sha384.KeyPair.generateDeterministic(@as([48]u8, @splat(0x23)));
+    const sec1 = kp.public_key.toUncompressedSec1();
+    const key = ec2Key(cbor.cose.alg_es384, cbor.cose.crv_p384, &sec1);
+
+    var auth: [37]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(vectors.rp_id, auth[0..32], .{});
+    auth[32] = 0x01; // UP
+    @memset(auth[33..37], 0);
+    auth[36] = 7;
+    const cdj = try std.fmt.allocPrint(a, "{{\"type\":\"webauthn.get\",\"challenge\":\"Y2hhbGxlbmdl\",\"origin\":\"{s}\"}}", .{vectors.origin});
+    var signed: [37 + 32]u8 = undefined;
+    @memcpy(signed[0..37], &auth);
+    std.crypto.hash.sha2.Sha256.hash(cdj, signed[37..69], .{});
+    var dbuf: [p384.EcdsaP384Sha384.Signature.der_encoded_length_max]u8 = undefined;
+    const sig = (try kp.sign(&signed, null)).toDer(&dbuf);
+    const opts: webauthn.AssertionOptions = .{ .rp_id = vectors.rp_id, .expected_challenge = "challenge", .expected_origin = vectors.origin };
+
+    const r = try webauthn.verifyAssertion(a, &auth, cdj, sig, key, opts);
+    try testing.expect(r.user_present);
+
+    var bad_auth = auth;
+    bad_auth[36] = 8; // signCount changed after signing
+    try testing.expectError(error.BadSignature, webauthn.verifyAssertion(a, &bad_auth, cdj, sig, key, opts));
+}

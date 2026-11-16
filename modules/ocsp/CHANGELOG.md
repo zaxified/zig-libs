@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Ed25519 responder signatures (id-Ed25519, OID 1.3.101.112) for both the response signature and a delegated responder certificate's issuer signature; the responder key must be Ed25519 and the signature algorithm must agree, otherwise `UnsupportedSignatureAlgorithm`. Previously every Ed25519 response was `UnsupportedSignatureAlgorithm`. No external vector (round trips with in-test keys).
+
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the prime256v1 / secp384r1 / rsaEncryption OID byte constants are `x509.safe`'s instead of private copies.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private strict DER signature decoder (`derToRawStrict`, `derLen`) is gone; ECDSA verification calls `p256.sign.derToRawN`.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `daysFromCivil` is a thin wrapper over `datefmt.ymdToEpochDay` (new dependency `datefmt`; the digit fields are still not validated, months past 14 still wrap as before).

@@ -3,11 +3,11 @@
 W3C Web Authentication (WebAuthn) Level 3 / FIDO2 **Relying-Party verifier**:
 authentication-assertion verification (§7.2) and registration-attestation
 verification (§7.1/§8). This is a spec-assembly layer over already-KAT'd
-primitives — `p256` (ES256), `std.crypto.sign.Ed25519` (EdDSA), `rsa`
+primitives — `p256` (ES256), `p384` (ES384), `p521` (ES512), `std.crypto.sign.Ed25519` (EdDSA), `rsa`
 (RS256) for signatures, and the sibling `cbor`/`cbor.cose` codec for
 CBOR/COSE — not a new crypto implementation.
 
-**Status: assertion verify complete (ES256/EdDSA/RS256). Attestation verify
+**Status: assertion verify complete (ES256/ES384/ES512/EdDSA/RS256). Attestation verify
 complete for `none`/`packed`/`fido-u2f`; `tpm`/`android-key` structurally
 DEFERRED (`error.UnsupportedFormat`, not half-implemented).** See `SPEC.md`
 for the full threat model and deferred-work rationale.
