@@ -42,9 +42,9 @@ packed-Hilbert-R-tree bulk-load idea. No source consulted or copied.
 - **bbox is a CLOSED rectangle.** A point exactly on an edge or corner
   (`lat == min_lat`/`max_lat`, or `lon == min_lon`/`max_lon`) is **included**. A
   zero-area rectangle (`min == max` on both axes) is a valid point query. Pass
-  `min <= max` on each axis (an inverted rectangle matches nothing). The
-  rectangle **must not cross the antimeridian** in v1 — split a
-  ±180-spanning query into two (see `SPEC.md`).
+  `min_lat <= max_lat` (an inverted latitude range matches nothing). **`min_lon > max_lon`
+  is an antimeridian-wrapping rectangle** (`[min_lon, 180] ∪ [-180, max_lon]`, no
+  duplicates, shared buffer/budget/filter); `within`/kNN are not wrap-aware (see `SPEC.md`).
 - **kNN distance is an equirectangular approximation** scaled by
   `cos(query latitude)`: `dx = (lon − qlon)·cos(qlat)`, `dy = lat − qlat`,
   `dist2 = dx² + dy²`. This is a monotone proxy for great-circle distance,
