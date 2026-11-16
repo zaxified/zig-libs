@@ -85,7 +85,21 @@ pub const Options = struct {
     mode: ?Mode = null,
     /// Force a mask pattern (0–7). Null runs the standard penalty evaluation.
     mask: ?u3 = null,
+    /// Declare the character set of the data with an ECI designator segment
+    /// (ISO/IEC 18004 §7.4.2) in front of it, e.g. `26` for UTF-8, `3` for
+    /// ISO-8859-1. Valid values are 0–999999; a larger one is `error.BadEci`.
+    /// An ECI designates how *bytes* are read, so it implies byte mode (a
+    /// forced `mode` other than `.byte` is `error.ModeMismatch`). In a
+    /// structured-append sequence every symbol carries the designator. The
+    /// designator is as short as its value allows (8, 16 or 24 bits) and is
+    /// counted in the capacity and version selection. Null (the default)
+    /// writes none, which is what a reader expects for ISO-8859-1 / UTF-8
+    /// sniffing and is smallest.
+    eci: ?u32 = null,
 };
+
+/// Largest ECI assignment number (ISO/IEC 18004 §7.4.2.2: six decimal digits).
+pub const max_eci: u32 = 999_999;
 
 /// One symbol's place in a structured-append sequence (ISO/IEC 18004 §8.4.6):
 /// a message too big for one symbol, split across up to sixteen that a reader
@@ -122,6 +136,8 @@ pub const Error = error{
     ModeMismatch,
     /// `Options.version` was outside 1–40.
     BadVersion,
+    /// `Options.eci` was above `max_eci`.
+    BadEci,
 };
 
 /// Modules per side of the largest symbol (version 40).
@@ -196,10 +212,8 @@ pub fn encode(out: *Matrix, text: []const u8, opts: Options) Error!void {
 pub fn encodeSequence(out: []Matrix, text: []const u8, opts: Options) Error![]Matrix {
     if (out.len == 0) return Error.TooLong;
 
-    const mode = if (opts.mode) |m| blk: {
-        if (!modeFits(m, text)) return Error.ModeMismatch;
-        break :blk m;
-    } else pickMode(text);
+    const mode = try resolveMode(text, opts);
+    const head_bits = sequence_header_bits + eciBits(opts.eci);
 
     const room = @min(out.len, max_sequence);
     var version: u6 = 0;
@@ -207,12 +221,12 @@ pub fn encodeSequence(out: []Matrix, text: []const u8, opts: Options) Error![]Ma
     if (opts.version) |v| {
         if (v < 1 or v > 40) return Error.BadVersion;
         version = v;
-        chunk = maxChunk(mode, v, opts.ecc);
+        chunk = maxChunk(mode, v, opts.ecc, head_bits);
         if (chunk == 0 or symbolsNeeded(text.len, chunk) > room) return Error.TooLong;
     } else {
         var v: u6 = 1;
         while (v <= 40) : (v += 1) {
-            const c = maxChunk(mode, v, opts.ecc);
+            const c = maxChunk(mode, v, opts.ecc, head_bits);
             if (c > 0 and symbolsNeeded(text.len, c) <= room) {
                 version = v;
                 chunk = c;
@@ -250,15 +264,15 @@ fn symbolsNeeded(len: usize, chunk: usize) usize {
 /// Longest chunk, in characters, that still fits once the structured-append
 /// header has taken its 20 bits. Monotonic in the length, so a binary search is
 /// exact and does not need `dataBits` inverted per mode.
-fn maxChunk(mode: Mode, version: u6, ecc: Ecc) usize {
+fn maxChunk(mode: Mode, version: u6, ecc: Ecc, head_bits: usize) usize {
     const cap = dataCapacityBits(version, ecc);
-    if (cap <= sequence_header_bits) return 0;
+    if (cap <= head_bits) return 0;
 
     var lo: usize = 0;
     var hi: usize = cap; // any length needs at least a bit per character
     while (lo < hi) {
         const mid = (lo + hi + 1) / 2;
-        if (sequence_header_bits + dataBits(mode, mid, version) <= cap) lo = mid else hi = mid - 1;
+        if (head_bits + dataBits(mode, mid, version) <= cap) lo = mid else hi = mid - 1;
     }
     // The character-count field is finite too, and for a short numeric symbol it
     // is the binding constraint rather than the capacity.
@@ -270,13 +284,44 @@ fn maxChunk(mode: Mode, version: u6, ecc: Ecc) usize {
 const sequence_header_bits = 4 + 4 + 4 + 8;
 const sequence_mode: u4 = 0b0011;
 
-fn encodeOne(out: *Matrix, text: []const u8, opts: Options, seq: ?Sequence) Error!void {
-    const mode = if (opts.mode) |m| blk: {
-        if (!modeFits(m, text)) return Error.ModeMismatch;
-        break :blk m;
-    } else pickMode(text);
+const eci_mode: u4 = 0b0111;
 
-    const extra: usize = if (seq == null) 0 else sequence_header_bits;
+/// Bits of the ECI segment header: mode indicator plus the designator, which is
+/// 8, 16 or 24 bits by value (§7.4.2.2). Zero when there is none.
+fn eciBits(eci: ?u32) usize {
+    const v = eci orelse return 0;
+    return 4 + @as(usize, if (v < 1 << 7) 8 else if (v < 1 << 14) 16 else 24);
+}
+
+fn putEci(w: *BitWriter, v: u32) void {
+    w.put(eci_mode, 4);
+    if (v < 1 << 7) {
+        w.put(v, 8); // 0xxxxxxx
+    } else if (v < 1 << 14) {
+        w.put(0b10 << 14 | v, 16); // 10xxxxxx xxxxxxxx
+    } else {
+        w.put(0b110 << 21 | v, 24); // 110xxxxx xxxxxxxx xxxxxxxx
+    }
+}
+
+/// The segment mode, honouring `Options.mode` and `Options.eci`.
+fn resolveMode(text: []const u8, opts: Options) Error!Mode {
+    if (opts.eci) |e| {
+        if (e > max_eci) return Error.BadEci;
+        if (opts.mode) |m| if (m != .byte) return Error.ModeMismatch;
+        return .byte;
+    }
+    if (opts.mode) |m| {
+        if (!modeFits(m, text)) return Error.ModeMismatch;
+        return m;
+    }
+    return pickMode(text);
+}
+
+fn encodeOne(out: *Matrix, text: []const u8, opts: Options, seq: ?Sequence) Error!void {
+    const mode = try resolveMode(text, opts);
+
+    const extra: usize = (if (seq == null) @as(usize, 0) else sequence_header_bits) + eciBits(opts.eci);
     const version = if (opts.version) |v| blk: {
         if (v < 1 or v > 40) return Error.BadVersion;
         if (extra + dataBits(mode, text.len, v) > dataCapacityBits(v, opts.ecc)) return Error.TooLong;
@@ -285,7 +330,7 @@ fn encodeOne(out: *Matrix, text: []const u8, opts: Options, seq: ?Sequence) Erro
 
     var codewords: [max_codewords]u8 = undefined;
     const total = totalCodewords(version);
-    buildCodewords(codewords[0..total], mode, text, version, opts.ecc, seq);
+    buildCodewords(codewords[0..total], mode, text, version, opts.ecc, seq, opts.eci);
 
     out.* = .{ .size = sideFor(version), .version = version, .ecc = opts.ecc };
     @memset(&out.bits, 0);
@@ -587,7 +632,7 @@ const BitWriter = struct {
 };
 
 /// Bitstream → blocks → EC → interleave, all in one pass over `out`.
-fn buildCodewords(out: []u8, mode: Mode, text: []const u8, version: u6, ecc: Ecc, seq: ?Sequence) void {
+fn buildCodewords(out: []u8, mode: Mode, text: []const u8, version: u6, ecc: Ecc, seq: ?Sequence, eci: ?u32) void {
     const spec = ecSpec(version, ecc);
     const data_len = out.len - @as(usize, spec.ec_per_block) * spec.blocks;
 
@@ -604,6 +649,8 @@ fn buildCodewords(out: []u8, mode: Mode, text: []const u8, version: u6, ecc: Ecc
         w.put(@as(u64, q.total) - 1, 4);
         w.put(q.parity, 8);
     }
+
+    if (eci) |e| putEci(&w, e);
 
     w.put(@backingInt(mode), 4);
     w.put(text.len, countBits(mode, version));
@@ -1051,6 +1098,10 @@ pub const DecodeError = error{
 pub const Part = struct {
     data: []u8,
     sequence: ?Sequence,
+    /// The ECI assignment number the symbol declared for `data`, or null if it
+    /// carried no designator (then the reader's default applies). `decode`
+    /// drops it; use `decodePart` when the character set matters.
+    eci: ?u32 = null,
 };
 
 /// Decode `m` into `out`, returning the message. Corrects up to the symbol's
@@ -1139,8 +1190,9 @@ pub fn decodePart(m: *const Matrix, out: []u8) DecodeError!Part {
     }
 
     var seq: ?Sequence = null;
-    const text = try parseSegments(data[0..data_len], version, out, &seq);
-    return .{ .data = text, .sequence = seq };
+    var eci: ?u32 = null;
+    const text = try parseSegments(data[0..data_len], version, out, &seq, &eci);
+    return .{ .data = text, .sequence = seq, .eci = eci };
 }
 
 /// Both copies of the format information are read and the nearer valid codeword
@@ -1323,9 +1375,10 @@ const BitReader = struct {
     }
 };
 
-fn parseSegments(data: []const u8, version: u6, out: []u8, seq_out: *?Sequence) DecodeError![]u8 {
+fn parseSegments(data: []const u8, version: u6, out: []u8, seq_out: *?Sequence, eci_out: *?u32) DecodeError![]u8 {
     var r: BitReader = .{ .buf = data };
     var n: usize = 0;
+    var data_seen = false;
     var first = true;
 
     while (true) : (first = false) {
@@ -1346,11 +1399,30 @@ fn parseSegments(data: []const u8, version: u6, out: []u8, seq_out: *?Sequence) 
             };
             continue;
         }
+        if (raw_mode == eci_mode) {
+            // One designator, ahead of the data it governs. A later one would
+            // switch character set mid-message, which this API cannot report.
+            if (data_seen or eci_out.* != null) return DecodeError.BadData;
+            const b0 = r.take(8) orelse return DecodeError.BadData;
+            if (b0 & 0x80 == 0) {
+                eci_out.* = @intCast(b0);
+            } else if (b0 & 0xC0 == 0x80) {
+                const b1 = r.take(8) orelse return DecodeError.BadData;
+                eci_out.* = @intCast((b0 & 0x3F) << 8 | b1);
+            } else if (b0 & 0xE0 == 0xC0) {
+                const rest = r.take(16) orelse return DecodeError.BadData;
+                const v: u32 = @intCast((b0 & 0x1F) << 16 | rest);
+                if (v > max_eci) return DecodeError.BadData;
+                eci_out.* = v;
+            } else return DecodeError.BadData; // 111xxxxx is reserved
+            continue;
+        }
+        data_seen = true;
         const mode: Mode = switch (raw_mode) {
             0b0001 => .numeric,
             0b0010 => .alphanumeric,
             0b0100 => .byte,
-            else => return DecodeError.BadData, // incl. ECI and kanji
+            else => return DecodeError.BadData, // incl. kanji
         };
         const count = r.take(countBits(mode, version)) orelse return DecodeError.BadData;
 
@@ -1871,6 +1943,7 @@ test "decode reports BadData when the corrected codewords are not a well-formed 
     const t = std.testing;
     var out: [16]u8 = undefined;
     var seq: ?Sequence = null;
+    var eci: ?u32 = null;
 
     // `parseSegments` directly, bypassing the matrix/RS-correction machinery
     // entirely: an RS-corrected block that happens to decode to this byte is
@@ -1892,7 +1965,7 @@ test "decode reports BadData when the corrected codewords are not a well-formed 
     // reaches is worse than no comment: it is why that branch survived to a
     // first audit unguarded.
     const data = [_]u8{0b0011_0000};
-    try t.expectError(DecodeError.BadData, parseSegments(&data, 1, &out, &seq));
+    try t.expectError(DecodeError.BadData, parseSegments(&data, 1, &out, &seq, &eci));
 }
 
 test "decode rejects a malformed symbol rather than guessing" {
@@ -2263,7 +2336,7 @@ test "the header costs capacity, and the accounting says so" {
     const t = std.testing;
     // A message that exactly fills a version 1-L symbol on its own cannot also
     // carry a 20-bit sequence header, and the split has to notice.
-    const chunk = maxChunk(.byte, 1, .low);
+    const chunk = maxChunk(.byte, 1, .low, sequence_header_bits);
     var text: [64]u8 = undefined;
     @memset(&text, 'x');
     const fits_alone = text[0 .. chunk + 2];
@@ -2437,10 +2510,12 @@ const TestBits = struct {
 test "TEETH: an unimplemented segment mode is REFUSED, not read as bytes" {
     // Mutating `else => return DecodeError.BadData` to `else => .byte` left the
     // whole suite green: an ECI (0b0111) or Kanji (0b1000) segment would have
-    // been silently reinterpreted as byte data, i.e. decoded to a different
+    // been silently reinterpreted as byte data (ECI is implemented since
+    // 2026-11-16 and is no longer in the refused list below), i.e. decoded to a different
     // string, with nothing to say so.
     var out: [128]u8 = undefined;
     var seq: ?Sequence = null;
+    var eci: ?u32 = null;
 
     // ⚠ The payload behind the bad indicator is a WELL-FORMED byte segment.
     // A first version of this test put arbitrary bytes there, and it passed
@@ -2449,7 +2524,7 @@ test "TEETH: an unimplemented segment mode is REFUSED, not read as bytes" {
     // still errored — by a route that has nothing to do with the guard. With a
     // count of 2 and two bytes behind it, the mutated decoder succeeds and
     // returns "hi", so only the guard itself can produce the refusal.
-    for ([_]u32{ 0b0111, 0b1000, 0b0101, 0b1001, 0b1111 }) |raw_mode| {
+    for ([_]u32{ 0b1000, 0b0101, 0b1001, 0b1111 }) |raw_mode| {
         var b: TestBits = .{};
         b.put(raw_mode, 4);
         b.put(2, 8); // a count a byte-mode reader would accept
@@ -2457,7 +2532,7 @@ test "TEETH: an unimplemented segment mode is REFUSED, not read as bytes" {
         b.put('i', 8);
         try std.testing.expectError(
             DecodeError.BadData,
-            parseSegments(b.bytes(), 1, &out, &seq),
+            parseSegments(b.bytes(), 1, &out, &seq, &eci),
         );
     }
 
@@ -2468,7 +2543,7 @@ test "TEETH: an unimplemented segment mode is REFUSED, not read as bytes" {
     ok.put(2, 8); // count, 8 bits at version 1
     ok.put('h', 8);
     ok.put('i', 8);
-    const got = try parseSegments(ok.bytes(), 1, &out, &seq);
+    const got = try parseSegments(ok.bytes(), 1, &out, &seq, &eci);
     try std.testing.expectEqualStrings("hi", got);
 }
 
@@ -2478,6 +2553,7 @@ test "TEETH: a structured-append index past its total is REFUSED" {
     // reassemble.
     var out: [128]u8 = undefined;
     var seq: ?Sequence = null;
+    var eci: ?u32 = null;
     var b: TestBits = .{};
     b.put(sequence_mode, 4);
     b.put(9, 4); // index
@@ -2486,7 +2562,7 @@ test "TEETH: a structured-append index past its total is REFUSED" {
     b.put(0b0100, 4); // a byte segment after it
     b.put(1, 8);
     b.put('x', 8);
-    try std.testing.expectError(DecodeError.BadData, parseSegments(b.bytes(), 1, &out, &seq));
+    try std.testing.expectError(DecodeError.BadData, parseSegments(b.bytes(), 1, &out, &seq, &eci));
 
     // Control: index == total is legal (part 3 of 3) and must be accepted.
     var ok: TestBits = .{};
@@ -2497,7 +2573,7 @@ test "TEETH: a structured-append index past its total is REFUSED" {
     ok.put(0b0100, 4);
     ok.put(1, 8);
     ok.put('x', 8);
-    const got = try parseSegments(ok.bytes(), 1, &out, &seq);
+    const got = try parseSegments(ok.bytes(), 1, &out, &seq, &eci);
     try std.testing.expectEqualStrings("x", got);
     try std.testing.expect(seq != null);
 }
@@ -2509,33 +2585,34 @@ test "TEETH: out-of-range numeric and alphanumeric groups are REFUSED, not folde
     // *some other string* rather than being refused.
     var out: [128]u8 = undefined;
     var seq: ?Sequence = null;
+    var eci: ?u32 = null;
 
     // Numeric: one group of three digits, value 1000 (the smallest illegal).
     var num: TestBits = .{};
     num.put(0b0001, 4); // numeric mode
     num.put(3, 10); // count = 3 digits, 10 bits at version 1
     num.put(1000, 10);
-    try std.testing.expectError(DecodeError.BadData, parseSegments(num.bytes(), 1, &out, &seq));
+    try std.testing.expectError(DecodeError.BadData, parseSegments(num.bytes(), 1, &out, &seq, &eci));
 
     // Alphanumeric: one pair, value 45*45 (the smallest illegal).
     var alnum: TestBits = .{};
     alnum.put(0b0010, 4); // alphanumeric mode
     alnum.put(2, 9); // count = 2 chars, 9 bits at version 1
     alnum.put(45 * 45, 11);
-    try std.testing.expectError(DecodeError.BadData, parseSegments(alnum.bytes(), 1, &out, &seq));
+    try std.testing.expectError(DecodeError.BadData, parseSegments(alnum.bytes(), 1, &out, &seq, &eci));
 
     // Controls: the largest LEGAL value in each encoding still decodes.
     var num_ok: TestBits = .{};
     num_ok.put(0b0001, 4);
     num_ok.put(3, 10);
     num_ok.put(999, 10);
-    try std.testing.expectEqualStrings("999", try parseSegments(num_ok.bytes(), 1, &out, &seq));
+    try std.testing.expectEqualStrings("999", try parseSegments(num_ok.bytes(), 1, &out, &seq, &eci));
 
     var alnum_ok: TestBits = .{};
     alnum_ok.put(0b0010, 4);
     alnum_ok.put(2, 9);
     alnum_ok.put(44 * 45 + 44, 11); // ":" ":" — the last pair in the table
-    _ = try parseSegments(alnum_ok.bytes(), 1, &out, &seq);
+    _ = try parseSegments(alnum_ok.bytes(), 1, &out, &seq, &eci);
 }
 
 test "EXTERNAL ORACLE: 160 segno-produced grids decode back to segno's own input" {
@@ -2622,4 +2699,170 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+// ── ECI ─────────────────────────────────────────────────────────────────────
+
+test "ECI: header bits match ISO/IEC 18004 §7.4.2.2 for the three designator lengths" {
+    var b: [8]u8 = @splat(0);
+    var w: BitWriter = .{ .buf = &b };
+    putEci(&w, 26); // 0111 00011010
+    try std.testing.expectEqual(@as(usize, 12), w.bit);
+    try std.testing.expectEqualSlices(u8, &.{ 0x71, 0xA0 }, b[0..2]);
+
+    @memset(&b, 0);
+    w = .{ .buf = &b };
+    putEci(&w, 128); // 0111 10 00000010000000
+    try std.testing.expectEqual(@as(usize, 20), w.bit);
+    try std.testing.expectEqualSlices(u8, &.{ 0x78, 0x08, 0x00 }, b[0..3]);
+
+    @memset(&b, 0);
+    w = .{ .buf = &b };
+    putEci(&w, 999_999); // 0111 110_01111 01000010 00111111
+    try std.testing.expectEqual(@as(usize, 28), w.bit);
+    try std.testing.expectEqualSlices(u8, &.{ 0x7C, 0xF4, 0x23, 0xF0 }, b[0..4]);
+
+    try std.testing.expectEqual(@as(usize, 0), eciBits(null));
+    try std.testing.expectEqual(@as(usize, 12), eciBits(127));
+    try std.testing.expectEqual(@as(usize, 20), eciBits(128));
+    try std.testing.expectEqual(@as(usize, 20), eciBits(16383));
+    try std.testing.expectEqual(@as(usize, 28), eciBits(16384));
+}
+
+test "ECI 26 + UTF-8 text round-trips and decode reports the number" {
+    const t = std.testing;
+    const text = "Žluťoučký kůň — 日本語";
+    var m: Matrix = undefined;
+    try encode(&m, text, .{ .eci = 26 });
+    var buf: [128]u8 = undefined;
+    const part = try decodePart(&m, &buf);
+    try t.expectEqualStrings(text, part.data);
+    try t.expectEqual(@as(?u32, 26), part.eci);
+    try t.expect(part.sequence == null);
+    // `decode` returns the data of an ECI symbol too.
+    try t.expectEqualStrings(text, try decode(&m, &buf));
+
+    // Without the option there is no designator.
+    try encode(&m, text, .{});
+    try t.expectEqual(@as(?u32, null), (try decodePart(&m, &buf)).eci);
+}
+
+test "ECI: all three designator lengths round-trip through a symbol" {
+    const t = std.testing;
+    var buf: [64]u8 = undefined;
+    for ([_]u32{ 0, 3, 26, 127, 128, 900, 16383, 16384, 123_456, max_eci }) |e| {
+        var m: Matrix = undefined;
+        try encode(&m, "hi\xC3\xA9", .{ .eci = e });
+        const part = try decodePart(&m, &buf);
+        try t.expectEqualStrings("hi\xC3\xA9", part.data);
+        try t.expectEqual(@as(?u32, e), part.eci);
+    }
+}
+
+test "ECI: version selection counts the header bits" {
+    const t = std.testing;
+    // Version 1-L holds 152 data bits: 4 + 8 + 8n for n bytes -> 17 bytes fit,
+    // so 17 bytes without ECI is version 1, and with ECI (12 bits) it is not.
+    const msg = "ABCDEFGHIJKLMNOPQ".*; // 17 bytes
+    var m: Matrix = undefined;
+    try encode(&m, &msg, .{ .ecc = .low, .mode = .byte });
+    try t.expectEqual(@as(u6, 1), m.version);
+    try encode(&m, &msg, .{ .ecc = .low, .eci = 26 });
+    try t.expectEqual(@as(u6, 2), m.version);
+    // A forced version that the header pushes over is refused, not truncated.
+    try t.expectError(Error.TooLong, encode(&m, &msg, .{ .ecc = .low, .eci = 26, .version = 1 }));
+    // 16 bytes: 12 (ECI) + 4 + 8 + 128 = 152 bits, exactly version 1-L.
+    try encode(&m, msg[0..16], .{ .ecc = .low, .eci = 26, .version = 1 });
+    var buf: [32]u8 = undefined;
+    try t.expectEqualStrings(msg[0..16], (try decodePart(&m, &buf)).data);
+}
+
+test "ECI: option errors" {
+    const t = std.testing;
+    var m: Matrix = undefined;
+    try t.expectError(Error.BadEci, encode(&m, "x", .{ .eci = max_eci + 1 }));
+    try t.expectError(Error.ModeMismatch, encode(&m, "123", .{ .eci = 3, .mode = .numeric }));
+    // Unforced mode with ECI is byte mode even for digits.
+    try encode(&m, "123", .{ .eci = 3 });
+    var buf: [8]u8 = undefined;
+    try t.expectEqualStrings("123", (try decodePart(&m, &buf)).data);
+}
+
+test "ECI: every symbol of a structured-append sequence carries it" {
+    const t = std.testing;
+    var big: [200]u8 = undefined;
+    for (&big, 0..) |*c, i| c.* = @intCast('a' + i % 26);
+    var ms: [16]Matrix = undefined;
+    const parts = try encodeSequence(&ms, &big, .{ .ecc = .low, .eci = 26 });
+    try t.expect(parts.len > 1);
+    var buf: [64]u8 = undefined;
+    var total: usize = 0;
+    for (parts) |*pm| {
+        const p = try decodePart(pm, &buf);
+        try t.expectEqual(@as(?u32, 26), p.eci);
+        try t.expect(p.sequence != null);
+        try t.expectEqualSlices(u8, big[total..][0..p.data.len], p.data);
+        total += p.data.len;
+    }
+    try t.expectEqual(big.len, total);
+}
+
+test "ECI decode: 1/2/3-byte forms, refusals" {
+    var out: [16]u8 = undefined;
+    var seq: ?Sequence = null;
+
+    // Non-minimal forms are accepted: ECI 3 as 2 and 3 bytes.
+    inline for (.{ .{ 16, 0b10 << 14 | 3 }, .{ 24, 0b110 << 21 | 3 } }) |f| {
+        var eci: ?u32 = null;
+        var b: TestBits = .{};
+        b.put(eci_mode, 4);
+        b.put(f[1], f[0]);
+        b.put(0b0100, 4);
+        b.put(1, 8);
+        b.put('x', 8);
+        try std.testing.expectEqualStrings("x", try parseSegments(b.bytes(), 1, &out, &seq, &eci));
+        try std.testing.expectEqual(@as(?u32, 3), eci);
+    }
+
+    // Truncated designators: 2-byte form missing its second byte, 3-byte form
+    // missing its tail, bare mode indicator, and the reserved 111xxxxx prefix.
+    inline for (.{ .{ 8, 0b10_000011 }, .{ 16, 0b110_00000 << 8 | 1 }, .{ 0, 0 }, .{ 8, 0b1110_0000 } }) |f| {
+        var eci: ?u32 = null;
+        var b: TestBits = .{};
+        b.put(eci_mode, 4);
+        if (f[0] > 0) b.put(f[1], f[0]);
+        // No data and no padding: the bit stream just ends (byte-aligned zeros
+        // would read as a terminator, so give it a stream that is cut short).
+        const bytes = b.bytes();
+        const r = parseSegments(bytes, 1, &out, &seq, &eci);
+        try std.testing.expectError(DecodeError.BadData, r);
+    }
+
+    // 24-bit value above 999999.
+    {
+        var eci: ?u32 = null;
+        var b: TestBits = .{};
+        b.put(eci_mode, 4);
+        b.put(0b110 << 21 | 1_000_000, 24);
+        try std.testing.expectError(DecodeError.BadData, parseSegments(b.bytes(), 1, &out, &seq, &eci));
+    }
+
+    // A second designator, and one after data, are refused.
+    {
+        var eci: ?u32 = null;
+        var b: TestBits = .{};
+        b.put(eci_mode, 4);
+        b.put(26, 8);
+        b.put(eci_mode, 4);
+        b.put(3, 8);
+        try std.testing.expectError(DecodeError.BadData, parseSegments(b.bytes(), 1, &out, &seq, &eci));
+        eci = null;
+        var c: TestBits = .{};
+        c.put(0b0100, 4);
+        c.put(1, 8);
+        c.put('x', 8);
+        c.put(eci_mode, 4);
+        c.put(26, 8);
+        try std.testing.expectError(DecodeError.BadData, parseSegments(c.bytes(), 1, &out, &seq, &eci));
+    }
 }

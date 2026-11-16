@@ -127,9 +127,12 @@ widening if the input cannot be expressed that way.
 to transcode into that encoding before calling; byte mode carries the same text
 as UTF-8 in the same or fewer bits for anything short of near-pure Japanese.
 
-**ECI** (declaring a character set other than the default) and **Micro QR**.
-Neither is needed by a caller that wants "put this text in a QR code", and each
-is a separable addition rather than something this design forecloses.
+**Micro QR.** Not needed by a caller that wants "put this text in a QR code";
+a separable addition rather than something this design forecloses.
+
+**ECI** is supported: `Options.eci = 26` (UTF-8) writes a designator segment
+before the byte data, and `decodePart` reports it in `Part.eci`. Only one
+designator per symbol, ahead of the data; mixed-charset symbols are refused.
 
 **Reading from an image.** `decode` takes a matrix; producing that matrix from a
 photograph is binarisation, symbol location, perspective correction and grid
