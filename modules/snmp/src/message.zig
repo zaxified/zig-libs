@@ -302,8 +302,8 @@ fn parseTrapV1(content: []const u8) DecodeError!TrapV1Pdu {
 
 // ── encoding ────────────────────────────────────────────────────────────────
 
-/// Manager-side encodable PDU. The v1 Trap-PDU has a different shape and is
-/// decode-only here (`error.UnsupportedPdu`).
+/// Encodable PDU. The v1 Trap-PDU has a different shape and goes through
+/// `encodeTrapV1` (`error.UnsupportedPdu` here).
 pub const EncodePdu = struct {
     type: PduType,
     request_id: i32,
@@ -333,26 +333,101 @@ pub fn encode(
 /// Prepend one bare PDU TLV (varbind list + the three INTEGER slots, wrapped in
 /// the PDU's context tag) onto `e`. The building block shared by the v1/v2c
 /// `encode` and the v3 ScopedPDU builder. The v1 Trap-PDU has a different shape
-/// and is not encodable here (`error.UnsupportedPdu`).
+/// and is not encodable here (`error.UnsupportedPdu`; see `encodeTrapV1`).
 pub fn encodePdu(e: *ber.Encoder, pdu: EncodePdu) EncodeError!void {
     if (pdu.type == .trap_v1) return error.UnsupportedPdu;
 
+    try prependVarbinds(e, pdu.varbinds);
+    try e.prependInteger(ber.tag.integer, pdu.error_index);
+    try e.prependInteger(ber.tag.integer, pdu.error_status);
+    try e.prependInteger(ber.tag.integer, pdu.request_id);
+    try e.wrap(@backingInt(pdu.type), 0);
+}
+
+fn prependVarbinds(e: *ber.Encoder, varbinds: []const VarBind) EncodeError!void {
     const list_mark = e.len();
-    var i = pdu.varbinds.len;
+    var i = varbinds.len;
     while (i > 0) {
         i -= 1;
-        const vb = &pdu.varbinds[i];
+        const vb = &varbinds[i];
         const vb_mark = e.len();
         try e.prependValue(&vb.value);
         try e.prependOid(&vb.name);
         try e.wrap(ber.tag.sequence, vb_mark);
     }
     try e.wrap(ber.tag.sequence, list_mark);
+}
 
-    try e.prependInteger(ber.tag.integer, pdu.error_index);
-    try e.prependInteger(ber.tag.integer, pdu.error_status);
-    try e.prependInteger(ber.tag.integer, pdu.request_id);
-    try e.wrap(@backingInt(pdu.type), 0);
+/// Encodable v1 Trap-PDU fields (RFC 1157 §4.1.6).
+pub const TrapV1Args = struct {
+    enterprise: Oid,
+    agent_addr: [4]u8,
+    generic_trap: GenericTrap,
+    specific_trap: i32 = 0,
+    /// sysUpTime at trap generation, in TimeTicks.
+    time_stamp: u32,
+    varbinds: []const VarBind = &.{},
+};
+
+/// Encode a complete SNMPv1 message carrying a Trap-PDU. Always version 1
+/// (a Trap-PDU does not exist in v2c). Aligned to the end of `buf`, like
+/// `encode`.
+pub fn encodeTrapV1(buf: []u8, community: []const u8, t: TrapV1Args) EncodeError![]const u8 {
+    var e = ber.Encoder.init(buf);
+    try prependVarbinds(&e, t.varbinds);
+    try e.prependUnsigned(ber.tag.time_ticks, t.time_stamp);
+    try e.prependInteger(ber.tag.integer, t.specific_trap);
+    try e.prependInteger(ber.tag.integer, @backingInt(t.generic_trap));
+    try e.prependTlv(ber.tag.ip_address, &t.agent_addr);
+    try e.prependOid(&t.enterprise);
+    try e.wrap(@backingInt(PduType.trap_v1), 0);
+    try e.prependTlv(ber.tag.octet_string, community);
+    try e.prependInteger(ber.tag.integer, @backingInt(Version.v1));
+    try e.wrap(ber.tag.sequence, 0);
+    return e.encoded();
+}
+
+// ── v2 notifications (SNMPv2-Trap, InformRequest) ───────────────────────────
+
+/// Largest number of extra varbinds a `Notification` may carry (the two
+/// mandatory leading ones are added on top).
+pub const max_notification_varbinds = 32;
+
+pub const NotificationError = error{
+    /// More than `max_notification_varbinds` extra varbinds.
+    TooManyOids,
+    /// An extra varbind names `sysUpTime.0` or `snmpTrapOID.0`, which the
+    /// library inserts itself (RFC 3416 §4.2.6).
+    ReservedVarbind,
+};
+
+/// A v2c / v3 notification: the library prepends `sysUpTime.0` (TimeTicks)
+/// and `snmpTrapOID.0` (OBJECT IDENTIFIER) as the first two varbinds, as
+/// RFC 3416 §4.2.6 requires; `varbinds` are the payload bindings after them.
+pub const Notification = struct {
+    /// sysUpTime.0 value, hundredths of a second.
+    uptime: u32,
+    /// snmpTrapOID.0 value: the notification type.
+    trap_oid: Oid,
+    varbinds: []const VarBind = &.{},
+};
+
+/// Build the full varbind list of `n` into `out` (2 + extras entries) and
+/// return the filled prefix.
+pub fn notificationVarbinds(
+    out: *[max_notification_varbinds + 2]VarBind,
+    n: Notification,
+) NotificationError![]const VarBind {
+    if (n.varbinds.len > max_notification_varbinds) return error.TooManyOids;
+    const up = Oid.fromSlice(&.{ 1, 3, 6, 1, 2, 1, 1, 3, 0 }) catch unreachable;
+    const toid = Oid.fromSlice(&.{ 1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0 }) catch unreachable;
+    for (n.varbinds) |vb| {
+        if (vb.name.eql(&up) or vb.name.eql(&toid)) return error.ReservedVarbind;
+    }
+    out[0] = .{ .name = up, .value = .{ .time_ticks = n.uptime } };
+    out[1] = .{ .name = toid, .value = .{ .oid = n.trap_oid } };
+    @memcpy(out[2..][0..n.varbinds.len], n.varbinds);
+    return out[0 .. 2 + n.varbinds.len];
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -946,4 +1021,79 @@ test "Report-PDU [8] encodes and decodes as a BasicPdu (RFC 3416 §3)" {
     try testing.expectEqual(@as(u32, 1), vb.value.counter32);
     const want = try Oid.parse("1.3.6.1.6.3.15.1.1.4.0");
     try testing.expect(vb.name.eql(&want));
+}
+
+test "v1 Trap-PDU: encode matches the hand-built wire and round-trips" {
+    const vbs = [_]VarBind{.{ .name = try Oid.parse("1.3.6.1.2.1.1.5.0"), .value = .{ .octet_string = "x" } }};
+    var buf: [128]u8 = undefined;
+    const wire = try encodeTrapV1(&buf, "public", .{
+        .enterprise = try Oid.parse("1.3.6.1.4.1.8072"),
+        .agent_addr = .{ 192, 168, 0, 1 },
+        .generic_trap = .enterprise_specific,
+        .specific_trap = 42,
+        .time_stamp = 100494,
+        .varbinds = &vbs,
+    });
+    const expected = [_]u8{
+        0x30, 0x38, 0x02, 0x01, 0x00, 0x04, 0x06, 'p', 'u', 'b', 'l', 'i', 'c',
+        0xa4, 0x2b, // Trap-PDU
+        0x06, 0x07, 0x2b, 0x06, 0x01, 0x04, 0x01, 0xbf, 0x08, // enterprise
+        0x40, 0x04, 192, 168, 0, 1, // agent-addr
+        0x02, 0x01, 0x06, // generic = enterpriseSpecific
+        0x02, 0x01, 0x2a, // specific = 42
+        0x43, 0x03, 0x01, 0x88, 0x8e, // time-stamp
+        0x30, 0x0f, 0x30, 0x0d, 0x06,
+        0x08, 0x2b, 0x06, 0x01, 0x02,
+        0x01, 0x01, 0x05, 0x00, 0x04,
+        0x01, 'x',
+    };
+    try testing.expectEqualSlices(u8, &expected, wire);
+    const m = try decode(wire);
+    try testing.expectEqual(Version.v1, m.version);
+    try testing.expectEqualStrings("public", m.community);
+    const p = m.pdu.trap_v1;
+    try testing.expect(p.enterprise.eql(&(try Oid.parse("1.3.6.1.4.1.8072"))));
+    try testing.expectEqualSlices(u8, &.{ 192, 168, 0, 1 }, &p.agent_addr);
+    try testing.expectEqual(GenericTrap.enterprise_specific, p.generic_trap);
+    try testing.expectEqual(@as(i32, 42), p.specific_trap);
+    try testing.expectEqual(@as(u32, 100494), p.time_stamp);
+    var it = p.varbinds.iterator();
+    try testing.expectEqualStrings("x", (try it.next()).?.value.octet_string);
+    // Too small a buffer is a typed error, not a panic.
+    var tiny: [8]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, encodeTrapV1(&tiny, "public", .{
+        .enterprise = try Oid.parse("1.3.6.1.4.1.8072"),
+        .agent_addr = .{ 1, 2, 3, 4 },
+        .generic_trap = .cold_start,
+        .time_stamp = 1,
+    }));
+}
+
+test "notificationVarbinds: inserts sysUpTime.0 + snmpTrapOID.0 first; rejects reserved and oversize" {
+    var out: [max_notification_varbinds + 2]VarBind = undefined;
+    const extra = [_]VarBind{.{ .name = try Oid.parse("1.3.6.1.2.1.2.2.1.1.3"), .value = .{ .integer = 3 } }};
+    const vbs = try notificationVarbinds(&out, .{
+        .uptime = 777,
+        .trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.3"),
+        .varbinds = &extra,
+    });
+    try testing.expectEqual(@as(usize, 3), vbs.len);
+    try testing.expect(vbs[0].name.eql(&(try Oid.parse("1.3.6.1.2.1.1.3.0"))));
+    try testing.expectEqual(@as(u32, 777), vbs[0].value.time_ticks);
+    try testing.expect(vbs[1].name.eql(&(try Oid.parse("1.3.6.1.6.3.1.1.4.1.0"))));
+    try testing.expect(vbs[1].value.oid.eql(&(try Oid.parse("1.3.6.1.6.3.1.1.5.3"))));
+    try testing.expectEqual(@as(i64, 3), vbs[2].value.integer);
+
+    const reserved = [_]VarBind{.{ .name = try Oid.parse("1.3.6.1.2.1.1.3.0"), .value = .{ .time_ticks = 1 } }};
+    try testing.expectError(error.ReservedVarbind, notificationVarbinds(&out, .{
+        .uptime = 1,
+        .trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.1"),
+        .varbinds = &reserved,
+    }));
+    const many: [max_notification_varbinds + 1]VarBind = @splat(extra[0]);
+    try testing.expectError(error.TooManyOids, notificationVarbinds(&out, .{
+        .uptime = 1,
+        .trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.1"),
+        .varbinds = &many,
+    }));
 }

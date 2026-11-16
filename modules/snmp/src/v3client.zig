@@ -204,7 +204,7 @@ pub const Response = struct {
 };
 
 pub const Error = client_mod.TransportError || message.DecodeError ||
-    message.EncodeError || v3.DecodeError || usm.AuthError ||
+    message.EncodeError || message.NotificationError || v3.DecodeError || usm.AuthError ||
     usm.KeyDerivationError || priv.PrivError || timewin.TimeError ||
     report_mod.ReportError || error{
     /// The reply's inner request-id did not match the request's.
@@ -423,6 +423,18 @@ pub const V3Client = struct {
     /// GetBulkRequest (RFC 3416 §4.2.3).
     pub fn getBulk(c: *V3Client, non_repeaters: i32, max_repetitions: i32, oids: []const Oid) Error!Response {
         return c.nullVarBindRequest(.get_bulk_request, oids, non_repeaters, max_repetitions);
+    }
+
+    /// InformRequest (RFC 3416 §4.2.7) at the client's security level: the
+    /// receiver is the authoritative engine, so discovery and keys work as for
+    /// every other request. `sysUpTime.0` and `snmpTrapOID.0` are inserted as
+    /// the first two varbinds. Waits for the Response. (v3 *Trap* sending is
+    /// not offered: the sender would be authoritative, which needs a local
+    /// engine id / boots / time this client does not own.)
+    pub fn inform(c: *V3Client, n: message.Notification) Error!Response {
+        var buf: [message.max_notification_varbinds + 2]VarBind = undefined;
+        const vbs = try message.notificationVarbinds(&buf, n);
+        return c.request(.inform_request, vbs, 0, 0);
     }
 
     /// SetRequest with fully typed varbinds.
@@ -999,7 +1011,7 @@ pub const FakeAgent = struct {
             },
         };
         const rid = switch (scoped.pdu) {
-            .get_request, .get_next_request, .set_request => |p| p.request_id,
+            .get_request, .get_next_request, .set_request, .inform_request => |p| p.request_id,
             .get_bulk_request => |p| p.request_id,
             else => return error.UnexpectedTag,
         };
@@ -1019,7 +1031,7 @@ pub const FakeAgent = struct {
             .encrypted => return null,
         };
         return switch (s.pdu) {
-            .get_request, .get_next_request, .set_request, .response, .report => |p| p.request_id,
+            .get_request, .get_next_request, .set_request, .inform_request, .response, .report => |p| p.request_id,
             .get_bulk_request => |p| p.request_id,
             else => null,
         };
@@ -1167,6 +1179,32 @@ fn expectLevelRoundTrip(level: SecurityLevel, auth: usm.AuthProtocol, privp: pri
     var it = resp.varbinds.iterator();
     try testing.expectEqualStrings("zig-libs", (try it.next()).?.value.octet_string);
     try testing.expectEqualSlices(u8, &usm.netsnmp_engine_id, resp.context_engine_id);
+}
+
+test "v3 inform: discovery, then an InformRequest with the two leading varbinds is answered" {
+    const vals = try sysNameVarBinds();
+    var agent: FakeAgent = .{
+        .user = .{ .name = "plain", .level = .no_auth_no_priv },
+        .values = &vals,
+    };
+    var c = V3Client.init(agent.transport(), .{ .name = "plain", .level = .no_auth_no_priv }, .{});
+    const resp = try c.inform(.{ .uptime = 321, .trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.1") });
+    try testing.expectEqual(message.ErrorStatus.no_error, resp.error_status);
+    try testing.expectEqual(@as(usize, 1), agent.served);
+    const m = try v3.decode(agent.lastRequest());
+    const inf = m.data.plaintext.pdu.inform_request;
+    var vbs: [3]VarBind = undefined;
+    const got = try inf.varbinds.collect(&vbs);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqual(@as(u32, 321), got[0].value.time_ticks);
+    try testing.expect(got[1].value.oid.eql(&(try Oid.parse("1.3.6.1.6.3.1.1.5.1"))));
+
+    const reserved = [_]VarBind{.{ .name = try Oid.parse("1.3.6.1.2.1.1.3.0"), .value = .null }};
+    try testing.expectError(error.ReservedVarbind, c.inform(.{
+        .uptime = 1,
+        .trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.1"),
+        .varbinds = &reserved,
+    }));
 }
 
 test "authNoPriv: every auth protocol round-trips through discover + GET" {
