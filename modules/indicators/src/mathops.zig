@@ -454,3 +454,26 @@ test "mathops: batch == streaming" {
         }
     }
 }
+
+test "minmax: the shared block scan answers extBatch's bits, NaN and signed-zero ties included" {
+    var prng = std.Random.DefaultPrng.init(0x313a);
+    const r = prng.random();
+    var xs: [300]f64 = undefined;
+    var mn: [300]f64 = undefined;
+    var mx: [300]f64 = undefined;
+    var emn: [300]f64 = undefined;
+    var emx: [300]f64 = undefined;
+    const pool = [_]f64{ -1.0, -0.0, 0.0, 1.0, 2.0, std.math.nan(f64) };
+    for (0..120) |round| {
+        for (&xs) |*x| x.* = pool[r.uintLessThan(usize, pool.len)];
+        const per: usize = if (round == 0) window.block_cap else 2 + round % 40;
+        const n = r.uintAtMost(usize, xs.len);
+        try testing.expectEqual(per - 1, try minmax(f64, xs[0..n], mn[0..n], mx[0..n], .{ .period = per }));
+        _ = try window.extBatch(f64, false, xs[0..n], emn[0..n], .{ .period = per });
+        _ = try window.extBatch(f64, true, xs[0..n], emx[0..n], .{ .period = per });
+        for (mn[0..n], emn[0..n], mx[0..n], emx[0..n]) |a, b, c, d| {
+            try testing.expect(th.sameBits(a, b));
+            try testing.expect(th.sameBits(c, d));
+        }
+    }
+}

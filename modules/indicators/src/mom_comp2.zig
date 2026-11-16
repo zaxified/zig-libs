@@ -1186,3 +1186,16 @@ test "stc: peekStep leaves the core as it was, and a short scratch is refused" {
     try testing.expectError(error.BadParam, STC.init(.{}, short[0 .. short.len - 1]));
     try testing.expectEqual(short.len, STC.scratchLen(.{}));
 }
+
+test "stochrsi f64: the series batch validates its parameters and its slice lengths itself" {
+    const gpa = testing.allocator;
+    var x: [40]f64 = undefined;
+    for (&x, 0..) |*v, i| v.* = @floatFromInt(i % 7);
+    var k: [40]f64 = undefined;
+    var d: [40]f64 = undefined;
+    try testing.expectError(error.BadParam, stochrsi(f64, gpa, &x, &k, &d, .{ .fastk = 0 }));
+    try testing.expectError(error.BadParam, stochrsi(f64, gpa, &x, &k, &d, .{ .fastd = 0 }));
+    try testing.expectError(error.BadParam, stochrsi(f64, gpa, &x, k[0..39], &d, .{}));
+    try testing.expectError(error.BadParam, stochrsi(f64, gpa, &x, &k, d[0..39], .{}));
+    try testing.expectError(error.BadParam, stochrsi(f64, gpa, x[0..39], &k, &d, .{}));
+}

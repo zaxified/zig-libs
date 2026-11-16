@@ -1164,6 +1164,71 @@ test "median, percentile: a NaN in the data never takes an index out of the sort
     }
 }
 
+/// MEDIAN (`rank == 0`) / PERCENTILE over `xs` as the cores ran before the counting fast path: every position by
+/// `upperBound` / `lowerBound`, NaN or not. The counts must answer the same bits while the window is NaN-free, and the
+/// searches must take over (for good) once a NaN has entered it.
+fn searchRolling(xs: []const f64, out: []f64, sorted: []f64, p: usize, rank: usize) void {
+    for (xs, out, 0..) |x, *o, n| {
+        if (n + 1 < p) {
+            const pos = upperBound(sorted[0..n], x);
+            var j = n;
+            while (j > pos) : (j -= 1) sorted[j] = sorted[j - 1];
+            sorted[pos] = x;
+            o.* = std.math.nan(f64);
+            continue;
+        }
+        const s = sorted[0 .. p - 1];
+        const pos = upperBound(s, x);
+        const at = struct {
+            fn f(r: []const f64, v: f64, ps: usize, k: usize) f64 {
+                return if (k < ps) r[k] else if (k == ps) v else r[k - 1];
+            }
+        }.f;
+        if (rank == 0) {
+            const lo = at(s, x, pos, (p - 1) / 2);
+            const hi = at(s, x, pos, p / 2);
+            o.* = if ((p - 1) / 2 == p / 2) lo else (lo + hi) / 2.0;
+        } else {
+            o.* = at(s, x, pos, rank - 1);
+        }
+        var j = @min(lowerBound(s, xs[n + 1 - p]), s.len - 1);
+        if (j < pos) {
+            while (j + 1 < pos) : (j += 1) s[j] = s[j + 1];
+            s[pos - 1] = x;
+        } else {
+            while (j > pos) : (j -= 1) s[j] = s[j - 1];
+            s[pos] = x;
+        }
+    }
+}
+
+test "median, percentile: the counting fast path answers the searches' bits, and a NaN hands over to the searches" {
+    var prng = std.Random.DefaultPrng.init(0x3ed1a);
+    const r = prng.random();
+    var xs: [240]f64 = undefined;
+    var got: [240]f64 = undefined;
+    var want: [240]f64 = undefined;
+    var sorted: [40]f64 = undefined;
+    for (0..400) |round| {
+        // Small integers and signed zeros (ties everywhere, the sign of a zero shows the order of equals); every
+        // other round a few NaN from a random bar on, so the window is clean first and NaN-tainted after.
+        const nan_from: usize = if (round % 2 == 0) xs.len else r.uintLessThan(usize, xs.len);
+        for (&xs, 0..) |*x, i| {
+            const v = r.intRangeAtMost(i8, -3, 3);
+            x.* = if (i >= nan_from and r.uintLessThan(u8, 5) == 0) std.math.nan(f64) else if (v == 0 and r.boolean()) -0.0 else @floatFromInt(v);
+        }
+        const period = 2 + round % 38;
+        const pct: f64 = @floatFromInt(r.uintAtMost(u8, 100));
+        _ = try median(f64, testing.allocator, &xs, &got, .{ .period = period });
+        searchRolling(&xs, &want, &sorted, period, 0);
+        for (got, want) |g, w| try testing.expectEqual(@as(u64, @bitCast(w)), @as(u64, @bitCast(g)));
+        const pr = try PercentileCore.init(.{ .period = period, .percentile = pct }, &sorted);
+        _ = try percentile(f64, testing.allocator, &xs, &got, .{ .period = period, .percentile = pct });
+        searchRolling(&xs, &want, &sorted, period, pr.rank);
+        for (got, want) |g, w| try testing.expectEqual(@as(u64, @bitCast(w)), @as(u64, @bitCast(g)));
+    }
+}
+
 test "statistic: BadParam edges" {
     const gpa = testing.allocator;
     var out: [8]f64 = undefined;
@@ -1220,4 +1285,10 @@ test "statistic: batch == streaming, lookback == leading NaN" {
     try th.checkOne(KurtosisParams, KurtosisStream, kurtosis, kurtosisLookback, &jag, .{ .period = 9 });
     const flat: [100]f64 = @splat(42.0);
     try K.checkCore(CorrelCore, .{ .period = 5 }, .{ .x = &flat, .y = &flat });
+}
+
+test "var period 1: the shift is the first bar, so a huge first value answers 0, not inf - inf" {
+    var out: [2]f64 = undefined;
+    _ = try variance(f64, &.{ 1e200, 1e200 }, &out, .{ .period = 1 });
+    try testing.expectEqualSlices(f64, &.{ 0.0, 0.0 }, &out);
 }

@@ -6,7 +6,7 @@
 
 **Scope:** mvp — TA-Lib C 0.8.3, all 237 of its functions: the seed set (17), the Overlap Studies wave (27: every moving-average type, the bands / channels, SAR family, Supertrend, Ichimoku, Zig-Zag), the volume / volatility / price-transform / statistic / math-operator wave (50), the cycle wave (25: HT family, MAMA, three SWAK rows, 15 math transforms), the momentum wave (57: ADX family, AROON, ROC family, oscillators, KST / KDJ / STOCHRSI / CRSI / STC / SQZMOM, ...) and the 61 candlestick patterns (`candles.zig`). Remaining deviations from TA-Lib: MAVP has no streaming type; LINEARREG_ANGLE, PSO and the math transforms (ACOS ... TANH) carry a 2-ULP bound (libm `atan` / `tanh` rounding); the Hilbert family and MAMA a column-relative 1e-13 bound (`atan`); RSI answers NaN where TA-Lib's NaN-poisoned state reads 50; batch and streaming MAX / MIN / MINMAX / MIDPOINT / MIDPRICE / WILLR / ICHIMOKU differ in the sign of a 0.0 / -0.0 tie and where a NaN is in the window, as TA-Lib's two tiers do (the batch is its block scan, the stream its automaton) (surveyed 2026-11-15 against `ta_func.h` and the function sources of the 0.8.3 tarball)
 
-**Audit:** review 2026-11-15 · mutation 2026-11-16 (597/642, 45 eq) · src 050f3b1c48e9290e
+**Audit:** review 2026-11-15 · mutation 2026-11-17 (689/756, 67 eq) · src 97038cddf3871e11
 
 **Hardening:** fuzz 2026-11-15 (1,080,000 runs clean in three verdicts of 4 jobs, INDICATORS_FUZZ, ReleaseSafe; reach on every function: all 237 entries x f64 / f32 x stream, per-function counts printed; the whole surface — every batch function, `Lookback`, every streaming type with `bufLen` / `init` / `update` / `peek` / `value` / `clone` — under NaN / inf / -0 / denormal / huge data, lengths 0 .. 600, parameters at and beyond every range, mismatched slice lengths, short buffers, a failing allocator and in-place calls; batch == stream, `peek` == `update`, the NaN lead == the lookback, no unwritten output slot; the harness checked by 11 planted mutants) · ct n/a — no secret enters an indicator · panic 2026-11-15 (every entry point and every `@intFromFloat` / `@intCast` / `unreachable` / `.?` / allocation site swept, all 237 functions called by the fuzz harness: MEDIAN / PERCENTILE no longer index out of the sorted copy when the data holds a NaN; BBW / PERCENTB streams keep a ring as long as their average needs (KAMA / ZLEMA / VIDYA were wrong and `peek` differed from `update`); ZIGZAG's `pivot_idx` saturates at 2^31 - 1 instead of trapping)
 
@@ -15,6 +15,43 @@
 **Known defects:** none recorded
 
 **Downstream consumer:** no
+
+**Audit 2026-11-17 (delta mutation).** 114 schemata mutants over the non-test lines of the third P-gap round: CRSI's
+percent rank (`countBelow`: lane compare, tail compare, reduction, bound; the ring threshold, the divisor), the STOCH /
+STOCHF / KDJ batch (`kSeries`: NaN lead, its `min`, the automatons' start state, the first bar; `maStage`: lead, `min`,
+skip flag; the stage offsets, the f64 / f32 dispatch, the in-place swap and its blanking), STOCHRSI's three passes
+(dispatch, validation, length check, RSI lead, its `min`, the %K period, the %D offset, the swap), the ALMA 8-lane batch
+(dispatch, period-1 guard, lead, bound, seed, fused vs separate multiply-add, both stores, window offset),
+`VarCore.steadyStep` / `steady` / the step hand-off and the peak select, the BBANDS head / steady split, VAR / STDDEV
+`steady` / `steadyRun` (the `nbdev` arm, the write-back), MEDIAN / PERCENTILE (`countCmp` / `countBoth`: every compare,
+bound and reduction; `upperIdx`'s switch both ways, `sortedInsert` / `replaceAt` shifts, clamp and branch, the
+`clean` flag dropped and both ways at each switch, the empty-window guard, `computeAt`'s position), HMA (`flatRun`'s
+guard both bounds, the three re-anchor schedules and strides, the trailing re-reads, the ring slot, wrap and rebuild
+window, `wmaRebuild`'s weight, the write-backs), FRAMA (dispatch both ways, validation, length check, warm-up bounds
+and steps, the older pair's offset, the seed price, the NaN lead, the two-lane select, the range, the blend gate, the
+output gate) and MINMAX (block-scan dispatch, lookback, lead and its `min`, the sink, the returned lookback). First run:
+77 killed, 37 survived. New tests: MEDIAN / PERCENTILE against the binary searches they replaced (bit for bit, ties of
+signed zeros, NaN from a random bar on, every period 2..39 — the counts must answer the searches' bits and hand over to
+the searches for good once a NaN entered); MINMAX's shared block scan against two `extBatch` passes with NaN and
+signed-zero ties up to `block_cap`; STOCHRSI's f64 batch refusing a zero `fastk` and every short slice; VAR period 1
+with a huge first bar (the shift is that bar: 0, not inf - inf); ALMA over an all -0.0 window (+0.0, the stream's seed);
+FRAMA's f64 batch against the core with an inf or a NaN on every bar of the first windows, in both NaN modes, on
+quantized bars with NaN, and on a tie followed by a NaN on the trailing bar. Rerun: 14 more killed. The last survivor,
+the newer half-window extremes first stepped one bar late in FRAMA's warm-up, is not equivalent: traced by hand, the
+late automaton keeps the earliest of two tied highs, rescans one bar before the core does and starts that rescan on a
+NaN, answering NaN on the first output bar where the core answers the tie; the tie-then-NaN test above is that trace
+(written after the last schemata build, so checked against the original only). EQUIVALENT (19): the f64 fast-path
+switches of STOCHRSI, STOCHF, STOCH, ALMA and FRAMA and MINMAX's block-scan switch (each other path is the same bits —
+STOCH's f32 loop captures by value, MINMAX's by the new test); the searches in place of the counts on a NaN-free window
+(two mutants: the same positions on a sorted NaN-free slice); the vector loop bounds of `countCmp`, `countBelow` and
+`almaRun` one block early (the scalar tail runs the same compares and operations); `compute`'s `isNan(x)` (no element
+is `<=` a NaN, and `upperBound` answers 0 too); the empty-window guard (period >= 2); BBANDS' `mv == null` past the head
+(every average answers from its own lookback on, which is at most the bands'); STOCHRSI's NaN `memset` and `kSeries`'
+NaN lead (every caller blanks or skips those bars before reading them); `RWin` without the wrap (`at` folds one lap and
+`first <= s`); FRAMA's select as `>=` (a tie changes only the sign of a zero, and the blend needs `r > 0`) and
+`x - (-y)` as `x + y` (the same IEEE operation). UNOBSERVABLE (3): the write-backs of `VarianceCore.steadyRun` and
+`HmaCore.flatRun` (`since`, the outer `trailing`) — every caller discards the core after a batch; they need a caller that
+keeps stepping it. 114 of 114 resolved (92 killed, 19 equivalent, 3 unobservable).
 
 **Audit 2026-11-16 (delta mutation).** 174 schemata mutants over the non-test lines of the second P-gap round:
 `window.hiLoBlocks` / `hiLoBlocksFrom` (every guard and bound, the block start and stride, each suffix and prefix

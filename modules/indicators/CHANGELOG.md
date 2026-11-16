@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the third P-gap round (CRSI rank count,
+  STOCH / STOCHF / KDJ / STOCHRSI series passes, ALMA 8-lane batch, VAR / STDDEV / BBANDS steady loops, MEDIAN /
+  PERCENTILE counts and their NaN fallback, HMA flat loop, FRAMA f64 batch, MINMAX shared block scan), 92/114 killed
+  (one by a hand-traced test checked against the original only), 19 equivalent, 3 unobservable; new tests: MEDIAN /
+  PERCENTILE against the binary searches with NaN, MINMAX against `extBatch`, STOCHRSI refusals, VAR period 1 with a huge
+  first bar, ALMA's +0.0 seed, FRAMA's batch against its core (inf / NaN on every early bar, both NaN modes, quantized
+  bars, a tie then a NaN on the trailing bar).
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** SPEC benchmark rows of the third P-gap round re-measured (0.43x to 1.9x TA-Lib,
   31 of 88 functions over 1.1x, worst STC / FRAMA), Performance line, Result and the P-gap Backlog updated; this file's three
   previous entries had literal `\n` escapes, now line breaks.

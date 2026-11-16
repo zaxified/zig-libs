@@ -568,3 +568,78 @@ test "cksp stream clone re-binds its scratch and continues identically" {
     }
     try testing.expectError(error.BadParam, S.init(p, buf[0 .. buf.len - 1]));
 }
+
+test "alma: the eight-bar batch seeds each dot product with +0.0 (an all -0.0 window answers +0.0, as the stream)" {
+    const x: [24]f64 = @splat(-0.0);
+    var o: [24]f64 = undefined;
+    _ = try ind.alma(f64, testing.allocator, &x, &o, .{ .period = 5 });
+    for (o[4..]) |v| try testing.expect(v == 0.0 and !std.math.signbit(v));
+}
+
+test "frama: the f64 batch run answers the core's bits with an inf or a NaN on any bar of the first windows; nan = .skip stays on the core" {
+    const s = Series.make(43);
+    const len = 48;
+    var h: [len]f64 = undefined;
+    var l: [len]f64 = undefined;
+    var got: [len]f64 = undefined;
+    var want: [len]f64 = undefined;
+    const inf = std.math.inf(f64);
+    const nan = std.math.nan(f64);
+    for ([_]usize{ 2, 4, 6, 10 }) |per| {
+        for (0..3 * per) |j| {
+            for (0..4) |kind| {
+                @memcpy(&h, s.h[0..len]);
+                @memcpy(&l, s.l[0..len]);
+                switch (kind) {
+                    0 => h[j] = inf,
+                    1 => h[j] = nan,
+                    2 => l[j] = nan,
+                    else => l[j] = -inf,
+                }
+                inline for (.{ ind.Nan.propagate, ind.Nan.skip }) |mode| {
+                    const p = ind.FramaParams{ .period = per, .nan = mode };
+                    _ = try ind.frama(f64, &h, &l, &got, p);
+                    _ = try hist.batch(f64, overlap.FramaCore, .{ &h, &l }, [_][]f64{&want}, p, &.{});
+                    try th.expectSameBits(&want, &got);
+                }
+            }
+        }
+    }
+}
+
+test "frama: the f64 batch run answers the core's bits on quantized bars with NaN (ties, NaN held by a rescan)" {
+    var prng = std.Random.DefaultPrng.init(0xf4a);
+    const r = prng.random();
+    const len = 80;
+    var h: [len]f64 = undefined;
+    var l: [len]f64 = undefined;
+    var got: [len]f64 = undefined;
+    var want: [len]f64 = undefined;
+    for (0..600) |round| {
+        for (&h, &l) |*hi, *lo| {
+            hi.* = if (r.uintLessThan(u8, 6) == 0) std.math.nan(f64) else @floatFromInt(r.intRangeAtMost(i8, 0, 4));
+            lo.* = if (r.uintLessThan(u8, 6) == 0) std.math.nan(f64) else @floatFromInt(r.intRangeAtMost(i8, -4, 0));
+        }
+        const p = ind.FramaParams{ .period = 2 * (1 + round % 8) };
+        _ = try ind.frama(f64, &h, &l, &got, p);
+        _ = try hist.batch(f64, overlap.FramaCore, .{ &h, &l }, [_][]f64{&want}, p, &.{});
+        try th.expectSameBits(&want, &got);
+    }
+}
+
+test "frama: the batch steps the newer half-window extremes from their first full window (a tie then a NaN on the trailing bar)" {
+    // period 6 (half 3). The core's newest-half MAX rescans bars 0..2 at bar 2 (index 2), then keeps the newest of
+    // the ties at bars 3 and 5; an automaton first stepped at bar 3 rescans 1..3 (index 2), rescans 3..5 at bar 5
+    // (index 3, the earliest tie) and at bar 6 rescans from the NaN at bar 4, holding NaN where the core answers 3.
+    const nan = std.math.nan(f64);
+    const h = [_]f64{ 1, 1, 3, 3, nan, 3, 2, 2.5, 2, 3 };
+    const l = [_]f64{ 0, 0, 1, 2, 0.5, 1, 1.5, 1, 1, 2 };
+    var got: [h.len]f64 = undefined;
+    var want: [h.len]f64 = undefined;
+    const p = ind.FramaParams{ .period = 6 };
+    try testing.expectEqual(@as(usize, 6), try ind.frama(f64, &h, &l, &got, p));
+    _ = try hist.batch(f64, overlap.FramaCore, .{ &h, &l }, [_][]f64{&want}, p, &.{});
+    try th.expectSameBits(&want, &got);
+    // r1 = 3 - 0.5, r2 = 3 - 0, r = 3: the bar blends (a NaN extreme would answer the bar's price, 1.75).
+    try testing.expect(got[6] != 1.75 and !std.math.isNan(got[6]));
+}
