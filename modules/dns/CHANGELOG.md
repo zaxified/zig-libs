@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the local-refusal refund, 4/4 killed (one after a
+  new test: an `InvalidOptions` refusal takes no budget token either).
 - **2026-11-16** — `CachingResolver`: a lookup the Resolver refuses before sending anything (`BadName`, `NameTooLong`,
   `RequestTooLarge`, `InvalidOptions`, `NoDotSupport`, `NoDohEndpoint`) no longer counts in `Stats.network_lookups` and gives
   its `max_network_lookups` token back, as the table-bypass path already did. Two tests.
