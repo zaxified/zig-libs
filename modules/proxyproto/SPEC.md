@@ -60,9 +60,31 @@ A PROXY header is a claim by the peer about someone else. `read` therefore takes
 
 ## Anchoring
 
-Test vectors are built by hand from the spec's byte layouts (`src/tests.zig`); no other implementation's test data is used. They are the author's reading of the specification, so this is the weakest external grade. The writer-to-parser round trips share that reading.
+Test vectors in `src/tests.zig` are built by hand from the spec's byte layouts; no other implementation's test data is used. Those and the writer-to-parser round trips are the author's reading of the specification. The foreign check is the interop oracle below.
 
-**Anchor grade:** class A · oracle SELF
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire format: other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — the verdicts of the parse and write paths are compared with pires/go-proxyproto v0.16.0, driven live (`zig build interop-proxyproto`, not in `test-proxyproto`). Not frozen into the module's tests, and not run against HAProxy itself.
+
+### Interop oracle
+
+`tools/interop.zig` (the Zig driver) and `tools/go_oracle/` (Go, public API of go-proxyproto v0.16.0 only: `ParseUDPDatagram`, `Header.Format`, `TLVs`/`SetTLVs`, `HeaderProxyFromAddrs`, `tlvparse.SSL`; fetched, pinned by `go.sum`, not vendored; the CRC32C TLV, which go-proxyproto neither writes nor verifies, is computed and checked with the standard library's Castagnoli table). Both sides produce a canonical verdict line per input (version, command, family, addresses as raw bytes and ports, TLV list, consumed length) and the driver compares. Our v2 cap is set to Go's 4096-byte payload for the run (the default stays 536). Three kinds of case, a third each: **parse** (valid headers of every family with TLVs, CRC32C and trailing application data, hand-made v2 prefixes with random family and command bytes and lengths, v1 lines with hostile addresses and ports, then truncated, bit-flipped, replaced, inserted, deleted bytes and rewritten lengths), **zig-writes** (our writer's bytes, parsed by Go, must equal the description), **go-writes** (Go's bytes, parsed here, must equal the description and are compared byte for byte with our writer's), plus one SSL TLV case per header that carries one.
+
+**Run 2026-11-16** (go-proxyproto v0.16.0, go1.26.9, seed 20261116): 160 085 cases, 50 000 per direction and 10 085 SSL: **0 unexplained disagreements**. Agreement: 27 886 headers parsed identically, 2 778 absent, 15 488 refused, 6 830 incomplete (Go sees EOF there), 50 000 of our writes read back by Go as described, 40 922 of Go's writes byte-identical to ours. No defect in this module was found.
+
+Documented differences (each a class the driver counts, anything else fails the run):
+
+- **v2 PROXY with UNSPEC (0x21 0x00)**: Go refuses (`UnsupportedAddressFamilyAndProtocol`); we accept, no addresses (the specification leaves it to the receiver, § Decisions). 62.
+- **v2 LOCAL with an undefined family byte**: Go refuses; we discard the whole block as the specification says a LOCAL receiver must. 600.
+- **Malformed TLV area**: Go's `Read` accepts, `TLVs()` fails later; we refuse at parse so every typed helper reads a checked area. 1 364.
+- **CRC32C**: Go never verifies it. Where our `BadChecksum` (587) or `Malformed` for a duplicate / non-4-byte CRC TLV (19) fires, the oracle's own check with `hash/crc32` agrees.
+- **`PROXY` followed by a byte other than a space**: Go commits to v1 and errors; we say absent (the bytes are not a header and stay for the real protocol). 388.
+- **Unix path over 108 bytes or with a NUL in the writer**: Go truncates silently / writes a path no parser can read back; we refuse with `InvalidHeader`. 8 425.
+- **`HeaderProxyFromAddrs`** labels a v4-mapped IPv6 pair TCP4/UDP4 whatever the caller asked (Go-side quirk); the oracle builds the header directly then, and the bytes still match. 653.
+- **SSL TLV content**: `tlvparse.SSL` also validates strings (ASCII version and cipher, UTF-8 CN, version present when the SSL flag is set); we decode the structure and leave the content to the caller. 4 083.
+
+Re-run: `go build` the oracle into `.zig-cache/pp-oracle/gooracle` (see `tools/go_oracle/README.md`), then `zig build interop-proxyproto -- --cases 150000 --seed 20261116`.
 
 **Audit 2026-11-15 (mutation, whole module).** 224 schemata mutants over `src/root.zig`, ReleaseSafe, one
 build, each mutant under `setsid -w timeout` and `ulimit -v` (the coverage-guided `testing.fuzz` entry
@@ -102,5 +124,5 @@ carried; no new test, 0 equivalent.
 
 ## Open
 
-- An interop run against HAProxy `send-proxy-v2` / `send-proxy-v2-ssl` (`tools/` oracle) has not been done; until it has, the oracle grade stays SELF.
+- An interop run against HAProxy `send-proxy-v2` / `send-proxy-v2-ssl` itself has not been done (the oracle above is a second implementation, go-proxyproto, not the specification's home).
 - No mutation run and no audit.
