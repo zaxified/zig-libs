@@ -6,7 +6,7 @@
 
 **Scope:** core — Jinja2 3.1.6 (surveyed 2026-09-30, S3 pass 2026-11-13): faithful core and oracle-checked, now with `format`, `groupby`, `wordwrap`, `filesizeformat`, Unicode case mapping and the `sameas`/`callable` tests; remaining gaps listed in §6 and the builtin table in §6.1 (`urlize`, `pprint`, `random`, `attr`, `cycler`/`joiner`/`lipsum`, the `filter`/`test` tests, `{% trans %}`)
 
-**Audit:** review 2026-09-02 · mutation 2026-11-17 (71/74, 3 eq) · src ?
+**Audit:** review 2026-09-02 · mutation 2026-11-17 (71/74, 3 eq) · src 9603f4c04187bf0b
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JINJA_FUZZ) · ct n/a — template engine (keyword review, 2026-10-07)
 

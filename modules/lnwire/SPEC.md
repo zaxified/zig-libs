@@ -6,7 +6,7 @@
 
 **Scope:** core — LDK `lightning::ln::msgs` / lnd `lnwire` (BOLT#1/2/7 message sets) (surveyed 2026-09-30; re-assessed 2026-10-06 against that survey, no new survey: mvp -> core after `channel_reestablish`, `update_fail_malformed_htlc`, `announcement_signatures`, `gossip_timestamp_filter`, typed address descriptors and feature-bit helpers landed)
 
-**Audit:** review 2026-09-03 · mutation 2026-11-17 (126/127, 1 eq) · src ?
+**Audit:** review 2026-09-03 · mutation 2026-11-17 (126/127, 1 eq) · src bdcde22f8cb6a3bc
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, LNWIRE_FUZZ) · ct n/a — public wire messages (keyword review, 2026-10-07)
 
