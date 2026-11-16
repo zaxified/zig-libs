@@ -103,6 +103,11 @@ pub const ComposeError = compose_mod.Error;
 
 /// Compose every document in `source` into native `Value` trees (Part 2).
 pub const composeAll = compose_mod.composeAll;
+/// Fields of a YAML 1.1 `!!timestamp`, and the parser behind that tag.
+pub const Timestamp = compose_mod.Timestamp;
+pub const parseTimestamp = compose_mod.parseTimestamp;
+/// The bytes of a YAML 1.1 `!!binary` scalar's base64 text.
+pub const decodeBinary = compose_mod.decodeBinary;
 /// Naive structural equality (no depth bound, no memo — for trusted trees).
 pub const valueEql = compose_mod.valueEql;
 

@@ -146,9 +146,11 @@ suite's documents, so nothing of yaml-test-suite is vendored here.
   checked against PyYAML.
 
 ## Deferred
-- **Schemas other than core.** The failsafe and JSON schemas, and the `!!binary`
-  / `!!timestamp` / `!!set` / `!!omap` types, are not resolved; those tags leave
-  their scalars as text.
+- **Schemas other than core.** The failsafe and JSON schemas, and the `!!set` /
+  `!!omap` types, are not resolved; those tags leave their scalars as text.
+  (`!!binary` and `!!timestamp` are checked when written explicitly and kept as
+  text: `yaml.decodeBinary` returns a `!!binary` scalar's bytes,
+  `yaml.parseTimestamp` a `!!timestamp`'s fields. Malformed -> `BadTaggedScalar`.)
 - **Integers outside `i64`** stay strings holding their exact text — see
   SPEC.md §9.
 - **UTF-16/UTF-32 input.** §5.2 allows a BOM to select them; only the UTF-8 BOM

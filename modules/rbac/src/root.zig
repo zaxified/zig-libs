@@ -92,6 +92,40 @@ pub const rbac = struct {
         ConflictingRole,
     };
 
+    /// How a stored permission is compared with a requested `(action,
+    /// resource)`. `.exact` (the default) is byte equality, as always.
+    /// `.key_match` is opt-in (`Engine.initWithMatch`): see `keyMatch`.
+    pub const Match = enum { exact, key_match };
+
+    /// Casbin `keyMatch`-style pattern test, one rule set: in `pattern`, `*`
+    /// matches any run of bytes (possibly empty, `/` and `:` included, so
+    /// `/api/*` covers `/api/a/b` and `read:*` covers `read:doc`); every other
+    /// byte matches itself. There is no escape and no other metacharacter. A
+    /// `*` in `text` is an ordinary byte. Iterative with one backtrack point
+    /// (the last `*`): O(pattern.len * text.len) worst case, never exponential.
+    pub fn keyMatch(pattern: []const u8, text: []const u8) bool {
+        var p: usize = 0;
+        var t: usize = 0;
+        var star: ?usize = null; // pattern index just after the last `*`
+        var mark: usize = 0; // text index that `*` currently extends to
+        while (t < text.len) {
+            if (p < pattern.len and pattern[p] == '*') {
+                star = p + 1;
+                mark = t;
+                p += 1;
+            } else if (p < pattern.len and pattern[p] == text[t]) {
+                p += 1;
+                t += 1;
+            } else if (star) |s| {
+                mark += 1;
+                t = mark;
+                p = s;
+            } else return false;
+        }
+        while (p < pattern.len and pattern[p] == '*') p += 1;
+        return p == pattern.len;
+    }
+
     const RoleData = struct {
         permissions: std.ArrayListUnmanaged(Permission) = .empty,
         /// Direct junior roles: this role inherits their permissions,
@@ -127,6 +161,10 @@ pub const rbac = struct {
     /// item cannot grow the engine.
     pub const Engine = struct {
         gpa: Allocator,
+        /// Permission comparison used by `check` (not by the idempotence /
+        /// removal bookkeeping, which is always exact: a pattern is its own
+        /// stored string). Set at init; `.exact` unless asked otherwise.
+        match: Match = .exact,
         roles: std.StringHashMapUnmanaged(RoleData) = .empty,
         /// user -> set of directly assigned role names. A user with no
         /// remaining roles has NO entry (removed with its last role).
@@ -135,6 +173,15 @@ pub const rbac = struct {
 
         pub fn init(allocator: Allocator) Engine {
             return .{ .gpa = allocator };
+        }
+
+        /// An engine whose stored permissions are patterns (`keyMatch`) for
+        /// `check`: `addPermission("r", .{ .action = "read:*", .resource =
+        /// "/api/*" })` grants every read on every path under `/api/`. A
+        /// policy that uses patterns must declare it here; with `init` a `*`
+        /// is just a byte.
+        pub fn initWithMatch(allocator: Allocator, match: Match) Engine {
+            return .{ .gpa = allocator, .match = match };
         }
 
         pub fn deinit(self: *Engine) void {
@@ -181,7 +228,7 @@ pub const rbac = struct {
         /// directly is a no-op.
         pub fn addPermission(self: *Engine, role: []const u8, perm: Permission) Error!void {
             const rd = self.roles.getPtr(role) orelse return error.UnknownRole;
-            if (self.roleGrantsDirect(role, perm.action, perm.resource)) return;
+            if (self.roleHasExact(role, perm.action, perm.resource)) return;
             const action = try self.dupe(perm.action);
             errdefer self.gpa.free(action);
             const resource = try self.dupe(perm.resource);
@@ -411,10 +458,20 @@ pub const rbac = struct {
             }
         }
 
-        fn roleGrantsDirect(self: *const Engine, role: []const u8, action: []const u8, resource: []const u8) bool {
+        /// Exact stored-string equality (idempotence bookkeeping).
+        fn roleHasExact(self: *const Engine, role: []const u8, action: []const u8, resource: []const u8) bool {
             const rd = self.roles.get(role) orelse return false;
             for (rd.permissions.items) |p| {
                 if (std.mem.eql(u8, p.action, action) and std.mem.eql(u8, p.resource, resource)) return true;
+            }
+            return false;
+        }
+
+        fn roleGrantsDirect(self: *const Engine, role: []const u8, action: []const u8, resource: []const u8) bool {
+            if (self.match == .exact) return self.roleHasExact(role, action, resource);
+            const rd = self.roles.get(role) orelse return false;
+            for (rd.permissions.items) |p| {
+                if (keyMatch(p.action, action) and keyMatch(p.resource, resource)) return true;
             }
             return false;
         }
@@ -839,6 +896,72 @@ fn buildBasicEngine(a: Allocator) !rbac.Engine {
     try e.addPermission("viewer", .{ .action = "read", .resource = "doc" });
     try e.addPermission("editor", .{ .action = "write", .resource = "doc" });
     return e;
+}
+
+test "rbac: pattern permissions (key_match) match, and exact stays the default" {
+    var e = rbac.Engine.initWithMatch(testing.allocator, .key_match);
+    defer e.deinit();
+    try e.addRole("api");
+    try e.addPermission("api", .{ .action = "read:*", .resource = "/api/*" });
+    try e.addPermission("api", .{ .action = "write", .resource = "/api/items" });
+    try e.assignRole("u", "api");
+    try testing.expect(e.check("u", "read:doc", "/api/a/b").isPermit());
+    try testing.expect(e.check("u", "read:", "/api/").isPermit()); // `*` matches empty
+    try testing.expect(e.check("u", "write", "/api/items").isPermit()); // exact entries still work
+    try testing.expect(!e.check("u", "write", "/api/items/1").isPermit()); // no star, no prefix match
+    try testing.expect(!e.check("u", "read", "/api/a").isPermit()); // "read" lacks the "read:" prefix
+    try testing.expect(!e.check("u", "read:doc", "/apix/a").isPermit());
+    try testing.expect(!e.check("u", "delete:doc", "/api/a").isPermit());
+    // A `*` in the request is an ordinary byte, never a pattern.
+    try testing.expect(!e.check("u", "write", "/api/*").isPermit());
+    // Inheritance works with patterns too.
+    try e.addRole("top");
+    try e.addHierarchy("top", "api");
+    try e.assignRole("v", "top");
+    try testing.expect(e.check("v", "read:x", "/api/y").isPermit());
+
+    // Default engine: `*` is a literal byte, exactly as before.
+    var d = rbac.Engine.init(testing.allocator);
+    defer d.deinit();
+    try d.addRole("r");
+    try d.addPermission("r", .{ .action = "read:*", .resource = "/api/*" });
+    try d.assignRole("u", "r");
+    try testing.expect(!d.check("u", "read:doc", "/api/a").isPermit());
+    try testing.expect(d.check("u", "read:*", "/api/*").isPermit());
+}
+
+test "rbac: keyMatch rules" {
+    const km = rbac.keyMatch;
+    try testing.expect(km("", ""));
+    try testing.expect(!km("", "a"));
+    try testing.expect(km("*", ""));
+    try testing.expect(km("*", "anything/at/all"));
+    try testing.expect(km("a*c", "abc"));
+    try testing.expect(km("a*c", "ac"));
+    try testing.expect(!km("a*c", "ab"));
+    try testing.expect(km("a*b*c", "aXbYbZc"));
+    try testing.expect(km("**", "x"));
+    try testing.expect(!km("abc", "abcd"));
+    try testing.expect(!km("abcd", "abc"));
+    try testing.expect(km("/api/*", "/api/"));
+    try testing.expect(!km("/api/*", "/api"));
+}
+
+test "rbac: a pathological pattern stays fast" {
+    const n = 3000;
+    var pat: [2 * n + 1]u8 = undefined;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        pat[2 * i] = '*';
+        pat[2 * i + 1] = 'a';
+    }
+    pat[2 * n] = 'b';
+    var text: [n * 2]u8 = undefined;
+    @memset(&text, 'a');
+    // No `b` in the text: the worst case for backtracking matchers.
+    try testing.expect(!rbac.keyMatch(&pat, &text));
+    text[n] = 'b';
+    try testing.expect(rbac.keyMatch(&pat, text[0 .. n + 1]));
 }
 
 test "rbac: direct grant permits" {

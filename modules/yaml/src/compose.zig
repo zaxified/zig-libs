@@ -753,7 +753,7 @@ const Composer = struct {
 
     fn resolveScalar(self: *Composer, text: []const u8, style: parser.ScalarStyle, tag: ?[]const u8) Error!Value {
         const owned = try self.alloc.dupe(u8, text);
-        if (tag) |t| return resolveTagged(owned, t);
+        if (tag) |t| return resolveTagged(self.alloc, owned, t);
         // Only *plain* scalars are resolved by the schema. A quoted, literal or
         // folded scalar is a string however it reads — `"true"` is not a bool
         // (YAML 1.2 §10.2.2).
@@ -787,7 +787,7 @@ const core_str = "tag:yaml.org,2002:str";
 /// its literal text: only the application that defined the tag can say what it
 /// means, and guessing would be worse than handing over the bytes. The suite
 /// agrees (`5TYM`, `CC74`, `6WLZ`, `7FWL` all expect the raw string).
-fn resolveTagged(text: []const u8, tag: []const u8) Error!Value {
+fn resolveTagged(alloc: std.mem.Allocator, text: []const u8, tag: []const u8) Error!Value {
     if (std.mem.eql(u8, tag, core_str)) return .{ .string = text };
     if (std.mem.eql(u8, tag, core_null)) return .null;
     if (std.mem.eql(u8, tag, core_bool)) {
@@ -804,7 +804,148 @@ fn resolveTagged(text: []const u8, tag: []const u8) Error!Value {
         // is the float 1.0 without a separate integer path.
         return parseFloat(text) orelse error.BadTaggedScalar;
     }
+    if (std.mem.eql(u8, tag, yaml11_binary)) {
+        // Validated, then kept as its base64 text, as the suite expects
+        // (565N's in.json); `decodeBinary` gives the bytes. Keeping the text
+        // also keeps `.string` printable for `emit`.
+        const bytes = try decodeBinary(alloc, text);
+        alloc.free(bytes);
+        return .{ .string = text };
+    }
+    if (std.mem.eql(u8, tag, yaml11_timestamp)) {
+        // Validated, then kept as its text (the `Value` model has no
+        // timestamp variant); `parseTimestamp` gives the fields.
+        _ = parseTimestamp(text) orelse return error.BadTaggedScalar;
+        return .{ .string = text };
+    }
     return .{ .string = text };
+}
+
+// ── YAML 1.1 `!!binary` and `!!timestamp` (explicit tags only) ──────────────
+
+const yaml11_binary = "tag:yaml.org,2002:binary";
+const yaml11_timestamp = "tag:yaml.org,2002:timestamp";
+
+/// `!!binary`: standard base64 (padding required) with ASCII whitespace
+/// (space, tab, CR, LF) ignored anywhere, per the YAML 1.1 type spec. Returns
+/// the decoded bytes, owned by the caller (`alloc`); bad base64 is
+/// `BadTaggedScalar`. A `!!binary` scalar's `.string` is its text, checked by
+/// this on load.
+pub fn decodeBinary(alloc: std.mem.Allocator, text: []const u8) Error![]const u8 {
+    const clean = try alloc.alloc(u8, text.len);
+    defer alloc.free(clean);
+    var n: usize = 0;
+    for (text) |c| switch (c) {
+        ' ', '\t', '\r', '\n' => {},
+        else => {
+            clean[n] = c;
+            n += 1;
+        },
+    };
+    const dec = std.base64.standard.Decoder;
+    const size = dec.calcSizeForSlice(clean[0..n]) catch return error.BadTaggedScalar;
+    const out = try alloc.alloc(u8, size);
+    errdefer alloc.free(out);
+    dec.decode(out, clean[0..n]) catch return error.BadTaggedScalar;
+    return out;
+}
+
+/// The fields of a YAML 1.1 `!!timestamp`.
+pub const Timestamp = struct {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8 = 0,
+    minute: u8 = 0,
+    second: u8 = 0,
+    /// Fraction of a second in nanoseconds (digits past the 9th are dropped).
+    nanosecond: u32 = 0,
+    /// Offset from UTC in minutes (`Z` is 0); null when the text has no zone
+    /// (YAML 1.1: UTC) and for a date-only value.
+    utc_offset_minutes: ?i32 = null,
+};
+
+fn digits(s: []const u8, i: *usize, min: usize, max: usize) ?u32 {
+    var n: usize = 0;
+    var v: u32 = 0;
+    while (i.* + n < s.len and n < max and s[i.* + n] >= '0' and s[i.* + n] <= '9') : (n += 1)
+        v = v * 10 + (s[i.* + n] - '0');
+    if (n < min) return null;
+    i.* += n;
+    return v;
+}
+
+fn skipBlank(s: []const u8, i: *usize) usize {
+    const st = i.*;
+    while (i.* < s.len and (s[i.*] == ' ' or s[i.*] == '\t')) i.* += 1;
+    return i.* - st;
+}
+
+/// Parse the YAML 1.1 timestamp grammar: `YYYY-MM-DD`, or
+/// `YYYY-M(M)-D(D)` + (`T`/`t`/blanks) + `H(H):MM:SS` + optional `.fraction`
+/// + optional zone after optional blanks (`Z`, or `±H(H)` / `±H(H):MM`).
+/// Calendar ranges are checked (month, day of month incl. leap years, hour
+/// < 24, minute and second < 60, zone hours < 24); null on any mismatch.
+pub fn parseTimestamp(text: []const u8) ?Timestamp {
+    var i: usize = 0;
+    const y = digits(text, &i, 4, 4) orelse return null;
+    if (i >= text.len or text[i] != '-') return null;
+    i += 1;
+    const date_only_len = i + 5; // "MM-DD"
+    const mo = digits(text, &i, 1, 2) orelse return null;
+    if (i >= text.len or text[i] != '-') return null;
+    i += 1;
+    const d = digits(text, &i, 1, 2) orelse return null;
+    var t: Timestamp = .{ .year = @intCast(y), .month = @intCast(mo), .day = @intCast(d) };
+    if (mo < 1 or mo > 12 or d < 1) return null;
+    const leap = (y % 4 == 0 and y % 100 != 0) or y % 400 == 0;
+    const dim = [_]u8{ 31, if (leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (d > dim[mo - 1]) return null;
+    if (i == text.len) {
+        // The date-only form is the strict `NN-NN`.
+        return if (i == date_only_len) t else null;
+    }
+    if (text[i] == 'T' or text[i] == 't') {
+        i += 1;
+    } else if (skipBlank(text, &i) == 0) return null;
+    const h = digits(text, &i, 1, 2) orelse return null;
+    if (i >= text.len or text[i] != ':') return null;
+    i += 1;
+    const mi = digits(text, &i, 2, 2) orelse return null;
+    if (i >= text.len or text[i] != ':') return null;
+    i += 1;
+    const se = digits(text, &i, 2, 2) orelse return null;
+    if (h > 23 or mi > 59 or se > 59) return null;
+    t.hour = @intCast(h);
+    t.minute = @intCast(mi);
+    t.second = @intCast(se);
+    if (i < text.len and text[i] == '.') {
+        i += 1;
+        var scale: u32 = 100_000_000;
+        while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {
+            t.nanosecond += (text[i] - '0') * scale;
+            scale /= 10; // reaches 0 after 9 digits; the rest are dropped
+        }
+    }
+    if (i == text.len) return t;
+    _ = skipBlank(text, &i);
+    if (i < text.len and text[i] == 'Z') {
+        i += 1;
+        t.utc_offset_minutes = 0;
+    } else if (i < text.len and (text[i] == '+' or text[i] == '-')) {
+        const neg = text[i] == '-';
+        i += 1;
+        const zh = digits(text, &i, 1, 2) orelse return null;
+        var zm: u32 = 0;
+        if (i < text.len and text[i] == ':') {
+            i += 1;
+            zm = digits(text, &i, 2, 2) orelse return null;
+        }
+        if (zh > 23 or zm > 59) return null;
+        const off: i32 = @intCast(zh * 60 + zm);
+        t.utc_offset_minutes = if (neg) -off else off;
+    } else return null;
+    return if (i == text.len) t else null;
 }
 
 /// The core schema's resolution order for an untagged plain scalar:
@@ -1067,6 +1208,73 @@ test "an unknown tag leaves the literal text" {
 test "a core tag whose body does not match is rejected" {
     try testing.expectError(error.BadTaggedScalar, single("x: !!int nope\n"));
     try testing.expectError(error.BadTaggedScalar, single("x: !!bool maybe\n"));
+}
+
+test "!!binary keeps its text; decodeBinary gives the bytes, ignoring whitespace" {
+    const r = try single("a: !!binary |\n  R0lG\n  ODlh\nb: !!binary \"aGVs bG8=\"\nc: !!binary \"\"\n");
+    defer r.deinit();
+    try testing.expectEqualStrings("R0lG\nODlh\n", r.root.get("a").?.string);
+    try testing.expectEqualStrings("aGVs bG8=", r.root.get("b").?.string);
+    const a = try decodeBinary(testing.allocator, r.root.get("a").?.string);
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("GIF89a", a);
+    const b = try decodeBinary(testing.allocator, r.root.get("b").?.string);
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("hello", b);
+    try testing.expectEqualStrings("", r.root.get("c").?.string);
+}
+
+test "!!binary refuses malformed base64" {
+    try testing.expectError(error.BadTaggedScalar, single("x: !!binary 'aGVsbG8'\n")); // no padding
+    try testing.expectError(error.BadTaggedScalar, single("x: !!binary 'a*b='\n"));
+    try testing.expectError(error.BadTaggedScalar, single("x: !!binary 'a'\n"));
+}
+
+test "!!timestamp: YAML 1.1 type-spec examples compose" {
+    const r = try single("a: !!timestamp 2001-12-15T02:59:43.1Z\nb: !!timestamp 2001-12-14t21:59:43.10-05:00\n" ++
+        "c: !!timestamp 2001-12-14 21:59:43.10 -5\nd: !!timestamp 2001-12-15 2:59:43.10\ne: !!timestamp 2002-12-14\n");
+    defer r.deinit();
+    try testing.expectEqualStrings("2001-12-15T02:59:43.1Z", r.root.get("a").?.string);
+    try testing.expect(r.root.get("e") != null);
+}
+
+test "parseTimestamp fields" {
+    const a = parseTimestamp("2001-12-15T02:59:43.1Z").?;
+    try testing.expectEqual(@as(u16, 2001), a.year);
+    try testing.expectEqual(@as(u8, 12), a.month);
+    try testing.expectEqual(@as(u8, 15), a.day);
+    try testing.expectEqual(@as(u8, 2), a.hour);
+    try testing.expectEqual(@as(u8, 59), a.minute);
+    try testing.expectEqual(@as(u8, 43), a.second);
+    try testing.expectEqual(@as(u32, 100_000_000), a.nanosecond);
+    try testing.expectEqual(@as(?i32, 0), a.utc_offset_minutes);
+    const b = parseTimestamp("2001-12-14t21:59:43.10-05:00").?;
+    try testing.expectEqual(@as(?i32, -300), b.utc_offset_minutes);
+    try testing.expectEqual(@as(u32, 100_000_000), b.nanosecond);
+    const c = parseTimestamp("2001-12-14 21:59:43.10 -5").?; // blank before the zone, as in the type spec
+    try testing.expectEqual(@as(?i32, -300), c.utc_offset_minutes);
+    const c2 = parseTimestamp("2001-12-14 21:59:43.10-5").?;
+    try testing.expectEqual(@as(?i32, -300), c2.utc_offset_minutes);
+    const z = parseTimestamp("2001-12-14 21:59:43 \tZ").?;
+    try testing.expectEqual(@as(?i32, 0), z.utc_offset_minutes);
+    const d = parseTimestamp("2001-12-15 2:59:43.10").?;
+    try testing.expectEqual(@as(u8, 2), d.hour);
+    try testing.expectEqual(@as(?i32, null), d.utc_offset_minutes);
+    const e = parseTimestamp("2002-12-14").?;
+    try testing.expectEqual(@as(u8, 14), e.day);
+    try testing.expectEqual(@as(u32, 123456789), parseTimestamp("2001-01-01T00:00:00.1234567891Z").?.nanosecond);
+    try testing.expect(parseTimestamp("2024-02-29") != null);
+}
+
+test "parseTimestamp refuses malformed values" {
+    const bad = [_][]const u8{
+        "",                          "2001",                "2001-12",             "2001-1-5",            "2001-13-01",          "2001-00-10",        "2001-12-32",            "2023-02-29",
+        "1900-02-29",                "2001-12-15T",         "2001-12-15T25:00:00", "2001-12-15T02:60:00", "2001-12-15T02:00:60", "2001-12-15T2:5:00", "2001-12-15T02:59:43Zx", "2001-12-15T02:59:43+24",
+        "2001-12-15T02:59:43+05:60", "2001-12-15x02:59:43", "01-12-15",            "2001-12-15 ",
+    };
+    for (bad) |b| try testing.expect(parseTimestamp(b) == null);
+    try testing.expectError(error.BadTaggedScalar, single("x: !!timestamp yesterday\n"));
+    try testing.expectError(error.BadTaggedScalar, single("x: !!timestamp 2001-13-01\n"));
 }
 
 test "aliases share the anchored node" {
