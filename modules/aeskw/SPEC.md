@@ -29,22 +29,24 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 **Where we are ahead:** the only pure-Zig AES-KW; constant-time integrity check, scratch
 zeroization on failure, zero-alloc caller-supplied buffers. **Where we are behind:** RFC 5649
-KWP absent (deliberately deferred, see *Scope*). (The 192-bit KEK gap closed 2026-10-10 via the
+KWP shipped 2026-11-16 (`wrapPad`/`unwrapPad`, see *Scope*). (The 192-bit KEK gap closed 2026-10-10 via the
 `aes192` module.)
 
 RFC 3394 AES Key Wrap. Usage: see ./README.md.
 
 ## Scope
 
-- **RFC 3394 only** (the unpadded "AES Key Wrap" construction, §2.2.1 wrap / §2.2.2 unwrap /
-  §2.2.3.1 default IV). `plaintext`/recovered key data is always a multiple of 8 bytes, >= 16
-  (>= 2 semiblocks) — the RFC's own domain.
-- **RFC 5649 (AES Key Wrap with Padding, for key data that isn't an 8-byte multiple) is
-  deferred, not implemented.** No in-repo consumer (`jwe`, `dnp3`, `xmlenc`) needs it today —
-  all three only ever wrap fixed-size, already-8-byte-aligned symmetric keys (AES-128/192/256,
-  HMAC keys). Adding it later is additive (a new `wrapPad`/`unwrapPad` pair layering RFC 5649
-  §4.1's alternative IV + padding scheme on top of this module's block-recurrence core) and
-  would not change this module's existing `wrap`/`unwrap` signatures or KATs.
+- **RFC 3394** (the unpadded "AES Key Wrap" construction, §2.2.1 wrap / §2.2.2 unwrap /
+  §2.2.3.1 default IV): `wrap`/`unwrap`. `plaintext`/recovered key data is a multiple of 8
+  bytes, >= 16 (>= 2 semiblocks) — the RFC's own domain.
+- **RFC 5649 (AES Key Wrap with Padding)** — `wrapPad`/`unwrapPad` (2026-11-16): key data of
+  1..2^32-1 bytes, zero-padded to 8n, IV = `A65959A6 || MLI` (32-bit big-endian length). n = 1
+  is one AES block encryption/decryption (no recurrence); n >= 2 shares the RFC 3394 core with
+  `wrap`/`unwrap`. `unwrapPad` takes an `out` of `ciphertext.len - 8` bytes (the padded size),
+  returns the first MLI bytes, and folds the §4.2 checks (AIV prefix, `8(n-1) < MLI <= 8n`,
+  zero padding) into one non-short-circuit verdict; failure is `error.Unauthentic` with `out`
+  zeroed. Empty plaintext is refused with `error.InvalidLength` (as RustCrypto and OpenSSL do).
+  Anchored on RFC 5649 §6 (20-byte and 7-byte key data, 192-bit KEK).
 - **KEK width: AES-128 (16-byte), AES-192 (24-byte) and AES-256 (32-byte).** Anything else
   returns `error.UnsupportedKeyLength`. Zig 0.17's `std.crypto.core.aes` ships only
   `Aes128`/`Aes256` (`aes.zig:27-28`); the 24-byte arm of `encBlock`/`decBlock` runs on the sibling `aes192`
@@ -123,7 +125,7 @@ XML-Enc `EncryptedKey`, a JOSE `A128KW`/`A256KW` Encrypted Key) — `unwrap` nev
 ciphertext's length or content, rejects malformed shapes before touching AES, and fails closed
 without a plaintext-derived timing or content leak. Not covered: key derivation/agreement (how
 the KEK itself was established — out of this module's scope, same posture as RFC 3394 itself),
-and RFC 5649 padding (see "Scope" above).
+
 
 ## Anchoring
 
@@ -146,5 +148,5 @@ wipe on a KEK-width error in `unwrap` (the output then holds only a copy of the 
 
 ## Backlog / deferred
 
-- **(survey 2026-09-30) RFC 5649 AES Key Wrap with Padding (`wrapPad`/`unwrapPad`)** — RustCrypto `aes-kw` and OpenSSL both ship it; it is what KMIP/PKCS#11/CMS key-wrap uses for key data that is not an 8-byte multiple. Additive on top of the existing core (see *Scope*). Effort: small–medium (alternative IV, padding, the n=1 single-block special case, KATs from RFC 5649 §6). Fits §2: yes.
+- ✅ DONE 2026-11-16: `wrapPad`/`unwrapPad` (RFC 5649, §6 KATs, all KEK widths, constant-time verdict, refuses empty plaintext). Not yet extended: fuzz/ctgrind/stackprobe harness rows for the padded pair. ~~**(survey 2026-09-30) RFC 5649 AES Key Wrap with Padding (`wrapPad`/`unwrapPad`)** — RustCrypto `aes-kw` and OpenSSL both ship it; it is what KMIP/PKCS#11/CMS key-wrap uses for key data that is not an 8-byte multiple. Additive on top of the existing core (see *Scope*). Effort: small–medium (alternative IV, padding, the n=1 single-block special case, KATs from RFC 5649 §6). Fits §2: yes.~~
 - ~~**AES-192 KEK** is blocked on `std` (no `Aes192`)~~ — done 2026-10-10 over the `aes192` module (RFC 3394 §4.2/§4.4 KATs, fuzz harnesses and ctgrind row extended to three KEK widths).

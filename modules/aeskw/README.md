@@ -46,6 +46,9 @@ pub const Error = error{
 
 pub fn wrap(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8;
 pub fn unwrap(kek: []const u8, ciphertext: []const u8, out: []u8) Error![]u8;
+// RFC 5649 (with padding): any key length 1..2^32-1; empty plaintext is InvalidLength.
+pub fn wrapPad(kek: []const u8, plaintext: []const u8, out: []u8) Error![]u8;   // out >= 8*ceil(len/8) + 8
+pub fn unwrapPad(kek: []const u8, ciphertext: []const u8, out: []u8) Error![]u8; // out >= ciphertext.len - 8; returns the MLI bytes
 ```
 
 `wrap`: `plaintext.len` must be a multiple of 8 and `>= 16`; writes `plaintext.len + 8` bytes to
@@ -67,8 +70,7 @@ single-bit-corrupted ciphertext) each proven `error.Unauthentic` with an all-zer
 same-shape correct-KEK positive control; length/KEK-width validation with positive controls at
 the exact 16-/24-byte boundaries. See `SPEC.md` for the full breakdown.
 
-## Deferred (not implemented)
+## RFC 5649
 
-- **RFC 5649** (AES Key Wrap with Padding, for key data that isn't an 8-byte multiple) — no
-  in-repo consumer needs it; see `SPEC.md` "Scope" for why adding it later is additive, not a
-  breaking change to this module's `wrap`/`unwrap`.
+`wrapPad`/`unwrapPad` implement AES Key Wrap with Padding (key data of any length, IV
+`A65959A6 || MLI`); anchored on RFC 5649 §6 (20- and 7-byte key data). See `SPEC.md` "Scope".
