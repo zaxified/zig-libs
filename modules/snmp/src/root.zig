@@ -147,11 +147,13 @@ pub const Transport = client_mod.Transport;
 pub const TransportError = client_mod.TransportError;
 pub const UdpTransport = client_mod.UdpTransport;
 pub const Walker = client_mod.Walker;
+pub const BulkWalker = client_mod.BulkWalker;
 
 /// SNMPv3/USM manager over the same `Transport` seam as `Client`:
 /// noAuthNoPriv / authNoPriv / authPriv, engine discovery, Report handling.
 pub const V3Client = v3client_mod.V3Client;
 pub const V3Walker = v3client_mod.Walker;
+pub const V3BulkWalker = v3client_mod.BulkWalker;
 pub const SecurityLevel = v3client_mod.SecurityLevel;
 pub const User = v3client_mod.User;
 pub const EngineState = v3client_mod.EngineState;

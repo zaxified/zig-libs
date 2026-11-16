@@ -56,12 +56,26 @@ pub const Client = struct {
     transport: Transport,
     version: message.Version,
     next_request_id: i32,
+    /// Re-sends of one request after a per-try `error.Timeout` (or after a
+    /// reply carrying another request id). See `Options.retries`.
+    retries: u8,
     request_buf: [max_message_len]u8 = undefined,
     reply_buf: [max_message_len]u8 = undefined,
 
     pub const Options = struct {
         version: message.Version = .v2c,
         initial_request_id: i32 = 1,
+        /// How many times a request is re-sent (same request id) after the
+        /// transport reports `error.Timeout`, or after a reply with another
+        /// request id arrives; total tries = `retries + 1`. The per-try
+        /// timeout is the transport's own (`UdpTransport.Options.timeout`).
+        /// Default 5, net-snmp's default (`-r 5`; its default timeout is
+        /// 1 s, which the caller sets on the transport: `UdpTransport`
+        /// itself defaults to `.none`, i.e. it blocks, so no retry ever
+        /// happens until a timeout is set). Because the id is reused, a late
+        /// reply to an earlier try is accepted by a later try. Set 0 for the
+        /// old single-shot behaviour.
+        retries: u8 = 5,
     };
 
     pub const Error = TransportError || message.DecodeError || message.EncodeError ||
@@ -78,6 +92,7 @@ pub const Client = struct {
             .transport = transport,
             .version = options.version,
             .next_request_id = options.initial_request_id,
+            .retries = options.retries,
         };
     }
 
@@ -114,6 +129,24 @@ pub const Client = struct {
         return .{ .client = c, .community = community, .root = root, .current = root };
     }
 
+    /// GetBulk-driven subtree walk (v2c only; on a v1 client `next` returns
+    /// `error.UnsupportedPdu`). Uses `default_max_repetitions`.
+    pub fn bulkWalker(c: *Client, community: []const u8, root: Oid) BulkWalker {
+        return c.bulkWalkerWith(community, root, default_max_repetitions);
+    }
+
+    /// As `bulkWalker` with an explicit max-repetitions (>= 1; 0 makes `next`
+    /// return `error.InvalidMaxRepetitions`).
+    pub fn bulkWalkerWith(c: *Client, community: []const u8, root: Oid, max_repetitions: u16) BulkWalker {
+        return .{
+            .client = c,
+            .community = community,
+            .root = root,
+            .current = root,
+            .max_repetitions = max_repetitions,
+        };
+    }
+
     fn nullVarBindRequest(
         c: *Client,
         pdu_type: message.PduType,
@@ -144,18 +177,36 @@ pub const Client = struct {
             .error_index = f2,
             .varbinds = varbinds,
         });
-        const reply = try c.transport.exchange(wire, &c.reply_buf);
-        const msg = try message.decode(reply);
-        const pdu = switch (msg.pdu) {
-            .response => |p| p,
-            else => return error.UnexpectedPduType,
-        };
-        if (pdu.request_id != rid) return error.RequestIdMismatch;
-        return .{
-            .error_status = pdu.error_status,
-            .error_index = pdu.error_index,
-            .varbinds = pdu.varbinds,
-        };
+        // Retry loop: only a Timeout or a stale-id reply is retried; every
+        // other failure (transport error, cancel, undecodable bytes, wrong
+        // PDU type) is returned at once. After the last try the error of
+        // that try is returned.
+        var last: Error = error.Timeout;
+        var attempt: u32 = 0;
+        while (attempt <= c.retries) : (attempt += 1) {
+            const reply = c.transport.exchange(wire, &c.reply_buf) catch |err| switch (err) {
+                error.Timeout => {
+                    last = error.Timeout;
+                    continue;
+                },
+                else => return err,
+            };
+            const msg = try message.decode(reply);
+            const pdu = switch (msg.pdu) {
+                .response => |p| p,
+                else => return error.UnexpectedPduType,
+            };
+            if (pdu.request_id != rid) {
+                last = error.RequestIdMismatch;
+                continue;
+            }
+            return .{
+                .error_status = pdu.error_status,
+                .error_index = pdu.error_index,
+                .varbinds = pdu.varbinds,
+            };
+        }
+        return last;
     }
 
     fn allocRequestId(c: *Client) i32 {
@@ -212,6 +263,67 @@ pub const Walker = struct {
         }
         w.current = vb.name;
         return vb;
+    }
+};
+
+/// Default GETBULK max-repetitions for `bulkWalker`; net-snmp's
+/// `snmpbulkwalk -Cr` default.
+pub const default_max_repetitions: u16 = 10;
+
+/// GetBulk-driven subtree iterator: one round trip yields up to
+/// `max_repetitions` rows. Same stop rules as `Walker` (end of the subtree,
+/// endOfMibView, noSuchName, an empty reply) plus the loop guard: a name that
+/// is not strictly greater than the previous one is `error.OidNotIncreasing`.
+/// A yielded varbind is valid until the walker's next step that fetches.
+pub const BulkWalker = struct {
+    client: *Client,
+    community: []const u8,
+    root: Oid,
+    current: Oid,
+    max_repetitions: u16,
+    batch: ?message.VarBindList.Iterator = null,
+    batch_yielded: bool = false,
+    finished: bool = false,
+
+    pub const Error = Client.Error || error{ OidNotIncreasing, RequestFailed, InvalidMaxRepetitions };
+
+    // secret-api-ok: iterator over `Client.getBulk`; a v1/v2c community string travels in clear by design (no key derivation or cipher here).
+    pub fn next(w: *BulkWalker) BulkWalker.Error!?VarBind {
+        return w.step() catch |err| {
+            w.finished = true; // never loop on a failing agent
+            return err;
+        };
+    }
+
+    fn step(w: *BulkWalker) BulkWalker.Error!?VarBind {
+        while (true) {
+            if (w.finished) return null;
+            if (w.batch == null) {
+                if (w.max_repetitions == 0) return error.InvalidMaxRepetitions;
+                const resp = try w.client.getBulk(w.community, 0, w.max_repetitions, &.{w.current});
+                if (resp.error_status == .no_such_name) {
+                    w.finished = true;
+                    return null;
+                }
+                if (resp.error_status != .no_error) return error.RequestFailed;
+                w.batch = resp.varbinds.iterator();
+                w.batch_yielded = false;
+            }
+            const vb = (try w.batch.?.next()) orelse {
+                // Batch used up. An empty batch means nothing follows.
+                if (!w.batch_yielded) w.finished = true;
+                w.batch = null;
+                continue;
+            };
+            if (vb.value == .end_of_mib_view or !vb.name.startsWith(&w.root)) {
+                w.finished = true;
+                return null;
+            }
+            if (vb.name.order(&w.current) != .gt) return error.OidNotIncreasing;
+            w.current = vb.name;
+            w.batch_yielded = true;
+            return vb;
+        }
     }
 };
 
@@ -530,6 +642,212 @@ test "walk detects a non-advancing agent -> OidNotIncreasing" {
     var w = client.walker("public", try Oid.parse("1.3.6.1.2.1.2.2.1.2"));
     _ = try w.next(); // first result (root -> .1) is fine
     try testing.expectError(error.OidNotIncreasing, w.next());
+}
+
+/// Scripted transport for retry tests: per call, either time out, answer
+/// with a wrong id, or answer properly (echoing the request's id).
+const RetryAgent = struct {
+    const Act = enum { timeout, wrong_id, ok, canceled };
+    script: []const Act,
+    calls: usize = 0,
+    ids: [16]i32 = undefined,
+    wires_equal: bool = true,
+    first_wire: [256]u8 = undefined,
+    first_len: usize = 0,
+
+    fn exchangeFn(ctx: *anyopaque, request: []const u8, reply_buf: []u8) TransportError!usize {
+        const a: *RetryAgent = @ptrCast(@alignCast(ctx));
+        const act = a.script[@min(a.calls, a.script.len - 1)];
+        const msg = message.decode(request) catch return error.TransportFailed;
+        const rid = msg.pdu.get_request.request_id;
+        a.ids[a.calls] = rid;
+        if (a.calls == 0) {
+            @memcpy(a.first_wire[0..request.len], request);
+            a.first_len = request.len;
+        } else if (!std.mem.eql(u8, a.first_wire[0..a.first_len], request)) a.wires_equal = false;
+        a.calls += 1;
+        switch (act) {
+            .timeout => return error.Timeout,
+            .canceled => return error.Canceled,
+            .wrong_id, .ok => {},
+        }
+        var it = msg.pdu.get_request.varbinds.iterator();
+        const asked = (it.next() catch return error.TransportFailed) orelse return error.TransportFailed;
+        const vbs = [_]VarBind{.{ .name = asked.name, .value = .{ .integer = 7 } }};
+        const out = message.encode(reply_buf, msg.version, msg.community, .{
+            .type = .response,
+            .request_id = if (act == .wrong_id) rid +% 1 else rid,
+            .varbinds = &vbs,
+        }) catch return error.TransportFailed;
+        std.mem.copyForwards(u8, reply_buf[0..out.len], out);
+        return out.len;
+    }
+};
+
+fn retryClient(a: *RetryAgent, retries: u8) Client {
+    return Client.init(.{ .ctx = a, .exchangeFn = RetryAgent.exchangeFn }, .{ .retries = retries });
+}
+
+test "retry: default is net-snmp's 5 retries" {
+    var a: RetryAgent = .{ .script = &.{.ok} };
+    try testing.expectEqual(@as(u8, 5), retryClient(&a, 5).retries);
+    try testing.expectEqual(@as(u8, 5), Client.init(.{ .ctx = &a, .exchangeFn = RetryAgent.exchangeFn }, .{}).retries);
+}
+
+test "retry: timeouts re-send the identical request (same id) until a reply arrives" {
+    var a: RetryAgent = .{ .script = &.{ .timeout, .timeout, .ok } };
+    var c = retryClient(&a, 5);
+    const resp = try c.get("public", &.{try Oid.parse("1.3.6.1.2.1.1.1.0")});
+    try testing.expectEqual(@as(usize, 3), a.calls);
+    try testing.expectEqual(a.ids[0], a.ids[1]);
+    try testing.expectEqual(a.ids[0], a.ids[2]);
+    try testing.expect(a.wires_equal);
+    var it = resp.varbinds.iterator();
+    try testing.expectEqual(@as(i32, 7), (try it.next()).?.value.integer);
+    // The next request gets a fresh id.
+    try testing.expectEqual(a.ids[0] + 1, c.next_request_id);
+}
+
+test "retry: exhausted retries -> Timeout after retries + 1 tries" {
+    var a: RetryAgent = .{ .script = &.{.timeout} };
+    var c = retryClient(&a, 3);
+    try testing.expectError(error.Timeout, c.get("public", &.{try Oid.parse("1.3.6.1.2.1.1.1.0")}));
+    try testing.expectEqual(@as(usize, 4), a.calls);
+
+    var a0: RetryAgent = .{ .script = &.{.timeout} };
+    var c0 = retryClient(&a0, 0);
+    try testing.expectError(error.Timeout, c0.get("public", &.{try Oid.parse("1.3.6.1.2.1.1.1.0")}));
+    try testing.expectEqual(@as(usize, 1), a0.calls);
+}
+
+test "retry: a reply with another id is ignored, the next try can succeed" {
+    var a: RetryAgent = .{ .script = &.{ .wrong_id, .ok } };
+    var c = retryClient(&a, 5);
+    _ = try c.get("public", &.{try Oid.parse("1.3.6.1.2.1.1.1.0")});
+    try testing.expectEqual(@as(usize, 2), a.calls);
+
+    // Only wrong ids until the budget ends: the mismatch is reported.
+    var b: RetryAgent = .{ .script = &.{.wrong_id} };
+    var cb = retryClient(&b, 2);
+    try testing.expectError(error.RequestIdMismatch, cb.get("public", &.{try Oid.parse("1.3.6.1.2.1.1.1.0")}));
+    try testing.expectEqual(@as(usize, 3), b.calls);
+}
+
+test "retry: Canceled and transport failures are never retried" {
+    var a: RetryAgent = .{ .script = &.{.canceled} };
+    var c = retryClient(&a, 5);
+    try testing.expectError(error.Canceled, c.get("public", &.{try Oid.parse("1.3.6.1.2.1.1.1.0")}));
+    try testing.expectEqual(@as(usize, 1), a.calls);
+}
+
+/// GETBULK semantics over a sorted table: up to max_repetitions successors
+/// of the single asked OID; an exhausted table ends with endOfMibView.
+const BulkAgent = struct {
+    table: []const VarBind,
+    calls: usize = 0,
+    last_max_rep: u32 = 0,
+    /// Debug knob: ignore the asked OID and always start at table[0].
+    stuck: bool = false,
+
+    fn transport(a: *BulkAgent) Transport {
+        return .{ .ctx = a, .exchangeFn = exchangeFn };
+    }
+
+    fn exchangeFn(ctx: *anyopaque, request: []const u8, reply_buf: []u8) TransportError!usize {
+        const a: *BulkAgent = @ptrCast(@alignCast(ctx));
+        const msg = message.decode(request) catch return error.TransportFailed;
+        const pdu = switch (msg.pdu) {
+            .get_bulk_request => |p| p,
+            else => return error.TransportFailed,
+        };
+        a.calls += 1;
+        a.last_max_rep = pdu.max_repetitions;
+        var it = pdu.varbinds.iterator();
+        const asked = (it.next() catch return error.TransportFailed) orelse return error.TransportFailed;
+        var out_vbs: [64]VarBind = undefined;
+        var n: usize = 0;
+        for (a.table) |*entry| {
+            if (n >= pdu.max_repetitions) break;
+            if (a.stuck or entry.name.order(&asked.name) == .gt) {
+                out_vbs[n] = entry.*;
+                n += 1;
+            }
+        }
+        if (n == 0) {
+            out_vbs[0] = .{ .name = asked.name, .value = .end_of_mib_view };
+            n = 1;
+        }
+        const out = message.encode(reply_buf, msg.version, msg.community, .{
+            .type = .response,
+            .request_id = pdu.request_id,
+            .varbinds = out_vbs[0..n],
+        }) catch return error.TransportFailed;
+        std.mem.copyForwards(u8, reply_buf[0..out.len], out);
+        return out.len;
+    }
+};
+
+fn bigTable() ![6]VarBind {
+    return .{
+        .{ .name = try Oid.parse("1.3.6.1.2.1.2.2.1.2.1"), .value = .{ .octet_string = "a" } },
+        .{ .name = try Oid.parse("1.3.6.1.2.1.2.2.1.2.2"), .value = .{ .octet_string = "b" } },
+        .{ .name = try Oid.parse("1.3.6.1.2.1.2.2.1.2.3"), .value = .{ .octet_string = "c" } },
+        .{ .name = try Oid.parse("1.3.6.1.2.1.2.2.1.2.4"), .value = .{ .octet_string = "d" } },
+        .{ .name = try Oid.parse("1.3.6.1.2.1.2.2.1.2.5"), .value = .{ .octet_string = "e" } },
+        .{ .name = try Oid.parse("1.3.6.1.2.1.31.1.1.1.1.1"), .value = .{ .octet_string = "x" } },
+    };
+}
+
+test "bulkWalker: batches rows, stops at the subtree end with fewer round trips" {
+    const table = try bigTable();
+    var agent: BulkAgent = .{ .table = &table };
+    var client = Client.init(agent.transport(), .{});
+    var w = client.bulkWalkerWith("public", try Oid.parse("1.3.6.1.2.1.2.2.1.2"), 3);
+    var seen: usize = 0;
+    while (try w.next()) |vb| {
+        seen += 1;
+        try testing.expect(vb.value == .octet_string);
+    }
+    try testing.expectEqual(@as(usize, 5), seen);
+    try testing.expectEqual(@as(u32, 3), agent.last_max_rep);
+    // 5 rows in the subtree: batch of 3, batch (2 + one foreign row ends it).
+    try testing.expectEqual(@as(usize, 2), agent.calls);
+    try testing.expectEqual(@as(?VarBind, null), try w.next()); // stays finished
+}
+
+test "bulkWalker: default max-repetitions; ends on endOfMibView and empty subtree" {
+    const table = try bigTable();
+    var agent: BulkAgent = .{ .table = table[5..] };
+    var client = Client.init(agent.transport(), .{});
+    var w = client.bulkWalker("public", try Oid.parse("1.3.6.1.2.1.31"));
+    try testing.expect((try w.next()) != null);
+    try testing.expectEqual(@as(?VarBind, null), try w.next()); // endOfMibView
+    try testing.expectEqual(@as(u32, default_max_repetitions), agent.last_max_rep);
+
+    // Nothing under the root at all: first batch's endOfMibView ends it.
+    var w2 = client.bulkWalker("public", try Oid.parse("1.3.6.1.4.1"));
+    try testing.expectEqual(@as(?VarBind, null), try w2.next());
+}
+
+test "bulkWalker: non-increasing agent -> OidNotIncreasing; v1 and zero repetitions rejected" {
+    const table = try bigTable();
+    var agent: BulkAgent = .{ .table = &table, .stuck = true };
+    var client = Client.init(agent.transport(), .{});
+    var w = client.bulkWalkerWith("public", try Oid.parse("1.3.6.1.2.1.2.2.1.2"), 2);
+    // First batch (a, b) is fine; the second restarts at a -> not increasing.
+    try testing.expect((try w.next()) != null);
+    try testing.expect((try w.next()) != null);
+    try testing.expectError(error.OidNotIncreasing, w.next());
+    try testing.expectEqual(@as(?VarBind, null), try w.next()); // no further loop
+
+    var v1 = Client.init(agent.transport(), .{ .version = .v1 });
+    var w1 = v1.bulkWalker("public", try Oid.parse("1.3.6.1.2.1.2.2.1.2"));
+    try testing.expectError(error.UnsupportedPdu, w1.next());
+
+    var w0 = client.bulkWalkerWith("public", try Oid.parse("1.3.6.1.2.1.2.2.1.2"), 0);
+    const calls_before = agent.calls;
+    try testing.expectError(error.InvalidMaxRepetitions, w0.next());
+    try testing.expectEqual(calls_before, agent.calls);
 }
 
 test "UdpTransport compiles (never sends in tests)" {

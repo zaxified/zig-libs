@@ -34,8 +34,9 @@ network-device management work (alongside `netlink`, `nftables`, `icmp`).
   - **Client** (`Client`): manager behind a `Transport` seam ("send request
     bytes, receive reply bytes"), so everything is offline-testable —
     `get`, `getNext`, `getBulk` (v2c), `set`, request-id allocation and
-    matching, error-status surfacing, and a GetNext `walker` with subtree,
-    endOfMibView/noSuchName, and OID-not-increasing guards. `UdpTransport`
+    matching, error-status surfacing, a retry policy (`Options.retries`, default 5, same id re-sent on timeout), and a GetNext `walker` and a
+    GETBULK `bulkWalker` with subtree, endOfMibView/noSuchName, and
+    OID-not-increasing guards. `UdpTransport`
     is an optional real `std.Io.net` adapter (UDP/161); tests never send.
   - **SNMPv3 framing** (`v3`): the RFC 3412 message envelope
     (`msgID` / `msgMaxSize` / `msgFlags` / `msgSecurityModel`), the opaque
@@ -90,7 +91,7 @@ network-device management work (alongside `netlink`, `nftables`, `icmp`).
     discovery** handshake exposed as a public `discover` (plus `seedEngine` for
     a caller-driven or cached identity); one RFC-sanctioned retry after a
     recoverable Report; downgrade rejection; `get`/`getNext`/`getBulk`/`set`
-    and a v3 `walker`. Makes no time-of-day calls — a stale clock self-corrects
+    a v3 `walker` and `bulkWalker`. Makes no time-of-day calls — a stale clock self-corrects
     from the engine's authenticated `notInTimeWindows` Report.
   - **DES note.** Zig's `std.crypto` has no DES, so this module carries its own
     (`des.zig`, from FIPS 46-3). It is provided **for interop with legacy
