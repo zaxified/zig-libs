@@ -29,9 +29,10 @@
 //! `ParseError`, never a panic, OOB read, hang, or amplified allocation.
 //!
 //! Scheme coverage: the master public key is decoded and `KeyValidate`d
-//! (on-curve + order-`r` subgroup + non-identity) for the two verifiable
+//! (on-curve + order-`r` subgroup + non-identity) for the verifiable
 //! schemes: into a `G2` point (`pubkey_g2`, 96-byte compressed) for
-//! quicknet's `bls-unchained-g1-rfc9380`, and into a `G1` point
+//! quicknet's `bls-unchained-g1-rfc9380` and the deprecated
+//! `bls-unchained-on-g1` (same key group), and into a `G1` point
 //! (`pubkey_g1`, 48-byte compressed) for the chained default network's
 //! `pedersen-bls-chained`. Other schemes still parse (metadata, hash,
 //! period, raw key bytes) but leave both points `null`;
@@ -117,8 +118,10 @@ pub const Scheme = enum {
     /// `G2` `..._NUL_` DST. Verified (`verify.verifyChainedRoundPoints`).
     pedersen_bls_chained,
     /// `bls-unchained-on-g1` — the deprecated pre-RFC-9380 unchained
-    /// scheme (reuses the `G2` DST for `G1` hashing — a known
-    /// non-conformance). Recognized, not verified.
+    /// scheme: same shape as quicknet (signatures in `G1`, key in `G2`,
+    /// message `SHA-256(round_be)`) but hashed to `G1` under the `G2`
+    /// `..._NUL_` DST — a known non-conformance kept for old networks.
+    /// Verified (`verify.verifyDeprecatedUnchainedPoints`).
     bls_unchained_on_g1,
     /// Any other / unknown `schemeID` string.
     other,
@@ -132,10 +135,11 @@ pub const Scheme = enum {
     }
 
     /// True iff this module can BLS-verify a round under this scheme
-    /// (quicknet or the chained default network). `verify.verifyRound`
-    /// returns `error.UnsupportedScheme` for any scheme where this is false.
+    /// (quicknet, the chained default network or the deprecated
+    /// `bls-unchained-on-g1`). `verify.verifyRound` returns
+    /// `error.UnsupportedScheme` for any scheme where this is false.
     pub fn isVerifiable(self: Scheme) bool {
-        return self == .unchained_g1_rfc9380 or self == .pedersen_bls_chained;
+        return self == .unchained_g1_rfc9380 or self == .pedersen_bls_chained or self == .bls_unchained_on_g1;
     }
 };
 
@@ -279,7 +283,7 @@ pub fn parseInfo(gpa: std.mem.Allocator, bytes: []const u8) ParseError!ChainInfo
     var pubkey_g2: ?g2.Affine = null;
     var pubkey_g1: ?g1.Affine = null;
     switch (scheme) {
-        .unchained_g1_rfc9380 => {
+        .unchained_g1_rfc9380, .bls_unchained_on_g1 => {
             if (pubkey_nbytes != g2.compressed_bytes) return error.InvalidLength;
             // drand KeyValidate: reject identity and non-subgroup keys (the
             // decoder checks the subgroup).
@@ -300,7 +304,7 @@ pub fn parseInfo(gpa: std.mem.Allocator, bytes: []const u8) ParseError!ChainInfo
             if (pt.infinity) return error.InvalidPoint;
             pubkey_g1 = pt;
         },
-        .bls_unchained_on_g1, .other => {},
+        .other => {},
     }
 
     // No chain has period 0; refusing it here keeps `expectedRound` total.
@@ -588,7 +592,7 @@ test "parseInfo: quicknet leaves pubkey_g1 null; an unverifiable scheme decodes 
     try testing.expect(qn.pubkey_g1 == null);
     // Same chain fields, scheme relabelled: the label is not hashed, so the
     // document parses, and no point is decoded for a scheme we cannot verify.
-    const relabelled = try std.mem.replaceOwned(u8, testing.allocator, chained_default_info_json, "pedersen-bls-chained", "bls-unchained-on-g1");
+    const relabelled = try std.mem.replaceOwned(u8, testing.allocator, chained_default_info_json, "pedersen-bls-chained", "no-such-scheme");
     defer testing.allocator.free(relabelled);
     const other = try parseInfo(testing.allocator, relabelled);
     try testing.expect(other.pubkey_g1 == null and other.pubkey_g2 == null);

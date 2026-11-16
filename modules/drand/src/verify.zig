@@ -69,8 +69,9 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const VerifyError = error{
     /// The chain's scheme is not one this module can verify (quicknet
-    /// `bls-unchained-g1-rfc9380` and the chained default network's
-    /// `pedersen-bls-chained` are supported).
+    /// `bls-unchained-g1-rfc9380`, the chained default network's
+    /// `pedersen-bls-chained` and the deprecated `bls-unchained-on-g1`
+    /// are supported).
     UnsupportedScheme,
     /// The `ChainInfo` and `Round` disagree on the signature group
     /// (e.g. a `G2`-signature chained round against a quicknet chain, or
@@ -126,6 +127,32 @@ comptime {
 pub fn verifyRoundPoints(pubkey: g2.Affine, round: u64, sig: g1.Affine) bool {
     const msg = ciphersuite.beaconId(round);
     return QuicknetSuite.verify(.{ .point = pubkey }, &msg, .{ .point = sig });
+}
+
+/// The DST the deprecated `bls-unchained-on-g1` hashes its message to `G1`
+/// under: the `G2` ciphersuite's `_NUL_` tag — a known non-conformance of
+/// that scheme (RFC 9380 wants a `G1` tag for a `G1` hash), kept by
+/// drand/kyber and drand-client for old networks. Everything else is
+/// quicknet's: signature in `G1`, key in `G2`, message
+/// `beaconId(round) = SHA-256(u64be(round))`.
+pub const deprecated_unchained_dst = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+
+comptime {
+    // It really is the G2 tag, and really differs from quicknet's G1 tag.
+    std.debug.assert(std.mem.eql(u8, deprecated_unchained_dst, bls12_381.scheme.MinPkBasic.dst_sig));
+    std.debug.assert(!std.mem.eql(u8, deprecated_unchained_dst, QuicknetSuite.dst_sig));
+}
+
+/// The BLS verification of one `bls-unchained-on-g1` round on
+/// already-decoded points: `QuicknetSuite`'s equation and `KeyValidate`
+/// of both operands (run by `coreAggregateVerify`), but with the message
+/// hashed to `G1` under `deprecated_unchained_dst`. `false` on any
+/// refusal.
+pub fn verifyDeprecatedUnchainedPoints(pubkey: g2.Affine, round: u64, sig: g1.Affine) bool {
+    const msg = ciphersuite.beaconId(round);
+    const pks = [_]QuicknetSuite.PublicKey{.{ .point = pubkey }};
+    const msgs = [_][]const u8{&msg};
+    return QuicknetSuite.coreAggregateVerify(&pks, &msgs, .{ .point = sig }, deprecated_unchained_dst) catch false;
 }
 
 /// The DST `pedersen-bls-chained` hashes its digest to `G2` under: the
@@ -199,7 +226,13 @@ pub fn verifyRound(info: *const ChainInfo, round: *const Round) VerifyError!void
             if (!verifyChainedRoundPoints(pubkey, round.round, round.previousSignatureBytes(), sig))
                 return error.InvalidSignature;
         },
-        .bls_unchained_on_g1, .other => return error.UnsupportedScheme,
+        .bls_unchained_on_g1 => {
+            const pubkey = info.pubkey_g2 orelse return error.MissingPublicKey;
+            if (round.sig_len != g1.compressed_bytes) return error.SchemeGroupMismatch;
+            const sig = round.sig_g1 orelse return error.MissingSignature;
+            if (!verifyDeprecatedUnchainedPoints(pubkey, round.round, sig)) return error.InvalidSignature;
+        },
+        .other => return error.UnsupportedScheme,
     }
 
     // drand: randomness = SHA-256(signature). Check it when present.
@@ -378,11 +411,11 @@ test "verifyRound: hand-built values without the scheme's points → MissingPubl
     try testing.expectError(error.MissingPublicKey, verifyRound(&info, &rnd));
 }
 
-test "verifyRound: an unsupported scheme (bls-unchained-on-g1, unknown) → UnsupportedScheme" {
+test "verifyRound: an unsupported scheme (unknown label) → UnsupportedScheme" {
     // The chained default document relabelled: the label is not hashed, so
     // it parses, and no point is decoded for a scheme this module does not
     // verify.
-    for ([_][]const u8{ "bls-unchained-on-g1", "no-such-scheme" }) |label| {
+    for ([_][]const u8{"no-such-scheme"}) |label| {
         const doc = try std.mem.replaceOwned(u8, testing.allocator, chaininfo.chained_default_info_json, "pedersen-bls-chained", label);
         defer testing.allocator.free(doc);
         const info = try chaininfo.parseInfo(testing.allocator, doc);
@@ -391,6 +424,137 @@ test "verifyRound: an unsupported scheme (bls-unchained-on-g1, unknown) → Unsu
         const crnd = try round_mod.parseRound(testing.allocator, chained_round_1000000_json);
         try testing.expectError(error.UnsupportedScheme, verifyRound(&info, &crnd));
     }
+}
+
+// ── bls-unchained-on-g1: the deprecated non-conformant DST ────────────
+//
+// ⚠ NO EXTERNAL ANCHOR. The repository holds no genuine beacon of a
+// `bls-unchained-on-g1` network, and none is invented here: these are
+// SELF-CONSISTENCY tests. A known secret scalar signs `beaconId(round)`
+// through `bls12_381.hash_to_curve` (the reference hash-to-`G1` with a
+// caller-chosen DST) and a scalar multiply; verification goes through
+// `verifyRound`. They pin the construction as drand's source states it
+// (signature `G1`, key `G2`, message `SHA-256(u64be(round))`, hashed under
+// the `G2` `_NUL_` tag) and that the deprecated and RFC 9380 DSTs really
+// differ, but cannot catch a misreading of drand shared by test and code.
+
+const deprecated_sk_be: [32]u8 = blk: {
+    var b: [32]u8 = @splat(0);
+    b[24..].* = .{ 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf1 };
+    break :blk b;
+};
+
+fn deprecatedPublicKey() g2.Affine {
+    return g2.Jacobian.fromAffine(g2.Affine.generator).scalarMulBytes(&deprecated_sk_be).toAffine();
+}
+
+/// `sk * H(beaconId(round), dst)` — a BLS signature in `G1` under `dst`.
+fn signUnchainedG1(round: u64, dst: []const u8) g1.Affine {
+    const h = bls12_381.hash_to_curve.hashToCurveG1(&ciphersuite.beaconId(round), dst);
+    return g1.Jacobian.fromAffine(h).scalarMulBytes(&deprecated_sk_be).toAffine();
+}
+
+fn deprecatedRound(gpa: std.mem.Allocator, round: u64, sig: g1.Affine) !Round {
+    const sig_hex = std.fmt.bytesToHex(g1.toBytesCompressed(sig), .lower);
+    const doc = try gpa.print("{{\"round\":{d},\"signature\":\"{s}\"}}", .{ round, sig_hex });
+    defer gpa.free(doc);
+    return round_mod.parseRound(gpa, doc);
+}
+
+/// A `bls-unchained-on-g1` chain on the known key: quicknet's `/info`
+/// relabelled (the label is not hashed, so it parses and decodes the `G2`
+/// key), the decoded key then swapped for `deprecatedPublicKey()`.
+fn deprecatedInfo() !ChainInfo {
+    const doc = try std.mem.replaceOwned(u8, testing.allocator, quicknet_info_json, "bls-unchained-g1-rfc9380", "bls-unchained-on-g1");
+    defer testing.allocator.free(doc);
+    var info = try chaininfo.parseInfo(testing.allocator, doc);
+    try testing.expectEqual(chaininfo.Scheme.bls_unchained_on_g1, info.scheme);
+    try testing.expect(info.scheme.isVerifiable());
+    try testing.expect(info.pubkey_g2 != null); // same key group as quicknet
+    info.pubkey_g2 = deprecatedPublicKey();
+    return info;
+}
+
+test "bls-unchained-on-g1: the deprecated DST is the G2 tag and differs from the RFC 9380 G1 tag" {
+    try testing.expectEqualStrings("BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_", deprecated_unchained_dst);
+    try testing.expectEqualStrings("BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_", QuicknetSuite.dst_sig);
+    // And they hash to different G1 points, so a signature cannot serve both.
+    const m = ciphersuite.beaconId(1000);
+    const a = bls12_381.hash_to_curve.hashToCurveG1(&m, deprecated_unchained_dst);
+    const b = bls12_381.hash_to_curve.hashToCurveG1(&m, QuicknetSuite.dst_sig);
+    try testing.expect(!std.mem.eql(u8, &g1.toBytesCompressed(a), &g1.toBytesCompressed(b)));
+}
+
+test "bls-unchained-on-g1: a self-signed round under the deprecated DST verifies" {
+    const info = try deprecatedInfo();
+    for ([_]u64{ 1, 1000, 1 << 33 }) |r| {
+        const rnd = try deprecatedRound(testing.allocator, r, signUnchainedG1(r, deprecated_unchained_dst));
+        try verifyRound(&info, &rnd);
+        try testing.expect(verifyDeprecatedUnchainedPoints(deprecatedPublicKey(), r, rnd.sig_g1.?));
+    }
+    // With a correct randomness field the extra check passes too.
+    var rnd = try deprecatedRound(testing.allocator, 7, signUnchainedG1(7, deprecated_unchained_dst));
+    var digest: [32]u8 = undefined;
+    Sha256.hash(rnd.signatureBytes(), &digest, .{});
+    rnd.randomness = digest;
+    try verifyRound(&info, &rnd);
+    rnd.randomness.?[0] ^= 1;
+    try testing.expectError(error.RandomnessMismatch, verifyRound(&info, &rnd));
+}
+
+test "bls-unchained-on-g1: wrong round, wrong key and a flipped signature are refused" {
+    const info = try deprecatedInfo();
+    var rnd = try deprecatedRound(testing.allocator, 1000, signUnchainedG1(1000, deprecated_unchained_dst));
+    try verifyRound(&info, &rnd); // control
+    // Wrong round.
+    rnd.round = 1001;
+    try testing.expectError(error.InvalidSignature, verifyRound(&info, &rnd));
+    rnd.round = 1000;
+    // Wrong key (quicknet's real key).
+    const qn = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
+    var other = info;
+    other.pubkey_g2 = qn.pubkey_g2;
+    try testing.expectError(error.InvalidSignature, verifyRound(&other, &rnd));
+    // Flipped signature: refused at parse (off curve / out of subgroup) or at verify, never accepted.
+    var bytes = g1.toBytesCompressed(rnd.sig_g1.?);
+    bytes[47] ^= 0x01;
+    const doc = try testing.allocator.print("{{\"round\":1000,\"signature\":\"{s}\"}}", .{std.fmt.bytesToHex(bytes, .lower)});
+    defer testing.allocator.free(doc);
+    if (round_mod.parseRound(testing.allocator, doc)) |bad| {
+        try testing.expectError(error.InvalidSignature, verifyRound(&info, &bad));
+    } else |err| {
+        try testing.expect(err == error.InvalidPoint or err == error.SignatureNotInSubgroup);
+    }
+    // A 96-byte (G2) signature is a group mismatch, as for quicknet.
+    const g2rnd = try round_mod.parseRound(testing.allocator, chained_round_1000000_json);
+    try testing.expectError(error.SchemeGroupMismatch, verifyRound(&info, &g2rnd));
+}
+
+test "bls-unchained-on-g1: the DSTs are not interchangeable between it and quicknet" {
+    const info = try deprecatedInfo();
+    var quick = info;
+    quick.scheme = .unchained_g1_rfc9380;
+    const r: u64 = 1000;
+    const dep_sig = try deprecatedRound(testing.allocator, r, signUnchainedG1(r, deprecated_unchained_dst));
+    const rfc_sig = try deprecatedRound(testing.allocator, r, signUnchainedG1(r, QuicknetSuite.dst_sig));
+    // Each verifies under its own scheme…
+    try verifyRound(&info, &dep_sig);
+    try verifyRound(&quick, &rfc_sig);
+    // …and is refused under the other.
+    try testing.expectError(error.InvalidSignature, verifyRound(&info, &rfc_sig));
+    try testing.expectError(error.InvalidSignature, verifyRound(&quick, &dep_sig));
+    // The genuine quicknet round 1000 (external anchor) is not valid under
+    // the deprecated scheme either, even with quicknet's own key.
+    const qinfo_doc = try std.mem.replaceOwned(u8, testing.allocator, quicknet_info_json, "bls-unchained-g1-rfc9380", "bls-unchained-on-g1");
+    defer testing.allocator.free(qinfo_doc);
+    const qdep = try chaininfo.parseInfo(testing.allocator, qinfo_doc);
+    const genuine = try round_mod.parseRound(testing.allocator, round_1000_json);
+    try testing.expectError(error.InvalidSignature, verifyRound(&qdep, &genuine));
+}
+
+test "bls-unchained-on-g1: identity operands are refused" {
+    try testing.expect(!verifyDeprecatedUnchainedPoints(g2.Affine.identity, 1, g1.Affine.identity));
+    try testing.expect(!verifyDeprecatedUnchainedPoints(deprecatedPublicKey(), 1, g1.Affine.identity));
 }
 
 // ── expectedRound: freshness, not authenticity ──────────────────────────
@@ -1171,7 +1335,8 @@ const drand_seeds = [_][]const u8{
 // and round 1000000. Fields: 0 key, 1 signature, 2 randomness, 3 hash,
 // 4 groupHash, 5 previous_signature. Scheme labels: 0 the genuine
 // `pedersen-bls-chained`, 1 quicknet's label (a 48-byte key under it must be
-// refused at parse), 2 `bls-unchained-on-g1` and 3 "" (parse, unverifiable).
+// refused at parse), 2 `bls-unchained-on-g1` (likewise: it wants a G2 key) and
+// 3 "" (parse, unverifiable).
 
 const chained_pubkey_hex = "868f005eb8e6e4ca0a47c8a77ceaa5309a47978a7c71bc5cce96366b5d7a569937c529eeda66c7293784a9402801af31";
 const chained_hash_hex = "8990e7a9aaed2ffed73dbd7092123d6f289930540d7651336225dc172e51b2ce";
@@ -1216,7 +1381,9 @@ fn checkChainedFixture(c: Choices) !void {
     else
         try std.mem.print(&round_buf, "{{\"round\":{d},\"signature\":\"{s}\",\"previous_signature\":\"{s}\"}}", .{ round_no, &sig, &prev });
 
-    const info_damaged = pk_damaged or hash_damaged or ghash_damaged or c.scheme_idx == 1;
+    // A 48-byte key under quicknet's label OR `bls-unchained-on-g1`'s (both
+    // want a 96-byte G2 key) must be refused at parse.
+    const info_damaged = pk_damaged or hash_damaged or ghash_damaged or c.scheme_idx == 1 or c.scheme_idx == 2;
     const info = chaininfo.parseInfo(testing.allocator, info_json) catch |e| {
         if (!info_damaged) return e;
         ChainedMark.mark(.info_refused);
