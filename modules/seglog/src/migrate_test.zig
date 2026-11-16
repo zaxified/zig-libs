@@ -504,3 +504,418 @@ test "migration: resuming, a file already converted must be the segment the mani
     try testing.expectEqual(@as(u64, 11), rep.failure.?.segment);
     try testing.expect(rep.failure.?.reason == .bad_header);
 }
+
+// ── audit 2026-11-16 (mutation) ──────────────────────────────────────────────
+
+test "migration: a newest segment torn inside its header is cut, and every byte of it reported" {
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    var segs = fixture;
+    segs[2] = .{ .id = 12, .sealed = false, .missing = true };
+    try writeV1(&sim, &segs, &.{}, null);
+    try sim.installFile("seg-00000000000000000012.log", "SGLS\x01\x00\x00\x00\x0c\x00");
+    var log = try openAuto(&sim, null);
+    defer log.close();
+    const m = log.migration().?;
+    try testing.expectEqual(@as(u64, 10), m.torn_bytes);
+    try testing.expectEqual(@as(u64, 5), m.records);
+    try testing.expectEqual(@as(?u64, 12), log.activeSegment());
+}
+
+test "migration: eight bytes of a current-format header are not a torn version-1 header" {
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    var segs = fixture;
+    segs[2] = .{ .id = 12, .sealed = false, .missing = true };
+    try writeV1(&sim, &segs, &.{}, null);
+    try sim.installFile("seg-00000000000000000012.log", "SGLS\x02\x00\x00\x00");
+    try expectRefused(&sim, 12, .bad_header);
+}
+
+test "migration: a version-1 segment with the wrong magic is refused" {
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    try writeV1(&sim, &fixture, &.{}, null);
+    sim.fileContent("seg-00000000000000000010.log").?[0] = 'X';
+    try expectRefused(&sim, 10, .bad_header);
+}
+
+test "migration: the manifest names every segment converted, so a reader may open" {
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    try writeV1(&sim, &fixture, &.{}, null);
+    {
+        var log = try openAuto(&sim, null);
+        log.close();
+    }
+    const m = sim.fileContent("MANIFEST").?;
+    for (0..3) |i| try testing.expectEqual(@as(u8, 0), m[16 + 24 * i + 16]);
+    var r = try Log.openReadOnly(gpa, sim.storage(), .{});
+    r.close();
+}
+
+test "migration: a version-1 segment of another version is refused" {
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    try writeV1(&sim, &fixture, &.{}, null);
+    sim.fileContent("seg-00000000000000000010.log").?[4] = 3;
+    try expectRefused(&sim, 10, .bad_header);
+}
+
+test "migration: a newest segment ending in a whole record with a bad CRC is cut, and the cut reported" {
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    var segs = fixture;
+    // CRC (wrong), type 1, length 5, "hello": nine bytes of header and five of payload.
+    segs[2].tail = "\x00\x00\x00\x00\x01\x05\x00\x00\x00hello";
+    try writeV1(&sim, &segs, &.{}, null);
+    var log = try openAuto(&sim, null);
+    defer log.close();
+    try testing.expectEqual(@as(u64, 14), log.migration().?.torn_bytes);
+    try testing.expectEqual(@as(u64, 7), log.migration().?.records);
+}
+
+test "migration: a closed segment's seal must have the right length, say where it is, and end the file" {
+    { // a seal payload of 8 bytes whose count is right
+        var sim = SimStorage.init(gpa);
+        defer sim.deinit();
+        try writeV1(&sim, &fixture, &.{}, null);
+        var b: std.ArrayList(u8) = .empty;
+        defer b.deinit(gpa);
+        try b.appendSlice(gpa, "SGLS");
+        try appendInt(&b, u32, 1);
+        try appendInt(&b, u64, 10);
+        for (fixture[0].payloads) |p| try appendRecord(&b, 1, p);
+        var sp: [8]u8 = undefined;
+        std.mem.writeInt(u64, &sp, 3, .little);
+        try appendRecord(&b, 2, &sp);
+        try sim.installFile("seg-00000000000000000010.log", b.items);
+        try expectRefused(&sim, 10, .bad_seal);
+    }
+    { // a seal that names another offset for itself
+        var sim = SimStorage.init(gpa);
+        defer sim.deinit();
+        try writeV1(&sim, &fixture, &.{}, null);
+        const f = sim.fileContent("seg-00000000000000000010.log").?;
+        const seal_payload = f.len - 16;
+        f[seal_payload + 8] ^= 1;
+        std.mem.writeInt(u32, f[seal_payload - 9 ..][0..4], crc(f[seal_payload - 5 ..]), .little);
+        try expectRefused(&sim, 10, .bad_seal);
+    }
+    { // a byte after the seal of a closed segment
+        var sim = SimStorage.init(gpa);
+        defer sim.deinit();
+        var segs = fixture;
+        segs[0].tail = "\x01";
+        try writeV1(&sim, &segs, &.{}, null);
+        try expectRefused(&sim, 10, .bad_seal);
+    }
+}
+
+test "migration: a header of the current format is not believed while the manifest is still version 1" {
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    try writeV1(&sim, &fixture, &.{}, null);
+    // Base LSN 0 is what a version-1 manifest implies for every segment: a current-format file that
+    // agrees with it is still no business of a manifest that has not been converted.
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(gpa);
+    try b.appendSlice(gpa, "SGLS");
+    try appendInt(&b, u32, 2);
+    try appendInt(&b, u64, 10);
+    try appendInt(&b, u64, 0);
+    try appendInt(&b, i64, 0);
+    try appendInt(&b, u32, 0);
+    try appendInt(&b, u32, crc(b.items));
+    try sim.installFile("seg-00000000000000000010.log", b.items);
+    try expectRefused(&sim, 10, .bad_header);
+}
+
+/// The fixture migrated and closed, then its manifest taken back to "segment 10
+/// not converted yet": what a crash between the rename and the manifest leaves.
+fn convertedButNotNamed(sim: *SimStorage) !void {
+    try writeV1(sim, &fixture, &.{}, null);
+    {
+        var log = try openAuto(sim, null);
+        log.close();
+    }
+    const m = sim.fileContent("MANIFEST").?;
+    m[16 + 16] = 2; // form_legacy for the first entry
+    std.mem.writeInt(u32, m[m.len - 4 ..][0..4], crc(m[0 .. m.len - 4]), .little);
+}
+
+test "migration: resuming, a segment already converted counts its records, and is checked" {
+    {
+        var sim = SimStorage.init(gpa);
+        defer sim.deinit();
+        try convertedButNotNamed(&sim);
+        var rep: seglog.MigrationReport = .{};
+        var log = try openAuto(&sim, &rep);
+        defer log.close();
+        try testing.expectEqual(@as(u64, 1), rep.segments);
+        try testing.expectEqual(@as(u64, 3), rep.records);
+        // Only the segment still to convert is counted into what the migration read.
+        try testing.expectEqual(@as(u64, sim.fileContent("seg-00000000000000000010.log").?.len), rep.bytes_before);
+        try expectMigrated(&sim, &log);
+    }
+    { // its seal disagrees with its records
+        var sim = SimStorage.init(gpa);
+        defer sim.deinit();
+        try convertedButNotNamed(&sim);
+        const f = sim.fileContent("seg-00000000000000000010.log").?;
+        const seal = f.len - (25 + 48);
+        f[seal + 25] = 9; // the count
+        std.mem.writeInt(u32, f[seal..][0..4], crc(f[seal + 4 ..]), .little);
+        try expectRefused(&sim, 10, .mismatch);
+    }
+    { // a byte after its seal
+        var sim = SimStorage.init(gpa);
+        defer sim.deinit();
+        try convertedButNotNamed(&sim);
+        try sim.appendDurable("seg-00000000000000000010.log", "\x00");
+        try expectRefused(&sim, 10, .mismatch);
+    }
+    { // a record with an LSN out of sequence
+        var sim = SimStorage.init(gpa);
+        defer sim.deinit();
+        try convertedButNotNamed(&sim);
+        const f = sim.fileContent("seg-00000000000000000010.log").?;
+        const first = 40;
+        const len = std.mem.readInt(u32, f[first + 5 ..][0..4], .little);
+        std.mem.writeInt(u64, f[first + 9 ..][0..8], 9, .little);
+        std.mem.writeInt(u32, f[first..][0..4], crc(f[first + 4 .. first + 25 + len]), .little);
+        try expectRefused(&sim, 10, .mismatch);
+    }
+}
+
+test "migration: a segment's header remembers the time of its first record" {
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    try writeV1(&sim, &fixture, &.{}, null);
+    var log = try openAuto(&sim, null);
+    defer log.close();
+    const want = [_]i64{ 100, 200, 300 };
+    for ([_]u64{ 10, 11, 12 }, want) |id, ts| {
+        var nb: [40]u8 = undefined;
+        const f = sim.fileContent(segName(&nb, id)).?;
+        try testing.expectEqual(ts, std.mem.readInt(i64, f[24..32], .little));
+    }
+}
+
+/// A backend that damages the file a migration writes, in a way its own CRCs
+/// do not give away: the converted segment is well formed and wrong.
+const TamperMigrate = struct {
+    const Mode = enum { off, payload, lsn, seal_count, header_id, extra_byte };
+    inner: seglog.Storage,
+    mode: Mode = .off,
+    tmp: ?seglog.Storage.Handle = null,
+
+    fn storage(self: *TamperMigrate) seglog.Storage {
+        return .{ .ctx = self, .vtable = &vt };
+    }
+    const S = seglog.Storage;
+    const vt: S.VTable = .{
+        .open = open_,
+        .size = size_,
+        .pread = pread_,
+        .writeAll = writeAll_,
+        .sync = sync_,
+        .truncate = truncate_,
+        .close = close_,
+        .rename = rename_,
+        .delete = delete_,
+        .syncDir = syncDir_,
+        .tryLockExclusive = lock_,
+    };
+    fn c(ctx: *anyopaque) *TamperMigrate {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn open_(ctx: *anyopaque, p: []const u8, m: S.OpenMode) S.Error!S.Handle {
+        const h = try c(ctx).inner.open(p, m);
+        if (std.mem.eql(u8, p, "MIGRATE.tmp") and m != .read_only) c(ctx).tmp = h;
+        return h;
+    }
+    fn size_(ctx: *anyopaque, h: S.Handle) S.Error!u64 {
+        return c(ctx).inner.size(h);
+    }
+    fn pread_(ctx: *anyopaque, h: S.Handle, b: []u8, off: u64) S.Error!usize {
+        return c(ctx).inner.pread(h, b, off);
+    }
+    fn writeAll_(ctx: *anyopaque, h: S.Handle, b: []const u8, off: u64) S.Error!void {
+        const self = c(ctx);
+        if (self.tmp == h and self.mode != .off and self.mode != .extra_byte) {
+            var copy: [4096]u8 = undefined;
+            const n = @min(b.len, copy.len);
+            @memcpy(copy[0..n], b[0..n]);
+            var hit = false;
+            switch (self.mode) {
+                // The first record (stamped payload of 9 bytes, 34 bytes in all): payload byte, LSN.
+                .payload, .lsn => if (off >= 40 and b.len > 34 and b.len != 73) {
+                    if (self.mode == .payload) copy[30] ^= 0x40 else std.mem.writeInt(u64, copy[9..17], 77, .little);
+                    std.mem.writeInt(u32, copy[0..4], crc(copy[4..34]), .little);
+                    hit = true;
+                },
+                .seal_count => if (off >= 40 and b.len == 73) {
+                    copy[25] ^= 1;
+                    std.mem.writeInt(u32, copy[0..4], crc(copy[4..73]), .little);
+                    hit = true;
+                },
+                .header_id => if (off == 0 and b.len == 40) {
+                    copy[8] ^= 1;
+                    std.mem.writeInt(u32, copy[36..40], crc(copy[0..36]), .little);
+                    hit = true;
+                },
+                else => {},
+            }
+            if (hit) {
+                try self.inner.writeAll(h, copy[0..n], off);
+                return;
+            }
+        }
+        return self.inner.writeAll(h, b, off);
+    }
+    fn sync_(ctx: *anyopaque, h: S.Handle) S.Error!void {
+        const self = c(ctx);
+        if (self.tmp == h and self.mode == .extra_byte) try self.inner.writeAll(h, "\x00", try self.inner.size(h));
+        return self.inner.sync(h);
+    }
+    fn truncate_(ctx: *anyopaque, h: S.Handle, len: u64) S.Error!void {
+        return c(ctx).inner.truncate(h, len);
+    }
+    fn close_(ctx: *anyopaque, h: S.Handle) void {
+        if (c(ctx).tmp == h) c(ctx).tmp = null;
+        c(ctx).inner.close(h);
+    }
+    fn rename_(ctx: *anyopaque, a: []const u8, b: []const u8) S.Error!void {
+        return c(ctx).inner.rename(a, b);
+    }
+    fn delete_(ctx: *anyopaque, p: []const u8) S.Error!void {
+        return c(ctx).inner.delete(p);
+    }
+    fn syncDir_(ctx: *anyopaque) S.Error!void {
+        return c(ctx).inner.syncDir();
+    }
+    fn lock_(ctx: *anyopaque, h: S.Handle) S.Error!bool {
+        return c(ctx).inner.tryLockExclusive(h);
+    }
+};
+
+test "migration: a converted segment that is well formed and wrong is caught, whatever way it is wrong" {
+    for ([_]TamperMigrate.Mode{ .payload, .lsn, .seal_count, .header_id, .extra_byte }) |mode| {
+        var sim = SimStorage.init(gpa);
+        defer sim.deinit();
+        try writeV1(&sim, &fixture, &.{}, null);
+        var t: TamperMigrate = .{ .inner = sim.storage(), .mode = mode };
+        var rep: seglog.MigrationReport = .{};
+        testing.expectError(error.MigrationFailed, Log.open(gpa, t.storage(), .{ .legacy_ts = tsOf, .migration_report = &rep })) catch |e| {
+            std.debug.print("tamper mode {s}\n", .{@tagName(mode)});
+            return e;
+        };
+        try testing.expectEqual(@as(u64, 10), rep.failure.?.segment);
+        try testing.expect(rep.failure.?.reason == .mismatch);
+        try testing.expect(sim.fileContent("MIGRATE.tmp") == null);
+        // Under way, not done; a sound disk finishes it.
+        t.mode = .off;
+        var log = try Log.open(gpa, t.storage(), .{ .legacy_ts = tsOf });
+        defer log.close();
+        try expectMigrated(&sim, &log);
+    }
+}
+
+/// `max_manifest_ids` of root.zig under test.
+const max_ids = 256;
+
+/// A version-1 MANIFEST with these ids, a good CRC, and a pending count that may lie.
+fn writeV1Manifest(sim: *SimStorage, live: []const u64, pending: []const u64, np_field: ?u32) !void {
+    var m: std.ArrayList(u8) = .empty;
+    defer m.deinit(gpa);
+    try m.appendSlice(gpa, "SGLM");
+    try appendInt(&m, u32, 1);
+    try appendInt(&m, u32, @intCast(live.len));
+    try appendInt(&m, u32, np_field orelse @intCast(pending.len));
+    for (live) |id| try appendInt(&m, u64, id);
+    for (pending) |id| try appendInt(&m, u64, id);
+    try appendInt(&m, u32, crc(m.items));
+    sim.storage().delete("MANIFEST") catch {};
+    try sim.installFile("MANIFEST", m.items);
+}
+
+test "migration: a version-1 manifest is read as strictly as the current one" {
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    const no_log = error.Corrupt;
+    // As many ids as a manifest may hold is a log to migrate; one more is not.
+    var ids: [max_ids + 1]u64 = undefined;
+    for (&ids, 0..) |*p, i| p.* = 1 + i;
+    try writeV1Manifest(&sim, ids[0..max_ids], &.{}, null);
+    try testing.expectError(error.MigrationInProgress, Log.openReadOnly(gpa, sim.storage(), .{}));
+    try writeV1Manifest(&sim, &ids, &.{}, null);
+    try testing.expectError(no_log, Log.openReadOnly(gpa, sim.storage(), .{}));
+    // The same id twice, a pending id that is live, a pending count the file does not hold.
+    try writeV1Manifest(&sim, &.{ 1, 1 }, &.{}, null);
+    try testing.expectError(no_log, Log.openReadOnly(gpa, sim.storage(), .{}));
+    try writeV1Manifest(&sim, &.{ 1, 2 }, &.{2}, null);
+    try testing.expectError(no_log, Log.openReadOnly(gpa, sim.storage(), .{}));
+    try writeV1Manifest(&sim, &.{ 1, 2 }, &.{}, 1);
+    try testing.expectError(no_log, Log.openReadOnly(gpa, sim.storage(), .{}));
+}
+
+test "migration: a version-1 log with no segment is still a migration, and ends as a current manifest" {
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    try writeV1Manifest(&sim, &.{}, &.{}, null);
+    try testing.expectError(error.MigrationInProgress, Log.openReadOnly(gpa, sim.storage(), .{}));
+    var log = try openAuto(&sim, null);
+    defer log.close();
+    try testing.expect(log.migration() != null);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, sim.fileContent("MANIFEST").?[4..8], .little));
+}
+
+test "migration: a position past the data of a version-1 segment translates to nothing" {
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    try writeV1(&sim, &fixture, &.{}, null);
+    var log = try openAuto(&sim, null);
+    defer log.close();
+    const end10: u64 = 16 + 3 * 9 + 8 * 3 + 1 + 2 + 3;
+    try testing.expect((try log.translatePosition(.{ .segment = 10, .offset = end10 })) != null);
+    // Where the version-1 seal ended, were it as long as the version-2 one.
+    try testing.expectEqual(@as(?seglog.Position, null), try log.translatePosition(.{ .segment = 10, .offset = end10 + 9 + 48 }));
+    try testing.expectEqual(@as(?seglog.Position, null), try log.translatePosition(.{ .segment = 10, .offset = end10 + 5 }));
+}
+
+test "migration: a segment larger than a block comes across whole" {
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    const big: [300]u8 = @splat('x');
+    const segs = [_]Seg{
+        .{ .id = 1, .payloads = &.{ &big, &big, &big } },
+        .{ .id = 2, .payloads = &.{&big}, .sealed = false },
+    };
+    try writeV1(&sim, &segs, &.{}, null);
+    var log = try openAuto(&sim, null);
+    defer log.close();
+    var it = log.iterator(null);
+    defer it.deinit();
+    var n: u64 = 0;
+    while (try it.next()) |r| {
+        n += 1;
+        try testing.expectEqual(n, r.lsn);
+        try testing.expectEqualSlices(u8, &big, r.payload);
+    }
+    try testing.expectEqual(@as(u64, 4), n);
+    var v = try log.verify(gpa);
+    defer v.deinit(gpa);
+    try testing.expect(v.clean());
+}
+
+test "migration: Concurrent.migration reports what its open migrated" {
+    var sim = SimStorage.init(gpa);
+    defer sim.deinit();
+    try writeV1(&sim, &fixture, &.{}, null);
+    var c = try seglog.Concurrent.open(gpa, sim.storage(), testing.io, .{ .legacy_ts = tsOf });
+    defer c.close();
+    const m = c.migration().?;
+    try testing.expectEqual(@as(u64, 3), m.segments);
+    try testing.expectEqual(@as(u64, 7), m.records);
+}
