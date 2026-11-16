@@ -171,3 +171,84 @@ test "fuzz driver: AESKW_FUZZ (unwrap)" {
 test "fuzz harness: unwrap, 300 seeds, reaches every outcome" {
     try Mark.reach(fuzzUnwrap, "aeskw-unwrap", 300);
 }
+
+// ── fuzz: RFC 5649 `unwrapPad` on an attacker-controlled ciphertext ─────────
+// The same outcomes as `fuzzUnwrap`, over key data of any length 1..64 (n = 1
+// is the single-block case, every other length a padded last semiblock).
+
+const PadMark = Marker(enum { genuine, single_block, padded, flipped_refused, wrong_kek_refused, truncated_refused, damaged_refused, zeroed_on_failure, small_buffer });
+
+fn fuzzUnwrapPad(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    var raw: [24]u8 = undefined;
+    const raw_len: usize = src.slice(&raw);
+    var knobs: Cursor = .{ .bytes = raw[0..raw_len] };
+    var kek_bytes: [32]u8 = undefined;
+    expand(&knobs, &kek_bytes);
+    const kek_len: usize = switch (knobs.ranged(0, 2)) {
+        0 => 16,
+        1 => 24,
+        else => 32,
+    };
+    const kek = kek_bytes[0..kek_len];
+    var pt_bytes: [64]u8 = undefined;
+    expand(&knobs, &pt_bytes);
+    const pt = pt_bytes[0..knobs.ranged(1, 64)];
+    if (pt.len <= 8) PadMark.mark(.single_block);
+    if (pt.len % 8 != 0) PadMark.mark(.padded);
+
+    var ct_buf: [72]u8 = undefined;
+    const ct = try aeskw.wrapPad(kek, pt, &ct_buf);
+    var out: [64]u8 = undefined;
+    const got = aeskw.unwrapPad(kek, ct, &out) catch return error.GenuineWrapRefused;
+    if (!std.mem.eql(u8, got, pt)) return error.UnwrapDiffers;
+    PadMark.mark(.genuine);
+
+    {
+        var bad: [72]u8 = undefined;
+        @memcpy(bad[0..ct.len], ct);
+        const at = (@as(usize, knobs.byte()) << 8 | knobs.byte()) % ct.len;
+        bad[at] ^= @as(u8, 1) << @intCast(knobs.ranged(0, 7));
+        @memset(&out, 0xAA);
+        if (aeskw.unwrapPad(kek, bad[0..ct.len], &out)) |_| return error.FlippedWrapAccepted else |e| {
+            if (e != error.Unauthentic) return error.WrongRefusalKind;
+            if (!allZero(out[0 .. ct.len - 8])) return error.PartialKeyLeaked;
+            PadMark.mark(.flipped_refused);
+            PadMark.mark(.zeroed_on_failure);
+        }
+    }
+    {
+        var other = kek_bytes;
+        other[knobs.ranged(0, @intCast(kek_len - 1))] ^= @as(u8, 1) << @intCast(knobs.ranged(0, 7));
+        if (aeskw.unwrapPad(other[0..kek_len], ct, &out)) |_| return error.WrongKekAccepted else |e| {
+            if (e != error.Unauthentic) return error.WrongRefusalKind;
+            PadMark.mark(.wrong_kek_refused);
+        }
+    }
+    {
+        const cut = knobs.ranged(0, @intCast(ct.len - 1));
+        if (aeskw.unwrapPad(kek, ct[0..cut], &out)) |_| return error.TruncatedWrapAccepted else |_| PadMark.mark(.truncated_refused);
+    }
+    {
+        var buf: [80]u8 = undefined;
+        const n = damage(src, &buf, ct);
+        if (aeskw.unwrapPad(kek, buf[0..n], &out)) |_| {
+            if (!std.mem.eql(u8, buf[0..n], ct)) return error.DamagedWrapAccepted;
+        } else |_| PadMark.mark(.damaged_refused);
+    }
+    {
+        if (aeskw.unwrapPad(kek, ct, out[0 .. ct.len - 9])) |_| return error.SmallBufferAccepted else |e| {
+            if (e != error.BufferTooSmall) return error.WrongRefusalKind;
+            PadMark.mark(.small_buffer);
+        }
+    }
+}
+
+test "fuzz: aeskw unwrapPad, genuine accepted / damaged refused and zeroed" {
+    try testing.fuzz({}, smithWrap(fuzzUnwrapPad), .{});
+}
+test "fuzz driver: AESKW_PAD_FUZZ (unwrapPad)" {
+    try fuzz_driver.run(fuzzUnwrapPad, .{ .prefix = "AESKW_PAD_FUZZ", .name = "aeskw-unwrap-pad" });
+}
+test "fuzz harness: unwrapPad, 300 seeds, reaches every outcome" {
+    try PadMark.reach(fuzzUnwrapPad, "aeskw-unwrap-pad", 300);
+}

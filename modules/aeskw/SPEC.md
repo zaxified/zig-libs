@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-10-05 (12/13, 1 eq) · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget, clean, AESKW_FUZZ) · ct 2026-11-16 (ctgrind: KEK + wrapped key through wrap/unwrap/tampered unwrap and the RFC 5649 wrapPad/unwrapPad/tampered unwrapPad, AES-128/192/256; 12 in-file = each integrity verdict after its constant-time compare, twice per KEK size per construction)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget, clean, AESKW_FUZZ); 2026-11-16 `unwrapPad` (200,000 driver runs clean, ReleaseSafe, AESKW_PAD_FUZZ; every outcome reached) · ct 2026-11-16 (ctgrind: KEK + wrapped key through wrap/unwrap/tampered unwrap and the RFC 5649 wrapPad/unwrapPad/tampered unwrapPad, AES-128/192/256; 12 in-file = each integrity verdict after its constant-time compare, twice per KEK size per construction)
 **Performance:** not measured
 
 **Known defects:** none recorded
@@ -148,5 +148,5 @@ wipe on a KEK-width error in `unwrap` (the output then holds only a copy of the 
 
 ## Backlog / deferred
 
-- ✅ DONE 2026-11-16: `wrapPad`/`unwrapPad` (RFC 5649, §6 KATs, all KEK widths, constant-time verdict, refuses empty plaintext). Not yet extended: fuzz/ctgrind/stackprobe harness rows for the padded pair. ~~**(survey 2026-09-30) RFC 5649 AES Key Wrap with Padding (`wrapPad`/`unwrapPad`)** — RustCrypto `aes-kw` and OpenSSL both ship it; it is what KMIP/PKCS#11/CMS key-wrap uses for key data that is not an 8-byte multiple. Additive on top of the existing core (see *Scope*). Effort: small–medium (alternative IV, padding, the n=1 single-block special case, KATs from RFC 5649 §6). Fits §2: yes.~~
+- ✅ DONE 2026-11-16: `wrapPad`/`unwrapPad` (RFC 5649, §6 KATs, all KEK widths, constant-time verdict, refuses empty plaintext). Fuzz (AESKW_PAD_FUZZ) and ctgrind (12 in-file) extended the same day; the stackprobe row for the padded pair is still open (both run under `burn.run` like `wrap`/`unwrap`). ~~**(survey 2026-09-30) RFC 5649 AES Key Wrap with Padding (`wrapPad`/`unwrapPad`)** — RustCrypto `aes-kw` and OpenSSL both ship it; it is what KMIP/PKCS#11/CMS key-wrap uses for key data that is not an 8-byte multiple. Additive on top of the existing core (see *Scope*). Effort: small–medium (alternative IV, padding, the n=1 single-block special case, KATs from RFC 5649 §6). Fits §2: yes.~~
 - ~~**AES-192 KEK** is blocked on `std` (no `Aes192`)~~ — done 2026-10-10 over the `aes192` module (RFC 3394 §4.2/§4.4 KATs, fuzz harnesses and ctgrind row extended to three KEK widths).

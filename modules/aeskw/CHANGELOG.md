@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** a fuzz harness for `unwrapPad` (genuine, flipped, wrong KEK, truncated,
+  damaged, small buffer; AESKW_PAD_FUZZ driver, 200,000 runs clean).
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the ctgrind harness also drives `wrapPad` / `unwrapPad` / a tampered
   `unwrapPad` (12 in-file contexts: each integrity verdict, accept and reject, per KEK size); ct-compare pin 2.
 - **2026-11-16** — New: `wrapPad`/`unwrapPad`, RFC 5649 AES Key Wrap with Padding (any key length 1..2^32-1, AIV `A65959A6 || MLI`, n = 1 single-block case, all three KEK widths); `unwrapPad` folds the AIV/MLI/zero-padding checks into one constant-time verdict and wipes `out` on failure; empty plaintext is `error.InvalidLength`. RFC 5649 §6 KATs, round trip over 1..64 bytes, negative tests. `wrap`/`unwrap` share the recurrence core but are byte-for-byte unchanged. Fuzz/ctgrind/stackprobe harness rows for the new pair are not added yet.
