@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the second P-gap round (block-scan extremes,
+  MFI flow ring, STC `BlockWin`, HMA fused loop), 149/174 killed, 24 equivalent or unobservable, 1 open; new tests:
+  signed-zero ties and refusals of `hiLoBlocks`, short inputs of the block-scan batches, HMA and MFI against their streams,
+  `BlockWin` and STC against a window rescan.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** SPEC benchmark re-measured on a quiet machine after the second P-gap round
   (0.68x to 3.4x TA-Lib, 39 of 88 functions over 1.1x, worst CRSI), the table regenerated from the run, the P-gap Backlog
   rewritten from the profile.

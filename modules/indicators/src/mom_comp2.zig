@@ -1008,3 +1008,131 @@ test "kstext / stochrsi / kdj: every MaType in every slot, KDJ defaults to RMA" 
     try testing.expectEqual(lb, try stoch_.stoch(f64, gpa, b.h, b.l, b.c, &k2, &d2, .{ .fastk = 9, .slowk = 3, .slowk_ma = .rma, .slowd = 3, .slowd_ma = .rma }));
     for (lb..80) |i| try testing.expectEqual(k2[i], k1[i]);
 }
+
+// ── delta mutation audit 2026-11-16: tests the first schemata run asked for ──
+
+test "BlockWin: the extremes of the last len values equal a rescan, across block ends" {
+    var prng = std.Random.DefaultPrng.init(0x57c);
+    const rnd = prng.random();
+    for ([_]usize{ 2, 3, 7 }) |len| {
+        var buf: [3 * 7 + 2]f64 = undefined;
+        var rest: []f64 = &buf;
+        var w = BlockWin.carve(&rest, len);
+        var hist: [200]f64 = undefined;
+        for (0..200) |i| {
+            const v: f64 = @floatFromInt(rnd.intRangeAtMost(i32, -9, 9));
+            hist[i] = v;
+            const e = w.extremes(v);
+            w.commit(v);
+            if (w.count < len) continue;
+            var hi = v;
+            var lo = v;
+            for (hist[i + 1 - len .. i]) |t| {
+                hi = @max(hi, t);
+                lo = @min(lo, t);
+            }
+            try testing.expectEqual(hi, e[0]);
+            try testing.expectEqual(lo, e[1]);
+        }
+    }
+}
+
+/// STC as the window rescan the block scan replaced: the line is fast EMA - slow EMA, two stochastic passes of
+/// `cycle` values each, each smoothed by 0.5 (the first smoothing seeded with its first value).
+fn stcRescan(x: []const f64, p: StcParams, out: []f64) !void {
+    var fa: [512]f64 = undefined;
+    var sa: [512]f64 = undefined;
+    // The fast average starts `slow - fast` bars late, so both seed (SMA) on the same bar.
+    const sk = @max(p.fast, p.slow) - @min(p.fast, p.slow);
+    _ = try smooth.ema(f64, x[sk..], fa[0 .. x.len - sk], .{ .period = @min(p.fast, p.slow) });
+    _ = try smooth.ema(f64, x, sa[0..x.len], .{ .period = @max(p.fast, p.slow) });
+    const lb = try stcLookback(p);
+    var lines: [512]f64 = undefined;
+    var pfs: [512]f64 = undefined;
+    var nl: usize = 0;
+    var npf: usize = 0;
+    var frac1: f64 = 0.0;
+    var frac2: f64 = 0.0;
+    var pf_v: f64 = 0.0;
+    var pff: f64 = 0.0;
+    @memset(out, std.math.nan(f64));
+    for (@max(p.fast, p.slow) - 1..x.len) |i| {
+        const line = fa[i - sk] - sa[i];
+        lines[nl] = line;
+        nl += 1;
+        if (nl < p.cycle) continue;
+        var hi = line;
+        var lo = line;
+        for (lines[nl - p.cycle .. nl - 1]) |t| {
+            if (t > hi) hi = t;
+            if (t < lo) lo = t;
+        }
+        if (hi - lo > 0.0) frac1 = (line - lo) / (hi - lo) * 100.0;
+        pf_v = if (npf == 0) frac1 else @mulAdd(f64, 0.5, frac1 - pf_v, pf_v);
+        pfs[npf] = pf_v;
+        npf += 1;
+        if (npf < p.cycle) continue;
+        hi = pf_v;
+        lo = pf_v;
+        for (pfs[npf - p.cycle .. npf - 1]) |t| {
+            if (t > hi) hi = t;
+            if (t < lo) lo = t;
+        }
+        if (hi - lo > 0.0) frac2 = (pf_v - lo) / (hi - lo) * 100.0;
+        pff = if (npf == p.cycle) frac2 else @mulAdd(f64, 0.5, frac2 - pff, pff);
+        if (i >= lb) out[i] = pff;
+    }
+}
+
+test "stc equals the window rescan it replaced, on a walk and on a flat series" {
+    const gpa = testing.allocator;
+    var x: [400]f64 = undefined;
+    @import("testhelp.zig").walk(x[0..300], 0x57c1);
+    @memset(x[300..], 7.0); // a constant tail: the line decays but a fully flat start is below
+    var want: [400]f64 = undefined;
+    var got: [400]f64 = undefined;
+    for ([_]StcParams{ .{}, .{ .fast = 5, .slow = 12, .cycle = 3 }, .{ .fast = 12, .slow = 5, .cycle = 2 } }) |p| {
+        try stcRescan(&x, p, &want);
+        const lb = try stc(f64, gpa, &x, &got, p);
+        for (0..x.len) |i| {
+            if (i < lb) {
+                try testing.expect(std.math.isNan(got[i]));
+            } else try testing.expectEqual(want[i], got[i]);
+        }
+    }
+    // An all-zero start: every line is exactly 0 (a nonzero constant would leave EMA rounding behind), no range
+    // opens and the fractions keep their starting 0; when the walk begins they must pick up from there (a NaN
+    // from 0 / 0 in the first fraction would stick in the smoothing for good).
+    var flat: [220]f64 = undefined;
+    @memset(flat[0..70], 0.0);
+    @import("testhelp.zig").walk(flat[70..], 0x57c2);
+    var fw: [220]f64 = undefined;
+    var fo: [220]f64 = undefined;
+    try stcRescan(&flat, .{}, &fw);
+    const lb = try stc(f64, gpa, &flat, &fo, .{});
+    for (lb..flat.len) |i| try testing.expectEqual(fw[i], fo[i]);
+    try testing.expect(!std.math.isNan(fo[flat.len - 1]));
+    try testing.expect(fo[flat.len - 1] != fo[lb]);
+}
+
+test "stc: peekStep leaves the core as it was, and a short scratch is refused" {
+    var s1: [2 * BlockWin.slots(10)]f64 = undefined;
+    var s2: [2 * BlockWin.slots(10)]f64 = undefined;
+    var a = try STC.init(.{}, &s1);
+    var b = try STC.init(.{}, &s2);
+    var prng = std.Random.DefaultPrng.init(99);
+    const rnd = prng.random();
+    var v: f64 = 50;
+    for (0..300) |_| {
+        v += rnd.float(f64) - 0.5;
+        const peeked = a.peekStep(NoSrc{}, .{ .x = v });
+        _ = a.peekStep(NoSrc{}, .{ .x = v + 1.0 }); // a second peek with other data: still nothing kept
+        const ra = a.step(NoSrc{}, .{ .x = v });
+        const rb = b.step(NoSrc{}, .{ .x = v });
+        try testing.expectEqual(rb, ra);
+        try testing.expectEqual(ra, peeked);
+    }
+    var short: [2 * BlockWin.slots(10)]f64 = undefined;
+    try testing.expectError(error.BadParam, STC.init(.{}, short[0 .. short.len - 1]));
+    try testing.expectEqual(short.len, STC.scratchLen(.{}));
+}

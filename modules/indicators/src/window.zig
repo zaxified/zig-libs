@@ -551,3 +551,152 @@ fn expectSameOpt(batch: f64, stream: ?f64) !void {
         try testing.expectEqual(@as(u64, @bitCast(v)), @as(u64, @bitCast(batch)));
     } else try testing.expect(std.math.isNan(batch));
 }
+
+// ── delta mutation audit 2026-11-16: tests the first schemata run asked for ──
+
+const Capture = struct {
+    hi: []f64,
+    lo: []f64,
+    pub fn put(s: @This(), k: usize, h: f64, l: f64) void {
+        s.hi[k] = h;
+        s.lo[k] = l;
+    }
+};
+
+fn expectZeros(got: []const f64, signs: []const bool) !void {
+    for (got, signs) |g, neg| {
+        try testing.expectEqual(@as(f64, 0.0), g);
+        try testing.expectEqual(neg, std.math.signbit(g));
+    }
+}
+
+test "hiLoBlocks: a 0.0 / -0.0 tie goes the way TA-Lib's block scan sends it" {
+    const nz: f64 = -0.0;
+    var hi: [8]f64 = undefined;
+    var lo: [8]f64 = undefined;
+    const sink = Capture{ .hi = &hi, .lo = &lo };
+    // The suffix is scanned backward with a strict compare: the later bar of a block keeps a tie; at the join the
+    // suffix keeps it against the next block's prefix.
+    const h1 = [_]f64{ nz, 0.0, nz, 0.0 };
+    const l1 = [_]f64{ 0.0, nz, 0.0, nz };
+    try testing.expect(hiLoBlocks(f64, &h1, &l1, 2, sink));
+    try expectZeros(hi[1..4], &.{ false, false, false });
+    try expectZeros(lo[1..4], &.{ true, true, true });
+    // The prefix of the next block is scanned forward with a strict compare: the first bar keeps a tie.
+    const h2 = [_]f64{ -5, -5, -5, 0.0, nz };
+    const l2 = [_]f64{ 5, 5, 5, nz, 0.0 };
+    try testing.expect(hiLoBlocks(f64, &h2, &l2, 3, sink));
+    try expectZeros(hi[3..5], &.{ false, false });
+    try expectZeros(lo[3..5], &.{ true, true });
+}
+
+test "hiLoBlocksFrom and hiLoBlocks decline what they cannot serve, and serve the longest period" {
+    const Never = struct {
+        pub fn put(_: @This(), _: usize, _: f64, _: f64) void {
+            unreachable;
+        }
+    };
+    var h: [300]f64 = undefined;
+    for (&h, 0..) |*x, i| x.* = @floatFromInt(i % 7);
+    try testing.expect(!hiLoBlocks(f64, &h, &h, 0, Never{}));
+    try testing.expect(!hiLoBlocksFrom(f64, &h, &h, 0, 5, Never{}));
+    try testing.expect(!hiLoBlocksFrom(f64, &h, &h, 5, 3, Never{})); // starts before the first full window
+    var hi: [300]f64 = undefined;
+    var lo: [300]f64 = undefined;
+    // Exactly block_cap bars of period: served, one window (bar 255) and its 44 successors.
+    try testing.expect(hiLoBlocks(f64, &h, &h, block_cap, Capture{ .hi = &hi, .lo = &lo }));
+    try testing.expectEqual(@as(f64, 6.0), hi[block_cap - 1]);
+    try testing.expectEqual(@as(f64, 0.0), lo[299]);
+    // Unequal series: the shorter one bounds the outputs.
+    var hi2: [10]f64 = undefined;
+    var lo2: [10]f64 = undefined;
+    try testing.expect(hiLoBlocks(f64, h[0..10], h[0..7], 3, Capture{ .hi = &hi2, .lo = &lo2 }));
+    try testing.expectEqual(@as(f64, 6.0), hi2[6]); // bars 4..6 hold 4, 5, 6; only seven bars exist
+    try testing.expectEqual(@as(f64, 4.0), lo2[6]);
+}
+
+test "block-scan batches on inputs shorter than the lookback: all NaN, the lookback returned; period 1 is refused where it is" {
+    const ind = @import("root.zig");
+    var h: [12]f64 = undefined;
+    var l: [12]f64 = undefined;
+    var c: [12]f64 = undefined;
+    for (&h, &l, &c, 0..) |*hh, *ll, *cc, i| {
+        cc.* = 10.0 + @as(f64, @floatFromInt(i));
+        hh.* = cc.* + 1.0;
+        ll.* = cc.* - 1.0;
+    }
+    var o1: [12]f64 = undefined;
+    var o2: [12]f64 = undefined;
+    var o3: [12]f64 = undefined;
+    var o4: [12]f64 = undefined;
+    for (0..12) |n| {
+        for ([_]usize{ 2, 3, 5, 9 }) |per| {
+            @memset(&o1, 0.5);
+            const lb = try ind.midpoint(f64, c[0..n], o1[0..n], .{ .period = per });
+            try testing.expectEqual(per - 1, lb);
+            for (o1[0..@min(lb, n)]) |v| try testing.expect(std.math.isNan(v));
+            _ = try ind.midprice(f64, h[0..n], l[0..n], o1[0..n], .{ .period = per });
+            for (o1[0..@min(lb, n)]) |v| try testing.expect(std.math.isNan(v));
+            _ = try ind.willr(f64, h[0..n], l[0..n], c[0..n], o1[0..n], .{ .period = per });
+            for (o1[0..@min(lb, n)]) |v| try testing.expect(std.math.isNan(v));
+            const ip = ind.IchimokuParams{ .tenkan = 2, .kijun = per, .senkou_b = per + 1 };
+            const ilb = try ind.ichimoku(f64, h[0..n], l[0..n], o1[0..n], o2[0..n], o3[0..n], o4[0..n], ip);
+            try testing.expectEqual(per, ilb);
+            for ([_][]f64{ o1[0..n], o2[0..n], o3[0..n], o4[0..n] }) |o| for (o[0..@min(ilb, n)]) |v| try testing.expect(std.math.isNan(v));
+        }
+    }
+    try testing.expectError(error.BadParam, ind.willr(f64, &h, &l, &c, &o1, .{ .period = 1 }));
+    try testing.expectError(error.BadParam, ind.mfi(f64, &h, &l, &c, &c, &o1, .{ .period = 1 }));
+}
+
+test "hma on every short length equals the stream; mfi around its ring threshold and on money-free windows" {
+    const ind = @import("root.zig");
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    var x: [60]f64 = undefined;
+    var hh: [60]f64 = undefined;
+    var ll: [60]f64 = undefined;
+    var v: [60]f64 = undefined;
+    for (&x, &hh, &ll, &v) |*a, *b, *cc, *d| {
+        a.* = 100.0 + rnd.float(f64) * 5.0;
+        b.* = a.* + rnd.float(f64);
+        cc.* = a.* - rnd.float(f64);
+        d.* = 100.0 + rnd.float(f64) * 900.0;
+    }
+    var out: [60]f64 = undefined;
+    var buf: [4 * 302]f64 = undefined;
+    for (0..60) |n| {
+        _ = try ind.hma(f64, x[0..n], out[0..n], .{ .period = 9 });
+        var s = try ind.HmaStream(f64).init(.{ .period = 9 }, &buf);
+        for (x[0..n], out[0..n]) |a, o| try expectSameOpt(o, s.update(a));
+        for ([_]usize{ 2, 3, 5 }) |per| {
+            _ = try ind.mfi(f64, hh[0..n], ll[0..n], x[0..n], v[0..n], out[0..n], .{ .period = per });
+            var m = try ind.MfiStream(f64).init(.{ .period = per }, &buf);
+            for (hh[0..n], ll[0..n], x[0..n], v[0..n], out[0..n]) |a, b, cc, d, o| try expectSameOpt(o, m.update(.{ .high = a, .low = b, .close = cc, .volume = d }));
+        }
+    }
+    // A bar whose price moved by less than TA-Lib's epsilon carries no money flow (up or down), so the window
+    // holds the one real flow only: all of it up.
+    var p3 = [_]f64{ 100.0, 110.0, 110.0 - 1e-13 };
+    var one = [_]f64{ 1000.0, 1000.0, 1000.0 };
+    var o3: [3]f64 = undefined;
+    _ = try ind.mfi(f64, &p3, &p3, &p3, &one, &o3, .{ .period = 2 });
+    try testing.expectEqual(@as(f64, 100.0), o3[2]);
+    // Money-free bars (an unmoved price) end a window's flows: p of them in a row zero the sums, whatever rounding
+    // residue the sliding left in them. These flows leave 1.45e-11 behind.
+    const px = [_]f64{ 100.0, 126.2, 126.7, 126.7, 126.7 };
+    const vol = [_]f64{ 1.0, 500.4, 748.7, 1.0, 1.0 };
+    var o5: [5]f64 = undefined;
+    _ = try ind.mfi(f64, &px, &px, &px, &vol, &o5, .{ .period = 2 });
+    try testing.expectEqual(@as(f64, 0.0), o5[4]);
+    var m5 = try ind.MfiStream(f64).init(.{ .period = 2 }, &buf);
+    var last: ?f64 = null;
+    for (px, vol) |a, d| last = m5.update(.{ .high = a, .low = a, .close = a, .volume = d });
+    try testing.expectEqual(@as(?f64, 0.0), last);
+    // A NaN volume on a bar between two zero prices (a * volume is NaN, but no price moved) adds nothing.
+    const pz = [_]f64{ 100.0, 110.0, 120.0, 0.0, 0.0 };
+    const vz = [_]f64{ 1.0, 1.0, 1.0, 1.0, std.math.nan(f64) };
+    var oz: [5]f64 = undefined;
+    _ = try ind.mfi(f64, &pz, &pz, &pz, &vz, &oz, .{ .period = 3 });
+    try testing.expectEqual(@as(f64, 100.0), oz[4]);
+}

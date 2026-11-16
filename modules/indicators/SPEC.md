@@ -6,7 +6,7 @@
 
 **Scope:** mvp — TA-Lib C 0.8.3, all 237 of its functions: the seed set (17), the Overlap Studies wave (27: every moving-average type, the bands / channels, SAR family, Supertrend, Ichimoku, Zig-Zag), the volume / volatility / price-transform / statistic / math-operator wave (50), the cycle wave (25: HT family, MAMA, three SWAK rows, 15 math transforms), the momentum wave (57: ADX family, AROON, ROC family, oscillators, KST / KDJ / STOCHRSI / CRSI / STC / SQZMOM, ...) and the 61 candlestick patterns (`candles.zig`). Remaining deviations from TA-Lib: MAVP has no streaming type; LINEARREG_ANGLE, PSO and the math transforms (ACOS ... TANH) carry a 2-ULP bound (libm `atan` / `tanh` rounding); the Hilbert family and MAMA a column-relative 1e-13 bound (`atan`); RSI answers NaN where TA-Lib's NaN-poisoned state reads 50; batch and streaming MAX / MIN / MINMAX / MIDPOINT / MIDPRICE / WILLR / ICHIMOKU differ in the sign of a 0.0 / -0.0 tie and where a NaN is in the window, as TA-Lib's two tiers do (the batch is its block scan, the stream its automaton) (surveyed 2026-11-15 against `ta_func.h` and the function sources of the 0.8.3 tarball)
 
-**Audit:** review 2026-11-15 · mutation 2026-11-15 (447/468, 21 eq) · src 790b3560d8b6182f
+**Audit:** review 2026-11-15 · mutation 2026-11-16 (596/642, 45 eq) · src 050f3b1c48e9290e
 
 **Hardening:** fuzz 2026-11-15 (1,080,000 runs clean in three verdicts of 4 jobs, INDICATORS_FUZZ, ReleaseSafe; reach on every function: all 237 entries x f64 / f32 x stream, per-function counts printed; the whole surface — every batch function, `Lookback`, every streaming type with `bufLen` / `init` / `update` / `peek` / `value` / `clone` — under NaN / inf / -0 / denormal / huge data, lengths 0 .. 600, parameters at and beyond every range, mismatched slice lengths, short buffers, a failing allocator and in-place calls; batch == stream, `peek` == `update`, the NaN lead == the lookback, no unwritten output slot; the harness checked by 11 planted mutants) · ct n/a — no secret enters an indicator · panic 2026-11-15 (every entry point and every `@intFromFloat` / `@intCast` / `unreachable` / `.?` / allocation site swept, all 237 functions called by the fuzz harness: MEDIAN / PERCENTILE no longer index out of the sorted copy when the data holds a NaN; BBW / PERCENTB streams keep a ring as long as their average needs (KAMA / ZLEMA / VIDYA were wrong and `peek` differed from `update`); ZIGZAG's `pivot_idx` saturates at 2^31 - 1 instead of trapping)
 
@@ -15,6 +15,37 @@
 **Known defects:** none recorded
 
 **Downstream consumer:** no
+
+**Audit 2026-11-16 (delta mutation).** 174 schemata mutants over the non-test lines of the second P-gap round:
+`window.hiLoBlocks` / `hiLoBlocksFrom` (every guard and bound, the block start and stride, each suffix and prefix
+store, the join window, each strict compare as `>=` / `<=`), the MIDPOINT / MIDPRICE / WILLR / ICHIMOKU batches
+(validation, length check, fallback to the automaton, the NaN lead and its `min` against a short output, the returned
+lookback, the three ICHIMOKU periods and the mean of tenkan and kijun), MFI (`flowTp`'s vector selects, the epsilon
+compare and the money flag, `step` / `steadyStep` / `steady`, the batch's threshold, ring fill, slot walk and
+subtractions), STC (`BlockWin`: carve, `extremes` lanes, compare and sentinel index, `commit` rebuild; `stepImpl`'s
+counts, ranges and fractions, the committing flag, `peekStep`, the scratch size), HMA (`steady`, `steadyRun`'s guards,
+offsets, ring index and write-backs), `WmaCore.step` / `steadyStep` and the local copy in `vs_kit.run`. First run: 126
+killed (one by timeout), 48 survived. New tests: `hiLoBlocks` with 0.0 / -0.0 ties at every compare, its refusals
+(`per` 0, `from < per - 1`) and the longest period, unequal series lengths; the four block-scan batches on every input
+shorter than the lookback; WILLR and MFI refusing period 1; HMA on every length 0..59 against its stream; MFI around its
+ring threshold against its stream, a bar inside the epsilon carrying no flow, rounding residue wiped by `period`
+money-free bars, a NaN volume on a bar between two zero prices; `BlockWin` against a rescan; STC against the window
+rescan it replaced (walk, swapped periods, an all-zero start followed by a walk), `peekStep` leaving the core as it was,
+a scratch one value short. Rerun: 23 more killed, 25 survived. EQUIVALENT (24): `m > 1 or true` re-compares the same bar
+(window); a period of exactly 256 taking the automaton instead of the blocks, and `per >= mfi_ring_cap`, are path
+choices with the same values (the documented NaN / 0.0 tie difference aside); `lb < len + 1` only adds an empty loop;
+`down` as `<=` (a zero step is always inside the epsilon, which overrides the select); MFI's `validate` (both
+continuations validate the same period); `for (0..k)` in the ring fill (slot 0 is rewritten before it is read);
+`cc.n += 1` (the copy is discarded and `tail` takes `n` as an argument); the ring's initial zeros (every slot is written
+before it is read); the four tie compares of `BlockWin` (`>=` against `>` differ only on equal values, hence only in the
+sign of a zero, which no later comparison or output value sees); the rebuild stopping at slot 1 (suffix slot 0 is never
+read); `HmaCore.steady` with `p == 1` guarded away (`n >= 0` holds anyway) and one bar later (the step then does the
+same work); `WmaCore.step`'s `p != 1` guard (`n + 1 < 1` is false anyway); a committing `peekStep` (the real step
+rewrites the ring slot it touched and never reads the suffix slot a block-end commit rebuilds). UNOBSERVABLE: the
+write-backs of `HmaCore.steadyRun` and `vs_kit.run`'s local copy, and `HmaCore.n` (every caller discards the core; they
+need a caller that keeps stepping the same core after the loop). Not closed (1): `r1 >= 0.0` in STC's first fraction
+(0 / 0 = NaN sticks in the smoothing when a flat start is followed by movement; the all-zero-start test is written and
+passes on the original, it was not run against this mutant).
 
 ## Compared with
 
