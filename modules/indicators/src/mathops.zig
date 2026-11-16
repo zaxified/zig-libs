@@ -173,6 +173,25 @@ pub fn minmax(comptime T: type, in: []const T, out_min: []T, out_max: []T, p: Mi
     // TA-Lib's batch block scan (`window.extBatch`), not the automaton the stream runs: see the note on MinmaxCore.
     try MinmaxCore.validate(p);
     try core.checkLen(in.len, &.{ out_min.len, out_max.len });
+    if (p.period <= window.block_cap) {
+        // Both extremes from one block scan, as TA_MINMAX shares it: `hiLoBlocks` runs `extBatch`'s comparisons
+        // (backward strict suffix, forward strict prefix, the suffix winning a tie), so the values are the same bits.
+        const lb = p.period - 1;
+        for (out_min[0..@min(lb, in.len)], out_max[0..@min(lb, in.len)]) |*a, *b| {
+            a.* = std.math.nan(T);
+            b.* = std.math.nan(T);
+        }
+        const Sink = struct {
+            mn: []T,
+            mx: []T,
+            pub fn put(s: @This(), k: usize, h: f64, l: f64) void {
+                s.mx[k] = core.to(T, h);
+                s.mn[k] = core.to(T, l);
+            }
+        };
+        _ = window.hiLoBlocks(T, in, in, p.period, Sink{ .mn = out_min, .mx = out_max });
+        return lb;
+    }
     _ = try window.extBatch(T, false, in, out_min, p);
     return window.extBatch(T, true, in, out_max, p);
 }
