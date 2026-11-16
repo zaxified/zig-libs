@@ -34,6 +34,8 @@ var buf: [rdap.max_url_len]u8 = undefined;
 _ = try rdap.buildPath(&buf, .domain, "example.com"); // "domain/example.com"
 _ = try rdap.buildPath(&buf, .ip, "192.0.2.0/24");    // "ip/192.0.2.0%2F24"
 _ = try rdap.buildPath(&buf, .autnum, "65536");       // "autnum/65536"
+_ = try rdap.buildPath(&buf, .help, "");              // "help" (server help)
+_ = try rdap.buildPath(&buf, .tld, ".com");           // "domain/com" (TLD query, root server)
 const url = try rdap.buildUrl(&buf, "https://rdap.example/", .domain, "example.com");
 _ = rdap.accept_header; // { "Accept", "application/rdap+json" } (RFC 7480 §4.2)
 

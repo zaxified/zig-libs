@@ -122,7 +122,7 @@ names a loopback/RFC 1918 host — never dialed). Run: `zig build test-rdap`.
   schema validation are deliberate non-goals, not v1 gaps).
 
 - **Bootstrap fetch + cache helper** *(survey 2026-09-30)*. openrdap ships "automatic server detection" with an optional cache; here the user downloads the IANA `dns.json`/`ipv4.json`/`ipv6.json`/`asn.json` files, calls `parseBootstrap`, then `lookup*`, then `Client.query`. Every first-time user writes this glue, and a naive one re-downloads the file per query (IANA asks clients to cache *(inferred)*). Effort: small-medium (a `Resolver` over `Fetcher` with caller-supplied clock for TTL; file cache stays the caller's). Fits CONVENTIONS §2.
-- **`help` query and TLD query (`domain/<tld>` on the root server)** *(survey 2026-09-30)*. In openrdap (`help`) and icann-rdap (TLD queries); low use. Effort: small (`QueryType` variants). Fits §2.
+- **`help` query and TLD query (`domain/<tld>` on the root server)** *(survey 2026-09-30)*. In openrdap (`help`) and icann-rdap (TLD queries); low use. Effort: small (`QueryType` variants). Fits §2. ✅ DONE 2026-11-16 (`QueryType.help` -> path `help`, value ignored; `QueryType.tld` -> `domain/<tld>`, one leading dot dropped, for a root server; `buildPath`/`buildUrl` goldens)
 - **`secureDNS` model** *(survey 2026-09-30)*. Already recorded above (kept as "legitimate future addition"); it matters to anyone showing DNSSEC posture from RDAP. Effort: small-medium. Fits §2.
 
 ## Status
