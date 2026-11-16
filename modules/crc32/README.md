@@ -19,6 +19,8 @@ const crc32 = @import("crc32");
 const c = crc32.hash(bytes);                   // == std.hash.Crc32.hash(bytes)
 const c2 = crc32.extend(c, more);              // == hash(bytes ++ more), zlib's crc32(c, …)
 const c3 = crc32.combine(c, crc32.hash(more), more.len); // same, without the bytes
+const op = crc32.combineGen(4096); // many 4 KiB blocks: the operator once,
+const c4 = crc32.combineOp(c3, crc32.hash(block), op); // then one multiply per join
 
 var s = crc32.Crc32.init();                    // std.hash.Crc32's shape
 s.update(part1);

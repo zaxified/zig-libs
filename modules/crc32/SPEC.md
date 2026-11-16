@@ -230,7 +230,7 @@ table.
   the target already has `pclmul`), else the table -- and add a Debug
   `-Dtarget=x86_64-linux` build of the module to its checks.
 
-- **Precomputed combine operator** *(survey 2026-09-30)*: zlib ≥ 1.2.12 offers `crc32_combine_gen(len)` /
+- ✅ **DONE 2026-11-16 (`combineGen` / `combineOp`):** **Precomputed combine operator** *(survey 2026-09-30)*: zlib ≥ 1.2.12 offers `crc32_combine_gen(len)` /
   `crc32_combine_op(a, b, op)` so a parallel or chunked checksummer that joins many equal-length blocks pays the
   `x^(8n)` computation once. `combine(a, b, n)` here recomputes it per call (log-time, cheap), so this only matters
   for hot join loops. Effort: small (expose the `x^(8n) mod P` value and its multiply). Fits §2: yes. Low priority.

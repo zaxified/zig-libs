@@ -65,6 +65,22 @@ pub fn combine(crc_a: u32, crc_b: u32, len_b: u64) u32 {
     return multModP(xPow8n(len_b), crc_a) ^ crc_b;
 }
 
+/// The operator `combine` applies for a second block of `len_b` bytes
+/// (zlib's `crc32_combine_gen`): x^(8·len_b) mod P. Compute it once to join
+/// many blocks of the same length with `combineOp`.
+pub fn combineGen(len_b: u64) u32 {
+    return xPow8n(len_b);
+}
+
+/// `combine` with the operator from `combineGen(len_b)` (zlib's
+/// `crc32_combine_op`): one multiply mod P, no length walk. Any `op` is
+/// accepted; one that `combineGen` did not make just gives a meaningless CRC.
+pub fn combineOp(crc_a: u32, crc_b: u32, op: u32) u32 {
+    // 0 is no x^n; `multModP` needs a non-zero multiplier to stop.
+    if (op == 0) return crc_b;
+    return multModP(op, crc_a) ^ crc_b;
+}
+
 /// Streaming form, with the shape of `std.hash.Crc32`: `init`, `update`,
 /// `final`, `hash`.
 pub const Crc32 = struct {
@@ -687,6 +703,30 @@ test "combine joins two checksums without the bytes" {
     }
     // An empty right-hand side changes nothing, whatever its "checksum".
     try testing.expectEqual(hash("abc"), combine(hash("abc"), 0, 0));
+}
+
+test "combineGen + combineOp equal combine, the operator reused across blocks" {
+    var prng = std.Random.DefaultPrng.init(0xc0b1_7e);
+    const r = prng.random();
+    var buf: [4096]u8 = undefined;
+    r.bytes(&buf);
+    // Many 64-byte blocks joined with one operator, like a chunked checksummer.
+    const op = combineGen(64);
+    var acc = hash(buf[0..64]);
+    var off: usize = 64;
+    while (off < buf.len) : (off += 64) acc = combineOp(acc, hash(buf[off..][0..64]), op);
+    try testing.expectEqual(hash(&buf), acc);
+    for (0..2000) |_| {
+        const a = r.int(u32);
+        const b = r.int(u32);
+        const n = r.int(u64);
+        try testing.expectEqual(combine(a, b, n), combineOp(a, b, combineGen(n)));
+    }
+    // x^0 = 1: the operator of an empty block is the identity.
+    try testing.expectEqual(@as(u32, 1 << 31), combineGen(0));
+    try testing.expectEqual(@as(u32, 0x1234_5678), combineOp(0x1234_5678, 0, combineGen(0)));
+    // A zero operator (no combineGen makes it) ends at once instead of looping.
+    try testing.expectEqual(@as(u32, 7), combineOp(0xdead_beef, 7, 0));
 }
 
 test "combine over lengths past 2^32 bytes: x2n repeats with period 32" {

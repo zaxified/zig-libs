@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — `combineGen(len)` / `combineOp(a, b, op)` (zlib `crc32_combine_gen` / `crc32_combine_op`): the
+  `x^(8n) mod P` operator computed once for many equal-length joins. A zero operator returns `b` instead of looping.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** the ARMv8 run-time detection reads `std.elf.AT.HWCAP` (Zig 0.17 made `std.elf.AT` a per-OS namespace; `AT_HWCAP` is gone). Cross-built and run for aarch64-linux-musl under qemu.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC: 'no per-function target features' and codegen notes labelled as 0.16 measurements, not re-checked on 0.17; std CRC/memset facts updated for 0.17.0.
