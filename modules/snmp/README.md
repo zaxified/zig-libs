@@ -27,14 +27,14 @@ network-device management work (alongside `netlink`, `nftables`, `icmp`).
     rejection) in the codec.
   - **Messages** (`message`): `SEQUENCE { version, community, PDU }` with
     all v1 + v2c PDUs — GetRequest [0], GetNextRequest [1], Response [2],
-    SetRequest [3], v1 Trap [4] (decode-only), GetBulkRequest [5],
+    SetRequest [3], v1 Trap [4] (decode + `encodeTrapV1`), GetBulkRequest [5],
     InformRequest [6], SNMPv2-Trap [7], Report [8]. Lazy typed varbind
     iteration; GetBulk's non-repeaters/max-repetitions handled per RFC 3416
     (negatives clamp to 0).
   - **Client** (`Client`): manager behind a `Transport` seam ("send request
     bytes, receive reply bytes"), so everything is offline-testable —
     `get`, `getNext`, `getBulk` (v2c), `set`, request-id allocation and
-    matching, error-status surfacing, a retry policy (`Options.retries`, default 5, same id re-sent on timeout), and a GetNext `walker` and a
+    matching, error-status surfacing, a retry policy (`Options.retries`, default 5, same id re-sent on timeout), notification sending (`trapV1`, `trapV2`, `inform`; `V3Client.inform`; `sysUpTime.0` + `snmpTrapOID.0` inserted for v2), and a GetNext `walker` and a
     GETBULK `bulkWalker` with subtree, endOfMibView/noSuchName, and
     OID-not-increasing guards. `UdpTransport`
     is an optional real `std.Io.net` adapter (UDP/161); tests never send.

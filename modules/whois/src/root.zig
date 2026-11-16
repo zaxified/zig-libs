@@ -491,7 +491,30 @@ pub const LookupOptions = struct {
     /// Maximum referrals to follow after the root (clamped to
     /// `Chain.capacity - 1`).
     max_referrals: u8 = 5,
+    /// Format each hop's query with that server's documented syntax
+    /// (`serverQuery`) instead of sending the bare query everywhere, as the
+    /// reference `whois` client does. Set false to send `query` verbatim to
+    /// every hop.
+    per_server_syntax: bool = true,
 };
+
+/// Hop-aware query formatting used by `lookup`. Known registries get their
+/// documented flag: ARIN (`whois.arin.net`) gets `n <ip>` for an IP literal,
+/// Verisign (`whois.verisign-grs.com`) gets `domain <name>` for a domain
+/// name. Any other server, any other query kind (ASN, handle, a query that
+/// already carries a space-separated flag) gets the bare query. Host
+/// comparison is ASCII case-insensitive and ignores one trailing dot.
+pub fn serverQuery(buf: []u8, server: []const u8, query: []const u8) QueryError![]const u8 {
+    const host = if (server.len > 0 and server[server.len - 1] == '.') server[0 .. server.len - 1] else server;
+    if (std.mem.findScalar(u8, query, ' ') == null) {
+        if (std.ascii.eqlIgnoreCase(host, "whois.arin.net") and netaddr.parseIp(query) != null)
+            return arinIpQuery(buf, query);
+        if (std.ascii.eqlIgnoreCase(host, "whois.verisign-grs.com") and
+            std.mem.findScalar(u8, query, '.') != null and netaddr.parseIp(query) == null)
+            return verisignDomainQuery(buf, query);
+    }
+    return formatQuery(buf, query);
+}
 
 /// The servers consulted, in order, root first. Fixed storage — host names
 /// are copied so they survive response-buffer reuse across hops.
@@ -561,7 +584,9 @@ pub fn lookup(
     var port = opts.port;
     while (true) {
         const server = chain.get(chain.count - 1);
-        const response = try transport.exchange(server, port, wire, response_buf);
+        var hop_buf: [max_query_len + 2 + 8]u8 = undefined;
+        const hop_wire = if (opts.per_server_syntax) try serverQuery(&hop_buf, server, query) else wire;
+        const response = try transport.exchange(server, port, hop_wire, response_buf);
 
         const ref = nextServer(response) orelse
             return .{ .response = response, .chain = chain, .truncated = false };
@@ -1089,9 +1114,50 @@ test "lookup: follows the IANA → Verisign → registrar chain" {
     try testing.expectEqualStrings("whois.markmonitor.com", result.chain.get(2));
     // Wire format on every hop: "<query>\r\n" at port 43.
     for (scripted.calls[0..scripted.call_count]) |*c| {
-        try testing.expectEqualStrings("example.com\r\n", c.queryText());
         try testing.expectEqual(default_port, c.port);
     }
+    // Per-server syntax: only the Verisign hop gets the `domain ` flag.
+    try testing.expectEqualStrings("example.com\r\n", scripted.calls[0].queryText());
+    try testing.expectEqualStrings("domain example.com\r\n", scripted.calls[1].queryText());
+    try testing.expectEqualStrings("example.com\r\n", scripted.calls[2].queryText());
+}
+
+test "lookup: per_server_syntax=false sends the bare query to every hop" {
+    var scripted: ScriptedTransport = .{ .entries = &.{
+        .{ .server = "whois.iana.org", .response = iana_reply },
+        .{ .server = "whois.verisign-grs.com", .response = verisign_reply },
+        .{ .server = "whois.markmonitor.com", .response = terminal_reply },
+    } };
+    var buf: [1024]u8 = undefined;
+    _ = try lookup(scripted.transport(), "example.com", .{ .per_server_syntax = false }, &buf);
+    try testing.expectEqual(@as(usize, 3), scripted.call_count);
+    for (scripted.calls[0..scripted.call_count]) |*c|
+        try testing.expectEqualStrings("example.com\r\n", c.queryText());
+}
+
+test "serverQuery: ARIN n-flag for IPs, Verisign domain-flag for names, bare elsewhere" {
+    var b: [64]u8 = undefined;
+    try testing.expectEqualStrings("n 192.0.2.1\r\n", try serverQuery(&b, "whois.arin.net", "192.0.2.1"));
+    try testing.expectEqualStrings("n 2001:db8::1\r\n", try serverQuery(&b, "WHOIS.ARIN.NET.", "2001:db8::1"));
+    try testing.expectEqualStrings("AS64496\r\n", try serverQuery(&b, "whois.arin.net", "AS64496"));
+    try testing.expectEqualStrings("192.0.2.1\r\n", try serverQuery(&b, "whois.ripe.net", "192.0.2.1"));
+    try testing.expectEqualStrings("domain example.com\r\n", try serverQuery(&b, "whois.verisign-grs.com", "example.com"));
+    try testing.expectEqualStrings("192.0.2.1\r\n", try serverQuery(&b, "whois.verisign-grs.com", "192.0.2.1"));
+    try testing.expectEqualStrings("EXAMPLE\r\n", try serverQuery(&b, "whois.verisign-grs.com", "EXAMPLE"));
+    // A caller-supplied flag is never double-prefixed.
+    try testing.expectEqualStrings("domain example.com\r\n", try serverQuery(&b, "whois.verisign-grs.com", "domain example.com"));
+    // Error paths still apply.
+    try testing.expectError(error.InvalidQuery, serverQuery(&b, "whois.arin.net", "1.2.3.4\r\nx"));
+    try testing.expectError(error.QueryTooLong, serverQuery(&b, "whois.verisign-grs.com", strRepeat("a.", 300)));
+}
+
+test "lookup: ARIN hop of an IP chain gets the n flag" {
+    var scripted: ScriptedTransport = .{ .entries = &.{
+        .{ .server = "whois.arin.net", .response = "NetRange: 192.0.2.0 - 192.0.2.255\n" },
+    } };
+    var buf: [256]u8 = undefined;
+    _ = try lookup(scripted.transport(), "192.0.2.1", .{ .root = "whois.arin.net" }, &buf);
+    try testing.expectEqualStrings("n 192.0.2.1\r\n", scripted.calls[0].queryText());
 }
 
 test "lookup: self-referral stops cleanly" {

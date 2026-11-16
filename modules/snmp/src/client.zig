@@ -33,6 +33,18 @@ pub const TransportError = error{
 pub const Transport = struct {
     ctx: *anyopaque,
     exchangeFn: *const fn (ctx: *anyopaque, request: []const u8, reply_buf: []u8) TransportError!usize,
+    /// Optional fire-and-forget send (no reply expected), used for
+    /// notifications that are not acknowledged (v1 Trap, SNMPv2-Trap). A
+    /// transport that cannot send without waiting leaves it null; trap
+    /// senders then fail with `error.SendNotSupported`.
+    sendFn: ?*const fn (ctx: *anyopaque, request: []const u8) TransportError!void = null,
+
+    pub const SendError = TransportError || error{SendNotSupported};
+
+    pub fn send(t: Transport, request: []const u8) SendError!void {
+        const f = t.sendFn orelse return error.SendNotSupported;
+        try f(t.ctx, request);
+    }
 
     pub fn exchange(t: Transport, request: []const u8, reply_buf: []u8) TransportError![]const u8 {
         const n = try t.exchangeFn(t.ctx, request, reply_buf);
@@ -79,6 +91,7 @@ pub const Client = struct {
     };
 
     pub const Error = TransportError || message.DecodeError || message.EncodeError ||
+        message.NotificationError || Transport.SendError ||
         error{ RequestIdMismatch, UnexpectedPduType, TooManyOids };
 
     pub const Response = struct {
@@ -121,6 +134,39 @@ pub const Client = struct {
     /// SetRequest with fully typed varbinds.
     pub fn set(c: *Client, community: []const u8, varbinds: []const VarBind) Error!Response {
         return c.request(.set_request, community, varbinds, 0, 0);
+    }
+
+    /// Send a v1 Trap-PDU (fire and forget; always an SNMPv1 message
+    /// whatever `version` the client was built with). Needs a transport with
+    /// `sendFn`. The trap's varbinds are passed through unchanged.
+    pub fn trapV1(c: *Client, community: []const u8, trap: message.TrapV1Args) Error!void {
+        const wire = try message.encodeTrapV1(&c.request_buf, community, trap);
+        try c.transport.send(wire);
+    }
+
+    /// Send an SNMPv2-Trap (fire and forget; v2c clients only). `sysUpTime.0`
+    /// and `snmpTrapOID.0` are inserted as the first two varbinds (RFC 3416
+    /// §4.2.6); a payload varbind naming either is `error.ReservedVarbind`.
+    pub fn trapV2(c: *Client, community: []const u8, n: message.Notification) Error!void {
+        if (c.version != .v2c) return error.UnsupportedPdu;
+        var buf: [message.max_notification_varbinds + 2]VarBind = undefined;
+        const vbs = try message.notificationVarbinds(&buf, n);
+        const wire = try message.encode(&c.request_buf, .v2c, community, .{
+            .type = .trap_v2,
+            .request_id = c.allocRequestId(),
+            .varbinds = vbs,
+        });
+        try c.transport.send(wire);
+    }
+
+    /// Send an InformRequest (v2c only) and wait for the receiver's Response,
+    /// re-sending on timeout per `Options.retries` like every other request.
+    /// Leading varbinds as `trapV2`. The returned varbinds echo the request's.
+    pub fn inform(c: *Client, community: []const u8, n: message.Notification) Error!Response {
+        if (c.version != .v2c) return error.UnsupportedPdu;
+        var buf: [message.max_notification_varbinds + 2]VarBind = undefined;
+        const vbs = try message.notificationVarbinds(&buf, n);
+        return c.request(.inform_request, community, vbs, 0, 0);
     }
 
     /// GetNext-based subtree walk. The yielded varbind (and any slice value
@@ -357,7 +403,15 @@ pub const UdpTransport = struct {
     }
 
     pub fn transport(t: *UdpTransport) Transport {
-        return .{ .ctx = t, .exchangeFn = exchangeFn };
+        return .{ .ctx = t, .exchangeFn = exchangeFn, .sendFn = sendFn };
+    }
+
+    fn sendFn(ctx: *anyopaque, request: []const u8) TransportError!void {
+        const t: *UdpTransport = @ptrCast(@alignCast(ctx));
+        t.socket.send(t.io, &t.peer, request) catch |err| return switch (err) {
+            error.Canceled => error.Canceled,
+            else => error.TransportFailed,
+        };
     }
 
     fn exchangeFn(ctx: *anyopaque, request: []const u8, reply_buf: []u8) TransportError!usize {
@@ -896,4 +950,139 @@ test "UdpTransport: a canceled receive surfaces error.Canceled, not error.Transp
     const result = fut.cancel(io);
     try testing.expect(arrived);
     try testing.expectError(error.Canceled, result);
+}
+
+/// Records what is sent; `exchangeFn` answers informs like an acking receiver
+/// (optionally dropping the first `drop` datagrams as timeouts).
+const NotifySink = struct {
+    sent: usize = 0,
+    exchanged: usize = 0,
+    drop: usize = 0,
+    last: [max_message_len]u8 = undefined,
+    last_len: usize = 0,
+
+    fn transport(s: *NotifySink) Transport {
+        return .{ .ctx = s, .exchangeFn = exchangeFn, .sendFn = sendFn };
+    }
+
+    fn lastWire(s: *const NotifySink) []const u8 {
+        return s.last[0..s.last_len];
+    }
+
+    fn sendFn(ctx: *anyopaque, request: []const u8) TransportError!void {
+        const s: *NotifySink = @ptrCast(@alignCast(ctx));
+        s.sent += 1;
+        @memcpy(s.last[0..request.len], request);
+        s.last_len = request.len;
+    }
+
+    fn exchangeFn(ctx: *anyopaque, request: []const u8, reply_buf: []u8) TransportError!usize {
+        const s: *NotifySink = @ptrCast(@alignCast(ctx));
+        s.exchanged += 1;
+        @memcpy(s.last[0..request.len], request);
+        s.last_len = request.len;
+        if (s.exchanged <= s.drop) return error.Timeout;
+        const msg = message.decode(request) catch return error.TransportFailed;
+        const p = switch (msg.pdu) {
+            .inform_request => |p| p,
+            else => return error.TransportFailed,
+        };
+        const out = message.encode(reply_buf, msg.version, msg.community, .{
+            .type = .response,
+            .request_id = p.request_id,
+            .varbinds = &.{},
+        }) catch return error.TransportFailed;
+        std.mem.copyForwards(u8, reply_buf[0..out.len], out);
+        return out.len;
+    }
+};
+
+test "trapV1: sent via sendFn as an SNMPv1 Trap-PDU, round-trips through the decoder" {
+    var sink: NotifySink = .{};
+    var client = Client.init(sink.transport(), .{}); // v2c client still emits a v1 message
+    try client.trapV1("public", .{
+        .enterprise = try Oid.parse("1.3.6.1.4.1.8072"),
+        .agent_addr = .{ 10, 0, 0, 9 },
+        .generic_trap = .link_down,
+        .time_stamp = 55,
+    });
+    try testing.expectEqual(@as(usize, 1), sink.sent);
+    const m = try message.decode(sink.lastWire());
+    try testing.expectEqual(message.Version.v1, m.version);
+    try testing.expectEqual(message.GenericTrap.link_down, m.pdu.trap_v1.generic_trap);
+    try testing.expectEqual(@as(u32, 55), m.pdu.trap_v1.time_stamp);
+}
+
+test "trapV2: leading sysUpTime.0 + snmpTrapOID.0, payload after; version and reserved checks" {
+    var sink: NotifySink = .{};
+    var client = Client.init(sink.transport(), .{});
+    const payload = [_]VarBind{.{ .name = try Oid.parse("1.3.6.1.2.1.1.5.0"), .value = .{ .octet_string = "r1" } }};
+    try client.trapV2("public", .{
+        .uptime = 4242,
+        .trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.3"),
+        .varbinds = &payload,
+    });
+    const m = try message.decode(sink.lastWire());
+    const p = m.pdu.trap_v2;
+    var vbs: [4]VarBind = undefined;
+    const got = try p.varbinds.collect(&vbs);
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expectEqual(@as(u32, 4242), got[0].value.time_ticks);
+    try testing.expect(got[1].value.oid.eql(&(try Oid.parse("1.3.6.1.6.3.1.1.5.3"))));
+    try testing.expectEqualStrings("r1", got[2].value.octet_string);
+
+    // The receiver module normalizes it back to the same event.
+    const receiver = @import("receiver.zig");
+    const ev = try receiver.parseTrap(sink.lastWire());
+    try testing.expectEqual(@as(?u32, 4242), ev.sysUpTime());
+
+    var v1c = Client.init(sink.transport(), .{ .version = .v1 });
+    try testing.expectError(error.UnsupportedPdu, v1c.trapV2("public", .{
+        .uptime = 1,
+        .trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.1"),
+    }));
+    const bad = [_]VarBind{.{ .name = try Oid.parse("1.3.6.1.6.3.1.1.4.1.0"), .value = .null }};
+    try testing.expectError(error.ReservedVarbind, client.trapV2("public", .{
+        .uptime = 1,
+        .trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.1"),
+        .varbinds = &bad,
+    }));
+    try testing.expectEqual(@as(usize, 1), sink.sent); // none of the failures sent
+}
+
+test "trap without sendFn -> SendNotSupported" {
+    var agent: FakeAgent = .{};
+    var client = Client.init(agent.transport(), .{});
+    try testing.expectError(error.SendNotSupported, client.trapV2("public", .{
+        .uptime = 1,
+        .trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.1"),
+    }));
+    try testing.expectEqual(@as(usize, 0), agent.requests_seen);
+}
+
+test "inform: waits for the Response, retries on timeout, gives up after the retry budget" {
+    var sink: NotifySink = .{};
+    var client = Client.init(sink.transport(), .{ .retries = 2 });
+    const n: message.Notification = .{ .uptime = 9, .trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.4") };
+    const resp = try client.inform("public", n);
+    try testing.expectEqual(message.ErrorStatus.no_error, resp.error_status);
+    try testing.expectEqual(@as(usize, 1), sink.exchanged);
+    const m = try message.decode(sink.lastWire());
+    try testing.expectEqual(@as(usize, 2), try m.pdu.inform_request.varbinds.count());
+
+    // First two tries dropped, third answered.
+    var flaky: NotifySink = .{ .drop = 2 };
+    var c2 = Client.init(flaky.transport(), .{ .retries = 2 });
+    _ = try c2.inform("public", n);
+    try testing.expectEqual(@as(usize, 3), flaky.exchanged);
+
+    // All tries dropped -> Timeout.
+    var dead: NotifySink = .{ .drop = 100 };
+    var c3 = Client.init(dead.transport(), .{ .retries = 2 });
+    try testing.expectError(error.Timeout, c3.inform("public", n));
+    try testing.expectEqual(@as(usize, 3), dead.exchanged);
+
+    // v1 has no InformRequest.
+    var c4 = Client.init(sink.transport(), .{ .version = .v1 });
+    try testing.expectError(error.UnsupportedPdu, c4.inform("public", n));
 }
