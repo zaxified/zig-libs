@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Batch speed (third round, bit for bit unchanged): ALMA (f64, period > 1) runs eight bars side by side as two
+  four-lane accumulators, each lane one bar's dot product with the scalar loop's operations in its order (seed 0.0, separate
+  multiply and add, weight order) — 2.5x TA-Lib before, 0.52x now.
 - **2026-11-16** — Batch speed (third round, bit for bit unchanged): STOCH, STOCHF and KDJ (f64) compute the raw %K with the
   two extremum automatons run as `ExtCore.Run` over the slices (same rescans, same tie rule, no `?f64` per bar) and run each
   smoothing stage as one `MaCore` dispatch per call with the variant's monomorphic loop (`smooth.runCore`) instead of a

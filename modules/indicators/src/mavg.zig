@@ -941,11 +941,47 @@ pub fn alma(comptime T: type, gpa: std.mem.Allocator, in: []const T, out: []T, p
         c.fillWeights(w);
         c.weights = w;
     }
+    if (T == f64 and p.period > 1) {
+        almaRun(in, out, w);
+        return AlmaCore.lookback(p);
+    }
     const sl = core.SliceSrc(T){ .xs = in };
     for (in, out) |x, *o| {
         o.* = if (c.step(sl, x)) |r| core.to(T, r) else std.math.nan(T);
     }
     return AlmaCore.lookback(p);
+}
+
+/// The f64 batch of `AlmaCore.stepW` with a weight table (`w.len > 1`): eight bars at a time as two 4-lane
+/// accumulators. Every lane is one bar's dot product, seeded with 0.0 and accumulated in weight order with a separate
+/// multiply and add, the scalar loop's operations and order, so the bits are its bits; the bars only run side by
+/// side (their sums are independent chains, the scalar loop serialises on one).
+fn almaRun(in: []const f64, out: []f64, w: []const f64) void {
+    const n = in.len;
+    const lb = w.len - 1;
+    for (out[0..@min(lb, n)]) |*o| o.* = std.math.nan(f64);
+    const V = @Vector(4, f64);
+    var k = lb; // the bar being written; its window starts at `k - lb`
+    while (k + 8 <= n) : (k += 8) {
+        const b = k - lb;
+        var a0: V = @splat(0.0);
+        var a1: V = @splat(0.0);
+        for (w, 0..) |wj, j| {
+            const ws: V = @splat(wj);
+            const x0: V = in[b + j ..][0..4].*;
+            const x1: V = in[b + j + 4 ..][0..4].*;
+            a0 += ws * x0;
+            a1 += ws * x1;
+        }
+        out[k..][0..4].* = a0;
+        out[k + 4 ..][0..4].* = a1;
+    }
+    while (k < n) : (k += 1) {
+        const b = k - lb;
+        var sum: f64 = 0.0;
+        for (w, 0..) |wj, j| sum += wj * in[b + j];
+        out[k] = sum;
+    }
 }
 pub fn AlmaStream(comptime T: type) type {
     return smooth.Stream1(T, AlmaParams, AlmaCore);
