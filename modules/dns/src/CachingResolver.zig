@@ -1757,6 +1757,25 @@ test "a local refusal takes no budget token" {
     try testing.expectEqual(@as(u64, 0), c.stats().budget_refused);
 }
 
+test "a local refusal from the options takes no budget token either" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    // DO without EDNS: no query can be built (`InvalidOptions`), nothing is sent.
+    var ro = h.ropts;
+    ro.dnssec_ok = true;
+    ro.edns_udp_size = null;
+    var c = try CachingResolver.init(testing.allocator, h.io, ro, .{
+        .clock = h.clock.clock(),
+        .max_network_lookups = .{ .per_s = 1, .burst = 1 },
+    });
+    defer c.deinit();
+    for (0..3) |_| try testing.expectError(error.InvalidOptions, c.lookupIp("a.example.com"));
+    try testing.expectEqual(@as(u64, 0), c.stats().budget_refused);
+    try testing.expectEqual(@as(u64, 0), c.stats().network_lookups);
+    try testing.expectEqual(@as(u32, 0), h.queries());
+}
+
 test "network budget: refusal, refill, and stale under budget" {
     var h: Harness = .{};
     try h.start(.v4);
