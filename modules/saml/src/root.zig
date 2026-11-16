@@ -243,6 +243,15 @@ fn untrustedMetadataXmlOptions() xml.Options {
     return .{ .max_elements = max_untrusted_elements, .utf8_only = true };
 }
 
+/// `untrustedMetadataXmlOptions` with the caller's element budget: a
+/// federation aggregate is far larger than one entity's metadata, so
+/// `parseIdpMetadataFor` takes the bound from `AggregateOptions`.
+fn untrustedAggregateXmlOptions(max_elements: usize) xml.Options {
+    var o = untrustedMetadataXmlOptions();
+    o.max_elements = max_elements;
+    return o;
+}
+
 // ── configuration ────────────────────────────────────────────────────────────
 
 /// The IdP's signing key, as `Config.idp_key` takes it.
@@ -2215,9 +2224,7 @@ pub fn parseIdpMetadataFor(
     entity_id: []const u8,
     opts: AggregateOptions,
 ) AggregateError!IdpMetadata {
-    var xo = untrustedMetadataXmlOptions();
-    xo.max_elements = opts.max_elements;
-    var doc = xml.parse(alloc, metadata_xml, xo) catch |e| switch (e) {
+    var doc = xml.parse(alloc, metadata_xml, untrustedAggregateXmlOptions(opts.max_elements)) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedMetadata,
     };
@@ -4779,7 +4786,8 @@ test "TEETH: every untrusted parse in this file goes through an options helper" 
         if (skip) continue;
         checked += 1;
         const ok = std.mem.find(u8, tail, "untrustedXmlOptions()") != null or
-            std.mem.find(u8, tail, "untrustedMetadataXmlOptions()") != null;
+            std.mem.find(u8, tail, "untrustedMetadataXmlOptions()") != null or
+            std.mem.find(u8, tail, "untrustedAggregateXmlOptions(") != null;
         if (!ok) {
             std.debug.print("an untrusted xml.parse does not use an options helper:\n  {s}\n", .{tail});
             return error.UntrustedParseWithoutBudget;
