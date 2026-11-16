@@ -37,11 +37,17 @@ const v1_prefix = "PROXY ";
 /// A v1 line, CRLF included, is at most 107 bytes (spec § 2.1).
 pub const max_v1_len = 107;
 
-/// Default cap on a whole v2 header (16 fixed bytes + the length field).
-/// 536 is the figure the specification derives for a header that always fits
-/// one minimum-size IPv4 datagram (576 − 20 IP − 20 TCP): the largest header a
-/// balancer is expected to send. A unix-socket address block alone is 216.
-pub const default_max_v2_len = 536;
+/// Default cap on a whole v2 header (16 fixed bytes + the length field):
+/// 16 + 4096, go-proxyproto's payload cap. The specification's 536 (a header
+/// that fits one minimum-size IPv4 datagram, 576 − 20 IP − 20 TCP) is a
+/// sender's guideline for headers without extra TLVs, not a receiver's limit:
+/// HAProxy's `send-proxy-v2-ssl-cn` with a long CN, ALPN, authority and a
+/// unique id can pass it. A unix-socket address block alone is 216. Set
+/// `max_v2_len` lower to bound what a peer can make `read` buffer.
+pub const default_max_v2_len = 16 + 4096;
+
+/// The specification's limit on a `PP2_TYPE_UNIQUE_ID` value.
+pub const max_unique_id_len = 128;
 
 /// A unix-socket address field is 108 bytes, NUL padded.
 pub const unix_path_len = 108;
@@ -119,8 +125,12 @@ pub const Header = struct {
     pub fn authority(h: Header) error{Malformed}!?[]const u8 {
         return h.tlv(tlv_type.authority);
     }
+    /// `error.Malformed` when the value is longer than the specification's
+    /// 128 bytes (`max_unique_id_len`): a caller can log or store it bounded.
     pub fn uniqueId(h: Header) error{Malformed}!?[]const u8 {
-        return h.tlv(tlv_type.unique_id);
+        const v = try h.tlv(tlv_type.unique_id) orelse return null;
+        if (v.len > max_unique_id_len) return error.Malformed;
+        return v;
     }
     pub fn netns(h: Header) error{Malformed}!?[]const u8 {
         return h.tlv(tlv_type.netns);
@@ -339,7 +349,8 @@ fn parseV2(buf: []const u8, opts: Options) ParseError!ParseResult {
     if (buf.len < total) return .{ .need_more = total - buf.len };
     const payload = buf[16..total];
     if (cmd == 0) {
-        // LOCAL: the protocol block, family included, is discarded.
+        // LOCAL: the protocol block, family included, is discarded unchecked (spec: the receiver
+        // must ignore it), TLVs and a CRC32C among them.
         return .{ .header = .{ .h = .{ .command = .local }, .consumed = total } };
     }
     const fam: Family, const alen: usize = switch (buf[13]) {
@@ -352,6 +363,7 @@ fn parseV2(buf: []const u8, opts: Options) ParseError!ParseResult {
         0x32 => .{ .unix_dgram, 216 },
         else => return error.Malformed,
     };
+    // UNSPEC: no addresses; the rest of the block is discarded unchecked, as for LOCAL.
     if (fam == .unspec) return .{ .header = .{ .h = .{}, .consumed = total } };
     if (payload.len < alen) return error.Malformed;
     const tlvs = payload[alen..];

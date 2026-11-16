@@ -268,16 +268,19 @@ test "v2: address block shorter than the family needs" {
     try testing.expectError(error.Malformed, pp.parse(&u));
 }
 
-test "v2: size cap, default 536" {
+test "v2: size cap, default 16 + 4096" {
     var big: [16]u8 = undefined;
     @memcpy(big[0..12], &sig);
     big[12] = 0x21;
     big[13] = 0x11;
-    // 520 payload bytes = exactly 536: accepted as far as the cap goes.
-    std.mem.writeInt(u16, big[14..16], 520, .big);
-    try testing.expectEqual(@as(usize, 520), (try pp.parse(&big)).need_more);
-    std.mem.writeInt(u16, big[14..16], 521, .big);
+    // 4096 payload bytes = exactly the default cap: accepted as far as the cap goes.
+    std.mem.writeInt(u16, big[14..16], 4096, .big);
+    try testing.expectEqual(@as(usize, 4096), (try pp.parse(&big)).need_more);
+    std.mem.writeInt(u16, big[14..16], 4097, .big);
     try testing.expectError(error.TooLarge, pp.parse(&big));
+    // The specification's 536 is still a cap one can set.
+    std.mem.writeInt(u16, big[14..16], 521, .big);
+    try testing.expectError(error.TooLarge, pp.parseOpts(&big, .{ .max_v2_len = 536 }));
     std.mem.writeInt(u16, big[14..16], 65535, .big);
     try testing.expectError(error.TooLarge, pp.parse(&big));
     // A configured cap, both ways.
@@ -876,4 +879,21 @@ test "writeV2: the payload length field holds 65535, not 65536" {
     std.mem.writeInt(u16, tlvs[1..3], 65_533, .big);
     w = .fixed(out);
     try testing.expectError(error.TooLarge, pp.writeV2(&w, .{ .command = .local }, tlvs));
+}
+
+test "uniqueId: the specification's 128 bytes pass, 129 are refused" {
+    for ([_]usize{ 0, 128, 129 }) |n| {
+        var area: [3 + 129]u8 = undefined;
+        area[0] = pp.tlv_type.unique_id;
+        std.mem.writeInt(u16, area[1..3], @intCast(n), .big);
+        @memset(area[3..][0..n], 'u');
+        const h: pp.Header = .{ .command = .proxy, .tlvs = area[0 .. 3 + n] };
+        if (n <= pp.max_unique_id_len) {
+            try testing.expectEqual(n, (try h.uniqueId()).?.len);
+        } else {
+            try testing.expectError(error.Malformed, h.uniqueId());
+        }
+        // The raw accessor keeps any length.
+        try testing.expectEqual(n, (try h.tlv(pp.tlv_type.unique_id)).?.len);
+    }
 }

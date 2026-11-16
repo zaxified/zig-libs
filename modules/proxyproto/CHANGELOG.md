@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Independent review fixes. **Behaviour change:** `default_max_v2_len` is 16 + 4096 (go-proxyproto's cap)
+  instead of the specification's 536, which is a sender's guideline and refused legitimate TLV-heavy headers (set
+  `max_v2_len = 536` for the old bound; a `read` buffer sized with `default_max_v2_len` grows accordingly). `uniqueId()`
+  refuses a value over 128 bytes (`max_unique_id_len`). Documented: the writer's payload range vs the reader's cap, the raw
+  `writeV2` TLV area, LOCAL/UNSPEC blocks discarded unchecked, and a read deadline as the caller's job.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** SPEC § Open no longer says "no mutation run" (the 2026-11-15 audit is recorded); what is open is an independent review.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** interop oracle against pires/go-proxyproto v0.16.0 (`tools/interop.zig` + `tools/go_oracle/`, `zig build interop-proxyproto`): 160 085 seeded cases (parse, our writer read by Go, Go's writer read here, SSL TLV), 0 unexplained disagreements, eight documented differences listed in SPEC § Interop oracle; the anchor oracle moves from SELF to EXTERNAL.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** `example/main.zig` (CONVENTIONS §7.2: 34 `pub fn`): a balancer writes a v2 header with ALPN and CRC32C, the server reads it from a trusted peer and keeps the client's bytes, an untrusted peer is refused, a connection without a header keeps every byte, and the v1 line round-trips.
