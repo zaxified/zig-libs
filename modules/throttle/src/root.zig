@@ -292,12 +292,167 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 /// cookie there, `csrf` issues its token there — could not touch a 503 whose
 /// head had already gone out.
 fn shed(t: *Throttle, ctx: *router.Ctx) anyerror!void {
+    return shedAfter(t.options.retry_after_ms, ctx);
+}
+
+fn shedAfter(retry_after_ms: u64, ctx: *router.Ctx) anyerror!void {
     var retry_buf: [24]u8 = undefined;
-    const retry_s = @max(1, std.math.divCeil(u64, t.options.retry_after_ms, std.time.ms_per_s) catch unreachable);
+    const retry_s = @max(1, std.math.divCeil(u64, retry_after_ms, std.time.ms_per_s) catch unreachable);
     ctx.res.setStatus(503);
     try ctx.res.setHeader("Retry-After", std.mem.print(&retry_buf, "{d}", .{retry_s}) catch unreachable);
     try ctx.res.setHeader("Content-Type", "text/plain");
     try ctx.res.writeAll("Service Unavailable\n");
+}
+
+// ── partitioned limiter ─────────────────────────────────────────────────────
+
+/// Most partitions a `Partitioned` can hold (fixed storage, no allocation).
+pub const max_partitions = 16;
+
+pub const PartitionError = error{
+    /// `shares_percent` is empty.
+    NoPartitions,
+    /// More than `max_partitions` shares.
+    TooManyPartitions,
+    /// The shares add up to more than 100 %.
+    SharesExceed100,
+    /// `max_in_flight` is 0.
+    ZeroLimit,
+};
+
+pub const PartitionedOptions = struct {
+    /// Total budget the partitions share. Must be >= 1.
+    max_in_flight: u32,
+    /// One entry per partition: its guaranteed percentage of `max_in_flight`
+    /// (rounded down). The sum must be <= 100; the unassigned rest is only
+    /// ever borrowable. 0 is allowed (a pure borrower).
+    shares_percent: []const u8,
+    /// `Retry-After` hint for the 503 of `middleware()` (same meaning as
+    /// `Options.retry_after_ms`).
+    retry_after_ms: u64 = 1_000,
+    /// Picks the partition of a request for `middleware()` (e.g. by path or
+    /// header). null = every request is partition 0. An index out of range
+    /// is shed.
+    classify: ?*const fn (ctx: *router.Ctx) usize = null,
+};
+
+/// Netflix `PartitionedLimiter` shape: each partition has a guaranteed share
+/// of the budget and may borrow what the others leave unused. A request of
+/// partition `p` is admitted when `p` holds fewer slots than its guarantee,
+/// OR the total in flight is below `max_in_flight` (borrowing). Hence a flood
+/// in one partition fills at most the whole budget and can never take away a
+/// slot another partition is still entitled to: that partition's own
+/// guaranteed requests are admitted even then. The price (same as Netflix):
+/// the total may exceed `max_in_flight` while guaranteed requests land on a
+/// fully borrowed budget, by at most the sum of the guarantees (so at most
+/// 2 x `max_in_flight`). No waiting: a refused request sheds at once.
+/// Lock-free (atomics only), no allocation, `release(p)` must name the
+/// partition the matching acquire used.
+pub const Partitioned = struct {
+    retry_after_ms: u64,
+    classify: ?*const fn (ctx: *router.Ctx) usize,
+    max_in_flight: u32,
+    count: usize,
+    guarantee: [max_partitions]u32 = @splat(0),
+    busy: [max_partitions]std.atomic.Value(u32) = @splat(.init(0)),
+    total: std.atomic.Value(u32) = .init(0),
+
+    pub fn init(options: PartitionedOptions) PartitionError!Partitioned {
+        if (options.max_in_flight == 0) return error.ZeroLimit;
+        if (options.shares_percent.len == 0) return error.NoPartitions;
+        if (options.shares_percent.len > max_partitions) return error.TooManyPartitions;
+        var sum: u32 = 0;
+        for (options.shares_percent) |sh| sum += sh; // <= 16 * 255, no overflow
+        if (sum > 100) return error.SharesExceed100;
+        var p: Partitioned = .{
+            .retry_after_ms = options.retry_after_ms,
+            .classify = options.classify,
+            .max_in_flight = options.max_in_flight,
+            .count = options.shares_percent.len,
+        };
+        for (options.shares_percent, 0..) |sh, i| {
+            p.guarantee[i] = @intCast(@as(u64, options.max_in_flight) * sh / 100);
+        }
+        return p;
+    }
+
+    /// Asserts that every slot was released.
+    pub fn deinit(p: *Partitioned) void {
+        std.debug.assert(p.total.load(.seq_cst) == 0);
+        p.* = undefined;
+    }
+
+    /// Take a slot for `partition`; false = shed (also for an index out of
+    /// range). A failed attempt consumes nothing. Pair every success with one
+    /// `release(partition)`.
+    pub fn tryAcquire(p: *Partitioned, partition: usize) bool {
+        if (partition >= p.count) return false;
+        const b = &p.busy[partition];
+        // Guaranteed path: under the partition's own share.
+        var cur = b.load(.seq_cst);
+        while (cur < p.guarantee[partition]) {
+            cur = b.cmpxchgWeak(cur, cur + 1, .seq_cst, .seq_cst) orelse {
+                _ = p.total.fetchAdd(1, .seq_cst);
+                return true;
+            };
+        }
+        // Borrow path: the whole budget still has room.
+        var t = p.total.load(.seq_cst);
+        while (t < p.max_in_flight) {
+            t = p.total.cmpxchgWeak(t, t + 1, .seq_cst, .seq_cst) orelse {
+                _ = b.fetchAdd(1, .seq_cst);
+                return true;
+            };
+        }
+        return false;
+    }
+
+    /// Return a slot taken for `partition`. An index out of range or a
+    /// release without a matching acquire is a caller bug: it asserts in
+    /// Debug (the index case just returns) and saturates at 0 in release
+    /// builds, never wrapping.
+    pub fn release(p: *Partitioned, partition: usize) void {
+        if (partition >= p.count) return;
+        const b = &p.busy[partition];
+        var cur = b.load(.seq_cst);
+        while (true) {
+            std.debug.assert(cur > 0);
+            if (cur == 0) return;
+            cur = b.cmpxchgWeak(cur, cur - 1, .seq_cst, .seq_cst) orelse break;
+        }
+        _ = p.total.fetchSub(1, .seq_cst);
+    }
+
+    /// Slots currently held across all partitions.
+    pub fn inFlight(p: *const Partitioned) usize {
+        return p.total.load(.seq_cst);
+    }
+
+    /// Slots currently held by `partition` (0 for an index out of range).
+    pub fn inFlightIn(p: *const Partitioned, partition: usize) usize {
+        if (partition >= p.count) return 0;
+        return p.busy[partition].load(.seq_cst);
+    }
+
+    /// The guaranteed slot count of `partition` (0 for an index out of range).
+    pub fn guaranteed(p: *const Partitioned, partition: usize) u32 {
+        if (partition >= p.count) return 0;
+        return p.guarantee[partition];
+    }
+
+    /// A `router.Middleware` like `Throttle.middleware`: the partition comes
+    /// from `PartitionedOptions.classify`; shed = 503 + `Retry-After`.
+    pub fn middleware(p: *Partitioned) router.Middleware {
+        return .{ .state = p, .run = partitionedRun };
+    }
+};
+
+fn partitionedRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    const p: *Partitioned = @ptrCast(@alignCast(state.?));
+    const part = if (p.classify) |f| f(ctx) else 0;
+    if (!p.tryAcquire(part)) return shedAfter(p.retry_after_ms, ctx);
+    defer p.release(part);
+    return next.run(ctx);
 }
 
 // ── tests: the bare semaphore (no clock, no Io, no HTTP) ────────────────────
@@ -1244,4 +1399,150 @@ test "Clock.monotonic keeps sub-second resolution and advances across a sleep" {
     const b = Clock.monotonic.now();
     try testing.expect(b >= a + 20 * std.time.ns_per_ms);
     try testing.expect(b - a < 900 * std.time.ns_per_ms);
+}
+
+// ── tests: partitioned limiter ──────────────────────────────────────────────
+
+test "Partitioned.init: refuses bad shares with errors, never panics" {
+    try testing.expectError(error.ZeroLimit, Partitioned.init(.{ .max_in_flight = 0, .shares_percent = &.{50} }));
+    try testing.expectError(error.NoPartitions, Partitioned.init(.{ .max_in_flight = 10, .shares_percent = &.{} }));
+    try testing.expectError(error.SharesExceed100, Partitioned.init(.{ .max_in_flight = 10, .shares_percent = &.{ 60, 41 } }));
+    try testing.expectError(error.SharesExceed100, Partitioned.init(.{ .max_in_flight = 10, .shares_percent = &.{ 255, 255 } }));
+    const many: [max_partitions + 1]u8 = @splat(1);
+    try testing.expectError(error.TooManyPartitions, Partitioned.init(.{ .max_in_flight = 10, .shares_percent = &many }));
+    const full: [max_partitions]u8 = @splat(1);
+    var ok = try Partitioned.init(.{ .max_in_flight = 100, .shares_percent = &full });
+    defer ok.deinit();
+    var exact = try Partitioned.init(.{ .max_in_flight = 10, .shares_percent = &.{ 60, 40 } });
+    defer exact.deinit();
+    try testing.expectEqual(@as(u32, 6), exact.guaranteed(0));
+    try testing.expectEqual(@as(u32, 4), exact.guaranteed(1));
+    try testing.expectEqual(@as(u32, 0), exact.guaranteed(2));
+}
+
+test "Partitioned: a flood in one partition cannot starve another's guaranteed share" {
+    var p = try Partitioned.init(.{ .max_in_flight = 10, .shares_percent = &.{ 50, 30 } });
+    defer p.deinit();
+    // Flood A: borrows the whole budget (5 guaranteed + 5 borrowed).
+    var a: usize = 0;
+    while (p.tryAcquire(0)) a += 1;
+    try testing.expectEqual(@as(usize, 10), a);
+    try testing.expect(!p.tryAcquire(0));
+    // B still gets exactly its guarantee, though the budget is full.
+    var b: usize = 0;
+    while (p.tryAcquire(1)) b += 1;
+    try testing.expectEqual(@as(usize, 3), b);
+    try testing.expectEqual(@as(usize, 13), p.inFlight());
+    // Past its share B may only borrow, and the budget is still over-full.
+    p.release(0);
+    try testing.expect(!p.tryAcquire(1)); // total 12 >= 10
+    for (0..3) |_| p.release(0);
+    try testing.expect(p.tryAcquire(1)); // total 9 < 10: the borrow succeeds
+    try testing.expectEqual(@as(usize, 4), p.inFlightIn(1));
+    while (p.inFlightIn(0) > 0) p.release(0);
+    while (p.inFlightIn(1) > 0) p.release(1);
+}
+
+test "Partitioned: borrowing when the other partition is idle, then reclaiming" {
+    var p = try Partitioned.init(.{ .max_in_flight = 10, .shares_percent = &.{ 50, 50 } });
+    defer p.deinit();
+    var a: usize = 0;
+    while (p.tryAcquire(0)) a += 1;
+    try testing.expectEqual(@as(usize, 10), a); // 5 own + 5 borrowed from idle B
+    try testing.expectEqual(@as(usize, 10), p.inFlightIn(0));
+    // B's guaranteed requests are admitted at once although the budget is full.
+    for (0..5) |_| try testing.expect(p.tryAcquire(1));
+    try testing.expect(!p.tryAcquire(1));
+    // Drain everything: counters return to zero.
+    for (0..10) |_| p.release(0);
+    for (0..5) |_| p.release(1);
+    try testing.expectEqual(@as(usize, 0), p.inFlight());
+    try testing.expectEqual(@as(usize, 0), p.inFlightIn(0));
+    try testing.expectEqual(@as(usize, 0), p.inFlightIn(1));
+}
+
+test "Partitioned: release accounting, bad index, unassigned share is borrowable" {
+    var p = try Partitioned.init(.{ .max_in_flight = 10, .shares_percent = &.{ 20, 20 } });
+    defer p.deinit();
+    try testing.expect(!p.tryAcquire(2)); // out of range: shed, nothing consumed
+    p.release(2); // out of range: no-op
+    try testing.expectEqual(@as(usize, 0), p.inFlight());
+    try testing.expectEqual(@as(usize, 0), p.inFlightIn(7));
+    // 60 % unassigned: partition 0 can reach 10 only by borrowing.
+    for (0..10) |_| try testing.expect(p.tryAcquire(0));
+    try testing.expectEqual(@as(usize, 10), p.inFlightIn(0));
+    p.release(0);
+    try testing.expectEqual(@as(usize, 9), p.inFlight());
+    try testing.expectEqual(@as(usize, 9), p.inFlightIn(0));
+    // Freed room is borrowable by the other partition once its guarantee is used up.
+    try testing.expect(p.tryAcquire(1));
+    try testing.expectEqual(@as(usize, 10), p.inFlight());
+    for (0..9) |_| p.release(0);
+    p.release(1);
+    try testing.expectEqual(@as(usize, 0), p.inFlight());
+}
+
+test "Partitioned: a zero-share partition only borrows" {
+    var p = try Partitioned.init(.{ .max_in_flight = 4, .shares_percent = &.{ 100, 0 } });
+    defer p.deinit();
+    for (0..4) |_| try testing.expect(p.tryAcquire(0));
+    try testing.expect(!p.tryAcquire(1)); // no guarantee, no room
+    p.release(0);
+    try testing.expect(p.tryAcquire(1)); // borrows the freed slot
+    p.release(1);
+    for (0..3) |_| p.release(0);
+}
+
+fn classifyByPath(ctx: *router.Ctx) usize {
+    return if (std.mem.eql(u8, ctx.req.path, "/health")) 1 else 0;
+}
+
+test "Partitioned.middleware: classify picks the partition, 503 when its partition is out of budget" {
+    var p = try Partitioned.init(.{
+        .max_in_flight = 2,
+        .shares_percent = &.{ 50, 50 },
+        .classify = classifyByPath,
+    });
+    defer p.deinit();
+    var hits: u32 = 0;
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &hits;
+    try r.use(p.middleware());
+    try r.get("/t", hCount);
+    try r.get("/health", hCount);
+
+    var buf: [1024]u8 = undefined;
+    // Partition 0 saturated (borrowing the whole budget).
+    try testing.expect(p.tryAcquire(0));
+    try testing.expect(p.tryAcquire(0));
+    try expectStatus(runWire(&r, wire("/t"), &buf), "503");
+    try expectHeaderLine(runWire(&r, wire("/t"), &buf), "Retry-After: 1");
+    try testing.expectEqual(0, hits);
+    // Partition 1 is still served from its guarantee, and the slot comes back.
+    try expectStatus(runWire(&r, wire("/health"), &buf), "200");
+    try testing.expectEqual(1, hits);
+    try testing.expectEqual(2, p.inFlight());
+    p.release(0);
+    p.release(0);
+    try expectStatus(runWire(&r, wire("/t"), &buf), "200");
+    try testing.expectEqual(0, p.inFlight());
+}
+
+test "Partitioned: 8 threads never lose accounting and guaranteed share holds" {
+    var p = try Partitioned.init(.{ .max_in_flight = 8, .shares_percent = &.{ 50, 25 } });
+    defer p.deinit();
+    const W = struct {
+        fn run(pp: *Partitioned, part: usize) void {
+            for (0..20_000) |_| {
+                if (pp.tryAcquire(part)) pp.release(part);
+            }
+        }
+    };
+    var ts: [8]std.Thread = undefined;
+    for (&ts, 0..) |*t, i| t.* = std.Thread.spawn(.{}, W.run, .{ &p, i % 2 }) catch return error.SkipZigTest;
+    for (ts) |t| t.join();
+    try testing.expectEqual(@as(usize, 0), p.inFlight());
+    try testing.expectEqual(@as(usize, 0), p.inFlightIn(0));
+    try testing.expectEqual(@as(usize, 0), p.inFlightIn(1));
 }

@@ -63,6 +63,27 @@ Observability: `inFlight()`, `waiting()`, `maxInFlight()`, `maxWaiters()` —
 utilization is `inFlight() / maxInFlight()` (for the `metrics`
 module).
 
+## Partitioned limits
+
+`Partitioned` splits the budget into up to 16 partitions with guaranteed
+percentage shares (sum <= 100, else `init` returns an error). A request is
+admitted when its partition is under its share, or the total is under
+`max_in_flight` (borrowing idle capacity). A flood in one partition therefore
+cannot take another's guaranteed slots; the price is that the total may
+briefly exceed `max_in_flight` (by at most the sum of the guarantees).
+
+```zig
+var p = try throttle.Partitioned.init(.{
+    .max_in_flight = 100,
+    .shares_percent = &.{ 10, 60 }, // 0 = health checks, 1 = paying tier; 30 % only borrowable
+    .classify = myClassify, // fn (*router.Ctx) usize; null = partition 0
+});
+defer p.deinit();
+try r.use(p.middleware()); // or: if (p.tryAcquire(1)) { defer p.release(1); ... }
+```
+
+No waiting: a refused request sheds at once (503 + `Retry-After`).
+
 ## Without the router
 
 The middleware is a convenience wrapper; the whole mechanism is two public,

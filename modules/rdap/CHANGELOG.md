@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — New typed `secureDNS` (RFC 9083 §5.3): `Object.secure_dns: ?SecureDns` (`zone_signed`, `delegation_signed`, `max_sig_life`, `ds_data: []DsData`, `key_data: []KeyData`; records carry optional `events`/`links`). Lenient like the other mappers (wrong types -> null, bad entries skipped); each record list capped at `max_secure_dns_records` (64). Additive: `Object` gained one defaulted field.
 - **2026-11-16** — New `QueryType.help` (`buildPath`/`buildUrl` give `help`, value ignored) and `QueryType.tld` (`domain/<tld>` for a root RDAP server, one leading dot dropped). Additive: the five existing variants and their outputs are unchanged; `QueryType` gained two members, so an exhaustive `switch` over it in caller code needs two new arms.
 - **2026-10-18** — Ported to Zig 0.17.0. Test-only `ReadCueIo` overrides `vtable.operate` and counts `.net_read`. No behaviour change.
 - **2026-10-10** — **SECURITY (Fixed): a trailing dot hid a numeric host from the special-use guard.** `127.0.0.1.`, `127.1.` and `2130706433.` are now read as the address they denote (ONE trailing dot is stripped before the `inet_aton` analysis); two trailing dots leave an empty part and are refused as an invalid numeric form.

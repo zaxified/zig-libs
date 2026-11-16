@@ -267,6 +267,45 @@ pub const Redacted = struct {
     method: ?[]const u8 = null, // "removal" / "emptyValue" / "partialValue" / "referenceRemoval"
 };
 
+/// Cap on how many `secureDNS.dsData[]` / `keyData[]` records are mapped
+/// (each); records past it are silently dropped, like entities past
+/// `max_entity_depth`. A real zone has a handful (key rollover: 2-4).
+pub const max_secure_dns_records: usize = 64;
+
+/// One `secureDNS.dsData[]` member (RFC 9083 §5.3): a DS record as the
+/// registry holds it. Numeric members that are missing, wrong-typed or out
+/// of the `u32` range read as `null`.
+pub const DsData = struct {
+    key_tag: ?u32 = null,
+    algorithm: ?u32 = null,
+    /// Hex digest text as sent.
+    digest: []const u8 = "",
+    digest_type: ?u32 = null,
+    events: []const Event = &.{},
+    links: []const Link = &.{},
+};
+
+/// One `secureDNS.keyData[]` member (RFC 9083 §5.3): a DNSKEY record.
+pub const KeyData = struct {
+    flags: ?u32 = null,
+    protocol: ?u32 = null,
+    /// Base64 public key text as sent.
+    public_key: []const u8 = "",
+    algorithm: ?u32 = null,
+    events: []const Event = &.{},
+    links: []const Link = &.{},
+};
+
+/// The `secureDNS` member of a domain (RFC 9083 §5.3) — DNSSEC posture.
+/// Booleans/numbers that are absent or wrong-typed are `null`.
+pub const SecureDns = struct {
+    zone_signed: ?bool = null,
+    delegation_signed: ?bool = null,
+    max_sig_life: ?i64 = null,
+    ds_data: []const DsData = &.{},
+    key_data: []const KeyData = &.{},
+};
+
 /// One `links[]` member (RFC 9083 §4.2). Entries without an `href` are
 /// dropped during mapping.
 pub const Link = struct {
@@ -327,6 +366,8 @@ pub const Object = struct {
     public_ids: []const PublicId = &.{},
     /// `redacted[]` (RFC 9537) — GDPR/privacy redaction disclosures.
     redacted: []const Redacted = &.{},
+    /// `secureDNS` (RFC 9083 §5.3); `null` when absent or not a JSON object.
+    secure_dns: ?SecureDns = null,
 
     /// `eventDate` of the first event with this action
     /// (ASCII case-insensitive), e.g. "registration", "expiration".
@@ -502,7 +543,68 @@ fn mapObject(a: std.mem.Allocator, obj: std.json.ObjectMap) error{OutOfMemory}!O
     o.remarks = try mapNotices(a, obj.get("remarks"));
     o.public_ids = try mapPublicIds(a, obj.get("publicIds"));
     o.redacted = try mapRedacted(a, obj.get("redacted"));
+    if (getObj(obj, "secureDNS")) |sd| o.secure_dns = try mapSecureDns(a, sd);
     return o;
+}
+
+fn boolField(obj: std.json.ObjectMap, key: []const u8) ?bool {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .bool => |b| b,
+        else => null,
+    };
+}
+
+fn u32Field(obj: std.json.ObjectMap, key: []const u8) ?u32 {
+    const i = intField(obj, key) orelse return null;
+    return std.math.cast(u32, i);
+}
+
+fn mapSecureDns(a: std.mem.Allocator, sd: std.json.ObjectMap) error{OutOfMemory}!SecureDns {
+    var out: SecureDns = .{
+        .zone_signed = boolField(sd, "zoneSigned"),
+        .delegation_signed = boolField(sd, "delegationSigned"),
+        .max_sig_life = intField(sd, "maxSigLife"),
+    };
+    if (arrayOf(sd.get("dsData"))) |arr| {
+        var list: std.ArrayList(DsData) = .empty;
+        for (arr.items) |item| {
+            if (list.items.len >= max_secure_dns_records) break;
+            const eo = switch (item) {
+                .object => |x| x,
+                else => continue,
+            };
+            try list.append(a, .{
+                .key_tag = u32Field(eo, "keyTag"),
+                .algorithm = u32Field(eo, "algorithm"),
+                .digest = if (getStr(eo, "digest")) |s| try a.dupe(u8, s) else "",
+                .digest_type = u32Field(eo, "digestType"),
+                .events = try mapEvents(a, eo.get("events")),
+                .links = try mapLinks(a, eo.get("links")),
+            });
+        }
+        out.ds_data = try list.toOwnedSlice(a);
+    }
+    if (arrayOf(sd.get("keyData"))) |arr| {
+        var list: std.ArrayList(KeyData) = .empty;
+        for (arr.items) |item| {
+            if (list.items.len >= max_secure_dns_records) break;
+            const eo = switch (item) {
+                .object => |x| x,
+                else => continue,
+            };
+            try list.append(a, .{
+                .flags = u32Field(eo, "flags"),
+                .protocol = u32Field(eo, "protocol"),
+                .public_key = if (getStr(eo, "publicKey")) |s| try a.dupe(u8, s) else "",
+                .algorithm = u32Field(eo, "algorithm"),
+                .events = try mapEvents(a, eo.get("events")),
+                .links = try mapLinks(a, eo.get("links")),
+            });
+        }
+        out.key_data = try list.toOwnedSlice(a);
+    }
+    return out;
 }
 
 fn mapEvents(a: std.mem.Allocator, v_opt: ?std.json.Value) error{OutOfMemory}![]const Event {
@@ -2613,6 +2715,93 @@ test "HttpFetcher: every redirect Location is gated, and the chain is bounded (r
 // spoof); `parseBootstrap` runs on the IANA bootstrap registry file the
 // client fetches to find that server in the first place — both are JSON
 // this process did not produce.
+
+test "secureDNS: hand-built full record" {
+    var parsed = try parseResponse(testing.allocator,
+        \\{"objectClassName":"domain","secureDNS":{"zoneSigned":true,"delegationSigned":false,"maxSigLife":604800,
+        \\ "dsData":[{"keyTag":12345,"algorithm":8,"digest":"ABCD","digestType":2,
+        \\   "events":[{"eventAction":"last changed","eventDate":"2026-01-01T00:00:00Z"}],
+        \\   "links":[{"href":"https://x.example/ds","rel":"self"}]}],
+        \\ "keyData":[{"flags":257,"protocol":3,"publicKey":"AwEAAQ==","algorithm":13}]}}
+    );
+    defer parsed.deinit();
+    const sd = parsed.document.object.secure_dns.?;
+    try testing.expectEqual(@as(?bool, true), sd.zone_signed);
+    try testing.expectEqual(@as(?bool, false), sd.delegation_signed);
+    try testing.expectEqual(@as(?i64, 604800), sd.max_sig_life);
+    try testing.expectEqual(@as(usize, 1), sd.ds_data.len);
+    const ds = sd.ds_data[0];
+    try testing.expectEqual(@as(?u32, 12345), ds.key_tag);
+    try testing.expectEqual(@as(?u32, 8), ds.algorithm);
+    try testing.expectEqualStrings("ABCD", ds.digest);
+    try testing.expectEqual(@as(?u32, 2), ds.digest_type);
+    try testing.expectEqualStrings("last changed", ds.events[0].action);
+    try testing.expectEqualStrings("https://x.example/ds", ds.links[0].href);
+    try testing.expectEqual(@as(usize, 1), sd.key_data.len);
+    const kd = sd.key_data[0];
+    try testing.expectEqual(@as(?u32, 257), kd.flags);
+    try testing.expectEqual(@as(?u32, 3), kd.protocol);
+    try testing.expectEqualStrings("AwEAAQ==", kd.public_key);
+    try testing.expectEqual(@as(?u32, 13), kd.algorithm);
+}
+
+test "secureDNS: absent, wrong-typed and malformed members degrade" {
+    const cases = [_][]const u8{
+        \\{"objectClassName":"domain"}
+        ,
+        \\{"secureDNS":"yes"}
+        ,
+        \\{"secureDNS":[1,2]}
+        ,
+    };
+    for (cases) |c| {
+        var p = try parseResponse(testing.allocator, c);
+        defer p.deinit();
+        try testing.expect(p.document.object.secure_dns == null);
+    }
+    var p = try parseResponse(testing.allocator,
+        \\{"secureDNS":{"zoneSigned":"true","delegationSigned":1,"maxSigLife":"x","dsData":"no",
+        \\ "keyData":[7,{"flags":-1,"protocol":4294967296,"publicKey":5,"algorithm":1.5}]}}
+    );
+    defer p.deinit();
+    const sd = p.document.object.secure_dns.?;
+    try testing.expect(sd.zone_signed == null);
+    try testing.expect(sd.delegation_signed == null);
+    try testing.expect(sd.max_sig_life == null);
+    try testing.expectEqual(@as(usize, 0), sd.ds_data.len);
+    try testing.expectEqual(@as(usize, 1), sd.key_data.len);
+    try testing.expect(sd.key_data[0].flags == null);
+    try testing.expect(sd.key_data[0].protocol == null);
+    try testing.expectEqualStrings("", sd.key_data[0].public_key);
+    try testing.expect(sd.key_data[0].algorithm == null);
+}
+
+test "secureDNS: empty object and record count cap" {
+    var p0 = try parseResponse(testing.allocator, "{\"secureDNS\":{}}");
+    defer p0.deinit();
+    const sd0 = p0.document.object.secure_dns.?;
+    try testing.expect(sd0.zone_signed == null and sd0.ds_data.len == 0 and sd0.key_data.len == 0);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try buf.appendSlice(testing.allocator, "{\"secureDNS\":{\"dsData\":[");
+    for (0..max_secure_dns_records + 10) |i| {
+        if (i != 0) try buf.append(testing.allocator, ',');
+        try buf.appendSlice(testing.allocator, "{\"keyTag\":1}");
+    }
+    try buf.appendSlice(testing.allocator, "]}}");
+    var p1 = try parseResponse(testing.allocator, buf.items);
+    defer p1.deinit();
+    try testing.expectEqual(max_secure_dns_records, p1.document.object.secure_dns.?.ds_data.len);
+}
+
+test "secureDNS: domain_json KAT carries delegationSigned only" {
+    var p = try parseResponse(testing.allocator, domain_json);
+    defer p.deinit();
+    const sd = p.document.object.secure_dns.?;
+    try testing.expectEqual(@as(?bool, true), sd.delegation_signed);
+    try testing.expect(sd.zone_signed == null);
+}
 
 /// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
 const tkfuzz = @import("testkit").fuzz;
