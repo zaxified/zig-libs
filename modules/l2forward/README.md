@@ -150,6 +150,8 @@ order — both pinned by permanent tests.
 - `forward(isid, dst, ingress, now, out) !Decision` — the forward decision;
   `replicationSet(isid, ingress, out) ![]const PeId` — the replication set
   directly, for a pre-classified BUM frame.
+- `fdbIterator(isid, now)` — allocation-free walk over `{mac, pe, age, static, quarantined, expired}`
+  of one I-SID (each entry once, unspecified order; invalidated by any table mutation).
 - `tick(now)` — reclaim aged entries. `fdbCount(isid)` / `isidCount()` — sizes.
 - `isBroadcast(mac)` / `isMulticast(mac)` / `isBumAddress(dst)` — pure BUM
   classification helpers.

@@ -710,6 +710,55 @@ pub const Table = struct {
         return ie.fdb.count();
     }
 
+    /// One FDB entry as reported by `fdbIterator`.
+    pub const FdbInfo = struct {
+        mac: Mac,
+        pe: PeId,
+        /// `now - learned_at` as of the iterator's `now`, clamped to 0 for a
+        /// non-monotonic clock; always 0 for a static entry (never aged).
+        age: Time,
+        /// Pinned by `learnStatic`.
+        static: bool,
+        /// Quarantined by duplicate-MAC detection (`lookup` reports a miss).
+        quarantined: bool,
+        /// Over-age as of `now` and not yet reclaimed by `tick`: `lookup`
+        /// already reports a miss for it. False for static and live-quarantined.
+        expired: bool,
+    };
+
+    /// Allocation-free walk over one I-SID's FDB, in unspecified order. Every
+    /// entry physically present (including over-age ones not yet reclaimed and
+    /// quarantined ones; see `FdbInfo`) is reported exactly once. Read-only.
+    /// Mutating the table (`learn`, `learnStatic`, `forget`, `tick`,
+    /// `removeMember`, `removeIsid`, ...) while an iterator is live invalidates
+    /// it: do not call `next` afterwards, restart with `fdbIterator`.
+    pub const FdbIterator = struct {
+        table: *const Table,
+        inner: ?Fdb.Iterator,
+        now: Time,
+
+        pub fn next(self: *FdbIterator) ?FdbInfo {
+            const it = &(self.inner orelse return null);
+            const kv = it.next() orelse return null;
+            const e = kv.value_ptr.*;
+            return .{
+                .mac = kv.key_ptr.*,
+                .pe = e.pe,
+                .age = if (e.static or self.now < e.learned_at) 0 else self.now - e.learned_at,
+                .static = e.static,
+                .quarantined = e.duplicate,
+                .expired = self.table.isExpired(e, self.now),
+            };
+        }
+    };
+
+    /// Enumerate `isid`'s FDB as of `now` (the `bridge fdb show` equivalent).
+    /// An unknown I-SID yields an empty walk. See `FdbIterator`.
+    pub fn fdbIterator(self: *const Table, isid: Isid, now: Time) FdbIterator {
+        const ie = self.isids.getPtr(isid) orelse return .{ .table = self, .inner = null, .now = now };
+        return .{ .table = self, .inner = ie.fdb.iterator(), .now = now };
+    }
+
     /// Number of I-SIDs currently holding any membership or FDB state.
     pub fn isidCount(self: *const Table) usize {
         return self.isids.count();
@@ -1357,6 +1406,62 @@ test "ageing: fresh → unicast; past aging_ticks the entry is gone → flood; r
     // Relearn refreshes the age: fresh again well past the original expiry.
     _ = try t.learn(4, macOf(0x88), 2, 1101);
     try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(4, macOf(0x88), .access, 1200, &buf));
+}
+
+test "fdbIterator: every entry exactly once with pe/age/static; empty and unknown isid" {
+    var t = testTable();
+    defer t.deinit();
+    try t.addMember(4, 8);
+    try t.addMember(4, 2);
+    // Unknown and known-but-empty I-SIDs both yield nothing.
+    var e0 = t.fdbIterator(99, 0);
+    try testing.expect(e0.next() == null);
+    var e1 = t.fdbIterator(4, 0);
+    try testing.expect(e1.next() == null);
+    _ = try t.learn(4, macOf(1), 2, 1000);
+    _ = try t.learn(4, macOf(2), 8, 1050);
+    try t.learnStatic(4, macOf(3), 8, 1000);
+    try t.addMember(5, 1);
+    _ = try t.learn(5, macOf(9), 1, 1000); // other tenant: must not appear
+    var seen: [4]u8 = @splat(0);
+    var it = t.fdbIterator(4, 1101); // aging_ticks = 100
+    while (it.next()) |f| {
+        const k = f.mac[5];
+        seen[k] += 1;
+        switch (k) {
+            1 => {
+                try testing.expectEqual(@as(PeId, 2), f.pe);
+                try testing.expectEqual(@as(Time, 101), f.age);
+                try testing.expect(!f.static and f.expired and !f.quarantined);
+            },
+            2 => {
+                try testing.expectEqual(@as(PeId, 8), f.pe);
+                try testing.expectEqual(@as(Time, 51), f.age);
+                try testing.expect(!f.static and !f.expired);
+            },
+            3 => {
+                try testing.expectEqual(@as(Time, 0), f.age);
+                try testing.expect(f.static and !f.expired);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual([_]u8{ 0, 1, 1, 1 }, seen);
+    // Exhausted iterator stays exhausted.
+    try testing.expect(it.next() == null);
+    // Clock before learned_at clamps age to 0 (as isExpired does).
+    var sk = t.fdbIterator(4, 0);
+    while (sk.next()) |f| try testing.expectEqual(@as(Time, 0), f.age);
+    // Aged boundary: exactly aging_ticks is still fresh, as for `lookup`.
+    var bd = t.fdbIterator(4, 1100);
+    while (bd.next()) |f| if (f.mac[5] == 1) try testing.expect(!f.expired and f.age == 100);
+    // After tick the expired entry is gone from the walk.
+    t.tick(1101);
+    var n: usize = 0;
+    var af = t.fdbIterator(4, 1101);
+    while (af.next()) |_| n += 1;
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(t.fdbCount(4), n);
 }
 
 test "static entry is never aged and not overwritten by dynamic learn" {
