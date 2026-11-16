@@ -1599,8 +1599,9 @@ otp	ReleaseFast	uri	1	0	221034d7dfc217bf	36cedfe2472c9cba
 # aeskw (2026-10-10) — wrap: KEK + wrapped key tainted, AES-128/192/256 KEKs
 # (192 via the aes192 module since 2026-10-10), wrap, unwrap, tampered unwrap.
 # 6 = the integrity verdict after the constant-time IV compare, twice per KEK
-# size.
-aeskw	ReleaseFast	wrap	1	6	ab5548ee8f278ffd	a613db024e13b3d3
+# size. 2026-11-16: + RFC 5649 wrapPad/unwrapPad/tampered unwrapPad, whose
+# folded AIV/MLI/padding verdict adds the same twice per KEK size: 12.
+aeskw	ReleaseFast	wrap	1	12	986ea45fe8c756da	23036d19c2656c6a
 # wireguard (2026-11-03) — messages and public keys declassified where they leave the
 # function that made them (they go on the wire). Read off the --stacks log:
 # keyb64 1, keyhex 1 = the codec's accept/reject. handshake 4 = three AEAD tag

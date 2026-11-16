@@ -14,7 +14,9 @@
 //!    ciphertext byte flipped (rejected on the integrity check, which must be
 //!    a constant-time compare folded into one verdict). The wrapped output is
 //!    public (it is what goes on the wire) and is marked defined before the
-//!    tampered copy is made, so the flip is not on a secret.
+//!    tampered copy is made, so the flip is not on a secret. Then the same
+//!    three for RFC 5649 `wrapPad`/`unwrapPad` over 20 bytes of key data (a
+//!    padded last semiblock), whose §4.2 checks fold into one verdict too.
 //!
 //! ## The propagation witness
 //!
@@ -55,6 +57,19 @@ fn run(comptime kek_len: usize, t: Taint) !void {
     bad[17] ^= 0x01;
     const rejected = if (aeskw.unwrap(&kek, &bad, &back)) |_| false else |_| true;
     std.debug.print("ctgrind_result={x}\n", .{[1]u8{@intFromBool(rejected)}});
+
+    // RFC 5649: 20 bytes of the key, so the last semiblock carries 4 pad bytes.
+    var pad_buf: [32]u8 = undefined;
+    const pwrapped = try aeskw.wrapPad(&kek, key[0..20], &pad_buf);
+    std.debug.print("ctgrind_result={x}\n", .{pwrapped});
+    std.valgrind.memcheck.makeMemDefined(pwrapped);
+    var pback: [24]u8 = undefined;
+    const pgot = try aeskw.unwrapPad(&kek, pwrapped, &pback);
+    std.debug.print("ctgrind_result={x}\n", .{pgot});
+    var pbad = pad_buf;
+    pbad[17] ^= 0x01;
+    const prejected = if (aeskw.unwrapPad(&kek, &pbad, &pback)) |_| false else |_| true;
+    std.debug.print("ctgrind_result={x}\n", .{[1]u8{@intFromBool(prejected)}});
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
