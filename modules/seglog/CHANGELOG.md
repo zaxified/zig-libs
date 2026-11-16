@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Review LOW-7: a read-only `Log` keeps the index it rebuilds for the newest segment (which has no
+  `.idx` until sealed) and extends it over the appended tail, so `seek` / `seekTime` there no longer re-walk the whole
+  segment per call. The cache covers only whole CRC-valid records and is dropped on a new newest segment, a shrunk
+  segment or a changed last record. No API change.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** new offline tool `tools/seglog-dump` (`zig build install-dump-seglog`): `segments`, `verify`, `seek --lsn|--time`, `get --lsn [--hex]` and `rebuild-manifest` over a log directory, read-only except the last; public API only, no library change. Smoke script `tools/seglog-dump/smoke.sh`.
 - **2026-11-16** — Review LOW-6 and LOW-8: an `OutOfMemory` in `dropBefore` (or before `compress`'s rename) no longer
   leaves `segments()` ahead of the manifest on disk with the log unpoisoned (a retry found nothing to drop); every

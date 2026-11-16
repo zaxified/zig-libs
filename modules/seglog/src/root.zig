@@ -336,6 +336,21 @@ const Seal = struct {
 
 /// Running totals of the data records in a segment, read from its first
 /// record on: what its seal must agree with.
+/// A read-only log's rebuilt index of its newest segment: it covers exactly
+/// the complete data records in `[segment_header_len, covered)`, and a seek
+/// extends it from `covered` instead of walking from the start.
+const SeekCache = struct {
+    id: u64,
+    first_lsn: u64,
+    covered: u64 = segment_header_len,
+    index: SparseIndex = .{},
+    tally: Tally,
+    /// The last record walked (0: none) and its stored CRC: a writer that
+    /// lost unsynced bytes and appended others there shows as a different CRC.
+    last_off: u64 = 0,
+    last_crc: [4]u8 = undefined,
+};
+
 const Tally = struct {
     base: u64,
     count: u64 = 0,
@@ -1442,6 +1457,9 @@ pub const Log = struct {
     cut_on_open: u64 = 0,
     /// Scratch for encoding records and the manifest.
     scratch: std.ArrayList(u8) = .empty,
+    /// A reader's index of the newest segment, which has no `.idx` until it
+    /// is sealed: kept between seeks and extended over the appended tail.
+    seek_cache: ?SeekCache = null,
     /// What `stats` reports; its gauges are filled in when asked.
     counters: Stats = .{},
     /// Syncs begun (`syncBegin`) and not yet finished — `Concurrent` runs
@@ -1714,6 +1732,17 @@ pub const Log = struct {
         std.mem.swap(std.ArrayList(u64), &self.live_lsn, &fresh.live_lsn);
         std.mem.swap(std.ArrayList(u8), &self.live_form, &fresh.live_form);
         std.mem.swap(std.ArrayList(u64), &self.pending, &fresh.pending);
+        // The cache answers only for the segment it walked: another newest
+        // segment, or the same id under another first LSN, drops it.
+        if (self.seek_cache) |c| {
+            const n = self.newest();
+            if (n == null or n.? != c.id or self.segmentFirstLsn(c.id) != c.first_lsn) self.dropSeekCache();
+        }
+    }
+
+    fn dropSeekCache(self: *Log) void {
+        if (self.seek_cache) |*c| c.index.deinit(self.gpa);
+        self.seek_cache = null;
     }
 
     pub fn isReadOnly(self: *const Log) bool {
@@ -1741,6 +1770,7 @@ pub const Log = struct {
         self.live_form.deinit(self.gpa);
         self.pending.deinit(self.gpa);
         self.scratch.deinit(self.gpa);
+        self.dropSeekCache();
         if (self.segs) |sg| sg.destroy();
         self.segs = null;
     }
@@ -2884,8 +2914,56 @@ pub const Log = struct {
         var seg: SeekSegment = .{ .handle = h, .owned = true, .bound = size, .is_newest = is_newest, .max_ts = null, .compacted = flags & flag_compacted != 0 };
         errdefer seg.loaded.deinit(self.gpa);
         if (want_time and (!is_newest or self.read_only)) seg.max_ts = try self.sealMaxTs(id);
-        if (self.opts.index_interval != 0) try self.loadIndex(id, h, size, &seg.loaded);
+        if (self.opts.index_interval == 0) return seg;
+        if (self.read_only and is_newest) {
+            // Sealed since the manifest was read: its `.idx` is whole.
+            if (try self.readIndexFile(id, size, &seg.loaded)) {
+                self.dropSeekCache();
+                return seg;
+            }
+            try self.extendSeekCache(id, h, size);
+            seg.borrowed = self.seek_cache.?.index.entries.items;
+        } else try self.loadIndex(id, h, size, &seg.loaded);
         return seg;
+    }
+
+    /// Bring the reader's cached index of the newest segment `id` up to its
+    /// `size`, walking only the bytes past what it already covers. A cache of
+    /// another segment, or of more bytes than the segment has now, is rebuilt
+    /// from the start. A torn or incomplete tail is not covered: the next
+    /// call walks it again, so the cache never answers for bytes it did not
+    /// parse as whole records.
+    fn extendSeekCache(self: *Log, id: u64, h: Storage.Handle, size: u64) SeekError!void {
+        const first = self.segmentFirstLsn(id).?;
+        if (self.seek_cache) |c| {
+            if (c.id != id or c.first_lsn != first or c.covered > size) {
+                self.dropSeekCache();
+            } else if (c.last_off != 0) {
+                var crc: [4]u8 = undefined;
+                self.store.preadFull(h, &crc, c.last_off) catch |e| switch (e) {
+                    error.Corrupt => crc = .{ 0, 0, 0, 0 }, // short: not what it was
+                    else => |x| return x,
+                };
+                if (!std.mem.eql(u8, &crc, &c.last_crc)) self.dropSeekCache();
+            }
+        }
+        if (self.seek_cache == null) self.seek_cache = .{ .id = id, .first_lsn = first, .tally = Tally.init(first, false) };
+        const c = &self.seek_cache.?;
+        var w: Window = .{};
+        defer w.deinit(self.gpa);
+        while (true) {
+            const raw = switch (try parseAt(&w, self.gpa, self.store, h, c.covered, size, self.opts.max_record_len)) {
+                .record => |r| r,
+                else => break,
+            };
+            if (raw.typ != rec_data) break;
+            try c.index.entries.ensureUnusedCapacity(self.gpa, 1);
+            c.index.note(self.opts.index_interval, .{ .lsn = raw.lsn, .offset = c.covered, .max_before = c.tally.maxOrMin() });
+            c.tally.add(raw.ts, raw.lsn);
+            c.last_off = c.covered;
+            c.covered += raw.len;
+        }
+        if (c.last_off != 0) try self.store.preadFull(h, &c.last_crc, c.last_off);
     }
 
     /// The segment's index from its `.idx` file, if that is whole and fits
@@ -6608,6 +6686,54 @@ test "a seek reads a sliver of a big segment, not the segment" {
     counting.bytes = 0;
     try testing.expectEqual(last, (try log.seekTime(9_999)).?);
     try testing.expect(counting.bytes < seek_block);
+}
+
+test "a reader's seeks on the newest segment read a sliver after the first, and follow appends and a seal" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var w = try Log.open(testing.allocator, sim.storage(), .{ .create = true });
+    defer w.close();
+    try w.rotate(1);
+    var buf: [100]u8 = @splat(7);
+    for (0..10_000) |k| _ = try w.appendAt(@intCast(k), &buf); // ~1.25 MB
+    try w.sync();
+    var counting: CountingReads = .{ .inner = sim.storage() };
+    var r = try Log.openReadOnly(testing.allocator, counting.storage(), .{});
+    defer r.close();
+    // The first seek builds the index: it walks the segment.
+    try testing.expectEqual(@as(u64, 5000), (try r.seek(5000)).?.lsn);
+    try testing.expect(counting.bytes > 1_000_000);
+    // The next hundred read a few blocks each, not the segment.
+    counting.bytes = 0;
+    for (0..100) |k| {
+        const lsn: u64 = 1 + k * 97;
+        try testing.expectEqual(lsn, (try r.seek(lsn)).?.lsn);
+        try testing.expectEqual(lsn, (try r.seekTime(@intCast(lsn - 1))).?.lsn);
+    }
+    try testing.expect(counting.bytes < 200 * 3 * @max(4096, 2 * 4096));
+
+    // The writer appends: the cache extends over the new tail only.
+    for (10_000..10_500) |k| _ = try w.appendAt(@intCast(k), &buf);
+    try w.sync();
+    try testing.expectEqual(@as(?Position, null), try r.seek(10_501));
+    counting.bytes = 0;
+    try testing.expectEqual(@as(u64, 10_400), (try r.seek(10_400)).?.lsn);
+    try testing.expectEqual(@as(u64, 10_400), (try r.seekTime(10_399)).?.lsn);
+    try testing.expect(counting.bytes < 3 * 3 * @max(4096, 2 * 4096));
+    // A record that appears after a miss is found by the next call.
+    _ = try w.appendAt(10_500, &buf);
+    try w.sync();
+    try testing.expectEqual(@as(u64, 10_501), (try r.seek(10_501)).?.lsn);
+
+    // A rotation seals segment 1 and starts 2: nothing stale answers.
+    try w.rotate(2);
+    for (0..10) |k| _ = try w.appendAt(@intCast(20_000 + k), "tail");
+    try w.sync();
+    try testing.expectEqual(@as(u64, 10_000), (try r.seek(10_000)).?.lsn);
+    try testing.expectEqual(@as(u64, 10_505), (try r.seek(10_505)).?.lsn);
+    try testing.expectEqual(@as(u64, 10_505), (try r.seekTime(20_003)).?.lsn);
+    try testing.expectEqual(@as(?Position, null), try r.seek(10_600));
+    try testing.expectEqual(@as(u64, 2), (try r.seek(10_505)).?.segment);
 }
 
 // ── compaction ──────────────────────────────────────────────────────────────
