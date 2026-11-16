@@ -94,8 +94,8 @@ slices, splat and count; `handleOne` closing its fd; `clear` bumping `version`;
 
 - (survey 2026-09-30) **Publish/subscribe (server push)** — NNG, ZeroMQ and D-Bus users expect notifications; here subscribers poll `Bus.version`. Effort: medium-large (needs persistent connections and an event loop). Fits CONVENTIONS §2. Already listed as deferred above.
 - (survey 2026-09-30) **Concurrent connections** — a slow or stalled client blocks every other request (one connection at a time, no read timeout). Effort: medium (poll-based accept loop or `std.Io` group; per-connection deadline). Fits §2.
-- (survey 2026-09-30) **Peer credentials (`SO_PEERCRED`)** — D-Bus users get uid/pid of the caller; without it the only access control is the socket file mode. Effort: small (one `getsockopt`, exposed to `dispatch`). Fits §2.
-- (survey 2026-09-30) **Read/write timeouts on `Client.request` and `handleOne`** — a silent peer hangs the caller forever. Effort: small. Fits §2.
+- ✅ DONE 2026-11-16 (`peerCred(fd) !PeerCred{pid,uid,gid}` via `getsockopt(SO_PEERCRED)`; call it on the `acceptOne` fd before `handleOne`) (survey 2026-09-30) **Peer credentials (`SO_PEERCRED`)** — D-Bus users get uid/pid of the caller; without it the only access control is the socket file mode. Effort: small (one `getsockopt`, exposed to `dispatch`). Fits §2.
+- ✅ DONE 2026-11-16 (`Options{.timeout_ms}`; `Client.requestWithOptions`, `Server.handleOneWithOptions`; poll(2) against one monotonic deadline, `error.Timeout`; default unchanged) (survey 2026-09-30) **Read/write timeouts on `Client.request` and `handleOne`** — a silent peer hangs the caller forever. Effort: small. Fits §2.
 
 ## Status
 

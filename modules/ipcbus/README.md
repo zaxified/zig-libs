@@ -50,6 +50,13 @@ while (true) {
 var reply_buf: [4096]u8 = undefined;
 const reply = try ipcbus.Client.request("/run/app.sock", req_bytes, &reply_buf, .{});
 
+// ── timeouts and peer credentials ──
+// error.Timeout instead of a hang on a silent/stalled peer (default: no timeout)
+const r2 = try ipcbus.Client.requestWithOptions(path, req_bytes, &reply_buf, .{}, .{ .timeout_ms = 2000 });
+// server: authenticate the caller, then serve with a budget
+const pc = try ipcbus.peerCred(conn);                // .pid, .uid, .gid (SO_PEERCRED)
+try ipcbus.Server.handleOneWithOptions(conn, ctx, dispatch, arena.allocator(), .{}, .{ .timeout_ms = 2000 });
+
 // ── in-memory scratch bus (owner thread only) ──
 var bus = ipcbus.Bus(64).init(gpa);   // cap = 64 keys, evicts when full
 defer bus.deinit();

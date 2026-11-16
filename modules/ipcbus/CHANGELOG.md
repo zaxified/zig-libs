@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **Added:** optional timeouts and peer credentials. `Options{ .timeout_ms }` with `Client.requestWithOptions` and `Server.handleOneWithOptions` (one monotonic deadline over the request/reply I/O, polled; a silent or stalled peer returns `error.Timeout`, never a hang; `request`/`handleOne` keep blocking forever). `peerCred(fd)` returns `PeerCred{pid,uid,gid}` (`SO_PEERCRED`); new `TransportError.Timeout` and `.PeerCredFailed`. `FdReader`/`FdWriter` gain deadline fields (default off). No behaviour change for existing callers.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-23** — **Fix (performance):** `FdReader` refills its buffer on small reads. Zig 0.17's `defaultReadVec` streams straight into the caller's slice once the buffer has been filled to its end, so a long-lived reader paid one `read(2)` per frame-length prefix. Regression test with a negative control. No API change.
