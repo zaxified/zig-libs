@@ -195,14 +195,17 @@ network lookup (hickory, unbound): the first registers an in-flight record under
 asks; later misses of the key wait on it (cancelable) and then read the table again — the lead's
 answer as `.cache`, or its upstream failure through the backoff (so N concurrent misses on a failing
 name cost one lookup, not N), serve-stale as usual. A lead that leaves nothing in the table (canceled,
-a non-cacheable answer, a local error) wakes them to an empty table and one of them asks in turn: a
-waiter is never stranded. `Stats.coalesced` counts the waits. `Options.prefetch_pct` (unbound
+a non-cacheable answer, a local error) wakes them to an empty table and each asks itself, in parallel
+and uncoalesced (as without coalescing): a waiter is never stranded nor queued behind another. A failed
+refresh keeps the old answer and arms the key's backoff, so a dead upstream is not retried on every
+`refreshDue`. Independent review 2026-11-16: no HIGH, two MED (serialised waiters after an empty lead,
+no backoff on a failed refresh) and three LOW fixed the same day. `Stats.coalesced` counts the waits. `Options.prefetch_pct` (unbound
 `prefetch`; off by default, ≤ 99): a hit with less than that share of its stored TTL left is served
 and marks the key due once; `refreshDue(max)` refreshes due keys (most recently used first) through
 the same miss path, caller-driven — no task is hidden in the library, a caller runs it from a timer on
 its `Io`; `Stats.prefetches`. `lookupIpMany(names, results)` runs `lookupIp` over a `std.Io.Group`,
 one result per name, every result set also on cancel. Tests: four concurrent misses → one query and
-three coalesced; a held SERVFAIL shared by three misses → one lookup; a canceled waiter and a canceled
+three coalesced; a failed refresh held by the backoff; a held SERVFAIL shared by three misses → one lookup; a canceled waiter and a canceled
 lead (the waiter asks in turn); the four-thread test now also asserts exactly one query per name;
 prefetch off by default, the mark threshold, mark-once, renewal past the old expiry, `prefetch_pct`
 100 refused; `lookupIpMany` mixed results and length mismatch, and cancel mid-flight.

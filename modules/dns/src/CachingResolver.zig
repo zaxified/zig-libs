@@ -63,8 +63,9 @@
 //!    the first asks the network, the others wait for it (cancelable) and then
 //!    read the table it filled — its answer as `.cache`, or its failure through
 //!    the usual backoff / serve-stale rules; an outcome that left nothing in the
-//!    table (a canceled lead, a non-cacheable answer, a local error) makes one
-//!    of them ask in turn. `Stats.coalesced` counts the waits. An answer expires TTL seconds after the moment
+//!    table (a canceled lead, a non-cacheable answer, a local error) makes each
+//!    of them ask itself, in parallel, as without coalescing. `Stats.coalesced`
+//!    counts the waits. An answer expires TTL seconds after the moment
 //!    the lookup was sent, not after it returned. `lookupIp` order is RFC 6724
 //!    as of the lookup time; a hit is re-sorted on the way out (see
 //!    `Options.resort_ip_hits`), so a route change shows in the order.
@@ -245,11 +246,14 @@ pub const Stats = struct {
     network_lookups: u64,
     budget_refused: u64,
     /// Misses that waited for a concurrent lookup of the same key instead of
-    /// asking the network themselves (request coalescing). A wait whose lead
-    /// left nothing in the table (canceled, not cacheable) is followed by a
-    /// network lookup of its own and counts in both.
+    /// asking the network themselves (request coalescing); a wait that was
+    /// canceled counts too. A wait whose lead left nothing in the table
+    /// (canceled, not cacheable, a local error) is followed by a network lookup
+    /// of its own, uncoalesced and in parallel with the other waiters', and
+    /// counts in both.
     coalesced: u64,
-    /// Refreshes `refreshDue` performed (each a network lookup or a wait for one).
+    /// Refreshes `refreshDue` attempted (a network lookup, a wait for one, or a
+    /// refresh the key's backoff or the budget refused).
     prefetches: u64,
 };
 
@@ -581,8 +585,8 @@ pub const IpResult = Error!Answer(netaddr.Ip);
 
 /// `lookupIp` for every name at once: the lookups run concurrently on the
 /// cache's `Io` (a `std.Io.Group`; the network side is bounded by
-/// `max_concurrent_lookups`, the rest wait for a pooled Resolver or coalesce
-/// with a lookup of the same key), `results[i]` for `names[i]`. Every result is
+/// `max_concurrent_lookups`, the rest wait for a pooled Resolver, and misses
+/// of one key coalesce; hits are served at once), `results[i]` for `names[i]`. Every result is
 /// set when this returns, also on `error.Canceled` (a lookup that was cut short
 /// holds `error.Canceled`); the caller frees each answer.
 /// `error.LengthMismatch`: `results.len != names.len` (nothing was looked up).
@@ -695,6 +699,9 @@ fn runLocked(
 
     var counted = refresh;
     var force = refresh;
+    // Set once this miss has waited for a lead: if the table still has nothing for it, it asks the network
+    // itself, uncoalesced, instead of queueing behind the next waiter's lookup (which would serialise them).
+    var waited = false;
     while (true) {
         const t0 = c.now();
         var entry: ?*Entry = c.map.get(k);
@@ -721,12 +728,13 @@ fn runLocked(
         const stale_entry: ?*Entry = if (entry) |e| (if (c.staleUsable(e, t0)) e else null) else null;
         if (entry) |e| {
             if (e.fail_count > 0 and t0 < e.retry_at_s) {
+                if (refresh) return e.last_err; // nobody reads a refresh's answer: no stale clone, no stale count
                 if (stale_entry) |s| return c.staleAnswer(T, s, e.last_err);
                 return e.last_err;
             }
         }
         // Another task is asking the network for this key: wait for it, then read the table again.
-        if (c.inflight.get(k)) |f| {
+        if (!waited) if (c.inflight.get(k)) |f| {
             c.coalesced += 1;
             f.waiters += 1;
             c.flight_waiters += 1;
@@ -740,11 +748,13 @@ fn runLocked(
             if (f.done and f.waiters == 0) c.destroyFlight(f);
             if (wait_err) |err| return err;
             force = false; // what the lead stored is the refresh
+            waited = true;
             continue;
-        }
+        };
         if (c.options.max_network_lookups) |b| {
             if (!c.takeToken(b, t0)) {
                 c.budget_refused += 1;
+                if (refresh) return error.BudgetExceeded;
                 if (stale_entry) |s| return c.staleAnswer(T, s, error.BudgetExceeded);
                 return error.BudgetExceeded;
             }
@@ -753,7 +763,7 @@ fn runLocked(
     }
     c.network_lookups += 1;
     // Lead the lookup; without memory for the record it simply goes uncoalesced.
-    const flight: ?*Flight = c.startFlight(k);
+    const flight: ?*Flight = if (waited) null else c.startFlight(k);
     defer if (flight) |f| c.endFlight(f); // `mutex` is held again on every return below
     c.mutex.unlock(io);
     held = false;
@@ -774,7 +784,7 @@ fn runLocked(
     c.mutex.lockUncancelable(io);
     held = true;
     const t1 = c.now();
-    var lk = res catch |err| return c.failed(T, k, err, t1);
+    var lk = res catch |err| return c.failed(T, k, err, t1, refresh);
     return c.succeeded(T, k, &lk, t_call);
 }
 
@@ -902,8 +912,17 @@ fn release(c: *CachingResolver, s: *Slot) void {
 
 /// Called with `mutex` held. An upstream failure arms the key's backoff and
 /// serves what is still allowed to be served.
-fn failed(c: *CachingResolver, comptime T: type, k: []const u8, err: Resolver.Error, t: u64) Error!Answer(T) {
+fn failed(c: *CachingResolver, comptime T: type, k: []const u8, err: Resolver.Error, t: u64, refresh: bool) Error!Answer(T) {
     if (!isUpstreamFailure(err)) return err;
+    if (refresh) {
+        // A prefetch refresh failed: the old answer stays (fresh hits ignore the failure state), but the key's
+        // backoff is armed, so the next refresh of a dead upstream waits for it instead of retrying at once.
+        const e = c.map.get(k) orelse return err;
+        e.fail_count +|= 1;
+        e.last_err = err;
+        e.retry_at_s = t +| c.backoffDelay(e.fail_count);
+        return err;
+    }
     // A concurrent miss of the same key may have stored a fresh answer while
     // this lookup was failing: serve it, and leave the failure state alone.
     if (c.map.get(k)) |cur| {
@@ -2297,6 +2316,29 @@ test "prefetch: a hit in the last prefetch_pct of the TTL marks the key once; re
     try testing.expectEqual(@as(u64, 1), st.misses); // the refresh is no miss
 }
 
+test "a failed prefetch refresh keeps the old answer and arms the key's backoff (no retry storm)" {
+    var h: Harness = .{};
+    try h.start(.v4);
+    defer h.stop();
+    var c = try h.cache(.{ .prefetch_pct = 20 });
+    defer c.deinit();
+    dropAnswer(c.lookupIp("pf.example.com")); // stored for 60 s
+    h.clock.add(50);
+    dropAnswer(c.lookupIp("pf.example.com")); // marks it due
+    h.stub.mode.store(.servfail, .release);
+    try testing.expectEqual(@as(usize, 1), try c.refreshDue(10));
+    const sent = h.queries();
+    try testing.expect(sent >= 2);
+    var hit = try c.lookupIp("pf.example.com"); // the old answer is still served, and marks it again
+    try testing.expectEqual(Source.cache, hit.source);
+    hit.deinit();
+    try testing.expectEqual(@as(usize, 1), try c.refreshDue(10)); // attempted ...
+    try testing.expectEqual(sent, h.queries()); // ... but held by the backoff: nothing sent
+    const st = c.stats();
+    try testing.expectEqual(@as(u64, 0), st.stale_served);
+    try testing.expectEqual(@as(u64, 2), st.prefetches);
+}
+
 test "prefetch_pct over 99 is refused" {
     var h: Harness = .{};
     try h.start(.v4);
@@ -3015,7 +3057,7 @@ test "F4: a failure never arms backoff on an entry that holds a fresh answer" {
     var kbuf: [key_buf_len]u8 = undefined;
     const k = nameKey(&kbuf, .ip, "host.example.com").?;
     c.mutex.lockUncancelable(c.io);
-    var served = try c.failed(netaddr.Ip, k, error.Timeout, c.now());
+    var served = try c.failed(netaddr.Ip, k, error.Timeout, c.now(), false);
     c.mutex.unlock(c.io);
     defer served.deinit();
     try testing.expectEqual(Source.cache, served.source);
@@ -3193,9 +3235,9 @@ test "a fresh answer served by a failure is aged, capped at its stored TTL and b
     const ka = nameKey(&kbuf, .ip, "a.example.com").?;
 
     c.mutex.lockUncancelable(c.io);
-    var aged = try c.failed(netaddr.Ip, ka, error.Timeout, c.now());
+    var aged = try c.failed(netaddr.Ip, ka, error.Timeout, c.now(), false);
     // an earlier `t` would give 70 s left: the stored TTL (60) is the ceiling
-    var capped = try c.failed(netaddr.Ip, ka, error.Timeout, c.now() - 20);
+    var capped = try c.failed(netaddr.Ip, ka, error.Timeout, c.now() - 20, false);
     c.mutex.unlock(c.io);
     defer aged.deinit();
     defer capped.deinit();

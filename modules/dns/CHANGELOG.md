@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — `CachingResolver` review fixes (same day, before any release): a waiter whose coalesced lead left nothing in
+  the table asks itself in parallel instead of queueing behind the next waiter (TTL-0 / non-cacheable answers were serialised);
+  a failed prefetch refresh arms the key's backoff while the old answer keeps being served (it retried a dead upstream on every
+  refresh); a refresh refused by backoff or budget no longer counts as a stale answer.
 - **2026-11-16** — `CachingResolver`: **request coalescing** (concurrent misses on one key share one network lookup; waiters read
   the lead's answer or its failure through the backoff; a canceled lead wakes them and one asks in turn; `Stats.coalesced`),
   **prefetch** (`Options.prefetch_pct`, off by default, ≤ 99 else `InvalidOptions`; `refreshDue(max)` refreshes the keys a late
