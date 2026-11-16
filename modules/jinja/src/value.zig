@@ -91,6 +91,23 @@ pub const Loop = struct {
     last_changed: ?[]const Value = null,
 };
 
+/// The two stateful callable globals of Jinja2 3.1, `cycler(*items)` and
+/// `joiner(sep=", ")` (`jinja2.utils.Cycler` / `Joiner`). Mutable like
+/// `Namespace` and `Loop`: one per call of the global, shared by identity.
+pub const Gadget = struct {
+    kind: Kind,
+    /// Cycler: the (non-empty) items to walk through.
+    items: []const Value = &.{},
+    /// Cycler: index of the current item.
+    pos: usize = 0,
+    /// Joiner: the separator returned from the second call on.
+    sep: Str = .{ .bytes = ", " },
+    /// Joiner: set by the first call.
+    used: bool = false,
+
+    pub const Kind = enum { cycler, joiner };
+};
+
 /// A missing name, or the result of an operation the reference implementation
 /// answers with `Undefined`. `name` is what the message will blame.
 pub const Undefined = struct {
@@ -128,6 +145,7 @@ pub const Value = union(enum) {
     namespace: *Namespace,
     loop: *Loop,
     macro: MacroRef,
+    gadget: *Gadget,
 
     pub const empty_string: Value = .{ .string = .{ .bytes = "" } };
 
@@ -158,7 +176,7 @@ pub const Value = union(enum) {
             .map => |m| m.pairs.len != 0,
             .namespace => true,
             .loop => |l| l.items.len != 0,
-            .macro => true,
+            .macro, .gadget => true,
         };
     }
 
@@ -174,6 +192,7 @@ pub const Value = union(enum) {
             .list => "list",
             .tuple => "tuple",
             .macro => "macro",
+            .gadget => |g| if (g.kind == .cycler) "Cycler" else "Joiner",
             .map, .namespace, .loop => "dict",
         };
     }
@@ -363,6 +382,7 @@ fn reprToDepth(writer: *std.Io.Writer, v: Value, depth: usize) Error!void {
         .map => |m| try reprPairs(writer, m.pairs, depth + 1),
         .namespace => |ns| try reprPairs(writer, ns.pairs.items, depth + 1),
         .loop => try w(writer, "<loop>"),
+        .gadget => |g| try w(writer, if (g.kind == .cycler) "<Cycler>" else "<Joiner>"),
         .macro => |m| {
             try w(writer, "<Macro '");
             try w(writer, m.name);
@@ -783,6 +803,7 @@ pub fn valueEql(a: Value, b: Value) bool {
         .map => |m| b == .map and pairsEql(m.pairs, b.map.pairs),
         .namespace => |n| b == .namespace and n == b.namespace,
         .loop => |l| b == .loop and l == b.loop,
+        .gadget => |g| b == .gadget and g == b.gadget,
         .macro => |m| b == .macro and m.impl == b.macro.impl,
         else => false,
     };

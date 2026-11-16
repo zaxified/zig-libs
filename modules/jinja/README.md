@@ -359,7 +359,8 @@ Jinja2, `x is >= 2` is not valid template syntax.
 ## Globals and methods
 
 Globals: `range(stop)` / `range(start, stop[, step])`, `dict(k=v, …)`,
-`namespace(k=v, …)`.
+`namespace(k=v, …)`, `cycler(*items)` (`.next()`, `.current`, `.reset()`) and `joiner(sep=", ")`
+("" on the first call, `sep` afterwards). `lipsum` is not implemented.
 
 `namespace()` is the way to accumulate across a `{% for %}` body, because a
 `{% set %}` inside a loop does not outlive the loop (that is the reference's

@@ -273,7 +273,7 @@ or a documented, tested behaviour.
 | D5 | `map`/`select`/`reject`/`selectattr`/`rejectattr`/`items`/`dictsort`/`batch`/`slice` return lists, not generators, so rendering one directly prints `[…]` where the reference prints `<generator object …>` | silent, strictly more useful |
 | D6 | Filters absent: `attr`, `pprint`, `random`, `urlize` (`filesizeformat`, `format`, `groupby`, `wordwrap` landed 2026-11-13, §6.1) | **compile error** |
 | D7 | ✅ DONE 2026-11-16: tests `filter`, `test` and the symbolic aliases (`==` `!=` `>` `>=` `<` `<=`, usable via `select`/`reject`; `x is >=` is a syntax error in Jinja2 too) | — |
-| D8 | Globals absent: `lipsum`, `cycler`, `joiner` (callable *objects* need a `Value` kind with state and a method-call path on non-name callees) | **runtime error** |
+| D8 | `cycler`/`joiner` ✅ DONE 2026-11-16 (`Value.gadget`, a stateful object: `cycler(*items)` with `.next()`/`.current`/`.reset()`, `joiner(sep=", ")` callable). Still absent: `lipsum` | `lipsum`: **runtime error** |
 | D9 | `*args`/`**kwargs` *at a call site*, line statements/comments, and custom delimiters (macro `varargs`/`kwargs` on the receiving side are implemented) | **compile error** |
 | D10 | `{% do %}` and `{% with %}` need no extension to be enabled | superset |
 | D11 | String methods are a documented subset (README); an unknown one is a render error naming the type and method | runtime error |
@@ -317,7 +317,7 @@ see below), `pprint` (Python's pretty-printer layout), `random` (needs an inject
 `odd` `sameas` `sequence` `string` `true` `undefined` `upper`. Absent: the symbolic aliases (`==`, `!=`, `>`, `>=`, `<`, `<=`),
 `filter` and `test` (they ask the environment whether a name is registered; the evaluator has no such query).
 
-**Globals.** Present: `range` `dict` `namespace`. Absent: `lipsum`, `cycler`, `joiner` (D8).
+**Globals.** Present: `range` `dict` `namespace`. Absent: `lipsum` (D8); `cycler`/`joiner` ✅ DONE 2026-11-16.
 
 **`format` design.** `fmt % args` is Python's printf: the engine parses the specification itself and renders floats from the
 EXACT binary value (a small bignum), because std's printer rounds the shortest round-trip digits and answers `2.68` for
@@ -678,7 +678,7 @@ makes these bound tests rather than "it errored eventually" tests.
 
 **Missing and it matters** *(survey 2026-09-30; `format`/`groupby`/`wordwrap`/`filesizeformat`/Unicode case closed 2026-11-13)*:
 
-- **Call-site `*args` / `**kwargs` (D9), `cycler`/`joiner`/`lipsum` (D8)**; the `filter`/`test` tests and the symbolic test aliases (D7) ✅ DONE 2026-11-16 (`is filter`/`is test` via `Ctx.hasFilter`/`hasTest`; symbolic names registered in `builtin_tests`):
+- **Call-site `*args` / `**kwargs` (D9), `lipsum` (D8; `cycler`/`joiner` ✅ DONE 2026-11-16 as `Value.gadget`)**; the `filter`/`test` tests and the symbolic test aliases (D7) ✅ DONE 2026-11-16 (`is filter`/`is test` via `Ctx.hasFilter`/`hasTest`; symbolic names registered in `builtin_tests`):
   each hit occasionally by Jinja2 code ported as-is; today all are compile or render errors. `cycler`/`joiner` need a stateful
   callable value (`cycler.next()`, `joiner()`), the others small parser work. Effort: small to medium each.
 - **Arbitrary-precision integers (D3)** *(survey 2026-09-30)*: Python grows, we raise `OutOfRange`; only matters for

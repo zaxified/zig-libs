@@ -96,6 +96,7 @@ pub const Str = value_mod.Str;
 pub const Pair = value_mod.Pair;
 pub const Map = value_mod.Map;
 pub const Namespace = value_mod.Namespace;
+pub const Gadget = value_mod.Gadget;
 pub const Undefined = value_mod.Undefined;
 
 /// Build a `Value` from ordinary Zig data — structs become ordered maps in
