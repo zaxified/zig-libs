@@ -510,27 +510,61 @@ pub fn buildRequest(
     issuer_cert_der: []const u8,
     opts: RequestOptions,
 ) BuildRequestError![]u8 {
-    const subject = try parseCert(subject_cert_der);
-    const issuer = try parseCert(issuer_cert_der);
+    const one = [_]CertPair{.{ .subject_cert_der = subject_cert_der, .issuer_cert_der = issuer_cert_der }};
+    return buildRequestImpl(gpa, &one, opts);
+}
+
+/// A certificate and its issuer, both DER: one question for `buildRequests`
+/// or one lookup for `verifyMany`.
+pub const CertPair = struct {
+    subject_cert_der: []const u8,
+    issuer_cert_der: []const u8,
+};
+
+/// Build one DER `OCSPRequest` whose `requestList` carries one `Request` per
+/// entry of `certs`, in order (RFC 6960 §4.1.1; the `ParseResponseForCert`-per-
+/// certificate shape of Go, a multi-id request in OpenSSL). One `opts.hash`
+/// and one optional nonce cover the whole request. An empty `certs` is
+/// `error.Malformed` (the `requestList` must name at least one certificate).
+/// The bytes are owned by `gpa`. `buildRequest` is the one-entry case and its
+/// output is unchanged.
+pub fn buildRequests(
+    gpa: std.mem.Allocator,
+    certs: []const CertPair,
+    opts: RequestOptions,
+) BuildRequestError![]u8 {
+    return buildRequestImpl(gpa, certs, opts);
+}
+
+fn buildRequestImpl(
+    gpa: std.mem.Allocator,
+    certs: []const CertPair,
+    opts: RequestOptions,
+) BuildRequestError![]u8 {
+    if (certs.len == 0) return error.Malformed;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const b: Builder = .{ .a = arena.allocator() };
 
-    var name_buf: [64]u8 = undefined;
-    var key_buf: [64]u8 = undefined;
-    const name_hash = digest(opts.hash.hash(), issuer.subject_name, &name_buf);
-    const key_hash = digest(opts.hash.hash(), issuer.pub_key_bits, &key_buf);
-
     const alg_id = try b.seq(&.{ try b.oid(opts.hash.oid()), try b.null() });
-    const cert_id = try b.seq(&.{
-        alg_id,
-        try b.octetString(name_hash),
-        try b.octetString(key_hash),
-        try b.integerRaw(subject.serial),
-    });
-    const request = try b.seq(&.{cert_id});
-    const request_list = try b.seq(&.{request});
+    var requests = std.ArrayList([]const u8).empty;
+    for (certs) |pair| {
+        const subject = try parseCert(pair.subject_cert_der);
+        const issuer = try parseCert(pair.issuer_cert_der);
+        var name_buf: [64]u8 = undefined;
+        var key_buf: [64]u8 = undefined;
+        const name_hash = digest(opts.hash.hash(), issuer.subject_name, &name_buf);
+        const key_hash = digest(opts.hash.hash(), issuer.pub_key_bits, &key_buf);
+        const cert_id = try b.seq(&.{
+            alg_id,
+            try b.octetString(name_hash),
+            try b.octetString(key_hash),
+            try b.integerRaw(subject.serial),
+        });
+        try requests.append(b.a, try b.seq(&.{cert_id}));
+    }
+    const request_list = try b.seq(requests.items);
 
     var tbs_parts: [2][]const u8 = undefined;
     var n: usize = 0;
@@ -860,6 +894,20 @@ pub fn verify(
     // strictness here can only reject, never accept.
     if (!std.mem.eql(u8, subject.issuer_name, issuer.subject_name)) return error.IssuerMismatch;
 
+    // ── 1-3. Authorized responder, signature, nonce ──
+    const delegated = try authorize(basic, issuer, opts);
+
+    // ── 4. Find the SingleResponse whose CertID binds to the subject cert ──
+    const single = try findMatchingSingle(basic, issuer, subject.serial) orelse
+        return error.CertIdMismatch;
+
+    return finishVerdict(basic, single, delegated, opts);
+}
+
+/// Steps 1-3 of `verify`: resolve the authorized responder key, verify the
+/// signature over `tbsResponseData`, check the nonce. Returns whether a
+/// delegated responder certificate (not the issuer itself) signed.
+fn authorize(basic: Basic, issuer: CertView, opts: VerifyOptions) VerifyError!bool {
     // ── 1. Resolve the authorized responder key ──
     var responder_algo: PubKeyAlgo = undefined;
     var responder_spki: []const u8 = undefined;
@@ -894,12 +942,11 @@ pub fn verify(
         const got = basic.nonce orelse return error.NonceMismatch;
         if (!constEql(want, got)) return error.NonceMismatch;
     }
+    return delegated;
+}
 
-    // ── 4. Find the SingleResponse whose CertID binds to the subject cert ──
-    const single = try findMatchingSingle(basic, issuer, subject.serial) orelse
-        return error.CertIdMismatch;
-
-    // ── 5. Freshness ──
+/// Step 5 of `verify`: freshness of the matched SingleResponse, then the verdict.
+fn finishVerdict(basic: Basic, single: SingleResult, delegated: bool, opts: VerifyOptions) VerifyError!Verdict {
     if (opts.now_unix < single.this_update_unix) return error.ResponseNotYetValid;
     if (single.next_update_unix) |nu| {
         if (opts.now_unix > nu) return error.ResponseStale;
@@ -915,6 +962,80 @@ pub fn verify(
         .next_update_unix = single.next_update_unix,
         .produced_at_unix = basic.produced_at_unix,
     };
+}
+
+/// What `verifyMany` found for one `CertPair`.
+pub const CertOutcome = union(enum) {
+    /// The response answers for this certificate (authorized, signed, fresh).
+    verdict: Verdict,
+    /// The response is valid but no `SingleResponse` names this certificate
+    /// (`verify` reports the same case as `error.CertIdMismatch`).
+    absent,
+    /// This pair could not be answered: any `VerifyError` except
+    /// `CertIdMismatch` (e.g. `IssuerMismatch`, `UntrustedResponder` when the
+    /// responder is not authorized for THIS pair's issuer, `ResponseStale`
+    /// for this certificate's SingleResponse, `NonceMismatch`).
+    failed: VerifyError,
+};
+
+pub const VerifyManyError = error{
+    /// `responseStatus` was not `successful`.
+    UnsuccessfulResponse,
+    /// Successful response but not `id-pkix-ocsp-basic`.
+    UnsupportedResponseType,
+    /// `out.len != queries.len`.
+    LengthMismatch,
+};
+
+/// Look up several certificates in one response: `out[i]` is the outcome for
+/// `queries[i]`, exactly what `verify(response, queries[i].issuer_cert_der,
+/// queries[i].subject_cert_der, opts)` would decide (a `Verdict`, or its error
+/// as `.failed`, or `.absent` for `error.CertIdMismatch`), but consecutive
+/// queries sharing an issuer authorize the responder and check the signature
+/// once. Each pair is judged on its own: a pair whose issuer the responder is
+/// not authorized for, a stale entry or a non-chain pair fails alone and does
+/// not affect the others. No allocation; the caller owns `out`.
+pub fn verifyMany(
+    response: Response,
+    queries: []const CertPair,
+    out: []CertOutcome,
+    opts: VerifyOptions,
+) VerifyManyError!void {
+    if (out.len != queries.len) return error.LengthMismatch;
+    if (response.status != .successful) return error.UnsuccessfulResponse;
+    const basic = response.basic orelse return error.UnsupportedResponseType;
+
+    // The last authorization, reused while the issuer bytes stay the same.
+    var last_issuer: ?[]const u8 = null;
+    var last_auth: VerifyError!bool = false;
+
+    for (queries, out) |q, *slot| {
+        slot.* = verifyOneOf(basic, q, opts, &last_issuer, &last_auth);
+    }
+}
+
+fn verifyOneOf(
+    basic: Basic,
+    q: CertPair,
+    opts: VerifyOptions,
+    last_issuer: *?[]const u8,
+    last_auth: *VerifyError!bool,
+) CertOutcome {
+    const issuer = parseCert(q.issuer_cert_der) catch return .{ .failed = error.Malformed };
+    const subject = parseCert(q.subject_cert_der) catch return .{ .failed = error.Malformed };
+    if (!std.mem.eql(u8, subject.issuer_name, issuer.subject_name)) return .{ .failed = error.IssuerMismatch };
+
+    const reuse = if (last_issuer.*) |li| std.mem.eql(u8, li, q.issuer_cert_der) else false;
+    if (!reuse) {
+        last_auth.* = authorize(basic, issuer, opts);
+        last_issuer.* = q.issuer_cert_der;
+    }
+    const delegated = last_auth.* catch |e| return .{ .failed = e };
+
+    const single = (findMatchingSingle(basic, issuer, subject.serial) catch |e|
+        return .{ .failed = e }) orelse return .absent;
+    const v = finishVerdict(basic, single, delegated, opts) catch |e| return .{ .failed = e };
+    return .{ .verdict = v };
 }
 
 /// Constant-time equality for the nonce comparison (defense against a timing

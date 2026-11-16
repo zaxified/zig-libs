@@ -243,6 +243,15 @@ fn untrustedMetadataXmlOptions() xml.Options {
     return .{ .max_elements = max_untrusted_elements, .utf8_only = true };
 }
 
+/// `untrustedMetadataXmlOptions` with the caller's element budget: a
+/// federation aggregate is far larger than one entity's metadata, so
+/// `parseIdpMetadataFor` takes the bound from `AggregateOptions`.
+fn untrustedAggregateXmlOptions(max_elements: usize) xml.Options {
+    var o = untrustedMetadataXmlOptions();
+    o.max_elements = max_elements;
+    return o;
+}
+
 // ── configuration ────────────────────────────────────────────────────────────
 
 /// The IdP's signing key, as `Config.idp_key` takes it.
@@ -2108,11 +2117,51 @@ pub const IdpMetadata = struct {
     /// feed adversarial DER to std.crypto.Certificate). A descriptor with no
     /// `use` is treated as usable for signing (SAML default = both).
     signing_certs_der: []const []const u8,
+    /// `mdui:UIInfo` display data from `<md:IDPSSODescriptor><md:Extensions>`
+    /// (empty when the descriptor carries none). **UNTRUSTED text** — it is
+    /// what a login page would show, never an input to any trust decision.
+    ui_info: UiInfo = .{},
 
     pub fn deinit(self: *IdpMetadata) void {
         self.arena.deinit();
         self.* = undefined;
     }
+};
+
+/// `urn:oasis:names:tc:SAML:metadata:ui` (SAML V2.0 Metadata Extensions for
+/// Login and Discovery User Interface, `mdui`).
+pub const mdui_ns = "urn:oasis:names:tc:SAML:metadata:ui";
+
+/// At most this many entries are kept per `UiInfo` list (`DisplayName`,
+/// `Description`, `Logo`); further ones are ignored.
+pub const max_ui_entries = 64;
+
+/// A language-tagged string from `mdui:UIInfo`. `lang` is the `xml:lang` value,
+/// `""` when the element has none (mdui requires it; a document that omits it
+/// is still read).
+pub const UiString = struct {
+    lang: []const u8,
+    value: []const u8,
+};
+
+/// `<mdui:Logo height width xml:lang>URL</mdui:Logo>`. An element whose
+/// `width`/`height` is not a non-negative decimal integer is skipped.
+pub const UiLogo = struct {
+    lang: []const u8,
+    width: u32,
+    height: u32,
+    /// The element text (an https URL or a `data:` URI), whitespace-trimmed.
+    /// Never fetched or interpreted here.
+    url: []const u8,
+};
+
+/// The `mdui:DisplayName` / `mdui:Description` / `mdui:Logo` children of an
+/// IdP's `mdui:UIInfo` (`InformationURL`, `PrivacyStatementURL`, `Keywords`
+/// are not read).
+pub const UiInfo = struct {
+    display_names: []const UiString = &.{},
+    descriptions: []const UiString = &.{},
+    logos: []const UiLogo = &.{},
 };
 
 pub const MetadataError = error{
@@ -2130,8 +2179,106 @@ pub fn parseIdpMetadata(alloc: std.mem.Allocator, metadata_xml: []const u8) Meta
     };
     defer doc.deinit();
 
-    const ed = doc.root;
-    if (!isEl(ed, md_ns, "EntityDescriptor")) return error.MalformedMetadata;
+    if (!isEl(doc.root, md_ns, "EntityDescriptor")) return error.MalformedMetadata;
+    return idpFromEntityDescriptor(alloc, doc.root);
+}
+
+/// Bounds for `parseIdpMetadataFor`.
+pub const AggregateOptions = struct {
+    /// Element cap of the XML parse. The default of `xml`'s own limit (2^20)
+    /// fits a federation aggregate of ~10k entities; the 8192 used for a single
+    /// descriptor would refuse one.
+    max_elements: usize = 1 << 20,
+    /// Deepest `<md:EntitiesDescriptor>` nesting accepted (the root counts as 1).
+    max_nesting: u8 = 8,
+    /// Most `<md:EntityDescriptor>`s looked at before giving up.
+    max_entities: u32 = 100_000,
+};
+
+pub const AggregateError = MetadataError || error{
+    /// No `<md:EntityDescriptor>` with that `entityID` in the document.
+    EntityNotFound,
+    /// Two or more descriptors carry that `entityID` (the aggregate does not
+    /// say which to trust, so none is chosen).
+    AmbiguousEntity,
+};
+
+/// `parseIdpMetadata` for a document that may be an `<md:EntitiesDescriptor>`
+/// aggregate (a federation's metadata file): selects the one
+/// `<md:EntityDescriptor entityID="entity_id">` — anywhere in the aggregate,
+/// through nested `EntitiesDescriptor`s — and returns it exactly as
+/// `parseIdpMetadata` would for that descriptor alone. A plain
+/// `EntityDescriptor` root is accepted too, if its `entityID` is `entity_id`.
+///
+/// Bounded by `opts` (nesting, descriptor count, parse elements): exceeding
+/// one is `MalformedMetadata`. `EntityNotFound` / `AmbiguousEntity` as above; a
+/// selected entity without an `IDPSSODescriptor` is `NoIdpDescriptor`.
+///
+/// **This does not verify any signature.** Neither does `parseIdpMetadata`: the
+/// module has no metadata-signature path, so a `<ds:Signature>` on the
+/// aggregate (or `validUntil`) is ignored. Fetch the aggregate over a channel
+/// you trust or verify it (with `xmldsig`) before calling this.
+pub fn parseIdpMetadataFor(
+    alloc: std.mem.Allocator,
+    metadata_xml: []const u8,
+    entity_id: []const u8,
+    opts: AggregateOptions,
+) AggregateError!IdpMetadata {
+    var doc = xml.parse(alloc, metadata_xml, untrustedAggregateXmlOptions(opts.max_elements)) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.MalformedMetadata,
+    };
+    defer doc.deinit();
+
+    var found: ?*const xml.Element = null;
+    var seen: u32 = 0;
+    if (isEl(doc.root, md_ns, "EntityDescriptor")) {
+        try matchEntity(doc.root, entity_id, &found, &seen, opts);
+    } else if (isEl(doc.root, md_ns, "EntitiesDescriptor")) {
+        try scanAggregate(doc.root, 1, entity_id, &found, &seen, opts);
+    } else return error.MalformedMetadata;
+
+    return idpFromEntityDescriptor(alloc, found orelse return error.EntityNotFound);
+}
+
+fn matchEntity(
+    ed: *const xml.Element,
+    entity_id: []const u8,
+    found: *?*const xml.Element,
+    seen: *u32,
+    opts: AggregateOptions,
+) AggregateError!void {
+    seen.* += 1;
+    if (seen.* > opts.max_entities) return error.MalformedMetadata;
+    const id = ed.attr("", "entityID") orelse return;
+    if (!std.mem.eql(u8, id, entity_id)) return;
+    if (found.* != null) return error.AmbiguousEntity;
+    found.* = ed;
+}
+
+fn scanAggregate(
+    group: *const xml.Element,
+    depth: u32,
+    entity_id: []const u8,
+    found: *?*const xml.Element,
+    seen: *u32,
+    opts: AggregateOptions,
+) AggregateError!void {
+    if (depth > opts.max_nesting) return error.MalformedMetadata;
+    for (group.children) |c| switch (c.content) {
+        .element => |el| {
+            if (isEl(el, md_ns, "EntityDescriptor")) {
+                try matchEntity(el, entity_id, found, seen, opts);
+            } else if (isEl(el, md_ns, "EntitiesDescriptor")) {
+                try scanAggregate(el, depth + 1, entity_id, found, seen, opts);
+            }
+        },
+        else => {},
+    };
+}
+
+/// Read an `<md:EntityDescriptor>` element into an `IdpMetadata`.
+fn idpFromEntityDescriptor(alloc: std.mem.Allocator, ed: *const xml.Element) MetadataError!IdpMetadata {
     const entity_id_src = ed.attr("", "entityID") orelse return error.MalformedMetadata;
     const idp = childEl(ed, md_ns, "IDPSSODescriptor") orelse return error.NoIdpDescriptor;
 
@@ -2143,6 +2290,7 @@ pub fn parseIdpMetadata(alloc: std.mem.Allocator, metadata_xml: []const u8) Meta
 
     var endpoints: std.ArrayList(SsoEndpoint) = .empty;
     var certs: std.ArrayList([]const u8) = .empty;
+    var ui: UiAcc = .{};
     for (idp.children) |c| switch (c.content) {
         .element => |el| {
             if (isEl(el, md_ns, "SingleSignOnService")) {
@@ -2161,6 +2309,8 @@ pub fn parseIdpMetadata(alloc: std.mem.Allocator, metadata_xml: []const u8) Meta
                     const der = decodeBase64(a, text) catch continue;
                     try certs.append(a, der);
                 }
+            } else if (isEl(el, md_ns, "Extensions")) {
+                try collectUiInfo(a, el, &ui);
             }
         },
         else => {},
@@ -2171,6 +2321,54 @@ pub fn parseIdpMetadata(alloc: std.mem.Allocator, metadata_xml: []const u8) Meta
         .entity_id = entity_id,
         .sso_endpoints = try endpoints.toOwnedSlice(a),
         .signing_certs_der = try certs.toOwnedSlice(a),
+        .ui_info = .{
+            .display_names = try ui.names.toOwnedSlice(a),
+            .descriptions = try ui.descs.toOwnedSlice(a),
+            .logos = try ui.logos.toOwnedSlice(a),
+        },
+    };
+}
+
+const UiAcc = struct {
+    names: std.ArrayList(UiString) = .empty,
+    descs: std.ArrayList(UiString) = .empty,
+    logos: std.ArrayList(UiLogo) = .empty,
+};
+
+fn uiText(a: std.mem.Allocator, el: *const xml.Element) std.mem.Allocator.Error![]const u8 {
+    const t = try textAlloc(a, el);
+    return std.mem.trim(u8, t, " \t\r\n");
+}
+
+fn uiLang(a: std.mem.Allocator, el: *const xml.Element) std.mem.Allocator.Error![]const u8 {
+    return a.dupe(u8, el.attr(xml.xml_ns, "lang") orelse "");
+}
+
+/// Read every `mdui:UIInfo` under an `<md:Extensions>` element.
+fn collectUiInfo(a: std.mem.Allocator, extensions: *const xml.Element, acc: *UiAcc) std.mem.Allocator.Error!void {
+    for (extensions.children) |c| switch (c.content) {
+        .element => |info| {
+            if (!isEl(info, mdui_ns, "UIInfo")) continue;
+            for (info.children) |cc| switch (cc.content) {
+                .element => |el| {
+                    if (!std.mem.eql(u8, el.uri, mdui_ns)) continue;
+                    if (std.mem.eql(u8, el.local, "DisplayName")) {
+                        if (acc.names.items.len < max_ui_entries)
+                            try acc.names.append(a, .{ .lang = try uiLang(a, el), .value = try uiText(a, el) });
+                    } else if (std.mem.eql(u8, el.local, "Description")) {
+                        if (acc.descs.items.len < max_ui_entries)
+                            try acc.descs.append(a, .{ .lang = try uiLang(a, el), .value = try uiText(a, el) });
+                    } else if (std.mem.eql(u8, el.local, "Logo")) {
+                        if (acc.logos.items.len >= max_ui_entries) continue;
+                        const w = std.fmt.parseInt(u32, el.attr("", "width") orelse continue, 10) catch continue;
+                        const h = std.fmt.parseInt(u32, el.attr("", "height") orelse continue, 10) catch continue;
+                        try acc.logos.append(a, .{ .lang = try uiLang(a, el), .width = w, .height = h, .url = try uiText(a, el) });
+                    }
+                },
+                else => {},
+            };
+        },
+        else => {},
     };
 }
 
@@ -3907,6 +4105,7 @@ test {
     _ = @import("test_response_sig.zig");
     _ = @import("test_multikey.zig");
     _ = @import("test_metadata.zig");
+    _ = @import("test_metadata_aggregate.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
     _ = @import("test_sweep.zig");
@@ -4587,7 +4786,8 @@ test "TEETH: every untrusted parse in this file goes through an options helper" 
         if (skip) continue;
         checked += 1;
         const ok = std.mem.find(u8, tail, "untrustedXmlOptions()") != null or
-            std.mem.find(u8, tail, "untrustedMetadataXmlOptions()") != null;
+            std.mem.find(u8, tail, "untrustedMetadataXmlOptions()") != null or
+            std.mem.find(u8, tail, "untrustedAggregateXmlOptions(") != null;
         if (!ok) {
             std.debug.print("an untrusted xml.parse does not use an options helper:\n  {s}\n", .{tail});
             return error.UntrustedParseWithoutBudget;

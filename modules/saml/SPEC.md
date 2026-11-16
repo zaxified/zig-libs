@@ -426,7 +426,8 @@ Documents read: `saml-core-2.0-os` and `saml-profiles-2.0-os` (OASIS Standard,
 - **`buildSpMetadata`** — see "SP metadata" below.
 - **`parseIdpMetadata`**: `<md:EntityDescriptor>` → entityID, SSO endpoints, and
   `<md:KeyDescriptor use="signing">` certificate **DER** (raw bytes only, for the
-  caller to parse/pin).
+  caller to parse/pin), plus `mdui:UIInfo` display data. `parseIdpMetadataFor` does the same
+  for one entity of an `<md:EntitiesDescriptor>` aggregate (2026-11-16).
 
 ## SP metadata (`buildSpMetadata`)
 
@@ -797,7 +798,7 @@ forbidden for the Response by SAMLProf §4.1.2, so it is deliberately not offere
   form needs `sign_with` on `AuthnRequestOptions`, which widens `buildAuthnRequest`'s error
   set (BREAKING for exhaustive switches). Effort: small. Fits §2: yes.
 - **ECDSA for the SP's own signatures** — already listed under *Deferred / out of scope*; small.
-- **Metadata extensions** (`mdui:UIInfo`, entity attributes, `md:EncryptionMethod` under the
+- ✅ DONE 2026-11-16 for `mdui:UIInfo` (DisplayName/Description/Logo with `xml:lang` → `IdpMetadata.ui_info`) and `<md:EntitiesDescriptor>` aggregates (`parseIdpMetadataFor(alloc, xml, entity_id, AggregateOptions)`: nested groups, bounded depth/count/elements, `EntityNotFound`/`AmbiguousEntity`; `parseIdpMetadata` itself unchanged). STILL OPEN: entity attributes and `md:EncryptionMethod` (not trivial: need a `saml:Attribute` reader and a policy for the algorithm list). No metadata-signature verification exists in this module, so an aggregate's top-level `ds:Signature` is not checked (documented; caller verifies with `xmldsig`). **Metadata extensions** (`mdui:UIInfo`, entity attributes, `md:EncryptionMethod` under the
   encryption KeyDescriptor) and **`<md:EntitiesDescriptor>` aggregates** in
   `parseIdpMetadata`. Effort: small each. Fits §2: yes.
 - **IdP side** — refused by design (see *Deferred / out of scope*).

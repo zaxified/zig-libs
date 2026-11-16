@@ -56,6 +56,9 @@ switch (verdict.status) {
 ## Public API
 
 - `buildRequest(gpa, subject_cert_der, issuer_cert_der, RequestOptions) ![]u8`
+- `buildRequests(gpa, []const CertPair, RequestOptions) ![]u8` — one request, several `Request`s.
+- `verifyMany(response, []const CertPair, []CertOutcome, VerifyOptions) VerifyManyError!void`
+  — one verified response, one outcome per pair (`.verdict`, `.absent`, `.failed`).
 - `parseResponse(der_bytes) ParseError!Response` — `Response.status`
   (`ResponseStatus`) and, for a successful basic response, `Response.basic`
   (`Basic`: `tbs_response_data`, `responder`, `produced_at_unix`, `responses`,

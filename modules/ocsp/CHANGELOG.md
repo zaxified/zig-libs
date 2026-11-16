@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — ADDED (additive): `buildRequests` (one `OCSPRequest` with several `Request`s), `verifyMany` (several `CertPair`s looked up in one response; per pair a `CertOutcome`: `.verdict`, `.absent` or `.failed: VerifyError`; new `CertPair`, `CertOutcome`, `VerifyManyError`). `verify` / `buildRequest` behave and encode as before (`verify`'s steps are now shared private helpers).
 - **2026-11-16** — Ed25519 responder signatures (id-Ed25519, OID 1.3.101.112) for both the response signature and a delegated responder certificate's issuer signature; the responder key must be Ed25519 and the signature algorithm must agree, otherwise `UnsupportedSignatureAlgorithm`. Previously every Ed25519 response was `UnsupportedSignatureAlgorithm`. No external vector (round trips with in-test keys).
 
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the prime256v1 / secp384r1 / rsaEncryption OID byte constants are `x509.safe`'s instead of private copies.
