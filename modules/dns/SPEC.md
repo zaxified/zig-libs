@@ -6,7 +6,7 @@
 
 **Scope:** core — Go net resolver (reference) / c-ares / hickory-resolver / libunbound / dnspython / systemd-resolved / Node `dns` (surveyed 2026-11-15; parity -> core 2026-11-15: the answer cache is now `CachingResolver` (2026-11-15), but the API is blocking-only where every library but Go's is asynchronous — see "Where we are behind")
 
-**Audit:** review 2026-09-12 · mutation 2026-11-16 (300/319, 19 eq) · src a0b9875b25d7af0f
+**Audit:** review 2026-09-12 · mutation 2026-11-16 (300/319, 19 eq) · src 13247f8ac5c44d0a
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DNS_FUZZ); 2026-11-02 `dns-query-roundtrip` (random QueryOptions incl. DO/AD/CD and EDNS options → encode → decode equal, or the documented refusal; 200,000 driver runs clean, ReleaseSafe) · ct n/a — public DNS codec (keyword review, 2026-10-07); TSIG (2026-10-16): std HMAC, MAC compared with `timing_safe.eql`, secret frames burned (stack probe) · panic 2026-10-31 (sweep + blind review: `RequestTooLarge` for > 65535 B, TSIG length guards, spoofed/QR-clear/undecodable UDP replies dropped to the same deadline, DoH body ≤ 65535, owner-name sharing 17.8 → 0.85 MB on a pointer flood; delta audit 28/31 + 3 eq)
 
