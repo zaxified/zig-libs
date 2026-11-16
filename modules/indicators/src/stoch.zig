@@ -46,12 +46,7 @@ pub const KCore = struct {
         const hh = self.hi.step(hsrc, b.high);
         const ll = self.lo.step(lsrc, b.low);
         if (hh == null or ll == null) return null;
-        const range = hh.? - ll.?;
-        // 1e-14 is TA_EPSILON; the band is scaled by the extremes' own magnitude.
-        if (!(@abs(range) <= 0.00000000000001 * (@abs(hh.?) + @abs(ll.?)))) {
-            return (b.close - ll.?) / range * 100.0;
-        }
-        return 0.0;
+        return kOf(hh.?, ll.?, b.close);
     }
 };
 
@@ -82,14 +77,44 @@ fn validK(period: usize) Error!void {
     try core.checkPeriod(period, 1);
 }
 
-/// Batch %K of every bar into the f64 series `out` (NaN before `period - 1`).
+/// Batch %K of every bar into the f64 series `out` (NaN before `period - 1`): `KCore.step` per bar, with the two
+/// extremum automatons run as `ExtCore.Run` over the slices (the same rescans and tie rule, the state in registers,
+/// no `?f64` per bar) and the same %K arithmetic.
 fn kSeries(comptime T: type, hs: []const T, ls: []const T, cs: []const T, out: []f64, period: usize) void {
-    var k = KCore.init(period);
-    const sh = SliceSrc(T){ .xs = hs };
-    const sl = SliceSrc(T){ .xs = ls };
-    for (hs, ls, cs, out) |h, l, c, *o| {
-        const r = k.step(sh, sl, .{ .high = h, .low = l, .close = c });
-        o.* = r orelse std.math.nan(f64);
+    const n = hs.len;
+    const lead = @min(period - 1, n);
+    for (out[0..lead]) |*o| o.* = std.math.nan(f64);
+    var hr = HiCore.Run{ .p = period, .idx1 = 0, .val = 0.0 };
+    var lr = LoCore.Run{ .p = period, .idx1 = 0, .val = 0.0 };
+    var i = lead;
+    while (i < n) : (i += 1) {
+        const hh = hr.bar(T, hs, i);
+        const ll = lr.bar(T, ls, i);
+        out[i] = kOf(hh, ll, cs[i]);
+    }
+}
+
+/// Raw %K from the window's extremes (`KCore.step`'s arithmetic).
+inline fn kOf(hh: f64, ll: f64, close: f64) f64 {
+    const range = hh - ll;
+    // 1e-14 is TA_EPSILON; the band is scaled by the extremes' own magnitude.
+    if (!(@abs(range) <= 0.00000000000001 * (@abs(hh) + @abs(ll)))) {
+        return (close - ll) / range * 100.0;
+    }
+    return 0.0;
+}
+
+/// One moving-average stage of a batch: `MaCore.step` over `in[from..]` into `out[from..]` (the stage's bar 0 is
+/// `in[from]`), NaN before `from`. One dispatch per call, then the active variant's monomorphic loop (its
+/// `steadyRun` where it declares one, bitwise its `step`), as `smooth.ma` runs it.
+fn maStage(c: MaCore, in: []const f64, out: []f64, from: usize) void {
+    const f = @min(from, in.len);
+    for (out[0..f]) |*o| o.* = std.math.nan(f64);
+    switch (c) {
+        inline else => |v| {
+            var local = v;
+            smooth.runCore(f64, &local, in[f..], out[f..], false);
+        },
     }
 }
 
@@ -137,11 +162,16 @@ pub fn stochf(comptime T: type, gpa: std.mem.Allocator, high: []const T, low: []
         break :blk owned;
     };
     kSeries(T, high, low, close, kb, p.fastk);
-    var cd = try MaCore.init(plan.d);
-    const sd = SliceSrc(f64){ .xs = kb, .off = plan.lb_k };
-    for (kb, out_d, 0..) |kv, *o, i| {
-        const r = if (i >= plan.lb_k) cd.step(sd, kv) else null;
-        o.* = if (r) |v| core.to(T, v) else nan;
+    const cd = try MaCore.init(plan.d);
+    if (T == f64) {
+        maStage(cd, kb, out_d, plan.lb_k);
+    } else {
+        var cdv = cd;
+        const sd = SliceSrc(f64){ .xs = kb, .off = plan.lb_k };
+        for (kb, out_d, 0..) |kv, *o, i| {
+            const r = if (i >= plan.lb_k) cdv.step(sd, kv) else null;
+            o.* = if (r) |v| core.to(T, v) else nan;
+        }
     }
     // %K is reported only from the first %D bar.
     for (out_k, kb, 0..) |*o, kv, i| o.* = if (i < total) nan else core.to(T, kv);
@@ -245,25 +275,24 @@ pub fn stoch(comptime T: type, gpa: std.mem.Allocator, high: []const T, low: []c
     // 1. raw %K -> a
     kSeries(T, high, low, close, a, p.fastk);
     // 2. slow %K = MA(raw %K) -> b
-    var ck = try MaCore.init(plan.sk);
-    const s1 = SliceSrc(f64){ .xs = a, .off = plan.lb_k };
-    for (a, b, 0..) |kv, *o, i| {
-        const r = if (i >= plan.lb_k) ck.step(s1, kv) else null;
-        o.* = r orelse std.math.nan(f64);
-    }
+    maStage(try MaCore.init(plan.sk), a, b, plan.lb_k);
     // 3. slow %D = MA(slow %K) -> a (the raw %K is no longer needed)
-    var cd = try MaCore.init(plan.sd);
     const start = plan.lb_k + plan.lb_sk;
-    const s2 = SliceSrc(f64){ .xs = b, .off = start };
-    for (a, b, 0..) |*o, sk, i| {
-        const r = if (i >= start) cd.step(s2, sk) else null;
-        o.* = r orelse std.math.nan(f64);
-    }
+    maStage(try MaCore.init(plan.sd), b, a, start);
     // 4. a now holds slow %D and b slow %K. Slow %K is reported only from the
     // first slow %D bar.
-    for (out_k, out_d, a, b, 0..) |*ok, *od, dv, kv, i| {
-        ok.* = if (i < total) nan else core.to(T, kv);
-        od.* = core.to(T, dv);
+    if (T == f64) {
+        // `a` is `out_k`, `b` is `out_d`: swap them in place.
+        for (a, b, 0..) |*x, *y, i| {
+            const dv = x.*;
+            x.* = if (i < total) nan else y.*;
+            y.* = dv;
+        }
+    } else {
+        for (out_k, out_d, a, b, 0..) |*ok, *od, dv, kv, i| {
+            ok.* = if (i < total) nan else core.to(T, kv);
+            od.* = core.to(T, dv);
+        }
     }
     return total;
 }

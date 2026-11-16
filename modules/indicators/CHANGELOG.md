@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Batch speed (third round, bit for bit unchanged): STOCH, STOCHF and KDJ (f64) compute the raw %K with the
+  two extremum automatons run as `ExtCore.Run` over the slices (same rescans, same tie rule, no `?f64` per bar) and run each
+  smoothing stage as one `MaCore` dispatch per call with the variant's monomorphic loop (`smooth.runCore`) instead of a
+  per-bar union switch — STOCH 2.3x TA-Lib before, 1.11x now; STOCHF 1.8x -> 1.14x; KDJ 2.5x -> 1.05x.
 - **2026-11-16** — Batch speed (P-gap work, third round; every output bit for bit unchanged, NaN inputs included): CRSI counts its
   percent rank over the ring buffer as one contiguous slice with eight-lane compares (an integer count, so in any order) instead of
   a `%`-indexed `src.at` per window value — 3.4x TA-Lib before, 0.42x now.
