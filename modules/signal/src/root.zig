@@ -101,11 +101,8 @@ pub const generateSignedPreKey = x3dh.generateSignedPreKey;
 // messages and associated data, so keeping both sets visible makes every
 // cross-feed a compile error on distinct types.
 //
-// Note what is NOT here: PQXDH ships no wire codec. X3DH's `PreKeyBundle` and
-// `InitialMessage` have `toBytes`/`fromBytes`; their PQXDH counterparts do
-// not, so a caller who needs to transmit a PQXDH bundle writes the encoding
-// themselves — including the `has_opk` discipline x3dh's codec already gets
-// right, for a message carrying two 1568-byte fields.
+// Both PQXDH types have `toBytes`/`fromBytes` (2026-11-16): the X3DH layouts
+// extended by the KEM fields, with the same `has_opk` discipline.
 pub const PqPreKeyBundle = pqxdh.PreKeyBundle;
 pub const PqInitialMessage = pqxdh.InitialMessage;
 pub const PqAgreement = pqxdh.Agreement;

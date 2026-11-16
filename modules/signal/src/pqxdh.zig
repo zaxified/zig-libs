@@ -153,6 +153,66 @@ pub const PreKeyBundle = struct {
     kem_prekey: [kem_public_length]u8,
     kem_prekey_id: u32,
     kem_prekey_signature: xeddsa.Signature,
+
+    /// `x3dh.PreKeyBundle`'s 169 bytes (`identity_key || signed_prekey ||
+    /// signed_prekey_id(4 LE) || signed_prekey_signature || has_opk(1) ||
+    /// one_time_prekey_id(4 LE) || one_time_prekey(32, zero-filled if
+    /// absent)`) followed by `kem_prekey(1568) || kem_prekey_id(4 LE) ||
+    /// kem_prekey_signature(64)`. This module's own layout, the X3DH one
+    /// extended (Signal's protobufs are not reproduced).
+    pub const encoded_length: usize = x3dh.PreKeyBundle.encoded_length + kem_public_length + 4 + signature_length; // 1805
+
+    pub const DecodeError = error{InvalidPreKeyBundle};
+
+    // secret-api-ok: PreKeyBundle is Bob's PUBLISHED bundle (public keys, ids, public signatures); the lint reads the field name identity_key as secret.
+    pub fn toBytes(b: PreKeyBundle) [encoded_length]u8 {
+        var out: [encoded_length]u8 = undefined;
+        const curve: x3dh.PreKeyBundle = .{
+            .identity_key = b.identity_key,
+            .signed_prekey = b.signed_prekey,
+            .signed_prekey_id = b.signed_prekey_id,
+            .signed_prekey_signature = b.signed_prekey_signature,
+            .one_time_prekey = b.one_time_prekey,
+            .one_time_prekey_id = b.one_time_prekey_id,
+        };
+        out[0..x3dh.PreKeyBundle.encoded_length].* = curve.toBytes();
+        var off: usize = x3dh.PreKeyBundle.encoded_length;
+        out[off..][0..kem_public_length].* = b.kem_prekey;
+        off += kem_public_length;
+        std.mem.writeInt(u32, out[off..][0..4], b.kem_prekey_id, .little);
+        off += 4;
+        out[off..][0..signature_length].* = b.kem_prekey_signature;
+        off += signature_length;
+        std.debug.assert(off == encoded_length);
+        return out;
+    }
+
+    // secret-api-ok: PreKeyBundle is Bob's PUBLISHED bundle (public keys, ids, public signatures); the lint reads the field name identity_key as secret.
+    pub fn fromBytes(bytes: [encoded_length]u8) DecodeError!PreKeyBundle {
+        const n = x3dh.PreKeyBundle.encoded_length;
+        const curve = x3dh.PreKeyBundle.fromBytes(bytes[0..n].*) catch return error.InvalidPreKeyBundle;
+        // x3dh's layout: identity, signed prekey, its id, signature, has_opk.
+        const opk_id_off = key_length + key_length + 4 + signature_length + 1;
+        var off: usize = n;
+        const kem_prekey = bytes[off..][0..kem_public_length].*;
+        off += kem_public_length;
+        const kem_prekey_id = std.mem.readInt(u32, bytes[off..][0..4], .little);
+        off += 4;
+        const kem_prekey_signature = bytes[off..][0..signature_length].*;
+        return .{
+            .identity_key = curve.identity_key,
+            .signed_prekey = curve.signed_prekey,
+            .signed_prekey_id = curve.signed_prekey_id,
+            .signed_prekey_signature = curve.signed_prekey_signature,
+            .one_time_prekey = curve.one_time_prekey,
+            // `one_time_prekey_id` is not optional here: an absent one-time
+            // prekey keeps the id it was written with (0 from `toBytes`).
+            .one_time_prekey_id = std.mem.readInt(u32, bytes[opk_id_off..][0..4], .little),
+            .kem_prekey = kem_prekey,
+            .kem_prekey_id = kem_prekey_id,
+            .kem_prekey_signature = kem_prekey_signature,
+        };
+    }
 };
 
 /// What Alice sends. `kem_ciphertext` is the encapsulation against
@@ -176,6 +236,76 @@ pub const InitialMessage = struct {
     /// not compile.
     pub fn deinit(m: InitialMessage, allocator: std.mem.Allocator) void {
         allocator.free(m.ciphertext);
+    }
+
+    pub const DecodeError = error{InvalidInitialMessage} || std.mem.Allocator.Error;
+
+    /// Fixed header, NOT counting `ciphertext`: `identity_key(32) ||
+    /// ephemeral_key(32) || signed_prekey_id(4 LE) || has_opk(1) ||
+    /// one_time_prekey_id(4 LE) || kem_prekey_id(4 LE) ||
+    /// kem_ciphertext(1568) || ciphertext_len(4 LE)` — `x3dh.InitialMessage`'s
+    /// header with the KEM fields before the length.
+    pub const header_length: usize = key_length + key_length + 4 + 1 + 4 + 4 + kem_ciphertext_length + 4; // 1649
+
+    /// Caller owns the returned slice (`allocator.free`).
+    // secret-api-ok: InitialMessage is Alice's wire message (public keys, ids, KEM ciphertext, ciphertext); the lint reads the field name identity_key as secret.
+    pub fn toBytes(m: InitialMessage, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+        const out = try allocator.alloc(u8, header_length + m.ciphertext.len);
+        var off: usize = 0;
+        out[off..][0..key_length].* = m.identity_key;
+        off += key_length;
+        out[off..][0..key_length].* = m.ephemeral_key;
+        off += key_length;
+        std.mem.writeInt(u32, out[off..][0..4], m.signed_prekey_id, .little);
+        off += 4;
+        out[off] = @intFromBool(m.one_time_prekey_id != null);
+        off += 1;
+        std.mem.writeInt(u32, out[off..][0..4], m.one_time_prekey_id orelse 0, .little);
+        off += 4;
+        std.mem.writeInt(u32, out[off..][0..4], m.kem_prekey_id, .little);
+        off += 4;
+        out[off..][0..kem_ciphertext_length].* = m.kem_ciphertext;
+        off += kem_ciphertext_length;
+        std.mem.writeInt(u32, out[off..][0..4], @intCast(m.ciphertext.len), .little);
+        off += 4;
+        std.debug.assert(off == header_length);
+        @memcpy(out[off..], m.ciphertext);
+        return out;
+    }
+
+    /// Caller owns the returned `ciphertext` (`deinit`).
+    // secret-api-ok: InitialMessage is Alice's wire message (public keys, ids, KEM ciphertext, ciphertext); the lint reads the field name identity_key as secret.
+    pub fn fromBytes(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!InitialMessage {
+        if (bytes.len < header_length) return error.InvalidInitialMessage;
+        var off: usize = 0;
+        const identity_key = bytes[off..][0..key_length].*;
+        off += key_length;
+        const ephemeral_key = bytes[off..][0..key_length].*;
+        off += key_length;
+        const signed_prekey_id = std.mem.readInt(u32, bytes[off..][0..4], .little);
+        off += 4;
+        const has_opk_byte = bytes[off];
+        off += 1;
+        if (has_opk_byte > 1) return error.InvalidInitialMessage;
+        const opk_id = std.mem.readInt(u32, bytes[off..][0..4], .little);
+        off += 4;
+        const kem_prekey_id = std.mem.readInt(u32, bytes[off..][0..4], .little);
+        off += 4;
+        const kem_ciphertext = bytes[off..][0..kem_ciphertext_length].*;
+        off += kem_ciphertext_length;
+        const ciphertext_len = std.mem.readInt(u32, bytes[off..][0..4], .little);
+        off += 4;
+        std.debug.assert(off == header_length);
+        if (bytes.len - off != ciphertext_len) return error.InvalidInitialMessage;
+        return .{
+            .identity_key = identity_key,
+            .ephemeral_key = ephemeral_key,
+            .signed_prekey_id = signed_prekey_id,
+            .one_time_prekey_id = if (has_opk_byte == 1) opk_id else null,
+            .kem_prekey_id = kem_prekey_id,
+            .kem_ciphertext = kem_ciphertext,
+            .ciphertext = try allocator.dupe(u8, bytes[off..]),
+        };
     }
 };
 
@@ -766,4 +896,61 @@ test "a degraded io.random cannot reach any PQXDH secret" {
     defer testing.allocator.free(b.message.ciphertext);
     try testing.expect(!std.mem.eql(u8, &a.message.kem_ciphertext, &b.message.kem_ciphertext));
     try testing.expect(!std.mem.eql(u8, &a.agreement.shared_secret, &b.agreement.shared_secret));
+}
+
+test "wire codecs: bundle and initial message through bytes, then the handshake still agrees" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const bob_ik = shim.x3dh.generateKeyPair(io);
+    const alice_ik = shim.x3dh.generateKeyPair(io);
+    const z: xeddsa.RandomData = @splat(0x55);
+    const spk = shim.x3dh.generateSignedPreKey(bob_ik, 7, z, io);
+    const kem = shim.pqxdh.generateKemPreKey(bob_ik, 42, true, z, io);
+    const opk_kp = shim.x3dh.generateKeyPair(io);
+    const opk: OneTimePreKey = .{ .key_pair = opk_kp, .id = 9 };
+
+    for ([_]bool{ true, false }) |with_opk| {
+        const bundle: PreKeyBundle = .{
+            .identity_key = bob_ik.public_key,
+            .signed_prekey = spk.key_pair.public_key,
+            .signed_prekey_id = spk.id,
+            .signed_prekey_signature = spk.signature,
+            .one_time_prekey = if (with_opk) opk_kp.public_key else null,
+            .one_time_prekey_id = if (with_opk) opk.id else 0,
+            .kem_prekey = kem.key_pair.public_key.toBytes(),
+            .kem_prekey_id = kem.id,
+            .kem_prekey_signature = kem.signature,
+        };
+        const wire_bundle = bundle.toBytes();
+        try testing.expectEqual(@as(usize, 1805), wire_bundle.len);
+        const got_bundle = try PreKeyBundle.fromBytes(wire_bundle);
+        try testing.expectEqualDeep(bundle, got_bundle);
+
+        const out = try shim.pqxdh.initiate(testing.allocator, alice_ik, got_bundle, "hello", io);
+        defer testing.allocator.free(out.message.ciphertext);
+        const wire = try out.message.toBytes(testing.allocator);
+        defer testing.allocator.free(wire);
+        try testing.expectEqual(InitialMessage.header_length + out.message.ciphertext.len, wire.len);
+        const msg = try InitialMessage.fromBytes(testing.allocator, wire);
+        defer msg.deinit(testing.allocator);
+        try testing.expectEqualDeep(out.message, msg);
+
+        const bob = try shim.pqxdh.respond(testing.allocator, bob_ik, spk, if (with_opk) opk else null, kem, msg);
+        defer testing.allocator.free(bob.plaintext);
+        try testing.expectEqualSlices(u8, &out.agreement.shared_secret, &bob.agreement.shared_secret);
+        try testing.expectEqualStrings("hello", bob.plaintext);
+
+        // Malformed: bad has_opk byte, short, length field off by one.
+        var bad = try testing.allocator.dupe(u8, wire);
+        defer testing.allocator.free(bad);
+        bad[key_length * 2 + 4] = 2;
+        try testing.expectError(error.InvalidInitialMessage, InitialMessage.fromBytes(testing.allocator, bad));
+        try testing.expectError(error.InvalidInitialMessage, InitialMessage.fromBytes(testing.allocator, wire[0 .. InitialMessage.header_length - 1]));
+        try testing.expectError(error.InvalidInitialMessage, InitialMessage.fromBytes(testing.allocator, wire[0 .. wire.len - 1]));
+        var bad_bundle = wire_bundle;
+        bad_bundle[key_length * 2 + 4 + signature_length] = 7;
+        try testing.expectError(error.InvalidPreKeyBundle, PreKeyBundle.fromBytes(bad_bundle));
+    }
 }

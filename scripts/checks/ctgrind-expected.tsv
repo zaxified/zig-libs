@@ -1024,8 +1024,8 @@ hpke	ReleaseFast	xwing_decap	1	0	ce5cc5ca5ca12914	a1bdb379c24261c4
 hpke	ReleaseFast	mlkem768_p256_decap	1	1	ce5cc5ca5ca12914	8138f7d1f156cb12
 hpke	ReleaseFast	mlkem1024_p384_decap	1	0	ce5cc5ca5ca12914	7ed0df34eb9be0f8
 hpke	ReleaseFast	onestage	1	0	e3ca546d9642880d	98f6996d0d949c61
-signal	ReleaseFast	sign	1	1	e04f9d267e44c557	b2a0053066d93a75
-signal	ReleaseFast	ratchet	1	2	e51a8b700cd49988	92ab00fad0ce5c41
+signal	ReleaseFast	sign	1	1	c662185ad7f7f1f0	b2a0053066d93a75
+signal	ReleaseFast	ratchet	1	2	106051654f920fad	92ab00fad0ce5c41
 # sphinx construct 10 -> 8 (re-pin 2026-09-15): its two ECDH `k256.mul` calls
 # (core.zig:124/:152) read 2 contexts each on the old ladder and 1 each now --
 # `rejectIdentity` at group.zig:347 via `mulInner`, exactly k256/mul's 2 -> 1.
