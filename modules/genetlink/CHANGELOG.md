@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **Additive:** `Socket.wipeRecvBuffer()` (secureZero of the receive buffer, for callers that parsed a secret-carrying reply, e.g. wireguard's `WG_CMD_GET_DEVICE`) and opt-in field `Socket.wipe_on_close` (default false; `close` wipes first). Default behaviour and cost unchanged. Limit: a buffer freed by an earlier growth is not wiped (transport-side).
 - **2026-11-16** — **Additive:** `Socket.listFamilies` (`CTRL_CMD_GETFAMILY` + `NLM_F_DUMP`, every registered family; `ListFamiliesError` adds `DumpInterrupted`), `Socket.getFamily` / `Family` (id, name, `CTRL_ATTR_VERSION`, `HDRSIZE`, `MAXATTR`), pure `parseFamily` / `buildListFamiliesRequest`. Existing resolvers unchanged. Tested offline on real kernel records.
 - **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GZ sweep (13 mutants, ReleaseSafe schemata): 13 killed after 1 new test (a group reply with family id exactly GENL_ID_CTRL / GENL_MAX_ID). hpke's 27 mutants were all killed by the sweep tests. Not a whole-module mutation score.
 - **2026-10-31** — **Behaviour change (no-panic sweep § GZ):** `.one_group` / `.many_groups` replies must carry the requested family's name and an in-range id, as the F2 doc already said (a reply without a name, with another family's name or an out-of-range id is `MalformedReply`). `resolveMcastGroups` resets `out` to all-null on any error, and a `names`/`out` length mismatch is a documented checked panic (was an assert).

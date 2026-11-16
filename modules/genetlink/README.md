@@ -57,7 +57,7 @@ try genetlink.appendHeader(gpa, &list, my_cmd, my_version); // after the nlmsghd
 
 Socket: `open`/`close`, `handle` (= the `fd` field, for poll/epoll and
 `setsockopt`), `setRecvTimeout`, `nextSeq`, `send`, `recvDatagram` /
-`recvDatagramStrict`, `lastErrorMessage`, `resolveFamily`,
+`recvDatagramStrict`, `wipeRecvBuffer` (zero the receive buffer after a secret-carrying reply; `wipe_on_close` does it at `close`), `lastErrorMessage`, `resolveFamily`,
 `resolveMcastGroup`, `getFamily` (id, name, version, header size, max attribute),
 `listFamilies` (every registered family; free the slice with `gpa.free`).
 Pure: `Family`, `parseFamily`, `buildListFamiliesRequest`,

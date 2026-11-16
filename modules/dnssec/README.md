@@ -54,6 +54,7 @@ multi-zone-cut resolver that walks the chain root→TLD→… is also out of sco
 | `src/keys.zig` | DNSKEY public-key wire decode (RFC 3110/6605/8080) + per-algorithm signature verify dispatch | real, tested |
 | `src/ds.zig` | DS digest computation (RFC 4034 §5.1.4) + DNSKEY matching | real, tested |
 | `src/canonical.zig` | RFC 4034 §3.1.8.1 canonical RRset signed-data construction (wildcard + original-TTL + embedded-name lowering) | real, oracle-verified |
+| `src/policy.zig` | RFC 8624 DNSKEY-algorithm / DS-digest validation policy (`Policy`, default refuses the MUST NOT rows; `ValidateOptions.policy`, `chain.validateDnskeySetPolicy`) | real, tested |
 | `src/chain.zig` | DS-to-DNSKEY delegation-chain link (one zone cut) | real, oracle-verified |
 | `src/root.zig` | `meta`, RRSIG validity-window check, top-level `validate` | real, oracle-verified |
 | `src/oracle_vectors.zig` / `src/oracle_test.zig` | KAT vectors from `ldns-signzone` + the validation KATs | test-only |

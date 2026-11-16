@@ -377,6 +377,9 @@ pub const Socket = struct {
     /// `lastErrorMessage`. Sized and shaped by the shared transport.
     ext_ack_buf: @FieldType(netlink.Socket, "ext_ack_buf") = @splat(0),
     ext_ack_len: usize = 0,
+    /// Opt-in: when true, `close` zeroes the receive buffer before freeing it
+    /// (see `wipeRecvBuffer`). Default false — no extra cost.
+    wipe_on_close: bool = false,
 
     /// Borrow this socket's state as the shared `netlink` transport. Cheap
     /// (a struct copy); the borrow is always scoped to one operation.
@@ -420,9 +423,26 @@ pub const Socket = struct {
     }
 
     pub fn close(self: *Socket) void {
+        if (self.wipe_on_close) self.wipeRecvBuffer();
         var t = self.transport();
         t.close();
         self.* = undefined;
+    }
+
+    /// Zero the whole receive buffer (`std.crypto.secureZero`, not elided by
+    /// the optimiser). Call it after parsing a reply that carried secrets
+    /// (e.g. `wireguard`'s `WG_CMD_GET_DEVICE`: interface private key,
+    /// pre-shared keys), once nothing borrowed from `recvDatagram`'s slice is
+    /// needed any more — that slice aliases this buffer and reads as zeros
+    /// afterwards. Never fails, allocates nothing; the default receive path
+    /// is unchanged. Set `wipe_on_close = true` to have `close` do it too.
+    ///
+    /// Limit: only the current buffer is wiped. If a larger datagram forced
+    /// the buffer to grow, the earlier (smaller) allocation was freed by the
+    /// transport's `realloc` without being zeroed; that is in `netlink`, not
+    /// here.
+    pub fn wipeRecvBuffer(self: *Socket) void {
+        std.crypto.secureZero(u8, self.buf);
     }
 
     /// The raw file descriptor, for poll/epoll integration, `setsockopt`
@@ -1443,6 +1463,39 @@ test "integration: nlctrl family resolve (unprivileged)" {
     // nlctrl always resolves to itself.
     const ctrl = try sock.resolveFamily("nlctrl");
     try testing.expectEqual(GENL_ID_CTRL, ctrl);
+}
+
+test "wipeRecvBuffer zeroes the receive buffer after a real reply; wipe_on_close is opt-in" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer sock.close();
+    try testing.expect(!sock.wipe_on_close);
+
+    _ = try sock.resolveFamily("nlctrl");
+    // The reply is still in the buffer after parsing.
+    try testing.expect(std.mem.indexOfNone(u8, sock.buf, &.{0}) != null);
+    sock.wipeRecvBuffer();
+    try testing.expect(std.mem.indexOfNone(u8, sock.buf, &.{0}) == null);
+    // Idempotent, and the socket still works afterwards.
+    sock.wipeRecvBuffer();
+    try testing.expectEqual(GENL_ID_CTRL, try sock.resolveFamily("nlctrl"));
+}
+
+test "wipeRecvBuffer: wipe_on_close wipes the buffer before it is freed" {
+    // Pure (no socket): a hand-built Socket on a fixed buffer, close() not
+    // called (it would close fd and free); the close path is the one-line
+    // `if (wipe_on_close) wipeRecvBuffer()`, exercised via the same call.
+    var storage: [64]u8 = @splat(0xAA);
+    var sock: Socket = .{
+        .gpa = testing.allocator,
+        .fd = -1,
+        .portid = 0,
+        .seq = 0,
+        .buf = &storage,
+        .wipe_on_close = true,
+    };
+    if (sock.wipe_on_close) sock.wipeRecvBuffer();
+    for (storage) |b| try testing.expectEqual(@as(u8, 0), b);
 }
 
 test "integration: nlctrl multicast group resolve (unprivileged)" {
