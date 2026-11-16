@@ -857,9 +857,8 @@ pub fn parseDurationCell(s: []const u8) ?i64 {
         i = 1;
     }
     if (i < s.len and (s[i] == 'P' or s[i] == 'p')) {
-        // In i128, so that `-PT9223372036854.775808S` (minInt) reads back.
-        const v = parseIsoDurationBody(s[i + 1 ..]) orelse return null;
-        return std.math.cast(i64, if (neg) -v else v);
+        // `datefmt` reads the sign too, and `-PT9223372036854.775808S` (minInt) reads back.
+        return datefmt.parseIsoDurationUnits(s, timestamp_units_per_second) catch null;
     }
     return parsePandasDuration(s[i..], neg);
 }
@@ -892,54 +891,6 @@ fn fractionUs(s: []const u8, i: *usize) ?i64 {
 fn addScaled(total: i64, n: i64, unit: i64) ?i64 {
     const part = std.math.mul(i64, n, unit) catch return null;
     return std.math.add(i64, total, part) catch null;
-}
-
-/// The magnitude, in i128: each part is at most i64 times a week of microseconds, five
-/// parts at most, so the sum cannot overflow; the caller checks it fits i64.
-fn parseIsoDurationBody(s: []const u8) ?i128 {
-    const sec = timestamp_units_per_second;
-    var i: usize = 0;
-    var total: i128 = 0;
-    var any = false;
-    var in_time = false;
-    // Units must come in order, each at most once: rank of the last one read.
-    var last: u8 = 0;
-    while (i < s.len) {
-        if (s[i] == 'T' or s[i] == 't') {
-            if (in_time) return null;
-            in_time = true;
-            i += 1;
-            if (i == s.len) return null; // `PT` with nothing after it
-            continue;
-        }
-        const n = digitsRun(s, &i) orelse return null;
-        var frac: i64 = 0;
-        var has_frac = false;
-        if (i < s.len and (s[i] == '.' or s[i] == ',')) {
-            i += 1;
-            frac = fractionUs(s, &i) orelse return null;
-            has_frac = true;
-        }
-        if (i == s.len) return null;
-        const u = std.ascii.toUpper(s[i]);
-        i += 1;
-        const rank: u8, const unit: i128 = if (!in_time) switch (u) {
-            'W' => .{ 1, 7 * 86_400 * sec },
-            'D' => .{ 2, 86_400 * sec },
-            else => return null,
-        } else switch (u) {
-            'H' => .{ 3, 3600 * sec },
-            'M' => .{ 4, 60 * sec },
-            'S' => .{ 5, sec },
-            else => return null,
-        };
-        if (rank <= last) return null;
-        if (has_frac and u != 'S') return null;
-        last = rank;
-        total += @as(i128, n) * unit + frac;
-        any = true;
-    }
-    return if (any) total else null;
 }
 
 /// `neg`: the text began with `-`. With a day count the sign is the days' alone
@@ -996,26 +947,9 @@ fn parsePandasDuration(s: []const u8, neg: bool) ?i64 {
 /// A `.duration` cell as ISO 8601 in seconds, polars' JSON form: `P0D` for zero,
 /// else `[-]PT<s>[.F]S` with the fraction's trailing zeros trimmed (`PT93784.5S`,
 /// `-PT90S`). Every `i64` is accepted; `parseDurationCell` reads every result back.
+/// The writing is `datefmt.formatIsoDurationUnits` in microseconds.
 pub fn formatIsoDuration(buf: *[max_duration_len]u8, us: i64) []const u8 {
-    if (us == 0) return "P0D";
-    var w: std.Io.Writer = .fixed(buf);
-    const mag: u64 = @abs(us);
-    const per: u64 = @intCast(timestamp_units_per_second);
-    if (us < 0) w.writeByte('-') catch unreachable;
-    w.print("PT{d}", .{mag / per}) catch unreachable;
-    writeFraction(&w, mag % per);
-    w.writeByte('S') catch unreachable;
-    return w.buffered();
-}
-
-fn writeFraction(w: *std.Io.Writer, frac: u64) void {
-    if (frac == 0) return;
-    var fb: [6]u8 = undefined;
-    _ = std.mem.print(&fb, "{d:0>6}", .{frac}) catch unreachable;
-    var end: usize = fb.len;
-    while (fb[end - 1] == '0') end -= 1;
-    w.writeByte('.') catch unreachable;
-    w.writeAll(fb[0..end]) catch unreachable;
+    return datefmt.formatIsoDurationUnits(buf[0..datefmt.max_iso_duration_len], us, timestamp_units_per_second);
 }
 
 /// A `.duration` cell as polars prints it: the nonzero parts of days, hours, minutes,

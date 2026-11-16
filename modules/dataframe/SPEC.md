@@ -88,7 +88,7 @@ the codes and shares the dictionary, `concat` encodes the union again. A column 
 categorical may hold plain text storage (a `FrameBuilder` frame): it reads the same. Categories
 in a given order (pandas `ordered=True`, polars `Enum`) are built (wave W6, below); group/join/sort
 over the codes rather than the text (the speed of an encoded key) — Backlog, measured first. A duration is ISO 8601 in CSV and JSON
-(`formatIsoDuration`, polars' JSON form; polars refuses a duration in CSV, pandas writes
+(`formatIsoDuration`, polars' JSON form, delegating to `datefmt`'s ISO 8601 duration functions since 2026-11-17; polars refuses a duration in CSV, pandas writes
 `1 days 02:03:04`, which `parseDurationCell` reads too) and polars' `1d 2h` in `format`.
 `mutate` gives an expression the temporal type it keeps (`expr.temporalType`: `ts - ts` a
 duration, `ts ± dur` a timestamp, `dur * k` a duration, the `dt` functions that move an

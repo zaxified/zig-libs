@@ -123,6 +123,10 @@ fn parseDuration(s) error{InvalidDuration}!i64;  // exactly Go's time.ParseDurat
 fn parseDurationExt(s, .{ .days = true, .weeks = true }) error{InvalidDuration}!i64;  // + `d` (24 h), `w` (7 d), opt-in
 fn bufDuration(buf: *[duration_max_len]u8, ns: i64) []u8;  // exactly Go's Duration.String
 fn formatDuration(alloc, ns: i64) ![]u8;
+fn parseIsoDuration(s) error{InvalidDuration}!i64;  // "PT1H30M", "P1DT2H", "-P2W": W D H M S only, no years/months
+fn formatIsoDuration(buf: *[max_iso_duration_len]u8, ns: i64) []const u8;  // "P0D", "-PT90S", "PT93784.5S"
+fn parseIsoDurationUnits(s, comptime units_per_second) error{InvalidDuration}!i64;  // same, e.g. 1_000_000 for microseconds
+fn formatIsoDurationUnits(buf, v: i64, comptime units_per_second) []const u8;
 fn truncateNs(ns: i64, unit: i64) i64;           // Go Time.Truncate: down, also before 1970
 fn roundNs(ns: i64, unit: i64) i64;              // Go Time.Round: halfway up
 

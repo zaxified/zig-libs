@@ -2082,6 +2082,164 @@ fn durationUnit(u: []const u8, opts: DurationExtOptions) ?u64 {
     return null;
 }
 
+// ---------------------------------------------------------------------------
+// Durations: ISO 8601 text (`PT1H30M`, `P1DT2H`, `-P2W`)
+// ---------------------------------------------------------------------------
+//
+// The same `i64` as the Go-grammar functions above, in nanoseconds; the
+// `...Units` forms take the unit as a comptime number of units per second (a
+// power of ten up to 1e9) for callers that count microseconds or
+// milliseconds, so a range of +-292 000 years is not cut to +-292 years.
+// Years and months have no fixed length, so they are refused, not guessed.
+
+/// Room for any `formatIsoDuration`/`formatIsoDurationUnits` text; the longest,
+/// `-PT9223372036854.775808S` (microseconds), is 24 bytes.
+pub const max_iso_duration_len = 32;
+
+/// The number of decimal digits of a fraction in `units_per_second`: 1e9 is 9.
+fn isoUnitDigits(comptime units_per_second: i64) comptime_int {
+    comptime {
+        var d = 0;
+        var n: i64 = 1;
+        while (n < units_per_second) : (d += 1) n *= 10;
+        if (n != units_per_second or d == 0 or d > 9) @compileError("units_per_second must be a power of ten from 10 to 1e9");
+        return d;
+    }
+}
+
+/// Parse an ISO 8601 duration into nanoseconds: `[+-]P[nW][nD][T[nH][nM][n[.F]S]]`,
+/// letters in either case. Only the fixed units: no years or months (`P1Y`,
+/// `P1M` are errors), at least one part, parts in that order and each once, a
+/// week is 7 days and a day 24 hours (no calendar, no DST). The fraction
+/// (`.` or `,`, 1-9 digits) belongs to the seconds only; digits past the
+/// nanosecond are dropped. Anything outside `i64` nanoseconds, and anything
+/// that is not the grammar, is `error.InvalidDuration`; it never traps.
+pub fn parseIsoDuration(s: []const u8) error{InvalidDuration}!i64 {
+    return parseIsoDurationUnits(s, std.time.ns_per_s);
+}
+
+/// `parseIsoDuration` counting `units_per_second` units (1_000_000 for
+/// microseconds): the result and the dropped fraction digits are in that
+/// unit, the range is that of `i64` in it (`-PT9223372036854.775808S` is the
+/// minimum in microseconds).
+pub fn parseIsoDurationUnits(s: []const u8, comptime units_per_second: i64) error{InvalidDuration}!i64 {
+    const digits = comptime isoUnitDigits(units_per_second);
+    var i: usize = 0;
+    var neg = false;
+    if (s.len != 0 and (s[0] == '-' or s[0] == '+')) {
+        neg = s[0] == '-';
+        i = 1;
+    }
+    if (i >= s.len or (s[i] != 'P' and s[i] != 'p')) return error.InvalidDuration;
+    i += 1;
+    // In i128: each part is at most i64 times a week, five parts at most, so
+    // the sum cannot overflow; the cast below checks it fits.
+    var total: i128 = 0;
+    var any = false;
+    var in_time = false;
+    // Units come in order, each at most once: the rank of the last one read.
+    var last: u8 = 0;
+    while (i < s.len) {
+        if (s[i] == 'T' or s[i] == 't') {
+            if (in_time) return error.InvalidDuration;
+            in_time = true;
+            i += 1;
+            if (i == s.len) return error.InvalidDuration; // `PT` with nothing after it
+            continue;
+        }
+        const n = isoDigits(s, &i) orelse return error.InvalidDuration;
+        var frac: i64 = 0;
+        var has_frac = false;
+        if (i < s.len and (s[i] == '.' or s[i] == ',')) {
+            i += 1;
+            frac = isoFraction(s, &i, digits) orelse return error.InvalidDuration;
+            has_frac = true;
+        }
+        if (i == s.len) return error.InvalidDuration;
+        const u = std.ascii.toUpper(s[i]);
+        i += 1;
+        const rank: u8, const unit: i128 = if (!in_time) switch (u) {
+            'W' => .{ 1, 7 * 86_400 * units_per_second },
+            'D' => .{ 2, 86_400 * units_per_second },
+            else => return error.InvalidDuration,
+        } else switch (u) {
+            'H' => .{ 3, 3600 * units_per_second },
+            'M' => .{ 4, 60 * units_per_second },
+            'S' => .{ 5, units_per_second },
+            else => return error.InvalidDuration,
+        };
+        if (rank <= last) return error.InvalidDuration;
+        if (has_frac and u != 'S') return error.InvalidDuration;
+        last = rank;
+        total += @as(i128, n) * unit + frac;
+        any = true;
+    }
+    if (!any) return error.InvalidDuration;
+    return std.math.cast(i64, if (neg) -total else total) orelse error.InvalidDuration;
+}
+
+/// Digits at `s[i.*..]` as an unsigned number, advancing `i`; null with none or past i64.
+fn isoDigits(s: []const u8, i: *usize) ?i64 {
+    const start = i.*;
+    var v: i64 = 0;
+    while (i.* < s.len and s[i.*] >= '0' and s[i.*] <= '9') : (i.* += 1) {
+        v = std.math.mul(i64, v, 10) catch return null;
+        v = std.math.add(i64, v, s[i.*] - '0') catch return null;
+    }
+    return if (i.* == start) null else v;
+}
+
+/// A fraction's digits at `s[i.*..]` in units of 10^-`digits` second (1-9
+/// digits, those past `digits` dropped); null with none or more than nine.
+fn isoFraction(s: []const u8, i: *usize, comptime digits: comptime_int) ?i64 {
+    var n: usize = 0;
+    var v: i64 = 0;
+    while (i.* < s.len and s[i.*] >= '0' and s[i.*] <= '9') : (i.* += 1) {
+        if (n == 9) return null;
+        if (n < digits) v = v * 10 + (s[i.*] - '0');
+        n += 1;
+    }
+    if (n == 0) return null;
+    while (n < digits) : (n += 1) v *= 10;
+    return v;
+}
+
+/// `ns` as ISO 8601 in seconds: `P0D` for zero, else `[-]PT<s>[.F]S` with the
+/// fraction's trailing zeros trimmed (`PT93784.5S`, `-PT90S`). Every `i64` is
+/// accepted and `parseIsoDuration` reads every result back. Returns the
+/// written prefix of `buf` (or a literal).
+pub fn formatIsoDuration(buf: *[max_iso_duration_len]u8, ns: i64) []const u8 {
+    return formatIsoDurationUnits(buf, ns, std.time.ns_per_s);
+}
+
+/// `formatIsoDuration` for a count of `units_per_second` units.
+pub fn formatIsoDurationUnits(buf: *[max_iso_duration_len]u8, v: i64, comptime units_per_second: i64) []const u8 {
+    const digits = comptime isoUnitDigits(units_per_second);
+    if (v == 0) return "P0D";
+    var w: std.Io.Writer = .fixed(buf);
+    const mag: u64 = @abs(v);
+    const per: u64 = @intCast(units_per_second);
+    if (v < 0) w.writeByte('-') catch unreachable;
+    w.print("PT{d}", .{mag / per}) catch unreachable;
+    const frac = mag % per;
+    if (frac != 0) {
+        var fb: [digits]u8 = undefined;
+        var x = frac;
+        var k: usize = digits;
+        while (k > 0) {
+            k -= 1;
+            fb[k] = '0' + @as(u8, @intCast(x % 10));
+            x /= 10;
+        }
+        var end: usize = digits;
+        while (fb[end - 1] == '0') end -= 1;
+        w.writeByte('.') catch unreachable;
+        w.writeAll(fb[0..end]) catch unreachable;
+    }
+    w.writeByte('S') catch unreachable;
+    return w.buffered();
+}
+
 /// The range check the canned writers share: a valid date and time, year
 /// 0000..9999 (four digits).
 fn checkCanned(p: DateParts) error{ InvalidDate, InvalidTime }!void {
@@ -3396,4 +3554,110 @@ test "parseDurationExt: d and w are opt-in, 24 h and 7 d" {
     try t.expectError(error.InvalidDuration, parseDurationExt("106751d106751d", .{ .days = true }));
     // the minimum is reachable only through the sign, as in Go
     try t.expectEqual(@as(i64, -106751 * day), try parseDurationExt("-106751d", .{ .days = true }));
+}
+
+test "parseIsoDuration: the grammar, in nanoseconds" {
+    const t = std.testing;
+    const s = std.time.ns_per_s;
+    const day = 86_400 * s;
+    try t.expectEqual(@as(i64, 93_784 * s + 500_000_000), try parseIsoDuration("PT93784.5S"));
+    try t.expectEqual(@as(i64, -90 * s), try parseIsoDuration("-PT90S"));
+    try t.expectEqual(@as(i64, 90 * s), try parseIsoDuration("+PT90S"));
+    try t.expectEqual(@as(i64, 0), try parseIsoDuration("P0D"));
+    try t.expectEqual(@as(i64, 5400 * s), try parseIsoDuration("PT1H30M"));
+    try t.expectEqual(@as(i64, day + 2 * 3600 * s + 3 * 60 * s + 4 * s), try parseIsoDuration("P1DT2H3M4S"));
+    try t.expectEqual(@as(i64, day + 2 * 3600 * s), try parseIsoDuration("P1DT2H"));
+    try t.expectEqual(@as(i64, 14 * day), try parseIsoDuration("P2W"));
+    try t.expectEqual(@as(i64, -14 * day), try parseIsoDuration("-P2W"));
+    try t.expectEqual(@as(i64, 7 * day + day), try parseIsoDuration("P1W1D"));
+    try t.expectEqual(@as(i64, day + 2 * 3600 * s + 3 * 60 * s + 4 * s), try parseIsoDuration("p1dt2h3m4s")); // lower case
+    try t.expectEqual(@as(i64, 1_500_000_000), try parseIsoDuration("PT1,5S")); // comma fraction
+    try t.expectEqual(@as(i64, 123_456_789), try parseIsoDuration("PT0.123456789S"));
+    try t.expectEqual(@as(i64, 100_000_000), try parseIsoDuration("PT0.1S"));
+    try t.expectEqual(@as(i64, 1), try parseIsoDuration("PT0.000000001S"));
+}
+
+test "parseIsoDurationUnits: microseconds keep the +-292 000 year range and truncate past the sixth digit" {
+    const t = std.testing;
+    try t.expectEqual(@as(i64, 1), try parseIsoDurationUnits("PT0.0000019S", 1_000_000));
+    try t.expectEqual(@as(i64, 93_784_500_000), try parseIsoDurationUnits("PT93784.5S", 1_000_000));
+    try t.expectEqual(@as(i64, std.math.minInt(i64)), try parseIsoDurationUnits("-PT9223372036854.775808S", 1_000_000));
+    try t.expectEqual(@as(i64, std.math.maxInt(i64)), try parseIsoDurationUnits("PT9223372036854.775807S", 1_000_000));
+    try t.expectError(error.InvalidDuration, parseIsoDurationUnits("PT9223372036854.775808S", 1_000_000));
+    try t.expectError(error.InvalidDuration, parseIsoDurationUnits("-PT9223372036854.775809S", 1_000_000));
+    // in nanoseconds the same texts are far out of range
+    try t.expectError(error.InvalidDuration, parseIsoDuration("PT9223372036855S"));
+    try t.expectEqual(@as(i64, 1500), try parseIsoDurationUnits("PT1.5S", 1000));
+}
+
+test "parseIsoDuration: refused text is an error, never a panic" {
+    const t = std.testing;
+    // calendar units, a unit out of order or twice, a fraction not on seconds, `PT` with
+    // nothing, junk, overflow, a missing P, a lone sign, a part with no digits or no unit
+    for ([_][]const u8{
+        "P1Y",             "P1M",              "P1Y2M3DT4H",        "PT1M1H", "P1D1D",    "PT1.5H",                 "P1.5D",
+        "PT",              "P",                "",                  "-",      "+",        "-P",                     "PT1S1S",
+        "PTT1S",           "P1DT",             "1D",                "PT1",    "PTS",      "PT.5S",                  "PT1.S",
+        "PT1.1234567891S", "PT9223372036855S", "P106751991167301D", "P1DX",   "PT1S ",    " PT1S",                  "PT-1S",
+        "P-1D",            "P1D2H",            "PT1H2",             "\xff",   "PT1\x00S", "P99999999999999999999D", "P1W2D1W",
+        "pT1S1",           "--PT1S",
+    }) |bad| {
+        if (parseIsoDuration(bad)) |v| {
+            std.debug.print("accepted {s} as {d}\n", .{ bad, v });
+            return error.TestUnexpectedResult;
+        } else |e| try t.expectEqual(error.InvalidDuration, e);
+    }
+    // every part just fits, the sum does not
+    try t.expectError(error.InvalidDuration, parseIsoDuration("P53375W106751D"));
+    try t.expectError(error.InvalidDuration, parseIsoDuration("P106752D"));
+    try t.expectEqual(@as(i64, 106751 * 86_400 * std.time.ns_per_s), try parseIsoDuration("P106751D"));
+}
+
+test "formatIsoDuration: polars' JSON form, round trip over random i64 in both units" {
+    const t = std.testing;
+    var b: [max_iso_duration_len]u8 = undefined;
+    try t.expectEqualStrings("P0D", formatIsoDuration(&b, 0));
+    try t.expectEqualStrings("PT93784.5S", formatIsoDuration(&b, 93_784_500_000_000));
+    try t.expectEqualStrings("-PT90S", formatIsoDuration(&b, -90 * std.time.ns_per_s));
+    try t.expectEqualStrings("PT0.000000001S", formatIsoDuration(&b, 1));
+    try t.expectEqualStrings("PT0.5S", formatIsoDuration(&b, 500_000_000));
+    try t.expectEqualStrings("PT0.00000005S", formatIsoDuration(&b, 50));
+    try t.expectEqualStrings("-PT9223372036.854775808S", formatIsoDuration(&b, std.math.minInt(i64)));
+    try t.expectEqualStrings("PT9223372036.854775807S", formatIsoDuration(&b, std.math.maxInt(i64)));
+    try t.expectEqualStrings("-PT9223372036854.775808S", formatIsoDurationUnits(&b, std.math.minInt(i64), 1_000_000));
+    try t.expectEqualStrings("PT93784.5S", formatIsoDurationUnits(&b, 93_784_500_000, 1_000_000));
+    try t.expectEqualStrings("PT0.000001S", formatIsoDurationUnits(&b, 1, 1_000_000));
+    try t.expectEqualStrings("PT0.001S", formatIsoDurationUnits(&b, 1, 1000));
+    var prng = std.Random.DefaultPrng.init(7);
+    const r = prng.random();
+    const edge = [_]i64{ std.math.minInt(i64), std.math.maxInt(i64), -1, 1, std.math.minInt(i64) + 1 };
+    for (0..20_000) |i| {
+        const x: i64 = if (i < edge.len) edge[i] else r.int(i64) >> @intCast(r.uintLessThan(u8, 63));
+        try t.expectEqual(x, try parseIsoDuration(formatIsoDuration(&b, x)));
+        try t.expectEqual(x, try parseIsoDurationUnits(formatIsoDurationUnits(&b, x, 1_000_000), 1_000_000));
+        try t.expectEqual(x, try parseIsoDurationUnits(formatIsoDurationUnits(&b, x, 1000), 1000));
+    }
+}
+
+test "parseIsoDuration: mutated and random bytes are an error or a value, never a panic" {
+    var prng = std.Random.DefaultPrng.init(0x8601);
+    const r = prng.random();
+    const seeds = [_][]const u8{ "P1DT2H3M4.5S", "-P2W", "PT9223372036854.775807S", "pt0,000001s", "P0D" };
+    var buf: [48]u8 = undefined;
+    for (0..40_000) |i| {
+        const seed = seeds[i % seeds.len];
+        var len = seed.len;
+        @memcpy(buf[0..len], seed);
+        for (0..r.uintLessThan(u8, 4)) |_| {
+            if (len == 0) break;
+            const at = r.uintLessThan(usize, len);
+            switch (r.uintLessThan(u8, 3)) {
+                0 => buf[at] = r.int(u8),
+                1 => len = at,
+                else => buf[at] = "PTWDHMS.,-+0123456789"[r.uintLessThan(usize, 21)],
+            }
+        }
+        _ = parseIsoDuration(buf[0..len]) catch {};
+        _ = parseIsoDurationUnits(buf[0..len], 1_000_000) catch {};
+    }
 }

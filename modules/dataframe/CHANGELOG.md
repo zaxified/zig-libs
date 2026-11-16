@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the ISO 8601 duration reader and writer moved to `datefmt` (`parseIsoDurationUnits`/`formatIsoDurationUnits`, microseconds); `parseDurationCell` and `formatIsoDuration` keep their names, grammar and output bytes, and the pandas text form stays here.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: binary (de)serialization of a `Frame` (consumer request) points at the planned `arrow` and `parquet` modules, now tracked in the root `NEW-MODULES.md`.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
