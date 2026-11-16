@@ -21,7 +21,10 @@ pub const meta = .{
 
 /// The FlatBuffers subset Arrow's metadata uses (bounds-checked reader, back-to-front builder).
 pub const fb = @import("fb.zig");
+/// Arrow schema metadata (`Schema.fbs`) and the `Message` envelope (`Message.fbs`).
+pub const schema = @import("schema.zig");
 
 test {
     _ = fb;
+    _ = schema;
 }
