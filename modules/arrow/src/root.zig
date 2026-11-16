@@ -23,8 +23,11 @@ pub const meta = .{
 pub const fb = @import("fb.zig");
 /// Arrow schema metadata (`Schema.fbs`) and the `Message` envelope (`Message.fbs`).
 pub const schema = @import("schema.zig");
+/// IPC framing (encapsulated messages, end of stream) and the RecordBatch / DictionaryBatch metadata.
+pub const ipc = @import("ipc.zig");
 
 test {
     _ = fb;
     _ = schema;
+    _ = ipc;
 }
