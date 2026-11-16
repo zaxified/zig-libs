@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **`EEE`, `FEC`, `WOL`, `PRIVFLAGS` and `TSINFO_GET` are typed calls** (additive, no break): `Ethtool.eee`/`setEee`, `fec`/`setFec`, `wol`/`setWol`, `privflags`/`setPrivflags`, `tsInfo`, with offline `build*` encoders and decoders in new `eee_fec.zig`, `wol.zig`, `privflags.zig`, `tsinfo.zig`, attribute constants in `uapi` (`EEE`, `FEC`, `WOL`, `WAKE`, `PRIVFLAGS`, `TSINFO`) and `bitset.appendMasked`. WOL's `SOPASS` is wiped everywhere this module holds it (reply copy, socket receive buffer, request builder and sent datagram; `Wol.deinit` zeroes the secret it returned; `buildSetWol`'s result is the caller's to `wol.wipe`). Tests are decoder/encoder round trips built from the kernel's attribute layout; no new `strace` captures (`goldens.zig` unchanged). FEC_STATS and the TSINFO stats/provider nests stay on `raw`.
+
 - **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** the provenance note no longer points at a module `NOTICE` that does not exist (a black-box oracle needs none).
 
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.

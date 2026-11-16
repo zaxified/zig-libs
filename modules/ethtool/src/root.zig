@@ -40,9 +40,10 @@
 //! * **Implemented:** `LINKINFO_GET`/`SET`, `LINKMODES_GET`/`SET`,
 //!   `LINKSTATE_GET`, `RINGS_GET`/`SET`, `COALESCE_GET`/`SET`,
 //!   `PAUSE_GET`/`SET`, `CHANNELS_GET`/`SET`, `FEATURES_GET`/`SET`,
-//!   `STATS_GET`, `STRSET_GET`, `MODULE_GET`/`SET`, `MODULE_EEPROM_GET`, the
-//!   `monitor` multicast group, and a **`raw` escape hatch** that reaches every
-//!   remaining command (WOL, EEE, FEC, PRIVFLAGS, TSINFO, cable test, RSS, …).
+//!   `STATS_GET`, `STRSET_GET`, `MODULE_GET`/`SET`, `MODULE_EEPROM_GET`,
+//!   `EEE_GET`/`SET`, `FEC_GET`/`SET`, `WOL_GET`/`SET`, `PRIVFLAGS_GET`/`SET`,
+//!   `TSINFO_GET`, the `monitor` multicast group, and a **`raw` escape hatch**
+//!   that reaches every remaining command (cable test, RSS, PLCA, …).
 //!
 //! ## Bitsets are the part that bites
 //!
@@ -54,7 +55,7 @@
 //!
 //! **Platform:** linux (raw `std.os.linux` syscalls over `AF_NETLINK` — a
 //! conscious ceiling). **Privileges:** every GET here is unprivileged (except
-//! `WOL_GET`, reachable through `raw`); every SET needs **CAP_NET_ADMIN**.
+//! `WOL_GET`); every SET needs **CAP_NET_ADMIN**.
 //!
 //! Verification: `goldens.zig` asserts the encoders reproduce, byte for byte,
 //! requests captured from a real `ethtool` under `strace`, and decodes the
@@ -120,6 +121,14 @@ pub const features = @import("features.zig");
 pub const stats = @import("stats.zig");
 /// `MODULE_GET`/`SET` and `MODULE_EEPROM_GET`.
 pub const moduleinfo = @import("moduleinfo.zig");
+/// `EEE_GET`/`SET` and `FEC_GET`/`SET`.
+pub const eee_fec = @import("eee_fec.zig");
+/// `WOL_GET`/`SET`, including the SOPASS secret handling.
+pub const wol = @import("wol.zig");
+/// `PRIVFLAGS_GET`/`SET`.
+pub const privflags = @import("privflags.zig");
+/// `TSINFO_GET`.
+pub const tsinfo = @import("tsinfo.zig");
 /// The socket client and the `monitor` notification socket.
 pub const client = @import("client.zig");
 /// The two `SIOCETHTOOL` calls with no netlink message: `drvinfo()` and
@@ -163,6 +172,15 @@ pub const Stats = stats.Stats;
 pub const StringSets = stats.StringSets;
 pub const ModuleInfo = moduleinfo.ModuleInfo;
 pub const Eeprom = moduleinfo.Eeprom;
+pub const Eee = eee_fec.Eee;
+pub const EeeSet = eee_fec.EeeSet;
+pub const Fec = eee_fec.Fec;
+pub const FecSet = eee_fec.FecSet;
+pub const Wol = wol.Wol;
+pub const WolSet = wol.WolSet;
+pub const Privflags = privflags.Privflags;
+pub const PrivflagsSet = privflags.PrivflagsSet;
+pub const TsInfo = tsinfo.TsInfo;
 
 // ── offline request encoders ───────────────────────────────────────────────
 //
@@ -195,6 +213,16 @@ pub const buildStringSet = stats.buildStringSet;
 pub const buildModuleInfo = moduleinfo.buildModuleInfo;
 pub const buildSetModulePowerPolicy = moduleinfo.buildSetModulePowerPolicy;
 pub const buildModuleEeprom = moduleinfo.buildModuleEeprom;
+pub const buildEee = eee_fec.buildEee;
+pub const buildSetEee = eee_fec.buildSetEee;
+pub const buildFec = eee_fec.buildFec;
+pub const buildSetFec = eee_fec.buildSetFec;
+pub const buildWol = wol.buildWol;
+/// The datagram may contain the SOPASS: zero it with `wol.wipe` before freeing.
+pub const buildSetWol = wol.buildSetWol;
+pub const buildPrivflags = privflags.buildPrivflags;
+pub const buildSetPrivflags = privflags.buildSetPrivflags;
+pub const buildTsInfo = tsinfo.buildTsInfo;
 
 pub const Port = uapi.Port;
 pub const Duplex = uapi.Duplex;
@@ -682,7 +710,8 @@ test "live: the raw escape hatch reaches a command the typed API does not model"
     var buf: [uapi.ifnamesize]u8 = undefined;
     const dev = try targetOrSkip(&buf);
 
-    // ETHTOOL_MSG_TSINFO_GET — deliberately not in the typed API.
+    // ETHTOOL_MSG_TSINFO_GET — has a typed call now (`tsInfo`); sent raw here
+    // on purpose, to keep the escape hatch itself under test.
     var attrs: std.ArrayList(u8) = .empty;
     defer attrs.deinit(gpa);
     try header.append(gpa, &attrs, 1, .{ .target = dev, .compact_bitsets = true });
@@ -763,6 +792,44 @@ test "live (root): FEATURES_SET is judged by its reply, not by its ACK" {
     try testing.expectEqual(@as(?bool, true), after.isActive(name));
 }
 
+test "live: the typed EEE/FEC/PRIVFLAGS/TSINFO GETs answer or skip cleanly" {
+    var et = try openOrSkip();
+    defer et.close();
+    const gpa = testing.allocator;
+    var buf: [uapi.ifnamesize]u8 = undefined;
+    const dev = try targetOrSkip(&buf);
+
+    var ran: u32 = 0;
+    if (et.tsInfo(dev, .verbose)) |t| {
+        var ts = t;
+        defer ts.deinit(gpa);
+        try testing.expectEqualStrings(dev.name, ts.device.name());
+        ran += 1;
+    } else |_| {}
+    if (et.eee(dev, .verbose)) |e| {
+        var ee = e;
+        ee.deinit(gpa);
+        ran += 1;
+    } else |_| {}
+    if (et.fec(dev, .verbose)) |f| {
+        var ff = f;
+        ff.deinit(gpa);
+        ran += 1;
+    } else |_| {}
+    if (et.privflags(dev, .verbose)) |p| {
+        var pp = p;
+        pp.deinit(gpa);
+        ran += 1;
+    } else |_| {}
+    // WOL_GET needs CAP_NET_ADMIN; unprivileged it is AccessDenied, never a crash.
+    if (et.wol(dev, .verbose)) |w| {
+        var ww = w;
+        ww.deinit(gpa);
+        ran += 1;
+    } else |_| {}
+    if (ran == 0) return skip("no device implements any of TSINFO/EEE/FEC/PRIVFLAGS/WOL");
+}
+
 // ── dark-tests aggregator ──────────────────────────────────────────────────
 // A bare `pub const x = @import(…)` re-export does NOT pull x's tests into the
 // test binary (CONVENTIONS §6.3).
@@ -776,6 +843,10 @@ test {
     _ = features;
     _ = stats;
     _ = moduleinfo;
+    _ = eee_fec;
+    _ = wol;
+    _ = privflags;
+    _ = tsinfo;
     _ = client;
     _ = ioctl;
     _ = @import("goldens.zig");

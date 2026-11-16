@@ -453,6 +453,21 @@ pub fn appendIndexedValues(
     codec.nestEnd(list, nest) catch return error.InvalidRequest;
 }
 
+/// Append a masked bitset request given **either** by bit index or by name
+/// (never both; neither appends nothing). The SET structs of EEE, FEC, WOL and
+/// PRIVFLAGS all carry such a pair, so the either/or rule lives here once.
+pub fn appendMasked(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    attr_type: u16,
+    by_index: []const IndexedValue,
+    by_name: []const NamedValue,
+) BuildError!void {
+    if (by_index.len != 0 and by_name.len != 0) return error.InvalidRequest;
+    if (by_index.len != 0) return appendIndexedValues(gpa, list, attr_type, by_index);
+    if (by_name.len != 0) return appendNamedValues(gpa, list, attr_type, by_name);
+}
+
 fn appendFlag(gpa: std.mem.Allocator, list: *std.ArrayList(u8), attr_type: u16) BuildError!void {
     codec.appendAttr(gpa, list, attr_type, &.{}) catch |e| switch (e) {
         error.AttrTooLong => unreachable, // 4 bytes total

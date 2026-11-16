@@ -500,6 +500,78 @@ pub const PAUSE_STAT = struct {
     pub const RX_FRAMES: u16 = 3;
 };
 
+// ── EEE / FEC / WOL / PRIVFLAGS / TSINFO ──────────────────────────────────
+// Attribute numbers from the kernel's `ethtool_netlink_generated.h`.
+
+pub const EEE = struct {
+    pub const HEADER: u16 = 1;
+    /// Bitset of link modes: value = EEE advertised, mask = EEE supported.
+    pub const MODES_OURS: u16 = 2;
+    /// Bitset of link modes the link partner advertises EEE for.
+    pub const MODES_PEER: u16 = 3;
+    /// u8 bool: EEE is active on the link right now.
+    pub const ACTIVE: u16 = 4;
+    /// u8 bool: EEE is enabled.
+    pub const ENABLED: u16 = 5;
+    /// u8 bool: transmit low-power-idle is enabled.
+    pub const TX_LPI_ENABLED: u16 = 6;
+    /// u32: the TX LPI timer, microseconds.
+    pub const TX_LPI_TIMER: u16 = 7;
+};
+
+pub const FEC = struct {
+    pub const HEADER: u16 = 1;
+    /// Bitset of FEC modes (named by the link-mode string set).
+    pub const MODES: u16 = 2;
+    /// u8 bool: automatic FEC selection.
+    pub const AUTO: u16 = 3;
+    /// u32: the *bit index* of the active FEC mode in the link-mode set.
+    pub const ACTIVE: u16 = 4;
+    /// Nest of FEC statistics. Not decoded by this module.
+    pub const STATS: u16 = 5;
+};
+
+pub const WOL = struct {
+    pub const HEADER: u16 = 1;
+    /// Bitset of wake-up modes (`ETH_SS_WOL_MODES`, see `WAKE`).
+    pub const MODES: u16 = 2;
+    /// Binary, `sopass_len` bytes: the SecureOn password. A secret.
+    pub const SOPASS: u16 = 3;
+};
+
+/// `SOPASS_MAX_LEN` — the SecureOn password is one MAC address long.
+pub const sopass_len = 6;
+
+/// Bit indices of the `ETH_SS_WOL_MODES` string set (`WAKE_*` is `1 << index`).
+pub const WAKE = struct {
+    pub const phy: u32 = 0;
+    pub const ucast: u32 = 1;
+    pub const mcast: u32 = 2;
+    pub const bcast: u32 = 3;
+    pub const arp: u32 = 4;
+    pub const magic: u32 = 5;
+    pub const magicsecure: u32 = 6;
+    pub const filter: u32 = 7;
+};
+
+pub const PRIVFLAGS = struct {
+    pub const HEADER: u16 = 1;
+    /// Bitset; bit names come from the driver (`ETH_SS_PRIV_FLAGS`).
+    pub const FLAGS: u16 = 2;
+};
+
+pub const TSINFO = struct {
+    pub const HEADER: u16 = 1;
+    /// Bitset of `SOF_TIMESTAMPING_*` capabilities (`ETH_SS_SOF_TIMESTAMPING`).
+    pub const TIMESTAMPING: u16 = 2;
+    /// Bitset of hardware TX types (`ETH_SS_TS_TX_TYPES`).
+    pub const TX_TYPES: u16 = 3;
+    /// Bitset of hardware RX filters (`ETH_SS_TS_RX_FILTERS`).
+    pub const RX_FILTERS: u16 = 4;
+    /// u32: index of the PTP hardware clock, absent when there is none.
+    pub const PHC_INDEX: u16 = 5;
+};
+
 // ── features ──────────────────────────────────────────────────────────────
 
 pub const FEATURES = struct {

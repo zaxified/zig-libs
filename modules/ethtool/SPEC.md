@@ -372,14 +372,17 @@ through to the kernel, which is the correct place to resolve it.
 
 ## 4. Deferred
 
+(2026-11-16: `WOL`, `EEE`, `FEC`, `PRIVFLAGS` and `TSINFO_GET` left this table and are typed calls.
+**WOL's `SOPASS` is a secret**: `wol.zig` zeroes the reply copy and the socket receive buffer after a
+GET, builds a SET in a pre-reserved buffer that is zeroed, and zeroes the sent datagram. A caller of
+the offline `buildSetWol` zeroes its result with `wol.wipe`. FEC's per-lane statistics stay on `raw`.)
+
 Reachable through `Ethtool.raw`, not modelled:
 
 | command family | why deferred |
 |---|---|
-| `WOL_GET`/`SET` | needs CAP_NET_ADMIN even to read, and its `SOPASS` is a secret that deserves its own handling |
-| `EEE_GET`/`SET`, `FEC_GET`/`SET` | more bitsets, no new decoding problem; add on demand |
-| `PRIVFLAGS`, `DEBUG` | driver-private string-keyed flag sets; the `STRSET` half is already here |
-| `TSINFO`/`TSCONFIG`, `PHC_VCLOCKS` | PTP timestamping — a coherent sub-domain of its own |
+| `DEBUG` | driver-private message-level flag set; the `PRIVFLAGS` shape would fit, add on demand |
+| `TSCONFIG`, `PHC_VCLOCKS`, the `TSINFO` stats/provider nests | newer PTP surface; `TSINFO_GET` itself is typed (2026-11-16) |
 | `CABLE_TEST_ACT` / `_TDR_ACT` | asynchronous: the result arrives as a notification, so it needs a request/notification correlation design this v1 does not have |
 | `RSS_GET`/`SET`, `PLCA`, `MM`, `PSE`, `PHY`, `TUNNEL_INFO`, `MODULE_FW_FLASH` | newer and narrower; several are still churning |
 | the all-devices **dump** form (`NLM_F_DUMP` with an empty header nest) | the typed API is per-device; `raw(.{ .dump = true })` reaches it |
@@ -387,11 +390,11 @@ Reachable through `Ethtool.raw`, not modelled:
 Survey findings (survey 2026-09-30), ranked by how often `ethtool(8)` users reach for them; all fit CONVENTIONS §2
 (netlink over raw syscalls, no libc). Each is reachable through `raw` today.
 
-1. **EEE and FEC `GET`/`SET`** (survey 2026-09-30) — `--show-eee`/`--show-fec` are routine on 10G+ and copper; mdlayher/ethtool already has FEC. Effort: small (bitsets exist).
-2. **WOL `GET`/`SET`** (survey 2026-09-30) — the everyday laptop/server `ethtool -s ... wol g`; mdlayher/ethtool has it. Effort: small; `SOPASS` needs the secret handling noted above.
-3. **`PRIVFLAGS` `GET`/`SET`** (survey 2026-09-30) — driver switches; `STRSET` half exists. Effort: small.
+1. ✅ DONE 2026-11-16 (`Ethtool.eee`/`setEee`, `fec`/`setFec` in `eee_fec.zig`; FEC_STATS left to `raw`) **EEE and FEC `GET`/`SET`** (survey 2026-09-30) — `--show-eee`/`--show-fec` are routine on 10G+ and copper; mdlayher/ethtool already has FEC. Effort: small (bitsets exist).
+2. ✅ DONE 2026-11-16 (`Ethtool.wol`/`setWol` in `wol.zig`; SOPASS buffers wiped, see its header) **WOL `GET`/`SET`** (survey 2026-09-30) — the everyday laptop/server `ethtool -s ... wol g`; mdlayher/ethtool has it. Effort: small; `SOPASS` needs the secret handling noted above.
+3. ✅ DONE 2026-11-16 (`Ethtool.privflags`/`setPrivflags` in `privflags.zig`) **`PRIVFLAGS` `GET`/`SET`** (survey 2026-09-30) — driver switches; `STRSET` half exists. Effort: small.
 4. **`RSS_GET` / indirection table** (survey 2026-09-30) — `ethtool -x` is standard for NIC tuning; safchain has `GetIndir`. Effort: medium.
-5. **`TSINFO_GET`** (survey 2026-09-30) — `ethtool -T`, first stop for PTP setup. Effort: small-medium.
+5. ✅ DONE 2026-11-16 (`Ethtool.tsInfo` in `tsinfo.zig`; stats / provider nests left to `raw`) **`TSINFO_GET`** (survey 2026-09-30) — `ethtool -T`, first stop for PTP setup. Effort: small-medium.
 6. **Cable test (`CABLE_TEST_ACT`/`TDR`)** (survey 2026-09-30) — needs request/notification correlation. Effort: medium.
 
 **Decided 2026-09-30 (user, option B): a small, bounded `SIOCETHTOOL` part — done 2026-09-30.**
