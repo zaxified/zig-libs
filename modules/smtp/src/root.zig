@@ -16,7 +16,8 @@
 //! * `data` (RFC 5321 §4.5.2) — dot-stuffing and un-stuffing, and the
 //!   `CRLF.CRLF` terminator, strict about the bare-LF ambiguity that "SMTP
 //!   smuggling" turns into message injection.
-//! * `auth` (RFC 4954, RFC 4616) — SASL PLAIN and LOGIN.
+//! * `auth` (RFC 4954, RFC 4616, RFC 7628) — SASL PLAIN and LOGIN, and the OAuth
+//!   bearer mechanisms XOAUTH2 and OAUTHBEARER.
 //! * `mime` (RFC 5322, RFC 2045/2047) — header folding, encoded words,
 //!   quoted-printable, base64, RFC 5322 dates.
 //! * `message` — the composer: address headers, `multipart/mixed` and
@@ -102,6 +103,7 @@ pub const Envelope = session.Envelope;
 pub const RecipientStatus = session.RecipientStatus;
 pub const TlsPolicy = session.TlsPolicy;
 pub const Credentials = session.Credentials;
+pub const Dsn = session.Dsn;
 
 /// Replies (RFC 5321 §4.2 + RFC 3463).
 pub const Reply = reply.Reply;

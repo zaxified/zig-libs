@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-//! RFC 4954 — the SMTP AUTH extension, PLAIN (RFC 4616) and LOGIN.
+//! RFC 4954 — the SMTP AUTH extension, PLAIN (RFC 4616), LOGIN, and the OAuth 2
+//! bearer mechanisms XOAUTH2 (Google/Microsoft) and OAUTHBEARER (RFC 7628).
 //!
 //! Both mechanisms transmit the password in the clear after a base64 encode
 //! that is not encryption. RFC 4954 §9 (Security Considerations), last
@@ -102,6 +103,110 @@ pub fn plainResponse(buf: []u8, authzid: []const u8, authcid: []const u8, passwd
     return b64ct.encode(buf, raw[0..i]);
 }
 
+/// 1 when the octet is not a legal bearer-token byte (VCHAR, 0x21..0x7e;
+/// RFC 6750 §2.1 b64token is a subset), without a branch: the token is secret.
+inline fn badTokenByte(c: u8) u8 {
+    const t: i16 = @as(i16, c) - 0x21;
+    const lo: u16 = @as(u16, @bitCast(t)) >> 15; // c < 0x21
+    const hi: u16 = @as(u16, @bitCast(@as(i16, 0x5d) - t)) >> 15; // c > 0x7e
+    return @intCast(lo | hi);
+}
+
+/// Token: non-empty and every byte 0x21..0x7e (so no space, no \x01 field
+/// separator, no control characters). One verdict per call.
+fn checkToken(token: []const u8) AuthError!void {
+    if (token.len == 0) return error.InvalidCredential;
+    var bad: u8 = 0;
+    for (token) |c| bad |= badTokenByte(c);
+    if (bad != 0) return error.InvalidCredential;
+}
+
+/// A user name inside an OAuth initial response: no NUL, CR, LF, and no \x01
+/// (the field separator, which would forge a whole `auth=` field).
+fn checkUser(s: []const u8) AuthError!void {
+    var bad: u8 = 0;
+    for (s) |c| bad |= isZero(c) | isZero(c ^ '\r') | isZero(c ^ '\n') | isZero(c ^ 1);
+    if (bad != 0) return error.InvalidCredential;
+}
+
+/// Raw (pre-base64) length of the XOAUTH2 initial response; the size of the
+/// `scratch` buffer `xoauth2Response` needs.
+pub fn xoauth2RawLen(user: []const u8, token: []const u8) usize {
+    return "user=".len + user.len + "\x01auth=Bearer ".len + token.len + 2;
+}
+
+/// XOAUTH2 initial response (Google/Microsoft format), base64:
+/// `user=<user>\x01auth=Bearer <token>\x01\x01`. `scratch` (at least
+/// `xoauth2RawLen` bytes) holds the plaintext and is wiped before return.
+pub fn xoauth2Response(buf: []u8, scratch: []u8, user: []const u8, token: []const u8) AuthError![]const u8 {
+    try checkUser(user);
+    try checkToken(token);
+    const raw_len = xoauth2RawLen(user, token);
+    if (raw_len > scratch.len or encodedLen(raw_len) > buf.len) return error.NoSpaceLeft;
+    const raw = scratch[0..raw_len];
+    defer std.crypto.secureZero(u8, raw);
+    var w: RawWriter = .{ .out = raw };
+    w.put("user=");
+    w.put(user);
+    w.put("\x01auth=Bearer ");
+    w.put(token);
+    w.put("\x01\x01");
+    return b64ct.encode(buf, raw);
+}
+
+const RawWriter = struct {
+    out: []u8,
+    i: usize = 0,
+    fn put(self: *RawWriter, s: []const u8) void {
+        @memcpy(self.out[self.i..][0..s.len], s);
+        self.i += s.len;
+    }
+};
+
+/// RFC 5801 §4 GS2 name escaping inside `a=`: ',' is `=2C`, '=' is `=3D`.
+fn gs2EscapedLen(s: []const u8) usize {
+    var n: usize = 0;
+    for (s) |c| n += if (c == ',' or c == '=') @as(usize, 3) else 1;
+    return n;
+}
+
+/// Raw length of the OAUTHBEARER initial response; the `scratch` size for
+/// `oauthbearerResponse`.
+pub fn oauthbearerRawLen(user: []const u8, token: []const u8) usize {
+    const a = if (user.len == 0) 0 else "a=".len + gs2EscapedLen(user);
+    return "n,".len + a + ",".len + "\x01auth=Bearer ".len + token.len + 2;
+}
+
+/// OAUTHBEARER initial response (RFC 7628 §3.1), base64: the GS2 header
+/// `n,a=<user>,` (`n,,` for an empty user) then
+/// `\x01auth=Bearer <token>\x01\x01`. `scratch` as for `xoauth2Response`.
+pub fn oauthbearerResponse(buf: []u8, scratch: []u8, user: []const u8, token: []const u8) AuthError![]const u8 {
+    try checkUser(user);
+    try checkToken(token);
+    const raw_len = oauthbearerRawLen(user, token);
+    if (raw_len > scratch.len or encodedLen(raw_len) > buf.len) return error.NoSpaceLeft;
+    const raw = scratch[0..raw_len];
+    defer std.crypto.secureZero(u8, raw);
+    var w: RawWriter = .{ .out = raw };
+    w.put("n,");
+    if (user.len != 0) {
+        w.put("a=");
+        for (user) |c| switch (c) {
+            ',' => w.put("=2C"),
+            '=' => w.put("=3D"),
+            else => w.put(&.{c}),
+        };
+    }
+    w.put(",\x01auth=Bearer ");
+    w.put(token);
+    w.put("\x01\x01");
+    return b64ct.encode(buf, raw);
+}
+
+/// The client's answer to an OAUTHBEARER error challenge (RFC 7628 §3.2.3):
+/// a single \x01, base64.
+pub const oauthbearer_error_ack = "AQ==";
+
 /// One LOGIN step: base64 of the credential the server just asked for.
 pub fn loginResponse(buf: []u8, credential: []const u8) AuthError![]const u8 {
     try checkCredential(credential);
@@ -182,6 +287,59 @@ test "LOGIN challenges are the literal base64 the servers send" {
 
     try testing.expectEqualStrings("dXNlckBleGFtcGxlLmNvbQ==", try loginResponse(&buf, "user@example.com"));
     try testing.expectEqualStrings("c2VjcmV0", try loginResponse(&buf, "secret"));
+}
+
+test "XOAUTH2 initial response" {
+    var buf: [256]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    // Fixed vector, base64 computed independently.
+    const r = try xoauth2Response(&buf, &scratch, "someuser@example.com", "ya29.vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg");
+    var dec: [256]u8 = undefined;
+    try testing.expectEqualSlices(u8, "user=someuser@example.com\x01auth=Bearer ya29.vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg\x01\x01", try decodeChallenge(&dec, r));
+    try testing.expectEqualStrings(
+        "dXNlcj1zb21ldXNlckBleGFtcGxlLmNvbQFhdXRoPUJlYXJlciB5YTI5LnZGOWRmdDRxbVRjMk52YjNSbGNrQmhkSFJoZG1semRHRXVZMjl0Q2cBAQ==",
+        r,
+    );
+    // The scratch plaintext is wiped.
+    for (scratch[0..xoauth2RawLen("someuser@example.com", "ya29.vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg")]) |c| try testing.expectEqual(@as(u8, 0), c);
+}
+
+test "OAUTHBEARER initial response, RFC 7628 §4.1 shape" {
+    var buf: [256]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    const r = try oauthbearerResponse(&buf, &scratch, "user@example.com", "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==");
+    var dec: [256]u8 = undefined;
+    try testing.expectEqualSlices(u8, "n,a=user@example.com,\x01auth=Bearer vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==\x01\x01", try decodeChallenge(&dec, r));
+    for (scratch[0..oauthbearerRawLen("user@example.com", "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==")]) |c| try testing.expectEqual(@as(u8, 0), c);
+
+    // Empty user: no a= part. ',' and '=' in the user are GS2-escaped.
+    const r2 = try oauthbearerResponse(&buf, &scratch, "", "tok");
+    try testing.expectEqualSlices(u8, "n,,\x01auth=Bearer tok\x01\x01", try decodeChallenge(&dec, r2));
+    const r3 = try oauthbearerResponse(&buf, &scratch, "a,b=c", "tok");
+    try testing.expectEqualSlices(u8, "n,a=a=2Cb=3Dc,\x01auth=Bearer tok\x01\x01", try decodeChallenge(&dec, r3));
+    try testing.expectEqualSlices(u8, "\x01", try decodeChallenge(&dec, oauthbearer_error_ack));
+}
+
+test "OAuth responses refuse forged fields and small buffers" {
+    var buf: [256]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    const fns = .{ xoauth2Response, oauthbearerResponse };
+    inline for (fns) |f| {
+        try testing.expectError(error.InvalidCredential, f(&buf, &scratch, "u\x01auth=Bearer x", "tok"));
+        try testing.expectError(error.InvalidCredential, f(&buf, &scratch, "u\r\nQUIT", "tok"));
+        try testing.expectError(error.InvalidCredential, f(&buf, &scratch, "u\x00", "tok"));
+        try testing.expectError(error.InvalidCredential, f(&buf, &scratch, "u", ""));
+        try testing.expectError(error.InvalidCredential, f(&buf, &scratch, "u", "to ken"));
+        try testing.expectError(error.InvalidCredential, f(&buf, &scratch, "u", "tok\x01\x01"));
+        try testing.expectError(error.InvalidCredential, f(&buf, &scratch, "u", "tok\r\n"));
+        try testing.expectError(error.InvalidCredential, f(&buf, &scratch, "u", "tok\x7f"));
+        try testing.expectError(error.InvalidCredential, f(&buf, &scratch, "u", "tok\xc3\xa9"));
+        _ = try f(&buf, &scratch, "u", "!~"); // the 0x21 and 0x7e edges
+        var small: [8]u8 = undefined;
+        try testing.expectError(error.NoSpaceLeft, f(&small, &scratch, "user", "token"));
+        var tiny_scratch: [8]u8 = undefined;
+        try testing.expectError(error.NoSpaceLeft, f(&buf, &tiny_scratch, "user", "token"));
+    }
 }
 
 test "credentials that would forge a separator or a command line are refused" {

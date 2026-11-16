@@ -14,7 +14,7 @@ builds `multipart/mixed` and `multipart/alternative` trees with attachments.
   do not). RFC 3463 enhanced status codes are parsed when the server sends them.
 - **ESMTP negotiation.** The EHLO reply is resolved into a capability set — `STARTTLS`,
   `AUTH`, `PIPELINING`, `SIZE`, `8BITMIME`, `SMTPUTF8`, `ENHANCEDSTATUSCODES`,
-  `CHUNKING`/`BINARYMIME`/`DSN` (reported, not implemented) — with unknown keywords kept
+  `CHUNKING`/`BINARYMIME` (reported, not implemented) and `DSN` (reported; parameters below) — with unknown keywords kept
   verbatim rather than rejected, and a `HELO` fallback for a server that refuses EHLO.
 - **STARTTLS is a seam, not an implementation** (CONVENTIONS.md §2). The module negotiates
   it, the caller performs the handshake and returns the upgraded transport. The pre-TLS
@@ -25,7 +25,16 @@ builds `multipart/mixed` and `multipart/alternative` trees with attachments.
   the process has not yet read are invisible to it, so the caller's TLS hook is what must
   confirm nothing is waiting on the wire before it starts the handshake (see SPEC.md).
 - **AUTH** PLAIN (RFC 4616) and LOGIN, refused on an unencrypted link unless the caller
-  sets `allow_plaintext_auth` (RFC 4954 §9).
+  sets `allow_plaintext_auth` (RFC 4954 §9). **XOAUTH2** (Google/Microsoft) and
+  **OAUTHBEARER** (RFC 7628) are opt-in: `Credentials{ .username, .token, .mechanisms =
+  &.{.oauthbearer, .xoauth2} }`, used only when the server advertises the mechanism; the
+  caller obtains the token. The token is wiped from every buffer that held it, the AUTH
+  line limit is 12288 (RFC 4954 §4) so long tokens fit, and after a failed login the
+  server's JSON error is `Session.authErrorJson()` / `Client.authErrorJson()`.
+- **DSN parameters (RFC 3461).** `Envelope.dsn = .{ .ret, .envid, .notify, .orcpt }` adds
+  `RET=`/`ENVID=` to MAIL FROM and `NOTIFY=`/`ORCPT=` to each RCPT TO, xtext-encoded
+  (`command.xtext`), only when the server advertised DSN (otherwise
+  `error.DsnNotSupported` before any byte goes out). No `multipart/report` composer.
 - **DATA transparency.** Dot-stuffing on send, un-stuffing on receive, and the `CRLF.CRLF`
   terminator. A body line that is exactly `.` is the canonical case and is tested
   everywhere, including end-to-end against a real server. The terminator is *only*

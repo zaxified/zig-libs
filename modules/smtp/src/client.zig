@@ -167,6 +167,12 @@ pub const Client = struct {
         return self.sess.serverCapabilities();
     }
 
+    /// The server's JSON error document after a failed XOAUTH2/OAUTHBEARER
+    /// login (`Session.authErrorJson`).
+    pub fn authErrorJson(self: *const Client) ?[]const u8 {
+        return self.sess.authErrorJson();
+    }
+
     pub fn lastReply(self: *const Client) ?reply_mod.Reply {
         return self.sess.lastReply();
     }

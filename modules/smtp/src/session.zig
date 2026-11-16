@@ -64,11 +64,18 @@ pub const TlsPolicy = enum {
 };
 
 pub const Credentials = struct {
+    /// The login name; for XOAUTH2/OAUTHBEARER the account (`user=` / `a=`).
     username: []const u8,
-    password: []const u8,
+    /// PLAIN/LOGIN password. Unused by the OAuth mechanisms.
+    password: []const u8 = "",
+    /// XOAUTH2/OAUTHBEARER bearer token, as obtained by the caller (acquiring
+    /// and refreshing it is not this module's job). A secret: every buffer
+    /// that held it is wiped. Visible ASCII only, no spaces.
+    token: []const u8 = "",
     /// SASL authorization identity; empty means "the same as `username`".
     authzid: []const u8 = "",
     /// Preference order. The first mechanism the server also offers wins.
+    /// `.xoauth2` and `.oauthbearer` are opt-in: list them (and set `token`).
     mechanisms: []const Mechanism = &.{ .plain, .login },
 };
 
@@ -114,6 +121,27 @@ pub const Envelope = struct {
     eight_bit: bool = false,
     /// The envelope or headers need RFC 6531 SMTPUTF8.
     smtputf8: bool = false,
+    /// RFC 3461 DSN parameters; null = none.
+    dsn: ?Dsn = null,
+};
+
+/// RFC 3461 delivery status notification request. Sent only when the server
+/// advertised DSN; otherwise `beginTransaction` fails with
+/// `error.DsnNotSupported` before any byte goes out.
+pub const Dsn = struct {
+    /// `RET=` on MAIL FROM.
+    ret: ?command.DsnRet = null,
+    /// `ENVID=` on MAIL FROM (raw bytes; xtext-encoded on the wire).
+    envid: ?[]const u8 = null,
+    /// `NOTIFY=` on every RCPT TO.
+    notify: command.DsnNotify = .{},
+    /// `ORCPT=` per recipient, parallel to `Envelope.to`; empty for none,
+    /// otherwise exactly `to.len` entries (null = no ORCPT for that one).
+    orcpt: []const ?command.DsnOrcpt = &.{},
+
+    fn requested(self: Dsn) bool {
+        return self.ret != null or self.envid != null or !self.notify.isEmpty() or self.orcpt.len != 0;
+    }
 };
 
 pub const RecipientStatus = struct {
@@ -148,6 +176,8 @@ pub const SessionError = error{
     /// An 8-bit body without 8BITMIME, or a UTF-8 envelope without SMTPUTF8.
     EightBitNotSupported,
     SmtpUtf8NotSupported,
+    /// DSN parameters requested but the server did not advertise DSN.
+    DsnNotSupported,
     /// More recipients than `Options.max_recipients`.
     TooManyRecipients,
     /// A call used out of order (`beginTransaction` before the handshake, a
@@ -185,6 +215,9 @@ pub const State = enum {
     auth_username,
     auth_password,
     auth_plain_response,
+    /// XOAUTH2/OAUTHBEARER: the server answered with a 334 error challenge;
+    /// the empty acknowledgement goes out next, then the failure reply.
+    auth_oauth_error,
     /// Handshake complete; idle, waiting for a transaction or QUIT.
     ready,
     /// MAIL/RCPT/DATA in flight.
@@ -232,6 +265,9 @@ pub const Session = struct {
     mechanism: Mechanism = .plain,
     /// The caller asked to close.
     quit_requested: bool = false,
+    /// The JSON error document of a failed XOAUTH2/OAUTHBEARER exchange
+    /// (decoded from the server's 334 challenge), owned.
+    auth_error: ?[]u8 = null,
 
     pub fn init(gpa: std.mem.Allocator, opts: Options) Session {
         return .{ .gpa = gpa, .opts = opts, .caps = .empty(gpa) };
@@ -242,8 +278,29 @@ pub const Session = struct {
         self.wipeOut();
         self.out.deinit(self.gpa);
         self.rcpts.deinit(self.gpa);
+        if (self.auth_error) |e| self.gpa.free(e);
         if (self.last) |*l| l.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    /// After a failed XOAUTH2/OAUTHBEARER login: the server's JSON error
+    /// document (RFC 7628 §3.2.2, e.g. `{"status":"invalid_token",...}`), valid
+    /// until `deinit`. Null when there was none or it was not valid base64.
+    pub fn authErrorJson(self: *const Session) ?[]const u8 {
+        return self.auth_error;
+    }
+
+    fn storeAuthError(self: *Session, challenge: []const u8) SessionError!void {
+        if (self.auth_error) |e| self.gpa.free(e);
+        self.auth_error = null;
+        const trimmed = std.mem.trim(u8, challenge, " \t");
+        const n = std.base64.standard.Decoder.calcSizeForSlice(trimmed) catch return;
+        const out = try self.gpa.alloc(u8, n);
+        std.base64.standard.Decoder.decode(out, trimmed) catch {
+            self.gpa.free(out);
+            return;
+        };
+        self.auth_error = out;
     }
 
     /// Overwrite the command buffer before reuse: it has held a base64-encoded
@@ -316,6 +373,13 @@ pub const Session = struct {
                 const ir = try auth_mod.plainResponse(&resp, c.authzid, c.username, c.password);
                 defer std.crypto.secureZero(u8, &resp);
                 try self.emit(command.authContinue(try self.buf(), ir, self.opts.cmd_limits));
+                return self.sent();
+            },
+            .auth_oauth_error => {
+                // RFC 7628 §3.2.3 / the XOAUTH2 convention: acknowledge the
+                // error challenge so the server can send its final failure.
+                const ack: []const u8 = if (self.mechanism == .oauthbearer) auth_mod.oauthbearer_error_ack else "";
+                try self.emit(command.authContinue(try self.buf(), ack, self.opts.cmd_limits));
                 return self.sent();
             },
             .ready => {
@@ -434,6 +498,9 @@ pub const Session = struct {
                 if (r.code != 235) return self.authFailed(r);
                 self.authOk();
             },
+            // Whatever follows our acknowledgement is the end: even a 235
+            // here is not a login we asked for.
+            .auth_oauth_error => return self.authFailed(r),
             .ready => return error.InvalidState,
             .transaction => try self.onTransactionReply(r),
             .body => {
@@ -536,8 +603,36 @@ pub const Session = struct {
                 try self.emit(command.auth(try self.buf(), "PLAIN", ir, self.opts.cmd_limits));
             },
             .login => try self.emit(command.auth(try self.buf(), "LOGIN", null, self.opts.cmd_limits)),
+            .xoauth2, .oauthbearer => try self.emitOauthInitial(c),
         }
         return self.sent();
+    }
+
+    /// The OAuth initial response. Bearer tokens routinely exceed the 512-octet
+    /// default line, so the line ceiling is RFC 4954 §4's 12288 for AUTH, and
+    /// the buffers are sized to the token. Every buffer that held it is wiped.
+    fn emitOauthInitial(self: *Session, c: Credentials) SessionError!void {
+        const raw_len = if (self.mechanism == .xoauth2)
+            auth_mod.xoauth2RawLen(c.username, c.token)
+        else
+            auth_mod.oauthbearerRawLen(c.username, c.token);
+        const enc_len = auth_mod.encodedLen(raw_len);
+        if (enc_len > 12288) return error.NoSpaceLeft;
+        const scratch = try self.gpa.alloc(u8, raw_len);
+        defer self.gpa.free(scratch);
+        const enc = try self.gpa.alloc(u8, enc_len);
+        defer self.gpa.free(enc);
+        defer std.crypto.secureZero(u8, enc);
+        defer std.crypto.secureZero(u8, scratch);
+        const ir = if (self.mechanism == .xoauth2)
+            try auth_mod.xoauth2Response(enc, scratch, c.username, c.token)
+        else
+            try auth_mod.oauthbearerResponse(enc, scratch, c.username, c.token);
+        var lim = self.opts.cmd_limits;
+        lim.max_command_line = @max(lim.max_command_line, 12288);
+        self.wipeOut();
+        try self.out.resize(self.gpa, enc_len + 64);
+        try self.emit(command.auth(self.out.items, self.mechanism.name(), ir, lim));
     }
 
     fn onAuthInitial(self: *Session, r: reply_mod.Reply) SessionError!void {
@@ -548,6 +643,17 @@ pub const Session = struct {
                 // anyway (RFC 4954 §4 allows an empty 334): repeat it.
                 334 => {
                     self.state = .auth_plain_response;
+                    self.phase = .emit;
+                },
+                else => return self.authFailed(r),
+            },
+            .xoauth2, .oauthbearer => switch (r.code) {
+                235 => self.authOk(),
+                334 => {
+                    // The error document, base64 JSON. Keep it for the caller
+                    // and acknowledge it (`.auth_oauth_error`).
+                    try self.storeAuthError(r.text);
+                    self.state = .auth_oauth_error;
                     self.phase = .emit;
                 },
                 else => return self.authFailed(r),
@@ -594,6 +700,13 @@ pub const Session = struct {
         if (env.to.len > self.opts.max_recipients) return error.TooManyRecipients;
         if (env.eight_bit and self.esmtp and !self.caps.eightbitmime) return error.EightBitNotSupported;
         if (env.smtputf8 and !self.caps.smtputf8) return error.SmtpUtf8NotSupported;
+        if (env.dsn) |d| {
+            if (d.requested()) {
+                // RFC 3461 §4: the parameters exist only when DSN was offered.
+                if (!self.esmtp or !self.caps.dsn) return error.DsnNotSupported;
+                if (d.orcpt.len != 0 and d.orcpt.len != env.to.len) return error.InvalidDsnParameter;
+            }
+        }
         // The size of what goes on the wire, not of the slice handed in: LF
         // endings grow to CRLF (A1 F6 — 100 000 B of LF text was announced
         // as SIZE=100000 and sent as 102 000, past a 100 000 limit). Also the
@@ -609,6 +722,15 @@ pub const Session = struct {
         for (env.to) |t| {
             try command.validateMailbox(t, self.opts.cmd_limits, env.smtputf8);
             try self.rcpts.append(self.gpa, .{ .addr = t });
+        }
+        if (env.dsn != null) {
+            // Dry-run the lines so a bad DSN parameter is refused before MAIL
+            // FROM goes out, not halfway through the transaction.
+            var line: [1024]u8 = undefined;
+            _ = try command.mail(&line, env.from, self.mailParams(env), self.opts.cmd_limits);
+            for (env.to, 0..) |t, i| {
+                _ = try command.rcpt(&line, t, self.rcptParams(env, i), self.opts.cmd_limits, env.smtputf8 and self.caps.smtputf8);
+            }
         }
 
         self.env = env;
@@ -650,7 +772,7 @@ pub const Session = struct {
             const bytes = if (i == 0)
                 try command.mail(&line, env.from, self.mailParams(env), self.opts.cmd_limits)
             else if (i < total - 1)
-                try command.rcpt(&line, self.rcpts.items[i - 1].addr, .{}, self.opts.cmd_limits, env.smtputf8 and self.caps.smtputf8)
+                try command.rcpt(&line, self.rcpts.items[i - 1].addr, self.rcptParams(env, i - 1), self.opts.cmd_limits, env.smtputf8 and self.caps.smtputf8)
             else
                 try command.data(&line, self.opts.cmd_limits);
             try self.out.appendSlice(self.gpa, bytes);
@@ -671,6 +793,17 @@ pub const Session = struct {
                 null,
             .body = if (env.eight_bit and self.caps.eightbitmime) .eight_bit_mime else null,
             .smtputf8 = env.smtputf8 and self.caps.smtputf8,
+            .ret = if (env.dsn) |d| d.ret else null,
+            .envid = if (env.dsn) |d| d.envid else null,
+        };
+    }
+
+    fn rcptParams(self: *const Session, env: Envelope, i: usize) command.RcptParams {
+        _ = self;
+        const d = env.dsn orelse return .{};
+        return .{
+            .notify = d.notify,
+            .orcpt = if (i < d.orcpt.len) d.orcpt[i] else null,
         };
     }
 
@@ -1532,4 +1665,228 @@ test "too many recipients is bounded" {
         .to = &many,
         .body = "x",
     }));
+}
+
+// ── OAuth bearer mechanisms and DSN parameters (2026-11-16) ────────────────
+
+test "XOAUTH2 login with a token past the 512-octet default line" {
+    const gpa = testing.allocator;
+    // A Microsoft-sized JWT-ish token: 1500 visible octets.
+    const tok = try gpa.alloc(u8, 1500);
+    defer gpa.free(tok);
+    for (tok, 0..) |*c, i| c.* = "abcdefghijklmnopqrstuvwxyz0123456789.-_"[i % 39];
+    var s: Session = .init(gpa, .{
+        .tls = .disabled,
+        .allow_plaintext_auth = true,
+        .credentials = .{ .username = "u@example.com", .token = tok, .mechanisms = &.{ .xoauth2, .plain } },
+    });
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{
+        "220 ready\r\n",
+        "250-mail.example.com Hello\r\n250 AUTH PLAIN XOAUTH2\r\n",
+        "235 2.7.0 ok\r\n",
+    } };
+    defer sc.deinit();
+    try sc.run(&s);
+    try testing.expect(s.authenticated);
+    const scratch = try gpa.alloc(u8, auth_mod.xoauth2RawLen("u@example.com", tok));
+    defer gpa.free(scratch);
+    const enc = try gpa.alloc(u8, auth_mod.encodedLen(scratch.len));
+    defer gpa.free(enc);
+    const ir = try auth_mod.xoauth2Response(enc, scratch, "u@example.com", tok);
+    const want = try gpa.print("EHLO localhost\r\nAUTH XOAUTH2 {s}\r\n", .{ir});
+    defer gpa.free(want);
+    try testing.expectEqualStrings(want, sc.sent.items);
+    // The command buffer that held the encoded token is wiped and emptied
+    // after login (the spare-capacity scan is the ReleaseFast F13 test).
+    try testing.expectEqual(@as(usize, 0), s.out.items.len);
+    try testing.expect(s.authErrorJson() == null);
+}
+
+test "OAUTHBEARER login, and it is only used when the server offers it" {
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, .{
+        .tls = .disabled,
+        .allow_plaintext_auth = true,
+        .credentials = .{ .username = "u@example.com", .token = "tok", .mechanisms = &.{.oauthbearer} },
+    });
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{
+        "220 ready\r\n",
+        "250-mail.example.com Hello\r\n250 AUTH PLAIN OAUTHBEARER\r\n",
+        "235 2.7.0 ok\r\n",
+    } };
+    defer sc.deinit();
+    try sc.run(&s);
+    try testing.expect(s.authenticated);
+    // base64("n,a=u@example.com,\x01auth=Bearer tok\x01\x01")
+    var scratch: [64]u8 = undefined;
+    var enc: [128]u8 = undefined;
+    const ir = try auth_mod.oauthbearerResponse(&enc, &scratch, "u@example.com", "tok");
+    const want = try gpa.print("EHLO localhost\r\nAUTH OAUTHBEARER {s}\r\n", .{ir});
+    defer gpa.free(want);
+    try testing.expectEqualStrings(want, sc.sent.items);
+
+    // The server does not list OAUTHBEARER: nothing is sent, typed error.
+    var s2: Session = .init(gpa, .{
+        .tls = .disabled,
+        .allow_plaintext_auth = true,
+        .credentials = .{ .username = "u", .token = "tok", .mechanisms = &.{ .oauthbearer, .xoauth2 } },
+    });
+    defer s2.deinit();
+    var sc2: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "250-x\r\n250 AUTH PLAIN LOGIN\r\n" } };
+    defer sc2.deinit();
+    try testing.expectError(error.NoSupportedAuthMechanism, sc2.run(&s2));
+    try testing.expectEqualStrings("EHLO localhost\r\n", sc2.sent.items);
+
+    // An invalid token (a space) is refused locally, nothing leaves.
+    var s3: Session = .init(gpa, .{
+        .tls = .disabled,
+        .allow_plaintext_auth = true,
+        .credentials = .{ .username = "u", .token = "bad token", .mechanisms = &.{.xoauth2} },
+    });
+    defer s3.deinit();
+    var sc3: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "250-x\r\n250 AUTH XOAUTH2\r\n" } };
+    defer sc3.deinit();
+    try testing.expectError(error.InvalidCredential, sc3.run(&s3));
+    try testing.expectEqualStrings("EHLO localhost\r\n", sc3.sent.items);
+}
+
+test "OAuth mechanisms are refused on a plaintext link like PLAIN" {
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, .{
+        .tls = .disabled,
+        .credentials = .{ .username = "u", .token = "tok", .mechanisms = &.{.xoauth2} },
+    });
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "250-x\r\n250 AUTH XOAUTH2\r\n" } };
+    defer sc.deinit();
+    try testing.expectError(error.PlaintextAuthRefused, sc.run(&s));
+}
+
+test "XOAUTH2 error challenge: empty response sent, JSON surfaced" {
+    const gpa = testing.allocator;
+    const json = "{\"status\":\"401\",\"schemes\":\"Bearer\",\"scope\":\"https://mail.google.com/\"}";
+    var jb: [200]u8 = undefined;
+    const json_b64 = std.base64.standard.Encoder.encode(&jb, json);
+    const challenge = try gpa.print("334 {s}\r\n", .{json_b64});
+    defer gpa.free(challenge);
+    var s: Session = .init(gpa, .{
+        .tls = .disabled,
+        .allow_plaintext_auth = true,
+        .credentials = .{ .username = "u@example.com", .token = "tok", .mechanisms = &.{.xoauth2} },
+    });
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{
+        "220 ready\r\n",
+        "250-x\r\n250 AUTH XOAUTH2\r\n",
+        challenge,
+        "535 5.7.8 Username and Password not accepted\r\n",
+    } };
+    defer sc.deinit();
+    try testing.expectError(error.PermanentFailure, sc.run(&s));
+    try testing.expectEqualStrings(json, s.authErrorJson().?);
+    try testing.expect(!s.authenticated);
+    try testing.expectEqual(State.closed, s.state);
+    // EHLO, AUTH XOAUTH2 <ir>, then the EMPTY response line.
+    try testing.expect(std.mem.endsWith(u8, sc.sent.items, "\r\n\r\n"));
+    try testing.expectEqual(@as(usize, 0), s.out.items.len);
+}
+
+test "OAUTHBEARER error challenge is acknowledged with a single \\x01" {
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, .{
+        .tls = .disabled,
+        .allow_plaintext_auth = true,
+        .credentials = .{ .username = "", .token = "tok", .mechanisms = &.{.oauthbearer} },
+    });
+    defer s.deinit();
+    var sc: Script = .{
+        .gpa = gpa,
+        .replies = &.{
+            "220 ready\r\n",
+            "250-x\r\n250 AUTH OAUTHBEARER\r\n",
+            "334 eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIn0=\r\n", // {"status":"invalid_token"}
+            "535 5.7.8 bad\r\n",
+        },
+    };
+    defer sc.deinit();
+    try testing.expectError(error.PermanentFailure, sc.run(&s));
+    try testing.expectEqualStrings("{\"status\":\"invalid_token\"}", s.authErrorJson().?);
+    try testing.expect(std.mem.endsWith(u8, sc.sent.items, "\r\nAQ==\r\n"));
+
+    // A 334 that is not base64 is still acknowledged; no JSON is kept.
+    var s2: Session = .init(gpa, .{
+        .tls = .disabled,
+        .allow_plaintext_auth = true,
+        .credentials = .{ .username = "u", .token = "tok", .mechanisms = &.{.oauthbearer} },
+    });
+    defer s2.deinit();
+    var sc2: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "250-x\r\n250 AUTH OAUTHBEARER\r\n", "334 !!!\r\n", "535 no\r\n" } };
+    defer sc2.deinit();
+    try testing.expectError(error.PermanentFailure, sc2.run(&s2));
+    try testing.expect(s2.authErrorJson() == null);
+    try testing.expect(std.mem.endsWith(u8, sc2.sent.items, "\r\nAQ==\r\n"));
+}
+
+test "DSN parameters go out when DSN is advertised" {
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, .{ .tls = .disabled });
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "250-mail.example.com Hello\r\n250-PIPELINING\r\n250 DSN\r\n" } };
+    defer sc.deinit();
+    try sc.run(&s);
+    try s.beginTransaction(.{
+        .from = "a@example.com",
+        .to = &.{ "b@example.net", "c@example.net" },
+        .body = "x\r\n",
+        .dsn = .{
+            .ret = .hdrs,
+            .envid = "id=1+2",
+            .notify = .{ .success = true, .failure = true },
+            .orcpt = &.{ .{ .address = "b+x@example.net" }, null },
+        },
+    });
+    const st = try s.next();
+    try testing.expectEqualStrings(
+        "MAIL FROM:<a@example.com> RET=HDRS ENVID=id+3D1+2B2\r\n" ++
+            "RCPT TO:<b@example.net> NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;b+2Bx@example.net\r\n" ++
+            "RCPT TO:<c@example.net> NOTIFY=SUCCESS,FAILURE\r\n" ++
+            "DATA\r\n",
+        st.send,
+    );
+}
+
+test "DSN parameters are refused locally without the DSN capability, and bad ones before MAIL" {
+    const gpa = testing.allocator;
+    // No DSN advertised.
+    var s: Session = .init(gpa, .{ .tls = .disabled });
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", ehlo_plain } };
+    defer sc.deinit();
+    try sc.run(&s);
+    try testing.expectError(error.DsnNotSupported, s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "x", .dsn = .{ .ret = .full } }));
+    try testing.expectError(error.DsnNotSupported, s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "x", .dsn = .{ .notify = .{ .never = true } } }));
+    // An all-default Dsn requests nothing and is accepted.
+    try s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "x", .dsn = .{} });
+
+    // HELO-only server: ESMTP parameters do not exist.
+    var h: Session = .init(gpa, .{ .tls = .disabled });
+    defer h.deinit();
+    var sch: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "502 no\r\n", "250 hi\r\n" } };
+    defer sch.deinit();
+    try sch.run(&h);
+    try testing.expectError(error.DsnNotSupported, h.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "x", .dsn = .{ .ret = .full } }));
+
+    // DSN advertised: invalid parameters are errors up front, state intact.
+    var d: Session = .init(gpa, .{ .tls = .disabled });
+    defer d.deinit();
+    var scd: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "250-x\r\n250 DSN\r\n" } };
+    defer scd.deinit();
+    try scd.run(&d);
+    const to = &[_][]const u8{"b@example.net"};
+    try testing.expectError(error.InvalidDsnParameter, d.beginTransaction(.{ .from = "a@example.com", .to = to, .body = "x", .dsn = .{ .notify = .{ .never = true, .failure = true } } }));
+    try testing.expectError(error.InvalidDsnParameter, d.beginTransaction(.{ .from = "a@example.com", .to = to, .body = "x", .dsn = .{ .envid = "" } }));
+    try testing.expectError(error.InvalidDsnParameter, d.beginTransaction(.{ .from = "a@example.com", .to = to, .body = "x", .dsn = .{ .orcpt = &.{ null, null } } }));
+    try testing.expectEqual(State.ready, d.state);
 }
