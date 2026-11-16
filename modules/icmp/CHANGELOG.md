@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the stddev / jitter update is one function (`Stats.noteReply`) that the
+  reply path and its test share, so the test exercises the code the pinger runs.
 - **2026-11-16** — **NEW (additive):** `Stats.stddevNs()` (population standard deviation of received RTTs, pro-bing `StdDevRtt` definition, Welford online, no stored samples) and `Stats.jitterNs()` (mean absolute difference of consecutive RTTs; not the RFC 3550 smoothed estimator). New fields `rtt_mean`, `rtt_m2`, `jitter_sum_ns` default to zero; existing fields unchanged.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-08** — **NEW:** `icmp.checksum` (`sum`, `finish`, `checksum`): the RFC 1071 internet checksum primitives with a `u64` accumulator, now the one implementation (duplicate-code pass); `echo.checksum` is a wrapper, same results.

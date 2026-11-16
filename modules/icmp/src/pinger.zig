@@ -241,6 +241,23 @@ pub const Stats = struct {
         if (s.recv < 2) return null;
         return s.jitter_sum_ns / (s.recv - 1);
     }
+
+    /// One reply's RTT into `recv`, `last_ns` and the stddev / jitter
+    /// state (the reply path's update; `total_ns`, `min_ns`, `max_ns` stay
+    /// with the caller).
+    fn noteReply(s: *Stats, rtt: u64) void {
+        const had_prev = s.recv > 0;
+        s.recv +|= 1;
+        if (had_prev) {
+            const d = if (rtt > s.last_ns) rtt - s.last_ns else s.last_ns - rtt;
+            s.jitter_sum_ns +|= d;
+        }
+        const x: f64 = @floatFromInt(rtt);
+        const delta = x - s.rtt_mean;
+        s.rtt_mean += delta / @as(f64, @floatFromInt(s.recv));
+        s.rtt_m2 += delta * (x - s.rtt_mean);
+        s.last_ns = rtt;
+    }
 };
 
 /// A probe destination: family-tagged sockaddr, built from a `netaddr.Ip`
@@ -1256,17 +1273,7 @@ pub const Pinger = struct {
                 self.inflight -= 1;
 
                 const s = &t.stats;
-                const had_prev = s.recv > 0;
-                s.recv +|= 1;
-                if (had_prev) {
-                    const d = if (rtt > s.last_ns) rtt - s.last_ns else s.last_ns - rtt;
-                    s.jitter_sum_ns +|= d;
-                }
-                const x: f64 = @floatFromInt(rtt);
-                const delta = x - s.rtt_mean;
-                s.rtt_mean += delta / @as(f64, @floatFromInt(s.recv));
-                s.rtt_m2 += delta * (x - s.rtt_mean);
-                s.last_ns = rtt;
+                s.noteReply(rtt);
                 s.total_ns += rtt;
                 if (s.min_ns == 0 or rtt < s.min_ns) s.min_ns = rtt;
                 if (rtt > s.max_ns) s.max_ns = rtt;
@@ -1543,20 +1550,13 @@ test "stats helpers" {
 }
 
 test "stats stddev and jitter: online accumulation" {
-    // Folds the same update the reply path does.
+    // The reply path's own update (`noteReply`).
     var s: Stats = .{};
     try std.testing.expectEqual(@as(?u64, null), s.stddevNs());
     try std.testing.expectEqual(@as(?u64, null), s.jitterNs());
     const rtts = [_]u64{ 10_000, 20_000, 40_000, 20_000 };
     for (rtts, 0..) |rtt, i| {
-        const had_prev = s.recv > 0;
-        s.recv += 1;
-        if (had_prev) s.jitter_sum_ns += if (rtt > s.last_ns) rtt - s.last_ns else s.last_ns - rtt;
-        const x: f64 = @floatFromInt(rtt);
-        const delta = x - s.rtt_mean;
-        s.rtt_mean += delta / @as(f64, @floatFromInt(s.recv));
-        s.rtt_m2 += delta * (x - s.rtt_mean);
-        s.last_ns = rtt;
+        s.noteReply(rtt);
         if (i == 0) {
             try std.testing.expectEqual(@as(?u64, 0), s.stddevNs());
             try std.testing.expectEqual(@as(?u64, null), s.jitterNs());
