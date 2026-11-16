@@ -229,8 +229,7 @@ pub const Found = struct {
     module_px: f32,
 };
 
-/// Locate one symbol and sample it. Returns the grid; hand it to `qr.decode`.
-pub fn scan(img: Image, scratch: []u8) Error!Found {
+fn validate(img: Image, scratch: []u8) Error!void {
     if (img.width < 21 or img.height < 21) return Error.BadImage;
     // Checked before anything below does size arithmetic on `img.width` /
     // `img.height`: this is the one gate standing between an untrusted
@@ -265,11 +264,96 @@ pub fn scan(img: Image, scratch: []u8) Error!Found {
     // `max_dimension` ceiling above bounds `width` and `height`, never `stride`.
     if (@as(u64, img.luma.len) < @as(u64, img.stride) * @as(u64, img.height)) return Error.BadImage;
     if (scratch.len < scratchSize(img.width, img.height)) return Error.ScratchTooSmall;
+}
 
+/// Locate one symbol and sample it. Returns the grid; hand it to `qr.decode`.
+///
+/// Reads dark-on-light symbols only; `scanAny` also tries light-on-dark and
+/// mirrored ones, after this plain attempt has failed.
+pub fn scan(img: Image, scratch: []u8) Error!Found {
+    try validate(img, scratch);
     var ws = Workspace.carve(img, scratch);
     binarize(img, &ws.bits, ws.means);
-    const bits = &ws.bits;
+    const r = scanBits(&ws);
+    if (r.found) |f| return f;
+    return Error.NotFound;
+}
 
+/// Which retry of `scanAny` produced the result.
+pub const Transform = enum {
+    /// The image as given: dark modules on a light ground. What `scan` reads.
+    none,
+    /// Light modules on a dark ground (a dark-mode screen, an engraved plate).
+    inverted,
+    /// Mirror image (a reflection, a code seen from behind a transparency).
+    mirrored,
+    /// Both at once.
+    inverted_mirrored,
+};
+
+/// Which retries `scanAny` may make after the plain attempt. Both default to on:
+/// this is a new entry point, so nothing that calls `scan` changes, and a caller
+/// who knows its source (a camera never shows mirrored codes) can switch one off
+/// to skip the extra passes on a frame with no symbol.
+pub const ScanOptions = struct {
+    /// Retry with the polarity flipped (light-on-dark).
+    try_inverted: bool = true,
+    /// Retry with the image mirrored left-right. With `try_inverted` it also
+    /// covers a mirrored light-on-dark symbol.
+    try_mirrored: bool = true,
+};
+
+pub const ScannedAny = struct {
+    found: Found,
+    /// The transform under which the symbol was found; `found.matrix` is already
+    /// in the symbol's own (un-mirrored, dark-module) orientation.
+    transform: Transform,
+};
+
+/// `scan`, then — only if that finds no readable symbol — the inverted image,
+/// the mirrored one, and both, in that order (the ZXing-style retries), each
+/// gated by `opts`. Binarisation runs once; the retries flip or mirror the
+/// binarised bitmap in the caller's scratch, so a first-attempt success costs
+/// exactly what `scan` costs. If no attempt yields a *readable* grid but the
+/// plain one yielded a best-effort grid, that grid is returned with
+/// `.transform = .none`, as `scan` would have.
+pub fn scanAny(img: Image, scratch: []u8, opts: ScanOptions) Error!ScannedAny {
+    try validate(img, scratch);
+    var ws = Workspace.carve(img, scratch);
+    binarize(img, &ws.bits, ws.means);
+
+    const first = scanBits(&ws);
+    if (first.found) |f| if (first.readable) return .{ .found = f, .transform = .none };
+
+    // Bitmap state walks: plain -> inverted -> mirrored -> inverted+mirrored,
+    // so each retry is one cheap in-place pass over the bitmap.
+    if (opts.try_inverted) {
+        ws.bits.invert();
+        const r = scanBits(&ws);
+        if (r.found) |f| if (r.readable) return .{ .found = f, .transform = .inverted };
+        if (opts.try_mirrored) {
+            ws.bits.invert();
+            ws.bits.mirror();
+            const r2 = scanBits(&ws);
+            if (r2.found) |f| if (r2.readable) return .{ .found = f, .transform = .mirrored };
+            ws.bits.invert();
+            const r3 = scanBits(&ws);
+            if (r3.found) |f| if (r3.readable) return .{ .found = f, .transform = .inverted_mirrored };
+        }
+    } else if (opts.try_mirrored) {
+        ws.bits.mirror();
+        const r = scanBits(&ws);
+        if (r.found) |f| if (r.readable) return .{ .found = f, .transform = .mirrored };
+    }
+    if (first.found) |f| return .{ .found = f, .transform = .none };
+    return Error.NotFound;
+}
+
+const Attempt = struct { found: ?Found, readable: bool };
+
+/// One locate-and-sample pass over the already binarised bitmap in `ws`.
+fn scanBits(ws: *Workspace) Attempt {
+    const bits = &ws.bits;
     var finders: [max_candidates]Finder = undefined;
 
     // Two passes, strict first. The strict pass demands the ring: the outer
@@ -299,13 +383,13 @@ pub fn scan(img: Image, scratch: []u8) Error!Found {
         // grid and still has to decode it, and a symbol that scans but cannot
         // be read is still `qr.decode`'s verdict to give, not this module's.
         // What it does is choose between two grids of our own making.
-        if (readable(&got.found.matrix)) return got.found;
+        if (readable(&got.found.matrix)) return .{ .found = got.found, .readable = true };
         if (got.score > best_score) {
             best_score = got.score;
             best = got.found;
         }
     }
-    return best orelse Error.NotFound;
+    return .{ .found = best, .readable = false };
 }
 
 /// Whether `qr` can read this grid. `BufferTooSmall` counts as yes: the format
@@ -341,6 +425,29 @@ const Bitmap = struct {
     fn get(self: *const Bitmap, x: u32, y: u32) bool {
         const i = @as(usize, y) * self.width + x;
         return (self.bits[i >> 3] >> @intCast(i & 7)) & 1 != 0;
+    }
+
+    /// Flip every pixel's polarity (the padding bits past the last pixel are
+    /// never read).
+    fn invert(self: *Bitmap) void {
+        for (self.bits) |*b| b.* = ~b.*;
+    }
+
+    /// Mirror every row left-right, in place.
+    fn mirror(self: *Bitmap) void {
+        var y: u32 = 0;
+        while (y < self.height) : (y += 1) {
+            var x: u32 = 0;
+            while (x < self.width / 2) : (x += 1) {
+                const x2 = self.width - 1 - x;
+                const a = self.get(x, y);
+                const b = self.get(x2, y);
+                if (a != b) {
+                    self.set(x, y, b);
+                    self.set(x2, y, a);
+                }
+            }
+        }
     }
 
     fn set(self: *Bitmap, x: u32, y: u32, dark: bool) void {
@@ -1664,6 +1771,140 @@ test "scan finds and samples a rendered symbol, and decode reads it back" {
             try t.expectEqualStrings(text, try qr.decode(&fm, &out));
         }
     }
+}
+
+fn invertLuma(buf: []u8, img: Image) void {
+    for (buf[0 .. @as(usize, img.stride) * img.height]) |*v| v.* = 255 - v.*;
+}
+
+fn mirrorLuma(buf: []u8, img: Image) void {
+    for (0..img.height) |y| {
+        std.mem.reverse(u8, buf[y * img.stride ..][0..img.width]);
+    }
+}
+
+fn expectGrid(m: *const qr.Matrix, got: *const qr.Matrix) !void {
+    try std.testing.expectEqual(m.size, got.size);
+    for (0..m.size) |y| {
+        for (0..m.size) |x| {
+            try std.testing.expectEqual(m.isDark(@intCast(x), @intCast(y)), got.isDark(@intCast(x), @intCast(y)));
+        }
+    }
+}
+
+test "scanAny: plain, inverted, mirrored and both are found and report the transform" {
+    const t = std.testing;
+    const cases = [_]struct { inv: bool, mir: bool, want: Transform }{
+        .{ .inv = false, .mir = false, .want = .none },
+        .{ .inv = true, .mir = false, .want = .inverted },
+        .{ .inv = false, .mir = true, .want = .mirrored },
+        .{ .inv = true, .mir = true, .want = .inverted_mirrored },
+    };
+    const texts = [_][]const u8{ "HELLO WORLD", "https://example.com/x" };
+    var m: qr.Matrix = undefined;
+    var pixels: [512 * 512]u8 = undefined;
+    var scratch: [scratchSize(512, 512)]u8 = undefined;
+    var out: [256]u8 = undefined;
+
+    for (texts) |text| {
+        for ([_]u32{ 4, 7 }) |scale| {
+            for (cases) |c| {
+                try qr.encode(&m, text, .{ .ecc = .quartile });
+                const img = render(&m, scale, &pixels);
+                if (c.inv) invertLuma(&pixels, img);
+                if (c.mir) mirrorLuma(&pixels, img);
+                const r = try scanAny(img, &scratch, .{});
+                try t.expectEqual(c.want, r.transform);
+                try expectGrid(&m, &r.found.matrix);
+                var fm = r.found.matrix;
+                try t.expectEqualStrings(text, try qr.decode(&fm, &out));
+            }
+        }
+    }
+}
+
+test "scanAny: a plain symbol agrees with scan, module for module" {
+    var m: qr.Matrix = undefined;
+    var pixels: [256 * 256]u8 = undefined;
+    var scratch: [scratchSize(256, 256)]u8 = undefined;
+    try qr.encode(&m, "PLAIN PATH", .{ .ecc = .quartile });
+    const img = render(&m, 5, &pixels);
+    const a = try scan(img, &scratch);
+    const b = try scanAny(img, &scratch, .{});
+    try std.testing.expectEqual(Transform.none, b.transform);
+    try expectGrid(&a.matrix, &b.found.matrix);
+    try std.testing.expectEqual(a.module_px, b.found.module_px);
+}
+
+/// The result is either `NotFound` or a best-effort grid that `qr.decode` rejects
+/// (`scan` documents returning one; it is never reported as a successful read).
+fn expectNotRead(r: anytype) !void {
+    var out: [256]u8 = undefined;
+    if (r) |v| {
+        var fm = if (@hasField(@TypeOf(v), "found")) v.found.matrix else v.matrix;
+        try std.testing.expect(std.meta.isError(qr.decode(&fm, &out)));
+    } else |e| try std.testing.expectEqual(Error.NotFound, e);
+}
+
+test "scanAny: the options switch the retries off, and scan itself never retries" {
+    const t = std.testing;
+    var m: qr.Matrix = undefined;
+    var pixels: [256 * 256]u8 = undefined;
+    var scratch: [scratchSize(256, 256)]u8 = undefined;
+    try qr.encode(&m, "OPTIONS", .{ .ecc = .quartile });
+
+    // Inverted: needs try_inverted.
+    var img = render(&m, 5, &pixels);
+    invertLuma(&pixels, img);
+    try expectNotRead(scanAny(img, &scratch, .{ .try_inverted = false, .try_mirrored = false }));
+    try expectNotRead(scanAny(img, &scratch, .{ .try_inverted = false }));
+    try t.expectEqual(Transform.inverted, (try scanAny(img, &scratch, .{ .try_mirrored = false })).transform);
+    // `scan` reads dark-on-light only: an inverted image never yields a readable grid.
+    try expectNotRead(scan(img, &scratch));
+
+    // Mirrored: needs try_mirrored.
+    img = render(&m, 5, &pixels);
+    mirrorLuma(&pixels, img);
+    try expectNotRead(scanAny(img, &scratch, .{ .try_mirrored = false }));
+    try t.expectEqual(Transform.mirrored, (try scanAny(img, &scratch, .{ .try_inverted = false })).transform);
+
+    // Both: needs both switches.
+    img = render(&m, 5, &pixels);
+    invertLuma(&pixels, img);
+    mirrorLuma(&pixels, img);
+    try expectNotRead(scanAny(img, &scratch, .{ .try_mirrored = false }));
+    try expectNotRead(scanAny(img, &scratch, .{ .try_inverted = false }));
+    try t.expectEqual(Transform.inverted_mirrored, (try scanAny(img, &scratch, .{})).transform);
+}
+
+test "scanAny: errors match scan, and a blank image is NotFound under every transform" {
+    const t = std.testing;
+    var pixels: [64 * 64]u8 = undefined;
+    var scratch: [scratchSize(64, 64)]u8 = undefined;
+    @memset(&pixels, 200);
+    const img: Image = .{ .luma = &pixels, .width = 64, .height = 64, .stride = 64 };
+    try t.expectError(Error.NotFound, scanAny(img, &scratch, .{}));
+    try t.expectError(Error.BadImage, scanAny(.{ .luma = &pixels, .width = 10, .height = 64, .stride = 64 }, &scratch, .{}));
+    try t.expectError(Error.BadImage, scanAny(.{ .luma = &pixels, .width = 64, .height = 64, .stride = 8 }, &scratch, .{}));
+    try t.expectError(Error.ScratchTooSmall, scanAny(img, scratch[0..10], .{}));
+}
+
+test "Bitmap.invert and mirror: involutions that move the right pixels" {
+    const t = std.testing;
+    var mem: [(23 * 5 + 7) / 8]u8 = undefined;
+    @memset(&mem, 0);
+    var b: Bitmap = .{ .bits = &mem, .width = 23, .height = 5 };
+    b.set(0, 2, true);
+    b.set(5, 4, true);
+    b.mirror();
+    try t.expect(b.get(22, 2) and b.get(17, 4) and !b.get(0, 2) and !b.get(5, 4));
+    try t.expect(!b.get(11, 2)); // the odd width's centre column stays put
+    b.mirror();
+    try t.expect(b.get(0, 2) and b.get(5, 4));
+    b.invert();
+    try t.expect(!b.get(0, 2) and b.get(1, 2));
+    b.invert();
+    try t.expect(b.get(0, 2) and !b.get(1, 2));
 }
 
 /// Render rotated by `deg` about the image centre, by inverse-mapping each

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **New:** `scanAny(img, scratch, ScanOptions)` — `scan`, then only if that finds no readable symbol, the inverted (light-on-dark), mirrored and inverted+mirrored images (ZXing-style retries; both `try_inverted` and `try_mirrored` default on). Returns `ScannedAny{ found, transform }` with `Transform = none | inverted | mirrored | inverted_mirrored`. Binarisation runs once and retries flip/mirror the bitmap in place, so a first-attempt success costs what `scan` costs; `scan` is unchanged and no error was added.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0. comptime `strRepeat` helper: larger `@setEvalBranchQuota` (0.17 counts more branches per iteration).

@@ -405,7 +405,7 @@ tilt angles where only ZXing still reads the symbol). See `tools/README.md`.
 - **Multiple symbols per frame.** Candidates for several are already found; only
   the best triple is sampled. A wallet showing two codes at once is the case.
 
-- (survey 2026-09-30) **Inverted (light-on-dark) and mirrored symbols** — ZXing-family readers try them; a user scanning a dark-mode screen or a reflected code gets `NotFound` here. Effort: small-medium (re-run binarisation with flipped polarity; transposed sampling). Fits CONVENTIONS §2.
+- ✅ DONE 2026-11-16 (`scanAny(img, scratch, ScanOptions)` retries inverted, mirrored, then both after the plain attempt fails, on the already binarised bitmap; the result's `transform` says which; `scan` unchanged) (survey 2026-09-30) **Inverted (light-on-dark) and mirrored symbols** — ZXing-family readers try them; a user scanning a dark-mode screen or a reflected code gets `NotFound` here. Effort: small-medium (re-run binarisation with flipped polarity; transposed sampling). Fits CONVENTIONS §2.
 - (survey 2026-09-30) **Multiple symbols per image** — quirc, rqrr and ZXing return every code found; here only the best triple is sampled (already listed above under *Multiple symbols per frame*). Effort: medium (API returns a slice, scratch stays bounded). Fits §2.
 - (survey 2026-09-30) **Steeper tilt / curved surfaces** — ZXing-class readers read codes at much sharper angles (40° in the differential); here 25–30° about the vertical axis in the differential and 10–25° in the in-repo sweep (already listed above as *A mesh instead of one global map*). Effort: large. Fits §2.
 

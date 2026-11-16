@@ -18,6 +18,12 @@ var m = found.matrix;
 const text = try qr.decode(&m, &out);
 ```
 
+`scan` reads dark modules on a light ground only. `qrscan.scanAny(img, &scratch, .{})`
+does the same and, only when that finds nothing readable, retries the inverted
+(light-on-dark), mirrored and inverted+mirrored image, reporting in `.transform`
+which one matched (`.none`, `.inverted`, `.mirrored`, `.inverted_mirrored`).
+`ScanOptions.try_inverted` / `.try_mirrored` (both default on) switch a retry off.
+
 ## Luminance in, not a file
 
 The two sources that exist give different things and neither is a PNG:
