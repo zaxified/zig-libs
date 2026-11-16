@@ -30,6 +30,7 @@ const testing = std.testing;
 pub const base_ns = "urn:ietf:params:xml:ns:netconf:base:1.0";
 
 /// RFC 5277 §4 notification namespace.
+pub const with_defaults_ns = "urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults";
 pub const notification_ns = "urn:ietf:params:xml:ns:netconf:notification:1.0";
 
 pub const cap_base_1_0 = "urn:ietf:params:netconf:base:1.0";
@@ -45,6 +46,7 @@ pub const cap_startup = "urn:ietf:params:netconf:capability:startup:1.0";
 pub const cap_url = "urn:ietf:params:netconf:capability:url:1.0";
 pub const cap_xpath = "urn:ietf:params:netconf:capability:xpath:1.0";
 pub const cap_notification = "urn:ietf:params:netconf:capability:notification:1.0";
+pub const cap_with_defaults = "urn:ietf:params:netconf:capability:with-defaults:1.0";
 pub const cap_interleave = "urn:ietf:params:netconf:capability:interleave:1.0";
 
 /// What this client advertises by default: both base versions (so a
@@ -111,6 +113,7 @@ pub const Capabilities = struct {
     xpath: bool = false,
     notification: bool = false,
     interleave: bool = false,
+    with_defaults: bool = false,
 
     pub fn deinit(self: *Capabilities) void {
         for (self.list) |c| self.gpa.free(c);
@@ -160,6 +163,7 @@ pub const Capabilities = struct {
         self.xpath = self.has(cap_xpath);
         self.notification = self.has(cap_notification);
         self.interleave = self.has(cap_interleave);
+        self.with_defaults = self.has(cap_with_defaults);
     }
 };
 

@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [jiegec/netconf-rs](https://github.com/jiegec/netconf-rs) | Rust | MIT | 4 | push 2026-01-30 | Its description: "a rust library for NETCONF (RFC 6241)". Tiny; no leading Rust NETCONF crate found in a `netconf language:rust` search (best hit `mechubsec/rustnetconf`, MIT, 4 stars, a platform with YANG codegen — not comparable). |
 | [etnt/zinc](https://github.com/etnt/zinc) | Zig | MPL-2.0 | 0 | push 2025-01-25 | Its README: a NETCONF client CLI over TCP and SSH, NETCONF 1.0/1.1, hello / get-config with filter. The only Zig NETCONF client found; an application, not a library, and far narrower. |
 
-**Where we are ahead:** the only Zig NETCONF library found; RFC 6242 framing with both dialects and the hostile-input discipline, RFC 5277 notifications queued between reply and request, and typed builders for get, get-config, edit-config (all operations and test/error options), copy/delete-config, lock/unlock, commit incl. confirmed and persist, discard, validate, kill/close-session, create-subscription; XML via the sibling `xml` module with DOCTYPE refused · **Where we are behind:** no TLS transport or Call Home (libnetconf2), no server side, no vendor helpers (ncclient), no typed builders for `get-schema`, `cancel-commit`, `:with-defaults`, `:partial-lock`, NMDA `get-data`/`edit-data` (all reachable through `Rpc.raw`), no out-of-order reply dispatcher (SPEC "Deferred") (→ Backlog).
+**Where we are ahead:** the only Zig NETCONF library found; RFC 6242 framing with both dialects and the hostile-input discipline, RFC 5277 notifications queued between reply and request, and typed builders for get, get-config, edit-config (all operations and test/error options), copy/delete-config, lock/unlock, commit incl. confirmed and persist, discard, validate, kill/close-session, create-subscription; XML via the sibling `xml` module with DOCTYPE refused · **Where we are behind:** no TLS transport or Call Home (libnetconf2), no server side, no vendor helpers (ncclient), no typed builders for `get-schema`, `:partial-lock`, NMDA `get-data`/`edit-data` (all reachable through `Rpc.raw`), no out-of-order reply dispatcher (SPEC "Deferred") (→ Backlog).
 
 ## Design & invariants
 
@@ -376,7 +376,7 @@ Honest list of what this module does **not** do:
 * **YANG.** No schema model, no validation, no `get-schema`/`ietf-netconf-monitoring`
   helpers, no XPath evaluation. Filters and `<config>` bodies are opaque XML fragments; a
   YANG layer belongs above this module, not inside it.
-* **`:with-defaults` (RFC 6243), `:url` scheme validation, `:partial-lock` (RFC 5717),
+* **`:url` scheme validation, `:partial-lock` (RFC 5717),
   NMDA `<get-data>`/`<edit-data>` (RFC 8526).** `Rpc.raw` reaches all of them; none has a
   typed builder.
 * **Notification replay bookkeeping.** `create-subscription` (incl. `startTime`/`stopTime`)
@@ -408,6 +408,6 @@ Honest list of what this module does **not** do:
 Survey findings; `## Deferred` above remains the prose list of what is not done.
 
 - **`get-schema` and `ietf-netconf-monitoring` helpers (RFC 6022)** *(survey 2026-09-30)*. Discovering what a device supports (`<get>` of `/netconf-state/schemas`, then `get-schema`) is the first thing ncclient users do against an unknown device; today they hand-write it through `Rpc.raw`. Effort: small (two builders, one reply-shape reader). Fits CONVENTIONS §2. SPEC "Deferred" lists YANG as not done, which is about a schema *model*; these two RPCs are not.
-- **Typed `cancel-commit` and `:with-defaults` (RFC 6243) parameters** *(survey 2026-09-30)*. `commit` already models `confirmed`/`persist`/`persist-id`, but cancelling a persistent confirmed commit needs `Rpc.raw`. Effort: small. Fits §2.
+- **Typed `cancel-commit` and `:with-defaults` (RFC 6243) parameters** *(survey 2026-09-30)*. `commit` already models `confirmed`/`persist`/`persist-id`, but cancelling a persistent confirmed commit needs `Rpc.raw`. Effort: small. Fits §2. ✅ DONE 2026-11-16 (`Rpc.cancel_commit` / `Client.cancelCommit` with optional `persist-id`, gated on `:confirmed-commit:1.1`; `with_defaults: ?WithDefaults` on `Get`/`GetConfig`/`CopyConfig` emitting `<with-defaults>` in the RFC 6243 namespace with report-all/trim/explicit/report-all-tagged, gated on `:with-defaults`; the advertised basic-mode/also-supported parameters are not checked).
 - **NETCONF over TLS (RFC 7589) and Call Home (RFC 8071)** *(survey 2026-09-30)*. Provided by libnetconf2; used by devices managed by a controller that accepts inbound sessions. The `Transport` seam already takes any byte stream; the missing piece is TLS client-cert wiring from the `tlsclient` sibling and the reverse-connect listener. Effort: medium. Fits §2 (TLS is a sibling module, not a dependency of this one).
 - **Reply dispatcher for true pipelining** *(survey 2026-09-30)*. Listed under Deferred; a controller polling many RPCs on one session wants it. Effort: small-medium. Fits §2.
