@@ -21,6 +21,7 @@ const xml = @import("xml");
 
 pub const base_ns = caps.base_ns;
 pub const notification_ns = caps.notification_ns;
+pub const with_defaults_ns = caps.with_defaults_ns;
 
 /// A configuration datastore, as it appears inside `<source>`/`<target>`.
 /// `.url` requires the peer's `:url` capability (RFC 6241 §8.8).
@@ -143,18 +144,51 @@ pub const EditConfig = struct {
     error_option: ?ErrorOption = null,
 };
 
+/// RFC 6243 §3 retrieval mode of the `<with-defaults>` parameter. Needs the
+/// peer's `:with-defaults` capability (§4); `null` in the request structs means
+/// "do not send the parameter" (the server's basic mode applies).
+pub const WithDefaults = enum {
+    report_all,
+    trim,
+    explicit,
+    report_all_tagged,
+
+    pub fn wire(self: WithDefaults) []const u8 {
+        return switch (self) {
+            .report_all => "report-all",
+            .trim => "trim",
+            .explicit => "explicit",
+            .report_all_tagged => "report-all-tagged",
+        };
+    }
+};
+
 pub const GetConfig = struct {
     source: Datastore = .running,
     filter: Filter = .none,
+    /// RFC 6243 §4.5.1; needs `:with-defaults`.
+    with_defaults: ?WithDefaults = null,
 };
 
 pub const Get = struct {
     filter: Filter = .none,
+    /// RFC 6243 §4.5.2; needs `:with-defaults`.
+    with_defaults: ?WithDefaults = null,
 };
 
 pub const CopyConfig = struct {
     target: Datastore,
     source: ConfigSource,
+    /// RFC 6243 §4.5.3 (applies to the `<source>` when it is a datastore);
+    /// needs `:with-defaults`.
+    with_defaults: ?WithDefaults = null,
+};
+
+/// RFC 6241 §8.4.4.1 `<cancel-commit>`. Needs `:confirmed-commit:1.1`.
+pub const CancelCommit = struct {
+    /// `<persist-id>` — required to cancel a persistent confirmed commit that
+    /// was started by another session; null cancels this session's own.
+    persist_id: ?[]const u8 = null,
 };
 
 /// RFC 6241 §8.3.4.1 / §8.4.5.1 `<commit>`.
@@ -193,6 +227,7 @@ pub const Rpc = union(enum) {
     lock: Datastore,
     unlock: Datastore,
     commit: Commit,
+    cancel_commit: CancelCommit,
     discard_changes,
     validate: ConfigSource,
     close_session,
@@ -210,11 +245,12 @@ pub fn writeRpc(w: *std.Io.Writer, message_id: u64, rpc: Rpc) BuildError!void {
     try w.print("<rpc message-id=\"{d}\" xmlns=\"{s}\">\n", .{ message_id, base_ns });
     switch (rpc) {
         .get => |g| {
-            if (g.filter == .none) {
+            if (g.filter == .none and g.with_defaults == null) {
                 try w.writeAll("  <get/>\n");
             } else {
                 try w.writeAll("  <get>\n");
                 try writeFilter(w, g.filter, 4);
+                try writeWithDefaults(w, g.with_defaults, 4);
                 try w.writeAll("  </get>\n");
             }
         },
@@ -222,6 +258,7 @@ pub fn writeRpc(w: *std.Io.Writer, message_id: u64, rpc: Rpc) BuildError!void {
             try w.writeAll("  <get-config>\n");
             try writeDatastore(w, "source", g.source, 4);
             try writeFilter(w, g.filter, 4);
+            try writeWithDefaults(w, g.with_defaults, 4);
             try w.writeAll("  </get-config>\n");
         },
         .edit_config => |e| {
@@ -253,6 +290,7 @@ pub fn writeRpc(w: *std.Io.Writer, message_id: u64, rpc: Rpc) BuildError!void {
             try w.writeAll("  <copy-config>\n");
             try writeDatastore(w, "target", c.target, 4);
             try writeSource(w, c.source, 4);
+            try writeWithDefaults(w, c.with_defaults, 4);
             try w.writeAll("  </copy-config>\n");
         },
         .delete_config => |t| {
@@ -288,6 +326,15 @@ pub fn writeRpc(w: *std.Io.Writer, message_id: u64, rpc: Rpc) BuildError!void {
                     try w.writeAll("</persist-id>\n");
                 }
                 try w.writeAll("  </commit>\n");
+            }
+        },
+        .cancel_commit => |c| {
+            if (c.persist_id) |p| {
+                try w.writeAll("  <cancel-commit>\n    <persist-id>");
+                try writeEscaped(w, p);
+                try w.writeAll("</persist-id>\n  </cancel-commit>\n");
+            } else {
+                try w.writeAll("  <cancel-commit/>\n");
             }
         },
         .discard_changes => try w.writeAll("  <discard-changes/>\n"),
@@ -339,6 +386,12 @@ pub fn buildRpc(gpa: std.mem.Allocator, message_id: u64, rpc: Rpc) std.mem.Alloc
 
 fn indent(w: *std.Io.Writer, n: usize) BuildError!void {
     try w.splatByteAll(' ', n);
+}
+
+fn writeWithDefaults(w: *std.Io.Writer, wd: ?WithDefaults, ind: usize) BuildError!void {
+    const mode = wd orelse return;
+    try indent(w, ind);
+    try w.print("<with-defaults xmlns=\"{s}\">{s}</with-defaults>\n", .{ with_defaults_ns, mode.wire() });
 }
 
 fn writeDatastore(w: *std.Io.Writer, wrapper: []const u8, d: Datastore, ind: usize) BuildError!void {
@@ -1027,6 +1080,11 @@ test "every builder emits well-formed XML with the right envelope" {
         .{ .commit = .{} },
         .{ .commit = .{ .confirmed = true, .confirm_timeout = 60, .persist = "id-1" } },
         .{ .commit = .{ .persist_id = "id-1" } },
+        .{ .cancel_commit = .{} },
+        .{ .cancel_commit = .{ .persist_id = "id-1" } },
+        .{ .get = .{ .with_defaults = .trim } },
+        .{ .get_config = .{ .with_defaults = .report_all_tagged } },
+        .{ .copy_config = .{ .target = .startup, .source = .running, .with_defaults = .explicit } },
         .discard_changes,
         .{ .validate = .{ .config = "<a/>" } },
         .close_session,
@@ -1056,4 +1114,63 @@ test "escaping: a value can never forge the end-of-message delimiter" {
     defer gpa.free(got);
     try testing.expect(std.mem.find(u8, got, "]]>]]>") == null);
     try testing.expect(std.mem.find(u8, got, "]]&gt;]]&gt;") != null);
+}
+
+test "cancel-commit emits RFC 6241 §8.4.4.1 XML, with and without persist-id" {
+    const gpa = testing.allocator;
+    {
+        const got = try build(gpa, 7, .{ .cancel_commit = .{} });
+        defer gpa.free(got);
+        try expectSameStructure(got,
+            \\<rpc message-id="7" xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"><cancel-commit/></rpc>
+        );
+    }
+    {
+        const got = try build(gpa, 8, .{ .cancel_commit = .{ .persist_id = "IQ,d4668" } });
+        defer gpa.free(got);
+        try expectSameStructure(got,
+            \\<rpc message-id="8" xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            \\  <cancel-commit><persist-id>IQ,d4668</persist-id></cancel-commit></rpc>
+        );
+    }
+    {
+        // A hostile persist-id cannot inject markup.
+        const got = try build(gpa, 9, .{ .cancel_commit = .{ .persist_id = "a</persist-id><x/>" } });
+        defer gpa.free(got);
+        try testing.expect(std.mem.find(u8, got, "<x/>") == null);
+    }
+}
+
+test "with-defaults (RFC 6243) on get, get-config and copy-config" {
+    const gpa = testing.allocator;
+    const wd = "xmlns=\"urn:ietf:params:xml:ns:yang:ietf-netconf-with-defaults\"";
+    const modes = [_]WithDefaults{ .report_all, .trim, .explicit, .report_all_tagged };
+    const names = [_][]const u8{ "report-all", "trim", "explicit", "report-all-tagged" };
+    for (modes, names) |m, n| {
+        try testing.expectEqualStrings(n, m.wire());
+        var buf: [512]u8 = undefined;
+        {
+            const got = try build(gpa, 1, .{ .get_config = .{ .source = .running, .with_defaults = m } });
+            defer gpa.free(got);
+            const want = try std.fmt.bufPrint(&buf, "<rpc message-id=\"1\" xmlns=\"{s}\"><get-config><source><running/></source><with-defaults {s}>{s}</with-defaults></get-config></rpc>", .{ base_ns, wd, n });
+            try expectSameStructure(got, want);
+        }
+        {
+            const got = try build(gpa, 2, .{ .get = .{ .with_defaults = m } });
+            defer gpa.free(got);
+            const want = try std.fmt.bufPrint(&buf, "<rpc message-id=\"2\" xmlns=\"{s}\"><get><with-defaults {s}>{s}</with-defaults></get></rpc>", .{ base_ns, wd, n });
+            try expectSameStructure(got, want);
+        }
+        {
+            const got = try build(gpa, 3, .{ .copy_config = .{ .target = .startup, .source = .running, .with_defaults = m } });
+            defer gpa.free(got);
+            const want = try std.fmt.bufPrint(&buf, "<rpc message-id=\"3\" xmlns=\"{s}\"><copy-config><target><startup/></target><source><running/></source><with-defaults {s}>{s}</with-defaults></copy-config></rpc>", .{ base_ns, wd, n });
+            try expectSameStructure(got, want);
+        }
+    }
+    // Absent parameter: output is unchanged (bare <get/>).
+    const bare = try build(gpa, 4, .{ .get = .{} });
+    defer gpa.free(bare);
+    try testing.expect(std.mem.find(u8, bare, "<get/>") != null);
+    try testing.expect(std.mem.find(u8, bare, "with-defaults") == null);
 }

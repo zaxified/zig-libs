@@ -18,7 +18,8 @@ protocol operation, and typed `<rpc-reply>` / `<rpc-error>` parsing.
 - **Every standard operation** — `get`, `get-config`, `edit-config` (with
   `default-operation` / `test-option` / `error-option` and the `operation=` attribute),
   `copy-config`, `delete-config`, `lock`/`unlock`, `commit` (incl. confirmed commit with
-  `confirm-timeout`/`persist`), `discard-changes`, `validate`, `close-session`,
+  `confirm-timeout`/`persist`), `cancel-commit` (optional `persist-id`), the RFC 6243
+  `with-defaults` parameter on `get`/`get-config`/`copy-config`, `discard-changes`, `validate`, `close-session`,
   `kill-session`, plus RFC 5277 `create-subscription` — and a `raw` escape hatch that puts
   caller-supplied operation XML inside the correlated `<rpc>` envelope.
 - **Typed replies** — `<ok>`, `<data>`, or one-or-more `<rpc-error>` with every field
@@ -148,7 +149,8 @@ RFC 6241/5277 gate several operations behind a capability the peer must advertis
 `<hello>`: `:candidate` (§8.3) for anything naming `.candidate` as a source/target,
 `:startup` (§8.7) for `.startup`, `:url` (§8.8) for a `Datastore.url`/`EditPayload.url`,
 `:confirmed-commit` (§8.4) for `commit(.{.confirmed = true})`, `:validate` (§8.6) for
-`validate`, and RFC 5277 §3.1's `:notification` for `createSubscription`. By default (
+`validate`, `:confirmed-commit:1.1` for `cancelCommit`, RFC 6243's `:with-defaults` for any
+`with_defaults` parameter, and RFC 5277 §3.1's `:notification` for `createSubscription`. By default (
 `Options.check_capabilities = true`) `Client.send` checks the peer's parsed `<hello>`
 (`Client.serverCapabilities()`) against this list before writing anything to the wire, and
 fails locally with `error.CapabilityNotAdvertised` rather than round-tripping to find out
@@ -170,7 +172,7 @@ capability that announces it; for those, construct the `Client` with
 | `.send(Rpc) !u64` / `.receiveReply(id) !Reply` | pipelining seam; returns/consumes the `message-id` |
 | `.call(Rpc) !Reply` | send + correlated receive |
 | `.callOk(Rpc, ?*?Reply) !void` | `call` + `expectOk`, handing the failed reply back |
-| `.get` `.getConfig` `.editConfig` `.copyConfig` `.deleteConfig` `.lock` `.unlock` `.commit` `.discardChanges` `.validate` `.killSession` `.createSubscription` `.raw` | one wrapper per RFC 6241 §7/§8 operation |
+| `.get` `.getConfig` `.editConfig` `.copyConfig` `.deleteConfig` `.lock` `.unlock` `.commit` `.cancelCommit` `.discardChanges` `.validate` `.killSession` `.createSubscription` `.raw` | one wrapper per RFC 6241 §7/§8 operation |
 | `.closeSession()` | §7.8 graceful close |
 | `.nextNotification()` / `.awaitNotification()` | RFC 5277 events (queued while waiting for replies) |
 

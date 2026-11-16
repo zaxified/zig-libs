@@ -371,7 +371,13 @@ pub const Client = struct {
         const server = self.serverCapabilities() orelse return;
         var needed: [2]?[]const u8 = .{ null, null };
         switch (rpc) {
-            .get_config => |g| needed[0] = datastoreCapability(g.source),
+            .get => |g| if (g.with_defaults != null) {
+                needed[0] = capabilities.cap_with_defaults;
+            },
+            .get_config => |g| {
+                needed[0] = datastoreCapability(g.source);
+                if (g.with_defaults != null) needed[1] = capabilities.cap_with_defaults;
+            },
             .edit_config => |e| {
                 needed[0] = datastoreCapability(e.target);
                 needed[1] = switch (e.payload) {
@@ -382,6 +388,10 @@ pub const Client = struct {
             .copy_config => |c| {
                 needed[0] = datastoreCapability(c.target);
                 needed[1] = configSourceCapability(c.source);
+                // A third requirement: refuse up front rather than send a
+                // `<with-defaults>` the peer never offered (RFC 6243 §4).
+                if (c.with_defaults != null and !server.has(capabilities.cap_with_defaults))
+                    return error.CapabilityNotAdvertised;
             },
             .delete_config => |d| needed[0] = datastoreCapability(d),
             .lock => |d| needed[0] = datastoreCapability(d),
@@ -389,12 +399,14 @@ pub const Client = struct {
             .commit => |c| if (c.confirmed) {
                 needed[0] = capabilities.cap_confirmed_commit;
             },
+            // RFC 6241 §8.4.4.1: cancel-commit is part of :confirmed-commit:1.1.
+            .cancel_commit => needed[0] = capabilities.cap_confirmed_commit,
             .validate => |s| {
                 needed[0] = capabilities.cap_validate;
                 needed[1] = configSourceCapability(s);
             },
             .create_subscription => needed[0] = capabilities.cap_notification,
-            .get, .discard_changes, .close_session, .kill_session, .raw => {},
+            .discard_changes, .close_session, .kill_session, .raw => {},
         }
         for (needed) |maybe_cap| {
             const cap = maybe_cap orelse continue;
@@ -578,6 +590,10 @@ pub const Client = struct {
 
     pub fn commit(self: *Client, c: rpc_mod.Commit) SessionError!reply_mod.Reply {
         return self.call(.{ .commit = c });
+    }
+
+    pub fn cancelCommit(self: *Client, c: rpc_mod.CancelCommit) SessionError!reply_mod.Reply {
+        return self.call(.{ .cancel_commit = c });
     }
 
     pub fn discardChanges(self: *Client) SessionError!reply_mod.Reply {
@@ -1274,6 +1290,50 @@ test "check_capabilities (default true) refuses locally an operation the peer ne
     // The control: an operation naming no gated datastore/feature at all
     // must NOT be refused by the same client/peer pair.
     var r = try h.client.call(.{ .get = .{} });
+    r.deinit();
+}
+
+test "cancel-commit and with-defaults are refused locally without their capability" {
+    const gpa = testing.allocator;
+    const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1, capabilities.cap_confirmed_commit_1_0 }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+    const cases = [_]rpc_mod.Rpc{
+        .{ .cancel_commit = .{} }, // :confirmed-commit:1.0 is not enough
+        .{ .cancel_commit = .{ .persist_id = "x" } },
+        .{ .get = .{ .with_defaults = .trim } },
+        .{ .get_config = .{ .with_defaults = .explicit } },
+        .{ .copy_config = .{ .target = .{ .url = "file:///x" }, .source = .running, .with_defaults = .report_all } },
+        .{ .copy_config = .{ .target = .running, .source = .{ .config = "<a/>" }, .with_defaults = .report_all } },
+    };
+    for (cases) |op| try testing.expectError(error.CapabilityNotAdvertised, h.client.call(op));
+    // Without the parameter the same operations pass the check.
+    var r = try h.client.call(.{ .get_config = .{} });
+    r.deinit();
+}
+
+test "cancel-commit and with-defaults go out when advertised" {
+    const gpa = testing.allocator;
+    const h = try helloWith(gpa, &.{
+        capabilities.cap_base_1_0,
+        capabilities.cap_base_1_1,
+        capabilities.cap_confirmed_commit,
+        capabilities.cap_with_defaults ++ "?basic-mode=explicit&also-supported=trim,report-all",
+    }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+    try testing.expect(h.client.serverCapabilities().?.with_defaults);
+    const ops = [_]rpc_mod.Rpc{
+        .{ .cancel_commit = .{ .persist_id = "p1" } },
+        .{ .get = .{ .with_defaults = .report_all } },
+        .{ .get_config = .{ .with_defaults = .trim } },
+        .{ .copy_config = .{ .target = .running, .source = .{ .config = "<a/>" }, .with_defaults = .explicit } },
+    };
+    for (ops) |op| {
+        var r = try h.client.call(op);
+        r.deinit();
+    }
+    var r = try h.client.cancelCommit(.{});
     r.deinit();
 }
 
