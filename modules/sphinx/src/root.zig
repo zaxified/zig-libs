@@ -103,6 +103,10 @@ pub const max_hops = core.max_hops;
 pub const ProcessError = core.ProcessError;
 pub const ProcessResult = core.ProcessResult;
 pub const process = core.process;
+pub const processWithHook = core.processWithHook;
+pub const ProcessHookError = core.ProcessHookError;
+pub const ReplayHook = core.ReplayHook;
+pub const replay_tag_len = core.replay_tag_len;
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
 //

@@ -78,6 +78,23 @@ pub const AppendResp = struct {
     /// then sends is re-checked by the follower, so a wrong one costs round
     /// trips, never safety.
     index: LogIndex,
+    /// OPTIONAL conflict-term hint (§5.3's optimization; Raft thesis §5.3,
+    /// etcd-style), only on a failure caused by a log mismatch, and only when
+    /// `conflict_index != 0` (zero means "no hint": a legacy peer, a stale
+    /// term, or a success). `conflict_term` is the term of the follower's
+    /// entry at `prev_log_index` (0 when `prev_log_index` is past the
+    /// follower's end); `conflict_index` is the first index of that term in
+    /// the follower's log, or, past the end, one beyond its last index (so
+    /// `>= 1`). The leader resumes after its own last entry of
+    /// `conflict_term` if it has one, else at `conflict_index`: O(terms)
+    /// round trips for a divergent tail. Wire: the 18-byte frame is extended
+    /// to 34 bytes (`conflict_term`, `conflict_index`) only when a hint is
+    /// present; the tag has no version byte, so the decoder accepts both
+    /// lengths and an old peer's frames decode with no hint. An old decoder
+    /// refuses the 34-byte frame (a mixed-version cluster must upgrade
+    /// leaders first; a follower only sends it in reply to AppendEntries).
+    conflict_term: Term = 0,
+    conflict_index: LogIndex = 0,
 };
 
 pub const Tag = enum(u8) {
@@ -102,6 +119,8 @@ pub const Message = struct {
     pub const vote_req_len = 1 + 8 + 8 + 8;
     pub const vote_resp_len = 1 + 8 + 1;
     pub const append_resp_len = 1 + 8 + 1 + 8;
+    /// `append_resp_len` plus `conflict_term` and `conflict_index`.
+    pub const append_resp_hint_len = append_resp_len + 8 + 8;
     pub const append_header_len = 1 + 8 + 8 + 8 + 8 + 4;
     /// Per entry: term(8) kind(1) data length(4), then the data.
     pub const entry_header_len = 8 + 1 + 4;
@@ -111,7 +130,7 @@ pub const Message = struct {
         return switch (self.body) {
             .vote_req => vote_req_len,
             .vote_resp => vote_resp_len,
-            .append_resp => append_resp_len,
+            .append_resp => |a| if (a.conflict_index != 0) append_resp_hint_len else append_resp_len,
             .append_req => |a| blk: {
                 var n: usize = append_header_len;
                 for (a.entries) |e| n += entry_header_len + e.data.len;
@@ -142,7 +161,10 @@ pub const Message = struct {
                 std.mem.writeInt(u64, buf[1..9], a.term, .little);
                 buf[9] = @intFromBool(a.success);
                 std.mem.writeInt(u64, buf[10..18], a.index, .little);
-                return append_resp_len;
+                if (a.conflict_index == 0) return append_resp_len;
+                std.mem.writeInt(u64, buf[18..26], a.conflict_term, .little);
+                std.mem.writeInt(u64, buf[26..34], a.conflict_index, .little);
+                return append_resp_hint_len;
             },
             .append_req => |a| {
                 std.mem.writeInt(u64, buf[1..9], a.term, .little);
@@ -195,12 +217,22 @@ pub const Message = struct {
                 } };
             },
             .append_resp => blk: {
-                try exactLen(bytes, append_resp_len);
-                break :blk .{ .append_resp = .{
+                if (bytes.len < append_resp_len) return error.Truncated;
+                var r: AppendResp = .{
                     .term = try termAt(bytes, 1),
                     .success = try boolAt(bytes, 9),
                     .index = std.mem.readInt(u64, bytes[10..18], .little),
-                } };
+                };
+                if (bytes.len != append_resp_len) {
+                    // The hinted form: only a rejection carries one, and its
+                    // index is >= 1 (the first index of a term / one past the end).
+                    if (bytes.len < append_resp_hint_len) return error.Truncated;
+                    try exactLen(bytes, append_resp_hint_len);
+                    r.conflict_term = try termAt(bytes, 18);
+                    r.conflict_index = std.mem.readInt(u64, bytes[26..34], .little);
+                    if (r.success or r.conflict_index == 0) return error.InvalidEncoding;
+                }
+                break :blk .{ .append_resp = r };
             },
             .append_req => .{ .append_req = try decodeAppend(bytes, entries_out) },
         };
@@ -314,6 +346,8 @@ test "every message kind round-trips, entries with their bytes" {
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .vote_req = .{ .term = 4, .last_log_index = 9, .last_log_term = 3 } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .vote_resp = .{ .term = 4, .granted = true } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .append_resp = .{ .term = 4, .success = false, .index = 17 } } });
+    try roundTrip(.{ .from = 1, .to = 2, .body = .{ .append_resp = .{ .term = 4, .success = false, .index = 17, .conflict_term = 3, .conflict_index = 9 } } });
+    try roundTrip(.{ .from = 1, .to = 2, .body = .{ .append_resp = .{ .term = 4, .success = false, .index = 17, .conflict_term = 0, .conflict_index = 18 } } });
     const es = [_]Entry{
         .{ .index = 6, .term = 2, .kind = .noop },
         .{ .index = 7, .term = 3, .data = "set k v" },
@@ -502,4 +536,29 @@ test "corpus: every message seed reaches the decoder, and what it accepted is pi
     try testing.expectEqual(@as(usize, 5), accepted);
     // The number a heartbeat-only corpus cannot produce.
     try testing.expectEqual(@as(usize, 2), entries);
+}
+
+test "append_resp conflict hint: optional on the wire, legacy frames still decode, bad ones refused" {
+    var scratch: [1]Entry = undefined;
+    var buf: [40]u8 = undefined;
+    // No hint: the 18-byte legacy frame, decoding to a zero hint.
+    const plain: Message = .{ .from = 1, .to = 2, .body = .{ .append_resp = .{ .term = 4, .success = false, .index = 17 } } };
+    try testing.expectEqual(Message.append_resp_len, plain.encode(&buf));
+    const d = try Message.decode(buf[0..Message.append_resp_len], 1, 2, &scratch);
+    try testing.expectEqual(@as(LogIndex, 0), d.body.append_resp.conflict_index);
+    // Hinted: 34 bytes.
+    const hinted: Message = .{ .from = 1, .to = 2, .body = .{ .append_resp = .{ .term = 4, .success = false, .index = 17, .conflict_term = 2, .conflict_index = 5 } } };
+    try testing.expectEqual(Message.append_resp_hint_len, hinted.encode(&buf));
+    // In-between, too long, a success with a hint, a zero conflict index, a term above max.
+    try testing.expectError(error.Truncated, Message.decode(buf[0..30], 1, 2, &scratch));
+    try testing.expectError(error.InvalidEncoding, Message.decode(buf[0..35], 1, 2, &scratch));
+    var bad = buf;
+    bad[9] = 1;
+    try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..34], 1, 2, &scratch));
+    bad = buf;
+    @memset(bad[26..34], 0);
+    try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..34], 1, 2, &scratch));
+    bad = buf;
+    std.mem.writeInt(u64, bad[18..26], types.max_term + 1, .little);
+    try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..34], 1, 2, &scratch));
 }

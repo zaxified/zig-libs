@@ -327,7 +327,7 @@ new ones); `kat_test.zig` now carries zero skips:
 ## Backlog / deferred
 
 - **Failure-message obfuscation / decryption (BOLT#4 "Returning Errors")** *(survey 2026-09-30)* — a forwarding node must wrap failures and a sender must unwrap them to learn which hop failed; without it neither role works. Reuses the shared secrets already derived. Effort: small-medium; fits §2.
-- **Replay-protection hook** *(survey 2026-09-30)* — expose the per-hop shared-secret hash (`SHA256(ss)`, BOLT#4 replay rule) so a caller can plug a log; lnd ships `replaylog`. Effort: small; fits §2.
+- ✅ DONE 2026-11-16 (`ProcessResult.replay_tag` = SHA256(ss); `processWithHook` + `ReplayHook`, consulted after the HMAC check, refusal = `error.Replayed`; nothing stored) **Replay-protection hook** *(survey 2026-09-30)* — expose the per-hop shared-secret hash (`SHA256(ss)`, BOLT#4 replay rule) so a caller can plug a log; lnd ships `replaylog`. Effort: small; fits §2.
 - **Route blinding (BOLT#4 "Route Blinding")** *(survey 2026-09-30)* — blinded-path construction and receiving (blinded payment hops, `path_key` tweak); needed for BOLT#12 payments. Effort: medium; fits §2. (The survey lists it as missing and it matters.)
 
 ## Anchoring

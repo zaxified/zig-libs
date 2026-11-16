@@ -91,7 +91,12 @@ What moved into it from the old netsim plumbing, and what changed on the way:
   `fingerprint` (index, term, kind, bytes), so the kernel's log and the
   invariant checkers compare content, not just terms.
 - **Rejections carry a hint** (the follower's last index), so a gap costs one
-  round trip; `nextIndex` never drops below `matchIndex + 1`, and a leader
+  round trip; since 2026-11-16 also a **conflict-term hint** (§5.3: the term of
+  the follower's entry at `prevLogIndex` and the first index of it, or one past
+  its end), on the optional 34-byte `append_resp` frame, so a divergent tail
+  costs O(terms) round trips — the leader resumes after its own last entry of
+  that term, else at the follower's first index of it (`message.AppendResp`;
+  the 18-byte frame still decodes, as "no hint"); `nextIndex` never drops below `matchIndex + 1`, and a leader
   retries at once only when a reply moved it (no duplicated streams).
 - **Batch decoding is fail-closed for honesty too:** an AppendEntries whose entry
   terms decrease, are 0, exceed the message term or undercut `prev_log_term`, or
@@ -388,7 +393,7 @@ linearizable reads are the core items, still in the Backlog.
 
 9. (review 2026-10-04, M3) A torn-Ready crash fault in the harness: crash a server after it persisted part of a Ready, or after it sent but before `advance`, so the sweep — not only the unit tests — checks the persist-before-send order. Effort: medium.
 10. (review 2026-10-04, M1/M2) Flow control and hostile-peer limits: a byte cap per AppendEntries (today an entry cap), an in-flight window, a term-jump bound or counter. Effort: medium.
-11. (review 2026-10-04) A conflict-term hint (§5.3's optimization) so a follower with a long divergent tail costs O(terms) round trips, not O(tail). Effort: small.
+11. ✅ DONE 2026-11-16 (`message.AppendResp.conflict_term/conflict_index`, optional 34-byte frame; `Node` follower fills it, leader uses it) (review 2026-10-04) A conflict-term hint (§5.3's optimization) so a follower with a long divergent tail costs O(terms) round trips, not O(tail). Effort: small.
 
 ## Anchoring
 
