@@ -39,7 +39,7 @@ this repo: `ratelimit` (per-key rate, 429), `abuseguard` (per-IP connections) an
 (503 plus `Retry-After`, released on handler error); lock-free CAS semaphore, no allocation,
 bounded waiter set, an 8-thread over-admission stress test. **Where we are behind:** adaptive
 limit discovery (Netflix Gradient/Vegas, Envoy adaptive filter), FIFO fairness and weighted
-acquires (Go semaphore) and partitioned/priority limits (→ Backlog).
+acquires (Go semaphore) and priority limits (partitioned limits now exist: `Partitioned`).
 
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — design references only, no source copied).
 
@@ -108,7 +108,7 @@ Adaptive limit discovery (Netflix Gradient-style AIMD on observed latency) — d
 README, not implemented.
 
 - **(survey 2026-09-30) Adaptive limit discovery** — already the item above; it is the defining feature of the design this module is modelled on (Netflix concurrency-limits, Envoy's adaptive concurrency filter), and a static `max_in_flight` goes stale when the service auto-scales. Effort: medium (a limit algorithm fed by observed latency, Vegas/Gradient2-style; needs the injected `Clock`). Fits §2: yes.
-- **(survey 2026-09-30) Partitioned or priority limits** (e.g. reserve slots for health checks or a paying tier; Netflix ships partitioned limiters *(inferred)*) — today one shared budget, so a flood of low-value requests can starve important ones. Effort: small–medium. Fits §2: yes.
+- **(survey 2026-09-30) Partitioned or priority limits** (e.g. reserve slots for health checks or a paying tier; Netflix ships partitioned limiters *(inferred)*) — today one shared budget, so a flood of low-value requests can starve important ones. Effort: small–medium. Fits §2: yes. ✅ DONE 2026-11-16 (`Partitioned`: up to 16 partitions with guaranteed percentage shares, borrowing of unused capacity, admit when under own share OR total < max_in_flight; shares > 100 % / empty / > 16 / zero limit = `PartitionError`, never a panic; `middleware()` with a `classify` callback; no waiting; the total may exceed `max_in_flight` by at most the sum of guarantees, as in Netflix)
 - Weighted acquires and FIFO fairness are refused by the SPEC's own design note (barging, no per-waiter queue memory).
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
