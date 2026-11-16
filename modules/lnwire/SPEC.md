@@ -6,7 +6,7 @@
 
 **Scope:** core — LDK `lightning::ln::msgs` / lnd `lnwire` (BOLT#1/2/7 message sets) (surveyed 2026-09-30; re-assessed 2026-10-06 against that survey, no new survey: mvp -> core after `channel_reestablish`, `update_fail_malformed_htlc`, `announcement_signatures`, `gossip_timestamp_filter`, typed address descriptors and feature-bit helpers landed)
 
-**Audit:** review 2026-09-03 · mutation 2026-10-05 (36/36) · src ?
+**Audit:** review 2026-09-03 · mutation 2026-11-17 (126/127, 1 eq) · src ?
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, LNWIRE_FUZZ) · ct n/a — public wire messages (keyword review, 2026-10-07)
 
@@ -287,6 +287,24 @@ octet short of its signature block and exactly at it, 65536 `htlc_signatures` re
 `FieldTooLong`, `init`'s `remote_addr` (type 3) kept. Equivalent: none.
 
 Run: `zig build test-lnwire` (Debug and `-Doptimize=ReleaseFast`).
+
+**Audit 2026-11-17 (delta mutation).** 91 schemata mutants over the typed TLV records added the same day
+(`bolt1.zig`: the `networks` iterator, `checkInitTlvs`, `Init.networks`/`remoteAddr`; `bolt2.zig`: `ChannelType`,
+`AttributionData`, `FeeRange`, their length checks, accessors and encode/decode hooks on `open_channel`,
+`accept_channel`, `update_fulfill_htlc`, `update_fail_htlc`, `closing_signed`; `bolt7.zig`: `QueryFlags`,
+`checkQueryFlags`, `checkQueryOption`, the two accessors and the decode/serialize hooks), ReleaseSafe, one build,
+each mutant under `setsid -w timeout` and `ulimit -v`: length guards (dropped, one short), modulus and boundary
+constants, the looked-up TLV type, byte order and offsets of the 920- and 16-octet encodings, the `bigsize`
+walk, the `errdefer` after `decodeExtension`, the decode- and encode-time check calls, the swallowed error in a
+check, and the accessors' own guards. First run: 73 killed (1 HANG: a position that stops advancing), 18
+survived. Six tests added: the refusal paths run under the leak-detecting allocator (the older tests used an
+arena, so a missing `errdefer` was invisible), `networks` of 16 and 48 octets, accessors and the iterator on
+hand-built values (a malformed record yields `null`, never an out-of-range read), the exact-length boundaries
+of `attribution_data` and `fee_range`, a compressed `query_flags` whose bytes would not parse as bigsizes, and
+`ChannelType.minimal`; the rerun killed 17. 1 is EQUIVALENT: starting the `query_flags` walk at 0 instead of 1
+(the walk only runs for encoding 0, and that octet decodes as the canonical one-octet bigsize 0, which advances by
+exactly one). The TLV type constants and the known-type arrays are comptime and are not mutated. 90 killed + 1 eq
+= 91; the card's counts are cumulative with the 2026-10-05 run (36/36).
 
 ## Status
 

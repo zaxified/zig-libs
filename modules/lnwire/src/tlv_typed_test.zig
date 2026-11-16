@@ -356,3 +356,143 @@ test "typed TLV: query_short_channel_ids query_flags; vendored zlib vectors; mal
     }
     try testing.expect(seen >= 1);
 }
+
+// ── delta mutation audit 2026-11-17 ─────────────────────────────────────
+// Tests added for survivors: the error paths free the extension (checked with
+// the leak-detecting allocator, not an arena), the accessors on a message that
+// was built by hand (not decoded) refuse a malformed record instead of reading
+// past it, exact-length boundaries, and a compressed `query_flags`.
+
+/// `msg_type` followed by `n` zero bytes.
+fn zeroFrame(a: Allocator, msg_type: u16, n: usize) ![]u8 {
+    const out = try a.alloc(u8, 2 + n);
+    std.mem.writeInt(u16, out[0..2], msg_type, .big);
+    @memset(out[2..], 0);
+    return out;
+}
+
+fn recs(r: []const tlv.RawRecord) message.Extension {
+    return .{ .records = @constCast(r) };
+}
+
+test "typed TLV: a refused decode frees what it had read (leak-detecting allocator)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const la = testing.allocator;
+
+    const init_base = try zeroFrame(a, bolt1.INIT_TYPE, 4);
+    const networks_bad = try withTlvs(a, init_base, &.{.{ .type = 1, .value = &@as([33]u8, @splat(1)) }});
+    try testing.expectError(error.InvalidTlvLength, bolt1.decodeInit(la, networks_bad));
+
+    const fulfill_base = try zeroFrame(a, bolt2.UPDATE_FULFILL_HTLC_TYPE, 72);
+    const fulfill_bad = try withTlvs(a, fulfill_base, &.{.{ .type = 1, .value = &@as([10]u8, @splat(1)) }});
+    try testing.expectError(error.InvalidTlvLength, bolt2.decodeUpdateFulfillHtlc(la, fulfill_bad));
+
+    const fail_base = try zeroFrame(a, bolt2.UPDATE_FAIL_HTLC_TYPE, 42);
+    const fail_bad = try withTlvs(a, fail_base, &.{.{ .type = 1, .value = &@as([10]u8, @splat(1)) }});
+    try testing.expectError(error.InvalidTlvLength, bolt2.decodeUpdateFailHtlc(la, fail_bad));
+
+    const closing_base = try zeroFrame(a, bolt2.CLOSING_SIGNED_TYPE, 104);
+    const closing_bad = try withTlvs(a, closing_base, &.{.{ .type = 1, .value = &@as([15]u8, @splat(1)) }});
+    try testing.expectError(error.InvalidTlvLength, bolt2.decodeClosingSigned(la, closing_bad));
+
+    const qsci_base = try zeroFrame(a, bolt7.QUERY_SHORT_CHANNEL_IDS_TYPE, 32 + 2);
+    const qsci_bad = try withTlvs(a, qsci_base, &.{.{ .type = 1, .value = &.{} }});
+    try testing.expectError(error.InvalidTlvLength, bolt7.decodeQueryShortChannelIds(la, qsci_bad));
+
+    const qcr_base = try zeroFrame(a, bolt7.QUERY_CHANNEL_RANGE_TYPE, 32 + 8);
+    const qcr_bad = try withTlvs(a, qcr_base, &.{.{ .type = 1, .value = &.{ 0x03, 0x00 } }});
+    try testing.expectError(error.InvalidTlvLength, bolt7.decodeQueryChannelRange(la, qcr_bad));
+}
+
+test "typed TLV: networks is a whole number of 32-octet hashes, not of 16" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = try zeroFrame(a, bolt1.INIT_TYPE, 4);
+    for ([_]usize{ 16, 48 }) |n| {
+        const body = try a.alloc(u8, n);
+        @memset(body, 2);
+        try testing.expectError(error.InvalidTlvLength, bolt1.decodeInit(a, try withTlvs(a, base, &.{.{ .type = 1, .value = body }})));
+        const msg: bolt1.Init = .{ .globalfeatures = &.{}, .features = &.{}, .extension = .{ .records = @constCast(&[_]tlv.RawRecord{.{ .type = 1, .value = body }}) } };
+        try testing.expectError(error.InvalidTlvLength, bolt1.serializeInit(a, msg));
+    }
+}
+
+test "typed TLV: hand-built values: iterator over an unaligned value, networks() of a bad record" {
+    // 63 bytes: one hash, then 31 left over, which is not a hash.
+    const raw: [63]u8 = @splat(7);
+    var it: bolt1.NetworksIterator = .{ .bytes = &raw };
+    try testing.expectEqualSlices(u8, &@as([32]u8, @splat(7)), &it.next().?);
+    try testing.expect(it.next() == null);
+    // exactly one hash is returned (the boundary is "fewer than 32 left")
+    const one: [32]u8 = @splat(9);
+    var it1: bolt1.NetworksIterator = .{ .bytes = &one };
+    try testing.expect(it1.next() != null);
+    try testing.expect(it1.next() == null);
+
+    const bad33: [33]u8 = @splat(1);
+    const bad_msg: bolt1.Init = .{ .globalfeatures = &.{}, .features = &.{}, .extension = recs(&.{.{ .type = 1, .value = &bad33 }}) };
+    try testing.expect(bad_msg.networks() == null);
+    const good64: [64]u8 = @splat(1);
+    const good_msg: bolt1.Init = .{ .globalfeatures = &.{}, .features = &.{}, .extension = recs(&.{.{ .type = 1, .value = &good64 }}) };
+    try testing.expectEqual(@as(usize, 2), good_msg.networks().?.count());
+}
+
+test "typed TLV: accessors on a hand-built message refuse a record of the wrong length" {
+    const wire: usize = bolt2.AttributionData.wire_len;
+    const lens = [_]usize{ wire - 1, wire + 1 };
+    var buf: [wire + 1]u8 = @splat(5);
+    for (lens) |n| {
+        const ext: message.Extension = .{ .records = @constCast(&[_]tlv.RawRecord{.{ .type = 1, .value = buf[0..n] }}) };
+        const ful: bolt2.UpdateFulfillHtlc = .{ .channel_id = @splat(0), .id = 0, .payment_preimage = @splat(0), .extension = ext };
+        try testing.expect(ful.attributionData() == null);
+        const fail: bolt2.UpdateFailHtlc = .{ .channel_id = @splat(0), .id = 0, .reason = &.{}, .extension = ext };
+        try testing.expect(fail.attributionData() == null);
+    }
+    const ok_ext: message.Extension = .{ .records = @constCast(&[_]tlv.RawRecord{.{ .type = 1, .value = buf[0..wire] }}) };
+    const ful_ok: bolt2.UpdateFulfillHtlc = .{ .channel_id = @splat(0), .id = 0, .payment_preimage = @splat(0), .extension = ok_ext };
+    try testing.expect(ful_ok.attributionData() != null);
+    const fail_ok: bolt2.UpdateFailHtlc = .{ .channel_id = @splat(0), .id = 0, .reason = &.{}, .extension = ok_ext };
+    try testing.expect(fail_ok.attributionData() != null);
+
+    var fee: [17]u8 = @splat(1);
+    for ([_]usize{ 15, 17 }) |n| {
+        const cs: bolt2.ClosingSigned = .{ .channel_id = @splat(0), .fee_satoshis = 0, .signature = @splat(0), .extension = .{ .records = @constCast(&[_]tlv.RawRecord{.{ .type = 1, .value = fee[0..n] }}) } };
+        try testing.expect(cs.feeRange() == null);
+    }
+    const cs_ok: bolt2.ClosingSigned = .{ .channel_id = @splat(0), .fee_satoshis = 0, .signature = @splat(0), .extension = .{ .records = @constCast(&[_]tlv.RawRecord{.{ .type = 1, .value = fee[0..16] }}) } };
+    try testing.expect(cs_ok.feeRange() != null);
+}
+
+test "typed TLV: query_flags()/queryOption() on a hand-built message with a malformed record" {
+    const empty: [0]u8 = .{};
+    const qs: bolt7.QueryShortChannelIds = .{ .chain_hash = @splat(0), .encoded_short_ids = &.{}, .extension = recs(&.{.{ .type = 1, .value = &empty }}) };
+    try testing.expect(qs.queryFlags() == null);
+    const qs2: bolt7.QueryShortChannelIds = .{ .chain_hash = @splat(0), .encoded_short_ids = &.{}, .extension = recs(&.{.{ .type = 1, .value = &.{0} }}) };
+    try testing.expectEqual(@as(usize, 0), qs2.queryFlags().?.data.len);
+
+    for ([_][]const u8{ &.{}, &.{ 0x03, 0x00 }, &.{ 0xfd, 0x00, 0x03 } }) |bad_v| {
+        const qr: bolt7.QueryChannelRange = .{ .chain_hash = @splat(0), .first_blocknum = 0, .number_of_blocks = 0, .extension = .{ .records = @constCast(&[_]tlv.RawRecord{.{ .type = 1, .value = bad_v }}) } };
+        try testing.expect(qr.queryOption() == null);
+    }
+}
+
+test "typed TLV: a compressed query_flags is carried whatever its bytes look like" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const chain: [32]u8 = @splat(0x11);
+    const head = try std.mem.concat(a, u8, &.{ &[_]u8{ 0x01, 0x05 }, &chain, &[_]u8{ 0x00, 0x01, 0x00 } });
+    // encoding 1 (zlib) followed by bytes that would not parse as bigsizes
+    const z = try bolt7.decodeQueryShortChannelIds(a, try withTlvs(a, head, &.{.{ .type = 1, .value = &.{ 0x01, 0xfd, 0x00, 0x01 } }}));
+    try testing.expectEqual(@as(u8, 1), z.queryFlags().?.encoding_type);
+    try testing.expectEqual(@as(usize, 3), z.queryFlags().?.data.len);
+}
+
+test "typed TLV: ChannelType.minimal trims leading zero octets" {
+    const ct: bolt2.ChannelType = .{ .bits = &.{ 0x00, 0x00, 0x10, 0x01 } };
+    try testing.expectEqualSlices(u8, &.{ 0x10, 0x01 }, ct.minimal());
+    try testing.expect(ct.isSet(0) and ct.isSet(12) and !ct.isSet(1));
+}
