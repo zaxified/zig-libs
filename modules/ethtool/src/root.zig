@@ -127,6 +127,8 @@ pub const eee_fec = @import("eee_fec.zig");
 pub const wol = @import("wol.zig");
 /// `PRIVFLAGS_GET`/`SET`.
 pub const privflags = @import("privflags.zig");
+/// `RSS_GET` (hash function, key, indirection table).
+pub const rss = @import("rss.zig");
 /// `TSINFO_GET`.
 pub const tsinfo = @import("tsinfo.zig");
 /// The socket client and the `monitor` notification socket.
@@ -181,6 +183,7 @@ pub const WolSet = wol.WolSet;
 pub const Privflags = privflags.Privflags;
 pub const PrivflagsSet = privflags.PrivflagsSet;
 pub const TsInfo = tsinfo.TsInfo;
+pub const Rss = rss.Rss;
 
 // ── offline request encoders ───────────────────────────────────────────────
 //
@@ -223,6 +226,7 @@ pub const buildSetWol = wol.buildSetWol;
 pub const buildPrivflags = privflags.buildPrivflags;
 pub const buildSetPrivflags = privflags.buildSetPrivflags;
 pub const buildTsInfo = tsinfo.buildTsInfo;
+pub const buildRss = rss.buildRss;
 
 pub const Port = uapi.Port;
 pub const Duplex = uapi.Duplex;
@@ -830,6 +834,20 @@ test "live: the typed EEE/FEC/PRIVFLAGS/TSINFO GETs answer or skip cleanly" {
     if (ran == 0) return skip("no device implements any of TSINFO/EEE/FEC/PRIVFLAGS/WOL");
 }
 
+test "live: RSS_GET answers or skips cleanly" {
+    var et = try openOrSkip();
+    defer et.close();
+    var buf: [uapi.ifnamesize]u8 = undefined;
+    const dev = try targetOrSkip(&buf);
+    var r = et.rss(dev, null) catch |e| switch (e) {
+        // Virtual / non-RSS devices answer EOPNOTSUPP; unprivileged is fine.
+        error.NotSupported, error.AccessDenied, error.NoSuchDevice => return skip("device does not answer RSS_GET"),
+        else => return e,
+    };
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings(dev.name, r.device.name());
+}
+
 // ── dark-tests aggregator ──────────────────────────────────────────────────
 // A bare `pub const x = @import(…)` re-export does NOT pull x's tests into the
 // test binary (CONVENTIONS §6.3).
@@ -847,6 +865,7 @@ test {
     _ = wol;
     _ = privflags;
     _ = tsinfo;
+    _ = rss;
     _ = client;
     _ = ioctl;
     _ = @import("goldens.zig");

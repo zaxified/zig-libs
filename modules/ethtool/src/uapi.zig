@@ -563,6 +563,24 @@ pub const PRIVFLAGS = struct {
     pub const FLAGS: u16 = 2;
 };
 
+pub const RSS = struct {
+    pub const HEADER: u16 = 1;
+    /// u32: RSS context id (request: which context; reply: the one answered).
+    pub const CONTEXT: u16 = 2;
+    /// u32: hash-function mask (`ETH_RSS_HASH_*`, see `rss.rss_hfunc`).
+    pub const HFUNC: u16 = 3;
+    /// Binary: the indirection table, an array of u32 queue numbers.
+    pub const INDIR: u16 = 4;
+    /// Binary: the hash key.
+    pub const HKEY: u16 = 5;
+    /// u32: input transformation, `RXH_XFRM_*`.
+    pub const INPUT_XFRM: u16 = 6;
+    /// u32 (dump only): first context to list. Not used by this module.
+    pub const START_CONTEXT: u16 = 7;
+    /// Nest of per-flow-type hash fields. Not decoded by this module.
+    pub const FLOW_HASH: u16 = 8;
+};
+
 pub const TSINFO = struct {
     pub const HEADER: u16 = 1;
     /// Bitset of `SOF_TIMESTAMPING_*` capabilities (`ETH_SS_SOF_TIMESTAMPING`).

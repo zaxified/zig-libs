@@ -57,6 +57,7 @@ const eee_fec = @import("eee_fec.zig");
 const wol_mod = @import("wol.zig");
 const privflags_mod = @import("privflags.zig");
 const tsinfo_mod = @import("tsinfo.zig");
+const rss_mod = @import("rss.zig");
 
 /// `NETLINK_ADD_MEMBERSHIP` / `NETLINK_DROP_MEMBERSHIP` (linux/netlink.h) —
 /// used by `EventSocket` below.
@@ -614,6 +615,17 @@ pub const Ethtool = struct {
         const seq = cl.sock.nextSeq();
         const msg = try privflags_mod.buildSetPrivflags(cl.allocator(), cl.family_id, seq, target, set);
         try cl.exchangeAck(msg, seq, uapi.PRIVFLAGS.HEADER, target);
+    }
+
+    /// `ETHTOOL_MSG_RSS_GET` — hash function, hash key and indirection table
+    /// (`ethtool -x`). `context` picks a non-default RSS context. Unprivileged;
+    /// `NotSupported` when the device has no RSS. Free with `deinit`.
+    pub fn rss(cl: *Ethtool, target: header.Target, context: ?u32) RequestError!rss_mod.Rss {
+        const seq = cl.sock.nextSeq();
+        const msg = try rss_mod.buildRss(cl.allocator(), cl.family_id, seq, target, context);
+        var reply = try cl.exchangeGet(msg, seq, uapi.RSS.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return rss_mod.parseRss(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
     }
 
     /// `ETHTOOL_MSG_TSINFO_GET` — timestamping capabilities and the PTP
