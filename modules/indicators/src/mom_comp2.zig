@@ -370,7 +370,36 @@ pub fn stochrsiLookback(p: StochrsiParams) Error!usize {
 }
 /// Outputs fast %K and fast %D of the RSI.
 pub fn stochrsi(comptime T: type, gpa: std.mem.Allocator, in: []const T, fastk: []T, fastd: []T, p: StochrsiParams) core.AllocError!usize {
+    if (T == f64) {
+        try STOCHRSI.validate(p);
+        if (fastk.len != in.len or fastd.len != in.len) return error.BadParam;
+        try stochrsiRun(in, fastk, fastd, p);
+        return STOCHRSI.lookback(p);
+    }
     return vs.batchScratch(T, STOCHRSI, gpa, p, .{ .x = in }, .{ fastk, fastd });
+}
+
+/// The f64 batch of `STOCHRSI.step`, bitwise, as three passes over series instead of three cores per bar: the RSI
+/// into `fastk`, the stochastic of the RSI values (`stoch.kSeries`, the same automaton) into `fastd`, its average
+/// (`stoch.maStage`, one dispatch) back into `fastk`, then the two swapped and blanked before the first %D.
+fn stochrsiRun(in: []const f64, fastk: []f64, fastd: []f64, p: StochrsiParams) Error!void {
+    const nan = std.math.nan(f64);
+    const rp = rsi_.RsiParams{ .period = p.period, .unstable = p.unstable };
+    var rc = try rsi_.RsiCore.init(rp);
+    for (in, fastk) |x, *o| o.* = rc.step(NoSrc{}, x) orelse nan;
+    // The RSI answers from its lookback on, every bar.
+    const lbr = @min(rsi_.RsiCore.lookback(rp), in.len);
+    @memset(fastd[0..lbr], nan);
+    const r = fastk[lbr..];
+    stoch_.kSeries(f64, r, r, r, fastd[lbr..], p.fastk);
+    stoch_.maStage(try MaCore.init(STOCHRSI.dParams(p)), fastd[lbr..], fastk[lbr..], p.fastk - 1);
+    const total = STOCHRSI.lookback(p);
+    for (fastk, fastd, 0..) |*k, *d, i| {
+        const dv = k.*;
+        const kv = d.*;
+        k.* = if (i < total) nan else kv;
+        d.* = if (i < total) nan else dv;
+    }
 }
 pub fn StochrsiStream(comptime T: type) type {
     return vs.SingleStream(T, STOCHRSI);

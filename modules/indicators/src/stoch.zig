@@ -80,7 +80,7 @@ fn validK(period: usize) Error!void {
 /// Batch %K of every bar into the f64 series `out` (NaN before `period - 1`): `KCore.step` per bar, with the two
 /// extremum automatons run as `ExtCore.Run` over the slices (the same rescans and tie rule, the state in registers,
 /// no `?f64` per bar) and the same %K arithmetic.
-fn kSeries(comptime T: type, hs: []const T, ls: []const T, cs: []const T, out: []f64, period: usize) void {
+pub fn kSeries(comptime T: type, hs: []const T, ls: []const T, cs: []const T, out: []f64, period: usize) void {
     const n = hs.len;
     const lead = @min(period - 1, n);
     for (out[0..lead]) |*o| o.* = std.math.nan(f64);
@@ -107,7 +107,7 @@ inline fn kOf(hh: f64, ll: f64, close: f64) f64 {
 /// One moving-average stage of a batch: `MaCore.step` over `in[from..]` into `out[from..]` (the stage's bar 0 is
 /// `in[from]`), NaN before `from`. One dispatch per call, then the active variant's monomorphic loop (its
 /// `steadyRun` where it declares one, bitwise its `step`), as `smooth.ma` runs it.
-fn maStage(c: MaCore, in: []const f64, out: []f64, from: usize) void {
+pub fn maStage(c: MaCore, in: []const f64, out: []f64, from: usize) void {
     const f = @min(from, in.len);
     for (out[0..f]) |*o| o.* = std.math.nan(f64);
     switch (c) {

@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-16** — Batch speed (third round, bit for bit unchanged): HMA (period >= 4) runs its three weighted averages as one
+- **2026-11-16** — Batch speed (third round, bit for bit unchanged): STOCHRSI (f64) runs as three passes over series instead of\n  three cores per bar: the RSI, the stochastic of the RSI values (`stoch.kSeries`, the same automaton) and its average\n  (`stoch.maStage`, one dispatch per call), the outputs swapped and blanked before the first %D — 2.0x TA-Lib before, 1.03x now.\n- **2026-11-16** — Batch speed (third round, bit for bit unchanged): HMA (period >= 4) runs its three weighted averages as one
   TA-Lib shaped loop with the sums in locals, the value each average drops re-read from the input (from the ring slot about to
   be overwritten, for the outer one) instead of carried, and each re-anchor due at a bar number instead of three count-downs
   in memory (profiled: 2.4x the instructions of TA_HMA, spilled counters, no branch misses) — 2.4x TA-Lib before, 1.03x now.
