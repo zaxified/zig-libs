@@ -353,6 +353,186 @@ fn elementText(el: *const xml.Element, source: []const u8) []const u8 {
     return std.mem.trim(u8, out, " \t\r\n");
 }
 
+// ── RFC 6022 schema discovery ──────────────────────────────────────────────
+
+/// RFC 6022 §2.1 / §3.1: the `ietf-netconf-monitoring` namespace.
+pub const monitoring_ns = "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring";
+
+/// Upper bound on `<schema>` entries `parseSchemaList` accepts. Real devices
+/// list hundreds to a few thousand modules; `parseReply` already caps the whole
+/// document at `caps.default_max_elements` (65536) elements, so this only makes
+/// the list bound explicit and independent of how many leaves an entry has.
+pub const max_schemas: usize = 8192;
+/// Upper bound on `<location>` entries of one schema (RFC 6022 §2.1.3 lists
+/// "NETCONF" plus a handful of URIs).
+pub const max_locations: usize = 64;
+
+pub const SchemaError = CheckError || error{
+    /// The list holds more than `max_schemas` entries, or one entry more than
+    /// `max_locations` locations.
+    TooManyEntries,
+} || std.mem.Allocator.Error;
+
+/// One `/netconf-state/schemas/schema` entry (RFC 6022 §2.1.3). The strings are
+/// owned by the enclosing `SchemaList`.
+pub const Schema = struct {
+    /// Key leaf `identifier`: what `<get-schema>` takes.
+    identifier: []const u8,
+    /// Key leaf `version`; may legitimately be empty for unversioned schemas.
+    version: []const u8 = "",
+    /// Key leaf `format` (`yang`, `xsd`, …); "" if the server omitted it.
+    format: []const u8 = "",
+    /// `namespace` leaf (the XML namespace the schema defines); "" if absent.
+    namespace: []const u8 = "",
+    /// `location` leaf-list, in order: a URI, or the literal "NETCONF" meaning
+    /// "retrievable with `<get-schema>`".
+    locations: []const []const u8 = &.{},
+
+    /// True when `<get-schema>` can fetch this entry (RFC 6022 §2.1.3: a
+    /// `location` of `NETCONF`). Servers that omit `location` entirely are not
+    /// excluded: an entry with no locations is reported as retrievable too,
+    /// because the RFC makes `location` optional and `<get-schema>` is keyed by
+    /// the three key leaves, not by it.
+    pub fn viaGetSchema(self: Schema) bool {
+        if (self.locations.len == 0) return true;
+        for (self.locations) |l| if (std.mem.eql(u8, l, "NETCONF")) return true;
+        return false;
+    }
+};
+
+/// The parsed schema list. Owns its strings; independent of the `Reply` it was
+/// parsed from.
+pub const SchemaList = struct {
+    arena: std.heap.ArenaAllocator,
+    items: []const Schema,
+
+    pub fn deinit(self: *SchemaList) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Whitespace-trimmed text of a leaf: its direct text and CDATA children
+/// concatenated, comments and nested elements ignored.
+fn leafText(a: std.mem.Allocator, el: *const xml.Element) std.mem.Allocator.Error![]const u8 {
+    var single: ?[]const u8 = null;
+    var n: usize = 0;
+    for (el.children) |c| switch (c.content) {
+        .text, .cdata => |t| {
+            single = t;
+            n += 1;
+        },
+        else => {},
+    };
+    if (n == 0) return "";
+    if (n == 1) return a.dupe(u8, std.mem.trim(u8, single.?, " \t\r\n"));
+    var out: std.ArrayList(u8) = .empty;
+    for (el.children) |c| switch (c.content) {
+        .text, .cdata => |t| try out.appendSlice(a, t),
+        else => {},
+    };
+    return std.mem.trim(u8, out.items, " \t\r\n");
+}
+
+/// RFC 6022 §2.1.3 / §4.1: read `/netconf-state/schemas` out of the reply to a
+/// `<get>` (see `rpc.schemas_filter`). Rules, in the module's usual lenient
+/// style for unknown content: elements outside the monitoring namespace and
+/// unknown children are skipped; a `<schema>` with no `<identifier>` is skipped
+/// (it cannot be asked for); an absent `<netconf-state>`/`<schemas>` (a filter
+/// that matched nothing, `<data/>`) is an empty list. An `<rpc-error>` is
+/// `error.RpcError`, a reply with no `<data>` is `error.UnexpectedReply`, and
+/// more than `max_schemas` entries / `max_locations` locations per entry is
+/// `error.TooManyEntries`.
+pub fn parseSchemaList(gpa: std.mem.Allocator, r: *const Reply) SchemaError!SchemaList {
+    _ = try r.expectData();
+    const data_el = r.data_element orelse return error.UnexpectedReply;
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var list: std.ArrayList(Schema) = .empty;
+    var nit = data_el.elementIterator();
+    while (nit.next()) |state| {
+        if (!std.mem.eql(u8, state.uri, monitoring_ns) or !std.mem.eql(u8, state.local, "netconf-state")) continue;
+        var sit = state.elementIterator();
+        while (sit.next()) |schemas| {
+            if (!std.mem.eql(u8, schemas.uri, monitoring_ns) or !std.mem.eql(u8, schemas.local, "schemas")) continue;
+            var eit = schemas.elementIterator();
+            while (eit.next()) |entry| {
+                if (!std.mem.eql(u8, entry.uri, monitoring_ns) or !std.mem.eql(u8, entry.local, "schema")) continue;
+                var s: Schema = .{ .identifier = "" };
+                var have_id = false;
+                var locs: std.ArrayList([]const u8) = .empty;
+                var fit = entry.elementIterator();
+                while (fit.next()) |f| {
+                    if (!std.mem.eql(u8, f.uri, monitoring_ns)) continue;
+                    if (std.mem.eql(u8, f.local, "identifier")) {
+                        s.identifier = try leafText(a, f);
+                        have_id = s.identifier.len != 0;
+                    } else if (std.mem.eql(u8, f.local, "version")) {
+                        s.version = try leafText(a, f);
+                    } else if (std.mem.eql(u8, f.local, "format")) {
+                        s.format = try leafText(a, f);
+                    } else if (std.mem.eql(u8, f.local, "namespace")) {
+                        s.namespace = try leafText(a, f);
+                    } else if (std.mem.eql(u8, f.local, "location")) {
+                        if (locs.items.len >= max_locations) return error.TooManyEntries;
+                        try locs.append(a, try leafText(a, f));
+                    }
+                }
+                if (!have_id) continue;
+                if (list.items.len >= max_schemas) return error.TooManyEntries;
+                s.locations = locs.items;
+                try list.append(a, s);
+            }
+        }
+    }
+    return .{ .arena = arena, .items = list.items };
+}
+
+/// RFC 6022 §3.1 / §4.2: the schema text of a `<get-schema>` reply, owned by the
+/// caller. The `<data>` element may be in the base namespace or — as the RFC's
+/// own examples have it — in `ietf-netconf-monitoring`; both are accepted. Its
+/// content is returned as the schema: text and CDATA are XML-unescaped and
+/// concatenated (a YANG module), and when the content is itself XML (an `xsd`
+/// schema) its markup is returned verbatim. Not trimmed. `<rpc-error>` is
+/// `error.RpcError` (RFC 6022 §3.1: unknown schema is `invalid-value`, an
+/// ambiguous one `operation-failed`/`data-not-unique`), no `<data>` is
+/// `error.UnexpectedReply`.
+pub fn parseSchemaText(gpa: std.mem.Allocator, r: *const Reply) (CheckError || std.mem.Allocator.Error)![]u8 {
+    if (r.hasErrors()) return error.RpcError;
+    var data_el: ?*xml.Element = null;
+    var it = r.doc.root.elementIterator();
+    while (it.next()) |c| {
+        if (!std.mem.eql(u8, c.local, "data")) continue;
+        if (std.mem.eql(u8, c.uri, base_ns) or std.mem.eql(u8, c.uri, monitoring_ns)) {
+            data_el = c;
+            break;
+        }
+    }
+    const el = data_el orelse return error.UnexpectedReply;
+
+    var has_element = false;
+    for (el.children) |c| switch (c.content) {
+        .element => has_element = true,
+        else => {},
+    };
+    if (has_element) {
+        // Verbatim inner XML: from the first child node to the end of the last.
+        const first = el.children[0].span.start;
+        const last = el.children[el.children.len - 1].span.end;
+        return gpa.dupe(u8, r.raw[first..last]);
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (el.children) |c| switch (c.content) {
+        .text, .cdata => |t| try out.appendSlice(gpa, t),
+        else => {},
+    };
+    return out.toOwnedSlice(gpa);
+}
+
 // ── notifications (RFC 5277 §2.2.1) ────────────────────────────────────────
 
 pub const Notification = struct {
@@ -1048,4 +1228,302 @@ test "corpus: every reply seed reaches the parsers, and the counts are pinned" {
     try testing.expectEqual(@as(usize, 1), notifications);
     try testing.expectEqual(@as(usize, 15), classified);
     try testing.expectEqual(@as(usize, 2), rpc_errors);
+}
+
+// ── RFC 6022 tests ─────────────────────────────────────────────────────────
+
+/// RFC 6022 §4.1, verbatim — the schema list reply.
+const rfc_6022_4_1_reply =
+    \\<rpc-reply message-id="101"
+    \\           xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+    \\  <data>
+    \\    <netconf-state
+    \\    xmlns="urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring">
+    \\      <schemas>
+    \\        <schema>
+    \\          <identifier>foo</identifier>
+    \\          <version>1.0</version>
+    \\          <format>xsd</format>
+    \\          <namespace>http://example.com/foo</namespace>
+    \\          <location>ftp://ftp.example.com/schemas/foo_1.0.xsd</location>
+    \\          <location>http://www.example.com/schema/foo_1.0.xsd</location>
+    \\          <location>NETCONF</location>
+    \\        </schema>
+    \\        <schema>
+    \\          <identifier>foo</identifier>
+    \\          <version>1.1</version>
+    \\          <format>xsd</format>
+    \\          <namespace>http://example.com/foo</namespace>
+    \\          <location>ftp://ftp.example.com/schemas/foo_1.1.xsd</location>
+    \\          <location>http://www.example.com/schema/foo_1.1.xsd</location>
+    \\          <location>NETCONF</location>
+    \\        </schema>
+    \\        <schema>
+    \\          <identifier>bar</identifier>
+    \\          <version>2008-06-01</version>
+    \\          <format>yang</format>
+    \\          <namespace>http://example.com/bar</namespace>
+    \\          <location>
+    \\            http://example.com/schema/bar@2008-06-01.yang
+    \\          </location>
+    \\          <location>NETCONF</location>
+    \\        </schema>
+    \\        <schema>
+    \\          <identifier>bar-types</identifier>
+    \\          <version>2008-06-01</version>
+    \\          <format>yang</format>
+    \\          <namespace>http://example.com/bar</namespace>
+    \\          <location>
+    \\            http://example.com/schema/bar-types@2008-06-01.yang
+    \\          </location>
+    \\          <location>NETCONF</location>
+    \\        </schema>
+    \\      </schemas>
+    \\    </netconf-state>
+    \\  </data>
+    \\</rpc-reply>
+;
+
+test "parseSchemaList: RFC 6022 §4.1 reply (verbatim): four entries, locations kept, whitespace trimmed" {
+    const gpa = testing.allocator;
+    var r = try parseReply(gpa, rfc_6022_4_1_reply);
+    defer r.deinit();
+    var l = try parseSchemaList(gpa, &r);
+    defer l.deinit();
+    try testing.expectEqual(@as(usize, 4), l.items.len);
+    const foo10 = l.items[0];
+    try testing.expectEqualStrings("foo", foo10.identifier);
+    try testing.expectEqualStrings("1.0", foo10.version);
+    try testing.expectEqualStrings("xsd", foo10.format);
+    try testing.expectEqualStrings("http://example.com/foo", foo10.namespace);
+    try testing.expectEqual(@as(usize, 3), foo10.locations.len);
+    try testing.expectEqualStrings("ftp://ftp.example.com/schemas/foo_1.0.xsd", foo10.locations[0]);
+    try testing.expectEqualStrings("http://www.example.com/schema/foo_1.0.xsd", foo10.locations[1]);
+    try testing.expectEqualStrings("NETCONF", foo10.locations[2]);
+    try testing.expect(foo10.viaGetSchema());
+    try testing.expectEqualStrings("1.1", l.items[1].version);
+    const bar = l.items[2];
+    try testing.expectEqualStrings("bar", bar.identifier);
+    try testing.expectEqualStrings("2008-06-01", bar.version);
+    try testing.expectEqualStrings("yang", bar.format);
+    // The RFC indents this location on its own lines; the value is trimmed.
+    try testing.expectEqualStrings("http://example.com/schema/bar@2008-06-01.yang", bar.locations[0]);
+    try testing.expectEqualStrings("bar-types", l.items[3].identifier);
+}
+
+test "parseSchemaList: the list outlives the Reply it came from" {
+    const gpa = testing.allocator;
+    var r = try parseReply(gpa, rfc_6022_4_1_reply);
+    var l = try parseSchemaList(gpa, &r);
+    defer l.deinit();
+    r.deinit();
+    try testing.expectEqualStrings("bar-types", l.items[3].identifier);
+}
+
+test "parseSchemaList: hostile and odd replies are errors or skips, never a panic" {
+    const gpa = testing.allocator;
+    const head = "<rpc-reply message-id=\"1\" xmlns=\"" ++ base_ns ++ "\">";
+    const state = "<netconf-state xmlns=\"" ++ monitoring_ns ++ "\"><schemas>";
+    const state_end = "</schemas></netconf-state>";
+
+    // <ok/>, no <data>: UnexpectedReply.
+    {
+        var r = try parseReply(gpa, head ++ "<ok/></rpc-reply>");
+        defer r.deinit();
+        try testing.expectError(error.UnexpectedReply, parseSchemaList(gpa, &r));
+    }
+    // <rpc-error>: RpcError.
+    {
+        var r = try parseReply(gpa, rfc_7_5_lock_denied);
+        defer r.deinit();
+        try testing.expectError(error.RpcError, parseSchemaList(gpa, &r));
+    }
+    // Empty <data/> (filter matched nothing), and no <schemas>: empty list.
+    inline for (.{ "<data/>", "<data><netconf-state xmlns=\"" ++ monitoring_ns ++ "\"/></data>" }) |body| {
+        var r = try parseReply(gpa, head ++ body ++ "</rpc-reply>");
+        defer r.deinit();
+        var l = try parseSchemaList(gpa, &r);
+        defer l.deinit();
+        try testing.expectEqual(@as(usize, 0), l.items.len);
+    }
+    // Unknown children, a foreign-namespace <schema>, a schema with no/empty
+    // identifier: skipped; the good entry survives; missing leaves are "".
+    {
+        const body = "<data>" ++ state ++
+            "<junk>x<schema/></junk>" ++
+            "<schema xmlns=\"urn:other\"><identifier>alien</identifier></schema>" ++
+            "<schema><version>1</version></schema>" ++
+            "<schema><identifier>  </identifier></schema>" ++
+            "<schema><identifier>ok</identifier><weird><identifier>nested</identifier></weird></schema>" ++
+            state_end ++ "</data>";
+        var r = try parseReply(gpa, head ++ body ++ "</rpc-reply>");
+        defer r.deinit();
+        var l = try parseSchemaList(gpa, &r);
+        defer l.deinit();
+        try testing.expectEqual(@as(usize, 1), l.items.len);
+        try testing.expectEqualStrings("ok", l.items[0].identifier);
+        try testing.expectEqualStrings("", l.items[0].version);
+        try testing.expectEqual(@as(usize, 0), l.items[0].locations.len);
+        try testing.expect(l.items[0].viaGetSchema());
+    }
+    // Entities are expanded; CDATA and split text are one value.
+    {
+        const body = "<data>" ++ state ++
+            "<schema><identifier>a&amp;b<![CDATA[<c>]]>d</identifier>" ++
+            "<location>http://x/?a=1&amp;b=2</location></schema>" ++ state_end ++ "</data>";
+        var r = try parseReply(gpa, head ++ body ++ "</rpc-reply>");
+        defer r.deinit();
+        var l = try parseSchemaList(gpa, &r);
+        defer l.deinit();
+        try testing.expectEqualStrings("a&b<c>d", l.items[0].identifier);
+        try testing.expectEqualStrings("http://x/?a=1&b=2", l.items[0].locations[0]);
+        try testing.expect(!l.items[0].viaGetSchema());
+    }
+    // Entity tricks: a DOCTYPE (billion laughs, external entity) never gets as
+    // far as the schema reader -- parseReply refuses it.
+    try testing.expectError(error.DoctypeForbidden, parseReply(gpa, "<!DOCTYPE r [<!ENTITY a \"aaaa\"><!ENTITY b \"&a;&a;&a;&a;\">]>" ++ head ++
+        "<data>" ++ state ++ "<schema><identifier>&b;</identifier></schema>" ++ state_end ++ "</data></rpc-reply>"));
+}
+
+test "parseSchemaList: more than max_schemas entries, or max_locations locations, is TooManyEntries" {
+    const gpa = testing.allocator;
+    const head = "<rpc-reply message-id=\"1\" xmlns=\"" ++ base_ns ++ "\"><data><netconf-state xmlns=\"" ++ monitoring_ns ++ "\"><schemas>";
+    const tail = "</schemas></netconf-state></data></rpc-reply>";
+    var doc: std.ArrayList(u8) = .empty;
+    defer doc.deinit(gpa);
+
+    // Exactly max_schemas: fine. One more: error.
+    try doc.appendSlice(gpa, head);
+    for (0..max_schemas) |_| try doc.appendSlice(gpa, "<schema><identifier>m</identifier></schema>");
+    try doc.appendSlice(gpa, tail);
+    {
+        var r = try parseReply(gpa, doc.items);
+        defer r.deinit();
+        var l = try parseSchemaList(gpa, &r);
+        defer l.deinit();
+        try testing.expectEqual(max_schemas, l.items.len);
+    }
+    doc.clearRetainingCapacity();
+    try doc.appendSlice(gpa, head);
+    for (0..max_schemas + 1) |_| try doc.appendSlice(gpa, "<schema><identifier>m</identifier></schema>");
+    try doc.appendSlice(gpa, tail);
+    {
+        var r = try parseReply(gpa, doc.items);
+        defer r.deinit();
+        try testing.expectError(error.TooManyEntries, parseSchemaList(gpa, &r));
+    }
+
+    // Locations.
+    for ([_]usize{ max_locations, max_locations + 1 }) |n| {
+        doc.clearRetainingCapacity();
+        try doc.appendSlice(gpa, head);
+        try doc.appendSlice(gpa, "<schema><identifier>m</identifier>");
+        for (0..n) |_| try doc.appendSlice(gpa, "<location>NETCONF</location>");
+        try doc.appendSlice(gpa, "</schema>");
+        try doc.appendSlice(gpa, tail);
+        var r = try parseReply(gpa, doc.items);
+        defer r.deinit();
+        if (n > max_locations) {
+            try testing.expectError(error.TooManyEntries, parseSchemaList(gpa, &r));
+        } else {
+            var l = try parseSchemaList(gpa, &r);
+            defer l.deinit();
+            try testing.expectEqual(n, l.items[0].locations.len);
+        }
+    }
+}
+
+test "parseSchemaText: RFC 6022 §4.2 YANG reply (data in the monitoring namespace)" {
+    const gpa = testing.allocator;
+    // RFC 6022 §4.2 example 2's reply (message-id 102): the <data> element is
+    // in ietf-netconf-monitoring, not the base namespace, and holds plain text.
+    var r = try parseReply(gpa,
+        \\<rpc-reply message-id="102"
+        \\  xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+        \\  <data
+        \\  xmlns="urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring">
+        \\    module bar {
+        \\      //default format (yang) returned
+        \\      leaf a { type string; }  // &lt;&amp;&gt; in a comment
+        \\    }
+        \\  </data>
+        \\</rpc-reply>
+    );
+    defer r.deinit();
+    const text = try parseSchemaText(gpa, &r);
+    defer gpa.free(text);
+    try testing.expect(std.mem.startsWith(u8, std.mem.trim(u8, text, " \n"), "module bar {"));
+    try testing.expect(std.mem.find(u8, text, "// <&> in a comment") != null);
+    try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, text, " \n"), "}"));
+}
+
+test "parseSchemaText: base-namespace <data>, CDATA, and an xsd body kept as XML" {
+    const gpa = testing.allocator;
+    {
+        var r = try parseReply(gpa, "<rpc-reply message-id=\"1\" xmlns=\"" ++ base_ns ++ "\"><data>module m { description \"a&amp;b\"; }" ++
+            "<![CDATA[ // <raw> & ]]></data></rpc-reply>");
+        defer r.deinit();
+        const text = try parseSchemaText(gpa, &r);
+        defer gpa.free(text);
+        try testing.expectEqualStrings("module m { description \"a&b\"; } // <raw> & ", text);
+    }
+    {
+        // RFC 6022 §4.2 example 1's reply: the schema is XML.
+        var r = try parseReply(gpa,
+            \\<rpc-reply message-id="101"
+            \\  xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            \\  <data
+            \\  xmlns="urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring">
+            \\    <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            \\      <!-- foo 1.0 xsd schema contents here -->
+            \\    </xs:schema>
+            \\  </data>
+            \\</rpc-reply>
+        );
+        defer r.deinit();
+        const text = try parseSchemaText(gpa, &r);
+        defer gpa.free(text);
+        const t = std.mem.trim(u8, text, " \n");
+        try testing.expect(std.mem.startsWith(u8, t, "<xs:schema xmlns:xs="));
+        try testing.expect(std.mem.endsWith(u8, t, "</xs:schema>"));
+        try testing.expect(std.mem.find(u8, t, "<!-- foo 1.0 xsd schema contents here -->") != null);
+    }
+}
+
+test "parseSchemaText: hostile replies are errors, never a panic" {
+    const gpa = testing.allocator;
+    const head = "<rpc-reply message-id=\"1\" xmlns=\"" ++ base_ns ++ "\">";
+    // No <data>.
+    {
+        var r = try parseReply(gpa, head ++ "<ok/></rpc-reply>");
+        defer r.deinit();
+        try testing.expectError(error.UnexpectedReply, parseSchemaText(gpa, &r));
+    }
+    // A <data> in a foreign namespace is not ours.
+    {
+        var r = try parseReply(gpa, head ++ "<data xmlns=\"urn:other\">x</data></rpc-reply>");
+        defer r.deinit();
+        try testing.expectError(error.UnexpectedReply, parseSchemaText(gpa, &r));
+    }
+    // rpc-error (RFC 6022 §3.1 invalid-value).
+    {
+        var r = try parseReply(gpa, head ++
+            "<rpc-error><error-type>application</error-type><error-tag>invalid-value</error-tag>" ++
+            "<error-severity>error</error-severity></rpc-error></rpc-reply>");
+        defer r.deinit();
+        try testing.expectError(error.RpcError, parseSchemaText(gpa, &r));
+        try testing.expectEqual(ErrorTag.invalid_value, r.firstError().?.tag);
+    }
+    // Empty <data/>: an empty text, not a crash (indexing children[0] is guarded).
+    {
+        var r = try parseReply(gpa, head ++ "<data/></rpc-reply>");
+        defer r.deinit();
+        const text = try parseSchemaText(gpa, &r);
+        defer gpa.free(text);
+        try testing.expectEqual(@as(usize, 0), text.len);
+    }
+    // Two <data>: AmbiguousReply already at parseReply for base-ns ones.
+    try testing.expectError(error.AmbiguousReply, parseReply(gpa, head ++ "<data>a</data><data>b</data></rpc-reply>"));
+    // DOCTYPE entity bomb never reaches the reader.
+    try testing.expectError(error.DoctypeForbidden, parseReply(gpa, "<!DOCTYPE r [<!ENTITY a \"aaaa\">]>" ++ head ++ "<data>&a;</data></rpc-reply>"));
 }

@@ -407,6 +407,9 @@ pub const Client = struct {
             },
             .create_subscription => needed[0] = capabilities.cap_notification,
             .discard_changes, .close_session, .kill_session, .raw => {},
+            // RFC 6022: the capability URI carries `?module=…&revision=…`, so
+            // there is no exact string to test; the peer answers for itself.
+            .get_schema => {},
         }
         for (needed) |maybe_cap| {
             const cap = maybe_cap orelse continue;
@@ -610,6 +613,24 @@ pub const Client = struct {
 
     pub fn createSubscription(self: *Client, s: rpc_mod.CreateSubscription) SessionError!reply_mod.Reply {
         return self.call(.{ .create_subscription = s });
+    }
+
+    /// RFC 6022 §3.1 `<get-schema>`: the schema text (a YANG module, or XML for
+    /// `xsd`), owned by the caller. An `<rpc-error>` (unknown schema:
+    /// `invalid-value`; ambiguous: `data-not-unique`) is `error.RpcError`; use
+    /// `call(.{ .get_schema = … })` and `reply.parseSchemaText` to keep it.
+    pub fn getSchema(self: *Client, g: rpc_mod.GetSchema) SessionError![]u8 {
+        var r = try self.call(.{ .get_schema = g });
+        defer r.deinit();
+        return try reply_mod.parseSchemaText(self.gpa, &r);
+    }
+
+    /// RFC 6022 §2.1.3: `<get>` of `/netconf-state/schemas`, parsed. Caller
+    /// calls `deinit` on the result.
+    pub fn listSchemas(self: *Client) (SessionError || reply_mod.SchemaError)!reply_mod.SchemaList {
+        var r = try self.call(.{ .get = .{ .filter = rpc_mod.schemas_filter } });
+        defer r.deinit();
+        return try reply_mod.parseSchemaList(self.gpa, &r);
     }
 
     /// Caller-supplied operation XML inside our correlated `<rpc>` envelope.
@@ -854,6 +875,21 @@ const FakePeer = struct {
         if (self.forge_message_id) |forged| {
             self.forge_message_id = null;
             try w.print("<rpc-reply message-id=\"{d}\" xmlns=\"{s}\"><ok/></rpc-reply>", .{ forged, capabilities.base_ns });
+        } else if (std.mem.eql(u8, op.local, "get-schema")) {
+            // RFC 6022 §4.2: <data> in the monitoring namespace, plain text.
+            try w.print("<rpc-reply message-id=\"{s}\" xmlns=\"{s}\">", .{ id_text, capabilities.base_ns });
+            try w.writeAll("<data xmlns=\"urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring\">module bar { // &lt;x&gt;\n}</data></rpc-reply>");
+        } else if (std.mem.eql(u8, op.local, "get") and
+            if (op.firstElementChild()) |c| std.mem.eql(u8, c.local, "filter") else false)
+        {
+            // The schema-list filter of `Client.listSchemas` (a <filter> child).
+            try w.print("<rpc-reply message-id=\"{s}\" xmlns=\"{s}\">", .{ id_text, capabilities.base_ns });
+            try w.writeAll(
+                \\<data><netconf-state xmlns="urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring"><schemas>
+                \\<schema><identifier>bar</identifier><version>2008-06-01</version><format>yang</format>
+                \\<namespace>http://example.com/bar</namespace><location>NETCONF</location></schema>
+                \\</schemas></netconf-state></data></rpc-reply>
+            );
         } else if (std.mem.eql(u8, op.local, "get-config") or std.mem.eql(u8, op.local, "get")) {
             try w.print("<rpc-reply message-id=\"{s}\" xmlns=\"{s}\">\n", .{ id_text, capabilities.base_ns });
             try w.writeAll(
@@ -1256,6 +1292,26 @@ test "the full operation surface round-trips against the fake peer" {
         defer r.deinit();
         try testing.expect(!r.hasErrors());
     }
+}
+
+test "getSchema and listSchemas round-trip against the fake peer (RFC 6022)" {
+    const gpa = testing.allocator;
+    const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+
+    const text = try h.client.getSchema(.{ .identifier = "bar", .version = "2008-06-01" });
+    defer gpa.free(text);
+    try testing.expectEqualStrings("module bar { // <x>\n}", text);
+
+    var l = try h.client.listSchemas();
+    defer l.deinit();
+    try testing.expectEqual(@as(usize, 1), l.items.len);
+    try testing.expectEqualStrings("bar", l.items[0].identifier);
+    try testing.expectEqualStrings("2008-06-01", l.items[0].version);
+    try testing.expectEqualStrings("yang", l.items[0].format);
+    try testing.expectEqualStrings("http://example.com/bar", l.items[0].namespace);
+    try testing.expectEqualStrings("NETCONF", l.items[0].locations[0]);
 }
 
 test "check_capabilities (default true) refuses locally an operation the peer never advertised" {

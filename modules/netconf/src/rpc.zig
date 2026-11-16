@@ -22,6 +22,9 @@ const xml = @import("xml");
 pub const base_ns = caps.base_ns;
 pub const notification_ns = caps.notification_ns;
 pub const with_defaults_ns = caps.with_defaults_ns;
+/// RFC 6022 §3.1 / §2.1: the `ietf-netconf-monitoring` module's namespace —
+/// the one `<get-schema>` and `<netconf-state>` live in.
+pub const monitoring_ns = "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring";
 
 /// A configuration datastore, as it appears inside `<source>`/`<target>`.
 /// `.url` requires the peer's `:url` capability (RFC 6241 §8.8).
@@ -204,6 +207,26 @@ pub const Commit = struct {
     persist_id: ?[]const u8 = null,
 };
 
+/// RFC 6022 §3.1 `<get-schema>`. The server must implement
+/// `ietf-netconf-monitoring`; this client does not gate on the capability
+/// (its advertised form carries `?module=…&revision=…`, so the peer decides).
+pub const GetSchema = struct {
+    /// `<identifier>` — mandatory; a schema list entry's identifier (§2.1.3).
+    identifier: []const u8,
+    /// `<version>` — optional. Without it, a server holding several versions
+    /// answers `operation-failed` / `data-not-unique` (§3.1).
+    version: ?[]const u8 = null,
+    /// `<format>` — optional data modeling language (`yang`, `xsd`, `rng`,
+    /// `rnc`, …, a `schema-format` identity); the server defaults to `yang`.
+    /// Sent verbatim (escaped), as RFC 6022 §4.2's examples do.
+    format: ?[]const u8 = null,
+};
+
+/// RFC 6022 §2.1.3 / §4.1: the subtree filter selecting `/netconf-state/schemas`,
+/// ready for `Rpc.get` / `Client.get` (`Client.listSchemas` uses it). The schema
+/// list is the answer to "what can I `get-schema`?".
+pub const schemas_filter: Filter = .{ .subtree = "<netconf-state xmlns=\"" ++ monitoring_ns ++ "\"><schemas/></netconf-state>" };
+
 /// RFC 5277 §2.1.1 `<create-subscription>`.
 pub const CreateSubscription = struct {
     /// Event stream name; null means the default `NETCONF` stream.
@@ -233,6 +256,8 @@ pub const Rpc = union(enum) {
     close_session,
     kill_session: u32,
     create_subscription: CreateSubscription,
+    /// RFC 6022 §3.1.
+    get_schema: GetSchema,
     /// Verbatim XML child element(s) of `<rpc>`.
     raw: []const u8,
 };
@@ -368,6 +393,25 @@ pub fn writeRpc(w: *std.Io.Writer, message_id: u64, rpc: Rpc) BuildError!void {
                 try w.writeAll("</stopTime>\n");
             }
             try w.writeAll("  </create-subscription>\n");
+        },
+        .get_schema => |g| {
+            // RFC 6022 §3.1 / §4.2: the operation element carries the
+            // ietf-netconf-monitoring namespace; parameters inherit it.
+            try w.print("  <get-schema xmlns=\"{s}\">\n", .{monitoring_ns});
+            try w.writeAll("    <identifier>");
+            try writeEscaped(w, g.identifier);
+            try w.writeAll("</identifier>\n");
+            if (g.version) |v| {
+                try w.writeAll("    <version>");
+                try writeEscaped(w, v);
+                try w.writeAll("</version>\n");
+            }
+            if (g.format) |f| {
+                try w.writeAll("    <format>");
+                try writeEscaped(w, f);
+                try w.writeAll("</format>\n");
+            }
+            try w.writeAll("  </get-schema>\n");
         },
         .raw => |body| try writeFragment(w, body, 2),
     }
@@ -1090,6 +1134,8 @@ test "every builder emits well-formed XML with the right envelope" {
         .close_session,
         .{ .kill_session = 4 },
         .{ .create_subscription = .{} },
+        .{ .get_schema = .{ .identifier = "ietf-interfaces", .version = "2018-02-20", .format = "yang" } },
+        .{ .get = .{ .filter = schemas_filter } },
         .{ .raw = "<my-op xmlns=\"urn:x\"/>" },
     };
     for (all, 0..) |r, i| {
@@ -1173,4 +1219,76 @@ test "with-defaults (RFC 6243) on get, get-config and copy-config" {
     defer gpa.free(bare);
     try testing.expect(std.mem.find(u8, bare, "<get/>") != null);
     try testing.expect(std.mem.find(u8, bare, "with-defaults") == null);
+}
+
+test "get-schema emits RFC 6022 §4.2 XML: identifier, version, format" {
+    const gpa = testing.allocator;
+    {
+        // RFC 6022 §4.2 example 1 (message-id 101), with the RFC's `foo`.
+        const got = try build(gpa, 101, .{ .get_schema = .{ .identifier = "foo", .version = "1.0", .format = "xsd" } });
+        defer gpa.free(got);
+        try expectSameStructure(got,
+            \\<rpc message-id="101"
+            \\  xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            \\  <get-schema
+            \\  xmlns="urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring">
+            \\    <identifier>foo</identifier>
+            \\    <version>1.0</version>
+            \\    <format>xsd</format>
+            \\  </get-schema>
+            \\</rpc>
+        );
+    }
+    {
+        // Example 2: identifier + version. (The RFC text misspells the element
+        // `identifer` there; its YANG module, §5, says `identifier`.)
+        const got = try build(gpa, 102, .{ .get_schema = .{ .identifier = "bar", .version = "2008-06-01" } });
+        defer gpa.free(got);
+        try expectSameStructure(got,
+            \\<rpc message-id="102" xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            \\  <get-schema xmlns="urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring">
+            \\    <identifier>bar</identifier>
+            \\    <version>2008-06-01</version>
+            \\  </get-schema>
+            \\</rpc>
+        );
+        try testing.expect(std.mem.find(u8, got, "<format") == null);
+    }
+    {
+        // Example 3: identifier only.
+        const got = try build(gpa, 103, .{ .get_schema = .{ .identifier = "bar-types" } });
+        defer gpa.free(got);
+        try expectSameStructure(got,
+            \\<rpc message-id="103" xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            \\  <get-schema xmlns="urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring">
+            \\    <identifier>bar-types</identifier>
+            \\  </get-schema>
+            \\</rpc>
+        );
+        try testing.expect(std.mem.find(u8, got, "<version") == null);
+    }
+    {
+        // Hostile parameters cannot inject markup.
+        const got = try build(gpa, 104, .{ .get_schema = .{
+            .identifier = "a</identifier><x/>",
+            .version = "<y/>",
+            .format = "]]>]]>",
+        } });
+        defer gpa.free(got);
+        try testing.expect(std.mem.find(u8, got, "<x/>") == null);
+        try testing.expect(std.mem.find(u8, got, "<y/>") == null);
+        try testing.expect(std.mem.find(u8, got, "]]>]]>") == null);
+    }
+}
+
+test "schemas_filter selects /netconf-state/schemas (RFC 6022 §2.1.3)" {
+    const gpa = testing.allocator;
+    const got = try build(gpa, 5, .{ .get = .{ .filter = schemas_filter } });
+    defer gpa.free(got);
+    try expectSameStructure(got,
+        \\<rpc message-id="5" xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+        \\  <get><filter type="subtree">
+        \\    <netconf-state xmlns="urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring"><schemas/></netconf-state>
+        \\  </filter></get></rpc>
+    );
 }

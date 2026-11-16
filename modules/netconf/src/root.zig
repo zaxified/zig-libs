@@ -96,6 +96,7 @@ pub const EditPayload = rpc.EditPayload;
 pub const CopyConfig = rpc.CopyConfig;
 pub const Commit = rpc.Commit;
 pub const CreateSubscription = rpc.CreateSubscription;
+pub const GetSchema = rpc.GetSchema;
 pub const Operation = rpc.Operation;
 pub const DefaultOperation = rpc.DefaultOperation;
 pub const TestOption = rpc.TestOption;
@@ -108,6 +109,9 @@ pub const ErrorTag = reply.ErrorTag;
 pub const ErrorType = reply.ErrorType;
 pub const ErrorSeverity = reply.ErrorSeverity;
 pub const Notification = reply.Notification;
+/// RFC 6022 schema discovery: `Client.listSchemas` / `Client.getSchema`.
+pub const Schema = reply.Schema;
+pub const SchemaList = reply.SchemaList;
 
 /// Capability model (RFC 6241 §8.1).
 pub const Capabilities = capabilities.Capabilities;

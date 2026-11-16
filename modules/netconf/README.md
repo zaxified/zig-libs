@@ -20,7 +20,8 @@ protocol operation, and typed `<rpc-reply>` / `<rpc-error>` parsing.
   `copy-config`, `delete-config`, `lock`/`unlock`, `commit` (incl. confirmed commit with
   `confirm-timeout`/`persist`), `cancel-commit` (optional `persist-id`), the RFC 6243
   `with-defaults` parameter on `get`/`get-config`/`copy-config`, `discard-changes`, `validate`, `close-session`,
-  `kill-session`, plus RFC 5277 `create-subscription` — and a `raw` escape hatch that puts
+  `kill-session`, RFC 5277 `create-subscription`, and RFC 6022 `get-schema` plus a
+  parsed `/netconf-state/schemas` list (`Client.getSchema` / `Client.listSchemas`) — and a `raw` escape hatch that puts
   caller-supplied operation XML inside the correlated `<rpc>` envelope.
 - **Typed replies** — `<ok>`, `<data>`, or one-or-more `<rpc-error>` with every field
   (`error-type`, `error-tag`, `error-severity`, `error-app-tag`, `error-path`,
@@ -173,6 +174,8 @@ capability that announces it; for those, construct the `Client` with
 | `.call(Rpc) !Reply` | send + correlated receive |
 | `.callOk(Rpc, ?*?Reply) !void` | `call` + `expectOk`, handing the failed reply back |
 | `.get` `.getConfig` `.editConfig` `.copyConfig` `.deleteConfig` `.lock` `.unlock` `.commit` `.cancelCommit` `.discardChanges` `.validate` `.killSession` `.createSubscription` `.raw` | one wrapper per RFC 6241 §7/§8 operation |
+| `.getSchema(GetSchema) ![]u8` | RFC 6022 §3.1 `<get-schema>`; the schema text (caller frees), `error.RpcError` if unknown/ambiguous |
+| `.listSchemas() !SchemaList` | RFC 6022 §2.1.3 `<get>` of `/netconf-state/schemas` parsed into `{identifier, version, format, namespace, locations}` (`.deinit()`); bounded by `reply.max_schemas` / `max_locations` (`error.TooManyEntries`) |
 | `.closeSession()` | §7.8 graceful close |
 | `.nextNotification()` / `.awaitNotification()` | RFC 5277 events (queued while waiting for replies) |
 
