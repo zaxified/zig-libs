@@ -674,6 +674,10 @@ const Composer = struct {
                     }
                     try items.append(self.alloc, try self.composeNode(depth + 1));
                 }
+                if (c.tag) |t| {
+                    if (std.mem.eql(u8, t, yaml11_set)) return error.BadTaggedScalar; // a set is a mapping
+                    if (std.mem.eql(u8, t, yaml11_omap)) try self.checkOmap(items.items);
+                }
                 const v: Value = .{ .sequence = items.items };
                 self.finishAnchor(slot, v);
                 return v;
@@ -698,6 +702,10 @@ const Composer = struct {
                         if (try dup.checkAndInsert(self.alloc, k, self.effectiveMaxDepth(), &self.dup_probes)) return error.DuplicateKey;
                     }
                     try pairs.append(self.alloc, .{ .key = k, .value = val });
+                }
+                if (c.tag) |t| {
+                    if (std.mem.eql(u8, t, yaml11_omap)) return error.BadTaggedScalar; // an omap is a sequence
+                    if (std.mem.eql(u8, t, yaml11_set)) try checkSet(pairs.items);
                 }
                 const v: Value = .{ .mapping = if (merges.items.len == 0) pairs.items else try self.applyMerges(pairs.items, merges.items) };
                 self.finishAnchor(slot, v);
@@ -749,6 +757,22 @@ const Composer = struct {
             }
         }
         return out.items;
+    }
+
+    /// `!!omap` (YAML 1.1 type spec): a sequence of single-pair mappings with
+    /// no repeated key across the whole sequence. The value stays a sequence.
+    fn checkOmap(self: *Composer, items: []const Value) Error!void {
+        var seen: DupTracker = .{};
+        defer seen.deinit(self.alloc);
+        for (items) |it| {
+            const pairs = switch (it) {
+                .mapping => |m| m,
+                else => return error.BadTaggedScalar,
+            };
+            if (pairs.len != 1) return error.BadTaggedScalar;
+            if (try seen.checkAndInsert(self.alloc, pairs[0].key, self.effectiveMaxDepth(), &self.dup_probes))
+                return error.BadTaggedScalar;
+        }
     }
 
     fn resolveScalar(self: *Composer, text: []const u8, style: parser.ScalarStyle, tag: ?[]const u8) Error!Value {
@@ -818,10 +842,23 @@ fn resolveTagged(alloc: std.mem.Allocator, text: []const u8, tag: []const u8) Er
         _ = parseTimestamp(text) orelse return error.BadTaggedScalar;
         return .{ .string = text };
     }
+    // A scalar can be neither a set (mapping) nor an omap (sequence).
+    if (std.mem.eql(u8, tag, yaml11_set) or std.mem.eql(u8, tag, yaml11_omap)) return error.BadTaggedScalar;
     return .{ .string = text };
 }
 
 // ── YAML 1.1 `!!binary` and `!!timestamp` (explicit tags only) ──────────────
+// (`!!set` / `!!omap` below are collection tags: validated in `composeNode`.)
+
+const yaml11_set = "tag:yaml.org,2002:set";
+const yaml11_omap = "tag:yaml.org,2002:omap";
+
+/// `!!set` (YAML 1.1 type spec): a mapping whose values are all null. Key
+/// uniqueness is the ordinary mapping rule (`reject_duplicate_keys`). The value
+/// stays a mapping.
+fn checkSet(pairs: []const Pair) Error!void {
+    for (pairs) |p| if (!p.value.isNull()) return error.BadTaggedScalar;
+}
 
 const yaml11_binary = "tag:yaml.org,2002:binary";
 const yaml11_timestamp = "tag:yaml.org,2002:timestamp";
@@ -1275,6 +1312,35 @@ test "parseTimestamp refuses malformed values" {
     for (bad) |b| try testing.expect(parseTimestamp(b) == null);
     try testing.expectError(error.BadTaggedScalar, single("x: !!timestamp yesterday\n"));
     try testing.expectError(error.BadTaggedScalar, single("x: !!timestamp 2001-13-01\n"));
+}
+
+test "!!set is a mapping of null values" {
+    const r = try single("a: !!set {x, y: , ? z}\nb: !!set\n  ? p\n  ? q\nc: !!set {}\n");
+    defer r.deinit();
+    const a = r.root.get("a").?.mapping;
+    try testing.expectEqual(@as(usize, 3), a.len);
+    for (a) |p| try testing.expect(p.value.isNull());
+    try testing.expectEqual(@as(usize, 2), r.root.get("b").?.mapping.len);
+    try testing.expectEqual(@as(usize, 0), r.root.get("c").?.mapping.len);
+    try testing.expectError(error.BadTaggedScalar, single("a: !!set {x: 1}\n"));
+    try testing.expectError(error.BadTaggedScalar, single("a: !!set [x, y]\n"));
+    try testing.expectError(error.BadTaggedScalar, single("a: !!set {x, y: z}\n"));
+    try testing.expectError(error.BadTaggedScalar, single("a: !!set scalar\n"));
+    try testing.expectError(error.BadTaggedScalar, single("a: !!omap scalar\n"));
+}
+
+test "!!omap is a sequence of single-pair mappings with unique keys" {
+    const r = try single("a: !!omap\n  - x: 1\n  - y: 2\nb: !!omap []\nc: !!omap [{k: v}]\n");
+    defer r.deinit();
+    const a = r.root.get("a").?.sequence;
+    try testing.expectEqual(@as(usize, 2), a.len);
+    try testing.expectEqual(@as(i64, 2), a[1].get("y").?.int);
+    try testing.expectEqual(@as(usize, 0), r.root.get("b").?.sequence.len);
+    try testing.expectError(error.BadTaggedScalar, single("a: !!omap {x: 1}\n"));
+    try testing.expectError(error.BadTaggedScalar, single("a: !!omap [x, y]\n"));
+    try testing.expectError(error.BadTaggedScalar, single("a: !!omap [{x: 1, y: 2}]\n"));
+    try testing.expectError(error.BadTaggedScalar, single("a: !!omap [{}]\n"));
+    try testing.expectError(error.BadTaggedScalar, single("a: !!omap [{x: 1}, {x: 2}]\n"));
 }
 
 test "aliases share the anchored node" {
