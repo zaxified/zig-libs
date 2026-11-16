@@ -814,3 +814,70 @@ test "small edges the reference corpus does not reach" {
     try testing.expectError(error.TemplateSyntaxError, env.compile("{{ 1) }}", null));
     try testing.expectError(error.TemplateSyntaxError, env.compile("{{ '\\x4", null));
 }
+
+fn renderStr(gpa: std.mem.Allocator, src: []const u8, expect: []const u8) !void {
+    const out = try renderWith(gpa, .{}, src, .{ .none = {} });
+    defer gpa.free(out);
+    try testing.expectEqualStrings(expect, out);
+}
+
+test "symbolic test aliases work as select/reject test names (Jinja2 3.1 TESTS table)" {
+    const gpa = testing.allocator;
+    try renderStr(gpa, "{{ [1,2,3,4]|select('>', 2)|join(',') }}", "3,4");
+    try renderStr(gpa, "{{ [1,2,3,4]|select('>=', 2)|join(',') }}", "2,3,4");
+    try renderStr(gpa, "{{ [1,2,3,4]|select('<', 3)|join(',') }}", "1,2");
+    try renderStr(gpa, "{{ [1,2,3,4]|select('<=', 3)|join(',') }}", "1,2,3");
+    try renderStr(gpa, "{{ [1,2,3,2]|select('==', 2)|join(',') }}", "2,2");
+    try renderStr(gpa, "{{ [1,2,3,2]|select('!=', 2)|join(',') }}", "1,3");
+    try renderStr(gpa, "{{ [1,2,3,4]|reject('>', 2)|join(',') }}", "1,2");
+    try renderStr(gpa, "{{ [1,2,3,2]|reject('==', 2)|join(',') }}", "1,3");
+    try renderStr(gpa, "{{ [1,2,3,4]|reject('<=', 3)|join(',') }}", "4");
+    // the word forms keep working
+    try renderStr(gpa, "{{ [1,2,3,4]|select('ge', 3)|join(',') }}{{ 3 is eq 3 }}{{ 3 is ne 3 }}{{ 3 is lt 4 }}{{ 3 is le 3 }}{{ 3 is gt 4 }}{{ 3 is ge 4 }}", "3,4TrueFalseTrueTrueFalseFalse");
+}
+
+test "a symbolic alias after `is` is a syntax error, as in Jinja2" {
+    const gpa = testing.allocator;
+    var env = try jinja.Environment.init(gpa, .{});
+    defer env.deinit();
+    for ([_][]const u8{ "{{ 3 is >= 2 }}", "{{ 3 is == 3 }}", "{{ 3 is != 3 }}", "{{ 3 is < 3 }}" }) |src|
+        try testing.expectError(error.TemplateSyntaxError, env.compile(src, null));
+}
+
+test "an unknown test name in select/reject is a render error" {
+    const gpa = testing.allocator;
+    var env = try jinja.Environment.init(gpa, .{});
+    defer env.deinit();
+    for ([_][]const u8{ "{{ [1,2]|select('nosuch', 2) }}", "{{ [1,2]|reject('~~', 2) }}" }) |src| {
+        const r = env.renderAlloc(gpa, src, .{ .none = {} }, null);
+        if (r) |o| {
+            gpa.free(o);
+            return error.TestExpectedError;
+        } else |_| {}
+    }
+}
+
+test "the `filter` and `test` tests ask the environment" {
+    const gpa = testing.allocator;
+    try renderStr(gpa, "{{ 'upper' is filter }}{{ 'nosuch' is filter }}{{ 'upper' is test }}{{ 'nosuch' is test }}", "TrueFalseTrueFalse");
+    try renderStr(gpa, "{{ 'odd' is test }}{{ 'filter' is test }}{{ 'test' is test }}{{ '>=' is test }}{{ 'select' is filter }}", "TrueTrueTrueTrueTrue");
+    try renderStr(gpa, "{{ 'odd' is not filter }}{{ 3 is filter }}{{ none is test }}{{ [1] is filter }}", "TrueFalseFalseFalse");
+    try renderStr(gpa, "{{ ['upper', 'odd', 'x']|select('filter')|join(',') }}|{{ ['upper', 'odd', 'x']|select('test')|join(',') }}", "upper|upper,odd");
+}
+
+test "`is filter` / `is test` see custom registrations" {
+    const gpa = testing.allocator;
+    var env = try jinja.Environment.init(gpa, .{});
+    defer env.deinit();
+    try env.addTest("mine", struct {
+        fn f(ctx: *jinja.FilterCtx, input: jinja.Value, args: jinja.FilterArgs) jinja.FilterError!bool {
+            _ = ctx;
+            _ = input;
+            _ = args;
+            return true;
+        }
+    }.f);
+    const out = try env.renderAlloc(gpa, "{{ 'mine' is test }}{{ 'mine' is filter }}", .{ .none = {} }, null);
+    defer gpa.free(out);
+    try testing.expectEqualStrings("TrueFalse", out);
+}

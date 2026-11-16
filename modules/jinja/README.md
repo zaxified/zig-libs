@@ -346,12 +346,15 @@ name resolution happens at compile time.
 ## Tests
 
 `boolean` · `callable` · `defined` · `divisibleby` · `eq` · `equalto` · `escaped` · `even` ·
-`false` · `float` · `ge` · `greaterthan` · `gt` · `in` · `integer` ·
+`false` · `filter` · `float` · `ge` · `greaterthan` · `gt` · `in` · `integer` ·
 `iterable` · `le` · `lessthan` · `lower` · `lt` · `mapping` · `ne` · `none` ·
-`number` · `odd` · `sameas` · `sequence` · `string` · `true` · `undefined` · `upper`
+`number` · `odd` · `sameas` · `sequence` · `string` · `test` · `true` · `undefined` · `upper`
 
 Both call forms work: `x is divisibleby(3)` and `x is divisibleby 3`, and
-`is not` negates.
+`is not` negates. `filter` / `test` (`'upper' is filter`) ask the environment,
+custom registrations included. The symbolic spellings `==` `!=` `>` `>=` `<` `<=`
+are registered as test names for `select('>', 2)` / `reject('==', 2)`; as in
+Jinja2, `x is >= 2` is not valid template syntax.
 
 ## Globals and methods
 

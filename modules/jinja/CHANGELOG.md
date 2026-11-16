@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — New tests `filter` and `test` (true when the environment, custom registrations included, has a filter / test of that name; non-strings are false) and the symbolic test names `==` `!=` `>` `>=` `<` `<=` (aliases of `eq` `ne` `gt` `ge` `lt` `le`, reachable through `select`/`reject` like in Jinja2 3.1; `x is >= 2` stays a syntax error as there). `filters.Ctx` gained `hasFilter`/`hasTest` (defaulted).
+
 - **2026-11-13** — `groupby` groups report the first member's own key (the reference does not fold the grouper), `format` zero-pads `inf`/`nan` like Python, `sameas` on empty containers is false. The 80 new `s3_*` oracle cases replay against golden.json re-captured from Jinja2 3.1.6 (431 cases).
 
 - **2026-11-13** — New filters `format` (Python `%`, exact float rounding), `groupby`, `wordwrap` (`textwrap.wrap`), `filesizeformat`; new tests `sameas`, `callable`; `upper`/`lower`/`capitalize`/`title`, `is upper`/`is lower` and the case folding of `sort`/`min`/`max`/`unique` now use full Unicode case mapping through the new `unitext` dependency (ill-formed UTF-8 passes through). A template that used to fail to compile on these names now renders; a non-ASCII string through a case filter now changes where it used to stay as is.
