@@ -165,8 +165,16 @@ const StatusKind = union(enum) {
     unknown,
 };
 
+/// A further SingleResponse (same issuer, SHA-256 CertID) after the main one.
+const ExtraSingle = struct {
+    serial: []const u8,
+    status: StatusKind = .good,
+    next_update: ?[]const u8 = next_update,
+};
+
 const RespSpec = struct {
     issuer: IssuerBits,
+    extra: []const ExtraSingle = &.{},
     subject_serial: []const u8,
     responder_by_name: ?[]const u8 = null, // Name TLV
     responder_by_key: ?[]const u8 = null, // KeyHash (SHA-1 digest bytes)
@@ -291,6 +299,22 @@ fn buildResponseImpl(gpa: std.mem.Allocator, spec: RespSpec, with_decoy: bool) !
         }
         const decoy = try b.seq(decoy_parts.items);
         break :blk try b.seq(&.{ decoy, single });
+    } else if (spec.extra.len != 0) blk: {
+        var all = std.ArrayList([]const u8).empty;
+        try all.append(b.a, single);
+        for (spec.extra) |x| {
+            var xs = spec;
+            xs.subject_serial = x.serial;
+            var xp = std.ArrayList([]const u8).empty;
+            try xp.appendSlice(b.a, &.{
+                try certIdDer(b, xs),
+                try statusDer(b, x.status),
+                try b.generalizedTime(spec.this_update),
+            });
+            if (x.next_update) |nu| try xp.append(b.a, try b.explicit(0, try b.generalizedTime(nu)));
+            try all.append(b.a, try b.seq(xp.items));
+        }
+        break :blk try b.seq(all.items);
     } else try b.seq(&.{single});
 
     // ResponseData (tbs): responderID byName [1] or byKey [2], producedAt, responses [, exts]
@@ -707,6 +731,175 @@ test "verify: a non-matching SHA-1 entry ahead of the real SHA-256 one does not 
     const parsed = try ocsp.parseResponse(resp_der);
     const verdict = try ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts());
     try testing.expect(verdict.status == .good);
+}
+
+// A second leaf of the same CA (serial 0x4343) plus a third never answered.
+fn makeLeaf(gpa: std.mem.Allocator, fx: RsaFixture, cn: []const u8, serial: []const u8) ![]u8 {
+    const issuer = try extractBits(fx.issuer_der);
+    return buildLeafCert(gpa, fx.kp.secret_key, issuer.subject_name, try spkiOf(fx.issuer_der), cn, serial);
+}
+
+test "verifyMany: each queried certificate gets its own status; an absent one is reported absent" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    const subject = try extractBits(fx.subject_der); // serial 0x4242 -> good
+    const leaf2 = try makeLeaf(gpa, fx, "two.example.com", &.{ 0x43, 0x43 }); // revoked
+    defer gpa.free(leaf2);
+    const leaf3 = try makeLeaf(gpa, fx, "three.example.com", &.{ 0x44, 0x44 }); // unknown
+    defer gpa.free(leaf3);
+    const leaf4 = try makeLeaf(gpa, fx, "four.example.com", &.{ 0x45, 0x45 }); // not in the response
+    defer gpa.free(leaf4);
+    const leaf5 = try makeLeaf(gpa, fx, "five.example.com", &.{ 0x46, 0x46 }); // stale entry
+    defer gpa.free(leaf5);
+
+    const resp_der = try buildResponse(gpa, .{
+        .issuer = issuer,
+        .subject_serial = subject.serial,
+        .responder_by_name = issuer.subject_name,
+        .sign_rsa = fx.kp.secret_key,
+        .extra = &.{
+            .{ .serial = &.{ 0x43, 0x43 }, .status = .{ .revoked = .{ .time = "20260101000000Z", .reason = 1 } } },
+            .{ .serial = &.{ 0x44, 0x44 }, .status = .unknown },
+            .{ .serial = &.{ 0x46, 0x46 }, .next_update = "20270102000000Z" }, // before now_2027
+        },
+    });
+    defer gpa.free(resp_der);
+    const parsed = try ocsp.parseResponse(resp_der);
+
+    const q = [_]ocsp.CertPair{
+        .{ .subject_cert_der = fx.subject_der, .issuer_cert_der = fx.issuer_der },
+        .{ .subject_cert_der = leaf2, .issuer_cert_der = fx.issuer_der },
+        .{ .subject_cert_der = leaf3, .issuer_cert_der = fx.issuer_der },
+        .{ .subject_cert_der = leaf4, .issuer_cert_der = fx.issuer_der },
+        .{ .subject_cert_der = leaf5, .issuer_cert_der = fx.issuer_der },
+        // reversed order: the second certificate again, last
+        .{ .subject_cert_der = leaf2, .issuer_cert_der = fx.issuer_der },
+    };
+    var out: [q.len]ocsp.CertOutcome = undefined;
+    try ocsp.verifyMany(parsed, &q, &out, defaultOpts());
+
+    try testing.expect(out[0] == .verdict and out[0].verdict.status == .good);
+    try testing.expect(out[1] == .verdict);
+    try testing.expectEqual(@as(?u8, 1), out[1].verdict.status.revoked.reason);
+    try testing.expect(out[2] == .verdict and out[2].verdict.status == .unknown);
+    try testing.expect(out[3] == .absent);
+    try testing.expectEqual(error.ResponseStale, out[4].failed);
+    try testing.expect(out[5] == .verdict and out[5].verdict.status == .revoked);
+
+    // Agrees with the single-cert API for each pair.
+    const v1 = try ocsp.verify(parsed, fx.issuer_der, leaf2, defaultOpts());
+    try testing.expectEqual(v1.status.revoked.revocation_time_unix, out[1].verdict.status.revoked.revocation_time_unix);
+    try testing.expectError(error.CertIdMismatch, ocsp.verify(parsed, fx.issuer_der, leaf4, defaultOpts()));
+    try testing.expectError(error.ResponseStale, ocsp.verify(parsed, fx.issuer_der, leaf5, defaultOpts()));
+}
+
+test "verifyMany: per-pair failures are isolated; response-wide ones are call errors" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    const subject = try extractBits(fx.subject_der);
+
+    const resp_der = try buildResponse(gpa, .{
+        .issuer = issuer,
+        .subject_serial = subject.serial,
+        .responder_by_name = issuer.subject_name,
+        .sign_rsa = fx.kp.secret_key,
+        .nonce = "abc",
+    });
+    defer gpa.free(resp_der);
+    var parsed = try ocsp.parseResponse(resp_der);
+
+    // A pair that is not a chain (subject vs itself as issuer) fails alone.
+    const q = [_]ocsp.CertPair{
+        .{ .subject_cert_der = fx.subject_der, .issuer_cert_der = fx.subject_der },
+        .{ .subject_cert_der = fx.subject_der, .issuer_cert_der = fx.issuer_der },
+        .{ .subject_cert_der = "junk", .issuer_cert_der = fx.issuer_der },
+    };
+    var out: [3]ocsp.CertOutcome = undefined;
+    var opts = defaultOpts();
+    opts.expected_nonce = "abc";
+    try ocsp.verifyMany(parsed, &q, &out, opts);
+    try testing.expectEqual(error.IssuerMismatch, out[0].failed);
+    try testing.expect(out[1] == .verdict);
+    try testing.expectEqual(error.Malformed, out[2].failed);
+
+    // Wrong nonce: every well-formed pair fails with NonceMismatch.
+    opts.expected_nonce = "xyz";
+    try ocsp.verifyMany(parsed, &q, &out, opts);
+    try testing.expectEqual(error.NonceMismatch, out[1].failed);
+
+    // Tampered signed bytes (the responder name): the pair fails, never a verdict.
+    const bad = try gpa.dupe(u8, resp_der);
+    defer gpa.free(bad);
+    const at = std.mem.find(u8, bad, "zig-libs OCSP test CA").?;
+    bad[at] ^= 1;
+    const parsed_bad = try ocsp.parseResponse(bad);
+    try ocsp.verifyMany(parsed_bad, q[1..2], out[1..2], defaultOpts());
+    try testing.expect(out[1] == .failed);
+
+    // Call-level errors.
+    try testing.expectError(error.LengthMismatch, ocsp.verifyMany(parsed, &q, out[0..2], defaultOpts()));
+    parsed.status = .try_later;
+    try testing.expectError(error.UnsuccessfulResponse, ocsp.verifyMany(parsed, &q, &out, defaultOpts()));
+    parsed.status = .successful;
+    parsed.basic = null;
+    try testing.expectError(error.UnsupportedResponseType, ocsp.verifyMany(parsed, &q, &out, defaultOpts()));
+    // empty query list on a good response is a no-op
+    var none: [0]ocsp.CertOutcome = .{};
+    parsed = try ocsp.parseResponse(resp_der);
+    try ocsp.verifyMany(parsed, &.{}, &none, defaultOpts());
+}
+
+test "buildRequests: several Requests in order; one-entry form equals buildRequest; empty refused" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const leaf2 = try makeLeaf(gpa, fx, "two.example.com", &.{ 0x43, 0x43 });
+    defer gpa.free(leaf2);
+    const pairs = [_]ocsp.CertPair{
+        .{ .subject_cert_der = fx.subject_der, .issuer_cert_der = fx.issuer_der },
+        .{ .subject_cert_der = leaf2, .issuer_cert_der = fx.issuer_der },
+    };
+
+    // one entry == buildRequest, byte for byte
+    const one = try ocsp.buildRequests(gpa, pairs[0..1], .{ .nonce = "n0nce" });
+    defer gpa.free(one);
+    const single = try ocsp.buildRequest(gpa, fx.subject_der, fx.issuer_der, .{ .nonce = "n0nce" });
+    defer gpa.free(single);
+    try testing.expectEqualSlices(u8, single, one);
+
+    const req = try ocsp.buildRequests(gpa, &pairs, .{ .hash = .sha256 });
+    defer gpa.free(req);
+    const outer = try elem(req, 0);
+    const tbs = try elem(req, outer.slice.start);
+    const req_list = try elem(req, tbs.slice.start);
+    var pos = req_list.slice.start;
+    const want = [_][]const u8{ &.{ 0x42, 0x42 }, &.{ 0x43, 0x43 } };
+    var n: usize = 0;
+    var exp_name: [32]u8 = undefined;
+    Sha256.hash((try extractBits(fx.issuer_der)).subject_name, &exp_name, .{});
+    while (pos < req_list.slice.end) : (n += 1) {
+        const request = try elem(req, pos);
+        pos = request.slice.end;
+        const cert_id = try elem(req, request.slice.start);
+        const alg = try elem(req, cert_id.slice.start);
+        const name_hash = try elem(req, alg.slice.end);
+        const key_hash = try elem(req, name_hash.slice.end);
+        const serial = try elem(req, key_hash.slice.end);
+        try testing.expectEqualSlices(u8, &exp_name, req[name_hash.slice.start..name_hash.slice.end]);
+        try testing.expectEqualSlices(u8, want[n], req[serial.slice.start..serial.slice.end]);
+    }
+    try testing.expectEqual(@as(usize, 2), n);
+
+    try testing.expectError(error.Malformed, ocsp.buildRequests(gpa, &.{}, .{}));
+    const badp = [_]ocsp.CertPair{.{ .subject_cert_der = "x", .issuer_cert_der = fx.issuer_der }};
+    try testing.expectError(error.Malformed, ocsp.buildRequests(gpa, &badp, .{}));
+
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, ocsp.buildRequests(failing.allocator(), &pairs, .{}));
 }
 
 test "verify: stale response (now > nextUpdate) → ResponseStale" {
