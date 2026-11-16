@@ -182,8 +182,6 @@ different prologue, so their bytes do not apply to tenantkex's transcript.)
 
 * **XX fallback** — when the responder's static key is *not* pre-provisioned.
   Would add a 3-message pattern and in-band responder-static transmission.
-* **PSK modes (IKpsk2)** — an additional pre-shared secret mixed in as a
-  quantum-resistance hedge; `noise` already implements the `psk` token.
 * **Rekey / rehandshake scheduling** — in-session rekey is `aeadframe`'s epoch
   bump; a fresh handshake is simply a new tenantkex session. No scheduler here.
 * **Retransmission / timeout** of handshake messages — owned by the caller's
@@ -223,7 +221,7 @@ wipe: `wipe()`), `FabricContext` (public), and a `noise` build whose DH leaves m
 
 ## Backlog / deferred
 
-- **IKpsk2 (PSK) mode** *(survey 2026-09-30)* — WireGuard runs IK with a PSK as a post-quantum hedge; `noise` already has the `psk` token. Effort: small; fits §2. (Listed in SPEC §6; survey: worth doing if the fabric wants the hedge.)
+- ✅ DONE 2026-11-16 (`Initiator/Responder.initPsk`/`initPskEphemeral`: opt-in `Noise_IKpsk2`, distinct prologue label `prologue_label_psk`, PSK copy wiped by `wipe`; tests: match, wrong PSK, PSK on one side, moved struct, noise-as-oracle KAT) **IKpsk2 (PSK) mode** *(survey 2026-09-30)* — WireGuard runs IK with a PSK as a post-quantum hedge; `noise` already has the `psk` token. Effort: small; fits §2. (Listed in SPEC §6; survey: worth doing if the fabric wants the hedge.)
 - **XX fallback** *(survey 2026-09-30)* — for a responder whose static key is not provisioned. Effort: small-medium; fits §2. (SPEC §6.)
 
 ## Anchoring

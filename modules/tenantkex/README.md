@@ -111,9 +111,18 @@ though they share that one tunnel — defence the outer WG layer cannot provide.
 Because the outer tunnel already hides identities from any off-path observer,
 IK's weaker identity-hiding (vs XX) is not a concern here (see SPEC.md §5).
 
+## PSK mode (opt-in)
+
+`Initiator.initPsk` / `Responder.initPsk` (and `initPskEphemeral`) run
+`Noise_IKpsk2` with a 32-byte pre-shared secret (WireGuard-style hedge). Both
+sides must use it with the same PSK; the plain IK `init` stays the default. A
+wrong PSK fails the initiator's `readMessage2` with `DecryptionFailed`; a PSK on
+one side only fails the responder's `readMessage1`. `wipe` destroys the module's
+copy of the PSK.
+
 ## Deferred
 
-XX fallback (responder static unknown), PSK modes (IKpsk2), rekey/rehandshake
+XX fallback (responder static unknown), rekey/rehandshake
 scheduling (aeadframe's epoch handles in-session rekey; a fresh handshake is a
 new session), handshake-message retransmission/timeout (the transport owns it).
 
