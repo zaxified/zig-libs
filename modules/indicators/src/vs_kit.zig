@@ -209,8 +209,12 @@ pub fn run(comptime Core: type, c: *Core, p: Core.Params, ins: anytype, outs: an
         }
     }
     if (fast) {
+        // The core's state in a local: through `c` every output store could alias it (the outputs are f64 slices
+        // too), and the recurrences would go through memory on every bar.
+        var cc = c.*;
+        defer c.* = cc;
         while (i < n) : (i += 1) {
-            const r = c.steadyStep(src, src.at(i));
+            const r = cc.steadyStep(src, src.at(i));
             inline for (0..outs.len) |k| outs[k][i] = core.to(Child(@TypeOf(outs[k])), outAt(r, k));
         }
     }

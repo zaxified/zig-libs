@@ -70,8 +70,22 @@ pub fn midpointLookback(p: MidParams) Error!usize {
     try MidpointCore.validate(p);
     return MidpointCore.lookback(p);
 }
+/// The batch runs TA-Lib's block scan (`window.hiLoBlocks`) up to `window.block_cap` bars of period, the
+/// streaming automaton above it; the two differ only where a NaN or a 0.0 / -0.0 tie is in the window.
 pub fn midpoint(comptime T: type, in: []const T, out: []T, p: MidParams) Error!usize {
-    return smooth.batch1(T, MidpointCore, in, out, p);
+    core.checkFloat(T);
+    try core.checkLen(in.len, &.{out.len});
+    try MidpointCore.validate(p);
+    const Sink = struct {
+        out: []T,
+        pub inline fn put(s: @This(), k: usize, h: f64, l: f64) void {
+            s.out[k] = core.to(T, (h + l) / 2.0);
+        }
+    };
+    if (!window.hiLoBlocks(T, in, in, p.period, Sink{ .out = out })) return smooth.batch1(T, MidpointCore, in, out, p);
+    const lb = MidpointCore.lookback(p);
+    for (out[0..@min(lb, out.len)]) |*o| o.* = std.math.nan(T);
+    return lb;
 }
 pub fn MidpointStream(comptime T: type) type {
     return smooth.Stream1(T, MidParams, MidpointCore);
@@ -119,8 +133,22 @@ pub fn midpriceLookback(p: MidParams) Error!usize {
     try MidpriceCore.validate(p);
     return MidpriceCore.lookback(p);
 }
+/// The batch runs TA-Lib's block scan up to `window.block_cap` bars of period, as `midpoint` does.
 pub fn midprice(comptime T: type, high: []const T, low: []const T, out: []T, p: MidParams) Error!usize {
-    return hist.batch(T, MidpriceCore, .{ high, low }, .{out}, p, &.{});
+    core.checkFloat(T);
+    try core.checkLen(high.len, &.{ low.len, out.len });
+    try MidpriceCore.validate(p);
+    const Sink = struct {
+        out: []T,
+        pub inline fn put(s: @This(), k: usize, h: f64, l: f64) void {
+            s.out[k] = core.to(T, (h + l) / 2.0);
+        }
+    };
+    if (!window.hiLoBlocks(T, high, low, p.period, Sink{ .out = out }))
+        return hist.batch(T, MidpriceCore, .{ high, low }, .{out}, p, &.{});
+    const lb = MidpriceCore.lookback(p);
+    for (out[0..@min(lb, out.len)]) |*o| o.* = std.math.nan(T);
+    return lb;
 }
 pub fn MidpriceStream(comptime T: type) type {
     return hist.Stream(T, MidParams, MidpriceCore);

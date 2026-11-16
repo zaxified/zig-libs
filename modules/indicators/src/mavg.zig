@@ -749,6 +749,63 @@ pub const HmaCore = struct {
         self.dring[m % self.s] = diff;
         return self.outer.step(DRingSrc{ .buf = &self.dring, .len = self.s }, diff);
     }
+    /// The steady path of `smooth.runCore`: from the first output on.
+    pub fn steady(self: *const HmaCore) bool {
+        return self.p == 1 or self.n >= self.p - 1 + self.s - 1;
+    }
+    /// `step` over bars `i..` as one loop: the three averages' steady updates (`WmaCore.steadyStep`, so the same
+    /// operations in the same order), the difference ring indexed by a wrapping counter instead of `% s`.
+    pub fn steadyRun(self: *HmaCore, comptime T: type, in: []const T, out: []T, i: usize) void {
+        defer self.n = in.len;
+        if (self.p == 1) {
+            for (in[i..], out[i..]) |x, *o| o.* = core.to(T, @as(f64, x));
+            return;
+        }
+        if (i >= in.len) return;
+        const Off = struct {
+            xs: []const T,
+            off: usize,
+            pub inline fn at(s: @This(), j: usize) f64 {
+                return s.xs[j + s.off];
+            }
+        };
+        // The outer average's bar `j` is `dring[j % s]`; it only reads bars `m + 1 - s .. m` of the current `m`.
+        const Ring = struct {
+            buf: *const [hma_max_ring]f64,
+            s: usize,
+            m: usize,
+            ri: usize, // m % s
+            pub inline fn at(r: @This(), j: usize) f64 {
+                const back = r.m - j;
+                return r.buf[if (r.ri >= back) r.ri - back else r.ri + r.s - back];
+            }
+        };
+        const full_src = Off{ .xs = in, .off = 0 };
+        const half_src = Off{ .xs = in, .off = self.shift };
+        // The three averages in locals: through `self` every `out[n]` store could alias their running sums.
+        var full = self.full;
+        var half = self.half;
+        var outer = self.outer;
+        defer {
+            self.full = full;
+            self.half = half;
+            self.outer = outer;
+        }
+        var m = i - (self.p - 1);
+        var ri = m % self.s;
+        var n = i;
+        while (n < in.len) : (n += 1) {
+            const x: f64 = in[n];
+            const f = full.steadyStep(full_src, x);
+            const h = half.steadyStep(half_src, x);
+            const diff = 2.0 * h - f;
+            self.dring[ri] = diff;
+            out[n] = core.to(T, outer.steadyStep(Ring{ .buf = &self.dring, .s = self.s, .m = m, .ri = ri }, diff));
+            m += 1;
+            ri += 1;
+            if (ri == self.s) ri = 0;
+        }
+    }
 };
 
 pub fn hmaLookback(p: HmaParams) Error!usize {

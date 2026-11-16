@@ -762,8 +762,11 @@ fn runEntry(
         }
     }
     // `nan = .skip` answers differently in batch and stream by design (see SPEC); so do the batch MAX / MIN / MINMAX
-    // (block scan) and their stream (automaton) where a NaN is in the data (SPEC, MAX / MIN / MINMAX).
-    const block_scan = comptime std.mem.eql(u8, name, "max") or std.mem.eql(u8, name, "min") or std.mem.eql(u8, name, "minmax");
+    // (block scan) and their stream (automaton) where a NaN is in the data (SPEC, MAX / MIN / MINMAX), and so do
+    // MIDPOINT / MIDPRICE / WILLR / ICHIMOKU, whose batch runs the same scan (`window.hiLoBlocks`).
+    const block_scan = comptime std.mem.eql(u8, name, "max") or std.mem.eql(u8, name, "min") or
+        std.mem.eql(u8, name, "minmax") or std.mem.eql(u8, name, "midpoint") or std.mem.eql(u8, name, "midprice") or
+        std.mem.eql(u8, name, "willr") or std.mem.eql(u8, name, "ichimoku");
     const skipcase = (skip_mode and has_nan and p.nan == .skip) or (block_scan and has_nan);
     cur_info_len = if (std.fmt.bufPrint(&cur_info, "n={d} p={any}", .{ n, p })) |s| s.len else |_| 0;
 

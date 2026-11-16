@@ -212,6 +212,72 @@ pub fn extBatch(comptime T: type, comptime is_max: bool, in: []const T, out: []T
     return lb;
 }
 
+/// The longest period `hiLoBlocks` serves; its two suffix arrays live on the stack (4 KiB). TA-Lib keeps 30 on
+/// its stack and allocates past that; the batch functions that use the kernel take no allocator, so a longer
+/// period runs the caller's automaton instead (same values except where a NaN or a 0.0 / -0.0 tie shows).
+pub const block_cap: usize = 256;
+
+/// TA-Lib 0.8.3's batch window extrema over a highs and a lows series at once — the block scan of `ta_MIDPOINT.c`,
+/// `ta_MIDPRICE.c` and `ta_WILLR.c`, the two-series form of `extBatch` with the same tie rule (the block suffix,
+/// scanned backward with a strict comparison, wins a tie against the next block's prefix). Calls
+/// `sink.put(k, highest, lowest)` for every bar `k >= per - 1` in increasing order, the highest of `hs[k + 1 - per
+/// .. k]` and the lowest of `ls[...]` (pass one series twice for MIDPOINT). Returns false and calls nothing when
+/// `per > block_cap`. Amortized two comparisons per bar and series, no rescans, no allocation.
+pub fn hiLoBlocks(comptime T: type, hs: []const T, ls: []const T, per: usize, sink: anytype) bool {
+    if (per == 0) return false;
+    return hiLoBlocksFrom(T, hs, ls, per, per - 1, sink);
+}
+
+/// `hiLoBlocks` with the first output at bar `from >= per - 1` and the blocks aligned on `from + 1 - per`, as
+/// TA-Lib aligns them when a caller asks for a later start (ICHIMOKU's three MIDPRICE calls start at the longest
+/// lookback): bars before `from` are not reported.
+pub fn hiLoBlocksFrom(comptime T: type, hs: []const T, ls: []const T, per: usize, from: usize, sink: anytype) bool {
+    if (per > block_cap or per == 0 or from + 1 < per) return false;
+    var suf_h: [block_cap]f64 = undefined;
+    var suf_l: [block_cap]f64 = undefined;
+    const n = @min(hs.len, ls.len);
+    var b: usize = from + 1 - per; // block start; the block is [b, b + per - 1]
+    while (b + per <= n) : (b += per) {
+        const first = b + per - 1;
+        var h: f64 = hs[first];
+        var l: f64 = ls[first];
+        suf_h[per - 1] = h;
+        suf_l[per - 1] = l;
+        var i = per - 1;
+        while (i > 0) {
+            i -= 1;
+            const xh: f64 = hs[b + i];
+            const xl: f64 = ls[b + i];
+            if (xh > h) h = xh;
+            if (xl < l) l = xl;
+            suf_h[i] = h;
+            suf_l[i] = l;
+        }
+        sink.put(first, h, l);
+        // The windows ending in the next block: this block's suffix from `m` on, that block's prefix up to `m - 1`.
+        const next = b + per;
+        if (next >= n) break;
+        const avail = @min(per - 1, n - next);
+        var ph: f64 = hs[next];
+        var pl: f64 = ls[next];
+        var m: usize = 1;
+        while (m <= avail) : (m += 1) {
+            if (m > 1) {
+                const xh: f64 = hs[next + m - 1];
+                const xl: f64 = ls[next + m - 1];
+                if (xh > ph) ph = xh;
+                if (xl < pl) pl = xl;
+            }
+            var hh = suf_h[m];
+            if (ph > hh) hh = ph;
+            var ll = suf_l[m];
+            if (pl < ll) ll = pl;
+            sink.put(first + m, hh, ll);
+        }
+    }
+    return true;
+}
+
 pub fn maxLookback(p: MaxParams) Error!usize {
     try MaxCore.validate(p);
     return MaxCore.lookback(p);
@@ -371,4 +437,117 @@ test "max/min batch is TA-Lib's block scan; the streaming automaton decides ties
     try testing.expect(std.math.signbit(got[2].?));
     try testing.expect(!std.math.signbit(got[3].?));
     try testing.expect(std.math.signbit(got[4].?));
+}
+
+test "hiLoBlocks: every window's highest and lowest, across block edges and short tails, against a naive scan" {
+    var prng = std.Random.DefaultPrng.init(0x9e3779b97f4a7c15);
+    const rnd = prng.random();
+    var hs: [300]f64 = undefined;
+    var ls: [300]f64 = undefined;
+    const Sink = struct {
+        hi: []f64,
+        lo: []f64,
+        seen: []bool,
+        last: *usize,
+        pub fn put(s: @This(), k: usize, h: f64, l: f64) void {
+            // Strictly increasing, each bar once.
+            std.debug.assert(s.last.* == std.math.maxInt(usize) or k == s.last.* + 1);
+            s.last.* = k;
+            s.hi[k] = h;
+            s.lo[k] = l;
+            s.seen[k] = true;
+        }
+    };
+    var hi: [300]f64 = undefined;
+    var lo: [300]f64 = undefined;
+    var seen: [300]bool = undefined;
+    for (0..400) |_| {
+        const n = rnd.intRangeAtMost(usize, 0, 300);
+        const per = rnd.intRangeAtMost(usize, 1, 40);
+        // Few distinct values, so ties are common.
+        for (hs[0..n], ls[0..n]) |*h, *l| {
+            h.* = @floatFromInt(rnd.intRangeAtMost(i32, -4, 4));
+            l.* = @floatFromInt(rnd.intRangeAtMost(i32, -4, 4));
+        }
+        @memset(&seen, false);
+        var last: usize = std.math.maxInt(usize);
+        try testing.expect(hiLoBlocks(f64, hs[0..n], ls[0..n], per, Sink{ .hi = &hi, .lo = &lo, .seen = &seen, .last = &last }));
+        for (0..n) |k| {
+            try testing.expectEqual(k + 1 >= per, seen[k]);
+            if (k + 1 < per) continue;
+            var eh = hs[k + 1 - per];
+            var el = ls[k + 1 - per];
+            for (k + 1 - per..k + 1) |j| {
+                eh = @max(eh, hs[j]);
+                el = @min(el, ls[j]);
+            }
+            try testing.expectEqual(eh, hi[k]);
+            try testing.expectEqual(el, lo[k]);
+        }
+    }
+    // Past the stack scratch it declines and calls nothing.
+    const Never = struct {
+        pub fn put(_: @This(), _: usize, _: f64, _: f64) void {
+            unreachable;
+        }
+    };
+    try testing.expect(!hiLoBlocks(f64, hs[0..0], ls[0..0], block_cap + 1, Never{}));
+}
+
+test "midpoint / midprice / willr / ichimoku batch (block scan) equal the stream on both sides of block_cap" {
+    var prng = std.Random.DefaultPrng.init(42);
+    const rnd = prng.random();
+    const n = 700;
+    var h: [n]f64 = undefined;
+    var l: [n]f64 = undefined;
+    var c: [n]f64 = undefined;
+    var x: f64 = 100;
+    for (&h, &l, &c) |*hh, *ll, *cc| {
+        x += (rnd.float(f64) - 0.5);
+        hh.* = x + rnd.float(f64);
+        ll.* = x - rnd.float(f64);
+        cc.* = x;
+    }
+    const ind = @import("root.zig");
+    var out: [n]f64 = undefined;
+    var buf: [4 * 302]f64 = undefined;
+    for ([_]usize{ 2, 3, 14, 30, 255, 256, 257, 300 }) |per| {
+        _ = try ind.midpoint(f64, &c, &out, .{ .period = per });
+        var s1 = try ind.MidpointStream(f64).init(.{ .period = per }, &buf);
+        for (c, out) |v, o| try expectSameOpt(o, s1.update(v));
+        _ = try ind.midprice(f64, &h, &l, &out, .{ .period = per });
+        var s2 = try ind.MidpriceStream(f64).init(.{ .period = per }, &buf);
+        for (h, l, out) |hh, ll, o| try expectSameOpt(o, s2.update(.{ .high = hh, .low = ll }));
+        _ = try ind.willr(f64, &h, &l, &c, &out, .{ .period = per });
+        var s3 = try ind.WillrStream(f64).init(.{ .period = per }, &buf);
+        for (h, l, c, out) |hh, ll, cc, o| try expectSameOpt(o, s3.update(.{ .high = hh, .low = ll, .close = cc }));
+        // MFI: the batch's stack ring of flows (period <= 256) against the stream's recomputed flows.
+        var v: [n]f64 = undefined;
+        for (&v, 0..) |*vv, j| vv.* = 1000.0 + @as(f64, @floatFromInt(j % 17));
+        _ = try ind.mfi(f64, &h, &l, &c, &v, &out, .{ .period = per });
+        var s5 = try ind.MfiStream(f64).init(.{ .period = per }, &buf);
+        for (h, l, c, v, out) |hh, ll, cc, vv, o| try expectSameOpt(o, s5.update(.{ .high = hh, .low = ll, .close = cc, .volume = vv }));
+        // ICHIMOKU: the shorter periods' blocks are aligned on the longest lookback, not on bar 0.
+        const ip = ind.IchimokuParams{ .tenkan = @max(2, per / 3), .kijun = @max(2, per / 2), .senkou_b = per };
+        var t: [n]f64 = undefined;
+        var k: [n]f64 = undefined;
+        var a: [n]f64 = undefined;
+        var sb: [n]f64 = undefined;
+        _ = try ind.ichimoku(f64, &h, &l, &t, &k, &a, &sb, ip);
+        var s4 = try ind.IchimokuStream(f64).init(ip, &buf);
+        for (h, l, 0..) |hh, ll, j| {
+            if (s4.update(.{ .high = hh, .low = ll })) |r| {
+                try testing.expectEqual(@as(u64, @bitCast(r.tenkan)), @as(u64, @bitCast(t[j])));
+                try testing.expectEqual(@as(u64, @bitCast(r.kijun)), @as(u64, @bitCast(k[j])));
+                try testing.expectEqual(@as(u64, @bitCast(r.senkou_a)), @as(u64, @bitCast(a[j])));
+                try testing.expectEqual(@as(u64, @bitCast(r.senkou_b)), @as(u64, @bitCast(sb[j])));
+            } else try testing.expect(std.math.isNan(t[j]) and std.math.isNan(k[j]) and std.math.isNan(a[j]) and std.math.isNan(sb[j]));
+        }
+    }
+}
+
+fn expectSameOpt(batch: f64, stream: ?f64) !void {
+    if (stream) |v| {
+        try testing.expectEqual(@as(u64, @bitCast(v)), @as(u64, @bitCast(batch)));
+    } else try testing.expect(std.math.isNan(batch));
 }

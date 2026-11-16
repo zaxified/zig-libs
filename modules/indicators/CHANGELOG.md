@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Batch speed (P-gap work, second round; every output on NaN-free data bit for bit unchanged):
+  MIDPOINT, MIDPRICE, WILLR and ICHIMOKU (f64) run TA-Lib's block scan of the window extremes (`ta_MIDPOINT.c`,
+  `ta_WILLR.c`, three `TA_MIDPRICE` calls; new `window.hiLoBlocks`, stack scratch up to period 256, the automaton
+  above) — 3.5x / 2.2x / 3.1x TA-Lib before, 0.68-0.93x now; STC keeps its two stochastic windows with TA-Lib's
+  online block scan (`ta_STC.c`'s rings with suffix arrays) instead of rescanning them through a `%`-indexed ring
+  each bar, branchless — 6.4x to 1.9x; MFI takes the leaving money flow from a stack ring in the batch (period up
+  to 256) and selects its flows without branches — 3.3x to 1.5x; HMA has a fused steady loop without `%` — 3.9x to
+  2.4x. **Behaviour change where a NaN is in a window:** the batch MIDPOINT / MIDPRICE / WILLR / ICHIMOKU now answer
+  as TA-Lib's batch does (block scan), which can differ from their streams there (as MAX / MIN / MINMAX already
+  did); STC's stream and batch both follow TA-Lib's block scan, so a window holding a NaN or a 0.0 / -0.0 tie can
+  answer differently from before. **`StcStream.bufLen` grows** from `2 * cycle` to `6 * cycle + 4` f64 (callers
+  that size the buffer with `bufLen` are unaffected).
 - **2026-11-15** — ALMA through `MaCore` (MA, MACDEXT, BBANDS, ... with `.alma`) uses a precomputed weight table for periods up to 64
   (inline in the core, no allocator; larger periods keep the per-bar recompute): 27-38x faster on a 1e5-bar series, output bit for bit
   unchanged. `Stream1`'s dead NaN-skip branch is removed (a ring core with a `nan` parameter is now a compile error). Delta mutation: 6

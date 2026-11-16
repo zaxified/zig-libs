@@ -293,8 +293,33 @@ pub fn ichimokuLookback(p: IchimokuParams) Error!usize {
     try IchimokuCore.validate(p);
     return IchimokuCore.lookback(p);
 }
+/// The f64 batch is TA-Lib's: three block-scan midprices (`window.hiLoBlocksFrom`, aligned on the common lookback as
+/// TA_ICHIMOKU's three TA_MIDPRICE calls are) and their mean; f32 and periods over `window.block_cap` step the
+/// automaton. The two differ only where a NaN or a 0.0 / -0.0 tie is in a window.
 pub fn ichimoku(comptime T: type, high: []const T, low: []const T, tenkan: []T, kijun: []T, senkou_a: []T, senkou_b: []T, p: IchimokuParams) Error!usize {
+    core.checkFloat(T);
+    try core.checkLen(high.len, &.{ low.len, tenkan.len, kijun.len, senkou_a.len, senkou_b.len });
+    try IchimokuCore.validate(p);
+    if (T == f64 and IchimokuCore.ringLen(p) <= window.block_cap) return ichimokuBlocks(high, low, tenkan, kijun, senkou_a, senkou_b, p);
     return hist.batch(T, IchimokuCore, .{ high, low }, .{ tenkan, kijun, senkou_a, senkou_b }, p, &.{});
+}
+fn ichimokuBlocks(high: []const f64, low: []const f64, tenkan: []f64, kijun: []f64, senkou_a: []f64, senkou_b: []f64, p: IchimokuParams) usize {
+    const lb = IchimokuCore.lookback(p);
+    const Sink = struct {
+        out: []f64,
+        pub inline fn put(s: @This(), k: usize, h: f64, l: f64) void {
+            s.out[k] = (h + l) / 2.0;
+        }
+    };
+    _ = window.hiLoBlocksFrom(f64, high, low, p.tenkan, lb, Sink{ .out = tenkan });
+    _ = window.hiLoBlocksFrom(f64, high, low, p.kijun, lb, Sink{ .out = kijun });
+    _ = window.hiLoBlocksFrom(f64, high, low, p.senkou_b, lb, Sink{ .out = senkou_b });
+    if (lb < high.len) {
+        for (tenkan[lb..], kijun[lb..], senkou_a[lb..]) |t, k, *a| a.* = (t + k) / 2.0;
+    }
+    const lead = @min(lb, high.len);
+    inline for (.{ tenkan, kijun, senkou_a, senkou_b }) |o| @memset(o[0..lead], std.math.nan(f64));
+    return lb;
 }
 pub fn IchimokuStream(comptime T: type) type {
     return hist.Stream(T, IchimokuParams, IchimokuCore);

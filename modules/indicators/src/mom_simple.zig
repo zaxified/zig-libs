@@ -18,6 +18,7 @@ const core = @import("core.zig");
 const smooth = @import("smooth.zig");
 const vs = @import("vs_kit.zig");
 const mu = @import("mom_util.zig");
+const window = @import("window.zig");
 const Error = core.Error;
 const Unstable = core.Unstable;
 const pf = core.pf;
@@ -1085,8 +1086,24 @@ pub fn willrLookback(p: WillrParams) Error!usize {
     try WILLR.validate(p);
     return WILLR.lookback(p);
 }
+/// The batch runs TA-Lib's block scan (`window.hiLoBlocks`, as `ta_WILLR.c` does) up to `window.block_cap` bars of
+/// period, the per-bar window scan of the stream above it; the two differ only where a NaN or a 0.0 / -0.0 tie shows.
 pub fn willr(comptime T: type, high: []const T, low: []const T, close: []const T, out: []T, p: WillrParams) Error!usize {
-    return vs.batch(T, WILLR, p, .{ .high = high, .low = low, .close = close }, .{out});
+    core.checkFloat(T);
+    try WILLR.validate(p);
+    try core.checkLen(high.len, &.{ low.len, close.len, out.len });
+    const Sink = struct {
+        close: []const T,
+        out: []T,
+        pub inline fn put(s: @This(), k: usize, h: f64, l: f64) void {
+            s.out[k] = core.to(T, WILLR.value(h, l, s.close[k]));
+        }
+    };
+    if (!window.hiLoBlocks(T, high, low, p.period, Sink{ .close = close, .out = out }))
+        return vs.batch(T, WILLR, p, .{ .high = high, .low = low, .close = close }, .{out});
+    const lb = WILLR.lookback(p);
+    for (out[0..@min(lb, out.len)]) |*o| o.* = std.math.nan(T);
+    return lb;
 }
 pub fn WillrStream(comptime T: type) type {
     return vs.Stream(T, WILLR);
@@ -1460,6 +1477,10 @@ pub const MFI = struct {
     pos: f64 = 0.0,
     neg: f64 = 0.0,
     null_run: usize = 0,
+    // Typical prices already computed: of bar `n - 1`, and of bar `n - p - 1` (the older side of the flow that
+    // leaves the window at the next step). Each is the same expression on the same bar, so the same double.
+    tp_prev: f64 = 0.0,
+    tp_old: f64 = 0.0,
     pub fn validate(p: Params) Error!void {
         try checkP(p.period, 2);
     }
@@ -1476,33 +1497,56 @@ pub const MFI = struct {
     fn tp(t: In) f64 {
         return (t.high + t.low + t.close) / 3.0;
     }
-    const Flow = struct { money: f64, pos: f64, neg: f64 };
-    fn flow(cur: In, prev: In) Flow {
-        const a = tp(cur);
-        const pv = tp(prev);
+    /// `no_money`: the bar's money flow is 0.0 (TA-Lib's `moneyFlow == 0.0`).
+    const Flow = struct { no_money: bool, pos: f64, neg: f64 };
+    fn flowTp(a: f64, pv: f64, volume: f64) Flow {
         const diff = a - pv;
         const scale = @abs(a) + @abs(pv);
-        const raw = a * cur.volume;
-        const money = if (zeroScaled(diff, scale)) 0.0 else raw;
-        return .{
-            .money = money,
-            .pos = if (diff < 0.0) 0.0 else money,
-            .neg = if (diff < 0.0) money else 0.0,
-        };
+        const raw = a * volume;
+        const keep = !zeroScaled(diff, scale);
+        // money = keep ? raw : 0.0; pos = diff < 0 ? 0.0 : money; neg = diff < 0 ? money : 0.0 — as two-lane
+        // selects on vector compares: LLVM turns the scalar ternaries into branches (sinking the `volume` load into
+        // them), and the sign of a random walk's step mispredicts half of those.
+        const V = @Vector(2, f64);
+        const z: V = @splat(0.0);
+        const down: @Vector(2, bool) = @as(V, @splat(diff)) < z;
+        const flows = @select(f64, down, V{ 0.0, raw }, V{ raw, 0.0 });
+        const small: @Vector(2, bool) = @abs(@as(V, @splat(diff))) <= @as(V, @splat(eps * scale));
+        const sel = @select(f64, small, z, flows);
+        return .{ .no_money = !keep or raw == 0.0, .pos = sel[0], .neg = sel[1] };
     }
     pub fn step(self: *Self, src: anytype, b: In) ?f64 {
         const n = self.n;
+        if (n > self.p) return self.steadyStep(src, b);
         self.n += 1;
+        const a = tp(b);
+        defer self.tp_prev = a;
         if (n == 0) return null;
-        if (n > self.p) {
-            const old = flow(src.at(n - self.p), src.at(n - self.p - 1));
-            self.pos -= old.pos;
-            self.neg -= old.neg;
-        }
-        const f = flow(b, src.at(n - 1));
+        if (n == self.p) self.tp_old = tp(src.at(0));
+        return self.tail(flowTp(a, self.tp_prev, b.volume), n);
+    }
+    /// The step once a flow leaves the window at every bar (`n > p`), bitwise `step`.
+    pub fn steady(self: *const Self) bool {
+        return self.n > self.p;
+    }
+    pub inline fn steadyStep(self: *Self, src: anytype, b: In) f64 {
+        const n = self.n;
+        self.n += 1;
+        const leaving = src.at(n - self.p);
+        const oc = tp(leaving);
+        const old = flowTp(oc, self.tp_old, leaving.volume);
+        self.tp_old = oc;
+        self.pos -= old.pos;
+        self.neg -= old.neg;
+        const a = tp(b);
+        const f = flowTp(a, self.tp_prev, b.volume);
+        self.tp_prev = a;
+        return self.tail(f, n).?;
+    }
+    inline fn tail(self: *Self, f: Flow, n: usize) ?f64 {
         self.pos += f.pos;
         self.neg += f.neg;
-        self.null_run = if (f.money == 0.0) self.null_run + 1 else 0;
+        self.null_run = if (f.no_money) self.null_run + 1 else 0;
         if (self.null_run >= self.p) {
             self.null_run = self.p;
             self.pos = 0.0;
@@ -1519,8 +1563,54 @@ pub fn mfiLookback(p: MfiParams) Error!usize {
     try MFI.validate(p);
     return MFI.lookback(p);
 }
+/// The longest period whose batch keeps its money flows in a stack ring (TA-Lib's `mflow` arrays) instead of
+/// recomputing the flow that leaves the window from its two bars.
+const mfi_ring_cap = 256;
+
+/// The batch steps the core over the first `period + 1` bars, then runs TA-Lib's loop: one typical price and one
+/// flow per bar, the leaving flow taken from a ring (the same double the core recomputes, so bitwise `MfiStream`).
 pub fn mfi(comptime T: type, high: []const T, low: []const T, close: []const T, volume: []const T, out: []T, p: MfiParams) Error!usize {
-    return vs.batch(T, MFI, p, .{ .high = high, .low = low, .close = close, .volume = volume }, .{out});
+    core.checkFloat(T);
+    try MFI.validate(p);
+    try core.checkLen(high.len, &.{ low.len, close.len, volume.len, out.len });
+    const ins = .{ .high = high, .low = low, .close = close, .volume = volume };
+    const per = p.period;
+    const n = high.len;
+    if (per > mfi_ring_cap or n <= per + 1) return vs.batch(T, MFI, p, ins, .{out});
+    const k = per + 1; // from bar k on, every step drops a flow
+    var c = try MFI.init(p);
+    _ = try vs.run(MFI, &c, p, .{ .high = high[0..k], .low = low[0..k], .close = close[0..k], .volume = volume[0..k] }, .{out[0..k]});
+    const src = vs.SliceSrc(MFI.In, @TypeOf(ins)){ .ins = ins };
+    // Bar j's flow (against bar j - 1) sits in slot j % per; fill bars 1 .. per.
+    var pos_r: [mfi_ring_cap]f64 = undefined;
+    var neg_r: [mfi_ring_cap]f64 = undefined;
+    var prev = MFI.tp(src.at(0));
+    for (1..k) |j| {
+        const b = src.at(j);
+        const a = MFI.tp(b);
+        const f = MFI.flowTp(a, prev, b.volume);
+        pos_r[j % per] = f.pos;
+        neg_r[j % per] = f.neg;
+        prev = a;
+    }
+    var cc = c;
+    var slot = k % per;
+    var i = k;
+    while (i < n) : (i += 1) {
+        cc.pos -= pos_r[slot];
+        cc.neg -= neg_r[slot];
+        const b = src.at(i);
+        const a = MFI.tp(b);
+        const f = MFI.flowTp(a, cc.tp_prev, b.volume);
+        cc.tp_prev = a;
+        pos_r[slot] = f.pos;
+        neg_r[slot] = f.neg;
+        slot += 1;
+        if (slot == per) slot = 0;
+        cc.n += 1;
+        out[i] = core.to(T, cc.tail(f, i).?);
+    }
+    return MFI.lookback(p);
 }
 pub fn MfiStream(comptime T: type) type {
     return vs.Stream(T, MFI);
@@ -1939,7 +2029,7 @@ test "fractal: batch == streaming" {
     try testing.expect(any);
 }
 
-test "willr / cci batch equal the stepped core bit for bit (zero ties, NaN, inf)" {
+test "willr / cci batch equal the stepped core (cci bit for bit; willr where no NaN is in the window; zero ties, NaN, inf)" {
     const th_ = @import("testhelp.zig");
     var prng = std.Random.DefaultPrng.init(0xc1a5);
     const r = prng.random();
@@ -1977,9 +2067,18 @@ test "willr / cci batch equal the stepped core bit for bit (zero ties, NaN, inf)
         _ = try willr(f64, &h, &l, &c, &out, .{ .period = per });
         var s = WILLR.init(.{ .period = per }) catch unreachable;
         const src = vs.SliceSrc(WILLR.In, struct { high: []const f64, low: []const f64, close: []const f64 }){ .ins = .{ .high = &h, .low = &l, .close = &c } };
+        // The batch is TA-Lib's block scan (`window.hiLoBlocks`), the stepped core a window scan: the same value
+        // wherever the window holds no NaN, up to the sign of a zero (which of an equal 0.0 / -0.0 pair wins).
         for (0..n) |i| {
             const want = s.step(src, src.at(i));
-            if (want) |w| try testing.expect(th_.sameBits(w, out[i])) else try testing.expect(std.math.isNan(out[i]));
+            const w = want orelse {
+                try testing.expect(std.math.isNan(out[i]));
+                continue;
+            };
+            var has_nan = false;
+            for (i + 1 - per..i + 1) |j| has_nan = has_nan or std.math.isNan(h[j]) or std.math.isNan(l[j]);
+            if (has_nan) continue;
+            try testing.expect(w == out[i] or (std.math.isNan(w) and std.math.isNan(out[i])));
         }
         var out2: [n]f64 = undefined;
         _ = try cci(f64, &h, &l, &c, &out2, .{ .period = per });

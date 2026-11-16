@@ -483,6 +483,66 @@ pub const StcParams = struct {
     unstable: Unstable = core.no_unstable,
 };
 
+/// The extremes of the last `len` values of a derived series, the online block scan of TA-Lib's `ta_STC.c` (its
+/// `lineRing` / `pfRing` with their suffix arrays): the running extremes of the current block of `len` pushes
+/// combined with the suffix extremes of the previous block from the same slot on, the suffixes rebuilt once per
+/// block. Amortized two comparisons per value instead of a rescan of the window; the newer value wins a tie, as in
+/// TA-Lib. `extremes` touches only the scalar state, `commit` writes the arrays (so `peek` can skip it).
+const BlockWin = struct {
+    const V = @Vector(2, f64);
+    ring: []f64,
+    // Suffix extremes of the last full block: `suf_hi[i]`, and the NEGATED lowest `suf_nlo[i]`, so that one
+    // two-lane `x > p` select keeps both (negation is exact, so `-x > -lo` is `x < lo` bit for bit, NaN and zero
+    // signs included). Slot `len` is a -inf sentinel, as are all slots until the first block is complete: a
+    // combine with it changes nothing, so the "no suffix yet / last slot" test of TA-Lib needs no branch.
+    suf_hi: []f64,
+    suf_nlo: []f64,
+    idx: usize = 0,
+    count: usize = 0,
+    pre: V = @splat(0.0), // running {highest, -lowest} of the current block
+
+    fn carve(rest: *[]f64, len: usize) BlockWin {
+        const all = rest.*[0 .. 3 * len + 2];
+        rest.* = rest.*[3 * len + 2 ..];
+        @memset(all[0..len], 0.0);
+        @memset(all[len..], -std.math.inf(f64));
+        return .{ .ring = all[0..len], .suf_hi = all[len .. 2 * len + 1], .suf_nlo = all[2 * len + 1 ..] };
+    }
+    fn slots(len: usize) usize {
+        return 3 * len + 2;
+    }
+    /// The highest and lowest of the window that ends with `v` (`count` counts `v`).
+    inline fn extremes(w: *BlockWin, v: f64) [2]f64 {
+        w.count += 1;
+        const x = V{ v, -v };
+        const kept = @select(f64, x > w.pre, x, w.pre);
+        w.pre = @select(f64, @as(@Vector(2, bool), @splat(w.idx == 0)), x, kept);
+        const sfx = V{ w.suf_hi[w.idx + 1], w.suf_nlo[w.idx + 1] };
+        const r = @select(f64, sfx > w.pre, sfx, w.pre);
+        return .{ r[0], -r[1] };
+    }
+    /// After `extremes(v)`: park `v`; at the end of a block, rebuild the suffix extremes from it.
+    fn commit(w: *BlockWin, v: f64) void {
+        w.ring[w.idx] = v;
+        w.idx += 1;
+        if (w.idx < w.ring.len) return;
+        w.idx = 0;
+        var i = w.ring.len - 1;
+        var hi = w.ring[i];
+        var lo = hi;
+        w.suf_hi[i] = hi;
+        w.suf_nlo[i] = -lo;
+        while (i > 0) {
+            i -= 1;
+            const t = w.ring[i];
+            if (t > hi) hi = t;
+            if (t < lo) lo = t;
+            w.suf_hi[i] = hi;
+            w.suf_nlo[i] = -lo;
+        }
+    }
+};
+
 pub const STC = struct {
     const Self = @This();
     pub const In = vs.X(f64);
@@ -501,8 +561,8 @@ pub const STC = struct {
     l_line: usize, // bar of the first line value (the slow EMA's lookback)
     l_total: usize,
     cycle: usize,
-    lines: mu.Ring,
-    pfs: mu.Ring,
+    lw: BlockWin,
+    pw: BlockWin,
     frac1: f64 = 0.0,
     frac2: f64 = 0.0,
     pf_v: f64 = 0.0,
@@ -527,11 +587,11 @@ pub const STC = struct {
         return 0;
     }
     pub fn scratchLen(p: Params) usize {
-        return 2 * p.cycle;
+        return 2 * BlockWin.slots(p.cycle);
     }
     pub fn init(p: Params, scratch: []f64) Error!Self {
         try validate(p);
-        if (scratch.len < 2 * p.cycle) return error.BadParam;
+        if (scratch.len < 2 * BlockWin.slots(p.cycle)) return error.BadParam;
         const sw = swapped(p);
         const lf = EmaCore.lookbackOf(sw[0], p.unstable, .sma);
         const ls = EmaCore.lookbackOf(sw[1], p.unstable, .sma);
@@ -543,50 +603,47 @@ pub const STC = struct {
             .l_line = ls,
             .l_total = lookback(p),
             .cycle = p.cycle,
-            .lines = mu.carve(&rest, p.cycle),
-            .pfs = mu.carve(&rest, p.cycle),
+            .lw = BlockWin.carve(&rest, p.cycle),
+            .pw = BlockWin.carve(&rest, p.cycle),
         };
     }
     /// frac = position of `v` inside the min..max of the ring's last `cycle` values
-    fn windowFrac(r: mu.Ring, cycle: usize, v: f64, frac: f64) f64 {
-        var hi = v;
-        var lo = v;
-        var i = r.n - cycle;
-        while (i < r.n - 1) : (i += 1) {
-            const t = r.at(i);
-            if (t > hi) hi = t;
-            if (t < lo) lo = t;
-        }
-        const range = hi - lo;
-        return if (range > 0.0) (v - lo) / range * 100.0 else frac;
+    pub fn step(self: *Self, src: anytype, b: In) ?f64 {
+        return self.stepImpl(true, src, b);
     }
-    pub fn step(self: *Self, _: anytype, b: In) ?f64 {
+    fn stepImpl(self: *Self, comptime commit: bool, _: anytype, b: In) ?f64 {
         const n = self.n;
         self.n += 1;
         const s = self.slow.step(NoSrc{}, b.x);
         const f = if (n >= self.skip_fast) self.fast.step(NoSrc{}, b.x) else null;
         if (s == null or f == null) return null;
         const line = f.? - s.?;
-        self.lines.push(line);
-        if (self.lines.n < self.cycle) return null;
-        self.frac1 = windowFrac(self.lines, self.cycle, line, self.frac1);
-        if (self.pfs.n == 0) {
+        const lx = self.lw.extremes(line);
+        if (commit) self.lw.commit(line);
+        if (self.lw.count < self.cycle) return null;
+        const r1 = lx[0] - lx[1];
+        if (r1 > 0.0) self.frac1 = (line - lx[1]) / r1 * 100.0;
+        if (self.pw.count == 0) {
             self.pf_v = self.frac1;
         } else {
             self.pf_v = @mulAdd(f64, 0.5, self.frac1 - self.pf_v, self.pf_v);
         }
-        self.pfs.push(self.pf_v);
-        if (self.pfs.n < self.cycle) return null;
-        self.frac2 = windowFrac(self.pfs, self.cycle, self.pf_v, self.frac2);
-        if (self.pfs.n == self.cycle) {
+        const px = self.pw.extremes(self.pf_v);
+        if (commit) self.pw.commit(self.pf_v);
+        if (self.pw.count < self.cycle) return null;
+        const r2 = px[0] - px[1];
+        if (r2 > 0.0) self.frac2 = (self.pf_v - px[1]) / r2 * 100.0;
+        if (self.pw.count == self.cycle) {
             self.pff = self.frac2;
         } else {
             self.pff = @mulAdd(f64, 0.5, self.frac2 - self.pff, self.pff);
         }
         return if (n >= self.l_total) self.pff else null;
     }
+    /// A step that writes nothing outside the copy: the extremes read the suffix arrays, only `commit` writes them.
     pub fn peekStep(self: *const Self, src: anytype, b: In) ?f64 {
-        return mu.peekRings(Self, self, src, b);
+        var c = self.*;
+        return c.stepImpl(false, src, b);
     }
 };
 pub fn stcLookback(p: StcParams) Error!usize {

@@ -352,13 +352,20 @@ pub const WmaCore = struct {
     /// from the window every 8*period outputs (TA-Lib 0.8.x re-anchor).
     pub fn step(self: *WmaCore, src: anytype, x: f64) ?f64 {
         const n = self.n;
-        self.n += 1;
-        if (self.p == 1) return x;
-        if (n + 1 < self.p) {
+        if (self.p != 1 and n + 1 < self.p) {
+            self.n += 1;
             self.sub += x;
             self.sum += x * pf(n + 1);
             return null;
         }
+        return self.steadyStep(src, x);
+    }
+    /// `step` once the output has started (`n + 1 >= p`, or `p == 1`): the same operations, for the fused loops
+    /// that drive several averages at once (HMA's `steadyRun`).
+    pub inline fn steadyStep(self: *WmaCore, src: anytype, x: f64) f64 {
+        const n = self.n;
+        self.n += 1;
+        if (self.p == 1) return x;
         self.sub += x;
         self.sub -= self.trailing;
         self.sum += x * pf(self.p);
