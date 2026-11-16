@@ -281,3 +281,27 @@ test "sealStream and openStream release their memory on allocation failure" {
     var r: std.Io.Reader = .fixed(wire);
     try testing.expectError(error.OutOfMemory, Env.openStream(fa.allocator(), &aw.writer, &r, &kp.dk, fx.round1000Signature()));
 }
+
+test "peekHeader reads version and round from either wire's 15-byte prefix" {
+    const kp = fx.recipientKeypair(0x01);
+    const v1 = try Env.seal(testing.allocator, "secret", &kp.ek, fx.quicknetPubkey(), fx.seal_round, &fx.fixedRandomness());
+    defer testing.allocator.free(v1);
+    const v2 = try sealAlloc("secret", kp);
+    defer testing.allocator.free(v2);
+
+    const h1 = try Env.peekHeader(v1[0..stream.stream_header_bytes]);
+    try testing.expectEqual(envelope.version, h1.version);
+    try testing.expectEqual(fx.seal_round, h1.round);
+    const h2 = try Env.peekHeader(v2);
+    try testing.expectEqual(stream.stream_version, h2.version);
+    try testing.expectEqual(fx.seal_round, h2.round);
+
+    try testing.expectError(error.Truncated, Env.peekHeader(v2[0 .. stream.stream_header_bytes - 1]));
+    var bad = v2[0..stream.stream_header_bytes].*;
+    bad[0] ^= 1;
+    try testing.expectError(error.BadMagic, Env.peekHeader(&bad));
+    bad = v2[0..stream.stream_header_bytes].*;
+    bad[4] = 3;
+    try testing.expectError(error.UnsupportedVersion, Env.peekHeader(&bad));
+    try testing.expectError(error.SuiteMismatch, envelope.Envelope192.peekHeader(v2));
+}

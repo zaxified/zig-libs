@@ -71,11 +71,8 @@ const capsule_header_bytes = capsule_magic.len + 1 + 32;
 
 /// Both envelope versions start with the same 15 bytes: magic, version,
 /// suite, flags, round (u64 LE).
-/// zig-libs request: timelock_envelope — no header parser for the v2 stream
-/// wire (`Envelope.parse` answers UnsupportedVersion); this app reads the
-/// shared prefix itself. Backlog in modules/timelock_envelope/SPEC.md.
+/// The prefix both envelope versions share; `Env.peekHeader` reads it.
 const envelope_prefix_bytes = tle.stream.stream_header_bytes;
-const envelope_round_off = 7;
 
 const failure_exit: u8 = 1;
 const locked_exit: u8 = 3;
@@ -541,12 +538,13 @@ fn readHead(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?Head {
         return null;
     }
     const env = buf[capsule_header_bytes..got];
-    if (env.len < envelope_prefix_bytes or !std.mem.eql(u8, env[0..4], &tle.envelope.magic)) {
-        std.debug.print("timecapsule: {s}: envelope framing rejected: BadMagic or Truncated\n", .{path});
+    // Magic, version, suite and round of either wire version, from the
+    // envelope's shared prefix (no hand-rolled offsets).
+    const env_head = Env.peekHeader(env) catch |err| {
+        std.debug.print("timecapsule: {s}: envelope framing rejected: {t}\n", .{ path, err });
         return null;
-    }
-    const version = env[4];
-    if (version == tle.envelope.version) {
+    };
+    if (env_head.version == tle.envelope.version) {
         // Version 1: full framing check, exactly as earlier releases did.
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(capsule_header_bytes + Env.overhead + max_v1_plaintext_bytes)) catch |err| {
             std.debug.print("timecapsule: cannot read {s}: {t}\n", .{ path, err });
@@ -557,21 +555,16 @@ fn readHead(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?Head {
             std.debug.print("timecapsule: {s}: envelope framing rejected: {t}\n", .{ path, err });
             return null;
         };
-    } else if (version == tle.stream.stream_version) {
-        if (env[5] != Env.suite_id) {
-            std.debug.print("timecapsule: {s}: envelope framing rejected: SuiteMismatch\n", .{path});
-            return null;
-        }
-        // The smallest valid stream (empty plaintext: one empty last chunk).
+    } else {
+        // Version 2 (`peekHeader` admits no other). The smallest valid
+        // stream: empty plaintext, one empty last chunk.
         if (size < capsule_header_bytes + Env.streamSealedLen(0)) {
             std.debug.print("timecapsule: {s}: envelope framing rejected: Truncated\n", .{path});
             return null;
         }
-    } else {
-        std.debug.print("timecapsule: {s}: envelope framing rejected: UnsupportedVersion ({d})\n", .{ path, version });
-        return null;
     }
-    const round = std.mem.readInt(u64, env[envelope_round_off..][0..8], .little);
+    const version = env_head.version;
+    const round = env_head.round;
     // drand rounds are 1-based; round 0 is not a point on any chain, so a
     // capsule claiming it could never have been sealed legitimately and can
     // never be opened. Reject it here rather than downstream — the beacon

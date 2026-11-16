@@ -460,6 +460,33 @@ pub fn Envelope(comptime Kem: type) type {
             return pt;
         }
 
+        /// What the shared 15-byte prefix of either wire version says,
+        /// before anything is opened.
+        pub const Header = struct {
+            /// 1 for `seal`'s one-shot envelope, `stream.stream_version`
+            /// (2) for `sealStream`'s stream.
+            version: u8,
+            /// The beacon round the envelope is locked to: fetch its
+            /// signature, or show the unlock time, before `open`.
+            round: u64,
+        };
+
+        /// The version and round of a sealed envelope or stream from its
+        /// first `stream.stream_header_bytes` (15) bytes — the prefix both
+        /// versions share (magic, version, suite, flags, round). Only the
+        /// framing is checked: `Truncated` under 15 bytes, `BadMagic`,
+        /// `UnsupportedVersion` for any other version, `SuiteMismatch` for
+        /// another HQC set. Nothing is authenticated; `open` / `openStream`
+        /// still check everything.
+        pub fn peekHeader(prefix: []const u8) OpenError!Header {
+            if (prefix.len < stream.stream_header_bytes) return error.Truncated;
+            if (!std.mem.eql(u8, prefix[0..4], &magic)) return error.BadMagic;
+            const v = prefix[4];
+            if (v != version and v != stream.stream_version) return error.UnsupportedVersion;
+            if (prefix[5] != suite_id) return error.SuiteMismatch;
+            return .{ .version = v, .round = std.mem.readInt(u64, prefix[round_off..][0..8], .little) };
+        }
+
         /// The version-2 streaming format (`stream.zig`): the same two
         /// locks, content as an age-style STREAM over `std.Io.Reader` /
         /// `std.Io.Writer`, payloads of any size in bounded memory.
