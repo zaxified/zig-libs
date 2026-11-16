@@ -115,11 +115,15 @@ MODULES = {
             "MdiX.auto": "ETH_TP_MDI_AUTO",
             "MdiX.invalid": "ETH_TP_MDI_INVALID",
             "ifnamesize": "IFNAMSIZ",
+            "sopass_len": "SOPASS_MAX",
         },
         # `I2C_ADDRESS_LOW`/`_HIGH` are SFF-8472 addresses this repo names
-        # itself; the kernel has no macro for them. If this number grows,
-        # something stopped being checked.
-        "unresolved_budget": 2,
+        # itself; the kernel has no macro for them. The 8 `wake_bit.*` are the
+        # bit INDICES of the `ETH_SS_WOL_MODES` string set: the kernel only
+        # defines the masks (`WAKE_MAGIC = 1 << 5`), which must not be
+        # compared with them (2026-11-16). If this number grows, something
+        # stopped being checked.
+        "unresolved_budget": 10,
     },
     "nl80211": {
         "zig_files": ["modules/nl80211/src/uapi.zig"],
