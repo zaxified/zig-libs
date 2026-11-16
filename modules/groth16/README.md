@@ -28,6 +28,7 @@ longer `@panic`. The core was an **Opus** task, not a Fable one, because the
 | `qap.zig` | R1CS→QAP interpolation + the `A·B−C` divisibility oracle |
 | `prover.zig` | **real** `setup`/`prove` (the toy CRS + proof assembly) + `brokenProof` positive control |
 | `snarkjs_export.zig` | renders our `Proof`/`VerifyingKey`/public inputs into the exact JSON shape `snarkjs` parses — closes the one blind spot the `bn254`-verifier anchor can't see (it decodes our own encoding; see `SPEC.md` §5a) |
+| `snarkjs_import.zig` | the reverse: `parseProof`/`parseVerifyingKey`/`parsePublic` read snarkjs's `proof.json`/`verification_key.json`/`public.json` (canonical decimals, on-curve, `G2` in the subgroup; anything else is an error) |
 | `snarkjs_bin.zig` | the iden3 binary container and the field/point encodings inside it |
 | `zkey.zig` | snarkjs `.zkey` (Groth16 proving key) reader and writer — round-trips snarkjs's files byte for byte |
 | `circom.zig` | circom `.r1cs` reader, `.wtns` reader and writer |

@@ -72,6 +72,7 @@ pub const qap = @import("qap.zig");
 pub const bn254 = @import("bn254");
 const prover = @import("prover.zig");
 pub const snarkjs_export = @import("snarkjs_export.zig");
+pub const snarkjs_import = @import("snarkjs_import.zig");
 pub const snarkjs_bin = @import("snarkjs_bin.zig");
 pub const zkey = @import("zkey.zig");
 pub const circom = @import("circom.zig");
@@ -126,6 +127,7 @@ test {
     _ = qap;
     _ = prover;
     _ = snarkjs_export;
+    _ = snarkjs_import;
     _ = snarkjs_bin;
     _ = zkey;
     _ = circom;

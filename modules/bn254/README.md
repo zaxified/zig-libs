@@ -119,10 +119,12 @@ const proof: bn254.Groth16Proof = .{ .a = a, .b = b, .c = c };
 const valid = try bn254.groth16Verify(vk, proof, public_inputs); // bool
 ```
 
-Deliberately absent vs. `bls12_381`: `isLexicographicallyLargest` (a
-compressed-point "sign of y" helper) — Ethereum's EIP-196/197 encodes
-`G1`/`G2` points UNCOMPRESSED, so no consumer for that helper exists in
-this arc; see `SPEC.md`. Also absent: `G1`/`G2` cofactor-clearing —
+Compressed points (2026-11-16): `g1.toBytesCompressed`/`fromBytesCompressed`
+(32 bytes) and `g2.…` (64 bytes), gnark-crypto's convention (big-endian `x`,
+flag bits `0b10`/`0b11`/`0b01` = smaller `y`/larger `y`/infinity on top of byte
+0; `G2` `x = A1 || A0`, decode is subgroup-checked). arkworks' little-endian
+convention is not offered. EIP-196/197 itself stays uncompressed; there is no
+public `isLexicographicallyLargest`. Also absent: `G1`/`G2` cofactor-clearing —
 `G1`'s cofactor is 1 (nothing to clear) and `G2`'s cofactor-clearing has
 no consumer in this arc (BN254 has no standardized hash-to-`G2` needed
 for EIP-197/Groth16 verification); see `g1.zig`/`g2.zig`'s module doc

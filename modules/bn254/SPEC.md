@@ -943,7 +943,7 @@ role.
   this arc (see "Design & invariants" above); revisit only if a future
   part adds hash-to-`G2`.
 
-- **Compressed G1/G2 serialization** (the gnark/arkworks convention) *(survey 2026-09-30)*: `g1.zig` header says there is deliberately none because EIP-196/197 define none; users exchanging keys with gnark or arkworks tooling need it. Effort: small (sign/flag bits + `sqrt`, `Fp`/`Fp2.sqrt` exist). Fits §2; the wire choice (which convention) needs a decision.
+- ✅ DONE 2026-11-16 (`g1`/`g2` `toBytesCompressed`/`fromBytesCompressed`, gnark-crypto convention only: big-endian `x`, top two bits of byte 0 are flags `0b10` smallest `y` / `0b11` largest `y` / `0b01` infinity; G2 `x = A1 || A0`, 64 bytes, subgroup-checked on decode; arkworks' little-endian convention is NOT offered; decode refuses wrong length/flags, stray infinity bytes, `x >= p`, no-curve `x`, off-subgroup G2; G1 generator pinned by hand to `0x80 .. 01`; G2 byte order follows gnark's documented `A1 || A0` and this module's own `Fp2` order, no gnark output was available offline to pin it) **Compressed G1/G2 serialization** (the gnark/arkworks convention) *(survey 2026-09-30)*: `g1.zig` header says there is deliberately none because EIP-196/197 define none; users exchanging keys with gnark or arkworks tooling need it. Effort: small (sign/flag bits + `sqrt`, `Fp`/`Fp2.sqrt` exist). Fits §2; the wire choice (which convention) needs a decision.
 - **Public multi-scalar multiplication (Pippenger) for G1/G2** *(survey 2026-09-30)*: `groth16.zig` has a private naive `msm` for a handful of public inputs; gnark-crypto/arkworks expose one. Sibling `bls12_381` already has `kzg.g1Msm`, the algorithm exists in-repo. Effort: small. Fits §2.
 
 ## Anchoring

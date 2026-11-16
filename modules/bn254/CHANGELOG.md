@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — Compressed `G1`/`G2` points in gnark-crypto's convention: `g1`/`g2` `toBytesCompressed`/`fromBytesCompressed` (32/64 bytes; flag bits `0b10` smaller `y`, `0b11` larger, `0b01` infinity; `G2` decode subgroup-checked and refuses non-canonical `x`, off-curve `x`, bad flags, stray infinity bytes). arkworks' convention is not offered. Additive; existing encodings unchanged.
 - **2026-11-16** — `Fr.randomInto(out, io)`: a random scalar written into the caller's slot, the drawn bytes wiped, so a
   nonce or key is never returned by value through the caller's frame.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
