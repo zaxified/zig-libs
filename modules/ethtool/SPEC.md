@@ -6,7 +6,7 @@
 
 **Scope:** core — ethtool(8) 6.19 (surveyed 2026-09-30); raised from mvp 2026-09-30 with `-i` drvinfo and `-S` driver stats over ioctl
 
-**Audit:** review 2026-09-02 · mutation none · src ?
+**Audit:** review 2026-09-02 · mutation 2026-11-17 (36/42, 6 eq) · src ?
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ETHTOOL_FUZZ) · ct n/a — netlink ethtool queries (keyword review, 2026-10-07)
 
@@ -236,6 +236,24 @@ Two tests need CAP_NET_ADMIN (`RINGS_SET` writing the current value back, and
 `FEATURES_SET` re-requesting a feature's current state) and skip without it.
 Both were run for real inside `unshare -rn` against a `veth` pair; the
 features one exercises the full SET → `SetResult` path.
+
+### 1.8 Delta mutation audit
+
+**Audit 2026-11-17 (delta mutation).** 42 schemata mutants over `RSS_GET` (`rss.zig` `Rss.deinit`/`usesHfunc`,
+`parseRss`, `buildRss`, and `Ethtool.rss` in `client.zig`), ReleaseSafe, one build, each mutant under
+`setsid -w timeout` and `ulimit -v`: the free guards and the reset in `deinit`, the match polarity of
+`usesHfunc`, each attribute arm dropped or stored into the wrong field, the INDIR and HKEY duplicate guards
+(forced shut, forced open), the multiple-of-four guard and its modulus, the element count and byte offset of the
+table, the endianness, the key copy length, the unknown-attribute arm, the `errdefer`, and in `buildRss` the
+family id, command, sequence, device, context presence, value and attribute type and the `errdefer`. First
+run: 33 killed (2 of them HANG: a wrong sequence number makes the exchange wait), 9 survived. 3 new tests
+killed 3 (`Rss.deinit` clears the value so a second call is harmless; an unknown attribute is skipped; the
+request frame's family id, sequence and encoded device), 2 are EQUIVALENT (an empty INDIR or HKEY reaching
+`alloc`/`dupe` with length 0: a zero-length allocation allocates nothing and leaves the slice empty, which is
+what the `continue` leaves too), 4 are UNOBSERVABLE (`Ethtool.rss` passing `null` for the context, a wrong
+header attribute, a skipped `reply.deinit`, an empty reply body: the success path needs a NIC whose driver
+implements `get_rxfh`; the live test skips on every device available here, and a unit test would need a
+netlink peer answering `RSS_GET`). 36 killed + 6 eq (2 equivalent + 4 unobservable) = 42.
 
 ## 2. Design invariants
 

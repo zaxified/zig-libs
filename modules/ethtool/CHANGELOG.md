@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: delta mutation audit of `RSS_GET` (`rss.zig`, `Ethtool.rss`), 36/42 killed, 6 equivalent or unobservable; three tests added (`Rss.deinit` reset, unknown attributes skipped, request frame fields).
 - **2026-11-17** — **`RSS_GET` is a typed call** (additive, no break): `Ethtool.rss(target, context)` (`ethtool -x`) returns hash function mask, hash key, indirection table, context id and input xfrm; offline `buildRss`/`rss.parseRss` in new `rss.zig`, attribute constants `uapi.RSS`. Malformed attributes (wrong sizes, table not a multiple of 4 bytes, duplicates) are typed errors. Tests are hand-built reply buffers plus a live test that skips when the device answers `NotSupported`. `RSS_SET` and the `FLOW_HASH` nest stay on `raw`.
 - **2026-11-16** — `uapi.WAKE` (added the same day, unreleased) is renamed `uapi.wake_bit`: its values are bit indices,
   not the kernel's `WAKE_*` masks, and check-uapi compared them as masks.

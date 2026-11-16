@@ -234,3 +234,51 @@ test "RSS_GET request: default and explicit context" {
     try testing.expectEqual(@as(u32, 7), try c.asU32());
     try testing.expectError(error.InvalidRequest, buildRss(gpa, 23, 1, .byName(""), null));
 }
+
+// Delta mutation audit 2026-11-17: the tests below were added for survivors.
+
+test "Rss.deinit resets the value, so a second deinit is a no-op" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try appendIndir(gpa, &list, &.{ 4, 5 });
+    try codec.appendAttr(gpa, &list, uapi.RSS.HKEY, &.{ 9, 8, 7 });
+    try codec.appendAttrU32(gpa, &list, uapi.RSS.HFUNC, rss_hfunc.xor);
+    var r = try parseRss(gpa, list.items);
+    r.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), r.indir.len);
+    try testing.expectEqual(@as(usize, 0), r.key.len);
+    try testing.expectEqual(@as(?u32, null), r.hfunc);
+    r.deinit(gpa); // would be a double free if the first call had not cleared the slices
+}
+
+test "RSS reply: unknown attributes are skipped, known ones around them still decode" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try codec.appendAttrU32(gpa, &list, uapi.RSS.HFUNC, rss_hfunc.xor);
+    try codec.appendAttr(gpa, &list, 0x7ff0, &.{ 1, 2, 3 }); // a type this decoder does not know
+    try codec.appendAttrU32(gpa, &list, uapi.RSS.CONTEXT, 5);
+    var r = try parseRss(gpa, list.items);
+    defer r.deinit(gpa);
+    try testing.expectEqual(@as(?u32, rss_hfunc.xor), r.hfunc);
+    try testing.expectEqual(@as(?u32, 5), r.context);
+}
+
+test "RSS_GET request: frame fields and the encoded device" {
+    const gpa = testing.allocator;
+    const msg = try buildRss(gpa, 0x1234, 0xA1B2C3D4, .byName("eth7"), null);
+    defer gpa.free(msg);
+    try testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, msg[4..6], native_endian));
+    try testing.expectEqual(@as(u32, 0xA1B2C3D4), std.mem.readInt(u32, msg[8..12], native_endian));
+    var it: codec.AttrIterator = .{ .buf = msg[20..] };
+    const h = (try it.next()).?;
+    const dev = try header.parse(h.data);
+    try testing.expectEqualStrings("eth7", dev.name());
+
+    const m2 = try buildRss(gpa, 23, 1, .byIndex(42), 3);
+    defer gpa.free(m2);
+    var it2: codec.AttrIterator = .{ .buf = m2[20..] };
+    const dev2 = try header.parse((try it2.next()).?.data);
+    try testing.expectEqual(@as(?u32, 42), dev2.index);
+}
