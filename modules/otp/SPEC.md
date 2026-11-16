@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [pyca/cryptography](https://github.com/pyca/cryptography) `hazmat.primitives.twofactor` | Python | Apache-2.0 OR BSD-3-Clause (API: NOASSERTION; source not read) | 7.8k | push 2026-09-29 | HOTP and TOTP primitives with `verify` and SHA-1/256/512; no URI helper *(inferred)*. Closest in scope to this module. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | Only HMAC; no OTP, no base32. |
 
-**Where we are ahead:** of the other Zig OTP library, both HOTP and TOTP, SHA-1/256/512, a checked bounded-window `totpVerify` that evaluates every step in constant HMAC count with a constant-time compare, and every RFC 4226 Appendix D and RFC 6238 Appendix B vector asserted byte-exact (including the intermediate digests). **Where we are behind (updated 2026-09-30):** ~~no base32 / `otpauth://`~~ — both added the same day (`base32` module, `otpauth.zig`); still no HOTP look-ahead/resync (RFC 4226 §7.5), no replay guard (last accepted step; the caller's storage by design).
+**Where we are ahead:** of the other Zig OTP library, both HOTP and TOTP, SHA-1/256/512, a checked bounded-window `totpVerify` that evaluates every step in constant HMAC count with a constant-time compare, and every RFC 4226 Appendix D and RFC 6238 Appendix B vector asserted byte-exact (including the intermediate digests). **Where we are behind (updated 2026-09-30):** ~~no base32 / `otpauth://`~~ — both added the same day (`base32` module, `otpauth.zig`); ~~no HOTP look-ahead/resync~~ (added 2026-11-16), no replay guard (last accepted step; the caller's storage by design).
 
 ## Design
 
@@ -173,7 +173,7 @@ were not included; every RFC 4226 / 6238 vector pins them. Tests added: 5, all i
 
 - ✅ **DONE 2026-09-30** — **Base32 (RFC 4648) codec for shared secrets** (survey 2026-09-30). Authenticator apps and every stored TOTP secret are base32; pyotp, pquerna and karlseguin's library all handle it. The catalogue has no base32 module (`rg -il base32` finds only `dnssec`'s private NSEC3 base32hex), and Zig `std` has none. Best home: a small standalone `base32` (or an addition to `encoding`), used here and by `dnssec`. Effort: small. Fits §2. *(owner session: filed straight into this backlog.)*
 - ✅ **DONE 2026-09-30** — **`otpauth://` provisioning-URI builder (and parser)** (survey 2026-09-30). The enrollment step of 2FA; pyotp `provisioning_uri`, pquerna `Key.URL`. The SPEC lists it as out of scope "for a thin layer above", but no such layer exists in the catalogue. Effort: small (percent-encoding of issuer/account, parameters `secret`, `algorithm`, `digits`, `period`). Fits §2.
-- **HOTP look-ahead / counter resynchronisation (RFC 4226 §7.4–7.5)** (survey 2026-09-30). A hardware-token user whose counter drifted cannot verify here; only TOTP has a window helper (`totpVerify`). Effort: small. Fits §2.
+- ✅ DONE 2026-11-16 (`hotpVerify` look-ahead window capped at `max_hotp_window`, returns the matched counter; `hotpResync` two-consecutive-codes helper; constant HMAC count, constant-time compares) — **HOTP look-ahead / counter resynchronisation (RFC 4226 §7.4–7.5)** (survey 2026-09-30). A hardware-token user whose counter drifted cannot verify here; only TOTP has a window helper (`totpVerify`). Effort: small. Fits §2.
 
 ## Fuzz
 
