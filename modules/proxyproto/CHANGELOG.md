@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the card's src hash after the review fixes.
 - **2026-11-16** — Independent review fixes. **Behaviour change:** `default_max_v2_len` is 16 + 4096 (go-proxyproto's cap)
   instead of the specification's 536, which is a sender's guideline and refused legitimate TLV-heavy headers (set
   `max_v2_len = 536` for the old bound; a `read` buffer sized with `default_max_v2_len` grows accordingly). `uniqueId()`
