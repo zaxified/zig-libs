@@ -101,7 +101,7 @@ canceled read surfaces `error.Canceled` rather than `error.TransportFailed`; no 
 registry. Run: `zig build test-whois`.
 
 ## Backlog / deferred
-- **Per-server query syntax in `lookup`** *(survey 2026-09-30)*. `arinIpQuery`/`verisignDomainQuery` exist but `lookup` (`src/root.zig`, `lookup`) formats one wire query and sends it to every hop; the reference client switches flags per server (ARIN `n `, Verisign `domain `, DENIC/JPNIC-style switches *(inferred)*), so some registries return a fuzzy or unhelpful answer to the bare query. Effort: small (a hop-aware query callback or a table for the few servers with documented flags). Fits CONVENTIONS §2.
+- ✅ DONE 2026-11-16 (`serverQuery` + `LookupOptions.per_server_syntax`, default true: ARIN `n <ip>`, Verisign `domain <name>`; DENIC/JPNIC flags not added, only inferred) **Per-server query syntax in `lookup`** *(survey 2026-09-30)*. `arinIpQuery`/`verisignDomainQuery` exist but `lookup` (`src/root.zig`, `lookup`) formats one wire query and sends it to every hop; the reference client switches flags per server (ARIN `n `, Verisign `domain `, DENIC/JPNIC-style switches *(inferred)*), so some registries return a fuzzy or unhelpful answer to the bare query. Effort: small (a hop-aware query callback or a table for the few servers with documented flags). Fits CONVENTIONS §2.
 - **IDN (punycode/UTS #46) conversion of the query** *(survey 2026-09-30)*. A Unicode domain reaches the registry as raw UTF-8, which most port-43 servers reject; the reference client converts. Effort: medium — no sibling punycode/IDNA module (`ls modules | rg -i 'idn|puny'` empty; the README catalog was searched for punycode/idna/xn--). Fits §2.
 
 ## Status
