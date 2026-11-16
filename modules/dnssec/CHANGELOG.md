@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — New: `rdata.parseCds`/`Cds` and `rdata.parseCdnskey`/`Cdnskey` (RFC 7344), built on `parseDs`/`parseDnskey`, with `isDeleteSignal()` for the RFC 8078 §4 delete forms (CDS `0 0 0 00`, CDNSKEY `0 3 0 AA==`). Parsing only.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the three private `stripDot` copies (`nsec`, `nsec3`, `canonical`) are one `canonical.stripDot`. (duplicate-code pass)
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 

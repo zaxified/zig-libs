@@ -65,6 +65,8 @@ const dnssec = @import("dnssec");
 
 const dnskey = try dnssec.rdata.parseDnskey(dnskey_record.data.unknown);
 const rrsig = try dnssec.rdata.parseRrsig(gpa, rrsig_record.data.unknown);
+// CDS/CDNSKEY (RFC 7344): DS/DNSKEY shape; `isDeleteSignal()` is the RFC 8078 §4 form.
+const cds = try dnssec.rdata.parseCds(cds_record.data.unknown);
 
 // Validate one RRset whose signing key is vouched for by `trust_anchor`
 // (a pinned DNSKEY, or a DS naming that key — the apex DNSKEY-RRset case):
