@@ -1644,7 +1644,7 @@ fn oaepDoc(a: std.mem.Allocator, digest_uri: []const u8, mgf_uri: []const u8, ce
         \\  </ds:KeyInfo>
         \\  <xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>
         \\</xenc:EncryptedData>
-    , .{ xenc_ns, ds_ns, xenc11_ns, xenc_ns, xenc11_ns, digest_uri, mgf_uri, cek_b64, content_b64 });
+    , .{ xenc_ns, ds_ns, xenc11_ns, xenc11_ns, xenc11_ns, digest_uri, mgf_uri, cek_b64, content_b64 });
 }
 
 test "round-trip: xenc11 rsa-oaep, every SHA-1/256/384/512 digest x MGF1 pairing" {

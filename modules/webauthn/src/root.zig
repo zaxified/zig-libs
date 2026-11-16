@@ -4,7 +4,7 @@
 //! (registration) verification over untrusted, attacker-controlled wire
 //! bytes. This module is a spec-assembly layer, not a new crypto primitive —
 //! every signature check routes through an existing, independently-KAT'd
-//! primitive (`p256`'s ES256, `std.crypto.sign.Ed25519`'s EdDSA, `rsa`'s
+//! primitive (`p256`'s ES256, `p384`/`p521`'s ES384/ES512, `std.crypto.sign.Ed25519`'s EdDSA, `rsa`'s
 //! RS256 PKCS1-v1.5) and every CBOR/COSE parse routes through the sibling
 //! `cbor`/`cbor.cose` codec — this module never hand-rolls a bignum or a
 //! CBOR decoder.
@@ -22,7 +22,7 @@
 //!     requires it);
 //!   - the signature over `authenticatorData || SHA-256(clientDataJSON)`
 //!     verifies under the stored credential's COSE key + algorithm
-//!     (ES256/EdDSA/RS256).
+//!     (ES256/ES384/ES512/EdDSA/RS256).
 //! Returns the parsed `signCount` + flags on success, a typed error on any
 //! failure — see "Threat model" in SPEC.md for what each check defends
 //! against and the adversarial test suite (`assertion_test.zig`) that proves
@@ -69,6 +69,8 @@ const Allocator = std.mem.Allocator;
 const cbor = @import("cbor");
 const rsa = @import("rsa");
 const p256 = @import("p256");
+const p384 = @import("p384");
+const p521 = @import("p521");
 const x509 = @import("x509");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -86,7 +88,7 @@ pub const meta = .{
     .role = .util, // pure verification logic — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no shared/global state; every function takes its inputs as parameters
     .model_after = "W3C WebAuthn Level 3 (https://www.w3.org/TR/webauthn-3/) — clean-room from the spec",
-    .deps = .{ "cbor", "rsa", "p256", "x509" },
+    .deps = .{ "cbor", "rsa", "p256", "p384", "p521", "x509" },
 };
 
 // RFC 8812 §2 COSE algorithm identifier for RS256 (RSASSA-PKCS1-v1_5 w/
@@ -402,18 +404,40 @@ pub fn parseAuthenticatorData(allocator: Allocator, raw: []const u8) AuthDataErr
     return .{ .rp_id_hash = rp_id_hash, .flags = flags, .sign_count = sign_count, .attested_credential_data = attested, .extensions = extensions };
 }
 
-// ── signature verification dispatch (ES256 / EdDSA / RS256) ────────────────
+// ── signature verification dispatch (ES256 / ES384 / ES512 / EdDSA / RS256) ────────────────
 
 pub const SignatureError = error{ UnsupportedAlgorithm, InvalidKey, InvalidSignature, BadSignature };
 
+/// ECDSA over a sibling curve module's `Ecdsa(Hash)` type (P-384 / P-521):
+/// uncompressed SEC1 point from the COSE coordinates, DER signature.
+fn verifyEcdsaDer(comptime E: type, comptime coord_len: usize, x: []const u8, y: []const u8, msg: []const u8, sig: []const u8) SignatureError!void {
+    if (x.len != coord_len or y.len != coord_len) return error.InvalidKey;
+    var sec1: [1 + 2 * coord_len]u8 = undefined;
+    sec1[0] = 0x04;
+    @memcpy(sec1[1..][0..coord_len], x);
+    @memcpy(sec1[1 + coord_len ..][0..coord_len], y);
+    const pk = E.PublicKey.fromSec1(&sec1) catch return error.InvalidKey;
+    const parsed_sig = E.Signature.fromDer(sig) catch return error.InvalidSignature;
+    parsed_sig.verify(msg, pk) catch return error.BadSignature;
+}
+
 /// Verify `sig` over `msg` under `key`, per the COSE algorithm identifier
 /// `alg` — the alg is bound tightly to the key's own curve/type (an ES256
-/// `alg` against a P-384 key, or any `alg` that doesn't match the key's
+/// `alg` against a P-384 key (or ES384 against a P-256 key), or any `alg` that doesn't match the key's
 /// `kty`/`crv`, is `error.UnsupportedAlgorithm`, never silently coerced —
 /// this is the algorithm-confusion defense).
 pub fn verifySignature(key: CoseKey, alg: i64, msg: []const u8, sig: []const u8) SignatureError!void {
     switch (key) {
         .ec2 => |ec2| {
+            // ES384 / ES512 (RFC 9053 §2.1): the curve and the alg must pair
+            // exactly (P-384/-35, P-521/-36); any other combination is refused.
+            // Like ES256 below, no low-S requirement (WebAuthn does not impose one).
+            if (ec2.crv == cbor.cose.crv_p384 and alg == cbor.cose.alg_es384) {
+                return verifyEcdsaDer(p384.EcdsaP384Sha384, 48, ec2.x, ec2.y, msg, sig);
+            }
+            if (ec2.crv == cbor.cose.crv_p521 and alg == cbor.cose.alg_es512) {
+                return verifyEcdsaDer(p521.EcdsaP521Sha512, 66, ec2.x, ec2.y, msg, sig);
+            }
             if (ec2.crv != cbor.cose.crv_p256 or alg != cbor.cose.alg_es256) return error.UnsupportedAlgorithm;
             if (ec2.x.len != 32 or ec2.y.len != 32) return error.InvalidKey;
             var sec1: [65]u8 = undefined;
