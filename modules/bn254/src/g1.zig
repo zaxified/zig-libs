@@ -25,10 +25,8 @@
 //! double-and-add-always `scalarMul`, `isOnCurve`, EIP-196 64-byte
 //! uncompressed (de)serialization (`(0,0)` = point at infinity — see
 //! `SPEC.md`'s "EIP-196/197 encoding" section). EIP-196/197 has no
-//! compressed point format (unlike BLS12-381's ZCash/IETF wire format),
-//! so there is no `toBytesCompressed`/`fromBytesCompressed`/`recoverY`
-//! here either — this file's codec section is correspondingly simpler
-//! than `bls12_381/src/g1.zig`'s.
+//! compressed point format; gnark-crypto's compressed form is offered
+//! separately as `toBytesCompressed`/`fromBytesCompressed` (2026-11-16).
 
 const std = @import("std");
 const fp = @import("fp.zig");
@@ -312,6 +310,72 @@ pub fn fromBytes(bytes: []const u8) G1Error!Affine {
     return p;
 }
 
+// ── compressed codec (gnark-crypto convention, added 2026-11-16) ────────
+//
+// gnark-crypto's `ecc/bn254` compressed form: 32 bytes, the big-endian
+// `x`, with the two MOST significant bits of byte 0 as flags (`p` is
+// 254 bits, so they are free):
+//   0b10 — compressed, `y` is the lexicographically smaller of `±y`
+//   0b11 — compressed, `y` is the larger one
+//   0b01 — the point at infinity (all other bits and bytes zero)
+// (0b00 is gnark's UNCOMPRESSED flag and is refused here.) "Larger"
+// compares the canonical big-endian values of `y` and `p - y`.
+// arkworks' compressed form (little-endian `x`, flags in the top bits of
+// the LAST byte) is a different, incompatible convention and is NOT
+// offered.
+
+/// Compressed encoding width: 32 bytes (`x` with the flag bits on top).
+pub const compressed_bytes = Fp.encoded_bytes;
+
+const flag_mask: u8 = 0b1100_0000;
+const flag_smallest: u8 = 0b1000_0000;
+const flag_largest: u8 = 0b1100_0000;
+const flag_infinity: u8 = 0b0100_0000;
+
+/// `true` iff `y` is the lexicographically larger of `{y, -y}` (gnark's
+/// `LexicographicallyLargest`: `y > p - y` as integers).
+fn isLargest(y: Fp) bool {
+    const a = y.toBytes();
+    const n = y.neg().toBytes();
+    return std.mem.order(u8, &a, &n) == .gt;
+}
+
+/// Serializes `p` in gnark-crypto's 32-byte compressed form.
+pub fn toBytesCompressed(p: Affine) [compressed_bytes]u8 {
+    var out: [compressed_bytes]u8 = @splat(0);
+    if (p.infinity) {
+        out[0] = flag_infinity;
+        return out;
+    }
+    out = p.x.toBytes();
+    out[0] |= if (isLargest(p.y)) flag_largest else flag_smallest;
+    return out;
+}
+
+/// Parses gnark's compressed form. Refuses (all as errors): a wrong
+/// length or flags (`0b00`, i.e. an uncompressed marker) or non-zero
+/// bytes next to the infinity flag (`InvalidEncoding`), `x >= p`
+/// (`InvalidFieldElement`), and an `x` with no point on the curve
+/// (`NotOnCurve`). Every curve point is in `G1` (cofactor 1).
+pub fn fromBytesCompressed(bytes: []const u8) G1Error!Affine {
+    if (bytes.len != compressed_bytes) return error.InvalidEncoding;
+    const flags = bytes[0] & flag_mask;
+    var xb: [compressed_bytes]u8 = bytes[0..compressed_bytes].*;
+    xb[0] &= ~flag_mask;
+    switch (flags) {
+        flag_infinity => {
+            if (!std.mem.allEqual(u8, &xb, 0)) return error.InvalidEncoding;
+            return Affine.identity;
+        },
+        flag_smallest, flag_largest => {},
+        else => return error.InvalidEncoding,
+    }
+    const x = Fp.fromBytes(xb) catch return error.InvalidFieldElement;
+    const y0 = x.square().mul(x).add(b).sqrt() orelse return error.NotOnCurve;
+    const y = if (isLargest(y0) == (flags == flag_largest)) y0 else y0.neg();
+    return .{ .x = x, .y = y };
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 
 test "b == 3" {
@@ -502,4 +566,75 @@ test "fromBytes rejects an off-curve (x, y) pair" {
     bytes[31] = 1;
     bytes[63] = 3;
     try std.testing.expectError(error.NotOnCurve, fromBytes(&bytes));
+}
+
+test "compressed: generator (1, 2) is 0x80 || 30 zero bytes || 0x01 (hand-checked)" {
+    var expected: [32]u8 = @splat(0);
+    expected[0] = 0x80;
+    expected[31] = 0x01;
+    try std.testing.expectEqualSlices(u8, &expected, &toBytesCompressed(Affine.generator));
+    const back = try fromBytesCompressed(&expected);
+    try std.testing.expect(back.x.eql(Affine.generator.x) and back.y.eql(Affine.generator.y));
+}
+
+test "compressed: -G has the 0b11 flag, round-trips, and infinity is 0x40 || zeros" {
+    const neg = Jacobian.fromAffine(Affine.generator).negate().toAffine();
+    const c = toBytesCompressed(neg);
+    try std.testing.expectEqual(@as(u8, 0xC0), c[0]);
+    try std.testing.expectEqual(@as(u8, 0x01), c[31]);
+    const back = try fromBytesCompressed(&c);
+    try std.testing.expect(back.y.eql(neg.y));
+    var inf: [32]u8 = @splat(0);
+    inf[0] = 0x40;
+    try std.testing.expectEqualSlices(u8, &inf, &toBytesCompressed(Affine.identity));
+    try std.testing.expect((try fromBytesCompressed(&inf)).infinity);
+}
+
+test "compressed: round-trip of many multiples of G" {
+    var acc = Jacobian.fromAffine(Affine.generator);
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        const a = acc.toAffine();
+        const back = try fromBytesCompressed(&toBytesCompressed(a));
+        try std.testing.expect(back.x.eql(a.x) and back.y.eql(a.y));
+        acc = acc.add(Jacobian.fromAffine(Affine.generator)).double();
+    }
+}
+
+test "compressed: refusals" {
+    const good = toBytesCompressed(Affine.generator);
+    try std.testing.expectError(error.InvalidEncoding, fromBytesCompressed(good[0..31]));
+    var long: [33]u8 = @splat(0);
+    try std.testing.expectError(error.InvalidEncoding, fromBytesCompressed(&long));
+    // flag 0b00 (uncompressed marker)
+    var f0 = good;
+    f0[0] &= 0x3F;
+    try std.testing.expectError(error.InvalidEncoding, fromBytesCompressed(&f0));
+    // infinity flag with a stray bit / byte
+    var inf: [32]u8 = @splat(0);
+    inf[0] = 0x40;
+    inf[31] = 1;
+    try std.testing.expectError(error.InvalidEncoding, fromBytesCompressed(&inf));
+    inf[31] = 0;
+    inf[0] = 0x41;
+    try std.testing.expectError(error.InvalidEncoding, fromBytesCompressed(&inf));
+    // x = p (non-canonical) with the smallest flag
+    var nc = fp.p_bytes;
+    nc[0] |= 0x80;
+    try std.testing.expectError(error.InvalidFieldElement, fromBytesCompressed(&nc));
+    // the smallest x whose x^3 + 3 has no square root
+    var x: u8 = 1;
+    var found = false;
+    while (x < 100) : (x += 1) {
+        var xb: [32]u8 = @splat(0);
+        xb[31] = x;
+        const xf = try Fp.fromBytes(xb);
+        if (xf.square().mul(xf).add(b).sqrt() == null) {
+            xb[0] |= 0x80;
+            try std.testing.expectError(error.NotOnCurve, fromBytesCompressed(&xb));
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
 }

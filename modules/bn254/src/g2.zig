@@ -436,6 +436,73 @@ pub fn fromBytesUnchecked(bytes: []const u8) G2Error!Affine {
     return p;
 }
 
+// ── compressed codec (gnark-crypto convention, added 2026-11-16) ────────
+//
+// gnark-crypto's `ecc/bn254` compressed `G2`: 64 bytes, `x.A1 || x.A0`
+// (imaginary first — the same order as this module's `Fp2.toBytes` and
+// the uncompressed form above; `A1` is this module's `c1`), big-endian,
+// with the two most significant bits of byte 0 as flags: `0b10` = `y` is
+// the lexicographically smaller of `±y`, `0b11` = the larger, `0b01` =
+// infinity (rest all zero). `Fp2` order is lexicographic on `(A1, A0)`,
+// i.e. on the 64 serialized bytes. The ordering of `A1`/`A0` here
+// follows gnark's documented `X.A1 || X.A0`; no gnark output was
+// available offline to pin it, so it is tested only for self-consistency
+// (see SPEC). arkworks' convention (little-endian, flags in the last
+// byte) is not offered.
+
+/// Compressed encoding width: 64 bytes.
+pub const compressed_bytes = Fp2.encoded_bytes;
+
+const flag_mask: u8 = 0b1100_0000;
+const flag_smallest: u8 = 0b1000_0000;
+const flag_largest: u8 = 0b1100_0000;
+const flag_infinity: u8 = 0b0100_0000;
+
+fn isLargest(y: Fp2) bool {
+    const a = y.toBytes();
+    const n = y.neg().toBytes();
+    return std.mem.order(u8, &a, &n) == .gt;
+}
+
+/// Serializes `p` in gnark-crypto's 64-byte compressed form.
+pub fn toBytesCompressed(p: Affine) [compressed_bytes]u8 {
+    var out: [compressed_bytes]u8 = @splat(0);
+    if (p.infinity) {
+        out[0] = flag_infinity;
+        return out;
+    }
+    out = p.x.toBytes();
+    out[0] |= if (isLargest(p.y)) flag_largest else flag_smallest;
+    return out;
+}
+
+/// Parses gnark's compressed form, including the subgroup check. Refuses:
+/// a wrong length, flags `0b00` (uncompressed marker) or non-zero bytes
+/// next to the infinity flag (`InvalidEncoding`); a coordinate `>= p`
+/// (`InvalidFieldElement`); an `x` with no point on the twist
+/// (`NotOnCurve`); a point outside the order-`r` subgroup
+/// (`NotInSubgroup`).
+pub fn fromBytesCompressed(bytes: []const u8) G2Error!Affine {
+    if (bytes.len != compressed_bytes) return error.InvalidEncoding;
+    const flags = bytes[0] & flag_mask;
+    var xb: [compressed_bytes]u8 = bytes[0..compressed_bytes].*;
+    xb[0] &= ~flag_mask;
+    switch (flags) {
+        flag_infinity => {
+            if (!std.mem.allEqual(u8, &xb, 0)) return error.InvalidEncoding;
+            return Affine.identity;
+        },
+        flag_smallest, flag_largest => {},
+        else => return error.InvalidEncoding,
+    }
+    const x = Fp2.fromBytes(xb) catch return error.InvalidFieldElement;
+    const y0 = x.square().mul(x).add(twistB()).sqrt() orelse return error.NotOnCurve;
+    const y = if (isLargest(y0) == (flags == flag_largest)) y0 else y0.neg();
+    const p = Affine{ .x = x, .y = y };
+    if (!Jacobian.fromAffine(p).subgroupCheck()) return error.NotInSubgroup;
+    return p;
+}
+
 fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
     @setEvalBranchQuota(100_000);
     var out: [n]u8 = undefined;
@@ -821,4 +888,91 @@ test "ψ subgroup check == [r]P == O on members, non-members and off-twist point
         try std.testing.expect(!img.isOnCurve());
         try expectMembership(img, false);
     }
+}
+
+test "compressed: generator round-trips, flag matches y's order, imaginary-first x" {
+    const c = toBytesCompressed(Affine.generator);
+    // x.c1 (the first 32 bytes) leads, flags on top of its first byte.
+    try std.testing.expectEqualSlices(u8, &Affine.generator.x.c1.toBytes(), &[_]u8{c[0] & 0x3F} ++ c[1..32].*);
+    try std.testing.expect(c[0] & 0xC0 == 0x80 or c[0] & 0xC0 == 0xC0);
+    const back = try fromBytesCompressed(&c);
+    try std.testing.expect(back.x.eql(Affine.generator.x) and back.y.eql(Affine.generator.y));
+    // -G carries the other flag and decodes to -G.
+    const neg = Jacobian.fromAffine(Affine.generator).negate().toAffine();
+    const cn = toBytesCompressed(neg);
+    try std.testing.expect(cn[0] & 0xC0 != c[0] & 0xC0);
+    try std.testing.expectEqualSlices(u8, c[1..], cn[1..]);
+    const bn = try fromBytesCompressed(&cn);
+    try std.testing.expect(bn.y.eql(neg.y));
+}
+
+test "compressed: [2]G, [k]G round-trip; infinity is 0x40 || zeros" {
+    var acc = jacGen();
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        acc = acc.double().add(jacGen());
+        const a = acc.toAffine();
+        const back = try fromBytesCompressed(&toBytesCompressed(a));
+        try std.testing.expect(back.x.eql(a.x) and back.y.eql(a.y));
+    }
+    var inf: [64]u8 = @splat(0);
+    inf[0] = 0x40;
+    try std.testing.expectEqualSlices(u8, &inf, &toBytesCompressed(Affine.identity));
+    try std.testing.expect((try fromBytesCompressed(&inf)).infinity);
+}
+
+test "compressed: refusals" {
+    const good = toBytesCompressed(Affine.generator);
+    try std.testing.expectError(error.InvalidEncoding, fromBytesCompressed(good[0..63]));
+    var f0 = good;
+    f0[0] &= 0x3F;
+    try std.testing.expectError(error.InvalidEncoding, fromBytesCompressed(&f0));
+    var inf: [64]u8 = @splat(0);
+    inf[0] = 0x40;
+    inf[63] = 1;
+    try std.testing.expectError(error.InvalidEncoding, fromBytesCompressed(&inf));
+    inf[63] = 0;
+    inf[10] = 1;
+    try std.testing.expectError(error.InvalidEncoding, fromBytesCompressed(&inf));
+    var nc = good;
+    nc[0..32].* = fp.p_bytes;
+    nc[0] |= 0x80;
+    try std.testing.expectError(error.InvalidFieldElement, fromBytesCompressed(&nc));
+    nc = good;
+    nc[32..64].* = fp.p_bytes;
+    try std.testing.expectError(error.InvalidFieldElement, fromBytesCompressed(&nc));
+    // an x with no twist point, found by scanning x.c0 = 1, 2, ...
+    var found = false;
+    var v: u8 = 1;
+    while (v < 100) : (v += 1) {
+        var xb: [64]u8 = @splat(0);
+        xb[63] = v;
+        const xf = try Fp2.fromBytes(xb);
+        if (xf.square().mul(xf).add(twistB()).sqrt() == null) {
+            xb[0] |= 0x80;
+            try std.testing.expectError(error.NotOnCurve, fromBytesCompressed(&xb));
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "compressed: an on-twist point outside the subgroup is refused (NotInSubgroup)" {
+    // Scan x = (v, 0) for a twist point; all but a ~1/r fraction are outside G2.
+    var v: u8 = 1;
+    var tested = false;
+    while (v < 100) : (v += 1) {
+        var xb: [64]u8 = @splat(0);
+        xb[63] = v;
+        const xf = try Fp2.fromBytes(xb);
+        const y = xf.square().mul(xf).add(twistB()).sqrt() orelse continue;
+        const pt = Affine{ .x = xf, .y = y };
+        try std.testing.expect(!Jacobian.fromAffine(pt).subgroupCheck());
+        xb[0] |= 0x80;
+        try std.testing.expectError(error.NotInSubgroup, fromBytesCompressed(&xb));
+        tested = true;
+        break;
+    }
+    try std.testing.expect(tested);
 }
