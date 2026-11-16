@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **BEHAVIOUR CHANGE:** a DST over 255 bytes is no longer refused with `DstTooLong`; `expandMessageXof`
+  (and so `hashToElement` / `hashToScalar`) reduces it as RFC 9380 §5.3.3 requires, `SHAKE256("H2C-OVERSIZE-DST-" || DST, 56)`
+  (k = 224). New `hash.reduceOversizeDst`. `DstTooLong` stays in `HashError` but is no longer returned.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-10** — tests: deterministic fuzz driver `DECAF448_FUZZ` (testkit) over `Element.decode` (accepted encodings re-encode canonically, a damaged one names another element), the group law on random scalars, and hashToElement/hashToScalar DST bounds. No change to the library code.

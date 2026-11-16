@@ -287,7 +287,7 @@ no error union at all.
 
 - ~~Scalar completeness~~ — landed 2026-10-06: `scalar.sub`/`negate`/`invert`/`random`/`reduce`/`fromWide`.
 - ~~`hash_to_decaf448`~~ — landed 2026-10-06: `hash.expandMessageXof`/`hashToElement`/`hashToScalar`.
-- **Oversize DST** (RFC 9380 §5.3.3, `H2C-OVERSIZE-DST-`) *(2026-10-06)*: `expandMessageXof` refuses a DST over 255 bytes (`error.DstTooLong`) instead of reducing it, because the reduction needs the suite's `k` and no RFC 9380/9497 suite uses one. Effort: small. Fits §2.
+- ✅ **DONE 2026-11-16 (`hash.reduceOversizeDst`, applied by `expandMessageXof` to any DST over 255 bytes, k = 224; self-consistency tests only, RFC 9380 has no decaf448 oversize vector):** **Oversize DST** (RFC 9380 §5.3.3, `H2C-OVERSIZE-DST-`) *(2026-10-06)*: `expandMessageXof` refuses a DST over 255 bytes (`error.DstTooLong`) instead of reducing it, because the reduction needs the suite's `k` and no RFC 9380/9497 suite uses one. Effort: small. Fits §2.
 - **Faster scalar inversion** *(2026-10-06)*: `invert` is ~450 squarings + ~220 multiplications through `ed448.scalar.mul`'s bit-serial reduction. An addition chain or a Montgomery/Barrett `mul` in `ed448.scalar` would cut it several-fold. Effort: small-medium. Fits §2.
 
 ## Anchoring

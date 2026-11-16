@@ -87,7 +87,7 @@ const Rng = fuzz_driver.Rng;
 
 const DecodeMark = Marker(enum { genuine_accepted, accepted, refused, canonical, damaged_other_element });
 const GroupMark = Marker(enum { distributive, associative, inverse, encode_roundtrip, one_way_map });
-const HashMark = Marker(enum { hashed, dst_refused });
+const HashMark = Marker(enum { hashed, oversize_dst_reduced, dst_refused });
 
 fn randScalar(k: *Cursor) scalar.CompressedScalar {
     var wide: [114]u8 = undefined;
@@ -226,19 +226,26 @@ fn fuzzHash(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         if (buf[0] == 0 and buf[1] >= 128) buf[1] = 0;
     }
     // The first two octets split the rest into DST and message: 0..256 octets
-    // of DST, so the empty, accepted and too-long cases all occur.
+    // of DST, so the empty, accepted and oversize (reduced) cases all occur.
     const dst_len = @min(@as(usize, buf[0]) + buf[1] / 128, buf.len - 2);
     const dst = buf[2 .. 2 + dst_len];
     const msg = buf[2 + dst_len ..];
-    const want_err = dst.len == 0 or dst.len > hash.max_dst_length;
+    const want_err = dst.len == 0;
     if (hash.hashToElement(msg, dst)) |p| {
         if (want_err) return error.BadDstAccepted;
         const d = try Element.decode(p.encode());
         if (!d.equals(p)) return error.HashedElementNotCanonical;
+        if (dst.len > hash.max_dst_length) {
+            // RFC 9380 §5.3.3: the same element as the reduced DST gives.
+            const reduced = hash.reduceOversizeDst(dst);
+            const q = try hash.hashToElement(msg, &reduced);
+            if (!q.equals(p)) return error.OversizeDstNotReduced;
+            HashMark.mark(.oversize_dst_reduced);
+        }
         HashMark.mark(.hashed);
     } else |err| {
         if (!want_err) return error.GoodDstRefused;
-        if (err != error.DstEmpty and err != error.DstTooLong) return error.WrongError;
+        if (err != error.DstEmpty) return error.WrongError;
         HashMark.mark(.dst_refused);
     }
     if (hash.hashToScalar(msg, dst)) |s| {
