@@ -6,7 +6,7 @@
 
 **Scope:** mvp — iproute2 tc 6.19 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-15 · mutation 2026-09-10 · src ?
+**Audit:** review 2026-09-15 · mutation 2026-11-17 (70/70) · src ?
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, TC_FUZZ) · ct n/a — traffic control netlink (keyword review, 2026-10-07)
 
@@ -583,6 +583,19 @@ reachable through `raw` today:
   admin-up first); htb dumps `HTB_VER` (0x30011) in `tc_htb_glob.version`, of which only
   the high half is the protocol version `tc` sends; and an **empty** shared action table
   answers a dump with `-ENOENT` rather than an empty `NLMSG_DONE`.
+
+**Audit 2026-11-17 (delta mutation).** 70 schemata mutants over the statistics decoding added the same day
+(`parseStats2`, `parseLegacyStats`, `pickStats`, `parseFqCodelXstats` and the STATS2/STATS/XSTATS arms of
+`parseQdisc` and `parseClass` in `qdisc.zig`), ReleaseSafe, one build, each mutant under `setsid -w timeout` and
+`ulimit -v`: the byte order of both readers, every sub-attribute's length guard (forced open, one byte tighter),
+the `seen`, `have_pkt64` and `have_rate64` flags (skipped, forced), every decoded field (set to 0), the legacy
+length bound (one shorter, one longer), the null-versus-zeroed result, the STATS2-to-STATS fallback, the xstats
+type and length guards and every xstats member, the dispatch arms and the kind check on XSTATS. First run: 42
+killed, 28 survived. Six tests added (hardware counters and the 64-bit rate estimator in either order, each
+sub-attribute alone making the counters present, `PKT64` ahead of `BASIC`, minimum-size and one-byte-short
+sub-attributes, the fallback to the legacy attribute for a qdisc and a class, every fq_codel xstats member and an
+XSTATS on another kind); the rerun killed all 28. 70/70, 0 equivalent. The 2026-09-10 run recorded no count, so
+the card carries this run's.
 
 ## Provenance
 

@@ -2223,3 +2223,187 @@ test "stats: fq_codel TCA_XSTATS (qdisc half) decodes, a short or class-typed on
     try codec.appendAttr(gpa, &m3, TCA.XSTATS, &x);
     try testing.expect((try parseQdisc(m3.items)).fq_codel_xstats == null);
 }
+
+// ── statistics decoding: delta mutation audit 2026-11-17 ────────────────────
+// The tests below were added for survivors: hardware counters, the 64-bit rate
+// estimator, attribute order, exact minimum sizes, short attributes, the
+// STATS2 -> STATS fallback, a class carrying only the legacy attribute, every
+// fq_codel xstats field, and an XSTATS on a kind that is not fq_codel.
+
+fn statsOfNest(gpa: std.mem.Allocator, nest: []const u8) !?Stats {
+    var m: std.ArrayList(u8) = .empty;
+    defer m.deinit(gpa);
+    try statsFixture(gpa, &m, "htb");
+    try codec.appendAttr(gpa, &m, TCA.STATS2, nest);
+    return (try parseQdisc(m.items)).stats;
+}
+
+test "stats: BASIC_HW and RATE_EST64 decode; RATE_EST64 wins over RATE_EST in either order" {
+    const gpa = testing.allocator;
+    var hw: [16]u8 = @splat(0);
+    le64(&hw, 0, 42_000_000_000);
+    le32(&hw, 8, 7);
+    var r64: [16]u8 = undefined;
+    le64(&r64, 0, 9_000_000_000);
+    le64(&r64, 8, 8_000_000_000);
+    var r32: [8]u8 = @splat(0);
+    le32(&r32, 0, 5);
+    le32(&r32, 4, 6);
+
+    var n: std.ArrayList(u8) = .empty;
+    defer n.deinit(gpa);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.BASIC_HW, &hw);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.RATE_EST, &r32);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.RATE_EST64, &r64);
+    const a = (try statsOfNest(gpa, n.items)).?;
+    try testing.expectEqual(@as(u64, 42_000_000_000), a.hw_bytes);
+    try testing.expectEqual(@as(u64, 7), a.hw_packets);
+    try testing.expectEqual(@as(u64, 9_000_000_000), a.bps);
+    try testing.expectEqual(@as(u64, 8_000_000_000), a.pps);
+
+    // RATE_EST64 first: the later 32-bit RATE_EST must not overwrite it.
+    n.clearRetainingCapacity();
+    try codec.appendAttr(gpa, &n, TCA_STATS2.RATE_EST64, &r64);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.RATE_EST, &r32);
+    const b = (try statsOfNest(gpa, n.items)).?;
+    try testing.expectEqual(@as(u64, 9_000_000_000), b.bps);
+    try testing.expectEqual(@as(u64, 8_000_000_000), b.pps);
+}
+
+test "stats: each of BASIC, QUEUE, RATE_EST, RATE_EST64 alone makes the counters present" {
+    const gpa = testing.allocator;
+    const sizes = [_]struct { t: u16, len: usize }{
+        .{ .t = TCA_STATS2.BASIC, .len = 12 },
+        .{ .t = TCA_STATS2.QUEUE, .len = 20 },
+        .{ .t = TCA_STATS2.RATE_EST, .len = 8 },
+        .{ .t = TCA_STATS2.RATE_EST64, .len = 16 },
+    };
+    for (sizes) |sz| {
+        var body: [20]u8 = @splat(3);
+        var n: std.ArrayList(u8) = .empty;
+        defer n.deinit(gpa);
+        try codec.appendAttr(gpa, &n, sz.t, body[0..sz.len]);
+        try testing.expect((try statsOfNest(gpa, n.items)) != null);
+    }
+    // BASIC_HW and PKT64 alone do not: nothing usable was counted.
+    var body: [16]u8 = @splat(3);
+    var n: std.ArrayList(u8) = .empty;
+    defer n.deinit(gpa);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.BASIC_HW, &body);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.PKT64, body[0..8]);
+    try testing.expect((try statsOfNest(gpa, n.items)) == null);
+}
+
+test "stats: PKT64 is authoritative whatever the attribute order" {
+    const gpa = testing.allocator;
+    var basic: [16]u8 = @splat(0);
+    le64(&basic, 0, 100);
+    le32(&basic, 8, 1000);
+    var p: [8]u8 = undefined;
+    le64(&p, 0, 5_000_000_000);
+    var n: std.ArrayList(u8) = .empty;
+    defer n.deinit(gpa);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.PKT64, &p);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.BASIC, &basic);
+    const s = (try statsOfNest(gpa, n.items)).?;
+    try testing.expectEqual(@as(u64, 5_000_000_000), s.packets);
+    try testing.expectEqual(@as(u64, 100), s.bytes);
+}
+
+test "stats: sub-attributes of exactly the minimum size decode, one byte shorter are ignored" {
+    const gpa = testing.allocator;
+    var basic: [16]u8 = @splat(0);
+    le64(&basic, 0, 100);
+    le32(&basic, 8, 1000);
+    var b12: [12]u8 = @splat(0);
+    le64(&b12, 0, 77);
+    le32(&b12, 8, 3);
+    var r64: [16]u8 = @splat(0);
+    le64(&r64, 0, 11);
+    le64(&r64, 8, 12);
+    var p8: [8]u8 = undefined;
+    le64(&p8, 0, 6_000_000_000);
+
+    var n: std.ArrayList(u8) = .empty;
+    defer n.deinit(gpa);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.BASIC_HW, &b12); // exactly 12
+    try codec.appendAttr(gpa, &n, TCA_STATS2.BASIC, &b12); // exactly 12
+    try codec.appendAttr(gpa, &n, TCA_STATS2.RATE_EST64, &r64); // exactly 16
+    try codec.appendAttr(gpa, &n, TCA_STATS2.PKT64, &p8); // exactly 8
+    const s = (try statsOfNest(gpa, n.items)).?;
+    try testing.expectEqual(@as(u64, 77), s.hw_bytes);
+    try testing.expectEqual(@as(u64, 3), s.hw_packets);
+    try testing.expectEqual(@as(u64, 77), s.bytes);
+    try testing.expectEqual(@as(u64, 11), s.bps);
+    try testing.expectEqual(@as(u64, 12), s.pps);
+    try testing.expectEqual(@as(u64, 6_000_000_000), s.packets);
+
+    // One byte short each: ignored, and (BASIC full) the rest still decodes.
+    n.clearRetainingCapacity();
+    try codec.appendAttr(gpa, &n, TCA_STATS2.BASIC, &basic);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.BASIC_HW, b12[0..11]);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.RATE_EST, r64[0..7]);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.RATE_EST64, r64[0..15]);
+    try codec.appendAttr(gpa, &n, TCA_STATS2.PKT64, p8[0..7]);
+    const t = (try statsOfNest(gpa, n.items)).?;
+    try testing.expectEqual(@as(u64, 0), t.hw_bytes);
+    try testing.expectEqual(@as(u64, 0), t.hw_packets);
+    try testing.expectEqual(@as(u64, 0), t.bps);
+    try testing.expectEqual(@as(u64, 0), t.pps);
+    try testing.expectEqual(@as(u64, 1000), t.packets);
+}
+
+test "stats: a STATS2 with nothing usable falls back to the legacy TCA_STATS; a class too" {
+    const gpa = testing.allocator;
+    var legacy: [36]u8 = @splat(0);
+    le64(&legacy, 0, 555);
+    le32(&legacy, 8, 5);
+    var only: std.ArrayList(u8) = .empty;
+    defer only.deinit(gpa);
+    try codec.appendAttr(gpa, &only, TCA_STATS2.BASIC, &@as([11]u8, @splat(1)));
+
+    var m: std.ArrayList(u8) = .empty;
+    defer m.deinit(gpa);
+    try statsFixture(gpa, &m, "htb");
+    try codec.appendAttr(gpa, &m, TCA.STATS2, only.items);
+    try codec.appendAttr(gpa, &m, TCA.STATS, &legacy); // exactly tc_stats_len
+    const q = (try parseQdisc(m.items)).stats.?;
+    try testing.expectEqual(@as(u64, 555), q.bytes);
+    try testing.expectEqual(@as(u64, 5), q.packets);
+
+    // A class carrying only the legacy attribute.
+    var m2: std.ArrayList(u8) = .empty;
+    defer m2.deinit(gpa);
+    try statsFixture(gpa, &m2, "htb");
+    try codec.appendAttr(gpa, &m2, TCA.STATS, &legacy);
+    const c = (try parseClass(m2.items)).stats.?;
+    try testing.expectEqual(@as(u64, 555), c.bytes);
+    try testing.expectEqual(@as(u64, 5), c.packets);
+}
+
+test "stats: every fq_codel xstats field lands in its own member; other kinds ignore XSTATS" {
+    const gpa = testing.allocator;
+    var x: [40]u8 = @splat(0);
+    for (1..10) |i| le32(&x, i * 4, @intCast(i * 100));
+    var m: std.ArrayList(u8) = .empty;
+    defer m.deinit(gpa);
+    try statsFixture(gpa, &m, kind_fq_codel);
+    try codec.appendAttr(gpa, &m, TCA.XSTATS, &x);
+    const xs = (try parseQdisc(m.items)).fq_codel_xstats.?;
+    try testing.expectEqual(@as(u32, 100), xs.maxpacket);
+    try testing.expectEqual(@as(u32, 200), xs.drop_overlimit);
+    try testing.expectEqual(@as(u32, 300), xs.ecn_mark);
+    try testing.expectEqual(@as(u32, 400), xs.new_flow_count);
+    try testing.expectEqual(@as(u32, 500), xs.new_flows_len);
+    try testing.expectEqual(@as(u32, 600), xs.old_flows_len);
+    try testing.expectEqual(@as(u32, 700), xs.ce_mark);
+    try testing.expectEqual(@as(u32, 800), xs.memory_usage);
+    try testing.expectEqual(@as(u32, 900), xs.drop_overmemory);
+
+    // The same bytes on an htb qdisc are another kind's private statistics.
+    var m2: std.ArrayList(u8) = .empty;
+    defer m2.deinit(gpa);
+    try statsFixture(gpa, &m2, "htb");
+    try codec.appendAttr(gpa, &m2, TCA.XSTATS, &x);
+    try testing.expect((try parseQdisc(m2.items)).fq_codel_xstats == null);
+}
