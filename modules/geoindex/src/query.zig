@@ -55,6 +55,9 @@ pub const KnnStatus = enum {
     truncated_budget,
 };
 
+/// `within` reports the same statuses as `bbox` (complete / capacity / budget).
+pub const WithinStatus = BboxStatus;
+pub const WithinResult = struct { items: []Neighbor, status: WithinStatus };
 pub const BboxResult = struct { items: []Match, status: BboxStatus };
 pub const KnnResult = struct { items: []Neighbor, status: KnnStatus };
 
@@ -64,6 +67,23 @@ pub const KnnResult = struct { items: []Neighbor, status: KnnStatus };
 /// attacker-influenced queries.
 pub const QueryOptions = struct {
     max_visited: usize = 100_000,
+    /// Optional predicate applied to every candidate point DURING the search
+    /// (geoflatbush `filterFn`). A rejected point is neither reported nor counted
+    /// against the result capacity / `k`, so `knn` still returns the k nearest
+    /// points that pass. Rejecting points does not widen the visit budget.
+    filter: ?Filter = null,
+};
+
+/// A point predicate with a context pointer (no closures in Zig). `func` is
+/// called with `ctx` and the candidate point; return true to keep it. It must
+/// not mutate the index buffer.
+pub const Filter = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (ctx: ?*anyopaque, point: Match) bool,
+
+    fn keep(self: Filter, point: Match) bool {
+        return self.func(self.ctx, point);
+    }
 };
 
 /// Fixed inline DFS stack cap for `bbox`. A packed R-tree's stack depth is
@@ -147,9 +167,11 @@ pub const Frozen = struct {
             if (node.leaf) {
                 // A leaf's bbox is its point; intersection above already proved
                 // the point is inside the closed rectangle.
+                const m = Match{ .value = node.data, .lat = node.min_lat, .lon = node.min_lon };
+                if (opts.filter) |flt| if (!flt.keep(m)) continue;
                 if (n_out >= out.len)
                     return .{ .items = out[0..n_out], .status = .truncated_capacity };
-                out[n_out] = .{ .value = node.data, .lat = node.min_lat, .lon = node.min_lon };
+                out[n_out] = m;
                 n_out += 1;
             } else {
                 var c: u32 = 0;
@@ -157,6 +179,84 @@ pub const Frozen = struct {
                     const child_index = std.math.add(u32, node.data, c) catch return error.Corrupt;
                     const ch = try self.nodes.child(node, child_index);
                     if (boxesIntersect(ch.min_lat, ch.max_lat, ch.min_lon, ch.max_lon, min_lat, max_lat, min_lon, max_lon)) {
+                        if (sp >= stack.len) return error.StackOverflow;
+                        stack[sp] = child_index;
+                        sp += 1;
+                    }
+                }
+            }
+        }
+        return .{ .items = out[0..n_out], .status = .complete };
+    }
+
+    // ── within (radius) ──────────────────────────────────────────────────────
+    //
+    // Every point whose RANKING-METRIC distance to (lat, lon) is <= `radius`.
+    // This module has no great-circle distance (see SPEC: haversine is deferred),
+    // so the radius is in the same equirectangular metric as `knn`: DEGREES of
+    // latitude, with the longitude difference scaled by cos(query latitude). It is
+    // the planar kdbush `within` in that metric, not a metre radius. Each result
+    // carries `dist2` (= squared metric distance, <= radius^2). Order is
+    // unspecified (depth-first); sort by `dist2` if needed. A negative or NaN
+    // radius, or NaN query coordinates, match nothing; radius 0 matches the points
+    // exactly at the query. Subtrees whose bbox lower bound exceeds the radius
+    // (padded by 1e-9 deg against rounding) are pruned.
+
+    /// All indexed points within `radius` of `(lat, lon)` (see above), into
+    /// `out`. No allocation. Status as for `bbox`.
+    pub fn within(
+        self: Frozen,
+        lat: f64,
+        lon: f64,
+        radius: f64,
+        out: []Neighbor,
+        opts: QueryOptions,
+    ) QueryError!WithinResult {
+        if (self.header.item_count == 0 or !(radius >= 0))
+            return .{ .items = out[0..0], .status = .complete };
+        if (out.len == 0) return .{ .items = out[0..0], .status = .truncated_capacity };
+
+        const qk = std.math.cos(lat * std.math.pi / 180.0);
+        const r2 = radius * radius;
+        const r_pad = radius + 1e-9;
+        const prune2 = r_pad * r_pad;
+
+        var stack: [max_stack]u32 = undefined;
+        var sp: usize = 0;
+        stack[sp] = self.header.root_index;
+        sp += 1;
+        var n_out: usize = 0;
+        var visited: usize = 0;
+
+        while (sp > 0) {
+            sp -= 1;
+            const node = try self.nodes.at(stack[sp]);
+            if (opts.max_visited != 0 and visited >= opts.max_visited)
+                return .{ .items = out[0..n_out], .status = .truncated_budget };
+            visited += 1;
+
+            if (node.leaf) {
+                const d2 = pointDist2(lat, lon, node.min_lat, node.min_lon, qk);
+                if (!(d2 <= r2)) continue;
+                if (opts.filter) |flt| {
+                    if (!flt.keep(.{ .value = node.data, .lat = node.min_lat, .lon = node.min_lon })) continue;
+                }
+                if (n_out >= out.len)
+                    return .{ .items = out[0..n_out], .status = .truncated_capacity };
+                out[n_out] = .{ .value = node.data, .lat = node.min_lat, .lon = node.min_lon, .dist2 = d2 };
+                n_out += 1;
+            } else {
+                var c: u32 = 0;
+                while (c < node.child_count) : (c += 1) {
+                    const child_index = std.math.add(u32, node.data, c) catch return error.Corrupt;
+                    const ch = try self.nodes.child(node, child_index);
+                    const bd2 = if (ch.leaf)
+                        pointDist2(lat, lon, ch.min_lat, ch.min_lon, qk)
+                    else
+                        boxDist2(lat, lon, ch.min_lat, ch.max_lat, ch.min_lon, ch.max_lon, qk);
+                    // A leaf child is tested exactly when popped; here only prune
+                    // internal subtrees (and leaves clearly out of range).
+                    if (bd2 <= prune2 or bd2 != bd2) {
                         if (sp >= stack.len) return error.StackOverflow;
                         stack[sp] = child_index;
                         sp += 1;
@@ -220,6 +320,9 @@ pub const Frozen = struct {
 
             const e = heap.pop();
             if (e.is_point) {
+                if (opts.filter) |flt| {
+                    if (!flt.keep(.{ .value = e.value, .lat = e.lat, .lon = e.lon })) continue;
+                }
                 out[n_out] = .{ .value = e.value, .lat = e.lat, .lon = e.lon, .dist2 = e.dist2 };
                 n_out += 1;
             } else {
@@ -596,4 +699,171 @@ test "knn: scratch too small is a typed error, not a crash" {
     var out: [50]Neighbor = undefined;
     var tiny: [2]HeapEntry = undefined;
     try testing.expectError(error.ScratchTooSmall, f.knn(5, 5, 50, &out, &tiny, .{}));
+}
+
+// ── radius + filter tests (against a brute-force scan) ───────────────────────
+
+const Rng = std.Random.DefaultPrng;
+
+const Pt = struct { lat: f64, lon: f64 };
+
+fn randomIndex(rng: *Rng, n: usize, pts: []Pt) ![]u8 {
+    var b = builder.Builder.init(testing.allocator);
+    defer b.deinit();
+    for (0..n) |i| {
+        const lat = rng.random().float(f64) * 160.0 - 80.0;
+        const lon = rng.random().float(f64) * 340.0 - 170.0;
+        pts[i] = .{ .lat = lat, .lon = lon };
+        try b.add(lat, lon, @intCast(i));
+    }
+    return b.freeze(testing.allocator);
+}
+
+fn modFilter(ctx: ?*anyopaque, p: Match) bool {
+    const m: *const u32 = @ptrCast(@alignCast(ctx.?));
+    return p.value % m.* == 0;
+}
+
+fn rejectAll(_: ?*anyopaque, _: Match) bool {
+    return false;
+}
+
+test "within: equals a brute-force scan over random points (incl. r = 0, tiny, huge)" {
+    var rng = Rng.init(0x6e0_1d3);
+    var pts: [600]Pt = undefined;
+    const buf = try randomIndex(&rng, pts.len, &pts);
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    var out: [600]Neighbor = undefined;
+    const radii = [_]f64{ 0, 1e-12, 0.5, 3, 12, 40, 400 };
+    for (0..40) |qi| {
+        // Half the queries sit exactly on an indexed point.
+        const q: Pt = if (qi % 2 == 0) pts[qi * 7 % pts.len] else .{
+            .lat = rng.random().float(f64) * 180.0 - 90.0,
+            .lon = rng.random().float(f64) * 360.0 - 180.0,
+        };
+        const qk = std.math.cos(q.lat * std.math.pi / 180.0);
+        for (radii) |r| {
+            var expect = std.bit_set.IntegerBitSet(600).empty;
+            for (pts, 0..) |p, i| if (pointDist2(q.lat, q.lon, p.lat, p.lon, qk) <= r * r) expect.set(i);
+            const res = try f.within(q.lat, q.lon, r, &out, .{ .max_visited = 0 });
+            try testing.expectEqual(WithinStatus.complete, res.status);
+            var got = std.bit_set.IntegerBitSet(600).empty;
+            for (res.items) |m| {
+                try testing.expect(!got.isSet(m.value)); // no duplicates
+                got.set(m.value);
+                try testing.expect(m.dist2 <= r * r);
+                try testing.expectEqual(pts[m.value].lat, m.lat);
+            }
+            try testing.expect(expect.eql(got));
+            if (r == 0 and qi % 2 == 0) try testing.expect(res.items.len >= 1);
+        }
+    }
+}
+
+test "within: empty results, negative/NaN radius, capacity and budget truncation" {
+    var rng = Rng.init(7);
+    var pts: [200]Pt = undefined;
+    const buf = try randomIndex(&rng, pts.len, &pts);
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    var out: [200]Neighbor = undefined;
+    // Nothing within r = 0 of a spot that is not a point.
+    try testing.expectEqual(@as(usize, 0), (try f.within(89.9, 0, 0, &out, .{})).items.len);
+    try testing.expectEqual(@as(usize, 0), (try f.within(0, 0, -1, &out, .{})).items.len);
+    try testing.expectEqual(@as(usize, 0), (try f.within(0, 0, std.math.nan(f64), &out, .{})).items.len);
+    try testing.expectEqual(@as(usize, 0), (try f.within(std.math.nan(f64), 0, 5, &out, .{})).items.len);
+    // Everything, into a small buffer: capacity truncation; empty buffer too.
+    const small = try f.within(0, 0, 1e6, out[0..5], .{});
+    try testing.expectEqual(WithinStatus.truncated_capacity, small.status);
+    try testing.expectEqual(@as(usize, 5), small.items.len);
+    try testing.expectEqual(WithinStatus.truncated_capacity, (try f.within(0, 0, 1e6, out[0..0], .{})).status);
+    try testing.expectEqual(WithinStatus.truncated_budget, (try f.within(0, 0, 1e6, &out, .{ .max_visited = 3 })).status);
+    // Empty index.
+    const eb = try build(&.{});
+    defer testing.allocator.free(eb);
+    const ef = try Frozen.load(eb);
+    try testing.expectEqual(@as(usize, 0), (try ef.within(0, 0, 10, &out, .{})).items.len);
+}
+
+test "filter: bbox, within and knn equal a filtered brute-force scan" {
+    var rng = Rng.init(0xf117e2);
+    var pts: [500]Pt = undefined;
+    const buf = try randomIndex(&rng, pts.len, &pts);
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    var modulus: u32 = 3;
+    const flt = Filter{ .ctx = &modulus, .func = modFilter };
+    var m_out: [500]Match = undefined;
+    var n_out: [500]Neighbor = undefined;
+    var scratch: [1024]HeapEntry = undefined;
+
+    for (0..30) |_| {
+        const q: Pt = .{ .lat = rng.random().float(f64) * 160.0 - 80.0, .lon = rng.random().float(f64) * 340.0 - 170.0 };
+        const qk = std.math.cos(q.lat * std.math.pi / 180.0);
+
+        // bbox
+        var expect = std.bit_set.IntegerBitSet(500).empty;
+        for (pts, 0..) |p, i| {
+            if (i % 3 == 0 and p.lat >= q.lat - 20 and p.lat <= q.lat + 20 and p.lon >= q.lon - 40 and p.lon <= q.lon + 40) expect.set(i);
+        }
+        const br = try f.bbox(q.lat - 20, q.lat + 20, q.lon - 40, q.lon + 40, &m_out, .{ .max_visited = 0, .filter = flt });
+        try testing.expectEqual(BboxStatus.complete, br.status);
+        var got = std.bit_set.IntegerBitSet(500).empty;
+        for (br.items) |m| got.set(m.value);
+        try testing.expect(expect.eql(got));
+
+        // within
+        expect = std.bit_set.IntegerBitSet(500).empty;
+        for (pts, 0..) |p, i| if (i % 3 == 0 and pointDist2(q.lat, q.lon, p.lat, p.lon, qk) <= 30 * 30) expect.set(i);
+        const wr = try f.within(q.lat, q.lon, 30, &n_out, .{ .max_visited = 0, .filter = flt });
+        got = std.bit_set.IntegerBitSet(500).empty;
+        for (wr.items) |m| got.set(m.value);
+        try testing.expect(expect.eql(got));
+
+        // knn: k nearest among accepted points, in order
+        var order: [500]u32 = undefined;
+        var cnt: usize = 0;
+        for (0..pts.len) |i| {
+            if (i % 3 == 0) {
+                order[cnt] = @intCast(i);
+                cnt += 1;
+            }
+        }
+        const Ctx = struct {
+            pts: []const Pt,
+            q: Pt,
+            qk: f64,
+            fn less(c: @This(), a: u32, b: u32) bool {
+                const da = pointDist2(c.q.lat, c.q.lon, c.pts[a].lat, c.pts[a].lon, c.qk);
+                const db = pointDist2(c.q.lat, c.q.lon, c.pts[b].lat, c.pts[b].lon, c.qk);
+                if (da != db) return da < db;
+                return a < b;
+            }
+        };
+        std.mem.sort(u32, order[0..cnt], Ctx{ .pts = &pts, .q = q, .qk = qk }, Ctx.less);
+        const k = 25;
+        const kr = try f.knn(q.lat, q.lon, k, &n_out, &scratch, .{ .max_visited = 0, .filter = flt });
+        try testing.expectEqual(KnnStatus.complete, kr.status);
+        try testing.expectEqual(@min(@as(usize, k), cnt), kr.items.len);
+        for (kr.items, 0..) |m, i| try testing.expectEqual(order[i], m.value);
+    }
+}
+
+test "filter: rejecting everything yields empty results with complete status" {
+    var rng = Rng.init(99);
+    var pts: [100]Pt = undefined;
+    const buf = try randomIndex(&rng, pts.len, &pts);
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+    const flt = Filter{ .func = rejectAll };
+    var m_out: [100]Match = undefined;
+    var n_out: [100]Neighbor = undefined;
+    var scratch: [512]HeapEntry = undefined;
+    try testing.expectEqual(@as(usize, 0), (try f.bbox(-90, 90, -180, 180, &m_out, .{ .filter = flt })).items.len);
+    try testing.expectEqual(BboxStatus.complete, (try f.bbox(-90, 90, -180, 180, &m_out, .{ .filter = flt })).status);
+    try testing.expectEqual(@as(usize, 0), (try f.within(0, 0, 1e6, &n_out, .{ .filter = flt })).items.len);
+    const kr = try f.knn(0, 0, 10, &n_out, &scratch, .{ .filter = flt });
+    try testing.expectEqual(@as(usize, 0), kr.items.len);
+    try testing.expectEqual(KnnStatus.complete, kr.status);
 }
