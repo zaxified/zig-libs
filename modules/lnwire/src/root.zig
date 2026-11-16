@@ -166,5 +166,6 @@ test {
     _ = features;
     _ = @import("bolt1_kat_test.zig");
     _ = @import("bolt2_kat_test.zig");
+    _ = @import("tlv_typed_test.zig");
     _ = @import("stackprobe_test.zig");
 }

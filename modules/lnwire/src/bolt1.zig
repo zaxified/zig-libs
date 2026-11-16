@@ -5,6 +5,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const message = @import("message.zig");
+const bolt7 = @import("bolt7.zig");
 const Reader = message.Reader;
 const Writer = message.Writer;
 const Extension = message.Extension;
@@ -12,10 +13,50 @@ const ChannelId = message.ChannelId;
 
 pub const DecodeError = message.FrameError || message.tlv.StreamError;
 
+/// A known TLV record of the wrong length (`InvalidTlvLength`); see `message.TlvLengthError`.
+pub const TlvLengthError = message.TlvLengthError;
+
 // ── init (type 16) ──────────────────────────────────────────────────────
 
 pub const INIT_TYPE: u16 = 16;
-const init_known_tlv_types = [_]u64{ 1, 3 }; // networks, remote_addr
+/// `init_tlvs` TLV types (BOLT#1).
+pub const TLV_NETWORKS: u64 = 1;
+pub const TLV_REMOTE_ADDR: u64 = 3;
+const init_known_tlv_types = [_]u64{ TLV_NETWORKS, TLV_REMOTE_ADDR };
+
+/// Walks the `networks` TLV value: a concatenation of 32-octet chain hashes
+/// (BOLT#1 `networks`: `...*chain_hash`). Borrowed from the decoded extension.
+pub const NetworksIterator = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+
+    pub fn next(self: *NetworksIterator) ?[32]u8 {
+        if (self.bytes.len - self.pos < 32) return null;
+        const h = self.bytes[self.pos..][0..32].*;
+        self.pos += 32;
+        return h;
+    }
+
+    /// How many chain hashes the value holds.
+    pub fn count(self: NetworksIterator) usize {
+        return self.bytes.len / 32;
+    }
+};
+
+/// Checks the two known records' encodings: `networks` is a whole number of
+/// 32-octet hashes; `remote_addr` is exactly one BOLT#7 address descriptor
+/// (an unknown descriptor type cannot be framed, so it is let through and
+/// `Init.remoteAddr` reports it as absent).
+fn checkInitTlvs(ext: Extension) TlvLengthError!void {
+    if (ext.find(TLV_NETWORKS)) |v| {
+        if (v.len % 32 != 0) return error.InvalidTlvLength;
+    }
+    if (ext.find(TLV_REMOTE_ADDR)) |v| {
+        var it = bolt7.addressIterator(v);
+        const a = it.next() catch return error.InvalidTlvLength;
+        if (a != null and it.unparsed().len != 0) return error.InvalidTlvLength;
+    }
+}
 
 pub const Init = struct {
     /// Borrowed slices (see `message.zig`'s module doc comment).
@@ -26,17 +67,38 @@ pub const Init = struct {
     pub fn deinit(self: *Init, allocator: Allocator) void {
         self.extension.deinit(allocator);
     }
+
+    /// `networks` (TLV 1), if present: the chain hashes the sender is
+    /// interested in. Its length (a multiple of 32) was checked at decode.
+    pub fn networks(self: Init) ?NetworksIterator {
+        const v = self.extension.find(TLV_NETWORKS) orelse return null;
+        if (v.len % 32 != 0) return null;
+        return .{ .bytes = v };
+    }
+
+    /// `remote_addr` (TLV 3), if present: the address the sender sees this
+    /// connection coming from. `null` when absent or of a descriptor type
+    /// this module does not know. Borrowed from the decoded extension.
+    pub fn remoteAddr(self: Init) ?bolt7.Address {
+        const v = self.extension.find(TLV_REMOTE_ADDR) orelse return null;
+        var it = bolt7.addressIterator(v);
+        const a = it.next() catch return null;
+        return a;
+    }
 };
 
-pub fn decodeInit(allocator: Allocator, bytes: []const u8) (DecodeError || Allocator.Error)!Init {
+pub fn decodeInit(allocator: Allocator, bytes: []const u8) (DecodeError || TlvLengthError || Allocator.Error)!Init {
     var r = try message.openFrame(bytes, INIT_TYPE);
     const globalfeatures = try r.bytesU16();
     const features = try r.bytesU16();
-    const extension = try message.decodeExtension(allocator, r.rest(), &init_known_tlv_types);
+    var extension = try message.decodeExtension(allocator, r.rest(), &init_known_tlv_types);
+    errdefer extension.deinit(allocator);
+    try checkInitTlvs(extension);
     return .{ .globalfeatures = globalfeatures, .features = features, .extension = extension };
 }
 
-pub fn serializeInit(allocator: Allocator, msg: Init) message.WriteError![]u8 {
+pub fn serializeInit(allocator: Allocator, msg: Init) (message.WriteError || TlvLengthError)![]u8 {
+    try checkInitTlvs(msg.extension);
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, INIT_TYPE);

@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [ACINQ/eclair](https://github.com/ACINQ/eclair) | Scala | Apache-2.0 | 1.3k | v0.14.3 (2026-09-14) | Scala codecs for the full message set *(inferred)*. |
 | Zig ecosystem | Zig | — | — | — | GitHub search for Lightning/BOLT Zig repositories (2026-09-30) found none besides this collection. |
 
-**Where we are ahead:** the only Zig BOLT#1/2/7 codec; strict TLV rules (increasing types, minimal BigSize, it's-ok-to-be-odd) pinned to the spec's vectors; ownership model documented (decode borrows the input); `update_fail_malformed_htlc`'s `BADONION` rule and `channel_reestablish`'s TLV lengths enforced in the codec itself (rust-lightning's own vector carries a `failure_code` without the bit, i.e. its message codec leaves that rule to a later layer). **Where we are even:** the base channel lifecycle (open → HTLCs → reestablish → close) and the gossip set a node needs to announce a channel and subscribe to gossip; typed `node_announcement` addresses; feature-bit reads. **Where we are behind:** interactive-tx / dual-funding / splicing / quiescence / `closing_complete`+`closing_sig` / `start_batch`, onion messages, zlib-compressed range queries, per-record typing of the other messages' TLVs, a named BOLT#9 feature table.
+**Where we are ahead:** the only Zig BOLT#1/2/7 codec; strict TLV rules (increasing types, minimal BigSize, it's-ok-to-be-odd) pinned to the spec's vectors; ownership model documented (decode borrows the input); `update_fail_malformed_htlc`'s `BADONION` rule and `channel_reestablish`'s TLV lengths enforced in the codec itself (rust-lightning's own vector carries a `failure_code` without the bit, i.e. its message codec leaves that rule to a later layer). **Where we are even:** the base channel lifecycle (open → HTLCs → reestablish → close) and the gossip set a node needs to announce a channel and subscribe to gossip; typed `node_announcement` addresses; feature-bit reads. **Where we are behind:** interactive-tx / dual-funding / splicing / quiescence / `closing_complete`+`closing_sig` / `start_batch`, onion messages, zlib-compressed range queries, a named BOLT#9 feature table (`features.Feature`, partial).
 
 **Re-assessed 2026-10-06** (no new web survey; the 2026-09-30 table above is a week old): the four messages and the typed addresses/features the survey ranked first in Backlog landed, so what a v1-channel node or a gossip client exchanges is now covered; what remains (the v2/splicing message family, onion messages, zlib) is what newer peers *negotiate* by feature bit, and a peer that has not negotiated them never sends them — Backlog-grade, hence `core`, not `parity`.
 
@@ -48,8 +48,7 @@ allocation any decode performs is a message's `Extension.records` array — see 
 - `message.zig` — a bounds-checked big-endian `Reader`/`Writer`, the BOLT#1 "Fundamental Types"
   aliases (`Point`, `Signature`, `ChannelId`, ...), the 2-byte message-type frame (`openFrame`/
   `putFrameType`), and `Extension` — a message's trailing `tlv_stream`, decoded into its defined
-  top-level record types via `tlv.parseStream`. Per-record *value* semantics (e.g. `fee_range`'s
-  two `u64`s) are left to the caller — `Extension.find(type)` hands back raw bytes.
+  top-level record types via `tlv.parseStream`. Per-record *value* semantics live in the message structs' typed accessors (`feeRange`, `attributionData`, `networks`, ...); `Extension.find(type)` still hands back raw bytes.
 - `bolt1.zig` — `init`, `error`/`warning` (identical wire layout, one codec parameterized by
   `msg_type`), `ping`, `pong`.
 - `bolt2.zig` — 15 BOLT#2 channel messages (the 13 originally required, plus `update_fail_malformed_htlc` and `channel_reestablish` since 2026-10-06; see README's Scope section).
@@ -162,14 +161,7 @@ unit of work, not a corner cut inside a message this module claims to implement)
   (`closing_complete`/`closing_sig` — this module implements only the legacy `closing_signed`
   negotiation). (`channel_reestablish` and `update_fail_malformed_htlc` landed 2026-10-06, as did
   BOLT#7's `announcement_signatures` and `gossip_timestamp_filter`.)
-- **Per-field TLV value semantics beyond the raw `(type, value)` pair** — e.g. `channel_type`'s
-  feature-bitmap interpretation, `fee_range`'s two-`u64` decode, `attribution_data`'s
-  `20*u32 + 210*sha256[..4]` structure, `query_flags`'s per-`short_channel_id` bit array. Every
-  message's trailing extension is generically parsed with the *correct* known-type set (so
-  legitimate even-typed fields like `upfront_shutdown_script`/`blinded_path` round-trip correctly
-  and genuinely-unknown even types are still rejected — see "Design & invariants" above), but the
-  bytes of each known record are handed back raw. This mirrors the BOLT#7 digest split (expose the
-  primitive, defer the domain-specific interpretation) applied one level further down.
+- **Per-field TLV value semantics** — typed since 2026-11-17 (see Backlog): `fee_range`, `attribution_data`, `channel_type`, `networks`, `remote_addr`, `query_option`, `query_flags` have accessors with decode-time length checks; the raw `extension` stays the lossless form. Still out of scope: interpreting `query_flags`'s bits per channel beyond the bigsize walk, the zlib-compressed form, and `channel_type`'s mapping to named channel types.
 - **Script-form parsing** — `shutdown.scriptpubkey`'s `OP_0`/`OP_1`-`OP_16`/`OP_RETURN`
   allow-list is an opaque byte slice, same "no Script interpretation" scope cut the sibling
   `bitcointx` module documents for `scriptSig`/`scriptPubKey`. (`node_announcement.addresses` is
@@ -305,7 +297,7 @@ Run: `zig build test-lnwire` (Debug and `-Doptimize=ReleaseFast`).
 
 - **Dual-funding / interactive-tx / splicing / `stfu` / `closing_complete`+`closing_sig` message set** *(survey 2026-09-30)* — what current LND/CLN/LDK peers negotiate. Effort: medium (mechanical, spec vectors exist); fits §2.
 - **Named BOLT#9 feature table** *(2026-10-06)* — ✅ DONE 2026-11-16 (`features.Feature`/`table`/`row`/`setFeature`/`hasFeature`/`checkDependencies`: 18 rows with even bit, I/N/9 contexts, dependencies; rows not yet verified against the spec text — dual_fund, attribution data, onion messages, provide storage, trampoline, simple close, splice, initial_routing_sync, the C/B contexts — are omitted, a follow-up).
-- **Typed TLV records for the other messages** *(2026-10-06)* — `channel_type`/`fee_range`/`attribution_data` etc. are still raw `(type, value)` pairs (only `channel_reestablish`'s two records are typed). Effort: small; fits §2.
+- **Typed TLV records for the other messages** *(2026-10-06)* — ✅ 2026-11-17 typed accessors with decode-time (and encode-time) length/shape checks: `open_channel`/`accept_channel` `upfrontShutdownScript`/`channelType`, `closing_signed` `feeRange` (16 octets), `update_fulfill_htlc`/`update_fail_htlc` `attributionData` (920 octets: 20 x u32 hold times + 210 x 4-octet truncated HMACs), `init` `networks` (multiple of 32) / `remoteAddr` (one BOLT#7 descriptor), `query_short_channel_ids` `queryFlags` (uncompressed list walked; zlib carried, not inflated), `query_channel_range` `queryOption` (one minimal bigsize). The raw `extension` stays; an unknown odd record is still discarded at decode (BOLT#1), an unknown even one still fails. `timestamps_tlv`/`checksums_tlv` of `reply_channel_range` were typed before.
 - **zlib-compressed `short_channel_id` lists** *(survey 2026-09-30)* — decode-only support would let extended queries interoperate with peers that compress (4 of the 10 spec rows). Effort: needs an inflate (no zlib/deflate module in this collection; `std.compress.flate` in Zig 0.16 has a zlib-container `Decompress`); fits §2 if std is used.
 
 ## Anchoring

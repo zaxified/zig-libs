@@ -17,13 +17,15 @@
 //!
 //! Every message's trailing `tlv_stream` is decoded generically via
 //! `message.Extension` (see `message.zig`'s doc comment) into its
-//! defined top-level record types; per-field internal semantics (e.g.
-//! `fee_range`'s two `u64`s) are the caller's to interpret from the raw
-//! record bytes.
+//! defined top-level record types (raw form kept in `extension`); the
+//! known records are also typed through accessors on the message structs
+//! (`feeRange`, `attributionData`, `channelType`, ...), with the record's
+//! length checked at decode and encode (`TlvLengthError`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const message = @import("message.zig");
+const features = @import("features.zig");
 const burn = @import("burn.zig");
 const Reader = message.Reader;
 const Writer = message.Writer;
@@ -35,6 +37,9 @@ const Point = message.Point;
 
 pub const DecodeError = message.FrameError || message.tlv.StreamError;
 
+/// A known TLV record of the wrong length (`InvalidTlvLength`); see `message.TlvLengthError`.
+pub const TlvLengthError = message.TlvLengthError;
+
 fn readPoint(r: *Reader) message.ReadError!Point {
     return r.takeArray(33);
 }
@@ -45,7 +50,28 @@ fn readSignature(r: *Reader) message.ReadError!Signature {
 // ── open_channel (type 32) ──────────────────────────────────────────────
 
 pub const OPEN_CHANNEL_TYPE: u16 = 32;
-const open_channel_known_tlv = [_]u64{ 0, 1 }; // upfront_shutdown_script, channel_type
+/// `open_channel_tlvs` / `accept_channel_tlvs` TLV types (BOLT#2).
+pub const TLV_UPFRONT_SHUTDOWN_SCRIPT: u64 = 0;
+pub const TLV_CHANNEL_TYPE: u64 = 1;
+
+/// A `channel_type` TLV value (BOLT#2): a feature-bit vector in BOLT#9
+/// byte order, i.e. `features.isSet` semantics. Borrowed from the decoded
+/// extension. BOLT#2 requires the sender to use the minimal length; the
+/// receiver is not told to reject a longer one, so none is rejected here
+/// (`minimal` hands back the trimmed form).
+pub const ChannelType = struct {
+    bits: []const u8,
+
+    pub fn isSet(self: ChannelType, bit: usize) bool {
+        return features.isSet(self.bits, bit);
+    }
+
+    pub fn minimal(self: ChannelType) []const u8 {
+        return features.minimal(self.bits);
+    }
+};
+
+const open_channel_known_tlv = [_]u64{ TLV_UPFRONT_SHUTDOWN_SCRIPT, TLV_CHANNEL_TYPE }; // upfront_shutdown_script, channel_type
 
 pub const OpenChannel = struct {
     chain_hash: message.ChainHash,
@@ -70,6 +96,19 @@ pub const OpenChannel = struct {
 
     pub fn deinit(self: *OpenChannel, allocator: Allocator) void {
         self.extension.deinit(allocator);
+    }
+
+    /// `upfront_shutdown_script` (TLV 0), if present (BOLT#2 `open_channel_tlvs`;
+    /// a zero-length value is the "opt in, script to follow" signal and is
+    /// returned as an empty slice). Borrowed from the decoded extension.
+    pub fn upfrontShutdownScript(self: OpenChannel) ?[]const u8 {
+        return self.extension.find(TLV_UPFRONT_SHUTDOWN_SCRIPT);
+    }
+
+    /// `channel_type` (TLV 1), if present (BOLT#2 `open_channel_tlvs`).
+    pub fn channelType(self: OpenChannel) ?ChannelType {
+        const v = self.extension.find(TLV_CHANNEL_TYPE) orelse return null;
+        return .{ .bits = v };
     }
 };
 
@@ -148,6 +187,19 @@ pub const AcceptChannel = struct {
 
     pub fn deinit(self: *AcceptChannel, allocator: Allocator) void {
         self.extension.deinit(allocator);
+    }
+
+    /// `upfront_shutdown_script` (TLV 0), if present (BOLT#2 `open_channel_tlvs`;
+    /// a zero-length value is the "opt in, script to follow" signal and is
+    /// returned as an empty slice). Borrowed from the decoded extension.
+    pub fn upfrontShutdownScript(self: AcceptChannel) ?[]const u8 {
+        return self.extension.find(TLV_UPFRONT_SHUTDOWN_SCRIPT);
+    }
+
+    /// `channel_type` (TLV 1), if present (BOLT#2 `open_channel_tlvs`).
+    pub fn channelType(self: AcceptChannel) ?ChannelType {
+        const v = self.extension.find(TLV_CHANNEL_TYPE) orelse return null;
+        return .{ .bits = v };
     }
 };
 
@@ -342,7 +394,47 @@ pub fn serializeUpdateAddHtlc(allocator: Allocator, msg: UpdateAddHtlc) Allocato
 // ── update_fulfill_htlc (type 130) ────────────────────────────────────────
 
 pub const UPDATE_FULFILL_HTLC_TYPE: u16 = 130;
-const update_fulfill_htlc_known_tlv = [_]u64{1}; // attribution_data
+/// `attribution_data` TLV type of `update_fulfill_htlc` / `update_fail_htlc`
+/// (BOLT#2 "attributable failures" extension, `update_*_tlvs`).
+pub const TLV_ATTRIBUTION_DATA: u64 = 1;
+
+/// The `attribution_data` value: `htlc_hold_times` (20 x `u32`, big-endian)
+/// followed by `truncated_hmacs` (210 x 4 octets) -- exactly 920 octets.
+pub const AttributionData = struct {
+    htlc_hold_times: [max_hops]u32,
+    truncated_hmacs: [hmac_count][hmac_len]u8,
+
+    pub const max_hops: usize = 20;
+    pub const hmac_len: usize = 4;
+    /// 20 * (20 + 1) / 2 -- one truncated HMAC per (hop, downstream hop) pair.
+    pub const hmac_count: usize = 210;
+    pub const wire_len: usize = max_hops * 4 + hmac_count * hmac_len;
+
+    pub fn toBytes(self: AttributionData) [wire_len]u8 {
+        var out: [wire_len]u8 = undefined;
+        for (self.htlc_hold_times, 0..) |t, i| std.mem.writeInt(u32, out[i * 4 ..][0..4], t, .big);
+        const base = max_hops * 4;
+        for (self.truncated_hmacs, 0..) |h, i| @memcpy(out[base + i * hmac_len ..][0..hmac_len], &h);
+        return out;
+    }
+
+    /// `v.len` must be `wire_len` (decode guarantees it for a decoded message).
+    fn fromBytes(v: []const u8) AttributionData {
+        var out: AttributionData = undefined;
+        for (&out.htlc_hold_times, 0..) |*t, i| t.* = std.mem.readInt(u32, v[i * 4 ..][0..4], .big);
+        const base = max_hops * 4;
+        for (&out.truncated_hmacs, 0..) |*h, i| h.* = v[base + i * hmac_len ..][0..hmac_len].*;
+        return out;
+    }
+};
+
+fn checkAttributionLength(ext: Extension) TlvLengthError!void {
+    if (ext.find(TLV_ATTRIBUTION_DATA)) |v| {
+        if (v.len != AttributionData.wire_len) return error.InvalidTlvLength;
+    }
+}
+
+const update_fulfill_htlc_known_tlv = [_]u64{TLV_ATTRIBUTION_DATA};
 
 pub const UpdateFulfillHtlc = struct {
     channel_id: ChannelId,
@@ -358,18 +450,28 @@ pub const UpdateFulfillHtlc = struct {
     pub fn deinit(self: *UpdateFulfillHtlc, allocator: Allocator) void {
         self.extension.deinit(allocator);
     }
+
+    /// `attribution_data` (TLV 1), if present. Its length (920) was checked at decode.
+    pub fn attributionData(self: UpdateFulfillHtlc) ?AttributionData {
+        const v = self.extension.find(TLV_ATTRIBUTION_DATA) orelse return null;
+        if (v.len != AttributionData.wire_len) return null;
+        return AttributionData.fromBytes(v);
+    }
 };
 
-pub fn decodeUpdateFulfillHtlc(allocator: Allocator, bytes: []const u8) (DecodeError || Allocator.Error)!UpdateFulfillHtlc {
+pub fn decodeUpdateFulfillHtlc(allocator: Allocator, bytes: []const u8) (DecodeError || TlvLengthError || Allocator.Error)!UpdateFulfillHtlc {
     var r = try message.openFrame(bytes, UPDATE_FULFILL_HTLC_TYPE);
     const channel_id = try r.takeArray(32);
     const id = try r.u64be();
     const payment_preimage = try r.takeArray(32);
-    const extension = try message.decodeExtension(allocator, r.rest(), &update_fulfill_htlc_known_tlv);
+    var extension = try message.decodeExtension(allocator, r.rest(), &update_fulfill_htlc_known_tlv);
+    errdefer extension.deinit(allocator);
+    try checkAttributionLength(extension);
     return .{ .channel_id = channel_id, .id = id, .payment_preimage = payment_preimage, .extension = extension };
 }
 
-pub fn serializeUpdateFulfillHtlc(allocator: Allocator, msg: UpdateFulfillHtlc) Allocator.Error![]u8 {
+pub fn serializeUpdateFulfillHtlc(allocator: Allocator, msg: UpdateFulfillHtlc) (Allocator.Error || TlvLengthError)![]u8 {
+    try checkAttributionLength(msg.extension);
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, UPDATE_FULFILL_HTLC_TYPE);
@@ -383,7 +485,7 @@ pub fn serializeUpdateFulfillHtlc(allocator: Allocator, msg: UpdateFulfillHtlc) 
 // ── update_fail_htlc (type 131) ───────────────────────────────────────────
 
 pub const UPDATE_FAIL_HTLC_TYPE: u16 = 131;
-const update_fail_htlc_known_tlv = [_]u64{1}; // attribution_data
+const update_fail_htlc_known_tlv = [_]u64{TLV_ATTRIBUTION_DATA};
 
 pub const UpdateFailHtlc = struct {
     channel_id: ChannelId,
@@ -395,18 +497,28 @@ pub const UpdateFailHtlc = struct {
     pub fn deinit(self: *UpdateFailHtlc, allocator: Allocator) void {
         self.extension.deinit(allocator);
     }
+
+    /// `attribution_data` (TLV 1), if present. Its length (920) was checked at decode.
+    pub fn attributionData(self: UpdateFailHtlc) ?AttributionData {
+        const v = self.extension.find(TLV_ATTRIBUTION_DATA) orelse return null;
+        if (v.len != AttributionData.wire_len) return null;
+        return AttributionData.fromBytes(v);
+    }
 };
 
-pub fn decodeUpdateFailHtlc(allocator: Allocator, bytes: []const u8) (DecodeError || Allocator.Error)!UpdateFailHtlc {
+pub fn decodeUpdateFailHtlc(allocator: Allocator, bytes: []const u8) (DecodeError || TlvLengthError || Allocator.Error)!UpdateFailHtlc {
     var r = try message.openFrame(bytes, UPDATE_FAIL_HTLC_TYPE);
     const channel_id = try r.takeArray(32);
     const id = try r.u64be();
     const reason = try r.bytesU16();
-    const extension = try message.decodeExtension(allocator, r.rest(), &update_fail_htlc_known_tlv);
+    var extension = try message.decodeExtension(allocator, r.rest(), &update_fail_htlc_known_tlv);
+    errdefer extension.deinit(allocator);
+    try checkAttributionLength(extension);
     return .{ .channel_id = channel_id, .id = id, .reason = reason, .extension = extension };
 }
 
-pub fn serializeUpdateFailHtlc(allocator: Allocator, msg: UpdateFailHtlc) message.WriteError![]u8 {
+pub fn serializeUpdateFailHtlc(allocator: Allocator, msg: UpdateFailHtlc) (message.WriteError || TlvLengthError)![]u8 {
+    try checkAttributionLength(msg.extension);
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, UPDATE_FAIL_HTLC_TYPE);
@@ -574,7 +686,40 @@ pub fn serializeShutdown(allocator: Allocator, msg: Shutdown) message.WriteError
 // ── closing_signed (type 39) ─────────────────────────────────────────────
 
 pub const CLOSING_SIGNED_TYPE: u16 = 39;
-const closing_signed_known_tlv = [_]u64{1}; // fee_range
+/// `closing_signed_tlvs` `fee_range` TLV type (BOLT#2).
+pub const TLV_FEE_RANGE: u64 = 1;
+
+/// The `fee_range` value: `min_fee_satoshis` then `max_fee_satoshis`, each a
+/// big-endian `u64` -- exactly 16 octets. BOLT#2 requires `min <= max` of
+/// the sender; the codec does not enforce it (the negotiating layer does).
+pub const FeeRange = struct {
+    min_fee_satoshis: u64,
+    max_fee_satoshis: u64,
+
+    pub const wire_len: usize = 16;
+
+    pub fn toBytes(self: FeeRange) [wire_len]u8 {
+        var out: [wire_len]u8 = undefined;
+        std.mem.writeInt(u64, out[0..8], self.min_fee_satoshis, .big);
+        std.mem.writeInt(u64, out[8..16], self.max_fee_satoshis, .big);
+        return out;
+    }
+
+    fn fromBytes(v: []const u8) FeeRange {
+        return .{
+            .min_fee_satoshis = std.mem.readInt(u64, v[0..8], .big),
+            .max_fee_satoshis = std.mem.readInt(u64, v[8..16], .big),
+        };
+    }
+};
+
+fn checkFeeRangeLength(ext: Extension) TlvLengthError!void {
+    if (ext.find(TLV_FEE_RANGE)) |v| {
+        if (v.len != FeeRange.wire_len) return error.InvalidTlvLength;
+    }
+}
+
+const closing_signed_known_tlv = [_]u64{TLV_FEE_RANGE};
 
 pub const ClosingSigned = struct {
     channel_id: ChannelId,
@@ -585,18 +730,28 @@ pub const ClosingSigned = struct {
     pub fn deinit(self: *ClosingSigned, allocator: Allocator) void {
         self.extension.deinit(allocator);
     }
+
+    /// `fee_range` (TLV 1), if present. Its length (16) was checked at decode.
+    pub fn feeRange(self: ClosingSigned) ?FeeRange {
+        const v = self.extension.find(TLV_FEE_RANGE) orelse return null;
+        if (v.len != FeeRange.wire_len) return null;
+        return FeeRange.fromBytes(v);
+    }
 };
 
-pub fn decodeClosingSigned(allocator: Allocator, bytes: []const u8) (DecodeError || Allocator.Error)!ClosingSigned {
+pub fn decodeClosingSigned(allocator: Allocator, bytes: []const u8) (DecodeError || TlvLengthError || Allocator.Error)!ClosingSigned {
     var r = try message.openFrame(bytes, CLOSING_SIGNED_TYPE);
     const channel_id = try r.takeArray(32);
     const fee_satoshis = try r.u64be();
     const signature = try readSignature(&r);
-    const extension = try message.decodeExtension(allocator, r.rest(), &closing_signed_known_tlv);
+    var extension = try message.decodeExtension(allocator, r.rest(), &closing_signed_known_tlv);
+    errdefer extension.deinit(allocator);
+    try checkFeeRangeLength(extension);
     return .{ .channel_id = channel_id, .fee_satoshis = fee_satoshis, .signature = signature, .extension = extension };
 }
 
-pub fn serializeClosingSigned(allocator: Allocator, msg: ClosingSigned) Allocator.Error![]u8 {
+pub fn serializeClosingSigned(allocator: Allocator, msg: ClosingSigned) (Allocator.Error || TlvLengthError)![]u8 {
+    try checkFeeRangeLength(msg.extension);
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, CLOSING_SIGNED_TYPE);
@@ -704,13 +859,6 @@ pub const FundingTxidFlags = struct {
     fn fromBytes(v: []const u8) FundingTxidFlags {
         return .{ .txid = v[0..32].*, .retransmit_flags = v[32] };
     }
-};
-
-pub const TlvLengthError = error{
-    /// A KNOWN TLV record's length is not the one its encoding requires
-    /// (BOLT#1: "if `length` is not exactly equal to that required for the
-    /// known encoding for `type`: MUST fail to parse the `tlv_stream`").
-    InvalidTlvLength,
 };
 
 pub const ChannelReestablish = struct {

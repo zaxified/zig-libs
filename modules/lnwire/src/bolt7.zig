@@ -40,6 +40,9 @@ const ShortChannelId = message.ShortChannelId;
 
 pub const DecodeError = message.FrameError || message.tlv.StreamError;
 
+/// A known TLV record of the wrong length / shape (`InvalidTlvLength`); see `message.TlvLengthError`.
+pub const TlvLengthError = message.TlvLengthError;
+
 fn readPoint(r: *Reader) message.ReadError!Point {
     return r.takeArray(33);
 }
@@ -613,7 +616,61 @@ pub fn verifyChannelUpdate(
 // ── query_short_channel_ids / reply_short_channel_ids_end (261/262) ─────
 
 pub const QUERY_SHORT_CHANNEL_IDS_TYPE: u16 = 261;
-const query_short_channel_ids_known_tlv = [_]u64{1}; // query_flags
+/// `query_short_channel_ids_tlvs` `query_flags` TLV type (BOLT#7).
+pub const TLV_QUERY_FLAGS: u64 = 1;
+const query_short_channel_ids_known_tlv = [_]u64{TLV_QUERY_FLAGS};
+
+/// The `query_flags` value: an `encoding_type` octet then `encoded_query_flags`
+/// (BOLT#7: one `bigsize` per queried `short_channel_id`). Borrowed from the
+/// decoded extension.
+pub const QueryFlags = struct {
+    encoding_type: u8,
+    data: []const u8,
+
+    pub const ENCODING_UNCOMPRESSED: u8 = 0;
+    /// Query-flag bits (BOLT#7): which gossip to send for a channel.
+    pub const SEND_CHANNEL_ANNOUNCEMENT: u64 = 1 << 0;
+    pub const SEND_CHANNEL_UPDATE_NODE1: u64 = 1 << 1;
+    pub const SEND_CHANNEL_UPDATE_NODE2: u64 = 1 << 2;
+    pub const SEND_NODE_ANNOUNCEMENT_NODE1: u64 = 1 << 3;
+    pub const SEND_NODE_ANNOUNCEMENT_NODE2: u64 = 1 << 4;
+
+    pub const IterError = error{UnsupportedEncoding} || message.tlv.BigSizeError;
+
+    /// Walks the per-channel flag values of an uncompressed (`encoding_type`
+    /// 0) list; zlib (1) and unknown encodings yield `error.UnsupportedEncoding`
+    /// (this module has no zlib, see SPEC).
+    pub fn iterator(self: QueryFlags) IterError!Iterator {
+        if (self.encoding_type != ENCODING_UNCOMPRESSED) return error.UnsupportedEncoding;
+        return .{ .bytes = self.data };
+    }
+
+    pub const Iterator = struct {
+        bytes: []const u8,
+        pos: usize = 0,
+
+        pub fn next(self: *Iterator) message.tlv.BigSizeError!?u64 {
+            if (self.pos >= self.bytes.len) return null;
+            const d = try message.tlv.decodeBigSize(self.bytes[self.pos..]);
+            self.pos += d.consumed;
+            return d.value;
+        }
+    };
+};
+
+/// Checks `query_flags`: at least the `encoding_type` octet, and for the
+/// uncompressed encoding a clean sequence of minimal `bigsize`s.
+fn checkQueryFlags(ext: Extension) TlvLengthError!void {
+    const v = ext.find(TLV_QUERY_FLAGS) orelse return;
+    if (v.len < 1) return error.InvalidTlvLength;
+    if (v[0] == QueryFlags.ENCODING_UNCOMPRESSED) {
+        var pos: usize = 1;
+        while (pos < v.len) {
+            const d = message.tlv.decodeBigSize(v[pos..]) catch return error.InvalidTlvLength;
+            pos += d.consumed;
+        }
+    }
+}
 
 pub const QueryShortChannelIds = struct {
     chain_hash: ChainHash,
@@ -624,17 +681,27 @@ pub const QueryShortChannelIds = struct {
     pub fn deinit(self: *QueryShortChannelIds, allocator: Allocator) void {
         self.extension.deinit(allocator);
     }
+
+    /// `query_flags` (TLV 1), if present. Shape checked at decode.
+    pub fn queryFlags(self: QueryShortChannelIds) ?QueryFlags {
+        const v = self.extension.find(TLV_QUERY_FLAGS) orelse return null;
+        if (v.len < 1) return null;
+        return .{ .encoding_type = v[0], .data = v[1..] };
+    }
 };
 
-pub fn decodeQueryShortChannelIds(allocator: Allocator, bytes: []const u8) (DecodeError || Allocator.Error)!QueryShortChannelIds {
+pub fn decodeQueryShortChannelIds(allocator: Allocator, bytes: []const u8) (DecodeError || TlvLengthError || Allocator.Error)!QueryShortChannelIds {
     var r = try message.openFrame(bytes, QUERY_SHORT_CHANNEL_IDS_TYPE);
     const chain_hash = try r.takeArray(32);
     const encoded_short_ids = try r.bytesU16();
-    const extension = try message.decodeExtension(allocator, r.rest(), &query_short_channel_ids_known_tlv);
+    var extension = try message.decodeExtension(allocator, r.rest(), &query_short_channel_ids_known_tlv);
+    errdefer extension.deinit(allocator);
+    try checkQueryFlags(extension);
     return .{ .chain_hash = chain_hash, .encoded_short_ids = encoded_short_ids, .extension = extension };
 }
 
-pub fn serializeQueryShortChannelIds(allocator: Allocator, msg: QueryShortChannelIds) message.WriteError![]u8 {
+pub fn serializeQueryShortChannelIds(allocator: Allocator, msg: QueryShortChannelIds) (message.WriteError || TlvLengthError)![]u8 {
+    try checkQueryFlags(msg.extension);
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, QUERY_SHORT_CHANNEL_IDS_TYPE);
@@ -670,7 +737,19 @@ pub fn serializeReplyShortChannelIdsEnd(allocator: Allocator, msg: ReplyShortCha
 // ── query_channel_range / reply_channel_range (263/264) ─────────────────
 
 pub const QUERY_CHANNEL_RANGE_TYPE: u16 = 263;
-const query_channel_range_known_tlv = [_]u64{1}; // query_option
+/// `query_channel_range_tlvs` `query_option` TLV type (BOLT#7).
+pub const TLV_QUERY_OPTION: u64 = 1;
+const query_channel_range_known_tlv = [_]u64{TLV_QUERY_OPTION};
+
+/// `query_option` bits (BOLT#7): which extra data the reply should carry.
+pub const QUERY_OPTION_TIMESTAMPS: u64 = 1 << 0;
+pub const QUERY_OPTION_CHECKSUMS: u64 = 1 << 1;
+
+fn checkQueryOption(ext: Extension) TlvLengthError!void {
+    const v = ext.find(TLV_QUERY_OPTION) orelse return;
+    const d = message.tlv.decodeBigSize(v) catch return error.InvalidTlvLength;
+    if (d.consumed != v.len) return error.InvalidTlvLength;
+}
 
 pub const QueryChannelRange = struct {
     chain_hash: ChainHash,
@@ -681,18 +760,30 @@ pub const QueryChannelRange = struct {
     pub fn deinit(self: *QueryChannelRange, allocator: Allocator) void {
         self.extension.deinit(allocator);
     }
+
+    /// `query_option` (TLV 1), if present: a `bigsize` bit set
+    /// (`QUERY_OPTION_TIMESTAMPS`, `QUERY_OPTION_CHECKSUMS`). Checked at decode.
+    pub fn queryOption(self: QueryChannelRange) ?u64 {
+        const v = self.extension.find(TLV_QUERY_OPTION) orelse return null;
+        const d = message.tlv.decodeBigSize(v) catch return null;
+        if (d.consumed != v.len) return null;
+        return d.value;
+    }
 };
 
-pub fn decodeQueryChannelRange(allocator: Allocator, bytes: []const u8) (DecodeError || Allocator.Error)!QueryChannelRange {
+pub fn decodeQueryChannelRange(allocator: Allocator, bytes: []const u8) (DecodeError || TlvLengthError || Allocator.Error)!QueryChannelRange {
     var r = try message.openFrame(bytes, QUERY_CHANNEL_RANGE_TYPE);
     const chain_hash = try r.takeArray(32);
     const first_blocknum = try r.u32be();
     const number_of_blocks = try r.u32be();
-    const extension = try message.decodeExtension(allocator, r.rest(), &query_channel_range_known_tlv);
+    var extension = try message.decodeExtension(allocator, r.rest(), &query_channel_range_known_tlv);
+    errdefer extension.deinit(allocator);
+    try checkQueryOption(extension);
     return .{ .chain_hash = chain_hash, .first_blocknum = first_blocknum, .number_of_blocks = number_of_blocks, .extension = extension };
 }
 
-pub fn serializeQueryChannelRange(allocator: Allocator, msg: QueryChannelRange) Allocator.Error![]u8 {
+pub fn serializeQueryChannelRange(allocator: Allocator, msg: QueryChannelRange) (Allocator.Error || TlvLengthError)![]u8 {
+    try checkQueryOption(msg.extension);
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, QUERY_CHANNEL_RANGE_TYPE);

@@ -193,6 +193,12 @@ pub fn putFrameType(w: *Writer, allocator: Allocator, msg_type: u16) Allocator.E
 
 // ── trailing TLV extension ──────────────────────────────────────────────
 
+/// A KNOWN TLV record's length is not the one its encoding requires
+/// (BOLT#1: "if `length` is not exactly equal to that required for the
+/// known encoding for `type`: MUST fail to parse the `tlv_stream`").
+/// `bolt2.TlvLengthError` is the same error value.
+pub const TlvLengthError = error{InvalidTlvLength};
+
 /// A message's trailing `tlv_stream` (BOLT#1's `extension` field),
 /// decoded via `tlv.parseStream`. Only the *known* record types for this
 /// particular message (its `known_tlv_types`, see each `bolt2.zig`/
