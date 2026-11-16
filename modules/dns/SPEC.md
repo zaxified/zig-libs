@@ -6,7 +6,7 @@
 
 **Scope:** parity — Go net resolver (reference) / c-ares / hickory-resolver / libunbound / dnspython / systemd-resolved / Node `dns` (surveyed 2026-11-15; parity -> core 2026-11-15 for the blocking-only API alone, core -> parity 2026-11-16: many lookups in flight through `std.Io` (`lookupIpMany`, `io.async` on the thread-safe `CachingResolver`), request coalescing and prefetch; what remains behind — failover memory, in-line DNSSEC, per-RRset cache TTLs — is in the Backlog with its reason, see "Where we are behind")
 
-**Audit:** review 2026-09-12 · mutation 2026-11-16 (300/319, 19 eq) · src 13247f8ac5c44d0a
+**Audit:** review 2026-09-12 · mutation 2026-11-16 (377/399, 22 eq) · src 73c07bcb911f1e11
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DNS_FUZZ); 2026-11-02 `dns-query-roundtrip` (random QueryOptions incl. DO/AD/CD and EDNS options → encode → decode equal, or the documented refusal; 200,000 driver runs clean, ReleaseSafe) · ct n/a — public DNS codec (keyword review, 2026-10-07); TSIG (2026-10-16): std HMAC, MAC compared with `timing_safe.eql`, secret frames burned (stack probe) · panic 2026-10-31 (sweep + blind review: `RequestTooLarge` for > 65535 B, TSIG length guards, spoofed/QR-clear/undecodable UDP replies dropped to the same deadline, DoH body ≤ 65535, owner-name sharing 17.8 → 0.85 MB on a pointer flood; delta audit 28/31 + 3 eq)
 
@@ -397,6 +397,31 @@ probe, plus the default `sort_source` equal to `netaddr.systemSource` on Linux. 
 `builtin.os.tag` choice of `defaultSortSource` (UNOBSERVABLE: comptime, needs a non-Linux host) and
 the `T == netaddr.Ip` guard of the re-sort (comptime: the other element types do not compile
 without it); the Linux half is pinned by the new default-probe assertion.
+
+**Audit 2026-11-16 (delta mutation).** 80 schemata mutants over the non-test lines of `src/CachingResolver.zig` that
+request coalescing, prefetch and `lookupIpMany` added: `init`'s `prefetch_pct` check and the `inflight` table's
+release, the two new `Stats` fields, `refreshDue` (its bound, count, statistic and the `Canceled` arm), `takeDue` (the
+due test, the clearing of the mark, the key copy and length, the newest-first walk), `refreshKey` (the refresh flag of
+every key kind and the byte offsets of the reverse and SRV keys), `lookupIpMany` (the length check, the result
+initialisation, the await, `manyOne`), `runLocked` (the `refresh` / `force` / `waited` flags and the miss count, the
+hit count and the prefetch mark with its boundary, each step of the flight wait: counter, `waiters`, cancel,
+destruction; the refresh-only budget and backoff returns, the lead's registration and its `endFlight`),
+`startFlight` / `endFlight` / `destroyFlight` (every free and the wake-up), `failed`'s refresh branch (entry lookup,
+failure count, remembered error, retry time) and the mark cleared by `store`. First run: 51 killed (5 of them by
+timeout or a crash), 29 survived. New tests: every key kind (both address families, MX, NS, TXT, CNAME, SRV) renewed by
+`refreshDue` and then served from the table, the SRV refresh asking for the same wire name again (the Stub counts it);
+`refreshDue`'s bound and its newest-first order with the next call finding the older key; a canceled `refreshDue`
+returning `error.Canceled`; the mark at the exact 20 % and 99 % boundaries; a refresh refused by the budget serving
+nothing stale; a new answer clearing the mark an expired one carried; a failed refresh remembering its error for the
+next lookup inside the backoff; a failed refresh of a key forgotten meanwhile leaving no failure entry; a refresh parked
+behind a user lookup of its key reading what that stored without asking again; waiters of a canceled lead asking the
+network themselves and a newcomer not parking behind them. Rerun: 26 more killed, 3 survived (the SRV offsets, until
+the Stub learned to count names), rerun 3 killed. 77 killed, 3 equivalent / unobservable: the `pct != 0` guard of the mark
+(with `pct == 0` the comparison `left * 100 < 0` is false anyway) and its `!e.prefetch_due` guard (it only skips setting an
+already set flag) are EQUIVALENT; the result initialisation of `lookupIpMany` is UNOBSERVABLE (every task sets its own
+result, also a canceled one; it needs a `Group` that drops tasks which never started). Latent, not a defect today: in
+`refreshKey` the SRV lengths are `u8`, so `1 + sl` and `2 + sl + pl` would overflow at 255 / 254 bytes; a key that long
+never carries an answer because the Resolver refuses labels over 63 bytes.
 
 **Audit 2026-10-04 (mutation).** 54 schemata mutants over the wire codec (name length and
 label caps, pointer direction and jump budget, section-count pre-checks, RDLENGTH/RDATA

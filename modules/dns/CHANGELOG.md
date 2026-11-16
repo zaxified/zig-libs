@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the coalescing, prefetch and `lookupIpMany` code in
+  `CachingResolver`, 77/80 killed, 3 equivalent or unobservable; ten new tests (every key kind renewed by `refreshDue`, its
+  order and cancelation, the prefetch boundary, refused and failed refreshes, waiters of a canceled lead), and the test Stub
+  counts SRV query names.
 - **2026-11-16** — `CachingResolver` review fixes (same day, before any release): a waiter whose coalesced lead left nothing in
   the table asks itself in parallel instead of queueing behind the next waiter (TTL-0 / non-cacheable answers were serialised);
   a failed prefetch refresh arms the key's backoff while the old answer keeps being served (it retried a dead upstream on every
