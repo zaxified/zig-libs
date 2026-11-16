@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | rustls / rustls-webpki | Rust | (see `x509`) | — | — | Neither fetches nor verifies OCSP; a stapled response is handed to the caller *(inferred)*. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No OCSP at all. |
 
-**Where we are ahead:** of Zig `std`, the only OCSP code in the Zig world we know of; allocation-free bounds-safe decoding, a check order that authorises the responder before trusting any status, EKU stricter than `hasPurpose` (no `anyExtendedKeyUsage` responder), subject/issuer link check, and it is tested on real DigiCert and GoDaddy responses. **Where we are behind:** Ed25519 and P-521 responder signatures (RSA, ECDSA P-256 and P-384 since 2026-09-30), one certificate per request/response, no responder-side signing, no signed requests.
+**Where we are ahead:** of Zig `std`, the only OCSP code in the Zig world we know of; allocation-free bounds-safe decoding, a check order that authorises the responder before trusting any status, EKU stricter than `hasPurpose` (no `anyExtendedKeyUsage` responder), subject/issuer link check, and it is tested on real DigiCert and GoDaddy responses. **Where we are behind:** P-521 responder signatures (RSA, ECDSA P-256 and P-384 since 2026-09-30, Ed25519 since 2026-11-16), one certificate per request/response, no responder-side signing, no signed requests.
 
 ## Scope
 
@@ -250,7 +250,7 @@ gate under it, and it ages every time a test is added.
 - **CRL-based revocation** — a separate mechanism (a distinct future module).
 - **Full path building for a delegated responder** beyond the single
   issuer→responder link RFC 6960 §4.2.2.2 mandates.
-- **Ed25519 / P-521** responder signatures — no CA we know of uses them for OCSP.
+- **P-521** responder signatures — no CA we know of uses them for OCSP. (Ed25519: done 2026-11-16.)
 - **Request signing** (`optionalSignature`) — not needed for stapling fetches.
 
 ## Status
@@ -275,7 +275,7 @@ test-ocsp` — green in Debug and ReleaseFast.
 ## Backlog / deferred
 
 - ~~**ECDSA P-384 / SHA-384 (and P-256 with SHA-384) responder signatures**~~ (survey 2026-09-30) — **DONE 2026-09-30**. Anchored on three responses OpenSSL 3 made and verified itself ("Response verify OK"): a P-384 CA answering directly with ecdsa-with-SHA384 (byKey) and with ecdsa-with-SHA256 (byName), and a delegated P-384 responder (its certificate signed ecdsa-with-SHA384) answering `revoked`/keyCompromise (`src/p384_test.zig`, recipe in its header; fixtures in `src/testdata/p384/`). A signed-byte or signature-byte change is `SignatureInvalid`; `p256.sign.derToRawN` (moved from ocsp's `derToRawStrict`, 2026-11-08) has its own rows for the DER shapes std's `fromDer` lets through.
-- **Ed25519 responder signatures** (survey 2026-09-30). Go and OpenSSL support them; rare in the wild. Effort: small (std has Ed25519). Fits §2.
+- ✅ DONE 2026-11-16 (id-Ed25519 1.3.101.112 signatureAlgorithm + Ed25519 SPKI via `std.crypto.sign.Ed25519`; key/algorithm mismatch either way is `UnsupportedSignatureAlgorithm`; in-test vectors only, no external one) **Ed25519 responder signatures** (survey 2026-09-30). Go and OpenSSL support them; rare in the wild. Effort: small (std has Ed25519). Fits §2.
 - **Several `Request`s / `SingleResponse`s matched per call** (survey 2026-09-30). Go's `ParseResponse` and OpenSSL handle multi-cert exchanges; here the first matching single response wins. Effort: small. Fits §2.
 - **Responder side: `CreateResponse`-style signing** (survey 2026-09-30). Go can sign a response; a user running a private CA's OCSP responder cannot use this module. Effort: medium. Fits §2, no consumer yet.
 

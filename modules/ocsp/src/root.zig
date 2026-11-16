@@ -55,7 +55,7 @@
 //! id-kp-OCSPSigning DECISION is local and stricter than `extensions.hasPurpose`
 //! (which also honours `anyExtendedKeyUsage`); see `hasOcspSigningEku`. No
 //! second ASN.1 reader is written here. Responder-signature
-//! verification reuses `rsa.verifyPkcs1v15` and `p256.sign.ecdsaVerify`. Only the
+//! verification reuses `rsa.verifyPkcs1v15` and `p256.sign.ecdsaVerify`; Ed25519 uses std. Only the
 //! narrow cert-structure walk (locating subject DN / SPKI / serial / validity /
 //! tbs / signature) is local, because x509's equivalent (`chain.parseShape`) is
 //! private; it is built on the same bounded `parseElement`.
@@ -69,12 +69,12 @@
 //! - Full path building for the delegated responder beyond the single
 //!   issuer→responder link RFC 6960 §4.2.2.2 requires (the responder MUST be
 //!   directly issued by the CA that issued the certificate in question).
-//! - ECDSA on curves other than P-256/P-384, and Ed25519 responder signatures.
+//! - ECDSA on curves other than P-256/P-384.
 //!
 //! Provenance: clean-room from RFC 6960 (a public IETF specification). Built on
 //! this repo's `x509` (DER reader + EKU), `rsa` (RFC 8017 PKCS#1) and `p256`
 //! (ECDSA-P256) modules, and `std.crypto.sign.ecdsa` for P-384 and the
-//! non-SHA-256 P-256 pairings. See SPEC.md / README.md.
+//! non-SHA-256 P-256 pairings, `std.crypto.sign.Ed25519` for Ed25519. See SPEC.md / README.md.
 
 const std = @import("std");
 const x509 = @import("x509");
@@ -129,6 +129,7 @@ const oid_sha1_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05
 const oid_sha256_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b };
 const oid_sha384_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c };
 const oid_sha512_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d };
+const oid_ed25519 = [_]u8{ 0x2b, 0x65, 0x70 }; // 1.3.101.112 (id-Ed25519: key and signature algorithm)
 const oid_ecdsa_sha256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 }; // 1.2.840.10045.4.3.2
 const oid_ecdsa_sha384 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03 }; // 1.2.840.10045.4.3.3
 const oid_ecdsa_sha512 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04 }; // 1.2.840.10045.4.3.4
@@ -287,7 +288,7 @@ fn digest(algo: HashAlgo, data: []const u8, out: *[64]u8) []const u8 {
 /// The key type of a certificate's SPKI. EC keys are split by named curve
 /// (RFC 5480): the curve, not the signature OID, decides the verifier, and a
 /// signature OID never says which curve signed.
-const PubKeyAlgo = enum { rsa, ec_p256, ec_p384, other };
+const PubKeyAlgo = enum { rsa, ec_p256, ec_p384, ed25519, other };
 
 /// The certificate fields OCSP needs, as views over the input DER. Produced by
 /// `parseCert` with the bounds-safe reader — never `std.crypto.Certificate.parse`.
@@ -310,6 +311,7 @@ const CertView = struct {
 /// curve other than P-256/P-384, is `.other` — refused later as unsupported.
 fn classifyPubKey(oid: []const u8, params: ?[]const u8) PubKeyAlgo {
     if (std.mem.eql(u8, oid, &oid_rsa_encryption)) return .rsa;
+    if (std.mem.eql(u8, oid, &oid_ed25519)) return .ed25519; // RFC 8410: parameters MUST be absent
     if (std.mem.eql(u8, oid, &oid_ec_public_key)) {
         const curve = params orelse return .other;
         if (std.mem.eql(u8, curve, &oid_prime256v1)) return .ec_p256;
@@ -1167,7 +1169,7 @@ fn parseRevoked(bytes: []const u8, revoked: Element) VerifyError!CertStatus {
 
 // ── responder signature verification ────────────────────────────────────────
 
-const SigScheme = enum { rsa_sha1, rsa_sha256, rsa_sha384, rsa_sha512, ecdsa_sha256, ecdsa_sha384, ecdsa_sha512 };
+const SigScheme = enum { rsa_sha1, rsa_sha256, rsa_sha384, rsa_sha512, ecdsa_sha256, ecdsa_sha384, ecdsa_sha512, ed25519 };
 
 fn sigSchemeFromOid(oid: []const u8) ?SigScheme {
     if (std.mem.eql(u8, oid, &oid_sha256_rsa)) return .rsa_sha256;
@@ -1177,6 +1179,7 @@ fn sigSchemeFromOid(oid: []const u8) ?SigScheme {
     if (std.mem.eql(u8, oid, &oid_ecdsa_sha256)) return .ecdsa_sha256;
     if (std.mem.eql(u8, oid, &oid_ecdsa_sha384)) return .ecdsa_sha384;
     if (std.mem.eql(u8, oid, &oid_ecdsa_sha512)) return .ecdsa_sha512;
+    if (std.mem.eql(u8, oid, &oid_ed25519)) return .ed25519;
     return null;
 }
 
@@ -1192,6 +1195,17 @@ fn verifySignature(
 ) VerifyError!void {
     const scheme = sigSchemeFromOid(sig_alg_oid) orelse return error.UnsupportedSignatureAlgorithm;
     switch (scheme) {
+        .ed25519 => {
+            // The key and the algorithm must agree (RFC 8410): an Ed25519
+            // signature OID under any other key type, or any other signature
+            // OID under an Ed25519 key, is refused (the latter below).
+            if (algo != .ed25519) return error.UnsupportedSignatureAlgorithm;
+            const Ed = std.crypto.sign.Ed25519;
+            if (key_bits.len != Ed.PublicKey.encoded_length or signature.len != Ed.Signature.encoded_length)
+                return error.SignatureInvalid;
+            const pk = Ed.PublicKey.fromBytes(key_bits[0..Ed.PublicKey.encoded_length].*) catch return error.InvalidResponderKey;
+            Ed.Signature.fromBytes(signature[0..Ed.Signature.encoded_length].*).verify(msg, pk) catch return error.SignatureInvalid;
+        },
         .rsa_sha1, .rsa_sha256, .rsa_sha384, .rsa_sha512 => {
             if (algo != .rsa) return error.UnsupportedSignatureAlgorithm;
             const pk = rsa.PublicKey.fromDer(spki) catch return error.InvalidResponderKey;
@@ -1224,7 +1238,7 @@ fn verifySignature(
                 .ecdsa_sha512 => try stdEcdsaVerify(std.crypto.ecc.P384, Sha512, key_bits, msg, signature),
                 else => unreachable,
             },
-            .rsa, .other => return error.UnsupportedSignatureAlgorithm,
+            .rsa, .ed25519, .other => return error.UnsupportedSignatureAlgorithm,
         },
     }
 }
