@@ -53,7 +53,8 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup and exact
   (`unparsed()` returns the rest); `encodeAddresses` builds the field and refuses port 0,
   non-ascending types, a second DNS name, and non-ASCII hostnames.
 - **BOLT#9 feature bits** — `lnwire.features`: `isSet`, `supports` (either bit of a pair), `set`,
-  `byteLenFor`, `firstUnknownEvenBit`, `minimal`.
+  `byteLenFor`, `firstUnknownEvenBit`, `minimal`; named table (partial): `Feature`, `table`, `row`,
+  `setFeature`, `hasFeature`, `checkDependencies` (set feature whose dependency is missing).
 
 Deliberately deferred (SPEC.md has the full rationale): BOLT#11 invoices / BOLT#12 offers
 (bech32-based — the sibling `lninvoice` module), signature verification (caller's secp256k1 — see

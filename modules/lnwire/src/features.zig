@@ -8,8 +8,10 @@
 //! even = compulsory, odd = optional — and BOLT#1's "it's ok to be odd"
 //! rule means only an unknown EVEN bit makes a peer incompatible.
 //!
-//! No feature-name table: BOLT#9's assignments change faster than this
-//! codec, so callers pass the bit numbers they understand. Every function
+//! The raw functions take bit numbers; `Feature`/`table` below add a NAMED
+//! subset of BOLT#9's assignments (only rows the author is sure of; see
+//! `table`'s doc), with `setFeature`/`hasFeature`/`checkDependencies`.
+//! Unlisted bits stay usable through the numeric functions. Every function
 //! is a pure read over (or write into) a caller-owned slice; out-of-range
 //! bits read as unset.
 
@@ -69,6 +71,113 @@ pub fn minimal(features: []const u8) []const u8 {
     return features[i..];
 }
 
+/// Where a feature may appear (BOLT#9 "Context" column: I, N, C, 9, B).
+pub const Contexts = packed struct {
+    init: bool = false, // I: `init` message
+    node_announcement: bool = false, // N
+    channel_announcement: bool = false, // C
+    invoice: bool = false, // 9: BOLT#11 invoice
+    blinded_path: bool = false, // B
+};
+
+/// Named BOLT#9 features. The value is the EVEN (compulsory) bit; the odd
+/// (optional) bit is `bit + 1`. Names follow BOLT#9 without the `option_` prefix.
+pub const Feature = enum(u16) {
+    data_loss_protect = 0,
+    upfront_shutdown_script = 4,
+    gossip_queries = 6,
+    var_onion_optin = 8,
+    gossip_queries_ex = 10,
+    static_remotekey = 12,
+    payment_secret = 14,
+    basic_mpp = 16,
+    support_large_channel = 18,
+    anchor_outputs = 20,
+    anchors_zero_fee_htlc_tx = 22,
+    route_blinding = 24,
+    shutdown_anysegwit = 26,
+    quiesce = 34,
+    channel_type = 44,
+    scid_alias = 46,
+    payment_metadata = 48,
+    zeroconf = 50,
+
+    /// The compulsory (even) bit.
+    pub fn evenBit(self: Feature) usize {
+        return @backingInt(self);
+    }
+    /// The optional (odd) bit.
+    pub fn oddBit(self: Feature) usize {
+        return @as(usize, @backingInt(self)) + 1;
+    }
+};
+
+/// One row of BOLT#9's table.
+pub const Row = struct {
+    feature: Feature,
+    contexts: Contexts,
+    /// Features that must also be supported (either bit) when this one is set.
+    deps: []const Feature = &.{},
+};
+
+const ctx_in: Contexts = .{ .init = true, .node_announcement = true };
+const ctx_in9: Contexts = .{ .init = true, .node_announcement = true, .invoice = true };
+
+/// BOLT#9 rows entered here. NOT the full table: `initial_routing_sync` (odd
+/// only), `option_dual_fund`, attribution data, onion messages, provide
+/// storage, trampoline, simple close, splice and the experimental/staging
+/// bits are omitted until their numbers/dependencies are checked against the
+/// spec text. The `C`/`B` contexts are not filled in either (only `I`, `N`,
+/// `9` are), so treat `contexts` as a lower bound.
+pub const table = [_]Row{
+    .{ .feature = .data_loss_protect, .contexts = ctx_in },
+    .{ .feature = .upfront_shutdown_script, .contexts = ctx_in },
+    .{ .feature = .gossip_queries, .contexts = ctx_in },
+    .{ .feature = .var_onion_optin, .contexts = ctx_in9 },
+    .{ .feature = .gossip_queries_ex, .contexts = ctx_in, .deps = &.{.gossip_queries} },
+    .{ .feature = .static_remotekey, .contexts = ctx_in },
+    .{ .feature = .payment_secret, .contexts = ctx_in9, .deps = &.{.var_onion_optin} },
+    .{ .feature = .basic_mpp, .contexts = ctx_in9, .deps = &.{.payment_secret} },
+    .{ .feature = .support_large_channel, .contexts = ctx_in },
+    .{ .feature = .anchor_outputs, .contexts = ctx_in, .deps = &.{.static_remotekey} },
+    .{ .feature = .anchors_zero_fee_htlc_tx, .contexts = ctx_in, .deps = &.{.static_remotekey} },
+    .{ .feature = .route_blinding, .contexts = ctx_in9, .deps = &.{.var_onion_optin} },
+    .{ .feature = .shutdown_anysegwit, .contexts = ctx_in },
+    .{ .feature = .quiesce, .contexts = ctx_in },
+    .{ .feature = .channel_type, .contexts = ctx_in },
+    .{ .feature = .scid_alias, .contexts = ctx_in },
+    .{ .feature = .payment_metadata, .contexts = .{ .invoice = true } },
+    .{ .feature = .zeroconf, .contexts = ctx_in, .deps = &.{.scid_alias} },
+};
+
+/// The table row for `f` (every `Feature` has one).
+pub fn row(f: Feature) Row {
+    for (table) |r| if (r.feature == f) return r;
+    unreachable; // comptime-checked by the "every Feature has a row" test
+}
+
+/// Sets `f` in `buf`: the odd (optional) bit, or the even (compulsory) bit
+/// when `compulsory`. Same short-buffer refusal as `set`.
+pub fn setFeature(buf: []u8, f: Feature, compulsory: bool) error{BufferTooSmall}!void {
+    try set(buf, if (compulsory) f.evenBit() else f.oddBit());
+}
+
+/// Whether `f` is supported: either bit of its pair is set.
+pub fn hasFeature(features: []const u8, f: Feature) bool {
+    return supports(features, f.evenBit());
+}
+
+/// The first (table order) named feature that is set (either bit) while a
+/// dependency of it is not, as `{feature, missing dependency}`; null if
+/// consistent. Only table rows are checked; unnamed bits are ignored.
+pub fn checkDependencies(features: []const u8) ?struct { feature: Feature, missing: Feature } {
+    for (table) |r| {
+        if (!hasFeature(features, r.feature)) continue;
+        for (r.deps) |d| if (!hasFeature(features, d)) return .{ .feature = r.feature, .missing = d };
+    }
+    return null;
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -116,4 +225,57 @@ test "SELF-DERIVED (BOLT#9 text): bit numbering runs from the LAST octet" {
     try testing.expectEqual(@as(?usize, 8), firstUnknownEvenBit(&.{ 0x01, 0x02 }, &.{}));
     try testing.expectEqualSlices(u8, &.{ 0x01, 0x00 }, minimal(&.{ 0x00, 0x00, 0x01, 0x00 }));
     try testing.expectEqual(@as(usize, 0), minimal(&.{ 0, 0 }).len);
+}
+
+test "named feature table: bits, set/has by name, both bits" {
+    try testing.expectEqual(@as(usize, 14), Feature.payment_secret.evenBit());
+    try testing.expectEqual(@as(usize, 15), Feature.payment_secret.oddBit());
+    var buf: [2]u8 = @splat(0);
+    try setFeature(&buf, .var_onion_optin, false);
+    try testing.expect(isSet(&buf, 9) and !isSet(&buf, 8));
+    try testing.expect(hasFeature(&buf, .var_onion_optin));
+    try setFeature(&buf, .data_loss_protect, true);
+    try testing.expect(isSet(&buf, 0) and hasFeature(&buf, .data_loss_protect));
+    try testing.expect(!hasFeature(&buf, .gossip_queries));
+    // quiesce is bit 34: a 2-octet buffer refuses it.
+    try testing.expectError(error.BufferTooSmall, setFeature(&buf, .quiesce, false));
+    var big: [7]u8 = @splat(0); // holds bit 50/51
+    try setFeature(&big, .zeroconf, true);
+    try testing.expect(isSet(&big, 50) and hasFeature(&big, .zeroconf));
+}
+
+test "named feature table: every Feature has exactly one row, deps are in-table" {
+    for (std.enums.values(Feature)) |f| {
+        var n: usize = 0;
+        for (table) |r| {
+            if (r.feature == f) n += 1;
+        }
+        try testing.expectEqual(@as(usize, 1), n);
+    }
+    for (table) |r| {
+        try testing.expectEqual(@as(usize, 0), r.feature.evenBit() % 2);
+        for (r.deps) |d| try testing.expect(d != r.feature);
+    }
+    try testing.expect(row(.basic_mpp).deps[0] == .payment_secret);
+    try testing.expect(row(.payment_metadata).contexts.invoice and !row(.payment_metadata).contexts.init);
+}
+
+test "checkDependencies: set but dependency missing" {
+    var buf: [7]u8 = @splat(0);
+    try testing.expectEqual(null, checkDependencies(&buf));
+    try setFeature(&buf, .basic_mpp, false);
+    var r = checkDependencies(&buf).?;
+    try testing.expect(r.feature == .basic_mpp and r.missing == .payment_secret);
+    try setFeature(&buf, .payment_secret, true);
+    r = checkDependencies(&buf).?;
+    try testing.expect(r.feature == .payment_secret and r.missing == .var_onion_optin);
+    try setFeature(&buf, .var_onion_optin, false);
+    try testing.expectEqual(null, checkDependencies(&buf));
+    // Either bit of the dependency's pair satisfies it; zeroconf needs scid_alias.
+    try setFeature(&buf, .zeroconf, false);
+    try testing.expect(checkDependencies(&buf).?.missing == .scid_alias);
+    try setFeature(&buf, .scid_alias, true);
+    try testing.expectEqual(null, checkDependencies(&buf));
+    // Empty vector is consistent.
+    try testing.expectEqual(null, checkDependencies(&.{}));
 }

@@ -58,7 +58,7 @@ allocation any decode performs is a message's `Extension.records` array — see 
   signature(s) sign, computed exactly as BOLT#7 specifies ("beginning at offset 256/64, up to the
   end of the message" — the offset is precisely the byte-size of the signature field(s) each
   message leads with).
-- `features.zig` — BOLT#9 feature-bit-vector reads/writes (no name table).
+- `features.zig` — BOLT#9 feature-bit-vector reads/writes plus a named (partial) feature table with dependency check.
 - `root.zig` — `meta` + a flat re-export of every public type/function, plus the dark-tests
   aggregator.
 
@@ -304,7 +304,8 @@ Run: `zig build test-lnwire` (Debug and `-Doptimize=ReleaseFast`).
 ## Backlog / deferred
 
 - **Dual-funding / interactive-tx / splicing / `stfu` / `closing_complete`+`closing_sig` message set** *(survey 2026-09-30)* — what current LND/CLN/LDK peers negotiate. Effort: medium (mechanical, spec vectors exist); fits §2.
-- **Named BOLT#9 feature table and typed TLV records for the other messages** *(2026-10-06)* — `features.zig` takes bit numbers, and `channel_type`/`fee_range`/`attribution_data` etc. are still raw `(type, value)` pairs (only `channel_reestablish`'s two records are typed). Effort: small; fits §2.
+- **Named BOLT#9 feature table** *(2026-10-06)* — ✅ DONE 2026-11-16 (`features.Feature`/`table`/`row`/`setFeature`/`hasFeature`/`checkDependencies`: 18 rows with even bit, I/N/9 contexts, dependencies; rows not yet verified against the spec text — dual_fund, attribution data, onion messages, provide storage, trampoline, simple close, splice, initial_routing_sync, the C/B contexts — are omitted, a follow-up).
+- **Typed TLV records for the other messages** *(2026-10-06)* — `channel_type`/`fee_range`/`attribution_data` etc. are still raw `(type, value)` pairs (only `channel_reestablish`'s two records are typed). Effort: small; fits §2.
 - **zlib-compressed `short_channel_id` lists** *(survey 2026-09-30)* — decode-only support would let extended queries interoperate with peers that compress (4 of the 10 spec rows). Effort: needs an inflate (no zlib/deflate module in this collection; `std.compress.flate` in Zig 0.16 has a zlib-container `Decompress`); fits §2 if std is used.
 
 ## Anchoring
