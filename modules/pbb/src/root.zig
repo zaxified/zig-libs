@@ -293,6 +293,63 @@ pub fn encodeAlloc(allocator: Allocator, fields: Fields, customer_data: []const 
     return encode(fields, customer_data, buf) catch unreachable;
 }
 
+// ── customer tag peek (read-only) ──────────────────────────────────────────────
+
+/// TPID of an 802.1Q C-tag.
+pub const ctag_tpid: u16 = 0x8100;
+
+/// One 802.1Q / 802.1ad tag found at the front of `customer_data`.
+pub const CustomerTag = struct {
+    /// The TPID as seen on the wire: `ctag_tpid` (0x8100, C-tag) or `b_tpid`
+    /// (0x88A8, S-tag).
+    tpid: u16,
+    pcp: u3,
+    dei: bool,
+    /// VLAN id. 0 means a priority-tagged frame (no VLAN).
+    vid: u12,
+
+    pub fn isSTag(t: CustomerTag) bool {
+        return t.tpid == b_tpid;
+    }
+};
+
+/// The outer tag and, if a second tag follows it, the inner one.
+pub const CustomerTags = struct {
+    outer: CustomerTag,
+    inner: ?CustomerTag,
+};
+
+/// Read-only peek at the VLAN tags of the customer frame carried in
+/// `customer_data` (the bytes after the customer DA/SA, as returned by
+/// `decode`). Reports the outer tag (TPID 0x8100 or 0x88A8, then PCP/DEI/VID)
+/// and, if another such tag directly follows, the inner one (QinQ). Looks at
+/// most two tags deep.
+///
+/// Returns null when the customer frame is untagged (first EtherType is not a
+/// VLAN TPID) or when a tag is cut short (a TPID with fewer than 4 octets, at
+/// either level): a truncated tag is refused rather than half-reported.
+/// Never modifies, copies or allocates; no input can make it panic.
+pub fn peekCustomerTags(customer_data: []const u8) ?CustomerTags {
+    const outer = readTag(customer_data) orelse return null;
+    const rest = customer_data[4..];
+    if (rest.len >= 2) {
+        const tp = std.mem.readInt(u16, rest[0..2], .big);
+        if (tp == ctag_tpid or tp == b_tpid) {
+            const inner = readTag(rest) orelse return null;
+            return .{ .outer = outer, .inner = inner };
+        }
+    }
+    return .{ .outer = outer, .inner = null };
+}
+
+fn readTag(data: []const u8) ?CustomerTag {
+    if (data.len < 4) return null;
+    const tpid = std.mem.readInt(u16, data[0..2], .big);
+    if (tpid != ctag_tpid and tpid != b_tpid) return null;
+    const t = decodeBTci(std.mem.readInt(u16, data[2..4], .big));
+    return .{ .tpid = tpid, .pcp = t.pcp, .dei = t.dei, .vid = t.vid };
+}
+
 // ── decode (receive side) ───────────────────────────────────────────────────────
 
 /// A decoded PBB frame. `customer_data` is a **subslice of the input** (not owned,
@@ -1181,4 +1238,46 @@ test "corpus: every seed reaches the decoder, and the counts are pinned" {
     try testing.expectEqual(decode_seeds.len - 1, nonempty); // the empty frame is deliberate
     try testing.expectEqual(@as(usize, 3), decoded);
     try testing.expectEqual(@as(usize, 2), b_tagged);
+}
+
+test "peekCustomerTags: untagged, single C-tag, QinQ, truncated, priority-tagged" {
+    // untagged: IPv4 EtherType first
+    try testing.expect(peekCustomerTags(&.{ 0x08, 0x00, 0x45, 0x00 }) == null);
+    try testing.expect(peekCustomerTags(&.{}) == null);
+    // single C-tag PCP=5 DEI=1 VID=0x123, then IPv4
+    const single = [_]u8{ 0x81, 0x00, 0xB1, 0x23, 0x08, 0x00, 0x45 };
+    const r1 = peekCustomerTags(&single).?;
+    try testing.expectEqual(@as(u16, 0x8100), r1.outer.tpid);
+    try testing.expectEqual(@as(u3, 5), r1.outer.pcp);
+    try testing.expect(r1.outer.dei);
+    try testing.expectEqual(@as(u12, 0x123), r1.outer.vid);
+    try testing.expect(!r1.outer.isSTag());
+    try testing.expect(r1.inner == null);
+    // QinQ: S-tag VID 200 (PCP2 DEI1), C-tag VID 10
+    const qinq = [_]u8{ 0x88, 0xa8, 0x50, 0xc8, 0x81, 0x00, 0x00, 0x0a, 0x08, 0x00 };
+    const r2 = peekCustomerTags(&qinq).?;
+    try testing.expect(r2.outer.isSTag());
+    try testing.expectEqual(@as(u3, 2), r2.outer.pcp);
+    try testing.expectEqual(@as(u12, 200), r2.outer.vid);
+    try testing.expectEqual(@as(u12, 10), r2.inner.?.vid);
+    try testing.expectEqual(@as(u16, 0x8100), r2.inner.?.tpid);
+    // truncated: every cut of a tag is null, at either level
+    for (0..4) |n| try testing.expect(peekCustomerTags(single[0..n]) == null);
+    try testing.expect(peekCustomerTags(qinq[0..5]) != null); // 1 byte after outer: not a TPID
+    try testing.expect(peekCustomerTags(qinq[0..6]) == null); // inner TPID, no TCI
+    try testing.expect(peekCustomerTags(qinq[0..7]) == null);
+    try testing.expect(peekCustomerTags(qinq[0..8]).?.inner != null);
+    // priority-tagged: VID 0, PCP 7
+    const prio = [_]u8{ 0x81, 0x00, 0xE0, 0x00, 0x08, 0x00 };
+    const r3 = peekCustomerTags(&prio).?;
+    try testing.expectEqual(@as(u12, 0), r3.outer.vid);
+    try testing.expectEqual(@as(u3, 7), r3.outer.pcp);
+    // the Wireshark-anchored golden's customer_data carries C-VLAN 10
+    const dec = try decode(&golden_wireshark_customer_vlan);
+    try testing.expectEqual(@as(u12, 10), peekCustomerTags(dec.customer_data).?.outer.vid);
+}
+
+test "peekCustomerTags: never panics on every short/tag-like prefix" {
+    var buf: [8]u8 = .{ 0x88, 0xa8, 0xff, 0xff, 0x81, 0x00, 0xff, 0xff };
+    for (0..buf.len + 1) |n| _ = peekCustomerTags(buf[0..n]);
 }
