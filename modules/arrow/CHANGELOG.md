@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — Wave A5 and A6 part 1: ZSTD body compression read and write (`WriteOptions.compression = .zstd`,
+  `compression_level`; a buffer that does not shrink is stored raw; `ReadOptions.max_body_bytes` caps what a
+  compressed body may expand to; LZ4_FRAME stays `error.Unsupported`); `ReadOptions.lossy` reads a value
+  `dataframe` cannot hold (Decimal128 out of range, a time of 24:00:00, a date outside 0000-9999, an overflowing
+  s/ms timestamp) as null and an unknown time zone as a naive column — the default is still `error.Unsupported`;
+  the apache/arrow-testing integration golden files (Apache-2.0 data, `NOTICE`) committed and compared field by
+  field with their JSON; a deterministic fuzz driver for the readers (`ARROW_FUZZ`); `example/main.zig`. Depends
+  on `zstd` too.
 - **2026-11-16** — Wave A4: the Arrow IPC file format — `arrow.writeFile`, `arrow.readFile`, and `arrow.openFile`
   with `File.readBatch(i)` for random access to one record batch (footer with dictionary and record batch blocks);
   a Time32/Time64 value outside the day now reads as `error.Unsupported` (a value `dataframe` cannot hold) rather

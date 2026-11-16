@@ -16,14 +16,14 @@ const Allocator = std.mem.Allocator;
 const Column = df.Column;
 const ColumnData = df.ColumnData;
 
-fn validBits(a: Allocator, n: usize, nulls: []const usize) ![]u64 {
+pub fn validBits(a: Allocator, n: usize, nulls: []const usize) ![]u64 {
     const w = try a.alloc(u64, (n + 63) / 64);
     @memset(w, ~@as(u64, 0));
     for (nulls) |i| w[i / 64] &= ~(@as(u64, 1) << @as(u6, @truncate(i)));
     return w;
 }
 
-fn textCol(a: Allocator, cells: []const ?[]const u8) !df.TextColumn {
+pub fn textCol(a: Allocator, cells: []const ?[]const u8) !df.TextColumn {
     const offs = try a.alloc(usize, cells.len + 1);
     var bytes: std.ArrayList(u8) = .empty;
     var nulls: std.ArrayList(usize) = .empty;
@@ -35,7 +35,7 @@ fn textCol(a: Allocator, cells: []const ?[]const u8) !df.TextColumn {
     return .{ .offsets = offs, .bytes = bytes.items, .valid = if (nulls.items.len > 0) try validBits(a, cells.len, nulls.items) else null };
 }
 
-fn expectSameType(want: Column, got: Column) !void {
+pub fn expectSameType(want: Column, got: Column) !void {
     try testing.expectEqual(want.type, got.type);
     try testing.expectEqual(want.array_width, got.array_width);
     if (want.time_zone) |z| try testing.expectEqualStrings(z, got.time_zone.?) else try testing.expect(got.time_zone == null);
@@ -46,7 +46,7 @@ fn expectSameType(want: Column, got: Column) !void {
 }
 
 /// Same columns (name, declared type) and the same cells, compared as values.
-fn expectSameFrame(want: df.Frame, got: df.Frame) !void {
+pub fn expectSameFrame(want: df.Frame, got: df.Frame) !void {
     try testing.expectEqual(want.len, got.len);
     try testing.expectEqual(want.columns.len, got.columns.len);
     for (want.columns, got.columns, 0..) |wc, gc, ci| {
@@ -66,7 +66,7 @@ fn expectSameFrame(want: df.Frame, got: df.Frame) !void {
 const scale: i128 = df.decimal_scale;
 
 /// Five rows of every column type the mapping covers, with nulls.
-fn sampleFrame(a: Allocator) !df.Frame {
+pub fn sampleFrame(a: Allocator) !df.Frame {
     const n = 5;
     const ints: ColumnData = .{ .int = .{ .values = &.{ 1, -2, 0, 4, std.math.maxInt(i64) }, .valid = try validBits(a, n, &.{2}) } };
     const items = try a.create(ColumnData);
@@ -275,6 +275,8 @@ const HandBatch = struct {
     bufs: []const []const u8,
     dict_id: ?i64 = null,
     delta: bool = false,
+    /// Marks the body compressed (the buffers are given already prefixed and compressed).
+    codec: ?ipc.Codec = null,
 };
 
 fn hand(gpa: Allocator, fields: []const schema.Field, batches: []const HandBatch) ![]u8 {
@@ -289,7 +291,7 @@ fn hand(gpa: Allocator, fields: []const schema.Field, batches: []const HandBatch
         for (hb.bufs) |x| if (x.len == 0) try body.addEmpty(gpa) else try body.add(gpa, x);
         var mb = fb.Builder.init(gpa);
         defer mb.deinit();
-        const rb: ipc.RecordBatch = .{ .length = hb.length, .nodes = hb.nodes, .buffers = body.locs.items };
+        const rb: ipc.RecordBatch = .{ .length = hb.length, .nodes = hb.nodes, .buffers = body.locs.items, .compression = hb.codec };
         const blen: i64 = @intCast(body.bytes.items.len);
         const meta = if (hb.dict_id) |id|
             try ipc.encodeDictionaryBatchMessage(&mb, .{ .id = id, .data = rb, .is_delta = hb.delta }, blen)
@@ -602,4 +604,219 @@ test "file: bad marks, footer and blocks are errors; every truncation and byte f
             for (0..file.batchCount()) |b| _ = file.readBatch(b) catch {};
         }
     }
+}
+
+// ── body compression (wave A5) ──────────────────────────────────────────────
+
+const zstd = @import("zstd");
+
+/// Counts the compressed buffers of every batch of `bytes` by their prefix: stored raw
+/// (-1) or compressed (a length); fails on a batch that is not marked zstd.
+fn countPrefixes(a: Allocator, bytes: []const u8) !struct { raw: usize, packed_: usize } {
+    var pos: usize = 0;
+    var raw: usize = 0;
+    var packed_: usize = 0;
+    _ = try ipc.readMessage(bytes, &pos); // the schema
+    while (true) {
+        const m = ipc.readMessage(bytes, &pos) catch |e| switch (e) {
+            error.EndOfStream => break,
+            else => return e,
+        };
+        const rb = if (m.msg.header_type == .dictionary_batch)
+            (try ipc.decodeDictionaryBatch(a, m.msg.header.?, m.enc.body.len)).data
+        else
+            try ipc.decodeRecordBatch(a, m.msg.header.?, m.enc.body.len);
+        try testing.expectEqual(ipc.Codec.zstd, rb.compression.?);
+        for (rb.buffers) |l| {
+            if (l.length == 0) continue;
+            const b = m.enc.body[@intCast(l.offset)..][0..@intCast(l.length)];
+            if (std.mem.readInt(i64, b[0..8], .little) == -1) raw += 1 else packed_ += 1;
+        }
+    }
+    return .{ .raw = raw, .packed_ = packed_ };
+}
+
+test "compression: zstd round trip of every column type, stream and file, one batch and many" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const f = try sampleFrame(a);
+    for ([_]usize{ 0, 1, 2, 100 }) |per| {
+        const opts: stream.WriteOptions = .{ .rows_per_batch = per, .compression = .zstd };
+        const s = try stream.writeStream(gpa, f, opts);
+        defer gpa.free(s);
+        try expectSameFrame(f, try stream.readStream(a, s, .{}));
+        const fl = try stream.writeFile(gpa, f, opts);
+        defer gpa.free(fl);
+        try expectSameFrame(f, try stream.readFile(a, fl, .{}));
+        var file = try stream.openFile(a, fl, .{});
+        try expectRows(f, 0, try file.readBatch(0));
+    }
+    // Five-row buffers do not shrink: stored raw behind -1.
+    const small = try stream.writeStream(gpa, f, .{ .compression = .zstd });
+    defer gpa.free(small);
+    const sc = try countPrefixes(a, small);
+    try testing.expect(sc.raw > 0);
+
+    // A long repetitive column does shrink, at any level.
+    const n = 4096;
+    const vals = try a.alloc(i64, n);
+    for (vals, 0..) |*v, i| v.* = @intCast(i % 7);
+    const big: df.Frame = .{ .columns = &.{.{ .name = "x", .type = .int }}, .data = &.{.{ .int = .{ .values = vals } }}, .len = n };
+    const plain = try stream.writeStream(gpa, big, .{});
+    defer gpa.free(plain);
+    for ([_]i32{ -5, 0, 1, 19 }) |level| {
+        const z = try stream.writeStream(gpa, big, .{ .compression = .zstd, .compression_level = level });
+        defer gpa.free(z);
+        try testing.expect(z.len * 4 < plain.len);
+        try testing.expect((try countPrefixes(a, z)).packed_ == 1);
+        try expectSameFrame(big, try stream.readStream(a, z, .{}));
+    }
+    // A level zstd refuses.
+    try testing.expectError(error.Unsupported, stream.writeStream(gpa, big, .{ .compression = .zstd, .compression_level = 23 }));
+}
+
+test "compression: declared lengths, broken frames and LZ4 are errors" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const fields = [_]schema.Field{.{ .name = "x", .type = .{ .int = .{ .bits = 32, .signed = true } } }};
+    const vals = bytesOf(i32, &.{ 7, -8 });
+    var frame_buf: [64]u8 = undefined;
+    const fl = try zstd.compress(gpa, &frame_buf, vals, .{});
+    const frame = frame_buf[0..fl];
+    const pre = struct {
+        fn with(al: Allocator, len: i64, payload: []const u8) ![]u8 {
+            const out = try al.alloc(u8, 8 + payload.len);
+            std.mem.writeInt(i64, out[0..8], len, .little);
+            @memcpy(out[8..], payload);
+            return out;
+        }
+    }.with;
+    const node: ipc.FieldNode = .{ .length = 2, .null_count = 0 };
+    const Case = struct { want: ?anyerror, codec: ipc.Codec = .zstd, buf: []const u8 };
+    const cases = [_]Case{
+        .{ .want = null, .buf = try pre(a, 8, frame) },
+        .{ .want = null, .buf = try pre(a, -1, vals) },
+        .{ .want = error.LimitExceeded, .buf = try pre(a, 1 << 40, frame) },
+        .{ .want = error.Malformed, .buf = try pre(a, -2, frame) },
+        .{ .want = error.Malformed, .buf = "\x08\x00\x00" },
+        .{ .want = error.Malformed, .buf = try pre(a, 16, frame) }, // decodes to fewer bytes than declared
+        .{ .want = error.Malformed, .buf = try pre(a, 4, frame) }, // more
+        .{ .want = error.Malformed, .buf = try pre(a, 8, "not a zstd frame") },
+        .{ .want = error.Malformed, .buf = try pre(a, 8, "") },
+        .{ .want = error.Unsupported, .codec = .lz4_frame, .buf = try pre(a, -1, vals) },
+        .{ .want = error.Unsupported, .codec = @fromBackingInt(@intCast(7)), .buf = try pre(a, -1, vals) },
+    };
+    for (cases, 0..) |c, i| {
+        const bytes = try hand(gpa, &fields, &.{.{ .length = 2, .nodes = &.{node}, .bufs = &.{ "", c.buf }, .codec = c.codec }});
+        defer gpa.free(bytes);
+        const got = stream.readStream(a, bytes, .{});
+        if (c.want) |e| {
+            testing.expectError(e, got) catch |x| {
+                std.debug.print("case {d}\n", .{i});
+                return x;
+            };
+        } else {
+            const f = try got;
+            try testing.expectEqual(@as(i64, 7), f.columnAt(0).get(0).int);
+            try testing.expectEqual(@as(i64, -8), f.columnAt(0).get(1).int);
+        }
+    }
+    // The body cap counts the whole message.
+    const two = try hand(gpa, &fields, &.{.{ .length = 2, .nodes = &.{node}, .bufs = &.{ try pre(a, -1, "\xff"), try pre(a, 8, frame) }, .codec = .zstd }});
+    defer gpa.free(two);
+    try testing.expectError(error.LimitExceeded, stream.readStream(a, two, .{ .max_body_bytes = 8 }));
+    _ = try stream.readStream(a, two, .{ .max_body_bytes = 9 });
+}
+
+test "compression: every truncation and byte flip of a compressed stream is an error or a frame" {
+    const gpa = testing.allocator;
+    var keep = std.heap.ArenaAllocator.init(gpa);
+    defer keep.deinit();
+    const ka = keep.allocator();
+    const full = try sampleFrame(ka);
+    const pick = [_][]const u8{ "i64", "s", "cat", "l", "st" };
+    var cols: [pick.len]Column = undefined;
+    var data: [pick.len]ColumnData = undefined;
+    for (pick, 0..) |p, i| {
+        const ci = full.columnIndex(p).?;
+        cols[i] = full.columns[ci];
+        data[i] = full.data[ci];
+    }
+    // Small buffers: most are stored raw (-1); the fuzz driver damages compressed frames.
+    const f0: df.Frame = .{ .columns = &cols, .data = &data, .len = full.len };
+    const good = try stream.writeStream(gpa, f0, .{ .rows_per_batch = 3, .compression = .zstd });
+    defer gpa.free(good);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const opts: stream.ReadOptions = .{ .max_rows = 1 << 12, .max_body_bytes = 1 << 16 };
+    try expectSameFrame(f0, try stream.readStream(arena_state.allocator(), good, opts));
+    for (0..good.len) |n| {
+        _ = arena_state.reset(.retain_capacity);
+        _ = stream.readStream(arena_state.allocator(), good[0..n], opts) catch {};
+    }
+    const copy = try gpa.alloc(u8, good.len);
+    defer gpa.free(copy);
+    for (0..good.len) |i| {
+        for ([_]u8{ 0x00, 0x7f, 0xff }) |v| {
+            @memcpy(copy, good);
+            copy[i] = v;
+            _ = arena_state.reset(.retain_capacity);
+            _ = stream.readStream(arena_state.allocator(), copy, opts) catch {};
+        }
+    }
+}
+
+// ── lossy reads (ReadOptions.lossy) ─────────────────────────────────────────
+
+test "lossy: values dataframe cannot hold fail the read by default and read as null with lossy" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const node: ipc.FieldNode = .{ .length = 2, .null_count = 0 };
+    const Case = struct { field: schema.Field, values: []const u8, row1: df.Value };
+    const cases = [_]Case{
+        // 10^37 at scale 0 needs 49 digits at dataframe's 12.
+        .{ .field = .{ .name = "dec", .type = .{ .decimal = .{ .precision = 38, .scale = 0 } } }, .values = bytesOf(i128, &.{ std.math.pow(i128, 10, 37), 5 }), .row1 = .{ .decimal = 5 * df.decimal_scale } },
+        // 10^-14 has digits past the 12th.
+        .{ .field = .{ .name = "dec14", .type = .{ .decimal = .{ .precision = 20, .scale = 14 } } }, .values = bytesOf(i128, &.{ 1, 300 }), .row1 = .{ .decimal = 3 } },
+        // 24:00:00, which Arrow allows.
+        .{ .field = .{ .name = "t", .type = .{ .time = .{ .unit = .second, .bits = 32 } } }, .values = bytesOf(i32, &.{ 86_400, 1 }), .row1 = .{ .int = 1_000_000 } },
+        .{ .field = .{ .name = "tneg", .type = .{ .time = .{ .unit = .microsecond, .bits = 64 } } }, .values = bytesOf(i64, &.{ -1, 2 }), .row1 = .{ .int = 2 } },
+        // Year 12921.
+        .{ .field = .{ .name = "d", .type = .{ .date = .day } }, .values = bytesOf(i32, &.{ 4_000_000, 0 }), .row1 = .{ .text = "1970-01-01" } },
+        // Seconds whose microseconds overflow i64.
+        .{ .field = .{ .name = "ts", .type = .{ .timestamp = .{ .unit = .second } } }, .values = bytesOf(i64, &.{ std.math.maxInt(i64), 2 }), .row1 = .{ .int = 2_000_000 } },
+        .{ .field = .{ .name = "dur", .type = .{ .duration = .millisecond } }, .values = bytesOf(i64, &.{ std.math.minInt(i64), 3 }), .row1 = .{ .int = 3_000 } },
+    };
+    for (cases) |c| {
+        const bytes = try hand(gpa, &.{c.field}, &.{.{ .length = 2, .nodes = &.{node}, .bufs = &.{ "", c.values } }});
+        defer gpa.free(bytes);
+        try testing.expectError(error.Unsupported, stream.readStream(a, bytes, .{}));
+        const f = try stream.readStream(a, bytes, .{ .lossy = true });
+        try testing.expect(f.columnAt(0).get(0) == .null);
+        const got = f.columnAt(0).get(1);
+        if (!got.eql(c.row1)) {
+            std.debug.print("{s}: want {any} got {any}\n", .{ c.field.name, c.row1, got });
+            return error.TestExpectedEqual;
+        }
+    }
+    // A zone `tz` does not know: the column reads naive, every instant kept.
+    const zf = [_]schema.Field{.{ .name = "z", .type = .{ .timestamp = .{ .unit = .microsecond, .tz = "Nowhere/Atlantis" } } }};
+    const zb = try hand(gpa, &zf, &.{.{ .length = 2, .nodes = &.{node}, .bufs = &.{ "", bytesOf(i64, &.{ 5, 6 }) } }});
+    defer gpa.free(zb);
+    try testing.expectError(error.Unsupported, stream.readStream(a, zb, .{}));
+    const zr = try stream.readStream(a, zb, .{ .lossy = true });
+    try testing.expectEqual(df.ColumnType.timestamp, zr.columns[0].type);
+    try testing.expect(zr.columns[0].time_zone == null);
+    try testing.expectEqual(@as(i64, 5), zr.columnAt(0).get(0).int);
+    try testing.expectEqual(@as(i64, 6), zr.columnAt(0).get(1).int);
+    // `lossy` does not excuse a malformed stream.
+    const short = try oneInt32(gpa, .{ .length = 3, .null_count = 0 }, 3, bytesOf(i32, &.{ 1, 2 }), "");
+    defer gpa.free(short);
+    try testing.expectError(error.Malformed, stream.readStream(a, short, .{ .lossy = true }));
 }

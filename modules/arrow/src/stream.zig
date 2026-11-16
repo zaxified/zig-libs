@@ -23,6 +23,7 @@ const df = @import("dataframe");
 const fb = @import("fb.zig");
 const schema = @import("schema.zig");
 const ipc = @import("ipc.zig");
+const zstd = @import("zstd");
 
 const Allocator = std.mem.Allocator;
 const Column = df.Column;
@@ -39,7 +40,18 @@ pub const WriteOptions = struct {
     /// written as LargeUtf8 / LargeBinary (64-bit offsets). The default is where 32-bit
     /// offsets stop; 0 writes every one Large.
     large_from: u64 = 1 << 31,
+    /// Body compression (`BodyCompression`, method BUFFER): every buffer of every record and
+    /// dictionary batch compressed on its own, after an `int64` of its uncompressed length; a
+    /// buffer that does not shrink is stored raw (length -1), as Arrow C++ and arrow-rs do.
+    compression: Compression = .none,
+    /// The zstd level (`zstd.Options.level`: 1..22, negative for the fast levels, 0 = zstd's
+    /// default, 3).
+    compression_level: i32 = 0,
 };
+
+/// Body compression codecs the writer offers. LZ4_FRAME is read as `error.Unsupported`
+/// until the collection has an LZ4 codec.
+pub const Compression = enum { none, zstd };
 
 pub const ReadOptions = struct {
     /// Most rows any one array of the stream may claim (frame rows summed over the
@@ -47,6 +59,18 @@ pub const ReadOptions = struct {
     /// Bounds the memory a small hostile stream can ask for where a length is not
     /// backed by bytes (a Null column, a list of nulls, a struct without fields).
     max_rows: u64 = 1 << 27,
+    /// The most bytes one compressed message body may expand to (the uncompressed lengths
+    /// its buffers declare, summed); past it `error.LimitExceeded`. Bounds what a small
+    /// compressed stream can make the reader allocate.
+    max_body_bytes: u64 = 1 << 31,
+    /// A value `dataframe` cannot hold reads as a null cell instead of failing the whole
+    /// read with `error.Unsupported`: a Decimal128 that does not fit 12 fractional digits in
+    /// an i128, a time of day outside `[0, 24h)` (Arrow allows 24:00:00), a date outside
+    /// the years 0000-9999, a timestamp or duration in s/ms whose microseconds overflow
+    /// i64. A timestamp zone `dataframe`'s `tz` does not know reads as a naive column (the
+    /// instants are UTC either way; only the `time_zone` tag is dropped). Nothing else
+    /// changes: a malformed stream is still an error.
+    lossy: bool = false,
 };
 
 /// A selector entry meaning "a null cell" (also what `ColumnData.get` reads past the end).
@@ -89,6 +113,8 @@ const Writer = struct {
     tmp: Allocator,
     opts: WriteOptions,
     dicts: std.ArrayList(WDict) = .empty,
+    /// Set when `opts.compression` is `.zstd`; reused for every buffer.
+    zc: ?zstd.Compressor = null,
 
     fn plan(w: *Writer, name: []const u8, decl: ?Column, data: ColumnData, rows: usize, depth: usize) Error!WField {
         if (depth >= schema.max_depth) return error.Unsupported;
@@ -252,17 +278,53 @@ const Writer = struct {
         var bo: BatchOut = .{};
         defer bo.deinit(w.gpa);
         for (fields) |*f| try w.writeArray(&bo, f, sel);
+        var packed_body: ipc.BodyBuilder = .{};
+        defer packed_body.deinit(w.gpa);
+        var codec: ?ipc.Codec = null;
+        const bb: *const ipc.BodyBuilder = if (w.zc != null) blk: {
+            try w.compressBody(&bo.body, &packed_body);
+            codec = .zstd;
+            break :blk &packed_body;
+        } else &bo.body;
         var b = fb.Builder.init(w.gpa);
         defer b.deinit();
-        const rb: ipc.RecordBatch = .{ .length = @intCast(sel.len), .nodes = bo.nodes.items, .buffers = bo.body.locs.items };
-        const body_len: i64 = @intCast(bo.body.bytes.items.len);
+        const rb: ipc.RecordBatch = .{ .length = @intCast(sel.len), .nodes = bo.nodes.items, .buffers = bb.locs.items, .compression = codec };
+        const body_len: i64 = @intCast(bb.bytes.items.len);
         const meta = if (dict_id) |id|
             try ipc.encodeDictionaryBatchMessage(&b, .{ .id = @intCast(id), .data = rb, .is_delta = false }, body_len)
         else
             try ipc.encodeRecordBatchMessage(&b, rb, body_len);
-        try ipc.writeMessage(w.gpa, out, meta, bo.body.bytes.items);
-        const body = bo.body.bytes.items.len;
+        try ipc.writeMessage(w.gpa, out, meta, bb.bytes.items);
+        const body = bb.bytes.items.len;
         return .{ .offset = @intCast(at), .meta_len = @intCast(out.items.len - at - body), .body_len = @intCast(body) };
+    }
+
+    /// Every buffer of `src` zstd-compressed into `dst`, behind its uncompressed length as an
+    /// `int64`; a buffer that would not shrink is stored raw behind -1, an absent one stays
+    /// absent.
+    fn compressBody(w: *Writer, src: *const ipc.BodyBuilder, dst: *ipc.BodyBuilder) Error!void {
+        const zc = &w.zc.?;
+        for (src.locs.items) |l| {
+            const raw = src.bytes.items[@intCast(l.offset)..][0..@intCast(l.length)];
+            if (raw.len == 0) {
+                try dst.addEmpty(w.gpa);
+                continue;
+            }
+            const buf = try w.tmp.alloc(u8, 8 + @max(raw.len, zstd.compressBound(raw.len)));
+            const n = zc.compress(buf[8..], raw, .{ .level = w.opts.compression_level }) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.Unsupported, // a level zstd refuses
+            };
+            var len = 8 + n;
+            if (n < raw.len) {
+                std.mem.writeInt(i64, buf[0..8], @intCast(raw.len), .little);
+            } else {
+                std.mem.writeInt(i64, buf[0..8], -1, .little);
+                @memcpy(buf[8..][0..raw.len], raw);
+                len = 8 + raw.len;
+            }
+            try dst.add(w.gpa, buf[0..len]);
+        }
     }
 
     fn pushNode(w: *Writer, bo: *BatchOut, n: usize, bits: Bits) Error!void {
@@ -552,6 +614,8 @@ fn write(gpa: Allocator, f: df.Frame, opts: WriteOptions, file: bool) Error![]u8
     var tmp_state = std.heap.ArenaAllocator.init(gpa);
     defer tmp_state.deinit();
     var w: Writer = .{ .gpa = gpa, .arena = arena_state.allocator(), .tmp = tmp_state.allocator(), .opts = opts };
+    if (opts.compression == .zstd) w.zc = zstd.Compressor.init(gpa);
+    defer if (w.zc) |*c| c.deinit();
 
     const fields = try w.arena.alloc(WField, f.columns.len);
     for (fields, f.columns, 0..) |*wf, c, ci| wf.* = try w.plan(c.name, c, f.columnAt(ci), f.len, 0);
@@ -656,6 +720,8 @@ const Reader = struct {
     a: Allocator,
     opts: ReadOptions,
     dicts: std.ArrayList(*RDict) = .empty,
+    /// Made at the first zstd-compressed buffer (its tables come from the arena).
+    zd: ?zstd.Decompressor = null,
 
     fn plan(r: *Reader, f: schema.Field, ctr: *Counter, depth: usize, in_dict: bool) Error!RField {
         if (depth >= schema.max_depth) return error.Malformed;
@@ -737,7 +803,11 @@ const Reader = struct {
                 rf.col.type = .timestamp;
                 if (t.tz) |z| {
                     rf.col.time_zone = try r.a.dupe(u8, z);
-                    rf.col.checkZone() catch return error.Unsupported; // a zone `dataframe` does not know
+                    rf.col.checkZone() catch {
+                        // A zone `dataframe` does not know; `lossy` reads the instants as a naive column.
+                        if (!r.opts.lossy) return error.Unsupported;
+                        rf.col.time_zone = null;
+                    };
                 }
             },
             .duration => |u| {
@@ -808,7 +878,7 @@ const Reader = struct {
         const h = msg.header orelse return error.Malformed;
         const rb = ipc.decodeRecordBatch(r.a, h, body.len) catch |e| return noEos(e);
         try r.checkBatch(rb, top.ctr, top.fields);
-        return .{ .rb = rb, .body = body };
+        return r.inflate(rb, body);
     }
 
     fn takeDict(r: *Reader, msg: schema.Message, body: []const u8) Error!void {
@@ -819,7 +889,7 @@ const Reader = struct {
         } else return error.Malformed;
         if (!db.is_delta and d.chunks.items.len > 0) return error.Unsupported; // replacement
         try r.checkBatch(db.data, .{ .nodes = d.nodes, .bufs = d.bufs }, (&d.value)[0..1]);
-        try d.chunks.append(r.a, .{ .rb = db.data, .body = body });
+        try d.chunks.append(r.a, try r.inflate(db.data, body));
     }
 
     fn finishDicts(r: *Reader) Error!void {
@@ -848,11 +918,54 @@ const Reader = struct {
     /// A batch's shape against the schema: node and buffer counts, every length within
     /// `max_rows`, every top-level column as long as the batch.
     fn checkBatch(r: *const Reader, rb: ipc.RecordBatch, ctr: Counter, top: []const RField) Error!void {
-        if (rb.compression != null) return error.Unsupported; // body compression: wave A5
         if (rb.nodes.len != ctr.nodes or rb.buffers.len != ctr.bufs) return error.Malformed;
         if (@as(u64, @intCast(rb.length)) > r.opts.max_rows) return error.LimitExceeded;
         for (rb.nodes) |nd| _ = try r.rows(nd);
         for (top) |f| if (rb.nodes[f.node_ix].length != rb.length) return error.Malformed;
+    }
+
+    /// A batch whose body is compressed, with every buffer decompressed into one fresh body
+    /// (a batch without compression is returned as it is). Each non-empty buffer starts with
+    /// its uncompressed length as an `int64`: -1 means the rest is stored raw.
+    fn inflate(r: *Reader, rb: ipc.RecordBatch, body: []const u8) Error!Chunk {
+        const codec = rb.compression orelse return .{ .rb = rb, .body = body };
+        // LZ4_FRAME: the collection has no LZ4 codec yet; any other value is not Arrow's.
+        if (codec != .zstd) return error.Unsupported;
+        var total: u64 = 0;
+        for (rb.buffers) |l| {
+            const src = locBytes(body, l);
+            if (src.len == 0) continue;
+            total +|= try rawLen(src);
+            if (total > r.opts.max_body_bytes) return error.LimitExceeded;
+        }
+        const out = try r.a.alloc(u8, @intCast(total));
+        const locs = try r.a.alloc(ipc.BufferLoc, rb.buffers.len);
+        var at: usize = 0;
+        for (rb.buffers, locs) |l, *o| {
+            const src = locBytes(body, l);
+            var n: usize = 0;
+            if (src.len > 0) {
+                n = @intCast(try rawLen(src));
+                const dst = out[at..][0..n];
+                if (std.mem.readInt(i64, src[0..8], .little) == -1) {
+                    @memcpy(dst, src[8..]);
+                } else if (n > 0) {
+                    const frames = src[8..];
+                    // A frame declaring more than it can hold is refused before decoding.
+                    const bound = zstd.decompressBound(frames) catch return error.Malformed;
+                    if (n > bound) return error.Malformed;
+                    if (r.zd == null) r.zd = try zstd.Decompressor.init(r.a, .{});
+                    const got = r.zd.?.decompress(dst, frames) catch return error.Malformed;
+                    if (got != n) return error.Malformed;
+                }
+            }
+            o.* = .{ .offset = @intCast(at), .length = @intCast(n) };
+            at += n;
+        }
+        var plain = rb;
+        plain.buffers = locs;
+        plain.compression = null;
+        return .{ .rb = plain, .body = out };
     }
 
     fn rows(r: *const Reader, node: ipc.FieldNode) Error!usize {
@@ -868,7 +981,7 @@ const Reader = struct {
             if (n > r.opts.max_rows) return error.LimitExceeded;
         }
         if (rf.kind == .null_) return .nulls;
-        const valid = try r.validity(rf, chunks, n);
+        var valid = try r.validity(rf, chunks, n);
         return switch (rf.kind) {
             .null_ => .nulls,
             .i8 => typed("int8", try r.raw(i8, rf, chunks, n, valid), valid, n),
@@ -889,12 +1002,12 @@ const Reader = struct {
             },
             .dec => blk: {
                 const v = try r.raw(i128, rf, chunks, n, valid);
-                for (v) |*x| x.* = try rescale(x.*, rf.scale);
+                for (v, 0..) |*x, i| x.* = rescale(x.*, rf.scale) catch try r.drop(&valid, n, i);
                 break :blk typed("decimal", v, valid, n);
             },
             .ts, .dur => blk: {
                 const v = try r.raw(i64, rf, chunks, n, valid);
-                for (v) |*x| x.* = try toMicros(x.*, rf.unit);
+                for (v, 0..) |*x, i| x.* = toMicros(x.*, rf.unit) catch try r.drop(&valid, n, i);
                 break :blk typed("int", v, valid, n);
             },
             .time32, .time64 => blk: {
@@ -902,9 +1015,10 @@ const Reader = struct {
                 if (rf.kind == .time32) {
                     for (v, try r.raw(i32, rf, chunks, n, valid)) |*o, x| o.* = x;
                 } else @memcpy(v, try r.raw(i64, rf, chunks, n, valid));
-                for (v) |*x| {
-                    x.* = try toMicros(x.*, rf.unit);
-                    if (x.* < 0 or x.* >= us_per_day) return error.Unsupported; // 24:00:00 and beyond: no `.time` value
+                for (v, 0..) |*x, i| {
+                    x.* = toMicros(x.*, rf.unit) catch try r.drop(&valid, n, i);
+                    // 24:00:00 and beyond: no `.time` value.
+                    if (x.* < 0 or x.* >= us_per_day) x.* = try r.drop(&valid, n, i);
                 }
                 break :blk typed("int", v, valid, n);
             },
@@ -914,6 +1028,14 @@ const Reader = struct {
                     for (days, try r.raw(i32, rf, chunks, n, valid)) |*o, x| o.* = x;
                 } else {
                     for (days, try r.raw(i64, rf, chunks, n, valid)) |*o, x| o.* = @divFloor(x, 86_400_000);
+                }
+                for (days, 0..) |*d, i| {
+                    if (!isSet(valid, i)) continue;
+                    const date = df.Date.fromOrdinal(d.*) orelse {
+                        d.* = try r.drop(&valid, n, i);
+                        continue;
+                    };
+                    if (date.y < 0 or date.y > 9999) d.* = try r.drop(&valid, n, i); // no 4-digit ISO form
                 }
                 break :blk try r.dateText(days, valid, n);
             },
@@ -938,6 +1060,19 @@ const Reader = struct {
                 break :blk .{ .@"struct" = sc };
             },
         };
+    }
+
+    /// A value `dataframe` cannot hold at row `i`: `error.Unsupported`, or under
+    /// `ReadOptions.lossy` a null cell (the 0 returned is the slot's value).
+    fn drop(r: *Reader, valid: *?[]u64, n: usize, i: usize) Error!i64 {
+        if (!r.opts.lossy) return error.Unsupported;
+        if (valid.* == null) {
+            const w = try r.a.alloc(u64, (n + 63) / 64);
+            @memset(w, ~@as(u64, 0));
+            valid.* = w;
+        }
+        valid.*.?[i / 64] &= ~(@as(u64, 1) << @as(u6, @truncate(i)));
+        return 0;
     }
 
     /// The merged validity bitmap of all chunks (null: no null anywhere).
@@ -1240,6 +1375,20 @@ fn bufOf(c: Chunk, ix: usize) []const u8 {
     // `decodeRecordBatch` checked every location against the body.
     const l = c.rb.buffers[ix];
     return c.body[@intCast(l.offset)..][0..@intCast(l.length)];
+}
+
+fn locBytes(body: []const u8, l: ipc.BufferLoc) []const u8 {
+    // `decodeRecordBatch` checked every location against the body.
+    return body[@intCast(l.offset)..][0..@intCast(l.length)];
+}
+
+/// The uncompressed length a compressed buffer declares (its first 8 bytes; -1: the rest
+/// is stored raw).
+fn rawLen(src: []const u8) Error!u64 {
+    if (src.len < 8) return error.Malformed;
+    const x = std.mem.readInt(i64, src[0..8], .little);
+    if (x == -1) return src.len - 8;
+    return std.math.cast(u64, x) orelse error.Malformed;
 }
 
 fn readOff(offs: []const u8, i: usize, wide: bool) Error!usize {

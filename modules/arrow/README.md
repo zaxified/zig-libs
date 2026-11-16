@@ -2,9 +2,10 @@
 
 Apache Arrow IPC — the stream and file (Feather v2) formats — for `dataframe.Frame`.
 
-**Status:** work in progress. Done: the FlatBuffers layer (`arrow.fb`). Planned (SPEC.md § Plan): the
-schema mapping to every `dataframe` column type, the IPC stream and file formats, ZSTD body compression,
-a fuzz driver and an interop oracle over the apache/arrow-testing golden files.
+**Status:** stream and file format for every `dataframe` column type, ZSTD body compression both ways,
+`ReadOptions.lossy` for values `dataframe` cannot hold; anchored on the apache/arrow-testing golden files;
+fuzz driver (`ARROW_FUZZ`). Still open (SPEC.md § Plan, A6): no-panic sweep, mutation, survey.
 
 Provenance: written from the Arrow columnar format specification (arrow.apache.org/docs/format) and the
-FlatBuffers binary format description; no Arrow or FlatBuffers source was read or ported.
+FlatBuffers binary format description; no Arrow or FlatBuffers source was read or ported. `src/testdata/` reproduces apache/arrow-testing golden
+files (Apache-2.0 data) — see `NOTICE`.

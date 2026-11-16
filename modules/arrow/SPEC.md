@@ -8,11 +8,9 @@
 
 **Audit:** review none · mutation none · src ?
 
-**Hardening:** fuzz none · ct n/a — <why this module holds no secret>
+**Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean; reach: frames, files, batches, every error kind, frames from compressed inputs) · ct n/a — parses and writes data files, holds no secret
 
 **Performance:** not measured
-
-**Evidence:** unclassified
 
 **Known defects:** none recorded
 
@@ -143,6 +141,14 @@ its `int32` length and `ARROW1`; `openFile` reads the footer's schema, decodes t
 batch's metadata, and `File.readBatch(i)` decodes one batch on demand. Buffers are written 64-byte aligned and padded;
 any 8-byte layout is read. Validity bitmaps are LSB-first, a buffer of length 0 when the array has no null.
 
+**Body compression (wave A5).** `Message.fbs` `BodyCompression`, method BUFFER: each buffer of a record or
+dictionary batch is compressed on its own and starts with its uncompressed length as a little-endian `int64`; -1
+means the bytes after it are stored raw; a buffer of length 0 stays empty. `WriteOptions.compression = .zstd`
+(level `compression_level`, 0 = zstd's 3) compresses every non-empty buffer with the collection's `zstd` module and
+stores raw the ones that do not shrink, as Arrow C++ and arrow-rs do. The reader decompresses ZSTD (one zstd context
+per read) after checking each declared length against `zstd.decompressBound` and the message's total against
+`ReadOptions.max_body_bytes`; LZ4_FRAME is `error.Unsupported` (the collection has no LZ4 codec).
+
 **Type mapping (wave A2).** The writer maps the column's DECLARED `ColumnType` and reads the cells through
 `ColumnData.get`, so storage of another kind that holds values of the declared type is written too:
 
@@ -151,12 +157,12 @@ any 8-byte layout is read. Validity bitmaps are LSB-first, a buffer of length 0 
 | `int` / `int8`..`int32` / `uint8`..`uint64` | Int64 / Int8..Int32 / UInt8..UInt64 | — |
 | `float` / `float32` | Float64 / Float32 | Float16 → `float32` |
 | `bool` | Bool (bit-packed) | — |
-| `decimal` (i128, 12 digits) | Decimal128(38, 12) | Decimal128(p, s) rescaled to 12 digits; inexact → `Unsupported` |
+| `decimal` (i128, 12 digits) | Decimal128(38, 12) | Decimal128(p, s) rescaled to 12 digits; inexact or out of range → `Unsupported`, or null under `lossy` |
 | `text` / `binary` | Utf8 / Binary; Large* from `WriteOptions.large_from` bytes (default 2^31) | LargeUtf8 / LargeBinary; FixedSizeBinary → `binary` |
 | `date` (ISO text) | Date32 (days) | Date64 (ms, floored to the day); years outside 0000–9999 → `Unsupported` |
-| `timestamp` (+ `time_zone`) | Timestamp(us, zone) | s / ms / ns (ns floored to us); a zone `tz` does not know → `Unsupported` |
+| `timestamp` (+ `time_zone`) | Timestamp(us, zone) | s / ms / ns (ns floored to us); a zone `tz` does not know → `Unsupported`, or under `lossy` a naive column (the cells are UTC instants either way) |
 | `duration` | Duration(us) | s / ms / ns |
-| `time` | Time64(us) | Time32(s, ms), Time64(ns); a value outside `[0, 24h)` → `Unsupported` |
+| `time` | Time64(us) | Time32(s, ms), Time64(ns); a value outside `[0, 24h)` (Arrow allows 24:00:00) → `Unsupported`, or null under `lossy` |
 | `categorical` | Utf8, dictionary-encoded, Int32 indices, `ordered` kept | any integer index type; an unordered dictionary is deduplicated and sorted lexically (the `CatColumn` invariant), an ordered one deduplicated in its order; null dictionary entries read as null rows |
 | `list` (`inner[0]`) | List (Int32 offsets) | LargeList; null rows with elements and offsets not starting at 0 are compacted |
 | `array` (`array_width`) | FixedSizeList(width) | — |
@@ -187,7 +193,15 @@ instead. Those are different grades of evidence and must not be written alike.
 - Nesting deeper than `schema.max_depth` (64) is refused on both sides.
 - `dataframe` keeps list offsets in `u32`: more than 2^32 − 1 elements in one list column → `Unsupported`; the
   writer's Int32 list offsets refuse more than 2^31 − 1 elements in one batch.
-- Refused on read (`Unsupported`): body compression (wave A5), a dictionary replaced mid-stream (deltas are
+- `ReadOptions.max_body_bytes` (default 2^31, ours): the most bytes one compressed message body may expand to;
+  `error.LimitExceeded`. A declared length above what the zstd frames can hold (`zstd.decompressBound`), a frame
+  that decodes to another length, or a broken frame is `error.Malformed`.
+- Values `dataframe` cannot hold — a Decimal128 that does not fit 12 fractional digits in an i128, a time of day
+  outside `[0, 24h)`, a date outside the years 0000–9999, s/ms timestamps or durations whose microseconds overflow
+  i64 — fail the whole read with `error.Unsupported` by default. `ReadOptions.lossy = true` reads each as a null
+  cell, and a timestamp zone `tz` does not know as a naive column; nothing else changes (a malformed stream is
+  still an error). Tests: `src/stream_test.zig` "lossy: …", and the `datetime` and `decimal` golden sets.
+- Refused on read (`Unsupported`): LZ4_FRAME body compression, a dictionary replaced mid-stream (deltas are
   appended), a dictionary nested in a dictionary's values, Decimal32/64/256, Interval, Union, Map, the view types,
   tensors. Every structural defect — a buffer shorter than its node, offsets running backwards or past the data, an
   index outside its dictionary, node or buffer counts not matching the schema, a column length not the batch's —
@@ -195,29 +209,21 @@ instead. Those are different grades of evidence and must not be written alike.
 
 ## Anchoring
 
-Where the expected values in the tests come from. Distinguish, in these words:
+**External anchor (2026-11-17):** the apache/arrow-testing integration golden files written by Arrow C++,
+committed under `src/testdata/` (Apache-2.0 data, see `NOTICE`; commit `5a26d357`), read by
+`src/golden_test.zig`. Each set's `.stream` and `.arrow_file` is compared field by field and cell by cell with
+its Arrow integration JSON (`.json.gz`), through an oracle written from the JSON's own encoding (units, decimal
+scales, hex binary, dictionary indices, offsets; dates by Hinnant's `civil_from_days`), not through the reader.
+Sets: `custom_metadata`, `dictionary`, `dictionary_unsigned`, `duplicate_fieldnames`, `extension`, `nested`,
+`nested_large_offsets`, `null`, `null_trivial`, `primitive`, `primitive_large_offsets`, `primitive_no_batches`,
+`primitive_zerolength`, `recursive_nested`, and from `2.0.0-compression` `zstd` and `uncompressible_zstd`
+(ZSTD body compression); `datetime` and `decimal` are `Unsupported` by default and compared under `lossy`.
+Stream and file read equal, each file batch has its JSON batch's length, and the frame this module writes back
+(plain and zstd, stream and file) reads equal. `decimal256`, `interval`, `map`, `map_non_canonical`,
+`nested_dictionary`, `union` and `lz4` are asserted `Unsupported`, lossy or not. The writer's bytes are anchored
+only through the reader (no foreign reader runs here).
 
-- **External anchor** — published vectors, bytes captured from a foreign
-  implementation, or a live run against a foreign peer. It can fail us.
-- **Re-derived** — an in-house oracle reaching the answer another way. Catches
-  a typo; does **not** catch a shared misreading of the spec.
-- **Self** — we wrote the expected values from our own reading.
-
-⚠ An external anchor is produced by an INSTRUMENT, and that instrument is part
-of the module: it lives in `src/` if it is pure Zig, in `modules/<name>/tools/`
-if it needs a foreign toolchain (`CONVENTIONS.md` §9), and never in a scratch
-directory. An anchor whose producer cannot be re-run is a number nobody can
-check — name the file here.
-
-⚠ Never record a design reference ("we looked at how X does it") as an anchor.
-State the grade in the machine-checked form `check-catalog` reads:
-
-**Anchor grade:** class <A|B|C|D> · oracle <EXTERNAL|REDERIVED|MIXED|SELF|n/a>
-
-Class A/B means an outside truth exists (a wire format others must agree with, or
-a published construction with vectors) and the oracle may not be `n/a`. Class C/D
-means none exists — an internal algorithm, or our own design — and the oracle must
-be `n/a`, because grading one invents anchor debt that cannot be paid.
+**Anchor grade:** class A · oracle EXTERNAL
 
 ## What is deliberately not done
 
@@ -229,16 +235,10 @@ get confused constantly.
 
 ## Open
 
-- No external anchor committed yet: every test is a self round trip or a hand-assembled stream from our reading of
-  the spec. A one-off probe (2026-11-16, not kept) read the apache/arrow-testing `1.0.0-littleendian` integration
-  files, `.stream` and `.arrow_file`, written by Arrow C++: `primitive`, `primitive_large_offsets`,
-  `primitive_no_batches`, `primitive_zerolength`, `nested`, `nested_large_offsets`, `recursive_nested`, `null`,
-  `null_trivial`, `dictionary`, `dictionary_unsigned`, `custom_metadata`, `duplicate_fieldnames`, `extension` decode,
-  stream and file agree, rewriting ours reads back equal, and spot-checked cells match the JSON. `datetime`
-  (Time32 86400 s = 24:00:00), `decimal` (precision 38 at scale 2 overflows 12 digits in i128), `decimal256`,
-  `interval`, `map`, `map_non_canonical`, `nested_dictionary`, `union` are `Unsupported`. Next: commit those files
-  with their JSON as data (Apache-2.0: a third-party attribution NOTICE) and a reader comparing to the JSON —
-  owner decision.
+- The writer is anchored only through our own reader: no foreign implementation reads our bytes (a live pyarrow
+  round trip needs a venv + wheel — owner decision).
+- LZ4_FRAME body compression: `Unsupported` until the collection has an LZ4 codec (a new-module idea; not filed
+  from this wave).
 - The reader copies every buffer (no zero-copy views over the input) and text is not checked for UTF-8.
 - Performance not measured.
 
@@ -253,5 +253,5 @@ pyarrow round trip is an owner decision. Out: the C data interface, Flight, comp
 | A2 | Type mapping `dataframe` ↔ Arrow (table above); `boxed` refused | done 2026-11-16 |
 | A3 | IPC stream: framing, Schema / DictionaryBatch / RecordBatch, end of stream, `rows_per_batch`; `writeStream` / `readStream` | done 2026-11-16 |
 | A4 | IPC file: `ARROW1`, footer with blocks, random access to a batch; `writeFile` / `readFile` / `openFile` | done 2026-11-16 |
-| A5 | ZSTD body compression; LZ4_FRAME `Unsupported` until an `lz4` module exists | open |
-| A6 | Golden oracle, fuzz driver, no-panic sweep, mutation, example, survey | open |
+| A5 | ZSTD body compression read and write (`WriteOptions.compression`); LZ4_FRAME `Unsupported` until an `lz4` module exists | done 2026-11-17 |
+| A6 | Golden oracle (done 2026-11-17), `ReadOptions.lossy` (done), fuzz driver (done 2026-11-17), example (done); no-panic sweep, mutation, survey | part 1 done 2026-11-17 |

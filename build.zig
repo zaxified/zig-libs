@@ -321,7 +321,7 @@ pub const module_list = [_]Module{
     .{ .name = "finstats", .libs = &.{"storage"}, .deps = &.{"datefmt"}, .test_deps = &.{"testkit"} },
     .{ .name = "indicators", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
     .{ .name = "dataframe", .libs = &.{"storage"}, .deps = &.{ "datefmt", "csvstream", "regex", "tz", "unitext" }, .test_deps = &.{ "testkit", "encoding", "bzip2" } }, // columnar dataframe
-    .{ .name = "arrow", .libs = &.{"storage"}, .deps = &.{"dataframe"} }, // Apache Arrow IPC over dataframe (in progress)
+    .{ .name = "arrow", .libs = &.{"storage"}, .deps = &.{ "dataframe", "zstd" }, .test_deps = &.{"testkit"} }, // Apache Arrow IPC over dataframe, ZSTD body compression
     .{ .name = "filestore", .libs = &.{"storage"}, .deps = &.{"clock"}, .test_deps = &.{"testkit"} },
     .{ .name = "jsontext", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "unitext", .libs = &.{"format"}, .test_deps = &.{"testkit"} },

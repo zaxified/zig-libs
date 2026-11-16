@@ -6,20 +6,20 @@
 //! back (waves A2 + A3 of the plan in SPEC.md). Underneath: the FlatBuffers layer
 //! (`fb`) Arrow's metadata is written in, the schema tables (`schema`) and the
 //! message framing (`ipc`). `writeFile` / `readFile` / `openFile` do the same for the
-//! IPC file format (wave A4), with random access to a record batch. Body compression
-//! follows.
+//! IPC file format (wave A4), with random access to a record batch, and ZSTD body
+//! compression both ways (wave A5; `WriteOptions.compression`).
 
 const std = @import("std");
 
 pub const meta = .{
-    .doc = "Apache Arrow IPC stream and file format for dataframe frames (in progress: stream and file format done, compression to come)",
+    .doc = "Apache Arrow IPC stream and file format for dataframe frames (stream and file format, ZSTD body compression; hardening in progress)",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "Apache Arrow columnar format 1.x (arrow-rs arrow-ipc, pyarrow.ipc)",
-    .deps = .{"dataframe"},
+    .deps = .{ "dataframe", "zstd" },
 };
 
 /// The FlatBuffers subset Arrow's metadata uses (bounds-checked reader, back-to-front builder).
@@ -34,6 +34,7 @@ pub const stream = @import("stream.zig");
 pub const Error = stream.Error;
 pub const WriteOptions = stream.WriteOptions;
 pub const ReadOptions = stream.ReadOptions;
+pub const Compression = stream.Compression;
 /// The frame as an Arrow IPC stream (caller frees the bytes).
 pub const writeStream = stream.writeStream;
 /// An Arrow IPC stream as a frame allocated from an arena.
@@ -52,4 +53,6 @@ test {
     _ = ipc;
     _ = stream;
     _ = @import("stream_test.zig");
+    _ = @import("golden_test.zig");
+    _ = @import("fuzz_test.zig");
 }
