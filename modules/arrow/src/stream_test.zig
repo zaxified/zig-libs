@@ -1386,6 +1386,165 @@ test "run-end encoded: read expanded into a plain column, over batches; a sliced
     }
 }
 
+test "run-end encoded metadata: reported in the column's shape (the values' children), so a write-back keeps it in place" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const kv = struct {
+        fn f(comptime k: []const u8) []const schema.KeyValue {
+            return &.{.{ .key = k, .value = k ++ "!" }};
+        }
+    }.f;
+    const ends = schema.Field{ .name = "run_ends", .nullable = false, .type = .{ .int = .{ .bits = 16, .signed = true } }, .metadata = kv("ends") };
+    // r: run-end encoded struct{a: int32, b: utf8}, metadata on every field.
+    const ab = [_]schema.Field{
+        .{ .name = "a", .type = .{ .int = .{ .bits = 32, .signed = true } }, .metadata = kv("a") },
+        .{ .name = "b", .type = .utf8, .metadata = kv("b") },
+    };
+    const r_kids = [_]schema.Field{ ends, .{ .name = "values", .type = .@"struct", .children = &ab, .metadata = kv("values") } };
+    // rr: run-end encoded run-end encoded struct{c: int32} (folded through both levels).
+    const c = [_]schema.Field{.{ .name = "c", .type = .{ .int = .{ .bits = 32, .signed = true } }, .metadata = kv("c") }};
+    const inner_kids = [_]schema.Field{ ends, .{ .name = "values", .type = .@"struct", .children = &c, .metadata = kv("inner values") } };
+    const rr_kids = [_]schema.Field{ ends, .{ .name = "values", .type = .run_end_encoded, .children = &inner_kids, .metadata = kv("outer values") } };
+    const fields = [_]schema.Field{
+        .{ .name = "r", .type = .run_end_encoded, .children = &r_kids, .metadata = kv("r") },
+        .{ .name = "rr", .type = .run_end_encoded, .children = &rr_kids, .metadata = kv("rr") },
+    };
+    const nd = struct {
+        fn f(len: i64) ipc.FieldNode {
+            return .{ .length = len, .null_count = 0 };
+        }
+    }.f;
+    const bytes = try hand(gpa, &fields, &.{.{ .length = 3, .nodes = &.{ nd(3), nd(2), nd(2), nd(2), nd(2), nd(3), nd(1), nd(1), nd(1), nd(1), nd(1) }, .bufs = &.{
+        "", bytesOf(i16, &.{ 1, 3 }), "", "",                  bytesOf(i32, &.{ 10, 20 }), "", bytesOf(i32, &.{ 0, 1, 3 }), "pqq",
+        "", bytesOf(i16, &.{3}),      "", bytesOf(i16, &.{1}), "",                         "", bytesOf(i32, &.{5}),
+    } }});
+    defer gpa.free(bytes);
+    var md: stream.Metadata = .{};
+    const f = try stream.readStream(a, bytes, .{ .metadata = &md });
+    try testing.expectEqual(df.ColumnType.@"struct", f.columns[0].type);
+    try testing.expectEqual(df.ColumnType.@"struct", f.columns[1].type);
+    try testing.expectEqualStrings("qq", f.columnAt(0).get(2).record.get(1).text);
+    try testing.expectEqual(@as(i64, 5), f.columnAt(1).get(2).record.get(0).int);
+    // The metadata has the frame's shape: the field's own, then the values' children; the
+    // `run_ends` / `values` fields' own metadata is dropped (as Arrow C++ reads it).
+    const check = struct {
+        fn run(m: stream.Metadata) !void {
+            try testing.expectEqual(@as(usize, 2), m.fields.len);
+            try testing.expectEqualStrings("r!", m.fields[0].metadata[0].value);
+            try testing.expectEqual(@as(usize, 2), m.fields[0].children.len);
+            try testing.expectEqualStrings("a!", m.fields[0].children[0].metadata[0].value);
+            try testing.expectEqualStrings("b!", m.fields[0].children[1].metadata[0].value);
+            try testing.expectEqualStrings("rr!", m.fields[1].metadata[0].value);
+            try testing.expectEqual(@as(usize, 1), m.fields[1].children.len);
+            try testing.expectEqualStrings("c!", m.fields[1].children[0].metadata[0].value);
+            try testing.expectEqual(@as(usize, 1), m.fields[1].children[0].metadata.len);
+        }
+    }.run;
+    try check(md);
+    try testing.expectEqualStrings("a", md.fields[0].children[0].name);
+    // Written back plain with what was read: every pair lands on the same field again.
+    const back = try stream.writeStream(gpa, f, .{ .field_metadata = md.fields });
+    defer gpa.free(back);
+    var bmd: stream.Metadata = .{};
+    try expectSameFrame(f, try stream.readStream(a, back, .{ .metadata = &bmd }));
+    try check(bmd);
+}
+
+test "map: read as list<struct<key, value>> under the file's names; null entries or keys and bad map schemas are Malformed" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const kv_fields = [_]schema.Field{
+        .{ .name = "k", .nullable = false, .type = .utf8 },
+        .{ .name = "v", .type = .{ .int = .{ .bits = 32, .signed = true } } },
+    };
+    const entries = schema.Field{ .name = "pairs", .nullable = false, .type = .@"struct", .children = &kv_fields };
+    const ent = [1]schema.Field{entries};
+    const mapField = struct {
+        fn f(e: *const [1]schema.Field, sorted: bool) [1]schema.Field {
+            return .{.{ .name = "m", .type = .{ .map = sorted }, .children = e }};
+        }
+    }.f;
+    const nd = struct {
+        fn f(len: i64, nulls: i64) ipc.FieldNode {
+            return .{ .length = len, .null_count = nulls };
+        }
+    }.f;
+    // Rows: {x: 1, y: null}, null, {z: 3}.
+    const Case = struct { e_nulls: i64 = 0, e_valid: []const u8 = "", k_nulls: i64 = 0, k_valid: []const u8 = "", end: i32 = 3 };
+    const make = struct {
+        fn f(g: Allocator, fs: []const schema.Field, cs: Case) ![]u8 {
+            const offs = [_]i32{ 0, 2, 2, cs.end };
+            return hand(g, fs, &.{.{ .length = 3, .nodes = &.{ nd(3, 1), nd(3, cs.e_nulls), nd(3, cs.k_nulls), nd(3, 1) }, .bufs = &.{
+                "\x05", std.mem.sliceAsBytes(&offs), cs.e_valid, cs.k_valid, bytesOf(i32, &.{ 0, 1, 2, 3 }), "xyz",
+                "\x05", bytesOf(i32, &.{ 1, 0, 3 }),
+            } }});
+        }
+    }.f;
+    for ([_]bool{ false, true }) |sorted| {
+        const fs = mapField(&ent, sorted);
+        const bytes = try make(gpa, &fs, .{});
+        defer gpa.free(bytes);
+        const f = try stream.readStream(a, bytes, .{});
+        const col = f.columns[0];
+        try testing.expectEqual(df.ColumnType.list, col.type);
+        try testing.expectEqualStrings("pairs", col.inner[0].name);
+        try testing.expectEqual(df.ColumnType.@"struct", col.inner[0].type);
+        try testing.expectEqualStrings("k", col.inner[0].inner[0].name);
+        try testing.expectEqualStrings("v", col.inner[0].inner[1].name);
+        const r0 = f.columnAt(0).get(0).list;
+        try testing.expectEqual(@as(usize, 2), r0.len());
+        try testing.expectEqualStrings("y", r0.get(1).record.get(0).text);
+        try testing.expect(r0.get(1).record.get(1) == .null);
+        try testing.expect(f.columnAt(0).get(1) == .null);
+        try testing.expectEqual(@as(i64, 3), f.columnAt(0).get(2).list.get(0).record.get(1).int);
+        // Written back as a List of Struct (the map tag is not kept), read back equal.
+        const back = try stream.writeStream(gpa, f, .{});
+        defer gpa.free(back);
+        try expectSameFrame(f, try stream.readStream(a, back, .{}));
+        // Map slots are charged like a list's: the column, its entries, keys and values.
+        try testing.expectError(error.LimitExceeded, stream.readStream(a, bytes, .{ .max_cells = 11 }));
+        _ = try stream.readStream(a, bytes, .{ .max_cells = 12 });
+    }
+    const fs = mapField(&ent, false);
+    for ([_]Case{
+        .{ .e_nulls = 1, .e_valid = "\x06" }, // a null entry
+        .{ .k_nulls = 1, .k_valid = "\x06" }, // a null key
+        .{ .end = 4 }, // offsets past the entries
+    }) |cs| {
+        const bad = try make(gpa, &fs, cs);
+        defer gpa.free(bad);
+        try testing.expectError(error.Malformed, stream.readStream(a, bad, .{}));
+    }
+    // Schemas Arrow C++ and arrow-rs refuse: nullable entries or keys, entries that are not
+    // a struct of two fields, not one child, a dictionary-encoded entries field.
+    var nullable_entries = entries;
+    nullable_entries.nullable = true;
+    const nullable_key = [_]schema.Field{ .{ .name = "k", .type = .utf8 }, kv_fields[1] };
+    var key_nullable = entries;
+    key_nullable.children = &nullable_key;
+    var one_field = entries;
+    one_field.children = kv_fields[0..1];
+    var not_struct = entries;
+    not_struct.type = .utf8;
+    not_struct.children = &.{};
+    var dict_entries = entries;
+    dict_entries.dictionary = .{ .id = 0 };
+    for ([_]schema.Field{ nullable_entries, key_nullable, one_field, not_struct, dict_entries }) |e| {
+        const ea = [1]schema.Field{e};
+        const bad = try hand(gpa, &mapField(&ea, false), &.{});
+        defer gpa.free(bad);
+        try testing.expectError(error.Malformed, stream.readStream(a, bad, .{}));
+    }
+    const two = [_]schema.Field{.{ .name = "m", .type = .{ .map = false }, .children = &.{ entries, entries } }};
+    const bad = try hand(gpa, &two, &.{});
+    defer gpa.free(bad);
+    try testing.expectError(error.Malformed, stream.readStream(a, bad, .{}));
+}
+
 /// A 16-byte BinaryView / Utf8View: inline when `data` holds 12 bytes or fewer, else
 /// `len` bytes at `offset` of data buffer `index` (`data` is then the referenced bytes).
 pub fn view(data: []const u8, index: i32, offset: i32) [16]u8 {

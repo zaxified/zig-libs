@@ -22,9 +22,9 @@ pub const Precision = enum(i16) { half = 0, single = 1, double = 2 };
 
 pub const IntType = struct { bits: u8, signed: bool };
 
-/// The logical types this module reads and writes (`run_end_encoded` and the view
-/// types are read only). `unsupported` keeps the union id of a type it does not
-/// (Interval, Union, Map), so a reader can name it.
+/// The logical types this module reads and writes (`run_end_encoded`, `map` and the
+/// view types are read only). `unsupported` keeps the union id of a type it does not
+/// (Interval, Union), so a reader can name it.
 pub const Type = union(enum) {
     null,
     int: IntType,
@@ -52,6 +52,9 @@ pub const Type = union(enum) {
     /// Offsets plus sizes into one child, any order, overlap allowed.
     list_view,
     large_list_view,
+    /// One child, the non-nullable `entries` struct of a non-nullable key and a value;
+    /// the payload is `keysSorted`.
+    map: bool,
     unsupported: u8,
 };
 
@@ -95,6 +98,7 @@ const tid = struct {
     const struct_ = 13;
     const fixed_size_binary = 15;
     const fixed_size_list = 16;
+    const map = 17;
     const duration = 18;
     const large_binary = 19;
     const large_utf8 = 20;
@@ -259,6 +263,7 @@ fn decodeType(id: u8, tt: ?fb.Table) Error!Type {
         tid.utf8_view => .utf8_view,
         tid.list_view => .list_view,
         tid.large_list_view => .large_list_view,
+        tid.map => .{ .map = if (tt) |m| try m.scalar(bool, 0, false) else false },
         0 => error.Malformed, // NONE
         else => .{ .unsupported = id },
     };
@@ -361,6 +366,7 @@ fn typeId(t: Type) ?u8 {
         .utf8_view => tid.utf8_view,
         .list_view => tid.list_view,
         .large_list_view => tid.large_list_view,
+        .map => tid.map,
         .unsupported => null,
     };
 }
@@ -394,6 +400,7 @@ fn encodeTypeTable(b: *fb.Builder, t: Type) Error!fb.Ref {
         .fixed_size_binary => |w| try b.addScalar(0, i32, w, 0),
         .fixed_size_list => |n| try b.addScalar(0, i32, n, 0),
         .duration => |u| try b.addScalar(0, TimeUnit, u, .millisecond),
+        .map => |sorted| try b.addScalar(0, bool, sorted, false),
         else => {},
     }
     return b.endTable();

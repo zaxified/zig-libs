@@ -142,8 +142,10 @@ deterministic fuzz driver, with a read that ends in an error and never in a cras
 (arrow-rs does too; C++ makes it a separate `Validate` call *(inferred)*); the anchor is the Arrow integration
 golden files compared with their JSON through an oracle written from the JSON's own encoding; pure Zig with
 ZSTD built in both ways, no C, no `libarrow`. Nothing here is a measured lead, so the scope is not `ahead`.
-**Where we are behind** (all in Backlog): the types the format has and `dataframe` has no column for (Map, Union,
-Interval) are refused, and the view types, RunEndEncoded and Decimal32/64/256 are read but never written; LZ4_FRAME, the
+**Where we are behind** (all in Backlog): the types the format has and `dataframe` has no column for (Union,
+Interval) are refused; Map is read as a list of its entries struct, so a write-back loses the "map" tag (Arrow C++,
+arrow-rs and polars 2.x keep a map type of their own); the view types, RunEndEncoded, Map and Decimal32/64/256 are
+read but never written; LZ4_FRAME, the
 other codec every Arrow implementation but this one has and the default of pyarrow's Feather writer, is refused
 (waits for an `lz4` module); dictionary replacement and a dictionary nested in a list or struct are refused; there is no
 zero-copy or memory-mapped read, no incremental reader or writer over `std.Io` (the input and the
@@ -165,10 +167,10 @@ hostile stream ends in an error, within the limits below, never in a crash or an
 **Not here:** the Arrow C data interface (sharing buffers with another library in the same process), Flight
 (RPC), compute kernels, a columnar in-memory representation of its own (the reader decodes into `dataframe`'s
 storage and copies every buffer — no zero-copy views over the input), Parquet, the JSON integration format as an
-output, and the types `dataframe` has no column for (Interval, Union, Map) — those are refused
+output, and the types `dataframe` has no column for (Interval, Union) — those are refused
 (`Unsupported`). RunEndEncoded is read expanded into a plain column, BinaryView / Utf8View as `binary` /
-`text`, ListView / LargeListView as `list`, Decimal32 / Decimal64 / Decimal256 as `decimal`; none of them is
-written. LZ4_FRAME body compression is refused until the
+`text`, ListView / LargeListView as `list`, Map as a `list` of its entries `struct`, Decimal32 / Decimal64 /
+Decimal256 as `decimal`; none of them is written. LZ4_FRAME body compression is refused until the
 collection has an LZ4 codec (deferred, not refused for good).
 
 ## Wire format / algorithm
@@ -213,6 +215,29 @@ per read) after checking each declared length against `zstd.decompressBound` and
 | `boxed` storage | `Unsupported` (no Arrow type short of a dense union) | — |
 | (the values' column) | — | RunEndEncoded (Int16/32/64 run ends) → the values' type, runs expanded |
 | `text` / `binary` / `list` | — | Utf8View / BinaryView (inline or variadic-buffer views, copied) / ListView, LargeListView (offsets + sizes, copied) |
+| `list` of `struct` (key, value) | — | Map: a list of its entries struct under the file's own field names (`entries` / `key` / `value` when canonical), `keysSorted` dropped; written back as a List of Struct (the "map" tag is lost) |
+
+**Map (2026-11-17, owner decision).** `dataframe` has no map column, so a Map reads as what it physically is,
+`list<struct<key, value>>` — what polars read it as until 1.39 (`DataType::List` of the entries field;
+polars-core `datatypes/field.rs`) and still does without its `dtype-map` feature, and what pandas gets from
+pyarrow (a list of `(key, value)` tuples). Arrow C++ (`MapType`), arrow-rs (`DataType::Map`) and polars 2.x
+(`dtype-map`, on in its Python build) keep a map type of their own; a write-back from this module is a List of
+Struct. Field names are kept as the file gives them, as arrow-rs does (`ipc/convert.rs`); Arrow C++ renames the
+key and value fields to `key` / `value` on read and writes the entries as `entries`. The rules both C++
+(`ipc/metadata_internal.cc`, `MapArray::ValidateChildData`) and arrow-rs (`MapArray::try_new`) enforce, as
+Schema.fbs states them ("neither the entries field nor the key field may be nullable"), are `error.Malformed`
+here: a Map field without exactly one child, entries that are not a struct of two fields (or are
+dictionary-encoded), a nullable entries or key field, and a batch whose entries or keys hold a null (a non-zero
+null count on either node).
+
+**Run-end encoded metadata (2026-11-17).** `ReadOptions.metadata` reports a RunEndEncoded field in the shape of
+the column it reads as: the field's own pairs, and as its children the `values` field's children (through
+nested run-end fields); the `run_ends` and `values` fields' own pairs are dropped. Arrow C++'s IPC reader does
+the same — it rebuilds the type from the two children's TYPES only (`ipc/metadata_internal.cc`,
+`RunEndEncodedType(children[0]->type(), children[1]->type())`), so neither child's name, nullability nor metadata
+survives a read there either; the values' own children (a struct's fields) keep theirs as part of the type. So
+`WriteOptions.field_metadata` taken from a read always fits the frame: a run-end encoded struct's child metadata
+lands on the struct's own fields, never on the `run_ends` / `values` pair.
 
 A dictionary over a non-text type (Int64 values, say) is read as a plain column of that type. Each dictionary-encoded
 column gets its own id, its whole dictionary written once before the first record batch.
@@ -274,7 +299,7 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
   changes (a malformed stream is still an error). Tests: `src/stream_test.zig` "lossy: …", "inexact time
   conversions", and the `datetime` and `decimal` golden sets.
 - Refused on read (`Unsupported`): LZ4_FRAME body compression, a dictionary replaced mid-stream (deltas are
-  appended), a dictionary nested in a dictionary's values, Interval, Union, Map,
+  appended), a dictionary nested in a dictionary's values, Interval, Union,
   tensors. Every structural defect — a buffer shorter than its node, offsets running backwards or past the data, an
   index outside its dictionary, node or buffer counts not matching the schema, a column length not the batch's —
   is `error.Malformed`.
@@ -290,12 +315,15 @@ Sets: `custom_metadata`, `dictionary`, `dictionary_unsigned`, `duplicate_fieldna
 `nested_large_offsets`, `null`, `null_trivial`, `primitive`, `primitive_large_offsets`, `primitive_no_batches`,
 `primitive_zerolength`, `recursive_nested`, and from `2.0.0-compression` `zstd` and `uncompressible_zstd`
 (ZSTD body compression), from `cpp-21.0.0` `decimal32`, `decimal64`, `run_end_encoded`, `binary_view` and
-`list_view`; `datetime`, `decimal` and (from
+`list_view`, and `map` and `map_non_canonical` (a Map as a list of its entries; the latter's `.stream`, written
+by Arrow C++, carries the canonical `entries` / `key` / `value` names, its `.arrow_file` the JSON's own, and
+either is accepted as the file's); `datetime`, `decimal` and (from
 `cpp-21.0.0`) `decimal256` are `Unsupported` by default and compared under `lossy` (the Decimal256 oracle parses
 the JSON's 77-digit values as i256).
 Stream and file read equal, each file batch has its JSON batch's length, and the frame this module writes back
-(plain and zstd, stream and file) reads equal. `interval`, `map`, `map_non_canonical`,
-`nested_dictionary`, `union` and `lz4` are asserted `Unsupported`, lossy or not. The writer's bytes are anchored
+(plain and zstd, stream and file) reads equal, its metadata too (in the frame's shape: a run-end encoded field's
+children are its values'). `interval`, `nested_dictionary`, `union` and `lz4` are asserted `Unsupported`, lossy
+or not. The writer's bytes are anchored
 only through the reader (no foreign reader runs here).
 
 **Anchor grade:** class A · oracle EXTERNAL
@@ -389,9 +417,9 @@ refuses the same `total` before the selectors are allocated and `gather` charges
   compute) for separate modules if a consumer ever needs them.
 - **LZ4_FRAME — superseded by something external:** waits for an `lz4` codec module in the collection; writing
   LZ4 is not planned even then (ZSTD is what Arrow C++ and arrow-rs recommend).
-- **Reading the types `dataframe` has no column for — never as such.** Interval, Union and Map would need new
-  `dataframe` column kinds first. (RunEndEncoded and the view types are read, but only as the plain columns
-  they encode; writing them would need column kinds of their own.)
+- **Reading the types `dataframe` has no column for — never as such.** Interval and Union would need new
+  `dataframe` column kinds first. (RunEndEncoded, the view types and Map are read, but only as the plain columns
+  they encode — Map as a list of its entries struct; writing them would need column kinds of their own.)
 
 ## Open
 
@@ -411,10 +439,6 @@ refuses the same `total` before the selectors are allocated and `gather` charges
   never emits views and the `cpp-21.0.0` view goldens are uncompressed.
 - Message-level `custom_metadata` (on each Schema / RecordBatch / DictionaryBatch message) is neither surfaced
   nor written; only schema, field and footer metadata are.
-- `field_metadata` on write is matched to children by position and count only: a RunEndEncoded column whose
-  values are a struct of two or more fields, read with its `run_ends` / `values` child metadata and written back
-  plain, would put that metadata on the struct's first two fields. Rare (REE of struct with child metadata); the
-  fix is to drop REE child metadata at read time, which changes what `ReadOptions.metadata` reports.
 
 ## Plan
 
@@ -460,8 +484,9 @@ competing libraries and cheap enough to finish in one wave; none of them is star
   `readStream` / `readFile` / `openFile` keep their signatures) is filled with a `Metadata` — the schema's pairs,
   a `FieldMetadata` tree parallel to the frame's columns, a file footer's pairs — copied into the read's arena;
   `WriteOptions.schema_metadata` / `field_metadata` (by position) / `footer_metadata` write them (more entries
-  than columns is `Unsupported`; more `children` than a field has — a run-end encoded field's, written back plain
-  — are dropped, the field's own metadata kept). Anchored on the
+  than columns is `Unsupported`; more `children` than a field has are dropped, the field's own metadata kept; a
+  run-end encoded field's children are reported as its values' since 2026-11-17, so a read's metadata always
+  fits). Anchored on the
   `custom_metadata` and `extension` goldens (every set's metadata is compared with its JSON, then written back
   and read again). Was: `arrow.schema` decodes `KeyValue`s (and the writer's schema encoder
   takes them) but the frame has no slot, so Pandas metadata, extension type names (`ARROW:extension:name`) and
@@ -476,9 +501,13 @@ competing libraries and cheap enough to finish in one wave; none of them is star
   fractional digits and is `Unsupported` (null under `lossy`) otherwise. Why: the format lists all three and the status matrix shows Decimal256 in every
   implementation *(doc)*. Effort: ~0.5 wave. Writing stays
   Decimal128.
-- **Map on read as `list<struct<key, value>>`** (a Map is physically a list of a two-field struct). The frame
-  keeps the data but not the "map" tag: a write back is a List of Struct. Owner call on fidelity before doing it
-  (a `lossy`-only option is the conservative form). Effort: ~0.5 wave.
+- ✅ 2026-11-17 **Map on read as `list<struct<key, value>>`** — done by default (owner decision: behave like the
+  frame libraries without a map type), see "Map" under the type mapping: file's field names, `keysSorted`
+  dropped, null entries or keys and non-conforming map schemas `Malformed`, anchored on the `map` and
+  `map_non_canonical` goldens. Was: owner call on fidelity (a `lossy`-only option the conservative form).
+- **Keep the "map" tag** — needs a map column kind in `dataframe` (or a tag on a `list` column); then a Map would
+  read into it and be written back as a Map, as Arrow C++, arrow-rs and polars 2.x round-trip it. Today the
+  write-back is a List of Struct. Waits for `dataframe`.
 - ✅ 2026-11-17 **RunEndEncoded on read.** Done as sketched: the column reads as its values' type, each batch's
   runs expanded (run ends signed Int16/32/64, positive, strictly increasing, the last AT LEAST the batch length —
   greater for a sliced array, as the columnar spec allows; only the batch's rows are expanded — no nulls on the

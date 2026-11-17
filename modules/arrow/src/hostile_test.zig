@@ -602,3 +602,29 @@ test "hostile views: many views of one long slice, list views of one whole child
         try testing.expectEqual(@as(?anyerror, error.Unsupported), got.err);
     }
 }
+
+test "hostile map: 2^22 entries of zero-width keys and Null values from a few bytes stop at max_cells" {
+    const gpa = testing.allocator;
+    const n = 1 << 22;
+    const kv = [_]schema.Field{
+        .{ .name = "key", .nullable = false, .type = .{ .fixed_size_binary = 0 } },
+        .{ .name = "value", .type = .null },
+    };
+    const entries = [_]schema.Field{.{ .name = "entries", .nullable = false, .type = .@"struct", .children = &kv }};
+    const fields = [_]schema.Field{.{ .name = "m", .type = .{ .map = false }, .children = &entries }};
+    var offs: [8]u8 = undefined;
+    std.mem.writeInt(i32, offs[0..4], 0, .little);
+    std.mem.writeInt(i32, offs[4..8], n, .little);
+    const e: ipc.FieldNode = .{ .length = n, .null_count = 0 };
+    const bytes = try st.hand(gpa, &fields, &.{.{ .length = 1, .nodes = &.{ .{ .length = 1, .null_count = 0 }, e, e, .{ .length = n, .null_count = n } }, .bufs = &.{ "", &offs, "", "", "" } }});
+    defer gpa.free(bytes);
+    const got = try streamUnderCap(bytes, .{ .max_cells = 1 << 20 }, 4 << 20);
+    try testing.expectEqual(@as(?anyerror, error.LimitExceeded), got.err);
+    try testing.expect(got.peak < 1 << 20);
+    // A child shorter than the offsets claim is Malformed, not read past.
+    const short: ipc.FieldNode = .{ .length = n - 1, .null_count = 0 };
+    const cut = try st.hand(gpa, &fields, &.{.{ .length = 1, .nodes = &.{ .{ .length = 1, .null_count = 0 }, short, short, .{ .length = n - 1, .null_count = n - 1 } }, .bufs = &.{ "", &offs, "", "", "" } }});
+    defer gpa.free(cut);
+    const got2 = try streamUnderCap(cut, .{}, 4 << 20);
+    try testing.expectEqual(@as(?anyerror, error.Malformed), got2.err);
+}

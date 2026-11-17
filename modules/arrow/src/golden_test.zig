@@ -10,7 +10,8 @@
 //! offsets), not through the reader's code. Then: the stream and the file read
 //! equal, each file batch is the JSON batch's length, and the frame written
 //! back by this module (plain and zstd-compressed, stream and file) reads equal.
-//! The sets with types `dataframe` has no column for are `error.Unsupported`,
+//! A Map reads as a list of its entries struct. The sets with types `dataframe`
+//! has no column for are `error.Unsupported`,
 //! with and without `ReadOptions.lossy`.
 
 const std = @import("std");
@@ -84,14 +85,16 @@ const sets = [_]Set{
     // BinaryView / Utf8View (inline and in variadic buffers) and ListView / LargeListView.
     set(c21, "binary_view", true, .exact),
     set(c21, "list_view", true, .exact),
+    // Map, read as a list of its entries struct; `map_non_canonical` names the entries,
+    // key and value fields otherwise (kept as the file names them).
+    set(v1, "map", true, .exact),
+    set(v1, "map_non_canonical", true, .exact),
 };
 
 /// Sets with a type `dataframe` has no column for (or a codec the collection lacks):
 /// only their `.stream` is committed.
 const refused = [_]struct { []const u8, []const u8 }{
     .{ "interval", @embedFile(v1 ++ "interval.stream") },
-    .{ "map", @embedFile(v1 ++ "map.stream") },
-    .{ "map_non_canonical", @embedFile(v1 ++ "map_non_canonical.stream") },
     .{ "nested_dictionary", @embedFile(v1 ++ "nested_dictionary.stream") },
     .{ "union", @embedFile(v1 ++ "union.stream") },
     .{ "lz4", @embedFile(v2 ++ "lz4.stream") },
@@ -254,7 +257,7 @@ const Oracle = struct {
             .binary
         else if (std.mem.eql(u8, name, "listview") or std.mem.eql(u8, name, "largelistview"))
             .list
-        else if (std.mem.eql(u8, name, "decimal")) .decimal else if (std.mem.eql(u8, name, "date")) .date else if (std.mem.eql(u8, name, "time")) .time else if (std.mem.eql(u8, name, "timestamp")) .timestamp else if (std.mem.eql(u8, name, "duration")) .duration else if (std.mem.eql(u8, name, "list") or std.mem.eql(u8, name, "largelist")) .list else if (std.mem.eql(u8, name, "fixedsizelist")) .array else if (std.mem.eql(u8, name, "struct")) .@"struct" else return o.fail(field, "type {s} not in the mapping", .{name});
+        else if (std.mem.eql(u8, name, "decimal")) .decimal else if (std.mem.eql(u8, name, "date")) .date else if (std.mem.eql(u8, name, "time")) .time else if (std.mem.eql(u8, name, "timestamp")) .timestamp else if (std.mem.eql(u8, name, "duration")) .duration else if (std.mem.eql(u8, name, "list") or std.mem.eql(u8, name, "largelist") or std.mem.eql(u8, name, "map")) .list else if (std.mem.eql(u8, name, "fixedsizelist")) .array else if (std.mem.eql(u8, name, "struct")) .@"struct" else return o.fail(field, "type {s} not in the mapping", .{name});
         if (col.type != want) return o.fail(field, "type {t}, want {t}", .{ col.type, want });
         if (want == .timestamp) {
             const zone: ?[]const u8 = if (get(t, "timezone")) |z| z.string else null;
@@ -267,8 +270,26 @@ const Oracle = struct {
         if (want == .list or want == .array or want == .@"struct") {
             const kids = items(field, "children");
             if (kids.len != col.inner.len) return o.fail(field, "{d} inner columns", .{col.inner.len});
+            if (std.mem.eql(u8, name, "map")) return o.expectMapEntries(kids[0], col.inner[0]);
             for (kids, col.inner) |k, c| try o.expectColumn(k, c);
         }
+    }
+
+    /// A Map's entries struct. The reader keeps the names the file gives; Arrow C++ writes
+    /// the canonical `entries` / `key` / `value` whatever the JSON says (the
+    /// `map_non_canonical` `.stream`; its `.arrow_file` keeps the JSON's names), so either
+    /// is the file's own.
+    fn expectMapEntries(o: *const Oracle, entries: J, col: df.Column) !void {
+        try o.expectNameOr(entries, col, "entries");
+        if (col.type != .@"struct" or col.inner.len != 2) return o.fail(entries, "type {t} of {d}", .{ col.type, col.inner.len });
+        for (items(entries, "children"), col.inner, [_][]const u8{ "key", "value" }) |k, c, canonical| {
+            try o.expectNameOr(k, c, canonical);
+            try o.expectColumnNamed(k, c, c.name);
+        }
+    }
+
+    fn expectNameOr(o: *const Oracle, field: J, col: df.Column, canonical: []const u8) !void {
+        if (!std.mem.eql(u8, col.name, str(field, "name")) and !std.mem.eql(u8, col.name, canonical)) return o.fail(field, "name {s}", .{col.name});
     }
 
     /// Cell `i` of the JSON column `cj` (of `field`) against the frame's cell.
@@ -383,7 +404,7 @@ const Oracle = struct {
             if (got != .int or got.int != want) return o.fail(field, "{any}, want {d}", .{ got, want });
             return;
         }
-        if (std.mem.eql(u8, name, "list") or std.mem.eql(u8, name, "largelist") or std.mem.eql(u8, name, "fixedsizelist")) {
+        if (std.mem.eql(u8, name, "list") or std.mem.eql(u8, name, "largelist") or std.mem.eql(u8, name, "map") or std.mem.eql(u8, name, "fixedsizelist")) {
             const child = items(field, "children")[0];
             const ccol = items(cj, "children")[0];
             var lo: usize = undefined;
@@ -453,33 +474,29 @@ fn expectKeyValues(want: []const J, got: []const stream.KeyValue) !void {
     }
 }
 
-/// The fields' key/value metadata (`metadata` in the JSON), recursively; with `names`
-/// the field names too (a frame written back names a list's child `item`).
+/// The children of the column a JSON field reads as: a run-end encoded field's are
+/// its `values` field's (the `run_ends` / `values` fields themselves are not columns).
+fn columnChildren(field: J) []const J {
+    const kids = items(field, "children");
+    if (std.mem.eql(u8, typeName(field), "runendencoded")) return columnChildren(kids[1]);
+    return kids;
+}
+
+/// The fields' key/value metadata (`metadata` in the JSON), recursively, in the shape
+/// of the frame's columns; with `names` the field names too (a frame written back names
+/// a list's child `item`; a Map's entries, key and value may carry their canonical names,
+/// see `Oracle.expectMapEntries`).
 fn expectFieldMetadata(fields: []const J, got: []const stream.FieldMetadata, names: bool) !void {
-    try testing.expectEqual(fields.len, got.len);
-    for (fields, got) |fj, g| {
-        if (names) try testing.expectEqualStrings(str(fj, "name"), g.name);
-        try expectKeyValues(items(fj, "metadata"), g.metadata);
-        try expectFieldMetadata(items(fj, "children"), g.children, names);
-    }
+    return expectFieldMetadataIn(fields, got, names, &.{});
 }
 
-fn hasRunEnds(fields: []const J) bool {
-    for (fields) |f| {
-        if (std.mem.eql(u8, typeName(f), "runendencoded") or hasRunEnds(items(f, "children"))) return true;
-    }
-    return false;
-}
-
-/// Like `expectFieldMetadata` (without names) for a frame written back from one with
-/// run-end encoded fields: such a field keeps its own metadata and has no children.
-fn expectPlainMetadata(fields: []const J, got: []const stream.FieldMetadata) !void {
+fn expectFieldMetadataIn(fields: []const J, got: []const stream.FieldMetadata, names: bool, canonical: []const []const u8) !void {
     try testing.expectEqual(fields.len, got.len);
-    for (fields, got) |fj, g| {
+    for (fields, got, 0..) |fj, g, i| {
+        if (names and !(i < canonical.len and std.mem.eql(u8, canonical[i], g.name))) try testing.expectEqualStrings(str(fj, "name"), g.name);
         try expectKeyValues(items(fj, "metadata"), g.metadata);
-        if (std.mem.eql(u8, typeName(fj), "runendencoded")) {
-            try testing.expectEqual(@as(usize, 0), g.children.len);
-        } else try expectPlainMetadata(items(fj, "children"), g.children);
+        const kids_canonical: []const []const u8 = if (std.mem.eql(u8, typeName(fj), "map")) &.{"entries"} else if (canonical.len == 1) &.{ "key", "value" } else &.{};
+        try expectFieldMetadataIn(columnChildren(fj), g.children, names, kids_canonical);
     }
 }
 
@@ -554,9 +571,8 @@ test "golden: apache/arrow-testing integration files read field by field equal t
         }
 
         // What this module writes of the frame and of its metadata reads back equal,
-        // plain and compressed. A run-end encoded field is written back plain, without its
-        // two children: its own metadata is kept, its children's is dropped.
-        const same_shape = !hasRunEnds(items(get(json, "schema").?, "fields"));
+        // plain and compressed (a run-end encoded field is written back plain, a Map as a
+        // List of its entries struct: the metadata read has the frame's shape either way).
         for ([_]stream.Compression{ .none, .zstd }) |c| {
             const wo: stream.WriteOptions = .{ .compression = c, .rows_per_batch = 8, .schema_metadata = md.schema, .field_metadata = md.fields };
             for ([_]bool{ false, true }) |file| {
@@ -565,11 +581,7 @@ test "golden: apache/arrow-testing integration files read field by field equal t
                 defer gpa.free(back);
                 const g = if (file) try stream.readFile(a, back, .{ .metadata = &bmd }) else try stream.readStream(a, back, .{ .metadata = &bmd });
                 try st.expectSameFrame(f, g);
-                if (same_shape) try expectMetadata(json, bmd, false) else {
-                    const sch = get(json, "schema").?;
-                    try expectKeyValues(items(sch, "metadata"), bmd.schema);
-                    try expectPlainMetadata(items(sch, "fields"), bmd.fields);
-                }
+                try expectMetadata(json, bmd, false);
             }
         }
     }

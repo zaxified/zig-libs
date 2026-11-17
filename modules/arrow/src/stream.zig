@@ -58,8 +58,9 @@ pub const WriteOptions = struct {
     /// Key/value metadata per column, by position: entry `i` goes on column `i`'s field,
     /// its `children` on the field's children in order (a list's item, a struct's fields).
     /// `name` is not looked at. More entries than columns is `error.Unsupported`; more
-    /// `children` than the field has (a run-end encoded field's, read and written back
-    /// plain) are dropped, the field's own metadata kept.
+    /// `children` than the field has are dropped, the field's own metadata kept (a read
+    /// reports a run-end encoded column's children as its values', so its metadata
+    /// always fits).
     field_metadata: []const FieldMetadata = &.{},
     /// The file footer's `custom_metadata` (`writeFile` only; a stream has no footer).
     footer_metadata: []const KeyValue = &.{},
@@ -838,6 +839,8 @@ const RField = struct {
     index: schema.IntType = .{ .bits = 32, .signed = true },
     /// A view-typed field's ordinal among its message's view fields (`Chunk.variadic`).
     view: usize = 0,
+    /// A Map read as a list of its entries struct: the entries and their keys hold no null.
+    map: bool = false,
     children: []RField = &.{},
     dict: ?*RDict = null,
 };
@@ -1014,8 +1017,18 @@ const Reader = struct {
                 rf.width = std.math.cast(usize, w) orelse return error.Malformed;
                 rf.col.type = .binary;
             },
-            .list, .large_list, .fixed_size_list => {
+            .list, .large_list, .fixed_size_list, .map => {
                 if (f.children.len != 1) return error.Malformed;
+                if (f.type == .map) {
+                    // Schema.fbs: one child, a struct of the key and the value; neither the
+                    // entries field nor the key field may be nullable (Arrow C++ and arrow-rs
+                    // refuse the schema otherwise). Read as list<struct<key, value>> under the
+                    // file's own names; `keysSorted` is dropped.
+                    const e = f.children[0];
+                    if (e.type != .@"struct" or e.children.len != 2 or e.dictionary != null) return error.Malformed;
+                    if (e.nullable or e.children[0].nullable) return error.Malformed;
+                    rf.map = true;
+                }
                 switch (f.type) {
                     .fixed_size_list => |n| {
                         bufs = 1;
@@ -1025,7 +1038,7 @@ const Reader = struct {
                         rf.col.array_width = std.math.cast(u32, n) orelse return error.Malformed;
                     },
                     else => {
-                        rf.kind = if (f.type == .list) .list32 else .list64;
+                        rf.kind = if (f.type == .large_list) .list64 else .list32; // a Map has Int32 offsets
                         rf.col.type = .list;
                     },
                 }
@@ -1395,7 +1408,15 @@ const Reader = struct {
             .bool_ => try r.bools(rf, chunks, n, valid),
             .var32, .var64, .fsb => try r.text(rf, chunks, n, valid),
             .dict => try r.dictColumn(rf, chunks, n, valid),
-            .list32, .list64, .fsl => try r.list(rf, chunks, n, valid),
+            .list32, .list64, .fsl => blk: {
+                if (rf.map) for (chunks) |c| {
+                    // Map entries and keys must hold no null (Arrow C++ `MapArray::ValidateChildData`,
+                    // arrow-rs `MapArray::try_new`).
+                    const e = &rf.children[0];
+                    if (c.rb.nodes[e.node_ix].null_count != 0 or c.rb.nodes[e.children[0].node_ix].null_count != 0) return error.Malformed;
+                };
+                break :blk try r.list(rf, chunks, n, valid);
+            },
             .view => try r.viewColumn(rf, chunks, n, valid),
             .lview32, .lview64 => try r.listView(rf, chunks, n, valid),
             .ree => unreachable, // returned above
@@ -2185,16 +2206,28 @@ fn copyFieldMetadata(arena: Allocator, fields: []const schema.Field) Error![]con
     for (out, fields) |*o, f| o.* = .{
         .name = try arena.dupe(u8, f.name),
         .metadata = try copyKeyValues(arena, f.metadata),
-        .children = try copyFieldMetadata(arena, f.children),
+        .children = try copyFieldMetadata(arena, decodedChildren(f)),
     };
     return out;
+}
+
+/// The children a field's COLUMN has: a RunEndEncoded field reads as its values' column,
+/// so its children are the values field's (folded through nested run-end fields). The
+/// `run_ends` / `values` fields' own metadata is dropped, as Arrow C++'s IPC reader does
+/// (it rebuilds the type from the two children's types only), so the metadata a read
+/// reports has the frame column's shape and a write-back cannot misplace it.
+fn decodedChildren(f: schema.Field) []const schema.Field {
+    var g = f;
+    while (g.type == .run_end_encoded and g.children.len == 2) g = g.children[1];
+    return g.children;
 }
 
 /// Reads an Arrow IPC stream into a frame allocated from `arena` (free it all with the
 /// arena; nothing borrows `bytes`). Dictionary deltas are appended; ZSTD body compression
 /// is read. A dictionary REPLACED mid-stream, LZ4_FRAME body compression, a metadata
-/// version before V4, and the types `dataframe` has no column for (Interval, Union, Map,
-/// the view types) are `error.Unsupported`.
+/// version before V4, and the types `dataframe` has no column for (Interval, Union) are
+/// `error.Unsupported`. A Map reads as a list of its entries struct (the map tag is not
+/// kept), a run-end encoded column as its values' column.
 pub fn readStream(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!df.Frame {
     var r: Reader = .{ .a = arena, .opts = opts };
     var pos: usize = 0;

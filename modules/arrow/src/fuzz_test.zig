@@ -16,7 +16,7 @@
 //!
 //! Inputs are also read with one column projected (`ReadOptions.columns`) and with the
 //! key/value metadata asked for; the golden inputs for Decimal32/256, RunEndEncoded,
-//! the view types and custom metadata carry a reach label each.
+//! the view types, Map and custom metadata carry a reach label each.
 //!
 //! Driver: `ARROW_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_MS`,
 //! `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there). Harness name: `read`.
@@ -49,11 +49,12 @@ const golden = [_][]const u8{
     @embedFile("testdata/cpp-21.0.0/generated_run_end_encoded.arrow_file"),
     @embedFile("testdata/cpp-21.0.0/generated_binary_view.stream"),
     @embedFile("testdata/cpp-21.0.0/generated_list_view.stream"),
+    @embedFile("testdata/1.0.0-littleendian/generated_map.arrow_file"),
 };
 
 /// Reach labels for the golden inputs that exercise one decoder each (a frame read from
 /// one, damaged or not, reached that decoder).
-const golden_label = [golden.len]?[]const u8{ null, null, null, null, null, null, null, null, null, null, null, "key/value metadata", "Decimal32", "Decimal256", "RunEndEncoded", "BinaryView/Utf8View", "ListView/LargeListView" };
+const golden_label = [golden.len]?[]const u8{ null, null, null, null, null, null, null, null, null, null, null, "key/value metadata", "Decimal32", "Decimal256", "RunEndEncoded", "BinaryView/Utf8View", "ListView/LargeListView", "Map" };
 
 fn hitSource(pick: usize) void {
     inline for (golden_label, 0..) |l, i| {
