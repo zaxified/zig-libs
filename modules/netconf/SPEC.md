@@ -6,7 +6,7 @@
 
 **Scope:** core — ncclient 0.7.1 (client) and libnetconf2 4.4 (C, client+server) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (83/86, 3 eq) · src f2ee8ae9c7cdf09a
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (84/87, 3 eq) · src f2ee8ae9c7cdf09a
 
 **Hardening:** fuzz 2026-10-10 (`netconf-wire` 200,000-run budget clean; `netconf-client` at `.scale` 2 = 100,000 runs — a whole session whose peer bytes are tampered at one read; NETCONF_FUZZ; the hello and framer harnesses are unchanged) · ct n/a — the SSH password is handed straight to `ssh.userauth`; framing/RPC carry no key, MAC or compare (review, 2026-10-10)
 
@@ -375,7 +375,7 @@ without the one-node shortcut (the join of one node, trimmed, is the shortcut's 
 reach them; the filter's bytes are pinned by `schemas_filter selects /netconf-state/schemas`) and the
 `data_element orelse` in `parseSchemaList` (`expectData` has already returned for a reply with no `<data>`, and
 `data` and `data_element` are set together in `parseReply`, so it is unreachable). The card's counts are
-cumulative; no earlier mutation run existed. Hand list for the later `<data>` change in `parseReply` (6 conditions, by reasoning and one added test, all killed): the monitoring-namespace compare and the `data` compare each forced true (killed by the new test with a foreign-namespace `<data>` and a monitoring `<schemas>` next to one real `<data>`), the counter not incremented, `>1` as `>2` and as `>0` and the monitoring term dropped from the sum (killed by the pair, mixed and single-monitoring cases). In `parseSchemaText` the `break` is now equivalent (at most one `<data>` can reach it).
+cumulative; no earlier mutation run existed. Delta mutation of the later `<data>` change in `parseReply` (2026-11-17, ReleaseSafe, one schemata build, 9 mutants, measured): the monitoring-namespace compare and the `data` compare each forced true, the counter skipped, the counter assigned `1` instead of incremented, `>1` as `>2`, the monitoring term dropped from the sum, the base `data_count` term dropped, and a single `<data>` of either namespace refused (`>0`): 8 killed. The ninth, the `break` in `parseSchemaText`, survives and is EQUIVALENT: at most one `<data>` in the base or monitoring namespace can reach that loop (a second is `AmbiguousReply` in `parseReply`; a foreign-namespace `<data>` fails the namespace test), so "first wins" and "last wins" agree. Cumulative: 84 killed + 3 equivalent = 87 (the earlier run's `break` kill was against the code before the change and now counts as equivalent).
 
 ## Provenance
 
