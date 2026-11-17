@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — Whole-module mutation of `src/ecvrf.zig` and `src/burn.zig` (114 mutants, 88 killed, 26 EQUIVALENT/UNOBSERVABLE; card now carries whole-module counts). 1 test added (a low-order Gamma answers `InvalidProof`). No source change, no behaviour change.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Ported to Zig 0.17.0. Test only: std 0.17 `Edwards25519.fromBytes` itself now rejects x = 0 with the sign bit set, so the kat_test control expects rejection; `decodeProof` result unchanged.
 
 - **2026-10-10** — tests: deterministic fuzz driver `ECVRF_FUZZ` (testkit) over `decodeProof` (accepted proofs re-encode canonically), `verify` on damaged key/proof pairs, and prove/verify (genuine proof accepted and hashes agree; a flipped bit, another alpha or another key refused). No change to the library code.
