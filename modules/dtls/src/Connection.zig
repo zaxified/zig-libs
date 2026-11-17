@@ -1715,19 +1715,6 @@ pub const Connection = struct {
     last_flight: [max_flight_bytes]u8 = undefined,
     last_flight_len: usize = 0,
     retransmit_timer: flight.RetransmitTimer = flight.RetransmitTimer.init(1000, 60_000),
-    /// RFC 9147 §7 flight bookkeeping (`flight.FlightTracker`) for the
-    /// records of the flight currently awaiting acknowledgement.
-    /// Acknowledgement here is IMPLICIT (receipt of the peer's next
-    /// expected flight clears it), matching RFC 9147 §7's own framing of
-    /// ACKs as needed only when a peer would otherwise have no way to
-    /// infer receipt — not required on this engine's synchronous
-    /// request/immediate-response happy path.
-    /// Sized for the largest flight this engine ever sends: PSK-only is 3
-    /// (ServerHello, EncryptedExtensions, Finished) or 1 (client Finished);
-    /// certificate mode adds up to 3 more (CertificateRequest, Certificate,
-    /// CertificateVerify) — 8 covers the server's worst case with headroom.
-    pending_flight_buf: [8]flight.RecordNumber = undefined,
-    pending_flight_count: usize = 0,
 
     // ── incoming-flight accumulation (RFC 9147 §5.2 reassembly) ─────────
     /// Datagrams received for the flight currently being consumed,
@@ -1839,9 +1826,7 @@ pub const Connection = struct {
         const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.client_hello), self.message_seq, ch_body, &frag_buf);
         self.message_seq +%= 1;
 
-        const ch_seq = self.hs0.send_seq;
         const record_bytes = try self.writeEpoch0Record(fragment, out);
-        self.markFlightSent(&.{.{ .epoch = 0, .sequence_number = ch_seq }});
         try self.cacheFlight(record_bytes, now_ms);
 
         self.state = .wait_server_hello;
@@ -3150,24 +3135,6 @@ pub const Connection = struct {
         }
     }
 
-    /// RFC 9147 §7 flight bookkeeping: records the given (epoch, seq) pairs
-    /// as "sent, awaiting acknowledgement" via `flight.FlightTracker`,
-    /// reusing `pending_flight_buf` as that tracker's backing storage (a
-    /// fresh `FlightTracker` is constructed each call rather than stored,
-    /// since it holds a slice that would dangle across a `Connection` move
-    /// — see the field's doc comment).
-    fn markFlightSent(self: *Connection, records: []const flight.RecordNumber) void {
-        var t = flight.FlightTracker.init(&self.pending_flight_buf);
-        for (records) |rn| t.markSent(rn) catch break; // never overflows: <= 3 records/flight here
-        self.pending_flight_count = t.count;
-    }
-
-    /// Marks the whole outstanding flight as acknowledged — called when the
-    /// peer's next expected flight arrives (implicit ACK-by-progression).
-    fn clearFlightTracker(self: *Connection) void {
-        self.pending_flight_count = 0;
-    }
-
     /// Caches `bytes` as the last flight WE sent (for `poll` to retransmit)
     /// and (re)arms `retransmit_timer` from `now_ms`.
     fn cacheFlight(self: *Connection, bytes: []const u8, now_ms: u64) HandshakeError!void {
@@ -3895,7 +3862,6 @@ pub const Connection = struct {
         var sh_frag_buf: [max_server_hello_body + handshake.header_len]u8 = undefined;
         const sh_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.server_hello), self.message_seq, sh_body, &sh_frag_buf);
         self.message_seq +%= 1;
-        const sh_seq = self.hs0.send_seq;
         var cursor: usize = 0;
         {
             const sh_record = try self.writeEpoch0Record(sh_fragment, out[cursor..]);
@@ -3929,7 +3895,6 @@ pub const Connection = struct {
         var ee_frag_buf: [ee_body_cap + handshake.header_len]u8 = undefined;
         const ee_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.encrypted_extensions), self.message_seq, ee_body, &ee_frag_buf);
         self.message_seq +%= 1;
-        const ee_seq = self.hs2.send_seq;
         {
             const ee_record = try self.protectHandshakeMessage(ee_fragment, out[cursor..]);
             cursor += ee_record.len;
@@ -3940,8 +3905,6 @@ pub const Connection = struct {
         // above `handleFlightServer`. Zero records emitted when neither
         // `config.request_client_cert` nor `config.cert` is set, reproducing
         // the original PSK-only flight 2 exactly.
-        var extra_records: [3]flight.RecordNumber = undefined;
-        var extra_n: usize = 0;
 
         if (self.config.request_client_cert) {
             // RFC 8446 §4.3.2: CertificateRequest MUST carry a
@@ -3957,8 +3920,6 @@ pub const Connection = struct {
             var frag_buf: [max_certreq_body + handshake.header_len]u8 = undefined;
             const r = try self.sendEpoch2Message(.certificate_request, creq_body, &frag_buf, out[cursor..]);
             cursor += r.bytes.len;
-            extra_records[extra_n] = .{ .epoch = 2, .sequence_number = r.seq };
-            extra_n += 1;
         }
 
         if (self.config.cert) |cc| {
@@ -3967,8 +3928,6 @@ pub const Connection = struct {
             var frag_buf: [max_cert_message_body + handshake.header_len]u8 = undefined;
             const cert_r = try self.sendEpoch2Message(.certificate, cert_body, &frag_buf, out[cursor..]);
             cursor += cert_r.bytes.len;
-            extra_records[extra_n] = .{ .epoch = 2, .sequence_number = cert_r.seq };
-            extra_n += 1;
 
             // RFC 8446 §4.2.3 negotiation (see `selectSignatureScheme`): the
             // scheme this server signs with must be one the CLIENT actually
@@ -3978,8 +3937,6 @@ pub const Connection = struct {
             const scheme = try selectSignatureScheme(cc, self.config.signature_algorithms, client_sig_algs_buf[0..client_sig_algs_len]);
             const cv_r = try self.signAndSendCertificateVerify(cc, scheme, .server, entropy, out[cursor..]);
             cursor += cv_r.bytes.len;
-            extra_records[extra_n] = .{ .epoch = 2, .sequence_number = cv_r.seq };
-            extra_n += 1;
         }
 
         const th_before_finished = self.transcript.currentHash(alg, &th_buf);
@@ -3989,7 +3946,6 @@ pub const Connection = struct {
         var fin_frag_buf: [suitehash.max_hash_len + handshake.header_len]u8 = undefined;
         const fin_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.finished), self.message_seq, verify_data, &fin_frag_buf);
         self.message_seq +%= 1;
-        const fin_seq = self.hs2.send_seq;
         {
             const fin_record = try self.protectHandshakeMessage(fin_fragment, out[cursor..]);
             cursor += fin_record.len;
@@ -4000,19 +3956,6 @@ pub const Connection = struct {
         const th_through_server_finished = self.transcript.currentHash(alg, &th_buf);
         suitehash.deriveApplicationSecrets(alg, &self.pending_ap_client, &self.pending_ap_server, &self.exporter_master, &ms, th_through_server_finished);
 
-        var all_records: [6]flight.RecordNumber = undefined;
-        var n: usize = 0;
-        all_records[n] = .{ .epoch = 0, .sequence_number = sh_seq };
-        n += 1;
-        all_records[n] = .{ .epoch = 2, .sequence_number = ee_seq };
-        n += 1;
-        for (extra_records[0..extra_n]) |r| {
-            all_records[n] = r;
-            n += 1;
-        }
-        all_records[n] = .{ .epoch = 2, .sequence_number = fin_seq };
-        n += 1;
-        self.markFlightSent(all_records[0..n]);
         try self.cacheFlight(out[0..cursor], now_ms);
         self.state = .wait_finished;
         return .{ .out = out[0..cursor], .done = false };
@@ -4052,7 +3995,6 @@ pub const Connection = struct {
         self.transcript.append(@backingInt(messages.HandshakeType.finished), fin.verify_data);
 
         try self.installApplicationSecrets(self.suite, self.pending_ap_client[0..alg.len()], self.pending_ap_server[0..alg.len()]);
-        self.clearFlightTracker();
         self.retransmit_timer.reset();
         self.last_flight_len = 0;
 
@@ -4202,10 +4144,7 @@ pub const Connection = struct {
         const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.client_hello), self.message_seq, ch_body, &frag_buf);
         self.message_seq +%= 1;
 
-        const ch_seq = self.hs0.send_seq;
         const record_bytes = try self.writeEpoch0Record(fragment, out);
-        self.clearFlightTracker();
-        self.markFlightSent(&.{.{ .epoch = 0, .sequence_number = ch_seq }});
         try self.cacheFlight(record_bytes, now_ms);
 
         // Still waiting for a ServerHello — just for the real one this time.
@@ -4279,7 +4218,6 @@ pub const Connection = struct {
 
         self.transcript.select(alg);
         self.transcript.append(@backingInt(messages.HandshakeType.server_hello), sh_parsed.body);
-        self.clearFlightTracker(); // the ClientHello flight is now implicitly ACKed
         self.retransmit_timer.reset();
 
         // Handshake secret: PSK path (`null` DHE) unchanged; cert-DHE path
@@ -4377,8 +4315,6 @@ pub const Connection = struct {
         // Must be sent — and appended to the transcript — BEFORE the
         // client's Finished, whose verify_data covers them.
         var cursor: usize = 0;
-        var extra_records: [2]flight.RecordNumber = undefined;
-        var extra_n: usize = 0;
 
         if (cert_result.requested_client_cert) {
             const ctx = cert_result.creq_context[0..cert_result.creq_context_len];
@@ -4389,8 +4325,6 @@ pub const Connection = struct {
                 const body = messages.encodeCertificate(ctx, cc.chain, &cert_body_buf) catch return error.BufferTooShort;
                 const r = try self.sendEpoch2Message(.certificate, body, &frag_buf, out[cursor..]);
                 cursor += r.bytes.len;
-                extra_records[extra_n] = .{ .epoch = 2, .sequence_number = r.seq };
-                extra_n += 1;
 
                 // RFC 8446 §4.2.3 negotiation: the scheme this client signs
                 // with must be one the SERVER advertised in its
@@ -4400,16 +4334,12 @@ pub const Connection = struct {
                 const scheme = try selectSignatureScheme(cc, self.config.signature_algorithms, cert_result.peerSigAlgs());
                 const cv_r = try self.signAndSendCertificateVerify(cc, scheme, .client, entropy, out[cursor..]);
                 cursor += cv_r.bytes.len;
-                extra_records[extra_n] = .{ .epoch = 2, .sequence_number = cv_r.seq };
-                extra_n += 1;
             } else {
                 // RFC 8446 §4.4.2: no suitable certificate -> an EMPTY
                 // Certificate message, no CertificateVerify.
                 const body = messages.encodeCertificate(ctx, &.{}, &cert_body_buf) catch return error.BufferTooShort;
                 const r = try self.sendEpoch2Message(.certificate, body, &frag_buf, out[cursor..]);
                 cursor += r.bytes.len;
-                extra_records[extra_n] = .{ .epoch = 2, .sequence_number = r.seq };
-                extra_n += 1;
             }
         }
 
@@ -4421,19 +4351,8 @@ pub const Connection = struct {
         var fin_frag_buf: [suitehash.max_hash_len + handshake.header_len]u8 = undefined;
         const client_fin_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.finished), self.message_seq, client_vd, &fin_frag_buf);
         self.message_seq +%= 1;
-        const client_fin_seq = self.hs2.send_seq;
         const client_fin_record = try self.protectHandshakeMessage(client_fin_fragment, out[cursor..]);
         cursor += client_fin_record.len;
-
-        var all_records: [3]flight.RecordNumber = undefined;
-        var n: usize = 0;
-        for (extra_records[0..extra_n]) |r| {
-            all_records[n] = r;
-            n += 1;
-        }
-        all_records[n] = .{ .epoch = 2, .sequence_number = client_fin_seq };
-        n += 1;
-        self.markFlightSent(all_records[0..n]);
 
         try self.installApplicationSecrets(suite, ap.client[0..alg.len()], ap.server[0..alg.len()]);
         // `now_ms` is used only on the HelloRetryRequest path above (arming
@@ -6355,7 +6274,6 @@ test "HRR server: the cookie exchange completes — and the connection that answ
     // amplification one.
     try testing.expectEqual(State.start, server1.state);
     try testing.expectEqual(@as(usize, 0), server1.last_flight_len);
-    try testing.expectEqual(@as(usize, 0), server1.pending_flight_count);
     var empty_th: Secret = undefined;
     var server1_th: Secret = undefined;
     try testing.expectEqualSlices(u8, (suitehash.Transcript{}).currentHash(.sha256, &empty_th), server1.transcript.currentHash(.sha256, &server1_th));
