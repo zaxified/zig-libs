@@ -980,3 +980,7 @@ test "corpus: every base58 seed reaches the decoder, and the counts are pinned" 
     try testing.expectEqual(@as(usize, 56), payload_octets);
     try testing.expectEqual(@as(usize, 2), check_decoded);
 }
+
+test "ct base58: isZeroBit is exactly 1 for 0 and 0 for every other byte" {
+    for (0..256) |b| try testing.expectEqual(@as(usize, if (b == 0) 1 else 0), isZeroBit(@intCast(b)));
+}
