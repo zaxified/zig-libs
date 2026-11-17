@@ -711,7 +711,6 @@ pub const XxResponder = struct {
         const got = self.hs.rs orelse unreachable; // XX's msg3 always carries `s`
         if (!std.crypto.timing_safe.eql(PublicKey, got, self.expected_initiator)) {
             std.crypto.secureZero(u8, payload_out[0..step.len]);
-            std.crypto.secureZero(u8, std.mem.asBytes(&pair));
             wipeHs(&self.hs);
             self.state = .failed;
             return error.UnknownInitiator;
@@ -1753,6 +1752,16 @@ test "XX mode: out-of-order calls are WrongState" {
     try testing.expectError(error.WrongState, rsp.writeMessage2(prng.random(), "", &buf));
     _ = try ini.readMessage2(m2[0..n2], &pl, &learned);
     try testing.expectError(error.WrongState, ini.readMessage2(m2[0..n2], &pl, &learned));
+    var m3: [256]u8 = undefined;
+    const n3 = try ini.writeMessage3(prng.random(), "", m3[0..xxMessage3Len(0)], &keys);
+    _ = try rsp.readMessage3(m3[0..n3], &pl, &keys);
+    // Done: every call on either side is refused by the state machine itself.
+    try testing.expectError(error.WrongState, ini.writeMessage1(prng.random(), "", &buf));
+    try testing.expectError(error.WrongState, ini.readMessage2(m2[0..n2], &pl, &learned));
+    try testing.expectError(error.WrongState, ini.writeMessage3(prng.random(), "", &buf, &keys));
+    try testing.expectError(error.WrongState, rsp.readMessage1(buf[0..n1], &pl));
+    try testing.expectError(error.WrongState, rsp.writeMessage2(prng.random(), "", &buf));
+    try testing.expectError(error.WrongState, rsp.readMessage3(m3[0..n3], &pl, &keys));
 }
 
 test "XX mode: wipe clears the static and ephemeral secrets and the chaining key mid-handshake" {

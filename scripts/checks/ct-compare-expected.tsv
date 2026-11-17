@@ -67,7 +67,8 @@ modules/sphinx/src/failure.zig	1
 modules/ssh/src/stackprobe2_test.zig	1
 modules/ssh/src/transport.zig	4
 modules/stun/src/root.zig	2
-modules/tenantkex/src/root.zig	1
+# tenantkex 2026-11-17: +1 constant-time (XxResponder.readMessage3's provisioned initiator key check, the XX twin of readMessage1's).
+modules/tenantkex/src/root.zig	2
 modules/tlock/src/age.zig	1
 # tls13 certverify 2026-10-21: the second plain compare is a test's (a hedged ML-DSA signature differs from the deterministic one) -- public.
 # tls13 certverify 2026-11-01: +1 constant-time (Ed25519Signer's once-at-load key check, :274), +1 plain (identity encoding of R, a published signature component, :879).

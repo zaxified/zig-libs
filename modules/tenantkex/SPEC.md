@@ -6,9 +6,9 @@
 
 **Scope:** core — snow / WireGuard `Noise_IK` (no reference for a per-tenant prologue-bound IK driver) (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation 2026-10-05 (18/18) · src ?
+**Audit:** review 2026-08-06 · mutation 2026-11-17 (44/44) · src c30788182921b275
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget, clean at `.scale` 2 = 100,000 runs — a run is a whole handshake, TENANTKEX_FUZZ) · ct 2026-10-10 (ctgrind: Noise_IK both PEs, static private keys + ephemerals tainted; 9 in-file = std X25519 identity checks, AEAD verdicts and the pinned-static verdict, none a tenantkex branch on a key)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget, clean at `.scale` 2 = 100,000 runs — a run is a whole handshake, TENANTKEX_FUZZ) · ct 2026-10-10 (ctgrind: Noise_IK both PEs, static private keys + ephemerals tainted; 9 in-file = std X25519 identity checks, AEAD verdicts and the pinned-static verdict, none a tenantkex branch on a key; Noise_XX row `xx` 2026-11-17, 9 in-file, the same classes)
 **Performance:** not measured
 
 **Evidence:** model — byte-exact comparison with raw Noise_IK as oracle; fuzz is never-panic only
@@ -238,7 +238,8 @@ msg3:  -> s, se                [+ payload]               64 + payload
   with its key visible.
 * **Initiator → responder** stays as in IK: `XxResponder` accepts exactly the
   provisioned key of `ctx.initiator_pe` and refuses any other at msg3 with
-  `UnknownInitiator` — payload zeroed, transport pair zeroed, handshake wiped,
+  `UnknownInitiator` — payload zeroed, handshake wiped (the transport pair `Split()` already
+  produced dies in the burned body frame, as on every path),
   no keys written, no further calls.
 * **Binding.** The same `(I-SID, PE pair)` fields follow the label; msg1 is
   not authenticated, so a mismatch fails at msg2 (`DecryptionFailed`).
@@ -250,6 +251,19 @@ msg3:  -> s, se                [+ payload]               64 + payload
   `Noise_XX_25519_ChaChaPoly_SHA256` vector, whose prologue is not tenantkex's.
 * **Constant time:** ctgrind row `xx` (both statics and every ephemeral
   tainted).
+
+### Mutation run 2026-11-17 (XX mode, delta)
+
+Schemata over a detached copy (one ReleaseSafe build, the kit's `run.sh`): **27 mutants on the
+XX code, 26 killed, 1 survivor resolved by deleting its line.** Points: the XX prologue label,
+the three length helpers, every state guard and state assignment of both XX types, the learned
+responder key write, both `fillKeys` orientations, the provisioned initiator key, the msg3
+initiator check, the refusal's payload wipe, handshake wipe and failed state, and both `wipe`s.
+Not mutated: the `step.complete` guards (true for `XX` by its token table, unobservable without
+changing `noise`, as for IK) and `initialize`'s comptime pattern/role. Survivor: zeroing the
+`Split()` pair on the `UnknownInitiator` path — a local of the body frame that `burn.run`
+zeroes anyway, so the line was redundant and is gone (no other path zeroed it). One test was
+added before the run (every call refused once both XX sides are done). Card: 18 + 26 = 44/44.
 
 ## Secret residue on the dead stack
 
