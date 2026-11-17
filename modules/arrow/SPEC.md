@@ -6,9 +6,9 @@
 
 **Scope:** core — Apache Arrow C++ / pyarrow (apache/arrow 26.0.1; arrow-rs `arrow-ipc` 60.1.0 as the closest-shaped permissive one) (surveyed 2026-11-17)
 
-**Audit:** review 2026-11-17 · mutation 2026-11-17 (391/423, 29 eq) · src 3268ef43dafdc7ee
+**Audit:** review 2026-11-17 · mutation 2026-11-17 (410/442, 29 eq) · src c367d11d392c3f57
 
-**Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; again after the metadata / projection / Decimal32-256 / RunEndEncoded / view-type wave: 200k seeds in 24 s ReleaseSafe, clean; reach: frames, files, batches, every error kind incl. InvalidUtf8 and UnknownColumn, frames from compressed inputs, projected frames, metadata reads, frames from the custom_metadata, Decimal32, Decimal256, RunEndEncoded, BinaryView/Utf8View and ListView goldens; resource shapes the driver cannot make are in `src/hostile_test.zig`) · ct n/a — parses and writes data files, holds no secret
+**Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; again after the metadata / projection / Decimal32-256 / RunEndEncoded / view-type wave: 200k seeds in 24 s ReleaseSafe, clean; again after Map on read and the run-end metadata fold: 200k seeds in 35 s ReleaseSafe, clean, the Map golden reached; reach: frames, files, batches, every error kind incl. InvalidUtf8 and UnknownColumn, frames from compressed inputs, projected frames, metadata reads, frames from the custom_metadata, Decimal32, Decimal256, RunEndEncoded, BinaryView/Utf8View, ListView and Map goldens; resource shapes the driver cannot make are in `src/hostile_test.zig`) · ct n/a — parses and writes data files, holds no secret
 
 **Performance:** not measured
 
@@ -407,6 +407,15 @@ appending, and no picked column reads it; cost-only); the Decimal256 precision c
 precision ≤ 38 the decimal path repeats `|x| < 10^p`; past 38 a value of 10^p or more has over 38 digits, which
 the i128 cast or the 38-digit check drops the same way); the all-null ListView branch (without it `afford`
 refuses the same `total` before the selectors are allocated and `gather` charges it; cost-only). No finding.
+
+**Audit 2026-11-17 (delta mutation, Map on read and run-end metadata).** Base `7ef45b844`. 19 schemata mutants over
+the non-test code the change touched: `schema.zig` the Map type id both ways, `keysSorted` decoded, defaulted
+and encoded (4); in the reader's `plan` the Map branch — the branch taken, the entries' type, field count,
+dictionary and nullability, the key's nullability, the flag, the offset width (8); `decode`'s Map null checks
+— taken, the entries' count, the key's count, the key's node (4); the metadata fold — dropped, one level only,
+the other child (3). Same method as above, one ReleaseSafe build per run. First run 14 killed / 5 survived;
+new tests kill all 5 (`keysSorted` through a schema round trip and its default without a type table; entries of
+an Int type with two children and a struct of three fields). Second run 19/19. No equivalent, no finding.
 
 ## What is deliberately not done
 
