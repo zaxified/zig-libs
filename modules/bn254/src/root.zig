@@ -58,6 +58,7 @@ pub const gate = @import("gate.zig");
 pub const pairing = @import("pairing.zig");
 pub const precompiles = @import("precompiles.zig");
 pub const groth16 = @import("groth16.zig");
+pub const msm = @import("msm.zig");
 
 pub const Fp = fp.Fp;
 pub const Fp2 = fp2.Fp2;
@@ -121,6 +122,7 @@ test {
     _ = pairing;
     _ = precompiles;
     _ = groth16;
+    _ = msm;
     _ = @import("fuzz_test.zig");
 }
 

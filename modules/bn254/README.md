@@ -119,6 +119,14 @@ const proof: bn254.Groth16Proof = .{ .a = a, .b = b, .c = c };
 const valid = try bn254.groth16Verify(vk, proof, public_inputs); // bool
 ```
 
+Multi-scalar multiplication (2026-11-17; **public data only**: variable-time,
+the bucket a point lands in depends on the scalar's digits):
+
+```zig
+const sum = try bn254.msm.g1Msm(allocator, points, scalars); // sum_i scalars[i] * points[i], a G1 Jacobian
+const sum2 = try bn254.msm.g2Msm(allocator, points2, scalars); // error.LengthMismatch if the slices differ
+```
+
 Compressed points (2026-11-16): `g1.toBytesCompressed`/`fromBytesCompressed`
 (32 bytes) and `g2.…` (64 bytes), gnark-crypto's convention (big-endian `x`,
 flag bits `0b10`/`0b11`/`0b01` = smaller `y`/larger `y`/infinity on top of byte
@@ -145,6 +153,7 @@ comments.
 | `pairing.zig` | Part 4: `Gt`/`PairingPair`, the pairing (`pairing`/`multiMillerLoop`/`pairingCheck`), and the `millerLoop` (`6x+2` walk + BN Frobenius tail) / `finalExponentiation` (easy + BN hard-part) cores |
 | `precompiles.zig` | Part 5: EVM precompile entry points `ecAdd`/`ecMul`/`ecPairing` (EIP-196/197 calldata padding/truncation, point decode, group op, re-encode) — pure composition over Parts 1-4 |
 | `groth16.zig` | Part 6: Groth16 zk-SNARK verifier — `VerifyingKey`/`Proof`/`verify` (`G1` multi-scalar accumulation + one `pairingCheck`) — pure composition over Parts 1-4 |
+| `msm.zig` | Pippenger multi-scalar multiplication for `G1`/`G2` (`g1Msm`/`g2Msm`/`msm(G, ..)`; public data only, variable-time) — same shape as `bls12_381`'s |
 | `root.zig` | Module entry: `meta`, re-exports, dark-tests aggregator |
 
 ## Verify

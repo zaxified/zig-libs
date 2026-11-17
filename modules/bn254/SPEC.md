@@ -908,6 +908,32 @@ does it (`groth16/src/burn.zig`, stack probe). Checked with `rg -n 'pub fn'
 modules/bn254/src` — no function takes or returns a key, nonce, or witness by name or
 role.
 
+## Multi-scalar multiplication (`msm.zig`, 2026-11-17)
+
+`msm(G, allocator, points, scalars)` (and `g1Msm`/`g2Msm`) computes `sum_i scalars[i] * points[i]` by Pippenger's bucket method: each
+scalar is cut into `c`-bit windows (`c` from 2 for n < 4 up to 8 from n = 4096), points go into the bucket of their digit, the buckets are
+summed with the running-sum trick, windows are folded high to low with `c` doublings. 254 bits of window (`Fr` is below 2^254). Empty input is the
+identity, identity points and zero scalars drop out, `points.len != scalars.len` is `error.LengthMismatch`. `addVartime` and
+`mixedAddVartime` (EFD `add-2007-bl`, `madd-2007-bl` with the degenerate cases branched on) are public too.
+
+**Public data only, variable-time.** The additions branch on `P == Q`, `P == -Q`, identity, and the bucket index depends on the scalar digits, so time and
+memory access reveal the scalars; no buffer is wiped. Secret scalars: `Jacobian.scalarMul` (constant-time). The `groth16` module's
+prover MSM (secret witness) keeps its own wiping copy of the bucket loop and now only borrows these two additions.
+
+**Reference (owner rule 2026-11-17).** The module's reference for the API is the sibling `bls12_381` (`msm.zig`, same names and error set), the algorithm is
+the one gnark-crypto (`G1Jac.MultiExp`) and arkworks (`VariableBaseMSM::msm`) use. Those two were not read for the window rule; the
+window widths are `bls12_381`'s, not tuned for BN254 (any `c` in 1..16 gives the same sum, so they only move the cost).
+
+**Tests** (`msm.zig`): equality with the constant-time naive sum (`Jacobian.scalarMul` + `add`, no shared code with the Pippenger path) in `G1` and `G2` for
+n = 1, 3, 8, 21, 70 with every 7th input degenerate (identity point, zero scalar, scalar one, repeated point, point and its negation under equal scalars); n = 300 in
+`G1`; n = 1100 and 4100 (windows 7 and 8) on one repeated base against `(sum of scalars) * base`; the largest scalar `r - 1` gives `-P`, cancels against 1,
+and the scalar 2^253 (top window); empty input, length mismatch, all-zero scalars; `addVartime`/`mixedAddVartime` against the constant-time `add` on every degenerate class (`G2`).
+
+**Delta mutation 2026-11-17** (39 mutants over `msm.zig`, one schemata build, ReleaseSafe): 36 killed, 3 equivalent: `points.len == 0` early return dropped
+(the general path also yields the identity), `w != n_windows - 1` guard made always true (doubling the identity), `if (!any) continue` dropped (adding identity buckets,
+cost-only). The window thresholds in `windowBits` are not mutated (cost-only, see above). **The card has no whole-module mutation count, so these numbers are not written
+onto it: the module needs a whole-module mutation run** (the 2026-09-03 audit's counts were never recorded on the card).
+
 ## Backlog
 
 - ✅ **DONE 2026-11-16 (`Fr.randomInto`, the drawn bytes wiped):** **`Fr.randomInto(out: *Fr, io)`** *(sweep 2026-10-09)*: `Fr.random` returns the
@@ -944,7 +970,7 @@ role.
   part adds hash-to-`G2`.
 
 - ✅ DONE 2026-11-16 (`g1`/`g2` `toBytesCompressed`/`fromBytesCompressed`, gnark-crypto convention only: big-endian `x`, top two bits of byte 0 are flags `0b10` smallest `y` / `0b11` largest `y` / `0b01` infinity; G2 `x = A1 || A0`, 64 bytes, subgroup-checked on decode; arkworks' little-endian convention is NOT offered; decode refuses wrong length/flags, stray infinity bytes, `x >= p`, no-curve `x`, off-subgroup G2; G1 generator pinned by hand to `0x80 .. 01`; G2 byte order follows gnark's documented `A1 || A0` and this module's own `Fp2` order, no gnark output was available offline to pin it) **Compressed G1/G2 serialization** (the gnark/arkworks convention) *(survey 2026-09-30)*: `g1.zig` header says there is deliberately none because EIP-196/197 define none; users exchanging keys with gnark or arkworks tooling need it. Effort: small (sign/flag bits + `sqrt`, `Fp`/`Fp2.sqrt` exist). Fits §2; the wire choice (which convention) needs a decision.
-- **Public multi-scalar multiplication (Pippenger) for G1/G2** *(survey 2026-09-30)*: `groth16.zig` has a private naive `msm` for a handful of public inputs; gnark-crypto/arkworks expose one. Sibling `bls12_381` already has `kzg.g1Msm`, the algorithm exists in-repo. Effort: small. Fits §2.
+- ✅ DONE 2026-11-17 (`msm.zig`: `g1Msm`/`g2Msm`/`msm(G, ..)`, `addVartime`/`mixedAddVartime`, shape and names of `bls12_381`'s; see "Multi-scalar multiplication") **Public multi-scalar multiplication (Pippenger) for G1/G2** *(survey 2026-09-30)*: gnark-crypto/arkworks expose one. The Groth16 verifier's own `msm` (a handful of public inputs, no allocator) is unchanged.
 
 ## Anchoring
 

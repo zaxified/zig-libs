@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** `msm.pippengerG1`/`pippengerG2` use `bn254.msm.addVartime`/`mixedAddVartime` (public in `bn254` since today) instead of a private copy of the same two formulas; the bucket loop, its wipes and the small-MSM path are unchanged. `ctgrind --check groth16`: counts unchanged (`zkprove_ct` 6 in-file, `zkprove_vt` 54 against the `>=10` pin), source digests re-pinned.
+
 - **2026-11-16** — New `snarkjs_import`: `parseProof`, `parseVerifyingKey` (+ `freeVerifyingKey`) and `parsePublic` read snarkjs's `proof.json`, `verification_key.json` and `public.json` (the shape `snarkjs_export` writes). Refuses wrong protocol/curve, non-canonical numbers, off-curve points and `G2` points outside the subgroup, all as errors. Additive.
 - **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** fuzz verdict recorded for the file readers (`zkey`, `wtns`, `r1cs`, `ptau` on damaged real snarkjs/circom files): 200,000 runs of `GROTH16_FUZZ` clean in ReleaseSafe, every accepted-kind and error label reached; new in-suite reach test (300 seeds, `HarnessDoesNotReach`). Proof/verifying-key verification lives in `bn254` (its own harness).
 

@@ -49,61 +49,17 @@ pub fn msmG2(bases: []const G2.Affine, scalars: []const Fr) G2.Jacobian {
 // `msmG1`/`msmG2` above (constant-time `scalarMul` per term) stay as the
 // reference this path is tested against.
 
-/// Variable-time group operations over Jacobian coordinates, generic in the
-/// coordinate field (`Fp` for G1, `Fp2` for G2). Both curves have `a = 0`.
-fn VtOps(comptime J: type, comptime A: type) type {
+/// The variable-time group operations are `bn254.msm`'s (`addVartime`,
+/// `mixedAddVartime`: public in `bn254` since 2026-11-17, they were a private
+/// copy here). Both curves have `a = 0`.
+fn VtOps(comptime G: type) type {
     return struct {
-        /// madd-2007-bl (EFD shortw/jacobian-0), with the degenerate cases
-        /// branched on instead of selected.
-        fn addMixed(p: J, q: A) J {
-            if (q.infinity) return p;
-            if (p.isIdentity()) return J.fromAffine(q);
-            const z1z1 = p.z.square();
-            const qx_z = q.x.mul(z1z1);
-            const s2 = q.y.mul(p.z).mul(z1z1);
-            const h = qx_z.sub(p.x);
-            const s_diff = s2.sub(p.y);
-            if (h.isZero()) {
-                if (s_diff.isZero()) return p.double();
-                return J.identity;
-            }
-            const hh = h.square();
-            const i = hh.add(hh).add(hh.add(hh));
-            const j = h.mul(i);
-            const rr = s_diff.add(s_diff);
-            const v = p.x.mul(i);
-            const x3 = rr.square().sub(j).sub(v.add(v));
-            const y1j = p.y.mul(j);
-            const y3 = rr.mul(v.sub(x3)).sub(y1j.add(y1j));
-            const z3 = p.z.add(h).square().sub(z1z1).sub(hh);
-            return .{ .x = x3, .y = y3, .z = z3 };
+        fn addMixed(p: G.Jacobian, q: G.Affine) G.Jacobian {
+            return bn254.msm.mixedAddVartime(G, p, q);
         }
 
-        /// add-2007-bl, degenerate cases branched.
-        fn add(a: J, b: J) J {
-            if (a.isIdentity()) return b;
-            if (b.isIdentity()) return a;
-            const z1z1 = a.z.square();
-            const z2z2 = b.z.square();
-            const ua = a.x.mul(z2z2);
-            const ub = b.x.mul(z1z1);
-            const s1 = a.y.mul(b.z).mul(z2z2);
-            const s2 = b.y.mul(a.z).mul(z1z1);
-            const h = ub.sub(ua);
-            const s_diff = s2.sub(s1);
-            if (h.isZero()) {
-                if (s_diff.isZero()) return a.double();
-                return J.identity;
-            }
-            const i = h.add(h).square();
-            const j = h.mul(i);
-            const rr = s_diff.add(s_diff);
-            const v = ua.mul(i);
-            const x3 = rr.square().sub(j).sub(v.add(v));
-            const s1j = s1.mul(j);
-            const y3 = rr.mul(v.sub(x3)).sub(s1j.add(s1j));
-            const z3 = a.z.add(b.z).square().sub(z1z1).sub(z2z2).mul(h);
-            return .{ .x = x3, .y = y3, .z = z3 };
+        fn add(a: G.Jacobian, b: G.Jacobian) G.Jacobian {
+            return bn254.msm.addVartime(G.Jacobian, a, b);
         }
     };
 }
@@ -132,8 +88,10 @@ fn digitAt(limbs: *const [4]u64, bit: usize, c: u5) usize {
 /// (measured: 10 000 such calls were most of `newZkey`'s time).
 const small_msm = 8;
 
-fn Pippenger(comptime J: type, comptime A: type) type {
-    const Ops = VtOps(J, A);
+fn Pippenger(comptime G: type) type {
+    const J = G.Jacobian;
+    const A = G.Affine;
+    const Ops = VtOps(G);
     return struct {
         fn small(bases: []const A, scalars: []const Fr) J {
             const minus_one = Fr.zero.sub(Fr.one);
@@ -220,12 +178,12 @@ fn Pippenger(comptime J: type, comptime A: type) type {
 /// `Σ scalarsᵢ · basesᵢ` in `G1` by Pippenger's bucket method — the prover's
 /// MSM. Variable-time in the scalars (see the section comment above).
 pub fn pippengerG1(allocator: std.mem.Allocator, bases: []const G1.Affine, scalars: []const Fr) std.mem.Allocator.Error!G1.Jacobian {
-    return Pippenger(G1.Jacobian, G1.Affine).run(allocator, bases, scalars);
+    return Pippenger(G1).run(allocator, bases, scalars);
 }
 
 /// `Σ scalarsᵢ · basesᵢ` in `G2` by Pippenger's bucket method.
 pub fn pippengerG2(allocator: std.mem.Allocator, bases: []const G2.Affine, scalars: []const Fr) std.mem.Allocator.Error!G2.Jacobian {
-    return Pippenger(G2.Jacobian, G2.Affine).run(allocator, bases, scalars);
+    return Pippenger(G2).run(allocator, bases, scalars);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
