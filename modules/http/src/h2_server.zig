@@ -2929,6 +2929,40 @@ fn streamRoutes(ctx: ?*anyopaque, preview: RequestPreview) bool {
     return std.mem.startsWith(u8, preview.path(), "/stream-");
 }
 
+/// In-memory `BodySpool` for the `/rewind` handlers (one request at a time).
+const RewindSpool = struct {
+    data: std.ArrayList(u8) = .empty,
+    opens: u32 = 0,
+
+    fn source(rs: *RewindSpool) Server.SpoolSource {
+        return .{ .ctx = rs, .open = open };
+    }
+    fn open(ctx: ?*anyopaque) error{ SpoolOpenFailed, OutOfMemory }!Server.BodySpool {
+        const rs: *RewindSpool = @ptrCast(@alignCast(ctx.?));
+        rs.opens += 1;
+        rs.data.clearRetainingCapacity();
+        return .{ .ctx = rs, .vtable = &vt };
+    }
+    const vt: Server.BodySpool.VTable = .{ .append = append, .readAt = readAt, .deinit = release };
+    fn append(ctx: *anyopaque, bytes: []const u8) error{SpoolWriteFailed}!void {
+        const rs: *RewindSpool = @ptrCast(@alignCast(ctx));
+        rs.data.appendSlice(testing.allocator, bytes) catch return error.SpoolWriteFailed;
+    }
+    fn readAt(ctx: *anyopaque, offset: u64, buf: []u8) error{SpoolReadFailed}!usize {
+        const rs: *RewindSpool = @ptrCast(@alignCast(ctx));
+        if (offset >= rs.data.items.len) return 0;
+        const o: usize = @intCast(offset);
+        const n = @min(buf.len, rs.data.items.len - o);
+        @memcpy(buf[0..n], rs.data.items[o..][0..n]);
+        return n;
+    }
+    fn release(ctx: *anyopaque) void {
+        const rs: *RewindSpool = @ptrCast(@alignCast(ctx));
+        rs.data.clearRetainingCapacity();
+    }
+};
+var rewind_spool: RewindSpool = .{};
+
 /// The one handler every test (h1 and h2 alike) is served by.
 fn testHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
     if (std.mem.eql(u8, req.path, "/method")) {
@@ -3072,6 +3106,25 @@ fn testHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
             try rw.writeAll(w.buffered());
             try rw.flush();
         }
+    } else if (std.mem.eql(u8, req.path, "/rewind") or std.mem.eql(u8, req.path, "/stream-rewind")) {
+        // RewindableBody over the h2 request body (buffered on /rewind, incremental
+        // on /stream-rewind): drain once, read twice from byte 0, answer the digest.
+        var rb: Server.RewindableBody = undefined;
+        rb.init(testing.allocator, .{ .memory_limit = 1024, .spool = rewind_spool.source() });
+        defer rb.deinit();
+        rb.fill(req.reader()) catch return error.BodyReadFailed;
+        const prev = rb.install(req);
+        defer req.decoded = prev;
+        const first = try req.reader().allocRemaining(testing.allocator, .unlimited);
+        defer testing.allocator.free(first);
+        const second = try rb.reader().allocRemaining(testing.allocator, .unlimited);
+        defer testing.allocator.free(second);
+        var d: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(first, &d, .{});
+        var out: [160]u8 = undefined;
+        try rw.writeAll(try std.mem.print(&out, "n={d} eq={} spooled={} sha={x}", .{
+            first.len, std.mem.eql(u8, first, second), rb.spooled(), d,
+        }));
     } else {
         rw.setStatus(404);
         try rw.writeAll("not found\n");
@@ -8778,4 +8831,60 @@ test "integration: an h2c server sends its SETTINGS as soon as it has read the c
     try sw.interface.flush();
     const hdr = try sr.interface.takeArray(9);
     try testing.expectEqual(@as(u8, 4), hdr[3]); // SETTINGS
+}
+
+// ── RewindableBody over an h2 request body ─────────────────────────────────
+
+test "h2 RewindableBody: a buffered request body re-reads identically from byte 0 (memory + spool)" {
+    const gpa = testing.allocator;
+    defer rewind_spool.data.clearAndFree(gpa);
+    rewind_spool.opens = 0;
+    var body: [5000]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/rewind"), false);
+    try peer.conn.sendData(&peer.wire, sid, body[0..1700], false);
+    try peer.conn.sendData(&peer.wire, sid, body[1700..3333], false);
+    try peer.conn.sendData(&peer.wire, sid, body[3333..], true);
+    var out_buf: [16384]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&body, &d, .{});
+    var want: [160]u8 = undefined;
+    const w = try std.mem.print(&want, "n={d} eq={} spooled={} sha={x}", .{ body.len, true, true, d });
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
+    try testing.expectEqualStrings(w, peer.resp(sid).body.items);
+    try testing.expectEqual(@as(u32, 1), rewind_spool.opens);
+}
+
+test "h2 RewindableBody: a streamed request body (handler runs at HEADERS) re-reads identically; a small one never spools" {
+    const gpa = testing.allocator;
+    defer rewind_spool.data.clearAndFree(gpa);
+    rewind_spool.opens = 0;
+    var body: [5000]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const big = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-rewind"), false);
+    try peer.conn.sendData(&peer.wire, big, body[0..999], false);
+    try peer.conn.sendData(&peer.wire, big, body[999..4000], false);
+    try peer.conn.sendData(&peer.wire, big, body[4000..], true);
+    const small = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-rewind"), false);
+    try peer.conn.sendData(&peer.wire, small, body[0..300], true);
+    var out_buf: [16384]u8 = undefined;
+    try runOffline(&peer, streamOpts(), &out_buf);
+    var d: [32]u8 = undefined;
+    var want: [160]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&body, &d, .{});
+    const w_big = try std.mem.print(&want, "n={d} eq={} spooled={} sha={x}", .{ body.len, true, true, d });
+    try testing.expectEqual(@as(u16, 200), peer.resp(big).status);
+    try testing.expectEqualStrings(w_big, peer.resp(big).body.items);
+    std.crypto.hash.sha2.Sha256.hash(body[0..300], &d, .{});
+    const w_small = try std.mem.print(&want, "n={d} eq={} spooled={} sha={x}", .{ @as(usize, 300), true, false, d });
+    try testing.expectEqual(@as(u16, 200), peer.resp(small).status);
+    try testing.expectEqualStrings(w_small, peer.resp(small).body.items);
+    try testing.expectEqual(@as(u32, 1), rewind_spool.opens);
 }

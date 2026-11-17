@@ -4238,3 +4238,95 @@ test "spool: FileSpool over a temp file end to end" {
     // The spool was released after the request: the file is truncated.
     try testing.expectEqual(@as(u64, 0), try file.length(io));
 }
+
+fn chunkedRequest(gpa: std.mem.Allocator, key: []const u8, body: []const u8, chunk: usize, terminate: bool) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    errdefer w.deinit();
+    try w.writer.print("POST /up HTTP/1.1\r\nHost: t\r\nIdempotency-Key: {s}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n", .{key});
+    var i: usize = 0;
+    while (i < body.len) : (i += chunk) {
+        const part = body[i..@min(i + chunk, body.len)];
+        try w.writer.print("{x}\r\n", .{part.len});
+        try w.writer.writeAll(part);
+        try w.writer.writeAll("\r\n");
+    }
+    if (terminate) try w.writer.writeAll("0\r\n\r\n");
+    return w.toOwnedSlice();
+}
+
+test "spool: a chunked request body past max_body_bytes is fingerprinted and replays against the same bytes under Content-Length" {
+    var ts: TestSpool = .{ .gpa = testing.allocator };
+    defer ts.deinit();
+    var f: MiniFixture = undefined;
+    try f.init(testing.allocator, "/up", hBodyEcho, .{ .spool = ts.source() });
+    defer f.deinit();
+    var body: [50_000]u8 = undefined;
+    _ = bigBody(&body, 6);
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&body, &d, .{});
+    var want_buf: [128]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "{d} {x}", .{ body.len, d });
+    var b: [4096]u8 = undefined;
+    const chunked = try chunkedRequest(testing.allocator, "chunk-1", &body, 7001, true);
+    defer testing.allocator.free(chunked);
+    const first = runWire(&f.r, chunked, &b);
+    try testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 200"));
+    try testing.expectEqualStrings(want, bodyOf(first));
+    try testing.expectEqual(@as(u32, 1), ts.opens);
+    // The identical bytes framed by Content-Length are the same request: replay.
+    const cl = try bigRequest(testing.allocator, "chunk-1", &body);
+    defer testing.allocator.free(cl);
+    const second = runWire(&f.r, cl, &b);
+    try testing.expect(std.mem.startsWith(u8, second, "HTTP/1.1 200"));
+    try testing.expectEqualStrings("true", headerValue(second, "Idempotent-Replayed").?);
+    try testing.expectEqualStrings(want, bodyOf(second));
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+}
+
+test "spool: a body cut short (Content-Length unmet, chunked without its end) is not a 413, runs no handler and reserves nothing" {
+    var ts: TestSpool = .{ .gpa = testing.allocator };
+    defer ts.deinit();
+    var f: MiniFixture = undefined;
+    try f.init(testing.allocator, "/up", hBodyEcho, .{ .spool = ts.source() });
+    defer f.deinit();
+    var body: [60_000]u8 = undefined;
+    _ = bigBody(&body, 8);
+    var b: [4096]u8 = undefined;
+    // Content-Length 60000, only 35000 bytes arrive before the client goes away.
+    const full = try bigRequest(testing.allocator, "cut-1", &body);
+    defer testing.allocator.free(full);
+    const head_len = full.len - body.len;
+    const cut = runWire(&f.r, full[0 .. head_len + 35_000], &b);
+    try testing.expect(!std.mem.startsWith(u8, cut, "HTTP/1.1 413"));
+    try testing.expect(!std.mem.startsWith(u8, cut, "HTTP/1.1 2"));
+    try testing.expectEqual(@as(u32, 0), f.app.calls);
+    // Chunked: the stream ends between chunks, no terminating chunk.
+    const chunked = try chunkedRequest(testing.allocator, "cut-1", body[0..35_000], 5000, false);
+    defer testing.allocator.free(chunked);
+    const cut2 = runWire(&f.r, chunked, &b);
+    try testing.expect(!std.mem.startsWith(u8, cut2, "HTTP/1.1 413"));
+    try testing.expect(!std.mem.startsWith(u8, cut2, "HTTP/1.1 2"));
+    try testing.expectEqual(@as(u32, 0), f.app.calls);
+    // Nothing stayed reserved: the same key with the whole body runs.
+    try testing.expect(std.mem.startsWith(u8, runWire(&f.r, full, &b), "HTTP/1.1 200"));
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+}
+
+test "spool: bytes beyond Content-Length are not part of the body (no 413, the handler sees exactly the declared length)" {
+    var ts: TestSpool = .{ .gpa = testing.allocator };
+    defer ts.deinit();
+    var f: MiniFixture = undefined;
+    try f.init(testing.allocator, "/up", hBodyEcho, .{ .spool = ts.source() });
+    defer f.deinit();
+    var body: [60_000]u8 = undefined;
+    _ = bigBody(&body, 9);
+    const full = try bigRequest(testing.allocator, "extra-1", body[0..40_000]);
+    defer testing.allocator.free(full);
+    const wire = try std.mem.concat(testing.allocator, u8, &.{ full, body[40_000..] });
+    defer testing.allocator.free(wire);
+    var b: [4096]u8 = undefined;
+    const got = runWire(&f.r, wire, &b);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.startsWith(u8, bodyOf(got), "40000 "));
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+}
