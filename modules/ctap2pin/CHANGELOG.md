@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** audit note only: the four burn/wipe redundancy verdicts of the whole-module mutation were re-checked by mutating each redundant pair together in ReleaseFast (both CBC burns, a wipe plus its covering burn); all four combined mutants die in the stack probes. No source, test or behaviour change.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of `src/root.zig` (111 mutants, 100 killed, 11 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). 6 tests added in `src/mutation_test.zig` (CBC destination lengths, a scalar that is canonical only little-endian, zeroed outputs on error, the IV-short destination, a signature longer than the MAC). No source change, no behaviour change; the ctgrind source digests were re-pinned (counts unchanged).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged).
