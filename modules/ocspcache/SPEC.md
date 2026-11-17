@@ -6,7 +6,7 @@
 
 **Scope:** core — CertMagic OCSP stapling and nginx `ssl_stapling` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-09-10 · src ?
+**Audit:** review 2026-09-03 · mutation 2026-11-17 (16/16) · src 93dee96077e6b662
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, OCSPCACHE_FUZZ) · ct n/a — public response cache (keyword review, 2026-10-07)
 
@@ -290,6 +290,10 @@ black-box compatibility test oracle, CONVENTIONS.md §5 / root NOTICE §0); no
 root NOTICE change accompanies this addition. `ocspcache` has no
 module-local `NOTICE` file of its own (nothing here ports third-party source
 or a design reference), so this note lives in SPEC.md only.
+
+## Delta mutation 2026-11-17 (export / import)
+
+16 schemata mutants over the persistence code (ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`): `exportEntries` (the expiry compare at its boundary and dropped, the exported expiry and key, the sort comparator flipped and constant, the three cleanup paths of the error unwind), `freeExported` (each of its two frees), `subjectKey`, `importStaple` (the size bound at its boundary and dropped, subject and issuer swapped) and `refresh`'s call into the shared `verifyAndStore` (subject and issuer swapped). First run: 15 killed, 1 survived (the comparator made constant: for the two real fixtures the map happens to iterate in key order); a test that inserts 24 synthetic entries and checks the order killed it. 16 killed, 0 survived. Not mutated: `verifyAndStore`'s body (moved verbatim out of `refresh`; its steps are the 2026-09-10 run's subject and every refusal is pinned by the import tests). The earlier 2026-09-10 run is not itemized, so the card counts are this delta only.
 
 ## Deferred (out of scope, not silently skipped)
 

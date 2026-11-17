@@ -1857,3 +1857,27 @@ test {
     _ = @import("goldens.zig");
     _ = @import("fuzz_test.zig");
 }
+
+test "exportEntries: sorted by subject key whatever order the map iterates in" {
+    const gpa = testing.allocator;
+    var dead: struct {
+        fn fetch(_: *anyopaque, _: std.mem.Allocator, _: FetchRequest) FetchError!FetchResponse {
+            return error.TransportFailed;
+        }
+    } = .{};
+    var cache = Cache.init(gpa, .{ .context = &dead, .fetchFn = @TypeOf(dead).fetch }, .{ .max_entries = 64 });
+    defer cache.deinit();
+    var prng = std.Random.DefaultPrng.init(0x0c5b);
+    const random = prng.random();
+    for (0..24) |_| {
+        var key: CacheKey = undefined;
+        random.bytes(&key);
+        const body = try gpa.dupe(u8, &key);
+        try cache.entries.put(gpa, key, .{ .response_der = body, .this_update_unix = 1, .next_update_unix = 100 });
+    }
+    const list = try cache.exportEntries(gpa, 50);
+    defer Cache.freeExported(gpa, list);
+    try testing.expectEqual(@as(usize, 24), list.len);
+    for (list[1..], 0..) |e, i| try testing.expect(std.mem.lessThan(u8, &list[i].subject_key, &e.subject_key));
+    for (list) |e| try testing.expectEqualSlices(u8, &e.subject_key, e.response_der);
+}

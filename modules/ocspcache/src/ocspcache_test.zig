@@ -897,6 +897,8 @@ test "importStaple: stored bytes are verified like a fetch; every refusal leaves
     var big: [16 * 1024 + 1]u8 = undefined;
     @memset(&big, 0);
     try testing.expectError(error.ResponseTooLarge, cache.importStaple(subject_with_aia, issuer_der, &big, now));
+    // Exactly at the bound is not too large (it is just not a response).
+    try testing.expectError(error.Malformed, cache.importStaple(subject_with_aia, issuer_der, big[0 .. big.len - 1], now));
     try testing.expectEqual(@as(usize, 0), cache.entries.count());
 
     // A good one is stored; the bound applies to a second certificate.
