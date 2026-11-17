@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** CSP rendering (`csp.build` / `render` / `renderNonce`) scans the caller's `remove` and `nonce_in` lists in linear time (a bitmap per `Name`) instead of O(list × 26); a repeated name is idempotent and a `directives` list longer than the 26 names is still `DuplicateDirective` (as in helmet, which keeps a `Set` of names seen). Boundary tests at 5000-entry lists; delta mutation 12 mutants, 9 killed, 3 equivalent; card counts cumulative (476/483, 7 eq).
+
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the `staticHeaders` dedupe (5 comptime clones, 5 killed); card counts cumulative.
 - **2026-11-17** — **Behaviour change:** `SecurityHeaders.staticHeaders` (the comptime list for `http.Server.Options.error_headers`) now holds one entry per header name, as `headerList` and `applyStatic` already did: an `extra` named like a built-in (any letter case) or like an earlier `extra` replaces that entry's name and value in place, instead of being listed a second time (an error reply used to carry e.g. `X-Frame-Options` twice). Options without such an `extra` give the same list as before.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of `headerList` (20 schemata mutants, 20 killed); card counts cumulative.
