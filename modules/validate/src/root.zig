@@ -606,8 +606,11 @@ pub const CrossOp = enum {
     /// present. (`excludedWithAll`.)
     excluded_with_all,
     /// The field must be absent when ANY `excluded_without` entry's sibling is absent.
-    /// go's `excludedWithout` reads ONE field name; several entries mean "any", as
-    /// its doc comment says. (`excludedWithout`.)
+    /// Each entry names ONE sibling, as go's `excludedWithout` reads one name; several
+    /// entries behave like several go tags (`excluded_without=A,excluded_without=B`),
+    /// each judged alone, i.e. "any". (go's `excluded_without=A B` is the single name
+    /// "A B", which exists nowhere; an `other` holding a space is that same literal
+    /// key here.) (`excludedWithout`.)
     excluded_without,
     /// The field must be absent when EVERY `excluded_without_all` entry's sibling is
     /// absent. (`excludedWithoutAll`.)

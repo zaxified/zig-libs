@@ -36,8 +36,12 @@ for op in ['required_with', 'required_without', 'required_with_all', 'required_w
            'excluded_with', 'excluded_with_all', 'excluded_without_all']:
     for sibs in (['A'], ['A', 'B']):
         TAGS.append((op + '=' + ' '.join(sibs), sibs, entries(op, sibs)))
-# go's excluded_without reads ONE field name.
+# go's excluded_without reads ONE field name (strings.TrimSpace of the whole param): a space-separated
+# `A B` is the single name "A B", found nowhere, so it always counts as absent. Several Zig entries
+# are several go tags (`excluded_without=A,excluded_without=B`), each judged alone: "any".
 TAGS.append(('excluded_without=A', ['A'], entries('excluded_without', ['A'])))
+TAGS.append(('excluded_without=A,excluded_without=B', ['A', 'B'], entries('excluded_without', ['A', 'B'])))
+TAGS.append(('excluded_without=A B', ['A', 'B'], entries('excluded_without', ['A B'])))
 for op in ['required_if', 'required_unless', 'skip_unless', 'excluded_if', 'excluded_unless']:
     for pairs in ([('A', 'x')], [('A', 'x'), ('B', 'y')]):
         TAGS.append((op + '=' + ' '.join(s + ' ' + v for s, v in pairs), [s for s, _ in pairs], ventries(op, pairs)))
