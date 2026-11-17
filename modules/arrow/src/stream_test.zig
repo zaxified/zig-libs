@@ -441,11 +441,11 @@ test "reader: targeted corruptions are errors" {
         try cases.append(gpa, .{ .want = error.Malformed, .bytes = try hand(gpa, &fields, &.{.{ .length = 1, .nodes = &.{.{ .length = 1, .null_count = 0 }}, .bufs = &.{ "", bytesOf(i32, &.{ 0, 0 }) } }}) });
     }
     {
-        // A timestamp zone dataframe does not know; a 256-bit decimal.
+        // A timestamp zone dataframe does not know; a 256-bit decimal of 77 digits.
         const fields = [_]schema.Field{.{ .name = "t", .type = .{ .timestamp = .{ .unit = .second, .tz = "Mars/Olympus" } } }};
         try cases.append(gpa, .{ .want = error.Unsupported, .bytes = try hand(gpa, &fields, &.{}) });
-        const f2 = [_]schema.Field{.{ .name = "d", .type = .{ .decimal = .{ .precision = 40, .scale = 0, .bits = 256 } } }};
-        try cases.append(gpa, .{ .want = error.Unsupported, .bytes = try hand(gpa, &f2, &.{}) });
+        const f2 = [_]schema.Field{.{ .name = "d", .type = .{ .decimal = .{ .precision = 77, .scale = 0, .bits = 256 } } }};
+        try cases.append(gpa, .{ .want = error.Malformed, .bytes = try hand(gpa, &f2, &.{}) });
     }
     for (cases.items, 0..) |c, i| {
         const got = stream.readStream(a, c.bytes, .{});
@@ -1165,4 +1165,66 @@ test "projection: unprojected columns and dictionaries are neither decompressed 
     try testing.expectError(error.LimitExceeded, stream.readStream(a, z, .{ .max_body_bytes = 64 }));
     const p = try stream.readStream(a, z, .{ .max_body_bytes = 64, .columns = &.{.{ .name = "i64" }} });
     try testing.expectEqual(@as(i64, -2), p.columnAt(0).get(1).int);
+}
+
+test "decimal widths: Decimal32 / Decimal64 widen exactly, Decimal256 when it fits; precision per width" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dec = struct {
+        fn f(p: i32, sc: i32, bits: i32) schema.Type {
+            return .{ .decimal = .{ .precision = p, .scale = sc, .bits = bits } };
+        }
+    }.f;
+    const fields = [_]schema.Field{
+        .{ .name = "d32", .type = dec(9, 2, 32) },
+        .{ .name = "d64", .type = dec(18, 0, 64) },
+        .{ .name = "d256", .type = dec(40, 12, 256) },
+    };
+    const two: ipc.FieldNode = .{ .length = 2, .null_count = 0 };
+    const big: i256 = 99_999_999_999_999_999_999_999_999_999_999_999_999; // 38 digits
+    const bytes = try hand(gpa, &fields, &.{.{ .length = 2, .nodes = &.{ two, two, two }, .bufs = &.{
+        "", bytesOf(i32, &.{ -123_456_789, 5 }),
+        "", bytesOf(i64, &.{ 999_999_999_999_999_999, -1 }),
+        "", bytesOf(i256, &.{ big, -7 }),
+    } }});
+    defer gpa.free(bytes);
+    const f = try stream.readStream(a, bytes, .{});
+    try testing.expectEqual(df.ColumnType.decimal, f.columns[0].type);
+    try testing.expectEqual(@as(i128, -123_456_789 * 10_000_000_000), f.cell(0, "d32").?.decimal);
+    try testing.expectEqual(@as(i128, 5 * 10_000_000_000), f.cell(1, "d32").?.decimal);
+    try testing.expectEqual(@as(i128, 999_999_999_999_999_999 * scale), f.cell(0, "d64").?.decimal);
+    try testing.expectEqual(@as(i128, -scale), f.cell(1, "d64").?.decimal);
+    try testing.expectEqual(@as(i128, @intCast(big)), f.cell(0, "d256").?.decimal);
+    try testing.expectEqual(@as(i128, -7), f.cell(1, "d256").?.decimal);
+    // Written back as Decimal128.
+    const back = try stream.writeStream(gpa, f, .{});
+    defer gpa.free(back);
+    try expectSameFrame(f, try stream.readStream(a, back, .{}));
+
+    // A Decimal256 of 39 digits, one outside i128, one past its declared precision:
+    // Unsupported, null under lossy.
+    const one: ipc.FieldNode = .{ .length = 1, .null_count = 0 };
+    for ([_]struct { schema.Type, i256 }{
+        .{ dec(40, 12, 256), big * 10 + 9 },
+        .{ dec(76, 0, 256), @as(i256, 1) << 200 },
+        .{ dec(76, 0, 256), -(@as(i256, 1) << 200) },
+        .{ dec(3, 0, 256), 1000 },
+        .{ dec(3, 0, 32), -1000 },
+    }) |c| {
+        var raw: [32]u8 = undefined;
+        const w: usize = @intCast(@divExact(c[0].decimal.bits, 8));
+        std.mem.writeInt(i256, &raw, c[1], .little);
+        const bad = try hand(gpa, &.{.{ .name = "d", .type = c[0] }}, &.{.{ .length = 1, .nodes = &.{one}, .bufs = &.{ "", raw[0..w] } }});
+        defer gpa.free(bad);
+        try testing.expectError(error.Unsupported, stream.readStream(a, bad, .{}));
+        try testing.expect((try stream.readStream(a, bad, .{ .lossy = true })).cell(0, "d").? == .null);
+    }
+    // Precisions a width cannot hold are not types.
+    for ([_]schema.Type{ dec(10, 0, 32), dec(19, 0, 64), dec(39, 0, 128), dec(77, 0, 256), dec(0, 0, 256) }) |t| {
+        const bad = try hand(gpa, &.{.{ .name = "d", .type = t }}, &.{});
+        defer gpa.free(bad);
+        try testing.expectError(error.Malformed, stream.readStream(a, bad, .{}));
+    }
 }

@@ -24,6 +24,7 @@ const J = std.json.Value;
 
 const v1 = "testdata/1.0.0-littleendian/generated_";
 const v2 = "testdata/2.0.0-compression/generated_";
+const c21 = "testdata/cpp-21.0.0/generated_";
 
 const Want = enum {
     /// Reads with the default options; every cell matches the JSON.
@@ -73,12 +74,16 @@ const sets = [_]Set{
     set(v1, "decimal", false, .lossy),
     set(v2, "zstd", true, .exact),
     set(v2, "uncompressible_zstd", true, .exact),
+    // Decimal32 / Decimal64 (precision 3..9 / 3..18, scale 2) widen exactly.
+    set(c21, "decimal32", true, .exact),
+    set(c21, "decimal64", true, .exact),
+    // Decimal256 of precision 37..69 at scale 5: past 38 digits at 12, so lossy.
+    set(c21, "decimal256", true, .lossy),
 };
 
 /// Sets with a type `dataframe` has no column for (or a codec the collection lacks):
 /// only their `.stream` is committed.
 const refused = [_]struct { []const u8, []const u8 }{
-    .{ "decimal256", @embedFile(v1 ++ "decimal256.stream") },
     .{ "interval", @embedFile(v1 ++ "interval.stream") },
     .{ "map", @embedFile(v1 ++ "map.stream") },
     .{ "map_non_canonical", @embedFile(v1 ++ "map_non_canonical.stream") },
@@ -117,6 +122,15 @@ fn jint(v: J) !i128 {
     return switch (v) {
         .integer => |i| i,
         .string, .number_string => |s| std.fmt.parseInt(i128, s, 10),
+        else => error.TestUnexpectedJson,
+    };
+}
+
+/// A Decimal256 value (up to 77 digits).
+fn jint256(v: J) !i256 {
+    return switch (v) {
+        .integer => |i| i,
+        .string, .number_string => |s| std.fmt.parseInt(i256, s, 10),
         else => error.TestUnexpectedJson,
     };
 }
@@ -296,10 +310,12 @@ const Oracle = struct {
             return;
         }
         if (std.mem.eql(u8, name, "decimal")) {
-            const raw = try jint(data[i]);
+            const wide = try jint256(data[i]);
             // More digits than the declared precision is not a value of the type.
-            const prec: u7 = @intCast(try jint(get(t, "precision").?));
-            if (@abs(raw) >= std.math.pow(u128, 10, prec)) return o.unholdable(field, got);
+            const prec: u8 = @intCast(try jint(get(t, "precision").?));
+            if (@abs(wide) >= std.math.pow(u256, 10, prec)) return o.unholdable(field, got);
+            // A Decimal256 outside i128 has no `dataframe` form.
+            const raw = std.math.cast(i128, wide) orelse return o.unholdable(field, got);
             const want = decimal12(raw, @intCast(try jint(get(t, "scale").?))) orelse return o.unholdable(field, got);
             // 39 digits at scale 12 fit an i128 but no Decimal128 (38 digits at most).
             if (@abs(want) >= std.math.pow(u128, 10, 38)) return o.unholdable(field, got);

@@ -572,6 +572,15 @@ const pow10 = blk: {
     break :blk t;
 };
 
+/// 10^k for k in 0..76: the precisions of Decimal256 (10^76 still fits a u256).
+const pow10_256 = blk: {
+    @setEvalBranchQuota(10_000);
+    var t: [77]u256 = undefined;
+    t[0] = 1;
+    for (1..t.len) |i| t[i] = t[i - 1] * 10;
+    break :blk t;
+};
+
 /// Digits of |x| (1 for 0); 39 for anything Decimal128 cannot hold.
 fn digitCount(x: i128) i32 {
     const u = @abs(x);
@@ -815,9 +824,10 @@ const RField = struct {
     unit: schema.TimeUnit = .microsecond,
     /// FixedSizeBinary width, FixedSizeList size.
     width: usize = 0,
-    /// Decimal scale and precision.
+    /// Decimal scale, precision and width (32, 64, 128 or 256 bits).
     scale: i32 = 0,
     precision: i32 = max_precision,
+    dec_bits: u16 = 128,
     /// Dictionary index type.
     index: schema.IntType = .{ .bits = 32, .signed = true },
     children: []RField = &.{},
@@ -933,11 +943,20 @@ const Reader = struct {
                 rf.col.type = .bool;
             },
             .decimal => |d| {
-                if (d.bits != 128) return error.Unsupported;
-                if (d.precision < 1 or d.precision > max_precision) return error.Malformed; // no Decimal128
+                // The precisions each width can hold (Decimal32 9 digits, Decimal64 18,
+                // Decimal128 38, Decimal256 76); the schema decoder admits only these widths.
+                const most: i32 = switch (d.bits) {
+                    32 => 9,
+                    64 => 18,
+                    128 => max_precision,
+                    256 => 76,
+                    else => return error.Malformed,
+                };
+                if (d.precision < 1 or d.precision > most) return error.Malformed;
                 rf.kind = .dec;
                 rf.scale = d.scale;
                 rf.precision = d.precision;
+                rf.dec_bits = @intCast(d.bits);
                 rf.col.type = .decimal;
             },
             .date => |u| {
@@ -1220,11 +1239,12 @@ const Reader = struct {
                 break :blk typed("float32", out, valid, n);
             },
             .dec => blk: {
-                const v = try r.raw(i128, rf, chunks, n, valid);
+                const v = try r.decimals(rf, chunks, n, &valid);
                 for (v, 0..) |*x, i| {
                     // More digits than the declared precision is not a value of this type;
                     // more than 38 at 12 fractional digits has no Decimal128 form to write back.
-                    const fits = @abs(x.*) < pow10[@intCast(rf.precision)];
+                    // (A Decimal256 wider than 38 digits was dropped or narrowed by `decimals`.)
+                    const fits = rf.precision > max_precision or @abs(x.*) < pow10[@intCast(rf.precision)];
                     x.* = (if (fits) rescale(x.*, rf.scale) else error.Unsupported) catch try r.drop(&valid, n, i);
                     if (digitCount(x.*) > max_precision) x.* = try r.drop(&valid, n, i);
                 }
@@ -1292,6 +1312,31 @@ const Reader = struct {
                 break :blk .{ .@"struct" = sc };
             },
         };
+    }
+
+    /// Every chunk's decimals of any width as i128 (null slots zeroed). Decimal32 and
+    /// Decimal64 widen exactly; a Decimal256 value with more digits than its declared
+    /// precision, or outside i128, is a value `dataframe` cannot hold (`drop`).
+    fn decimals(r: *Reader, rf: *const RField, chunks: []const Chunk, n: usize, valid: *?[]u64) Error![]i128 {
+        switch (rf.dec_bits) {
+            inline 32, 64 => |bits| {
+                // `raw` checks the buffers against the nodes before anything is allocated.
+                const narrow = try r.raw(@Int(.signed, bits), rf, chunks, n, valid.*);
+                const out = try r.a.alloc(i128, n);
+                for (out, narrow) |*o, x| o.* = x;
+                return out;
+            },
+            256 => {
+                const wide = try r.raw(i256, rf, chunks, n, valid.*);
+                const out = try r.a.alloc(i128, n);
+                const p: usize = @intCast(rf.precision);
+                for (out, wide, 0..) |*o, x, i| {
+                    o.* = if (@abs(x) < pow10_256[p]) std.math.cast(i128, x) orelse try r.drop(valid, n, i) else try r.drop(valid, n, i);
+                }
+                return out;
+            },
+            else => return r.raw(i128, rf, chunks, n, valid.*),
+        }
     }
 
     /// A value `dataframe` cannot hold at row `i`: `error.Unsupported`, or under
@@ -1861,7 +1906,7 @@ fn copyFieldMetadata(arena: Allocator, fields: []const schema.Field) Error![]con
 /// arena; nothing borrows `bytes`). Dictionary deltas are appended; ZSTD body compression
 /// is read. A dictionary REPLACED mid-stream, LZ4_FRAME body compression, a metadata
 /// version before V4, and the types `dataframe` has no column for (Interval, Union, Map,
-/// the view types, Decimal other than 128-bit) are `error.Unsupported`.
+/// the view types) are `error.Unsupported`.
 pub fn readStream(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!df.Frame {
     var r: Reader = .{ .a = arena, .opts = opts };
     var pos: usize = 0;

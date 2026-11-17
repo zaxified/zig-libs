@@ -143,7 +143,7 @@ deterministic fuzz driver, with a read that ends in an error and never in a cras
 golden files compared with their JSON through an oracle written from the JSON's own encoding; pure Zig with
 ZSTD built in both ways, no C, no `libarrow`. Nothing here is a measured lead, so the scope is not `ahead`.
 **Where we are behind** (all in Backlog): the types the format has and `dataframe` has no column for (Map, Union,
-Interval, Decimal256, run-end, the view types, ListView) are refused, and so are Decimal32/64; LZ4_FRAME, the
+Interval, run-end, the view types, ListView) are refused; LZ4_FRAME, the
 other codec every Arrow implementation but this one has and the default of pyarrow's Feather writer, is refused
 (waits for an `lz4` module); dictionary replacement and a dictionary nested in a list or struct are refused; there is no
 zero-copy or memory-mapped read, no incremental reader or writer over `std.Io` (the input and the
@@ -165,8 +165,8 @@ hostile stream ends in an error, within the limits below, never in a crash or an
 **Not here:** the Arrow C data interface (sharing buffers with another library in the same process), Flight
 (RPC), compute kernels, a columnar in-memory representation of its own (the reader decodes into `dataframe`'s
 storage and copies every buffer — no zero-copy views over the input), Parquet, the JSON integration format as an
-output, and the types `dataframe` has no column for (Interval, Union, Map, RunEndEncoded, the view types,
-Decimal32/64/256) — those are refused (`Unsupported`). LZ4_FRAME body compression is refused until the
+output, and the types `dataframe` has no column for (Interval, Union, Map, RunEndEncoded, the view types) —
+those are refused (`Unsupported`). Decimal32 / Decimal64 / Decimal256 are read (as `decimal`), never written. LZ4_FRAME body compression is refused until the
 collection has an LZ4 codec (deferred, not refused for good).
 
 ## Wire format / algorithm
@@ -197,7 +197,7 @@ per read) after checking each declared length against `zstd.decompressBound` and
 | `int` / `int8`..`int32` / `uint8`..`uint64` | Int64 / Int8..Int32 / UInt8..UInt64 | — |
 | `float` / `float32` | Float64 / Float32 | Float16 → `float32` |
 | `bool` | Bool (bit-packed) | — |
-| `decimal` (i128, 12 digits) | Decimal128(p, 12), p = digits of the widest value (≥ 12); 39 digits → `Unsupported` | Decimal128(p, s) rescaled to 12 digits; inexact, out of range, wider than p or than 38 digits → `Unsupported`, or null under `lossy` |
+| `decimal` (i128, 12 digits) | Decimal128(p, 12), p = digits of the widest value (≥ 12); 39 digits → `Unsupported` | Decimal128(p, s) rescaled to 12 digits; inexact, out of range, wider than p or than 38 digits → `Unsupported`, or null under `lossy`. Decimal32 / Decimal64 widened exactly, then the same; Decimal256 when the value fits an i128, else the same refusal |
 | `text` / `binary` | Utf8 (UTF-8 checked) / Binary; Large* from `WriteOptions.large_from` bytes (default 2^31) | LargeUtf8 / LargeBinary; FixedSizeBinary → `binary` |
 | `date` (ISO text) | Date32 (days) | Date64 (ms; off a day boundary → `Unsupported`, floored to the containing day under `lossy`); years outside 0000–9999 → `Unsupported` |
 | `timestamp` (+ `time_zone`) | Timestamp(us, zone) | s / ms / ns (ns not divisible to us → `Unsupported`, truncated toward zero under `lossy`); a zone `tz` does not know → `Unsupported`, or under `lossy` a naive column (the cells are UTC instants either way) |
@@ -270,7 +270,7 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
   changes (a malformed stream is still an error). Tests: `src/stream_test.zig` "lossy: …", "inexact time
   conversions", and the `datetime` and `decimal` golden sets.
 - Refused on read (`Unsupported`): LZ4_FRAME body compression, a dictionary replaced mid-stream (deltas are
-  appended), a dictionary nested in a dictionary's values, Decimal32/64/256, Interval, Union, Map, the view types,
+  appended), a dictionary nested in a dictionary's values, Interval, Union, Map, the view types,
   tensors. Every structural defect — a buffer shorter than its node, offsets running backwards or past the data, an
   index outside its dictionary, node or buffer counts not matching the schema, a column length not the batch's —
   is `error.Malformed`.
@@ -285,9 +285,11 @@ scales, hex binary, dictionary indices, offsets; dates by Hinnant's `civil_from_
 Sets: `custom_metadata`, `dictionary`, `dictionary_unsigned`, `duplicate_fieldnames`, `extension`, `nested`,
 `nested_large_offsets`, `null`, `null_trivial`, `primitive`, `primitive_large_offsets`, `primitive_no_batches`,
 `primitive_zerolength`, `recursive_nested`, and from `2.0.0-compression` `zstd` and `uncompressible_zstd`
-(ZSTD body compression); `datetime` and `decimal` are `Unsupported` by default and compared under `lossy`.
+(ZSTD body compression), from `cpp-21.0.0` `decimal32` and `decimal64`; `datetime`, `decimal` and (from
+`cpp-21.0.0`) `decimal256` are `Unsupported` by default and compared under `lossy` (the Decimal256 oracle parses
+the JSON's 77-digit values as i256).
 Stream and file read equal, each file batch has its JSON batch's length, and the frame this module writes back
-(plain and zstd, stream and file) reads equal. `decimal256`, `interval`, `map`, `map_non_canonical`,
+(plain and zstd, stream and file) reads equal. `interval`, `map`, `map_non_canonical`,
 `nested_dictionary`, `union` and `lz4` are asserted `Unsupported`, lossy or not. The writer's bytes are anchored
 only through the reader (no foreign reader runs here).
 
@@ -415,7 +417,10 @@ competing libraries and cheap enough to finish in one wave; none of them is star
   provenance tags are dropped on read and absent on write; the footer's `custom_metadata` likewise. Sketch: a
   side result (`readStreamMeta` returning the frame plus `schema.Schema.metadata`, or an out parameter on
   `ReadOptions`) and `WriteOptions.schema_metadata` / `field_metadata`; no `dataframe` change. Effort: ~0.5 wave.
-- **Decimal32 / Decimal64 / Decimal256 on read.** The first two widen into the existing Decimal128 rescale path
+- ✅ 2026-11-17 **Decimal32 / Decimal64 / Decimal256 on read.** Done as sketched: the precision must suit the
+  width (1–9, 1–18, 1–38, 1–76, else `Malformed`); a Decimal256 past its declared precision or outside i128 is
+  refused like any value `dataframe` cannot hold. Anchored on the `cpp-21.0.0` `decimal32`, `decimal64` and
+  `decimal256` goldens (the old `1.0.0` `decimal256.stream`, a refusal fixture, is dropped). Was: the first two widen into the existing Decimal128 rescale path
   unchanged; Decimal256 (32-byte little-endian two's complement) is read when the value fits an i128 at 12
   fractional digits and is `Unsupported` (null under `lossy`) otherwise. Why: the format lists all three and the status matrix shows Decimal256 in every
   implementation *(doc)*. Effort: ~0.5 wave. Writing stays

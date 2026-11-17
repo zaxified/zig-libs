@@ -18,7 +18,7 @@ https://github.com/apache/arrow-testing at commit
 `data/arrow-ipc-stream/integration/`. The files are the Arrow integration
 "golden" files written by Arrow C++: an IPC stream (`.stream`), an IPC file
 (`.arrow_file`) and the Arrow integration JSON describing the same data
-(`.json.gz`). 60 files, 939 459 bytes in all:
+(`.json.gz`). 68 files, 665 611 bytes in all:
 
   - `src/testdata/1.0.0-littleendian/` — from `1.0.0-littleendian/`:
       * all three files of `generated_<set>` for the sets custom_metadata,
@@ -28,12 +28,15 @@ https://github.com/apache/arrow-testing at commit
         primitive_zerolength, recursive_nested;
       * `generated_decimal.stream` and `generated_decimal.json.gz` (its
         `.arrow_file`, 256 KB, is not taken);
-      * only the `.stream` of decimal256, interval, map, map_non_canonical,
+      * only the `.stream` of interval, map, map_non_canonical,
         nested_dictionary and union (sets whose types this module refuses;
         the test asserts the refusal).
   - `src/testdata/2.0.0-compression/` — from `2.0.0-compression/`: all three
     files of `generated_zstd` and `generated_uncompressible_zstd`, and
     `generated_lz4.stream`.
+  - `src/testdata/cpp-21.0.0/` — from `cpp-21.0.0/` (taken 2026-11-17, same
+    commit): all three files of `generated_<set>` for the sets decimal32,
+    decimal64, decimal256.
 
 Not taken: the other sets and versions of the directory, and everything else
 in the repository.

@@ -429,3 +429,17 @@ test "hostile dictionaries: an entry copied into many rows counts against max_ce
     try testing.expectEqual(@as(?anyerror, error.LimitExceeded), lg.err);
     try testing.expect(lg.peak < 32 << 20);
 }
+
+test "hostile decimals: a Decimal256 / Decimal32 node longer than its buffer allocates nothing for it" {
+    const gpa = testing.allocator;
+    for ([_]i32{ 32, 64, 256 }) |bits| {
+        const fields = [_]schema.Field{.{ .name = "d", .type = .{ .decimal = .{ .precision = 9, .scale = 0, .bits = bits } } }};
+        const rows = 1 << 24;
+        const z: [32]u8 = @splat(0);
+        const bytes = try st.hand(gpa, &fields, &.{.{ .length = rows, .nodes = &.{.{ .length = rows, .null_count = 0 }}, .bufs = &.{ "", &z } }});
+        defer gpa.free(bytes);
+        const got = try streamUnderCap(bytes, .{ .max_rows = 1 << 25, .max_cells = 1 << 25 }, 4 << 20);
+        try testing.expectEqual(@as(?anyerror, error.Malformed), got.err);
+        try testing.expect(got.peak < 1 << 20);
+    }
+}
