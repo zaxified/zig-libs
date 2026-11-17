@@ -153,7 +153,7 @@ const blob_proof = try kzg.computeBlobKzgProof(allocator, &blob, commitment, &se
 const ok6 = try kzg.verifyBlobKzgProof(allocator, &blob, commitment, blob_proof, &setup);
 const ok7 = try kzg.verifyBlobKzgProofBatch(allocator, &blobs, &commitments, &proofs, &setup);
 
-// Threshold BLS (Part 6 — trusted-dealer, min-pk):
+// Threshold BLS (Part 6 — trusted-dealer; file-level names = min-pk POP):
 const threshold = bls12_381.threshold;
 const split = try threshold.splitSecretKey(allocator, &sk, 3, 5, coeffs); // t=3-of-5, coeffs.len == t-1
 defer allocator.free(split.shares);
@@ -162,6 +162,10 @@ const partial1 = threshold.partialSign(&split.shares[0], "message"); // thin ove
 const ok8 = threshold.verifyPartialSignature(threshold.derivePublicKeyShare(split.vvec, 1), "message", partial1);
 const combined = try threshold.combineSignatures(&.{ partial1, partial2, partial3 }, 3); // == bls.sign(sk, "message")
 const ok9 = bls.verify(threshold.groupPublicKey(split.vvec), "message", combined); // ordinary bls_sig.verify
+// min-sig (keys/commitments in G2, signatures in G1): the same API on threshold.MinSig;
+// threshold.Threshold(.min_sig, .basic) is drand quicknet's suite.
+const ms_split = try threshold.MinSig.splitSecretKey(allocator, &sk, 3, 5, coeffs);
+const ms_partial = threshold.MinSig.partialSign(&ms_split.shares[0], "message"); // == bls.MinSigPop.sign under the share
 ```
 
 Deserialization (`fromBytesCompressed`/`fromBytesUncompressed`) checks
@@ -191,7 +195,7 @@ caller already trusts only. A point built some other way still needs
 | `kzg.zig` | Part 5: EIP-4844 KZG — `loadTrustedSetup` (memoized), `blobToKzgCommitment`/`computeKzgProof`/`verifyKzgProof`/`computeBlobKzgProof`/`verifyBlobKzgProof`/`verifyBlobKzgProofBatch`, plus `fft`/`ifft` and `g1Msm` primitives |
 | `src/data/trusted_setup.txt` | The embedded official Ethereum KZG ceremony trusted setup (`@embedFile`d by `kzg.zig`) |
 | `src/data/kzg_test_vectors/` | Two embedded `c-kzg-4844` KAT blobs (constant-2 + random #4; see `NOTICE`) |
-| `threshold.zig` | Part 6: trusted-dealer threshold BLS — `splitSecretKey`/`groupPublicKey`/`derivePublicKeyShare` (Shamir+Feldman VSS), `partialSign`/`verifyPartialSignature` (thin over `bls_sig`), `combineSignatures` (Lagrange-in-the-exponent) |
+| `threshold.zig` | Part 6: trusted-dealer threshold BLS, `Threshold(variant, scheme)` (min-pk/min-sig × Basic/POP; file-level names = `MinPk`) — `splitSecretKey`/`groupPublicKey`/`derivePublicKeyShare` (Shamir+Feldman VSS), `partialSign`/`verifyPartialSignature` (thin over `bls_sig`), `combineSignatures` (Lagrange-in-the-exponent) |
 | `root.zig` | Module entry: `meta`, re-exports, dark-tests aggregator |
 
 ## Verify

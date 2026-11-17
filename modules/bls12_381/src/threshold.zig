@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT
 //! threshold — Part 6 of the `bls12_381` arc: **trusted-dealer**
-//! threshold BLS, min-pk ciphersuite (public keys/shares live in `G1`,
-//! signatures/partial signatures live in `G2` — the SAME convention as
-//! Part 4's `bls_sig.zig`, whose DSTs (`bls_sig.dst_sig`) and
-//! `SecretKey`/`PublicKey`/`Signature` wire types this file reuses
-//! directly rather than reinventing). A `t`-of-`n` Shamir secret
+//! threshold BLS over any Basic or ProofOfPossession ciphersuite of
+//! `scheme.zig` (`Threshold(variant, scheme)`, generalised 2026-11-17 the
+//! way `scheme.zig` generalised the signatures). The file-level names are
+//! the min-pk POP instance `MinPk` (public keys/shares in `G1`,
+//! signatures/partial signatures in `G2` — Part 4's `bls_sig.zig`
+//! convention, whose `SecretKey`/`PublicKey`/`Signature` wire types they
+//! reuse); `MinSig` swaps the groups (keys in `G2`, signatures in `G1`)
+//! and signs/verifies as `bls_sig.MinSigPop`. A `t`-of-`n` Shamir secret
 //! sharing of a BLS secret key `sk`, with a Feldman verifiable-secret-
 //! sharing (VSS) commitment so every share is publicly checkable
 //! against the dealer's claimed sharing polynomial, and a Lagrange-
@@ -87,6 +90,7 @@ const g1 = @import("g1.zig");
 const g2 = @import("g2.zig");
 const scalarmod = @import("scalar.zig");
 const bls_sig = @import("bls_sig.zig");
+const schememod = @import("scheme.zig");
 const burn = @import("burn.zig");
 
 pub const Fr = scalarmod.Fr;
@@ -129,7 +133,8 @@ pub const ThresholdError = error{
 /// (`f(0) = sk`). SECRET: `scalar` must be handled with the same care
 /// as a `bls_sig.SecretKey.scalar` (never logged, zeroed after use by a
 /// careful caller, etc — this module does not itself add any
-/// additional handling beyond what `Fr` already provides).
+/// additional handling beyond what `Fr` already provides). The same type
+/// for every ciphersuite: a share is a scalar, like `SecretKey`.
 pub const SecretKeyShare = struct {
     index: u32,
     scalar: Fr,
@@ -174,210 +179,6 @@ pub const SecretKeyShare = struct {
     }
 };
 
-/// Participant `index`'s PUBLIC verifying share `[share_i]G1` (a `G1`
-/// point, same convention as `bls_sig.PublicKey` — min-pk). Obtained
-/// either by evaluating a dealer's `VerificationVector` at `index`
-/// (`derivePublicKeyShare`, without ever seeing `share_i` itself — the
-/// VSS-consistency property) or, degenerately, by a participant
-/// computing `bls_sig.skToPk` on their own `SecretKeyShare` directly.
-pub const PublicKeyShare = struct {
-    index: u32,
-    point: g1.Affine,
-
-    pub const encoded_bytes = 4 + g1.compressed_bytes; // 52
-
-    /// REAL: `index` big-endian `||` `g1.toBytesCompressed`.
-    pub fn toBytes(self: PublicKeyShare) [encoded_bytes]u8 {
-        var out: [encoded_bytes]u8 = undefined;
-        std.mem.writeInt(u32, out[0..4], self.index, .big);
-        out[4..encoded_bytes].* = g1.toBytesCompressed(self.point);
-        return out;
-    }
-
-    /// REAL. Rejects `index == 0`; `point` is checked on-curve and in
-    /// `G1` by `g1.fromBytesCompressed` (the identity still decodes;
-    /// `verifyPartialSignature` refuses it through `bls_sig.verify`'s
-    /// `keyValidate`).
-    pub fn fromBytes(bytes: [encoded_bytes]u8) ThresholdError!PublicKeyShare {
-        const index = std.mem.readInt(u32, bytes[0..4], .big);
-        if (index == 0) return error.ZeroIndex;
-        const point = try g1.fromBytesCompressed(bytes[4..encoded_bytes].*);
-        return .{ .index = index, .point = point };
-    }
-};
-
-/// Participant `index`'s partial signature: `[share_i]Q` for
-/// `Q = hashToCurveG2(msg, bls_sig.dst_sig)` (a `G2` point, `bls_sig.
-/// Signature`'s own shape — min-pk). Produced by `partialSign`,
-/// consumed by `verifyPartialSignature` and `combineSignatures`.
-pub const PartialSignature = struct {
-    index: u32,
-    point: g2.Affine,
-
-    pub const encoded_bytes = 4 + g2.compressed_bytes; // 100
-
-    /// REAL: `index` big-endian `||` `g2.toBytesCompressed`.
-    pub fn toBytes(self: PartialSignature) [encoded_bytes]u8 {
-        var out: [encoded_bytes]u8 = undefined;
-        std.mem.writeInt(u32, out[0..4], self.index, .big);
-        out[4..encoded_bytes].* = g2.toBytesCompressed(self.point);
-        return out;
-    }
-
-    /// REAL. Rejects `index == 0`; `point` is checked on-curve and in
-    /// `G2` by `g2.fromBytesCompressed`, so `combineSignatures` never
-    /// sees a torsion component from a decoded partial.
-    pub fn fromBytes(bytes: [encoded_bytes]u8) ThresholdError!PartialSignature {
-        const index = std.mem.readInt(u32, bytes[0..4], .big);
-        if (index == 0) return error.ZeroIndex;
-        const point = try g2.fromBytesCompressed(bytes[4..encoded_bytes].*);
-        return .{ .index = index, .point = point };
-    }
-};
-
-/// A Feldman VSS commitment to the dealer's degree-`(t-1)` sharing
-/// polynomial `f(x) = sk + a_1*x + a_2*x^2 + ... + a_{t-1}*x^{t-1}`:
-/// `commitments[j] = [a_j]G1` for `j` in `0..t` (`a_0 := sk`), so
-/// `commitments[0] == [sk]G1` (`groupPublicKey`) and
-/// `commitments.len == t` (`threshold()`). PUBLIC — this is the
-/// information the dealer broadcasts alongside the (secret,
-/// out-of-band) per-participant shares, letting every participant
-/// verify their own share (and derive anyone else's PUBLIC key share)
-/// without trusting the dealer any further. Owned slice: free
-/// `commitments` with the same allocator that produced it
-/// (`splitSecretKey`/`fromBytesAlloc`).
-pub const VerificationVector = struct {
-    commitments: []const g1.Affine,
-
-    /// `t`, the reconstruction threshold this vector commits to. REAL:
-    /// plain length read.
-    pub fn threshold(self: VerificationVector) usize {
-        return self.commitments.len;
-    }
-
-    /// Length-prefixed encoding: `u32-BE count || commitments[0] || ...
-    /// || commitments[count-1]` (each a 48-byte `g1` compressed point).
-    /// REAL — mechanical concatenation over already-real
-    /// `g1.toBytesCompressed`, the same "allocate the exact owned
-    /// slice, encode in order" shape as `frost.
-    /// encodeGroupCommitmentList`. Caller frees the returned slice with
-    /// `allocator`.
-    pub fn toBytesAlloc(self: VerificationVector, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
-        const out = try allocator.alloc(u8, 4 + self.commitments.len * g1.compressed_bytes);
-        std.mem.writeInt(u32, out[0..4], @intCast(self.commitments.len), .big);
-        for (self.commitments, 0..) |c, i| {
-            const off = 4 + i * g1.compressed_bytes;
-            out[off..][0..g1.compressed_bytes].* = g1.toBytesCompressed(c);
-        }
-        return out;
-    }
-
-    /// Inverse of `toBytesAlloc`. REAL: validates the length-prefix
-    /// against the actual byte length, then decodes each compressed
-    /// point (on-curve and subgroup checked by `g1.fromBytesCompressed`,
-    /// so `groupPublicKey`/`derivePublicKeyShare` never fold a torsion
-    /// component from a dealer's broadcast into a key). Caller frees the returned `commitments` slice with
-    /// `allocator`.
-    pub fn fromBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) ThresholdError!VerificationVector {
-        if (bytes.len < 4) return error.InvalidEncoding;
-        const count = std.mem.readInt(u32, bytes[0..4], .big);
-        const expected_len = 4 + @as(usize, count) * g1.compressed_bytes;
-        if (bytes.len != expected_len) return error.InvalidEncoding;
-
-        const commitments = try allocator.alloc(g1.Affine, count);
-        errdefer allocator.free(commitments);
-        for (commitments, 0..) |*slot, i| {
-            const off = 4 + i * g1.compressed_bytes;
-            slot.* = try g1.fromBytesCompressed(bytes[off..][0..g1.compressed_bytes].*);
-        }
-        return .{ .commitments = commitments };
-    }
-};
-
-// ── trusted-dealer split (Shamir + Feldman) ─────────────────────────
-
-/// `splitSecretKey`'s return value: `n` shares plus the `t`-length
-/// Feldman commitment to the sharing polynomial. `shares` and
-/// `vvec.commitments` are TWO SEPARATE owned allocations (both made
-/// with the same `allocator` passed to `splitSecretKey`) — free each
-/// individually.
-pub const SplitResult = struct {
-    shares: []SecretKeyShare,
-    vvec: VerificationVector,
-};
-
-/// Trusted-dealer Shamir splitting of `sk` into `n` shares
-/// reconstructible by any `t` of them, PLUS a Feldman VSS commitment so
-/// every share is publicly checkable (`derivePublicKeyShare`) without
-/// revealing any share value. Mirrors `frost.trustedDealerKeygen`
-/// (`secret_share_shard` + `vss_commit`, RFC 9591 Appendix C.1/C.2)
-/// over THIS module's `Fr`/`g1` instead of secp256k1 — the identical
-/// two-part construction:
-///
-/// ```text
-/// // 1. secret_share_shard (Shamir): the degree-(t-1) polynomial
-/// //      f(x) = sk + coefficients[0]*x + ... + coefficients[t-2]*x^(t-1)
-/// //    (coefficients is the caller-supplied RANDOM a_1..a_{t-1}; f(0) = sk)
-/// for i in 1..=n:
-///     shares[i] = (i, f(i))                 // Horner's method — evalPolynomialAt
-///
-/// // 2. vss_commit (Feldman): one G1 commitment per coefficient
-/// commitments[0] = [sk]G1
-/// commitments[j] = [coefficients[j-1]]G1     for j in 1..t            // feldmanCommitCoefficient
-/// ```
-///
-/// `coefficients` is CALLER-SUPPLIED randomness (length exactly
-/// `t - 1`), not sampled internally — the same "deterministic entry
-/// point" shape `frost.trustedDealerKeygen` uses for its own
-/// `coefficients` parameter (reproducible tests; a real deployment's
-/// caller samples fresh coefficients via `Fr.random`/`std.Io`, once per
-/// dealing, and discards them immediately after — retaining them
-/// defeats Shamir's security exactly as retaining `sk` itself would).
-///
-/// The two inner per-iteration computations (`evalPolynomialAt`,
-/// `feldmanCommitCoefficient`) are the crypto core — see their own doc
-/// comments for the exact construction and const-time notes.
-pub fn splitSecretKey(
-    allocator: std.mem.Allocator,
-    sk: *const bls_sig.SecretKey,
-    t: u32,
-    n: u32,
-    coefficients: []const Fr,
-) ThresholdError!SplitResult {
-    return burn.run(burn.sign_burn, ThresholdError!SplitResult, splitSecretKeyBody, .{ allocator, sk, t, n, coefficients });
-}
-
-fn splitSecretKeyBody(
-    allocator: std.mem.Allocator,
-    sk: *const bls_sig.SecretKey,
-    t: u32,
-    n: u32,
-    coefficients: []const Fr,
-) ThresholdError!SplitResult {
-    if (t == 0 or n == 0 or t > n) return error.InvalidParameters;
-    if (coefficients.len != @as(usize, t) - 1) return error.InvalidParameters;
-
-    const shares = try allocator.alloc(SecretKeyShare, n);
-    errdefer {
-        // The shares are secrets: wipe them before the heap hands them on.
-        std.crypto.secureZero(u8, std.mem.sliceAsBytes(shares));
-        allocator.free(shares);
-    }
-    var i: u32 = 1;
-    while (i <= n) : (i += 1) {
-        shares[i - 1] = .{ .index = i, .scalar = evalPolynomialAt(sk.scalar, coefficients, i) };
-    }
-
-    const commitments = try allocator.alloc(g1.Affine, t);
-    errdefer allocator.free(commitments);
-    for (commitments, 0..) |*slot, j| {
-        const coeff = if (j == 0) sk.scalar else coefficients[j - 1];
-        slot.* = feldmanCommitCoefficient(coeff);
-    }
-
-    return .{ .shares = shares, .vvec = .{ .commitments = commitments } };
-}
-
 /// Shamir polynomial evaluation `f(index)` via Horner's method, over
 /// `Fr`:
 ///
@@ -400,7 +201,7 @@ fn splitSecretKeyBody(
 /// already-constant-time `add`/`mul` (`scalar.zig`, `std.crypto.ff`
 /// Montgomery arithmetic), with no secret-dependent branching (the loop
 /// bound `coefficients.len` and `index` are both PUBLIC, so looping/
-/// indexing on them is fine).
+/// indexing on them is fine). Variant-independent: a share is a scalar.
 fn evalPolynomialAt(secret: Fr, coefficients: []const Fr, index: u32) Fr {
     const x = frFromIndex(index);
     var acc = Fr.zero;
@@ -419,199 +220,435 @@ fn frFromIndex(index: u32) Fr {
     return Fr.fromBytes(buf) catch unreachable; // u32 << r: always canonical
 }
 
-/// One Feldman VSS commitment: `[coeff]G1`
-/// (`g1.Jacobian.fromAffine(g1.Affine.generator).scalarMul(coeff).
-/// toAffine()`) — PUBLIC output, but `coeff` itself is a secret
-/// polynomial coefficient (or `sk` itself, for `j == 0`), so the
-/// multiplication MUST use `g1.zig`'s constant-time `scalarMul` — this
-/// is EXACTLY `bls_sig.skToPk`'s own construction, one call site
-/// removed (`sk`/`coeff` play the identical role `SecretKey.scalar`
-/// plays there — `g1.Jacobian.scalarMul` is constant-time
-/// double-and-add-always, see `g1.zig`).
-fn feldmanCommitCoefficient(coeff: Fr) g1.Affine {
-    return g1.Jacobian.fromAffine(g1.Affine.generator).scalarMul(coeff).toAffine();
-}
+// ── the threshold layer of one ciphersuite ──────────────────────────
 
-// ── public-key-share derivation ─────────────────────────────────────
-
-/// The group's BLS public key: `vvec.commitments[0]`, i.e. `[sk]G1` —
-/// the same "`vss_commitment[0]` IS the group public key" identity RFC
-/// 9591 Appendix C documents (`frost.TrustedDealerKeygenResult.
-/// group_public_key`). REAL: plain indexing, no field/group arithmetic
-/// of its own — `commitments[0]` was already computed (by
-/// `splitSecretKey`, or by a caller
-/// constructing a `VerificationVector` some other way).
-pub fn groupPublicKey(vvec: VerificationVector) bls_sig.PublicKey {
-    return .{ .point = vvec.commitments[0] };
-}
-
-/// Evaluates the Feldman commitment polynomial
-/// `C(x) = commitments[0] + commitments[1]*x + ... + commitments[t-1]*x^(t-1)`
-/// AT `x = index`, IN THE EXPONENT — no discrete log needed, since
-/// `C(x) == [f(x)]G1` for the SAME sharing polynomial `f`
-/// `splitSecretKey` dealt shares from (linearity of `[.]G1` in the
-/// coefficients). This reconstructs participant `index`'s PUBLIC key
-/// share WITHOUT ever seeing that participant's secret share `f(index)`
-/// — the defining VSS-consistency property: `derivePublicKeyShare(vvec,
-/// i)` MUST equal `[share_i]G1` for every share `splitSecretKey` dealt,
-/// which is exactly what this file's Feldman-consistency test checks.
+/// Trusted-dealer threshold BLS over the ciphersuite `scheme.Bls(variant,
+/// scheme)` — the same generalisation `scheme.zig` made of the signature
+/// suites: `PkGroup` carries the Feldman commitments, the public key
+/// shares and the group key (`G1` for min-pk, `G2` for min-sig), and
+/// `SigGroup` the partial and combined signatures (`G2` for min-pk, `G1`
+/// for min-sig). `partialSign`/`verifyPartialSignature` are the suite's
+/// own `sign`/`verify` under a share, so the combined signature is
+/// byte-for-byte that suite's `sign(&sk, msg)`.
 ///
-/// Construction — Horner's method IN THE EXPONENT (mirrors
-/// `evalPolynomialAt`'s scalar-field Horner loop one tower level up;
-/// `index` is PUBLIC here, unlike `evalPolynomialAt`'s secret
-/// coefficients, so a variable-time ladder would be an acceptable
-/// follow-up optimization once correctness is established — not a
-/// requirement for the first crypto-core pass):
-///
-/// ```text
-/// x = Fr(index)                                   // same u32 -> Fr conversion as evalPolynomialAt
-/// acc = commitments[t-1]
-/// for j in (t-2)..=0:
-///     acc = [x]acc + commitments[j]                // g1 scalarMul (by x) + g1 add
-/// return PublicKeyShare{ .index = index, .point = acc }   // == Σ_j x^j * commitments[j]
-/// ```
-pub fn derivePublicKeyShare(vvec: VerificationVector, index: u32) PublicKeyShare {
-    const x = frFromIndex(index);
-    const commitments = vvec.commitments;
-    var acc = g1.Jacobian.fromAffine(commitments[commitments.len - 1]);
-    var j: usize = commitments.len - 1;
-    while (j > 0) : (j -= 1) {
-        acc = acc.scalarMul(x).add(g1.Jacobian.fromAffine(commitments[j - 1]));
-    }
-    return .{ .index = index, .point = acc.toAffine() };
-}
+/// Basic and ProofOfPossession only. MessageAugmentation signs
+/// `SkToPk(SK) || msg` (draft §3.2.1): under a share that prefix is the
+/// share's own public key, a different message per signer, so the
+/// partials do not interpolate to `sign(&sk, msg)` — rejected at compile
+/// time rather than produce a signature nothing verifies. Threshold
+/// deployments use Basic (drand: min-pk chained and min-sig quicknet)
+/// or POP.
+pub fn Threshold(comptime variant: schememod.Variant, comptime scheme: schememod.Scheme) type {
+    if (scheme == .message_augmentation)
+        @compileError("threshold BLS: MessageAugmentation signs SkToPk(share) || msg, which does not interpolate; use .basic or .proof_of_possession");
+    return struct {
+        const Layer = @This();
+        /// The ciphersuite this threshold layer signs and verifies under.
+        pub const Suite = schememod.Bls(variant, scheme);
+        /// The group of the commitments, key shares and group key.
+        pub const PkGroup = Suite.PkGroup;
+        /// The group of the partial and combined signatures.
+        pub const SigGroup = Suite.SigGroup;
 
-// ── partial signing / verification (REAL — thin over Part 4) ───────
+        /// Participant `index`'s PUBLIC verifying share `[share_i]P` (a
+        /// `PkGroup` point, the suite's `PublicKey` shape). Obtained
+        /// either by evaluating a dealer's `VerificationVector` at `index`
+        /// (`derivePublicKeyShare`, without ever seeing `share_i` itself —
+        /// the VSS-consistency property) or, degenerately, by a participant
+        /// computing `Suite.skToPk` on their own `SecretKeyShare` directly.
+        pub const PublicKeyShare = struct {
+            index: u32,
+            point: PkGroup.Affine,
 
-/// A participant's non-interactive partial signature:
-/// `[share.scalar]Q` where `Q = hashToCurveG2(msg, bls_sig.dst_sig)` —
-/// EXACTLY Part 4's `bls_sig.sign`, just called with the SHARE's scalar
-/// instead of the whole secret key. This is the entire reason
-/// threshold BLS needs no interactive signing round: `sign`'s equation
-/// `R = SK * Q` is LINEAR in `SK`, so any Shamir-shared piece of `SK`
-/// produces a correspondingly-shared piece of `R`, and Lagrange
-/// interpolation in the exponent (`combineSignatures`) recombines the
-/// pieces exactly as it would recombine the secret key itself. REAL: a
-/// thin, judgment-free wrapper over Part 4's already-real, already-
-/// constant-time `bls_sig.sign` — no new crypto judgment is introduced
-/// here.
-pub fn partialSign(share: *const SecretKeyShare, msg: []const u8) PartialSignature {
-    return burn.run(burn.sign_burn, PartialSignature, partialSignBody, .{ share, msg });
-}
+            /// 52 bytes for min-pk, 100 for min-sig.
+            pub const encoded_bytes = 4 + PkGroup.compressed_bytes;
 
-fn partialSignBody(share: *const SecretKeyShare, msg: []const u8) PartialSignature {
-    const partial_sk: bls_sig.SecretKey = .{ .scalar = share.scalar };
-    const sig = bls_sig.sign(&partial_sk, msg);
-    return .{ .index = share.index, .point = sig.point };
-}
+            /// REAL: `index` big-endian `||` the compressed point.
+            pub fn toBytes(self: Layer.PublicKeyShare) [encoded_bytes]u8 {
+                var out: [encoded_bytes]u8 = undefined;
+                std.mem.writeInt(u32, out[0..4], self.index, .big);
+                out[4..encoded_bytes].* = PkGroup.toBytesCompressed(self.point);
+                return out;
+            }
 
-/// Checks partial signature `partial` against participant `partial.
-/// index`'s public key share `pk_share` (obtained via
-/// `derivePublicKeyShare`, or a participant's own `bls_sig.skToPk` on
-/// their `SecretKeyShare`) — lets a Coordinator identify a misbehaving
-/// signer BEFORE combining, the same "Identifiable Abort" motivation as
-/// `frost.verifySignatureShare`. REAL: once unwrapped, `pk_share.point`
-/// and `partial.point` are literally a `bls_sig.PublicKey`/`bls_sig.
-/// Signature` pair, and `partialSign`'s construction (above) IS
-/// `bls_sig.sign` under a share-derived key — `bls_sig.verify`'s
-/// existing pairing equation checks it back exactly the same way it
-/// checks any ordinary BLS signature (`e(pk_share, Q) == e(G1_gen,
-/// partial)`), including ALL of that function's mandatory fail-closed
-/// subgroup/`keyValidate` checks. This is a thin wrapper, not new
-/// crypto. Returns `false` (never panics) on an index mismatch between
-/// `pk_share`/`partial` — a caller bug this function can and should
-/// catch cheaply before doing any pairing work.
-pub fn verifyPartialSignature(pk_share: PublicKeyShare, msg: []const u8, partial: PartialSignature) bool {
-    if (pk_share.index != partial.index) return false;
-    const pk: bls_sig.PublicKey = .{ .point = pk_share.point };
-    const sig: bls_sig.Signature = .{ .point = partial.point };
-    return bls_sig.verify(pk, msg, sig);
-}
+            /// REAL. Rejects `index == 0`; `point` is checked on-curve and
+            /// in the subgroup by `fromBytesCompressed` (the identity still
+            /// decodes; `verifyPartialSignature` refuses it through the
+            /// suite's `verify` and its `keyValidate`).
+            pub fn fromBytes(bytes: [encoded_bytes]u8) ThresholdError!Layer.PublicKeyShare {
+                const index = std.mem.readInt(u32, bytes[0..4], .big);
+                if (index == 0) return error.ZeroIndex;
+                const point = try PkGroup.fromBytesCompressed(bytes[4..encoded_bytes].*);
+                return .{ .index = index, .point = point };
+            }
+        };
 
-// ── combining (SECURITY-CRITICAL) ───────────────────────────────────
+        /// Participant `index`'s partial signature: `[share_i]H(msg)` (a
+        /// `SigGroup` point, the suite's `Signature` shape). Produced by
+        /// `partialSign`, consumed by `verifyPartialSignature` and
+        /// `combineSignatures`.
+        pub const PartialSignature = struct {
+            index: u32,
+            point: SigGroup.Affine,
 
-/// Combines `t` (or more) valid, distinctly-indexed partial signatures
-/// into ONE ordinary BLS `Signature` — byte-for-byte the SAME signature
-/// `bls_sig.sign(&sk, msg)` would have produced directly, because
-/// Lagrange interpolation in the exponent reconstructs `[sk]Q` from the
-/// partials' `[share_i]Q` pieces exactly as `frost.secretShareCombine`
-/// (or this file's own `evalPolynomialAt`'s scalar-field inverse
-/// operation) reconstructs `sk` itself from `share_i` values — only
-/// every scalar multiplication happens in `G2` (on `Q`) instead of on
-/// the scalar field directly:
-///
-/// ```text
-/// x_coords = [i for (i, _) in partials]
-/// combined = Identity_G2
-/// for (i, partial_i) in partials:
-///     lambda_i = Π_{j in x_coords, j != i} (0 - x_j) / (x_i - x_j)   // Fr; division via Fr.inv
-///     combined = combined + [lambda_i] * partial_i                    // g2 scalarMul + g2 add
-/// return Signature{ .point = combined.toAffine() }
-/// ```
-///
-/// **The Lagrange coefficient formula** (identical in shape to
-/// `frost.deriveInterpolatingValue`'s, restated here for this module's
-/// own `Fr` and its `u32` indices):
-///
-/// ```text
-/// lambda_i = Π_{j != i} (0 - x_j) / (x_i - x_j)
-///          = Π_{j != i} (-x_j) * (x_i - x_j)^-1        // x_j, x_i as Fr(index)
-/// ```
-///
-/// — evaluating the unique degree-`(t-1)` polynomial the dealt shares
-/// lie on AT `x = 0` (`splitSecretKey`'s own `f(0) = sk`). Requires
-/// `>= t` DISTINCT indices among `partials` (validated below, REAL);
-/// using MORE than `t` distinct, mutually-consistent partials is
-/// mathematically fine — an over-determined but internally-consistent
-/// Lagrange interpolation reconstructs the SAME unique low-degree
-/// polynomial (the identical reasoning `frost.secretShareCombine`'s own
-/// doc comment gives for accepting an arbitrary-size `shares` slice
-/// without a separate `t` check on ITS OWN — this function is handed an
-/// explicit `t` instead so it can reject a too-small set up front,
-/// before doing any curve arithmetic).
-///
-/// The distinct-index / minimum-count / nonzero-index precondition
-/// checks below run first (mechanical, no field/group arithmetic — same
-/// `O(n^2)` public-index comparison `frost.deriveInterpolatingValue`/
-/// `secretShareCombine` use; index `0` is additionally rejected here
-/// because an in-memory-constructed partial bypasses
-/// `PartialSignature.fromBytes`'s own `ZeroIndex` check, and `x = 0` as
-/// a Lagrange node would silently return that partial VERBATIM instead
-/// of interpolating — actively wrong, not merely undefined). All index
-/// arithmetic is over PUBLIC values (see the module doc comment's
-/// const-time note); `Fr.inv` is constant-time regardless.
-pub fn combineSignatures(partials: []const PartialSignature, t: u32) ThresholdError!bls_sig.Signature {
-    if (t == 0 or partials.len < t) return error.InsufficientShares;
-    for (partials, 0..) |a, i| {
-        if (a.index == 0) return error.ZeroIndex;
-        for (partials[i + 1 ..]) |b| {
-            if (a.index == b.index) return error.DuplicateIndex;
+            /// 100 bytes for min-pk, 52 for min-sig.
+            pub const encoded_bytes = 4 + SigGroup.compressed_bytes;
+
+            /// REAL: `index` big-endian `||` the compressed point.
+            pub fn toBytes(self: Layer.PartialSignature) [encoded_bytes]u8 {
+                var out: [encoded_bytes]u8 = undefined;
+                std.mem.writeInt(u32, out[0..4], self.index, .big);
+                out[4..encoded_bytes].* = SigGroup.toBytesCompressed(self.point);
+                return out;
+            }
+
+            /// REAL. Rejects `index == 0`; `point` is checked on-curve and
+            /// in the subgroup by `fromBytesCompressed`, so
+            /// `combineSignatures` never sees a torsion component from a
+            /// decoded partial.
+            pub fn fromBytes(bytes: [encoded_bytes]u8) ThresholdError!Layer.PartialSignature {
+                const index = std.mem.readInt(u32, bytes[0..4], .big);
+                if (index == 0) return error.ZeroIndex;
+                const point = try SigGroup.fromBytesCompressed(bytes[4..encoded_bytes].*);
+                return .{ .index = index, .point = point };
+            }
+        };
+
+        /// A Feldman VSS commitment to the dealer's degree-`(t-1)` sharing
+        /// polynomial `f(x) = sk + a_1*x + a_2*x^2 + ... + a_{t-1}*x^{t-1}`:
+        /// `commitments[j] = [a_j]P` (`P` the `PkGroup` generator) for `j`
+        /// in `0..t` (`a_0 := sk`), so `commitments[0] == [sk]P`
+        /// (`groupPublicKey`) and `commitments.len == t` (`threshold()`).
+        /// PUBLIC — this is the information the dealer broadcasts alongside
+        /// the (secret, out-of-band) per-participant shares, letting every
+        /// participant verify their own share (and derive anyone else's
+        /// PUBLIC key share) without trusting the dealer any further. Owned
+        /// slice: free `commitments` with the same allocator that produced
+        /// it (`splitSecretKey`/`fromBytesAlloc`).
+        pub const VerificationVector = struct {
+            commitments: []const PkGroup.Affine,
+
+            /// `t`, the reconstruction threshold this vector commits to.
+            /// REAL: plain length read.
+            pub fn threshold(self: Layer.VerificationVector) usize {
+                return self.commitments.len;
+            }
+
+            /// Length-prefixed encoding: `u32-BE count || commitments[0] ||
+            /// ... || commitments[count-1]` (each a compressed `PkGroup`
+            /// point: 48 bytes for min-pk, 96 for min-sig). REAL —
+            /// mechanical concatenation, the same "allocate the exact owned
+            /// slice, encode in order" shape as `frost.
+            /// encodeGroupCommitmentList`. Caller frees the returned slice
+            /// with `allocator`.
+            pub fn toBytesAlloc(self: Layer.VerificationVector, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+                const out = try allocator.alloc(u8, 4 + self.commitments.len * PkGroup.compressed_bytes);
+                std.mem.writeInt(u32, out[0..4], @intCast(self.commitments.len), .big);
+                for (self.commitments, 0..) |c, i| {
+                    const off = 4 + i * PkGroup.compressed_bytes;
+                    out[off..][0..PkGroup.compressed_bytes].* = PkGroup.toBytesCompressed(c);
+                }
+                return out;
+            }
+
+            /// Inverse of `toBytesAlloc`. REAL: validates the length-prefix
+            /// against the actual byte length, then decodes each compressed
+            /// point (on-curve and subgroup checked by
+            /// `fromBytesCompressed`, so `groupPublicKey`/
+            /// `derivePublicKeyShare` never fold a torsion component from a
+            /// dealer's broadcast into a key). Caller frees the returned
+            /// `commitments` slice with `allocator`.
+            pub fn fromBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) ThresholdError!Layer.VerificationVector {
+                if (bytes.len < 4) return error.InvalidEncoding;
+                const count = std.mem.readInt(u32, bytes[0..4], .big);
+                const expected_len = 4 + @as(usize, count) * PkGroup.compressed_bytes;
+                if (bytes.len != expected_len) return error.InvalidEncoding;
+
+                const commitments = try allocator.alloc(PkGroup.Affine, count);
+                errdefer allocator.free(commitments);
+                for (commitments, 0..) |*slot, i| {
+                    const off = 4 + i * PkGroup.compressed_bytes;
+                    slot.* = try PkGroup.fromBytesCompressed(bytes[off..][0..PkGroup.compressed_bytes].*);
+                }
+                return .{ .commitments = commitments };
+            }
+        };
+
+        // ── trusted-dealer split (Shamir + Feldman) ─────────────────
+
+        /// `splitSecretKey`'s return value: `n` shares plus the `t`-length
+        /// Feldman commitment to the sharing polynomial. `shares` and
+        /// `vvec.commitments` are TWO SEPARATE owned allocations (both made
+        /// with the same `allocator` passed to `splitSecretKey`) — free
+        /// each individually.
+        pub const SplitResult = struct {
+            shares: []SecretKeyShare,
+            vvec: Layer.VerificationVector,
+        };
+
+        /// Trusted-dealer Shamir splitting of `sk` into `n` shares
+        /// reconstructible by any `t` of them, PLUS a Feldman VSS
+        /// commitment so every share is publicly checkable
+        /// (`derivePublicKeyShare`) without revealing any share value.
+        /// Mirrors `frost.trustedDealerKeygen` (`secret_share_shard` +
+        /// `vss_commit`, RFC 9591 Appendix C.1/C.2) over THIS module's
+        /// `Fr`/`PkGroup` instead of secp256k1 — the identical two-part
+        /// construction:
+        ///
+        /// ```text
+        /// // 1. secret_share_shard (Shamir): the degree-(t-1) polynomial
+        /// //      f(x) = sk + coefficients[0]*x + ... + coefficients[t-2]*x^(t-1)
+        /// //    (coefficients is the caller-supplied RANDOM a_1..a_{t-1}; f(0) = sk)
+        /// for i in 1..=n:
+        ///     shares[i] = (i, f(i))                 // Horner's method — evalPolynomialAt
+        ///
+        /// // 2. vss_commit (Feldman): one PkGroup commitment per coefficient
+        /// commitments[0] = [sk]P
+        /// commitments[j] = [coefficients[j-1]]P      for j in 1..t            // feldmanCommitCoefficient
+        /// ```
+        ///
+        /// `coefficients` is CALLER-SUPPLIED randomness (length exactly
+        /// `t - 1`), not sampled internally — the same "deterministic entry
+        /// point" shape `frost.trustedDealerKeygen` uses for its own
+        /// `coefficients` parameter (reproducible tests; a real
+        /// deployment's caller samples fresh coefficients via
+        /// `Fr.random`/`std.Io`, once per dealing, and discards them
+        /// immediately after — retaining them defeats Shamir's security
+        /// exactly as retaining `sk` itself would). The shares are the same
+        /// for every ciphersuite; only the commitments' group differs.
+        pub fn splitSecretKey(
+            allocator: std.mem.Allocator,
+            sk: *const bls_sig.SecretKey,
+            t: u32,
+            n: u32,
+            coefficients: []const Fr,
+        ) ThresholdError!Layer.SplitResult {
+            return burn.run(burn.sign_burn, ThresholdError!Layer.SplitResult, splitSecretKeyBody, .{ allocator, sk, t, n, coefficients });
         }
-    }
 
-    var combined = g2.Jacobian.identity;
-    for (partials) |partial_i| {
-        // lambda_i = Π_{j != i} x_j * (x_j - x_i)^-1 — frost.
-        // deriveInterpolatingValue's exact numerator/denominator-product
-        // form (equivalently Π (0 - x_j)/(x_i - x_j): both signs flip,
-        // so the quotient is identical).
-        const xi = frFromIndex(partial_i.index);
-        var numerator = Fr.one;
-        var denominator = Fr.one;
-        for (partials) |partial_j| {
-            if (partial_j.index == partial_i.index) continue;
-            const xj = frFromIndex(partial_j.index);
-            numerator = numerator.mul(xj);
-            denominator = denominator.mul(xj.sub(xi));
+        fn splitSecretKeyBody(
+            allocator: std.mem.Allocator,
+            sk: *const bls_sig.SecretKey,
+            t: u32,
+            n: u32,
+            coefficients: []const Fr,
+        ) ThresholdError!Layer.SplitResult {
+            if (t == 0 or n == 0 or t > n) return error.InvalidParameters;
+            if (coefficients.len != @as(usize, t) - 1) return error.InvalidParameters;
+
+            const shares = try allocator.alloc(SecretKeyShare, n);
+            errdefer {
+                // The shares are secrets: wipe them before the heap hands them on.
+                std.crypto.secureZero(u8, std.mem.sliceAsBytes(shares));
+                allocator.free(shares);
+            }
+            var i: u32 = 1;
+            while (i <= n) : (i += 1) {
+                shares[i - 1] = .{ .index = i, .scalar = evalPolynomialAt(sk.scalar, coefficients, i) };
+            }
+
+            const commitments = try allocator.alloc(PkGroup.Affine, t);
+            errdefer allocator.free(commitments);
+            for (commitments, 0..) |*slot, j| {
+                const coeff = if (j == 0) sk.scalar else coefficients[j - 1];
+                slot.* = feldmanCommitCoefficient(coeff);
+            }
+
+            return .{ .shares = shares, .vvec = .{ .commitments = commitments } };
         }
-        // Every factor x_j - x_i is nonzero (indices are distinct u32s
-        // < r, so distinct as Fr elements), and a product of nonzero
-        // elements of the prime field Fr is nonzero — invertible.
-        const lambda_i = numerator.mul(denominator.inv() catch unreachable);
-        combined = combined.add(g2.Jacobian.fromAffine(partial_i.point).scalarMul(lambda_i));
-    }
-    return .{ .point = combined.toAffine() };
+
+        /// One Feldman VSS commitment: `[coeff]P` — PUBLIC output, but
+        /// `coeff` itself is a secret polynomial coefficient (or `sk`
+        /// itself, for `j == 0`), so the multiplication MUST use the
+        /// group's constant-time `scalarMul` — this is EXACTLY the suite's
+        /// `skToPk` construction, one call site removed (`g1.zig`'s and
+        /// `g2.zig`'s `Jacobian.scalarMul` are both constant-time
+        /// double-and-add-always).
+        fn feldmanCommitCoefficient(coeff: Fr) PkGroup.Affine {
+            return PkGroup.Jacobian.fromAffine(PkGroup.Affine.generator).scalarMul(coeff).toAffine();
+        }
+
+        // ── public-key-share derivation ─────────────────────────────
+
+        /// The group's BLS public key: `vvec.commitments[0]`, i.e.
+        /// `[sk]P` — the same "`vss_commitment[0]` IS the group public key"
+        /// identity RFC 9591 Appendix C documents (`frost.
+        /// TrustedDealerKeygenResult.group_public_key`). REAL: plain
+        /// indexing, no field/group arithmetic of its own.
+        pub fn groupPublicKey(vvec: Layer.VerificationVector) Suite.PublicKey {
+            return .{ .point = vvec.commitments[0] };
+        }
+
+        /// Evaluates the Feldman commitment polynomial
+        /// `C(x) = commitments[0] + commitments[1]*x + ... + commitments[t-1]*x^(t-1)`
+        /// AT `x = index`, IN THE EXPONENT — no discrete log needed, since
+        /// `C(x) == [f(x)]P` for the SAME sharing polynomial `f`
+        /// `splitSecretKey` dealt shares from (linearity of `[.]P` in the
+        /// coefficients). This reconstructs participant `index`'s PUBLIC
+        /// key share WITHOUT ever seeing that participant's secret share
+        /// `f(index)` — the defining VSS-consistency property:
+        /// `derivePublicKeyShare(vvec, i)` MUST equal `[share_i]P` for every
+        /// share `splitSecretKey` dealt, which is exactly what this file's
+        /// Feldman-consistency test checks.
+        ///
+        /// Construction — Horner's method IN THE EXPONENT (mirrors
+        /// `evalPolynomialAt`'s scalar-field Horner loop one tower level
+        /// up; `index` is PUBLIC here, unlike `evalPolynomialAt`'s secret
+        /// coefficients, so a variable-time ladder would be an acceptable
+        /// follow-up optimization):
+        ///
+        /// ```text
+        /// x = Fr(index)
+        /// acc = commitments[t-1]
+        /// for j in (t-2)..=0:
+        ///     acc = [x]acc + commitments[j]
+        /// return PublicKeyShare{ .index = index, .point = acc }   // == Σ_j x^j * commitments[j]
+        /// ```
+        pub fn derivePublicKeyShare(vvec: Layer.VerificationVector, index: u32) Layer.PublicKeyShare {
+            const x = frFromIndex(index);
+            const commitments = vvec.commitments;
+            var acc = PkGroup.Jacobian.fromAffine(commitments[commitments.len - 1]);
+            var j: usize = commitments.len - 1;
+            while (j > 0) : (j -= 1) {
+                acc = acc.scalarMul(x).add(PkGroup.Jacobian.fromAffine(commitments[j - 1]));
+            }
+            return .{ .index = index, .point = acc.toAffine() };
+        }
+
+        // ── partial signing / verification (thin over the suite) ────
+
+        /// A participant's non-interactive partial signature:
+        /// `[share.scalar]H(msg)` — EXACTLY the suite's `sign`, called with
+        /// the SHARE's scalar instead of the whole secret key. This is the
+        /// entire reason threshold BLS needs no interactive signing round:
+        /// `sign`'s equation `R = SK * H(msg)` is LINEAR in `SK`, so any
+        /// Shamir-shared piece of `SK` produces a correspondingly-shared
+        /// piece of `R`, and Lagrange interpolation in the exponent
+        /// (`combineSignatures`) recombines the pieces exactly as it would
+        /// recombine the secret key itself. A thin wrapper over the
+        /// suite's already-constant-time `sign`.
+        pub fn partialSign(share: *const SecretKeyShare, msg: []const u8) Layer.PartialSignature {
+            return burn.run(burn.sign_burn, Layer.PartialSignature, partialSignBody, .{ share, msg });
+        }
+
+        fn partialSignBody(share: *const SecretKeyShare, msg: []const u8) Layer.PartialSignature {
+            const partial_sk: bls_sig.SecretKey = .{ .scalar = share.scalar };
+            const sig = Suite.sign(&partial_sk, msg);
+            return .{ .index = share.index, .point = sig.point };
+        }
+
+        /// Checks partial signature `partial` against participant
+        /// `partial.index`'s public key share `pk_share` (obtained via
+        /// `derivePublicKeyShare`, or a participant's own `Suite.skToPk` on
+        /// their `SecretKeyShare`) — lets a Coordinator identify a
+        /// misbehaving signer BEFORE combining, the same "Identifiable
+        /// Abort" motivation as `frost.verifySignatureShare`. Once
+        /// unwrapped, `pk_share.point` and `partial.point` are literally a
+        /// `Suite.PublicKey`/`Suite.Signature` pair, checked by the suite's
+        /// own `verify`, including ALL of that function's mandatory
+        /// fail-closed subgroup/`keyValidate` checks. Returns `false`
+        /// (never panics) on an index mismatch between `pk_share`/`partial`
+        /// — a caller bug this function catches before any pairing work.
+        pub fn verifyPartialSignature(pk_share: Layer.PublicKeyShare, msg: []const u8, partial: Layer.PartialSignature) bool {
+            if (pk_share.index != partial.index) return false;
+            const pk: Suite.PublicKey = .{ .point = pk_share.point };
+            const sig: Suite.Signature = .{ .point = partial.point };
+            return Suite.verify(pk, msg, sig);
+        }
+
+        // ── combining (SECURITY-CRITICAL) ───────────────────────────
+
+        /// Combines `t` (or more) valid, distinctly-indexed partial
+        /// signatures into ONE ordinary `Suite.Signature` — byte-for-byte
+        /// the SAME signature `Suite.sign(&sk, msg)` would have produced
+        /// directly, because Lagrange interpolation in the exponent
+        /// reconstructs `[sk]H(msg)` from the partials' `[share_i]H(msg)`
+        /// pieces exactly as `frost.secretShareCombine` reconstructs `sk`
+        /// itself from `share_i` values — only every scalar multiplication
+        /// happens in `SigGroup` instead of on the scalar field directly:
+        ///
+        /// ```text
+        /// x_coords = [i for (i, _) in partials]
+        /// combined = Identity
+        /// for (i, partial_i) in partials:
+        ///     lambda_i = Π_{j in x_coords, j != i} (0 - x_j) / (x_i - x_j)   // Fr; division via Fr.inv
+        ///     combined = combined + [lambda_i] * partial_i
+        /// return Signature{ .point = combined.toAffine() }
+        /// ```
+        ///
+        /// — evaluating the unique degree-`(t-1)` polynomial the dealt
+        /// shares lie on AT `x = 0` (`splitSecretKey`'s own `f(0) = sk`).
+        /// Requires `>= t` DISTINCT indices among `partials` (validated
+        /// first); MORE than `t` distinct, mutually-consistent partials
+        /// reconstruct the SAME unique low-degree polynomial (the reasoning
+        /// `frost.secretShareCombine`'s own doc comment gives). The explicit
+        /// `t` lets a too-small set be refused up front.
+        ///
+        /// The distinct-index / minimum-count / nonzero-index checks run
+        /// first (mechanical, no field/group arithmetic — the same `O(n^2)`
+        /// public-index comparison `frost.deriveInterpolatingValue`/
+        /// `secretShareCombine` use; index `0` is additionally rejected
+        /// here because an in-memory-constructed partial bypasses
+        /// `PartialSignature.fromBytes`'s own `ZeroIndex` check, and `x = 0`
+        /// as a Lagrange node would silently return that partial VERBATIM
+        /// instead of interpolating). All index arithmetic is over PUBLIC
+        /// values (see the module doc comment's const-time note); `Fr.inv`
+        /// is constant-time regardless.
+        pub fn combineSignatures(partials: []const Layer.PartialSignature, t: u32) ThresholdError!Suite.Signature {
+            if (t == 0 or partials.len < t) return error.InsufficientShares;
+            for (partials, 0..) |a, i| {
+                if (a.index == 0) return error.ZeroIndex;
+                for (partials[i + 1 ..]) |b| {
+                    if (a.index == b.index) return error.DuplicateIndex;
+                }
+            }
+
+            var combined = SigGroup.Jacobian.identity;
+            for (partials) |partial_i| {
+                // lambda_i = Π_{j != i} x_j * (x_j - x_i)^-1 — frost.
+                // deriveInterpolatingValue's exact numerator/denominator-
+                // product form (equivalently Π (0 - x_j)/(x_i - x_j): both
+                // signs flip, so the quotient is identical).
+                const xi = frFromIndex(partial_i.index);
+                var numerator = Fr.one;
+                var denominator = Fr.one;
+                for (partials) |partial_j| {
+                    if (partial_j.index == partial_i.index) continue;
+                    const xj = frFromIndex(partial_j.index);
+                    numerator = numerator.mul(xj);
+                    denominator = denominator.mul(xj.sub(xi));
+                }
+                // Every factor x_j - x_i is nonzero (indices are distinct
+                // u32s < r, so distinct as Fr elements), and a product of
+                // nonzero elements of the prime field Fr is nonzero —
+                // invertible.
+                const lambda_i = numerator.mul(denominator.inv() catch unreachable);
+                combined = combined.add(SigGroup.Jacobian.fromAffine(partial_i.point).scalarMul(lambda_i));
+            }
+            return .{ .point = combined.toAffine() };
+        }
+    };
 }
+
+/// The min-pk ProofOfPossession threshold layer — Ethereum's suite and
+/// `bls_sig`'s file-level one. The file-level names below are this
+/// instance, kept as they were before min-sig existed.
+pub const MinPk = Threshold(.min_pk, .proof_of_possession);
+/// The min-sig ProofOfPossession threshold layer (`G2` keys and commitments,
+/// `G1` partial and combined signatures; signs and verifies as
+/// `bls_sig.MinSigPop`). `Threshold(.min_sig, .basic)` is drand quicknet's.
+pub const MinSig = Threshold(.min_sig, .proof_of_possession);
+
+pub const PublicKeyShare = MinPk.PublicKeyShare;
+pub const PartialSignature = MinPk.PartialSignature;
+pub const VerificationVector = MinPk.VerificationVector;
+pub const SplitResult = MinPk.SplitResult;
+pub const splitSecretKey = MinPk.splitSecretKey;
+pub const groupPublicKey = MinPk.groupPublicKey;
+pub const derivePublicKeyShare = MinPk.derivePublicKeyShare;
+pub const partialSign = MinPk.partialSign;
+pub const verifyPartialSignature = MinPk.verifyPartialSignature;
+pub const combineSignatures = MinPk.combineSignatures;
 
 // ── tests: wire/plumbing ─────────────────────────────────────────────
 
@@ -991,4 +1028,270 @@ test "(t=n=4) end-to-end keystone chain (every share required)" {
     const expected = bls_sig.sign(&built.sk, msg);
     try std.testing.expectEqualSlices(u8, &expected.toBytes(), &combined.toBytes());
     try std.testing.expect(bls_sig.verify(groupPublicKey(built.split.vvec), msg, combined));
+}
+
+// ── tests: the min-sig instances (mirrors of the min-pk tests above) ─
+
+/// The min-sig threshold layers under test: POP (`MinSig`) and Basic
+/// (drand quicknet's suite).
+const min_sig_layers = .{ MinSig, Threshold(.min_sig, .basic) };
+
+/// `testSplit` for any threshold layer `T`, same deterministic knobs.
+fn testSplitT(comptime T: type, allocator: std.mem.Allocator, ikm_byte: u8, t: u32, n: u32) !struct { sk: bls_sig.SecretKey, split: T.SplitResult } {
+    var sk: bls_sig.SecretKey = undefined;
+    try bls_sig.keyGen(&sk, &(@as([32]u8, @splat(ikm_byte))), "");
+    var coeffs: [8]Fr = undefined;
+    var j: usize = 0;
+    while (j < t - 1) : (j += 1) {
+        var seed = @as([32]u8, @splat(0));
+        seed[31] = @intCast(j + 1);
+        seed[30] = ikm_byte;
+        coeffs[j] = Fr.reduceWide(&seed);
+    }
+    const split = try T.splitSecretKey(allocator, &sk, t, n, coeffs[0 .. t - 1]);
+    return .{ .sk = sk, .split = split };
+}
+
+/// Reconstructs `f(0)` from shares by Lagrange interpolation over `Fr` —
+/// the test-side oracle for "the reconstructed key": independent of any
+/// group, so a combined signature can be compared with `sign` under it.
+fn reconstructSecret(shares: []const SecretKeyShare) bls_sig.SecretKey {
+    var acc = Fr.zero;
+    for (shares) |si| {
+        const xi = frFromIndex(si.index);
+        var num = Fr.one;
+        var den = Fr.one;
+        for (shares) |sj| {
+            if (sj.index == si.index) continue;
+            const xj = frFromIndex(sj.index);
+            num = num.mul(xj);
+            den = den.mul(xj.sub(xi));
+        }
+        acc = acc.add(si.scalar.mul(num.mul(den.inv() catch unreachable)));
+    }
+    return .{ .scalar = acc };
+}
+
+test "min-sig: the layer's groups and wire sizes are the min-pk ones swapped" {
+    inline for (min_sig_layers) |T| {
+        try std.testing.expect(T.PkGroup == g2);
+        try std.testing.expect(T.SigGroup == g1);
+        try std.testing.expectEqual(@as(usize, 100), T.PublicKeyShare.encoded_bytes);
+        try std.testing.expectEqual(@as(usize, 52), T.PartialSignature.encoded_bytes);
+    }
+    try std.testing.expect(MinPk.PkGroup == g1);
+    try std.testing.expect(MinPk.SigGroup == g2);
+    try std.testing.expect(MinSig.Suite == bls_sig.MinSigPop);
+    try std.testing.expect(MinPk.Suite == bls_sig.MinPkPop);
+}
+
+test "min-sig: PublicKeyShare/PartialSignature codecs round-trip and refuse a zero index" {
+    inline for (min_sig_layers) |T| {
+        const pk_share: T.PublicKeyShare = .{ .index = 5, .point = g2.Affine.generator };
+        const pk_back = try T.PublicKeyShare.fromBytes(pk_share.toBytes());
+        try std.testing.expectEqual(pk_share.index, pk_back.index);
+        try std.testing.expectEqualSlices(u8, &pk_share.toBytes(), &pk_back.toBytes());
+
+        const partial: T.PartialSignature = .{ .index = 2, .point = g1.Affine.generator };
+        const partial_back = try T.PartialSignature.fromBytes(partial.toBytes());
+        try std.testing.expectEqual(partial.index, partial_back.index);
+        try std.testing.expectEqualSlices(u8, &partial.toBytes(), &partial_back.toBytes());
+
+        var pk_bytes = pk_share.toBytes();
+        @memset(pk_bytes[0..4], 0);
+        try std.testing.expectError(error.ZeroIndex, T.PublicKeyShare.fromBytes(pk_bytes));
+        var sig_bytes = partial.toBytes();
+        @memset(sig_bytes[0..4], 0);
+        try std.testing.expectError(error.ZeroIndex, T.PartialSignature.fromBytes(sig_bytes));
+    }
+}
+
+test "min-sig: VerificationVector codec round-trips G2 commitments and refuses a length/count mismatch" {
+    const allocator = std.testing.allocator;
+    inline for (min_sig_layers) |T| {
+        const commitments = [_]g2.Affine{
+            g2.Affine.generator,
+            g2.Jacobian.fromAffine(g2.Affine.generator).double().toAffine(),
+        };
+        const vvec: T.VerificationVector = .{ .commitments = &commitments };
+        const bytes = try vvec.toBytesAlloc(allocator);
+        defer allocator.free(bytes);
+        try std.testing.expectEqual(@as(usize, 4 + 2 * g2.compressed_bytes), bytes.len);
+        const back = try T.VerificationVector.fromBytesAlloc(allocator, bytes);
+        defer allocator.free(back.commitments);
+        try std.testing.expectEqual(@as(usize, 2), back.threshold());
+        try std.testing.expectEqualSlices(u8, &g2.toBytesCompressed(commitments[1]), &g2.toBytesCompressed(back.commitments[1]));
+        // One byte short and one byte over: both refused.
+        try std.testing.expectError(error.InvalidEncoding, T.VerificationVector.fromBytesAlloc(allocator, bytes[0 .. bytes.len - 1]));
+        var long: [4 + 2 * g2.compressed_bytes + 1]u8 = undefined;
+        @memcpy(long[0..bytes.len], bytes);
+        long[bytes.len] = 0;
+        try std.testing.expectError(error.InvalidEncoding, T.VerificationVector.fromBytesAlloc(allocator, &long));
+        try std.testing.expectError(error.InvalidEncoding, T.VerificationVector.fromBytesAlloc(allocator, bytes[0..3]));
+    }
+}
+
+test "min-sig: splitSecretKey and combineSignatures refuse bad parameters before any crypto work" {
+    const allocator = std.testing.allocator;
+    var sk: bls_sig.SecretKey = undefined;
+    try bls_sig.keyGen(&sk, &(@as([32]u8, @splat(0x9a))), "");
+    inline for (min_sig_layers) |T| {
+        try std.testing.expectError(error.InvalidParameters, T.splitSecretKey(allocator, &sk, 0, 5, &.{}));
+        try std.testing.expectError(error.InvalidParameters, T.splitSecretKey(allocator, &sk, 3, 0, &.{}));
+        try std.testing.expectError(error.InvalidParameters, T.splitSecretKey(allocator, &sk, 4, 3, &.{ Fr.one, Fr.one, Fr.one }));
+        try std.testing.expectError(error.InvalidParameters, T.splitSecretKey(allocator, &sk, 3, 5, &.{Fr.one}));
+
+        const two = [_]T.PartialSignature{
+            .{ .index = 1, .point = g1.Affine.generator },
+            .{ .index = 2, .point = g1.Affine.generator },
+        };
+        try std.testing.expectError(error.InsufficientShares, T.combineSignatures(&two, 3));
+        try std.testing.expectError(error.InsufficientShares, T.combineSignatures(&two, 0));
+        const dup = [_]T.PartialSignature{
+            .{ .index = 1, .point = g1.Affine.generator },
+            .{ .index = 1, .point = g1.Affine.generator },
+        };
+        try std.testing.expectError(error.DuplicateIndex, T.combineSignatures(&dup, 2));
+        const zero = [_]T.PartialSignature{
+            .{ .index = 0, .point = g1.Affine.generator },
+            .{ .index = 2, .point = g1.Affine.generator },
+        };
+        try std.testing.expectError(error.ZeroIndex, T.combineSignatures(&zero, 2));
+    }
+}
+
+test "min-sig keystone: t-of-n combine == the suite's sign under the reconstructed key, and verifies under the min-sig suite" {
+    const allocator = std.testing.allocator;
+    inline for (min_sig_layers, .{ 0x11, 0x12 }) |T, ikm| {
+        const t: u32 = 3;
+        const built = try testSplitT(T, allocator, ikm, t, 5);
+        defer allocator.free(built.split.shares);
+        defer allocator.free(built.split.vvec.commitments);
+        const shares = built.split.shares;
+
+        const msg = "min-sig threshold keystone";
+        const subset_a = [_]T.PartialSignature{ T.partialSign(&shares[0], msg), T.partialSign(&shares[2], msg), T.partialSign(&shares[4], msg) };
+        const subset_b = [_]T.PartialSignature{ T.partialSign(&shares[1], msg), T.partialSign(&shares[3], msg), T.partialSign(&shares[4], msg) };
+        const combined = try T.combineSignatures(&subset_a, t);
+
+        // The reconstructed key (Lagrange over Fr, no group involved) is the
+        // dealt key, and the combined signature is its ordinary signature.
+        const rec = reconstructSecret(&.{ shares[0], shares[2], shares[4] });
+        try std.testing.expect(rec.scalar.eql(built.sk.scalar));
+        const direct = T.Suite.sign(&rec, msg);
+        try std.testing.expectEqualSlices(u8, &direct.toBytes(), &combined.toBytes());
+        try std.testing.expectEqual(@as(usize, 48), combined.toBytes().len); // a G1 signature
+
+        // It verifies under the min-sig suite with the group key, which is
+        // the suite's own skToPk of the dealt key.
+        const gpk = T.groupPublicKey(built.split.vvec);
+        try std.testing.expectEqualSlices(u8, &T.Suite.skToPk(&built.sk).toBytes(), &gpk.toBytes());
+        try std.testing.expect(T.Suite.verify(gpk, msg, combined));
+        try std.testing.expect(!T.Suite.verify(gpk, "another message", combined));
+
+        // Any other t-subset agrees.
+        try std.testing.expectEqualSlices(u8, &combined.toBytes(), &(try T.combineSignatures(&subset_b, t)).toBytes());
+    }
+}
+
+test "min-sig: the combined signature belongs to its suite only (POP and Basic do not cross, min-pk differs)" {
+    const allocator = std.testing.allocator;
+    const built = try testSplitT(MinSig, allocator, 0x13, 2, 3);
+    defer allocator.free(built.split.shares);
+    defer allocator.free(built.split.vvec.commitments);
+    const msg = "suite separation";
+    const parts = [_]MinSig.PartialSignature{ MinSig.partialSign(&built.split.shares[0], msg), MinSig.partialSign(&built.split.shares[1], msg) };
+    const combined = try MinSig.combineSignatures(&parts, 2);
+    const gpk = MinSig.groupPublicKey(built.split.vvec);
+    try std.testing.expect(bls_sig.MinSigPop.verify(gpk, msg, combined));
+    // Same groups, different DST: Basic refuses it.
+    try std.testing.expect(!bls_sig.MinSigBasic.verify(.{ .point = gpk.point }, msg, .{ .point = combined.point }));
+    // The same dealing through the min-pk layer gives the min-pk signature,
+    // not this one (different group, different hash).
+    const built_pk = try testSplit(allocator, 0x13, 2, 3);
+    defer allocator.free(built_pk.split.shares);
+    defer allocator.free(built_pk.split.vvec.commitments);
+    const pk_parts = [_]PartialSignature{ partialSign(&built_pk.split.shares[0], msg), partialSign(&built_pk.split.shares[1], msg) };
+    const pk_combined = try combineSignatures(&pk_parts, 2);
+    try std.testing.expectEqualSlices(u8, &bls_sig.sign(&built.sk, msg).toBytes(), &pk_combined.toBytes());
+    // Shares are scalars, the same for both layers.
+    for (built.split.shares, built_pk.split.shares) |a, b| try std.testing.expect(a.scalar.eql(b.scalar));
+}
+
+test "min-sig Feldman VSS consistency: derivePublicKeyShare(vvec, i) equals skToPk(share_i) in G2" {
+    const allocator = std.testing.allocator;
+    inline for (min_sig_layers) |T| {
+        const built = try testSplitT(T, allocator, 0x14, 3, 4);
+        defer allocator.free(built.split.shares);
+        defer allocator.free(built.split.vvec.commitments);
+        for (built.split.shares) |share| {
+            const derived = T.derivePublicKeyShare(built.split.vvec, share.index);
+            const expected = T.Suite.skToPk(&.{ .scalar = share.scalar });
+            try std.testing.expectEqual(share.index, derived.index);
+            try std.testing.expectEqualSlices(u8, &expected.toBytes(), &g2.toBytesCompressed(derived.point));
+        }
+    }
+}
+
+test "min-sig: fewer than t partials do NOT reconstruct; more than t still do" {
+    const allocator = std.testing.allocator;
+    inline for (min_sig_layers) |T| {
+        const built = try testSplitT(T, allocator, 0x15, 3, 5);
+        defer allocator.free(built.split.shares);
+        defer allocator.free(built.split.vvec.commitments);
+        const shares = built.split.shares;
+        const msg = "below and above threshold";
+        const expected = T.Suite.sign(&built.sk, msg);
+
+        const under_parts = [_]T.PartialSignature{ T.partialSign(&shares[0], msg), T.partialSign(&shares[1], msg) };
+        const under = try T.combineSignatures(&under_parts, 2); // a lying t
+        try std.testing.expect(!std.mem.eql(u8, &expected.toBytes(), &under.toBytes()));
+        try std.testing.expect(!T.Suite.verify(T.groupPublicKey(built.split.vvec), msg, under));
+
+        const over_parts = [_]T.PartialSignature{
+            T.partialSign(&shares[0], msg), T.partialSign(&shares[1], msg),
+            T.partialSign(&shares[2], msg), T.partialSign(&shares[3], msg),
+        };
+        try std.testing.expectEqualSlices(u8, &expected.toBytes(), &(try T.combineSignatures(&over_parts, 3)).toBytes());
+    }
+}
+
+test "min-sig verifyPartialSignature: accepts each valid partial, rejects wrong-share and wrong-index partials" {
+    const allocator = std.testing.allocator;
+    inline for (min_sig_layers) |T| {
+        const built = try testSplitT(T, allocator, 0x16, 3, 5);
+        defer allocator.free(built.split.shares);
+        defer allocator.free(built.split.vvec.commitments);
+        const shares = built.split.shares;
+        const msg = "identifiable abort, min-sig";
+        for (shares) |share| {
+            const pk_share = T.derivePublicKeyShare(built.split.vvec, share.index);
+            try std.testing.expect(T.verifyPartialSignature(pk_share, msg, T.partialSign(&share, msg)));
+            try std.testing.expect(!T.verifyPartialSignature(pk_share, "wrong message", T.partialSign(&share, msg)));
+        }
+        const pk_share_1 = T.derivePublicKeyShare(built.split.vvec, 1);
+        const forged: T.PartialSignature = .{ .index = 1, .point = T.partialSign(&shares[1], msg).point };
+        try std.testing.expect(!T.verifyPartialSignature(pk_share_1, msg, forged));
+        const relabeled: T.PartialSignature = .{ .index = 3, .point = T.partialSign(&shares[0], msg).point };
+        try std.testing.expect(!T.verifyPartialSignature(pk_share_1, msg, relabeled));
+        // The identity key share is refused (keyValidate inside verify).
+        const id_share: T.PublicKeyShare = .{ .index = 1, .point = g2.Affine.identity };
+        try std.testing.expect(!T.verifyPartialSignature(id_share, msg, T.partialSign(&shares[0], msg)));
+    }
+}
+
+test "min-sig (t=n=4) and (t=2, n=3) end-to-end chains" {
+    const allocator = std.testing.allocator;
+    inline for (.{ .{ 4, 4 }, .{ 2, 3 } }) |tn| {
+        const t: u32 = tn[0];
+        const built = try testSplitT(MinSig, allocator, 0x17, t, tn[1]);
+        defer allocator.free(built.split.shares);
+        defer allocator.free(built.split.vvec.commitments);
+        const msg = "min-sig no slack";
+        var parts: [4]MinSig.PartialSignature = undefined;
+        for (parts[0..t], built.split.shares[0..t]) |*p, *s| p.* = MinSig.partialSign(s, msg);
+        const combined = try MinSig.combineSignatures(parts[0..t], t);
+        try std.testing.expectEqualSlices(u8, &bls_sig.MinSigPop.sign(&built.sk, msg).toBytes(), &combined.toBytes());
+        try std.testing.expect(bls_sig.MinSigPop.verify(MinSig.groupPublicKey(built.split.vvec), msg, combined));
+    }
 }
