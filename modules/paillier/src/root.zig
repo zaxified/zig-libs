@@ -369,8 +369,6 @@ const CrtParams = struct {
     /// `q²` as an `ff` modulus — the domain of the Garner recombination step
     /// (and to reduce `c` into the mod-`q²` domain).
     q_sq: Modulus,
-    /// `p²` as an `Fe` canonical mod `n_sq` — the `x = x_p + p²·u` multiplier.
-    p_sq_fe: Fe,
     /// `(p²)⁻¹ mod q²`, canonical mod `q_sq` — the Garner coefficient.
     p_sq_inv: Fe,
 };
@@ -492,7 +490,7 @@ pub const SecretKey = struct {
     /// the entire `crt` block. `crt.p_sq`/`crt.q_sq` are `p²`/`q²` — from
     /// which the factorization `p`,`q` is directly recoverable (a square
     /// root over the integers) — so every field derived from them
-    /// (`p_sq_mont`/`q_sq_mont`/`dp`/`dq`/`p_sq_fe`/`p_sq_inv`) is
+    /// (`p_sq_mont`/`q_sq_mont`/`dp`/`dq`/`p_sq_inv`) is
     /// factorization-equivalent secret material too (see `CrtParams`'s doc
     /// comment). `n`/`n_sq`/`n_sq_mont` are PUBLIC — the same values the
     /// `PublicKey` carries — and are left untouched. Idempotent; the key
@@ -707,8 +705,7 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
     try crtExponent(&lam, &pv, &p1, 8 * pb.len - @clz(pb[0]), &dp_buf);
     try crtExponent(&lam, &qv, &q1, 8 * qb.len - @clz(qb[0]), &dq_buf);
 
-    // Garner coefficient (p²)⁻¹ mod q² (gcd(p²,q²)=1 for distinct primes),
-    // and p² as an Fe canonical mod n² (the x = x_p + p²·u multiplier).
+    // Garner coefficient (p²)⁻¹ mod q² (gcd(p²,q²)=1 for distinct primes).
     // p² has 2b or 2b − 1 bits for a b-bit p: built from the limbs with
     // that length (one verdict) instead of `montParamsFromModulus`'s scan of
     // the secret value — both reveal the same one bit.
@@ -720,7 +717,6 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
     defer std.crypto.secureZero(u64, &pinv);
     if (!q_sq_mont.inverse(&psq_mod, &pinv)) return error.InvalidPrimes;
     const p_sq_inv = elemToFe(q_sq, &pinv);
-    const p_sq_fe = elemToFe(n_sq, psq_w[0..L]);
 
     const n_sq_mont = montParamsFromModulus(n_sq);
 
@@ -740,7 +736,6 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
                 .dq = dq_buf,
                 .p_sq = p_sq,
                 .q_sq = q_sq,
-                .p_sq_fe = p_sq_fe,
                 .p_sq_inv = p_sq_inv,
             },
         },

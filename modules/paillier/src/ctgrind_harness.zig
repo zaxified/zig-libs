@@ -48,7 +48,7 @@
 //!                every `fromPrimes`/`generate`-derived key actually takes).
 //!                Taints `lambda`, `mu`, and the ENTIRE `crt` block
 //!                (`p_sq`/`q_sq`/`p_sq_mont`/`q_sq_mont`/`dp`/`dq`/
-//!                `p_sq_fe`/`p_sq_inv`; all but the montint slot, see
+//!                `p_sq_inv`; all but the montint slot, see
 //!                there) — per `SecretKey.deinit`'s own doc
 //!                comment, `p_sq`/`q_sq` are factorization-equivalent to
 //!                `p`/`q` (a square root away), so leaving them untainted
