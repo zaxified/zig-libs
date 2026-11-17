@@ -868,7 +868,7 @@ test "utf8: the writer refuses text that is not UTF-8; the reader checks Utf8 un
     _ = try stream.readStream(a, bb, .{});
 }
 
-test "inexact time conversions: refused without lossy, truncated toward zero with it" {
+test "inexact time conversions: refused without lossy, times truncated toward zero, dates floored to their day with it" {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -880,8 +880,8 @@ test "inexact time conversions: refused without lossy, truncated toward zero wit
         .{ .field = .{ .name = "ts", .type = .{ .timestamp = .{ .unit = .nanosecond } } }, .values = bytesOf(i64, &.{ -1, -1_999, 1_700_000_000_123_456_789 }), .want = .{ .{ .int = 0 }, .{ .int = -1 }, .{ .int = 1_700_000_000_123_456 } } },
         .{ .field = .{ .name = "dur", .type = .{ .duration = .nanosecond } }, .values = bytesOf(i64, &.{ -1, -1_999, 2_500 }), .want = .{ .{ .int = 0 }, .{ .int = -1 }, .{ .int = 2 } } },
         .{ .field = .{ .name = "t", .type = .{ .time = .{ .unit = .nanosecond, .bits = 64 } } }, .values = bytesOf(i64, &.{ 1, 1_999, 3_000 }), .want = .{ .{ .int = 0 }, .{ .int = 1 }, .{ .int = 3 } } },
-        // Date64 off a day boundary: -1 ms is day 0 under truncation.
-        .{ .field = .{ .name = "d", .type = .{ .date = .millisecond } }, .values = bytesOf(i64, &.{ -1, 86_400_000 + 1, -86_400_000 - 1 }), .want = .{ .{ .text = "1970-01-01" }, .{ .text = "1970-01-02" }, .{ .text = "1969-12-31" } } },
+        // Date64 off a day boundary is floored to the day that contains the instant.
+        .{ .field = .{ .name = "d", .type = .{ .date = .millisecond } }, .values = bytesOf(i64, &.{ -1, 86_400_000 + 1, -86_400_000 - 1 }), .want = .{ .{ .text = "1969-12-31" }, .{ .text = "1970-01-02" }, .{ .text = "1969-12-30" } } },
     };
     for (cases) |c| {
         const bytes = try hand(gpa, &.{c.field}, &.{.{ .length = 3, .nodes = &.{node}, .bufs = &.{ "", c.values } }});

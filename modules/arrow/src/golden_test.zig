@@ -308,7 +308,7 @@ const Oracle = struct {
         }
         if (std.mem.eql(u8, name, "date")) {
             const raw = try jint(data[i]);
-            const days = if (std.mem.eql(u8, str(t, "unit"), "DAY")) raw else @divTrunc(raw, 86_400_000);
+            const days = if (std.mem.eql(u8, str(t, "unit"), "DAY")) raw else @divFloor(raw, 86_400_000);
             var buf: [10]u8 = undefined;
             const want = isoDay(&buf, days) orelse return o.unholdable(field, got);
             if (got != .text or !std.mem.eql(u8, got.text, want)) return o.fail(field, "{any}, want {s}", .{ got, want });

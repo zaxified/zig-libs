@@ -153,7 +153,7 @@ per read) after checking each declared length against `zstd.decompressBound` and
 | `bool` | Bool (bit-packed) | — |
 | `decimal` (i128, 12 digits) | Decimal128(p, 12), p = digits of the widest value (≥ 12); 39 digits → `Unsupported` | Decimal128(p, s) rescaled to 12 digits; inexact, out of range, wider than p or than 38 digits → `Unsupported`, or null under `lossy` |
 | `text` / `binary` | Utf8 (UTF-8 checked) / Binary; Large* from `WriteOptions.large_from` bytes (default 2^31) | LargeUtf8 / LargeBinary; FixedSizeBinary → `binary` |
-| `date` (ISO text) | Date32 (days) | Date64 (ms; off a day boundary → `Unsupported`, truncated under `lossy`); years outside 0000–9999 → `Unsupported` |
+| `date` (ISO text) | Date32 (days) | Date64 (ms; off a day boundary → `Unsupported`, floored to the containing day under `lossy`); years outside 0000–9999 → `Unsupported` |
 | `timestamp` (+ `time_zone`) | Timestamp(us, zone) | s / ms / ns (ns not divisible to us → `Unsupported`, truncated toward zero under `lossy`); a zone `tz` does not know → `Unsupported`, or under `lossy` a naive column (the cells are UTC instants either way) |
 | `duration` | Duration(us) | s / ms / ns (ns as for timestamps) |
 | `time` | Time64(us) | Time32(s, ms), Time64(ns, as for timestamps); a value outside `[0, 24h)` (Arrow allows 24:00:00) → `Unsupported`, or null under `lossy` |

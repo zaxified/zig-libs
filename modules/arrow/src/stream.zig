@@ -89,8 +89,9 @@ pub const ReadOptions = struct {
     ///   `[0, 24h)` (Arrow allows 24:00:00); a date outside the years 0000-9999; a
     ///   timestamp or duration in s/ms whose microseconds overflow i64;
     /// - truncated toward zero: a nanosecond timestamp, duration or time with digits past
-    ///   the microsecond (`dataframe` keeps microseconds), and a Date64 that is not on a
-    ///   day boundary (so -1 ms reads as 1970-01-01, not 1969-12-31);
+    ///   the microsecond (`dataframe` keeps microseconds);
+    /// - floored to its calendar day: a Date64 that is not on a day boundary (-1 ms is
+    ///   1969-12-31, the day that contains the instant);
     /// - a timestamp zone `dataframe`'s `tz` does not know reads as a naive column (the
     ///   instants are UTC either way; only the `time_zone` tag is dropped).
     /// Nothing else changes: a malformed stream is still an error.
@@ -1136,7 +1137,9 @@ const Reader = struct {
                     // date (null slots are 0).
                     for (days, try r.raw(i64, rf, chunks, n, valid)) |*o, x| {
                         if (@rem(x, ms_per_day) != 0 and !r.opts.lossy) return error.Unsupported;
-                        o.* = @divTrunc(x, ms_per_day);
+                        // Floor, not truncation: the calendar day that contains the instant
+                        // (-1 ms is 1969-12-31).
+                        o.* = @divFloor(x, ms_per_day);
                     }
                 }
                 for (days, 0..) |*d, i| {
