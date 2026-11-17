@@ -205,6 +205,14 @@ distributed lock to close the same race across processes.
   free the new holder early, which the lease contract allows; (f) the spinlock spans allocator and
   cache calls (short sections).
 - **Streaming fingerprint for large bodies** *(survey 2026-09-30)* — hash the body incrementally so `max_body_bytes` is not a hard 413 for uploads. Effort: small-medium (needs the body-reader seam). Fits §2. Low priority.
+  *Analysis 2026-11-17 (blocked on a seam in `http`, not started):* hashing incrementally is the easy half; the
+  decision (replay, 422, 409 or run) needs the COMPLETE digest before the handler is chosen, and the handler that
+  then runs must still read the same bytes, so a one-pass stream cannot serve both. The module buffers today for
+  exactly that reason (`req.decoded` re-exposes the buffer). Dropping the cap therefore needs the request body to be
+  spooled or rewindable (a `Request` body source that can be read twice, or a spool-to-file reader), which is an
+  `http` addition. The references do not stream either: Stripe compares the parsed parameters, node-idempotency
+  hashes the already-parsed body (BLAKE2s of `JSON.stringify(body)`), IdempotentAPI hashes the buffered payload, so the
+  bounded fail-closed 413 stays the default and nothing here changes until that seam exists.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
 

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** docs only: SPEC records why a streaming body fingerprint needs a rewindable or spooled request body in `http` (the decision needs the full digest before the handler runs); not started.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** tests only, from the whole-module mutation run on current source (335 mutants, 329 killed, 6 equivalent, 0 undecided): the whole fingerprint is compared (a digest differing in one byte, ramcache and `KvBackend`), the whole body is fingerprinted (long shared prefix), a record that cannot be encoded is dropped without a panic, `Clock.monotonic` advances, a quoted key with a byte above 0x7e is refused, a response whose sink failed part-way is refused by capture even when the handler swallowed the error, and `Options.header_name` / `replay_header` are honoured.
