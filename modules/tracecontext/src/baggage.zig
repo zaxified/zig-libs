@@ -537,17 +537,29 @@ test "malformed members are errors, not panics" {
     _ = try Baggage.parse("k=a;b", &s);
     _ = try Baggage.parse("a=1;p=%zz,b=2", &s);
     // An empty property is dropped, the member kept (OpenTelemetry Go), strict and lenient alike.
-    for ([_][]const u8{ "k=v;", "k=v;;p", "k=v; ;p;", "k=v;p;;q=r" }) |h| {
+    const Case = struct { h: []const u8, n: usize };
+    for ([_]Case{
+        .{ .h = "k=v;", .n = 0 },
+        .{ .h = "k=v;;p", .n = 1 },
+        .{ .h = "k=v; ;p;", .n = 1 },
+        .{ .h = "k=v;p;;q=r", .n = 2 },
+        .{ .h = "k=v;p; ;q", .n = 2 },
+    }) |c| {
         for (0..2) |mode| {
-            const e = if (mode == 0) try Baggage.parse(h, &s) else try Baggage.parseLenient(h, &s);
+            const e = if (mode == 0) try Baggage.parse(c.h, &s) else try Baggage.parseLenient(c.h, &s);
             try testing.expectEqual(@as(usize, 1), e.members().len);
             try testing.expectEqualStrings("v", e.get("k").?);
             var it = e.members()[0].propertyIterator();
             var n: usize = 0;
             while (it.next()) |_| n += 1;
-            try testing.expectEqual(@as(usize, if (h.len == 4) 0 else if (h.len == 6) 1 else if (h.len == 8) 1 else 2), n);
+            try testing.expectEqual(c.n, n);
         }
     }
+    // A bad property after an empty one is still refused.
+    try testing.expectError(error.BadMember, Baggage.parse("k=v;;=x", &s));
+    try testing.expectError(error.BadMember, Baggage.parse("k=v; ;p q", &s));
+    var bp: Baggage = .{};
+    try testing.expectError(error.BadMember, bp.put("k", "v", ";;=x"));
     // NUL and control bytes inside a header never parse.
     try testing.expectError(error.BadMember, Baggage.parse("k=a\x00b", &s));
     try testing.expectError(error.BadMember, Baggage.parse("k=a\r\nb", &s));

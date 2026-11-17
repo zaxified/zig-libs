@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: delta mutation of the empty-property and last-duplicate code (23 mutants, 21 killed first run, 2 survivors killed by two new test cases; cumulative 446/470, 24 equivalent); card hash re-taken.
 - **2026-11-17** — Behaviour change: `Baggage.get` returns the LAST member of a duplicated key (all four OpenTelemetry propagators keep the last of equal keys); `put` updates that last member in place; `members()` still keeps every duplicate in order (W3C §3.3.1.1). Before, `get` and `put` acted on the first.
 - **2026-11-17** — Behaviour change: an empty property (`a=1;`, `a=1;;p`, `a=1; ;`) no longer makes the member malformed: the empty property is dropped and the member kept, in `parse`, `parseLenient` and `put`, and `propertyIterator` skips empty pieces (as OpenTelemetry Go does). The oracle's `empty_property` class is deleted (932 of 954 cases agree, four classes left); the SPEC divergence table is updated.
 - **2026-11-17** — Behaviour change (reverts the earlier same-day bullet on property escapes): a `%` that is not a valid escape in a Baggage PROPERTY value is accepted again as opaque wire text (owner decision: Java, JS and Python accept it, only Go refuses); the member value still refuses it. The oracle's `property_bad_escape` class is back to be re-decided against its hit count.
