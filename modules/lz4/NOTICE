@@ -23,6 +23,16 @@ refused), no code copied:
   - lz4_flex `src/frame/decompress.rs` (MIT, https://github.com/PSeitz/lz4_flex):
     its handling of concatenated frames, dictionary ids and oversized blocks.
 
+Design reference consulted for TECHNIQUE (speed), no code copied or
+translated (2026-11-17):
+
+  - liblz4 v1.10.0 `lib/lz4.c` (BSD-2-Clause): the decoder's fast loop with
+    chunked copies while far from the buffers' ends and a safe loop for the
+    rest, short-offset pattern copies; the compressor's `byU16` table for
+    inputs under `LZ4_64Klimit`, the next probe's hash computed ahead
+    (`forwardH`), skipping output checks when the room is known to suffice.
+    The Zig code is this module's own (SPEC.md "Speed").
+
 Black-box test oracles
 ----------------------
 
