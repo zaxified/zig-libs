@@ -810,6 +810,9 @@ fn mapNotices(a: std.mem.Allocator, v_opt: ?std.json.Value) error{OutOfMemory}![
 pub const Bootstrap = struct {
     arena: *std.heap.ArenaAllocator,
     services: []const Service,
+    /// The file's `publication` member (RFC 9224 §3: an RFC 3339 timestamp),
+    /// verbatim, or null when absent or not a string.
+    publication: ?[]const u8 = null,
 
     pub const Service = struct {
         keys: []const []const u8,
@@ -925,8 +928,143 @@ pub fn parseBootstrap(gpa: std.mem.Allocator, json_text: []const u8) ParseError!
         if (keys.len == 0 or urls.len == 0) continue;
         try list.append(a, .{ .keys = keys, .urls = urls });
     }
-    return .{ .arena = arena, .services = try list.toOwnedSlice(a) };
+    var publication: ?[]const u8 = null;
+    if (obj.get("publication")) |pv| switch (pv) {
+        .string => |t| publication = try a.dupe(u8, t),
+        else => {},
+    };
+    return .{ .arena = arena, .services = try list.toOwnedSlice(a), .publication = publication };
 }
+
+/// The four IANA bootstrap registries (RFC 9224 §§3-5).
+pub const RegistryKind = enum {
+    dns,
+    ipv4,
+    ipv6,
+    asn,
+
+    /// File name under the registry base URL (`dns.json`, ...).
+    pub fn fileName(k: RegistryKind) []const u8 {
+        return switch (k) {
+            .dns => "dns.json",
+            .ipv4 => "ipv4.json",
+            .ipv6 => "ipv6.json",
+            .asn => "asn.json",
+        };
+    }
+};
+
+/// Caller-driven cache of the IANA bootstrap files over a `Fetcher`: no
+/// clock, timer or thread of its own; the caller passes `now_s` (any
+/// monotonic-enough seconds, e.g. Unix time) to every call.
+///
+/// Behaviour follows openrdap's bootstrap client (MIT; `bootstrap/client.go`,
+/// `bootstrap/cache/disk_cache.go`, read 2026-11-17): one file per registry,
+/// a default lifetime of 24 hours, a refresh once it expires, and an expired
+/// copy kept in use when the refresh fails. The file cache on disk stays the
+/// caller's: prime a slot from its bytes with `load`.
+///
+/// Not thread-safe: one `BootstrapCache` per thread, or a lock around it.
+/// URL slices returned by `get(...).lookup*` point into the cached
+/// `Bootstrap` and die with the next refresh of that registry: copy first.
+pub const BootstrapCache = struct {
+    fetcher: Fetcher,
+    gpa: std.mem.Allocator,
+    /// Where the four files live (RFC 9224 §1; IANA publishes them here).
+    base_url: []const u8 = "https://data.iana.org/rdap/",
+    /// Seconds a copy stays fresh (openrdap: 24 h).
+    ttl_s: i64 = 24 * 60 * 60,
+    slots: [4]?Slot = @splat(null),
+
+    const Slot = struct { bootstrap: Bootstrap, fetched_s: i64 };
+
+    pub const GetError = FetchError || ParseError || UrlError ||
+        error{ HttpStatus, EmptyBootstrap };
+
+    pub fn deinit(c: *BootstrapCache) void {
+        for (&c.slots) |*sl| if (sl.*) |*x| x.bootstrap.deinit();
+        c.* = undefined;
+    }
+
+    /// Install `json_text` (e.g. read from the caller's disk cache) as the
+    /// copy of `kind` fetched at `fetched_s`. A malformed file is refused and
+    /// leaves the slot untouched.
+    pub fn load(c: *BootstrapCache, kind: RegistryKind, json_text: []const u8, fetched_s: i64) ParseError!void {
+        const b = try parseBootstrap(c.gpa, json_text);
+        c.install(kind, b, fetched_s);
+    }
+
+    fn install(c: *BootstrapCache, kind: RegistryKind, b: Bootstrap, fetched_s: i64) void {
+        const sl = &c.slots[@backingInt(kind)];
+        if (sl.*) |*old| old.bootstrap.deinit();
+        sl.* = .{ .bootstrap = b, .fetched_s = fetched_s };
+    }
+
+    /// The cached registry, fetched first when absent or older than `ttl_s`
+    /// (a clock that went backwards counts as expired). When the refresh
+    /// fails (transport, non-200, unparseable) and an expired copy exists it
+    /// is returned instead, as openrdap does; `error.Canceled` and
+    /// `error.OutOfMemory` always propagate. `body_buf` is the response byte
+    /// cap (size it for the largest registry file you fetch).
+    pub fn get(c: *BootstrapCache, kind: RegistryKind, now_s: i64, body_buf: []u8) GetError!*const Bootstrap {
+        const idx = @backingInt(kind);
+        if (c.slots[idx]) |*sl| {
+            const age = now_s -| sl.fetched_s;
+            if (age >= 0 and age < c.ttl_s) return &sl.bootstrap;
+        }
+        const fresh = c.fetchOne(kind, body_buf) catch |err| {
+            if (err == error.Canceled or err == error.OutOfMemory) return err;
+            if (c.slots[idx]) |*sl| return &sl.bootstrap;
+            return err;
+        };
+        c.install(kind, fresh, now_s);
+        return &c.slots[idx].?.bootstrap;
+    }
+
+    fn fetchOne(c: *BootstrapCache, kind: RegistryKind, body_buf: []u8) GetError!Bootstrap {
+        var url_buf: [max_url_len]u8 = undefined;
+        const base = std.mem.trimEnd(u8, c.base_url, "/");
+        const url = std.fmt.bufPrint(&url_buf, "{s}/{s}", .{ base, kind.fileName() }) catch return error.UrlTooLong;
+        const r = try c.fetcher.fetch(url, body_buf);
+        if (r.status != 200) return error.HttpStatus;
+        const b = try parseBootstrap(c.gpa, r.body);
+        if (b.services.len == 0) {
+            var dead = b;
+            dead.deinit();
+            return error.EmptyBootstrap;
+        }
+        return b;
+    }
+
+    /// The `publication` of the cached copy of `kind`, if one is held and
+    /// carries it (tells the caller whether a refresh brought anything new).
+    pub fn publication(c: *const BootstrapCache, kind: RegistryKind) ?[]const u8 {
+        const sl = c.slots[@backingInt(kind)] orelse return null;
+        return sl.bootstrap.publication;
+    }
+
+    /// `get(.dns)` + `lookupDomain` in one call.
+    pub fn lookupDomain(c: *BootstrapCache, domain: []const u8, now_s: i64, body_buf: []u8) GetError!?[]const []const u8 {
+        return (try c.get(.dns, now_s, body_buf)).lookupDomain(domain);
+    }
+
+    /// `get(.ipv4 or .ipv6)` + `lookupIp`, the family chosen by the address.
+    /// An unparseable address is `null`, without a fetch.
+    pub fn lookupIp(c: *BootstrapCache, addr_text: []const u8, now_s: i64, body_buf: []u8) GetError!?[]const []const u8 {
+        const bare = if (std.mem.findScalar(u8, addr_text, '/')) |i| addr_text[0..i] else addr_text;
+        const ip = netaddr.parseIp(bare) orelse return null;
+        const kind: RegistryKind = switch (ip) {
+            .v4 => .ipv4,
+            .v6 => .ipv6,
+        };
+        return (try c.get(kind, now_s, body_buf)).lookupIp(addr_text);
+    }
+
+    /// `get(.asn)` + `lookupAsn` in one call.
+    pub fn lookupAsn(c: *BootstrapCache, asn: u32, now_s: i64, body_buf: []u8) GetError!?[]const []const u8 {
+        return (try c.get(.asn, now_s, body_buf)).lookupAsn(asn);
+    }
+};
 
 fn dupStrArray(a: std.mem.Allocator, v: std.json.Value) error{OutOfMemory}![]const []const u8 {
     const arr = switch (v) {
@@ -3170,4 +3308,212 @@ test "corpus: every bootstrap seed reaches parseBootstrap, and the counts are pi
 test {
     _ = @import("goldens.zig");
     _ = @import("fuzz_test.zig");
+}
+
+// Scripted fetcher for the cache: one body/status per call, a fetch counter,
+// a failure switch, the last URL.
+const CacheStub = struct {
+    body: []const u8,
+    status: u16 = 200,
+    fail: ?FetchError = null,
+    calls: usize = 0,
+    last_url: [max_url_len]u8 = undefined,
+    last_len: usize = 0,
+
+    fn fetcher(s: *CacheStub) Fetcher {
+        return .{ .ctx = s, .fetchFn = fetchFn };
+    }
+
+    fn lastUrl(s: *const CacheStub) []const u8 {
+        return s.last_url[0..s.last_len];
+    }
+
+    fn fetchFn(ctx: *anyopaque, url: []const u8, body_buf: []u8) FetchError!Fetcher.Result {
+        const s: *CacheStub = @ptrCast(@alignCast(ctx));
+        s.calls += 1;
+        @memcpy(s.last_url[0..url.len], url);
+        s.last_len = url.len;
+        if (s.fail) |e| return e;
+        if (s.body.len > body_buf.len) return error.ResponseTooLarge;
+        @memcpy(body_buf[0..s.body.len], s.body);
+        return .{ .status = s.status, .body_len = s.body.len };
+    }
+};
+
+const cache_v1 =
+    \\{"version":"1.0","publication":"2026-07-01T00:00:00Z","services":[[["com"],["https://one.example/"]]]}
+;
+const cache_v2 =
+    \\{"version":"1.0","publication":"2026-08-01T00:00:00Z","services":[[["com"],["https://two.example/"]]]}
+;
+
+test "BootstrapCache: first get fetches the named file, then serves from memory for ttl_s" {
+    var stub: CacheStub = .{ .body = cache_v1 };
+    var c: BootstrapCache = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator, .ttl_s = 100 };
+    defer c.deinit();
+    var buf: [4096]u8 = undefined;
+
+    const urls = (try c.lookupDomain("example.com", 1000, &buf)).?;
+    try testing.expectEqualStrings("https://one.example/", urls[0]);
+    try testing.expectEqualStrings("https://data.iana.org/rdap/dns.json", stub.lastUrl());
+    try testing.expectEqual(@as(usize, 1), stub.calls);
+    try testing.expectEqualStrings("2026-07-01T00:00:00Z", c.publication(.dns).?);
+    try testing.expect(c.publication(.asn) == null);
+
+    // fresh up to (not including) ttl_s: no further fetch
+    _ = try c.get(.dns, 1000, &buf);
+    _ = try c.get(.dns, 1099, &buf);
+    try testing.expectEqual(@as(usize, 1), stub.calls);
+    // expired exactly at ttl_s: refetch, and the new file replaces the old
+    stub.body = cache_v2;
+    const b = try c.get(.dns, 1100, &buf);
+    try testing.expectEqual(@as(usize, 2), stub.calls);
+    try testing.expectEqualStrings("https://two.example/", b.lookupDomain("example.com").?[0]);
+    try testing.expectEqualStrings("2026-08-01T00:00:00Z", c.publication(.dns).?);
+}
+
+test "BootstrapCache: registry kinds map to their own files and base_url is joined without a double slash" {
+    var stub: CacheStub = .{ .body = cache_v1 };
+    var c: BootstrapCache = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator, .base_url = "https://mirror.example/rdap///" };
+    defer c.deinit();
+    var buf: [4096]u8 = undefined;
+    const kinds = [_]struct { RegistryKind, []const u8 }{
+        .{ .dns, "https://mirror.example/rdap/dns.json" },
+        .{ .ipv4, "https://mirror.example/rdap/ipv4.json" },
+        .{ .ipv6, "https://mirror.example/rdap/ipv6.json" },
+        .{ .asn, "https://mirror.example/rdap/asn.json" },
+    };
+    for (kinds, 0..) |k, i| {
+        _ = try c.get(k[0], 5, &buf);
+        try testing.expectEqualStrings(k[1], stub.lastUrl());
+        try testing.expectEqual(i + 1, stub.calls);
+    }
+    // four independent slots: all fresh now
+    for (kinds) |k| _ = try c.get(k[0], 6, &buf);
+    try testing.expectEqual(@as(usize, 4), stub.calls);
+}
+
+test "BootstrapCache: lookupIp picks the registry by address family; a bad address fetches nothing" {
+    var stub: CacheStub = .{ .body =
+        \\{"version":"1.0","services":[[["192.0.2.0/24","2001:db8::/32"],["https://ip.example/"]]]}
+    };
+    var c: BootstrapCache = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
+    defer c.deinit();
+    var buf: [4096]u8 = undefined;
+    try testing.expect((try c.lookupIp("not-an-ip", 0, &buf)) == null);
+    try testing.expectEqual(@as(usize, 0), stub.calls);
+    try testing.expectEqualStrings("https://ip.example/", (try c.lookupIp("192.0.2.9", 0, &buf)).?[0]);
+    try testing.expectEqualStrings("https://data.iana.org/rdap/ipv4.json", stub.lastUrl());
+    try testing.expectEqualStrings("https://ip.example/", (try c.lookupIp("2001:db8::1", 0, &buf)).?[0]);
+    try testing.expectEqualStrings("https://data.iana.org/rdap/ipv6.json", stub.lastUrl());
+    try testing.expectEqual(@as(usize, 2), stub.calls);
+}
+
+test "BootstrapCache: lookupAsn goes through asn.json" {
+    var stub: CacheStub = .{ .body =
+        \\{"version":"1.0","services":[[["64496-64511"],["https://asn.example/"]]]}
+    };
+    var c: BootstrapCache = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
+    defer c.deinit();
+    var buf: [4096]u8 = undefined;
+    try testing.expectEqualStrings("https://asn.example/", (try c.lookupAsn(64500, 0, &buf)).?[0]);
+    try testing.expect((try c.lookupAsn(1, 0, &buf)) == null);
+    try testing.expectEqualStrings("https://data.iana.org/rdap/asn.json", stub.lastUrl());
+}
+
+test "BootstrapCache: a failed refresh keeps the expired copy; a failed first fetch is the error" {
+    var stub: CacheStub = .{ .body = cache_v1, .fail = error.FetchFailed };
+    var c: BootstrapCache = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator, .ttl_s = 10 };
+    defer c.deinit();
+    var buf: [4096]u8 = undefined;
+    try testing.expectError(error.FetchFailed, c.get(.dns, 0, &buf));
+    stub.fail = null;
+    _ = try c.get(.dns, 0, &buf);
+    // transport failure, non-200, unparseable body, empty registry: stale served
+    stub.fail = error.FetchFailed;
+    try testing.expectEqualStrings("https://one.example/", (try c.get(.dns, 50, &buf)).lookupDomain("a.com").?[0]);
+    stub.fail = null;
+    stub.status = 503;
+    try testing.expectEqualStrings("https://one.example/", (try c.get(.dns, 50, &buf)).lookupDomain("a.com").?[0]);
+    stub.status = 200;
+    stub.body = "{not json";
+    try testing.expectEqualStrings("https://one.example/", (try c.get(.dns, 50, &buf)).lookupDomain("a.com").?[0]);
+    stub.body = "{\"version\":\"1.0\",\"services\":[]}";
+    try testing.expectEqualStrings("https://one.example/", (try c.get(.dns, 50, &buf)).lookupDomain("a.com").?[0]);
+    try testing.expectEqual(@as(usize, 6), stub.calls);
+    // Canceled is never papered over
+    stub.fail = error.Canceled;
+    try testing.expectError(error.Canceled, c.get(.dns, 50, &buf));
+}
+
+test "BootstrapCache: first-fetch error classes" {
+    var stub: CacheStub = .{ .body = cache_v1, .status = 404 };
+    var c: BootstrapCache = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
+    defer c.deinit();
+    var buf: [4096]u8 = undefined;
+    try testing.expectError(error.HttpStatus, c.get(.dns, 0, &buf));
+    stub.status = 200;
+    stub.body = "[1]";
+    try testing.expectError(error.InvalidRdap, c.get(.dns, 0, &buf));
+    stub.body = "{\"version\":\"1.0\",\"services\":[]}";
+    try testing.expectError(error.EmptyBootstrap, c.get(.dns, 0, &buf));
+    var tiny: [8]u8 = undefined;
+    stub.body = cache_v1;
+    try testing.expectError(error.ResponseTooLarge, c.get(.dns, 0, &tiny));
+    const long_base: [2100]u8 = @splat('a');
+    var long: BootstrapCache = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator, .base_url = &long_base };
+    defer long.deinit();
+    try testing.expectError(error.UrlTooLong, long.get(.dns, 0, &buf));
+}
+
+test "BootstrapCache: a clock that went backwards counts as expired" {
+    var stub: CacheStub = .{ .body = cache_v1 };
+    var c: BootstrapCache = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator, .ttl_s = 100 };
+    defer c.deinit();
+    var buf: [4096]u8 = undefined;
+    _ = try c.get(.dns, 1000, &buf);
+    _ = try c.get(.dns, 999, &buf);
+    try testing.expectEqual(@as(usize, 2), stub.calls);
+}
+
+test "BootstrapCache: load primes a slot (no fetch while fresh) and refuses a malformed file" {
+    var stub: CacheStub = .{ .body = cache_v2 };
+    var c: BootstrapCache = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator, .ttl_s = 100 };
+    defer c.deinit();
+    var buf: [4096]u8 = undefined;
+    try c.load(.dns, cache_v1, 500);
+    try testing.expectEqualStrings("https://one.example/", (try c.get(.dns, 550, &buf)).lookupDomain("a.com").?[0]);
+    try testing.expectEqual(@as(usize, 0), stub.calls);
+    try testing.expectError(error.InvalidJson, c.load(.dns, "{oops", 560));
+    try testing.expectEqualStrings("https://one.example/", (try c.get(.dns, 560, &buf)).lookupDomain("a.com").?[0]);
+    // loaded as old: it is refreshed
+    try c.load(.dns, cache_v1, 0);
+    try testing.expectEqualStrings("https://two.example/", (try c.get(.dns, 550, &buf)).lookupDomain("a.com").?[0]);
+    try testing.expectEqual(@as(usize, 1), stub.calls);
+}
+
+test "parseBootstrap: publication is kept verbatim; absent or wrong-typed is null" {
+    var b = try parseBootstrap(testing.allocator, cache_v1);
+    defer b.deinit();
+    try testing.expectEqualStrings("2026-07-01T00:00:00Z", b.publication.?);
+    var b2 = try parseBootstrap(testing.allocator, "{\"services\":[],\"publication\":5}");
+    defer b2.deinit();
+    try testing.expect(b2.publication == null);
+    var b3 = try parseBootstrap(testing.allocator, "{\"services\":[]}");
+    defer b3.deinit();
+    try testing.expect(b3.publication == null);
+}
+
+test "BootstrapCache: OutOfMemory during a refresh propagates, the expired copy is not served" {
+    var stub: CacheStub = .{ .body = cache_v2 };
+    var c: BootstrapCache = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator, .ttl_s = 10 };
+    defer c.deinit();
+    var buf: [4096]u8 = undefined;
+    try c.load(.dns, cache_v1, 0);
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    c.gpa = failing.allocator();
+    try testing.expectError(error.OutOfMemory, c.get(.dns, 100, &buf));
+    c.gpa = testing.allocator;
+    // the old copy is intact and a retry with memory succeeds
+    try testing.expectEqualStrings("https://two.example/", (try c.get(.dns, 100, &buf)).lookupDomain("a.com").?[0]);
 }

@@ -203,14 +203,24 @@ fn renderImpl(spec: Spec, nonce: ?[]const u8, nonce_in: []const Name, buf: ?[]u8
             count += 1;
         }
     }
+    // Caller lists are untrusted-length: every pass below is linear in the
+    // list (name sets are bitmaps over the closed `Name` enum), never
+    // O(list x names). Duplicates in `remove` / `nonce_in` are idempotent
+    // (set semantics, as in helmet where directives are object keys).
+    var named = @as([n_names]bool, @splat(false));
+    for (spec.directives) |d| named[@backingInt(d.name)] = true;
+    var removed = @as([n_names]bool, @splat(false));
     for (spec.remove) |r| {
-        for (spec.directives) |d| if (d.name == r) return error.ConflictingRemove;
         const i = @backingInt(r);
-        if (!present[i]) continue;
-        present[i] = false;
+        if (named[i]) return error.ConflictingRemove;
+        removed[i] = true;
+    }
+    if (count != 0) {
         var k: usize = 0;
         for (order[0..count]) |o| {
-            if (o != r) {
+            if (removed[@backingInt(o)]) {
+                present[@backingInt(o)] = false;
+            } else {
                 order[k] = o;
                 k += 1;
             }
@@ -230,10 +240,14 @@ fn renderImpl(spec: Spec, nonce: ?[]const u8, nonce_in: []const Name, buf: ?[]u8
         vals[i] = d.values;
     }
     if (count == 0) return error.NoDirectives;
+    var nonced = @as([n_names]bool, @splat(false));
     for (nonce_in) |n| {
-        if (!present[@backingInt(n)]) return error.NonceDirectiveMissing;
+        const i = @backingInt(n);
+        if (nonced[i]) continue;
+        nonced[i] = true;
+        if (!present[i]) return error.NonceDirectiveMissing;
         if (!n.isSourceList()) return error.NonceDirectiveInvalid;
-        for (vals[@backingInt(n)]) |v| if (std.ascii.eqlIgnoreCase(v, "'none'")) return error.NonceDirectiveInvalid;
+        for (vals[i]) |v| if (std.ascii.eqlIgnoreCase(v, "'none'")) return error.NonceDirectiveInvalid;
     }
     // `Nonce.text` is a public field: a hand-built nonce holding `;`, a space
     // or a quote would inject a directive or a source. Only the CSP
@@ -246,12 +260,7 @@ fn renderImpl(spec: Spec, nonce: ?[]const u8, nonce_in: []const Name, buf: ?[]u8
     for (order[0..count], 0..) |name, idx| {
         const values = vals[@backingInt(name)];
         if (name.isFlag() and values.len != 0) return error.UnexpectedValues;
-        var with_nonce = false;
-        if (nonce != null) {
-            for (nonce_in) |n| {
-                if (n == name) with_nonce = true;
-            }
-        }
+        const with_nonce = nonce != null and nonced[@backingInt(name)];
         if (values.len == 0 and !with_nonce and !name.mayBeEmpty()) return error.EmptyDirective;
         for (values) |v| try checkValue(name, v);
 
@@ -686,4 +695,50 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+fn rep(comptime n: usize, comptime name: Name) [n]Name {
+    return @splat(name);
+}
+
+test "caller lists: repeated names are set-idempotent and long lists stay linear (SH-3)" {
+    var buf: [512]u8 = undefined;
+    const nonce = Nonce.fromBytes(&(@as([16]u8, @splat(0x41))));
+    // 5000 repeats of one name in `remove` and `nonce_in`: same output as one.
+    const many_rm: [5000]Name = @splat(.img_src);
+    const many_n: [5000]Name = @splat(.script_src);
+    const spec_many: Spec = .{ .remove = &many_rm };
+    const spec_one: Spec = .{ .remove = &.{.img_src} };
+    var buf2: [512]u8 = undefined;
+    try testing.expectEqualStrings(try render(spec_one, &buf), try render(spec_many, &buf2));
+    const a = try renderNonce(.{}, &nonce, &many_n, &buf);
+    const b = try renderNonce(.{}, &nonce, &.{.script_src}, &buf2);
+    try testing.expectEqualStrings(b, a);
+    // the nonce appears exactly once
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, a, "'nonce-"));
+    // removing every default in one list, repeated, leaves the rest in order
+    const all = comptime blk: {
+        var l: [default_directives.len * 3]Name = undefined;
+        for (&l, 0..) |*x, i| x.* = default_directives[i % default_directives.len].name;
+        break :blk l;
+    };
+    try testing.expectError(error.NoDirectives, render(.{ .remove = &all }, &buf));
+    // a remove list repeating a name that a directive carries is still a conflict, wherever it sits
+    const conflict = rep(100, .img_src) ++ [_]Name{.font_src};
+    try testing.expectError(error.ConflictingRemove, render(.{
+        .directives = &.{.{ .name = .font_src, .values = &.{"'self'"} }},
+        .remove = &conflict,
+    }, &buf));
+    // nonce_in: an invalid name behind 5000 valid repeats is still found
+    const tail_bad = rep(5000, .script_src) ++ [_]Name{.sandbox};
+    try testing.expectError(error.NonceDirectiveInvalid, renderNonce(.{ .directives = &.{.{ .name = .sandbox }} }, &nonce, &tail_bad, &buf));
+    const tail_missing = rep(5000, .script_src) ++ [_]Name{.worker_src};
+    try testing.expectError(error.NonceDirectiveMissing, renderNonce(.{}, &nonce, &tail_missing, &buf));
+    // a directives list longer than the 26 names is refused (helmet: duplicate directive)
+    const dir_list = comptime blk: {
+        var l: [60]Directive = undefined;
+        for (&l, 0..) |*d, i| d.* = .{ .name = @fromBackingInt(@intCast(i % n_names)), .values = &.{"'self'"} };
+        break :blk l;
+    };
+    try testing.expectError(error.DuplicateDirective, render(.{ .directives = &dir_list }, &buf));
 }

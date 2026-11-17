@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **FEATURE:** `BootstrapCache` (+ `RegistryKind`): a caller-driven cache of the four IANA bootstrap files over the existing `Fetcher` — fetch on first use, fresh for `ttl_s` (default 24 h, as openrdap) against a caller-supplied `now_s`, refresh when expired, expired copy kept when the refresh fails, `load` to prime from the caller's disk cache, `lookupDomain`/`lookupIp`/`lookupAsn` conveniences. `Bootstrap` gained `publication: ?[]const u8` (the file's `publication` member; additive, defaults to null). No HTTP client, clock or file I/O inside. Delta mutation 19 mutants, 19 killed.
+
 - **2026-11-16** — New typed `secureDNS` (RFC 9083 §5.3): `Object.secure_dns: ?SecureDns` (`zone_signed`, `delegation_signed`, `max_sig_life`, `ds_data: []DsData`, `key_data: []KeyData`; records carry optional `events`/`links`). Lenient like the other mappers (wrong types -> null, bad entries skipped); each record list capped at `max_secure_dns_records` (64). Additive: `Object` gained one defaulted field.
 - **2026-11-16** — New `QueryType.help` (`buildPath`/`buildUrl` give `help`, value ignored) and `QueryType.tld` (`domain/<tld>` for a root RDAP server, one leading dot dropped). Additive: the five existing variants and their outputs are unchanged; `QueryType` gained two members, so an exhaustive `switch` over it in caller code needs two new arms.
 - **2026-10-18** — Ported to Zig 0.17.0. Test-only `ReadCueIo` overrides `vtable.operate` and counts `.net_read`. No behaviour change.

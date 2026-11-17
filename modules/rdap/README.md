@@ -64,6 +64,11 @@ _ = b.lookupIp("192.0.2.7");       // longest-prefix CIDR match (via netaddr)
 _ = b.lookupAsn(65536);            // "start-end" range keys
 _ = rdap.bootstrapLookup(&b, "com"); // exact-key primitive
 
+// ...or let a cache fetch and keep the IANA files (through your Fetcher):
+var cache: rdap.BootstrapCache = .{ .fetcher = fetcher, .gpa = gpa };
+defer cache.deinit();
+const urls = try cache.lookupDomain("example.com", now_s, &body_buf); // refetched after ttl_s (24 h)
+
 // Client over the fetch seam ("GET url → status + body"); offline testable
 var client: rdap.Client = .{ .fetcher = my_fetcher, .gpa = gpa };
 var body_buf: [64 * 1024]u8 = undefined;
