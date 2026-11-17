@@ -2951,3 +2951,230 @@ test "delta tests: codel and fq round trip with a distinct value in every field"
     const ow = try qdisc.parseFqOptions(odd.items);
     try testing.expect(ow.priomap == null and ow.weights == null and ow.horizon_drop == null);
 }
+
+// ── hfsc and red (captured 2026-11-17, iproute2-6.19.0, `unshare -rn`) ──
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794893788 len=56
+// tc qdisc add dev lo root handle 1: hfsc
+const g_hfsc_bare_qdisc =
+    "3800000024000506dce7fb6a00000000000000000100000000000100ffffffff00000000090001006866736300000000" ++
+    "0600020000000000";
+const seq_hfsc_bare_qdisc: u32 = 1794893788;
+
+test "golden: hfsc bare" {
+    // tc qdisc add dev lo root handle 1: hfsc
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_hfsc_bare_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .hfsc = .{} },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_hfsc_bare_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794893788 len=56
+// tc qdisc add dev lo root handle 1: hfsc default 10
+const g_hfsc_default_qdisc =
+    "3800000024000506dce7fb6a00000000000000000100000000000100ffffffff00000000090001006866736300000000" ++
+    "0600020010000000";
+const seq_hfsc_default_qdisc: u32 = 1794893788;
+
+test "golden: hfsc default" {
+    // tc qdisc add dev lo root handle 1: hfsc default 10
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_hfsc_default_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .hfsc = .{ .default_class = 0x10 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_hfsc_default_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794893788 len=348
+// tc qdisc add dev lo root handle 2: red limit 100000 min 10000 max 30000 avpkt 1000 burst 20 probability 0.02
+const g_red_basic_qdisc =
+    "5c01000024000506dce7fb6a00000000000000000100000000000200ffffffff00000000080001007265640030010200" ++
+    "14000100a0860100102700003075000004140e0004010200000000000000000000000000010101010101010101010101" ++
+    "020202020202020202020202030303030303030303030303040404040404040404040404050505050505050505050506" ++
+    "06060606060606060606060707070707070707070707070808080808080808080808080909090909090909090909090a" ++
+    "0a0a0a0a0a0a0a0a0a0a0a0b0b0b0b0b0b0b0b0b0b0b0c0c0c0c0c0c0c0c0c0c0c0c0d0d0d0d0d0d0d0d0d0d0d0d0e0e" ++
+    "0e0e0e0e0e0e0e0e0e0e0f0f0f0f0f0f0f0f0f0f0f0f1010101010101010101010111111111111111111111111121212" ++
+    "1212121212121212121313131313131313131313131414141414141414141414141515151515151f0800030051b81e05" ++
+    "0c000400000000000f000000";
+const seq_red_basic_qdisc: u32 = 1794893788;
+
+test "golden: red basic" {
+    // tc qdisc add dev lo root handle 2: red limit 100000 min 10000 max 30000 avpkt 1000 burst 20 probability 0.02
+    var stab: [qdisc.red_stab_len]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&stab, g_red_basic_qdisc[72 * 2 .. 328 * 2]);
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_red_basic_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(2, 0), .parent = Handle.root },
+        .{ .red = .{
+            .limit = 100000,
+            .qth_min = 10000,
+            .qth_max = 30000,
+            .wlog = 4,
+            .plog = 20,
+            .scell_log = 14,
+            .stab = &stab,
+            .max_p = 85899345,
+            .flags = 0,
+        } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_red_basic_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794893789 len=348
+// tc qdisc add dev lo root handle 2: red limit 100000 min 10000 max 30000 avpkt 1000 burst 20 probability 0.02 ecn harddrop adaptive
+const g_red_flags_qdisc =
+    "5c01000024000506dde7fb6a00000000000000000100000000000200ffffffff00000000080001007265640030010200" ++
+    "14000100a0860100102700003075000004140e0004010200000000000000000000000000010101010101010101010101" ++
+    "020202020202020202020202030303030303030303030303040404040404040404040404050505050505050505050506" ++
+    "06060606060606060606060707070707070707070707070808080808080808080808080909090909090909090909090a" ++
+    "0a0a0a0a0a0a0a0a0a0a0a0b0b0b0b0b0b0b0b0b0b0b0c0c0c0c0c0c0c0c0c0c0c0c0d0d0d0d0d0d0d0d0d0d0d0d0e0e" ++
+    "0e0e0e0e0e0e0e0e0e0e0f0f0f0f0f0f0f0f0f0f0f0f1010101010101010101010111111111111111111111111121212" ++
+    "1212121212121212121313131313131313131313131414141414141414141414141515151515151f0800030051b81e05" ++
+    "0c000400070000000f000000";
+const seq_red_flags_qdisc: u32 = 1794893789;
+
+test "golden: red flags" {
+    // tc qdisc add dev lo root handle 2: red limit 100000 min 10000 max 30000 avpkt 1000 burst 20 probability 0.02 ecn harddrop adaptive
+    var stab: [qdisc.red_stab_len]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&stab, g_red_flags_qdisc[72 * 2 .. 328 * 2]);
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_red_flags_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(2, 0), .parent = Handle.root },
+        .{ .red = .{
+            .limit = 100000,
+            .qth_min = 10000,
+            .qth_max = 30000,
+            .wlog = 4,
+            .plog = 20,
+            .scell_log = 14,
+            .stab = &stab,
+            .max_p = 85899345,
+            .flags = 7,
+        } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_red_flags_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794893789 len=348
+// tc qdisc add dev lo root handle 2: red limit 400000 min 30000 max 90000 avpkt 1000 burst 55 probability 0.01 ecn
+const g_red_ecn_big_qdisc =
+    "5c01000024000506dde7fb6a00000000000000000100000000000200ffffffff00000000080001007265640030010200" ++
+    "14000100801a060030750000905f010005170f0004010200000000000000000000000000000101010101010101010101" ++
+    "010202020202020202020202020303030303030303030303030404040404040404040404040505050505050505050505" ++
+    "050606060606060606060606060707070707070707070707070808080808080808080808080909090909090909090909" ++
+    "090a0a0a0a0a0a0a0a0a0a0a0a0b0b0b0b0b0b0b0b0b0b0b0b0c0c0c0c0c0c0c0c0c0c0c0c0d0d0d0d0d0d0d0d0d0d0d" ++
+    "0d0e0e0e0e0e0e0e0e0e0e0e0e0f0f0f0f0f0f0f0f0f0f0f0f1010101010101010101010101111111111111111111111" ++
+    "1112121212121212121212121213131313131313131313131314141414141414141414141415151f08000300285c8f02" ++
+    "0c000400010000000f000000";
+const seq_red_ecn_big_qdisc: u32 = 1794893789;
+
+test "golden: red ecn big" {
+    // tc qdisc add dev lo root handle 2: red limit 400000 min 30000 max 90000 avpkt 1000 burst 55 probability 0.01 ecn
+    var stab: [qdisc.red_stab_len]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&stab, g_red_ecn_big_qdisc[72 * 2 .. 328 * 2]);
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_red_ecn_big_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(2, 0), .parent = Handle.root },
+        .{ .red = .{
+            .limit = 400000,
+            .qth_min = 30000,
+            .qth_max = 90000,
+            .wlog = 5,
+            .plog = 23,
+            .scell_log = 15,
+            .stab = &stab,
+            .max_p = 42949672,
+            .flags = 1,
+        } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_red_ecn_big_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794893789 len=348
+// tc qdisc add dev lo root handle 2: red limit 100000 min 10000 max 30000 avpkt 1000 burst 20 probability 0.02 ecn nodrop
+const g_red_nodrop_qdisc =
+    "5c01000024000506dde7fb6a00000000000000000100000000000200ffffffff00000000080001007265640030010200" ++
+    "14000100a0860100102700003075000004140e0004010200000000000000000000000000010101010101010101010101" ++
+    "020202020202020202020202030303030303030303030303040404040404040404040404050505050505050505050506" ++
+    "06060606060606060606060707070707070707070707070808080808080808080808080909090909090909090909090a" ++
+    "0a0a0a0a0a0a0a0a0a0a0a0b0b0b0b0b0b0b0b0b0b0b0c0c0c0c0c0c0c0c0c0c0c0c0d0d0d0d0d0d0d0d0d0d0d0d0e0e" ++
+    "0e0e0e0e0e0e0e0e0e0e0f0f0f0f0f0f0f0f0f0f0f0f1010101010101010101010111111111111111111111111121212" ++
+    "1212121212121212121313131313131313131313131414141414141414141414141515151515151f0800030051b81e05" ++
+    "0c000400090000000f000000";
+const seq_red_nodrop_qdisc: u32 = 1794893789;
+
+test "golden: red nodrop" {
+    // tc qdisc add dev lo root handle 2: red limit 100000 min 10000 max 30000 avpkt 1000 burst 20 probability 0.02 ecn nodrop
+    var stab: [qdisc.red_stab_len]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&stab, g_red_nodrop_qdisc[72 * 2 .. 328 * 2]);
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_red_nodrop_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(2, 0), .parent = Handle.root },
+        .{ .red = .{
+            .limit = 100000,
+            .qth_min = 10000,
+            .qth_max = 30000,
+            .wlog = 4,
+            .plog = 20,
+            .scell_log = 14,
+            .stab = &stab,
+            .max_p = 85899345,
+            .flags = 9,
+        } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_red_nodrop_qdisc, req);
+}
+
+test "goldens re-parse: hfsc and red qdiscs" {
+    const codec = @import("netlink").codec;
+    var buf: [1024]u8 = undefined;
+    {
+        const bytes = try std.fmt.hexToBytes(buf[0 .. g_hfsc_default_qdisc.len / 2], g_hfsc_default_qdisc);
+        var it: codec.MessageIterator = .{ .buf = bytes };
+        const q = try qdisc.parseQdisc((try it.next()).?.payload);
+        try testing.expectEqualStrings("hfsc", q.kind());
+        try testing.expectEqual(@as(u16, 0x10), q.hfsc.?.default_class);
+    }
+    {
+        const bytes = try std.fmt.hexToBytes(buf[0 .. g_red_flags_qdisc.len / 2], g_red_flags_qdisc);
+        var it: codec.MessageIterator = .{ .buf = bytes };
+        const q = try qdisc.parseQdisc((try it.next()).?.payload);
+        try testing.expectEqualStrings("red", q.kind());
+        const r = q.red.?;
+        try testing.expectEqual(@as(u32, 100_000), r.limit);
+        try testing.expectEqual(@as(u32, 10_000), r.qth_min);
+        try testing.expectEqual(@as(u32, 30_000), r.qth_max);
+        try testing.expectEqual(@as(u8, 4), r.wlog);
+        try testing.expectEqual(@as(?u32, 7), r.flags);
+        try testing.expect(r.max_p != null);
+    }
+    // hfsc options shorter than the qopt are skipped.
+    try testing.expect(qdisc.parseHfscOptions("\x01") == null);
+}

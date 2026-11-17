@@ -124,6 +124,15 @@ pub const TCA_FQ_CODEL = struct {
 };
 
 /// codel attribute types (linux/pkt_sched.h `TCA_CODEL_*`).
+/// `TCA_RED_*` (`pkt_sched.h`).
+pub const TCA_RED = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const PARMS: u16 = 1;
+    pub const STAB: u16 = 2;
+    pub const MAX_P: u16 = 3;
+    pub const FLAGS: u16 = 4;
+};
+
 pub const TCA_CODEL = struct {
     pub const UNSPEC: u16 = 0;
     pub const TARGET: u16 = 1;
@@ -196,6 +205,8 @@ pub const kind_bfifo = "bfifo";
 pub const kind_sfq = "sfq";
 pub const kind_codel = "codel";
 pub const kind_fq = "fq";
+pub const kind_hfsc = "hfsc";
+pub const kind_red = "red";
 
 /// `sizeof(struct tc_netem_qopt)`.
 pub const tc_netem_qopt_len = 24;
@@ -1472,6 +1483,131 @@ pub fn parseFqOptions(data: []const u8) codec.Error!FqWire {
     return w;
 }
 
+// ── hfsc and red ─────────────────────────────────────────────────────────────
+
+/// The hierarchical fair-service-curve qdisc (`hfsc`). Its qdisc options are one
+/// `struct tc_hfsc_qopt` (a `u16` `defcls`); the curves live on the classes,
+/// which this module does not model.
+pub const Hfsc = struct {
+    /// `default N`: the class id (minor) that unclassified packets go to; 0 = none.
+    default_class: u16 = 0,
+};
+
+/// Wire readback of an hfsc qdisc's options.
+pub const HfscWire = struct { default_class: u16 };
+
+fn appendHfscOptions(h: Hfsc, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) std.mem.Allocator.Error!void {
+    var raw: [2]u8 = undefined;
+    std.mem.writeInt(u16, &raw, h.default_class, native_endian);
+    try list.appendSlice(gpa, &raw);
+}
+
+/// Null when the payload is shorter than `struct tc_hfsc_qopt`.
+pub fn parseHfscOptions(data: []const u8) ?HfscWire {
+    if (data.len < 2) return null;
+    return .{ .default_class = std.mem.readInt(u16, data[0..2], native_endian) };
+}
+
+/// `TC_RED_ECN`, `TC_RED_HARDDROP`, `TC_RED_ADAPTATIVE`, `TC_RED_NODROP`.
+pub const red_flag_ecn: u8 = 1;
+pub const red_flag_harddrop: u8 = 2;
+pub const red_flag_adaptative: u8 = 4;
+pub const red_flag_nodrop: u8 = 8;
+/// `TC_RED_SUPPORTED_FLAGS`: the selector `tc` sends with the flags value.
+pub const red_supported_flags: u32 = 0x0f;
+/// `RED_STAB_SIZE`.
+pub const red_stab_len = 256;
+
+/// Random early detection (`red`). `tc` derives `wlog`, `plog`, `scell_log` and
+/// the 256-octet idle-damping table `stab` from `burst`/`avpkt`/`probability`
+/// (and `bandwidth`); that derivation is NOT reproduced here, so the caller
+/// supplies them (the kernel refuses a `red` without `stab`). `max_p` is
+/// `probability * 2^32`.
+pub const Red = struct {
+    /// `limit`, bytes.
+    limit: u32,
+    /// `min`, bytes.
+    qth_min: u32,
+    /// `max`, bytes.
+    qth_max: u32,
+    wlog: u8,
+    plog: u8,
+    scell_log: u8,
+    /// `TCA_RED_STAB`: the idle-damping table, `RED_STAB_SIZE` octets.
+    stab: *const [red_stab_len]u8,
+    /// `TCA_RED_MAX_P`; null omits it.
+    max_p: ?u32 = null,
+    /// `red_flag_*` bits (`ecn`, `harddrop`, `adaptive`, `nodrop`), sent as
+    /// `TCA_RED_FLAGS` with `red_supported_flags` as selector, as `tc` does.
+    flags: u8 = 0,
+};
+
+/// Wire readback of a red qdisc's options (the kernel does not dump `stab`).
+pub const RedWire = struct {
+    limit: u32 = 0,
+    qth_min: u32 = 0,
+    qth_max: u32 = 0,
+    wlog: u8 = 0,
+    plog: u8 = 0,
+    scell_log: u8 = 0,
+    /// The `flags` octet of `struct tc_red_qopt` (historic flags).
+    qopt_flags: u8 = 0,
+    max_p: ?u32 = null,
+    /// `TCA_RED_FLAGS` value, when sent.
+    flags: ?u32 = null,
+};
+
+const RedAttrError = std.mem.Allocator.Error || error{AttrTooLong};
+
+fn redAttrErr(e: RedAttrError) EncodeError {
+    return switch (e) {
+        error.AttrTooLong => error.OptionsTooLong,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+fn appendRedOptions(r: Red, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    var parms: [16]u8 = undefined;
+    std.mem.writeInt(u32, parms[0..4], r.limit, native_endian);
+    std.mem.writeInt(u32, parms[4..8], r.qth_min, native_endian);
+    std.mem.writeInt(u32, parms[8..12], r.qth_max, native_endian);
+    parms[12] = r.wlog;
+    parms[13] = r.plog;
+    parms[14] = r.scell_log;
+    parms[15] = 0; // tc keeps the flags out of the struct and sends them as TCA_RED_FLAGS
+    codec.appendAttr(gpa, list, TCA_RED.PARMS, &parms) catch |e| return redAttrErr(e);
+    codec.appendAttr(gpa, list, TCA_RED.STAB, r.stab) catch |e| return redAttrErr(e);
+    if (r.max_p) |v| codec.appendAttrU32(gpa, list, TCA_RED.MAX_P, v) catch |e| return redAttrErr(e);
+    var fl: [8]u8 = undefined;
+    std.mem.writeInt(u32, fl[0..4], r.flags, native_endian);
+    std.mem.writeInt(u32, fl[4..8], red_supported_flags, native_endian);
+    codec.appendAttr(gpa, list, TCA_RED.FLAGS, &fl) catch |e| return redAttrErr(e);
+}
+
+pub fn parseRedOptions(data: []const u8) codec.Error!RedWire {
+    var w: RedWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| switch (a.type) {
+        TCA_RED.PARMS => if (a.data.len >= 16) {
+            w.limit = std.mem.readInt(u32, a.data[0..4], native_endian);
+            w.qth_min = std.mem.readInt(u32, a.data[4..8], native_endian);
+            w.qth_max = std.mem.readInt(u32, a.data[8..12], native_endian);
+            w.wlog = a.data[12];
+            w.plog = a.data[13];
+            w.scell_log = a.data[14];
+            w.qopt_flags = a.data[15];
+        },
+        TCA_RED.MAX_P => if (a.data.len == 4) {
+            w.max_p = std.mem.readInt(u32, a.data[0..4], native_endian);
+        },
+        TCA_RED.FLAGS => if (a.data.len == 8) {
+            w.flags = std.mem.readInt(u32, a.data[0..4], native_endian);
+        },
+        else => {},
+    };
+    return w;
+}
+
 // ── the spec unions ─────────────────────────────────────────────────────────
 
 /// Escape hatch for a kind this module does not model: a `TCA_KIND` string
@@ -1497,6 +1633,8 @@ pub const QdiscSpec = union(enum) {
     sfq: Sfq,
     codel: Codel,
     fq: Fq,
+    hfsc: Hfsc,
+    red: Red,
     raw: Raw,
 
     pub fn kind(self: QdiscSpec) []const u8 {
@@ -1515,6 +1653,8 @@ pub const QdiscSpec = union(enum) {
             .sfq => kind_sfq,
             .codel => kind_codel,
             .fq => kind_fq,
+            .hfsc => kind_hfsc,
+            .red => kind_red,
             .raw => |r| r.kind,
         };
     }
@@ -1555,6 +1695,8 @@ pub const QdiscSpec = union(enum) {
             .sfq => |q| try appendSfqOptions(q, gpa, list),
             .codel => |c| try appendCodelOptions(c, gpa, list),
             .fq => |f| try appendFqOptions(f, gpa, list),
+            .hfsc => |h| try appendHfscOptions(h, gpa, list),
+            .red => |r| try appendRedOptions(r, gpa, list),
             .raw => |r| {
                 if (r.options.len > std.math.maxInt(u16)) return error.OptionsTooLong;
                 try list.appendSlice(gpa, r.options);
@@ -1753,6 +1895,8 @@ pub const Qdisc = struct {
     sfq: ?SfqWire = null,
     codel: ?CodelWire = null,
     fq: ?FqWire = null,
+    hfsc: ?HfscWire = null,
+    red: ?RedWire = null,
     /// Counters (`tc -s`); null when the kernel sent none (API addition).
     stats: ?Stats = null,
     /// `TCA_XSTATS` of an `fq_codel` qdisc. Other kinds' private statistics
@@ -1838,6 +1982,10 @@ pub fn parseQdisc(payload: []const u8) codec.Error!Qdisc {
             q.codel = try parseCodelOptions(opt);
         } else if (std.mem.eql(u8, k, kind_fq)) {
             q.fq = try parseFqOptions(opt);
+        } else if (std.mem.eql(u8, k, kind_hfsc)) {
+            q.hfsc = parseHfscOptions(opt);
+        } else if (std.mem.eql(u8, k, kind_red)) {
+            q.red = try parseRedOptions(opt);
         }
     }
     return q;

@@ -135,7 +135,7 @@ class's direct children, and `filters(ifi, parent)` matches the attach point exa
 - `Handle` — `init(major, minor)`, `.root`/`.ingress`/`.clsact`/`.unspec`, `major()`,
   `minor()`, `qdisc()`, `isClass()`, `parse("1:10")`, `{f}` formatting. **Hexadecimal**,
   like `tc`.
-- `QdiscSpec` = `.netem` | `.htb` | `.tbf` | `.fq_codel` | `.mq` | `.ingress` | `.clsact` | `.cake` | `.prio` | `.pfifo` | `.bfifo` | `.sfq` | `.codel` | `.fq` | `.raw`;
+- `QdiscSpec` = `.netem` | `.htb` | `.tbf` | `.fq_codel` | `.mq` | `.ingress` | `.clsact` | `.cake` | `.prio` | `.pfifo` | `.bfifo` | `.sfq` | `.codel` | `.fq` | `.hfsc` | `.red` | `.raw`;
   `ClassSpec` = `.htb` | `.raw`; `FilterSpec` = `.u32` | `.flower` | `.matchall` | `.bpf` | `.raw`;
   `ActionSpec` = `.gact` | `.mirred` | `.police` | `.skbedit` | `.vlan` | `.raw`.
 - `Verdict` — the `TC_ACT_*` return codes (`.ok`, `.shot`, `.pipe`, `.stolen`,
@@ -156,7 +156,7 @@ class's direct children, and `filters(ifi, parent)` matches the attach point exa
   `src/qdisc.zig` / `src/filter.zig`. Rates are **bytes per second** (`1mbit` = 125000).
 - `Qdisc`, `Class`, `Filter` — dump results, each with a `kind()` plus an optional
   decoded-options field per modelled kind (`q.netem`, `q.htb`, `q.tbf`, `q.fq_codel`,
-  `q.cake`, `q.prio`, `q.fifo`, `q.sfq`, `q.codel`, `q.fq`, `c.htb`, `f.u32_sel`, `f.flower`, `f.matchall`, `f.bpf`, `f.classid()`).
+  `q.cake`, `q.prio`, `q.fifo`, `q.sfq`, `q.codel`, `q.fq`, `q.hfsc`, `q.red`, `c.htb`, `f.u32_sel`, `f.flower`, `f.matchall`, `f.bpf`, `f.classid()`).
 - `Psched`, `RateSpec`, `LinkLayer` and the rate-table helpers in `tc.ratespec`.
 - `tc.message` — the pure request builders (`buildQdiscSet`, `buildClassSet`,
   `buildFilterSet`, `buildDump`, …) if you want the bytes without a socket.

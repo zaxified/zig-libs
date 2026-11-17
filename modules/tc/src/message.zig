@@ -176,6 +176,8 @@ pub fn buildQdiscSet(
         const nest = try codec.nestBegin(gpa, &list, qdisc.TCA.OPTIONS);
         try spec.appendOptions(gpa, &list, ps);
         codec.nestEnd(&list, nest) catch return error.OptionsTooLong;
+        // A payload that is not a multiple of 4 (hfsc's `u16`) is padded OUTSIDE the attribute's length.
+        try list.appendNTimes(gpa, 0, codec.alignUp(list.items.len) - list.items.len);
     }
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
