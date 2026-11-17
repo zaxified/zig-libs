@@ -9530,6 +9530,9 @@ test "audit: unprotectHandshakeMessage: short ciphertext, replay, inner content 
     try testing.expectError(error.ReplayedRecord, r.unprotectHandshakeMessage(rec, &pt, null));
     try testing.expectError(error.UnexpectedMessage, r.unprotectHandshakeMessage(try auditSealInner(.aes_128_gcm_sha256, &s.hs_write_keys, 2, 7, "abc\x17", &out), &pt, null));
     try testing.expectError(error.Malformed, r.unprotectHandshakeMessage(try auditSealInner(.aes_128_gcm_sha256, &s.hs_write_keys, 2, 8, &.{ 0, 0, 0 }, &out), &pt, null));
+    // An `ack` inner type is admitted by `unprotectHandshakeRecord` only;
+    // this handshake-message-only entry point refuses it.
+    try testing.expectError(error.UnexpectedMessage, r.unprotectHandshakeMessage(try auditSealInner(.aes_128_gcm_sha256, &s.hs_write_keys, 2, 9, &.{ 0, 0, content_type_ack }, &out), &pt, null));
     r.hs2.recv_max_seq = 70000;
     r.hs2.recv_window = 1;
     s.hs2.send_seq = 70001;
