@@ -445,6 +445,7 @@ test {
     _ = @import("Connection12.zig");
     _ = @import("Endpoint.zig");
     _ = @import("conn12_test.zig");
+    _ = @import("audit_test.zig");
     _ = @import("fuzz12_test.zig");
 }
 

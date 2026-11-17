@@ -597,6 +597,51 @@ early `end >= max_len` break in `nextDatagram` — the next iteration's
 has no whole-module counts (`src ?`), so this delta is recorded here only;
 the module still needs a whole-module mutation run.
 
+**Audit 2026-11-17 (whole-module mutation) — partial, not on the card.**
+1327 mutants over every non-test line of `src/` (test files, the fuzz corpus,
+KAT/replay data, the ctgrind harness and stack probes excluded), generated
+one per condition × class: guard dropped (per disjunct / conjunct), ordering
+comparison off by one, counter increment skipped, `self.*` assignment
+skipped, wipe skipped. One ReleaseSafe schemata binary per round, four
+rounds. Result: **985 killed (one of them a hang), 83 EQUIVALENT, 44 UNOBSERVABLE,
+215 still open** — 53 in `Connection12.zig`, 162 in `Connection.zig`.
+Every other file (`record`, `record12`, `handshake`, `flight`, `aead`,
+`keyschedule`, `prf12`, `suitehash`, `messages`, `messages12`, `certauth`,
+`sig12`, `suite12`, `Endpoint`, `engine`, `burn`, `root`) is closed: zero
+survivors. The killing tests are `src/audit_test.zig`: exact-size output
+buffers and one-past-the-limit lengths for every `messages` / `messages12`
+encoder, decoder edges, record / record12 / Reassembler / FlightTracker /
+AEAD / PRF boundaries, a 33-byte Ed25519 key, and for the DTLS 1.2 engine a
+fake peer that feeds crafted ServerHello / HelloVerifyRequest /
+ServerKeyExchange / ClientHello / ClientKeyExchange / CCS / Finished
+records, plus the send/recv API edges. Classes of the EQUIVALENT verdicts:
+a length check whose exact-boundary case fails the very next check with the
+same error (decoders, encoders whose extensions block needs two more bytes);
+infeasible values (lengths that are always even or multiples of 16, the
+48-bit reconstruction corner); invariants on our own data (the cached
+ClientHello in `Endpoint.handOver`, server-minted cookie lengths); dominated
+checks (an ALPN name over 255 already exceeds the 256-byte list cap; the
+ClientKeyExchange refusal of a missing required certificate);
+cost-only (`nextDatagram`'s early break, a zero-length copy, the
+queue-less retry). UNOBSERVABLE: wipes of keys, secrets, premasters and
+rollback copies (they need a read of dead memory or of a struct after
+`deinit`) and the write-only `ecdhe_live` / `ecdhe_secret_live` bookkeeping
+behind them. **Finding (fixed):** the plain-PSK premaster buffer held
+2 + 80 + 2 + 512 bytes, but RFC 4279 §2's `other_secret` is `psk.len` zero
+bytes, so a 297..512-byte `Config.psk` overflowed it (panic in ReleaseSafe,
+stack overflow in ReleaseFast); now `2 + max(80, max_psk_len) + 2 +
+max_psk_len`, the 512 cap (OpenSSL's `PSK_MAX_PSK_LEN`) kept. Only the local
+configuration reaches it, not a peer. The DTLS 1.3 PSK path has no such
+buffer (the PSK goes straight into HKDF-Extract; an over-long PSK identity
+is a typed `BufferTooShort` from the ClientHello's pre_shared_key buffer).
+The 2026-11-17 triage item "1.2: a later message is dropped" is refuted:
+later messages are queued (test "whole messages arriving in reverse order
+inside one datagram are queued, not dropped", and the queue mutants were
+killed). Open: the 1.3 engine's KeyUpdate / ACK / record-protection /
+HelloRetryRequest / certificate-flight survivors and the 1.2 engine's
+retransmission flags, Finished length, signature-scheme selection and
+buffer caps. The per-mutant table is the audit's scratch, not committed.
+
 ## Threat model / out of scope
 
 - **Not yet — see Backlog (not silently skipped):** session resumption /
