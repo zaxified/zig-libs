@@ -1003,7 +1003,18 @@ test "review H1: one issuer is never driven by two threads at once" {
     try m.addIssuer(fake.issuer(false));
     var got: std.atomic.Value(u32) = .init(0);
     // Two different names: two entries, one issuer — the calls must queue.
+    // The script answers in call order (od1 first), so the second thread
+    // starts only once the first is inside `issue`, holding the issuer: it
+    // then has to queue behind it, and the answers meet the right names.
+    // Spawned together, od2 won the issuer in ~3 % of runs, got od1's
+    // certificate (refused: does not cover the name) and the test failed
+    // (scheduled CI 44076840159, reproduced 12/400 locally).
     const t1 = try std.Thread.spawn(.{}, askName, .{ &m, "od.example", &got });
+    var spins: usize = 0;
+    while (fake.max_in_flight.load(.acquire) == 0) : (spins += 1) {
+        if (spins > 50_000_000) break; // never hang: the asserts below then fail
+        std.Thread.yield() catch {};
+    }
     const t2 = try std.Thread.spawn(.{}, askName, .{ &m, "od2.example", &got });
     t1.join();
     t2.join();

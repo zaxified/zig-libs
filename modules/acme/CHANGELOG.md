@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the `review H1` test (one issuer never driven by two threads) was order-dependent: its fake issuer answers in call order, so when the second name won the issuer it got the first name's certificate and both lookups failed (~3 % of runs; scheduled CI 44076840159). The second thread now starts once the first holds the issuer, which also guarantees the two calls overlap. 0/2000 failures under 8-way load, 12/400 before. Audit src hash re-stamped (test synchronisation only, no code or assertion change).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** tests from the whole-module mutation re-run (648 mutants over `Client`, `jws`, `x509`, `Manager`, `storage`, `root`): the built-in DNS-01 solver refuses an identifier whose record name is longer than 253 bytes without publishing or removing anything; `x509.pemBlockCount` reads a malformed block after a good one as 0 (fail closed); a chain skips blocks of other labels (a key after the certificates) and refuses a CERTIFICATE block that does not decode or is unterminated; `ratioRenewAt` clamps a certificate that expires before it starts to a zero lifetime.
