@@ -92,6 +92,24 @@ frame cannot derail a run — but a peer that stays silent is treated as absent 
 `Participant.init` and `Dkg.run` refuse `n < 2t − 1` (`NoHonestMajority`): GJKR's
 guarantees need the `t − 1` parties it tolerates to be a minority.
 
+Surviving a restart: a party's in-flight state serialises with `p.toBytes(buf)` (size the
+buffer with `p.encodedLength()`) and resumes with `dkg.Participant.fromBytes(allocator, bytes)`;
+`ReshareReceiver` has the same three functions. Snapshot at each round boundary, and keep
+exactly the latest one (an older snapshot replays rounds).
+
+```zig
+const buf = try allocator.alloc(u8, p.encodedLength());
+defer { std.crypto.secureZero(u8, buf); allocator.free(buf); }
+const bytes = try p.toBytes(buf);
+// ... store `bytes` ENCRYPTED, like a key: every byte is secret ...
+var resumed = try dkg.Participant.fromBytes(allocator, bytes); // error.InvalidState on anything off
+defer resumed.deinit();
+```
+
+The snapshot is plain bytes, not encrypted by the module: like frost-core's `SecretPackage`
+and tss-lib's save data, it leaves protection at rest to the caller. It includes the frames
+not yet taken from `takeOutgoing`, so a crash between snapshot and send loses none.
+
 Resharing to a new committee (or the same one, as a proactive refresh):
 
 ```zig

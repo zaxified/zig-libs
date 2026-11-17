@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — New `dkg.snapshot` (`snapshot.zig`): `Participant` and `ReshareReceiver` gain `encodedLength()` / `toBytes(out)` / `fromBytes(allocator, bytes)`, a versioned byte format (version, kind and group tag; pending frames included) so a party that restarts mid-run resumes at any round boundary with the same group key. Fail-closed decoder (`error.InvalidState`): every length checked before allocation, trailing bytes, bad tags, non-canonical scalars, off-curve points and phase-inconsistent states refused, secrets wiped on every error path. The snapshot is plain secret bytes (the caller protects it), as in frost-core and tss-lib. No existing API changed.
 - **2026-11-16** — New `dkg.echo` / `dkg.EchoBroadcast`: sans-I/O, allocation-free echo-broadcast helper (broadcast with abort) around the existing rounds; `addReceived`, `missing`, `digest`, `check`, `firstMismatch`. No existing API changed.
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 

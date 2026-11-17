@@ -70,6 +70,7 @@ const core = @import("core.zig");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
 const burn = @import("burn.zig");
+const snapshot = @import("snapshot.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
@@ -284,6 +285,34 @@ pub const Participant = struct {
         if (self.result) |*r| r.deinit();
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    // ── snapshot (versioned bytes of the in-flight state, `snapshot.zig`) ──
+
+    /// Exact length `toBytes` writes for the current state.
+    pub fn encodedLength(self: *const Participant) usize {
+        return snapshot.participantLength(self);
+    }
+
+    /// Writes a snapshot of this in-flight party into `out` and returns the
+    /// used prefix; `fromBytes` resumes the run from it. **Every byte is
+    /// SECRET** (own secret polynomials, received shares, pending frames, the
+    /// finished share): store it like a key, encrypted and access-controlled,
+    /// and `secureZero` the buffer when done. The module does not wrap it (the
+    /// reference libraries, frost-core and tss-lib, leave this to the caller
+    /// too). A snapshot is only as fresh as the call: restoring an old one
+    /// replays rounds, so keep exactly the latest. No allocation.
+    pub fn toBytes(self: *const Participant, out: []u8) snapshot.EncodeError![]u8 {
+        return snapshot.participantToBytes(self, out);
+    }
+
+    /// Rebuilds a party from `toBytes` output (the caller `deinit`s it). The
+    /// decoder is fail-closed: wrong version, kind or group tag, a bad length,
+    /// trailing bytes, a non-canonical scalar, an invalid point or a state no
+    /// run can reach is `error.InvalidState`; secrets of a half-built state are
+    /// wiped. The caller's `bytes` (secret) stay the caller's to zero.
+    pub fn fromBytes(allocator: std.mem.Allocator, bytes: []const u8) snapshot.DecodeError!Participant {
+        return snapshot.participantFromBytes(allocator, bytes);
     }
 
     // ── observers ────────────────────────────────────────────────────────
