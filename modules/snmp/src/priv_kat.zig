@@ -36,3 +36,15 @@ pub const cases = [_]Case{
     .{ .auth = "hmac_sha512", .priv = "aes192_cisco_cfb", .key_hex = "22a5a36cedfcc085807a128d7bc6c2382167ad6c0dbc5fdf", .ct_hex = "adb2610c14f85bbeb0b0655bb7c10549bd6132fe44b907a822ca45751bcffa3b76086a5510" },
     .{ .auth = "hmac_sha512", .priv = "aes256_cisco_cfb", .key_hex = "22a5a36cedfcc085807a128d7bc6c2382167ad6c0dbc5fdff856740f3d84c099", .ct_hex = "4da14c8db27f0853f5803f4468332bff4ab48ef1ed01b98861f20716b0e3cb8d5a25497e93" },
 };
+
+/// Multi-round extension (need = 64 bytes), through `usm.extendLocalizedKey` directly: the
+/// protocols only ever need one round (<= 32 bytes), so this is the only multi-round check.
+pub const ExtCase = struct { auth: []const u8, how: []const u8, key_hex: []const u8 };
+pub const ext64 = [_]ExtCase{
+    .{ .auth = "hmac_md5", .how = "blumenthal", .key_hex = "526f5eed9fcce26f8964c2930787d82bfa24a92467426c2f4b09192be10dfaecf0e919ede2ddaa44c67a3ed12eda7a81f542d83de1c3dfd85227ac2f9c801c1e" },
+    .{ .auth = "hmac_md5", .how = "reeder", .key_hex = "526f5eed9fcce26f8964c2930787d82b79eff44a90650ee0a3a40abfac5acc12756904ca25465d682d467ad465ed8f592ba4090bd43f4212134e9750c910cbf5" },
+    .{ .auth = "hmac_sha1", .how = "blumenthal", .key_hex = "6695febc9288e36282235fc7151f128497b38f3f505e07eb9af25568fa1f5dbe1bf2e6a0e36ea40aaa0f656e819227e8a6ca3f9975e4f56b85313d30fdf58c3c" },
+    .{ .auth = "hmac_sha1", .how = "reeder", .key_hex = "6695febc9288e36282235fc7151f128497b38f3f9b8b6d78936ba6e7d19dfd9cd2d5065547743fb50e6354a6739601fcea55d6faddb5b0531310bd08506ea390" },
+    .{ .auth = "hmac_sha224", .how = "blumenthal", .key_hex = "0bd8827c6e29f8065e08e09237f177e410f69b90e1782be682075674e82d9bf08a4be4ff61a62a30b247c72561bad42766ab42307b45a226203e8c1e52da777f" },
+    .{ .auth = "hmac_sha224", .how = "reeder", .key_hex = "0bd8827c6e29f8065e08e09237f177e410f69b90e1782be68207567422c34be4e8642b2bb4b0caf6ae78b304832112fbd833c355af0342840febcfe9cafdc8ad" },
+};

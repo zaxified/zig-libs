@@ -120,5 +120,7 @@ protocol operations), RFC 2578 (SMI types), ITU-T X.690 (BER), RFC 3412
 RFC 7860 (SHA-2 auth), FIPS PUB 46-3 (DES, public domain) and NIST SP 800-38A
 (CFB mode), both KAT-verified — original work of the zig-libs authors (MIT).
 net-snmp (BSD-like license) is cited as a behavior reference and is otherwise
-used only as a black-box interop oracle (run it, capture its packets, compare)
-— no source consulted or copied, so it carries no attribution obligation.
+used as a black-box interop oracle (run it, capture its packets, compare) and,
+for the AES-192/256 privacy key extension and variant OIDs (draft-blumenthal-aes-usm-04
+plus the Reeder/Cisco extension), its `keytools.c`/`snmpusm.c` were read for the
+algorithm — no code copied, so it carries no attribution obligation.

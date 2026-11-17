@@ -92,3 +92,13 @@ for hn, h in HASHES:
         key = extend(h, how, kul0, bits)[:bits]
         print(f"    .{{ .auth = \"{hn}\", .priv = \"{pn}\", .key_hex = {hx(key)}, .ct_hex = {hx(cfb(key, PLAIN))} }},")
 print("};")
+print("")
+print("/// Multi-round extension (need = 64 bytes), through `usm.extendLocalizedKey` directly: the")
+print("/// protocols only ever need one round (<= 32 bytes), so this is the only multi-round check.")
+print("pub const ExtCase = struct { auth: []const u8, how: []const u8, key_hex: []const u8 };")
+print("pub const ext64 = [_]ExtCase{")
+for hn, h in HASHES[:3]:
+    kul0 = localize(h, ku(h, PASSWORD), ENGINE)
+    for how in ("blumenthal", "reeder"):
+        print(f"    .{{ .auth = \"{hn}\", .how = \"{how}\", .key_hex = {hx(extend(h, how, kul0, 64))} }},")
+print("};")

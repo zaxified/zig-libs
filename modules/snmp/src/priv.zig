@@ -772,7 +772,8 @@ test "AES-192/256 KATs: every auth hash x each new privacy protocol (tools/gen_a
         const want_ct = comptime unhex(c.ct_hex);
         var key_buf: [usm.max_key_len]u8 = undefined;
         const key = try localizeKey(proto, auth, "maplesyrup", &engine_id, &key_buf);
-        try testing.expect(key.len >= proto.keyLen());
+        // Exactly max(hash length, key length): no more is appended than needed.
+        try testing.expectEqual(@max(auth.keyLen(), proto.keyLen()), key.len);
         try testing.expectEqualSlices(u8, &want_key, key[0..proto.keyLen()]);
 
         var src = SaltSource.fixedForInterop(salt);
@@ -833,6 +834,39 @@ test "key extension: a long-enough key is left alone; the two families differ; s
     const c = try localizeKey(.aes256_cfb, .hmac_md5, "maplesyrup", &other, &c_buf);
     const d = try localizeKey(.aes256_cisco_cfb, .hmac_md5, "maplesyrup", &other, &d_buf);
     try testing.expect(!std.mem.eql(u8, c[16..32], d[16..32]));
+}
+
+test "key extension over several rounds (need 64): both families vs the oracle" {
+    @setEvalBranchQuota(200_000);
+    const kat = @import("priv_kat.zig");
+    const engine_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+    inline for (kat.ext64) |c| {
+        const auth = comptime std.meta.stringToEnum(usm.AuthProtocol, c.auth).?;
+        const how = comptime std.meta.stringToEnum(usm.KeyExtension, c.how).?;
+        const want = comptime unhex(c.key_hex);
+        var buf: [usm.max_key_len]u8 = undefined;
+        const k = try usm.passwordToKey(auth, "maplesyrup", &engine_id, &buf);
+        const ext = try usm.extendLocalizedKey(auth, how, &engine_id, &buf, k.len, 64);
+        try testing.expectEqualSlices(u8, &want, ext);
+    }
+}
+
+test "localizeKey: exact-fit buffer works, a buffer shorter than the hash is refused before any write" {
+    const engine_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+    var fit: [32]u8 = undefined;
+    const k = try localizeKey(.aes256_cfb, .hmac_sha1, "maplesyrup", &engine_id, &fit);
+    try testing.expectEqual(@as(usize, 32), k.len);
+    var fit24: [24]u8 = undefined;
+    try testing.expectEqual(@as(usize, 24), (try localizeKey(.aes192_cisco_cfb, .hmac_md5, "maplesyrup", &engine_id, &fit24)).len);
+    // SHA-512 localizes to 64 bytes: a 32-byte buffer must be refused, not overrun.
+    var small: [32]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, localizeKey(.aes128_cfb, .hmac_sha512, "maplesyrup", &engine_id, &small));
+    // AES-128 and DES are never extended: the plain localized key comes back.
+    var buf: [usm.max_key_len]u8 = undefined;
+    inline for (.{ PrivProtocol.aes128_cfb, PrivProtocol.des_cbc }) |p| {
+        const a = try localizeKey(p, .hmac_sha1, "maplesyrup", &engine_id, &buf);
+        try testing.expectEqualSlices(u8, &unhex("6695febc9288e36282235fc7151f128497b38f3f"), a);
+    }
 }
 
 test "AES-192/256 negative cases: short key, wrong salt length, partial blocks" {
