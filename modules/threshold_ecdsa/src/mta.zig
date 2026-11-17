@@ -1149,6 +1149,18 @@ test "centeredModQ: a negative β' (wrapped plaintext) still yields α ≡ a·b 
     try testing.expect(centeredModQ(&hi, &n).equivalent(zkproofs.scalarFromWide(&hi).sub(zkproofs.scalarFromWide(&n))));
 }
 
+test "mtaBobResponseChecked refuses a Paillier N below the q^7 floor (mutation audit 2026-11-17)" {
+    var kprng = std.Random.DefaultPrng.init(0x666c_6f6f_72);
+    var kp: paillier.KeyPair = undefined;
+    try paillier.generate(kprng.random(), 512, &kp);
+    var prng = std.Random.DefaultPrng.init(0x666c_6f6f_7232);
+    const random = prng.random();
+    var alice: AliceInitChecked = undefined;
+    try mtaAliceInitChecked(&scalarFromU64(5), kp.public, random, &alice);
+    var bob: BobResponseChecked = undefined;
+    try testing.expectError(error.PaillierModulusBelowFloor, mtaBobResponseChecked(&scalarFromU64(7), alice.c_a, kp.public, random, &bob));
+}
+
 test "mutation audit: the verified finalize centres a wrapped plaintext; the checked finalize is bound to the proof context" {
     if (builtin.mode == .debug) return error.SkipZigTest;
     var kprng = std.Random.DefaultPrng.init(0x6d75_7461_7564_6974);

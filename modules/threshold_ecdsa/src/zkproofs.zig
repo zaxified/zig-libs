@@ -3816,3 +3816,235 @@ test "powSecret: equals ff's public-exponent pow for exponents shorter than, equ
     // A zero exponent is 1 (ff's pow refuses it).
     try testing.expect(auxFeEql(powSecret(m, base, &[_]u8{ 0, 0, 0 }), m.one()));
 }
+
+/// The Fiat-Shamir transcript spelled out independently of `Transcript`:
+/// SHA-256 over the domain, then each part as a big-endian u32 length and
+/// its bytes, the digest reduced into the scalar field (mutation audit
+/// 2026-11-17: a field dropped from a challenge changes nothing an honest
+/// proof or a tampered one can show; only the layout itself can).
+const HandTranscript = struct {
+    h: Sha256,
+
+    fn init(domain: []const u8) HandTranscript {
+        var t: HandTranscript = .{ .h = Sha256.init(.{}) };
+        t.h.update(domain);
+        return t;
+    }
+
+    fn add(self: *HandTranscript, bytes: []const u8) void {
+        var len_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(bytes.len), .big);
+        self.h.update(&len_buf);
+        self.h.update(bytes);
+    }
+
+    fn auxFe(self: *HandTranscript, fe: root.AuxFe) void {
+        var buf: [root.aux_modulus_bytes]u8 = undefined;
+        fe.toBytes(&buf, .big) catch unreachable;
+        self.add(&buf);
+    }
+
+    fn auxParams(self: *HandTranscript, aux: root.AuxParams) void {
+        var buf: [root.aux_modulus_bytes]u8 = undefined;
+        aux.n_tilde.toBytes(&buf, .big) catch unreachable;
+        self.add(&buf);
+        self.auxFe(aux.h1);
+        self.auxFe(aux.h2);
+    }
+
+    fn ciphertext(self: *HandTranscript, c: paillier.Ciphertext) void {
+        var buf: [paillier.modulus_sq_bytes]u8 = undefined;
+        c.toBytes(&buf) catch unreachable;
+        self.add(&buf);
+    }
+
+    fn paillierKey(self: *HandTranscript, pk: paillier.PublicKey) void {
+        var n_buf: [paillier.modulus_bytes]u8 = undefined;
+        const n_len = pk.nByteLen();
+        pk.nToBytes(n_buf[0..n_len]) catch unreachable;
+        self.add(n_buf[0..n_len]);
+        var g_buf: [paillier.modulus_sq_bytes]u8 = undefined;
+        pk.gToBytes(&g_buf) catch unreachable;
+        self.add(&g_buf);
+    }
+
+    fn element(self: *HandTranscript, e: root.Element) void {
+        self.add(&e.toBytes());
+    }
+
+    fn expect(self: *HandTranscript, got: Scalar) !void {
+        var wide = @as([48]u8, @splat(0));
+        wide[16..48].* = self.h.finalResult();
+        const want = Scalar.fromBytes48(wide, .big);
+        try testing.expectEqualSlices(u8, &want.toBytes(.big), &got.toBytes(.big));
+    }
+};
+
+test "Fiat-Shamir challenges: every public input is hashed length-prefixed, in this order (layout pinned; mutation audit 2026-11-17)" {
+    const pk = toyPaillierPk();
+    const aux = auxFromBytes(187, 4, 16);
+    const ctx = "layout-ctx";
+    var cts: [4]paillier.Ciphertext = undefined;
+    for (&cts, 0..) |*c, i| {
+        const m = paillier.Fe.fromPrimitive(u32, pk.n_sq, @intCast(10 + i)) catch unreachable;
+        const r = paillier.Fe.fromPrimitive(u32, pk.n_sq, @intCast(3 + i)) catch unreachable;
+        c.* = paillier.encrypt(pk, &m, &r) catch unreachable;
+    }
+    var fes: [5]root.AuxFe = undefined;
+    for (&fes, 0..) |*f, i| f.* = root.AuxFe.fromBytes(aux.n_tilde, &[_]u8{@intCast(20 + 7 * i)}, .big) catch unreachable;
+    const g = try root.Element.fromPoint(root.Secp256k1.basePoint);
+    const b_point = mulBase(g, scalarFromU64(5));
+    const u1_point = mulBase(g, scalarFromU64(6));
+    const point = mulBase(g, scalarFromU64(7));
+
+    var t = HandTranscript.init(range_proof_domain);
+    t.add(ctx);
+    t.auxParams(aux);
+    t.paillierKey(pk);
+    t.ciphertext(cts[0]);
+    t.auxFe(fes[0]);
+    t.ciphertext(cts[1]);
+    t.auxFe(fes[1]);
+    try t.expect(rangeProofChallenge(ctx, aux, pk, cts[0], fes[0], cts[1], fes[1]));
+
+    t = HandTranscript.init(mta_proof_domain);
+    t.add(ctx);
+    t.auxParams(aux);
+    t.paillierKey(pk);
+    t.ciphertext(cts[0]);
+    t.ciphertext(cts[1]);
+    t.auxFe(fes[0]);
+    t.auxFe(fes[1]);
+    t.auxFe(fes[2]);
+    t.ciphertext(cts[2]);
+    t.auxFe(fes[3]);
+    try t.expect(mtaProofChallenge(ctx, aux, pk, cts[0], cts[1], fes[0], fes[1], fes[2], cts[2], fes[3]));
+
+    t = HandTranscript.init(mta_proof_wc_domain);
+    t.add(ctx);
+    t.auxParams(aux);
+    t.paillierKey(pk);
+    t.ciphertext(cts[0]);
+    t.ciphertext(cts[1]);
+    t.auxFe(fes[0]);
+    t.auxFe(fes[1]);
+    t.auxFe(fes[2]);
+    t.ciphertext(cts[2]);
+    t.auxFe(fes[3]);
+    t.element(b_point);
+    t.element(u1_point);
+    try t.expect(mtaProofWcChallenge(ctx, aux, pk, cts[0], cts[1], fes[0], fes[1], fes[2], cts[2], fes[3], b_point, u1_point));
+
+    t = HandTranscript.init(pdl_proof_domain);
+    t.add(ctx);
+    t.auxParams(aux);
+    t.paillierKey(pk);
+    t.ciphertext(cts[0]);
+    t.auxFe(fes[0]);
+    t.ciphertext(cts[1]);
+    t.auxFe(fes[1]);
+    t.element(g);
+    t.element(point);
+    t.element(u1_point);
+    try t.expect(pdlProofChallenge(aux, pk, cts[0], fes[0], cts[1], fes[1], .{ .base = g, .point = point, .context = ctx }, u1_point));
+}
+
+test "verify-side key checks refuse proofs that are otherwise valid: non-standard Γ, sub-floor N (Alice), sub-floor Ñ (Alice and Bob) (mutation audit 2026-11-17)" {
+    if (builtin.mode == .debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const setup = try realAuxAndKey(0x4d55_5441_5445);
+    const pk = setup.kp.public;
+    const aux = setup.aux;
+    var prng = std.Random.DefaultPrng.init(0x4d55_5441_5446);
+    const random = prng.random();
+    const a = scalarFromU64(7);
+    var a_bytes = a.toBytes(.big);
+    const bp = bpWide(scalarFromU64(0xb14b));
+
+    // Control: the honest inner proof verifies.
+    const r_a = testPaillierRandomness(pk, random);
+    const c_a = paillier.encrypt(pk, &(scalarToTestFe(a, pk)), &r_a) catch unreachable;
+    const ok = try proveAliceRangeInner(allocator, &a_bytes, r_a, pk, aux, test_ctx, null, random);
+    defer ok.proof.deinit(allocator);
+    try testing.expect(verifyAliceRange(ok.proof, c_a, pk, aux, test_ctx));
+
+    // Γ = (N+1)²: every equation closes (the verifier's generic path), only the
+    // standard-generator check refuses; Alice's and Bob's proof alike.
+    var pk_g = pk;
+    pk_g.g = pk.n_sq.mul(pk.g, pk.g);
+    const r_g = testPaillierRandomness(pk_g, random);
+    const c_g = paillier.encrypt(pk_g, &(scalarToTestFe(a, pk_g)), &r_g) catch unreachable;
+    const p_g = try proveAliceRangeInner(allocator, &a_bytes, r_g, pk_g, aux, test_ctx, null, random);
+    defer p_g.proof.deinit(allocator);
+    try testing.expect(!verifyAliceRange(p_g.proof, c_g, pk_g, aux, test_ctx));
+    const r_b = testPaillierRandomness(pk_g, random);
+    const c_b = buildCb(pk_g, c_g, &a_bytes, &bp, r_b);
+    const b_g = try proveBobInner(allocator, &a_bytes, &bp, r_b, c_g, c_b, pk_g, aux, test_ctx, null, random);
+    defer b_g.proof.deinit(allocator);
+    try testing.expect(!verifyBobInner(b_g.proof, c_g, c_b, pk_g, aux, test_ctx, null, null));
+
+    // A 1024-bit Paillier N (below the q⁷ floor, above everything Alice's proof
+    // needs): only the floor refuses Alice's otherwise valid proof.
+    var small: paillier.KeyPair = undefined;
+    try paillier.generate(random, 1024, &small);
+    const spk = small.public;
+    const r_s = testPaillierRandomness(spk, random);
+    const c_s = paillier.encrypt(spk, &(scalarToTestFe(a, spk)), &r_s) catch unreachable;
+    const p_s = try proveAliceRangeInner(allocator, &a_bytes, r_s, spk, aux, test_ctx, null, random);
+    defer p_s.proof.deinit(allocator);
+    try testing.expect(!verifyAliceRange(p_s.proof, c_s, spk, aux, test_ctx));
+
+    // A ~1000-bit Ñ with square generators (below the floor): the proofs close
+    // over it, only the Ñ floor refuses them.
+    const small_composite = comptime comptimeIntBytes(128, ((1 << 500) + 9) * ((1 << 500) + 15));
+    const nt = root.AuxModulus.fromBytes(std.mem.trimStart(u8, &small_composite, &.{0}), .big) catch unreachable;
+    const small_aux: root.AuxParams = .{
+        .n_tilde = nt,
+        .h1 = root.AuxFe.fromBytes(nt, &[_]u8{4}, .big) catch unreachable,
+        .h2 = root.AuxFe.fromBytes(nt, &[_]u8{16}, .big) catch unreachable,
+    };
+    const p_n = try proveAliceRangeInner(allocator, &a_bytes, r_a, pk, small_aux, test_ctx, null, random);
+    defer p_n.proof.deinit(allocator);
+    try testing.expect(!verifyAliceRange(p_n.proof, c_a, pk, small_aux, test_ctx));
+    const r_b2 = testPaillierRandomness(pk, random);
+    const c_b2 = buildCb(pk, c_a, &a_bytes, &bp, r_b2);
+    const b_n = try proveBobInner(allocator, &a_bytes, &bp, r_b2, c_a, c_b2, pk, small_aux, test_ctx, null, random);
+    defer b_n.proof.deinit(allocator);
+    try testing.expect(!verifyBobInner(b_n.proof, c_a, c_b2, pk, small_aux, test_ctx, null, null));
+}
+
+test "intCompare, mulBytes, scalarFromWide and auxExponentTooLong: values and boundaries (mutation audit 2026-11-17)" {
+    // intCompare: leading zeros do not count, and a longer significant part is greater.
+    try testing.expectEqual(std.math.Order.eq, intCompare(&.{ 0, 0, 5 }, &.{5}));
+    try testing.expectEqual(std.math.Order.gt, intCompare(&.{ 1, 0 }, &.{5}));
+    try testing.expectEqual(std.math.Order.lt, intCompare(&.{5}, &.{ 1, 0 }));
+    try testing.expectEqual(std.math.Order.lt, intCompare(&.{ 0, 1, 2 }, &.{ 1, 3 }));
+    // mulBytes against 128-bit arithmetic, with carries across every byte.
+    var prng = std.Random.DefaultPrng.init(0x6d75_6c62);
+    for (0..40) |_| {
+        const x = prng.random().int(u64) | 0x8080_8080_8080_8080;
+        const y = prng.random().int(u64) | 0x0101_0101_0101_0101;
+        var xb: [8]u8 = undefined;
+        var yb: [8]u8 = undefined;
+        std.mem.writeInt(u64, &xb, x, .big);
+        std.mem.writeInt(u64, &yb, y, .big);
+        var out: [16]u8 = undefined;
+        mulBytes(&xb, &yb, &out);
+        try testing.expectEqual(@as(u128, x) * @as(u128, y), std.mem.readInt(u128, &out, .big));
+    }
+    // scalarFromWide: x·2^128 + y for a head of every residue mod 16.
+    const radix = scalarFromWide(&([_]u8{1} ++ @as([16]u8, @splat(0)))); // 2^128
+    for ([_]usize{ 1, 7, 8, 9, 15 }) |head| {
+        var bytes: [32]u8 = undefined;
+        for (&bytes, 0..) |*b, i| b.* = @intCast(0x11 + 3 * i);
+        const wide = bytes[0 .. head + 16];
+        const want = scalarFromWide(wide[0..head]).mul(radix).add(scalarFromWide(wide[head..]));
+        try testing.expect(scalarFromWide(wide).equivalent(want));
+    }
+    // auxExponentTooLong: exactly 96 + |Ñ| + 1 bytes is the largest honest s2.
+    const nt = root.AuxModulus.fromBytes(&[_]u8{187}, .big) catch unreachable;
+    const nt_len: usize = 1;
+    var buf: [96 + nt_len + 3]u8 = @splat(7);
+    try testing.expect(!auxExponentTooLong(buf[0 .. 96 + nt_len + 1], nt));
+    try testing.expect(auxExponentTooLong(buf[0 .. 96 + nt_len + 2], nt));
+}

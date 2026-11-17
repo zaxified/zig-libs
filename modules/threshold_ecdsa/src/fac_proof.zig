@@ -685,6 +685,13 @@ test "Πfac TEETH: N0 = 3·X — the equations accept, the range check refuses" 
     try testing.expect(verifyInner(n0, st.aux, ctx_a, proof, false));
     try testing.expect(!verify(n0, st.aux, ctx_a, proof));
     try testing.expect(bitLen(proof.z2.bytes()) > ell_bits + epsilon_bits + 1024 + 1);
+
+    // The same with the factors swapped: now z1 is the oversized one, and
+    // only the z1 half of the range check can refuse it (mutation audit 2026-11-17).
+    const swapped = try proveUnchecked(n0, &x, &[_]u8{3}, st.aux, ctx_a, random, true);
+    try testing.expect(verifyInner(n0, st.aux, ctx_a, swapped, false));
+    try testing.expect(!verify(n0, st.aux, ctx_a, swapped));
+    try testing.expect(bitLen(swapped.z1.bytes()) > ell_bits + epsilon_bits + 1024 + 1);
 }
 
 test "FacProof.fromBytes refuses an integer wider than an honest one" {
@@ -760,4 +767,36 @@ fn fuzzFacProof(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     defer gpa.free(twice);
     if (!std.mem.eql(u8, once, twice)) return error.EncodingNotFixedPoint;
     FacMark.mark(.fixed_point);
+}
+
+test "Πfac challenge: domain, context, N0, the verifier tuple, the five commitments and σ, each length-prefixed, in this order (layout pinned; mutation audit 2026-11-17)" {
+    var prng = std.Random.DefaultPrng.init(0x6661_6337);
+    const st = try realStatement(0, 1);
+    const proof = try prove(st.n0, &st.p, &st.q, st.aux, ctx_a, prng.random());
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(domain);
+    const part = struct {
+        fn add(hh: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
+            var len_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len_buf, @intCast(bytes.len), .big);
+            hh.update(&len_buf);
+            hh.update(bytes);
+        }
+    };
+    part.add(&h, ctx_a);
+    var buf: [mod_bytes]u8 = undefined;
+    try st.n0.toBytes(&buf, .big);
+    part.add(&h, &buf);
+    try st.aux.n_tilde.toBytes(&buf, .big);
+    part.add(&h, &buf);
+    for ([_]AuxFe{ st.aux.h1, st.aux.h2, proof.p_commit, proof.q_commit, proof.a, proof.b, proof.t }) |fe| {
+        try fe.toBytes(&buf, .big);
+        part.add(&h, &buf);
+    }
+    part.add(&h, proof.sigma.bytes());
+    var wide = @as([48]u8, @splat(0));
+    wide[16..48].* = h.finalResult();
+    const want = root.Scalar.fromBytes48(wide, .big);
+    const got = challenge(ctx_a, st.n0, st.aux, proof.p_commit, proof.q_commit, proof.a, proof.b, proof.t, proof.sigma.bytes());
+    try testing.expectEqualSlices(u8, &want.toBytes(.big), &got.toBytes(.big));
 }

@@ -852,3 +852,78 @@ test "findDuplicate: two parties announcing one message key" {
     try testing.expectEqual(@as(usize, 0), dup[0]);
     try testing.expectEqual(@as(usize, 1), dup[1]);
 }
+
+test "reusesMaterial: the message key, the Paillier N and the Ñ each fire alone (mutation audit 2026-11-17)" {
+    const f = try annFixture();
+    const old: root.PartyPublicKeys = .{
+        .index = 1,
+        .paillier_pk = f.anns[0].paillier_pk,
+        .aux = f.anns[0].aux,
+        .verifying_share = try root.Element.fromPoint(root.Secp256k1.basePoint),
+        .message_key = f.anns[0].message_key,
+    };
+    try testing.expect(!reusesMaterial(f.anns[1], old));
+    var same_key = f.anns[1];
+    same_key.message_key = old.message_key;
+    try testing.expect(reusesMaterial(same_key, old));
+    var same_n = f.anns[1];
+    same_n.paillier_pk = old.paillier_pk;
+    try testing.expect(reusesMaterial(same_n, old));
+    var same_nt = f.anns[1];
+    same_nt.aux = old.aux;
+    try testing.expect(reusesMaterial(same_nt, old));
+}
+
+test "AnnouncementSet: `me` must lie in 1..n, and verified() needs every announced and every factored flag (mutation audit 2026-11-17)" {
+    const allocator = testing.allocator;
+    const f = try annFixture();
+    try testing.expectError(error.InvalidParameters, AnnouncementSet.init(allocator, &f.anns, 0));
+    try testing.expectError(error.InvalidParameters, AnnouncementSet.init(allocator, &f.anns, 4));
+    var set = try AnnouncementSet.init(allocator, &f.anns, 1);
+    defer set.deinit(allocator);
+    set.distinct = true;
+    try testing.expect(set.verified() == null); // the peers are neither announced nor factored
+    @memset(set.announced, true);
+    @memset(set.factored, true);
+    try testing.expect(set.verified() != null);
+    set.announced[1] = false;
+    try testing.expect(set.verified() == null);
+    set.announced[1] = true;
+    set.factored[2] = false;
+    try testing.expect(set.verified() == null);
+}
+
+test "assembleKeyShare: an index or commitment count outside 1..n, and a local secret that is not the announced one, are refused one check at a time (mutation audit 2026-11-17)" {
+    const allocator = testing.allocator;
+    const f = try annFixture();
+    const g = try root.Element.fromPoint(root.Secp256k1.basePoint);
+    const secret = root.Scalar.one;
+    var share: root.KeyShare = undefined;
+    const one_commit = [_]root.Element{g};
+    const four_commits = [_]root.Element{ g, g, g, g };
+    const none = [_]root.Element{};
+    const bad_me = [_]u32{ 0, 4 };
+    for (bad_me) |me| {
+        const v: Verified = .{ .all = &f.anns, .me = me, .seal = &verified_token };
+        try testing.expectError(error.InvalidParameters, assembleKeyShare(allocator, v, &secret, &one_commit, &f.locals[0], &share));
+    }
+    const v1: Verified = .{ .all = &f.anns, .me = 1, .seal = &verified_token };
+    try testing.expectError(error.InvalidParameters, assembleKeyShare(allocator, v1, &secret, &none, &f.locals[0], &share));
+    try testing.expectError(error.InvalidParameters, assembleKeyShare(allocator, v1, &secret, &four_commits, &f.locals[0], &share));
+    // Own announcement vs own local material: each of the five comparisons alone.
+    var own = f.locals[0];
+    own.paillier = f.locals[1].paillier;
+    try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, v1, &secret, &one_commit, &own, &share));
+    own = f.locals[0];
+    own.aux.n_tilde = f.locals[1].aux.n_tilde;
+    try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, v1, &secret, &one_commit, &own, &share));
+    own = f.locals[0];
+    own.aux.h1 = f.locals[1].aux.h1;
+    try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, v1, &secret, &one_commit, &own, &share));
+    own = f.locals[0];
+    own.aux.h2 = f.locals[1].aux.h2;
+    try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, v1, &secret, &one_commit, &own, &share));
+    own = f.locals[0];
+    own.message_seed = f.locals[1].message_seed;
+    try testing.expectError(error.NotOwnAnnouncement, assembleKeyShare(allocator, v1, &secret, &one_commit, &own, &share));
+}

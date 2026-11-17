@@ -2135,6 +2135,18 @@ const Case = enum {
     /// The cheater's round-4 messages carry a signed body shorter than the
     /// attestation block that must head them.
     short_body,
+    /// Mutation audit 2026-11-17: a signed round-1 broadcast shorter than its
+    /// commitment, a round-1 broadcast and a round-2 p2p payload with one byte
+    /// too many.
+    r1_short,
+    r1_trailing,
+    r2_trailing,
+    r3_trailing,
+    r4_trailing,
+    r5_trailing,
+    r6_trailing,
+    /// The cheater announces the δ that makes Σδ_i = 0.
+    delta_zero,
     /// `sigma_shift`, then every signer abandons the opening (`abandon`).
     abandon_open,
     /// `sigma_shift`; the last signer shows signer 0 a second, signed version
@@ -2160,6 +2172,19 @@ const Case = enum {
     open7_late_round2,
     open5_late_mask,
 };
+
+/// The round whose cheater message gets one byte too many (0: none).
+fn trailingRound(case: Case) usize {
+    return switch (case) {
+        .r1_trailing => 1,
+        .r2_trailing => 2,
+        .r3_trailing => 3,
+        .r4_trailing => 4,
+        .r5_trailing => 5,
+        .r6_trailing => 6,
+        else => 0,
+    };
+}
 
 /// The signer position that lies in its opening in this case: the last one
 /// for the cases where the first-checked honest signer would otherwise be
@@ -2319,6 +2344,15 @@ fn runSession(allocator: std.mem.Allocator, shares: []const root.KeyShare, rando
                     me.delta = me.delta.add(Scalar.one);
                     m.bytes[at..][0..Ns].* = me.delta.toBytes(.big);
                 },
+                .delta_zero => if (r == 3) {
+                    var sum = Scalar.zero;
+                    for (0..t) |j| {
+                        if (j != cheat_pos) sum = sum.add(parties[j].peers[parties[j].me].delta);
+                    }
+                    const me = &parties[cheat_pos].peers[parties[cheat_pos].me];
+                    me.delta = sum.neg();
+                    m.bytes[at..][0..Ns].* = me.delta.toBytes(.big);
+                },
                 .pedersen_proof => if (r == 3) flipLast(m.bytes),
                 .gamma_swap => if (r == 4) {
                     m.bytes[at..][0..Ne].* = (Element.fromPoint(Secp256k1.basePoint) catch unreachable).toBytes();
@@ -2387,6 +2421,23 @@ fn runSession(allocator: std.mem.Allocator, shares: []const root.KeyShare, rando
                         @memcpy(short[0 .. header_length + 10], m.bytes[0 .. header_length + 10]);
                         resign(&parties[cheat_pos], short, false);
                         try inboxes[to].append(allocator, short);
+                        continue;
+                    }
+                    if (deliver and case == .r1_short and round == 1 and m.to == null) {
+                        const short = try allocator.alloc(u8, header_length + 10 + signature_length);
+                        try copies.append(allocator, short);
+                        @memcpy(short[0 .. header_length + 10], m.bytes[0 .. header_length + 10]);
+                        resign(&parties[cheat_pos], short, false);
+                        try inboxes[to].append(allocator, short);
+                        continue;
+                    }
+                    if (deliver and trailingRound(case) == round and (m.to != null) == (case == .r2_trailing)) {
+                        const long = try allocator.alloc(u8, m.bytes.len + 1);
+                        try copies.append(allocator, long);
+                        @memcpy(long[0 .. m.bytes.len - signature_length], m.bytes[0 .. m.bytes.len - signature_length]);
+                        long[m.bytes.len - signature_length] = 0;
+                        resign(&parties[cheat_pos], long, false);
+                        try inboxes[to].append(allocator, long);
                         continue;
                     }
                     if (deliver and case == .p2p_in_bc_round and round == 3 and m.to == null) {
@@ -2730,6 +2781,15 @@ const deviation_cases = [_]DeviationExpect{
     .{ .case = .p2p_in_bc_round, .fault = .unexpected_message, .attributed = true },
     // Signed, but too short to hold the attestation block (a signed lie).
     .{ .case = .short_body, .fault = .malformed_message, .attributed = true },
+    .{ .case = .r1_short, .fault = .malformed_message, .attributed = true },
+    .{ .case = .r1_trailing, .fault = .malformed_message, .attributed = true },
+    .{ .case = .r2_trailing, .fault = .malformed_message, .attributed = true },
+    .{ .case = .r3_trailing, .fault = .malformed_message, .attributed = true },
+    .{ .case = .r4_trailing, .fault = .malformed_message, .attributed = true },
+    .{ .case = .r5_trailing, .fault = .malformed_message, .attributed = true },
+    .{ .case = .r6_trailing, .fault = .malformed_message, .attributed = true },
+    // Σδ_i = 0: R = Γ·δ⁻¹ does not exist; nobody can be blamed.
+    .{ .case = .delta_zero, .fault = .degenerate, .attributed = false },
     // Different broadcasts to different signers: caught by the signed
     // attestations before anyone acts on the split view (review F1) —
     // and since the cheater signed both versions, it is named.
@@ -2797,7 +2857,12 @@ test "presign: every deviation aborts every honest signer, naming the cheater wh
 
 test "presign: every deviation aborts every honest signer, naming the cheater where GG20 §4.2 can (attestations, sums)" {
     if (builtin.mode == .debug) return error.SkipZigTest;
-    try expectDeviationsAbort(deviation_cases[16..]);
+    try expectDeviationsAbort(deviation_cases[16..24]);
+}
+
+test "presign: every deviation aborts every honest signer, naming the cheater where GG20 §4.2 can (trailing bytes, sums)" {
+    if (builtin.mode == .debug) return error.SkipZigTest;
+    try expectDeviationsAbort(deviation_cases[24..]);
 }
 
 test "presign: §4.3 opening — a signer lying in its opening is named by everyone who received the lie" {
@@ -3197,6 +3262,11 @@ test "presign: init refuses a bad signer set" {
     var t3 = share;
     t3.t = 3;
     try testing.expectError(error.InvalidParameters, Party.init(allocator, &t3, &[_]u32{ 1, 2 }, sid, &scratch));
+    // A one-signer session is refused even when the share claims t = 1 (the
+    // `signers.len < 2` guard stands on its own; mutation audit 2026-11-17).
+    var t1 = share;
+    t1.t = 1;
+    try testing.expectError(error.InvalidParameters, Party.init(allocator, &t1, &[_]u32{1}, sid, &scratch));
     // A public-keys list naming signer 2 twice.
     const dup = try std.mem.concat(allocator, root.PartyPublicKeys, &.{ share.public_keys.entries, share.public_keys.entries[1..2] });
     defer allocator.free(dup);
@@ -3211,6 +3281,13 @@ test "presign: init refuses a bad signer set" {
     var bad_x_share = share;
     bad_x_share.public_keys = .{ .entries = bad_x };
     try testing.expectError(error.InvalidParameters, Party.init(allocator, &bad_x_share, &[_]u32{ 1, 2 }, sid, &scratch));
+    // The share's own X_1 differs from the table's, or its message seed is not the announced one.
+    var bad_vs = share;
+    bad_vs.verifying_share = try Element.fromPoint(Secp256k1.basePoint);
+    try testing.expectError(error.InvalidParameters, Party.init(allocator, &bad_vs, &[_]u32{ 1, 2 }, sid, &scratch));
+    var bad_seed = share;
+    bad_seed.message_seed[0] ^= 1;
+    try testing.expectError(error.InvalidParameters, Party.init(allocator, &bad_seed, &[_]u32{ 1, 2 }, sid, &scratch));
     // Public material intact, but signer 1's secret share is not the x_1
     // behind X_1: only the own-share check can see it.
     var bad_secret = share;
@@ -3219,6 +3296,12 @@ test "presign: init refuses a bad signer set" {
     var p: Party = undefined;
     try Party.init(allocator, &share, &[_]u32{ 3, 1 }, sid, &p);
     defer p.deinit();
+    // `abandon` is for the opening states only: a party still in round 1 is untouched.
+    p.abandon();
+    try testing.expectEqual(State.round1, p.state);
+    try testing.expectError(error.InvalidState, p.openAbort(random));
+    try testing.expectError(error.InvalidState, p.echoOpenings(&.{}));
+    try testing.expectError(error.InvalidState, p.identify(&.{}));
     try testing.expectError(error.InvalidParameters, p.advance(&[_][]const u8{"x"}, random));
     var presig: Presignature = undefined;
     try testing.expectError(error.InvalidState, p.finish(&.{}, &presig));
@@ -3373,6 +3456,20 @@ test "presign: round 1 refuses a party whose own aux tuple or Paillier key fails
         const entries = try allocator.dupe(root.PartyPublicKeys, kg.key_shares[0].public_keys.entries);
         defer allocator.free(entries);
         entries[0].aux.h1 = entries[0].aux.n_tilde.one();
+        var share = kg.key_shares[0];
+        share.public_keys = .{ .entries = entries };
+        var p: Party = undefined;
+        try Party.init(allocator, &share, &[_]u32{ 1, 2 }, sid, &p);
+        defer p.deinit();
+        try testing.expectError(error.InvalidParameters, p.advance(&.{}, random));
+    }
+    // Own Paillier N is below the floor (a 512-bit key).
+    {
+        var small: paillier.KeyPair = undefined;
+        try paillier.generate(random, 512, &small);
+        const entries = try allocator.dupe(root.PartyPublicKeys, kg.key_shares[0].public_keys.entries);
+        defer allocator.free(entries);
+        entries[0].paillier_pk = small.public;
         var share = kg.key_shares[0];
         share.public_keys = .{ .entries = entries };
         var p: Party = undefined;

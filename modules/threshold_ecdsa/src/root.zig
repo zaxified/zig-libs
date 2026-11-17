@@ -3485,3 +3485,61 @@ test "KeyShare.fromBytesAlloc rejects a message seed that is not the one behind 
     var scratch_ks: KeyShare = undefined;
     try testing.expectError(error.InvalidEncoding, KeyShare.fromBytesAlloc(allocator, bad, &scratch_ks));
 }
+
+test "splitSecretKey: t = 0, t > n and a wrong coefficient count are each refused (mutation audit 2026-11-17)" {
+    const allocator = testing.allocator;
+    const c1 = [_]Scalar{testScalar(2)};
+    const c2 = [_]Scalar{ testScalar(2), testScalar(3) };
+    const none = [_]Scalar{};
+    const secret = testScalar(9);
+    try testing.expectError(error.InvalidParameters, splitSecretKey(allocator, &secret, 0, 3, &none));
+    try testing.expectError(error.InvalidParameters, splitSecretKey(allocator, &secret, 3, 2, &c2)); // t > n with the right count
+    try testing.expectError(error.InvalidParameters, splitSecretKey(allocator, &secret, 2, 3, &none));
+    try testing.expectError(error.InvalidParameters, splitSecretKey(allocator, &secret, 2, 3, &c2));
+    const ok = try splitSecretKey(allocator, &secret, 2, 3, &c1);
+    allocator.free(ok.shares);
+    allocator.free(ok.commitments.commitments);
+}
+
+test "keygenTrustedDealer: each of the three per-party slices must have exactly n entries (mutation audit 2026-11-17)" {
+    const allocator = testing.allocator;
+    var keys: [2]paillier.KeyPair = undefined;
+    const aux = [_]AuxParams{ toyAuxParams(), toyAuxParams() };
+    const secret = testScalar(41);
+    const coeffs = [_]Scalar{testScalar(42)};
+    const seeds = test_message_seeds[0..2];
+    try testing.expectError(error.InvalidParameters, keygenTrustedDealer(allocator, 2, 2, &secret, &coeffs, keys[0..1], &aux, seeds));
+    try testing.expectError(error.InvalidParameters, keygenTrustedDealer(allocator, 2, 2, &secret, &coeffs, &keys, aux[0..1], seeds));
+    try testing.expectError(error.InvalidParameters, keygenTrustedDealer(allocator, 2, 2, &secret, &coeffs, &keys, &aux, seeds[0..1]));
+}
+
+test "PublicKeys.fromBytesAlloc refuses a small-order message key (mutation audit 2026-11-17)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7062_6b65_7973);
+    const random = prng.random();
+    var kp1: paillier.KeyPair = undefined;
+    try paillier.generate(random, paillier.min_generate_bits, &kp1);
+    var kp2: paillier.KeyPair = undefined;
+    try paillier.generate(random, paillier.min_generate_bits, &kp2);
+    const paillier_keys = [_]paillier.KeyPair{ kp1, kp2 };
+    const aux = toyAuxParams();
+    const aux_params = [_]AuxParams{ aux, aux };
+    const secret = testScalar(41);
+    const coeffs = [_]Scalar{testScalar(42)};
+    const key_shares = try keygenTrustedDealer(allocator, 2, 2, &secret, &coeffs, &paillier_keys, &aux_params, test_message_seeds[0..2]);
+    defer allocator.free(key_shares);
+    defer allocator.free(key_shares[0].public_keys.entries);
+    const entries = try allocator.dupe(PartyPublicKeys, key_shares[0].public_keys.entries);
+    defer allocator.free(entries);
+
+    const good = try (PublicKeys{ .entries = entries }).toBytesAlloc(allocator);
+    defer allocator.free(good);
+    const back = try PublicKeys.fromBytesAlloc(allocator, good);
+    allocator.free(back.entries);
+
+    entries[1].message_key = @splat(0);
+    entries[1].message_key[0] = 1; // the identity point
+    const bad = try (PublicKeys{ .entries = entries }).toBytesAlloc(allocator);
+    defer allocator.free(bad);
+    try testing.expectError(error.InvalidEncoding, PublicKeys.fromBytesAlloc(allocator, bad));
+}

@@ -1607,6 +1607,27 @@ test "ModProof toBytesAlloc/fromBytesAlloc round-trip (hand-built dummy values, 
     }
 }
 
+test "ModProof fromBytesAlloc: each of the two flag bytes of an entry must be 0 or 1 (mutation audit 2026-11-17)" {
+    const allocator = testing.allocator;
+    const nt = toyModulus();
+    var entries: [pi_mod_iterations]ModEntry = undefined;
+    for (&entries, 0..) |*e, i| e.* = .{ .x = toyFe(nt, @intCast(2 + i % 90)), .z = toyFe(nt, @intCast(3 + i % 90)), .a = false, .b = true };
+    const proof: ModProof = .{ .w = toyFe(nt, 5), .entries = entries };
+    const bytes = try proof.toBytesAlloc(allocator);
+    defer allocator.free(bytes);
+    // w, then x, z of entry 0 (each length-prefixed, full width), then its flags.
+    const flags = 3 * (4 + root.aux_modulus_bytes);
+    _ = try ModProof.fromBytesAlloc(nt, bytes);
+    for ([_]usize{ flags, flags + 1 }) |at| {
+        const bad = try allocator.dupe(u8, bytes);
+        defer allocator.free(bad);
+        bad[at] = 2;
+        try testing.expectError(error.InvalidEncoding, ModProof.fromBytesAlloc(nt, bad));
+    }
+    // A truncation inside the two flag bytes is refused, not read past.
+    try testing.expectError(error.InvalidEncoding, ModProof.fromBytesAlloc(nt, bytes[0 .. flags + 1]));
+}
+
 test "PrmProof toBytesAlloc/fromBytesAlloc round-trip (hand-built dummy values, ungated)" {
     const allocator = testing.allocator;
     const nt = toyModulus();
@@ -2426,4 +2447,131 @@ test "mutation audit: verifyWellFormedBound runs the structural floor, honest bo
     try testing.expect(Pimod.verifyBound(aux, ctx, proof.mod));
     // …but the tuple is far below the q⁷ floor and must be refused as a whole.
     try testing.expectError(error.InvalidAuxParams, verifyWellFormedBound(aux, ctx, proof, random));
+}
+
+test "Πmod: a prime modulus is refused although a perfectly valid proof for it exists (mutation audit 2026-11-17)" {
+    // For a prime p ≡ 3 (mod 4) every quadratic residue has a fourth root and
+    // z = y satisfies z^p = y, so the equations close; only the primality
+    // test in `verifyCore` refuses.
+    const nt = try root.AuxModulus.fromBytes(&[_]u8{251}, .big);
+    const minus_one = nt.sub(nt.zero, nt.one());
+    var w = toyFe(nt, 2);
+    while (!(nt.powWithEncodedPublicExponent(w, &[_]u8{125}, .big) catch unreachable).eql(minus_one)) w = nt.add(w, nt.one());
+    const ctx = "prime-modulus";
+    const seed = deriveModSeed(.{ .paillier = .{ .n = nt, .context = ctx } }, w);
+    var entries: [pi_mod_iterations]ModEntry = undefined;
+    for (&entries, 0..) |*e, idx| {
+        const y = deriveModChallenge(nt, seed, @intCast(idx + 1));
+        const neg_y = nt.sub(nt.zero, y);
+        var found = false;
+        var cand: u8 = 1;
+        while (cand <= 125 and !found) : (cand += 1) {
+            const x = toyFe(nt, cand);
+            const x4 = nt.sq(nt.sq(x));
+            if (x4.eql(y)) {
+                e.* = .{ .x = x, .z = y, .a = false, .b = false };
+                found = true;
+            } else if (x4.eql(neg_y)) {
+                e.* = .{ .x = x, .z = y, .a = true, .b = false };
+                found = true;
+            }
+        }
+        try testing.expect(found);
+    }
+    const proof: ModProof = .{ .w = w, .entries = entries };
+    try testing.expect(!Pimod.verifyPaillier(nt, ctx, proof));
+}
+
+fn expectDigest(domain: []const u8, parts: []const []const u8, got: [32]u8) !void {
+    var h = Sha256.init(.{});
+    h.update(domain);
+    for (parts) |p| {
+        var len_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(p.len), .big);
+        h.update(&len_buf);
+        h.update(p);
+    }
+    try testing.expectEqualSlices(u8, &h.finalResult(), &got);
+}
+
+fn feFull(fe: root.AuxFe) ![root.aux_modulus_bytes]u8 {
+    var buf: [root.aux_modulus_bytes]u8 = undefined;
+    try fe.toBytes(&buf, .big);
+    return buf;
+}
+
+test "Πmod / Πprm seeds and the challenge expansion: layout pinned byte for byte (mutation audit 2026-11-17)" {
+    const nt = toyModulus();
+    const aux: root.AuxParams = .{ .n_tilde = nt, .h1 = toyFe(nt, 4), .h2 = toyFe(nt, 16) };
+    const w = toyFe(nt, 5);
+    var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
+    try nt.toBytes(&nt_buf, .big);
+    const h1 = try feFull(aux.h1);
+    const h2 = try feFull(aux.h2);
+    const wb = try feFull(w);
+    try expectDigest(pi_mod_domain, &.{ &nt_buf, &h1, &h2, &wb }, deriveModSeed(.{ .aux = aux }, w));
+    try expectDigest(pi_mod_bound_domain, &.{ "ctx", &nt_buf, &h1, &h2, &wb }, deriveModSeed(.{ .aux_bound = .{ .aux = aux, .context = "ctx" } }, w));
+    try expectDigest(pi_mod_paillier_domain, &.{ "ctx", &nt_buf, &wb }, deriveModSeed(.{ .paillier = .{ .n = nt, .context = "ctx" } }, w));
+
+    var commitments: [3]root.AuxFe = undefined;
+    var cbufs: [3][root.aux_modulus_bytes]u8 = undefined;
+    for (&commitments, &cbufs, 0..) |*c, *cb, i| {
+        c.* = toyFe(nt, @intCast(7 + i));
+        cb.* = try feFull(c.*);
+    }
+    try expectDigest(pi_prm_domain, &.{ &nt_buf, &h1, &h2, &cbufs[0], &cbufs[1], &cbufs[2] }, derivePrmSeed(aux, null, &commitments));
+    try expectDigest(pi_prm_bound_domain, &.{ "ctx", &nt_buf, &h1, &h2, &cbufs[0], &cbufs[1], &cbufs[2] }, derivePrmSeed(aux, "ctx", &commitments));
+
+    // expandChallenge: SHA-256(seed || index || sub || block), blocks 0, 1, ... — raw, no length prefixes.
+    const seed: [32]u8 = @splat(0x5a);
+    var out: [40]u8 = undefined;
+    expandChallenge(seed, 3, 5, &out);
+    for (0..2) |blk| {
+        var h = Sha256.init(.{});
+        h.update(&seed);
+        for ([_]u32{ 3, 5, @intCast(blk) }) |v| {
+            var b4: [4]u8 = undefined;
+            std.mem.writeInt(u32, &b4, v, .big);
+            h.update(&b4);
+        }
+        const d = h.finalResult();
+        const n = @min(32, out.len - blk * 32);
+        try testing.expectEqualSlices(u8, d[0..n], out[blk * 32 ..][0..n]);
+    }
+}
+
+test "derivePrmChallengeBits: bit i is bit 7 - i % 8 of byte i / 8 of the expansion (mutation audit 2026-11-17)" {
+    const seed: [32]u8 = @splat(0x3c);
+    var bits: [pi_prm_iterations]bool = undefined;
+    derivePrmChallengeBits(seed, &bits);
+    var bytes: [(pi_prm_iterations + 7) / 8]u8 = undefined;
+    expandChallenge(seed, 0, 0, &bytes);
+    for (bits, 0..) |b, i| try testing.expectEqual(((bytes[i / 8] >> @intCast(7 - i % 8)) & 1) == 1, b);
+}
+
+test "isProbablePrime: primes pass; Carmichael numbers and strong pseudoprimes fail (mutation audit 2026-11-17)" {
+    var prng = std.Random.DefaultPrng.init(0x6d72_6d72);
+    const random = prng.random();
+    const primes = [_][]const u8{
+        &.{251},
+        &.{ 0x01, 0x00, 0x01 },
+        &.{ 0x0f, 0x42, 0x43 },
+        &.{ 0x7f, 0xff, 0xff, 0xff },
+    };
+    const composites = [_][]const u8{
+        &.{ 0x02, 0x31 }, // 561, the smallest Carmichael number
+        &.{ 0x04, 0x51 }, // 1105
+        &.{ 0x06, 0xc1 }, // 1729
+        &.{ 0x07, 0xff }, // 2047, a strong pseudoprime to base 2
+        &.{ 0x01, 0x82, 0x71, 0xb1 }, // 25326001, strong pseudoprime to 2, 3, 5
+        &.{ 0xbf, 0xa1, 0x7d, 0xc7 }, // 3215031751, strong pseudoprime to 2, 3, 5, 7
+    };
+    for (primes) |p| {
+        const m = try root.AuxModulus.fromBytes(p, .big);
+        try testing.expect(isProbablePrime(m, random));
+    }
+    for (composites) |c| {
+        const m = try root.AuxModulus.fromBytes(c, .big);
+        try testing.expect(!isProbablePrime(m, random));
+    }
 }

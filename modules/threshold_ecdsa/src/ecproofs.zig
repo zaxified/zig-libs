@@ -760,3 +760,38 @@ test "DleqProof: each equation is load-bearing, and the challenge binds Σ" {
     const a = pointOf(Scalar.one);
     try testing.expect(!dleqChallenge("ctx", r_point, s_true, pointOf(sigma), a, a).equivalent(dleqChallenge("ctx", r_point, s_true, pointOf(other), a, a)));
 }
+
+/// The transcript layout, spelled out independently of `Challenge`: the
+/// domain, then every part as a big-endian u32 length and its bytes, hashed
+/// with SHA-256, the digest reduced into the scalar field.
+fn expectChallenge(domain: []const u8, parts: []const []const u8, got: Scalar) !void {
+    var h = Sha256.init(.{});
+    h.update(domain);
+    for (parts) |p| {
+        var len_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(p.len), .big);
+        h.update(&len_buf);
+        h.update(p);
+    }
+    var wide = @as([48]u8, @splat(0));
+    wide[16..48].* = h.finalResult();
+    const want = Scalar.fromBytes48(wide, .big);
+    try testing.expectEqualSlices(u8, &want.toBytes(.big), &got.toBytes(.big));
+}
+
+test "Fiat-Shamir challenges: domain, then context and every element length-prefixed, in this order (layout pinned; mutation audit 2026-11-17)" {
+    const ctx = "layout-ctx";
+    const h = pedersenH().toBytes();
+    const p = [_][Ne]u8{
+        pointOf(Scalar.one).toBytes(),
+        pointOf(Scalar.one.add(Scalar.one)).toBytes(),
+        pointOf(Scalar.one.add(Scalar.one).add(Scalar.one)).toBytes(),
+        pointOf(Scalar.one.add(Scalar.one).add(Scalar.one).add(Scalar.one)).toBytes(),
+        pointOf(Scalar.one.add(Scalar.one).add(Scalar.one).add(Scalar.one).add(Scalar.one)).toBytes(),
+    };
+    const e = [_]Element{ try Element.fromBytes(p[0]), try Element.fromBytes(p[1]), try Element.fromBytes(p[2]), try Element.fromBytes(p[3]), try Element.fromBytes(p[4]) };
+    try expectChallenge(pedersen_proof_domain, &.{ ctx, &h, &p[0], &p[1] }, pedersenChallenge(ctx, e[0], e[1]));
+    try expectChallenge(st_proof_domain, &.{ ctx, &h, &p[0], &p[1], &p[2], &p[3], &p[4] }, stChallenge(ctx, e[0], e[1], e[2], e[3], e[4]));
+    try expectChallenge(schnorr_proof_domain, &.{ ctx, &p[0], &p[1] }, schnorrChallenge(ctx, e[0], e[1]));
+    try expectChallenge(dleq_proof_domain, &.{ ctx, &p[0], &p[1], &p[2], &p[3], &p[4] }, dleqChallenge(ctx, e[0], e[1], e[2], e[3], e[4]));
+}
