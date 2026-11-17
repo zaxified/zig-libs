@@ -8,6 +8,8 @@
 
 **Audit:** review 2026-09-12 · mutation 2026-09-12 · src ?
 
+**Audit 2026-11-17 (delta mutation, Ed448; not on the card: no whole-module baseline).** 7 mutants of the Ed448 code in `keys.zig` (dispatch arm, key-length guard, point check at decode, signature-length guard, non-canonical-S error class, verify context, verify error class), one schemata build, baseline first: 7 killed, 0 survived, 0 equivalent. The dnssec card needs a whole-module mutation run before its `**Audit:**` line can carry counts.
+
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean (oracle-validate at 1/5 scale), DNSSEC_FUZZ) · ct n/a — public key verification (keyword review, 2026-10-07)
 
 **Performance:** not measured
