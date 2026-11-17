@@ -101,6 +101,7 @@ test {
     _ = policy;
     _ = @import("oracle_test.zig");
     _ = @import("rfc8080_test.zig");
+    _ = @import("audit_test.zig");
 }
 
 // ── RRSIG validity window (RFC 4034 §3.1.5) ────────────────────────────────
