@@ -6,7 +6,7 @@
 
 **Scope:** mvp — iproute2 `devlink` 7.2.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation 2026-10-05 (36/40, 2 eq) · src ?
+**Audit:** review 2026-09-02 · mutation 2026-11-17 (48/52, 2 eq) · src 22b7625d73a75f40
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DEVLINK_FUZZ) · ct n/a — netlink device info (keyword review, 2026-10-07)
 
@@ -382,6 +382,14 @@ Everything that needs a real instance prints `SKIPPED: …` and passes. **No liv
 test can fail for want of hardware.**
 
 ### 4.5 Mutation run
+
+**Delta run 2026-11-17** (schemata, ReleaseSafe, 12 mutants over `reload.zig`:
+the performed-actions decoder — the selector mask, the width check, `did`'s
+shift guard — the limit validation (both operands), each `NETNS_*` selector,
+the action value, and the limit bitfield's value and selector): 12 killed, 0
+survivors. The audit line is cumulative with the 2026-10-05 run below.
+`Devlink.reload` itself runs only on a real socket and is, like the other
+client methods, untested offline.
 
 **Mutation run 2026-10-05** (in-place, Debug, 40 mutants over the region
 snapshot bounds and chunk `Assembler`, handle validation and echo checks,

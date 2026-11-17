@@ -6,7 +6,7 @@
 
 **Scope:** mvp — iproute2 tc 6.19 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-17 (70/70) · src fd8da86adbef3dd6
+**Audit:** review 2026-09-15 · mutation 2026-11-17 (73/73) · src 74b6ce438c3cb534
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, TC_FUZZ) · ct n/a — traffic control netlink (keyword review, 2026-10-07)
 
@@ -582,6 +582,12 @@ reachable through `raw` today:
   admin-up first); htb dumps `HTB_VER` (0x30011) in `tc_htb_glob.version`, of which only
   the high half is the protocol version `tc` sends; and an **empty** shared action table
   answers a dump with `-ENOENT` rather than an empty `NLMSG_DONE`.
+
+**Audit 2026-11-17 (delta mutation, `ingress`/`clsact`).** 3 schemata mutants (the two kind
+strings swapped; `carriesOptions` flipped for both option-less kinds): 3/3 killed by the
+kind test and the two captured goldens; cumulative 73/73 with the statistics run below.
+The `appendOptions` arm for the new kinds is a no-op gated by `carriesOptions` (not
+observable). The earlier delta run follows.
 
 **Audit 2026-11-17 (delta mutation).** 70 schemata mutants over the statistics decoding added the same day
 (`parseStats2`, `parseLegacyStats`, `pickStats`, `parseFqCodelXstats` and the STATS2/STATS/XSTATS arms of

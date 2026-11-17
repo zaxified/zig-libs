@@ -6,7 +6,7 @@
 
 **Scope:** parity — Eclipse Mosquitto 2.1.2 broker + client libraries (paho, autopaho, rumqttc, mochi-mqtt): MQTT 3.1.1 and 5.0, QoS 0–2 both ways, sessions, extended AUTH, `$SYS`, bridging, persistence seam, ACL/password files, reconnect + in-flight resume, operator limits (surveyed 2026-09-30, re-surveyed 2026-10-16, gaps closed 2026-10-17)
 
-**Audit:** review 2026-10-01 · mutation 2026-10-01 (48/48) · src ?
+**Audit:** review 2026-10-01 · mutation 2026-11-17 (55/56, 1 eq) · src 59bdbd02dae1a2af
 
 **Hardening:** fuzz 2026-10-17 (200,000-run budget per harness clean, MQTT_FUZZ: decode ×4, acl-parse, broker-session) · fuzz 2026-10-19 (100,000 runs, new MQTT_FUZZ harness broker-multi: shared client ids, 3.1.1 + 5.0, persistent sessions, delayed Wills, failing subscriber transports) · ct 2026-10-17 (ctgrind: CONNECT password + auth data tainted, `encode` + `decode`, 0 in-file; `acl.Passwords.verify` password tainted, 0 in acl.zig) · panic 2026-10-29 (sweep of every pub entry point, wire + session, + blind review: clock overflows, per-packet compaction and fanout linear; a non-reading subscriber is cut after `TcpServer.write_timeout_ms` (10 s) instead of blocking publishers; `Config.max_subscription_nodes` 1 Mi)
 
@@ -456,6 +456,13 @@ the workers speak 5.0 (QoS 2, identifiers, a shared subscription, session expiry
 mutants over the new guards (one schemata build), 45 killed at first; the 3 survivors became tests
 (Topic Alias 0 on decode, an alias above the client's announced maximum, a PUBCOMP that must not
 free a QoS 1 / unreleased QoS 2 message); 48/48.
+
+**Delta mutation 2026-11-17** (Response Information; schemata over `broker.zig`'s tests, 8 mutants:
+the v5 gate, the request default, the fit check, the Maximum Packet Size drop and its `>` boundary,
+the length limit, the NUL check, the UTF-8 check): 7 killed (the boundary one after a test was
+added at the exact CONNACK size), 1 EQUIVALENT: dropping `v5 and` from `want_response_info` — a 3.1.1
+CONNECT is decoded without properties, so `request_response_information` is null and the gate stays
+false. The audit line is cumulative (48 + 8).
 
 **Persistent sessions** have 16 offline tests (resume with `session_present`, queue while away,
 socket death without DISCONNECT, clean-session discard, DUP resend with the original id, a failed
