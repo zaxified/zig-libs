@@ -242,6 +242,10 @@ test "keys: ECDSA and Ed25519 error classes and signature lengths" {
         @memcpy(wk[0..32], &c.x.toBytes(.big));
         @memcpy(wk[32..64], &c.y.toBytes(.big));
         const key = try keys.decodePublicKey(13, &wk);
+        var wk_longer: [65]u8 = undefined;
+        @memcpy(wk_longer[0..64], &wk);
+        wk_longer[64] = 0;
+        try testing.expectError(error.InvalidKeyEncoding, keys.decodePublicKey(13, &wk_longer));
         try keys.verifySignature(13, key, "msg", &sig);
         try testing.expectError(error.SignatureVerificationFailed, keys.verifySignature(13, key, "other", &sig));
         var longer: [65]u8 = undefined;
@@ -258,6 +262,10 @@ test "keys: ECDSA and Ed25519 error classes and signature lengths" {
         @memcpy(wk[0..48], &c.x.toBytes(.big));
         @memcpy(wk[48..96], &c.y.toBytes(.big));
         const key = try keys.decodePublicKey(14, &wk);
+        var wk_longer: [97]u8 = undefined;
+        @memcpy(wk_longer[0..96], &wk);
+        wk_longer[96] = 0;
+        try testing.expectError(error.InvalidKeyEncoding, keys.decodePublicKey(14, &wk_longer));
         try keys.verifySignature(14, key, "msg", &sig);
         try testing.expectError(error.SignatureVerificationFailed, keys.verifySignature(14, key, "other", &sig));
         var longer: [97]u8 = undefined;
@@ -731,6 +739,14 @@ test "nsec: the closest encloser is the longer of the two shared suffixes" {
     const r2 = nrec("b.example", "x.m.example", tbm(&b3, &.{2}));
     const w2 = nrec("*.m.example", "n.m.example", tbm(&b4, &.{1}));
     try testing.expectEqual(nsec.DenialResult.wildcard_answer, nsec.proveDenial("a.m.example", 1, .{ .records = &.{ r2, w2 } }));
+}
+
+test "nsec: a next name equal to the wildcard does not cover it (the wildcard exists)" {
+    var b1: [34]u8 = undefined;
+    var b2: [34]u8 = undefined;
+    const r1 = nrec("m.example", "z.example", tbm(&b1, &.{2}));
+    const r2 = nrec("example", "*.example", tbm(&b2, &.{ 2, 6 }));
+    try testing.expectEqual(nsec.DenialResult.bogus, nsec.proveDenial("nx.example", 1, .{ .records = &.{ r1, r2 } }));
 }
 
 test "nsec: a one-record chain (owner == next) covers every other name" {
