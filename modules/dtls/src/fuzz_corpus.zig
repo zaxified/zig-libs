@@ -197,7 +197,7 @@ pub fn collectHandshakeBodies(store: anytype, msg_type: u8, tail: ?u64) void {
 /// extensions<>` list including its own two-octet length, which is exactly
 /// what `messages.decodeExtensions` takes.
 pub fn collectExtensionBlocks(store: anytype, msg_type: u8, tail: ?u64) void {
-    var bodies: Store(8192, 32) = .{};
+    var bodies: Store(16384, 64) = .{};
     collectHandshakeBodies(&bodies, msg_type, null);
     for (bodies.frames[0..bodies.n]) |body| {
         const exts = extensionBlockOf(msg_type, body) orelse continue;
@@ -209,7 +209,7 @@ pub fn collectExtensionBlocks(store: anytype, msg_type: u8, tail: ?u64) void {
 /// `msg_type` body — a real `key_share`, `cookie`, `psk_key_exchange_modes`,
 /// `supported_groups` or `pre_shared_key` body, as a peer actually sent it.
 pub fn collectExtensionData(store: anytype, msg_type: u8, ext_type: u16, tail: ?u64) void {
-    var blocks: Store(8192, 32) = .{};
+    var blocks: Store(16384, 64) = .{};
     collectExtensionBlocks(&blocks, msg_type, null);
     for (blocks.frames[0..blocks.n]) |block| {
         const total: usize = std.mem.readInt(u16, block[0..2], .big);
@@ -272,7 +272,7 @@ test "every recorded datagram fits the buffer this file hands its callers" {
         largest = @max(largest, d.len);
     }
     try testing.expectEqual(@as(usize, 0), it.too_large);
-    try testing.expectEqual(@as(usize, 156), count);
+    try testing.expectEqual(@as(usize, 186), count);
     try testing.expect(largest > 1500); // a recording that lost its big flights
 }
 
@@ -281,15 +281,15 @@ test "the transcript still yields the frames the corpora are built from" {
     // more. What must never happen silently is FEWER — a corpus built from an
     // emptied transcript is an empty corpus, and every guard downstream would
     // still pass with `expectEqual(0, 0)`.
-    var ch: Store(8192, 32) = .{};
+    var ch: Store(16384, 64) = .{};
     collectHandshakeBodies(&ch, 1, null);
     try testing.expectEqual(@as(usize, 0), ch.dropped);
-    try testing.expectEqual(@as(usize, 15), ch.n);
+    try testing.expectEqual(@as(usize, 20), ch.n);
 
     var sh: Store(8192, 32) = .{};
     collectHandshakeBodies(&sh, 2, null);
     try testing.expectEqual(@as(usize, 0), sh.dropped);
-    try testing.expectEqual(@as(usize, 23), sh.n);
+    try testing.expectEqual(@as(usize, 29), sh.n);
 
     // The one that matters most: the hybrid key_share, which is bigger than
     // every fuzz buffer this module had before the corpora were written.

@@ -95,7 +95,7 @@ const transcript = @embedFile("testdata/wolfssl_transcript.txt");
 /// the anchor got smaller — which a replay over "whatever is in the file"
 /// would report as a pass. Raise it when cases are added; a drop needs a
 /// sentence in CHANGELOG.md saying which anchor was given up.
-const recorded_cases_floor = 18;
+const recorded_cases_floor = 22;
 
 // ── a tiny line format, parsed here ───────────────────────────────────────
 //
@@ -162,6 +162,9 @@ const Recorded = struct {
     now_sec: i64 = 0,
     offer_group: u16 = 0,
     client_cert: bool = false,
+    /// The recorded `suite=`: a SHA-384 suite also implies the SHA-384 PSK
+    /// hash (the PSK cases of the AES-256 recording use a 48-byte PSK).
+    sha384: bool = false,
 
     psk_buf: [64]u8 = @splat(0),
     psk_len: usize = 0,
@@ -200,10 +203,15 @@ const Recorded = struct {
         }
 
         // The suite is recorded so a transcript taken under a different one is
-        // visible in the file; only one is wired here, and a second would need
-        // a `Config.cipher_suites` mapping rather than a silent pass.
+        // visible in the file; two are wired here (AES-128-GCM-SHA256 and, for
+        // the PSK cases, AES-256-GCM-SHA384), and a third would need a
+        // `Config.cipher_suites` mapping rather than a silent pass.
         const suite = arg(line, "suite") orelse return error.MissingArgument;
-        if (!std.mem.eql(u8, suite, "aes_128_gcm_sha256")) return error.UnknownCipherSuite;
+        if (std.mem.eql(u8, suite, "aes_256_gcm_sha384")) {
+            // Certificate mode stays on the AES-128 suite in the recorder.
+            if (r.cert_mode) return error.UnknownCipherSuite;
+            r.sha384 = true;
+        } else if (!std.mem.eql(u8, suite, "aes_128_gcm_sha256")) return error.UnknownCipherSuite;
 
         if (!r.cert_mode) {
             r.identity_len = try copyHex(&r.identity_buf, arg(line, "psk_identity") orelse return error.MissingArgument);
@@ -231,6 +239,12 @@ const Recorded = struct {
     fn identity(self: *const Recorded) []const u8 {
         return self.identity_buf[0..self.identity_len];
     }
+    fn pskSuites(self: *const Recorded) []const conn_mod.CipherSuite {
+        return if (self.sha384) &.{.aes_256_gcm_sha384} else &.{.aes_128_gcm_sha256};
+    }
+    fn pskHash(self: *const Recorded) conn_mod.HashAlg {
+        return if (self.sha384) .sha384 else .sha256;
+    }
 
     /// The two fixture chains stay in `certauth_kat_vectors.zig` and are
     /// referenced by role, not copied into the transcript: the peer read the
@@ -251,14 +265,16 @@ const Recorded = struct {
                 .role = .client,
                 .psk_identity = self.identity(),
                 .psk = self.psk(),
-                .cipher_suites = &.{.aes_128_gcm_sha256},
+                .psk_hash = self.pskHash(),
+                .cipher_suites = self.pskSuites(),
                 .alpn_protocols = alpn,
             },
             .server => .{
                 .role = .server,
                 .psk_identity = self.identity(),
                 .psk = self.psk(),
-                .cipher_suites = &.{.aes_128_gcm_sha256},
+                .psk_hash = self.pskHash(),
+                .cipher_suites = self.pskSuites(),
                 .hello_retry = if (self.has_binding) .{
                     .cookie_secret = self.cookie_buf[0..self.cookie_len],
                     .peer_binding = self.binding_buf[0..self.binding_len],
@@ -321,6 +337,7 @@ const Replay = struct {
     retry_cases: usize = 0,
     key_updates: usize = 0,
     alpn_cases: usize = 0,
+    sha384_cases: usize = 0,
     /// Big enough for the whole of a hybrid ServerHello flight in one buffer.
     out: [4096]u8 = undefined,
     plain: [2048]u8 = undefined,
@@ -365,6 +382,7 @@ const Replay = struct {
             const flow = arg(line, "flow") orelse return error.MissingArgument;
             self.flows_seen.insert(std.meta.stringToEnum(Flow, flow) orelse return error.UnknownFlow);
             self.kx_seen.insert(if (self.rec.cert_mode) .cert_dhe else .psk);
+            if (self.rec.sha384) self.sha384_cases += 1;
         } else if (std.mem.eql(u8, op, "client_init")) {
             self.deinit();
             self.conn = try Connection.clientInit(self.rec.config(.client));
@@ -518,6 +536,9 @@ test "wolfSSL transcript: every recorded exchange replays byte-for-byte, with no
     // KeyUpdate started by each side, all of them against a live wolfSSL.
     try testing.expect(r.alpn_cases >= 2);
     try testing.expect(r.key_updates >= 2);
+    // The AES-256-GCM-SHA384 anchors (2026-11-17): our client with and without
+    // a HelloRetryRequest, our server stateful and stateless, SHA-384 PSK.
+    try testing.expect(r.sha384_cases >= 4);
 }
 
 test "wolfSSL transcript: the header names the release, the date and the command that took it" {

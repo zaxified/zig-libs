@@ -432,8 +432,8 @@ test "reconstructSequenceNumber: clamps at the 48-bit ceiling" {
 /// speaks. A hand-edited header would have been refused by the fixed-bit gate
 /// or the length check and the corpus would have measured the refusal path.
 const RecordCorpus = struct {
-    unified: fuzz_corpus.Store(8192, 128) = .{},
-    plaintext: fuzz_corpus.Store(8192, 128) = .{},
+    unified: fuzz_corpus.Store(16384, 256) = .{},
+    plaintext: fuzz_corpus.Store(16384, 256) = .{},
 
     /// `knobs`: the low octet is the negotiated CID length, bit 8 forces byte 0
     /// into the fixed pattern. A seed with no tail reads 0 for both, which is
@@ -557,10 +557,10 @@ test "corpus: every record seed reaches its decoder, and the counts are pinned" 
         if (d.hdr.length != null) with_length += 1;
     }
     try testing.expectEqual(unified.len, nonempty);
-    try testing.expectEqual(@as(usize, 113), decoded);
-    try testing.expectEqual(@as(usize, 529), consumed);
+    try testing.expectEqual(@as(usize, 131), decoded);
+    try testing.expectEqual(@as(usize, 611), consumed);
     try testing.expectEqual(@as(usize, 4), with_cid);
-    try testing.expectEqual(@as(usize, 111), with_length);
+    try testing.expectEqual(@as(usize, 129), with_length);
 
     var p_nonempty: usize = 0;
     var p_decoded: usize = 0;
@@ -577,9 +577,9 @@ test "corpus: every record seed reaches its decoder, and the counts are pinned" 
         declared += h.length;
     }
     try testing.expectEqual(corpus.plaintext.n, p_nonempty);
-    try testing.expectEqual(@as(usize, 23), p_decoded);
-    try testing.expectEqual(@as(usize, 23), handshake_records);
-    try testing.expectEqual(@as(usize, 10411), declared);
+    try testing.expectEqual(@as(usize, 28), p_decoded);
+    try testing.expectEqual(@as(usize, 28), handshake_records);
+    try testing.expectEqual(@as(usize, 12000), declared);
 
     // Nothing was dropped for capacity: a dropped frame is a corpus entry that
     // silently does not exist.
