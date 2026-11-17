@@ -2010,6 +2010,171 @@ fn keygenTrustedDealerByValue(
     return key_shares;
 }
 
+// ── BIP-32 non-hardened child derivation of shares ───────────────────────
+//
+// Shamir shares of `x` are evaluations `x_i = f(i)` of a polynomial with
+// `f(0) = x`. Adding a PUBLIC constant `δ` to every share is adding `δ` to
+// `f`'s constant term (the Lagrange coefficients of any signing set sum to 1),
+// so the joint key becomes `x + δ`, every verifying share `X_i + δ·G` and the
+// group key `X + δ·G`. BIP-32's public child derivation (`CKDpub`) is
+// exactly such a tweak: `δ = IL`, with `IL || IR = HMAC-SHA512(chain_code,
+// X || ser32(index))`, so the child key a plain BIP-32 wallet derives from
+// the group public key is the key the shares sign under after `deriveChild`.
+// No interaction is needed: every party computes the same `δ` from public
+// data. multi-party-sig (`DeriveChild`) and cggmp24 (`hd_wallet`) derive
+// shares the same way, and both refuse hardened indices (they need the
+// private key). Presignatures made under the parent key do not carry over:
+// they are bound to its shares.
+
+/// First hardened child index (BIP-32); `childTweak` refuses `>=` this.
+pub const hardened_index_min: u32 = 0x8000_0000;
+
+pub const DeriveChildError = error{
+    /// `index >= hardened_index_min`: hardened derivation needs the private key.
+    HardenedIndex,
+    /// BIP-32's "invalid child" case (`IL >= n`, or the child key or a child
+    /// share is the identity), probability about 2^-127. Same verdict as the
+    /// sibling `bip32` module's `ckdPub` (it does not try the next index).
+    InvalidChildKey,
+} || std.mem.Allocator.Error;
+
+/// The public tweak and chain code of one BIP-32 child step.
+pub const ChildTweak = struct {
+    /// `IL`: the constant added to every share and to the secret.
+    tweak: Scalar,
+    /// `IR`: the child's chain code (input of the next level).
+    chain_code: [32]u8,
+};
+
+/// BIP-32 `CKDpub`'s HMAC step on the group public key: the tweak and child
+/// chain code for non-hardened `index`. PUBLIC inputs and outputs.
+pub fn childTweak(parent_public_key: Element, chain_code: [32]u8, index: u32) DeriveChildError!ChildTweak {
+    if (index >= hardened_index_min) return error.HardenedIndex;
+    var data: [Ne + 4]u8 = undefined;
+    @memcpy(data[0..Ne], &parent_public_key.bytes);
+    std.mem.writeInt(u32, data[Ne..][0..4], index, .big);
+    var i: [64]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha512.create(&i, &data, &chain_code);
+    return childTweakFromIl(parent_public_key, i[0..32].*, i[32..64].*);
+}
+
+/// `childTweak` from `IL`/`IR` onward, split out so a test can hand in the
+/// ~2^-127 cases (`IL >= n`, a child key at infinity) that no real HMAC
+/// output reaches. Not `pub`.
+fn childTweakFromIl(parent_public_key: Element, il: [32]u8, ir: [32]u8) DeriveChildError!ChildTweak {
+    const tweak = Scalar.fromBytes(il, .big) catch return error.InvalidChildKey;
+    const tg = Secp256k1.basePoint.mul(tweak.toBytes(.big), .big) catch return error.InvalidChildKey;
+    _ = try shiftElement(parent_public_key, tg);
+    return .{ .tweak = tweak, .chain_code = ir };
+}
+
+fn shiftElement(e: Element, tweak_point: Secp256k1) DeriveChildError!Element {
+    const p = e.point() catch return error.InvalidChildKey;
+    return Element.fromPoint(p.add(tweak_point)) catch return error.InvalidChildKey;
+}
+
+/// This party's share of the child key: `x_i + tweak`, with the group key,
+/// this party's verifying share and every `PublicKeys` entry's verifying
+/// share moved by `tweak·G`; Paillier keys, aux parameters, message keys and
+/// `t`/`n`/`index` are unchanged. Every party of the group must apply the
+/// same `tweak` (from `childTweak` on the group public key). Allocates the
+/// child's own `public_keys.entries` (free it with `allocator`, once per
+/// derived share). The parent share is not modified; wipe it when retiring
+/// it. Constant time in the secret share.
+pub fn deriveChild(share: *const KeyShare, allocator: std.mem.Allocator, tweak: Scalar) DeriveChildError!KeyShare {
+    const result = deriveChildUnburned(share, allocator, tweak);
+    burn.stack(key_share_to_bytes_stack_burn);
+    return result;
+}
+
+noinline fn deriveChildUnburned(share: *const KeyShare, allocator: std.mem.Allocator, tweak: Scalar) DeriveChildError!KeyShare {
+    const tg = Secp256k1.basePoint.mul(tweak.toBytes(.big), .big) catch return error.InvalidChildKey;
+    const entries = try allocator.alloc(PartyPublicKeys, share.public_keys.entries.len);
+    errdefer allocator.free(entries);
+    for (share.public_keys.entries, entries) |src, *dst| {
+        dst.* = src;
+        dst.verifying_share = try shiftElement(src.verifying_share, tg);
+    }
+    var child = share.*;
+    child.secret_share = share.secret_share.add(tweak);
+    child.group_public_key = try shiftElement(share.group_public_key, tg);
+    child.verifying_share = try shiftElement(share.verifying_share, tg);
+    child.public_keys = .{ .entries = entries };
+    return child;
+}
+
+// BIP-32 test vectors 1 and 2 (the public keys and chain codes are the ones
+// in the BIP's serialized xpubs): every NON-hardened step of the two chains.
+const BipStep = struct { parent_pk: []const u8, parent_cc: []const u8, index: u32, child_pk: []const u8, child_cc: []const u8 };
+const bip32_steps = [_]BipStep{
+    // vector 1: m/0H -> m/0H/1
+    .{ .parent_pk = "035a784662a4a20a65bf6aab9ae98a6c068a81c52e4b032c0fb5400c706cfccc56", .parent_cc = "47fdacbd0f1097043b78c63c20c34ef4ed9a111d980047ad16282c7ae6236141", .index = 1, .child_pk = "03501e454bf00751f24b1b489aa925215d66af2234e3891c3b21a52bedb3cd711c", .child_cc = "2a7857631386ba23dacac34180dd1983734e444fdbf774041578e9b6adb37c19" },
+    // vector 1: m/0H/1/2H -> m/0H/1/2H/2
+    .{ .parent_pk = "0357bfe1e341d01c69fe5654309956cbea516822fba8a601743a012a7896ee8dc2", .parent_cc = "04466b9cc8e161e966409ca52986c584f07e9dc81f735db683c3ff6ec7b1503f", .index = 2, .child_pk = "02e8445082a72f29b75ca48748a914df60622a609cacfce8ed0e35804560741d29", .child_cc = "cfb71883f01676f587d023cc53a35bc7f88f724b1f8c2892ac1275ac822a3edd" },
+    // vector 1: m/0H/1/2H/2 -> m/0H/1/2H/2/1000000000
+    .{ .parent_pk = "02e8445082a72f29b75ca48748a914df60622a609cacfce8ed0e35804560741d29", .parent_cc = "cfb71883f01676f587d023cc53a35bc7f88f724b1f8c2892ac1275ac822a3edd", .index = 1000000000, .child_pk = "022a471424da5e657499d1ff51cb43c47481a03b1e77f951fe64cec9f5a48f7011", .child_cc = "c783e67b921d2beb8f6b389cc646d7263b4145701dadd2161548a8b078e65e9e" },
+    // vector 2: m -> m/0
+    .{ .parent_pk = "03cbcaa9c98c877a26977d00825c956a238e8dddfbd322cce4f74b0b5bd6ace4a7", .parent_cc = "60499f801b896d83179a4374aeb7822aaeaceaa0db1f85ee3e904c4defbd9689", .index = 0, .child_pk = "02fc9e5af0ac8d9b3cecfe2a888e2117ba3d089d8585886c9c826b6b22a98d12ea", .child_cc = "f0909affaa7ee7abe5dd4e100598d4dc53cd709d5a5c2cac40e7412f232f7c9c" },
+    // vector 2: m/0/2147483647H -> m/0/2147483647H/1
+    .{ .parent_pk = "03c01e7425647bdefa82b12d9bad5e3e6865bee0502694b94ca58b666abc0a5c3b", .parent_cc = "be17a268474a6bb9c61e1d720cf6215e2a88c5406c4aee7b38547f585c9a37d9", .index = 1, .child_pk = "03a7d1d856deb74c508e05031f9895dab54626251b3806e16b4bd12e781a7df5b9", .child_cc = "f366f48f1ea9f2d1d3fe958c95ca84ea18e4c4ddb9366c336c927eb246fb38cb" },
+    // vector 2: m/0/2147483647H/1/2147483646H -> m/0/2147483647H/1/2147483646H/2
+    .{ .parent_pk = "02d2b36900396c9282fa14628566582f206a5dd0bcc8d5e892611806cafb0301f0", .parent_cc = "637807030d55d01f9a0cb3a7839515d796bd07706386a6eddf06cc29a65a0e29", .index = 2, .child_pk = "024d902e1a2fc7a8755ab5b694c575fce742c48d9ff192e63df5193e4c7afe1f9c", .child_cc = "9452b549be8cea3ecb7a84bec10dcfd94afe4d129ebfd3b3cb58eedf394ed271" },
+};
+
+test "childTweak: BIP-32 CKDpub vectors 1 and 2, every non-hardened step (parent key + tweak*G = the BIP's child key, chain codes equal)" {
+    for (bip32_steps) |st| {
+        var ppk: [Ne]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&ppk, st.parent_pk);
+        var pcc: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&pcc, st.parent_cc);
+        var cpk: [Ne]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&cpk, st.child_pk);
+        var ccc: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&ccc, st.child_cc);
+
+        const parent = try Element.fromBytes(ppk);
+        const ct = try childTweak(parent, pcc, st.index);
+        try std.testing.expectEqualSlices(u8, &ccc, &ct.chain_code);
+        const tg = try Secp256k1.basePoint.mul(ct.tweak.toBytes(.big), .big);
+        const child = try shiftElement(parent, tg);
+        try std.testing.expectEqualSlices(u8, &cpk, &child.toBytes());
+    }
+}
+
+test "childTweak: a hardened index is refused (it needs the private key); the largest non-hardened index works" {
+    var ppk: [Ne]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&ppk, bip32_steps[0].parent_pk);
+    const parent = try Element.fromBytes(ppk);
+    const cc: [32]u8 = @splat(9);
+    try std.testing.expectError(error.HardenedIndex, childTweak(parent, cc, hardened_index_min));
+    try std.testing.expectError(error.HardenedIndex, childTweak(parent, cc, std.math.maxInt(u32)));
+    const last = try childTweak(parent, cc, hardened_index_min - 1);
+    const first = try childTweak(parent, cc, 0);
+    try std.testing.expect(!std.mem.eql(u8, &last.chain_code, &first.chain_code));
+}
+
+test "childTweakFromIl: IL >= n, IL = 0 and a child key at infinity are InvalidChildKey; IL = n-1 on a generic key works" {
+    const g = try Element.fromPoint(Secp256k1.basePoint);
+    const ir: [32]u8 = @splat(5);
+    var order: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&order, "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
+    // IL = n and IL = 2^256 - 1 are not canonical scalars
+    try std.testing.expectError(error.InvalidChildKey, childTweakFromIl(g, order, ir));
+    try std.testing.expectError(error.InvalidChildKey, childTweakFromIl(g, @splat(0xff), ir));
+    // IL = 0: the tweak point is the identity (BIP-32 allows it, the sibling bip32 module refuses it too)
+    try std.testing.expectError(error.InvalidChildKey, childTweakFromIl(g, @splat(0), ir));
+    // IL = n - 1 on the key G: G + (n-1)G is the identity
+    var n_minus_1 = order;
+    n_minus_1[31] -= 1;
+    try std.testing.expectError(error.InvalidChildKey, childTweakFromIl(g, n_minus_1, ir));
+    // IL = n - 2 is fine: G + (n-2)G = -G, and the chain code passes through
+    var n_minus_2 = order;
+    n_minus_2[31] -= 2;
+    const ok = try childTweakFromIl(g, n_minus_2, ir);
+    try std.testing.expectEqualSlices(u8, &ir, &ok.chain_code);
+    try std.testing.expectEqualSlices(u8, &n_minus_2, &ok.tweak.toBytes(.big));
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 //
 // Threshold-ECDSA has no official standard KAT vectors (unlike frost's

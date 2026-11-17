@@ -497,3 +497,93 @@ test "lagrangeCoefficient: Σ λ_i · x_i over a subset reconstructs the group s
     const actual_x = try kg.key_shares[0].group_public_key.point();
     try testing.expect(expected_x.equivalent(actual_x));
 }
+
+fn freeChildren(allocator: std.mem.Allocator, kids: []const root.KeyShare) void {
+    for (kids) |k| allocator.free(k.public_keys.entries);
+}
+
+/// Derive every party's child share for non-hardened `index` of the group key.
+fn deriveAll(allocator: std.mem.Allocator, parents: []const root.KeyShare, chain_code: [32]u8, index: u32, out: []root.KeyShare) !root.ChildTweak {
+    const ct = try root.childTweak(parents[0].group_public_key, chain_code, index);
+    var made: usize = 0;
+    errdefer freeChildren(allocator, out[0..made]);
+    for (parents, out) |p, *o| {
+        o.* = try root.deriveChild(&p, allocator, ct.tweak);
+        made += 1;
+    }
+    return ct;
+}
+
+test "BIP-32 child shares: signatures verify under the child key; Σ λ·x' = x + tweak; X' = parent + tweak*G; two levels deep" {
+    if (builtin.mode == .debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x62697033_32686420); // "bip32hd "
+    const random = prng.random();
+
+    const kg = try testKeygen(allocator, random, 2, 3);
+    defer kg.deinit(allocator);
+    var cc: [32]u8 = undefined;
+    random.bytes(&cc);
+
+    var kids: [3]root.KeyShare = undefined;
+    const ct = try deriveAll(allocator, kg.key_shares, cc, 7, &kids);
+    defer freeChildren(allocator, &kids);
+
+    // The key a plain BIP-32 wallet derives: parent X + IL*G (CKDpub), checked
+    // against the BIP vectors in root.zig's tests.
+    const tg = try Secp256k1.basePoint.mul(ct.tweak.toBytes(.big), .big);
+    const expect_pk = try Secp256k1.fromSec1(&kg.key_shares[0].group_public_key.toBytes());
+    const child_pt = expect_pk.add(tg);
+    for (kids, kg.key_shares) |k, p| {
+        try testing.expectEqualSlices(u8, &child_pt.toCompressedSec1(), &k.group_public_key.toBytes());
+        // every share still matches its public share, and the broadcast copy
+        const xg = try Secp256k1.basePoint.mul(k.secret_share.toBytes(.big), .big);
+        try testing.expectEqualSlices(u8, &xg.toCompressedSec1(), &k.verifying_share.toBytes());
+        try testing.expectEqualSlices(u8, &k.verifying_share.toBytes(), &k.public_keys.get(k.index).?.verifying_share.toBytes());
+        // the parent is untouched, everything else is carried over
+        try testing.expect(!std.mem.eql(u8, &k.secret_share.toBytes(.big), &p.secret_share.toBytes(.big)));
+        try testing.expectEqualSlices(u8, &k.secret_share.sub(ct.tweak).toBytes(.big), &p.secret_share.toBytes(.big));
+        try testing.expectEqual(p.index, k.index);
+        try testing.expectEqual(p.t, k.t);
+        try testing.expectEqual(p.n, k.n);
+        try testing.expectEqualSlices(u8, &p.message_seed, &k.message_seed);
+    }
+    // Σ λ_i x_i' = x + tweak, for two different signing subsets
+    for ([_][2]usize{ .{ 0, 1 }, .{ 2, 1 } }) |pair| {
+        const idx = [_]u32{ kids[pair[0]].index, kids[pair[1]].index };
+        var acc = Scalar.zero;
+        for (pair) |i| acc = acc.add(lagrangeCoefficient(&idx, kids[i].index).mul(kids[i].secret_share));
+        const g = try Secp256k1.basePoint.mul(acc.toBytes(.big), .big);
+        try testing.expectEqualSlices(u8, &child_pt.toCompressedSec1(), &g.toCompressedSec1());
+    }
+
+    const message = "child key of a BIP-32 derivation";
+    const pk = try ecdsa.PublicKey.fromSec1(&kids[0].group_public_key.toBytes());
+    for ([_][2]usize{ .{ 0, 1 }, .{ 0, 2 } }) |pair| {
+        const subset = [_]root.KeyShare{ kids[pair[0]], kids[pair[1]] };
+        const sig = try signWithShares(allocator, &subset, message, random);
+        try sig.verify(message, pk);
+        // and not under the parent key
+        const ppk = try ecdsa.PublicKey.fromSec1(&kg.key_shares[0].group_public_key.toBytes());
+        try testing.expectError(error.SignatureVerificationFailed, sig.verify(message, ppk));
+    }
+
+    // a zero tweak is refused, and so is one that makes this party's own
+    // share zero (its public share would be the identity); nothing leaks
+    try testing.expectError(error.InvalidChildKey, root.deriveChild(&kg.key_shares[0], allocator, Scalar.zero));
+    try testing.expectError(error.InvalidChildKey, root.deriveChild(&kg.key_shares[0], allocator, kg.key_shares[0].secret_share.neg()));
+    // another party's entry hitting the identity is refused too (after the loop's first entries)
+    try testing.expectError(error.InvalidChildKey, root.deriveChild(&kg.key_shares[0], allocator, kg.key_shares[2].secret_share.neg()));
+
+    // a party still on the parent share is refused (different group key)
+    const mixed = [_]root.KeyShare{ kids[0], kg.key_shares[1] };
+    try testing.expectError(error.InvalidParameters, signWithShares(allocator, &mixed, message, random));
+
+    // second level: child of the child, with the child's chain code
+    var grand: [3]root.KeyShare = undefined;
+    const ct2 = try deriveAll(allocator, &kids, ct.chain_code, 0, &grand);
+    defer freeChildren(allocator, &grand);
+    _ = ct2;
+    const sig2 = try signWithShares(allocator, grand[0..2], message, random);
+    try sig2.verify(message, try ecdsa.PublicKey.fromSec1(&grand[0].group_public_key.toBytes()));
+}

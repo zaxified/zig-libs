@@ -160,6 +160,15 @@ const pk = try signing.ecdsa.PublicKey.fromSec1(&key_shares[0].group_public_key.
 try sig2.verify("message to sign", pk); // std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256
 ```
 
+BIP-32 child keys (non-hardened, no interaction): every party computes the same
+public tweak from the group key and a chain code, then shifts its own share:
+
+```zig
+const ct = try tecdsa.childTweak(key_share.group_public_key, chain_code, 7); // index < 2^31
+const child = try tecdsa.deriveChild(&key_share, allocator, ct.tweak); // free child.public_keys.entries
+// the child group key is what a plain BIP-32 wallet derives (CKDpub); ct.chain_code is its chain code
+```
+
 See `src/root.zig` for the full keygen/MtA API — `splitSecretKey`/
 `groupPublicKey`/`derivePublicKeyShare` are also exposed standalone (the
 same Shamir+Feldman primitives `keygenTrustedDealer` composes), and
@@ -170,6 +179,6 @@ the in-process driver (`signWithShares`, `lagrangeCoefficient`) and
 
 ## Backlog
 
-See `SPEC.md` "Backlog / deferred": redistribution to a different committee,
-BIP-32 / HD derivation of shares, and an independent cryptographic review
+See `SPEC.md` "Backlog / deferred": redistribution to a different committee
+and an independent cryptographic review
 (`SPEC.md` "Auditor brief", A1–A9).
