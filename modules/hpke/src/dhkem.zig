@@ -81,6 +81,11 @@ pub const EncapError = error{
     DeserializeError,
 };
 
+/// What `keyPairFromSecret` can fail with: a private key outside the
+/// curve's scalar range `[1, n-1]` (RFC 9180 §7.1.2 `DeserializePrivateKey`
+/// validation). X25519 never fails.
+pub const KeyPairFromSecretError = error{DeserializeError};
+
 /// Mirrors `EncapError` for the receiver side (`Decap`/`AuthDecap`), plus
 /// a malformed `enc`/public-key deserialization failure.
 pub const DecapError = error{
@@ -192,6 +197,24 @@ pub const X25519Kem = struct {
         // ct25519's comb (std's ladder was 2.9× AWS-LC's keygen); the KeyPair
         // type stays std's, so the public API is unchanged.
         out.* = .{ .public_key = ct25519.X25519.recoverPublicKey(sk) catch unreachable, .secret_key = sk };
+    }
+
+    /// A key pair from its serialized private key `sk` — RFC 9180 §7.1.2's
+    /// `DeserializePrivateKey(skXm)` plus the public half, for a caller that
+    /// holds a private key from elsewhere (a protocol state, a test vector)
+    /// rather than an `ikm` to derive one from. `out.secret_key` is `sk`
+    /// verbatim. Every 32-byte string is a valid X25519
+    /// private key (RFC 7748 §5 clamps it at use, and `secret_key` is stored
+    /// unclamped exactly as `deriveKeyPair` stores it), so this never fails;
+    /// the error union is the one every KEM's `keyPairFromSecret` shares.
+    pub fn keyPairFromSecret(out: *KeyPair, sk: *const [Nsk]u8) KeyPairFromSecretError!void {
+        return burn.run(burn.kem_burn, KeyPairFromSecretError!void, keyPairFromSecretBody, .{ out, sk });
+    }
+
+    fn keyPairFromSecretBody(out: *KeyPair, sk: *const [Nsk]u8) KeyPairFromSecretError!void {
+        // A clamped scalar times the base point is never the identity (see
+        // `deriveKeyPairBody`).
+        out.* = .{ .public_key = ct25519.X25519.recoverPublicKey(sk.*) catch unreachable, .secret_key = sk.* };
     }
 
     /// RFC 9180 §4.1 `Encap(pkR)`, real-randomness entry point: draw a
@@ -411,6 +434,25 @@ pub const P256Kem = struct {
         @panic("hpke: P-256 DeriveKeyPair exhausted 256 candidates (probability ~2^-8192; RFC 9180 7.1.3 DeriveKeyPairError)");
     }
 
+    /// A key pair from its serialized private key `sk` — RFC 9180 §7.1.2's
+    /// `DeserializePrivateKey(skXm)` plus the public half, for a caller that
+    /// holds a private key from elsewhere (a protocol state, a test vector)
+    /// rather than an `ikm` to derive one from. `out.secret_key` is `sk`
+    /// verbatim. Refuses a scalar outside [1, n-1] with `error.DeserializeError`,
+    /// the error this KEM already returns for a key that does not
+    /// deserialize.
+    pub fn keyPairFromSecret(out: *KeyPair, sk: *const [Nsk]u8) KeyPairFromSecretError!void {
+        return burn.run(burn.kem_burn, KeyPairFromSecretError!void, keyPairFromSecretBody, .{ out, sk });
+    }
+
+    fn keyPairFromSecretBody(out: *KeyPair, sk: *const [Nsk]u8) KeyPairFromSecretError!void {
+        P256.scalar.rejectNonCanonical(sk.*, .big) catch return error.DeserializeError; // sk >= n
+        if (std.mem.allEqual(u8, sk, 0)) return error.DeserializeError; // sk == 0
+        // basePoint * nonzero canonical scalar never hits the identity.
+        const pk_point = P256.basePoint.mul(sk.*, .big) catch unreachable;
+        out.* = .{ .secret_key = sk.*, .public_key = pk_point.toUncompressedSec1() };
+    }
+
     /// RFC 9180 §4.1/§7.1.2 `Encap(pkR)` for P-256 — same shape as
     /// `X25519Kem.encapDeterministic`, but the DH is a scalar-point
     /// multiply whose output is the shared point's X COORDINATE (RFC 9180
@@ -607,6 +649,29 @@ pub const P384Kem = struct {
         @panic("hpke: P-384 DeriveKeyPair exhausted 256 candidates (probability ~2^-8192; RFC 9180 7.1.3 DeriveKeyPairError)");
     }
 
+    /// A key pair from its serialized private key `sk` — RFC 9180 §7.1.2's
+    /// `DeserializePrivateKey(skXm)` plus the public half, for a caller that
+    /// holds a private key from elsewhere (a protocol state, a test vector)
+    /// rather than an `ikm` to derive one from. `out.secret_key` is `sk`
+    /// verbatim. Refuses a scalar outside [1, n-1] with `error.DeserializeError`,
+    /// the error this KEM already returns for a key that does not
+    /// deserialize.
+    pub fn keyPairFromSecret(out: *KeyPair, sk: *const [Nsk]u8) KeyPairFromSecretError!void {
+        return burn.run(burn.kem_burn, KeyPairFromSecretError!void, keyPairFromSecretBody, .{ out, sk });
+    }
+
+    fn keyPairFromSecretBody(out: *KeyPair, sk: *const [Nsk]u8) KeyPairFromSecretError!void {
+        P384.scalar.rejectNonCanonical(sk.*, .big) catch return error.DeserializeError; // sk >= n
+        if (std.mem.allEqual(u8, sk, 0)) return error.DeserializeError; // sk == 0
+        // Range-checked and non-zero: the fixed-base comb needs no identity
+        // check (same reasoning as `deriveKeyPairBody`).
+        var le = sk.*;
+        std.mem.reverse(u8, &le);
+        const pk_point = P384.mulBaseCtUnburned(&le);
+        std.crypto.secureZero(u8, &le);
+        out.* = .{ .secret_key = sk.*, .public_key = pk_point.toUncompressedSec1() };
+    }
+
     /// RFC 9180 §4.1/§7.1.2 `Encap(pkR)` for P-384 — same shape as
     /// `P256Kem.encapDeterministic`: x-coordinate-only ECDH, `Nsecret=48`
     /// via `HkdfSha384`.
@@ -766,6 +831,29 @@ pub const P521Kem = struct {
             return;
         }
         @panic("hpke: P-521 DeriveKeyPair exhausted 256 candidates (probability ~2^-66000; RFC 9180 7.1.3 DeriveKeyPairError)");
+    }
+
+    /// A key pair from its serialized private key `sk` — RFC 9180 §7.1.2's
+    /// `DeserializePrivateKey(skXm)` plus the public half, for a caller that
+    /// holds a private key from elsewhere (a protocol state, a test vector)
+    /// rather than an `ikm` to derive one from. `out.secret_key` is `sk`
+    /// verbatim. Refuses a scalar outside [1, n-1] with `error.DeserializeError`,
+    /// the error this KEM already returns for a key that does not
+    /// deserialize.
+    pub fn keyPairFromSecret(out: *KeyPair, sk: *const [Nsk]u8) KeyPairFromSecretError!void {
+        return burn.run(burn.kem_burn, KeyPairFromSecretError!void, keyPairFromSecretBody, .{ out, sk });
+    }
+
+    fn keyPairFromSecretBody(out: *KeyPair, sk: *const [Nsk]u8) KeyPairFromSecretError!void {
+        p521.scalar.rejectNonCanonical(sk.*, .big) catch return error.DeserializeError; // sk >= n
+        if (std.mem.allEqual(u8, sk, 0)) return error.DeserializeError; // sk == 0
+        // Range-checked and non-zero: the fixed-base comb needs no identity
+        // check (same reasoning as `deriveKeyPairBody`).
+        var le = sk.*;
+        std.mem.reverse(u8, &le);
+        const pk_point = p521.P521.mulBaseCtUnburned(&le);
+        std.crypto.secureZero(u8, &le);
+        out.* = .{ .secret_key = sk.*, .public_key = pk_point.toUncompressedSec1() };
     }
 
     /// One DH: x(sk · pk) through `p521.ecdhInto`. A peer that does not

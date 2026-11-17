@@ -185,6 +185,7 @@ test {
     _ = @import("kat_rfc9180.zig");
     _ = @import("kat_rfc9180_a6.zig");
     _ = @import("kat_rfc9180_a6_test.zig");
+    _ = @import("keypair_from_secret_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");

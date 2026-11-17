@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — New `keyPairFromSecret(out: *KeyPair, sk: *const [Nsk]u8) KeyPairFromSecretError!void` on all four DHKEMs (X25519, P-256, P-384, P-521): RFC 9180 §7.1.2 `DeserializePrivateKey` plus the public key, under `kem_burn`. The NIST curves refuse `sk` outside `[1, n-1]` with `error.DeserializeError`; X25519 accepts any 32 bytes (RFC 7748 clamping). Anchored on every RFC 9180 Appendix A private key, the Go vectors' `skRm` (including P-384) and `deriveKeyPair`'s own output (`src/keypair_from_secret_test.zig`). Additive; nothing else changes.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-01** — **Performance:** the ML-KEM KEMs, X-Wing and the MLKEM768-P256 / MLKEM1024-P384 hybrids run on the `mlkem` module (new dep) instead of `std.crypto.kem.ml_kem`; outputs byte-identical (Go `crypto/hpke` vectors and the live oracle unchanged), public API and error sets unchanged.
 - **2026-11-01** — **Performance:** DHKEM(X25519) and X-Wing's X25519 run on the `ct25519` module (new dep) instead of std's ladder: X25519 keygen 2.93× → 1.34× AWS-LC, setupS 2.15× → 1.29×, setupR 1.76× → 1.27×. Same bytes (RFC 9180 A.1, Go oracle); `X25519Kem.KeyPair` is still `std.crypto.dh.X25519.KeyPair`. `bench-hpke -- --vs=awslc` measures AWS-LC's `EVP_HPKE`.

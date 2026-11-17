@@ -783,6 +783,15 @@ card: **Performance:** ref 0.20–1.00× Go crypto/hpke (Go <version>) · fastes
   of a prime-order group, the eager vs lazy expansion giving the same bytes, a zero-length
   expand, X25519 dh2; 5 by probability ≤ 2^-32 or a 64 GiB input). No bug leads.
 
+**`keyPairFromSecret` delta mutation (2026-11-17).** 13 mutants over the four
+new bodies, one per guard and class: the X25519 public key and stored secret;
+for each NIST curve, the range check dropped, the zero check dropped and the
+stored secret replaced; for P-384/P-521, the little-endian reversal skipped.
+Result 13/13 killed, 0 equivalent. The two P-256 guard drops are killed by a
+panic (the base-point multiply of `0` or `n` returns the identity), which is
+the reason the guards exist. This is a delta: the card's whole-module counts
+are not changed by it.
+
 ## Performance work (2026-10-31)
 
 - `Context` keeps the AEAD with its key expanded (`aesgcm.Context`, set on the first
@@ -847,6 +856,27 @@ card: **Performance:** ref 0.20–1.00× Go crypto/hpke (Go <version>) · fastes
    `ChaCha20Poly1305` mode vectors of A.2/A.5, which differ from the
    embedded A.1/A.3/A.4 mode vectors only in the `aead_id`/`kdf_id` bytes
    of `suite_id` — already covered by their respective base headers.
+
+## Key pair from a private key (2026-11-17)
+
+`X25519Kem`/`P256Kem`/`P384Kem`/`P521Kem.keyPairFromSecret(out, sk)` rebuild a
+`KeyPair` from a serialized private key, which is RFC 9180 §7.1.2's
+`DeserializePrivateKey` plus the public half. Before, only X25519 had a way to
+do it (its `KeyPair` is std's, with `generateDeterministic`). The NIST KEMs
+offered only `deriveKeyPair(ikm)` and `generateKeyPair`, so a protocol that
+holds its private keys (MLS: a member's init and leaf keys, the interop
+vectors' `init_priv`/`encryption_priv`) could not use them. `sk` goes in by
+pointer, the pair comes out in `out`, and the body runs under `kem_burn`. The
+NIST curves refuse a scalar outside `[1, n-1]` with `error.DeserializeError`,
+which is the error the KEMs already use for a key that does not deserialize.
+X25519 accepts every 32-byte string, because RFC 7748 clamps it at use; it
+stores `sk` unclamped, exactly as `deriveKeyPair` does. Anchors are in
+`keypair_from_secret_test.zig`. Every RFC 9180 Appendix A `skEm`/`skRm`/`skSm`
+(34 keys) and every Go vector's `skRm`/`pkRm` (P-384's only external anchor)
+rebuilds its public key. `deriveKeyPair`'s output round-trips for all four
+KEMs. For each NIST curve, `0`, `n`, `n+1` and all-ones are refused, and `1`
+and `n-1` are accepted. Delta mutation 2026-11-17 over the four bodies: see the
+`keyPairFromSecret` paragraph of the Audit section below.
 
 ## Backlog / deferred
 

@@ -992,21 +992,21 @@ coconut	ReleaseFast	user_issue	1	21	06c770f681312a71	af24664cb307a403
 # reached from Entropy.scalar, 5 -> 4 distinct chains. No new site.
 coconut	ReleaseFast	user_show	1	26	580bc6f94c4a7f19	286e5ea12d924b29
 # hpke x25519 (2026-11-01): X25519 moved from std to ct25519 -- std's curve25519.zig isZero context is gone (ct25519's identity check is constant time): x25519 1->0 / 2->0 in-file, xwing 2->1.
-hpke	ReleaseFast	x25519_decap	1	0	9ad55e0228090c9c	c0cee0a8c6bf72c3
-hpke	ReleaseFast	x25519_authdecap	1	0	9ad55e0228090c9c	05af25d1d0e3943d
-hpke	ReleaseFast	p256_decap	1	1	9ad55e0228090c9c	851ee3406999dacc
-hpke	ReleaseFast	p256_authdecap	1	2	9ad55e0228090c9c	4b0f0c964acb8411
+hpke	ReleaseFast	x25519_decap	1	0	89f1e58d39506052	c0cee0a8c6bf72c3
+hpke	ReleaseFast	x25519_authdecap	1	0	89f1e58d39506052	05af25d1d0e3943d
+hpke	ReleaseFast	p256_decap	1	1	89f1e58d39506052	851ee3406999dacc
+hpke	ReleaseFast	p256_authdecap	1	2	89f1e58d39506052	4b0f0c964acb8411
 # p384_decap / p384_authdecap 2 -> 0 and 4 -> 0 (2026-10-31): DHKEM(P-384) moved to the `p384`
 # module (ecdhInto), which declassifies its range/identity verdicts like `p521`; only the
 # propagation witness (2 contexts) remains.
-hpke	ReleaseFast	p384_decap	1	0	9ad55e0228090c9c	6b70bba9cc229a39
-hpke	ReleaseFast	p384_authdecap	1	0	9ad55e0228090c9c	2741ac2ff5069767
-hpke	ReleaseFast	open	1	1	2eb3235458f3fcb2	59883c70dcd08ee6
+hpke	ReleaseFast	p384_decap	1	0	89f1e58d39506052	6b70bba9cc229a39
+hpke	ReleaseFast	p384_authdecap	1	0	89f1e58d39506052	2741ac2ff5069767
+hpke	ReleaseFast	open	1	1	e7a48b31b5ed7455	59883c70dcd08ee6
 # hpke p521 (2026-10-10): DHKEM(P-521, HKDF-SHA512) decap / authDecap, skR tainted,
 # group through the `p521` module's ecdhInto: 0 in-file (p521's range/identity verdicts
 # are declassified there, see modules/p521/SPEC.md).
-hpke	ReleaseFast	p521_decap	1	0	b4e797fe0ba4369a	f9c48b1e130f8af6
-hpke	ReleaseFast	p521_authdecap	1	0	b4e797fe0ba4369a	f00506c9b354a23b
+hpke	ReleaseFast	p521_decap	1	0	056add82a2ae09fa	f9c48b1e130f8af6
+hpke	ReleaseFast	p521_authdecap	1	0	056add82a2ae09fa	f00506c9b354a23b
 # hpke pq KEMs and the one-stage schedule (2026-10-31). Tainted: the serialized seed, std
 # ML-KEM's expanded private state (`sk.sk`, `sk.z`) and, for the hybrids, the curve scalar.
 # In-file contexts are all std's or a sibling module's, none in pq.zig/kdf.zig/schedule.zig:
