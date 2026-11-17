@@ -1628,6 +1628,7 @@ test {
     _ = @import("w3c_vectors.zig");
     _ = @import("w3c_conformance_test.zig");
     _ = @import("otel_oracle_test.zig");
+    _ = @import("otel_baggage_oracle_test.zig");
 }
 
 // ── fuzz: TraceParent.parse never panics on arbitrary or shaped bytes ──────
