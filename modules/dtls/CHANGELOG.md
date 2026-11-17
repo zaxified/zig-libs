@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** `prf12.masterSecret` carries the `secret-api-ok` note its sibling `prf` has (it writes into the caller's `out`; its only engine caller runs inside the entry points' burns) — `check-secret-api --ratchet` flagged it once dtls was touched. `ctgrind --check dtls` re-measured: hs 174, app 13, ku 21, hs12 96, app12 3, all unchanged; hs12/app12 source digests re-pinned (comment-only change).
+
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE (live-peer coverage):** `tools/interop.zig` and `tools/wolfssl_peer.c` gain four wolfSSL 5.9.1 cases: ALPN as client and as server, a KeyUpdate sent by our side (wolfSSL ACKs and answers) and one sent by wolfSSL (`wolfSSL_update_keys`; our `recv` reports `ReceivedKeyUpdate`, `poll` answers). The committed transcript was re-captured whole (18 cases, new ops `request_key_update` / `poll` / `poll_idle` / `expect_epochs`, `config alpn=`, `expect alpn=`), `src/wolfssl_replay.zig` replays them, and the counts the corpora derive from the transcript are re-pinned (`record.zig`, `messages.zig`, `fuzz_corpus.zig`). No production code touched; no wire defect found. `ctgrind --check dtls`: every count unchanged (hs 174, app 13, ku 21, hs12 96, app12 3), source digests re-pinned (the test code in `record.zig`/`messages.zig` is in the digested files).
 
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** DTLS 1.2 tests: a Certificate fragmented across two datagrams (RFC 6347 §4.2.3; `need_more_data`, a duplicate first datagram absorbed), and a peer alert (`error.ReceivedAlert`) in epoch 0 during the handshake (rolled back) and encrypted after it.

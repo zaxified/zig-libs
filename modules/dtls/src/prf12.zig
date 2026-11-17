@@ -68,6 +68,7 @@ pub fn prf(alg: HashAlg, secret: []const u8, label: []const u8, seed: []const []
 /// `seed` is `ClientHello.random + ServerHello.random` for the former and
 /// the `session_hash` (the transcript hash through ClientKeyExchange) for
 /// the latter.
+// secret-api-ok: writes into the caller's `out`; its only engine caller (Connection12) runs inside the entry points' burns, and `prf` wipes its own temporaries.
 pub fn masterSecret(
     alg: HashAlg,
     pre_master_secret: []const u8,
