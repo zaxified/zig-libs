@@ -1330,3 +1330,39 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation audit 2026-11-17: authOffsetFor boundaries ───────
+
+fn paramsInto(buf: []const u8, off: usize, len: usize) UsmSecurityParameters {
+    return .{
+        .engine_id = "",
+        .engine_boots = 0,
+        .engine_time = 0,
+        .user_name = "",
+        .auth_params = buf[off..][0..len],
+        .priv_params = "",
+    };
+}
+
+test "authOffsetFor: the OCTET STRING header, the field's length and its position are each checked" {
+    const n: u8 = @intCast(AuthProtocol.hmac_md5.digestLen());
+    var m = @as([14]u8, @splat(0));
+    m[0] = ber.tag.octet_string;
+    m[1] = n;
+    // Smallest legal offset (2), field flush with the end of the message.
+    try testing.expectEqual(@as(?usize, 2), authOffsetFor(.hmac_md5, &m, paramsInto(&m, 2, n)));
+    // A field one byte shorter than the protocol's, behind a correct header.
+    try testing.expectEqual(@as(?usize, null), authOffsetFor(.hmac_md5, &m, paramsInto(&m, 2, n - 4)));
+    // Wrong tag byte with a correct length byte, and the other way round.
+    var wrong_tag = m;
+    wrong_tag[0] = 0x05;
+    try testing.expectEqual(@as(?usize, null), authOffsetFor(.hmac_md5, &wrong_tag, paramsInto(&wrong_tag, 2, n)));
+    var wrong_len = m;
+    wrong_len[1] = n - 1;
+    try testing.expectEqual(@as(?usize, null), authOffsetFor(.hmac_md5, &wrong_len, paramsInto(&wrong_len, 2, n)));
+    // Offset 1 has no room for a two-byte header: refused, not read at -1.
+    var wide = @as([20]u8, @splat(0));
+    wide[0] = ber.tag.octet_string;
+    wide[1] = n;
+    try testing.expectEqual(@as(?usize, null), authOffsetFor(.hmac_md5, &wide, paramsInto(&wide, 1, n)));
+}

@@ -227,3 +227,12 @@ test "a boots value above the RFC ceiling cannot walk past the always-out-of-win
         checkTimeWindow(.authoritative, &auth_state, std.math.maxInt(u32), 0),
     );
 }
+
+test "latch: a message carrying exactly the latest time is not newer" {
+    var s = EngineTimeState.init(5, 100);
+    try std.testing.expect(!latch(&s, 5, 100)); // equal: nothing to adopt
+    try std.testing.expect(latch(&s, 5, 101));
+    try std.testing.expect(!latch(&s, 5, 101));
+    try std.testing.expect(!latch(&s, 4, 999)); // older boots never win
+    try std.testing.expectEqual(@as(u32, 101), s.latest_received_engine_time);
+}

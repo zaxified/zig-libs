@@ -1097,3 +1097,117 @@ test "notificationVarbinds: inserts sysUpTime.0 + snmpTrapOID.0 first; rejects r
         .varbinds = &many,
     }));
 }
+
+// ── whole-module mutation audit 2026-11-17: structure and range checks ─────
+
+const AuditPdu = struct { rid: i64 = 1, f1: i64 = 0, f2: i64 = 0, extra: bool = false };
+
+fn auditPduContent(buf: []u8, o: AuditPdu) ![]const u8 {
+    var e = ber.Encoder.init(buf);
+    if (o.extra) try e.prependNull(ber.tag.null);
+    try e.prependTlv(ber.tag.sequence, "");
+    try e.prependInteger(ber.tag.integer, o.f2);
+    try e.prependInteger(ber.tag.integer, o.f1);
+    try e.prependInteger(ber.tag.integer, o.rid);
+    return e.encoded();
+}
+
+fn auditDecode(tag_byte: u8, buf: []u8, o: AuditPdu) !Pdu {
+    return decodePdu(.{ .tag = tag_byte, .content = try auditPduContent(buf, o) });
+}
+
+test "mutation audit: PDU field ranges are refused, not wrapped to a valid-looking value" {
+    var buf: [64]u8 = undefined;
+    const get = @backingInt(PduType.get_request);
+    try testing.expectEqual(@as(i32, 1), (try auditDecode(get, &buf, .{})).get_request.request_id);
+    // 2^32 + 1 would wrap to 1.
+    try testing.expectError(error.IntegerTooLarge, auditDecode(get, &buf, .{ .rid = 4294967297 }));
+    try testing.expectError(error.IntegerTooLarge, auditDecode(get, &buf, .{ .rid = 2147483648 }));
+    try testing.expectError(error.InvalidValue, auditDecode(get, &buf, .{ .f2 = 4294967297 }));
+    try testing.expectError(error.InvalidValue, auditDecode(get, &buf, .{ .f2 = -1 }));
+    try testing.expectError(error.InvalidValue, auditDecode(get, &buf, .{ .f1 = 257 }));
+    try testing.expectEqual(@as(u32, 4294967295), (try auditDecode(get, &buf, .{ .f2 = 4294967295 })).get_request.error_index);
+}
+
+test "mutation audit: a stray element inside a PDU is TrailingData, for basic, bulk and trap PDUs" {
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.TrailingData, auditDecode(@backingInt(PduType.get_request), &buf, .{ .extra = true }));
+    try testing.expectError(error.TrailingData, auditDecode(@backingInt(PduType.get_bulk_request), &buf, .{ .extra = true }));
+}
+
+test "mutation audit: GetBulk counts clamp into u32 (negative to 0, huge to the maximum)" {
+    var buf: [64]u8 = undefined;
+    const bulk = @backingInt(PduType.get_bulk_request);
+    const neg = (try auditDecode(bulk, &buf, .{ .f1 = -1, .f2 = -5 })).get_bulk_request;
+    try testing.expectEqual(@as(u32, 0), neg.non_repeaters);
+    try testing.expectEqual(@as(u32, 0), neg.max_repetitions);
+    const big = (try auditDecode(bulk, &buf, .{ .f1 = 4294967296, .f2 = 5 })).get_bulk_request;
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), big.non_repeaters);
+    try testing.expectEqual(@as(u32, 5), big.max_repetitions);
+}
+
+const AuditTrap = struct { addr_len: usize = 4, specific: i64 = 0, extra: bool = false };
+
+fn auditTrap(buf: []u8, o: AuditTrap) !Pdu {
+    var e = ber.Encoder.init(buf);
+    const addr = [_]u8{ 1, 2, 3, 4, 5 };
+    if (o.extra) try e.prependNull(ber.tag.null);
+    try e.prependTlv(ber.tag.sequence, "");
+    try e.prependUnsigned(ber.tag.time_ticks, 0);
+    try e.prependInteger(ber.tag.integer, o.specific);
+    try e.prependInteger(ber.tag.integer, 6);
+    try e.prependTlv(ber.tag.ip_address, addr[0..o.addr_len]);
+    try e.prependTlv(ber.tag.object_identifier, &.{0x2b});
+    return decodePdu(.{ .tag = @backingInt(PduType.trap_v1), .content = e.encoded() });
+}
+
+test "mutation audit: v1 Trap-PDU agent address, trailing element and specific-trap range" {
+    var buf: [64]u8 = undefined;
+    const ok = (try auditTrap(&buf, .{})).trap_v1;
+    try testing.expectEqual([4]u8{ 1, 2, 3, 4 }, ok.agent_addr);
+    try testing.expectError(error.InvalidValue, auditTrap(&buf, .{ .addr_len = 3 }));
+    try testing.expectError(error.InvalidValue, auditTrap(&buf, .{ .addr_len = 5 }));
+    try testing.expectError(error.TrailingData, auditTrap(&buf, .{ .extra = true }));
+    try testing.expectError(error.IntegerTooLarge, auditTrap(&buf, .{ .specific = 4294967297 }));
+}
+
+test "mutation audit: a message with a stray element after the PDU, and a varbind with one extra value" {
+    var buf: [64]u8 = undefined;
+    // `encodePdu` closes its element over everything already in the encoder,
+    // so the PDU is built apart and appended as bytes behind the stray NULL.
+    var pdu_buf: [32]u8 = undefined;
+    var pe = ber.Encoder.init(&pdu_buf);
+    try encodePdu(&pe, .{ .type = .get_request, .request_id = 1 });
+    var e = ber.Encoder.init(&buf);
+    try e.prependNull(ber.tag.null);
+    try e.prependBytes(pe.encoded());
+    try e.prependTlv(ber.tag.octet_string, "");
+    try e.prependInteger(ber.tag.integer, 1);
+    try e.wrap(ber.tag.sequence, 0);
+    try testing.expectError(error.TrailingData, decode(e.encoded()));
+
+    // SEQUENCE { OID 1.3, NULL, NULL }
+    const vbl: VarBindList = .{ .bytes = &.{ 0x30, 0x07, 0x06, 0x01, 0x2b, 0x05, 0x00, 0x05, 0x00 } };
+    var it = vbl.iterator();
+    try testing.expectError(error.TrailingData, it.next());
+}
+
+test "mutation audit: collect fills the buffer exactly and refuses one varbind more" {
+    const vbl: VarBindList = .{ .bytes = &.{ 0x30, 0x05, 0x06, 0x01, 0x2b, 0x05, 0x00, 0x30, 0x05, 0x06, 0x01, 0x2b, 0x05, 0x00 } };
+    var two: [2]VarBind = undefined;
+    try testing.expectEqual(@as(usize, 2), (try vbl.collect(&two)).len);
+    var one: [1]VarBind = undefined;
+    try testing.expectError(error.BufferTooSmall, vbl.collect(&one));
+}
+
+test "mutation audit: a notification may carry exactly max_notification_varbinds of its own" {
+    var vbs: [max_notification_varbinds + 1]VarBind = undefined;
+    for (&vbs, 0..) |*v, i| v.* = .{ .name = try Oid.fromSlice(&.{ 1, 3, 6, 1, 4, 1, 99, @intCast(i) }), .value = .null };
+    var out: [max_notification_varbinds + 2]VarBind = undefined;
+    const n: Notification = .{ .uptime = 1, .trap_oid = try Oid.fromSlice(&.{ 1, 3, 6, 1, 6, 3, 1, 1, 5, 1 }) };
+    var full = n;
+    full.varbinds = vbs[0..max_notification_varbinds];
+    try testing.expectEqual(@as(usize, max_notification_varbinds + 2), (try notificationVarbinds(&out, full)).len);
+    full.varbinds = &vbs;
+    try testing.expectError(error.TooManyOids, notificationVarbinds(&out, full));
+}

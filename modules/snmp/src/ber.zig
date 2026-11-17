@@ -729,3 +729,77 @@ test "toUnsigned: the upper half of the destination range survives a following r
         if (got) |v| try testing.expectEqual(r.upper, v > std.math.maxInt(i8));
     }
 }
+
+// ── whole-module mutation audit 2026-11-17: boundary tests ──────────────────
+
+test "decode: a non-minimal long-form length whose octets end the buffer is plain BER" {
+    // `04 81 00`: one length octet, value 0, nothing after it. The length
+    // octets fit exactly (n == remaining), the empty content fits too.
+    const v = try decodeOne(&.{ 0x04, 0x81, 0x00 });
+    try testing.expectEqual(@as(usize, 0), v.octet_string.len);
+    // One octet short of that is Truncated, not a read past the end.
+    var d = Decoder.init(&.{ 0x04, 0x82, 0x00 });
+    try testing.expectError(error.Truncated, d.any());
+}
+
+test "parseOid: the first octet splits at 40 and 80 (X.690 §8.19.4)" {
+    const cases = [_]struct { b: u8, a: [2]u32 }{
+        .{ .b = 0x27, .a = .{ 0, 39 } },
+        .{ .b = 0x28, .a = .{ 1, 0 } },
+        .{ .b = 0x4f, .a = .{ 1, 39 } },
+        .{ .b = 0x50, .a = .{ 2, 0 } },
+    };
+    for (cases) |c| {
+        const o = try parseOid(&.{c.b});
+        try testing.expectEqualSlices(u32, &c.a, o.slice());
+    }
+}
+
+test "IpAddress content longer than 4 bytes is refused, not truncated" {
+    try testing.expectError(error.InvalidValue, decodeOne(&.{ 0x40, 0x05, 1, 2, 3, 4, 5 }));
+}
+
+test "Encoder.prependBytes fills the buffer exactly and refuses one byte more" {
+    var b: [3]u8 = undefined;
+    var e = Encoder.init(&b);
+    try e.prependBytes(&.{ 1, 2, 3 });
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, e.encoded());
+    try testing.expectError(error.BufferTooSmall, e.prependBytes(&.{4}));
+    try testing.expectError(error.BufferTooSmall, e.prependByte(4));
+}
+
+test "prependUnsigned pads a top bit of exactly 0x80" {
+    try expectValueBytes(&.{ 0x41, 0x02, 0x00, 0x80 }, .{ .counter32 = 128 });
+    try expectValueBytes(&.{ 0x42, 0x01, 0x7f }, .{ .gauge32 = 127 });
+    try expectValueBytes(&.{ 0x42, 0x03, 0x00, 0x80, 0x00 }, .{ .gauge32 = 0x8000 });
+    try expectValueBytes(&.{ 0x46, 0x02, 0x00, 0xff }, .{ .counter64 = 255 });
+}
+
+test "prependOid: root constraints and the u32 ceiling of the first subidentifier" {
+    var buf: [32]u8 = undefined;
+    inline for (.{
+        &[_]u32{},
+        &[_]u32{1},
+        &[_]u32{ 3, 1 },
+        &[_]u32{ 0, 40 },
+        &[_]u32{ 1, 40 },
+        &[_]u32{ 2, 4294967216 }, // 80 + arc = 2^32, one past the ceiling
+    }) |arcs| {
+        const o = try Oid.fromSlice(arcs);
+        var e = Encoder.init(&buf);
+        try testing.expectError(error.InvalidOid, e.prependOid(&o));
+    }
+    // The boundaries just inside are accepted and read back.
+    inline for (.{
+        &[_]u32{ 0, 39 },
+        &[_]u32{ 1, 39 },
+        &[_]u32{ 2, 40 },
+        &[_]u32{ 2, 4294967215, 1 }, // first subidentifier == 2^32 - 1
+    }) |arcs| {
+        const o = try Oid.fromSlice(arcs);
+        var e = Encoder.init(&buf);
+        try e.prependOid(&o);
+        const back = (try decodeOne(e.encoded())).oid;
+        try testing.expect(back.eql(&o));
+    }
+}

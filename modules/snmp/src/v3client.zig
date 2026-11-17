@@ -940,6 +940,22 @@ pub const FakeAgent = struct {
     served: usize = 0,
     /// Count of discovery probes served.
     probes: usize = 0,
+    /// Reason of the Report answering a discovery probe.
+    probe_reason: report_mod.Reason = .unknown_engine_ids,
+    /// Put this engineID into the USM parameters of every reply, while the
+    /// keys stay localized to `engine_id`: a reply that authenticates under
+    /// our key yet names another engine.
+    advertised_engine_id: ?[]const u8 = null,
+    /// Answer an authenticated request with an unauthenticated Response.
+    unauth_reply: bool = false,
+    /// Send forced Reports unauthenticated even at an authenticated level.
+    report_unauth: bool = false,
+    /// Keep answering with `force_report` instead of clearing it.
+    repeat_report: bool = false,
+    /// Count of forced Reports sent.
+    reports: usize = 0,
+    /// Data replies after this many carry no varbind at all.
+    max_data_replies: usize = std.math.maxInt(usize),
 
     scratch: [max_message_len]u8 = undefined,
     plain: [max_message_len]u8 = undefined,
@@ -981,7 +997,7 @@ pub const FakeAgent = struct {
         // Unknown/empty engine ID → discovery Report (unauthenticated).
         if (params.engine_id.len == 0 or !std.mem.eql(u8, params.engine_id, a.engine_id)) {
             a.probes += 1;
-            return a.buildReport(m.header.msg_id, requestIdOf(m) orelse 0, .unknown_engine_ids, false);
+            return a.buildReport(m.header.msg_id, requestIdOf(m) orelse 0, a.probe_reason, false);
         }
 
         // Verify the digest exactly as a real engine would.
@@ -993,7 +1009,7 @@ pub const FakeAgent = struct {
             };
         }
         if (forcedReason(a)) |reason| {
-            const authed = m.header.flags.auth;
+            const authed = m.header.flags.auth and !a.report_unauth;
             return a.buildReport(m.header.msg_id, 0, reason, authed);
         }
 
@@ -1024,7 +1040,8 @@ pub const FakeAgent = struct {
 
     fn forcedReason(a: *FakeAgent) ?report_mod.Reason {
         const r = a.force_report orelse return null;
-        a.force_report = null; // one-shot
+        if (!a.repeat_report) a.force_report = null; // one-shot
+        a.reports += 1;
         return r;
     }
 
@@ -1072,8 +1089,8 @@ pub const FakeAgent = struct {
             .request_id = rid +% a.request_id_offset,
             .error_status = a.error_status,
             .error_index = a.error_index,
-            .varbinds = a.values,
-        }, a.user.level.hasAuth(), encrypted);
+            .varbinds = if (a.served > a.max_data_replies) &.{} else a.values,
+        }, a.user.level.hasAuth() and !a.unauth_reply, encrypted);
     }
 
     /// Build (and sign/encrypt) a reply datagram into `a.out`.
@@ -1088,7 +1105,7 @@ pub const FakeAgent = struct {
         const salt = salt_src.mode.fixed_for_interop;
         var sp_buf: [128]u8 = undefined;
         const sp = try usm.encode(&sp_buf, .{
-            .engine_id = a.engine_id,
+            .engine_id = a.advertised_engine_id orelse a.engine_id,
             .engine_boots = a.boots,
             .engine_time = skewed,
             .user_name = if (authed) a.user.name else "",
@@ -1916,4 +1933,334 @@ test "the three v3 client limits are the values RFC 3411/3414 fix, not whatever 
     try c2.seedEngine(&usm.netsnmp_engine_id, 1, 1);
     try testing.expectError(error.TooManyOids, c2.get(oids[0..33]));
     try testing.expectEqual(@as(usize, 0), agent.served);
+}
+
+// ── whole-module mutation audit 2026-11-17 ──────────────────────────────────
+
+const audit_oid = "1.3.6.1.2.1.1.5.0";
+
+const audit_auth_user: User = .{
+    .name = "rfcUser",
+    .level = .auth_no_priv,
+    .auth_protocol = .hmac_sha1,
+    .auth_password = "maplesyrup",
+};
+
+const audit_plain_user: User = .{ .name = "plain", .level = .no_auth_no_priv };
+
+fn auditSeeded(agent: *FakeAgent, user: User) !V3Client {
+    var c = V3Client.init(agent.transport(), user, .{ .salt_seed = test_salt_seed });
+    try c.seedEngine(agent.engine_id, agent.boots, agent.time);
+    return c;
+}
+
+test "discovery probe and requests are sent reportable, the probe with nothing else set" {
+    var agent: FakeAgent = .{ .user = audit_plain_user };
+    var c = V3Client.init(agent.transport(), audit_plain_user, .{});
+    try c.discover();
+    const probe = try v3.decode(agent.lastRequest());
+    try testing.expect(probe.header.flags.reportable);
+    try testing.expect(!probe.header.flags.auth and !probe.header.flags.priv);
+
+    const vals = try sysNameVarBinds();
+    agent.values = &vals;
+    _ = try c.get(&.{try Oid.parse(audit_oid)});
+    const req = try v3.decode(agent.lastRequest());
+    try testing.expect(req.header.flags.reportable);
+}
+
+test "discover: a Report with an unclassifiable counter is UnknownReport, any known counter still yields the engine" {
+    var bad: FakeAgent = .{ .user = audit_plain_user, .probe_reason = .unknown };
+    var c = V3Client.init(bad.transport(), audit_plain_user, .{});
+    try testing.expectError(error.UnknownReport, c.discover());
+    try testing.expect(!c.engine.discovered);
+
+    var other: FakeAgent = .{ .user = audit_plain_user, .probe_reason = .wrong_digests };
+    var c2 = V3Client.init(other.transport(), audit_plain_user, .{});
+    try c2.discover();
+    try testing.expect(c2.engine.discovered);
+}
+
+test "seedEngine again at a lower security level drops the keys of the higher one" {
+    var agent: FakeAgent = .{ .user = audit_plain_user };
+    const full: User = .{
+        .name = "u",
+        .level = .auth_priv,
+        .auth_protocol = .hmac_sha1,
+        .auth_password = "maplesyrup",
+        .priv_protocol = .aes128_cfb,
+        .priv_password = "maplesyrup",
+    };
+    var c = V3Client.init(agent.transport(), full, .{ .salt_seed = test_salt_seed });
+    try c.seedEngine(agent.engine_id, 1, 100);
+    try testing.expect(c.engine.authKey().len > 0 and c.engine.privKey().len > 0);
+    c.user.level = .auth_no_priv;
+    try c.seedEngine(agent.engine_id, 1, 100);
+    try testing.expect(c.engine.authKey().len > 0);
+    try testing.expectEqual(@as(usize, 0), c.engine.privKey().len);
+    c.user.level = .no_auth_no_priv;
+    try c.seedEngine(agent.engine_id, 1, 100);
+    try testing.expectEqual(@as(usize, 0), c.engine.authKey().len);
+}
+
+test "advanceEngineTime saturates at the top of u32 and moves the replay floor with the clock" {
+    var agent: FakeAgent = .{ .user = audit_plain_user };
+    var c = try auditSeeded(&agent, audit_plain_user);
+    c.setEngineTime(1, std.math.maxInt(u32) - 5);
+    c.advanceEngineTime(10);
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), c.engine.clock.engine_time);
+    c.setEngineTime(1, 100);
+    c.advanceEngineTime(7);
+    try testing.expectEqual(@as(u32, 107), c.engine.clock.engine_time);
+    try testing.expectEqual(@as(u32, 107), c.engine.clock.latest_received_engine_time);
+}
+
+test "requests: exactly max_request_oids names go out, each as NULL; a longer list is refused" {
+    var agent: FakeAgent = .{ .user = audit_plain_user };
+    var c = try auditSeeded(&agent, audit_plain_user);
+    var oids: [max_request_oids + 1]Oid = @splat(try Oid.parse("1.3.6.1"));
+    _ = try c.get(oids[0..max_request_oids]);
+    const sent = try v3.decode(agent.lastRequest());
+    var it = sent.data.plaintext.pdu.get_request.varbinds.iterator();
+    var n: usize = 0;
+    while (try it.next()) |vb| : (n += 1) try testing.expect(vb.value == .null);
+    try testing.expectEqual(@as(usize, max_request_oids), n);
+    try testing.expectError(error.TooManyOids, c.get(&oids));
+}
+
+test "user name: exactly 32 bytes is sent, one more is BadUserName at request time" {
+    const name32 = "0123456789abcdef0123456789abcdef";
+    var agent: FakeAgent = .{ .user = audit_plain_user };
+    var c = try auditSeeded(&agent, .{ .name = name32, .level = .no_auth_no_priv });
+    _ = try c.get(&.{try Oid.parse(audit_oid)});
+    c.user.name = name32 ++ "x";
+    try testing.expectError(error.BadUserName, c.get(&.{try Oid.parse(audit_oid)}));
+}
+
+test "a reply datagram as long as the whole reply buffer is read, not refused as oversize" {
+    const Fill = struct {
+        fn exchange(_: *anyopaque, _: []const u8, reply_buf: []u8) client_mod.TransportError!usize {
+            @memset(reply_buf, 0);
+            return reply_buf.len;
+        }
+    };
+    var agent: FakeAgent = .{ .user = audit_plain_user };
+    var c = try auditSeeded(&agent, audit_plain_user);
+    c.transport = .{ .ctx = &agent, .exchangeFn = Fill.exchange };
+    // Zeros are not a message: a decode error, but not TransportFailed.
+    try testing.expectError(error.UnexpectedTag, c.get(&.{try Oid.parse(audit_oid)}));
+}
+
+test "a reply with another msgID is MsgIdMismatch" {
+    const vals = try sysNameVarBinds();
+    var agent: FakeAgent = .{ .user = audit_plain_user, .values = &vals };
+    var c = try auditSeeded(&agent, audit_plain_user);
+    agent.force_msg_id = 9999;
+    try testing.expectError(error.MsgIdMismatch, c.get(&.{try Oid.parse(audit_oid)}));
+}
+
+test "message and request ids wrap from 2^31 - 1 to 1" {
+    const vals = try sysNameVarBinds();
+    var agent: FakeAgent = .{ .user = audit_plain_user, .values = &vals };
+    var c = V3Client.init(agent.transport(), audit_plain_user, .{
+        .initial_msg_id = std.math.maxInt(i32),
+        .initial_request_id = std.math.maxInt(i32),
+    });
+    try c.seedEngine(agent.engine_id, agent.boots, agent.time);
+    _ = try c.get(&.{try Oid.parse(audit_oid)});
+    try testing.expectEqual(@as(i32, 1), c.next_msg_id);
+    try testing.expectEqual(@as(i32, 1), c.next_request_id);
+    _ = try c.get(&.{try Oid.parse(audit_oid)});
+    try testing.expectEqual(@as(i32, 2), c.next_msg_id);
+    try testing.expectEqual(@as(i32, 2), c.next_request_id);
+}
+
+test "an authenticated Report naming us a new engine is acted on once; a second one ends in ReportRetryExhausted after one retry" {
+    var agent: FakeAgent = .{ .user = audit_auth_user, .force_report = .unknown_engine_ids, .repeat_report = true };
+    var c = V3Client.init(agent.transport(), audit_auth_user, .{});
+    try c.discover();
+    try testing.expectError(error.ReportRetryExhausted, c.get(&.{try Oid.parse(audit_oid)}));
+    try testing.expectEqual(@as(usize, 2), agent.reports);
+}
+
+test "an unauthenticated unknownEngineIDs Report cannot re-point a client that already holds an engine" {
+    var agent: FakeAgent = .{ .user = audit_auth_user, .force_report = .unknown_engine_ids, .report_unauth = true };
+    var c = V3Client.init(agent.transport(), audit_auth_user, .{});
+    try c.discover();
+    try testing.expectError(error.UnknownEngineId, c.get(&.{try Oid.parse(audit_oid)}));
+    try testing.expectEqual(@as(usize, 1), agent.reports);
+}
+
+test "an authenticated Report about another engine is not dated against our clock (it is discovery)" {
+    const other = "\x80\x00\x00\x00\x05zzzz";
+    var agent: FakeAgent = .{ .user = audit_auth_user };
+    var c = V3Client.init(agent.transport(), audit_auth_user, .{});
+    try c.discover();
+    agent.force_report = .unknown_engine_ids;
+    agent.advertised_engine_id = other;
+    agent.time_skew = -80;
+    // Our cached clock is far ahead of the Report's: were it dated against
+    // that clock the Report would be NotInTimeWindow. It is not, it is acted
+    // on (the engine is re-seeded) and the retry then meets an agent that
+    // does not know the new engine id.
+    c.setEngineTime(1, 5000);
+    try testing.expectError(error.UnknownEngineId, c.get(&.{try Oid.parse(audit_oid)}));
+}
+
+test "notInTimeWindows: at noAuthNoPriv it moves the clock, at an authenticated level only an authenticated one does" {
+    const vals = try sysNameVarBinds();
+
+    // noAuthNoPriv: nothing to authenticate, the Report is taken and retried.
+    var a1: FakeAgent = .{ .user = audit_plain_user, .values = &vals, .time = 100 };
+    var c1 = try auditSeeded(&a1, audit_plain_user);
+    a1.time = 150;
+    a1.force_report = .not_in_time_windows;
+    _ = try c1.get(&.{try Oid.parse(audit_oid)});
+    try testing.expectEqual(@as(u32, 150), c1.engine.clock.engine_time);
+
+    // authNoPriv: an unauthenticated one must not move anything.
+    var a2: FakeAgent = .{ .user = audit_auth_user, .values = &vals, .time = 100 };
+    var c2 = try auditSeeded(&a2, audit_auth_user);
+    a2.time = 150;
+    a2.force_report = .not_in_time_windows;
+    a2.report_unauth = true;
+    try testing.expectError(error.NotInTimeWindow, c2.get(&.{try Oid.parse(audit_oid)}));
+    try testing.expectEqual(@as(u32, 100), c2.engine.clock.engine_time);
+}
+
+test "notInTimeWindows naming another engine is EngineIdMismatch, not a clock update" {
+    const other = "\x80\x00\x00\x00\x05zzzz";
+    var agent: FakeAgent = .{ .user = audit_plain_user, .advertised_engine_id = other };
+    var c = try auditSeeded(&agent, audit_plain_user);
+    agent.force_report = .not_in_time_windows;
+    try testing.expectError(error.EngineIdMismatch, c.get(&.{try Oid.parse(audit_oid)}));
+    try testing.expectEqual(@as(u32, 100), c.engine.clock.engine_time);
+}
+
+test "data replies: unauthenticated at an authenticated level, or from another engine, are refused" {
+    const vals = try sysNameVarBinds();
+    var a1: FakeAgent = .{ .user = audit_auth_user, .values = &vals, .unauth_reply = true };
+    var c1 = try auditSeeded(&a1, audit_auth_user);
+    try testing.expectError(error.SecurityLevelDowngrade, c1.get(&.{try Oid.parse(audit_oid)}));
+
+    var a2: FakeAgent = .{ .user = audit_plain_user, .values = &vals, .advertised_engine_id = "\x80\x00\x00\x00\x05zzzz" };
+    var c2 = try auditSeeded(&a2, audit_plain_user);
+    try testing.expectError(error.EngineIdMismatch, c2.get(&.{try Oid.parse(audit_oid)}));
+}
+
+test "V3 Walker: every way a walk can end is final, a further next() sends nothing" {
+    const root = try Oid.parse("1.3.6.1.2.1.1");
+    const inside = [_]VarBind{.{ .name = try Oid.parse("1.3.6.1.2.1.1.5.0"), .value = .{ .integer = 1 } }};
+    const outside = [_]VarBind{.{ .name = try Oid.parse("1.3.6.1.2.1.2.1.0"), .value = .{ .integer = 1 } }};
+    const eom = [_]VarBind{.{ .name = root, .value = .end_of_mib_view }};
+
+    var a1: FakeAgent = .{ .user = audit_plain_user, .error_status = 5 };
+    var c1 = try auditSeeded(&a1, audit_plain_user);
+    var w1 = c1.walker(root);
+    try testing.expectError(error.RequestFailed, w1.next());
+    try testing.expectEqual(@as(?VarBind, null), try w1.next());
+    try testing.expectEqual(@as(usize, 1), a1.served);
+
+    var a2: FakeAgent = .{ .user = audit_plain_user };
+    var c2 = try auditSeeded(&a2, audit_plain_user);
+    var w2 = c2.walker(root);
+    try testing.expectEqual(@as(?VarBind, null), try w2.next());
+    try testing.expectEqual(@as(?VarBind, null), try w2.next());
+    try testing.expectEqual(@as(usize, 1), a2.served);
+
+    var a3: FakeAgent = .{ .user = audit_plain_user, .values = &eom };
+    var c3 = try auditSeeded(&a3, audit_plain_user);
+    var w3 = c3.walker(root);
+    try testing.expectEqual(@as(?VarBind, null), try w3.next());
+    try testing.expectEqual(@as(?VarBind, null), try w3.next());
+    try testing.expectEqual(@as(usize, 1), a3.served);
+
+    var a4: FakeAgent = .{ .user = audit_plain_user, .values = &outside };
+    var c4 = try auditSeeded(&a4, audit_plain_user);
+    var w4 = c4.walker(root);
+    try testing.expectEqual(@as(?VarBind, null), try w4.next());
+    try testing.expectEqual(@as(?VarBind, null), try w4.next());
+    try testing.expectEqual(@as(usize, 1), a4.served);
+
+    // The agent answers every GetNext with the same row: the first is fine,
+    // the second repeats the cursor (OidNotIncreasing), the third is null.
+    var a5: FakeAgent = .{ .user = audit_plain_user, .values = &inside };
+    var c5 = try auditSeeded(&a5, audit_plain_user);
+    var w5 = c5.walker(root);
+    try testing.expect((try w5.next()) != null);
+    try testing.expectError(error.OidNotIncreasing, w5.next());
+    try testing.expectEqual(@as(?VarBind, null), try w5.next());
+    try testing.expectEqual(@as(usize, 2), a5.served);
+}
+
+test "V3 BulkWalker: errors, an empty batch and every end are final" {
+    const root = try Oid.parse("1.3.6.1.2.1.1");
+    const inside = [_]VarBind{.{ .name = try Oid.parse("1.3.6.1.2.1.1.5.0"), .value = .{ .integer = 1 } }};
+    const outside = [_]VarBind{.{ .name = try Oid.parse("1.3.6.1.2.1.2.1.0"), .value = .{ .integer = 1 } }};
+    const eom = [_]VarBind{.{ .name = root, .value = .end_of_mib_view }};
+
+    var a1: FakeAgent = .{ .user = audit_plain_user, .error_status = 5 };
+    var c1 = try auditSeeded(&a1, audit_plain_user);
+    var w1 = c1.bulkWalker(root);
+    try testing.expectError(error.RequestFailed, w1.next());
+    try testing.expectEqual(@as(?VarBind, null), try w1.next());
+    try testing.expectEqual(@as(usize, 1), a1.served);
+
+    // A first batch with no varbind at all means nothing follows.
+    var a2: FakeAgent = .{ .user = audit_plain_user };
+    var c2 = try auditSeeded(&a2, audit_plain_user);
+    var w2 = c2.bulkWalker(root);
+    try testing.expectEqual(@as(?VarBind, null), try w2.next());
+    try testing.expectEqual(@as(?VarBind, null), try w2.next());
+    try testing.expectEqual(@as(usize, 1), a2.served);
+
+    var a3: FakeAgent = .{ .user = audit_plain_user, .values = &eom };
+    var c3 = try auditSeeded(&a3, audit_plain_user);
+    var w3 = c3.bulkWalker(root);
+    try testing.expectEqual(@as(?VarBind, null), try w3.next());
+    try testing.expectEqual(@as(?VarBind, null), try w3.next());
+    try testing.expectEqual(@as(usize, 1), a3.served);
+
+    var a4: FakeAgent = .{ .user = audit_plain_user, .values = &outside };
+    var c4 = try auditSeeded(&a4, audit_plain_user);
+    var w4 = c4.bulkWalker(root);
+    try testing.expectEqual(@as(?VarBind, null), try w4.next());
+    try testing.expectEqual(@as(?VarBind, null), try w4.next());
+    try testing.expectEqual(@as(usize, 1), a4.served);
+
+    // The same row every batch: first batch fine, second repeats the cursor.
+    var a5: FakeAgent = .{ .user = audit_plain_user, .values = &inside };
+    var c5 = try auditSeeded(&a5, audit_plain_user);
+    var w5 = c5.bulkWalker(root);
+    try testing.expect((try w5.next()) != null);
+    try testing.expectError(error.OidNotIncreasing, w5.next());
+    try testing.expectEqual(@as(?VarBind, null), try w5.next());
+    try testing.expectEqual(@as(usize, 2), a5.served);
+}
+
+test "V3 BulkWalker: rows, then an empty batch: the walk ends there" {
+    const root = try Oid.parse("1.3.6.1.2.1.1");
+    const inside = [_]VarBind{.{ .name = try Oid.parse("1.3.6.1.2.1.1.5.0"), .value = .{ .integer = 1 } }};
+    var agent: FakeAgent = .{ .user = audit_plain_user, .values = &inside, .max_data_replies = 1 };
+    var c = try auditSeeded(&agent, audit_plain_user);
+    var w = c.bulkWalker(root);
+    try testing.expect((try w.next()) != null);
+    try testing.expectEqual(@as(?VarBind, null), try w.next());
+    try testing.expectEqual(@as(?VarBind, null), try w.next());
+    try testing.expectEqual(@as(usize, 2), agent.served);
+}
+
+test "V3 BulkWalker: a walk that ends on a row outside the subtree in mid-batch stays ended" {
+    const root = try Oid.parse("1.3.6.1.2.1.1");
+    const rows = [_]VarBind{
+        .{ .name = try Oid.parse("1.3.6.1.2.1.1.5.0"), .value = .{ .integer = 1 } },
+        .{ .name = try Oid.parse("1.3.6.1.2.1.2.1.0"), .value = .{ .integer = 1 } },
+    };
+    var agent: FakeAgent = .{ .user = audit_plain_user, .values = &rows };
+    var c = try auditSeeded(&agent, audit_plain_user);
+    var w = c.bulkWalker(root);
+    try testing.expect((try w.next()) != null);
+    try testing.expectEqual(@as(?VarBind, null), try w.next()); // the foreign row
+    try testing.expectEqual(@as(?VarBind, null), try w.next());
+    try testing.expectEqual(@as(usize, 1), agent.served);
 }

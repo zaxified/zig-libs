@@ -146,3 +146,16 @@ test "eql, startsWith, order, append" {
     var big: [max_arcs + 1]u32 = @splat(1);
     try testing.expectError(error.TooManyArcs, Oid.fromSlice(&big));
 }
+
+test "mutation audit: 64 arcs fit exactly, startsWith refuses a longer prefix" {
+    var arcs: [max_arcs]u32 = @splat(1);
+    const full = try Oid.fromSlice(&arcs);
+    try testing.expectEqual(@as(u8, max_arcs), full.count);
+    // The prefix is longer than the OID although the zero-padded storage
+    // would compare equal.
+    const short = try Oid.fromSlice(&.{ 1, 3 });
+    const longer = try Oid.fromSlice(&.{ 1, 3, 0 });
+    try testing.expect(!short.startsWith(&longer));
+    try testing.expect(longer.startsWith(&short));
+    try testing.expect(short.startsWith(&short));
+}
