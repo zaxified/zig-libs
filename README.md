@@ -518,7 +518,7 @@ Every one of the 264 modules above claims `.linux64` (Linux, amd64 or arm64) —
 
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
-| [`arrow`](modules/arrow/README.md) | 4? (A) | Apache Arrow IPC stream and file format for dataframe frames (stream and file format, ZSTD body compression; hardening in progress) | any | dataframe, zstd |
+| [`arrow`](modules/arrow/README.md) | 4 (A) | Apache Arrow IPC stream and file format for dataframe frames (stream and file format, ZSTD body compression; hardening in progress) | any | dataframe, zstd |
 | [`blobstore`](modules/blobstore/README.md) | 2 (S,E,A,P) | Content-addressed blob store (git-object/restic style) with refcounted GC, configurable fan-out and a cross-process ingest lock, plus name-addressed and small named-record layers; crash-safe. | posix | hashdigest |
 | [`dataframe`](modules/dataframe/README.md) | 2 (S,E,A,P) | Columnar dataframe (`Frame`): typed columns, validity bitmaps and pandas/polars verbs — aggregate, join, pivot, sort, melt, filter. | any | datefmt, csvstream, regex, tz, unitext |
 | [`decimal`](modules/decimal/README.md) | 2 (S,E,A,P) | Exact i128 fixed-point decimal for money math with IEEE/GDA rounding modes and rescale — float-free arithmetic, f64 only at an explicit fromFloat/toFloat boundary. | any | — |
