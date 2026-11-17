@@ -1715,19 +1715,6 @@ pub const Connection = struct {
     last_flight: [max_flight_bytes]u8 = undefined,
     last_flight_len: usize = 0,
     retransmit_timer: flight.RetransmitTimer = flight.RetransmitTimer.init(1000, 60_000),
-    /// RFC 9147 §7 flight bookkeeping (`flight.FlightTracker`) for the
-    /// records of the flight currently awaiting acknowledgement.
-    /// Acknowledgement here is IMPLICIT (receipt of the peer's next
-    /// expected flight clears it), matching RFC 9147 §7's own framing of
-    /// ACKs as needed only when a peer would otherwise have no way to
-    /// infer receipt — not required on this engine's synchronous
-    /// request/immediate-response happy path.
-    /// Sized for the largest flight this engine ever sends: PSK-only is 3
-    /// (ServerHello, EncryptedExtensions, Finished) or 1 (client Finished);
-    /// certificate mode adds up to 3 more (CertificateRequest, Certificate,
-    /// CertificateVerify) — 8 covers the server's worst case with headroom.
-    pending_flight_buf: [8]flight.RecordNumber = undefined,
-    pending_flight_count: usize = 0,
 
     // ── incoming-flight accumulation (RFC 9147 §5.2 reassembly) ─────────
     /// Datagrams received for the flight currently being consumed,
@@ -1839,9 +1826,7 @@ pub const Connection = struct {
         const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.client_hello), self.message_seq, ch_body, &frag_buf);
         self.message_seq +%= 1;
 
-        const ch_seq = self.hs0.send_seq;
         const record_bytes = try self.writeEpoch0Record(fragment, out);
-        self.markFlightSent(&.{.{ .epoch = 0, .sequence_number = ch_seq }});
         try self.cacheFlight(record_bytes, now_ms);
 
         self.state = .wait_server_hello;
@@ -2154,9 +2139,7 @@ pub const Connection = struct {
     /// Malformed ACK bodies are `error.Malformed`; ACKs naming anything else
     /// (e.g. the handshake's final flight, re-ACKed) are ignored.
     fn processAck(self: *Connection, body: []const u8) SendError!void {
-        if (body.len < 2) return error.Malformed;
-        const list_len: usize = std.mem.readInt(u16, body[0..2], .big);
-        if (body.len != 2 + list_len or list_len % flight.record_number_len != 0) return error.Malformed;
+        try checkAckBody(body);
         if (self.ku_state != .in_flight) return;
         var i: usize = 2;
         while (i < body.len) : (i += flight.record_number_len) {
@@ -2168,6 +2151,14 @@ pub const Connection = struct {
                 }
             }
         }
+    }
+
+    /// An RFC 9147 §7 `ACK` body is a u16 byte length followed by exactly
+    /// that many whole 8-byte record numbers, nothing after.
+    fn checkAckBody(body: []const u8) error{Malformed}!void {
+        if (body.len < 2) return error.Malformed;
+        const list_len: usize = std.mem.readInt(u16, body[0..2], .big);
+        if (body.len != 2 + list_len or list_len % flight.record_number_len != 0) return error.Malformed;
     }
 
     fn completeKeyUpdate(self: *Connection) void {
@@ -3006,6 +2997,18 @@ pub const Connection = struct {
     /// `seq_out`, when given, receives the record's reconstructed 48-bit
     /// sequence number — what an RFC 9147 §7 ACK has to name.
     fn unprotectHandshakeMessage(self: *Connection, record_bytes: []const u8, out: []u8, seq_out: ?*u64) HandshakeError![]const u8 {
+        var ctype: u8 = 0;
+        const body = try self.unprotectHandshakeRecord(record_bytes, out, seq_out, &ctype);
+        if (ctype != content_type_handshake) return error.UnexpectedMessage;
+        return body;
+    }
+
+    /// `unprotectHandshakeMessage` that also admits an `ack` record (RFC
+    /// 9147 §7): the inner content type comes back in `ctype_out` and
+    /// anything other than handshake / ack is `error.UnexpectedMessage`.
+    /// The replay window is updated for either (an ACK is a record like any
+    /// other, see `recv`).
+    fn unprotectHandshakeRecord(self: *Connection, record_bytes: []const u8, out: []u8, seq_out: ?*u64, ctype_out: *u8) HandshakeError![]const u8 {
         const dec = record.decodeUnified(record_bytes, 0) catch return error.Malformed;
         const seq_len = dec.hdr.seq_len;
         const seq_bytes_n: usize = if (seq_len == .short) 1 else 2;
@@ -3038,7 +3041,8 @@ pub const Connection = struct {
         while (end > 0 and out[end - 1] == 0) end -= 1;
         if (end == 0) return error.Malformed;
         const ctype = out[end - 1];
-        if (ctype != content_type_handshake) return error.UnexpectedMessage;
+        if (ctype != content_type_handshake and ctype != content_type_ack) return error.UnexpectedMessage;
+        ctype_out.* = ctype;
 
         // RFC 9147 §4.5.1 anti-replay window, epoch-2 (handshake-traffic)
         // analogue of the check in `recv` above — same AEAD-authenticated-
@@ -3099,16 +3103,25 @@ pub const Connection = struct {
             const fragment = switch (kind) {
                 .epoch0_plaintext => blk: {
                     const rec = record.decodePlaintext(datagram[pos.*..]) catch return error.Malformed;
-                    if (rec.content_type != content_type_handshake) return error.UnexpectedMessage;
+                    if (rec.content_type != content_type_handshake and rec.content_type != content_type_ack) return error.UnexpectedMessage;
                     const start = pos.* + record.plaintext_header_len;
                     if (datagram.len < start + rec.length) return error.Malformed;
                     pos.* = start + rec.length;
+                    if (rec.content_type == content_type_ack) {
+                        try checkAckBody(datagram[start..][0..rec.length]);
+                        continue;
+                    }
                     break :blk datagram[start..][0..rec.length];
                 },
                 .epoch2_protected => blk: {
                     var record_seq: u64 = 0;
-                    const f = try self.unprotectHandshakeMessage(datagram[pos.*..], &plain_buf, &record_seq);
+                    var ctype: u8 = 0;
+                    const f = try self.unprotectHandshakeRecord(datagram[pos.*..], &plain_buf, &record_seq, &ctype);
                     pos.* += try recordWireLen(datagram[pos.*..]);
+                    if (ctype == content_type_ack) {
+                        try checkAckBody(f);
+                        continue;
+                    }
                     if (acks) |a| a.add(record_seq);
                     break :blk f;
                 },
@@ -3148,24 +3161,6 @@ pub const Connection = struct {
                 return .{ .msg_type = reasm.msg_type, .body = body, .message_seq = expected };
             }
         }
-    }
-
-    /// RFC 9147 §7 flight bookkeeping: records the given (epoch, seq) pairs
-    /// as "sent, awaiting acknowledgement" via `flight.FlightTracker`,
-    /// reusing `pending_flight_buf` as that tracker's backing storage (a
-    /// fresh `FlightTracker` is constructed each call rather than stored,
-    /// since it holds a slice that would dangle across a `Connection` move
-    /// — see the field's doc comment).
-    fn markFlightSent(self: *Connection, records: []const flight.RecordNumber) void {
-        var t = flight.FlightTracker.init(&self.pending_flight_buf);
-        for (records) |rn| t.markSent(rn) catch break; // never overflows: <= 3 records/flight here
-        self.pending_flight_count = t.count;
-    }
-
-    /// Marks the whole outstanding flight as acknowledged — called when the
-    /// peer's next expected flight arrives (implicit ACK-by-progression).
-    fn clearFlightTracker(self: *Connection) void {
-        self.pending_flight_count = 0;
     }
 
     /// Caches `bytes` as the last flight WE sent (for `poll` to retransmit)
@@ -3895,7 +3890,6 @@ pub const Connection = struct {
         var sh_frag_buf: [max_server_hello_body + handshake.header_len]u8 = undefined;
         const sh_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.server_hello), self.message_seq, sh_body, &sh_frag_buf);
         self.message_seq +%= 1;
-        const sh_seq = self.hs0.send_seq;
         var cursor: usize = 0;
         {
             const sh_record = try self.writeEpoch0Record(sh_fragment, out[cursor..]);
@@ -3929,7 +3923,6 @@ pub const Connection = struct {
         var ee_frag_buf: [ee_body_cap + handshake.header_len]u8 = undefined;
         const ee_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.encrypted_extensions), self.message_seq, ee_body, &ee_frag_buf);
         self.message_seq +%= 1;
-        const ee_seq = self.hs2.send_seq;
         {
             const ee_record = try self.protectHandshakeMessage(ee_fragment, out[cursor..]);
             cursor += ee_record.len;
@@ -3940,8 +3933,6 @@ pub const Connection = struct {
         // above `handleFlightServer`. Zero records emitted when neither
         // `config.request_client_cert` nor `config.cert` is set, reproducing
         // the original PSK-only flight 2 exactly.
-        var extra_records: [3]flight.RecordNumber = undefined;
-        var extra_n: usize = 0;
 
         if (self.config.request_client_cert) {
             // RFC 8446 §4.3.2: CertificateRequest MUST carry a
@@ -3957,8 +3948,6 @@ pub const Connection = struct {
             var frag_buf: [max_certreq_body + handshake.header_len]u8 = undefined;
             const r = try self.sendEpoch2Message(.certificate_request, creq_body, &frag_buf, out[cursor..]);
             cursor += r.bytes.len;
-            extra_records[extra_n] = .{ .epoch = 2, .sequence_number = r.seq };
-            extra_n += 1;
         }
 
         if (self.config.cert) |cc| {
@@ -3967,8 +3956,6 @@ pub const Connection = struct {
             var frag_buf: [max_cert_message_body + handshake.header_len]u8 = undefined;
             const cert_r = try self.sendEpoch2Message(.certificate, cert_body, &frag_buf, out[cursor..]);
             cursor += cert_r.bytes.len;
-            extra_records[extra_n] = .{ .epoch = 2, .sequence_number = cert_r.seq };
-            extra_n += 1;
 
             // RFC 8446 §4.2.3 negotiation (see `selectSignatureScheme`): the
             // scheme this server signs with must be one the CLIENT actually
@@ -3978,8 +3965,6 @@ pub const Connection = struct {
             const scheme = try selectSignatureScheme(cc, self.config.signature_algorithms, client_sig_algs_buf[0..client_sig_algs_len]);
             const cv_r = try self.signAndSendCertificateVerify(cc, scheme, .server, entropy, out[cursor..]);
             cursor += cv_r.bytes.len;
-            extra_records[extra_n] = .{ .epoch = 2, .sequence_number = cv_r.seq };
-            extra_n += 1;
         }
 
         const th_before_finished = self.transcript.currentHash(alg, &th_buf);
@@ -3989,7 +3974,6 @@ pub const Connection = struct {
         var fin_frag_buf: [suitehash.max_hash_len + handshake.header_len]u8 = undefined;
         const fin_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.finished), self.message_seq, verify_data, &fin_frag_buf);
         self.message_seq +%= 1;
-        const fin_seq = self.hs2.send_seq;
         {
             const fin_record = try self.protectHandshakeMessage(fin_fragment, out[cursor..]);
             cursor += fin_record.len;
@@ -4000,19 +3984,6 @@ pub const Connection = struct {
         const th_through_server_finished = self.transcript.currentHash(alg, &th_buf);
         suitehash.deriveApplicationSecrets(alg, &self.pending_ap_client, &self.pending_ap_server, &self.exporter_master, &ms, th_through_server_finished);
 
-        var all_records: [6]flight.RecordNumber = undefined;
-        var n: usize = 0;
-        all_records[n] = .{ .epoch = 0, .sequence_number = sh_seq };
-        n += 1;
-        all_records[n] = .{ .epoch = 2, .sequence_number = ee_seq };
-        n += 1;
-        for (extra_records[0..extra_n]) |r| {
-            all_records[n] = r;
-            n += 1;
-        }
-        all_records[n] = .{ .epoch = 2, .sequence_number = fin_seq };
-        n += 1;
-        self.markFlightSent(all_records[0..n]);
         try self.cacheFlight(out[0..cursor], now_ms);
         self.state = .wait_finished;
         return .{ .out = out[0..cursor], .done = false };
@@ -4052,7 +4023,6 @@ pub const Connection = struct {
         self.transcript.append(@backingInt(messages.HandshakeType.finished), fin.verify_data);
 
         try self.installApplicationSecrets(self.suite, self.pending_ap_client[0..alg.len()], self.pending_ap_server[0..alg.len()]);
-        self.clearFlightTracker();
         self.retransmit_timer.reset();
         self.last_flight_len = 0;
 
@@ -4202,10 +4172,7 @@ pub const Connection = struct {
         const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.client_hello), self.message_seq, ch_body, &frag_buf);
         self.message_seq +%= 1;
 
-        const ch_seq = self.hs0.send_seq;
         const record_bytes = try self.writeEpoch0Record(fragment, out);
-        self.clearFlightTracker();
-        self.markFlightSent(&.{.{ .epoch = 0, .sequence_number = ch_seq }});
         try self.cacheFlight(record_bytes, now_ms);
 
         // Still waiting for a ServerHello — just for the real one this time.
@@ -4279,7 +4246,6 @@ pub const Connection = struct {
 
         self.transcript.select(alg);
         self.transcript.append(@backingInt(messages.HandshakeType.server_hello), sh_parsed.body);
-        self.clearFlightTracker(); // the ClientHello flight is now implicitly ACKed
         self.retransmit_timer.reset();
 
         // Handshake secret: PSK path (`null` DHE) unchanged; cert-DHE path
@@ -4377,8 +4343,6 @@ pub const Connection = struct {
         // Must be sent — and appended to the transcript — BEFORE the
         // client's Finished, whose verify_data covers them.
         var cursor: usize = 0;
-        var extra_records: [2]flight.RecordNumber = undefined;
-        var extra_n: usize = 0;
 
         if (cert_result.requested_client_cert) {
             const ctx = cert_result.creq_context[0..cert_result.creq_context_len];
@@ -4389,8 +4353,6 @@ pub const Connection = struct {
                 const body = messages.encodeCertificate(ctx, cc.chain, &cert_body_buf) catch return error.BufferTooShort;
                 const r = try self.sendEpoch2Message(.certificate, body, &frag_buf, out[cursor..]);
                 cursor += r.bytes.len;
-                extra_records[extra_n] = .{ .epoch = 2, .sequence_number = r.seq };
-                extra_n += 1;
 
                 // RFC 8446 §4.2.3 negotiation: the scheme this client signs
                 // with must be one the SERVER advertised in its
@@ -4400,16 +4362,12 @@ pub const Connection = struct {
                 const scheme = try selectSignatureScheme(cc, self.config.signature_algorithms, cert_result.peerSigAlgs());
                 const cv_r = try self.signAndSendCertificateVerify(cc, scheme, .client, entropy, out[cursor..]);
                 cursor += cv_r.bytes.len;
-                extra_records[extra_n] = .{ .epoch = 2, .sequence_number = cv_r.seq };
-                extra_n += 1;
             } else {
                 // RFC 8446 §4.4.2: no suitable certificate -> an EMPTY
                 // Certificate message, no CertificateVerify.
                 const body = messages.encodeCertificate(ctx, &.{}, &cert_body_buf) catch return error.BufferTooShort;
                 const r = try self.sendEpoch2Message(.certificate, body, &frag_buf, out[cursor..]);
                 cursor += r.bytes.len;
-                extra_records[extra_n] = .{ .epoch = 2, .sequence_number = r.seq };
-                extra_n += 1;
             }
         }
 
@@ -4421,19 +4379,8 @@ pub const Connection = struct {
         var fin_frag_buf: [suitehash.max_hash_len + handshake.header_len]u8 = undefined;
         const client_fin_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.finished), self.message_seq, client_vd, &fin_frag_buf);
         self.message_seq +%= 1;
-        const client_fin_seq = self.hs2.send_seq;
         const client_fin_record = try self.protectHandshakeMessage(client_fin_fragment, out[cursor..]);
         cursor += client_fin_record.len;
-
-        var all_records: [3]flight.RecordNumber = undefined;
-        var n: usize = 0;
-        for (extra_records[0..extra_n]) |r| {
-            all_records[n] = r;
-            n += 1;
-        }
-        all_records[n] = .{ .epoch = 2, .sequence_number = client_fin_seq };
-        n += 1;
-        self.markFlightSent(all_records[0..n]);
 
         try self.installApplicationSecrets(suite, ap.client[0..alg.len()], ap.server[0..alg.len()]);
         // `now_ms` is used only on the HelloRetryRequest path above (arming
@@ -6355,7 +6302,6 @@ test "HRR server: the cookie exchange completes — and the connection that answ
     // amplification one.
     try testing.expectEqual(State.start, server1.state);
     try testing.expectEqual(@as(usize, 0), server1.last_flight_len);
-    try testing.expectEqual(@as(usize, 0), server1.pending_flight_count);
     var empty_th: Secret = undefined;
     var server1_th: Secret = undefined;
     try testing.expectEqualSlices(u8, (suitehash.Transcript{}).currentHash(.sha256, &empty_th), server1.transcript.currentHash(.sha256, &server1_th));
@@ -9584,6 +9530,9 @@ test "audit: unprotectHandshakeMessage: short ciphertext, replay, inner content 
     try testing.expectError(error.ReplayedRecord, r.unprotectHandshakeMessage(rec, &pt, null));
     try testing.expectError(error.UnexpectedMessage, r.unprotectHandshakeMessage(try auditSealInner(.aes_128_gcm_sha256, &s.hs_write_keys, 2, 7, "abc\x17", &out), &pt, null));
     try testing.expectError(error.Malformed, r.unprotectHandshakeMessage(try auditSealInner(.aes_128_gcm_sha256, &s.hs_write_keys, 2, 8, &.{ 0, 0, 0 }, &out), &pt, null));
+    // An `ack` inner type is admitted by `unprotectHandshakeRecord` only;
+    // this handshake-message-only entry point refuses it.
+    try testing.expectError(error.UnexpectedMessage, r.unprotectHandshakeMessage(try auditSealInner(.aes_128_gcm_sha256, &s.hs_write_keys, 2, 9, &.{ 0, 0, content_type_ack }, &out), &pt, null));
     r.hs2.recv_max_seq = 70000;
     r.hs2.recv_window = 1;
     s.hs2.send_seq = 70001;
@@ -9903,4 +9852,191 @@ test "audit: client HelloRetryRequest: the cookie size limit; after a 1.3 retry 
     const hvr = try messages12.encodeHelloVerifyRequest("ck", &hb);
     var dg: [128]u8 = undefined;
     try testing.expectError(error.UnexpectedMessage, dual.handleFlight(try auditPlainRecord(messages12.HandshakeType.hello_verify_request, 1, 1, hvr, &dg), rnd, 0, &buf));
+}
+
+// ── a peer's ACK in the middle of a handshake flight (RFC 9147 §7) ──────
+
+/// A well-formed ACK naming `rns`, as an epoch-0 plaintext record (`epoch2`
+/// false) or as an epoch-2 record sealed under `keys` with sequence `seq`.
+fn ackRecordForTest(epoch2: bool, keys: *const DirKeys, seq: u48, rns: []const flight.RecordNumber, out: []u8) ![]const u8 {
+    var body: [2 + 4 * flight.record_number_len + 1]u8 = undefined;
+    const ack = try flight.encodeAck(rns, &body);
+    return rawAckForTest(epoch2, keys, seq, ack, out);
+}
+
+/// `ack_body` verbatim (so a test can hand in a malformed one).
+fn rawAckForTest(epoch2: bool, keys: *const DirKeys, seq: u48, ack_body: []const u8, out: []u8) ![]const u8 {
+    if (!epoch2) {
+        const hdr = try record.encodePlaintext(.{ .content_type = content_type_ack, .epoch = 0, .sequence_number = seq, .length = @intCast(ack_body.len) }, out);
+        @memcpy(out[hdr.len..][0..ack_body.len], ack_body);
+        return out[0 .. hdr.len + ack_body.len];
+    }
+    var inner: [64]u8 = undefined;
+    @memcpy(inner[0..ack_body.len], ack_body);
+    inner[ack_body.len] = content_type_ack;
+    return auditSealInner(.aes_128_gcm_sha256, keys, 2, seq, inner[0 .. ack_body.len + 1], out);
+}
+
+const ack_peer_psk = Config{ .role = .client, .psk_identity = "ack-peer", .psk = "ack-peer-shared-key" };
+
+fn ackPair(client: *Connection, server: *Connection) !void {
+    var c = ack_peer_psk;
+    c.cipher_suites = &.{.aes_128_gcm_sha256};
+    var s = c;
+    s.role = .server;
+    client.* = try Connection.clientInit(c);
+    server.* = try Connection.serverInit(s);
+}
+
+test "handshake: ACKs between the records of the server's flight are skipped, the handshake still completes (epochs 0 and 2)" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try ackPair(&client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x31)));
+    const rnd = seededForTest(&csprng);
+    var b1: [1500]u8 = undefined;
+    var b2: [1500]u8 = undefined;
+    var dg: [3000]u8 = undefined;
+    var ab: [200]u8 = undefined;
+
+    const ch = try client.startHandshake(rnd, 0, &b1);
+    const f2 = try server.handleFlight(ch, rnd, 0, &b2);
+    // ACK epoch 0 | ServerHello (epoch 0) | EncryptedExtensions | ACK epoch 2 | Finished.
+    const sh_len = record.plaintext_header_len + (try record.decodePlaintext(f2.out)).length;
+    try testing.expect(sh_len < f2.out.len);
+    const ee_len = try recordWireLen(f2.out[sh_len..]);
+    var n: usize = 0;
+    const a0 = try ackRecordForTest(false, &server.hs_write_keys, 9, &.{.{ .epoch = 0, .sequence_number = 0 }}, &ab);
+    @memcpy(dg[n..][0..a0.len], a0);
+    n += a0.len;
+    @memcpy(dg[n..][0..sh_len], f2.out[0..sh_len]);
+    n += sh_len;
+    @memcpy(dg[n..][0..ee_len], f2.out[sh_len..][0..ee_len]);
+    n += ee_len;
+    const a2 = try ackRecordForTest(true, &server.hs_write_keys, 2, &.{.{ .epoch = 2, .sequence_number = 0 }}, &ab);
+    @memcpy(dg[n..][0..a2.len], a2);
+    n += a2.len;
+    const rest = f2.out[sh_len + ee_len ..];
+    @memcpy(dg[n..][0..rest.len], rest);
+    n += rest.len;
+
+    const cf = try client.handleFlight(dg[0..n], rnd, 0, &b1);
+    try testing.expect(cf.done);
+    const sf = try server.handleFlight(cf.out, rnd, 0, &b2);
+    try testing.expect(sf.done);
+    try testing.expectEqual(State.connected, client.state);
+    try testing.expectEqual(State.connected, server.state);
+    try testing.expectEqualSlices(u8, client.write_keys.key[0..client.write_keys.key_len], server.read_keys.key[0..server.read_keys.key_len]);
+    try testing.expectEqualSlices(u8, client.read_keys.key[0..client.read_keys.key_len], server.write_keys.key[0..server.write_keys.key_len]);
+    var wire: [128]u8 = undefined;
+    var plain: [128]u8 = undefined;
+    try testing.expectEqualStrings("up", try server.recv(try client.send("up", &wire), &plain));
+}
+
+test "handshake: an ACK ahead of the client's Finished is skipped by the server, and does not enter the ACK it owes" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try ackPair(&client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x32)));
+    const rnd = seededForTest(&csprng);
+    var b1: [1500]u8 = undefined;
+    var b2: [1500]u8 = undefined;
+    var dg: [3000]u8 = undefined;
+    var ab: [200]u8 = undefined;
+
+    const ch = try client.startHandshake(rnd, 0, &b1);
+    const f2 = try server.handleFlight(ch, rnd, 0, &b2);
+    const cf = try client.handleFlight(f2.out, rnd, 0, &b1);
+    const a2 = try ackRecordForTest(true, &client.hs_write_keys, 50, &.{ .{ .epoch = 2, .sequence_number = 0 }, .{ .epoch = 2, .sequence_number = 1 } }, &ab);
+    @memcpy(dg[0..a2.len], a2);
+    @memcpy(dg[a2.len..][0..cf.out.len], cf.out);
+    const sf = try server.handleFlight(dg[0 .. a2.len + cf.out.len], rnd, 0, &b2);
+    try testing.expect(sf.done);
+    try testing.expectEqual(State.connected, server.state);
+    // The ACK the server owes names the client's Finished only (RFC 9147
+    // §7.2: ACKs are for handshake records, never for another content type):
+    // as long as an ACK of exactly one record number.
+    const one = try ackRecordForTest(true, &server.write_keys, 3, &.{.{ .epoch = 2, .sequence_number = 1 }}, &ab);
+    try testing.expectEqual(one.len, sf.out.len);
+    var p: [64]u8 = undefined;
+    try testing.expectError(error.ReceivedAck, client.recv(sf.out, &p));
+    try testing.expectEqual(State.connected, client.state);
+}
+
+test "handshake: a malformed ACK in the middle of a flight still fails the handshake" {
+    const bad_bodies = [_][]const u8{
+        &.{0}, // shorter than the length prefix
+        &.{ 0, 8, 1, 2, 3 }, // list shorter than declared
+        &.{ 0, 7, 1, 2, 3, 4, 5, 6, 7 }, // not whole record numbers
+        &.{ 0, 0, 0xff }, // a byte after the list
+    };
+    for (bad_bodies) |bad| {
+        for ([_]bool{ false, true }) |epoch2| {
+            var client: Connection = undefined;
+            var server: Connection = undefined;
+            try ackPair(&client, &server);
+            defer client.deinit();
+            defer server.deinit();
+            var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x33)));
+            const rnd = seededForTest(&csprng);
+            var b1: [1500]u8 = undefined;
+            var b2: [1500]u8 = undefined;
+            var dg: [3000]u8 = undefined;
+            var ab: [200]u8 = undefined;
+            const ch = try client.startHandshake(rnd, 0, &b1);
+            const f2 = try server.handleFlight(ch, rnd, 0, &b2);
+            const sh_len = record.plaintext_header_len + (try record.decodePlaintext(f2.out)).length;
+            const a = try rawAckForTest(epoch2, &server.hs_write_keys, 70, bad, &ab);
+            var n: usize = 0;
+            if (!epoch2) {
+                // The epoch-0 reader meets the bad ACK before the ServerHello.
+                @memcpy(dg[n..][0..a.len], a);
+                n += a.len;
+            }
+            @memcpy(dg[n..][0..sh_len], f2.out[0..sh_len]);
+            n += sh_len;
+            if (epoch2) {
+                // The epoch-2 reader meets it before the EncryptedExtensions.
+                @memcpy(dg[n..][0..a.len], a);
+                n += a.len;
+            }
+            const rest = f2.out[sh_len..];
+            @memcpy(dg[n..][0..rest.len], rest);
+            n += rest.len;
+            try testing.expectError(error.Malformed, client.handleFlight(dg[0..n], rnd, 0, &b1));
+            try testing.expect(client.state != .connected);
+        }
+    }
+}
+
+test "handshake: an ACK record that is a replay, or a record of another content type, is refused" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try ackPair(&client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x34)));
+    const rnd = seededForTest(&csprng);
+    var b1: [1500]u8 = undefined;
+    var b2: [1500]u8 = undefined;
+    var ab: [200]u8 = undefined;
+    var dg: [3000]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &b1);
+    const f2 = try server.handleFlight(ch, rnd, 0, &b2);
+    const cf = try client.handleFlight(f2.out, rnd, 0, &b1);
+    const a2 = try ackRecordForTest(true, &client.hs_write_keys, 50, &.{}, &ab);
+    // The same ACK twice in a row: the second copy is a replay.
+    @memcpy(dg[0..a2.len], a2);
+    @memcpy(dg[a2.len..][0..a2.len], a2);
+    @memcpy(dg[2 * a2.len ..][0..cf.out.len], cf.out);
+    try testing.expectError(error.ReplayedRecord, server.handleFlight(dg[0 .. 2 * a2.len + cf.out.len], rnd, 0, &b2));
+    // An application_data inner type is neither handshake nor ack.
+    const app = try auditSealInner(.aes_128_gcm_sha256, &client.hs_write_keys, 2, 51, "x\x17", &ab);
+    @memcpy(dg[0..app.len], app);
+    @memcpy(dg[app.len..][0..cf.out.len], cf.out);
+    try testing.expectError(error.UnexpectedMessage, server.handleFlight(dg[0 .. app.len + cf.out.len], rnd, 0, &b2));
 }
