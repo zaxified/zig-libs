@@ -83,6 +83,10 @@ pub const meta = .{
     .deps = .{ "router", "http", "clock" },
 };
 
+/// W3C Baggage (`baggage` header): see `baggage.zig`.
+pub const baggage = @import("baggage.zig");
+pub const Baggage = baggage.Baggage;
+
 /// Default header names (case-insensitive on read; emitted lowercase per spec).
 pub const default_traceparent_header = "traceparent";
 pub const default_tracestate_header = "tracestate";
@@ -1619,6 +1623,7 @@ test "generated ids: exact function of the sequence and the prefix; the zero ima
 
 // See w3c_conformance_test.zig / w3c_vectors.zig / NOTICE.
 test {
+    _ = @import("baggage.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("w3c_vectors.zig");
     _ = @import("w3c_conformance_test.zig");
