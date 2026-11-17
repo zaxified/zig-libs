@@ -6,7 +6,7 @@
 
 **Scope:** core — Apache Arrow C++ / pyarrow (apache/arrow 26.0.1; arrow-rs `arrow-ipc` 60.1.0 as the closest-shaped permissive one) (surveyed 2026-11-17)
 
-**Audit:** review 2026-11-17 · mutation 2026-11-17 (297/325, 25 eq) · src a42d409fc6b16f09
+**Audit:** review 2026-11-17 · mutation 2026-11-17 (391/423, 29 eq) · src 3268ef43dafdc7ee
 
 **Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; again after the metadata / projection / Decimal32-256 / RunEndEncoded / view-type wave: 200k seeds in 24 s ReleaseSafe, clean; reach: frames, files, batches, every error kind incl. InvalidUtf8 and UnknownColumn, frames from compressed inputs, projected frames, metadata reads, frames from the custom_metadata, Decimal32, Decimal256, RunEndEncoded, BinaryView/Utf8View and ListView goldens; resource shapes the driver cannot make are in `src/hostile_test.zig`) · ct n/a — parses and writes data files, holds no secret
 
@@ -357,6 +357,28 @@ year check (decode dropped those years); `allNull` of zero rows (a bitmap exists
 consistent offsets, so `at` is null exactly when the row is not valid).
 3 unobservable: the builder's 4 GiB offset cap, a categorical of more than 2^31 distinct texts, and a Utf8
 batch past 2 GiB, each needing that many bytes in memory. No finding.
+
+**Audit 2026-11-17 (delta mutation, read gaps).** 98 schemata mutants over the non-test code the read-gap wave
+changed since the whole-module audit (metadata, projection, Decimal32/64/256, RunEndEncoded incl. the sliced
+last run end, the view types, the `field_metadata` children rule, and the review's all-null ListView charge):
+`ipc.zig` variadic counts (2), `schema.zig` metadata charges and footer budget, new type ids both ways (9),
+the writer's metadata placement (6), and in the reader `afford` and its boundary, every new plan rule (decimal
+precision per width, dictionary of views, view / list-view / run-end planning), projection (selection,
+ambiguity, repeats, node and buffer ranges, dictionary use), dictionary batches and replacement, `checkBatch`'s
+variadic counts and charges, `prepare`'s buffer reordering and projection mask, `inflate`'s skipped buffers,
+Decimal256 narrowing, run-end checks and expansion, view bounds / prefix / UTF-8 / charges, list-view bounds,
+the u32 cap and charges, and metadata copying (81). Same method as above, one ReleaseSafe build per run.
+First run 83 killed / 13 survived; new tests kill 9: metadata keys charged like values, the footer metadata's
+own budget (a file footer of 256 shared 64 KiB entries), a Utf8View dictionary read as categorical, run ends
+with a dictionary, compressed (raw-prefixed) view batches read whole and projected past broken view buffers
+(both halves of `prepare`'s mask), a views buffer and a list view's offsets short of the rows, 2^32 list-view
+elements against the u32 cap, the exact `max_cells` of a list view (`afford` at its boundary). Second run (with
+the review fix's 2 mutants) 94/98 killed.
+4 equivalent: `finishDicts` skipping an unused dictionary (it has no chunks: `takeDict` returns before
+appending, and no picked column reads it; cost-only); the Decimal256 precision check dropped or off by one (for
+precision ≤ 38 the decimal path repeats `|x| < 10^p`; past 38 a value of 10^p or more has over 38 digits, which
+the i128 cast or the 38-digit check drops the same way); the all-null ListView branch (without it `afford`
+refuses the same `total` before the selectors are allocated and `gather` charges it; cost-only). No finding.
 
 ## What is deliberately not done
 
