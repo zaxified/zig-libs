@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — Scope survey against Apache Arrow C++ / pyarrow, arrow-rs, polars, arrow-go, arrow-nanoarrow and the Zig attempts: `**Scope:** core`, `## Compared with` table, gap list under `## Backlog / deferred` (8 proposed, 10 deferred). Documentation only; NO CODE CHANGE.
 - **2026-11-17** — Module lands in the collection: catalog, Libraries and Portability tables regenerated; its NEW-MODULES entry is replaced by an `lz4` idea (LZ4_FRAME bodies read as `error.Unsupported` until then). NO CONSUMER-VISIBLE CHANGE beyond that.
 - **2026-11-17** — `lossy`: a Date64 off a day boundary is now floored to the calendar day that contains the instant (-1 ms reads as 1969-12-31), not truncated toward zero; nanosecond times still truncate toward zero.
 - **2026-11-17** — Review fixes (1 HIGH, 4 MED, 8 LOW). **Breaking:** `Error` gains `InvalidUtf8`;
