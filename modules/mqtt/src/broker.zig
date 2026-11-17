@@ -8619,6 +8619,26 @@ test "v5 CONNACK: Response Information is dropped when it would exceed the clien
     try testing.expectEqualStrings(big, ok.connack.properties.response_information.?);
 }
 
+test "v5 CONNACK: Response Information fits the client's Maximum Packet Size exactly, not one byte less" {
+    const ri = "resp/exact";
+    // The CONNACK's size with the property: the only thing the broker wrote.
+    var b0 = Broker.init(testing.allocator, .{ .response_information = ri });
+    defer b0.deinit();
+    var t0 = TestTransport{};
+    _ = try connect5(&b0, &t0, .{ .client_id = "ri", .properties = .{ .request_response_information = true } }, 0);
+    const size: u32 = @intCast(t0.len);
+    var b1 = Broker.init(testing.allocator, .{ .response_information = ri });
+    defer b1.deinit();
+    var t1 = TestTransport{};
+    const fits = try connect5(&b1, &t1, .{ .client_id = "ri", .properties = .{ .request_response_information = true, .maximum_packet_size = size } }, 0);
+    try testing.expectEqualStrings(ri, fits.connack.properties.response_information.?);
+    var b2 = Broker.init(testing.allocator, .{ .response_information = ri });
+    defer b2.deinit();
+    var t2 = TestTransport{};
+    const over = try connect5(&b2, &t2, .{ .client_id = "ri", .properties = .{ .request_response_information = true, .maximum_packet_size = size - 1 } }, 0);
+    try testing.expect(over.connack.properties.response_information == null);
+}
+
 test "v3.1.1 CONNECT never gets Response Information" {
     var b = Broker.init(testing.allocator, .{ .response_information = "resp/" });
     defer b.deinit();
