@@ -80,9 +80,9 @@
 //! resets the response to build its automatic 500, dropping what the
 //! middleware set; the server's own 400/431/414/413 replies bypass the
 //! router entirely. Those replies carry the headers only through
-//! `http.Server.Options.error_headers`, fed from `staticHeaders` — so only
-//! for a comptime `Options` (a runtime-built `SecurityHeaders` has no static
-//! list to hand over).
+//! `http.Server.Options.error_headers`, fed from `staticHeaders` for a
+//! comptime `Options` or from `SecurityHeaders.headerList` for one built at
+//! run time.
 //!
 //! Header values are emitted verbatim onto the wire: caller-supplied
 //! strings must outlive the middleware and must not contain CR/LF/NUL
@@ -626,6 +626,58 @@ pub const SecurityHeaders = struct {
             const final = list[0..list.len].*;
             return &final;
         }
+    }
+
+    /// Enough entries for `headerList` on any configuration `init` accepted:
+    /// it writes one per distinct header name, and `init` refuses more names
+    /// than `http`'s response header table holds.
+    pub const max_header_list_len = http_header_slots;
+
+    /// `staticHeaders` for a configuration built at run time: the headers
+    /// `apply` leaves on a response, in `apply`'s order, one entry per name
+    /// (an `extra` entry named like a built-in or an earlier `extra` replaces
+    /// its value in place, as `setHeader` does). Hand the result to
+    /// `http.Server.Options.error_headers` (or `h2_server.Options.error_headers`)
+    /// so the server's own 4xx/5xx answers carry the same set — like
+    /// Express's `finalhandler`, whose error replies keep the headers helmet
+    /// set, where Go's `net/http` (the unrolled/secure side) writes its own
+    /// 400/431 bare. Nothing is copied: the entries are `sh`'s configured
+    /// slices and its HSTS buffer, so `sh` must stay alive and in place while
+    /// the list is in use. `out` of `max_header_list_len` entries always
+    /// suffices; a shorter one may fail with `error.NoSpaceLeft`.
+    pub fn headerList(sh: *const SecurityHeaders, out: []http.Header) error{NoSpaceLeft}![]const http.Header {
+        const o = &sh.options;
+        var n: usize = 0;
+        if (o.hsts != null) try listPut(out, &n, "Strict-Transport-Security", sh.hstsValue());
+        if (o.content_security_policy) |v| try listPut(out, &n, "Content-Security-Policy", v);
+        if (o.content_security_policy_report_only) |v| try listPut(out, &n, "Content-Security-Policy-Report-Only", v);
+        if (o.x_content_type_options) try listPut(out, &n, "X-Content-Type-Options", "nosniff");
+        if (o.x_frame_options) |v| try listPut(out, &n, "X-Frame-Options", v);
+        if (o.referrer_policy) |v| try listPut(out, &n, "Referrer-Policy", v);
+        if (o.permissions_policy) |v| try listPut(out, &n, "Permissions-Policy", v);
+        if (o.cross_origin_opener_policy) |v| try listPut(out, &n, "Cross-Origin-Opener-Policy", v);
+        if (o.cross_origin_resource_policy) |v| try listPut(out, &n, "Cross-Origin-Resource-Policy", v);
+        if (o.cross_origin_embedder_policy) |v| try listPut(out, &n, "Cross-Origin-Embedder-Policy", v);
+        if (o.origin_agent_cluster) try listPut(out, &n, "Origin-Agent-Cluster", "?1");
+        if (o.x_dns_prefetch_control) |v| try listPut(out, &n, "X-DNS-Prefetch-Control", v);
+        if (o.x_download_options) try listPut(out, &n, "X-Download-Options", "noopen");
+        if (o.x_permitted_cross_domain_policies) |v| try listPut(out, &n, "X-Permitted-Cross-Domain-Policies", v);
+        if (o.x_xss_protection) try listPut(out, &n, "X-XSS-Protection", "0");
+        if (o.server) |v| try listPut(out, &n, "Server", v);
+        for (o.extra) |h| try listPut(out, &n, h.name, h.value);
+        return out[0..n];
+    }
+
+    /// `headerList`'s insert: replace by case-insensitive name (name and
+    /// value, as `setHeader` replaces), else append.
+    fn listPut(out: []http.Header, n: *usize, name: []const u8, value: []const u8) error{NoSpaceLeft}!void {
+        for (out[0..n.*]) |*e| if (std.ascii.eqlIgnoreCase(e.name, name)) {
+            e.* = .{ .name = name, .value = value }; // the later spelling, as `setHeader`
+            return;
+        };
+        if (n.* == out.len) return error.NoSpaceLeft;
+        out[n.*] = .{ .name = name, .value = value };
+        n.* += 1;
     }
 
     /// The exact bytes `init` would format into `hsts_buf` for `h`, built
@@ -1338,6 +1390,91 @@ test "staticHeaders: the applyStatic set reaches http.Server's own error answers
         const line = try std.mem.print(&line_buf, "\r\n{s}: {s}\r\n", .{ h.name, h.value });
         try testing.expect(std.mem.find(u8, got, line) != null);
     }
+}
+
+test "headerList: exactly the table apply leaves on a response, for every knob and an overriding extra" {
+    const all_on: Options = .{
+        .hsts = .{ .max_age_s = 63072000, .include_subdomains = true, .preload = true },
+        .content_security_policy = csp_api,
+        .content_security_policy_report_only = "default-src 'self'",
+        .permissions_policy = "camera=()",
+        .cross_origin_embedder_policy = "require-corp",
+        .server = "edge",
+        // Replaces a built-in (other spelling), adds one, then replaces that.
+        .extra = &.{
+            .{ .name = "x-frame-options", .value = "SAMEORIGIN" },
+            .{ .name = "X-Extra", .value = "1" },
+            .{ .name = "x-extra", .value = "2" },
+        },
+    };
+    const configs = [_]Options{ .{}, api_options, all_on, .{
+        .hsts = null,
+        .x_content_type_options = false,
+        .x_frame_options = null,
+        .referrer_policy = null,
+        .cross_origin_opener_policy = null,
+        .cross_origin_resource_policy = null,
+        .origin_agent_cluster = false,
+        .x_dns_prefetch_control = null,
+        .x_download_options = false,
+        .x_permitted_cross_domain_policies = null,
+        .x_xss_protection = false,
+    } };
+    for (configs) |o| {
+        const sh: SecurityHeaders = try .init(o);
+        var out_buf: [64]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [64]u8 = undefined;
+        var chunk_buf: [64]u8 = undefined;
+        var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+        try sh.apply(&rw);
+        var buf: [SecurityHeaders.max_header_list_len]http.Header = undefined;
+        const list = try sh.headerList(&buf);
+        try testing.expectEqual(rw.headers_len, list.len);
+        for (rw.headers[0..rw.headers_len], list) |want, got| {
+            try testing.expectEqualStrings(want.name, got.name);
+            try testing.expectEqualStrings(want.value, got.value);
+        }
+        // Lent, not copied: the HSTS value is `sh`'s own buffer.
+        if (o.hsts != null) try testing.expectEqual(sh.hstsValue().ptr, list[0].value.ptr);
+        // A buffer of exactly `list.len` fits; one entry less does not.
+        var exact: [SecurityHeaders.max_header_list_len]http.Header = undefined;
+        try testing.expectEqual(list.len, (try sh.headerList(exact[0..list.len])).len);
+        if (list.len > 0) try testing.expectError(error.NoSpaceLeft, sh.headerList(exact[0 .. list.len - 1]));
+    }
+}
+
+test "headerList: a runtime-built set reaches http.Server's own error answers (h1 400)" {
+    var hsts_age: u64 = 31536000;
+    hsts_age += 1; // known only at run time
+    const sh: SecurityHeaders = try .init(.{ .hsts = .{ .max_age_s = hsts_age }, .content_security_policy = csp_api });
+    var buf: [SecurityHeaders.max_header_list_len]http.Header = undefined;
+    const hs = try sh.headerList(&buf);
+    // A request http refuses itself (400: no Host) never meets middleware.
+    var in: std.Io.Reader = .fixed("GET / HTTP/1.1\r\n\r\n");
+    var out_buf: [2048]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var head_buf: [512]u8 = undefined;
+    var req_body: [64]u8 = undefined;
+    var res_body: [64]u8 = undefined;
+    var chunk: [64]u8 = undefined;
+    var trailers: [64]u8 = undefined;
+    const H = struct {
+        fn handle(_: *http.Server.Request, _: *http.Server.ResponseWriter) anyerror!void {}
+    };
+    http.Server.serveStream(.{ .handler = H.handle, .error_headers = hs }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &req_body,
+        .response_body = &res_body,
+        .chunk = &chunk,
+        .trailers = &trailers,
+    });
+    const got = out.buffered();
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 "));
+    try expectHeaderLine(got, "Strict-Transport-Security: max-age=31536001; includeSubDomains");
+    try expectHeaderLine(got, "Content-Security-Policy: " ++ csp_api);
+    try expectHeaderLine(got, "X-Frame-Options: DENY");
+    try expectHeaderLine(got, "X-XSS-Protection: 0");
 }
 
 test "legacy defaults: helmet 8.3.0 values, each knob alone disables its header, values overridable" {

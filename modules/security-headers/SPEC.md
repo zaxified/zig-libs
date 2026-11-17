@@ -33,7 +33,7 @@ Surveyed 2026-09-30, refreshed 2026-10-17 per `SURVEY-PLAYBOOK.md`; stars and ac
 | [tower-rs/tower-http](https://github.com/tower-rs/tower-http) (`SetResponseHeaderLayer`) | Rust | MIT (`tower-http/LICENSE`) | 919 | tower-http-0.7.1 (2026-08-31) | Generic set-header layers with if-not-present semantics; no security-header curation. *(inferred)* |
 | Zig ecosystem | Zig | — | — | — | No dedicated security-headers package found: httpz has only CORS as built-in middleware (README); Zig `std` has none. A Zig user hand-writes `setHeader` calls. *(searched README/docs; no repository found)* |
 
-**Where we are ahead:** secure defaults ahead of helmet's (`X-Frame-Options: DENY`, COOP/CORP `same-origin`), a `csp_api` deny-everything posture for JSON APIs next to helmet's own default, a comptime `applyStatic` that compiles to slot writes, precomputed immutable headers with no allocation or lock on the hot path, and header values byte-anchored to RFC 7034/6797 and OWASP examples; the only such module in Zig. Closed value sets checked at `init` and at compile time (`InvalidPolicyValue`, helmet 8.3.0's sets plus COOP/COEP report-to parameters, 2026-11-05). **Where we are behind:** no request-time directive callbacks (the nonce is an explicit call, `applyCspNonce`, not a function in the policy), no CSP hash helper, no SSL redirect / host allow-list (not response headers), and the 500/431/414/413 replies `http.Server` builds itself carry no security headers.
+**Where we are ahead:** secure defaults ahead of helmet's (`X-Frame-Options: DENY`, COOP/CORP `same-origin`), a `csp_api` deny-everything posture for JSON APIs next to helmet's own default, a comptime `applyStatic` that compiles to slot writes, precomputed immutable headers with no allocation or lock on the hot path, and header values byte-anchored to RFC 7034/6797 and OWASP examples; the only such module in Zig. Closed value sets checked at `init` and at compile time (`InvalidPolicyValue`, helmet 8.3.0's sets plus COOP/COEP report-to parameters, 2026-11-05). **Where we are behind:** no request-time directive callbacks (the nonce is an explicit call, `applyCspNonce`, not a function in the policy), no CSP hash helper, no SSL redirect / host allow-list (not response headers), and the 500/431/414/413 replies `http.Server` builds itself carry the headers only when they are handed to `error_headers` (`staticHeaders` at compile time, `headerList` at run time) — Express's `finalhandler` keeps helmet's headers on its error replies on its own.
 
 ## Design & invariants
 
@@ -81,8 +81,8 @@ Surveyed 2026-09-30, refreshed 2026-10-17 per `SURVEY-PLAYBOOK.md`; stars and ac
 Not a WAF or input validator: it only sets response headers, it never inspects or blocks requests.
 Error replies: when a handler *errors*, `http.Server` resets the response to build its own automatic
 500, and the server's own 400/431/414/413 replies bypass the router; both carry this module's headers
-only through `http.Server.Options.error_headers` fed from `staticHeaders` (a comptime `Options`). A
-runtime-built `SecurityHeaders` still leaves them bare.
+only through `http.Server.Options.error_headers`, fed from `staticHeaders` (a comptime `Options`) or
+`SecurityHeaders.headerList` (a runtime-built one, 2026-11-17).
 HSTS is meaningful only over HTTPS — browsers ignore it over plain HTTP, so shipping it is harmless
 there, but deploying it on a host not actually served via TLS is a caller misconfiguration this
 module cannot detect (and once cached, browsers refuse plain-HTTP access for `max-age`, so `preload`
@@ -166,9 +166,21 @@ enabled; rerun: 26 killed. No defect found.
 - **Delta audit 2026-10-29 (no-panic sweep § GJ):** 6 mutants (old CR/LF/NUL predicate, slot check dropped, built-in and repeated-extra dedupe dropped, CSP copied instead of lent, every built-in counted): 6/6 killed on the first run; the RID-1 test gained a CSP-only case first, because the default set alone freed enough room to hide a copied CSP. Unfiltered ReleaseSafe suite.
 - **No-panic sweep 2026-10-29 (§ GJ):** (a) `init`'s byte check still counts the lent values, so it is now conservative: a CSP larger than the 4 KiB copy budget would work on the wire but is refused. **Decided: stays strict (owner delegated 10-29, safe default)** — a documented opt-out only if a consumer ever needs a > 4 KiB CSP. (b) SH-3 (LOW): `csp` `renderImpl` duplicate scans are O(directives × names) over caller lists, uncapped (≤ 26 names make longer lists useless).
 
-- **Headers on server-generated error replies for a RUNTIME config** *(survey 2026-09-30; comptime
-  path done via `http.Server.Options.error_headers` + `staticHeaders`)* — a `SecurityHeaders` built at
-  run time has no static list to feed `error_headers`. Effort: small (a runtime list in `http`).
+- **DONE 2026-11-17 — headers on server-generated error replies for a RUNTIME config** *(survey
+  2026-09-30; comptime path via `http.Server.Options.error_headers` + `staticHeaders`)* —
+  `SecurityHeaders.headerList(out)` writes the set `apply` leaves on a response (its order, one entry
+  per name, an overriding `extra` replacing in place) into a caller array of `max_header_list_len`,
+  lending `sh`'s slices; the result feeds `error_headers` of `http.Server` / `h2_server`. `http` needed
+  no change: `error_headers` was already a run-time slice. Reference behaviour: Express's
+  `finalhandler` (the error path helmet's users get) keeps every header middleware set and only
+  overrides CSP/nosniff and the content headers (`pillarjs/finalhandler` `send`, read 2026-11-17);
+  Go's `net/http` writes its own 400/431 bare, so unrolled/secure users get none there. We follow the
+  reference. Not changed: `staticHeaders` still lists an `extra` that repeats a built-in name as a
+  second entry (two lines on an error reply; `applyStatic` replaces) — see the next item.
+- **`staticHeaders` repeats a name `extra` overrides** *(found 2026-11-17, LOW)* — `applyStatic`
+  replaces by name, but the list `staticHeaders` hands to `error_headers` keeps both entries, so the
+  server's own error replies carry e.g. `X-Frame-Options` twice. Fix: dedupe at comptime like
+  `headerList`. Not done here: a change of the comptime list's shape, outside the 2026-11-17 brief.
 - **DONE 2026-11-17 — a replaced header spends the budget twice** *(review 2026-10-24)* — `http`'s
   `putHeader` now rewrites a replaced header's own copy when the new value fits there or the copy is
   the last one in the store (and no other entry borrows its bytes), so a nonce policy rendered again

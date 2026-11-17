@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **FEATURE:** `SecurityHeaders.headerList(out) error{NoSpaceLeft}![]const http.Header` and `SecurityHeaders.max_header_list_len`: the header set `apply` leaves on a response, for a configuration built at run time, ready for `http.Server.Options.error_headers` (and `h2_server`'s), so the server's own 4xx/5xx answers carry it as they already could with `staticHeaders` for a comptime one. Nothing copied (`sh` must stay alive and in place). Additive.
 - **2026-11-17** — **Behaviour change:** `applyCspNonce` / `applyCspWithNonce` set over an earlier rendered policy no longer spends `http`'s header budget twice — `http` now rewrites a replaced header in place when it fits — so a large nonce policy rendered twice on one response (a middleware, then the handler) fits where it failed with `HeaderBytesExhausted`. The budget caveat on `applyCspWithNonce` is replaced by that description. Test only otherwise.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-07** — **FIX (LOW, hardening):** `renderNonce` refuses a nonce whose text leaves the CSP `base64-value` alphabet (`A-Z a-z 0-9 + / - _ =`) with `error.InvalidCharacter`. `Nonce.text` is a public field, so a hand-built nonce holding `;` or a space used to reach the header verbatim and inject a directive; `Nonce.fromBytes`/`secure` output is unaffected. Found by the whole-module mutation run.
