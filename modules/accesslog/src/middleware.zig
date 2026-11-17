@@ -76,6 +76,12 @@ pub const Logger = struct {
     /// the writer and read as absent. Names must follow the `Field` key
     /// grammar. Empty (the default) captures nothing.
     response_headers: []const []const u8 = &.{},
+    /// Names of request headers to capture for `%{Name}i` (at most
+    /// `max_request_headers`; the rest are ignored), looked up with
+    /// `Request.header` (case-insensitive, first occurrence). `Referer` and
+    /// `User-Agent` are always available and need not be listed. Names must
+    /// follow the `Field` key grammar. Empty (the default) captures nothing.
+    request_headers: []const []const u8 = &.{},
     /// Minutes east of UTC for a template's `%{format}t` (`Entry.utc_offset_min`).
     utc_offset_min: i16 = 0,
 
@@ -106,6 +112,9 @@ pub const Logger = struct {
     /// Most headers `response_headers` captures.
     pub const max_response_headers = 8;
 
+    /// Most headers `request_headers` captures.
+    pub const max_request_headers = 8;
+
     pub fn middleware(l: *const Logger) router.Middleware {
         return .{ .state = @constCast(l), .run = run };
     }
@@ -129,6 +138,15 @@ pub const Logger = struct {
                 rh_n += 1;
             }
         }
+        var qh_buf: [max_request_headers]root.Field = undefined;
+        var qh_n: usize = 0;
+        for (l.request_headers) |name| {
+            if (qh_n == max_request_headers) break;
+            if (ctx.req.header(name)) |v| {
+                qh_buf[qh_n] = .{ .key = name, .value = v };
+                qh_n += 1;
+            }
+        }
         var entry = root.entryFromRequest(ctx.req, ctx.res, &addr_buf, .{
             .timestamp_ns = start,
             .time_formatted = if (l.time_format) |f| f(start, &time_buf) else null,
@@ -141,6 +159,7 @@ pub const Logger = struct {
             .user = if (l.user) |f| f(ctx) else null,
             .extra = if (l.extra_fn) |f| f(ctx, &extra_buf) else &.{},
             .response_headers = rh_buf[0..rh_n],
+            .request_headers = qh_buf[0..qh_n],
         });
         entry.utc_offset_min = l.utc_offset_min;
         if (std.meta.isError(result) and !ctx.res.sent_head) {
@@ -291,6 +310,38 @@ test "Logger: response_headers feed %{Name}o of a Sink template" {
     var buf: [1024]u8 = undefined;
     _ = runWire(&r, get_req, &buf);
     try testing.expectEqualStrings("200 \"text/plain\" \"a\\\"b\" \"-\" \"-\"\n", sw.buffered());
+}
+
+test "Logger: request_headers feed %{Name}i of a Sink template (any header, cap, absent = -)" {
+    var clock: FakeClock = .{ .t = 1000, .step = 10 };
+    var sink_buf: [1024]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(&sink_buf);
+    const tpl = comptime root.LogFormat.comptimeParse("\"%{x-req}i\" \"%{Host}i\" \"%{X-Nope}i\" \"%{Connection}i\" \"%{User-Agent}i\"");
+    var sink = root.Sink.init(&sw, .{ .template = &tpl });
+    var logger: Logger = .{
+        .sink = &sink,
+        .clock = .{ .context = &clock, .now_ns = FakeClock.now },
+        .request_headers = &.{ "X-Req", "host", "X-Nope" },
+    };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(logger.middleware());
+    try r.get("/items/:id", hOk);
+    var buf: [1024]u8 = undefined;
+    _ = runWire(&r, get_req, &buf);
+    // Connection was not listed: "-". User-Agent needs no listing.
+    try testing.expectEqualStrings("\"r-1\" \"t\" \"-\" \"-\" \"probe\"\n", sw.buffered());
+
+    // Only the first max_request_headers PRESENT headers are captured: Host is the ninth.
+    var sw2: std.Io.Writer = .fixed(&sink_buf);
+    const tpl2 = comptime root.LogFormat.comptimeParse("%{X1}i %{X8}i %{Host}i");
+    var sink2 = root.Sink.init(&sw2, .{ .template = &tpl2 });
+    const names = [_][]const u8{ "X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8", "Host" };
+    logger.sink = &sink2;
+    logger.request_headers = &names;
+    const many_req = "GET /items/7 HTTP/1.1\r\nX1: 1\r\nX2: 2\r\nX3: 3\r\nX4: 4\r\nX5: 5\r\nX6: 6\r\nX7: 7\r\nX8: 8\r\nHost: t\r\nConnection: close\r\n\r\n";
+    _ = runWire(&r, many_req, &buf);
+    try testing.expectEqualStrings("1 8 -\n", sw2.buffered());
 }
 
 test "Logger: a handler error is re-raised to the server (500) and logged as 500" {

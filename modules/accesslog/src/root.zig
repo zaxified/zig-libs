@@ -167,6 +167,13 @@ pub const Entry = struct {
     /// `Field` key grammar to be found by a template. Empty = `-`.
     /// `Logger.response_headers` fills it from the router's response.
     response_headers: []const Field = &.{},
+    /// Request headers for `LogFormat`'s `%{Name}i` (Apache), other than
+    /// `Referer` and `User-Agent` (those have their own fields): `key` is the
+    /// header name, matched case-insensitively, first match wins. Not written
+    /// by JSON Lines, logfmt or Combined. Names must follow the `Field` key
+    /// grammar to be found by a template. Empty = `-`.
+    /// `Logger.request_headers` fills it from the request.
+    request_headers: []const Field = &.{},
     /// Minutes east of UTC for `LogFormat`'s `%{format}t` wall clock and
     /// `%z` (`timestamp_ns` itself is always UTC). 0 (default) = UTC; values
     /// beyond +-23:59 are clamped. Used by nothing else.
@@ -663,6 +670,8 @@ pub const FromRequestOptions = struct {
     extra: []const Field = &.{},
     /// Response headers, borrowed. See `Entry.response_headers`.
     response_headers: []const Field = &.{},
+    /// Request headers, borrowed. See `Entry.request_headers`.
+    request_headers: []const Field = &.{},
 };
 
 /// Build an `Entry` from a served request + its response writer, pulling
@@ -702,6 +711,7 @@ pub fn entryFromRequest(
         .user = opts.user,
         .extra = opts.extra,
         .response_headers = opts.response_headers,
+        .request_headers = opts.request_headers,
     };
     if (req.peerAddress()) |p| {
         var w: std.Io.Writer = .fixed(addr_buf);
