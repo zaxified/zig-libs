@@ -712,6 +712,19 @@ pub const Options = struct {
     /// doc's "Request-fingerprint mismatch" note. Default
     /// `default_max_body_bytes` (16 KiB).
     max_body_bytes: usize = default_max_body_bytes,
+    /// Opt-in: fingerprint bodies larger than `max_body_bytes`. Null (the
+    /// default) keeps the behaviour above unchanged. Set, the first
+    /// `max_body_bytes` stay in memory and the rest goes to a spool this
+    /// source opens per request (`http.Server.FileSpool` over a caller-opened
+    /// temp file is the ready one); the body is hashed while it is buffered,
+    /// and the handler reads it back from the start
+    /// (`http.Server.RewindableBody`). A spool failure is a server error
+    /// (never the 413) and reserves nothing. The spool's storage holds the
+    /// request body: it is the caller's security boundary.
+    spool: ?http.Server.SpoolSource = null,
+    /// With `spool` set: cap on the whole body (413 above it). Null = only
+    /// the server's own body cap.
+    max_spooled_body_bytes: ?u64 = null,
     /// Who the caller is, for keeping records apart: each caller gets its own
     /// key namespace (A1 F1). Return the credential or identity the request
     /// authenticated with -- the `Authorization` value, an account id; it is
@@ -792,31 +805,58 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     // fails with `StreamTooLong` on the next one (0.16 failed at `n`, which
     // is why this used to probe at `max_body_bytes + 1`) -- exactly the
     // documented boundary. `maxInt` means unlimited (`n + 1` would overflow).
-    const probe_cap: std.Io.Limit = if (idem.options.max_body_bytes == std.math.maxInt(usize))
-        .unlimited
-    else
-        .limited(idem.options.max_body_bytes);
-    const body_bytes = ctx.req.reader().allocRemaining(idem.store.alloc(), probe_cap) catch |err| switch (err) {
-        error.StreamTooLong => return payloadTooLarge(ctx),
-        else => |e| return e,
-    };
-    defer {
-        // The caller's payload, on a heap the next request draws from (A1 F4).
-        std.crypto.secureZero(u8, body_bytes);
-        idem.store.alloc().free(body_bytes);
-    }
-    const digest = fingerprint(body_bytes, ctx.req.query);
-
-    // We just drained the body ourselves — re-expose the buffered bytes to
-    // the handler transparently via the `decoded` override seam (the same
-    // one inbound gzip decoding uses), so a handler that reads the body
-    // still sees it. Restored (not just nulled) on return, in case an outer
-    // caller relies on whatever was there before us (e.g. a decompressed
-    // stream from server-level gzip handling).
-    var body_reader: std.Io.Reader = .fixed(body_bytes);
     const prev_decoded = ctx.req.decoded;
-    ctx.req.decoded = &body_reader;
     defer ctx.req.decoded = prev_decoded;
+    // Opt-in large bodies (`Options.spool`): a re-readable body hashed in the
+    // same pass; the default path below is unchanged.
+    var spooled: http.Server.RewindableBody = undefined;
+    var spooled_live = false;
+    defer if (spooled_live) spooled.deinit();
+    var body_owned: ?[]u8 = null;
+    defer if (body_owned) |b| {
+        // The caller's payload, on a heap the next request draws from (A1 F4).
+        std.crypto.secureZero(u8, b);
+        idem.store.alloc().free(b);
+    };
+    var body_reader: std.Io.Reader = undefined;
+    const digest = if (idem.options.spool) |source| blk: {
+        var hasher: BodyHasher = .{};
+        const tap: http.Server.RequestBodyTap = .{ .ctx = &hasher, .observe = BodyHasher.observe };
+        spooled.init(idem.store.alloc(), .{
+            .memory_limit = idem.options.max_body_bytes,
+            .max_total = idem.options.max_spooled_body_bytes,
+            .spool = source,
+            .tap = &tap,
+        });
+        spooled_live = true;
+        spooled.fill(ctx.req.reader()) catch |err| switch (err) {
+            error.BodyTooLarge => return payloadTooLarge(ctx),
+            else => |e| return e,
+        };
+        var body_digest: [digest_len]u8 = undefined;
+        hasher.h.final(&body_digest);
+        _ = spooled.install(ctx.req);
+        break :blk fingerprintDigest(body_digest, ctx.req.query);
+    } else blk: {
+        const probe_cap: std.Io.Limit = if (idem.options.max_body_bytes == std.math.maxInt(usize))
+            .unlimited
+        else
+            .limited(idem.options.max_body_bytes);
+        const body_bytes = ctx.req.reader().allocRemaining(idem.store.alloc(), probe_cap) catch |err| switch (err) {
+            error.StreamTooLong => return payloadTooLarge(ctx),
+            else => |e| return e,
+        };
+        body_owned = body_bytes;
+        // We just drained the body ourselves — re-expose the buffered bytes to
+        // the handler transparently via the `decoded` override seam (the same
+        // one inbound gzip decoding uses), so a handler that reads the body
+        // still sees it. Restored (not just nulled) on return, in case an outer
+        // caller relies on whatever was there before us (e.g. a decompressed
+        // stream from server-level gzip handling).
+        body_reader = .fixed(body_bytes);
+        ctx.req.decoded = &body_reader;
+        break :blk fingerprint(body_bytes, ctx.req.query);
+    };
 
     // One atomic step: replay a completed response, flag a body-fingerprint
     // mismatch, reject a concurrent in-flight duplicate (409), or reserve
@@ -982,14 +1022,31 @@ fn refuseCapture(store: *Store) void {
 fn fingerprint(body: []const u8, query: []const u8) [digest_len]u8 {
     var digest: [digest_len]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
-    if (query.len == 0) return digest;
+    return fingerprintDigest(digest, query);
+}
+
+/// `fingerprint` from the body's own SHA-256 (the spooled path hashes the
+/// body incrementally; SHA-256 over chunks equals the one-shot hash, so a
+/// record stored by either path matches the other).
+fn fingerprintDigest(body_digest: [digest_len]u8, query: []const u8) [digest_len]u8 {
+    if (query.len == 0) return body_digest;
+    var digest: [digest_len]u8 = undefined;
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update(&digest);
+    h.update(&body_digest);
     h.update(&.{0x01});
     h.update(query);
     h.final(&digest);
     return digest;
 }
+
+/// The spooled path's `RequestBodyTap`: SHA-256 over every body byte.
+const BodyHasher = struct {
+    h: std.crypto.hash.sha2.Sha256 = .init(.{}),
+    fn observe(ctx: *anyopaque, bytes: []const u8) void {
+        const s: *BodyHasher = @ptrCast(@alignCast(ctx));
+        s.h.update(bytes);
+    }
+};
 
 fn methodGuarded(methods: []const http.Method, m: http.Method) bool {
     for (methods) |g| {
@@ -3990,4 +4047,194 @@ test "Options.header_name and replay_header name the header read for the key and
     _ = runWire(&r, reqKey("POST", "/orders", "k2"), &b3);
     _ = runWire(&r, reqKey("POST", "/orders", "k2"), &b3);
     try testing.expectEqual(@as(u32, 3), app.calls);
+}
+
+// ── Options.spool: fingerprinting bodies past max_body_bytes ────────────────
+
+/// In-memory spool for the `Options.spool` tests, with failure switches.
+const TestSpool = struct {
+    gpa: std.mem.Allocator,
+    data: std.ArrayList(u8) = .empty,
+    fail_open: bool = false,
+    fail_append: bool = false,
+    opens: u32 = 0,
+
+    fn source(ts: *TestSpool) http.Server.SpoolSource {
+        return .{ .ctx = ts, .open = open };
+    }
+    fn open(ctx: ?*anyopaque) error{ SpoolOpenFailed, OutOfMemory }!http.Server.BodySpool {
+        const ts: *TestSpool = @ptrCast(@alignCast(ctx.?));
+        if (ts.fail_open) return error.SpoolOpenFailed;
+        ts.opens += 1;
+        ts.data.clearRetainingCapacity();
+        return .{ .ctx = ts, .vtable = &vt };
+    }
+    const vt: http.Server.BodySpool.VTable = .{ .append = append, .readAt = readAt, .deinit = release };
+    fn append(ctx: *anyopaque, bytes: []const u8) error{SpoolWriteFailed}!void {
+        const ts: *TestSpool = @ptrCast(@alignCast(ctx));
+        if (ts.fail_append) return error.SpoolWriteFailed;
+        ts.data.appendSlice(ts.gpa, bytes) catch return error.SpoolWriteFailed;
+    }
+    fn readAt(ctx: *anyopaque, offset: u64, buf: []u8) error{SpoolReadFailed}!usize {
+        const ts: *TestSpool = @ptrCast(@alignCast(ctx));
+        if (offset >= ts.data.items.len) return 0;
+        const o: usize = @intCast(offset);
+        const n = @min(buf.len, ts.data.items.len - o);
+        @memcpy(buf[0..n], ts.data.items[o..][0..n]);
+        return n;
+    }
+    fn release(ctx: *anyopaque) void {
+        const ts: *TestSpool = @ptrCast(@alignCast(ctx));
+        @memset(ts.data.items, 0);
+        ts.data.clearRetainingCapacity();
+    }
+    fn deinit(ts: *TestSpool) void {
+        ts.data.deinit(ts.gpa);
+    }
+};
+
+/// Reads the whole body and answers `<len> <sha256 hex>`.
+fn hBodyEcho(ctx: *router.Ctx) anyerror!void {
+    const app: *RawApp = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    const body = try ctx.req.reader().allocRemaining(testing.allocator, .unlimited);
+    defer testing.allocator.free(body);
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &d, .{});
+    var out: [128]u8 = undefined;
+    try ctx.res.writeAll(try std.fmt.bufPrint(&out, "{d} {x}", .{ body.len, d }));
+}
+
+fn bigRequest(gpa: std.mem.Allocator, key: []const u8, body: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "POST /up HTTP/1.1\r\nHost: t\r\nIdempotency-Key: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ key, body.len, body });
+}
+
+fn bigBody(buf: []u8, seed: u8) []u8 {
+    for (buf, 0..) |*b, i| b.* = 'a' + @as(u8, @truncate((i *% 7 +% seed) % 26));
+    return buf;
+}
+
+test "spool: a body past max_body_bytes is fingerprinted; the handler reads it whole; replay and 422 work" {
+    var ts: TestSpool = .{ .gpa = testing.allocator };
+    defer ts.deinit();
+    var f: MiniFixture = undefined;
+    try f.init(testing.allocator, "/up", hBodyEcho, .{ .spool = ts.source() });
+    defer f.deinit();
+    var body_a: [50_000]u8 = undefined;
+    var body_b: [50_000]u8 = undefined;
+    _ = bigBody(&body_a, 1);
+    _ = bigBody(&body_b, 2);
+    var want: [128]u8 = undefined;
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&body_a, &d, .{});
+    const want_body = try std.fmt.bufPrint(&want, "{d} {x}", .{ body_a.len, d });
+
+    var b: [4096]u8 = undefined;
+    const r1 = try bigRequest(testing.allocator, "big-1", &body_a);
+    defer testing.allocator.free(r1);
+    const first = runWire(&f.r, r1, &b);
+    try testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 200"));
+    try testing.expectEqualStrings(want_body, bodyOf(first));
+    try testing.expectEqual(@as(u32, 1), ts.opens);
+
+    const second = runWire(&f.r, r1, &b);
+    try testing.expect(std.mem.startsWith(u8, second, "HTTP/1.1 200"));
+    try testing.expectEqualStrings("true", headerValue(second, "Idempotent-Replayed").?);
+    try testing.expectEqualStrings(want_body, bodyOf(second));
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+
+    const r3 = try bigRequest(testing.allocator, "big-1", &body_b);
+    defer testing.allocator.free(r3);
+    const third = runWire(&f.r, r3, &b);
+    try testing.expect(std.mem.startsWith(u8, third, "HTTP/1.1 422"));
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+}
+
+test "spool: a small body never opens the spool and gets the same fingerprint as the default path" {
+    var ts: TestSpool = .{ .gpa = testing.allocator };
+    defer ts.deinit();
+    var f: MiniFixture = undefined;
+    try f.init(testing.allocator, "/up", hBodyEcho, .{ .spool = ts.source() });
+    defer f.deinit();
+    var b: [4096]u8 = undefined;
+    const got = runWire(&f.r, reqKeyBody("POST", "/up", "small-1", "hello"), &b);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expectEqual(@as(u32, 0), ts.opens);
+    // Incremental and one-shot fingerprints agree, with and without a query.
+    var d: [digest_len]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("hello", &d, .{});
+    try testing.expectEqualSlices(u8, &fingerprint("hello", ""), &fingerprintDigest(d, ""));
+    try testing.expectEqualSlices(u8, &fingerprint("hello", "a=1"), &fingerprintDigest(d, "a=1"));
+}
+
+test "spool: max_spooled_body_bytes answers 413 one byte over, handler not run" {
+    var ts: TestSpool = .{ .gpa = testing.allocator };
+    defer ts.deinit();
+    var f: MiniFixture = undefined;
+    try f.init(testing.allocator, "/up", hBodyEcho, .{ .spool = ts.source(), .max_spooled_body_bytes = 30_000 });
+    defer f.deinit();
+    var body: [30_001]u8 = undefined;
+    _ = bigBody(&body, 3);
+    var b: [4096]u8 = undefined;
+    const at = try bigRequest(testing.allocator, "cap-1", body[0..30_000]);
+    defer testing.allocator.free(at);
+    try testing.expect(std.mem.startsWith(u8, runWire(&f.r, at, &b), "HTTP/1.1 200"));
+    const over = try bigRequest(testing.allocator, "cap-2", &body);
+    defer testing.allocator.free(over);
+    try testing.expect(std.mem.startsWith(u8, runWire(&f.r, over, &b), "HTTP/1.1 413"));
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+}
+
+test "spool: a failing spool is a server error, never 413, and reserves nothing" {
+    var ts: TestSpool = .{ .gpa = testing.allocator };
+    defer ts.deinit();
+    var f: MiniFixture = undefined;
+    try f.init(testing.allocator, "/up", hBodyEcho, .{ .spool = ts.source() });
+    defer f.deinit();
+    var body: [40_000]u8 = undefined;
+    _ = bigBody(&body, 4);
+    const req = try bigRequest(testing.allocator, "fail-1", &body);
+    defer testing.allocator.free(req);
+    var b: [4096]u8 = undefined;
+    inline for (.{ "open", "append" }) |which| {
+        ts.fail_open = std.mem.eql(u8, which, "open");
+        ts.fail_append = std.mem.eql(u8, which, "append");
+        const got = runWire(&f.r, req, &b);
+        try testing.expect(!std.mem.startsWith(u8, got, "HTTP/1.1 413"));
+        try testing.expect(!std.mem.startsWith(u8, got, "HTTP/1.1 2"));
+        try testing.expectEqual(@as(u32, 0), f.app.calls);
+    }
+    ts.fail_open = false;
+    ts.fail_append = false;
+    // Nothing stayed reserved: the same key with a working spool runs.
+    try testing.expect(std.mem.startsWith(u8, runWire(&f.r, req, &b), "HTTP/1.1 200"));
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+}
+
+test "spool: FileSpool over a temp file end to end" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "body.spool", .{ .read = true, .truncate = true });
+    defer file.close(io);
+    var fs = http.Server.FileSpool.init(io, file);
+    const Src = struct {
+        fn open(ctx: ?*anyopaque) error{ SpoolOpenFailed, OutOfMemory }!http.Server.BodySpool {
+            const s: *http.Server.FileSpool = @ptrCast(@alignCast(ctx.?));
+            return s.spool();
+        }
+    };
+    var f: MiniFixture = undefined;
+    try f.init(testing.allocator, "/up", hBodyEcho, .{ .spool = .{ .ctx = &fs, .open = Src.open } });
+    defer f.deinit();
+    var body: [60_000]u8 = undefined;
+    _ = bigBody(&body, 5);
+    const req = try bigRequest(testing.allocator, "file-1", &body);
+    defer testing.allocator.free(req);
+    var b: [4096]u8 = undefined;
+    const got = runWire(&f.r, req, &b);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.startsWith(u8, bodyOf(got), "60000 "));
+    // The spool was released after the request: the file is truncated.
+    try testing.expectEqual(@as(u64, 0), try file.length(io));
 }
