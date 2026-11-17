@@ -234,7 +234,19 @@ pub const ConfigError = error{
     /// suites in `.psk` mode, ECDHE_ECDSA/ECDHE_RSA in the certificate
     /// modes), or holds a value it does not wire at all.
     NoCipherSuites12,
+    /// `Config.max_datagram_len` is non-zero but below
+    /// `min_max_datagram_len`: too small to carry a record header, a
+    /// handshake header, the AEAD overhead and a useful fragment.
+    MaxDatagramLenTooSmall,
 };
+
+/// The smallest non-zero `Config.max_datagram_len`: a 13-byte record
+/// header, the 12-byte handshake header, the largest 1.2 AEAD overhead (24
+/// bytes, GCM's explicit nonce + tag) and room for a fragment that is not
+/// mostly framing. OpenSSL refuses link MTUs under 256 (228 bytes of UDP
+/// payload); wolfSSL and pion set no floor. 128 keeps every fragment at
+/// least 79 bytes of message.
+pub const min_max_datagram_len: u16 = 128;
 
 /// Server-side HelloRetryRequest / stateless-cookie configuration — RFC 9147
 /// §5.1's return-routability check (the mechanism is RFC 8446 §4.1.4's
@@ -526,6 +538,20 @@ pub const Config = struct {
     /// ServerKeyExchange. Empty = no hint (and, for plain PSK, no
     /// ServerKeyExchange at all).
     psk_identity_hint: []const u8 = &.{},
+    /// DTLS 1.2 only: the largest datagram this side emits (the path MTU
+    /// minus the IP and UDP headers). Non-zero makes `Connection12` split
+    /// every handshake message whose record would be larger into RFC 6347
+    /// §4.2.3 fragments, so no record exceeds it; the records of one
+    /// `handleFlight` / `poll` result are then meant to go out as several
+    /// datagrams, which `record.nextDatagram` cuts from the returned bytes.
+    /// 0 (the default) keeps one record per message and leaves datagram
+    /// sizing to the caller — the behaviour before this field existed.
+    /// pion/dtls defaults to 1200, wolfSSL and OpenSSL take the socket's MTU
+    /// (about 1400 / 1472 on Ethernet), mbedTLS defaults to 0 like this one:
+    /// a non-zero default would oblige every caller to split. The 1.3
+    /// engine does not fragment on send yet and ignores this field (SPEC
+    /// Backlog). Values below `min_max_datagram_len` are a config error.
+    max_datagram_len: u16 = 0,
 
     pub fn allows(self: Config, v: ProtocolVersion) bool {
         return std.mem.indexOfScalar(ProtocolVersion, self.versions, v) != null;
@@ -548,6 +574,7 @@ pub const Config = struct {
             }
             if (!usable) return error.NoCipherSuites12;
         }
+        if (self.max_datagram_len != 0 and self.max_datagram_len < min_max_datagram_len) return error.MaxDatagramLenTooSmall;
         if (self.cipher_suites.len == 0) return error.NoCipherSuites;
         // A suite with no `suiteParams` entry cannot have keys installed, so
         // offering it is a config error, not a negotiation outcome. Rejecting

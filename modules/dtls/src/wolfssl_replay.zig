@@ -103,21 +103,21 @@ const recorded_cases_floor = 18;
 // lowercase, an empty value is an empty byte string. The generated file
 // documents it in its own header; this is the reader.
 
-fn opName(line: []const u8) []const u8 {
+pub fn opName(line: []const u8) []const u8 {
     const end = std.mem.findScalar(u8, line, ' ') orelse line.len;
     return line[0..end];
 }
 
 /// The rest of the line after the op name, untrimmed of inner spaces — for the
 /// two ops whose argument is prose (`case`, `why`).
-fn opRest(line: []const u8) []const u8 {
+pub fn opRest(line: []const u8) []const u8 {
     const sp = std.mem.findScalar(u8, line, ' ') orelse return "";
     return std.mem.trim(u8, line[sp + 1 ..], " ");
 }
 
 /// The value of `key=` on this line, or null when the key is absent. An empty
 /// value (`out=`) returns an empty slice, which is a different answer.
-fn arg(line: []const u8, key: []const u8) ?[]const u8 {
+pub fn arg(line: []const u8, key: []const u8) ?[]const u8 {
     var it = std.mem.tokenizeScalar(u8, line, ' ');
     _ = it.next(); // the op
     while (it.next()) |tok| {
@@ -129,7 +129,7 @@ fn arg(line: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
-fn hexArg(gpa: std.mem.Allocator, line: []const u8, key: []const u8) ![]u8 {
+pub fn hexArg(gpa: std.mem.Allocator, line: []const u8, key: []const u8) ![]u8 {
     const text = arg(line, key) orelse return error.MissingArgument;
     if (text.len % 2 != 0) return error.OddHexLength;
     const out = try gpa.alloc(u8, text.len / 2);
@@ -138,17 +138,17 @@ fn hexArg(gpa: std.mem.Allocator, line: []const u8, key: []const u8) ![]u8 {
     return out;
 }
 
-fn numArg(comptime T: type, line: []const u8, key: []const u8) !T {
+pub fn numArg(comptime T: type, line: []const u8, key: []const u8) !T {
     const text = arg(line, key) orelse return error.MissingArgument;
     return std.fmt.parseInt(T, text, 10);
 }
 
-fn hex4Arg(line: []const u8, key: []const u8) !u16 {
+pub fn hex4Arg(line: []const u8, key: []const u8) !u16 {
     const text = arg(line, key) orelse return error.MissingArgument;
     return std.fmt.parseInt(u16, text, 16);
 }
 
-fn boolArg(line: []const u8, key: []const u8) !bool {
+pub fn boolArg(line: []const u8, key: []const u8) !bool {
     return (try numArg(u8, line, key)) != 0;
 }
 

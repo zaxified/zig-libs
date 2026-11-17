@@ -28,17 +28,24 @@
 //! AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305, PSK with AES-128-GCM and
 //! ECDHE_PSK with ChaCha20-Poly1305. ECDHE groups X25519, secp256r1,
 //! secp384r1 (RFC 8422). Extended master secret (RFC 7627) mandatory by
-//! default; RFC 5746 `renegotiation_info` always sent and required from the
-//! peer, renegotiation itself never performed (a peer's HelloRequest or
+//! default; RFC 5746 `renegotiation_info` always sent by a client and
+//! required from the server; a server answers it when the client signals it
+//! and, since it never renegotiates, also serves a client that does not
+//! (RFC 5746 §4.3, as OpenSSL, wolfSSL and mbedTLS do). Renegotiation itself
+//! is never performed (a peer's HelloRequest or
 //! renewed ClientHello after the handshake is ignored).
 //!
 //! **Deliberately absent:** CBC suites, static-RSA key exchange, compression
 //! (only `null` is offered or accepted), renegotiation, session resumption
 //! (session IDs / RFC 5077 tickets; every handshake is full), CCM suites,
 //! `use_srtp`, connection ID (RFC 9146), and sending alerts (errors are
-//! typed; the caller decides). Send-side fragmentation is not done: each
-//! handshake message travels in one record, so the peer's MTU must fit the
-//! largest one (as in the 1.3 engine).
+//! typed; the caller decides).
+//!
+//! **Fragmentation** (RFC 6347 §4.2.3): with `Config.max_datagram_len` set,
+//! an epoch-0 handshake message whose record would exceed it is sent as
+//! several fragments (`handshake.Fragmenter`), one record each, and the
+//! returned bytes are cut into datagrams with `record.nextDatagram`. With
+//! it 0 (the default) every message travels in one record, as before.
 //!
 //! **Retransmission** (RFC 6347 §4.2.4): the last flight is cached as
 //! MESSAGES, not records, and re-encoded with fresh record sequence numbers
@@ -54,8 +61,12 @@
 //! connection is restored to its state before the call (as in the 1.3
 //! engine: epoch-0 records are unauthenticated, so a forged one must not
 //! poison the handshake). Incoming handshake messages are reassembled one
-//! at a time, in order, bounded by `max_message_len`; fragments of a later
-//! message are dropped (the peer retransmits).
+//! at a time by `handshake.Reassembler` (fragments in any order, duplicates
+//! tolerated, a contradicting overlap refused), bounded by
+//! `max_message_len`. Fragments of a LATER message (RFC 6347 §4.2.2) are
+//! queued, up to `max_future_ahead` messages ahead and `max_future_bytes` in
+//! all, and fed in once their turn comes; beyond that they are dropped and
+//! the peer retransmits.
 
 const std = @import("std");
 const conn13 = @import("Connection.zig");
@@ -113,6 +124,15 @@ const tx_cap = 6144;
 const max_client_hello = 2048;
 const max_plain = max_message_len + handshake.header_len + 64;
 const max_send_seq: u48 = std.math.maxInt(u48);
+/// Queue for fragments of messages AHEAD of the expected one (RFC 6347
+/// §4.2.2): bytes in all, and how far ahead. Sized like the 1.3 engine's
+/// `max_flight_bytes` bound: the largest flight this engine accepts
+/// (ServerHello + a `max_message_len` Certificate + ServerKeyExchange +
+/// CertificateRequest + ServerHelloDone) fits, so a fully reversed flight is
+/// still taken in one pass; anything beyond is dropped and retransmitted.
+const max_future_bytes = 6144;
+const max_future_ahead: u16 = 8;
+const future_entry_header = 1 + handshake.header_len;
 const max_psk_len = 512;
 const max_point_len = 133;
 
@@ -165,6 +185,8 @@ pub const Connection12 = struct {
     kx: KeyExchange12 = .ecdhe_ecdsa,
     /// RFC 7627 was negotiated.
     ems: bool = false,
+    /// Server: the client signalled RFC 5746 (extension or SCSV).
+    peer_ri: bool = false,
     client_random: [32]u8 = @splat(0),
     server_random: [32]u8 = @splat(0),
 
@@ -194,6 +216,14 @@ pub const Connection12 = struct {
     rx_type: u8 = 0,
     rx_total: usize = 0,
     rx_filled: usize = 0,
+    /// Which bytes of `rx_msg` have arrived (`handshake.Reassembler`).
+    rx_have: [max_message_len]bool = undefined,
+    /// Fragments of later messages (`stashFuture`): entries of an epoch
+    /// byte, the 12-byte handshake header and the fragment.
+    rx_future: [max_future_bytes]u8 = undefined,
+    rx_future_len: usize = 0,
+    /// This `handleFlight` call fed a queued fragment (see there).
+    queue_used: bool = false,
     /// Rank of the last message processed in the current flight, for order
     /// enforcement (see `rank`).
     last_rank: u8 = 0,
@@ -319,9 +349,24 @@ pub const Connection12 = struct {
         var o = Out{ .buf = out };
         self.saw_duplicate = false;
         self.stateless_reply = false;
+        self.queue_used = false;
         self.processDatagram(datagram, entropy, now_ms, &o) catch |err| {
+            const used_queue = self.queue_used;
             self.* = saved;
-            return err;
+            if (!used_queue) return err;
+            // The queue is unauthenticated: a forged fragment of a later
+            // message, queued earlier, would otherwise fail every genuine
+            // copy of this flight the same way. Retry once from live bytes
+            // alone (what the engine did before it queued anything); the
+            // queue is lost, the peer's retransmission refills it.
+            self.dropQueue();
+            o.len = 0;
+            self.saw_duplicate = false;
+            self.stateless_reply = false;
+            self.processDatagram(datagram, entropy, now_ms, &o) catch |err2| {
+                self.* = saved;
+                return err2;
+            };
         };
         if (self.stateless_reply) {
             // HelloVerifyRequest: the server keeps NOTHING (RFC 6347 §4.2.1).
@@ -522,26 +567,107 @@ pub const Connection12 = struct {
                 self.saw_duplicate = true;
                 continue;
             }
-            if (hh.message_seq != self.next_recv_seq) continue; // a later message: dropped
-            if (!self.rx_active) {
-                self.rx_active = true;
-                self.rx_type = hh.msg_type;
-                self.rx_total = hh.length;
-                self.rx_filled = 0;
-            } else if (self.rx_type != hh.msg_type or self.rx_total != hh.length) return error.Malformed;
-            const off: usize = hh.fragment_offset;
-            if (off <= self.rx_filled and off + fl > self.rx_filled) {
-                const new = frag[self.rx_filled - off ..];
-                @memcpy(self.rx_msg[self.rx_filled..][0..new.len], new);
-                self.rx_filled += new.len;
+            if (hh.message_seq != self.next_recv_seq) {
+                // RFC 6347 §4.2.2: a later message is queued, not dropped.
+                self.stashFuture(hh, frag, epoch);
+                continue;
             }
-            if (self.rx_filled < self.rx_total) continue;
-            self.rx_active = false;
-            const seq = self.next_recv_seq;
-            self.next_recv_seq +%= 1;
-            try self.processMessage(self.rx_type, seq, self.rx_msg[0..self.rx_total], epoch, entropy, now_ms, o);
+            try self.takeFragment(hh, frag, epoch, entropy, now_ms, o);
             if (self.stateless_reply) return;
         }
+    }
+
+    /// Feeds one fragment of the expected message (`next_recv_seq`) to the
+    /// reassembler and, once the message is whole, processes it — and then
+    /// every queued later message that has become the expected one.
+    fn takeFragment(self: *Connection12, hh: handshake.HandshakeHeader, frag: []const u8, epoch: u16, entropy: Entropy, now_ms: u64, o: *Out) HandshakeError!void {
+        var done = try self.feedCurrent(hh, frag);
+        var cur_epoch = epoch;
+        while (true) {
+            if (done) |body| {
+                const seq = self.next_recv_seq;
+                self.next_recv_seq +%= 1;
+                try self.processMessage(self.rx_type, seq, body, cur_epoch, entropy, now_ms, o);
+                if (self.stateless_reply) return;
+            }
+            // A queued fragment of the (new) expected message, fed straight
+            // from the queue (the reassembler copies it) and then dropped.
+            const q = self.nextQueued() orelse return;
+            const e = self.rx_future[q.at..][0..q.len];
+            cur_epoch = e[0];
+            self.queue_used = true;
+            done = try self.feedCurrent(q.hh, e[future_entry_header..]);
+            self.dropQueued(q.at, q.len);
+        }
+    }
+
+    /// The incoming-message reassembler (`handshake.Reassembler`, shared
+    /// with the 1.3 engine): fragments in any order, duplicates allowed, a
+    /// contradicting overlap refused. Rebuilt over this connection's own
+    /// buffers on each call, so the struct stays freely copyable (the
+    /// `handleFlight` transaction copies it).
+    fn feedCurrent(self: *Connection12, hh: handshake.HandshakeHeader, frag: []const u8) HandshakeError!?[]const u8 {
+        var r: handshake.Reassembler = .{
+            .buf = &self.rx_msg,
+            .received = &self.rx_have,
+            .total_len = if (self.rx_active) @intCast(self.rx_total) else null,
+            .message_seq = if (self.rx_active) self.next_recv_seq else null,
+            .msg_type = self.rx_type,
+            .received_bytes = self.rx_filled,
+        };
+        const done = try r.feed(hh, frag);
+        self.rx_active = done == null;
+        self.rx_type = r.msg_type;
+        self.rx_total = r.total_len.?;
+        self.rx_filled = r.received_bytes;
+        return done;
+    }
+
+    /// Queues a fragment of a LATER message (RFC 6347 §4.2.2: an
+    /// implementation MAY discard it, but SHOULD queue it if it has the
+    /// buffer space). Bounded: only `max_future_ahead` messages ahead, at
+    /// most `max_future_bytes` in all; a fragment that does not fit is
+    /// dropped (the peer retransmits). A stateless server at `.start` keeps
+    /// nothing. The bytes are unauthenticated until the Finished check, as
+    /// with every epoch-0 handshake byte.
+    fn stashFuture(self: *Connection12, hh: handshake.HandshakeHeader, frag: []const u8, epoch: u16) void {
+        if (self.state == .start) return;
+        if (hh.message_seq -% self.next_recv_seq > max_future_ahead) return;
+        if (max_future_bytes - self.rx_future_len < future_entry_header + frag.len) return;
+        const e = self.rx_future[self.rx_future_len..];
+        e[0] = @intCast(epoch);
+        handshake.encodeHeader(hh, e[1..][0..handshake.header_len]);
+        @memcpy(e[future_entry_header..][0..frag.len], frag);
+        self.rx_future_len += future_entry_header + frag.len;
+    }
+
+    const Queued = struct { at: usize, len: usize, hh: handshake.HandshakeHeader };
+
+    /// The first queued fragment of the expected message, after discarding
+    /// queued fragments that are now in the past.
+    fn nextQueued(self: *Connection12) ?Queued {
+        var i: usize = 0;
+        while (i < self.rx_future_len) {
+            const hh = handshake.decodeHeader(self.rx_future[i + 1 .. self.rx_future_len]) catch unreachable; // encoded by `stashFuture`
+            const len = future_entry_header + hh.fragment_length;
+            if (hh.message_seq == self.next_recv_seq) return .{ .at = i, .len = len, .hh = hh };
+            if (messageSeqBefore(hh.message_seq, self.next_recv_seq)) {
+                self.dropQueued(i, len);
+            } else i += len;
+        }
+        return null;
+    }
+
+    /// Empties the queue, and the message in progress with it when that
+    /// may hold queued bytes.
+    fn dropQueue(self: *Connection12) void {
+        self.rx_future_len = 0;
+        self.rx_active = false;
+    }
+
+    fn dropQueued(self: *Connection12, at: usize, len: usize) void {
+        std.mem.copyForwards(u8, self.rx_future[at..], self.rx_future[at + len .. self.rx_future_len]);
+        self.rx_future_len -= len;
     }
 
     // ── message dispatch ─────────────────────────────────────────────────
@@ -990,7 +1116,14 @@ pub const Connection12 = struct {
             m12.ext_ec_point_formats => if (!m12.pointFormatsIncludeUncompressed(e.data)) return error.Malformed,
             else => {},
         };
-        if (!ri) return error.SecureRenegotiationRequired;
+        // RFC 5746 §4.3: a server that never renegotiates MAY complete a
+        // handshake with a client that signals neither the extension nor the
+        // SCSV — the attack RFC 5746 closes needs a renegotiation, which this
+        // module never performs. OpenSSL, wolfSSL and mbedTLS servers do
+        // accept such a client; wolfSSL's own 1.2 client (Debian's build,
+        // without HAVE_SECURE_RENEGOTIATION) is one. Only a non-empty
+        // `renegotiation_info` (above) is refused.
+        self.peer_ri = ri;
         if (!ems and self.config.require_extended_master_secret) return error.ExtendedMasterSecretRequired;
         self.ems = ems;
 
@@ -1051,8 +1184,12 @@ pub const Connection12 = struct {
             var ext_buf: [300]u8 = undefined;
             var exts: [4]m12.Extension = undefined;
             var n: usize = 0;
-            exts[n] = .{ .ext_type = m12.ext_renegotiation_info, .data = &m12.renegotiation_info_initial };
-            n += 1;
+            // RFC 5746 §3.6: answered only when the client signalled it
+            // (RFC 5246 §7.4.1.4: no unsolicited extensions).
+            if (self.peer_ri) {
+                exts[n] = .{ .ext_type = m12.ext_renegotiation_info, .data = &m12.renegotiation_info_initial };
+                n += 1;
+            }
             if (self.ems) {
                 exts[n] = .{ .ext_type = m12.ext_extended_master_secret, .data = &.{} };
                 n += 1;
@@ -1327,7 +1464,10 @@ pub const Connection12 = struct {
     }
 
     /// (Re-)encodes the cached flight into records with fresh sequence
-    /// numbers, appended to `o`.
+    /// numbers, appended to `o`. With `Config.max_datagram_len` set, a
+    /// handshake message whose record would be larger is split into RFC 6347
+    /// §4.2.3 fragments (`handshake.Fragmenter`, as for 1.3) so that no
+    /// record exceeds it; `record.nextDatagram` then packs them.
     fn emitFlight(self: *Connection12, o: *Out) HandshakeError!void {
         var i: usize = 0;
         while (i < self.tx_len) {
@@ -1335,21 +1475,46 @@ pub const Connection12 = struct {
             const n: usize = std.mem.readInt(u16, self.tx[i + 1 ..][0..2], .big);
             const bytes = self.tx[i + 3 ..][0..n];
             i += 3 + n;
-            switch (kind) {
-                .handshake_epoch0, .change_cipher_spec => {
-                    if (self.send_seq[0] == max_send_seq) return error.SequenceNumberExhausted;
-                    const ct = if (kind == .change_cipher_spec) content_change_cipher_spec else content_handshake;
-                    const rec = try plaintextRecord(ct, 0, self.send_seq[0], bytes, o.rest());
-                    self.send_seq[0] += 1;
-                    o.len += rec.len;
-                },
-                .handshake_epoch1 => {
-                    if (self.send_seq[1] == max_send_seq) return error.SequenceNumberExhausted;
-                    const rec = record12.seal(&self.write_keys, 1, self.send_seq[1], content_handshake, bytes, o.rest()) catch return error.BufferTooShort;
-                    self.send_seq[1] += 1;
-                    o.len += rec.len;
-                },
+            const limit: usize = self.config.max_datagram_len;
+            // Only epoch-0 messages can need it: the one epoch-1 handshake
+            // message is Finished (12 + 12 bytes), and `Config.validate`
+            // keeps `limit` above its sealed record.
+            if (kind != .handshake_epoch0 or limit == 0 or record.plaintext_header_len + bytes.len <= limit) {
+                try self.emitRecord(kind, bytes, o);
+                continue;
             }
+            const frag_cap = limit - record.plaintext_header_len - handshake.header_len;
+            const hh = handshake.decodeHeader(bytes) catch unreachable; // framed by `cacheMessage`
+            var fr = handshake.Fragmenter.init(hh.msg_type, hh.message_seq, bytes[handshake.header_len..]);
+            while (fr.pos < fr.body.len) {
+                const take = @min(frag_cap, fr.body.len - fr.pos);
+                const dst = o.rest();
+                if (dst.len < record.plaintext_header_len + handshake.header_len + take) return error.BufferTooShort;
+                const frag = fr.next(take, dst[record.plaintext_header_len..]) orelse break;
+                if (self.send_seq[0] == max_send_seq) return error.SequenceNumberExhausted;
+                _ = try record.encodePlaintext(.{ .content_type = content_handshake, .epoch = 0, .sequence_number = self.send_seq[0], .length = @intCast(frag.len) }, dst);
+                self.send_seq[0] += 1;
+                o.len += record.plaintext_header_len + frag.len;
+            }
+        }
+    }
+
+    /// One record of the flight: plaintext in epoch 0, sealed in epoch 1.
+    fn emitRecord(self: *Connection12, kind: TxKind, bytes: []const u8, o: *Out) HandshakeError!void {
+        switch (kind) {
+            .handshake_epoch0, .change_cipher_spec => {
+                if (self.send_seq[0] == max_send_seq) return error.SequenceNumberExhausted;
+                const ct = if (kind == .change_cipher_spec) content_change_cipher_spec else content_handshake;
+                const rec = try plaintextRecord(ct, 0, self.send_seq[0], bytes, o.rest());
+                self.send_seq[0] += 1;
+                o.len += rec.len;
+            },
+            .handshake_epoch1 => {
+                if (self.send_seq[1] == max_send_seq) return error.SequenceNumberExhausted;
+                const rec = record12.seal(&self.write_keys, 1, self.send_seq[1], content_handshake, bytes, o.rest()) catch return error.BufferTooShort;
+                self.send_seq[1] += 1;
+                o.len += rec.len;
+            },
         }
     }
 };

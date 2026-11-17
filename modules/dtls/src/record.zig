@@ -211,6 +211,55 @@ pub fn decodePlaintext(buf: []const u8) RecordError!PlaintextHeader {
     };
 }
 
+// ── datagram packing (RFC 6347 §4.1.1 / RFC 9147 §4.4) ──────────────────
+
+/// The wire length of the record at the front of `buf` — a `DTLSPlaintext`
+/// /`DTLSCiphertext` record (first byte a content type, 13-byte header) or
+/// a DTLS 1.3 unified-header record carrying a length. Null when the header
+/// is not readable, declares more bytes than `buf` holds, or is a unified
+/// header without a length (such a record runs to the end of its datagram).
+fn recordWireLen(buf: []const u8) ?usize {
+    if (buf.len == 0) return null;
+    if (buf[0] & fixed_mask == fixed_value) {
+        const dec = decodeUnified(buf, 0) catch return null;
+        const len = dec.hdr.length orelse return null;
+        if (buf.len - dec.consumed < len) return null;
+        return dec.consumed + len;
+    }
+    const hdr = decodePlaintext(buf) catch return null;
+    if (buf.len - plaintext_header_len < hdr.length) return null;
+    return plaintext_header_len + hdr.length;
+}
+
+pub const DatagramSplit = struct {
+    /// The next datagram to send: one or more whole records.
+    datagram: []const u8,
+    /// What is left; empty when `datagram` was the last one.
+    rest: []const u8,
+};
+
+/// Cuts the next datagram off `records` (the bytes a `handleFlight` / `poll`
+/// / `send` returned): as many whole records as fit in `max_len` bytes,
+/// packed greedily in order, the same rule `Connection12` follows when
+/// `Config.max_datagram_len` is set, so the cut never falls inside a record
+/// (RFC 6347 §4.1.1: a record MUST NOT span datagrams). A single record
+/// longer than `max_len` is returned alone, never split. `max_len == 0`
+/// means no limit (everything in one datagram), as does a record header that
+/// cannot be read (the rest is returned whole rather than guessed at).
+/// Pure: call it in a loop until `rest` is empty.
+pub fn nextDatagram(records: []const u8, max_len: usize) DatagramSplit {
+    if (max_len == 0) return .{ .datagram = records, .rest = records[records.len..] };
+    var end: usize = 0;
+    while (end < records.len) {
+        const n = recordWireLen(records[end..]) orelse
+            return .{ .datagram = records, .rest = records[records.len..] };
+        if (end > 0 and end + n > max_len) break;
+        end += n;
+        if (end >= max_len) break;
+    }
+    return .{ .datagram = records[0..end], .rest = records[end..] };
+}
+
 // ── sequence-number reconstruction (RFC 9147 §4.3) ──────────────────────
 
 /// Reconstructs the full 48-bit sequence number from the on-wire low-order
@@ -536,4 +585,64 @@ test "corpus: every record seed reaches its decoder, and the counts are pinned" 
     // silently does not exist.
     try testing.expectEqual(@as(usize, 0), corpus.unified.dropped);
     try testing.expectEqual(@as(usize, 0), corpus.plaintext.dropped);
+}
+
+fn testPlaintextRecord(seq: u48, payload_len: u16, out: []u8) []u8 {
+    _ = encodePlaintext(.{ .content_type = 22, .epoch = 0, .sequence_number = seq, .length = payload_len }, out) catch unreachable;
+    @memset(out[plaintext_header_len..][0..payload_len], @truncate(seq));
+    return out[0 .. plaintext_header_len + payload_len];
+}
+
+test "nextDatagram: greedy packing, a record exactly max_len long, an oversized record alone, empty input" {
+    var buf: [512]u8 = undefined;
+    var n: usize = 0;
+    n += testPlaintextRecord(0, 37, buf[n..]).len; // 50 bytes
+    n += testPlaintextRecord(1, 37, buf[n..]).len; // 50
+    n += testPlaintextRecord(2, 87, buf[n..]).len; // 100
+    n += testPlaintextRecord(3, 187, buf[n..]).len; // 200
+    const all = buf[0..n];
+
+    // max 100: [50+50] [100] [200 alone, over the limit, never split]
+    var s = nextDatagram(all, 100);
+    try std.testing.expectEqual(@as(usize, 100), s.datagram.len);
+    s = nextDatagram(s.rest, 100);
+    try std.testing.expectEqual(@as(usize, 100), s.datagram.len); // exactly max_len
+    try std.testing.expectEqual(@as(u8, 2), s.datagram[plaintext_header_len]);
+    s = nextDatagram(s.rest, 100);
+    try std.testing.expectEqual(@as(usize, 200), s.datagram.len);
+    try std.testing.expectEqual(@as(usize, 0), s.rest.len);
+
+    // max 99: the second 50-byte record no longer fits beside the first.
+    s = nextDatagram(all, 99);
+    try std.testing.expectEqual(@as(usize, 50), s.datagram.len);
+    // max 101: still only two records (the 100-byte one does not fit after them).
+    s = nextDatagram(all, 101);
+    try std.testing.expectEqual(@as(usize, 100), s.datagram.len);
+    // no limit / huge limit: everything at once.
+    try std.testing.expectEqual(n, nextDatagram(all, 0).datagram.len);
+    try std.testing.expectEqual(n, nextDatagram(all, 4096).datagram.len);
+
+    const empty = nextDatagram(all[0..0], 100);
+    try std.testing.expectEqual(@as(usize, 0), empty.datagram.len);
+    try std.testing.expectEqual(@as(usize, 0), empty.rest.len);
+}
+
+test "nextDatagram: an unreadable or truncated record is returned whole, never cut" {
+    var buf: [128]u8 = undefined;
+    const r = testPlaintextRecord(7, 40, &buf);
+    // Truncated: the header declares 40 bytes, 39 are there.
+    const s = nextDatagram(r[0 .. r.len - 1], 60);
+    try std.testing.expectEqual(r.len - 1, s.datagram.len);
+    try std.testing.expectEqual(@as(usize, 0), s.rest.len);
+    // A unified header without a length runs to the datagram's end.
+    const no_len = [_]u8{ 0x20, 0x05, 0xaa, 0xbb, 0xcc };
+    try std.testing.expectEqual(no_len.len, nextDatagram(&no_len, 2).datagram.len);
+    // A unified header WITH a length is cut like a plaintext one.
+    var two: [16]u8 = undefined;
+    const one_unified = [_]u8{ 0x24, 0x05, 0x00, 0x02, 0xaa, 0xbb }; // L bit, short seq, length 2
+    @memcpy(two[0..6], &one_unified);
+    @memcpy(two[6..12], &one_unified);
+    const u = nextDatagram(two[0..12], 8);
+    try std.testing.expectEqual(@as(usize, 6), u.datagram.len);
+    try std.testing.expectEqual(@as(usize, 6), u.rest.len);
 }

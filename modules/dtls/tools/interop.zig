@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 
 //! LIVE third-party-peer interop for `dtls`: this module's DTLS 1.3 handshakes
-//! against **wolfSSL**, over a real loopback UDP socket — and the recorder that
-//! turns each of those exchanges into a committed transcript the module can
-//! replay with no wolfSSL and no C compiler anywhere near it.
+//! — and, since 2026-11-17, its DTLS 1.2 ones (`cases12`, recorded into a
+//! transcript of their own) — against **wolfSSL**, over a real loopback UDP
+//! socket, and the recorder that turns each of those exchanges into a
+//! committed transcript the module can replay with no wolfSSL and no C
+//! compiler anywhere near it.
 //!
 //! ## Why this is a PROGRAM and not a test
 //!
@@ -36,6 +38,7 @@
 //!     zig build interop-dtls -- --capture    # ...and rewrite the transcript
 //!     zig build interop-dtls -- --case cert-client-mutual
 //!     zig build interop-dtls -- --list
+//!     zig build interop-dtls -- --capture --version 12   # only the 1.2 recording
 //!
 //! It reads `modules/dtls/tools/wolfssl_peer.c` and
 //! `modules/dtls/src/testdata/certs/*` **from their own paths at run time**,
@@ -60,6 +63,7 @@ const dtls = @import("dtls");
 const Connection = dtls.Connection;
 const Entropy = dtls.Entropy;
 const certverify = dtls.certverify;
+const rsa = @import("rsa");
 const net = std.Io.net;
 
 const x25519_group: u16 = @backingInt(dtls.messages.NamedGroup.x25519);
@@ -413,6 +417,8 @@ const Fixtures = struct {
     server_secret_key_bytes: []u8,
     client_cert_der: []u8,
     client_secret_key_bytes: []u8,
+    rsa12_cert_der: []u8,
+    rsa12_key_der: []u8,
     /// The one-element chains `Config.cert.chain` points AT.
     ///
     /// They are fields, and `Fixtures` is passed by pointer, because
@@ -427,6 +433,7 @@ const Fixtures = struct {
     /// therefore static.
     server_chain: [1][]const u8 = undefined,
     client_chain: [1][]const u8 = undefined,
+    rsa12_chain: [1][]const u8 = undefined,
 
     fn load(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir) !Fixtures {
         var fx: Fixtures = .{
@@ -435,9 +442,12 @@ const Fixtures = struct {
             .server_secret_key_bytes = try read(gpa, io, root, "server-key.bin"),
             .client_cert_der = try read(gpa, io, root, "client-cert.der"),
             .client_secret_key_bytes = try read(gpa, io, root, "client-key.bin"),
+            .rsa12_cert_der = try read(gpa, io, root, "rsa12-cert.der"),
+            .rsa12_key_der = try read(gpa, io, root, "rsa12-key.der"),
         };
         fx.server_chain = .{fx.server_cert_der};
         fx.client_chain = .{fx.client_cert_der};
+        fx.rsa12_chain = .{fx.rsa12_cert_der};
         return fx;
     }
 
@@ -479,9 +489,21 @@ const Fixtures = struct {
     /// point is recomputed from the scalar, so the key wolfSSL signs with
     /// cannot silently drift from the certificate the Zig side verifies
     /// against.
+    var rsa12_sk: rsa.SecretKey = undefined;
+
+    fn rsa12Key(self: *const Fixtures) certverify.SecretKey {
+        rsa.SecretKey.fromDer(&rsa12_sk, self.rsa12_key_der) catch unreachable;
+        return .{ .rsa = &rsa12_sk };
+    }
+
+    /// `keySec1Der` of the server leaf's scalar.
     fn serverKeySec1Der(self: *const Fixtures) [121]u8 {
+        return keySec1Der(self.server_secret_key_bytes);
+    }
+
+    fn keySec1Der(scalar: []const u8) [121]u8 {
         const P256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-        const sk = P256.SecretKey.fromBytes(scalar32(self.server_secret_key_bytes)) catch unreachable;
+        const sk = P256.SecretKey.fromBytes(scalar32(scalar)) catch unreachable;
         const kp = P256.KeyPair.fromSecretKey(sk) catch unreachable;
         const point = kp.public_key.toUncompressedSec1(); // 0x04 || X || Y, 65 bytes
 
@@ -496,7 +518,7 @@ const Fixtures = struct {
         put(&out, &i, &.{ 0x30, 0x77 }); // SEQUENCE, 119 content bytes
         put(&out, &i, &.{ 0x02, 0x01, 0x01 }); // version = 1
         put(&out, &i, &.{ 0x04, 0x20 }); // privateKey OCTET STRING (32)
-        put(&out, &i, self.server_secret_key_bytes[0..32]);
+        put(&out, &i, scalar[0..32]);
         // [0] parameters: OID 1.2.840.10045.3.1.7 (prime256v1)
         put(&out, &i, &.{ 0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 });
         // [1] publicKey: BIT STRING, 0 unused bits, uncompressed point
@@ -516,6 +538,13 @@ const Fixtures = struct {
         const key = self.serverKeySec1Der();
         try dir.writeFile(io, .{ .sub_path = "server-key.der", .data = &key });
         try dir.writeFile(io, .{ .sub_path = "anchor-cert.der", .data = self.anchor_cert_der });
+        // The DTLS 1.2 modes: a wolfSSL client presenting the fixture CLIENT
+        // certificate, and the RSA identity for ECDHE_RSA.
+        try dir.writeFile(io, .{ .sub_path = "client-cert.der", .data = self.client_cert_der });
+        const ckey = keySec1Der(self.client_secret_key_bytes);
+        try dir.writeFile(io, .{ .sub_path = "client-key.der", .data = &ckey });
+        try dir.writeFile(io, .{ .sub_path = "rsa12-cert.der", .data = self.rsa12_cert_der });
+        try dir.writeFile(io, .{ .sub_path = "rsa12-key.der", .data = self.rsa12_key_der });
     }
 };
 
@@ -1283,6 +1312,549 @@ fn runServerFlow(
     rec.note("peer exited 0 (not replayable): it accepted our side and, in certificate mode, X509_V_OK'd our chain", .{});
 }
 
+// ── DTLS 1.2 (RFC 6347): `Connection12` against `wolfDTLSv1_2_*_method` ────
+//
+// A table, two flows and a transcript of their own (`transcript12_path`), so
+// that re-taking the 1.2 anchor does not rewrite the 1.3 one (whose bytes
+// also feed `fuzz_corpus.zig`'s pinned counts) and vice versa.
+
+const Connection12 = dtls.Connection12;
+const CipherSuite12 = dtls.CipherSuite12;
+const transcript12_path = "modules/dtls/src/testdata/wolfssl12_transcript.txt";
+
+/// Every certificate case runs at this instant: inside both the ECDSA
+/// (2026-07-21 ..) and the RSA (2026-11-13 ..) fixtures' validity.
+const now12_sec: i64 = 1798761600; // 2027-01-01
+
+/// The identity hint our 1.2 PSK server sends (RFC 4279 §2). Test material.
+const psk12_hint = "zig-libs-hint";
+
+const Kind12 = enum {
+    /// ECDHE_PSK (RFC 5489). Debian's wolfSSL has no static PSK, so plain
+    /// PSK is not reachable from this peer at all.
+    psk,
+    /// ECDHE_ECDSA with the P-256 fixture chain.
+    ecdsa,
+    /// ECDHE_RSA with the self-signed RSA-2048 fixture.
+    rsa,
+};
+
+const Case12 = struct {
+    name: []const u8,
+    flow: Flow,
+    peer_mode: []const u8,
+    seed: u8,
+    kind: Kind12,
+    /// Non-zero: wolfSSL fragments what it sends to fit.
+    peer_mtu: u16 = 0,
+    /// Our `Config.max_datagram_len`: non-zero makes OUR side fragment.
+    max_datagram: u16 = 0,
+    /// Client flow: present the fixture client certificate. Server flow:
+    /// request (and require) one.
+    mutual: bool = false,
+    expect_suite: CipherSuite12,
+    expect_group: u16 = x25519_group,
+    /// Client flow: wolfSSL's 1.2 server always runs the cookie exchange.
+    expect_hvr: bool = false,
+    expect_peer_cert_subject: ?[]const u8 = null,
+    app_send: []const u8 = "hello from zig-libs over dtls 1.2",
+    app_expect: []const u8 = "hello from zig-libs over dtls 1.2",
+    why: []const u8,
+};
+
+const wolfssl12_client_hello = "hello from wolfssl 1.2 client";
+
+const cases12 = [_]Case12{
+    .{
+        .name = "dtls12-psk-client",
+        .flow = .client,
+        .peer_mode = "12-server-psk",
+        .seed = 0x71,
+        .kind = .psk,
+        .expect_suite = .ecdhe_psk_with_chacha20_poly1305_sha256,
+        .expect_hvr = true,
+        .why = "ECDHE_PSK (RFC 5489) ChaCha20-Poly1305 against a live wolfSSL 1.2 server: its HelloVerifyRequest, its identity hint in ServerKeyExchange, the RFC 4279 premaster with a foreign ECDH share",
+    },
+    .{
+        .name = "dtls12-psk-server",
+        .flow = .server,
+        .peer_mode = "12-client-psk",
+        .seed = 0x72,
+        .kind = .psk,
+        .expect_suite = .ecdhe_psk_with_chacha20_poly1305_sha256,
+        .app_expect = wolfssl12_client_hello,
+        .why = "a wolfSSL 1.2 PSK client completes against OUR server's ServerKeyExchange (hint + ECDH params) and Finished",
+    },
+    .{
+        .name = "dtls12-psk-server-cookie",
+        .flow = .server_cookie,
+        .peer_mode = "12-client-psk",
+        .seed = 0x73,
+        .kind = .psk,
+        .expect_suite = .ecdhe_psk_with_chacha20_poly1305_sha256,
+        .app_expect = wolfssl12_client_hello,
+        .why = "OUR HelloVerifyRequest (RFC 6347 4.2.1) accepted by a stock client, the handshake finished by a BRAND-NEW server connection from the cookie alone",
+    },
+    .{
+        .name = "dtls12-ecdsa-client",
+        .flow = .client,
+        .peer_mode = "12-server-ecdsa",
+        .seed = 0x74,
+        .kind = .ecdsa,
+        .expect_suite = .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .expect_hvr = true,
+        .why = "ECDHE_ECDSA AES-128-GCM: wolfSSL's Certificate and signed ServerKeyExchange verified by us, our ClientKeyExchange and Finished by it",
+    },
+    .{
+        .name = "dtls12-ecdsa-client-aes256",
+        .flow = .client,
+        .peer_mode = "12-server-ecdsa-aes256",
+        .seed = 0x74,
+        .kind = .ecdsa,
+        .expect_suite = .ecdhe_ecdsa_with_aes_256_gcm_sha384,
+        .expect_hvr = true,
+        .why = "the SHA-384 suite: PRF, transcript hash and Finished over SHA-384 (RFC 5289), AES-256-GCM records",
+    },
+    .{
+        .name = "dtls12-ecdsa-client-p256",
+        .flow = .client,
+        .peer_mode = "12-server-ecdsa-p256",
+        .seed = 0x74,
+        .kind = .ecdsa,
+        .expect_suite = .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .expect_group = secp256r1_group,
+        .expect_hvr = true,
+        .why = "a server that accepts only secp256r1 picks it from our supported_groups: our P-256 ECDHE against foreign code",
+    },
+    .{
+        .name = "dtls12-ecdsa-client-mtu256",
+        .flow = .client,
+        .peer_mode = "12-server-ecdsa",
+        .seed = 0x74,
+        .kind = .ecdsa,
+        .peer_mtu = 256,
+        .expect_suite = .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .expect_hvr = true,
+        .why = "wolfSSL at a 256-byte MTU must fragment its Certificate: our 1.2 reassembly against a real fragmenter",
+    },
+    .{
+        .name = "dtls12-ecdsa-client-mutual",
+        .flow = .client,
+        .peer_mode = "12-server-ecdsa-mutual",
+        .seed = 0x74,
+        .kind = .ecdsa,
+        .mutual = true,
+        .expect_suite = .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .expect_hvr = true,
+        .expect_peer_cert_subject = "dtls-test-client",
+        .why = "mutual auth: wolfSSL (VERIFY_PEER|FAIL_IF_NO_PEER_CERT) parses our CertificateRequest answer and verifies OUR 1.2 CertificateVerify over the handshake messages",
+    },
+    .{
+        .name = "dtls12-ecdsa-server",
+        .flow = .server,
+        .peer_mode = "12-client-ecdsa",
+        .seed = 0x75,
+        .kind = .ecdsa,
+        .expect_suite = .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .app_expect = wolfssl12_client_hello,
+        .why = "a wolfSSL 1.2 client verifies OUR chain and signed ServerKeyExchange (it asserts X509_V_OK before exiting 0)",
+    },
+    .{
+        .name = "dtls12-ecdsa-server-chacha",
+        .flow = .server,
+        .peer_mode = "12-client-ecdsa-chacha",
+        .seed = 0x75,
+        .kind = .ecdsa,
+        .expect_suite = .ecdhe_ecdsa_with_chacha20_poly1305_sha256,
+        .app_expect = wolfssl12_client_hello,
+        .why = "a client offering only ECDHE-ECDSA-CHACHA20-POLY1305: our server's suite choice and the RFC 7905 record nonce",
+    },
+    .{
+        .name = "dtls12-ecdsa-server-mutual",
+        .flow = .server,
+        .peer_mode = "12-client-ecdsa-mutual",
+        .seed = 0x75,
+        .kind = .ecdsa,
+        .mutual = true,
+        .expect_suite = .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .app_expect = wolfssl12_client_hello,
+        .why = "OUR CertificateRequest answered by a foreign client: its Certificate chained to our anchor and its CertificateVerify verified by us",
+    },
+    .{
+        .name = "dtls12-rsa-client",
+        .flow = .client,
+        .peer_mode = "12-server-rsa",
+        .seed = 0x76,
+        .kind = .rsa,
+        .expect_suite = .ecdhe_rsa_with_aes_128_gcm_sha256,
+        .expect_hvr = true,
+        .why = "ECDHE_RSA: wolfSSL's RSA signature over our randoms and its ECDH params, in the scheme it picked from our signature_algorithms",
+    },
+    .{
+        .name = "dtls12-rsa-server",
+        .flow = .server,
+        .peer_mode = "12-client-rsa",
+        .seed = 0x77,
+        .kind = .rsa,
+        .expect_suite = .ecdhe_rsa_with_aes_128_gcm_sha256,
+        .app_expect = wolfssl12_client_hello,
+        .why = "OUR RSA ServerKeyExchange signature verified by wolfSSL",
+    },
+    .{
+        .name = "dtls12-ecdsa-server-frag",
+        .flow = .server,
+        .peer_mode = "12-client-ecdsa",
+        .seed = 0x75,
+        .kind = .ecdsa,
+        .max_datagram = 200,
+        .expect_suite = .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .app_expect = wolfssl12_client_hello,
+        .why = "OUR send-side fragmentation (Config.max_datagram_len = 200): the server flight leaves in several datagrams, the Certificate in fragments a real peer must reassemble",
+    },
+    .{
+        .name = "dtls12-ecdsa-client-mutual-frag",
+        .flow = .client,
+        .peer_mode = "12-server-ecdsa-mutual",
+        .seed = 0x74,
+        .kind = .ecdsa,
+        .mutual = true,
+        .max_datagram = 200,
+        .expect_suite = .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .expect_hvr = true,
+        .expect_peer_cert_subject = "dtls-test-client",
+        .why = "the client side of it: OUR Certificate and CertificateVerify flight in 200-byte datagrams, reassembled and verified by wolfSSL",
+    },
+};
+
+const v12_only = [_]dtls.ProtocolVersion{.dtls12};
+
+fn config12(case: Case12, role: dtls.Role, fx: *const Fixtures, binding: ?[]const u8) dtls.Config {
+    var c: dtls.Config = .{
+        .role = role,
+        .versions = &v12_only,
+        .now_sec = now12_sec,
+        .max_datagram_len = case.max_datagram,
+    };
+    switch (case.kind) {
+        .psk => {
+            c.psk_identity = psk_identity;
+            c.psk = &psk;
+            if (role == .server) c.psk_identity_hint = psk12_hint;
+        },
+        .ecdsa, .rsa => {
+            c.key_exchange = .cert_dhe;
+            const anchor = if (case.kind == .rsa) fx.rsa12_cert_der else fx.anchor_cert_der;
+            switch (role) {
+                .client => {
+                    c.peer_verify = .{ .trust_anchor = anchor };
+                    if (case.mutual) c.cert = .{ .chain = &fx.client_chain, .private_key = fx.clientKey() };
+                },
+                .server => {
+                    c.cert = if (case.kind == .rsa)
+                        .{ .chain = &fx.rsa12_chain, .private_key = fx.rsa12Key() }
+                    else
+                        .{ .chain = &fx.server_chain, .private_key = fx.serverKey() };
+                    if (case.mutual) {
+                        c.request_client_cert = true;
+                        c.require_peer_cert = true;
+                        c.peer_verify = .{ .trust_anchor = anchor };
+                    }
+                },
+            }
+        },
+    }
+    if (binding) |b| c.hello_retry = .{ .cookie_secret = cookie_secret, .peer_binding = b };
+    return c;
+}
+
+fn recordConfig12(rec: *Recorder, case: Case12, seed: [32]u8) void {
+    rec.op("config");
+    rec.strArg("flow", @tagName(case.flow));
+    rec.strArg("kind", @tagName(case.kind));
+    rec.hexArg("seed", &seed);
+    rec.numArg("now_sec", now12_sec);
+    rec.numArg("mutual", @intFromBool(case.mutual));
+    rec.numArg("max_datagram", case.max_datagram);
+    rec.hexArg("psk_identity", psk_identity);
+    rec.hexArg("psk", &psk);
+    rec.hexArg("psk_hint", psk12_hint);
+    rec.hexArg("cookie_secret", cookie_secret);
+    rec.end();
+}
+
+/// Sends `bytes` as the datagrams `record.nextDatagram` cuts at `limit` (one
+/// datagram when 0), returning how many went out.
+fn sendDatagrams(io: std.Io, sock: net.Socket, to: *const net.IpAddress, bytes: []const u8, limit: usize) !usize {
+    var rest = bytes;
+    var n: usize = 0;
+    while (rest.len > 0) {
+        const s = dtls.record.nextDatagram(rest, limit);
+        if (limit != 0 and s.datagram.len > limit) return error.DatagramOverLimit;
+        try sock.send(io, to, s.datagram);
+        rest = s.rest;
+        n += 1;
+    }
+    return n;
+}
+
+fn expectState12(conn: *const Connection12, case: Case12) !void {
+    try expectU16("negotiated suite", @backingInt(case.expect_suite), @backingInt(conn.negotiatedSuite() orelse return error.NotConnected));
+    try expectU16("negotiated group", case.expect_group, conn.ecdhe_group);
+    try expectBool("extended master secret", true, conn.ems);
+}
+
+fn recordExpect12(rec: *Recorder, conn: *const Connection12) void {
+    rec.op("expect");
+    rec.hex4Arg("suite", @backingInt(conn.negotiatedSuite().?));
+    rec.hex4Arg("group", conn.ecdhe_group);
+    rec.numArg("ems", @intFromBool(conn.ems));
+    rec.numArg("hvr", conn.hvr_count);
+}
+
+/// The application-data read. A 1.2 peer has nothing else to put on epoch 1
+/// after the handshake, but a retransmitted Finished is tolerated (and
+/// recorded) as in the 1.3 flows.
+fn recvApplicationData12(io: std.Io, sock: net.Socket, conn: *Connection12, rx: []u8, plain: []u8, rec: *Recorder) ![]const u8 {
+    var skipped: usize = 0;
+    while (skipped <= 4) {
+        const incoming = try sock.receiveTimeout(io, rx, deadline(io, 10_000));
+        const got = conn.recv(incoming.data, plain) catch |err| switch (err) {
+            error.ReceivedPostHandshakeMessage => {
+                rec.op("recv");
+                rec.hexArg("in", incoming.data);
+                rec.strArg("skip", @errorName(err));
+                rec.end();
+                skipped += 1;
+                continue;
+            },
+            else => return err,
+        };
+        rec.op("recv");
+        rec.hexArg("in", incoming.data);
+        rec.hexArg("out", got);
+        rec.end();
+        return got;
+    }
+    return error.NoApplicationData;
+}
+
+/// The peer's `PEERCERT` line, recorded as a note.
+fn checkPeerCertLine(reader: *std.Io.Reader, want: []const u8, rec: *Recorder) !void {
+    var lines: usize = 0;
+    while (lines < 6) : (lines += 1) {
+        const line = peerLine(reader) catch break;
+        if (std.mem.startsWith(u8, line, "PEERCERT ")) {
+            if (std.mem.find(u8, line, want) == null) {
+                std.debug.print("  peer saw \"{s}\", which does not name {s}\n", .{ line, want });
+                return error.WrongPeerCertificate;
+            }
+            rec.note("peer stdout (not replayable): {s}", .{line});
+            return;
+        }
+    }
+    return error.PeerNeverReportedOurCertificate;
+}
+
+fn runClientFlow12(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, case: Case12, fx: *const Fixtures, rec: *Recorder) !void {
+    const port = try freeLoopbackPort(io);
+    var port_buf: [8]u8 = undefined;
+    const port_str = try std.mem.print(&port_buf, "{d}", .{port});
+    var mtu_buf: [8]u8 = undefined;
+    const mtu_str = try std.mem.print(&mtu_buf, "{d}", .{case.peer_mtu});
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "./wolfssl_peer", case.peer_mode, port_str, mtu_str },
+        .cwd = .{ .dir = work },
+        .environ_map = child_env,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    // Killed, not waited for: a case that fails mid-handshake leaves wolfSSL
+    // blocked in `wolfSSL_read` with no timeout, and a wait would hang the
+    // whole run (it did, on the first live run).
+    defer child.kill(io);
+
+    var ready_buf: [256]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(io, &ready_buf);
+    const ready_line = peerLine(&stdout_reader.interface) catch return error.PeerNeverReady;
+    if (!std.mem.eql(u8, "READY", ready_line)) {
+        std.debug.print("  peer said \"{s}\", not READY\n", .{ready_line});
+        return error.PeerNeverReady;
+    }
+
+    const local: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = try local.bind(io, .{ .mode = .dgram });
+    defer sock.close(io);
+    const server_addr: net.IpAddress = .{ .ip4 = .loopback(port) };
+
+    const seed = @as([32]u8, @splat(case.seed));
+    var csprng = std.Random.DefaultCsprng.init(seed);
+    const rnd = seededForTest(&csprng);
+    recordConfig12(rec, case, seed);
+
+    var conn = try Connection12.clientInit(config12(case, .client, fx, null));
+    defer conn.deinit();
+    rec.op("client_init");
+    rec.end();
+
+    var out: [8192]u8 = undefined;
+    var rx: [4096]u8 = undefined;
+    const hello = try conn.startHandshake(rnd, 0, &out);
+    rec.op("start");
+    rec.hexArg("out", hello);
+    rec.end();
+    _ = try sendDatagrams(io, sock, &server_addr, hello, case.max_datagram);
+
+    var steps: usize = 0;
+    var partial_steps: usize = 0;
+    var largest_datagram: usize = 0;
+    var datagrams_out: usize = 0;
+    while (!conn.isConnected()) : (steps += 1) {
+        if (steps > 40) return error.TooManyFlights;
+        const incoming = try sock.receiveTimeout(io, &rx, deadline(io, 10_000));
+        largest_datagram = @max(largest_datagram, incoming.data.len);
+        const result = conn.handleFlight(incoming.data, rnd, 0, &out) catch |err| {
+            reportPeerDiagnosis(gpa, io, &child, true, "wolfSSL rejected our flight", err);
+            return err;
+        };
+        if (result.need_more_data) partial_steps += 1;
+        rec.op("flight");
+        rec.hexArg("in", incoming.data);
+        rec.hexArg("out", result.out);
+        rec.numArg("more", @intFromBool(result.need_more_data));
+        rec.end();
+        if (result.out.len > 0) datagrams_out += try sendDatagrams(io, sock, &server_addr, result.out, case.max_datagram);
+    }
+
+    try expectState12(&conn, case);
+    try expectBool("HelloVerifyRequest seen", case.expect_hvr, conn.hvr_count > 0);
+    recordExpect12(rec, &conn);
+    if (case.peer_mtu > 0) {
+        if (largest_datagram > case.peer_mtu) return error.PeerIgnoredMtu;
+        if (fx.server_cert_der.len <= case.peer_mtu) return error.CertificateTooSmallToFragment;
+        if (partial_steps < 1) return error.NothingWasReassembled;
+        rec.numArg("max_in_datagram", case.peer_mtu);
+        rec.numArg("min_partial", 1);
+    }
+    if (case.max_datagram > 0) {
+        // Our certificate flight cannot have fit one datagram.
+        if (datagrams_out < 3) return error.OurFlightWasNotFragmented;
+    }
+    rec.end();
+
+    const record = try conn.send(case.app_send, &out);
+    rec.op("send");
+    rec.hexArg("in", case.app_send);
+    rec.hexArg("out", record);
+    rec.end();
+    try sock.send(io, &server_addr, record);
+    var plain: [2048]u8 = undefined;
+    const echoed = try recvApplicationData12(io, sock, &conn, &rx, &plain, rec);
+    try expectBytes("echoed application data", case.app_expect, echoed);
+
+    if (case.expect_peer_cert_subject) |want| try checkPeerCertLine(&stdout_reader.interface, want, rec);
+}
+
+fn runServerFlow12(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, case: Case12, fx: *const Fixtures, rec: *Recorder) !void {
+    const local: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = try local.bind(io, .{ .mode = .dgram });
+    defer sock.close(io);
+    var port_buf: [8]u8 = undefined;
+    const port_str = try std.mem.print(&port_buf, "{d}", .{sock.address.getPort()});
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "./wolfssl_peer", case.peer_mode, port_str },
+        .cwd = .{ .dir = work },
+        .environ_map = child_env,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
+
+    const seed = @as([32]u8, @splat(case.seed));
+    var csprng = std.Random.DefaultCsprng.init(seed);
+    const rnd = seededForTest(&csprng);
+    recordConfig12(rec, case, seed);
+
+    var out: [8192]u8 = undefined;
+    var rx: [4096]u8 = undefined;
+    var peer_addr: net.IpAddress = undefined;
+    var binding_buf: [64]u8 = undefined;
+    const cookie_mode = case.flow == .server_cookie;
+    var conn: ?Connection12 = null;
+    defer if (conn) |*c| c.deinit();
+    var retries_served: usize = 0;
+    var datagrams_out: usize = 0;
+
+    var steps: usize = 0;
+    while (true) : (steps += 1) {
+        if (steps > 40) return error.TooManyFlights;
+        const incoming = try sock.receiveTimeout(io, &rx, deadline(io, 10_000));
+        peer_addr = incoming.from;
+        if (conn == null) {
+            const binding = if (cookie_mode) try std.mem.print(&binding_buf, "{f}", .{incoming.from}) else null;
+            conn = try Connection12.serverInit(config12(case, .server, fx, binding));
+            rec.op("server_init");
+            if (binding) |b| rec.hexArg("binding", b);
+            rec.end();
+        }
+        const result = conn.?.handleFlight(incoming.data, rnd, 0, &out) catch |err| {
+            reportPeerDiagnosis(gpa, io, &child, false, "our server rejected wolfSSL's flight", err);
+            return err;
+        };
+        rec.op("flight");
+        rec.hexArg("in", incoming.data);
+        rec.hexArg("out", result.out);
+        rec.numArg("more", @intFromBool(result.need_more_data));
+        rec.end();
+        if (result.out.len > 0) datagrams_out += try sendDatagrams(io, sock, &peer_addr, result.out, case.max_datagram);
+        if (conn.?.isConnected()) break;
+        // Still `.start` after an answer went out: that was a
+        // HelloVerifyRequest and the server kept nothing (RFC 6347 4.2.1).
+        // Throw the connection away; ClientHello 2 must stand on its cookie.
+        if (cookie_mode and conn.?.state == .start and result.out.len > 0) {
+            retries_served += 1;
+            conn.?.deinit();
+            conn = null;
+            rec.op("drop_conn");
+            rec.end();
+        }
+    }
+
+    if (cookie_mode and retries_served < 1) return error.NoRetryWasServed;
+    try expectState12(&conn.?, case);
+    recordExpect12(rec, &conn.?);
+    if (cookie_mode) rec.numArg("min_retries", 1);
+    if (case.mutual) {
+        if (!conn.?.client_cert_presented) return error.PeerPresentedNoCertificate;
+        rec.numArg("client_cert", 1);
+    }
+    if (case.max_datagram > 0 and datagrams_out < 3) return error.OurFlightWasNotFragmented;
+    rec.end();
+
+    var plain: [2048]u8 = undefined;
+    const received = try recvApplicationData12(io, sock, &conn.?, &rx, &plain, rec);
+    try expectBytes("received application data", case.app_expect, received);
+    const echo = try conn.?.send(received, &out);
+    rec.op("send");
+    rec.hexArg("in", received);
+    rec.hexArg("out", echo);
+    rec.end();
+    try sock.send(io, &peer_addr, echo);
+
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0) {
+            std.debug.print("  peer exited {d}, not 0\n", .{code});
+            return error.PeerRejectedUs;
+        },
+        else => return error.PeerDiedAbnormally,
+    }
+    rec.note("peer exited 0 (not replayable): it completed the handshake, in certificate modes after X509_V_OK on our chain, and got its message echoed", .{});
+}
+
 // ── the transcript header ─────────────────────────────────────────────────
 
 fn utcDate(buf: []u8) []const u8 {
@@ -1299,20 +1871,20 @@ fn utcDate(buf: []u8) []const u8 {
     }) catch "unknown";
 }
 
-fn writeHeader(w: *std.Io.Writer, wolfssl_version: []const u8) !void {
+fn writeHeader(w: *std.Io.Writer, wolfssl_version: []const u8, version: Version) !void {
     var date_buf: [16]u8 = undefined;
     try w.print(
-        \\# dtls ↔ wolfSSL DTLS 1.3 transcript — a RECORDING, not a specification.
+        \\# dtls ↔ wolfSSL DTLS {s} transcript — a RECORDING, not a specification.
         \\#
         \\# Every byte below was taken off a real loopback UDP socket between this
         \\# module and wolfSSL. `modules/dtls/tools/interop.zig` wrote it;
-        \\# `modules/dtls/src/wolfssl_replay.zig` replays it with no wolfSSL and no C
+        \\# `modules/dtls/src/{s}` replays it with no wolfSSL and no C
         \\# compiler in sight, which is where the anchor's value now lives. Re-taking it
         \\# needs `libwolfssl-dev` and a C compiler:
         \\#
         \\#     wolfSSL:  {s}
         \\#     captured: {s}
-        \\#     command:  zig build interop-dtls -- --capture
+        \\#     command:  zig build interop-dtls -- --capture{s}
         \\#
         \\# WHAT PINS IT. Our side draws every random byte from `Entropy`, and these
         \\# runs use its `.seeded_for_test` arm with the fixed seed each case records.
@@ -1345,12 +1917,23 @@ fn writeHeader(w: *std.Io.Writer, wolfssl_version: []const u8) !void {
         \\#   expect_epochs write=<n> read=<n>           the connection's write/read epochs
         \\#   expect hrr=<0|1> group=<hex4> [alpn=<name>] [...]
         \\#                                              the connection's own view, after the handshake
+        \\#   expect suite=<hex4> group=<hex4> ems=<0|1> hvr=<n> [...]
+        \\#                                              the same, for a DTLS 1.2 connection
         \\#
         \\format version=1
         \\
         \\
-    , .{ wolfssl_version, utcDate(&date_buf) });
+    , .{
+        if (version == .v12) "1.2" else "1.3",
+        if (version == .v12) "wolfssl12_replay.zig" else "wolfssl_replay.zig",
+        wolfssl_version,
+        utcDate(&date_buf),
+        if (version == .v12) " --version 12" else "",
+    });
 }
+
+/// Which table / transcript a run covers (`--version`).
+const Version = enum { v13, v12 };
 
 // ── main ──────────────────────────────────────────────────────────────────
 
@@ -1360,6 +1943,8 @@ const usage =
     \\  zig build interop-dtls                  run every case live
     \\  zig build interop-dtls -- --capture     ...and rewrite the committed transcript
     \\  zig build interop-dtls -- --case NAME   run one case (repeatable)
+    \\  zig build interop-dtls -- --version 12  only the DTLS 1.2 (or 13) cases; with
+    \\                                          --capture, rewrite only that transcript
     \\  zig build interop-dtls -- --list        list the case names
     \\  zig build interop-dtls -- --repo-root P read wolfssl_peer.c and the fixtures from P
     \\
@@ -1367,6 +1952,14 @@ const usage =
     \\what a capture recorded — is `zig build test-dtls` and needs neither.
     \\
 ;
+
+fn isSelected(selected: []const []const u8, name: []const u8) bool {
+    if (selected.len == 0) return true;
+    for (selected) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
     var da: std.heap.DebugAllocator(.{}) = .init;
@@ -1388,8 +1981,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     child_env = &env_map;
 
     var capture = false;
+    var only: ?Version = null;
     var repo_root: []const u8 = ".";
-    var selected: [cases.len][]const u8 = undefined;
+    var selected: [cases.len + cases12.len][]const u8 = undefined;
     var selected_len: usize = 0;
 
     var args = init.args.iterate();
@@ -1399,7 +1993,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             capture = true;
         } else if (std.mem.eql(u8, arg, "--list")) {
             for (cases) |c| std.debug.print("{s}\t{s}\n", .{ c.name, c.why });
+            for (cases12) |c| std.debug.print("{s}\t{s}\n", .{ c.name, c.why });
             return 0;
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            const v = args.next() orelse "";
+            only = if (std.mem.eql(u8, v, "12")) .v12 else if (std.mem.eql(u8, v, "13")) .v13 else {
+                std.debug.print("--version takes 12 or 13\n{s}", .{usage});
+                return 2;
+            };
         } else if (std.mem.eql(u8, arg, "--case")) {
             const name = args.next() orelse {
                 std.debug.print("--case needs a name\n{s}", .{usage});
@@ -1440,51 +2041,76 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try fx.writeForPeer(io, work);
     const version = readPeerVersion(gpa, io, work);
 
-    var transcript: std.Io.Writer.Allocating = .init(gpa);
-    defer transcript.deinit();
-    var rec: Recorder = .{ .enabled = capture, .out = &transcript.writer };
-    if (capture) try writeHeader(&transcript.writer, version);
-
     // A capture of a SUBSET would silently truncate the committed file into
     // something that still looks complete, so the two are refused together.
+    // `--version` is not a subset: it rewrites one whole transcript.
     if (capture and selected_len > 0) {
-        std.debug.print("--capture rewrites the whole transcript; it cannot be combined with --case\n", .{});
+        std.debug.print("--capture rewrites whole transcripts; it cannot be combined with --case\n", .{});
         return 2;
     }
 
     var ran: usize = 0;
     var failed: usize = 0;
-    for (cases) |case| {
-        if (selected_len > 0) {
-            var wanted = false;
-            for (selected[0..selected_len]) |name| {
-                if (std.mem.eql(u8, name, case.name)) wanted = true;
-            }
-            if (!wanted) continue;
-        }
+    var t13: std.Io.Writer.Allocating = .init(gpa);
+    defer t13.deinit();
+    var t12: std.Io.Writer.Allocating = .init(gpa);
+    defer t12.deinit();
+    var failed13: usize = 0;
+    var failed12: usize = 0;
 
-        std.debug.print("{s} ... ", .{case.name});
-        // Marked BEFORE the case header goes in, so a failure rolls back the
-        // header too rather than leaving a case with no body.
-        const mark = transcript.written().len;
-        rec.raw("case {s}\n", .{case.name});
-        rec.raw("why {s}\n", .{case.why});
-        const result = switch (case.flow) {
-            .client => runClientFlow(gpa, io, work, case, &fx, &rec),
-            .server, .server_cookie => runServerFlow(gpa, io, work, case, &fx, &rec),
-        };
-        ran += 1;
-        if (result) {
-            std.debug.print("ok\n", .{});
-            rec.raw("\n", .{});
-        } else |err| {
-            std.debug.print("FAILED ({t})\n", .{err});
-            failed += 1;
-            // A half-written case must not reach the committed file: it would
-            // be a fixture recording a run that did not work.
-            transcript.shrinkRetainingCapacity(mark);
+    if (only != .v12) {
+        var rec: Recorder = .{ .enabled = capture, .out = &t13.writer };
+        if (capture) try writeHeader(&t13.writer, version, .v13);
+        for (cases) |case| {
+            if (!isSelected(selected[0..selected_len], case.name)) continue;
+            std.debug.print("{s} ... ", .{case.name});
+            // Marked BEFORE the case header goes in, so a failure rolls back
+            // the header too rather than leaving a case with no body.
+            const mark = t13.written().len;
+            rec.raw("case {s}\n", .{case.name});
+            rec.raw("why {s}\n", .{case.why});
+            const result = switch (case.flow) {
+                .client => runClientFlow(gpa, io, work, case, &fx, &rec),
+                .server, .server_cookie => runServerFlow(gpa, io, work, case, &fx, &rec),
+            };
+            ran += 1;
+            if (result) {
+                std.debug.print("ok\n", .{});
+                rec.raw("\n", .{});
+            } else |err| {
+                std.debug.print("FAILED ({t})\n", .{err});
+                failed13 += 1;
+                // A half-written case must not reach the committed file: it
+                // would be a fixture recording a run that did not work.
+                t13.shrinkRetainingCapacity(mark);
+            }
         }
     }
+    if (only != .v13) {
+        var rec: Recorder = .{ .enabled = capture, .out = &t12.writer };
+        if (capture) try writeHeader(&t12.writer, version, .v12);
+        for (cases12) |case| {
+            if (!isSelected(selected[0..selected_len], case.name)) continue;
+            std.debug.print("{s} ... ", .{case.name});
+            const mark = t12.written().len;
+            rec.raw("case {s}\n", .{case.name});
+            rec.raw("why {s}\n", .{case.why});
+            const result = switch (case.flow) {
+                .client => runClientFlow12(gpa, io, work, case, &fx, &rec),
+                .server, .server_cookie => runServerFlow12(gpa, io, work, case, &fx, &rec),
+            };
+            ran += 1;
+            if (result) {
+                std.debug.print("ok\n", .{});
+                rec.raw("\n", .{});
+            } else |err| {
+                std.debug.print("FAILED ({t})\n", .{err});
+                failed12 += 1;
+                t12.shrinkRetainingCapacity(mark);
+            }
+        }
+    }
+    failed = failed13 + failed12;
 
     if (ran == 0) {
         std.debug.print("no case matched\n{s}", .{usage});
@@ -1494,11 +2120,17 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     if (capture) {
         if (failed > 0) {
-            std.debug.print("NOT writing the transcript: {d} case(s) failed\n", .{failed});
+            std.debug.print("NOT writing any transcript: {d} case(s) failed\n", .{failed});
             return 1;
         }
-        try root.writeFile(io, .{ .sub_path = transcript_path, .data = transcript.written() });
-        std.debug.print("wrote {s} ({d} bytes)\n", .{ transcript_path, transcript.written().len });
+        if (only != .v12) {
+            try root.writeFile(io, .{ .sub_path = transcript_path, .data = t13.written() });
+            std.debug.print("wrote {s} ({d} bytes)\n", .{ transcript_path, t13.written().len });
+        }
+        if (only != .v13) {
+            try root.writeFile(io, .{ .sub_path = transcript12_path, .data = t12.written() });
+            std.debug.print("wrote {s} ({d} bytes)\n", .{ transcript12_path, t12.written().len });
+        }
     }
     return if (failed > 0) 1 else 0;
 }

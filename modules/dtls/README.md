@@ -232,11 +232,38 @@ AES-128-GCM and ECDHE_PSK with ChaCha20-Poly1305 (`.psk` mode). Groups
 X25519, secp256r1, secp384r1. RSA-PSS preferred, PKCS#1 v1.5 accepted for
 1.2 peers that offer nothing else. HelloVerifyRequest cookies (stateless,
 via `Config.hello_retry`), retransmission, mutual authentication, the RFC
-5705 exporter and ALPN. Extended master secret (RFC 7627) and secure
-renegotiation signalling (RFC 5746) are required from the peer by default;
-renegotiation itself, CBC suites, static-RSA key exchange, compression and
-resumption are deliberately absent. Self-interop tested only so far — no
-live 1.2 peer yet (SPEC Backlog).
+5705 exporter and ALPN. Extended master secret (RFC 7627) is required from
+the peer by default; a client requires RFC 5746 `renegotiation_info` from the
+server, a server answers it when offered and, since it never renegotiates,
+also serves a client that does not offer it (as OpenSSL, wolfSSL and mbedTLS
+servers do). Renegotiation itself, CBC suites, static-RSA key exchange,
+compression and resumption are deliberately absent.
+
+**Small MTUs.** `Config.max_datagram_len` (1.2 only, default 0 = off) splits
+every handshake message whose record would exceed it into RFC 6347 §4.2.3
+fragments; the bytes a call returns are then several datagrams, which
+`dtls.record.nextDatagram` cuts:
+
+```zig
+var rest = result.out;
+while (rest.len > 0) {
+    const d = dtls.record.nextDatagram(rest, config.max_datagram_len);
+    try socket.send(d.datagram);
+    rest = d.rest;
+}
+```
+
+Incoming fragments may arrive in any order and duplicated; fragments of a
+later message are queued (bounded) rather than dropped.
+
+**Live peer.** `zig build interop-dtls -- --version 12` runs fifteen DTLS 1.2
+cases against wolfSSL 5.9.1 (`wolfDTLSv1_2_*_method`), both roles: ECDHE_PSK,
+ECDHE_ECDSA with all three AEADs and on secp256r1, ECDHE_RSA, mutual
+authentication both ways, wolfSSL's HelloVerifyRequest and ours (stateless),
+wolfSSL fragmenting at a 256-byte MTU, and our side fragmenting at 200 bytes.
+`src/wolfssl12_replay.zig` replays the recording on every test run. Plain PSK
+(`psk_with_aes_128_gcm_sha256`) is self-interop only: Debian's wolfSSL is
+built without static PSK suites.
 
 ## Import
 

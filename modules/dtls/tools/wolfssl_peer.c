@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
-// A real third-party DTLS 1.3 peer for `tools/interop.zig` — wolfSSL in
-// either role, speaking DTLS 1.3 on loopback.
+// A real third-party DTLS peer for `tools/interop.zig` — wolfSSL in either
+// role, speaking DTLS 1.3 (and, in the `12-*` modes, DTLS 1.2) on loopback.
 //
 // THIS FILE IS NOT PART OF THE `dtls` MODULE. It lives beside the program that
 // compiles it, outside `src/`, because a zig-libs module is standalone Zig with
@@ -72,6 +72,16 @@
 //                                     # one more message and echoes it: our
 //                                     # side sends a KeyUpdate in between and
 //                                     # wolfSSL must accept and answer it.
+//   ./wolfssl_peer 12-server-<what> <port> [mtu]
+//   ./wolfssl_peer 12-client-<what> <port> [mtu]
+//                                     # DTLS 1.2 (RFC 6347) through
+//                                     # `wolfDTLSv1_2_*_method`; <what> is
+//                                     # psk (ECDHE-PSK-CHACHA20-POLY1305),
+//                                     # ecdsa, ecdsa-aes256, ecdsa-chacha,
+//                                     # ecdsa-p256 (secp256r1 only),
+//                                     # ecdsa-mutual (client certificates
+//                                     # required / presented) or rsa. See
+//                                     # `run12` below.
 //   ./wolfssl_peer server-ku-theirs <port>
 //                                     # ...and here wolfSSL itself starts a
 //                                     # KeyUpdate (`wolfSSL_update_keys`) after
@@ -585,6 +595,251 @@ static int run_client(int port) {
     return 0;
 }
 
+// ── DTLS 1.2 (RFC 6347), `wolfDTLSv1_2_*_method` ─────────────────────────
+//
+// One runner for every 1.2 mode, configured by `struct opts12`:
+//
+//   * `psk` — ECDHE-PSK (RFC 5489) with the same fixture PSK/identity as the
+//     1.3 modes, through wolfSSL's 1.2 PSK callbacks. Plain (static) PSK is
+//     NOT available: Debian's wolfSSL 5.9.1 is built without
+//     `WOLFSSL_STATIC_PSK`, so `PSK-AES128-GCM-SHA256` does not exist there.
+//   * `cert` / `key` — the identity this side presents (server: always in a
+//     certificate mode; client: only when `client_cert`). DER files written
+//     by the Zig program from the repo's own fixtures.
+//   * `anchor` — the trusted CA for verifying the other side; a client in a
+//     certificate mode always verifies (VERIFY_PEER, verify result asserted),
+//     a server only with `verify_peer` (VERIFY_PEER | FAIL_IF_NO_PEER_CERT).
+//   * `group` / `group_name` — when set, the only ECDHE curve this side
+//     accepts.
+//   * `mtu` — when non-zero, wolfSSL fragments what it sends to fit it.
+//
+// The cookie exchange (HelloVerifyRequest) is wolfSSL's DTLS 1.2 server
+// default and is left on, so every server mode here runs it.
+struct opts12 {
+    int server;
+    int psk;
+    const char *suite;
+    const char *cert;
+    const char *key;
+    const char *anchor;
+    int verify_peer;
+    int client_cert;
+    int group;
+    const char *group_name;
+    int mtu;
+};
+
+static unsigned int psk12_server_cb(WOLFSSL *ssl, const char *identity,
+                                    unsigned char *key, unsigned int key_max_len) {
+    (void)ssl;
+    if (strcmp(identity, kIdentity) != 0) return 0;
+    if (key_max_len < sizeof(kPsk)) return 0;
+    memcpy(key, kPsk, sizeof(kPsk));
+    return (unsigned int)sizeof(kPsk);
+}
+
+static unsigned int psk12_client_cb(WOLFSSL *ssl, const char *hint, char *identity,
+                                    unsigned int id_max_len, unsigned char *key,
+                                    unsigned int key_max_len) {
+    (void)ssl;
+    printf("HINT %s\n", hint ? hint : "");
+    fflush(stdout);
+    if (id_max_len < sizeof(kIdentity)) return 0;
+    memcpy(identity, kIdentity, sizeof(kIdentity));
+    if (key_max_len < sizeof(kPsk)) return 0;
+    memcpy(key, kPsk, sizeof(kPsk));
+    return (unsigned int)sizeof(kPsk);
+}
+
+static int load_anchor_file(WOLFSSL_CTX *ctx, const char *path) {
+    unsigned char der[4096];
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "%s missing\n", path); return 0; }
+    size_t n = fread(der, 1, sizeof(der), f);
+    fclose(f);
+    if (n == 0 || n == sizeof(der)) { fprintf(stderr, "%s unreadable\n", path); return 0; }
+    if (wolfSSL_CTX_load_verify_buffer(ctx, der, (long)n, WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "load_verify_buffer(%s) failed\n", path);
+        return 0;
+    }
+    return 1;
+}
+
+static int run12(int port, struct opts12 o) {
+    WOLFSSL_CTX *ctx = wolfSSL_CTX_new(o.server ? wolfDTLSv1_2_server_method()
+                                                : wolfDTLSv1_2_client_method());
+    if (!ctx) { fprintf(stderr, "CTX_new failed\n"); return 1; }
+    if (wolfSSL_CTX_set_cipher_list(ctx, o.suite) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "set_cipher_list(%s) failed\n", o.suite);
+        return 1;
+    }
+    if (o.psk) {
+        if (o.server) {
+            wolfSSL_CTX_set_psk_server_callback(ctx, psk12_server_cb);
+            if (wolfSSL_CTX_use_psk_identity_hint(ctx, "wolfssl-hint") != WOLFSSL_SUCCESS) {
+                fprintf(stderr, "use_psk_identity_hint failed\n");
+                return 1;
+            }
+        } else {
+            wolfSSL_CTX_set_psk_client_callback(ctx, psk12_client_cb);
+        }
+    }
+    if (o.cert && (o.server || o.client_cert)) {
+        if (wolfSSL_CTX_use_certificate_file(ctx, o.cert, WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS) {
+            fprintf(stderr, "use_certificate_file(%s) failed\n", o.cert);
+            return 1;
+        }
+        if (wolfSSL_CTX_use_PrivateKey_file(ctx, o.key, WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS) {
+            fprintf(stderr, "use_PrivateKey_file(%s) failed\n", o.key);
+            return 1;
+        }
+    }
+    int verify = !o.psk && (!o.server || o.verify_peer);
+    if (verify) {
+        if (!load_anchor_file(ctx, o.anchor)) return 1;
+        wolfSSL_CTX_set_verify(ctx,
+                               o.server ? WOLFSSL_VERIFY_PEER | WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT
+                                        : WOLFSSL_VERIFY_PEER,
+                               NULL);
+    } else {
+        wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, NULL);
+    }
+    if (o.group) {
+        // `set_groups` is the TLS 1.3 key-share knob; a 1.2 server picks its
+        // ECDHE curve from the client's supported_groups minus the curves
+        // `set1_curves_list` leaves out, so that is the one that restricts
+        // it (found live: with `set_groups` alone it still chose X25519).
+        if (wolfSSL_CTX_set1_curves_list(ctx, o.group_name) != WOLFSSL_SUCCESS) {
+            fprintf(stderr, "set1_curves_list(%s) failed\n", o.group_name);
+            return 1;
+        }
+    }
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (o.server) {
+        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) { perror("bind"); return 1; }
+        printf("READY\n");
+        fflush(stdout);
+        char probe[1];
+        struct sockaddr_in peer = {0};
+        socklen_t peer_len = sizeof(peer);
+        if (recvfrom(fd, probe, sizeof(probe), MSG_PEEK, (struct sockaddr *)&peer, &peer_len) < 0) {
+            perror("recvfrom peek");
+            return 1;
+        }
+        if (connect(fd, (struct sockaddr *)&peer, peer_len) != 0) { perror("connect"); return 1; }
+    } else if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror("connect");
+        return 1;
+    }
+
+    WOLFSSL *ssl = wolfSSL_new(ctx);
+    wolfSSL_set_fd(ssl, fd);
+    if (o.mtu > 0 && wolfSSL_dtls_set_mtu(ssl, (unsigned short)o.mtu) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "dtls_set_mtu(%d) failed\n", o.mtu);
+        return 1;
+    }
+    int rc = o.server ? wolfSSL_accept(ssl) : wolfSSL_connect(ssl);
+    if (rc != WOLFSSL_SUCCESS) {
+        int err = wolfSSL_get_error(ssl, rc);
+        char buf[80];
+        fprintf(stderr, "%s failed: %d (%s)\n", o.server ? "accept" : "connect", err,
+                wolfSSL_ERR_error_string((unsigned long)err, buf));
+        return 1;
+    }
+    printf("HANDSHAKE %s %s\n", wolfSSL_get_version(ssl), wolfSSL_get_cipher(ssl));
+    fflush(stdout);
+    if (verify) {
+        if (!o.server) {
+            long vr = wolfSSL_get_verify_result(ssl);
+            if (vr != WOLFSSL_X509_V_OK) { fprintf(stderr, "peer chain not verified: %ld\n", vr); return 1; }
+        }
+        WOLFSSL_X509 *peer_cert = wolfSSL_get_peer_certificate(ssl);
+        if (!peer_cert) { fprintf(stderr, "no peer certificate\n"); return 1; }
+        char *subject = wolfSSL_X509_NAME_oneline(wolfSSL_X509_get_subject_name(peer_cert), NULL, 0);
+        printf("PEERCERT %s\n", subject ? subject : "?");
+        fflush(stdout);
+        wolfSSL_X509_free(peer_cert);
+    }
+
+    char msg[256];
+    if (o.server) {
+        int n = wolfSSL_read(ssl, msg, sizeof(msg) - 1);
+        if (n <= 0) { fprintf(stderr, "read failed\n"); return 1; }
+        msg[n] = '\0';
+        printf("RECV %s\n", msg);
+        fflush(stdout);
+        if (wolfSSL_write(ssl, msg, n) != n) { fprintf(stderr, "write failed\n"); return 1; }
+    } else {
+        const char *hello = "hello from wolfssl 1.2 client";
+        if (wolfSSL_write(ssl, hello, (int)strlen(hello)) <= 0) { fprintf(stderr, "write failed\n"); return 1; }
+        int n = wolfSSL_read(ssl, msg, sizeof(msg) - 1);
+        if (n <= 0) { fprintf(stderr, "read failed\n"); return 1; }
+        msg[n] = '\0';
+        printf("ECHO %s\n", msg);
+        fflush(stdout);
+        if (strcmp(msg, hello) != 0) { fprintf(stderr, "echo differs\n"); return 1; }
+    }
+
+    wolfSSL_shutdown(ssl);
+    wolfSSL_free(ssl);
+    wolfSSL_CTX_free(ctx);
+    close(fd);
+    return 0;
+}
+
+// The 1.2 mode table: `12-<role>-<what>`. Returns -1 for a name that is not
+// a 1.2 mode.
+static int run12_mode(const char *mode, int port, int mtu) {
+    struct opts12 o = {0};
+    o.mtu = mtu;
+    o.anchor = "anchor-cert.der";
+    o.cert = "server-cert.der";
+    o.key = "server-key.der";
+    o.suite = "ECDHE-ECDSA-AES128-GCM-SHA256";
+    if (strncmp(mode, "12-server-", 10) == 0) {
+        o.server = 1;
+        mode += 10;
+    } else if (strncmp(mode, "12-client-", 10) == 0) {
+        mode += 10;
+    } else {
+        return -1;
+    }
+    if (strcmp(mode, "psk") == 0) {
+        o.psk = 1;
+        o.suite = "ECDHE-PSK-CHACHA20-POLY1305";
+    } else if (strcmp(mode, "ecdsa") == 0) {
+    } else if (strcmp(mode, "ecdsa-aes256") == 0) {
+        o.suite = "ECDHE-ECDSA-AES256-GCM-SHA384";
+    } else if (strcmp(mode, "ecdsa-chacha") == 0) {
+        o.suite = "ECDHE-ECDSA-CHACHA20-POLY1305";
+    } else if (strcmp(mode, "ecdsa-p256") == 0) {
+        o.group = WOLFSSL_ECC_SECP256R1;
+        o.group_name = "P-256";
+    } else if (strcmp(mode, "ecdsa-mutual") == 0) {
+        // Server: requires and verifies OUR client certificate. Client:
+        // presents the fixture client certificate to OUR server.
+        o.verify_peer = 1;
+        o.client_cert = 1;
+        if (!o.server) {
+            o.cert = "client-cert.der";
+            o.key = "client-key.der";
+        }
+    } else if (strcmp(mode, "rsa") == 0) {
+        o.suite = "ECDHE-RSA-AES128-GCM-SHA256";
+        o.cert = "rsa12-cert.der";
+        o.key = "rsa12-key.der";
+        o.anchor = "rsa12-cert.der";
+    } else {
+        return -1;
+    }
+    return run12(port, o);
+}
+
 int main(int argc, char **argv) {
     // `version` prints the RUNTIME library version and exits. The recorder
     // stamps the committed transcript with whatever this prints, so the header
@@ -599,8 +854,9 @@ int main(int argc, char **argv) {
                 "usage: %s server|server-hrr|server-cert|server-cert-hrr|"
                 "server-cert-p256|server-cert-p256-hrr|server-cert-mlkem|"
                 "server-cert-mutual|client|client-cert|client-cert-mlkem|"
-                "server-alpn|client-alpn|server-ku-ours|server-ku-theirs "
-                "<port> [mtu] | version\n",
+                "server-alpn|client-alpn|server-ku-ours|server-ku-theirs|"
+                "12-{server,client}-{psk,ecdsa,ecdsa-aes256,ecdsa-chacha,"
+                "ecdsa-p256,ecdsa-mutual,rsa} <port> [mtu] | version\n",
                 argv[0]);
         return 2;
     }
@@ -613,8 +869,10 @@ int main(int argc, char **argv) {
         .group = WOLFSSL_ECC_X25519,
         .verify_peer = 0,
     };
-    int rc;
-    if (strcmp(argv[1], "server") == 0) {
+    int rc = run12_mode(argv[1], port, mtu);
+    if (rc != -1) {
+        // a DTLS 1.2 mode, already run
+    } else if (strcmp(argv[1], "server") == 0) {
         rc = run_server(port, 0);
     } else if (strcmp(argv[1], "server-hrr") == 0) {
         rc = run_server(port, 1);

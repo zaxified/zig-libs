@@ -362,10 +362,38 @@ fn serverSeesHello(exts: []const m12.Extension, suites: []const u16) anyerror!vo
 const ems_ext = m12.Extension{ .ext_type = m12.ext_extended_master_secret, .data = &.{} };
 const ri_ext = m12.Extension{ .ext_type = m12.ext_renegotiation_info, .data = &m12.renegotiation_info_initial };
 
-test "dtls12 server: RFC 7627 required, RFC 5746 required, renegotiation refused, SCSV accepted" {
+/// The extension types of the ServerHello a server answers `exts` with.
+fn serverHelloExtensions(exts: []const m12.Extension, suites: []const u16, types: []u16) ![]const u16 {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(9)));
+    var server = try Connection12.serverInit(pskConfig(.server, &.{.psk_with_aes_128_gcm_sha256}));
+    var body_buf: [512]u8 = undefined;
+    const body = try m12.encodeClientHello(.{ .random = @splat(1), .cipher_suites = suites, .extensions = exts }, &body_buf);
+    var rec: [600]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    const r = try server.handleFlight(buildRecord(1, 0, body, &rec), seeded(&csprng), 0, &out);
+    // The first record is the ServerHello.
+    const sh = r.out[record.plaintext_header_len + handshake.header_len ..];
+    var ext: [16]m12.Extension = undefined;
+    const dec = try m12.decodeServerHello(sh[0 .. std.mem.readInt(u16, r.out[11..13], .big) - handshake.header_len], &ext);
+    for (dec.extensions, 0..) |e, i| types[i] = e.ext_type;
+    return types[0..dec.extensions.len];
+}
+
+test "dtls12 server: RFC 7627 required, renegotiation refused, RFC 5746 answered only when signalled" {
     const psk_suite = [_]u16{0x00a8};
     try testing.expectError(error.ExtendedMasterSecretRequired, serverSeesHello(&.{ri_ext}, &psk_suite));
-    try testing.expectError(error.SecureRenegotiationRequired, serverSeesHello(&.{ems_ext}, &psk_suite));
+    // RFC 5746 §4.3: a server that never renegotiates serves a client that
+    // signals neither the extension nor the SCSV (OpenSSL, wolfSSL and
+    // mbedTLS servers do; Debian's wolfSSL 1.2 client is one, found live) —
+    // and then must not send the extension itself (RFC 5246 §7.4.1.4).
+    try serverSeesHello(&.{ems_ext}, &psk_suite);
+    var types: [16]u16 = undefined;
+    const without = try serverHelloExtensions(&.{ems_ext}, &psk_suite, &types);
+    try testing.expect(std.mem.indexOfScalar(u16, without, m12.ext_renegotiation_info) == null);
+    const with_ext = try serverHelloExtensions(&.{ ems_ext, ri_ext }, &psk_suite, &types);
+    try testing.expect(std.mem.indexOfScalar(u16, with_ext, m12.ext_renegotiation_info) != null);
+    const with_scsv = try serverHelloExtensions(&.{ems_ext}, &.{ 0x00a8, m12.empty_renegotiation_info_scsv }, &types);
+    try testing.expect(std.mem.indexOfScalar(u16, with_scsv, m12.ext_renegotiation_info) != null);
     const reneg = m12.Extension{ .ext_type = m12.ext_renegotiation_info, .data = &.{ 12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 } };
     try testing.expectError(error.SecureRenegotiationRequired, serverSeesHello(&.{ ems_ext, reneg }, &psk_suite));
     // RFC 5746 §3.3: the SCSV stands in for the empty extension.
@@ -591,4 +619,248 @@ test "dtls12: a peer alert is error.ReceivedAlert, during and after the handshak
     var out: [64]u8 = undefined;
     try testing.expectError(error.ReceivedAlert, client.recv(close, &out));
     try testing.expectEqual([2]u8{ 1, 0 }, client.peer_alert.?);
+}
+
+// ── send-side fragmentation and the receive queue (RFC 6347 §4.2.2/§4.2.3) ─
+
+/// Cuts `blob` into datagrams the way a caller must (`record.nextDatagram`),
+/// checking every datagram AND every record against `limit`.
+fn datagramsOf(blob: []const u8, limit: usize, out: [][]const u8) ![]const []const u8 {
+    var n: usize = 0;
+    var rest = blob;
+    while (rest.len > 0) {
+        const s = record.nextDatagram(rest, limit);
+        try testing.expect(s.datagram.len <= limit);
+        out[n] = s.datagram;
+        n += 1;
+        rest = s.rest;
+    }
+    return out[0..n];
+}
+
+/// Feeds `dgs` to `conn` in reverse order, each twice (a duplicate right
+/// after the original), and returns the first answer that came back, copied.
+fn feedReversedTwice(conn: *Connection12, dgs: []const []const u8, rnd: Entropy, reply: []u8) ![]const u8 {
+    var out: [8192]u8 = undefined;
+    var reply_len: usize = 0;
+    var i = dgs.len;
+    while (i > 0) {
+        i -= 1;
+        for (0..2) |_| {
+            const r = try conn.handleFlight(dgs[i], rnd, 0, &out);
+            if (r.out.len == 0) continue;
+            if (reply_len == 0) {
+                @memcpy(reply[0..r.out.len], r.out);
+                reply_len = r.out.len;
+            } else {
+                // A duplicate of an already-consumed datagram after the
+                // answer went out: RFC 6347 §4.2.4 resends that answer.
+                try testing.expectEqual(reply_len, r.out.len);
+            }
+        }
+    }
+    return reply[0..reply_len];
+}
+
+test "dtls12: Config.max_datagram_len fragments every large message; flights delivered reversed and duplicated still complete in one pass" {
+    const limit = 200;
+    var s = ecdsaServerConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256});
+    s.request_client_cert = true;
+    s.require_peer_cert = true;
+    s.peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der };
+    s.max_datagram_len = limit;
+    var c = ecdsaClientConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256});
+    c.cert = .{ .chain = &.{&cert_kat.client_cert_der}, .private_key = clientEcdsa() };
+    c.max_datagram_len = limit;
+
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(21)));
+    const rnd = seeded(&csprng);
+    var client = try Connection12.clientInit(c);
+    defer client.deinit();
+    var server = try Connection12.serverInit(s);
+    defer server.deinit();
+    var bufs: Bufs = .{};
+    var dg_buf: [64][]const u8 = undefined;
+    var reply: [8192]u8 = undefined;
+
+    const ch = try client.startHandshake(rnd, 0, &bufs.a);
+    const ch_dgs = try datagramsOf(ch, limit, &dg_buf);
+    var f4_copy: [8192]u8 = undefined;
+    var f4: []const u8 = &.{};
+    for (ch_dgs) |d| {
+        const r = try server.handleFlight(d, rnd, 0, &bufs.b);
+        if (r.out.len > 0) {
+            @memcpy(f4_copy[0..r.out.len], r.out);
+            f4 = f4_copy[0..r.out.len];
+        }
+    }
+    // The server flight (Certificate ~0.5 KB) needs several datagrams.
+    const f4_dgs = try datagramsOf(f4, limit, &dg_buf);
+    try testing.expect(f4_dgs.len >= 3);
+    const f5 = try feedReversedTwice(&client, f4_dgs, rnd, &reply);
+    try testing.expectEqual(c12.State.wait_server_finished, client.state);
+    // The client's final flight (its own Certificate) is fragmented too;
+    // delivered in order, each datagram twice.
+    var f5_copy: [8192]u8 = undefined;
+    @memcpy(f5_copy[0..f5.len], f5);
+    var dg5: [64][]const u8 = undefined;
+    const f5_dgs = try datagramsOf(f5_copy[0..f5.len], limit, &dg5);
+    try testing.expect(f5_dgs.len >= 3);
+    var f6: []const u8 = &.{};
+    var f6_copy: [1024]u8 = undefined;
+    for (f5_dgs) |d| {
+        for (0..2) |_| {
+            const r = try server.handleFlight(d, rnd, 0, &bufs.b);
+            if (r.done) {
+                @memcpy(f6_copy[0..r.out.len], r.out);
+                f6 = f6_copy[0..r.out.len];
+            }
+        }
+    }
+    try testing.expect(server.isConnected());
+    try testing.expect((try client.handleFlight(f6, rnd, 0, &bufs.a)).done);
+    try testing.expect(server.client_cert_presented);
+    try exchangeData(&client, &server);
+}
+
+test "dtls12: a fragmented flight's retransmission (poll) is fragmented the same way" {
+    var s = ecdsaServerConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256});
+    s.max_datagram_len = 160;
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(22)));
+    const rnd = seeded(&csprng);
+    var client = try Connection12.clientInit(ecdsaClientConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer client.deinit();
+    var server = try Connection12.serverInit(s);
+    defer server.deinit();
+    var bufs: Bufs = .{};
+    const ch = try client.startHandshake(rnd, 0, &bufs.a);
+    const first = try server.handleFlight(ch, rnd, 0, &bufs.b);
+    var dg_buf: [64][]const u8 = undefined;
+    const n_first = (try datagramsOf(first.out, 160, &dg_buf)).len;
+    // Lost: the timer fires, the same messages go out again as fragments
+    // under fresh record numbers.
+    var again_buf: [8192]u8 = undefined;
+    const again = (try server.poll(60_000, &again_buf)).?;
+    try testing.expectEqual(first.out.len, again.len);
+    try testing.expectEqual(n_first, (try datagramsOf(again, 160, &dg_buf)).len);
+    var dg2: [64][]const u8 = undefined;
+    for (try datagramsOf(again, 160, &dg2)) |d| _ = try client.handleFlight(d, rnd, 0, &bufs.a);
+    try testing.expectEqual(c12.State.wait_server_finished, client.state);
+}
+
+test "dtls12: whole messages arriving in reverse order inside one datagram are queued, not dropped" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(23)));
+    const rnd = seeded(&csprng);
+    var client = try Connection12.clientInit(ecdsaClientConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer client.deinit();
+    var server = try Connection12.serverInit(ecdsaServerConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer server.deinit();
+    var bufs: Bufs = .{};
+    const ch = try client.startHandshake(rnd, 0, &bufs.a);
+    const f4 = try server.handleFlight(ch, rnd, 0, &bufs.b);
+    // ServerHello, Certificate, ServerKeyExchange, ServerHelloDone: one
+    // record each. Re-pack them last-first into one datagram.
+    var recs: [8][]const u8 = undefined;
+    var n: usize = 0;
+    var rest = f4.out;
+    while (rest.len > 0) {
+        const one = record.nextDatagram(rest, 1); // one record at a time
+        recs[n] = one.datagram;
+        n += 1;
+        rest = one.rest;
+    }
+    try testing.expectEqual(@as(usize, 4), n);
+    var rev: [8192]u8 = undefined;
+    var len: usize = 0;
+    var i = n;
+    while (i > 0) {
+        i -= 1;
+        @memcpy(rev[len..][0..recs[i].len], recs[i]);
+        len += recs[i].len;
+    }
+    const f5 = try client.handleFlight(rev[0..len], rnd, 0, &bufs.a);
+    try testing.expectEqual(c12.State.wait_server_finished, client.state);
+    try testing.expectEqual(@as(usize, 0), client.rx_future_len);
+    const f6 = try server.handleFlight(f5.out, rnd, 0, &bufs.b);
+    try testing.expect((try client.handleFlight(f6.out, rnd, 0, &bufs.a)).done);
+    try exchangeData(&client, &server);
+}
+
+/// One epoch-0 handshake record carrying one fragment, `body_len` bytes of
+/// `fill` at offset 0 of a message of `total` bytes.
+fn forgedFragment(seq: u48, msg_type: u8, message_seq: u16, total: u24, body_len: u16, fill: u8, out: []u8) []const u8 {
+    const len = handshake.header_len + body_len;
+    _ = record.encodePlaintext(.{ .content_type = 22, .epoch = 0, .sequence_number = seq, .length = @intCast(len) }, out) catch unreachable;
+    handshake.encodeHeader(.{ .msg_type = msg_type, .length = total, .message_seq = message_seq, .fragment_offset = 0, .fragment_length = body_len }, out[record.plaintext_header_len..][0..handshake.header_len]);
+    @memset(out[record.plaintext_header_len + handshake.header_len ..][0..body_len], fill);
+    return out[0 .. record.plaintext_header_len + len];
+}
+
+test "dtls12: a flood of forged later-message fragments stays inside the queue bound and cannot wedge the genuine flight" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(24)));
+    const rnd = seeded(&csprng);
+    var client = try Connection12.clientInit(ecdsaClientConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer client.deinit();
+    var server = try Connection12.serverInit(ecdsaServerConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer server.deinit();
+    var bufs: Bufs = .{};
+    const ch = try client.startHandshake(rnd, 0, &bufs.a);
+
+    // 4000 forged fragments: message_seq 1..8 (inside the queue window)
+    // over and over, each with different content, plus every tenth one far
+    // ahead — far more than the queue holds. A forged message that is
+    // COMPLETE (seq 2, 40 of 40 bytes) is in there too.
+    var rec_buf: [512]u8 = undefined;
+    var seq: u48 = 1000;
+    var k: u16 = 0;
+    while (k < 4000) : (k += 1) {
+        const ms: u16 = if (k % 10 == 9) 9 + k else 1 + k % 8;
+        const d = if (ms == 2)
+            forgedFragment(seq, m12.HandshakeType.certificate, ms, 40, 40, @truncate(k), &rec_buf)
+        else
+            forgedFragment(seq, m12.HandshakeType.certificate, ms, 900, 300, @truncate(k), &rec_buf);
+        seq += 1;
+        const r = try client.handleFlight(d, rnd, 0, &bufs.a);
+        try testing.expectEqual(@as(usize, 0), r.out.len);
+        try testing.expect(client.rx_future_len <= client.rx_future.len);
+    }
+    try testing.expect(client.rx_future_len > client.rx_future.len - 400); // it did fill up
+    try testing.expectEqual(c12.State.wait_server_hello, client.state);
+
+    // The genuine flight still completes: the queued forgeries make the
+    // first pass fail, and the datagram is retried from live bytes alone.
+    // (Its record numbers are put above the forged ones: the epoch-0 replay
+    // window is a separate matter from the queue.)
+    server.send_seq[0] = 1_000_000;
+    const f4 = try server.handleFlight(ch, rnd, 0, &bufs.b);
+    const f5 = try client.handleFlight(f4.out, rnd, 0, &bufs.a);
+    try testing.expectEqual(c12.State.wait_server_finished, client.state);
+    const f6 = try server.handleFlight(f5.out, rnd, 0, &bufs.b);
+    try testing.expect((try client.handleFlight(f6.out, rnd, 0, &bufs.a)).done);
+    try exchangeData(&client, &server);
+
+    // Only the window is queued: far-ahead fragments are not.
+    var c2 = try Connection12.clientInit(ecdsaClientConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer c2.deinit();
+    _ = try c2.startHandshake(rnd, 0, &bufs.a);
+    _ = try c2.handleFlight(forgedFragment(7, m12.HandshakeType.certificate, 9, 40, 40, 1, &rec_buf), rnd, 0, &bufs.a);
+    try testing.expectEqual(@as(usize, 0), c2.rx_future_len);
+    _ = try c2.handleFlight(forgedFragment(8, m12.HandshakeType.certificate, 8, 40, 40, 1, &rec_buf), rnd, 0, &bufs.a);
+    try testing.expectEqual(@as(usize, 13 + 40), c2.rx_future_len);
+
+    // A stateless server at `.start` keeps nothing at all.
+    var s2 = try Connection12.serverInit(ecdsaServerConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer s2.deinit();
+    _ = try s2.handleFlight(forgedFragment(5, m12.HandshakeType.client_key_exchange, 3, 40, 40, 1, &rec_buf), rnd, 0, &bufs.b);
+    try testing.expectEqual(@as(usize, 0), s2.rx_future_len);
+}
+
+test "Config.validate: max_datagram_len below the floor" {
+    var c = pskConfig(.client, &.{.psk_with_aes_128_gcm_sha256});
+    c.max_datagram_len = conn13.min_max_datagram_len - 1;
+    try testing.expectError(error.MaxDatagramLenTooSmall, c.validate());
+    c.max_datagram_len = conn13.min_max_datagram_len;
+    try c.validate();
+    c.max_datagram_len = 0;
+    try c.validate();
 }
