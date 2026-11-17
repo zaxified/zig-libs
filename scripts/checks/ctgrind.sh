@@ -297,7 +297,7 @@ declare -A TARGETS=(
     # ── 2026-10-10: ct-wave: AEAD framing channel keys + plaintext ──
     [aeadframe]="chacha aes"
     # ── 2026-10-10: ct-wave: per-tenant Noise_IK PE statics + ephemerals ──
-    [tenantkex]="ik"
+    [tenantkex]="ik xx"
     # ── 2026-10-10: ct-wave: CTAP2 client PIN, shared secret, pinUvAuthToken ──
     [ctap2]="pin token"
     # ── 2026-10-10: ct-wave: VOPRF server key, client input/blinds, keygen seed ──
@@ -795,6 +795,7 @@ declare -A PATTERN=(
     [aeadframe/chacha]='channel[.]zig|record[.]zig|replay[.]zig|burn[.]zig|root[.]zig'
     [aeadframe/aes]='channel[.]zig|record[.]zig|replay[.]zig|burn[.]zig|root[.]zig'
     [tenantkex/ik]='root[.]zig|burn[.]zig'
+    [tenantkex/xx]='root[.]zig|burn[.]zig'
     [ctap2/pin]='clientpin[.]zig|root[.]zig'
     [ctap2/token]='clientpin[.]zig|root[.]zig'
     # voprf's protocol code moved from root.zig into protocol.zig/groups.zig/h2c.zig
@@ -1181,6 +1182,7 @@ declare -A LABEL=(
     [aeadframe/chacha]='aeadframe ChaCha seal/rekey/open (key+plaintext tainted)'
     [aeadframe/aes]='aeadframe AES-GCM seal/rekey/open (key+plaintext tainted)'
     [tenantkex/ik]='tenantkex Noise_IK both sides (PE statics + ephemerals tainted)'
+    [tenantkex/xx]='tenantkex Noise_XX both sides (PE statics + ephemerals tainted)'
     [ctap2/pin]='ctap2 PIN rules/pad/hash + encrypt/MAC (PIN + shared secret tainted)'
     [ctap2/token]='ctap2 decryptToken + Token.authenticate (shared secret tainted)'
     [voprf/server]='voprf blindEvaluate/Verifiable/Poprf + evaluate (skS + proof nonce tainted)'

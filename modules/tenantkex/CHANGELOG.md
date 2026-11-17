@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NEW (opt-in):** XX mode for an initiator without the responder's provisioned static key — `XxInitiator` (`init`/`initEphemeral`, `writeMessage1`, `readMessage2` reporting the responder's static key for the caller to check, `writeMessage3` → keys) and `XxResponder` (`readMessage1`, `writeMessage2`, `readMessage3` → keys, `UnknownInitiator` unless the initiator key is the provisioned one); three-message `Noise_XX` under a distinct `prologue_label_xx` (`FabricContext.writePrologueXx`), lengths `xxMessage1Len`/`2Len`/`3Len`. IK is unchanged and never switches to XX; IK and XX messages are refused across modes. New ctgrind row `xx`. Tests incl. a byte-exact noise-as-oracle KAT.
 - **2026-11-16** — **NEW (opt-in):** PSK mode `Noise_IKpsk2` — `Initiator.initPsk`/`initPskEphemeral`, `Responder.initPsk`/`initPskEphemeral` take a `*const [32]u8` PSK (copied, wiped by `wipe`); distinct transcript (`prologue_label_psk`, `FabricContext.writeProloguePsk`); wire lengths equal IK's. Plain IK unchanged and default. Tests incl. a byte-exact noise-as-oracle KAT.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-10-18** — Ported to Zig 0.17.0. `X25519.KeyPair.generateDeterministic` no longer returns an error union (`try`/`catch unreachable` dropped). `example/main.zig` wraps `generateDeterministic` in `@as(anyerror!…)` for the now-infallible X25519 call.

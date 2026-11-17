@@ -120,9 +120,33 @@ wrong PSK fails the initiator's `readMessage2` with `DecryptionFailed`; a PSK on
 one side only fails the responder's `readMessage1`. `wipe` destroys the module's
 copy of the PSK.
 
+## XX mode (opt-in): the responder's key is not provisioned
+
+`XxInitiator` / `XxResponder` run a three-message `Noise_XX_25519_ChaChaPoly_SHA256`
+under their own prologue label (`prologue_label_xx`, same fabric fields):
+
+```zig
+var ini: tenantkex.XxInitiator = undefined;
+ini.init(&my_static, ctx); // no responder key
+const n1 = try ini.writeMessage1(rng, "", &m1); // -> e (payload in CLEAR)
+// responder: rsp.init(&its_static, provisioned_initiator_key, ctx);
+//            rsp.readMessage1 -> rsp.writeMessage2 (<- e, ee, s, es)
+var responder_key: tenantkex.PublicKey = undefined;
+_ = try ini.readMessage2(m2, &pl, &responder_key);
+// CHECK responder_key against your trust policy here; on refusal ini.wipe().
+const n3 = try ini.writeMessage3(rng, "", &m3, &keys); // -> s, se; keys
+// responder: rsp.readMessage3(m3, &pl, &keys) -- UnknownInitiator unless the
+//            initiator key is the provisioned one.
+```
+
+Lengths: `xxMessage1Len` (32 + payload), `xxMessage2Len` (96 + payload),
+`xxMessage3Len` (64 + payload). The mode is the caller's explicit choice: an IK
+`Initiator`/`Responder` never switches to XX, and IK and XX messages are refused
+across modes. It is not Noise Pipes' `XXfallback` role switch (see SPEC.md §6).
+
 ## Deferred
 
-XX fallback (responder static unknown), rekey/rehandshake
+Noise Pipes' `XXfallback` (needs `noise`'s `fallback` modifier), rekey/rehandshake
 scheduling (aeadframe's epoch handles in-session rekey; a fresh handshake is a
 new session), handshake-message retransmission/timeout (the transport owns it).
 

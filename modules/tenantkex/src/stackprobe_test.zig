@@ -195,6 +195,8 @@ fn reset() void {
     prng_r = .init(0x7e17_0002);
     ini = undefined;
     rsp = undefined;
+    xini = undefined;
+    xrsp = undefined;
     keys_i = undefined;
     keys_r = undefined;
 }
@@ -224,7 +226,7 @@ noinline fn stepRead2() void {
     apiRead2();
 }
 
-const steps = [_]struct { name: []const u8, call: *const fn () void }{
+const steps = [_]Step{
     .{ .name = "Initiator.init", .call = stepInitI },
     .{ .name = "Responder.init", .call = stepInitR },
     .{ .name = "Initiator.writeMessage1", .call = stepWrite1 },
@@ -305,19 +307,123 @@ fn buildNeedles(n: *Needles) !void {
     n.add("control", control);
 }
 
+// ── XX mode (2026-11-17): adapter, state, steps, needles ─────────────────────
+
+var xini: tk.XxInitiator = undefined;
+var xrsp: tk.XxResponder = undefined;
+var xwire1: [tk.xxMessage1Len(0)]u8 = undefined;
+var xwire2: [tk.xxMessage2Len(0)]u8 = undefined;
+var xwire3: [tk.xxMessage3Len(0)]u8 = undefined;
+var xlearned: tk.PublicKey = undefined;
+
+noinline fn stepXxInitI() void {
+    xini.init(&s_i, ctx);
+}
+noinline fn stepXxInitR() void {
+    xrsp.init(&s_r, s_i.public_key, ctx);
+}
+noinline fn stepXxWrite1() void {
+    wire1_len = xini.writeMessage1(prng_i.random(), "", &xwire1) catch unreachable;
+}
+noinline fn stepXxRead1() void {
+    _ = xrsp.readMessage1(xwire1[0..wire1_len], &pl) catch unreachable;
+}
+noinline fn stepXxWrite2() void {
+    wire2_len = xrsp.writeMessage2(prng_r.random(), "", &xwire2) catch unreachable;
+}
+noinline fn stepXxRead2() void {
+    _ = xini.readMessage2(xwire2[0..wire2_len], &pl, &xlearned) catch unreachable;
+}
+noinline fn stepXxWrite3() void {
+    xwire3_len = xini.writeMessage3(prng_i.random(), "", &xwire3, &keys_i) catch unreachable;
+}
+noinline fn stepXxRead3() void {
+    _ = xrsp.readMessage3(xwire3[0..xwire3_len], &pl, &keys_r) catch unreachable;
+}
+var xwire3_len: usize = 0;
+
+const xx_steps = [_]Step{
+    .{ .name = "XxInitiator.init", .call = stepXxInitI },
+    .{ .name = "XxResponder.init", .call = stepXxInitR },
+    .{ .name = "XxInitiator.writeMessage1", .call = stepXxWrite1 },
+    .{ .name = "XxResponder.readMessage1", .call = stepXxRead1 },
+    .{ .name = "XxResponder.writeMessage2", .call = stepXxWrite2 },
+    .{ .name = "XxInitiator.readMessage2", .call = stepXxRead2 },
+    .{ .name = "XxInitiator.writeMessage3 (+keys)", .call = stepXxWrite3 },
+    .{ .name = "XxResponder.readMessage3 (+keys)", .call = stepXxRead3 },
+};
+
+/// XX's key schedule: MixKey(ee), MixKey(es), MixKey(se), then Split.
+fn buildXxNeedles(n: *Needles) !void {
+    reset();
+    n.addKey("static key I", s_i.secret_key);
+    n.addKey("static key R", s_r.secret_key);
+    const e_i = tk.KeyPair.generateDeterministic(seedOf(prng_i));
+    const e_r = tk.KeyPair.generateDeterministic(seedOf(prng_r));
+    n.addKey("ephemeral key I", e_i.secret_key);
+    n.addKey("ephemeral key R", e_r.secret_key);
+    const ee = try X25519.scalarmult(e_r.secret_key, e_i.public_key);
+    const es = try X25519.scalarmult(e_i.secret_key, s_r.public_key);
+    const se = try X25519.scalarmult(s_i.secret_key, e_r.public_key);
+    n.add("ee", ee);
+    n.add("es", es);
+    n.add("se", se);
+
+    stepXxInitI();
+    const ck0 = xini.hs.symmetric_state.ck;
+    const m_ee = hkdf2(ck0, &ee);
+    const m_es = hkdf2(m_ee.o1, &es);
+    const m_se = hkdf2(m_es.o1, &se);
+    const m_sp = hkdf2(m_se.o1, "");
+    n.add("temp_key (ee)", m_ee.temp);
+    n.add("ck after ee", m_ee.o1);
+    n.add("k after ee", m_ee.o2);
+    n.add("temp_key (es)", m_es.temp);
+    n.add("ck after es", m_es.o1);
+    n.add("k after es", m_es.o2);
+    n.add("temp_key (se)", m_se.temp);
+    n.add("ck after se", m_se.o1);
+    n.add("k after se", m_se.o2);
+    n.add("temp_key (split)", m_sp.temp);
+    n.add("session key i2r", m_sp.o1);
+    n.add("session key r2i", m_sp.o2);
+    stepXxInitR();
+    stepXxWrite1();
+    stepXxRead1();
+    stepXxWrite2();
+    stepXxRead2();
+    stepXxWrite3();
+    stepXxRead3();
+    try std.testing.expectEqualSlices(u8, &s_r.public_key, &xlearned);
+    try std.testing.expectEqualSlices(u8, &keys_i.send_key, &m_sp.o1);
+    try std.testing.expectEqualSlices(u8, &keys_i.recv_key, &m_sp.o2);
+    try std.testing.expectEqualSlices(u8, &keys_r.send_key, &m_sp.o2);
+    n.add("control", control);
+}
+
 fn skipUnlessOptimized() !void {
     if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
 }
 
+const Step = struct { name: []const u8, call: *const fn () void };
+
 test "STACKPROBE tenantkex (wave 9): no key, DH or HKDF residue on the dead stack after any handshake call" {
     try skipUnlessOptimized();
+    try probe("IK", &steps, buildNeedles);
+}
 
+test "STACKPROBE tenantkex XX mode (2026-11-17): no key, DH or HKDF residue after any XX handshake call" {
+    try skipUnlessOptimized();
+    try probe("XX", &xx_steps, buildXxNeedles);
+}
+
+fn probe(comptime label: []const u8, comptime the_steps: []const Step, comptime build: anytype) !void {
     s_i = tk.KeyPair.generateDeterministic(hash("static I"));
     s_r = tk.KeyPair.generateDeterministic(hash("static R"));
     control = hash("control");
 
     var needles: Needles = .{};
-    try buildNeedles(&needles);
+    try build(&needles);
     const nd = needles.slice();
     const ctl = nd.len - 1;
 
@@ -329,13 +435,13 @@ test "STACKPROBE tenantkex (wave 9): no key, DH or HKDF residue on the dead stac
     measure(callLeaky);
     countAll(nd, pos[0..nd.len]);
 
-    var hits: [steps.len][max_needles]usize = @splat(@splat(0));
-    var depth: [steps.len]usize = @splat(0);
-    var shallow: [steps.len]usize = @splat(0);
-    var deep: [steps.len]usize = @splat(0);
+    var hits: [the_steps.len][max_needles]usize = @splat(@splat(0));
+    var depth: [the_steps.len]usize = @splat(0);
+    var shallow: [the_steps.len]usize = @splat(0);
+    var deep: [the_steps.len]usize = @splat(0);
     for (0..3) |_| {
         reset();
-        for (steps, &hits, &depth, &shallow, &deep) |st, *h, *d, *s, *dp| {
+        for (the_steps, &hits, &depth, &shallow, &deep) |st, *h, *d, *s, *dp| {
             resetDepths();
             measure(st.call);
             d.* = @max(d.*, dirtyDepth());
@@ -353,8 +459,8 @@ test "STACKPROBE tenantkex (wave 9): no key, DH or HKDF residue on the dead stac
     };
     bad = bad or total != 0;
     if (verbose or bad) {
-        std.debug.print("\n=== STACKPROBE tenantkex ({t}, window {d} KiB) NEG={any} POS(control)={d} needles={d} total residue={d} ===\n", .{ builtin.mode, WINDOW / 1024, neg[0..nd.len], pos[ctl], nd.len, total });
-        for (steps, &hits, depth, shallow, deep) |st, *h, d, s, dp| {
+        std.debug.print("\n=== STACKPROBE tenantkex " ++ label ++ " ({t}, window {d} KiB) NEG={any} POS(control)={d} needles={d} total residue={d} ===\n", .{ builtin.mode, WINDOW / 1024, neg[0..nd.len], pos[ctl], nd.len, total });
+        for (the_steps, &hits, depth, shallow, deep) |st, *h, d, s, dp| {
             std.debug.print("  {s:<36} dirty={d} B, hits {d}..{d} B\n", .{ st.name, d, s, dp });
             for (nd, h[0..nd.len]) |nn, x| {
                 if (x != 0) std.debug.print("    RESIDUE {s:<34} {d} (3 runs)\n", .{ nn.name, x });

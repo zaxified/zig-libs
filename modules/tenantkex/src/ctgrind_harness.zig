@@ -15,6 +15,10 @@
 //!    a `std.Random` whose fill marks its output undefined) tainted. Static
 //!    public keys, the fabric context (I-SID, PE ids) and lengths are public.
 //!    Both sides' `SessionKeys` are printed.
+//!  * `xx` (2026-11-17) — the same for the XX mode (`XxInitiator.writeMessage1`,
+//!    `XxResponder.readMessage1`, `writeMessage2`, `XxInitiator.readMessage2`,
+//!    `writeMessage3`, `XxResponder.readMessage3`): statics and ephemerals
+//!    tainted, the learned responder static printed with the keys.
 //!
 //! This module is a driver over `noise` (whose own rows measure the
 //! handshake engine); the in-file pattern is this module's own files plus
@@ -31,7 +35,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const tk = @import("root.zig");
 
-const Target = enum { ik };
+const Target = enum { ik, xx };
 const Taint = enum { yes, no };
 
 var taint_on = false;
@@ -91,6 +95,38 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var ikeys: tk.SessionKeys = undefined;
             _ = try ini.readMessage2(m2[0..n2], &pl, &ikeys);
             std.debug.print("ctgrind_result={x}\n", .{ikeys.send_key ++ ikeys.recv_key ++ ikeys.transcript_hash});
+            std.debug.print("ctgrind_result={x}\n", .{rkeys.send_key ++ rkeys.recv_key});
+        },
+        .xx => {
+            var pe_a = tk.KeyPair.generateDeterministic(secretBytes(32, "ctgrind-tenantkex-pe-a-v1"));
+            var pe_b = tk.KeyPair.generateDeterministic(secretBytes(32, "ctgrind-tenantkex-pe-b-v1"));
+            if (taint_on) {
+                std.valgrind.memcheck.makeMemUndefined(&pe_a.secret_key);
+                std.valgrind.memcheck.makeMemUndefined(&pe_b.secret_key);
+            }
+            const ctx: tk.FabricContext = .{ .isid = 0x123456, .initiator_pe = 7, .responder_pe = 9 };
+            var trng: TaintRng = .{ .prng = .init(0x7e4a48) };
+            const rng = trng.random();
+
+            var ini: tk.XxInitiator = undefined;
+            ini.init(&pe_a, ctx);
+            var rsp: tk.XxResponder = undefined;
+            rsp.init(&pe_b, pe_a.public_key, ctx);
+
+            var m1: [256]u8 = undefined;
+            var m2: [256]u8 = undefined;
+            var m3: [256]u8 = undefined;
+            var pl: [64]u8 = undefined;
+            const n1 = try ini.writeMessage1(rng, "", &m1);
+            _ = try rsp.readMessage1(m1[0..n1], &pl);
+            const n2 = try rsp.writeMessage2(rng, "tenant ack", &m2);
+            var learned: tk.PublicKey = undefined;
+            _ = try ini.readMessage2(m2[0..n2], &pl, &learned);
+            var ikeys: tk.SessionKeys = undefined;
+            const n3 = try ini.writeMessage3(rng, "tenant hello", &m3, &ikeys);
+            var rkeys: tk.SessionKeys = undefined;
+            _ = try rsp.readMessage3(m3[0..n3], &pl, &rkeys);
+            std.debug.print("ctgrind_result={x}\n", .{ikeys.send_key ++ ikeys.recv_key ++ ikeys.transcript_hash ++ learned});
             std.debug.print("ctgrind_result={x}\n", .{rkeys.send_key ++ rkeys.recv_key});
         },
     }

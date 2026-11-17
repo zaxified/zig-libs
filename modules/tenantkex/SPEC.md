@@ -36,7 +36,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [WireGuard/wireguard-go](https://github.com/WireGuard/wireguard-go) | Go | MIT | 4.4k | push 2026-05-22 | The deployed `Noise_IKpsk2` user (the design this module cites); handshake + timers + rekey scheduling included, not reusable as a library *(inferred)*. |
 | [spiral-ladder/noiz](https://github.com/spiral-ladder/noiz) | Zig | MIT | 11 | push 2025-06-19 | Zig Noise library; the only Zig Noise alternative found by GitHub search; general patterns, no tenant binding *(inferred)*. |
 
-**Where we are ahead:** the tenant/I-SID/PE-id prologue binding with a permanent positive-control test (a handshake for tenant A fails for tenant B), and the `send_key`/`recv_key` orientation already resolved per role - the split-index footgun is gone; handoff by plain `[32]u8` to `aeadframe`. **Where we are behind:** only `Noise_IK_25519_ChaChaPoly_SHA256`; no PSK modes (IKpsk2, as WireGuard uses), no XX fallback, no rekey/timer scheduling (all listed as deferred in SPEC §6).
+**Where we are ahead:** the tenant/I-SID/PE-id prologue binding with a permanent positive-control test (a handshake for tenant A fails for tenant B), and the `send_key`/`recv_key` orientation already resolved per role - the split-index footgun is gone; handoff by plain `[32]u8` to `aeadframe`. **Where we are behind:** only `Noise_IK_25519_ChaChaPoly_SHA256`; no rekey/timer scheduling (deferred in SPEC §6); PSK (IKpsk2) since 2026-11-16 and an explicit XX mode since 2026-11-17 (no `XXfallback` role switch — snow lacks it too).
 
 ## 1. Model
 
@@ -180,8 +180,13 @@ different prologue, so their bytes do not apply to tenantkex's transcript.)
 
 ## 6. Deferred
 
-* **XX fallback** — when the responder's static key is *not* pre-provisioned.
-  Would add a 3-message pattern and in-band responder-static transmission.
+* **XX for an unprovisioned responder key — DONE 2026-11-17 as an explicit
+  mode, not as Noise Pipes' `XXfallback`.** See § 7. The §10.2 `XXfallback`
+  (an IK msg1 the responder cannot decrypt turns into an XX handshake that
+  reuses the initiator's ephemeral, with the roles switched) stays deferred:
+  the sibling `noise` has no `fallback` modifier, and the module's reference
+  snow ("all features … with the exception of the `fallback` modifier") and
+  flynn/noise do not implement it either; WireGuard has no fallback at all.
 * **Rekey / rehandshake scheduling** — in-session rekey is `aeadframe`'s epoch
   bump; a fresh handshake is simply a new tenantkex session. No scheduler here.
 * **Retransmission / timeout** of handshake messages — owned by the caller's
@@ -202,6 +207,50 @@ also checked mid-handshake and after an `UnknownInitiator` refusal.
 initiator — see § 5 "Mutual authentication". `Responder.init`/`initEphemeral` take the
 provisioned `initiator_static` key; `readMessage1` refuses any other.
 
+## 7. XX mode (2026-11-17)
+
+When the initiator has no provisioned static key for the responder, IK cannot
+start (its msg1 encrypts to that key). `XxInitiator`/`XxResponder` run
+`Noise_XX_25519_ChaChaPoly_SHA256` instead — Noise Pipes' "full handshake"
+(spec §10.2) — over the same `noise` engine:
+
+```
+msg1:  -> e                    [payload in CLEAR]        32 + payload
+msg2:  <- e, ee, s, es         [+ payload]               96 + payload
+msg3:  -> s, se                [+ payload]               64 + payload
+```
+
+* **Policy is explicit.** XX is a separate pair of types chosen by the caller;
+  nothing in `Initiator`/`Responder` falls back to it. The XX prologue label
+  (`prologue_label_xx`) and the pattern differ from IK's, so a message of one
+  mode is refused by a peer in the other: an XX msg1 is too short for an IK
+  responder (`MessageTooShort`) or, padded to IK's length, fails its tag; an
+  IK msg1 is read by an XX responder as an unauthenticated `e` + payload, but
+  the IK initiator then refuses the XX msg2 (`DecryptionFailed`) and the XX
+  responder never reaches keys. All tested.
+* **Responder → initiator.** msg2 carries the responder's static, authenticated
+  as the holder of its private half (`es`), but nothing provisioned vouches for
+  it. `readMessage2` hands it to the caller, who must check it (pin, lookup,
+  out-of-band fingerprint) BEFORE `writeMessage3` reveals the initiator's own
+  static to it; a refusal is `wipe()` and drop. The Noise spec leaves accepting a
+  received static key to the application; snow likewise exposes `get_remote_static()` and leaves the
+  decision to the caller. A test shows an impostor responder completing msg2
+  with its key visible.
+* **Initiator → responder** stays as in IK: `XxResponder` accepts exactly the
+  provisioned key of `ctx.initiator_pe` and refuses any other at msg3 with
+  `UnknownInitiator` — payload zeroed, transport pair zeroed, handshake wiped,
+  no keys written, no further calls.
+* **Binding.** The same `(I-SID, PE pair)` fields follow the label; msg1 is
+  not authenticated, so a mismatch fails at msg2 (`DecryptionFailed`).
+* **Identity hiding** is XX's usual (the initiator's static goes out only
+  after the responder authenticated), moot inside the WG tunnel as for IK.
+* **KAT anchoring** as IK's: raw `noise` XX with the same injected ephemerals
+  and the XX prologue gives byte-identical msg1/msg2/msg3, keys and hash;
+  `noise`'s XX is byte-exact against the noise-c/cacophony
+  `Noise_XX_25519_ChaChaPoly_SHA256` vector, whose prologue is not tenantkex's.
+* **Constant time:** ctgrind row `xx` (both statics and every ephemeral
+  tainted).
+
 ## Secret residue on the dead stack
 
 Review 2026-10-09 (`src/stackprobe_test.zig`, ReleaseFast only): a full IK handshake through the
@@ -215,6 +264,12 @@ handshake calls (`init`/`initEphemeral`, `writeMessage1`, `readMessage1`, `write
 travel by `*const KeyPair`, `init` is in place, and the session keys leave through a `*SessionKeys`.
 After: 0 in every probed call.
 
+XX mode (2026-11-17): a second probe drives a full XX handshake (eight calls: both
+`init`s, `writeMessage1`, `readMessage1`, `writeMessage2`, `readMessage2`, `writeMessage3`,
+`readMessage3`) with the same needle classes (statics, ephemerals, `ee`/`es`/`se`, every HKDF
+`temp_key`, `ck`/`k` after each `MixKey`, both session keys, control): 0 in every probed call;
+the XX calls use the same one-frame-down body and 2 KiB burn.
+
 NOT covered: the caller's `KeyPair`, `SessionKeys` and `Initiator`/`Responder` (the caller's to
 wipe: `wipe()`), `FabricContext` (public), and a `noise` build whose DH leaves more than the 8 KiB
 `noise` burns.
@@ -222,7 +277,8 @@ wipe: `wipe()`), `FabricContext` (public), and a `noise` build whose DH leaves m
 ## Backlog / deferred
 
 - ✅ DONE 2026-11-16 (`Initiator/Responder.initPsk`/`initPskEphemeral`: opt-in `Noise_IKpsk2`, distinct prologue label `prologue_label_psk`, PSK copy wiped by `wipe`; tests: match, wrong PSK, PSK on one side, moved struct, noise-as-oracle KAT) **IKpsk2 (PSK) mode** *(survey 2026-09-30)* — WireGuard runs IK with a PSK as a post-quantum hedge; `noise` already has the `psk` token. Effort: small; fits §2. (Listed in SPEC §6; survey: worth doing if the fabric wants the hedge.)
-- **XX fallback** *(survey 2026-09-30)* — for a responder whose static key is not provisioned. Effort: small-medium; fits §2. (SPEC §6.)
+- ✅ DONE 2026-11-17 (`XxInitiator`/`XxResponder`: explicit opt-in `Noise_XX` under `prologue_label_xx`; the initiator reports the learned responder key for the caller to check before msg3, the responder still accepts only the provisioned initiator key; IK never switches; tests: completion + learned key, impostor responder visible, `UnknownInitiator` at msg3, prologue binding, tampered msg2/msg3, IK↔XX crossings refused both ways, state machine, wipe, noise-as-oracle KAT; § 7) **XX fallback** *(survey 2026-09-30)* — for a responder whose static key is not provisioned. Effort: small-medium; fits §2. (SPEC §6.)
+- **Noise Pipes `XXfallback` (§10.2 role switch)** *(2026-11-17)* — an IK attempt with a stale responder key recovering in the same exchange instead of a new XX handshake. Depends on a `fallback` modifier in `noise` (its SPEC: deferred); snow and flynn/noise lack it too. Effort: medium (noise) + small (here).
 
 ## Anchoring
 

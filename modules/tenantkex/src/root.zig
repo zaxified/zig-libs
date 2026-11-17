@@ -32,9 +32,16 @@
 //! so `initiator.send_key == responder.recv_key` and vice versa. Feed
 //! `send_key` to that side's `aeadframe` Sealer and `recv_key` to its Opener.
 //!
-//! Deferred (see SPEC.md): XX fallback (responder static unknown), PSK modes
-//! (IKpsk2), rekey/rehandshake scheduling (aeadframe's epoch handles in-session
-//! rekey; a fresh handshake is simply a new session), handshake-message
+//! XX mode (`XxInitiator`/`XxResponder`, 2026-11-17): when the initiator has
+//! no provisioned responder static key, an explicit three-message `Noise_XX`
+//! handshake under its own prologue label — the initiator learns the responder
+//! key from msg2 and must check it before msg3; the responder still accepts
+//! only the provisioned initiator key. Never entered silently from IK. Opt-in
+//! PSK mode: `initPsk` (`Noise_IKpsk2`).
+//!
+//! Deferred (see SPEC.md): Noise Pipes' `XXfallback` role switch (needs the
+//! `fallback` modifier in `noise`), rekey/rehandshake scheduling (aeadframe's
+//! epoch handles in-session rekey; a fresh handshake is simply a new session), handshake-message
 //! retransmission/timeout, and identity-hiding hardening (moot here — the whole
 //! handshake already rides an authenticated, encrypted WG tunnel).
 //!
@@ -103,6 +110,14 @@ pub const FabricContext = struct {
 
     /// Serialized prologue length in bytes in PSK mode.
     pub const prologue_len_psk = prologue_label_psk.len + 3 + 4 + 4;
+
+    /// Serialized prologue length in bytes in XX mode.
+    pub const prologue_len_xx = prologue_label_xx.len + 3 + 4 + 4;
+
+    /// As `writePrologue`, with `prologue_label_xx` (the XX mode's transcript).
+    pub fn writePrologueXx(self: FabricContext, buf: *[prologue_len_xx]u8) void {
+        self.writeBody(prologue_label_xx, buf);
+    }
 
     /// As `writePrologue`, with `prologue_label_psk` (the PSK mode's transcript).
     pub fn writeProloguePsk(self: FabricContext, buf: *[prologue_len_psk]u8) void {
@@ -202,6 +217,11 @@ fn fillKeys(comptime is_initiator: bool, pair: *const [2]Suite.CipherState, h: [
 fn wipeHandshake(hs: *HS, psk: *[32]u8) void {
     std.crypto.secureZero(u8, psk);
     hs.psks = &.{};
+    wipeHs(hs);
+}
+
+/// `wipeHandshake` without a PSK (the XX mode has none).
+fn wipeHs(hs: *HS) void {
     if (hs.s != null) std.crypto.secureZero(u8, &hs.s.?.secret_key);
     if (hs.e != null) std.crypto.secureZero(u8, &hs.e.?.secret_key);
     std.crypto.secureZero(u8, &hs.symmetric_state.ck);
@@ -480,6 +500,222 @@ pub const Responder = struct {
         var pair: [2]Suite.CipherState = undefined;
         const step = try self.hs.writeMessage(random, payload, out, &pair);
         if (!step.complete) return error.HandshakeNotComplete; // msg2 completes IK
+        self.state = .done;
+        fillKeys(false, &pair, self.hs.symmetric_state.getHandshakeHash(), keys);
+        return step.len;
+    }
+};
+
+// ── XX mode: the responder's static key is not provisioned ────────────────
+
+/// Prologue label of the XX mode (`Noise_XX`): a distinct transcript from
+/// `prologue_label` and `prologue_label_psk`, so an XX handshake can never be
+/// confused with an IK one.
+pub const prologue_label_xx = "tenantkex/v1 Noise_XX_25519_ChaChaPoly_SHA256";
+
+/// Wire length of XX msg1 for a payload of `payload_len` bytes: e(32) +
+/// payload. ⚠ The msg1 payload travels in CLEAR (no key exists yet).
+pub fn xxMessage1Len(payload_len: usize) usize {
+    return Suite.DHLEN + payload_len;
+}
+/// Wire length of XX msg2: e(32) + encrypted-s(32+16) + payload(+16).
+pub fn xxMessage2Len(payload_len: usize) usize {
+    return Suite.DHLEN + (Suite.DHLEN + Suite.TAGLEN) + payload_len + Suite.TAGLEN;
+}
+/// Wire length of XX msg3: encrypted-s(32+16) + payload(+16).
+pub fn xxMessage3Len(payload_len: usize) usize {
+    return (Suite.DHLEN + Suite.TAGLEN) + payload_len + Suite.TAGLEN;
+}
+
+/// The initiating PE of an XX handshake: it does NOT know the responder's
+/// static key and learns it from msg2. Drive it exactly once through
+/// `writeMessage1` → `readMessage2` → `writeMessage3`.
+///
+/// This is an explicit, separate mode — Noise Pipes' "full handshake"
+/// (Noise spec §10.2), not its `XXfallback` role switch: an IK `Initiator`
+/// or `Responder` never turns into this type, and an XX message is refused
+/// by an IK peer (and the reverse) because the patterns and the prologue
+/// labels differ. The caller chooses XX when it has no provisioned
+/// responder key, and IK otherwise.
+pub const XxInitiator = struct {
+    hs: HS,
+    state: State = .start,
+
+    const State = enum { start, awaiting_msg2, awaiting_write3, done };
+
+    /// Start an XX handshake in place. `static_kp` is this PE's static
+    /// keypair (sent to the responder, encrypted, in msg3); `ctx` binds the
+    /// tenant/PE identity into the prologue exactly as in IK.
+    pub fn init(self: *XxInitiator, static_kp: *const KeyPair, ctx: FabricContext) void {
+        self.initEphemeral(static_kp, ctx, null);
+    }
+
+    /// As `init`, with an explicit ephemeral keypair (KAT/testing hook).
+    pub fn initEphemeral(self: *XxInitiator, static_kp: *const KeyPair, ctx: FabricContext, ephemeral: ?*const KeyPair) void {
+        burn.run(burn.hs_burn, void, initBody, .{ self, static_kp, ctx, ephemeral });
+    }
+
+    fn initBody(self: *XxInitiator, static_kp: *const KeyPair, ctx: FabricContext, ephemeral: ?*const KeyPair) void {
+        self.* = .{ .hs = .{} };
+        var pbuf: [FabricContext.prologue_len_xx]u8 = undefined;
+        ctx.writePrologueXx(&pbuf);
+        self.hs.initialize(noise.patterns.XX, true, &pbuf, &.{ .s = static_kp, .e = ephemeral });
+    }
+
+    /// Destroy the static/ephemeral secrets and the chaining/cipher keys
+    /// held in the handshake state (see `Initiator.wipe`). Call it also to
+    /// abandon a handshake whose responder key the caller refuses.
+    pub fn wipe(self: *XxInitiator) void {
+        wipeHs(&self.hs);
+    }
+
+    /// Emit msg1 (`-> e`) into `out` (needs `xxMessage1Len(payload.len)`
+    /// bytes). ⚠ `payload` is sent in CLEAR — XX's first message has no key;
+    /// pass an empty payload unless it is public.
+    pub fn writeMessage1(self: *XxInitiator, random: std.Random, payload: []const u8, out: []u8) WriteError!usize {
+        return burn.run(burn.hs_burn, WriteError!usize, writeMessage1Body, .{ self, random, payload, out });
+    }
+
+    fn writeMessage1Body(self: *XxInitiator, random: std.Random, payload: []const u8, out: []u8) WriteError!usize {
+        if (self.state != .start) return error.WrongState;
+        var pair: [2]Suite.CipherState = undefined;
+        const step = try self.hs.writeMessage(random, payload, out, &pair);
+        if (step.complete) return error.UnexpectedHandshakeCompletion; // msg1 never completes XX
+        self.state = .awaiting_msg2;
+        return step.len;
+    }
+
+    /// Consume msg2 (`<- e, ee, s, es`), decrypting the responder's payload
+    /// into `payload_out` and its static public key into `responder_static`.
+    /// The key is authenticated as the holder of its private half (the `es`
+    /// DH), but nothing provisioned vouches for it: CHECK IT against the
+    /// caller's trust policy (pin it, look it up, compare a fingerprint
+    /// received out of band) BEFORE `writeMessage3`, which reveals this PE's
+    /// static key to it; on refusal call `wipe` and drop the handshake.
+    /// A tampered msg2 or a mismatched prologue fails `DecryptionFailed`.
+    pub fn readMessage2(self: *XxInitiator, message: []const u8, payload_out: []u8, responder_static: *PublicKey) ReadError!usize {
+        return burn.run(burn.hs_burn, ReadError!usize, readMessage2Body, .{ self, message, payload_out, responder_static });
+    }
+
+    fn readMessage2Body(self: *XxInitiator, message: []const u8, payload_out: []u8, responder_static: *PublicKey) ReadError!usize {
+        if (self.state != .awaiting_msg2) return error.WrongState;
+        var pair: [2]Suite.CipherState = undefined;
+        const step = try self.hs.readMessage(message, payload_out, &pair);
+        if (step.complete) return error.UnexpectedHandshakeCompletion; // msg2 never completes XX
+        responder_static.* = self.hs.rs orelse unreachable; // XX's msg2 always carries `s`
+        self.state = .awaiting_write3;
+        return step.len;
+    }
+
+    /// Emit msg3 (`-> s, se`) into `out` (needs `xxMessage3Len(payload.len)`
+    /// bytes) and derive the session keys into `keys` (only on success).
+    /// Returns the msg3 wire length.
+    pub fn writeMessage3(self: *XxInitiator, random: std.Random, payload: []const u8, out: []u8, keys: *SessionKeys) WriteError!usize {
+        return burn.run(burn.hs_burn, WriteError!usize, writeMessage3Body, .{ self, random, payload, out, keys });
+    }
+
+    fn writeMessage3Body(self: *XxInitiator, random: std.Random, payload: []const u8, out: []u8, keys: *SessionKeys) WriteError!usize {
+        if (self.state != .awaiting_write3) return error.WrongState;
+        var pair: [2]Suite.CipherState = undefined;
+        const step = try self.hs.writeMessage(random, payload, out, &pair);
+        if (!step.complete) return error.HandshakeNotComplete; // msg3 completes XX
+        self.state = .done;
+        fillKeys(true, &pair, self.hs.symmetric_state.getHandshakeHash(), keys);
+        return step.len;
+    }
+};
+
+/// The responding PE of an XX handshake: its static key is sent to the
+/// initiator (encrypted) in msg2, and it still accepts exactly ONE
+/// initiator key — the provisioned key of `ctx.initiator_pe`, as in IK.
+/// Drive it exactly once through `readMessage1` → `writeMessage2` →
+/// `readMessage3`. See `XxInitiator` for when XX is used.
+pub const XxResponder = struct {
+    hs: HS,
+    /// The initiator static public key this responder accepts.
+    expected_initiator: PublicKey,
+    state: State = .start,
+
+    const State = enum { start, awaiting_write2, awaiting_msg3, done, failed };
+
+    /// Start an XX handshake as the responder. `initiator_static` is the
+    /// provisioned static public key of `ctx.initiator_pe` — the only key
+    /// `readMessage3` accepts (`UnknownInitiator` otherwise).
+    pub fn init(self: *XxResponder, static_kp: *const KeyPair, initiator_static: PublicKey, ctx: FabricContext) void {
+        self.initEphemeral(static_kp, initiator_static, ctx, null);
+    }
+
+    /// As `init`, with an explicit ephemeral keypair (KAT/testing hook).
+    pub fn initEphemeral(self: *XxResponder, static_kp: *const KeyPair, initiator_static: PublicKey, ctx: FabricContext, ephemeral: ?*const KeyPair) void {
+        burn.run(burn.hs_burn, void, initBody, .{ self, static_kp, initiator_static, ctx, ephemeral });
+    }
+
+    fn initBody(self: *XxResponder, static_kp: *const KeyPair, initiator_static: PublicKey, ctx: FabricContext, ephemeral: ?*const KeyPair) void {
+        self.* = .{ .hs = .{}, .expected_initiator = initiator_static };
+        var pbuf: [FabricContext.prologue_len_xx]u8 = undefined;
+        ctx.writePrologueXx(&pbuf);
+        self.hs.initialize(noise.patterns.XX, false, &pbuf, &.{ .s = static_kp, .e = ephemeral });
+    }
+
+    /// See `XxInitiator.wipe`.
+    pub fn wipe(self: *XxResponder) void {
+        wipeHs(&self.hs);
+    }
+
+    /// Consume msg1 (`-> e`), copying its CLEAR payload into `payload_out`.
+    /// Nothing in msg1 is authenticated (the prologue is checked from msg2
+    /// on); returns the payload length.
+    pub fn readMessage1(self: *XxResponder, message: []const u8, payload_out: []u8) ReadError!usize {
+        return burn.run(burn.hs_burn, ReadError!usize, readMessage1Body, .{ self, message, payload_out });
+    }
+
+    fn readMessage1Body(self: *XxResponder, message: []const u8, payload_out: []u8) ReadError!usize {
+        if (self.state != .start) return error.WrongState;
+        var pair: [2]Suite.CipherState = undefined;
+        const step = try self.hs.readMessage(message, payload_out, &pair);
+        if (step.complete) return error.UnexpectedHandshakeCompletion; // msg1 never completes XX
+        self.state = .awaiting_write2;
+        return step.len;
+    }
+
+    /// Emit msg2 (`<- e, ee, s, es`) into `out` (needs
+    /// `xxMessage2Len(payload.len)` bytes); returns its wire length.
+    pub fn writeMessage2(self: *XxResponder, random: std.Random, payload: []const u8, out: []u8) WriteError!usize {
+        return burn.run(burn.hs_burn, WriteError!usize, writeMessage2Body, .{ self, random, payload, out });
+    }
+
+    fn writeMessage2Body(self: *XxResponder, random: std.Random, payload: []const u8, out: []u8) WriteError!usize {
+        if (self.state != .awaiting_write2) return error.WrongState;
+        var pair: [2]Suite.CipherState = undefined;
+        const step = try self.hs.writeMessage(random, payload, out, &pair);
+        if (step.complete) return error.UnexpectedHandshakeCompletion; // msg2 never completes XX
+        self.state = .awaiting_msg3;
+        return step.len;
+    }
+
+    /// Consume msg3 (`-> s, se`), decrypting the initiator's payload into
+    /// `payload_out` and deriving the session keys into `keys`. A msg3 under
+    /// any initiator static key but `init`'s `initiator_static` is
+    /// `UnknownInitiator`: the payload is zeroed, the handshake wiped, no keys
+    /// are written and the responder can no longer be driven. A tampered
+    /// msg3 fails `DecryptionFailed`.
+    pub fn readMessage3(self: *XxResponder, message: []const u8, payload_out: []u8, keys: *SessionKeys) ReadError!usize {
+        return burn.run(burn.hs_burn, ReadError!usize, readMessage3Body, .{ self, message, payload_out, keys });
+    }
+
+    fn readMessage3Body(self: *XxResponder, message: []const u8, payload_out: []u8, keys: *SessionKeys) ReadError!usize {
+        if (self.state != .awaiting_msg3) return error.WrongState;
+        var pair: [2]Suite.CipherState = undefined;
+        const step = try self.hs.readMessage(message, payload_out, &pair);
+        if (!step.complete) return error.HandshakeNotComplete; // msg3 completes XX
+        const got = self.hs.rs orelse unreachable; // XX's msg3 always carries `s`
+        if (!std.crypto.timing_safe.eql(PublicKey, got, self.expected_initiator)) {
+            std.crypto.secureZero(u8, payload_out[0..step.len]);
+            std.crypto.secureZero(u8, std.mem.asBytes(&pair));
+            wipeHs(&self.hs);
+            self.state = .failed;
+            return error.UnknownInitiator;
+        }
         self.state = .done;
         fillKeys(false, &pair, self.hs.symmetric_state.getHandshakeHash(), keys);
         return step.len;
@@ -1295,6 +1531,320 @@ test "KAT (noise as oracle): PSK mode == raw Noise_IKpsk2 over the PSK prologue,
     try testing.expectEqualSlices(u8, &ref_pair[0].k, &fin_i.keys.send_key);
     try testing.expectEqualSlices(u8, &ref_pair[1].k, &fin_r.keys.send_key);
     try testing.expectEqualSlices(u8, &rrsp.symmetric_state.getHandshakeHash(), &fin_i.keys.transcript_hash);
+}
+
+// ── XX mode ────────────────────────────────────────────────────────────────
+
+const XxOutcome = union(enum) {
+    ok: struct { i: SessionKeys, r: SessionKeys, learned: PublicKey, n: [3]usize },
+    msg2_failed: ReadError,
+    msg3_failed: ReadError,
+};
+
+/// A full XX handshake: initiator `is` (context `ci`) against responder `rs`
+/// provisioned with `expected` (context `cr`); payloads "a" / "b" / "c".
+fn runXx(is: KeyPair, rs: KeyPair, expected: PublicKey, ci: FabricContext, cr: FabricContext) !XxOutcome {
+    var ini: XxInitiator = undefined;
+    var rsp: XxResponder = undefined;
+    ini.init(&is, ci);
+    rsp.init(&rs, expected, cr);
+    var prng = testRandom(0xC0DE);
+    var m1: [256]u8 = undefined;
+    var m2: [256]u8 = undefined;
+    var m3: [256]u8 = undefined;
+    var pl: [64]u8 = undefined;
+    const n1 = try ini.writeMessage1(prng.random(), "a", m1[0..xxMessage1Len(1)]);
+    try testing.expectEqualStrings("a", pl[0..try rsp.readMessage1(m1[0..n1], &pl)]);
+    const n2 = try rsp.writeMessage2(prng.random(), "b", m2[0..xxMessage2Len(1)]);
+    var learned: PublicKey = undefined;
+    const p2 = ini.readMessage2(m2[0..n2], &pl, &learned) catch |e| return .{ .msg2_failed = e };
+    try testing.expectEqualStrings("b", pl[0..p2]);
+    var ik: SessionKeys = undefined;
+    const n3 = try ini.writeMessage3(prng.random(), "c", m3[0..xxMessage3Len(1)], &ik);
+    var rk: SessionKeys = undefined;
+    const p3 = rsp.readMessage3(m3[0..n3], &pl, &rk) catch |e| return .{ .msg3_failed = e };
+    try testing.expectEqualStrings("c", pl[0..p3]);
+    return .{ .ok = .{ .i = ik, .r = rk, .learned = learned, .n = .{ n1, n2, n3 } } };
+}
+
+test "XX mode: an initiator without the responder's key completes, learns that key, crossed keys" {
+    const is = kp(init_static_priv);
+    const rs = kp(resp_static_priv);
+    const out = (try runXx(is, rs, is.public_key, demo_ctx, demo_ctx)).ok;
+    try testing.expectEqualSlices(u8, &out.i.send_key, &out.r.recv_key);
+    try testing.expectEqualSlices(u8, &out.i.recv_key, &out.r.send_key);
+    try testing.expectEqualSlices(u8, &out.i.transcript_hash, &out.r.transcript_hash);
+    try testing.expect(!std.mem.eql(u8, &out.i.send_key, &out.i.recv_key));
+    try testing.expectEqualSlices(u8, &rs.public_key, &out.learned);
+    try testing.expectEqual([3]usize{ 33, 97, 65 }, out.n);
+    try testing.expectEqual(@as(usize, 32), xxMessage1Len(0));
+    try testing.expectEqual(@as(usize, 96), xxMessage2Len(0));
+    try testing.expectEqual(@as(usize, 64), xxMessage3Len(0));
+    // A different tenant context gives a different transcript (and keys).
+    const other = (try runXx(is, rs, is.public_key, .{ .isid = 1, .initiator_pe = 1001, .responder_pe = 2002 }, .{ .isid = 1, .initiator_pe = 1001, .responder_pe = 2002 })).ok;
+    try testing.expect(!std.mem.eql(u8, &other.i.transcript_hash, &out.i.transcript_hash));
+    // XX and IK between the same PEs derive different keys.
+    const ik = try runHandshake(demo_ctx, demo_ctx);
+    try testing.expect(!std.mem.eql(u8, &ik.i.send_key, &out.i.send_key));
+}
+
+test "XX mode: the responder key is reported, not trusted — an impostor responder is visible to the caller" {
+    // Whoever answers msg1 with a key pair of its own completes msg2; the
+    // initiator's only protection is checking `responder_static` before msg3.
+    const is = kp(init_static_priv);
+    const impostor = kp(@as([32]u8, @splat(0x66)));
+    const out = (try runXx(is, impostor, is.public_key, demo_ctx, demo_ctx)).ok;
+    try testing.expectEqualSlices(u8, &impostor.public_key, &out.learned);
+    try testing.expect(!std.mem.eql(u8, &kp(resp_static_priv).public_key, &out.learned));
+}
+
+test "XX mode: an initiator key other than the provisioned one is UnknownInitiator at msg3, payload zeroed, no keys" {
+    const rs = kp(resp_static_priv);
+    const attacker = kp(@as([32]u8, @splat(0x77)));
+    var ini: XxInitiator = undefined;
+    var rsp: XxResponder = undefined;
+    ini.init(&attacker, demo_ctx);
+    rsp.init(&rs, kp(init_static_priv).public_key, demo_ctx);
+    var prng = testRandom(0x7171);
+    var m1: [256]u8 = undefined;
+    var m2: [256]u8 = undefined;
+    var m3: [256]u8 = undefined;
+    var pl: [64]u8 = undefined;
+    const n1 = try ini.writeMessage1(prng.random(), "", m1[0..xxMessage1Len(0)]);
+    _ = try rsp.readMessage1(m1[0..n1], &pl);
+    const n2 = try rsp.writeMessage2(prng.random(), "", m2[0..xxMessage2Len(0)]);
+    var learned: PublicKey = undefined;
+    _ = try ini.readMessage2(m2[0..n2], &pl, &learned);
+    var ik: SessionKeys = undefined;
+    const n3 = try ini.writeMessage3(prng.random(), "sneaky", m3[0..xxMessage3Len(6)], &ik);
+    var rk: SessionKeys = .{ .send_key = @splat(0xAA), .recv_key = @splat(0xAA), .transcript_hash = @splat(0xAA) };
+    @memset(&pl, 0);
+    try testing.expectError(error.UnknownInitiator, rsp.readMessage3(m3[0..n3], &pl, &rk));
+    try testing.expectEqualSlices(u8, &(@as([64]u8, @splat(0))), &pl);
+    try testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0xAA))), &rk.send_key); // no keys written
+    try testing.expect(std.mem.allEqual(u8, &rsp.hs.s.?.secret_key, 0)); // wiped
+    try testing.expectError(error.WrongState, rsp.readMessage3(m3[0..n3], &pl, &rk));
+    try testing.expectError(error.WrongState, rsp.readMessage1(m1[0..n1], &pl));
+}
+
+test "XX mode: a different I-SID or PE id fails msg2 (the prologue is bound from msg2 on)" {
+    const is = kp(init_static_priv);
+    const rs = kp(resp_static_priv);
+    const a = FabricContext{ .isid = 100, .initiator_pe = 1, .responder_pe = 2 };
+    const b = FabricContext{ .isid = 200, .initiator_pe = 1, .responder_pe = 2 };
+    const c = FabricContext{ .isid = 100, .initiator_pe = 1, .responder_pe = 3 };
+    try testing.expectEqual(ReadError.DecryptionFailed, (try runXx(is, rs, is.public_key, a, b)).msg2_failed);
+    try testing.expectEqual(ReadError.DecryptionFailed, (try runXx(is, rs, is.public_key, a, c)).msg2_failed);
+}
+
+test "XX mode: tampered msg2 and msg3 fail DecryptionFailed and yield no keys" {
+    const is = kp(init_static_priv);
+    const rs = kp(resp_static_priv);
+    inline for (.{ 2, 3 }) |which| {
+        var ini: XxInitiator = undefined;
+        var rsp: XxResponder = undefined;
+        ini.init(&is, demo_ctx);
+        rsp.init(&rs, is.public_key, demo_ctx);
+        var prng = testRandom(0x5151);
+        var m1: [256]u8 = undefined;
+        var m2: [256]u8 = undefined;
+        var m3: [256]u8 = undefined;
+        var pl: [64]u8 = undefined;
+        const n1 = try ini.writeMessage1(prng.random(), "", m1[0..xxMessage1Len(0)]);
+        _ = try rsp.readMessage1(m1[0..n1], &pl);
+        const n2 = try rsp.writeMessage2(prng.random(), "", m2[0..xxMessage2Len(0)]);
+        var learned: PublicKey = undefined;
+        if (which == 2) {
+            m2[n2 - 1] ^= 1;
+            try testing.expectError(error.DecryptionFailed, ini.readMessage2(m2[0..n2], &pl, &learned));
+        } else {
+            _ = try ini.readMessage2(m2[0..n2], &pl, &learned);
+            var ik: SessionKeys = undefined;
+            const n3 = try ini.writeMessage3(prng.random(), "", m3[0..xxMessage3Len(0)], &ik);
+            m3[5] ^= 1; // inside the encrypted static
+            var rk: SessionKeys = undefined;
+            try testing.expectError(error.DecryptionFailed, rsp.readMessage3(m3[0..n3], &pl, &rk));
+        }
+    }
+}
+
+test "XX and IK never cross: a provisioned (IK) peer refuses XX messages, an XX peer refuses IK ones" {
+    const is = kp(init_static_priv);
+    const rs = kp(resp_static_priv);
+    var prng = testRandom(0x1C1C);
+    var m1: [256]u8 = undefined;
+    var m2: [256]u8 = undefined;
+    var pl: [128]u8 = undefined;
+
+    // XX msg1 into an IK responder: too short, and at IK's length (a 64-octet
+    // clear payload) the encrypted `s` it expects fails its tag.
+    {
+        var xi: XxInitiator = undefined;
+        xi.init(&is, demo_ctx);
+        const n1 = try xi.writeMessage1(prng.random(), "", m1[0..xxMessage1Len(0)]);
+        var rsp = tRsp(rs, is.public_key, demo_ctx);
+        try testing.expectError(error.MessageTooShort, rsp.readMessage1(m1[0..n1], &pl));
+        var xi2: XxInitiator = undefined;
+        xi2.init(&is, demo_ctx);
+        const filler: [64]u8 = @splat(0x33);
+        const n1b = try xi2.writeMessage1(prng.random(), &filler, m1[0..xxMessage1Len(64)]);
+        try testing.expectEqual(message1Len(0), n1b);
+        var rsp2 = tRsp(rs, is.public_key, demo_ctx);
+        try testing.expectError(error.DecryptionFailed, rsp2.readMessage1(m1[0..n1b], &pl));
+    }
+    // IK msg1 into an XX responder: XX's msg1 is unauthenticated, so it is
+    // read as `e` + a clear payload — but the IK initiator then refuses the
+    // XX msg2, and the XX responder holds no keys (it waits for a msg3 that
+    // never comes).
+    {
+        var ini = tIni(is, rs.public_key, demo_ctx);
+        const n1 = try ini.writeMessage1(prng.random(), "", m1[0..message1Len(0)]);
+        var xr: XxResponder = undefined;
+        xr.init(&rs, is.public_key, demo_ctx);
+        _ = try xr.readMessage1(m1[0..n1], &pl);
+        const n2 = try xr.writeMessage2(prng.random(), "", m2[0..xxMessage2Len(0)]);
+        var keys: SessionKeys = undefined;
+        try testing.expectError(error.DecryptionFailed, ini.readMessage2(m2[0..n2], &pl, &keys));
+        try testing.expectEqual(XxResponder.State.awaiting_msg3, xr.state);
+    }
+    // XX between peers with the right keys but one side on the IK prologue
+    // label: the transcript differs, msg2 fails.
+    {
+        var pbuf: [FabricContext.prologue_len]u8 = undefined;
+        demo_ctx.writePrologue(&pbuf);
+        var raw: HS = .{};
+        raw.initialize(noise.patterns.XX, true, &pbuf, &.{ .s = &is });
+        var tp: [2]Suite.CipherState = undefined;
+        const w1 = try raw.writeMessage(prng.random(), "", &m1, &tp);
+        var xr: XxResponder = undefined;
+        xr.init(&rs, is.public_key, demo_ctx);
+        _ = try xr.readMessage1(m1[0..w1.len], &pl);
+        const n2 = try xr.writeMessage2(prng.random(), "", m2[0..xxMessage2Len(0)]);
+        try testing.expectError(error.DecryptionFailed, raw.readMessage(m2[0..n2], &pl, &tp));
+    }
+    try testing.expect(!std.mem.eql(u8, prologue_label, prologue_label_xx));
+    try testing.expect(!std.mem.eql(u8, prologue_label_psk, prologue_label_xx));
+}
+
+test "XX mode: out-of-order calls are WrongState" {
+    const is = kp(init_static_priv);
+    const rs = kp(resp_static_priv);
+    var ini: XxInitiator = undefined;
+    var rsp: XxResponder = undefined;
+    ini.init(&is, demo_ctx);
+    rsp.init(&rs, is.public_key, demo_ctx);
+    var prng = testRandom(0x0D0D);
+    var buf: [256]u8 = undefined;
+    var m2: [256]u8 = undefined;
+    var pl: [64]u8 = undefined;
+    var keys: SessionKeys = undefined;
+    var learned: PublicKey = undefined;
+    try testing.expectError(error.WrongState, ini.readMessage2(&buf, &pl, &learned));
+    try testing.expectError(error.WrongState, ini.writeMessage3(prng.random(), "", &buf, &keys));
+    try testing.expectError(error.WrongState, rsp.writeMessage2(prng.random(), "", &buf));
+    try testing.expectError(error.WrongState, rsp.readMessage3(&buf, &pl, &keys));
+    const n1 = try ini.writeMessage1(prng.random(), "", buf[0..xxMessage1Len(0)]);
+    try testing.expectError(error.WrongState, ini.writeMessage1(prng.random(), "", &buf));
+    try testing.expectError(error.WrongState, ini.writeMessage3(prng.random(), "", &buf, &keys));
+    _ = try rsp.readMessage1(buf[0..n1], &pl);
+    try testing.expectError(error.WrongState, rsp.readMessage1(buf[0..n1], &pl));
+    try testing.expectError(error.WrongState, rsp.readMessage3(&buf, &pl, &keys));
+    const n2 = try rsp.writeMessage2(prng.random(), "", m2[0..xxMessage2Len(0)]);
+    try testing.expectError(error.WrongState, rsp.writeMessage2(prng.random(), "", &buf));
+    _ = try ini.readMessage2(m2[0..n2], &pl, &learned);
+    try testing.expectError(error.WrongState, ini.readMessage2(m2[0..n2], &pl, &learned));
+}
+
+test "XX mode: wipe clears the static and ephemeral secrets and the chaining key mid-handshake" {
+    const is = kp(init_static_priv);
+    const rs = kp(resp_static_priv);
+    var ini: XxInitiator = undefined;
+    var rsp: XxResponder = undefined;
+    ini.init(&is, demo_ctx);
+    rsp.init(&rs, is.public_key, demo_ctx);
+    var prng = testRandom(0x0E0E);
+    var m1: [256]u8 = undefined;
+    var m2: [256]u8 = undefined;
+    var pl: [64]u8 = undefined;
+    const n1 = try ini.writeMessage1(prng.random(), "", m1[0..xxMessage1Len(0)]);
+    _ = try rsp.readMessage1(m1[0..n1], &pl);
+    _ = try rsp.writeMessage2(prng.random(), "", m2[0..xxMessage2Len(0)]);
+    // Preconditions, so the checks below cannot pass vacuously.
+    try testing.expect(!std.mem.allEqual(u8, &ini.hs.e.?.secret_key, 0));
+    try testing.expect(!std.mem.allEqual(u8, &rsp.hs.symmetric_state.ck, 0));
+    try testing.expect(rsp.hs.symmetric_state.cipher_state.has_key);
+    ini.wipe();
+    rsp.wipe();
+    for ([_]*HS{ &ini.hs, &rsp.hs }) |hs| {
+        try testing.expect(std.mem.allEqual(u8, &hs.s.?.secret_key, 0));
+        try testing.expect(std.mem.allEqual(u8, &hs.e.?.secret_key, 0));
+        try testing.expect(std.mem.allEqual(u8, &hs.symmetric_state.ck, 0));
+        try testing.expect(std.mem.allEqual(u8, &hs.symmetric_state.cipher_state.k, 0));
+        try testing.expect(!hs.symmetric_state.cipher_state.has_key);
+    }
+    try testing.expectEqualSlices(u8, &init_static_priv, &is.secret_key); // the caller's copy is untouched
+}
+
+test "XX prologue: label, then the same fixed-width fields as IK" {
+    var buf: [FabricContext.prologue_len_xx]u8 = undefined;
+    (FabricContext{ .isid = 0x010203, .initiator_pe = 0x04050607, .responder_pe = 0x08090a0b }).writePrologueXx(&buf);
+    try testing.expectEqualStrings(prologue_label_xx, buf[0..prologue_label_xx.len]);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b }, buf[prologue_label_xx.len..]);
+}
+
+test "KAT (noise as oracle): XX mode == raw Noise_XX over the XX prologue, byte-exact" {
+    // As the IK KAT: `noise`'s Noise_XX_25519_ChaChaPoly_SHA256 is itself
+    // byte-exact against the official noise-c/cacophony XX vector; the
+    // published vector's prologue is not tenantkex's, so its bytes cannot
+    // apply here directly.
+    const is = kp(init_static_priv);
+    const rs = kp(resp_static_priv);
+    const ie = kp(init_eph_priv);
+    const re = kp(resp_eph_priv);
+    var pbuf: [FabricContext.prologue_len_xx]u8 = undefined;
+    demo_ctx.writePrologueXx(&pbuf);
+    var rini: HS = .{};
+    var rrsp: HS = .{};
+    rini.initialize(noise.patterns.XX, true, &pbuf, &.{ .s = &is, .e = &ie });
+    rrsp.initialize(noise.patterns.XX, false, &pbuf, &.{ .s = &rs, .e = &re });
+    var no_rng = testRandom(0);
+    var ref: [3][256]u8 = undefined;
+    var ref_pl: [64]u8 = undefined;
+    var ref_pair: [2]Suite.CipherState = undefined;
+    var scratch: [2]Suite.CipherState = undefined;
+    const r1 = try rini.writeMessage(no_rng.random(), "p1", &ref[0], &scratch);
+    _ = try rrsp.readMessage(ref[0][0..r1.len], &ref_pl, &scratch);
+    const r2 = try rrsp.writeMessage(no_rng.random(), "p2", &ref[1], &scratch);
+    _ = try rini.readMessage(ref[1][0..r2.len], &ref_pl, &scratch);
+    const r3 = try rini.writeMessage(no_rng.random(), "p3", &ref[2], &ref_pair);
+    _ = try rrsp.readMessage(ref[2][0..r3.len], &ref_pl, &scratch);
+
+    var ini: XxInitiator = undefined;
+    var rsp: XxResponder = undefined;
+    ini.initEphemeral(&is, demo_ctx, &ie);
+    rsp.initEphemeral(&rs, is.public_key, demo_ctx, &re);
+    var m: [3][256]u8 = undefined;
+    var pl: [64]u8 = undefined;
+    const n1 = try ini.writeMessage1(no_rng.random(), "p1", m[0][0..xxMessage1Len(2)]);
+    _ = try rsp.readMessage1(m[0][0..n1], &pl);
+    const n2 = try rsp.writeMessage2(no_rng.random(), "p2", m[1][0..xxMessage2Len(2)]);
+    var learned: PublicKey = undefined;
+    _ = try ini.readMessage2(m[1][0..n2], &pl, &learned);
+    var ik: SessionKeys = undefined;
+    const n3 = try ini.writeMessage3(no_rng.random(), "p3", m[2][0..xxMessage3Len(2)], &ik);
+    var rk: SessionKeys = undefined;
+    _ = try rsp.readMessage3(m[2][0..n3], &pl, &rk);
+
+    try testing.expectEqualSlices(u8, ref[0][0..r1.len], m[0][0..n1]);
+    try testing.expectEqualSlices(u8, ref[1][0..r2.len], m[1][0..n2]);
+    try testing.expectEqualSlices(u8, ref[2][0..r3.len], m[2][0..n3]);
+    try testing.expectEqualSlices(u8, &ref_pair[0].k, &ik.send_key);
+    try testing.expectEqualSlices(u8, &ref_pair[1].k, &ik.recv_key);
+    try testing.expectEqualSlices(u8, &ref_pair[1].k, &rk.send_key);
+    try testing.expectEqualSlices(u8, &ref_pair[0].k, &rk.recv_key);
+    const h = rrsp.symmetric_state.getHandshakeHash();
+    try testing.expectEqualSlices(u8, &h, &ik.transcript_hash);
+    try testing.expectEqualSlices(u8, &h, &rk.transcript_hash);
 }
 
 test {
