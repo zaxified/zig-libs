@@ -6,7 +6,7 @@
 
 **Scope:** mvp — OpenMLS v0.9.0, RFC 9420 (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-11 · mutation 2026-11-17 (51/52, 1 eq) · src 88fbe1f46df8c33a
+**Audit:** review 2026-08-11 · mutation 2026-11-17 (53/54, 1 eq) · src 1c40c20aa02a09bc
 
 Audit detail: the 2026-11-17 mutation run is a delta over the cipher-suite work (11 mutants, 11 killed; the signature/public-key codecs, `hpkeSuiteId`, the NIST private-key refusals), added to the 2026-10-06 whole-module run (40/41, 1 eq). See "Cipher suites 0x0002/0x0003/0x0005/0x0007".
 
@@ -1622,6 +1622,12 @@ and signature both verify, and `protectPrivate`'s output decrypts with the
 same keys to the vector's body under a verifying signature. The suite-filtered
 embedded files are re-filtered from the same upstream commit to suites
 {1, 2, 3, 5, 7} (`NOTICE`), in upstream order, with records unmodified.
+
+**Delta mutation 2026-11-17 (NIST HPKE key admission):** 2 mutants on
+`isUnusableHpkeKey`'s new branch (the length guard dropped: killed by an
+index-out-of-bounds panic on the short key; a refused key reported usable:
+killed by the admission test), 2/2; the `@hasDecl` branch is comptime and has
+the second mutant's effect. Card cumulative 53/54, 1 equivalent.
 
 **Delta mutation 2026-11-17** over the non-test changes: 11 mutants, 11
 killed, 0 equivalent. They cover the signature and public-key codecs

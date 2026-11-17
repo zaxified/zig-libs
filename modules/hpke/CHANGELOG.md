@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of `validatePublicKey` (3/3 killed); the Audit card carries it and the morning's `keyPairFromSecret` delta cumulatively (33/37, 4 eq); ctgrind re-measured, counts unchanged, source digests re-pinned.
 - **2026-11-17** — New: `P256Kem`/`P384Kem`/`P521Kem.validatePublicKey(&pk)`, an admission check that refuses (`error.DeserializeError`) exactly the public keys `encap` would refuse (SEC1 uncompressed, canonical, on the curve), so a protocol (MLS KeyPackage `init_key` / leaf `encryption_key`) can refuse an invalid point when it receives it. Same accept set as Go `crypto/ecdh` `NewPublicKey`.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog: a public-key admission check for the NIST DHKEMs (`validatePublicKey`), asked for by `mls` (KeyPackage keys are only checked at `encap` today); catalog grade line regenerated.
 
