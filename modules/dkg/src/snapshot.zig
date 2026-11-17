@@ -883,8 +883,12 @@ test "Participant: resuming at every boundary through complaint, defense, exposu
 
 /// A 2-of-3 world with the bent dealer, brought `steps` rounds on.
 fn world(steps: usize) !tn.TestNet {
+    return worldIn(testing.allocator, steps);
+}
+
+fn worldIn(allocator: Allocator, steps: usize) !tn.TestNet {
     var prng = std.Random.DefaultPrng.init(0xF033);
-    var net = try tn.TestNet.init(testing.allocator, .{ .t = 2, .n = 3 }, prng.random());
+    var net = try tn.TestNet.init(allocator, .{ .t = 2, .n = 3 }, prng.random());
     errdefer net.deinit();
     net.filter = tamperShare2to3;
     try net.startAll();
@@ -1206,4 +1210,91 @@ test "Participant: an input claiming a huge n is refused before anything is allo
     std.mem.writeInt(u32, bytes[11..15], 1, .big);
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     try testing.expectError(error.InvalidState, Participant.fromBytes(failing.allocator(), &bytes));
+}
+
+// ── fuzz: the decoders never panic, leak or accept a non-canonical input ──
+
+const fz = @import("fuzz_test.zig");
+const Mark = fz.Marker(enum { refused, accepted_participant, accepted_receiver, canonical_roundtrip });
+const snapshot_buf_len = 8192;
+
+var corpus_cache: ?[]const []const u8 = null;
+
+/// Real snapshots (a Participant at every round of a world that passes
+/// through complaint, defense, exposure and reconstruction; receivers from
+/// `reshare.fuzzSnapshotCorpus`), each behind a little-endian u32 length.
+fn corpusEntries() []const []const u8 {
+    if (corpus_cache == null) {
+        const pa = std.heap.page_allocator; // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
+        var list: std.ArrayList([]const u8) = .empty;
+        for (0..7) |steps| {
+            var net = worldIn(pa, steps) catch unreachable;
+            defer net.deinit();
+            for (net.parties) |*p| {
+                const bytes = pa.alloc(u8, p.encodedLength()) catch unreachable;
+                _ = p.toBytes(bytes) catch unreachable;
+                list.append(pa, withHeader(pa, bytes)) catch unreachable;
+            }
+        }
+        reshare.fuzzSnapshotCorpus(pa, &list) catch unreachable;
+        corpus_cache = list.toOwnedSlice(pa) catch unreachable;
+    }
+    return corpus_cache.?;
+}
+
+pub fn withHeader(pa: Allocator, bytes: []const u8) []const u8 {
+    const out = pa.alloc(u8, 4 + bytes.len) catch unreachable;
+    std.mem.writeInt(u32, out[0..4], @intCast(bytes.len), .little);
+    @memcpy(out[4..], bytes);
+    return out;
+}
+
+fn fuzzSnapshotSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzSnapshotDecode(std.testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzSnapshotDecode(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
+    var buf: [snapshot_buf_len]u8 = undefined;
+    const len: usize = fz.drawInput(S, src, &buf, corpusEntries());
+    const input = buf[0..len];
+    var accepted = false;
+    if (Participant.fromBytes(gpa, input)) |q| {
+        var p = q;
+        defer p.deinit();
+        accepted = true;
+        Mark.mark(.accepted_participant);
+        const again = try gpa.alloc(u8, p.encodedLength());
+        defer freeBytes(gpa, again);
+        _ = try p.toBytes(again);
+        if (!std.mem.eql(u8, again, input)) return error.NonCanonicalSnapshotAccepted;
+        Mark.mark(.canonical_roundtrip);
+    } else |_| {}
+    if (ReshareReceiver.fromBytes(gpa, input)) |q| {
+        var r = q;
+        defer r.deinit();
+        accepted = true;
+        Mark.mark(.accepted_receiver);
+        const again = try gpa.alloc(u8, r.encodedLength());
+        defer freeBytes(gpa, again);
+        _ = try r.toBytes(again);
+        if (!std.mem.eql(u8, again, input)) return error.NonCanonicalSnapshotAccepted;
+    } else |_| {}
+    if (!accepted) Mark.mark(.refused);
+}
+
+fn freeBytes(gpa: Allocator, b: []u8) void {
+    std.crypto.secureZero(u8, b);
+    gpa.free(b);
+}
+
+test "fuzz: snapshot decoders never panic" {
+    try std.testing.fuzz({}, fuzzSnapshotSmith, .{ .corpus = corpusEntries() });
+}
+
+test "fuzz driver: DKG_FUZZ (snapshot decode)" {
+    try fz.fuzz_driver.run(fuzzSnapshotDecode, .{ .prefix = "DKG_FUZZ", .name = "dkg-snapshot-decode", .scale = 40 });
+}
+
+test "fuzz harness: snapshot decode, 200 seeds, reaches every outcome" {
+    try Mark.reach(fuzzSnapshotDecode, "dkg-snapshot-decode", 200);
 }

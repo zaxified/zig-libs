@@ -1543,9 +1543,13 @@ const snap_old_cfg: Config = .{ .t = 2, .n = 3 };
 const snap_new_cfg: Config = .{ .t = 2, .n = 4 };
 
 fn snapRig(old: []const DkgShareOutput, xs: []Element, filter: ?tn.Filter, do_resume: bool, stop_after: usize, seed: u64) !Rig {
+    return snapRigIn(testing.allocator, old, xs, filter, do_resume, stop_after, seed);
+}
+
+fn snapRigIn(allocator: Allocator, old: []const DkgShareOutput, xs: []Element, filter: ?tn.Filter, do_resume: bool, stop_after: usize, seed: u64) !Rig {
     const rc = configFor(old, snap_old_cfg, snap_new_cfg, &.{ 1, 3 }, xs);
     var prng = std.Random.DefaultPrng.init(seed);
-    var rig = try Rig.init(testing.allocator, rc, old, prng.random());
+    var rig = try Rig.init(allocator, rc, old, prng.random());
     errdefer rig.deinit();
     rig.filter = filter;
     try driveRig(&rig, do_resume, stop_after);
@@ -1797,4 +1801,21 @@ test "ReshareReceiver: a Participant snapshot is not a receiver snapshot and vic
     defer freeSnapR(pb);
     _ = try p.toBytes(pb);
     try testing.expectError(error.InvalidState, ReshareReceiver.fromBytes(testing.allocator, pb));
+}
+
+/// Receiver snapshots at several boundaries of a run with one bent share, for
+/// the snapshot fuzz harness's corpus (each entry behind a LE u32 length).
+pub fn fuzzSnapshotCorpus(pa: Allocator, list: *std.ArrayList([]const u8)) !void {
+    const old = try oldCommittee(pa, snap_old_cfg, 0x5A9_3003);
+    defer freeOutputs(pa, old);
+    var xs: [3]Element = undefined;
+    for ([_]usize{ 0, 1, 3, 99 }) |stop| {
+        var rig = try snapRigIn(pa, old, &xs, bendShare1to2, false, stop, 0x5A9_3004);
+        defer rig.deinit();
+        for (rig.receivers) |*r| {
+            const bytes = try pa.alloc(u8, r.encodedLength());
+            _ = try r.toBytes(bytes);
+            try list.append(pa, @import("snapshot.zig").withHeader(pa, bytes));
+        }
+    }
 }
