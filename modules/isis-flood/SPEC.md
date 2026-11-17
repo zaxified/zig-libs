@@ -6,7 +6,17 @@
 
 **Scope:** mvp — FRR isisd flooding (10.7) and holo-isis flooding (v0.9.0), ISO 10589 §7.3.15/.16 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-08-23 · src ?
+**Audit:** review 2026-09-03 · mutation 2026-11-17 (137/151, 14 eq) · src 16f1f20c43e240d9
+
+**Audit 2026-11-17 (whole-module mutation).** 151 mutants over every non-test line of `src/snp.zig` and `src/scheduler.zig` (the LSP-ID successor / midpoint arithmetic, SNP entry sorting and PDU building with its error mapping, the SRM drain and retransmit pacing, the per-circuit burst cap, the Down-edge reset, PSNP chunking and the SSN drain, CSNP windows, chunk tiling and the series cursor, the wakeup and truncation bookkeeping), one schemata build per round, baseline first. Round 1: 105 killed, 46 survived. 18 tests were added (3 in `snp.zig`, 15 in `scheduler.zig`): successor carrying into the top octet and across 0xFE, midpoint symmetric in its operands, `ValueTooLong` above 15 entries and `BufferTooSmall` for every shorter scratch, last-sent pruning not resurrecting a stale victim, a Down circuit losing only its own pacing records, the burst cap, pacing measured from the real send time and the wakeup naming the retransmit, an unfinished series waking at `now`, PSNP and CSNP failures for lack of effect slots or scratch ending the pass, several PSNPs keeping their own bytes in ascending order, SNP lifetimes aged to the poll time, a window of exactly 256 entries versus one cut at the 256th id, an empty database, a CSNP that found no effect slot being retried, and a finished series restarting from the bottom of the ID space. Round 2 killed 32 of the 46; 14 do not die, all EQUIVALENT:
+- `sortEntries` `<=` for `<` (LSP-IDs in one database are distinct);
+- every `wake = minOpt(wake, now)` on a path that also sets `truncated` (`next_wakeup` is `now` whenever `truncated`, so the update is overwritten): burst cap, out of effect room, PSNP full, CSNP more, CSNP full;
+- `truncated = true` and the out-of-room report in `emitCsnp` / `poll` (an out-of-room CSNP also reports `more`, and every later stage re-checks the effect room);
+- the Down-edge reset of `csnp_primed`, `csnp_next` and the victim list, the first-sight priming and a reset of a circuit that was never Up (each is redundant with another: `csnp_next` starts at 0 and is reset to 0 on a Down edge, so the first CSNP after a flap fires at once with or without priming).
+
+**Finding fixed (behaviour change).** `Scheduler.poll` panicked in Debug / ReleaseSafe on an EMPTY LSDB (a fresh router's first poll): the Debug-only ordering check `for (1..m)` in `emitCsnp` is a range `1..0` when `m == 0` (in ReleaseFast that range is undefined behaviour). The loop is now `for (1..@max(m, 1))`. The CSNP emitted for an empty database is the one ISO/IEC 10589 §7.3.15 describes for an empty summary: one PDU, Start LSP ID 0000.0000.0000.00-00, End LSP ID FFFF.FFFF.FFFF.FF-FF, no LSP Entries TLV (a test pins that content). The same pattern (`for (1..x)`, `x - 1` on a count that can be 0) was searched for in `isis-flood`, `isis-spf` and `l2forward`: every other hit is guarded (`node_count - 1` after the local system is known to be in the graph; `entries[i - 1]` / `entries[j - 1]` only on non-first chunks) or test code with a fixed non-zero count.
+
+Not mutated: the `Config` defaults and `snp` limits (comptime constants), the `emitPsnp` `db.get(...) orelse continue` (unreachable under the `isis-lsdb` invariants, see the comment there), `root.zig` (module metadata) and the golden tests. Counts on the card are whole-module.
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — LSP flooding (keyword review, 2026-10-07)
 

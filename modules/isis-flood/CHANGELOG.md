@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **Fix (behaviour change):** `Scheduler.poll` no longer panics in Debug / ReleaseSafe on an empty LSDB. A fresh router's first poll reached the ordering check `for (1..m)` of `emitCsnp` with `m == 0`, a range `1..0` (undefined behaviour in ReleaseFast). It now emits the one empty CSNP (Start LSP-ID all zeros, End all ones, no LSP Entries) the SPEC describes.
+- **2026-11-17** — tests, from a whole-module mutation audit (151 mutants, 137 killed, 14 equivalent): LSP-ID `successor` / `midpoint` edges, PDU build error mapping, pacing (stale victims, Down circuit, real send time, wakeup), the burst cap, PSNP / CSNP failures for lack of effect slots or scratch, PSNP ordering and byte ownership, aged lifetimes in SNPs, the 256-entry window boundary, the empty database, CSNP retry and the series cursor.
 - **2026-10-18** — Ported to Zig 0.17.0 (`IntegerBitSet.initEmpty()` -> `.empty`). Examples/tools ported to Zig 0.17.0 (example: `.empty`).
 
 - **2026-09-03** — Drift re-audit. **`emitCsnp` no longer binary-searches its
