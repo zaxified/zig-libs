@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** test-only seam `take_seam` inside `takeJob`'s `taking` window (compiled out of non-test builds) and a deterministic test that fails every time when `pause`'s `taking` handshake is disabled; delta mutation 3/3 killed, card 138/142, 4 eq, A1 again.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep (§ GK): 7 mutants over the GK fixes, 7/7 after one new test. Card A1 again.
