@@ -317,6 +317,11 @@ pub const Connection = struct {
     /// 5.0 inbound Topic Aliases (owned topics), `Config.topic_alias_maximum`
     /// long once the first is set; never carried to another connection.
     aliases: []?[]u8 = &.{},
+    /// 5.0 outbound Topic Aliases this broker assigned on this connection
+    /// (owned topics; alias = index + 1), at most `out_alias_max` long.
+    /// Guarded by `tx_lock`.
+    out_aliases: std.ArrayListUnmanaged([]u8) = .empty,
+    out_alias_max: u16 = 0,
     /// 5.0: why the broker is ending the connection, for the DISCONNECT
     /// `process` sends when a handler fails with a violation.
     close_reason: ?packet.ReasonCode = null,
@@ -1386,6 +1391,19 @@ pub const Config = struct {
     /// table itself is 16 bytes a slot, made at the first alias. 0 = none.
     topic_alias_maximum: u16 = 16,
 
+    /// 5.0: Topic Aliases the broker assigns toward a subscriber that announced
+    /// a Topic Alias Maximum in its CONNECT, as Mosquitto does: the first
+    /// PUBLISH of a topic on a connection carries the topic and the next free
+    /// alias (1, 2, ...), later ones of that topic an empty topic and the
+    /// alias. No eviction -- once the client's slots (or this cap) are used,
+    /// further topics go unaliased; a new connection starts empty. A
+    /// delivery whose aliased form would exceed the client's Maximum Packet
+    /// Size goes unaliased. Each alias costs one owned topic copy per
+    /// connection: at most `min(client's maximum, this)` of them. Mosquitto
+    /// takes the client's number as it is; this cap is the memory bound.
+    /// 0 = never alias.
+    outbound_topic_aliases: u16 = 16,
+
     /// Operator limit on the keep-alive a client may ask for, in seconds
     /// (mosquitto.conf `max_keepalive`); 0 = no limit. A client asking for
     /// more -- or for 0, "no keep-alive", which is the longest there is --
@@ -2418,6 +2436,47 @@ pub const Broker = struct {
         for (conn.aliases) |a| if (a) |t| b.allocator.free(t);
         b.allocator.free(conn.aliases);
         conn.aliases = &.{};
+        for (conn.out_aliases.items) |t| b.allocator.free(t);
+        conn.out_aliases.deinit(b.allocator);
+        conn.out_aliases = .empty;
+    }
+
+    /// Encode a delivery PUBLISH for `conn`, with an outbound Topic Alias
+    /// where `Config.outbound_topic_aliases` allows (Mosquitto's policy: an
+    /// alias already assigned for the topic is used with an empty topic; else,
+    /// while the client's slots last, the next free one is assigned and sent
+    /// with the topic). Falls back to the plain packet whenever the aliased
+    /// form does not fit the client's Maximum Packet Size, `tx_buf`, or memory.
+    /// Caller holds `conn.tx_lock`; `p` has passed `fits`.
+    fn encodeDelivery(b: *Broker, conn: *Connection, p: packet.Publish) packet.EncodeError![]const u8 {
+        if (conn.version != .v5 or conn.out_alias_max == 0 or p.topic.len == 0)
+            return packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = p });
+        var q = p;
+        var fresh = false;
+        for (conn.out_aliases.items, 1..) |t, alias| if (std.mem.eql(u8, t, p.topic)) {
+            q.topic = "";
+            q.properties.topic_alias = @intCast(alias);
+            break;
+        };
+        if (q.properties.topic_alias == null) {
+            if (conn.out_aliases.items.len >= conn.out_alias_max)
+                return packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = p });
+            q.properties.topic_alias = @intCast(conn.out_aliases.items.len + 1);
+            fresh = true;
+        }
+        if (packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = q })) |bytes| {
+            if (bytes.len <= conn.client_max_packet) {
+                if (!fresh) return bytes;
+                if (b.allocator.dupe(u8, p.topic)) |owned| {
+                    conn.out_aliases.append(b.allocator, owned) catch {
+                        b.allocator.free(owned);
+                        return packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = p });
+                    };
+                    return bytes;
+                } else |_| {}
+            }
+        } else |_| {}
+        return packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = p });
     }
 
     /// Publish the Will, once, and forget it — or, under 5.0 with a Will
@@ -3265,6 +3324,7 @@ pub const Broker = struct {
             conn.session_expiry_s = sei;
             if (v5) {
                 conn.client_receive_maximum = c.properties.receive_maximum orelse std.math.maxInt(u16);
+                conn.out_alias_max = @min(c.properties.topic_alias_maximum orelse 0, b.config.outbound_topic_aliases);
             }
             conn.state = .connected;
             // The peak of simultaneous clients (`$SYS/broker/clients/maximum`):
@@ -3700,7 +3760,7 @@ pub const Broker = struct {
                             b.allocator.free(x.inflight.orderedRemove(i).bytes);
                             continue;
                         }
-                        bytes = packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = p }) catch {
+                        bytes = b.encodeDelivery(conn, p) catch {
                             b.allocator.free(x.inflight.orderedRemove(i).bytes);
                             b.countDrop(x);
                             continue;
@@ -3729,7 +3789,7 @@ pub const Broker = struct {
                         const p0 = deliveryPacket(conn, m.outgoing(), .at_most_once, m.retain, false, 0, m.ids(), expiry);
                         defer b.allocator.free(m.bytes);
                         if (!b.fits(conn, p0)) continue;
-                        bytes = packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = p0 }) catch {
+                        bytes = b.encodeDelivery(conn, p0) catch {
                             b.countDrop(x);
                             continue;
                         };
@@ -3746,7 +3806,7 @@ pub const Broker = struct {
                             b.allocator.free(m.bytes);
                             continue;
                         }
-                        bytes = packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = p }) catch {
+                        bytes = b.encodeDelivery(conn, p) catch {
                             b.allocator.free(m.bytes);
                             b.countDrop(x);
                             continue;
@@ -4664,7 +4724,7 @@ pub const Broker = struct {
                 return;
             };
         }
-        const bytes = try packet.encodePacket(sub_conn.tx_buf, sub_conn.version, .{ .publish = p });
+        const bytes = try b.encodeDelivery(sub_conn, p);
         try sub_conn.write(bytes);
         _ = b.stats.publish_sent.fetchAdd(1, .monotonic);
     }
@@ -4716,7 +4776,7 @@ pub const Broker = struct {
                 b.countDrop(q);
                 continue;
             };
-            const bytes = packet.encodePacket(conn.tx_buf, conn.version, .{ .publish = p }) catch {
+            const bytes = b.encodeDelivery(conn, p) catch {
                 conn.removePending(p.packet_id);
                 b.countDrop(q);
                 continue;
@@ -8900,6 +8960,163 @@ test "v5 forwarding: a 5.0 subscriber gets the properties unaltered, a 3.1.1 one
     const plain = (try t3.next()).?.publish;
     try testing.expectEqualStrings("r/1", plain.topic);
     try testing.expectEqualStrings("{}", plain.payload);
+}
+
+/// One 5.0 subscriber `id` on `filter`, announcing `props` in its CONNECT.
+fn aliasSub(b: *Broker, tt: *TestTransport, id: []const u8, filter: []const u8, props: packet.Properties) !*Connection {
+    const s = try connect5(b, tt, .{ .client_id = id, .properties = props }, 0);
+    _ = try send5(b, s.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{.{ .filter = filter }} } }, 0);
+    _ = (try next5(tt)).?; // SUBACK
+    return s.conn;
+}
+
+fn aliasPub(b: *Broker, p: *Connection, name: []const u8) !void {
+    _ = try send5(b, p, .{ .publish = .{ .topic = name, .payload = "x" } }, 1);
+}
+
+test "v5 outbound Topic Aliases: Mosquitto's policy -- first use assigns, repeats send an empty topic, no eviction" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var ts = TestTransport{};
+    const s = try aliasSub(&b, &ts, "S", "t/#", .{ .topic_alias_maximum = 2 });
+    var tn = TestTransport{};
+    _ = try aliasSub(&b, &tn, "N", "t/#", .{}); // announced no maximum
+    var t3 = TestTransport{};
+    const s3 = try connectClient(&b, &t3, "S3", 60, 0);
+    try feedSubscribe(&b, s3, 1, &.{.{ .filter = "t/#" }});
+    _ = (try t3.next()).?;
+    var tp = TestTransport{};
+    const p = (try connect5(&b, &tp, .{ .client_id = "P" }, 0)).conn;
+
+    for ([_][]const u8{ "t/a", "t/b", "t/c", "t/a", "t/b", "t/c" }) |name| try aliasPub(&b, p, name);
+    const want = [_]struct { []const u8, ?u16 }{ .{ "t/a", 1 }, .{ "t/b", 2 }, .{ "t/c", null }, .{ "", 1 }, .{ "", 2 }, .{ "t/c", null } };
+    for (want) |w| {
+        const got = (try next5(&ts)).?.publish;
+        try testing.expectEqualStrings(w[0], got.topic);
+        try testing.expectEqual(w[1], got.properties.topic_alias);
+        try testing.expectEqualStrings("x", got.payload);
+    }
+    try testing.expectEqual(@as(usize, 2), s.out_aliases.items.len);
+    // No maximum announced, or 3.1.1: never an alias.
+    for (0..6) |_| {
+        const got = (try next5(&tn)).?.publish;
+        try testing.expect(got.topic.len != 0);
+        try testing.expectEqual(@as(?u16, null), got.properties.topic_alias);
+    }
+    try testing.expectEqualStrings("t/a", (try t3.next()).?.publish.topic);
+
+    // A new connection of the same client starts with no alias.
+    b.remove(s);
+    var ts2 = TestTransport{};
+    _ = try aliasSub(&b, &ts2, "S", "t/#", .{ .topic_alias_maximum = 2 });
+    try aliasPub(&b, p, "t/b");
+    const again = (try next5(&ts2)).?.publish;
+    try testing.expectEqualStrings("t/b", again.topic);
+    try testing.expectEqual(@as(?u16, 1), again.properties.topic_alias);
+}
+
+test "v5 outbound Topic Aliases: Config.outbound_topic_aliases caps (or switches off) what the client announced" {
+    for ([_]u16{ 0, 1 }) |cap| {
+        var b = Broker.init(testing.allocator, .{ .outbound_topic_aliases = cap });
+        defer b.deinit();
+        var ts = TestTransport{};
+        _ = try aliasSub(&b, &ts, "S", "t/#", .{ .topic_alias_maximum = 5 });
+        var tp = TestTransport{};
+        const p = (try connect5(&b, &tp, .{ .client_id = "P" }, 0)).conn;
+        try aliasPub(&b, p, "t/a");
+        try aliasPub(&b, p, "t/b");
+        try aliasPub(&b, p, "t/a");
+        const a1 = (try next5(&ts)).?.publish;
+        const a2 = (try next5(&ts)).?.publish;
+        const a3 = (try next5(&ts)).?.publish;
+        try testing.expectEqual(@as(?u16, if (cap == 1) 1 else null), a1.properties.topic_alias);
+        try testing.expectEqualStrings("t/a", a1.topic);
+        try testing.expectEqual(@as(?u16, null), a2.properties.topic_alias);
+        try testing.expectEqualStrings("t/b", a2.topic);
+        try testing.expectEqual(@as(?u16, if (cap == 1) 1 else null), a3.properties.topic_alias);
+        try testing.expectEqualStrings(if (cap == 1) "" else "t/a", a3.topic);
+    }
+}
+
+test "v5 outbound Topic Aliases: an aliased form over the client's Maximum Packet Size goes out plain and uses no slot" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    const big: [100]u8 = @splat('x');
+    const plain = try packet.packetWireLen(.v5, .{ .publish = .{ .topic = "t/a", .payload = &big } });
+    var ts = TestTransport{};
+    const s = try aliasSub(&b, &ts, "S", "t/#", .{ .topic_alias_maximum = 2, .maximum_packet_size = @intCast(plain) });
+    var tp = TestTransport{};
+    const p = (try connect5(&b, &tp, .{ .client_id = "P" }, 0)).conn;
+    for (0..2) |_| _ = try send5(&b, p, .{ .publish = .{ .topic = "t/a", .payload = &big } }, 1);
+    for (0..2) |_| {
+        const got = (try next5(&ts)).?.publish;
+        try testing.expectEqualStrings("t/a", got.topic);
+        try testing.expectEqual(@as(?u16, null), got.properties.topic_alias);
+    }
+    try testing.expectEqual(@as(usize, 0), s.out_aliases.items.len);
+}
+
+test "v5 outbound Topic Aliases: exact fit of the aliased form, and the queued, resent and offline-queued deliveries" {
+    var b = Broker.init(testing.allocator, .{ .queue_qos0_messages = true });
+    defer b.deinit();
+    // The aliased first-use form is 3 bytes longer than the plain one.
+    const big: [100]u8 = @splat('x');
+    const plain = try packet.packetWireLen(.v5, .{ .publish = .{ .topic = "e/a", .payload = &big } });
+    var te = TestTransport{};
+    const exact = try aliasSub(&b, &te, "E", "e/#", .{ .topic_alias_maximum = 2, .maximum_packet_size = @intCast(plain + 3) });
+    var tx = TestTransport{};
+    _ = try aliasSub(&b, &tx, "X", "e/#", .{ .topic_alias_maximum = 2, .maximum_packet_size = @intCast(plain + 2) });
+    try b.publish("e/a", &big, .at_most_once, false);
+    try testing.expectEqual(@as(?u16, 1), (try next5(&te)).?.publish.properties.topic_alias);
+    try testing.expectEqual(@as(?u16, null), (try next5(&tx)).?.publish.properties.topic_alias);
+    try testing.expectEqual(@as(usize, 1), exact.out_aliases.items.len);
+
+    var tq = TestTransport{};
+    const q0 = try connect5(&b, &tq, .{ .client_id = "Q", .clean_session = false, .properties = .{ .session_expiry_interval = 60, .receive_maximum = 1, .topic_alias_maximum = 3 } }, 0);
+    _ = try send5(&b, q0.conn, .{ .subscribe = .{ .packet_id = 1, .filters = &.{ .{ .filter = "q/1", .qos = .at_least_once }, .{ .filter = "q/2", .qos = .at_least_once }, .{ .filter = "q/0", .qos = .at_most_once } } } }, 0);
+    _ = (try next5(&tq)).?;
+    try b.publish("q/1", "m1", .at_least_once, false); // in flight, never acknowledged
+    const first = (try next5(&tq)).?.publish;
+    try testing.expectEqual(@as(?u16, 1), first.properties.topic_alias);
+    b.remove(q0.conn);
+    try b.publish("q/2", "m2", .at_least_once, false); // offline: queued
+    try b.publish("q/0", "m0", .at_most_once, false); // offline: queued (queue_qos0_messages)
+
+    // Back: the resend (DUP) opens this connection's aliases afresh.
+    var tr = TestTransport{};
+    const q1 = try connect5(&b, &tr, .{ .client_id = "Q", .clean_session = false, .properties = .{ .session_expiry_interval = 60, .receive_maximum = 1, .topic_alias_maximum = 3 } }, 10);
+    const again = (try next5(&tr)).?.publish;
+    try testing.expectEqualStrings("q/1", again.topic);
+    try testing.expectEqual(@as(?u16, 1), again.properties.topic_alias);
+    try testing.expect(again.dup);
+    _ = try send5(&b, q1.conn, .{ .puback = .{ .packet_id = again.packet_id } }, 11);
+    const queued = (try next5(&tr)).?.publish; // the offline QoS 1 message, from the session queue
+    try testing.expectEqualStrings("q/2", queued.topic);
+    try testing.expectEqual(@as(?u16, 2), queued.properties.topic_alias);
+    _ = try send5(&b, q1.conn, .{ .puback = .{ .packet_id = queued.packet_id } }, 12);
+    const q0msg = (try next5(&tr)).?.publish; // the offline QoS 0 message
+    try testing.expectEqualStrings("q/0", q0msg.topic);
+    try testing.expectEqual(@as(?u16, 3), q0msg.properties.topic_alias);
+}
+
+test "v5 outbound Topic Aliases: a clean session's held message (Receive Maximum) goes out aliased" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tc = TestTransport{};
+    const c = try aliasSub(&b, &tc, "C", "t", .{ .topic_alias_maximum = 2, .receive_maximum = 1 });
+    _ = try send5(&b, c, .{ .subscribe = .{ .packet_id = 2, .filters = &.{.{ .filter = "t", .qos = .at_least_once }} } }, 0);
+    _ = (try next5(&tc)).?;
+    try b.publish("t", "1", .at_least_once, false);
+    try b.publish("t", "2", .at_least_once, false); // held: window of 1
+    const held = (try next5(&tc)).?.publish;
+    try testing.expectEqual(@as(?u16, 1), held.properties.topic_alias);
+    try testing.expectEqualStrings("t", held.topic);
+    try testing.expectEqual(@as(?packet.Packet, null), try next5(&tc));
+    _ = try send5(&b, c, .{ .puback = .{ .packet_id = held.packet_id } }, 1);
+    const second = (try next5(&tc)).?.publish;
+    try testing.expectEqualStrings("2", second.payload);
+    try testing.expectEqualStrings("", second.topic);
+    try testing.expectEqual(@as(?u16, 1), second.properties.topic_alias);
 }
 
 test "v5 Message Expiry: retained and queued copies count down and are dropped once it runs out" {

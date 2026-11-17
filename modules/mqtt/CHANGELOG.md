@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **Added (Behaviour change: a 5.0 subscriber that announces a Topic Alias Maximum now receives aliased PUBLISHes):** broker outbound Topic Aliases as Mosquitto does them (first use of a topic assigns the next free alias and sends the topic, repeats send an empty topic and the alias, no eviction, per connection), on every delivery path. `Config.outbound_topic_aliases` (default 16, 0 = off) caps the slots per connection; an aliased form over the client's Maximum Packet Size goes out plain.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** test for the exact Maximum Packet Size boundary of the Response Information (fits at the CONNACK's size, dropped one byte below).
 - **2026-11-17** — **API addition:** `Config.response_information` (default null) — the 5.0 CONNACK Response Information, sent only to a client that asked with Request Response Information = 1; not sent when unset (as Mosquitto, which does not return it, and HiveMQ, which has no setting), invalid, longer than `max_response_information` (256) or over the client's Maximum Packet Size. New export `max_response_information`. Default behaviour unchanged. SPEC: the Reason Strings half of the backlog line was already done (2026-10-17).
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog: the Payload Format validation and `$SYS` statistics items were already implemented (2026-10-17) and are now marked done; no code change.

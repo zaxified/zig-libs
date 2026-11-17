@@ -120,7 +120,7 @@ transport-agnostic client and a broker, all fully offline-testable.
     5.0 connection is told why with a DISCONNECT (0x81, 0x82, 0x93, 0x94, 0x9B;
     0x8E on take-over). Session Expiry with Clean Start; Message Expiry counted
     down through the retained store and session queues (`messagesExpired()`); the
-    forwardable properties carried unaltered; inbound Topic Aliases; the client's
+    forwardable properties carried unaltered; inbound Topic Aliases, and outbound ones toward a subscriber that announces a maximum (`Config.outbound_topic_aliases`, as Mosquitto); the client's
     Receive Maximum and Maximum Packet Size honoured (`oversizeDrops()`); No Local,
     Retain As Published, Retain Handling; Subscription Identifiers; **Shared
     Subscriptions** `$share/{group}/{filter}` (round-robin, connected members first

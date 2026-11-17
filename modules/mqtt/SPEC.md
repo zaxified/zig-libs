@@ -279,7 +279,7 @@ stored with a retained or queued message as property entries. *Limits:* the clie
 Maximum bounds unacknowledged deliveries (a clean connection drops past it, a session waits); a
 delivery larger than the client's Maximum Packet Size or `tx_buf` is dropped for that subscriber,
 as if delivered (3.1.2-25, `oversizeDrops`) — never a delivery failure. *Topic aliases:* inbound
-only (`Config.topic_alias_maximum`), owned topic copies per connection. *Subscriptions:* the trie's
+(`Config.topic_alias_maximum`) and outbound (`Config.outbound_topic_aliases`, Mosquitto's policy), owned topic copies per connection. *Subscriptions:* the trie's
 `SubRef` carries the options; No Local is applied per subscription before collapsing to one copy per
 owner; that copy keeps RETAIN if any matching subscription has Retain As Published, and carries
 every matching Subscription Identifier (3.3.4-4); Retain Handling decides the retained walk
@@ -296,7 +296,7 @@ DISCONNECT:* refusals and acks carry 5.0 codes; a handler that fails records `cl
 `process` sends the DISCONNECT before returning the error as before. A take-over's DISCONNECT 0x8E
 is written after `Broker.mutex` is released (`Superseded`, a reference held, then
 `tellSuperseded`) — never a write under the registry lock. *Not implemented:* extended
-authentication (a CONNECT naming a method gets 0x8C), outbound topic aliases. (Response
+authentication (a CONNECT naming a method gets 0x8C). (Outbound topic aliases: 2026-11-17. Response
 Information and Reason Strings from the broker were added later: 2026-11-17 and 2026-10-17.)
 
 ## Review 2026-10-01 (independent, of the QoS 2 + 5.0 broker work)
@@ -546,7 +546,7 @@ fallback).
 - ~~**MQTT 5.0**~~ — DONE 2026-10-01 (codec, client, broker; see *MQTT 5.0*). ~~**Broker-side inbound QoS 2**~~ — DONE 2026-10-01, both directions (see *QoS 2 in the broker*).
 - **Broker extended authentication** (2026-10-01, deferred from the 5.0 work): AUTH exchanges (4.12) need a hook shaped like `authenticateFn` but multi-step (method, data in → continue/success/deny + data out) and per-connection state between CONNECT and CONNACK, plus re-authentication. Today a CONNECT naming a method gets CONNACK 0x8C, which 4.12.0-1 allows. Effort: medium. The client side already exists (caller-driven).
 - ~~**`restoreSession` for 5.0 sessions**~~ — done 2026-10-02: `SessionSub` options, `restoreSessionWith` with `expiry_interval_s` (see § sessions above).
-- **Broker outbound Topic Aliases** (2026-10-01): the broker never aliases toward a client (legal: 3.1.2-27 only forbids exceeding the client's maximum). Mosquitto does (measured in the interop capture). Effort: small–medium (per-connection LRU of topics, alias per delivery).
+- ~~**Broker outbound Topic Aliases**~~ *(2026-10-01)* — DONE 2026-11-17, as Mosquitto (lib/send_publish.c `send__publish`, lib/alias_mosq.c, read 2026-11-17): for a 5.0 subscriber that announced a Topic Alias Maximum, the first PUBLISH of a topic on the connection carries the topic and the next free alias (1, 2, ...), every later one of that topic an empty topic and the alias; no eviction (once the slots are used, further topics go unaliased); a new connection starts empty; 3.1.1 clients and clients with no maximum are never aliased. Applied on all five delivery paths (live, the clean-session queue, a persistent session's resend, queue and QoS 0 queue) by `Broker.encodeDelivery`. Where this differs from Mosquitto: `Config.outbound_topic_aliases` (default 16, 0 = off) caps what a client's announced maximum may make the broker allocate (Mosquitto takes the client's number as it is -- up to 65535 owned topic copies per connection), and an aliased form that would exceed the client's Maximum Packet Size or `tx_buf` goes out plain and uses no slot (the plain form was already held to those limits).
 - ~~**Payload Format validation** (2026-10-01)~~ ✅ DONE 2026-11-16 (already present since 2026-10-17, line was stale: `Config.validate_payload_format`, default on; a 5.0 PUBLISH with Payload Format Indicator 1 and invalid UTF-8 gets PUBACK/PUBREC 0x99 or DISCONNECT 0x99; test `payload format: invalid UTF-8 ...`).
 - ~~**Response Information / Reason Strings from the broker** (2026-10-01)~~ ✅ DONE: Reason Strings since 2026-10-17 (line was stale), Response Information 2026-11-17 — `Config.response_information` (default null = never sent, as Mosquitto, whose man page lists Request Response Information / Response Information as "supported but not used", and HiveMQ, which has no broker setting for it (an extension interceptor does it); it is a MAY). Set, it goes into the CONNACK of a 5.0 client that sent Request Response Information = 1; not sent for an invalid/over-long value or when the CONNACK would exceed the client's Maximum Packet Size. Tests `v5 CONNACK: Response Information ...`.
 - **Client: automatic outbound Topic Aliases** (2026-10-01): outbound aliases are the caller's per publish. An opt-in LRU (as paho offers) would save bytes on repetitive topics. Effort: small.
