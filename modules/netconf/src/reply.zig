@@ -240,6 +240,9 @@ pub fn parseReply(gpa: std.mem.Allocator, source: []const u8) ParseError!Reply {
     var ok = false;
     var ok_count: usize = 0;
     var data_count: usize = 0;
+    // RFC 6022 §4.2 spells the get-schema `<data>` in `ietf-netconf-monitoring`;
+    // it is not `Reply.data`, but two `<data>` in either namespace are one too many.
+    var monitoring_data_count: usize = 0;
 
     var it = root.elementIterator();
     while (it.next()) |child| {
@@ -264,6 +267,9 @@ pub fn parseReply(gpa: std.mem.Allocator, source: []const u8) ParseError!Reply {
                 continue;
             }
         }
+        if (std.mem.eql(u8, child.uri, monitoring_ns) and std.mem.eql(u8, child.local, "data")) {
+            monitoring_data_count += 1;
+        }
         // Anything else is an RPC-specific output element; `body` holds it.
     }
 
@@ -276,7 +282,7 @@ pub fn parseReply(gpa: std.mem.Allocator, source: []const u8) ParseError!Reply {
         @as(u2, @intFromBool(ok_count > 0)) +
         @as(u2, @intFromBool(data_count > 0)) +
         @as(u2, @intFromBool(errors.items.len > 0));
-    if (categories_present > 1 or ok_count > 1 or data_count > 1) return error.AmbiguousReply;
+    if (categories_present > 1 or ok_count > 1 or data_count + monitoring_data_count > 1) return error.AmbiguousReply;
 
     return .{
         .gpa = gpa,
@@ -1575,18 +1581,21 @@ test "parseSchemaList: a leaf is trimmed and joined across text and CDATA nodes"
     try testing.expectEqualStrings("x y", l.items[1].format);
 }
 
-test "parseSchemaText: first <data> wins; an XML body is returned byte for byte, untrimmed" {
+test "parseSchemaText: two <data> are ambiguous in either namespace; an XML body is returned byte for byte, untrimmed" {
     const gpa = testing.allocator;
     const mon = "xmlns=\"" ++ monitoring_ns ++ "\"";
     const head = "<rpc-reply message-id=\"1\" xmlns=\"" ++ base_ns ++ "\">";
+    // ncclient reads the first one and libnetconf2 (libyang: one instance of the
+    // output leaf) refuses; RFC 6241 §4.2 allows a single <data>. Refused.
+    try testing.expectError(error.AmbiguousReply, parseReply(gpa, head ++ "<data " ++ mon ++ ">first</data><data " ++ mon ++ ">second</data></rpc-reply>"));
+    try testing.expectError(error.AmbiguousReply, parseReply(gpa, head ++ "<data>first</data><data>second</data></rpc-reply>"));
+    try testing.expectError(error.AmbiguousReply, parseReply(gpa, head ++ "<data>first</data><data " ++ mon ++ ">second</data></rpc-reply>"));
     {
-        // Two <data> in the monitoring namespace are not an AmbiguousReply (only
-        // the base-namespace ones are counted); the first is the schema.
-        var r = try parseReply(gpa, head ++ "<data " ++ mon ++ ">first</data><data " ++ mon ++ ">second</data></rpc-reply>");
+        var r = try parseReply(gpa, head ++ "<data " ++ mon ++ ">only</data></rpc-reply>");
         defer r.deinit();
         const text = try parseSchemaText(gpa, &r);
         defer gpa.free(text);
-        try testing.expectEqualStrings("first", text);
+        try testing.expectEqualStrings("only", text);
     }
     {
         const inner = "\n  <xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><!-- c --></xs:schema>\n ";
