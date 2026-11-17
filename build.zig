@@ -182,7 +182,7 @@ pub const module_list = [_]Module{
     .{ .name = "brotli", .libs = &.{"web"}, .test_deps = &.{"testkit"} },
     .{ .name = "bzip2", .libs = &.{"format"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "lzma", .libs = &.{"format"}, .test_deps = &.{"testkit"}, .heavy = true },
-    .{ .name = "lz4", .libs = &.{"format"}, .test_deps = &.{"testkit"}, .heavy = true },
+    .{ .name = "lz4", .libs = &.{ "format", "storage" }, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "zstd", .libs = &.{ "format", "storage", "web" }, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "dns", .libs = &.{"net"}, .deps = &.{ "netaddr", "http", "tlsclient", "b64ct" }, .test_deps = &.{ "testkit", "tlsserver" }, .loopback = true },
     .{ .name = "ramcache", .libs = &.{ "storage", "net" }, .test_deps = &.{"testkit"} },

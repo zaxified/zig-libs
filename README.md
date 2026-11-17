@@ -290,7 +290,7 @@ those crypto and format modules are yours too without going looking.
 |---|---:|---|
 | `web` | 36 | [`netaddr`](modules/netaddr/README.md) (net) · [`zstd`](modules/zstd/README.md) (format) · [`entropy`](modules/entropy/README.md) (crypto) · [`rsa`](modules/rsa/README.md) (crypto) · [`regex`](modules/regex/README.md) (format) · [`protobuf`](modules/protobuf/README.md) (format) · [`p256`](modules/p256/README.md) (crypto) · [`keycodec`](modules/keycodec/README.md) (crypto) |
 | `net` | 76 | [`http`](modules/http/README.md) (web) · [`ramcache`](modules/ramcache/README.md) (storage) · [`resilience`](modules/resilience/README.md) (web) · [`kvtree`](modules/kvtree/README.md) (storage) · [`rsa`](modules/rsa/README.md) (crypto) · [`xml`](modules/xml/README.md) (web) · [`x509`](modules/x509/README.md) (crypto) · [`tlsclient`](modules/tlsclient/README.md) (crypto) · [`tlsserver`](modules/tlsserver/README.md) (crypto) · [`sphinx`](modules/sphinx/README.md) (crypto) · [`aesgcm`](modules/aesgcm/README.md) (crypto) |
-| `storage` | 18 | [`zstd`](modules/zstd/README.md) (format) · [`crc32`](modules/crc32/README.md) (format) · [`crc32c`](modules/crc32c/README.md) (format) · [`hashdigest`](modules/hashdigest/README.md) (crypto) |
+| `storage` | 18 | [`lz4`](modules/lz4/README.md) (format) · [`zstd`](modules/zstd/README.md) (format) · [`crc32`](modules/crc32/README.md) (format) · [`crc32c`](modules/crc32c/README.md) (format) · [`hashdigest`](modules/hashdigest/README.md) (crypto) |
 | `crypto` | 89 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
 | `format` | 30 | [`http`](modules/http/README.md) (web) · [`decimal`](modules/decimal/README.md) (storage) |
 | `os` | 16 | [`framing`](modules/framing/README.md) (format) |
@@ -518,7 +518,7 @@ Every one of the 265 modules above claims `.linux64` (Linux, amd64 or arm64) —
 
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
-| [`arrow`](modules/arrow/README.md) | 3 (S,H,P) | Apache Arrow IPC stream and file format for dataframe frames (stream and file format, ZSTD body compression; hardening in progress) | any | dataframe, zstd |
+| [`arrow`](modules/arrow/README.md) | 3 (S,H,P) | Apache Arrow IPC stream and file format for dataframe frames (stream and file format, ZSTD and LZ4_FRAME body compression; hardening in progress) | any | dataframe, zstd, lz4 |
 | [`blobstore`](modules/blobstore/README.md) | 2 (S,E,A,P) | Content-addressed blob store (git-object/restic style) with refcounted GC, configurable fan-out and a cross-process ingest lock, plus name-addressed and small named-record layers; crash-safe. | posix | hashdigest |
 | [`dataframe`](modules/dataframe/README.md) | 2 (S,E,A,P) | Columnar dataframe (`Frame`): typed columns, validity bitmaps and pandas/polars verbs — aggregate, join, pivot, sort, melt, filter. | any | datefmt, csvstream, regex, tz, unitext |
 | [`decimal`](modules/decimal/README.md) | 2 (S,E,A,P) | Exact i128 fixed-point decimal for money math with IEEE/GDA rounding modes and rescale — float-free arithmetic, f64 only at an explicit fromFloat/toFloat boundary. | any | — |
@@ -544,6 +544,7 @@ Every one of the 265 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | [`crc32`](modules/crc32/README.md) *(format)* | 2 (S,E,A,P) | CRC-32 (IEEE: gzip/zlib/PNG) — x86-64 PCLMULQDQ folding and ARMv8 CRC instructions picked at run time, slicing-by-8 fallback; drop-in for std.hash.Crc32, streaming, extend, combine. | any (x86-64 PCLMULQDQ / arm64 CRC asm + portable fallback) | — |
 | [`crc32c`](modules/crc32c/README.md) *(format)* | 2 (S,E,A,P) | CRC-32C (Castagnoli) — SSE4.2 and ARMv8 CRC instructions picked at run time (three interleaved streams), slicing-by-8 fallback; streaming, extend, combine. | any (x86-64 SSE4.2 / arm64 CRC asm + portable fallback) | — |
 | [`hashdigest`](modules/hashdigest/README.md) *(crypto)* | 2 (S,E,A) | Streaming digests — one-shot, incremental, and file hashing; SHA-256 convenience plus a multi-algorithm SHA-2/SHA-3/BLAKE2b/BLAKE3 layer. | any | sha2 |
+| [`lz4`](modules/lz4/README.md) *(format)* | 4 (P) | LZ4 block and frame (.lz4) codec: fast greedy compressor with acceleration, bounded decompressor for frames (checksums, linked blocks, skippable, legacy) and raw blocks | any | — |
 | [`zstd`](modules/zstd/README.md) *(format)* | 2 (S,A,P) | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size, long-distance matching as `--long`, targetCBlockSize superblocks), the sequence-level API (compressSequences, generateSequences, a block-level sequence producer) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries | any | — |
 
 ### Crypto
