@@ -6,7 +6,7 @@
 
 **Scope:** core — python-fido2 `pin` protocols and libfido2 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-15 · mutation 2026-09-11 · src ?
+**Audit:** review 2026-09-15 · mutation 2026-11-17 (100/111, 11 eq) · src 9ec4d4aec8e8f48b
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, CTAP2PIN_FUZZ; protocol at 1/4 of it) · ct 2026-09-09 (ctgrind)
 
@@ -163,6 +163,20 @@ updated; behavior for shared-secret keys is bit-for-bit unchanged.
 **What the tests actually contain.** AES/HKDF/HMAC/ECDH NIST/RFC KAT anchor the crypto core; PIN protocol framing is round-trip only
 
 **How it got there.** The anchoring work landed. DONE 0341464: fido2 anchors the FRAMING; found unexpressible protocol-Two pinUvAuthParam
+
+## Audit 2026-11-17 (whole-module mutation)
+
+111 mutants over every non-test line of `src/root.zig`: `Aes256Cbc` (the length gates, IV, chaining, the xor, the block loop, the step, every burn and the key-pointer escape), `PublicKey.toPoint` (endianness, x/y order, the identity refusal), `publicKeyFromScalar` and `ecdhZ` (the canonical check and its endianness, the zero-scalar refusal, the multiply, the error codes, which coordinate is Z, the wipes and the zeroing of `out` on error, the burns), `Protocol.fromWire`, and for `One` and `Two`: `kdf` (hash, salt, info strings, half positions), `encapsulate` (every step and its wipe), `encrypt` / `decrypt` (IV, key half, IV framing, length gates), `encryptedLength` / `decryptedLength` (every boundary), `authenticate` (key and message order, which half of the MAC), `verify` (the length gate in each direction, the empty-key arm, a first-byte or last-byte-only compare). Two schemata builds: ReleaseSafe for the functional mutants, ReleaseFast for the burn and wipe mutants (the stack probes only run there); the survivors of both were re-run in a build with the new tests, and the one that needs a safety panic (`Two.encrypt` with a destination shorter than the IV) in ReleaseSafe again.
+
+83 mutants die on the existing suite. 6 tests were added in `src/mutation_test.zig`: a destination shorter than the plaintext (encrypt) or longer than the ciphertext (decrypt) is `InvalidLength`; the group order plus one is refused as a scalar although its little-endian reading is below the order (kills both `.little` canonical-check mutants); `ecdhZ` and both `encapsulate`s zero their output on every error (three `errdefer` mutants); `Two.encrypt` with a destination shorter than the IV is `InvalidLength` (otherwise a slice panic); a signature one byte longer than the MAC is refused by `One.verify` and `Two.verify`. With them 100 of 111 die; 8 of those (the burn of `publicKeyFromScalar`, `ecdhZ`, both `kdf`s, both `authenticate`s, and the `Z` wipes of both `encapsulate`s) only in the ReleaseFast build, by the stack probes. No crypto check survives: the canonical scalar rule, the zero-scalar refusal, the identity refusal, the MAC compare byte by byte and the key-half selection are all killed.
+
+11 do not, none of them a defect:
+
+- 6 EQUIVALENT by redundancy: dropping one of the two overlapping `burn.stack` calls of `Aes256Cbc.encrypt` / `decrypt` (4 mutants; the probe reads the state after both, and removing both is not mutated), the `shared` wipe in `ecdhZUnburned` and the `prk` wipe in `Two.kdfUnburned` (their frames are burned by the public entry point below them).
+- 2 UNOBSERVABLE: `std.mem.doNotOptimizeAway(key)` in `encryptUnburned` / `decryptUnburned`: it guards against an LLVM argument promotion that the ReleaseFast stack probe does not see on Zig 0.17.1 x86_64 (the comment records the 2026-10-08 measurement on an older build); the injection would be a toolchain that promotes the pointer.
+- 3 EQUIVALENT: `ecdhZ`'s second multiply failure code (a canonical non-zero scalar times a validated non-identity point of the prime-order group cannot fail), and the destination-length checks of `Two.encrypt` (longer destination) and `Two.decrypt`, which `Aes256Cbc` repeats and answers with the same `InvalidLength` before anything is written.
+
+Not mutated: comptime constants and lengths (pinned by the KATs), the `Impl` switch, the doc comments, and every test file. ctgrind: the four rows keep their counts (`--check` measured them unchanged); only the source digests were re-pinned because `root.zig` gained the test import. Counts on the card are whole-module.
 
 ## Backlog / deferred
 

@@ -537,6 +537,7 @@ test {
     _ = @import("pin_protocol_oracle_vectors.zig");
     _ = @import("pin_protocol_oracle_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 // ── fuzz: untrusted-wire decoders never panic/OOB on arbitrary bytes ──────
