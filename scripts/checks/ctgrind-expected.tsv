@@ -146,7 +146,7 @@ bn254	ReleaseFast	field	1	1	e6846e4ec6c4207e	831aa25b5c3d2f05
 # `Fr.toBytes` reduce with bn254's own CIOS behind a `blackBox` barrier instead
 # of `std.crypto.ff`'s `fromMontgomery`; exactly the three contexts attributed
 # to std's ff went (9 -> 6 total), output byte-identical.
-bn254	ReleaseFast	scalarmul	1	2	bd2fb4a4c7bf0251	1bba83824af4d763
+bn254	ReleaseFast	scalarmul	1	2	940fa5c173fc1c87	1bba83824af4d763
 chachapoly	ReleaseFast	poly1305	1	0	8c79828616cd830f	ff3ba8f00b851bdf
 chachapoly	ReleaseSafe	poly1305	1	>=1	8c79828616cd830f	ff3ba8f00b851bdf
 # The AEAD's own claim (added 2026-09-02). SPEC.md and root.zig state that the

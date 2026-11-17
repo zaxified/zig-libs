@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (436 mutants, 421 killed, 15 equivalent; the card now carries the count). 12 new tests (`src/audit_test.zig`, `scalar.zig`) pin per-limb and per-component `isZero`/`eql`, the `subLimbs` borrow chain, `Fp.fromInt` bounds and wide values, non-canonical identities on `G1`/`G2`, malformed `G1`/`G2` encodings (each coordinate, over-long compressed input, the `G2` compressed flag order) and `groth16.verify`'s refusal of an off-curve `A`/`C` and an out-of-subgroup `B`. Library code: `Fr.randomInto`'s body moved into a private `randomIntoBuf` so a test can see the wipe; same behaviour. ctgrind row `scalarmul` re-pinned (digest only, counts unchanged).
+
 - **2026-11-17** — **NEW (public multi-scalar multiplication):** `bn254.msm` (`msm.zig`): `g1Msm(allocator, points, scalars)` / `g2Msm` / `msm(G, ..)`, Pippenger's bucket method, the shape and names of `bls12_381`'s (`MsmError` = `LengthMismatch` or `OutOfMemory`), plus `addVartime` / `mixedAddVartime`. Public data only: variable-time in the scalars, nothing wiped (use `Jacobian.scalarMul` for a secret scalar). The Groth16 verifier keeps its own allocation-free loop. Delta mutation 36/39 killed, 3 equivalent (card: no whole-module count, unchanged).
 
 - **2026-11-16** — Compressed `G1`/`G2` points in gnark-crypto's convention: `g1`/`g2` `toBytesCompressed`/`fromBytesCompressed` (32/64 bytes; flag bits `0b10` smaller `y`, `0b11` larger, `0b01` infinity; `G2` decode subgroup-checked and refuses non-canonical `x`, off-curve `x`, bad flags, stray infinity bytes). arkworks' convention is not offered. Additive; existing encodings unchanged.

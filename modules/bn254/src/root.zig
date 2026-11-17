@@ -124,6 +124,7 @@ test {
     _ = groth16;
     _ = msm;
     _ = @import("fuzz_test.zig");
+    _ = @import("audit_test.zig");
 }
 
 test "meta.model_after names BN254/alt-bn128" {

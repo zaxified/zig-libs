@@ -168,10 +168,17 @@ pub const Fr = struct {
     /// `out` to wipe.
     pub fn randomInto(out: *Fr, io: std.Io) void {
         var buf: [encoded_bytes]u8 = undefined;
-        defer std.crypto.secureZero(u8, &buf);
+        randomIntoBuf(out, io, &buf);
+    }
+
+    /// `randomInto`'s body with the scratch buffer as an explicit
+    /// out-parameter (same shape as `g1.zig`'s `scalarMulZeroing`), so a test
+    /// can hold on to it after the call and see the wipe happened.
+    fn randomIntoBuf(out: *Fr, io: std.Io, buf: *[encoded_bytes]u8) void {
+        defer std.crypto.secureZero(u8, buf);
         while (true) {
-            io.random(&buf);
-            out.* = Fr.fromBytes(buf) catch continue; // >= r: reject, redraw
+            io.random(buf);
+            out.* = Fr.fromBytes(buf.*) catch continue; // >= r: reject, redraw
             return;
         }
     }
@@ -304,4 +311,15 @@ test "Fr.randomInto produces canonical, distinct draws in place" {
     _ = try Fr.fromBytes(a.toBytes());
     _ = try Fr.fromBytes(b.toBytes());
     try std.testing.expect(!a.eql(b));
+}
+
+test "Fr.randomInto wipes the drawn bytes" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var buf: [Fr.encoded_bytes]u8 = @splat(0xAA);
+    var out: Fr = undefined;
+    Fr.randomIntoBuf(&out, io, &buf);
+    try std.testing.expect(!out.isZero());
+    try std.testing.expect(std.mem.allEqual(u8, &buf, 0));
 }

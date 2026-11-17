@@ -6,7 +6,7 @@
 
 **Scope:** core — go-ethereum `core/vm` alt_bn128 precompiles + gnark-crypto (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-09-03 · src ?
+**Audit:** review 2026-09-03 · mutation 2026-11-17 (421/436, 15 eq) · src bb6d3a04edb796c8
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BN254_FUZZ; ecadd and ecmul at 1/4, ecpairing at 1/10, algebra at 1/100 of it) · ct 2026-10-02 (ctgrind)
 
@@ -931,8 +931,39 @@ and the scalar 2^253 (top window); empty input, length mismatch, all-zero scalar
 
 **Delta mutation 2026-11-17** (39 mutants over `msm.zig`, one schemata build, ReleaseSafe): 36 killed, 3 equivalent: `points.len == 0` early return dropped
 (the general path also yields the identity), `w != n_windows - 1` guard made always true (doubling the identity), `if (!any) continue` dropped (adding identity buckets,
-cost-only). The window thresholds in `windowBits` are not mutated (cost-only, see above). **The card has no whole-module mutation count, so these numbers are not written
-onto it: the module needs a whole-module mutation run** (the 2026-09-03 audit's counts were never recorded on the card).
+cost-only). The window thresholds in `windowBits` are not mutated (cost-only, see above). These 39 are folded into the whole-module count below.
+
+**Audit 2026-11-17 (whole-module mutation).** 397 schemata mutants over every production file except `msm.zig` and the tooling (`fp`, `fp2`, `fp6`, `fp12`,
+`g1`, `g2`, `scalar`, `pairing`, `precompiles`, `groth16`; ReleaseSafe, one build, each mutant under `ulimit -v` and a 20 s kill), plus the 39 `msm.zig` delta
+mutants above: **436 in all, 421 killed (29 of them by a 20 s hang), 15 equivalent.** Mutated: carry and borrow propagation and the conditional subtract of
+`montMul`/`montSqr`/`addLimbs`/`subLimbs`, `geP`/`fromBytes`/`fromInt` bounds, every identity/equality/zero predicate of the tower, the Karatsuba and
+Granger-Scott formula steps, the Jacobian add/double special-case selects, scalar-multiplication loops and the secret wipe, every codec length/error/flag branch
+(uncompressed and compressed), the Miller loop (bit walk, Frobenius tail, line coefficients), the final exponentiation chain, the precompile padding and length
+rules, and `groth16.verify`'s count and input validation. Not mutated (arid): constants and comptime derivations (KAT-pinned), `toMont`/`fromMont`, byte
+order helpers, `Fp.random`/`Fr.random` rejection loops, `ctgrind_harness.zig`, `fuzz_test.zig`. 353 mutants died on the existing tests; 44 survived and 32
+of those were killed by the 12 tests of `src/audit_test.zig` and `scalar.zig` (round 2, one more build, same code): per-limb and per-component
+`isZero`/`eql` of `Fp`, `Fp2`, `Fp6`, `Fp12` (no earlier test looked at the upper limbs or at `c1`/`c2` alone); a borrow rippling through an equal limb in
+`subLimbs`; `Fp.fromInt` at `p` and with bits in limbs 2 and 3; a non-canonical identity (`z = 0`, arbitrary `x`, `y`) on the curve in `G1`/`G2`; `G1.subgroupCheck`
+of an off-curve point; `G1.fromBytes` with `y >= p`; all four `G2` coordinates `>= p`; 33-/65-byte compressed input; the `G2` compressed flag against the
+lexicographic order of `y` and `-y` (a swapped order is self-consistent, so only an independent check sees it); and `groth16.verify` refusing an off-curve `A`
+or `C` and an on-twist non-member `B`. The Groth16 ones close the gap the earlier test comment called not closable: a verifying key whose `alpha` and `IC[0]`
+are the identity leaves the check resting on `A`, `B`, `C` alone; an `(0, 0)` that is not flagged infinity makes every Miller line `c * w^3`, which the final
+exponentiation maps to 1 (the test asserts that premise through `pairingCheck`), and with `A = C = infinity` every pair is skipped, so only `verify`'s own
+validation can refuse the point. The `Fr.randomInto` wipe became observable by factoring the body into `randomIntoBuf` (scratch buffer as an out-parameter, the
+shape of `scalarMulZeroing`); behaviour unchanged.
+
+*Equivalent (12 here, 3 in `msm.zig` above), invariant named:*
+
+- **Spare top bit of `p` (5):** `p < 2^254`, so `a + b < 2p < 2^255` and every CIOS/SOS intermediate stays below `2^255`: the fifth word is always 0. Dropping the
+  carry into `condSubP` in `addLimbs` (`fp.zig` 219), the `condSubP` top word in `montMul` (274) and `montSqr` (332), `t[L + 1]` (258) and the final
+  `s2 >> 64` carry (271) therefore changes nothing.
+- **Identity is `z == 0` (4):** in `Jacobian.add` of `G1` and `G2`, `z3 = (...) * h` is already 0 when `h == 0`, so the explicit "P == -Q" select of the canonical
+  `(1, 1, 0)` only normalises the representation (the next line's "P == Q" select overrides it anyway, which makes `h_zero == 1` equivalent for the condition).
+  Every consumer tests `z == 0` (`isIdentity`, `toAffine`, `isOnCurve`'s early return); nothing compares raw identity coordinates.
+- **`G2.mulPublic` starts at bit 128:** `6x^2 < 2^127`, so bit 127 is zero and starting at 127 only doubles the identity one more time.
+- **`ecPairingCheck`'s `k == 0` early return:** the general path returns the final exponentiation of 1, which is 1 (cost-only).
+- **`additionStep` evaluates the line through `q` or through `t`:** the line passes through both points, so `lambda * x - y` is the same value (taken before `t`
+  is updated).
 
 ## Backlog
 
