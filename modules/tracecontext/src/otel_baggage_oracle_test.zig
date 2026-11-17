@@ -273,12 +273,13 @@ test "otel baggage oracle: strict, lenient and write agree with OpenTelemetry Go
         };
         if (classOf(c, v)) |k| {
             hits[@backingInt(k)] += 1;
-            continue;
+        } else {
+            // Failure path only: an unexplained disagreement fails the test below.
+            bad += 1;
+            std.debug.print("{s}: {s} differs from otel; input {f}\n   otel ok={} string={f}\n", .{
+                c.id, @tagName(reason), std.zig.fmtString(c.input[0..@min(c.input.len, 120)]), c.ok, std.zig.fmtString(c.string[0..@min(c.string.len, 120)]),
+            });
         }
-        bad += 1;
-        std.debug.print("{s}: {s} differs from otel; input {f}\n   otel ok={} string={f}\n", .{
-            c.id, @tagName(reason), std.zig.fmtString(c.input[0..@min(c.input.len, 120)]), c.ok, std.zig.fmtString(c.string[0..@min(c.string.len, 120)]),
-        });
     }
     for (hits, 0..) |h, i| if (h == 0) {
         std.debug.print("class {s} agrees now: delete it\n", .{@tagName(@as(Class, @fromBackingInt(@intCast(i))))});
