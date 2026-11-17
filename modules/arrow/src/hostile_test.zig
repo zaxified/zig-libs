@@ -178,16 +178,16 @@ test "hostile schema: fields shared through offsets (a DAG) cannot multiply the 
         try testing.expectEqual(@as(?anyerror, error.Malformed), got.err);
         try testing.expect(got.peak < 4 << 20);
     }
-    // One 64 KiB metadata value behind 256 entries of the schema's `custom_metadata`: a
-    // reader asked for the metadata copies every entry.
-    {
+    // One 64 KiB metadata value (or key) behind 256 entries of the schema's
+    // `custom_metadata`: a reader asked for the metadata copies every entry.
+    for ([_]bool{ false, true }) |long_key| {
         var b = fb.Builder.init(gpa);
         defer b.deinit();
         const long = try gpa.alloc(u8, 64 << 10);
         defer gpa.free(long);
         @memset(long, 'v');
-        const k = try b.createString("k");
-        const v = try b.createString(long);
+        const k = try b.createString(if (long_key) long else "k");
+        const v = try b.createString(if (long_key) "v" else long);
         b.startTable();
         try b.addOffset(0, k);
         try b.addOffset(1, v);
@@ -212,6 +212,47 @@ test "hostile schema: fields shared through offsets (a DAG) cannot multiply the 
         const got = try streamUnderCap(out.items, .{ .metadata = &got_md }, 4 << 20);
         try testing.expectEqual(@as(?anyerror, error.Malformed), got.err);
         try testing.expect(got.peak < 1 << 20);
+    }
+    // The same in a file footer's `custom_metadata` (decoded in a budget of its own); one
+    // entry of it reads.
+    for ([_]usize{ 256, 1 }) |entries| {
+        var b = fb.Builder.init(gpa);
+        defer b.deinit();
+        const long = try gpa.alloc(u8, 64 << 10);
+        defer gpa.free(long);
+        @memset(long, 'v');
+        const k = try b.createString("k");
+        const v = try b.createString(long);
+        b.startTable();
+        try b.addOffset(0, k);
+        try b.addOffset(1, v);
+        const kv = try b.endTable();
+        var refs: [256]fb.Ref = @splat(kv);
+        const md = try b.createOffsetVector(refs[0..entries]);
+        const empty = try b.createOffsetVector(&.{});
+        b.startTable();
+        try b.addOffset(1, empty);
+        const sref = try b.endTable();
+        b.startTable();
+        try b.addScalarForce(0, schema.MetadataVersion, .v5);
+        try b.addOffset(1, sref);
+        try b.addOffset(4, md);
+        const footer = try b.finish(try b.endTable());
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        try out.appendSlice(gpa, "ARROW1\x00\x00");
+        try out.appendSlice(gpa, footer);
+        try out.appendSlice(gpa, &std.mem.toBytes(std.mem.nativeToLittle(i32, @as(i32, @intCast(footer.len)))));
+        try out.appendSlice(gpa, "ARROW1");
+        var got_md: stream.Metadata = .{};
+        const got = try fileUnderCap(out.items, .{ .metadata = &got_md }, 4 << 20);
+        if (entries == 1) {
+            try testing.expectEqual(@as(?anyerror, null), got.err);
+            try testing.expectEqual(@as(usize, 1), got_md.footer.len); // (its bytes went with the arena)
+        } else {
+            try testing.expectEqual(@as(?anyerror, error.Malformed), got.err);
+            try testing.expect(got.peak < 1 << 20);
+        }
     }
     // An honest schema of the same shapes (no sharing) still decodes.
     {
@@ -484,7 +525,7 @@ test "hostile run-end encoding: one run of 2^22 rows from a few bytes stops at m
     try testing.expectEqualStrings(&value, f.columnAt(0).get(4095).text);
 }
 
-test "hostile views: many views of one long slice, list views of one whole child, stop at max_cells before the copy" {
+test "hostile views: many views of one long slice, list views of one whole child (a Null one too), stop at max_cells" {
     const gpa = testing.allocator;
     // 2^16 Utf8View rows, each naming the same 64 KiB of one data buffer: 4 GiB of copies
     // from 1 MiB of views.
@@ -524,5 +565,40 @@ test "hostile views: many views of one long slice, list views of one whole child
         const got = try streamUnderCap(bytes, .{ .max_cells = 1 << 24 }, 16 << 20);
         try testing.expectEqual(@as(?anyerror, error.LimitExceeded), got.err);
         try testing.expect(got.peak < 4 << 20);
+    }
+    // 65535 ListView rows, each the whole Null child of 65535: no copy to make, but the
+    // frame would hold 65535^2 (just under 2^32) elements for a writer or a walker.
+    {
+        const rows = 65535;
+        const offs = try gpa.alloc(i32, rows);
+        defer gpa.free(offs);
+        @memset(offs, 0);
+        const sizes = try gpa.alloc(i32, rows);
+        defer gpa.free(sizes);
+        @memset(sizes, rows);
+        const item = [_]schema.Field{.{ .name = "item", .type = .null }};
+        const fields = [_]schema.Field{.{ .name = "l", .type = .list_view, .children = &item }};
+        const bytes = try st.hand(gpa, &fields, &.{.{ .length = rows, .nodes = &.{ .{ .length = rows, .null_count = 0 }, .{ .length = rows, .null_count = rows } }, .bufs = &.{ "", std.mem.sliceAsBytes(offs), std.mem.sliceAsBytes(sizes) } }});
+        defer gpa.free(bytes);
+        const got = try streamUnderCap(bytes, .{ .max_cells = 1 << 20 }, 16 << 20);
+        try testing.expectEqual(@as(?anyerror, error.LimitExceeded), got.err);
+        try testing.expect(got.peak < 4 << 20);
+    }
+    // 65536 such rows of a 65536-slot child: 2^32 elements, past `dataframe`'s u32 list
+    // offsets, refused as the sizes are summed (before any charge).
+    {
+        const rows = 65536;
+        const offs = try gpa.alloc(i32, rows);
+        defer gpa.free(offs);
+        @memset(offs, 0);
+        const sizes = try gpa.alloc(i32, rows);
+        defer gpa.free(sizes);
+        @memset(sizes, rows);
+        const item = [_]schema.Field{.{ .name = "item", .type = .null }};
+        const fields = [_]schema.Field{.{ .name = "l", .type = .list_view, .children = &item }};
+        const bytes = try st.hand(gpa, &fields, &.{.{ .length = rows, .nodes = &.{ .{ .length = rows, .null_count = 0 }, .{ .length = rows, .null_count = rows } }, .bufs = &.{ "", std.mem.sliceAsBytes(offs), std.mem.sliceAsBytes(sizes) } }});
+        defer gpa.free(bytes);
+        const got = try streamUnderCap(bytes, .{ .max_cells = 1 << 40 }, 16 << 20);
+        try testing.expectEqual(@as(?anyerror, error.Unsupported), got.err);
     }
 }

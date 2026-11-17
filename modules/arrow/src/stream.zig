@@ -1671,7 +1671,8 @@ const Reader = struct {
     /// ListView / LargeListView: each valid row's elements are `sizes[i]` child slots from
     /// `offsets[i]` (any order, overlapping allowed), within its batch's child. The rows
     /// are copied out of the child as a `list`; the selectors are checked against
-    /// `max_cells` before they are allocated and `gather` charges the copy. Null rows'
+    /// `max_cells` before they are allocated and `gather` charges the copy (an all-null
+    /// child's elements are charged without one). Null rows'
     /// offsets and sizes are not looked at.
     fn listView(r: *Reader, rf: *const RField, chunks: []const Chunk, n: usize, valid: ?[]u64) Error!ColumnData {
         const child = &rf.children[0];
@@ -1701,7 +1702,11 @@ const Reader = struct {
             base += len;
         }
         var items = try r.decode(child, chunks);
-        if (items != .nulls) {
+        if (items == .nulls) {
+            // Nothing to copy, but the frame holds `total` elements all the same (every row
+            // may name the whole child): charged as the copy would be.
+            try r.charge(total);
+        } else {
             try r.afford(total);
             const sel = try r.a.alloc(usize, @intCast(total));
             var k: usize = 0;

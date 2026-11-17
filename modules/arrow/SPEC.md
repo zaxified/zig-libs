@@ -380,6 +380,15 @@ batch past 2 GiB, each needing that many bytes in memory. No finding.
 - The reader copies every buffer (no zero-copy views over the input).
 - `openFile` reads the schema from the footer only; it does not compare it with the stream schema at offset 8.
 - Performance not measured.
+- RunEndEncoded requires `values.length == run_ends.length` per batch (Arrow C++ is believed to refuse only
+  fewer values than runs). Relaxing it needs a per-batch values base in the run index, or another batch's
+  values would be picked silently.
+- Written key/value metadata (schema, field, footer) is read back only by this module's own reader; a future
+  differential oracle should carry one metadata case, footer included.
+- Compressed view batches (`prepare` splitting variadic buffers before a zstd `inflate`) have no test: the writer
+  never emits views and the `cpp-21.0.0` view goldens are uncompressed.
+- Message-level `custom_metadata` (on each Schema / RecordBatch / DictionaryBatch message) is neither surfaced
+  nor written; only schema, field and footer metadata are.
 
 ## Plan
 

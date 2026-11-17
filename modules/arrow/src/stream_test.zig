@@ -1001,6 +1001,14 @@ test "a dictionary shared by two fields: read when the value types agree, refuse
     try testing.expectEqualStrings("y", f.cell(0, "p").?.text);
     try testing.expectEqualStrings("x", f.cell(1, "p").?.text);
     try testing.expectEqualStrings("x", f.cell(0, "q").?.text);
+    // Projected: the dictionary is read when either of its columns is picked.
+    for ([_][]const u8{ "p", "q" }) |nm| {
+        const one = [_]stream.ColumnRef{.{ .name = nm }};
+        const g = try stream.readStream(a, ok, .{ .columns = &one });
+        try testing.expectEqual(@as(usize, 1), g.columns.len);
+        try testing.expectEqualStrings(f.cell(0, nm).?.text, g.cell(0, nm).?.text);
+        try testing.expectEqualStrings(f.cell(1, nm).?.text, g.cell(1, nm).?.text);
+    }
 
     const Case = struct { want: anyerror, second: schema.Field };
     for ([_]Case{
@@ -1011,6 +1019,46 @@ test "a dictionary shared by two fields: read when the value types agree, refuse
         const bytes = try hand(gpa, &.{ shared[0], c.second }, &.{ dict, batch });
         defer gpa.free(bytes);
         try testing.expectError(c.want, stream.readStream(a, bytes, .{}));
+    }
+}
+
+test "a Utf8View dictionary: categorical, its variadic buffers in the DictionaryBatch; skipped unread when no picked column uses it" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const fields = [_]schema.Field{
+        .{ .name = "v", .type = .utf8_view, .dictionary = .{ .id = 0 } },
+        .{ .name = "n", .type = .{ .int = .{ .bits = 32, .signed = true } } },
+    };
+    const long = "a dictionary value past twelve bytes";
+    const node: ipc.FieldNode = .{ .length = 2, .null_count = 0 };
+    const batch: HandBatch = .{ .length = 2, .nodes = &.{ node, node }, .bufs = &.{ "", bytesOf(i32, &.{ 1, 0 }), "", bytesOf(i32, &.{ 7, 8 }) } };
+    for ([_]bool{ true, false }) |good| {
+        var views: [32]u8 = undefined;
+        views[0..16].* = view("s", 0, 0);
+        views[16..32].* = view(long, 0, 3);
+        if (!good) views[20] = 'X'; // a prefix that is not the data's
+        const dict: HandBatch = .{ .length = 2, .dict_id = 0, .variadic = &.{1}, .nodes = &.{node}, .bufs = &.{ "", &views, "xyz" ++ long } };
+        const bytes = try hand(gpa, &fields, &.{ dict, batch });
+        defer gpa.free(bytes);
+        const by_v = [_]stream.ColumnRef{.{ .name = "v" }};
+        if (good) {
+            for ([_]?[]const stream.ColumnRef{ null, &by_v }) |cols| {
+                const f = try stream.readStream(a, bytes, .{ .columns = cols });
+                try testing.expectEqual(df.ColumnType.categorical, f.columns[0].type);
+                try testing.expectEqualStrings(long, f.cell(0, "v").?.text);
+                try testing.expectEqualStrings("s", f.cell(1, "v").?.text);
+            }
+        } else {
+            try testing.expectError(error.Malformed, stream.readStream(a, bytes, .{}));
+            try testing.expectError(error.Malformed, stream.readStream(a, bytes, .{ .columns = &by_v }));
+        }
+        // Only `n` picked: the dictionary's body is not read, the bad one included.
+        const by_n = [_]stream.ColumnRef{.{ .index = 1 }};
+        const g = try stream.readStream(a, bytes, .{ .columns = &by_n });
+        try testing.expectEqual(@as(usize, 1), g.columns.len);
+        try testing.expectEqual(@as(i64, 8), g.cell(1, "n").?.int);
     }
 }
 
@@ -1329,6 +1377,7 @@ test "run-end encoded: read expanded into a plain column, over batches; a sliced
         &.{ .{ .name = "run_ends", .type = .{ .int = .{ .bits = 8, .signed = true } } }, r16_kids[1] },
         &.{ .{ .name = "run_ends", .type = .{ .float = .double } }, r16_kids[1] },
         &.{ .{ .name = "run_ends", .type = .utf8, .dictionary = .{ .id = 0 } }, r16_kids[1] },
+        &.{ .{ .name = "run_ends", .type = i32_ends.type, .dictionary = .{ .id = 0 } }, r16_kids[1] },
         r16_kids[0..1],
     }) |kids| {
         const bad = try hand(gpa, &.{.{ .name = "r", .type = .run_end_encoded, .children = kids }}, &.{});
@@ -1492,4 +1541,70 @@ test "view types: views and list views outside their buffers are Malformed; bad 
         defer gpa.free(b);
         try testing.expectError(error.Malformed, stream.readStream(a, b, .{}));
     }
+}
+
+test "view types: compressed batches (raw-prefixed buffers), projected past broken view buffers; short buffers; the exact max_cells of a list view" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const raw = struct {
+        // A compressed body's buffer stored as is: length -1, then the bytes.
+        fn f(g: Allocator, x: []const u8) ![]u8 {
+            const out = try g.alloc(u8, 8 + x.len);
+            std.mem.writeInt(i64, out[0..8], -1, .little);
+            @memcpy(out[8..], x);
+            return out;
+        }
+    }.f;
+    const fields = [_]schema.Field{ .{ .name = "sv", .type = .utf8_view }, .{ .name = "x", .type = .{ .int = .{ .bits = 32, .signed = true } } } };
+    const long = "a value longer than twelve bytes";
+    var views: [32]u8 = undefined;
+    views[0..16].* = view("hi", 0, 0);
+    views[16..32].* = view(long, 0, 0);
+    const node: ipc.FieldNode = .{ .length = 2, .null_count = 0 };
+    const rv = try raw(a, &views);
+    const rd = try raw(a, long);
+    const rx = try raw(a, bytesOf(i32, &.{ 5, 6 }));
+    const by_sv = [_]stream.ColumnRef{.{ .name = "sv" }};
+    const by_x = [_]stream.ColumnRef{.{ .name = "x" }};
+    for ([_]bool{ true, false }) |good| {
+        // Broken: the view field's views and data buffers are too short to hold a length.
+        const bytes = try hand(gpa, &fields, &.{.{ .length = 2, .codec = .zstd, .variadic = &.{1}, .nodes = &.{ node, node }, .bufs = &.{ "", if (good) rv else "bad", if (good) rd else "bad", "", rx } }});
+        defer gpa.free(bytes);
+        const p = try stream.readStream(a, bytes, .{ .columns = &by_x });
+        try testing.expectEqual(@as(usize, 1), p.columns.len);
+        try testing.expectEqual(@as(i64, 6), p.cell(1, "x").?.int);
+        if (good) {
+            for ([_]?[]const stream.ColumnRef{ null, &by_sv }) |cols| {
+                const f = try stream.readStream(a, bytes, .{ .columns = cols });
+                try testing.expectEqualStrings("hi", f.cell(0, "sv").?.text);
+                try testing.expectEqualStrings(long, f.cell(1, "sv").?.text);
+            }
+        } else {
+            try testing.expectError(error.Malformed, stream.readStream(a, bytes, .{}));
+            try testing.expectError(error.Malformed, stream.readStream(a, bytes, .{ .columns = &by_sv }));
+        }
+    }
+    // A views buffer short of one view per row, a list view's offsets short of one per row.
+    {
+        const sv = [_]schema.Field{fields[0]};
+        const bad = try hand(gpa, &sv, &.{.{ .length = 2, .variadic = &.{1}, .nodes = &.{node}, .bufs = &.{ "", views[16..32], long } }});
+        defer gpa.free(bad);
+        try testing.expectError(error.Malformed, stream.readStream(a, bad, .{}));
+    }
+    const item = [_]schema.Field{.{ .name = "item", .type = fields[1].type }};
+    const lv = [_]schema.Field{.{ .name = "l", .type = .list_view, .children = &item }};
+    const child: ipc.FieldNode = .{ .length = 3, .null_count = 0 };
+    {
+        const bad = try hand(gpa, &lv, &.{.{ .length = 2, .nodes = &.{ node, child }, .bufs = &.{ "", bytesOf(i32, &.{0}), bytesOf(i32, &.{ 3, 2 }), "", bytesOf(i32, &.{ 1, 2, 3 }) } }});
+        defer gpa.free(bad);
+        try testing.expectError(error.Malformed, stream.readStream(a, bad, .{}));
+    }
+    // Two rows naming 3 + 2 of 3 child slots: 2 + 3 node slots, then 5 copied.
+    const ok = try hand(gpa, &lv, &.{.{ .length = 2, .nodes = &.{ node, child }, .bufs = &.{ "", bytesOf(i32, &.{ 0, 1 }), bytesOf(i32, &.{ 3, 2 }), "", bytesOf(i32, &.{ 1, 2, 3 }) } }});
+    defer gpa.free(ok);
+    const f = try stream.readStream(a, ok, .{ .max_cells = 10 });
+    try testing.expectEqual(@as(i64, 3), f.cell(1, "l").?.list.get(1).int);
+    try testing.expectError(error.LimitExceeded, stream.readStream(a, ok, .{ .max_cells = 9 }));
 }
