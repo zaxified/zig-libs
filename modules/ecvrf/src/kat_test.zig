@@ -442,3 +442,27 @@ test "negative: decodeProof rejects non-canonical s (s >= group order)" {
     try std.testing.expectError(error.InvalidProof, ecvrf.decodeProof(pi));
     try std.testing.expectError(error.InvalidProof, ecvrf.verify(try hex32(v.vectors[0].pk), "", pi));
 }
+
+test "negative: a low-order Gamma (order 1, 2, 4 or 8) makes verify answer InvalidProof, never InvalidPublicKey or a crash" {
+    // `decodeProof` accepts any canonical point as Gamma (RFC 9381 §5.4.4 asks
+    // for no low-order check). For order 1, 2 and 4, `mulDoubleBasePublic`
+    // refuses `-Gamma` (`WeakPublicKey`) and `verify` maps that to
+    // `InvalidProof`; for order 8 the call succeeds and the challenge
+    // comparison refuses. Either way the answer is the proof's, not the key's.
+    const vec = v.vectors[0];
+    const pk = try hex32(vec.pk);
+    const pi0 = try hex80(vec.pi);
+    const gammas = [_][32]u8{
+        [_]u8{1} ++ @as([31]u8, @splat(0)), // order 1: y = 1
+        try hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"), // order 2: y = p - 1
+        try hex32("0000000000000000000000000000000000000000000000000000000000000000"), // order 4: y = 0
+        try hex32("0000000000000000000000000000000000000000000000000000000000000080"), // order 4: y = 0, sign 1
+        try hex32("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"), // order 8
+    };
+    for (gammas) |g| {
+        var pi = pi0;
+        pi[0..32].* = g;
+        _ = try ecvrf.decodeProof(pi); // structurally fine
+        try std.testing.expectError(error.InvalidProof, ecvrf.verify(pk, "", pi));
+    }
+}

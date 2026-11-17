@@ -6,7 +6,7 @@
 
 **Scope:** parity — RIPEMD-160 as in Bitcoin Core / RustCrypto `ripemd` 0.2.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-09-10 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (108/113, 5 eq) · src 8bf1e52429340ff3
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, RIPEMD160_FUZZ) · ct 2026-10-09 (ctgrind: message tainted, `hash` + `hash160`, 0 in-file) · panic 2026-10-30 (sweep + blind review: `final` with 56..63 buffered bytes resets `buf_len` (second final/update was OOB in ReleaseFast); delta audit 1/1)
 
@@ -128,6 +128,8 @@ matches an earlier audit estimate (2026-09-04) of 3.0–3.2×; the range here is
 wider because the measuring machine was shared with concurrent agent work
 (see the fix campaign's own measurement notes), not because the two
 implementations diverge.
+
+**Audit 2026-11-17 (whole-module mutation).** 113 mutants over every non-test line of `src/root.zig` that is not a constant table: the five round functions (each operator and each negation), the init state, `update` (the partial-fill guard in every operator class, fill count, copy offsets, the middle-block loop bound and step, remainder copy and `buf_len` advance, `total_len`), `final` (zero fill, the `0x80` marker, the `64 - buf_len < 8` guard in three classes, the pad block and its zeroing, bit length scale and endianness, digest endianness and word order), `compress` (block read, all ten initial register loads, group selection, every term of both lines' step, the register rotation, both mirrored function / constant / permutation / rotation tables, all five output sums) and `hash160`. One schemata build, baseline first: 108 killed, 5 survive and are not killable: 2 EQUIVALENT (`f2` and `f4` with `|` turned into `^`: the two terms are bit-disjoint, `x & y` against `~x & z`), 1 EQUIVALENT (dropping the `buf_len != 0` guard of `update`: with an empty buffer the fill branch copies the first 64 bytes and compresses them, which is what the block loop would do — cost-only), 1 EQUIVALENT (`final` zeroing from `buf_len + 1`: the byte at `buf_len` is overwritten by the marker on the next line) and 1 UNOBSERVABLE (`total_len +%=` as `+=`: needs 2^64 bytes hashed). No test was needed: the KATs, the 55/56/64-byte padding tests, the million-`a` vector and the HMAC vectors killed every observable mutant. The round-constant, rotate-amount and word-selection tables (`R`, `RP`, `S`, `SP`, `K_GROUP`, `KP_GROUP`, the IV) were not mutated entry by entry (arid; each entry feeds every digest, which the ten KATs pin). Counts on the card are whole-module.
 
 ## Backlog / deferred
 
