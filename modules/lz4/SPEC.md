@@ -43,7 +43,8 @@ A whole-buffer LZ4 codec. The block API decodes into a caller's slice whose leng
 budget (`LZ4_decompress_safe`'s contract) and compresses with a single-probe hash-table greedy
 matcher at LZ4's default level, with LZ4's acceleration knob. The frame API reads everything an
 `.lz4` file may hold — LZ4 frames with every combination of the descriptor flags and block sizes,
-skippable frames, legacy frames, concatenated in any order — and writes one LZ4 frame with the
+skippable frames, legacy frames, concatenated in any order — into a fresh allocation (`decompress`) or a
+caller's buffer whose length caps the output (`decompressInto`), and writes one LZ4 frame with the
 options liblz4's `LZ4F_preferences_t` offers except the compression level.
 
 **Not here (expected by some, deliberately absent):** LZ4 HC (levels 3..12: a slower,
@@ -182,8 +183,9 @@ byte; `compressInto` with 1..4 bytes too few for a block checksum).
   tuned beyond 16-byte wild copies in the decoder; the obvious next steps are a 5-byte hash and a
   larger table for the compressor and a fast loop without per-sequence bounds checks while far
   from the ends of the buffers.
-- **B5** `decompressFrameInto(dst, src)`: decode a frame into a caller's buffer (a consumer that
-  knows the size, like Arrow IPC, would save the copy).
+- **B5** ~~`decompressFrameInto(dst, src)`: decode a frame into a caller's buffer~~ — done
+  2026-11-17 as `decompressInto(src, dst, opts)` (the `compressInto` argument order; `dst.len` caps
+  the output like `max_output`; no allocation). First consumer: Arrow IPC LZ4_FRAME buffers.
 
 ## Open
 

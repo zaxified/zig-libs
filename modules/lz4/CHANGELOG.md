@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — `decompressInto(src, dst, opts)`: the frame decoder into a caller's buffer (SPEC Backlog B5). `dst.len` caps the output like `max_output` (the smaller applies; past it `error.OutputTooLarge`, a declared content size over it refused before decoding); nothing is allocated. Tests for a buffer one byte short, exact and larger, and the fuzz harness checks it against `decompress` under the same cap on every input.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the frame fuzz harness draws its mutation positions full-range (`check-fuzz-reach` R2); README Libraries table regenerated for the new module.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation run (109 mutants: 97 killed, 11 equivalent, 1 unobservable); tests added for its survivors and for the cap at exactly one block maximum, a declared size over what is left of the cap, content checksums of concatenated frames, the legacy block size bound, the 13-byte minimum and the 64 KiB window edge, and acceleration.
 - **2026-11-17** — New module: lz4, the LZ4 block format and the LZ4 frame format (`.lz4`).

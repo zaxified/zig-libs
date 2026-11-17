@@ -9,7 +9,8 @@
 //!
 //! Frame: `decompress` reads LZ4 frames (block and content checksums, content
 //! size, linked or independent blocks, any block size), skippable frames and
-//! the legacy `lz4 -l` frame, concatenated, with a decompression-bomb cap;
+//! the legacy `lz4 -l` frame, concatenated, with a decompression-bomb cap
+//! (`decompressInto`: into a caller's buffer, its length the cap);
 //! `compress` writes one frame with liblz4's defaults unless told otherwise.
 //! Malformed input is a typed error, never a panic.
 //!
@@ -54,6 +55,9 @@ pub const DecodeOptions = frame.DecodeOptions;
 pub const default_max_output = frame.default_max_output;
 /// Every frame of `src`, concatenated. Caller owns the result.
 pub const decompress = frame.decompress;
+/// Every frame of `src` decoded into `dst`; returns the decoded length.
+/// `dst.len` caps the output (`error.OutputTooLarge` past it). No allocation.
+pub const decompressInto = frame.decompressInto;
 
 pub const EncodeError = frame.EncodeError;
 pub const EncodeOptions = frame.EncodeOptions;

@@ -75,6 +75,14 @@ fn expectDecodes(want: []const u8, frame: []const u8, opts: lz4.DecodeOptions) !
     const got = try lz4.decompress(gpa, frame, opts);
     defer gpa.free(got);
     try testing.expectEqualSlices(u8, want, got);
+    // `decompressInto` agrees, into an exact buffer and into a larger one.
+    const buf = try gpa.alloc(u8, want.len + 7);
+    defer gpa.free(buf);
+    try testing.expectEqual(want.len, try lz4.decompressInto(frame, buf[0..want.len], opts));
+    try testing.expectEqualSlices(u8, want, buf[0..want.len]);
+    @memset(buf, 0xAA);
+    try testing.expectEqual(want.len, try lz4.decompressInto(frame, buf, opts));
+    try testing.expectEqualSlices(u8, want, buf[0..want.len]);
 }
 
 test "frame: stored and compressed blocks, content size, dictionary id" {
@@ -424,6 +432,53 @@ test "frame: the output cap" {
     try two.end();
     try testing.expectError(error.OutputTooLarge, lz4.decompress(gpa, two.list.items, .{ .max_output = 21 }));
     try expectDecodes("hello worldhello world", two.list.items, .{ .max_output = 22 });
+}
+
+test "decompressInto: the buffer is the cap, nothing past the output is needed" {
+    // A compressed block (1 MiB of zeros in 16 blocks), a stored block, a
+    // declared size, a legacy frame: one byte short is OutputTooLarge, exact
+    // and larger buffers decode, the smaller of `dst.len` and `max_output` wins.
+    const zeros = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(zeros);
+    @memset(zeros, 0);
+    const z = try lz4.compress(gpa, zeros, .{});
+    defer gpa.free(z);
+    var s: Builder = .{};
+    defer s.deinit();
+    try s.header(.{});
+    try s.stored("hello world");
+    try s.end();
+    var sized: Builder = .{};
+    defer sized.deinit();
+    try sized.header(.{ .size = 11 });
+    try sized.stored("hello world");
+    try sized.end();
+    // `printf 'hello hello hello hello world\n' | lz4 -l` (lz4 v1.10.0).
+    const leg = "\x02\x21\x4c\x18\x10\x00\x00\x00\x6e\x68\x65\x6c\x6c\x6f\x20\x06\x00\x60\x77\x6f\x72\x6c\x64\x0a";
+    const cases = [_]struct { want: []const u8, frame: []const u8 }{
+        .{ .want = zeros, .frame = z },
+        .{ .want = "hello world", .frame = s.list.items },
+        .{ .want = "hello world", .frame = sized.list.items },
+        .{ .want = "hello hello hello hello world\n", .frame = leg },
+    };
+    const buf = try gpa.alloc(u8, (1 << 20) + 64);
+    defer gpa.free(buf);
+    for (cases) |c| {
+        try testing.expectError(error.OutputTooLarge, lz4.decompressInto(c.frame, buf[0 .. c.want.len - 1], .{}));
+        try testing.expectError(error.OutputTooLarge, lz4.decompressInto(c.frame, buf, .{ .max_output = c.want.len - 1 }));
+        try testing.expectError(error.OutputTooLarge, lz4.decompressInto(c.frame, buf[0 .. c.want.len - 1], .{ .max_output = null }));
+        try testing.expectEqual(c.want.len, try lz4.decompressInto(c.frame, buf[0..c.want.len], .{ .max_output = null }));
+        try testing.expectEqualSlices(u8, c.want, buf[0..c.want.len]);
+        try testing.expectEqual(c.want.len, try lz4.decompressInto(c.frame, buf, .{ .max_output = c.want.len }));
+        try testing.expectEqualSlices(u8, c.want, buf[0..c.want.len]);
+    }
+    // A declared size over the buffer is refused before any block is read: a
+    // frame whose only block is truncated still says OutputTooLarge.
+    try testing.expectError(error.OutputTooLarge, lz4.decompressInto(sized.list.items[0 .. sized.list.items.len - 6], buf[0..10], .{}));
+    try testing.expectError(error.TruncatedInput, lz4.decompressInto(sized.list.items[0 .. sized.list.items.len - 6], buf[0..11], .{}));
+    // Empty input into an empty buffer; malformed input keeps its own error.
+    try testing.expectEqual(@as(usize, 0), try lz4.decompressInto("", buf[0..0], .{}));
+    try testing.expectError(error.BadMagic, lz4.decompressInto("junkjunk", buf, .{}));
 }
 
 test "frame: encoder options round trip and set the header bits" {

@@ -238,6 +238,27 @@ fn decodeInput(comptime S: type, src: *S, gpa: std.mem.Allocator, input: []const
     };
     var fa = testkit.fuzz.failingAllocator(src, gpa, 16);
     const r = lz4.decompress(fa.allocator(), input, opts);
+    // `decompressInto` gives `decompress`'s verdict under the cap `dst.len`:
+    // the same bytes or the same error. `dst` is drawn around the decoded
+    // length (or anywhere when the input is refused).
+    {
+        const near: usize = if (r) |out| out.len else |_| src.valueRangeAtMost(u32, 0, 70_000);
+        const dlen = (near + src.valueRangeAtMost(u8, 0, 6)) -| 3;
+        const dst = try gpa.alloc(u8, dlen);
+        defer gpa.free(dst);
+        var capped = opts;
+        capped.max_output = @min(opts.max_output orelse std.math.maxInt(usize), dlen);
+        const want = lz4.decompress(gpa, input, capped);
+        defer if (want) |w| gpa.free(w) else |_| {};
+        const got = lz4.decompressInto(input, dst, opts);
+        if (want) |w| {
+            try testing.expectEqualSlices(u8, w, dst[0..try got]);
+            mark("into_ok");
+        } else |e| {
+            try testing.expectError(e, got);
+            if (e == error.OutputTooLarge) mark("into_short");
+        }
+    }
     if (r) |out| {
         defer fa.allocator().free(out);
         if (out.len == 0) mark("ok_empty") else mark("ok_data");
@@ -493,6 +514,7 @@ const reach_labels = [_][]const u8{
     "err_BlockChecksumMismatch",  "err_ContentChecksumMismatch", "err_ContentSizeMismatch", "err_OutputTooLarge", "err_TrailingData",
     "blk_raw",                    "blk_synth",                   "blk_ok",                  "blk_err_Truncated",  "blk_err_BadOffset",
     "blk_err_OutputTooSmall",     "rt_multiblock",               "rt_frame",                "rt_block",           "rt_block_cut",
+    "into_ok",                    "into_short",
 };
 
 test "fuzz harnesses: 3000 seeds in every test run, and they get everywhere" {

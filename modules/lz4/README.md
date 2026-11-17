@@ -27,6 +27,10 @@ const lz4 = @import("lz4");
 const plain = try lz4.decompress(gpa, file_bytes, .{ .max_output = 64 << 20 });
 defer gpa.free(plain);
 
+// Into a caller's buffer when the size is known (Arrow IPC's LZ4_FRAME buffers): dst.len is the
+// cap, output past it is error.OutputTooLarge; returns the decoded length. Allocates nothing.
+const got = try lz4.decompressInto(frame_bytes, dst, .{});
+
 // One frame; liblz4's defaults (64 KiB linked blocks, no checksums) unless told otherwise.
 const z = try lz4.compress(gpa, plain, .{ .content_checksum = true, .block_size = .max4MB });
 defer gpa.free(z);

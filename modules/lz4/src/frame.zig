@@ -265,6 +265,26 @@ pub fn decompress(gpa: std.mem.Allocator, src: []const u8, opts: DecodeOptions) 
     return d.out.toOwnedSlice(gpa);
 }
 
+/// As `decompress`, into `dst`: returns the decoded length. `dst.len` is a
+/// cap like `DecodeOptions.max_output` (the smaller of the two applies), so
+/// output that would not fit is `error.OutputTooLarge`, a frame whose header
+/// declares more than fits is refused before decoding, and bytes of `dst`
+/// past the returned length may have been written. Allocates nothing; never
+/// returns `error.OutOfMemory`.
+pub fn decompressInto(src: []const u8, dst: []u8, opts: DecodeOptions) DecodeError!usize {
+    var d: Decoder = .{
+        // Every write is bounded by `max_output` <= `dst.len` before it is
+        // made, so the list never grows past its buffer.
+        .gpa = std.mem.Allocator.failing,
+        .src = src,
+        .out = .initBuffer(dst),
+        .max_output = @min(opts.max_output orelse std.math.maxInt(usize), dst.len),
+        .opts = opts,
+    };
+    try d.run();
+    return d.out.items.len;
+}
+
 // ── encoder ─────────────────────────────────────────────────────────────
 
 /// Frame header length for `opts` (magic, FLG, BD, optional size, HC).
