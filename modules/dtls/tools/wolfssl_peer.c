@@ -61,6 +61,22 @@
 //                                     # ...offering the X25519MLKEM768 hybrid
 //                                     # share, so OUR server's encapsulation
 //                                     # path is exercised by foreign code.
+//   ./wolfssl_peer server-alpn <port> # PSK server that accepts ONLY "coap"
+//                                     # over ALPN (RFC 7301) and prints
+//                                     # `ALPN <name>` once connected.
+//   ./wolfssl_peer client-alpn <port> # PSK client offering "h3,coap" and
+//                                     # exiting non-zero unless the server's
+//                                     # answer is "coap".
+//   ./wolfssl_peer server-ku-ours <port>
+//                                     # PSK server that, after the echo, reads
+//                                     # one more message and echoes it: our
+//                                     # side sends a KeyUpdate in between and
+//                                     # wolfSSL must accept and answer it.
+//   ./wolfssl_peer server-ku-theirs <port>
+//                                     # ...and here wolfSSL itself starts a
+//                                     # KeyUpdate (`wolfSSL_update_keys`) after
+//                                     # the echo and sends a message under the
+//                                     # new keys; our side must accept it.
 //
 // Deliberate configuration, each item chosen to match what this module
 // implements — a mismatch here would make the test prove nothing:
@@ -95,6 +111,74 @@ static const unsigned char kPsk[16] = {
 };
 static const char kIdentity[] = "zig-libs-dtls";
 static const char kSuite[] = "TLS13-AES128-GCM-SHA256";
+
+// Set by `main` for the cases that need them; every other mode leaves them off.
+static const char *g_alpn = NULL;        // ALPN list offered (client) / accepted (server)
+static const char *g_alpn_expect = NULL; // client: the name the server must answer
+static int g_keyupdate = 0;              // 1: our side initiates, 2: wolfSSL initiates
+
+// Applies the ALPN switch to a fresh session. wolfSSL takes a comma-separated
+// list and, with FAILED_ON_MISMATCH, aborts the handshake instead of silently
+// carrying on without a protocol.
+static int apply_alpn(WOLFSSL *ssl) {
+    if (!g_alpn) return 0;
+    if (wolfSSL_UseALPN(ssl, (char *)g_alpn, (unsigned int)strlen(g_alpn),
+                        WOLFSSL_ALPN_FAILED_ON_MISMATCH) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "UseALPN failed\n");
+        return 1;
+    }
+    return 0;
+}
+
+// Prints the negotiated protocol (`ALPN <name>` or `ALPN none`) and, when the
+// mode names an expected answer, returns non-zero if it is not that.
+static int report_alpn(WOLFSSL *ssl) {
+    if (!g_alpn) return 0;
+    char *proto = NULL;
+    unsigned short size = 0;
+    if (wolfSSL_ALPN_GetProtocol(ssl, &proto, &size) == WOLFSSL_SUCCESS) {
+        printf("ALPN %.*s\n", (int)size, proto);
+    } else {
+        printf("ALPN none\n");
+        proto = NULL;
+    }
+    fflush(stdout);
+    if (g_alpn_expect && (!proto || strlen(g_alpn_expect) != size ||
+                          memcmp(proto, g_alpn_expect, size) != 0)) {
+        fprintf(stderr, "ALPN answer is not \"%s\"\n", g_alpn_expect);
+        return 1;
+    }
+    return 0;
+}
+
+// The KeyUpdate round (RFC 9147 section 8), after the first echo. Mode 2 has
+// wolfSSL start the update and then speak under the new keys; both modes then
+// read the other side's next message and echo it, which is what makes the
+// peer process (and answer) a KeyUpdate our side sent in between.
+static int keyupdate_round(WOLFSSL *ssl) {
+    if (g_keyupdate == 2) {
+        if (wolfSSL_update_keys(ssl) != WOLFSSL_SUCCESS) {
+            fprintf(stderr, "update_keys failed\n");
+            return 1;
+        }
+        const char *note = "wolfssl after its keyupdate";
+        int len = (int)strlen(note);
+        if (wolfSSL_write(ssl, note, len) != len) {
+            fprintf(stderr, "write after update_keys failed\n");
+            return 1;
+        }
+        printf("KEYUPDATE sent\n");
+        fflush(stdout);
+    }
+    char msg[256];
+    int n = wolfSSL_read(ssl, msg, sizeof(msg) - 1);
+    if (n <= 0) { fprintf(stderr, "read after keyupdate failed\n"); return 1; }
+    msg[n] = '\0';
+    printf("RECV %s\n", msg);
+    fflush(stdout);
+    if (wolfSSL_write(ssl, msg, n) != n) { fprintf(stderr, "echo after keyupdate failed\n"); return 1; }
+    return 0;
+}
 
 static unsigned int psk_server_cb(WOLFSSL *ssl, const char *identity,
                                   unsigned char *key, unsigned int key_max_len,
@@ -166,6 +250,7 @@ static int run_server(int port, int hrr_cookie) {
     WOLFSSL *ssl = wolfSSL_new(ctx);
     wolfSSL_set_fd(ssl, fd);
     if (!hrr_cookie) wolfSSL_disable_hrr_cookie(ssl);
+    if (apply_alpn(ssl)) return 1;
     int rc = wolfSSL_accept(ssl);
     if (rc != WOLFSSL_SUCCESS) {
         int err = wolfSSL_get_error(ssl, rc);
@@ -176,6 +261,7 @@ static int run_server(int port, int hrr_cookie) {
     }
     printf("HANDSHAKE %s\n", wolfSSL_get_cipher(ssl));
     fflush(stdout);
+    if (report_alpn(ssl)) return 1;
 
     char msg[256];
     int n = wolfSSL_read(ssl, msg, sizeof(msg) - 1);
@@ -184,6 +270,7 @@ static int run_server(int port, int hrr_cookie) {
     printf("RECV %s\n", msg);
     fflush(stdout);
     if (wolfSSL_write(ssl, msg, n) != n) { fprintf(stderr, "write failed\n"); return 1; }
+    if (g_keyupdate && keyupdate_round(ssl)) return 1;
 
     wolfSSL_shutdown(ssl);
     wolfSSL_free(ssl);
@@ -466,6 +553,7 @@ static int run_client(int port) {
 
     WOLFSSL *ssl = wolfSSL_new(ctx);
     wolfSSL_set_fd(ssl, fd);
+    if (apply_alpn(ssl)) return 1;
     int rc = wolfSSL_connect(ssl);
     if (rc != WOLFSSL_SUCCESS) {
         int err = wolfSSL_get_error(ssl, rc);
@@ -476,6 +564,7 @@ static int run_client(int port) {
     }
     printf("HANDSHAKE %s\n", wolfSSL_get_cipher(ssl));
     fflush(stdout);
+    if (report_alpn(ssl)) return 1;
 
     const char *hello = "hello from wolfssl client";
     if (wolfSSL_write(ssl, hello, (int)strlen(hello)) <= 0) {
@@ -509,7 +598,8 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "usage: %s server|server-hrr|server-cert|server-cert-hrr|"
                 "server-cert-p256|server-cert-p256-hrr|server-cert-mlkem|"
-                "server-cert-mutual|client|client-cert|client-cert-mlkem "
+                "server-cert-mutual|client|client-cert|client-cert-mlkem|"
+                "server-alpn|client-alpn|server-ku-ours|server-ku-theirs "
                 "<port> [mtu] | version\n",
                 argv[0]);
         return 2;
@@ -554,6 +644,19 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], "server-cert-mutual") == 0) {
         cert.verify_peer = 1;
         rc = run_cert_server(port, cert);
+    } else if (strcmp(argv[1], "server-alpn") == 0) {
+        g_alpn = "coap";
+        rc = run_server(port, 0);
+    } else if (strcmp(argv[1], "client-alpn") == 0) {
+        g_alpn = "h3,coap";
+        g_alpn_expect = "coap";
+        rc = run_client(port);
+    } else if (strcmp(argv[1], "server-ku-ours") == 0) {
+        g_keyupdate = 1;
+        rc = run_server(port, 0);
+    } else if (strcmp(argv[1], "server-ku-theirs") == 0) {
+        g_keyupdate = 2;
+        rc = run_server(port, 0);
     } else if (strcmp(argv[1], "client-cert") == 0) {
         rc = run_cert_client(port, WOLFSSL_ECC_X25519);
     } else if (strcmp(argv[1], "client-cert-mlkem") == 0) {

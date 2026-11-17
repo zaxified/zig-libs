@@ -95,7 +95,7 @@ const transcript = @embedFile("testdata/wolfssl_transcript.txt");
 /// the anchor got smaller — which a replay over "whatever is in the file"
 /// would report as a pass. Raise it when cases are added; a drop needs a
 /// sentence in CHANGELOG.md saying which anchor was given up.
-const recorded_cases_floor = 14;
+const recorded_cases_floor = 18;
 
 // ── a tiny line format, parsed here ───────────────────────────────────────
 //
@@ -167,6 +167,12 @@ const Recorded = struct {
     psk_len: usize = 0,
     identity_buf: [64]u8 = @splat(0),
     identity_len: usize = 0,
+    /// The `alpn=` names, comma-separated as recorded (`-` = none); the slices
+    /// `Config.alpn_protocols` needs are cut from it by `config`, so they point
+    /// into the copy that is used, not into a temporary.
+    alpn_buf: [64]u8 = @splat(0),
+    alpn_len: usize = 0,
+    alpn_names: [4][]const u8 = undefined,
     cookie_buf: [128]u8 = @splat(0),
     cookie_len: usize = 0,
     binding_buf: [128]u8 = @splat(0),
@@ -185,6 +191,13 @@ const Recorded = struct {
         r.now_sec = try numArg(i64, line, "now_sec");
         r.offer_group = try hex4Arg(line, "offer_group");
         r.client_cert = try boolArg(line, "client_cert");
+        if (arg(line, "alpn")) |a| {
+            if (!std.mem.eql(u8, a, "-")) {
+                if (a.len > r.alpn_buf.len) return error.ValueTooLong;
+                @memcpy(r.alpn_buf[0..a.len], a);
+                r.alpn_len = a.len;
+            }
+        }
 
         // The suite is recorded so a transcript taken under a different one is
         // visible in the file; only one is wired here, and a second would need
@@ -223,13 +236,23 @@ const Recorded = struct {
     /// referenced by role, not copied into the transcript: the peer read the
     /// SAME bytes off disk when the recording was taken, so "which certificate"
     /// has one answer in the tree, not one per consumer.
-    fn config(self: *const Recorded, role: enum { client, server }) Config {
+    fn config(self: *Recorded, role: enum { client, server }) Config {
+        var names: usize = 0;
+        if (self.alpn_len > 0) {
+            var it = std.mem.splitScalar(u8, self.alpn_buf[0..self.alpn_len], ',');
+            while (it.next()) |name| {
+                self.alpn_names[names] = name;
+                names += 1;
+            }
+        }
+        const alpn = self.alpn_names[0..names];
         if (!self.cert_mode) return switch (role) {
             .client => .{
                 .role = .client,
                 .psk_identity = self.identity(),
                 .psk = self.psk(),
                 .cipher_suites = &.{.aes_128_gcm_sha256},
+                .alpn_protocols = alpn,
             },
             .server => .{
                 .role = .server,
@@ -240,6 +263,7 @@ const Recorded = struct {
                     .cookie_secret = self.cookie_buf[0..self.cookie_len],
                     .peer_binding = self.binding_buf[0..self.binding_len],
                 } else null,
+                .alpn_protocols = alpn,
             },
         };
         return switch (role) {
@@ -255,6 +279,7 @@ const Recorded = struct {
                     .private_key = clientKey(),
                 } else null,
                 .key_share_group = @fromBackingInt(@intCast(self.offer_group)),
+                .alpn_protocols = alpn,
             },
             .server => .{
                 .role = .server,
@@ -264,6 +289,7 @@ const Recorded = struct {
                     .chain = &.{&cert_kat.server_cert_der},
                     .private_key = serverKey(),
                 },
+                .alpn_protocols = alpn,
             },
         };
     }
@@ -293,6 +319,8 @@ const Replay = struct {
     flows_seen: std.EnumSet(Flow) = .empty,
     kx_seen: std.EnumSet(KeyExchange) = .empty,
     retry_cases: usize = 0,
+    key_updates: usize = 0,
+    alpn_cases: usize = 0,
     /// Big enough for the whole of a hybrid ServerHello flight in one buffer.
     out: [4096]u8 = undefined,
     plain: [2048]u8 = undefined,
@@ -402,6 +430,27 @@ const Replay = struct {
                 if (!std.mem.eql(u8, want, got))
                     return self.fail("the plaintext we recovered differs from the recorded one", .{});
             }
+        } else if (std.mem.eql(u8, op, "request_key_update")) {
+            self.conn.?.requestKeyUpdate(try boolArg(line, "peer")) catch |err|
+                return self.fail("requestKeyUpdate refused: {s}", .{@errorName(err)});
+        } else if (std.mem.eql(u8, op, "poll")) {
+            const want = try hexArg(self.gpa, line, "out");
+            defer self.gpa.free(want);
+            const got = self.conn.?.poll(try numArg(u64, line, "now"), &self.out) catch |err|
+                return self.fail("poll failed: {s}", .{@errorName(err)});
+            if (got == null) return self.fail("poll returned nothing, the recording says a {d}-byte control record", .{want.len});
+            if (!std.mem.eql(u8, want, got.?))
+                return self.fail("our control record (ACK / KeyUpdate) differs from the recorded one ({d} bytes recorded, {d} produced)", .{ want.len, got.?.len });
+        } else if (std.mem.eql(u8, op, "poll_idle")) {
+            const got = self.conn.?.poll(try numArg(u64, line, "now"), &self.out) catch |err|
+                return self.fail("poll failed: {s}", .{@errorName(err)});
+            if (got) |extra| return self.fail("poll owes the peer one more control record ({d} bytes) the recording does not have", .{extra.len});
+        } else if (std.mem.eql(u8, op, "expect_epochs")) {
+            const w = try numArg(u64, line, "write");
+            const r = try numArg(u64, line, "read");
+            if (self.conn.?.write_epoch != w or self.conn.?.read_epoch != r)
+                return self.fail("epochs are write {d} / read {d}, the recording says {d} / {d}", .{ self.conn.?.write_epoch, self.conn.?.read_epoch, w, r });
+            self.key_updates += 1;
         } else if (std.mem.eql(u8, op, "expect")) {
             const want_hrr = try boolArg(line, "hrr");
             if (self.conn.?.sawHelloRetryRequest() != want_hrr)
@@ -412,6 +461,12 @@ const Replay = struct {
                 return self.fail("the handshake ran on group 0x{x:0>4}, the recording says 0x{x:0>4}", .{ self.conn.?.ecdhe_group, want_group });
             if (self.conn.?.state != .connected)
                 return self.fail("the connection is {t}, not connected", .{self.conn.?.state});
+            if (arg(line, "alpn")) |want_alpn| {
+                const got_alpn = self.conn.?.negotiatedAlpn() orelse "";
+                if (!std.mem.eql(u8, want_alpn, got_alpn))
+                    return self.fail("negotiated ALPN is \"{s}\", the recording says \"{s}\"", .{ got_alpn, want_alpn });
+                self.alpn_cases += 1;
+            }
             if (arg(line, "max_datagram") != null) {
                 const cap = try numArg(usize, line, "max_datagram");
                 if (self.tally.largest_datagram > cap)
@@ -459,6 +514,10 @@ test "wolfSSL transcript: every recorded exchange replays byte-for-byte, with no
     try testing.expect(r.flows_seen.count() == 3);
     try testing.expect(r.kx_seen.count() == 2);
     try testing.expect(r.retry_cases >= 5);
+    // The post-handshake anchors (2026-11-17): ALPN in both roles, and a
+    // KeyUpdate started by each side, all of them against a live wolfSSL.
+    try testing.expect(r.alpn_cases >= 2);
+    try testing.expect(r.key_updates >= 2);
 }
 
 test "wolfSSL transcript: the header names the release, the date and the command that took it" {

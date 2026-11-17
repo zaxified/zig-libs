@@ -361,8 +361,16 @@ API (additive; every existing caller is unchanged):
 both suites, the next read key re-derived independently from RFC 8446 §7.2's
 `"traffic upd"` label, late previous-epoch records, a lost KeyUpdate and a
 lost ACK, the exporter equal on both sides and distinct from the TLS-prefix
-exporter. Not yet against a live peer: the wolfSSL interop program has no
-KeyUpdate or ALPN case.
+exporter. **Against a live peer (2026-11-17, wolfSSL 5.9.1, PSK mode):** four interop cases. `psk-client-alpn`: our ClientHello offers
+`h3`, `coap`; wolfSSL (accepts only `coap`) answers in EncryptedExtensions, `negotiatedAlpn()` is `coap` and the peer prints
+the same. `psk-server-alpn`: wolfSSL offers `h3,coap`, our server (preference `coap`, `h3`) picks `coap`, and the peer exits 0 only
+if the answer it parsed is `coap`. `psk-client-keyupdate-ours`: we send a KeyUpdate with `update_requested`; wolfSSL ACKs it and answers with its own,
+both epochs go 3 -> 4, and a message and its echo cross under the new keys. `psk-client-keyupdate-theirs`: wolfSSL calls
+`wolfSSL_update_keys` and writes under the new key; `recv` reports `ReceivedKeyUpdate`, our `poll` answers with the ACK and, because wolfSSL
+asked for it, our own update (two control records), the epochs go 3 -> 4 and the data decrypts. The transcript replays all of it,
+including the control records `poll` emits (new ops `request_key_update`, `poll`, `poll_idle`, `expect_epochs`; `expect ... alpn=`).
+Both KeyUpdate cases have wolfSSL as the SERVER; the engine is role-symmetric here, but a wolfSSL KeyUpdate in the client role is not recorded.
+The first `poll` after an update request also carries the ACK of wolfSSL's NewSessionTicket (two records, not one).
 
 ## Cipher suites and the suite hash (2026-11-13)
 
@@ -549,7 +557,7 @@ wolfSSL interop program speaks 1.3 only (Backlog).
 
 `tools/interop.zig` runs real DTLS 1.3 handshakes over a loopback UDP socket
 against **wolfSSL 5.9.1**, in both roles and in both PSK and certificate mode,
-each followed by an application-data round trip — fourteen cases in all.
+each followed by an application-data round trip — eighteen cases in all (the last four, 2026-11-17: ALPN in both roles, a KeyUpdate from each side).
 
 **It is a PROGRAM, not a test, since 2026-09-06, and that is the design.** A
 zig-libs module is standalone Zig with no external dependency; an anchor against
@@ -777,7 +785,7 @@ two `Connection`s written from the same reading of the RFC cannot see.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** a committed transcript of live interop vs a real wolfSSL 5.9.1 peer (both roles, both key exchanges, fourteen flows), replayed byte-for-byte by `src/wolfssl_replay.zig` with no wolfSSL present; the live exchanges themselves are `tools/interop.zig` (`zig build interop-dtls`)
+**What the tests actually contain.** a committed transcript of live interop vs a real wolfSSL 5.9.1 peer (both roles, both key exchanges, eighteen flows), replayed byte-for-byte by `src/wolfssl_replay.zig` with no wolfSSL present; the live exchanges themselves are `tools/interop.zig` (`zig build interop-dtls`)
 
 ## Backlog / deferred
 
@@ -785,7 +793,7 @@ two `Connection`s written from the same reading of the RFC cannot see.
 
 - **DTLS 1.2 against a live peer** (2026-11-13). The engine is self-interop tested only (see "DTLS 1.2"); `tools/wolfssl_peer.c` drives wolfSSL's 1.3 methods. A 1.2 case there (`wolfDTLSv1_2_*_method`, ECDHE_ECDSA + PSK, HelloVerifyRequest, both roles) and re-captured replay transcript would catch the wire defects two copies of one reading cannot (the 1.3 interop found four). Changing the reviewed peer needs the owner's OK. Effort: small-medium.
 - **DTLS 1.2 send-side fragmentation and out-of-order buffering** (2026-11-13). One handshake message per record and in-order reassembly only (a later message is dropped and retransmitted). Fine at the usual 1200+ byte MTU; a tiny-MTU peer with a large chain cannot be served. Effort: small.
-- **KeyUpdate / ALPN against a live peer** (2026-11-13). Implemented and self-interop tested (see "Post-handshake"), but `tools/interop.zig` has no case where wolfSSL sends or answers a KeyUpdate or negotiates ALPN; adding one means extending the reviewed `wolfssl_peer.c` (`wolfSSL_update_keys`, `wolfSSL_UseALPN`) and re-capturing the replay transcript. Effort: small.
+- ✅ DONE 2026-11-17 (four cases in `tools/interop.zig`, `wolfssl_peer.c` modes `server-alpn`/`client-alpn`/`server-ku-ours`/`server-ku-theirs`, transcript re-captured; see "Post-handshake") **KeyUpdate / ALPN against a live peer** (2026-11-13). Remaining: a wolfSSL-initiated KeyUpdate with wolfSSL as the client, ALPN and KeyUpdate in certificate mode.
 - **AES-256-GCM-SHA384 against a live peer.** Self-interop only (done 2026-11-13, see "Cipher suites and the suite hash"); the wolfSSL interop program offers one suite (`kSuite` in `tools/wolfssl_peer.c`). A case with `TLS13-AES256-GCM-SHA384` there (both roles, PSK with a SHA-384 PSK, HelloRetryRequest) would wire-verify the SHA-384 transcript and the 83-byte cookie. Effort: small.
 - **CCM / CCM_8 suites** (survey 2026-09-30). RFC 7925's constrained-device profile, this module's stated CoAP audience, mandates CCM_8. Blocked on a 12-byte-nonce CCM: std 0.17.1 exports only the 13-byte presets (its generic `AesCcm` is private, `aes_ccm.zig:36`), and the sibling `oscore` uses std's 13-byte `Aes128Ccm8` directly, so there is no CCM core to reuse. Wanted: an **`aesccm` module (12/13-byte nonce, tag 8/16) shared by oscore + dtls** (rechecked 2026-11-13). Effort: medium. Fits §2.
 - **Session tickets / resumption and 0-RTT** (survey 2026-09-30; still open for both engines after 1.2 landed 2026-11-13). Saves a handshake on constrained links; pion has it for 1.2, wolfSSL for 1.3. Effort: medium (sibling `tlsresume` covers the server ticket seal for TLS). Fits §2.

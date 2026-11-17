@@ -113,6 +113,15 @@ const Flow = enum {
     server_cookie,
 };
 
+/// A post-handshake KeyUpdate round after the first echo (client flow only).
+const KeyUpdate = enum {
+    none,
+    /// Our side sends it (`update_requested`); wolfSSL must ACK, answer with its own, and speak under the new keys.
+    ours,
+    /// wolfSSL sends it (`wolfSSL_update_keys`) and then a message under the new keys.
+    theirs,
+};
+
 const Case = struct {
     name: []const u8,
     flow: Flow,
@@ -140,6 +149,13 @@ const Case = struct {
     /// What our side sends once connected, and what it must receive.
     app_send: []const u8 = "",
     app_expect: []const u8,
+    /// ALPN names our side offers (client) or accepts, in preference order (server).
+    alpn: []const []const u8 = &.{},
+    /// What `negotiatedAlpn()` must report on our side.
+    expect_alpn: ?[]const u8 = null,
+    /// The name the peer must print on its `ALPN <name>` line (client flow).
+    expect_peer_alpn: ?[]const u8 = null,
+    key_update: KeyUpdate = .none,
     /// One line of prose, copied into the transcript, saying what THIS case
     /// proves that no other one does.
     why: []const u8,
@@ -172,6 +188,48 @@ const cases = [_]Case{
         .seed = 0x5b,
         .app_expect = "hello from wolfssl client",
         .why = "a real wolfSSL client accepts what OUR server puts on the wire",
+    },
+    .{
+        .name = "psk-client-alpn",
+        .flow = .client,
+        .peer_mode = "server-alpn",
+        .seed = 0x2c,
+        .alpn = &.{ "h3", "coap" },
+        .expect_alpn = "coap",
+        .expect_peer_alpn = "coap",
+        .app_send = "hello from zig-libs",
+        .app_expect = "hello from zig-libs",
+        .why = "ALPN (RFC 7301) against a live server: our ClientHello offers h3 and coap, wolfSSL (which accepts only coap) answers in EncryptedExtensions, and both sides name the same protocol",
+    },
+    .{
+        .name = "psk-server-alpn",
+        .flow = .server,
+        .peer_mode = "client-alpn",
+        .seed = 0x5b,
+        .alpn = &.{ "coap", "h3" },
+        .expect_alpn = "coap",
+        .app_expect = "hello from wolfssl client",
+        .why = "ALPN in the other role: wolfSSL offers h3 and coap, OUR server picks its first preference (coap) and the peer exits 0 only if the EncryptedExtensions it parsed name coap",
+    },
+    .{
+        .name = "psk-client-keyupdate-ours",
+        .flow = .client,
+        .peer_mode = "server-ku-ours",
+        .seed = 0x2c,
+        .key_update = .ours,
+        .app_send = "hello from zig-libs",
+        .app_expect = "hello from zig-libs",
+        .why = "OUR KeyUpdate (update_requested) against a live peer: wolfSSL ACKs it, answers with its own, and the data after the update is exchanged under epoch-4 keys in both directions",
+    },
+    .{
+        .name = "psk-client-keyupdate-theirs",
+        .flow = .client,
+        .peer_mode = "server-ku-theirs",
+        .seed = 0x2c,
+        .key_update = .theirs,
+        .app_send = "hello from zig-libs",
+        .app_expect = "hello from zig-libs",
+        .why = "wolfSSL's KeyUpdate (wolfSSL_update_keys) reaches OUR engine: recv reports ReceivedKeyUpdate, our ACK (and answering update when requested) is accepted, and the message wolfSSL sends under its new keys decrypts",
     },
     .{
         .name = "psk-server-cookie",
@@ -640,6 +698,7 @@ fn clientConfig(case: Case, fx: *const Fixtures) dtls.Config {
         .psk_identity = psk_identity,
         .psk = &psk,
         .cipher_suites = &.{.aes_128_gcm_sha256},
+        .alpn_protocols = case.alpn,
     };
     return .{
         .role = .client,
@@ -656,6 +715,7 @@ fn clientConfig(case: Case, fx: *const Fixtures) dtls.Config {
             .private_key = fx.clientKey(),
         } else null,
         .key_share_group = @fromBackingInt(@intCast(case.offer_group)),
+        .alpn_protocols = case.alpn,
     };
 }
 
@@ -669,6 +729,7 @@ fn serverConfig(case: Case, fx: *const Fixtures, binding: ?[]const u8) dtls.Conf
             .{ .cookie_secret = cookie_secret, .peer_binding = b }
         else
             null,
+        .alpn_protocols = case.alpn,
     };
     return .{
         .role = .server,
@@ -678,7 +739,23 @@ fn serverConfig(case: Case, fx: *const Fixtures, binding: ?[]const u8) dtls.Conf
             .chain = &fx.server_chain,
             .private_key = fx.serverKey(),
         },
+        .alpn_protocols = case.alpn,
     };
+}
+
+/// The ALPN names as the `config` line writes them: comma-separated, `-` for none.
+fn joinAlpn(buf: []u8, names: []const []const u8) []const u8 {
+    if (names.len == 0) return "-";
+    var n: usize = 0;
+    for (names, 0..) |name, i| {
+        if (i > 0) {
+            buf[n] = ',';
+            n += 1;
+        }
+        @memcpy(buf[n..][0..name.len], name);
+        n += name.len;
+    }
+    return buf[0..n];
 }
 
 /// The `config` line the replay reads back. Written from the same `Case` the
@@ -693,6 +770,8 @@ fn recordConfig(rec: *Recorder, case: Case, seed: [32]u8) void {
     rec.numArg("now_sec", valid_now_sec);
     rec.hex4Arg("offer_group", case.offer_group);
     rec.numArg("client_cert", @intFromBool(case.client_cert));
+    var alpn_buf: [64]u8 = undefined;
+    rec.strArg("alpn", joinAlpn(&alpn_buf, case.alpn));
     if (!case.cert_mode) {
         rec.hexArg("psk_identity", psk_identity);
         rec.hexArg("psk", &psk);
@@ -807,6 +886,10 @@ fn runClientFlow(
     // case predicted -- the prediction was just checked against it, and a
     // transcript that echoed the prediction back would be checking nothing.
     rec.hex4Arg("group", conn.ecdhe_group);
+    if (case.expect_alpn) |want| {
+        try expectBytes("negotiated ALPN", want, conn.negotiatedAlpn() orelse "");
+        rec.strArg("alpn", want);
+    }
     if (case.mtu > 0) {
         // Every datagram stayed inside the MTU, and the certificate alone is
         // bigger than one — so its Certificate message cannot have arrived
@@ -831,8 +914,32 @@ fn runClientFlow(
     try sock.send(io, &server_addr, record);
 
     var plain: [2048]u8 = undefined;
-    const echoed = try recvApplicationData(io, sock, &conn, &rx, &plain, rec);
+    const echoed = try recvApplicationData(io, sock, &conn, &rx, &plain, rec, null);
     try expectBytes("echoed application data", case.app_expect, echoed);
+
+    switch (case.key_update) {
+        .none => {},
+        .ours => try keyUpdateOurs(io, sock, &server_addr, &conn, &out, &rx, &plain, rec),
+        .theirs => try keyUpdateTheirs(io, sock, &server_addr, &conn, &out, &rx, &plain, rec),
+    }
+
+    // The peer's own `ALPN <name>` line, a NOTE like the certificate subject
+    // below: the peer's stdout is not bytes on the wire.
+    if (case.expect_peer_alpn) |want| {
+        var lines: usize = 0;
+        const found = while (lines < 6) : (lines += 1) {
+            const line = peerLine(&stdout_reader.interface) catch break false;
+            if (std.mem.startsWith(u8, line, "ALPN ")) {
+                if (!std.mem.eql(u8, line["ALPN ".len..], want)) {
+                    std.debug.print("  peer reported \"{s}\", not ALPN {s}\n", .{ line, want });
+                    return error.WrongPeerAlpn;
+                }
+                rec.note("peer stdout (not replayable): {s}", .{line});
+                break true;
+            }
+        } else false;
+        if (!found) return error.PeerNeverReportedAlpn;
+    }
 
     // The peer's own account of what it verified. Read only AFTER the
     // application-data round trip, so the peer has certainly printed it, and
@@ -863,6 +970,125 @@ fn runClientFlow(
     }
 }
 
+/// What a KeyUpdate case needs to answer a peer's KeyUpdate: where to send, a
+/// buffer, the caller-supplied clock `poll` takes, and a count of the control
+/// records sent (an ACK alone is one, an ACK plus our own update is two).
+const Flusher = struct {
+    peer: *const net.IpAddress,
+    out: []u8,
+    now: *u64,
+    emitted: *usize,
+};
+
+/// Drains `poll` (one record per call) onto the wire and records every call,
+/// ending with the call that returned `null`. `now` is a fake clock that moves
+/// 10 ms per flush: only the retransmit timer reads it.
+fn flushPoll(io: std.Io, sock: net.Socket, conn: *Connection, rec: *Recorder, fl: Flusher) !void {
+    while (try conn.poll(fl.now.*, fl.out)) |bytes| {
+        rec.op("poll");
+        rec.numArg("now", fl.now.*);
+        rec.hexArg("out", bytes);
+        rec.end();
+        try sock.send(io, fl.peer, bytes);
+        fl.emitted.* += 1;
+    }
+    rec.op("poll_idle");
+    rec.numArg("now", fl.now.*);
+    rec.end();
+    fl.now.* += 10;
+}
+
+/// One datagram that must be a post-handshake control record (an ACK, a
+/// KeyUpdate, a ticket); a KeyUpdate is answered at once.
+fn recvControl(io: std.Io, sock: net.Socket, conn: *Connection, rx: []u8, plain: []u8, rec: *Recorder, fl: Flusher) !void {
+    const incoming = try sock.receiveTimeout(io, rx, deadline(io, 10_000));
+    if (conn.recv(incoming.data, plain)) |_| {
+        return error.UnexpectedApplicationData;
+    } else |err| switch (err) {
+        error.ReceivedAck, error.ReceivedPostHandshakeMessage, error.ReceivedKeyUpdate => {
+            rec.op("recv");
+            rec.hexArg("in", incoming.data);
+            rec.strArg("skip", @errorName(err));
+            rec.end();
+            if (err == error.ReceivedKeyUpdate) try flushPoll(io, sock, conn, rec, fl);
+        },
+        else => return err,
+    }
+}
+
+fn recordEpochs(rec: *Recorder, conn: *const Connection) void {
+    rec.op("expect_epochs");
+    rec.numArg("write", conn.write_epoch);
+    rec.numArg("read", conn.read_epoch);
+    rec.end();
+}
+
+/// Our KeyUpdate against a live peer. Both epochs must advance exactly once:
+/// the write one when wolfSSL's ACK names our KeyUpdate record, the read one
+/// when wolfSSL answers `update_requested` with its own update.
+fn keyUpdateOurs(io: std.Io, sock: net.Socket, peer: *const net.IpAddress, conn: *Connection, out: []u8, rx: []u8, plain: []u8, rec: *Recorder) !void {
+    const epoch0 = conn.write_epoch;
+    var now: u64 = 1000;
+    var emitted: usize = 0;
+    const fl: Flusher = .{ .peer = peer, .out = out, .now = &now, .emitted = &emitted };
+    try conn.requestKeyUpdate(true);
+    rec.op("request_key_update");
+    rec.numArg("peer", 1);
+    rec.end();
+    try flushPoll(io, sock, conn, rec, fl);
+    // The first poll may also owe the ACK for wolfSSL's NewSessionTicket, which
+    // `recv` skipped earlier, so the count is at least one, not exactly one.
+    if (emitted < 1) return error.KeyUpdateNotEmitted;
+
+    var datagrams: usize = 0;
+    while ((conn.write_epoch == epoch0 or conn.read_epoch == epoch0) and datagrams < 8) : (datagrams += 1) {
+        try recvControl(io, sock, conn, rx, plain, rec, fl);
+    }
+    if (conn.write_epoch != epoch0 + 1) return error.OurKeyUpdateWasNotAcknowledged;
+    if (conn.read_epoch != epoch0 + 1) return error.PeerDidNotAnswerWithItsOwnKeyUpdate;
+    recordEpochs(rec, conn);
+
+    const msg = "after our keyupdate";
+    const record = try conn.send(msg, out);
+    rec.op("send");
+    rec.hexArg("in", msg);
+    rec.hexArg("out", record);
+    rec.end();
+    try sock.send(io, peer, record);
+    const echoed = try recvApplicationData(io, sock, conn, rx, plain, rec, fl);
+    try expectBytes("echo under the updated keys", msg, echoed);
+}
+
+/// wolfSSL's KeyUpdate against our engine: it arrives as `ReceivedKeyUpdate`,
+/// the ACK goes out, and the message wolfSSL then sends under its new keys
+/// decrypts. If wolfSSL asked for an update in return (two control records
+/// flushed), the wait for its ACK is part of the case.
+fn keyUpdateTheirs(io: std.Io, sock: net.Socket, peer: *const net.IpAddress, conn: *Connection, out: []u8, rx: []u8, plain: []u8, rec: *Recorder) !void {
+    const epoch0 = conn.read_epoch;
+    var now: u64 = 1000;
+    var emitted: usize = 0;
+    const fl: Flusher = .{ .peer = peer, .out = out, .now = &now, .emitted = &emitted };
+    const note = try recvApplicationData(io, sock, conn, rx, plain, rec, fl);
+    try expectBytes("message under wolfSSL's updated keys", "wolfssl after its keyupdate", note);
+    if (emitted == 0) return error.NoKeyUpdateWasReceived;
+    if (conn.read_epoch != epoch0 + 1) return error.PeerKeyUpdateNotApplied;
+    var datagrams: usize = 0;
+    while (emitted >= 2 and conn.write_epoch == epoch0 and datagrams < 8) : (datagrams += 1) {
+        try recvControl(io, sock, conn, rx, plain, rec, fl);
+    }
+    recordEpochs(rec, conn);
+
+    const msg = "after wolfssl keyupdate";
+    const record = try conn.send(msg, out);
+    rec.op("send");
+    rec.hexArg("in", msg);
+    rec.hexArg("out", record);
+    rec.end();
+    try sock.send(io, peer, record);
+    const echoed = try recvApplicationData(io, sock, conn, rx, plain, rec, fl);
+    try expectBytes("echo after wolfSSL's KeyUpdate", msg, echoed);
+}
+
 /// The application-data read both directions share. A real peer puts other
 /// things on the application epoch first: wolfSSL ACKs our Finished (RFC 9147
 /// §7) and sends a NewSessionTicket. Neither is application data and neither is
@@ -878,6 +1104,7 @@ fn recvApplicationData(
     rx: []u8,
     plain: []u8,
     rec: *Recorder,
+    fl: ?Flusher,
 ) ![]const u8 {
     var skipped: usize = 0;
     while (skipped <= 8) {
@@ -891,6 +1118,19 @@ fn recvApplicationData(
                 skipped += 1;
                 continue;
             },
+            // A peer KeyUpdate: the read key moved, and `poll` now owes the
+            // peer an ACK (and our own update when it asked for one). Only the
+            // KeyUpdate cases pass a `Flusher`; for every other case a
+            // KeyUpdate is an error, as before.
+            error.ReceivedKeyUpdate => if (fl) |f| {
+                rec.op("recv");
+                rec.hexArg("in", incoming.data);
+                rec.strArg("skip", @errorName(err));
+                rec.end();
+                try flushPoll(io, sock, conn, rec, f);
+                skipped += 1;
+                continue;
+            } else return err,
             else => return err,
         };
         rec.op("recv");
@@ -1008,12 +1248,16 @@ fn runServerFlow(
     rec.op("expect");
     rec.numArg("hrr", @intFromBool(case.expect_hrr));
     rec.hex4Arg("group", conn.?.ecdhe_group);
+    if (case.expect_alpn) |want| {
+        try expectBytes("negotiated ALPN", want, conn.?.negotiatedAlpn() orelse "");
+        rec.strArg("alpn", want);
+    }
     if (cookie_mode) rec.numArg("min_retries", 1);
     rec.end();
 
     // The wolfSSL client sends first and expects its own message echoed.
     var plain: [2048]u8 = undefined;
-    const received = try recvApplicationData(io, sock, &conn.?, &rx, &plain, rec);
+    const received = try recvApplicationData(io, sock, &conn.?, &rx, &plain, rec, null);
     try expectBytes("received application data", case.app_expect, received);
 
     const echo = try conn.?.send(received, &out);
@@ -1095,7 +1339,12 @@ fn writeHeader(w: *std.Io.Writer, wolfssl_version: []const u8) !void {
         \\#   send in=<hex> out=<hex>                    send(in) must return exactly this
         \\#   recv in=<hex> out=<hex>                    recv(in) must return exactly this plaintext
         \\#   recv in=<hex> skip=<Error>                 recv(in) must fail with exactly this error
-        \\#   expect hrr=<0|1> group=<hex4> [...]        the connection's own view, after the handshake
+        \\#   request_key_update peer=<0|1>              requestKeyUpdate(peer)
+        \\#   poll now=<ms> out=<hex>                    poll(now) must return exactly this control record
+        \\#   poll_idle now=<ms>                         poll(now) must return nothing
+        \\#   expect_epochs write=<n> read=<n>           the connection's write/read epochs
+        \\#   expect hrr=<0|1> group=<hex4> [alpn=<name>] [...]
+        \\#                                              the connection's own view, after the handshake
         \\#
         \\format version=1
         \\

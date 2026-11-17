@@ -61,7 +61,7 @@ bookkeeping, and the handshake message bodies incl. the PSK and cert-mode
 extensions.
 
 **Third-party interop — taken live, replayed hermetically.** The module
-itself ships no foreign source and needs no C compiler. Fourteen real DTLS 1.3
+itself ships no foreign source and needs no C compiler. Eighteen real DTLS 1.3
 handshakes against **wolfSSL 5.9.1** over a loopback UDP socket, each followed
 by an application-data round trip, are run by `tools/interop.zig` — a
 standalone program *outside* the module (`zig build interop-dtls`, needs

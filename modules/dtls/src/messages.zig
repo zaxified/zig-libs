@@ -2047,7 +2047,7 @@ test "corpus: every message seed reaches its decoder, and the counts are pinned"
         var it = CipherSuiteIter{ .raw = dec.cipher_suites_raw };
         while (it.next()) |_| r.walked += 1;
     }
-    try expectReach(r, .{ .entries = 19, .accepted = 14, .walked = 91, .mutated = 3 });
+    try expectReach(r, .{ .entries = 21, .accepted = 16, .walked = 109, .mutated = 3 });
     try testing.expectEqual(@as(usize, 0), ch.dropped);
 
     // ── ServerHello: extensions parsed.
@@ -2065,7 +2065,7 @@ test "corpus: every message seed reaches its decoder, and the counts are pinned"
         r.accepted += 1;
         r.walked += dec.extensions.len;
     }
-    try expectReach(r, .{ .entries = 26, .accepted = 23, .walked = 45, .mutated = 3 });
+    try expectReach(r, .{ .entries = 29, .accepted = 26, .walked = 51, .mutated = 3 });
     try testing.expectEqual(@as(usize, 0), sh.dropped);
 
     // ── Certificate: DER octets handed back as `cert_data`. 1161 is three
@@ -2102,7 +2102,7 @@ test "corpus: every message seed reaches its decoder, and the counts are pinned"
         r.accepted += 1;
         r.walked += got.len;
     }
-    try expectReach(r, .{ .entries = 36, .accepted = 32, .walked = 115 });
+    try expectReach(r, .{ .entries = 38, .accepted = 34, .walked = 131 });
     try testing.expectEqual(@as(usize, 0), ext.dropped);
 
     // ── cookie: cookie octets returned.
@@ -2154,7 +2154,7 @@ test "corpus: every message seed reaches its decoder, and the counts are pinned"
         r.accepted += 1;
         r.walked += got.identities.len;
     }
-    try expectReach(r, .{ .entries = 11, .accepted = 7, .walked = 6 });
+    try expectReach(r, .{ .entries = 13, .accepted = 9, .walked = 8 });
     try testing.expectEqual(@as(usize, 0), op.dropped);
 
     // ── supported_groups / signature_algorithms: u16 values decoded.
