@@ -6,7 +6,7 @@
 
 **Scope:** core — ncclient 0.7.1 (client) and libnetconf2 4.4 (C, client+server) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation ? · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (77/79, 2 eq) · src 3dd8ad7237a8d487
 
 **Hardening:** fuzz 2026-10-10 (`netconf-wire` 200,000-run budget clean; `netconf-client` at `.scale` 2 = 100,000 runs — a whole session whose peer bytes are tampered at one read; NETCONF_FUZZ; the hello and framer harnesses are unchanged) · ct n/a — the SSH password is handed straight to `ssh.userauth`; framing/RPC carry no key, MAC or compare (review, 2026-10-10)
 
@@ -353,6 +353,29 @@ are byte-exact in the strong sense.
 Without a live server, the live tests are counted skips (not passes); with
 `NETCONF_TEST_SERVER` set, they all run for real. Green in both `Debug` and
 `--release=fast`.
+
+**Audit 2026-11-17 (delta mutation).** 79 schemata mutants over the RFC 6022 code added the same day, ReleaseSafe,
+one build, each mutant under `setsid -w timeout` and `ulimit -v`: in `rpc.zig` the `get-schema` writer (the
+namespace, escaping of each of the three parameters, dropping the optional `version` and `format`, the element
+names, the closing tag); in `client.zig` the capability arm for `get_schema` (a forced requirement), the
+parameters handed to the call, the `schemas_filter` handed to `get`, and the two `deinit`s; in `reply.zig`
+`Schema.viaGetSchema` (empty list, the `NETCONF` compare, the loop, the fall-through), `leafText` (the zero and
+one node shortcuts, the trim, text and CDATA counted and joined), `parseSchemaList` (the data guard, the
+namespace and local-name test at each of the four levels and on the leaves, the identifier rules, each leaf's
+assignment, both caps with drop, `>` and `- 1`, the location and entry appends) and `parseSchemaText` (the error
+guard, the `data` name and the two accepted namespaces, `break`, the element test, the first and last child
+bounds and the slice, the text and CDATA join). First run: 59 killed, 20 survived. Three tests and one fake-peer
+mode added (a schema list whose every level, and every leaf, is a decoy in the wrong namespace or under the wrong
+name; leaves trimmed and joined across text and CDATA nodes, and a CDATA-only leaf; the first of two
+monitoring-namespace `<data>` wins and an XML body is returned byte for byte, untrimmed; `getSchema` against a
+peer that echoes the request's parameters, so a dropped `version` or `format` shows) killed 18; 2 are EQUIVALENT:
+`leafText` with no text node falling through to the join (an empty list trimmed is `""`, no allocation) and
+without the one-node shortcut (the join of one node, trimmed, is the shortcut's value; cost-only). 77 killed
++ 2 eq = 79. Not mutated: `monitoring_ns` and `schemas_filter` (comptime constants, a compile-time switch cannot
+reach them; the filter's bytes are pinned by `schemas_filter selects /netconf-state/schemas`) and the
+`data_element orelse` in `parseSchemaList` (`expectData` has already returned for a reply with no `<data>`, and
+`data` and `data_element` are set together in `parseReply`, so it is unreachable). The card's counts are
+cumulative; no earlier mutation run existed.
 
 ## Provenance
 

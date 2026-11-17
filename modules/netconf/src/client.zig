@@ -766,6 +766,9 @@ const FakePeer = struct {
     notify_before_reply: bool = false,
     /// Answer the next request with this message-id instead of the real one.
     forge_message_id: ?u64 = null,
+    /// Answer `<get-schema>` with the request's own parameters
+    /// (`name=value;` per child, XML-escaped) instead of a fixed module.
+    schema_echo: bool = false,
     hello_sent: bool = false,
     /// Hold the next reply back instead of putting it in `outbox` — released
     /// later with `releaseHeld`, so a test can make a *later* request's
@@ -878,7 +881,20 @@ const FakePeer = struct {
         } else if (std.mem.eql(u8, op.local, "get-schema")) {
             // RFC 6022 §4.2: <data> in the monitoring namespace, plain text.
             try w.print("<rpc-reply message-id=\"{s}\" xmlns=\"{s}\">", .{ id_text, capabilities.base_ns });
-            try w.writeAll("<data xmlns=\"urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring\">module bar { // &lt;x&gt;\n}</data></rpc-reply>");
+            if (self.schema_echo) {
+                try w.print("<data xmlns=\"{s}\">", .{rpc_mod.monitoring_ns});
+                var it = op.elementIterator();
+                while (it.next()) |c| {
+                    const t = try c.textContent(self.gpa);
+                    defer self.gpa.free(t);
+                    try w.print("{s}=", .{c.local});
+                    try rpc_mod.writeEscaped(w, t);
+                    try w.writeAll(";");
+                }
+                try w.writeAll("</data></rpc-reply>");
+            } else {
+                try w.writeAll("<data xmlns=\"urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring\">module bar { // &lt;x&gt;\n}</data></rpc-reply>");
+            }
         } else if (std.mem.eql(u8, op.local, "get") and
             if (op.firstElementChild()) |c| std.mem.eql(u8, c.local, "filter") else false)
         {
@@ -1312,6 +1328,22 @@ test "getSchema and listSchemas round-trip against the fake peer (RFC 6022)" {
     try testing.expectEqualStrings("yang", l.items[0].format);
     try testing.expectEqualStrings("http://example.com/bar", l.items[0].namespace);
     try testing.expectEqualStrings("NETCONF", l.items[0].locations[0]);
+}
+
+test "getSchema sends identifier, version and format to the peer (none dropped)" {
+    const gpa = testing.allocator;
+    const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+    h.peer.schema_echo = true;
+
+    const all = try h.client.getSchema(.{ .identifier = "a&b", .version = "1.0", .format = "xsd" });
+    defer gpa.free(all);
+    try testing.expectEqualStrings("identifier=a&b;version=1.0;format=xsd;", all);
+
+    const bare = try h.client.getSchema(.{ .identifier = "m" });
+    defer gpa.free(bare);
+    try testing.expectEqualStrings("identifier=m;", bare);
 }
 
 test "check_capabilities (default true) refuses locally an operation the peer never advertised" {

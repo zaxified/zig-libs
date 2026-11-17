@@ -1527,3 +1527,73 @@ test "parseSchemaText: hostile replies are errors, never a panic" {
     // DOCTYPE entity bomb never reaches the reader.
     try testing.expectError(error.DoctypeForbidden, parseReply(gpa, "<!DOCTYPE r [<!ENTITY a \"aaaa\">]>" ++ head ++ "<data>&a;</data></rpc-reply>"));
 }
+
+test "parseSchemaList: every level must be an ietf-netconf-monitoring element of the right name" {
+    const gpa = testing.allocator;
+    const mon = "xmlns=\"" ++ monitoring_ns ++ "\"";
+    const other = "xmlns=\"urn:other\"";
+    // Each decoy carries an otherwise valid <identifier>, so a reader that stops
+    // checking its level's namespace or local name would list it.
+    const body = "<data>" ++
+        "<netconf-state " ++ other ++ "><schemas " ++ mon ++ "><schema><identifier>a1</identifier></schema></schemas></netconf-state>" ++
+        "<other-state " ++ mon ++ "><schemas><schema><identifier>b1</identifier></schema></schemas></other-state>" ++
+        "<netconf-state " ++ mon ++ ">" ++
+        "<schemas " ++ other ++ "><schema " ++ mon ++ "><identifier>c1</identifier></schema></schemas>" ++
+        "<schemas-x><schema><identifier>d1</identifier></schema></schemas-x>" ++
+        "<schemas>" ++
+        "<schema " ++ other ++ "><identifier " ++ mon ++ ">e1</identifier></schema>" ++
+        "<junk><identifier>f1</identifier></junk>" ++
+        "<schema><identifier " ++ other ++ ">g1</identifier></schema>" ++
+        "<schema><identifier>good</identifier><version " ++ other ++ ">bad</version></schema>" ++
+        "</schemas></netconf-state></data>";
+    var r = try parseReply(gpa, "<rpc-reply message-id=\"1\" xmlns=\"" ++ base_ns ++ "\">" ++ body ++ "</rpc-reply>");
+    defer r.deinit();
+    var l = try parseSchemaList(gpa, &r);
+    defer l.deinit();
+    try testing.expectEqual(@as(usize, 1), l.items.len);
+    try testing.expectEqualStrings("good", l.items[0].identifier);
+    try testing.expectEqualStrings("", l.items[0].version);
+}
+
+test "parseSchemaList: a leaf is trimmed and joined across text and CDATA nodes" {
+    const gpa = testing.allocator;
+    const head = "<rpc-reply message-id=\"1\" xmlns=\"" ++ base_ns ++ "\"><data><netconf-state xmlns=\"" ++ monitoring_ns ++ "\"><schemas>";
+    const tail = "</schemas></netconf-state></data></rpc-reply>";
+    var r = try parseReply(gpa, head ++
+        "<schema><identifier>  a&amp;b<![CDATA[<c>]]>d  </identifier><version>ab<![CDATA[cd]]></version></schema>" ++
+        "<schema><identifier><![CDATA[ solo ]]></identifier><format><![CDATA[x]]> y </format></schema>" ++ tail);
+    defer r.deinit();
+    var l = try parseSchemaList(gpa, &r);
+    defer l.deinit();
+    try testing.expectEqual(@as(usize, 2), l.items.len);
+    // Several nodes: concatenated, then trimmed as a whole.
+    try testing.expectEqualStrings("a&b<c>d", l.items[0].identifier);
+    // Text then CDATA: both kept.
+    try testing.expectEqualStrings("abcd", l.items[0].version);
+    // A CDATA section alone is the value (trimmed).
+    try testing.expectEqualStrings("solo", l.items[1].identifier);
+    try testing.expectEqualStrings("x y", l.items[1].format);
+}
+
+test "parseSchemaText: first <data> wins; an XML body is returned byte for byte, untrimmed" {
+    const gpa = testing.allocator;
+    const mon = "xmlns=\"" ++ monitoring_ns ++ "\"";
+    const head = "<rpc-reply message-id=\"1\" xmlns=\"" ++ base_ns ++ "\">";
+    {
+        // Two <data> in the monitoring namespace are not an AmbiguousReply (only
+        // the base-namespace ones are counted); the first is the schema.
+        var r = try parseReply(gpa, head ++ "<data " ++ mon ++ ">first</data><data " ++ mon ++ ">second</data></rpc-reply>");
+        defer r.deinit();
+        const text = try parseSchemaText(gpa, &r);
+        defer gpa.free(text);
+        try testing.expectEqualStrings("first", text);
+    }
+    {
+        const inner = "\n  <xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><!-- c --></xs:schema>\n ";
+        var r = try parseReply(gpa, head ++ "<data " ++ mon ++ ">" ++ inner ++ "</data></rpc-reply>");
+        defer r.deinit();
+        const text = try parseSchemaText(gpa, &r);
+        defer gpa.free(text);
+        try testing.expectEqualStrings(inner, text);
+    }
+}
