@@ -780,6 +780,16 @@ test "dtls12: whole messages arriving in reverse order inside one datagram are q
         @memcpy(rev[len..][0..recs[i].len], recs[i]);
         len += recs[i].len;
     }
+    // Two early copies of the ServerKeyExchange first: queued; the first
+    // completes it, the second is then stale and must be discarded.
+    // (The second copy under another record number, or the replay window
+    // would drop it before the handshake layer sees it.)
+    _ = try client.handleFlight(recs[2], rnd, 0, &bufs.a);
+    var copy: [1024]u8 = undefined;
+    @memcpy(copy[0..recs[2].len], recs[2]);
+    copy[10] +%= 40;
+    _ = try client.handleFlight(copy[0..recs[2].len], rnd, 0, &bufs.a);
+    try testing.expectEqual(2 * (recs[2].len - record.plaintext_header_len + 1), client.rx_future_len);
     const f5 = try client.handleFlight(rev[0..len], rnd, 0, &bufs.a);
     try testing.expectEqual(c12.State.wait_server_finished, client.state);
     try testing.expectEqual(@as(usize, 0), client.rx_future_len);
@@ -963,4 +973,87 @@ test "dtls12: fragmenting at the end of the epoch-0 sequence space is SequenceNu
     // second would need max: refused, never wrapped.
     server.send_seq[0] = std.math.maxInt(u48) - 2;
     try testing.expectError(error.SequenceNumberExhausted, server.handleFlight(ch, rnd, 0, &bufs.b));
+}
+
+/// The records of `bytes`, one slice each.
+fn recordsOf(bytes: []const u8, out: [][]const u8) []const []const u8 {
+    var n: usize = 0;
+    var rest = bytes;
+    while (rest.len > 0) : (n += 1) {
+        const d = record.nextDatagram(rest, 1);
+        out[n] = d.datagram;
+        rest = d.rest;
+    }
+    return out[0..n];
+}
+
+/// `message_seq` / `msg_type` of an epoch-0 handshake record.
+fn recMsgSeq(rec: []const u8) u16 {
+    return std.mem.readInt(u16, rec[record.plaintext_header_len + 4 ..][0..2], .big);
+}
+
+test "dtls12: a retry after a queued message failed sends ONE answer, not the failed pass's output plus the retry's" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(28)));
+    const rnd = seeded(&csprng);
+    var client = try Connection12.clientInit(ecdsaClientConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer client.deinit();
+    var server = try Connection12.serverInit(ecdsaServerConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer server.deinit();
+    var bufs: Bufs = .{};
+    const ch = try client.startHandshake(rnd, 0, &bufs.a);
+    const f4 = try server.handleFlight(ch, rnd, 0, &bufs.b);
+    // A complete forged message 4, right after ServerHelloDone (3). The
+    // first pass writes the final flight, then fails on it.
+    var rec_buf: [128]u8 = undefined;
+    _ = try client.handleFlight(forgedFragment(50, m12.HandshakeType.certificate, 4, 40, 40, 7, &rec_buf), rnd, 0, &bufs.a);
+    const f5 = try client.handleFlight(f4.out, rnd, 0, &bufs.a);
+    try testing.expectEqual(c12.State.wait_server_finished, client.state);
+    try testing.expectEqual(@as(usize, 3), countRecords(f5.out)); // ClientKeyExchange, CCS, Finished
+    const f6 = try server.handleFlight(f5.out, rnd, 0, &bufs.b);
+    try testing.expect((try client.handleFlight(f6.out, rnd, 0, &bufs.a)).done);
+}
+
+test "dtls12: once a message completed from the queue, a forged fragment cannot evict a genuine partial message" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(29)));
+    const rnd = seeded(&csprng);
+    var client = try Connection12.clientInit(ecdsaClientConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer client.deinit();
+    var s = ecdsaServerConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256});
+    s.max_datagram_len = conn13.min_max_datagram_len; // the ServerKeyExchange is fragmented too
+    var server = try Connection12.serverInit(s);
+    defer server.deinit();
+    var bufs: Bufs = .{};
+    const ch = try client.startHandshake(rnd, 0, &bufs.a);
+    const f4 = try server.handleFlight(ch, rnd, 0, &bufs.b);
+    var rbuf: [64][]const u8 = undefined;
+    const recs = recordsOf(f4.out, &rbuf);
+    var ske_first: ?usize = null;
+    // Every Certificate fragment (message 1) first: all queued.
+    for (recs, 0..) |r, i| switch (recMsgSeq(r)) {
+        1 => _ = try client.handleFlight(r, rnd, 0, &bufs.a),
+        2 => if (ske_first == null) {
+            ske_first = i;
+        },
+        else => {},
+    };
+    // The ServerHello: it completes, and the Certificate completes from the queue.
+    _ = try client.handleFlight(recs[0], rnd, 0, &bufs.a);
+    try testing.expectEqual(@as(u16, 2), client.next_recv_seq);
+    // The first half of the ServerKeyExchange, live.
+    _ = try client.handleFlight(recs[ske_first.?], rnd, 0, &bufs.a);
+    try testing.expect(client.rx_active);
+    const filled = client.rx_filled;
+    // A forged fragment of it with another length: refused, nothing moves.
+    var rec_buf: [128]u8 = undefined;
+    try testing.expectError(error.InconsistentLength, client.handleFlight(forgedFragment(60, m12.HandshakeType.server_key_exchange, 2, 999, 10, 1, &rec_buf), rnd, 0, &bufs.a));
+    try testing.expectEqual(filled, client.rx_filled);
+    // The rest, in order: the handshake completes on the genuine bytes.
+    var f5: []const u8 = &.{};
+    for (recs[ske_first.? + 1 ..]) |r| {
+        const res = try client.handleFlight(r, rnd, 0, &bufs.a);
+        if (res.out.len > 0) f5 = res.out;
+    }
+    try testing.expectEqual(c12.State.wait_server_finished, client.state);
+    const f6 = try server.handleFlight(f5, rnd, 0, &bufs.b);
+    try testing.expect((try client.handleFlight(f6.out, rnd, 0, &bufs.a)).done);
 }

@@ -558,6 +558,32 @@ plain PSK (`psk_with_aes_128_gcm_sha256`) cannot be checked against this
 peer — Debian's wolfSSL is built without `WOLFSSL_STATIC_PSK`, so it has no
 `PSK-AES128-GCM-SHA256`; it stays self-interop only.
 
+**Delta mutation (2026-11-17, fragmentation + queue + RFC 5746 server
+change).** 42 mutants on the non-test changes (`Connection12.zig`
+fragmentation, reassembler wiring, queue, retry-without-queue, `peer_ri`;
+`record.nextDatagram` / `recordWireLen`; the `max_datagram_len` floor in
+`Config.validate`), one schemata build in ReleaseSafe plus one rebuild after
+the first run: 37 killed (one a hang), 5 EQUIVALENT, 0 survivors. The first
+run left three that became tests: skipping `o.len = 0` before the retry (a
+failed first pass's flight was sent in front of the retry's — test "a retry
+after a queued message failed sends ONE answer"), not clearing the
+"message holds queued bytes" flag on completion (a later forged fragment
+could then evict a genuine partial message), and keeping stale queued copies
+(test: two early copies of one message). EQUIVALENT: (a) `cur_epoch` from
+the queued entry — an epoch-1 handshake fragment can only be read once the
+peer's CCS was accepted, which requires every earlier message, so nothing
+after Finished is ever processed and every drained entry meets the same
+`UnexpectedMessage` in either epoch; (b) fragmenting a record of exactly
+`max_datagram_len` — it becomes one fragment at offset 0 of full length,
+byte-identical to the unfragmented record (cost-only); (c) dropping the
+`kind != .handshake_epoch0` guard — CCS (1 byte) and Finished (24) always fit
+under the 128-byte floor; (d) `or true` on the fragment loop — `Fragmenter
+.next` returns null after the last fragment and the loop breaks; (e) the
+early `end >= max_len` break in `nextDatagram` — the next iteration's
+`end + n > max_len` breaks anyway (cost-only). The card's `**Audit:**` line
+has no whole-module counts (`src ?`), so this delta is recorded here only;
+the module still needs a whole-module mutation run.
+
 ## Threat model / out of scope
 
 - **Not yet — see Backlog (not silently skipped):** session resumption /

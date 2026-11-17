@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the day's 1.2 changes (42 mutants: 37 killed, 5 EQUIVALENT argued in SPEC "DTLS 1.2"); three first-run survivors became tests (one answer after a retry, no eviction of a genuine partial message after a queue-completed one, stale queued copies discarded). The card has no whole-module counts, so the result is a SPEC paragraph only.
+
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** test: a 1.2 server fragmenting its flight at the end of the epoch-0 sequence space gets `SequenceNumberExhausted` rather than wrapping.
 
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE (hardening of the same-day 1.2 receive queue):** the retry-without-queue also runs when the message in progress holds queued bytes latched by an EARLIER call (a forged partial fragment queued, then drained when the genuine previous message completed), and then forgets that message too. New tests: that case; a record of exactly `max_datagram_len` is not fragmented and one byte over is; a short output buffer while fragmenting is `BufferTooShort`; no stale queued copies left after a reversed, duplicated flight; `nextDatagram` on a truncated unified header.
