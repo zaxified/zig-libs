@@ -188,12 +188,14 @@ pub fn decodeInto(src: []const u8, out: []u8, start: usize, prefix_start: usize)
 inline fn wildMatch(out: []u8, op: usize, offset: usize, len: usize) void {
     const m = op - offset;
     if (offset >= 16) {
-        // Two chunks cover the common short match; a chunk never overlaps
+        // One chunk covers the common short match; a chunk never overlaps
         // itself, and one reading what an earlier one wrote reads the right
         // bytes (the copy runs forwards).
         out[op..][0..16].* = out[m..][0..16].*;
-        out[op + 16 ..][0..16].* = out[m + 16 ..][0..16].*;
-        if (len > 32) copyLong(out, op, m, len);
+        if (len > 16) {
+            out[op + 16 ..][0..16].* = out[m + 16 ..][0..16].*;
+            if (len > 32) copyLong(out, op, m, len);
+        }
         return;
     }
     // A shorter offset repeats the `offset` bytes before `op`: spread them
