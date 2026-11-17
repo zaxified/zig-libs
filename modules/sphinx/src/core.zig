@@ -168,6 +168,25 @@ noinline fn deriveHopSecretsBody(session_key: *const [32]u8, hop_pubkeys: []cons
 /// longer route is `error.RouteTooLong` before EC math runs.
 pub const max_hops: usize = hop_payloads_len / (1 + 2 + hmac_len);
 
+/// BOLT#4 "Shared Secret", the RECEIVING side: `ss = SHA256(compressed(
+/// ephemeral_pubkey · node_privkey))` for the `public_key` of an incoming
+/// packet (`OnionPacket.public_key`, or `HopSecret.ephemeral_pubkey` on the
+/// sender). The same value `process` derives internally; a relay needs it
+/// to authenticate and obfuscate the failure packet it returns for that HTLC
+/// (`failure.create` / `failure.forward`), which `process` does not hand out.
+/// Runs under the same dead-stack burn as `process`.
+pub fn sharedSecret(out: *[32]u8, node_privkey: *const [32]u8, ephemeral_pubkey: *const [pubkey_len]u8) SharedSecretError!void {
+    defer burnStack();
+    return sharedSecretBody(out, node_privkey, ephemeral_pubkey);
+}
+
+noinline fn sharedSecretBody(out: *[32]u8, node_privkey: *const [32]u8, ephemeral_pubkey: *const [pubkey_len]u8) SharedSecretError!void {
+    const point = Secp256k1.fromSec1(ephemeral_pubkey) catch return error.InvalidPublicKey;
+    const shared_point = point.mul(node_privkey.*, .big) catch return error.IdentityElement;
+    const compressed = shared_point.toCompressedSec1();
+    Sha256.hash(&compressed, out, .{});
+}
+
 pub const ConstructError = SharedSecretError || hopframe.FrameError || error{
     /// The route (given each hop's `shiftSize`) does not fit in the fixed
     /// 1300-byte `hop_payloads` budget.

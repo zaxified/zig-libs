@@ -219,6 +219,84 @@ test "KAT: full construct -> process round-trip peels all 5 hops" {
     }
 }
 
+test "KAT: sharedSecret (receiver side) equals the published shared secret at every hop, from the packet's own public_key" {
+    const hop_pubkeys = katPubkeys();
+    var storage: [5][300]u8 = undefined;
+    const tlvs = try katPayloadTlvs(&storage);
+    const associated_data = hexN(32, v.associated_data);
+    var pkt = try sphinx.construct(&hexN(32, v.session_key), &hop_pubkeys, &tlvs, &associated_data);
+    inline for (v.node_privkeys, 0..) |privkey_hex, i| {
+        var ss: [32]u8 = undefined;
+        try sphinx.sharedSecret(&ss, &hexN(32, privkey_hex), &pkt.public_key);
+        try testing.expectEqualSlices(u8, &hexN(32, v.shared_secrets[i]), &ss);
+        const result = try sphinx.process(&hexN(32, privkey_hex), pkt, &associated_data);
+        var tag: [32]u8 = undefined;
+        Sha256.hash(&ss, &tag, .{});
+        try testing.expectEqualSlices(u8, &tag, &result.replay_tag);
+        if (result.next_packet) |n| pkt = n;
+    }
+    // an off-curve public key is refused by name
+    var ss: [32]u8 = undefined;
+    var bad = pkt.public_key;
+    bad[0] = 0x05;
+    try testing.expectError(error.InvalidPublicKey, sphinx.sharedSecret(&ss, &hexN(32, v.node_privkeys[0]), &bad));
+    // a zero private scalar lands on the identity
+    try testing.expectError(error.IdentityElement, sphinx.sharedSecret(&ss, &@as([32]u8, @splat(0)), &pkt.public_key));
+}
+
+test "sharedSecret reads the private key big-endian (the vector's keys are one repeated byte, blind to byte order)" {
+    var k: [32]u8 = undefined;
+    var e: [32]u8 = undefined;
+    for (&k, &e, 0..) |*kb, *eb, i| {
+        kb.* = @intCast(i + 1);
+        eb.* = @intCast(i * 7 + 3);
+    }
+    const epk = (try Secp256k1.basePoint.mul(e, .big)).toCompressedSec1();
+    var want: [32]u8 = undefined;
+    Sha256.hash(&(try (try Secp256k1.fromSec1(&epk)).mul(k, .big)).toCompressedSec1(), &want, .{});
+    var got: [32]u8 = undefined;
+    try sphinx.sharedSecret(&got, &k, &epk);
+    try testing.expectEqualSlices(u8, &want, &got);
+    // the little-endian reading is a different secret
+    var le = k;
+    std.mem.reverse(u8, &le);
+    var other: [32]u8 = undefined;
+    try sphinx.sharedSecret(&other, &le, &epk);
+    try testing.expect(!std.mem.eql(u8, &want, &other));
+}
+
+test "KAT: end to end: relays derive their own shared secret, hop 3 fails the HTLC, the origin names hop 3" {
+    const hop_pubkeys = katPubkeys();
+    var storage: [5][300]u8 = undefined;
+    const tlvs = try katPayloadTlvs(&storage);
+    const associated_data = hexN(32, v.associated_data);
+    const session_key = hexN(32, v.session_key);
+    var pkt = try sphinx.construct(&session_key, &hop_pubkeys, &tlvs, &associated_data);
+
+    // The forward path: remember each relay's own derived secret.
+    var relay_ss: [4][32]u8 = undefined;
+    inline for (v.node_privkeys[0..4], 0..) |privkey_hex, i| {
+        try sphinx.sharedSecret(&relay_ss[i], &hexN(32, privkey_hex), &pkt.public_key);
+        pkt = (try sphinx.process(&hexN(32, privkey_hex), pkt, &associated_data)).next_packet.?;
+    }
+    // The return path: hop 3 builds the failure, hops 2, 1, 0 obfuscate it.
+    var buf: [1024]u8 = undefined;
+    var p = try sphinx.failure.create(&buf, &relay_ss[3], "\x40\x0f temporary_channel_failure");
+    var i: usize = 3;
+    while (i > 0) {
+        i -= 1;
+        p = sphinx.failure.forward(p, &relay_ss[i]);
+    }
+    // The origin only has the session key and the route.
+    var hs: [5]sphinx.HopSecret = undefined;
+    try sphinx.deriveHopSecrets(&session_key, &hop_pubkeys, &hs);
+    var origin_ss: [5][32]u8 = undefined;
+    for (&origin_ss, hs) |*o, h| o.* = h.shared_secret;
+    const src = try sphinx.failure.unwrap(p, &origin_ss);
+    try testing.expectEqual(@as(usize, 3), src.hop);
+    try testing.expectEqualStrings("\x40\x0f temporary_channel_failure", try sphinx.failure.parseFailure(src.data));
+}
+
 test "KAT: a 1-bit hmac tamper on the official onion is IntegrityCheckFailed" {
     var pkt = try sphinx.OnionPacket.fromBytes(hexN(sphinx.packet_len, v.onion));
     pkt.hmac[0] ^= 0x01;

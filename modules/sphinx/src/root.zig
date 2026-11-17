@@ -37,6 +37,10 @@
 //! — a single hop's unwrap: verify HMAC in constant time, deobfuscate,
 //! extract this hop's payload, derive the next hop's blinded pubkey).
 //!
+//! `failure` — BOLT#4 "Returning Errors": the erring node's packet (`create`), a
+//! relay's obfuscation (`forward`) and the origin's unwrap, which names the failing hop
+//! (`unwrap`); byte-exact against `bolt04/onion-error-test.json` and the spec's trace.
+//!
 //! KAT: the official BOLT#4 test vector (`bolt04/onion-test.json` +
 //! `04-onion-routing.md`'s "Test Vector" section, `lightning/bolts` —
 //! see `kat_vectors.zig`'s doc comment for exact provenance and `SPEC.md`
@@ -77,6 +81,7 @@ pub const keyderive = @import("keyderive.zig");
 pub const packet = @import("packet.zig");
 pub const hopframe = @import("hopframe.zig");
 pub const core = @import("core.zig");
+pub const failure = @import("failure.zig");
 
 // ── convenience re-exports (the common call-site surface) ──────────────────
 
@@ -95,6 +100,7 @@ pub const generateCipherStream = keyderive.generateCipherStream;
 pub const HopSecret = core.HopSecret;
 pub const SharedSecretError = core.SharedSecretError;
 pub const deriveHopSecrets = core.deriveHopSecrets;
+pub const sharedSecret = core.sharedSecret;
 
 pub const ConstructError = core.ConstructError;
 pub const construct = core.construct;
@@ -119,6 +125,7 @@ test {
     _ = packet;
     _ = hopframe;
     _ = core;
+    _ = failure;
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
     _ = @import("fuzz_test.zig");

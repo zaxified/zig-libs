@@ -63,6 +63,7 @@ modules/snmp/src/usm.zig	5
 modules/sntp/src/root.zig	1
 modules/spake2plus/src/root.zig	2
 modules/sphinx/src/core.zig	2
+modules/sphinx/src/failure.zig	1
 modules/ssh/src/stackprobe2_test.zig	1
 modules/ssh/src/transport.zig	4
 modules/stun/src/root.zig	2

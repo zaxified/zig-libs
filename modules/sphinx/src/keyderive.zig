@@ -5,10 +5,10 @@
 //! from. Both are plain `std.crypto` — no elliptic-curve math here at all.
 //!
 //! - `generateKey`: BOLT#4 "Key Generation" — `HMAC-SHA256(key_type_label,
-//!   shared_secret)`. Four key types are named by the spec: `rho` (streams
+//!   shared_secret)`. Five key types are named by the spec: `rho` (streams
 //!   the obfuscating keystream), `mu` (the packet-integrity HMAC key), `um`
-//!   (the error-message HMAC key — return-path only, not used by
-//!   `construct`/`process` in this module), `pad` (seeds the initial
+//!   (the error-message HMAC key — return-path only, used by `failure.zig`),
+//!   `ammag` (the return-path obfuscation stream, "Returning Errors"), `pad` (seeds the initial
 //!   1300-byte random padding). Per the spec: "the key-type does not
 //!   include a C-style 0x00-termination-byte" — `"rho"` is exactly 3 bytes
 //!   as the HMAC key, not 4.
@@ -32,6 +32,8 @@ pub const KeyType = enum {
     mu,
     um,
     pad,
+    /// BOLT#4 "Returning Errors": keys the obfuscation stream of a failure packet.
+    ammag,
 
     fn label(self: KeyType) []const u8 {
         return switch (self) {
@@ -39,6 +41,7 @@ pub const KeyType = enum {
             .mu => "mu",
             .um => "um",
             .pad => "pad",
+            .ammag => "ammag",
         };
     }
 };
@@ -115,11 +118,12 @@ test "generateKey: deterministic, and matches a std-only recomputation (HMAC-key
     try std.testing.expectEqualSlices(u8, &expected, &a);
 }
 
-test "generateKey: the four labels have no 0x00 terminator (3/2/2/3 bytes)" {
+test "generateKey: the five labels have no 0x00 terminator (3/2/2/3/5 bytes)" {
     try std.testing.expectEqual(@as(usize, 3), KeyType.rho.label().len);
     try std.testing.expectEqual(@as(usize, 2), KeyType.mu.label().len);
     try std.testing.expectEqual(@as(usize, 2), KeyType.um.label().len);
     try std.testing.expectEqual(@as(usize, 3), KeyType.pad.label().len);
+    try std.testing.expectEqual(@as(usize, 5), KeyType.ammag.label().len);
 }
 
 test "generateCipherStream: deterministic, full-length, and matches raw ChaCha20IETF.stream" {

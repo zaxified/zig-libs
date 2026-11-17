@@ -1041,8 +1041,8 @@ signal	ReleaseFast	ratchet	1	2	106051654f920fad	92ab00fad0ce5c41
 # gives), chunked differently now that the result is built in processBody.
 # Zig 0.17.0 (2026-10-18): construct 11/7, process 50/45, as on 0.16; the only shape change is
 # compiler_rt's memset frame (`memsetSmallPowerOf2 <- memset`, was `memset`). Digest re-pinned.
-sphinx	ReleaseFast	construct	1	7	9846f38c71f15c7b	cb364f94f78ea089
-sphinx	ReleaseFast	process	1	<=47	9846f38c71f15c7b	e7c50d755f64b027
+sphinx	ReleaseFast	construct	1	7	8df3507d45f1fbeb	cb364f94f78ea089
+sphinx	ReleaseFast	process	1	<=47	8df3507d45f1fbeb	e7c50d755f64b027
 # bolt3 derive 7 -> 8 (re-pin 2026-10-06; the fix landed 2026-10-05):
 # derivePrivateKey now refuses a per_commitment_secret >= n, so the std scalar
 # canonicality verdict (common.zig:75 via scalar.zig:87, root.zig:98) appears

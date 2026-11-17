@@ -21,8 +21,10 @@ threat model.
 | `keyderive.zig` | `generateKey`/`generateCipherStream` — BOLT#4 "Key Generation" + "Pseudo Random Byte Stream" (REAL) |
 | `packet.zig` | `OnionPacket` — the fixed 1366-byte wire packet, parse/serialize (REAL) |
 | `hopframe.zig` | Per-hop `bigsize(length) ‖ payload ‖ hmac` framing + shift-size arithmetic (REAL) |
-| `core.zig` | `deriveHopSecrets`/`construct`/`process` — the Sphinx crypto cores |
+| `core.zig` | `deriveHopSecrets`/`construct`/`process` — the Sphinx crypto cores; `sharedSecret` — a hop's own ECDH step |
+| `failure.zig` | BOLT#4 "Returning Errors": `create`/`forward`/`unwrap` the return-path failure packet (REAL) |
 | `kat_vectors.zig` | The official BOLT#4 test vector, embedded |
+| `failure_vectors.zig` | The BOLT#4 "Returning Errors" vectors, embedded |
 | `kat_test.zig` | KAT assertions against the official vector — all live, zero skips |
 
 **Deps:** `k256` (secp256k1 point and scalar arithmetic); the rest is `std.crypto`.
@@ -48,7 +50,7 @@ Stream"):
 
 ```zig
 var rho: [32]u8 = undefined;
-sphinx.generateKey(&rho, .rho, &shared_secret); // .rho | .mu | .um | .pad
+sphinx.generateKey(&rho, .rho, &shared_secret); // .rho | .mu | .um | .ammag | .pad
 var stream: [1300]u8 = undefined;
 sphinx.generateCipherStream(&rho, &stream); // ChaCha20(rho, nonce=0) keystream
 ```
@@ -93,6 +95,23 @@ if (result.next_packet) |next| {
 // then returns `error.Replayed`). The module stores nothing.
 const r2 = try sphinx.processWithHook(&node_privkey, pkt, associated_data, .{ .ctx = &log, .check = myCheck });
 ```
+
+**Returning errors** (BOLT#4 "Returning Errors", classic failure packets; `shared_secret` is the
+hop's secret: `sharedSecret(&ss, &node_privkey, &pkt.public_key)` on a relay, `deriveHopSecrets` on
+the sender):
+
+```zig
+// the erring node: hmac ++ failure_len ++ failuremsg ++ pad, authenticated and obfuscated
+var buf: [sphinx.failure.max_packet_len]u8 = undefined;
+var p = try sphinx.failure.create(&buf, &ss, failuremsg);
+// every relay on the way back
+p = sphinx.failure.forward(p, &my_ss);
+// the origin: one shared secret per hop, first to last; the packet is decrypted in place
+const src = try sphinx.failure.unwrap(p, route_secrets); // error.SourceUnidentified if no hop verifies
+const failure = try sphinx.failure.parseFailure(src.data); // src.hop = index of the failing hop
+```
+
+`attribution_data` is not implemented.
 
 ## Verify
 
