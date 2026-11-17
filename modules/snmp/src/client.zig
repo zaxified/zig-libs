@@ -1086,3 +1086,342 @@ test "inform: waits for the Response, retries on timeout, gives up after the ret
     var c4 = Client.init(sink.transport(), .{ .version = .v1 });
     try testing.expectError(error.UnsupportedPdu, c4.inform("public", n));
 }
+
+// ── whole-module mutation audit 2026-11-17 ──────────────────────────────────
+
+/// Wraps a transport and counts the exchanges that go through it.
+const Counting = struct {
+    inner: Transport,
+    calls: usize = 0,
+    last: [max_message_len]u8 = undefined,
+    last_len: usize = 0,
+
+    fn transport(c: *Counting) Transport {
+        return .{ .ctx = c, .exchangeFn = exchangeFn };
+    }
+
+    fn exchangeFn(ctx: *anyopaque, request: []const u8, reply_buf: []u8) TransportError!usize {
+        const c: *Counting = @ptrCast(@alignCast(ctx));
+        c.calls += 1;
+        @memcpy(c.last[0..request.len], request);
+        c.last_len = request.len;
+        return c.inner.exchangeFn(c.inner.ctx, request, reply_buf);
+    }
+};
+
+/// Answers every request with one fixed varbind, whatever was asked.
+const AuditStuckAgent = struct {
+    entry: VarBind,
+
+    fn exchangeFn(ctx: *anyopaque, request: []const u8, reply_buf: []u8) TransportError!usize {
+        const a: *AuditStuckAgent = @ptrCast(@alignCast(ctx));
+        const msg = message.decode(request) catch return error.TransportFailed;
+        const rid: i32 = switch (msg.pdu) {
+            .get_next_request => |p| p.request_id,
+            .get_bulk_request => |p| p.request_id,
+            else => return error.TransportFailed,
+        };
+        const out = message.encode(reply_buf, msg.version, msg.community, .{
+            .type = .response,
+            .request_id = rid,
+            .varbinds = (&a.entry)[0..1],
+        }) catch return error.TransportFailed;
+        std.mem.copyForwards(u8, reply_buf[0..out.len], out);
+        return out.len;
+    }
+};
+
+/// First request: the given rows; every later one: an empty varbind list.
+const OnceThenEmpty = struct {
+    rows: []const VarBind,
+    calls: usize = 0,
+
+    fn exchangeFn(ctx: *anyopaque, request: []const u8, reply_buf: []u8) TransportError!usize {
+        const a: *OnceThenEmpty = @ptrCast(@alignCast(ctx));
+        const msg = message.decode(request) catch return error.TransportFailed;
+        const rid = msg.pdu.get_bulk_request.request_id;
+        const rows = if (a.calls == 0) a.rows else &.{};
+        a.calls += 1;
+        const out = message.encode(reply_buf, msg.version, msg.community, .{
+            .type = .response,
+            .request_id = rid,
+            .varbinds = rows,
+        }) catch return error.TransportFailed;
+        std.mem.copyForwards(u8, reply_buf[0..out.len], out);
+        return out.len;
+    }
+};
+
+const walk_root = "1.3.6.1.2.1.2.2.1.2";
+
+test "Walker: every way a walk can end is final, a further next() sends nothing" {
+    const table = try ifDescrTable();
+
+    // v1 noSuchName.
+    var v1: WalkAgent = .{ .table = &.{}, .v1_style_end = true };
+    var c1: Counting = .{ .inner = v1.transport() };
+    var client1 = Client.init(c1.transport(), .{ .version = .v1 });
+    var w1 = client1.walker("public", try Oid.parse(walk_root));
+    try testing.expectEqual(@as(?VarBind, null), try w1.next());
+    try testing.expectEqual(@as(?VarBind, null), try w1.next());
+    try testing.expectEqual(@as(usize, 1), c1.calls);
+
+    // endOfMibView.
+    var eom: WalkAgent = .{ .table = &.{} };
+    var c2: Counting = .{ .inner = eom.transport() };
+    var client2 = Client.init(c2.transport(), .{});
+    var w2 = client2.walker("public", try Oid.parse(walk_root));
+    try testing.expectEqual(@as(?VarBind, null), try w2.next());
+    try testing.expectEqual(@as(?VarBind, null), try w2.next());
+    try testing.expectEqual(@as(usize, 1), c2.calls);
+
+    // The first successor lies outside the subtree.
+    var outside: WalkAgent = .{ .table = table[2..] };
+    var c3: Counting = .{ .inner = outside.transport() };
+    var client3 = Client.init(c3.transport(), .{});
+    var w3 = client3.walker("public", try Oid.parse(walk_root));
+    try testing.expectEqual(@as(?VarBind, null), try w3.next());
+    try testing.expectEqual(@as(?VarBind, null), try w3.next());
+    try testing.expectEqual(@as(usize, 1), c3.calls);
+
+    // An empty varbind list.
+    var empty: FakeAgent = .{};
+    var c4: Counting = .{ .inner = empty.transport() };
+    var client4 = Client.init(c4.transport(), .{});
+    var w4 = client4.walker("public", try Oid.parse(walk_root));
+    try testing.expectEqual(@as(?VarBind, null), try w4.next());
+    try testing.expectEqual(@as(?VarBind, null), try w4.next());
+    try testing.expectEqual(@as(usize, 1), c4.calls);
+
+    // A non-zero error-status is RequestFailed once, then the walk is over.
+    var failing: FakeAgent = .{ .error_status = 5 };
+    var c5: Counting = .{ .inner = failing.transport() };
+    var client5 = Client.init(c5.transport(), .{});
+    var w5 = client5.walker("public", try Oid.parse(walk_root));
+    try testing.expectError(error.RequestFailed, w5.next());
+    try testing.expectEqual(@as(?VarBind, null), try w5.next());
+    try testing.expectEqual(@as(usize, 1), c5.calls);
+
+    // A non-advancing agent is OidNotIncreasing once, then the walk is over.
+    var stuck: AuditStuckAgent = .{ .entry = table[0] };
+    var c6: Counting = .{ .inner = .{ .ctx = &stuck, .exchangeFn = AuditStuckAgent.exchangeFn } };
+    var client6 = Client.init(c6.transport(), .{});
+    var w6 = client6.walker("public", try Oid.parse(walk_root));
+    try testing.expect((try w6.next()) != null);
+    try testing.expectError(error.OidNotIncreasing, w6.next());
+    try testing.expectEqual(@as(?VarBind, null), try w6.next());
+    try testing.expectEqual(@as(usize, 2), c6.calls);
+}
+
+test "Walker: the cursor moves to each returned OID" {
+    const table = try ifDescrTable();
+    var agent: WalkAgent = .{ .table = &table };
+    var c: Counting = .{ .inner = agent.transport() };
+    var client = Client.init(c.transport(), .{});
+    var w = client.walker("public", try Oid.parse(walk_root));
+    var seen: usize = 0;
+    while (try w.next()) |_| {
+        seen += 1;
+        if (seen > 10) return error.TestUnexpectedResult; // cursor not advancing
+    }
+    // Two rows plus the one request that crossed the boundary: had the cursor
+    // stayed at the root, every request would return the first row again.
+    try testing.expectEqual(@as(usize, 2), seen);
+    try testing.expectEqual(@as(usize, 3), c.calls);
+}
+
+test "BulkWalker: noSuchName, an error status, an empty batch and every end are final" {
+    const table = try bigTable();
+
+    var nsn: FakeAgent = .{ .error_status = 2 };
+    var c1: Counting = .{ .inner = nsn.transport() };
+    var client1 = Client.init(c1.transport(), .{});
+    var w1 = client1.bulkWalker("public", try Oid.parse(walk_root));
+    try testing.expectEqual(@as(?VarBind, null), try w1.next());
+    try testing.expectEqual(@as(?VarBind, null), try w1.next());
+    try testing.expectEqual(@as(usize, 1), c1.calls);
+
+    var failing: FakeAgent = .{ .error_status = 5 };
+    var c2: Counting = .{ .inner = failing.transport() };
+    var client2 = Client.init(c2.transport(), .{});
+    var w2 = client2.bulkWalker("public", try Oid.parse(walk_root));
+    try testing.expectError(error.RequestFailed, w2.next());
+    try testing.expectEqual(@as(?VarBind, null), try w2.next());
+    try testing.expectEqual(@as(usize, 1), c2.calls);
+
+    // A first batch with no varbind at all means nothing follows.
+    var empty: FakeAgent = .{};
+    var c3: Counting = .{ .inner = empty.transport() };
+    var client3 = Client.init(c3.transport(), .{});
+    var w3 = client3.bulkWalker("public", try Oid.parse(walk_root));
+    try testing.expectEqual(@as(?VarBind, null), try w3.next());
+    try testing.expectEqual(@as(?VarBind, null), try w3.next());
+    try testing.expectEqual(@as(usize, 1), c3.calls);
+
+    // Rows, then an empty batch: the walk ends there (the "yielded" flag is
+    // per batch, not per walk).
+    var once: OnceThenEmpty = .{ .rows = table[0..2] };
+    var c4: Counting = .{ .inner = .{ .ctx = &once, .exchangeFn = OnceThenEmpty.exchangeFn } };
+    var client4 = Client.init(c4.transport(), .{});
+    var w4 = client4.bulkWalkerWith("public", try Oid.parse(walk_root), 5);
+    try testing.expect((try w4.next()) != null);
+    try testing.expect((try w4.next()) != null);
+    try testing.expectEqual(@as(?VarBind, null), try w4.next());
+    try testing.expectEqual(@as(?VarBind, null), try w4.next());
+    try testing.expectEqual(@as(usize, 2), c4.calls);
+
+    // endOfMibView and a row outside the subtree end it for good.
+    var tail_agent: BulkAgent = .{ .table = table[5..] };
+    var c5: Counting = .{ .inner = tail_agent.transport() };
+    var client5 = Client.init(c5.transport(), .{});
+    var w5 = client5.bulkWalker("public", try Oid.parse(walk_root));
+    try testing.expectEqual(@as(?VarBind, null), try w5.next());
+    try testing.expectEqual(@as(?VarBind, null), try w5.next());
+    try testing.expectEqual(@as(usize, 1), c5.calls);
+
+    var eom: BulkAgent = .{ .table = &.{} };
+    var c6: Counting = .{ .inner = eom.transport() };
+    var client6 = Client.init(c6.transport(), .{});
+    var w6 = client6.bulkWalker("public", try Oid.parse(walk_root));
+    try testing.expectEqual(@as(?VarBind, null), try w6.next());
+    try testing.expectEqual(@as(?VarBind, null), try w6.next());
+    try testing.expectEqual(@as(usize, 1), c6.calls);
+}
+
+test "BulkWalker: a repeated OID (not only a smaller one) is OidNotIncreasing; the cursor advances" {
+    const table = try bigTable();
+    var stuck: AuditStuckAgent = .{ .entry = table[0] };
+    var c: Counting = .{ .inner = .{ .ctx = &stuck, .exchangeFn = AuditStuckAgent.exchangeFn } };
+    var client = Client.init(c.transport(), .{});
+    var w = client.bulkWalkerWith("public", try Oid.parse(walk_root), 1);
+    try testing.expect((try w.next()) != null);
+    try testing.expectError(error.OidNotIncreasing, w.next());
+
+    // With a well-behaved agent the next batch starts after the last row, so
+    // each request advances: 3 rows over batches of 2 = 2 requests + the end.
+    var agent: BulkAgent = .{ .table = &table };
+    var c2: Counting = .{ .inner = agent.transport() };
+    var client2 = Client.init(c2.transport(), .{});
+    var w2 = client2.bulkWalkerWith("public", try Oid.parse(walk_root), 2);
+    var seen: usize = 0;
+    while (try w2.next()) |_| {
+        seen += 1;
+        if (seen > 10) return error.TestUnexpectedResult; // cursor not advancing
+    }
+    try testing.expectEqual(@as(usize, 5), seen);
+    try testing.expectEqual(@as(usize, 3), c2.calls);
+}
+
+test "Transport.exchange: a reply exactly as long as the buffer is fine, one longer is TransportFailed" {
+    const Fixed = struct {
+        fn exact(_: *anyopaque, _: []const u8, reply_buf: []u8) TransportError!usize {
+            return reply_buf.len;
+        }
+        fn over(_: *anyopaque, _: []const u8, reply_buf: []u8) TransportError!usize {
+            return reply_buf.len + 1;
+        }
+    };
+    var dummy: u8 = 0;
+    var buf: [8]u8 = undefined;
+    const t_exact: Transport = .{ .ctx = &dummy, .exchangeFn = Fixed.exact };
+    try testing.expectEqual(@as(usize, 8), (try t_exact.exchange("x", &buf)).len);
+    const t_over: Transport = .{ .ctx = &dummy, .exchangeFn = Fixed.over };
+    try testing.expectError(error.TransportFailed, t_over.exchange("x", &buf));
+}
+
+test "requests: exactly max_request_oids names are accepted, and every one is sent as NULL" {
+    var agent: FakeAgent = .{};
+    var c: Counting = .{ .inner = agent.transport() };
+    var client = Client.init(c.transport(), .{});
+    var oids: [max_request_oids]Oid = @splat(try Oid.parse("1.3.6.1"));
+    _ = try client.get("public", &oids);
+    try testing.expectEqual(@as(usize, 1), c.calls);
+    const sent = try message.decode(c.last[0..c.last_len]);
+    var it = sent.pdu.get_request.varbinds.iterator();
+    var n: usize = 0;
+    while (try it.next()) |vb| : (n += 1) try testing.expect(vb.value == .null);
+    try testing.expectEqual(@as(usize, max_request_oids), n);
+}
+
+test "retry: a Timeout after a stale-id reply is reported as Timeout, the last try wins" {
+    var a: RetryAgent = .{ .script = &.{ .wrong_id, .timeout } };
+    var c = retryClient(&a, 1);
+    try testing.expectError(error.Timeout, c.get("public", &.{try Oid.parse("1.3.6.1.2.1.1.1.0")}));
+    try testing.expectEqual(@as(usize, 2), a.calls);
+}
+
+test "request ids wrap from 2^31 - 1 to 1" {
+    var agent: FakeAgent = .{};
+    var client = Client.init(agent.transport(), .{ .initial_request_id = std.math.maxInt(i32) });
+    _ = try client.get("public", &.{try Oid.parse("1.3.6.1.2.1.1.1.0")});
+    try testing.expectEqual(@as(i32, 1), client.next_request_id);
+    _ = try client.get("public", &.{try Oid.parse("1.3.6.1.2.1.1.1.0")});
+    try testing.expectEqual(@as(i32, 2), client.next_request_id);
+}
+
+test "UdpTransport: a silent peer is Timeout, an oversize reply is TransportFailed" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const peer_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var peer_socket = peer_addr.bind(io, .{ .mode = .dgram }) catch |err| {
+        return testkit.loopbackSkip("snmp udp test bind failed ({t})", .{err});
+    };
+    defer peer_socket.close(io);
+    const peer_port = peer_socket.address.getPort();
+    const peer = try std.Io.net.IpAddress.parse("127.0.0.1", peer_port);
+
+    // Nobody answers: the receive deadline surfaces as Timeout.
+    var quiet = try UdpTransport.open(io, peer, .{ .timeout = .{ .duration = .{
+        .raw = .fromMilliseconds(100),
+        .clock = .awake,
+    } } });
+    defer quiet.close();
+    var small: [4]u8 = undefined;
+    try testing.expectError(error.Timeout, exchangeOnce(quiet.transport(), "probe", &small));
+    // Its probe is still queued at the peer; take it so the next one is next.
+    var drain: [64]u8 = undefined;
+    _ = try peer_socket.receiveTimeout(io, &drain, .{ .duration = .{
+        .raw = .fromMilliseconds(10_000),
+        .clock = .awake,
+    } });
+
+    // A 10-byte datagram into a 4-byte buffer is truncated by the kernel; the
+    // transport reports it instead of handing back a cut-off message.
+    var talk = try UdpTransport.open(io, peer, .{ .timeout = .{ .duration = .{
+        .raw = .fromMilliseconds(20_000),
+        .clock = .awake,
+    } } });
+    defer talk.close();
+    var fut = try io.concurrent(exchangeOnce, .{ talk.transport(), "probe", &small });
+    var probe_buf: [64]u8 = undefined;
+    const got = peer_socket.receiveTimeout(io, &probe_buf, .{ .duration = .{
+        .raw = .fromMilliseconds(60_000),
+        .clock = .awake,
+    } }) catch |err| {
+        _ = fut.cancel(io) catch {};
+        return err;
+    };
+    peer_socket.send(io, &got.from, "0123456789") catch |err| {
+        _ = fut.cancel(io) catch {};
+        return err;
+    };
+    try testing.expectError(error.TransportFailed, fut.await(io));
+}
+
+test "BulkWalker: a walk that ends on a row outside the subtree in mid-batch stays ended" {
+    const table = try bigTable();
+    var agent: BulkAgent = .{ .table = &table };
+    var c: Counting = .{ .inner = agent.transport() };
+    var client = Client.init(c.transport(), .{});
+    var w = client.bulkWalkerWith("public", try Oid.parse(walk_root), 10);
+    var seen: usize = 0;
+    while (try w.next()) |_| {
+        seen += 1;
+        if (seen > 10) return error.TestUnexpectedResult;
+    }
+    try testing.expectEqual(@as(usize, 5), seen);
+    try testing.expectEqual(@as(?VarBind, null), try w.next());
+    try testing.expectEqual(@as(usize, 1), c.calls);
+}

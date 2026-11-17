@@ -937,3 +937,30 @@ fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [uni
     for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
     return buf;
 }
+
+// ── whole-module mutation audit 2026-11-17: DES buffer bounds and padding ──
+
+test "DES encrypt: out exactly the padded size works, one byte less is BufferTooSmall, pad bytes are zero" {
+    const key = @as([16]u8, @splat(0x11));
+    const pt = "abcde"; // 5 bytes -> padded to 8
+    var salt_a = SaltSource.counter(1);
+    var out_a: [8]u8 = @splat(0xaa); // stale non-zero scratch
+    const enc_a = try encrypt(.des_cbc, &key, 0, 0, &salt_a, pt, &out_a);
+    try testing.expectEqual(@as(usize, 8), enc_a.ciphertext.len);
+
+    // The same encryption over a zeroed scratch is byte-identical: the pad
+    // is written, not inherited from whatever `out` held.
+    var salt_b = SaltSource.counter(1);
+    var out_b: [8]u8 = @splat(0);
+    const enc_b = try encrypt(.des_cbc, &key, 0, 0, &salt_b, pt, &out_b);
+    try testing.expectEqualSlices(u8, enc_b.ciphertext, enc_a.ciphertext);
+
+    var dec: [8]u8 = undefined;
+    const back = try decrypt(.des_cbc, &key, 0, 0, &enc_a.salt, enc_a.ciphertext, &dec);
+    try testing.expectEqualSlices(u8, "abcde\x00\x00\x00", back);
+
+    // Room for the plaintext but not for its padding.
+    var small: [7]u8 = undefined;
+    var salt_c = SaltSource.counter(1);
+    try testing.expectError(error.BufferTooSmall, encrypt(.des_cbc, &key, 0, 0, &salt_c, pt, &small));
+}

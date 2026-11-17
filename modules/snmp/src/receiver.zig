@@ -384,3 +384,22 @@ test "ackInform: buffer too small is a typed error, not a panic" {
     var tiny: [8]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, ackInform(ev, &tiny));
 }
+
+test "mutation audit: snmpTrapOid of a v1 trap is null even when its varbinds look like a v2 notification" {
+    const vbs = [_]message.VarBind{
+        .{ .name = try Oid.parse("1.3.6.1.2.1.1.3.0"), .value = .{ .time_ticks = 1 } },
+        .{ .name = try Oid.parse("1.3.6.1.6.3.1.1.4.1.0"), .value = .{ .oid = try Oid.parse("1.3.6.1.6.3.1.1.5.1") } },
+    };
+    var buf: [256]u8 = undefined;
+    const wire = try message.encodeTrapV1(&buf, "public", .{
+        .enterprise = try Oid.parse("1.3.6.1.4.1.99"),
+        .agent_addr = .{ 1, 2, 3, 4 },
+        .generic_trap = .cold_start,
+        .time_stamp = 5,
+        .varbinds = &vbs,
+    });
+    const ev = try parseTrap(wire);
+    try std.testing.expect(ev.kind == .v1);
+    try std.testing.expect(ev.snmpTrapOid() == null);
+    try std.testing.expectEqual(@as(?u32, 5), ev.sysUpTime());
+}

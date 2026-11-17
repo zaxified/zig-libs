@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only, from a whole-module mutation audit (415 mutants incl. the AES-192/256 delta, 405 killed, 10 equivalent): boundary and structure tests for the BER decoder and encoder, OID parsing, `authOffsetFor`, DES padding and buffer bounds, the v3 envelope and PDU decoders (stray trailing elements, values that would wrap into range), the `Walker` / `BulkWalker` end states (v1/v2c and v3), retry bookkeeping, request-id wrap, `UdpTransport` timeout and truncation, and the v3 client's Report handling. The test-only `FakeAgent` gained a few knobs. The constant-time harness counts are unchanged; its source pins in `ctgrind-expected.tsv` were re-pinned because the counted files gained tests.
+
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the constant-time harness (`ctgrind_harness.zig`) also drives the AES-192/256 protocols and both key-extension families; the in-file counts are unchanged (kdf 0, auth 0, aes 0, des 256 open), source/output pins re-recorded.
 
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only for the AES-192/256 privacy above: multi-round key-extension oracle vectors, exact-fit and short-buffer `priv.localizeKey` cases, and the README provenance note (net-snmp's `keytools.c`/`snmpusm.c` read for the key-extension algorithm).

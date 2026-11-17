@@ -772,3 +772,87 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "decode: bytes after the message SEQUENCE are TrailingData" {
+    var buf: [256]u8 = undefined;
+    const dg = try encode(&buf, .{
+        .msg_id = 1,
+        .security_parameters = "",
+        .context_engine_id = "",
+        .pdu = .{ .type = .get_request, .request_id = 1 },
+    });
+    _ = try decode(dg);
+    var padded: [257]u8 = undefined;
+    @memcpy(padded[0..dg.len], dg);
+    padded[dg.len] = 0;
+    try testing.expectError(error.TrailingData, decode(padded[0 .. dg.len + 1]));
+}
+
+const HandOpts = struct {
+    msg_id: i64 = 1,
+    max_size: i64 = 1472,
+    flags: []const u8 = "\x04",
+    model: i64 = 3,
+    extra_header: bool = false,
+    extra_msg: bool = false,
+    extra_scoped: bool = false,
+};
+
+/// A hand-assembled plaintext v3 datagram (GetRequest, empty names), with
+/// individual fields out of range or a stray element left inside each of the
+/// three SEQUENCEs.
+fn handBuilt(buf: []u8, o: HandOpts) ![]const u8 {
+    // `encodePdu` closes its element over everything already in the encoder,
+    // so the PDU is built apart and appended as bytes.
+    var pdu_buf: [32]u8 = undefined;
+    var pe = ber.Encoder.init(&pdu_buf);
+    try message.encodePdu(&pe, .{ .type = .get_request, .request_id = 1 });
+
+    var e = ber.Encoder.init(buf);
+    if (o.extra_msg) try e.prependNull(ber.tag.null);
+    const sm = e.len();
+    if (o.extra_scoped) try e.prependNull(ber.tag.null);
+    try e.prependBytes(pe.encoded());
+    try e.prependTlv(ber.tag.octet_string, "");
+    try e.prependTlv(ber.tag.octet_string, "");
+    try e.wrap(ber.tag.sequence, sm);
+    try e.prependTlv(ber.tag.octet_string, ""); // msgSecurityParameters
+    const hm = e.len();
+    if (o.extra_header) try e.prependNull(ber.tag.null);
+    try e.prependInteger(ber.tag.integer, o.model);
+    try e.prependTlv(ber.tag.octet_string, o.flags);
+    try e.prependInteger(ber.tag.integer, o.max_size);
+    try e.prependInteger(ber.tag.integer, o.msg_id);
+    try e.wrap(ber.tag.sequence, hm);
+    try e.prependInteger(ber.tag.integer, 3);
+    try e.wrap(ber.tag.sequence, 0);
+    return e.encoded();
+}
+
+test "mutation audit: a stray element inside any of the three SEQUENCEs is TrailingData" {
+    var buf: [128]u8 = undefined;
+    const ok = try decode(try handBuilt(&buf, .{}));
+    try testing.expectEqual(@as(i32, 1), ok.header.msg_id);
+    try testing.expectError(error.TrailingData, decode(try handBuilt(&buf, .{ .extra_msg = true })));
+    try testing.expectError(error.TrailingData, decode(try handBuilt(&buf, .{ .extra_header = true })));
+    try testing.expectError(error.TrailingData, decode(try handBuilt(&buf, .{ .extra_scoped = true })));
+}
+
+test "mutation audit: msgFlags is exactly one octet" {
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.InvalidValue, decode(try handBuilt(&buf, .{ .flags = "" })));
+    try testing.expectError(error.InvalidValue, decode(try handBuilt(&buf, .{ .flags = "\x04\x00" })));
+}
+
+test "mutation audit: msgID, msgMaxSize and msgSecurityModel outside their integer types are refused, not wrapped" {
+    var buf: [128]u8 = undefined;
+    // 2^32 + 1 would wrap to 1, 2^32 + 3 to the USM model number.
+    try testing.expectError(error.IntegerTooLarge, decode(try handBuilt(&buf, .{ .msg_id = 4294967297 })));
+    try testing.expectError(error.IntegerTooLarge, decode(try handBuilt(&buf, .{ .msg_id = 2147483648 })));
+    try testing.expectError(error.IntegerTooLarge, decode(try handBuilt(&buf, .{ .max_size = 4294967297 })));
+    try testing.expectError(error.IntegerTooLarge, decode(try handBuilt(&buf, .{ .max_size = 2147483648 })));
+    try testing.expectError(error.IntegerTooLarge, decode(try handBuilt(&buf, .{ .model = 4294967299 })));
+    // The largest legal values still decode.
+    const edge = try decode(try handBuilt(&buf, .{ .msg_id = 2147483647, .max_size = 2147483647 }));
+    try testing.expectEqual(@as(i32, 2147483647), edge.header.msg_max_size);
+}
