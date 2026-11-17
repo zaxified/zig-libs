@@ -303,34 +303,16 @@ fn httpFetch(context: *anyopaque, gpa: std.mem.Allocator, req: FetchRequest) Fet
     defer response.deinit();
 
     // `http.Client`'s own `total_timeout_ms` bounds `request` above --
-    // redirect hops, TLS handshake, response-head read -- but says so itself
-    // (Client.zig's module doc) that it deliberately does NOT bound the body
-    // read that follows: "the caller drives those reads and decides how long
-    // a slow trickle is acceptable; wrap the read in your own
-    // `runBounded`-shaped race if you need one." Before this, nothing did --
-    // a responder that answers a head and then sends no body parked
-    // `refresh` forever (F2), with no counterpart to `max_response_bytes`,
-    // which bounds SIZE, not TIME. `body_timeout_ms == 0` keeps the old,
-    // unbounded behaviour byte for byte (default for a caller-built
-    // `FetchRequest`; `Cache.refresh` itself always sets a real deadline via
-    // `Config.body_read_timeout_ms`).
-    const body = if (req.body_timeout_ms == 0)
-        response.readAllAlloc(gpa, req.max_response_bytes) catch |err| return mapReadAllAllocError(err)
-    else body: {
-        const deadline: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(req.body_timeout_ms), .clock = .awake } };
-        // `.duration` always yields a `Timestamp` from `toTimestamp` (only
-        // `.none` yields null); `.?` is safe here, never `.none`.
-        break :body runBounded(client.io, deadline.toTimestamp(client.io).?, readAllAllocFn, .{ &response, gpa, req.max_response_bytes }) catch |err| switch (err) {
-            // No unit of concurrency to race with (single-threaded Io, or a
-            // `Threaded` at its `concurrent_limit`): run the read directly
-            // rather than silently dropping the bound's *intent* -- same
-            // choice `llmclient` makes at its own `runBounded` call site.
-            error.ConcurrencyUnavailable => response.readAllAlloc(gpa, req.max_response_bytes) catch |e| return mapReadAllAllocError(e),
-            error.Timeout => return error.Timeout,
-            error.Canceled => return error.Canceled,
-            else => |e| return mapReadAllAllocError(e),
-        };
-    };
+    // redirect hops, TLS handshake, response-head read -- but deliberately
+    // NOT the body read that follows. A responder that answers a head and then
+    // sends no body would park `refresh` forever (F2), with no counterpart to
+    // `max_response_bytes`, which bounds SIZE, not TIME. `readAllAllocTimeout`
+    // is the bounded whole-body read: `body_timeout_ms == 0` is a plain,
+    // unbounded read (default for a caller-built `FetchRequest`;
+    // `Cache.refresh` itself always sets a real deadline via
+    // `Config.body_read_timeout_ms`), and with no unit of concurrency to race
+    // with it reads unbounded rather than dropping the read.
+    const body = response.readAllAllocTimeout(gpa, req.max_response_bytes, req.body_timeout_ms) catch |err| return mapReadAllAllocError(err);
     return .{ .status = response.status, .body = body };
 }
 
@@ -347,72 +329,6 @@ fn mapReadAllAllocError(err: http.Client.Error) FetchError {
         error.Timeout => error.Timeout,
         else => error.TransportFailed,
     };
-}
-
-/// `Response.readAllAlloc` as a plain function, so `runBounded` can race it
-/// on a concurrent task (a method value cannot be `io.concurrent`'d directly).
-fn readAllAllocFn(response: *http.Client.Response, gpa: std.mem.Allocator, max_len: usize) http.Client.Error![]u8 {
-    return response.readAllAlloc(gpa, max_len);
-}
-
-// ── a deadline for one blocking read ────────────────────────────────────────
-//
-// The same shape `http.Client` uses for its own `total_timeout_ms` (kept
-// private there -- a copy is the price of not widening `http`'s public API
-// for one consumer; `llmclient`'s `read_timeout_ms` makes the identical
-// copy for the identical reason). Contract: finished in time -> `func`'s own
-// result; deadline hit -> the task is canceled and joined, then
-// `error.Timeout` (a success that landed in the cancelation window is still
-// returned); this task canceled while waiting -> `error.Canceled`; no unit
-// of concurrency -> the caller runs `func` unbounded (`error.ConcurrencyUnavailable`).
-fn RunBoundedResult(comptime func: anytype) type {
-    const Result = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
-    const Payload = @typeInfo(Result).error_union.payload;
-    const Errs = @typeInfo(Result).error_union.error_set;
-    return (Errs || error{ Timeout, Canceled, ConcurrencyUnavailable })!Payload;
-}
-
-fn runBounded(
-    io: std.Io,
-    deadline: std.Io.Clock.Timestamp,
-    comptime func: anytype,
-    args: std.meta.ArgsTuple(@TypeOf(func)),
-) RunBoundedResult(func) {
-    const Result = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
-    const Ctx = struct {
-        args: std.meta.ArgsTuple(@TypeOf(func)),
-        result: Result = undefined,
-        state: std.atomic.Value(u32) = .init(0),
-
-        fn run(ctx: *@This(), io_: std.Io) void {
-            ctx.result = @call(.auto, func, ctx.args);
-            ctx.state.store(1, .release);
-            io_.futexWake(u32, &ctx.state.raw, 1);
-        }
-    };
-
-    var ctx: Ctx = .{ .args = args };
-    var future = io.concurrent(Ctx.run, .{ &ctx, io }) catch return error.ConcurrencyUnavailable;
-
-    var canceled = false;
-    var expired = false;
-    while (ctx.state.load(.acquire) == 0) {
-        if (deadline.durationFromNow(io).raw.nanoseconds <= 0) {
-            expired = true;
-            break;
-        }
-        io.futexWaitTimeout(u32, &ctx.state.raw, 0, .{ .deadline = deadline }) catch {
-            canceled = true;
-            break;
-        };
-    }
-    if (!expired and !canceled) {
-        future.await(io);
-        return ctx.result;
-    }
-    future.cancel(io);
-    if (ctx.result) |value| return value else |_| {}
-    return if (expired) error.Timeout else error.Canceled;
 }
 
 pub const BuildGetUrlError = error{OutOfMemory};
@@ -2119,7 +2035,7 @@ test "httpFetch: a canceled body wait under body_timeout_ms is error.Canceled, n
     const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     // Same peer and cue as the unbounded cancel test above, but the body read now
-    // runs inside `runBounded`, whose wait is what the cancel interrupts.
+    // runs inside `readAllAllocTimeout`, whose wait is what the cancel interrupts.
     var fut = try io.concurrent(fetchOnce, .{ transport, testing.allocator, FetchRequest{ .url = url, .max_response_bytes = 1024, .body_timeout_ms = 60_000 } });
     const reached = ReadCueIo.awaitReads(io, 2);
     const result = fut.cancel(io);
