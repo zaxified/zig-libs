@@ -1545,3 +1545,187 @@ fn plaintextRecord(content_type: u8, epoch: u16, seq: u48, payload: []const u8, 
 fn messageSeqBefore(a: u16, b: u16) bool {
     return a != b and (b -% a) < 0x8000;
 }
+
+// ── audit 2026-11-17 (whole-module mutation): private-helper pins ────────
+
+test "audit: transcript and flight-cache appends refuse one byte over their caps and fill them exactly" {
+    var c: Connection12 = .{ .role = .client, .config = auditCfg() };
+    const body: [5]u8 = @splat(1);
+    c.transcript_len = transcript_cap - handshake.header_len - body.len;
+    try c.appendTranscript(1, 0, &body);
+    try std.testing.expectEqual(@as(usize, transcript_cap), c.transcript_len);
+    c.transcript_len = transcript_cap - handshake.header_len - body.len + 1;
+    try std.testing.expectError(error.FlightTooLarge, c.appendTranscript(1, 0, &body));
+    c.tx_len = tx_cap - 3 - body.len;
+    try c.cacheEntry(.change_cipher_spec, &body);
+    try std.testing.expectEqual(@as(usize, tx_cap), c.tx_len);
+    c.tx_len = tx_cap - 3 - body.len + 1;
+    try std.testing.expectError(error.BufferTooShort, c.cacheEntry(.change_cipher_spec, &body));
+    c.tx_len = tx_cap - 3 - handshake.header_len - body.len;
+    try c.cacheMessage(.handshake_epoch0, 1, 0, &body);
+    try std.testing.expectEqual(@as(usize, tx_cap), c.tx_len);
+    c.tx_len = tx_cap - 3 - handshake.header_len - body.len + 1;
+    try std.testing.expectError(error.BufferTooShort, c.cacheMessage(.handshake_epoch0, 1, 0, &body));
+}
+
+test "audit: advertisedSchemes keeps room for the PKCS#1 pair however long the configured list is" {
+    var cfg = auditCfg();
+    const many: [40]certverify.SignatureScheme = @splat(.ecdsa_secp256r1_sha256);
+    cfg.signature_algorithms = &many;
+    const c: Connection12 = .{ .role = .client, .config = cfg };
+    var buf: [32]u16 = undefined;
+    const s = c.advertisedSchemes(&buf);
+    try std.testing.expectEqual(@as(usize, 32), s.len);
+    try std.testing.expectEqualSlices(u16, &sig12.pkcs1_schemes, s[30..]);
+}
+
+test "audit: selectScheme honours the suite family and what the key can sign" {
+    var sk = try std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(audit_kat.server_secret_key_bytes);
+    var cfg = auditCfg();
+    cfg.cert = .{ .chain = &.{&audit_kat.server_cert_der}, .private_key = .{ .ecdsa_p256 = &sk } };
+    cfg.signature_algorithms = &.{ .ecdsa_secp384r1_sha384, .ecdsa_secp256r1_sha256 };
+    const c: Connection12 = .{ .role = .server, .config = cfg };
+    const peer = [_]u16{ 0x0503, 0x0403 };
+    // A P-256 key signs only ecdsa_secp256r1_sha256, whatever comes first.
+    try std.testing.expectEqual(@as(?u16, 0x0403), c.selectScheme(&peer, .ecdhe_ecdsa));
+    // An ECDSA key cannot serve an ECDHE_RSA suite.
+    try std.testing.expectEqual(@as(?u16, null), c.selectScheme(&peer, .ecdhe_rsa));
+}
+
+test "audit: verifyPeerSignature checks the scheme was advertised and fits the suite before the signature" {
+    var sk = try std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(audit_kat.server_secret_key_bytes);
+    var cfg = auditCfg();
+    cfg.signature_algorithms = &.{.ecdsa_secp256r1_sha256};
+    var c: Connection12 = .{ .role = .client, .config = cfg };
+    const leaf = &audit_kat.server_cert_der;
+    @memcpy(c.transcript[0..leaf.len], leaf);
+    c.transcript_len = leaf.len;
+    c.peer_leaf_off = 0;
+    c.peer_leaf_len = leaf.len;
+    const content = "server key exchange params";
+    var csprng = std.Random.DefaultCsprng.init(@splat(5));
+    var sig_buf: [128]u8 = undefined;
+    const sig = try sig12.sign(0x0403, .{ .ecdsa_p256 = &sk }, content, csprng.random(), &sig_buf);
+    // Genuine: accepted for an ECDHE_ECDSA suite.
+    try c.verifyPeerSignature(.{ .scheme = 0x0403, .signature = sig }, content, .ecdhe_ecdsa);
+    // The same valid signature for an ECDHE_RSA suite: the family is wrong.
+    try std.testing.expectError(error.CertVerifyFailed, c.verifyPeerSignature(.{ .scheme = 0x0403, .signature = sig }, content, .ecdhe_rsa));
+    // A scheme this side never advertised is refused by name.
+    try std.testing.expectError(error.SignatureSchemeNotAdvertised, c.verifyPeerSignature(.{ .scheme = 0x0503, .signature = sig }, content, .ecdhe_ecdsa));
+}
+
+test "audit: CertificateRequest schemes: the last one is kept, the list is capped" {
+    var c: Connection12 = .{ .role = .client, .config = auditCfg() };
+    c.kx = .ecdhe_ecdsa;
+    var buf: [256]u8 = undefined;
+    try c.clientCertificateRequest(try m12.encodeCertificateRequest(&.{0x0403}, &buf));
+    try std.testing.expectEqualSlices(u16, &.{0x0403}, c.peer_schemes[0..c.peer_schemes_len]);
+    var many: [40]u16 = undefined;
+    for (&many, 0..) |*s, i| s.* = @intCast(0x0800 + i);
+    c.cert_requested = false;
+    try c.clientCertificateRequest(try m12.encodeCertificateRequest(&many, &buf));
+    try std.testing.expectEqual(@as(usize, c.peer_schemes.len), c.peer_schemes_len);
+    try std.testing.expectEqual(@as(u16, 0x0800 + 31), c.peer_schemes[31]);
+}
+
+test "audit: plaintextRecord takes a u16-sized payload and not one byte more" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 65536);
+    defer a.free(payload);
+    @memset(payload, 7);
+    const out = try a.alloc(u8, 65536 + record.plaintext_header_len);
+    defer a.free(out);
+    const rec = try plaintextRecord(content_handshake, 0, 1, payload[0..65535], out);
+    try std.testing.expectEqual(@as(usize, 65535 + record.plaintext_header_len), rec.len);
+    try std.testing.expectError(error.BufferTooShort, plaintextRecord(content_handshake, 0, 1, payload, out));
+}
+
+test "audit: an epoch-1 flight entry at the last sequence number is refused, not wrapped" {
+    var c: Connection12 = .{ .role = .client, .config = auditCfg() };
+    c.write_keys = .{ .key = @splat(1), .iv = @splat(2) };
+    c.send_seq[1] = max_send_seq;
+    var out: [128]u8 = undefined;
+    var o = Out{ .buf = &out };
+    try std.testing.expectError(error.SequenceNumberExhausted, c.emitRecord(.handshake_epoch1, "finished", &o));
+}
+
+test "audit: a fragmented flight fits an output buffer of exactly its size" {
+    var cfg = auditCfg();
+    cfg.max_datagram_len = 100;
+    var c: Connection12 = .{ .role = .client, .config = cfg };
+    const body: [250]u8 = @splat(3);
+    try c.cacheMessage(.handshake_epoch0, 1, 0, &body);
+    var big: [1024]u8 = undefined;
+    var o = Out{ .buf = &big };
+    try c.emitFlight(&o);
+    const need = o.len;
+    try std.testing.expect(need > 250 + 3 * (record.plaintext_header_len + handshake.header_len) - 1);
+    c.send_seq[0] = 0;
+    var exact = Out{ .buf = big[0..need] };
+    try c.emitFlight(&exact);
+    try std.testing.expectEqual(need, exact.len);
+}
+
+test "audit: epoch-1 records before and after the ChangeCipherSpec" {
+    var csprng = std.Random.DefaultCsprng.init(@splat(6));
+    const ent: Entropy = .{ .seeded_for_test = csprng.random() };
+    var c: Connection12 = .{ .role = .client, .config = auditCfg(), .state = .wait_server_finished };
+    var ob: [256]u8 = undefined;
+    var o = Out{ .buf = &ob };
+    // Before the peer's CCS an epoch-1 record cannot be read: dropped, no error.
+    const junk: [40]u8 = @splat(9);
+    try c.processRecord(.{ .content_type = content_handshake, .epoch = 1, .sequence_number = 0, .length = junk.len }, &junk, ent, 0, &o);
+    // One record the size of the plaintext buffer plus overhead is opened (and fails
+    // authentication), not refused for size.
+    c.read_epoch = 1;
+    c.keys_live = true;
+    c.read_keys = .{ .key = @splat(4), .iv = @splat(5) };
+    var big: [max_plain + 24]u8 = @splat(0);
+    try std.testing.expectError(error.DecryptionFailed, c.processRecord(.{ .content_type = content_handshake, .epoch = 1, .sequence_number = 1, .length = big.len }, &big, ent, 0, &o));
+    // A genuine epoch-1 alert is reported once; its replay is dropped.
+    var rb: [64]u8 = undefined;
+    const alert = try record12.seal(&c.read_keys, 1, 7, content_alert, &.{ 1, 0 }, &rb);
+    const hdr = try record.decodePlaintext(alert);
+    try std.testing.expectError(error.ReceivedAlert, c.processRecord(hdr, alert[record.plaintext_header_len..], ent, 0, &o));
+    try c.processRecord(hdr, alert[record.plaintext_header_len..], ent, 0, &o);
+    // A ChangeCipherSpec under epoch 1 is a protocol violation.
+    var cb: [64]u8 = undefined;
+    const ccs1 = try record12.seal(&c.read_keys, 1, 8, content_change_cipher_spec, &.{1}, &cb);
+    const h1 = try record.decodePlaintext(ccs1);
+    try std.testing.expectError(error.UnexpectedMessage, c.processRecord(h1, ccs1[record.plaintext_header_len..], ent, 0, &o));
+    // A retransmitted epoch-0 CCS after ours took effect marks a duplicate.
+    c.saw_duplicate = false;
+    try c.processRecord(.{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = 3, .length = 1 }, &.{1}, ent, 0, &o);
+    try std.testing.expect(c.saw_duplicate);
+    try std.testing.expectEqual(@as(u16, 1), c.read_epoch);
+}
+
+test "audit: an early epoch-0 ChangeCipherSpec is dropped, not taken for a retransmission; alerts are two bytes" {
+    var csprng = std.Random.DefaultCsprng.init(@splat(7));
+    const ent: Entropy = .{ .seeded_for_test = csprng.random() };
+    var c: Connection12 = .{ .role = .client, .config = auditCfg(), .state = .wait_server_hello_done };
+    var ob: [256]u8 = undefined;
+    var o = Out{ .buf = &ob };
+    try c.processRecord(.{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = 1, .length = 1 }, &.{1}, ent, 0, &o);
+    try std.testing.expect(!c.saw_duplicate);
+    try std.testing.expectEqual(@as(u16, 0), c.read_epoch);
+    try std.testing.expectError(error.Malformed, c.processRecord(.{ .content_type = content_alert, .epoch = 0, .sequence_number = 2, .length = 1 }, &.{2}, ent, 0, &o));
+    try std.testing.expectError(error.Malformed, c.processRecord(.{ .content_type = content_alert, .epoch = 0, .sequence_number = 3, .length = 3 }, &.{ 2, 40, 0 }, ent, 0, &o));
+    try std.testing.expectEqual(@as(?[2]u8, null), c.peer_alert);
+}
+
+test "audit: the future-message queue takes a fragment that fills it exactly" {
+    var c: Connection12 = .{ .role = .client, .config = auditCfg(), .state = .wait_server_hello_done, .next_recv_seq = 1 };
+    var frag: [max_future_bytes - future_entry_header]u8 = undefined;
+    @memset(&frag, 1);
+    c.stashFuture(.{ .msg_type = m12.HandshakeType.certificate, .length = frag.len, .message_seq = 2, .fragment_offset = 0, .fragment_length = frag.len }, &frag, 0);
+    try std.testing.expectEqual(@as(usize, max_future_bytes), c.rx_future_len);
+    c.stashFuture(.{ .msg_type = m12.HandshakeType.certificate, .length = 1, .message_seq = 3, .fragment_offset = 0, .fragment_length = 1 }, frag[0..1], 0);
+    try std.testing.expectEqual(@as(usize, max_future_bytes), c.rx_future_len);
+}
+
+const audit_kat = @import("certauth_kat_vectors.zig");
+
+fn auditCfg() Config {
+    return .{ .role = .client, .versions = &.{.dtls12}, .psk_identity = "audit", .psk = "audit-psk" };
+}
