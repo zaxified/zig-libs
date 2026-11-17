@@ -536,3 +536,149 @@ test "nesting deeper than max_depth is refused on decode and on encode" {
     defer b2.deinit();
     try testing.expectError(error.Unsupported, encodeSchemaMessage(&b2, .{ .fields = chain[0..1] }));
 }
+
+test "max_depth is exact: 63 nested levels decode and encode, 64 do not" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    for ([_]struct { levels: usize, ok: bool }{ .{ .levels = 63, .ok = true }, .{ .levels = 64, .ok = false } }) |c| {
+        var b = fb.Builder.init(testing.allocator);
+        defer b.deinit();
+        var inner: ?fb.Ref = null;
+        for (0..c.levels) |_| {
+            const kids = if (inner) |r| try b.createOffsetVector(&.{r}) else try b.createOffsetVector(&.{});
+            b.startTable();
+            try b.addScalarForce(2, u8, tid.struct_);
+            try b.addOffset(5, kids);
+            inner = try b.endTable();
+        }
+        const top = try b.createOffsetVector(&.{inner.?});
+        b.startTable();
+        try b.addOffset(1, top);
+        const buf = try b.finish(try b.endTable());
+        const got = decodeSchema(arena_state.allocator(), try fb.root(buf));
+        if (c.ok) _ = try got else try testing.expectError(error.Malformed, got);
+
+        var chain: [64]Field = undefined;
+        const n = c.levels;
+        for (chain[0..n], 0..) |*f, i| f.* = .{ .name = "s", .type = .@"struct", .children = if (i + 1 < n) chain[i + 1 ..][0..1] else &.{} };
+        var b2 = fb.Builder.init(testing.allocator);
+        defer b2.deinit();
+        const enc = encodeSchemaMessage(&b2, .{ .fields = chain[0..1] });
+        if (c.ok) _ = try enc else try testing.expectError(error.Unsupported, enc);
+    }
+}
+
+test "decoder: the budget refuses exactly what it cannot pay" {
+    var d: Decoder = .{ .arena = testing.allocator, .left = 16 };
+    try d.charge(16);
+    try testing.expectError(error.Malformed, d.charge(1));
+}
+
+test "decoder: big-endian schemas, type parameters the format does not allow, absent type tables" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    {
+        var b = fb.Builder.init(testing.allocator);
+        defer b.deinit();
+        const empty = try b.createOffsetVector(&.{});
+        b.startTable();
+        try b.addScalar(0, i16, 1, 0); // endianness Big
+        try b.addOffset(1, empty);
+        const buf = try b.finish(try b.endTable());
+        try testing.expectError(error.Unsupported, decodeSchema(arena_state.allocator(), try fb.root(buf)));
+    }
+    const Bad = struct { id: u8, field: u16, value: i32 };
+    for ([_]Bad{
+        .{ .id = tid.decimal, .field = 2, .value = 100 }, // bitWidth
+        .{ .id = tid.time, .field = 1, .value = 16 }, // bitWidth
+        .{ .id = tid.fixed_size_binary, .field = 0, .value = -1 },
+        .{ .id = tid.fixed_size_list, .field = 0, .value = -1 },
+    }) |c| {
+        var b = fb.Builder.init(testing.allocator);
+        defer b.deinit();
+        b.startTable();
+        try b.addScalarForce(c.field, i32, c.value);
+        const buf = try b.finish(try b.endTable());
+        try testing.expectError(error.Malformed, decodeType(c.id, try fb.root(buf)));
+    }
+    // Without their tables Date and Duration take Schema.fbs' defaults; NONE is no type.
+    try testing.expectEqual(DateUnit.millisecond, (try decodeType(tid.date, null)).date);
+    try testing.expectEqual(TimeUnit.millisecond, (try decodeType(tid.duration, null)).duration);
+    try testing.expectError(error.Malformed, decodeType(0, null));
+}
+
+test "decoder: a dictionary without indexType is int32; shared metadata and a shared zone are charged per use" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    {
+        var b = fb.Builder.init(testing.allocator);
+        defer b.deinit();
+        b.startTable();
+        try b.addScalar(0, i64, 3, 0);
+        const de = try b.endTable(); // DictionaryEncoding: id 3, no indexType
+        b.startTable();
+        const tt = try b.endTable(); // Utf8
+        b.startTable();
+        try b.addScalarForce(2, u8, tid.utf8);
+        try b.addOffset(3, tt);
+        try b.addOffset(4, de);
+        const field = try b.endTable();
+        const fields = try b.createOffsetVector(&.{field});
+        b.startTable();
+        try b.addOffset(1, fields);
+        const buf = try b.finish(try b.endTable());
+        const s = try decodeSchema(arena, try fb.root(buf));
+        const d = s.fields[0].dictionary.?;
+        try testing.expectEqual(@as(i64, 3), d.id);
+        try testing.expectEqual(IntType{ .bits = 32, .signed = true }, d.index);
+    }
+    {
+        // One KeyValue table named by 1000 metadata entries: 4 bytes each, a table each to decode.
+        var b = fb.Builder.init(testing.allocator);
+        defer b.deinit();
+        const k = try b.createString("k");
+        b.startTable();
+        try b.addOffset(0, k);
+        const kv = try b.endTable();
+        const refs: [1000]fb.Ref = @splat(kv);
+        const md = try b.createOffsetVector(&refs);
+        const empty = try b.createOffsetVector(&.{});
+        b.startTable();
+        try b.addOffset(1, empty);
+        try b.addOffset(2, md);
+        const buf = try b.finish(try b.endTable());
+        try testing.expectError(error.Malformed, decodeSchema(arena, try fb.root(buf)));
+    }
+    {
+        // 50 fields of their own, all naming one Timestamp type whose zone is 1000 bytes.
+        var b = fb.Builder.init(testing.allocator);
+        defer b.deinit();
+        const zone: [1000]u8 = @splat('z');
+        const z = try b.createString(&zone);
+        b.startTable();
+        try b.addOffset(1, z);
+        const ts = try b.endTable();
+        var refs: [50]fb.Ref = undefined;
+        for (&refs) |*r| {
+            b.startTable();
+            try b.addScalarForce(2, u8, tid.timestamp);
+            try b.addOffset(3, ts);
+            r.* = try b.endTable();
+        }
+        const fields = try b.createOffsetVector(&refs);
+        b.startTable();
+        try b.addOffset(1, fields);
+        const buf = try b.finish(try b.endTable());
+        try testing.expectError(error.Malformed, decodeSchema(arena, try fb.root(buf)));
+    }
+}
+
+test "decoder: a Message without a version is V1, which is Unsupported" {
+    var b = fb.Builder.init(testing.allocator);
+    defer b.deinit();
+    b.startTable();
+    try b.addScalarForce(1, HeaderType, .schema);
+    const buf = try b.finish(try b.endTable());
+    try testing.expectError(error.Unsupported, decodeMessage(buf));
+}

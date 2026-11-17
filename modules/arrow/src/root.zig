@@ -56,4 +56,5 @@ test {
     _ = @import("hostile_test.zig");
     _ = @import("golden_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("guards_test.zig");
 }

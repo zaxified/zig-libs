@@ -292,3 +292,72 @@ test "framing: every truncation of a stream is an error or a clean end, never a 
         }
     }
 }
+
+test "framing: a stream may end without the marker, its last metadata or body flush with the end" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var b1 = fb.Builder.init(gpa);
+    defer b1.deinit();
+    const fields = [_]schema.Field{.{ .name = "x", .type = .{ .int = .{ .bits = 32, .signed = true } } }};
+    try writeMessage(gpa, &out, try schema.encodeSchemaMessage(&b1, .{ .fields = &fields }), &.{});
+    var pos: usize = 0;
+    _ = try readMessage(out.items, &pos); // metadata ending exactly at the end
+    try testing.expectError(error.EndOfStream, readMessage(out.items, &pos));
+
+    var body: BodyBuilder = .{};
+    defer body.deinit(gpa);
+    try body.add(gpa, std.mem.sliceAsBytes(&[_]i32{ 1, 2 }));
+    var b2 = fb.Builder.init(gpa);
+    defer b2.deinit();
+    const rb: RecordBatch = .{ .length = 2, .nodes = &.{.{ .length = 2, .null_count = 0 }}, .buffers = body.locs.items };
+    try writeMessage(gpa, &out, try encodeRecordBatchMessage(&b2, rb, @intCast(body.bytes.items.len)), body.bytes.items);
+    pos = 0;
+    _ = try readMessage(out.items, &pos);
+    const m = try readMessage(out.items, &pos); // body ending exactly at the end
+    try testing.expectEqual(@as(usize, 64), m.enc.body.len);
+    try testing.expectEqual(out.items.len, pos);
+    try testing.expectError(error.EndOfStream, readMessage(out.items, &pos));
+}
+
+test "framing: metadata is padded to 8 bytes and its length prefix counts the padding" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try writeMessage(gpa, &out, "12345", &.{});
+    try testing.expectEqual(@as(usize, 16), out.items.len);
+    try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, out.items[4..8], .little));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, out.items[13..16]);
+}
+
+test "body: every buffer starts on a 64-byte boundary" {
+    var body: BodyBuilder = .{};
+    defer body.deinit(testing.allocator);
+    try body.add(testing.allocator, "abc");
+    try body.add(testing.allocator, "defgh");
+    try testing.expectEqual(@as(i64, 64), body.locs.items[1].offset);
+    try testing.expectEqual(@as(usize, 128), body.bytes.items.len);
+}
+
+test "record batch metadata: a negative null count and a compression method other than BUFFER are refused" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    {
+        var b = fb.Builder.init(gpa);
+        defer b.deinit();
+        const buf = try encodeRecordBatchMessage(&b, .{ .length = 1, .nodes = &.{.{ .length = 1, .null_count = -1 }}, .buffers = &.{} }, 0);
+        const m = try schema.decodeMessage(buf);
+        try testing.expectError(error.Malformed, decodeRecordBatch(arena_state.allocator(), m.header.?, 0));
+    }
+    var b = fb.Builder.init(gpa);
+    defer b.deinit();
+    b.startTable();
+    try b.addScalarForce(0, Codec, .zstd);
+    try b.addScalarForce(1, i8, 1); // method: not BUFFER
+    const comp = try b.endTable();
+    b.startTable();
+    try b.addOffset(3, comp);
+    const buf = try b.finish(try b.endTable());
+    try testing.expectError(error.Unsupported, decodeRecordBatch(arena_state.allocator(), try fb.root(buf), 0));
+}

@@ -440,3 +440,83 @@ test "reader: every truncation and every single-byte corruption of a buffer is a
         }
     }
 }
+
+/// One table written by hand into `out`: the root offset, the vtable `vt` (vt_len,
+/// tbl_len, field offsets), then the table bytes `tbl`, whose first 4 bytes become the
+/// soffset back to the vtable.
+fn rawTable(out: []u8, vt: []const u16, tbl: []const u8) []const u8 {
+    var p: usize = 4;
+    for (vt) |x| {
+        std.mem.writeInt(u16, out[p..][0..2], x, .little);
+        p += 2;
+    }
+    @memcpy(out[p..][0..tbl.len], tbl);
+    std.mem.writeInt(u32, out[0..4], @intCast(p), .little);
+    std.mem.writeInt(i32, out[p..][0..4], @intCast(p - 4), .little);
+    return out[0 .. p + tbl.len];
+}
+
+test "reader: hand-built vtables and field offsets that break the format are refused" {
+    var mem: [64]u8 = undefined;
+    // 12 table bytes of which the vtable claims 8; field 0 is an i32 at offset 4.
+    var tbl: [12]u8 = @splat(0);
+    std.mem.writeInt(i32, tbl[4..8], 7, .little);
+    std.mem.writeInt(i32, tbl[8..12], 9, .little);
+    try testing.expectEqual(@as(i32, 7), try (try root(rawTable(&mem, &.{ 6, 8, 4 }, &tbl))).scalar(i32, 0, 0));
+    // vt_len below 4, odd, past the buffer; tbl_len below 4, past the buffer.
+    for ([_][3]u16{ .{ 2, 8, 4 }, .{ 7, 8, 4 }, .{ 200, 8, 4 }, .{ 6, 2, 4 }, .{ 6, 100, 4 } }) |vt|
+        try testing.expectError(error.Malformed, root(rawTable(&mem, &vt, &tbl)));
+    // A field offset into the soffset; a field running past tbl_len by one byte and by four.
+    try testing.expectError(error.Malformed, (try root(rawTable(&mem, &.{ 6, 8, 2 }, &tbl))).scalar(u16, 0, 0));
+    try testing.expectError(error.Malformed, (try root(rawTable(&mem, &.{ 6, 8, 5 }, &tbl))).scalar(i32, 0, 0));
+    try testing.expectError(error.Malformed, (try root(rawTable(&mem, &.{ 6, 8, 8 }, &tbl))).scalar(i32, 0, 0));
+    // An enum value the enum does not name.
+    const E = enum(i32) { a = 0, b = 1 };
+    std.mem.writeInt(i32, tbl[4..8], 5, .little);
+    try testing.expectError(error.Malformed, (try root(rawTable(&mem, &.{ 6, 8, 4 }, &tbl))).scalar(E, 0, .a));
+}
+
+test "reader: a string needs its NUL, a vector its bytes, an element its index" {
+    try testing.expectEqualStrings("abc", try readString(&.{ 3, 0, 0, 0, 'a', 'b', 'c', 0 }, 0));
+    try testing.expectError(error.Malformed, readString(&.{ 3, 0, 0, 0, 'a', 'b', 'c' }, 0));
+    // Five elements claimed, three bytes there.
+    try testing.expectError(error.Malformed, Vector.at(&.{ 5, 0, 0, 0, 1, 2, 3 }, 0));
+    const v = try Vector.at(&.{ 2, 0, 0, 0, 1, 2, 3, 4, 5 }, 0);
+    try testing.expectEqual(@as(u8, 2), try v.scalarAt(u8, 1));
+    try testing.expectError(error.Malformed, v.scalarAt(u8, 2)); // past len, though the bytes are there
+    // One 4-byte struct claimed, three bytes there: the element overruns the buffer by one.
+    try testing.expectError(error.Malformed, (try Vector.at(&.{ 1, 0, 0, 0, 1, 2, 3 }, 0)).structAt(0, 4));
+}
+
+test "builder: scalars, vectors and structs land at their alignment; tbl_len is the table's size" {
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+    const s = try b.createString("abcde"); // 10 bytes: what follows starts off an 8-byte boundary
+    const nums = try b.createVector(i64, &.{ 1, 2, 3 });
+    const st: [16]u8 = @splat(0xab);
+    const svec = try b.createStructVector(&st, 16, 8);
+    b.startTable();
+    try b.addScalarForce(1, i64, 9);
+    try b.addScalarForce(0, i16, 5); // leaves the size 2 bytes past an 8-byte boundary
+    try b.addStruct(2, &st, 8);
+    try b.addOffset(3, s);
+    try b.addOffset(4, nums);
+    try b.addOffset(5, svec);
+    const buf = try b.finish(try b.endTable());
+    try testing.expectEqual(@as(usize, 0), buf.len % 8);
+    const t = try root(buf);
+    try testing.expectEqual(@as(usize, 0), t.pos % 4);
+    try testing.expectEqual(@as(usize, 0), (try t.field(1, 8)).? % 8);
+    try testing.expectEqual(@as(usize, 0), (try t.field(0, 2)).? % 2);
+    try testing.expectEqual(@as(usize, 0), (try t.field(2, 16)).? % 8);
+    try testing.expectEqual(@as(usize, 0), (try t.vector(4)).?.pos % 8);
+    try testing.expectEqual(@as(usize, 0), (try t.vector(5)).?.pos % 8);
+    try testing.expectEqualStrings("abcde", (try t.string(3)).?);
+
+    var b2 = Builder.init(testing.allocator);
+    defer b2.deinit();
+    b2.startTable();
+    try b2.addScalarForce(0, i32, 1);
+    const t2 = try root(try b2.finish(try b2.endTable()));
+    try testing.expectEqual(@as(u16, 8), t2.tbl_len); // the soffset and the one i32
+}
