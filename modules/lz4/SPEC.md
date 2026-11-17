@@ -68,14 +68,19 @@ frames, the `lz4` command-line program.
   `0x00000000`; an optional xxh32 of the content.
 - **Skippable frame:** magic `0x184D2A50..5F`, 32-bit length, payload — skipped.
 - **Legacy frame** (`lz4 -l`): magic `0x184C2102`, then 32-bit compressed sizes and independent
-  blocks of at most 8 MiB each, until the input ends or a size word equals a frame magic number
-  (which starts the next frame).
+  blocks of at most 8 MiB each, until the input ends or a word over `LZ4_COMPRESSBOUND(8 MiB)`
+  takes the place of a size (every frame magic number is; that word is read again as the next
+  frame's magic, or as trailing data — the lz4 CLI's "maybe new stream?").
 - **Compressor:** 4-byte sequences hashed (`v * 2654435761 >> 20`) into 4096 positions; on a miss
   the step grows by one every 64 misses (× acceleration), LZ4's skip; a hit is extended backwards
   over pending literals and forwards eight bytes at a time; after a match the position two bytes
   before its end is entered. The last match starts at least 12 bytes before the block's end and the
   last 5 bytes are literals (rules 2 and 3), so liblz4 accepts every block. In a linked frame the
-  hash table carries over and matches reach up to 64 KiB into the previous blocks. A block that
+  hash table carries over and matches reach up to 64 KiB into the previous blocks. In an
+  independent frame every block starts without history, as liblz4's (`LZ4F_compressBlock` →
+  `LZ4_compress_fast_extState_fastReset`, which clears its table or moves its base 64 KiB on): the
+  table is not cleared, but an entry from an earlier block is below the block's start and refused
+  on its probe exactly as an empty slot is, so the output is the same as with a cleared table. A block that
   does not shrink is stored (as liblz4 does).
 
 ## Behaviour choices (owner rule: like the reference or the majority; the spec's mandate first)
@@ -86,8 +91,9 @@ frames, the `lz4` command-line program.
 | End-of-block rules 2 and 3 (last 5 bytes literals, last match ≥ 12 bytes before the end) | Not enforced by the decoder; always obeyed by the encoder | Format: "a conformant decoder is allowed to reject the block". liblz4's safe loop enforces them relative to its output capacity, its fast loop does not in the same way, so its verdict is not a clean rule; lz4_flex does not enforce them. `tools/interop.zig` shows every block liblz4 refuses and we accept breaks one of them. |
 | Rule 1 (block ends after a literal-only sequence), empty block | Enforced: `error.Truncated` / `error.CorruptBlock` | Format; liblz4 refuses both (measured: `LZ4_decompress_safe("", …)` = −1). |
 | Match-length nibble of the last token | Ignored | Format (no match follows); liblz4 the same, except at output capacity 0 where it accepts only the byte `0x00`. |
-| Concatenated frames | Read all (`multi_frame = true`) | lz4 CLI and lz4_flex read them; python-lz4 reads the first only (`multi_frame = false`). |
+| Concatenated frames | Read all (`multi_frame = true`) | lz4 CLI and lz4_flex read them. `multi_frame = false` reads the first frame only and makes anything after it `error.TrailingData` (Arrow IPC's "exactly one frame"); python-lz4 reads the first and ignores the rest, which is `multi_frame = false` with `ignore_trailing_garbage = true`. |
 | Junk after the last frame | `error.TrailingData` (`ignore_trailing_garbage` to accept) | lz4 CLI exits with an error (output written); python-lz4 ignores it. |
+| A word over `LZ4_COMPRESSBOUND(8 MiB)` after a legacy frame's blocks | Ends the legacy frame; read again as a magic number, so junk there is `error.TrailingData` (ignored with `ignore_trailing_garbage`) | lz4 CLI 1.10.0 `LZ4IO_decodeLegacyStream`: "Cannot read next block : maybe new stream ?", then `selectDecoder`'s "Stream followed by undecodable data". Until 2026-11-17 it was `error.BlockTooLarge`. |
 | Empty input | Empty output | lz4 CLI (exit 0) and lz4_flex; python-lz4 raises. |
 | Skippable frames | Skipped, anywhere | lz4 CLI, liblz4 frame API. |
 | Legacy frames | Read, in any order with other frames | lz4 CLI reads them (and, measured, fails on a legacy frame *after* an LZ4 frame — an artefact of its decoder, not followed); liblz4's frame API, python-lz4 and lz4_flex do not read them. |
@@ -105,8 +111,10 @@ None claimed: the data is public. There is no secret in this module.
 
 - `decompressBlock`: output at most `dst.len` (`error.OutputTooSmall`); no history.
 - Frame block maximum: from BD (64 KiB … 4 MiB); a stored block, a compressed block's size word or
-  its decoded size over it is `error.BlockTooLarge`. Legacy blocks: at most 8 MiB decoded and
-  `LZ4_COMPRESSBOUND(8 MiB)` stored.
+  its decoded size over it is `error.BlockTooLarge`. Legacy blocks: at most 8 MiB decoded
+  (`error.BlockTooLarge`) and `LZ4_COMPRESSBOUND(8 MiB)` stored (a larger word ends the frame).
+- Match lengths are summed with an overflow check from their 4-byte minimum on, so a long run
+  of 255 bytes in a raw block cannot wrap the length on a 32-bit target.
 - `DecodeOptions.max_output`: default 256 MiB (`default_max_output`), `null` = unbounded; one byte
   more is `error.OutputTooLarge`; a header whose content size exceeds what is left of the cap is
   refused before its blocks are read (pinned by `test "frame: the output cap"`).
@@ -136,7 +144,11 @@ None claimed: the data is public. There is no secret in this module.
   `src/testdata/`), replayed by `src/golden_test.zig` against the inputs' SHA-256; the xxHash32
   values of four strings as the CLI writes them (`src/frame_test.zig`).
 - **Re-derived:** `modelDecode` in `src/fuzz_test.zig`, a byte-at-a-time reading of the block format
-  written independently of `block.zig`, judges every fuzzed block.
+  written independently of `block.zig`, judges every fuzzed block; `modelFrames`, a reading of the
+  frame format and the CLI's stream rules (concatenation, skippable and legacy frames, trailing
+  data, the options) written apart from `frame.zig` on top of the same block model, judges
+  `decompress` and `decompressInto` on every fuzzed frame-decoder input (verdict and bytes; the
+  error kinds are pinned by unit tests).
 
 **Anchor grade:** class A · oracle EXTERNAL
 
@@ -192,5 +204,4 @@ ignored, `max_output = null` read as 0, the returned length): 4 killed, none equ
 
 ## Open
 
-- No independent review yet (Audit line `review none`).
 - Big-endian and 32-bit targets are not run; `meta.targets` is `linux64`.

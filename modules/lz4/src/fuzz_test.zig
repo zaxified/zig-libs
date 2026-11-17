@@ -7,8 +7,12 @@
 //!   decode     arbitrary bytes, valid frames mutated anywhere or in their
 //!              structure (descriptor, block size words, checksums), frames
 //!              glued to skippable/legacy frames and junk, under a failing
-//!              allocator. Invariants: no panic, no leak, no hang; an
-//!              accepted input re-encodes and decodes to the same bytes.
+//!              allocator. Invariants: no panic, no leak, no hang;
+//!              `decompress` and `decompressInto` (under a drawn `dst.len`)
+//!              agree with `modelFrames`, a reading of the frame format and
+//!              the CLI's stream rules written apart from `frame.zig` on top
+//!              of a byte-at-a-time block model; an accepted input
+//!              re-encodes and decodes to the same bytes.
 //!   block      arbitrary and synthetic token streams through
 //!              `decompressBlock` with a random output budget, judged
 //!              against `modelDecode`, a byte-at-a-time reading of the
@@ -139,6 +143,133 @@ fn modelDecode(src: []const u8, out: []u8) ?usize {
     }
 }
 
+/// The block format appended to `out` one byte at a time, matches reaching
+/// back to `out[prefix..]`, at most `limit` bytes in `out` afterwards: the
+/// frame model's block reader. `false` = malformed or over the limit.
+fn modelBlockAppend(gpa: std.mem.Allocator, src: []const u8, out: *std.ArrayList(u8), prefix: usize, limit: usize) !bool {
+    if (src.len == 0) return false;
+    var i: usize = 0;
+    while (true) {
+        if (i == src.len) return false;
+        const t = src[i];
+        i += 1;
+        var lit: usize = t >> 4;
+        if (lit == 15) while (true) {
+            if (i == src.len) return false;
+            lit += src[i];
+            i += 1;
+            if (src[i - 1] != 255) break;
+        };
+        for (0..lit) |_| {
+            if (i == src.len or out.items.len == limit) return false;
+            try out.append(gpa, src[i]);
+            i += 1;
+        }
+        if (i == src.len) return true;
+        if (i + 1 == src.len) return false;
+        const off = @as(usize, src[i]) | @as(usize, src[i + 1]) << 8;
+        i += 2;
+        if (off == 0 or off > out.items.len - prefix) return false;
+        var ml: usize = t & 15;
+        if (ml == 15) while (true) {
+            if (i == src.len) return false;
+            ml += src[i];
+            i += 1;
+            if (src[i - 1] != 255) break;
+        };
+        for (0..ml + 4) |_| {
+            if (out.items.len == limit) return false;
+            try out.append(gpa, out.items[out.items.len - off]);
+        }
+    }
+}
+
+/// The frame format read straight from lz4_Frame_format.md and the lz4 CLI's
+/// stream rules, written apart from `frame.zig`: the oracle `decompress` and
+/// `decompressInto` are judged against. `cap` is the output budget. Returns
+/// the decoded bytes in `out`, or `false` for a refused input (the verdict
+/// only; error kinds are pinned by unit tests).
+fn modelFrames(gpa: std.mem.Allocator, in: []const u8, opts: lz4.DecodeOptions, cap: usize, out: *std.ArrayList(u8)) !bool {
+    const Xxh = std.hash.XxHash32;
+    const legacy_max = 8 << 20;
+    const legacy_bound = legacy_max + legacy_max / 255 + 16;
+    var p: usize = 0;
+    var frames: usize = 0;
+    while (p < in.len) : (frames += 1) {
+        if (frames == 1 and !opts.multi_frame) return opts.ignore_trailing_garbage;
+        if (in.len - p < 4) return frames > 0 and opts.ignore_trailing_garbage;
+        const m = std.mem.readInt(u32, in[p..][0..4], .little);
+        const is_frame = m == 0x184D2204;
+        const is_legacy = m == 0x184C2102;
+        const is_skip = m >= 0x184D2A50 and m <= 0x184D2A5F;
+        if (!is_frame and !is_legacy and !is_skip) return frames > 0 and opts.ignore_trailing_garbage;
+        p += 4;
+        if (is_skip) {
+            if (in.len - p < 4) return false;
+            const n = std.mem.readInt(u32, in[p..][0..4], .little);
+            p += 4;
+            if (in.len - p < n) return false;
+            p += n;
+        } else if (is_legacy) {
+            while (p < in.len) {
+                if (in.len - p < 4) return false;
+                const n = std.mem.readInt(u32, in[p..][0..4], .little);
+                if (n > legacy_bound) break; // not a block: the next frame or junk
+                p += 4;
+                if (in.len - p < n) return false;
+                const start = out.items.len;
+                if (!try modelBlockAppend(gpa, in[p..][0..n], out, start, @min(cap, start + legacy_max))) return false;
+                p += n;
+            }
+        } else {
+            if (in.len - p < 2) return false;
+            const flg = in[p];
+            const bd = in[p + 1];
+            if (flg & 0xC0 != 0x40 or flg & 0x02 != 0) return false;
+            if (bd & 0x80 != 0 or bd & 0x0F != 0 or bd >> 4 < 4) return false;
+            const block_max = @as(usize, 1) << @intCast(2 * (bd >> 4) + 8);
+            var dl: usize = 2;
+            if (flg & 0x08 != 0) dl += 8;
+            if (flg & 0x01 != 0) dl += 4;
+            if (in.len - p < dl + 1) return false;
+            if (@as(u8, @truncate(Xxh.hash(0, in[p..][0..dl]) >> 8)) != in[p + dl]) return false;
+            const declared: u64 = if (flg & 0x08 != 0) std.mem.readInt(u64, in[p + 2 ..][0..8], .little) else 0;
+            p += dl + 1;
+            const first = out.items.len;
+            while (true) {
+                if (in.len - p < 4) return false;
+                const w = std.mem.readInt(u32, in[p..][0..4], .little);
+                p += 4;
+                if (w == 0) break;
+                const n: usize = w & 0x7FFF_FFFF;
+                const sum_len: usize = if (flg & 0x10 != 0) 4 else 0;
+                if (n > block_max or in.len - p < n + sum_len) return false;
+                const data = in[p..][0..n];
+                p += n;
+                if (sum_len != 0) {
+                    if (opts.verify_checksums and Xxh.hash(0, data) != std.mem.readInt(u32, in[p..][0..4], .little)) return false;
+                    p += 4;
+                }
+                if (w & 0x8000_0000 != 0) {
+                    if (out.items.len + n > cap) return false;
+                    try out.appendSlice(gpa, data);
+                } else {
+                    const start = out.items.len;
+                    const prefix = if (flg & 0x20 != 0) start else first;
+                    if (!try modelBlockAppend(gpa, data, out, prefix, @min(cap, start + block_max))) return false;
+                }
+            }
+            if (declared != 0 and declared != out.items.len - first) return false;
+            if (flg & 0x04 != 0) {
+                if (in.len - p < 4) return false;
+                if (opts.verify_checksums and Xxh.hash(0, out.items[first..]) != std.mem.readInt(u32, in[p..][0..4], .little)) return false;
+                p += 4;
+            }
+        }
+    }
+    return true;
+}
+
 /// A random but mostly well-formed token stream: literal and match lengths
 /// near the 15 boundary, offsets near the history size.
 fn synthBlock(comptime S: type, src: *S, list: *std.ArrayList(u8), gpa: std.mem.Allocator) !void {
@@ -238,24 +369,31 @@ fn decodeInput(comptime S: type, src: *S, gpa: std.mem.Allocator, input: []const
     };
     var fa = testkit.fuzz.failingAllocator(src, gpa, 16);
     const r = lz4.decompress(fa.allocator(), input, opts);
-    // `decompressInto` gives `decompress`'s verdict under the cap `dst.len`:
-    // the same bytes or the same error. `dst` is drawn around the decoded
-    // length (or anywhere when the input is refused).
+    // Both entry points are judged against `modelFrames`, not each other.
+    var model: std.ArrayList(u8) = .empty;
+    defer model.deinit(gpa);
+    const cap = opts.max_output orelse std.math.maxInt(usize);
+    const ok = try modelFrames(gpa, input, opts, cap, &model);
+    if (r) |out| {
+        if (!ok) return error.ModelRefused;
+        try testing.expectEqualSlices(u8, model.items, out);
+    } else |e| if (e != error.OutOfMemory and ok) return error.ModelAccepted;
+    // `decompressInto` under the cap `dst.len`; `dst` is drawn around the
+    // decoded length (or anywhere when the input is refused).
     {
-        const near: usize = if (r) |out| out.len else |_| src.valueRangeAtMost(u32, 0, 70_000);
+        const near: usize = if (ok) model.items.len else src.valueRangeAtMost(u32, 0, 70_000);
         const dlen = (near + src.valueRangeAtMost(u8, 0, 6)) -| 3;
         const dst = try gpa.alloc(u8, dlen);
         defer gpa.free(dst);
-        var capped = opts;
-        capped.max_output = @min(opts.max_output orelse std.math.maxInt(usize), dlen);
-        const want = lz4.decompress(gpa, input, capped);
-        defer if (want) |w| gpa.free(w) else |_| {};
+        model.clearRetainingCapacity();
+        const want = try modelFrames(gpa, input, opts, @min(cap, dlen), &model);
         const got = lz4.decompressInto(input, dst, opts);
-        if (want) |w| {
-            try testing.expectEqualSlices(u8, w, dst[0..try got]);
+        if (got) |n| {
+            if (!want) return error.ModelRefused;
+            try testing.expectEqualSlices(u8, model.items, dst[0..n]);
             mark("into_ok");
         } else |e| {
-            try testing.expectError(e, got);
+            if (want) return error.ModelAccepted;
             if (e == error.OutputTooLarge) mark("into_short");
         }
     }

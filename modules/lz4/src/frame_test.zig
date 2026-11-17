@@ -394,8 +394,20 @@ test "frame: legacy frames" {
     try testing.expectError(error.TruncatedInput, lz4.decompress(gpa, leg ++ "\x01\x00", .{}));
     try testing.expectError(error.CorruptBlock, lz4.decompress(gpa, leg ++ "\x00\x00\x00\x00", .{}));
     try testing.expectError(error.TruncatedInput, lz4.decompress(gpa, leg[0 .. leg.len - 1], .{}));
-    // A block size over LZ4_COMPRESSBOUND(8 MiB).
-    try testing.expectError(error.BlockTooLarge, lz4.decompress(gpa, leg[0..4] ++ "\x00\x00\x90\x00", .{}));
+    // A word over LZ4_COMPRESSBOUND(8 MiB) is not a block size: it ends the
+    // legacy frame and is read as what follows, here junk (the lz4 CLI:
+    // "Stream followed by undecodable data", the legacy output written).
+    inline for (.{ "\x00\x00\x90\x00", "\x00\x00\x90\x00more junk", "junk", "\xff\xff\xff\xff" }) |junk| {
+        try testing.expectError(error.TrailingData, lz4.decompress(gpa, leg ++ junk, .{}));
+        try expectDecodes(text, leg ++ junk, .{ .ignore_trailing_garbage = true });
+        try testing.expectError(error.TrailingData, lz4.decompress(gpa, leg[0..4] ++ junk, .{}));
+        try expectDecodes("", leg[0..4] ++ junk, .{ .ignore_trailing_garbage = true });
+    }
+    // One frame only: the junk after the legacy frame is trailing data too.
+    try testing.expectError(error.TrailingData, lz4.decompress(gpa, leg ++ "junk", .{ .multi_frame = false }));
+    try expectDecodes(text, leg ++ "junk", .{ .multi_frame = false, .ignore_trailing_garbage = true });
+    // A word within the bound is a block size, junk or not.
+    try testing.expectError(error.TruncatedInput, lz4.decompress(gpa, leg ++ "\x00\x00\x80\x00", .{ .ignore_trailing_garbage = true }));
     // Legacy blocks are independent of each other.
     try testing.expectError(error.BadOffset, lz4.decompress(gpa, leg ++ "\x05\x00\x00\x00\x00\x02\x00\x10!", .{}));
 }
@@ -624,7 +636,50 @@ test "frame: a legacy block at exactly LZ4_COMPRESSBOUND(8 MiB) is read" {
     try c.u32le(lz4.legacy_frame_magic);
     try c.u32le(@intCast(lz4.compressBlockBound(8 << 20) + 1));
     try c.bytes("\x10a");
-    try testing.expectError(error.BlockTooLarge, lz4.decompress(gpa, c.list.items, .{}));
+    // One more is not a block size: the legacy frame (empty) ends before it.
+    try testing.expectError(error.TrailingData, lz4.decompress(gpa, c.list.items, .{}));
+    try expectDecodes("", c.list.items, .{ .ignore_trailing_garbage = true });
+}
+
+test "frame: every independent block decodes alone" {
+    // Blocks that repeat each other: a linked frame would match across them;
+    // independent ones must not, so block k decodes with no history (liblz4
+    // starts each independent block with an empty table,
+    // `LZ4F_compressBlock`). With block checksums the stored blocks are
+    // walked by their size words.
+    var prng = std.Random.DefaultPrng.init(11);
+    var pat: [3000]u8 = undefined;
+    prng.random().bytes(&pat);
+    const input = try gpa.alloc(u8, 6 * 65_536);
+    defer gpa.free(input);
+    for (input, 0..) |*c, i| c.* = pat[(i * 7 + i / 5000) % pat.len];
+    for ([_]u32{ 1, 3 }) |accel| {
+        const z = try lz4.compress(gpa, input, .{ .independent_blocks = true, .block_checksum = true, .acceleration = accel });
+        defer gpa.free(z);
+        var at: usize = 7;
+        var k: usize = 0;
+        var compressed: usize = 0;
+        var out: [65_536]u8 = undefined;
+        while (true) : (k += 1) {
+            const word = std.mem.readInt(u32, z[at..][0..4], .little);
+            at += 4;
+            if (word == 0) break;
+            const len = word & 0x7FFF_FFFF;
+            const data = z[at..][0..len];
+            at += len + 4;
+            const want = input[k * 65_536 .. @min(input.len, (k + 1) * 65_536)];
+            if (word & 0x8000_0000 != 0) {
+                try testing.expectEqualSlices(u8, want, data);
+                continue;
+            }
+            compressed += 1;
+            try testing.expectEqual(want.len, try lz4.decompressBlock(data, &out));
+            try testing.expectEqualSlices(u8, want, out[0..want.len]);
+        }
+        try testing.expectEqual(@as(usize, 6), k);
+        try testing.expectEqual(@as(usize, 6), compressed);
+        try expectDecodes(input, z, .{});
+    }
 }
 
 test "block API: a match may end exactly at the end of the output" {

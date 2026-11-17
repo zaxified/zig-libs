@@ -41,11 +41,13 @@ const n = try lz4.compressInto(plain, buf, .{});
 
 `DecodeOptions`: `max_output` (bomb cap, default 256 MiB, `null` = unbounded; a header declaring
 more is refused up front), `multi_frame` (default on, as the CLI and lz4_flex; off = the first
-frame only, as python-lz4), `ignore_trailing_garbage` (default off: junk after the last frame is
-`error.TrailingData`, as the CLI), `verify_checksums` (default on; the CLI's `--no-crc`).
+frame only, anything after it `error.TrailingData`), `ignore_trailing_garbage` (default off: junk
+after the last frame is `error.TrailingData`, as the CLI; with `multi_frame` off it ignores what
+follows the first frame, as python-lz4), `verify_checksums` (default on; the CLI's `--no-crc`).
 
 `EncodeOptions`: `block_size` (`.max64KB` … `.max4MB`), `independent_blocks`, `block_checksum`,
-`content_checksum`, `content_size`, `acceleration` (1 = LZ4's default level; higher is faster).
+`content_checksum`, `content_size`, `acceleration` (1 = LZ4's default level; higher is faster; `LZ4_compress_fast`'s knob — liblz4's
+frame API maps a negative `compressionLevel` L to acceleration `1 - L`).
 
 ## Blocks
 

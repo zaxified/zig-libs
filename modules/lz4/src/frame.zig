@@ -59,10 +59,14 @@ pub const DecodeOptions = struct {
     /// declares more is refused before decoding.
     max_output: ?usize = default_max_output,
     /// Read every frame of the input (the lz4 CLI and lz4_flex do); `false`
-    /// stops after the first frame (python-lz4's `lz4.frame.decompress`).
+    /// reads the first frame only, and anything after it is
+    /// `error.TrailingData` unless `ignore_trailing_garbage` is also set (the
+    /// two together are python-lz4's `lz4.frame.decompress`).
     multi_frame: bool = true,
-    /// Bytes after the last frame that are not a frame magic end the input
-    /// quietly instead of being `error.TrailingData`.
+    /// Bytes after the last frame that are not a frame magic (with
+    /// `multi_frame = false`: everything after the first frame) end the input
+    /// quietly instead of being `error.TrailingData`; so does a word after a
+    /// legacy frame's blocks that is too large to be one.
     ignore_trailing_garbage: bool = false,
     /// Check block and content checksums when the frame carries them (the
     /// lz4 CLI's `--no-crc` turns this off).
@@ -92,7 +96,10 @@ pub const EncodeOptions = struct {
     content_checksum: bool = false,
     /// The content size in the header.
     content_size: bool = false,
-    /// The block compressor's acceleration (1 = LZ4's default level).
+    /// The block compressor's acceleration (1 = LZ4's default level), as
+    /// `LZ4_compress_fast` takes it. liblz4's frame API derives it from a
+    /// negative `compressionLevel` L as `1 - L` (`LZ4F_compressBlock`), so
+    /// level -1 is acceleration 2.
     acceleration: u32 = 1,
 };
 
@@ -211,11 +218,13 @@ const Decoder = struct {
         while (d.pos < d.src.len) {
             if (d.src.len - d.pos < 4) return error.TruncatedInput;
             const len: usize = readU32(d.src, d.pos);
-            // A magic number where a block size would be starts the next
-            // frame, as in the lz4 CLI.
-            if (knownMagic(@intCast(len))) return;
+            // A word over the largest legacy block is not a block size: it
+            // ends the legacy frame and is read again as what follows it (the
+            // next frame's magic number, or trailing data), as the lz4 CLI
+            // does ("maybe new stream?", `LZ4IO_decodeLegacyStream`). Every
+            // frame magic number is over that bound.
+            if (len > block.compressBound(legacy_block_size)) return;
             d.pos += 4;
-            if (len > block.compressBound(legacy_block_size)) return error.BlockTooLarge;
             try d.need(len);
             const data = d.src[d.pos..][0..len];
             d.pos += len;

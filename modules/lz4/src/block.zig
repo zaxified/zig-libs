@@ -86,9 +86,10 @@ pub fn decodeInto(src: []const u8, out: []u8, start: usize, prefix_start: usize)
         ip += 2;
         if (offset == 0 or offset > op - prefix_start) return error.BadOffset;
 
-        var ml: usize = token & 15;
-        if (ml == 15) ml = try readLength(src, &ip, 15);
-        ml += min_match;
+        // The minimum match is the base of the sum `readLength` checks: on a
+        // 32-bit target a long run of 255 bytes cannot wrap the length.
+        var ml: usize = (token & 15) + min_match;
+        if (ml == 15 + min_match) ml = try readLength(src, &ip, 15 + min_match);
         if (ml > out.len - op) return error.OutputTooSmall;
         if (offset >= 16 and out.len - op - ml >= 16) {
             // 16-byte chunks, overshooting by up to 15 bytes of scratch: no
