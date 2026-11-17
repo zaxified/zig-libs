@@ -723,7 +723,7 @@ pub const ProxyHandler = struct {
     ///     configuration. A proxy cannot: it learns the backend's header set
     ///     only once the backend has answered, and re-deriving "will this
     ///     fit" here would duplicate the writer's own accounting — the copy
-    ///     store's append-only budget, replace-by-name, the managed headers —
+    ///     store's budget, replace-by-name, the managed headers —
     ///     which is a second constant to get wrong.
     ///
     /// So the proxy reports what happened: it could not faithfully relay the

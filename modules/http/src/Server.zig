@@ -3682,12 +3682,11 @@ pub const ResponseWriter = struct {
     /// and passed. Only ReleaseSafe reused the stack soon enough to expose it,
     /// which is why twelve green full-gate runs never saw it.
     ///
-    /// A bump allocator, not a heap: replacing a header by name appends new
-    /// bytes and abandons the old ones rather than compacting, so a handler
-    /// that rewrites the same header in a loop spends budget each time. With
-    /// `header_copy_bytes` against 32 headers that is deliberate — the code is
-    /// simpler and the slices already handed out stay valid, which compaction
-    /// would break.
+    /// A bump allocator, not a heap: nothing is compacted, so the slices of
+    /// OTHER headers stay valid. Replacing a header by name reuses its own
+    /// copy when the new value fits there or that copy is the last one in the
+    /// store (`replaceInPlace`, since 2026-11-17); otherwise it appends and
+    /// abandons the old bytes, as `delHeader` does.
     header_buf: [header_copy_bytes]u8 = undefined,
     header_buf_len: usize = 0,
     sent_head: bool = false,
@@ -4025,6 +4024,7 @@ pub const ResponseWriter = struct {
         // stays spent forever: a handler that retries with a shorter value
         // has strictly less room than before it asked, and since
         // `proxy.relayFailed` the same budget decides relay-versus-502.
+        if (replacing) |hd| if (rw.replaceInPlace(hd, name, value)) return;
         const mark = rw.header_buf_len;
         errdefer rw.header_buf_len = mark;
         const n = try rw.dupe(name);
@@ -4038,6 +4038,64 @@ pub const ResponseWriter = struct {
     }
 
     const PutHeaderError = error{ TooManyHeaders, HeaderBytesExhausted };
+
+    /// Replace `hd` (a table entry whose name matches `name` case-insensitively)
+    /// by rewriting the bytes its earlier copy occupies instead of appending a
+    /// second copy, so a header set again (a per-response CSP nonce over the
+    /// policy a middleware set, a handler overriding a default) does not spend
+    /// the budget twice. Taken when the old value was copied into `header_buf`,
+    /// no other header or trailer entry shares its bytes, and the new value
+    /// fits: it is no longer than the old one, or the old one is the last copy
+    /// in the store (then the store end moves with it, both ways). The name
+    /// keeps its slot when its bytes are equal; a different spelling (same
+    /// length) is rewritten in place under the same exclusivity rule.
+    /// Otherwise false, and the caller appends as before -- the wire bytes are
+    /// the same either way. `@memmove`: the new value may be a slice of the
+    /// old one (a handler trimming what `getHeader` returned).
+    fn replaceInPlace(rw: *ResponseWriter, hd: *http.Header, name: []const u8, value: []const u8) bool {
+        const at = rw.copiedAt(hd.value) orelse return false;
+        if (rw.shared(hd, at, hd.value.len)) return false;
+        const tail = at + hd.value.len == rw.header_buf_len;
+        if (value.len > hd.value.len and !(tail and value.len <= rw.header_buf.len - at)) return false;
+        var n = hd.name;
+        if (!std.mem.eql(u8, n, name)) {
+            const name_at = rw.copiedAt(n) orelse return false;
+            if (rw.shared(hd, name_at, n.len)) return false;
+            @memcpy(rw.header_buf[name_at..][0..name.len], name);
+            n = rw.header_buf[name_at..][0..name.len];
+        }
+        @memmove(rw.header_buf[at..][0..value.len], value);
+        if (tail) rw.header_buf_len = at + value.len;
+        hd.* = .{ .name = n, .value = rw.header_buf[at..][0..value.len] };
+        return true;
+    }
+
+    /// Offset of `s` in the used part of `header_buf`, or null when `s` was
+    /// not copied there (a static, borrowed or `trailer_decl_buf` slice).
+    fn copiedAt(rw: *const ResponseWriter, s: []const u8) ?usize {
+        const base = @intFromPtr(&rw.header_buf);
+        const p = @intFromPtr(s.ptr);
+        if (p < base or p - base > rw.header_buf_len or s.len > rw.header_buf_len - (p - base)) return null;
+        return p - base;
+    }
+
+    /// Whether any header entry other than `self` has a name or value
+    /// overlapping `header_buf[at..][0..len]` (a `setHeaderBorrowed` value
+    /// lent from another header's copy, say). Trailers need no scan: every
+    /// trailer byte is a copy of its own (`setTrailer`), and only the header
+    /// table can borrow.
+    fn shared(rw: *const ResponseWriter, self: *const http.Header, at: usize, len: usize) bool {
+        const lo = @intFromPtr(&rw.header_buf) + at;
+        const hi = lo + len;
+        for (rw.headers[0..rw.headers_len]) |*e| {
+            if (e == self) continue;
+            for ([_][]const u8{ e.name, e.value }) |s| {
+                const p = @intFromPtr(s.ptr);
+                if (p < hi and lo < p + s.len) return true;
+            }
+        }
+        return false;
+    }
 
     /// Copy `bytes` into `header_buf` and return a slice of the copy, stable
     /// for the life of the response. The one place header/trailer bytes enter
@@ -4094,7 +4152,10 @@ pub const ResponseWriter = struct {
     /// The first value set for `name` (case-insensitive) so far, or null —
     /// Go's `Header().Get` on a response. Managed headers the writer keeps
     /// out of the table (`Content-Length`, `Transfer-Encoding`, `Connection`)
-    /// read as null; `Date`/`Server` added at write time likewise.
+    /// read as null; `Date`/`Server` added at write time likewise. The slice
+    /// is valid until `name` is set or removed again (a replacement may
+    /// rewrite these bytes in place) or the response ends; passing it back
+    /// to `setHeader` itself is fine.
     pub fn getHeader(rw: *const ResponseWriter, name: []const u8) ?[]const u8 {
         for (rw.headers[0..rw.headers_len]) |hd| if (std.ascii.eqlIgnoreCase(hd.name, name)) return hd.value;
         return null;
@@ -6512,6 +6573,112 @@ test "ResponseWriter: a REJECTED header returns its name's bytes to the budget" 
     try rw.setHeader("X-Y", &v2);
 }
 
+test "ResponseWriter: a replaced header reuses its own copy when the new value fits (no second spend)" {
+    var out_buf: [512]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try rw.setHeader("X-A", "aaaaaaaa");
+    try rw.setHeader("X-B", "bbbb");
+    const used = rw.header_buf_len;
+    // Not the last copy, shorter: rewritten where it was, nothing appended.
+    try rw.setHeader("X-A", "zz");
+    try testing.expectEqual(used, rw.header_buf_len);
+    // Same length, other spelling of the name: the name is rewritten too.
+    try rw.setHeader("x-a", "yy");
+    try testing.expectEqual(used, rw.header_buf_len);
+    // Not the last copy and longer: appended (name and value), as before.
+    try rw.setHeader("X-A", "ccccccccc");
+    try testing.expectEqual(used + "X-A".len + "ccccccccc".len, rw.header_buf_len);
+    // Its own bytes passed back (a trimmed `getHeader`): an overlapping move.
+    try rw.setHeader("X-A", rw.getHeader("X-A").?[3..]);
+    try testing.expectEqual(used + "X-A".len + "cccccc".len, rw.header_buf_len);
+    try rw.end();
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "X-A: cccccc\r\n" ++
+        "X-B: bbbb\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", out.buffered());
+}
+
+test "ResponseWriter: replacing the LAST copy moves the store end both ways, and a too-long one changes nothing" {
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try rw.setHeader("X-B", "bbbb");
+    // The whole remaining budget in one header: before 2026-11-17 setting it
+    // again, even to the same length, was `HeaderBytesExhausted`.
+    const room = header_copy_bytes - "X-Pad".len - "X-B".len - "bbbb".len;
+    const first: [header_copy_bytes]u8 = @splat('p');
+    try rw.setHeader("X-Pad", first[0..room]);
+    try testing.expectEqual(@as(usize, header_copy_bytes), rw.header_buf_len);
+    const pad: [header_copy_bytes]u8 = @splat('q');
+    try rw.setHeader("X-Pad", pad[0..room]);
+    try testing.expectEqualStrings(pad[0..room], rw.getHeader("X-Pad").?);
+    try testing.expectEqual(@as(usize, header_copy_bytes), rw.header_buf_len);
+    // Shrinking the last copy gives the bytes back...
+    try rw.setHeader("X-Pad", "short");
+    const after_short = header_copy_bytes - room + "short".len;
+    try testing.expectEqual(after_short, rw.header_buf_len);
+    try rw.setHeader("X-C", "c");
+    // ...and the last copy (now X-C) may grow up to the end of the store.
+    const c_room = header_copy_bytes - after_short - "X-C".len;
+    try rw.setHeader("X-C", pad[0..c_room]);
+    try testing.expectEqual(@as(usize, header_copy_bytes), rw.header_buf_len);
+    // One byte more is refused and leaves the entry and the store as they were.
+    try testing.expectError(error.HeaderBytesExhausted, rw.setHeader("X-C", pad[0 .. c_room + 1]));
+    try testing.expectEqual(@as(usize, header_copy_bytes), rw.header_buf_len);
+    try testing.expectEqual(c_room, rw.getHeader("X-C").?.len);
+    try testing.expectEqualStrings("short", rw.getHeader("X-Pad").?);
+    try testing.expectEqualStrings("bbbb", rw.getHeader("X-B").?);
+}
+
+test "ResponseWriter: a replaced header whose bytes another entry borrows, or that was never copied, is appended" {
+    var out_buf: [512]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try rw.setHeader("X-A", "shared-bytes");
+    // `X-L` is lent the copy of `X-A`'s value (and its name's bytes, below):
+    // rewriting either in place would change `X-L` behind its back.
+    try rw.setHeaderBorrowed("X-L", try ResponseWriter.HeaderValue.init(rw.getHeader("X-A").?));
+    var used = rw.header_buf_len;
+    try rw.setHeader("X-A", "other");
+    try testing.expectEqual(used + "X-A".len + "other".len, rw.header_buf_len);
+    // A name lent the same way blocks a respelled name the same way.
+    try rw.setHeader("X-N", "nn");
+    const name_copy = rw.headers[rw.headers_len - 1].name;
+    try rw.setHeaderBorrowed("X-M", try ResponseWriter.HeaderValue.init(name_copy));
+    used = rw.header_buf_len;
+    try rw.setHeader("x-n", "mm");
+    try testing.expectEqual(used + "x-n".len + "mm".len, rw.header_buf_len);
+    // A static value was never copied: its replacement is a plain append.
+    try rw.setHeaderStatic("X-S", "static");
+    used = rw.header_buf_len;
+    try rw.setHeader("X-S", "s");
+    try testing.expectEqual(used + "X-S".len + "s".len, rw.header_buf_len);
+    // A static NAME over a copied value (borrowed out of an orphaned copy):
+    // a respelled name has no copy to rewrite, so the pair is appended.
+    try rw.setHeaderBorrowed("X-T", try ResponseWriter.HeaderValue.init(rw.header_buf[0..3]));
+    used = rw.header_buf_len;
+    try rw.setHeader("x-t", "t");
+    try testing.expectEqual(used + "x-t".len + "t".len, rw.header_buf_len);
+    try rw.end();
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "X-A: other\r\n" ++
+        "X-L: shared-bytes\r\n" ++
+        "x-n: mm\r\n" ++
+        "X-M: X-N\r\n" ++
+        "X-S: s\r\n" ++
+        "x-t: t\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", out.buffered());
+}
+
 test "declareTrailers: byte exhaustion is reported as such, not as TooManyTrailers" {
     var out_buf: [256]u8 = undefined;
     var out: Writer = .fixed(&out_buf);
@@ -6573,16 +6740,18 @@ test "declareTrailers: a REJECTED declaration does not poison the advert of a la
     // the cost of — every later advert.
     //
     // Budget: 40 free. "X-A" costs `Trailer`(7) + `X-A`(3) = 10, leaving 30.
-    // The 24-char name then needs 7 + len("X-A, " ++ name) = 36 > 30 and is
-    // refused. "X-C" afterwards needs 7 + len("X-A, X-C") = 15 ≤ 30 and must
-    // succeed — with the refused name still in the buffer it would need
-    // 7 + len("X-A, X-0123456789012345678901, X-C") = 41 and fail too. The
-    // remaining 15 bytes cover both `setTrailer` pairs (4 each).
+    // The advert is the last copy in the store, so a re-declaration rewrites
+    // it in place (since 2026-11-17) and its value may grow to 40 - 7 = 33.
+    // The 30-char name needs len("X-A, " ++ name) = 35 > 33 and is refused.
+    // "X-C" afterwards needs len("X-A, X-C") = 8 ≤ 33 and must succeed —
+    // with the refused name still in the buffer it would need
+    // len("X-A, X-0123456789012345678901234567, X-C") = 40 and fail too. The
+    // remaining 25 bytes cover both `setTrailer` pairs (4 each).
     try spendCopyStore(&rw, 40);
     try rw.declareTrailer("X-A");
     try testing.expectError(
         error.HeaderBytesExhausted,
-        rw.declareTrailer("X-0123456789012345678901"),
+        rw.declareTrailer("X-0123456789012345678901234567"),
     );
     try rw.declareTrailer("X-C");
 

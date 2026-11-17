@@ -169,11 +169,13 @@ enabled; rerun: 26 killed. No defect found.
 - **Headers on server-generated error replies for a RUNTIME config** *(survey 2026-09-30; comptime
   path done via `http.Server.Options.error_headers` + `staticHeaders`)* — a `SecurityHeaders` built at
   run time has no static list to feed `error_headers`. Effort: small (a runtime list in `http`).
-- **A replaced header spends the budget twice** *(review 2026-10-24)* — `http`'s `putHeader` copies a
-  replacement without reclaiming the old bytes, so `applyCspNonce` over a configured large
-  `content_security_policy` can exhaust the 4 KiB `header_copy_bytes` that `init` checked `apply`
-  against alone. Documented on `applyCspWithNonce`; the fix (reuse the slot when the new value fits)
-  lives in `http`. Effort: small.
+- **DONE 2026-11-17 — a replaced header spends the budget twice** *(review 2026-10-24)* — `http`'s
+  `putHeader` now rewrites a replaced header's own copy when the new value fits there or the copy is
+  the last one in the store (and no other entry borrows its bytes), so a nonce policy rendered again
+  over an earlier one reuses its bytes (test "applyCspWithNonce: a large nonce policy set again
+  reuses its header bytes…"). Since 2026-10-29 the configured policy is lent by `apply`, not copied,
+  so the first nonce render was already a single copy; the double spend that remained was a second
+  render on the same response.
 - **HSTS only over a secure transport** *(review 2026-10-24)* — RFC 6797 §7.2: an HSTS host MUST NOT
   send the header over plain HTTP. The module does not know the transport (no `is_tls` on the
   request); a predicate option (`fn (*const router.Ctx) bool`) would need that flag from `http`.

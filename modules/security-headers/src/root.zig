@@ -664,10 +664,10 @@ pub const CspNonceError = csp.Error || http.Server.ResponseWriter.SetHeaderError
 /// (`setHeader` copies it) -- a stack buffer is fine; nothing allocates.
 /// Replaces a policy of the same name set earlier (e.g. by `apply`).
 /// The caller keeps `nonce` for the HTML (`nonce.slice()`).
-/// Budget: `http` does not reclaim a replaced header's bytes, so replacing a
-/// configured `content_security_policy` spends the policy twice out of the
-/// per-response `header_copy_bytes` (4 KiB) — `init`'s check covers `apply`
-/// alone. With a large static policy, configure none and set it only here.
+/// Budget: the rendered policy is copied into the response's
+/// `header_copy_bytes` (4 KiB) once; the configured policy `apply` set is
+/// lent, not copied, and a later render over this one reuses its bytes
+/// (`http` rewrites a replaced header in place when it fits).
 pub fn applyCspWithNonce(
     res: *http.Server.ResponseWriter,
     spec: csp.Spec,
@@ -1493,6 +1493,33 @@ test "applyCspWithNonce: report-only name, deterministic bytes, errors surface" 
     try rw.end();
     try expectHeaderLine(out.buffered(), "Content-Security-Policy-Report-Only: script-src 'strict-dynamic' 'nonce-AAAAAAAAAAAAAAAAAAAAAA'");
     try expectNoHeader(out.buffered(), "Content-Security-Policy");
+}
+
+test "applyCspWithNonce: a large nonce policy set again reuses its header bytes (no double spend of header_copy_bytes)" {
+    // A source of ~2.4 KiB: one rendered policy fits the 4 KiB copy budget
+    // next to the defaults, two copies do not. Before 2026-11-17 the second
+    // render (a nonce middleware, then a handler re-rendering) failed with
+    // `HeaderBytesExhausted`: `http` appended the replacement.
+    const big = "https://cdn.example/" ++ @as([2380]u8, @splat('a'));
+    const spec: csp.Spec = .{ .use_defaults = false, .directives = &.{.{ .name = .script_src, .values = &.{big} }} };
+    const sh: SecurityHeaders = try .init(.{ .content_security_policy = "script-src " ++ big });
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try sh.apply(&rw);
+    var scratch: [4096]u8 = undefined;
+    const first = csp.Nonce.fromBytes(&(@as([16]u8, @splat(0))));
+    try applyCspWithNonce(&rw, spec, &first, &.{.script_src}, false, &scratch);
+    const after_first = rw.header_buf_len;
+    try testing.expect(2 * after_first > http_header_budget_bytes); // a second copy could not fit
+    const second = csp.Nonce.fromBytes(&(@as([16]u8, @splat(0xff))));
+    try applyCspWithNonce(&rw, spec, &second, &.{.script_src}, false, &scratch);
+    try testing.expectEqual(after_first, rw.header_buf_len);
+    try rw.end();
+    try expectHeaderLine(out.buffered(), "Content-Security-Policy: script-src " ++ big ++ " 'nonce-" ++ @as([21]u8, @splat('/')) ++ "w'");
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.buffered(), "Content-Security-Policy:"));
 }
 
 // ── tests (in-process integration — http.Server + http.Client) ──────────────
