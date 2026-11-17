@@ -489,7 +489,19 @@ directly-exposed parser.
   answer 400 (client fault) instead of 500.
 
 - ~~**Constant time: header bytes go through tables**~~ — DONE 2026-10-18 for the h1 value check (vector/SWAR, faster than the table) and the HPACK encoder (credentials never indexed + raw by default, `Encoder.Options.default_sensitive`); the HPACK **decoder** still walks a Huffman-coded secret per bit — RFC-mandated input, cannot be refused, documented. Was (found 2026-10-18, pre-tag sweep; owner decision — hot path): `h1.zig` `isValidFieldValue` indexes a 256-entry table by every header-value byte (h1.zig ~221/246), and HPACK's Huffman encoder indexes `huff_codes[b]` by each byte and its decoder walks a tree per bit (hpack.zig ~342-373, ~410-426, ~511-514) — both over `Authorization`, `Cookie` and API-key values (llmclient's `x-api-key` too). Options: an arithmetic range check in `isValidFieldValue` (cost to measure on the h1 bench); for HPACK, emit sensitive fields (`authorization`, `cookie`, `proxy-authorization`, a caller list) as raw never-indexed literals (RFC 7541 §7.1.3 recommends never-indexed for them; Huffman stays for the rest) — the decoder side cannot be helped the same way. Severity low-medium (local cache side channel).
-- **HPACK encoder: fast path for a field repeated from the previous block** *(2026-10-18, the web-server consumer repin A/B)* —
+- **DONE 2026-11-17 — HPACK encoder: fast path for a field repeated from the previous block.** `Encoder.recent`
+  keeps, per block position (the first 32), a hint naming the static index or the dynamic-table SEQUENCE where that
+  position's field was found or inserted in the previous block; `encodeField` checks that one candidate with
+  `mem.eql` against the TABLE entry's bytes (never against the caller's previous slices, so a refilled buffer at the
+  same address is no false hit) and a live-sequence check, and only on a miss runs `findField`. Byte-identical: a
+  live exact pair has exactly one answer, because a pair is inserted only when no live entry holds it; pinned by a
+  differential test against the old scan with positional repeats, in-place refills, swaps, sensitivity toggles,
+  eviction and table-size changes (`encoder hint: …`). No `static` flag on `Field` was added: the one compare is the
+  whole cost left, and the flag would need plumbing through `ResponseWriter`. Measured (instructions, `perf stat -e
+  instructions:u`, ReleaseFast, 200 000 blocks of `:status` + the 11 default security headers incl. a helmet CSP,
+  values copied into a reused buffer per block): 5 565 → 2 867 per block (−48 %, cycles about −55 %); adversarial
+  rotation (every position changes every block, all hints miss): 6 049 → 6 685 (+10.5 %). Was:
+  **HPACK encoder: fast path for a field repeated from the previous block** *(2026-10-18, the web-server consumer repin A/B)* —
   static response headers (comptime slices in rodata: `setHeaderStatic`, `security-headers` `applyStatic`,
   `error_headers`) are the same `(name.ptr, value.ptr)` on every response of a connection, yet `Encoder.findField`
   re-derives the index each time: `static_names` lookup, `hashName` + `hashPair` over the bytes, then `mem.eql`

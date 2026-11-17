@@ -1060,6 +1060,25 @@ pub const Encoder = struct {
     /// and the final value must be signalled (§4.2).
     pending_min: ?usize = null,
     pending_final: ?usize = null,
+    /// Per block position `i < recent_len`: where field `i` of the previous
+    /// block ended up (an exact match or its own insert; encoding below). A response head repeats its fields at the
+    /// same positions block after block (`:status`, the security headers), so
+    /// `encodeField` first checks that one candidate with a plain compare
+    /// against the table entry, and only on a miss pays `findField`'s
+    /// static-name lookup, two hashes and two map probes. A hint, never
+    /// trusted: the candidate entry's own bytes must equal the field's
+    /// (never a pointer compare against the caller's previous slices, which
+    /// a reused buffer refills with new bytes at the same address), and a
+    /// dynamic entry must still be live. Byte-identical to the search: an
+    /// exact pair has one answer as long as it is live, since `encodeField`
+    /// inserts a pair only when no live entry holds it.
+    recent: [recent_len]u64 = @splat(recent_none),
+
+    const recent_len = 32;
+    /// A `recent` slot: 0 none, `1..static_table.len` a
+    /// static index, `recent_dynamic + seq` a dynamic-table sequence number.
+    const recent_none: u64 = 0;
+    const recent_dynamic: u64 = 64;
 
     pub const HuffmanMode = enum {
         /// Huffman-encode a string whenever that is no longer than the raw
@@ -1127,7 +1146,31 @@ pub const Encoder = struct {
             e.pending_min = null;
             e.pending_final = null;
         }
-        for (fields) |f| try e.encodeField(f, out);
+        for (fields, 0..) |f, i| try e.encodeField(f, if (i < recent_len) &e.recent[i] else null, out);
+    }
+
+    /// The combined index of `f`'s exact match if `hint` (a `recent` slot)
+    /// still names an entry holding exactly `f`, else null.
+    fn recall(e: *const Encoder, hint: u64, f: Field) ?u64 {
+        if (hint == recent_none) return null;
+        if (hint < recent_dynamic) {
+            const s = static_table[@intCast(hint - 1)];
+            if (!std.mem.eql(u8, s.name, f.name) or !std.mem.eql(u8, s.value, f.value)) return null;
+            return hint;
+        }
+        const t = &e.table;
+        const seq = hint - recent_dynamic;
+        if (seq < t.evicted) return null; // evicted since
+        const en = t.bySeq(seq);
+        if (!std.mem.eql(u8, en.name(), f.name) or !std.mem.eql(u8, en.value(), f.value)) return null;
+        return static_table.len + t.indexOfSeq(seq);
+    }
+
+    /// The `recent` encoding of combined index `index` (an exact match).
+    fn remember(e: *const Encoder, index: u64) u64 {
+        if (index <= static_table.len) return index;
+        const t = &e.table;
+        return recent_dynamic + t.evicted + t.entries.items.len - (index - static_table.len);
     }
 
     /// Current dynamic-table size in octets (§4.1 accounting).
@@ -1147,22 +1190,33 @@ pub const Encoder = struct {
         return .{ .name = entry.name(), .value = entry.value() };
     }
 
-    fn encodeField(e: *Encoder, f: Field, out: *std.ArrayList(u8)) Allocator.Error!void {
+    /// `slot`: this block position's `recent` entry, or null past `recent_len`.
+    fn encodeField(e: *Encoder, f: Field, slot: ?*u64, out: *std.ArrayList(u8)) Allocator.Error!void {
         if (f.sensitive or (e.default_sensitive and isDefaultSensitive(f))) {
             // §6.2.3 literal never indexed. The name may still travel by
             // index (only the value is the secret); the value goes raw.
             try e.encodeLiteral(f, 0x10, 4, e.findNameIndex(f.name), out, .never);
             return;
         }
+        if (slot) |s| if (e.recall(s.*, f)) |index| {
+            try appendInt(e.gpa, out, 0x80, 7, index);
+            return;
+        };
         const m = e.findField(f);
         if (m.exact) |index| {
             // Â§6.1 indexed.
+            if (slot) |s| s.* = e.remember(index);
             try appendInt(e.gpa, out, 0x80, 7, index);
             return;
         }
         // Â§6.2.1 literal with incremental indexing.
         try e.encodeLiteral(f, 0x40, 6, m.name, out, .auto);
         try e.table.add(e.gpa, f.name, f.value);
+        // Inserted unless larger than the whole table (`add` then empties it;
+        // a slot left stale is harmless, `recall` verifies it).
+        if (slot) |s| if (DynamicTable.entrySize(f.name, f.value) <= e.table.max_size) {
+            s.* = recent_dynamic + e.table.evicted + e.table.entries.items.len - 1;
+        };
     }
 
     /// Emit a literal representation with pattern `flags` / `prefix_bits`,
@@ -2312,7 +2366,7 @@ test "encoder search: indexed findField equals the old scan; bytes identical (ra
                     if (x > static_table.len) dyn_name_only += 1;
                 }
                 const before = enc.table.evicted;
-                try enc.encodeField(f, &a);
+                try enc.encodeField(f, null, &a);
                 try encodeFieldOld(&ref, f, &b);
                 evictions += enc.table.evicted - before;
                 try testing.expectEqual(ref.table.count(), enc.table.count());
@@ -2348,6 +2402,151 @@ test "encoder search: indexed findField equals the old scan; bytes identical (ra
     try testing.expect(dyn_exact > 100);
     try testing.expect(dyn_name_only > 200);
     try testing.expect(evictions > 200);
+}
+
+test "encoder hint: positional repeats, buffers refilled in place, eviction -- bytes identical to the search" {
+    // `encodeBlock` with its per-position hints against the old scan field by
+    // field. Blocks repeat their fields position by position (a response head)
+    // with a few changes each: a field redrawn into its own buffer (same
+    // address, new bytes), one byte of a value flipped in place, two
+    // positions swapped, `sensitive` toggled. Up to 40 fields, past `recent_len`.
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7541_0017);
+    const rnd = prng.random();
+    var hits: usize = 0;
+    var stale: usize = 0;
+    var evicted_hints: usize = 0;
+    var past_len: usize = 0;
+    for (0..40) |round| {
+        const max: usize = switch (round % 4) {
+            0 => 96,
+            1 => 300,
+            2 => 4096,
+            else => 0,
+        };
+        const mode: Encoder.HuffmanMode = if (round % 2 == 0) .auto else .never;
+        var enc = Encoder.init(gpa, .{ .max_table_size = max, .huffman = mode });
+        defer enc.deinit();
+        var ref = Encoder.init(gpa, .{ .max_table_size = max, .huffman = mode });
+        defer ref.deinit();
+        var dec = Decoder.init(gpa, .{ .max_table_size = 4096 });
+        defer dec.deinit();
+        var fields: [40]Field = undefined;
+        var bufs: [40][80]u8 = undefined;
+        var nf = 1 + rnd.uintLessThan(usize, fields.len);
+        for (&fields, 0..) |*f, i| f.* = diffField(rnd, &bufs[i]);
+        for (0..40) |_| {
+            if (rnd.uintLessThan(u8, 10) == 0) {
+                const sizes = [_]usize{ 0, 40, 96, 200, 512, 4096 };
+                const ns = sizes[rnd.uintLessThan(usize, sizes.len)];
+                enc.setMaxTableSize(ns);
+                ref.setMaxTableSize(ns);
+            }
+            if (rnd.uintLessThan(u8, 8) == 0) nf = 1 + rnd.uintLessThan(usize, fields.len);
+            for (0..rnd.uintLessThan(usize, 4)) |_| {
+                const i = rnd.uintLessThan(usize, nf);
+                switch (rnd.uintLessThan(u8, 4)) {
+                    0 => fields[i] = diffField(rnd, &bufs[i]),
+                    1 => if (fields[i].value.len > 0) {
+                        // Only a value that lives in a test buffer may change.
+                        const p = @intFromPtr(fields[i].value.ptr);
+                        for (&bufs) |*b| if (p >= @intFromPtr(b) and p < @intFromPtr(b) + b.len) {
+                            const v: [*]u8 = @ptrFromInt(p);
+                            v[0] = if (v[0] == 'a') 'b' else 'a';
+                            break;
+                        };
+                    },
+                    2 => std.mem.swap(Field, &fields[i], &fields[rnd.uintLessThan(usize, nf)]),
+                    else => fields[i].sensitive = !fields[i].sensitive,
+                }
+            }
+            for (fields[0..@min(nf, Encoder.recent_len)], enc.recent[0..@min(nf, Encoder.recent_len)]) |f, h| {
+                if (enc.recall(h, f) != null) {
+                    hits += 1;
+                } else if (h != Encoder.recent_none) {
+                    stale += 1;
+                    if (h >= Encoder.recent_dynamic and h - Encoder.recent_dynamic < enc.table.evicted) evicted_hints += 1;
+                }
+            }
+            if (nf > Encoder.recent_len) past_len += 1;
+            var a: std.ArrayList(u8) = .empty;
+            defer a.deinit(gpa);
+            var b: std.ArrayList(u8) = .empty;
+            defer b.deinit(gpa);
+            try enc.encodeBlock(fields[0..nf], &a);
+            try ref.encodeBlock(&.{}, &b);
+            for (fields[0..nf]) |f| try encodeFieldOld(&ref, f, &b);
+            try testing.expectEqualSlices(u8, b.items, a.items);
+            try testing.expectEqual(ref.table.count(), enc.table.count());
+            try testing.expectEqual(ref.table.size, enc.table.size);
+            var hl = try dec.decodeBlock(a.items);
+            defer hl.deinit(gpa);
+            for (fields[0..nf], hl.fields) |f, g| {
+                try testing.expectEqualStrings(f.name, g.name);
+                try testing.expectEqualStrings(f.value, g.value);
+            }
+        }
+    }
+    if (hits <= 2000 or stale <= 500 or evicted_hints <= 100 or past_len <= 100)
+        std.debug.print("coverage: hits={d} stale={d} evicted_hints={d} past_len={d}\n", .{ hits, stale, evicted_hints, past_len });
+    try testing.expect(hits > 2000);
+    try testing.expect(stale > 500);
+    try testing.expect(evicted_hints > 100);
+    try testing.expect(past_len > 100);
+}
+
+test "encoder hint: a slot names the static index or the entry the field went into; none for a secret or an entry too large" {
+    const gpa = testing.allocator;
+    var enc = Encoder.init(gpa, .{});
+    defer enc.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const block = [_]Field{
+        .{ .name = ":status", .value = "200" }, // static index 8
+        .{ .name = "x-a", .value = "1" }, // inserted: sequence 0
+        .{ .name = "authorization", .value = "secret" }, // never indexed
+    };
+    try enc.encodeBlock(&block, &out);
+    try testing.expectEqual(@as(u64, 8), enc.recent[0]);
+    try testing.expectEqual(Encoder.recent_dynamic + 0, enc.recent[1]);
+    try testing.expectEqual(Encoder.recent_none, enc.recent[2]);
+    // The same block again: both by index from the hints, the secret raw again.
+    out.clearRetainingCapacity();
+    try enc.encodeBlock(&block, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x88, 0xbe }, out.items[0..2]);
+    try testing.expectEqual(@as(u8, 0x10 | 0x0f), out.items[2]); // §6.2.3, name index 23 = 15 + 8
+    // `x-a` at a position whose hint names nothing: found by the search at
+    // combined index 64 (two newer entries), and the slot then names sequence 0.
+    out.clearRetainingCapacity();
+    try enc.encodeBlock(&.{ .{ .name = "x-b", .value = "2" }, .{ .name = "x-q", .value = "9" }, .{ .name = "x-a", .value = "1" } }, &out);
+    try testing.expectEqual(Encoder.recent_dynamic + 1, enc.recent[0]);
+    try testing.expectEqual(Encoder.recent_dynamic + 2, enc.recent[1]);
+    try testing.expectEqual(Encoder.recent_dynamic + 0, enc.recent[2]);
+    try testing.expectEqual(@as(u8, 0x80 | 64), out.items[out.items.len - 1]);
+
+    // After an eviction the slot still names the sequence, not the index.
+    var two = Encoder.init(gpa, .{ .max_table_size = 2 * (32 + 2) });
+    defer two.deinit();
+    for ([_][]const u8{ "a", "b", "c" }, [_][]const u8{ "1", "2", "3" }) |n, v|
+        try two.encodeBlock(&.{.{ .name = n, .value = v }}, &out); // "c" evicts "a" (sequence 0)
+    try testing.expectEqual(@as(u64, 1), two.table.evicted);
+    try testing.expectEqual(Encoder.recent_dynamic + 2, two.recent[0]);
+    out.clearRetainingCapacity();
+    try two.encodeBlock(&.{.{ .name = "b", .value = "2" }}, &out); // found at 63 = sequence 1
+    try testing.expectEqualSlices(u8, &.{0x80 | 63}, out.items);
+    try testing.expectEqual(Encoder.recent_dynamic + 1, two.recent[0]);
+
+    // An entry larger than the whole table is never inserted: no hint.
+    var small = Encoder.init(gpa, .{ .max_table_size = 40 });
+    defer small.deinit();
+    out.clearRetainingCapacity();
+    try small.encodeBlock(&.{.{ .name = "x-long", .value = "0123456789" }}, &out);
+    try testing.expectEqual(@as(usize, 0), small.table.count());
+    try testing.expectEqual(Encoder.recent_none, small.recent[0]);
+    // One that just fits is, and is named.
+    try small.encodeBlock(&.{.{ .name = "x", .value = "1234567" }}, &out);
+    try testing.expectEqual(@as(usize, 1), small.table.count());
+    try testing.expectEqual(Encoder.recent_dynamic + 0, small.recent[0]);
 }
 
 test "encoder search: same name+value re-added after eviction, and duplicate names (newest wins)" {
