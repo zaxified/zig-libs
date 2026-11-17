@@ -6,7 +6,7 @@
 
 **Scope:** core — ncclient 0.7.1 (client) and libnetconf2 4.4 (C, client+server) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (77/79, 2 eq) · src 3dd8ad7237a8d487
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (83/86, 3 eq) · src f2ee8ae9c7cdf09a
 
 **Hardening:** fuzz 2026-10-10 (`netconf-wire` 200,000-run budget clean; `netconf-client` at `.scale` 2 = 100,000 runs — a whole session whose peer bytes are tampered at one read; NETCONF_FUZZ; the hello and framer harnesses are unchanged) · ct n/a — the SSH password is handed straight to `ssh.userauth`; framing/RPC carry no key, MAC or compare (review, 2026-10-10)
 
@@ -375,7 +375,7 @@ without the one-node shortcut (the join of one node, trimmed, is the shortcut's 
 reach them; the filter's bytes are pinned by `schemas_filter selects /netconf-state/schemas`) and the
 `data_element orelse` in `parseSchemaList` (`expectData` has already returned for a reply with no `<data>`, and
 `data` and `data_element` are set together in `parseReply`, so it is unreachable). The card's counts are
-cumulative; no earlier mutation run existed.
+cumulative; no earlier mutation run existed. Hand list for the later `<data>` change in `parseReply` (6 conditions, by reasoning and one added test, all killed): the monitoring-namespace compare and the `data` compare each forced true (killed by the new test with a foreign-namespace `<data>` and a monitoring `<schemas>` next to one real `<data>`), the counter not incremented, `>1` as `>2` and as `>0` and the monitoring term dropped from the sum (killed by the pair, mixed and single-monitoring cases). In `parseSchemaText` the `break` is now equivalent (at most one `<data>` can reach it).
 
 ## Provenance
 

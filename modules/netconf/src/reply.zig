@@ -1591,6 +1591,12 @@ test "parseSchemaText: two <data> are ambiguous in either namespace; an XML body
     try testing.expectError(error.AmbiguousReply, parseReply(gpa, head ++ "<data>first</data><data>second</data></rpc-reply>"));
     try testing.expectError(error.AmbiguousReply, parseReply(gpa, head ++ "<data>first</data><data " ++ mon ++ ">second</data></rpc-reply>"));
     {
+        // Not counted: a `<data>` in a foreign namespace and a monitoring-namespace
+        // element of another name next to the one real `<data>`.
+        var r = try parseReply(gpa, head ++ "<data>only</data><data xmlns=\"urn:example:x\">x</data><schemas " ++ mon ++ "/></rpc-reply>");
+        r.deinit();
+    }
+    {
         var r = try parseReply(gpa, head ++ "<data " ++ mon ++ ">only</data></rpc-reply>");
         defer r.deinit();
         const text = try parseSchemaText(gpa, &r);
