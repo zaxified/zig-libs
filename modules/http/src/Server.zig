@@ -105,6 +105,16 @@ const crc32 = @import("crc32");
 const conneg = @import("conneg.zig");
 const bufpool = @import("bufpool.zig");
 const zeroize = @import("zeroize.zig");
+const rebody = @import("rebody.zig");
+
+/// Re-readable request body (opt-in): memory up to a threshold, then a
+/// caller-supplied spool; see `rebody.zig`.
+pub const RewindableBody = rebody.RewindableBody;
+pub const RewindableBodyOptions = rebody.Options;
+pub const BodySpool = rebody.BodySpool;
+pub const SpoolSource = rebody.SpoolSource;
+pub const RequestBodyTap = rebody.Tap;
+pub const FileSpool = rebody.FileSpool;
 // The branchless civil-from-days calendar, for the `Date` header. std has one
 // too, and it walks a year at a time from 1970 -- see `formatHttpDate`.
 const datefmt = @import("datefmt");

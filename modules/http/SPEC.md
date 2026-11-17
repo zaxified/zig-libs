@@ -200,6 +200,25 @@ read via `bindErrorName()`. Same shape as `probe.ConnectOutcome.err_name`
 and for the same reason: `std.Io.net` reports an `anyerror`, not an errno,
 so there is no numeric code to carry, only `@errorName`'s static string.
 
+**Re-readable request body (2026-11-17, `src/rebody.zig`).** `Server.RewindableBody`
+drains `Request.reader()` once and hands out readers from byte 0 any number of times;
+`install(req)` points `req.reader()` at one through the `Request.decoded` seam (the
+one gzip decoding and `idempotency` already use), so no server path, `Request` field
+or buffer changes and the default per-request memory is untouched. Shape of the
+references (ASP.NET Core `EnableBuffering` — memory up to `bufferThreshold` 30 KiB,
+then a temp file, `bufferLimit` → error; Rack 3 `RewindableInput` / Puma — Tempfile
+spill; Go and Express buffer in memory only under a size cap): the first
+`memory_limit` bytes (default 30 KiB, grown on demand) in memory, the rest in a
+`BodySpool` the caller supplies through a `SpoolSource` (opened only when a body
+passes `memory_limit`), `max_total` → `error.BodyTooLarge` (the caller answers 413);
+the server's own body cap and read timeouts still apply underneath. A source read
+error or a spool failure is never `BodyTooLarge`. An optional `Tap` sees every byte
+once while `fill` buffers it (hash in the same pass). `FileSpool` is a spool over a
+file the CALLER opened (`http` keeps no path policy; an unlinked / `O_TMPFILE` file is
+the intended use); its `deinit` truncates the file to 0. `RewindableBody.deinit`
+wipes the memory part and the staging buffers — the spool's storage is the caller's
+security boundary.
+
 ## Threat model / out of scope
 Hardened for direct internet exposure (no reverse proxy required):
 - **Request smuggling:** duplicate/disagreeing Content-Length → 400; Content-Length **and**
