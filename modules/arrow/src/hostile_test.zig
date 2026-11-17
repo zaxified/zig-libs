@@ -178,6 +178,41 @@ test "hostile schema: fields shared through offsets (a DAG) cannot multiply the 
         try testing.expectEqual(@as(?anyerror, error.Malformed), got.err);
         try testing.expect(got.peak < 4 << 20);
     }
+    // One 64 KiB metadata value behind 256 entries of the schema's `custom_metadata`: a
+    // reader asked for the metadata copies every entry.
+    {
+        var b = fb.Builder.init(gpa);
+        defer b.deinit();
+        const long = try gpa.alloc(u8, 64 << 10);
+        defer gpa.free(long);
+        @memset(long, 'v');
+        const k = try b.createString("k");
+        const v = try b.createString(long);
+        b.startTable();
+        try b.addOffset(0, k);
+        try b.addOffset(1, v);
+        const kv = try b.endTable();
+        const refs: [256]fb.Ref = @splat(kv);
+        const md = try b.createOffsetVector(&refs);
+        const empty = try b.createOffsetVector(&.{});
+        b.startTable();
+        try b.addOffset(1, empty);
+        try b.addOffset(2, md);
+        const sref = try b.endTable();
+        b.startTable();
+        try b.addScalarForce(0, schema.MetadataVersion, .v5);
+        try b.addScalarForce(1, schema.HeaderType, .schema);
+        try b.addOffset(2, sref);
+        const meta = try b.finish(try b.endTable());
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        try ipc.writeMessage(gpa, &out, meta, &.{});
+        try ipc.writeEos(gpa, &out);
+        var got_md: stream.Metadata = .{};
+        const got = try streamUnderCap(out.items, .{ .metadata = &got_md }, 4 << 20);
+        try testing.expectEqual(@as(?anyerror, error.Malformed), got.err);
+        try testing.expect(got.peak < 1 << 20);
+    }
     // An honest schema of the same shapes (no sharing) still decodes.
     {
         var b = fb.Builder.init(gpa);

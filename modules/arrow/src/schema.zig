@@ -154,8 +154,19 @@ fn decodeMetadata(d: *Decoder, v: ?fb.Vector) Error![]const KeyValue {
     for (out, 0..) |*kv, i| {
         const t = try vec.tableAt(i);
         kv.* = .{ .key = try t.string(0) orelse "", .value = try t.string(1) orelse "" };
+        // A reader copies both strings: one long value behind many entries is charged per use.
+        try d.charge(kv.key.len +| kv.value.len);
     }
     return out;
+}
+
+/// Decodes the `[KeyValue]` vector at field `id` of table `t` (a file footer's
+/// `custom_metadata`, say), within the same budget a schema of `t.buf`'s length gets:
+/// one long string behind many entries is `error.Malformed`. Strings point into the
+/// buffer; the slice is allocated from `arena`.
+pub fn decodeKeyValues(arena: std.mem.Allocator, t: fb.Table, id: u16) Error![]const KeyValue {
+    var d: Decoder = .{ .arena = arena, .left = budgetFor(t.buf.len) };
+    return decodeMetadata(&d, try t.vector(id));
 }
 
 fn decodeInt(t: fb.Table) Error!IntType {
@@ -253,6 +264,11 @@ fn encodeFields(b: *fb.Builder, fields: []const Field, depth: usize) Error!fb.Re
     defer b.gpa.free(refs);
     for (fields, 0..) |f, i| refs[i] = try encodeField(b, f, depth);
     return b.createOffsetVector(refs);
+}
+
+/// Builds a `[KeyValue]` vector (null for none, which a table then omits).
+pub fn encodeKeyValues(b: *fb.Builder, md: []const KeyValue) Error!?fb.Ref {
+    return encodeMetadata(b, md);
 }
 
 fn encodeMetadata(b: *fb.Builder, md: []const KeyValue) Error!?fb.Ref {

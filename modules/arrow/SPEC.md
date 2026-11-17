@@ -145,8 +145,7 @@ ZSTD built in both ways, no C, no `libarrow`. Nothing here is a measured lead, s
 **Where we are behind** (all in Backlog): the types the format has and `dataframe` has no column for (Map, Union,
 Interval, Decimal256, run-end, the view types, ListView) are refused, and so are Decimal32/64; LZ4_FRAME, the
 other codec every Arrow implementation but this one has and the default of pyarrow's Feather writer, is refused
-(waits for an `lz4` module); schema and field key/value metadata are decoded and then dropped, and are not
-written; dictionary replacement and a dictionary nested in a list or struct are refused; there is no column
+(waits for an `lz4` module); dictionary replacement and a dictionary nested in a list or struct are refused; there is no column
 projection, no zero-copy or memory-mapped read, no incremental reader or writer over `std.Io` (the input and the
 output are whole byte slices), no big-endian byte swap; the writer's output has not been read by a foreign
 implementation and no speed was measured.
@@ -155,7 +154,9 @@ implementation and no speed was measured.
 
 Apache Arrow IPC — the stream format and the file (Feather v2) format — between bytes and a whole
 `dataframe.Frame`: `writeStream` / `writeFile` turn a frame into Arrow, `readStream` / `readFile` read one back,
-`openFile` gives random access to a file's record batches, ZSTD body compression both ways. Underneath, a
+`openFile` gives random access to a file's record batches, ZSTD body compression both ways, the schema's, fields'
+and file footer's key/value metadata both ways (`ReadOptions.metadata`, `WriteOptions.schema_metadata` /
+`field_metadata` / `footer_metadata`: `dataframe.Frame` has no slot for it). Underneath, a
 bounds-checked FlatBuffers reader and builder, the `Schema.fbs` / `Message.fbs` / `File.fbs` tables, and the
 message framing, each usable on its own (`arrow.fb`, `arrow.schema`, `arrow.ipc`). Every input is untrusted: a
 hostile stream ends in an error, within the limits below, never in a crash or an unbounded allocation.
@@ -220,8 +221,9 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
 
 - **Schema decode budget** (not an option): FlatBuffers offsets may share tables, so a few KB of metadata can
   name 2^64 fields through children vectors pointing at one table. `schema.decodeSchema` charges 16 units per
-  `Field` and `KeyValue` and one per byte of every name and zone string against `2 × metadata length + 64`; past
-  it `error.Malformed`. An honest schema spends at most about its length (every field needs more than 8 unique
+  `Field` and `KeyValue` and one per byte of every name, zone, metadata key and metadata value string against
+  `2 × metadata length + 64`; past it `error.Malformed` (a footer's `custom_metadata` gets the same budget from
+  the footer's length). An honest schema spends at most about its length (every field needs more than 8 unique
   bytes plus its name). Nesting deeper than `schema.max_depth` (64) is refused on both sides.
 - `ReadOptions.max_rows` (default 2^27, ours): the most rows any one array may claim — the frame's rows summed over
   the batches, a list's elements, a dictionary's entries.
@@ -401,7 +403,12 @@ competing libraries and cheap enough to finish in one wave; none of them is star
   defaults to LZ4, so this is the commonest refusal a user meets. Sketch: `Compression.lz4`, the reader dispatches
   on `BodyCompression.codec` next to zstd, with the same `max_body_bytes` charge from the frame's declared
   content size (a frame without one is `Malformed`, as arrow-rs needs it). Effort: ~0.5 wave once the codec exists.
-- **Schema and field key/value metadata.** `arrow.schema` decodes `KeyValue`s (and the writer's schema encoder
+- ✅ 2026-11-17 **Schema and field key/value metadata.** Done: `ReadOptions.metadata` (an out parameter, so
+  `readStream` / `readFile` / `openFile` keep their signatures) is filled with a `Metadata` — the schema's pairs,
+  a `FieldMetadata` tree parallel to the frame's columns, a file footer's pairs — copied into the read's arena;
+  `WriteOptions.schema_metadata` / `field_metadata` (by position) / `footer_metadata` write them. Anchored on the
+  `custom_metadata` and `extension` goldens (every set's metadata is compared with its JSON, then written back
+  and read again). Was: `arrow.schema` decodes `KeyValue`s (and the writer's schema encoder
   takes them) but the frame has no slot, so Pandas metadata, extension type names (`ARROW:extension:name`) and
   provenance tags are dropped on read and absent on write; the footer's `custom_metadata` likewise. Sketch: a
   side result (`readStreamMeta` returning the frame plus `schema.Schema.metadata`, or an out parameter on

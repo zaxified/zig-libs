@@ -1011,3 +1011,62 @@ test "a dictionary shared by two fields: read when the value types agree, refuse
         try testing.expectError(c.want, stream.readStream(a, bytes, .{}));
     }
 }
+
+test "metadata: schema, field (nested) and footer key/value metadata round trip; extra entries are Unsupported" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const f = try sampleFrame(a);
+    const kv = struct {
+        fn one(comptime k: []const u8, comptime v: []const u8) []const stream.KeyValue {
+            const x = [_]stream.KeyValue{.{ .key = k, .value = v }};
+            return &x;
+        }
+    }.one;
+    var fm: [24]stream.FieldMetadata = @splat(.{});
+    fm[0] = .{ .metadata = kv("unit", "m/s") };
+    fm[21] = .{ .children = &.{.{ .metadata = kv("odd_values", "{}") }} }; // l: its item
+    fm[23] = .{ .metadata = kv("ARROW:extension:name", "point"), .children = &.{ .{}, .{ .metadata = kv("b", "") } } }; // st
+    const schema_md = [_]stream.KeyValue{ .{ .key = "pandas", .value = "{\"index_columns\": []}" }, .{ .key = "empty", .value = "" } };
+    const wo: stream.WriteOptions = .{ .schema_metadata = &schema_md, .field_metadata = &fm, .footer_metadata = kv("written_by", "zig-libs") };
+    for ([_]bool{ false, true }) |file| {
+        const bytes = if (file) try stream.writeFile(gpa, f, wo) else try stream.writeStream(gpa, f, wo);
+        defer gpa.free(bytes);
+        var md: stream.Metadata = .{};
+        const back = if (file) try stream.readFile(a, bytes, .{ .metadata = &md }) else try stream.readStream(a, bytes, .{ .metadata = &md });
+        try expectSameFrame(f, back);
+        try testing.expectEqual(@as(usize, 2), md.schema.len);
+        try testing.expectEqualStrings("pandas", md.schema[0].key);
+        try testing.expectEqualStrings("{\"index_columns\": []}", md.schema[0].value);
+        try testing.expectEqualStrings("", md.schema[1].value);
+        try testing.expectEqual(f.columns.len, md.fields.len);
+        try testing.expectEqualStrings("i64", md.fields[0].name);
+        try testing.expectEqualStrings("m/s", md.fields[0].metadata[0].value);
+        try testing.expectEqual(@as(usize, 0), md.fields[1].metadata.len);
+        try testing.expectEqualStrings("odd_values", md.fields[21].children[0].metadata[0].key);
+        try testing.expectEqual(@as(usize, 0), md.fields[21].metadata.len);
+        try testing.expectEqualStrings("point", md.fields[23].metadata[0].value);
+        try testing.expectEqual(@as(usize, 0), md.fields[23].children[0].metadata.len);
+        try testing.expectEqualStrings("b", md.fields[23].children[1].metadata[0].key);
+        if (file) {
+            try testing.expectEqual(@as(usize, 1), md.footer.len);
+            try testing.expectEqualStrings("zig-libs", md.footer[0].value);
+        } else try testing.expectEqual(@as(usize, 0), md.footer.len);
+    }
+    // Without the options nothing is written; without `metadata` nothing is read.
+    const plain = try stream.writeFile(gpa, f, .{});
+    defer gpa.free(plain);
+    var none: stream.Metadata = .{ .schema = kv("stale", "x") };
+    _ = try stream.readFile(a, plain, .{ .metadata = &none });
+    try testing.expectEqual(@as(usize, 0), none.schema.len + none.footer.len);
+    for (none.fields) |x| try testing.expectEqual(@as(usize, 0), x.metadata.len);
+
+    // More entries than columns, or than a field has children.
+    const extra = try a.alloc(stream.FieldMetadata, f.columns.len + 1);
+    @memset(extra, .{});
+    try testing.expectError(error.Unsupported, stream.writeStream(gpa, f, .{ .field_metadata = extra }));
+    var kids: [24]stream.FieldMetadata = @splat(.{});
+    kids[0] = .{ .children = &.{.{}} }; // an int column has no children
+    try testing.expectError(error.Unsupported, stream.writeStream(gpa, f, .{ .field_metadata = &kids }));
+}

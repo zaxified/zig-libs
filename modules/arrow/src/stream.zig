@@ -50,6 +50,36 @@ pub const WriteOptions = struct {
     /// The zstd level (`zstd.Options.level`: 1..22, negative for the fast levels, 0 = zstd's
     /// default, 3).
     compression_level: i32 = 0,
+    /// The schema's key/value metadata (`Schema.custom_metadata`: Pandas metadata,
+    /// provenance tags), written as given.
+    schema_metadata: []const KeyValue = &.{},
+    /// Key/value metadata per column, by position: entry `i` goes on column `i`'s field,
+    /// its `children` on the field's children in order (a list's item, a struct's fields).
+    /// `name` is not looked at. More entries than columns (or than a field has children)
+    /// is `error.Unsupported`.
+    field_metadata: []const FieldMetadata = &.{},
+    /// The file footer's `custom_metadata` (`writeFile` only; a stream has no footer).
+    footer_metadata: []const KeyValue = &.{},
+};
+
+/// One `KeyValue` of Arrow's custom metadata.
+pub const KeyValue = schema.KeyValue;
+
+/// A field's key/value metadata (`Field.custom_metadata`) and its children's, in field
+/// order: what `ARROW:extension:name`, Pandas and provenance tags live in.
+pub const FieldMetadata = struct {
+    name: []const u8 = "",
+    metadata: []const KeyValue = &.{},
+    children: []const FieldMetadata = &.{},
+};
+
+/// The key/value metadata a read found, allocated from the read's arena (nothing borrows
+/// the input): the schema's, each column's field (parallel to `Frame.columns`) with its
+/// children, and a file footer's (empty for a stream).
+pub const Metadata = struct {
+    schema: []const KeyValue = &.{},
+    fields: []const FieldMetadata = &.{},
+    footer: []const KeyValue = &.{},
 };
 
 /// Body compression codecs the writer offers. LZ4_FRAME is read as `error.Unsupported`
@@ -96,6 +126,11 @@ pub const ReadOptions = struct {
     ///   instants are UTC either way; only the `time_zone` tag is dropped).
     /// Nothing else changes: a malformed stream is still an error.
     lossy: bool = false,
+    /// When set, filled with the schema's, the fields' and (a file's) the footer's
+    /// key/value metadata, allocated from the read's arena. `dataframe.Frame` has no
+    /// slot for it, so it comes out here. Its bytes are charged against the schema
+    /// decode budget like names (one long value behind many entries is `Malformed`).
+    metadata: ?*Metadata = null,
 };
 
 /// A selector entry meaning "a null cell" (also what `ColumnData.get` reads past the end).
@@ -288,11 +323,14 @@ const Writer = struct {
         return f;
     }
 
-    fn toField(w: *Writer, wf: *const WField) Error!schema.Field {
+    fn toField(w: *Writer, wf: *const WField, md: ?FieldMetadata) Error!schema.Field {
         var f: schema.Field = .{ .name = wf.name, .type = wf.arrow };
         if (wf.dict) |di| f.dictionary = .{ .id = @intCast(di), .ordered = w.dicts.items[di].ordered };
+        const kmd: []const FieldMetadata = if (md) |m| m.children else &.{};
+        if (kmd.len > wf.children.len) return error.Unsupported; // metadata for children the field has not
+        if (md) |m| f.metadata = m.metadata;
         const kids = try w.arena.alloc(schema.Field, wf.children.len);
-        for (kids, wf.children) |*k, *c| k.* = try w.toField(c);
+        for (kids, wf.children, 0..) |*k, *c, i| k.* = try w.toField(c, if (i < kmd.len) kmd[i] else null);
         f.children = kids;
         return f;
     }
@@ -684,8 +722,10 @@ fn write(gpa: Allocator, f: df.Frame, opts: WriteOptions, file: bool) Error![]u8
 
     const fields = try w.arena.alloc(WField, f.columns.len);
     for (fields, f.columns, 0..) |*wf, c, ci| wf.* = try w.plan(c.name, c, f.columnAt(ci), f.len, 0);
+    if (opts.field_metadata.len > fields.len) return error.Unsupported; // metadata for columns the frame has not
     const sfields = try w.arena.alloc(schema.Field, fields.len);
-    for (sfields, fields) |*s, *wf| s.* = try w.toField(wf);
+    for (sfields, fields, 0..) |*s, *wf, i| s.* = try w.toField(wf, if (i < opts.field_metadata.len) opts.field_metadata[i] else null);
+    const sch: schema.Schema = .{ .fields = sfields, .metadata = opts.schema_metadata };
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -693,7 +733,7 @@ fn write(gpa: Allocator, f: df.Frame, opts: WriteOptions, file: bool) Error![]u8
     {
         var b = fb.Builder.init(gpa);
         defer b.deinit();
-        try ipc.writeMessage(gpa, &out, try schema.encodeSchemaMessage(&b, .{ .fields = sfields }), &.{});
+        try ipc.writeMessage(gpa, &out, try schema.encodeSchemaMessage(&b, sch), &.{});
     }
     var dict_blocks: std.ArrayList(Block) = .empty;
     var batch_blocks: std.ArrayList(Block) = .empty;
@@ -713,14 +753,16 @@ fn write(gpa: Allocator, f: df.Frame, opts: WriteOptions, file: bool) Error![]u8
     if (file) {
         var b = fb.Builder.init(gpa);
         defer b.deinit();
-        const sref = try schema.encodeSchema(&b, .{ .fields = sfields });
+        const sref = try schema.encodeSchema(&b, sch);
         const dv = try blockVector(&b, w.tmp, dict_blocks.items);
         const rv = try blockVector(&b, w.tmp, batch_blocks.items);
+        const fmd = try schema.encodeKeyValues(&b, opts.footer_metadata);
         b.startTable();
         try b.addScalarForce(0, schema.MetadataVersion, .v5);
         try b.addOffset(1, sref);
         try b.addOffset(2, dv);
         try b.addOffset(3, rv);
+        if (fmd) |m| try b.addOffset(4, m);
         const footer = try b.finish(try b.endTable());
         const flen = std.math.cast(i32, footer.len) orelse return error.Unsupported;
         try out.appendSlice(gpa, footer);
@@ -1708,6 +1750,34 @@ fn noEos(e: ipc.Error) Error {
     };
 }
 
+/// The schema's, the fields' and the footer's key/value metadata, copied into `arena`
+/// (the decoded schema points into the input).
+fn copyMetadata(arena: Allocator, s: schema.Schema, footer: []const KeyValue) Error!Metadata {
+    return .{
+        .schema = try copyKeyValues(arena, s.metadata),
+        .fields = try copyFieldMetadata(arena, s.fields),
+        .footer = try copyKeyValues(arena, footer),
+    };
+}
+
+fn copyKeyValues(arena: Allocator, kvs: []const KeyValue) Error![]const KeyValue {
+    const out = try arena.alloc(KeyValue, kvs.len);
+    for (out, kvs) |*o, kv| o.* = .{ .key = try arena.dupe(u8, kv.key), .value = try arena.dupe(u8, kv.value) };
+    return out;
+}
+
+fn copyFieldMetadata(arena: Allocator, fields: []const schema.Field) Error![]const FieldMetadata {
+    // The decoded schema is at most `schema.max_depth` deep and its size is bounded by the
+    // decode budget, so this copy is too.
+    const out = try arena.alloc(FieldMetadata, fields.len);
+    for (out, fields) |*o, f| o.* = .{
+        .name = try arena.dupe(u8, f.name),
+        .metadata = try copyKeyValues(arena, f.metadata),
+        .children = try copyFieldMetadata(arena, f.children),
+    };
+    return out;
+}
+
 /// Reads an Arrow IPC stream into a frame allocated from `arena` (free it all with the
 /// arena; nothing borrows `bytes`). Dictionary deltas are appended; ZSTD body compression
 /// is read. A dictionary REPLACED mid-stream, LZ4_FRAME body compression, a metadata
@@ -1720,6 +1790,7 @@ pub fn readStream(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!
     if (first.msg.header_type != .schema) return error.Malformed;
     const s = try schema.decodeSchema(arena, first.msg.header orelse return error.Malformed);
     const top = try r.planAll(s);
+    if (opts.metadata) |m| m.* = try copyMetadata(arena, s, &.{});
 
     var batches: std.ArrayList(Chunk) = .empty;
     while (true) {
@@ -1786,6 +1857,7 @@ pub fn openFile(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!Fi
     var r: Reader = .{ .a = arena, .opts = opts };
     const s = try schema.decodeSchema(arena, try footer.table(1) orelse return error.Malformed);
     const top = try r.planAll(s);
+    if (opts.metadata) |m| m.* = try copyMetadata(arena, s, try schema.decodeKeyValues(arena, footer, 4));
 
     // The messages live between the leading mark and the footer. Every block is located
     // and checked before anything is inflated.

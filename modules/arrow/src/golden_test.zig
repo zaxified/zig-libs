@@ -378,6 +378,35 @@ const Oracle = struct {
     }
 };
 
+/// The same key/value pairs; the order is not compared (Arrow C++ writes an extension
+/// type's pairs in another order than its JSON lists them).
+fn expectKeyValues(want: []const J, got: []const stream.KeyValue) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want) |w| {
+        const n = for (got) |g| {
+            if (std.mem.eql(u8, str(w, "key"), g.key)) break g;
+        } else return error.TestMissingKey;
+        try testing.expectEqualStrings(str(w, "value"), n.value);
+    }
+}
+
+/// The fields' key/value metadata (`metadata` in the JSON), recursively; with `names`
+/// the field names too (a frame written back names a list's child `item`).
+fn expectFieldMetadata(fields: []const J, got: []const stream.FieldMetadata, names: bool) !void {
+    try testing.expectEqual(fields.len, got.len);
+    for (fields, got) |fj, g| {
+        if (names) try testing.expectEqualStrings(str(fj, "name"), g.name);
+        try expectKeyValues(items(fj, "metadata"), g.metadata);
+        try expectFieldMetadata(items(fj, "children"), g.children, names);
+    }
+}
+
+fn expectMetadata(json: J, md: stream.Metadata, names: bool) !void {
+    const sch = get(json, "schema").?;
+    try expectKeyValues(items(sch, "metadata"), md.schema);
+    try expectFieldMetadata(items(sch, "fields"), md.fields, names);
+}
+
 test "golden: apache/arrow-testing integration files read field by field equal to their JSON" {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -388,14 +417,21 @@ test "golden: apache/arrow-testing integration files read field by field equal t
         const json = try std.json.parseFromSliceLeaky(J, a, try gunzip(a, s.json), .{});
         const lossy = s.want == .lossy;
         if (lossy) try testing.expectError(error.Unsupported, stream.readStream(a, s.stream, .{}));
-        const opts: stream.ReadOptions = .{ .lossy = lossy };
+        var md: stream.Metadata = .{};
+        const opts: stream.ReadOptions = .{ .lossy = lossy, .metadata = &md };
         var o: Oracle = .{ .json = json, .lossy = lossy, .where = s.name };
 
         const f = try stream.readStream(a, s.stream, opts);
         try o.expectFrame(f);
+        // Schema and field key/value metadata (`custom_metadata`, `extension`).
+        try expectMetadata(json, md, true);
 
         if (s.file) |bytes| {
-            try st.expectSameFrame(f, try stream.readFile(a, bytes, opts));
+            var fmd: stream.Metadata = .{};
+            var fopts = opts;
+            fopts.metadata = &fmd;
+            try st.expectSameFrame(f, try stream.readFile(a, bytes, fopts));
+            try expectMetadata(json, fmd, true);
             var file = try stream.openFile(a, bytes, opts);
             const batches = items(json, "batches");
             try testing.expectEqual(batches.len, file.batchCount());
@@ -406,15 +442,19 @@ test "golden: apache/arrow-testing integration files read field by field equal t
             }
         }
 
-        // What this module writes of the frame reads back equal, plain and compressed.
+        // What this module writes of the frame (and of its metadata) reads back equal,
+        // plain and compressed.
         for ([_]stream.Compression{ .none, .zstd }) |c| {
-            const wo: stream.WriteOptions = .{ .compression = c, .rows_per_batch = 8 };
+            const wo: stream.WriteOptions = .{ .compression = c, .rows_per_batch = 8, .schema_metadata = md.schema, .field_metadata = md.fields };
+            var bmd: stream.Metadata = .{};
             const back = try stream.writeStream(gpa, f, wo);
             defer gpa.free(back);
-            try st.expectSameFrame(f, try stream.readStream(a, back, .{}));
+            try st.expectSameFrame(f, try stream.readStream(a, back, .{ .metadata = &bmd }));
+            try expectMetadata(json, bmd, false);
             const fback = try stream.writeFile(gpa, f, wo);
             defer gpa.free(fback);
-            try st.expectSameFrame(f, try stream.readFile(a, fback, .{}));
+            try st.expectSameFrame(f, try stream.readFile(a, fback, .{ .metadata = &bmd }));
+            try expectMetadata(json, bmd, false);
         }
     }
 }
