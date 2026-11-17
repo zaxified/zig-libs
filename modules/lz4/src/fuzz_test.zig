@@ -268,42 +268,42 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     switch (mode) {
         0 => {
             mark("mode_raw");
-            var raw: [300]u8 = undefined;
-            const n = src.slice(&raw);
-            if (n >= 6 and src.valueRangeAtMost(u8, 0, 2) != 0) {
+            var junk: [300]u8 = undefined;
+            const junk_len = src.slice(&junk);
+            if (junk_len >= 6 and src.valueRangeAtMost(u8, 0, 2) != 0) {
                 const m: u32 = switch (src.valueRangeAtMost(u8, 0, 2)) {
                     0 => lz4.frame_magic,
                     1 => lz4.legacy_frame_magic,
                     else => lz4.skippable_magic_base + src.valueRangeAtMost(u32, 0, 15),
                 };
-                std.mem.writeInt(u32, raw[0..4], m, .little);
+                std.mem.writeInt(u32, junk[0..4], m, .little);
                 // A plausible descriptor: version 01, a valid block size id.
                 if (m == lz4.frame_magic and src.value(bool)) {
-                    raw[4] = 0x40 | (raw[4] & 0x3D);
-                    raw[5] = @as(u8, src.valueRangeAtMost(u3, 4, 7)) << 4;
-                    const desc_len: usize = 2 + @as(usize, if (raw[4] & 8 != 0) 8 else 0) + @as(usize, if (raw[4] & 1 != 0) 4 else 0);
-                    if (n > 4 + desc_len) raw[4 + desc_len] = @truncate(std.hash.XxHash32.hash(0, raw[4..][0..desc_len]) >> 8);
+                    junk[4] = 0x40 | (junk[4] & 0x3D);
+                    junk[5] = @as(u8, src.valueRangeAtMost(u3, 4, 7)) << 4;
+                    const desc_len: usize = 2 + @as(usize, if (junk[4] & 8 != 0) 8 else 0) + @as(usize, if (junk[4] & 1 != 0) 4 else 0);
+                    if (junk_len > 4 + desc_len) junk[4 + desc_len] = @truncate(std.hash.XxHash32.hash(0, junk[4..][0..desc_len]) >> 8);
                 }
             }
-            try stream.appendSlice(gpa, raw[0..n]);
+            try stream.appendSlice(gpa, junk[0..junk_len]);
         },
         1, 2, 3 => {
-            const n: usize = if (src.valueRangeAtMost(u8, 0, 3) == 0) src.valueRangeAtMost(u16, 0, 20) else src.valueRangeAtMost(u16, 0, 9000);
-            drawStructured(S, src, data[0..n]);
+            const plain_len: usize = if (src.valueRangeAtMost(u8, 0, 3) == 0) src.valueRangeAtMost(u16, 0, 20) else src.valueRangeAtMost(u16, 0, 9000);
+            drawStructured(S, src, data[0..plain_len]);
             const eo = drawEncodeOptions(S, src);
-            const z = try lz4.compress(gpa, data[0..n], eo);
+            const z = try lz4.compress(gpa, data[0..plain_len], eo);
             defer gpa.free(z);
             try stream.appendSlice(gpa, z);
             if (mode == 1) {
                 mark("mode_mutated");
                 for (0..src.valueRangeAtMost(u8, 1, 4)) |_| {
                     if (stream.items.len == 0) break;
-                    const at = src.index(stream.items.len);
+                    const pos: usize = @intCast(src.value(u64) % stream.items.len);
                     switch (src.valueRangeAtMost(u8, 0, 3)) {
-                        0 => stream.items[at] ^= @as(u8, 1) << src.valueRangeAtMost(u3, 0, 7),
-                        1 => stream.items[at] = src.value(u8),
-                        2 => stream.shrinkRetainingCapacity(at),
-                        else => try stream.insert(gpa, at, src.value(u8)),
+                        0 => stream.items[pos] ^= @as(u8, 1) << src.valueRangeAtMost(u3, 0, 7),
+                        1 => stream.items[pos] = src.value(u8),
+                        2 => stream.shrinkRetainingCapacity(pos),
+                        else => try stream.insert(gpa, pos, src.value(u8)),
                     }
                 }
             } else if (mode == 2) {
@@ -312,15 +312,15 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
                 mark("mode_struct");
                 const hl = 7 + @as(usize, if (eo.content_size) 8 else 0);
                 const targets = [_]usize{ 4, 5, 6, hl - 1, hl, hl + 1, hl + 3, stream.items.len - 1, stream.items.len -| 5, stream.items.len -| 8 };
-                const at = @min(targets[src.valueRangeAtMost(u8, 0, targets.len - 1)], stream.items.len - 1);
+                const pos = @min(targets[@intCast(src.value(u64) % targets.len)], stream.items.len - 1);
                 switch (src.valueRangeAtMost(u8, 0, 2)) {
-                    0 => stream.items[at] ^= @as(u8, 1) << src.valueRangeAtMost(u3, 0, 7),
-                    1 => stream.items[at] = src.value(u8),
-                    else => stream.items[at] +%= 1,
+                    0 => stream.items[pos] ^= @as(u8, 1) << src.valueRangeAtMost(u3, 0, 7),
+                    1 => stream.items[pos] = src.value(u8),
+                    else => stream.items[pos] +%= 1,
                 }
                 // Keep the header checksum valid half the time, so the damage
                 // reaches past it.
-                if (src.value(bool) and at >= 4 and at < hl) {
+                if (src.value(bool) and pos >= 4 and pos < hl) {
                     stream.items[hl - 1] = @truncate(std.hash.XxHash32.hash(0, stream.items[4 .. hl - 1]) >> 8);
                 }
             } else {
@@ -341,7 +341,7 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
                         std.mem.writeInt(u32, &w, lz4.legacy_frame_magic, .little);
                         try stream.appendSlice(gpa, &w);
                         var blk: [lz4.compressBlockBound(200)]u8 = undefined;
-                        const k = @min(n, 200);
+                        const k = @min(plain_len, 200);
                         const bn = try lz4.compressBlock(data[0..k], &blk, .{});
                         std.mem.writeInt(u32, &w, @intCast(bn), .little);
                         try stream.appendSlice(gpa, &w);
