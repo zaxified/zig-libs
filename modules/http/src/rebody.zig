@@ -369,6 +369,7 @@ test "RewindableBody: memory -> spool switch at the exact boundary, and one byte
         try testing.expectEqual(@as(u64, body.len), rb.len());
         try testing.expectEqual(extra != 0, rb.spooled());
         try testing.expectEqual(@as(usize, extra), ms.data.items.len);
+        try testing.expectEqual(@as(u32, @intFromBool(extra != 0)), ms.opens); // one spool per body, never one per chunk
         for (0..2) |_| {
             const got = try readAllInto(rb.reader(), testing.allocator);
             defer testing.allocator.free(got);
@@ -749,6 +750,30 @@ test "RewindableBody: a spool read failure stays latched until the next rewind, 
         ms.lie = false;
     }
     {
+        // A spool that comes up short (0 bytes where the body continues) fails the same way, and also latches.
+        const keep = ms.data.items.len;
+        const tail = try testing.allocator.dupe(u8, ms.data.items[keep - 1000 ..]);
+        defer testing.allocator.free(tail);
+        ms.data.shrinkRetainingCapacity(keep - 1000);
+        const r = rb.reader();
+        var w: Writer = .fixed(&out);
+        _ = try RewindableBody.stream(r, &w, .unlimited);
+        _ = try RewindableBody.stream(r, &w, .unlimited); // the part that is still there
+        try testing.expectError(error.ReadFailed, RewindableBody.stream(r, &w, .unlimited));
+        try ms.data.appendSlice(testing.allocator, tail);
+        try testing.expectError(error.ReadFailed, RewindableBody.stream(r, &w, .unlimited));
+    }
+    {
+        // The same latch after a lying spool.
+        ms.lie = true;
+        const r = rb.reader();
+        var w: Writer = .fixed(&out);
+        _ = try RewindableBody.stream(r, &w, .unlimited);
+        try testing.expectError(error.ReadFailed, RewindableBody.stream(r, &w, .unlimited));
+        ms.lie = false;
+        try testing.expectError(error.ReadFailed, RewindableBody.stream(r, &w, .unlimited));
+    }
+    {
         // Bytes in the spool beyond the body's length are never exposed.
         try ms.data.appendSlice(testing.allocator, "EXTRA-EXTRA-EXTRA");
         const got = try readAllInto(rb.reader(), testing.allocator);
@@ -803,4 +828,40 @@ test "FileSpool: one FileSpool reused for two bodies in a row starts the second 
         try testing.expectEqual(@as(u64, 0), fs.len);
         try testing.expectEqual(@as(u64, 0), try file.length(io));
     }
+}
+
+test "FileSpool: a file the caller opened without the right mode is SpoolReadFailed / SpoolWriteFailed, not a panic or an empty read" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile(io, "wo.bin", .{ .read = false, .truncate = true });
+        defer f.close(io);
+        var fs = FileSpool.init(io, f);
+        const sp = fs.spool();
+        try sp.vtable.append(sp.ctx, "abcdef");
+        var buf: [8]u8 = undefined;
+        try testing.expectError(error.SpoolReadFailed, sp.vtable.readAt(sp.ctx, 0, &buf));
+    }
+    {
+        const f = try tmp.dir.openFile(io, "wo.bin", .{ .mode = .read_only });
+        defer f.close(io);
+        var fs = FileSpool.init(io, f);
+        const sp = fs.spool();
+        try testing.expectError(error.SpoolWriteFailed, sp.vtable.append(sp.ctx, "x"));
+        try testing.expectEqual(@as(u64, 0), fs.len);
+    }
+}
+
+test "FileSpool.create: deinit closes the file descriptor (the next open reuses its number)" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = try tmp.dir.createFile(io, "a.bin", .{ .read = true, .truncate = true });
+    const handle = a.handle;
+    const fs = try FileSpool.create(testing.allocator, io, a);
+    fs.spool().vtable.deinit(fs.spool().ctx);
+    const b = try tmp.dir.createFile(io, "b.bin", .{ .read = true, .truncate = true });
+    defer b.close(io);
+    try testing.expectEqual(handle, b.handle);
 }
