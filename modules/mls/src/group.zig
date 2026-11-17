@@ -7689,6 +7689,127 @@ test "low-order X25519 keys: processCommit refuses an insider's Commit that adds
     try testing.expectEqual(@as(u64, 2), b.epoch);
 }
 
+/// A client's KeyPackage with `cipher_suite` or `version` rewritten and
+/// RE-SIGNED, so the only thing wrong with it is the field §10.1 names —
+/// the signature check cannot be what refuses it.
+fn mismatchedKeyPackage(arena: std.mem.Allocator, c: TestClient, which: enum { suite, version }) !keypackage_mod.KeyPackage {
+    var kp = c.kp;
+    switch (which) {
+        .suite => kp.cipher_suite = if (TestSuite.id == .mls_128_dhkemx25519_chacha20poly1305_sha256_ed25519)
+            .mls_128_dhkemx25519_aes128gcm_sha256_ed25519
+        else
+            .mls_128_dhkemx25519_chacha20poly1305_sha256_ed25519,
+        .version => kp.version = @fromBackingInt(@as(u16, 2)),
+    }
+    kp.signature = &.{};
+    const sig = try kp.sign(TestSuite, arena, &c.sig);
+    kp.signature = try arena.dupe(u8, &sig.toBytes());
+    try kp.verifySignature(TestSuite, arena);
+    return kp;
+}
+
+test "§10.1/§12.2: createCommit refuses an Add whose KeyPackage names another cipher suite or protocol version" {
+    // RFC 9420 §10.1: "Verify that the cipher suite and protocol version of
+    // the KeyPackage match those in the GroupContext." The other suite here
+    // has the same key and signature sizes as the group's, so nothing but
+    // this comparison can tell the two apart.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 241);
+    const dave = try TestClient.init(aa, "dave", 242);
+    var a = try tCreate(gpa, .{
+        .io = io,
+        .group_id = "kp-mismatch-create",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = &alice.enc_priv,
+    });
+    defer a.deinit();
+    const before = try stateDigest(&a);
+    for ([_]keypackage_mod.KeyPackage{
+        try mismatchedKeyPackage(aa, dave, .suite),
+        try mismatchedKeyPackage(aa, dave, .version),
+    }) |kp| {
+        const r = a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = &alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = kp } }},
+        });
+        if (r) |c| {
+            c.deinit(gpa);
+            return error.TestUnexpectedResult;
+        } else |e| try testing.expectEqual(error.KeyPackageMismatch, e);
+        try testing.expectEqualSlices(u8, &before, &(try stateDigest(&a)));
+    }
+    // The unaltered KeyPackage is accepted, so the refusals above are the
+    // field's and not the client's.
+    const ok = try a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = &alice.sig,
+        .proposals = &.{.{ .by_value = .{ .add = dave.kp } }},
+    });
+    ok.deinit(gpa);
+}
+
+test "§10.1/§12.2: processCommit refuses an insider's Commit adding a KeyPackage of another cipher suite or protocol version" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 251);
+    const bob = try TestClient.init(aa, "bob", 252);
+    const carol = try TestClient.init(aa, "carol", 253);
+    var a = try tCreate(gpa, .{
+        .io = io,
+        .group_id = "kp-mismatch-process",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = &alice.enc_priv,
+    });
+    defer a.deinit();
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = &alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
+        });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+
+    // Forged by the insider from a genuine Commit adding carol: the Add's
+    // KeyPackage swapped for carol's own, re-signed with the one field
+    // changed, and the Commit re-framed so every other check passes.
+    const c = try a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = &alice.sig,
+        .proposals = &.{.{ .by_value = .{ .add = carol.kp } }},
+    });
+    defer c.deinit(gpa);
+    const cases = [_]keypackage_mod.KeyPackage{
+        try mismatchedKeyPackage(aa, carol, .suite),
+        try mismatchedKeyPackage(aa, carol, .version),
+    };
+    for (cases, 0..) |kp, i| {
+        errdefer std.debug.print("case {d}\n", .{i});
+        const bad = try reframeMemberMessage(gpa, aa, c.commit, alice.sig, &b, .{ .add0_key_package = kp });
+        defer gpa.free(bad);
+        try testing.expectError(error.KeyPackageMismatch, b.processCommit(.{ .commit_msg = bad }));
+        try testing.expectEqual(@as(u64, 1), b.epoch);
+    }
+    try b.processCommit(.{ .commit_msg = c.commit });
+    try expectSameEpoch(&a, &b);
+}
+
 test "low-order X25519 keys: a Welcome whose ratchet tree carries one is refused" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
