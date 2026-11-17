@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the live interop test's `SNMP_TEST_PRIV_PROTO` now accepts every spelling of net-snmp's `-x` table (`snmplib/snmpusm.c` `usm_priv_type`), case-insensitively: `DES`, `AES`, `AES-128`/`AES128`, `AES-192`/`AES192`, `AES-256`/`AES256`, `AES-192-C`/`AES192C`, `AES-256-C`/`AES256C`; new test for the table. `src/interop.zig` is test tooling, outside the mutation card's counted files, so no mutation run and the card counts are unchanged.
+
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** SPEC note with the sources and the delta mutation (12 mutants, 11 killed, 1 unobservable) for the `msgID` / `msgMaxSize` range check above; card counts now 416/427, 11 eq.
 
 - **2026-11-17** — **Behaviour change:** `v3.decode` now refuses a `msgGlobalData` whose `msgID` is negative or whose `msgMaxSize` is below 484 (both with `error.InvalidValue`); before, any `i32` was accepted. RFC 3412 §6 gives the SYNTAX `msgID` 0..2147483647 and `msgMaxSize` 484..2147483647, and §7.2.2 makes a message outside it no SNMPv3Message (discard, `snmpInASNParseErrs`); net-snmp's `snmpv3_parse` rejects exactly these (`snmplib/snmp_api.c`). Values above `i32` max stay `IntegerTooLarge`. `V3Client.Options.initial_msg_id` below 0 is raised to 0 so the client never sends an illegal `msgID`. New `v3.min_msg_max_size`. The live interop test (`SNMP_TEST_PRIV_PROTO`) also accepts `AES192`, `AES256`, `AES192C`, `AES256C` (net-snmp's `-x` spellings).

@@ -6,7 +6,7 @@
 
 **Scope:** core — Net-SNMP manager tools (snmpget/snmpwalk/snmpbulkwalk/snmpset/snmptrapd), gosnmp v1.45 as library yardstick (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation 2026-11-17 (416/427, 11 eq) · src 67214a8ee3f3cc70
+**Audit:** review 2026-09-02 · mutation 2026-11-17 (416/427, 11 eq) · src b8bb2161898c7028
 
 **Audit 2026-11-17 (whole-module mutation).** 415 mutants = the 21 delta mutants over the AES-192/256 change run earlier (19 killed, 2 EQUIVALENT, listed under "Mutation 2026-11-17" in Verification; not re-run) + 394 new over every other non-test source file (`ber`, `oid`, `message`, `usm`, `priv`, `des`, `timewin`, `v3`, `report`, `receiver`, `client`, `v3client`), one schemata build per round, baseline first. Round 1: 271 killed + 6 hung, 117 survived. 51 tests were added, in the files they test: BER length-octet and sign-padding boundaries, the OID first-octet split at 40/80 and the 2^32 - 1 ceiling of the first subidentifier, `prependUnsigned`'s top bit of exactly 0x80, `Encoder.prependBytes` filling a buffer exactly, `authOffsetFor`'s header / length / position checks one at a time, DES buffer bounds and zero padding, `latch` on an equal clock, a stray element inside each of the v3 message, header, ScopedPDU, PDU, Trap-PDU and varbind SEQUENCEs, `msgID` / `msgMaxSize` / request-id / error-index / specific-trap values that would wrap into range, GetBulk count clamping, the 32-varbind notification limit, `Walker` / `BulkWalker` (v1/v2c and v3) where every way a walk can end is final and a further `next()` sends nothing, `request()`'s retry bookkeeping, request-id wrap at 2^31 - 1, `UdpTransport` Timeout and oversize-reply, and the v3 client's Report handling (acting on one authenticated `unknownEngineIDs` and giving up after exactly one retry; an unauthenticated Report cannot move the clock at an authenticated level; a Report naming another engine is not dated against our clock; `notInTimeWindows` about another engine is `EngineIdMismatch`; a downgraded or foreign-engine data reply). The test `FakeAgent` gained the knobs these needed (a discovery-Report reason, an advertised engine id, an unauthenticated reply or Report, a repeating forced Report, a data-reply budget). Round 2 killed 104 of the 117 (4 of those by a hang: a loop that no longer ends); round 3 killed 5 more after two of the new tests were corrected (`message.encodePdu` closes its element over everything already in the encoder, so a stray element has to be appended behind a separately built PDU; a Report naming another engine has to be armed after discovery). 8 survive, all EQUIVALENT:
 - sign-padding strip `c.len > 1` -> `> 2` in `parseInteger` and `parseUnsigned` (two padded bytes accumulate to the same value as one; the strip only matters for the 8-byte length test);
@@ -248,7 +248,10 @@ The v3 stack is anchored three independent ways:
 
 3. **Live interop.** `SNMP_TEST_AGENT=host:port` runs discovery + a GET + a walk against a real
    agent (`SNMP_TEST_USER`, `SNMP_TEST_AUTH_PROTO`, `SNMP_TEST_PRIV_PROTO`, `SNMP_TEST_LEVEL`,
-   `SNMP_TEST_*_PASSWORD` select the rest). Without the variable it prints `SKIPPED:` and passes,
+   `SNMP_TEST_*_PASSWORD` select the rest). `SNMP_TEST_PRIV_PROTO` takes net-snmp's own `-x` names, any
+   case, with or without the hyphens (`DES`, `AES`, `AES-128`, `AES-192`, `AES-256`, `AES-192-C`,
+   `AES-256-C`, `AES192`, `AES256C`, …; table `usm_priv_type` in `snmplib/snmpusm.c`, BSD, matched
+   there with `strncasecmp`; exact names only here, no abbreviations). Without the variable it prints `SKIPPED:` and passes,
    like the live tests in `netconf` and `tc`. Executed 2026-07-23 against an unprivileged net-snmp
    5.9.4 `snmpd` on `udp:127.0.0.1:11161` — all green:
 

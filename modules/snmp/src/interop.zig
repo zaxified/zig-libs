@@ -770,8 +770,9 @@ test "golden replay through V3Client: the captured discovery Report drives the h
 // SNMP_TEST_USER (default "shaAesUser"), SNMP_TEST_AUTH_PASSWORD and
 // SNMP_TEST_PRIV_PASSWORD (default "maplesyrup"), SNMP_TEST_AUTH_PROTO
 // (md5 | sha1 | sha224 | sha256 | sha384 | sha512, default sha1) and
-// SNMP_TEST_PRIV_PROTO (des | aes | AES192 | AES256 | AES192C | AES256C,
-// default aes; the last four are net-snmp's `-x` spellings) and SNMP_TEST_LEVEL
+// SNMP_TEST_PRIV_PROTO (net-snmp's `-x` names, any case: DES | AES | AES-128 |
+// AES-192 | AES-256 | AES-192-C | AES-256-C, also without the hyphens
+// (AES192, AES256C, ...); default aes) and SNMP_TEST_LEVEL
 // (noAuthNoPriv | authNoPriv | authPriv, default authPriv). Without
 // SNMP_TEST_AGENT, or if the agent does not answer, the test prints SKIPPED and
 // passes.
@@ -793,14 +794,50 @@ fn authProtoFromEnv() ?usm.AuthProtocol {
 
 fn privProtoFromEnv() ?priv.PrivProtocol {
     const name = envVar("SNMP_TEST_PRIV_PROTO") orelse return .aes128_cfb;
-    if (std.mem.eql(u8, name, "des")) return .des_cbc;
-    if (std.mem.eql(u8, name, "aes")) return .aes128_cfb;
-    // net-snmp `-x` spellings: AES192/AES256 (Blumenthal), AES192C/AES256C (Cisco/Reeder).
-    if (std.mem.eql(u8, name, "AES192")) return .aes192_cfb;
-    if (std.mem.eql(u8, name, "AES256")) return .aes256_cfb;
-    if (std.mem.eql(u8, name, "AES192C")) return .aes192_cisco_cfb;
-    if (std.mem.eql(u8, name, "AES256C")) return .aes256_cisco_cfb;
+    return privProtoFromName(name);
+}
+
+/// net-snmp's `-x` table (`usm_priv_type` in `snmplib/snmpusm.c`, BSD): DES,
+/// AES, AES-128/AES128, AES-192/AES192, AES-256/AES256 and the Cisco forms
+/// AES-192-C/AES192C, AES-256-C/AES256C, matched case-insensitively
+/// (`strncasecmp`). net-snmp compares only the first `strlen(arg)` bytes, so
+/// an abbreviation ("AES-1") also matches there; this accepts exact names only.
+fn privProtoFromName(name: []const u8) ?priv.PrivProtocol {
+    const table = [_]struct { []const u8, priv.PrivProtocol }{
+        .{ "DES", .des_cbc },
+        .{ "AES", .aes128_cfb },
+        .{ "AES-128", .aes128_cfb },
+        .{ "AES128", .aes128_cfb },
+        .{ "AES-192", .aes192_cfb },
+        .{ "AES192", .aes192_cfb },
+        .{ "AES-256", .aes256_cfb },
+        .{ "AES256", .aes256_cfb },
+        .{ "AES-192-C", .aes192_cisco_cfb },
+        .{ "AES192C", .aes192_cisco_cfb },
+        .{ "AES-256-C", .aes256_cisco_cfb },
+        .{ "AES256C", .aes256_cisco_cfb },
+    };
+    for (table) |e| if (std.ascii.eqlIgnoreCase(e[0], name)) return e[1];
     return null;
+}
+
+test "privProtoFromName: every net-snmp -x spelling, any case; nothing else" {
+    try testing.expectEqual(priv.PrivProtocol.des_cbc, privProtoFromName("des").?);
+    try testing.expectEqual(priv.PrivProtocol.aes128_cfb, privProtoFromName("aes").?);
+    try testing.expectEqual(priv.PrivProtocol.aes128_cfb, privProtoFromName("AES-128").?);
+    try testing.expectEqual(priv.PrivProtocol.aes128_cfb, privProtoFromName("aes128").?);
+    try testing.expectEqual(priv.PrivProtocol.aes192_cfb, privProtoFromName("AES-192").?);
+    try testing.expectEqual(priv.PrivProtocol.aes192_cfb, privProtoFromName("AES192").?);
+    try testing.expectEqual(priv.PrivProtocol.aes256_cfb, privProtoFromName("aes-256").?);
+    try testing.expectEqual(priv.PrivProtocol.aes256_cfb, privProtoFromName("AES256").?);
+    try testing.expectEqual(priv.PrivProtocol.aes192_cisco_cfb, privProtoFromName("AES-192-C").?);
+    try testing.expectEqual(priv.PrivProtocol.aes192_cisco_cfb, privProtoFromName("aes192c").?);
+    try testing.expectEqual(priv.PrivProtocol.aes256_cisco_cfb, privProtoFromName("AES-256-C").?);
+    try testing.expectEqual(priv.PrivProtocol.aes256_cisco_cfb, privProtoFromName("AES256C").?);
+    try testing.expect(privProtoFromName("") == null);
+    try testing.expect(privProtoFromName("AES-1") == null);
+    try testing.expect(privProtoFromName("AES-192-X") == null);
+    try testing.expect(privProtoFromName("3DES") == null);
 }
 
 fn levelFromEnv() ?v3client.SecurityLevel {
