@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — Snapshot decoder: a receiver snapshot's `used` list is checked against the included dealers by count first (no bounds-dependent loop). tests: a table of single-field breakages per round for `Participant` and `ReshareReceiver` snapshots, each demanded refused. No consumer-visible change.
 - **2026-11-17** — tests: snapshot decoders refuse a claimed complaint / used-list count that does not fit the input before allocating for it (checked against a 64 KiB fixed buffer). No source change.
 - **2026-11-17** — tests: fuzz harness `dkg-snapshot-decode` (`DKG_FUZZ`; real `Participant` and `ReshareReceiver` snapshots of every round, damaged, into both decoders; what decodes re-encodes to the same octets; 200,000 runs clean in 34 s). No source change.
 - **2026-11-17** — New `dkg.snapshot` (`snapshot.zig`): `Participant` and `ReshareReceiver` gain `encodedLength()` / `toBytes(out)` / `fromBytes(allocator, bytes)`, a versioned byte format (version, kind and group tag; pending frames included) so a party that restarts mid-run resumes at any round boundary with the same group key. Fail-closed decoder (`error.InvalidState`): every length checked before allocation, trailing bytes, bad tags, non-canonical scalars, off-curve points and phase-inconsistent states refused, secrets wiped on every error path. The snapshot is plain secret bytes (the caller protects it), as in frost-core and tss-lib. No existing API changed.

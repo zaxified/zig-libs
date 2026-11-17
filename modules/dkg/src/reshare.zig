@@ -1843,3 +1843,51 @@ test "ReshareReceiver: claimed counts that do not fit the input are refused befo
     std.mem.writeInt(u32, longer[bytes.len..][0..4], 0xFFFF_FFFF, .big);
     try snapshot.expectRefusedBeforeAllocating(ReshareReceiver, longer);
 }
+
+/// A fresh receiver of a 2-of-3 to 2-of-4 resharing, for snapshot.zig's tests.
+pub fn snapshotTestReceiver(allocator: Allocator) !ReshareReceiver {
+    const old = try oldCommittee(allocator, snap_old_cfg, 0x5A9_300B);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    return ReshareReceiver.init(allocator, configFor(old, snap_old_cfg, snap_new_cfg, &.{ 1, 3 }, &xs), 1);
+}
+
+fn breakReceiver(r: *ReshareReceiver, k: usize) !void {
+    switch (k) {
+        // .complaints: an accepted share whose dealing never came
+        0 => r.bcast[1] = null,
+        // more pending frames than dealers
+        1 => for (0..3) |_| try r.outbox.append(r.allocator, .{ .to = .broadcast, .bytes = try r.allocator.dupe(u8, r.outbox.items[0].bytes) }),
+        // .done: an included dealer without its accepted share
+        2 => r.accepted[0] = null,
+        // `used` and `included` agree but fewer dealers than the old threshold
+        3 => {
+            r.included[1] = false;
+            r.used = r.used.?[0..1];
+        },
+        else => unreachable,
+    }
+}
+
+test "ReshareReceiver: each combination a run cannot produce is refused" {
+    const allocator = testing.allocator;
+    const old = try oldCommittee(allocator, snap_old_cfg, 0x5A9_300C);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    const Case = struct { stop: usize, k: usize };
+    for ([_]Case{ .{ .stop = 1, .k = 0 }, .{ .stop = 1, .k = 1 }, .{ .stop = 99, .k = 2 }, .{ .stop = 99, .k = 3 } }) |c| {
+        var rig = try snapRig(old, &xs, bendShare1to2, false, c.stop, 0x5A9_300D);
+        defer rig.deinit();
+        const bytes = try snapR(&rig.receivers[1]);
+        defer freeSnapR(bytes);
+        var q = try ReshareReceiver.fromBytes(testing.allocator, bytes);
+        defer q.deinit();
+        try breakReceiver(&q, c.k);
+        const again = try snapR(&q);
+        defer freeSnapR(again);
+        testing.expectError(error.InvalidState, ReshareReceiver.fromBytes(testing.allocator, again)) catch |e| {
+            std.debug.print("receiver case {d} was not refused\n", .{c.k});
+            return e;
+        };
+    }
+}

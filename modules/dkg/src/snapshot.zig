@@ -742,14 +742,16 @@ fn validateReceiver(rr: *const ReshareReceiver) error{InvalidState}!void {
         const used = rr.used orelse return error.InvalidState;
         if (fk.len != rr.rc.new.t or used.len < rr.rc.old.t) return error.InvalidState;
         // `used` is exactly the included dealers, in dealer order.
+        var included: usize = 0;
+        for (rr.included) |i| included += @intFromBool(i);
+        if (included != used.len) return error.InvalidState;
         var w: usize = 0;
         for (0..nd) |pos| {
             if (!rr.included[pos]) continue;
             if (rr.bcast[pos] == null or rr.accepted[pos] == null) return error.InvalidState;
-            if (w >= used.len or used[w] != rr.rc.dealers[pos]) return error.InvalidState;
+            if (used[w] != rr.rc.dealers[pos]) return error.InvalidState;
             w += 1;
         }
-        if (w != used.len) return error.InvalidState;
         if (!bytesEq(res.group_public_key.toBytes(), rr.rc.group_public_key.toBytes())) return error.InvalidState;
         try checkResult(res, fk, rr.me);
     } else if (rr.result != null or rr.commitments_ != null or rr.used != null) {
@@ -1231,6 +1233,207 @@ test "Participant: a claimed complaint count that does not fit the input is refu
     // The tail of a never-started party: complaint count, outbox count, three flags.
     std.mem.writeInt(u32, bytes[bytes.len - 11 ..][0..4], 0xFFFF_FFFF, .big);
     try expectRefusedBeforeAllocating(Participant, bytes);
+}
+
+fn someElements(p: *Participant) ![]Element {
+    const e = try p.arena.allocator().alloc(Element, p.cfg.t);
+    @memset(e, commit.pedersenH());
+    return e;
+}
+
+fn someOutput(p: *const Participant) types.DkgShareOutput {
+    return .{ .index = p.me, .secret_share = Scalar.one, .group_public_key = commit.pedersenH(), .verifying_share = commit.pedersenH() };
+}
+
+fn addComplaint(p: *Participant, complainant: u32, accused: u32, valid: bool, seen: bool) !void {
+    const aa = p.arena.allocator();
+    try p.complaints.append(aa, .{ .complainant = complainant, .accused = accused });
+    try p.defense_valid.append(aa, valid);
+    try p.defense_seen.append(aa, seen);
+}
+
+fn shareFrame(p: *Participant) *Outgoing {
+    for (p.outbox.items) |*m| switch (m.to) {
+        .party => return m,
+        .broadcast => {},
+    };
+    unreachable;
+}
+
+/// Decode a valid snapshot, break one field, and demand that the broken state
+/// is refused (each case violates exactly the rule it is named after).
+fn expectBrokenRefused(bytes: []const u8, breakIt: *const fn (*Participant, usize) anyerror!void, cases: usize) !void {
+    for (0..cases) |k| {
+        var q = try Participant.fromBytes(testing.allocator, bytes);
+        defer q.deinit();
+        try breakIt(&q, k);
+        const again = try snap(&q);
+        defer freeSnap(again);
+        testing.expectError(error.InvalidState, Participant.fromBytes(testing.allocator, again)) catch |e| {
+            std.debug.print("case {d} was not refused\n", .{k});
+            return e;
+        };
+    }
+}
+
+fn breakNew(p: *Participant, k: usize) anyerror!void {
+    switch (k) {
+        0 => p.ped[1] = try someElements(p),
+        1 => p.fel[1] = try someElements(p),
+        2 => p.wire_s[1] = Scalar.one,
+        3 => p.wire_sp[1] = Scalar.one,
+        4 => p.accepted[1] = Scalar.one,
+        5 => p.accepted_sp[1] = Scalar.one,
+        6 => p.recovered[1] = p.a,
+        7 => p.present[0] = true,
+        8 => p.qualified[0] = true,
+        9 => p.exposed[0] = true,
+        10 => try addComplaint(p, 1, 2, false, false),
+        11 => try p.outbox.append(p.allocator, .{ .to = .broadcast, .bytes = try p.allocator.dupe(u8, "x") }),
+        12 => p.result = someOutput(p),
+        13 => p.group_commitments = try someElements(p),
+        14 => p.culprit_ = 1,
+        15 => p.revealed[0] = Scalar.one,
+        else => unreachable,
+    }
+}
+
+fn breakShares(p: *Participant, k: usize) anyerror!void {
+    switch (k) {
+        0 => p.present[0] = false,
+        1 => p.accepted_sp[0] = Scalar.one,
+        2 => p.accepted_sp[1] = Scalar.one,
+        3 => p.ped[0].?[0] = p.ped[0].?[1],
+        4 => p.fel[0].?[0] = p.fel[0].?[1],
+        5 => p.accepted[0] = Scalar.one,
+        6 => shareFrame(p).bytes[0] = 0,
+        7 => shareFrame(p).bytes[0] = 255,
+        8 => shareFrame(p).to = .{ .party = 0 },
+        9 => {
+            const m = shareFrame(p);
+            p.allocator.free(m.bytes);
+            m.bytes = try p.allocator.alloc(u8, 0);
+        },
+        10 => {
+            p.phase_ = .aborted;
+            p.result = someOutput(p);
+        },
+        11 => {
+            p.phase_ = .aborted;
+            p.group_commitments = try someElements(p);
+        },
+        else => unreachable,
+    }
+}
+
+fn breakComplaints(p: *Participant, k: usize) anyerror!void {
+    switch (k) {
+        0 => p.present[1] = !p.present[1],
+        1 => p.accepted_sp[1] = null,
+        2 => {
+            p.ped[1] = null;
+            p.present[1] = false;
+        },
+        else => unreachable,
+    }
+}
+
+fn breakComplaintHeld(p: *Participant, k: usize) anyerror!void {
+    switch (k) {
+        0 => p.defense_seen.items[0] = true,
+        1 => p.defense_valid.items[0] = true,
+        else => unreachable,
+    }
+}
+
+fn breakDefenses(p: *Participant, k: usize) anyerror!void {
+    switch (k) {
+        0 => {
+            p.defense_valid.items[0] = true;
+            p.defense_seen.items[0] = false;
+        },
+        1 => try addComplaint(p, 1, 0, false, false),
+        2 => try addComplaint(p, 1, 4, false, false),
+        3 => p.fel[1] = try someElements(p),
+        else => unreachable,
+    }
+}
+
+fn breakFeldman(p: *Participant, k: usize) anyerror!void {
+    switch (k) {
+        0 => {
+            p.accepted[1] = null;
+            p.accepted_sp[1] = null;
+        },
+        1 => {
+            p.qualified[1] = false;
+            p.fel[1] = try someElements(p);
+        },
+        2 => p.exposed[1] = true,
+        else => unreachable,
+    }
+}
+
+fn breakReveals(p: *Participant, k: usize) anyerror!void {
+    switch (k) {
+        0 => {
+            p.qualified[1] = false;
+            p.fel[1] = null;
+        },
+        1 => p.exposed[0] = true,
+        2 => {
+            p.exposed[1] = false;
+            for (p.revealed[3..6]) |*s| s.* = null;
+        },
+        else => unreachable,
+    }
+}
+
+test "Participant: each field a run cannot combine is refused, round by round" {
+    var prng = std.Random.DefaultPrng.init(0x5A9_2002);
+    var fresh = try Participant.init(testing.allocator, .{ .t = 2, .n = 3 }, 1, prng.random());
+    defer fresh.deinit();
+    {
+        const bytes = try snap(&fresh);
+        defer freeSnap(bytes);
+        try expectBrokenRefused(bytes, breakNew, 16);
+    }
+    const Case = struct { steps: usize, hold: bool, f: *const fn (*Participant, usize) anyerror!void, cases: usize };
+    const table = [_]Case{
+        .{ .steps = 0, .hold = false, .f = breakShares, .cases = 12 },
+        .{ .steps = 1, .hold = false, .f = breakComplaints, .cases = 3 },
+        .{ .steps = 1, .hold = true, .f = breakComplaintHeld, .cases = 2 },
+        .{ .steps = 2, .hold = false, .f = breakDefenses, .cases = 4 },
+        .{ .steps = 3, .hold = false, .f = breakFeldman, .cases = 3 },
+        .{ .steps = 5, .hold = false, .f = breakReveals, .cases = 3 },
+    };
+    inline for (table) |c| {
+        var net = try world(c.steps);
+        defer net.deinit();
+        if (c.hold) try net.deliverAll(); // party 1 holds party 3's complaint while still in `.complaints`
+        const p = &net.parties[0];
+        const bytes = try snap(p);
+        defer freeSnap(bytes);
+        // the unbroken state is accepted
+        var ok = try Participant.fromBytes(testing.allocator, bytes);
+        ok.deinit();
+        try expectBrokenRefused(bytes, c.f, c.cases);
+    }
+}
+
+test "ReshareReceiver snapshot: NoSpaceLeft below encodedLength" {
+    var buf: [4096]u8 = undefined;
+    const old = try reshare_test_receiver(testing.allocator);
+    var r = old;
+    defer r.deinit();
+    const len = r.encodedLength();
+    try testing.expect(len < buf.len);
+    try testing.expectError(error.NoSpaceLeft, r.toBytes(buf[0 .. len - 1]));
+    try testing.expectEqual(len, (try r.toBytes(&buf)).len);
+}
+
+fn reshare_test_receiver(allocator: Allocator) !ReshareReceiver {
+    return reshare.snapshotTestReceiver(allocator);
 }
 
 // ── fuzz: the decoders never panic, leak or accept a non-canonical input ──
