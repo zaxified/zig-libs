@@ -1003,7 +1003,7 @@ pub const Connection12 = struct {
         }
 
         // ClientKeyExchange + premaster.
-        var pms: [2 + 80 + 2 + max_psk_len]u8 = undefined;
+        var pms: [2 + @max(80, max_psk_len) + 2 + max_psk_len]u8 = undefined;
         defer std.crypto.secureZero(u8, &pms);
         var pms_len: usize = 0;
         var cke_len: usize = 0;
@@ -1283,7 +1283,7 @@ pub const Connection12 = struct {
             std.crypto.secureZero(u8, &self.ecdhe_secret);
             self.ecdhe_live = false;
         } else if (rest.len != 0) return error.Malformed;
-        var pms: [2 + 80 + 2 + max_psk_len]u8 = undefined;
+        var pms: [2 + @max(80, max_psk_len) + 2 + max_psk_len]u8 = undefined;
         defer std.crypto.secureZero(u8, &pms);
         const n = try self.premaster(if (self.kx.usesEcdhe()) z.slice() else null, &pms);
         self.deriveKeys(pms[0..n]);
