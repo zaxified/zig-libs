@@ -259,6 +259,13 @@ shared by several fields, and inside another dictionary's values (the `nested_di
 lists whose items are dictionary-encoded reads as a `list` of `categorical`) — the inner one is decoded first, as
 Arrow C++ resolves it. Deltas (`isDelta`) extend a dictionary; a delta for a dictionary not yet sent is
 `error.Malformed` (Arrow C++ `DictionaryMemo::AddDictionaryDelta` and arrow-rs `update_dictionaries` refuse it).
+A record batch whose dictionary-encoded column has a valid (non-null) index before any `DictionaryBatch` for that
+id is `error.Malformed` (2026-11-17; it used to be read against the first dictionary that came later): Arrow C++
+26.0.1 refuses every record batch before the initial dictionaries (`reader.cc`, "IPC stream did not have the
+expected number (N) of dictionaries at the start of the stream"), arrow-rs 60.1.0 stands in an empty dictionary
+(`reader.rs`, "dictionary batches may be omitted when all values in the column are null") whose bounds check then
+refuses the index. Both refuse it; an all-null batch there is read, as arrow-rs and the columnar spec allow (C++ is
+stricter).
 
 *Replacement.* In a STREAM a non-delta `DictionaryBatch` for an id already seen replaces the dictionary
 (Columnar.rst, "IPC Streaming Format"): the record batches read before it keep indexing the old one, those after it
@@ -329,7 +336,8 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
   children, and the children's own dictionary encodings: id, index type, order); each keeps its own index type.
   Different value types are `Malformed`; one dictionary with two `isOrdered` flags is `Unsupported`. A dictionary
   inside its own values (a cycle through the ids) is `Malformed`.
-- **Dictionary batches**: a delta before the dictionary's first batch, a replacement in a file → `Malformed`.
+- **Dictionary batches**: a delta before the dictionary's first batch, a replacement in a file, a valid index in a
+  record batch before its dictionary's first batch → `Malformed`.
 - `dataframe` keeps list offsets in `u32`: more than 2^32 − 1 elements in one list column → `Unsupported`; the
   writer's Int32 list offsets refuse more than 2^31 − 1 elements in one batch.
 - **Values `dataframe` cannot hold, or holds only inexactly** fail the whole read with `error.Unsupported` by

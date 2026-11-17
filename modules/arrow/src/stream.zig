@@ -888,12 +888,15 @@ const RDict = struct {
     /// While its value field is planned: a dictionary inside its own values is a cycle.
     planning: bool = false,
 
-    /// The generation a batch read at `seq` indexes: the latest one begun by then, or the
-    /// first when the batch came before any (a stream may send an all-null batch before
-    /// the dictionary; the columnar spec allows it); null without any DictionaryBatch.
+    /// The generation a batch read at `seq` indexes: the latest one begun by then; null
+    /// when none was begun by then. Such a batch is read only if its indices are all null
+    /// (the columnar spec lets a stream send an all-null batch before the dictionary);
+    /// a valid index there is `error.Malformed`, as Arrow C++ (a record batch before the
+    /// initial dictionaries is `Invalid`) and arrow-rs (an empty dictionary, so the index
+    /// is out of bounds) refuse it.
     fn genAt(d: *const RDict, seq: u64) ?usize {
         const gs = d.gens.items;
-        if (gs.len == 0) return null;
+        if (gs.len == 0 or gs[0].seq > seq) return null;
         var lo: usize = 0;
         var hi: usize = gs.len;
         while (hi - lo > 1) {

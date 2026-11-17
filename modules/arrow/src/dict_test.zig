@@ -244,6 +244,40 @@ test "replacement: a non-text dictionary, an index past the CURRENT dictionary, 
         try expectTexts(f, 0, &.{ null, "c", "z" });
         try expectCategories(f.columnAt(0).categorical, &.{ "a", "b", "c", "z" });
     }
+    {
+        // A valid index before the dictionary is Malformed (Arrow C++ refuses any record
+        // batch before the initial dictionaries, arrow-rs an index into the empty one it
+        // stands in); it used to be read against the first dictionary that came later.
+        // Index 0 too, and when another dictionary came first.
+        inline for (.{ 0, 2 }) |x| {
+            const first: st.HandBatch = .{ .length = 1, .nodes = &.{one}, .bufs = &.{ "", bytesOf(i32, &.{x}) } };
+            const bytes = try st.hand(gpa, &fields, &.{ first, abc, row2 });
+            defer gpa.free(bytes);
+            try testing.expectError(error.Malformed, stream.readStream(a, bytes, .{}));
+        }
+        const two_fields = [_]schema.Field{
+            .{ .name = "c", .type = .utf8, .dictionary = .{ .id = 0 } },
+            .{ .name = "d", .type = .utf8, .dictionary = .{ .id = 1 } },
+        };
+        const both: st.HandBatch = .{ .length = 1, .nodes = &.{ one, one }, .bufs = &.{ "", bytesOf(i32, &.{0}), "", bytesOf(i32, &.{0}) } };
+        const d1 = textDict(1, false, one, bytesOf(i32, &.{ 0, 1 }), "q");
+        const early = try st.hand(gpa, &two_fields, &.{ z, both, d1, both });
+        defer gpa.free(early);
+        try testing.expectError(error.Malformed, stream.readStream(a, early, .{}));
+        // The same batch after both dictionaries reads.
+        const late = try st.hand(gpa, &two_fields, &.{ z, d1, both });
+        defer gpa.free(late);
+        const f = try stream.readStream(a, late, .{});
+        try expectTexts(f, 0, &.{"z"});
+        try expectTexts(f, 1, &.{"q"});
+        // The column without a dictionary yet, all null: read.
+        const half: st.HandBatch = .{ .length = 1, .nodes = &.{ one, .{ .length = 1, .null_count = 1 } }, .bufs = &.{ "", bytesOf(i32, &.{0}), &.{0}, bytesOf(i32, &.{0}) } };
+        const ok = try st.hand(gpa, &two_fields, &.{ z, half, d1 });
+        defer gpa.free(ok);
+        const g = try stream.readStream(a, ok, .{});
+        try expectTexts(g, 0, &.{"z"});
+        try expectTexts(g, 1, &.{null});
+    }
 }
 
 test "replacement: projection reads a replaced dictionary only for the columns that use it" {
