@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 **Where we are ahead:** of the Go and Rust libraries, CAKE and `mq` with the full option set,
 the psched rate tables done the way `tc` does (byte-exact goldens diffed against the real `tc`
 6.19), the standalone action table, hexadecimal handles and 64-bit rates; and it is the only
-Zig option. **Where we are behind:** the common classic qdiscs, eBPF-object `bpf`
+Zig option. **Where we are behind:** `hfsc`/`red`, eBPF-object `bpf`
 filters and `pedit`/`tunnel_key`/`connmark` (→ Backlog; all reachable via the `raw`
 escape hatches). `ingress`/`clsact` are typed since 2026-11-17. Statistics on qdisc/class dumps (`tc -s`) are decoded since 2026-11-17.
 
@@ -428,7 +428,7 @@ caller-supplied rate/size can panic in ReleaseSafe or wrap in ReleaseFast.
 - **flower beyond L2–L4 basics**: MAC addresses, VLAN/CVLAN, MPLS, tunnel keys, ARP,
   ICMP type/code, TCP flags, IP TOS/TTL, ct state, port ranges, `TCA_FLOWER_INDEV`. The
   `skip_hw`/`skip_sw` bits are settable via `Flower.flags` but untested against hardware.
-- **Other qdiscs**: hfsc, prio, sfq, red, codel, pfifo/bfifo. `QdiscSpec.raw` covers them if you encode the options yourself. (`mq` and `cake`
+- **Other qdiscs**: hfsc and red. `QdiscSpec.raw` covers them if you encode the options yourself. (`mq` and `cake`
   are now modelled — see the "mq carries no options" section.)
 - **CAKE knobs not modelled**: the built-in RTT/bandwidth *presets* (`datacentre`, `lan`,
   `metro`, `regional`, `internet`, `oceanic`, `satellite`) — these are just CLI shorthands
@@ -461,7 +461,7 @@ reachable through `raw` today:
 2. ✅ 2026-11-17 **Statistics on qdisc/class dumps** (survey 2026-09-30) — `Qdisc.stats`/`Class.stats: ?Stats` from `TCA_STATS2` (basic, queue, rate estimators, `PKT64`, `BASIC_HW`) with the legacy `TCA_STATS` as fallback; `Qdisc.fq_codel_xstats` from `TCA_XSTATS`. A sub-attribute shorter than its struct is skipped like other optional attributes (stats stay null if nothing valid decoded); a malformed nest is a codec error. Layouts from the local UAPI headers.
 3. ✅ 2026-11-17 (`matchall`, and `bpf` with an inline classic-BPF program) **`matchall` and `bpf` classifiers** (survey 2026-09-30) — `FilterSpec.matchall` (classid, action list, `skip_sw`/`skip_hw` flags) and `FilterSpec.bpf` (`ops` classic-BPF instructions, classid, actions, `direct_action`, `flags_gen`), `Filter.matchall`/`.bpf` on dumps. 12 byte-exact goldens from iproute2 6.19.0 (`tc filter add ... matchall ...` / `bpf bytecode ...`), attribute order read off them: matchall CLASSID, ACT, FLAGS; bpf CLASSID, ACT, OPS_LEN, OPS, FLAGS_GEN, FLAGS. **Not done:** the eBPF forms `bpf obj|fd|pinned` — `tc` loads the object through `bpf(2)`, which an unprivileged network namespace refuses, so no golden could be captured (`FilterSpec.raw` covers them). A bare `matchall` has no golden either: stock `tc` sends no `TCA_OPTIONS` and the kernel rejects it (EINVAL); this module sends an empty options nest for it, unverified against a kernel.
 4. **`pedit`, `tunnel_key`, `connmark`, `csum`, `sample`, `ct`** (survey 2026-09-30) — header rewrite and tunnel actions used by most SDN-style setups; vishvananda has them. Effort: medium each (`pedit` largest).
-5. **Classic qdiscs `prio`, `sfq`, `hfsc`, `red`, `codel`, `fq`, `pfifo`/`bfifo`** (survey 2026-09-30) — Effort: small each.
+5. ✅ 2026-11-17 (`prio`, `pfifo`/`bfifo`, `sfq`, `codel`, `fq`; **still open: `hfsc`, `red`**) **Classic qdiscs `prio`, `sfq`, `hfsc`, `red`, `codel`, `fq`, `pfifo`/`bfifo`** (survey 2026-09-30) — `QdiscSpec.prio` / `.pfifo` / `.bfifo` / `.sfq` / `.codel` / `.fq`, and `Qdisc.prio` / `.fifo` / `.sfq` / `.codel` / `.fq` on dumps. 20 byte-exact goldens from iproute2 6.19.0 (`tc qdisc add ... prio|pfifo|bfifo|sfq|codel|fq ...`), attribute order read off them. Wire facts the goldens pinned: `prio` is a `tc_prio_qopt` struct followed by an attribute of type `TCA_OPTIONS` (empty, or holding `TCA_PRIO_MQ` for `multiqueue`); `pfifo`/`bfifo` are one `u32`, and with no `limit` (like a bare `sfq`) `tc` sends no `TCA_OPTIONS` at all; any `sfq` option sends the whole 72-octet `tc_sfq_qopt_v1`; `fq maxrate`/`low_rate_threshold` are `u32` bytes per second and `buckets` goes out as `BUCKETS_LOG` (first). Not done inside these kinds: `sfq` RED's `wlog`/`plog`/`scell_log` are caller-supplied wire fields (`tc` derives them from `burst`/`avpkt`; the formula is not reproduced), `fq buckets` is taken as its log2, `fq`'s `defrate` (`FLOW_DEFAULT_RATE`, absent from iproute2 6.19's usage) and `fq` priomap `bands` other than 3, `codel`'s CE-threshold selector/mask, and `pfifo_fast`/`pfifo_head_drop`.
 6. **netem distributions and GI/GE loss models** (survey 2026-09-30) — needs the distribution table; matters for realistic impairment. Effort: medium.
 7. **Chains and `TC_ACT_GOTO_CHAIN`, rtnetlink event monitor** (survey 2026-09-30) — Effort: medium.
 

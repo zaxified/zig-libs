@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Qdisc and class option encoding/decoding: the kind-specific `TCA_OPTIONS`
-//! payloads for **netem**, **htb**, **tbf** and **fq_codel**.
+//! payloads for **netem**, **htb**, **tbf**, **fq_codel**, **cake**, **prio**,
+//! **pfifo**/**bfifo**, **sfq**, **codel** and **fq**.
 //!
 //! Everything here is pure: a spec struct in ergonomic units goes in, wire
 //! bytes come out, and a `TCA_OPTIONS` payload read back from a dump decodes
@@ -122,6 +123,42 @@ pub const TCA_FQ_CODEL = struct {
     pub const CE_THRESHOLD_MASK: u16 = 11;
 };
 
+/// codel attribute types (linux/pkt_sched.h `TCA_CODEL_*`).
+pub const TCA_CODEL = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const TARGET: u16 = 1;
+    pub const LIMIT: u16 = 2;
+    pub const INTERVAL: u16 = 3;
+    pub const ECN: u16 = 4;
+    pub const CE_THRESHOLD: u16 = 5;
+};
+
+/// fq attribute types (linux/pkt_sched.h `TCA_FQ_*`).
+pub const TCA_FQ = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const PLIMIT: u16 = 1;
+    pub const FLOW_PLIMIT: u16 = 2;
+    pub const QUANTUM: u16 = 3;
+    pub const INITIAL_QUANTUM: u16 = 4;
+    pub const RATE_ENABLE: u16 = 5;
+    pub const FLOW_DEFAULT_RATE: u16 = 6;
+    pub const FLOW_MAX_RATE: u16 = 7;
+    pub const BUCKETS_LOG: u16 = 8;
+    pub const FLOW_REFILL_DELAY: u16 = 9;
+    pub const ORPHAN_MASK: u16 = 10;
+    pub const LOW_RATE_THRESHOLD: u16 = 11;
+    pub const CE_THRESHOLD: u16 = 12;
+    pub const TIMER_SLACK: u16 = 13;
+    pub const HORIZON: u16 = 14;
+    pub const HORIZON_DROP: u16 = 15;
+    pub const PRIO: u16 = 16;
+    pub const WEIGHTS: u16 = 17;
+    pub const OFFLOAD_HORIZON: u16 = 18;
+};
+
+/// prio's nested attribute (`TCA_PRIO_MQ`).
+pub const TCA_PRIO_MQ: u16 = 1;
+
 /// cake attribute types (linux/pkt_sched.h `TCA_CAKE_*`).
 pub const TCA_CAKE = struct {
     pub const UNSPEC: u16 = 0;
@@ -153,6 +190,12 @@ pub const kind_mq = "mq";
 pub const kind_ingress = "ingress";
 pub const kind_clsact = "clsact";
 pub const kind_cake = "cake";
+pub const kind_prio = "prio";
+pub const kind_pfifo = "pfifo";
+pub const kind_bfifo = "bfifo";
+pub const kind_sfq = "sfq";
+pub const kind_codel = "codel";
+pub const kind_fq = "fq";
 
 /// `sizeof(struct tc_netem_qopt)`.
 pub const tc_netem_qopt_len = 24;
@@ -188,6 +231,8 @@ pub const EncodeError = std.mem.Allocator.Error || error{
     /// `cell_log`/`ccell_log` outside `[0, ratespec.max_cell_log]` — see
     /// `ratespec.checkCellLog`.
     InvalidCellLog,
+    /// A `prio` qdisc with `bands` outside `[2, 16]` or a priomap entry `>= bands`.
+    InvalidPrioBands,
 };
 
 // ── netem ───────────────────────────────────────────────────────────────────
@@ -1052,6 +1097,381 @@ pub fn parseCakeOptions(data: []const u8) codec.Error!CakeWire {
     return cw;
 }
 
+// ── classic qdiscs: prio, pfifo/bfifo, sfq, codel, fq ───────────────────────
+//
+// Layouts read off byte-exact goldens from iproute2 6.19.0 (`goldens.zig`).
+
+/// An attribute whose payload is a few octets, so it cannot overflow the 16-bit length.
+fn appendSmallAttr(gpa: std.mem.Allocator, list: *std.ArrayList(u8), attr_type: u16, data: []const u8) std.mem.Allocator.Error!void {
+    codec.appendAttr(gpa, list, attr_type, data) catch |err| switch (err) {
+        error.AttrTooLong => unreachable,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// `TC_PRIO_MAX + 1`: the size of a priomap.
+pub const prio_map_len = 16;
+/// The priomap `tc` sends when none is given (`TC_PRIO_*` → band).
+pub const prio_default_map: [prio_map_len]u8 = .{ 1, 2, 2, 2, 1, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 };
+
+/// The strict-priority qdisc. The payload is `struct tc_prio_qopt` (bands as a
+/// native `i32`, then the 16-octet priomap) followed by an attribute of type
+/// `TCA_OPTIONS` that `tc` always appends; it is empty, or holds the empty
+/// `TCA_PRIO_MQ` flag for `multiqueue`.
+pub const Prio = struct {
+    /// `bands N`, 2..16 (`tc` default 3).
+    bands: u8 = 3,
+    /// `priomap P0 … P15`: the band of each of the 16 `TC_PRIO_*` values; each
+    /// must be below `bands`.
+    priomap: [prio_map_len]u8 = prio_default_map,
+    /// `multiqueue`: map bands to the device's hardware queues (`TCA_PRIO_MQ`).
+    multiqueue: bool = false,
+};
+
+/// Wire readback of a prio qdisc's options.
+pub const PrioWire = struct {
+    bands: u32,
+    priomap: [prio_map_len]u8,
+};
+
+fn appendPrioQopt(list: *std.ArrayList(u8), gpa: std.mem.Allocator, bands: u32, priomap: [prio_map_len]u8) std.mem.Allocator.Error!void {
+    var raw: [4]u8 = undefined;
+    std.mem.writeInt(u32, &raw, bands, native_endian);
+    try list.appendSlice(gpa, &raw);
+    try list.appendSlice(gpa, &priomap);
+}
+
+fn appendPrioOptions(p: Prio, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    if (p.bands < 2 or p.bands > prio_map_len) return error.InvalidPrioBands;
+    for (p.priomap) |b| if (b >= p.bands) return error.InvalidPrioBands;
+    try appendPrioQopt(list, gpa, p.bands, p.priomap);
+    const nest = try codec.nestBegin(gpa, list, TCA.OPTIONS);
+    if (p.multiqueue) try appendSmallAttr(gpa, list, TCA_PRIO_MQ, &.{});
+    codec.nestEnd(list, nest) catch return error.OptionsTooLong;
+}
+
+/// Null when the payload is shorter than `struct tc_prio_qopt` (skipped like any
+/// other optional attribute; the kernel never sends one).
+pub fn parsePrioOptions(data: []const u8) ?PrioWire {
+    if (data.len < 4 + prio_map_len) return null;
+    return .{
+        .bands = std.mem.readInt(u32, data[0..4], native_endian),
+        .priomap = data[4..][0..prio_map_len].*,
+    };
+}
+
+/// A packet-count FIFO (`pfifo`) or byte-count FIFO (`bfifo`) — the same
+/// options (`struct tc_fifo_qopt`, one `u32`), distinguished by the kind.
+/// With no `limit` `tc` sends no `TCA_OPTIONS` at all (`carriesOptions`).
+pub const Fifo = struct {
+    /// `limit N`: packets for `pfifo`, bytes for `bfifo`.
+    limit: ?u32 = null,
+};
+
+/// Wire readback of a pfifo/bfifo qdisc's options.
+pub const FifoWire = struct { limit: u32 };
+
+fn appendFifoOptions(f: Fifo, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) std.mem.Allocator.Error!void {
+    var raw: [4]u8 = undefined;
+    std.mem.writeInt(u32, &raw, f.limit orelse 0, native_endian);
+    try list.appendSlice(gpa, &raw);
+}
+
+/// Null when the payload is shorter than `struct tc_fifo_qopt`.
+pub fn parseFifoOptions(data: []const u8) ?FifoWire {
+    if (data.len < 4) return null;
+    return .{ .limit = std.mem.readInt(u32, data[0..4], native_endian) };
+}
+
+/// `sizeof(struct tc_sfq_qopt_v1)`: the 20-octet v0 part (quantum, perturb,
+/// limit, divisor, flows), depth and headdrop, the RED extension and the
+/// trailing `tc_sfqred_stats`.
+pub const tc_sfq_qopt_v1_len = 72;
+
+/// The RED part of `sfq` (`redflowlimit`/`min`/`max`/`avpkt`/`burst`/
+/// `probability`/`ecn`/`harddrop`), as the **wire fields** of
+/// `struct tc_sfq_qopt_v1`. `tc` derives `wlog`, `plog` and `scell_log` from
+/// `burst`/`avpkt`/`min`/`max`; this module does not, so the caller supplies
+/// them (the golden shows `burst 55 avpkt 1000 min 30000 max 90000 probability
+/// 0.4` as 5, 18, 0 and `max_p` = 0x66666666).
+pub const SfqRed = struct {
+    /// `redflowlimit` (`limit` in `struct tc_sfq_qopt_v1`).
+    flow_limit: u32 = 0,
+    qth_min: u32 = 0,
+    qth_max: u32 = 0,
+    wlog: u8 = 0,
+    plog: u8 = 0,
+    scell_log: u8 = 0,
+    /// `TC_RED_ECN` = 1, `TC_RED_HARDDROP` = 2, `TC_RED_ADAPTATIVE` = 4.
+    flags: u8 = 0,
+    /// `probability` as a fraction of 2^32.
+    max_p: u32 = 0,
+};
+
+/// Stochastic fairness queueing. Every field is optional; with none set `tc`
+/// sends no `TCA_OPTIONS`, with any set it sends the whole 72-octet
+/// `tc_sfq_qopt_v1`, unset fields as 0.
+pub const Sfq = struct {
+    quantum: ?u32 = null,
+    /// `perturb SECONDS`.
+    perturb_s: ?i32 = null,
+    limit: ?u32 = null,
+    divisor: ?u32 = null,
+    flows: ?u32 = null,
+    depth: ?u32 = null,
+    headdrop: ?bool = null,
+    red: ?SfqRed = null,
+};
+
+/// Wire readback of an sfq qdisc's options (the fields this module models).
+pub const SfqWire = struct {
+    quantum: u32,
+    perturb_s: i32,
+    limit: u32,
+    divisor: u32,
+    flows: u32,
+    /// Absent when the payload is the 20-octet v0 form.
+    depth: ?u32 = null,
+    headdrop: ?u32 = null,
+    red: ?SfqRed = null,
+};
+
+fn sfqAnySet(q: Sfq) bool {
+    return q.quantum != null or q.perturb_s != null or q.limit != null or q.divisor != null or
+        q.flows != null or q.depth != null or q.headdrop != null or q.red != null;
+}
+
+fn appendSfqOptions(q: Sfq, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) std.mem.Allocator.Error!void {
+    var raw: [tc_sfq_qopt_v1_len]u8 = @splat(0);
+    std.mem.writeInt(u32, raw[0..4], q.quantum orelse 0, native_endian);
+    std.mem.writeInt(i32, raw[4..8], q.perturb_s orelse 0, native_endian);
+    std.mem.writeInt(u32, raw[8..12], q.limit orelse 0, native_endian);
+    std.mem.writeInt(u32, raw[12..16], q.divisor orelse 0, native_endian);
+    std.mem.writeInt(u32, raw[16..20], q.flows orelse 0, native_endian);
+    std.mem.writeInt(u32, raw[20..24], q.depth orelse 0, native_endian);
+    std.mem.writeInt(u32, raw[24..28], @intFromBool(q.headdrop orelse false), native_endian);
+    if (q.red) |r| {
+        std.mem.writeInt(u32, raw[28..32], r.flow_limit, native_endian);
+        std.mem.writeInt(u32, raw[32..36], r.qth_min, native_endian);
+        std.mem.writeInt(u32, raw[36..40], r.qth_max, native_endian);
+        raw[40] = r.wlog;
+        raw[41] = r.plog;
+        raw[42] = r.scell_log;
+        raw[43] = r.flags;
+        std.mem.writeInt(u32, raw[44..48], r.max_p, native_endian);
+    }
+    try list.appendSlice(gpa, &raw);
+}
+
+/// Null when the payload is shorter than the 20-octet v0 `tc_sfq_qopt`.
+pub fn parseSfqOptions(data: []const u8) ?SfqWire {
+    if (data.len < 20) return null;
+    var w: SfqWire = .{
+        .quantum = std.mem.readInt(u32, data[0..4], native_endian),
+        .perturb_s = std.mem.readInt(i32, data[4..8], native_endian),
+        .limit = std.mem.readInt(u32, data[8..12], native_endian),
+        .divisor = std.mem.readInt(u32, data[12..16], native_endian),
+        .flows = std.mem.readInt(u32, data[16..20], native_endian),
+    };
+    if (data.len >= 28) {
+        w.depth = std.mem.readInt(u32, data[20..24], native_endian);
+        w.headdrop = std.mem.readInt(u32, data[24..28], native_endian);
+    }
+    if (data.len >= 48) w.red = .{
+        .flow_limit = std.mem.readInt(u32, data[28..32], native_endian),
+        .qth_min = std.mem.readInt(u32, data[32..36], native_endian),
+        .qth_max = std.mem.readInt(u32, data[36..40], native_endian),
+        .wlog = data[40],
+        .plog = data[41],
+        .scell_log = data[42],
+        .flags = data[43],
+        .max_p = std.mem.readInt(u32, data[44..48], native_endian),
+    };
+    return w;
+}
+
+/// Controlled-delay AQM. Every field is optional (`null` omits the attribute);
+/// `tc codel` with nothing sends an empty options nest.
+pub const Codel = struct {
+    /// Hard packet limit (`limit`).
+    limit: ?u32 = null,
+    /// `interval`, microseconds.
+    interval_us: ?u32 = null,
+    /// `target`, microseconds.
+    target_us: ?u32 = null,
+    /// `ecn` / `noecn`.
+    ecn: ?bool = null,
+    /// `ce_threshold`, microseconds.
+    ce_threshold_us: ?u32 = null,
+};
+
+/// Wire readback of a codel qdisc's options.
+pub const CodelWire = struct {
+    limit: ?u32 = null,
+    interval_us: ?u32 = null,
+    target_us: ?u32 = null,
+    ecn: ?u32 = null,
+    ce_threshold_us: ?u32 = null,
+};
+
+fn appendCodelOptions(c: Codel, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    // Order of the goldens: LIMIT, INTERVAL, TARGET, ECN, CE_THRESHOLD.
+    if (c.limit) |v| try codec.appendAttrU32(gpa, list, TCA_CODEL.LIMIT, v);
+    if (c.interval_us) |v| try codec.appendAttrU32(gpa, list, TCA_CODEL.INTERVAL, v);
+    if (c.target_us) |v| try codec.appendAttrU32(gpa, list, TCA_CODEL.TARGET, v);
+    if (c.ecn) |v| try codec.appendAttrU32(gpa, list, TCA_CODEL.ECN, @intFromBool(v));
+    if (c.ce_threshold_us) |v| try codec.appendAttrU32(gpa, list, TCA_CODEL.CE_THRESHOLD, v);
+}
+
+pub fn parseCodelOptions(data: []const u8) codec.Error!CodelWire {
+    var w: CodelWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| {
+        if (a.data.len != 4) continue;
+        const v = std.mem.readInt(u32, a.data[0..4], native_endian);
+        switch (a.type) {
+            TCA_CODEL.LIMIT => w.limit = v,
+            TCA_CODEL.INTERVAL => w.interval_us = v,
+            TCA_CODEL.TARGET => w.target_us = v,
+            TCA_CODEL.ECN => w.ecn = v,
+            TCA_CODEL.CE_THRESHOLD => w.ce_threshold_us = v,
+            else => {},
+        }
+    }
+    return w;
+}
+
+/// The fair-queue pacing qdisc (`sch_fq`). Every field is optional; `tc fq`
+/// with nothing sends an empty options nest. Rates are bytes per second
+/// (`maxrate 10mbit` = 1250000, a `u32` on the wire), times are as noted.
+pub const Fq = struct {
+    /// `limit`, packets.
+    limit: ?u32 = null,
+    flow_limit: ?u32 = null,
+    quantum: ?u32 = null,
+    initial_quantum: ?u32 = null,
+    /// `pacing` / `nopacing` (`TCA_FQ_RATE_ENABLE`).
+    pacing: ?bool = null,
+    /// `maxrate`, bytes per second.
+    maxrate: ?u32 = null,
+    /// log2 of `buckets` (`buckets 2048` is 11); sent first.
+    buckets_log: ?u32 = null,
+    /// `refill_delay`, microseconds.
+    refill_delay_us: ?u32 = null,
+    orphan_mask: ?u32 = null,
+    /// `low_rate_threshold`, bytes per second.
+    low_rate_threshold: ?u32 = null,
+    /// `ce_threshold`, microseconds.
+    ce_threshold_us: ?u32 = null,
+    /// `timer_slack`, nanoseconds.
+    timer_slack_ns: ?u32 = null,
+    /// `horizon`, microseconds.
+    horizon_us: ?u32 = null,
+    /// `horizon_drop` (true) / `horizon_cap` (false).
+    horizon_drop: ?bool = null,
+    /// `bands 3 priomap …` (`TCA_FQ_PRIO`, bands fixed at 3).
+    priomap: ?[prio_map_len]u8 = null,
+    /// `weights W1 W2 W3`.
+    weights: ?[3]i32 = null,
+    /// `offload_horizon`, microseconds.
+    offload_horizon_us: ?u32 = null,
+};
+
+/// Wire readback of an fq qdisc's options.
+pub const FqWire = struct {
+    limit: ?u32 = null,
+    flow_limit: ?u32 = null,
+    quantum: ?u32 = null,
+    initial_quantum: ?u32 = null,
+    pacing: ?u32 = null,
+    maxrate: ?u32 = null,
+    buckets_log: ?u32 = null,
+    refill_delay_us: ?u32 = null,
+    orphan_mask: ?u32 = null,
+    low_rate_threshold: ?u32 = null,
+    ce_threshold_us: ?u32 = null,
+    timer_slack_ns: ?u32 = null,
+    horizon_us: ?u32 = null,
+    horizon_drop: ?u8 = null,
+    priomap: ?[prio_map_len]u8 = null,
+    weights: ?[3]i32 = null,
+    offload_horizon_us: ?u32 = null,
+};
+
+fn appendFqOptions(f: Fq, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    // The order iproute2 6.19 sends (goldens): BUCKETS_LOG, PLIMIT, FLOW_PLIMIT,
+    // QUANTUM, INITIAL_QUANTUM, RATE_ENABLE, FLOW_MAX_RATE, LOW_RATE_THRESHOLD,
+    // FLOW_REFILL_DELAY, ORPHAN_MASK, CE_THRESHOLD, TIMER_SLACK, HORIZON,
+    // HORIZON_DROP, PRIO, WEIGHTS, OFFLOAD_HORIZON.
+    if (f.buckets_log) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.BUCKETS_LOG, v);
+    if (f.limit) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.PLIMIT, v);
+    if (f.flow_limit) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.FLOW_PLIMIT, v);
+    if (f.quantum) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.QUANTUM, v);
+    if (f.initial_quantum) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.INITIAL_QUANTUM, v);
+    if (f.pacing) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.RATE_ENABLE, @intFromBool(v));
+    if (f.maxrate) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.FLOW_MAX_RATE, v);
+    if (f.low_rate_threshold) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.LOW_RATE_THRESHOLD, v);
+    if (f.refill_delay_us) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.FLOW_REFILL_DELAY, v);
+    if (f.orphan_mask) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.ORPHAN_MASK, v);
+    if (f.ce_threshold_us) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.CE_THRESHOLD, v);
+    if (f.timer_slack_ns) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.TIMER_SLACK, v);
+    if (f.horizon_us) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.HORIZON, v);
+    if (f.horizon_drop) |v| try appendSmallAttr(gpa, list, TCA_FQ.HORIZON_DROP, &.{@intFromBool(v)});
+    if (f.priomap) |m| {
+        var raw: std.ArrayList(u8) = .empty;
+        defer raw.deinit(gpa);
+        try appendPrioQopt(&raw, gpa, 3, m);
+        try appendSmallAttr(gpa, list, TCA_FQ.PRIO, raw.items);
+    }
+    if (f.weights) |w| {
+        var raw: [12]u8 = undefined;
+        for (w, 0..) |x, i| std.mem.writeInt(i32, raw[i * 4 ..][0..4], x, native_endian);
+        try appendSmallAttr(gpa, list, TCA_FQ.WEIGHTS, &raw);
+    }
+    if (f.offload_horizon_us) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.OFFLOAD_HORIZON, v);
+}
+
+pub fn parseFqOptions(data: []const u8) codec.Error!FqWire {
+    var w: FqWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| {
+        if (a.data.len == 4) {
+            const v = std.mem.readInt(u32, a.data[0..4], native_endian);
+            switch (a.type) {
+                TCA_FQ.PLIMIT => w.limit = v,
+                TCA_FQ.FLOW_PLIMIT => w.flow_limit = v,
+                TCA_FQ.QUANTUM => w.quantum = v,
+                TCA_FQ.INITIAL_QUANTUM => w.initial_quantum = v,
+                TCA_FQ.RATE_ENABLE => w.pacing = v,
+                TCA_FQ.FLOW_MAX_RATE => w.maxrate = v,
+                TCA_FQ.BUCKETS_LOG => w.buckets_log = v,
+                TCA_FQ.FLOW_REFILL_DELAY => w.refill_delay_us = v,
+                TCA_FQ.ORPHAN_MASK => w.orphan_mask = v,
+                TCA_FQ.LOW_RATE_THRESHOLD => w.low_rate_threshold = v,
+                TCA_FQ.CE_THRESHOLD => w.ce_threshold_us = v,
+                TCA_FQ.TIMER_SLACK => w.timer_slack_ns = v,
+                TCA_FQ.HORIZON => w.horizon_us = v,
+                TCA_FQ.OFFLOAD_HORIZON => w.offload_horizon_us = v,
+                else => {},
+            }
+        } else switch (a.type) {
+            TCA_FQ.HORIZON_DROP => if (a.data.len == 1) {
+                w.horizon_drop = a.data[0];
+            },
+            TCA_FQ.PRIO => if (a.data.len >= 4 + prio_map_len) {
+                w.priomap = a.data[4..][0..prio_map_len].*;
+            },
+            TCA_FQ.WEIGHTS => if (a.data.len == 12) {
+                var x: [3]i32 = undefined;
+                for (&x, 0..) |*e, i| e.* = std.mem.readInt(i32, a.data[i * 4 ..][0..4], native_endian);
+                w.weights = x;
+            },
+            else => {},
+        }
+    }
+    return w;
+}
+
 // ── the spec unions ─────────────────────────────────────────────────────────
 
 /// Escape hatch for a kind this module does not model: a `TCA_KIND` string
@@ -1071,6 +1491,12 @@ pub const QdiscSpec = union(enum) {
     ingress: Ingress,
     clsact: Clsact,
     cake: Cake,
+    prio: Prio,
+    pfifo: Fifo,
+    bfifo: Fifo,
+    sfq: Sfq,
+    codel: Codel,
+    fq: Fq,
     raw: Raw,
 
     pub fn kind(self: QdiscSpec) []const u8 {
@@ -1083,6 +1509,12 @@ pub const QdiscSpec = union(enum) {
             .ingress => kind_ingress,
             .clsact => kind_clsact,
             .cake => kind_cake,
+            .prio => kind_prio,
+            .pfifo => kind_pfifo,
+            .bfifo => kind_bfifo,
+            .sfq => kind_sfq,
+            .codel => kind_codel,
+            .fq => kind_fq,
             .raw => |r| r.kind,
         };
     }
@@ -1095,6 +1527,9 @@ pub const QdiscSpec = union(enum) {
     pub fn carriesOptions(self: QdiscSpec) bool {
         return switch (self) {
             .mq, .ingress, .clsact => false,
+            // `tc pfifo`/`bfifo`/`sfq` with no argument send no options at all.
+            .pfifo, .bfifo => |f| f.limit != null,
+            .sfq => |q| sfqAnySet(q),
             else => true,
         };
     }
@@ -1115,6 +1550,11 @@ pub const QdiscSpec = union(enum) {
             .fq_codel => |f| try appendFqCodelOptions(f, gpa, list),
             .mq, .ingress, .clsact => {}, // no options; carriesOptions() gates the nest away
             .cake => |c| try appendCakeOptions(c, gpa, list),
+            .prio => |p| try appendPrioOptions(p, gpa, list),
+            .pfifo, .bfifo => |f| try appendFifoOptions(f, gpa, list),
+            .sfq => |q| try appendSfqOptions(q, gpa, list),
+            .codel => |c| try appendCodelOptions(c, gpa, list),
+            .fq => |f| try appendFqOptions(f, gpa, list),
             .raw => |r| {
                 if (r.options.len > std.math.maxInt(u16)) return error.OptionsTooLong;
                 try list.appendSlice(gpa, r.options);
@@ -1307,6 +1747,12 @@ pub const Qdisc = struct {
     tbf: ?TbfWire = null,
     fq_codel: ?FqCodelWire = null,
     cake: ?CakeWire = null,
+    prio: ?PrioWire = null,
+    /// `pfifo` and `bfifo` (told apart by `kind()`).
+    fifo: ?FifoWire = null,
+    sfq: ?SfqWire = null,
+    codel: ?CodelWire = null,
+    fq: ?FqWire = null,
     /// Counters (`tc -s`); null when the kernel sent none (API addition).
     stats: ?Stats = null,
     /// `TCA_XSTATS` of an `fq_codel` qdisc. Other kinds' private statistics
@@ -1382,6 +1828,16 @@ pub fn parseQdisc(payload: []const u8) codec.Error!Qdisc {
             q.fq_codel = try parseFqCodelOptions(opt);
         } else if (std.mem.eql(u8, k, kind_cake)) {
             q.cake = try parseCakeOptions(opt);
+        } else if (std.mem.eql(u8, k, kind_prio)) {
+            q.prio = parsePrioOptions(opt);
+        } else if (std.mem.eql(u8, k, kind_pfifo) or std.mem.eql(u8, k, kind_bfifo)) {
+            q.fifo = parseFifoOptions(opt);
+        } else if (std.mem.eql(u8, k, kind_sfq)) {
+            q.sfq = parseSfqOptions(opt);
+        } else if (std.mem.eql(u8, k, kind_codel)) {
+            q.codel = try parseCodelOptions(opt);
+        } else if (std.mem.eql(u8, k, kind_fq)) {
+            q.fq = try parseFqOptions(opt);
         }
     }
     return q;

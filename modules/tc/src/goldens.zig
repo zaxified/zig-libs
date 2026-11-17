@@ -2254,3 +2254,566 @@ test "bpf: an empty or over-long program is refused; an empty matchall is an emp
     // 36 header+tcmsg, 16 kind attribute, 4 empty TCA_OPTIONS.
     try testing.expectEqual(@as(usize, 36 + 16 + 4), bare.len);
 }
+
+// ── classic qdiscs: prio, pfifo/bfifo, sfq, codel, fq (captured 2026-11-17, iproute2-6.19.0, `unshare -rn`) ──
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889037 len=76
+// tc qdisc add dev lo root handle 1: prio
+const g_prio_default_qdisc =
+    "4c000000240005064dd5fb6a00000000000000000100000000000100ffffffff00000000090001007072696f00000000" ++
+    "1c000200030000000102020201020000010101010101010104000200";
+const seq_prio_default_qdisc: u32 = 1794889037;
+
+test "golden: prio default (bands 3, default priomap, empty trailing options)" {
+    // tc qdisc add dev lo root handle 1: prio
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_prio_default_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .prio = .{} },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_prio_default_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889037 len=76
+// tc qdisc add dev lo root handle 1: prio bands 5 priomap 1 1 2 2 0 0 1 1 3 3 4 4 1 1 2 2
+const g_prio_bands5_qdisc =
+    "4c000000240005064dd5fb6a00000000000000000100000000000100ffffffff00000000090001007072696f00000000" ++
+    "1c000200050000000101020200000101030304040101020204000200";
+const seq_prio_bands5_qdisc: u32 = 1794889037;
+
+test "golden: prio bands 5 + priomap" {
+    // tc qdisc add dev lo root handle 1: prio bands 5 priomap 1 1 2 2 0 0 1 1 3 3 4 4 1 1 2 2
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_prio_bands5_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .prio = .{ .bands = 5, .priomap = .{ 1, 1, 2, 2, 0, 0, 1, 1, 3, 3, 4, 4, 1, 1, 2, 2 } } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_prio_bands5_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889037 len=80
+// tc qdisc add dev lo root handle 1: prio bands 3 multiqueue
+const g_prio_multiqueue_qdisc =
+    "50000000240005064dd5fb6a00000000000000000100000000000100ffffffff00000000090001007072696f00000000" ++
+    "2000020003000000010202020102000001010101010101010800020004000100";
+const seq_prio_multiqueue_qdisc: u32 = 1794889037;
+
+test "golden: prio multiqueue (nested TCA_PRIO_MQ)" {
+    // tc qdisc add dev lo root handle 1: prio bands 3 multiqueue
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_prio_multiqueue_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .prio = .{ .multiqueue = true } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_prio_multiqueue_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889037 len=48
+// tc qdisc add dev lo root handle 1: pfifo
+const g_pfifo_bare_qdisc =
+    "30000000240005064dd5fb6a00000000000000000100000000000100ffffffff000000000a000100706669666f000000";
+const seq_pfifo_bare_qdisc: u32 = 1794889037;
+
+test "golden: pfifo bare (no options at all)" {
+    // tc qdisc add dev lo root handle 1: pfifo
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_pfifo_bare_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .pfifo = .{} },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_pfifo_bare_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889037 len=56
+// tc qdisc add dev lo root handle 1: pfifo limit 500
+const g_pfifo_limit_qdisc =
+    "38000000240005064dd5fb6a00000000000000000100000000000100ffffffff000000000a000100706669666f000000" ++
+    "08000200f4010000";
+const seq_pfifo_limit_qdisc: u32 = 1794889037;
+
+test "golden: pfifo limit" {
+    // tc qdisc add dev lo root handle 1: pfifo limit 500
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_pfifo_limit_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .pfifo = .{ .limit = 500 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_pfifo_limit_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889037 len=56
+// tc qdisc add dev lo root handle 1: bfifo limit 30000
+const g_bfifo_limit_qdisc =
+    "38000000240005064dd5fb6a00000000000000000100000000000100ffffffff000000000a000100626669666f000000" ++
+    "0800020030750000";
+const seq_bfifo_limit_qdisc: u32 = 1794889037;
+
+test "golden: bfifo limit (bytes)" {
+    // tc qdisc add dev lo root handle 1: bfifo limit 30000
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_bfifo_limit_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .bfifo = .{ .limit = 30000 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_bfifo_limit_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889037 len=48
+// tc qdisc add dev lo root handle 1: bfifo
+const g_bfifo_bare_qdisc =
+    "30000000240005064dd5fb6a00000000000000000100000000000100ffffffff000000000a000100626669666f000000";
+const seq_bfifo_bare_qdisc: u32 = 1794889037;
+
+test "golden: bfifo bare (no options at all)" {
+    // tc qdisc add dev lo root handle 1: bfifo
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_bfifo_bare_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .bfifo = .{} },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_bfifo_bare_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889037 len=44
+// tc qdisc add dev lo root handle 1: sfq
+const g_sfq_bare_qdisc =
+    "2c000000240005064dd5fb6a00000000000000000100000000000100ffffffff000000000800010073667100";
+const seq_sfq_bare_qdisc: u32 = 1794889037;
+
+test "golden: sfq bare (no options at all)" {
+    // tc qdisc add dev lo root handle 1: sfq
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_sfq_bare_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .sfq = .{} },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_sfq_bare_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889037 len=120
+// tc qdisc add dev lo root handle 1: sfq perturb 10 quantum 1514 limit 100
+const g_sfq_basic_qdisc =
+    "78000000240005064dd5fb6a00000000000000000100000000000100ffffffff0000000008000100736671004c000200" ++
+    "ea0500000a00000064000000000000000000000000000000000000000000000000000000000000000000000000000000" ++
+    "000000000000000000000000000000000000000000000000";
+const seq_sfq_basic_qdisc: u32 = 1794889037;
+
+test "golden: sfq perturb/quantum/limit (72-octet tc_sfq_qopt_v1)" {
+    // tc qdisc add dev lo root handle 1: sfq perturb 10 quantum 1514 limit 100
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_sfq_basic_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .sfq = .{ .perturb_s = 10, .quantum = 1514, .limit = 100 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_sfq_basic_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889037 len=120
+// tc qdisc add dev lo root handle 1: sfq divisor 512 flows 64 depth 20 headdrop
+const g_sfq_divisor_qdisc =
+    "78000000240005064dd5fb6a00000000000000000100000000000100ffffffff0000000008000100736671004c000200" ++
+    "000000000000000000000000000200004000000014000000010000000000000000000000000000000000000000000000" ++
+    "000000000000000000000000000000000000000000000000";
+const seq_sfq_divisor_qdisc: u32 = 1794889037;
+
+test "golden: sfq divisor/flows/depth/headdrop" {
+    // tc qdisc add dev lo root handle 1: sfq divisor 512 flows 64 depth 20 headdrop
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_sfq_divisor_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .sfq = .{ .divisor = 512, .flows = 64, .depth = 20, .headdrop = true } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_sfq_divisor_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889037 len=120
+// tc qdisc add dev lo root handle 1: sfq limit 100 redflowlimit 100000 min 30000 max 90000 avpkt 1000 burst 55 probability 0.4 ecn harddrop
+const g_sfq_red_qdisc =
+    "78000000240005064dd5fb6a00000000000000000100000000000100ffffffff0000000008000100736671004c000200" ++
+    "00000000000000006400000000000000000000000000000000000000a086010030750000905f01000512000366666666" ++
+    "000000000000000000000000000000000000000000000000";
+const seq_sfq_red_qdisc: u32 = 1794889037;
+
+test "golden: sfq RED extension (wire fields)" {
+    // tc qdisc add dev lo root handle 1: sfq limit 100 redflowlimit 100000 min 30000 max 90000 avpkt 1000 burst 55 probability 0.4 ecn harddrop
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_sfq_red_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .sfq = .{ .limit = 100, .red = .{ .flow_limit = 100000, .qth_min = 30000, .qth_max = 90000, .wlog = 5, .plog = 18, .flags = 3, .max_p = 0x66666666 } } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_sfq_red_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889037 len=52
+// tc qdisc add dev lo root handle 1: codel
+const g_codel_bare_qdisc =
+    "34000000240005064dd5fb6a00000000000000000100000000000100ffffffff000000000a000100636f64656c000000" ++
+    "04000200";
+const seq_codel_bare_qdisc: u32 = 1794889037;
+
+test "golden: codel bare (empty options nest)" {
+    // tc qdisc add dev lo root handle 1: codel
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_codel_bare_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .codel = .{} },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_codel_bare_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889037 len=84
+// tc qdisc add dev lo root handle 1: codel limit 1000 target 5ms interval 100ms ecn
+const g_codel_basic_qdisc =
+    "54000000240005064dd5fb6a00000000000000000100000000000100ffffffff000000000a000100636f64656c000000" ++
+    "2400020008000200e803000008000300a086010008000100881300000800040001000000";
+const seq_codel_basic_qdisc: u32 = 1794889037;
+
+test "golden: codel limit/target/interval/ecn" {
+    // tc qdisc add dev lo root handle 1: codel limit 1000 target 5ms interval 100ms ecn
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_codel_basic_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .codel = .{ .limit = 1000, .target_us = 5000, .interval_us = 100000, .ecn = true } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_codel_basic_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889038 len=92
+// tc qdisc add dev lo root handle 1: codel limit 1000 target 5ms interval 100ms noecn ce_threshold 4ms
+const g_codel_all_qdisc =
+    "5c000000240005064ed5fb6a00000000000000000100000000000100ffffffff000000000a000100636f64656c000000" ++
+    "2c00020008000200e803000008000300a08601000800010088130000080004000000000008000500a00f0000";
+const seq_codel_all_qdisc: u32 = 1794889038;
+
+test "golden: codel noecn + ce_threshold (full order)" {
+    // tc qdisc add dev lo root handle 1: codel limit 1000 target 5ms interval 100ms noecn ce_threshold 4ms
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_codel_all_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .codel = .{ .limit = 1000, .target_us = 5000, .interval_us = 100000, .ecn = false, .ce_threshold_us = 4000 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_codel_all_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889038 len=48
+// tc qdisc add dev lo root handle 1: fq
+const g_fq_bare_qdisc =
+    "30000000240005064ed5fb6a00000000000000000100000000000100ffffffff00000000070001006671000004000200";
+const seq_fq_bare_qdisc: u32 = 1794889038;
+
+test "golden: fq bare (empty options nest)" {
+    // tc qdisc add dev lo root handle 1: fq
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_fq_bare_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .fq = .{} },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_fq_bare_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889038 len=120
+// tc qdisc add dev lo root handle 1: fq limit 5000 flow_limit 50 quantum 3028 initial_quantum 15140 maxrate 10mbit buckets 2048 orphan_mask 1023 nopacing ce_threshold 4ms
+const g_fq_basic_qdisc =
+    "78000000240005064ed5fb6a00000000000000000100000000000100ffffffff0000000007000100667100004c000200" ++
+    "080008000b0000000800010088130000080002003200000008000300d40b000008000400243b00000800050000000000" ++
+    "08000700d012130008000a00ff03000008000c00a00f0000";
+const seq_fq_basic_qdisc: u32 = 1794889038;
+
+test "golden: fq limits, quanta, maxrate, buckets, nopacing" {
+    // tc qdisc add dev lo root handle 1: fq limit 5000 flow_limit 50 quantum 3028 initial_quantum 15140 maxrate 10mbit buckets 2048 orphan_mask 1023 nopacing ce_threshold 4ms
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_fq_basic_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .fq = .{ .buckets_log = 11, .limit = 5000, .flow_limit = 50, .quantum = 3028, .initial_quantum = 15140, .pacing = false, .maxrate = 1250000, .orphan_mask = 1023, .ce_threshold_us = 4000 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_fq_basic_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889038 len=56
+// tc qdisc add dev lo root handle 1: fq pacing
+const g_fq_pacing_qdisc =
+    "38000000240005064ed5fb6a00000000000000000100000000000100ffffffff0000000007000100667100000c000200" ++
+    "0800050001000000";
+const seq_fq_pacing_qdisc: u32 = 1794889038;
+
+test "golden: fq pacing" {
+    // tc qdisc add dev lo root handle 1: fq pacing
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_fq_pacing_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .fq = .{ .pacing = true } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_fq_pacing_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889038 len=64
+// tc qdisc add dev lo root handle 1: fq horizon 5ms horizon_cap
+const g_fq_horizon_cap_qdisc =
+    "40000000240005064ed5fb6a00000000000000000100000000000100ffffffff00000000070001006671000014000200" ++
+    "08000e008813000005000f0000000000";
+const seq_fq_horizon_cap_qdisc: u32 = 1794889038;
+
+test "golden: fq horizon_cap" {
+    // tc qdisc add dev lo root handle 1: fq horizon 5ms horizon_cap
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_fq_horizon_cap_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .fq = .{ .horizon_us = 5000, .horizon_drop = false } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_fq_horizon_cap_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889038 len=72
+// tc qdisc add dev lo root handle 1: fq maxrate 10mbit low_rate_threshold 50kbit refill_delay 20ms
+const g_fq_rates_qdisc =
+    "48000000240005064ed5fb6a00000000000000000100000000000100ffffffff0000000007000100667100001c000200" ++
+    "08000700d012130008000b006a18000008000900204e0000";
+const seq_fq_rates_qdisc: u32 = 1794889038;
+
+test "golden: fq maxrate, low_rate_threshold, refill_delay (MAX_RATE, LOW_RATE, REFILL)" {
+    // tc qdisc add dev lo root handle 1: fq maxrate 10mbit low_rate_threshold 50kbit refill_delay 20ms
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_fq_rates_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .fq = .{ .maxrate = 1250000, .low_rate_threshold = 6250, .refill_delay_us = 20000 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_fq_rates_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889038 len=192
+// tc qdisc add dev lo root handle 1: fq offload_horizon 2ms horizon_drop bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1 horizon 5ms timer_slack 20us ce_threshold 4ms orphan_mask 1023 refill_delay 20ms low_rate_threshold 50kbit maxrate 10mbit nopacing initial_quantum 15140 quantum 3028 flow_limit 50 limit 5000 buckets 2048
+const g_fq_all_qdisc =
+    "c0000000240005064ed5fb6a00000000000000000100000000000100ffffffff00000000070001006671000094000200" ++
+    "080008000b0000000800010088130000080002003200000008000300d40b000008000400243b00000800050000000000" ++
+    "08000700d012130008000b006a18000008000900204e000008000a00ff03000008000c00a00f000008000d00204e0000" ++
+    "08000e008813000005000f000100000018001000030000000102020201020000010101010101010108001200d0070000";
+const seq_fq_all_qdisc: u32 = 1794889038;
+
+test "golden: fq every attribute but weights (full order)" {
+    // tc qdisc add dev lo root handle 1: fq offload_horizon 2ms horizon_drop bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1 horizon 5ms timer_slack 20us ce_threshold 4ms orphan_mask 1023 refill_delay 20ms low_rate_threshold 50kbit maxrate 10mbit nopacing initial_quantum 15140 quantum 3028 flow_limit 50 limit 5000 buckets 2048
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_fq_all_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .fq = .{ .buckets_log = 11, .limit = 5000, .flow_limit = 50, .quantum = 3028, .initial_quantum = 15140, .pacing = false, .maxrate = 1250000, .low_rate_threshold = 6250, .refill_delay_us = 20000, .orphan_mask = 1023, .ce_threshold_us = 4000, .timer_slack_ns = 20000, .horizon_us = 5000, .horizon_drop = true, .priomap = .{ 1, 2, 2, 2, 1, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 }, .offload_horizon_us = 2000 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_fq_all_qdisc, req);
+}
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1794889038 len=96
+// tc qdisc add dev lo root handle 1: fq offload_horizon 2ms bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1 weights 20000 40000 80000
+const g_fq_weights_qdisc =
+    "60000000240005064ed5fb6a00000000000000000100000000000100ffffffff00000000070001006671000034000200" ++
+    "18001000030000000102020201020000010101010101010110001100204e0000409c00008038010008001200d0070000";
+const seq_fq_weights_qdisc: u32 = 1794889038;
+
+test "golden: fq priomap, weights, offload_horizon (PRIO, WEIGHTS, OFFLOAD_HORIZON)" {
+    // tc qdisc add dev lo root handle 1: fq offload_horizon 2ms bands 3 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1 weights 20000 40000 80000
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq_fq_weights_qdisc,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .fq = .{ .priomap = .{ 1, 2, 2, 2, 1, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 }, .weights = .{ 20000, 40000, 80000 }, .offload_horizon_us = 2000 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_fq_weights_qdisc, req);
+}
+
+fn parseQdiscGolden(hex: []const u8, buf: []u8) !qdisc.Qdisc {
+    const codec = @import("netlink").codec;
+    const bytes = try std.fmt.hexToBytes(buf[0 .. hex.len / 2], hex);
+    var it: codec.MessageIterator = .{ .buf = bytes };
+    const m = (try it.next()).?;
+    return qdisc.parseQdisc(m.payload);
+}
+
+test "goldens re-parse: prio, pfifo/bfifo, sfq, codel and fq qdiscs" {
+    var buf: [512]u8 = undefined;
+    {
+        const q = try parseQdiscGolden(g_prio_bands5_qdisc, &buf);
+        try testing.expectEqualStrings("prio", q.kind());
+        try testing.expectEqual(@as(u32, 5), q.prio.?.bands);
+        try testing.expectEqualSlices(u8, &.{ 1, 1, 2, 2, 0, 0, 1, 1, 3, 3, 4, 4, 1, 1, 2, 2 }, &q.prio.?.priomap);
+    }
+    {
+        const q = try parseQdiscGolden(g_pfifo_limit_qdisc, &buf);
+        try testing.expectEqualStrings("pfifo", q.kind());
+        try testing.expectEqual(@as(u32, 500), q.fifo.?.limit);
+        const b = try parseQdiscGolden(g_bfifo_limit_qdisc, &buf);
+        try testing.expectEqualStrings("bfifo", b.kind());
+        try testing.expectEqual(@as(u32, 30000), b.fifo.?.limit);
+        const bare = try parseQdiscGolden(g_pfifo_bare_qdisc, &buf);
+        try testing.expect(bare.fifo == null);
+    }
+    {
+        const q = try parseQdiscGolden(g_sfq_red_qdisc, &buf);
+        const s = q.sfq.?;
+        try testing.expectEqual(@as(u32, 100), s.limit);
+        try testing.expectEqual(@as(u32, 0), s.depth.?);
+        const r = s.red.?;
+        try testing.expectEqual(@as(u32, 100000), r.flow_limit);
+        try testing.expectEqual(@as(u32, 30000), r.qth_min);
+        try testing.expectEqual(@as(u32, 90000), r.qth_max);
+        try testing.expectEqual(@as(u8, 18), r.plog);
+        try testing.expectEqual(@as(u8, 3), r.flags);
+        try testing.expectEqual(@as(u32, 0x66666666), r.max_p);
+        const d = try parseQdiscGolden(g_sfq_divisor_qdisc, &buf);
+        try testing.expectEqual(@as(u32, 512), d.sfq.?.divisor);
+        try testing.expectEqual(@as(u32, 64), d.sfq.?.flows);
+        try testing.expectEqual(@as(u32, 1), d.sfq.?.headdrop.?);
+        const b = try parseQdiscGolden(g_sfq_basic_qdisc, &buf);
+        try testing.expectEqual(@as(i32, 10), b.sfq.?.perturb_s);
+        try testing.expectEqual(@as(u32, 1514), b.sfq.?.quantum);
+    }
+    {
+        const q = try parseQdiscGolden(g_codel_all_qdisc, &buf);
+        const c = q.codel.?;
+        try testing.expectEqual(@as(?u32, 1000), c.limit);
+        try testing.expectEqual(@as(?u32, 5000), c.target_us);
+        try testing.expectEqual(@as(?u32, 100000), c.interval_us);
+        try testing.expectEqual(@as(?u32, 0), c.ecn);
+        try testing.expectEqual(@as(?u32, 4000), c.ce_threshold_us);
+    }
+    {
+        const q = try parseQdiscGolden(g_fq_all_qdisc, &buf);
+        const f = q.fq.?;
+        try testing.expectEqual(@as(?u32, 11), f.buckets_log);
+        try testing.expectEqual(@as(?u32, 5000), f.limit);
+        try testing.expectEqual(@as(?u32, 50), f.flow_limit);
+        try testing.expectEqual(@as(?u32, 3028), f.quantum);
+        try testing.expectEqual(@as(?u32, 15140), f.initial_quantum);
+        try testing.expectEqual(@as(?u32, 0), f.pacing);
+        try testing.expectEqual(@as(?u32, 1250000), f.maxrate);
+        try testing.expectEqual(@as(?u32, 6250), f.low_rate_threshold);
+        try testing.expectEqual(@as(?u32, 20000), f.refill_delay_us);
+        try testing.expectEqual(@as(?u32, 1023), f.orphan_mask);
+        try testing.expectEqual(@as(?u32, 4000), f.ce_threshold_us);
+        try testing.expectEqual(@as(?u32, 20000), f.timer_slack_ns);
+        try testing.expectEqual(@as(?u32, 5000), f.horizon_us);
+        try testing.expectEqual(@as(?u8, 1), f.horizon_drop);
+        try testing.expectEqual(@as(u8, 2), f.priomap.?[1]);
+        try testing.expectEqual(@as(?u32, 2000), f.offload_horizon_us);
+        const w = (try parseQdiscGolden(g_fq_weights_qdisc, &buf)).fq.?;
+        try testing.expectEqual([3]i32{ 20000, 40000, 80000 }, w.weights.?);
+        const cap = (try parseQdiscGolden(g_fq_horizon_cap_qdisc, &buf)).fq.?;
+        try testing.expectEqual(@as(?u8, 0), cap.horizon_drop);
+    }
+}
+
+test "classic qdiscs: invalid prio bands/priomap refused, options nest only when tc sends one" {
+    const bad = [_]qdisc.Prio{
+        .{ .bands = 1 },
+        .{ .bands = 17 },
+        .{ .bands = 2 }, // the default priomap has a 2
+        .{ .bands = 3, .priomap = .{ 3, 2, 2, 2, 1, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 } },
+    };
+    for (bad) |p| {
+        try testing.expectError(error.InvalidPrioBands, message.buildQdiscSet(
+            gpa,
+            0,
+            .add,
+            .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+            .{ .prio = p },
+            ps,
+        ));
+    }
+    const two_bands: qdisc.Prio = .{ .bands = 2, .priomap = @splat(1) };
+    const ok = try message.buildQdiscSet(gpa, 0, .add, .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root }, .{ .prio = two_bands }, ps);
+    defer gpa.free(ok);
+    try testing.expect((qdisc.QdiscSpec{ .pfifo = .{ .limit = 1 } }).carriesOptions());
+    try testing.expect(!(qdisc.QdiscSpec{ .pfifo = .{} }).carriesOptions());
+    try testing.expect(!(qdisc.QdiscSpec{ .bfifo = .{} }).carriesOptions());
+    try testing.expect(!(qdisc.QdiscSpec{ .sfq = .{} }).carriesOptions());
+    try testing.expect((qdisc.QdiscSpec{ .sfq = .{ .headdrop = false } }).carriesOptions());
+    try testing.expect((qdisc.QdiscSpec{ .codel = .{} }).carriesOptions());
+    try testing.expect((qdisc.QdiscSpec{ .fq = .{} }).carriesOptions());
+    // A payload shorter than the kernel struct is skipped, not an error.
+    try testing.expect(qdisc.parsePrioOptions(&.{ 3, 0, 0, 0 }) == null);
+    try testing.expect(qdisc.parseFifoOptions(&.{ 1, 2, 3 }) == null);
+    try testing.expect(qdisc.parseSfqOptions(&@as([19]u8, @splat(0))) == null);
+    const v0 = qdisc.parseSfqOptions(&@as([20]u8, @splat(0))).?;
+    try testing.expect(v0.depth == null and v0.red == null);
+    const v1 = qdisc.parseSfqOptions(&@as([28]u8, @splat(0))).?;
+    try testing.expect(v1.depth != null and v1.red == null);
+}
