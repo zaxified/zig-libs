@@ -52,8 +52,10 @@ pub const WriteOptions = struct {
     compression: Compression = .none,
     /// The codec's level. `.zstd`: `zstd.Options.level` (1..22, negative for the fast
     /// levels, 0 = zstd's default, 3). `.lz4`: liblz4's `compressionLevel` as Arrow C++
-    /// passes it on: negative = the fast mode with acceleration `-level`, 0..2 = LZ4's
-    /// default; 3 and up (LZ4 HC) are `error.Unsupported` (the `lz4` module has no HC).
+    /// passes it on: negative = the fast mode with acceleration `1 - level` (liblz4's
+    /// `LZ4F_compressBlock`: level -1 is acceleration 2), 0..2 = LZ4's default
+    /// (acceleration 1); 3 and up (LZ4 HC) are `error.Unsupported` (the `lz4` module has
+    /// no HC).
     compression_level: i32 = 0,
     /// The schema's key/value metadata (`Schema.custom_metadata`: Pandas metadata,
     /// provenance tags), written as given.
@@ -757,11 +759,12 @@ fn write(gpa: Allocator, f: df.Frame, opts: WriteOptions, file: bool) Error![]u8
     switch (opts.compression) {
         .none => {},
         .zstd => w.zc = zstd.Compressor.init(gpa),
-        // liblz4's level: negative = acceleration, 0..2 = the default fast level,
-        // 3.. = HC, which the `lz4` module does not have.
+        // liblz4's level: negative = acceleration `-level + 1` (`LZ4F_compressBlock`),
+        // 0..2 = the default fast level, 3.. = HC, which the `lz4` module does not have.
+        // `minInt(i32)` gives 2^31 + 1, which `lz4` clamps as liblz4 does.
         .lz4 => {
             if (opts.compression_level >= 3) return error.Unsupported;
-            w.lz4o = .{ .acceleration = if (opts.compression_level < 0) @abs(opts.compression_level) else 1 };
+            w.lz4o = .{ .acceleration = if (opts.compression_level < 0) @abs(opts.compression_level) + 1 else 1 };
         },
     }
     defer if (w.zc) |*c| c.deinit();
@@ -1388,7 +1391,10 @@ const Reader = struct {
                     if (one.len < 4 or std.mem.readInt(u32, one[0..4], .little) != lz4.frame_magic) return error.Malformed;
                     const got = lz4.decompressInto(one, dst, .{ .max_output = null, .multi_frame = false }) catch return error.Malformed;
                     if (got != n) return error.Malformed;
-                } else if (n > 0) {
+                } else {
+                    // ZSTD_decompress over the whole rest, as Arrow C++'s ZSTD codec
+                    // hands it on whatever the length: a declared 0 decodes nothing,
+                    // an empty frame or a skippable one; junk is an error.
                     const frames = src[8..];
                     // A frame declaring more than it can hold is refused before decoding.
                     const bound = zstd.decompressBound(frames) catch return error.Malformed;

@@ -193,6 +193,10 @@ writes the compressed form and stores raw only when `IpcWriteOptions::min_space_
 (`writer.cc` `CompressBuffer` / `ShouldCompress`). Every reader takes both. The reader decompresses ZSTD (one zstd
 context per read) after checking each declared length against `zstd.decompressBound`, and LZ4_FRAME into the
 buffer the declared length sized, both after checking the whole read's total against `ReadOptions.max_body_bytes`.
+A non-empty buffer declaring 0 bytes is still decoded, with either codec, as Arrow C++ 26.0.1 hands it to the codec
+whatever the length (`reader.cc` `DecompressBuffer`; ZSTD: `ZSTD_decompressDCtx` over the rest, so no bytes, an
+empty frame or a skippable frame are 0 bytes, junk or a frame holding data is an error — `error.Malformed`; until
+2026-11-17 a ZSTD buffer declaring 0 was skipped unread).
 
 **LZ4_FRAME (2026-11-17)**, as Arrow C++ 26.0.1 `util/compression_lz4.cc` `Lz4FrameCodec` does it (behaviour read,
 no code taken). Write: one frame per buffer with liblz4's zeroed `LZ4F_preferences_t` (C++'s
@@ -200,7 +204,9 @@ no code taken). Write: one frame per buffer with liblz4's zeroed `LZ4F_preferenc
 the `lz4` module's `EncodeOptions` defaults (checked in `src/stream_test.zig` on every frame written, and by the
 lz4 1.10.0 CLI and python-lz4 4.4.5 decoding each buffer frame of a three-column 200 000-row stream at two levels:
 24 frames, byte-equal). `compression_level` is liblz4's `compressionLevel` as C++ passes it: negative = the fast
-mode with acceleration `-level`, 0..2 = LZ4's default level, 3 and up = LZ4 HC, `error.Unsupported` here (no HC in
+mode with acceleration `1 - level` (liblz4 1.10.0 `lz4frame.c` `LZ4F_compressBlock` / `_continue`:
+`acceleration = (level < 0) ? -level + 1 : 1`; until 2026-11-17 it was `-level` here, so -1 gave 1), 0..2 = LZ4's
+default level (acceleration 1), 3 and up = LZ4 HC, `error.Unsupported` here (no HC in
 `lz4`; its Backlog B2). Read: exactly one LZ4 frame per buffer (C++ `Decompress`: "more than one frame" and "less
 than one frame" are errors), so a legacy or skippable frame, a second frame or a trailing byte is
 `error.Malformed`; the frame must decode to the declared length exactly (C++ `DecompressBuffer`, arrow-rs

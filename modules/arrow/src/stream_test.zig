@@ -748,8 +748,8 @@ test "compression: lz4 round trip of every column type, stream and file, one bat
     try testing.expect(sc.raw > 0);
 
     // A long repetitive column does shrink, at every level LZ4's fast mode has: liblz4's
-    // negative levels are the acceleration, 0..2 its default. A bigger acceleration
-    // never compresses better.
+    // negative level L is acceleration 1 - L (`LZ4F_compressBlock`), 0..2 its default
+    // (acceleration 1). A bigger acceleration never compresses better.
     const n = 1 << 16;
     const vals = try a.alloc(i64, n);
     var prng = std.Random.DefaultPrng.init(5);
@@ -767,9 +767,11 @@ test "compression: lz4 round trip of every column type, stream and file, one bat
         try testing.expectEqual(@as(usize, 1), try expectLz4Frames(a, z));
         try expectSameFrame(big, try stream.readStream(a, z, .{}));
     }
-    // 0, 1, 2 and -1 are all acceleration 1; -64 is faster and looser.
-    for (sizes[1..4]) |x| try testing.expectEqual(sizes[0], x);
-    try testing.expect(sizes[4] > sizes[0]);
+    // 0, 1 and 2 are all acceleration 1; -1 is already acceleration 2 (it was 1 here
+    // until 2026-11-17), -64 is 65: faster and looser.
+    for (sizes[1..3]) |x| try testing.expectEqual(sizes[0], x);
+    try testing.expect(sizes[3] > sizes[0]);
+    try testing.expect(sizes[4] > sizes[3]);
     // The most negative level (acceleration 2^31, which LZ4 clamps) still writes a stream
     // that reads back.
     const fastest = try stream.writeStream(gpa, big, .{ .compression = .lz4, .compression_level = std.math.minInt(i32) });
@@ -870,6 +872,28 @@ test "compression: declared lengths and broken frames are errors" {
     // bytes to the codec whatever the length): the validity buffer here.
     for ([_]struct { ok: bool, frame: []const u8 }{ .{ .ok = true, .frame = lz_empty }, .{ .ok = false, .frame = "junk" }, .{ .ok = false, .frame = lz } }) |c| {
         const bytes = try hand(gpa, &fields, &.{.{ .length = 2, .nodes = &.{node}, .bufs = &.{ try pre(a, 0, c.frame), try pre(a, 8, lz) }, .codec = .lz4_frame }});
+        defer gpa.free(bytes);
+        const got = stream.readStream(a, bytes, .{});
+        if (c.ok) {
+            try testing.expectEqual(@as(i64, -8), (try got).columnAt(0).get(1).int);
+        } else try testing.expectError(error.Malformed, got);
+    }
+    // ZSTD with a declared length of 0: the rest goes to the decoder all the same, as
+    // Arrow C++ hands it to `ZSTD_decompressDCtx` (`DecompressBuffer`, ZSTD codec): no
+    // bytes, an empty frame or a skippable frame decode to nothing; junk or a frame of
+    // something is an error. (Until 2026-11-17 such a buffer was skipped unread.)
+    var zempty_buf: [32]u8 = undefined;
+    const zempty = zempty_buf[0..try zstd.compress(gpa, &zempty_buf, "", .{})];
+    for ([_]struct { ok: bool, frame: []const u8 }{
+        .{ .ok = true, .frame = "" },
+        .{ .ok = true, .frame = zempty },
+        .{ .ok = true, .frame = "\x50\x2a\x4d\x18\x02\x00\x00\x00ab" },
+        .{ .ok = false, .frame = "junk" },
+        .{ .ok = false, .frame = "junkjunk" },
+        .{ .ok = false, .frame = frame },
+        .{ .ok = false, .frame = lz_empty },
+    }) |c| {
+        const bytes = try hand(gpa, &fields, &.{.{ .length = 2, .nodes = &.{node}, .bufs = &.{ try pre(a, 0, c.frame), try pre(a, 8, frame) }, .codec = .zstd }});
         defer gpa.free(bytes);
         const got = stream.readStream(a, bytes, .{});
         if (c.ok) {
