@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — tests: the per-field breakage table names its group in a failure message. No source change.
 - **2026-11-17** — Snapshot decoder: a receiver snapshot's `used` list is checked against the included dealers by count first (no bounds-dependent loop). tests: a table of single-field breakages per round for `Participant` and `ReshareReceiver` snapshots, each demanded refused. No consumer-visible change.
 - **2026-11-17** — tests: snapshot decoders refuse a claimed complaint / used-list count that does not fit the input before allocating for it (checked against a 64 KiB fixed buffer). No source change.
 - **2026-11-17** — tests: fuzz harness `dkg-snapshot-decode` (`DKG_FUZZ`; real `Participant` and `ReshareReceiver` snapshots of every round, damaged, into both decoders; what decodes re-encodes to the same octets; 200,000 runs clean in 34 s). No source change.

@@ -1262,7 +1262,7 @@ fn shareFrame(p: *Participant) *Outgoing {
 
 /// Decode a valid snapshot, break one field, and demand that the broken state
 /// is refused (each case violates exactly the rule it is named after).
-fn expectBrokenRefused(bytes: []const u8, breakIt: *const fn (*Participant, usize) anyerror!void, cases: usize) !void {
+fn expectBrokenRefused(name: []const u8, bytes: []const u8, breakIt: *const fn (*Participant, usize) anyerror!void, cases: usize) !void {
     for (0..cases) |k| {
         var q = try Participant.fromBytes(testing.allocator, bytes);
         defer q.deinit();
@@ -1270,7 +1270,7 @@ fn expectBrokenRefused(bytes: []const u8, breakIt: *const fn (*Participant, usiz
         const again = try snap(&q);
         defer freeSnap(again);
         testing.expectError(error.InvalidState, Participant.fromBytes(testing.allocator, again)) catch |e| {
-            std.debug.print("case {d} was not refused\n", .{k});
+            std.debug.print("{s}: case {d} was not refused\n", .{ name, k });
             return e;
         };
     }
@@ -1396,16 +1396,16 @@ test "Participant: each field a run cannot combine is refused, round by round" {
     {
         const bytes = try snap(&fresh);
         defer freeSnap(bytes);
-        try expectBrokenRefused(bytes, breakNew, 16);
+        try expectBrokenRefused("new", bytes, breakNew, 16);
     }
-    const Case = struct { steps: usize, hold: bool, f: *const fn (*Participant, usize) anyerror!void, cases: usize };
+    const Case = struct { name: []const u8, steps: usize, hold: bool, f: *const fn (*Participant, usize) anyerror!void, cases: usize };
     const table = [_]Case{
-        .{ .steps = 0, .hold = false, .f = breakShares, .cases = 12 },
-        .{ .steps = 1, .hold = false, .f = breakComplaints, .cases = 3 },
-        .{ .steps = 1, .hold = true, .f = breakComplaintHeld, .cases = 2 },
-        .{ .steps = 2, .hold = false, .f = breakDefenses, .cases = 4 },
-        .{ .steps = 3, .hold = false, .f = breakFeldman, .cases = 3 },
-        .{ .steps = 5, .hold = false, .f = breakReveals, .cases = 3 },
+        .{ .steps = 0, .hold = false, .name = "breakShares", .f = breakShares, .cases = 12 },
+        .{ .steps = 1, .hold = false, .name = "breakComplaints", .f = breakComplaints, .cases = 3 },
+        .{ .steps = 1, .hold = true, .name = "breakComplaintHeld", .f = breakComplaintHeld, .cases = 2 },
+        .{ .steps = 2, .hold = false, .name = "breakDefenses", .f = breakDefenses, .cases = 4 },
+        .{ .steps = 3, .hold = false, .name = "breakFeldman", .f = breakFeldman, .cases = 3 },
+        .{ .steps = 5, .hold = false, .name = "breakReveals", .f = breakReveals, .cases = 3 },
     };
     inline for (table) |c| {
         var net = try world(c.steps);
@@ -1417,7 +1417,7 @@ test "Participant: each field a run cannot combine is refused, round by round" {
         // the unbroken state is accepted
         var ok = try Participant.fromBytes(testing.allocator, bytes);
         ok.deinit();
-        try expectBrokenRefused(bytes, c.f, c.cases);
+        try expectBrokenRefused(c.name, bytes, c.f, c.cases);
     }
 }
 
