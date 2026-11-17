@@ -878,12 +878,34 @@ KEMs. For each NIST curve, `0`, `n`, `n+1` and all-ones are refused, and `1`
 and `n-1` are accepted. Delta mutation 2026-11-17 over the four bodies: see the
 `keyPairFromSecret` paragraph of the Audit section below.
 
+## Public-key admission check (2026-11-17)
+
+`P256Kem`/`P384Kem`/`P521Kem.validatePublicKey(&pk)` refuse a public key that
+`encap` would refuse, with the same `error.DeserializeError`, so a protocol
+can check a key when it ADMITS it (MLS: a KeyPackage's `init_key`, a leaf's
+`encryption_key`) instead of failing at first use. The check is exactly the
+decode `encap`/`authDecap` apply (RFC 9180 §7.1.1 `DeserializePublicKey`):
+SEC1 uncompressed (`0x04`; any other prefix is refused at this fixed length),
+both coordinates canonical, the point on the curve. The identity needs no
+separate test, since it has no uncompressed encoding. Behaviour as the
+reference: Go `crypto/ecdh` `Curve.NewPublicKey` (which Go's `crypto/hpke`
+uses to deserialize a NIST KEM key) refuses the same set. Public data, so not
+constant time. X25519 has no such function. RFC 9180 §7.1.4 needs no public
+key validation there (the all-zero DH check runs at `encap`), and Go accepts
+every 32-byte string. A protocol that wants the low-order points refused at
+admission checks them itself, as `mls` does. Anchor:
+`validatePublicKey: P-256/384/521 accept a real key, refuse every bad encoding
+exactly where encap does` in `dhkem.zig`. It covers seven bad-key classes per
+curve (y off the curve, `0x02`/`0x00`/`0x06` prefixes, all zeros, x ≥ p,
+y ≥ p), each refused by both `validatePublicKey` and `encapDeterministic`, and
+a real key accepted by both.
+
 ## Backlog / deferred
 
 - 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
 
 - **Done 2026-10-31:** post-quantum and hybrid KEMs, SHAKE/TurboSHAKE one-stage KDFs, the `export_only` suite (formerly three Backlog items; see "Post-quantum KEMs, one-stage KDFs, export-only").
-- **Public-key admission check for the NIST DHKEMs** (2026-11-17, from `mls`): a `validatePublicKey(pk)` per KEM (SEC1 uncompressed, on the curve, not the identity) that a protocol can call when it ADMITS a key (an MLS KeyPackage's `init_key` / leaf `encryption_key`), so an invalid P-256/384/521 point is refused at admission instead of failing later in `encap`. X25519's low-order check already plays that role for `mls`. Small; the curve modules already decode SEC1.
+- **Done 2026-11-17:** public-key admission check for the NIST DHKEMs (`validatePublicKey`, asked by `mls`; see "Public-key admission check").
 - **Runtime-agile suite selection** (Go `NewKEM`/`NewKDF`/`NewAEAD` by id): suites are comptime types here. A protocol that negotiates the suite (ECH, MLS) switches over the ids it supports itself (`tlsserver/src/ech.zig` does). Small; only if a consumer asks.
 - **One-stage psk mode has no published vector:** the draft's vectors and Go's are base mode only; psk over a one-stage KDF follows draft-ietf-hpke-hpke §5.1 `CombineSecrets_OneStage` text and is pinned by round trips only (`kat_go_test.zig`). Re-anchor when a psk vector is published.
 - **DHKEM(X448, HKDF-SHA512)** (0x0021) *(survey 2026-09-30)*: RFC 9180 registers it (MLS suites 0x0004/0x0006 need it); none of the peers offer X448. Small on top of sibling `ed448` (`x448.scalarmult`). Fits §2. (DHKEM(P-521, HKDF-SHA512) 0x0012: done 2026-10-10 on the `p521` module, RFC 9180 A.6 byte-exact.)

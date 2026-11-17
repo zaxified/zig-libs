@@ -453,6 +453,18 @@ pub const P256Kem = struct {
         out.* = .{ .secret_key = sk.*, .public_key = pk_point.toUncompressedSec1() };
     }
 
+    /// Admission check for a public key a protocol receives (an MLS
+    /// KeyPackage `init_key` or leaf `encryption_key`): the SEC1
+    /// uncompressed encoding of a point on the curve, which `encap` would
+    /// otherwise only refuse when it is first used. Exactly the
+    /// deserialization `encap`/`authDecap` apply (RFC 9180 §7.1.1
+    /// `DeserializePublicKey`), so whatever passes here deserializes there;
+    /// the identity has no uncompressed encoding. Like Go `crypto/ecdh`
+    /// `NewPublicKey`. Public data: not constant time.
+    pub fn validatePublicKey(pk: *const PublicKey) error{DeserializeError}!void {
+        _ = P256.fromSec1(pk) catch return error.DeserializeError;
+    }
+
     /// RFC 9180 §4.1/§7.1.2 `Encap(pkR)` for P-256 — same shape as
     /// `X25519Kem.encapDeterministic`, but the DH is a scalar-point
     /// multiply whose output is the shared point's X COORDINATE (RFC 9180
@@ -672,6 +684,18 @@ pub const P384Kem = struct {
         out.* = .{ .secret_key = sk.*, .public_key = pk_point.toUncompressedSec1() };
     }
 
+    /// Admission check for a public key a protocol receives (an MLS
+    /// KeyPackage `init_key` or leaf `encryption_key`): the SEC1
+    /// uncompressed encoding of a point on the curve, which `encap` would
+    /// otherwise only refuse when it is first used. Exactly the
+    /// deserialization `encap`/`authDecap` apply (RFC 9180 §7.1.1
+    /// `DeserializePublicKey`), so whatever passes here deserializes there;
+    /// the identity has no uncompressed encoding. Like Go `crypto/ecdh`
+    /// `NewPublicKey`. Public data: not constant time.
+    pub fn validatePublicKey(pk: *const PublicKey) error{DeserializeError}!void {
+        _ = P384.fromSec1(pk) catch return error.DeserializeError;
+    }
+
     /// RFC 9180 §4.1/§7.1.2 `Encap(pkR)` for P-384 — same shape as
     /// `P256Kem.encapDeterministic`: x-coordinate-only ECDH, `Nsecret=48`
     /// via `HkdfSha384`.
@@ -854,6 +878,18 @@ pub const P521Kem = struct {
         const pk_point = p521.P521.mulBaseCtUnburned(&le);
         std.crypto.secureZero(u8, &le);
         out.* = .{ .secret_key = sk.*, .public_key = pk_point.toUncompressedSec1() };
+    }
+
+    /// Admission check for a public key a protocol receives (an MLS
+    /// KeyPackage `init_key` or leaf `encryption_key`): the SEC1
+    /// uncompressed encoding of a point on the curve, which `encap` would
+    /// otherwise only refuse when it is first used. The same decode
+    /// `p521.ecdhInto` applies (RFC 9180 §7.1.1 `DeserializePublicKey`), so
+    /// whatever passes here deserializes there; the identity has no
+    /// uncompressed encoding. Like Go `crypto/ecdh` `NewPublicKey`. Public
+    /// data: not constant time.
+    pub fn validatePublicKey(pk: *const PublicKey) error{DeserializeError}!void {
+        _ = p521.P521.fromSec1(pk) catch return error.DeserializeError;
     }
 
     /// One DH: x(sk · pk) through `p521.ecdhInto`. A peer that does not
@@ -1756,4 +1792,52 @@ test "P384Kem's internal KDF is HKDF-SHA384: shared_secret matches an independen
     HkdfSha384.expand(&want, &info, eae_prk);
 
     try testing.expectEqualSlices(u8, &want, &got.shared_secret);
+}
+
+// ── validatePublicKey (admission check, 2026-11-17) ─────────────────────────
+
+/// For one NIST KEM: a real key passes; each class of bad encoding is refused,
+/// and refused exactly where `encapDeterministic` refuses it (the claim is
+/// "passes here <=> deserializes there").
+fn checkValidatePublicKey(comptime K: type, comptime Fe_len: usize) !void {
+    var kp: K.KeyPair = undefined;
+    var ikm: [K.Nsk]u8 = @splat(0x42);
+    K.deriveKeyPair(&kp, &ikm);
+    try K.validatePublicKey(&kp.public_key);
+
+    var eph: K.KeyPair = undefined;
+    ikm = @splat(0x17);
+    K.deriveKeyPair(&eph, &ikm);
+
+    var bad: [7]K.PublicKey = undefined;
+    bad[0] = kp.public_key;
+    bad[0][K.Npk - 1] ^= 1; // y moved off the curve
+    bad[1] = kp.public_key;
+    bad[1][0] = 0x02; // compressed prefix on an uncompressed-length key
+    bad[2] = kp.public_key;
+    bad[2][0] = 0x00; // the identity's prefix with a body
+    bad[3] = @splat(0); // all zeros
+    bad[4] = kp.public_key;
+    @memset(bad[4][1 .. 1 + Fe_len], 0xff); // x >= p: non-canonical
+    bad[5] = kp.public_key;
+    @memset(bad[5][1 + Fe_len ..], 0xff); // y >= p: non-canonical
+    bad[6] = kp.public_key;
+    bad[6][0] = 0x06; // hybrid / unknown prefix
+    for (&bad, 0..) |*pk, i| {
+        if (K.validatePublicKey(pk)) |_| {
+            std.debug.print("{s}: bad key {d} accepted\n", .{ @typeName(K), i });
+            return error.TestUnexpectedResult;
+        } else |err| try testing.expectEqual(error.DeserializeError, err);
+        var out: K.Encapped = undefined;
+        try testing.expectError(error.DeserializeError, K.encapDeterministic(&out, pk.*, &eph));
+    }
+    // And a key that passes is one encap takes.
+    var out: K.Encapped = undefined;
+    try K.encapDeterministic(&out, kp.public_key, &eph);
+}
+
+test "validatePublicKey: P-256/384/521 accept a real key, refuse every bad encoding exactly where encap does" {
+    try checkValidatePublicKey(P256Kem, 32);
+    try checkValidatePublicKey(P384Kem, 48);
+    try checkValidatePublicKey(P521Kem, 66);
 }
