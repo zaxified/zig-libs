@@ -797,6 +797,8 @@ test "compression: declared lengths and broken frames are errors" {
     var lz_bad_sum: [64]u8 = undefined;
     @memcpy(lz_bad_sum[0..lz_sized.len], lz_sized);
     lz_bad_sum[lz_sized.len - 1] ^= 1;
+    var lz_empty_buf: [16]u8 = undefined;
+    const lz_empty = lz_empty_buf[0..try lz4.compressInto("", &lz_empty_buf, .{})];
     var lz_bomb_buf: [64]u8 = undefined; // 4 KiB of zeros in a few bytes
     const lz_bomb = lz_bomb_buf[0..try lz4.compressInto(&@as([4096]u8, @splat(0)), &lz_bomb_buf, .{})];
     // The two-byte content `lz4 -l` would write: a legacy frame of the same bytes.
@@ -844,6 +846,8 @@ test "compression: declared lengths and broken frames are errors" {
         .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 8, lz[0 .. lz.len - 1]) },
         .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 8, lz[0..3]) },
         .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 8, frame) }, // a zstd frame
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 8, try std.mem.concat(a, u8, &.{ lz, "\x50\x2a\x4d\x18\x00\x00\x00\x00" })) }, // then a skippable frame
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 8, try std.mem.concat(a, u8, &.{ lz, lz_empty })) }, // then an empty frame
         .{ .want = error.Malformed, .buf = try pre(a, 8, lz) }, // an LZ4 frame marked ZSTD
         .{ .want = error.Unsupported, .codec = @fromBackingInt(@intCast(7)), .buf = try pre(a, -1, vals) },
     };
@@ -861,6 +865,16 @@ test "compression: declared lengths and broken frames are errors" {
             try testing.expectEqual(@as(i64, 7), f.columnAt(0).get(0).int);
             try testing.expectEqual(@as(i64, -8), f.columnAt(0).get(1).int);
         }
+    }
+    // A declared length of 0 still needs one LZ4 frame, of nothing (Arrow C++ hands the
+    // bytes to the codec whatever the length): the validity buffer here.
+    for ([_]struct { ok: bool, frame: []const u8 }{ .{ .ok = true, .frame = lz_empty }, .{ .ok = false, .frame = "junk" }, .{ .ok = false, .frame = lz } }) |c| {
+        const bytes = try hand(gpa, &fields, &.{.{ .length = 2, .nodes = &.{node}, .bufs = &.{ try pre(a, 0, c.frame), try pre(a, 8, lz) }, .codec = .lz4_frame }});
+        defer gpa.free(bytes);
+        const got = stream.readStream(a, bytes, .{});
+        if (c.ok) {
+            try testing.expectEqual(@as(i64, -8), (try got).columnAt(0).get(1).int);
+        } else try testing.expectError(error.Malformed, got);
     }
     // The body cap counts the whole message.
     const two = try hand(gpa, &fields, &.{.{ .length = 2, .nodes = &.{node}, .bufs = &.{ try pre(a, -1, "\xff"), try pre(a, 8, frame) }, .codec = .zstd }});

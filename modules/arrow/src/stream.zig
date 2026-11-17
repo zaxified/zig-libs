@@ -1378,11 +1378,12 @@ const Reader = struct {
                 const dst = out[at..][0..n];
                 if (std.mem.readInt(i64, src[0..8], .little) == -1) {
                     @memcpy(dst, src[8..]);
-                } else if (n > 0 and codec == .lz4_frame) {
+                } else if (codec == .lz4_frame) {
                     // Exactly one LZ4 frame, as Arrow C++ reads it (`LZ4F_decompress` until the
                     // frame ends, input left over is an error): no legacy or skippable frame,
-                    // nothing after it. The buffer is the cap: a frame (or its declared
-                    // content size) past the declared length stops there.
+                    // nothing after it, and a declared length of 0 still needs a frame (of
+                    // nothing). The buffer is the cap: a frame (or its declared content size)
+                    // past the declared length stops there.
                     const one = src[8..];
                     if (one.len < 4 or std.mem.readInt(u32, one[0..4], .little) != lz4.frame_magic) return error.Malformed;
                     const got = lz4.decompressInto(one, dst, .{ .max_output = null, .multi_frame = false }) catch return error.Malformed;
