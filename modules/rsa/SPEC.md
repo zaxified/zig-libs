@@ -520,8 +520,18 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
   (ssh Backlog).
 - **Private-key PEM: a ctgrind target** — ✅ 2026-10-17 the base64 half: `marshal.zig` encodes and
   `pemDecodeBody` decodes through the constant-time `b64ct` module (`standard.encode`,
-  `decodeIgnoring` with `pem_whitespace`). Still open: a ctgrind target over
-  `SecretKey.toPem`/`fromPem`, which would also measure the DER marshalling around it. Original text:
+  `decodeIgnoring` with `pem_whitespace`). A ctgrind target over
+  `SecretKey.toPem`/`fromPem` was **measured 2026-11-17 and is NOT clean, so no row is pinned**
+  (ReleaseFast, 2048-bit KAT key, `p`/`q`/`d`/`dP`/`dQ`/`qInv` tainted, `toPem(.pkcs1)` then `fromPem` of
+  that text: 227 contexts, none in the base64 codec). Classes: `toPem` 8 — `marshal.zig`'s
+  leading-zero strip of each INTEGER (`while field[z] == 0`, `field[z] & 0x80`), i.e. the DER length
+  bytes, which the SPEC already names as public by format; `fromPem` 213 — 107 inside `fromPrimes`'
+  re-derivation (target `keygen`'s residue), 46 in `checkWireFields` (`ff`/`dyn` carriers of the wire
+  integers), and the rest in the DER walk (`std.crypto.codecs.asn1`, `derChild`, `loadBE`), which
+  branches on the length bytes that the encoder derived from the key. The decode-side
+  counts are therefore dominated by the same documented DER-length dependence plus `keygen`'s
+  residue; a clean row would need the harness to declassify the (public-by-format) length bytes and
+  to count only the walk and the wire comparison, which is a design decision, not a pin. Open. Original text:
 - **Private-key PEM base64 is not constant-time** *(2026-10-16, found while wiring RSA into `acme`)*:
   `marshal.zig:282` encodes and `root.zig:2681` decodes the private-key DER through std's base64
   alphabet tables — loads indexed by key bytes, the class ctgrind found in `acme`'s EC key PEM on

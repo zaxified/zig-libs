@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** docs only: the ctgrind measurement of `SecretKey.toPem`/`fromPem` is recorded in SPEC (not clean: DER length bytes and `fromPrimes` residue; no row pinned).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-15** — **Performance (via montint, no rsa source change):** montint's almost-Montgomery `powMont` ladder speeds up every CRT private op. `bench-rsa` 2048, loaded host, base vs new: sign 0.985 → 0.960×, signbl 1.053 → 1.036×, dec 0.993 → 0.959×, decbl 1.071 → 1.038× OpenSSL. SPEC "2026-11-15: montint's almost-Montgomery ladder" also records the measurement that OpenSSL runs its MULX path here, not `rsaz_avx2`.
 
