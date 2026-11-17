@@ -87,6 +87,12 @@ Contracts (full detail in [SPEC.md](SPEC.md)):
   no trailer). An `Opener` reads version 2 only after `o.allow_padding = true`
   (otherwise `error.UnsupportedVersion`, as before) and returns the plaintext
   length without the padding; a bad trailer is `error.InvalidPadding`.
+- **Overlap at rekey (opt-in).** `Opener.rekeyOverlap(key, epoch)` /
+  `bumpEpochOverlap()` also keep the epoch being left (key and replay window) so
+  records in flight across the switch still open; `dropPrevious()` or the next
+  rekey/bump ends it (`previousEpoch()` shows it). Plain `rekey`/`bumpEpoch`
+  still refuse the old epoch. DTLS 1.3 allows retaining it for up to the MSL; the
+  module has no clock, so the caller ends the overlap.
 - **AAD binding.** The `aad` is authenticated into the tag; a record sealed
   under tenant A does not open under tenant B (`error.AuthenticationFailed`).
 

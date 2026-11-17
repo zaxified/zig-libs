@@ -106,6 +106,13 @@ pub const OpenError = error{
     InvalidPadding,
 } || std.crypto.errors.AuthenticationError;
 
+/// Error from the overlap rekeys of `Opener`.
+pub const OverlapError = error{
+    /// The new epoch equals the current one, so a record could not be told to
+    /// belong to the old key or the new one. Use a distinct epoch.
+    EpochNotDistinct,
+};
+
 /// Build a record/frame channel over a concrete AEAD.
 pub fn Channel(comptime Aead: type) type {
     comptime {
@@ -281,6 +288,19 @@ pub fn Channel(comptime Aead: type) type {
             /// the padding; `out` must still hold the whole encrypted body
             /// (`rec.len - record.overhead` bytes).
             allow_padding: bool = false,
+            /// The previous epoch's key and replay window, kept by `rekeyOverlap` /
+            /// `bumpEpochOverlap` so records in flight across the change still
+            /// open. Null (the default) means no overlap: an old-epoch record is
+            /// `EpochMismatch`. Cleared by `dropPrevious` and by any other
+            /// `rekey`/`bumpEpoch`; never consulted for sealing (the opener has no
+            /// sealing).
+            prev: ?Previous = null,
+
+            const Previous = struct {
+                key: [32]u8,
+                epoch: u32,
+                window: replay.ReplayWindow,
+            };
 
             pub fn init(key: [32]u8, epoch: u32) Opener {
                 return .{ .key = key, .epoch = epoch };
@@ -314,10 +334,20 @@ pub fn Channel(comptime Aead: type) type {
 
             fn openBody(self: *Opener, out: []u8, rec: []const u8, aad: []const u8) OpenError!usize {
                 const p = try record.parseWith(rec, self.allow_padding);
-                if (p.header.epoch != self.epoch) return error.EpochMismatch;
+                // The current epoch wins; the retained previous epoch (overlap)
+                // opens under its own key and its own window (RFC 9147 §4.5.1:
+                // "a separate sliding window is needed for each epoch").
+                var key: *const [32]u8 = &self.key;
+                var window: *replay.ReplayWindow = &self.window;
+                if (p.header.epoch != self.epoch) {
+                    const pv = if (self.prev) |*x| x else return error.EpochMismatch;
+                    if (p.header.epoch != pv.epoch) return error.EpochMismatch;
+                    key = &pv.key;
+                    window = &pv.window;
+                }
                 if (out.len < p.ct_len) return error.BufferTooSmall;
                 if (aad.len > max_caller_aad) return error.AadTooLarge;
-                if (!self.window.accepts(p.header.seq)) return error.Replayed;
+                if (!window.accepts(p.header.seq)) return error.Replayed;
 
                 const nonce = record.deriveNonce(p.header.epoch, p.header.seq);
                 const ct = rec[p.ct_off..][0..p.ct_len];
@@ -326,14 +356,14 @@ pub fn Channel(comptime Aead: type) type {
                 var aad_scratch: [record.header_len + max_caller_aad]u8 = undefined;
                 const eff_aad = try effectiveAad(&aad_scratch, rec[0..record.header_len], aad);
                 const pt = out[0..p.ct_len];
-                Aead.decrypt(pt, ct, tag, eff_aad, nonce, self.key) catch |e| {
+                Aead.decrypt(pt, ct, tag, eff_aad, nonce, key.*) catch |e| {
                     // Uniform across AEADs: std's AES-GCM leaves `m` undefined
                     // on failure, chachapoly zeroes it. Make the "no garbage
                     // plaintext" contract hold for both.
                     std.crypto.secureZero(u8, pt);
                     return e;
                 };
-                self.window.commit(p.header.seq);
+                window.commit(p.header.seq);
                 if (!p.padded) return p.ct_len;
                 return stripPadding(pt) catch |e| {
                     std.crypto.secureZero(u8, pt);
@@ -358,8 +388,62 @@ pub fn Channel(comptime Aead: type) type {
             /// replay window (fresh nonce space ⇒ old sequence numbers void).
             pub fn bumpEpoch(self: *Opener) EpochError!void {
                 if (self.epoch == std.math.maxInt(u32)) return error.EpochExhausted;
+                self.dropPrevious();
                 self.epoch += 1;
                 self.window.reset();
+            }
+
+            /// `bumpEpoch` that keeps the epoch being left (same key, its replay
+            /// window as it stands) for records still in flight: they keep opening
+            /// until `dropPrevious` or the next rekey/bump of any kind. Whatever
+            /// was retained before is dropped. The sealer side needs nothing: it
+            /// only ever seals under its newest epoch.
+            pub fn bumpEpochOverlap(self: *Opener) EpochError!void {
+                if (self.epoch == std.math.maxInt(u32)) return error.EpochExhausted;
+                self.dropPrevious();
+                self.prev = .{ .key = self.key, .epoch = self.epoch, .window = self.window };
+                self.epoch += 1;
+                self.window.reset();
+            }
+
+            /// `rekey` that keeps the key and epoch being left, with the replay
+            /// window as it stands, so records sealed just before the peer
+            /// switched still open. DTLS 1.3 (RFC 9147 §4.2.1) allows an endpoint
+            /// to retain the previous epoch's keying material for reordering,
+            /// with a window per epoch; ESP keeps the old SA until its delete. The
+            /// module has no clock: the overlap lasts until `dropPrevious` or the
+            /// next `rekey`/`bumpEpoch` of any kind (which also wipe the retained
+            /// key), and the caller bounds it (RFC 9147: up to the TCP MSL). One
+            /// previous epoch is kept, never a chain. `error.EpochNotDistinct`
+            /// when `new_epoch` equals the current epoch.
+            pub fn rekeyOverlap(self: *Opener, new_key: [32]u8, new_epoch: u32) OverlapError!void {
+                return burn.run(burn.frame_burn, OverlapError!void, rekeyOverlapBody, .{ self, &new_key, new_epoch });
+            }
+
+            /// `rekeyOverlap` with the new key by pointer (dead-stack-clean).
+            pub fn rekeyOverlapInto(self: *Opener, new_key: *const [32]u8, new_epoch: u32) OverlapError!void {
+                return burn.run(burn.frame_burn, OverlapError!void, rekeyOverlapBody, .{ self, new_key, new_epoch });
+            }
+
+            fn rekeyOverlapBody(self: *Opener, new_key: *const [32]u8, new_epoch: u32) OverlapError!void {
+                if (new_epoch == self.epoch) return error.EpochNotDistinct;
+                self.dropPrevious();
+                self.prev = .{ .key = self.key, .epoch = self.epoch, .window = self.window };
+                self.key = new_key.*;
+                self.epoch = new_epoch;
+                self.window.reset();
+            }
+
+            /// End an overlap: wipe the retained previous key and refuse that
+            /// epoch from now on (`EpochMismatch`). A no-op when none is kept.
+            pub fn dropPrevious(self: *Opener) void {
+                if (self.prev) |*pv| std.crypto.secureZero(u8, &pv.key);
+                self.prev = null;
+            }
+
+            /// The epoch kept by an overlap, or null.
+            pub fn previousEpoch(self: *const Opener) ?u32 {
+                return if (self.prev) |pv| pv.epoch else null;
             }
 
             /// Rekey to a caller-supplied fresh key + epoch and reset the
@@ -376,6 +460,7 @@ pub fn Channel(comptime Aead: type) type {
             }
 
             fn rekeyBody(self: *Opener, new_key: *const [32]u8, new_epoch: u32) void {
+                self.dropPrevious();
                 self.key = new_key.*;
                 self.epoch = new_epoch;
                 self.window.reset();
@@ -386,6 +471,7 @@ pub fn Channel(comptime Aead: type) type {
             /// record of what this peer already accepted.
             pub fn wipe(self: *Opener) void {
                 std.crypto.secureZero(u8, &self.key);
+                self.dropPrevious();
             }
         };
     };
@@ -1169,9 +1255,12 @@ test "padded record: an authentic record with a bad trailer is InvalidPadding, c
         const Aead = c[1];
         const key = testKey(25);
         const bodies = [_][]const u8{
-            "data" ++ [_]u8{ 0, 1, 0, 3 }, // a non-zero padding byte
+            "data" ++ [_]u8{ 0, 1, 0, 0, 3 }, // a non-zero padding byte (middle)
+            "data" ++ [_]u8{ 9, 0, 0, 0, 3 }, // ... first
+            "data" ++ [_]u8{ 0, 0, 7, 0, 3 }, // ... last
             "data" ++ [_]u8{ 0, 0, 0, 9 }, // pad length longer than the body
-            "ab" ++ [_]u8{ 0, 3 }, // pad length 3 > the 2 bytes before the trailer
+            "ab" ++ [_]u8{ 0, 3 }, // pad length 3 > the 0 bytes before the trailer
+            &[_]u8{ 0, 3, 0 }, // trailer read from the last two bytes only
             &[_]u8{ 0xff, 0xff }, // pad length 65535 > body
         };
         for (bodies, 0..) |body, i| {
@@ -1224,5 +1313,150 @@ test "padded record: the maximum pad, buffer boundaries and block rounding" {
         const pad = record.padForBlock(len, 16);
         try testing.expectEqual(@as(usize, 0), (len + pad + record.pad_trailer_len) % 16);
         try testing.expect(pad < 16);
+    }
+}
+
+// ── multi-epoch opener: overlap window at rekey ──────────────────────────────
+
+test "overlap rekey: in-flight old-epoch records open, windows are per epoch, default is unchanged (both AEADs)" {
+    inline for (channels) |Ch| {
+        const key_a = testKey(31);
+        const key_b = testKey(32);
+        var s_old = Ch.Sealer.init(key_a, 0);
+        var s_new = Ch.Sealer.init(key_b, 1);
+        var old: [4][record.overhead + 1]u8 = undefined;
+        for (&old, 0..) |*r, i| _ = try s_old.seal(r, &[_]u8{@intCast('a' + i)}, "c");
+        var pt: [1]u8 = undefined;
+
+        // Without overlap, the same switch refuses the in-flight record.
+        {
+            var plain = Ch.Opener.init(key_a, 0);
+            _ = try plain.open(&pt, &old[0], "c");
+            plain.rekey(key_b, 1);
+            try testing.expectEqual(@as(?u32, null), plain.previousEpoch());
+            try testing.expectError(error.EpochMismatch, plain.open(&pt, &old[1], "c"));
+        }
+
+        var o = Ch.Opener.init(key_a, 0);
+        _ = try o.open(&pt, &old[0], "c"); // seq 0 delivered before the switch
+        try o.rekeyOverlap(key_b, 1);
+        try testing.expectEqual(@as(?u32, 0), o.previousEpoch());
+
+        // New-epoch traffic races ahead; its window must not affect the old one.
+        var n: [record.overhead + 1]u8 = undefined;
+        s_new.seq = 50;
+        _ = try s_new.seal(&n, "N", "c");
+        try testing.expectEqual(@as(usize, 1), try o.open(&pt, &n, "c"));
+        try testing.expectEqualStrings("N", &pt);
+
+        // Old records still in flight: seq 2 before seq 1 (reordered), both open once.
+        try testing.expectEqual(@as(usize, 1), try o.open(&pt, &old[2], "c"));
+        try testing.expectEqualStrings("c", &pt);
+        try testing.expectEqual(@as(usize, 1), try o.open(&pt, &old[1], "c"));
+        try testing.expectEqualStrings("b", &pt);
+        // Replays in the old epoch: seq 0 (opened before the switch) and seq 2.
+        try testing.expectError(error.Replayed, o.open(&pt, &old[0], "c"));
+        try testing.expectError(error.Replayed, o.open(&pt, &old[2], "c"));
+        // An epoch that is neither is still a mismatch.
+        var s_x = Ch.Sealer.init(key_b, 2);
+        var x: [record.overhead + 1]u8 = undefined;
+        _ = try s_x.seal(&x, "x", "c");
+        try testing.expectError(error.EpochMismatch, o.open(&pt, &x, "c"));
+
+        // The new epoch has its own fresh window: its seq 0 opens although the old epoch used seq 0.
+        var s_fresh = Ch.Sealer.init(key_b, 1);
+        var f0: [record.overhead + 1]u8 = undefined;
+        _ = try s_fresh.seal(&f0, "F", "c");
+        try testing.expectEqual(@as(usize, 1), try o.open(&pt, &f0, "c"));
+
+        // Ending the overlap refuses the old epoch and wipes its key.
+        o.dropPrevious();
+        try testing.expectEqual(@as(?u32, null), o.previousEpoch());
+        try testing.expectError(error.EpochMismatch, o.open(&pt, &old[3], "c"));
+        o.dropPrevious(); // a no-op when nothing is kept
+    }
+}
+
+test "overlap rekey: a forged old-epoch record burns nothing; the retained key is wiped on drop, wipe and any other rekey" {
+    inline for (channels) |Ch| {
+        const key_a = testKey(33);
+        const key_b = testKey(34);
+        var s_old = Ch.Sealer.init(key_a, 0);
+        var o = Ch.Opener.init(key_a, 0);
+        try o.rekeyOverlap(key_b, 1);
+        try testing.expectEqualSlices(u8, &key_a, &o.prev.?.key);
+
+        // Same epoch number, wrong key: authentication fails and the slot stays free.
+        var forger = Ch.Sealer.init(testKey(99), 0);
+        var bad: [record.overhead + 1]u8 = undefined;
+        _ = try forger.seal(&bad, "f", "c");
+        var pt: [1]u8 = undefined;
+        try testing.expectError(error.AuthenticationFailed, o.open(&pt, &bad, "c"));
+        var good: [record.overhead + 1]u8 = undefined;
+        _ = try s_old.seal(&good, "g", "c");
+        try testing.expectEqual(@as(usize, 1), try o.open(&pt, &good, "c"));
+
+        // Another overlap replaces the retained epoch (one, never a chain) and wipes the old key.
+        try o.rekeyOverlap(testKey(35), 2);
+        try testing.expectEqual(@as(?u32, 1), o.previousEpoch());
+        try testing.expectEqualSlices(u8, &key_b, &o.prev.?.key);
+        try testing.expectError(error.EpochMismatch, o.open(&pt, &good, "c")); // epoch 0 is gone
+
+        // dropPrevious zeroes the retained key where it lives (the optional's payload outlives the null).
+        try o.rekeyOverlap(testKey(60), 7);
+        const kept: *const [32]u8 = &o.prev.?.key;
+        try testing.expectEqualSlices(u8, &testKey(35), kept);
+        o.dropPrevious();
+        try testing.expectEqualSlices(u8, &@as([32]u8, @splat(0)), kept);
+
+        // A plain rekey ends it; so does bumpEpoch; so does wipe.
+        try o.rekeyOverlap(testKey(61), 8);
+        try testing.expect(o.previousEpoch() != null);
+        o.rekey(testKey(36), 3);
+        try testing.expectEqual(@as(?u32, null), o.previousEpoch());
+        try o.rekeyOverlap(testKey(37), 4);
+        try o.bumpEpoch();
+        try testing.expectEqual(@as(?u32, null), o.previousEpoch());
+        try o.rekeyOverlap(testKey(38), 6);
+        o.wipe();
+        try testing.expectEqual(@as(?u32, null), o.previousEpoch());
+    }
+}
+
+test "overlap rekey: same-epoch rekey is refused untouched; bumpEpochOverlap keeps the same key and window" {
+    inline for (channels) |Ch| {
+        const key = testKey(40);
+        var o = Ch.Opener.init(key, 5);
+        try testing.expectError(error.EpochNotDistinct, o.rekeyOverlap(testKey(41), 5));
+        // Any distinct epoch is fine, a lower one too (the caller numbers epochs).
+        var lower = Ch.Opener.init(key, 5);
+        try lower.rekeyOverlap(testKey(42), 2);
+        try testing.expectEqual(@as(?u32, 5), lower.previousEpoch());
+        try testing.expectEqual(@as(u32, 2), lower.epoch);
+        try testing.expectEqualSlices(u8, &key, &o.key);
+        try testing.expectEqual(@as(?u32, null), o.previousEpoch());
+        try testing.expectEqual(@as(u32, 5), o.epoch);
+
+        var s = Ch.Sealer.init(key, 5);
+        var recs: [3][record.overhead + 1]u8 = undefined;
+        for (&recs) |*r| _ = try s.seal(r, "z", "");
+        var pt: [1]u8 = undefined;
+        _ = try o.open(&pt, &recs[0], "");
+        try o.bumpEpochOverlap();
+        try testing.expectEqual(@as(u32, 6), o.epoch);
+        try testing.expectEqual(@as(?u32, 5), o.previousEpoch());
+        try testing.expectError(error.Replayed, o.open(&pt, &recs[0], "")); // its window came along
+        try testing.expectEqual(@as(usize, 1), try o.open(&pt, &recs[2], ""));
+        try testing.expectEqual(@as(usize, 1), try o.open(&pt, &recs[1], ""));
+        // The new epoch opens under the same key with a fresh window.
+        try s.bumpEpoch();
+        var next: [record.overhead + 1]u8 = undefined;
+        _ = try s.seal(&next, "n", "");
+        try testing.expectEqual(@as(usize, 1), try o.open(&pt, &next, ""));
+
+        // The epoch ceiling is refused with the state intact.
+        var top = Ch.Opener.init(key, std.math.maxInt(u32));
+        try testing.expectError(error.EpochExhausted, top.bumpEpochOverlap());
+        try testing.expectEqual(@as(?u32, null), top.previousEpoch());
     }
 }

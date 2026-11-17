@@ -70,6 +70,7 @@ pub const AesGcmOpener = channel.AesGcmOpener;
 pub const SealError = channel.SealError;
 pub const EpochError = channel.EpochError;
 pub const OpenError = channel.OpenError;
+pub const OverlapError = channel.OverlapError;
 
 pub const ReplayWindow = replay.ReplayWindow;
 pub const version = record.version;

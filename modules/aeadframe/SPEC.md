@@ -6,7 +6,7 @@
 
 **Scope:** core — IPsec ESP (RFC 4303) / DTLS 1.3 record layer (RFC 9147 §5); no single reference implementation (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation 2026-10-05 (35/35) · src ?
+**Audit:** review 2026-08-06 · mutation 2026-11-17 (79/82, 3 eq) · src 551b77868cdf0024
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, AEADFRAME_FUZZ) · ct 2026-10-10 (ctgrind: channel keys + plaintext through seal/rekey/open, ChaCha20-Poly1305 and AES-256-GCM; 5 in-file each = AEAD verdicts + the rekey same-key verdict)
 **Performance:** not measured
@@ -35,7 +35,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [google/tink](https://github.com/google/tink) streaming AEAD | Java/C++/Go/… | Apache-2.0 | 13.5k | v1.7.0 (2022-08-10) | Segment-based streaming AEAD with key derivation per stream *(inferred)*. Repository quiet since 2024-04. |
 | Zig `std.crypto.aead` | Zig | MIT | — | Zig 0.16.0 | Single-shot AEAD primitives only; no record framing, no nonce management, no replay filter *(inferred)*. |
 
-**Where we are ahead:** one small, allocation-free record layer that does nonce derivation, epoch/rekey and a replay window together (the libsodium/STREAM constructions assume ordered delivery and have no replay window), generic over ChaCha20-Poly1305 and AES-256-GCM, with a byte-anchored wire KAT and a decode fuzz harness. **Where we are behind:** no end-of-stream signal (documented), no sequence-number encryption (DTLS 1.3; length padding is opt-in, §2.1), no multi-epoch overlap opener, one-key-per-instance only (no SPI/connection-id demultiplexing).
+**Where we are ahead:** one small, allocation-free record layer that does nonce derivation, epoch/rekey and a replay window together (the libsodium/STREAM constructions assume ordered delivery and have no replay window), generic over ChaCha20-Poly1305 and AES-256-GCM, with a byte-anchored wire KAT and a decode fuzz harness. **Where we are behind:** no end-of-stream signal (documented), no sequence-number encryption (DTLS 1.3; length padding is opt-in, §2.1), an overlap opener only as opt-in (§4.1), one-key-per-instance only (no SPI/connection-id demultiplexing).
 
 ## 1. Model
 
@@ -200,9 +200,33 @@ replay meaning under the new one. An old-epoch record presented to an advanced
 opener is rejected with `error.EpochMismatch` before any crypto.
 
 This module implements **explicit, caller-driven** epoch transitions on both
-ends (no automatic negotiation). Out-of-order delivery *across* an epoch
-boundary is not handled — a record from the previous epoch arriving after the
-opener has advanced is dropped (see §6).
+ends (no automatic negotiation). By default, out-of-order delivery *across* an
+epoch boundary is not handled — a record from the previous epoch arriving after
+the opener has advanced is dropped (`EpochMismatch`). The opt-in overlap below
+keeps the previous epoch open for such records.
+
+### 4.1 Overlap window at rekey (multi-epoch opener)
+
+`Opener.rekeyOverlap(new_key, new_epoch)` and `Opener.bumpEpochOverlap()` do what
+`rekey`/`bumpEpoch` do and additionally retain the epoch being left: its key and
+its replay window as it stands. Records of either epoch then open, each under its
+own key and its own window; any other epoch is `EpochMismatch`. The current epoch
+wins when both could apply (they cannot: `rekeyOverlap` refuses
+`new_epoch == current` with `EpochNotDistinct`).
+
+Reference rule. DTLS 1.3 (RFC 9147 §4.2.1): implementations SHOULD discard earlier
+epochs but MAY retain their keying material, for up to the TCP MSL, to handle
+reordering; §4.5.1: a separate sliding window per epoch, updated only after the
+record is deprotected; §5.6: a server SHOULD NOT accept the old epoch
+indefinitely. ESP keeps the old SA until its delete/lifetime. So the default
+stays "discard" (unchanged), the overlap is opt-in, one previous epoch is kept
+(never a chain), a window per epoch, committed only after authentication, and
+the end is the caller's: the module has no clock, so the overlap ends at
+`dropPrevious()` or at the next `rekey`/`bumpEpoch` of any kind (which also wipe
+the retained key), and `wipe()` destroys it. The caller should end it within the
+MSL-scale bound DTLS gives. A forged record in the retained epoch fails
+authentication and burns no slot, as for the current epoch. The sealer needs no
+overlap: it seals under its newest epoch only.
 
 ## 5. Anti-replay window
 
@@ -318,9 +342,9 @@ arbitrary bytes:
   retain every key it has held, which is the opposite of the forward secrecy
   `rekey` exists to provide — so it is a caller obligation, stated rather than
   enforced.
-- **Out-of-order delivery across an epoch boundary.** Records straddling a
-  rekey are dropped as `EpochMismatch`; a multi-epoch opener (keeping the
-  previous epoch's key+window alive during a transition window) is not built.
+- **Out-of-order delivery across an epoch boundary.** By default, records
+  straddling a rekey are dropped as `EpochMismatch`; the opt-in overlap opener
+  (§4.1) keeps one previous epoch's key and window until the caller ends it.
 - **Multi-channel / tenant map.** One `Channel` is one `(key, epoch)` context.
   The I-SID → channel map is orchestration glue above this module.
 - **Concurrency.** `single_owner`: a `Sealer`/`Opener` is owned by one
@@ -350,9 +374,13 @@ ceiling and advance, both `bumpEpoch`s, `rekey`'s nonce-space rule and seq/windo
   checked beyond it), seq restart at 0 after `bumpEpoch`/`rekey` on a sealer that had sealed,
   and `Opener.rekey` restarting the window.
 
+### Delta mutation 2026-11-17 (padding and overlap)
+
+47 schemata mutants over the code added the same day (ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`): `record.zig` (`parseWith`: the allow flag and the version compare forced, the version refusal dropped, the trailer-length guard at its boundary and dropped, the `padded` flag; `padForBlock`: the small-block shortcut, the trailer term, the aligned case, the clamp; the version byte of `encodePadded`) and `channel.zig` (`sealCore`: the trailer in the body length, the header version, the pad-length value's endianness, the zero fill, the plaintext copy, the tag offset, `sealedLenPadded`; `openBody`: the allow flag, the epoch test, the previous-epoch test, which key and which window the previous epoch uses, the window commit, the padded branch; `stripPadding`: the trailer-fit bound at its boundary and dropped, the zero check, its length by one, the plaintext length, the trailer's endianness; `bumpEpochOverlap`, `rekeyOverlapBody`, `bumpEpoch`, `rekeyBody` and `wipe`: the retained epoch's assignment, its window, the key and window reset, the same-epoch refusal, the drop; `dropPrevious`; `previousEpoch`). First run: 43 killed, 4 survived. One test fix (a plain `rekey` after an overlap was checked against an already-empty retained slot) killed one: 44 killed. Three survivors, each argued: `bumpEpochOverlap` and `rekeyOverlapBody` without their leading `dropPrevious()` are EQUIVALENT (the next statement overwrites the whole retained slot, key included); `dropPrevious` without its `secureZero` is UNOBSERVABLE here (the test that reads the retained key through a pointer after the drop still sees zeros, because this compiler's null store clears the optional's payload too; the explicit wipe stays as the guarantee the language does not give). Not run: the rekeyOverlap same-epoch compare as `<=` (one anchor, taken by the dropped-check mutant; a test pins a lower distinct epoch as accepted). The card's counts are cumulative with the 2026-10-05 run: 35 + 44 = 79 killed, 3 equivalent, 82 mutants.
+
 ## Backlog / deferred
 
-- **Multi-epoch opener (overlap window at rekey)** *(survey 2026-09-30)* — records in flight across a rekey are dropped as `EpochMismatch`; DTLS 1.3 and ESP rekeying keep the previous SA alive briefly. A user rekeying on a lossy/reordering link loses records. Effort: small-medium; fits §2. (Already noted in SPEC §8 as deferred; the survey rates it worth doing.)
+- **Multi-epoch opener (overlap window at rekey)** — DONE 2026-11-17, see §4.1.
 - **Optional length padding** — DONE 2026-11-17, see §2.1.
 
 ## Anchoring
