@@ -2786,6 +2786,7 @@ test "classic qdiscs: invalid prio bands/priomap refused, options nest only when
         .{ .bands = 1 },
         .{ .bands = 17 },
         .{ .bands = 2 }, // the default priomap has a 2
+        .{ .bands = 1, .priomap = @splat(0) }, // one band is not a priority qdisc, even with a valid map
         .{ .bands = 3, .priomap = .{ 3, 2, 2, 2, 1, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 } },
     };
     for (bad) |p| {
@@ -2816,4 +2817,137 @@ test "classic qdiscs: invalid prio bands/priomap refused, options nest only when
     try testing.expect(v0.depth == null and v0.red == null);
     const v1 = qdisc.parseSfqOptions(&@as([28]u8, @splat(0))).?;
     try testing.expect(v1.depth != null and v1.red == null);
+}
+
+test "delta tests: bpf instruction layout, bpf flag attributes read back apart" {
+    const codec = @import("netlink").codec;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    const spec: filter.FilterSpec = .{ .bpf = .{ .ops = &.{.{ .code = 0x15, .jt = 1, .jf = 2, .k = 0x01020304 }} } };
+    try spec.appendOptionsWith(gpa, &list, ps);
+    var it: codec.AttrIterator = .{ .buf = list.items };
+    var seen: bool = false;
+    while (try it.next()) |a| if (a.type == filter.TCA_BPF.OPS) {
+        seen = true;
+        var want: [8]u8 = undefined;
+        std.mem.writeInt(u16, want[0..2], 0x15, native_endian);
+        want[2] = 1;
+        want[3] = 2;
+        std.mem.writeInt(u32, want[4..8], 0x01020304, native_endian);
+        try testing.expectEqualSlices(u8, &want, a.data);
+    };
+    try testing.expect(seen);
+
+    var buf: [512]u8 = undefined;
+    const sw = try std.fmt.hexToBytes(buf[0 .. g_bpf_bytecode_skip_sw.len / 2], g_bpf_bytecode_skip_sw);
+    var mit: codec.MessageIterator = .{ .buf = sw };
+    const f = try filter.parseFilter((try mit.next()).?.payload);
+    try testing.expectEqual(@as(?u32, null), f.bpf.?.flags);
+    try testing.expectEqual(@as(?u32, 2), f.bpf.?.flags_gen);
+    const da = try std.fmt.hexToBytes(buf[0 .. g_bpf_bytecode_da.len / 2], g_bpf_bytecode_da);
+    var mit2: codec.MessageIterator = .{ .buf = da };
+    const g = try filter.parseFilter((try mit2.next()).?.payload);
+    try testing.expectEqual(@as(?u32, 1), g.bpf.?.flags);
+    try testing.expectEqual(@as(?u32, null), g.bpf.?.flags_gen);
+    try testing.expectEqual(@as(?u16, 1), g.bpf.?.ops_len);
+}
+
+fn expectOptionsBytes(spec: qdisc.QdiscSpec) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    try spec.appendOptions(gpa, &list, ps);
+    return list.toOwnedSlice(gpa);
+}
+
+test "delta tests: prio bands 16, prio/sfq payload length edges, sfq single-field options" {
+    const sixteen = try expectOptionsBytes(.{ .prio = .{ .bands = 16, .priomap = @splat(15) } });
+    defer gpa.free(sixteen);
+    try testing.expectEqual(@as(u32, 16), qdisc.parsePrioOptions(sixteen).?.bands);
+    try testing.expect(qdisc.parsePrioOptions(&@as([19]u8, @splat(0))) == null);
+    try testing.expect(qdisc.parsePrioOptions(&@as([20]u8, @splat(0))) != null);
+    try testing.expect(qdisc.parseFifoOptions(&@as([4]u8, @splat(0))) != null);
+    try testing.expect(qdisc.parseSfqOptions(&@as([20]u8, @splat(0))) != null);
+    try testing.expect(qdisc.parseSfqOptions(&@as([47]u8, @splat(0))).?.red == null);
+    try testing.expect(qdisc.parseSfqOptions(&@as([48]u8, @splat(0))).?.red != null);
+    try testing.expect(qdisc.parseSfqOptions(&@as([27]u8, @splat(0))).?.depth == null);
+
+    const singles = [_]qdisc.Sfq{
+        .{ .quantum = 1 },
+        .{ .perturb_s = 1 },
+        .{ .limit = 1 },
+        .{ .divisor = 1 },
+        .{ .flows = 1 },
+        .{ .depth = 1 },
+        .{ .headdrop = true },
+        .{ .red = .{} },
+    };
+    for (singles) |s| try testing.expect((qdisc.QdiscSpec{ .sfq = s }).carriesOptions());
+
+    // Every RED field in its own place; scell_log is 0 in the capture.
+    const red = try expectOptionsBytes(.{ .sfq = .{ .red = .{ .flow_limit = 1, .qth_min = 2, .qth_max = 3, .wlog = 4, .plog = 5, .scell_log = 6, .flags = 7, .max_p = 8 } } });
+    defer gpa.free(red);
+    const w = qdisc.parseSfqOptions(red).?;
+    try testing.expectEqual(@as(u32, 0), w.limit);
+    try testing.expectEqual(qdisc.SfqRed{ .flow_limit = 1, .qth_min = 2, .qth_max = 3, .wlog = 4, .plog = 5, .scell_log = 6, .flags = 7, .max_p = 8 }, w.red.?);
+    try testing.expectEqual(@as(u32, 0), w.headdrop.?);
+}
+
+test "delta tests: codel and fq round trip with a distinct value in every field" {
+    const codec = @import("netlink").codec;
+    const c = try expectOptionsBytes(.{ .codel = .{ .limit = 11, .interval_us = 12, .target_us = 13, .ecn = true, .ce_threshold_us = 15 } });
+    defer gpa.free(c);
+    const cw = try qdisc.parseCodelOptions(c);
+    try testing.expectEqual(@as(?u32, 11), cw.limit);
+    try testing.expectEqual(@as(?u32, 12), cw.interval_us);
+    try testing.expectEqual(@as(?u32, 13), cw.target_us);
+    try testing.expectEqual(@as(?u32, 1), cw.ecn);
+    try testing.expectEqual(@as(?u32, 15), cw.ce_threshold_us);
+
+    const f = try expectOptionsBytes(.{ .fq = .{
+        .limit = 101,
+        .flow_limit = 102,
+        .quantum = 103,
+        .initial_quantum = 104,
+        .pacing = true,
+        .maxrate = 106,
+        .buckets_log = 107,
+        .refill_delay_us = 108,
+        .orphan_mask = 109,
+        .low_rate_threshold = 110,
+        .ce_threshold_us = 111,
+        .timer_slack_ns = 112,
+        .horizon_us = 113,
+        .horizon_drop = false,
+        .priomap = .{ 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0 },
+        .weights = .{ 1, 2, 3 },
+        .offload_horizon_us = 117,
+    } });
+    defer gpa.free(f);
+    const w = try qdisc.parseFqOptions(f);
+    try testing.expectEqual(@as(?u32, 101), w.limit);
+    try testing.expectEqual(@as(?u32, 102), w.flow_limit);
+    try testing.expectEqual(@as(?u32, 103), w.quantum);
+    try testing.expectEqual(@as(?u32, 104), w.initial_quantum);
+    try testing.expectEqual(@as(?u32, 1), w.pacing);
+    try testing.expectEqual(@as(?u32, 106), w.maxrate);
+    try testing.expectEqual(@as(?u32, 107), w.buckets_log);
+    try testing.expectEqual(@as(?u32, 108), w.refill_delay_us);
+    try testing.expectEqual(@as(?u32, 109), w.orphan_mask);
+    try testing.expectEqual(@as(?u32, 110), w.low_rate_threshold);
+    try testing.expectEqual(@as(?u32, 111), w.ce_threshold_us);
+    try testing.expectEqual(@as(?u32, 112), w.timer_slack_ns);
+    try testing.expectEqual(@as(?u32, 113), w.horizon_us);
+    try testing.expectEqual(@as(?u8, 0), w.horizon_drop);
+    try testing.expectEqual(@as(u8, 2), w.priomap.?[2]);
+    try testing.expectEqual([3]i32{ 1, 2, 3 }, w.weights.?);
+    try testing.expectEqual(@as(?u32, 117), w.offload_horizon_us);
+
+    // Attributes of the wrong size are skipped, not misread.
+    var odd: std.ArrayList(u8) = .empty;
+    defer odd.deinit(gpa);
+    try codec.appendAttr(gpa, &odd, qdisc.TCA_FQ.PRIO, &@as([19]u8, @splat(1)));
+    try codec.appendAttr(gpa, &odd, qdisc.TCA_FQ.WEIGHTS, &@as([16]u8, @splat(1)));
+    try codec.appendAttr(gpa, &odd, qdisc.TCA_FQ.HORIZON_DROP, &@as([4]u8, @splat(1)));
+    const ow = try qdisc.parseFqOptions(odd.items);
+    try testing.expect(ow.priomap == null and ow.weights == null and ow.horizon_drop == null);
 }
