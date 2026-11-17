@@ -115,7 +115,7 @@ fn reloadVolatile(comptime T: type, s: *const T) T {
     return out;
 }
 
-const Target = enum { crt, crtbl, crtcache, noncrt, keygen, oaepnf };
+const Target = enum { crt, crtbl, crtcache, noncrt, keygen, oaepnf, pemenc, pemdec };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -125,6 +125,8 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "noncrt")) return .noncrt;
     if (std.mem.eql(u8, s, "keygen")) return .keygen;
     if (std.mem.eql(u8, s, "oaepnf")) return .oaepnf;
+    if (std.mem.eql(u8, s, "pemenc")) return .pemenc;
+    if (std.mem.eql(u8, s, "pemdec")) return .pemdec;
     return error.UnknownTarget;
 }
 
@@ -179,6 +181,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return;
     }
 
+    if (target == .pemenc) return pemEnc(taint);
+    if (target == .pemdec) return pemDec(taint);
+
     // For `crt`/`noncrt`, key construction runs on the UNTAINTED fixed KAT
     // bytes — the per-operation path is what those targets measure; the
     // import itself is target `keygen`'s.
@@ -216,7 +221,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .noncrt => {
             taintBytes(taint, std.mem.asBytes(&sk.d));
         },
-        .keygen => unreachable, // returned above
+        .keygen, .pemenc, .pemdec => unreachable, // returned above
     }
 
     const sk_reloaded = reloadVolatile(rsa.SecretKey, &sk);
@@ -255,10 +260,123 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("ok={} msg={x}\n", .{ r.ok, r.msg });
             out = raw_out;
         },
-        .keygen => unreachable,
+        .keygen, .pemenc, .pemdec => unreachable,
     }
 
     // Propagation proof: format the (tainted, if taint=yes) result through a
     // non-constant-time path. See the module doc comment above.
     std.debug.print("m={x}\n", .{out});
+}
+
+// ── targets `pemenc` / `pemdec` (2026-11-17) ───────────────────────────────
+//
+// Private-key PEM, split in two rows so that each counts only its own code.
+// What DER publishes about a secret INTEGER — its length and its 0x00 sign
+// pad — is public by format; neither row taints it.
+
+/// `pemenc`: `SecretKey.toPem(.pkcs1)` of a key whose secret members (`d`,
+/// `dP`, `dQ`, `qInv`, the primes and their Montgomery params) are tainted:
+/// the DER writer (`marshal.zig`, whose INTEGER trim declassifies only the
+/// length and the pad bit) and the constant-time base64 encoder (`b64ct`).
+fn pemEnc(taint: Taint) !void {
+    var sk0: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPrimes(&sk0, &kat_p, &kat_q, &kat_e);
+    defer sk0.deinit();
+    taintBytes(taint, std.mem.asBytes(&sk0.d));
+    taintBytes(taint, std.mem.asBytes(&sk0.dp));
+    taintBytes(taint, std.mem.asBytes(&sk0.dq));
+    taintBytes(taint, std.mem.asBytes(&sk0.qinv));
+    taintMont(taint, &sk0.p_mont);
+    taintMont(taint, &sk0.q_mont);
+    const skr = reloadVolatile(rsa.SecretKey, &sk0);
+    var buf: [rsa.max_private_pem_len]u8 = undefined;
+    const text = try skr.toPem(.pkcs1, &buf);
+    // The witness and the output pin: SHA-256 (constant-time) of the text.
+    var h: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &h, .{});
+    std.debug.print("ctgrind_result={x}\n", .{h});
+}
+
+/// `pemdec`: `SecretKey.fromPem` of the PEM text of an UNTAINTED key in
+/// which exactly the base64 characters whose six bits all come from the
+/// CONTENT bytes of `d`, `dP`, `dQ`, `qInv` are tainted (tags, lengths, the
+/// armor and line breaks stay defined): the constant-time base64 decoder,
+/// the DER walk, and `checkWireFields`' comparison and adoption of the wire
+/// `d`. `p` and `q` stay untainted on purpose: `fromPem` re-derives the key
+/// from them through `fromPrimes`, which is target `keygen`'s claim and
+/// residue — tainting them here would count that row a second time.
+fn pemDec(taint: Taint) !void {
+    var sk0: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPrimes(&sk0, &kat_p, &kat_q, &kat_e);
+    defer sk0.deinit();
+    var buf: [rsa.max_private_pem_len]u8 = undefined;
+    const text = try sk0.toPem(.pkcs1, &buf);
+
+    // Locate the body (between the BEGIN line and the END line) and decode
+    // it here, untainted, to find the INTEGER content ranges.
+    const body_start = (std.mem.indexOfScalar(u8, text, '\n') orelse return error.BadPem) + 1;
+    const body_end = std.mem.indexOf(u8, text, "-----END") orelse return error.BadPem;
+    var b64: [rsa.max_private_pem_len]u8 = undefined;
+    var nb: usize = 0;
+    for (text[body_start..body_end]) |c| {
+        if (c == '\n') continue;
+        b64[nb] = c;
+        nb += 1;
+    }
+    var der: [rsa.max_private_pem_len]u8 = undefined;
+    const dlen = try std.base64.standard.Decoder.calcSizeForSlice(b64[0..nb]);
+    try std.base64.standard.Decoder.decode(der[0..dlen], b64[0..nb]);
+
+    // SEQUENCE { version, n, e, d, p, q, dP, dQ, qInv }: secret = 3, 6, 7, 8.
+    var secret: [9]struct { start: usize, end: usize } = undefined;
+    var at: usize = derHeaderLen(der[0..dlen], 0);
+    for (&secret) |*r| {
+        const hl = derHeaderLen(der[0..dlen], at);
+        const cl = derContentLen(der[0..dlen], at);
+        r.* = .{ .start = at + hl, .end = at + hl + cl };
+        at += hl + cl;
+    }
+    if (at != dlen) return error.BadDer;
+    const secret_fields = [_]usize{ 3, 6, 7, 8 };
+
+    // Taint each body character whose bits all fall in secret content.
+    var k: usize = 0;
+    for (text[body_start..body_end], body_start..) |c, pos| {
+        if (c == '\n') continue;
+        defer k += 1;
+        if (c == '=') continue;
+        const first = (6 * k) / 8;
+        const last = (6 * k + 5) / 8;
+        var all = true;
+        for ([_]usize{ first, last }) |byte_at| {
+            var in = false;
+            for (secret_fields) |f| {
+                if (byte_at >= secret[f].start and byte_at < secret[f].end) in = true;
+            }
+            all = all and in;
+        }
+        if (all) taintBytes(taint, buf[pos..][0..1]);
+    }
+
+    var back: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPem(&back, text);
+    defer back.deinit();
+    var d_out: [modulus_len]u8 = undefined;
+    try back.d.toBytes(&d_out, .big);
+    std.debug.print("d={x}\n", .{d_out});
+}
+
+/// Header length of the (definite, short- or long-form) DER element at `at`.
+fn derHeaderLen(der: []const u8, at: usize) usize {
+    const l = der[at + 1];
+    return if (l < 0x80) 2 else 2 + (l & 0x7f);
+}
+
+/// Content length of the DER element at `at`.
+fn derContentLen(der: []const u8, at: usize) usize {
+    const l = der[at + 1];
+    if (l < 0x80) return l;
+    var v: usize = 0;
+    for (der[at + 2 ..][0 .. l & 0x7f]) |b| v = (v << 8) | b;
+    return v;
 }

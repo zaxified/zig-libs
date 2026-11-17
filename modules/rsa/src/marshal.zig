@@ -112,6 +112,13 @@ const RevWriter = struct {
     /// INTEGER of the non-negative limb value `v`, written by position into
     /// a `width`-byte field (`width` ≥ the value's byte length), then
     /// trimmed to its minimal form.
+    ///
+    /// The trim runs over the whole field with no branch on the bytes: `z`
+    /// (the count of leading zero bytes) and the sign-pad bit of the first
+    /// kept byte are computed branch-free and only then declassified for
+    /// memcheck (`makeMemDefined`; a no-op outside Valgrind). Those two are
+    /// exactly what DER publishes — the INTEGER's length and its 0x00 pad —
+    /// so the encoder's timing depends on nothing else of a secret member.
     fn integer(w: *RevWriter, v: *const MontElem, width: usize) MarshalError!void {
         if (width == 0 or width > w.pos) return error.BufferTooSmall;
         const end = w.pos;
@@ -120,10 +127,25 @@ const RevWriter = struct {
             const at = width - 1 - i;
             o.* = if (at / 8 < v.len) @truncate(v[at / 8] >> @intCast(8 * (at % 8))) else 0;
         }
+        // seen = 1 from the first non-zero byte on; z counts the bytes before
+        // it. The last byte is always kept (a zero value encodes as one 0x00).
+        var seen: usize = 0;
         var z: usize = 0;
-        while (z + 1 < width and field[z] == 0) z += 1;
+        var top: u8 = 0; // the first kept byte, selected by mask
+        for (field[0 .. width - 1]) |b| {
+            const nz: usize = @intFromBool(b != 0);
+            const first = nz & ~seen & 1; // this is the first non-zero byte
+            top |= b & (0 -% @as(u8, @intCast(first)));
+            seen |= nz;
+            z += 1 - seen;
+        }
+        top |= field[width - 1] & (0 -% @as(u8, @intCast(1 - (seen & 1))));
+        var pad: u8 = top >> 7;
+        std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&z));
+        std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&pad));
+        std.crypto.secureZero(u8, std.mem.asBytes(&top));
         w.pos = end - width + z;
-        if (field[z] & 0x80 != 0) try w.byte(0);
+        if (pad != 0) try w.byte(0);
         try w.header(0x02, end - w.pos);
     }
 
@@ -489,4 +511,40 @@ pub fn encryptedPem(sk: *const SecretKey, password: []const u8, random: std.Rand
         return err;
     };
     return pemFromTail(out, w.len(), "ENCRYPTED PRIVATE KEY");
+}
+
+test "integer: the branch-free trim gives the minimal DER INTEGER at every boundary" {
+    const Case = struct { v: u64, width: usize, want: []const u8 };
+    const cases = [_]Case{
+        .{ .v = 0, .width = 1, .want = &.{ 0x02, 0x01, 0x00 } },
+        .{ .v = 0, .width = 4, .want = &.{ 0x02, 0x01, 0x00 } }, // all zero: one 0x00 kept
+        .{ .v = 1, .width = 4, .want = &.{ 0x02, 0x01, 0x01 } },
+        .{ .v = 0x7f, .width = 4, .want = &.{ 0x02, 0x01, 0x7f } },
+        .{ .v = 0x80, .width = 4, .want = &.{ 0x02, 0x02, 0x00, 0x80 } }, // pad
+        .{ .v = 0x80, .width = 1, .want = &.{ 0x02, 0x02, 0x00, 0x80 } }, // pad, no zero byte to trim
+        .{ .v = 0x0100, .width = 4, .want = &.{ 0x02, 0x02, 0x01, 0x00 } }, // zero LOW byte kept
+        .{ .v = 0x8000, .width = 4, .want = &.{ 0x02, 0x03, 0x00, 0x80, 0x00 } },
+        .{ .v = 0x0080_0001, .width = 4, .want = &.{ 0x02, 0x04, 0x00, 0x80, 0x00, 0x01 } },
+        .{ .v = 0x0100_0000, .width = 4, .want = &.{ 0x02, 0x04, 0x01, 0x00, 0x00, 0x00 } }, // nothing to trim
+        .{ .v = 0xffff_ffff, .width = 4, .want = &.{ 0x02, 0x05, 0x00, 0xff, 0xff, 0xff, 0xff } },
+        .{ .v = 0x7f00_0000_0000_0000, .width = 9, .want = &.{ 0x02, 0x08, 0x7f, 0, 0, 0, 0, 0, 0, 0 } }, // limb edge
+        .{ .v = 0x0000_0000_0000_00ff, .width = 9, .want = &.{ 0x02, 0x02, 0x00, 0xff } },
+    };
+    for (cases) |c| {
+        var e = MontParams.zero;
+        e[0] = c.v;
+        var buf: [32]u8 = undefined;
+        var w = RevWriter.init(&buf);
+        try w.integer(&e, c.width);
+        try std.testing.expectEqualSlices(u8, c.want, buf[w.pos..]);
+    }
+}
+
+test "integer: a value in a higher limb, the field wider than the value" {
+    var e = MontParams.zero;
+    e[1] = 0x80; // 2^71: bytes 80 00..00 (9 bytes), needs the pad
+    var buf: [64]u8 = undefined;
+    var w = RevWriter.init(&buf);
+    try w.integer(&e, 24);
+    try std.testing.expectEqualSlices(u8, &.{ 0x02, 0x0a, 0x00, 0x80, 0, 0, 0, 0, 0, 0, 0, 0 }, buf[w.pos..]);
 }
