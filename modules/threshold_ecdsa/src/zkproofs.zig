@@ -3949,7 +3949,7 @@ test "Fiat-Shamir challenges: every public input is hashed length-prefixed, in t
     try t.expect(pdlProofChallenge(aux, pk, cts[0], fes[0], cts[1], fes[1], .{ .base = g, .point = point, .context = ctx }, u1_point));
 }
 
-test "verify-side key checks refuse proofs that are otherwise valid: non-standard Γ, sub-floor N (Alice), sub-floor Ñ (Alice and Bob) (mutation audit 2026-11-17)" {
+test "mut 527: verify-side key checks refuse proofs that are otherwise valid: non-standard Γ, sub-floor N (Alice and Bob), sub-floor Ñ (Alice and Bob) (mutation audit 2026-11-17)" {
     if (builtin.mode == .debug) return error.SkipZigTest;
     const allocator = testing.allocator;
     const setup = try realAuxAndKey(0x4d55_5441_5445);
@@ -3993,6 +3993,12 @@ test "verify-side key checks refuse proofs that are otherwise valid: non-standar
     const p_s = try proveAliceRangeInner(allocator, &a_bytes, r_s, spk, aux, test_ctx, null, random);
     defer p_s.proof.deinit(allocator);
     try testing.expect(!verifyAliceRange(p_s.proof, c_s, spk, aux, test_ctx));
+    // …and Bob's (mutation audit 2026-11-17, mutant 527: `verifyBobInner` had no test for its own N floor).
+    const r_bs = testPaillierRandomness(spk, random);
+    const c_bs = buildCb(spk, c_s, &a_bytes, &bp, r_bs);
+    const b_s = try proveBobInner(allocator, &a_bytes, &bp, r_bs, c_s, c_bs, spk, aux, test_ctx, null, random);
+    defer b_s.proof.deinit(allocator);
+    try testing.expect(!verifyBobInner(b_s.proof, c_s, c_bs, spk, aux, test_ctx, null, null));
 
     // A ~1000-bit Ñ with square generators (below the floor): the proofs close
     // over it, only the Ñ floor refuses them.
@@ -4047,4 +4053,23 @@ test "intCompare, mulBytes, scalarFromWide and auxExponentTooLong: values and bo
     var buf: [96 + nt_len + 3]u8 = @splat(7);
     try testing.expect(!auxExponentTooLong(buf[0 .. 96 + nt_len + 1], nt));
     try testing.expect(auxExponentTooLong(buf[0 .. 96 + nt_len + 2], nt));
+}
+
+test "mut 483: a prover refuses a bad received aux tuple although the Paillier key passes both of its own gates" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6d75_7434_3833);
+    const random = prng.random();
+    // An above-floor modulus with the standard generator (no keygen), so only the
+    // aux tuple can be what `validateReceivedParams` refuses.
+    const big_composite = comptime comptimeIntBytes(256, ((1 << 1000) + 9) * ((1 << 1000) + 15));
+    const pk = paillier.PublicKey.fromBytes(std.mem.trimStart(u8, &big_composite, &.{0}), null) catch unreachable;
+    try testing.expect(root.paillierNMeetsFloor(pk));
+    try testing.expect(root.paillierGeneratorIsStandard(pk));
+    const a = scalarFromU64(7);
+    const r_a = paillier.Fe.fromPrimitive(u32, pk.n_sq, 3) catch unreachable;
+    // Ñ = 187 is below the floor; h1 = 1 is out of range.
+    for ([_]root.AuxParams{ auxFromBytes(187, 4, 16), auxFromBytes(187, 1, 16) }) |bad_aux| {
+        try testing.expectError(error.InvalidAuxParams, bad_aux.validate(random));
+        try testing.expectError(error.InvalidAuxParams, proveAliceRange(allocator, &a, &r_a, pk, bad_aux, test_ctx, random));
+    }
 }

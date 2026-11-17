@@ -2575,3 +2575,55 @@ test "isProbablePrime: primes pass; Carmichael numbers and strong pseudoprimes f
         try testing.expect(!isProbablePrime(m, random));
     }
 }
+
+test "mut 86: Πprm refuses a generator that shares a factor with Ñ although its proof is otherwise honest (mutation audit 2026-11-17)" {
+    // Ñ = 187 = 11·17. h2 = 11 is no unit, h1 = 11² ∈ ⟨h2⟩, and the proof
+    // `11^{z_i} = A_i · (11²)^{e_i}` closes in every round; only the Jacobi
+    // symbol (0 for a non-unit) refuses the tuple. The same proof machinery
+    // accepts a unit tuple (h2 = 3, h1 = 3⁷).
+    const nt = toyModulus();
+    const aux: root.AuxParams = .{ .n_tilde = nt, .h1 = toyFe(nt, 121), .h2 = toyFe(nt, 11) };
+    try testing.expect(!Piprm.verify(aux, toyPrmProof(aux, 11, 2)));
+    const honest: root.AuxParams = .{ .n_tilde = nt, .h1 = toyFe(nt, @intCast(powModSmall(3, 7, 187))), .h2 = toyFe(nt, 3) };
+    try testing.expect(Piprm.verify(honest, toyPrmProof(honest, 3, 7)));
+}
+
+test "mut 109: verifyWellFormedBound refuses a Πmod proof that fails although the Πprm proof under the same context holds (mutation audit 2026-11-17)" {
+    var prng = std.Random.DefaultPrng.init(0x6d75_7431_3039);
+    const random = prng.random();
+    // A genuine ~2000-bit composite above the q⁷ floor with h1 = 9² ∈ ⟨h2 = 9⟩
+    // (both squares): `validate` accepts the tuple, and a Πprm proof of it needs
+    // no secret, `9^{z_i} = 9^{a_i} · (9²)^{e_i}` with z_i = a_i + 2·e_i.
+    const composite = comptime blk: {
+        const f1 = (1 << 1000) + 9;
+        const f2 = (1 << 1000) + 15;
+        break :blk f1 * f2;
+    };
+    const bytes = comptime comptimeIntBytes(root.aux_modulus_bytes, composite);
+    const nt = root.AuxModulus.fromBytes(std.mem.trimStart(u8, &bytes, &.{0}), .big) catch unreachable;
+    const aux: root.AuxParams = .{ .n_tilde = nt, .h1 = toyFe2048(nt, 81), .h2 = toyFe2048(nt, 9) };
+    try aux.validate(random);
+    const ctx = "mut-109-ctx";
+
+    var commitments: [pi_prm_iterations]root.AuxFe = undefined;
+    var a_vals: [pi_prm_iterations]u8 = undefined;
+    for (&commitments, &a_vals, 0..) |*c, *a, i| {
+        a.* = @intCast(1 + (i * 37) % 150);
+        c.* = nt.powWithEncodedPublicExponent(aux.h2, &[_]u8{a.*}, .big) catch unreachable;
+    }
+    var e_bits: [pi_prm_iterations]bool = undefined;
+    derivePrmChallengeBits(derivePrmSeed(aux, ctx, &commitments), &e_bits);
+    var entries: [pi_prm_iterations]PrmEntry = undefined;
+    for (&entries, commitments, a_vals, e_bits) |*e, c, a, e_i| {
+        e.* = .{ .a_commit = c, .z = toyFe2048(nt, a + if (e_i) @as(u8, 2) else 0) };
+    }
+    const prm: PrmProof = .{ .entries = entries };
+    // A Πmod proof that is nothing of the kind (w = 4 has Jacobi +1).
+    var mod_entries: [pi_mod_iterations]ModEntry = undefined;
+    for (&mod_entries) |*e| e.* = .{ .x = toyFe2048(nt, 1), .z = toyFe2048(nt, 1), .a = false, .b = false };
+    const mod: ModProof = .{ .w = toyFe2048(nt, 4), .entries = mod_entries };
+
+    try testing.expect(Piprm.verifyBound(aux, ctx, prm));
+    try testing.expect(!Pimod.verifyBound(aux, ctx, mod));
+    try testing.expectError(error.InvalidWellFormedProof, verifyWellFormedBound(aux, ctx, .{ .prm = prm, .mod = mod }, random));
+}
