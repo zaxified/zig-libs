@@ -3408,3 +3408,194 @@ test "decrypt: no secret full-value copy survives on the dead stack (paillier F2
 test {
     _ = @import("stackprobe_test.zig");
 }
+
+// ── whole-module mutation round (2026-11-17) ─────────────────────────────────
+
+fn leftPad(comptime N: usize, value: []const u8) [N]u8 {
+    var out = @as([N]u8, @splat(0));
+    @memcpy(out[N - value.len ..], value);
+    return out;
+}
+
+/// A `std.Random` that replays a fixed byte script (a draw past its end is a test bug).
+const ScriptRandom = struct {
+    script: []const u8,
+    pos: usize = 0,
+
+    fn fill(self: *ScriptRandom, buf: []u8) void {
+        for (buf) |*b| {
+            b.* = self.script[self.pos];
+            self.pos += 1;
+        }
+    }
+
+    fn random(self: *ScriptRandom) std.Random {
+        return std.Random.init(self, fill);
+    }
+};
+
+test "fromPrimes: the smallest odd prime p = 3 is a valid factor (a factor below 3 is the refusal)" {
+    var kp: KeyPair = undefined;
+    try fromPrimes(&[_]u8{3}, &[_]u8{5}, &kp); // n = 15, phi = 8
+    const m = try Fe.fromPrimitive(u32, kp.public.n_sq, 7);
+    const r = try Fe.fromPrimitive(u32, kp.public.n_sq, 2);
+    const c = try encrypt(kp.public, &m, &r);
+    try testing.expectEqual(@as(u32, 7), try (try decryptTest(&kp.secret, c)).toPrimitive(u32));
+}
+
+test "fromPrimes: genuine primes with gcd(n, phi(n)) != 1 are refused (paillier F9)" {
+    var kp: KeyPair = undefined;
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{5}, &[_]u8{11}, &kp)); // 5 | phi = 40
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{3}, &[_]u8{7}, &kp)); // 3 | phi = 12
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{7}, &[_]u8{3}, &kp));
+}
+
+test "fromPrimes: a multi-limb prime whose low limb is 1 is not mistaken for a tiny one" {
+    // p = a * 2^64 + 1 (150 bits, low limb 1) and a 128-bit prime; found offline
+    // (Python, 40-round Miller-Rabin), gcd(n, phi(n)) = 1 checked there.
+    var p: [19]u8 = undefined;
+    var q: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&p, "36db56c405fc24dc3407310000000000000001");
+    _ = try std.fmt.hexToBytes(&q, "d8e897c06937b7d9d5bdfd50a42c3441");
+    var kp: KeyPair = undefined;
+    try fromPrimes(&p, &q, &kp);
+    const m = try Fe.fromPrimitive(u64, kp.public.n_sq, 0x1122334455667788);
+    const r = try Fe.fromPrimitive(u64, kp.public.n_sq, 0x0123456789abcdef);
+    const c = try encrypt(kp.public, &m, &r);
+    try testing.expectEqual(@as(u64, 0x1122334455667788), try (try decryptTest(&kp.secret, c)).toPrimitive(u64));
+}
+
+test "fromPrimes: a product between 2^modulus_bits and 2^(modulus_bits + 64) is Overflow, not a truncated key" {
+    // 1031-bit factors: the product (2062 bits) leaves the 32 limbs of n but
+    // not the 33rd, which an off-by-one cap would let through (and `n` would
+    // then be silently cut to its low 2048 bits).
+    var p = @as([129]u8, @splat(0xff));
+    p[0] = 0x7f;
+    var q = p;
+    q[128] = 0xfd;
+    var kp: KeyPair = undefined;
+    try testing.expectError(error.Overflow, fromPrimes(&p, &q, &kp));
+}
+
+test "fromPrimes closeness guard: |p − q| just above 2^(nlen/2 − 100) is accepted" {
+    // 256-bit primes with q − p = 2^156 + 240 (n is 512 bits, the bound is
+    // 2^156): the exact-boundary test above pins the refusal, this pins the
+    // other side, so a guard that is one bit too wide fails. Found offline
+    // (Python, 40-round Miller-Rabin), gcd(n, phi(n)) = 1 checked there.
+    var p: [32]u8 = undefined;
+    var q: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&p, "df283fb15c62f1b70d4ac14be106a7b61d408af499518b7a77e2d6b8b08457cb");
+    _ = try std.fmt.hexToBytes(&q, "df283fb15c62f1b70d4ac14bf106a7b61d408af499518b7a77e2d6b8b08458bb");
+    var kp: KeyPair = undefined;
+    try fromPrimes(&p, &q, &kp);
+    try testing.expectEqual(@as(usize, 512), kp.public.n.bits());
+}
+
+test "topBitsMatch: a difference in byte 11 (bits 88-95) already prevents a match" {
+    var p = @as([16]u8, @splat(0x5a));
+    var q = p;
+    q[11] ^= 0x01;
+    try testing.expect(!topBitsMatch(&p, &q));
+    // Past bit 100 nothing matters: bytes 13.. and the low nibble of byte 12.
+    q = p;
+    q[12] ^= 0x0f;
+    q[13] ^= 0xff;
+    q[15] ^= 0xff;
+    try testing.expect(topBitsMatch(&p, &q));
+}
+
+test "generate: n has exactly the requested bits, for every seed and also when bits/2 is not a multiple of 8" {
+    inline for (.{ 512, 514, 522 }) |bits| {
+        for (0..6) |seed| {
+            var prng = std.Random.DefaultPrng.init(0x6269740000 + seed);
+            var kp: KeyPair = undefined;
+            try generate(prng.random(), bits, &kp);
+            try testing.expectEqual(@as(usize, bits), kp.public.n.bits());
+            const m = try Fe.fromPrimitive(u32, kp.public.n_sq, 424242);
+            const c = try encryptRandom(kp.public, &m, prng.random());
+            try testing.expectEqual(@as(u32, 424242), try (try decryptTest(&kp.secret, c)).toPrimitive(u32));
+        }
+    }
+}
+
+test "a key whose n is not a whole number of bytes: byte lengths, encrypt, decrypt and the r draw agree" {
+    var kp: KeyPair = undefined;
+    try fromPrimes(&[_]u8{41}, &[_]u8{43}, &kp); // n = 1763, 11 bits
+    try testing.expectEqual(@as(usize, 11), kp.public.n.bits());
+    try testing.expectEqual(@as(usize, 2), kp.public.nByteLen());
+    try testing.expectEqual(@as(usize, 2), kp.secret.nByteLen());
+    const m = try Fe.fromPrimitive(u32, kp.public.n_sq, 100);
+    const r = try Fe.fromPrimitive(u32, kp.public.n_sq, 5);
+    const c = try encrypt(kp.public, &m, &r);
+    try testing.expectEqual(@as(u32, 100), try (try decryptTest(&kp.secret, c)).toPrimitive(u32));
+    var prng = std.Random.DefaultPrng.init(0x0b17);
+    // (A random r can share a factor with this tiny n and then has no decryption, so
+    // the draw itself is checked: nonzero and below n, over every residue class.)
+    for (0..400) |_| {
+        const r2 = sampleNonzeroLtN(kp.public, prng.random());
+        const v = try r2.toPrimitive(u32);
+        try testing.expect(v >= 1 and v < 1763);
+    }
+}
+
+test "byte loaders ignore leading zero bytes, however many (n, g, lambda, mu, ciphertext)" {
+    var prng = std.Random.DefaultPrng.init(0x7a50);
+    var kp: KeyPair = undefined;
+    try generate(prng.random(), 512, &kp);
+    var n_be: [64]u8 = undefined;
+    try kp.public.nToBytes(&n_be);
+    var g_be: [modulus_sq_bytes]u8 = undefined;
+    try kp.public.gToBytes(&g_be);
+    var lam_be: [modulus_sq_bytes]u8 = undefined;
+    try kp.secret.lambdaToBytes(&lam_be);
+    var mu_be: [64]u8 = undefined;
+    try kp.secret.muToBytes(&mu_be);
+    const m = try Fe.fromPrimitive(u32, kp.public.n_sq, 31337);
+    const c = try encryptRandom(kp.public, &m, prng.random());
+    var c_be: [modulus_sq_bytes]u8 = undefined;
+    try c.toBytes(&c_be);
+
+    const n_pad = leftPad(modulus_bytes + 40, &n_be); // longer than any n: only trimming makes it fit
+    const g_pad = leftPad(modulus_sq_bytes + 40, &g_be);
+    const lam_pad = leftPad(modulus_sq_bytes + 40, &lam_be);
+    const mu_pad = leftPad(modulus_bytes + 40, &mu_be);
+    const c_pad = leftPad(modulus_sq_bytes + 40, &c_be);
+
+    const pk = try PublicKey.fromBytes(&n_pad, &g_pad);
+    try testing.expect(pk.g.eql(kp.public.g));
+    try testing.expectEqual(@as(usize, 512), pk.n.bits());
+    const pk_std = try PublicKey.fromBytes(&n_pad, null);
+    try testing.expect(pk_std.g.eql(kp.public.g));
+
+    var sk: SecretKey = undefined;
+    try SecretKey.fromBytes(&n_pad, &lam_pad, &mu_pad, &sk);
+    const c2 = try Ciphertext.fromBytes(pk, &c_pad);
+    try testing.expect(c2.c.eql(c.c));
+    try testing.expectEqual(@as(u32, 31337), try (try decryptTest(&sk, c2)).toPrimitive(u32));
+}
+
+test "SecretKey.fromBytes: lambda is canonical mod n² (above n accepted, n² refused), mu mod n (n refused)" {
+    // Toy key n = 187, n² = 34969 = 0x8899.
+    _ = try SecretKey.fromBytesImpl(&kat_n, &[_]u8{188}, &kat_mu, .unchecked);
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromBytesImpl(&kat_n, &[_]u8{ 0x88, 0x99 }, &kat_mu, .unchecked));
+    _ = try SecretKey.fromBytesImpl(&kat_n, &kat_lambda, &[_]u8{186}, .unchecked);
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromBytesImpl(&kat_n, &kat_lambda, &[_]u8{187}, .unchecked));
+}
+
+test "decrypt refuses everything under a key with lambda = 0, instead of answering 0" {
+    var sk = try SecretKey.fromBytesImpl(&kat_n, &[_]u8{0}, &kat_mu, .unchecked);
+    var out: Fe = undefined;
+    for ([_]u32{ 1, 5, 100 }) |v| {
+        const c = Ciphertext{ .c = try Fe.fromPrimitive(u32, sk.n_sq, v) };
+        try testing.expectError(error.InvalidCiphertext, decrypt(&sk, c, &out));
+    }
+}
+
+test "sampleNonzeroLtN redraws a draw equal to n and a draw equal to zero" {
+    var kp: KeyPair = undefined;
+    try fromPrimes(&kat_p, &kat_q, &kp); // n = 187: one byte, no masking
+    var s: ScriptRandom = .{ .script = &[_]u8{ 187, 0, 5 } };
+    const r = sampleNonzeroLtN(kp.public, s.random());
+    try testing.expectEqual(@as(u32, 5), try r.toPrimitive(u32));
+    try testing.expectEqual(@as(usize, 3), s.pos);
+}
