@@ -15,18 +15,6 @@ set the parity bar), **Notes** (dependencies, open decisions, effort).
 
 ## Open
 
-### lz4 — LZ4 block and frame format codec
-- **Origin:** 2026-11-17, the `arrow` module: Arrow IPC body compression is LZ4_FRAME or ZSTD;
-  without an LZ4 codec `arrow` reads LZ4-compressed files with `error.Unsupported`. `parquet`
-  (LZ4_RAW pages) would be the second consumer.
-- **Scope:** LZ4 block format and the LZ4 frame format (magic, frame descriptor, block
-  checksums, content checksum via xxHash32), compress and decompress, bounded output size.
-  Out: LZ4 HC levels at first, dictionary compression.
-- **Expected:** the reference `lz4` C library and its CLI (frame format), lz4_flex (Rust),
-  python-lz4.
-- **Notes:** an xxHash32 is needed for the frame checksums (check sibling modules first).
-  Interop oracle: the `lz4` CLI round trip. Effort M.
-
 ### parquet — Apache Parquet over `dataframe.Frame`
 - **Origin:** named as planned in `dataframe`'s SPEC; the same consumer request asks for it
   "later".

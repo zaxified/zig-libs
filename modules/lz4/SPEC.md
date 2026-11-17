@@ -1,0 +1,168 @@
+# `lz4` — specification
+
+## Maturity
+
+**Grade:** *(written by `zig build gen-catalog` — never by hand)*
+
+**Scope:** core — liblz4 1.10.0 and its lz4 CLI (surveyed 2026-11-17)
+
+**Audit:** review none · mutation none · src ?
+
+**Hardening:** fuzz 2026-11-17 (400,000 frame-decoder + 400,000 block-decoder + 50,000 round-trip runs clean, LZ4_FUZZ, every reach label hit; arbitrary, mutated and structure-aimed frames, synthetic token streams judged against a byte-at-a-time model, glued skippable/legacy frames, failing allocator; 3,000 seeds in every test run) · ct n/a — compression only, no secret is processed · panic 2026-11-17 (self-review at creation: every length, offset and size from the input is checked before use; the only asserts are on internal callers' arguments, never reachable with caller data through the public API; oversized inputs are `error.InputTooLarge`)
+
+**Performance:** ref 1.40–2.56× liblz4 1.10.0 (`lz4 -b1 -B65536`, 64 KiB independent blocks of three 8 MiB payloads; compress 1.40–2.00×, decompress 1.81–2.56×; `zig build bench-lz4`) · fastest ? (measured 2026-11-17)
+
+**Known defects:** none recorded
+
+**Downstream consumer:** no
+
+Consumer view, API and purpose: [README.md](README.md).
+
+## Compared with
+
+Surveyed 2026-11-17 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date (GitHub API).
+Behaviour was measured on the installed lz4 1.10.0 CLI and python-lz4 4.4.5 (system liblz4 1.10.0);
+lz4_flex's frame decoder source was read (MIT) for its acceptance rules; the others are described
+from their own documentation.
+
+| Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
+|---|---|---|--:|---|---|
+| [lz4/lz4](https://github.com/lz4/lz4) (liblz4 + `lz4` CLI) — **reference** | C | BSD-2-Clause (lib), GPL-2.0+ (CLI) | 12.8k | v1.11.1 (2026-11-10); 1.10.0 measured | The yardstick. Has HC levels 3..12, dictionaries, streaming (`LZ4F_compressUpdate`/`LZ4F_decompress`), a multithreaded CLI. Its decoder accepts a 0 offset (zero-fills) and enforces the end-of-block rules where this module does not (below). Its frame API reads one frame per call and no legacy frames; the CLI reads concatenated, skippable and legacy frames. |
+| [PSeitz/lz4_flex](https://github.com/PSeitz/lz4_flex) | Rust | MIT | 623 | 0.14.1 (2026-11-14) | Pure-Rust block + frame codec, streaming `FrameEncoder`/`FrameDecoder`, concatenated frames; refuses frames with a dictionary id; no HC. |
+| [python-lz4](https://github.com/python-lz4/python-lz4) | Python/C | BSD-3-Clause | 306 | v4.4.5 (2025-11-03) | Bindings to liblz4; `lz4.frame.decompress` reads the first frame only and ignores what follows. |
+| [pierrec/lz4](https://github.com/pierrec/lz4) | Go | BSD-3-Clause | 975 | v4.1.33 (2026-10-02) | Pure-Go block + frame codec with streaming Reader/Writer and concurrent compression. Not measured here. |
+| [allyourcodebase/lz4](https://github.com/allyourcodebase/lz4) | Zig build + C | MIT | 11 | push 2026-10-20 | liblz4 packaged for `build.zig`: liblz4 itself, linked. |
+| Zig `std.compress` | Zig | MIT | — | Zig 0.17.1 | `flate`, `lzma`, `lzma2`, `xz`, `zstd`; no LZ4. `std.hash.XxHash32` is there and is what this module uses. |
+
+**Where we are ahead:** nothing measured. **Where we are behind:** no streaming interface (B1),
+no HC levels (B2), no dictionaries (B3), speed (B4: 1.4–2.6× liblz4's time).
+
+## What this module is, and what it is not
+
+A whole-buffer LZ4 codec. The block API decodes into a caller's slice whose length is the output
+budget (`LZ4_decompress_safe`'s contract) and compresses with a single-probe hash-table greedy
+matcher at LZ4's default level, with LZ4's acceleration knob. The frame API reads everything an
+`.lz4` file may hold — LZ4 frames with every combination of the descriptor flags and block sizes,
+skippable frames, legacy frames, concatenated in any order — and writes one LZ4 frame with the
+options liblz4's `LZ4F_preferences_t` offers except the compression level.
+
+**Not here (expected by some, deliberately absent):** LZ4 HC (levels 3..12: a slower,
+better-compressing matcher; its output decodes here), dictionary compression and decoding with a
+dictionary (a frame's dictionary id is read and ignored; a block that needs the dictionary fails on
+its first out-of-range offset), streaming `std.Io.Reader`/`Writer` interfaces, writing legacy
+frames, the `lz4` command-line program.
+
+## Wire format / algorithm
+
+- **Block** (lz4_Block_format.md): sequences of `token` (high nibble literal length, low nibble
+  match length − 4; 15 = more length bytes follow, each added, until one is not 255), literals,
+  a little-endian 16-bit offset (1..65535) and the match length extension. The last sequence holds
+  literals only and the block ends right after them (rule 1). Matches may overlap their own output
+  (offset < length repeats a pattern).
+- **Frame** (lz4_Frame_format.md): magic `0x184D2204`; FLG (version `01`, block independence,
+  block checksum, content size, content checksum, reserved bit, dictionary id), BD (block maximum
+  size id 4..7 = 64 KiB, 256 KiB, 1 MiB, 4 MiB; other bits reserved), optional 8-byte content size
+  and 4-byte dictionary id, header checksum `(xxh32(descriptor, 0) >> 8) & 0xFF`; blocks as a 32-bit
+  size word (high bit = stored uncompressed), data, optional xxh32 of the stored bytes; the end mark
+  `0x00000000`; an optional xxh32 of the content.
+- **Skippable frame:** magic `0x184D2A50..5F`, 32-bit length, payload — skipped.
+- **Legacy frame** (`lz4 -l`): magic `0x184C2102`, then 32-bit compressed sizes and independent
+  blocks of at most 8 MiB each, until the input ends or a size word equals a frame magic number
+  (which starts the next frame).
+- **Compressor:** 4-byte sequences hashed (`v * 2654435761 >> 20`) into 4096 positions; on a miss
+  the step grows by one every 64 misses (× acceleration), LZ4's skip; a hit is extended backwards
+  over pending literals and forwards eight bytes at a time; after a match the position two bytes
+  before its end is entered. The last match starts at least 12 bytes before the block's end and the
+  last 5 bytes are literals (rules 2 and 3), so liblz4 accepts every block. In a linked frame the
+  hash table carries over and matches reach up to 64 KiB into the previous blocks. A block that
+  does not shrink is stored (as liblz4 does).
+
+## Behaviour choices (owner rule: like the reference or the majority; the spec's mandate first)
+
+| Question | Choice | Source |
+|---|---|---|
+| Offset 0 | `error.BadOffset` | Format: "0 is an invalid offset value … denotes an invalid (corrupted) block". liblz4 1.10.0 instead zero-fills the match and accepts (measured); the spec's mandate wins. |
+| End-of-block rules 2 and 3 (last 5 bytes literals, last match ≥ 12 bytes before the end) | Not enforced by the decoder; always obeyed by the encoder | Format: "a conformant decoder is allowed to reject the block". liblz4's safe loop enforces them relative to its output capacity, its fast loop does not in the same way, so its verdict is not a clean rule; lz4_flex does not enforce them. `tools/interop.zig` shows every block liblz4 refuses and we accept breaks one of them. |
+| Rule 1 (block ends after a literal-only sequence), empty block | Enforced: `error.Truncated` / `error.CorruptBlock` | Format; liblz4 refuses both (measured: `LZ4_decompress_safe("", …)` = −1). |
+| Match-length nibble of the last token | Ignored | Format (no match follows); liblz4 the same, except at output capacity 0 where it accepts only the byte `0x00`. |
+| Concatenated frames | Read all (`multi_frame = true`) | lz4 CLI and lz4_flex read them; python-lz4 reads the first only (`multi_frame = false`). |
+| Junk after the last frame | `error.TrailingData` (`ignore_trailing_garbage` to accept) | lz4 CLI exits with an error (output written); python-lz4 ignores it. |
+| Empty input | Empty output | lz4 CLI (exit 0) and lz4_flex; python-lz4 raises. |
+| Skippable frames | Skipped, anywhere | lz4 CLI, liblz4 frame API. |
+| Legacy frames | Read, in any order with other frames | lz4 CLI reads them (and, measured, fails on a legacy frame *after* an LZ4 frame — an artefact of its decoder, not followed); liblz4's frame API, python-lz4 and lz4_flex do not read them. |
+| Dictionary id in the header | Read and ignored | liblz4 (measured: decodes such a frame); lz4_flex refuses it. |
+| Content size field 0 | "Unknown", not checked | liblz4 (measured). |
+| Content size mismatch, stored or decoded block over the block maximum, reserved bits, version ≠ 01, block size id < 4, header checksum | Errors | liblz4 (measured, each), lz4_flex (size, block maximum). |
+| Block and content checksums | Verified (`verify_checksums = false` skips) | liblz4, the CLI (`--no-crc` skips), lz4_flex. |
+| Encoder defaults | 64 KiB, linked blocks, no checksums, no content size | liblz4's zeroed `LZ4F_preferences_t` (python-lz4: the same plus content size; the CLI: 4 MiB independent blocks with a content checksum). |
+
+## Constant-time contract
+
+None claimed: the data is public. There is no secret in this module.
+
+## Limits and refusals
+
+- `decompressBlock`: output at most `dst.len` (`error.OutputTooSmall`); no history.
+- Frame block maximum: from BD (64 KiB … 4 MiB); a stored block, a compressed block's size word or
+  its decoded size over it is `error.BlockTooLarge`. Legacy blocks: at most 8 MiB decoded and
+  `LZ4_COMPRESSBOUND(8 MiB)` stored.
+- `DecodeOptions.max_output`: default 256 MiB (`default_max_output`), `null` = unbounded; one byte
+  more is `error.OutputTooLarge`; a header whose content size exceeds what is left of the cap is
+  refused before its blocks are read (pinned by `test "frame: the output cap"`).
+- Allocation: a compressed block reserves `min(block maximum, 255 × stored size, cap left)` (no
+  block decodes to more than 255 bytes per stored byte); nothing is sized from a declared length.
+- Compressor input: at most `0x7E000000` bytes per block (`max_block_input`, liblz4's
+  `LZ4_MAX_INPUT_SIZE`) and `2^32 − 1` per frame (`error.InputTooLarge`); `acceleration` is clamped
+  to 1..65537 as in liblz4.
+- Bounds: `compressBlockBound(n) = n + n/255 + 16` (liblz4's macro); `compressBound(n, opts)` = the
+  header, `n`, 4 bytes per block (+4 with block checksums), the end mark (+4 with a content
+  checksum).
+
+## Anchoring
+
+- **External anchor — live:** `tools/interop.zig` against the lz4 1.10.0 CLI and liblz4 through
+  python-lz4 4.4.5 and `ctypes`: 30 shapes (`src/shapes.zig`: empty, 1 byte, 12/13/17 bytes around
+  the 13-byte minimum for a match, incompressible, long runs, periodic data at offsets 1..16,
+  matches at offsets 65533..65536 around the window edge, 64 KiB / 256 KiB / 1 MiB block
+  boundaries, 5 MiB); our frames under four option sets through `lz4 -d` and `lz4.frame.decompress`;
+  CLI frames under nine flag sets (default, `-9`, `-12 -BD`, `--fast=3`, linked 64 KiB with block
+  checksums and content size, `-B5`…`-B7`, legacy `-l`) and python-lz4's frames (four option
+  sets) and blocks (default, HC 12, fast 30) through ours; our blocks at accelerations 1/4/100
+  through `LZ4_decompress_safe`; 6 000 mutated blocks and frames whose verdicts agree with liblz4's
+  except the classified divergences. Run 2026-11-17: 6 809 checks, 0 failures (746 both accept with
+  the same bytes, 5 253 both refuse, 1 offset 0, 4 end-of-block rule, 1 zero-capacity token).
+- **External anchor — frozen:** ten frames written by the lz4 1.10.0 CLI (`tools/capture-goldens.sh`,
+  `src/testdata/`), replayed by `src/golden_test.zig` against the inputs' SHA-256; the xxHash32
+  values of four strings as the CLI writes them (`src/frame_test.zig`).
+- **Re-derived:** `modelDecode` in `src/fuzz_test.zig`, a byte-at-a-time reading of the block format
+  written independently of `block.zig`, judges every fuzzed block.
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+## What is deliberately not done
+
+- **Byte parity with liblz4's compressor** — never: the format leaves the matcher free; liblz4's
+  output depends on its hash function and table layout, which this module does not copy. Sizes are
+  within 0.6 % of `lz4 -1` on the bench payloads.
+- **Enforcing end-of-block rules 2 and 3 in the decoder** — not now (see Behaviour choices); a
+  strict mode could be added if a consumer needs to refuse what liblz4 refuses.
+- **Writing legacy frames** — never: `lz4 -l` exists for old Linux kernels' boot images; reading
+  them is enough.
+
+## Backlog / deferred
+
+- **B1** Streaming: a pull `std.Io.Reader` over frames and a `std.Io.Writer` compressor (block by
+  block, memory bounded by two blocks).
+- **B2** LZ4 HC levels (hash chains, lazy / optimal parsing).
+- **B3** Dictionaries: compress and decompress with a caller's dictionary (frame dictionary id).
+- **B4** Speed: decompression 1.8–2.6× and compression 1.4–2.0× liblz4's time (2026-11-17). Not
+  tuned beyond 16-byte wild copies in the decoder; the obvious next steps are a 5-byte hash and a
+  larger table for the compressor and a fast loop without per-sequence bounds checks while far
+  from the ends of the buffers.
+- **B5** `decompressFrameInto(dst, src)`: decode a frame into a caller's buffer (a consumer that
+  knows the size, like Arrow IPC, would save the copy).
+
+## Open
+
+- No mutation run yet at creation (Audit line).
+- Big-endian and 32-bit targets are not run; `meta.targets` is `linux64`.

@@ -1,0 +1,35 @@
+lz4 — provenance note
+====================
+
+A record only. Nothing in this file imposes a redistribution condition beyond
+zig-libs' own MIT license (see the repository `LICENSE`).
+
+An original Zig implementation
+------------------------------
+
+The block and frame codecs implement the two format documents of the LZ4
+project, `doc/lz4_Block_format.md` and `doc/lz4_Frame_format.md` (LZ4
+v1.10.0, Yann Collet), as the specification. The compressor is a textbook
+single-probe hash-table greedy LZ77 matcher with LZ4's published
+"acceleration" skip; no liblz4 code was copied or translated.
+
+Design references consulted for BEHAVIOUR only (which inputs are accepted or
+refused), no code copied:
+
+  - liblz4 v1.10.0 `lib/lz4.c`, `LZ4_decompress_generic` (BSD-2-Clause): the
+    validity conditions of its safe decoding loop, to decide which of the
+    format's optional end-of-block rules this module enforces (SPEC.md
+    "Behaviour choices").
+  - lz4_flex `src/frame/decompress.rs` (MIT, https://github.com/PSeitz/lz4_flex):
+    its handling of concatenated frames, dictionary ids and oversized blocks.
+
+Black-box test oracles
+----------------------
+
+The `lz4` command-line program (v1.10.0; the program is GPL-2.0-or-later, the
+library BSD-2-Clause) and python-lz4 4.4.5 (BSD-3-Clause, linking the system
+liblz4) are run as black boxes by `tools/interop.zig` and `tools/bench.zig`.
+The frames in `src/testdata/` are the CLI's output over inputs this module's
+recipe generates (`tools/capture-goldens.sh`): our content in the tool's
+format, which needs no attribution (root NOTICE §0); recorded here with the
+version for reproducibility. No source of the CLI was read.

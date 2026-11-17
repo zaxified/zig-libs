@@ -17,7 +17,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 264 modules (Zig 0.17.1, tests green in `ReleaseSafe` and `ReleaseFast`)
+**Status:** 265 modules (Zig 0.17.1, tests green in `ReleaseSafe` and `ReleaseFast`)
 · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -303,7 +303,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 <!-- BEGIN GENERATED: check-portable-table (source: build.zig; regenerate with `zig build gen-portable-table`; do not hand-edit) -->
 ### Portability — claimed vs. verified
 
-Every one of the 264 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 264 modules — a linux64-only module has nothing further to show here.
+Every one of the 265 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 265 modules — a linux64-only module has nothing further to show here.
 
 47 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 57 declared pairs, 56 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 
@@ -668,6 +668,7 @@ Every one of the 264 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | [`json5`](modules/json5/README.md) | 1 | Single-pass JSON5→JSON preprocessor (comments, unquoted keys, trailing commas, single-quoted strings, JSON5 numbers, line continuations). | any | — |
 | [`jsontext`](modules/jsontext/README.md) | 2 (S,E,P) | JSON text helpers: string-literal writer (RFC 8259 §7; U+FFFD / byte-escape / reject for ill-formed UTF-8, ASCII-only and HTML-safe options) and a string-aware nesting-depth prescan | any | — |
 | [`linkheader`](modules/linkheader/README.md) | 3 (S,E,H,P) | Web Linking (RFC 8288) `Link` header build + parse: every param (anchor/media/title*/extensions), RFC 8187 ext-values, unquote, RFC 3986 target resolution, `pagination` + `find(rel)`; zero-alloc, injection-safe builder. | any | — |
+| [`lz4`](modules/lz4/README.md) | 4 (P) | LZ4 block and frame (.lz4) codec: fast greedy compressor with acceleration, bounded decompressor for frames (checksums, linked blocks, skippable, legacy) and raw blocks | any | — |
 | [`lzma`](modules/lzma/README.md) | 2 (S,A,P) | LZMA1, LZMA2 and the .xz / .lzma containers: streaming decoder with a dictionary cap, and a liblzma-compatible encoder | any | — |
 | [`numparse`](modules/numparse/README.md) | 1 | Locale-aware grouped-number parsing (thousands/decimal separators) into an exact `decimal.Decimal`. | any | decimal |
 | [`protobuf`](modules/protobuf/README.md) | 3 (S,E,H,P) | Protocol Buffers wire format (proto3) codec — schema derived at comptime from Zig structs (oneof, map, well-known types incl. Any/Struct), no `.proto` compiler; untrusted-input hardened. | any | — |
