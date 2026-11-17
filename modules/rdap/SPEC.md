@@ -6,7 +6,7 @@
 
 **Scope:** core — openrdap/rdap v0.10.2 (Go) and icann-rdap v1.0.0 (Rust) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation 2026-11-17 (19/19) · src bb64116a588131f5
+**Audit:** review 2026-09-02 · mutation 2026-11-17 (452/462, 10 eq) · src b614a2801aa21d31
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, RDAP_FUZZ) · ct n/a — public registry queries (keyword review, 2026-10-07)
 
@@ -108,6 +108,8 @@ malformed/wrong-top-level, and wrong-typed-member (degrade-not-panic) cases; boo
 404→NotFound, `status_out` carrying the real HTTP status on `error.HttpStatus` (429 vs. 500 vs.
 403), related-link follow and its fallback when the second hop fails or when the `related` href
 names a loopback/RFC 1918 host — never dialed). Run: `zig build test-rdap`.
+
+**Audit 2026-11-17 (whole-module mutation).** 462 mutants = the 19 delta mutants over `BootstrapCache` (all killed; not re-run) + 443 over every non-test line of `src/root.zig` (URL building and percent-encoding, the response mapper and every JSON key it reads, bootstrap parsing, longest-match domain / IP-prefix / ASN lookup, `BootstrapCache`, `Client` status handling and error mapping, `DestinationPolicy`, `isSpecialUseHost` / `inet_aton` parsing, `HttpFetcher` redirects and body reading), one schemata build per round, baseline first. Round 1: 319 killed + 1 hung, 123 survived. 30 tests were added: overflow stage and error code of every `buildPath` / `buildUrl` write, one-character values and bases, every percent-encoded class, `OutOfMemory` (never `InvalidJson`) from `checkAllAllocationFailures` over `parseResponse` and `parseBootstrap`, keys no other test read (nameserver `unicodeName`, link `value`/`title`, redacted `replacementPath`/`pathLang`, `keyData` events/links), the `keyData` cap at 63/64/65, jCard edge shapes, longest-match with the long key first, first-wins ties, `/0` `/32` `/128` and invalid prefix lengths, family mismatches, ASN endpoints and malformed range keys, a saturating clock, HTTP 200 only for a bootstrap file, `Client` status classes 1xx..3xx, `status_out` untouched by the related hop, URL scheme spelling, `inet_aton` forms and bounds, documentation-net boundaries, and loopback tests for `HttpFetcher` (each of 301/302/303/307/308 followed with the base advancing, non-redirects with a `Location` returned, the redirect cap and a too-long `Location`, exact / short / oversize bodies, and a cancel during the exact-fit probe read). Round 2 killed 112 of the 124 (one more by a hang); round 3 killed the last one (an empty key is the root). 10 do not die: 9 EQUIVALENT (`queryValue` `.help` value unused; `number_string` only arises where `parseInt(i64)` fails; domain length compare for keys of non-empty labels differ by 0 or >= 2; `0x` invalid by either branch; leading 0 of an octal part; empty digits fail in `parseInt`; `room < 32` redundant with the part cap; `isUniqueLocal` subsumed by `isPrivate`; the always-probe read is cost-only) and 1 UNOBSERVABLE (`http.Url.parse` failing on a URL the client has just fetched). Comptime-only constants (`max_url_len`, `max_entity_depth`, field defaults) cannot be switched at run time; a test pins their values. Counts on the card are whole-module.
 
 ## Backlog / deferred
 

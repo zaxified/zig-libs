@@ -2631,6 +2631,8 @@ const FetchCancelPeer = struct {
     io: std.Io,
     listener: *std.Io.net.Server,
     stop: std.atomic.Value(u32) = .init(0),
+    /// What the peer sends before it parks: a head promising more body than it sends.
+    response: []const u8 = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
     /// Set once `accept` returned; `release` only has to wake a peer before that.
     accepted: std.atomic.Value(u32) = .init(0),
 
@@ -2641,7 +2643,7 @@ const FetchCancelPeer = struct {
         if (p.stop.load(.acquire) != 0) return; // woken by `release`
         var wbuf: [256]u8 = undefined;
         var sw = s.writer(p.io, &wbuf);
-        sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n") catch {};
+        sw.interface.writeAll(p.response) catch {};
         sw.interface.flush() catch {};
         while (p.stop.load(.acquire) == 0)
             p.io.sleep(.fromMilliseconds(5), .awake) catch return;
@@ -3516,4 +3518,648 @@ test "BootstrapCache: OutOfMemory during a refresh propagates, the expired copy 
     c.gpa = testing.allocator;
     // the old copy is intact and a retry with memory succeeds
     try testing.expectEqualStrings("https://two.example/", (try c.get(.dns, 100, &buf)).lookupDomain("a.com").?[0]);
+}
+
+// ── whole-module mutation additions (2026-11-17) ────────────────────────────
+// Each test below kills mutants that survived the whole-module run; the
+// behaviour pinned is the module's existing, documented one.
+
+test "buildPath/buildUrl: one-character values and bases, every overflow stage reports its own error" {
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("domain/a", try buildPath(&buf, .domain, "a"));
+    try testing.expectEqualStrings("x/domain/a", try buildUrl(&buf, "x", .domain, "a"));
+    try testing.expectEqualStrings("domain/a", try buildPath(&buf, .tld, ".a"));
+    try testing.expectError(error.EmptyQuery, buildPath(&buf, .tld, "."));
+    // A buffer one byte short at every stage: the error is always the overflow.
+    var small: [64]u8 = undefined;
+    const full_path = "domain/example.com";
+    for (0..full_path.len) |k| {
+        try testing.expectError(error.PathTooLong, buildPath(small[0..k], .domain, "example.com"));
+    }
+    for (0.."help".len) |k| try testing.expectError(error.PathTooLong, buildPath(small[0..k], .help, ""));
+    const full_url = "https://r/domain/example.com";
+    for (0..full_url.len) |k| {
+        try testing.expectError(error.UrlTooLong, buildUrl(small[0..k], "https://r", .domain, "example.com"));
+    }
+    for (0.."https://r/help".len) |k| try testing.expectError(error.UrlTooLong, buildUrl(small[0..k], "https://r/", .help, ""));
+    try testing.expectEqualStrings(full_url, try buildUrl(small[0..full_url.len], "https://r", .domain, "example.com"));
+}
+
+test "buildPath: every unreserved character passes, every other byte is percent-encoded in upper-case hex" {
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("domain/a_b~c:d-e.F9", try buildPath(&buf, .domain, "a_b~c:d-e.F9"));
+    try testing.expectEqualStrings(
+        "domain/a%25b%3Fc%23d%2Be%0A%20%2F%80%FF",
+        try buildPath(&buf, .domain, "a%b?c#d+e\n /\x80\xff"),
+    );
+}
+
+test "object classes and case-insensitive helpers" {
+    try testing.expectEqual(ObjectClass.domain, classFromName("domain"));
+    try testing.expectEqual(ObjectClass.ip_network, classFromName("ip network"));
+    try testing.expectEqual(ObjectClass.autnum, classFromName("autnum"));
+    try testing.expectEqual(ObjectClass.nameserver, classFromName("nameserver"));
+    try testing.expectEqual(ObjectClass.entity, classFromName("entity"));
+    try testing.expectEqual(ObjectClass.domain, classFromName("DOMAIN"));
+    try testing.expectEqual(ObjectClass.other, classFromName("something else"));
+    const e: Entity = .{ .roles = &.{"Registrar"} };
+    try testing.expect(e.hasRole("registrar"));
+    try testing.expect(!e.hasRole("abuse"));
+    const o: Object = .{
+        .links = &.{.{ .href = "https://x/", .rel = "SELF" }},
+        .events = &.{.{ .action = "Registration", .date = "d" }},
+    };
+    try testing.expectEqualStrings("https://x/", o.linkHref("self").?);
+    try testing.expectEqualStrings("d", o.eventDate("registration").?);
+    try testing.expect(o.eventDate("expiration") == null);
+    try testing.expect(o.linkHref("related") == null);
+    const nested: Entity = .{ .entities = &.{ .{ .roles = &.{"technical"} }, .{ .roles = &.{"abuse"} } } };
+    try testing.expectEqual(@as(*const Entity, &nested.entities[1]), nested.entityWithRole("abuse").?);
+    try testing.expect(nested.entityWithRole("registrar") == null);
+    const top: Object = .{ .entities = &.{ .{ .roles = &.{"technical"} }, .{ .roles = &.{"abuse"} } } };
+    try testing.expectEqual(@as(*const Entity, &top.entities[1]), top.entityWithRole("abuse").?);
+    try testing.expect(top.entityWithRole("registrar") == null);
+}
+
+fn parseResponseOom(a: std.mem.Allocator, text: []const u8) !void {
+    var p = try parseResponse(a, text);
+    p.deinit();
+}
+
+fn parseBootstrapOom(a: std.mem.Allocator, text: []const u8) !void {
+    var b = try parseBootstrap(a, text);
+    b.deinit();
+}
+
+test "parse: an allocation failure anywhere is OutOfMemory (never InvalidJson), and nothing leaks" {
+    const doc =
+        \\{"objectClassName":"domain","handle":"h","ldhName":"a.example","status":["active"],
+        \\ "events":[{"eventAction":"registration","eventDate":"2020-01-01T00:00:00Z"}],
+        \\ "entities":[{"handle":"e","roles":["registrar"],"vcardArray":["vcard",[["fn",{},"text","Name"]]]}],
+        \\ "links":[{"href":"https://x/","rel":"self"}],"secureDNS":{"dsData":[{"keyTag":1,"digest":"AB"}]}}
+    ;
+    try std.testing.checkAllAllocationFailures(testing.allocator, parseResponseOom, .{doc});
+    try std.testing.checkAllAllocationFailures(testing.allocator, parseBootstrapOom, .{cache_v1});
+}
+
+test "parse: errorCode of the wrong type reads as 0; integers beyond i64 read as null" {
+    var p = try parseResponse(testing.allocator, "{\"errorCode\":\"404\",\"title\":\"t\"}");
+    defer p.deinit();
+    try testing.expectEqual(@as(i64, 0), p.document.rdap_error.error_code);
+    var q = try parseResponse(testing.allocator, "{\"objectClassName\":\"autnum\",\"startAutnum\":99999999999999999999,\"endAutnum\":7}");
+    defer q.deinit();
+    try testing.expect(q.document.object.start_autnum == null);
+    try testing.expectEqual(@as(?i64, 7), q.document.object.end_autnum);
+}
+
+test "parse: members whose key was never read by another test (nameserver, link, redacted, keyData)" {
+    var p = try parseResponse(testing.allocator,
+        \\{"objectClassName":"domain",
+        \\ "nameservers":[{"ldhName":"ns1.x","unicodeName":"ns1.ü","handle":"H"}],
+        \\ "links":[{"href":"https://x/","rel":"self","type":"application/rdap+json","value":"https://v/","title":"T"}],
+        \\ "redacted":[{"name":{"description":"D"},"prePath":"$.a","postPath":"$.b","replacementPath":"$.c","pathLang":"jsonpath","method":"removal"}],
+        \\ "secureDNS":{"keyData":[{"flags":257,"protocol":3,"publicKey":"AAA","algorithm":8,
+        \\   "events":[{"eventAction":"x","eventDate":"d"}],"links":[{"href":"https://k/"}]}]}}
+    );
+    defer p.deinit();
+    const o = p.document.object;
+    try testing.expectEqualStrings("ns1.ü", o.nameservers[0].unicode_name.?);
+    try testing.expectEqualStrings("https://v/", o.links[0].value.?);
+    try testing.expectEqualStrings("T", o.links[0].title.?);
+    try testing.expectEqualStrings("application/rdap+json", o.links[0].media_type.?);
+    try testing.expectEqualStrings("D", o.redacted[0].name.?);
+    try testing.expectEqualStrings("$.c", o.redacted[0].replacement_path.?);
+    try testing.expectEqualStrings("jsonpath", o.redacted[0].path_lang.?);
+    const k = o.secure_dns.?.key_data[0];
+    try testing.expectEqualStrings("x", k.events[0].action);
+    try testing.expectEqualStrings("https://k/", k.links[0].href);
+}
+
+test "secureDNS: keyData cap is exactly max_secure_dns_records" {
+    for ([_]usize{ 63, 64, 65, 80 }) |n| {
+        var json: std.ArrayList(u8) = .empty;
+        defer json.deinit(testing.allocator);
+        try json.appendSlice(testing.allocator, "{\"secureDNS\":{\"keyData\":[");
+        for (0..n) |i| {
+            if (i != 0) try json.append(testing.allocator, ',');
+            try json.appendSlice(testing.allocator, "{\"flags\":257}");
+        }
+        try json.appendSlice(testing.allocator, "]}}");
+        var p = try parseResponse(testing.allocator, json.items);
+        defer p.deinit();
+        try testing.expectEqual(@min(n, max_secure_dns_records), p.document.object.secure_dns.?.key_data.len);
+    }
+}
+
+test "parse: jCard edge shapes (short arrays, upper-case names, first value wins, empty first component)" {
+    var p = try parseResponse(testing.allocator,
+        \\{"entities":[
+        \\ {"vcardArray":["vcard"]},
+        \\ {"vcardArray":["vcard",[["fn",{},"text"]]]},
+        \\ {"vcardArray":["vcard",[["FN",{},"text","Upper"],["ORG",{},"text","UpOrg"],["EMAIL",{},"text","u@x"]]]},
+        \\ {"vcardArray":["vcard",[["fn",{},"text","One"],["fn",{},"text","Two"],["org",{},"text","O1"],["org",{},"text","O2"],
+        \\                         ["email",{},"text","a@x"],["email",{},"text","b@x"]]]},
+        \\ {"vcardArray":["vcard",[["org",{},"text",["","Acme"]]]]}
+        \\]}
+    );
+    defer p.deinit();
+    const es = p.document.object.entities;
+    try testing.expect(es[0].full_name == null);
+    try testing.expect(es[1].full_name == null);
+    try testing.expectEqualStrings("Upper", es[2].full_name.?);
+    try testing.expectEqualStrings("UpOrg", es[2].org.?);
+    try testing.expectEqualStrings("u@x", es[2].email.?);
+    try testing.expectEqualStrings("One", es[3].full_name.?);
+    try testing.expectEqualStrings("O1", es[3].org.?);
+    try testing.expectEqualStrings("a@x", es[3].email.?);
+    try testing.expectEqualStrings("Acme", es[4].org.?);
+}
+
+test "bootstrap: domain lookup is longest-match, first-wins on a tie, case-insensitive, label-bounded" {
+    var b = try parseBootstrap(testing.allocator,
+        \\{"services":[[["co.uk"],["https://couk/"]],[["uk"],["https://uk/"]],
+        \\ [["com"],["https://one/"]],[["com"],["https://two/"]]]}
+    );
+    defer b.deinit();
+    try testing.expectEqualStrings("https://couk/", b.lookupDomain("a.co.uk").?[0]);
+    try testing.expectEqualStrings("https://uk/", b.lookupDomain("a.uk").?[0]);
+    try testing.expectEqualStrings("https://one/", b.lookupDomain("x.com").?[0]);
+    try testing.expectEqualStrings("https://one/", b.lookupDomain("com").?[0]);
+    try testing.expectEqualStrings("https://one/", b.lookupDomain("COM").?[0]);
+    try testing.expectEqualStrings("https://one/", b.lookupDomain("EXAMPLE.COM").?[0]);
+    try testing.expectEqualStrings("https://one/", b.lookupDomain("example.com.").?[0]);
+    try testing.expect(b.lookupDomain(".com") == null);
+    try testing.expect(b.lookupDomain("examplecom") == null);
+    try testing.expect(b.lookupDomain("") == null);
+    try testing.expect(b.lookupDomain(".") == null);
+}
+
+test "bootstrap: an empty key is the root, reached by \"\" and by \".\"" {
+    var b = try parseBootstrap(testing.allocator, "{\"services\":[[[\"\"],[\"https://root/\"]]]}");
+    defer b.deinit();
+    try testing.expectEqualStrings("https://root/", b.lookupDomain("").?[0]);
+    try testing.expectEqualStrings("https://root/", b.lookupDomain(".").?[0]);
+}
+
+test "bootstrap: IP lookup (first wins on a tie, /0, /32, /128, invalid prefix lengths, family mismatch)" {
+    var a = try parseBootstrap(testing.allocator,
+        \\{"services":[[["10.0.0.0/8"],["https://a/"]],[["10.0.0.0/8"],["https://dup/"]],
+        \\ [["10.1.0.0/16"],["https://b/"]],[["1.2.3.4/32"],["https://host/"]],
+        \\ [["2001:db8::/32"],["https://x/"]],[["2001:db8:1::/48"],["https://y/"]],
+        \\ [["2001:db8::/128"],["https://z/"]],[["2001:db8::/129","2001:db8::/abc","2001:db8::/-1"],["https://bad/"]]]}
+    );
+    defer a.deinit();
+    try testing.expectEqualStrings("https://a/", a.lookupIp("10.2.3.4").?[0]);
+    try testing.expectEqualStrings("https://a/", a.lookupIp("10.2.0.0/16").?[0]);
+    try testing.expectEqualStrings("https://b/", a.lookupIp("10.1.9.9").?[0]);
+    try testing.expectEqualStrings("https://host/", a.lookupIp("1.2.3.4").?[0]);
+    try testing.expect(a.lookupIp("1.2.3.5") == null);
+    try testing.expectEqualStrings("https://x/", a.lookupIp("2001:db8::1").?[0]);
+    try testing.expectEqualStrings("https://y/", a.lookupIp("2001:db8:1::5").?[0]);
+    try testing.expectEqualStrings("https://z/", a.lookupIp("2001:db8::").?[0]);
+    try testing.expect(a.lookupIp("2001:db9::1") == null);
+
+    var all = try parseBootstrap(testing.allocator, "{\"services\":[[[\"0.0.0.0/0\"],[\"https://all/\"]]]}");
+    defer all.deinit();
+    try testing.expectEqualStrings("https://all/", all.lookupIp("8.8.8.8").?[0]);
+    try testing.expect(all.lookupIp("::1") == null); // a v4 key never matches a v6 address
+
+    var v6 = try parseBootstrap(testing.allocator, "{\"services\":[[[\"::/16\"],[\"https://six/\"]]]}");
+    defer v6.deinit();
+    try testing.expect(v6.lookupIp("1.2.3.4") == null); // nor a v6 key a v4 address
+    try testing.expectEqualStrings("https://six/", v6.lookupIp("::1").?[0]);
+
+    var bad = try parseBootstrap(testing.allocator,
+        \\{"services":[[["1.2.3.0/33","1.2.3.0/abc","1.2.3.0/-1","1.2.3.0/256"],["https://bad/"]]]}
+    );
+    defer bad.deinit();
+    try testing.expect(bad.lookupIp("1.2.3.0") == null);
+}
+
+test "cidrMatch returns the prefix length of the matching CIDR" {
+    const ip = netaddr.parseIp("10.1.2.3").?;
+    try testing.expectEqual(@as(?i16, 8), cidrMatch(ip, "10.0.0.0/8"));
+    try testing.expectEqual(@as(?i16, 16), cidrMatch(ip, "10.1.0.0/16"));
+    try testing.expectEqual(@as(?i16, 0), cidrMatch(ip, "0.0.0.0/0"));
+    try testing.expectEqual(@as(?i16, null), cidrMatch(ip, "11.0.0.0/8"));
+    try testing.expectEqual(@as(?i16, 128), cidrMatch(netaddr.parseIp("::1").?, "::1/128"));
+}
+
+test "bootstrap: ASN lookup, malformed range keys are skipped, endpoints are inclusive" {
+    var b = try parseBootstrap(testing.allocator,
+        \\{"services":[[["abc-100","200-xyz"],["https://bad/"]],[["300"],["https://single/"]],
+        \\ [["64496-64511"],["https://range/"]]]}
+    );
+    defer b.deinit();
+    try testing.expect(b.lookupAsn(50) == null);
+    try testing.expect(b.lookupAsn(5000) == null);
+    try testing.expectEqualStrings("https://single/", b.lookupAsn(300).?[0]);
+    try testing.expect(b.lookupAsn(299) == null);
+    try testing.expect(b.lookupAsn(301) == null);
+    try testing.expectEqualStrings("https://range/", b.lookupAsn(64496).?[0]);
+    try testing.expectEqualStrings("https://range/", b.lookupAsn(64511).?[0]);
+    try testing.expect(b.lookupAsn(64495) == null);
+    try testing.expect(b.lookupAsn(64512) == null);
+}
+
+test "parseBootstrap: an entry needs both keys and urls" {
+    var b = try parseBootstrap(testing.allocator,
+        \\{"services":[[[],["https://nokeys/"]],[["com"],[]],[["net"],["https://ok/"]]]}
+    );
+    defer b.deinit();
+    try testing.expectEqual(@as(usize, 1), b.services.len);
+    try testing.expectEqualStrings("https://ok/", b.lookup("NET").?[0]);
+}
+
+test "RegistryKind: every kind names its own file" {
+    try testing.expectEqualStrings("dns.json", RegistryKind.dns.fileName());
+    try testing.expectEqualStrings("ipv4.json", RegistryKind.ipv4.fileName());
+    try testing.expectEqualStrings("ipv6.json", RegistryKind.ipv6.fileName());
+    try testing.expectEqualStrings("asn.json", RegistryKind.asn.fileName());
+}
+
+test "BootstrapCache: a clock far from the stored time saturates instead of overflowing" {
+    var stub: CacheStub = .{ .body = cache_v2 };
+    var c: BootstrapCache = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
+    defer c.deinit();
+    var buf: [4096]u8 = undefined;
+    try c.load(.dns, cache_v1, std.math.maxInt(i64));
+    try testing.expectEqualStrings("https://two.example/", (try c.get(.dns, -2, &buf)).lookupDomain("a.com").?[0]);
+    try testing.expectEqual(@as(usize, 1), stub.calls);
+    try c.load(.dns, cache_v1, std.math.minInt(i64));
+    try testing.expectEqualStrings("https://two.example/", (try c.get(.dns, std.math.maxInt(i64), &buf)).lookupDomain("a.com").?[0]);
+    try testing.expectEqual(@as(usize, 2), stub.calls);
+}
+
+test "BootstrapCache: only HTTP 200 is a bootstrap file (openrdap: any other status is an error)" {
+    var buf: [4096]u8 = undefined;
+    for ([_]u16{ 201, 204, 206, 301, 302, 304, 404, 500 }) |st| {
+        var stub: CacheStub = .{ .body = cache_v1, .status = st };
+        var c: BootstrapCache = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
+        defer c.deinit();
+        try testing.expectError(error.HttpStatus, c.get(.dns, 0, &buf));
+        try testing.expect(c.publication(.dns) == null);
+    }
+}
+
+test "BootstrapCache: lookupIp takes a CIDR, lookupAsn is inclusive at both ends, lookupDomain" {
+    var stub: CacheStub = .{ .body =
+        \\{"version":"1.0","services":[[["192.0.2.0/24","64496-64511","com"],["https://x.example/"]]]}
+    };
+    var c: BootstrapCache = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
+    defer c.deinit();
+    var buf: [4096]u8 = undefined;
+    try testing.expectEqualStrings("https://x.example/", (try c.lookupIp("192.0.2.0/24", 0, &buf)).?[0]);
+    try testing.expectEqualStrings("https://x.example/", (try c.lookupAsn(64511, 0, &buf)).?[0]);
+    try testing.expectEqualStrings("https://x.example/", (try c.lookupAsn(64496, 0, &buf)).?[0]);
+    try testing.expect((try c.lookupAsn(64512, 0, &buf)) == null);
+    try testing.expectEqualStrings("https://x.example/", (try c.lookupDomain("a.com", 0, &buf)).?[0]);
+    try testing.expect((try c.lookupDomain("a.net", 0, &buf)) == null);
+}
+
+const LyingFetcher = struct {
+    extra: usize,
+    fn fetchFn(ctx: *anyopaque, _: []const u8, body_buf: []u8) FetchError!Fetcher.Result {
+        const s: *LyingFetcher = @ptrCast(@alignCast(ctx));
+        return .{ .status = 200, .body_len = body_buf.len + s.extra };
+    }
+};
+
+test "Fetcher.fetch: a body length beyond the buffer is an error, an exactly full buffer is not" {
+    var lie: LyingFetcher = .{ .extra = 1 };
+    const f: Fetcher = .{ .ctx = &lie, .fetchFn = LyingFetcher.fetchFn };
+    var buf: [8]u8 = undefined;
+    try testing.expectError(error.FetchFailed, f.fetch("https://x/", &buf));
+    lie.extra = 0;
+    const r = try f.fetch("https://x/", &buf);
+    try testing.expectEqual(@as(usize, 8), r.body.len);
+}
+
+test "client: status classes (2xx is success, anything else needs a typed body) and the failure paths" {
+    const ok_body = "{\"objectClassName\":\"domain\"}";
+    const cases = [_]struct { status: u16, body: []const u8, want: ?anyerror }{
+        .{ .status = 100, .body = ok_body, .want = error.HttpStatus },
+        .{ .status = 199, .body = ok_body, .want = error.HttpStatus },
+        .{ .status = 200, .body = ok_body, .want = null },
+        .{ .status = 201, .body = ok_body, .want = null },
+        .{ .status = 299, .body = ok_body, .want = null },
+        .{ .status = 300, .body = ok_body, .want = error.HttpStatus },
+        .{ .status = 301, .body = ok_body, .want = error.HttpStatus },
+        .{ .status = 200, .body = "not json", .want = error.InvalidJson },
+        .{ .status = 200, .body = "[]", .want = error.InvalidRdap },
+        .{ .status = 500, .body = "[]", .want = error.HttpStatus },
+        .{ .status = 403, .body = "not json", .want = error.HttpStatus },
+        .{ .status = 405, .body = ok_body, .want = error.HttpStatus },
+    };
+    for (cases) |cs| {
+        const entries = [_]StubFetcher.Entry{.{ .url = "https://r.example/domain/x.example", .status = cs.status, .body = cs.body }};
+        var stub: StubFetcher = .{ .entries = &entries };
+        var client: Client = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
+        var buf: [256]u8 = undefined;
+        var status: u16 = 7777;
+        if (cs.want) |e| {
+            try testing.expectError(e, client.query("https://r.example", .domain, "x.example", .{}, &buf, &status));
+            // status_out is written only for HttpStatus.
+            try testing.expectEqual(@as(u16, if (e == error.HttpStatus) cs.status else 7777), status);
+        } else {
+            var parsed = try client.query("https://r.example", .domain, "x.example", .{}, &buf, &status);
+            parsed.deinit();
+            try testing.expectEqual(@as(u16, 7777), status);
+        }
+    }
+    // A failing allocator is OutOfMemory even under a failure status.
+    const entries = [_]StubFetcher.Entry{.{ .url = "https://r.example/domain/x.example", .status = 500, .body = "{}" }};
+    var stub: StubFetcher = .{ .entries = &entries };
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var client: Client = .{ .fetcher = stub.fetcher(), .gpa = failing.allocator() };
+    var buf: [256]u8 = undefined;
+    try testing.expectError(error.OutOfMemory, client.query("https://r.example", .domain, "x.example", .{}, &buf, null));
+}
+
+test "client: a failed related hop leaves status_out alone and returns the first document" {
+    const entries = [_]StubFetcher.Entry{
+        .{ .url = "https://r.example/domain/x.example", .body = "{\"objectClassName\":\"domain\",\"links\":[{\"href\":\"https://reg.example/x\",\"rel\":\"related\"},{\"href\":\"https://self.example/x\",\"rel\":\"self\"}]}" },
+        .{ .url = "https://reg.example/x", .status = 500, .body = "oops" },
+        .{ .url = "https://self.example/x", .body = "{\"objectClassName\":\"entity\"}" },
+    };
+    var stub: StubFetcher = .{ .entries = &entries };
+    var client: Client = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
+    var buf: [512]u8 = undefined;
+    var status: u16 = 7777;
+    var parsed = try client.query("https://r.example", .domain, "x.example", .{ .follow_related = true }, &buf, &status);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(u16, 7777), status);
+    try testing.expectEqual(ObjectClass.domain, parsed.document.object.object_class);
+    try testing.expectEqual(@as(usize, 2), stub.call_count); // the self link was not followed
+}
+
+test "checkDestination: scheme spelling, plain-http, unparseable URLs" {
+    const strict: DestinationPolicy = .{};
+    try testing.expectError(error.BadDestination, checkDestination("https:/rdap.example/x", strict));
+    try testing.expectError(error.BadDestination, checkDestination("http:/rdap.example/x", strict));
+    try testing.expectError(error.BlockedDestination, checkDestination("HTTP://rdap.example/x", strict));
+    try checkDestination("HTTPS://rdap.example/x", strict);
+    const lax: DestinationPolicy = .{ .require_https = false };
+    try checkDestination("HTTP://rdap.example/x", lax);
+    try testing.expectError(error.BadDestination, checkDestination("https://rdap.example/a b", strict));
+    try testing.expectError(error.BadDestination, checkDestination("http://rdap.example/a b", lax));
+}
+
+test "isSpecialUseHost: short names, .localhost in any case, absolute IPv6, documentation boundaries" {
+    try testing.expect(!isSpecialUseHost("a"));
+    try testing.expect(isSpecialUseHost("FOO.LOCALHOST"));
+    try testing.expect(isSpecialUseHost("::1."));
+    try testing.expect(isSpecialUseHost("."));
+    try testing.expect(isSpecialUseHost("8.8.8.8..")); // a second dot is an empty part: refused, not guessed
+    try testing.expect(!isSpecialUseHost("8.8.8.8."));
+    try testing.expect(!isSpecialUseHost("192.1.2.1"));
+    try testing.expect(!isSpecialUseHost("198.52.100.1"));
+    try testing.expect(!isSpecialUseHost("203.1.113.1"));
+    try testing.expect(!isSpecialUseHost("2001:b8::1"));
+    try testing.expect(isSpecialUseHost("198.51.100.1"));
+    try testing.expect(isSpecialUseHost("::ffff:192.0.2.1")); // v4-mapped documentation
+    try testing.expect(isSpecialUseHost("fd12:3456::1"));
+    try testing.expect(!isSpecialUseHost("example.com"));
+}
+
+test "parseInetAton: forms, bounds and the shapes that are not numeric" {
+    try testing.expect(parseInetAton("") == .not_numeric);
+    try testing.expect(parseInetAton(".5") == .not_numeric);
+    try testing.expect(parseInetAton("1.abc") == .not_numeric);
+    try testing.expect(parseInetAton("example.com") == .not_numeric);
+    try testing.expect(parseInetAton("9x1.0.0.1") == .invalid);
+    try testing.expect(parseInetAton("1.2.65536") == .invalid);
+    try testing.expect(parseInetAton("4294967296") == .invalid);
+    try testing.expect(parseInetAton("1.2.3.4.5") == .invalid);
+    try testing.expect(parseInetAton("1..2") == .invalid);
+    try testing.expect(parseInetAton("08.8.8.8") == .invalid);
+    try testing.expect(parseInetAton("256.1.1.1") == .invalid);
+    try testing.expectEqualSlices(u8, &.{ 8, 8, 8, 8 }, &parseInetAton("0X8.8.8.8").addr);
+    try testing.expectEqualSlices(u8, &.{ 8, 8, 8, 8 }, &parseInetAton("0x8.010.0x8.8").addr);
+    try testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, &parseInetAton("4294967295").addr);
+    try testing.expectEqualSlices(u8, &.{ 255, 1, 1, 1 }, &parseInetAton("255.1.1.1").addr);
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &parseInetAton("127.1").addr);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 0, 3 }, &parseInetAton("1.2.3").addr);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, &parseInetAton("1.2.3.4").addr);
+}
+
+test "defaults are pinned: constants, cache lifetime and base, redirect cap, destination policy" {
+    try testing.expectEqualStrings("application/rdap+json", media_type);
+    try testing.expectEqualStrings("Accept", accept_header.name);
+    try testing.expectEqualStrings(media_type, accept_header.value);
+    try testing.expectEqual(@as(usize, 2048), max_url_len);
+    try testing.expectEqual(@as(u32, 8), max_entity_depth);
+    try testing.expectEqual(@as(usize, 64), max_secure_dns_records);
+    const c: BootstrapCache = .{ .fetcher = undefined, .gpa = testing.allocator };
+    try testing.expectEqual(@as(i64, 86400), c.ttl_s);
+    try testing.expectEqualStrings("https://data.iana.org/rdap/", c.base_url);
+    const hf: HttpFetcher = .{ .client = undefined };
+    try testing.expectEqual(@as(u8, 5), hf.max_redirects);
+    try testing.expect(hf.destinations.deny_special_use and hf.destinations.require_https);
+}
+
+// ── loopback tests for HttpFetcher ──────────────────────────────────────────
+
+/// A listener that answers the n-th request with `responses[min(n, len-1)]`
+/// and remembers the request path of the first eight requests.
+const ScriptPeer = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    responses: []const []const u8,
+    hits: std.atomic.Value(u32) = .init(0),
+    stop: std.atomic.Value(u32) = .init(0),
+    paths: [8][40]u8 = undefined,
+    path_lens: [8]usize = @splat(0),
+
+    fn run(p: *ScriptPeer) void {
+        while (true) {
+            const s = p.listener.accept(p.io) catch return;
+            defer s.close(p.io);
+            if (p.stop.load(.acquire) != 0) return;
+            const n = p.hits.load(.monotonic);
+            var rbuf: [2048]u8 = undefined;
+            var sr = s.reader(p.io, &rbuf);
+            const line = sr.interface.takeDelimiterExclusive('\n') catch "";
+            var it = std.mem.splitScalar(u8, line, ' ');
+            _ = it.next();
+            const path = it.next() orelse "";
+            if (n < p.paths.len) {
+                const l = @min(path.len, p.paths[n].len);
+                @memcpy(p.paths[n][0..l], path[0..l]);
+                p.path_lens[n] = l;
+            }
+            _ = p.hits.fetchAdd(1, .monotonic);
+            var wbuf: [512]u8 = undefined;
+            var sw = s.writer(p.io, &wbuf);
+            sw.interface.writeAll(p.responses[@min(n, p.responses.len - 1)]) catch {};
+            sw.interface.flush() catch {};
+        }
+    }
+
+    fn pathAt(p: *const ScriptPeer, i: usize) []const u8 {
+        return p.paths[i][0..p.path_lens[i]];
+    }
+};
+
+const ScriptRun = struct {
+    result: FetchError!Fetcher.Response = error.FetchFailed,
+    hits: u32 = 0,
+    peer: ScriptPeer = undefined,
+};
+
+/// Fetch `first_path` from a `ScriptPeer` through an `HttpFetcher` whose policy
+/// allows plaintext loopback; the outcome is left in `run`.
+fn runScript(responses: []const []const u8, max_redirects: u8, first_path: []const u8, body_buf: []u8, run: *ScriptRun) !void {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
+    var open = true;
+    defer if (open) server.deinit(io);
+    const port = server.socket.address.getPort();
+    run.peer = .{ .io = io, .listener = &server, .responses = responses };
+    const pt = try std.Thread.spawn(.{}, ScriptPeer.run, .{&run.peer});
+
+    var http_client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer http_client.deinit();
+    var hf: HttpFetcher = .{
+        .client = &http_client,
+        .destinations = .{ .require_https = false, .deny_special_use = false },
+        .max_redirects = max_redirects,
+    };
+    var url_buf: [96]u8 = undefined;
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, first_path });
+    run.result = hf.fetcher().fetch(url, body_buf);
+
+    run.peer.stop.store(1, .release);
+    if (server.socket.address.connect(io, .{ .mode = .stream })) |wake| {
+        var w = wake;
+        w.close(io);
+    } else |_| {}
+    pt.join();
+    server.deinit(io);
+    open = false;
+    run.hits = run.peer.hits.load(.monotonic);
+}
+
+test "HttpFetcher: 301/302/303/307/308 are redirects, each hop resolves against the one before" {
+    inline for (.{ 301, 302, 303, 307, 308 }) |st| {
+        const to_a = comptime std.fmt.comptimePrint("HTTP/1.1 {d} Moved\r\nLocation: /a\r\nContent-Length: 0\r\n\r\n", .{st});
+        const to_b = comptime std.fmt.comptimePrint("HTTP/1.1 {d} Moved\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n", .{st});
+        const responses = [_][]const u8{ to_a, to_b, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" };
+        var buf: [64]u8 = undefined;
+        var run: ScriptRun = .{};
+        try runScript(&responses, 5, "/first", &buf, &run);
+        const r = try run.result;
+        try testing.expectEqual(@as(u16, 200), r.status);
+        try testing.expectEqualStrings("ok", r.body);
+        try testing.expectEqual(@as(u32, 3), run.hits);
+        try testing.expectEqualStrings("/first", run.peer.pathAt(0));
+        try testing.expectEqualStrings("/a", run.peer.pathAt(1));
+        try testing.expectEqualStrings("/b", run.peer.pathAt(2));
+    }
+}
+
+test "HttpFetcher: other statuses are returned as they are, even with a Location header" {
+    inline for (.{ 200, 201, 300, 304, 404 }) |st| {
+        const resp = comptime std.fmt.comptimePrint("HTTP/1.1 {d} X\r\nLocation: /elsewhere\r\nContent-Length: 0\r\n\r\n", .{st});
+        const responses = [_][]const u8{resp};
+        var buf: [64]u8 = undefined;
+        var run: ScriptRun = .{};
+        try runScript(&responses, 5, "/first", &buf, &run);
+        const r = try run.result;
+        try testing.expectEqual(@as(u16, st), r.status);
+        try testing.expectEqual(@as(u32, 1), run.hits);
+    }
+    // A redirect without a Location is an ordinary response: its body is handed back.
+    const responses = [_][]const u8{"HTTP/1.1 302 Found\r\nContent-Length: 2\r\n\r\nhi"};
+    var buf: [64]u8 = undefined;
+    var run: ScriptRun = .{};
+    try runScript(&responses, 5, "/first", &buf, &run);
+    const r = try run.result;
+    try testing.expectEqual(@as(u16, 302), r.status);
+    try testing.expectEqualStrings("hi", r.body);
+    try testing.expectEqual(@as(u32, 1), run.hits);
+}
+
+test "HttpFetcher: the redirect cap is max_redirects follow-ups (default 5), a too-long Location fails" {
+    const forever = [_][]const u8{"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n"};
+    var buf: [64]u8 = undefined;
+    var run: ScriptRun = .{};
+    try runScript(&forever, 5, "/first", &buf, &run);
+    try testing.expectError(error.FetchFailed, run.result);
+    try testing.expectEqual(@as(u32, 1 + 5), run.hits);
+    try runScript(&forever, 0, "/first", &buf, &run);
+    try testing.expectError(error.FetchFailed, run.result);
+    try testing.expectEqual(@as(u32, 1), run.hits);
+
+    var head: [2300]u8 = undefined;
+    const prefix = "HTTP/1.1 302 Found\r\nLocation: /";
+    const suffix = "\r\nContent-Length: 0\r\n\r\n";
+    @memcpy(head[0..prefix.len], prefix);
+    @memset(head[prefix.len .. prefix.len + 2100], 'a');
+    @memcpy(head[prefix.len + 2100 ..][0..suffix.len], suffix);
+    const long = [_][]const u8{head[0 .. prefix.len + 2100 + suffix.len]};
+    try runScript(&long, 5, "/first", &buf, &run);
+    try testing.expectError(error.FetchFailed, run.result);
+    try testing.expectEqual(@as(u32, 1), run.hits);
+}
+
+test "HttpFetcher: the body must fit the buffer; exactly full is fine, one more is ResponseTooLarge" {
+    const responses = [_][]const u8{"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789"};
+    var buf: [16]u8 = undefined;
+    var run: ScriptRun = .{};
+    try runScript(&responses, 5, "/x", buf[0..9], &run);
+    try testing.expectError(error.ResponseTooLarge, run.result);
+    try runScript(&responses, 5, "/x", buf[0..10], &run);
+    {
+        const r = try run.result;
+        try testing.expectEqual(@as(u16, 200), r.status);
+        try testing.expectEqualStrings("0123456789", r.body);
+    }
+    try runScript(&responses, 5, "/x", buf[0..11], &run);
+    {
+        const r = try run.result;
+        try testing.expectEqualStrings("0123456789", r.body);
+    }
+}
+
+test "HttpFetcher.fetchFn: a cancel while probing for more body than fits surfaces error.Canceled" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("rdap fetch cancel test listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    // The head promises 10 bytes, 5 arrive and the peer parks: the 5-byte
+    // buffer fills exactly, so the extra one-byte probe read is the blocked one.
+    var peer: FetchCancelPeer = .{
+        .io = io,
+        .listener = &listener,
+        .response = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n01234",
+    };
+    const peer_thread = try std.Thread.spawn(.{}, FetchCancelPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.release(port);
+
+    var cue: ReadCueIo = .init(io);
+    var http_client = http.Client.init(cue.io(), testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer http_client.deinit();
+    var hf: HttpFetcher = .{ .client = &http_client };
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var body_buf: [5]u8 = undefined;
+
+    var fut = try io.concurrent(fetchOnce, .{ hf.fetcher(), url, &body_buf });
+    const reached = ReadCueIo.awaitReads(io, 2);
+    const result = fut.cancel(io);
+    try testing.expect(reached);
+    try testing.expectError(error.Canceled, result);
 }
