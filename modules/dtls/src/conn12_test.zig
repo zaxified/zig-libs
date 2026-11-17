@@ -947,3 +947,20 @@ test "dtls12: a forged queued fragment latched by an EARLIER call is dropped whe
     const f6 = try server.handleFlight(f5.out, rnd, 0, &bufs.b);
     try testing.expect((try client.handleFlight(f6.out, rnd, 0, &bufs.a)).done);
 }
+
+test "dtls12: fragmenting at the end of the epoch-0 sequence space is SequenceNumberExhausted" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(27)));
+    const rnd = seeded(&csprng);
+    var client = try Connection12.clientInit(ecdsaClientConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer client.deinit();
+    var s = ecdsaServerConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256});
+    s.max_datagram_len = 200;
+    var server = try Connection12.serverInit(s);
+    defer server.deinit();
+    var bufs: Bufs = .{};
+    const ch = try client.startHandshake(rnd, 0, &bufs.a);
+    // ServerHello takes max-2, the first Certificate fragment max-1, the
+    // second would need max: refused, never wrapped.
+    server.send_seq[0] = std.math.maxInt(u48) - 2;
+    try testing.expectError(error.SequenceNumberExhausted, server.handleFlight(ch, rnd, 0, &bufs.b));
+}
