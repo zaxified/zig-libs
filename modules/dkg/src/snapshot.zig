@@ -1334,6 +1334,7 @@ fn breakComplaints(p: *Participant, k: usize) anyerror!void {
             p.ped[1] = null;
             p.present[1] = false;
         },
+        3 => p.accepted_sp[0] = Scalar.one,
         else => unreachable,
     }
 }
@@ -1380,7 +1381,10 @@ fn breakReveals(p: *Participant, k: usize) anyerror!void {
             p.qualified[1] = false;
             p.fel[1] = null;
         },
-        1 => p.exposed[0] = true,
+        1 => {
+            p.exposed[0] = true;
+            p.revealed[0] = Scalar.one;
+        },
         2 => {
             p.exposed[1] = false;
             for (p.revealed[3..6]) |*s| s.* = null;
@@ -1401,7 +1405,7 @@ test "Participant: each field a run cannot combine is refused, round by round" {
     const Case = struct { name: []const u8, steps: usize, hold: bool, f: *const fn (*Participant, usize) anyerror!void, cases: usize };
     const table = [_]Case{
         .{ .steps = 0, .hold = false, .name = "breakShares", .f = breakShares, .cases = 12 },
-        .{ .steps = 1, .hold = false, .name = "breakComplaints", .f = breakComplaints, .cases = 3 },
+        .{ .steps = 1, .hold = false, .name = "breakComplaints", .f = breakComplaints, .cases = 4 },
         .{ .steps = 1, .hold = true, .name = "breakComplaintHeld", .f = breakComplaintHeld, .cases = 2 },
         .{ .steps = 2, .hold = false, .name = "breakDefenses", .f = breakDefenses, .cases = 4 },
         .{ .steps = 3, .hold = false, .name = "breakFeldman", .f = breakFeldman, .cases = 3 },

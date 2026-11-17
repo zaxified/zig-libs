@@ -1865,6 +1865,24 @@ fn breakReceiver(r: *ReshareReceiver, k: usize) !void {
             r.included[1] = false;
             r.used = r.used.?[0..1];
         },
+        // `used` out of dealer order
+        4 => std.mem.swap(u32, &r.used.?[0], &r.used.?[1]),
+        // `used` longer than the included set
+        5 => {
+            const longer = try r.arena.allocator().alloc(u32, 3);
+            @memcpy(longer[0..2], r.used.?);
+            longer[2] = 9;
+            r.used = longer;
+        },
+        // a self-consistent result of ANOTHER key: x = c0 + c1 * id, F = (c0 G, c1 G)
+        6 => {
+            const fk = try r.arena.allocator().alloc(Element, 2);
+            fk[0] = try commit.feldmanEvalShare(&commit.scalarFromIndex(1));
+            fk[1] = try commit.feldmanEvalShare(&commit.scalarFromIndex(2));
+            const x = commit.scalarFromIndex(1 + 2 * r.me);
+            r.commitments_ = fk;
+            r.result = .{ .index = r.me, .secret_share = x, .group_public_key = fk[0], .verifying_share = try commit.feldmanEvalShare(&x) };
+        },
         else => unreachable,
     }
 }
@@ -1875,7 +1893,7 @@ test "ReshareReceiver: each combination a run cannot produce is refused" {
     defer freeOutputs(allocator, old);
     var xs: [3]Element = undefined;
     const Case = struct { stop: usize, k: usize };
-    for ([_]Case{ .{ .stop = 1, .k = 0 }, .{ .stop = 1, .k = 1 }, .{ .stop = 99, .k = 2 }, .{ .stop = 99, .k = 3 } }) |c| {
+    for ([_]Case{ .{ .stop = 1, .k = 0 }, .{ .stop = 1, .k = 1 }, .{ .stop = 99, .k = 2 }, .{ .stop = 99, .k = 3 }, .{ .stop = 99, .k = 4 }, .{ .stop = 99, .k = 5 }, .{ .stop = 99, .k = 6 } }) |c| {
         var rig = try snapRig(old, &xs, bendShare1to2, false, c.stop, 0x5A9_300D);
         defer rig.deinit();
         const bytes = try snapR(&rig.receivers[1]);
