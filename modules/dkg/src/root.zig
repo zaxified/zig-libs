@@ -93,6 +93,8 @@ pub const freeOutgoing = wire.freeOutgoing;
 
 const participant = @import("participant.zig");
 pub const Participant = participant.Participant;
+/// Versioned snapshot bytes of an in-flight `Participant` / `ReshareReceiver` (`toBytes` / `fromBytes`).
+pub const snapshot = @import("snapshot.zig");
 pub const Phase = participant.Phase;
 
 const reshare = @import("reshare.zig");
@@ -375,5 +377,6 @@ test {
     _ = participant;
     _ = reshare;
     _ = echo;
+    _ = snapshot;
     _ = @import("stackprobe_test.zig");
 }

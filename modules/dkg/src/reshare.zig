@@ -77,6 +77,7 @@ const core = @import("core.zig");
 const types = @import("types.zig");
 const wire = @import("wire.zig");
 const burn = @import("burn.zig");
+const snapshot = @import("snapshot.zig");
 
 // Dead-stack burns of the secret entry points (`burn.zig`), each a little
 // above the depth its body reached in `stackprobe_test.zig` (ReleaseFast,
@@ -419,6 +420,34 @@ pub const ReshareReceiver = struct {
         if (self.result) |*r| r.deinit();
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    // ── snapshot (versioned bytes of the in-flight state, `snapshot.zig`) ──
+
+    /// Exact length `toBytes` writes for the current state.
+    pub fn encodedLength(self: *const ReshareReceiver) usize {
+        return snapshot.receiverLength(self);
+    }
+
+    /// Writes a snapshot of this in-flight party into `out` and returns the
+    /// used prefix; `fromBytes` resumes the run from it. **Every byte is
+    /// SECRET** (own secret polynomials, received shares, pending frames, the
+    /// finished share): store it like a key, encrypted and access-controlled,
+    /// and `secureZero` the buffer when done. The module does not wrap it (the
+    /// reference libraries, frost-core and tss-lib, leave this to the caller
+    /// too). A snapshot is only as fresh as the call: restoring an old one
+    /// replays rounds, so keep exactly the latest. No allocation.
+    pub fn toBytes(self: *const ReshareReceiver, out: []u8) snapshot.EncodeError![]u8 {
+        return snapshot.receiverToBytes(self, out);
+    }
+
+    /// Rebuilds a party from `toBytes` output (the caller `deinit`s it). The
+    /// decoder is fail-closed: wrong version, kind or group tag, a bad length,
+    /// trailing bytes, a non-canonical scalar, an invalid point or a state no
+    /// run can reach is `error.InvalidState`; secrets of a half-built state are
+    /// wiped. The caller's `bytes` (secret) stay the caller's to zero.
+    pub fn fromBytes(allocator: std.mem.Allocator, bytes: []const u8) snapshot.DecodeError!ReshareReceiver {
+        return snapshot.receiverFromBytes(allocator, bytes);
     }
 
     pub fn phase(self: *const ReshareReceiver) ReceiverPhase {
@@ -1442,5 +1471,441 @@ test "t' complaints: the dealer does not defend, and receivers exclude it even i
         try rig.dealersToReceivers();
         for (rig.receivers) |*r| try r.advance();
         for (rig.receivers) |*r| try testing.expectEqualSlices(u32, &.{ 2, 3 }, r.usedDealers().?);
+    }
+}
+
+// ── snapshot tests (the format itself is in `snapshot.zig`) ──────────────
+
+fn snapR(r: *const ReshareReceiver) ![]u8 {
+    const buf = try testing.allocator.alloc(u8, r.encodedLength());
+    errdefer testing.allocator.free(buf);
+    const out = try r.toBytes(buf);
+    try testing.expectEqual(buf.len, out.len);
+    return buf;
+}
+
+fn freeSnapR(b: []u8) void {
+    std.crypto.secureZero(u8, b);
+    testing.allocator.free(b);
+}
+
+fn resumeReceivers(rig: *Rig) !void {
+    for (rig.receivers) |*r| {
+        const bytes = try snapR(r);
+        defer freeSnapR(bytes);
+        var q = try ReshareReceiver.fromBytes(testing.allocator, bytes);
+        errdefer q.deinit();
+        const again = try snapR(&q);
+        defer freeSnapR(again);
+        try testing.expectEqualSlices(u8, bytes, again);
+        r.deinit();
+        r.* = q;
+    }
+}
+
+/// `Rig.run`, step by step, with every receiver replaced by its restored
+/// snapshot at each boundary (when `do_resume`); stops after `stop_after`
+/// boundaries so a test can take a snapshot of a receiver mid-run.
+fn driveRig(rig: *Rig, do_resume: bool, stop_after: usize) !void {
+    var boundaries: usize = 0;
+    for (rig.dealers) |*d| try d.start();
+    try rig.dealersToReceivers();
+    if (do_resume) try resumeReceivers(rig);
+    boundaries += 1;
+    if (boundaries > stop_after) return;
+    for (rig.receivers) |*r| try r.advance(); // shares -> complaints
+    if (do_resume) try resumeReceivers(rig); // complaint frames pending
+    boundaries += 1;
+    if (boundaries > stop_after) return;
+    try rig.receiversToAll();
+    if (do_resume) try resumeReceivers(rig);
+    boundaries += 1;
+    if (boundaries > stop_after) return;
+    for (rig.receivers) |*r| try r.advance(); // complaints -> defenses
+    if (do_resume) try resumeReceivers(rig);
+    boundaries += 1;
+    if (boundaries > stop_after) return;
+    for (rig.dealers) |*d| try d.advance();
+    try rig.dealersToReceivers();
+    if (do_resume) try resumeReceivers(rig);
+    boundaries += 1;
+    if (boundaries > stop_after) return;
+    for (rig.receivers) |*r| try r.advance(); // defenses -> done
+    if (do_resume) try resumeReceivers(rig);
+}
+
+fn bendShare1to2(from: u32, to: u32, bytes: []u8) Action {
+    if (from == 1 and to == 2 and bytes[0] == @backingInt(wire.Kind.reshare_share)) bytes[1 + 8 + Ns - 1] ^= 1;
+    return .deliver;
+}
+
+const snap_old_cfg: Config = .{ .t = 2, .n = 3 };
+const snap_new_cfg: Config = .{ .t = 2, .n = 4 };
+
+fn snapRig(old: []const DkgShareOutput, xs: []Element, filter: ?tn.Filter, do_resume: bool, stop_after: usize, seed: u64) !Rig {
+    return snapRigIn(testing.allocator, old, xs, filter, do_resume, stop_after, seed);
+}
+
+fn snapRigIn(allocator: Allocator, old: []const DkgShareOutput, xs: []Element, filter: ?tn.Filter, do_resume: bool, stop_after: usize, seed: u64) !Rig {
+    const rc = configFor(old, snap_old_cfg, snap_new_cfg, &.{ 1, 3 }, xs);
+    var prng = std.Random.DefaultPrng.init(seed);
+    var rig = try Rig.init(allocator, rc, old, prng.random());
+    errdefer rig.deinit();
+    rig.filter = filter;
+    try driveRig(&rig, do_resume, stop_after);
+    return rig;
+}
+
+test "ReshareReceiver: resuming from a snapshot at every round boundary gives the uninterrupted run's key shares" {
+    const allocator = testing.allocator;
+    const old = try oldCommittee(allocator, snap_old_cfg, 0x5A9_3001);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    for ([_]?tn.Filter{ null, bendShare1to2 }) |filter| {
+        var base = try snapRig(old, &xs, filter, false, 99, 0x5A9_3002);
+        defer base.deinit();
+        var resumed = try snapRig(old, &xs, filter, true, 99, 0x5A9_3002);
+        defer resumed.deinit();
+        try testing.expectEqual(base.refused, resumed.refused);
+        for (base.receivers, resumed.receivers) |*a, *b| {
+            try testing.expectEqual(ReceiverPhase.done, b.phase());
+            try testing.expectEqualSlices(u8, &a.output().?.toBytes(), &b.output().?.toBytes());
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(a.usedDealers().?), std.mem.sliceAsBytes(b.usedDealers().?));
+            for (a.publicCommitments().?, b.publicCommitments().?) |x, y| try testing.expectEqualSlices(u8, &x.toBytes(), &y.toBytes());
+        }
+        const outs = try resumed.outputs();
+        defer allocator.free(outs);
+        for (outs) |o| try testing.expect(checks.verifyingShareConsistent(o));
+        try testing.expect(try checks.reconstructsToQ(allocator, outs[0..2]));
+        try testing.expect(try checks.reconstructsToQ(allocator, outs[2..4]));
+    }
+}
+
+test "ReshareReceiver: truncations, trailing octet, bad tags/phase and damaged bytes are refused or re-encode identically" {
+    const allocator = testing.allocator;
+    const old = try oldCommittee(allocator, snap_old_cfg, 0x5A9_3003);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    // boundary 1 (.shares, dealings in), 2 (.complaints, frames pending), 4 (.defenses), 6 (.done).
+    for ([_]usize{ 0, 1, 3, 99 }) |stop| {
+        var rig = try snapRig(old, &xs, bendShare1to2, false, stop, 0x5A9_3004);
+        defer rig.deinit();
+        const r = &rig.receivers[1];
+        const bytes = try snapR(r);
+        defer freeSnapR(bytes);
+        for (0..bytes.len) |len| {
+            try testing.expectError(error.InvalidState, ReshareReceiver.fromBytes(testing.allocator, bytes[0..len]));
+        }
+        const longer = try testing.allocator.alloc(u8, bytes.len + 1);
+        defer freeSnapR(longer);
+        @memcpy(longer[0..bytes.len], bytes);
+        longer[bytes.len] = 0;
+        try testing.expectError(error.InvalidState, ReshareReceiver.fromBytes(testing.allocator, longer));
+
+        const bad = try testing.allocator.dupe(u8, bytes);
+        defer freeSnapR(bad);
+        const edits = [_]struct { at: usize, v: u8 }{
+            .{ .at = 0, .v = 0 }, .{ .at = 0, .v = 2 }, .{ .at = 1, .v = 1 },
+            .{ .at = 1, .v = 0 }, .{ .at = 2, .v = 0 }, .{ .at = 2, .v = 2 },
+        };
+        for (edits) |e| {
+            @memcpy(bad, bytes);
+            bad[e.at] = e.v;
+            try testing.expectError(error.InvalidState, ReshareReceiver.fromBytes(testing.allocator, bad));
+        }
+        // The phase octet: after the header, 4 configs, the dealers (count + ids), Q, the old X_i, and our id.
+        const phase_at = 3 + 16 + 4 + 4 * r.rc.dealers.len + Ne + Ne * r.rc.old.n + 4;
+        @memcpy(bad, bytes);
+        bad[phase_at] = 9;
+        try testing.expectError(error.InvalidState, ReshareReceiver.fromBytes(testing.allocator, bad));
+
+        for (0..bytes.len) |at| {
+            for ([_]u8{ 0xFF, bytes[at] ^ 1 }) |v| {
+                @memcpy(bad, bytes);
+                bad[at] = v;
+                var q = ReshareReceiver.fromBytes(testing.allocator, bad) catch continue;
+                defer q.deinit();
+                const again = try snapR(&q);
+                defer freeSnapR(again);
+                try testing.expectEqualSlices(u8, bad, again);
+            }
+        }
+        if (stop == 1) {
+            const F = struct {
+                fn f(a: Allocator, b: []const u8) !void {
+                    var q = try ReshareReceiver.fromBytes(a, b);
+                    q.deinit();
+                }
+            };
+            try testing.checkAllAllocationFailures(testing.allocator, F.f, .{bytes});
+        }
+    }
+}
+
+fn expectReceiverRefused(r: *const ReshareReceiver) !void {
+    const bytes = try snapR(r);
+    defer freeSnapR(bytes);
+    try testing.expectError(error.InvalidState, ReshareReceiver.fromBytes(testing.allocator, bytes));
+}
+
+test "ReshareReceiver: states no run can reach are refused" {
+    const allocator = testing.allocator;
+    const old = try oldCommittee(allocator, snap_old_cfg, 0x5A9_3005);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    {
+        // .shares with the dealings in.
+        var rig = try snapRig(old, &xs, null, false, 0, 0x5A9_3006);
+        defer rig.deinit();
+        const r = &rig.receivers[0];
+        {
+            const bytes = try snapR(r);
+            defer freeSnapR(bytes);
+            var q = try ReshareReceiver.fromBytes(testing.allocator, bytes);
+            q.deinit();
+        }
+        {
+            r.phase_ = .done;
+            defer r.phase_ = .shares;
+            try expectReceiverRefused(r);
+        }
+        {
+            r.accepted[0] = Scalar.one; // accepted before the round closed
+            defer r.accepted[0] = null;
+            try expectReceiverRefused(r);
+        }
+        {
+            r.included[0] = true;
+            defer r.included[0] = false;
+            try expectReceiverRefused(r);
+        }
+        {
+            try r.complaints.append(r.arena.allocator(), .{ .complainant = 2, .accused = 1 });
+            try r.defense_valid.append(r.arena.allocator(), false);
+            try r.defense_seen.append(r.arena.allocator(), false);
+            defer {
+                _ = r.complaints.pop();
+                _ = r.defense_valid.pop();
+                _ = r.defense_seen.pop();
+            }
+            try expectReceiverRefused(r);
+        }
+        {
+            // a dealing whose B_0 is not the old verifying share
+            const b = r.bcast[0].?;
+            const old_el = b[0];
+            defer b[0] = old_el;
+            b[0] = b[1];
+            try expectReceiverRefused(r);
+        }
+        {
+            r.commitments_ = r.bcast[0];
+            defer r.commitments_ = null;
+            try expectReceiverRefused(r);
+        }
+    }
+    {
+        // .done
+        var rig = try snapRig(old, &xs, null, false, 99, 0x5A9_3006);
+        defer rig.deinit();
+        const r = &rig.receivers[0];
+        try testing.expectEqual(ReceiverPhase.done, r.phase());
+        {
+            const o = r.result;
+            defer r.result = o;
+            r.result = null;
+            try expectReceiverRefused(r);
+        }
+        {
+            const o = r.used;
+            defer r.used = o;
+            r.used = null;
+            try expectReceiverRefused(r);
+            r.used = o.?[0..1];
+            try expectReceiverRefused(r);
+        }
+        {
+            const o = r.commitments_;
+            defer r.commitments_ = o;
+            r.commitments_ = o.?[0..1];
+            try expectReceiverRefused(r);
+        }
+        {
+            const o = r.result.?;
+            defer r.result = o;
+            r.result.?.secret_share = o.secret_share.add(Scalar.one);
+            try expectReceiverRefused(r);
+            r.result.?.secret_share = o.secret_share;
+            r.result.?.index = 3;
+            try expectReceiverRefused(r);
+            r.result.?.index = o.index;
+            r.result.?.group_public_key = o.verifying_share;
+            try expectReceiverRefused(r);
+        }
+        {
+            r.included[0] = false; // `used` is exactly the included dealers
+            defer r.included[0] = true;
+            try expectReceiverRefused(r);
+        }
+        {
+            r.phase_ = .complaints; // a result before the end
+            defer r.phase_ = .done;
+            try expectReceiverRefused(r);
+        }
+    }
+    {
+        // Complaints name old dealers by id; an unknown accused, a complainant
+        // outside the new committee and a duplicate pair are refused.
+        var rig = try snapRig(old, &xs, bendShare1to2, false, 1, 0x5A9_3006);
+        defer rig.deinit();
+        const r = &rig.receivers[1];
+        try testing.expectEqual(ReceiverPhase.complaints, r.phase());
+        try testing.expect(r.complaints.items.len >= 1);
+        const aa = r.arena.allocator();
+        for ([_]Complaint{ .{ .complainant = 2, .accused = 2 }, .{ .complainant = 9, .accused = 1 }, .{ .complainant = 0, .accused = 1 }, r.complaints.items[0] }) |c| {
+            try r.complaints.append(aa, c);
+            try r.defense_valid.append(aa, false);
+            try r.defense_seen.append(aa, false);
+            try expectReceiverRefused(r);
+            _ = r.complaints.pop();
+            _ = r.defense_valid.pop();
+            _ = r.defense_seen.pop();
+        }
+        // a defense mark before the defense round
+        r.defense_seen.items[0] = true;
+        try expectReceiverRefused(r);
+        r.defense_seen.items[0] = false;
+        // a pending frame of a kind receivers never send
+        const m = &r.outbox.items[0];
+        const kind = m.bytes[0];
+        m.bytes[0] = @backingInt(wire.Kind.reshare_defense);
+        try expectReceiverRefused(r);
+        m.bytes[0] = kind;
+    }
+}
+
+test "ReshareReceiver: a Participant snapshot is not a receiver snapshot and vice versa" {
+    const allocator = testing.allocator;
+    const old = try oldCommittee(allocator, snap_old_cfg, 0x5A9_3007);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    var rig = try snapRig(old, &xs, null, false, 0, 0x5A9_3008);
+    defer rig.deinit();
+    const bytes = try snapR(&rig.receivers[0]);
+    defer freeSnapR(bytes);
+    try testing.expectError(error.InvalidState, @import("participant.zig").Participant.fromBytes(testing.allocator, bytes));
+    var prng = std.Random.DefaultPrng.init(1);
+    var p = try @import("participant.zig").Participant.init(testing.allocator, .{ .t = 2, .n = 3 }, 1, prng.random());
+    defer p.deinit();
+    const pb = try testing.allocator.alloc(u8, p.encodedLength());
+    defer freeSnapR(pb);
+    _ = try p.toBytes(pb);
+    try testing.expectError(error.InvalidState, ReshareReceiver.fromBytes(testing.allocator, pb));
+}
+
+/// Receiver snapshots at several boundaries of a run with one bent share, for
+/// the snapshot fuzz harness's corpus (each entry behind a LE u32 length).
+pub fn fuzzSnapshotCorpus(pa: Allocator, list: *std.ArrayList([]const u8)) !void {
+    const old = try oldCommittee(pa, snap_old_cfg, 0x5A9_3003);
+    defer freeOutputs(pa, old);
+    var xs: [3]Element = undefined;
+    for ([_]usize{ 0, 1, 3, 99 }) |stop| {
+        var rig = try snapRigIn(pa, old, &xs, bendShare1to2, false, stop, 0x5A9_3004);
+        defer rig.deinit();
+        for (rig.receivers) |*r| {
+            const bytes = try pa.alloc(u8, r.encodedLength());
+            _ = try r.toBytes(bytes);
+            try list.append(pa, @import("snapshot.zig").withHeader(pa, bytes));
+        }
+    }
+}
+
+test "ReshareReceiver: claimed counts that do not fit the input are refused before they are allocated" {
+    const allocator = testing.allocator;
+    const old = try oldCommittee(allocator, snap_old_cfg, 0x5A9_3009);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    // A receiver before any frame: nothing received, nothing pending.
+    var fresh = try ReshareReceiver.init(allocator, configFor(old, snap_old_cfg, snap_new_cfg, &.{ 1, 3 }, &xs), 1);
+    defer fresh.deinit();
+    const bytes = try snapR(&fresh);
+    defer freeSnapR(bytes);
+    // tail: complaint count(4), outbox count(4), result flag, commitments flag, used flag.
+    const patched = try allocator.dupe(u8, bytes);
+    defer freeSnapR(patched);
+    std.mem.writeInt(u32, patched[patched.len - 11 ..][0..4], 0xFFFF_FFFF, .big);
+    try snapshot.expectRefusedBeforeAllocating(ReshareReceiver, patched);
+    // a present `used` list that claims 2^32 - 1 ids
+    const longer = try allocator.alloc(u8, bytes.len + 4);
+    defer freeSnapR(longer);
+    @memcpy(longer[0..bytes.len], bytes);
+    longer[bytes.len - 1] = 1;
+    std.mem.writeInt(u32, longer[bytes.len..][0..4], 0xFFFF_FFFF, .big);
+    try snapshot.expectRefusedBeforeAllocating(ReshareReceiver, longer);
+}
+
+/// A fresh receiver of a 2-of-3 to 2-of-4 resharing, for snapshot.zig's tests.
+pub fn snapshotTestReceiver(allocator: Allocator) !ReshareReceiver {
+    const old = try oldCommittee(allocator, snap_old_cfg, 0x5A9_300B);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    return ReshareReceiver.init(allocator, configFor(old, snap_old_cfg, snap_new_cfg, &.{ 1, 3 }, &xs), 1);
+}
+
+fn breakReceiver(r: *ReshareReceiver, k: usize) !void {
+    switch (k) {
+        // .complaints: an accepted share whose dealing never came
+        0 => r.bcast[1] = null,
+        // more pending frames than dealers
+        1 => for (0..3) |_| try r.outbox.append(r.allocator, .{ .to = .broadcast, .bytes = try r.allocator.dupe(u8, r.outbox.items[0].bytes) }),
+        // .done: an included dealer without its accepted share
+        2 => r.accepted[0] = null,
+        // `used` and `included` agree but fewer dealers than the old threshold
+        3 => {
+            r.included[1] = false;
+            r.used = r.used.?[0..1];
+        },
+        // `used` out of dealer order
+        4 => std.mem.swap(u32, &r.used.?[0], &r.used.?[1]),
+        // `used` longer than the included set
+        5 => {
+            const longer = try r.arena.allocator().alloc(u32, 3);
+            @memcpy(longer[0..2], r.used.?);
+            longer[2] = 9;
+            r.used = longer;
+        },
+        // a self-consistent result of ANOTHER key: x = c0 + c1 * id, F = (c0 G, c1 G)
+        6 => {
+            const fk = try r.arena.allocator().alloc(Element, 2);
+            fk[0] = try commit.feldmanEvalShare(&commit.scalarFromIndex(1));
+            fk[1] = try commit.feldmanEvalShare(&commit.scalarFromIndex(2));
+            const x = commit.scalarFromIndex(1 + 2 * r.me);
+            r.commitments_ = fk;
+            r.result = .{ .index = r.me, .secret_share = x, .group_public_key = fk[0], .verifying_share = try commit.feldmanEvalShare(&x) };
+        },
+        else => unreachable,
+    }
+}
+
+test "ReshareReceiver: each combination a run cannot produce is refused" {
+    const allocator = testing.allocator;
+    const old = try oldCommittee(allocator, snap_old_cfg, 0x5A9_300C);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    const Case = struct { stop: usize, k: usize };
+    for ([_]Case{ .{ .stop = 1, .k = 0 }, .{ .stop = 1, .k = 1 }, .{ .stop = 99, .k = 2 }, .{ .stop = 99, .k = 3 }, .{ .stop = 99, .k = 4 }, .{ .stop = 99, .k = 5 }, .{ .stop = 99, .k = 6 } }) |c| {
+        var rig = try snapRig(old, &xs, bendShare1to2, false, c.stop, 0x5A9_300D);
+        defer rig.deinit();
+        const bytes = try snapR(&rig.receivers[1]);
+        defer freeSnapR(bytes);
+        var q = try ReshareReceiver.fromBytes(testing.allocator, bytes);
+        defer q.deinit();
+        try breakReceiver(&q, c.k);
+        const again = try snapR(&q);
+        defer freeSnapR(again);
+        testing.expectError(error.InvalidState, ReshareReceiver.fromBytes(testing.allocator, again)) catch |e| {
+            std.debug.print("receiver case {d} was not refused\n", .{c.k});
+            return e;
+        };
     }
 }

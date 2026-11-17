@@ -9,7 +9,7 @@
 //! holds what they share with the driver: the reach counters with the N-seed
 //! in-suite check, and the input draw.
 //! Driver: `DKG_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_ONLY` selects by
-//! harness name). Harness names: dkg-pedersen-decode, dkg-feldman-decode, dkg-sharemsg-decode, dkg-participant-handle, dkg-reshare-receiver-handle.
+//! harness name). Harness names: dkg-pedersen-decode, dkg-feldman-decode, dkg-sharemsg-decode, dkg-participant-handle, dkg-reshare-receiver-handle, dkg-snapshot-decode.
 //!
 
 const std = @import("std");
