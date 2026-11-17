@@ -637,18 +637,24 @@ test "block: the encoder writes nothing past its output, and NoSpaceLeft exactly
     const shapes = @import("shapes.zig");
     var prng = std.Random.DefaultPrng.init(9);
     const r = prng.random();
-    // Text, noisy text, runs, and literal runs of 300 bytes between matches
-    // (literal length bytes).
+    // Text, noisy text, runs, literal runs of 300 bytes between matches, and
+    // a first sequence with over 20 length bytes each for its literals and
+    // for its match (more than the 16 spare bytes of the room check).
     var lits: [4000]u8 = undefined;
     for (&lits, 0..) |*c, i| c.* = if (i % 400 < 300) r.int(u8) else "matchmatch"[i % 10];
+    var long: [6000 + 6000 + 12]u8 = undefined;
+    r.bytes(long[0..6000]);
+    @memset(long[6000..12000], 0);
+    for (long[12000..], 1..) |*c, i| c.* = @intCast(i);
     const inputs = [_]shapes.Shape{
         .{ .name = "text", .kind = .text, .len = 3000 },
         .{ .name = "noisy", .kind = .noisy_text, .len = 3000, .param = 8 },
         .{ .name = "runs", .kind = .runs, .len = 3000, .param = 300 },
     };
-    var bufs: [inputs.len + 1][]u8 = undefined;
+    var bufs: [inputs.len + 2][]u8 = undefined;
     for (inputs, 0..) |shape, i| bufs[i] = try shapes.generate(gpa, shape);
     bufs[inputs.len] = try gpa.dupe(u8, &lits);
+    bufs[inputs.len + 1] = try gpa.dupe(u8, &long);
     defer for (bufs) |b| gpa.free(b);
     for (bufs) |input| {
         const full = try gpa.alloc(u8, compressBound(input.len));
