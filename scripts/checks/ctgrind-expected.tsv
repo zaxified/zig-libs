@@ -1455,9 +1455,9 @@ tlsclient	ReleaseFast	cv	1	30	aac4ebb6ece329f8	a92e71f50313cf2b
 # copy; the three-suite loop is not unrolled. AES-256-GCM adds one tag-verdict context (its own AesGcm instantiation) in
 # app; in ku the three aesgcm verdict contexts become two. No new kind of site; no branch on a key or secret.
 # suitehash[.]zig added to the dtls patterns (source pin).
-dtls	ReleaseFast	hs	1	174	832ad08af1bac4de	61a204df8edf79a0
+dtls	ReleaseFast	hs	1	174	6933631defcb01fe	61a204df8edf79a0
 # 2026-11-03 (re-pin from full CI 41622100028, counts only, not read by --stacks): dtls app 14 -> 13, down by one after chachapoly's short AEAD engine (no dtls source changed). Owner rule: no local ctgrind re-run.
-dtls	ReleaseFast	app	1	13	832ad08af1bac4de	70da17057fd7a044
+dtls	ReleaseFast	app	1	13	6933631defcb01fe	70da17057fd7a044
 # 2026-11-13 (KeyUpdate / exporter / ALPN; local --stacks run, contexts read one by one): hs 120 -> 123 = +3 messages.zig
 # decodeExtensions on the DECRYPTED EncryptedExtensions (the client now parses it for the ALPN answer), class (b). app 13 -> 23:
 # per record the replay window (replayCheckAndUpdate, now reached through per-epoch pointers, so inlined once per record: 12)
@@ -1466,7 +1466,7 @@ dtls	ReleaseFast	app	1	13	832ad08af1bac4de	70da17057fd7a044
 # exporter master secret tainted, a KeyUpdate each way (update_requested), the ACKs, records both ways on epoch 4, an
 # RFC 8446 §7.5 export, under AES-128-GCM and ChaCha20-Poly1305: 22 = the same class-(b) record sites as app plus
 # processAck's parsing of the decrypted ACK body (2) and its replay window (2). No branch on a key or secret.
-dtls	ReleaseFast	ku	1	21	832ad08af1bac4de	505aa3fdd426f98d
+dtls	ReleaseFast	ku	1	21	6933631defcb01fe	505aa3fdd426f98d
 # 2026-11-13 (DTLS 1.2, Connection12; local --stacks run, contexts read by top frame and module chain). hs/app/ku
 # unchanged in count (174/13/21); their source digests move because Connection.zig gained the 1.2 Config fields, the
 # dual-version hello and the NegotiatedDtls12 gates (no tainted path touched). New rows:
@@ -1481,8 +1481,27 @@ dtls	ReleaseFast	ku	1	21	832ad08af1bac4de	505aa3fdd426f98d
 #   app12 — after untainted handshakes, both directions' record keys (key, implicit salt / IV) tainted, send/recv both
 #   ways under AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM: 3 in-file = the 3 AEAD tag verdicts. (The 1.2 record header
 #   is public, so unlike app there is no sequence-number or content-type context.) No branch on a key or secret.
-dtls	ReleaseFast	hs12	1	96	0b95898ef4a16668	d87712f4d6e60179
-dtls	ReleaseFast	app12	1	3	0b95898ef4a16668	a30c6f8f370c5fa7
+# 2026-11-17 (DTLS 1.2 fragmentation + receive queue, RFC 5746 server change; local --stacks runs of ef482576e and of the
+# new tree, contexts diffed by top frame and harness call line). hs12 96 -> 53, every vanished context accounted for:
+#   * MOVED into handshake.zig (already in the counted pattern): the in-order reassembly of the decrypted Finished
+#     (Connection12 533/535/538 at ef482576e: 5 + 28 + 4, the 28 being std memcpy under a tainted length) is now
+#     Reassembler.feed (handshake.zig 199/205/240/249/250/257/258: 1+1+1+2+2+6+6) and takeFragment's completion test
+#     (Connection12 591: 2). Header checks 513/516/521/525 -> 562/565/570/574 (5 each -> 2 each), message dispatch
+#     rank 560 -> 693 (8 -> 4), processMessage 572/604/607/626/628/648 -> 705/737/740/759/761/781 (18 -> 11), the
+#     ':0' inlined frames under processHandshakeRecord (4) -> 580 (2) and frameMessage 1533 (2, appendTranscript's
+#     framing of the decrypted Finished, no longer inlined).
+#   * COLLAPSED by memcheck's duplicate rule (an error is new only if its top four distinct IPs differ): at
+#     ef482576e handleFlightBody was inlined into burn.run, so the fourth IP was the harness call site and every
+#     site was reported once per call line (100/101) and per unrolled copy of the three-mode loop (main IPs
+#     ..323B/..3372/..345A); now handleFlightBody, takeFragment and feed are frames of their own, the fourth IP stays
+#     inside the engine, and the copies merge (two main IPs ..30DB/..32FA). The aesgcm tag verdict at harness line
+#     101 (not in-file) merged with the one at 100 the same way (same four IPs FFC8A/B398A/22D67/1E228).
+#   No new kind of site: all are the Finished/AEAD verdicts and work on the DECRYPTED Finished (public length/type
+#   fields), class (a)/(b) as before; no context is in the queue, the fragmenter or the PRF/ECDH. hs/app/ku/app12
+#   counts unchanged (174/13/21/3); digests re-pinned for Connection.zig (Config.max_datagram_len), record.zig
+#   (nextDatagram) and Connection12.zig.
+dtls	ReleaseFast	hs12	1	53	0ad56722240b7e65	d87712f4d6e60179
+dtls	ReleaseFast	app12	1	3	0ad56722240b7e65	a30c6f8f370c5fa7
 # tlsserver (2026-10-21) — hs: Server.feed on the plaintext ClientHello
 # records of five recorded sessions (P-256/X25519, P-256/X25519MLKEM768, P-384,
 # Ed25519, a HelloRetryRequest) up to the first flight, every octet of

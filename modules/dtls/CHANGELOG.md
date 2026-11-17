@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind `hs12` re-pinned 96 → 53 after `--stacks` runs of the old and new tree diffed site by site: the decrypted Finished's reassembly moved into `handshake.Reassembler` (counted), and memcheck's four-IP duplicate rule merges copies that were distinct while `handleFlightBody` was inlined; no new kind of site. hs/app/ku/app12 counts unchanged, all dtls digests re-pinned. SPEC Backlog: OpenSSL and wolfSSL also advance the epoch-0 replay window on unauthenticated records (checked in their source; behaviour kept).
+
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the day's 1.2 changes (42 mutants: 37 killed, 5 EQUIVALENT argued in SPEC "DTLS 1.2"); three first-run survivors became tests (one answer after a retry, no eviction of a genuine partial message after a queue-completed one, stale queued copies discarded). The card has no whole-module counts, so the result is a SPEC paragraph only.
 
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** test: a 1.2 server fragmenting its flight at the end of the epoch-0 sequence space gets `SequenceNumberExhausted` rather than wrapping.
