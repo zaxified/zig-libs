@@ -1602,9 +1602,9 @@ megolm	ReleaseFast	pickle	1	26	6fe29ae8e255a23b	f06f4b1b938d2036
 # ks and tree: 0. priv 4 = std Ed25519 signing internals 2 (sign:376,
 # pcMul16 rejectIdentity) + the AES-GCM tag-verify outcome of the two
 # decryptions. TreeKEM/HPKE are the hpke module's rows.
-mls	ReleaseFast	ks	1	0	6934766f87e6052e	cbdae823f31fa99e
-mls	ReleaseFast	tree	1	0	6934766f87e6052e	22ea84b82599122e
-mls	ReleaseFast	priv	1	4	6934766f87e6052e	616cb338b933af50
+mls	ReleaseFast	ks	1	0	8eb897814c57e255	cbdae823f31fa99e
+mls	ReleaseFast	tree	1	0	8eb897814c57e255	22ea84b82599122e
+mls	ReleaseFast	priv	1	4	8eb897814c57e255	616cb338b933af50
 # otp (2026-10-10) — code: the shared secret through hotp/totp/hotpFmt/
 # totpVerify for SHA-1/256/512. FIX: the RFC 4226 dynamic truncation read
 # mac[offset..][0..4] with offset = the MAC's low nibble, a load address

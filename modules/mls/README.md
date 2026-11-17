@@ -105,7 +105,7 @@ applied, in both directions.
 | File | Provides |
 |---|---|
 | `codec.zig` | RFC 9420 §2.1 TLS-presentation-language (de)serializer: `Writer`/`Reader`, fixed-width big-endian ints, `optional<T>`, enums, and the QUIC-style variable-length-integer VECTOR length prefix (§2.1.2) that is RFC 9420's one deviation from plain RFC 8446 |
-| `suite.zig` | `CipherSuite(...)` (comptime KEM+KDF+AEAD+Hash+Signature bundle); `Mls128X25519Aes128GcmSha256Ed25519` (suite `0x0001`, the mandatory-to-implement suite) |
+| `suite.zig` | `CipherSuite(...)` (comptime KEM+KDF+AEAD+Hash+Signature bundle); suites `0x0001` (mandatory, `default`), `0x0002`, `0x0003`, `0x0005`, `0x0007` (`supported`), with the per-suite signature/public-key wire encodings |
 | `crypto.zig` | `RefHash`/`make_keypackage_ref`/`make_proposal_ref` (§5.2), `ExpandWithLabel`/`DeriveSecret` (§8), `DeriveTreeSecret` (§9.1), `SignWithLabel`/`VerifyWithLabel` (§5.1.2), `EncryptWithLabel`/`DecryptWithLabel` (§5.1.3, delegates to the sibling `hpke` module's `sealBase`/`openBase`) |
 | `treemath.zig` | RFC 9420 Appendix C array-based binary tree math: `left`/`right`/`parent`/`sibling`, `root`, `direct_path`, `copath`, `is_leaf`, `node_width`, `level` — a direct port of the RFC's own published Python |
 | `kat_test.zig` | Part 1's official RFC 9420 interop vectors (`mlswg/mls-implementations`'s `tree-math.json`/`crypto-basics.json`), embedded and driven end-to-end |
@@ -137,9 +137,9 @@ applied, in both directions.
   Part 5's framing returns BYTES to send and takes bytes received — MLS
   does not specify a transport, so owning one here would be an invention).
   **Concurrency:** reentrant — every type is a plain caller-owned value.
-- **Deps:** `hpke` (the sibling module supplies suite `0x0001`'s
-  DHKEM(X25519, HKDF-SHA256) + AES-128-GCM machinery via `sealBase`/
-  `openBase`; MLS's own `ExpandWithLabel`/`RefHash`/`SignWithLabel` are a
+- **Deps:** `hpke` (the sibling module supplies every suite's DHKEM and
+  HPKE machinery via `sealBase`/`openBase`), `aesgcm`, and `p256`/`p384`/
+  `p521` for the ECDSA suites' signatures; MLS's own `ExpandWithLabel`/`RefHash`/`SignWithLabel` are a
   SEPARATE wire encoding from HPKE's own labeling, see `crypto.zig`'s
   module doc comment).
 

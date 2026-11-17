@@ -30,6 +30,7 @@ const aesgcm = @import("aesgcm");
 const burn = @import("burn.zig");
 const p256 = @import("p256");
 const p384 = @import("p384");
+const p521 = @import("p521");
 
 /// RFC 9420 §17.1's registry — every suite name IANA has assigned a
 /// `CipherSuite` value to. The ones this module instantiates are listed in
@@ -248,6 +249,18 @@ pub const Mls128P256Aes128GcmSha256P256 = CipherSuite(
     .mls_128_dhkemp256_aes128gcm_sha256_p256,
 );
 
+/// `0x0005` = `MLS_256_DHKEMP521_AES256GCM_SHA512_P521`: DHKEM(P-521,
+/// HKDF-SHA512) + AES-256-GCM + SHA-512 + ECDSA over P-521 with SHA-512, on
+/// `hpke.P521Kem` and the sibling `p521` module (std has no P-521).
+pub const Mls256P521Aes256GcmSha512P521 = CipherSuite(
+    hpke.P521Kem,
+    aesgcm.Aes256Gcm,
+    std.crypto.kdf.hkdf.HkdfSha512,
+    std.crypto.hash.sha2.Sha512,
+    p521.EcdsaP521Sha512,
+    .mls_256_dhkemp521_aes256gcm_sha512_p521,
+);
+
 /// `0x0007` = `MLS_256_DHKEMP384_AES256GCM_SHA384_P384`: DHKEM(P-384,
 /// HKDF-SHA384) + AES-256-GCM + SHA-384 + ECDSA over P-384 with SHA-384, on
 /// `hpke.P384Kem` and the sibling `p384` module.
@@ -271,6 +284,7 @@ pub const supported = .{
     Mls128X25519Aes128GcmSha256Ed25519,
     Mls128P256Aes128GcmSha256P256,
     Mls128X25519ChaCha20Poly1305Sha256Ed25519,
+    Mls256P521Aes256GcmSha512P521,
     Mls256P384Aes256GcmSha384P384,
 };
 
@@ -313,6 +327,16 @@ test "0x0002: widths match RFC 9420 §17.1's MLS_128_DHKEMP256_AES128GCM_SHA256_
     try testing.expectEqual(@as(usize, 65), S.Nspk); // uncompressed SEC1
     try testing.expectEqual(@as(usize, 32), S.Nssk);
     try testing.expectEqual(@as(usize, 65), S.Kem.Npk);
+}
+
+test "0x0005: widths match RFC 9420 §17.1's MLS_256_DHKEMP521_AES256GCM_SHA512_P521 row" {
+    const S5 = Mls256P521Aes256GcmSha512P521;
+    try testing.expectEqual(@as(u16, 0x0005), @backingInt(S5.id));
+    try testing.expectEqual(@as(usize, 64), S5.Nh);
+    try testing.expectEqual(@as(usize, 32), S5.Nk);
+    try testing.expectEqual(@as(usize, 64), S5.Nm);
+    try testing.expectEqual(@as(usize, 133), S5.Nspk);
+    try testing.expectEqual(@as(usize, 66), S5.Nssk);
 }
 
 test "0x0007: widths match RFC 9420 §17.1's MLS_256_DHKEMP384_AES256GCM_SHA384_P384 row" {

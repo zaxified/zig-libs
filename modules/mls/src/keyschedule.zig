@@ -882,6 +882,7 @@ test "hpkeSuiteId: the RFC 9180 registry ids of every wired suite's KEM, KDF and
         .{ suite.Mls128X25519Aes128GcmSha256Ed25519, 0x0020, 0x0001, 0x0001 },
         .{ suite.Mls128P256Aes128GcmSha256P256, 0x0010, 0x0001, 0x0001 },
         .{ suite.Mls128X25519ChaCha20Poly1305Sha256Ed25519, 0x0020, 0x0001, 0x0003 },
+        .{ suite.Mls256P521Aes256GcmSha512P521, 0x0012, 0x0003, 0x0002 },
         .{ suite.Mls256P384Aes256GcmSha384P384, 0x0011, 0x0002, 0x0002 },
     };
     inline for (cases) |c| {

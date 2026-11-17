@@ -6,7 +6,9 @@
 
 **Scope:** mvp — OpenMLS v0.9.0, RFC 9420 (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-11 · mutation 2026-10-06 (40/41, 1 eq) · src ?
+**Audit:** review 2026-08-11 · mutation 2026-11-17 (51/52, 1 eq) · src 88fbe1f46df8c33a
+
+Audit detail: the 2026-11-17 mutation run is a delta over the cipher-suite work (11 mutants, 11 killed; the signature/public-key codecs, `hpkeSuiteId`, the NIST private-key refusals), added to the 2026-10-06 whole-module run (40/41, 1 eq). See "Cipher suites 0x0002/0x0003/0x0005/0x0007".
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean at `.scale` 8 = 25,000 runs each — a run is a whole group exchange, MLS_FUZZ) · ct 2026-10-10 (ctgrind: key schedule, secret tree + ratchets, PrivateMessage protect/decrypt; `ks` 0 / `tree` 0 / `priv` 4 in-file — std Ed25519 signing and AEAD verdicts; TreeKEM/HPKE via hpke)
 **Performance:** not measured
@@ -29,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [wireapp/core-crypto](https://github.com/wireapp/core-crypto) | Rust (on openmls) | GPL-3.0 (docs only) | 51 | v10.5.3 (2026-09-23) | Wire's production MLS layer over OpenMLS; shows what a deployed client needs on top: key-package pools, credential management, persistence *(inferred)*. |
 | Zig ecosystem | Zig | — | — | — | No MLS in Zig found on GitHub (searched `mls messaging layer security` language:zig). `std.crypto` has none. |
 
-**Where we are ahead:** the only Zig MLS and unusually thorough against the official mlswg vectors: tree math, TreeKEM, key schedule, secret tree, framing, welcome and three recorded `passive-client-*` sessions replayed epoch by epoch (one of 200 Commits); atomic Commit processing with allocation-failure sweeps; both directions of external Commits; send *and* receive of proposals, commits and welcomes. **Where we are behind:** no group-level application-message send/receive (the secret tree is not driven per epoch, so a caller wires `secrettree` + `framing.protectPrivate` by hand — `group.zig` module doc), `PrivateMessage` handshakes refused (`error.PrivateHandshakeNotSupported`), one of the seven RFC 9420 cipher suites (0x0001 only), no ReInit/branch, no KeyPackage/LeafNode admission validation beyond the rules a Commit names, and a long-lived `Group`'s retained memory grows with every adopted Commit (about 5 KB per epoch measured; an arena per epoch is kept until `deinit`) (→ Backlog).
+**Where we are ahead:** the only Zig MLS and unusually thorough against the official mlswg vectors: tree math, TreeKEM, key schedule, secret tree, framing, welcome and three recorded `passive-client-*` sessions replayed epoch by epoch (one of 200 Commits); atomic Commit processing with allocation-failure sweeps; both directions of external Commits; send *and* receive of proposals, commits and welcomes. **Where we are behind:** no group-level application-message send/receive (the secret tree is not driven per epoch, so a caller wires `secrettree` + `framing.protectPrivate` by hand — `group.zig` module doc), `PrivateMessage` handshakes refused (`error.PrivateHandshakeNotSupported`), five of the seven RFC 9420 cipher suites (0x0001/0x0002/0x0003/0x0005/0x0007; the X448/Ed448 pair waits for an X448 KEM in `hpke`), no ReInit/branch, no KeyPackage/LeafNode admission validation beyond the rules a Commit names, and a long-lived `Group`'s retained memory grows with every adopted Commit (about 5 KB per epoch measured; an arena per epoch is kept until `deinit`) (→ Backlog).
 
 ## What this is, in one paragraph
 
@@ -1552,6 +1554,96 @@ the choice, and no vector exercises it.
   `PrivateMessage` unprotect, a caller-built struct) and its doc comment
   says so. The function itself is tested directly.
 
+## Cipher suites 0x0002/0x0003/0x0005/0x0007 (2026-11-17)
+
+`suite.supported` lists the five instantiated suites in registry order:
+`0x0001`, `0x0002` (P-256/AES-128-GCM/SHA-256/ECDSA-P256), `0x0003`
+(X25519/ChaCha20-Poly1305/SHA-256/Ed25519), `0x0005` (P-521/AES-256-GCM/
+SHA-512/ECDSA-P521) and `0x0007` (P-384/AES-256-GCM/SHA-384/ECDSA-P384). Every
+primitive is a sibling's. The KEMs are `hpke`'s, the AEADs `aesgcm`'s and
+`chachapoly`'s (through `hpke.ChaCha20Poly1305`), and the ECDSA schemes come
+from `p256`/`p384`/`p521`.
+
+**Suite choice is a compile-time parameter.** That is the existing design
+(`comptime S: type`), and it matches how the references bind a suite: OpenMLS
+builds a group over one `Ciphersuite` from its crypto provider, and mls-rs
+picks a `CipherSuiteProvider` per group. Neither negotiates within a group.
+What crosses the wire is checked against `S` exactly as before:
+
+- a `Welcome` or `GroupInfo` of another suite is `error.CipherSuiteMismatch`;
+- an Add whose KeyPackage names another suite or protocol version is
+  `error.KeyPackageMismatch` on both `createCommit` and `processCommit`
+  (RFC 9420 §10.1 MUST). The check already existed but had no test. A
+  `0x0003` KeyPackage has the same widths as a `0x0001` group's, so this
+  comparison is the only thing that separates them; it is now pinned in
+  `group.zig`.
+
+**Signature encodings are the suite's (RFC 9420 §5.1.1/§5.1.2).** EdDSA keys
+are raw 32 bytes and signatures the fixed 64-byte `R || S`. ECDSA public keys
+are UNCOMPRESSED SEC1 points; a compressed point is refused as
+`error.WrongKeyLength`, as are a hybrid point and any other length. ECDSA
+signatures are DER `Ecdsa-Sig-Value`s, and anything else (raw `r || s`, a
+truncated DER) is also `error.WrongKeyLength`. That is the error every
+verifier here already returned for a signature it cannot parse.
+`S.encodeSignature`/`decodeSignature`/`encodePublicKey`/`decodePublicKey`/
+`signatureKeyPair` are the only places that know the difference. `Nx` is now
+the maximum signature width, and `Nspk`/`Nssk` are the public and private
+signature key widths.
+
+**Private keys handed in.** `Group.create`/`fromWelcome` rebuild the KEM key
+pair from a caller's private key with `hpke`'s new `Kem.keyPairFromSecret`.
+X25519 used std's `generateDeterministic`, which the NIST KEMs do not have. A
+NIST scalar outside `[1, n-1]` is `error.PrivateKeyMismatch`, the error a
+wrong key already got.
+
+**Two findings on the way.** First, `treekem.applyUpdatePath` took no suite
+and hashed parent hashes with `suite.default`'s SHA-256. That was invisible
+while every wired suite used SHA-256, but every genuine `0x0005`/`0x0007`
+UpdatePath was rejected as `Malformed`. It now takes `comptime S`
+(BREAKING for direct callers; `Group` passes its suite). Second, the upstream
+P-521 vectors write private keys as minimal big-endian integers (65 bytes when
+the top byte is zero). The KAT harnesses left-pad them to the 66-byte scalar
+the API takes. The API itself stays fixed-width, as RFC 9180's
+`SerializePrivateKey` is.
+
+**What the vectors cover.** Every official vector file the module drove for
+`0x0001` now runs once per supported suite: crypto-basics, key-schedule,
+psk_secret, secret-tree, message-protection, transcript-hashes, welcome,
+tree-validation, treekem, passive-client-welcome and
+passive-client-handling-commit, plus the commit-generation KATs over treekem
+and handling-commit. `tree-operations` and `passive-client-random` exist
+upstream for `0x0001` only. ECDSA signatures carry the signer's nonce, so for
+the ECDSA suites the byte-exact *sign* checks become verify checks. In
+crypto-basics, the vector's signature verifies and re-encodes to its own
+bytes, and ours verifies and fails under another label. In
+message-protection, `protectPublic`'s output equals the vector's once the
+signature and the membership tag are substituted back. Our membership tag
+and signature both verify, and `protectPrivate`'s output decrypts with the
+same keys to the vector's body under a verifying signature. The suite-filtered
+embedded files are re-filtered from the same upstream commit to suites
+{1, 2, 3, 5, 7} (`NOTICE`), in upstream order, with records unmodified.
+
+**Delta mutation 2026-11-17** over the non-test changes: 11 mutants, 11
+killed, 0 equivalent. They cover the signature and public-key codecs
+(`encodeSignature` for both families, `decodeSignature`'s length guard,
+`encodePublicKey`, `decodePublicKey`'s length and `0x04` guards,
+`signatureKeyPair`'s ECDSA arm), `hpkeSuiteId`'s KDF id, and the three
+`keyPairFromSecret → PrivateKeyMismatch` mappings in `create`/`fromWelcome`.
+Two new tests close what the KATs could not reach. The first is
+`hpkeSuiteId` against the RFC 9180 registry ids written out per suite (a
+SHA-256-only KDF id passes every round trip). The second is the NIST
+private-key refusal on `create` and both `fromWelcome` keys. The
+`applyUpdatePath` fix has no runtime mutant, because the suite is a
+comptime parameter. The treekem.json vectors of `0x0005`/`0x0007` are what
+fail without it. Cumulative with the 2026-10-06 run: 51/52, 1 eq.
+
+**Not done.** The X25519 low-order key refusal (`isLowOrderHpkeKey`) has no
+NIST analogue. A KeyPackage whose P-256/P-384/P-521 `init_key` or
+`encryption_key` is not a curve point is admitted, and later fails at
+encapsulation (`hpke`'s `DeserializeError`), exactly as a low-order X25519
+key did before 2026-10-06. Backlog: refuse it at admission, which needs a
+public point-validation entry in `hpke` or the curve siblings.
+
 ## Mutation run 2026-10-06
 
 **Mutation run 2026-10-06** (in-place, Debug, 41 mutants over the security
@@ -1791,7 +1883,7 @@ fire by deleting one `errdefer` each.
   ever exercises a violation (none of Part 2's KATs do).
 - **Group-level application messages: per-epoch secret-tree driver and `protectApplication`/`unprotect`** *(survey 2026-09-30)*: the everyday operation of an MLS client. `rg -i 'application|protectPrivate' modules/mls/src/group.zig` shows the group object never encrypts or decrypts application data; `group.zig`'s header calls it a scope boundary. OpenMLS/mls-rs expose it as the main call. Effort: medium (generation/deletion policy for the ratchets per epoch, out-of-order window already in `secrettree.Window`). Fits §2.
 - **`PrivateMessage` handshake messages (proposals/commits)** *(survey 2026-09-30)*: the common wire-format policy in deployments encrypts handshakes too; here `processCommit` returns `PrivateHandshakeNotSupported`. Effort: medium, done together with the item above (needs the secret tree). Fits §2.
-- **More cipher suites**: 0x0002 (P-256/AES-GCM/ECDSA), 0x0003 (X25519/ChaCha20-Poly1305), 0x0007 (P-384), then 0x0004/0x0006 (X448/Ed448) and 0x0005 (P-521) *(survey 2026-09-30)*: `suite.zig` says only 0x0001 is instantiated; the enum names all seven. Sibling `hpke` already has X25519/P-256/P-384 KEMs and std has ECDSA P-256/P-384; X448/Ed448 exist in `ed448` but hpke lacks an X448 KEM (see its Backlog), and P-521 has no std support. Effort: small (0x0003), medium (0x0002, 0x0007), large (0x0005). Fits §2.
+- **More cipher suites** *(survey 2026-09-30)*: **Done 2026-11-17** for 0x0002, 0x0003, 0x0005 and 0x0007 (see "Cipher suites 0x0002/0x0003/0x0005/0x0007"). Open: 0x0004/0x0006 (X448/Ed448). `ed448` has the signature side, but `hpke` has no DHKEM(X448) (its Backlog); instantiate both suites when that lands.
 - **Part 3: §7.3/§10.1 LeafNode and KeyPackage validation and X.509 credentials** *(survey 2026-09-30)*: lifetime, capability and extension consistency, credential acceptance; existing README/SPEC list it as "still not built". Every real deployment needs at least the lifetime and capability checks; X.509 credential support needs sibling `x509`. Effort: medium. Fits §2.
 - **ReInit and subgroup branch (§11.2/§11.3)** *(survey 2026-09-30)*: named in README as remaining. Effort: small-medium once resumption PSKs (already done) are used. Fits §2.
 
@@ -1902,5 +1994,7 @@ fire by deleting one `errdefer` each.
 **What the tests actually contain.** mlswg/mls-implementations official interop KAT (tree-operations.json etc.)
 
 ## Backlog / deferred
+
+- **NIST-curve HPKE keys are not validated at admission** (2026-11-17): the `isLowOrderHpkeKey` refusal is X25519-only. A KeyPackage or leaf whose `init_key`/`encryption_key` is not a valid P-256/P-384/P-521 point is admitted and fails later at encapsulation. Refuse it at admission, the way the X25519 case is refused.
 
 - 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
