@@ -13089,3 +13089,59 @@ test "origin: an unbracketed IPv6 literal is refused, with or without a port (mu
     try fmtOk(.origin, "https://[fe80::1]");
     try fmtOk(.origin, "http://127.0.0.1:8080");
 }
+
+test "cross: excluded_* with several entries report the FIRST entry that decides; excluded beats the comparison ops" {
+    const s = [_]Rule{
+        .{ .field = "a" },
+        .{ .field = "b" },
+        .{ .field = "mode" },
+        .{ .field = "i", .cross = &.{ .{ .op = .excluded_if, .other = "mode", .value = "off" }, .{ .op = .excluded_if, .other = "a", .value = "1" } } },
+        .{ .field = "u", .cross = &.{ .{ .op = .excluded_unless, .other = "mode", .value = "on" }, .{ .op = .excluded_unless, .other = "a", .value = "2" } } },
+        .{ .field = "w", .cross = &.{ .{ .op = .excluded_with, .other = "a" }, .{ .op = .excluded_with, .other = "b" } } },
+        .{ .field = "wa", .cross = &.{ .{ .op = .excluded_with_all, .other = "a" }, .{ .op = .excluded_with_all, .other = "b" } } },
+        .{ .field = "wo", .cross = &.{ .{ .op = .excluded_without, .other = "x" }, .{ .op = .excluded_without, .other = "y" } } },
+        .{ .field = "woa", .cross = &.{ .{ .op = .excluded_without_all, .other = "x" }, .{ .op = .excluded_without_all, .other = "y" } } },
+        .{ .field = "cmp", .cross = &.{ .{ .op = .eq_field, .other = "a" }, .{ .op = .excluded_with, .other = "b" } } },
+    };
+    var r = try validateJson(testing.allocator, "{\"a\":\"1\",\"b\":2,\"mode\":\"off\",\"i\":1,\"u\":1,\"w\":1,\"wa\":1,\"wo\":1,\"woa\":1,\"cmp\":\"zzz\"}", &s);
+    defer r.deinit();
+    const want = [_][2][]const u8{ .{ "i", "mode" }, .{ "u", "mode" }, .{ "w", "a" }, .{ "wa", "a" }, .{ "wo", "x" }, .{ "woa", "x" }, .{ "cmp", "b" } };
+    try testing.expectEqual(want.len, r.errors.len);
+    for (want) |w| {
+        const e = r.find(w[0]).?;
+        try testing.expectEqualStrings("excluded", e.code);
+        try testing.expectEqualStrings(w[1], e.param);
+    }
+    // The comparison alone still reports.
+    var c = try validateJson(testing.allocator, "{\"a\":\"1\",\"cmp\":\"zzz\"}", &s);
+    defer c.deinit();
+    try expectError(&c, "cmp", "field_mismatch");
+}
+
+test "export: a repeated entry of the later presence ops is written once" {
+    try expectJsonEq(
+        \\{"type":"object","properties":{"F":{"type":"string"}},"allOf":[{"if":{"allOf":[{"properties":{"A":{"enum":["x",false]}},"required":["A"]}]},"then":{"required":["F"]}}]}
+    , &.{
+        .{ .field = "F", .kind = .string, .cross = &.{ .{ .op = .skip_unless, .other = "A", .value = "x" }, .{ .op = .skip_unless, .other = "A", .value = "x" } } },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"F":{"type":"string"}},"allOf":[{"anyOf":[{"not":{"required":["F"]}},{"properties":{"A":{"enum":["x",false]}},"required":["A"]}]}]}
+    , &.{
+        .{ .field = "F", .kind = .string, .cross = &.{ .{ .op = .excluded_unless, .other = "A", .value = "x" }, .{ .op = .excluded_unless, .other = "A", .value = "x" } } },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"F":{"type":"string"}},"allOf":[{"anyOf":[{"not":{"required":["F"]}},{"required":["A"]}]}]}
+    , &.{
+        .{ .field = "F", .kind = .string, .cross = &.{ .{ .op = .excluded_without, .other = "A" }, .{ .op = .excluded_without, .other = "A" } } },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"F":{"type":"string"}},"allOf":[{"if":{"required":["A"]},"then":{"required":["F"]}}]}
+    , &.{
+        .{ .field = "F", .kind = .string, .cross = &.{ .{ .op = .required_with_all, .other = "A" }, .{ .op = .required_with_all, .other = "A" } } },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"F":{"type":"string"}},"allOf":[{"anyOf":[{"required":["F"]},{"required":["A"]}]}]}
+    , &.{
+        .{ .field = "F", .kind = .string, .cross = &.{ .{ .op = .required_without_all, .other = "A" }, .{ .op = .required_without_all, .other = "A" } } },
+    });
+}
