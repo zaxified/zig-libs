@@ -81,6 +81,9 @@ const sets = [_]Set{
     set(c21, "decimal256", true, .lossy),
     // RunEndEncoded (Int16/32/64 run ends over int32, utf8, float32, bool), expanded.
     set(c21, "run_end_encoded", true, .exact),
+    // BinaryView / Utf8View (inline and in variadic buffers) and ListView / LargeListView.
+    set(c21, "binary_view", true, .exact),
+    set(c21, "list_view", true, .exact),
 };
 
 /// Sets with a type `dataframe` has no column for (or a codec the collection lacks):
@@ -233,7 +236,7 @@ const Oracle = struct {
         const name = str(t, "name");
         // A run-end encoded column reads as a plain column of its values' type.
         if (std.mem.eql(u8, name, "runendencoded")) return o.expectColumnNamed(items(field, "children")[1], col, want_name);
-        const dict_text = get(field, "dictionary") != null and (std.mem.eql(u8, name, "utf8") or std.mem.eql(u8, name, "largeutf8"));
+        const dict_text = get(field, "dictionary") != null and (std.mem.eql(u8, name, "utf8") or std.mem.eql(u8, name, "largeutf8") or std.mem.eql(u8, name, "utf8view"));
         const want: df.ColumnType = if (dict_text) .categorical else if (std.mem.eql(u8, name, "int")) blk: {
             const bits = try jint(get(t, "bitWidth").?);
             const signed = get(t, "isSigned").?.bool;
@@ -245,10 +248,12 @@ const Oracle = struct {
             };
         } else if (std.mem.eql(u8, name, "floatingpoint"))
             (if (std.mem.eql(u8, str(t, "precision"), "DOUBLE")) .float else .float32)
-        else if (std.mem.eql(u8, name, "bool")) .bool else if (std.mem.eql(u8, name, "utf8") or std.mem.eql(u8, name, "largeutf8") or std.mem.eql(u8, name, "null"))
+        else if (std.mem.eql(u8, name, "bool")) .bool else if (std.mem.eql(u8, name, "utf8") or std.mem.eql(u8, name, "largeutf8") or std.mem.eql(u8, name, "utf8view") or std.mem.eql(u8, name, "null"))
             .text
-        else if (std.mem.eql(u8, name, "binary") or std.mem.eql(u8, name, "largebinary") or std.mem.eql(u8, name, "fixedsizebinary"))
+        else if (std.mem.eql(u8, name, "binary") or std.mem.eql(u8, name, "largebinary") or std.mem.eql(u8, name, "fixedsizebinary") or std.mem.eql(u8, name, "binaryview"))
             .binary
+        else if (std.mem.eql(u8, name, "listview") or std.mem.eql(u8, name, "largelistview"))
+            .list
         else if (std.mem.eql(u8, name, "decimal")) .decimal else if (std.mem.eql(u8, name, "date")) .date else if (std.mem.eql(u8, name, "time")) .time else if (std.mem.eql(u8, name, "timestamp")) .timestamp else if (std.mem.eql(u8, name, "duration")) .duration else if (std.mem.eql(u8, name, "list") or std.mem.eql(u8, name, "largelist")) .list else if (std.mem.eql(u8, name, "fixedsizelist")) .array else if (std.mem.eql(u8, name, "struct")) .@"struct" else return o.fail(field, "type {s} not in the mapping", .{name});
         if (col.type != want) return o.fail(field, "type {t}, want {t}", .{ col.type, want });
         if (want == .timestamp) {
@@ -287,6 +292,31 @@ const Oracle = struct {
                 if (try jint(e) > i) break j;
             } else return o.fail(field, "row past the last run end", .{});
             return o.expectCell(kids[1], kc[1], run, got, true);
+        }
+        if (std.mem.eql(u8, name, "utf8view") or std.mem.eql(u8, name, "binaryview")) {
+            // A view: inline (`INLINED`, text or hex) or `SIZE` bytes at `OFFSET` of the hex
+            // variadic buffer `BUFFER_INDEX`.
+            const v = items(cj, "VIEWS")[i];
+            const size: usize = @intCast(try jint(get(v, "SIZE").?));
+            const is_text = std.mem.eql(u8, name, "utf8view");
+            var buf: [4096]u8 = undefined;
+            const want: []const u8 = if (size <= 12) blk: {
+                const s = str(v, "INLINED");
+                break :blk if (is_text) s else try std.fmt.hexToBytes(&buf, s);
+            } else blk: {
+                const hex = items(cj, "VARIADIC_DATA_BUFFERS")[@intCast(try jint(get(v, "BUFFER_INDEX").?))].string;
+                const off: usize = @intCast(try jint(get(v, "OFFSET").?));
+                break :blk try std.fmt.hexToBytes(&buf, hex[2 * off ..][0 .. 2 * size]);
+            };
+            if (got != .text or !std.mem.eql(u8, got.text, want)) return o.fail(field, "{any}, want {s}", .{ got, want });
+            return;
+        }
+        if (std.mem.eql(u8, name, "listview") or std.mem.eql(u8, name, "largelistview")) {
+            const lo: usize = @intCast(try jint(items(cj, "OFFSET")[i]));
+            const size: usize = @intCast(try jint(items(cj, "SIZE")[i]));
+            if (got != .list or got.list.len() != size) return o.fail(field, "{any}, want a list of {d}", .{ got, size });
+            for (lo..lo + size, 0..) |e, k| try o.expectCell(items(field, "children")[0], items(cj, "children")[0], e, got.list.get(k), true);
+            return;
         }
         if (std.mem.eql(u8, name, "null")) return o.expectNull(field, got);
         if (std.mem.eql(u8, name, "bool")) {

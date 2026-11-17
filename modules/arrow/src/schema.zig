@@ -22,9 +22,9 @@ pub const Precision = enum(i16) { half = 0, single = 1, double = 2 };
 
 pub const IntType = struct { bits: u8, signed: bool };
 
-/// The logical types this module reads and writes (`run_end_encoded` is read only).
-/// `unsupported` keeps the union id of a type it does not (Interval, Union, Map,
-/// the view types), so a reader can name it.
+/// The logical types this module reads and writes (`run_end_encoded` and the view
+/// types are read only). `unsupported` keeps the union id of a type it does not
+/// (Interval, Union, Map), so a reader can name it.
 pub const Type = union(enum) {
     null,
     int: IntType,
@@ -46,6 +46,12 @@ pub const Type = union(enum) {
     large_list,
     /// Two children: `run_ends` (Int16/32/64) and `values`.
     run_end_encoded,
+    /// 16-byte views into variadic data buffers.
+    binary_view,
+    utf8_view,
+    /// Offsets plus sizes into one child, any order, overlap allowed.
+    list_view,
+    large_list_view,
     unsupported: u8,
 };
 
@@ -94,6 +100,10 @@ const tid = struct {
     const large_utf8 = 20;
     const large_list = 21;
     const run_end_encoded = 22;
+    const binary_view = 23;
+    const utf8_view = 24;
+    const list_view = 25;
+    const large_list_view = 26;
 };
 
 // ── decoding ────────────────────────────────────────────────────────────────
@@ -245,6 +255,10 @@ fn decodeType(id: u8, tt: ?fb.Table) Error!Type {
         tid.large_utf8 => .large_utf8,
         tid.large_list => .large_list,
         tid.run_end_encoded => .run_end_encoded,
+        tid.binary_view => .binary_view,
+        tid.utf8_view => .utf8_view,
+        tid.list_view => .list_view,
+        tid.large_list_view => .large_list_view,
         0 => error.Malformed, // NONE
         else => .{ .unsupported = id },
     };
@@ -343,6 +357,10 @@ fn typeId(t: Type) ?u8 {
         .large_utf8 => tid.large_utf8,
         .large_list => tid.large_list,
         .run_end_encoded => tid.run_end_encoded,
+        .binary_view => tid.binary_view,
+        .utf8_view => tid.utf8_view,
+        .list_view => tid.list_view,
+        .large_list_view => tid.large_list_view,
         .unsupported => null,
     };
 }

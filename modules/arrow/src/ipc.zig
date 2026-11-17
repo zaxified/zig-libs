@@ -83,6 +83,10 @@ pub const RecordBatch = struct {
     nodes: []const FieldNode,
     buffers: []const BufferLoc,
     compression: ?Codec = null,
+    /// `variadicBufferCounts`: the number of data buffers after each view-typed array's
+    /// views buffer, one entry per BinaryView / Utf8View field in pre-order (absent when
+    /// the schema has none).
+    variadic_counts: []const i64 = &.{},
 };
 
 /// Decodes a `RecordBatch` table (slices from `arena`). Every node and buffer
@@ -117,7 +121,15 @@ pub fn decodeRecordBatch(arena: std.mem.Allocator, t: fb.Table, body_len: u64) E
         if (method != 0) return error.Unsupported; // BUFFER is the only method
         codec = try c.scalar(Codec, 0, .lz4_frame);
     }
-    return .{ .length = length, .nodes = nodes, .buffers = bufs, .compression = codec };
+    var counts: []i64 = &.{};
+    if (try t.vector(4)) |v| {
+        counts = try arena.alloc(i64, v.len);
+        for (counts, 0..) |*x, i| {
+            x.* = try v.scalarAt(i64, i);
+            if (x.* < 0) return error.Malformed;
+        }
+    }
+    return .{ .length = length, .nodes = nodes, .buffers = bufs, .compression = codec, .variadic_counts = counts };
 }
 
 /// Builds a `RecordBatch` table.
@@ -136,6 +148,7 @@ pub fn encodeRecordBatch(b: *fb.Builder, rb: RecordBatch) error{OutOfMemory}!fb.
         std.mem.writeInt(i64, buf_bytes[i * 16 + 8 ..][0..8], x.length, .little);
     }
     const bufs = try b.createStructVector(buf_bytes, 16, 8);
+    const counts: ?fb.Ref = if (rb.variadic_counts.len > 0) try b.createVector(i64, rb.variadic_counts) else null;
     var comp: ?fb.Ref = null;
     if (rb.compression) |c| {
         b.startTable();
@@ -147,6 +160,7 @@ pub fn encodeRecordBatch(b: *fb.Builder, rb: RecordBatch) error{OutOfMemory}!fb.
     try b.addOffset(1, nodes);
     try b.addOffset(2, bufs);
     if (comp) |c| try b.addOffset(3, c);
+    if (counts) |c| try b.addOffset(4, c);
     return b.endTable();
 }
 

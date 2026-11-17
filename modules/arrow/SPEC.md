@@ -143,7 +143,7 @@ deterministic fuzz driver, with a read that ends in an error and never in a cras
 golden files compared with their JSON through an oracle written from the JSON's own encoding; pure Zig with
 ZSTD built in both ways, no C, no `libarrow`. Nothing here is a measured lead, so the scope is not `ahead`.
 **Where we are behind** (all in Backlog): the types the format has and `dataframe` has no column for (Map, Union,
-Interval, the view types, ListView) are refused; LZ4_FRAME, the
+Interval) are refused, and the view types, RunEndEncoded and Decimal32/64/256 are read but never written; LZ4_FRAME, the
 other codec every Arrow implementation but this one has and the default of pyarrow's Feather writer, is refused
 (waits for an `lz4` module); dictionary replacement and a dictionary nested in a list or struct are refused; there is no
 zero-copy or memory-mapped read, no incremental reader or writer over `std.Io` (the input and the
@@ -165,8 +165,10 @@ hostile stream ends in an error, within the limits below, never in a crash or an
 **Not here:** the Arrow C data interface (sharing buffers with another library in the same process), Flight
 (RPC), compute kernels, a columnar in-memory representation of its own (the reader decodes into `dataframe`'s
 storage and copies every buffer — no zero-copy views over the input), Parquet, the JSON integration format as an
-output, and the types `dataframe` has no column for (Interval, Union, Map, the view types) — those are
-refused (`Unsupported`). RunEndEncoded is read expanded into a plain column, never written. Decimal32 / Decimal64 / Decimal256 are read (as `decimal`), never written. LZ4_FRAME body compression is refused until the
+output, and the types `dataframe` has no column for (Interval, Union, Map) — those are refused
+(`Unsupported`). RunEndEncoded is read expanded into a plain column, BinaryView / Utf8View as `binary` /
+`text`, ListView / LargeListView as `list`, Decimal32 / Decimal64 / Decimal256 as `decimal`; none of them is
+written. LZ4_FRAME body compression is refused until the
 collection has an LZ4 codec (deferred, not refused for good).
 
 ## Wire format / algorithm
@@ -210,6 +212,7 @@ per read) after checking each declared length against `zstd.decompressBound` and
 | `.nulls` storage with no declaration (a list's elements) | Null | Null → `text` with no storage (what `readJson` gives an all-null column) |
 | `boxed` storage | `Unsupported` (no Arrow type short of a dense union) | — |
 | (the values' column) | — | RunEndEncoded (Int16/32/64 run ends) → the values' type, runs expanded |
+| `text` / `binary` / `list` | — | Utf8View / BinaryView (inline or variadic-buffer views, copied) / ListView, LargeListView (offsets + sizes, copied) |
 
 A dictionary over a non-text type (Int64 values, say) is read as a plain column of that type. Each dictionary-encoded
 column gets its own id, its whole dictionary written once before the first record batch.
@@ -228,7 +231,7 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
   the footer's length). An honest schema spends at most about its length (every field needs more than 8 unique
   bytes plus its name). Nesting deeper than `schema.max_depth` (64) is refused on both sides.
 - `ReadOptions.max_rows` (default 2^27, ours): the most rows any one array may claim — the frame's rows summed over
-  the batches, a list's elements, a dictionary's entries.
+  the batches, a list's elements, a dictionary's entries, a run-end array's runs.
 - `ReadOptions.max_cells` (default 2^28, ours): the most array slots the whole read may decode — every array's
   length (column, list child, struct field, dictionary; under `ReadOptions.columns` only the projected columns'
   and the dictionaries they use) summed over every batch, plus every row, list element and
@@ -271,7 +274,7 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
   changes (a malformed stream is still an error). Tests: `src/stream_test.zig` "lossy: …", "inexact time
   conversions", and the `datetime` and `decimal` golden sets.
 - Refused on read (`Unsupported`): LZ4_FRAME body compression, a dictionary replaced mid-stream (deltas are
-  appended), a dictionary nested in a dictionary's values, Interval, Union, Map, the view types,
+  appended), a dictionary nested in a dictionary's values, Interval, Union, Map,
   tensors. Every structural defect — a buffer shorter than its node, offsets running backwards or past the data, an
   index outside its dictionary, node or buffer counts not matching the schema, a column length not the batch's —
   is `error.Malformed`.
@@ -286,7 +289,8 @@ scales, hex binary, dictionary indices, offsets; dates by Hinnant's `civil_from_
 Sets: `custom_metadata`, `dictionary`, `dictionary_unsigned`, `duplicate_fieldnames`, `extension`, `nested`,
 `nested_large_offsets`, `null`, `null_trivial`, `primitive`, `primitive_large_offsets`, `primitive_no_batches`,
 `primitive_zerolength`, `recursive_nested`, and from `2.0.0-compression` `zstd` and `uncompressible_zstd`
-(ZSTD body compression), from `cpp-21.0.0` `decimal32`, `decimal64` and `run_end_encoded`; `datetime`, `decimal` and (from
+(ZSTD body compression), from `cpp-21.0.0` `decimal32`, `decimal64`, `run_end_encoded`, `binary_view` and
+`list_view`; `datetime`, `decimal` and (from
 `cpp-21.0.0`) `decimal256` are `Unsupported` by default and compared under `lossy` (the Decimal256 oracle parses
 the JSON's 77-digit values as i256).
 Stream and file read equal, each file batch has its JSON batch's length, and the frame this module writes back
@@ -363,9 +367,9 @@ batch past 2 GiB, each needing that many bytes in memory. No finding.
   compute) for separate modules if a consumer ever needs them.
 - **LZ4_FRAME — superseded by something external:** waits for an `lz4` codec module in the collection; writing
   LZ4 is not planned even then (ZSTD is what Arrow C++ and arrow-rs recommend).
-- **Reading the types `dataframe` has no column for — never as such.** Interval, Union, Map and the view types
-  would need new `dataframe` column kinds first. (RunEndEncoded is read, but only as the plain column it encodes;
-  writing it would need a run-end column kind.)
+- **Reading the types `dataframe` has no column for — never as such.** Interval, Union and Map would need new
+  `dataframe` column kinds first. (RunEndEncoded and the view types are read, but only as the plain columns
+  they encode; writing them would need column kinds of their own.)
 
 ## Open
 
@@ -399,7 +403,15 @@ competing libraries and cheap enough to finish in one wave; none of them is star
 
 **Propose to implement**
 
-- **View types and ListView on read.** BinaryView / Utf8View (16-byte views, ≤ 12 bytes inline, else a buffer
+- ✅ 2026-11-17 **View types and ListView on read.** Done as sketched. A message's `variadicBufferCounts` must
+  have one entry per view field (pre-order) and the buffers must number the fixed ones plus their sum
+  (`Malformed`); each valid row's view is checked against its batch's variadic buffers (index, offset and length
+  in range, the 4-byte prefix equal to the data's start) and copied, every copied byte charged to `max_cells`
+  before the copy is allocated (views may share bytes); Utf8View is UTF-8 checked; a Utf8View dictionary reads
+  as a categorical. A list view's offset and size must lie within its batch's child; its selectors are checked
+  against `max_cells` before allocation. Null rows' views, offsets and sizes are not looked at. Projection
+  skips a view field's variadic buffers with its views. Anchored on the `cpp-21.0.0` `binary_view` and
+  `list_view` goldens. Was: BinaryView / Utf8View (16-byte views, ≤ 12 bytes inline, else a buffer
   index and offset into the variadic data buffers) read into `binary` / `text`; ListView / LargeListView (offsets
   plus sizes, any order, overlap allowed) read into a `list` by copying each row's slice. Why: C++, arrow-rs and
   polars write the view encoding (polars chooses by `compat_level`), so a file from them is `Unsupported` today.

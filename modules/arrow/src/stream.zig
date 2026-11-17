@@ -153,7 +153,7 @@ const us_per_day: i64 = 86_400 * df.timestamp_units_per_second;
 const ms_per_day: i64 = 86_400_000;
 
 /// The physical layouts both directions handle.
-const Kind = enum { null_, i8, i16, i32, i64, u8, u16, u32, u64, f16, f32, f64, bool_, dec, date32, date64, time32, time64, ts, dur, var32, var64, fsb, dict, list32, list64, fsl, struct_, ree };
+const Kind = enum { null_, i8, i16, i32, i64, u8, u16, u32, u64, f16, f32, f64, bool_, dec, date32, date64, time32, time64, ts, dur, var32, var64, fsb, dict, list32, list64, fsl, struct_, ree, view, lview32, lview64 };
 
 // ── writer ──────────────────────────────────────────────────────────────────
 
@@ -527,7 +527,7 @@ const Writer = struct {
                 try w.pushNode(bo, sel.len, bits);
                 for (wf.children) |*c| try w.writeArray(bo, c, sel);
             },
-            .f16, .date64, .time32, .fsb, .list64, .ree => return error.Unsupported, // never planned
+            .f16, .date64, .time32, .fsb, .list64, .ree, .view, .lview32, .lview64 => return error.Unsupported, // never planned
         }
     }
 };
@@ -814,7 +814,10 @@ fn iota(a: Allocator, start: usize, end: usize) Error![]usize {
 
 // ── reader ──────────────────────────────────────────────────────────────────
 
-const Chunk = struct { rb: ipc.RecordBatch, body: []const u8 };
+/// One batch ready to decode: its fixed buffers in schema order (`rb.buffers`, one set
+/// per field as `plan` counted them) and, per view-typed field, its variadic data
+/// buffers (`variadic[RField.view]`), all located in `body`.
+const Chunk = struct { rb: ipc.RecordBatch, body: []const u8, variadic: []const []const ipc.BufferLoc = &.{} };
 
 const RField = struct {
     kind: Kind,
@@ -830,6 +833,8 @@ const RField = struct {
     dec_bits: u16 = 128,
     /// Dictionary index type.
     index: schema.IntType = .{ .bits = 32, .signed = true },
+    /// A view-typed field's ordinal among its message's view fields (`Chunk.variadic`).
+    view: usize = 0,
     children: []RField = &.{},
     dict: ?*RDict = null,
 };
@@ -840,8 +845,8 @@ const RDict = struct {
     /// sharing the id must have the same value type.
     field: schema.Field,
     value: RField,
-    nodes: usize,
-    bufs: usize,
+    /// The nodes, buffers and view fields a DictionaryBatch of it has.
+    ctr: Counter,
     ordered: bool,
     categorical: bool,
     chunks: std.ArrayList(Chunk) = .empty,
@@ -853,7 +858,10 @@ const RDict = struct {
     used: bool = true,
 };
 
-const Counter = struct { nodes: usize = 0, bufs: usize = 0 };
+/// What a message's metadata must hold for a schema: nodes, fixed buffers, and for each
+/// BinaryView / Utf8View field in pre-order the index of its views buffer (its variadic
+/// data buffers follow that buffer in the message).
+const Counter = struct { nodes: usize = 0, bufs: usize = 0, views: std.ArrayList(usize) = .empty };
 
 const Reader = struct {
     a: Allocator,
@@ -907,10 +915,9 @@ const Reader = struct {
                 .id = d.id,
                 .field = vf,
                 .value = try r.plan(vf, &vctr, depth, true),
-                .nodes = vctr.nodes,
-                .bufs = vctr.bufs,
+                .ctr = vctr,
                 .ordered = d.ordered,
-                .categorical = vf.type == .utf8 or vf.type == .large_utf8,
+                .categorical = vf.type == .utf8 or vf.type == .large_utf8 or vf.type == .utf8_view,
             };
             try r.dicts.append(r.a, rd);
             try r.by_id.put(r.a, d.id, rd);
@@ -1040,6 +1047,26 @@ const Reader = struct {
                 rf.children = kids;
                 rf.col.inner = inner;
             },
+            .binary_view, .utf8_view => {
+                // Validity and 16-byte views; the variadic data buffers follow the views in
+                // the message, as many as its `variadicBufferCounts` entry says.
+                rf.kind = .view;
+                rf.col.type = if (f.type == .utf8_view) .text else .binary;
+                rf.view = ctr.views.items.len;
+                try ctr.views.append(r.a, rf.buf_ix + 1);
+            },
+            .list_view, .large_list_view => {
+                // Validity, offsets, sizes; one child.
+                if (f.children.len != 1) return error.Malformed;
+                rf.kind = if (f.type == .list_view) .lview32 else .lview64;
+                rf.col.type = .list;
+                ctr.bufs += 3;
+                bufs = 0;
+                const kids = try r.a.alloc(RField, 1);
+                kids[0] = try r.plan(f.children[0], ctr, depth + 1, in_dict);
+                rf.children = kids;
+                rf.col.inner = try r.a.dupe(Column, &.{kids[0].col});
+            },
             .run_end_encoded => {
                 // No buffers of its own; `run_ends` (signed Int16/32/64, no nulls) and `values`.
                 // Read as a plain column of the values' type, the runs expanded.
@@ -1124,7 +1151,7 @@ const Reader = struct {
         const h = msg.header orelse return error.Malformed;
         const rb = ipc.decodeRecordBatch(r.a, h, body.len) catch |e| return noEos(e);
         try r.checkBatch(rb, top.ctr, top.fields, top.need, true);
-        return r.inflate(rb, body, if (top.need) |n| n.bufs else null);
+        return r.prepare(rb, body, top.ctr, if (top.need) |n| n.bufs else null);
     }
 
     fn takeDict(r: *Reader, msg: schema.Message, body: []const u8) Error!void {
@@ -1135,9 +1162,9 @@ const Reader = struct {
         d.batches += 1;
         // A dictionary no projected column reads: its metadata is checked, its body is not
         // read (as an unprojected column's buffers are not).
-        try r.checkBatch(db.data, .{ .nodes = d.nodes, .bufs = d.bufs }, (&d.value)[0..1], null, d.used);
+        try r.checkBatch(db.data, d.ctr, (&d.value)[0..1], null, d.used);
         if (!d.used) return;
-        try d.chunks.append(r.a, try r.inflate(db.data, body, null));
+        try d.chunks.append(r.a, try r.prepare(db.data, body, d.ctr, null));
     }
 
     fn finishDicts(r: *Reader) Error!void {
@@ -1174,13 +1201,58 @@ const Reader = struct {
     /// that will be decoded (`need`: the projected ones; `count = false`: none) counted
     /// against `max_cells`.
     fn checkBatch(r: *Reader, rb: ipc.RecordBatch, ctr: Counter, top: []const RField, need: ?Need, count: bool) Error!void {
-        if (rb.nodes.len != ctr.nodes or rb.buffers.len != ctr.bufs) return error.Malformed;
+        // One variadic count per view field (none without them); the buffers are the fixed
+        // ones plus every variadic one.
+        if (rb.variadic_counts.len != ctr.views.items.len) return error.Malformed;
+        var bufs: u64 = ctr.bufs;
+        for (rb.variadic_counts) |x| bufs +|= @intCast(x); // decodeRecordBatch refused negatives
+        if (rb.nodes.len != ctr.nodes or rb.buffers.len != bufs) return error.Malformed;
         if (@as(u64, @intCast(rb.length)) > r.opts.max_rows) return error.LimitExceeded;
         for (rb.nodes, 0..) |nd, i| {
             const n = try r.rows(nd);
             if (count and (need == null or need.?.nodes[i])) try r.charge(n);
         }
         for (top) |f| if (rb.nodes[f.node_ix].length != rb.length) return error.Malformed;
+    }
+
+    /// A batch as `decode` reads it: the variadic data buffers of its view fields moved out
+    /// of the buffer list (into `Chunk.variadic`), so every field's fixed buffers sit where
+    /// `plan` counted them; then inflated. `need` marks the fixed buffers a projection
+    /// reads (a view field's variadic buffers go with its views buffer). `checkBatch` has
+    /// matched the counts.
+    fn prepare(r: *Reader, rb: ipc.RecordBatch, body: []const u8, ctr: Counter, need: ?[]const bool) Error!Chunk {
+        const nv = ctr.views.items.len;
+        if (nv == 0) return r.inflate(rb, body, need);
+        const all = try r.a.alloc(ipc.BufferLoc, rb.buffers.len);
+        const mask: ?[]bool = if (need != null) try r.a.alloc(bool, rb.buffers.len) else null;
+        const starts = try r.a.alloc(usize, nv + 1);
+        var src: usize = 0;
+        var tail: usize = ctr.bufs;
+        var k: usize = 0;
+        for (0..ctr.bufs) |j| {
+            all[j] = rb.buffers[src];
+            src += 1;
+            if (mask) |m| m[j] = need.?[j];
+            if (k < nv and ctr.views.items[k] == j) {
+                starts[k] = tail;
+                for (0..@intCast(rb.variadic_counts[k])) |_| {
+                    all[tail] = rb.buffers[src];
+                    if (mask) |m| m[tail] = need.?[j];
+                    src += 1;
+                    tail += 1;
+                }
+                k += 1;
+            }
+        }
+        starts[nv] = tail;
+        var arranged = rb;
+        arranged.buffers = all;
+        var c = try r.inflate(arranged, body, mask);
+        const vs = try r.a.alloc([]const ipc.BufferLoc, nv);
+        for (vs, starts[0..nv], starts[1..]) |*v, lo, hi| v.* = c.rb.buffers[lo..hi];
+        c.rb.buffers = c.rb.buffers[0..ctr.bufs];
+        c.variadic = vs;
+        return c;
     }
 
     /// A batch whose body is compressed, with every buffer decompressed into one fresh body
@@ -1321,6 +1393,8 @@ const Reader = struct {
             .var32, .var64, .fsb => try r.text(rf, chunks, n, valid),
             .dict => try r.dictColumn(rf, chunks, n, valid),
             .list32, .list64, .fsl => try r.list(rf, chunks, n, valid),
+            .view => try r.viewColumn(rf, chunks, n, valid),
+            .lview32, .lview64 => try r.listView(rf, chunks, n, valid),
             .ree => unreachable, // returned above
             .struct_ => blk: {
                 for (chunks) |c| {
@@ -1544,6 +1618,109 @@ const Reader = struct {
         return .{ .text = .{ .offsets = offsets, .bytes = bytes.items, .valid = valid } };
     }
 
+    /// BinaryView / Utf8View: each valid row's 16-byte view — its length, then the bytes
+    /// inline (12 at most) or a 4-byte prefix, a data buffer index and an offset — checked
+    /// against its batch's variadic buffers (index, offset and length in range, the prefix
+    /// equal to the data's first bytes) and copied out. Views may share bytes, so every
+    /// copied byte is charged to `max_cells` before the copy is allocated; null rows'
+    /// views are not looked at. Utf8View values are UTF-8 checked like Utf8.
+    fn viewColumn(r: *Reader, rf: *const RField, chunks: []const Chunk, n: usize, valid: ?[]u64) Error!ColumnData {
+        const check = r.opts.validate_utf8 and rf.col.type == .text;
+        var total: u64 = 0;
+        var base: usize = 0;
+        for (chunks) |c| {
+            const len: usize = @intCast(c.rb.nodes[rf.node_ix].length);
+            if (len > 0 and bufOf(c, rf.buf_ix + 1).len / 16 < len) return error.Malformed;
+            const vb = bufOf(c, rf.buf_ix + 1);
+            for (0..len) |i| {
+                if (!isSet(valid, base + i)) continue;
+                total +|= (try viewBytes(c, rf.view, vb[i * 16 ..][0..16])).len;
+            }
+            base += len;
+        }
+        try r.charge(total);
+        const offsets = try r.a.alloc(usize, n + 1);
+        const bytes = try r.a.alloc(u8, @intCast(total));
+        offsets[0] = 0;
+        var at: usize = 0;
+        base = 0;
+        for (chunks) |c| {
+            const len: usize = @intCast(c.rb.nodes[rf.node_ix].length);
+            const vb = bufOf(c, rf.buf_ix + 1);
+            for (0..len) |i| {
+                if (isSet(valid, base + i)) {
+                    const v = try viewBytes(c, rf.view, vb[i * 16 ..][0..16]);
+                    if (check and !std.unicode.utf8ValidateSlice(v)) return error.InvalidUtf8;
+                    @memcpy(bytes[at..][0..v.len], v);
+                    at += v.len;
+                }
+                offsets[base + i + 1] = at;
+            }
+            base += len;
+        }
+        if (allNull(valid, n)) return .nulls;
+        return .{ .text = .{ .offsets = offsets, .bytes = bytes, .valid = valid } };
+    }
+
+    /// ListView / LargeListView: each valid row's elements are `sizes[i]` child slots from
+    /// `offsets[i]` (any order, overlapping allowed), within its batch's child. The rows
+    /// are copied out of the child as a `list`; the selectors are checked against
+    /// `max_cells` before they are allocated and `gather` charges the copy. Null rows'
+    /// offsets and sizes are not looked at.
+    fn listView(r: *Reader, rf: *const RField, chunks: []const Chunk, n: usize, valid: ?[]u64) Error!ColumnData {
+        const child = &rf.children[0];
+        const wide = rf.kind == .lview64;
+        const ow: usize = if (wide) 8 else 4;
+        for (chunks) |c| {
+            const len: usize = @intCast(c.rb.nodes[rf.node_ix].length);
+            if (len > 0 and (bufOf(c, rf.buf_ix + 1).len / ow < len or bufOf(c, rf.buf_ix + 2).len / ow < len)) return error.Malformed;
+        }
+        const offsets = try r.a.alloc(u32, n + 1);
+        offsets[0] = 0;
+        var total: u64 = 0;
+        var base: usize = 0;
+        for (chunks) |c| {
+            const len: usize = @intCast(c.rb.nodes[rf.node_ix].length);
+            const clen: usize = @intCast(c.rb.nodes[child.node_ix].length);
+            for (0..len) |i| {
+                if (isSet(valid, base + i)) {
+                    const lo = try readOff(bufOf(c, rf.buf_ix + 1), i, wide);
+                    const size = try readOff(bufOf(c, rf.buf_ix + 2), i, wide);
+                    if (lo > clen or size > clen - lo) return error.Malformed;
+                    total += size;
+                    if (total > std.math.maxInt(u32)) return error.Unsupported; // dataframe's u32 offsets
+                }
+                offsets[base + i + 1] = @intCast(total);
+            }
+            base += len;
+        }
+        var items = try r.decode(child, chunks);
+        if (items != .nulls) {
+            try r.afford(total);
+            const sel = try r.a.alloc(usize, @intCast(total));
+            var k: usize = 0;
+            var child_base: usize = 0;
+            base = 0;
+            for (chunks) |c| {
+                const len: usize = @intCast(c.rb.nodes[rf.node_ix].length);
+                for (0..len) |i| {
+                    if (!isSet(valid, base + i)) continue;
+                    const lo = try readOff(bufOf(c, rf.buf_ix + 1), i, wide);
+                    const size = try readOff(bufOf(c, rf.buf_ix + 2), i, wide);
+                    for (sel[k..][0..size], child_base + lo..) |*x, e| x.* = e;
+                    k += size;
+                }
+                child_base += @intCast(c.rb.nodes[child.node_ix].length);
+                base += len;
+            }
+            items = try gather(r, items, sel);
+        }
+        if (allNull(valid, n)) return .nulls;
+        const ip = try r.a.create(ColumnData);
+        ip.* = items;
+        return .{ .list = .{ .offsets = offsets, .items = ip, .valid = valid } };
+    }
+
     fn dateText(r: *Reader, days: []const i64, valid: ?[]u64, n: usize) Error!ColumnData {
         if (allNull(valid, n)) return .nulls;
         const offsets = try r.a.alloc(usize, n + 1);
@@ -1753,6 +1930,23 @@ fn sameValueType(x: schema.Field, y: schema.Field) bool {
         if (!std.mem.eql(u8, p.name, q.name) or !sameValueType(p, q)) return false;
     }
     return true;
+}
+
+/// The bytes one 16-byte view names: inline (length at most 12) or in variadic data
+/// buffer `index` of its field (`k`) at `offset`; `error.Malformed` when they lie outside
+/// it or the view's 4-byte prefix is not their start.
+fn viewBytes(c: Chunk, k: usize, v: *const [16]u8) Error![]const u8 {
+    const len = std.math.cast(usize, std.mem.readInt(i32, v[0..4], .little)) orelse return error.Malformed;
+    if (len <= 12) return v[4..][0..len];
+    const index = std.math.cast(usize, std.mem.readInt(i32, v[8..12], .little)) orelse return error.Malformed;
+    const offset = std.math.cast(usize, std.mem.readInt(i32, v[12..16], .little)) orelse return error.Malformed;
+    const bufs = c.variadic[k];
+    if (index >= bufs.len) return error.Malformed;
+    const data = locBytes(c.body, bufs[index]);
+    if (offset > data.len or len > data.len - offset) return error.Malformed;
+    const s = data[offset..][0..len];
+    if (!std.mem.eql(u8, s[0..4], v[4..8])) return error.Malformed; // the prefix must be the data's
+    return s;
 }
 
 fn bufOf(c: Chunk, ix: usize) []const u8 {

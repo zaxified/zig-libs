@@ -277,6 +277,8 @@ pub const HandBatch = struct {
     delta: bool = false,
     /// Marks the body compressed (the buffers are given already prefixed and compressed).
     codec: ?ipc.Codec = null,
+    /// `variadicBufferCounts` (one per view-typed field).
+    variadic: []const i64 = &.{},
 };
 
 pub fn hand(gpa: Allocator, fields: []const schema.Field, batches: []const HandBatch) ![]u8 {
@@ -291,7 +293,7 @@ pub fn hand(gpa: Allocator, fields: []const schema.Field, batches: []const HandB
         for (hb.bufs) |x| if (x.len == 0) try body.addEmpty(gpa) else try body.add(gpa, x);
         var mb = fb.Builder.init(gpa);
         defer mb.deinit();
-        const rb: ipc.RecordBatch = .{ .length = hb.length, .nodes = hb.nodes, .buffers = body.locs.items, .compression = hb.codec };
+        const rb: ipc.RecordBatch = .{ .length = hb.length, .nodes = hb.nodes, .buffers = body.locs.items, .compression = hb.codec, .variadic_counts = hb.variadic };
         const blen: i64 = @intCast(body.bytes.items.len);
         const meta = if (hb.dict_id) |id|
             try ipc.encodeDictionaryBatchMessage(&mb, .{ .id = id, .data = rb, .is_delta = hb.delta }, blen)
@@ -1309,5 +1311,162 @@ test "run-end encoded: read expanded into a plain column, over batches; bad run 
         const bad = try hand(gpa, &.{.{ .name = "r", .type = .run_end_encoded, .children = kids }}, &.{});
         defer gpa.free(bad);
         try testing.expectError(error.Malformed, stream.readStream(a, bad, .{}));
+    }
+}
+
+/// A 16-byte BinaryView / Utf8View: inline when `data` holds 12 bytes or fewer, else
+/// `len` bytes at `offset` of data buffer `index` (`data` is then the referenced bytes).
+pub fn view(data: []const u8, index: i32, offset: i32) [16]u8 {
+    var v: [16]u8 = @splat(0);
+    std.mem.writeInt(i32, v[0..4], @intCast(data.len), .little);
+    if (data.len <= 12) {
+        @memcpy(v[4..][0..data.len], data);
+    } else {
+        @memcpy(v[4..8], data[0..4]);
+        std.mem.writeInt(i32, v[8..12], index, .little);
+        std.mem.writeInt(i32, v[12..16], offset, .little);
+    }
+    return v;
+}
+
+test "view types: Utf8View / BinaryView inline and in variadic buffers, ListView / LargeListView any order" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const item = [_]schema.Field{.{ .name = "item", .type = .{ .int = .{ .bits = 32, .signed = true } } }};
+    const fields = [_]schema.Field{
+        .{ .name = "sv", .type = .utf8_view },
+        .{ .name = "x", .type = .{ .int = .{ .bits = 8, .signed = true } } },
+        .{ .name = "bv", .type = .binary_view },
+        .{ .name = "lv", .type = .list_view, .children = &item },
+        .{ .name = "llv", .type = .large_list_view, .children = &item },
+    };
+    const long_a = "a string longer than twelve";
+    const long_b = "\x00\x01binary past the inline twelve";
+    // sv: short, long (buffer 1), null, long again sharing buffer 1's bytes (offset 2).
+    const sv = view("short", 0, 0) ++ view(long_a, 1, 0) ++ view("", 0, 0) ++ view(long_a[2..], 1, 2);
+    const bv = view("\xff\xfe", 0, 0) ++ view(long_b, 0, 3) ++ view(long_b, 0, 3) ++ view("", 0, 0);
+    const nd = struct {
+        fn f(len: i64, nulls: i64) ipc.FieldNode {
+            return .{ .length = len, .null_count = nulls };
+        }
+    }.f;
+    const bytes = try hand(gpa, &fields, &.{.{
+        .length = 4,
+        .variadic = &.{ 2, 1 },
+        .nodes = &.{ nd(4, 1), nd(4, 0), nd(4, 0), nd(4, 1), nd(5, 0), nd(4, 0), nd(3, 0) },
+        .bufs = &.{
+            // sv: validity, views, its two data buffers (the first unused).
+            "\x0b",                         &sv,                                    "unused",                        long_a,
+            // x
+            "",                             bytesOf(i8, &.{ 1, 2, 3, 4 }),
+            // bv: validity, views, one data buffer (3 bytes before the value).
+                     "",                              &bv,
+            "pad" ++ long_b,
+                // lv: validity (row 1 null), offsets, sizes; child of 5.
+                           "\x0d",                                 bytesOf(i32, &.{ 3, 99, 0, 1 }), bytesOf(i32, &.{ 2, 99, 0, 3 }),
+            "",                             bytesOf(i32, &.{ 10, 11, 12, 13, 14 }),
+            // llv: offsets, sizes (64-bit); child of 3.
+            "",                              bytesOf(i64, &.{ 2, 0, 0, 1 }),
+            bytesOf(i64, &.{ 1, 3, 0, 2 }), "",                                     bytesOf(i32, &.{ 20, 21, 22 }),
+        },
+    }});
+    defer gpa.free(bytes);
+    const f = try stream.readStream(a, bytes, .{});
+    try testing.expectEqual(df.ColumnType.text, f.columns[0].type);
+    try testing.expectEqual(df.ColumnType.binary, f.columns[2].type);
+    try testing.expectEqual(df.ColumnType.list, f.columns[3].type);
+    try testing.expectEqualStrings("short", f.cell(0, "sv").?.text);
+    try testing.expectEqualStrings(long_a, f.cell(1, "sv").?.text);
+    try testing.expect(f.cell(2, "sv").? == .null);
+    try testing.expectEqualStrings(long_a[2..], f.cell(3, "sv").?.text);
+    try testing.expectEqualStrings("\xff\xfe", f.cell(0, "bv").?.text);
+    try testing.expectEqualStrings(long_b, f.cell(2, "bv").?.text);
+    try testing.expectEqualStrings("", f.cell(3, "bv").?.text);
+    try testing.expectEqual(@as(i64, 3), f.cell(2, "x").?.int);
+    const lv = [_][]const i64{ &.{ 13, 14 }, &.{}, &.{}, &.{ 11, 12, 13 } };
+    const llv = [_][]const i64{ &.{22}, &.{ 20, 21, 22 }, &.{}, &.{ 21, 22 } };
+    for (0..4) |r| {
+        const got = f.cell(r, "lv").?;
+        if (r == 1) try testing.expect(got == .null) else {
+            try testing.expectEqual(lv[r].len, got.list.len());
+            for (lv[r], 0..) |w, k| try testing.expectEqual(w, got.list.get(k).int);
+        }
+        const g2 = f.cell(r, "llv").?.list;
+        try testing.expectEqual(llv[r].len, g2.len());
+        for (llv[r], 0..) |w, k| try testing.expectEqual(w, g2.get(k).int);
+    }
+    // Written back as Utf8 / Binary / List; projection and zstd do not change what is read.
+    const back = try stream.writeStream(gpa, f, .{ .compression = .zstd });
+    defer gpa.free(back);
+    try expectSameFrame(f, try stream.readStream(a, back, .{}));
+    const p = try stream.readStream(a, bytes, .{ .columns = &.{ .{ .name = "bv" }, .{ .name = "x" } } });
+    try testing.expectEqualStrings(long_b, p.cell(1, "bv").?.text);
+    try testing.expectEqual(@as(i64, 4), p.cell(3, "x").?.int);
+    // The bytes copied out of views are charged: sv alone is its 4 rows and 5 + 27 + 25 bytes.
+    _ = try stream.readStream(a, bytes, .{ .columns = &.{.{ .name = "sv" }}, .max_cells = 4 + 57 });
+    try testing.expectError(error.LimitExceeded, stream.readStream(a, bytes, .{ .columns = &.{.{ .name = "sv" }}, .max_cells = 4 + 56 }));
+}
+
+test "view types: views and list views outside their buffers are Malformed; bad counts; text not UTF-8" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const one: ipc.FieldNode = .{ .length = 1, .null_count = 0 };
+    const sv = [_]schema.Field{.{ .name = "s", .type = .utf8_view }};
+    const data = "0123456789abcdefghij";
+    const ViewCase = struct { want: anyerror, v: [16]u8, counts: []const i64 = &.{1}, bufs: usize = 1 };
+    var bad_prefix = view(data, 0, 0);
+    bad_prefix[4] = 'X';
+    var neg_len = view("", 0, 0);
+    std.mem.writeInt(i32, neg_len[0..4], -1, .little);
+    for ([_]ViewCase{
+        .{ .want = error.Malformed, .v = view(data, 1, 0) }, // no buffer 1
+        .{ .want = error.Malformed, .v = view(data, -1, 0) },
+        .{ .want = error.Malformed, .v = view(data[1..], 0, 2) }, // runs past the end
+        .{ .want = error.Malformed, .v = view(data, 0, -1) },
+        .{ .want = error.Malformed, .v = bad_prefix },
+        .{ .want = error.Malformed, .v = neg_len },
+        .{ .want = error.Malformed, .v = view("x", 0, 0), .counts = &.{} }, // no count for the view field
+        .{ .want = error.Malformed, .v = view("x", 0, 0), .counts = &.{ 1, 0 } }, // one too many
+        .{ .want = error.Malformed, .v = view("x", 0, 0), .counts = &.{2} }, // more than the buffers
+        .{ .want = error.Malformed, .v = view("x", 0, 0), .counts = &.{-1} },
+        .{ .want = error.InvalidUtf8, .v = view("\xc3\x28", 0, 0) },
+    }) |c| {
+        var bufs: [3][]const u8 = .{ "", &c.v, data };
+        const b = try hand(gpa, &sv, &.{.{ .length = 1, .variadic = c.counts, .nodes = &.{one}, .bufs = bufs[0 .. 2 + c.bufs] }});
+        defer gpa.free(b);
+        try testing.expectError(c.want, stream.readStream(a, b, .{}));
+    }
+    // The same view inline in a short array is fine; invalid UTF-8 passes unchecked when asked.
+    {
+        const v = view("\xc3\x28", 0, 0);
+        const b = try hand(gpa, &sv, &.{.{ .length = 1, .variadic = &.{0}, .nodes = &.{one}, .bufs = &.{ "", &v } }});
+        defer gpa.free(b);
+        try testing.expectEqualStrings("\xc3\x28", (try stream.readStream(a, b, .{ .validate_utf8 = false })).cell(0, "s").?.text);
+    }
+    // List views: an offset or size outside the child, negative ones, short buffers.
+    const item = [_]schema.Field{.{ .name = "item", .type = .{ .int = .{ .bits = 32, .signed = true } } }};
+    const lv = [_]schema.Field{.{ .name = "l", .type = .list_view, .children = &item }};
+    const child = bytesOf(i32, &.{ 1, 2, 3 });
+    for ([_]struct { []const u8, []const u8 }{
+        .{ bytesOf(i32, &.{3}), bytesOf(i32, &.{1}) },
+        .{ bytesOf(i32, &.{1}), bytesOf(i32, &.{3}) },
+        .{ bytesOf(i32, &.{4}), bytesOf(i32, &.{0}) },
+        .{ bytesOf(i32, &.{-1}), bytesOf(i32, &.{1}) },
+        .{ bytesOf(i32, &.{0}), bytesOf(i32, &.{-1}) },
+        .{ bytesOf(i32, &.{0}), "" },
+    }) |c| {
+        const b = try hand(gpa, &lv, &.{.{ .length = 1, .nodes = &.{ one, .{ .length = 3, .null_count = 0 } }, .bufs = &.{ "", c[0], c[1], "", child } }});
+        defer gpa.free(b);
+        try testing.expectError(error.Malformed, stream.readStream(a, b, .{}));
+    }
+    // A list view with no child or two.
+    for ([_][]const schema.Field{ &.{}, &.{ item[0], item[0] } }) |kids| {
+        const b = try hand(gpa, &.{.{ .name = "l", .type = .large_list_view, .children = kids }}, &.{});
+        defer gpa.free(b);
+        try testing.expectError(error.Malformed, stream.readStream(a, b, .{}));
     }
 }

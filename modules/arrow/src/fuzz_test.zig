@@ -14,6 +14,10 @@
 //! hang. The oracle on a frame: the writer writes it, and that reads back equal
 //! cell by cell (a frame the reader makes is one the writer takes).
 //!
+//! Inputs are also read with one column projected (`ReadOptions.columns`) and with the
+//! key/value metadata asked for; the golden inputs for Decimal32/256, RunEndEncoded,
+//! the view types and custom metadata carry a reach label each.
+//!
 //! Driver: `ARROW_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_MS`,
 //! `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there). Harness name: `read`.
 
@@ -39,7 +43,25 @@ const golden = [_][]const u8{
     @embedFile("testdata/2.0.0-compression/generated_zstd.stream"),
     @embedFile("testdata/2.0.0-compression/generated_zstd.arrow_file"),
     @embedFile("testdata/2.0.0-compression/generated_uncompressible_zstd.stream"),
+    @embedFile("testdata/1.0.0-littleendian/generated_custom_metadata.arrow_file"),
+    @embedFile("testdata/cpp-21.0.0/generated_decimal32.stream"),
+    @embedFile("testdata/cpp-21.0.0/generated_decimal256.stream"),
+    @embedFile("testdata/cpp-21.0.0/generated_run_end_encoded.arrow_file"),
+    @embedFile("testdata/cpp-21.0.0/generated_binary_view.stream"),
+    @embedFile("testdata/cpp-21.0.0/generated_list_view.stream"),
 };
+
+/// Reach labels for the golden inputs that exercise one decoder each (a frame read from
+/// one, damaged or not, reached that decoder).
+const golden_label = [golden.len]?[]const u8{ null, null, null, null, null, null, null, null, null, null, null, "key/value metadata", "Decimal32", "Decimal256", "RunEndEncoded", "BinaryView/Utf8View", "ListView/LargeListView" };
+
+fn hitSource(pick: usize) void {
+    inline for (golden_label, 0..) |l, i| {
+        if (l) |name| {
+            if (pick == i) fuzz_driver.hit("frame from the " ++ name ++ " golden");
+        }
+    }
+}
 
 /// The inputs damage starts from: the golden files above and what this module writes
 /// of `sample` (built once, kept for the process).
@@ -180,14 +202,26 @@ fn harness(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
     var buf: [32 << 10]u8 = undefined;
     var n: usize = undefined;
     var compressed = false;
+    var pick: usize = std.math.maxInt(usize);
     if (S == fuzz_driver.Rng) {
         const c = try buildCorpus();
-        const pick = src.index(c.len);
+        pick = src.index(c.len);
         compressed = isCompressed(pick);
         n = damage(S, src, &buf, c[pick]);
     } else n = src.slice(&buf);
     const input = buf[0..n];
-    const opts: stream.ReadOptions = .{ .max_rows = 1 << 14, .max_body_bytes = 1 << 22, .lossy = src.value(bool) };
+    // Sometimes one column projected (an index past the last is `UnknownColumn`), sometimes
+    // the key/value metadata asked for.
+    var md: stream.Metadata = .{};
+    const col = src.valueRangeAtMost(u8, 0, 11);
+    const one_col = [_]stream.ColumnRef{.{ .index = col }};
+    const opts: stream.ReadOptions = .{
+        .max_rows = 1 << 14,
+        .max_body_bytes = 1 << 22,
+        .lossy = src.value(bool),
+        .columns = if (col < 4) &one_col else null,
+        .metadata = if (src.value(bool)) &md else null,
+    };
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -205,13 +239,16 @@ fn harness(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
     fuzz_driver.hit("frame");
     if (compressed) fuzz_driver.hit("frame from a compressed input");
     if (f.len > 0) fuzz_driver.hit("frame with rows");
+    if (opts.columns != null) fuzz_driver.hit("projected frame");
+    if (md.schema.len > 0 or (md.fields.len > 0 and md.fields[0].metadata.len > 0)) fuzz_driver.hit("metadata read");
+    hitSource(pick);
     try rewrites(gpa, a, f, src.value(bool));
 }
 
 /// Corpus entries whose bodies are zstd-compressed: three golden files and the last
 /// four this module wrote.
 fn isCompressed(i: usize) bool {
-    return (i >= 8 and i < golden.len) or i >= golden.len + 4;
+    return (i >= 8 and i < 11) or i >= golden.len + 4;
 }
 
 fn outcome(e: stream.Error) ?df.Frame {

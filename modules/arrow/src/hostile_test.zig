@@ -483,3 +483,46 @@ test "hostile run-end encoding: one run of 2^22 rows from a few bytes stops at m
     try testing.expectEqual(@as(usize, 4096), f.len);
     try testing.expectEqualStrings(&value, f.columnAt(0).get(4095).text);
 }
+
+test "hostile views: many views of one long slice, list views of one whole child, stop at max_cells before the copy" {
+    const gpa = testing.allocator;
+    // 2^16 Utf8View rows, each naming the same 64 KiB of one data buffer: 4 GiB of copies
+    // from 1 MiB of views.
+    {
+        const rows = 1 << 16;
+        const data = try gpa.alloc(u8, 64 << 10);
+        defer gpa.free(data);
+        @memset(data, 'd');
+        const v = st.view(data, 0, 0);
+        const views = try gpa.alloc(u8, rows * 16);
+        defer gpa.free(views);
+        for (0..rows) |i| @memcpy(views[i * 16 ..][0..16], &v);
+        const fields = [_]schema.Field{.{ .name = "s", .type = .utf8_view }};
+        const bytes = try st.hand(gpa, &fields, &.{.{ .length = rows, .variadic = &.{1}, .nodes = &.{.{ .length = rows, .null_count = 0 }}, .bufs = &.{ "", views, data } }});
+        defer gpa.free(bytes);
+        const got = try streamUnderCap(bytes, .{}, 16 << 20);
+        try testing.expectEqual(@as(?anyerror, error.LimitExceeded), got.err);
+        try testing.expect(got.peak < 4 << 20);
+    }
+    // 2^14 ListView rows, each the whole child of 2^14 elements: 2^28 selectors.
+    {
+        const rows = 1 << 14;
+        const offs = try gpa.alloc(i32, rows);
+        defer gpa.free(offs);
+        @memset(offs, 0);
+        const sizes = try gpa.alloc(i32, rows);
+        defer gpa.free(sizes);
+        @memset(sizes, rows);
+        const child = try gpa.alloc(i32, rows);
+        defer gpa.free(child);
+        @memset(child, 7);
+        const item = [_]schema.Field{.{ .name = "item", .type = .{ .int = .{ .bits = 32, .signed = true } } }};
+        const fields = [_]schema.Field{.{ .name = "l", .type = .list_view, .children = &item }};
+        const node: ipc.FieldNode = .{ .length = rows, .null_count = 0 };
+        const bytes = try st.hand(gpa, &fields, &.{.{ .length = rows, .nodes = &.{ node, node }, .bufs = &.{ "", std.mem.sliceAsBytes(offs), std.mem.sliceAsBytes(sizes), "", std.mem.sliceAsBytes(child) } }});
+        defer gpa.free(bytes);
+        const got = try streamUnderCap(bytes, .{ .max_cells = 1 << 24 }, 16 << 20);
+        try testing.expectEqual(@as(?anyerror, error.LimitExceeded), got.err);
+        try testing.expect(got.peak < 4 << 20);
+    }
+}
