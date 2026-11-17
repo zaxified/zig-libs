@@ -61,7 +61,7 @@
 //!     signature on every `LeafNode` it installs. It does not check
 //!     lifetimes, credential acceptability, or capability/extension
 //!     support. It does refuse a small-order X25519 HPKE key wherever one
-//!     enters (`isLowOrderHpkeKey`) — not a §7.3 rule, but such a key is
+//!     enters (`isUnusableHpkeKey`) — not a §7.3 rule, but such a key is
 //!     unusable and would make every later encapsulation to it fail.
 //!
 //! **Atomicity: a Commit is adopted whole, or not at all.** `processCommit`
@@ -140,7 +140,7 @@ pub const Error = error{
     /// §12.4.2: an `UpdatePath` bullet failed — wrong `leaf_node_source`,
     /// the committer's encryption key did not change, or a public key in
     /// the UpdatePath already appears in the tree — or a parent node's key
-    /// in it is a small-order X25519 point (`isLowOrderHpkeKey`).
+    /// in it is a small-order X25519 point (`isUnusableHpkeKey`).
     InvalidUpdatePath,
     /// A `PreSharedKeyID` in the Commit could not be resolved to key
     /// material (§12.4.2: "Verify that all PreSharedKey proposals ... are
@@ -173,7 +173,7 @@ pub const Error = error{
     /// `capabilities` do not list — or a `LeafNode`/`KeyPackage` HPKE key
     /// (`encryption_key`, `init_key`, or any node key of an imported tree)
     /// is a small-order X25519 point, to which no HPKE encapsulation can
-    /// succeed (`isLowOrderHpkeKey`).
+    /// succeed (`isUnusableHpkeKey`).
     LeafNodeInvalid,
     /// §7.3/§12.4.3.1: two nodes of the ratchet tree carry the same
     /// `encryption_key`, or two leaves the same `signature_key`.
@@ -2687,7 +2687,7 @@ pub fn Group(comptime S: type) type {
                     try self.checkLeafSelfConsistent(kp.leaf_node);
                     // The Welcome is encrypted to `init_key`: a low-order
                     // one makes every Commit adding it fail (`DhFailed`).
-                    if (isLowOrderHpkeKey(S, kp.init_key)) return error.LeafNodeInvalid;
+                    if (isUnusableHpkeKey(S, kp.init_key)) return error.LeafNodeInvalid;
                     const owned = try dupLeafNode(arena, kp.leaf_node);
                     // §12.1.1's placement: the leftmost blank leaf,
                     // extending the tree to the right if there is none.
@@ -3143,11 +3143,11 @@ pub fn Group(comptime S: type) type {
         // defaulting ON.
 
         /// The §7.3 rules that read the leaf alone, plus this module's own
-        /// refusal of a low-order HPKE `encryption_key` (`isLowOrderHpkeKey`;
+        /// refusal of a low-order HPKE `encryption_key` (`isUnusableHpkeKey`;
         /// not a `Policy` switch — such a key is unusable, not a policy
         /// choice).
         fn checkLeafSelfConsistent(self: *const Self, leaf: tree.LeafNode) !void {
-            if (isLowOrderHpkeKey(S, leaf.encryption_key)) return error.LeafNodeInvalid;
+            if (isUnusableHpkeKey(S, leaf.encryption_key)) return error.LeafNodeInvalid;
             if (!self.policy.check_leaf_extensions_supported) return;
             for (leaf.extensions) |ext| {
                 if (std.mem.findScalar(u16, leaf.capabilities.extensions, ext.extension_type) == null)
@@ -3432,7 +3432,7 @@ var test_admit_low_order_keys: bool = false;
 /// RFC 9180 §7.1's `kem_id` for DHKEM(X25519, HKDF-SHA256).
 const x25519_kem_id: u16 = 0x0020;
 
-/// True when `key` is an X25519 public key of small order (the all-zero
+/// For an X25519 KEM, true when `key` is a public key of small order (the all-zero
 /// encoding, `u = 1`, the order-8 points and their non-canonical twins).
 /// HPKE to such a key fails in the DH step (`hpke`'s `DhFailed`, RFC 9180
 /// §7.1.4's all-zero check), so a leaf or KeyPackage carrying one would be
@@ -3441,19 +3441,30 @@ const x25519_kem_id: u16 = 0x0020;
 /// out. Detected as std's own refusal: a clamped scalar is a multiple of
 /// the cofactor 8, so X25519 with ANY fixed scalar yields the identity
 /// (`error.IdentityElement`) exactly for the small-order points. Public
-/// data, so the probe need not be constant time. Only X25519-KEM suites
-/// are judged; a key of the wrong length is the length checks' business,
-/// not this one's.
-fn isLowOrderHpkeKey(comptime S: type, key: []const u8) bool {
-    if (comptime S.Kem.kem_id != x25519_kem_id) return false;
+/// data, so the probe need not be constant time.
+///
+/// For a NIST-curve KEM (P-256/P-384/P-521, suites 0x0002/0x0005/0x0007),
+/// true when `key` is not a point `hpke` would accept: its
+/// `validatePublicKey` refuses exactly the keys `encap` would (SEC1
+/// uncompressed, canonical, on the curve), so such a leaf fails the same way
+/// and is refused at the same admission points (2026-11-17).
+///
+/// A key of the wrong length is the length checks' business, not this one's.
+fn isUnusableHpkeKey(comptime S: type, key: []const u8) bool {
     if (@import("builtin").is_test and test_admit_low_order_keys) return false;
+    if (comptime @hasDecl(S.Kem, "validatePublicKey")) {
+        if (key.len != S.Kem.Npk) return false;
+        S.Kem.validatePublicKey(key[0..S.Kem.Npk]) catch return true;
+        return false;
+    }
+    if (comptime S.Kem.kem_id != x25519_kem_id) return false;
     if (key.len != std.crypto.dh.X25519.public_length) return false;
     const probe: [std.crypto.dh.X25519.secret_length]u8 = @splat(0x5a);
     _ = std.crypto.dh.X25519.scalarmult(probe, key[0..std.crypto.dh.X25519.public_length].*) catch return true;
     return false;
 }
 
-/// `isLowOrderHpkeKey` over every HPKE public key in a tree that arrived
+/// `isUnusableHpkeKey` over every HPKE public key in a tree that arrived
 /// whole from someone else (`fromWelcome`, `joinByExternalCommit`).
 fn rejectLowOrderTreeKeys(comptime S: type, t: *const tree.RatchetTree) error{LeafNodeInvalid}!void {
     for (t.nodes) |maybe| {
@@ -3462,17 +3473,17 @@ fn rejectLowOrderTreeKeys(comptime S: type, t: *const tree.RatchetTree) error{Le
             .leaf => |l| l.encryption_key,
             .parent => |p| p.encryption_key,
         };
-        if (isLowOrderHpkeKey(S, key)) return error.LeafNodeInvalid;
+        if (isUnusableHpkeKey(S, key)) return error.LeafNodeInvalid;
     }
 }
 
-/// `isLowOrderHpkeKey` over an UpdatePath's keys: the leaf's is a LeafNode
+/// `isUnusableHpkeKey` over an UpdatePath's keys: the leaf's is a LeafNode
 /// key (`LeafNodeInvalid`), the parent nodes' are the path's own
 /// (`InvalidUpdatePath`).
 fn rejectLowOrderPathKeys(comptime S: type, path: treekem.UpdatePath) error{ LeafNodeInvalid, InvalidUpdatePath }!void {
-    if (isLowOrderHpkeKey(S, path.leaf_node.encryption_key)) return error.LeafNodeInvalid;
+    if (isUnusableHpkeKey(S, path.leaf_node.encryption_key)) return error.LeafNodeInvalid;
     for (path.nodes) |n| {
-        if (isLowOrderHpkeKey(S, n.encryption_key)) return error.InvalidUpdatePath;
+        if (isUnusableHpkeKey(S, n.encryption_key)) return error.InvalidUpdatePath;
     }
 }
 
@@ -6344,7 +6355,7 @@ test "§12.4.3.1: a joiner refuses a group whose GroupContext declares a version
 /// private keys and path secrets, the remembered resumption PSKs, the pending
 /// Updates, and the encoded ratchet tree. Equal digests mean the group is
 /// bit-for-bit where it was.
-fn stateDigest(g: *const Group(TestSuite)) ![32]u8 {
+fn stateDigest(g: anytype) ![32]u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update(std.mem.asBytes(&g.epoch));
     h.update(&g.tree_hash);
@@ -7517,7 +7528,7 @@ test "leaks: an HPKE failure midway through the Welcome or the UpdatePath leaves
     const carol = try TestClient.init(aa, "carol", 213);
     const bad_init = try lowOrderClient(aa, "bad-init", 214, .init);
     const bad_enc = try lowOrderClient(aa, "bad-enc", 215, .encryption);
-    // Admission refuses both KeyPackages (`isLowOrderHpkeKey`); this test is
+    // Admission refuses both KeyPackages (`isUnusableHpkeKey`); this test is
     // about the failure paths AFTER admission, so it seats them anyway.
     test_admit_low_order_keys = true;
     defer test_admit_low_order_keys = false;
@@ -7572,12 +7583,12 @@ test "low-order X25519 keys: every small-order encoding is detected, a real key 
     for (hex) |h| {
         var k: [32]u8 = undefined;
         _ = try std.fmt.hexToBytes(&k, h);
-        try testing.expect(isLowOrderHpkeKey(TestSuite, &k));
+        try testing.expect(isUnusableHpkeKey(TestSuite, &k));
     }
     const good = (TestSuite.Kem.KeyPair.generateDeterministic(@splat(7))).public_key;
-    try testing.expect(!isLowOrderHpkeKey(TestSuite, &good));
+    try testing.expect(!isUnusableHpkeKey(TestSuite, &good));
     // Length is not this check's business.
-    try testing.expect(!isLowOrderHpkeKey(TestSuite, &@as([31]u8, @splat(0))));
+    try testing.expect(!isUnusableHpkeKey(TestSuite, &@as([31]u8, @splat(0))));
 }
 
 test "low-order X25519 keys: createCommit refuses an Add whose init_key or encryption_key is one" {
@@ -7850,7 +7861,87 @@ fn SuiteClient(comptime P: type) type {
                 .kp_msg = try msg.encodeAlloc(arena),
             };
         }
+
+        /// A validly signed KeyPackage whose `init_key` or leaf
+        /// `encryption_key` is not a point on the curve (the last byte of y
+        /// flipped).
+        fn offCurve(arena: std.mem.Allocator, name: []const u8, seed: u8, which: enum { init, encryption }) !@This() {
+            var c = try init(arena, name, seed);
+            var init_kp: P.Kem.KeyPair = undefined;
+            P.Kem.deriveKeyPair(&init_kp, &@as([P.Kem.Nsk]u8, @splat(seed +% 64)));
+            var enc_kp: P.Kem.KeyPair = undefined;
+            P.Kem.deriveKeyPair(&enc_kp, &@as([P.Kem.Nsk]u8, @splat(seed +% 128)));
+            const kp_ptr = if (which == .init) &init_kp else &enc_kp;
+            kp_ptr.public_key[P.Kem.Npk - 1] ^= 1;
+            c.kp = try keypackage_mod.create(P, arena, .{
+                .signature_key_pair = &c.sig,
+                .init_key = init_kp.public_key,
+                .encryption_key = enc_kp.public_key,
+                .credential = .{ .basic = name },
+                .capabilities = .{
+                    .versions = &.{1},
+                    .cipher_suites = &.{@backingInt(P.id)},
+                    .extensions = &.{},
+                    .proposals = &.{},
+                    .credentials = &.{1},
+                },
+                .lifetime = .{ .not_before = 0, .not_after = std.math.maxInt(u64) },
+            });
+            const msg: framing.MLSMessage = .{ .key_package = c.kp };
+            c.kp_msg = try msg.encodeAlloc(arena);
+            return c;
+        }
     };
+}
+
+test "NIST-curve HPKE keys: an off-curve init_key or encryption_key is refused at admission, every ECDSA suite" {
+    // Before 2026-11-17 only X25519's low-order keys were refused here; a
+    // P-256/P-384/P-521 key that is no point was admitted and failed at the
+    // first encapsulation to it (hpke `DeserializeError`).
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    inline for (.{ suite.Mls128P256Aes128GcmSha256P256, suite.Mls256P521Aes256GcmSha512P521, suite.Mls256P384Aes256GcmSha384P384 }) |P| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        const G = Group(P);
+        const alice = try SuiteClient(P).init(aa, "alice", 41);
+        const good = try SuiteClient(P).init(aa, "good", 42);
+        const bad_init = try SuiteClient(P).offCurve(aa, "bad-init", 43, .init);
+        const bad_enc = try SuiteClient(P).offCurve(aa, "bad-enc", 44, .encryption);
+        // The helper itself: a real key passes, the flipped one does not,
+        // a wrong length is not its business.
+        try testing.expect(!isUnusableHpkeKey(P, good.kp.init_key));
+        try testing.expect(isUnusableHpkeKey(P, bad_init.kp.init_key));
+        try testing.expect(isUnusableHpkeKey(P, bad_enc.kp.leaf_node.encryption_key));
+        try testing.expect(!isUnusableHpkeKey(P, good.kp.init_key[1..]));
+
+        var a: G = undefined;
+        try G.create(gpa, .{ .io = io, .group_id = "nist-admit", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv }, &a);
+        defer a.deinit();
+        const before = try stateDigest(&a);
+        for ([_]keypackage_mod.KeyPackage{ bad_init.kp, bad_enc.kp }) |kp| {
+            const r = a.createCommit(gpa, .{
+                .io = io,
+                .signature_key_pair = &alice.sig,
+                .proposals = &.{.{ .by_value = .{ .add = kp } }},
+            });
+            if (r) |c| {
+                c.deinit(gpa);
+                return error.TestUnexpectedResult;
+            } else |e| try testing.expectEqual(error.LeafNodeInvalid, e);
+            try testing.expectEqualSlices(u8, &before, &(try stateDigest(&a)));
+        }
+        // The same Add with a real key goes through.
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = &alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = good.kp } }},
+        });
+        c.deinit(gpa);
+    }
 }
 
 test "NIST-curve private keys: create/fromWelcome refuse a scalar outside [1, n-1] as PrivateKeyMismatch, every ECDSA suite" {

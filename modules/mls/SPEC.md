@@ -1637,7 +1637,7 @@ private-key refusal on `create` and both `fromWelcome` keys. The
 comptime parameter. The treekem.json vectors of `0x0005`/`0x0007` are what
 fail without it. Cumulative with the 2026-10-06 run: 51/52, 1 eq.
 
-**Not done.** The X25519 low-order key refusal (`isLowOrderHpkeKey`) has no
+**Not done.** The X25519 low-order key refusal (`isUnusableHpkeKey`) has no
 NIST analogue. A KeyPackage whose P-256/P-384/P-521 `init_key` or
 `encryption_key` is not a curve point is admitted, and later fails at
 encapsulation (`hpke`'s `DeserializeError`), exactly as a low-order X25519
@@ -1902,7 +1902,7 @@ fire by deleting one `errdefer` each.
   parent-node keys) and `verifiedTreeFromGroupInfo` (every node of a tree
   `fromWelcome` or `joinByExternalCommit` imports). The test is std's own:
   X25519 with a fixed clamped scalar returns `error.IdentityElement`
-  exactly for the small-order points (`isLowOrderHpkeKey`; X25519-KEM
+  exactly for the small-order points (`isUnusableHpkeKey`; X25519-KEM
   suites only). Tests: the detector over all eight small-order encodings;
   `createCommit` refusing both KeyPackages with and without a path;
   `processCommit` refusing a genuine Commit from a non-checking committer
@@ -1995,6 +1995,6 @@ fire by deleting one `errdefer` each.
 
 ## Backlog / deferred
 
-- **NIST-curve HPKE keys are not validated at admission** (2026-11-17): the `isLowOrderHpkeKey` refusal is X25519-only. A KeyPackage or leaf whose `init_key`/`encryption_key` is not a valid P-256/P-384/P-521 point is admitted and fails later at encapsulation. Refuse it at admission, the way the X25519 case is refused.
+- **Done 2026-11-17: NIST-curve HPKE keys are validated at admission.** `isUnusableHpkeKey` (was `isLowOrderHpkeKey`) also refuses, for suites 0x0002/0x0005/0x0007, a KeyPackage `init_key` or an `encryption_key` that `hpke`'s new `validatePublicKey` refuses (not SEC1 uncompressed, non-canonical, off the curve), at the same admission points and with the same `error.LeafNodeInvalid` as an X25519 low-order key; test "NIST-curve HPKE keys: an off-curve init_key or encryption_key is refused at admission, every ECDSA suite".
 
 - 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
