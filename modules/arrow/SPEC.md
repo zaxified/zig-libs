@@ -411,6 +411,10 @@ refuses the same `total` before the selectors are allocated and `gather` charges
   never emits views and the `cpp-21.0.0` view goldens are uncompressed.
 - Message-level `custom_metadata` (on each Schema / RecordBatch / DictionaryBatch message) is neither surfaced
   nor written; only schema, field and footer metadata are.
+- `field_metadata` on write is matched to children by position and count only: a RunEndEncoded column whose
+  values are a struct of two or more fields, read with its `run_ends` / `values` child metadata and written back
+  plain, would put that metadata on the struct's first two fields. Rare (REE of struct with child metadata); the
+  fix is to drop REE child metadata at read time, which changes what `ReadOptions.metadata` reports.
 
 ## Plan
 

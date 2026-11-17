@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — SPEC Open: REE-of-struct child metadata maps by position on write-back (known, not fixed). NO CONSUMER-VISIBLE CHANGE.
 - **2026-11-17** — SPEC: the Audit line records the delta mutation audit of the read-gap wave (cumulative 391/423, 29 equivalent; 98 new mutants, 94 killed, 4 equivalent, no finding) and the Anchoring section gains its paragraph. NO CONSUMER-VISIBLE CHANGE.
 - **2026-11-17** — Delta mutation of the read-gap wave: tests for the guards no test pinned (metadata keys charged like values, the footer metadata's own budget, run ends with a dictionary, a views buffer or list-view offsets short of the rows, the u32 cap on list-view elements, the exact `max_cells` of a list view, compressed view batches read whole and projected past broken view buffers). NO CONSUMER-VISIBLE CHANGE.
 - **2026-11-17** — Review fix (MED): a ListView whose child reads all-null (a Null child, say) now charges its elements to `max_cells` as a copy would; before, 65 535 rows each naming the whole 65 535-slot child read from ~512 KiB into a frame of ~4.3e9 list elements that a write back then tried to materialise (~16 GiB). Tests: that construction is `LimitExceeded`; projection of a dictionary shared by a picked and an unpicked column, and of a Utf8View dictionary (read, or skipped unread when unused). SPEC Open gains the review's remaining LOWs.
