@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — tests: the dead-stack probe (`stackprobe_test.zig`, ReleaseFast) also measures the snapshot entry points: `Participant.toBytes` / `fromBytes` of every party after round 1 and `ReshareReceiver.toBytes` / `fromBytes` of every receiver after the shares; no secret residue found. No source change.
 - **2026-11-17** — audit: delta mutation of the snapshot codec (154 mutants, 128 killed, 26 equivalent / unobservable), card line and ctgrind source digests re-pinned (counts unchanged). No source change.
 - **2026-11-17** — tests: snapshot breakage table gains the cases the mutation audit found missing (own `accepted_sp` after round 1, own exposure, `used` out of order / too long, a self-consistent result of another key). No source change.
 - **2026-11-17** — tests: the per-field breakage table names its group in a failure message. No source change.

@@ -275,6 +275,69 @@ noinline fn callOutput() void {
     out_share = parties[cur_party].output().?;
 }
 
+// ── snapshots (toBytes / fromBytes of a mid-run party) ───────────────────
+
+/// Heap buffer the probed `toBytes` writes into (its bytes are secret by
+/// design, but they are not on the stack the probe scans).
+var snap_buf: []u8 = &.{};
+var snap_len: usize = 0;
+var restored_party: Participant = undefined;
+var restored_receiver: reshare.ReshareReceiver = undefined;
+var snap_receiver: usize = 0;
+
+noinline fn callParticipantToBytes() void {
+    snap_len = (parties[cur_party].toBytes(snap_buf) catch @panic("Participant.toBytes")).len;
+}
+noinline fn callParticipantFromBytes() void {
+    restored_party = Participant.fromBytes(std.testing.allocator, snap_buf[0..snap_len]) catch @panic("Participant.fromBytes");
+}
+noinline fn callReceiverToBytes() void {
+    snap_len = (receivers[snap_receiver].toBytes(snap_buf) catch @panic("ReshareReceiver.toBytes")).len;
+}
+noinline fn callReceiverFromBytes() void {
+    restored_receiver = reshare.ReshareReceiver.fromBytes(std.testing.allocator, snap_buf[0..snap_len]) catch @panic("ReshareReceiver.fromBytes");
+}
+
+/// Snapshot round trip of every GJKR party, both calls probed. Needles: every
+/// party's secrets and, for `fromBytes`, the rebuilt party's.
+fn probeParticipantSnapshots(allocator: std.mem.Allocator, round: usize, label_buf: []u8) !usize {
+    var total: usize = 0;
+    for (0..n_parties) |i| {
+        cur_party = i;
+        snap_buf = try allocator.alloc(u8, parties[i].encodedLength());
+        defer {
+            std.crypto.secureZero(u8, snap_buf);
+            allocator.free(snap_buf);
+        }
+        total += probeParty(try std.mem.print(label_buf, "toBytes round {d} party {d}", .{ round, i + 1 }), callParticipantToBytes);
+        try std.testing.expectEqual(snap_buf.len, snap_len);
+        total += probeParty(try std.mem.print(label_buf, "fromBytes round {d} party {d}", .{ round, i + 1 }), callParticipantFromBytes);
+        defer restored_party.deinit();
+        try std.testing.expectEqual(parties[i].phase(), restored_party.phase());
+    }
+    return total;
+}
+
+/// Same for every reshare receiver (`fillReshare` covers the dealers and
+/// receivers; the rebuilt receiver holds the same secrets as the original).
+fn probeReceiverSnapshots(allocator: std.mem.Allocator, stage: []const u8, label_buf: []u8) !usize {
+    var total: usize = 0;
+    for (0..receivers.len) |i| {
+        snap_receiver = i;
+        snap_buf = try allocator.alloc(u8, receivers[i].encodedLength());
+        defer {
+            std.crypto.secureZero(u8, snap_buf);
+            allocator.free(snap_buf);
+        }
+        total += probePlain(try std.mem.print(label_buf, "receiver {d} toBytes ({s})", .{ i + 1, stage }), callReceiverToBytes, fillReshare);
+        try std.testing.expectEqual(snap_buf.len, snap_len);
+        total += probePlain(try std.mem.print(label_buf, "receiver {d} fromBytes ({s})", .{ i + 1, stage }), callReceiverFromBytes, fillReshare);
+        defer restored_receiver.deinit();
+        try std.testing.expectEqual(receivers[i].phase(), restored_receiver.phase());
+    }
+    return total;
+}
+
 fn addParticipant(n: *Needles, p: *const Participant) void {
     for (p.a) |c| n.addScalar("a (dealing)", c);
     for (p.b) |c| n.addScalar("b (blinding)", c);
@@ -364,6 +427,9 @@ test "STACKPROBE: no secret on the dead stack after any GJKR participant call" {
                 total += probeParty(try std.mem.print(&label_buf, "advance round {d} party {d}", .{ round, i + 1 }), callAdvance);
             },
         };
+        // Mid-run snapshots: after round 0 the parties hold their dealing
+        // polynomials, the shares sent and the shares accepted.
+        if (round == 0) total += try probeParticipantSnapshots(allocator, round, &label_buf);
     }
     for (&parties) |*p| try std.testing.expectEqual(dkg.Phase.done, p.phase());
     for (0..n_parties) |i| {
@@ -571,6 +637,8 @@ test "STACKPROBE: no secret on the dead stack after any reshare dealer or receiv
     for (&dealers) |*d| total += Driver(reshare.ReshareDealer).probe(.start, d, try std.mem.print(&label_buf, "dealer {d} start", .{d.id()}), fillReshare);
     try deliverReshare(allocator, &total, true, &label_buf);
     for (&receivers) |*r| total += Driver(reshare.ReshareReceiver).probe(.advance, r, try std.mem.print(&label_buf, "receiver {d} advance (shares)", .{r.id()}), fillReshare);
+    // Mid-run snapshots: the receivers hold the accepted sub-shares.
+    total += try probeReceiverSnapshots(allocator, "after shares", &label_buf);
     try deliverReshare(allocator, &total, false, &label_buf);
     for (&receivers) |*r| total += Driver(reshare.ReshareReceiver).probe(.advance, r, try std.mem.print(&label_buf, "receiver {d} advance (complaints)", .{r.id()}), fillReshare);
     for (&dealers) |*d| total += Driver(reshare.ReshareDealer).probe(.advance, d, try std.mem.print(&label_buf, "dealer {d} advance", .{d.id()}), fillReshare);

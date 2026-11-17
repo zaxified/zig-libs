@@ -284,7 +284,8 @@ complain, since `t'` public openings would reveal its share.
 
 - **Secret residue on the dead stack** (sweep 2026-10-08,
   `src/stackprobe_test.zig`, five tests covering every participant, reshare, ECDSA keygen and
-  refresh call and the free functions;
+  refresh call and the free functions; since 2026-11-17 also `toBytes` / `fromBytes` of every
+  mid-run `Participant` (after round 1) and `ReshareReceiver` (after the shares);
   ReleaseFast). Wiping named buffers did not keep secrets off the stack: compiler copies,
   by-value parameters and results, and callee frames left them in dead stack memory. Fix,
   as `bip32`/`k256` (2026-10-08): (1) every public entry point that touches a secret runs its
