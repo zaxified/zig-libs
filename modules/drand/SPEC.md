@@ -353,7 +353,7 @@ Go source) and reused here.
 ## Backlog / deferred
 
 - ~~**Chained-scheme verification (`pedersen-bls-chained`)**~~ — DONE 2026-10-06 (see "chained — `pedersen-bls-chained`"); the DST turned out to be the standard RFC 9380 G2 tag, not a legacy one.
-- **Live re-check of the chained fixtures** *(2026-10-06)* — `tools/fetch_chained.py live` was not run (api.drand.sh blocked from the committing session); the fixtures come from two published packages. Extending `tools/go/main.go` to the chained scheme would add the Go differential. Effort: small.
+- **Live re-check of the chained fixtures** *(2026-10-06)* — `tools/fetch_chained.py live` was not run (api.drand.sh blocked from the committing session); the fixtures come from two published packages. The Go differential for the chained scheme is done (2026-11-17, `tools/go/main.go` + `fetch_chained.py export`: 3/3 agree, a tampered `previous_signature` rejected 3/3 by both); a live re-fetch of the beacons is still open.
 - ~~**`bls-unchained-on-g1`** *(survey 2026-09-30)* — deprecated non-conformant DST; only for retro-compatibility.~~ ✅ DONE 2026-11-16 — verified through `QuicknetSuite.coreAggregateVerify` under the G2 `_NUL_` DST (see "`bls-unchained-on-g1`"). Open follow-up: no genuine beacon of an old `bls-unchained-on-g1` network is in the repo, so the tests are self-consistency only; add a real vector when one is available.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).

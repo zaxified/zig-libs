@@ -94,7 +94,6 @@ func main() {
 		os.Exit(2)
 	}
 	sch, pk, in := loadInfo(os.Args[1])
-	_ = in
 	raw, err := os.ReadFile(os.Args[2])
 	if err != nil {
 		panic(err)
@@ -106,7 +105,11 @@ func main() {
 	ok, bad := 0, 0
 	for _, b := range bs {
 		sig, _ := hex.DecodeString(b.Signature)
-		bc := &common.Beacon{Round: b.Round, Signature: sig}
+		// PreviousSig is what the chained scheme (`pedersen-bls-chained`)
+		// digests; the unchained schemes ignore it, so passing it always is
+		// harmless and one program covers both.
+		prev, _ := hex.DecodeString(b.PrevSig)
+		bc := &common.Beacon{Round: b.Round, Signature: sig, PreviousSig: prev}
 		if err := sch.VerifyBeacon(bc, pk); err == nil {
 			ok++
 		} else {
@@ -114,7 +117,7 @@ func main() {
 			fmt.Println("GO REJECT round", b.Round, err)
 		}
 	}
-	fmt.Printf("GO oracle: %d/%d live quicknet rounds verified (rejected %d)\n", ok, len(bs), bad)
+	fmt.Printf("GO oracle: %d/%d live %s rounds verified (rejected %d)\n", ok, len(bs), in.SchemeID, bad)
 	if bad != 0 {
 		os.Exit(1)
 	}

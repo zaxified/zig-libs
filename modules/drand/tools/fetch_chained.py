@@ -31,6 +31,9 @@ WHAT IT NEEDS. Python 3 with urllib; network access to the route chosen.
 
     python3 fetch_chained.py live
     python3 fetch_chained.py packages [workdir]   # default ./chained-pkgs
+    python3 fetch_chained.py export <dir>         # no network: chained_info.json +
+                                                  # chained_rounds.json, the input shape
+                                                  # of go/oracle and verify_driver
 
 It never writes into the repository: compare its output with the literals in
 src/verify.zig by eye (see README.md here for why vectors are pasted by hand).
@@ -112,13 +115,42 @@ def packages(workdir):
     return bad
 
 
+def export(outdir):
+    """Write the pinned chained beacons in the `fetch.py` shape, so the Go
+    oracle (`go/main.go`) and `verify_driver.zig` can both be run on them.
+    The `/info` document is the one pinned in `src/chaininfo.zig`.
+    `randomness` is sha256(signature) by drand's definition; the pinned
+    values are checked against that, and round 2634945 (no external value)
+    gets the derived one."""
+    import hashlib
+    os.makedirs(outdir, exist_ok=True)
+    info = {
+        "public_key": PUBKEY, "period": 30, "genesis_time": 1595431050, "hash": CHAIN,
+        "groupHash": "176f93498eac9ca337150b46d21dd58673ea4e3581185f869672e59fa4cb390a",
+        "schemeID": "pedersen-bls-chained", "metadata": {"beaconID": "default"},
+    }
+    rounds = []
+    for rnd, v in sorted(ROUNDS.items()):
+        derived = hashlib.sha256(bytes.fromhex(v["signature"])).hexdigest()
+        if v["randomness"] is not None and v["randomness"] != derived:
+            sys.exit(f"round {rnd}: pinned randomness is not sha256(signature)")
+        rounds.append({"round": rnd, "randomness": derived, "signature": v["signature"],
+                       "previous_signature": v["previous_signature"]})
+    json.dump(info, open(os.path.join(outdir, "chained_info.json"), "w"))
+    json.dump(rounds, open(os.path.join(outdir, "chained_rounds.json"), "w"))
+    print(f"wrote {outdir}/chained_info.json and chained_rounds.json ({len(rounds)} rounds)")
+    return 0
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "live"
     if mode == "live":
         bad = live()
     elif mode == "packages":
         bad = packages(sys.argv[2] if len(sys.argv) > 2 else "chained-pkgs")
+    elif mode == "export":
+        bad = export(sys.argv[2])
     else:
-        sys.exit("usage: fetch_chained.py live | packages [workdir]")
+        sys.exit("usage: fetch_chained.py live | packages [workdir] | export <dir>")
     print("ALL AGREE" if bad == 0 else f"{bad} DISAGREEMENT(S)")
     sys.exit(1 if bad else 0)

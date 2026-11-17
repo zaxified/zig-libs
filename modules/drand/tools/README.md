@@ -103,5 +103,24 @@ Only data was taken from either package. The DST
 read from drand v2.1.7 `crypto/schemes.go` `NewPedersenBLSChained` and confirmed by
 all three beacons verifying under it and failing under `_POP_`. Whoever next has
 access to the beacon should run `python3 fetch_chained.py live`; it exits non-zero
-on any disagreement with the pinned values. The Go oracle above was not extended to
-the chained scheme.
+on any disagreement with the pinned values.
+
+**Go differential for the chained scheme — added 2026-11-17.** `go/main.go` now
+passes each beacon's `previous_signature` to drand's own `VerifyBeacon` (the
+unchained schemes ignore it), and `python3 fetch_chained.py export <dir>` writes the
+three pinned beacons plus the `/info` document in the shape both oracles read
+(no network; `randomness` is `sha256(signature)`, checked against the pinned
+values). Run exactly as in the O1 section, with `chained_info.json` /
+`chained_rounds.json` in place of the quicknet files. Measured 2026-11-17:
+
+```
+GO oracle:  3/3 live pedersen-bls-chained rounds verified (rejected 0)
+ZIG oracle: 3/3 live rounds verified (rejected 0)
+# same rounds with one byte of previous_signature changed:
+GO oracle:  0/3 ... (rejected 3, "bls: invalid signature")
+ZIG oracle: 0/3 ... (rejected 3, InvalidSignature)
+```
+
+The tampered run is what shows the chaining is covered: the signature is over
+`sha256(previous_signature ‖ round)`, so a wrong predecessor must fail in both
+implementations. The beacons are the three pinned ones, not a fresh live fetch.
