@@ -49,7 +49,6 @@ const message_protection_json = @embedFile("data/message-protection.json");
 const transcript_hashes_json = @embedFile("data/transcript-hashes.json");
 
 const testing = std.testing;
-const S = suite.default;
 
 /// `message-protection.json`'s procedure: "Initialize a secret tree for 2
 /// members with the specified encryption_secret" and "use the member with
@@ -63,7 +62,7 @@ fn hexDecode(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     return out;
 }
 
-fn hexSecret(hex: []const u8) ![S.Nh]u8 {
+fn hexSecret(comptime S: type, hex: []const u8) ![S.Nh]u8 {
     var out: [S.Nh]u8 = undefined;
     const decoded = try std.fmt.hexToBytes(&out, hex);
     try testing.expectEqual(@as(usize, S.Nh), decoded.len);
@@ -114,6 +113,7 @@ fn encodeBodyAlloc(allocator: std.mem.Allocator, body: framing.FramedContentBody
 /// The §9.1 ratchet key/nonce for `generation` of `leaf`'s handshake or
 /// application ratchet, in a tree of `vector_group_size` leaves.
 fn ratchetKeyNonce(
+    comptime S: type,
     encryption_secret: [S.Nh]u8,
     leaf: u32,
     kind: secrettree.RatchetKind,
@@ -129,13 +129,17 @@ fn ratchetKeyNonce(
     return kn;
 }
 
-test "message-protection.json: RFC 9420 §6's whole protect/unprotect path for suite 0x0001, byte-exact" {
+test "message-protection.json: RFC 9420 §6's whole protect/unprotect path for every wired suite, byte-exact" {
+    inline for (suite.supported) |S| try messageProtection(S);
+}
+
+fn messageProtection(comptime S: type) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, message_protection_json, .{});
     defer parsed.deinit();
     const arena = parsed.arena.allocator();
     const alloc = testing.allocator;
 
-    var found_suite_1 = false;
+    var found_suite = false;
     var skipped_other_suites: usize = 0;
     var public_checked: usize = 0;
     var private_checked: usize = 0;
@@ -144,9 +148,9 @@ test "message-protection.json: RFC 9420 §6's whole protect/unprotect path for s
         const obj = entry.object;
         if (asI64(obj.get("cipher_suite").?) != @as(i64, @backingInt(S.id))) {
             skipped_other_suites += 1;
-            continue; // this module only wires suite 0x0001 — see suite.zig
+            continue; // driven by its own instantiation
         }
-        found_suite_1 = true;
+        found_suite = true;
 
         // ── the group state the vector's procedure prescribes ──
         const group_id = try hexDecode(arena, obj.get("group_id").?.string);
@@ -161,9 +165,9 @@ test "message-protection.json: RFC 9420 §6's whole protect/unprotect path for s
         const gc_bytes = try gc.encodeAlloc(alloc);
         defer alloc.free(gc_bytes);
 
-        const membership_key = try hexSecret(obj.get("membership_key").?.string);
-        const encryption_secret = try hexSecret(obj.get("encryption_secret").?.string);
-        const sender_data_secret = try hexSecret(obj.get("sender_data_secret").?.string);
+        const membership_key = try hexSecret(S, obj.get("membership_key").?.string);
+        const encryption_secret = try hexSecret(S, obj.get("encryption_secret").?.string);
+        const sender_data_secret = try hexSecret(S, obj.get("sender_data_secret").?.string);
 
         // `signature_priv` is the Ed25519 SEED (RFC 8032 §5.1.5's 32-byte
         // private key), not an expanded scalar — asserting that the derived
@@ -258,7 +262,7 @@ test "message-protection.json: RFC 9420 §6's whole protect/unprotect path for s
             try testing.expectEqual(vector_sender_leaf, sd.leaf_index);
 
             const kind: secrettree.RatchetKind = if (pmsg.content_type == .application) .application else .handshake;
-            const kn = try ratchetKeyNonce(encryption_secret, sd.leaf_index, kind, sd.generation);
+            const kn = try ratchetKeyNonce(S, encryption_secret, sd.leaf_index, kind, sd.generation);
 
             const plaintext = framing.decryptContent(S, alloc, pmsg, &kn, sd.reuse_guard) catch |err| {
                 std.debug.print("framing KAT: '" ++ spec[1] ++ " content AEAD (§6.3.1)' failed: {s}\n", .{@errorName(err)});
@@ -302,14 +306,18 @@ test "message-protection.json: RFC 9420 §6's whole protect/unprotect path for s
         }
     }
 
-    try testing.expect(found_suite_1);
+    try testing.expect(found_suite);
     try testing.expectEqual(@as(usize, 2), public_checked);
     try testing.expectEqual(@as(usize, 3), private_checked);
-    // Suites 0x0002-0x0007 each contribute one entry.
+    // The other six suites each contribute one entry.
     try testing.expectEqual(@as(usize, 6), skipped_other_suites);
 }
 
-test "message-protection.json: a tampered ciphertext byte fails the content AEAD, not silently" {
+test "message-protection.json: a tampered ciphertext byte fails the content AEAD, not silently (every wired suite)" {
+    inline for (suite.supported) |S| try tamperedCiphertext(S);
+}
+
+fn tamperedCiphertext(comptime S: type) !void {
     // Proves the §6.3.1 AEAD is actually authenticating the payload rather
     // than the harness accepting whatever decrypts to something parseable.
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, message_protection_json, .{});
@@ -322,15 +330,15 @@ test "message-protection.json: a tampered ciphertext byte fails the content AEAD
         if (asI64(obj.get("cipher_suite").?) != @as(i64, @backingInt(S.id))) continue;
 
         const vec = try hexDecode(arena, obj.get("application_priv").?.string);
-        const encryption_secret = try hexSecret(obj.get("encryption_secret").?.string);
-        const sender_data_secret = try hexSecret(obj.get("sender_data_secret").?.string);
+        const encryption_secret = try hexSecret(S, obj.get("encryption_secret").?.string);
+        const sender_data_secret = try hexSecret(S, obj.get("sender_data_secret").?.string);
 
         var r = codec.Reader.init(vec);
         const msg = try framing.MLSMessage.decode(alloc, &r);
         defer msg.deinit(alloc);
         const pmsg = msg.private_message;
         const sd = try framing.decryptSenderData(S, alloc, pmsg, &sender_data_secret);
-        const kn = try ratchetKeyNonce(encryption_secret, sd.leaf_index, .application, sd.generation);
+        const kn = try ratchetKeyNonce(S, encryption_secret, sd.leaf_index, .application, sd.generation);
 
         // Flip one bit in the middle of the ciphertext.
         const tampered = try alloc.dupe(u8, pmsg.ciphertext);
@@ -348,13 +356,17 @@ test "message-protection.json: a tampered ciphertext byte fails the content AEAD
     return error.SkipZigTest;
 }
 
-test "transcript-hashes.json: RFC 9420 §8.2's two hashes for suite 0x0001, byte-exact" {
+test "transcript-hashes.json: RFC 9420 §8.2's two hashes for every wired suite, byte-exact" {
+    inline for (suite.supported) |S| try transcriptHashes(S);
+}
+
+fn transcriptHashes(comptime S: type) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, transcript_hashes_json, .{});
     defer parsed.deinit();
     const arena = parsed.arena.allocator();
     const alloc = testing.allocator;
 
-    var found_suite_1 = false;
+    var found_suite = false;
     var skipped_other_suites: usize = 0;
 
     for (parsed.value.array.items) |entry| {
@@ -363,7 +375,7 @@ test "transcript-hashes.json: RFC 9420 §8.2's two hashes for suite 0x0001, byte
             skipped_other_suites += 1;
             continue;
         }
-        found_suite_1 = true;
+        found_suite = true;
 
         const ac_bytes = try hexDecode(arena, obj.get("authenticated_content").?.string);
         var r = codec.Reader.init(ac_bytes);
@@ -396,7 +408,7 @@ test "transcript-hashes.json: RFC 9420 §8.2's two hashes for suite 0x0001, byte
         // `confirmation_tag` must be a valid MAC over the confirmed hash it
         // just produced — the §6.1/§8.2 circularity this module resolves by
         // stopping `ConfirmedTranscriptHashInput` at the signature.
-        const confirmation_key = try hexSecret(obj.get("confirmation_key").?.string);
+        const confirmation_key = try hexSecret(S, obj.get("confirmation_key").?.string);
         try expectStageOk("confirmation_tag over confirmed_transcript_hash_after", keyschedule.verifyConfirmationTag(
             S,
             &confirmation_key,
@@ -405,11 +417,15 @@ test "transcript-hashes.json: RFC 9420 §8.2's two hashes for suite 0x0001, byte
         ));
     }
 
-    try testing.expect(found_suite_1);
+    try testing.expect(found_suite);
     try testing.expectEqual(@as(usize, 6), skipped_other_suites);
 }
 
-test "transcript-hashes.json: the confirmation_tag does NOT verify against the hash it is not defined over" {
+test "transcript-hashes.json: the confirmation_tag does NOT verify against the hash it is not defined over (every wired suite)" {
+    inline for (suite.supported) |S| try confirmationTagWrongHash(S);
+}
+
+fn confirmationTagWrongHash(comptime S: type) !void {
     // The confirmed hash and the interim hash are one hash step apart, and
     // both are 32 bytes — so a §8.2 implementation that returned the wrong
     // one would still typecheck and still look plausible. This is the check
@@ -430,7 +446,7 @@ test "transcript-hashes.json: the confirmation_tag does NOT verify against the h
 
         const interim_before = try hexDecode(arena, obj.get("interim_transcript_hash_before").?.string);
         const hashes = try transcript.advance(S, alloc, interim_before, ac);
-        const confirmation_key = try hexSecret(obj.get("confirmation_key").?.string);
+        const confirmation_key = try hexSecret(S, obj.get("confirmation_key").?.string);
 
         try testing.expectError(error.MacMismatch, keyschedule.verifyConfirmationTag(
             S,

@@ -50,7 +50,6 @@ const welcome = @import("welcome.zig");
 const welcome_json = @embedFile("data/welcome.json");
 
 const testing = std.testing;
-const S = suite.default;
 
 fn hexDecode(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, hex.len / 2);
@@ -86,21 +85,23 @@ fn expectStageOk(stage: []const u8, result: anyerror!void) !void {
 /// The returned slices alias `arena`; `key_package_bytes` is the WHOLE
 /// `MLSMessage(KeyPackage)` and `key_package_body` is that message minus its
 /// four-byte header, which is what §5.2's `MakeKeyPackageRef` hashes.
-const Entry = struct {
-    key_package_bytes: []u8,
-    welcome_bytes: []u8,
-    init_key_pair: S.Kem.KeyPair,
-    signer_pub: S.Sig.PublicKey,
-};
+fn Entry(comptime S: type) type {
+    return struct {
+        key_package_bytes: []u8,
+        welcome_bytes: []u8,
+        init_key_pair: S.Kem.KeyPair,
+        signer_pub: S.Sig.PublicKey,
+    };
+}
 
 /// Test-only by-value wrapper over the out-pointer `welcome.join`.
-fn tJoin(alloc: std.mem.Allocator, params: welcome.JoinParams(S)) !welcome.Joined(S) {
+fn tJoin(comptime S: type, alloc: std.mem.Allocator, params: welcome.JoinParams(S)) !welcome.Joined(S) {
     var out: welcome.Joined(S) = undefined;
     try welcome.join(S, alloc, &params, &out);
     return out;
 }
 
-fn loadEntry(arena: std.mem.Allocator, obj: std.json.ObjectMap) !Entry {
+fn loadEntry(comptime S: type, arena: std.mem.Allocator, obj: std.json.ObjectMap) !Entry(S) {
     var init_priv: [S.Kem.Nsk]u8 = undefined;
     const decoded = try std.fmt.hexToBytes(&init_priv, obj.get("init_priv").?.string);
     try testing.expectEqual(@as(usize, S.Kem.Nsk), decoded.len);
@@ -124,30 +125,34 @@ fn loadEntry(arena: std.mem.Allocator, obj: std.json.ObjectMap) !Entry {
 /// the hashed value (§5.2 hashes a `KeyPackage`, not its envelope), so the
 /// KeyPackage is re-encoded from the decoded struct — which the surrounding
 /// byte-exact re-encode check makes safe.
-fn keyPackageRef(allocator: std.mem.Allocator, kp: keypackage.KeyPackage) ![S.Hash.digest_length]u8 {
+fn keyPackageRef(comptime S: type, allocator: std.mem.Allocator, kp: keypackage.KeyPackage) ![S.Hash.digest_length]u8 {
     const bytes = try kp.encodeAlloc(allocator);
     defer allocator.free(bytes);
     return crypto.make_keypackage_ref(S, bytes);
 }
 
-test "welcome.json: RFC 9420 §12.4.3.1's whole joining path for suite 0x0001, byte-exact" {
+test "welcome.json: RFC 9420 §12.4.3.1's whole joining path for every wired suite, byte-exact" {
+    inline for (suite.supported) |S| try welcomeJoin(S);
+}
+
+fn welcomeJoin(comptime S: type) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, welcome_json, .{});
     defer parsed.deinit();
     const arena = parsed.arena.allocator();
     const alloc = testing.allocator;
 
-    var found_suite_1 = false;
+    var found_suite = false;
     var skipped_other_suites: usize = 0;
 
     for (parsed.value.array.items) |entry| {
         const obj = entry.object;
         if (asI64(obj.get("cipher_suite").?) != @as(i64, @backingInt(S.id))) {
             skipped_other_suites += 1;
-            continue; // this module only wires suite 0x0001 — see suite.zig
+            continue; // driven by its own instantiation
         }
-        found_suite_1 = true;
+        found_suite = true;
 
-        const e = try loadEntry(arena, obj);
+        const e = try loadEntry(S, arena, obj);
 
         // ── the caller's own KeyPackage ──
         var kp_reader = codec.Reader.init(e.key_package_bytes);
@@ -169,7 +174,7 @@ test "welcome.json: RFC 9420 §12.4.3.1's whole joining path for suite 0x0001, b
         // KeyPackageRef below meaningful as an identifier.
         try expectStageOk("KeyPackage self-signature (§10)", kp.verifySignature(S, alloc));
 
-        const kp_ref = try keyPackageRef(alloc, kp);
+        const kp_ref = try keyPackageRef(S, alloc, kp);
 
         // ── §12.4.3.1: the Welcome ──
         var w_reader = codec.Reader.init(e.welcome_bytes);
@@ -263,7 +268,7 @@ test "welcome.json: RFC 9420 §12.4.3.1's whole joining path for suite 0x0001, b
 
         // ── and the same thing again through the one-call entry point,
         // which must agree with the hand-staged path above in every field ──
-        var joined = tJoin(alloc, .{
+        var joined = tJoin(S, alloc, .{
             .welcome = w,
             .key_package_ref = &kp_ref,
             .init_key_pair = &e.init_key_pair,
@@ -287,12 +292,16 @@ test "welcome.json: RFC 9420 §12.4.3.1's whole joining path for suite 0x0001, b
         try expectStage("join -> interim_transcript_hash (§8.2)", &interim, &joined.interim_transcript_hash);
     }
 
-    try testing.expect(found_suite_1);
-    // Suites 0x0002-0x0007 each contribute one entry.
+    try testing.expect(found_suite);
+    // The other six suites each contribute one entry.
     try testing.expectEqual(@as(usize, 6), skipped_other_suites);
 }
 
-test "welcome.json: each layer's teeth — one flipped byte fails the layer it belongs to and no other" {
+test "welcome.json: each layer's teeth — one flipped byte fails the layer it belongs to and no other (every wired suite)" {
+    inline for (suite.supported) |S| try welcomeTeeth(S);
+}
+
+fn welcomeTeeth(comptime S: type) !void {
     // The point of this test is that a corruption at each of the four
     // stages produces the error NAMED FOR THAT STAGE, so a future
     // divergence can be localized instead of reported as "the vector
@@ -307,12 +316,12 @@ test "welcome.json: each layer's teeth — one flipped byte fails the layer it b
         const obj = entry.object;
         if (asI64(obj.get("cipher_suite").?) != @as(i64, @backingInt(S.id))) continue;
 
-        const e = try loadEntry(arena, obj);
+        const e = try loadEntry(S, arena, obj);
 
         var kp_reader = codec.Reader.init(e.key_package_bytes);
         const kp_msg = try framing.MLSMessage.decode(alloc, &kp_reader);
         defer kp_msg.deinit(alloc);
-        const kp_ref = try keyPackageRef(alloc, kp_msg.key_package);
+        const kp_ref = try keyPackageRef(S, alloc, kp_msg.key_package);
 
         var w_reader = codec.Reader.init(e.welcome_bytes);
         const w_msg = try framing.MLSMessage.decode(alloc, &w_reader);
@@ -327,7 +336,7 @@ test "welcome.json: each layer's teeth — one flipped byte fails the layer it b
             var bad_ref = kp_ref;
             bad_ref[0] ^= 0x01;
             try testing.expect(w.findSecret(&bad_ref) == null);
-            try testing.expectError(error.NoMatchingKeyPackage, tJoin(alloc, .{
+            try testing.expectError(error.NoMatchingKeyPackage, tJoin(S, alloc, .{
                 .welcome = w,
                 .key_package_ref = &bad_ref,
                 .init_key_pair = &e.init_key_pair,

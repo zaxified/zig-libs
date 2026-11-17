@@ -2,17 +2,15 @@
 //! mls.suite — RFC 9420 §5.1/§17.1 Cipher Suites: the named bundle of
 //! (KEM, KDF, AEAD, Hash, Signature) algorithms an MLS session picks once
 //! and uses for every group-key computation. `CipherSuite(...)` is a
-//! comptime type constructor, so the shape would accommodate the other
-//! registered suites (the P-256/P-384/ChaCha20 variants of RFC 9420 §17.1).
-//! Only the mandatory suite `0x0001` is INSTANTIATED, and that is a
-//! deliberate end state, not an unfinished one: nothing in this repo
-//! consumes a ChaCha20 or NIST-curve MLS suite. The `Id` enum below names
-//! them because the registry does, which is a wire-decoding concern, not a
-//! promise to instantiate them. **Do not propose adding an instantiation.**
-//! Standing one up only to have something to rewire would add an untested
-//! crypto path and a maintenance surface with no consumer behind it; the
-//! task is to instantiate a suite when a consumer needs it, and there is no
-//! such consumer.
+//! comptime type constructor; every suite in `supported` is an
+//! instantiation of it, and the rest of the module is generic over the
+//! instantiation (`comptime S: type`). Suite choice is therefore a
+//! compile-time decision of the caller, the way OpenMLS and mls-rs bind a
+//! crypto provider: a `Welcome`/`GroupInfo` naming a different suite than
+//! the one the caller instantiated is refused (`error.CipherSuiteMismatch`)
+//! exactly as before more suites existed. A registry suite missing from
+//! `supported` is not instantiated; the X448/Ed448 pair (`0x0004`/`0x0006`)
+//! cannot be until the sibling `hpke` module provides an X448 KEM.
 //!
 //! `0x0001` = `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`: DHKEM(X25519,
 //! HKDF-SHA256) + HKDF-SHA256 + AES-128-GCM (all three supplied by the
@@ -31,14 +29,11 @@ const hpke = @import("hpke");
 const aesgcm = @import("aesgcm");
 
 /// RFC 9420 §17.1's registry — every suite name IANA has assigned a
-/// `CipherSuite` value to. Only `mls_128_dhkemx25519_aes128gcm_sha256_ed25519`
-/// (`0x0001`, the mandatory-to-implement suite, RFC 9420 §16.1's
-/// MTI requirement) is INSTANTIATED by this module (see
-/// `Mls128X25519Aes128GcmSha256Ed25519` below); the others are named here
-/// only so a `CipherSuiteId` read off the wire prints/compares against its
-/// real registry name, matching the non-exhaustive-enum convention this
-/// repo's other wire-format id types follow (`hpke.suite.KemId`,
-/// `dtls.messages.HandshakeType`).
+/// `CipherSuite` value to. The ones this module instantiates are listed in
+/// `supported`; the others are named here so a `CipherSuiteId` read off
+/// the wire prints/compares against its real registry name, matching the
+/// non-exhaustive-enum convention this repo's other wire-format id types
+/// follow (`hpke.suite.KemId`, `dtls.messages.HandshakeType`).
 pub const CipherSuiteId = enum(u16) {
     mls_128_dhkemx25519_aes128gcm_sha256_ed25519 = 0x0001,
     mls_128_dhkemp256_aes128gcm_sha256_p256 = 0x0002,
@@ -124,8 +119,7 @@ pub fn CipherSuite(
     };
 }
 
-/// RFC 9420 §16.1's mandatory-to-implement suite — the ONLY suite this
-/// Part instantiates. `hpke.X25519Kem` + `aesgcm
+/// RFC 9420 §16.1's mandatory-to-implement suite. `hpke.X25519Kem` + `aesgcm
 /// .Aes128Gcm` + `std.crypto.kdf.hkdf.HkdfSha256` + `std.crypto.hash.sha2
 /// .Sha256` + `std.crypto.sign.Ed25519` reproduce `0x0001`'s five
 /// algorithms exactly (see this file's module doc comment).
@@ -138,9 +132,33 @@ pub const Mls128X25519Aes128GcmSha256Ed25519 = CipherSuite(
     .mls_128_dhkemx25519_aes128gcm_sha256_ed25519,
 );
 
-/// The suite every KAT in this Part drives, and the one a caller with no
-/// suite-negotiation needs of its own should reach for first.
+/// `0x0003` = `MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519`: the
+/// mandatory suite with ChaCha20-Poly1305 in place of AES-128-GCM — the
+/// choice for hosts without AES instructions. The AEAD is the sibling
+/// `chachapoly` module's (re-exported by `hpke` as `hpke.ChaCha20Poly1305`,
+/// byte-exact to std's and differentially anchored there), so the HPKE
+/// seal/open of §5.1.3 and the content/sender-data AEAD of §6.3 run the
+/// same implementation.
+pub const Mls128X25519ChaCha20Poly1305Sha256Ed25519 = CipherSuite(
+    hpke.X25519Kem,
+    hpke.ChaCha20Poly1305,
+    std.crypto.kdf.hkdf.HkdfSha256,
+    std.crypto.hash.sha2.Sha256,
+    std.crypto.sign.Ed25519,
+    .mls_128_dhkemx25519_chacha20poly1305_sha256_ed25519,
+);
+
+/// The suite a caller with no suite-negotiation needs of its own should
+/// reach for first — RFC 9420 §16.1's mandatory-to-implement `0x0001`.
 pub const default = Mls128X25519Aes128GcmSha256Ed25519;
+
+/// Every suite this module instantiates, in registry order. The official
+/// interop vectors are driven once per entry (`kat_*_test.zig`), so adding
+/// a suite here is what puts it under every vector file.
+pub const supported = .{
+    Mls128X25519Aes128GcmSha256Ed25519,
+    Mls128X25519ChaCha20Poly1305Sha256Ed25519,
+};
 
 // ── tests ─────────────────────────────────────────────────────────────
 
@@ -160,6 +178,16 @@ test "default suite: widths match RFC 9420 §17.1's MLS_128_DHKEMX25519_AES128GC
     try testing.expectEqual(@as(usize, 64), default.Nx); // Ed25519: R(32) || S(32)
     try testing.expectEqual(@as(usize, 32), default.Nm); // HMAC-SHA256
     try testing.expectEqual(CipherSuiteId.mls_128_dhkemx25519_aes128gcm_sha256_ed25519, default.id);
+}
+
+test "0x0003: widths match RFC 9420 §17.1's MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519 row" {
+    const S = Mls128X25519ChaCha20Poly1305Sha256Ed25519;
+    try testing.expectEqual(@as(u16, 0x0003), @backingInt(S.id));
+    try testing.expectEqual(@as(usize, 32), S.Nh);
+    try testing.expectEqual(@as(usize, 32), S.Nk); // ChaCha20: 256-bit key
+    try testing.expectEqual(@as(usize, 12), S.Nn);
+    try testing.expectEqual(@as(usize, 16), S.Aead.tag_length);
+    try testing.expectEqual(@as(usize, 32), S.Nm);
 }
 
 test "default suite: hash() is plain SHA-256" {

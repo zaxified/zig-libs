@@ -80,11 +80,13 @@ const handling_commit_json = @embedFile("data/passive-client-handling-commit.jso
 const random_json = @embedFile("data/passive-client-random.json");
 
 const testing = std.testing;
-const S = suite.default;
-const G = group.Group(S);
+
+fn isSuite(comptime S: type, entry: std.json.Value) bool {
+    return entry.object.get("cipher_suite").?.integer == @as(i64, @backingInt(S.id));
+}
 
 /// Test-only by-value view of `epochAuthenticator`'s out-pointer form.
-fn tAuth(g: *const G) [S.Nh]u8 {
+fn tAuth(comptime S: type, g: *const group.Group(S)) [S.Nh]u8 {
     var out: [S.Nh]u8 = undefined;
     g.epochAuthenticator(&out);
     return out;
@@ -137,6 +139,7 @@ fn decodeTree(allocator: std.mem.Allocator, hex: []const u8) !DecodedTree {
 /// `kat_treekem_test.zig`'s helper; duplicated rather than shared because
 /// each KAT file in this module stands alone (see `kat_test.zig`).
 fn buildGroupContext(
+    comptime S: type,
     allocator: std.mem.Allocator,
     group_id: []const u8,
     epoch: u64,
@@ -153,7 +156,7 @@ fn buildGroupContext(
     errdefer allocator.free(buf);
     var w = codec.Writer.init(buf);
     try w.writeU16(1);
-    try w.writeU16(1);
+    try w.writeU16(@backingInt(S.id));
     try w.writeVector(group_id);
     try w.writeU64(epoch);
     try w.writeVector(tree_hash);
@@ -167,13 +170,15 @@ fn buildGroupContext(
 /// content of the committer's NEW `LeafNode`. Nothing anchored in this file
 /// depends on it — see the module doc comment — so it is a fixed dummy, and
 /// the signature key is deterministic so a failure reproduces.
-const dummy_capabilities: tree.Capabilities = .{
-    .versions = &.{1},
-    .cipher_suites = &.{1},
-    .extensions = &.{},
-    .proposals = &.{},
-    .credentials = &.{1},
-};
+fn dummyCapabilities(comptime S: type) tree.Capabilities {
+    return .{
+        .versions = &.{1},
+        .cipher_suites = &.{@backingInt(S.id)},
+        .extensions = &.{},
+        .proposals = &.{},
+        .credentials = &.{1},
+    };
+}
 
 fn freeProcessed(allocator: std.mem.Allocator, p: treekem.ProcessedUpdatePath) void {
     allocator.free(p.commit_secret);
@@ -184,7 +189,11 @@ fn freeProcessed(allocator: std.mem.Allocator, p: treekem.ProcessedUpdatePath) v
 // ── 1 + 2: generation seeded from the vector, sealed for the vector's own
 // receivers ───────────────────────────────────────────────────────────────
 
-test "treekem.json: an UpdatePath GENERATED from the vector's own path_secret[0] reproduces its node public keys, commit_secret and leaf parent_hash byte-exact (GATED)" {
+test "treekem.json: an UpdatePath GENERATED from the vector's own path_secret[0] reproduces its node public keys, commit_secret and leaf parent_hash byte-exact (GATED, every wired suite)" {
+    inline for (suite.supported) |S| try generatedUpdatePaths(S);
+}
+
+fn generatedUpdatePaths(comptime S: type) !void {
     if (!gate.treekem_core_implemented) return error.SkipZigTest;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -202,6 +211,7 @@ test "treekem.json: an UpdatePath GENERATED from the vector's own path_secret[0]
     var total_paths: usize = 0;
 
     for (parsed.value.array.items) |entry| {
+        if (!isSuite(S, entry)) continue;
         const group_id = try hexDecode(testing.allocator, entry.object.get("group_id").?.string);
         defer testing.allocator.free(group_id);
         const epoch = try asU64(entry.object.get("epoch").?);
@@ -223,7 +233,7 @@ test "treekem.json: an UpdatePath GENERATED from the vector's own path_secret[0]
             defer testing.allocator.free(want_commit_secret);
             const tree_hash_after = try hexDecode(testing.allocator, up_entry.object.get("tree_hash_after").?.string);
             defer testing.allocator.free(tree_hash_after);
-            const group_context = try buildGroupContext(testing.allocator, group_id, epoch, tree_hash_after, confirmed);
+            const group_context = try buildGroupContext(S, testing.allocator, group_id, epoch, tree_hash_after, confirmed);
             defer testing.allocator.free(group_context);
             const up_path_secrets = up_entry.object.get("path_secrets").?.array.items;
 
@@ -273,7 +283,7 @@ test "treekem.json: an UpdatePath GENERATED from the vector's own path_secret[0]
                 .path_secret_0 = &path_secret_0,
                 .signature_key = &sig_kp.public_key.toBytes(),
                 .credential = .{ .basic = "kat-committer" },
-                .capabilities = dummy_capabilities,
+                .capabilities = dummyCapabilities(S),
             }, &staged);
 
             // ── ANCHORED. The generated filtered direct path must have the
@@ -364,7 +374,11 @@ test "treekem.json: an UpdatePath GENERATED from the vector's own path_secret[0]
     try testing.expect(anchored_nodes >= 100);
 }
 
-test "treekem.json: a generated UpdatePath is REJECTED when one derived key is corrupted (negative control)" {
+test "treekem.json: a generated UpdatePath is REJECTED when one derived key is corrupted (negative control, every wired suite)" {
+    inline for (suite.supported) |S| try corruptedUpdatePath(S);
+}
+
+fn corruptedUpdatePath(comptime S: type) !void {
     if (!gate.treekem_core_implemented) return error.SkipZigTest;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -377,7 +391,9 @@ test "treekem.json: a generated UpdatePath is REJECTED when one derived key is c
     // only has teeth if a WRONG output would differ — so drive the same
     // generation from a path secret that is one bit off and require every
     // anchored comparison to fail.
-    const entry = parsed.value.array.items[0].object;
+    const entry = (for (parsed.value.array.items) |e| {
+        if (isSuite(S, e)) break e;
+    } else return error.NoEntryForSuite).object;
     const up_entry = entry.get("update_paths").?.array.items[0].object;
     const sender: usize = @intCast(try asU64(up_entry.get("sender").?));
 
@@ -409,7 +425,7 @@ test "treekem.json: a generated UpdatePath is REJECTED when one derived key is c
         .path_secret_0 = &wrong_seed,
         .signature_key = &sig_kp.public_key.toBytes(),
         .credential = .{ .basic = "kat-committer" },
-        .capabilities = dummy_capabilities,
+        .capabilities = dummyCapabilities(S),
     }, &staged);
 
     // The FILTER is a property of the tree, so the shape still matches — it
@@ -430,38 +446,40 @@ test "treekem.json: a generated UpdatePath is REJECTED when one derived key is c
 
 /// A fresh joiner: a `KeyPackage` plus the private halves, all allocated
 /// from `arena`.
-const Newcomer = struct {
-    kp: keypackage.KeyPackage,
-    kp_msg: []u8,
-    init_priv: [S.Kem.Nsk]u8,
-    enc_priv: [S.Kem.Nsk]u8,
+fn Newcomer(comptime S: type) type {
+    return struct {
+        kp: keypackage.KeyPackage,
+        kp_msg: []u8,
+        init_priv: [S.Kem.Nsk]u8,
+        enc_priv: [S.Kem.Nsk]u8,
 
-    fn init(arena: std.mem.Allocator, seed: u8) !Newcomer {
-        const sig = try S.Sig.KeyPair.generateDeterministic(@splat(seed));
-        const init_kp = S.Kem.KeyPair.generateDeterministic(@splat(seed +% 64));
-        const enc_kp = S.Kem.KeyPair.generateDeterministic(@splat(seed +% 128));
-        const kp = try keypackage.create(S, arena, .{
-            .signature_key_pair = &sig,
-            .init_key = init_kp.public_key,
-            .encryption_key = enc_kp.public_key,
-            .credential = .{ .basic = "newcomer" },
-            .capabilities = dummy_capabilities,
-            .lifetime = .{ .not_before = 0, .not_after = std.math.maxInt(u64) },
-        });
-        const msg: framing.MLSMessage = .{ .key_package = kp };
-        return .{
-            .kp = kp,
-            .kp_msg = try msg.encodeAlloc(arena),
-            .init_priv = init_kp.secret_key,
-            .enc_priv = enc_kp.secret_key,
-        };
-    }
-};
+        fn init(arena: std.mem.Allocator, seed: u8) !@This() {
+            const sig = try S.Sig.KeyPair.generateDeterministic(@splat(seed));
+            const init_kp = S.Kem.KeyPair.generateDeterministic(@splat(seed +% 64));
+            const enc_kp = S.Kem.KeyPair.generateDeterministic(@splat(seed +% 128));
+            const kp = try keypackage.create(S, arena, .{
+                .signature_key_pair = &sig,
+                .init_key = init_kp.public_key,
+                .encryption_key = enc_kp.public_key,
+                .credential = .{ .basic = "newcomer" },
+                .capabilities = dummyCapabilities(S),
+                .lifetime = .{ .not_before = 0, .not_after = std.math.maxInt(u64) },
+            });
+            const msg: framing.MLSMessage = .{ .key_package = kp };
+            return .{
+                .kp = kp,
+                .kp_msg = try msg.encodeAlloc(arena),
+                .init_priv = init_kp.secret_key,
+                .enc_priv = enc_kp.secret_key,
+            };
+        }
+    };
+}
 
 /// Replay one recorded session exactly as `kat_passive_test.zig` does, then
 /// hand back the live group and the signing key the recorded client owns.
-fn replay(gpa: std.mem.Allocator, sa: std.mem.Allocator, obj: std.json.ObjectMap) !struct {
-    g: G,
+fn replay(comptime S: type, gpa: std.mem.Allocator, sa: std.mem.Allocator, obj: std.json.ObjectMap) !struct {
+    g: group.Group(S),
     sig: S.Sig.KeyPair,
     psks: []const group.ExternalPsk,
 } {
@@ -484,6 +502,7 @@ fn replay(gpa: std.mem.Allocator, sa: std.mem.Allocator, obj: std.json.ObjectMap
         });
     }
 
+    const G = group.Group(S);
     var g: G = undefined;
     try G.fromWelcome(gpa, .{
         .welcome_msg = welcome_msg,
@@ -514,7 +533,7 @@ fn replay(gpa: std.mem.Allocator, sa: std.mem.Allocator, obj: std.json.ObjectMap
     const epochs = obj.get("epochs").?.array.items;
     if (epochs.len > 0) {
         const want = try hexDecode(sa, epochs[epochs.len - 1].object.get("epoch_authenticator").?.string);
-        try testing.expectEqualSlices(u8, want, &tAuth(&g));
+        try testing.expectEqualSlices(u8, want, &tAuth(S, &g));
     }
     return .{ .g = g, .sig = try S.Sig.KeyPair.generateDeterministic(signature_priv), .psks = psks.items };
 }
@@ -523,7 +542,7 @@ fn replay(gpa: std.mem.Allocator, sa: std.mem.Allocator, obj: std.json.ObjectMap
 /// member, and require the joiner to derive the committer's epoch. Returns
 /// the replayed state's tree size (before the Commit), so a caller that
 /// wants to assert on the tree does not have to replay the session again.
-fn commitFromReplayedState(gpa: std.mem.Allocator, obj: std.json.ObjectMap, seed: u8) !usize {
+fn commitFromReplayedState(comptime S: type, gpa: std.mem.Allocator, obj: std.json.ObjectMap, seed: u8) !usize {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -532,13 +551,14 @@ fn commitFromReplayedState(gpa: std.mem.Allocator, obj: std.json.ObjectMap, seed
     defer scratch.deinit();
     const sa = scratch.allocator();
 
-    const replayed = try replay(gpa, sa, obj);
+    const G = group.Group(S);
+    const replayed = try replay(S, gpa, sa, obj);
     var g = replayed.g;
     defer g.deinit();
 
     const before_epoch = g.epoch;
     const before_size = g.treeSize();
-    const newcomer = try Newcomer.init(sa, seed);
+    const newcomer = try Newcomer(S).init(sa, seed);
 
     const created = try g.createCommit(gpa, .{
         .io = io,
@@ -568,7 +588,7 @@ fn commitFromReplayedState(gpa: std.mem.Allocator, obj: std.json.ObjectMap, seed
     // authenticator is the derived value that ties it all together.
     try testing.expectEqual(g.epoch, joined.epoch);
     try testing.expectEqualSlices(u8, &g.tree_hash, &joined.tree_hash);
-    try testing.expectEqualSlices(u8, &tAuth(&g), &tAuth(&joined));
+    try testing.expectEqualSlices(u8, &tAuth(S, &g), &tAuth(S, &joined));
 
     // Two more epochs, one from each side. This is where the joiner's
     // PRIVATE state gets exercised rather than merely constructed: the
@@ -585,7 +605,7 @@ fn commitFromReplayedState(gpa: std.mem.Allocator, obj: std.json.ObjectMap, seed
         });
         defer c2.deinit(gpa);
         try joined.processCommit(.{ .commit_msg = c2.commit, .external_psks = replayed.psks });
-        try testing.expectEqualSlices(u8, &tAuth(&g), &tAuth(&joined));
+        try testing.expectEqualSlices(u8, &tAuth(S, &g), &tAuth(S, &joined));
     }
     {
         const c3_sig = try S.Sig.KeyPair.generateDeterministic(@splat(seed));
@@ -596,24 +616,29 @@ fn commitFromReplayedState(gpa: std.mem.Allocator, obj: std.json.ObjectMap, seed
         });
         defer c3.deinit(gpa);
         try g.processCommit(.{ .commit_msg = c3.commit, .external_psks = replayed.psks });
-        try testing.expectEqualSlices(u8, &tAuth(&g), &tAuth(&joined));
+        try testing.expectEqualSlices(u8, &tAuth(S, &g), &tAuth(S, &joined));
     }
     return before_size;
 }
 
-test "passive-client-handling-commit.json: commit from each replayed session's final state and land a new member in the same epoch" {
+test "passive-client-handling-commit.json: commit from each replayed session's final state and land a new member in the same epoch (every wired suite)" {
+    inline for (suite.supported) |S| try commitFromHandlingCommit(S);
+}
+
+fn commitFromHandlingCommit(comptime S: type) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, handling_commit_json, .{});
     defer parsed.deinit();
 
     var runs: usize = 0;
     for (parsed.value.array.items, 0..) |entry, i| {
-        _ = commitFromReplayedState(testing.allocator, entry.object, @intCast(0x30 + i)) catch |err| {
+        if (!isSuite(S, entry)) continue;
+        _ = commitFromReplayedState(S, testing.allocator, entry.object, @intCast(0x30 + i)) catch |err| {
             std.debug.print("commit-from-replay [handling-commit] entry {d}: {s}\n", .{ i, @errorName(err) });
             return err;
         };
         runs += 1;
     }
-    try testing.expect(runs > 0);
+    try testing.expectEqual(@as(usize, 13), runs); // 13 recorded sessions per suite
 }
 
 test "passive-client-random.json: commit from the 200-Commit session's final state — a real 100-plus-leaf tree, not a synthetic one" {
@@ -631,6 +656,6 @@ test "passive-client-random.json: commit from the 200-Commit session's final sta
     // The tree size comes back from the same replay the Commit runs on. It
     // used to come from a separate replay of all 200 Commits first -- the
     // same state computed twice, half of this test's ~30 s in Debug.
-    const g_before = try commitFromReplayedState(testing.allocator, items[0].object, 0x91);
+    const g_before = try commitFromReplayedState(suite.default, testing.allocator, items[0].object, 0x91);
     try testing.expect(g_before >= 16);
 }

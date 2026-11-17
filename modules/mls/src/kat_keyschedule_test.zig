@@ -37,7 +37,6 @@ const key_schedule_json = @embedFile("data/key-schedule.json");
 const psk_secret_json = @embedFile("data/psk_secret.json");
 
 const testing = std.testing;
-const S = suite.default;
 
 fn hexDecode(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, hex.len / 2);
@@ -46,7 +45,7 @@ fn hexDecode(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
 }
 
 /// A vector field that must be exactly one KDF output wide.
-fn hexSecret(hex: []const u8) ![S.Nh]u8 {
+fn hexSecret(comptime S: type, hex: []const u8) ![S.Nh]u8 {
     var out: [S.Nh]u8 = undefined;
     const decoded = try std.fmt.hexToBytes(&out, hex);
     try testing.expectEqual(@as(usize, S.Nh), decoded.len);
@@ -69,12 +68,16 @@ fn expectStage(name: []const u8, want: []const u8, got: []const u8) !void {
     };
 }
 
-test "key-schedule.json: RFC 9420 §8's full epoch chain for cipher suite 0x0001, byte-exact" {
+test "key-schedule.json: RFC 9420 §8's full epoch chain for every wired cipher suite, byte-exact" {
+    inline for (suite.supported) |S| try keySchedule(S);
+}
+
+fn keySchedule(comptime S: type) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, key_schedule_json, .{});
     defer parsed.deinit();
     const arena = parsed.arena.allocator();
 
-    var found_suite_1 = false;
+    var found_suite = false;
     var skipped_other_suites: usize = 0;
     var checked_epochs: usize = 0;
 
@@ -82,9 +85,9 @@ test "key-schedule.json: RFC 9420 §8's full epoch chain for cipher suite 0x0001
         const cs = asI64(entry.object.get("cipher_suite").?);
         if (cs != @as(i64, @backingInt(S.id))) {
             skipped_other_suites += 1;
-            continue; // this module only wires suite 0x0001 — see suite.zig
+            continue; // driven by its own instantiation
         }
-        found_suite_1 = true;
+        found_suite = true;
 
         const group_id = try hexDecode(arena, entry.object.get("group_id").?.string);
 
@@ -92,7 +95,7 @@ test "key-schedule.json: RFC 9420 §8's full epoch chain for cipher suite 0x0001
         // the epoch before it, so a single wrong step poisons the rest —
         // which is exactly the property that makes this vector worth
         // driving as a CHAIN rather than as five independent cases.
-        var init_secret_prev = try hexSecret(entry.object.get("initial_init_secret").?.string);
+        var init_secret_prev = try hexSecret(S, entry.object.get("initial_init_secret").?.string);
 
         for (entry.object.get("epochs").?.array.items, 0..) |epoch_v, epoch_index| {
             const ep = epoch_v.object;
@@ -100,8 +103,8 @@ test "key-schedule.json: RFC 9420 §8's full epoch chain for cipher suite 0x0001
             // ── inputs the generator chose ──
             const tree_hash = try hexDecode(arena, ep.get("tree_hash").?.string);
             const cth = try hexDecode(arena, ep.get("confirmed_transcript_hash").?.string);
-            const commit_secret = try hexSecret(ep.get("commit_secret").?.string);
-            const psk_secret = try hexSecret(ep.get("psk_secret").?.string);
+            const commit_secret = try hexSecret(S, ep.get("commit_secret").?.string);
+            const psk_secret = try hexSecret(S, ep.get("psk_secret").?.string);
 
             // ── §8.1: GroupContext serialization ──
             const gc: keyschedule.GroupContext = .{
@@ -194,19 +197,23 @@ test "key-schedule.json: RFC 9420 §8's full epoch chain for cipher suite 0x0001
         }
     }
 
-    try testing.expect(found_suite_1);
+    try testing.expect(found_suite);
     try testing.expect(checked_epochs >= 5);
-    // Suites 0x0002-0x0007 are present in the file and intentionally
-    // skipped — this module only wires the mandatory suite.
+    // All seven registry suites are in the file; this instantiation skips
+    // the other six.
     try testing.expectEqual(@as(usize, 6), skipped_other_suites);
 }
 
-test "psk_secret.json: RFC 9420 §8.4's psk_secret chain for 0..10 PSKs, byte-exact" {
+test "psk_secret.json: RFC 9420 §8.4's psk_secret chain for 0..10 PSKs, every wired suite, byte-exact" {
+    inline for (suite.supported) |S| try pskSecretChain(S);
+}
+
+fn pskSecretChain(comptime S: type) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, psk_secret_json, .{});
     defer parsed.deinit();
     const arena = parsed.arena.allocator();
 
-    var found_suite_1 = false;
+    var found_suite = false;
     var checked_cases: usize = 0;
     var max_psks: usize = 0;
     var saw_empty = false;
@@ -214,7 +221,7 @@ test "psk_secret.json: RFC 9420 §8.4's psk_secret chain for 0..10 PSKs, byte-ex
     for (parsed.value.array.items) |entry| {
         const cs = asI64(entry.object.get("cipher_suite").?);
         if (cs != @as(i64, @backingInt(S.id))) continue;
-        found_suite_1 = true;
+        found_suite = true;
 
         const psks_json = entry.object.get("psks").?.array.items;
         const psks = try arena.alloc(keyschedule.PreSharedKey(S), psks_json.len);
@@ -241,7 +248,7 @@ test "psk_secret.json: RFC 9420 §8.4's psk_secret chain for 0..10 PSKs, byte-ex
         checked_cases += 1;
     }
 
-    try testing.expect(found_suite_1);
+    try testing.expect(found_suite);
     // The empty case pins §8.4's "the resulting psk_secret is
     // psk_secret_[0], the all-zero vector", and a double-digit chain pins
     // that PSKLabel.index/count really do advance per element.

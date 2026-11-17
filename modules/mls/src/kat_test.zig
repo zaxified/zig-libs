@@ -82,13 +82,16 @@ test "tree-math.json: root/left/right/parent/sibling for every n_leaves x every 
     try testing.expect(checked_cases >= 2000);
 }
 
-test "crypto-basics.json: cipher suite 0x0001 (MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519), byte-exact" {
+test "crypto-basics.json: every wired cipher suite, byte-exact" {
+    inline for (suite.supported) |S| try cryptoBasics(S);
+}
+
+fn cryptoBasics(comptime S: type) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, crypto_basics_json, .{});
     defer parsed.deinit();
     const arena = parsed.arena.allocator();
 
-    const S = suite.default;
-    var found_suite_1 = false;
+    var found_suite = false;
     var skipped_other_suites: usize = 0;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -99,9 +102,9 @@ test "crypto-basics.json: cipher suite 0x0001 (MLS_128_DHKEMX25519_AES128GCM_SHA
         const cs = asI64(entry.object.get("cipher_suite").?);
         if (cs != @as(i64, @backingInt(S.id))) {
             skipped_other_suites += 1;
-            continue; // this Part only wires suite 0x0001 — see suite.zig
+            continue; // driven by its own `cryptoBasics(S)` instantiation
         }
-        found_suite_1 = true;
+        found_suite = true;
 
         // ── ref_hash (RFC 9420 §5.2) ──
         {
@@ -199,11 +202,14 @@ test "crypto-basics.json: cipher suite 0x0001 (MLS_128_DHKEMX25519_AES128GCM_SHA
             const ciphertext = try hexDecode(arena, ew.get("ciphertext").?.string);
             const want_plaintext = try hexDecode(arena, ew.get("plaintext").?.string);
 
-            var skR: hpke.X25519Kem.KeyPair = undefined;
-            @memcpy(&skR.secret_key, priv_bytes[0..32]);
-            @memcpy(&skR.public_key, pub_bytes[0..32]);
-            var enc: hpke.X25519Kem.EncappedKey = undefined;
-            @memcpy(&enc, kem_output[0..32]);
+            var skR: S.Kem.KeyPair = undefined;
+            try testing.expectEqual(@as(usize, S.Kem.Nsk), priv_bytes.len);
+            try testing.expectEqual(@as(usize, S.Kem.Npk), pub_bytes.len);
+            try testing.expectEqual(@as(usize, S.Kem.Npk), kem_output.len);
+            @memcpy(&skR.secret_key, priv_bytes);
+            @memcpy(&skR.public_key, pub_bytes);
+            var enc: S.Kem.EncappedKey = undefined;
+            @memcpy(&enc, kem_output);
 
             // HPKE seal is RANDOMIZED, but the vector already gives us a
             // fixed `kem_output`/`ciphertext` pair: decrypt it and check
@@ -224,9 +230,8 @@ test "crypto-basics.json: cipher suite 0x0001 (MLS_128_DHKEMX25519_AES128GCM_SHA
         }
     }
 
-    try testing.expect(found_suite_1);
-    // Suites 0x0002-0x0007 are present in the file and intentionally
-    // skipped — this Part only wires the mandatory suite (see
-    // suite.zig's module doc comment + SPEC.md's arc breakdown).
+    try testing.expect(found_suite);
+    // All seven registry suites are in the file; every entry but this
+    // suite's own is skipped by this instantiation.
     try testing.expectEqual(@as(usize, 6), skipped_other_suites);
 }

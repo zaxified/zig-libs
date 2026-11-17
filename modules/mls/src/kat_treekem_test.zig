@@ -42,7 +42,13 @@ const tree_operations_json = @embedFile("data/tree-operations.json");
 const treekem_json = @embedFile("data/treekem.json");
 
 const testing = std.testing;
-const S = suite.default;
+
+/// Whether a vector entry belongs to suite `S`. The embedded
+/// `tree-validation.json`/`treekem.json` hold the entries of every suite
+/// this module wires (see `NOTICE`); each instantiation drives its own.
+fn isSuite(comptime S: type, entry: std.json.Value) bool {
+    return asI64(entry.object.get("cipher_suite").?) == @as(i64, @backingInt(S.id));
+}
 
 fn hexDecode(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, hex.len / 2);
@@ -87,12 +93,17 @@ fn decodeTree(allocator: std.mem.Allocator, hex: []const u8) !DecodedTree {
 
 // ── tree-validation.json: tree hash (REAL) ───────────────────────────────
 
-test "tree-validation.json: tree hash of every node index is byte-exact (ungated — treehash.zig is real)" {
+test "tree-validation.json: tree hash of every node index is byte-exact (ungated — treehash.zig is real) (every wired suite)" {
+    inline for (suite.supported) |S| try treeHashes(S);
+}
+
+fn treeHashes(comptime S: type) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tree_validation_json, .{});
     defer parsed.deinit();
 
     var checked: usize = 0;
     for (parsed.value.array.items) |entry| {
+        if (!isSuite(S, entry)) continue;
         var dt = try decodeTree(testing.allocator, entry.object.get("tree").?.string);
         defer dt.deinit(testing.allocator);
 
@@ -108,19 +119,24 @@ test "tree-validation.json: tree hash of every node index is byte-exact (ungated
             checked += 1;
         }
     }
-    // 14 suite-0x0001 trees, 3..127 nodes each (see NOTICE) — sanity that
-    // this ran over real ground, not a vacuously-empty vector list.
-    try testing.expect(checked >= 300);
+    // 14 trees per suite, 3..127 nodes each, 454 node hashes (see NOTICE) —
+    // sanity that this ran over real ground, not a vacuously-empty list.
+    try testing.expectEqual(@as(usize, 454), checked);
 }
 
 // ── tree-validation.json: leaf signatures (REAL) ─────────────────────────
 
-test "tree-validation.json: every leaf's signature verifies against the vector's group_id (ungated)" {
+test "tree-validation.json: every leaf's signature verifies against the vector's group_id (ungated) (every wired suite)" {
+    inline for (suite.supported) |S| try leafSignatures(S);
+}
+
+fn leafSignatures(comptime S: type) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tree_validation_json, .{});
     defer parsed.deinit();
 
     var checked: usize = 0;
     for (parsed.value.array.items) |entry| {
+        if (!isSuite(S, entry)) continue;
         var dt = try decodeTree(testing.allocator, entry.object.get("tree").?.string);
         defer dt.deinit(testing.allocator);
         const group_id = try hexDecode(testing.allocator, entry.object.get("group_id").?.string);
@@ -137,13 +153,19 @@ test "tree-validation.json: every leaf's signature verifies against the vector's
             checked += 1;
         }
     }
-    try testing.expect(checked >= 150); // 161 leaves total across the 14 suite-0x0001 trees
+    try testing.expectEqual(@as(usize, 161), checked); // 161 leaves across each suite's 14 trees
 }
 
-test "tree-validation.json: a tampered LeafNode (TBS content) fails signature verification (ungated, negative control)" {
+test "tree-validation.json: a tampered LeafNode (TBS content) fails signature verification (ungated, negative control) (every wired suite)" {
+    inline for (suite.supported) |S| try tamperedLeaf(S);
+}
+
+fn tamperedLeaf(comptime S: type) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tree_validation_json, .{});
     defer parsed.deinit();
-    const entry = parsed.value.array.items[0];
+    const entry = for (parsed.value.array.items) |e| {
+        if (isSuite(S, e)) break e;
+    } else return error.NoEntryForSuite;
 
     var dt = try decodeTree(testing.allocator, entry.object.get("tree").?.string);
     defer dt.deinit(testing.allocator);
@@ -175,13 +197,18 @@ test "tree-validation.json: a tampered LeafNode (TBS content) fails signature ve
 
 // ── tree-validation.json: resolution / parent-hash chain (GATED) ────────
 
-test "tree-validation.json: resolution(tree, i) matches for every node (GATED — resolution is a Fable core)" {
+test "tree-validation.json: resolution(tree, i) matches for every node (GATED — resolution is a Fable core) (every wired suite)" {
+    inline for (suite.supported) |S| try resolutionsKat(S);
+}
+
+fn resolutionsKat(comptime S: type) !void {
     if (!gate.treekem_core_implemented) return error.SkipZigTest;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tree_validation_json, .{});
     defer parsed.deinit();
 
     for (parsed.value.array.items) |entry| {
+        if (!isSuite(S, entry)) continue;
         var dt = try decodeTree(testing.allocator, entry.object.get("tree").?.string);
         defer dt.deinit(testing.allocator);
         const resolutions = entry.object.get("resolutions").?.array.items;
@@ -197,7 +224,11 @@ test "tree-validation.json: resolution(tree, i) matches for every node (GATED �
     }
 }
 
-test "tree-validation.json: validateParentHashes accepts all well-formed trees and rejects EVERY single-byte parent_hash tamper (GATED)" {
+test "tree-validation.json: validateParentHashes accepts all well-formed trees and rejects EVERY single-byte parent_hash tamper (GATED) (every wired suite)" {
+    inline for (suite.supported) |S| try parentHashes(S);
+}
+
+fn parentHashes(comptime S: type) !void {
     if (!gate.treekem_core_implemented) return error.SkipZigTest;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tree_validation_json, .{});
@@ -206,6 +237,7 @@ test "tree-validation.json: validateParentHashes accepts all well-formed trees a
     var trees_accepted: usize = 0;
     var tampers_rejected: usize = 0;
     for (parsed.value.array.items) |entry| {
+        if (!isSuite(S, entry)) continue;
         var dt = try decodeTree(testing.allocator, entry.object.get("tree").?.string);
         defer dt.deinit(testing.allocator);
 
@@ -259,7 +291,7 @@ test "tree-validation.json: validateParentHashes accepts all well-formed trees a
         // again (proves the restore path, not just the tamper path).
         try treekem.validateParentHashes(S, testing.allocator, &dt.tree);
     }
-    try testing.expectEqual(@as(usize, 14), trees_accepted); // 14 suite-0x0001 trees (see NOTICE)
+    try testing.expectEqual(@as(usize, 14), trees_accepted); // 14 trees per suite (see NOTICE)
     // One tamper per parent_hash the §7.9.2 chain covers across all 14
     // trees: every non-blank, non-root ParentNode plus every commit-source
     // LeafNode — every one must be REJECTED (a superset of the 145 the
@@ -300,6 +332,8 @@ fn applyProposal(allocator: std.mem.Allocator, t: *tree.RatchetTree, proposal_by
 }
 
 test "tree-operations.json: applying add/update/remove reproduces tree_after byte-exact (ungated — mechanical tree editing, not a Fable core)" {
+    // Upstream publishes this file for suite 0x0001 only.
+    const S = suite.default;
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, tree_operations_json, .{});
     defer parsed.deinit();
 
@@ -357,7 +391,7 @@ fn asU64(v: std.json.Value) !u64 {
 /// ```
 /// struct {
 ///     ProtocolVersion version = mls10;   // uint16 1
-///     CipherSuite cipher_suite;          // uint16 1 (0x0001)
+///     CipherSuite cipher_suite;          // uint16, S.id
 ///     opaque group_id<V>;
 ///     uint64 epoch;
 ///     opaque tree_hash<V>;               // = tree_hash_after
@@ -366,6 +400,7 @@ fn asU64(v: std.json.Value) !u64 {
 /// } GroupContext;
 /// ```
 fn buildGroupContext(
+    comptime S: type,
     allocator: std.mem.Allocator,
     group_id: []const u8,
     epoch: u64,
@@ -382,7 +417,7 @@ fn buildGroupContext(
     errdefer allocator.free(buf);
     var w = codec.Writer.init(buf);
     try w.writeU16(1); // ProtocolVersion mls10
-    try w.writeU16(1); // CipherSuite 0x0001
+    try w.writeU16(@backingInt(S.id)); // CipherSuite
     try w.writeVector(group_id);
     try w.writeU64(epoch);
     try w.writeVector(tree_hash);
@@ -398,7 +433,11 @@ fn freeProcessed(allocator: std.mem.Allocator, p: treekem.ProcessedUpdatePath) v
     allocator.free(p.derived_path_secrets);
 }
 
-test "treekem.json: processUpdatePath yields byte-exact commit_secret + first path_secret for every receiver view under the provisional GroupContext; UpdatePath round-trips byte-exact (GATED — processUpdatePath is a Fable core)" {
+test "treekem.json: processUpdatePath yields byte-exact commit_secret + first path_secret for every receiver view under the provisional GroupContext; UpdatePath round-trips byte-exact (GATED — processUpdatePath is a Fable core) (every wired suite)" {
+    inline for (suite.supported) |S| try processUpdatePaths(S);
+}
+
+fn processUpdatePaths(comptime S: type) !void {
     if (!gate.treekem_core_implemented) return error.SkipZigTest;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, treekem_json, .{});
@@ -407,6 +446,7 @@ test "treekem.json: processUpdatePath yields byte-exact commit_secret + first pa
     var checked_paths: usize = 0;
     var checked_receivers: usize = 0;
     for (parsed.value.array.items) |entry| {
+        if (!isSuite(S, entry)) continue;
         var dt = try decodeTree(testing.allocator, entry.object.get("ratchet_tree").?.string);
         defer dt.deinit(testing.allocator);
 
@@ -443,7 +483,7 @@ test "treekem.json: processUpdatePath yields byte-exact commit_secret + first pa
             // tree_hash_after (the tree hash after it is applied).
             const tree_hash_after = try hexDecode(testing.allocator, up_entry.object.get("tree_hash_after").?.string);
             defer testing.allocator.free(tree_hash_after);
-            const group_context = try buildGroupContext(testing.allocator, group_id, epoch, tree_hash_after, confirmed);
+            const group_context = try buildGroupContext(S, testing.allocator, group_id, epoch, tree_hash_after, confirmed);
             defer testing.allocator.free(group_context);
 
             // path_secrets[] is indexed by leaf: null for the sender, else
@@ -506,11 +546,15 @@ test "treekem.json: processUpdatePath yields byte-exact commit_secret + first pa
             checked_paths += 1;
         }
     }
-    try testing.expectEqual(@as(usize, 62), checked_paths); // 62 update paths across 11 suite-0x0001 entries
+    try testing.expectEqual(@as(usize, 62), checked_paths); // 62 update paths across each suite's 11 entries
     try testing.expectEqual(@as(usize, 328), checked_receivers); // 328 receiver views total
 }
 
-test "treekem.json: applyUpdatePath merges each UpdatePath into the public tree and reproduces tree_hash_after byte-exact (GATED — applyUpdatePath is a Fable core)" {
+test "treekem.json: applyUpdatePath merges each UpdatePath into the public tree and reproduces tree_hash_after byte-exact (GATED — applyUpdatePath is a Fable core) (every wired suite)" {
+    inline for (suite.supported) |S| try applyUpdatePaths(S);
+}
+
+fn applyUpdatePaths(comptime S: type) !void {
     if (!gate.treekem_core_implemented) return error.SkipZigTest;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, treekem_json, .{});
@@ -519,6 +563,7 @@ test "treekem.json: applyUpdatePath merges each UpdatePath into the public tree 
     var checked: usize = 0;
     var tampered: usize = 0;
     for (parsed.value.array.items) |entry| {
+        if (!isSuite(S, entry)) continue;
         const ratchet_tree_hex = entry.object.get("ratchet_tree").?.string;
         const update_paths = entry.object.get("update_paths").?.array.items;
 

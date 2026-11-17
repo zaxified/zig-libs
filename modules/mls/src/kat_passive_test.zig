@@ -57,8 +57,6 @@ const handling_commit_json = @embedFile("data/passive-client-handling-commit.jso
 const random_json = @embedFile("data/passive-client-random.json");
 
 const testing = std.testing;
-const S = suite.default;
-const G = group.Group(S);
 
 fn hexDecode(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, hex.len / 2);
@@ -95,10 +93,12 @@ fn expectAuthenticator(
 /// check the initial authenticator, then replay every recorded epoch.
 /// Returns the number of Commits replayed.
 fn runEntry(
+    comptime S: type,
     vector: []const u8,
     entry_index: usize,
     obj: std.json.ObjectMap,
 ) !usize {
+    const G = group.Group(S);
     const alloc = testing.allocator;
 
     var scratch = std.heap.ArenaAllocator.init(alloc);
@@ -201,45 +201,71 @@ fn runEntry(
     return replayed;
 }
 
-/// Every entry in an embedded file is already suite `0x0001` — the filter
-/// is applied before embedding, not here (see `NOTICE`). This asserts that,
-/// so a re-filter that let another suite through fails loudly rather than
-/// silently skipping the entries this module cannot drive.
-fn expectOnlySuite1(items: []const std.json.Value) !void {
-    for (items) |e| {
-        try testing.expectEqual(@as(i64, @backingInt(S.id)), e.object.get("cipher_suite").?.integer);
+/// The embedded files hold only the suites this module wires — the filter
+/// is applied before embedding (see `NOTICE`). This asserts that, so a
+/// re-filter that let an unwired suite through fails loudly rather than
+/// silently skipping entries nothing drives.
+fn expectOnlyWiredSuites(items: []const std.json.Value) !void {
+    outer: for (items) |e| {
+        const cs = e.object.get("cipher_suite").?.integer;
+        inline for (suite.supported) |S| {
+            if (cs == @as(i64, @backingInt(S.id))) continue :outer;
+        }
+        return error.UnwiredSuiteEmbedded;
     }
 }
 
-test "passive-client-welcome.json: join a recorded group and match its epoch_authenticator" {
+fn isSuite(comptime S: type, entry: std.json.Value) bool {
+    return entry.object.get("cipher_suite").?.integer == @as(i64, @backingInt(S.id));
+}
+
+test "passive-client-welcome.json: join a recorded group and match its epoch_authenticator (every wired suite)" {
+    inline for (suite.supported) |S| try passiveWelcome(S);
+}
+
+fn passiveWelcome(comptime S: type) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, welcome_json, .{});
     defer parsed.deinit();
     const items = parsed.value.array.items;
-    try expectOnlySuite1(items);
+    try expectOnlyWiredSuites(items);
 
+    var entries: usize = 0;
     for (items, 0..) |entry, i| {
-        const replayed = try runEntry("welcome", i, entry.object);
+        if (!isSuite(S, entry)) continue;
+        entries += 1;
+        const replayed = try runEntry(S, "welcome", i, entry.object);
         // This vector records the join and nothing after it — see the
         // coverage test below, which pins that as a property rather than
         // leaving it as an accident of the data.
         try testing.expectEqual(@as(usize, 0), replayed);
     }
+    // Upstream records 8 joins per suite.
+    try testing.expectEqual(@as(usize, 8), entries);
 }
 
-test "passive-client-handling-commit.json: replay each recorded session Commit by Commit" {
+test "passive-client-handling-commit.json: replay each recorded session Commit by Commit (every wired suite)" {
+    inline for (suite.supported) |S| try passiveHandlingCommit(S);
+}
+
+fn passiveHandlingCommit(comptime S: type) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, handling_commit_json, .{});
     defer parsed.deinit();
     const items = parsed.value.array.items;
-    try expectOnlySuite1(items);
+    try expectOnlyWiredSuites(items);
 
     var total: usize = 0;
+    var entries: usize = 0;
     for (items, 0..) |entry, i| {
-        total += try runEntry("handling-commit", i, entry.object);
+        if (!isSuite(S, entry)) continue;
+        entries += 1;
+        total += try runEntry(S, "handling-commit", i, entry.object);
     }
+    // Upstream records 13 sessions per suite.
+    try testing.expectEqual(@as(usize, 13), entries);
     // Every entry contributed at least one replayed Commit; a vector that
     // silently degenerated to a join-only file would otherwise pass this
     // test while proving nothing about commit processing.
-    try testing.expect(total >= items.len);
+    try testing.expect(total >= entries);
 }
 
 // ── the reduction's coverage properties ───────────────────────────────────
@@ -345,16 +371,18 @@ fn expectPublicMessage(hex: []const u8) !void {
 // ── the endurance vector ──────────────────────────────────────────────────
 
 test "passive-client-random.json: replay a 200-Commit recorded session end to end" {
+    // Upstream records this session for suite 0x0001 only.
+    const S = suite.default;
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, random_json, .{});
     defer parsed.deinit();
     const items = parsed.value.array.items;
-    try expectOnlySuite1(items);
+    try testing.expectEqual(@as(i64, @backingInt(S.id)), items[0].object.get("cipher_suite").?.integer);
     // Upstream ships this as a single recorded session; if that ever
     // changes, the per-entry loop below still works but the "one long
     // chain" property this vector exists for would not, so pin it.
     try testing.expectEqual(@as(usize, 1), items.len);
 
-    const replayed = try runEntry("random", 0, items[0].object);
+    const replayed = try runEntry(S, "random", 0, items[0].object);
     // The whole value of this vector is the LENGTH of the chain: each
     // Commit is an independent chance for a systematic error to surface,
     // and a truncated file would still pass every other assertion here.

@@ -480,13 +480,17 @@ fn hpkeSuiteId(comptime S: type) [10]u8 {
         @backingInt(hpke.AeadId.aes128gcm)
     else if (S.Aead == aesgcm.Aes256Gcm or S.Aead == std.crypto.aead.aes_gcm.Aes256Gcm)
         @backingInt(hpke.AeadId.aes256gcm)
-    else if (S.Aead == std.crypto.aead.chacha_poly.ChaCha20Poly1305)
+    else if (S.Aead == hpke.ChaCha20Poly1305 or S.Aead == std.crypto.aead.chacha_poly.ChaCha20Poly1305)
         @backingInt(hpke.AeadId.chacha20poly1305)
     else
         @compileError("mls: no RFC 9180 aead_id registered for " ++ @typeName(S.Aead));
+    // The KDF half comes from `hpke.kdf.Of(S.Nh)` — the SAME `Nh` dispatch
+    // `hpke.sealBase`/`setupBaseS` use to pick the HKDF they actually run
+    // (32 -> HKDF-SHA256, 48 -> HKDF-SHA384, 64 -> HKDF-SHA512), so the
+    // exported suite_id cannot name a KDF the context was not built with.
     return hpke.suite.suiteId(
         S.Kem.kem_id,
-        @backingInt(hpke.KdfId.hkdf_sha256),
+        hpke.kdf.Of(S.Nh).kdf_id,
         aead_id,
     );
 }

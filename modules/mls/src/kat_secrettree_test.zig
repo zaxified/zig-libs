@@ -33,7 +33,6 @@ const secrettree = @import("secrettree.zig");
 const secret_tree_json = @embedFile("data/secret-tree.json");
 
 const testing = std.testing;
-const S = suite.default;
 
 /// The vector's largest leaf generation is 15; a window that can hold every
 /// generation of the largest case is what lets the reverse-order pass be a
@@ -46,7 +45,7 @@ fn hexDecode(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     return out;
 }
 
-fn hexSecret(hex: []const u8) ![S.Nh]u8 {
+fn hexSecret(comptime S: type, hex: []const u8) ![S.Nh]u8 {
     var out: [S.Nh]u8 = undefined;
     const decoded = try std.fmt.hexToBytes(&out, hex);
     try testing.expectEqual(@as(usize, S.Nh), decoded.len);
@@ -70,12 +69,16 @@ fn expectStage(name: []const u8, leaf: usize, generation: u32, want: []const u8,
     };
 }
 
-test "secret-tree.json: RFC 9420 §9's tree, ratchets and §6.3.2 sender data for suite 0x0001, byte-exact" {
+test "secret-tree.json: RFC 9420 §9's tree, ratchets and §6.3.2 sender data for every wired suite, byte-exact" {
+    inline for (suite.supported) |S| try secretTree(S);
+}
+
+fn secretTree(comptime S: type) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, secret_tree_json, .{});
     defer parsed.deinit();
     const arena = parsed.arena.allocator();
 
-    var found_suite_1 = false;
+    var found_suite = false;
     var skipped_other_suites: usize = 0;
     var checked_generations: usize = 0;
     var max_leaves: usize = 0;
@@ -84,14 +87,14 @@ test "secret-tree.json: RFC 9420 §9's tree, ratchets and §6.3.2 sender data fo
         const cs = asI64(entry.object.get("cipher_suite").?);
         if (cs != @as(i64, @backingInt(S.id))) {
             skipped_other_suites += 1;
-            continue; // this module only wires suite 0x0001 — see suite.zig
+            continue; // driven by its own instantiation
         }
-        found_suite_1 = true;
+        found_suite = true;
 
         // ── §6.3.2: sender-data key and nonce ──
         {
             const sd = entry.object.get("sender_data").?.object;
-            const sds = try hexSecret(sd.get("sender_data_secret").?.string);
+            const sds = try hexSecret(S, sd.get("sender_data_secret").?.string);
             const ciphertext = try hexDecode(arena, sd.get("ciphertext").?.string);
             var got: secrettree.SenderDataKeys(S) = undefined;
             try secrettree.senderDataKeys(S, &sds, ciphertext, &got);
@@ -100,7 +103,7 @@ test "secret-tree.json: RFC 9420 §9's tree, ratchets and §6.3.2 sender data fo
         }
 
         // ── §9: the secret tree itself ──
-        const encryption_secret = try hexSecret(entry.object.get("encryption_secret").?.string);
+        const encryption_secret = try hexSecret(S, entry.object.get("encryption_secret").?.string);
         const leaves = entry.object.get("leaves").?.array.items;
         const n_leaves = leaves.len;
         max_leaves = @max(max_leaves, n_leaves);
@@ -157,11 +160,11 @@ test "secret-tree.json: RFC 9420 §9's tree, ratchets and §6.3.2 sender data fo
         }
     }
 
-    try testing.expect(found_suite_1);
+    try testing.expect(found_suite);
     // The 32-leaf case is what makes the left/right walk falsifiable — a
     // one-leaf tree would pass with no tree math at all.
     try testing.expect(max_leaves >= 32);
     try testing.expect(checked_generations >= 80);
-    // Suites 0x0002-0x0007 appear for each of the three tree sizes.
+    // The other six suites appear for each of the three tree sizes.
     try testing.expectEqual(@as(usize, 18), skipped_other_suites);
 }
