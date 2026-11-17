@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **API addition:** `Config.response_information` (default null) — the 5.0 CONNACK Response Information, sent only to a client that asked with Request Response Information = 1; not sent when unset (as Mosquitto, which does not return it, and HiveMQ, which has no setting), invalid, longer than `max_response_information` (256) or over the client's Maximum Packet Size. New export `max_response_information`. Default behaviour unchanged. SPEC: the Reason Strings half of the backlog line was already done (2026-10-17).
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog: the Payload Format validation and `$SYS` statistics items were already implemented (2026-10-17) and are now marked done; no code change.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).

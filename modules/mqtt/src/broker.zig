@@ -97,6 +97,8 @@ pub const max_in_flight = 64;
 /// Largest client id the broker stores inline (spec permits 65 535; a longer
 /// one is refused with CONNACK `identifier_rejected`).
 pub const max_client_id = 256;
+/// The longest `Config.response_information` the CONNACK buffer takes.
+pub const max_response_information = 256;
 
 /// Largest username the broker stores inline for ACL identity (a longer one
 /// is refused with CONNACK `bad_username_or_password`, mirroring
@@ -1403,6 +1405,17 @@ pub const Config = struct {
     /// `publishWith` with `retain` are refused too (`error.ProtocolViolation`).
     /// `publishSys` is exempt: `$SYS` is the broker's own state.
     retain_available: bool = true,
+    /// The Response Information (5.0 3.2.2.3.15) a CONNACK carries to a client
+    /// that asked for it with Request Response Information = 1 (3.1.2.11.7;
+    /// default 0), normally the topic prefix the client may build its response
+    /// topics under. Null (default) = never sent: like Mosquitto (the property
+    /// is "supported but not used") and HiveMQ (no broker setting); the spec
+    /// makes sending it a MAY. Borrowed: the bytes must outlive the
+    /// broker. A value that is not valid MQTT UTF-8 (or has a NUL), is longer
+    /// than `max_response_information`, or would push the CONNACK over the
+    /// client's Maximum Packet Size is **not sent** (a server may always tell
+    /// the client nothing).
+    response_information: ?[]const u8 = null,
     /// A retained message without a Message Expiry of its own is dropped once
     /// it has been stored this long (ms; 0 = never). mosquitto's
     /// `retain_expiry_interval` is a scan period in its docs (the broker
@@ -3017,6 +3030,7 @@ pub const Broker = struct {
             conn.client_max_packet = c.properties.maximum_packet_size orelse std.math.maxInt(u32);
             conn.problem_info = c.properties.request_problem_information orelse true;
         }
+        const want_response_info = v5 and (c.properties.request_response_information orelse false);
         // The codec already validated the protocol name/level. A 3.1.1 empty
         // client-id without clean session is answered, not dropped: CONNACK
         // 0x02, then close (3.1.3-8; Mosquitto and amqtt do the same,
@@ -3259,11 +3273,22 @@ pub const Broker = struct {
         }
         b.tellSuperseded(&owed);
 
-        var cbuf: [64 + max_client_id]u8 = undefined;
-        try conn.write(try packet.encodePacket(&cbuf, conn.version, .{ .connack = .{
+        var cbuf: [64 + max_client_id + max_response_information]u8 = undefined;
+        var connack: packet.Packet = .{ .connack = .{
             .session_present = resumed != null,
             .properties = if (v5) b.connackProperties(conn, assigned, if (sei != requested_sei) sei else null, server_keep_alive) else .{},
-        } }));
+        } };
+        if (want_response_info) {
+            if (b.config.response_information) |ri| {
+                if (responseInformationFits(ri)) {
+                    connack.connack.properties.response_information = ri;
+                    // Over the client's Maximum Packet Size: tell it nothing.
+                    const wire = (try packet.encodePacket(&cbuf, conn.version, connack)).len;
+                    if (wire > conn.client_max_packet) connack.connack.properties.response_information = null;
+                }
+            }
+        }
+        try conn.write(try packet.encodePacket(&cbuf, conn.version, connack));
         if (resumed) |x| {
             // Spec 4.4: unacknowledged PUBLISHes go again, with their
             // original ids and DUP set, before anything new.
@@ -4858,6 +4883,14 @@ fn deliveryPacket(conn: *const Connection, msg: Outgoing, qos: QoS, retain: bool
 /// (a CONNACK may carry one whatever Request Problem Information says).
 fn connackRefusalFor(buf: []u8, conn: *const Connection, rc3: packet.ConnectReturnCode, rc5: packet.ReasonCode) packet.EncodeError![]const u8 {
     return encodeWithReason(buf, conn, .{ .connack = .{ .session_present = false, .return_code = rc3, .reason_code = rc5 } }, reasonText(rc5));
+}
+
+/// Whether a configured Response Information can go on the wire: valid MQTT
+/// UTF-8 (no NUL) within `max_response_information`.
+fn responseInformationFits(ri: []const u8) bool {
+    if (ri.len > max_response_information) return false;
+    if (std.mem.indexOfScalar(u8, ri, 0) != null) return false;
+    return std.unicode.utf8ValidateSlice(ri);
 }
 
 /// A refusing CONNACK in the client's version: 3.1.1's return code, or the
@@ -8535,6 +8568,67 @@ test "v5 CONNACK: the broker's limits, an assigned id, a Session Expiry it lower
     try testing.expectEqualStrings(c.conn.clientId(), p.assigned_client_identifier.?);
     try testing.expect(std.mem.startsWith(u8, c.conn.clientId(), "auto-"));
     try testing.expectEqual(@as(?u32, 30), p.session_expiry_interval); // 3600 asked, 30 kept
+}
+
+test "v5 CONNACK: Response Information only when configured and requested" {
+    const Case = struct { cfg: ?[]const u8, ask: ?bool, want: ?[]const u8 };
+    const too_long: [max_response_information + 1]u8 = @splat('x');
+    const at_limit: [max_response_information]u8 = @splat('x');
+    const cases = [_]Case{
+        .{ .cfg = null, .ask = true, .want = null }, // default: never sent
+        .{ .cfg = "resp/", .ask = true, .want = "resp/" },
+        .{ .cfg = "resp/", .ask = null, .want = null }, // absent request = 0
+        .{ .cfg = "resp/", .ask = false, .want = null },
+        .{ .cfg = "bad\x00nul", .ask = true, .want = null },
+        .{ .cfg = "bad\xffutf8", .ask = true, .want = null },
+        .{ .cfg = &too_long, .ask = true, .want = null },
+        .{ .cfg = &at_limit, .ask = true, .want = &at_limit },
+    };
+    for (cases) |c| {
+        var b = Broker.init(testing.allocator, .{ .response_information = c.cfg });
+        defer b.deinit();
+        var tt = TestTransport{};
+        const got = try connect5(&b, &tt, .{ .client_id = "ri", .properties = .{ .request_response_information = c.ask } }, 0);
+        try testing.expectEqual(packet.ReasonCode.success, got.connack.reason_code);
+        if (c.want) |w| {
+            try testing.expectEqualStrings(w, got.connack.properties.response_information.?);
+        } else try testing.expect(got.connack.properties.response_information == null);
+    }
+}
+
+test "v5 CONNACK: Response Information is dropped when it would exceed the client's Maximum Packet Size" {
+    const big_buf: [200]u8 = @splat('y');
+    const big: []const u8 = &big_buf;
+    var b = Broker.init(testing.allocator, .{ .response_information = big });
+    defer b.deinit();
+    var tt = TestTransport{};
+    const got = try connect5(&b, &tt, .{ .client_id = "ri", .properties = .{
+        .request_response_information = true,
+        .maximum_packet_size = 100,
+    } }, 0);
+    try testing.expectEqual(packet.ReasonCode.success, got.connack.reason_code);
+    try testing.expect(got.connack.properties.response_information == null);
+    // Room for it: sent.
+    var b2 = Broker.init(testing.allocator, .{ .response_information = big });
+    defer b2.deinit();
+    var t2 = TestTransport{};
+    const ok = try connect5(&b2, &t2, .{ .client_id = "ri", .properties = .{
+        .request_response_information = true,
+        .maximum_packet_size = 400,
+    } }, 0);
+    try testing.expectEqualStrings(big, ok.connack.properties.response_information.?);
+}
+
+test "v3.1.1 CONNECT never gets Response Information" {
+    var b = Broker.init(testing.allocator, .{ .response_information = "resp/" });
+    defer b.deinit();
+    var tt = TestTransport{};
+    const conn = try b.accept(tt.transport());
+    var buf: [128]u8 = undefined;
+    try b.feed(conn, try packet.encodeConnect(&buf, .{ .version = .v3_1_1, .client_id = "old" }));
+    _ = try b.process(conn, 0);
+    // A 3.1.1 CONNACK is the four fixed bytes, no property block at all.
+    try testing.expectEqual(@as(usize, 4), tt.len);
 }
 
 test "v5 refusals carry 5.0 reason codes" {
