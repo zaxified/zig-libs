@@ -141,22 +141,21 @@ zstd bomb across many messages, K footer blocks naming one message), against a r
 deterministic fuzz driver, with a read that ends in an error and never in a crash; UTF-8 is checked by default
 (arrow-rs does too; C++ makes it a separate `Validate` call *(inferred)*); the anchor is the Arrow integration
 golden files compared with their JSON through an oracle written from the JSON's own encoding; pure Zig with
-ZSTD built in both ways, no C, no `libarrow`. Nothing here is a measured lead, so the scope is not `ahead`.
+ZSTD and LZ4_FRAME built in both ways, no C, no `libarrow`. Nothing here is a measured lead, so the scope is not `ahead`.
 **Where we are behind** (all in Backlog): the types the format has and `dataframe` has no column for (Union,
 Interval) are refused; Map is read as a list of its entries struct, so a write-back loses the "map" tag (Arrow C++,
 arrow-rs and polars 2.x keep a map type of their own); the view types, RunEndEncoded, Map and Decimal32/64/256 are
-read but never written; LZ4_FRAME, the
-other codec every Arrow implementation but this one has and the default of pyarrow's Feather writer, is refused
-(waits for an `lz4` module); there is no
+read but never written; LZ4_FRAME is written only at LZ4's fast levels (liblz4's
+levels 3..12, LZ4 HC, are refused: the `lz4` module has no HC); there is no
 zero-copy or memory-mapped read, no incremental reader or writer over `std.Io` (the input and the
-output are whole byte slices), no big-endian byte swap; the writer's output has not been read by a foreign
-implementation and no speed was measured.
+output are whole byte slices), no big-endian byte swap; the writer's output has not been read by a foreign Arrow
+implementation (its LZ4 buffer frames have, by the lz4 CLI and python-lz4) and no speed was measured.
 
 ## What this module is, and what it is not
 
 Apache Arrow IPC — the stream format and the file (Feather v2) format — between bytes and a whole
 `dataframe.Frame`: `writeStream` / `writeFile` turn a frame into Arrow, `readStream` / `readFile` read one back,
-`openFile` gives random access to a file's record batches, ZSTD body compression both ways, the schema's, fields'
+`openFile` gives random access to a file's record batches, ZSTD and LZ4_FRAME body compression both ways, the schema's, fields'
 and file footer's key/value metadata both ways (`ReadOptions.metadata`, `WriteOptions.schema_metadata` /
 `field_metadata` / `footer_metadata`: `dataframe.Frame` has no slot for it), column projection on read
 (`ReadOptions.columns`). Underneath, a
@@ -170,8 +169,7 @@ storage and copies every buffer — no zero-copy views over the input), Parquet,
 output, and the types `dataframe` has no column for (Interval, Union) — those are refused
 (`Unsupported`). RunEndEncoded is read expanded into a plain column, BinaryView / Utf8View as `binary` /
 `text`, ListView / LargeListView as `list`, Map as a `list` of its entries `struct`, Decimal32 / Decimal64 /
-Decimal256 as `decimal`; none of them is written. LZ4_FRAME body compression is refused until the
-collection has an LZ4 codec (deferred, not refused for good).
+Decimal256 as `decimal`; none of them is written.
 
 ## Wire format / algorithm
 
@@ -188,10 +186,26 @@ any 8-byte layout is read. Validity bitmaps are LSB-first, a buffer of length 0 
 **Body compression (wave A5).** `Message.fbs` `BodyCompression`, method BUFFER: each buffer of a record or
 dictionary batch is compressed on its own and starts with its uncompressed length as a little-endian `int64`; -1
 means the bytes after it are stored raw; a buffer of length 0 stays empty. `WriteOptions.compression = .zstd`
-(level `compression_level`, 0 = zstd's 3) compresses every non-empty buffer with the collection's `zstd` module and
-stores raw the ones that do not shrink, as Arrow C++ and arrow-rs do. The reader decompresses ZSTD (one zstd context
-per read) after checking each declared length against `zstd.decompressBound` and the whole read's total against
-`ReadOptions.max_body_bytes`; LZ4_FRAME is `error.Unsupported` (the collection has no LZ4 codec).
+(level `compression_level`, 0 = zstd's 3) compresses every non-empty buffer with the collection's `zstd` module,
+`.lz4` as one LZ4 frame with the `lz4` module. Either way a buffer that does not shrink is stored raw behind -1, as
+arrow-rs 60.1 does (`compress_to_vec`: raw when the compressed form is longer); Arrow C++ 26.0.1 by default always
+writes the compressed form and stores raw only when `IpcWriteOptions::min_space_savings` is set
+(`writer.cc` `CompressBuffer` / `ShouldCompress`). Every reader takes both. The reader decompresses ZSTD (one zstd
+context per read) after checking each declared length against `zstd.decompressBound`, and LZ4_FRAME into the
+buffer the declared length sized, both after checking the whole read's total against `ReadOptions.max_body_bytes`.
+
+**LZ4_FRAME (2026-11-17)**, as Arrow C++ 26.0.1 `util/compression_lz4.cc` `Lz4FrameCodec` does it (behaviour read,
+no code taken). Write: one frame per buffer with liblz4's zeroed `LZ4F_preferences_t` (C++'s
+`DefaultPreferences`): 64 KB linked blocks, no content size in the header, no block or content checksum — exactly
+the `lz4` module's `EncodeOptions` defaults (checked in `src/stream_test.zig` on every frame written, and by the
+lz4 1.10.0 CLI and python-lz4 4.4.5 decoding each buffer frame of a three-column 200 000-row stream at two levels:
+24 frames, byte-equal). `compression_level` is liblz4's `compressionLevel` as C++ passes it: negative = the fast
+mode with acceleration `-level`, 0..2 = LZ4's default level, 3 and up = LZ4 HC, `error.Unsupported` here (no HC in
+`lz4`; its Backlog B2). Read: exactly one LZ4 frame per buffer (C++ `Decompress`: "more than one frame" and "less
+than one frame" are errors), so a legacy or skippable frame, a second frame or a trailing byte is
+`error.Malformed`; the frame must decode to the declared length exactly (C++ `DecompressBuffer`, arrow-rs
+`decompress_lz4`: fewer is an error, more is an error), a content size or checksum in the frame is honoured. The
+declared length sizes the output buffer (`lz4.decompressInto`), so a frame that would expand past it stops there.
 
 **Type mapping (wave A2).** The writer maps the column's DECLARED `ColumnType` and reads the cells through
 `ColumnData.get`, so storage of another kind that holds values of the declared type is written too:
@@ -293,9 +307,10 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
   the budget, each call afresh.
 - `ReadOptions.max_body_bytes` (default 2^31, ours): the most bytes the compressed bodies of the WHOLE read may
   expand to — every buffer of every record and dictionary batch of the stream, or of every block of a file
-  (`openFile` inflates them all). zstd reaches ~32 000:1 on a run of one byte, so a per-message cap would let K
-  small messages expand K times. A declared length above what the zstd frames can hold
-  (`zstd.decompressBound`), a frame that decodes to another length, or a broken frame is `error.Malformed`.
+  (`openFile` inflates them all). zstd reaches ~32 000:1 on a run of one byte (LZ4 ~255:1), so a per-message cap
+  would let K small messages expand K times. A declared length above what the zstd frames can hold
+  (`zstd.decompressBound`), a frame that decodes to another length (an LZ4 frame is stopped at the declared
+  length), or a broken frame is `error.Malformed`.
 - **File footer blocks**: each `Block`'s `metaDataLength` (framing + padded metadata) and `bodyLength` must be
   those of the message at its offset, and no two blocks may share bytes (`error.Malformed`) — K blocks naming one
   message would otherwise be inflated and decoded K times. The footer's metadata version is checked like a
@@ -326,7 +341,7 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
   calendar day of the instant), and reads a timestamp zone `tz` does not know as a naive column. Nothing else
   changes (a malformed stream is still an error). Tests: `src/stream_test.zig` "lossy: …", "inexact time
   conversions", and the `datetime` and `decimal` golden sets.
-- Refused on read (`Unsupported`): LZ4_FRAME body compression, Interval, Union,
+- Refused on read (`Unsupported`): Interval, Union,
   tensors. Every structural defect — a buffer shorter than its node, offsets running backwards or past the data, an
   index outside its dictionary, node or buffer counts not matching the schema, a column length not the batch's —
   is `error.Malformed`.
@@ -342,19 +357,20 @@ Sets: `custom_metadata`, `dictionary`, `dictionary_unsigned`, `duplicate_fieldna
 `nested_large_offsets`, `null`, `null_trivial`, `primitive`, `primitive_large_offsets`, `primitive_no_batches`,
 `primitive_zerolength`, `recursive_nested`, `nested_dictionary` (a list dictionary of dictionary-encoded items and a
 struct dictionary whose two fields share one), from `4.0.0-shareddict` `shared_dict` (two columns, one
-dictionary), and from `2.0.0-compression` `zstd` and `uncompressible_zstd`
-(ZSTD body compression), from `cpp-21.0.0` `decimal32`, `decimal64`, `run_end_encoded`, `binary_view` and
+dictionary), and from `2.0.0-compression` `zstd`, `uncompressible_zstd`, `lz4` and `uncompressible_lz4`
+(ZSTD and LZ4_FRAME body compression), from `cpp-21.0.0` `decimal32`, `decimal64`, `run_end_encoded`, `binary_view` and
 `list_view`, and `map` and `map_non_canonical` (a Map as a list of its entries; the latter's `.stream`, written
 by Arrow C++, carries the canonical `entries` / `key` / `value` names, its `.arrow_file` the JSON's own, and
 either is accepted as the file's); `datetime`, `decimal` and (from
 `cpp-21.0.0`) `decimal256` are `Unsupported` by default and compared under `lossy` (the Decimal256 oracle parses
 the JSON's 77-digit values as i256).
 Stream and file read equal, each file batch has its JSON batch's length, and the frame this module writes back
-(plain and zstd, stream and file) reads equal, its metadata too (in the frame's shape: a run-end encoded field's
-children are its values'). `interval`, `union` and `lz4` are asserted `Unsupported`, lossy
+(plain, zstd and lz4, stream and file) reads equal, its metadata too (in the frame's shape: a run-end encoded field's
+children are its values'). `interval` and `union` are asserted `Unsupported`, lossy
 or not. No integration golden replaces a dictionary (the integration JSON cannot express one), so replacement is
 anchored on the behaviour cited under "Dictionaries" and hand-built streams (`src/dict_test.zig`). The writer's bytes are anchored
-only through the reader (no foreign reader runs here).
+only through the reader (no foreign Arrow reader runs here); its LZ4 buffer frames were also decoded by the lz4 CLI
+and python-lz4 (see "LZ4_FRAME").
 
 **Anchor grade:** class A · oracle EXTERNAL
 
@@ -472,8 +488,8 @@ cost-only, as in the whole-module audit). No finding.
   column representation. Revisit only with a consumer that reads files larger than memory.
 - **The C data interface, Flight, compute kernels — never here.** Separate concerns (in-process FFI, RPC,
   compute) for separate modules if a consumer ever needs them.
-- **LZ4_FRAME — superseded by something external:** waits for an `lz4` codec module in the collection; writing
-  LZ4 is not planned even then (ZSTD is what Arrow C++ and arrow-rs recommend).
+- **LZ4 HC levels (liblz4 3..12) on write — superseded by something external:** `error.Unsupported` until the
+  `lz4` module has HC (its Backlog B2); the fast levels are written.
 - **Reading the types `dataframe` has no column for — never as such.** Interval and Union would need new
   `dataframe` column kinds first. (RunEndEncoded, the view types and Map are read, but only as the plain columns
   they encode — Map as a list of its entries struct; writing them would need column kinds of their own.)
@@ -482,8 +498,6 @@ cost-only, as in the whole-module audit). No finding.
 
 - The writer is anchored only through our own reader: no foreign implementation reads our bytes (a live pyarrow
   round trip needs a venv + wheel — owner decision).
-- LZ4_FRAME body compression: `Unsupported` until the collection has an LZ4 codec (a new-module idea; not filed
-  from this wave).
 - The reader copies every buffer (no zero-copy views over the input).
 - `openFile` reads the schema from the footer only; it does not compare it with the stream schema at offset 8.
 - Performance not measured.
@@ -492,8 +506,8 @@ cost-only, as in the whole-module audit). No finding.
   values would be picked silently.
 - Written key/value metadata (schema, field, footer) is read back only by this module's own reader; a future
   differential oracle should carry one metadata case, footer included.
-- Compressed view batches (`prepare` splitting variadic buffers before a zstd `inflate`) have no test: the writer
-  never emits views and the `cpp-21.0.0` view goldens are uncompressed.
+- Compressed view batches (`prepare` splitting variadic buffers before an `inflate`) are tested only with
+  raw-prefixed (-1) buffers: the writer never emits views and the `cpp-21.0.0` view goldens are uncompressed.
 - Message-level `custom_metadata` (on each Schema / RecordBatch / DictionaryBatch message) is neither surfaced
   nor written; only schema, field and footer metadata are.
 
@@ -508,7 +522,7 @@ pyarrow round trip is an owner decision. Out: the C data interface, Flight, comp
 | A2 | Type mapping `dataframe` ↔ Arrow (table above); `boxed` refused | done 2026-11-16 |
 | A3 | IPC stream: framing, Schema / DictionaryBatch / RecordBatch, end of stream, `rows_per_batch`; `writeStream` / `readStream` | done 2026-11-16 |
 | A4 | IPC file: `ARROW1`, footer with blocks, random access to a batch; `writeFile` / `readFile` / `openFile` | done 2026-11-16 |
-| A5 | ZSTD body compression read and write (`WriteOptions.compression`); LZ4_FRAME `Unsupported` until an `lz4` module exists | done 2026-11-17 |
+| A5 | ZSTD body compression read and write (`WriteOptions.compression`); LZ4_FRAME read and write after the `lz4` module (2026-11-17) | done 2026-11-17 |
 | A6 | Golden oracle (done 2026-11-17), `ReadOptions.lossy` (done), fuzz driver (done 2026-11-17), example (done); no-panic sweep, mutation, survey | part 1 done 2026-11-17 |
 | A6.1 | Independent review 2026-11-17 (1 HIGH, 4 MED, 8 LOW) fixed: schema decode budget, read-wide `max_body_bytes` and `max_cells`, footer blocks checked and disjoint, UTF-8 both ways, inexact times refused, metadata version, decimal precision, shared dictionaries; structural hostile tests | done 2026-11-17 |
 
@@ -533,10 +547,12 @@ competing libraries and cheap enough to finish in one wave; none of them is star
   polars write the view encoding (polars chooses by `compat_level`), so a file from them is `Unsupported` today.
   Sketch: new `Kind`s in the reader's `plan`, bounds-checked per view against the data buffers and
   `max_cells`; the writer stays Utf8 / Binary / List. Effort: ~1 wave.
-- **LZ4_FRAME bodies, read and write — after the `lz4` module** (NEW-MODULES.md). pyarrow's Feather writer
-  defaults to LZ4, so this is the commonest refusal a user meets. Sketch: `Compression.lz4`, the reader dispatches
-  on `BodyCompression.codec` next to zstd, with the same `max_body_bytes` charge from the frame's declared
-  content size (a frame without one is `Malformed`, as arrow-rs needs it). Effort: ~0.5 wave once the codec exists.
+- ✅ 2026-11-17 **LZ4_FRAME bodies, read and write.** Done with the `lz4` module: `Compression.lz4`, the reader
+  dispatches on `BodyCompression.codec` next to zstd with the same `max_body_bytes` charge from each buffer's
+  declared length, decoding into the buffer it sized (`lz4.decompressInto`); see "LZ4_FRAME" under Wire format.
+  The sketch's "a frame without a content size is `Malformed`" was wrong: Arrow C++ writes none, and arrow-rs reads
+  by the declared length. Anchored on the `lz4` and `uncompressible_lz4` goldens. Was: pyarrow's Feather writer
+  defaults to LZ4, so this was the commonest refusal a user met.
 - ✅ 2026-11-17 **Schema and field key/value metadata.** Done: `ReadOptions.metadata` (an out parameter, so
   `readStream` / `readFile` / `openFile` keep their signatures) is filled with a `Metadata` — the schema's pairs,
   a `FieldMetadata` tree parallel to the frame's columns, a file footer's pairs — copied into the read's arena;

@@ -24,6 +24,7 @@ const fb = @import("fb.zig");
 const schema = @import("schema.zig");
 const ipc = @import("ipc.zig");
 const zstd = @import("zstd");
+const lz4 = @import("lz4");
 
 const Allocator = std.mem.Allocator;
 const Column = df.Column;
@@ -49,8 +50,10 @@ pub const WriteOptions = struct {
     /// dictionary batch compressed on its own, after an `int64` of its uncompressed length; a
     /// buffer that does not shrink is stored raw (length -1), as Arrow C++ and arrow-rs do.
     compression: Compression = .none,
-    /// The zstd level (`zstd.Options.level`: 1..22, negative for the fast levels, 0 = zstd's
-    /// default, 3).
+    /// The codec's level. `.zstd`: `zstd.Options.level` (1..22, negative for the fast
+    /// levels, 0 = zstd's default, 3). `.lz4`: liblz4's `compressionLevel` as Arrow C++
+    /// passes it on: negative = the fast mode with acceleration `-level`, 0..2 = LZ4's
+    /// default; 3 and up (LZ4 HC) are `error.Unsupported` (the `lz4` module has no HC).
     compression_level: i32 = 0,
     /// The schema's key/value metadata (`Schema.custom_metadata`: Pandas metadata,
     /// provenance tags), written as given.
@@ -86,9 +89,10 @@ pub const Metadata = struct {
     footer: []const KeyValue = &.{},
 };
 
-/// Body compression codecs the writer offers. LZ4_FRAME is read as `error.Unsupported`
-/// until the collection has an LZ4 codec.
-pub const Compression = enum { none, zstd };
+/// Body compression codecs the writer offers: ZSTD, and LZ4_FRAME (`.lz4`: one LZ4 frame
+/// per buffer with liblz4's default preferences, as Arrow C++ writes it: 64 KB linked
+/// blocks, no content size, no checksums). The reader takes both.
+pub const Compression = enum { none, zstd, lz4 };
 
 pub const ReadOptions = struct {
     /// Most rows any one array of the stream may claim (frame rows summed over the
@@ -192,6 +196,8 @@ const Writer = struct {
     dicts: std.ArrayList(WDict) = .empty,
     /// Set when `opts.compression` is `.zstd`; reused for every buffer.
     zc: ?zstd.Compressor = null,
+    /// Set when `opts.compression` is `.lz4`: the frame options from `compression_level`.
+    lz4o: ?lz4.EncodeOptions = null,
 
     fn plan(w: *Writer, name: []const u8, decl: ?Column, data: ColumnData, rows: usize, depth: usize) Error!WField {
         if (depth >= schema.max_depth) return error.Unsupported;
@@ -363,9 +369,9 @@ const Writer = struct {
         var packed_body: ipc.BodyBuilder = .{};
         defer packed_body.deinit(w.gpa);
         var codec: ?ipc.Codec = null;
-        const bb: *const ipc.BodyBuilder = if (w.zc != null) blk: {
+        const bb: *const ipc.BodyBuilder = if (w.zc != null or w.lz4o != null) blk: {
             try w.compressBody(&bo.body, &packed_body);
-            codec = .zstd;
+            codec = if (w.zc != null) .zstd else .lz4_frame;
             break :blk &packed_body;
         } else &bo.body;
         var b = fb.Builder.init(w.gpa);
@@ -381,22 +387,26 @@ const Writer = struct {
         return .{ .offset = @intCast(at), .meta_len = @intCast(out.items.len - at - body), .body_len = @intCast(body) };
     }
 
-    /// Every buffer of `src` zstd-compressed into `dst`, behind its uncompressed length as an
-    /// `int64`; a buffer that would not shrink is stored raw behind -1, an absent one stays
-    /// absent.
+    /// Every buffer of `src` compressed (zstd, or one LZ4 frame) into `dst`, behind its
+    /// uncompressed length as an `int64`; a buffer that would not shrink is stored raw behind
+    /// -1, an absent one stays absent.
     fn compressBody(w: *Writer, src: *const ipc.BodyBuilder, dst: *ipc.BodyBuilder) Error!void {
-        const zc = &w.zc.?;
         for (src.locs.items) |l| {
             const raw = src.bytes.items[@intCast(l.offset)..][0..@intCast(l.length)];
             if (raw.len == 0) {
                 try dst.addEmpty(w.gpa);
                 continue;
             }
-            const buf = try w.tmp.alloc(u8, 8 + @max(raw.len, zstd.compressBound(raw.len)));
-            const n = zc.compress(buf[8..], raw, .{ .level = w.opts.compression_level }) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.Unsupported, // a level zstd refuses
-            };
+            const bound = if (w.lz4o) |o| lz4.compressBound(raw.len, o) else zstd.compressBound(raw.len);
+            const buf = try w.tmp.alloc(u8, 8 + @max(raw.len, bound));
+            const n = if (w.lz4o) |o|
+                // `compressBound` bytes always fit; a buffer over 4 GiB is the only refusal.
+                lz4.compressInto(raw, buf[8..], o) catch return error.Unsupported
+            else
+                w.zc.?.compress(buf[8..], raw, .{ .level = w.opts.compression_level }) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.Unsupported, // a level zstd refuses
+                };
             var len = 8 + n;
             if (n < raw.len) {
                 std.mem.writeInt(i64, buf[0..8], @intCast(raw.len), .little);
@@ -744,7 +754,16 @@ fn write(gpa: Allocator, f: df.Frame, opts: WriteOptions, file: bool) Error![]u8
     var tmp_state = std.heap.ArenaAllocator.init(gpa);
     defer tmp_state.deinit();
     var w: Writer = .{ .gpa = gpa, .arena = arena_state.allocator(), .tmp = tmp_state.allocator(), .opts = opts };
-    if (opts.compression == .zstd) w.zc = zstd.Compressor.init(gpa);
+    switch (opts.compression) {
+        .none => {},
+        .zstd => w.zc = zstd.Compressor.init(gpa),
+        // liblz4's level: negative = acceleration, 0..2 = the default fast level,
+        // 3.. = HC, which the `lz4` module does not have.
+        .lz4 => {
+            if (opts.compression_level >= 3) return error.Unsupported;
+            w.lz4o = .{ .acceleration = if (opts.compression_level < 0) @abs(opts.compression_level) else 1 };
+        },
+    }
     defer if (w.zc) |*c| c.deinit();
 
     const fields = try w.arena.alloc(WField, f.columns.len);
@@ -1332,8 +1351,8 @@ const Reader = struct {
     /// its uncompressed length as an `int64`: -1 means the rest is stored raw.
     fn inflate(r: *Reader, rb: ipc.RecordBatch, body: []const u8, need: ?[]const bool) Error!Chunk {
         const codec = rb.compression orelse return .{ .rb = rb, .body = body };
-        // LZ4_FRAME: the collection has no LZ4 codec yet; any other value is not Arrow's.
-        if (codec != .zstd) return error.Unsupported;
+        // Any value but LZ4_FRAME and ZSTD is not Arrow's.
+        if (codec != .zstd and codec != .lz4_frame) return error.Unsupported;
         // The cap is over the whole read, not this message: K small messages of RLE frames
         // would otherwise expand K times the cap. Buffers no projected column reads (`need`)
         // are left compressed and become empty.
@@ -1356,6 +1375,15 @@ const Reader = struct {
                 const dst = out[at..][0..n];
                 if (std.mem.readInt(i64, src[0..8], .little) == -1) {
                     @memcpy(dst, src[8..]);
+                } else if (n > 0 and codec == .lz4_frame) {
+                    // Exactly one LZ4 frame, as Arrow C++ reads it (`LZ4F_decompress` until the
+                    // frame ends, input left over is an error): no legacy or skippable frame,
+                    // nothing after it. The buffer is the cap: a frame (or its declared
+                    // content size) past the declared length stops there.
+                    const one = src[8..];
+                    if (one.len < 4 or std.mem.readInt(u32, one[0..4], .little) != lz4.frame_magic) return error.Malformed;
+                    const got = lz4.decompressInto(one, dst, .{ .max_output = null, .multi_frame = false }) catch return error.Malformed;
+                    if (got != n) return error.Malformed;
                 } else if (n > 0) {
                     const frames = src[8..];
                     // A frame declaring more than it can hold is refused before decoding.
@@ -2299,7 +2327,7 @@ fn decodedChildren(f: schema.Field) []const schema.Field {
 /// arena; nothing borrows `bytes`). Dictionary deltas are appended; a dictionary REPLACED
 /// mid-stream applies to the batches after it, the batches before it keep the old one,
 /// and a categorical column's categories are the union of the dictionaries its rows
-/// use; ZSTD body compression is read. LZ4_FRAME body compression, a metadata
+/// use; ZSTD and LZ4_FRAME body compression is read. A metadata
 /// version before V4, and the types `dataframe` has no column for (Interval, Union) are
 /// `error.Unsupported`. A Map reads as a list of its entries struct (the map tag is not
 /// kept), a run-end encoded column as its values' column.

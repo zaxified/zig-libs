@@ -287,21 +287,23 @@ test "hostile bodies: max_body_bytes caps the whole read, not one message" {
     defer arena.deinit();
     const a = arena.allocator();
     // Four batches of 16 Ki zeros: 128 KiB inflated each, 512 KiB in all, from a few hundred
-    // bytes of zstd per batch.
+    // bytes of zstd per batch (about 520 of LZ4, whose densest ratio is ~255:1).
     const f = try zeros(a, 1 << 16);
-    const opts: stream.WriteOptions = .{ .rows_per_batch = 1 << 14, .compression = .zstd };
-    const s = try stream.writeStream(gpa, f, opts);
-    defer gpa.free(s);
-    const fl = try stream.writeFile(gpa, f, opts);
-    defer gpa.free(fl);
-    try testing.expect(s.len < 8 << 10);
-    // Every batch alone is under 300 KiB; together they are not.
-    const tight: stream.ReadOptions = .{ .max_body_bytes = 300 << 10 };
-    try testing.expectEqual(@as(?anyerror, error.LimitExceeded), (try streamUnderCap(s, tight, 4 << 20)).err);
-    try testing.expectEqual(@as(?anyerror, error.LimitExceeded), (try fileUnderCap(fl, tight, 4 << 20)).err);
-    const roomy: stream.ReadOptions = .{ .max_body_bytes = 512 << 10 };
-    try st.expectSameFrame(f, try stream.readStream(a, s, roomy));
-    try st.expectSameFrame(f, try stream.readFile(a, fl, roomy));
+    for ([_]stream.Compression{ .zstd, .lz4 }) |c| {
+        const opts: stream.WriteOptions = .{ .rows_per_batch = 1 << 14, .compression = c };
+        const s = try stream.writeStream(gpa, f, opts);
+        defer gpa.free(s);
+        const fl = try stream.writeFile(gpa, f, opts);
+        defer gpa.free(fl);
+        try testing.expect(s.len < 8 << 10);
+        // Every batch alone is under 300 KiB; together they are not.
+        const tight: stream.ReadOptions = .{ .max_body_bytes = 300 << 10 };
+        try testing.expectEqual(@as(?anyerror, error.LimitExceeded), (try streamUnderCap(s, tight, 4 << 20)).err);
+        try testing.expectEqual(@as(?anyerror, error.LimitExceeded), (try fileUnderCap(fl, tight, 4 << 20)).err);
+        const roomy: stream.ReadOptions = .{ .max_body_bytes = 512 << 10 };
+        try st.expectSameFrame(f, try stream.readStream(a, s, roomy));
+        try st.expectSameFrame(f, try stream.readFile(a, fl, roomy));
+    }
 }
 
 /// Rebuilds a file's footer: the metadata version, and the record batch blocks as given

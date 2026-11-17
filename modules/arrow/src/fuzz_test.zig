@@ -6,7 +6,7 @@
 //! The harness is generic over its source of choices (testkit's fuzz driver
 //! hands it `fuzz.Rng`, `std.testing.fuzz` a `Smith`). Under the driver, an
 //! input is a VALID stream or file — an apache/arrow-testing golden file, or a
-//! frame this module wrote (plain and zstd-compressed, one batch and many) —
+//! frame this module wrote (plain, zstd- and lz4-compressed, one batch and many) —
 //! damaged where it matters: a framing length, a FlatBuffers offset or vtable
 //! field, a node length or null count, a buffer location, a compressed buffer's
 //! length prefix, the file footer and its blocks, or plain bytes, then maybe
@@ -54,11 +54,13 @@ const golden = [_][]const u8{
     @embedFile("testdata/1.0.0-littleendian/generated_map.arrow_file"),
     @embedFile("testdata/1.0.0-littleendian/generated_nested_dictionary.stream"),
     @embedFile("testdata/4.0.0-shareddict/generated_shared_dict.arrow_file"),
+    @embedFile("testdata/2.0.0-compression/generated_lz4.stream"),
+    @embedFile("testdata/2.0.0-compression/generated_lz4.arrow_file"),
 };
 
 /// Reach labels for the golden inputs that exercise one decoder each (a frame read from
 /// one, damaged or not, reached that decoder).
-const golden_label = [golden.len]?[]const u8{ null, null, null, null, null, null, null, null, null, null, null, "key/value metadata", "Decimal32", "Decimal256", "RunEndEncoded", "BinaryView/Utf8View", "ListView/LargeListView", "Map", "nested dictionary", "shared dictionary" };
+const golden_label = [golden.len]?[]const u8{ null, null, null, null, null, null, null, null, null, null, null, "key/value metadata", "Decimal32", "Decimal256", "RunEndEncoded", "BinaryView/Utf8View", "ListView/LargeListView", "Map", "nested dictionary", "shared dictionary", "LZ4 stream", "LZ4 file" };
 
 fn hitSource(pick: usize) void {
     inline for (golden_label, 0..) |l, i| {
@@ -71,7 +73,7 @@ fn hitSource(pick: usize) void {
 
 /// The inputs damage starts from: the golden files above and what this module writes
 /// of `sample` (built once, kept for the process).
-var corpus_buf: [golden.len + 9][]const u8 = undefined;
+var corpus_buf: [golden.len + 13][]const u8 = undefined;
 var corpus: []const []const u8 = &.{};
 
 fn buildCorpus() ![]const []const u8 {
@@ -92,6 +94,8 @@ fn buildCorpus() ![]const []const u8 {
         .{ .rows_per_batch = 2 },
         .{ .compression = .zstd },
         .{ .compression = .zstd, .rows_per_batch = 2 },
+        .{ .compression = .lz4 },
+        .{ .compression = .lz4, .rows_per_batch = 2 },
     }) |o| {
         corpus_buf[n] = try stream.writeStream(a, f, o);
         corpus_buf[n + 1] = try stream.writeFile(a, f, o);
@@ -207,8 +211,8 @@ fn sameCell(x: df.Value, y: df.Value, depth: usize) bool {
 }
 
 /// The oracle on a frame the reader made: written and read back, cell for cell.
-fn rewrites(gpa: Allocator, a: Allocator, f: df.Frame, compress: bool) !void {
-    const bytes = stream.writeStream(gpa, f, .{ .rows_per_batch = 3, .compression = if (compress) .zstd else .none }) catch |e| switch (e) {
+fn rewrites(gpa: Allocator, a: Allocator, f: df.Frame, compression: stream.Compression) !void {
+    const bytes = stream.writeStream(gpa, f, .{ .rows_per_batch = 3, .compression = compression }) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => {
             std.debug.print("rewrite refused: {t}\n", .{e});
@@ -273,13 +277,13 @@ fn harness(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
     if (opts.columns != null) fuzz_driver.hit("projected frame");
     if (md.schema.len > 0 or (md.fields.len > 0 and md.fields[0].metadata.len > 0)) fuzz_driver.hit("metadata read");
     hitSource(pick);
-    try rewrites(gpa, a, f, src.value(bool));
+    try rewrites(gpa, a, f, @fromBackingInt(@intCast(src.valueRangeAtMost(u8, 0, 2))));
 }
 
-/// Corpus entries whose bodies are zstd-compressed: three golden files and the last
-/// four this module wrote.
+/// Corpus entries whose bodies are compressed: three zstd and two lz4 golden files and
+/// the last eight this module wrote (zstd, then lz4).
 fn isCompressed(i: usize) bool {
-    return (i >= 8 and i < 11) or i >= golden.len + 4;
+    return (i >= 8 and i < 11) or (i >= golden.len - 2 and i < golden.len) or i >= golden.len + 5;
 }
 
 fn outcome(e: stream.Error) ?df.Frame {
@@ -315,6 +319,6 @@ test "fuzz harness: every corpus entry reads and rewrites undamaged" {
             try stream.readFile(a, c, .{ .lossy = true })
         else
             try stream.readStream(a, c, .{ .lossy = true });
-        try rewrites(testing.allocator, a, f, true);
+        for ([_]stream.Compression{ .zstd, .lz4 }) |codec| try rewrites(testing.allocator, a, f, codec);
     }
 }

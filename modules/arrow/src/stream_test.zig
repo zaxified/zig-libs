@@ -614,10 +614,17 @@ test "file: bad marks, footer and blocks are errors; every truncation and byte f
 // ── body compression (wave A5) ──────────────────────────────────────────────
 
 const zstd = @import("zstd");
+const lz4 = @import("lz4");
 
 /// Counts the compressed buffers of every batch of `bytes` by their prefix: stored raw
-/// (-1) or compressed (a length); fails on a batch that is not marked zstd.
-fn countPrefixes(a: Allocator, bytes: []const u8) !struct { raw: usize, packed_: usize } {
+/// (-1) or compressed (a length); fails on a batch that is not marked `codec`.
+const Prefixes = struct { raw: usize, packed_: usize };
+
+fn countPrefixes(a: Allocator, bytes: []const u8) !Prefixes {
+    return countPrefixesOf(a, bytes, .zstd);
+}
+
+fn countPrefixesOf(a: Allocator, bytes: []const u8, codec: ipc.Codec) !Prefixes {
     var pos: usize = 0;
     var raw: usize = 0;
     var packed_: usize = 0;
@@ -631,7 +638,7 @@ fn countPrefixes(a: Allocator, bytes: []const u8) !struct { raw: usize, packed_:
             (try ipc.decodeDictionaryBatch(a, m.msg.header.?, m.enc.body.len)).data
         else
             try ipc.decodeRecordBatch(a, m.msg.header.?, m.enc.body.len);
-        try testing.expectEqual(ipc.Codec.zstd, rb.compression.?);
+        try testing.expectEqual(codec, rb.compression.?);
         for (rb.buffers) |l| {
             if (l.length == 0) continue;
             const b = m.enc.body[@intCast(l.offset)..][0..@intCast(l.length)];
@@ -682,7 +689,98 @@ test "compression: zstd round trip of every column type, stream and file, one ba
     try testing.expectError(error.Unsupported, stream.writeStream(gpa, big, .{ .compression = .zstd, .compression_level = 23 }));
 }
 
-test "compression: declared lengths, broken frames and LZ4 are errors" {
+/// Every LZ4-compressed buffer of every batch of `bytes`, checked to be one LZ4 frame with
+/// liblz4's default preferences (Arrow C++'s: version 01, linked 64 KB blocks, no content
+/// size, no checksums, no dictionary id) that decodes to its declared length.
+fn expectLz4Frames(a: Allocator, bytes: []const u8) !usize {
+    var pos: usize = 0;
+    var frames: usize = 0;
+    _ = try ipc.readMessage(bytes, &pos);
+    while (true) {
+        const m = ipc.readMessage(bytes, &pos) catch |e| switch (e) {
+            error.EndOfStream => break,
+            else => return e,
+        };
+        const rb = if (m.msg.header_type == .dictionary_batch)
+            (try ipc.decodeDictionaryBatch(a, m.msg.header.?, m.enc.body.len)).data
+        else
+            try ipc.decodeRecordBatch(a, m.msg.header.?, m.enc.body.len);
+        try testing.expectEqual(ipc.Codec.lz4_frame, rb.compression.?);
+        for (rb.buffers) |l| {
+            if (l.length == 0) continue;
+            const b = m.enc.body[@intCast(l.offset)..][0..@intCast(l.length)];
+            const n = std.mem.readInt(i64, b[0..8], .little);
+            if (n == -1) continue;
+            try testing.expectEqual(lz4.frame_magic, std.mem.readInt(u32, b[8..12], .little));
+            try testing.expectEqual(@as(u8, 0x40), b[12]); // FLG
+            try testing.expectEqual(@as(u8, 0x40), b[13]); // BD: 64 KB
+            const out = try lz4.decompress(a, b[8..], .{ .multi_frame = false });
+            try testing.expectEqual(@as(usize, @intCast(n)), out.len);
+            frames += 1;
+        }
+    }
+    return frames;
+}
+
+test "compression: lz4 round trip of every column type, stream and file, one batch and many" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const f = try sampleFrame(a);
+    for ([_]usize{ 0, 1, 2, 100 }) |per| {
+        const opts: stream.WriteOptions = .{ .rows_per_batch = per, .compression = .lz4 };
+        const s = try stream.writeStream(gpa, f, opts);
+        defer gpa.free(s);
+        try expectSameFrame(f, try stream.readStream(a, s, .{}));
+        _ = try expectLz4Frames(a, s);
+        const fl = try stream.writeFile(gpa, f, opts);
+        defer gpa.free(fl);
+        try expectSameFrame(f, try stream.readFile(a, fl, .{}));
+        var file = try stream.openFile(a, fl, .{});
+        try expectRows(f, 0, try file.readBatch(0));
+    }
+    // Five-row buffers do not shrink: stored raw behind -1 (as arrow-rs; Arrow C++
+    // writes the frame unless `min_space_savings` is set).
+    const small = try stream.writeStream(gpa, f, .{ .compression = .lz4 });
+    defer gpa.free(small);
+    const sc = try countPrefixesOf(a, small, .lz4_frame);
+    try testing.expect(sc.raw > 0);
+
+    // A long repetitive column does shrink, at every level LZ4's fast mode has: liblz4's
+    // negative levels are the acceleration, 0..2 its default. A bigger acceleration
+    // never compresses better.
+    const n = 1 << 16;
+    const vals = try a.alloc(i64, n);
+    var prng = std.Random.DefaultPrng.init(5);
+    for (vals, 0..) |*v, i| v.* = if (prng.random().uintLessThan(u8, 16) == 0) prng.random().int(i64) else @intCast(i % 7);
+    const big: df.Frame = .{ .columns = &.{.{ .name = "x", .type = .int }}, .data = &.{.{ .int = .{ .values = vals } }}, .len = n };
+    const plain = try stream.writeStream(gpa, big, .{});
+    defer gpa.free(plain);
+    var sizes: [5]usize = undefined;
+    for ([_]i32{ 0, 1, 2, -1, -64 }, &sizes) |level, *size| {
+        const z = try stream.writeStream(gpa, big, .{ .compression = .lz4, .compression_level = level });
+        defer gpa.free(z);
+        size.* = z.len;
+        try testing.expect(z.len < plain.len);
+        try testing.expect((try countPrefixesOf(a, z, .lz4_frame)).packed_ == 1);
+        try testing.expectEqual(@as(usize, 1), try expectLz4Frames(a, z));
+        try expectSameFrame(big, try stream.readStream(a, z, .{}));
+    }
+    // 0, 1, 2 and -1 are all acceleration 1; -64 is faster and looser.
+    for (sizes[1..4]) |x| try testing.expectEqual(sizes[0], x);
+    try testing.expect(sizes[4] > sizes[0]);
+    // The most negative level (acceleration 2^31, which LZ4 clamps) still writes a stream
+    // that reads back.
+    const fastest = try stream.writeStream(gpa, big, .{ .compression = .lz4, .compression_level = std.math.minInt(i32) });
+    defer gpa.free(fastest);
+    try expectSameFrame(big, try stream.readStream(a, fastest, .{}));
+    // LZ4 HC (liblz4 levels 3..12) is not in the `lz4` module.
+    for ([_]i32{ 3, 12, std.math.maxInt(i32) }) |level|
+        try testing.expectError(error.Unsupported, stream.writeStream(gpa, big, .{ .compression = .lz4, .compression_level = level }));
+}
+
+test "compression: declared lengths and broken frames are errors" {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -692,6 +790,21 @@ test "compression: declared lengths, broken frames and LZ4 are errors" {
     var frame_buf: [64]u8 = undefined;
     const fl = try zstd.compress(gpa, &frame_buf, vals, .{});
     const frame = frame_buf[0..fl];
+    var lz_buf: [64]u8 = undefined;
+    const lz = lz_buf[0..try lz4.compressInto(vals, &lz_buf, .{})];
+    var lz_sized_buf: [64]u8 = undefined;
+    const lz_sized = lz_sized_buf[0..try lz4.compressInto(vals, &lz_sized_buf, .{ .content_size = true, .content_checksum = true })];
+    var lz_bad_sum: [64]u8 = undefined;
+    @memcpy(lz_bad_sum[0..lz_sized.len], lz_sized);
+    lz_bad_sum[lz_sized.len - 1] ^= 1;
+    var lz_bomb_buf: [64]u8 = undefined; // 4 KiB of zeros in a few bytes
+    const lz_bomb = lz_bomb_buf[0..try lz4.compressInto(&@as([4096]u8, @splat(0)), &lz_bomb_buf, .{})];
+    // The two-byte content `lz4 -l` would write: a legacy frame of the same bytes.
+    var leg_buf: [64]u8 = undefined;
+    std.mem.writeInt(u32, leg_buf[0..4], lz4.legacy_frame_magic, .little);
+    const lb = try lz4.compressBlock(vals, leg_buf[8..], .{});
+    std.mem.writeInt(u32, leg_buf[4..8], @intCast(lb), .little);
+    const leg = leg_buf[0 .. 8 + lb];
     const pre = struct {
         fn with(al: Allocator, len: i64, payload: []const u8) ![]u8 {
             const out = try al.alloc(u8, 8 + payload.len);
@@ -712,7 +825,26 @@ test "compression: declared lengths, broken frames and LZ4 are errors" {
         .{ .want = error.Malformed, .buf = try pre(a, 4, frame) }, // more
         .{ .want = error.Malformed, .buf = try pre(a, 8, "not a zstd frame") },
         .{ .want = error.Malformed, .buf = try pre(a, 8, "") },
-        .{ .want = error.Unsupported, .codec = .lz4_frame, .buf = try pre(a, -1, vals) },
+        // LZ4_FRAME: exactly one LZ4 frame decoding to the declared length (Arrow C++).
+        .{ .want = null, .codec = .lz4_frame, .buf = try pre(a, -1, vals) },
+        .{ .want = null, .codec = .lz4_frame, .buf = try pre(a, 8, lz) },
+        .{ .want = null, .codec = .lz4_frame, .buf = try pre(a, 8, lz_sized) },
+        .{ .want = error.LimitExceeded, .codec = .lz4_frame, .buf = try pre(a, 1 << 40, lz) },
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, -2, lz) },
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = "\x08\x00\x00" },
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 16, lz) }, // fewer than declared
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 7, lz) }, // more
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 7, lz_sized) }, // declares more
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 8, lz_bad_sum[0..lz_sized.len]) },
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 8, lz_bomb) }, // a bomb stops at 8
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 8, leg) }, // a legacy frame
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 8, "\x50\x2a\x4d\x18\x00\x00\x00\x00") }, // skippable
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 8, try std.mem.concat(a, u8, &.{ lz, lz })) }, // two frames
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 8, try std.mem.concat(a, u8, &.{ lz, "\x00" })) }, // trailing byte
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 8, lz[0 .. lz.len - 1]) },
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 8, lz[0..3]) },
+        .{ .want = error.Malformed, .codec = .lz4_frame, .buf = try pre(a, 8, frame) }, // a zstd frame
+        .{ .want = error.Malformed, .buf = try pre(a, 8, lz) }, // an LZ4 frame marked ZSTD
         .{ .want = error.Unsupported, .codec = @fromBackingInt(@intCast(7)), .buf = try pre(a, -1, vals) },
     };
     for (cases, 0..) |c, i| {
@@ -735,6 +867,10 @@ test "compression: declared lengths, broken frames and LZ4 are errors" {
     defer gpa.free(two);
     try testing.expectError(error.LimitExceeded, stream.readStream(a, two, .{ .max_body_bytes = 8 }));
     _ = try stream.readStream(a, two, .{ .max_body_bytes = 9 });
+    const two_lz = try hand(gpa, &fields, &.{.{ .length = 2, .nodes = &.{node}, .bufs = &.{ try pre(a, -1, "\xff"), try pre(a, 8, lz) }, .codec = .lz4_frame }});
+    defer gpa.free(two_lz);
+    try testing.expectError(error.LimitExceeded, stream.readStream(a, two_lz, .{ .max_body_bytes = 8 }));
+    _ = try stream.readStream(a, two_lz, .{ .max_body_bytes = 9 });
 }
 
 test "compression: every truncation and byte flip of a compressed stream is an error or a frame" {

@@ -18,7 +18,7 @@ https://github.com/apache/arrow-testing at commit
 `data/arrow-ipc-stream/integration/`. The files are the Arrow integration
 "golden" files written by Arrow C++: an IPC stream (`.stream`), an IPC file
 (`.arrow_file`) and the Arrow integration JSON describing the same data
-(`.json.gz`). 86 files, 754 425 bytes in all:
+(`.json.gz`). 91 files, 758 545 bytes in all:
 
   - `src/testdata/1.0.0-littleendian/` — from `1.0.0-littleendian/`:
       * all three files of `generated_<set>` for the sets custom_metadata,
@@ -33,8 +33,10 @@ https://github.com/apache/arrow-testing at commit
       * only the `.stream` of interval and union (sets whose types this
         module refuses; the test asserts the refusal).
   - `src/testdata/2.0.0-compression/` — from `2.0.0-compression/`: all three
-    files of `generated_zstd` and `generated_uncompressible_zstd`, and
-    `generated_lz4.stream`.
+    files of `generated_zstd`, `generated_uncompressible_zstd`,
+    `generated_lz4` and `generated_uncompressible_lz4` (the lz4 sets'
+    `.arrow_file`, JSON and `generated_uncompressible_lz4.stream` taken
+    2026-11-17, same commit).
   - `src/testdata/cpp-21.0.0/` — from `cpp-21.0.0/` (taken 2026-11-17, same
     commit): all three files of `generated_<set>` for the sets decimal32,
     decimal64, decimal256, run_end_encoded, binary_view, list_view.
@@ -74,8 +76,8 @@ Scope of this file
 
 This file is about the reproduced golden files and nothing else. The rest of
 the module is zig-libs' own MIT work, written from the Arrow columnar format
-specification (see `README.md`, Provenance); no Arrow source was read or
-ported.
+specification (see `README.md`, Provenance); no Arrow source was ported (Arrow
+C++ and arrow-rs were read for behaviour choices only).
 
 
 Apache License 2.0, reproduced in full per §4(a)

@@ -9,7 +9,7 @@
 //! encoding (time units, decimal scales, hex binary, dictionary indices,
 //! offsets), not through the reader's code. Then: the stream and the file read
 //! equal, each file batch is the JSON batch's length, and the frame written
-//! back by this module (plain and zstd-compressed, stream and file) reads equal.
+//! back by this module (plain, zstd- and lz4-compressed, stream and file) reads equal.
 //! A Map reads as a list of its entries struct. The sets with types `dataframe`
 //! has no column for are `error.Unsupported`,
 //! with and without `ReadOptions.lossy`.
@@ -76,6 +76,9 @@ const sets = [_]Set{
     set(v1, "decimal", false, .lossy),
     set(v2, "zstd", true, .exact),
     set(v2, "uncompressible_zstd", true, .exact),
+    // LZ4_FRAME bodies (each buffer one LZ4 frame, as Arrow C++ writes it).
+    set(v2, "lz4", true, .exact),
+    set(v2, "uncompressible_lz4", true, .exact),
     // Decimal32 / Decimal64 (precision 3..9 / 3..18, scale 2) widen exactly.
     set(c21, "decimal32", true, .exact),
     set(c21, "decimal64", true, .exact),
@@ -97,12 +100,10 @@ const sets = [_]Set{
     set(v4, "shared_dict", true, .exact),
 };
 
-/// Sets with a type `dataframe` has no column for (or a codec the collection lacks):
-/// only their `.stream` is committed.
+/// Sets with a type `dataframe` has no column for: only their `.stream` is committed.
 const refused = [_]struct { []const u8, []const u8 }{
     .{ "interval", @embedFile(v1 ++ "interval.stream") },
     .{ "union", @embedFile(v1 ++ "union.stream") },
-    .{ "lz4", @embedFile(v2 ++ "lz4.stream") },
 };
 
 fn gunzip(a: Allocator, gz: []const u8) ![]u8 {
@@ -578,7 +579,7 @@ test "golden: apache/arrow-testing integration files read field by field equal t
         // What this module writes of the frame and of its metadata reads back equal,
         // plain and compressed (a run-end encoded field is written back plain, a Map as a
         // List of its entries struct: the metadata read has the frame's shape either way).
-        for ([_]stream.Compression{ .none, .zstd }) |c| {
+        for ([_]stream.Compression{ .none, .zstd, .lz4 }) |c| {
             const wo: stream.WriteOptions = .{ .compression = c, .rows_per_batch = 8, .schema_metadata = md.schema, .field_metadata = md.fields };
             for ([_]bool{ false, true }) |file| {
                 var bmd: stream.Metadata = .{};
