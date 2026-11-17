@@ -1186,3 +1186,146 @@ test "isProbablePrime: known small primes pass, known composites fail" {
     const composite = try PrimeModulus.fromPrimitive(u64, 1_000_003 * 999_983);
     try testing.expect(!isProbablePrime(composite, random));
 }
+
+// ── whole-module mutation (2026-11-17): the tests its survivors asked for ───
+
+test "incrementCandidateByTwo: carries ripple through 0xff bytes, and a plain byte takes exactly +2" {
+    var buf: [prime_bytes]u8 = @splat(0);
+    buf[0] = 0x80;
+    buf[prime_bytes - 1] = 0xfd;
+    incrementCandidateByTwo(&buf); // 0xfd + 2 = 0xff: no carry
+    try testing.expectEqual(@as(u8, 0xff), buf[prime_bytes - 1]);
+    try testing.expectEqual(@as(u8, 0), buf[prime_bytes - 2]);
+    incrementCandidateByTwo(&buf); // 0xff + 2 = 0x101: low byte 1, carry 1
+    try testing.expectEqual(@as(u8, 0x01), buf[prime_bytes - 1]);
+    try testing.expectEqual(@as(u8, 0x01), buf[prime_bytes - 2]);
+
+    // A chain: ... 12 ff ff ff -> ... 13 00 00 01.
+    buf = @splat(0);
+    buf[0] = 0x80;
+    buf[prime_bytes - 4] = 0x12;
+    buf[prime_bytes - 3] = 0xff;
+    buf[prime_bytes - 2] = 0xff;
+    buf[prime_bytes - 1] = 0xff;
+    incrementCandidateByTwo(&buf);
+    try testing.expectEqualSlices(u8, &.{ 0x13, 0x00, 0x00, 0x01 }, buf[prime_bytes - 4 ..]);
+    try testing.expectEqual(@as(u8, 0x80), buf[0]);
+    for (buf[1 .. prime_bytes - 4]) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "isProbablePrime: primes whose n-1 has a long run of factors of two pass (2-adic valuation 8, 12, 13, 16, 18)" {
+    var prng = std.Random.DefaultPrng.init(7);
+    // 257 = 2^8 + 1, 12289 = 3*2^12 + 1, 40961 = 5*2^13 + 1, 65537 = 2^16 + 1,
+    // 786433 = 3*2^18 + 1: s = 8, 12, 13, 16, 18 -- a byte shift of 1 or 2 and
+    // a bit shift of 0, 4, 5 and 2 in `shrBytesBe`.
+    for ([_]u64{ 257, 12289, 40961, 65537, 786433 }) |p| {
+        const pm = try PrimeModulus.fromPrimitive(u64, p);
+        try testing.expect(isProbablePrime(pm, prng.random()));
+    }
+    // And their odd neighbours that are composite do not.
+    for ([_]u64{ 259, 12291, 40963, 65541, 786435, 257 * 257 }) |c| {
+        const cm = try PrimeModulus.fromPrimitive(u64, c);
+        try testing.expect(!isProbablePrime(cm, prng.random()));
+    }
+}
+
+/// A witness source that yields `prefix` first, then cycles `good`, one value
+/// per draw, as a big-endian integer filling the draw.
+const ScriptedWitness = struct {
+    prefix: []const u64,
+    good: []const u64,
+    pos: usize = 0,
+
+    fn fill(ptr: *anyopaque, buf: []u8) void {
+        const self: *ScriptedWitness = @ptrCast(@alignCast(ptr));
+        const v = if (self.pos < self.prefix.len) self.prefix[self.pos] else self.good[(self.pos - self.prefix.len) % self.good.len];
+        self.pos += 1;
+        @memset(buf, 0);
+        var w = v;
+        var i = buf.len;
+        while (i > 0 and w != 0) {
+            i -= 1;
+            buf[i] = @truncate(w);
+            w >>= 8;
+        }
+    }
+
+    fn random(self: *ScriptedWitness) std.Random {
+        return .{ .ptr = self, .fillFn = fill };
+    }
+};
+
+test "isProbablePrime: the witnesses 0, 1 and n-1 are redrawn, never used" {
+    const good = [_]u64{ 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37 };
+
+    // A prime survives the redraws (a witness 0 would call it composite).
+    const p: u64 = 1_000_003;
+    const pm = try PrimeModulus.fromPrimitive(u64, p);
+    var sw: ScriptedWitness = .{ .prefix = &.{ 0, 1, p - 1 }, .good = &good };
+    try testing.expect(isProbablePrime(pm, sw.random()));
+    try testing.expect(sw.pos >= 3 + mr_rounds); // the three bad draws were consumed, then every round drew
+
+    // A composite is not rescued by 64 liars: 1 and n-1 pass every round of
+    // every odd n, so a test that used them would call 561 prime.
+    const c: u64 = 561;
+    const cm = try PrimeModulus.fromPrimitive(u64, c);
+    for ([_]u64{ 1, c - 1 }) |liar| {
+        var prefix: [mr_rounds]u64 = @splat(liar);
+        var sc: ScriptedWitness = .{ .prefix = &prefix, .good = &good };
+        try testing.expect(!isProbablePrime(cm, sc.random()));
+    }
+}
+
+test "isProbablePrime: a single round is not enough to call a composite prime" {
+    // 91 = 7 * 13 is a strong pseudoprime to many bases; with one round some
+    // seeds would call it prime, with the production 64 none does.
+    const cm = try PrimeModulus.fromPrimitive(u64, 91);
+    var seed: u64 = 0;
+    while (seed < 200) : (seed += 1) {
+        var prng = std.Random.DefaultPrng.init(seed);
+        try testing.expect(!isProbablePrime(cm, prng.random()));
+    }
+}
+
+test "Proof.toBytes: only a buffer of exactly modulus_bytes is accepted" {
+    const proof: Proof = .{ .pi = @splat(7) };
+    var small: [group.modulus_bytes - 1]u8 = undefined;
+    var big: [group.modulus_bytes + 1]u8 = undefined;
+    var exact: [group.modulus_bytes]u8 = undefined;
+    try testing.expectError(error.WrongLength, proof.toBytes(&small));
+    try testing.expectError(error.WrongLength, proof.toBytes(&big));
+    try proof.toBytes(&exact);
+    try testing.expectEqualSlices(u8, &proof.pi, &exact);
+}
+
+test "prove: an element outside the group, or a non-canonical y, is InvalidElement (not a proof)" {
+    const m = group.rsa2048ChallengeModulus();
+    var n_bytes: [group.modulus_bytes]u8 = undefined;
+    try m.toBytes(&n_bytes, .big);
+    const five = smallElement(5);
+    const zero: [group.modulus_bytes]u8 = @splat(0);
+    // y = 0 and y = N are not elements; x = 0 neither.
+    try testing.expectError(error.InvalidElement, prove(m, &five, &zero, 3));
+    try testing.expectError(error.InvalidElement, prove(m, &five, &n_bytes, 3));
+    try testing.expectError(error.InvalidElement, prove(m, &zero, &five, 3));
+    try testing.expectError(error.InvalidElement, prove(m, &n_bytes, &five, 3));
+    // y = N - 5 is an element but not the class representative.
+    const y_big = group.negate(m, try group.elementFromBytes(m, &five));
+    var y_bytes: [group.modulus_bytes]u8 = undefined;
+    try group.toBytes(y_big, &y_bytes);
+    try testing.expectError(error.InvalidElement, prove(m, &five, &y_bytes, 3));
+}
+
+test "isProbablePrime: the 2-adic valuation of n-1 is counted in full (a chain cut short accepts these composites)" {
+    const good = [_]u64{ 2, 3, 5, 7 };
+    // 513 = 3^3 * 19, n-1 = 2^9: base 134 is a witness; with the valuation cut
+    // to 8 (a zero low byte read as the end of the count) it would pass.
+    // 1281 = 3 * 7 * 61, n-1 = 2^8 * 5: base 20 is a witness; with the
+    // valuation cut to 7 it would pass.
+    for ([_]struct { n: u64, base: u64 }{ .{ .n = 513, .base = 134 }, .{ .n = 1281, .base = 20 } }) |c| {
+        const cm = try PrimeModulus.fromPrimitive(u64, c.n);
+        var prefix: [mr_rounds]u64 = @splat(c.base);
+        var sw: ScriptedWitness = .{ .prefix = &prefix, .good = &good };
+        try testing.expect(!isProbablePrime(cm, sw.random()));
+    }
+}

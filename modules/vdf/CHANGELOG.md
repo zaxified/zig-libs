@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — Whole-module mutation of `src/vdf.zig` and `src/group.zig` (145 mutants, 125 killed, 20 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts; no `verify` survivor is a soundness gap). 7 tests added (see SPEC § Audit 2026-11-17). No source change, no behaviour change.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Ported to Zig 0.17.0. `std.meta.Int` -> `@Int` (vdf.zig).
