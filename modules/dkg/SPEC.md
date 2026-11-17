@@ -6,7 +6,7 @@
 
 **Scope:** mvp — ZcashFoundation/frost frost-core 3.0.0 `keys::dkg`, bnb-chain/tss-lib keygen (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-03 · mutation 2026-10-03 · src ?
+**Audit:** review 2026-10-03 · mutation 2026-11-17 (128/154, 26 eq) · src 504c7a3f30d9b1a9
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per decoder clean, handlers at scale 5,000, DKG_FUZZ) · ct 2026-09-09 (ctgrind)
 
