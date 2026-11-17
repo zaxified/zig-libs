@@ -63,6 +63,9 @@ pub const MsgFlags = struct {
     }
 };
 
+/// RFC 3412 §6: the smallest legal `msgMaxSize`.
+pub const min_msg_max_size: i32 = 484;
+
 /// The `msgGlobalData` header fields (RFC 3412 §6).
 pub const HeaderData = struct {
     msg_id: i32,
@@ -190,9 +193,17 @@ fn decodeHeader(content: []const u8) DecodeError!HeaderData {
     if (flags_os.len != 1) return error.InvalidValue;
     const security_model = try ber.parseInteger(try d.expect(ber.tag.integer));
     if (!d.done()) return error.TrailingData;
+    // RFC 3412 §6 SYNTAX: msgID 0..2147483647, msgMaxSize 484..2147483647. A
+    // value outside it makes the message no serialization of an SNMPv3Message
+    // (§7.2.2: snmpInASNParseErrs, discard). Same as net-snmp's `snmpv3_parse`
+    // (snmplib/snmp_api.c: "Received bad msgID" / "bad msgMaxSize").
+    const id32 = std.math.cast(i32, msg_id) orelse return error.IntegerTooLarge;
+    const max32 = std.math.cast(i32, max_size) orelse return error.IntegerTooLarge;
+    if (id32 < 0) return error.InvalidValue;
+    if (max32 < min_msg_max_size) return error.InvalidValue;
     return .{
-        .msg_id = std.math.cast(i32, msg_id) orelse return error.IntegerTooLarge,
-        .msg_max_size = std.math.cast(i32, max_size) orelse return error.IntegerTooLarge,
+        .msg_id = id32,
+        .msg_max_size = max32,
         .flags = MsgFlags.fromByte(flags_os[0]),
         .security_model = ber.toUnsigned(u32, security_model) orelse return error.IntegerTooLarge,
     };
@@ -855,4 +866,22 @@ test "mutation audit: msgID, msgMaxSize and msgSecurityModel outside their integ
     // The largest legal values still decode.
     const edge = try decode(try handBuilt(&buf, .{ .msg_id = 2147483647, .max_size = 2147483647 }));
     try testing.expectEqual(@as(i32, 2147483647), edge.header.msg_max_size);
+}
+
+test "msgID and msgMaxSize outside their RFC 3412 ranges are InvalidValue" {
+    var buf: [128]u8 = undefined;
+    // msgID 0..2^31-1.
+    try testing.expectError(error.InvalidValue, decode(try handBuilt(&buf, .{ .msg_id = -1 })));
+    try testing.expectError(error.InvalidValue, decode(try handBuilt(&buf, .{ .msg_id = -2147483648 })));
+    try testing.expectEqual(@as(i32, 0), (try decode(try handBuilt(&buf, .{ .msg_id = 0 }))).header.msg_id);
+    try testing.expectEqual(@as(i32, 2147483647), (try decode(try handBuilt(&buf, .{ .msg_id = 2147483647 }))).header.msg_id);
+    // msgMaxSize 484..2^31-1.
+    try testing.expectError(error.InvalidValue, decode(try handBuilt(&buf, .{ .max_size = -1 })));
+    try testing.expectError(error.InvalidValue, decode(try handBuilt(&buf, .{ .max_size = 0 })));
+    try testing.expectError(error.InvalidValue, decode(try handBuilt(&buf, .{ .max_size = 483 })));
+    try testing.expectEqual(@as(i32, 484), (try decode(try handBuilt(&buf, .{ .max_size = 484 }))).header.msg_max_size);
+    try testing.expectEqual(@as(i32, 485), (try decode(try handBuilt(&buf, .{ .max_size = 485 }))).header.msg_max_size);
+    try testing.expectEqual(@as(i32, 2147483647), (try decode(try handBuilt(&buf, .{ .max_size = 2147483647 }))).header.msg_max_size);
+    // The encoder's default round-trips.
+    try testing.expectEqual(@as(i32, 1472), (try decode(try handBuilt(&buf, .{}))).header.msg_max_size);
 }

@@ -291,7 +291,8 @@ pub const V3Client = struct {
         return .{
             .transport = transport,
             .user = user,
-            .next_msg_id = options.initial_msg_id,
+            // RFC 3412 §6: msgID is 0..2^31-1; a negative start would put an illegal value on the wire.
+            .next_msg_id = @max(options.initial_msg_id, 0),
             .next_request_id = options.initial_request_id,
             .salt_source = priv.SaltSource.counter(if (options.salt_seed) |s| s.value() else 0),
             .salt_seeded = options.salt_seed != null,
@@ -2057,6 +2058,20 @@ test "a reply with another msgID is MsgIdMismatch" {
     var c = try auditSeeded(&agent, audit_plain_user);
     agent.force_msg_id = 9999;
     try testing.expectError(error.MsgIdMismatch, c.get(&.{try Oid.parse(audit_oid)}));
+}
+
+test "a negative initial_msg_id is raised to 0, so no msgID outside RFC 3412's 0..2^31-1 is sent" {
+    const vals = try sysNameVarBinds();
+    var agent: FakeAgent = .{ .user = audit_plain_user, .values = &vals };
+    var c = V3Client.init(agent.transport(), audit_plain_user, .{ .initial_msg_id = -5 });
+    try testing.expectEqual(@as(i32, 0), c.next_msg_id);
+    const c0 = V3Client.init(agent.transport(), audit_plain_user, .{ .initial_msg_id = 0 });
+    try testing.expectEqual(@as(i32, 0), c0.next_msg_id);
+    const c1 = V3Client.init(agent.transport(), audit_plain_user, .{ .initial_msg_id = 1 });
+    try testing.expectEqual(@as(i32, 1), c1.next_msg_id);
+    try c.seedEngine(agent.engine_id, agent.boots, agent.time);
+    _ = try c.get(&.{try Oid.parse(audit_oid)});
+    try testing.expectEqual(@as(i32, 1), c.next_msg_id);
 }
 
 test "message and request ids wrap from 2^31 - 1 to 1" {

@@ -770,7 +770,8 @@ test "golden replay through V3Client: the captured discovery Report drives the h
 // SNMP_TEST_USER (default "shaAesUser"), SNMP_TEST_AUTH_PASSWORD and
 // SNMP_TEST_PRIV_PASSWORD (default "maplesyrup"), SNMP_TEST_AUTH_PROTO
 // (md5 | sha1 | sha224 | sha256 | sha384 | sha512, default sha1) and
-// SNMP_TEST_PRIV_PROTO (des | aes, default aes) and SNMP_TEST_LEVEL
+// SNMP_TEST_PRIV_PROTO (des | aes | AES192 | AES256 | AES192C | AES256C,
+// default aes; the last four are net-snmp's `-x` spellings) and SNMP_TEST_LEVEL
 // (noAuthNoPriv | authNoPriv | authPriv, default authPriv). Without
 // SNMP_TEST_AGENT, or if the agent does not answer, the test prints SKIPPED and
 // passes.
@@ -794,6 +795,11 @@ fn privProtoFromEnv() ?priv.PrivProtocol {
     const name = envVar("SNMP_TEST_PRIV_PROTO") orelse return .aes128_cfb;
     if (std.mem.eql(u8, name, "des")) return .des_cbc;
     if (std.mem.eql(u8, name, "aes")) return .aes128_cfb;
+    // net-snmp `-x` spellings: AES192/AES256 (Blumenthal), AES192C/AES256C (Cisco/Reeder).
+    if (std.mem.eql(u8, name, "AES192")) return .aes192_cfb;
+    if (std.mem.eql(u8, name, "AES256")) return .aes256_cfb;
+    if (std.mem.eql(u8, name, "AES192C")) return .aes192_cisco_cfb;
+    if (std.mem.eql(u8, name, "AES256C")) return .aes256_cisco_cfb;
     return null;
 }
 
