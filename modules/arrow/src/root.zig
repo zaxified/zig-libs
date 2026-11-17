@@ -53,6 +53,7 @@ test {
     _ = ipc;
     _ = stream;
     _ = @import("stream_test.zig");
+    _ = @import("hostile_test.zig");
     _ = @import("golden_test.zig");
     _ = @import("fuzz_test.zig");
 }

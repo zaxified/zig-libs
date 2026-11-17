@@ -31,7 +31,10 @@ const ColumnType = df.ColumnType;
 const ColumnData = df.ColumnData;
 const Value = df.Value;
 
-pub const Error = error{ OutOfMemory, Malformed, Unsupported, LimitExceeded };
+/// `InvalidUtf8`: a `.text` cell that is not UTF-8 on write (Arrow's Utf8 requires it, and
+/// other readers refuse the file), or a Utf8 / LargeUtf8 value that is not on read (unless
+/// `ReadOptions.validate_utf8` is off).
+pub const Error = error{ OutOfMemory, Malformed, Unsupported, LimitExceeded, InvalidUtf8 };
 
 pub const WriteOptions = struct {
     /// Rows per `RecordBatch`; 0 writes the whole frame as one batch.
@@ -59,23 +62,45 @@ pub const ReadOptions = struct {
     /// Bounds the memory a small hostile stream can ask for where a length is not
     /// backed by bytes (a Null column, a list of nulls, a struct without fields).
     max_rows: u64 = 1 << 27,
-    /// The most bytes one compressed message body may expand to (the uncompressed lengths
-    /// its buffers declare, summed); past it `error.LimitExceeded`. Bounds what a small
-    /// compressed stream can make the reader allocate.
+    /// The most bytes the compressed message bodies of the WHOLE read may expand to: the
+    /// uncompressed lengths every buffer of every record and dictionary batch declares,
+    /// summed over the stream (or over every block of a file, which `openFile` inflates at
+    /// once); past it `error.LimitExceeded`. Bounds what a small compressed input (zstd
+    /// reaches ~32 000:1 on a run of one byte) can make the reader allocate.
     max_body_bytes: u64 = 1 << 31,
-    /// A value `dataframe` cannot hold reads as a null cell instead of failing the whole
-    /// read with `error.Unsupported`: a Decimal128 that does not fit 12 fractional digits in
-    /// an i128, a time of day outside `[0, 24h)` (Arrow allows 24:00:00), a date outside
-    /// the years 0000-9999, a timestamp or duration in s/ms whose microseconds overflow
-    /// i64. A timestamp zone `dataframe`'s `tz` does not know reads as a naive column (the
-    /// instants are UTC either way; only the `time_zone` tag is dropped). Nothing else
-    /// changes: a malformed stream is still an error.
+    /// The most array slots the whole read may decode: the length of every array — each
+    /// column, each list's or fixed-size list's child, each struct field, each dictionary —
+    /// summed over every batch, plus the rows a dictionary column copies out of its
+    /// dictionary; past it `error.LimitExceeded`. `max_rows` bounds one array; this bounds
+    /// their number times their length, which matters where rows cost no body bytes (a
+    /// FixedSizeBinary(0) or FixedSizeList(0) column, a Null child): the reader spends up
+    /// to ~16 bytes per slot on offsets and selectors. `File.readBatch` / `readAll` decode
+    /// within what the file's metadata left of it, each call afresh.
+    max_cells: u64 = 1 << 28,
+    /// Utf8 / LargeUtf8 values (a categorical's dictionary included) must be UTF-8, as the
+    /// format requires: `error.InvalidUtf8` otherwise (arrow-rs checks by default too).
+    /// `false` skips the check for a trusted input; the frame may then hold text the
+    /// writer refuses.
+    validate_utf8: bool = true,
+    /// A value `dataframe` cannot hold, or holds only inexactly, no longer fails the whole
+    /// read with `error.Unsupported`:
+    /// - read as a null cell: a Decimal128 that does not fit 12 fractional digits in an
+    ///   i128, or with more digits than its declared precision; a time of day outside
+    ///   `[0, 24h)` (Arrow allows 24:00:00); a date outside the years 0000-9999; a
+    ///   timestamp or duration in s/ms whose microseconds overflow i64;
+    /// - truncated toward zero: a nanosecond timestamp, duration or time with digits past
+    ///   the microsecond (`dataframe` keeps microseconds), and a Date64 that is not on a
+    ///   day boundary (so -1 ms reads as 1970-01-01, not 1969-12-31);
+    /// - a timestamp zone `dataframe`'s `tz` does not know reads as a naive column (the
+    ///   instants are UTC either way; only the `time_zone` tag is dropped).
+    /// Nothing else changes: a malformed stream is still an error.
     lossy: bool = false,
 };
 
 /// A selector entry meaning "a null cell" (also what `ColumnData.get` reads past the end).
 const none = std.math.maxInt(usize);
 const us_per_day: i64 = 86_400 * df.timestamp_units_per_second;
+const ms_per_day: i64 = 86_400_000;
 
 /// The physical layouts both directions handle.
 const Kind = enum { null_, i8, i16, i32, i64, u8, u16, u32, u64, f16, f32, f64, bool_, dec, date32, date64, time32, time64, ts, dur, var32, var64, fsb, dict, list32, list64, fsl, struct_ };
@@ -145,7 +170,7 @@ const Writer = struct {
             },
             .decimal => {
                 f.kind = .dec;
-                f.arrow = .{ .decimal = .{ .precision = 38, .scale = decimal_digits } };
+                f.arrow = .{ .decimal = .{ .precision = try decimalPrecision(data, rows), .scale = decimal_digits } };
             },
             .text, .binary => {
                 const large = textBytes(data, rows) >= w.opts.large_from;
@@ -376,7 +401,11 @@ const Writer = struct {
                     bits.set(i, v != .null);
                     switch (v) {
                         .null => {},
-                        .text => |t| try data.appendSlice(a, t),
+                        .text => |t| {
+                            // Utf8 must hold UTF-8: other readers refuse the whole file otherwise.
+                            if (wf.ty == .text and !std.unicode.utf8ValidateSlice(t)) return error.InvalidUtf8;
+                            try data.appendSlice(a, t);
+                        },
                         else => return error.Unsupported,
                     }
                     if (!wide and data.items.len > std.math.maxInt(i32)) return error.Unsupported;
@@ -478,6 +507,41 @@ const Bits = struct {
 
 /// The 12 fractional digits of `dataframe`'s decimal (`df.decimal_scale`).
 const decimal_digits = 12;
+
+/// Decimal128 holds at most 38 digits.
+const max_precision = 38;
+
+/// 10^k for k in 0..38 (10^38 still fits a u128).
+const pow10 = blk: {
+    var t: [max_precision + 1]u128 = undefined;
+    t[0] = 1;
+    for (1..t.len) |i| t[i] = t[i - 1] * 10;
+    break :blk t;
+};
+
+/// Digits of |x| (1 for 0); 39 for anything Decimal128 cannot hold.
+fn digitCount(x: i128) i32 {
+    const u = @abs(x);
+    var n: usize = 1;
+    while (n <= max_precision and u >= pow10[n]) n += 1;
+    return @intCast(n);
+}
+
+/// The precision a decimal column is written with: the digits of its widest value, at
+/// least the scale (so scale <= precision, which some readers require); a value of more
+/// than 38 digits has no Decimal128 form (`Unsupported`).
+fn decimalPrecision(data: ColumnData, rows: usize) Error!i32 {
+    var p: i32 = decimal_digits;
+    for (0..rows) |r| switch (data.get(r)) {
+        .decimal => |x| {
+            const d = digitCount(x);
+            if (d > max_precision) return error.Unsupported;
+            p = @max(p, d);
+        },
+        else => {},
+    };
+    return p;
+}
 
 fn storageType(data: ColumnData) ?ColumnType {
     return switch (data) {
@@ -694,8 +758,9 @@ const RField = struct {
     unit: schema.TimeUnit = .microsecond,
     /// FixedSizeBinary width, FixedSizeList size.
     width: usize = 0,
-    /// Decimal scale.
+    /// Decimal scale and precision.
     scale: i32 = 0,
+    precision: i32 = max_precision,
     /// Dictionary index type.
     index: schema.IntType = .{ .bits = 32, .signed = true },
     children: []RField = &.{},
@@ -704,6 +769,9 @@ const RField = struct {
 
 const RDict = struct {
     id: i64,
+    /// The schema field that declared it (without its dictionary encoding): a second field
+    /// sharing the id must have the same value type.
+    field: schema.Field,
     value: RField,
     nodes: usize,
     bufs: usize,
@@ -720,8 +788,19 @@ const Reader = struct {
     a: Allocator,
     opts: ReadOptions,
     dicts: std.ArrayList(*RDict) = .empty,
+    by_id: std.AutoHashMapUnmanaged(i64, *RDict) = .empty,
     /// Made at the first zstd-compressed buffer (its tables come from the arena).
     zd: ?zstd.Decompressor = null,
+    /// Bytes inflated so far, against `ReadOptions.max_body_bytes`.
+    inflated: u64 = 0,
+    /// Array slots so far, against `ReadOptions.max_cells`.
+    cells: u64 = 0,
+
+    /// Counts `n` array slots against `ReadOptions.max_cells`.
+    fn charge(r: *Reader, n: u64) Error!void {
+        r.cells +|= n;
+        if (r.cells > r.opts.max_cells) return error.LimitExceeded;
+    }
 
     fn plan(r: *Reader, f: schema.Field, ctr: *Counter, depth: usize, in_dict: bool) Error!RField {
         if (depth >= schema.max_depth) return error.Malformed;
@@ -729,16 +808,27 @@ const Reader = struct {
         ctr.nodes += 1;
         if (f.dictionary) |d| {
             if (in_dict) return error.Unsupported; // a dictionary inside a dictionary's values
-            for (r.dicts.items) |x| if (x.id == d.id) return error.Malformed;
             ctr.bufs += 2;
             rf.kind = .dict;
             rf.index = d.index;
             var vf = f;
             vf.dictionary = null;
+            if (r.by_id.get(d.id)) |rd| {
+                // Two fields sharing one dictionary, which Arrow allows: their value types
+                // must agree (each field keeps its own index type).
+                if (!sameValueType(rd.field, vf)) return error.Malformed;
+                if (rd.ordered != d.ordered) return error.Unsupported; // one dictionary, two orders
+                rf.dict = rd;
+                rf.col = rd.value.col;
+                rf.col.name = try r.a.dupe(u8, f.name);
+                if (rd.categorical) rf.col.type = .categorical;
+                return rf;
+            }
             var vctr: Counter = .{};
             const rd = try r.a.create(RDict);
             rd.* = .{
                 .id = d.id,
+                .field = vf,
                 .value = try r.plan(vf, &vctr, depth, true),
                 .nodes = vctr.nodes,
                 .bufs = vctr.bufs,
@@ -746,6 +836,7 @@ const Reader = struct {
                 .categorical = vf.type == .utf8 or vf.type == .large_utf8,
             };
             try r.dicts.append(r.a, rd);
+            try r.by_id.put(r.a, d.id, rd);
             rf.dict = rd;
             rf.col = rd.value.col;
             if (rd.categorical) rf.col.type = .categorical;
@@ -782,8 +873,10 @@ const Reader = struct {
             },
             .decimal => |d| {
                 if (d.bits != 128) return error.Unsupported;
+                if (d.precision < 1 or d.precision > max_precision) return error.Malformed; // no Decimal128
                 rf.kind = .dec;
                 rf.scale = d.scale;
+                rf.precision = d.precision;
                 rf.col.type = .decimal;
             },
             .date => |u| {
@@ -884,9 +977,7 @@ const Reader = struct {
     fn takeDict(r: *Reader, msg: schema.Message, body: []const u8) Error!void {
         const h = msg.header orelse return error.Malformed;
         const db = ipc.decodeDictionaryBatch(r.a, h, body.len) catch |e| return noEos(e);
-        const d = for (r.dicts.items) |x| {
-            if (x.id == db.id) break x;
-        } else return error.Malformed;
+        const d = r.by_id.get(db.id) orelse return error.Malformed;
         if (!db.is_delta and d.chunks.items.len > 0) return error.Unsupported; // replacement
         try r.checkBatch(db.data, .{ .nodes = d.nodes, .bufs = d.bufs }, (&d.value)[0..1]);
         try d.chunks.append(r.a, try r.inflate(db.data, body));
@@ -903,6 +994,10 @@ const Reader = struct {
     }
 
     fn frame(r: *Reader, top: *const Top, chunks: []const Chunk) Error!df.Frame {
+        // What decoding copies out of dictionaries counts against `max_cells` for this
+        // call only: `File.readBatch` may decode the same batch again.
+        const saved = r.cells;
+        defer r.cells = saved;
         var total: u64 = 0;
         for (chunks) |c| total += @intCast(c.rb.length);
         if (total > r.opts.max_rows) return error.LimitExceeded;
@@ -916,11 +1011,12 @@ const Reader = struct {
     }
 
     /// A batch's shape against the schema: node and buffer counts, every length within
-    /// `max_rows`, every top-level column as long as the batch.
-    fn checkBatch(r: *const Reader, rb: ipc.RecordBatch, ctr: Counter, top: []const RField) Error!void {
+    /// `max_rows`, every top-level column as long as the batch; every array's length
+    /// counted against `max_cells`.
+    fn checkBatch(r: *Reader, rb: ipc.RecordBatch, ctr: Counter, top: []const RField) Error!void {
         if (rb.nodes.len != ctr.nodes or rb.buffers.len != ctr.bufs) return error.Malformed;
         if (@as(u64, @intCast(rb.length)) > r.opts.max_rows) return error.LimitExceeded;
-        for (rb.nodes) |nd| _ = try r.rows(nd);
+        for (rb.nodes) |nd| try r.charge(try r.rows(nd));
         for (top) |f| if (rb.nodes[f.node_ix].length != rb.length) return error.Malformed;
     }
 
@@ -931,13 +1027,16 @@ const Reader = struct {
         const codec = rb.compression orelse return .{ .rb = rb, .body = body };
         // LZ4_FRAME: the collection has no LZ4 codec yet; any other value is not Arrow's.
         if (codec != .zstd) return error.Unsupported;
+        // The cap is over the whole read, not this message: K small messages of RLE frames
+        // would otherwise expand K times the cap.
         var total: u64 = 0;
         for (rb.buffers) |l| {
             const src = locBytes(body, l);
             if (src.len == 0) continue;
             total +|= try rawLen(src);
-            if (total > r.opts.max_body_bytes) return error.LimitExceeded;
+            if (r.inflated +| total > r.opts.max_body_bytes) return error.LimitExceeded;
         }
+        r.inflated += total;
         const out = try r.a.alloc(u8, @intCast(total));
         const locs = try r.a.alloc(ipc.BufferLoc, rb.buffers.len);
         var at: usize = 0;
@@ -1002,12 +1101,18 @@ const Reader = struct {
             },
             .dec => blk: {
                 const v = try r.raw(i128, rf, chunks, n, valid);
-                for (v, 0..) |*x, i| x.* = rescale(x.*, rf.scale) catch try r.drop(&valid, n, i);
+                for (v, 0..) |*x, i| {
+                    // More digits than the declared precision is not a value of this type;
+                    // more than 38 at 12 fractional digits has no Decimal128 form to write back.
+                    const fits = @abs(x.*) < pow10[@intCast(rf.precision)];
+                    x.* = (if (fits) rescale(x.*, rf.scale) else error.Unsupported) catch try r.drop(&valid, n, i);
+                    if (digitCount(x.*) > max_precision) x.* = try r.drop(&valid, n, i);
+                }
                 break :blk typed("decimal", v, valid, n);
             },
             .ts, .dur => blk: {
                 const v = try r.raw(i64, rf, chunks, n, valid);
-                for (v, 0..) |*x, i| x.* = toMicros(x.*, rf.unit) catch try r.drop(&valid, n, i);
+                for (v, 0..) |*x, i| x.* = toMicros(x.*, rf.unit, r.opts.lossy) catch try r.drop(&valid, n, i);
                 break :blk typed("int", v, valid, n);
             },
             .time32, .time64 => blk: {
@@ -1016,7 +1121,7 @@ const Reader = struct {
                     for (v, try r.raw(i32, rf, chunks, n, valid)) |*o, x| o.* = x;
                 } else @memcpy(v, try r.raw(i64, rf, chunks, n, valid));
                 for (v, 0..) |*x, i| {
-                    x.* = toMicros(x.*, rf.unit) catch try r.drop(&valid, n, i);
+                    x.* = toMicros(x.*, rf.unit, r.opts.lossy) catch try r.drop(&valid, n, i);
                     // 24:00:00 and beyond: no `.time` value.
                     if (x.* < 0 or x.* >= us_per_day) x.* = try r.drop(&valid, n, i);
                 }
@@ -1027,7 +1132,12 @@ const Reader = struct {
                 if (rf.kind == .date32) {
                     for (days, try r.raw(i32, rf, chunks, n, valid)) |*o, x| o.* = x;
                 } else {
-                    for (days, try r.raw(i64, rf, chunks, n, valid)) |*o, x| o.* = @divFloor(x, 86_400_000);
+                    // Date64 counts milliseconds of whole days; anything between is an inexact
+                    // date (null slots are 0).
+                    for (days, try r.raw(i64, rf, chunks, n, valid)) |*o, x| {
+                        if (@rem(x, ms_per_day) != 0 and !r.opts.lossy) return error.Unsupported;
+                        o.* = @divTrunc(x, ms_per_day);
+                    }
                 }
                 for (days, 0..) |*d, i| {
                     if (!isSet(valid, i)) continue;
@@ -1141,6 +1251,8 @@ const Reader = struct {
     fn text(r: *Reader, rf: *const RField, chunks: []const Chunk, n: usize, valid: ?[]u64) Error!ColumnData {
         const wide = rf.kind == .var64;
         const ow: usize = if (wide) 8 else 4;
+        // Utf8 / LargeUtf8 (Binary and FixedSizeBinary read as `.binary`).
+        const check = r.opts.validate_utf8 and rf.col.type == .text;
         for (chunks) |c| {
             const len: usize = @intCast(c.rb.nodes[rf.node_ix].length);
             if (len == 0) continue;
@@ -1169,7 +1281,11 @@ const Reader = struct {
                     hi = try readOff(offs, i + 1, wide);
                     if (lo > hi or hi > data.len) return error.Malformed;
                 }
-                if (isSet(valid, base + i)) try bytes.appendSlice(r.a, data[lo..hi]);
+                if (isSet(valid, base + i)) {
+                    const s = data[lo..hi];
+                    if (check and !std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
+                    try bytes.appendSlice(r.a, s);
+                }
                 offsets[base + i + 1] = bytes.items.len;
             }
             base += len;
@@ -1221,7 +1337,7 @@ const Reader = struct {
         if (d.categorical) return r.categorical(d, codes, valid, n);
         const sel = try r.a.alloc(usize, n);
         for (sel, codes, 0..) |*s, k, i| s.* = if (isSet(valid, i)) k else none;
-        return gather(r.a, d.data, sel);
+        return gather(r, d.data, sel);
     }
 
     /// A dictionary-encoded text column as `dataframe` keeps one: an unordered
@@ -1362,7 +1478,7 @@ const Reader = struct {
                 child_base += @intCast(c.rb.nodes[child.node_ix].length);
                 base += len;
             }
-            items = try gather(r.a, items, sel);
+            items = try gather(r, items, sel);
         }
         if (allNull(valid, n)) return .nulls;
         const ip = try r.a.create(ColumnData);
@@ -1370,6 +1486,24 @@ const Reader = struct {
         return .{ .list = .{ .offsets = offsets, .items = ip, .valid = valid } };
     }
 };
+
+/// Whether two dictionary value fields describe the same values: type (zone included),
+/// children by name and type, recursively. Nullability and metadata do not matter.
+fn sameValueType(x: schema.Field, y: schema.Field) bool {
+    if (std.meta.activeTag(x.type) != std.meta.activeTag(y.type)) return false;
+    const same = switch (x.type) {
+        .timestamp => |t| t.unit == y.type.timestamp.unit and
+            ((t.tz == null and y.type.timestamp.tz == null) or
+                (t.tz != null and y.type.timestamp.tz != null and std.mem.eql(u8, t.tz.?, y.type.timestamp.tz.?))),
+        else => std.meta.eql(x.type, y.type),
+    };
+    if (!same or x.children.len != y.children.len) return false;
+    if ((x.dictionary == null) != (y.dictionary == null)) return false;
+    for (x.children, y.children) |p, q| {
+        if (!std.mem.eql(u8, p.name, q.name) or !sameValueType(p, q)) return false;
+    }
+    return true;
+}
 
 fn bufOf(c: Chunk, ix: usize) []const u8 {
     // `decodeRecordBatch` checked every location against the body.
@@ -1447,13 +1581,14 @@ fn rescale(x: i128, scale: i32) Error!i128 {
     return @divExact(x, p);
 }
 
-fn toMicros(x: i64, unit: schema.TimeUnit) Error!i64 {
+fn toMicros(x: i64, unit: schema.TimeUnit, lossy: bool) Error!i64 {
     return switch (unit) {
         .second => std.math.mul(i64, x, 1_000_000) catch error.Unsupported,
         .millisecond => std.math.mul(i64, x, 1_000) catch error.Unsupported,
         .microsecond => x,
-        // `dataframe` keeps microseconds; the digits past them are dropped (toward the earlier instant).
-        .nanosecond => @divFloor(x, 1_000),
+        // `dataframe` keeps microseconds: digits past them are an inexact conversion, like a
+        // decimal's — refused, or under `lossy` truncated toward zero.
+        .nanosecond => if (@rem(x, 1_000) != 0 and !lossy) error.Unsupported else @divTrunc(x, 1_000),
     };
 }
 
@@ -1485,8 +1620,12 @@ const ValidOut = struct {
     }
 };
 
-/// The rows `sel` of `data` (an entry `none` is a null row), as fresh storage.
-fn gather(a: Allocator, data: ColumnData, sel: []const usize) Error!ColumnData {
+/// The rows `sel` of `data` (an entry `none` is a null row), as fresh storage. Every row,
+/// list element and text byte copied counts against `ReadOptions.max_cells`: a dictionary
+/// entry of N elements or bytes selected by M rows costs N x M, which the input does not.
+fn gather(r: *Reader, data: ColumnData, sel: []const usize) Error!ColumnData {
+    const a = r.a;
+    try r.charge(sel.len);
     switch (data) {
         .nulls => return .nulls,
         .boxed => return error.Unsupported,
@@ -1496,13 +1635,16 @@ fn gather(a: Allocator, data: ColumnData, sel: []const usize) Error!ColumnData {
             var vo: ValidOut = .{};
             offsets[0] = 0;
             for (sel, 0..) |row, i| {
-                if (t.at(row)) |s| try bytes.appendSlice(a, s) else if (!t.isValid(row)) try vo.clear(a, sel.len, i);
+                if (t.at(row)) |s| {
+                    try r.charge(s.len);
+                    try bytes.appendSlice(a, s);
+                } else if (!t.isValid(row)) try vo.clear(a, sel.len, i);
                 offsets[i + 1] = bytes.items.len;
             }
             return .{ .text = .{ .offsets = offsets, .bytes = bytes.items, .valid = vo.words } };
         },
         .categorical => |c| {
-            const codes = try gather(a, .{ .uint32 = c.codes }, sel);
+            const codes = try gather(r, .{ .uint32 = c.codes }, sel);
             const cc: df.TypedColumn(u32) = switch (codes) {
                 .uint32 => |x| x,
                 else => blk: {
@@ -1523,19 +1665,20 @@ fn gather(a: Allocator, data: ColumnData, sel: []const usize) Error!ColumnData {
             offsets[0] = 0;
             for (sel, 0..) |row, i| {
                 if (l.at(row)) |lv| {
+                    try r.charge(lv.len());
                     for (lv.start..lv.end) |e| try kids.append(a, e);
                 } else try vo.clear(a, sel.len, i);
                 offsets[i + 1] = std.math.cast(u32, kids.items.len) orelse return error.Unsupported;
             }
             const ip = try a.create(ColumnData);
-            ip.* = try gather(a, l.items.*, kids.items);
+            ip.* = try gather(r, l.items.*, kids.items);
             return .{ .list = .{ .offsets = offsets, .items = ip, .valid = vo.words } };
         },
         .@"struct" => |s| {
             var vo: ValidOut = .{};
             for (sel, 0..) |row, i| if (!s.isValid(row)) try vo.clear(a, sel.len, i);
             const kids = try a.alloc(ColumnData, s.children.len);
-            for (kids, s.children) |*k, c| k.* = try gather(a, c, sel);
+            for (kids, s.children) |*k, c| k.* = try gather(r, c, sel);
             const sc = try a.create(df.StructColumn);
             sc.* = .{ .names = s.names, .children = kids, .len = sel.len, .valid = vo.words };
             return .{ .@"struct" = sc };
@@ -1563,10 +1706,10 @@ fn noEos(e: ipc.Error) Error {
 }
 
 /// Reads an Arrow IPC stream into a frame allocated from `arena` (free it all with the
-/// arena; nothing borrows `bytes`). Dictionary deltas are appended; a dictionary
-/// REPLACED mid-stream, body compression, and the types `dataframe` has no column for
-/// (Interval, Union, Map, the view types, Decimal other than 128-bit) are
-/// `error.Unsupported`.
+/// arena; nothing borrows `bytes`). Dictionary deltas are appended; ZSTD body compression
+/// is read. A dictionary REPLACED mid-stream, LZ4_FRAME body compression, a metadata
+/// version before V4, and the types `dataframe` has no column for (Interval, Union, Map,
+/// the view types, Decimal other than 128-bit) are `error.Unsupported`.
 pub fn readStream(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!df.Frame {
     var r: Reader = .{ .a = arena, .opts = opts };
     var pos: usize = 0;
@@ -1604,8 +1747,9 @@ pub const File = struct {
         return self.batches.len;
     }
 
-    /// The rows of batch `i` (`i < batchCount()`).
-    pub fn batchRows(self: *const File, i: usize) usize {
+    /// The rows of batch `i`; `error.Unsupported` past the last batch (as `readBatch`).
+    pub fn batchRows(self: *const File, i: usize) Error!usize {
+        if (i >= self.batches.len) return error.Unsupported;
         return @intCast(self.batches[i].rb.length);
     }
 
@@ -1621,9 +1765,12 @@ pub const File = struct {
     }
 };
 
-/// Opens an Arrow IPC file: checks both `ARROW1` marks, reads the footer's schema,
-/// decodes every dictionary and checks every record batch's metadata (not its data,
-/// which `File.readBatch` decodes on demand).
+/// Opens an Arrow IPC file: checks both `ARROW1` marks and the footer's metadata version,
+/// reads the footer's schema, decodes every dictionary and checks every record batch's
+/// metadata (not its data, which `File.readBatch` decodes on demand). Every footer block
+/// must describe the message at its offset (framing + metadata length, body length), and
+/// no two blocks may share bytes (`error.Malformed`): otherwise K blocks naming one small
+/// message would make the reader inflate and decode it K times.
 pub fn openFile(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!File {
     if (bytes.len < 8 + 10) return error.Malformed;
     if (!std.mem.eql(u8, bytes[0..6], magic) or !std.mem.eql(u8, bytes[bytes.len - 6 ..], magic)) return error.Malformed;
@@ -1632,28 +1779,36 @@ pub fn openFile(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!Fi
     if (flen <= 0 or @as(usize, @intCast(flen)) > fend - 8) return error.Malformed;
     const fstart = fend - @as(usize, @intCast(flen));
     const footer = try fb.root(bytes[fstart..fend]);
+    try schema.checkVersion(try footer.scalar(schema.MetadataVersion, 0, .v1));
     var r: Reader = .{ .a = arena, .opts = opts };
     const s = try schema.decodeSchema(arena, try footer.table(1) orelse return error.Malformed);
     const top = try r.planAll(s);
 
-    // The messages live between the leading mark and the footer.
+    // The messages live between the leading mark and the footer. Every block is located
+    // and checked before anything is inflated.
     const region = bytes[0..fstart];
-    if (try footer.vector(2)) |v| for (0..v.len) |i| {
-        const m = try readBlock(region, try v.structAt(i, 24));
-        if (m.msg.header_type != .dictionary_batch) return error.Malformed;
-        try r.takeDict(m.msg, m.enc.body);
-    };
-    var batches: []Chunk = &.{};
-    if (try footer.vector(3)) |v| {
-        batches = try arena.alloc(Chunk, v.len);
-        var total: u64 = 0;
-        for (batches, 0..) |*c, i| {
-            const m = try readBlock(region, try v.structAt(i, 24));
-            if (m.msg.header_type != .record_batch) return error.Malformed;
-            c.* = try r.takeBatch(&top, m.msg, m.enc.body);
-            total += @intCast(c.rb.length);
-            if (total > opts.max_rows) return error.LimitExceeded;
-        }
+    const dv = try footer.vector(2);
+    const bv = try footer.vector(3);
+    const nd: usize = if (dv) |v| v.len else 0;
+    const nb: usize = if (bv) |v| v.len else 0;
+    const msgs = try arena.alloc(ipc.Read, nd + nb);
+    const spans = try arena.alloc(Span, nd + nb);
+    for (msgs, spans, 0..) |*m, *sp, i| {
+        const raw = if (i < nd) try dv.?.structAt(i, 24) else try bv.?.structAt(i - nd, 24);
+        m.* = try readBlock(region, raw, sp);
+        const want: schema.HeaderType = if (i < nd) .dictionary_batch else .record_batch;
+        if (m.msg.header_type != want) return error.Malformed;
+    }
+    std.mem.sort(Span, spans, {}, Span.before);
+    if (spans.len > 1) for (spans[1..], spans[0 .. spans.len - 1]) |x, prev| if (x.start < prev.end) return error.Malformed;
+
+    for (msgs[0..nd]) |m| try r.takeDict(m.msg, m.enc.body);
+    const batches = try arena.alloc(Chunk, nb);
+    var total: u64 = 0;
+    for (batches, msgs[nd..]) |*c, m| {
+        c.* = try r.takeBatch(&top, m.msg, m.enc.body);
+        total += @intCast(c.rb.length);
+        if (total > opts.max_rows) return error.LimitExceeded;
     }
     try r.finishDicts();
     return .{ .r = r, .top = top, .batches = batches };
@@ -1665,11 +1820,32 @@ pub fn readFile(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!df
     return f.readAll();
 }
 
-fn readBlock(region: []const u8, raw: []const u8) Error!ipc.Read {
+/// The bytes one footer block's message occupies.
+const Span = struct {
+    start: usize,
+    end: usize,
+
+    fn before(_: void, x: Span, y: Span) bool {
+        return x.start < y.start;
+    }
+};
+
+/// The message a footer `Block` points at. The block's `metaDataLength` (framing and
+/// padded metadata) and `bodyLength` must be the message's own: other readers read by
+/// them, so a writer's wrong value would pass here and fail there.
+fn readBlock(region: []const u8, raw: []const u8, span: *Span) Error!ipc.Read {
     const off = std.mem.readInt(i64, raw[0..8], .little);
+    const meta_len = std.mem.readInt(i32, raw[8..12], .little);
+    const body_len = std.mem.readInt(i64, raw[16..24], .little);
     if (off < 8 or off >= region.len) return error.Malformed;
-    var pos: usize = @intCast(off);
-    return ipc.readMessage(region, &pos) catch |e| return noEos(e);
+    const start: usize = @intCast(off);
+    var pos = start;
+    const m = ipc.readMessage(region, &pos) catch |e| return noEos(e);
+    const body_at = pos - m.enc.body.len;
+    if (meta_len < 0 or body_len < 0) return error.Malformed;
+    if (@as(usize, @intCast(meta_len)) != body_at - start or @as(u64, @intCast(body_len)) != m.enc.body.len) return error.Malformed;
+    span.* = .{ .start = start, .end = pos };
+    return m;
 }
 
 /// The planned top-level columns and the node/buffer counts a record batch must have.

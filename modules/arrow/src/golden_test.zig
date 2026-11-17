@@ -142,10 +142,11 @@ fn unitExp(unit: []const u8) i8 {
     return -3;
 }
 
-/// `x` units as microseconds (nanoseconds floored), or null past i64.
+/// `x` units as microseconds (nanoseconds truncated toward zero, as `lossy` reads them),
+/// or null past i64.
 fn micros(x: i128, unit: []const u8) ?i64 {
     const e = unitExp(unit);
-    const us: i128 = if (e >= 0) x * std.math.pow(i128, 10, @intCast(e)) else @divFloor(x, 1000);
+    const us: i128 = if (e >= 0) x * std.math.pow(i128, 10, @intCast(e)) else @divTrunc(x, 1000);
     return std.math.cast(i64, us);
 }
 
@@ -295,13 +296,19 @@ const Oracle = struct {
             return;
         }
         if (std.mem.eql(u8, name, "decimal")) {
-            const want = decimal12(try jint(data[i]), @intCast(try jint(get(t, "scale").?))) orelse return o.unholdable(field, got);
+            const raw = try jint(data[i]);
+            // More digits than the declared precision is not a value of the type.
+            const prec: u7 = @intCast(try jint(get(t, "precision").?));
+            if (@abs(raw) >= std.math.pow(u128, 10, prec)) return o.unholdable(field, got);
+            const want = decimal12(raw, @intCast(try jint(get(t, "scale").?))) orelse return o.unholdable(field, got);
+            // 39 digits at scale 12 fit an i128 but no Decimal128 (38 digits at most).
+            if (@abs(want) >= std.math.pow(u128, 10, 38)) return o.unholdable(field, got);
             if (got != .decimal or got.decimal != want) return o.fail(field, "{any}, want {d}", .{ got, want });
             return;
         }
         if (std.mem.eql(u8, name, "date")) {
             const raw = try jint(data[i]);
-            const days = if (std.mem.eql(u8, str(t, "unit"), "DAY")) raw else @divFloor(raw, 86_400_000);
+            const days = if (std.mem.eql(u8, str(t, "unit"), "DAY")) raw else @divTrunc(raw, 86_400_000);
             var buf: [10]u8 = undefined;
             const want = isoDay(&buf, days) orelse return o.unholdable(field, got);
             if (got != .text or !std.mem.eql(u8, got.text, want)) return o.fail(field, "{any}, want {s}", .{ got, want });

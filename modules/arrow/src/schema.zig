@@ -95,28 +95,62 @@ const tid = struct {
 
 // ── decoding ────────────────────────────────────────────────────────────────
 
+/// What one decoded `Field` or `KeyValue` costs the decode budget; a name or zone
+/// string costs one unit per byte on top (a reader copies those).
+const unit_per_table = 16;
+
+/// The decode budget of a schema in a FlatBuffer of `len` bytes. FlatBuffers offsets
+/// may point at the same table any number of times, so a schema of a few KB can name
+/// 2^64 fields through shared children; the budget bounds the TOTAL work, not only
+/// the depth. Every honest `Field` takes more than 8 unique bytes (its vector slot,
+/// its table, its type id) plus its name's bytes, so an honest schema spends at most
+/// about `len` units; twice that leaves room for a writer that shares strings.
+fn budgetFor(len: usize) usize {
+    return 2 * len + 64;
+}
+
+const Decoder = struct {
+    arena: std.mem.Allocator,
+    left: usize,
+
+    fn charge(d: *Decoder, units: usize) Error!void {
+        if (units > d.left) return error.Malformed; // more work than the buffer can honestly hold
+        d.left -= units;
+    }
+
+    fn tables(d: *Decoder, n: usize) Error!void {
+        return d.charge(std.math.mul(usize, n, unit_per_table) catch return error.Malformed);
+    }
+};
+
 /// Decodes a `Schema` table. Strings point into `buf`; slices are allocated
-/// from `arena` (free them all with the arena).
+/// from `arena` (free them all with the arena). The total number of fields and
+/// metadata entries decoded, and the bytes of their names, are bounded by the
+/// FlatBuffer's length (`error.Malformed` past it): a schema whose tables share
+/// children cannot make the decoder do more work than its bytes could describe.
 pub fn decodeSchema(arena: std.mem.Allocator, t: fb.Table) Error!Schema {
     const endianness = try t.scalar(i16, 0, 0);
     if (endianness != 0) return error.Unsupported; // big-endian data
+    var d: Decoder = .{ .arena = arena, .left = budgetFor(t.buf.len) };
     return .{
-        .fields = try decodeFields(arena, try t.vector(1), 0),
-        .metadata = try decodeMetadata(arena, try t.vector(2)),
+        .fields = try decodeFields(&d, try t.vector(1), 0),
+        .metadata = try decodeMetadata(&d, try t.vector(2)),
     };
 }
 
-fn decodeFields(arena: std.mem.Allocator, v: ?fb.Vector, depth: usize) Error![]const Field {
+fn decodeFields(d: *Decoder, v: ?fb.Vector, depth: usize) Error![]const Field {
     const vec = v orelse return &.{};
     if (depth >= max_depth) return error.Malformed;
-    const out = try arena.alloc(Field, vec.len);
-    for (out, 0..) |*f, i| f.* = try decodeField(arena, try vec.tableAt(i), depth);
+    try d.tables(vec.len);
+    const out = try d.arena.alloc(Field, vec.len);
+    for (out, 0..) |*f, i| f.* = try decodeField(d, try vec.tableAt(i), depth);
     return out;
 }
 
-fn decodeMetadata(arena: std.mem.Allocator, v: ?fb.Vector) Error![]const KeyValue {
+fn decodeMetadata(d: *Decoder, v: ?fb.Vector) Error![]const KeyValue {
     const vec = v orelse return &.{};
-    const out = try arena.alloc(KeyValue, vec.len);
+    try d.tables(vec.len);
+    const out = try d.arena.alloc(KeyValue, vec.len);
     for (out, 0..) |*kv, i| {
         const t = try vec.tableAt(i);
         kv.* = .{ .key = try t.string(0) orelse "", .value = try t.string(1) orelse "" };
@@ -130,21 +164,25 @@ fn decodeInt(t: fb.Table) Error!IntType {
     return .{ .bits = @intCast(bits), .signed = try t.scalar(bool, 1, false) };
 }
 
-fn decodeField(arena: std.mem.Allocator, t: fb.Table, depth: usize) Error!Field {
+fn decodeField(d: *Decoder, t: fb.Table, depth: usize) Error!Field {
     const type_id = try t.scalar(u8, 2, 0);
     const tt = try t.table(3);
+    const name = try t.string(0) orelse "";
+    try d.charge(name.len);
+    const ty = try decodeType(type_id, tt);
+    if (ty == .timestamp) if (ty.timestamp.tz) |z| try d.charge(z.len);
     var f: Field = .{
-        .name = try t.string(0) orelse "",
+        .name = name,
         .nullable = try t.scalar(bool, 1, false),
-        .type = try decodeType(type_id, tt),
-        .children = try decodeFields(arena, try t.vector(5), depth + 1),
-        .metadata = try decodeMetadata(arena, try t.vector(6)),
+        .type = ty,
+        .children = try decodeFields(d, try t.vector(5), depth + 1),
+        .metadata = try decodeMetadata(d, try t.vector(6)),
     };
-    if (try t.table(4)) |d| {
+    if (try t.table(4)) |de| {
         f.dictionary = .{
-            .id = try d.scalar(i64, 0, 0),
-            .index = if (try d.table(1)) |it| try decodeInt(it) else .{ .bits = 32, .signed = true },
-            .ordered = try d.scalar(bool, 2, false),
+            .id = try de.scalar(i64, 0, 0),
+            .index = if (try de.table(1)) |it| try decodeInt(it) else .{ .bits = 32, .signed = true },
+            .ordered = try de.scalar(bool, 2, false),
         };
     }
     return f;
@@ -333,13 +371,22 @@ pub const Message = struct {
     body_length: i64,
 };
 
-/// Reads a `Message` root table from one encapsulated message's metadata bytes.
-pub fn decodeMessage(buf: []const u8) fb.Error!Message {
+/// V4 (Arrow 0.8 to 0.17) and V5 (1.0 on) share the layouts this module reads; V1 to V3
+/// (pre-0.8) and any value the format does not name are `error.Unsupported`.
+pub fn checkVersion(v: MetadataVersion) Error!void {
+    if (v != .v4 and v != .v5) return error.Unsupported;
+}
+
+/// Reads a `Message` root table from one encapsulated message's metadata bytes;
+/// a metadata version other than V4 or V5 is `error.Unsupported`.
+pub fn decodeMessage(buf: []const u8) Error!Message {
     const t = try fb.root(buf);
     const body = try t.scalar(i64, 3, 0);
     if (body < 0) return error.Malformed;
+    const version = try t.scalar(MetadataVersion, 0, .v1);
+    try checkVersion(version);
     return .{
-        .version = try t.scalar(MetadataVersion, 0, .v1),
+        .version = version,
         .header_type = try t.scalar(HeaderType, 1, .none),
         .header = try t.table(2),
         .body_length = body,

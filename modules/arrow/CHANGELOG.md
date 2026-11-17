@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — Review fixes (1 HIGH, 4 MED, 8 LOW). **Breaking:** `Error` gains `InvalidUtf8`;
+  `File.batchRows` returns `Error!usize`; with `lossy = false` a nanosecond value with digits past the microsecond
+  and a Date64 off a day boundary are `error.Unsupported` (under `lossy` truncated toward zero, no longer floored).
+  The schema decoder charges every field, metadata entry and name byte against a budget from the metadata's
+  length, so tables shared through FlatBuffers offsets (2.5 KB naming 2^64 fields) are `Malformed` instead of
+  an unbounded allocation; `ReadOptions.max_body_bytes` caps the whole read, not each message;
+  `ReadOptions.max_cells` (new, 2^28) bounds the array slots a read decodes, dictionary copies included;
+  `ReadOptions.validate_utf8` (new, on) checks Utf8 values, and the writer refuses a `.text` cell that is not
+  UTF-8; the metadata version must be V4 or V5; Decimal128 is written with the column's real precision and a
+  value wider than its declared precision (or than 38 digits) is read like an inexact scale; two fields may share
+  a dictionary id when their value types agree; file footer blocks must match their message's lengths and may
+  not overlap. New `src/hostile_test.zig` builds each hostile shape with `fb.Builder` and reads it under a
+  byte-capped allocator. The example prints the batch as a table and writes under `.zig-cache/tmp/`.
 - **2026-11-17** — Wave A5 and A6 part 1: ZSTD body compression read and write (`WriteOptions.compression = .zstd`,
   `compression_level`; a buffer that does not shrink is stored raw; `ReadOptions.max_body_bytes` caps what a
   compressed body may expand to; LZ4_FRAME stays `error.Unsupported`); `ReadOptions.lossy` reads a value

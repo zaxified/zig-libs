@@ -269,7 +269,7 @@ test "the declared type picks the Arrow type; cells it cannot hold are Unsupport
 
 // ── hand-assembled streams ──────────────────────────────────────────────────
 
-const HandBatch = struct {
+pub const HandBatch = struct {
     length: i64,
     nodes: []const ipc.FieldNode,
     bufs: []const []const u8,
@@ -279,7 +279,7 @@ const HandBatch = struct {
     codec: ?ipc.Codec = null,
 };
 
-fn hand(gpa: Allocator, fields: []const schema.Field, batches: []const HandBatch) ![]u8 {
+pub fn hand(gpa: Allocator, fields: []const schema.Field, batches: []const HandBatch) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var b = fb.Builder.init(gpa);
@@ -303,7 +303,7 @@ fn hand(gpa: Allocator, fields: []const schema.Field, batches: []const HandBatch
     return out.toOwnedSlice(gpa);
 }
 
-fn bytesOf(comptime T: type, comptime xs: []const T) []const u8 {
+pub fn bytesOf(comptime T: type, comptime xs: []const T) []const u8 {
     return std.mem.sliceAsBytes(xs);
 }
 
@@ -336,8 +336,8 @@ test "reader: units, scales, half floats, index types, fixed-size binary, non-te
             .length = 2,
             .nodes = &.{ two, two, two, two, two, two, two, two, .{ .length = 2, .null_count = 1 }, .{ .length = 6, .null_count = 0 }, two },
             .bufs = &.{
-                "",        bytesOf(i64, &.{ 1_999, -1 }),
-                "",        bytesOf(i64, &.{ 86_400_000 * 3 + 5, -1 }),
+                "",        bytesOf(i64, &.{ 1_999_000, -1_000 }),
+                "",        bytesOf(i64, &.{ 86_400_000 * 3, -86_400_000 }),
                 "",        bytesOf(i32, &.{ 1_500, 0 }),
                 "",        bytesOf(i128, &.{ 12_345, -1 }),
                 "",        bytesOf(f16, &.{ 1.5, -0.25 }),
@@ -358,8 +358,8 @@ test "reader: units, scales, half floats, index types, fixed-size binary, non-te
             return fr.cell(r, name).?;
         }
     }.at;
-    try testing.expectEqual(@as(i64, 1), cell(f, "ns", 0).int);
-    try testing.expectEqual(@as(i64, -1), cell(f, "ns", 1).int); // -1 ns floors to -1 us
+    try testing.expectEqual(@as(i64, 1_999), cell(f, "ns", 0).int);
+    try testing.expectEqual(@as(i64, -1), cell(f, "ns", 1).int);
     try testing.expectEqualStrings("1970-01-04", cell(f, "d64", 0).text);
     try testing.expectEqualStrings("1969-12-31", cell(f, "d64", 1).text);
     try testing.expectEqual(df.ColumnType.time, f.columnType("t32").?);
@@ -533,11 +533,12 @@ test "file: round trip, both ARROW1 marks, random access to each batch" {
 
     var file = try stream.openFile(a, bytes, .{});
     try testing.expectEqual(@as(usize, 3), file.batchCount());
-    try testing.expectEqual(@as(usize, 1), file.batchRows(2));
+    try testing.expectEqual(@as(usize, 1), try file.batchRows(2));
+    try testing.expectError(error.Unsupported, file.batchRows(3));
     // Out of order, each batch alone.
     for ([_]usize{ 2, 0, 1 }) |i| {
         const got = try file.readBatch(i);
-        try testing.expectEqual(file.batchRows(i), got.len);
+        try testing.expectEqual(try file.batchRows(i), got.len);
         try expectRows(f, i * 2, got);
     }
     try testing.expectError(error.Unsupported, file.readBatch(3));
@@ -819,4 +820,194 @@ test "lossy: values dataframe cannot hold fail the read by default and read as n
     const short = try oneInt32(gpa, .{ .length = 3, .null_count = 0 }, 3, bytesOf(i32, &.{ 1, 2 }), "");
     defer gpa.free(short);
     try testing.expectError(error.Malformed, stream.readStream(a, short, .{ .lossy = true }));
+}
+
+// ── review fixes (2026-11-17) ───────────────────────────────────────────────
+
+test "utf8: the writer refuses text that is not UTF-8; the reader checks Utf8 unless told not to" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const bad = try textCol(a, &.{ "ok", "\xff\xfe", null });
+    const frames = [_]df.Frame{
+        .{ .columns = &.{.{ .name = "s", .type = .text }}, .data = &.{.{ .text = bad }}, .len = 3 },
+        // A categorical's dictionary; text storage under a categorical declaration.
+        .{ .columns = &.{.{ .name = "c", .type = .categorical }}, .data = &.{.{ .categorical = .{ .codes = .{ .values = &.{ 0, 1, 0 } }, .dict = try textCol(a, &.{ "a", "\xc3" }) } }}, .len = 3 },
+        .{ .columns = &.{.{ .name = "c", .type = .categorical }}, .data = &.{.{ .text = bad }}, .len = 3 },
+    };
+    for (frames) |f| {
+        try testing.expectError(error.InvalidUtf8, stream.writeStream(gpa, f, .{}));
+        try testing.expectError(error.InvalidUtf8, stream.writeFile(gpa, f, .{ .compression = .zstd }));
+    }
+    // The same bytes declared binary are written as Binary.
+    const bin: df.Frame = .{ .columns = &.{.{ .name = "b", .type = .binary }}, .data = &.{.{ .text = bad }}, .len = 3 };
+    try expectSameFrame(bin, try roundTrip(a, bin, .{}));
+
+    // Reader: a Utf8 value and a Utf8 dictionary entry that are not UTF-8.
+    const node: ipc.FieldNode = .{ .length = 2, .null_count = 0 };
+    const sf = [_]schema.Field{.{ .name = "s", .type = .large_utf8 }};
+    const sb = try hand(gpa, &sf, &.{.{ .length = 2, .nodes = &.{node}, .bufs = &.{ "", bytesOf(i64, &.{ 0, 1, 3 }), "a\xe2\x82" } }});
+    defer gpa.free(sb);
+    try testing.expectError(error.InvalidUtf8, stream.readStream(a, sb, .{}));
+    try testing.expectError(error.InvalidUtf8, stream.readStream(a, sb, .{ .lossy = true }));
+    const raw = try stream.readStream(a, sb, .{ .validate_utf8 = false });
+    try testing.expectEqualStrings("\xe2\x82", raw.columnAt(0).get(1).text);
+    const df_ = [_]schema.Field{.{ .name = "c", .type = .utf8, .dictionary = .{ .id = 0 } }};
+    const db = try hand(gpa, &df_, &.{
+        .{ .length = 2, .dict_id = 0, .nodes = &.{node}, .bufs = &.{ "", bytesOf(i32, &.{ 0, 1, 2 }), "x\x80" } },
+        .{ .length = 2, .nodes = &.{node}, .bufs = &.{ "", bytesOf(i32, &.{ 0, 0 }) } },
+    });
+    defer gpa.free(db);
+    try testing.expectError(error.InvalidUtf8, stream.readStream(a, db, .{}));
+    _ = try stream.readStream(a, db, .{ .validate_utf8 = false });
+    // Binary is never checked.
+    const bf = [_]schema.Field{.{ .name = "b", .type = .binary }};
+    const bb = try hand(gpa, &bf, &.{.{ .length = 2, .nodes = &.{node}, .bufs = &.{ "", bytesOf(i32, &.{ 0, 1, 3 }), "a\xe2\x82" } }});
+    defer gpa.free(bb);
+    _ = try stream.readStream(a, bb, .{});
+}
+
+test "inexact time conversions: refused without lossy, truncated toward zero with it" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const node: ipc.FieldNode = .{ .length = 3, .null_count = 0 };
+    const Case = struct { field: schema.Field, values: []const u8, want: [3]df.Value };
+    const cases = [_]Case{
+        // -1 ns truncates to 0 us (a floor would give -1); -1999 ns to -1 us.
+        .{ .field = .{ .name = "ts", .type = .{ .timestamp = .{ .unit = .nanosecond } } }, .values = bytesOf(i64, &.{ -1, -1_999, 1_700_000_000_123_456_789 }), .want = .{ .{ .int = 0 }, .{ .int = -1 }, .{ .int = 1_700_000_000_123_456 } } },
+        .{ .field = .{ .name = "dur", .type = .{ .duration = .nanosecond } }, .values = bytesOf(i64, &.{ -1, -1_999, 2_500 }), .want = .{ .{ .int = 0 }, .{ .int = -1 }, .{ .int = 2 } } },
+        .{ .field = .{ .name = "t", .type = .{ .time = .{ .unit = .nanosecond, .bits = 64 } } }, .values = bytesOf(i64, &.{ 1, 1_999, 3_000 }), .want = .{ .{ .int = 0 }, .{ .int = 1 }, .{ .int = 3 } } },
+        // Date64 off a day boundary: -1 ms is day 0 under truncation.
+        .{ .field = .{ .name = "d", .type = .{ .date = .millisecond } }, .values = bytesOf(i64, &.{ -1, 86_400_000 + 1, -86_400_000 - 1 }), .want = .{ .{ .text = "1970-01-01" }, .{ .text = "1970-01-02" }, .{ .text = "1969-12-31" } } },
+    };
+    for (cases) |c| {
+        const bytes = try hand(gpa, &.{c.field}, &.{.{ .length = 3, .nodes = &.{node}, .bufs = &.{ "", c.values } }});
+        defer gpa.free(bytes);
+        try testing.expectError(error.Unsupported, stream.readStream(a, bytes, .{}));
+        const f = try stream.readStream(a, bytes, .{ .lossy = true });
+        for (c.want, 0..) |w, i| {
+            const got = f.columnAt(0).get(i);
+            if (!got.eql(w)) {
+                std.debug.print("{s} row {d}: want {any} got {any}\n", .{ c.field.name, i, w, got });
+                return error.TestExpectedEqual;
+            }
+        }
+    }
+    // Exact values read without lossy, negative ones included.
+    const exact = try hand(gpa, &.{.{ .name = "ts", .type = .{ .timestamp = .{ .unit = .nanosecond } } }}, &.{.{ .length = 3, .nodes = &.{node}, .bufs = &.{ "", bytesOf(i64, &.{ -1_000, 0, 5_000 }) } }});
+    defer gpa.free(exact);
+    const f = try stream.readStream(a, exact, .{});
+    try testing.expectEqual(@as(i64, -1), f.columnAt(0).get(0).int);
+}
+
+test "metadata version: V4 and V5 read, older or unknown versions are Unsupported" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const fields = [_]schema.Field{.{ .name = "x", .type = .{ .int = .{ .bits = 32, .signed = true } } }};
+    for ([_]struct { v: schema.MetadataVersion, ok: bool }{
+        .{ .v = .v5, .ok = true },
+        .{ .v = .v4, .ok = true },
+        .{ .v = .v3, .ok = false },
+        .{ .v = .v1, .ok = false },
+        .{ .v = @fromBackingInt(@intCast(5)), .ok = false },
+    }) |c| {
+        var b = fb.Builder.init(gpa);
+        defer b.deinit();
+        const sref = try schema.encodeSchema(&b, .{ .fields = &fields });
+        b.startTable();
+        try b.addScalarForce(0, schema.MetadataVersion, c.v);
+        try b.addScalarForce(1, schema.HeaderType, .schema);
+        try b.addOffset(2, sref);
+        const meta = try b.finish(try b.endTable());
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        try ipc.writeMessage(gpa, &out, meta, &.{});
+        try ipc.writeEos(gpa, &out);
+        if (c.ok) _ = try stream.readStream(a, out.items, .{}) else try testing.expectError(error.Unsupported, stream.readStream(a, out.items, .{}));
+    }
+}
+
+test "decimal precision: written as the widest value's digits; values wider than declared are refused" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const precisionOf = struct {
+        fn f(al: Allocator, values: []const i128) !i32 {
+            const fr: df.Frame = .{ .columns = &.{.{ .name = "d", .type = .decimal }}, .data = &.{.{ .decimal = .{ .values = values } }}, .len = values.len };
+            const bytes = try stream.writeStream(testing.allocator, fr, .{});
+            defer testing.allocator.free(bytes);
+            try expectSameFrame(fr, try stream.readStream(al, bytes, .{}));
+            var pos: usize = 0;
+            const m = try ipc.readMessage(bytes, &pos);
+            return (try schema.decodeSchema(al, m.msg.header.?)).fields[0].type.decimal.precision;
+        }
+    }.f;
+    try testing.expectEqual(@as(i32, 12), try precisionOf(a, &.{ 5, -7 }));
+    try testing.expectEqual(@as(i32, 18), try precisionOf(a, &.{ 123_456 * scale, -1 }));
+    try testing.expectEqual(@as(i32, 38), try precisionOf(a, &.{std.math.pow(i128, 10, 38) - 1}));
+    // 39 digits fit an i128 but no Decimal128.
+    for ([_]i128{ std.math.pow(i128, 10, 38), std.math.maxInt(i128), std.math.minInt(i128) }) |x| {
+        const fr: df.Frame = .{ .columns = &.{.{ .name = "d", .type = .decimal }}, .data = &.{.{ .decimal = .{ .values = &.{x} } }}, .len = 1 };
+        try testing.expectError(error.Unsupported, stream.writeStream(gpa, fr, .{}));
+    }
+
+    const node: ipc.FieldNode = .{ .length = 2, .null_count = 0 };
+    // Decimal128(3, 0) holding 1000: more digits than declared.
+    const wide = try hand(gpa, &.{.{ .name = "d", .type = .{ .decimal = .{ .precision = 3, .scale = 0 } } }}, &.{.{ .length = 2, .nodes = &.{node}, .bufs = &.{ "", bytesOf(i128, &.{ 1000, -999 }) } }});
+    defer gpa.free(wide);
+    try testing.expectError(error.Unsupported, stream.readStream(a, wide, .{}));
+    const lf = try stream.readStream(a, wide, .{ .lossy = true });
+    try testing.expect(lf.columnAt(0).get(0) == .null);
+    try testing.expectEqual(-999 * scale, lf.columnAt(0).get(1).decimal);
+    // Decimal128(38, 11) holding 1.2e37: 39 digits once at 12 fractional digits.
+    const big = try hand(gpa, &.{.{ .name = "d", .type = .{ .decimal = .{ .precision = 38, .scale = 11 } } }}, &.{.{ .length = 2, .nodes = &.{node}, .bufs = &.{ "", bytesOf(i128, &.{ 12 * std.math.pow(i128, 10, 36), 1 }) } }});
+    defer gpa.free(big);
+    try testing.expectError(error.Unsupported, stream.readStream(a, big, .{}));
+    try testing.expect((try stream.readStream(a, big, .{ .lossy = true })).columnAt(0).get(0) == .null);
+    // A precision Decimal128 cannot have.
+    for ([_]i32{ 0, 39, -1 }) |p| {
+        const bp = try hand(gpa, &.{.{ .name = "d", .type = .{ .decimal = .{ .precision = p, .scale = 0 } } }}, &.{});
+        defer gpa.free(bp);
+        try testing.expectError(error.Malformed, stream.readStream(a, bp, .{}));
+    }
+}
+
+test "a dictionary shared by two fields: read when the value types agree, refused otherwise" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const node: ipc.FieldNode = .{ .length = 2, .null_count = 0 };
+    const dict: HandBatch = .{ .length = 2, .dict_id = 0, .nodes = &.{node}, .bufs = &.{ "", bytesOf(i32, &.{ 0, 1, 2 }), "yx" } };
+    const batch: HandBatch = .{ .length = 2, .nodes = &.{ node, node }, .bufs = &.{ "", bytesOf(i32, &.{ 0, 1 }), "", bytesOf(u8, &.{ 1, 1 }) } };
+    const shared = [_]schema.Field{
+        .{ .name = "p", .type = .utf8, .dictionary = .{ .id = 0 } },
+        .{ .name = "q", .type = .utf8, .dictionary = .{ .id = 0, .index = .{ .bits = 8, .signed = false } } },
+    };
+    const ok = try hand(gpa, &shared, &.{ dict, batch });
+    defer gpa.free(ok);
+    const f = try stream.readStream(a, ok, .{});
+    try testing.expectEqualStrings("p", f.columns[0].name);
+    try testing.expectEqualStrings("q", f.columns[1].name);
+    try testing.expectEqual(df.ColumnType.categorical, f.columns[1].type);
+    try testing.expectEqualStrings("y", f.cell(0, "p").?.text);
+    try testing.expectEqualStrings("x", f.cell(1, "p").?.text);
+    try testing.expectEqualStrings("x", f.cell(0, "q").?.text);
+
+    const Case = struct { want: anyerror, second: schema.Field };
+    for ([_]Case{
+        .{ .want = error.Malformed, .second = .{ .name = "q", .type = .binary, .dictionary = .{ .id = 0, .index = .{ .bits = 8, .signed = false } } } },
+        .{ .want = error.Malformed, .second = .{ .name = "q", .type = .large_utf8, .dictionary = .{ .id = 0, .index = .{ .bits = 8, .signed = false } } } },
+        .{ .want = error.Unsupported, .second = .{ .name = "q", .type = .utf8, .dictionary = .{ .id = 0, .index = .{ .bits = 8, .signed = false }, .ordered = true } } },
+    }) |c| {
+        const bytes = try hand(gpa, &.{ shared[0], c.second }, &.{ dict, batch });
+        defer gpa.free(bytes);
+        try testing.expectError(c.want, stream.readStream(a, bytes, .{}));
+    }
 }

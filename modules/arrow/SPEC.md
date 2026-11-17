@@ -8,7 +8,7 @@
 
 **Audit:** review none · mutation none · src ?
 
-**Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean; reach: frames, files, batches, every error kind, frames from compressed inputs) · ct n/a — parses and writes data files, holds no secret
+**Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; reach: frames, files, batches, every error kind incl. InvalidUtf8, frames from compressed inputs; resource shapes the driver cannot make are in `src/hostile_test.zig`) · ct n/a — parses and writes data files, holds no secret
 
 **Performance:** not measured
 
@@ -107,27 +107,21 @@
                  A consumed module must grade 3 or better; check-catalog-table
                  fails otherwise. -->
 
-## Compared with
-
-<!-- Required once Scope is surveyed (check-catalog-table enforces it): who
-     "the competition" is, so the Scope verdict can be checked and re-run.
-     Written by the survey (SURVEY-PLAYBOOK.md). Stars and activity go stale,
-     hence the date. Delete this section while Scope is `unsurveyed`. -->
-
-Surveyed YYYY-MM-DD per `SURVEY-PLAYBOOK.md`; stars and activity as of that date.
-
-| Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
-|---|---|---|--:|---|---|
-| [owner/repo](https://github.com/owner/repo) — **reference** | Rust | MIT | 12.3k | v1.2.3 (2026-08) | … |
-
-**Where we are ahead:** … · **Where we are behind:** … (→ Backlog items)
-
 ## What this module is, and what it is not
 
-One paragraph. Then the scope line that matters most: **what a reader might
-reasonably expect here and will not find.** Name it, and say whether that is
-deferred or refused. A capability silently absent is the thing that wastes
-someone's afternoon.
+Apache Arrow IPC — the stream format and the file (Feather v2) format — between bytes and a whole
+`dataframe.Frame`: `writeStream` / `writeFile` turn a frame into Arrow, `readStream` / `readFile` read one back,
+`openFile` gives random access to a file's record batches, ZSTD body compression both ways. Underneath, a
+bounds-checked FlatBuffers reader and builder, the `Schema.fbs` / `Message.fbs` / `File.fbs` tables, and the
+message framing, each usable on its own (`arrow.fb`, `arrow.schema`, `arrow.ipc`). Every input is untrusted: a
+hostile stream ends in an error, within the limits below, never in a crash or an unbounded allocation.
+
+**Not here:** the Arrow C data interface (sharing buffers with another library in the same process), Flight
+(RPC), compute kernels, a columnar in-memory representation of its own (the reader decodes into `dataframe`'s
+storage and copies every buffer — no zero-copy views over the input), Parquet, the JSON integration format as an
+output, and the types `dataframe` has no column for (Interval, Union, Map, RunEndEncoded, the view types,
+Decimal32/64/256) — those are refused (`Unsupported`). LZ4_FRAME body compression is refused until the
+collection has an LZ4 codec (deferred, not refused for good).
 
 ## Wire format / algorithm
 
@@ -146,7 +140,7 @@ dictionary batch is compressed on its own and starts with its uncompressed lengt
 means the bytes after it are stored raw; a buffer of length 0 stays empty. `WriteOptions.compression = .zstd`
 (level `compression_level`, 0 = zstd's 3) compresses every non-empty buffer with the collection's `zstd` module and
 stores raw the ones that do not shrink, as Arrow C++ and arrow-rs do. The reader decompresses ZSTD (one zstd context
-per read) after checking each declared length against `zstd.decompressBound` and the message's total against
+per read) after checking each declared length against `zstd.decompressBound` and the whole read's total against
 `ReadOptions.max_body_bytes`; LZ4_FRAME is `error.Unsupported` (the collection has no LZ4 codec).
 
 **Type mapping (wave A2).** The writer maps the column's DECLARED `ColumnType` and reads the cells through
@@ -157,12 +151,12 @@ per read) after checking each declared length against `zstd.decompressBound` and
 | `int` / `int8`..`int32` / `uint8`..`uint64` | Int64 / Int8..Int32 / UInt8..UInt64 | — |
 | `float` / `float32` | Float64 / Float32 | Float16 → `float32` |
 | `bool` | Bool (bit-packed) | — |
-| `decimal` (i128, 12 digits) | Decimal128(38, 12) | Decimal128(p, s) rescaled to 12 digits; inexact or out of range → `Unsupported`, or null under `lossy` |
-| `text` / `binary` | Utf8 / Binary; Large* from `WriteOptions.large_from` bytes (default 2^31) | LargeUtf8 / LargeBinary; FixedSizeBinary → `binary` |
-| `date` (ISO text) | Date32 (days) | Date64 (ms, floored to the day); years outside 0000–9999 → `Unsupported` |
-| `timestamp` (+ `time_zone`) | Timestamp(us, zone) | s / ms / ns (ns floored to us); a zone `tz` does not know → `Unsupported`, or under `lossy` a naive column (the cells are UTC instants either way) |
-| `duration` | Duration(us) | s / ms / ns |
-| `time` | Time64(us) | Time32(s, ms), Time64(ns); a value outside `[0, 24h)` (Arrow allows 24:00:00) → `Unsupported`, or null under `lossy` |
+| `decimal` (i128, 12 digits) | Decimal128(p, 12), p = digits of the widest value (≥ 12); 39 digits → `Unsupported` | Decimal128(p, s) rescaled to 12 digits; inexact, out of range, wider than p or than 38 digits → `Unsupported`, or null under `lossy` |
+| `text` / `binary` | Utf8 (UTF-8 checked) / Binary; Large* from `WriteOptions.large_from` bytes (default 2^31) | LargeUtf8 / LargeBinary; FixedSizeBinary → `binary` |
+| `date` (ISO text) | Date32 (days) | Date64 (ms; off a day boundary → `Unsupported`, truncated under `lossy`); years outside 0000–9999 → `Unsupported` |
+| `timestamp` (+ `time_zone`) | Timestamp(us, zone) | s / ms / ns (ns not divisible to us → `Unsupported`, truncated toward zero under `lossy`); a zone `tz` does not know → `Unsupported`, or under `lossy` a naive column (the cells are UTC instants either way) |
+| `duration` | Duration(us) | s / ms / ns (ns as for timestamps) |
+| `time` | Time64(us) | Time32(s, ms), Time64(ns, as for timestamps); a value outside `[0, 24h)` (Arrow allows 24:00:00) → `Unsupported`, or null under `lossy` |
 | `categorical` | Utf8, dictionary-encoded, Int32 indices, `ordered` kept | any integer index type; an unordered dictionary is deduplicated and sorted lexically (the `CatColumn` invariant), an ordered one deduplicated in its order; null dictionary entries read as null rows |
 | `list` (`inner[0]`) | List (Int32 offsets) | LargeList; null rows with elements and offsets not starting at 0 are compacted |
 | `array` (`array_width`) | FixedSizeList(width) | — |
@@ -173,39 +167,65 @@ per read) after checking each declared length against `zstd.decompressBound` and
 A dictionary over a non-text type (Int64 values, say) is read as a plain column of that type. Each dictionary-encoded
 column gets its own id, its whole dictionary written once before the first record batch.
 
-## Constant-time contract
-
-⚠ Only if this module touches secrets. State **which values are secret**, which
-operations are claimed constant-time w.r.t. them, and — the part usually
-missing — **what is deliberately not**. A blanket claim is worse than none: it
-is what a reader relies on when they should be careful.
-
-If a claim is machine-checked, say by what (`scripts/checks/ctgrind.sh <name>`, a row
-in `scripts/checks/ctgrind-expected.tsv`). If it rests on reading the code, say that
-instead. Those are different grades of evidence and must not be written alike.
-
 ## Limits and refusals
 
+Every limit is checked before the work it bounds; past one the read is `error.LimitExceeded` (an option) or
+`error.Malformed` (more than the input could honestly describe). Tests: `src/hostile_test.zig` builds each
+hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src/stream_test.zig`
+"targeted corruptions", "every truncation and byte flip".
+
+- **Schema decode budget** (not an option): FlatBuffers offsets may share tables, so a few KB of metadata can
+  name 2^64 fields through children vectors pointing at one table. `schema.decodeSchema` charges 16 units per
+  `Field` and `KeyValue` and one per byte of every name and zone string against `2 × metadata length + 64`; past
+  it `error.Malformed`. An honest schema spends at most about its length (every field needs more than 8 unique
+  bytes plus its name). Nesting deeper than `schema.max_depth` (64) is refused on both sides.
 - `ReadOptions.max_rows` (default 2^27, ours): the most rows any one array may claim — the frame's rows summed over
-  the batches, a list's elements, a dictionary's entries. It bounds what a few bytes of hostile stream can make the
-  reader allocate where a length is not backed by bytes (a Null column, a list of nulls, a struct without fields):
-  roughly 16 bytes per claimed row at worst. `error.LimitExceeded`.
-- Nesting deeper than `schema.max_depth` (64) is refused on both sides.
+  the batches, a list's elements, a dictionary's entries.
+- `ReadOptions.max_cells` (default 2^28, ours): the most array slots the whole read may decode — every array's
+  length (column, list child, struct field, dictionary) summed over every batch, plus every row, list element and
+  byte a dictionary column copies out of its dictionary. `max_rows` bounds one array; this bounds their number
+  times their length, which matters where rows cost no body bytes: FixedSizeBinary(0), FixedSizeList(0) and Null
+  children, and one large dictionary entry selected by many one-byte indices. The reader spends up to ~16 bytes
+  per slot on offsets and selectors. `File.readBatch` / `readAll` decode within what the file's metadata left of
+  the budget, each call afresh.
+- `ReadOptions.max_body_bytes` (default 2^31, ours): the most bytes the compressed bodies of the WHOLE read may
+  expand to — every buffer of every record and dictionary batch of the stream, or of every block of a file
+  (`openFile` inflates them all). zstd reaches ~32 000:1 on a run of one byte, so a per-message cap would let K
+  small messages expand K times. A declared length above what the zstd frames can hold
+  (`zstd.decompressBound`), a frame that decodes to another length, or a broken frame is `error.Malformed`.
+- **File footer blocks**: each `Block`'s `metaDataLength` (framing + padded metadata) and `bodyLength` must be
+  those of the message at its offset, and no two blocks may share bytes (`error.Malformed`) — K blocks naming one
+  message would otherwise be inflated and decoded K times. The footer's metadata version is checked like a
+  message's. `File.batchRows(i)` and `File.readBatch(i)` past the last batch are `error.Unsupported`.
+- **Metadata version**: V4 (Arrow 0.8–0.17) and V5 (1.0 on) are read; V1–V3 and values the format does not name
+  are `error.Unsupported`. The writer writes V5.
+- **UTF-8**: the writer refuses a `.text` cell (a categorical's dictionary included) that is not UTF-8
+  (`error.InvalidUtf8`) — Arrow's Utf8 requires it and arrow-rs fails the whole file otherwise; the same bytes
+  declared `.binary` are written as Binary. The reader checks every Utf8 / LargeUtf8 value and dictionary entry
+  (`error.InvalidUtf8`) unless `ReadOptions.validate_utf8 = false`.
+- **Decimal precision**: the writer declares Decimal128(p, 12) with p the digits of the column's widest value (at
+  least 12, so scale ≤ precision); a value of 39 digits (an i128 can hold it, Decimal128 cannot) is
+  `Unsupported`. The reader refuses a declared precision outside 1–38 (`Malformed`), and a value with more digits
+  than its declared precision, or with more than 38 once at 12 fractional digits, like an inexact scale.
+- **Shared dictionaries**: two fields may name one dictionary id when their value types agree (type, zone,
+  children); each keeps its own index type. Different value types are `Malformed`; one dictionary with two
+  `isOrdered` flags is `Unsupported`.
 - `dataframe` keeps list offsets in `u32`: more than 2^32 − 1 elements in one list column → `Unsupported`; the
   writer's Int32 list offsets refuse more than 2^31 − 1 elements in one batch.
-- `ReadOptions.max_body_bytes` (default 2^31, ours): the most bytes one compressed message body may expand to;
-  `error.LimitExceeded`. A declared length above what the zstd frames can hold (`zstd.decompressBound`), a frame
-  that decodes to another length, or a broken frame is `error.Malformed`.
-- Values `dataframe` cannot hold — a Decimal128 that does not fit 12 fractional digits in an i128, a time of day
-  outside `[0, 24h)`, a date outside the years 0000–9999, s/ms timestamps or durations whose microseconds overflow
-  i64 — fail the whole read with `error.Unsupported` by default. `ReadOptions.lossy = true` reads each as a null
-  cell, and a timestamp zone `tz` does not know as a naive column; nothing else changes (a malformed stream is
-  still an error). Tests: `src/stream_test.zig` "lossy: …", and the `datetime` and `decimal` golden sets.
+- **Values `dataframe` cannot hold, or holds only inexactly** fail the whole read with `error.Unsupported` by
+  default: a Decimal128 that does not fit 12 fractional digits in an i128 (or the precision rules above); a time of
+  day outside `[0, 24h)`; a date outside the years 0000–9999; s/ms timestamps or durations whose microseconds
+  overflow i64; a nanosecond timestamp, duration or time with digits past the microsecond; a Date64 that is not on
+  a day boundary. `ReadOptions.lossy = true` reads the first four as null cells, TRUNCATES the last two toward
+  zero (so −1 ns reads as 0 µs and a Date64 of −1 ms as 1970-01-01 — the day of the truncated count, not the
+  calendar day of the instant), and reads a timestamp zone `tz` does not know as a naive column. Nothing else
+  changes (a malformed stream is still an error). Tests: `src/stream_test.zig` "lossy: …", "inexact time
+  conversions", and the `datetime` and `decimal` golden sets.
 - Refused on read (`Unsupported`): LZ4_FRAME body compression, a dictionary replaced mid-stream (deltas are
   appended), a dictionary nested in a dictionary's values, Decimal32/64/256, Interval, Union, Map, the view types,
   tensors. Every structural defect — a buffer shorter than its node, offsets running backwards or past the data, an
   index outside its dictionary, node or buffer counts not matching the schema, a column length not the batch's —
-  is `error.Malformed`. Tests: `src/stream_test.zig` "targeted corruptions", "every truncation and byte flip".
+  is `error.Malformed`.
 
 ## Anchoring
 
@@ -227,11 +247,15 @@ only through the reader (no foreign reader runs here).
 
 ## What is deliberately not done
 
-Decisions to refuse work, with the reason. This is the section that stops the
-same proposal arriving every few months — and the one whose absence made a
-separate archive necessary until 2026-08-13. Distinguish **not now** from
-**never** from **superseded by something external**; they are not the same and
-get confused constantly.
+- **Zero-copy reading — not now.** The reader copies every buffer into `dataframe` storage, which has its own
+  layout (u32 list offsets, usize text offsets, 64-bit validity words); views over the input would need a second
+  column representation. Revisit only with a consumer that reads files larger than memory.
+- **The C data interface, Flight, compute kernels — never here.** Separate concerns (in-process FFI, RPC,
+  compute) for separate modules if a consumer ever needs them.
+- **LZ4_FRAME — superseded by something external:** waits for an `lz4` codec module in the collection; writing
+  LZ4 is not planned even then (ZSTD is what Arrow C++ and arrow-rs recommend).
+- **Reading the types `dataframe` has no column for — never as such.** Interval, Union, Map, RunEndEncoded and
+  the view types would need new `dataframe` column kinds first.
 
 ## Open
 
@@ -239,7 +263,8 @@ get confused constantly.
   round trip needs a venv + wheel — owner decision).
 - LZ4_FRAME body compression: `Unsupported` until the collection has an LZ4 codec (a new-module idea; not filed
   from this wave).
-- The reader copies every buffer (no zero-copy views over the input) and text is not checked for UTF-8.
+- The reader copies every buffer (no zero-copy views over the input).
+- `openFile` reads the schema from the footer only; it does not compare it with the stream schema at offset 8.
 - Performance not measured.
 
 ## Plan
@@ -255,3 +280,4 @@ pyarrow round trip is an owner decision. Out: the C data interface, Flight, comp
 | A4 | IPC file: `ARROW1`, footer with blocks, random access to a batch; `writeFile` / `readFile` / `openFile` | done 2026-11-16 |
 | A5 | ZSTD body compression read and write (`WriteOptions.compression`); LZ4_FRAME `Unsupported` until an `lz4` module exists | done 2026-11-17 |
 | A6 | Golden oracle (done 2026-11-17), `ReadOptions.lossy` (done), fuzz driver (done 2026-11-17), example (done); no-panic sweep, mutation, survey | part 1 done 2026-11-17 |
+| A6.1 | Independent review 2026-11-17 (1 HIGH, 4 MED, 8 LOW) fixed: schema decode budget, read-wide `max_body_bytes` and `max_cells`, footer blocks checked and disjoint, UTF-8 both ways, inexact times refused, metadata version, decimal precision, shared dictionaries; structural hostile tests | done 2026-11-17 |
