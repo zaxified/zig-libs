@@ -1822,10 +1822,11 @@ timelock_envelope	ReleaseFast	env	1	8	6999a74481b0971f	eb40a7f3ed6eaa0a
 # privacy round trip, OPEN FINDING: des.zig is table-driven (S-box and
 # permutation lookups indexed by key- and data-dependent values) -> 256.
 # Not fixed: SNMPv3 DES is legacy; replacing it is the owner's decision.
-snmp	ReleaseFast	kdf	1	0	ccbfd8dbe82e2efe	b7a78ad081fdb5eb
-snmp	ReleaseFast	auth	1	0	ccbfd8dbe82e2efe	42cc3493cbe134d7
-snmp	ReleaseFast	aes	1	0	03bccc909f1f3cb3	aeff07ae5b6a7083
-snmp	ReleaseFast	des	1	256	b230314abc8b4c78	f7e7b8e6152d7073
+# 2026-11-17: kdf also covers usm.extendLocalizedKey (both AES-192/256 key-extension families), aes the four AES-192/256 protocols besides AES-128; counts unchanged.
+snmp	ReleaseFast	kdf	1	0	b3b0b51029d04cca	d27a07bf3fe3a8d8
+snmp	ReleaseFast	auth	1	0	b3b0b51029d04cca	42cc3493cbe134d7
+snmp	ReleaseFast	aes	1	0	b79a782ee52f0c12	07f7c9867f83b17e
+snmp	ReleaseFast	des	1	256	1dfcf525eae33862	f7e7b8e6152d7073
 # aes192 (2026-10-10) — enc / dec: key + plaintext (enc) or ciphertext (dec)
 # tainted through initEnc/initEncInto/initDec/initDecInto/initFromEnc, the
 # one-block, wide and xor paths and std's modes.ctr. Pinned on the AES-NI

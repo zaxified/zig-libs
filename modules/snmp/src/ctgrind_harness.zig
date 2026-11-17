@@ -10,12 +10,13 @@
 //! ## What this measures (SNMPv3 USM, RFC 3414 / 7860 / 3826)
 //!
 //!  * `kdf` — the user's password tainted through `usm.passwordToUserKey`
-//!    (the 1 MiB password expansion) and `usm.localizeKey`, MD5 and SHA-1.
+//!    (the 1 MiB password expansion) and `usm.localizeKey`, MD5 and SHA-1, then
+//!    `usm.extendLocalizedKey` (both AES-192/256 key-extension families).
 //!  * `auth` — the localized auth key tainted through `usm.computeDigestInto`
 //!    for every auth protocol (HMAC-MD5-96 .. HMAC-SHA-512). The message is
 //!    public.
 //!  * `aes` — the localized privacy key and the scopedPDU tainted through
-//!    `priv.encrypt`/`decrypt` with AES-128-CFB (RFC 3826).
+//!    `priv.encrypt`/`decrypt` with AES-128-CFB (RFC 3826) and the four AES-192/256-CFB protocols.
 //!  * `des` — the same with DES-CBC (RFC 3414 §8). EXPECTED NON-ZERO: the
 //!    module's `des.zig` is a table-driven DES (S-boxes and permutation
 //!    tables indexed by key- and data-dependent values). Recorded as an open
@@ -55,17 +56,17 @@ fn taintBytes(t: Taint, bytes: []u8) void {
 }
 
 fn privRoundTrip(proto: priv.PrivProtocol, t: Taint) !void {
-    var key = secretBytes(16, "ctgrind-snmp-priv-key-v1");
+    var key = secretBytes(32, "ctgrind-snmp-priv-key-v1");
     var pdu = secretBytes(48, "ctgrind-snmp-scoped-pdu-v1");
     taintBytes(t, &key);
     taintBytes(t, &pdu);
     var salt = priv.SaltSource.counter(0x5a17);
     var ct_buf: [64]u8 = undefined;
-    const enc = try priv.encrypt(proto, &key, 3, 1234, &salt, &pdu, &ct_buf);
+    const enc = try priv.encrypt(proto, key[0..proto.keyLen()], 3, 1234, &salt, &pdu, &ct_buf);
     std.debug.print("ctgrind_result={x}\n", .{enc.ciphertext});
     std.valgrind.memcheck.makeMemDefined(enc.ciphertext); // on the wire
     var pt_buf: [64]u8 = undefined;
-    const pt = try priv.decrypt(proto, &key, 3, 1234, &enc.salt, enc.ciphertext, &pt_buf);
+    const pt = try priv.decrypt(proto, key[0..proto.keyLen()], 3, 1234, &enc.salt, enc.ciphertext, &pt_buf);
     std.debug.print("ctgrind_result={x}\n", .{pt});
 }
 
@@ -91,6 +92,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 const lk = usm.localizeKey(proto, uk, engine_id, &lk_buf);
                 std.debug.print("ctgrind_result={x}\n", .{lk});
             }
+            // AES-192/256 key extension over the tainted password's localized key (MD5: 16 -> 32 bytes).
+            for ([_]usm.KeyExtension{ .blumenthal, .reeder }) |how| {
+                var ext_buf: [usm.max_key_len]u8 = undefined;
+                const k = try usm.passwordToKey(.hmac_md5, &pw, engine_id, &ext_buf);
+                const ext = try usm.extendLocalizedKey(.hmac_md5, how, engine_id, &ext_buf, k.len, 32);
+                std.debug.print("ctgrind_result={x}\n", .{ext});
+            }
         },
         .auth => {
             var key = secretBytes(64, "ctgrind-snmp-auth-key-v1");
@@ -104,7 +112,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 std.debug.print("ctgrind_result={x}\n", .{d});
             }
         },
-        .aes => try privRoundTrip(.aes128_cfb, taint),
+        .aes => for ([_]priv.PrivProtocol{ .aes128_cfb, .aes192_cfb, .aes256_cfb, .aes192_cisco_cfb, .aes256_cisco_cfb }) |p| try privRoundTrip(p, taint),
         .des => try privRoundTrip(.des_cbc, taint),
     }
 }

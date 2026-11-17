@@ -114,7 +114,8 @@ pub const User = struct {
     /// Privacy protocol; ignored below `authPriv`.
     priv_protocol: priv.PrivProtocol = .aes128_cfb,
     /// Privacy password. RFC 3414 §2.6: it is localized with the **auth**
-    /// protocol's hash, then truncated to the cipher's key length.
+    /// protocol's hash, then truncated to the cipher's key length (AES-192/256:
+    /// extended first when the hash is shorter, per `priv.PrivProtocol`).
     priv_password: []const u8 = &.{},
 };
 
@@ -380,8 +381,10 @@ pub const V3Client = struct {
         if (c.user.level.hasPriv()) {
             if (c.user.priv_password.len == 0) return error.MissingCredentials;
             // RFC 3414 §2.6: the privacy password is localized with the AUTH
-            // protocol's hash, then the cipher takes the leading key bytes.
-            const k = try usm.passwordToKey(
+            // protocol's hash, then the cipher takes the leading key bytes;
+            // AES-192/256 first extend a short key (draft-blumenthal / Cisco).
+            const k = try priv.localizeKey(
+                c.user.priv_protocol,
                 c.user.auth_protocol,
                 c.user.priv_password,
                 c.engine.id(),
@@ -958,7 +961,7 @@ pub const FakeAgent = struct {
         return usm.passwordToKey(a.user.auth_protocol, a.user.auth_password, a.engine_id, buf);
     }
     fn privKey(a: *FakeAgent, buf: []u8) ![]const u8 {
-        return usm.passwordToKey(a.user.auth_protocol, a.user.priv_password, a.engine_id, buf);
+        return priv.localizeKey(a.user.priv_protocol, a.user.auth_protocol, a.user.priv_password, a.engine_id, buf);
     }
 
     fn exchangeFn(ctx: *anyopaque, req: []const u8, reply_buf: []u8) client_mod.TransportError!usize {
@@ -1222,6 +1225,16 @@ test "authPriv: DES-CBC and AES-128-CFB round-trip through discover + GET" {
     try expectLevelRoundTrip(.auth_priv, .hmac_sha512, .des_cbc);
 }
 
+test "authPriv: AES-192/256-CFB (both key-extension families) round-trip through discover + GET" {
+    // MD5/SHA-1 exercise the key extension, SHA-256/512 the no-extension path.
+    inline for (.{ priv.PrivProtocol.aes192_cfb, priv.PrivProtocol.aes256_cfb, priv.PrivProtocol.aes192_cisco_cfb, priv.PrivProtocol.aes256_cisco_cfb }) |pp| {
+        try expectLevelRoundTrip(.auth_priv, .hmac_md5, pp);
+        try expectLevelRoundTrip(.auth_priv, .hmac_sha1, pp);
+        try expectLevelRoundTrip(.auth_priv, .hmac_sha256, pp);
+        try expectLevelRoundTrip(.auth_priv, .hmac_sha512, pp);
+    }
+}
+
 test "an authenticated request before discovery is NotDiscovered, never sent in the clear" {
     var agent: FakeAgent = .{ .user = .{
         .name = "u",
@@ -1372,7 +1385,7 @@ test "the privacy salt never repeats across real authPriv requests" {
     // back off the wire. The client, not the caller, chose both — they must
     // differ, and so must the ciphertext of the (identical) ScopedPDUs.
     const vals = try sysNameVarBinds();
-    inline for (.{ priv.PrivProtocol.aes128_cfb, priv.PrivProtocol.des_cbc }) |proto| {
+    inline for (.{ priv.PrivProtocol.aes128_cfb, priv.PrivProtocol.des_cbc, priv.PrivProtocol.aes256_cfb, priv.PrivProtocol.aes192_cisco_cfb }) |proto| {
         const user: User = .{
             .name = "privUser",
             .level = .auth_priv,

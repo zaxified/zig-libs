@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-//! USM privacy — SNMPv3 scoped-PDU encryption (RFC 3414 §8 DES-CBC and
-//! RFC 3826 AES-128-CFB128). Sits on top of `des.zig` (from-scratch DES) and
+//! USM privacy — SNMPv3 scoped-PDU encryption (RFC 3414 §8 DES-CBC,
+//! RFC 3826 AES-128-CFB128 and the AES-192/256-CFB128 extensions of
+//! draft-blumenthal-aes-usm-04). Sits on top of `des.zig` (from-scratch DES) and
 //! `std.crypto.core.aes.Aes128` (single-block AES), and hands the decrypted
 //! ScopedPDU to `v3.decodeScopedPdu`.
 //!
@@ -20,6 +21,14 @@
 //!     localized key; IV = engineBoots(4, big-endian) ‖ engineTime(4,
 //!     big-endian) ‖ 8-byte salt. CFB is a stream mode, so ciphertext length
 //!     equals plaintext length (no padding).
+//!   * AES-192/256-CFB (draft-blumenthal-aes-usm-04 §3, net-snmp's
+//!     `usmAES192PrivProtocol` / `usmAES256PrivProtocol` and the Cisco-OID
+//!     `...CiscoPrivProtocol` pair): the same CFB128 mode, IV and 8-byte salt
+//!     as AES-128, with a 24-/32-byte key. When the auth hash yields fewer key
+//!     bytes (MD5, SHA-1 for AES-192; MD5, SHA-1, SHA-224 for AES-256) the
+//!     localized key is first extended (`usm.extendLocalizedKey`); the two
+//!     families differ only in that extension. `localizeKey` below does both
+//!     steps. AES-192 runs on the sibling `aes192` module (std has none).
 //!
 //! Salt ownership: `encrypt` does NOT take a salt from the caller. It draws one
 //! from a `SaltSource` it is handed, so the never-repeat obligation is the
@@ -27,15 +36,21 @@
 //! what it does not.
 //!
 //! Provenance: clean-room from RFC 3414 §8 (DES) and RFC 3826 (AES-CFB); FIPS
-//! 46-3 (DES tables, in `des.zig`) and NIST SP 800-38A (CFB mode). No source
-//! consulted.
+//! 46-3 (DES tables, in `des.zig`) and NIST SP 800-38A (CFB mode);
+//! draft-blumenthal-aes-usm-04 §3.1.2.1 and its Appendix A for the AES-192/256
+//! key extension. The Reeder/Cisco extension and the variant OIDs follow
+//! net-snmp's `keytools.c` / `snmpusm.c` (BSD-licensed; read for the algorithm,
+//! no code copied).
 
 const std = @import("std");
 const ber = @import("ber.zig");
 const burn = @import("burn.zig");
 const des = @import("des.zig");
 const v3 = @import("v3.zig");
+const aes192 = @import("aes192");
+const usm = @import("usm.zig");
 const Aes128 = std.crypto.core.aes.Aes128;
+const Aes256 = std.crypto.core.aes.Aes256;
 
 /// The USM privacy protocols supported here.
 pub const PrivProtocol = enum {
@@ -45,12 +60,39 @@ pub const PrivProtocol = enum {
     /// usmAesCfb128Protocol (RFC 3826) — CFB128-AES-128, 16-byte localized key,
     /// 8-byte salt.
     aes128_cfb,
+    /// CFB128-AES-192, 24-byte localized key extended per draft-blumenthal
+    /// (`Kul || H(Kul)`) — net-snmp `usmAES192PrivProtocol`
+    /// (1.3.6.1.4.1.14832.1.3).
+    aes192_cfb,
+    /// CFB128-AES-256, 32-byte key, draft-blumenthal extension — net-snmp
+    /// `usmAES256PrivProtocol` (1.3.6.1.4.1.14832.1.4).
+    aes256_cfb,
+    /// CFB128-AES-192 with the Reeder/Cisco key extension — net-snmp
+    /// `usmAES192CiscoPrivProtocol` (1.3.6.1.4.1.9.12.6.1.1).
+    aes192_cisco_cfb,
+    /// CFB128-AES-256 with the Reeder/Cisco key extension — net-snmp
+    /// `usmAES256CiscoPrivProtocol` (1.3.6.1.4.1.9.12.6.1.2).
+    aes256_cisco_cfb,
 
-    /// Minimum localized-privacy-key length this protocol consumes.
+    /// Minimum localized-privacy-key length this protocol consumes. For the
+    /// AES-192/256 protocols this is the length AFTER key extension (see
+    /// `localizeKey`).
     pub fn keyLen(self: PrivProtocol) usize {
         return switch (self) {
             .des_cbc => 16, // 8 key + 8 pre-IV
             .aes128_cfb => 16, // AES-128 key
+            .aes192_cfb, .aes192_cisco_cfb => 24,
+            .aes256_cfb, .aes256_cisco_cfb => 32,
+        };
+    }
+
+    /// The localized-key extension this protocol applies when the auth hash is
+    /// shorter than `keyLen()`; null for DES and AES-128 (never extended).
+    pub fn extension(self: PrivProtocol) ?usm.KeyExtension {
+        return switch (self) {
+            .des_cbc, .aes128_cfb => null,
+            .aes192_cfb, .aes256_cfb => .blumenthal,
+            .aes192_cisco_cfb, .aes256_cisco_cfb => .reeder,
         };
     }
 
@@ -151,7 +193,7 @@ pub const SaltSource = struct {
                 const v = n.*;
                 var out: [8]u8 = undefined;
                 switch (proto) {
-                    .aes128_cfb => std.mem.writeInt(u64, &out, v, .big),
+                    .aes128_cfb, .aes192_cfb, .aes256_cfb, .aes192_cisco_cfb, .aes256_cisco_cfb => std.mem.writeInt(u64, &out, v, .big),
                     .des_cbc => {
                         // A new boots epoch restarts the 32-bit budget: the
                         // engineBoots prefix already separates the two epochs.
@@ -181,6 +223,25 @@ pub const SaltSource = struct {
         s.last_iv_len = @intCast(iv.len);
     }
 };
+
+/// Localize `password` to `engine_id` with the auth protocol's hash and, for
+/// AES-192/256, extend the result to `proto.keyLen()` bytes (`usm.passwordToKey`
+/// + `usm.extendLocalizedKey`). Returns the key, which is at least
+/// `proto.keyLen()` long and is what `encrypt`/`decrypt` expect. `out` must be
+/// at least `max(auth.keyLen(), proto.keyLen())` bytes (`usm.max_key_len`
+/// always suffices), else `error.BufferTooSmall`.
+pub fn localizeKey(
+    proto: PrivProtocol,
+    auth: usm.AuthProtocol,
+    password: []const u8,
+    engine_id: []const u8,
+    out: []u8,
+) (usm.KeyDerivationError || usm.ExtendError)![]u8 {
+    if (out.len < @max(auth.keyLen(), proto.keyLen())) return error.BufferTooSmall;
+    const k = try usm.passwordToKey(auth, password, engine_id, out);
+    const how = proto.extension() orelse return k;
+    return usm.extendLocalizedKey(auth, how, engine_id, out, k.len, proto.keyLen());
+}
 
 /// What `encrypt` produced: the ciphertext plus the salt it chose, which the
 /// caller must copy into `msgPrivacyParameters`.
@@ -241,12 +302,11 @@ fn encryptBody(
             };
             return .{ .ciphertext = ct, .salt = salt };
         },
-        .aes128_cfb => {
+        .aes128_cfb, .aes192_cfb, .aes256_cfb, .aes192_cisco_cfb, .aes256_cisco_cfb => {
             if (out.len < plaintext.len) return error.BufferTooSmall;
-            const key: [16]u8 = localized_priv_key[0..16].*;
             const iv = aesIv(engine_boots, engine_time, salt);
             try salt_source.recordIv(&iv);
-            cfb128(false, Aes128.initEnc(key), iv, plaintext, out[0..plaintext.len]);
+            aesCfb(false, proto, localized_priv_key, iv, plaintext, out[0..plaintext.len]);
             return .{ .ciphertext = out[0..plaintext.len], .salt = salt };
         },
     }
@@ -295,10 +355,9 @@ fn decryptBody(
                 error.NotPadded => unreachable,
             };
         },
-        .aes128_cfb => {
-            const key: [16]u8 = localized_priv_key[0..16].*;
+        .aes128_cfb, .aes192_cfb, .aes256_cfb, .aes192_cisco_cfb, .aes256_cisco_cfb => {
             const iv = aesIv(engine_boots, engine_time, salt);
-            cfb128(true, Aes128.initEnc(key), iv, ciphertext, out[0..ciphertext.len]);
+            aesCfb(true, proto, localized_priv_key, iv, ciphertext, out[0..ciphertext.len]);
             return out[0..ciphertext.len];
         },
     }
@@ -334,13 +393,24 @@ fn aesIv(engine_boots: u32, engine_time: u32, salt: [8]u8) [16]u8 {
     return iv;
 }
 
-/// CFB128 (NIST SP 800-38A §6.3) over `Aes128`. IMPORTANT: CFB — for both
+/// CFB128 with the AES key size `proto` names, over the first `proto.keyLen()`
+/// bytes of `key` (length checked by the callers).
+fn aesCfb(comptime decrypt_mode: bool, proto: PrivProtocol, key: []const u8, iv: [16]u8, in: []const u8, out: []u8) void {
+    switch (proto) {
+        .aes128_cfb => cfb128(decrypt_mode, Aes128.initEnc(key[0..16].*), iv, in, out),
+        .aes192_cfb, .aes192_cisco_cfb => cfb128(decrypt_mode, aes192.Aes192.initEnc(key[0..24].*), iv, in, out),
+        .aes256_cfb, .aes256_cisco_cfb => cfb128(decrypt_mode, Aes256.initEnc(key[0..32].*), iv, in, out),
+        .des_cbc => unreachable, // only AES protocols reach here
+    }
+}
+
+/// CFB128 (NIST SP 800-38A §6.3) over any AES encryption context. IMPORTANT: CFB — for both
 /// encryption AND decryption — only ever uses the AES *forward* (encrypt)
 /// function to produce the keystream; there is no AES-decrypt call here. Using
 /// `Aes128.initDec`/`.decrypt` would be a classic, silent CFB bug. Partial final
 /// block handled like std's `modes.zig` `ctr()`: keystream truncated to the
 /// remaining byte count.
-fn cfb128(comptime decrypt_mode: bool, ctx: std.crypto.core.aes.AesEncryptCtx(Aes128), iv: [16]u8, in: []const u8, out: []u8) void {
+fn cfb128(comptime decrypt_mode: bool, ctx: anytype, iv: [16]u8, in: []const u8, out: []u8) void {
     var feedback = iv;
     var i: usize = 0;
     while (i + 16 <= in.len) : (i += 16) {
@@ -367,7 +437,6 @@ fn cfb128(comptime decrypt_mode: bool, ctx: std.crypto.core.aes.AesEncryptCtx(Ae
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const usm = @import("usm.zig");
 const message = @import("message.zig");
 
 test "NIST SP 800-38A F.3.13/F.3.14 CFB128-AES128 KAT (encrypt + decrypt)" {
@@ -418,6 +487,17 @@ test "CFB128 partial final block round-trips (stream mode, no padding)" {
 test "keyLen / saltLen" {
     try testing.expectEqual(@as(usize, 16), PrivProtocol.des_cbc.keyLen());
     try testing.expectEqual(@as(usize, 16), PrivProtocol.aes128_cfb.keyLen());
+    try testing.expectEqual(@as(usize, 24), PrivProtocol.aes192_cfb.keyLen());
+    try testing.expectEqual(@as(usize, 32), PrivProtocol.aes256_cfb.keyLen());
+    try testing.expectEqual(@as(usize, 24), PrivProtocol.aes192_cisco_cfb.keyLen());
+    try testing.expectEqual(@as(usize, 32), PrivProtocol.aes256_cisco_cfb.keyLen());
+    try testing.expectEqual(@as(?usm.KeyExtension, null), PrivProtocol.des_cbc.extension());
+    try testing.expectEqual(@as(?usm.KeyExtension, null), PrivProtocol.aes128_cfb.extension());
+    try testing.expectEqual(@as(?usm.KeyExtension, .blumenthal), PrivProtocol.aes192_cfb.extension());
+    try testing.expectEqual(@as(?usm.KeyExtension, .blumenthal), PrivProtocol.aes256_cfb.extension());
+    try testing.expectEqual(@as(?usm.KeyExtension, .reeder), PrivProtocol.aes192_cisco_cfb.extension());
+    try testing.expectEqual(@as(?usm.KeyExtension, .reeder), PrivProtocol.aes256_cisco_cfb.extension());
+    try testing.expectEqual(@as(usize, 8), PrivProtocol.aes256_cisco_cfb.saltLen());
     try testing.expectEqual(@as(usize, 8), PrivProtocol.des_cbc.saltLen());
     try testing.expectEqual(@as(usize, 8), PrivProtocol.aes128_cfb.saltLen());
 }
@@ -572,7 +652,8 @@ fn expectPrivRoundTrip(proto: PrivProtocol) !void {
     // Localize a privacy password to the example engine to get a realistic key.
     const engine_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
     var key_buf: [usm.max_key_len]u8 = undefined;
-    const key = try usm.passwordToKey(.hmac_sha1, "privpassword", &engine_id, &key_buf);
+    const key = try localizeKey(proto, .hmac_sha1, "privpassword", &engine_id, &key_buf);
+    const auth_key = key[0..usm.AuthProtocol.hmac_sha1.keyLen()];
     const salt = [8]u8{ 0x00, 0x00, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef };
     const boots: u32 = 5;
     const time: u32 = 12345;
@@ -597,7 +678,7 @@ fn expectPrivRoundTrip(proto: PrivProtocol) !void {
     // DES pads to a multiple of 8; AES is a stream cipher (exact length).
     switch (proto) {
         .des_cbc => try testing.expectEqual(@as(usize, 0), cipher.len % 8),
-        .aes128_cfb => try testing.expectEqual(scoped_plain.len, cipher.len),
+        else => try testing.expectEqual(scoped_plain.len, cipher.len),
     }
     // Ciphertext must differ from plaintext.
     try testing.expect(!std.mem.eql(u8, scoped_plain, cipher[0..scoped_plain.len]));
@@ -630,8 +711,8 @@ fn expectPrivRoundTrip(proto: PrivProtocol) !void {
     const sp = try usm.parse(m.security_parameters);
     try testing.expectEqualSlices(u8, &salt, sp.priv_params);
     const off = usm.authOffset(msg, sp) orelse return error.TestUnexpectedResult;
-    try usm.sign(.hmac_sha1, key, msg, off);
-    try usm.verify(.hmac_sha1, key, msg, sp);
+    try usm.sign(.hmac_sha1, auth_key, msg, off);
+    try usm.verify(.hmac_sha1, auth_key, msg, sp);
     const enc_bytes = m.data.encrypted;
 
     // Decrypt straight back through the parsing convenience.
@@ -659,6 +740,180 @@ test "privacy round-trip over a real v3 datagram: DES-CBC" {
 
 test "privacy round-trip over a real v3 datagram: AES-128-CFB" {
     try expectPrivRoundTrip(.aes128_cfb);
+}
+
+test "privacy round-trip over a real v3 datagram: AES-192/256 (both extension families)" {
+    try expectPrivRoundTrip(.aes192_cfb);
+    try expectPrivRoundTrip(.aes256_cfb);
+    try expectPrivRoundTrip(.aes192_cisco_cfb);
+    try expectPrivRoundTrip(.aes256_cisco_cfb);
+}
+
+fn unhex(comptime hex: []const u8) [hex.len / 2]u8 {
+    @setEvalBranchQuota(hex.len * 40 + 1000);
+    var out: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
+    return out;
+}
+
+test "AES-192/256 KATs: every auth hash x each new privacy protocol (tools/gen_aes_priv_kat.py)" {
+    const kat = @import("priv_kat.zig");
+    @setEvalBranchQuota(200_000);
+    const engine_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+    const salt = [8]u8{ 0, 0, 0, 1, 0xde, 0xad, 0xbe, 0xef };
+    var plain: [37]u8 = undefined;
+    for (&plain, 0..) |*b, i| b.* = @intCast((i * 37 + 5) & 0xff);
+    // 6 hashes x 4 protocols.
+    try testing.expectEqual(@as(usize, 24), kat.cases.len);
+    inline for (kat.cases) |c| {
+        const proto = comptime std.meta.stringToEnum(PrivProtocol, c.priv).?;
+        const auth = comptime std.meta.stringToEnum(usm.AuthProtocol, c.auth).?;
+        const want_key = comptime unhex(c.key_hex);
+        const want_ct = comptime unhex(c.ct_hex);
+        var key_buf: [usm.max_key_len]u8 = undefined;
+        const key = try localizeKey(proto, auth, "maplesyrup", &engine_id, &key_buf);
+        // Exactly max(hash length, key length): no more is appended than needed.
+        try testing.expectEqual(@max(auth.keyLen(), proto.keyLen()), key.len);
+        try testing.expectEqualSlices(u8, &want_key, key[0..proto.keyLen()]);
+
+        var src = SaltSource.fixedForInterop(salt);
+        var out: [64]u8 = undefined;
+        const e = try encrypt(proto, key, 5, 12345, &src, &plain, &out);
+        try testing.expectEqualSlices(u8, &want_ct, e.ciphertext);
+        try testing.expectEqualSlices(u8, &salt, &e.salt);
+        var back: [64]u8 = undefined;
+        const p = try decrypt(proto, key, 5, 12345, &salt, e.ciphertext, &back);
+        try testing.expectEqualSlices(u8, &plain, p);
+    }
+}
+
+test "key extension: draft-blumenthal-aes-usm-04 Appendix A (maplesyrup, SHA-1, 256 bit)" {
+    const engine_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+    var buf: [usm.max_key_len]u8 = undefined;
+    const k = try usm.passwordToKey(.hmac_sha1, "maplesyrup", &engine_id, &buf);
+    try testing.expectEqualSlices(u8, &unhex("6695febc9288e36282235fc7151f128497b38f3f"), k);
+    const ext = try usm.extendLocalizedKey(.hmac_sha1, .blumenthal, &engine_id, &buf, k.len, 32);
+    try testing.expectEqualSlices(
+        u8,
+        &unhex("6695febc9288e36282235fc7151f128497b38f3f505e07eb9af25568fa1f5dbe"),
+        ext,
+    );
+}
+
+test "key extension: a long-enough key is left alone; the two families differ; short buffer refused" {
+    const engine_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+    var buf: [usm.max_key_len]u8 = undefined;
+    // SHA-256 already gives 32 bytes: no extension for either family, either size.
+    var k = try usm.passwordToKey(.hmac_sha256, "maplesyrup", &engine_id, &buf);
+    const before: [32]u8 = k[0..32].*;
+    for ([_]usm.KeyExtension{ .blumenthal, .reeder }) |how| {
+        for ([_]usize{ 24, 32 }) |need| {
+            const e = try usm.extendLocalizedKey(.hmac_sha256, how, &engine_id, &buf, 32, need);
+            try testing.expectEqualSlices(u8, &before, e);
+        }
+    }
+    // SHA-1 -> 24 bytes: the first 20 bytes agree, the tail differs by family.
+    var a_buf: [usm.max_key_len]u8 = undefined;
+    var b_buf: [usm.max_key_len]u8 = undefined;
+    k = try usm.passwordToKey(.hmac_sha1, "maplesyrup", &engine_id, &a_buf);
+    _ = try usm.passwordToKey(.hmac_sha1, "maplesyrup", &engine_id, &b_buf);
+    const a = try usm.extendLocalizedKey(.hmac_sha1, .blumenthal, &engine_id, &a_buf, 20, 24);
+    const b = try usm.extendLocalizedKey(.hmac_sha1, .reeder, &engine_id, &b_buf, 20, 24);
+    try testing.expectEqual(@as(usize, 24), a.len);
+    try testing.expectEqual(@as(usize, 24), b.len);
+    try testing.expectEqualSlices(u8, a[0..20], b[0..20]);
+    try testing.expect(!std.mem.eql(u8, a[20..], b[20..]));
+    // Buffer too small for the requested key.
+    var small: [24]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, usm.extendLocalizedKey(.hmac_sha1, .blumenthal, &engine_id, &small, 20, 32));
+    try testing.expectError(error.BufferTooSmall, localizeKey(.aes256_cfb, .hmac_sha1, "maplesyrup", &engine_id, &small));
+    // The Reeder family depends on the engine ID, Blumenthal does not.
+    const other = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3 };
+    var c_buf: [usm.max_key_len]u8 = undefined;
+    var d_buf: [usm.max_key_len]u8 = undefined;
+    const c = try localizeKey(.aes256_cfb, .hmac_md5, "maplesyrup", &other, &c_buf);
+    const d = try localizeKey(.aes256_cisco_cfb, .hmac_md5, "maplesyrup", &other, &d_buf);
+    try testing.expect(!std.mem.eql(u8, c[16..32], d[16..32]));
+}
+
+test "key extension over several rounds (need 64): both families vs the oracle" {
+    @setEvalBranchQuota(200_000);
+    const kat = @import("priv_kat.zig");
+    const engine_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+    inline for (kat.ext64) |c| {
+        const auth = comptime std.meta.stringToEnum(usm.AuthProtocol, c.auth).?;
+        const how = comptime std.meta.stringToEnum(usm.KeyExtension, c.how).?;
+        const want = comptime unhex(c.key_hex);
+        var buf: [usm.max_key_len]u8 = undefined;
+        const k = try usm.passwordToKey(auth, "maplesyrup", &engine_id, &buf);
+        const ext = try usm.extendLocalizedKey(auth, how, &engine_id, &buf, k.len, 64);
+        try testing.expectEqualSlices(u8, &want, ext);
+    }
+}
+
+test "localizeKey: exact-fit buffer works, a buffer shorter than the hash is refused before any write" {
+    const engine_id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+    var fit: [32]u8 = undefined;
+    const k = try localizeKey(.aes256_cfb, .hmac_sha1, "maplesyrup", &engine_id, &fit);
+    try testing.expectEqual(@as(usize, 32), k.len);
+    var fit24: [24]u8 = undefined;
+    try testing.expectEqual(@as(usize, 24), (try localizeKey(.aes192_cisco_cfb, .hmac_md5, "maplesyrup", &engine_id, &fit24)).len);
+    // SHA-512 localizes to 64 bytes: a 32-byte buffer must be refused, not overrun.
+    var small: [32]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, localizeKey(.aes128_cfb, .hmac_sha512, "maplesyrup", &engine_id, &small));
+    // AES-128 and DES are never extended: the plain localized key comes back.
+    var buf: [usm.max_key_len]u8 = undefined;
+    inline for (.{ PrivProtocol.aes128_cfb, PrivProtocol.des_cbc }) |p| {
+        const a = try localizeKey(p, .hmac_sha1, "maplesyrup", &engine_id, &buf);
+        try testing.expectEqualSlices(u8, &unhex("6695febc9288e36282235fc7151f128497b38f3f"), a);
+    }
+}
+
+test "AES-192/256 negative cases: short key, wrong salt length, partial blocks" {
+    var out: [64]u8 = undefined;
+    var src = SaltSource.counter(1);
+    const k16 = @as([16]u8, @splat(7));
+    const k23 = @as([23]u8, @splat(7));
+    const k31 = @as([31]u8, @splat(7));
+    try testing.expectError(error.KeyTooShort, encrypt(.aes192_cfb, &k16, 0, 0, &src, "hello", &out));
+    try testing.expectError(error.KeyTooShort, encrypt(.aes192_cisco_cfb, &k23, 0, 0, &src, "hello", &out));
+    try testing.expectError(error.KeyTooShort, encrypt(.aes256_cfb, &k31, 0, 0, &src, "hello", &out));
+    try testing.expectError(error.KeyTooShort, decrypt(.aes256_cisco_cfb, &k31, 0, 0, &@as([8]u8, @splat(0)), "x", &out));
+    const k32 = @as([32]u8, @splat(7));
+    try testing.expectError(error.BadSalt, decrypt(.aes256_cfb, &k32, 0, 0, &@as([7]u8, @splat(0)), "x", &out));
+    try testing.expectError(error.BadSalt, decrypt(.aes192_cfb, &k32, 0, 0, &@as([9]u8, @splat(0)), "x", &out));
+    try testing.expectError(error.BufferTooSmall, encrypt(.aes256_cfb, &k32, 0, 0, &src, "0123456789", out[0..9]));
+    try testing.expectError(error.BufferTooSmall, decrypt(.aes192_cfb, &k32, 0, 0, &@as([8]u8, @splat(0)), "0123456789", out[0..9]));
+    // Stream mode: any length round-trips, output length == input length.
+    inline for (.{ PrivProtocol.aes192_cfb, PrivProtocol.aes256_cfb, PrivProtocol.aes192_cisco_cfb, PrivProtocol.aes256_cisco_cfb }) |proto| {
+        inline for (.{ 0, 1, 15, 16, 17, 33 }) |n| {
+            var pt: [n]u8 = undefined;
+            for (&pt, 0..) |*b, i| b.* = @intCast(i * 7 + 1);
+            var ct: [n]u8 = undefined;
+            var dec: [n]u8 = undefined;
+            var s2 = SaltSource.counter(9);
+            const e = try encrypt(proto, &k32, 2, 3, &s2, &pt, &ct);
+            try testing.expectEqual(@as(usize, n), e.ciphertext.len);
+            const p = try decrypt(proto, &k32, 2, 3, &e.salt, e.ciphertext, &dec);
+            try testing.expectEqualSlices(u8, &pt, p);
+        }
+    }
+}
+
+test "AES-192/256 counter salts are the 64-bit big-endian counter, like AES-128" {
+    const key = @as([32]u8, @splat(0));
+    var out: [16]u8 = undefined;
+    inline for (.{ PrivProtocol.aes192_cfb, PrivProtocol.aes256_cfb, PrivProtocol.aes192_cisco_cfb, PrivProtocol.aes256_cisco_cfb }) |proto| {
+        var src = SaltSource.counter(0x0102030405060708);
+        const a1 = try encrypt(proto, &key, 1, 1, &src, strRepeat("x", 16), &out);
+        const a2 = try encrypt(proto, &key, 1, 1, &src, strRepeat("x", 16), &out);
+        try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }, &a1.salt);
+        try testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 9 }, &a2.salt);
+    }
+    // A repeated IV is detected for the new protocols too.
+    var pinned = SaltSource.fixedForInterop(.{ 1, 1, 1, 1, 1, 1, 1, 1 });
+    _ = try encrypt(.aes256_cfb, &key, 3, 42, &pinned, strRepeat("x", 16), &out);
+    try testing.expectError(error.SaltReuse, encrypt(.aes256_cfb, &key, 3, 42, &pinned, strRepeat("x", 16), &out));
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

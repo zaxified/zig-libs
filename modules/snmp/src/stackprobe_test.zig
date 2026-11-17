@@ -20,6 +20,7 @@ var password: [24]u8 = undefined;
 var user_key: [64]u8 = undefined;
 var local_key: [64]u8 = undefined;
 var key16: [16]u8 = undefined;
+var key32: [32]u8 = undefined;
 var des_key: [8]u8 = undefined;
 var plain: [32]u8 = undefined;
 var cipher: [40]u8 = undefined;
@@ -37,6 +38,7 @@ test "STACKPROBE: no key residue after the USM key, digest and privacy paths" {
     try sp.skipUnlessOptimized();
     fill(&password, "snmp probe password");
     fill(&key16, "snmp probe priv key");
+    fill(&key32, "snmp probe priv key 256");
     fill(&des_key, "snmp probe des key");
     fill(&plain, "snmp probe plaintext");
     const proto: usm.AuthProtocol = .hmac_sha1;
@@ -44,8 +46,8 @@ test "STACKPROBE: no key residue after the USM key, digest and privacy paths" {
     // Only probe-able secrets: a buffer still zero at the call, or shorter than
     // a needle window (the 8-byte DES key), would make the probe warn. The
     // decrypted plaintext equals `plain` (asserted below), so it is listed once.
-    const secrets1 = [_][]const u8{ &password, &key16, &plain, user_key[0..klen] };
-    const secrets = [_][]const u8{ &password, &key16, &plain, user_key[0..klen], local_key[0..klen] };
+    const secrets1 = [_][]const u8{ &password, &key16, &key32, &plain, user_key[0..klen] };
+    const secrets = [_][]const u8{ &password, &key16, &key32, &plain, user_key[0..klen], local_key[0..klen] };
 
     // Key derivation (one-shot).
     _ = try P.run("passwordToUserKey", usm.passwordToUserKey, .{ proto, @as([]const u8, &password), @as([]u8, &user_key) }, &secrets1, .{});
@@ -72,9 +74,9 @@ test "STACKPROBE: no key residue after the USM key, digest and privacy paths" {
     _ = try P.run("verify", usm.verify, .{ proto, lk, @as([]const u8, &message), params }, &secrets, .{});
 
     // Privacy: AES-CFB and DES-CBC, encrypt then decrypt what it produced.
-    var local_priv: [16]u8 = undefined;
-    @memcpy(&local_priv, &key16);
-    for ([_]priv.PrivProtocol{ .aes128_cfb, .des_cbc }) |pp| {
+    var local_priv: [32]u8 = undefined;
+    @memcpy(&local_priv, &key32);
+    for ([_]priv.PrivProtocol{ .aes128_cfb, .des_cbc, .aes192_cfb, .aes256_cfb, .aes192_cisco_cfb, .aes256_cisco_cfb }) |pp| {
         salt_source = priv.SaltSource.counter(0x1122334455667788);
         _ = try P.run("priv.encrypt", priv.encrypt, .{ pp, @as([]const u8, &local_priv), @as(u32, 3), @as(u32, 4), &salt_source, @as([]const u8, &plain), @as([]u8, &cipher) }, &secrets, .{});
         salt_source = priv.SaltSource.counter(0x1122334455667788);
