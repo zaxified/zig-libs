@@ -6,7 +6,7 @@
 
 **Scope:** core — Net-SNMP manager tools (snmpget/snmpwalk/snmpbulkwalk/snmpset/snmptrapd), gosnmp v1.45 as library yardstick (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation 2026-08-23 · src ?
+**Audit:** review 2026-09-02 · mutation 2026-11-17 (19/21, 2 eq) · src 1b79d4868ecd171e
 
 **Hardening:** fuzz 2026-10-10 (SNMP_FUZZ: `snmp-wire` and `snmp-auth-priv` 200,000-run budget clean; `snmp-v3-reply` at `.scale` 64 = 3,125 runs — every run derives USM keys from passwords, ~65/s; the existing decode harnesses are unchanged) · ct 2026-11-17 (ctgrind: password KDF + AES-192/256 key extension, all auth digests, AES-128/192/256-CFB privacy 0 in-file; DES-CBC privacy 256 = open finding, table-driven des.zig)
 **Performance:** not measured
@@ -263,6 +263,8 @@ non-multiple-of-8 DES ciphertext, wrong-length salt); a Report with an unknown O
 non-Counter32 value, or extra varbinds; an out-of-window timestamp; msgID and request-id mismatch;
 a reply from a different engine; security-level downgrade; and full truncation + bit-flip sweeps
 over both the captured net-snmp datagrams and a live authPriv reply. Every one is a typed error.
+
+**Mutation 2026-11-17 (delta over the AES-192/256 change; the 2026-08-23 whole-module run recorded no counts, so this is the first countable figure):** 21 mutants (`usm.extendLocalizedKey`, `priv.localizeKey`, `PrivProtocol.keyLen/extension`, the AES-192/256 key slices, the `V3Client` privacy-key call), 19 killed (one by a hang), 2 EQUIVALENT: `have >= need` -> `have > need` (at equality the loop does not run and the same slice is returned) and `orelse return k` -> always extend (DES/AES-128 need <= 16 bytes, every auth hash gives >= 16, so the extension returns early). Not mutated: the `hashOnce` hash-type `switch` (comptime type selection cannot take a runtime switch; the SHA-224 arm is pinned by the KATs).
 
 ## Backlog / deferred
 Agent (engine/server) role; MIB compiler / SMI parsing; SNMPv3 over TLS/DTLS (RFC 6353); RFC 3826 `usmDHKickstart` and the `KeyChange`
