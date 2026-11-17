@@ -22,7 +22,8 @@
 //!   malformed member (the `%` MUST be encoded). Decoded values are written
 //!   into the scratch buffer, which must be at least as long as the input
 //!   (decoding never grows a value). Property values stay as on the wire
-//!   (still percent-encoded; `decodeValue` decodes one).
+//!   (still percent-encoded; `decodeValue` decodes one), but a `%` in one that is
+//!   not a valid escape makes the member malformed, as in the member value.
 //! - **Several `baggage` header fields** are one list (§3: combine per RFC
 //!   9110 §5.3, i.e. join with `,`); the limits apply to the combination
 //!   (§3.3.2), so pass the joined value.
@@ -76,13 +77,23 @@ const ows = " \t";
 /// The value is as on the wire (percent-encoded).
 pub const Property = struct { key: []const u8, value: ?[]const u8 };
 
-/// `property = key OWS "=" OWS value / key OWS`, OWS trimmed (§3.3.1.4).
+/// True when every `%` of `s` starts a valid `%XX` escape.
+fn escapesValid(s: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) i = (rawAt(s, i) catch return false).next;
+    return true;
+}
+
+/// `property = key OWS "=" OWS value / key OWS`, OWS trimmed (§3.3.1.4). A
+/// value holding a `%` that is not a valid escape is refused, as in the
+/// member value (owner decision 2026-11-17, symmetry; OpenTelemetry Go refuses it,
+/// Java, JS and Python keep properties opaque and accept it).
 fn parseProperty(piece: []const u8) ?Property {
     const p = std.mem.trim(u8, piece, ows);
     if (std.mem.findScalar(u8, p, '=')) |eq| {
         const key = std.mem.trim(u8, p[0..eq], ows);
         const value = std.mem.trim(u8, p[eq + 1 ..], ows);
-        if (!isToken(key) or !allBaggageOctets(value)) return null;
+        if (!isToken(key) or !allBaggageOctets(value) or !escapesValid(value)) return null;
         return .{ .key = key, .value = value };
     }
     if (!isToken(p)) return null;
@@ -517,9 +528,15 @@ test "malformed members are errors, not panics" {
         ",",
     };
     for (bad) |h| try testing.expectError(error.BadMember, Baggage.parse(h, &s));
-    // `;` starts a property, and a property value is never percent-decoded or checked for escapes.
+    // `;` starts a property; a property value is kept as on the wire but a bad escape in it is refused too.
     _ = try Baggage.parse("k=a;b", &s);
-    _ = try Baggage.parse("a=1;p=%zz,b=2", &s);
+    _ = try Baggage.parse("a=1;p=%41,b=2", &s);
+    const bad_prop = [_][]const u8{ "a=1;p=%zz,b=2", "a=1;p=%", "a=1;p=%4", "a=1;p=x%4g", "a=1;q;p=%zz" };
+    for (bad_prop) |h| try testing.expectError(error.BadMember, Baggage.parse(h, &s));
+    // Lenient mode skips just that member (§3.5).
+    const l = try Baggage.parseLenient("a=1;p=%zz,b=2", &s);
+    try testing.expectEqual(@as(usize, 1), l.members().len);
+    try testing.expectEqualStrings("b", l.members()[0].key);
     // NUL and control bytes inside a header never parse.
     try testing.expectError(error.BadMember, Baggage.parse("k=a\x00b", &s));
     try testing.expectError(error.BadMember, Baggage.parse("k=a\r\nb", &s));
