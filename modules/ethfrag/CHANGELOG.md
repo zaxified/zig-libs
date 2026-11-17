@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of `src/root.zig` (164 mutants, 159 killed, 5 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). 12 tests added at the end of `src/root.zig` (golden header bytes, fragment sizes and leak-freedom under a failing allocator, saturation and backwards-clock cases, lifetime and budget boundaries, buffer growth). No source change, no behaviour change.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog "Documented per-peer keying" re-checked against the references (Linux and smoltcp key reassembly by a peer identity carried in the packet; this wire format carries none) and the "one `Reassembler` per peer" decision recorded with its reasons; no code change.
 - **2026-11-16** — **BREAKING:** `Reassembler.init` returns `InitError!Reassembler`; an invalid config (`max_inflight`,
   `max_fragments_per_datagram` or a set `max_total_bytes` of 0, `max_frame_len` 0 or too large) is `error.InvalidConfig`
