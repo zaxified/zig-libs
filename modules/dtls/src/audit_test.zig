@@ -1271,3 +1271,208 @@ test "audit: dtls12 certificate options: a PSK identity hint does not leak into 
         try drive12(&client, &server);
     }
 }
+
+// ── Connection12, audit run 2 (2026-11-17) ───────────────────────────────
+
+const psk_cs12 = [_]u16{@backingInt(S12.psk_with_aes_128_gcm_sha256)};
+
+/// One plaintext epoch-0 record holding one fragment of a message.
+fn hsFrag(buf: []u8, rseq: u48, t: u8, mseq: u16, total: u24, off: u24, frag: []const u8) []u8 {
+    _ = record.encodePlaintext(.{ .content_type = 22, .epoch = 0, .sequence_number = rseq, .length = @intCast(handshake.header_len + frag.len) }, buf) catch unreachable;
+    handshake.encodeHeader(.{ .msg_type = t, .length = total, .message_seq = mseq, .fragment_offset = off, .fragment_length = @intCast(frag.len) }, buf[13..][0..handshake.header_len]);
+    @memcpy(buf[13 + handshake.header_len ..][0..frag.len], frag);
+    return buf[0 .. 13 + handshake.header_len + frag.len];
+}
+
+/// `flightOf` with the record sequence numbers starting at `rseq0`.
+fn flightAt(buf: []u8, rseq0: u48, mseq0: u16, msgs: []const Msg) []u8 {
+    var n: usize = 0;
+    for (msgs, 0..) |mm, i| n += hsRec(buf[n..], rseq0 + @as(u48, @intCast(i)), mm.t, mseq0 + @as(u16, @intCast(i)), mm.body).len;
+    return buf[0..n];
+}
+
+/// `fl` with its (last) epoch-1 record — the Finished — re-sealed under
+/// `keys` with `extra` appended to the verify_data and its first byte xored
+/// with `flip`.
+fn forgeFinished(fl: []const u8, keys: *const record12.DirKeys, extra: []const u8, flip: u8, out: []u8) ![]u8 {
+    var p: usize = 0;
+    var at: usize = fl.len;
+    while (p + 13 <= fl.len) {
+        const h = try record.decodePlaintext(fl[p..]);
+        if (h.epoch == 1) at = p;
+        p += 13 + h.length;
+    }
+    const h = try record.decodePlaintext(fl[at..]);
+    var pt: [64]u8 = undefined;
+    const plain = try record12.open(keys, h, fl[at + 13 ..][0..h.length], &pt);
+    const hh = try handshake.decodeHeader(plain);
+    const vd_len = plain.len - handshake.header_len;
+    const n = vd_len + extra.len;
+    var msg: [96]u8 = undefined;
+    handshake.encodeHeader(.{ .msg_type = hh.msg_type, .length = @intCast(n), .message_seq = hh.message_seq, .fragment_offset = 0, .fragment_length = @intCast(n) }, msg[0..handshake.header_len]);
+    @memcpy(msg[handshake.header_len..][0..vd_len], plain[handshake.header_len..]);
+    msg[handshake.header_len] ^= flip;
+    @memcpy(msg[handshake.header_len + vd_len ..][0..extra.len], extra);
+    @memcpy(out[0..at], fl[0..at]);
+    const rec = try record12.seal(keys, 1, h.sequence_number, 22, msg[0 .. handshake.header_len + n], out[at..]);
+    return out[0 .. at + rec.len];
+}
+
+test "audit: dtls12 stateless server: a retransmitted ClientHello is answered again, one answer per datagram" {
+    var cfg = psk12(.server);
+    cfg.hello_retry = .{ .cookie_secret = "dtls12 audit cookie secret", .peer_binding = "198.51.100.7:5684" };
+    var s = try C12.serverInit(cfg);
+    defer s.deinit();
+    var b: [512]u8 = undefined;
+    var dg: [2048]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    const ch = clientHello12(&b, &psk_cs12, &.{ ri_ext, ems_ext });
+    const rec_len = hsRec(&dg, 0, HT.client_hello, 0, ch).len;
+    var first: [256]u8 = undefined;
+    const r1 = try s.handleFlight(dg[0..rec_len], ent(), 0, &out);
+    const n1 = r1.out.len;
+    try testing.expect(n1 > 0 and n1 <= first.len);
+    @memcpy(first[0..n1], r1.out);
+    // The identical datagram again (our HelloVerifyRequest was lost): the
+    // server kept nothing, so it answers again, byte for byte.
+    try testing.expectEqualSlices(u8, first[0..n1], (try s.handleFlight(dg[0..rec_len], ent(), 0, &out)).out);
+    // Two ClientHello records in one datagram: one answer.
+    const second = hsRec(dg[rec_len..], 1, HT.client_hello, 0, ch);
+    try testing.expectEqual(n1, (try s.handleFlight(dg[0 .. rec_len + second.len], ent(), 0, &out)).out.len);
+    // Two ClientHello messages in one record: one answer.
+    const msg_len = handshake.header_len + ch.len;
+    _ = hsRec(&dg, 2, HT.client_hello, 0, ch); // its record header is rewritten for two messages
+    _ = record.encodePlaintext(.{ .content_type = 22, .epoch = 0, .sequence_number = 2, .length = @intCast(2 * msg_len) }, &dg) catch unreachable;
+    @memcpy(dg[13 + msg_len ..][0..msg_len], dg[13..][0..msg_len]);
+    try testing.expectEqual(n1, (try s.handleFlight(dg[0 .. 13 + 2 * msg_len], ent(), 0, &out)).out.len);
+}
+
+test "audit: dtls12 client: a server flight retransmitted inside the same datagram is answered once" {
+    var b: [512]u8 = undefined;
+    const sh = serverHello(&b, .psk_with_aes_128_gcm_sha256, &.{ ri_ext, ems_ext });
+    const msgs = [_]Msg{ .{ .t = HT.server_hello, .body = sh }, .{ .t = HT.server_hello_done, .body = "" } };
+    var out: [4096]u8 = undefined;
+    var dg: [4096]u8 = undefined;
+    var c1 = try C12.clientInit(psk12(.client));
+    defer c1.deinit();
+    _ = try c1.startHandshake(ent(), 0, &out);
+    const n_once = (try c1.handleFlight(flightAt(&dg, 0, 0, &msgs), ent(), 0, &out)).out.len;
+    try testing.expect(n_once > 0);
+    var c2 = try C12.clientInit(psk12(.client));
+    defer c2.deinit();
+    _ = try c2.startHandshake(ent(), 0, &out);
+    const a = flightAt(&dg, 0, 0, &msgs).len;
+    const a2 = flightAt(dg[a..], 10, 0, &msgs).len;
+    try testing.expectEqual(n_once, (try c2.handleFlight(dg[0 .. a + a2], ent(), 0, &out)).out.len);
+}
+
+test "audit: dtls12 after the handshake: handleFlight resends nothing, and a client owes no flight for a peer's epoch-1 handshake record" {
+    var c = try C12.clientInit(psk12(.client));
+    defer c.deinit();
+    var sc = psk12(.server);
+    sc.require_peer_cert = true; // no CertificateRequest in PSK: nothing to require
+    var s = try C12.serverInit(sc);
+    defer s.deinit();
+    try drive12(&c, &s);
+    var dg: [256]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    // A retransmitted ClientKeyExchange (message_seq 1) with a fresh record number.
+    const r = try s.handleFlight(hsRec(&dg, 40, HT.client_key_exchange, 1, "x"), ent(), 0, &out);
+    try testing.expectEqual(@as(usize, 0), r.out.len);
+    // The server's Finished again, under epoch 1: reported, but the client
+    // has no flight to resend.
+    var rb: [64]u8 = undefined;
+    const rec = try record12.seal(&s.write_keys, 1, s.send_seq[1], 22, &.{ 20, 0, 0, 0 }, &rb);
+    s.send_seq[1] += 1;
+    try testing.expectError(error.ReceivedPostHandshakeMessage, c.recv(rec, &out));
+    try testing.expectEqual(@as(?[]const u8, null), try c.poll(1_000_000, &out));
+    // The client's Finished again: the server owes its last flight.
+    const crec = try record12.seal(&c.write_keys, 1, c.send_seq[1], 22, &.{ 20, 0, 0, 0 }, &rb);
+    c.send_seq[1] += 1;
+    try testing.expectError(error.ReceivedPostHandshakeMessage, s.recv(crec, &out));
+    try testing.expect((try s.poll(1_000_000, &out)) != null);
+}
+
+test "audit: dtls12 stateless server: a fragment of a different ClientHello does not complete the one in progress" {
+    var s = try C12.serverInit(psk12(.server));
+    defer s.deinit();
+    var b: [512]u8 = undefined;
+    var dg: [1024]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    const ch = clientHello12(&b, &psk_cs12, &.{ ri_ext, ems_ext });
+    const k = ch.len / 2;
+    const total: u24 = @intCast(ch.len);
+    const r1 = try s.handleFlight(hsFrag(&dg, 0, HT.client_hello, 0, total, 0, ch[0..k]), ent(), 0, &out);
+    try testing.expect(r1.need_more_data and r1.out.len == 0);
+    const r2 = try s.handleFlight(hsFrag(&dg, 1, HT.client_hello, 1, total, @intCast(k), ch[k..]), ent(), 0, &out);
+    try testing.expectEqual(@as(usize, 0), r2.out.len);
+    const r3 = try s.handleFlight(hsFrag(&dg, 2, HT.client_hello, 0, total, @intCast(k), ch[k..]), ent(), 0, &out);
+    try testing.expect(r3.out.len > 0);
+}
+
+test "audit: dtls12 Finished: one byte too long or one bit off is refused on both sides" {
+    var c = try C12.clientInit(psk12(.client));
+    defer c.deinit();
+    var s = try C12.serverInit(psk12(.server));
+    defer s.deinit();
+    var a: [4096]u8 = undefined;
+    var bb: [4096]u8 = undefined;
+    var f: [4096]u8 = undefined;
+    const ch = try c.startHandshake(ent(), 0, &a);
+    const f4 = try s.handleFlight(ch, ent(), 0, &bb);
+    const fin = try c.handleFlight(f4.out, ent(), 0, &a);
+    try testing.expectError(error.FinishedVerifyFailed, s.handleFlight(try forgeFinished(fin.out, &c.write_keys, &.{0}, 0, &f), ent(), 0, &bb));
+    try testing.expectError(error.FinishedVerifyFailed, s.handleFlight(try forgeFinished(fin.out, &c.write_keys, "", 1, &f), ent(), 0, &bb));
+    const sf = try s.handleFlight(fin.out, ent(), 0, &bb);
+    try testing.expect(sf.done);
+    try testing.expectError(error.FinishedVerifyFailed, c.handleFlight(try forgeFinished(sf.out, &s.write_keys, &.{0}, 0, &f), ent(), 0, &a));
+    try testing.expect((try c.handleFlight(sf.out, ent(), 0, &a)).done);
+}
+
+test "audit: dtls12 server never picks a configured suite of the other key-exchange family" {
+    var cfg = ecdsa12(.server);
+    cfg.cipher_suites12 = &.{ .psk_with_aes_128_gcm_sha256, .ecdhe_ecdsa_with_aes_128_gcm_sha256 };
+    var s = try C12.serverInit(cfg);
+    defer s.deinit();
+    var b: [512]u8 = undefined;
+    var dg: [1024]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    try testing.expectError(error.NoCipherSuiteOverlap, s.handleFlight(hsRec(&dg, 0, HT.client_hello, 0, clientHello12(&b, &psk_cs12, &.{ ri_ext, ems_ext })), ent(), 0, &out));
+}
+
+test "audit: dtls12 queue retry: a duplicate seen in an earlier call does not trigger a resend" {
+    var b: [512]u8 = undefined;
+    const sh = serverHello(&b, .psk_with_aes_128_gcm_sha256, &.{ ri_ext, ems_ext });
+    var c = try clientFed(psk12(.client), &.{.{ .t = HT.server_hello, .body = sh }});
+    defer c.deinit();
+    var dg: [1024]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    // A retransmitted ServerHello, and a forged ServerHelloDone (message 2,
+    // a body where none belongs) that is queued.
+    const n1 = hsRec(&dg, 1, HT.server_hello, 0, sh).len;
+    const n2 = hsRec(dg[n1..], 2, HT.server_hello_done, 2, &.{0}).len;
+    _ = try c.handleFlight(dg[0 .. n1 + n2], ent(), 0, &out);
+    // The genuine ServerKeyExchange: the queued forgery fails it, the retry
+    // from live bytes succeeds, and there is nothing to send.
+    const r = try c.handleFlight(hsRec(&dg, 3, HT.server_key_exchange, 1, &.{ 0, 0 }), ent(), 0, &out);
+    try testing.expectEqual(@as(usize, 0), r.out.len);
+}
+
+test "audit: dtls12 queue retry: once the queue is dropped, later overlaps are plain errors" {
+    var b: [512]u8 = undefined;
+    const sh = serverHello(&b, .psk_with_aes_128_gcm_sha256, &.{ ri_ext, ems_ext });
+    var c = try clientFed(psk12(.client), &.{.{ .t = HT.server_hello, .body = sh }});
+    defer c.deinit();
+    var dg: [1024]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    // A fragment of message 2 (queued), then message 1: the queued fragment
+    // starts message 2.
+    const n1 = hsFrag(&dg, 1, HT.server_hello_done, 2, 4, 0, &.{ 1, 1 }).len;
+    const n2 = hsRec(dg[n1..], 2, HT.server_key_exchange, 1, &.{ 0, 0 }).len;
+    _ = try c.handleFlight(dg[0 .. n1 + n2], ent(), 0, &out);
+    // A fragment contradicting the queued bytes: the retry from live bytes
+    // restarts message 2 with it.
+    _ = try c.handleFlight(hsFrag(&dg, 3, HT.server_hello_done, 2, 4, 0, &.{ 2, 2 }), ent(), 0, &out);
+    // A fragment contradicting those LIVE bytes is an error: no queue is involved.
+    try testing.expectError(error.OverlappingFragment, c.handleFlight(hsFrag(&dg, 4, HT.server_hello_done, 2, 4, 0, &.{ 3, 3 }), ent(), 0, &out));
+}

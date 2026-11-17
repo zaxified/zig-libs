@@ -9218,3 +9218,689 @@ test "installApplicationSecrets: SHA-384 secrets install; the [32]u8 installAppl
     try expectSameKeys(&client, &server);
     try expectRoundTrip(&client, &server, "installed by hand");
 }
+
+// ── audit 2026-11-17 (whole-module mutation), run 2: pins ────────────────
+
+test "audit: AckCollector stops at its capacity" {
+    var a: AckCollector = .{};
+    for (0..6) |i| a.add(i);
+    try testing.expectEqual(@as(usize, 4), a.items().len);
+    try testing.expectEqual(@as(u64, 3), a.items()[3].sequence_number);
+}
+
+test "audit: signatureAlgorithmsExtension takes eight schemes, not nine" {
+    var buf: [64]u8 = undefined;
+    const eight: [8]certverify.SignatureScheme = @splat(.ecdsa_secp256r1_sha256);
+    const e = try signatureAlgorithmsExtension(&eight, &buf);
+    try testing.expectEqual(@as(usize, 2 + 16), e.data.len);
+    const nine: [9]certverify.SignatureScheme = @splat(.ecdsa_secp256r1_sha256);
+    try testing.expectError(error.BufferTooShort, signatureAlgorithmsExtension(&nine, &buf));
+}
+
+test "audit: openCookie refuses a MAC-valid cookie of another version or a length that does not match its suite" {
+    const hr: HelloRetryConfig = .{ .cookie_secret = "audit cookie secret", .peer_binding = "192.0.2.1:1" };
+    var ck: [cookie_len]u8 = undefined;
+    ck[0] = cookie_version;
+    std.mem.writeInt(u16, ck[1..3], @backingInt(CipherSuite.aes_128_gcm_sha256), .big);
+    @memset(ck[3 .. cookie_len - cookie_mac_len], 0x5a);
+    ck[cookie_len - cookie_mac_len ..].* = cookieMac(hr, ck[0 .. cookie_len - cookie_mac_len]);
+    _ = try openCookie(hr, &ck);
+    var v2 = ck;
+    v2[0] = cookie_version + 1;
+    v2[cookie_len - cookie_mac_len ..].* = cookieMac(hr, v2[0 .. cookie_len - cookie_mac_len]);
+    try testing.expectError(error.CookieVerifyFailed, openCookie(hr, &v2));
+    // A SHA-384 suite in a SHA-256-sized cookie.
+    var s384 = ck;
+    std.mem.writeInt(u16, s384[1..3], @backingInt(CipherSuite.aes_256_gcm_sha384), .big);
+    s384[cookie_len - cookie_mac_len ..].* = cookieMac(hr, s384[0 .. cookie_len - cookie_mac_len]);
+    try testing.expectError(error.CookieVerifyFailed, openCookie(hr, &s384));
+}
+
+test "audit: poll's retransmission fits an output buffer of exactly the flight's size; handleFlight takes a datagram that fills the buffer exactly" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x31)));
+    var client = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
+    defer client.deinit();
+    var buf: [2048]u8 = undefined;
+    const n = (try client.startHandshake(seededForTest(&csprng), 0, &buf)).len;
+    var out: [2048]u8 = undefined;
+    try testing.expectError(error.BufferTooShort, client.poll(100_000, out[0 .. n - 1]));
+    try testing.expectEqual(n, (try client.poll(100_000, out[0..n])).?.len);
+    // A client cannot be fed a flight before it has sent one, nor after it is connected.
+    var fresh = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
+    defer fresh.deinit();
+    try testing.expectError(error.WrongState, fresh.handleFlight(out[0..n], seededForTest(&csprng), 0, &buf));
+    var server = try Connection.serverInit(.{ .role = .server, .psk_identity = "id", .psk = "k" });
+    defer server.deinit();
+    const a = try testing.allocator.alloc(u8, max_flight_bytes);
+    defer testing.allocator.free(a);
+    @memset(a, 0);
+    if (server.handleFlight(a, seededForTest(&csprng), 0, &buf)) |_| {} else |e| try testing.expect(e != error.FlightTooLarge);
+}
+
+test "audit: installApplicationSecrets checks each secret's length" {
+    var c = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
+    defer c.deinit();
+    const good: [32]u8 = @splat(1);
+    const short: [16]u8 = @splat(2);
+    try testing.expectError(error.UnsupportedSuite, c.installApplicationSecrets(.aes_128_gcm_sha256, &short, &good));
+    try testing.expectError(error.UnsupportedSuite, c.installApplicationSecrets(.aes_128_gcm_sha256, &good, &short));
+    try c.installApplicationSecrets(.chacha20_poly1305_sha256, &good, &good);
+    try testing.expectEqual(CipherSuite.chacha20_poly1305_sha256, c.suite);
+    try testing.expectEqual(application_epoch, c.epoch);
+}
+
+/// A sealed application-epoch record with `inner` as its DTLSInnerPlaintext.
+fn auditSealInner(suite: CipherSuite, keys: *const DirKeys, epoch: u64, seq: u48, inner: []const u8, out: []u8) ![]const u8 {
+    const hdr = record.UnifiedHeader{ .epoch_low = @truncate(epoch), .seq_len = .short, .seq_wire = @truncate(seq), .cid = null, .length = @intCast(inner.len + 16) };
+    const hs = try record.encodeUnified(hdr, out);
+    const n = try protectDispatch(suite, keys, epoch, seq, inner, out[0..hs.len], out[hs.len..]);
+    try snMaskDispatch(suite, keys, out[hs.len..][0..16], out[1..][0..1]);
+    return out[0 .. hs.len + n];
+}
+
+test "audit: installApplicationKeys on a used connection starts its record state over" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.aes_128_gcm_sha256, .{ .role = .client }, &client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var w: [256]u8 = undefined;
+    var p: [256]u8 = undefined;
+    // The server asks for an update: the client keeps its previous read key,
+    // owes an ACK and queues its own update.
+    try server.requestKeyUpdate(true);
+    const ku = (try server.poll(0, &w)).?;
+    try testing.expectError(error.ReceivedKeyUpdate, client.recv(ku, &p));
+    try testing.expect(client.prev_read_live and client.ack_queue_len > 0 and client.keyUpdatePending());
+    _ = try client.send("a", &w);
+    // What the previous-epoch key slot holds once wiped.
+    var wiped = client.prev_read_keys;
+    secureZeroDirKeys(&wiped);
+    const sec = deriveApSecrets("another pre-shared key");
+    try client.installApplicationKeys(.aes_128_gcm_sha256, &sec.c, &sec.s);
+    try testing.expect(!client.keyUpdatePending());
+    try testing.expectEqual(@as(?[]const u8, null), try client.poll(0, &w));
+    try testing.expectEqual(@as(u48, 0), client.send_seq);
+    // The previous-epoch slot is dead, not merely wiped.
+    const late = try auditSealInner(.aes_128_gcm_sha256, &wiped, application_epoch - 1, 0, "late\x17", &w);
+    try testing.expectError(error.DecryptionFailed, client.recv(late, &p));
+}
+
+test "audit: ACK bodies: length rules, and a record number must match in epoch too" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try connectedPair(.aes_128_gcm_sha256, 0x32, &client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    try testing.expectError(error.Malformed, client.processAck(&.{0}));
+    try client.processAck(&.{ 0, 0 });
+    try testing.expectError(error.Malformed, client.processAck(&.{ 0, 1, 0 }));
+    try client.requestKeyUpdate(false);
+    var w: [256]u8 = undefined;
+    _ = (try client.poll(0, &w)).?;
+    const sent = client.ku_records[0];
+    var ab: [64]u8 = undefined;
+    const wrong_epoch = try flight.encodeAck(&.{.{ .epoch = sent.epoch - 1, .sequence_number = sent.sequence_number }}, &ab);
+    try client.processAck(wrong_epoch);
+    try testing.expect(client.keyUpdatePending());
+    const right = try flight.encodeAck(&.{sent}, &ab);
+    try client.processAck(right);
+    try testing.expect(!client.keyUpdatePending());
+}
+
+test "audit: queueAck dedupes by epoch AND sequence number, and stops at its capacity" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try connectedPair(.aes_128_gcm_sha256, 0x33, &client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    client.queueAck(.{ .epoch = 3, .sequence_number = 5 });
+    client.queueAck(.{ .epoch = 2, .sequence_number = 5 });
+    try testing.expectEqual(@as(usize, 2), client.ack_queue_len);
+    for (0..10) |i| client.queueAck(.{ .epoch = 3, .sequence_number = 100 + i });
+    try testing.expectEqual(@as(usize, max_ack_queue), client.ack_queue_len);
+}
+
+fn auditKuBody(buf: []u8, seq: u16, length: u24, frag_len: u24, body: []const u8) []const u8 {
+    handshake.encodeHeader(.{ .msg_type = hs_type_key_update, .length = length, .message_seq = seq, .fragment_offset = 0, .fragment_length = frag_len }, buf[0..handshake.header_len]);
+    @memcpy(buf[handshake.header_len..][0..body.len], body);
+    return buf[0 .. handshake.header_len + body.len];
+}
+
+test "audit: post-handshake KeyUpdate framing, epoch, and the epoch ceiling" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try connectedPair(.aes_128_gcm_sha256, 0x34, &client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    const exp = client.peer_message_seq.?;
+    const rn: flight.RecordNumber = .{ .epoch = 3, .sequence_number = 9 };
+    var b: [32]u8 = undefined;
+    // The fragment runs past the record.
+    try testing.expectEqual(error.Malformed, client.processPostHandshake(auditKuBody(&b, exp, 5, 5, &.{0}), rn, false));
+    // length 2 with a one-byte fragment; an empty fragment of a one-byte message.
+    try testing.expectEqual(error.Malformed, client.processPostHandshake(auditKuBody(&b, exp, 2, 1, &.{0}), rn, false));
+    try testing.expectEqual(error.Malformed, client.processPostHandshake(auditKuBody(&b, exp, 1, 0, &.{}), rn, false));
+    // Under the previous epoch.
+    try testing.expectEqual(error.Malformed, client.processPostHandshake(auditKuBody(&b, exp, 1, 1, &.{key_update_requested}), rn, true));
+    // At the sending-epoch ceiling a requested update is not answered.
+    client.write_epoch = max_send_epoch;
+    try testing.expectEqual(error.ReceivedKeyUpdate, client.processPostHandshake(auditKuBody(&b, exp, 1, 1, &.{key_update_requested}), rn, false));
+    try testing.expect(!client.keyUpdatePending());
+}
+
+test "audit: automatic rekey: not re-queued while one is in flight, never at the epoch ceiling" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.aes_128_gcm_sha256, .{ .role = .client, .key_update_after_records = 1 }, &client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var w: [256]u8 = undefined;
+    _ = try client.send("1", &w);
+    _ = try client.send("2", &w);
+    try testing.expect(client.keyUpdatePending());
+    _ = (try client.poll(0, &w)).?;
+    _ = try client.send("3", &w);
+    try testing.expectEqual(@as(?[]const u8, null), try client.poll(0, &w));
+    var c2: Connection = undefined;
+    var s2: Connection = undefined;
+    try kuPair(.aes_128_gcm_sha256, .{ .role = .client, .key_update_after_records = 0 }, &c2, &s2);
+    defer c2.deinit();
+    defer s2.deinit();
+    c2.write_epoch = max_send_epoch;
+    _ = try c2.send("x", &w);
+    try testing.expect(!c2.keyUpdatePending());
+}
+
+test "audit: protectRecord: inner-plaintext cap, sequence-number width, exact output size" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try connectedPair(.aes_128_gcm_sha256, 0x35, &client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var w: [2048]u8 = undefined;
+    const big: [1500]u8 = @splat(1);
+    const l0 = (try client.send("x", &w)).len;
+    try testing.expectEqual(l0, (try client.send("x", w[0..l0])).len);
+    try testing.expectError(error.BufferTooShort, client.send("x", w[0 .. l0 - 1]));
+    _ = try client.send(big[0..1499], &w);
+    try testing.expectError(error.BufferTooShort, client.send(&big, &w));
+    client.send_seq = 0xff;
+    try testing.expectEqual(l0, (try client.send("x", &w)).len);
+    try testing.expectEqual(l0 + 1, (try client.send("x", &w)).len);
+}
+
+test "audit: recv: a 16-byte ciphertext is opened, previous-epoch records use their own window, a long jump uses the largest seen, an all-zero inner plaintext is malformed" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try kuPair(.aes_128_gcm_sha256, .{ .role = .client }, &client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var w: [256]u8 = undefined;
+    var p: [256]u8 = undefined;
+    // 16 bytes of ciphertext: long enough to try, and it fails authentication.
+    var r16: [32]u8 = undefined;
+    const h = try record.encodeUnified(.{ .epoch_low = 3, .seq_len = .short, .seq_wire = 0, .cid = null, .length = 16 }, &r16);
+    @memset(r16[h.len..][0..16], 0x11);
+    try testing.expectError(error.DecryptionFailed, server.recv(r16[0 .. h.len + 16], &p));
+    // A record of the old epoch, delivered after the KeyUpdate.
+    var r0: [256]u8 = undefined;
+    var r1: [256]u8 = undefined;
+    const a0 = try client.send("old0", &r0);
+    const a1 = try client.send("old1", &r1);
+    try testing.expectEqualStrings("old0", try server.recv(a0, &p));
+    try client.requestKeyUpdate(false);
+    var kb: [256]u8 = undefined;
+    const ku = (try client.poll(0, &kb)).?;
+    try testing.expectError(error.ReceivedKeyUpdate, server.recv(ku, &p));
+    const ack = (try server.poll(0, &w)).?;
+    try testing.expectError(error.ReceivedAck, client.recv(ack, &p));
+    // Before any new-epoch record: the late one is taken, a replay of the old
+    // epoch is still caught by the old epoch's window.
+    try testing.expectEqualStrings("old1", try server.recv(a1, &p));
+    try testing.expectError(error.ReplayedRecord, server.recv(a0, &p));
+    try testing.expectEqualStrings("new0", try server.recv(try client.send("new0", &w), &p));
+    try testing.expectEqualStrings("new1", try server.recv(try client.send("new1", &w), &p));
+    try testing.expectError(error.ReplayedRecord, server.recv(a1, &p));
+    // Far ahead: reconstructed from the largest number seen, not from 0.
+    server.recv_max_seq = 70000;
+    server.recv_window = 1;
+    client.send_seq = 70001;
+    try testing.expectEqualStrings("far", try server.recv(try client.send("far", &w), &p));
+    // Inner plaintext of zeros only: no content type.
+    try testing.expectError(error.Malformed, server.recv(try client.protectRecord(0, &.{ 0, 0, 0 }, &w), &p));
+}
+
+test "audit: clientAcceptAlpn skips extensions other than ALPN" {
+    var c = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k", .alpn_protocols = &.{"coap"} });
+    defer c.deinit();
+    try c.clientAcceptAlpn(&.{ 0, 4, 0x12, 0x34, 0, 0 });
+    try testing.expectEqual(@as(?[]const u8, null), c.negotiatedAlpn());
+}
+
+test "audit: offeredSuites takes eight configured suites, not nine" {
+    const eight: [8]CipherSuite = @splat(.aes_128_gcm_sha256);
+    const nine: [9]CipherSuite = @splat(.aes_128_gcm_sha256);
+    var c8 = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k", .cipher_suites = &eight });
+    defer c8.deinit();
+    var buf: [8]u16 = undefined;
+    try testing.expectEqual(@as(usize, 8), (try c8.offeredSuites(&buf)).len);
+    var c9 = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k", .cipher_suites = &nine });
+    defer c9.deinit();
+    try testing.expectError(error.BufferTooShort, c9.offeredSuites(&buf));
+}
+
+test "audit: withDual12Suites: only for a dual-version client, only its key-exchange family, bounded" {
+    const cs13 = [_]u16{ 0x1301, 0x1302, 0x1303, 0x1301, 0x1302, 0x1303, 0x1301, 0x1302 };
+    var out: [24]u16 = undefined;
+    const mixed = [_]CipherSuite12{ .ecdhe_ecdsa_with_aes_128_gcm_sha256, .psk_with_aes_128_gcm_sha256 };
+    var only13 = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k", .cipher_suites12 = &mixed });
+    defer only13.deinit();
+    try testing.expectEqual(@as(usize, 8), only13.withDual12Suites(&cs13, &out).len);
+    var dual = try Connection.clientInit(.{ .role = .client, .versions = &.{ .dtls13, .dtls12 }, .psk_identity = "id", .psk = "k", .cipher_suites12 = &mixed });
+    defer dual.deinit();
+    const d = dual.withDual12Suites(&cs13, &out);
+    try testing.expectEqualSlices(u16, &.{@backingInt(CipherSuite12.psk_with_aes_128_gcm_sha256)}, d[8..]);
+    const many: [30]CipherSuite12 = @splat(.psk_with_aes_128_gcm_sha256);
+    var dual2 = try Connection.clientInit(.{ .role = .client, .versions = &.{ .dtls13, .dtls12 }, .psk_identity = "id", .psk = "k", .cipher_suites12 = &many });
+    defer dual2.deinit();
+    try testing.expectEqual(@as(usize, 24), dual2.withDual12Suites(&cs13, &out).len);
+    // A dual-version client also names DTLS 1.2 in supported_versions.
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x3c)));
+    var buf: [2048]u8 = undefined;
+    const ch = try dual.startHandshake(seededForTest(&csprng), 0, &buf);
+    var exts: [16]messages.Extension = undefined;
+    const dec = try messages.decodeClientHello(ch[13 + handshake.header_len ..], &exts);
+    const sv = for (dec.extensions) |e| {
+        if (e.ext_type == @backingInt(messages.ExtensionType.supported_versions)) break e.data;
+    } else return error.TestExpectedSupportedVersions;
+    try testing.expectEqualSlices(u8, &.{ 4, 0xfe, 0xfc, 0xfe, 0xfd }, sv);
+}
+
+test "audit: clientHelloShare picks by group, then by the group's share length" {
+    const k32: [32]u8 = @splat(9);
+    var kb: [128]u8 = undefined;
+    const two = try messages.encodeKeyShareClientHello(&.{ .{ .group = 0x1234, .key_exchange = &k32 }, .{ .group = x25519_group, .key_exchange = &k32 } }, &kb);
+    const s = try Connection.clientHelloShare(&.{.{ .ext_type = @backingInt(messages.ExtensionType.key_share), .data = two }});
+    try testing.expectEqual(x25519_group, s.group);
+    var kb2: [128]u8 = undefined;
+    const short = try messages.encodeKeyShareClientHello(&.{.{ .group = x25519_group, .key_exchange = k32[0..31] }}, &kb2);
+    try testing.expectError(error.MissingKeyShare, Connection.clientHelloShare(&.{.{ .ext_type = @backingInt(messages.ExtensionType.key_share), .data = short }}));
+}
+
+/// Two connections whose handshake-epoch keys are wired `s -> r`.
+fn auditHsWire(s: *Connection, r: *Connection) void {
+    const sec: Secret = @splat(0x42);
+    const k = deriveDir(.sha256, suiteParams(.aes_128_gcm_sha256).?, &sec);
+    s.suite = .aes_128_gcm_sha256;
+    r.suite = .aes_128_gcm_sha256;
+    s.hs_write_keys = k;
+    r.hs_read_keys = k;
+}
+
+fn auditHsRecord(s: *Connection, t: messages.HandshakeType, seq: u16, body: []const u8, out: []u8) ![]const u8 {
+    var frag: [1400]u8 = undefined;
+    const f = try frameHandshakeMessage(@backingInt(t), seq, body, &frag);
+    return s.protectHandshakeMessage(f, out);
+}
+
+test "audit: epoch-0 and epoch-2 record writers: exact output, the inner cap, the sequence-number width" {
+    var c = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
+    defer c.deinit();
+    var r = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
+    defer r.deinit();
+    auditHsWire(&c, &r);
+    const frag: [20]u8 = @splat(4);
+    var out: [2048]u8 = undefined;
+    try testing.expectEqual(@as(usize, 33), (try c.writeEpoch0Record(&frag, out[0..33])).len);
+    try testing.expectError(error.BufferTooShort, c.writeEpoch0Record(&frag, out[0..32]));
+    const l0 = (try c.protectHandshakeMessage(&frag, &out)).len;
+    try testing.expectEqual(l0, (try c.protectHandshakeMessage(&frag, out[0..l0])).len);
+    try testing.expectError(error.BufferTooShort, c.protectHandshakeMessage(&frag, out[0 .. l0 - 1]));
+    const big: [1500]u8 = @splat(5);
+    _ = try c.protectHandshakeMessage(big[0..1499], &out);
+    try testing.expectError(error.BufferTooShort, c.protectHandshakeMessage(&big, &out));
+    c.hs2.send_seq = 0xff;
+    try testing.expectEqual(l0, (try c.protectHandshakeMessage(&frag, &out)).len);
+    try testing.expectEqual(l0 + 1, (try c.protectHandshakeMessage(&frag, &out)).len);
+}
+
+test "audit: unprotectHandshakeMessage: short ciphertext, replay, inner content type, a long jump" {
+    var s = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
+    defer s.deinit();
+    var r = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
+    defer r.deinit();
+    auditHsWire(&s, &r);
+    var out: [256]u8 = undefined;
+    var pt: [256]u8 = undefined;
+    var rb: [64]u8 = undefined;
+    const h = try record.encodeUnified(.{ .epoch_low = 2, .seq_len = .short, .seq_wire = 0, .cid = null, .length = 15 }, &rb);
+    @memset(rb[h.len..][0..16], 0x22);
+    try testing.expectError(error.RecordTooShort, r.unprotectHandshakeMessage(rb[0 .. h.len + 15], &pt, null));
+    rb[h.len - 1] = 16; // the length field's low byte
+    try testing.expectError(error.DecryptionFailed, r.unprotectHandshakeMessage(rb[0 .. h.len + 16], &pt, null));
+    const rec = try s.protectHandshakeMessage("hello", &out);
+    try testing.expectEqualStrings("hello", try r.unprotectHandshakeMessage(rec, &pt, null));
+    try testing.expectError(error.ReplayedRecord, r.unprotectHandshakeMessage(rec, &pt, null));
+    try testing.expectError(error.UnexpectedMessage, r.unprotectHandshakeMessage(try auditSealInner(.aes_128_gcm_sha256, &s.hs_write_keys, 2, 7, "abc\x17", &out), &pt, null));
+    try testing.expectError(error.Malformed, r.unprotectHandshakeMessage(try auditSealInner(.aes_128_gcm_sha256, &s.hs_write_keys, 2, 8, &.{ 0, 0, 0 }, &out), &pt, null));
+    r.hs2.recv_max_seq = 70000;
+    r.hs2.recv_window = 1;
+    s.hs2.send_seq = 70001;
+    try testing.expectEqualStrings("far", try r.unprotectHandshakeMessage(try s.protectHandshakeMessage("far", &out), &pt, null));
+}
+
+test "audit: takeHandshakeMessage: non-handshake epoch-0 record, short fragment, message size against the caller's buffer" {
+    var c = try Connection.serverInit(.{ .role = .server, .psk_identity = "id", .psk = "k" });
+    defer c.deinit();
+    var mb: [10]u8 = undefined;
+    var rb: [10]bool = undefined;
+    var d: [64]u8 = undefined;
+    var pos: usize = 0;
+    _ = try record.encodePlaintext(.{ .content_type = 21, .epoch = 0, .sequence_number = 0, .length = 2 }, &d);
+    d[13] = 2;
+    d[14] = 40;
+    try testing.expectError(error.UnexpectedMessage, c.takeHandshakeMessage(d[0..15], &pos, .epoch0_plaintext, &mb, &rb, null));
+    pos = 0;
+    _ = try record.encodePlaintext(.{ .content_type = 22, .epoch = 0, .sequence_number = 0, .length = 16 }, &d);
+    handshake.encodeHeader(.{ .msg_type = 1, .length = 10, .message_seq = 0, .fragment_offset = 0, .fragment_length = 10 }, d[13..][0..12]);
+    try testing.expectError(error.Malformed, c.takeHandshakeMessage(d[0..29], &pos, .epoch0_plaintext, &mb, &rb, null));
+    pos = 0;
+    _ = try record.encodePlaintext(.{ .content_type = 22, .epoch = 0, .sequence_number = 0, .length = 22 }, &d);
+    @memset(d[25..35], 6);
+    const got = try c.takeHandshakeMessage(d[0..35], &pos, .epoch0_plaintext, &mb, &rb, null);
+    try testing.expectEqual(@as(usize, 10), got.body.len);
+    c.peer_message_seq = null;
+    pos = 0;
+    _ = try record.encodePlaintext(.{ .content_type = 22, .epoch = 0, .sequence_number = 0, .length = 23 }, &d);
+    handshake.encodeHeader(.{ .msg_type = 1, .length = 11, .message_seq = 0, .fragment_offset = 0, .fragment_length = 11 }, d[13..][0..12]);
+    try testing.expectError(error.BufferTooShort, c.takeHandshakeMessage(d[0..36], &pos, .epoch0_plaintext, &mb, &rb, null));
+}
+
+test "audit: cacheFlight takes a flight of exactly its capacity" {
+    var c = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
+    defer c.deinit();
+    const a = try testing.allocator.alloc(u8, max_flight_bytes + 1);
+    defer testing.allocator.free(a);
+    @memset(a, 3);
+    try c.cacheFlight(a[0..max_flight_bytes], 0);
+    try testing.expectError(error.BufferTooShort, c.cacheFlight(a, 0));
+}
+
+fn auditConsume(s: *Connection, r: *Connection, msgs: []const struct { t: messages.HandshakeType, body: []const u8 }, allow_cr: bool) HandshakeError!Connection.PeerCertResult {
+    var dg: [4096]u8 = undefined;
+    var n: usize = 0;
+    for (msgs, 0..) |mm, i| n += (auditHsRecord(s, mm.t, @intCast(i), mm.body, dg[n..]) catch unreachable).len;
+    var pos: usize = 0;
+    r.peer_message_seq = null;
+    return r.consumeOptionalCertMessages(dg[0..n], &pos, .server, allow_cr);
+}
+
+test "audit: consumeOptionalCertMessages: order, repetition and size rules" {
+    var s = try Connection.serverInit(.{ .role = .server, .psk_identity = "id", .psk = "k" });
+    defer s.deinit();
+    var r = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
+    defer r.deinit();
+    auditHsWire(&s, &r);
+    const fin64: [65]u8 = @splat(7);
+    try testing.expectEqual(@as(usize, 64), (try auditConsume(&s, &r, &.{.{ .t = .finished, .body = fin64[0..64] }}, true)).fin_len);
+    try testing.expectError(error.Malformed, auditConsume(&s, &r, &.{.{ .t = .finished, .body = &fin64 }}, true));
+    var crb: [512]u8 = undefined;
+    const cr = try messages.encodeCertificateRequest(.{ .certificate_request_context = &.{}, .extensions = &.{} }, &crb);
+    var ceb: [64]u8 = undefined;
+    const empty_cert = try messages.encodeCertificate(&.{}, &.{}, &ceb);
+    const fin: []const u8 = fin64[0..32];
+    try testing.expectError(error.UnexpectedMessage, auditConsume(&s, &r, &.{ .{ .t = .certificate_request, .body = cr }, .{ .t = .finished, .body = fin } }, false));
+    try testing.expectError(error.UnexpectedMessage, auditConsume(&s, &r, &.{ .{ .t = .certificate, .body = empty_cert }, .{ .t = .certificate_request, .body = cr }, .{ .t = .finished, .body = fin } }, true));
+    try testing.expectError(error.UnexpectedMessage, auditConsume(&s, &r, &.{ .{ .t = .certificate_request, .body = cr }, .{ .t = .certificate_request, .body = cr }, .{ .t = .finished, .body = fin } }, true));
+    try testing.expectError(error.UnexpectedMessage, auditConsume(&s, &r, &.{ .{ .t = .certificate, .body = empty_cert }, .{ .t = .certificate, .body = empty_cert }, .{ .t = .finished, .body = fin } }, true));
+    try testing.expectError(error.UnexpectedMessage, auditConsume(&s, &r, &.{ .{ .t = .certificate, .body = empty_cert }, .{ .t = .certificate_verify, .body = &.{ 4, 3, 0, 1, 0 } }, .{ .t = .finished, .body = fin } }, true));
+    // A 255-byte request context fits; an unknown extension is skipped.
+    const ctx: [255]u8 = @splat(1);
+    const cr255 = try messages.encodeCertificateRequest(.{ .certificate_request_context = &ctx, .extensions = &.{.{ .ext_type = 0x1234, .data = &.{0xff} }} }, &crb);
+    const res = try auditConsume(&s, &r, &.{ .{ .t = .certificate_request, .body = cr255 }, .{ .t = .finished, .body = fin } }, true);
+    try testing.expectEqual(@as(usize, 255), res.creq_context_len);
+}
+
+test "audit: consumeOptionalCertMessages: a second CertificateVerify is refused even when it verifies" {
+    var s = try Connection.serverInit(certDheServerConfig());
+    defer s.deinit();
+    var r = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
+    defer r.deinit();
+    auditHsWire(&s, &r);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x36)));
+    const cc = s.config.cert.?;
+    var dg: [4096]u8 = undefined;
+    var n: usize = 0;
+    var cb: [1300]u8 = undefined;
+    const cert_body = try messages.encodeCertificate(&.{}, cc.chain, &cb);
+    var fb: [1400]u8 = undefined;
+    n += (try s.sendEpoch2Message(.certificate, cert_body, &fb, dg[n..])).bytes.len;
+    n += (try s.signAndSendCertificateVerify(cc, .ecdsa_secp256r1_sha256, .server, seededForTest(&csprng), dg[n..])).bytes.len;
+    n += (try s.signAndSendCertificateVerify(cc, .ecdsa_secp256r1_sha256, .server, seededForTest(&csprng), dg[n..])).bytes.len;
+    const fin: [32]u8 = @splat(1);
+    n += (try auditHsRecord(&s, .finished, s.message_seq, &fin, dg[n..])).len;
+    var pos: usize = 0;
+    try testing.expectError(error.UnexpectedMessage, r.consumeOptionalCertMessages(dg[0..n], &pos, .server, true));
+}
+
+/// One epoch-0 plaintext record holding one whole handshake message.
+fn auditPlainRecord(t: u8, seq: u16, rseq: u48, body: []const u8, out: []u8) ![]const u8 {
+    var frag: [2048]u8 = undefined;
+    const f = try frameHandshakeMessage(t, seq, body, &frag);
+    const h = try record.encodePlaintext(.{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = rseq, .length = @intCast(f.len) }, out);
+    @memcpy(out[h.len..][0..f.len], f);
+    return out[0 .. h.len + f.len];
+}
+
+const audit_ch_type: u8 = @backingInt(messages.HandshakeType.client_hello);
+
+test "audit: server: ClientHello message type, a dual server's supported_versions" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x37)));
+    const rnd = seededForTest(&csprng);
+    var b1: [2048]u8 = undefined;
+    var b2: [4096]u8 = undefined;
+    {
+        var client = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
+        defer client.deinit();
+        var server = try Connection.serverInit(.{ .role = .server, .psk_identity = "id", .psk = "k" });
+        defer server.deinit();
+        const n = (try client.startHandshake(rnd, 0, &b1)).len;
+        b1[13] = @backingInt(messages.HandshakeType.server_hello);
+        try testing.expectError(error.UnexpectedMessage, server.handleFlight(b1[0..n], rnd, 0, &b2));
+    }
+    {
+        var dual = try Connection.serverInit(.{ .role = .server, .versions = &.{ .dtls13, .dtls12 }, .psk_identity = "id", .psk = "k" });
+        defer dual.deinit();
+        const Case = struct { sv: []const u8, want: anyerror };
+        const cases = [_]Case{
+            .{ .sv = &.{}, .want = error.Malformed },
+            .{ .sv = &.{ 2, 0xfe, 0xfc, 0xfe, 0xfd }, .want = error.Malformed },
+            .{ .sv = &.{ 3, 0xfe, 0xfd, 0 }, .want = error.Malformed },
+            .{ .sv = &.{0}, .want = error.NegotiatedDtls12 },
+            .{ .sv = &.{ 2, 0xfe, 0xfd }, .want = error.NegotiatedDtls12 },
+        };
+        for (cases) |cs| {
+            var body: [512]u8 = undefined;
+            const ch = try messages12.encodeClientHello(.{ .random = @splat(1), .cipher_suites = &.{0x1301}, .extensions = &.{.{ .ext_type = messages12.ext_supported_versions, .data = cs.sv }} }, &body);
+            try testing.expectError(cs.want, dual.handleFlight(try auditPlainRecord(audit_ch_type, 0, 0, ch, &b1), rnd, 0, &b2));
+        }
+    }
+}
+
+test "audit: HRR server: a ClientHello2 that drops the committed suite is refused" {
+    const binding = "198.51.100.7:44301";
+    var cfg_s = certDheServerConfig();
+    cfg_s.cipher_suites = &.{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256 };
+    cfg_s.hello_retry = .{ .cookie_secret = "audit cookie MAC key", .peer_binding = binding };
+    var cfg_c = certDheClientConfig();
+    cfg_c.cipher_suites = &.{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256 };
+    var client = try Connection.clientInit(cfg_c);
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x38)));
+    const rnd = seededForTest(&csprng);
+    var buf1: [4096]u8 = undefined;
+    var buf2: [4096]u8 = undefined;
+    const ch1 = try client.startHandshake(rnd, 0, &buf1);
+    var server1 = try Connection.serverInit(cfg_s);
+    defer server1.deinit();
+    const hrr = try server1.handleFlight(ch1, rnd, 0, &buf2);
+    const ch2 = try client.handleFlight(hrr.out, rnd, 0, &buf1);
+    var dg: [4096]u8 = undefined;
+    @memcpy(dg[0..ch2.out.len], ch2.out);
+    const body = dg[13 + handshake.header_len ..];
+    var p: usize = 2 + 32;
+    p += 1 + body[p];
+    p += 1 + body[p];
+    const cs_len = std.mem.readInt(u16, body[p..][0..2], .big);
+    var i: usize = p + 2;
+    var patched = false;
+    while (i < p + 2 + cs_len) : (i += 2) {
+        if (body[i] == 0x13 and body[i + 1] == 0x01) {
+            body[i + 1] = 0x03;
+            patched = true;
+        }
+    }
+    try testing.expect(patched);
+    var server2 = try Connection.serverInit(cfg_s);
+    defer server2.deinit();
+    try testing.expectError(error.NoCipherSuiteOverlap, server2.handleFlight(dg[0..ch2.out.len], rnd, 0, &buf2));
+}
+
+const AuditPskPair = struct {
+    client: Connection,
+    server: Connection,
+    f2: [4096]u8 = undefined,
+    f2_len: usize = 0,
+
+    fn init(self: *AuditPskPair, sc_extra: Config, rnd: Entropy) !void {
+        var sc = sc_extra;
+        sc.role = .server;
+        sc.psk_identity = "id";
+        sc.psk = "k";
+        self.client = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
+        self.server = try Connection.serverInit(sc);
+        var b1: [2048]u8 = undefined;
+        const ch = try self.client.startHandshake(rnd, 0, &b1);
+        const f2 = try self.server.handleFlight(ch, rnd, 0, &self.f2);
+        self.f2_len = f2.out.len;
+    }
+
+    fn deinit(self: *AuditPskPair) void {
+        self.client.deinit();
+        self.server.deinit();
+    }
+};
+
+const AuditMsg = struct { t: messages.HandshakeType, body: []const u8 };
+
+fn auditFlight(from: *Connection, first_seq: u16, msgs: []const AuditMsg, out: []u8) ![]const u8 {
+    var n: usize = 0;
+    for (msgs, 0..) |mm, i| n += (try auditHsRecord(from, mm.t, first_seq + @as(u16, @intCast(i)), mm.body, out[n..])).len;
+    return out[0..n];
+}
+
+test "audit: server: the client's final flight — Certificate rules and the Finished check" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x39)));
+    const rnd = seededForTest(&csprng);
+    var b1: [4096]u8 = undefined;
+    var b2: [4096]u8 = undefined;
+    var dg: [4096]u8 = undefined;
+    var ceb: [64]u8 = undefined;
+    const empty_cert = try messages.encodeCertificate(&.{}, &.{}, &ceb);
+    const garbage: [32]u8 = @splat(0x55);
+    {
+        var pr: AuditPskPair = .{ .client = undefined, .server = undefined };
+        try pr.init(.{ .role = .server }, rnd);
+        defer pr.deinit();
+        _ = try pr.client.handleFlight(pr.f2[0..pr.f2_len], rnd, 0, &b1);
+        const seq = pr.server.peer_message_seq.?;
+        try testing.expectError(error.FinishedVerifyFailed, pr.server.handleFlight(try auditFlight(&pr.client, seq, &.{.{ .t = .finished, .body = &garbage }}, &dg), rnd, 0, &b2));
+        try testing.expectError(error.Malformed, pr.server.handleFlight(try auditFlight(&pr.client, seq, &.{.{ .t = .finished, .body = garbage[0..31] }}, &dg), rnd, 0, &b2));
+        try testing.expectError(error.UnexpectedMessage, pr.server.handleFlight(try auditFlight(&pr.client, seq, &.{ .{ .t = .certificate, .body = empty_cert }, .{ .t = .finished, .body = &garbage } }, &dg), rnd, 0, &b2));
+    }
+    {
+        var pr: AuditPskPair = .{ .client = undefined, .server = undefined };
+        try pr.init(.{ .role = .server, .request_client_cert = true }, rnd);
+        defer pr.deinit();
+        const cf = try pr.client.handleFlight(pr.f2[0..pr.f2_len], rnd, 0, &b1);
+        const seq = pr.server.peer_message_seq.?;
+        // Asked for a certificate, answered with none at all.
+        try testing.expectError(error.Malformed, pr.server.handleFlight(try auditFlight(&pr.client, seq, &.{.{ .t = .finished, .body = &garbage }}, &dg), rnd, 0, &b2));
+        // An empty Certificate is a genuine answer when none is required.
+        try testing.expect((try pr.server.handleFlight(cf.out, rnd, 0, &b2)).done);
+    }
+}
+
+test "audit: client: the server's flight — message types, suite, Certificate without CertificateVerify, Finished" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x3a)));
+    const rnd = seededForTest(&csprng);
+    var pr: AuditPskPair = .{ .client = undefined, .server = undefined };
+    try pr.init(.{ .role = .server }, rnd);
+    defer pr.deinit();
+    var b1: [4096]u8 = undefined;
+    var dg: [4096]u8 = undefined;
+    const sh_rec = try record.decodePlaintext(pr.f2[0..pr.f2_len]);
+    const sh_len = 13 + @as(usize, sh_rec.length);
+    var eeb: [16]u8 = undefined;
+    const ee = try messages.encodeEncryptedExtensions(&.{}, &eeb);
+    var ceb: [64]u8 = undefined;
+    const empty_cert = try messages.encodeCertificate(&.{}, &.{}, &ceb);
+    const garbage: [32]u8 = @splat(0xaa);
+    const Variant = struct { msgs: []const AuditMsg, want: anyerror };
+    const variants = [_]Variant{
+        .{ .msgs = &.{.{ .t = .finished, .body = &garbage }}, .want = error.UnexpectedMessage },
+        .{ .msgs = &.{ .{ .t = .encrypted_extensions, .body = ee }, .{ .t = .certificate, .body = empty_cert }, .{ .t = .finished, .body = &garbage } }, .want = error.FinishedVerifyFailed },
+        .{ .msgs = &.{ .{ .t = .encrypted_extensions, .body = ee }, .{ .t = .finished, .body = garbage[0..31] } }, .want = error.Malformed },
+        .{ .msgs = &.{ .{ .t = .encrypted_extensions, .body = ee }, .{ .t = .finished, .body = &garbage } }, .want = error.FinishedVerifyFailed },
+    };
+    for (variants) |v| {
+        @memcpy(dg[0..sh_len], pr.f2[0..sh_len]);
+        const rest = try auditFlight(&pr.server, 1, v.msgs, dg[sh_len..]);
+        try testing.expectError(v.want, pr.client.handleFlight(dg[0 .. sh_len + rest.len], rnd, 0, &b1));
+    }
+    // The genuine ServerHello under another message type.
+    @memcpy(dg[0..pr.f2_len], pr.f2[0..pr.f2_len]);
+    dg[13] = @backingInt(messages.HandshakeType.certificate);
+    try testing.expectError(error.UnexpectedMessage, pr.client.handleFlight(dg[0..pr.f2_len], rnd, 0, &b1));
+    // A CCM suite this module knows by number but cannot protect records with.
+    var vb: [4]u8 = undefined;
+    const sv = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &vb);
+    var shb: [128]u8 = undefined;
+    const sh_ccm = try messages.encodeServerHello(.{ .random = @splat(1), .legacy_session_id_echo = &.{}, .cipher_suite = @backingInt(CipherSuite.aes_128_ccm_sha256), .extensions = &.{.{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sv }} }, &shb);
+    try testing.expectError(error.UnsupportedSuite, pr.client.handleFlight(try auditPlainRecord(@backingInt(messages.HandshakeType.server_hello), 0, 0, sh_ccm, &dg), rnd, 0, &b1));
+    // And the genuine flight still completes.
+    try testing.expect((try pr.client.handleFlight(pr.f2[0..pr.f2_len], rnd, 0, &b1)).done);
+}
+
+test "audit: client HelloRetryRequest: the cookie size limit; after a 1.3 retry a HelloVerifyRequest is not a 1.2 server" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x3b)));
+    const rnd = seededForTest(&csprng);
+    var buf: [4096]u8 = undefined;
+    var vb: [4]u8 = undefined;
+    const sv = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &vb);
+    const cookie: [max_cookie_len + 1]u8 = @splat(0xc0);
+    for ([_]usize{ max_cookie_len, max_cookie_len + 1 }) |len| {
+        var client = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
+        defer client.deinit();
+        _ = try client.startHandshake(rnd, 0, &buf);
+        var ckb: [256]u8 = undefined;
+        const ck = try messages.encodeCookieExtension(cookie[0..len], &ckb);
+        const d = try hrrDatagram(&.{ .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sv }, .{ .ext_type = @backingInt(messages.ExtensionType.cookie), .data = ck } });
+        if (len == max_cookie_len) {
+            _ = try client.handleFlight(d.bytes[0..d.len], rnd, 0, &buf);
+            try testing.expect(client.sawHelloRetryRequest());
+        } else try testing.expectError(error.BufferTooShort, client.handleFlight(d.bytes[0..d.len], rnd, 0, &buf));
+    }
+    var dual = try Connection.clientInit(.{ .role = .client, .versions = &.{ .dtls13, .dtls12 }, .psk_identity = "id", .psk = "k" });
+    defer dual.deinit();
+    _ = try dual.startHandshake(rnd, 0, &buf);
+    var ckb: [16]u8 = undefined;
+    const ck = try messages.encodeCookieExtension("c", &ckb);
+    const d = try hrrDatagram(&.{ .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sv }, .{ .ext_type = @backingInt(messages.ExtensionType.cookie), .data = ck } });
+    _ = try dual.handleFlight(d.bytes[0..d.len], rnd, 0, &buf);
+    var hb: [64]u8 = undefined;
+    const hvr = try messages12.encodeHelloVerifyRequest("ck", &hb);
+    var dg: [128]u8 = undefined;
+    try testing.expectError(error.UnexpectedMessage, dual.handleFlight(try auditPlainRecord(messages12.HandshakeType.hello_verify_request, 1, 1, hvr, &dg), rnd, 0, &buf));
+}

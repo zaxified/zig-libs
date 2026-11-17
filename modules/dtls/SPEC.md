@@ -6,7 +6,7 @@
 
 **Scope:** core — pion/dtls and wolfSSL DTLS (surveyed 2026-09-30; KeyUpdate, the exporter, ALPN, AES-256-GCM-SHA384 and DTLS 1.2 with version negotiation closed 2026-11-13; still lacks CCM/CCM_8, resumption / tickets (1.2 and 1.3), `use_srtp`, connection ID — see Backlog; the 1.2 engine is live-proven against wolfSSL since 2026-11-17)
 
-**Audit:** review 2026-09-10 · mutation 2026-09-07 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (1128/1327, 199 eq) · src 910131d7bc04319e
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DTLS_FUZZ: `dtls-keyupdate` added 2026-11-13, not yet budget-run; `dtls-handshake` PSK / HelloRetryRequest cookie / (EC)DHE with one flight damaged, `dtls-record`, `dtls-wire`; certificate-authenticated flights not driven) · ct 2026-10-10 (ctgrind: PSK through a full handshake — AES-128-GCM-SHA256 and, since 2026-11-13, AES-256-GCM-SHA384 with a SHA-384 PSK — record keys through send/recv; `hs` 174 (123 until 2026-11-13: +51 the SHA-384 handshake's transcript hashing of decrypted messages; 120 before the ALPN parse, 119 before the `transcript.writeHeader` guard) / `app` 13 (23 until 2026-11-13: the same sites counted once, the harness's suite loop no longer unrolled; AES-256-GCM added) / `ku` 21 (22 until 2026-11-13, same reason; KeyUpdate both ways + exporter, traffic and exporter secrets tainted) in-file, none a branch on a key — constant-time-check verdicts and processing of decrypted content) · DTLS 1.2 (2026-11-13): fuzz `dtls12-handshake` (PSK, ECDHE_PSK, PSK behind a HelloVerifyRequest, ECDHE_ECDSA; one datagram damaged / random / dropped / duplicated; since 2026-11-17 also fragmented at `max_datagram_len` 128..600 and two datagrams of a flight swapped, 40,000 runs clean) and `dtls12-wire` (the `messages12` decoders) added, not yet budget-run; ctgrind `hs12` 53 (96 until 2026-11-17: the 1.2 reassembly of the decrypted Finished moved into `handshake.Reassembler`, and memcheck's four-IP duplicate rule now merges the per-call-site and per-mode copies of each site, since `handleFlightBody`/`takeFragment`/`feed` are frames of their own; every vanished context mapped one by one, no new kind of site — table in `scripts/checks/ctgrind-expected.tsv`) (PSK tainted through PSK and ECDHE_PSK handshakes, the server's ECDHE key through an ECDHE_ECDSA AES-256-GCM-SHA384 one) / `app12` 3 (record keys tainted, three AEADs) in-file — the Finished and AEAD tag verdicts and the parsing of the decrypted Finished; the PRF, premaster and ECDH add none
 **Performance:** not measured
@@ -593,54 +593,65 @@ byte-identical to the unfragmented record (cost-only); (c) dropping the
 under the 128-byte floor; (d) `or true` on the fragment loop — `Fragmenter
 .next` returns null after the last fragment and the loop breaks; (e) the
 early `end >= max_len` break in `nextDatagram` — the next iteration's
-`end + n > max_len` breaks anyway (cost-only). The card's `**Audit:**` line
-has no whole-module counts (`src ?`), so this delta is recorded here only;
-the module still needs a whole-module mutation run.
+`end + n > max_len` breaks anyway (cost-only). This delta is part of the
+whole-module run below.
 
-**Audit 2026-11-17 (whole-module mutation) — partial, not on the card.**
+**Audit 2026-11-17 (whole-module mutation).**
 1327 mutants over every non-test line of `src/` (test files, the fuzz corpus,
 KAT/replay data, the ctgrind harness and stack probes excluded), generated
 one per condition × class: guard dropped (per disjunct / conjunct), ordering
 comparison off by one, counter increment skipped, `self.*` assignment
-skipped, wipe skipped. One ReleaseSafe schemata binary per round, four
-rounds. Result: **985 killed (one of them a hang), 83 EQUIVALENT, 44 UNOBSERVABLE,
-215 still open** — 53 in `Connection12.zig`, 162 in `Connection.zig`.
-Every other file (`record`, `record12`, `handshake`, `flight`, `aead`,
-`keyschedule`, `prf12`, `suitehash`, `messages`, `messages12`, `certauth`,
-`sig12`, `suite12`, `Endpoint`, `engine`, `burn`, `root`) is closed: zero
-survivors. The killing tests are `src/audit_test.zig`: exact-size output
-buffers and one-past-the-limit lengths for every `messages` / `messages12`
-encoder, decoder edges, record / record12 / Reassembler / FlightTracker /
-AEAD / PRF boundaries, a 33-byte Ed25519 key, and for the DTLS 1.2 engine a
-fake peer that feeds crafted ServerHello / HelloVerifyRequest /
-ServerKeyExchange / ClientHello / ClientKeyExchange / CCS / Finished
-records, plus the send/recv API edges. Classes of the EQUIVALENT verdicts:
-a length check whose exact-boundary case fails the very next check with the
-same error (decoders, encoders whose extensions block needs two more bytes);
-infeasible values (lengths that are always even or multiples of 16, the
-48-bit reconstruction corner); invariants on our own data (the cached
-ClientHello in `Endpoint.handOver`, server-minted cookie lengths); dominated
-checks (an ALPN name over 255 already exceeds the 256-byte list cap; the
-ClientKeyExchange refusal of a missing required certificate);
-cost-only (`nextDatagram`'s early break, a zero-length copy, the
-queue-less retry). UNOBSERVABLE: wipes of keys, secrets, premasters and
-rollback copies (they need a read of dead memory or of a struct after
-`deinit`) and the write-only `ecdhe_live` / `ecdhe_secret_live` bookkeeping
-behind them. **Finding (fixed):** the plain-PSK premaster buffer held
-2 + 80 + 2 + 512 bytes, but RFC 4279 §2's `other_secret` is `psk.len` zero
-bytes, so a 297..512-byte `Config.psk` overflowed it (panic in ReleaseSafe,
-stack overflow in ReleaseFast); now `2 + max(80, max_psk_len) + 2 +
-max_psk_len`, the 512 cap (OpenSSL's `PSK_MAX_PSK_LEN`) kept. Only the local
-configuration reaches it, not a peer. The DTLS 1.3 PSK path has no such
-buffer (the PSK goes straight into HKDF-Extract; an over-long PSK identity
-is a typed `BufferTooShort` from the ClientHello's pre_shared_key buffer).
-The 2026-11-17 triage item "1.2: a later message is dropped" is refuted:
-later messages are queued (test "whole messages arriving in reverse order
-inside one datagram are queued, not dropped", and the queue mutants were
-killed). Open: the 1.3 engine's KeyUpdate / ACK / record-protection /
-HelloRetryRequest / certificate-flight survivors and the 1.2 engine's
-retransmission flags, Finished length, signature-scheme selection and
-buffer caps. The per-mutant table is the audit's scratch, not committed.
+skipped, wipe skipped. One ReleaseSafe schemata binary per round, six
+rounds. Result: **1128 killed (one of them a hang), 155 EQUIVALENT, 44
+UNOBSERVABLE, none open** (the card counts UNOBSERVABLE with the
+equivalents: 199). The killing tests are `src/audit_test.zig` (black-box:
+exact-size output buffers and one-past-the-limit lengths for every
+`messages` / `messages12` encoder, decoder edges, record / record12 /
+Reassembler / FlightTracker / AEAD / PRF boundaries, a 33-byte Ed25519 key,
+and for the DTLS 1.2 engine a fake peer that feeds crafted ServerHello /
+HelloVerifyRequest / ServerKeyExchange / ClientHello / ClientKeyExchange /
+CCS / Finished records — a Finished one byte long or one bit off on both
+sides, a retransmitted ClientHello to a stateless server, a flight repeated
+inside one datagram, the queue-retry corners, the post-handshake resend
+duties) and test blocks at the end of `Connection12.zig` and
+`Connection.zig` for the private helpers (transcript / flight-cache / queue
+caps filled exactly, epoch-1 records around the CCS, scheme selection and
+the suite-family check, the 1.3 record and handshake-record writers and
+readers at their size, width and replay edges, ACK / KeyUpdate framing and
+bookkeeping, re-installing application keys, the cookie's version and
+length, CertificateRequest / Certificate / CertificateVerify order and
+repetition, a dual server's `supported_versions` parse, the client's and
+the server's Finished checks, a ClientHello2 that drops the suite the retry
+committed to). Classes of the EQUIVALENT verdicts: a length check whose
+exact-boundary case fails the very next check with the same error;
+infeasible values (lengths that are always even or multiples of 16, a
+header without a connection ID is at most 5 bytes, a request context is at
+most 255 bytes, the identity and binder lists of `pre_shared_key` have the
+same count); invariants on our own state (`stateless_reply` never outlives
+a call, `tx_len` is 0 only at `.start`, one CertificateRequest per
+handshake, each optional certificate message at most once, the KeyUpdate
+record ring is reset on every path into `.in_flight`, a reset window with
+`recv_seen_any` false behaves like a fresh one); defence-in-depth that an
+encoder or AEAD repeats (the cookie buffer, `protect`'s own length check);
+cost-only (the ML-KEM expanded key, `nextDatagram`'s early break, the
+queue-less retry); and dead bookkeeping — `pending_flight_count` and the
+record lists that feed it (`markFlightSent`) are written and never read
+(Backlog). UNOBSERVABLE: wipes of keys, secrets, premasters and rollback
+copies (they need a read of dead memory or of a struct after `deinit`) and
+the write-only `ecdhe_live` / `ecdhe_secret_live` bookkeeping behind them.
+**Finding (fixed):** the plain-PSK premaster buffer held 2 + 80 + 2 + 512
+bytes, but RFC 4279 §2's `other_secret` is `psk.len` zero bytes, so a
+297..512-byte `Config.psk` overflowed it (panic in ReleaseSafe, stack
+overflow in ReleaseFast); now `2 + max(80, max_psk_len) + 2 +
+max_psk_len`, the 512 cap (OpenSSL's `PSK_MAX_PSK_LEN`) kept. Only the
+local configuration reaches it, not a peer. The DTLS 1.3 PSK path has no
+such buffer (the PSK goes straight into HKDF-Extract; an over-long PSK
+identity is a typed `BufferTooShort` from the ClientHello's pre_shared_key
+buffer). The 2026-11-17 triage item "1.2: a later message is dropped" is
+refuted: later messages are queued (test "whole messages arriving in
+reverse order inside one datagram are queued, not dropped", and the queue
+mutants were killed). The per-mutant table is the audit's scratch, not
+committed.
 
 ## Threat model / out of scope
 
@@ -936,6 +947,7 @@ two `Connection`s written from the same reading of the RFC cannot see.
 - ✅ DONE 2026-11-17 (fifteen live cases, see "DTLS 1.2" → "Live peer"; one defect found: the server's RFC 5746 requirement) **DTLS 1.2 against a live peer.** Remaining: plain PSK, which Debian's wolfSSL cannot speak (no static PSK) — an OpenSSL `s_server -dtls1_2 -psk` case would cover it.
 - ✅ DONE 2026-11-17 (`Config.max_datagram_len`, `record.nextDatagram`, the receive queue; see "DTLS 1.2" → "Fragmentation") **DTLS 1.2 send-side fragmentation and out-of-order buffering.**
 - **DTLS 1.3 send-side fragmentation** (2026-11-17). `Config.max_datagram_len` is honoured by the 1.2 engine only; the 1.3 engine still sends one record per message (`protectHandshakeMessage`'s 1500-byte buffer, the cached `last_flight` as finished records, ACK bookkeeping of at most three records per flight), so a tiny-MTU 1.3 peer with a large chain still cannot be served. Wiring it means fragmenting at record build time and widening `FlightTracker`. Effort: small-medium.
+- **Dead flight-tracker bookkeeping in the 1.3 engine** (found by the 2026-11-17 whole-module mutation). `markFlightSent` / `clearFlightTracker` maintain `pending_flight_buf` / `pending_flight_count` (and the `extra_records` / `all_records` lists that feed them), but nothing in the engine reads them: a lost flight is resent whole from `last_flight` on the timer, and an incoming ACK is consulted only for the KeyUpdate. RFC 9147 §7 lets a sender retransmit only the records an ACK did not name (wolfSSL 1.3 does). Either wire that (it pairs with "DTLS 1.3 send-side fragmentation", which needs a wider `FlightTracker` anyway) or delete the dead state. No behaviour today. Effort: small.
 - **Epoch-0 replay window advanced by unauthenticated records** (found 2026-11-17 while testing the 1.2 queue). Both engines' epoch-0 windows accept and record any well-formed record, so an off-path sender with a high sequence number makes the genuine early records look stale (they are dropped, the peer retransmits under higher numbers until it overtakes). RFC 6347 §4.1.2.6 updates the window only after MAC verification, which epoch 0 does not have. **The references do the same as we do (checked in source 2026-11-17):** OpenSSL (`ssl/record/methods/dtls_meth.c`, master) calls `dtls_record_bitmap_update` at the end of `dtls_process_record`, after the cipher/MAC step, which for epoch 0 (null cipher, no MAC) authenticates nothing, and before the handshake layer parses the message; wolfSSL 5.9.1 (`src/internal.c` `ProcessReplyEx`, state `runProcessingOneRecord`) calls `DtlsUpdateWindow` for every DTLS 1.2 record after the decrypt/verify states (skipped in epoch 0) and before `runProcessingOneMessage`; its `_DtlsCheckWindow` refuses only a jump over 2^32 (and future records only with the non-default `WOLFSSL_DTLS_DISALLOW_FUTURE`). Only wolfSSL's DTLS 1.3 path holds back (`Dtls13UpdateWindowRecordRecvd` only once `dtlsStateful`). Behaviour kept (majority); a hardening option would be to advance the epoch-0 window only for records that parsed as the expected message. Effort: small.
 - ✅ DONE 2026-11-17 (four cases in `tools/interop.zig`, `wolfssl_peer.c` modes `server-alpn`/`client-alpn`/`server-ku-ours`/`server-ku-theirs`, transcript re-captured; see "Post-handshake") **KeyUpdate / ALPN against a live peer** (2026-11-13). Remaining: a wolfSSL-initiated KeyUpdate with wolfSSL as the client, ALPN and KeyUpdate in certificate mode.
 - **AES-256-GCM-SHA384 against a live peer.** Self-interop only (done 2026-11-13, see "Cipher suites and the suite hash"); the wolfSSL interop program offers one suite (`kSuite` in `tools/wolfssl_peer.c`). A case with `TLS13-AES256-GCM-SHA384` there (both roles, PSK with a SHA-384 PSK, HelloRetryRequest) would wire-verify the SHA-384 transcript and the 83-byte cookie. Effort: small.
