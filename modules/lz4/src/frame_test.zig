@@ -496,7 +496,7 @@ test "frame: compressInto reports a short buffer" {
     const need = lz4.compressBound(buf.len, .{ .block_checksum = true, .content_checksum = true });
     try testing.expect(need <= big.len);
     _ = try lz4.compressInto(&buf, big[0..need], .{ .block_checksum = true, .content_checksum = true });
-    for ([_]usize{ need - 1, need - 4, need - 5, need - 8, 900 }) |n| {
+    for ([_]usize{ need - 1, need - 4, need - 5, need - 8, need - 9, need - 12, 900 }) |n| {
         try testing.expectError(error.NoSpaceLeft, lz4.compressInto(&buf, big[0..n], .{ .block_checksum = true, .content_checksum = true }));
     }
 }
@@ -510,4 +510,89 @@ test "block API: compressBlock then decompressBlock" {
     try testing.expectEqual(text.len, try lz4.decompressBlock(z[0..n], &out));
     try testing.expectEqualStrings(text, &out);
     try testing.expectError(error.OutputTooSmall, lz4.decompressBlock(z[0..n], out[0 .. text.len - 1]));
+}
+
+test "frame: the cap at exactly one block maximum, and a declared size over what is left" {
+    // A 64 KiB-maximum frame whose block decodes to one byte more than the
+    // maximum, with exactly the maximum left of the cap: the block is at
+    // fault, not the cap.
+    var z: std.ArrayList(u8) = .empty;
+    defer z.deinit(gpa);
+    try z.appendSlice(gpa, "\x1fa\x01\x00");
+    var rest: usize = 65_537 - 1 - 5 - 4 - 15;
+    while (rest >= 255) : (rest -= 255) try z.append(gpa, 255);
+    try z.append(gpa, @intCast(rest));
+    try z.appendSlice(gpa, "\x50aaaaa");
+    var b: Builder = .{};
+    defer b.deinit();
+    try b.header(.{});
+    try b.compressed(z.items);
+    try b.end();
+    try testing.expectError(error.BlockTooLarge, lz4.decompress(gpa, b.list.items, .{ .max_output = 65_536 }));
+    try testing.expectError(error.OutputTooLarge, lz4.decompress(gpa, b.list.items, .{ .max_output = 65_535 }));
+
+    // The second frame declares 11 bytes with 10 left of the cap: refused
+    // before its (missing) blocks are read.
+    var two: Builder = .{};
+    defer two.deinit();
+    try two.header(.{});
+    try two.stored("hello world");
+    try two.end();
+    try two.header(.{ .size = 11 });
+    try testing.expectError(error.OutputTooLarge, lz4.decompress(gpa, two.list.items, .{ .max_output = 21 }));
+    try testing.expectError(error.TruncatedInput, lz4.decompress(gpa, two.list.items, .{ .max_output = 22 }));
+}
+
+test "frame: content checksums of concatenated frames cover their own frame" {
+    const one = try lz4.compress(gpa, "first frame", .{ .content_checksum = true });
+    defer gpa.free(one);
+    const two = try lz4.compress(gpa, "second", .{ .content_checksum = true, .block_checksum = true });
+    defer gpa.free(two);
+    var b: Builder = .{};
+    defer b.deinit();
+    try b.bytes(one);
+    try b.bytes(two);
+    try expectDecodes("first framesecond", b.list.items, .{});
+}
+
+test "frame: a legacy block at exactly LZ4_COMPRESSBOUND(8 MiB) is read" {
+    // The size word is the largest allowed: what follows is short, so the
+    // input is truncated rather than the block too large.
+    var b: Builder = .{};
+    defer b.deinit();
+    try b.u32le(lz4.legacy_frame_magic);
+    try b.u32le(@intCast(lz4.compressBlockBound(8 << 20)));
+    try b.bytes("\x10a");
+    try testing.expectError(error.TruncatedInput, lz4.decompress(gpa, b.list.items, .{}));
+    var c: Builder = .{};
+    defer c.deinit();
+    try c.u32le(lz4.legacy_frame_magic);
+    try c.u32le(@intCast(lz4.compressBlockBound(8 << 20) + 1));
+    try c.bytes("\x10a");
+    try testing.expectError(error.BlockTooLarge, lz4.decompress(gpa, c.list.items, .{}));
+}
+
+test "block API: a match may end exactly at the end of the output" {
+    // 'a', a 4-byte match at offset 1 that fills dst, then the empty last token.
+    var out: [5]u8 = undefined;
+    try testing.expectEqual(@as(usize, 5), try lz4.decompressBlock("\x10a\x01\x00\x00", &out));
+    try testing.expectEqualStrings("aaaaa", &out);
+    try testing.expectError(error.OutputTooSmall, lz4.decompressBlock("\x10a\x01\x00\x00", out[0..4]));
+}
+
+test "block API: a match is extended to the exact first differing byte" {
+    // 16 distinct bytes, the first 11 again, then 30 more distinct bytes: the
+    // greedy parse is 16 literals + an 11-byte match at offset 16, then 30
+    // literals: (1 + 1 + 16 + 2) + (1 + 1 + 30) = 52 bytes.
+    var input: [57]u8 = undefined;
+    for (input[0..16], 0..) |*c, i| c.* = @intCast(1 + 3 * i);
+    @memcpy(input[16..27], input[0..11]);
+    for (input[27..], 0..) |*c, i| c.* = @intCast(100 + i);
+    var z: [lz4.compressBlockBound(57)]u8 = undefined;
+    const n = try lz4.compressBlock(&input, &z, .{});
+    try testing.expectEqual(@as(usize, 52), n);
+    try testing.expectEqualSlices(u8, &.{ 0xf7, 0x01 }, z[0..2]); // 15+1 literals, match 4+7
+    var back: [57]u8 = undefined;
+    try testing.expectEqual(@as(usize, 57), try lz4.decompressBlock(z[0..n], &back));
+    try testing.expectEqualSlices(u8, &input, &back);
 }

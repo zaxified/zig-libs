@@ -6,9 +6,9 @@
 
 **Scope:** core — liblz4 1.10.0 and its lz4 CLI (surveyed 2026-11-17)
 
-**Audit:** review none · mutation none · src ?
+**Audit:** review none · mutation 2026-11-17 (97/109, 11 eq) · src d5ce4485a8d926f0
 
-**Hardening:** fuzz 2026-11-17 (400,000 frame-decoder + 400,000 block-decoder + 50,000 round-trip runs clean, LZ4_FUZZ, every reach label hit; arbitrary, mutated and structure-aimed frames, synthetic token streams judged against a byte-at-a-time model, glued skippable/legacy frames, failing allocator; 3,000 seeds in every test run) · ct n/a — compression only, no secret is processed · panic 2026-11-17 (self-review at creation: every length, offset and size from the input is checked before use; the only asserts are on internal callers' arguments, never reachable with caller data through the public API; oversized inputs are `error.InputTooLarge`)
+**Hardening:** fuzz 2026-11-17 (two verdict runs on the final code's predecessor and on it, each 400,000 frame-decoder + 400,000 block-decoder + 50,000 round-trip runs, clean in 42 s and 29 s; LZ4_FUZZ, every reach label hit; arbitrary, mutated and structure-aimed frames, synthetic token streams judged against a byte-at-a-time model, glued skippable/legacy frames, failing allocator; 3,000 seeds in every test run) · ct n/a — compression only, no secret is processed · panic 2026-11-17 (self-review at creation: every length, offset and size from the input is checked before use; the only asserts are on internal callers' arguments, never reachable with caller data through the public API; oversized inputs are `error.InputTooLarge`)
 
 **Performance:** ref 1.40–2.56× liblz4 1.10.0 (`lz4 -b1 -B65536`, 64 KiB independent blocks of three 8 MiB payloads; compress 1.40–2.00×, decompress 1.81–2.56×; `zig build bench-lz4`) · fastest ? (measured 2026-11-17)
 
@@ -139,6 +139,29 @@ None claimed: the data is public. There is no secret in this module.
 
 **Anchor grade:** class A · oracle EXTERNAL
 
+## Mutation
+
+2026-11-17, whole module (new), schemata over `src/block.zig` and `src/frame.zig` (every guard of the
+production code, one mutant per guard × class: drop, flip, off by one, the other arm, skip an
+assignment, error remap): 109 mutants, 97 killed (one of them a HANG: a 0 offset let through spins
+`copyMatch`), 11 equivalent, 1 unobservable, 0 findings. Three survivors of the first run became
+tests (a match ending exactly at the output's end; a match extended to the exact first differing
+byte; `compressInto` with 1..4 bytes too few for a block checksum).
+
+| Mutant | Verdict |
+|---|---|
+| drop `src.len == 0` | EQUIVALENT: the loop's first check returns the same `error.Truncated` |
+| 16-byte chunk copy guard `>= 16` → `>= 15` | EQUIVALENT: the overshoot is at most 15 bytes, so 15 is enough (cost-only) |
+| literal / match nibble `>= 15` → `>= 16` (the nibble, not the length bytes) | EQUIVALENT ×2: at 15 both arms give nibble 15 |
+| skip entering the first position before the search | EQUIVALENT: the first lookup enters it (cost-only) |
+| drop `cand < ip` | EQUIVALENT: the table only ever holds positions already passed |
+| 8-byte extension loop one step earlier | EQUIVALENT: the byte loop finishes the same match (cost-only) |
+| drop the `ip > match_limit` break after a match | EQUIVALENT: the search loop's first check breaks out on the same condition |
+| skip entering `ip − 2` after a match | EQUIVALENT (ratio-only: the format leaves the parse free; output stays valid) |
+| acceleration clamp 1 → 0 | EQUIVALENT (cost-only: a zero step for 64 probes, then the usual growth) |
+| room `raw.len − 1` → `raw.len` (store a block that does not shrink) | EQUIVALENT: a block compressing to exactly its raw size is valid either way, same length |
+| drop `src.len > max_block_input` | UNOBSERVABLE: needs an input over 2 GiB |
+
 ## What is deliberately not done
 
 - **Byte parity with liblz4's compressor** — never: the format leaves the matcher free; liblz4's
@@ -164,5 +187,5 @@ None claimed: the data is public. There is no secret in this module.
 
 ## Open
 
-- No mutation run yet at creation (Audit line).
+- No independent review yet (Audit line `review none`).
 - Big-endian and 32-bit targets are not run; `meta.targets` is `linux64`.

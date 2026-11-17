@@ -435,3 +435,41 @@ test "block: output too small for the encoder is NoSpaceLeft" {
     try testing.expectError(error.NoSpaceLeft, compress(&buf, &z, .{}));
     try testing.expectError(error.NoSpaceLeft, compress("", z[0..0], .{}));
 }
+
+test "block: the 13-byte minimum and the window edge" {
+    var z: [compressBound(3000)]u8 = undefined;
+    // 12 bytes: literals only (1 token + 12). 13 zeros: 1 literal, a 7-byte
+    // match ending 5 bytes before the end, 5 literals = 10 bytes.
+    const zeros: [13]u8 = @splat(0);
+    try testing.expectEqual(@as(usize, 13), try compress(zeros[0..12], &z, .{}));
+    try testing.expectEqual(@as(usize, 10), try compress(&zeros, &z, .{}));
+    // A 1000-byte repeat at offset 65535 is found; at 65536 it is out of
+    // the window and the block stays (valid) literals.
+    const shapes = @import("shapes.zig");
+    var sizes: [2]usize = undefined;
+    for ([_]u32{ 64_535, 64_536 }, 0..) |param, i| {
+        const s: shapes.Shape = .{ .name = "far", .kind = .far_repeat, .len = 0, .param = param };
+        const input = try testing.allocator.alloc(u8, shapes.length(s));
+        defer testing.allocator.free(input);
+        shapes.fill(s, input);
+        const zz = try testing.allocator.alloc(u8, compressBound(input.len));
+        defer testing.allocator.free(zz);
+        sizes[i] = try compress(input, zz, .{});
+        const back = try testing.allocator.alloc(u8, input.len);
+        defer testing.allocator.free(back);
+        try testing.expectEqual(input.len, try decompress(zz[0..sizes[i]], back));
+        try testing.expectEqualSlices(u8, input, back);
+    }
+    try testing.expect(sizes[0] + 900 < sizes[1]);
+}
+
+test "block: a higher acceleration trades size for speed" {
+    var buf: [65_536]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(4);
+    const r = prng.random();
+    for (&buf, 0..) |*c, i| c.* = if (r.uintLessThan(u8, 6) == 0) r.int(u8) else "acceleration knob "[i % 18];
+    var z: [compressBound(65_536)]u8 = undefined;
+    const slow = try compress(&buf, &z, .{});
+    const fast = try compress(&buf, &z, .{ .acceleration = 64 });
+    try testing.expect(fast > slow + 1000);
+}
