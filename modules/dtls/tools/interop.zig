@@ -168,11 +168,6 @@ const Case = struct {
     /// Run the PSK handshake under `TLS13-AES256-GCM-SHA384` with `psk384`
     /// instead of `TLS13-AES128-GCM-SHA256` with `psk` (PSK cases only).
     sha384: bool = false,
-    /// Run live but leave out of `wolfssl_transcript.txt`. The replay
-    /// (`src/wolfssl_replay.zig`) and the corpus counts pinned over the
-    /// transcript (`src/fuzz_corpus.zig`) know only the AES-128 suite, so the
-    /// SHA-384 cases are a pre-release check until they are taught.
-    live_only: bool = false,
     /// One line of prose, copied into the transcript, saying what THIS case
     /// proves that no other one does.
     why: []const u8,
@@ -263,7 +258,6 @@ const cases = [_]Case{
         .peer_mode = "server-aes256",
         .seed = 0x2c,
         .sha384 = true,
-        .live_only = true,
         .app_send = "hello from zig-libs",
         .app_expect = "hello from zig-libs",
         .why = "AES-256-GCM-SHA384 with a SHA-384 PSK against a live server: the binder, the key schedule and the Finished MACs run over SHA-384 and the records under AES-256-GCM, all checked by foreign code",
@@ -274,7 +268,6 @@ const cases = [_]Case{
         .peer_mode = "server-aes256-hrr",
         .seed = 0x2c,
         .sha384 = true,
-        .live_only = true,
         .expect_hrr = true,
         .app_send = "hello from zig-libs",
         .app_expect = "hello from zig-libs",
@@ -286,7 +279,6 @@ const cases = [_]Case{
         .peer_mode = "client-aes256",
         .seed = 0x5b,
         .sha384 = true,
-        .live_only = true,
         .app_expect = "hello from wolfssl client",
         .why = "a real wolfSSL client with a SHA-384 PSK accepts what OUR server puts on the wire under AES-256-GCM-SHA384",
     },
@@ -296,7 +288,6 @@ const cases = [_]Case{
         .peer_mode = "client-aes256",
         .seed = 0x6e,
         .sha384 = true,
-        .live_only = true,
         .expect_hrr = true,
         .app_expect = "hello from wolfssl client",
         .why = "the HelloRetryRequest WE emit under a SHA-384 suite: the stateless cookie (83 bytes: version, suite, 48-byte ClientHello1 hash, MAC) is accepted by a stock client and a BRAND-NEW connection re-derives the SHA-384 transcript from it alone",
@@ -2139,7 +2130,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             // Marked BEFORE the case header goes in, so a failure rolls back
             // the header too rather than leaving a case with no body.
             const mark = t13.written().len;
-            rec.enabled = capture and !case.live_only;
+            rec.enabled = capture;
             rec.raw("case {s}\n", .{case.name});
             rec.raw("why {s}\n", .{case.why});
             const result = switch (case.flow) {

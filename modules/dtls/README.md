@@ -71,10 +71,10 @@ seed, the configuration and the post-handshake assertions — is replayed
 byte-for-byte by `src/wolfssl_replay.zig` in `zig build test-dtls`, in pure
 Zig, with no wolfSSL, no C compiler, no child process and no socket. The
 replay is what runs per commit; the live program is the pre-release check and
-the only thing that can find a NEW divergence. Four further live-only cases
-(not in the recording) run the PSK handshake under AES-256-GCM-SHA384 with a
-SHA-384 PSK, with and without a HelloRetryRequest, in both roles. Covered
-live, and in the recording:
+the only thing that can find a NEW divergence. Four further cases (in the
+recording too) run the PSK handshake under AES-256-GCM-SHA384 with a SHA-384
+PSK, with and without a HelloRetryRequest, in both roles. Covered live, and in
+the recording:
 
 - **PSK, both roles** — our client against its server, our server against
   its client;
