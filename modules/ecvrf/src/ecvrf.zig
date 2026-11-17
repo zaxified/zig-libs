@@ -173,10 +173,11 @@ pub const Error = error{
 /// 127) | 64`) — used un-reduced-mod-`q` as the scalar-multiplication
 /// exponent (matching `std.crypto.sign.Ed25519`'s own key derivation;
 /// `Edwards25519.mul` computes the correct point regardless, since point
-/// order divides `q` exactly); the HIGH 32 bytes (`prefix`) are folded
-/// into `nonceGeneration` (RFC 8032 §5.1.6 steps 2-3, RFC 9381 §5.4.2.2)
-/// but are NOT otherwise part of the VRF secret scalar.
-const ExpandedSecretKey = struct { x: [32]u8, prefix: [32]u8 };
+/// order divides `q` exactly). The HIGH 32 bytes (RFC 8032's `prefix`) are
+/// folded into `nonceGeneration` (RFC 8032 §5.1.6 steps 2-3, RFC 9381
+/// §5.4.2.2) by `nonceStringFrom`, which re-derives them from the seed; they
+/// are NOT part of the VRF secret scalar and are not kept here.
+const ExpandedSecretKey = struct { x: [32]u8 };
 
 fn expandSecretKey(sk: SecretKey) ExpandedSecretKey {
     var h: [64]u8 = undefined;
@@ -195,7 +196,7 @@ fn expandSecretKey(sk: SecretKey) ExpandedSecretKey {
     // dead-frame copies of `x` the audit's stack-scan probe found; this is
     // the one inside ecvrf's own module, not `ct25519`'s or std's).
     defer std.crypto.secureZero(u8, &x);
-    return .{ .x = x, .prefix = h[32..64].* };
+    return .{ .x = x };
 }
 
 /// The VRF secret scalar `x` (RFC 9381's parameter list: "`x`: VRF secret
@@ -214,7 +215,6 @@ pub fn secretScalar(out: *[32]u8, sk: *const SecretKey) void {
 noinline fn secretScalarUnburned(out: *[32]u8, sk: *const SecretKey) void {
     var e = expandSecretKey(sk.*);
     defer std.crypto.secureZero(u8, &e.x);
-    defer std.crypto.secureZero(u8, &e.prefix);
     out.* = e.x;
 }
 
@@ -418,7 +418,6 @@ noinline fn proveUnburned(sk_ptr: *const SecretKey, alpha_string: []const u8) Pr
     const sk = sk_ptr;
     var exp = expandSecretKey(sk.*);
     defer std.crypto.secureZero(u8, &exp.x);
-    defer std.crypto.secureZero(u8, &exp.prefix);
 
     // Step 1: x, Y = x*B. `ct25519.mulBase` (constant-time, no error union)
     // — `x` is the VRF secret scalar; see the module doc comment for why
@@ -458,7 +457,6 @@ pub const KeyPair = struct {
     noinline fn keyPairProveUnburned(kp: *const KeyPair, alpha_string: []const u8) Proof {
         var exp = expandSecretKey(kp.secret_key);
         defer std.crypto.secureZero(u8, &exp.x);
-        defer std.crypto.secureZero(u8, &exp.prefix);
         return proveExpanded(&kp.secret_key, &exp, kp.public_key, alpha_string);
     }
 };
@@ -486,7 +484,7 @@ fn proveExpanded(sk: *const SecretKey, exp: *const ExpandedSecretKey, y_string: 
     var k_string = nonceStringFrom(sk, h_string);
     defer std.crypto.secureZero(u8, &k_string);
     var k = scalar.reduce64(k_string);
-    // A1 E4: the secret nonce was never zeroed — unlike `exp.x`/`exp.prefix`
+    // A1 E4: the secret nonce was never zeroed — unlike `exp.x`
     // just above, nothing wiped this function's own copy of `k` once it was
     // no longer needed. `s = k + c*x mod q` makes a leaked `k` equivalent to
     // a leaked `x` (`x = (s-k)*c^-1 mod q`), so this copy is exactly as

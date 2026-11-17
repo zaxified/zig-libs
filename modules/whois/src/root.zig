@@ -1935,3 +1935,306 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation (2026-11-17): the tests its survivors asked for ───
+
+test "formatQuery: 512 bytes fit exactly, 513 do not; a buffer of exactly len + 2 is enough, one byte less is not" {
+    var big: [600]u8 = undefined;
+    const out = try formatQuery(&big, strRepeat("a", 512));
+    try testing.expectEqual(@as(usize, 514), out.len);
+    try testing.expectError(error.QueryTooLong, formatQuery(&big, strRepeat("a", 513)));
+
+    var exact: [7]u8 = undefined;
+    try testing.expectEqualStrings("hello\r\n", try formatQuery(&exact, "hello"));
+    var short: [6]u8 = undefined;
+    try testing.expectError(error.QueryTooLong, formatQuery(&short, "hello"));
+}
+
+test "prefixed queries: the prefix counts toward the 512-byte cap; a buffer shorter than the prefix is QueryTooLong" {
+    var buf: [1024]u8 = undefined;
+    // "n " (2) + 510 = 512: fits; 511 does not.
+    const arin = try arinIpQuery(&buf, strRepeat("a", 510));
+    try testing.expectEqual(@as(usize, 2 + 510 + 2), arin.len);
+    try testing.expectError(error.QueryTooLong, arinIpQuery(&buf, strRepeat("a", 511)));
+    // "domain " (7) + 505 = 512: fits; 506 does not.
+    const ver = try verisignDomainQuery(&buf, strRepeat("a", 505));
+    try testing.expectEqual(@as(usize, 7 + 505 + 2), ver.len);
+    try testing.expectError(error.QueryTooLong, verisignDomainQuery(&buf, strRepeat("a", 506)));
+
+    var tiny: [1]u8 = undefined;
+    try testing.expectError(error.QueryTooLong, arinIpQuery(&tiny, "1"));
+    try testing.expectError(error.QueryTooLong, verisignDomainQuery(&tiny, "a.b"));
+}
+
+test "fieldValue and nextServer: line shapes that only a strict reader refuses" {
+    // An empty key never matches (a line starting with a colon is not a field).
+    try testing.expect(fieldValue(": value\n", "") == null);
+    // A line exactly as long as the key has no colon to read.
+    try testing.expect(fieldValue("refer", "refer") == null);
+    try testing.expect(nextServer("refer") == null);
+    // First occurrence wins, also in nextServer.
+    try testing.expectEqualStrings("first.example", nextServer("refer: first.example\nrefer: second.example\n").?.host);
+    // A bare key, a blank value and a CR-only value are skipped, not stored.
+    try testing.expectEqualStrings("real.example", nextServer("refer:\r\nrefer: real.example\r\n").?.host);
+    try testing.expectEqualStrings("real.example", nextServer("refer:\nrefer: real.example\n").?.host);
+    try testing.expectEqualStrings("real.example", nextServer("refer:   \nrefer: real.example\n").?.host);
+    // An unparseable referral does not hide a lower-priority one.
+    try testing.expectEqualStrings("good.example", nextServer("refer: not a host!\nwhois: good.example\n").?.host);
+}
+
+test "parseServerRef: CR trimmed, scheme case-insensitive, brackets and ports strict, underscores allowed" {
+    try testing.expectEqualStrings("host.example", parseServerRef("host.example\r").?.host);
+    try testing.expectEqualStrings("host.example", parseServerRef("WHOIS://host.example").?.host);
+    try testing.expect(parseServerRef("[::1]x") == null);
+    // Whatever follows the bracket must be a colon: "x43" is not port 43.
+    try testing.expect(parseServerRef("[::1]x43") == null);
+    try testing.expect(parseServerRef("[::1]:0") == null);
+    try testing.expectEqualStrings("a_b.example", parseServerRef("a_b.example").?.host);
+}
+
+test "isSpecialUseHost: names, numeric forms and the documentation prefixes, at their edges" {
+    // .localhost is matched without regard to case.
+    try testing.expect(isSpecialUseHost("foo.LOCALHOST"));
+    // A name that merely starts with a digit and holds hex letters is a name, not a number.
+    try testing.expect(!isSpecialUseHost("1.abc"));
+    // 32-bit part cap: 4294967295 is 255.255.255.255 (not special), one more is invalid (refused).
+    try testing.expect(!isSpecialUseHost("4294967295"));
+    try testing.expect(isSpecialUseHost("4294967296"));
+    // Past 32 bits is invalid even when the low bits spell a public address (0.0.0.1).
+    try testing.expect(isSpecialUseHost("4294967297"));
+    // The last part must fit the bytes left for it.
+    try testing.expect(isSpecialUseHost("1.2.3.256"));
+    try testing.expect(isSpecialUseHost("10.1.65536"));
+    try testing.expect(!isSpecialUseHost("1.2.3.255"));
+    // Neighbours of the documentation prefixes are public.
+    try testing.expect(!isSpecialUseHost("192.1.2.3"));
+    try testing.expect(!isSpecialUseHost("198.1.100.1"));
+    try testing.expect(!isSpecialUseHost("203.1.113.5"));
+    try testing.expect(!isSpecialUseHost("2001:eb8::1"));
+    try testing.expect(!isSpecialUseHost("2002:db8::1"));
+    try testing.expect(isSpecialUseHost("2001:db8::1"));
+}
+
+test "parseInetAton: an empty or dot-only host is not numeric; 0X is hex like 0x" {
+    try testing.expect(parseInetAton("") == .not_numeric);
+    try testing.expect(parseInetAton(".") == .not_numeric);
+    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, parseInetAton("0X7f.0.0.1").addr);
+    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, parseInetAton("0x7f.0.0.1").addr);
+}
+
+test "serverQuery: the Verisign host is matched without regard to case" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("domain example.com\r\n", try serverQuery(&buf, "WHOIS.VERISIGN-GRS.COM", "example.com"));
+    try testing.expectEqualStrings("n 192.0.2.1\r\n", try serverQuery(&buf, "WHOIS.ARIN.NET", "192.0.2.1"));
+}
+
+test "Chain.append: a 255-byte host fits, a 256-byte host does not" {
+    const h255: [255]u8 = @splat('x');
+    const h256: [256]u8 = @splat('x');
+    var c: Chain = .{};
+    try testing.expect(c.append(&h255));
+    try testing.expectEqual(@as(usize, 255), c.get(0).len);
+    try testing.expect(!c.append(&h256));
+    try testing.expectEqual(@as(usize, 1), c.count);
+}
+
+test "lookup: the root is asked on opts.port, a referral on the port it names" {
+    var scripted: ScriptedTransport = .{ .entries = &.{
+        .{ .server = "root.example", .response = "refer: next.example:4343\n" },
+        .{ .server = "next.example", .response = "done\n" },
+    } };
+    var buf: [256]u8 = undefined;
+    _ = try lookup(scripted.transport(), "example.com", .{ .root = "root.example", .port = 1043 }, &buf);
+    try testing.expectEqual(@as(usize, 2), scripted.call_count);
+    try testing.expectEqual(@as(u16, 1043), scripted.calls[0].port);
+    try testing.expectEqual(@as(u16, 4343), scripted.calls[1].port);
+}
+
+// -- TcpTransport: a real exchange, and the faults only a wrapped Io can inject --
+
+const LinePeer = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    reply: []const u8,
+    got: [64]u8 = undefined,
+    got_len: usize = 0,
+
+    /// Accept one client, read its query line, answer `reply`, close.
+    fn run(p: *LinePeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        var rbuf: [128]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        const line = sr.interface.takeDelimiterExclusive('\n') catch return;
+        const n = @min(line.len, p.got.len);
+        @memcpy(p.got[0..n], line[0..n]);
+        p.got_len = n;
+        var wbuf: [64]u8 = undefined;
+        var sw = s.writer(p.io, &wbuf);
+        sw.interface.writeAll(p.reply) catch return;
+        sw.interface.flush() catch return;
+    }
+};
+
+fn linePeerExchange(reply: []const u8, buf: []u8, got: *[64]u8, got_len: *usize) !TransportError![]const u8 {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("whois line-peer listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    var peer: LinePeer = .{ .io = io, .listener = &listener, .reply = reply };
+    const peer_thread = try std.Thread.spawn(.{}, LinePeer.run, .{&peer});
+
+    var tcp: TcpTransport = .{ .io = io, .deny_special_use = false, .timeout_ms = 5000 };
+    const res = tcp.transport().exchange("127.0.0.1", port, "example.com\r\n", buf);
+    // A client that failed before it connected must not leave the peer parked
+    // in `accept`; one that connected and failed has closed its end already.
+    if (res) |_| {} else |_| {
+        if (std.Io.net.IpAddress.parse("127.0.0.1", port)) |wake| {
+            if (wake.connect(io, .{ .mode = .stream })) |ws| ws.close(io) else |_| {}
+        } else |_| {}
+    }
+    peer_thread.join();
+    got.* = peer.got;
+    got_len.* = peer.got_len;
+    return res;
+}
+
+test "TcpTransport: the query is flushed to the peer and the reply comes back; an exact-fit reply is fine, one byte over is ResponseTooLarge" {
+    const reply = "0123456789abcdef";
+    var got: [64]u8 = undefined;
+    var got_len: usize = 0;
+
+    var exact: [16]u8 = undefined;
+    const ok = try linePeerExchange(reply, &exact, &got, &got_len);
+    try testing.expectEqualStrings(reply, try ok);
+    try testing.expectEqualStrings("example.com\r", got[0..got_len]);
+
+    var short: [15]u8 = undefined;
+    const over = try linePeerExchange(reply, &short, &got, &got_len);
+    try testing.expectError(error.ResponseTooLarge, over);
+}
+
+/// A real `std.Io` with one slot replaced by a fault. Same shape as
+/// `ReadCueIo`.
+fn FaultIo(comptime fault: enum { no_concurrent, cancel_lookup, cancel_write }) type {
+    return struct {
+        vtable: std.Io.VTable,
+        userdata: ?*anyopaque,
+
+        var inner_vtable: *const std.Io.VTable = undefined;
+
+        fn init(inner: std.Io) @This() {
+            inner_vtable = inner.vtable;
+            var vt = inner.vtable.*;
+            switch (fault) {
+                .no_concurrent => vt.concurrent = concurrent,
+                .cancel_lookup => vt.netLookup = netLookup,
+                .cancel_write => vt.operate = operate,
+            }
+            return .{ .vtable = vt, .userdata = inner.userdata };
+        }
+
+        fn io(self: *const @This()) std.Io {
+            return .{ .userdata = self.userdata, .vtable = &self.vtable };
+        }
+
+        fn concurrent(
+            _: ?*anyopaque,
+            _: usize,
+            _: std.mem.Alignment,
+            _: []const u8,
+            _: std.mem.Alignment,
+            _: *const fn (context: *const anyopaque, result: *anyopaque) void,
+        ) std.Io.ConcurrentError!*std.Io.AnyFuture {
+            return error.ConcurrencyUnavailable;
+        }
+
+        fn netLookup(
+            _: ?*anyopaque,
+            _: std.Io.net.HostName,
+            _: *std.Io.Queue(std.Io.net.HostName.LookupResult),
+            _: std.Io.net.HostName.LookupOptions,
+        ) std.Io.net.HostName.LookupError!void {
+            return error.Canceled;
+        }
+
+        fn operate(userdata: ?*anyopaque, op: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            if (op == .net_write) return error.Canceled;
+            return inner_vtable.operate(userdata, op);
+        }
+    };
+}
+
+test "TcpTransport: no unit of concurrency for the bounded exchange is a TransportFailed, not a Timeout" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var fio: FaultIo(.no_concurrent) = .init(threaded.io());
+    var tcp: TcpTransport = .{ .io = fio.io(), .deny_special_use = false, .timeout_ms = 1000 };
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.TransportFailed, tcp.transport().exchange("127.0.0.1", 9, "x\r\n", &buf));
+}
+
+test "TcpTransport: a cancel that lands while resolving surfaces as Canceled" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var fio: FaultIo(.cancel_lookup) = .init(threaded.io());
+    var tcp: TcpTransport = .{ .io = fio.io(), .deny_special_use = false };
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.Canceled, tcp.transport().exchange("127.0.0.1", 9, "x\r\n", &buf));
+}
+
+test "TcpTransport: a cancel that lands while writing the query surfaces as Canceled, bounded or not" {
+    for ([_]?u32{ null, 5000 }) |timeout_ms| {
+        var threaded = std.Io.Threaded.init(testing.allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        var listener = addr.listen(io, .{}) catch |err| {
+            return testkit.loopbackSkip("whois write-cancel test listen failed ({t})", .{err});
+        };
+        defer listener.deinit(io);
+        const port = listener.socket.address.getPort();
+        var peer: CancelPeer = .{ .io = io, .listener = &listener };
+        const peer_thread = try std.Thread.spawn(.{}, CancelPeer.run, .{&peer});
+        defer peer_thread.join();
+        defer peer.release(port);
+
+        var fio: FaultIo(.cancel_write) = .init(io);
+        var tcp: TcpTransport = .{ .io = fio.io(), .deny_special_use = false, .timeout_ms = timeout_ms };
+        var buf: [64]u8 = undefined;
+        try testing.expectError(error.Canceled, tcp.transport().exchange("127.0.0.1", port, "example.com\r\n", &buf));
+    }
+}
+
+test "TcpTransport: a canceled bounded read (timeout_ms set) surfaces error.Canceled" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("whois bounded cancel test listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: CancelPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, CancelPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.release(port);
+
+    var cue: ReadCueIo = .init(io);
+    var tcp: TcpTransport = .{ .io = cue.io(), .deny_special_use = false, .timeout_ms = 60_000 };
+    var buf: [256]u8 = undefined;
+
+    var fut = try io.concurrent(exchangeOnce, .{ tcp.transport(), "127.0.0.1", port, &buf });
+    const reached = ReadCueIo.awaitReads(io, 1);
+    const result = fut.cancel(io);
+    try testing.expect(reached);
+    try testing.expectError(error.Canceled, result);
+}

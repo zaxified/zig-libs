@@ -6,7 +6,7 @@
 
 **Scope:** mvp — chiavdf (class-group Wesolowski, the deployed VDF), poanetwork/vdf (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-11 · mutation 2026-09-11 · src ?
+**Audit:** review 2026-09-11 · mutation 2026-11-17 (125/145, 20 eq) · src ac0328d61535d035
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget clean for the codec harness; verify at 1/20 and eval at 1/50 of it (10,000 and 4,000 runs, ~200 and ~80 runs/s), VDF_FUZZ) · ct 2026-09-10 (ctgrind)
 
@@ -368,6 +368,15 @@ rather than papered over.
 - **Multi-party "RSA-UFO" trusted-setup ceremony** for a caller-supplied
   `N`. Out of scope; this module documents the caveat and takes `N` as a
   parameter rather than implementing a ceremony.
+
+## Audit 2026-11-17 (whole-module mutation)
+
+145 mutants over every non-test line of `src/vdf.zig` and `src/group.zig`, one schemata build in ReleaseSafe and one run per mutant, baseline first: `eval` (start, tick count, squaring, class representative), `deriveCandidate` (each hashed field, T endianness, the two forced bits), `incrementCandidateByTwo` (step, carry), the sieve (initial and stepped remainders, the divisibility test), `modSmall`, the witness seed, `randomWitness` (the 0, 1 and n-1 exclusions), `shrBytesBe`, `stripLeadingZeros`, `isProbablePrime` (n-1, the 2-adic valuation count, the shift, the pass conditions, the squaring loop bounds, the verdicts, the round count), `pow2Mod`, the `Proof` codec, `prove` (the four input checks, the binding of N/x/y/T, the class representative), `streamingQuotientPow` (every step of the long division and the Horner accumulator), `verify` (the three decode failures, the canonical and identity-class refusals, the binding, `l` and `r`, which exponent goes with which base, the quotient comparison), and in `group.zig` `montPowPublic`, `elementFromBytes`, `negate`, `canonicalize`, `isCanonical` and `isIdentityClass`. Round 1: 110 killed + 2 hung, 33 survived (4 of them were endianness mutants on a `comptime` argument, which a runtime switch cannot reach; they were rebuilt as whole statements and then died). 7 tests were added: carries through 0xff bytes in `incrementCandidateByTwo`; primes with a long run of factors of two in `n-1` (valuation 8, 12, 13, 16, 18); the witnesses 0, 1 and `n-1` redrawn, never used (a scripted witness source yields them first, and 64 liars must not rescue 561); a single round rejected by 91 over 200 seeds; `Proof.toBytes` with a short and a long buffer; `prove` refusing y = 0, y = N, x = 0, x = N and a non-canonical y; and two composites (513 and 1281) that only a full-length 2-adic chain rejects. Round 2 and 3: 125 killed (counting the 2 hangs), 20 do not die, none a defect and none a soundness gap in `verify`:
+
+- EQUIVALENT (16): the index-guard and carry-guard variants of `incrementCandidateByTwo` (a carry off the top byte aborts either way; a zero carry is cost-only); the sieve never rejecting (cost-only: Miller-Rabin rejects the same candidates); the witness mask, the leading-zero strip and its variants, a 65th round, the early composite exit inside the squaring loop (all cost-only); the extra squaring in the Miller-Rabin loop, 2 mutants (it tests a^(n-1) = -1, impossible for an odd n: every prime factor p would need v2(p-1) > v2(n-1), which forces n = 1 mod 2^(v2(n-1)+1)); `prove` reading an unreadable x as 1 (the identity-class check right after refuses it with the same error); `doubled >= l` as `doubled > l` (2r = l never happens, l is an odd prime); `verify` without its non-canonical-y early return (the final comparison against the canonical product refuses it; the guard only saves the hash-to-prime work); and two `montPowPublic` skip-loop variants (an all-zero exponent is base^0 = 1 either way; leading zero octets are cost-only).
+- UNOBSERVABLE (4): the Miller-Rabin witness seed (domain tag, candidate, which 8 bytes, byte order): the verdict depends on the seed only for a composite crafted to fool one specific seeded stream, which is the injection a test would need (2^-128 odds otherwise); the production stream is pinned against the 9-base pseudoprime.
+
+Not mutated: constants (`prime_bits`, `mr_rounds`, `max_search_candidates`, the sieve table, the domain strings, the RSA-2048 hex literal: comptime or pinned by the KATs against an independent oracle), `hashToPrimeUnsieved` and `naiveQuotientPowForTest` (test-only references), asserts, doc comments and the test files. Counts on the card are whole-module (they replace the earlier mutation entry, which carried none).
 
 ## Backlog / deferred
 

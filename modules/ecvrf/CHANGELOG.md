@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — Cleanup, **NO CONSUMER-VISIBLE CHANGE:** `ExpandedSecretKey.prefix` (written, wiped, never read; the nonce re-derives it from the seed) removed with its three wipes; mutation counts on the card are now 88/110 (22 eq). ctgrind counts unchanged, source digests re-taken.
 - **2026-11-17** — Whole-module mutation of `src/ecvrf.zig` and `src/burn.zig` (114 mutants, 88 killed, 26 EQUIVALENT/UNOBSERVABLE; card now carries whole-module counts). 1 test added (a low-order Gamma answers `InvalidProof`). No source change, no behaviour change.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Ported to Zig 0.17.0. Test only: std 0.17 `Edwards25519.fromBytes` itself now rejects x = 0 with the sign bit set, so the kat_test control expects rejection; `decodeProof` result unchanged.
 
