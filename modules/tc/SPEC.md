@@ -6,7 +6,7 @@
 
 **Scope:** mvp — iproute2 tc 6.19 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-17 (123/123) · src 88ac047110ced08a
+**Audit:** review 2026-09-15 · mutation 2026-11-17 (148/148) · src 1a793a20d5388596
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, TC_FUZZ) · ct n/a — traffic control netlink (keyword review, 2026-10-07)
 
@@ -430,7 +430,7 @@ caller-supplied rate/size can panic in ReleaseSafe or wrap in ReleaseFast.
   `skip_hw`/`skip_sw` bits are settable via `Flower.flags` but untested against hardware.
 - **Other qdiscs**: `hfsc` and `red` are modelled since 2026-11-17 (see the done line of item 5); the qdisc-level `hfsc` only (service curves live on classes, not modelled). `QdiscSpec.raw` covers any other kind. (`mq` and `cake`
   are now modelled — see the "mq carries no options" section.)
-- **`red`/`sfq` RED derivation (zig-libs request in the notes of item 5)**: `tc` derives `Wlog`, `Plog`, `Scell_log` and the 256-octet `stab` from `burst`/`avpkt`/`probability`/`bandwidth`; the caller supplies them. Reproducing it needs either iproute2's source (GPL, not read) or a derivation from the kernel's RED paper constants; the man page gives the recipe only in words. Effort: small once a permissively licensed statement of the formulas is at hand.
+- **`red`/`sfq` RED derivation**: `tc` derives `Wlog`, `Plog`, `Scell_log` and the 256-octet `stab` from `burst`/`avpkt`/`probability`/`bandwidth`; the caller supplies them. Reproducing it needs either iproute2's source (GPL, not read) or a derivation from the kernel's RED paper constants; the man page gives the recipe only in words. Effort: small once a permissively licensed statement of the formulas is at hand.
 - **CAKE knobs not modelled**: the built-in RTT/bandwidth *presets* (`datacentre`, `lan`,
   `metro`, `regional`, `internet`, `oceanic`, `satellite`) — these are just CLI shorthands
   that resolve to an `rtt`/`bandwidth` pair on iproute2's side, so set `rtt_us`/`bandwidth`
@@ -584,6 +584,8 @@ reachable through `raw` today:
   admin-up first); htb dumps `HTB_VER` (0x30011) in `tc_htb_glob.version`, of which only
   the high half is the protocol version `tc` sends; and an **empty** shared action table
   answers a dump with `-ENOENT` rather than an empty `NLMSG_DONE`.
+
+**Audit 2026-11-17 (delta mutation, `hfsc`/`red`).** 25 schemata mutants over `appendHfscOptions`/`parseHfscOptions`, `appendRedOptions` (every field index, the flags octet, `stab` length, `MAX_P` presence and value, the `FLAGS` value and selector), `parseRedOptions` (every field, the three length guards) and `buildQdiscSet`'s padding after the options nest, one schemata build, baseline first: 20 killed, 5 survived (the parse side of `plog`, `scell_log`, the historic flags octet and the two length guards: the goldens only re-read `wlog`), killed by `red options readback` (all fields apart, wrong-sized attributes skipped) on the second build. 25/25, 0 equivalent.
 
 **Audit 2026-11-17 (delta mutation, `ingress`/`clsact`).** 3 schemata mutants (the two kind
 strings swapped; `carriesOptions` flipped for both option-less kinds): 3/3 killed by the

@@ -3178,3 +3178,42 @@ test "goldens re-parse: hfsc and red qdiscs" {
     // hfsc options shorter than the qopt are skipped.
     try testing.expect(qdisc.parseHfscOptions("\x01") == null);
 }
+
+test "red options readback: every field apart, wrong-sized attributes skipped" {
+    const codec = @import("netlink").codec;
+    var l: std.ArrayList(u8) = .empty;
+    defer l.deinit(gpa);
+    var parms: [16]u8 = undefined;
+    std.mem.writeInt(u32, parms[0..4], 1001, native_endian);
+    std.mem.writeInt(u32, parms[4..8], 1002, native_endian);
+    std.mem.writeInt(u32, parms[8..12], 1003, native_endian);
+    parms[12] = 4;
+    parms[13] = 5;
+    parms[14] = 6;
+    parms[15] = 7;
+    try codec.appendAttr(gpa, &l, qdisc.TCA_RED.PARMS, &parms);
+    try codec.appendAttrU32(gpa, &l, qdisc.TCA_RED.MAX_P, 99);
+    var fl: [8]u8 = undefined;
+    std.mem.writeInt(u32, fl[0..4], 3, native_endian);
+    std.mem.writeInt(u32, fl[4..8], 15, native_endian);
+    try codec.appendAttr(gpa, &l, qdisc.TCA_RED.FLAGS, &fl);
+    const w = try qdisc.parseRedOptions(l.items);
+    try testing.expectEqual(@as(u32, 1001), w.limit);
+    try testing.expectEqual(@as(u32, 1002), w.qth_min);
+    try testing.expectEqual(@as(u32, 1003), w.qth_max);
+    try testing.expectEqual(@as(u8, 4), w.wlog);
+    try testing.expectEqual(@as(u8, 5), w.plog);
+    try testing.expectEqual(@as(u8, 6), w.scell_log);
+    try testing.expectEqual(@as(u8, 7), w.qopt_flags);
+    try testing.expectEqual(@as(?u32, 99), w.max_p);
+    try testing.expectEqual(@as(?u32, 3), w.flags);
+
+    // Attributes of the wrong size are skipped, not misread.
+    var odd: std.ArrayList(u8) = .empty;
+    defer odd.deinit(gpa);
+    try codec.appendAttr(gpa, &odd, qdisc.TCA_RED.PARMS, &@as([15]u8, @splat(1)));
+    try codec.appendAttr(gpa, &odd, qdisc.TCA_RED.MAX_P, &@as([8]u8, @splat(1)));
+    try codec.appendAttr(gpa, &odd, qdisc.TCA_RED.FLAGS, &@as([12]u8, @splat(1)));
+    const ow = try qdisc.parseRedOptions(odd.items);
+    try testing.expect(ow.limit == 0 and ow.max_p == null and ow.flags == null);
+}
