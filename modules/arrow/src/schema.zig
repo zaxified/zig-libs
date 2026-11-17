@@ -487,6 +487,7 @@ test "schema message round trip: every supported type, nesting, dictionary, meta
         .{ .name = "a", .nullable = false, .type = .{ .float = .double } },
         .{ .name = "b", .type = .utf8 },
     };
+    const entries = [_]Field{.{ .name = "entries", .nullable = false, .type = .@"struct", .children = &kids }};
     const fields = [_]Field{
         .{ .name = "n", .type = .null },
         .{ .name = "i8", .type = .{ .int = .{ .bits = 8, .signed = true } } },
@@ -507,6 +508,8 @@ test "schema message round trip: every supported type, nesting, dictionary, meta
         .{ .name = "lbin", .type = .large_binary },
         .{ .name = "lutf8", .type = .large_utf8 },
         .{ .name = "llist", .type = .large_list, .children = &item },
+        .{ .name = "map", .type = .{ .map = false }, .children = &entries },
+        .{ .name = "sorted_map", .type = .{ .map = true }, .children = &entries },
         .{ .name = "cat", .type = .utf8, .dictionary = .{ .id = 7, .index = .{ .bits = 16, .signed = true }, .ordered = true }, .metadata = &.{.{ .key = "k", .value = "v" }} },
     };
     const s: Schema = .{ .fields = &fields, .metadata = &.{.{ .key = "pandas", .value = "{}" }} };
@@ -650,6 +653,7 @@ test "decoder: big-endian schemas, type parameters the format does not allow, ab
     // Without their tables Date and Duration take Schema.fbs' defaults; NONE is no type.
     try testing.expectEqual(DateUnit.millisecond, (try decodeType(tid.date, null)).date);
     try testing.expectEqual(TimeUnit.millisecond, (try decodeType(tid.duration, null)).duration);
+    try testing.expectEqual(false, (try decodeType(tid.map, null)).map); // keysSorted's default
     try testing.expectError(error.Malformed, decodeType(0, null));
 }
 

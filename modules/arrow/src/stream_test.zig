@@ -1533,7 +1533,12 @@ test "map: read as list<struct<key, value>> under the file's names; null entries
     not_struct.children = &.{};
     var dict_entries = entries;
     dict_entries.dictionary = .{ .id = 0 };
-    for ([_]schema.Field{ nullable_entries, key_nullable, one_field, not_struct, dict_entries }) |e| {
+    var int_pair = entries; // two children, but not a struct
+    int_pair.type = .{ .int = .{ .bits = 32, .signed = true } };
+    const three = [_]schema.Field{ kv_fields[0], kv_fields[1], kv_fields[1] };
+    var three_fields = entries;
+    three_fields.children = &three;
+    for ([_]schema.Field{ nullable_entries, key_nullable, one_field, not_struct, dict_entries, int_pair, three_fields }) |e| {
         const ea = [1]schema.Field{e};
         const bad = try hand(gpa, &mapField(&ea, false), &.{});
         defer gpa.free(bad);
