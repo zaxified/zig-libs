@@ -126,6 +126,15 @@ fn Pippenger(comptime G: type) type {
             const n = bases.len;
             if (n == 0) return J.identity;
             if (n < small_msm) return small(bases, scalars);
+            return runWindow(allocator, bases, scalars, windowBits(n));
+        }
+
+        /// The bucket method with an explicit window width `c` (2..16 are
+        /// meaningful). `run` picks `windowBits(n)`; a test drives every width
+        /// directly, because a width only occurs for a range of `n`.
+        fn runWindow(allocator: std.mem.Allocator, bases: []const A, scalars: []const Fr, c: u5) std.mem.Allocator.Error!J {
+            std.debug.assert(bases.len == scalars.len);
+            const n = bases.len;
 
             // Canonical scalars as little-endian limbs, once.
             const limbs = try allocator.alloc([4]u64, n);
@@ -139,7 +148,6 @@ fn Pippenger(comptime G: type) type {
                 for (0..4) |k| l[k] = std.mem.readInt(u64, be[32 - 8 * (k + 1) ..][0..8], .big);
             }
 
-            const c = windowBits(n);
             const buckets = try allocator.alloc(J, (@as(usize, 1) << c) - 1);
             defer {
                 // Which bases sit in which bucket is the scalars' digits.
@@ -288,4 +296,24 @@ test "digitAt crosses limb boundaries" {
     const l: [4]u64 = .{ 0xF000_0000_0000_0000, 0x5, 0, 0x8000_0000_0000_0000 };
     try std.testing.expectEqual(@as(usize, 0b0101_1111), digitAt(&l, 60, 8));
     try std.testing.expectEqual(@as(usize, 1), digitAt(&l, 255, 4));
+}
+
+test "Pippenger.runWindow: widths that no test size reaches equal the naive sum" {
+    // `run` picks `windowBits(n)`, so the 12-term tests only ever see c = 2..3.
+    // The mutation audit found `scalar_bits` 254 -> 253 survived: it only loses
+    // a window when c divides 253, i.e. c = 11 (n >= 2^14 terms). Driving the
+    // widths directly, with r-1 (every digit populated, bit 253 set) among the
+    // scalars, closes that.
+    const a = std.testing.allocator;
+    const n = 12;
+    var pts: [n]G1.Affine = undefined;
+    var sc: [n]Fr = undefined;
+    testPoints(G1.Affine, G1.Jacobian, &pts, 3);
+    testScalars(&sc, 9);
+    sc[0] = Fr.zero.sub(Fr.one);
+    sc[4] = Fr.zero.sub(frFromU64(2));
+    const want = msmG1(&pts, &sc);
+    for ([_]u5{ 2, 3, 5, 8, 11 }) |c| {
+        try std.testing.expect(g1Eql(try Pippenger(G1).runWindow(a, &pts, &sc, c), want));
+    }
 }

@@ -6,7 +6,7 @@
 
 **Scope:** core — snarkjs 0.7.6 + circom 2.2.3 (reference), rapidsnark v0.0.8, arkworks-rs/groth16 0.6.0 (surveyed 2026-10-05)
 
-**Audit:** review 2026-10-02 · mutation 2026-10-02 · src ?
+**Audit:** review 2026-10-02 · mutation 2026-11-17 (517/566, 49 eq) · src 1e45d499f904a6c5
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, GROTH16_FUZZ) · ct 2026-10-09 (ctgrind)
 
@@ -398,6 +398,64 @@ and `ToxicWaste` variables, the witness vector) are the caller's to wipe;
 `circom.freeWitness` does it for the `parseWitness` result. Out of reach: the `.wtns`
 and `.zkey` file bytes the caller read in.
 
+## Mutation audit (2026-11-17)
+
+**Audit 2026-11-17 (whole-module mutation).** 566 schemata mutants over every production file (`prover`, `msm`, `poly`, `domain`, `fft`, `qap`, `r1cs`,
+`circom`, `ptau`, `snarkjs_bin`, `snarkjs_import`, `snarkjs_export`, `zkey`, `zkprove`, `phase2`, `burn`; ReleaseSafe, one build, each mutant under `ulimit -v`
+and a 30-60 s kill; the 14 wipe and burn mutants also in a ReleaseFast build, the only mode in which `stackprobe_test.zig` runs): **517 killed, 49 equivalent
+or unobservable, 0 open.** Mutated: every guard, bound, length and flag of the readers (`BinFile`, `Cursor`, `r1cs`, `wtns`, `ptau`, `zkey`, the JSON importer
+and exporter), the field/FFT/polynomial arithmetic, the QAP quotient of both provers (toy `prover` and `zkprove`'s coset form), the Pippenger window loop and
+its small-input path, `phase2` (`newZkey` row/domain rule, coefficient and column bookkeeping, the circuit hash, `contribute`, the transcript, `verify`'s ten
+count comparisons, four coefficient fields and every key comparison, `verifyContribution`), and the secret wipes. Not mutated (arid): constants and comptime
+derivations, `ctgrind_harness.zig`, `fuzz_test.zig`, `gate.zig`, the example. The bn254 side of the 2026-11-17 MSM reuse (public `addVartime`/`mixedAddVartime`)
+is counted in that module's card, not here. 415 mutants died on the existing tests; 150 survived, and 102 more (including one added afterwards) were killed by
+the new tests (`src/audit_test.zig`, `qap.zig`, `msm.zig`, `phase2.zig`, second build). What they pin, none of which any earlier test saw: the 2^28-th root of
+unity as the ark-bn254 / snarkjs constant (generators 5 and 7 give the SAME root for every domain up to 2^5, so every fixture here was blind to the choice);
+both bounds of `poly.add/sub` with operands of different length, the empty product, `divByVanishing` at exactly `max_degree`; the QAP divisibility test on a
+circuit whose A, B, C rows differ and on a domain exactly as large as the circuit; every `r1cs`/`ptau`/`zkey`/`wtns` refusal that was only reached through a
+different guard (versions, header and constraint-section trailing bytes, custom-gate sections 4 and 5, exact-fit signal counts, each required `ptau` section,
+a domain of exactly 2^28, a forged coefficient count, accessors one past the last point, field-prime width, `byteLen` overflow, ids 0 and 11 ignored by the
+section-order pass); the JSON importer's u256 overflow in the multiply and in the add, `:` as a digit, the infinity encodings of G1 and G2, a negative
+`nPublic`; `phase2.verify` naming the broken field for each count, coefficient field and key element, with `eqG1`/`eqG2` seen through one coordinate only
+(negated point; x multiplied by a cube root of unity); a contribution transcript pinned by an independent derivation (affine arithmetic and blake2b outside
+this module) so every input of the hash and the domain tag are covered, its `type` equal to snarkjs's, the name length bound; contribution records that
+exactly one guard refuses (`g1_s` at infinity, `delta_after` at infinity, a `g1_sx` that is not s*x: the first two satisfy both pairing ratios); the circuit
+hash pinned (derived from the bytes of `t0.zkey`) and sensitive to each of its six sections; `newZkey` on a circuit with coefficients (domain = next power of
+two of the rows, including a row count that is exactly one, the minimum domain 2, `PtauTooSmall` at the boundary, the coefficient records, and a proof that
+verifies); the Pippenger window widths 2..11 driven directly (`runWindow`, split out of `run` with no behaviour change; the `scalar_bits` 254 -> 253 mutant
+only loses a window at c = 11, i.e. >= 2^14 terms); `zkprove` refusing a 2^28 domain before allocating; and, in optimised builds only, that `freeWitness` and the
+Pippenger bucket array are wiped (`Allocator.free` poisons the block before the allocator sees it in Debug and ReleaseSafe, so only ReleaseFast can tell).
+
+**The 49 survivors**, each with the invariant that makes it equivalent or unobservable (the last three groups cannot be seen by any test):
+
+- *No effect on any result, or cost only (34):* `prover.prove` interpolates C and subtracts it, but C has degree < n and the quotient depends only on the
+  coefficients >= n of A*B, so the whole C path (`c_ev` row, its inverse NTT, the subtraction) is dead work in the toy prover (colEval guard `j >= n`, which
+  `setup` makes unreachable); Pippenger window width (`windowBits`), the zero / +1 / -1 shortcuts and the `n < 8` split are cost-only, the extra top bucket is never
+  written, one extra top window has only zero digits, and `i > j` instead of `i < j` swaps each bit-reversal pair once either way; `divByVanishing` never reads
+  `rem[i >= n]` again and visits each quotient index once; the QAP padding of A and of B is redundant with each other (the product with the other side's zero
+  padding is zero); `r1cs` `n_wires == 0` and the term-bound pre-check are subsumed by the checks after them; `BinFile.get` is only called with constants < 32;
+  `byteLen`'s usize cast is the identity on 64-bit targets; `g1ToBytes`/`g2ToBytes` infinity guards (the identity has zero coordinates); `zkey`'s section-order
+  pass is covered by `BinFile.parse` (duplicates) and `get` (missing); `n_vars == 0` is refused by `n_public >= n_vars`; the b_g2 section size is checked again
+  by `g2SliceUnchecked`; the 78-digit cap of `decimalToBytes` is subsumed by its overflow checks; `zkprove`'s A/B matrix assignment (the quotient of A*B - C with
+  C := A*B is symmetric in A and B); the default MSM choice (`prove` against `proveWith(.constant_time)`, identical proof, 21x slower); `phase2.verify`'s two
+  infinity guards of delta and its delta_g2 subgroup check (each redundant with the other guard, the pairing ratio and `zkey.parse`'s own subgroup check).
+- *Observed by a ctgrind row, not by a test (4):* `zkprove` mapping `.constant_time` to Pippenger (G1, G2) or `.pippenger` to the naive MSM (G1, G2): the same
+  proof, a different instruction trace. Row `zkprove_ct` (6 in-file contexts) would read >= 10, row `zkprove_vt` (positive control, >= 10) would read 0.
+  `ctgrind --check groth16` run once on the final sources: counts unchanged (6 and 54), source digests re-pinned.
+- *Not constructible (4):* `ptau` section 12 and `lagrangeBytes` at power 28 (a power-28 `.ptau` is over 2^29 points, tens of GiB) and `CircuitTooLarge` at 2^29
+  rows (needs > 2^28 constraints).
+- *Wipes shadowed by the entry point's burn (7):* the six `secureZero` defers of `prover.prove` (`a_ev`, `b_ev`, `c_ev`, `ab`, `p`, `h`) and the one of `x_inv` in
+  `contribute`. The array and the inverse live in the body's frame, and `burn.run` zeroes that frame (`prove_burn + n * per_point_burn`, twice the 8n field
+  elements the body keeps; `contribute_burn`) before the entry point returns; the stack probe sees the burn, not the defer. They are belt and braces.
+
+One mutant is only killed in an optimised build: `zkprove` without `@memset(evals, Fr.zero)` survives ReleaseSafe and Debug, because `Allocator.alloc` re-poisons
+every block with the constant byte 0xaa after the allocator returns it, and a constant offset of an evaluation vector cancels out of the quotient
+((A+g)(B+k) - interp((A_i+g)(B_i+k)) = A*B - C): no allocator can make the missing zeroing visible there. In ReleaseFast the test's allocator, which hands out
+varying bytes, does (killed, 2026-11-17 run). The wipes of the freed witness and of the Pippenger buckets (survivors of the existing stack probe, which has no
+needle for a bucket sum and never frees the witness) are killed in ReleaseFast by the new heap test; that test is skipped in Debug and ReleaseSafe like the probe.
+One observation that is not a defect: the toy prover's dead C path above (a speed-only simplification, not applied: that prover is the module's anchor and is
+kept simple on purpose).
+
 ## Backlog / deferred
 
 0. **Secret hygiene beyond the five entry points** (sweep 2026-10-09): the helpers
@@ -417,7 +475,7 @@ Re-ranked by the 2026-10-05 re-survey. Missing and it matters, most-hit first:
 5. **Hash-to-G2 for the contribution proof** (§ 5b item 6): replaces `[h]₂` with a point of unknown discrete log, so a record proves knowledge.
 6. **Positional file source** (A8): readers take bytes in memory. Proving needs only the `.zkey` (hundreds of MB at 10⁶ constraints *(inferred)*), and phase 2 needs a `.ptau` cut to the circuit's power; the full 2²⁸ ceremony file (~150 GB) does not fit. A `readAt` source over `std.Io.File` reading only the levels a circuit needs. Effort: medium.
 7. **Faster `contribute`** (A8): 12 s at 10 000 constraints, one constant-time `scalarMul` + inversion per C/H point; a fixed-window constant-time multiply and batch normalisation should take most of it.
-8. **Domain-size boundary fixture** (provenance review 2026-10-02): `phase2.newZkey`'s rule for a circuit whose row count is exactly a power of two (the `log_n` loop at the top of `newZkey`) is learnable black-box but no committed fixture pins it; a circom circuit landing on the boundary, run through `gen.sh`, would. The 10 000-constraint run is also manual (`gen.sh big`), not committed.
+8. **Domain-size boundary fixture** (provenance review 2026-10-02): `phase2.newZkey`'s rule for a circuit whose row count is exactly a power of two (the `log_n` loop at the top of `newZkey`) is learnable black-box but no committed fixture pins it; a circom circuit landing on the boundary, run through `gen.sh`, would. The 10 000-constraint run is also manual (`gen.sh big`), not committed. (2026-11-17: `src/audit_test.zig` pins this module's own rule, row counts 4 and 16 giving domains 4 and 16 and a row count of 1 giving 2, but against itself, not against snarkjs; the black-box fixture is still wanted.)
 9. **Phase-1 (`.ptau`) contribution and verification**: reading only today; users take a published ceremony (§ 5b item 5).
 10. **Circuit-building API (constraint-synthesis trait or gadget helpers)** (survey 2026-09-30): arkworks (`ark-relations`), bellman and gnark all let users write circuits; here R1CS is assembled by hand or comes from circom. Effort: medium-large. Fits §2.
 

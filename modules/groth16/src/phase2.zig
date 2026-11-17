@@ -479,3 +479,94 @@ test "verifyContribution: a δ that the proof of knowledge does not account for"
     try testing.expect(ratioMatches(rec.g1_s, rec.g1_sx, g2Sp(rec.transcript), rec.g2_spx));
     try testing.expect(!verifyContribution(z, 0));
 }
+
+fn forgeBase(z: *ZKey, x: Fr, s: Fr) !*zkey_mod.Contribution {
+    try contribute(std.testing.allocator, z, &x, &s, "forge");
+    return &z.contributions[0];
+}
+
+test "verifyContribution: records that only a single guard or check rejects" {
+    // Each forgery passes every check but one (the mutation audit found each
+    // of these checks could be removed without a test noticing):
+    //  - g1_s = g1_sx = infinity makes the proof of knowledge trivially true
+    //    (e(inf, .) = 1) — only the `g1_s.infinity` guard refuses it;
+    //  - delta_after = g1_sx = g2_spx = infinity satisfies both ratios — only
+    //    the `delta_after.infinity` guard refuses it;
+    //  - a g1_sx that is not s·x breaks only the first ratio.
+    const testing = std.testing;
+    const x = Fr.reduceWide(&@as([32]u8, @splat(7)));
+    const s = Fr.reduceWide(&@as([32]u8, @splat(9)));
+    const t0 = @embedFile("testdata/snarkjs/t0.zkey");
+
+    var z = try zkey_mod.parse(testing.allocator, t0);
+    defer z.deinit(testing.allocator);
+    const rec = try forgeBase(&z, x, s);
+    try testing.expect(verifyContribution(z, 0));
+    const good = rec.*;
+    const prev = z.circuit_hash;
+    const gen = G1.Affine.generator;
+
+    rec.g1_s = G1.Affine.identity;
+    rec.g1_sx = G1.Affine.identity;
+    rec.transcript = transcriptOf(prev, gen, rec.*);
+    rec.g2_spx = G2.Jacobian.fromAffine(g2Sp(rec.transcript)).scalarMul(x).toAffine();
+    try testing.expect(ratioMatches(rec.g1_s, rec.g1_sx, g2Sp(rec.transcript), rec.g2_spx));
+    try testing.expect(ratioMatches(gen, rec.delta_after, g2Sp(rec.transcript), rec.g2_spx));
+    try testing.expect(!verifyContribution(z, 0));
+
+    rec.* = good;
+    rec.delta_after = G1.Affine.identity;
+    rec.g1_sx = G1.Affine.identity;
+    rec.g2_spx = G2.Affine.identity;
+    rec.transcript = transcriptOf(prev, gen, rec.*);
+    try testing.expect(ratioMatches(rec.g1_s, rec.g1_sx, g2Sp(rec.transcript), rec.g2_spx));
+    try testing.expect(ratioMatches(gen, rec.delta_after, g2Sp(rec.transcript), rec.g2_spx));
+    try testing.expect(!verifyContribution(z, 0));
+
+    rec.* = good;
+    rec.g1_sx = mulG1(Fr.reduceWide(&@as([32]u8, @splat(5))));
+    rec.transcript = transcriptOf(prev, gen, rec.*);
+    rec.g2_spx = G2.Jacobian.fromAffine(g2Sp(rec.transcript)).scalarMul(x).toAffine();
+    try testing.expect(ratioMatches(gen, rec.delta_after, g2Sp(rec.transcript), rec.g2_spx));
+    try testing.expect(!verifyContribution(z, 0));
+}
+
+test "contribute: the record's transcript is the documented hash (independent derivation), type, name bounds" {
+    // The transcript was derived outside this module (Python, 20 lines of
+    // affine arithmetic over the base field plus blake2b):
+    //   blake2b-512("zig-libs groth16 phase2 contribution v1" || prev || G1(delta_before)
+    //   || G1(delta_after) || G1(s*G) || G1(s*x*G) || params), points as the
+    // 64 Montgomery little-endian bytes of the zkey format, params = [1, len, name],
+    // prev = the circuit hash of the key (a first contribution), delta_before = G.
+    // That pins every input of the hash (mutants: each `h.update` dropped, the domain tag included).
+    const testing = std.testing;
+    const t0 = @embedFile("testdata/snarkjs/t0.zkey");
+    const t1 = @embedFile("testdata/snarkjs/t1.zkey");
+    var xb: [32]u8 = undefined;
+    var sb: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&xb, "000000000000000000000000000000001234567890abcdef1234567890abcdef");
+    _ = try std.fmt.hexToBytes(&sb, "00000000000000000000000000000000fedcba0987654321fedcba0987654321");
+    const x = try Fr.fromBytes(xb);
+    const s = try Fr.fromBytes(sb);
+
+    var z = try zkey_mod.parse(testing.allocator, t0);
+    defer z.deinit(testing.allocator);
+    try contribute(testing.allocator, &z, &x, &s, "kat");
+    var want: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, "8f78aeadcd14c662fb5b6952b5bb6fb23c373ddea5f5456878531e79b6b3ca5eeb94116465d79aae49d6e86d7d29a2e23efc18c8d436bafdce1fc0e90ef0f631");
+    try testing.expectEqualSlices(u8, &want, &z.contributions[0].transcript);
+
+    // snarkjs's own record in t1.zkey has the same `type` field value as ours.
+    var t1z = try zkey_mod.parse(testing.allocator, t1);
+    defer t1z.deinit(testing.allocator);
+    try testing.expectEqual(t1z.contributions[0].type, z.contributions[0].type);
+
+    // A name of 255 bytes fits the one-byte length; 256 does not.
+    const long: [256]u8 = @splat('n');
+    var z2 = try zkey_mod.parse(testing.allocator, t0);
+    defer z2.deinit(testing.allocator);
+    try testing.expectError(error.NameTooLong, contribute(testing.allocator, &z2, &x, &s, &long));
+    try testing.expectEqual(@as(usize, 0), z2.contributions.len);
+    try contribute(testing.allocator, &z2, &x, &s, long[0..255]);
+    try testing.expectEqual(@as(usize, 255), z2.contributions[0].name().?.len);
+}

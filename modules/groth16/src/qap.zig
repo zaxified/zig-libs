@@ -148,3 +148,40 @@ test "TEETH: a circuit larger than the domain is REFUSED, not silently truncated
     try std.testing.expect(sys.isSatisfied(&w_ok));
     try std.testing.expect(try checkDivisible(4, sys, &w_ok));
 }
+
+// A circuit whose A, B and C rows are three different linear combinations:
+// w1*w2 = w3 and (w1+w2)*w3 = w4, witness [1, 3, 5, 15, 120]. (The 2026-11-17
+// mutation audit found that no other circuit here told a row's A from its B.)
+const mix_cons = [_]r1cs.Constraint{
+    .{ .a = &.{.{ .index = 1, .coeff = Fr.one }}, .b = &.{.{ .index = 2, .coeff = Fr.one }}, .c = &.{.{ .index = 3, .coeff = Fr.one }} },
+    .{ .a = &.{ .{ .index = 1, .coeff = Fr.one }, .{ .index = 2, .coeff = Fr.one } }, .b = &.{.{ .index = 3, .coeff = Fr.one }}, .c = &.{.{ .index = 4, .coeff = Fr.one }} },
+};
+const mix_good = [_]Fr{ Fr.one, field.frFromU64(3), field.frFromU64(5), field.frFromU64(15), field.frFromU64(120) };
+const mix_bad = [_]Fr{ Fr.one, field.frFromU64(3), field.frFromU64(5), field.frFromU64(15), field.frFromU64(121) };
+
+noinline fn dirtyStack() void {
+    var buf: [48 * 1024]u8 = undefined;
+    for (&buf, 0..) |*byte, i| byte.* = @truncate((i *% 2654435761) >> 7); // varying: a constant offset cancels
+    std.mem.doNotOptimizeAway(&buf);
+}
+
+test "checkDivisible: a circuit exactly as large as the domain, and one row short of it" {
+    // Mutant: `sys.constraints.len > n` -> `>=` refuses a full domain.
+    const sys = r1cs.System{ .num_vars = 5, .constraints = &mix_cons };
+    try std.testing.expect(sys.isSatisfied(&mix_good));
+    try std.testing.expectEqual(true, try checkDivisible(2, sys, &mix_good));
+    try std.testing.expectEqual(false, try checkDivisible(2, sys, &mix_bad));
+    try std.testing.expectEqual(true, try checkDivisible(4, sys, &mix_good));
+    try std.testing.expectError(error.DomainTooSmall, checkDivisible(1, sys, &mix_good));
+}
+
+test "checkDivisible: A, B and C rows are told apart, and padding rows are zero over a dirty stack" {
+    // Mutants: `b_evals[i] = e.b` -> `e.a`; the padding `a_evals[i] = Fr.zero` /
+    // `b_evals[i] = Fr.zero` dropped (the arrays are `undefined`, and the old
+    // stack happened to be zero).
+    const sys = r1cs.System{ .num_vars = 5, .constraints = &mix_cons };
+    @call(.never_inline, dirtyStack, .{});
+    try std.testing.expectEqual(true, try checkDivisible(8, sys, &mix_good));
+    @call(.never_inline, dirtyStack, .{});
+    try std.testing.expectEqual(false, try checkDivisible(8, sys, &mix_bad));
+}
