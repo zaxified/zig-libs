@@ -2510,6 +2510,15 @@ test "encoder hint: a slot names the static index or the entry the field went in
     try testing.expectEqual(@as(u64, 8), enc.recent[0]);
     try testing.expectEqual(Encoder.recent_dynamic + 0, enc.recent[1]);
     try testing.expectEqual(Encoder.recent_none, enc.recent[2]);
+    // The last static index is still static (61 = `www-authenticate: ""`).
+    var last = Encoder.init(gpa, .{});
+    defer last.deinit();
+    try last.encodeBlock(&.{.{ .name = "www-authenticate", .value = "" }}, &out);
+    try testing.expectEqual(@as(u64, static_table.len), last.recent[0]);
+    out.clearRetainingCapacity();
+    try last.encodeBlock(&.{.{ .name = "www-authenticate", .value = "" }}, &out);
+    try testing.expectEqualSlices(u8, &.{0x80 | 61}, out.items);
+    out.clearRetainingCapacity();
     // The same block again: both by index from the hints, the secret raw again.
     out.clearRetainingCapacity();
     try enc.encodeBlock(&block, &out);

@@ -6582,22 +6582,34 @@ test "ResponseWriter: a replaced header reuses its own copy when the new value f
     try rw.setHeader("X-A", "aaaaaaaa");
     try rw.setHeader("X-B", "bbbb");
     const used = rw.header_buf_len;
+    // A respelled name right after another header's copy (X-A's value ends
+    // where X-B's name begins): adjacent is not shared.
+    try rw.setHeader("x-b", "BBBB");
+    try testing.expectEqual(used, rw.header_buf_len);
+    try testing.expectEqualStrings("x-b", rw.headers[1].name);
     // Not the last copy, shorter: rewritten where it was, nothing appended.
     try rw.setHeader("X-A", "zz");
     try testing.expectEqual(used, rw.header_buf_len);
     // Same length, other spelling of the name: the name is rewritten too.
     try rw.setHeader("x-a", "yy");
     try testing.expectEqual(used, rw.header_buf_len);
+    try testing.expectEqualStrings("x-a", rw.headers[0].name);
     // Not the last copy and longer: appended (name and value), as before.
     try rw.setHeader("X-A", "ccccccccc");
     try testing.expectEqual(used + "X-A".len + "ccccccccc".len, rw.header_buf_len);
     // Its own bytes passed back (a trimmed `getHeader`): an overlapping move.
     try rw.setHeader("X-A", rw.getHeader("X-A").?[3..]);
     try testing.expectEqual(used + "X-A".len + "cccccc".len, rw.header_buf_len);
+    // An empty copy at the end of the store grows in place.
+    try rw.setHeader("X-E", "");
+    const before_e = rw.header_buf_len;
+    try rw.setHeader("X-E", "eee");
+    try testing.expectEqual(before_e + 3, rw.header_buf_len);
     try rw.end();
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
         "X-A: cccccc\r\n" ++
-        "X-B: bbbb\r\n" ++
+        "x-b: BBBB\r\n" ++
+        "X-E: eee\r\n" ++
         "Content-Length: 0\r\n" ++
         "\r\n", out.buffered());
 }
@@ -6667,6 +6679,23 @@ test "ResponseWriter: a replaced header whose bytes another entry borrows, or th
     used = rw.header_buf_len;
     try rw.setHeader("x-t", "t");
     try testing.expectEqual(used + "x-t".len + "t".len, rw.header_buf_len);
+    // The same spelling over a static name needs no name copy: the value is
+    // rewritten where it lies (the orphaned bytes again), nothing appended.
+    try rw.setHeaderBorrowed("X-U", try ResponseWriter.HeaderValue.init(rw.header_buf[0..3]));
+    used = rw.header_buf_len;
+    try rw.setHeader("X-U", "u");
+    try testing.expectEqual(used, rw.header_buf_len);
+    // Bytes past the used end of the store are not a copy: a value lent from
+    // there (a shrunk tail's old bytes) is replaced by an append, else the
+    // next copy would overwrite it.
+    try rw.setHeader("X-V", "vvvv");
+    try rw.setHeader("X-V", "");
+    const gone = rw.header_buf_len;
+    try rw.setHeaderBorrowed("X-W", try ResponseWriter.HeaderValue.init(rw.header_buf[gone..][0..4]));
+    try rw.setHeader("X-W", "wxyz");
+    try testing.expectEqual(gone + "X-W".len + "wxyz".len, rw.header_buf_len);
+    try rw.setHeader("X-Z", "1234567");
+    try testing.expectEqualStrings("wxyz", rw.getHeader("X-W").?);
     try rw.end();
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
         "X-A: other\r\n" ++
@@ -6675,6 +6704,10 @@ test "ResponseWriter: a replaced header whose bytes another entry borrows, or th
         "X-M: X-N\r\n" ++
         "X-S: s\r\n" ++
         "x-t: t\r\n" ++
+        "X-U: u\r\n" ++
+        "X-V: \r\n" ++
+        "X-W: wxyz\r\n" ++
+        "X-Z: 1234567\r\n" ++
         "Content-Length: 0\r\n" ++
         "\r\n", out.buffered());
 }
