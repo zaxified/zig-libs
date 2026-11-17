@@ -451,6 +451,19 @@ fi
     && echo "zstd-ref: v1.5.7" || echo "zstd-ref: clone failed"
 echo "::endgroup::"
 
+echo "::group::interop: lz4 CLI + python-lz4 (lz4)"
+# interop-lz4 spawns `lz4` and a bare `python3 -I` importing `lz4.frame` /
+# `lz4.block` plus liblz4 through ctypes; a missing one is ReferenceFailed, not
+# a skip (scheduled run 44076840159: the program was added with no peers here).
+# apt, not pip: Debian's python3-lz4 links the system liblz4 that ctypes loads,
+# so both halves of the oracle are the same library (the program's own claim).
+sudo apt-get install "${APT_QUIET[@]}" lz4 python3-lz4 >/dev/null 2>&1 \
+    && echo "lz4, python3-lz4: OK" || echo "lz4/python3-lz4: install failed"
+command -v lz4 >/dev/null 2>&1 && echo "lz4: $(lz4 --version 2>&1 | head -1)" || echo "lz4: MISSING"
+python3 -I -c 'import lz4.frame, lz4.block; print("python-lz4:", __import__("lz4").__version__)' 2>/dev/null \
+    || echo "python-lz4: MISSING"
+echo "::endgroup::"
+
 echo "::group::interop: Go module caches (jwt tracecontext websocket validate)"
 # The programs build with GOPROXY=off, like sntp/netaddr/router above, so the
 # cache is filled here from each oracle's own go.mod/go.sum.

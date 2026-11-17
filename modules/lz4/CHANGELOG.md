@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** `tools/interop.zig` names the failing reference and prints its stderr instead of a bare `ReferenceFailed`; CI's interop lane now installs the `lz4` CLI and `python3-lz4` the program needs (the scheduled full run failed on their absence).
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** SPEC: Backlog B4 done with the measured before/after table (new section Speed: compress 0.97–1.04×, decompress 0.94–1.10× liblz4 1.10 padded against the JCC erratum; 1.20–1.35× decode unpadded, B6), the Performance line, the compressor's two table layouts, the delta mutation of the speed work (41 mutants: 34 killed, 7 equivalent; Audit cumulative 142/161, 18 eq), two fuzz verdict runs; NOTICE names liblz4's `lz4.c` as the design reference for the techniques.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the decoder's fast loop drops an output-room check its loop condition already makes (delta mutation showed it redundant).
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the encoder capacity test also covers a first sequence with over 20 literal and match length bytes.

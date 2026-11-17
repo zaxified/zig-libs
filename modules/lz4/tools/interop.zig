@@ -91,10 +91,14 @@ const Ctx = struct {
         const r = try c.exec(argv);
         defer c.gpa.free(r.stdout);
         defer c.gpa.free(r.stderr);
-        return switch (r.term) {
+        const ok = switch (r.term) {
             .exited => |code| code == 0,
             else => false,
         };
+        // A reference failure must name the peer and say why, or a CI log
+        // shows only `error: ReferenceFailed` (scheduled run 44076840159).
+        if (!ok) std.debug.print("reference `{s}` failed ({any}): {s}\n", .{ argv[0], r.term, r.stderr });
+        return ok;
     }
 
     fn put(c: *Ctx, name: []const u8, data: []const u8) !void {
