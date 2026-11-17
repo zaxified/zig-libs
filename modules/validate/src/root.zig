@@ -22,7 +22,7 @@
 //!   `hex`, `e164`, `alpha`, `alphanumeric`, `numeric`, `ascii`,
 //!   `lowercase`/`uppercase`, `jwt`, `semver`, `cidr`, `mac` —
 //!   also standalone via `validateFormat`), cross-field rules (`Rule.cross`:
-//!   `eq_field` .. `required_without`) and a `custom` predicate —
+//!   `eq_field` .. `excluded_without_all`) and a `custom` predicate —
 //!   validated against a `std.json.Value`. A JSON array can be the document
 //!   root (`validateJsonRoot`, `[]const T` bodies).
 //!   Every error is **aggregated** into `{ path, code, message }` — never
@@ -525,7 +525,7 @@ pub const Rule = struct {
     /// as for `custom`.
     unique: bool = false,
     /// Cross-field rules: this field against its siblings in the same
-    /// object (go-playground's `eqfield` .. `required_without`). Evaluated
+    /// object (go-playground's `eqfield` .. `excluded_without_all`). Evaluated
     /// when the object is complete, on the tree and the streaming path
     /// alike. Empty = none, and a rule without them behaves exactly as it
     /// did before this field existed. Ignored on `items` element rules
@@ -543,7 +543,10 @@ pub const Rule = struct {
 /// The comparison ops (`eq_field` .. `lte_field`) run only on a present
 /// field that passed its own type gate (a wrong-typed field has its one
 /// `<kind>_type` error and no comparison noise) and is not `null`. The
-/// presence ops (`required_*`) run only when the field is absent.
+/// presence ops (`required_*`, `skip_unless`) run only when the field is
+/// absent; the `excluded_*` ops only when it is present (an explicit `null`
+/// counts, and so does a wrong-typed value: the key is there), and report
+/// the code `excluded` instead of the comparison.
 pub const CrossOp = enum {
     /// The field equals the sibling `other` (code `field_mismatch`). Numbers
     /// compare by value, strings by text, booleans and `null` by identity;
@@ -578,6 +581,37 @@ pub const CrossOp = enum {
     /// Required when ANY `required_without` entry's sibling is absent.
     /// (`requiredWithout`, line 2264.)
     required_without,
+    /// Required when EVERY `required_with_all` entry's sibling is present.
+    /// (`requiredWithAll`.)
+    required_with_all,
+    /// Required when EVERY `required_without_all` entry's sibling is absent.
+    /// (`requiredWithoutAll`.)
+    required_without_all,
+    /// Required when EVERY `skip_unless` entry's sibling holds `value`. go-playground
+    /// v10.30.5 ships `skipUnless` with exactly `requiredIf`'s body (its comment copies
+    /// `requiredUnless`'s): a field that is "skipped" unless the siblings match is, as
+    /// shipped, REQUIRED when they all match and unchecked otherwise. This op does what
+    /// the reference does.
+    skip_unless,
+    /// The field must be ABSENT (`excluded`) when EVERY `excluded_if` entry's sibling
+    /// holds `value`. (`excludedIf`.)
+    excluded_if,
+    /// The field must be absent unless ANY `excluded_unless` entry's sibling holds
+    /// `value`. (`excludedUnless`.)
+    excluded_unless,
+    /// The field must be absent when ANY `excluded_with` entry's sibling is present.
+    /// (`excludedWith`.)
+    excluded_with,
+    /// The field must be absent when EVERY `excluded_with_all` entry's sibling is
+    /// present. (`excludedWithAll`.)
+    excluded_with_all,
+    /// The field must be absent when ANY `excluded_without` entry's sibling is absent.
+    /// go's `excludedWithout` reads ONE field name; several entries mean "any", as
+    /// its doc comment says. (`excludedWithout`.)
+    excluded_without,
+    /// The field must be absent when EVERY `excluded_without_all` entry's sibling is
+    /// absent. (`excludedWithoutAll`.)
+    excluded_without_all,
 };
 
 /// One cross-field entry of `Rule.cross`. Several entries on a rule combine
@@ -1360,6 +1394,72 @@ fn crossOpCode(op: CrossOp) []const u8 {
     };
 }
 
+/// The `excluded_*` ops on a PRESENT field: the first entry that forbids it is
+/// reported (`excluded`, param = that sibling) and the answer is true. go-playground
+/// reports the same as one failed tag per field.
+fn checkExcluded(b: *Builder, path: []const u8, rule: *const Rule, lookup: anytype) Allocator.Error!bool {
+    var has_if: ?*const Cross = null;
+    var all_if = true;
+    var has_unless: ?*const Cross = null;
+    var unless_hit = false;
+    var with_hit: ?*const Cross = null;
+    var has_with_all: ?*const Cross = null;
+    var all_with_present = true;
+    var without_hit: ?*const Cross = null;
+    var has_without_all: ?*const Cross = null;
+    var all_without_absent = true;
+    for (rule.cross) |*c| switch (c.op) {
+        .excluded_if => {
+            if (has_if == null) has_if = c;
+            if (!slotHolds(lookup.get(c.other), c.value)) all_if = false;
+        },
+        .excluded_unless => {
+            if (has_unless == null) has_unless = c;
+            if (slotHolds(lookup.get(c.other), c.value)) unless_hit = true;
+        },
+        .excluded_with => {
+            if (with_hit == null and lookup.get(c.other) != .absent) with_hit = c;
+        },
+        .excluded_with_all => {
+            if (has_with_all == null) has_with_all = c;
+            if (lookup.get(c.other) == .absent) all_with_present = false;
+        },
+        .excluded_without => {
+            if (without_hit == null and lookup.get(c.other) == .absent) without_hit = c;
+        },
+        .excluded_without_all => {
+            if (has_without_all == null) has_without_all = c;
+            if (lookup.get(c.other) != .absent) all_without_absent = false;
+        },
+        else => {},
+    };
+    if (has_if) |c| if (all_if) {
+        try b.appendfParam(path, "excluded", c.other, "Field must be absent when `{s}` is `{s}`", .{ c.other, c.value });
+        return true;
+    };
+    if (has_unless) |c| if (!unless_hit) {
+        try b.appendfParam(path, "excluded", c.other, "Field must be absent unless `{s}` is `{s}`", .{ c.other, c.value });
+        return true;
+    };
+    if (with_hit) |c| {
+        try b.appendfParam(path, "excluded", c.other, "Field must be absent when `{s}` is present", .{c.other});
+        return true;
+    }
+    if (has_with_all) |c| if (all_with_present) {
+        try b.appendfParam(path, "excluded", c.other, "Field must be absent when `{s}` and all other listed fields are present", .{c.other});
+        return true;
+    };
+    if (without_hit) |c| {
+        try b.appendfParam(path, "excluded", c.other, "Field must be absent when `{s}` is absent", .{c.other});
+        return true;
+    }
+    if (has_without_all) |c| if (all_without_absent) {
+        try b.appendfParam(path, "excluded", c.other, "Field must be absent when `{s}` and all other listed fields are absent", .{c.other});
+        return true;
+    };
+    return false;
+}
+
 /// Run `rule.cross` for one member of a complete object. `self` is this
 /// rule's own field; `lookup.get(name)` the siblings. Absent field: the
 /// presence ops may demand it (`missing`) -- unless `rule.required` already
@@ -1373,6 +1473,12 @@ fn checkCross(b: *Builder, path: []const u8, rule: *const Rule, self: CrossSlot,
         var unless_hit = false;
         var with_hit: ?*const Cross = null;
         var without_hit: ?*const Cross = null;
+        var all_skip = true;
+        var has_skip: ?*const Cross = null;
+        var has_with_all: ?*const Cross = null;
+        var all_with_present = true;
+        var has_without_all: ?*const Cross = null;
+        var all_without_absent = true;
         for (rule.cross) |*c| switch (c.op) {
             .required_if => {
                 if (has_if == null) has_if = c;
@@ -1388,6 +1494,18 @@ fn checkCross(b: *Builder, path: []const u8, rule: *const Rule, self: CrossSlot,
             .required_without => {
                 if (without_hit == null and lookup.get(c.other) == .absent) without_hit = c;
             },
+            .skip_unless => {
+                if (has_skip == null) has_skip = c;
+                if (!slotHolds(lookup.get(c.other), c.value)) all_skip = false;
+            },
+            .required_with_all => {
+                if (has_with_all == null) has_with_all = c;
+                if (lookup.get(c.other) == .absent) all_with_present = false;
+            },
+            .required_without_all => {
+                if (has_without_all == null) has_without_all = c;
+                if (lookup.get(c.other) != .absent) all_without_absent = false;
+            },
             else => {},
         };
         if (has_if) |c| if (all_if)
@@ -1398,8 +1516,15 @@ fn checkCross(b: *Builder, path: []const u8, rule: *const Rule, self: CrossSlot,
             return b.appendfParam(path, "missing", c.other, "Field required when `{s}` is present", .{c.other});
         if (without_hit) |c|
             return b.appendfParam(path, "missing", c.other, "Field required when `{s}` is absent", .{c.other});
+        if (has_skip) |c| if (all_skip)
+            return b.appendfParam(path, "missing", c.other, "Field required when `{s}` is `{s}`", .{ c.other, c.value });
+        if (has_with_all) |c| if (all_with_present)
+            return b.appendfParam(path, "missing", c.other, "Field required when `{s}` and all other listed fields are present", .{c.other});
+        if (has_without_all) |c| if (all_without_absent)
+            return b.appendfParam(path, "missing", c.other, "Field required when `{s}` and all other listed fields are absent", .{c.other});
         return;
     }
+    if (try checkExcluded(b, path, rule, lookup)) return;
     if (!crossGated(rule, self)) return;
     for (rule.cross) |*c| {
         const holds = switch (c.op) {
@@ -5283,7 +5408,144 @@ fn writeRequiredField(s: *std.json.Stringify, field: []const u8) std.Io.Writer.E
 
 /// Does `writeCrossMembers` write an `allOf` for these rules?
 fn fieldsWriteAllOf(rules: []const Rule) bool {
-    return hasCrossOp(rules, .required_if) or hasCrossOp(rules, .required_unless) or hasCrossOp(rules, .required_without);
+    return hasCrossOp(rules, .required_if) or hasCrossOp(rules, .required_unless) or hasCrossOp(rules, .required_without) or hasExtraCross(rules);
+}
+
+/// The presence ops added after the first four (`required_*_all`, `skip_unless`,
+/// `excluded_*`): each is an `allOf` item written by `writeExtraCross`.
+fn isExtraOp(op: CrossOp) bool {
+    return switch (op) {
+        .required_with_all, .required_without_all, .skip_unless, .excluded_if, .excluded_unless, .excluded_with, .excluded_with_all, .excluded_without, .excluded_without_all => true,
+        else => false,
+    };
+}
+
+fn hasExtraCross(rules: []const Rule) bool {
+    for (rules) |r| for (r.cross) |c| if (isExtraOp(c.op)) return true;
+    return false;
+}
+
+/// `{"required":[field]}`, or with `forbid` `{"not":{"required":[field]}}`.
+fn writeFieldState(s: *std.json.Stringify, field: []const u8, forbid: bool) std.Io.Writer.Error!void {
+    if (!forbid) return writeRequiredField(s, field);
+    try s.beginObject();
+    try s.objectField("not");
+    try writeRequiredField(s, field);
+    try s.endObject();
+}
+
+/// `{"if":<cond>,"then":<field state>}` around a condition the caller writes.
+fn writeThenState(s: *std.json.Stringify, field: []const u8, forbid: bool) std.Io.Writer.Error!void {
+    try s.objectField("then");
+    try writeFieldState(s, field, forbid);
+}
+
+/// The `allOf` items of the later presence ops of rule `r`. `forbid` ops (the
+/// `excluded_*`) say "the field is absent" where the `required_*` say "present".
+fn writeExtraCross(s: *std.json.Stringify, rules: []const Rule, r: *const Rule) std.Io.Writer.Error!void {
+    // Value ops over all their entries: `if` every sibling holds -> state.
+    for ([_]struct { op: CrossOp, forbid: bool }{ .{ .op = .skip_unless, .forbid = false }, .{ .op = .excluded_if, .forbid = true } }) |k| {
+        var any = false;
+        for (r.cross) |c| if (c.op == k.op) {
+            any = true;
+        };
+        if (!any) continue;
+        try s.beginObject();
+        try s.objectField("if");
+        try s.beginObject();
+        try s.objectField("allOf");
+        try s.beginArray();
+        for (r.cross, 0..) |c, j| {
+            if (c.op != k.op or sameBefore(r, j)) continue;
+            try writeHoldsEntry(s, rules, c);
+        }
+        try s.endArray();
+        try s.endObject();
+        try writeThenState(s, r.field, k.forbid);
+        try s.endObject();
+    }
+    // excluded_unless: the field is absent, or one sibling holds.
+    {
+        var any = false;
+        for (r.cross) |c| if (c.op == .excluded_unless) {
+            any = true;
+        };
+        if (any) {
+            try s.beginObject();
+            try s.objectField("anyOf");
+            try s.beginArray();
+            try writeFieldState(s, r.field, true);
+            for (r.cross, 0..) |c, j| {
+                if (c.op != .excluded_unless or sameBefore(r, j)) continue;
+                try writeHoldsEntry(s, rules, c);
+            }
+            try s.endArray();
+            try s.endObject();
+        }
+    }
+    // Per entry: with -> if the sibling is present, state; without -> state or the sibling is present.
+    for (r.cross, 0..) |c, j| {
+        switch (c.op) {
+            .excluded_with => {
+                if (namedBefore(r, j, c.op, c.other)) continue;
+                try s.beginObject();
+                try s.objectField("if");
+                try writeRequiredField(s, c.other);
+                try writeThenState(s, r.field, true);
+                try s.endObject();
+            },
+            .excluded_without => {
+                if (namedBefore(r, j, c.op, c.other)) continue;
+                try s.beginObject();
+                try s.objectField("anyOf");
+                try s.beginArray();
+                try writeFieldState(s, r.field, true);
+                try writeRequiredField(s, c.other);
+                try s.endArray();
+                try s.endObject();
+            },
+            else => {},
+        }
+    }
+    // The `_all` ops over all their entries: with_all -> if every sibling is
+    // present, state; without_all -> state or some sibling is present.
+    for ([_]struct { op: CrossOp, forbid: bool }{ .{ .op = .required_with_all, .forbid = false }, .{ .op = .excluded_with_all, .forbid = true } }) |k| {
+        var any = false;
+        for (r.cross) |c| if (c.op == k.op) {
+            any = true;
+        };
+        if (!any) continue;
+        try s.beginObject();
+        try s.objectField("if");
+        try s.beginObject();
+        try s.objectField("required");
+        try s.beginArray();
+        for (r.cross, 0..) |c, j| {
+            if (c.op != k.op or namedBefore(r, j, k.op, c.other)) continue;
+            try s.write(c.other);
+        }
+        try s.endArray();
+        try s.endObject();
+        try writeThenState(s, r.field, k.forbid);
+        try s.endObject();
+    }
+    for ([_]struct { op: CrossOp, forbid: bool }{ .{ .op = .required_without_all, .forbid = false }, .{ .op = .excluded_without_all, .forbid = true } }) |k| {
+        var any = false;
+        for (r.cross) |c| if (c.op == k.op) {
+            any = true;
+        };
+        if (!any) continue;
+        try s.beginObject();
+        try s.objectField("anyOf");
+        try s.beginArray();
+        try writeFieldState(s, r.field, k.forbid);
+        for (r.cross, 0..) |c, j| {
+            if (c.op != k.op or namedBefore(r, j, k.op, c.other)) continue;
+            try writeRequiredField(s, c.other);
+        }
+        try s.endArray();
+        try s.endObject();
+    }
 }
 
 fn writeCrossMembers(s: *std.json.Stringify, rules: []const Rule) std.Io.Writer.Error!void {
@@ -5360,6 +5622,7 @@ fn writeCrossMembers(s: *std.json.Stringify, rules: []const Rule) std.Io.Writer.
             try s.endArray();
             try s.endObject();
         }
+        try writeExtraCross(s, rules, r);
     }
     try s.endArray();
 }
@@ -9437,6 +9700,7 @@ test {
 test {
     _ = @import("go_format_test.zig");
     _ = @import("go_rule_test.zig");
+    _ = @import("go_cross_test.zig");
     _ = @import("formats_extra_test.zig");
 }
 
@@ -10067,6 +10331,177 @@ fn expectJsonEq(want: []const u8, rules: []const Rule) !void {
     var w: std.Io.Writer = .fixed(&buf);
     try writeJsonSchema(rules, &w);
     try testing.expectEqualStrings(want, w.buffered());
+}
+
+test "cross: excluded_* — a present field is refused (code excluded, param = the sibling), an absent one never is" {
+    const s = [_]Rule{
+        .{ .field = "a" },
+        .{ .field = "b" },
+        .{ .field = "mode" },
+        .{ .field = "x_if", .cross = &.{ .{ .op = .excluded_if, .other = "mode", .value = "off" }, .{ .op = .excluded_if, .other = "a", .value = "1" } } },
+        .{ .field = "x_unless", .cross = &.{ .{ .op = .excluded_unless, .other = "mode", .value = "on" }, .{ .op = .excluded_unless, .other = "a", .value = "1" } } },
+        .{ .field = "x_with", .cross = &.{ .{ .op = .excluded_with, .other = "a" }, .{ .op = .excluded_with, .other = "b" } } },
+        .{ .field = "x_with_all", .cross = &.{ .{ .op = .excluded_with_all, .other = "a" }, .{ .op = .excluded_with_all, .other = "b" } } },
+        .{ .field = "x_without", .cross = &.{ .{ .op = .excluded_without, .other = "a" }, .{ .op = .excluded_without, .other = "b" } } },
+        .{ .field = "x_without_all", .cross = &.{ .{ .op = .excluded_without_all, .other = "a" }, .{ .op = .excluded_without_all, .other = "b" } } },
+    };
+    // Nothing present: no excluded field is there, so nothing to refuse.
+    try expectBoth("{}", &s, &.{});
+    // excluded_if needs EVERY entry to hold; x_unless is refused only when NO exemption holds.
+    try expectBoth("{\"mode\":\"off\",\"a\":\"1\",\"b\":1,\"x_if\":1}", &s, &.{.{ "x_if", "excluded" }});
+    try expectBoth("{\"mode\":\"off\",\"a\":\"2\",\"b\":1,\"x_if\":1}", &s, &.{});
+    try expectBoth("{\"mode\":\"x\",\"a\":\"2\",\"b\":1,\"x_unless\":1}", &s, &.{.{ "x_unless", "excluded" }});
+    try expectBoth("{\"mode\":\"on\",\"a\":\"2\",\"b\":1,\"x_unless\":1}", &s, &.{});
+    try expectBoth("{\"mode\":\"x\",\"a\":1,\"b\":1,\"x_unless\":1}", &s, &.{});
+    // excluded_with: ANY sibling present; excluded_with_all: EVERY sibling present.
+    try expectBoth("{\"a\":1,\"x_with\":1,\"x_with_all\":1}", &s, &.{.{ "x_with", "excluded" }});
+    try expectBoth("{\"b\":1,\"x_with\":1,\"x_with_all\":1}", &s, &.{.{ "x_with", "excluded" }});
+    try expectBoth("{\"a\":1,\"b\":1,\"x_with_all\":1}", &s, &.{.{ "x_with_all", "excluded" }});
+    // excluded_without: ANY sibling absent; excluded_without_all: EVERY sibling absent.
+    try expectBoth("{\"a\":1,\"x_without\":1,\"x_without_all\":1}", &s, &.{.{ "x_without", "excluded" }});
+    try expectBoth("{\"a\":1,\"b\":1,\"x_without\":1,\"x_without_all\":1}", &s, &.{});
+    try expectBoth("{\"x_without_all\":1}", &s, &.{.{ "x_without_all", "excluded" }});
+    // A present key is present whatever it holds: null and a wrong-typed value are refused too.
+    try expectBoth("{\"a\":1,\"b\":1,\"x_with\":null}", &s, &.{.{ "x_with", "excluded" }});
+    const typed = [_]Rule{
+        .{ .field = "a" },
+        .{ .field = "n", .kind = .int, .cross = &.{.{ .op = .excluded_with, .other = "a" }} },
+    };
+    var r = try validateJson(testing.allocator, "{\"a\":1,\"n\":\"s\"}", &typed);
+    defer r.deinit();
+    try testing.expect(r.find("n") != null); // one error for the field; the type error or the exclusion, never a panic
+}
+
+test "cross: excluded_* message and param name the sibling; code/message overrides apply" {
+    const s = [_]Rule{
+        .{ .field = "a" },
+        .{ .field = "mode" },
+        .{ .field = "f1", .cross = &.{.{ .op = .excluded_if, .other = "mode", .value = "off" }} },
+        .{ .field = "f2", .cross = &.{.{ .op = .excluded_unless, .other = "mode", .value = "on" }} },
+        .{ .field = "f3", .cross = &.{.{ .op = .excluded_with, .other = "a" }} },
+        .{ .field = "f4", .cross = &.{.{ .op = .excluded_with_all, .other = "a" }} },
+        .{ .field = "f5", .cross = &.{.{ .op = .excluded_without, .other = "z" }} },
+        .{ .field = "f6", .cross = &.{.{ .op = .excluded_without_all, .other = "z" }} },
+        .{ .field = "f7", .code = "nope", .message = "go away", .cross = &.{.{ .op = .excluded_with, .other = "a" }} },
+    };
+    var r = try validateJson(testing.allocator, "{\"a\":1,\"mode\":\"off\",\"f1\":1,\"f2\":1,\"f3\":1,\"f4\":1,\"f5\":1,\"f6\":1,\"f7\":1}", &s);
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 7), r.errors.len);
+    const want = [_][3][]const u8{
+        .{ "f1", "mode", "Field must be absent when `mode` is `off`" },
+        .{ "f2", "mode", "Field must be absent unless `mode` is `on`" },
+        .{ "f3", "a", "Field must be absent when `a` is present" },
+        .{ "f4", "a", "Field must be absent when `a` and all other listed fields are present" },
+        .{ "f5", "z", "Field must be absent when `z` is absent" },
+        .{ "f6", "z", "Field must be absent when `z` and all other listed fields are absent" },
+    };
+    for (want) |w| {
+        const e = r.find(w[0]).?;
+        try testing.expectEqualStrings("excluded", e.code);
+        try testing.expectEqualStrings(w[1], e.param);
+        try testing.expectEqualStrings(w[2], e.message);
+    }
+    const o = r.find("f7").?;
+    try testing.expectEqualStrings("nope", o.code);
+    try testing.expectEqualStrings("excluded", o.actual_code);
+    try testing.expectEqualStrings("go away", o.message);
+}
+
+test "cross: required_with_all / required_without_all / skip_unless (as shipped by go-playground: skip_unless is required_if)" {
+    const s = [_]Rule{
+        .{ .field = "a" },
+        .{ .field = "b" },
+        .{ .field = "mode" },
+        .{ .field = "wa", .cross = &.{ .{ .op = .required_with_all, .other = "a" }, .{ .op = .required_with_all, .other = "b" } } },
+        .{ .field = "woa", .cross = &.{ .{ .op = .required_without_all, .other = "a" }, .{ .op = .required_without_all, .other = "b" } } },
+        .{ .field = "su", .cross = &.{ .{ .op = .skip_unless, .other = "mode", .value = "card" }, .{ .op = .skip_unless, .other = "a", .value = "1" } } },
+    };
+    // Nothing present: woa is required (every sibling absent); wa and su are not.
+    try expectBoth("{}", &s, &.{.{ "woa", "missing" }});
+    // required_with_all needs EVERY sibling present.
+    try expectBoth("{\"a\":1,\"woa\":1}", &s, &.{});
+    try expectBoth("{\"a\":1,\"b\":1,\"woa\":1}", &s, &.{.{ "wa", "missing" }});
+    // required_without_all: ONE sibling present is enough to exempt.
+    try expectBoth("{\"b\":1}", &s, &.{});
+    // skip_unless: required when EVERY entry holds, otherwise nothing.
+    try expectBoth("{\"mode\":\"card\",\"a\":\"1\",\"b\":1,\"wa\":1}", &s, &.{.{ "su", "missing" }});
+    try expectBoth("{\"mode\":\"card\",\"a\":\"2\",\"b\":1,\"wa\":1}", &s, &.{});
+    var r = try validateJson(testing.allocator, "{\"mode\":\"card\",\"a\":\"1\",\"b\":1,\"wa\":1}", &s);
+    defer r.deinit();
+    try testing.expectEqualStrings("Field required when `mode` is `card`", r.find("su").?.message);
+    var r2 = try validateJson(testing.allocator, "{\"a\":1,\"b\":1}", &s);
+    defer r2.deinit();
+    try testing.expectEqualStrings("Field required when `a` and all other listed fields are present", r2.find("wa").?.message);
+    var r3 = try validateJson(testing.allocator, "{}", &s);
+    defer r3.deinit();
+    try testing.expectEqualStrings("Field required when `a` and all other listed fields are absent", r3.find("woa").?.message);
+}
+
+test "cross: the later presence ops on a query string and in the schema export" {
+    const q = [_]Rule{
+        .{ .field = "a", .kind = .string },
+        .{ .field = "f", .kind = .string, .cross = &.{.{ .op = .excluded_with, .other = "a" }} },
+        .{ .field = "g", .kind = .string, .cross = &.{.{ .op = .required_without_all, .other = "a" }} },
+    };
+    var bad = try validateQuery(testing.allocator, "a=1&f=2&g=3", &q);
+    defer bad.deinit();
+    try expectError(&bad, "f", "excluded");
+    var gone = try validateQuery(testing.allocator, "x=1", &q);
+    defer gone.deinit();
+    try expectError(&gone, "g", "missing");
+
+    try expectJsonEq(
+        \\{"type":"object","properties":{"a":{"type":"string"},"f":{"type":"string"}},"allOf":[{"if":{"required":["a"]},"then":{"not":{"required":["f"]}}}]}
+    , &.{
+        .{ .field = "a", .kind = .string },
+        .{ .field = "f", .kind = .string, .cross = &.{.{ .op = .excluded_with, .other = "a" }} },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"F":{"type":"string"}},"allOf":[{"anyOf":[{"not":{"required":["F"]}},{"required":["A"]},{"required":["B"]}]}]}
+    , &.{
+        .{ .field = "F", .kind = .string, .cross = &.{ .{ .op = .excluded_without_all, .other = "A" }, .{ .op = .excluded_without_all, .other = "B" } } },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"F":{"type":"string"}},"allOf":[{"if":{"required":["A","B"]},"then":{"required":["F"]}}]}
+    , &.{
+        .{ .field = "F", .kind = .string, .cross = &.{ .{ .op = .required_with_all, .other = "A" }, .{ .op = .required_with_all, .other = "B" } } },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"F":{"type":"string"}},"allOf":[{"anyOf":[{"not":{"required":["F"]}},{"properties":{"A":{"enum":["x",false]}},"required":["A"]}]}]}
+    , &.{
+        .{ .field = "F", .kind = .string, .cross = &.{.{ .op = .excluded_unless, .other = "A", .value = "x" }} },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"F":{"type":"string"}},"allOf":[{"if":{"allOf":[{"properties":{"A":{"enum":["x",false]}},"required":["A"]}]},"then":{"not":{"required":["F"]}}}]}
+    , &.{
+        .{ .field = "F", .kind = .string, .cross = &.{.{ .op = .excluded_if, .other = "A", .value = "x" }} },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"F":{"type":"string"}},"allOf":[{"if":{"allOf":[{"properties":{"A":{"enum":["x",false]}},"required":["A"]}]},"then":{"required":["F"]}}]}
+    , &.{
+        .{ .field = "F", .kind = .string, .cross = &.{.{ .op = .skip_unless, .other = "A", .value = "x" }} },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"F":{"type":"string"}},"allOf":[{"anyOf":[{"not":{"required":["F"]}},{"required":["A"]}]}]}
+    , &.{
+        .{ .field = "F", .kind = .string, .cross = &.{.{ .op = .excluded_without, .other = "A" }} },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"F":{"type":"string"}},"allOf":[{"if":{"required":["A","B"]},"then":{"not":{"required":["F"]}}}]}
+    , &.{
+        .{ .field = "F", .kind = .string, .cross = &.{ .{ .op = .excluded_with_all, .other = "A" }, .{ .op = .excluded_with_all, .other = "B" } } },
+    });
+    try expectJsonEq(
+        \\{"type":"object","properties":{"F":{"type":"string"}},"allOf":[{"anyOf":[{"required":["F"]},{"required":["A"]},{"required":["B"]}]}]}
+    , &.{
+        .{ .field = "F", .kind = .string, .cross = &.{ .{ .op = .required_without_all, .other = "A" }, .{ .op = .required_without_all, .other = "B" } } },
+    });
+    // A repeated sibling is one entry in the schema, as for required_without.
+    try expectJsonEq(
+        \\{"type":"object","properties":{"F":{"type":"string"}},"allOf":[{"if":{"required":["A"]},"then":{"not":{"required":["F"]}}}]}
+    , &.{
+        .{ .field = "F", .kind = .string, .cross = &.{ .{ .op = .excluded_with, .other = "A" }, .{ .op = .excluded_with, .other = "A" } } },
+    });
 }
 
 test "cross: the schema export — required_with is dependentRequired, the other presence ops are allOf items" {

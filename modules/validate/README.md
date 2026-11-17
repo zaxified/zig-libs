@@ -151,7 +151,7 @@ body answers **413**. `Query` + `Body`/`TypedBody` stack on one route — the
 | `custom` predicate | any (after type gate) | rule-supplied (default `custom`) |
 | `fields` | object (nested rules, paths `a.b`) | — |
 | `items` | array (per-element rule, paths `a[i]`) | — |
-| `cross` (see *Cross-field rules*) | object member vs its siblings | `field_mismatch` `field_equal` `greater_than_field` `greater_than_equal_field` `less_than_field` `less_than_equal_field`, `missing` |
+| `cross` (see *Cross-field rules*) | object member vs its siblings | `field_mismatch` `field_equal` `greater_than_field` `greater_than_equal_field` `less_than_field` `less_than_equal_field`, `missing`, `excluded` |
 | `format` (see *Formats*) | string | `format` |
 
 Query/path coercion failures: `int_parsing` / `float_parsing` /
@@ -200,6 +200,11 @@ const rules = [_]validate.Rule{
 | `gt_field` `gte_field` `lt_field` `lte_field` | numbers by value, date-times chronologically, other strings by byte length | `greater_than_field` `greater_than_equal_field` `less_than_field` `less_than_equal_field` |
 | `required_if` / `required_unless` | the field is present when EVERY entry's sibling equals `value` / unless ANY does | `missing` |
 | `required_with` / `required_without` | present when ANY named sibling is present / absent | `missing` |
+| `required_with_all` / `required_without_all` | present when EVERY named sibling is present / absent | `missing` |
+| `skip_unless` | present when EVERY entry's sibling equals `value` (go-playground ships it with `required_if`'s body) | `missing` |
+| `excluded_if` / `excluded_unless` | the field must be ABSENT when EVERY entry's sibling equals `value` / unless ANY does | `excluded` |
+| `excluded_with` / `excluded_without` | absent when ANY named sibling is present / absent | `excluded` |
+| `excluded_with_all` / `excluded_without_all` | absent when EVERY named sibling is present / absent | `excluded` |
 
 "Present" is key presence (an explicit `null` is present). A comparison runs on a present, non-null field
 that passed its own type gate; a missing sibling fails `eq` and the orderings, and passes `ne`. For a typed
