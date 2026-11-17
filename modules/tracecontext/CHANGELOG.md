@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — Behaviour change (reverts the earlier same-day bullet on property escapes): a `%` that is not a valid escape in a Baggage PROPERTY value is accepted again as opaque wire text (owner decision: Java, JS and Python accept it, only Go refuses); the member value still refuses it. The oracle's `property_bad_escape` class is back to be re-decided against its hit count.
 - **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: hand-list mutation of the property-escape check (cumulative 425/450, 25 equivalent) and the Baggage divergence table in SPEC; card hash re-taken.
 - **2026-11-17** — Behaviour change: a `%` that is not a valid `%XX` escape in a Baggage PROPERTY value now makes the member malformed (`Baggage.parse` returns `BadMember`, `parseLenient` skips the member, `put` refuses such property text), as already for the member value; before, property values were passed through unchecked. Matches OpenTelemetry Go; Java, JS and Python treat properties as opaque. The oracle's `property_bad_escape` class has no hits any more and is deleted (923 of 954 cases agree, four classes left); SPEC gains the five-class comparison table against the four OpenTelemetry propagators.
 - **2026-11-17** — Baggage oracle test prints a disagreement only on its failure path (repo stderr gate); card src hash re-taken. NO CONSUMER-VISIBLE CHANGE.

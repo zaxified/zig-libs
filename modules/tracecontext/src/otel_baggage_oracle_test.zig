@@ -38,6 +38,15 @@ const Class = enum {
     /// malformed; §3.5 lets a system remove it ("MAY remove that entry").
     /// We refuse the member (strict) or skip it (lenient).
     empty_property,
+    /// `a=1;p=%zz`: otel refuses a property value with a bad percent escape.
+    /// §3.3.1.4 gives property keys and values "no specific meaning" and
+    /// defines the property value by the `value` production (`*baggage-octet`,
+    /// which holds `%`), and §3.3.1.3's decoding rule (U+FFFD for non-UTF-8)
+    /// is stated for the list-member value only; nothing makes a parser
+    /// refuse. We pass property values through as on the wire (`decodeValue`
+    /// decodes one on request). Stricter is allowed ("MAY remove"), laxer is
+    /// not forbidden.
+    property_bad_escape,
     /// `a=1,a=2`: otel keeps the last of equal keys (a map). §3.3.1.1: "Uniqueness
     /// of keys ... is not guaranteed. The order of duplicate entries SHOULD be
     /// preserved when mutating the list"; we keep every entry in order.
@@ -61,6 +70,29 @@ const Reason = enum { strict_verdict, count, member, string, lenient };
 
 fn isErr(r: anytype) bool {
     return if (r) |_| false else |_| true;
+}
+
+fn badEscapeAt(v: []const u8) bool {
+    var i: usize = 0;
+    while (i < v.len) : (i += 1) {
+        if (v[i] != '%') continue;
+        if (v.len - i < 3 or !std.ascii.isHex(v[i + 1]) or !std.ascii.isHex(v[i + 2])) return true;
+    }
+    return false;
+}
+
+/// True when a property of some member has a `%` that is not an escape.
+fn propertyBadEscape(input: []const u8) bool {
+    var it = mem.splitScalar(u8, input, ',');
+    while (it.next()) |m| {
+        var ps = mem.splitScalar(u8, m, ';');
+        _ = ps.next();
+        while (ps.next()) |p| {
+            const eq = mem.findScalar(u8, p, '=') orelse continue;
+            if (badEscapeAt(p[eq + 1 ..])) return true;
+        }
+    }
+    return false;
 }
 
 /// `input` with every empty property piece (`;` followed by only OWS up to the
@@ -206,6 +238,7 @@ fn classOf(c: vectors.Case, v: Verdict) ?Class {
     var scratch: [baggage.max_len]u8 = undefined;
     switch (reason) {
         .strict_verdict, .lenient => {
+            if (propertyBadEscape(c.input) and !c.ok) return .property_bad_escape;
             // Only the empty property pieces set us apart: without them we
             // agree with otel (strict: accept the same list; lenient: keep its members).
             if (withoutEmptyProperties(&cleaned, c.input)) |t| {
@@ -254,12 +287,11 @@ test "otel baggage oracle: strict, lenient and write agree with OpenTelemetry Go
     };
     if (bad != 0) std.debug.print("{d} unexplained; agree {d}, hits {any}\n", .{ bad, agree, hits });
     try testing.expectEqual(@as(usize, 0), bad);
-    // 2026-11-17: the evidence is agreement (923 of 954); 38 cases fall in
-    // the four classes below (empty_property 16, duplicate_key 3,
-    // property_value_decoded 11, limit_keeps_prefix 1); the 7 cases of the
-    // removed property_bad_escape class agree since 2026-11-17.
+    // 2026-11-17: the evidence is agreement (916 of 954); 38 cases fall in
+    // the five classes below (empty_property 16, property_bad_escape 7,
+    // duplicate_key 3, property_value_decoded 11, limit_keeps_prefix 1).
     try testing.expectEqual(@as(usize, 954), vectors.cases.len);
-    try testing.expectEqual(@as(usize, 923), agree);
-    try testing.expectEqual([n_classes]usize{ 16, 3, 11, 1 }, hits);
+    try testing.expectEqual(@as(usize, 916), agree);
+    try testing.expectEqual([n_classes]usize{ 16, 7, 3, 11, 1 }, hits);
     try testing.expect(accepted >= 150 and rejected >= 400);
 }
