@@ -44,6 +44,12 @@ pub fn compressBound(n: usize) usize {
     return std.math.add(usize, n, n / 255 + 16) catch std.math.maxInt(usize);
 }
 
+/// A little-endian u16 in one load (`readInt` over a 2-byte array is two
+/// byte loads with Zig 0.17.1).
+inline fn read16(b: *const [2]u8) u16 {
+    return std.mem.littleToNative(u16, @as(*align(1) const u16, @ptrCast(b)).*);
+}
+
 fn readLength(src: []const u8, ip: *usize, base: usize) Error!usize {
     var len = base;
     while (true) {
@@ -55,14 +61,87 @@ fn readLength(src: []const u8, ip: *usize, base: usize) Error!usize {
     }
 }
 
+/// The fast loop runs while a token has more than this many input bytes
+/// after it: one 16-byte literal chunk, which also covers the two offset
+/// bytes that follow up to 14 literals.
+const fast_in = 16;
+/// The overshoot a chunked match copy may write past the match's end.
+const wild_room = 32;
+/// ... and while at least this much output room is left: up to 14 literals
+/// and a match of up to 18 bytes (no length bytes) then always leave
+/// `wild_room`, so only a sequence with length bytes needs a room check.
+const fast_out = 64;
+
 /// Decode one block into `out[start..]`. `out[prefix_start..start]` is the
 /// history a match may reach into (the previous blocks of a linked frame);
 /// `prefix_start == start` means none. Returns the end index of the output.
+///
+/// Two loops (liblz4's `LZ4_decompress_generic` was the design reference):
+/// a fast loop while the input and the output are far from their ends, whose
+/// copies are whole 16-byte chunks that may overshoot into bytes the next
+/// sequence overwrites, and the tail loop with exact copies and every
+/// error. The fast loop takes a sequence only when every check passes with
+/// its margins; anything else — a malformed sequence, one too close to an
+/// end — goes back to the sequence's token and leaves the rest of the block
+/// to the tail loop, which decides it with the same rules. So both loops
+/// give the same result for every input, and the fast loop has no error
+/// path and no call.
 pub fn decodeInto(src: []const u8, out: []u8, start: usize, prefix_start: usize) Error!usize {
     std.debug.assert(prefix_start <= start and start <= out.len);
     if (src.len == 0) return error.Truncated;
     var ip: usize = 0;
     var op: usize = start;
+    if (src.len > fast_in and out.len >= fast_out) {
+        const in_end = src.len - fast_in; // ip < in_end: more than fast_in left
+        const out_end = out.len - fast_out; // op <= out_end: fast_out left
+        while (ip < in_end and op <= out_end) {
+            const seq = ip;
+            const token = src[ip];
+            ip += 1;
+            var lit: usize = token >> 4;
+            if (lit != 15) {
+                // Up to 14 literals in one 16-byte chunk; at least 2 input
+                // bytes stay after them, so the offset is there and this is
+                // not the literal-only last sequence.
+                out[op..][0..16].* = src[ip..][0..16].*;
+            } else {
+                lit = readLength(src, &ip, 15) catch {
+                    ip = seq;
+                    break;
+                };
+                // 16 more input bytes than the literals (the chunk
+                // overshoot, the offset) and `fast_out` more output bytes.
+                if (src.len - ip < 16 or src.len - ip - 16 < lit or out.len - op < fast_out or out.len - op - fast_out < lit) {
+                    ip = seq;
+                    break;
+                }
+                var i: usize = 0;
+                while (i < lit) : (i += 16) out[op + i ..][0..16].* = src[ip + i ..][0..16].*;
+            }
+            ip += lit;
+            const mp = op + lit; // where the match goes; out.len - mp >= 50
+            const offset: usize = read16(src[ip..][0..2]);
+            ip += 2;
+            // 1 <= offset <= mp - prefix_start, in one unsigned compare.
+            if (offset -% 1 >= mp - prefix_start) {
+                ip = seq;
+                break;
+            }
+            var ml: usize = (token & 15) + min_match;
+            if (ml == 15 + min_match) {
+                ml = readLength(src, &ip, 15 + min_match) catch {
+                    ip = seq;
+                    break;
+                };
+                if (ml > out.len - mp - wild_room) {
+                    ip = seq;
+                    break;
+                }
+            }
+            wildMatch(out, mp, offset, ml);
+            op = mp + ml;
+        }
+    }
     while (true) {
         if (ip >= src.len) return error.Truncated; // ended after a match
         const token = src[ip];
@@ -101,6 +180,49 @@ pub fn decodeInto(src: []const u8, out: []u8, start: usize, prefix_start: usize)
         } else copyMatch(out, op, offset, ml);
         op += ml;
     }
+}
+
+/// Copy a match of `len` bytes from `op - offset` to `op` in whole 16-byte
+/// chunks, writing up to `wild_room` bytes past its end (the caller has
+/// checked that room). 1 <= offset <= op.
+inline fn wildMatch(out: []u8, op: usize, offset: usize, len: usize) void {
+    const m = op - offset;
+    if (offset >= 16) {
+        // Two chunks cover the common short match; a chunk never overlaps
+        // itself, and one reading what an earlier one wrote reads the right
+        // bytes (the copy runs forwards).
+        out[op..][0..16].* = out[m..][0..16].*;
+        out[op + 16 ..][0..16].* = out[m + 16 ..][0..16].*;
+        if (len > 32) copyLong(out, op, m, len);
+        return;
+    }
+    // A shorter offset repeats the `offset` bytes before `op`: spread them
+    // over a 16-byte pattern once (lanes `i % offset`; the bytes loaded past
+    // `op` are never selected) and store it every `stride` bytes, the largest
+    // multiple of the period that fits in 16.
+    switch (offset) {
+        inline 1...15 => |o| {
+            const stride = o * (16 / o);
+            const mask = comptime blk: {
+                var lanes: [16]i32 = undefined;
+                for (&lanes, 0..) |*l, i| l.* = @intCast(i % o);
+                break :blk lanes;
+            };
+            const v: @Vector(16, u8) = out[m..][0..16].*;
+            const pattern: [16]u8 = @shuffle(u8, v, undefined, mask);
+            var i: usize = 0;
+            while (i < len) : (i += stride) out[op + i ..][0..16].* = pattern;
+        },
+        else => unreachable, // 1 <= offset < 16 here
+    }
+}
+
+/// The rest of a match longer than 32 bytes at an offset of at least 16,
+/// in 16-byte chunks. Out of line: the common short match then keeps the
+/// decoder's loop free of this loop's registers.
+noinline fn copyLong(out: []u8, op: usize, m: usize, len: usize) void {
+    var i: usize = 32;
+    while (i < len) : (i += 16) out[op + i ..][0..16].* = out[m + i ..][0..16].*;
 }
 
 /// Copy `len` bytes from `op - offset` to `op`, overlap allowed (the copy is
@@ -143,12 +265,27 @@ const skip_trigger = 6;
 /// A hash table of input positions, reused across the blocks of a frame.
 pub const Table = [hash_size]u32;
 
+/// liblz4's `LZ4_64Klimit`: a single block shorter than this has every
+/// position below 65536, so `compress` keeps them as u16 in a table of twice
+/// as many entries in the same 16 KiB (liblz4's `byU16` table, hash log 13).
+const small_limit = 65536 + mf_limit - 1;
+const small_hash_log = 13;
+
+/// How a table stores positions: `Entry` per slot, `log` bits of hash.
+fn Layout(comptime Entry: type, comptime log: comptime_int) type {
+    return struct {
+        const Pos = Entry;
+        const Slots = [1 << log]Entry;
+        inline fn hash(v: u32) usize {
+            return @intCast((v *% 2654435761) >> (32 - log));
+        }
+    };
+}
+const Wide = Layout(u32, hash_log);
+const Small = Layout(u16, small_hash_log);
+
 inline fn read32(b: []const u8, i: usize) u32 {
     return std.mem.readInt(u32, b[i..][0..4], .little);
-}
-
-inline fn hash(v: u32) usize {
-    return @intCast((v *% 2654435761) >> (32 - hash_log));
 }
 
 const Sink = struct {
@@ -173,7 +310,75 @@ const Sink = struct {
         try s.byte(@intCast(r));
     }
 
-    fn sequence(s: *Sink, lits: []const u8, offset: ?u16, ml: usize) error{NoSpaceLeft}!void {
+    /// A sequence with a match: literals `buf[anchor..][0..lits]`, then
+    /// `offset` and the match length `ml`. When the room left holds the
+    /// sequence's worst case plus 16 bytes, every byte is written without a
+    /// per-byte room check (liblz4 skips its checks altogether when the
+    /// output holds `LZ4_COMPRESSBOUND`; this is the per-sequence form of
+    /// that); otherwise the checked writer below gives the exact
+    /// `error.NoSpaceLeft`.
+    inline fn matchSequence(s: *Sink, buf: []const u8, anchor: usize, lits: usize, offset: u16, ml: usize) error{NoSpaceLeft}!void {
+        // Token, literal length bytes (at most lits / 255 + 1), literals,
+        // offset, match length bytes (at most ml / 255 + 1); a shift by 7
+        // bounds a division by 255 from above without a multiply.
+        const worst = lits + (lits >> 7) + (ml >> 7) + 5;
+        const room = s.dst.len - s.at;
+        if (room < 16 or room - 16 < worst) return s.sequence(buf[anchor..][0..lits], offset, ml);
+        const d = s.dst;
+        var at = s.at;
+        const token_at = at;
+        at += 1;
+        var token: u8 = undefined;
+        if (lits >= 15) {
+            token = 15 << 4;
+            var r = lits - 15;
+            while (r >= 255) : (r -= 255) {
+                d[at] = 255;
+                at += 1;
+            }
+            d[at] = @intCast(r);
+            at += 1;
+        } else token = @as(u8, @intCast(lits)) << 4;
+        if (lits <= 8) {
+            // One 8-byte chunk. The bytes past the literals are overwritten
+            // by the offset (2) and the block's last sequence (a token and
+            // at least 5 literals) before the encoder returns, so nothing
+            // past the block's end changes. The source has them: a match
+            // starts at most `end - mf_limit`, 12 bytes before the end.
+            d[at..][0..8].* = buf[anchor..][0..8].*;
+        } else if (lits <= 16) {
+            // Two 8-byte chunks, the second ending exactly at the last literal.
+            d[at..][0..8].* = buf[anchor..][0..8].*;
+            d[at + lits - 8 ..][0..8].* = buf[anchor + lits - 8 ..][0..8].*;
+        } else {
+            // 16-byte chunks, the last one ending exactly at the last literal.
+            var i: usize = 0;
+            while (i + 16 < lits) : (i += 16) d[at + i ..][0..16].* = buf[anchor + i ..][0..16].*;
+            d[at + lits - 16 ..][0..16].* = buf[anchor + lits - 16 ..][0..16].*;
+        }
+        at += lits;
+        d[at] = @truncate(offset);
+        d[at + 1] = @truncate(offset >> 8);
+        at += 2;
+        const mcode = ml - min_match;
+        if (mcode >= 15) {
+            token |= 15;
+            var r = mcode - 15;
+            while (r >= 255) : (r -= 255) {
+                d[at] = 255;
+                at += 1;
+            }
+            d[at] = @intCast(r);
+            at += 1;
+        } else token |= @intCast(mcode);
+        d[token_at] = token;
+        s.at = at;
+    }
+
+    /// The checked writer: the block's last sequence, and a sequence near
+    /// the end of `dst`. Out of line, so the encoder's loop does not carry
+    /// its registers.
+    noinline fn sequence(s: *Sink, lits: []const u8, offset: ?u16, ml: usize) error{NoSpaceLeft}!void {
         const ln: u8 = if (lits.len >= 15) 15 else @intCast(lits.len);
         const mcode = if (offset == null) 0 else ml - min_match;
         const mn: u8 = if (mcode >= 15) 15 else @intCast(mcode);
@@ -201,8 +406,22 @@ pub fn encodeRange(
     acceleration: u32,
     dst: []u8,
 ) error{NoSpaceLeft}!usize {
-    std.debug.assert(history_start <= start and start <= end and end <= buf.len);
     std.debug.assert(end <= std.math.maxInt(u32));
+    return encodeWith(Wide, buf, start, end, history_start, table, acceleration, dst);
+}
+
+fn encodeWith(
+    comptime L: type,
+    buf: []const u8,
+    start: usize,
+    end: usize,
+    history_start: usize,
+    table: *L.Slots,
+    acceleration: u32,
+    dst: []u8,
+) error{NoSpaceLeft}!usize {
+    std.debug.assert(history_start <= start and start <= end and end <= buf.len);
+    const hash = L.hash;
     var s: Sink = .{ .dst = dst };
     const n = end - start;
     var anchor = start;
@@ -215,23 +434,35 @@ pub fn encodeRange(
             ip += 1;
         }
         outer: while (true) {
-            // Search for a match.
+            // Search for a match (here ip <= match_limit). The next
+            // position's bytes and hash are read before this probe is
+            // judged, so the two do not wait on each other (liblz4's
+            // `forwardH`); the read is clamped to `match_limit` so it stays
+            // in the block when the search is about to end.
             var misses: u32 = acceleration << skip_trigger;
             var cand: usize = undefined;
+            var v = read32(buf, ip);
+            var h = hash(v);
             while (true) {
-                if (ip > match_limit) break :outer;
-                const v = read32(buf, ip);
-                const h = hash(v);
+                const next = ip + (misses >> skip_trigger);
+                misses += 1;
                 cand = table[h];
                 table[h] = @intCast(ip);
-                if (cand >= history_start and cand < ip and ip - cand <= max_offset and read32(buf, cand) == v) break;
-                ip += misses >> skip_trigger;
-                misses += 1;
+                const vn = read32(buf, @min(next, match_limit));
+                // The table holds only positions already passed (cand < ip):
+                // a candidate is usable when it is in the history and at most
+                // 65535 bytes back.
+                if (cand >= @max(history_start, ip -| max_offset) and read32(buf, cand) == v) break;
+                if (next > match_limit) break :outer;
+                ip = next;
+                v = vn;
+                h = hash(vn);
             }
             // Extend backwards into pending literals.
-            while (ip > anchor and cand > history_start and buf[ip - 1] == buf[cand - 1]) {
-                ip -= 1;
-                cand -= 1;
+            if (ip > anchor and cand > history_start) {
+                const k = backExtend(buf, ip, cand, @min(ip - anchor, cand - history_start));
+                ip -= k;
+                cand -= k;
             }
             // Extend forwards.
             var e = ip + min_match;
@@ -250,7 +481,7 @@ pub fn encodeRange(
                     c += 1;
                 }
             }
-            try s.sequence(buf[anchor..ip], @intCast(ip - cand), e - ip);
+            try s.matchSequence(buf, anchor, ip - anchor, @intCast(ip - cand), e - ip);
             ip = e;
             anchor = ip;
             if (ip > match_limit) break;
@@ -260,6 +491,15 @@ pub fn encodeRange(
     }
     try s.sequence(buf[anchor..end], null, 0);
     return s.at;
+}
+
+/// How many bytes before `ip` equal those before `cand`, at most `max`.
+/// Out of line: inlined, its loop made LLVM step a dozen values derived
+/// from `ip` with it, all spilled.
+noinline fn backExtend(buf: []const u8, ip: usize, cand: usize, max: usize) usize {
+    var k: usize = 0;
+    while (k < max and buf[ip - 1 - k] == buf[cand - 1 - k]) k += 1;
+    return k;
 }
 
 pub const CompressOptions = struct {
@@ -278,8 +518,15 @@ pub fn clampAcceleration(a: u32) u32 {
 /// bytes always fit; with less room `error.NoSpaceLeft` may come back.
 pub fn compress(src: []const u8, dst: []u8, opts: CompressOptions) error{ NoSpaceLeft, InputTooLarge }!usize {
     if (src.len > max_input_size) return error.InputTooLarge;
+    const accel = clampAcceleration(opts.acceleration);
+    if (src.len < small_limit) {
+        // Every position a probe or a seed enters is at most
+        // `src.len - mf_limit` < 65536.
+        var small: Small.Slots = @splat(0);
+        return encodeWith(Small, src, 0, src.len, 0, &small, accel, dst);
+    }
     var table: Table = @splat(0);
-    return encodeRange(src, 0, src.len, 0, &table, clampAcceleration(opts.acceleration), dst);
+    return encodeRange(src, 0, src.len, 0, &table, accel, dst);
 }
 
 // ── tests ───────────────────────────────────────────────────────────────

@@ -14,10 +14,17 @@
 //! `lz4 -b1 -B65536` times: the file cut into 64 KiB pieces, each compressed
 //! as an independent block at the default level (acceleration 1) and each
 //! decompressed back. Ours: `compressBlock` / `decompressBlock` over the same
-//! pieces, the best of `BENCH_ROUNDS` (default 5) passes of at least 200 ms.
+//! pieces, 5 rounds, each timing passes for at least 200 ms.
 //! Ratio = ours / theirs by time per byte (MB/s inverted); below 1 = faster.
+//! Ours is the median of the rounds, its spread (slowest and fastest round)
+//! beside it; theirs is what `lz4 -b` prints (its best iteration).
 //! The compressed sizes are printed beside it (the matchers differ, so the
 //! sizes may too).
+//!
+//! `zig build bench-lz4 -- ours c|d [PASSES]`: ours only, a fixed number of
+//! passes (default 20) over every payload and nothing timed, for counting
+//! instructions with `perf stat -e instructions:u` (an A/B that a loaded
+//! machine's wall time cannot give).
 
 const std = @import("std");
 const lz4 = @import("lz4");
@@ -38,7 +45,20 @@ fn nowNs(io: std.Io) i96 {
     return std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
 }
 
-const Ours = struct { c_mbs: f64, d_mbs: f64, size: usize };
+const Ours = struct { c_mbs: f64, d_mbs: f64, c_lo: f64, c_hi: f64, d_lo: f64, d_hi: f64, size: usize };
+
+const max_rounds = 32;
+
+/// MB/s of the median, slowest and fastest of `ns[0..n]` (ns per pass).
+fn stats(ns: []i96, bytes: f64) [3]f64 {
+    std.mem.sort(i96, ns, {}, std.sort.asc(i96));
+    const f = struct {
+        fn mbs(t: i96, b: f64) f64 {
+            return b / @as(f64, @floatFromInt(t)) * 1e3;
+        }
+    }.mbs;
+    return .{ f(ns[ns.len / 2], bytes), f(ns[ns.len - 1], bytes), f(ns[0], bytes) };
+}
 
 fn measureOurs(io: std.Io, gpa: std.mem.Allocator, plain: []const u8, rounds: usize) !Ours {
     const n_pieces = (plain.len + piece - 1) / piece;
@@ -50,10 +70,10 @@ fn measureOurs(io: std.Io, gpa: std.mem.Allocator, plain: []const u8, rounds: us
     defer gpa.free(back);
     const stride = lz4.compressBlockBound(piece);
 
-    var best_c: i96 = std.math.maxInt(i96);
-    var best_d: i96 = std.math.maxInt(i96);
+    var c_ns: [max_rounds]i96 = undefined;
+    var d_ns: [max_rounds]i96 = undefined;
     var size: usize = 0;
-    for (0..rounds) |_| {
+    for (0..rounds) |round| {
         var reps: usize = 0;
         const t0 = nowNs(io);
         while (true) {
@@ -66,7 +86,7 @@ fn measureOurs(io: std.Io, gpa: std.mem.Allocator, plain: []const u8, rounds: us
             reps += 1;
             if (nowNs(io) - t0 > 200_000_000) break;
         }
-        best_c = @min(best_c, @divTrunc(nowNs(io) - t0, @as(i96, @intCast(reps))));
+        c_ns[round] = @divTrunc(nowNs(io) - t0, @as(i96, @intCast(reps)));
 
         reps = 0;
         const t1 = nowNs(io);
@@ -79,15 +99,46 @@ fn measureOurs(io: std.Io, gpa: std.mem.Allocator, plain: []const u8, rounds: us
             reps += 1;
             if (nowNs(io) - t1 > 200_000_000) break;
         }
-        best_d = @min(best_d, @divTrunc(nowNs(io) - t1, @as(i96, @intCast(reps))));
+        d_ns[round] = @divTrunc(nowNs(io) - t1, @as(i96, @intCast(reps)));
     }
     if (!std.mem.eql(u8, back, plain)) return error.RoundTripFailed;
     const bytes: f64 = @floatFromInt(plain.len);
-    return .{
-        .c_mbs = bytes / @as(f64, @floatFromInt(best_c)) * 1e3,
-        .d_mbs = bytes / @as(f64, @floatFromInt(best_d)) * 1e3,
-        .size = size,
-    };
+    const c = stats(c_ns[0..rounds], bytes);
+    const d = stats(d_ns[0..rounds], bytes);
+    return .{ .c_mbs = c[0], .c_lo = c[1], .c_hi = c[2], .d_mbs = d[0], .d_lo = d[1], .d_hi = d[2], .size = size };
+}
+
+/// The `ours` mode: `passes` untimed passes of one direction over `plain`.
+/// Returns the compressed size (so the work cannot be dropped).
+fn runOurs(gpa: std.mem.Allocator, plain: []const u8, decompress: bool, passes: usize) !usize {
+    const n_pieces = (plain.len + piece - 1) / piece;
+    const stride = lz4.compressBlockBound(piece);
+    const z = try gpa.alloc(u8, n_pieces * stride);
+    defer gpa.free(z);
+    const zlen = try gpa.alloc(usize, n_pieces);
+    defer gpa.free(zlen);
+    const back = try gpa.alloc(u8, plain.len);
+    defer gpa.free(back);
+    var size: usize = 0;
+    for (0..if (decompress) 1 else passes) |_| {
+        size = 0;
+        for (0..n_pieces) |i| {
+            const src = plain[i * piece .. @min(plain.len, (i + 1) * piece)];
+            zlen[i] = try lz4.compressBlock(src, z[i * stride ..][0..stride], .{});
+            size += zlen[i];
+        }
+    }
+    if (decompress) {
+        for (0..passes) |_| {
+            for (0..n_pieces) |i| {
+                const dst = back[i * piece .. @min(plain.len, (i + 1) * piece)];
+                const k = try lz4.decompressBlock(z[i * stride ..][0..zlen[i]], dst);
+                if (k != dst.len) return error.RoundTripFailed;
+            }
+        }
+        if (!std.mem.eql(u8, back, plain)) return error.RoundTripFailed;
+    }
+    return size;
 }
 
 const Theirs = struct { c_mbs: f64, d_mbs: f64, size: usize };
@@ -120,6 +171,21 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     defer threaded.deinit();
     const io = threaded.io();
 
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const args = try init.args.toSlice(arena_state.allocator());
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "ours")) {
+        const dec = std.mem.eql(u8, args[2], "d");
+        const passes = if (args.len >= 4) try std.fmt.parseInt(usize, args[3], 10) else 20;
+        for (payloads) |p| {
+            const plain = try shapes.generate(gpa, p.shape);
+            defer gpa.free(plain);
+            const size = try runOurs(gpa, plain, dec, passes);
+            std.debug.print("{s:<6} {s} x{d} size {d}\n", .{ p.name, if (dec) "decompress" else "compress", passes, size });
+        }
+        return 0;
+    }
+
     const rounds: usize = 5;
     var dir = try std.Io.Dir.cwd().createDirPathOpen(io, work_dir, .{});
     defer dir.close(io);
@@ -147,8 +213,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         const rd = theirs.d_mbs / ours.d_mbs;
         worst_c = @max(worst_c, rc);
         worst_d = @max(worst_d, rd);
-        std.debug.print("{s:<6} compress ours {d:>7.1} MB/s lz4 {d:>7.1} MB/s ratio {d:.2}x | decompress ours {d:>7.1} MB/s lz4 {d:>7.1} MB/s ratio {d:.2}x | size ours {d} lz4 {d}\n", .{
-            p.name, ours.c_mbs, theirs.c_mbs, rc, ours.d_mbs, theirs.d_mbs, rd, ours.size, theirs.size,
+        std.debug.print("{s:<6} compress ours {d:>7.1} MB/s ({d:.1}..{d:.1}) lz4 {d:>7.1} MB/s ratio {d:.2}x | decompress ours {d:>7.1} MB/s ({d:.1}..{d:.1}) lz4 {d:>7.1} MB/s ratio {d:.2}x | size ours {d} lz4 {d}\n", .{
+            p.name,      ours.c_mbs, ours.c_lo, ours.c_hi,    theirs.c_mbs, rc,
+            ours.d_mbs,  ours.d_lo,  ours.d_hi, theirs.d_mbs, rd,           ours.size,
+            theirs.size,
         });
     }
     std.debug.print("worst ratio (ours/theirs time): compress {d:.2}x, decompress {d:.2}x\n", .{ worst_c, worst_d });
