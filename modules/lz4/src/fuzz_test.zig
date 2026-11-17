@@ -606,6 +606,67 @@ pub fn roundtripHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
     }
 }
 
+// ── the decoder's fast loop at the ends ────────────────────────────────
+
+/// `decompressBlock` against `modelDecode` under one capacity.
+fn agreeWithModel(gpa: std.mem.Allocator, src: []const u8, cap: usize) !void {
+    const a = try gpa.alloc(u8, cap);
+    defer gpa.free(a);
+    const b = try gpa.alloc(u8, cap);
+    defer gpa.free(b);
+    const want = modelDecode(src, b);
+    if (lz4.decompressBlock(src, a)) |n| {
+        const w = want orelse return error.ModelRefused;
+        try testing.expectEqual(w, n);
+        try testing.expectEqualSlices(u8, b[0..w], a[0..n]);
+    } else |_| if (want != null) return error.ModelAccepted;
+}
+
+test "block decoder: every prefix and every capacity near the end agree with the model" {
+    // The fast loop hands a sequence to the tail loop when its input or
+    // output margin is short; cutting the block at every byte and the
+    // output at every size near the end puts each margin at its edge (a
+    // margin one byte too generous reads or writes past a slice: a safety
+    // panic in the test build).
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x1a4);
+    const r = prng.random();
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    for (0..16) |_| {
+        list.clearRetainingCapacity();
+        var produced: usize = 0;
+        for (0..6) |_| {
+            const lit: usize = switch (r.uintLessThan(u8, 8)) {
+                0 => 0,
+                1, 2 => r.intRangeAtMost(usize, 15, 40),
+                3 => r.intRangeAtMost(usize, 265, 300),
+                else => r.intRangeAtMost(usize, 1, 14),
+            };
+            const ml: usize = switch (r.uintLessThan(u8, 8)) {
+                0, 1 => r.intRangeAtMost(usize, 19, 40),
+                2 => r.intRangeAtMost(usize, 270, 300),
+                else => r.intRangeAtMost(usize, 4, 18),
+            };
+            const l = if (produced + lit == 0) 1 else lit;
+            try putSeq(&list, gpa, l, ml - 4);
+            for (0..l) |_| try list.append(gpa, r.int(u8));
+            produced += l;
+            const off: u16 = @intCast(r.intRangeAtMost(usize, 1, @min(produced, 40)));
+            try list.append(gpa, @truncate(off));
+            try list.append(gpa, @truncate(off >> 8));
+            if (ml - 4 >= 15) try putLen(&list, gpa, ml - 4 - 15);
+            produced += ml;
+        }
+        const last = r.intRangeAtMost(usize, 0, 20);
+        try putSeq(&list, gpa, last, 0);
+        for (0..last) |_| try list.append(gpa, r.int(u8));
+        produced += last;
+        for (1..list.items.len + 1) |k| try agreeWithModel(gpa, list.items[0..k], produced + 80);
+        for (0..produced + 81) |cap| try agreeWithModel(gpa, list.items, cap);
+    }
+}
+
 // ── drivers ─────────────────────────────────────────────────────────────
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {

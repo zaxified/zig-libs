@@ -605,6 +605,87 @@ test "block: a match may reach into the history prefix and no further" {
     try testing.expectEqualStrings("llollol!", out[2..10]);
 }
 
+test "block: the fast loop's offset check against the history prefix" {
+    // A sequence the fast loop takes (enough input and output left): three
+    // literals and an 8-byte match whose offset is 0, reaches the oldest
+    // history byte exactly, or one byte before the history.
+    var hist: [256]u8 = undefined;
+    for (&hist, 0..) |*c, i| c.* = @truncate(i *% 7 +% 3);
+    const start = 100;
+    const prefix_start = 40;
+    const oldest = start + 3 - prefix_start;
+    for ([_]usize{ 0, oldest, oldest + 1 }) |off| {
+        var out = hist;
+        var src: [1 + 3 + 2 + 2 + 20]u8 = undefined;
+        src[0] = 0x34; // 3 literals, match length 4 + 4
+        @memcpy(src[1..4], "xyz");
+        src[4] = @truncate(off);
+        src[5] = @truncate(off >> 8);
+        src[6] = 0xf0; // the last sequence: 15 + 5 literals
+        src[7] = 5;
+        @memset(src[8..], 'q');
+        const r = decodeInto(&src, &out, start, prefix_start);
+        if (off == oldest) {
+            try testing.expectEqual(@as(usize, start + 3 + 8 + 20), try r);
+            try testing.expectEqualSlices(u8, hist[prefix_start..][0..8], out[start + 3 ..][0..8]);
+        } else try testing.expectError(error.BadOffset, r);
+    }
+}
+
+test "block: the encoder writes nothing past its output, and NoSpaceLeft exactly when it does not fit" {
+    const gpa = testing.allocator;
+    const shapes = @import("shapes.zig");
+    var prng = std.Random.DefaultPrng.init(9);
+    const r = prng.random();
+    // Text, noisy text, runs, and literal runs of 300 bytes between matches
+    // (literal length bytes).
+    var lits: [4000]u8 = undefined;
+    for (&lits, 0..) |*c, i| c.* = if (i % 400 < 300) r.int(u8) else "matchmatch"[i % 10];
+    const inputs = [_]shapes.Shape{
+        .{ .name = "text", .kind = .text, .len = 3000 },
+        .{ .name = "noisy", .kind = .noisy_text, .len = 3000, .param = 8 },
+        .{ .name = "runs", .kind = .runs, .len = 3000, .param = 300 },
+    };
+    var bufs: [inputs.len + 1][]u8 = undefined;
+    for (inputs, 0..) |shape, i| bufs[i] = try shapes.generate(gpa, shape);
+    bufs[inputs.len] = try gpa.dupe(u8, &lits);
+    defer for (bufs) |b| gpa.free(b);
+    for (bufs) |input| {
+        const full = try gpa.alloc(u8, compressBound(input.len));
+        defer gpa.free(full);
+        const z = try compress(input, full, .{});
+        const dst = try gpa.alloc(u8, z + 64);
+        defer gpa.free(dst);
+        var cap = z -| 48;
+        while (cap <= z + 48) : (cap += 1) {
+            @memset(dst, 0xa5);
+            if (compress(input, dst[0..cap], .{})) |n| {
+                try testing.expectEqual(z, n);
+                try testing.expectEqualSlices(u8, full[0..z], dst[0..z]);
+                for (dst[z..]) |c| try testing.expectEqual(@as(u8, 0xa5), c);
+            } else |e| {
+                try testing.expectEqual(error.NoSpaceLeft, e);
+                try testing.expect(cap < z);
+            }
+        }
+    }
+}
+
+test "block: the u16 table up to liblz4's 64 KiB limit" {
+    // Zeros, then 12 other bytes: one match ends exactly at the last
+    // position a match may start (`len - 12`), so the search probes and
+    // enters that position: 65535 for the last length that takes the u16
+    // table, 65536 for the first that does not.
+    const gpa = testing.allocator;
+    for ([_]usize{ small_limit - 2, small_limit - 1, small_limit, small_limit + 1 }) |len| {
+        const input = try gpa.alloc(u8, len);
+        defer gpa.free(input);
+        @memset(input, 0);
+        for (input[len - 12 ..], 1..) |*c, i| c.* = @intCast(i);
+        try roundTrip(input, 1);
+    }
+}
+
 test "block: compressBound matches liblz4's macro" {
     try testing.expectEqual(@as(usize, 16), compressBound(0));
     try testing.expectEqual(@as(usize, 272), compressBound(255));
