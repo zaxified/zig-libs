@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-09-07 · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DTLS_FUZZ: `dtls-keyupdate` added 2026-11-13, not yet budget-run; `dtls-handshake` PSK / HelloRetryRequest cookie / (EC)DHE with one flight damaged, `dtls-record`, `dtls-wire`; certificate-authenticated flights not driven) · ct 2026-10-10 (ctgrind: PSK through a full handshake — AES-128-GCM-SHA256 and, since 2026-11-13, AES-256-GCM-SHA384 with a SHA-384 PSK — record keys through send/recv; `hs` 174 (123 until 2026-11-13: +51 the SHA-384 handshake's transcript hashing of decrypted messages; 120 before the ALPN parse, 119 before the `transcript.writeHeader` guard) / `app` 13 (23 until 2026-11-13: the same sites counted once, the harness's suite loop no longer unrolled; AES-256-GCM added) / `ku` 21 (22 until 2026-11-13, same reason; KeyUpdate both ways + exporter, traffic and exporter secrets tainted) in-file, none a branch on a key — constant-time-check verdicts and processing of decrypted content) · DTLS 1.2 (2026-11-13): fuzz `dtls12-handshake` (PSK, ECDHE_PSK, PSK behind a HelloVerifyRequest, ECDHE_ECDSA; one datagram damaged / random / dropped / duplicated) and `dtls12-wire` (the `messages12` decoders) added, not yet budget-run; ctgrind `hs12` 53 (96 until 2026-11-17: the 1.2 reassembly of the decrypted Finished moved into `handshake.Reassembler`, and memcheck's four-IP duplicate rule now merges the per-call-site and per-mode copies of each site, since `handleFlightBody`/`takeFragment`/`feed` are frames of their own; every vanished context mapped one by one, no new kind of site — table in `scripts/checks/ctgrind-expected.tsv`) (PSK tainted through PSK and ECDHE_PSK handshakes, the server's ECDHE key through an ECDHE_ECDSA AES-256-GCM-SHA384 one) / `app12` 3 (record keys tainted, three AEADs) in-file — the Finished and AEAD tag verdicts and the parsing of the decrypted Finished; the PRF, premaster and ECDH add none
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DTLS_FUZZ: `dtls-keyupdate` added 2026-11-13, not yet budget-run; `dtls-handshake` PSK / HelloRetryRequest cookie / (EC)DHE with one flight damaged, `dtls-record`, `dtls-wire`; certificate-authenticated flights not driven) · ct 2026-10-10 (ctgrind: PSK through a full handshake — AES-128-GCM-SHA256 and, since 2026-11-13, AES-256-GCM-SHA384 with a SHA-384 PSK — record keys through send/recv; `hs` 174 (123 until 2026-11-13: +51 the SHA-384 handshake's transcript hashing of decrypted messages; 120 before the ALPN parse, 119 before the `transcript.writeHeader` guard) / `app` 13 (23 until 2026-11-13: the same sites counted once, the harness's suite loop no longer unrolled; AES-256-GCM added) / `ku` 21 (22 until 2026-11-13, same reason; KeyUpdate both ways + exporter, traffic and exporter secrets tainted) in-file, none a branch on a key — constant-time-check verdicts and processing of decrypted content) · DTLS 1.2 (2026-11-13): fuzz `dtls12-handshake` (PSK, ECDHE_PSK, PSK behind a HelloVerifyRequest, ECDHE_ECDSA; one datagram damaged / random / dropped / duplicated; since 2026-11-17 also fragmented at `max_datagram_len` 128..600 and two datagrams of a flight swapped, 40,000 runs clean) and `dtls12-wire` (the `messages12` decoders) added, not yet budget-run; ctgrind `hs12` 53 (96 until 2026-11-17: the 1.2 reassembly of the decrypted Finished moved into `handshake.Reassembler`, and memcheck's four-IP duplicate rule now merges the per-call-site and per-mode copies of each site, since `handleFlightBody`/`takeFragment`/`feed` are frames of their own; every vanished context mapped one by one, no new kind of site — table in `scripts/checks/ctgrind-expected.tsv`) (PSK tainted through PSK and ECDHE_PSK handshakes, the server's ECDHE key through an ECDHE_ECDSA AES-256-GCM-SHA384 one) / `app12` 3 (record keys tainted, three AEADs) in-file — the Finished and AEAD tag verdicts and the parsing of the decrypted Finished; the PRF, premaster and ECDH add none
 **Performance:** not measured
 
 **Known defects:** none recorded
@@ -540,6 +540,19 @@ server flight delivered reversed and duplicated (one pass, no retransmit),
 mutual auth's client flight fragmented, a fragmented retransmission, whole
 messages reversed inside one datagram, the forged-fragment flood, and
 `record.nextDatagram` at its boundaries.
+
+**Fuzz (2026-11-17, fragmentation and reordering).** `dtls12-handshake` now
+sets `max_datagram_len` (128..600) on both sides in half its cases and in
+every `reorder` case, delivers each flight datagram by datagram
+(`record.nextDatagram`), and gains a sixth fault, two datagrams of one flight
+swapped. Undamaged or duplicated, fragmented or not, the pair must connect; a
+reordered pair need not (an epoch-1 record ahead of its ChangeCipherSpec may
+be dropped, RFC 6347 §4.1, and the harness has no retransmission timer), but
+must not panic and, when it connects, must agree on keys. Reach pins
+`fragmented_connected` and `reordered_connected` within 160 seeds. Verdict:
+40,000 runs clean in 9.2 s (ReleaseSafe driver), 15,331 fragmented and 359
+reordered handshakes connected. The Smith (`--fuzz`) path is unchanged: its
+input is the first datagram.
 
 **Live peer (2026-11-17).** `tools/interop.zig` + `tools/wolfssl_peer.c`
 (modes `12-server-*` / `12-client-*`, `wolfDTLSv1_2_*_method`) run fifteen

@@ -5,10 +5,17 @@
 //! (`DTLS_FUZZ=<runs>[,<first seed>]`, `_ONLY=<name>`):
 //! - `dtls12-handshake`: a whole `Connection12` handshake (PSK, ECDHE_PSK,
 //!   PSK behind a HelloVerifyRequest, ECDHE_ECDSA with a certificate) where
-//!   ONE datagram on the way is damaged, replaced by random bytes, dropped
-//!   or duplicated. Undamaged (or duplicated): both sides connect. Damaged:
-//!   never a panic, and a pair that does connect agrees on its keys and
-//!   moves a record both ways.
+//!   ONE flight on the way is damaged, replaced by random bytes, dropped,
+//!   duplicated or (2026-11-17) has two of its datagrams swapped. Half the
+//!   cases also set `max_datagram_len` (128..600) on both sides, so flights
+//!   are fragmented (RFC 6347 §4.2.3) and delivered datagram by datagram
+//!   (`record.nextDatagram`), driving the reassembly and the queue for
+//!   later messages. Undamaged or duplicated, fragmented or not: both sides
+//!   connect. Damaged or reordered: never a panic, and a pair that does
+//!   connect agrees on its keys and moves a record both ways (a reordered
+//!   flight need not connect: an epoch-1 record ahead of its
+//!   ChangeCipherSpec may be dropped, RFC 6347 §4.1, and there is no
+//!   retransmission timer here).
 //! - `dtls12-wire`: the 1.2 message decoders (`messages12`: ClientHello,
 //!   HelloVerifyRequest, ServerHello, Certificate, ServerECDHParams, the
 //!   PSK opaque fields, digitally-signed, CertificateRequest, the point
@@ -22,6 +29,7 @@ const conn13 = @import("Connection.zig");
 const c12 = @import("Connection12.zig");
 const m12 = @import("messages12.zig");
 const suite12 = @import("suite12.zig");
+const record = @import("record.zig");
 const cert_kat = @import("certauth_kat_vectors.zig");
 const certverify = @import("tls13").certverify;
 
@@ -72,15 +80,54 @@ fn expectEstablished(client: *Connection12, server: *Connection12) !void {
     if (!std.mem.eql(u8, "server to client", try client.recv(r2, &plain))) return error.RecordLost;
 }
 
-const HsMark = fz.Marker(enum { connected, refused, stalled, after_damage_connected, hvr, ecdsa });
+const HsMark = fz.Marker(enum { connected, refused, stalled, after_damage_connected, hvr, ecdsa, fragmented_connected, reordered_connected });
+
+/// Delivers one flight to `peer` as the datagrams `max_len` cuts it into
+/// (one datagram when 0), with two of them (`swap`, taken modulo the
+/// datagram count, made distinct) exchanged when there are at least two. Returns the first non-empty reply, copied into `reply`;
+/// `swapped` tells whether a swap happened.
+fn deliver(peer: *Connection12, flight_bytes: []const u8, max_len: u16, swap: ?[2]u8, rnd: conn13.Entropy, reply: []u8, swapped: *bool) ![]const u8 {
+    var parts: [32][]const u8 = undefined;
+    var n: usize = 0;
+    var rest = flight_bytes;
+    while (n < parts.len) {
+        const d = record.nextDatagram(rest, max_len);
+        parts[n] = d.datagram;
+        n += 1;
+        rest = d.rest;
+        if (rest.len == 0) break;
+    }
+    if (rest.len != 0) parts[n - 1] = flight_bytes[@intFromPtr(parts[n - 1].ptr) - @intFromPtr(flight_bytes.ptr) ..];
+    swapped.* = false;
+    if (swap) |sw| if (n >= 2) {
+        const i = sw[0] % n;
+        var j = sw[1] % n;
+        if (j == i) j = (i + 1) % n;
+        std.mem.swap([]const u8, &parts[i], &parts[j]);
+        swapped.* = true;
+    };
+    var got: []const u8 = reply[0..0];
+    var out: [8192]u8 = undefined;
+    for (parts[0..n]) |d| {
+        const res = try peer.handleFlight(d, rnd, 0, &out);
+        if (got.len == 0 and res.out.len != 0) {
+            @memcpy(reply[0..res.out.len], res.out);
+            got = reply[0..res.out.len];
+        }
+    }
+    return got;
+}
 
 pub fn fuzzHandshake12(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     _ = gpa;
     // Full-range `value(u64)` reduced by hand, not a ranged draw (check-fuzz-reach R1).
     const mode: Mode = @fromBackingInt(@intCast(src.value(u64) % 4));
-    const cfg = configs(mode);
-    var client = try Connection12.clientInit(cfg[0]);
-    var server = try Connection12.serverInit(cfg[1]);
+    var cfg = configs(mode);
+    // Fragmentation: the driver only (the Smith input stays the first
+    // datagram, check-fuzz-reach).
+    var max_len: u16 = 0;
+    if (S == fuzz_driver.Rng and src.valueRangeAtMost(u8, 0, 1) == 1)
+        max_len = conn13.min_max_datagram_len + src.valueRangeAtMost(u16, 0, 472);
     // `--fuzz` (Smith): the input is the first datagram itself, drawn first
     // in one call (check-fuzz-reach); the handshake randomness is fixed.
     var raw: [2048]u8 = undefined;
@@ -90,19 +137,29 @@ pub fn fuzzHandshake12(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerr
     var csprng = std.Random.DefaultCsprng.init(seed);
     const rnd: conn13.Entropy = .{ .seeded_for_test = csprng.random() };
 
-    const Kind = enum { none, damage, random, drop, duplicate };
+    const Kind = enum { none, damage, random, drop, duplicate, reorder };
     var kind: Kind = .random;
     var at: usize = 0;
+    var swap: [2]u8 = .{ 0, 0 };
     if (S == fuzz_driver.Rng) {
-        kind = switch (src.valueRangeAtMost(u8, 0, 9)) {
+        kind = switch (src.valueRangeAtMost(u8, 0, 11)) {
             0, 1, 2 => .none,
             3, 4, 5, 6 => .damage,
             7 => .random,
             8 => .drop,
-            else => .duplicate,
+            9 => .duplicate,
+            else => .reorder,
         };
         at = src.valueRangeAtMost(u8, 0, 4);
+        swap = .{ src.value(u8), src.value(u8) };
+        // A swap needs a flight of several datagrams.
+        if (kind == .reorder and max_len == 0) max_len = conn13.min_max_datagram_len + src.valueRangeAtMost(u16, 0, 472);
     }
+    cfg[0].max_datagram_len = max_len;
+    cfg[1].max_datagram_len = max_len;
+    var client = try Connection12.clientInit(cfg[0]);
+    var server = try Connection12.serverInit(cfg[1]);
+    var reordered = false;
     var bufs: [2][8192]u8 = undefined;
     var cur: []const u8 = client.startHandshake(rnd, 0, &bufs[0]) catch return;
     var to_server = true;
@@ -128,27 +185,33 @@ pub fn fuzzHandshake12(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerr
         };
         const peer: *Connection12 = if (to_server) &server else &client;
         const out = &bufs[(step + 1) % 2];
-        const res = peer.handleFlight(msg, rnd, 0, out) catch {
+        var swapped = false;
+        const sw: ?[2]u8 = if (step == at and kind == .reorder) swap else null;
+        const reply = deliver(peer, msg, max_len, sw, rnd, out, &swapped) catch {
             err_seen = true;
             break;
         };
+        if (swapped) reordered = true;
         if (step == at and kind == .duplicate) {
             var dup: [8192]u8 = undefined;
-            _ = peer.handleFlight(msg, rnd, 0, &dup) catch {};
+            var ignored = false;
+            _ = deliver(peer, msg, max_len, null, rnd, &dup, &ignored) catch {};
         }
         if (client.isConnected() and server.isConnected()) break;
-        if (res.out.len == 0) break;
-        cur = res.out;
+        if (reply.len == 0) break;
+        cur = reply;
         to_server = !to_server;
     }
     if (client.isConnected() and server.isConnected()) {
         try expectEstablished(&client, &server);
         if (changed) HsMark.mark(.after_damage_connected) else HsMark.mark(.connected);
+        if (max_len != 0 and !changed and !reordered) HsMark.mark(.fragmented_connected);
+        if (reordered and !changed) HsMark.mark(.reordered_connected);
         if (mode == .psk_hvr and !changed) HsMark.mark(.hvr);
         if (mode == .ecdsa and !changed) HsMark.mark(.ecdsa);
     } else {
-        if ((kind == .none or kind == .duplicate) and S == fuzz_driver.Rng) {
-            std.debug.print("dtls12-handshake: an undamaged handshake did not connect (mode {t}, kind {t}, client {t}, server {t})\n", .{ mode, kind, client.state, server.state });
+        if ((kind == .none or kind == .duplicate or (kind == .reorder and !reordered)) and S == fuzz_driver.Rng) {
+            std.debug.print("dtls12-handshake: an undamaged handshake did not connect (mode {t}, kind {t}, max_datagram_len {d}, client {t}, server {t})\n", .{ mode, kind, max_len, client.state, server.state });
             return error.GenuineHandshakeFailed;
         }
         if (err_seen) HsMark.mark(.refused) else HsMark.mark(.stalled);
