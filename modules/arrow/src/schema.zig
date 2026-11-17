@@ -22,9 +22,9 @@ pub const Precision = enum(i16) { half = 0, single = 1, double = 2 };
 
 pub const IntType = struct { bits: u8, signed: bool };
 
-/// The logical types this module reads and writes. `unsupported` keeps the
-/// union id of a type it does not (Interval, Union, Map, RunEndEncoded, the
-/// view types), so a reader can name it.
+/// The logical types this module reads and writes (`run_end_encoded` is read only).
+/// `unsupported` keeps the union id of a type it does not (Interval, Union, Map,
+/// the view types), so a reader can name it.
 pub const Type = union(enum) {
     null,
     int: IntType,
@@ -44,6 +44,8 @@ pub const Type = union(enum) {
     large_binary,
     large_utf8,
     large_list,
+    /// Two children: `run_ends` (Int16/32/64) and `values`.
+    run_end_encoded,
     unsupported: u8,
 };
 
@@ -91,6 +93,7 @@ const tid = struct {
     const large_binary = 19;
     const large_utf8 = 20;
     const large_list = 21;
+    const run_end_encoded = 22;
 };
 
 // ── decoding ────────────────────────────────────────────────────────────────
@@ -241,6 +244,7 @@ fn decodeType(id: u8, tt: ?fb.Table) Error!Type {
         tid.large_binary => .large_binary,
         tid.large_utf8 => .large_utf8,
         tid.large_list => .large_list,
+        tid.run_end_encoded => .run_end_encoded,
         0 => error.Malformed, // NONE
         else => .{ .unsupported = id },
     };
@@ -338,6 +342,7 @@ fn typeId(t: Type) ?u8 {
         .large_binary => tid.large_binary,
         .large_utf8 => tid.large_utf8,
         .large_list => tid.large_list,
+        .run_end_encoded => tid.run_end_encoded,
         .unsupported => null,
     };
 }

@@ -443,3 +443,43 @@ test "hostile decimals: a Decimal256 / Decimal32 node longer than its buffer all
         try testing.expect(got.peak < 1 << 20);
     }
 }
+
+test "hostile run-end encoding: one run of 2^22 rows from a few bytes stops at max_cells before it is expanded" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const kids = [_]schema.Field{
+        .{ .name = "run_ends", .nullable = false, .type = .{ .int = .{ .bits = 32, .signed = true } } },
+        .{ .name = "values", .type = .utf8 },
+    };
+    const fields = [_]schema.Field{.{ .name = "r", .type = .run_end_encoded, .children = &kids }};
+    const make = struct {
+        fn f(g: Allocator, rows: i32, value: []const u8) ![]u8 {
+            var ends: [4]u8 = undefined;
+            std.mem.writeInt(i32, &ends, rows, .little);
+            var offs: [8]u8 = undefined;
+            std.mem.writeInt(i32, offs[0..4], 0, .little);
+            std.mem.writeInt(i32, offs[4..8], @intCast(value.len), .little);
+            return st.hand(g, &fields, &.{.{ .length = rows, .nodes = &.{ .{ .length = rows, .null_count = 0 }, .{ .length = 1, .null_count = 0 }, .{ .length = 1, .null_count = 0 } }, .bufs = &.{ "", &ends, "", &offs, value } }});
+        }
+    }.f;
+    // One 64-byte value behind 2^22 rows: 2^22 selectors and 2^28 bytes of copies.
+    const value: [64]u8 = @splat('v');
+    const big = try make(gpa, 1 << 22, &value);
+    defer gpa.free(big);
+    const got = try streamUnderCap(big, .{ .max_cells = (1 << 22) + 100 }, 8 << 20);
+    try testing.expectEqual(@as(?anyerror, error.LimitExceeded), got.err);
+    try testing.expect(got.peak < 1 << 20);
+    // The copies are charged per byte too: 2^20 rows fit 2^22 slots, their 2^26 bytes do not.
+    const mid = try make(gpa, 1 << 20, &value);
+    defer gpa.free(mid);
+    const got2 = try streamUnderCap(mid, .{ .max_cells = 1 << 22 }, 48 << 20);
+    try testing.expectEqual(@as(?anyerror, error.LimitExceeded), got2.err);
+    // A run of 4096 rows reads.
+    const small = try make(gpa, 4096, &value);
+    defer gpa.free(small);
+    const f = try stream.readStream(a, small, .{});
+    try testing.expectEqual(@as(usize, 4096), f.len);
+    try testing.expectEqualStrings(&value, f.columnAt(0).get(4095).text);
+}

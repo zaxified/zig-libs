@@ -79,6 +79,8 @@ const sets = [_]Set{
     set(c21, "decimal64", true, .exact),
     // Decimal256 of precision 37..69 at scale 5: past 38 digits at 12, so lossy.
     set(c21, "decimal256", true, .lossy),
+    // RunEndEncoded (Int16/32/64 run ends over int32, utf8, float32, bool), expanded.
+    set(c21, "run_end_encoded", true, .exact),
 };
 
 /// Sets with a type `dataframe` has no column for (or a codec the collection lacks):
@@ -222,9 +224,15 @@ const Oracle = struct {
 
     /// The column `dataframe` declares for a field: name, type, zone, width, inner columns.
     fn expectColumn(o: *const Oracle, field: J, col: df.Column) !void {
-        if (!std.mem.eql(u8, str(field, "name"), col.name)) return o.fail(field, "name {s}", .{col.name});
+        return o.expectColumnNamed(field, col, str(field, "name"));
+    }
+
+    fn expectColumnNamed(o: *const Oracle, field: J, col: df.Column, want_name: []const u8) anyerror!void {
+        if (!std.mem.eql(u8, want_name, col.name)) return o.fail(field, "name {s}", .{col.name});
         const t = get(field, "type").?;
         const name = str(t, "name");
+        // A run-end encoded column reads as a plain column of its values' type.
+        if (std.mem.eql(u8, name, "runendencoded")) return o.expectColumnNamed(items(field, "children")[1], col, want_name);
         const dict_text = get(field, "dictionary") != null and (std.mem.eql(u8, name, "utf8") or std.mem.eql(u8, name, "largeutf8"));
         const want: df.ColumnType = if (dict_text) .categorical else if (std.mem.eql(u8, name, "int")) blk: {
             const bits = try jint(get(t, "bitWidth").?);
@@ -271,6 +279,15 @@ const Oracle = struct {
         const t = get(field, "type").?;
         const name = str(t, "name");
         const data = items(cj, "DATA");
+        if (std.mem.eql(u8, name, "runendencoded")) {
+            // Row i is the value of the first run whose end exceeds i.
+            const kids = items(field, "children");
+            const kc = items(cj, "children");
+            const run = for (items(kc[0], "DATA"), 0..) |e, j| {
+                if (try jint(e) > i) break j;
+            } else return o.fail(field, "row past the last run end", .{});
+            return o.expectCell(kids[1], kc[1], run, got, true);
+        }
         if (std.mem.eql(u8, name, "null")) return o.expectNull(field, got);
         if (std.mem.eql(u8, name, "bool")) {
             if (got != .bool or got.bool != data[i].bool) return o.fail(field, "{any}, want {}", .{ got, data[i].bool });
@@ -417,6 +434,13 @@ fn expectFieldMetadata(fields: []const J, got: []const stream.FieldMetadata, nam
     }
 }
 
+fn hasRunEnds(fields: []const J) bool {
+    for (fields) |f| {
+        if (std.mem.eql(u8, typeName(f), "runendencoded") or hasRunEnds(items(f, "children"))) return true;
+    }
+    return false;
+}
+
 fn expectMetadata(json: J, md: stream.Metadata, names: bool) !void {
     const sch = get(json, "schema").?;
     try expectKeyValues(items(sch, "metadata"), md.schema);
@@ -489,17 +513,20 @@ test "golden: apache/arrow-testing integration files read field by field equal t
 
         // What this module writes of the frame (and of its metadata) reads back equal,
         // plain and compressed.
+        // (A run-end encoded field is written back plain, without its two children, so its
+        // field metadata no longer has their shape: those sets are written without it.)
+        const same_shape = !hasRunEnds(items(get(json, "schema").?, "fields"));
         for ([_]stream.Compression{ .none, .zstd }) |c| {
-            const wo: stream.WriteOptions = .{ .compression = c, .rows_per_batch = 8, .schema_metadata = md.schema, .field_metadata = md.fields };
+            const wo: stream.WriteOptions = .{ .compression = c, .rows_per_batch = 8, .schema_metadata = md.schema, .field_metadata = if (same_shape) md.fields else &.{} };
             var bmd: stream.Metadata = .{};
             const back = try stream.writeStream(gpa, f, wo);
             defer gpa.free(back);
             try st.expectSameFrame(f, try stream.readStream(a, back, .{ .metadata = &bmd }));
-            try expectMetadata(json, bmd, false);
+            if (same_shape) try expectMetadata(json, bmd, false);
             const fback = try stream.writeFile(gpa, f, wo);
             defer gpa.free(fback);
             try st.expectSameFrame(f, try stream.readFile(a, fback, .{ .metadata = &bmd }));
-            try expectMetadata(json, bmd, false);
+            if (same_shape) try expectMetadata(json, bmd, false);
         }
     }
 }

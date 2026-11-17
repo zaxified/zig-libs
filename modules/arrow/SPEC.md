@@ -143,7 +143,7 @@ deterministic fuzz driver, with a read that ends in an error and never in a cras
 golden files compared with their JSON through an oracle written from the JSON's own encoding; pure Zig with
 ZSTD built in both ways, no C, no `libarrow`. Nothing here is a measured lead, so the scope is not `ahead`.
 **Where we are behind** (all in Backlog): the types the format has and `dataframe` has no column for (Map, Union,
-Interval, run-end, the view types, ListView) are refused; LZ4_FRAME, the
+Interval, the view types, ListView) are refused; LZ4_FRAME, the
 other codec every Arrow implementation but this one has and the default of pyarrow's Feather writer, is refused
 (waits for an `lz4` module); dictionary replacement and a dictionary nested in a list or struct are refused; there is no
 zero-copy or memory-mapped read, no incremental reader or writer over `std.Io` (the input and the
@@ -165,8 +165,8 @@ hostile stream ends in an error, within the limits below, never in a crash or an
 **Not here:** the Arrow C data interface (sharing buffers with another library in the same process), Flight
 (RPC), compute kernels, a columnar in-memory representation of its own (the reader decodes into `dataframe`'s
 storage and copies every buffer — no zero-copy views over the input), Parquet, the JSON integration format as an
-output, and the types `dataframe` has no column for (Interval, Union, Map, RunEndEncoded, the view types) —
-those are refused (`Unsupported`). Decimal32 / Decimal64 / Decimal256 are read (as `decimal`), never written. LZ4_FRAME body compression is refused until the
+output, and the types `dataframe` has no column for (Interval, Union, Map, the view types) — those are
+refused (`Unsupported`). RunEndEncoded is read expanded into a plain column, never written. Decimal32 / Decimal64 / Decimal256 are read (as `decimal`), never written. LZ4_FRAME body compression is refused until the
 collection has an LZ4 codec (deferred, not refused for good).
 
 ## Wire format / algorithm
@@ -209,6 +209,7 @@ per read) after checking each declared length against `zstd.decompressBound` and
 | `struct` (`inner`) | Struct | — |
 | `.nulls` storage with no declaration (a list's elements) | Null | Null → `text` with no storage (what `readJson` gives an all-null column) |
 | `boxed` storage | `Unsupported` (no Arrow type short of a dense union) | — |
+| (the values' column) | — | RunEndEncoded (Int16/32/64 run ends) → the values' type, runs expanded |
 
 A dictionary over a non-text type (Int64 values, say) is read as a plain column of that type. Each dictionary-encoded
 column gets its own id, its whole dictionary written once before the first record batch.
@@ -285,7 +286,7 @@ scales, hex binary, dictionary indices, offsets; dates by Hinnant's `civil_from_
 Sets: `custom_metadata`, `dictionary`, `dictionary_unsigned`, `duplicate_fieldnames`, `extension`, `nested`,
 `nested_large_offsets`, `null`, `null_trivial`, `primitive`, `primitive_large_offsets`, `primitive_no_batches`,
 `primitive_zerolength`, `recursive_nested`, and from `2.0.0-compression` `zstd` and `uncompressible_zstd`
-(ZSTD body compression), from `cpp-21.0.0` `decimal32` and `decimal64`; `datetime`, `decimal` and (from
+(ZSTD body compression), from `cpp-21.0.0` `decimal32`, `decimal64` and `run_end_encoded`; `datetime`, `decimal` and (from
 `cpp-21.0.0`) `decimal256` are `Unsupported` by default and compared under `lossy` (the Decimal256 oracle parses
 the JSON's 77-digit values as i256).
 Stream and file read equal, each file batch has its JSON batch's length, and the frame this module writes back
@@ -362,8 +363,9 @@ batch past 2 GiB, each needing that many bytes in memory. No finding.
   compute) for separate modules if a consumer ever needs them.
 - **LZ4_FRAME — superseded by something external:** waits for an `lz4` codec module in the collection; writing
   LZ4 is not planned even then (ZSTD is what Arrow C++ and arrow-rs recommend).
-- **Reading the types `dataframe` has no column for — never as such.** Interval, Union, Map, RunEndEncoded and
-  the view types would need new `dataframe` column kinds first.
+- **Reading the types `dataframe` has no column for — never as such.** Interval, Union, Map and the view types
+  would need new `dataframe` column kinds first. (RunEndEncoded is read, but only as the plain column it encodes;
+  writing it would need a run-end column kind.)
 
 ## Open
 
@@ -428,7 +430,11 @@ competing libraries and cheap enough to finish in one wave; none of them is star
 - **Map on read as `list<struct<key, value>>`** (a Map is physically a list of a two-field struct). The frame
   keeps the data but not the "map" tag: a write back is a List of Struct. Owner call on fidelity before doing it
   (a `lossy`-only option is the conservative form). Effort: ~0.5 wave.
-- **RunEndEncoded on read**, expanded into a plain column (`run_ends` Int16/32/64 must be strictly increasing and
+- ✅ 2026-11-17 **RunEndEncoded on read.** Done as sketched: the column reads as its values' type, each batch's
+  runs expanded (run ends signed Int16/32/64, positive, strictly increasing, the last EQUAL to the batch length,
+  no nulls on the run ends or the parent: `Malformed` otherwise); the expansion is checked against `max_cells`
+  before its selectors are allocated and then charged per row and copied byte. Anchored on the `cpp-21.0.0`
+  `run_end_encoded` golden. Was: expanded into a plain column (`run_ends` Int16/32/64 must be strictly increasing and
   end at the length; the expansion is charged to `max_cells`). Effort: ~0.5 wave.
 - ✅ 2026-11-17 **Column projection.** Done: `ReadOptions.columns` picks top-level columns by name or by index,
   in the order given (`error.UnknownColumn` for a name no field or two fields have, an index past the last, a

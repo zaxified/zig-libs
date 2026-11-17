@@ -18,7 +18,7 @@ https://github.com/apache/arrow-testing at commit
 `data/arrow-ipc-stream/integration/`. The files are the Arrow integration
 "golden" files written by Arrow C++: an IPC stream (`.stream`), an IPC file
 (`.arrow_file`) and the Arrow integration JSON describing the same data
-(`.json.gz`). 68 files, 665 611 bytes in all:
+(`.json.gz`). 71 files, 673 495 bytes in all:
 
   - `src/testdata/1.0.0-littleendian/` — from `1.0.0-littleendian/`:
       * all three files of `generated_<set>` for the sets custom_metadata,
@@ -36,7 +36,7 @@ https://github.com/apache/arrow-testing at commit
     `generated_lz4.stream`.
   - `src/testdata/cpp-21.0.0/` — from `cpp-21.0.0/` (taken 2026-11-17, same
     commit): all three files of `generated_<set>` for the sets decimal32,
-    decimal64, decimal256.
+    decimal64, decimal256, run_end_encoded.
 
 Not taken: the other sets and versions of the directory, and everything else
 in the repository.

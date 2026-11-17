@@ -153,7 +153,7 @@ const us_per_day: i64 = 86_400 * df.timestamp_units_per_second;
 const ms_per_day: i64 = 86_400_000;
 
 /// The physical layouts both directions handle.
-const Kind = enum { null_, i8, i16, i32, i64, u8, u16, u32, u64, f16, f32, f64, bool_, dec, date32, date64, time32, time64, ts, dur, var32, var64, fsb, dict, list32, list64, fsl, struct_ };
+const Kind = enum { null_, i8, i16, i32, i64, u8, u16, u32, u64, f16, f32, f64, bool_, dec, date32, date64, time32, time64, ts, dur, var32, var64, fsb, dict, list32, list64, fsl, struct_, ree };
 
 // ── writer ──────────────────────────────────────────────────────────────────
 
@@ -527,7 +527,7 @@ const Writer = struct {
                 try w.pushNode(bo, sel.len, bits);
                 for (wf.children) |*c| try w.writeArray(bo, c, sel);
             },
-            .f16, .date64, .time32, .fsb, .list64 => return error.Unsupported, // never planned
+            .f16, .date64, .time32, .fsb, .list64, .ree => return error.Unsupported, // never planned
         }
     }
 };
@@ -873,6 +873,12 @@ const Reader = struct {
         if (r.cells > r.opts.max_cells) return error.LimitExceeded;
     }
 
+    /// Whether `n` more slots fit `ReadOptions.max_cells` (checked before allocating for
+    /// work that `gather` charges after).
+    fn afford(r: *const Reader, n: u64) Error!void {
+        if (r.cells +| n > r.opts.max_cells) return error.LimitExceeded;
+    }
+
     fn plan(r: *Reader, f: schema.Field, ctr: *Counter, depth: usize, in_dict: bool) Error!RField {
         if (depth >= schema.max_depth) return error.Malformed;
         var rf: RField = .{ .kind = .null_, .col = .{ .name = try r.a.dupe(u8, f.name), .type = .text }, .node_ix = ctr.nodes, .buf_ix = ctr.bufs };
@@ -1033,6 +1039,25 @@ const Reader = struct {
                 }
                 rf.children = kids;
                 rf.col.inner = inner;
+            },
+            .run_end_encoded => {
+                // No buffers of its own; `run_ends` (signed Int16/32/64, no nulls) and `values`.
+                // Read as a plain column of the values' type, the runs expanded.
+                if (f.children.len != 2) return error.Malformed;
+                const ends = f.children[0];
+                if (ends.dictionary != null or ends.children.len != 0) return error.Malformed;
+                switch (ends.type) {
+                    .int => |it| if (!it.signed or it.bits < 16) return error.Malformed,
+                    else => return error.Malformed,
+                }
+                bufs = 0;
+                rf.kind = .ree;
+                const kids = try r.a.alloc(RField, 2);
+                for (kids, f.children) |*k, cf| k.* = try r.plan(cf, ctr, depth + 1, in_dict);
+                rf.children = kids;
+                const name = rf.col.name;
+                rf.col = kids[1].col;
+                rf.col.name = name;
             },
             .unsupported => return error.Unsupported,
         }
@@ -1219,6 +1244,7 @@ const Reader = struct {
             if (n > r.opts.max_rows) return error.LimitExceeded;
         }
         if (rf.kind == .null_) return .nulls;
+        if (rf.kind == .ree) return r.runEnded(rf, chunks, n);
         var valid = try r.validity(rf, chunks, n);
         return switch (rf.kind) {
             .null_ => .nulls,
@@ -1295,6 +1321,7 @@ const Reader = struct {
             .var32, .var64, .fsb => try r.text(rf, chunks, n, valid),
             .dict => try r.dictColumn(rf, chunks, n, valid),
             .list32, .list64, .fsl => try r.list(rf, chunks, n, valid),
+            .ree => unreachable, // returned above
             .struct_ => blk: {
                 for (chunks) |c| {
                     const len = c.rb.nodes[rf.node_ix].length;
@@ -1337,6 +1364,62 @@ const Reader = struct {
             },
             else => return r.raw(i128, rf, chunks, n, valid.*),
         }
+    }
+
+    /// A RunEndEncoded column expanded into a plain one: row `i` of a batch is the value of
+    /// the first run whose end exceeds `i`. Run ends must be positive, strictly increasing
+    /// and end at the batch's length, with no nulls (nulls live in the values); the parent
+    /// has no validity of its own. The expansion (one selector per row, then the copy)
+    /// is charged to `max_cells` before it is allocated.
+    fn runEnded(r: *Reader, rf: *const RField, chunks: []const Chunk, n: usize) Error!ColumnData {
+        const ends_f = &rf.children[0];
+        const vals_f = &rf.children[1];
+        var runs: usize = 0;
+        for (chunks) |c| {
+            const ends = c.rb.nodes[ends_f.node_ix];
+            if (c.rb.nodes[rf.node_ix].null_count != 0 or ends.null_count != 0) return error.Malformed;
+            if (ends.length != c.rb.nodes[vals_f.node_ix].length) return error.Malformed;
+            runs += try r.rows(ends);
+            if (runs > r.opts.max_rows) return error.LimitExceeded;
+        }
+        // `plan` admitted signed Int16/32/64 only.
+        const ends: []const i64 = switch (ends_f.kind) {
+            inline .i16, .i32 => |k| blk: {
+                const narrow = try r.raw(RawOf(k), ends_f, chunks, runs, null);
+                const wide = try r.a.alloc(i64, runs);
+                for (wide, narrow) |*w, x| w.* = x;
+                break :blk wide;
+            },
+            else => try r.raw(i64, ends_f, chunks, runs, null),
+        };
+        // Every run end checked before the expansion is sized.
+        var at: usize = 0;
+        for (chunks) |c| {
+            const len = c.rb.nodes[rf.node_ix].length;
+            const k: usize = @intCast(c.rb.nodes[ends_f.node_ix].length);
+            var prev: i64 = 0;
+            for (ends[at..][0..k]) |e| {
+                if (e <= prev) return error.Malformed; // not strictly increasing (or not positive)
+                prev = e;
+            }
+            if (prev != len) return error.Malformed; // the last run must end at the length
+            at += k;
+        }
+        try r.afford(n);
+        const sel = try r.a.alloc(usize, n);
+        var row: usize = 0;
+        at = 0;
+        for (chunks) |c| {
+            const k: usize = @intCast(c.rb.nodes[ends_f.node_ix].length);
+            const base = row;
+            for (ends[at..][0..k], at..) |e, run| {
+                const end = base + @as(usize, @intCast(e));
+                while (row < end) : (row += 1) sel[row] = run;
+            }
+            at += k;
+        }
+        const values = try r.decode(vals_f, chunks);
+        return gather(r, values, sel);
     }
 
     /// A value `dataframe` cannot hold at row `i`: `error.Unsupported`, or under

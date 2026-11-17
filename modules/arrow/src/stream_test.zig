@@ -1228,3 +1228,86 @@ test "decimal widths: Decimal32 / Decimal64 widen exactly, Decimal256 when it fi
         try testing.expectError(error.Malformed, stream.readStream(a, bad, .{}));
     }
 }
+
+test "run-end encoded: read expanded into a plain column, over batches; bad run ends are Malformed" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const i16_ends = schema.Field{ .name = "run_ends", .nullable = false, .type = .{ .int = .{ .bits = 16, .signed = true } } };
+    const i32_ends = schema.Field{ .name = "run_ends", .nullable = false, .type = .{ .int = .{ .bits = 32, .signed = true } } };
+    const r16_kids = [_]schema.Field{ i16_ends, .{ .name = "values", .type = .{ .int = .{ .bits = 32, .signed = true } } } };
+    const rs_kids = [_]schema.Field{ i32_ends, .{ .name = "values", .type = .utf8 } };
+    const fields = [_]schema.Field{
+        .{ .name = "r16", .type = .run_end_encoded, .children = &r16_kids },
+        .{ .name = "rs", .type = .run_end_encoded, .children = &rs_kids },
+    };
+    const nd = struct {
+        fn f(len: i64, nulls: i64) ipc.FieldNode {
+            return .{ .length = len, .null_count = nulls };
+        }
+    }.f;
+    const bytes = try hand(gpa, &fields, &.{
+        .{ .length = 5, .nodes = &.{ nd(5, 0), nd(2, 0), nd(2, 1), nd(5, 0), nd(2, 0), nd(2, 0) }, .bufs = &.{
+            "",    bytesOf(i16, &.{ 2, 5 }), "\x01", bytesOf(i32, &.{ 7, 0 }),
+            "",    bytesOf(i32, &.{ 1, 5 }), "",     bytesOf(i32, &.{ 0, 1, 3 }),
+            "abc",
+        } },
+        .{ .length = 3, .nodes = &.{ nd(3, 0), nd(1, 0), nd(1, 0), nd(3, 0), nd(3, 0), nd(3, 1) }, .bufs = &.{
+            "",   bytesOf(i16, &.{3}),         "",     bytesOf(i32, &.{9}),
+            "",   bytesOf(i32, &.{ 1, 2, 3 }), "\x05", bytesOf(i32, &.{ 0, 1, 1, 2 }),
+            "xz",
+        } },
+    });
+    defer gpa.free(bytes);
+    const f = try stream.readStream(a, bytes, .{});
+    try testing.expectEqual(@as(usize, 8), f.len);
+    try testing.expectEqual(df.ColumnType.int32, f.columns[0].type);
+    try testing.expectEqual(df.ColumnType.text, f.columns[1].type);
+    const want16 = [_]?i64{ 7, 7, null, null, null, 9, 9, 9 };
+    const wants = [_]?[]const u8{ "a", "bc", "bc", "bc", "bc", "x", null, "z" };
+    for (0..8) |i| {
+        const x = f.columnAt(0).get(i);
+        if (want16[i]) |w| try testing.expectEqual(w, x.int) else try testing.expect(x == .null);
+        const y = f.columnAt(1).get(i);
+        if (wants[i]) |w| try testing.expectEqualStrings(w, y.text) else try testing.expect(y == .null);
+    }
+    // Written back plain.
+    const back = try stream.writeStream(gpa, f, .{});
+    defer gpa.free(back);
+    try expectSameFrame(f, try stream.readStream(a, back, .{}));
+    // The expansion is charged: 8 rows of each column, its runs and values, then 8 copies each.
+    try testing.expectError(error.LimitExceeded, stream.readStream(a, bytes, .{ .max_cells = 40 }));
+
+    // One column, three rows, two runs: run ends that are not a run-end array.
+    const one = [_]schema.Field{fields[0]};
+    const Case = struct { ends: []const u8, ree_nulls: i64 = 0, ends_nulls: i64 = 0, ends_valid: []const u8 = "", vals_len: i64 = 2 };
+    for ([_]Case{
+        .{ .ends = bytesOf(i16, &.{ 2, 2 }) }, // not strictly increasing
+        .{ .ends = bytesOf(i16, &.{ 3, 1 }) },
+        .{ .ends = bytesOf(i16, &.{ 0, 3 }) }, // not positive
+        .{ .ends = bytesOf(i16, &.{ -1, 3 }) },
+        .{ .ends = bytesOf(i16, &.{ 1, 4 }) }, // past the length
+        .{ .ends = bytesOf(i16, &.{ 1, 2 }) }, // short of it
+        .{ .ends = bytesOf(i16, &.{ 1, 3 }), .ree_nulls = 1 }, // nulls on the parent
+        .{ .ends = bytesOf(i16, &.{ 1, 3 }), .ends_nulls = 1, .ends_valid = "\x02" }, // a null run end
+        .{ .ends = bytesOf(i16, &.{ 1, 3 }), .vals_len = 1 }, // fewer values than runs
+        .{ .ends = bytesOf(i16, &.{1}) }, // a short buffer
+    }) |c| {
+        const bad = try hand(gpa, &one, &.{.{ .length = 3, .nodes = &.{ nd(3, c.ree_nulls), nd(2, c.ends_nulls), nd(c.vals_len, 0) }, .bufs = &.{ c.ends_valid, c.ends, "", bytesOf(i32, &.{ 1, 2 }) } }});
+        defer gpa.free(bad);
+        try testing.expectError(error.Malformed, stream.readStream(a, bad, .{}));
+    }
+    // Run ends of a type other than signed Int16/32/64, or not two children.
+    for ([_][]const schema.Field{
+        &.{ .{ .name = "run_ends", .type = .{ .int = .{ .bits = 16, .signed = false } } }, r16_kids[1] },
+        &.{ .{ .name = "run_ends", .type = .{ .int = .{ .bits = 8, .signed = true } } }, r16_kids[1] },
+        &.{ .{ .name = "run_ends", .type = .{ .float = .double } }, r16_kids[1] },
+        &.{ .{ .name = "run_ends", .type = .utf8, .dictionary = .{ .id = 0 } }, r16_kids[1] },
+        r16_kids[0..1],
+    }) |kids| {
+        const bad = try hand(gpa, &.{.{ .name = "r", .type = .run_end_encoded, .children = kids }}, &.{});
+        defer gpa.free(bad);
+        try testing.expectError(error.Malformed, stream.readStream(a, bad, .{}));
+    }
+}
