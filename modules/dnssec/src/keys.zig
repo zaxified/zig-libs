@@ -3,13 +3,15 @@
 //! DNSKEY public-key wire decoding + signature verification, per algorithm:
 //! RSA (RFC 3110, algorithms 5/7/8/10 — RSASHA1/RSASHA1-NSEC3-SHA1/
 //! RSASHA256/RSASHA512), ECDSA (RFC 6605, algorithms 13/14 —
-//! ECDSAP256SHA256/ECDSAP384SHA384), and Ed25519 (RFC 8080, algorithm 15).
+//! ECDSAP256SHA256/ECDSAP384SHA384), Ed25519 (RFC 8080, algorithm 15) and
+//! Ed448 (RFC 8080, algorithm 16).
 //!
-//! This is mechanical wire-format glue over two already-real primitive
+//! This is mechanical wire-format glue over already-real primitive
 //! sources — Zig std's own `std.crypto.sign.ecdsa`/`std.crypto.sign.Ed25519`
-//! (public, verify-capable) and this repo's own `rsa` module
+//! (public, verify-capable), this repo's own `rsa` module
 //! (`rsa.verifyPkcs1v15`, since std's internal RSA verifier
-//! (`std.crypto.Certificate.rsa`) is not `pub`) — no cryptographic
+//! (`std.crypto.Certificate.rsa`) is not `pub`) and its `ed448` module (std
+//! has no Ed448) — no cryptographic
 //! primitive is implemented here, only correctly wiring DNSKEY's wire
 //! encoding to each library's public API.
 //!
@@ -20,6 +22,7 @@
 
 const std = @import("std");
 const rsa = @import("rsa");
+const ed448 = @import("ed448").ed448;
 const rdata = @import("rdata.zig");
 
 /// Test-only. `testkit.fuzz.seed` is the corpus format `Smith.slice` actually
@@ -42,6 +45,7 @@ pub const DecodedKey = union(enum) {
     ecdsa_p256: std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey,
     ecdsa_p384: std.crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey,
     ed25519: std.crypto.sign.Ed25519.PublicKey,
+    ed448: ed448.PublicKey,
 };
 
 /// Decode `public_key` (a DNSKEY RDATA's public-key field, RFC 4034 §2.1.4)
@@ -52,6 +56,7 @@ pub fn decodePublicKey(algorithm: u8, public_key: []const u8) DecodeKeyError!Dec
         rdata.algorithm.ecdsap256sha256 => .{ .ecdsa_p256 = try decodeEcdsaP256Key(public_key) },
         rdata.algorithm.ecdsap384sha384 => .{ .ecdsa_p384 = try decodeEcdsaP384Key(public_key) },
         rdata.algorithm.ed25519 => .{ .ed25519 = try decodeEd25519Key(public_key) },
+        rdata.algorithm.ed448 => .{ .ed448 = try decodeEd448Key(public_key) },
         else => error.UnsupportedAlgorithm,
     };
 }
@@ -101,6 +106,17 @@ fn decodeEd25519Key(public_key: []const u8) DecodeKeyError!std.crypto.sign.Ed255
     return std.crypto.sign.Ed25519.PublicKey.fromBytes(public_key[0..std.crypto.sign.Ed25519.PublicKey.encoded_length].*) catch error.InvalidKeyEncoding;
 }
 
+/// RFC 8080 §3: the Ed448 public key wire format inside a DNSKEY RDATA is the
+/// 57-octet RFC 8032 §5.2.5 public key, no wrapping. Unlike Ed25519 above, the
+/// point is decoded here (RFC 8032 §5.2.3), so a key that is not a curve point
+/// is refused at decode time (`InvalidKeyEncoding`) rather than at verify.
+fn decodeEd448Key(public_key: []const u8) DecodeKeyError!ed448.PublicKey {
+    if (public_key.len != 57) return error.InvalidKeyEncoding;
+    const pk = ed448.PublicKey.fromBytes(public_key[0..57].*);
+    _ = pk.lift() catch return error.InvalidKeyEncoding;
+    return pk;
+}
+
 pub const VerifyError = error{
     UnsupportedAlgorithm,
     InvalidSignatureEncoding,
@@ -139,6 +155,13 @@ pub fn verifySignature(algorithm: u8, key: DecodedKey, signed_data: []const u8, 
             if (signature.len != Sig.encoded_length) return error.InvalidSignatureEncoding;
             const sig = Sig.fromBytes(signature[0..Sig.encoded_length].*);
             sig.verify(signed_data, key.ed25519) catch return error.SignatureVerificationFailed;
+        },
+        rdata.algorithm.ed448 => {
+            // RFC 8080 §4 -> RFC 8032 §5.2.6/§5.2.7: pure Ed448 with the empty
+            // context (what OpenSSL, Unbound and BIND use for DNSSEC).
+            if (signature.len != ed448.Signature.encoded_length) return error.InvalidSignatureEncoding;
+            const sig = ed448.Signature.fromBytes(signature[0..ed448.Signature.encoded_length].*) catch return error.SignatureVerificationFailed;
+            ed448.verify(sig, signed_data, "", key.ed448) catch return error.SignatureVerificationFailed;
         },
         else => return error.UnsupportedAlgorithm,
     }
@@ -284,18 +307,26 @@ const key_reject_seeds = [_][]const u8{
     fuzzSeed("\x0e" ++ (strRepeat("\x00", 96))), // the same for P-384
     fuzzSeed("\x0f" ++ (strRepeat("\x00", 32))), // ⭐ ACCEPTED, measured: `Ed25519.PublicKey.fromBytes` only checks the length, so the all-zero point decodes. It is the 5th acceptance in the guard below and the only one that is not a real zone key.
     fuzzSeed("\x0f" ++ (strRepeat("\x00", 31))), // one octet short of an Ed25519 key
+    fuzzSeed("\x10"), // Ed448 with an empty key
+    fuzzSeed("\x10" ++ (strRepeat("\xff", 57))), // 57 octets, y past the field prime: not a point
+    fuzzSeed("\x10" ++ (strRepeat("\x00", 56))), // one octet short of an Ed448 key
     fuzzSeed("\x05\x03\x01\x00\x01\x00"), // RSASHA1: a modulus of a single zero octet
     fuzzSeed("\xc8\x00"), // algorithm 200: unregistered
     fuzzSeed("\xff" ++ (strRepeat("\xff", 260))), // over the old 256 buffer, on purpose
 };
 
-/// The whole corpus: the refusals above, plus the four real DNSKEYs.
+/// The RFC 8080 §6.2 Ed448 public key (example 1), a real zone key: the one
+/// accepting Ed448 seed (ldns has no Ed448 signer to take one from).
+const ed448_rfc8080_key = "\xde\x48\x11\x39\xa0\xe3\xae\x1d\x07\xda\x2b\xa2\xc5\x60\x6b\x73\xc8\x36\x12\x90\x41\x2c\x27\x46\xcc\x79\xa7\xf8\x6d\x8c\xa5\x33\xe1\xa6\x3f\xce\x88\x15\x47\x1d\x27\xcf\xa1\xdc\x75\x15\x86\x14\x70\x92\xa6\xd4\xc0\xe9\x26\xd2\x00";
+
+/// The whole corpus: the refusals above, plus the four real DNSKEYs and the
+/// Ed448 one.
 ///
 /// ⭐ The harness and the guard below both build it from HERE -- a guard that
 /// measured a different corpus from the one the harness gets is not a guard.
 const KeyCorpus = struct {
-    stores: [4][4 + 512]u8 = undefined,
-    entries: [key_reject_seeds.len + 4][]const u8 = undefined,
+    stores: [5][4 + 512]u8 = undefined,
+    entries: [key_reject_seeds.len + 5][]const u8 = undefined,
 
     fn build(self: *KeyCorpus) []const []const u8 {
         @memcpy(self.entries[0..key_reject_seeds.len], &key_reject_seeds);
@@ -315,6 +346,8 @@ const KeyCorpus = struct {
             self.entries[key_reject_seeds.len + i] =
                 testkit.fuzz.seedInto(&self.stores[i], frame[0 .. 1 + key.len]);
         }
+        self.entries[key_reject_seeds.len + 4] =
+            testkit.fuzz.seedInto(&self.stores[4], "\x10" ++ ed448_rfc8080_key);
         return &self.entries;
     }
 };
@@ -353,11 +386,11 @@ test "corpus: every key seed reaches decodePublicKey, and the families decoded a
     // ⭐ Two numbers, and `accepted` is not enough on its own: it would not
     // notice a corpus that decoded four RSA keys and no elliptic-curve ones,
     // which is precisely the shape this module's literals would have produced.
-    // `families` counts the distinct `DecodedKey` tags reached, so it is 4 only
-    // when all four of this file's decoders ran.
+    // `families` counts the distinct `DecodedKey` tags reached, so it is 5 only
+    // when all five of this file's decoders ran.
     var nonempty: usize = 0;
     var accepted: usize = 0;
-    var seen = @as([4]bool, @splat(false));
+    var seen = @as([5]bool, @splat(false));
     var corpus: KeyCorpus = .{};
     const entries = corpus.build();
     for (entries) |sd| {
@@ -378,10 +411,10 @@ test "corpus: every key seed reaches decodePublicKey, and the families decoded a
     // Measured 2026-09-07: 0 of 20 seeds non-empty, 0 accepted and 0 families
     // reached before the draw and the algorithm knob were fixed — the harness
     // ran `decodePublicKey(0, "")` on every iteration of its whole life.
-    // 5, not 4: the four real zone keys plus the all-zero Ed25519 seed, which
-    // `fromBytes` accepts on length alone.
-    try testing.expectEqual(@as(usize, 5), accepted);
-    try testing.expectEqual(@as(usize, 4), families);
+    // 6, not 5: the four real zone keys, the RFC 8080 Ed448 key, and the
+    // all-zero Ed25519 seed, which `fromBytes` accepts on length alone.
+    try testing.expectEqual(@as(usize, 6), accepted);
+    try testing.expectEqual(@as(usize, 5), families);
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

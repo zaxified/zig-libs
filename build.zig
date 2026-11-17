@@ -362,7 +362,7 @@ pub const module_list = [_]Module{
     .{ .name = "x509", .libs = &.{ "crypto", "net" }, .deps = &.{ "rsa", "slhdsa", "p521", "p256", "netaddr" }, .test_deps = &.{"testkit"}, .interop_deps = &.{"benchkit"} },
     .{ .name = "ocsp", .libs = &.{"crypto"}, .deps = &.{ "x509", "rsa", "p256", "datefmt" }, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "ocspcache", .libs = &.{"crypto"}, .deps = &.{ "ocsp", "http", "x509" }, .test_deps = &.{"testkit"}, .timing = true, .loopback = true },
-    .{ .name = "dnssec", .libs = &.{"net"}, .deps = &.{ "dns", "rsa", "base32" }, .test_deps = &.{"testkit"} },
+    .{ .name = "dnssec", .libs = &.{"net"}, .deps = &.{ "dns", "rsa", "base32", "ed448" }, .test_deps = &.{"testkit"} },
     .{ .name = "dnp3", .libs = &.{"net"}, .deps = &.{ "aeskw", "aesgcm" }, .test_deps = &.{"testkit"} },
     .{ .name = "slhdsa", .libs = &.{"crypto"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "falcon", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },

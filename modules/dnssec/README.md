@@ -1,7 +1,7 @@
 # dnssec
 
 Resolver-side DNSSEC validation: RFC 4033/4034/4035 core, RFC 5155 NSEC3,
-RFC 6605 ECDSA, RFC 8080 Ed25519.
+RFC 6605 ECDSA, RFC 8080 Ed25519/Ed448.
 
 **Status: validation core implemented + oracle-verified.** The full path is
 real: DNSKEY/RRSIG/DS/NSEC/NSEC3/NSEC3PARAM RDATA parsing, the Type Bit Maps
@@ -9,7 +9,7 @@ field, the DNSKEY key tag checksum, canonical name encoding, NSEC3's
 base32hex + iterated-SHA-1 owner hash, DS digest computation, per-algorithm
 DNSKEY decode + signature verification (wrapping
 `std.crypto.sign.ecdsa`/`std.crypto.sign.Ed25519` and this repo's own `rsa`
-module — no crypto primitive is reimplemented here), the RFC 4034 §3.1.8.1
+and `ed448` modules — no crypto primitive is reimplemented here), the RFC 4034 §3.1.8.1
 canonical signed-data construction (`canonical.buildSignedData`, incl.
 wildcard-name + original-TTL handling), the DS→DNSKEY delegation link
 (`chain.validateDnskeySet`), the NSEC3 denial-of-existence proof incl.
@@ -35,7 +35,7 @@ multi-zone-cut resolver that walks the chain root→TLD→… is also out of sco
 (this module is one cut — see `chain.zig`).
 
 - **Model after:** RFC 4033/4034/4035 (DNSSEC core), RFC 5155 (NSEC3),
-  RFC 6605 (ECDSA), RFC 8080 (Ed25519). Structure cross-checked against Go
+  RFC 6605 (ECDSA), RFC 8080 (Ed25519/Ed448). Structure cross-checked against Go
   `miekg/dns`'s `dnssec.go` and NLnet Labs' unbound/ldns validator behavior —
   behavioral/API-shape reference only, no source copied.
 - **Deps:** `dns` (this module reads `dns.Record`/`dns.Message`; DNSSEC RR
@@ -107,7 +107,8 @@ trust the zone's keys, then `validate` with the now-trusted ZSK as a
 - `std.crypto` (0.16) has real, public verify-capable APIs for every
   algorithm this module targets: `std.crypto.sign.ecdsa.EcdsaP256Sha256`/
   `EcdsaP384Sha384` (algorithms 13/14) and `std.crypto.sign.Ed25519`
-  (algorithm 15) — both directly usable, no gap. RSA (algorithms 5/7/8/10)
+  (algorithm 15) — both directly usable, no gap. Ed448 (algorithm 16) is not in
+  std; this repo's own `ed448` module supplies it. RSA (algorithms 5/7/8/10)
   is the one std gap: `std.crypto.Certificate.rsa` exists internally but is
   not `pub`, which is exactly why this repo's own `rsa` module
   (`rsa.verifyPkcs1v15`) exists and is reused here instead of reimplementing
@@ -147,7 +148,7 @@ only ever in a scratchpad and is not restored. See SPEC.
 ## Provenance
 
 Clean-room from the DNSSEC RFCs (4033/4034/4035 core, 5155 NSEC3, 6605 ECDSA,
-8080 Ed25519, 1982 serial arithmetic) — all open, public specifications, so the
+8080 Ed25519/Ed448, 1982 serial arithmetic) — all open, public specifications, so the
 spec citations need no attribution. Reuses Zig std's `std.crypto` (ECDSA
 P-256/P-384, Ed25519, SHA-1/256/384) and this repo's own `rsa` module (RFC 8017
 PKCS#1 v1.5 verify, for algs 8/10) and `dns` module (message/record wire

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! dnssec — resolver-side DNSSEC validation (RFC 4033/4034/4035, RFC 5155
-//! NSEC3, RFC 6605 ECDSA, RFC 8080 Ed25519), built on the `dns` module's
+//! NSEC3, RFC 6605 ECDSA, RFC 8080 Ed25519/Ed448), built on the `dns` module's
 //! wire codec and this repo's own `rsa` module.
 //!
 //! Implemented and oracle-verified: DNSKEY/RRSIG/DS/NSEC/NSEC3/NSEC3PARAM
@@ -9,8 +9,8 @@
 //! checksum, canonical name encoding (`wire.zig`), NSEC3's base32hex +
 //! iterated-SHA-1 owner hash (`nsec3.zig`), DS digest computation (`ds.zig`),
 //! per-algorithm DNSKEY decode + signature verification (`keys.zig`, wrapping
-//! `std.crypto.sign.ecdsa`/`std.crypto.sign.Ed25519` and this repo's
-//! `rsa.verifyPkcs1v15` — no crypto primitive is reimplemented), the
+//! `std.crypto.sign.ecdsa`/`std.crypto.sign.Ed25519`, this repo's
+//! `rsa.verifyPkcs1v15` and its `ed448` module — no crypto primitive is reimplemented), the
 //! RFC 4034 §3.1.8.1 canonical signed-data construction with wildcard +
 //! original-TTL handling (`canonical.buildSignedData`), the DS-to-DNSKEY
 //! delegation link (`chain.validateDnskeySet`), the NSEC3 closest-encloser /
@@ -51,8 +51,8 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure validation logic; no I/O, no socket of its own
     .concurrency = .reentrant, // no shared/global state
-    .model_after = "RFC 4033/4034/4035 (DNSSEC core), RFC 5155 (NSEC3), RFC 6605 (ECDSA), RFC 8080 (Ed25519); structure cross-checked vs. Go miekg/dns's dnssec.go and NLnet Labs' unbound/ldns validator behavior — design/behavioral reference only, no source copied",
-    .deps = .{ "dns", "rsa", "base32" },
+    .model_after = "RFC 4033/4034/4035 (DNSSEC core), RFC 5155 (NSEC3), RFC 6605 (ECDSA), RFC 8080 (Ed25519/Ed448); structure cross-checked vs. Go miekg/dns's dnssec.go and NLnet Labs' unbound/ldns validator behavior — design/behavioral reference only, no source copied",
+    .deps = .{ "dns", "rsa", "base32", "ed448" },
 };
 
 /// Uncompressed-name decoding + canonical name encoding (RFC 4034 §6.2) —
@@ -100,6 +100,7 @@ test {
     _ = chain;
     _ = policy;
     _ = @import("oracle_test.zig");
+    _ = @import("rfc8080_test.zig");
 }
 
 // ── RRSIG validity window (RFC 4034 §3.1.5) ────────────────────────────────

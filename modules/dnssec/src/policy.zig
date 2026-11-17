@@ -38,7 +38,7 @@
 //! (algorithms 0, 1, 3, 6; digest 0). Numbers absent from the tables are not
 //! refused by the policy (the RFC says nothing about them). Independently of
 //! the policy, an algorithm or digest this module cannot verify (ECC-GOST,
-//! GOST digest, Ed448, unassigned numbers) is unsupported: `isAlgorithmSupported`
+//! GOST digest, unassigned numbers) is unsupported: `isAlgorithmSupported`
 //! / `isDigestSupported` require BOTH "policy allows" and "implemented here".
 
 const rdata = @import("rdata.zig");
@@ -78,6 +78,7 @@ pub fn algorithmImplemented(alg: u8) bool {
         rdata.algorithm.ecdsap256sha256,
         rdata.algorithm.ecdsap384sha384,
         rdata.algorithm.ed25519,
+        rdata.algorithm.ed448,
         => true,
         else => false,
     };
@@ -142,10 +143,9 @@ const testing = @import("std").testing;
 test "rfc8624 table: MUST NOT rows are refused, everything the table allows (and we implement) is supported" {
     const p = Policy.rfc8624;
     for ([_]u8{ 0, 1, 3, 6 }) |a| try testing.expect(!p.isAlgorithmSupported(a));
-    for ([_]u8{ 5, 7, 8, 10, 13, 14, 15 }) |a| try testing.expect(p.isAlgorithmSupported(a));
+    for ([_]u8{ 5, 7, 8, 10, 13, 14, 15, 16 }) |a| try testing.expect(p.isAlgorithmSupported(a));
     // MAY / RECOMMENDED but not implemented here: unsupported, but not by policy.
     try testing.expect(p.algorithm_allowed[12] and !p.isAlgorithmSupported(12));
-    try testing.expect(p.algorithm_allowed[16] and !p.isAlgorithmSupported(16));
     try testing.expect(!p.isAlgorithmSupported(200));
     try testing.expect(!p.isDigestSupported(0));
     for ([_]u8{ 1, 2, 4 }) |d| try testing.expect(p.isDigestSupported(d));

@@ -38,7 +38,7 @@ pub const Dnskey = struct {
     protocol: u8,
     algorithm: u8,
     /// Algorithm-specific public key material (RFC 4034 §2.1.4), raw —
-    /// decoding it (RFC 3110 RSA / RFC 6605 ECDSA / RFC 8080 Ed25519) is
+    /// decoding it (RFC 3110 RSA / RFC 6605 ECDSA / RFC 8080 Ed25519 and Ed448) is
     /// `keys.zig`'s job, not this parser's.
     public_key: []const u8,
 
@@ -410,6 +410,7 @@ pub const algorithm = struct {
     pub const ecdsap256sha256: u8 = 13;
     pub const ecdsap384sha384: u8 = 14;
     pub const ed25519: u8 = 15;
+    pub const ed448: u8 = 16;
 };
 
 // ── tests ───────────────────────────────────────────────────────────────────
