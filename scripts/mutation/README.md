@@ -38,6 +38,20 @@ debug-only asserts). Line numbers are those of the file before insertion.
 python3 scripts/mutation/insert.py mutants.tsv CRC32C_MUT
 ```
 
+Two or more mutants on ONE anchor (same file, line and original text: `<` to
+`<=` and to `>`) are listed as separate lines; they nest, each later one into
+the original arm of the one before:
+
+```
+5	f.zig	40	a < b	(if (mut(5)) a <= b else a < b)
+6	f.zig	40	a < b	(if (mut(6)) a > b else a < b)
+```
+
+becomes `(if (mut(5)) a <= b else (if (mut(6)) a > b else a < b))`. An earlier
+replacement that does not hold the anchor exactly once (a prefix form,
+`if (x` → `if (!mut(1) and x`) cannot take a second one and is refused with
+that reason (since 2026-11-17; three agents had hand-patched the kit for it).
+
 It refuses an anchor that is not on its line exactly once, a missing
 `mut(<id>)`, a duplicate id, and fails unless the distinct `mut(N)` calls it
 wrote equal the list (a failed insert once left a copy unmutated, and every

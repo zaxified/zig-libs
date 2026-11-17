@@ -17,7 +17,20 @@ must occur EXACTLY ONCE; it is replaced by `<new>`, which must contain
 
 Several mutants may sit on one line: they are applied left to right in file
 order of their anchors, each anchor checked against the line as it is after the
-ones before it. Every mutated file gets, once, a switch read from <ENV_NAME>:
+ones before it.
+
+Several mutants may share ONE anchor (same file, line and `<old>`, e.g. `<` to
+`<=` and to `>`): the first is applied to the line, each later one replaces the
+original arm of the one before it, in list order --
+
+    5  f.zig  40  a < b  (if (mut(5)) a <= b else a < b)
+    6  f.zig  40  a < b  (if (mut(6)) a > b else a < b)
+    -> (if (mut(5)) a <= b else (if (mut(6)) a > b else a < b))
+
+so every earlier `<new>` must contain `<old>` exactly once (its original arm);
+a prefix-style one (`if (x` -> `if (!mut(1) and x`) cannot take a second mutant
+and is refused with that reason. Every mutated file gets, once, a switch read
+from <ENV_NAME>:
 
     fn mut(n: u32) bool   -- true when <ENV_NAME>=n (0 or unset = the original)
 
@@ -82,14 +95,27 @@ def main() -> None:
     out: dict[str, str] = {}
     for path, muts in by_file.items():
         lines = Path(path).read_text().split("\n")
-        for line, mid, old, new in sorted(muts, key=lambda m: (m[0], lines[m[0] - 1].find(m[2]) if 0 < m[0] <= len(lines) else 0)):
+        # Mutants sharing an anchor become one nested replacement (list order).
+        groups: dict[tuple[int, str], list[tuple[int, str]]] = {}
+        for line, mid, old, new in muts:
+            groups.setdefault((line, old), []).append((mid, new))
+        for (line, old), stack in sorted(groups.items(), key=lambda g: (g[0][0], lines[g[0][0] - 1].find(g[0][1]) if 0 < g[0][0] <= len(lines) else 0)):
+            mid = stack[0][0]
             if not 0 < line <= len(lines):
                 fail(f"{path}:{line} (mutant {mid}): no such line")
             text = lines[line - 1]
             count = text.count(old)
             if count != 1:
                 fail(f"{path}:{line} (mutant {mid}): anchor occurs {count} times on the line: {old!r}\n  line: {text}")
-            lines[line - 1] = text.replace(old, new, 1)
+            composed = stack[0][1]
+            for (prev, _), (nxt, new) in zip(stack, stack[1:]):
+                inner = composed.count(old)
+                if inner != 1:
+                    fail(f"{path}:{line} (mutant {nxt}): shares its anchor with mutant {prev}, whose "
+                         f"replacement holds the anchor {inner} times (needs exactly 1, its original arm, "
+                         f"to nest into): {old!r}\n  so far: {composed}")
+                composed = composed.replace(old, new, 1)
+            lines[line - 1] = text.replace(old, composed, 1)
         src = "\n".join(lines)
         anchor = 'const std = @import("std");\n'
         switch = SWITCH.format(env=env)
