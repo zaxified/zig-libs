@@ -2171,6 +2171,27 @@ const Case = enum {
     open7_late_strip,
     open7_late_round2,
     open5_late_mask,
+    /// Mutation audit 2026-11-17 (wave 3). `sigma_shift`; the LAST signer opens, for signer 0,
+    /// a round-2 message that signer 0 really signed (it is re-signed by signer 0 here) but
+    /// that is not the one it sent to the opener: another round, another sender, another
+    /// recipient, another session, a payload too short for the attestation block, a payload
+    /// with a byte too many. Each is well-formed otherwise, so only the one check on that
+    /// property can name the opener before the cheater's own check does.
+    open7_r2_round,
+    open7_r2_from,
+    open7_r2_to,
+    open7_r2_sid,
+    open7_r2_short,
+    open7_r2_long,
+    /// `delta_shift`; the LAST signer opens a `k` that is not the one in its signed `c_k`.
+    open5_late_k,
+    /// `delta_shift`; every party's own record of signer 0's broadcast Γ (resp. R̄) is replaced
+    /// by the base point, as if signer 0 had opened a γ (resp. k) that does not match it. A
+    /// lying opener cannot reach those two checks alone (its round-2 ciphertexts, which a
+    /// re-encryption must match, and its nonce commitment catch it first), so the record is
+    /// the thing that is made to disagree.
+    open5_view_big_gamma,
+    open5_view_r_bar,
 };
 
 /// The round whose cheater message gets one byte too many (0: none).
@@ -2191,8 +2212,16 @@ fn trailingRound(case: Case) usize {
 /// blamed instead (mutation audit), else the first.
 fn openLiar(case: Case, n: usize) usize {
     return switch (case) {
-        .open_lie_k, .open_trailing7, .open_short7, .open_trailing5, .open_short5, .open7_late_mu, .open7_late_strip, .open7_late_round2, .open5_late_mask => n - 1,
+        .open_lie_k, .open_trailing7, .open_short7, .open_trailing5, .open_short5, .open7_late_mu, .open7_late_strip, .open7_late_round2, .open5_late_mask, .open7_r2_round, .open7_r2_from, .open7_r2_to, .open7_r2_sid, .open7_r2_short, .open7_r2_long, .open5_late_k => n - 1,
         else => 0,
+    };
+}
+
+/// The cases that edit the round-2 message the last signer opens for signer 0.
+fn isR2Case(case: Case) bool {
+    return switch (case) {
+        .open7_r2_round, .open7_r2_from, .open7_r2_to, .open7_r2_sid, .open7_r2_short, .open7_r2_long => true,
+        else => false,
     };
 }
 
@@ -2308,7 +2337,7 @@ fn runSession(allocator: std.mem.Allocator, shares: []const root.KeyShare, rando
         errdefer for (next) |b| if (b) |o| o.deinit(allocator);
         for (0..t) |i| {
             if ((case == .sigma_shift or case == .open_plain_n or case == .open_lie_k or case == .open_trailing7 or case == .open_short7 or
-                case == .open7_late_mu or case == .open7_late_strip or case == .open7_late_round2 or
+                case == .open7_late_mu or case == .open7_late_strip or case == .open7_late_round2 or isR2Case(case) or
                 case == .abandon_open or case == .open_equivocate) and round == 3 and i == cheat_pos)
                 parties[i].secrets.sigma = parties[i].secrets.sigma.add(Scalar.one);
             next[i] = parties[i].advance(inboxes[i].items, random) catch |e| switch (e) {
@@ -2339,7 +2368,7 @@ fn runSession(allocator: std.mem.Allocator, shares: []const root.KeyShare, rando
                 .range_proof => if (r == 1 and m.to != null) flipLast(m.bytes),
                 .mta_swap => if (r == 2) try rewriteRound2(allocator, m.bytes, false, t),
                 .mtawc_swap => if (r == 2) try rewriteRound2(allocator, m.bytes, true, t),
-                .delta_shift, .open_lie, .open_lie_round2, .open_trailing5, .open_short5, .open5_late_mask => if (r == 3) {
+                .delta_shift, .open_lie, .open_lie_round2, .open_trailing5, .open_short5, .open5_late_mask, .open5_late_k, .open5_view_big_gamma, .open5_view_r_bar => if (r == 3) {
                     const me = &parties[cheat_pos].peers[parties[cheat_pos].me];
                     me.delta = me.delta.add(Scalar.one);
                     m.bytes[at..][0..Ns].* = me.delta.toBytes(.big);
@@ -2558,7 +2587,44 @@ fn openIfTypes5or7(allocator: std.mem.Allocator, parties: []Party, aborts: *std.
         }
         try lieConsistently(allocator, &parties[liar], openings[liar].messages[0].bytes);
     }
-    if (case == .open_lie or case == .open_lie_round2 or case == .open_plain_n or case == .open_lie_k) {
+    if (isR2Case(case)) {
+        // The last signer shows signer 0's round-2 message to it, altered in one way and
+        // re-signed by signer 0 (the genuine sender), so its attestation holds.
+        const liar = openLiar(case, parties.len);
+        const m = openings[liar].messages[0].bytes;
+        var sections: [8]OpenSection = undefined;
+        _ = parseOpening(m[header_length .. m.len - signature_length], parties[0].abort.?.fault, liar, sections[0..parties.len]).?;
+        const field = sections[0].round2;
+        const edited = switch (case) {
+            .open7_r2_short => try allocator.alloc(u8, header_length + 10 + signature_length),
+            .open7_r2_long => try allocator.alloc(u8, field.len + 1),
+            else => try allocator.dupe(u8, field),
+        };
+        defer allocator.free(edited);
+        switch (case) {
+            .open7_r2_round => edited[1] = 5,
+            .open7_r2_from => std.mem.writeInt(u32, edited[34..38], parties[1].myIndex(), .big),
+            .open7_r2_to => std.mem.writeInt(u32, edited[38..42], parties[1].myIndex(), .big),
+            .open7_r2_sid => edited[2] ^= 0x01,
+            .open7_r2_short => @memcpy(edited[0 .. header_length + 10], field[0 .. header_length + 10]),
+            else => {
+                @memcpy(edited[0 .. field.len - signature_length], field[0 .. field.len - signature_length]);
+                edited[field.len - signature_length] = 0xAA;
+            },
+        }
+        resign(&parties[0], edited, false);
+        const start = @intFromPtr(field.ptr) - @intFromPtr(m.ptr);
+        var list: std.ArrayList(u8) = .empty;
+        errdefer list.deinit(allocator);
+        try list.appendSlice(allocator, m[0 .. start - 4]);
+        try appendLenPrefixed(&list, allocator, edited);
+        try list.appendSlice(allocator, m[start + field.len ..]);
+        const fresh = try list.toOwnedSlice(allocator);
+        allocator.free(m);
+        openings[liar].messages[0].bytes = fresh;
+        try lieConsistently(allocator, &parties[liar], fresh);
+    }
+    if (case == .open_lie or case == .open_lie_round2 or case == .open_plain_n or case == .open_lie_k or case == .open5_late_k) {
         // Signer 0 (the last one for `open_lie_k`) lies in its opening, and signs the lie.
         const liar = openLiar(case, parties.len);
         const m = openings[liar].messages[0].bytes;
@@ -2567,7 +2633,7 @@ fn openIfTypes5or7(allocator: std.mem.Allocator, parties: []Party, aborts: *std.
         _ = parseOpening(body, parties[0].abort.?.fault, liar, sections[0..parties.len]).?;
         const at = switch (case) {
             .open_lie => header_length + 1 + Ns + 4 + paillier.modulus_sq_bytes + Ns - 1, // γ
-            .open_lie_k => header_length + Ns, // the last byte of k
+            .open_lie_k, .open5_late_k => header_length + Ns, // the last byte of k
             .open_lie_round2 => @intFromPtr(sections[1].round2.ptr) - @intFromPtr(m.ptr) + header_length + 10,
             else => @intFromPtr(sections[1].plain.ptr) - @intFromPtr(m.ptr),
         };
@@ -2630,6 +2696,8 @@ fn openIfTypes5or7(allocator: std.mem.Allocator, parties: []Party, aborts: *std.
                 k += 1;
             }
         }
+        if (case == .open5_view_big_gamma) p.peers[0].big_gamma = try Element.fromPoint(Secp256k1.basePoint);
+        if (case == .open5_view_r_bar) p.peers[0].r_bar = try Element.fromPoint(Secp256k1.basePoint);
         a.abort = try p.identify(inbox[0..k]);
         try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&p.secrets), 0));
     }
@@ -2929,6 +2997,30 @@ test "presign: §4.3 opening — a forged round-2 message or a decryption lifted
 test "presign: §4.3 opening — a forged round-2 message or a decryption lifted by N names the opener (late messages)" {
     if (builtin.mode == .debug) return error.SkipZigTest;
     try expectOpeningNamesLiar(opening_cases[7..]);
+}
+
+/// Mutation audit 2026-11-17 (wave 3): the checks `openedRound2`, `round2Fields` and the
+/// type-5 first loop make before any other judgement of an opening.
+const opening_cases_w3 = [_]OpeningCase{
+    .{ .open7_r2_round, .s_sum },
+    .{ .open7_r2_from, .s_sum },
+    .{ .open7_r2_to, .s_sum },
+    .{ .open7_r2_sid, .s_sum },
+    .{ .open7_r2_short, .s_sum },
+    .{ .open7_r2_long, .s_sum },
+    .{ .open5_late_k, .r_bar_sum },
+    .{ .open5_view_big_gamma, .r_bar_sum },
+    .{ .open5_view_r_bar, .r_bar_sum },
+};
+
+test "mut 286,287,288,289,307,308: a round-2 message signed by its sender but not the one sent to the opener (another round, sender, recipient or session, too short, a byte too many) names the opener" {
+    if (builtin.mode == .debug) return error.SkipZigTest;
+    try expectOpeningNamesLiar(opening_cases_w3[0..6]);
+}
+
+test "mut 293,294,299: type 5 names a signer whose nonce, Γ or R̄ disagrees with what it opened, before the δ check can name another" {
+    if (builtin.mode == .debug) return error.SkipZigTest;
+    try expectOpeningNamesLiar(opening_cases_w3[6..]);
 }
 
 test "presign: an opening shown two ways is caught by the echo round, its signer named by everyone (review F5)" {
@@ -3522,4 +3614,127 @@ test "presign: the pool refuses a duplicate id, and a record filed under another
     try testing.expectError(error.InvalidEncoding, pool.take(allocator, other_id, &back));
     try testing.expect(try pool.take(allocator, presig_id, &back));
     back.deinit();
+}
+
+test "mut 335,336: a record for fewer than two or more than 65535 signers is refused before anything is allocated" {
+    // Everything else about the record is junk, so a build without the bound would
+    // fail differently (`OutOfMemory` here: the first allocation of the decoder is
+    // made to fail, the original never gets that far).
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const g = (Element.fromPoint(Secp256k1.basePoint) catch unreachable).toBytes();
+    const fixed = 1 + 32 + 4 + Ne + 4;
+    const per = 4 + Ne + Ne + attestation_entry_length + 32;
+    for ([_]u32{ 1, 0xffff + 1 }) |n| {
+        const len: usize = fixed + @as(usize, n) * per + Ne + Ns + 3 * 32;
+        const bytes = try testing.allocator.alloc(u8, len);
+        defer testing.allocator.free(bytes);
+        @memset(bytes, 0);
+        bytes[0] = Presignature.codec_version;
+        std.mem.writeInt(u32, bytes[33..37], 1, .big);
+        bytes[37..][0..Ne].* = g;
+        std.mem.writeInt(u32, bytes[37 + Ne ..][0..4], n, .big);
+        var out: Presignature = undefined;
+        try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(failing.allocator(), bytes, &out));
+    }
+}
+
+test "mut 340,347,348,349: signers out of order are refused even when every per-signer field moves with them; the pool id hashes domain, session id, index and R" {
+    if (builtin.mode == .debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6d75_7433_3430);
+    const random = prng.random();
+    const kg = try signing.testKeygen(allocator, random, 2, 2);
+    defer kg.deinit(allocator);
+    var res = try runSession(allocator, kg.key_shares, random, .honest);
+    defer res.deinit(allocator);
+
+    // The id, spelled out independently of `Presignature.id`.
+    {
+        const p = &res.presigs[0];
+        var h = Sha256.init(.{});
+        h.update("threshold_ecdsa/presign/pool-id/v1");
+        h.update(&p.public.sid);
+        var u: [4]u8 = undefined;
+        std.mem.writeInt(u32, &u, p.index, .big);
+        h.update(&u);
+        h.update(&p.public.r_point.toBytes());
+        try testing.expectEqualSlices(u8, &h.finalResult(), &p.id());
+    }
+
+    const n = res.presigs[1].public.signers.len;
+    try testing.expectEqual(@as(usize, 2), n);
+    const bytes = try res.presigs[1].toBytesAlloc(allocator);
+    defer allocator.free(bytes);
+    // Signers, R̄, S, the round-6 attestations and the message keys swapped between
+    // the two positions: the same session seen in the other order, so every relation
+    // the decoder checks still holds and only the ascending order is wrong.
+    const signers_at = 1 + 32 + 4 + Ne + 4;
+    const r_bar_at = signers_at + 4 * n + Ne + Ns;
+    const s_at = r_bar_at + n * Ne;
+    const att_at = s_at + n * Ne;
+    const keys_at = att_at + n * attestation_entry_length;
+    const swapped = try allocator.dupe(u8, bytes);
+    defer allocator.free(swapped);
+    const Span = struct { at: usize, len: usize };
+    for ([_]Span{
+        .{ .at = signers_at, .len = 4 },
+        .{ .at = r_bar_at, .len = Ne },
+        .{ .at = s_at, .len = Ne },
+        .{ .at = att_at, .len = attestation_entry_length },
+        .{ .at = keys_at, .len = 32 },
+    }) |sp| {
+        @memcpy(swapped[sp.at..][0..sp.len], bytes[sp.at + sp.len ..][0..sp.len]);
+        @memcpy(swapped[sp.at + sp.len ..][0..sp.len], bytes[sp.at..][0..sp.len]);
+    }
+    var scratch: Presignature = undefined;
+    try testing.expectError(error.InvalidEncoding, Presignature.fromBytesAlloc(allocator, swapped, &scratch));
+    // The record itself is fine.
+    var back: Presignature = undefined;
+    try Presignature.fromBytesAlloc(allocator, bytes, &back);
+    back.deinit();
+}
+
+test "mut 352,353: the Γ commitment is SHA-256 over domain, session id, index, Γ and blind" {
+    const sid: SessionId = @splat(7);
+    const blind: [32]u8 = @splat(9);
+    const big_gamma = try Element.fromPoint(Secp256k1.basePoint);
+    var h = Sha256.init(.{});
+    h.update(gamma_commit_domain);
+    h.update(&sid);
+    h.update(&[_]u8{ 1, 2, 3, 4 });
+    h.update(&big_gamma.toBytes());
+    h.update(&blind);
+    try testing.expectEqualSlices(u8, &h.finalResult(), &commitGamma(sid, 0x01020304, big_gamma, blind));
+}
+
+test "mut 356: the session id is SHA-256 over domain, sid, group key, threshold, sorted signers and the public-key table hash" {
+    if (builtin.mode == .debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6d75_7433_3536);
+    const random = prng.random();
+    const kg = try signing.testKeygen(allocator, random, 2, 3);
+    defer kg.deinit(allocator);
+    const sid: SessionId = @splat(5);
+    const share = kg.key_shares[0];
+    var party: Party = undefined;
+    try Party.init(allocator, &share, &[_]u32{ 2, 1 }, sid, &party);
+    defer party.deinit();
+
+    var h = Sha256.init(.{});
+    h.update(session_domain);
+    h.update(&sid);
+    h.update(&share.group_public_key.toBytes());
+    var u: [4]u8 = undefined;
+    std.mem.writeInt(u32, &u, share.t, .big);
+    h.update(&u);
+    for ([_]u32{ 1, 2 }) |idx| {
+        std.mem.writeInt(u32, &u, idx, .big);
+        h.update(&u);
+    }
+    const table = try share.public_keys.toBytesAlloc(allocator);
+    defer allocator.free(table);
+    var th: [32]u8 = undefined;
+    Sha256.hash(table, &th, .{});
+    h.update(&th);
+    try testing.expectEqualSlices(u8, &h.finalResult(), &party.sid);
 }
