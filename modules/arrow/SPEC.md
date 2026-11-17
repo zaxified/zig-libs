@@ -6,7 +6,7 @@
 
 **Scope:** core — Apache Arrow C++ / pyarrow (apache/arrow 26.0.1; arrow-rs `arrow-ipc` 60.1.0 as the closest-shaped permissive one) (surveyed 2026-11-17)
 
-**Audit:** review none · mutation none · src ?
+**Audit:** review 2026-11-17 · mutation 2026-11-17 (297/325, 25 eq) · src a42d409fc6b16f09
 
 **Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; reach: frames, files, batches, every error kind incl. InvalidUtf8, frames from compressed inputs; resource shapes the driver cannot make are in `src/hostile_test.zig`) · ct n/a — parses and writes data files, holds no secret
 
@@ -288,6 +288,64 @@ Stream and file read equal, each file batch has its JSON batch's length, and the
 only through the reader (no foreign reader runs here).
 
 **Anchor grade:** class A · oracle EXTERNAL
+
+**Audit 2026-11-17 (mutation, whole module).** 325 schemata mutants over `src/fb.zig`, `src/schema.zig`,
+`src/ipc.zig` and `src/stream.zig`, ReleaseSafe, one build, each mutant under `setsid -w timeout` and
+`ulimit -v` (the coverage-guided `testing.fuzz` entry point is skipped in the mutation copy: outside the build
+runner it never returns; the golden files, `hostile_test.zig` and the corpus harness stay in). One mutant per
+guard × operator class: the FlatBuffers reader (every bounds check of `readInt`, `follow`, `Table.at`,
+`field`, strings, vectors and elements, enum values; 25) and builder (padding and alignment, offsets, lengths,
+vtable fields, slot reset, defaults omitted; 20); schema decoding (budget and its boundary, depth and its
+boundary, per-table and per-byte charges, endianness, every type table's parameter checks and defaults, the
+NONE id, message version and body length; 25) and encoding (every field, type parameter and header written;
+24); IPC framing (end of stream, continuation, metadata and body lengths and their exact fit, the position
+advance, padding, node and buffer checks, the compression method and codec, 64-byte buffer alignment; 24); the
+writer (type mapping and the Large switch at its boundary, declarations against storage, the categorical
+dictionary, compression choices, validity and null counts, decimal precision, time range, batches, the file
+footer and blocks; 58); the reader (planning of every type and its buffer counts, shared dictionaries,
+`max_rows` / `max_cells` / `max_body_bytes` at every place they are checked, inflation, every column kind's
+buffer-length, offset, index, validity and null-slot rule, lossy and strict conversions, the date range,
+categorical remapping, list identity and the u32 offset cap, `gather`'s charges, stream message order, the
+file's marks, footer length, blocks and their spans; 149).
+First run: 205 killed (2 by a hang: the position never advancing, `rows_per_batch = 0` taken literally),
+120 survived. The deterministic fuzz driver (`ARROW_FUZZ=20000`) over the survivors killed 5 more, all also
+pinned by a test since. New tests (`src/guards_test.zig` and beside each layer in `fb.zig`, `schema.zig`,
+`ipc.zig`) kill 92: hand-built vtables, field offsets, enums, strings without NUL and short vectors; builder
+alignment and `tbl_len`; exact `max_depth` (63 levels pass, 64 do not) and decode-budget boundaries; shared
+metadata and a shared zone charged per use; big-endian schemas, bad type parameters, absent type tables, a
+`Message` without a version; a stream without the end marker and a last message flush with the end; metadata
+and body padding; a negative null count and a compression method other than BUFFER; the Large switch at
+exactly `large_from`; declarations the storage cannot meet with every cell null, an `array_width` past i32, a
+time of 24:00, `.boxed` storage; struct children declared by name; a categorical stored as text written once
+per distinct text, sorted; a Null array's null count; null slots read as 0 / false / nothing and a null row's
+dictionary index unread; null dictionary entries; short bool / FixedSizeBinary / offset buffers, negative
+offsets and indices, a struct child of another length, a FixedSizeList child too short, a time whose unit and
+width disagree; list children cut to what the rows use and offsets not from 0; shared dictionaries differing
+in kind, unit, width, child name or child dictionary; the years 0000 / 9999 and either side; an all-null
+struct; index signs past 2^15 and 2^31 (null dictionaries); a decimal scale past 38 digits of rescaling;
+compressed buffers declaring -2 or more than their frame holds; `max_rows` over column-less batches, at
+`openFile` and over a list child's batches, `max_cells` over dictionary copies, the u32 list offsets over 33
+batches; a first message that is not a schema, a second schema; the leading mark, a footer reaching into it, a
+batch block naming the schema message.
+25 equivalent: `follow`'s and `Table.at`'s upper bounds (×3; every consumer reads through `readInt`, which
+bounds-checks); the vtable slot bound by one (vt_len and slot ends are both even); `ensure` growing at an exact
+fit (cost-only); `min_align` tracking and `finish` aligning to `min_align` without the floor of 8 (every
+alignment pushed is at most 8, and an item is aligned relative to the buffer's end, so the buffer padded to
+its largest alignment keeps every item aligned; `writeMessage` pads to 8); a node's negative length (implied
+by `null_count >= 0` and `null_count <= length`); `+|` against `+` for a buffer's end (both < 2^63); the
+writer's own depth limit (the schema encoder refuses every depth it would admit) and the reader's (the schema
+decoder already refuses it); the categorical planner's and the dictionary writer's non-text refusals (each
+refuses the cells the other would); the struct writer's cell check (only struct and null storage reach it);
+`cellAt`'s `none` (a row past the end reads as null); `finishDicts`' and `checkBatch`'s `max_rows` (decode and
+`frame` / `openFile` sum the same lengths again); the frame-size bound before decompression (cost-only: a
+frame producing fewer bytes than declared fails the length check after); clearing `compression` after
+inflation (nothing reads it); the date loop's null skip (a null slot holds day 0, a valid date); `dateText`'s
+year check (decode dropped those years); `allNull` of zero rows (a bitmap exists only once a row is null);
+`rescale`'s shortcut at scale 12 (cost-only); an empty compressed buffer written as an 8-byte raw marker
+(cost-only: every reader reads it as empty); `gather`'s text-null rule (the reader's text storage has
+consistent offsets, so `at` is null exactly when the row is not valid).
+3 unobservable: the builder's 4 GiB offset cap, a categorical of more than 2^31 distinct texts, and a Utf8
+batch past 2 GiB, each needing that many bytes in memory. No finding.
 
 ## What is deliberately not done
 
