@@ -530,6 +530,17 @@ pub fn build(b: *std.Build) void {
         "Only build tests whose name contains this substring (repeatable)",
     ) orelse &.{};
 
+    // `-Dtest-runner=<path>` — build the module tests against a SIMPLE-mode
+    // runner instead of Zig's default. For the mutation kit
+    // (`scripts/mutation/test_runner.zig`: a runtime test filter and
+    // fail-fast, so one schemata binary runs each mutant against the tests
+    // of its own file); no lane passes it.
+    const test_runner_path = b.option(
+        []const u8,
+        "test-runner",
+        "Build module tests with this simple-mode test runner (mutation kit)",
+    );
+
     // `-Dgroup=<lib>` (repeatable) — narrow the whole-collection steps
     // (`zig build`, `check-pubfn-reach`, `check-examples`, `run-examples`) to
     // the modules whose PRIMARY lib (`libs[0]`) is one of these. It exists so
@@ -725,6 +736,7 @@ pub fn build(b: *std.Build) void {
             .root_module = test_root,
             .use_llvm = use_llvm,
             .filters = test_filters,
+            .test_runner = if (test_runner_path) |p| .{ .path = b.path(p), .mode = .simple } else null,
         });
         const run = b.addRunArtifact(unit_tests);
         run.has_side_effects = fresh_run;

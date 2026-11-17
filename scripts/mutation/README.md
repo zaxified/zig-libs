@@ -73,6 +73,25 @@ hw run --slots 4 --name <m>-mut --quiet 600 -- \
     bash scripts/mutation/run.sh .zig-cache/<m>-mut <ENV_NAME> <last-id>
 ```
 
+**A module whose suite is slow, or whose deps make a hand-written `zig test`
+line fragile:** build through the build system with the kit's runner instead,
+then run the binary directly:
+
+```sh
+hw run --name <m>-mut-build -- zig build test-<m> -Doptimize=ReleaseSafe \
+    -Dtest-runner=scripts/mutation/test_runner.zig     # builds, runs mutant 0 once
+B=$(ls -t .zig-cache/o/*/<m> | head -1)
+MUT_TESTS=zkproofs.test.,presign.test. <ENV_NAME>=17 $B
+```
+
+`test_runner.zig` is the default terminal runner plus `MUT_TESTS` (comma-
+separated substrings of the fully qualified test name; unset = all) and
+fail-fast at the first failing test (`MUT_FAIL_FAST=0` to keep going), with
+the default runner's words, so `run.sh` classifies its output unchanged
+(`MUT_TESTS` passes through its environment). Without it a whole-suite run per
+mutant costs the full suite even for a mutant killed by the first test of its
+own file (threshold_ecdsa: 221 s × 111 mutants).
+
 `run.sh` runs mutant 0 (the original) first and stops if it does not pass
 under the exact command; each mutant under `ulimit -v` and
 `setsid -w timeout -s KILL` in its own session; one TSV line per mutant:
