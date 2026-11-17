@@ -2028,6 +2028,7 @@ test {
     // No-panic sweep (wave GV).
     _ = @import("sweep_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

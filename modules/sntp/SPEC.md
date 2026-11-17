@@ -6,7 +6,7 @@
 
 **Scope:** parity — beevik/ntp v1.6.0 (Go SNTP client library) (surveyed 2026-11-02)
 
-**Audit:** review 2026-09-10 · mutation 2026-09-10 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (243/245, 2 eq) · src 4e27bc0afd8f7021
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, SNTP_FUZZ) · ct n/a — time protocol (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: `fromUnixNanos` saturation, `query` checks the nonce first and discards spoofed/short replies incl. forged KoD; delta audit 11/11)
 
@@ -145,6 +145,19 @@ round-trips, offset/delay against hand-computed T1..T4 (including a negative off
 `processReply`/`validateReply` (peer-address match, truncation, origin-nonce echo, and that the
 offset math uses the real T1 rather than the wire nonce) exercised directly, without a socket. The
 live `query` test is gated behind `error.SkipZigTest`. Run: `zig build test-sntp`.
+
+## Audit 2026-11-17 (whole-module mutation)
+
+245 mutants over every non-test line of `src/root.zig` (up to `deadlineFromMs`): the `Timestamp` conversions (shifts, the u64 fast path of `fromWideNanos`, the pre-1900 clamp, the era fold of `diffNanos`, `toUnixNanosInferEra` / `Near`), the `Packet` helpers and the codec (every shift, byte slice and endianness of `encode` / `decode`, the length check), `isKissCode` and `parseKissCode`, every condition of `decodeResponse` (VN, mode, the stratum 0 / 15 / 16 edges, LI 3, T2 / T3 zero, the kiss reason and raw bytes) and `verifyOriginate`, every condition of `checkSynchronization` (boundaries, operand order, the lambda terms), `Auth` (key limits per algorithm, `macLen` per algorithm and version, the MAC input, the trailer layout and length, the NAK / key id / length branches of `verify`, the compared bytes), offset / delay / `minErrorNanos` / `rootDistanceNanos`, the clock reads, and `query` with `processReply` / `validateReplyPolicy` (nonce, request fields, signing, policy, the deferred auth error, the trunc flag, which timestamp feeds which sample slot). One schemata build in ReleaseSafe, baseline first; 206 died on the existing suite, 39 survived.
+
+17 tests added in `src/mutation_test.zig`. Eleven are boundary cases the survivors named (`isZero` with only the fraction set, the first nanosecond after 1900, `seconds == 2208988800` in `toUnixNanosInferEra`, rounding in `toUnixNanosNear` at 0.4 / 0.5 / 0.6 era and far below the pivot, root delay and dispersion read from their own fields, `pollSeconds` at 0 / 62 / 63, `referenceText` on 0x1f / 0x20 / 0x7e / 0x7f / 0x80, the kiss-code byte range, T3 == reference and lambda exactly 16 s, CMAC keys one byte too long, a 52-byte datagram that is no NAK and a datagram one byte past the MAC). Six use a scripted loopback "server" that records the request and answers with a clock 10 s ahead after holding the packet 60 ms: offset and delay from the wall clock (T1 and T4 are `ioTimestamp` reads), the request is exactly mode 3 + the asked version + a nonce that keeps the current second and has a non-zero random fraction, `timeout_ms = 0` waits, `check_sync` decides a 100 s root dispersion, a version-3 SHA-256 key signs and verifies with the 32-byte MAC both ways, a signed reply padded past the receive buffer is discarded by the trunc flag (not verified at its cut length), and an unusable key is refused before a local port that is already taken could fail the bind. All 245 mutants but two die; the loopback tests skip themselves when the sandbox refuses a loopback bind.
+
+2 do not, no defect:
+
+- EQUIVALENT: `fromUnixNanos` clamping at `ntp_ns < 0` instead of `<= 0`: `ntp_ns == 0` reaches `fromWideNanos(0)`, which is `.zero` as well.
+- UNOBSERVABLE: the `defer secureZero(mac)` of `Auth.verifyBody`: the `burn.run` around every keyed entry point overwrites the dead frame below it anyway, and the stack probe (ReleaseFast only) sees the state after the burn. Seeing it needs a probe of the unburned frame, where `std`'s hash frames hold residue at baseline. Kept as defence in depth.
+
+Not mutated: the 14 rows of the `parseKissCode` table (data; the "every RFC 5905 §7.4 code" test pins all of them), the `u64` fast-path bound of `fromWideNanos` (`<=` versus `<` at `maxInt(u64)` is cost-only: both paths compute the same value), the Windows branch of `nowUnixNanos`, the debug assert in `verifyBody`, comptime constants and defaults (`packet_len`, `max_reference_age_s`, `max_root_distance_s`, `QueryOptions` defaults), and every test file. Counts on the card are whole-module.
 
 ## Backlog / deferred
 

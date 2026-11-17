@@ -6,7 +6,7 @@
 
 **Scope:** core — Linux kernel IP reassembly behaviour, smoltcp (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-09-10 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (159/164, 5 eq) · src 927ca8ad3f5bcfc2
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ETHFRAG_FUZZ) · ct n/a — frame fragmentation (keyword review, 2026-10-07)
 
@@ -186,6 +186,20 @@ from the kernel (see that file's doc comment): this module treats an exact-dupli
 fragment as just another overlap and drops the whole datagram, while this host's
 kernel tolerates it as a harmless retransmission for both IPv4 and IPv6. Green in
 Debug and `-Doptimize=ReleaseFast`.
+
+## Audit 2026-11-17 (whole-module mutation)
+
+164 mutants over every non-test line of `src/root.zig` up to the test section: the header codec (endianness, byte offsets, the more flag, the reserved checks, the length gate), `fragment` (the frame, MTU and fragment-count limits at each boundary, the payload capacity with `header_overhead`, the split arithmetic, the stamped id, the error cleanup), `lifetimeCap` and `init` (every boundary), the counters (saturation, the class each error is tallied under), `expireOlderThan` and the inline idle check (strict boundaries, saturating subtraction, the idle / lifetime combination), and `insertInner` (every length and bound check, each error code, the table-full and budget logic with their boundaries, the initial buffer, the total-length and teardrop checks, the sorted-interval overlap checks against predecessor and successors, the completion test) and `ensureCapacity` (doubling, the frame cap, the budget trim, the exact-fit refusal). One ReleaseSafe schemata build, baseline first; 130 died on the existing suite, 34 survived.
+
+12 tests were added at the end of `src/root.zig`: golden header bytes and the stamped id (a big-endian `frag_id` was never pinned: only a round trip, where a byte-swapped id is a bijection); a 65535-byte frame, the payload capacity under `header_overhead`, and exactly 4096 fragments; `fragment` under a failing allocator (no leak at any failure point); `lifetimeCap` (default factor 8, a configured cap, saturation) and `init` at `max_frame_len = 1` / `max_fragments_per_datagram = 1`; saturating counters; a clock that goes backwards (no expiry, no trap, in `expireOlderThan` and in `insert`); the lifetime counted from the first fragment and not expired exactly at the cap; a zero-length final fragment holds no bytes and needs no budget; the budget does not reclaim expired datagrams when the new one fits exactly; a failed buffer allocation leaves no table slot; overlap against a predecessor that is not the first interval; growth doubles, is capped at `max_frame_len`, is trimmed to the budget, and a growth beyond the room under the budget is refused. All 164 mutants but five die.
+
+5 do not, none a defect:
+
+- 3 EQUIVALENT: the second `!contains(frag_id)` of the table-full block (expiry only removes, the id cannot have appeared in between); the initial `last_seen_ns = 0` (overwritten a few lines later); an always-empty initial buffer (cost-only: `ensureCapacity` grows it to exactly the needed length before any byte is stored, and `total_bytes` and the budget decisions come out identical).
+- 1 EQUIVALENT: `covered >= total_len` for `covered == total_len` (the accepted intervals are disjoint and lie inside `[0, total_len)`, so `covered` never exceeds it).
+- 1 UNOBSERVABLE: the successor scan stepping by 2 instead of 1. A run of more than one successor needs a zero-length and a non-zero interval at the same offset; a zero-length interval only exists with `more = false`, which fixes `total_len` at that offset, so the non-zero one is refused as `OutOfBounds`. The injection would be an entry built by hand with both.
+
+Not mutated: the `guardTableFull` / `guardTooManyFragments` wrappers (their only purpose is a distinct PC for the fuzz reach query), the `test_f8_*` / `test_f9_*` measurement counters, the OOM arms of `expireOlderThan` and the interval insert (best-effort paths; the failing-allocator tests above cover the cleanups they share), the `found_existing` branch test, `inflightCount` / `stats` / `totalBytes` getters, and every test. Counts on the card are whole-module.
 
 ## Backlog / deferred
 

@@ -2039,3 +2039,169 @@ test "init: every invalid config is error.InvalidConfig, never a panic" {
     var ok = try Reassembler.init(a, .{ .max_inflight = 1, .timeout_ns = 1, .max_frame_len = max_frame_len, .max_total_bytes = 1 });
     ok.deinit();
 }
+
+// ── whole-module mutation, 2026-11-17 ───────────────────────────────────────
+
+test "mutation: Header is big-endian at fixed offsets, and fragment() stamps the id" {
+    var b: [header_len]u8 = undefined;
+    (Header{ .frag_id = 0x0102, .offset = 0x0304, .length = 0x0506, .more = true }).encode(&b);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 1, 0 }, &b);
+    const h = try Header.decode(&b);
+    try testing.expectEqual(@as(u16, 0x0102), h.frag_id);
+    try testing.expectEqual(@as(u16, 0x0304), h.offset);
+    try testing.expectEqual(@as(u16, 0x0506), h.length);
+    try testing.expect(h.more);
+    const frags = try fragment(testing.allocator, "abc", 0x0A0B, 1500, 0);
+    defer freeFragments(testing.allocator, frags);
+    try testing.expectEqualSlices(u8, &.{ 0x0A, 0x0B }, frags[0].bytes[0..2]);
+}
+
+test "mutation: fragment sizes: a 65535-byte frame, header_overhead reserved, exactly 4096 fragments" {
+    const big = try testing.allocator.alloc(u8, max_frame_len);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*x, i| x.* = @truncate(i *% 31);
+    const frags = try fragment(testing.allocator, big, 1, 1500, 0);
+    defer freeFragments(testing.allocator, frags);
+    const out = (try reassembleAll(testing.allocator, .{ .max_inflight = 1, .timeout_ns = 1000 }, frags)).?;
+    defer testing.allocator.free(out);
+    try testing.expectEqualSlices(u8, big, out);
+
+    // mtu 50 minus 10 of outer framing minus the 8-byte header: 32 payload bytes
+    const hundred: [100]u8 = @splat(0x5A);
+    const reserved = try fragment(testing.allocator, &hundred, 1, 50, 10);
+    defer freeFragments(testing.allocator, reserved);
+    try testing.expectEqual(@as(usize, 4), reserved.len);
+    try testing.expectEqual(@as(usize, header_len + 32), reserved[0].bytes.len);
+    try testing.expectEqual(@as(usize, header_len + 4), reserved[3].bytes.len);
+
+    const many = try testing.allocator.alloc(u8, max_fragments_per_frame);
+    defer testing.allocator.free(many);
+    @memset(many, 1);
+    const one_byte_each = try fragment(testing.allocator, many, 1, header_len + 1, 0);
+    defer freeFragments(testing.allocator, one_byte_each);
+    try testing.expectEqual(max_fragments_per_frame, one_byte_each.len);
+}
+
+test "mutation: fragment frees everything it built when an allocation fails" {
+    var k: usize = 0;
+    while (k < 6) : (k += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = k });
+        if (fragment(fa.allocator(), "0123456789", 3, header_len + 4, 0)) |frags| {
+            freeFragments(fa.allocator(), frags);
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
+}
+
+test "mutation: lifetimeCap values and the init boundaries" {
+    try testing.expectEqual(@as(u64, 800), Reassembler.lifetimeCap(.{ .max_inflight = 1, .timeout_ns = 100 }));
+    try testing.expectEqual(@as(u64, 50), Reassembler.lifetimeCap(.{ .max_inflight = 1, .timeout_ns = 100, .max_lifetime_ns = 50 }));
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), Reassembler.lifetimeCap(.{ .max_inflight = 1, .timeout_ns = std.math.maxInt(u64) }));
+    var a = try Reassembler.init(testing.allocator, .{ .max_inflight = 1, .timeout_ns = 1, .max_frame_len = 1 });
+    a.deinit();
+    var b = try Reassembler.init(testing.allocator, .{ .max_inflight = 1, .timeout_ns = 1, .max_fragments_per_datagram = 1 });
+    b.deinit();
+}
+
+test "mutation: the counters saturate" {
+    var x: u64 = std.math.maxInt(u64);
+    Reassembler.bump(&x);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), x);
+    var y: u64 = 5;
+    Reassembler.bump(&y);
+    try testing.expectEqual(@as(u64, 6), y);
+}
+
+test "mutation: a clock that goes backwards neither expires nor traps" {
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 100 });
+    defer r.deinit();
+    var buf: [header_len + 10]u8 = undefined;
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 10, true), 1000));
+    try testing.expectEqual(@as(usize, 0), r.expireOlderThan(10));
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 10, 10, true), 20));
+    try testing.expectEqual(@as(usize, 1), r.inflightCount());
+}
+
+test "mutation: the lifetime runs from the first fragment, and exactly at the cap it has not expired" {
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000, .max_lifetime_ns = 100 });
+    defer r.deinit();
+    var buf: [header_len + 10]u8 = undefined;
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 10, true), 1_000_000));
+    try testing.expectEqual(@as(usize, 0), r.expireOlderThan(1_000_100));
+    try testing.expectEqual(@as(usize, 1), r.expireOlderThan(1_000_101));
+}
+
+test "mutation: a zero-length final fragment holds no bytes and needs no budget" {
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000, .max_total_bytes = 100 });
+    defer r.deinit();
+    var buf: [header_len]u8 = undefined;
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 200, 0, false), 0));
+    try testing.expectEqual(@as(usize, 0), r.totalBytes());
+}
+
+test "mutation: the budget reclaims expired datagrams only when the new fragment does not fit" {
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 8, .timeout_ns = 1000, .max_total_bytes = 200 });
+    defer r.deinit();
+    var buf: [header_len + 100]u8 = undefined;
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 100, true), 0));
+    // id 1 is long idle, but 100 + 100 fits the cap exactly: nothing is reclaimed
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 2, 0, 100, true), 5000));
+    try testing.expectEqual(@as(usize, 2), r.inflightCount());
+    try testing.expectEqual(@as(usize, 200), r.totalBytes());
+}
+
+test "mutation: a failed buffer allocation leaves no slot behind" {
+    var k: usize = 0;
+    while (k < 6) : (k += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = k });
+        var r = try Reassembler.init(fa.allocator(), .{ .max_inflight = 4, .timeout_ns = 1000 });
+        defer r.deinit();
+        var buf: [header_len + 10]u8 = undefined;
+        if (r.insert(testWire(&buf, 1, 0, 10, true), 0)) |_| {} else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(@as(usize, 0), r.inflightCount());
+        }
+    }
+}
+
+test "mutation: overlap is found against the predecessor, whichever interval that is" {
+    var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    defer r.deinit();
+    var buf: [header_len + 10]u8 = undefined;
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 10, true), 0));
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 20, 10, true), 0));
+    try testing.expectError(error.OverlappingFragment, r.insert(testWire(&buf, 1, 25, 10, true), 0));
+}
+
+test "mutation: buffer growth doubles, is capped at max_frame_len, and is trimmed to the budget" {
+    var buf: [header_len + 100]u8 = undefined;
+    {
+        var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+        defer r.deinit();
+        try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 100, true), 0));
+        try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 100, 10, true), 0));
+        try testing.expectEqual(@as(usize, 200), r.totalBytes());
+    }
+    {
+        var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000, .max_frame_len = 150 });
+        defer r.deinit();
+        try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 100, true), 0));
+        try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 100, 10, true), 0));
+        try testing.expectEqual(@as(usize, 150), r.totalBytes());
+    }
+    {
+        var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000, .max_total_bytes = 150 });
+        defer r.deinit();
+        try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 100, true), 0));
+        try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 100, 10, true), 0));
+        try testing.expectEqual(@as(usize, 150), r.totalBytes());
+    }
+    {
+        // growth of 60 needs more than the 50 bytes of room left under the cap
+        var r = try Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000, .max_total_bytes = 150 });
+        defer r.deinit();
+        try testing.expectEqual(InsertResult.incomplete, try r.insert(testWire(&buf, 1, 0, 100, true), 0));
+        try testing.expectError(error.BudgetExceeded, r.insert(testWire(&buf, 1, 100, 60, true), 0));
+    }
+}

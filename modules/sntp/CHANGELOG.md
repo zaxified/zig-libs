@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of `src/root.zig` (245 mutants, 243 killed, 2 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). 17 tests added in `src/mutation_test.zig` (boundary cases and a scripted loopback server that checks the request fields, the wall-clock T1/T4, the auth version and the truncation rule). No source change, no behaviour change.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-03** — **BREAKING:** `QueryError` gained `LocalAddressMismatch`, `InvalidAuthKey`, `AuthFailed`, `CryptoNak` and the four `SyncError` cases, so code that switches over it and hands the `else` to a `DecodeError` parameter no longer compiles: name the new cases (`example/main.zig` shows how). `decodeResponse` and `Sample` are unaffected.
 - **2026-11-03** — **BEHAVIOURAL, not breaking:** with `QueryOptions.auth`, a wrong-MAC reply or a crypto-NAK no longer ends `query` early: it is discarded and the wait goes on, `AuthFailed`/`CryptoNak` are returned only at the deadline. `Auth.validate` refuses `key_id` 0. `Auth.compute/sign/verify` burn their stack (`burn.zig`, `stackprobe_test.zig`, shown red with the burn removed). `Timestamp` conversions take a u64 path (cheaper on 32-bit). Proved against chronyd 4.8 with a keyfile.
