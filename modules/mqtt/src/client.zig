@@ -29,7 +29,7 @@
 //! Keep Alive (`serverLimits`) — and announces what it can hold itself
 //! (`connect`). Inbound Topic Aliases resolve through caller-provided slots
 //! (`Buffers.topic_aliases`); outbound ones are the caller's choice, per
-//! publish. Extended authentication is caller-driven: AUTH packets surface
+//! publish, or automatic when `Buffers.out_aliases` gives them room. Extended authentication is caller-driven: AUTH packets surface
 //! as `Event.auth` and go out through `auth`. A server's DISCONNECT is
 //! `Event.disconnect`.
 //!
@@ -203,6 +203,10 @@ pub const Client = struct {
     /// announced (never more than `aliases.len`).
     aliases: []AliasSlot = &.{},
     alias_max: u16 = 0,
+    /// Automatic outbound Topic Alias storage (`Buffers.out_aliases`): slot N-1
+    /// holds alias N, the first `out_alias_n` are assigned on this connection.
+    out_aliases: []AliasSlot = &.{},
+    out_alias_n: u16 = 0,
 
     next_packet_id: u16 = 1,
     pending: [max_in_flight]Pending = undefined,
@@ -251,6 +255,18 @@ pub const Client = struct {
         /// 5.0 only: room for the Topic Aliases the server may use toward
         /// this client. Empty (default) = the client accepts none.
         topic_aliases: []AliasSlot = &.{},
+        /// 5.0 only, opt-in: room for automatic outbound Topic Aliases, as
+        /// paho.golang's `topicaliases` extension does them: `publish` of a
+        /// topic that has no alias yet takes the next free one (up to
+        /// `min(len, the server's Topic Alias Maximum)`; topics up to
+        /// `alias_topic_capacity` bytes) and sends the topic with it; later
+        /// publishes of that topic send an empty topic and the alias. No
+        /// eviction -- when the slots are used, further topics go out plain.
+        /// Forgotten on `connect`. A publish that sets `properties.topic_alias`
+        /// itself is the caller's and untouched. With an outbox, a QoS 1/2
+        /// publish always carries its topic (it may be resent on a new
+        /// connection whose aliases are empty). Empty (default) = off.
+        out_aliases: []AliasSlot = &.{},
         /// Byte arena for the in-flight resume outbox. Empty (default) = no
         /// outbox, the client behaves as before (no buffering, `connect`
         /// resets everything). With room, the ENCODED bytes of every
@@ -274,7 +290,7 @@ pub const Client = struct {
     };
 
     pub fn init(transport: Transport, buffers: Buffers) Client {
-        return .{ .transport = transport, .rx_buf = buffers.rx, .tx_buf = buffers.tx, .aliases = buffers.topic_aliases, .outbox = buffers.outbox };
+        return .{ .transport = transport, .rx_buf = buffers.rx, .tx_buf = buffers.tx, .aliases = buffers.topic_aliases, .out_aliases = buffers.out_aliases, .outbox = buffers.outbox };
     }
 
     pub const PublishOptions = struct {
@@ -364,6 +380,7 @@ pub const Client = struct {
         c.version = opts.version;
         c.alias_max = alias_max;
         for (c.aliases) |*a| a.set = false;
+        c.out_alias_n = 0;
         try c.send(now, bytes);
         c.state = .connecting;
         c.keep_alive_ms = @as(u64, opts.keep_alive_s) * std.time.ms_per_s;
@@ -398,15 +415,63 @@ pub const Client = struct {
         }
         errdefer if (id != 0) c.removePending(id);
         errdefer if (id != 0) c.outboxRemove(id);
-        try c.sendPublish(now, .{
-            .topic = topic_name,
+        const plan = c.planAlias(topic_name, options);
+        const first = plan.slot != null; // a new alias: its topic goes with it
+        c.sendPublish(now, .{
+            .topic = if (plan.empty_topic) "" else topic_name,
             .payload = payload,
             .qos = options.qos,
             .retain = options.retain,
             .packet_id = id,
-            .properties = options.properties,
-        });
+            .properties = plan.properties,
+        }) catch |err| {
+            // The first-use form is 3 bytes longer than the plain one: if only
+            // that made it too large, send it plain and keep the slot free.
+            if (!first or (err != error.PacketTooLarge and err != error.BufferTooSmall)) return err;
+            try c.sendPublish(now, .{
+                .topic = topic_name,
+                .payload = payload,
+                .qos = options.qos,
+                .retain = options.retain,
+                .packet_id = id,
+                .properties = options.properties,
+            });
+            return if (id == 0) null else id;
+        };
+        if (plan.slot) |i| {
+            // Sent: the server now knows alias i + 1 for this topic.
+            const slot = &c.out_aliases[i];
+            @memcpy(slot.topic[0..topic_name.len], topic_name);
+            slot.len = topic_name.len;
+            slot.set = true;
+            c.out_alias_n += 1;
+        }
         return if (id == 0) null else id;
+    }
+
+    const AliasPlan = struct {
+        properties: packet.Properties,
+        empty_topic: bool = false,
+        /// Index of the slot a new alias will take, once the PUBLISH is sent.
+        slot: ?usize = null,
+    };
+
+    /// `Buffers.out_aliases`: which alias, if any, this publish uses.
+    fn planAlias(c: *const Client, topic_name: []const u8, o: PublishOptions) AliasPlan {
+        var plan: AliasPlan = .{ .properties = o.properties };
+        if (c.version != .v5 or c.out_aliases.len == 0 or o.properties.topic_alias != null or topic_name.len == 0) return plan;
+        for (c.out_aliases[0..c.out_alias_n], 1..) |slot, alias| {
+            if (!std.mem.eql(u8, slot.topic[0..slot.len], topic_name)) continue;
+            plan.properties.topic_alias = @intCast(alias);
+            plan.empty_topic = !(c.outbox.len > 0 and o.qos != .at_most_once);
+            return plan;
+        }
+        const room = @min(c.out_aliases.len, c.server.topic_alias_maximum);
+        if (c.out_alias_n < room and topic_name.len <= alias_topic_capacity) {
+            plan.properties.topic_alias = c.out_alias_n + 1;
+            plan.slot = c.out_alias_n;
+        }
+        return plan;
     }
 
     /// Retransmit an unacknowledged QoS > 0 publish with the DUP flag set,
@@ -1565,6 +1630,116 @@ fn makeConnected5(tt: *TestTransport, rx: []u8, tx: []u8, aliases: []AliasSlot, 
     try testing.expectEqual(packet.ReasonCode.success, ev.connack.reason_code);
     try testing.expectEqual(ConnectionState.connected, c.state);
     return c;
+}
+
+fn makeConnected5With(tt: *TestTransport, buffers: Client.Buffers, server: packet.Properties) !Client {
+    var c = Client.init(tt.transport(), buffers);
+    try c.connect(0, .{ .client_id = "v5", .keep_alive_s = 60, .version = .v5, .clean_session = false });
+    tt.reset();
+    try feed5(&c, .{ .connack = .{ .session_present = false, .properties = server } });
+    _ = (try c.poll(0)).?;
+    return c;
+}
+
+fn sentPublish(tt: *TestTransport) !packet.Publish {
+    const p = (try lastPacket5(tt)).publish;
+    return p;
+}
+
+test "v5 automatic outbound Topic Aliases: first use assigns, repeats go empty, no eviction, reset on connect" {
+    var tt = TestTransport{};
+    var rx: [256]u8 = undefined;
+    var tx: [256]u8 = undefined;
+    var out: [3]AliasSlot = .{ .{}, .{}, .{} };
+    var c = try makeConnected5With(&tt, .{ .rx = &rx, .tx = &tx, .out_aliases = &out }, .{ .topic_alias_maximum = 2 });
+    const steps = [_]struct { []const u8, []const u8, ?u16 }{
+        .{ "a", "a", 1 }, .{ "b", "b", 2 }, .{ "c", "c", null }, // the server takes 2
+        .{ "a", "", 1 },  .{ "b", "", 2 },  .{ "c", "c", null },
+    };
+    for (steps) |st| {
+        tt.reset();
+        _ = try c.publish(1, st[0], "x", .{});
+        const p = try sentPublish(&tt);
+        try testing.expectEqualStrings(st[1], p.topic);
+        try testing.expectEqual(st[2], p.properties.topic_alias);
+    }
+    // The caller's own alias wins and uses no slot.
+    tt.reset();
+    _ = try c.publish(1, "z", "x", .{ .properties = .{ .topic_alias = 2 } });
+    const own = try sentPublish(&tt);
+    try testing.expectEqualStrings("z", own.topic);
+    try testing.expectEqual(@as(?u16, 2), own.properties.topic_alias);
+    try testing.expectEqual(@as(u16, 2), c.out_alias_n);
+
+    // A new connection starts empty.
+    c.connectionLost();
+    try c.connect(2, .{ .client_id = "v5", .version = .v5 });
+    tt.reset();
+    try feed5(&c, .{ .connack = .{ .session_present = false, .properties = .{ .topic_alias_maximum = 2 } } });
+    _ = (try c.poll(2)).?;
+    tt.reset();
+    _ = try c.publish(3, "b", "x", .{});
+    const again = try sentPublish(&tt);
+    try testing.expectEqualStrings("b", again.topic);
+    try testing.expectEqual(@as(?u16, 1), again.properties.topic_alias);
+}
+
+test "v5 automatic outbound Topic Aliases: off by default, off under 3.1.1 or a server maximum of 0, never past packet size" {
+    var tt = TestTransport{};
+    var rx: [256]u8 = undefined;
+    var tx: [256]u8 = undefined;
+    var out: [3]AliasSlot = .{ .{}, .{}, .{} };
+    var none = try makeConnected5With(&tt, .{ .rx = &rx, .tx = &tx }, .{ .topic_alias_maximum = 2 });
+    _ = try none.publish(1, "a", "x", .{});
+    try testing.expectEqual(@as(?u16, null), (try sentPublish(&tt)).properties.topic_alias);
+    var zero = try makeConnected5With(&tt, .{ .rx = &rx, .tx = &tx, .out_aliases = &out }, .{});
+    tt.reset();
+    _ = try zero.publish(1, "a", "x", .{});
+    try testing.expectEqual(@as(?u16, null), (try sentPublish(&tt)).properties.topic_alias);
+
+    // The first-use form is 3 bytes longer: over the server's Maximum Packet Size it goes plain, no slot used.
+    const plain = try packet.packetWireLen(.v5, .{ .publish = .{ .topic = "a", .payload = "x" } });
+    var small = try makeConnected5With(&tt, .{ .rx = &rx, .tx = &tx, .out_aliases = &out }, .{ .topic_alias_maximum = 2, .maximum_packet_size = @intCast(plain) });
+    tt.reset();
+    _ = try small.publish(1, "a", "x", .{});
+    const p = try sentPublish(&tt);
+    try testing.expectEqualStrings("a", p.topic);
+    try testing.expectEqual(@as(?u16, null), p.properties.topic_alias);
+    try testing.expectEqual(@as(u16, 0), small.out_alias_n);
+    // Exactly the aliased size is fine.
+    var exact = try makeConnected5With(&tt, .{ .rx = &rx, .tx = &tx, .out_aliases = &out }, .{ .topic_alias_maximum = 2, .maximum_packet_size = @intCast(plain + 3) });
+    tt.reset();
+    _ = try exact.publish(1, "a", "x", .{});
+    try testing.expectEqual(@as(?u16, 1), (try sentPublish(&tt)).properties.topic_alias);
+    // A topic longer than a slot holds is sent plain.
+    const long: [alias_topic_capacity + 1]u8 = @splat('t');
+    var big_rx: [600]u8 = undefined;
+    var big_tx: [600]u8 = undefined;
+    var wide = try makeConnected5With(&tt, .{ .rx = &big_rx, .tx = &big_tx, .out_aliases = &out }, .{ .topic_alias_maximum = 2 });
+    tt.reset();
+    _ = try wide.publish(1, &long, "x", .{});
+    try testing.expectEqual(@as(?u16, null), (try sentPublish(&tt)).properties.topic_alias);
+}
+
+test "v5 automatic outbound Topic Aliases: with an outbox a QoS 1 publish always carries its topic" {
+    var tt = TestTransport{};
+    var rx: [256]u8 = undefined;
+    var tx: [256]u8 = undefined;
+    var ob: [512]u8 = undefined;
+    var out: [2]AliasSlot = .{ .{}, .{} };
+    var c = try makeConnected5With(&tt, .{ .rx = &rx, .tx = &tx, .out_aliases = &out, .outbox = &ob }, .{ .topic_alias_maximum = 2 });
+    for (0..2) |_| {
+        tt.reset();
+        _ = try c.publish(1, "a", "x", .{ .qos = .at_least_once });
+        const p = try sentPublish(&tt);
+        try testing.expectEqualStrings("a", p.topic);
+        try testing.expectEqual(@as(?u16, 1), p.properties.topic_alias);
+    }
+    tt.reset();
+    _ = try c.publish(1, "a", "x", .{}); // QoS 0 is not stored: the alias alone
+    const q0 = try sentPublish(&tt);
+    try testing.expectEqualStrings("", q0.topic);
+    try testing.expectEqual(@as(?u16, 1), q0.properties.topic_alias);
 }
 
 test "v5 connect: the client announces what it can hold, and refuses to promise more" {
