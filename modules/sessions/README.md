@@ -37,7 +37,7 @@ var mgr = try sessions.Manager.init(gpa, store.store(), .{ .io = io, .clock = .r
 Records go to a `kv` store under `prefix ++ id`, with a `kv` expiry refreshed by
 every save that drops abandoned sessions at the next `compact`. The manager
 needs `Clock.realtime` — `Manager.init` refuses the monotonic default over a
-persistent store, whose origin a reboot resets. Every save is an `fsync`, and
+persistent store, whose origin a reboot resets. Every save is an `fsync` -- including the `last_seen` roll of a session the handler did not change, as scs does when its idle timeout is on -- and
 the middleware saves on every request with a session: throughput is bounded by
 the disk's fsync rate (~300/s measured by `kv` on NVMe ext4). After a failed
 `kv` write the store answers "no session" to everything until rebuilt over a
