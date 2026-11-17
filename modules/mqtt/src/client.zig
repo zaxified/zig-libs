@@ -1652,6 +1652,12 @@ test "v5 automatic outbound Topic Aliases: first use assigns, repeats go empty, 
     var tx: [256]u8 = undefined;
     var out: [3]AliasSlot = .{ .{}, .{}, .{} };
     var c = try makeConnected5With(&tt, .{ .rx = &rx, .tx = &tx, .out_aliases = &out }, .{ .topic_alias_maximum = 2 });
+    // The caller's own alias wins, also while slots are free, and takes none.
+    _ = try c.publish(1, "z", "x", .{ .properties = .{ .topic_alias = 2 } });
+    const mine = try sentPublish(&tt);
+    try testing.expectEqualStrings("z", mine.topic);
+    try testing.expectEqual(@as(?u16, 2), mine.properties.topic_alias);
+    try testing.expectEqual(@as(u16, 0), c.out_alias_n);
     const steps = [_]struct { []const u8, []const u8, ?u16 }{
         .{ "a", "a", 1 }, .{ "b", "b", 2 }, .{ "c", "c", null }, // the server takes 2
         .{ "a", "", 1 },  .{ "b", "", 2 },  .{ "c", "c", null },
@@ -1711,6 +1717,28 @@ test "v5 automatic outbound Topic Aliases: off by default, off under 3.1.1 or a 
     tt.reset();
     _ = try exact.publish(1, "a", "x", .{});
     try testing.expectEqual(@as(?u16, 1), (try sentPublish(&tt)).properties.topic_alias);
+    // A send buffer that holds the plain form but not the aliased one: plain, no slot.
+    const body: [60]u8 = @splat('p');
+    const plain60 = try packet.packetWireLen(.v5, .{ .publish = .{ .topic = "a", .payload = &body } });
+    var tight_tx: [128]u8 = undefined;
+    var tight = try makeConnected5With(&tt, .{ .rx = &rx, .tx = tight_tx[0..plain60], .out_aliases = &out }, .{ .topic_alias_maximum = 2 });
+    tt.reset();
+    _ = try tight.publish(1, "a", &body, .{});
+    const tp = try sentPublish(&tt);
+    try testing.expectEqualStrings("a", tp.topic);
+    try testing.expectEqual(@as(?u16, null), tp.properties.topic_alias);
+    try testing.expectEqual(@as(u16, 0), tight.out_alias_n);
+    // A topic of exactly the slot capacity is aliased; one byte more is sent plain.
+    const cap_topic: [alias_topic_capacity]u8 = @splat('c');
+    var cap_rx: [600]u8 = undefined;
+    var cap_tx: [600]u8 = undefined;
+    var capc = try makeConnected5With(&tt, .{ .rx = &cap_rx, .tx = &cap_tx, .out_aliases = &out }, .{ .topic_alias_maximum = 2 });
+    tt.reset();
+    _ = try capc.publish(1, &cap_topic, "x", .{});
+    try testing.expectEqual(@as(?u16, 1), (try sentPublish(&tt)).properties.topic_alias);
+    tt.reset();
+    _ = try capc.publish(1, &cap_topic, "x", .{});
+    try testing.expectEqualStrings("", (try sentPublish(&tt)).topic);
     // A topic longer than a slot holds is sent plain.
     const long: [alias_topic_capacity + 1]u8 = @splat('t');
     var big_rx: [600]u8 = undefined;

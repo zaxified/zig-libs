@@ -6,7 +6,7 @@
 
 **Scope:** parity — Eclipse Mosquitto 2.1.2 broker + client libraries (paho, autopaho, rumqttc, mochi-mqtt): MQTT 3.1.1 and 5.0, QoS 0–2 both ways, sessions, extended AUTH, `$SYS`, bridging, persistence seam, ACL/password files, reconnect + in-flight resume, operator limits (surveyed 2026-09-30, re-surveyed 2026-10-16, gaps closed 2026-10-17)
 
-**Audit:** review 2026-10-01 · mutation 2026-11-17 (55/56, 1 eq) · src 59bdbd02dae1a2af
+**Audit:** review 2026-10-01 · mutation 2026-11-17 (87/94, 7 eq) · src bf98abc69a5b4705
 
 **Hardening:** fuzz 2026-10-17 (200,000-run budget per harness clean, MQTT_FUZZ: decode ×4, acl-parse, broker-session) · fuzz 2026-10-19 (100,000 runs, new MQTT_FUZZ harness broker-multi: shared client ids, 3.1.1 + 5.0, persistent sessions, delayed Wills, failing subscriber transports) · ct 2026-10-17 (ctgrind: CONNECT password + auth data tainted, `encode` + `decode`, 0 in-file; `acl.Passwords.verify` password tainted, 0 in acl.zig) · panic 2026-10-29 (sweep of every pub entry point, wire + session, + blind review: clock overflows, per-packet compaction and fanout linear; a non-reading subscriber is cut after `TcpServer.write_timeout_ms` (10 s) instead of blocking publishers; `Config.max_subscription_nodes` 1 Mi)
 
@@ -456,6 +456,18 @@ the workers speak 5.0 (QoS 2, identifiers, a shared subscription, session expiry
 mutants over the new guards (one schemata build), 45 killed at first; the 3 survivors became tests
 (Topic Alias 0 on decode, an alias above the client's announced maximum, a PUBCOMP that must not
 free a QoS 1 / unreleased QoS 2 message); 48/48.
+
+**Delta mutation 2026-11-17 (Topic Aliases, broker and client).** 38 schemata mutants (ReleaseSafe, one build, each under
+`setsid -w timeout` and `ulimit -v`) over `Broker.encodeDelivery` (alias found / assigned / cap / maximum-packet-size
+boundary / slot bookkeeping, the five delivery call sites, the CONNECT cap and its default, the table's release) and
+the client's `planAlias` / `publish` (slot commit after send, reset on `connect`, the caller's own alias, outbox rule,
+`min(slots, server maximum)`, the topic-capacity bound, the plain fallback for `PacketTooLarge` and
+`BufferTooSmall`). First run: 31 killed, 7 survived; one test added (the caller's own alias while slots are free), a
+rebuild killed it. Six EQUIVALENT: broker `encodeDelivery`'s version, zero-maximum and empty-topic guards (`out_alias_max`
+is set only under 5.0 and a zero maximum already stops at the slot-count test; a delivery's topic is never empty),
+client `planAlias`'s version and zero-slots guards (the server maximum is 0 under 3.1.1 and `room` is 0 without slots)
+and its empty-topic guard (an empty topic needs an explicit alias, which returns earlier). The Audit line is cumulative
+(55/56 + 32/38, 1 + 6 eq).
 
 **Delta mutation 2026-11-17** (Response Information; schemata over `broker.zig`'s tests, 8 mutants:
 the v5 gate, the request default, the fit check, the Maximum Packet Size drop and its `>` boundary,
