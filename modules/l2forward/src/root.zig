@@ -2126,3 +2126,60 @@ test "learnStats counts every learn outcome and refusal" {
     t.resetLearnStats();
     try testing.expectEqual(@as(u64, 0), t.learnStats().count(.learned));
 }
+
+// ── whole-module mutation audit 2026-11-17: boundary and edge cases ──────────
+
+test "address predicates read every octet, not the first one" {
+    try testing.expect(!isBroadcast(.{ 0xFF, 0, 0, 0, 0, 0 }));
+    try testing.expect(!isBroadcast(.{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE }));
+    try testing.expect(!isZeroMac(.{ 0, 0, 0, 0, 0, 1 }));
+    try testing.expect(!isZeroMac(.{ 0, 0x80, 0, 0, 0, 0 }));
+    try testing.expect(isZeroMac(.{ 0, 0, 0, 0, 0, 0 }));
+}
+
+test "max_mac_moves = 0: the very first move is refused and quarantines (documented)" {
+    var t = Table.init(testing.allocator, .{ .max_mac_moves = 0, .mac_move_window = 100 });
+    defer t.deinit();
+    try t.addIsid(1);
+    try testing.expectEqual(LearnOutcome.learned, try t.learn(1, macOf(1), 2, 0));
+    try testing.expectEqual(LearnOutcome.duplicate_detected, try t.learn(1, macOf(1), 3, 1));
+    try testing.expect(t.isQuarantined(1, macOf(1)));
+}
+
+test "learn counts an allocator failure and reports it" {
+    var fa = testing.FailingAllocator.init(testing.allocator, .{});
+    var t = Table.init(fa.allocator(), .{});
+    defer t.deinit();
+    try t.addIsid(1);
+    fa.fail_index = fa.alloc_index; // the next allocation (the FDB insert) fails
+    try testing.expectError(error.OutOfMemory, t.learn(1, macOf(1), 2, 0));
+    try testing.expectEqual(@as(u64, 1), t.learnStats().out_of_memory);
+    try testing.expectEqual(@as(usize, 0), t.fdbCount(1));
+}
+
+test "forget on an unknown I-SID is false; learnStatic over an existing MAC at the cap succeeds" {
+    var t = testTable(); // max_macs_per_isid = 8
+    defer t.deinit();
+    try testing.expect(!t.forget(99, macOf(1)));
+    try t.addIsid(1);
+    var i: u8 = 1;
+    while (i <= 8) : (i += 1) _ = try t.learn(1, macOf(i), 2, 0);
+    try testing.expectEqual(@as(usize, 8), t.fdbCount(1));
+    // a new MAC is refused at the cap, but pinning one that is already present
+    // is an overwrite, not an insert, so it must not hit FdbFull
+    try testing.expectError(error.FdbFull, t.learnStatic(1, macOf(9), 3, 0));
+    try t.learnStatic(1, macOf(3), 7, 0);
+    try testing.expectEqual(@as(usize, 8), t.fdbCount(1));
+    try testing.expectEqual(@as(?PeId, 7), t.lookup(1, macOf(3), 1_000_000)); // static: never ages
+    try testing.expect(t.forget(1, macOf(3)));
+}
+
+test "a move at a clock earlier than the window start stays inside the window (no underflow)" {
+    var t = Table.init(testing.allocator, .{ .max_mac_moves = 5, .mac_move_window = 100 });
+    defer t.deinit();
+    try t.addIsid(1);
+    try testing.expectEqual(LearnOutcome.learned, try t.learn(1, macOf(1), 2, 0));
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(1, macOf(1), 3, 500)); // window starts at 500
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(1, macOf(1), 2, 100)); // clock went back
+    try testing.expectEqual(@as(u8, 2), t.moveCount(1, macOf(1)));
+}

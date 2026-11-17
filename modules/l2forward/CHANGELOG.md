@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only, from a whole-module mutation audit (115 mutants, 111 killed, 4 equivalent): address predicates over every octet, `max_mac_moves = 0` quarantining on the first move, an allocator failure counted by `learn`, `forget` on an unknown I-SID, `learnStatic` over an existing MAC at the FDB cap, and a move at a clock earlier than the window start.
 - **2026-11-16** — `Table.learnStats()` / `resetLearnStats()` and `LearnStats`: saturating totals of every `learn` outcome
   (learned, refreshed, moved, duplicate_detected, denied_duplicate, static_pinned) and refusal (invalid source, unknown
   I-SID, FDB full, out of memory) — the FDB-change counters a bridge/EVPN daemon exports.
