@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the LZ4 level and ZSTD declared-0 fixes (2 mutants, both killed; Audit cumulative 454/494, 36 eq); a fuzz verdict run (200k seeds) clean.
 - **2026-11-17** — Behaviour change: LZ4 `compression_level` L < 0 is acceleration `1 - L`, as liblz4's frame API (`LZ4F_compressBlock`) and so Arrow C++ map it (it was `-L`: level -1 now compresses with acceleration 2, no longer the same as level 0). Behaviour change: a ZSTD buffer declaring 0 uncompressed bytes is decoded like any other, as Arrow C++ does (no bytes, an empty or a skippable frame are fine; junk or a frame holding data is `error.Malformed`; it used to be skipped unread). From an independent review.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the LZ4_FRAME and dictionary-before-batch changes (17 mutants: 14 killed, 2 equivalent, 1 unobservable, no finding); the Audit line is cumulative (452/492, 36 eq); fuzz verdict 200k seeds clean with both LZ4 goldens in the corpus.
 - **2026-11-17** — LZ4_FRAME read: a buffer declaring 0 uncompressed bytes must still hold one LZ4 frame (of nothing), as Arrow C++ hands the bytes to the codec whatever the declared length; junk there is `error.Malformed`. Tests for a frame followed by a skippable or an empty frame.

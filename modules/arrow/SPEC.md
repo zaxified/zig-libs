@@ -6,9 +6,9 @@
 
 **Scope:** core — Apache Arrow C++ / pyarrow (apache/arrow 26.0.1; arrow-rs `arrow-ipc` 60.1.0 as the closest-shaped permissive one) (surveyed 2026-11-17)
 
-**Audit:** review 2026-11-17 · mutation 2026-11-17 (452/492, 36 eq) · src a56a9158265b2b6c
+**Audit:** review 2026-11-17 · mutation 2026-11-17 (454/494, 36 eq) · src ef0cfd397977e65e
 
-**Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; again after the metadata / projection / Decimal32-256 / RunEndEncoded / view-type wave: 200k seeds in 24 s ReleaseSafe, clean; again after Map on read and the run-end metadata fold: 200k seeds in 35 s ReleaseSafe, clean, the Map golden reached; again after dictionary replacement and nested dictionaries: 200k seeds in 28 s ReleaseSafe, clean, the nested and shared dictionary goldens and a replacement stream reached; again after LZ4_FRAME and the dictionary-before-batch rule: 200k seeds in 19 s ReleaseSafe, clean, both LZ4 goldens and lz4-written streams in the corpus, the LZ4 stream and file goldens reached; reach: frames, files, batches, every error kind incl. InvalidUtf8 and UnknownColumn, frames from compressed inputs, projected frames, metadata reads, frames from the custom_metadata, Decimal32, Decimal256, RunEndEncoded, BinaryView/Utf8View, ListView, Map, nested and shared dictionary goldens, a dictionary replacement stream, LZ4 stream and file goldens; resource shapes the driver cannot make are in `src/hostile_test.zig`) · ct n/a — parses and writes data files, holds no secret
+**Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; again after the metadata / projection / Decimal32-256 / RunEndEncoded / view-type wave: 200k seeds in 24 s ReleaseSafe, clean; again after Map on read and the run-end metadata fold: 200k seeds in 35 s ReleaseSafe, clean, the Map golden reached; again after dictionary replacement and nested dictionaries: 200k seeds in 28 s ReleaseSafe, clean, the nested and shared dictionary goldens and a replacement stream reached; again after LZ4_FRAME and the dictionary-before-batch rule: 200k seeds in 19 s ReleaseSafe, clean, both LZ4 goldens and lz4-written streams in the corpus, the LZ4 stream and file goldens reached; again after the LZ4 level mapping and the ZSTD declared-0 rule: 200k seeds in 20 s ReleaseSafe, clean; reach: frames, files, batches, every error kind incl. InvalidUtf8 and UnknownColumn, frames from compressed inputs, projected frames, metadata reads, frames from the custom_metadata, Decimal32, Decimal256, RunEndEncoded, BinaryView/Utf8View, ListView, Map, nested and shared dictionary goldens, a dictionary replacement stream, LZ4 stream and file goldens; resource shapes the driver cannot make are in `src/hostile_test.zig`) · ct n/a — parses and writes data files, holds no secret
 
 **Performance:** not measured
 
@@ -508,6 +508,10 @@ level `< 0` → `<= 0` (EQUIVALENT: level 0 then gives acceleration 0, which `lz
 buffer declares more than 256 MiB, which a test cannot afford). Not mutated: `compressInto`'s error mapped to
 `Unsupported` (only a buffer over 4 GiB reaches it) and `decompressInto`'s error mapped to `Malformed` (arid:
 every error is the same verdict).
+
+**Audit 2026-11-17 (delta mutation, the lz4 review fixes).** Two schemata mutants, one ReleaseSafe build: the
+LZ4 acceleration `1 - level` back to `-level`, and a ZSTD buffer declaring 0 bytes skipped unread again. Both
+killed, no finding.
 
 ## What is deliberately not done
 
