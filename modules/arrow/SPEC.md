@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-11-17 · mutation 2026-11-17 (297/325, 25 eq) · src a42d409fc6b16f09
 
-**Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; reach: frames, files, batches, every error kind incl. InvalidUtf8, frames from compressed inputs; resource shapes the driver cannot make are in `src/hostile_test.zig`) · ct n/a — parses and writes data files, holds no secret
+**Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; again after the metadata / projection / Decimal32-256 / RunEndEncoded / view-type wave: 200k seeds in 24 s ReleaseSafe, clean; reach: frames, files, batches, every error kind incl. InvalidUtf8 and UnknownColumn, frames from compressed inputs, projected frames, metadata reads, frames from the custom_metadata, Decimal32, Decimal256, RunEndEncoded, BinaryView/Utf8View and ListView goldens; resource shapes the driver cannot make are in `src/hostile_test.zig`) · ct n/a — parses and writes data files, holds no secret
 
 **Performance:** not measured
 
