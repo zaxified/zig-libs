@@ -795,3 +795,146 @@ test "Cache.getStapled: the staple a caller holds survives the next refresh (no 
     try testing.expectEqualSlices(u8, good_response, staple);
     gpa.free(staple);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Export / import of cached staples across a restart
+// ════════════════════════════════════════════════════════════════════════════
+
+fn warmCache(gpa: std.mem.Allocator, mock: *MockTransport, config: ocspcache.Config) !ocspcache.Cache {
+    var cache = ocspcache.Cache.init(gpa, mock.transport(), config);
+    errdefer cache.deinit();
+    const now = this_update_unix + 100;
+    mock.body = good_response;
+    try cache.refresh(subject_with_aia, issuer_der, now);
+    mock.body = good_response3;
+    try cache.refresh(subject_with_aia2, issuer_der, now);
+    return cache;
+}
+
+test "exportEntries/importStaple: a restart serves the same staples without a fetch" {
+    const gpa = testing.allocator;
+    const now = this_update_unix + 100;
+
+    var mock: MockTransport = .{};
+    defer mock.deinit(gpa);
+    var before = try warmCache(gpa, &mock, .{ .refresh_margin_seconds = margin });
+    defer before.deinit();
+
+    const exported = try before.exportEntries(gpa, now);
+    defer ocspcache.Cache.freeExported(gpa, exported);
+    try testing.expectEqual(@as(usize, 2), exported.len);
+    // Reproducible order, and each handle really is the subject's key.
+    try testing.expect(std.mem.lessThan(u8, &exported[0].subject_key, &exported[1].subject_key));
+    const k1 = ocspcache.Cache.subjectKey(subject_with_aia);
+    const k2 = ocspcache.Cache.subjectKey(subject_with_aia2);
+    for (exported) |e| {
+        const is1 = std.mem.eql(u8, &e.subject_key, &k1);
+        try testing.expect(is1 or std.mem.eql(u8, &e.subject_key, &k2));
+        try testing.expectEqualSlices(u8, if (is1) good_response else good_response3, e.response_der);
+        try testing.expectEqual(next_update_unix, e.next_update_unix);
+    }
+
+    // "Restart": a new cache whose transport must never be called.
+    var dead: MockTransport = .{ .status = 500 };
+    defer dead.deinit(gpa);
+    var after = ocspcache.Cache.init(gpa, dead.transport(), .{ .refresh_margin_seconds = margin });
+    defer after.deinit();
+    for (exported) |e| {
+        const subject = if (std.mem.eql(u8, &e.subject_key, &k1)) subject_with_aia else subject_with_aia2;
+        try after.importStaple(subject, issuer_der, e.response_der, now);
+    }
+    try testing.expectEqual(@as(usize, 0), dead.calls);
+    try testing.expectEqual(@as(usize, 2), after.entries.count());
+    const s1 = (try after.getStapled(gpa, subject_with_aia, now)).?;
+    defer gpa.free(s1);
+    try testing.expectEqualSlices(u8, good_response, s1);
+    const s2 = (try after.getStapled(gpa, subject_with_aia2, now)).?;
+    defer gpa.free(s2);
+    try testing.expectEqualSlices(u8, good_response3, s2);
+    // Same refresh schedule as the original (the expiry is recomputed, not stored).
+    try testing.expect(!after.needsRefresh(subject_with_aia, threshold_unix));
+    try testing.expect(after.needsRefresh(subject_with_aia, threshold_unix + 1));
+    try testing.expect((try after.getStapled(gpa, subject_with_aia, next_update_unix + 1)) == null);
+}
+
+test "exportEntries: an entry past its expiry is not exported; an empty cache exports nothing" {
+    const gpa = testing.allocator;
+    var mock: MockTransport = .{};
+    defer mock.deinit(gpa);
+    var cache = try warmCache(gpa, &mock, .{});
+    defer cache.deinit();
+
+    // The boundary instant still serves (as getStapled does); one second later it does not.
+    const at = try cache.exportEntries(gpa, next_update_unix);
+    defer ocspcache.Cache.freeExported(gpa, at);
+    try testing.expectEqual(@as(usize, 2), at.len);
+    const past = try cache.exportEntries(gpa, next_update_unix + 1);
+    defer ocspcache.Cache.freeExported(gpa, past);
+    try testing.expectEqual(@as(usize, 0), past.len);
+
+    var empty = ocspcache.Cache.init(gpa, mock.transport(), .{});
+    defer empty.deinit();
+    const none = try empty.exportEntries(gpa, this_update_unix);
+    defer ocspcache.Cache.freeExported(gpa, none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "importStaple: stored bytes are verified like a fetch; every refusal leaves the cache untouched" {
+    const gpa = testing.allocator;
+    const now = this_update_unix + 100;
+    var mock: MockTransport = .{};
+    defer mock.deinit(gpa);
+    var cache = ocspcache.Cache.init(gpa, mock.transport(), .{ .max_entries = 1, .max_response_bytes = 16 * 1024 });
+    defer cache.deinit();
+
+    // Stale on disk: past nextUpdate, ocsp.verify refuses it (certmagic re-fetches a stale staple).
+    try testing.expectError(error.VerifyFailed, cache.importStaple(subject_with_aia, issuer_der, good_response, next_update_unix + 1));
+    // Tampered, and a response for another certificate (CertID mismatch).
+    try testing.expectError(error.VerifyFailed, cache.importStaple(subject_with_aia, issuer_der, tampered_response, now));
+    try testing.expectError(error.VerifyFailed, cache.importStaple(subject_with_aia2, issuer_der, good_response, now));
+    // Not an OCSP response at all; and over the size bound.
+    try testing.expectError(error.Malformed, cache.importStaple(subject_with_aia, issuer_der, "not der", now));
+    var big: [16 * 1024 + 1]u8 = undefined;
+    @memset(&big, 0);
+    try testing.expectError(error.ResponseTooLarge, cache.importStaple(subject_with_aia, issuer_der, &big, now));
+    try testing.expectEqual(@as(usize, 0), cache.entries.count());
+
+    // A good one is stored; the bound applies to a second certificate.
+    try cache.importStaple(subject_with_aia, issuer_der, good_response, now);
+    try testing.expectError(error.CacheFull, cache.importStaple(subject_with_aia2, issuer_der, good_response3, now));
+    try testing.expect(!try hasStaple(&cache, gpa, subject_with_aia2, now));
+    // Re-importing the same certificate replaces its entry (no leak under testing.allocator).
+    try cache.importStaple(subject_with_aia, issuer_der, good_response, now + 1);
+    try testing.expectEqual(@as(usize, 1), cache.entries.count());
+
+    // `unknown` leaves the entry alone; a verified `revoked` evicts it, as in refresh.
+    try testing.expectError(error.CertStatusUnknown, cache.importStaple(subject_with_aia, issuer_der, unknown_response, now));
+    try testing.expect(try hasStaple(&cache, gpa, subject_with_aia, now));
+    try testing.expectError(error.CertRevoked, cache.importStaple(subject_with_aia, issuer_der, revoked_response, now));
+    try testing.expect(!try hasStaple(&cache, gpa, subject_with_aia, now));
+}
+
+fn exportOnce(gpa: std.mem.Allocator, cache: *const ocspcache.Cache, now: i64) !void {
+    const list = try cache.exportEntries(gpa, now);
+    ocspcache.Cache.freeExported(gpa, list);
+}
+
+fn importOnce(gpa: std.mem.Allocator, now: i64) !void {
+    var dead: MockTransport = .{};
+    var cache = ocspcache.Cache.init(gpa, dead.transport(), .{});
+    defer cache.deinit();
+    cache.importStaple(subject_with_aia, issuer_der, good_response, now) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return error.TestUnexpectedResult,
+    };
+}
+
+test "exportEntries and importStaple: every allocation failure is clean (no leak, no partial state)" {
+    const gpa = testing.allocator;
+    var mock: MockTransport = .{};
+    defer mock.deinit(gpa);
+    var cache = try warmCache(gpa, &mock, .{});
+    defer cache.deinit();
+    try testing.checkAllAllocationFailures(gpa, exportOnce, .{ &cache, this_update_unix + 100 });
+    try testing.checkAllAllocationFailures(gpa, importOnce, .{this_update_unix + 100});
+}

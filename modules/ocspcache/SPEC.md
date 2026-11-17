@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | Nothing: no OCSP, no stapling. |
 | rustls | Rust | (see `tlsclient`) | — | — | Takes a staple as opaque bytes in `CertifiedKey`; fetching and refreshing is left to the application *(inferred)*. |
 
-**Where we are ahead:** of Zig `std`, the only stapling feeder available; verify-before-cache is enforced structurally (the map is mutated in one place), a verified `revoked` evicts the entry, copies are caller-owned, all bounded (`max_entries`, `max_response_bytes`), and an injectable `Transport` keeps it testable with no network. **Where we are behind:** no scheduler or persistence (by design: the caller owns timers, `now_unix` is a parameter), no HTTP cache-header use, no responder failover, no must-staple handling, and everything inherits `ocsp`'s signature-algorithm gaps (no Ed25519/P-521; ECDSA P-384 is supported since 2026-09-30).
+**Where we are ahead:** of Zig `std`, the only stapling feeder available; verify-before-cache is enforced structurally (the map is mutated in one place), a verified `revoked` evicts the entry, copies are caller-owned, all bounded (`max_entries`, `max_response_bytes`), and an injectable `Transport` keeps it testable with no network. **Where we are behind:** no scheduler (by design: the caller owns timers, `now_unix` is a parameter) and no I/O of its own, with export/import for the caller to persist staples, no HTTP cache-header use, no responder failover, no must-staple handling, and everything inherits `ocsp`'s signature-algorithm gaps (no Ed25519/P-521; ECDSA P-384 is supported since 2026-09-30).
 
 ## Scope
 
@@ -174,6 +174,37 @@ week-long OCSP validity — after revocation was positively proven. So
 error from every "could not get an answer" outcome. `Cache.invalidate` exposes
 the same eviction for a revocation learned out of band (a CRL, a CA notice).
 
+## Persistence across restarts (export / import)
+
+certmagic keeps the staple in its storage and, on start, loads it back, parses it
+against the issuer and uses it only while it is fresh, else fetches a new one;
+nginx lets a reload keep serving a staple it already holds. This module does no
+I/O (§2), so it offers the two ends and leaves the file to the caller:
+
+- `Cache.exportEntries(gpa, now_unix)` returns, ordered by key, a copy of every
+  entry `getStapled` would still serve at `now_unix`: `subject_key` (SHA-256 of
+  the subject DER, `Cache.subjectKey`), the response DER, and `next_update_unix`
+  (informational). `Cache.freeExported` releases it.
+- `Cache.importStaple(subject, issuer, response_der, now_unix)` takes a stored
+  response back. It runs the same code a fetched response does
+  (`verifyAndStore`: `parseResponse`, `ocsp.verify` against the issuer, the
+  subject's `CertID` and `now_unix`, the status, the `max_entries` bound, then the
+  single insertion point), so the "no response is cached without passing
+  `ocsp.verify`" rule holds for imports and the persisted expiry is never
+  trusted: it is recomputed from the response. Staleness on load is therefore
+  `ocsp.verify`'s freshness check (`VerifyFailed` for a response past its
+  `nextUpdate`), which is certmagic's behaviour of re-validating a stored staple
+  and re-fetching a stale one. A `revoked` response evicts and returns
+  `CertRevoked`, an `unknown` one `CertStatusUnknown`, exactly as in `refresh`;
+  every refusal leaves the cache untouched. A response larger than
+  `max_response_bytes` is `ResponseTooLarge`.
+
+Import replaces an existing entry for the same certificate (as `refresh` does),
+so a restart imports first and refreshes after; the module does not compare
+`thisUpdate` against what it holds, because the caller controls the order and
+the one source of truth for "fresher" is a fetch. Not persisted: anything but the
+verified response (counters, errors, the configuration).
+
 ## Staple ownership
 
 `getStapled` returns bytes the caller owns and frees, allocated from an
@@ -298,5 +329,5 @@ Debug and ReleaseFast.
 ## Backlog / deferred
 
 - ~~**Inherits the `ocsp` ECDSA P-384 gap**~~ (survey 2026-09-30) — **fixed in `ocsp` 2026-09-30**; nothing to change here (`refresh` verifies through `ocsp.verify`).
-- **Optional persistence of cached staples across restarts** (survey 2026-09-30). certmagic and nginx (via its cache directive) survive a reload without a cold-start window in which no staple is served; here a restart starts empty. Effort: small (expose export/import of entries as DER + expiry, caller writes the file). Fits §2 (no I/O in the module).
+- **Optional persistence of cached staples across restarts** — DONE 2026-11-17, see "Persistence across restarts".
 

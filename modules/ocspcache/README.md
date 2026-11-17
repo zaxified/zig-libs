@@ -86,6 +86,13 @@ if (try cache.getStapled(handshake_gpa, my_leaf_cert_der, now_unix)) |ocsp_respo
   - `invalidate(subject_cert_der) bool`
   - `needsRefresh(subject_cert_der, now_unix) bool`
   - `refresh(subject_cert_der, issuer_cert_der, now_unix) RefreshError!void`
+  - `exportEntries(gpa, now_unix) ![]Exported` / `freeExported(gpa, list)` /
+    `subjectKey(cert_der)` and `importStaple(subject_cert_der, issuer_cert_der,
+    response_der, now_unix) RefreshError!void` — persistence across a restart
+    without any I/O: export the still-servable staples (DER + key), write them
+    wherever you like, and at startup import each one. Import re-verifies the
+    bytes like a fetched response (a stale, tampered, foreign or revoked one is
+    refused as `refresh` would), so nothing read back is trusted.
 - `Config` — `hash` (CertID hash algo), `fetch_method` (`.post`/`.get`),
   `max_response_bytes`, `max_age_seconds`, `refresh_margin_seconds`,
   `max_entries`.

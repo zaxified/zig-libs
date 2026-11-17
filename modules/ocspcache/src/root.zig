@@ -673,6 +673,84 @@ pub const Cache = struct {
         return verdict.next_update_unix orelse (verdict.this_update_unix + max_age_seconds);
     }
 
+    /// One cached staple as `exportEntries` hands it out.
+    pub const Exported = struct {
+        /// `subjectKey` of the certificate the response is for (SHA-256 of its
+        /// DER): the caller's handle for finding the certificate again.
+        subject_key: [32]u8,
+        /// A `gpa`-owned copy of the verified `OCSPResponse` DER.
+        response_der: []u8,
+        /// When the cache would stop serving it (informational; `importStaple`
+        /// recomputes it from the response and never trusts a stored value).
+        next_update_unix: i64,
+    };
+
+    /// The cache key of a certificate (SHA-256 of its DER), the handle
+    /// `Exported.subject_key` carries.
+    pub fn subjectKey(subject_cert_der: []const u8) [32]u8 {
+        return keyOf(subject_cert_der);
+    }
+
+    /// Every staple `getStapled` would still serve at `now_unix`, as copies the
+    /// caller can write to its own storage and feed to `importStaple` after a
+    /// restart, so the first handshakes do not run without a staple. Ordered by
+    /// `subject_key` so the output is reproducible. Free with `freeExported`.
+    /// The module does no I/O: what to write, where and when is the caller's.
+    pub fn exportEntries(self: *const Cache, gpa: std.mem.Allocator, now_unix: i64) error{OutOfMemory}![]Exported {
+        var out: std.ArrayList(Exported) = .empty;
+        errdefer {
+            for (out.items) |e| gpa.free(e.response_der);
+            out.deinit(gpa);
+        }
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            if (now_unix > kv.value_ptr.next_update_unix) continue;
+            const copy = try gpa.dupe(u8, kv.value_ptr.response_der);
+            errdefer gpa.free(copy);
+            try out.append(gpa, .{
+                .subject_key = kv.key_ptr.*,
+                .response_der = copy,
+                .next_update_unix = kv.value_ptr.next_update_unix,
+            });
+        }
+        std.mem.sortUnstable(Exported, out.items, {}, struct {
+            fn lessThan(_: void, a: Exported, b: Exported) bool {
+                return std.mem.lessThan(u8, &a.subject_key, &b.subject_key);
+            }
+        }.lessThan);
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// Release what `exportEntries` returned: every copy in it and the slice.
+    pub fn freeExported(gpa: std.mem.Allocator, list: []Exported) void {
+        for (list) |e| gpa.free(e.response_der);
+        gpa.free(list);
+    }
+
+    /// Put a previously exported response back, e.g. at startup before the first
+    /// `refresh`. Nothing about the stored bytes is trusted: they go through
+    /// exactly the steps a fetched response does (`parseResponse`, then
+    /// `ocsp.verify` against `issuer_cert_der`, the subject's `CertID` and
+    /// `now_unix`, then the status and the `max_entries` bound), so a response
+    /// that went stale on disk is `VerifyFailed` (certmagic likewise
+    /// re-validates a response loaded from storage and re-fetches a stale one),
+    /// a `revoked` one evicts and returns `CertRevoked`, and a tampered or
+    /// foreign one is refused. The expiry is recomputed from the response, not
+    /// read from the file. Errors are `refresh`'s, minus the fetch ones, and
+    /// leave the cache untouched. A successful import replaces an existing
+    /// entry for the same certificate, as `refresh` does, so import before
+    /// refreshing, not after.
+    pub fn importStaple(
+        self: *Cache,
+        subject_cert_der: []const u8,
+        issuer_cert_der: []const u8,
+        response_der: []const u8,
+        now_unix: i64,
+    ) RefreshError!void {
+        if (response_der.len > self.config.max_response_bytes) return error.ResponseTooLarge;
+        return self.verifyAndStore(response_der, subject_cert_der, issuer_cert_der, now_unix);
+    }
+
     /// Fetch a fresh OCSP response for `subject_cert_der` (issued by
     /// `issuer_cert_der`), verify it, and — only on full success — cache it.
     /// `now_unix` is used both for `ocsp.verify`'s freshness check and as
@@ -723,7 +801,21 @@ pub const Cache = struct {
 
         if (resp.status != 200) return error.ResponderHttpError;
 
-        const parsed = ocsp.parseResponse(resp.body) catch return error.Malformed;
+        try self.verifyAndStore(resp.body, subject_cert_der, issuer_cert_der, now_unix);
+    }
+
+    /// Steps 4-7 of "Verify-before-cache": parse, verify against
+    /// `issuer_cert_der` and `now_unix`, act on the status, and only then store
+    /// a copy. The ONE place bytes enter `entries`, shared by `refresh` (bytes
+    /// from the responder) and `importStaple` (bytes from the caller's file).
+    fn verifyAndStore(
+        self: *Cache,
+        body: []const u8,
+        subject_cert_der: []const u8,
+        issuer_cert_der: []const u8,
+        now_unix: i64,
+    ) RefreshError!void {
+        const parsed = ocsp.parseResponse(body) catch return error.Malformed;
         if (parsed.status != .successful) return error.ResponderUnsuccessful;
         const basic_present = parsed.basic != null;
         if (!basic_present) return error.UnsupportedResponseType;
@@ -768,7 +860,7 @@ pub const Cache = struct {
             if (self.entries.count() >= self.config.max_entries) return error.CacheFull;
         }
 
-        const owned = self.gpa.dupe(u8, resp.body) catch return error.OutOfMemory;
+        const owned = self.gpa.dupe(u8, body) catch return error.OutOfMemory;
         errdefer self.gpa.free(owned);
 
         const gop = self.entries.getOrPut(self.gpa, key) catch return error.OutOfMemory;
