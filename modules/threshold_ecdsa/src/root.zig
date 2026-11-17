@@ -3543,3 +3543,258 @@ test "PublicKeys.fromBytesAlloc refuses a small-order message key (mutation audi
     defer allocator.free(bad);
     try testing.expectError(error.InvalidEncoding, PublicKeys.fromBytesAlloc(allocator, bad));
 }
+
+// ── killing tests for the 2026-11-17 whole-module mutation survivors ─────────
+// (test names carry the mutant ids so the survivor table can be mapped back)
+
+fn mutIsPrimeU64(x: u64) bool {
+    if (x < 2) return false;
+    var d: u64 = 2;
+    while (d * d <= x) : (d += 1) if (x % d == 0) return false;
+    return true;
+}
+
+test "mut 379: validate refuses a PRIME N_tilde that passes every other check" {
+    var prng = std.Random.DefaultPrng.init(0x6d75_7433_3739);
+    const random = prng.random();
+    // 2^1800 - 2163 is prime (above the q^7 floor); h1 = 4 and h2 = 16 are
+    // squares (Jacobi +1), neither is 0, 1 or of order 2: only the
+    // composite check can refuse this tuple.
+    const prime_bytes = comptime comptimeIntBytes(256, (1 << 1800) - 2163);
+    const nt = AuxModulus.fromBytes(std.mem.trimStart(u8, &prime_bytes, &.{0}), .big) catch unreachable;
+    try testing.expect(nTildeMeetsFloor(nt));
+    const bad: AuxParams = .{
+        .n_tilde = nt,
+        .h1 = AuxFe.fromBytes(nt, &[_]u8{4}, .big) catch unreachable,
+        .h2 = AuxFe.fromBytes(nt, &[_]u8{16}, .big) catch unreachable,
+    };
+    try testing.expectError(error.InvalidAuxParams, bad.validate(random));
+}
+
+test "mut 384,385: validate refuses a generator with Jacobi symbol != +1 on a large composite N_tilde" {
+    var prng = std.Random.DefaultPrng.init(0x6d75_7433_3834);
+    const random = prng.random();
+    const big_composite = comptime comptimeIntBytes(256, ((1 << 1000) + 9) * ((1 << 1000) + 15));
+    const nt = AuxModulus.fromBytes(std.mem.trimStart(u8, &big_composite, &.{0}), .big) catch unreachable;
+    const one = nt.one();
+    var scratch: [aux_scratch_bytes]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    // The smallest base whose symbol is not +1 (not 0/1 either, order != 2).
+    var v: u8 = 2;
+    while (auxFeJacobiIsOne(fba.allocator(), nt, AuxFe.fromBytes(nt, &[_]u8{v}, .big) catch unreachable)) v += 1;
+    const non_residue = AuxFe.fromBytes(nt, &[_]u8{v}, .big) catch unreachable;
+    try testing.expect(!non_residue.isZero() and !non_residue.eql(one) and !nt.sq(non_residue).eql(one));
+    const sq4 = AuxFe.fromBytes(nt, &[_]u8{4}, .big) catch unreachable;
+    const sq16 = AuxFe.fromBytes(nt, &[_]u8{16}, .big) catch unreachable;
+    try (AuxParams{ .n_tilde = nt, .h1 = sq4, .h2 = sq16 }).validate(random); // control
+    try testing.expectError(error.InvalidAuxParams, (AuxParams{ .n_tilde = nt, .h1 = non_residue, .h2 = sq16 }).validate(random));
+    try testing.expectError(error.InvalidAuxParams, (AuxParams{ .n_tilde = nt, .h1 = sq4, .h2 = non_residue }).validate(random));
+}
+
+test "mut 430: auxFeJacobiIsOne is false for a symbol of 0 (h shares a factor with N_tilde)" {
+    var scratch: [aux_scratch_bytes]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const gpa = fba.allocator();
+    const nt = AuxModulus.fromBytes(&[_]u8{187}, .big) catch unreachable; // 11 * 17
+    try testing.expect(!auxFeJacobiIsOne(gpa, nt, AuxFe.fromBytes(nt, &[_]u8{11}, .big) catch unreachable));
+    try testing.expect(!auxFeJacobiIsOne(gpa, nt, AuxFe.fromBytes(nt, &[_]u8{34}, .big) catch unreachable));
+    try testing.expect(!auxFeJacobiIsOne(gpa, nt, nt.zero));
+    try testing.expect(auxFeJacobiIsOne(gpa, nt, AuxFe.fromBytes(nt, &[_]u8{4}, .big) catch unreachable));
+}
+
+test "mut 394: shrBytesBe carries the bits of the next-higher byte" {
+    var a = [_]u8{ 0x01, 0x02, 0x03 };
+    shrBytesBe(&a, 1);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x81, 0x01 }, &a);
+    var b = [_]u8{ 0x01, 0x02, 0x03 };
+    shrBytesBe(&b, 9); // one byte and one bit
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x81 }, &b);
+    var c = [_]u8{ 0xff, 0xff, 0xff, 0xff };
+    shrBytesBe(&c, 4);
+    try testing.expectEqualSlices(u8, &.{ 0x0f, 0xff, 0xff, 0xff }, &c);
+}
+
+test "mut 396,397,398,399: generateSafePrime yields exactly-28-bit safe primes with the top two bits set, same ones as pinned" {
+    var prng = std.Random.DefaultPrng.init(0x6d75_7433_3936);
+    const random = prng.random();
+    var got: [10]u32 = undefined;
+    for (&got) |*g| {
+        var out: [4]u8 = undefined;
+        generateSafePrime(random, 28, &out);
+        const p = std.mem.readInt(u32, &out, .big);
+        g.* = p;
+        try testing.expect(p >> 26 == 0b11); // exactly 28 bits, top two set
+        try testing.expectEqual(@as(u32, 3), p & 3);
+        try testing.expect(mutIsPrimeU64(p));
+        try testing.expect(mutIsPrimeU64((p - 1) / 2));
+    }
+    // Pinned from the unmutated generator: the RNG stream is consumed
+    // identically only when every candidate is forced, sieved and tested the
+    // same way (a mutant that forces fewer bits or tests fewer candidates
+    // walks a different stream and lands on other primes).
+    const pinned = [10]u32{ 241508483, 240939239, 254152799, 260292827, 260899043, 213325523, 213681323, 250884287, 257815907, 216015083 };
+    try testing.expectEqualSlices(u32, &pinned, &got);
+}
+
+test "mut 401: generateBlumPrime yields only primes (28 bits, = 3 mod 4, top two bits set)" {
+    var prng = std.Random.DefaultPrng.init(0x6d75_7434_3031);
+    const random = prng.random();
+    for (0..24) |_| {
+        var out: [4]u8 = undefined;
+        generateBlumPrime(random, 28, &out);
+        const p = std.mem.readInt(u32, &out, .big);
+        try testing.expect(p >> 26 == 0b11);
+        try testing.expectEqual(@as(u32, 3), p & 3);
+        try testing.expect(mutIsPrimeU64(p));
+    }
+}
+
+test "mut 402,403,404: generatePaillierBlum refuses a width that is not a multiple of 16, below the floor, or above aux_modulus_bits" {
+    var prng = std.Random.DefaultPrng.init(0x6d75_7434_3032);
+    const random = prng.random();
+    var key: PaillierBlumKey = undefined;
+    try testing.expectError(error.InvalidBits, generatePaillierBlum(random, paillier.min_modulus_bits + 8, &key)); // 520: only %16
+    try testing.expectError(error.InvalidBits, generatePaillierBlum(random, paillier.min_modulus_bits - 16, &key)); // 496: only the floor
+    try testing.expectError(error.InvalidBits, generatePaillierBlum(random, aux_modulus_bits + 16, &key)); // 2064: only the cap
+}
+
+test "mut 405,406,407,408,409,410: paillierBlumFromPrimes size and Blum checks" {
+    var key: PaillierBlumKey = undefined;
+    const p7 = [_]u8{7}; // = 3 (mod 4)
+    const p11 = [_]u8{11};
+    const p13 = [_]u8{13}; // = 1 (mod 4)
+    try testing.expectError(error.InvalidPrimes, paillierBlumFromPrimes(&.{}, &p7, &key));
+    try testing.expectError(error.InvalidPrimes, paillierBlumFromPrimes(&.{ 0, 0 }, &p7, &key));
+    try testing.expectError(error.InvalidPrimes, paillierBlumFromPrimes(&p7, &.{}, &key));
+    try testing.expectError(error.InvalidPrimes, paillierBlumFromPrimes(&p7, &.{0}, &key));
+    var long: [paillier_blum_prime_bytes + 1]u8 = @splat(0x03);
+    long[0] = 0x01;
+    try testing.expectError(error.InvalidPrimes, paillierBlumFromPrimes(&long, &p7, &key));
+    try testing.expectError(error.InvalidPrimes, paillierBlumFromPrimes(&p7, &long, &key));
+    try testing.expectError(error.NotBlum, paillierBlumFromPrimes(&p13, &p7, &key));
+    try testing.expectError(error.NotBlum, paillierBlumFromPrimes(&p7, &p13, &key));
+    // control: two Blum primes are taken, and N is a valid aux modulus
+    try paillierBlumFromPrimes(&p7, &p11, &key);
+    defer key.wipe();
+    try testing.expectEqual(@as(usize, 1), key.prime_len);
+    _ = key.modulus();
+}
+
+test "mut 411,412: topHundredBitsMatch compares the first 96 bits and the next nibble" {
+    var a: [13]u8 = @splat(0xaa);
+    var b = a;
+    try testing.expect(topHundredBitsMatch(&a, &b));
+    a[12] = 0x1f;
+    b[12] = 0x10; // same top nibble
+    try testing.expect(topHundredBitsMatch(&a, &b));
+    b[12] = 0x2f; // different top nibble, first 96 bits equal
+    try testing.expect(!topHundredBitsMatch(&a, &b));
+    b[12] = 0x1f;
+    for (0..12) |i| { // any one differing byte of the first 12, equal nibble
+        b[i] ^= 0x01;
+        try testing.expect(!topHundredBitsMatch(&a, &b));
+        b[i] ^= 0x01;
+    }
+}
+
+test "mut 414,415,416: the ring-Pedersen exponent lambda is drawn in [1, p'q'), p' = (p-1)/2" {
+    var prng = std.Random.DefaultPrng.init(0x6d75_7434_3134);
+    const random = prng.random();
+    // Two 32-bit safe primes whose p'q' sits clearly below the draw bound
+    // 2^62, so a bound of ~2p'q' (an unshifted factor) is easy to see.
+    var pb: [4]u8 = undefined;
+    var qb: [4]u8 = undefined;
+    var ord: u64 = undefined;
+    while (true) {
+        generateSafePrime(random, 32, &pb);
+        generateSafePrime(random, 32, &qb);
+        if (std.mem.eql(u8, &pb, &qb)) continue;
+        const p: u64 = std.mem.readInt(u32, &pb, .big);
+        const q: u64 = std.mem.readInt(u32, &qb, .big);
+        ord = ((p - 1) / 2) * ((q - 1) / 2);
+        if (@as(u128, ord) * 10 < @as(u128, 7) << 62) break;
+    }
+    for (0..120) |_| {
+        const d = deriveAuxFromSafePrimes(&pb, &qb, 64, random);
+        const lam = try d.lambda.toPrimitive(u64);
+        try testing.expect(lam >= 1 and lam < ord);
+    }
+}
+
+fn mutDealTwo(allocator: std.mem.Allocator, random: std.Random) ![]KeyShare {
+    var kp1: paillier.KeyPair = undefined;
+    try paillier.generate(random, paillier.min_generate_bits, &kp1);
+    var kp2: paillier.KeyPair = undefined;
+    try paillier.generate(random, paillier.min_generate_bits, &kp2);
+    const paillier_keys = [_]paillier.KeyPair{ kp1, kp2 };
+    const aux = toyAuxParams();
+    const aux_params = [_]AuxParams{ aux, aux };
+    const secret = testScalar(41);
+    const coeffs = [_]Scalar{testScalar(42)};
+    return keygenTrustedDealer(allocator, 2, 2, &secret, &coeffs, &paillier_keys, &aux_params, test_message_seeds[0..2]);
+}
+
+test "mut 434,435,436,439: PublicKeys.fromBytesAlloc refuses a huge count, a missing second entry, a cut-off tail and trailing bytes" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6d75_7434_3334);
+    const key_shares = try mutDealTwo(allocator, prng.random());
+    defer allocator.free(key_shares);
+    defer allocator.free(key_shares[0].public_keys.entries);
+
+    const good = try (PublicKeys{ .entries = key_shares[0].public_keys.entries[0..1] }).toBytesAlloc(allocator);
+    defer allocator.free(good);
+    const back = try PublicKeys.fromBytesAlloc(allocator, good);
+    allocator.free(back.entries);
+
+    // 434: a count no input of this size can back, refused before the allocation
+    // (a small arena makes a missing refusal show up as OutOfMemory).
+    var tiny: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&tiny);
+    try testing.expectError(error.InvalidEncoding, PublicKeys.fromBytesAlloc(fba.allocator(), &.{ 0xff, 0xff, 0xff, 0xff }));
+
+    // 435: count says 2, the bytes hold one entry: the second index is cut off
+    const two = try allocator.dupe(u8, good);
+    defer allocator.free(two);
+    std.mem.writeInt(u32, two[0..4], 2, .big);
+    try testing.expectError(error.InvalidEncoding, PublicKeys.fromBytesAlloc(allocator, two));
+
+    // 436: the encoding ends right after the aux params (no share, no key)
+    try testing.expectError(error.InvalidEncoding, PublicKeys.fromBytesAlloc(allocator, good[0 .. good.len - (Ne + 32)]));
+
+    // 439: one trailing byte
+    const trail = try allocator.alloc(u8, good.len + 1);
+    defer allocator.free(trail);
+    @memcpy(trail[0..good.len], good);
+    trail[good.len] = 0;
+    try testing.expectError(error.InvalidEncoding, PublicKeys.fromBytesAlloc(allocator, trail));
+}
+
+test "mut 441,442: KeyShare.fromBytesAlloc refuses trailing bytes and a header share that differs from the broadcast copy" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6d75_7434_3431);
+    const key_shares = try mutDealTwo(allocator, prng.random());
+    defer allocator.free(key_shares);
+    defer allocator.free(key_shares[0].public_keys.entries);
+
+    const good = try key_shares[0].toBytesAlloc(allocator);
+    defer allocator.free(good);
+    var back: KeyShare = undefined;
+    try KeyShare.fromBytesAlloc(allocator, good, &back);
+    allocator.free(back.public_keys.entries);
+
+    // 441: one trailing byte after the public-keys field
+    const trail = try allocator.alloc(u8, good.len + 1);
+    defer allocator.free(trail);
+    @memcpy(trail[0..good.len], good);
+    trail[good.len] = 0;
+    var scratch_ks: KeyShare = undefined;
+    try testing.expectError(error.InvalidEncoding, KeyShare.fromBytesAlloc(allocator, trail, &scratch_ks));
+
+    // 442: the header's X_i replaced by the group key (a valid point, not X_1)
+    const swapped = try allocator.dupe(u8, good);
+    defer allocator.free(swapped);
+    const vs_at = 12 + Ns + Ne;
+    try testing.expect(!std.mem.eql(u8, good[12 + Ns ..][0..Ne], good[vs_at..][0..Ne]));
+    @memcpy(swapped[vs_at..][0..Ne], good[12 + Ns ..][0..Ne]);
+    try testing.expectError(error.InvalidEncoding, KeyShare.fromBytesAlloc(allocator, swapped, &scratch_ks));
+}
