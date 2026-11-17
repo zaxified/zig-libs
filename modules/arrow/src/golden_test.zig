@@ -471,6 +471,18 @@ fn hasRunEnds(fields: []const J) bool {
     return false;
 }
 
+/// Like `expectFieldMetadata` (without names) for a frame written back from one with
+/// run-end encoded fields: such a field keeps its own metadata and has no children.
+fn expectPlainMetadata(fields: []const J, got: []const stream.FieldMetadata) !void {
+    try testing.expectEqual(fields.len, got.len);
+    for (fields, got) |fj, g| {
+        try expectKeyValues(items(fj, "metadata"), g.metadata);
+        if (std.mem.eql(u8, typeName(fj), "runendencoded")) {
+            try testing.expectEqual(@as(usize, 0), g.children.len);
+        } else try expectPlainMetadata(items(fj, "children"), g.children);
+    }
+}
+
 fn expectMetadata(json: J, md: stream.Metadata, names: bool) !void {
     const sch = get(json, "schema").?;
     try expectKeyValues(items(sch, "metadata"), md.schema);
@@ -541,22 +553,24 @@ test "golden: apache/arrow-testing integration files read field by field equal t
             }
         }
 
-        // What this module writes of the frame (and of its metadata) reads back equal,
-        // plain and compressed.
-        // (A run-end encoded field is written back plain, without its two children, so its
-        // field metadata no longer has their shape: those sets are written without it.)
+        // What this module writes of the frame and of its metadata reads back equal,
+        // plain and compressed. A run-end encoded field is written back plain, without its
+        // two children: its own metadata is kept, its children's is dropped.
         const same_shape = !hasRunEnds(items(get(json, "schema").?, "fields"));
         for ([_]stream.Compression{ .none, .zstd }) |c| {
-            const wo: stream.WriteOptions = .{ .compression = c, .rows_per_batch = 8, .schema_metadata = md.schema, .field_metadata = if (same_shape) md.fields else &.{} };
-            var bmd: stream.Metadata = .{};
-            const back = try stream.writeStream(gpa, f, wo);
-            defer gpa.free(back);
-            try st.expectSameFrame(f, try stream.readStream(a, back, .{ .metadata = &bmd }));
-            if (same_shape) try expectMetadata(json, bmd, false);
-            const fback = try stream.writeFile(gpa, f, wo);
-            defer gpa.free(fback);
-            try st.expectSameFrame(f, try stream.readFile(a, fback, .{ .metadata = &bmd }));
-            if (same_shape) try expectMetadata(json, bmd, false);
+            const wo: stream.WriteOptions = .{ .compression = c, .rows_per_batch = 8, .schema_metadata = md.schema, .field_metadata = md.fields };
+            for ([_]bool{ false, true }) |file| {
+                var bmd: stream.Metadata = .{};
+                const back = if (file) try stream.writeFile(gpa, f, wo) else try stream.writeStream(gpa, f, wo);
+                defer gpa.free(back);
+                const g = if (file) try stream.readFile(a, back, .{ .metadata = &bmd }) else try stream.readStream(a, back, .{ .metadata = &bmd });
+                try st.expectSameFrame(f, g);
+                if (same_shape) try expectMetadata(json, bmd, false) else {
+                    const sch = get(json, "schema").?;
+                    try expectKeyValues(items(sch, "metadata"), bmd.schema);
+                    try expectPlainMetadata(items(sch, "fields"), bmd.fields);
+                }
+            }
         }
     }
 }

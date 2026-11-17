@@ -424,7 +424,9 @@ competing libraries and cheap enough to finish in one wave; none of them is star
 - ✅ 2026-11-17 **Schema and field key/value metadata.** Done: `ReadOptions.metadata` (an out parameter, so
   `readStream` / `readFile` / `openFile` keep their signatures) is filled with a `Metadata` — the schema's pairs,
   a `FieldMetadata` tree parallel to the frame's columns, a file footer's pairs — copied into the read's arena;
-  `WriteOptions.schema_metadata` / `field_metadata` (by position) / `footer_metadata` write them. Anchored on the
+  `WriteOptions.schema_metadata` / `field_metadata` (by position) / `footer_metadata` write them (more entries
+  than columns is `Unsupported`; more `children` than a field has — a run-end encoded field's, written back plain
+  — are dropped, the field's own metadata kept). Anchored on the
   `custom_metadata` and `extension` goldens (every set's metadata is compared with its JSON, then written back
   and read again). Was: `arrow.schema` decodes `KeyValue`s (and the writer's schema encoder
   takes them) but the frame has no slot, so Pandas metadata, extension type names (`ARROW:extension:name`) and
@@ -443,8 +445,9 @@ competing libraries and cheap enough to finish in one wave; none of them is star
   keeps the data but not the "map" tag: a write back is a List of Struct. Owner call on fidelity before doing it
   (a `lossy`-only option is the conservative form). Effort: ~0.5 wave.
 - ✅ 2026-11-17 **RunEndEncoded on read.** Done as sketched: the column reads as its values' type, each batch's
-  runs expanded (run ends signed Int16/32/64, positive, strictly increasing, the last EQUAL to the batch length,
-  no nulls on the run ends or the parent: `Malformed` otherwise); the expansion is checked against `max_cells`
+  runs expanded (run ends signed Int16/32/64, positive, strictly increasing, the last AT LEAST the batch length —
+  greater for a sliced array, as the columnar spec allows; only the batch's rows are expanded — no nulls on the
+  run ends or the parent: `Malformed` otherwise); the expansion is checked against `max_cells`
   before its selectors are allocated and then charged per row and copied byte. Anchored on the `cpp-21.0.0`
   `run_end_encoded` golden. Was: expanded into a plain column (`run_ends` Int16/32/64 must be strictly increasing and
   end at the length; the expansion is charged to `max_cells`). Effort: ~0.5 wave.

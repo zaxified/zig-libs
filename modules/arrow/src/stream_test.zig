@@ -1014,7 +1014,7 @@ test "a dictionary shared by two fields: read when the value types agree, refuse
     }
 }
 
-test "metadata: schema, field (nested) and footer key/value metadata round trip; extra entries are Unsupported" {
+test "metadata: schema, field (nested) and footer key/value metadata round trip; extra columns are Unsupported, extra children dropped" {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1064,13 +1064,24 @@ test "metadata: schema, field (nested) and footer key/value metadata round trip;
     try testing.expectEqual(@as(usize, 0), none.schema.len + none.footer.len);
     for (none.fields) |x| try testing.expectEqual(@as(usize, 0), x.metadata.len);
 
-    // More entries than columns, or than a field has children.
+    // More entries than columns: Unsupported.
     const extra = try a.alloc(stream.FieldMetadata, f.columns.len + 1);
     @memset(extra, .{});
     try testing.expectError(error.Unsupported, stream.writeStream(gpa, f, .{ .field_metadata = extra }));
+    // More children than a field has (a run-end encoded field's two, written back plain):
+    // the children's metadata is dropped, all of it, the field's own kept.
     var kids: [24]stream.FieldMetadata = @splat(.{});
-    kids[0] = .{ .children = &.{.{}} }; // an int column has no children
-    try testing.expectError(error.Unsupported, stream.writeStream(gpa, f, .{ .field_metadata = &kids }));
+    kids[0] = .{ .metadata = kv("own", "kept"), .children = &.{.{ .metadata = kv("run_ends", "") }} }; // an int column has no children
+    kids[21] = .{ .metadata = kv("l", "kept"), .children = &.{ .{ .metadata = kv("run_ends", "") }, .{ .metadata = kv("values", "") } } }; // l has one
+    const dropped = try stream.writeStream(gpa, f, .{ .field_metadata = &kids });
+    defer gpa.free(dropped);
+    var dmd: stream.Metadata = .{};
+    try expectSameFrame(f, try stream.readStream(a, dropped, .{ .metadata = &dmd }));
+    try testing.expectEqualStrings("kept", dmd.fields[0].metadata[0].value);
+    try testing.expectEqual(@as(usize, 0), dmd.fields[0].children.len);
+    try testing.expectEqualStrings("kept", dmd.fields[21].metadata[0].value);
+    try testing.expectEqual(@as(usize, 1), dmd.fields[21].children.len);
+    try testing.expectEqual(@as(usize, 0), dmd.fields[21].children[0].metadata.len);
 }
 
 test "projection: columns by name and index, in the order asked; unknown, ambiguous and repeated selections" {
@@ -1231,7 +1242,7 @@ test "decimal widths: Decimal32 / Decimal64 widen exactly, Decimal256 when it fi
     }
 }
 
-test "run-end encoded: read expanded into a plain column, over batches; bad run ends are Malformed" {
+test "run-end encoded: read expanded into a plain column, over batches; a sliced array's runs past the length are cut; bad run ends are Malformed" {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1289,8 +1300,7 @@ test "run-end encoded: read expanded into a plain column, over batches; bad run 
         .{ .ends = bytesOf(i16, &.{ 3, 1 }) },
         .{ .ends = bytesOf(i16, &.{ 0, 3 }) }, // not positive
         .{ .ends = bytesOf(i16, &.{ -1, 3 }) },
-        .{ .ends = bytesOf(i16, &.{ 1, 4 }) }, // past the length
-        .{ .ends = bytesOf(i16, &.{ 1, 2 }) }, // short of it
+        .{ .ends = bytesOf(i16, &.{ 1, 2 }) }, // short of the length
         .{ .ends = bytesOf(i16, &.{ 1, 3 }), .ree_nulls = 1 }, // nulls on the parent
         .{ .ends = bytesOf(i16, &.{ 1, 3 }), .ends_nulls = 1, .ends_valid = "\x02" }, // a null run end
         .{ .ends = bytesOf(i16, &.{ 1, 3 }), .vals_len = 1 }, // fewer values than runs
@@ -1299,6 +1309,19 @@ test "run-end encoded: read expanded into a plain column, over batches; bad run 
         const bad = try hand(gpa, &one, &.{.{ .length = 3, .nodes = &.{ nd(3, c.ree_nulls), nd(2, c.ends_nulls), nd(c.vals_len, 0) }, .bufs = &.{ c.ends_valid, c.ends, "", bytesOf(i32, &.{ 1, 2 }) } }});
         defer gpa.free(bad);
         try testing.expectError(error.Malformed, stream.readStream(a, bad, .{}));
+    }
+    // A sliced array: the last run may end past the length (one run, or several, beyond
+    // it); only the batch's rows are expanded, batch by batch.
+    {
+        const sliced = try hand(gpa, &one, &.{
+            .{ .length = 3, .nodes = &.{ nd(3, 0), nd(3, 0), nd(3, 0) }, .bufs = &.{ "", bytesOf(i16, &.{ 1, 4, 9 }), "", bytesOf(i32, &.{ 1, 2, 3 }) } },
+            .{ .length = 2, .nodes = &.{ nd(2, 0), nd(2, 0), nd(2, 0) }, .bufs = &.{ "", bytesOf(i16, &.{ 1, 5 }), "", bytesOf(i32, &.{ 4, 5 }) } },
+            .{ .length = 1, .nodes = &.{ nd(1, 0), nd(1, 0), nd(1, 0) }, .bufs = &.{ "", bytesOf(i16, &.{1}), "", bytesOf(i32, &.{6}) } },
+        });
+        defer gpa.free(sliced);
+        const g = try stream.readStream(a, sliced, .{});
+        try testing.expectEqual(@as(usize, 6), g.len);
+        for ([_]i64{ 1, 2, 2, 4, 5, 6 }, 0..) |w, i| try testing.expectEqual(w, g.columnAt(0).get(i).int);
     }
     // Run ends of a type other than signed Int16/32/64, or not two children.
     for ([_][]const schema.Field{

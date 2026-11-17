@@ -57,8 +57,9 @@ pub const WriteOptions = struct {
     schema_metadata: []const KeyValue = &.{},
     /// Key/value metadata per column, by position: entry `i` goes on column `i`'s field,
     /// its `children` on the field's children in order (a list's item, a struct's fields).
-    /// `name` is not looked at. More entries than columns (or than a field has children)
-    /// is `error.Unsupported`.
+    /// `name` is not looked at. More entries than columns is `error.Unsupported`; more
+    /// `children` than the field has (a run-end encoded field's, read and written back
+    /// plain) are dropped, the field's own metadata kept.
     field_metadata: []const FieldMetadata = &.{},
     /// The file footer's `custom_metadata` (`writeFile` only; a stream has no footer).
     footer_metadata: []const KeyValue = &.{},
@@ -340,8 +341,10 @@ const Writer = struct {
     fn toField(w: *Writer, wf: *const WField, md: ?FieldMetadata) Error!schema.Field {
         var f: schema.Field = .{ .name = wf.name, .type = wf.arrow };
         if (wf.dict) |di| f.dictionary = .{ .id = @intCast(di), .ordered = w.dicts.items[di].ordered };
-        const kmd: []const FieldMetadata = if (md) |m| m.children else &.{};
-        if (kmd.len > wf.children.len) return error.Unsupported; // metadata for children the field has not
+        // Metadata for more children than the field has (a run-end encoded field read, now
+        // written plain without its two children) no longer has their shape: the children's
+        // is dropped, the field's own kept.
+        const kmd: []const FieldMetadata = if (md) |m| (if (m.children.len <= wf.children.len) m.children else &.{}) else &.{};
         if (md) |m| f.metadata = m.metadata;
         const kids = try w.arena.alloc(schema.Field, wf.children.len);
         for (kids, wf.children, 0..) |*k, *c, i| k.* = try w.toField(c, if (i < kmd.len) kmd[i] else null);
@@ -1442,7 +1445,8 @@ const Reader = struct {
 
     /// A RunEndEncoded column expanded into a plain one: row `i` of a batch is the value of
     /// the first run whose end exceeds `i`. Run ends must be positive, strictly increasing
-    /// and end at the batch's length, with no nulls (nulls live in the values); the parent
+    /// and the last at least the batch's length (greater for a sliced array: only the
+    /// batch's rows are expanded), with no nulls (nulls live in the values); the parent
     /// has no validity of its own. The expansion (one selector per row, then the copy)
     /// is charged to `max_cells` before it is allocated.
     fn runEnded(r: *Reader, rf: *const RField, chunks: []const Chunk, n: usize) Error!ColumnData {
@@ -1476,7 +1480,7 @@ const Reader = struct {
                 if (e <= prev) return error.Malformed; // not strictly increasing (or not positive)
                 prev = e;
             }
-            if (prev != len) return error.Malformed; // the last run must end at the length
+            if (prev < len) return error.Malformed; // the runs must cover the length
             at += k;
         }
         try r.afford(n);
@@ -1484,10 +1488,12 @@ const Reader = struct {
         var row: usize = 0;
         at = 0;
         for (chunks) |c| {
+            const len = c.rb.nodes[rf.node_ix].length;
             const k: usize = @intCast(c.rb.nodes[ends_f.node_ix].length);
             const base = row;
             for (ends[at..][0..k], at..) |e, run| {
-                const end = base + @as(usize, @intCast(e));
+                // Runs past the length (a sliced array's) fill nothing.
+                const end = base + @as(usize, @intCast(@min(e, len)));
                 while (row < end) : (row += 1) sel[row] = run;
             }
             at += k;
