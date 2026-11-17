@@ -34,7 +34,9 @@ const Value = df.Value;
 /// `InvalidUtf8`: a `.text` cell that is not UTF-8 on write (Arrow's Utf8 requires it, and
 /// other readers refuse the file), or a Utf8 / LargeUtf8 value that is not on read (unless
 /// `ReadOptions.validate_utf8` is off).
-pub const Error = error{ OutOfMemory, Malformed, Unsupported, LimitExceeded, InvalidUtf8 };
+/// `UnknownColumn`: a `ReadOptions.columns` entry naming no field of the schema (or a name
+/// two fields share), an index past the last field, or a column selected twice.
+pub const Error = error{ OutOfMemory, Malformed, Unsupported, LimitExceeded, InvalidUtf8, UnknownColumn };
 
 pub const WriteOptions = struct {
     /// Rows per `RecordBatch`; 0 writes the whole frame as one batch.
@@ -131,7 +133,19 @@ pub const ReadOptions = struct {
     /// slot for it, so it comes out here. Its bytes are charged against the schema
     /// decode budget like names (one long value behind many entries is `Malformed`).
     metadata: ?*Metadata = null,
+    /// Column projection: only these top-level columns are decoded, in this order (the
+    /// frame's columns, and `Metadata.fields`, follow it). A name must name exactly one
+    /// field; an index counts the schema's fields from 0; a column may be selected once
+    /// (`error.UnknownColumn` otherwise). The other columns' buffers are neither
+    /// decompressed nor decoded, and their slots are not charged to `max_cells` (their
+    /// metadata — node and buffer counts, lengths within `max_rows` — is still checked).
+    /// A dictionary only unprojected columns use is skipped the same way: its batches'
+    /// metadata is checked, its body is not read. `null` reads every column.
+    columns: ?[]const ColumnRef = null,
 };
+
+/// A column picked by `ReadOptions.columns`: by field name or by position in the schema.
+pub const ColumnRef = union(enum) { name: []const u8, index: usize };
 
 /// A selector entry meaning "a null cell" (also what `ColumnData.get` reads past the end).
 const none = std.math.maxInt(usize);
@@ -823,6 +837,10 @@ const RDict = struct {
     chunks: std.ArrayList(Chunk) = .empty,
     data: ColumnData = .nulls,
     len: usize = 0,
+    /// Batches seen (a second non-delta one is a replacement).
+    batches: usize = 0,
+    /// Whether a projected column reads it; an unused dictionary's bodies are not read.
+    used: bool = true,
 };
 
 const Counter = struct { nodes: usize = 0, bufs: usize = 0 };
@@ -1007,27 +1025,80 @@ const Reader = struct {
         var ctr: Counter = .{};
         const fields = try r.a.alloc(RField, s.fields.len);
         for (fields, s.fields) |*rf, f| rf.* = try r.plan(f, &ctr, 0, false);
-        return .{ .fields = fields, .ctr = ctr };
+        var top: Top = .{ .fields = fields, .ctr = ctr, .pick = try iota(r.a, 0, fields.len) };
+        if (r.opts.columns) |cols| try r.project(&top, cols);
+        return top;
+    }
+
+    /// Resolves `ReadOptions.columns`: the picked fields, the nodes and buffers they own
+    /// (a top-level field's are contiguous, up to the next field's), the dictionaries
+    /// they read.
+    fn project(r: *Reader, top: *Top, cols: []const ColumnRef) Error!void {
+        const fields = top.fields;
+        const pick = try r.a.alloc(usize, cols.len);
+        const taken = try r.a.alloc(bool, fields.len);
+        @memset(taken, false);
+        for (pick, cols) |*p, c| {
+            const i: usize = switch (c) {
+                .index => |i| if (i < fields.len) i else return error.UnknownColumn,
+                .name => |nm| blk: {
+                    var found: ?usize = null;
+                    for (fields, 0..) |f, i| if (std.mem.eql(u8, f.col.name, nm)) {
+                        if (found != null) return error.UnknownColumn; // two fields of that name
+                        found = i;
+                    };
+                    break :blk found orelse return error.UnknownColumn;
+                },
+            };
+            if (taken[i]) return error.UnknownColumn; // selected twice
+            taken[i] = true;
+            p.* = i;
+        }
+        const nodes = try r.a.alloc(bool, top.ctr.nodes);
+        const bufs = try r.a.alloc(bool, top.ctr.bufs);
+        @memset(nodes, false);
+        @memset(bufs, false);
+        for (r.dicts.items) |d| d.used = false;
+        for (pick) |i| {
+            const f = &fields[i];
+            const node_end = if (i + 1 < fields.len) fields[i + 1].node_ix else top.ctr.nodes;
+            const buf_end = if (i + 1 < fields.len) fields[i + 1].buf_ix else top.ctr.bufs;
+            @memset(nodes[f.node_ix..node_end], true);
+            @memset(bufs[f.buf_ix..buf_end], true);
+            markUsed(f);
+        }
+        top.pick = pick;
+        top.need = .{ .nodes = nodes, .bufs = bufs };
+    }
+
+    fn markUsed(f: *const RField) void {
+        if (f.dict) |d| d.used = true;
+        for (f.children) |*c| markUsed(c);
     }
 
     fn takeBatch(r: *Reader, top: *const Top, msg: schema.Message, body: []const u8) Error!Chunk {
         const h = msg.header orelse return error.Malformed;
         const rb = ipc.decodeRecordBatch(r.a, h, body.len) catch |e| return noEos(e);
-        try r.checkBatch(rb, top.ctr, top.fields);
-        return r.inflate(rb, body);
+        try r.checkBatch(rb, top.ctr, top.fields, top.need, true);
+        return r.inflate(rb, body, if (top.need) |n| n.bufs else null);
     }
 
     fn takeDict(r: *Reader, msg: schema.Message, body: []const u8) Error!void {
         const h = msg.header orelse return error.Malformed;
         const db = ipc.decodeDictionaryBatch(r.a, h, body.len) catch |e| return noEos(e);
         const d = r.by_id.get(db.id) orelse return error.Malformed;
-        if (!db.is_delta and d.chunks.items.len > 0) return error.Unsupported; // replacement
-        try r.checkBatch(db.data, .{ .nodes = d.nodes, .bufs = d.bufs }, (&d.value)[0..1]);
-        try d.chunks.append(r.a, try r.inflate(db.data, body));
+        if (!db.is_delta and d.batches > 0) return error.Unsupported; // replacement
+        d.batches += 1;
+        // A dictionary no projected column reads: its metadata is checked, its body is not
+        // read (as an unprojected column's buffers are not).
+        try r.checkBatch(db.data, .{ .nodes = d.nodes, .bufs = d.bufs }, (&d.value)[0..1], null, d.used);
+        if (!d.used) return;
+        try d.chunks.append(r.a, try r.inflate(db.data, body, null));
     }
 
     fn finishDicts(r: *Reader) Error!void {
         for (r.dicts.items) |d| {
+            if (!d.used) continue;
             var n: u64 = 0;
             for (d.chunks.items) |c| n += @intCast(c.rb.length);
             if (n > r.opts.max_rows) return error.LimitExceeded;
@@ -1044,9 +1115,10 @@ const Reader = struct {
         var total: u64 = 0;
         for (chunks) |c| total += @intCast(c.rb.length);
         if (total > r.opts.max_rows) return error.LimitExceeded;
-        const columns = try r.a.alloc(Column, top.fields.len);
-        const data = try r.a.alloc(ColumnData, top.fields.len);
-        for (columns, data, top.fields) |*c, *dd, *rf| {
+        const columns = try r.a.alloc(Column, top.pick.len);
+        const data = try r.a.alloc(ColumnData, top.pick.len);
+        for (columns, data, top.pick) |*c, *dd, i| {
+            const rf = &top.fields[i];
             c.* = rf.col;
             dd.* = try r.decode(rf, chunks);
         }
@@ -1054,28 +1126,33 @@ const Reader = struct {
     }
 
     /// A batch's shape against the schema: node and buffer counts, every length within
-    /// `max_rows`, every top-level column as long as the batch; every array's length
-    /// counted against `max_cells`.
-    fn checkBatch(r: *Reader, rb: ipc.RecordBatch, ctr: Counter, top: []const RField) Error!void {
+    /// `max_rows`, every top-level column as long as the batch; the length of every array
+    /// that will be decoded (`need`: the projected ones; `count = false`: none) counted
+    /// against `max_cells`.
+    fn checkBatch(r: *Reader, rb: ipc.RecordBatch, ctr: Counter, top: []const RField, need: ?Need, count: bool) Error!void {
         if (rb.nodes.len != ctr.nodes or rb.buffers.len != ctr.bufs) return error.Malformed;
         if (@as(u64, @intCast(rb.length)) > r.opts.max_rows) return error.LimitExceeded;
-        for (rb.nodes) |nd| try r.charge(try r.rows(nd));
+        for (rb.nodes, 0..) |nd, i| {
+            const n = try r.rows(nd);
+            if (count and (need == null or need.?.nodes[i])) try r.charge(n);
+        }
         for (top) |f| if (rb.nodes[f.node_ix].length != rb.length) return error.Malformed;
     }
 
     /// A batch whose body is compressed, with every buffer decompressed into one fresh body
     /// (a batch without compression is returned as it is). Each non-empty buffer starts with
     /// its uncompressed length as an `int64`: -1 means the rest is stored raw.
-    fn inflate(r: *Reader, rb: ipc.RecordBatch, body: []const u8) Error!Chunk {
+    fn inflate(r: *Reader, rb: ipc.RecordBatch, body: []const u8, need: ?[]const bool) Error!Chunk {
         const codec = rb.compression orelse return .{ .rb = rb, .body = body };
         // LZ4_FRAME: the collection has no LZ4 codec yet; any other value is not Arrow's.
         if (codec != .zstd) return error.Unsupported;
         // The cap is over the whole read, not this message: K small messages of RLE frames
-        // would otherwise expand K times the cap.
+        // would otherwise expand K times the cap. Buffers no projected column reads (`need`)
+        // are left compressed and become empty.
         var total: u64 = 0;
-        for (rb.buffers) |l| {
+        for (rb.buffers, 0..) |l, i| {
             const src = locBytes(body, l);
-            if (src.len == 0) continue;
+            if (src.len == 0 or (need != null and !need.?[i])) continue;
             total +|= try rawLen(src);
             if (r.inflated +| total > r.opts.max_body_bytes) return error.LimitExceeded;
         }
@@ -1083,10 +1160,10 @@ const Reader = struct {
         const out = try r.a.alloc(u8, @intCast(total));
         const locs = try r.a.alloc(ipc.BufferLoc, rb.buffers.len);
         var at: usize = 0;
-        for (rb.buffers, locs) |l, *o| {
+        for (rb.buffers, locs, 0..) |l, *o, i| {
             const src = locBytes(body, l);
             var n: usize = 0;
-            if (src.len > 0) {
+            if (src.len > 0 and (need == null or need.?[i])) {
                 n = @intCast(try rawLen(src));
                 const dst = out[at..][0..n];
                 if (std.mem.readInt(i64, src[0..8], .little) == -1) {
@@ -1750,12 +1827,14 @@ fn noEos(e: ipc.Error) Error {
     };
 }
 
-/// The schema's, the fields' and the footer's key/value metadata, copied into `arena`
-/// (the decoded schema points into the input).
-fn copyMetadata(arena: Allocator, s: schema.Schema, footer: []const KeyValue) Error!Metadata {
+/// The schema's, the picked fields' (in the frame's column order) and the footer's
+/// key/value metadata, copied into `arena` (the decoded schema points into the input).
+fn copyMetadata(arena: Allocator, s: schema.Schema, pick: []const usize, footer: []const KeyValue) Error!Metadata {
+    const fields = try arena.alloc(schema.Field, pick.len);
+    for (fields, pick) |*f, i| f.* = s.fields[i];
     return .{
         .schema = try copyKeyValues(arena, s.metadata),
-        .fields = try copyFieldMetadata(arena, s.fields),
+        .fields = try copyFieldMetadata(arena, fields),
         .footer = try copyKeyValues(arena, footer),
     };
 }
@@ -1790,7 +1869,7 @@ pub fn readStream(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!
     if (first.msg.header_type != .schema) return error.Malformed;
     const s = try schema.decodeSchema(arena, first.msg.header orelse return error.Malformed);
     const top = try r.planAll(s);
-    if (opts.metadata) |m| m.* = try copyMetadata(arena, s, &.{});
+    if (opts.metadata) |m| m.* = try copyMetadata(arena, s, top.pick, &.{});
 
     var batches: std.ArrayList(Chunk) = .empty;
     while (true) {
@@ -1857,7 +1936,7 @@ pub fn openFile(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!Fi
     var r: Reader = .{ .a = arena, .opts = opts };
     const s = try schema.decodeSchema(arena, try footer.table(1) orelse return error.Malformed);
     const top = try r.planAll(s);
-    if (opts.metadata) |m| m.* = try copyMetadata(arena, s, try schema.decodeKeyValues(arena, footer, 4));
+    if (opts.metadata) |m| m.* = try copyMetadata(arena, s, top.pick, try schema.decodeKeyValues(arena, footer, 4));
 
     // The messages live between the leading mark and the footer. Every block is located
     // and checked before anything is inflated.
@@ -1923,5 +2002,10 @@ fn readBlock(region: []const u8, raw: []const u8, span: *Span) Error!ipc.Read {
     return m;
 }
 
-/// The planned top-level columns and the node/buffer counts a record batch must have.
-const Top = struct { fields: []RField, ctr: Counter };
+/// The planned top-level columns and the node/buffer counts a record batch must have;
+/// the columns a projection picked (all, in order, without one) and the nodes and buffers
+/// they own (null: all).
+const Top = struct { fields: []RField, ctr: Counter, pick: []const usize, need: ?Need = null };
+
+/// Which nodes and buffers of a record batch a projection decodes.
+const Need = struct { nodes: []const bool, bufs: []const bool };

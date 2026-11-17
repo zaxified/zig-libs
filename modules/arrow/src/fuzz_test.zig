@@ -221,6 +221,7 @@ fn outcome(e: stream.Error) ?df.Frame {
         error.LimitExceeded => fuzz_driver.hit("LimitExceeded"),
         error.OutOfMemory => fuzz_driver.hit("OutOfMemory"),
         error.InvalidUtf8 => fuzz_driver.hit("InvalidUtf8"),
+        error.UnknownColumn => fuzz_driver.hit("UnknownColumn"),
     }
     return null;
 }

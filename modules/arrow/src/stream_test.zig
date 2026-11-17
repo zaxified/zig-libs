@@ -1070,3 +1070,99 @@ test "metadata: schema, field (nested) and footer key/value metadata round trip;
     kids[0] = .{ .children = &.{.{}} }; // an int column has no children
     try testing.expectError(error.Unsupported, stream.writeStream(gpa, f, .{ .field_metadata = &kids }));
 }
+
+test "projection: columns by name and index, in the order asked; unknown, ambiguous and repeated selections" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const f = try sampleFrame(a);
+    const st_ix = for (f.columns, 0..) |c, i| {
+        if (std.mem.eql(u8, c.name, "st")) break i;
+    } else unreachable;
+    const cat_ix = for (f.columns, 0..) |c, i| {
+        if (std.mem.eql(u8, c.name, "cat")) break i;
+    } else unreachable;
+    const refs = [_]stream.ColumnRef{ .{ .name = "st" }, .{ .index = 0 }, .{ .name = "cat" }, .{ .name = "lcat" } };
+    const lcat_ix = f.columns.len - 2;
+    const want_ix = [_]usize{ st_ix, 0, cat_ix, lcat_ix };
+    var cols: [4]Column = undefined;
+    var data: [4]ColumnData = undefined;
+    for (want_ix, 0..) |i, k| {
+        cols[k] = f.columns[i];
+        data[k] = f.columnAt(i);
+    }
+    const want: df.Frame = .{ .columns = &cols, .data = &data, .len = f.len };
+    const fm = [_]stream.FieldMetadata{.{ .metadata = &.{.{ .key = "first", .value = "1" }} }};
+    for ([_]stream.Compression{ .none, .zstd }) |c| {
+        const wo: stream.WriteOptions = .{ .compression = c, .rows_per_batch = 2, .field_metadata = &fm };
+        const sb = try stream.writeStream(gpa, f, wo);
+        defer gpa.free(sb);
+        const fb_ = try stream.writeFile(gpa, f, wo);
+        defer gpa.free(fb_);
+        var md: stream.Metadata = .{};
+        try expectSameFrame(want, try stream.readStream(a, sb, .{ .columns = &refs, .metadata = &md }));
+        // Metadata follows the frame's columns: column 0 ("i64") is now the second.
+        try testing.expectEqual(@as(usize, 4), md.fields.len);
+        try testing.expectEqualStrings("st", md.fields[0].name);
+        try testing.expectEqualStrings("first", md.fields[1].metadata[0].key);
+        try expectSameFrame(want, try stream.readFile(a, fb_, .{ .columns = &refs }));
+        var file = try stream.openFile(a, fb_, .{ .columns = &refs });
+        const b1 = try file.readBatch(1);
+        try testing.expectEqual(@as(usize, 4), b1.columns.len);
+        try expectRows(want, 2, b1);
+        // No column at all: the rows, nothing else.
+        const none = try stream.readStream(a, sb, .{ .columns = &.{} });
+        try testing.expectEqual(f.len, none.len);
+        try testing.expectEqual(@as(usize, 0), none.columns.len);
+        for ([_][]const stream.ColumnRef{
+            &.{.{ .name = "nope" }},
+            &.{.{ .index = f.columns.len }},
+            &.{ .{ .name = "st" }, .{ .index = st_ix } },
+        }) |bad| {
+            try testing.expectError(error.UnknownColumn, stream.readStream(a, sb, .{ .columns = bad }));
+            try testing.expectError(error.UnknownColumn, stream.readFile(a, fb_, .{ .columns = bad }));
+        }
+    }
+    // A name two fields share picks neither.
+    const dup = [_]schema.Field{ .{ .name = "x", .type = .{ .int = .{ .bits = 8, .signed = true } } }, .{ .name = "x", .type = .{ .int = .{ .bits = 8, .signed = true } } } };
+    const one: ipc.FieldNode = .{ .length = 1, .null_count = 0 };
+    const db = try hand(gpa, &dup, &.{.{ .length = 1, .nodes = &.{ one, one }, .bufs = &.{ "", "\x01", "", "\x02" } }});
+    defer gpa.free(db);
+    try testing.expectError(error.UnknownColumn, stream.readStream(a, db, .{ .columns = &.{.{ .name = "x" }} }));
+    try testing.expectEqual(@as(i64, 2), (try stream.readStream(a, db, .{ .columns = &.{.{ .index = 1 }} })).columnAt(0).get(0).int);
+}
+
+test "projection: unprojected columns and dictionaries are neither decompressed nor decoded nor charged" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // "bad" holds bytes that are not UTF-8, "cat"'s dictionary too; "x" is fine.
+    const fields = [_]schema.Field{
+        .{ .name = "bad", .type = .utf8 },
+        .{ .name = "x", .type = .{ .int = .{ .bits = 32, .signed = true } } },
+        .{ .name = "cat", .type = .utf8, .dictionary = .{ .id = 0 } },
+    };
+    const two: ipc.FieldNode = .{ .length = 2, .null_count = 0 };
+    const bytes = try hand(gpa, &fields, &.{
+        .{ .length = 1, .dict_id = 0, .nodes = &.{.{ .length = 1, .null_count = 0 }}, .bufs = &.{ "", bytesOf(i32, &.{ 0, 1 }), "\xff" } },
+        .{ .length = 2, .nodes = &.{ two, two, two }, .bufs = &.{ "", bytesOf(i32, &.{ 0, 1, 2 }), "\xc3\x28", "", bytesOf(i32, &.{ 7, 8 }), "", bytesOf(i32, &.{ 0, 0 }) } },
+    });
+    defer gpa.free(bytes);
+    try testing.expectError(error.InvalidUtf8, stream.readStream(a, bytes, .{}));
+    try testing.expectError(error.InvalidUtf8, stream.readStream(a, bytes, .{ .columns = &.{.{ .name = "cat" }} }));
+    const f = try stream.readStream(a, bytes, .{ .columns = &.{.{ .name = "x" }} });
+    try testing.expectEqual(@as(i64, 8), f.columnAt(0).get(1).int);
+    // Only the projected column's slots count: 2 rows of 1 column (+ none of the dictionary's).
+    _ = try stream.readStream(a, bytes, .{ .columns = &.{.{ .name = "x" }}, .max_cells = 2 });
+    try testing.expectError(error.LimitExceeded, stream.readStream(a, bytes, .{ .max_cells = 6 }));
+
+    // Compressed: the unprojected columns' buffers do not count against max_body_bytes.
+    const sf = try sampleFrame(a);
+    const z = try stream.writeStream(gpa, sf, .{ .compression = .zstd });
+    defer gpa.free(z);
+    try testing.expectError(error.LimitExceeded, stream.readStream(a, z, .{ .max_body_bytes = 64 }));
+    const p = try stream.readStream(a, z, .{ .max_body_bytes = 64, .columns = &.{.{ .name = "i64" }} });
+    try testing.expectEqual(@as(i64, -2), p.columnAt(0).get(1).int);
+}

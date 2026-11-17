@@ -407,6 +407,18 @@ fn expectMetadata(json: J, md: stream.Metadata, names: bool) !void {
     try expectFieldMetadata(items(sch, "fields"), md.fields, names);
 }
 
+/// A projected read `p` against the full read `full`: the columns `refs` picked (by
+/// index), in that order, cell for cell.
+fn expectProjected(full: df.Frame, p: df.Frame, refs: []const stream.ColumnRef) !void {
+    var cols: [64]df.Column = undefined;
+    var data: [64]df.ColumnData = undefined;
+    for (refs, 0..) |x, k| {
+        cols[k] = full.columns[x.index];
+        data[k] = full.columnAt(x.index);
+    }
+    try st.expectSameFrame(.{ .columns = cols[0..refs.len], .data = data[0..refs.len], .len = full.len }, p);
+}
+
 test "golden: apache/arrow-testing integration files read field by field equal to their JSON" {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -439,6 +451,23 @@ test "golden: apache/arrow-testing integration files read field by field equal t
                 const n: usize = @intCast(try jint(get(b, "count").?));
                 try testing.expectEqual(n, file.batchRows(i));
                 try testing.expectEqual(n, (try file.readBatch(i)).len);
+            }
+        }
+
+        // Projection: the columns in reverse order, then each alone, read as the full
+        // frame's (stream and file).
+        {
+            const n = f.columns.len;
+            const refs = try a.alloc(stream.ColumnRef, n);
+            for (refs, 0..) |*x, i| x.* = .{ .index = n - 1 - i };
+            var popts: stream.ReadOptions = .{ .lossy = lossy, .columns = refs };
+            try expectProjected(f, try stream.readStream(a, s.stream, popts), refs);
+            if (s.file) |bytes| try expectProjected(f, try stream.readFile(a, bytes, popts), refs);
+            for (0..n) |i| {
+                const one = [_]stream.ColumnRef{.{ .index = i }};
+                popts.columns = &one;
+                try expectProjected(f, try stream.readStream(a, s.stream, popts), &one);
+                if (s.file) |bytes| try expectProjected(f, try stream.readFile(a, bytes, popts), &one);
             }
         }
 

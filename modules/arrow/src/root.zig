@@ -35,6 +35,12 @@ pub const Error = stream.Error;
 pub const WriteOptions = stream.WriteOptions;
 pub const ReadOptions = stream.ReadOptions;
 pub const Compression = stream.Compression;
+/// Key/value metadata (`ReadOptions.metadata` out, `WriteOptions.*_metadata` in).
+pub const KeyValue = stream.KeyValue;
+pub const FieldMetadata = stream.FieldMetadata;
+pub const Metadata = stream.Metadata;
+/// A column picked by `ReadOptions.columns` (by name or by index).
+pub const ColumnRef = stream.ColumnRef;
 /// The frame as an Arrow IPC stream (caller frees the bytes).
 pub const writeStream = stream.writeStream;
 /// An Arrow IPC stream as a frame allocated from an arena.

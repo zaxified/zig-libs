@@ -145,8 +145,8 @@ ZSTD built in both ways, no C, no `libarrow`. Nothing here is a measured lead, s
 **Where we are behind** (all in Backlog): the types the format has and `dataframe` has no column for (Map, Union,
 Interval, Decimal256, run-end, the view types, ListView) are refused, and so are Decimal32/64; LZ4_FRAME, the
 other codec every Arrow implementation but this one has and the default of pyarrow's Feather writer, is refused
-(waits for an `lz4` module); dictionary replacement and a dictionary nested in a list or struct are refused; there is no column
-projection, no zero-copy or memory-mapped read, no incremental reader or writer over `std.Io` (the input and the
+(waits for an `lz4` module); dictionary replacement and a dictionary nested in a list or struct are refused; there is no
+zero-copy or memory-mapped read, no incremental reader or writer over `std.Io` (the input and the
 output are whole byte slices), no big-endian byte swap; the writer's output has not been read by a foreign
 implementation and no speed was measured.
 
@@ -156,7 +156,8 @@ Apache Arrow IPC — the stream format and the file (Feather v2) format — betw
 `dataframe.Frame`: `writeStream` / `writeFile` turn a frame into Arrow, `readStream` / `readFile` read one back,
 `openFile` gives random access to a file's record batches, ZSTD body compression both ways, the schema's, fields'
 and file footer's key/value metadata both ways (`ReadOptions.metadata`, `WriteOptions.schema_metadata` /
-`field_metadata` / `footer_metadata`: `dataframe.Frame` has no slot for it). Underneath, a
+`field_metadata` / `footer_metadata`: `dataframe.Frame` has no slot for it), column projection on read
+(`ReadOptions.columns`). Underneath, a
 bounds-checked FlatBuffers reader and builder, the `Schema.fbs` / `Message.fbs` / `File.fbs` tables, and the
 message framing, each usable on its own (`arrow.fb`, `arrow.schema`, `arrow.ipc`). Every input is untrusted: a
 hostile stream ends in an error, within the limits below, never in a crash or an unbounded allocation.
@@ -228,7 +229,8 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
 - `ReadOptions.max_rows` (default 2^27, ours): the most rows any one array may claim — the frame's rows summed over
   the batches, a list's elements, a dictionary's entries.
 - `ReadOptions.max_cells` (default 2^28, ours): the most array slots the whole read may decode — every array's
-  length (column, list child, struct field, dictionary) summed over every batch, plus every row, list element and
+  length (column, list child, struct field, dictionary; under `ReadOptions.columns` only the projected columns'
+  and the dictionaries they use) summed over every batch, plus every row, list element and
   byte a dictionary column copies out of its dictionary. `max_rows` bounds one array; this bounds their number
   times their length, which matters where rows cost no body bytes: FixedSizeBinary(0), FixedSizeList(0) and Null
   children, and one large dictionary entry selected by many one-byte indices. The reader spends up to ~16 bytes
@@ -423,7 +425,14 @@ competing libraries and cheap enough to finish in one wave; none of them is star
   (a `lossy`-only option is the conservative form). Effort: ~0.5 wave.
 - **RunEndEncoded on read**, expanded into a plain column (`run_ends` Int16/32/64 must be strictly increasing and
   end at the length; the expansion is charged to `max_cells`). Effort: ~0.5 wave.
-- **Column projection:** `ReadOptions.columns` (names), decoding and decompressing only those fields' buffers,
+- ✅ 2026-11-17 **Column projection.** Done: `ReadOptions.columns` picks top-level columns by name or by index,
+  in the order given (`error.UnknownColumn` for a name no field or two fields have, an index past the last, a
+  repeat); the other columns' buffers are neither decompressed nor decoded nor charged to `max_cells` /
+  `max_body_bytes` (their node and buffer counts and lengths are still checked), through `File.readBatch` too. A
+  dictionary that only unprojected columns use is SKIPPED, not validated: its batches' metadata is checked (id
+  known, counts, `max_rows`, replacement), its body is not read — decoding it would cost what projection saves,
+  and a defect in it is as invisible to the frame as one in an unprojected column's buffers. Anchored on every
+  golden set (all columns reversed, then each alone, equal to the full read). Was: `ReadOptions.columns` (names), decoding and decompressing only those fields' buffers,
   also through `File.readBatch`; the others are skipped by the buffer index. Why: every implementation compared
   has it for files and it is what makes a wide file affordable. Effort: ~0.5 wave.
 - **Dictionary replacement in a stream** (a second non-delta `DictionaryBatch` for an id, today `Unsupported`).
