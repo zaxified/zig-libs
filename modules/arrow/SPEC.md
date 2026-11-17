@@ -6,9 +6,9 @@
 
 **Scope:** core — Apache Arrow C++ / pyarrow (apache/arrow 26.0.1; arrow-rs `arrow-ipc` 60.1.0 as the closest-shaped permissive one) (surveyed 2026-11-17)
 
-**Audit:** review 2026-11-17 · mutation 2026-11-17 (438/475, 34 eq) · src 054c958f86983424
+**Audit:** review 2026-11-17 · mutation 2026-11-17 (452/492, 36 eq) · src a56a9158265b2b6c
 
-**Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; again after the metadata / projection / Decimal32-256 / RunEndEncoded / view-type wave: 200k seeds in 24 s ReleaseSafe, clean; again after Map on read and the run-end metadata fold: 200k seeds in 35 s ReleaseSafe, clean, the Map golden reached; again after dictionary replacement and nested dictionaries: 200k seeds in 28 s ReleaseSafe, clean, the nested and shared dictionary goldens and a replacement stream reached; reach: frames, files, batches, every error kind incl. InvalidUtf8 and UnknownColumn, frames from compressed inputs, projected frames, metadata reads, frames from the custom_metadata, Decimal32, Decimal256, RunEndEncoded, BinaryView/Utf8View, ListView, Map, nested and shared dictionary goldens and a dictionary replacement stream; resource shapes the driver cannot make are in `src/hostile_test.zig`) · ct n/a — parses and writes data files, holds no secret
+**Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; again after the metadata / projection / Decimal32-256 / RunEndEncoded / view-type wave: 200k seeds in 24 s ReleaseSafe, clean; again after Map on read and the run-end metadata fold: 200k seeds in 35 s ReleaseSafe, clean, the Map golden reached; again after dictionary replacement and nested dictionaries: 200k seeds in 28 s ReleaseSafe, clean, the nested and shared dictionary goldens and a replacement stream reached; again after LZ4_FRAME and the dictionary-before-batch rule: 200k seeds in 19 s ReleaseSafe, clean, both LZ4 goldens and lz4-written streams in the corpus, the LZ4 stream and file goldens reached; reach: frames, files, batches, every error kind incl. InvalidUtf8 and UnknownColumn, frames from compressed inputs, projected frames, metadata reads, frames from the custom_metadata, Decimal32, Decimal256, RunEndEncoded, BinaryView/Utf8View, ListView, Map, nested and shared dictionary goldens, a dictionary replacement stream, LZ4 stream and file goldens; resource shapes the driver cannot make are in `src/hostile_test.zig`) · ct n/a — parses and writes data files, holds no secret
 
 **Performance:** not measured
 
@@ -488,6 +488,20 @@ refuses it as `Malformed` first); `markUsed` recursing into an already used dict
 survives planning); `takeDict`'s `max_rows` over the generations (decode sums the same chunks' lengths against
 `max_rows` before allocating; cost-only); `finishDicts` decoding an unused dictionary (it has no chunks;
 cost-only, as in the whole-module audit). No finding.
+
+**Audit 2026-11-17 (delta mutation, LZ4_FRAME and the dictionary-before-batch rule).** Base `9ffad6308`. 17
+schemata mutants over the non-test code the change touched: `emit`'s codec choice (compress when `lz4o` is set,
+the codec written; 2); `compressBody`'s bound (1); `write`'s level mapping (the HC bound off by one and dropped,
+`< 0` → `<= 0`, the acceleration ignored, `lz4o` never set; 5); `RDict.genAt` (the before-the-first-generation
+case dropped and `>` → `>=`; 2); `inflate` (LZ4_FRAME refused, the declared-0 frame skipped, the short-buffer and
+magic checks, `multi_frame`, the output cap, the length check; 7). Same method as above, one ReleaseSafe build.
+14 killed, 2 equivalent, 1 unobservable, no finding: zstd's `compressBound` for an LZ4 buffer (EQUIVALENT,
+cost-only: it is never below LZ4's frame bound, `n + 63` or more against `n + 15 + 4` per 64 KiB block);
+level `< 0` → `<= 0` (EQUIVALENT: level 0 then gives acceleration 0, which `lz4` clamps to 1); the LZ4 decode cap
+`null` → `lz4.default_max_output` (UNOBSERVABLE here: the declared length caps the output first unless one
+buffer declares more than 256 MiB, which a test cannot afford). Not mutated: `compressInto`'s error mapped to
+`Unsupported` (only a buffer over 4 GiB reaches it) and `decompressInto`'s error mapped to `Malformed` (arid:
+every error is the same verdict).
 
 ## What is deliberately not done
 

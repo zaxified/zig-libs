@@ -6,9 +6,9 @@
 
 **Scope:** core — liblz4 1.10.0 and its lz4 CLI (surveyed 2026-11-17)
 
-**Audit:** review none · mutation 2026-11-17 (97/109, 11 eq) · src ac76d992ce691ad6
+**Audit:** review none · mutation 2026-11-17 (101/113, 11 eq) · src 4366df3c681bd6ba
 
-**Hardening:** fuzz 2026-11-17 (three verdict runs over disjoint seed ranges, the last on the final code, each 400,000 frame-decoder + 400,000 block-decoder + 50,000 round-trip runs in 29–42 s, all clean; LZ4_FUZZ, every reach label hit; arbitrary, mutated and structure-aimed frames, synthetic token streams judged against a byte-at-a-time model, glued skippable/legacy frames, failing allocator; 3,000 seeds in every test run) · ct n/a — compression only, no secret is processed · panic 2026-11-17 (self-review at creation: every length, offset and size from the input is checked before use; the only asserts are on internal callers' arguments, never reachable with caller data through the public API; oversized inputs are `error.InputTooLarge`)
+**Hardening:** fuzz 2026-11-17 (three verdict runs over disjoint seed ranges, the last on the final code, each 400,000 frame-decoder + 400,000 block-decoder + 50,000 round-trip runs in 29–42 s, all clean; a fourth after `decompressInto` (its result checked against `decompress` under the same cap on every frame-decoder input): 400,000 + 400,000 + 50,000 runs, decode 43 s, clean; LZ4_FUZZ, every reach label hit; arbitrary, mutated and structure-aimed frames, synthetic token streams judged against a byte-at-a-time model, glued skippable/legacy frames, failing allocator; 3,000 seeds in every test run) · ct n/a — compression only, no secret is processed · panic 2026-11-17 (self-review at creation: every length, offset and size from the input is checked before use; the only asserts are on internal callers' arguments, never reachable with caller data through the public API; oversized inputs are `error.InputTooLarge`)
 
 **Performance:** ref 1.40–2.56× liblz4 1.10.0 (`lz4 -b1 -B65536`, 64 KiB independent blocks of three 8 MiB payloads; compress 1.40–2.00×, decompress 1.81–2.56×; `zig build bench-lz4`) · fastest ? (measured 2026-11-17)
 
@@ -148,6 +148,9 @@ assignment, error remap): 109 mutants, 97 killed (one of them a HANG: a 0 offset
 `copyMatch`), 11 equivalent, 1 unobservable, 0 findings. Three survivors of the first run became
 tests (a match ending exactly at the output's end; a match extended to the exact first differing
 byte; `compressInto` with 1..4 bytes too few for a block checksum).
+
+2026-11-17, delta: `decompressInto` (4 schemata mutants: the `dst.len` cap dropped, the `max_output` option
+ignored, `max_output = null` read as 0, the returned length): 4 killed, none equivalent, no finding.
 
 | Mutant | Verdict |
 |---|---|
