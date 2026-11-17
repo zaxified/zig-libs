@@ -173,6 +173,20 @@ test "replacement: an ordered dictionary keeps the order of first appearance; a 
         defer gpa.free(none);
         const g = try stream.readStream(a, none, .{});
         try testing.expectEqual(@as(usize, 0), g.len);
+        try expectCategories(g.columnAt(0).categorical, &.{"x"});
+    }
+    {
+        // The same for an ordered dictionary: ["x", "w"] replaced by ["y"] before any batch.
+        const fields = [_]schema.Field{.{ .name = "o", .type = .utf8, .dictionary = .{ .id = 0, .ordered = true } }};
+        const bytes = try st.hand(gpa, &fields, &.{
+            textDict(0, false, two, bytesOf(i32, &.{ 0, 1, 2 }), "xw"),
+            textDict(0, false, one, bytesOf(i32, &.{ 0, 1 }), "y"),
+            .{ .length = 1, .nodes = &.{one}, .bufs = &.{ "", bytesOf(i32, &.{0}) } },
+        });
+        defer gpa.free(bytes);
+        const f = try stream.readStream(a, bytes, .{});
+        try expectTexts(f, 0, &.{"y"});
+        try expectCategories(f.columnAt(0).categorical, &.{"y"});
     }
 }
 

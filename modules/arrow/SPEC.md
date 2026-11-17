@@ -6,9 +6,9 @@
 
 **Scope:** core — Apache Arrow C++ / pyarrow (apache/arrow 26.0.1; arrow-rs `arrow-ipc` 60.1.0 as the closest-shaped permissive one) (surveyed 2026-11-17)
 
-**Audit:** review 2026-11-17 · mutation 2026-11-17 (410/442, 29 eq) · src c367d11d392c3f57
+**Audit:** review 2026-11-17 · mutation 2026-11-17 (438/475, 34 eq) · src 054c958f86983424
 
-**Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; again after the metadata / projection / Decimal32-256 / RunEndEncoded / view-type wave: 200k seeds in 24 s ReleaseSafe, clean; again after Map on read and the run-end metadata fold: 200k seeds in 35 s ReleaseSafe, clean, the Map golden reached; reach: frames, files, batches, every error kind incl. InvalidUtf8 and UnknownColumn, frames from compressed inputs, projected frames, metadata reads, frames from the custom_metadata, Decimal32, Decimal256, RunEndEncoded, BinaryView/Utf8View, ListView and Map goldens; resource shapes the driver cannot make are in `src/hostile_test.zig`) · ct n/a — parses and writes data files, holds no secret
+**Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; again after the metadata / projection / Decimal32-256 / RunEndEncoded / view-type wave: 200k seeds in 24 s ReleaseSafe, clean; again after Map on read and the run-end metadata fold: 200k seeds in 35 s ReleaseSafe, clean, the Map golden reached; again after dictionary replacement and nested dictionaries: 200k seeds in 28 s ReleaseSafe, clean, the nested and shared dictionary goldens and a replacement stream reached; reach: frames, files, batches, every error kind incl. InvalidUtf8 and UnknownColumn, frames from compressed inputs, projected frames, metadata reads, frames from the custom_metadata, Decimal32, Decimal256, RunEndEncoded, BinaryView/Utf8View, ListView, Map, nested and shared dictionary goldens and a dictionary replacement stream; resource shapes the driver cannot make are in `src/hostile_test.zig`) · ct n/a — parses and writes data files, holds no secret
 
 **Performance:** not measured
 
@@ -446,6 +446,24 @@ dictionary and nullability, the key's nullability, the flag, the offset width (8
 the other child (3). Same method as above, one ReleaseSafe build per run. First run 14 killed / 5 survived;
 new tests kill all 5 (`keysSorted` through a schema round trip and its default without a type table; entries of
 an Int type with two children and a struct of three fields). Second run 19/19. No equivalent, no finding.
+
+**Audit 2026-11-17 (delta mutation, dictionary replacement and nested dictionaries).** Base `922fd86bb`. 33
+schemata mutants over the non-test code the change touched: `RDict.genAt` (the empty case, the `<=` bound, the
+arms, the loop bound; 4); `plan`'s dictionary branch (the cycle check, `planning` set and cleared, post-order
+append, the counter kept; 5); `markUsed` (the guard, the recursion into values; 2); `takeBatch`'s and `takeDict`'s
+sequence stamps (2); `takeDict` (delta with no dictionary, replacement refused only in a file — both halves, the
+sequence step, the generation base, `max_rows` over the generations and its `used` half, the length and
+generation-length updates, the unused-dictionary return; 10); `finishDicts`' `used` (1); `dictColumn` (the
+batch-less fallback, live marking, the index bound against the batch's generation, the generation base; 4);
+`categorical` (the remap reset, both `live` filters; 3); `sameValueType`'s child dictionary check (1);
+`readStream`'s `replace` (1). Same method as above, one ReleaseSafe build. 28 killed (two assertions added before
+the run: the categories of a batch-less read and of an ordered dictionary replaced before any batch).
+5 equivalent: the cycle check dropped and `planning` never set (a dictionary inside its own values is a field
+inside its own value type, and a finite type tree never equals its own proper subtree, so `sameValueType`
+refuses it as `Malformed` first); `markUsed` recursing into an already used dictionary (cost-only: no cycle
+survives planning); `takeDict`'s `max_rows` over the generations (decode sums the same chunks' lengths against
+`max_rows` before allocating; cost-only); `finishDicts` decoding an unused dictionary (it has no chunks;
+cost-only, as in the whole-module audit). No finding.
 
 ## What is deliberately not done
 
