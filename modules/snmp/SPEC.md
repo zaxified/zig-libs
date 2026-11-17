@@ -23,14 +23,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [net-snmp/net-snmp](https://github.com/net-snmp/net-snmp) — **reference** | C | BSD-style, several notices in `COPYING` (API: NOASSERTION); source not read | 490 | push 2026-09-29 (no GitHub release) | The de-facto tool set and the oracle: this module's v3 goldens and live test are captured from a stock 5.9.4 `snmpd`. Adds MIB loading (names instead of OIDs), an agent/`snmpd`, AgentX, trap sending, AES-192/256, TLS/DTLS/SSH transports *(inferred from general knowledge; not re-read)*. |
+| [net-snmp/net-snmp](https://github.com/net-snmp/net-snmp) — **reference** | C | BSD-style, several notices in `COPYING` (API: NOASSERTION); source read only for `keytools.c`/`snmpusm.c` (AES key extension, 2026-11-17), otherwise not read | 490 | push 2026-09-29 (no GitHub release) | The de-facto tool set and the oracle: this module's v3 goldens and live test are captured from a stock 5.9.4 `snmpd`. Adds MIB loading (names instead of OIDs), an agent/`snmpd`, AgentX, trap sending, AES-192/256, TLS/DTLS/SSH transports *(inferred from general knowledge; not re-read)*. |
 | [gosnmp/gosnmp](https://github.com/gosnmp/gosnmp) | Go | BSD-style (LICENSE file; API: NOASSERTION) | 1.3k | v1.45.0 (2026-09-19) | README: Get, GetNext, GetBulk, Walk, **BulkWalk**, Set, **SendTrap**, **Listen** for traps, v1/v2c/v3, IPv4/IPv6. Versus us: BulkWalk and trap sending exist there; this module's walker is GetNext-only and its receiver only listens. |
 | [roboplc/snmp2](https://github.com/roboplc/snmp2) | Rust | Apache-2.0 | 59 | push 2026-07-12 | README: "dependency-free" v1/v2/v3 client, v3 auth MD5/SHA1/SHA224–512, privacy DES/AES128/**AES192/AES256**, v1 traps, optional async. MIB support only through `libnetsnmp`. |
 | [rusticata/snmp-parser](https://github.com/rusticata/snmp-parser) | Rust | NOASSERTION (not read) | 45 | push 2026-01-19 | Parser only (`nom`), no client *(inferred from name/description)*. |
 | [lextudio/pysnmp](https://github.com/lextudio/pysnmp) | Python | BSD-2-Clause | 159 | push 2026-09-28 | Full manager/agent/notification framework with MIB support; asyncio *(inferred)*. |
 | [clarkmcc/snmp.zig](https://github.com/clarkmcc/snmp.zig) | Zig | MIT | 1 | push 2025-07-11 | Its README: bindings to the Net-SNMP C library; v1/v2c, "v3 in progress". Links libnetsnmp, so not pure Zig. The only Zig SNMP client found. |
 
-**Where we are ahead:** the only pure-Zig SNMP stack we found (the one Zig alternative links libnetsnmp); full SNMPv3 USM with six auth protocols incl. RFC 7860 SHA-2 and AES-128 privacy, with the library owning salt uniqueness, checked against fifteen net-snmp captures and a live `snmpd` matrix; zero-allocation, transport-agnostic; v1/v2c trap and Inform receiver with ack · **Where we are behind:** no BulkWalk (walker uses GetNext; `getBulk` exists as a call) *(searched: `rg -i bulk src/client.zig src/v3client.zig`)*, no trap/notification sending, no v3 notifications, no AES-192/256, no MIB name resolution, no agent side, no request retry policy (→ Backlog).
+**Where we are ahead:** the only pure-Zig SNMP stack we found (the one Zig alternative links libnetsnmp); full SNMPv3 USM with six auth protocols incl. RFC 7860 SHA-2 and AES-128 privacy, with the library owning salt uniqueness, checked against fifteen net-snmp captures and a live `snmpd` matrix; zero-allocation, transport-agnostic; v1/v2c trap and Inform receiver with ack · **Where we are behind:** no BulkWalk (walker uses GetNext; `getBulk` exists as a call) *(searched: `rg -i bulk src/client.zig src/v3client.zig`)*, no trap/notification sending, no v3 notifications, no MIB name resolution, no agent side, no request retry policy (→ Backlog).
 
 ## Design & invariants
 Layered: `ber` (X.690 subset — definite-length TLV, SNMP application types incl. Counter64 + v2c
@@ -71,11 +71,30 @@ USM is the security-sensitive part.
   is the RFC 3414 §A.2 1 MB expansion + `Kul = H(Ku ‖ engineID ‖ Ku)` with the protocol's hash.
   `verify` recomputes the digest with the auth field zero-filled and compares in **constant time**
   (`std.crypto.timing_safe.eql`, never `mem.eql`).
-- **Privacy.** DES-CBC (RFC 3414 §8) and AES-128-CFB128 (RFC 3826), encrypt + decrypt, wired into
+- **Privacy.** DES-CBC (RFC 3414 §8), AES-128-CFB128 (RFC 3826) and AES-192/256-CFB128 (below), encrypt + decrypt, wired into
   the message path both ways. **DES is legacy and is provided for interop only, not as a
   recommendation** (56-bit key); Zig's std has no DES, so `des.zig` is a from-scratch FIPS 46-3
-  implementation. AES-192/256 (draft-blumenthal / Cisco variants) and SNMPv3 over TLS/DTLS
-  (RFC 6353) remain out of scope.
+  implementation. SNMPv3 over TLS/DTLS (RFC 6353) remains out of scope.
+- **AES-192/256 privacy** (2026-11-17), the four variants net-snmp (the reference) offers, named after
+  what it calls them: `aes192_cfb`/`aes256_cfb` = `usmAES192PrivProtocol`/`usmAES256PrivProtocol`
+  (OIDs 1.3.6.1.4.1.14832.1.3/.4, draft-blumenthal-aes-usm-04), `aes192_cisco_cfb`/`aes256_cisco_cfb` =
+  `usmAES192CiscoPrivProtocol`/`usmAES256CiscoPrivProtocol` (1.3.6.1.4.1.9.12.6.1.1/.2). Mode, IV
+  (boots‖time‖salt), 8-byte salt and counter salt are exactly AES-128's (RFC 3826); only the key
+  differs: the first 24/32 bytes of the localized key. An auth hash of 32+ bytes (SHA-256/384/512)
+  needs no extension; otherwise `priv.localizeKey` extends it, and the two families differ ONLY here:
+  *Blumenthal* (draft §3.1.2.1; net-snmp `_kul_extend_blumenthal`) `Kul = Kul || H(Kul)` until enough
+  bytes; *Reeder/Cisco* (net-snmp `_kul_extend_reeder`, `NETSNMP_DRAFT_REEDER_3DES` style)
+  `Kul = Kul || localize(Ku(Kul), engineID)`, i.e. the password-to-key algorithm run over the key
+  so far. Both truncate to the key size (a key already long enough is left alone, as in net-snmp).
+  Pinned by the draft's own Appendix A vector (maplesyrup, SHA-1, 256 bit) and by KATs for every
+  auth hash x protocol from `tools/gen_aes_priv_kat.py` (independent re-derivation in Python:
+  hashlib + `cryptography`'s CFB; no live net-snmp was available, so wire interop with a real agent
+  or Cisco gear is **not** checked — the algorithms follow net-snmp's `keytools.c`, BSD, read for the
+  algorithm only). Note: pysnmp uses the OID 1.3.6.1.4.1.9.12.6.1.1/.2 for the *Blumenthal*
+  extension and 1.3.6.1.4.1.9.12.6.1.101/.102 for Reeder; net-snmp maps .1.1/.1.2 to Reeder and
+  comments the .101/.102 pair out. OIDs are not on the wire in this module (the user's
+  `priv_protocol` is configuration), so this follows net-snmp; pairing with an agent that follows
+  pysnmp's mapping means choosing the other family.
 - **Salt uniqueness — the library owns it, not the caller.** `msgPrivacyParameters` is the only
   thing standing between an authPriv session and keystream/IV reuse, so it is not an API parameter.
   `priv.encrypt` takes a `priv.SaltSource` and *returns* the salt it drew (`Encrypted.salt`) for the
@@ -246,8 +265,7 @@ a reply from a different engine; security-level downgrade; and full truncation +
 over both the captured net-snmp datagrams and a live authPriv reply. Every one is a typed error.
 
 ## Backlog / deferred
-Agent (engine/server) role; MIB compiler / SMI parsing; AES-192/256 privacy (draft-blumenthal /
-Cisco variants); SNMPv3 over TLS/DTLS (RFC 6353); RFC 3826 `usmDHKickstart` and the `KeyChange`
+Agent (engine/server) role; MIB compiler / SMI parsing; SNMPv3 over TLS/DTLS (RFC 6353); RFC 3826 `usmDHKickstart` and the `KeyChange`
 (key-update) TC; context-engine-ID proxy forwarding; v3 **notifications** (authenticated Trap/Inform
 send + receive — `receiver` is still v1/v2c only). The security-review pass on `snmp.usm`
 const-time/alg-confusion (see Threat model above) is done — clean, 2026-07-10.
@@ -255,7 +273,7 @@ const-time/alg-confusion (see Threat model above) is done — clean, 2026-07-10.
 - **BulkWalk (GETBULK-driven walker)** *(survey 2026-09-30)*. `Client.walker`/`V3Client.walker` use GetNext, so a table walk over a WAN costs one round trip per row; gosnmp and net-snmp `snmpbulkwalk` batch. Every monitoring user walks tables. Effort: small (`getBulk` and the OID-not-increasing guard exist). Fits CONVENTIONS §2. ✅ DONE 2026-11-16 (`Client.bulkWalker`/`bulkWalkerWith` and `V3Client.bulkWalker`/`bulkWalkerWith`: GETBULK-driven walkers, default max-repetitions 10 (net-snmp `snmpbulkwalk`), stop at the subtree end / endOfMibView / noSuchName / an empty batch, `OidNotIncreasing` on a non-increasing name, `InvalidMaxRepetitions` on 0; v1 client -> `UnsupportedPdu`)
 - **Request timeout/retry policy for the UDP transport (v1/v2c)** *(survey 2026-09-30)*. UDP loses packets; net-snmp defaults to retries, `UdpTransport` has a timeout only (`rg -i retr src/` finds the v3 Report retry alone). Effort: small; possibly caller's by design (module owns no clock policy) — question for the owner. ✅ DONE 2026-11-16 (`Client.Options.retries`, default 5 like net-snmp: on a transport `Timeout` or a reply with another request id the same bytes (same id) are re-sent, `retries + 1` tries; a late reply to an earlier try is accepted by the next try; Canceled/TransportFailed/decode errors are never retried. Per-try timeout = the transport's own timeout (`UdpTransport.Options.timeout`, default `.none` = blocks, so set it to 1 s for net-snmp's default). The module still owns no clock. v3 keeps its own Report-retry; no v3 timeout retry added)
 - ✅ DONE 2026-11-16 for v1/v2c (`Client.trapV1`/`trapV2`/`inform`, `message.encodeTrapV1`/`Notification`, optional `Transport.sendFn`) and v3 **Inform** (`V3Client.inform`); v3 **Trap** stays in Backlog: the sender is the authoritative engine, which needs a local engine id / boots / time (and users localized to it) that `V3Client` does not own. **Trap / Inform / SNMPv2-Trap sending, and v3 notifications** *(survey 2026-09-30)*. gosnmp `SendTrap`, net-snmp `snmptrap`; needed by anyone writing an agent, a test harness or a relay. The codecs for the PDUs already exist. Effort: small (v1/v2c), medium (v3, needs the engine-ID/boots ownership of the sender). Fits §2.
-- **AES-192/256 privacy (Cisco / draft-blumenthal variants)** *(survey 2026-09-30)*. snmp2 has them, net-snmp too *(inferred)*; some network gear mandates it. Effort: small (std AES) but the key-extension algorithm differs by vendor. Fits §2; already listed above as deferred.
+- ✅ DONE 2026-11-17 (all four net-snmp variants; see Scope). **AES-192/256 privacy (Cisco / draft-blumenthal variants)** *(survey 2026-09-30)*. snmp2 has them, net-snmp too *(inferred)*; some network gear mandates it. Effort: small (std AES) but the key-extension algorithm differs by vendor. Fits §2; already listed above as deferred.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
 

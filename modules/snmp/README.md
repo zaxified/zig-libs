@@ -53,8 +53,11 @@ network-device management work (alongside `netlink`, `nftables`, `icmp`).
     its final length** and written back in place, and verification compares in
     **constant time** (`std.crypto.timing_safe`).
   - **Privacy** (`priv`, `des`): CBC-DES (RFC 3414 §8, on a from-scratch FIPS
-    46-3 DES — see the note below) and AES-128-CFB128 (RFC 3826), with the
-    correct key/pre-IV/salt derivation and the boots‖time‖salt IV.
+    46-3 DES — see the note below), AES-128-CFB128 (RFC 3826) and AES-192/256-CFB128
+    (`aes192_cfb`/`aes256_cfb` draft-blumenthal, `aes192_cisco_cfb`/`aes256_cisco_cfb`
+    Reeder/Cisco key extension — net-snmp's four variants; `priv.localizeKey` derives
+    the extended key), with the correct key/pre-IV/salt derivation and the
+    boots‖time‖salt IV.
     `priv.encrypt` takes a `priv.SaltSource`, **not** a salt: the library draws
     `msgPrivacyParameters` from a never-repeating counter and hands it back in
     `Encrypted.salt`, so no caller can accidentally reuse one. Pinning a salt to
@@ -99,8 +102,7 @@ network-device management work (alongside `netlink`, `nftables`, `icmp`).
     Prefer AES-128-CFB (RFC 3826), and prefer the RFC 7860 SHA-2 auth
     protocols over MD5/SHA-1.
   - Out of scope for now: the **agent/engine (server) side**; trap listening
-    beyond `receiver`; MIB/SMI parsing; the AES-192/256 privacy drafts
-    (draft-blumenthal / Cisco variants); SNMPv3 over TLS/DTLS (RFC 6353);
+    beyond `receiver`; MIB/SMI parsing; SNMPv3 over TLS/DTLS (RFC 6353);
     RFC 3826's `usmDHKickstart`/key-change (`KeyChange`) machinery; and
     context-engine-ID *proxy* forwarding.
 

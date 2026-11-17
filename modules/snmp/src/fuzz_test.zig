@@ -80,7 +80,7 @@ fn flipBit(src: anytype, buf: []u8) void {
 }
 
 const all_auth = [_]usm.AuthProtocol{ .hmac_md5, .hmac_sha1, .hmac_sha224, .hmac_sha256, .hmac_sha384, .hmac_sha512 };
-const all_priv = [_]priv.PrivProtocol{ .des_cbc, .aes128_cfb };
+const all_priv = [_]priv.PrivProtocol{ .des_cbc, .aes128_cfb, .aes192_cfb, .aes256_cfb, .aes192_cisco_cfb, .aes256_cisco_cfb };
 
 // ── snmp-wire ───────────────────────────────────────────────────────────────
 

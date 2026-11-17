@@ -67,7 +67,7 @@ pub const meta = .{
     .role = .client, // manager + reusable wire codec
     .concurrency = .single_owner, // Client owns request-id counter + buffers
     .model_after = "SNMP v1 RFC 1157 + v2c RFC 3416/1905 + v3 RFC 3412/3414/3826/7860; net-snmp behavior",
-    .deps = .{}, // std only
+    .deps = .{"aes192"}, // AES-192 block cipher for the 192-bit privacy protocols (std has none); the rest is std only
 };
 
 /// BER (ITU-T X.690) codec — the subset SNMP uses.

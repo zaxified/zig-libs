@@ -306,6 +306,99 @@ fn passwordToKeyBody(proto: AuthProtocol, password: []const u8, engine_id: []con
     return localizeKey(proto, uk, engine_id, out);
 }
 
+/// How a localized key that is shorter than the privacy cipher's key is
+/// extended (AES-192/256 under an auth hash of 16..28 bytes: MD5, SHA-1,
+/// SHA-224 for 256-bit keys). With a 32-byte-or-longer hash no extension runs.
+/// The two methods are not interchangeable; the privacy protocol picks one.
+pub const KeyExtension = enum {
+    /// draft-blumenthal-aes-usm-04 §3.1.2.1 (net-snmp `usmAES192PrivProtocol`
+    /// / `usmAES256PrivProtocol`): `Kul = Kul || H(Kul)` repeated until there
+    /// are enough bytes.
+    blumenthal,
+    /// draft-reeder-snmpv3-usm-3desede-00 style (net-snmp
+    /// `usmAES192CiscoPrivProtocol` / `usmAES256CiscoPrivProtocol`): each
+    /// round runs the password-to-key algorithm over the key so far and
+    /// localizes the result: `Kul = Kul || localize(Ku(Kul))`.
+    reeder,
+};
+
+pub const ExtendError = error{
+    /// `key_buf` was smaller than the key length requested.
+    BufferTooSmall,
+};
+
+/// Extend the localized key held in `key_buf[0..have]` (as produced by
+/// `passwordToKey`) to `need` bytes using `how`, in place, and return
+/// `key_buf[0..max(have, need)]`. A key that is already long enough is
+/// returned unchanged (the same rule as net-snmp's `netsnmp_extend_kul`); the
+/// caller uses the leading `need` bytes. `engine_id` is used by `.reeder` only.
+/// `key_buf` must hold at least `max(have, need)` bytes and `have` must be the
+/// auth hash length, `proto.keyLen()` (it is trusted, as `localizeKey` does).
+pub fn extendLocalizedKey(
+    proto: AuthProtocol,
+    how: KeyExtension,
+    engine_id: []const u8,
+    key_buf: []u8,
+    have: usize,
+    need: usize,
+) ExtendError![]u8 {
+    return burn.run(burn.key_burn, ExtendError![]u8, extendLocalizedKeyBody, .{ proto, how, engine_id, key_buf, have, need });
+}
+
+fn extendLocalizedKeyBody(
+    proto: AuthProtocol,
+    how: KeyExtension,
+    engine_id: []const u8,
+    key_buf: []u8,
+    have: usize,
+    need: usize,
+) ExtendError![]u8 {
+    if (have >= need) return key_buf[0..have];
+    if (key_buf.len < need) return error.BufferTooSmall;
+    var len = have;
+    // Each round appends min(still-needed, digest length) bytes.
+    while (len < need) {
+        var d_buf: [max_key_len]u8 = undefined;
+        switch (how) {
+            .blumenthal => _ = hashOnce(proto, key_buf[0..len], &d_buf),
+            .reeder => {
+                var uk_buf: [max_key_len]u8 = undefined;
+                // `len` > 0 here (a localized key is never empty), so the
+                // password-to-key derivation cannot fail with EmptyPassword.
+                const uk = pwToUkProto(proto, key_buf[0..len], &uk_buf);
+                _ = localizeKey(proto, uk, engine_id, &d_buf);
+            },
+        }
+        const n = @min(need - len, proto.keyLen());
+        @memcpy(key_buf[len..][0..n], d_buf[0..n]);
+        len += n;
+    }
+    return key_buf[0..len];
+}
+
+fn pwToUkProto(proto: AuthProtocol, password: []const u8, out: []u8) []u8 {
+    return passwordToUserKeyBody(proto, password, out) catch unreachable; // password is non-empty (see caller)
+}
+
+fn hashOnce(proto: AuthProtocol, data: []const u8, out: []u8) []u8 {
+    switch (proto) {
+        inline else => |p| {
+            const Hash = switch (p) {
+                .hmac_md5 => hash.Md5,
+                .hmac_sha1 => hash.Sha1,
+                .hmac_sha224 => hash.sha2.Sha224,
+                .hmac_sha256 => hash.sha2.Sha256,
+                .hmac_sha384 => hash.sha2.Sha384,
+                .hmac_sha512 => hash.sha2.Sha512,
+            };
+            var d: [Hash.digest_length]u8 = undefined;
+            Hash.hash(data, &d, .{});
+            @memcpy(out[0..d.len], &d);
+            return out[0..d.len];
+        },
+    }
+}
+
 /// Compute the auth digest over `message`, treating the `proto.digestLen()`
 /// bytes at `auth_offset` as zero (RFC 3414 §6.3.1/§7.3.1, RFC 7860 §4.2.1: the
 /// digest is computed over the whole message with `msgAuthenticationParameters`
