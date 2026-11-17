@@ -122,6 +122,23 @@ static const unsigned char kPsk[16] = {
 static const char kIdentity[] = "zig-libs-dtls";
 static const char kSuite[] = "TLS13-AES128-GCM-SHA256";
 
+// The SHA-384 variant of the PSK cases: a 48-byte PSK (the length of a SHA-384
+// output) under TLS13-AES256-GCM-SHA384. Selected by the `*-aes256` modes
+// through `g_suite` / `g_psk`; every other mode keeps the defaults. Duplicated
+// in `tools/interop.zig`.
+static const unsigned char kPsk384[48] = {
+    0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c,
+    0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c,
+    0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c,
+    0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c,
+    0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c,
+    0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c,
+};
+static const char kSuite384[] = "TLS13-AES256-GCM-SHA384";
+static const char *g_suite = kSuite;
+static const unsigned char *g_psk = kPsk;
+static unsigned int g_psk_len = sizeof(kPsk);
+
 // Set by `main` for the cases that need them; every other mode leaves them off.
 static const char *g_alpn = NULL;        // ALPN list offered (client) / accepted (server)
 static const char *g_alpn_expect = NULL; // client: the name the server must answer
@@ -195,10 +212,10 @@ static unsigned int psk_server_cb(WOLFSSL *ssl, const char *identity,
                                   const char **ciphername) {
     (void)ssl;
     if (strcmp(identity, kIdentity) != 0) return 0;
-    if (key_max_len < sizeof(kPsk)) return 0;
-    memcpy(key, kPsk, sizeof(kPsk));
-    *ciphername = kSuite;
-    return (unsigned int)sizeof(kPsk);
+    if (key_max_len < g_psk_len) return 0;
+    memcpy(key, g_psk, g_psk_len);
+    *ciphername = g_suite;
+    return (unsigned int)g_psk_len;
 }
 
 static unsigned int psk_client_cb(WOLFSSL *ssl, const char *hint,
@@ -209,10 +226,10 @@ static unsigned int psk_client_cb(WOLFSSL *ssl, const char *hint,
     (void)hint;
     if (id_max_len < sizeof(kIdentity)) return 0;
     memcpy(identity, kIdentity, sizeof(kIdentity));
-    if (key_max_len < sizeof(kPsk)) return 0;
-    memcpy(key, kPsk, sizeof(kPsk));
-    *ciphername = kSuite;
-    return (unsigned int)sizeof(kPsk);
+    if (key_max_len < g_psk_len) return 0;
+    memcpy(key, g_psk, g_psk_len);
+    *ciphername = g_suite;
+    return (unsigned int)g_psk_len;
 }
 
 // `hrr_cookie` selects between the two server postures that matter here:
@@ -226,7 +243,7 @@ static int run_server(int port, int hrr_cookie) {
     if (!ctx) { fprintf(stderr, "CTX_new failed\n"); return 1; }
     wolfSSL_CTX_set_psk_server_tls13_callback(ctx, psk_server_cb);
     wolfSSL_CTX_no_dhe_psk(ctx);
-    if (wolfSSL_CTX_set_cipher_list(ctx, kSuite) != WOLFSSL_SUCCESS) {
+    if (wolfSSL_CTX_set_cipher_list(ctx, g_suite) != WOLFSSL_SUCCESS) {
         fprintf(stderr, "set_cipher_list failed\n");
         return 1;
     }
@@ -546,7 +563,7 @@ static int run_client(int port) {
     if (!ctx) { fprintf(stderr, "CTX_new failed\n"); return 1; }
     wolfSSL_CTX_set_psk_client_tls13_callback(ctx, psk_client_cb);
     wolfSSL_CTX_no_dhe_psk(ctx);
-    if (wolfSSL_CTX_set_cipher_list(ctx, kSuite) != WOLFSSL_SUCCESS) {
+    if (wolfSSL_CTX_set_cipher_list(ctx, g_suite) != WOLFSSL_SUCCESS) {
         fprintf(stderr, "set_cipher_list failed\n");
         return 1;
     }
@@ -855,6 +872,7 @@ int main(int argc, char **argv) {
                 "server-cert-p256|server-cert-p256-hrr|server-cert-mlkem|"
                 "server-cert-mutual|client|client-cert|client-cert-mlkem|"
                 "server-alpn|client-alpn|server-ku-ours|server-ku-theirs|"
+                "server-aes256|server-aes256-hrr|client-aes256|"
                 "12-{server,client}-{psk,ecdsa,ecdsa-aes256,ecdsa-chacha,"
                 "ecdsa-p256,ecdsa-mutual,rsa} <port> [mtu] | version\n",
                 argv[0]);
@@ -902,6 +920,17 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], "server-cert-mutual") == 0) {
         cert.verify_peer = 1;
         rc = run_cert_server(port, cert);
+    } else if (strcmp(argv[1], "server-aes256") == 0 ||
+               strcmp(argv[1], "server-aes256-hrr") == 0 ||
+               strcmp(argv[1], "client-aes256") == 0) {
+        g_suite = kSuite384;
+        g_psk = kPsk384;
+        g_psk_len = sizeof(kPsk384);
+        if (strcmp(argv[1], "client-aes256") == 0) {
+            rc = run_client(port);
+        } else {
+            rc = run_server(port, strcmp(argv[1], "server-aes256-hrr") == 0);
+        }
     } else if (strcmp(argv[1], "server-alpn") == 0) {
         g_alpn = "coap";
         rc = run_server(port, 0);

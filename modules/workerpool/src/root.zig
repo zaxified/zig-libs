@@ -596,6 +596,10 @@ pub const WorkerPool = struct {
     fn takeJob(self: *WorkerPool, w: *Worker) ?Job {
         w.taking.store(true, .seq_cst);
         defer w.taking.store(false, .release);
+        // Test seam -- see `take_seam`.
+        if (builtin.is_test) {
+            if (take_seam.load(.seq_cst)) |f| f();
+        }
         if (self.paused.load(.seq_cst) and self.state.load(.seq_cst) == .running) return null;
         const job = self.queue.pop() orelse return null;
         _ = self.started.fetchAdd(1, .seq_cst);
@@ -728,6 +732,13 @@ var pause_seam: std.atomic.Value(?*const fn () void) = .init(null);
 /// the park from sleeping through it (audit 2026-10-25, mutants 744/752).
 /// Same rules as `park_seam`.
 var pause_snapshot_seam: std.atomic.Value(?*const fn () void) = .init(null);
+
+/// **Test-only seam inside `takeJob`'s `taking` window**: after the worker
+/// has published `taking` and before it reads `paused`. It is the one place a
+/// test can hold a worker in the window `pause` waits for, deterministically
+/// instead of by racing it (audit 2026-10-25 left the handshake caught in only
+/// 2 of 3 runs). Same rules as `park_seam`.
+var take_seam: std.atomic.Value(?*const fn () void) = .init(null);
 
 /// The pool whose worker the current thread is, if any — how `wait` detects
 /// being called from one of its own jobs.
@@ -2324,6 +2335,64 @@ test "workingCount: N blocking jobs on N workers = N, back to 0 after" {
 }
 
 // ── max_queued ───────────────────────────────────────────────────────────────
+
+/// `take_seam` hook state. Armed (0) it fires once, from the worker.
+const TakeSeam = struct {
+    io: std.Io,
+    pool: ?*WorkerPool = null,
+    armed: std.atomic.Value(u32) = .init(1),
+    /// The worker is inside the window.
+    reached: std.atomic.Value(bool) = .init(false),
+    /// The worker has finished holding and is leaving the window.
+    left: std.atomic.Value(bool) = .init(false),
+};
+var take_seam_ctx: std.atomic.Value(?*TakeSeam) = .init(null);
+
+/// Holds the worker in its `taking` window until `pause()` has published the
+/// flag (bounded), then a further 40 ms: a `pause` that does not wait for
+/// `taking` returns inside that time, with `left` still false.
+fn holdInTakeWindow() void {
+    const ctx = take_seam_ctx.load(.seq_cst) orelse return;
+    if (ctx.armed.cmpxchgStrong(0, 1, .seq_cst, .seq_cst) != null) return;
+    ctx.reached.store(true, .seq_cst);
+    var ms: u32 = 0;
+    while (!ctx.pool.?.isPaused() and ms < 2000) : (ms += 1) sleepMsIo(ctx.io, 1);
+    sleepMsIo(ctx.io, 40);
+    ctx.left.store(true, .seq_cst);
+}
+
+test "TEETH: pause() does not return while a worker is inside its take window (the taking handshake)" {
+    // Deterministic form of the audit's race: the worker is parked INSIDE the
+    // window by `take_seam`, `pause()` is called, and it must still be blocked
+    // when the worker leaves. With `taking` never published, or `pause` not
+    // waiting for it, `pause()` returns at once with `left` still false.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var ctx = TakeSeam{ .io = io };
+    take_seam_ctx.store(&ctx, .seq_cst);
+    defer take_seam_ctx.store(null, .seq_cst);
+    take_seam.store(holdInTakeWindow, .seq_cst);
+    defer take_seam.store(null, .seq_cst);
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+    defer pool.deinit();
+    ctx.pool = pool;
+    sleepMsIo(io, 20); // the worker is parked or spinning on the empty queue
+    ctx.armed.store(0, .seq_cst);
+    pool.wakeAll(); // its next trip through `takeJob` fires the seam
+    var ms: u32 = 0;
+    while (!ctx.reached.load(.seq_cst) and ms < 5000) : (ms += 1) sleepMsIo(io, 1);
+    try testing.expect(ctx.reached.load(.seq_cst));
+
+    pool.pause();
+    try testing.expect(ctx.left.load(.seq_cst));
+    pool.@"resume"();
+}
 
 test "max_queued: 4 accepted on a paused pool, the 5th is QueueFull and changes nothing" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});

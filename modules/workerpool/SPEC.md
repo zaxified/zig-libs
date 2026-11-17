@@ -8,7 +8,7 @@
 
 **Ahead:** speed — faster than every measured pool on every row of `zig build bench-workerpool`: 0.67× panjf2000/ants v2.12.0 on pingpong (submit one, wait; the fastest there), 0.42–0.54× rayon-core 1.13.0 on the bursts and four producers (the fastest there), 0.43–0.48× threadpool 1.8.1, 0.05–0.14× the reference (`tools/rust_fast_bench`, `tools/go_fast_bench`; default `spin_ns` 50 µs) (measured 2026-10-25) · feature — no heap allocation per job in the steady state, where rayon-core 1.000, threadpool 1.032 and ants 0.998 allocations per job (test `lead: no heap allocation per job in the steady state, where rayon-core, threadpool and ants allocate one`; `<pool> allocs` in both tools) (measured 2026-10-25)
 
-**Audit:** review 2026-10-29 · mutation 2026-10-29 (135/139, 4 eq) · src 06a5b1634128079e
+**Audit:** review 2026-10-29 · mutation 2026-11-17 (138/142, 4 eq) · src bc63b211107a7f94
 
 **Hardening:** fuzz 2026-10-25 (4×4 000 seeds clean in 9 s, reach 11/11, WORKERPOOL_FUZZ) · ct n/a — thread pool (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: drain/shutdownNow/deinit from an own job panic instead of self-joining, queue bounded by default at 1 Mi, double Submitter.deinit is a checked panic)
 
@@ -371,9 +371,13 @@ gated jobs).
   rollback left a `wait` parked on an idle pool -- were fixed the same day): ~~`drain`/`shutdownNow`/
   `deinit` from a job of the same pool join their own thread~~ (DONE 2026-10-29, sweep WP-1: checked
   panic like `wait`); a job published right after the spin loop's last look is
-  seen only when `spin_ns` runs out (bounded delay, not a loss). The pause regression test catches a
-  disabled `taking` handshake in 2 of 3 runs (a race window, not a seam) -- a seam would make it
-  deterministic. Effort: small.
+  seen only when `spin_ns` runs out (bounded delay, not a loss). ~~The pause regression test catches a
+  disabled `taking` handshake in 2 of 3 runs (a race window, not a seam)~~ (DONE 2026-11-17: `take_seam`
+  in `takeJob`, between the `taking` store and the `paused` load, `comptime`-gated on `builtin.is_test`
+  like the other seams; "TEETH: pause() does not return while a worker is inside its take window" parks the
+  worker there, calls `pause()` and requires the worker to have left when it returns. Delta mutation
+  2026-11-17, 3 mutants, ReleaseSafe, 10 runs each of the one test: `taking` never published, `pause` not
+  waiting on `taking`, the seam call dropped -- each fails 10/10; the unmutated binary passes 10/10.)
 
 - (2026-10-29, blind review)
   Left in the Backlog: **R-WP-3** `n_workers` unclamped (30k threads) and `spin_ns = maxInt` means
