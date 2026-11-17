@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — Whole-module mutation of `src/root.zig` (224 mutants, 213 killed, 11 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). 14 tests added: a real loopback exchange, injected cancel and concurrency faults, and the edges of the caps, the numeric host forms and the documentation prefixes (see SPEC § Audit 2026-11-17). No source change, no behaviour change.
 - **2026-11-16** — **BEHAVIOUR CHANGE:** `lookup` now formats each hop's query with that server's syntax (new `serverQuery`, `LookupOptions.per_server_syntax = true`): `whois.arin.net` gets `n <ip>` for an IP literal, `whois.verisign-grs.com` gets `domain <name>` for a domain name; every other hop and query kind still gets the bare query. Set `per_server_syntax = false` for the old send-verbatim behaviour.
 
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
