@@ -699,6 +699,8 @@ test "dtls12: Config.max_datagram_len fragments every large message; flights del
     try testing.expect(f4_dgs.len >= 3);
     const f5 = try feedReversedTwice(&client, f4_dgs, rnd, &reply);
     try testing.expectEqual(c12.State.wait_server_finished, client.state);
+    // Every queued copy was consumed or, once stale, discarded.
+    try testing.expectEqual(@as(usize, 0), client.rx_future_len);
     // The client's final flight (its own Certificate) is fragmented too;
     // delivered in order, each datagram twice.
     var f5_copy: [8192]u8 = undefined;
@@ -863,4 +865,85 @@ test "Config.validate: max_datagram_len below the floor" {
     try c.validate();
     c.max_datagram_len = 0;
     try c.validate();
+}
+
+/// Records in `bytes` (each one, not datagrams).
+fn countRecords(bytes: []const u8) usize {
+    var n: usize = 0;
+    var rest = bytes;
+    while (rest.len > 0) : (n += 1) rest = record.nextDatagram(rest, 1).rest;
+    return n;
+}
+
+/// The largest record in `bytes`.
+fn largestRecord(bytes: []const u8) usize {
+    var m: usize = 0;
+    var rest = bytes;
+    while (rest.len > 0) {
+        const d = record.nextDatagram(rest, 1);
+        m = @max(m, d.datagram.len);
+        rest = d.rest;
+    }
+    return m;
+}
+
+fn serverFlight4(limit: u16, out: []u8) ![]const u8 {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(25)));
+    const rnd = seeded(&csprng);
+    var client = try Connection12.clientInit(ecdsaClientConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer client.deinit();
+    var s = ecdsaServerConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256});
+    s.max_datagram_len = limit;
+    var server = try Connection12.serverInit(s);
+    defer server.deinit();
+    var ch_buf: [2048]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &ch_buf);
+    return (try server.handleFlight(ch, rnd, 0, out)).out;
+}
+
+test "dtls12: a record of exactly max_datagram_len is not fragmented, one byte over is; a short output buffer is BufferTooShort" {
+    var b0: [8192]u8 = undefined;
+    const whole = try serverFlight4(0, &b0);
+    const biggest = largestRecord(whole); // the Certificate's record
+    try testing.expect(biggest > 300);
+    var b1: [8192]u8 = undefined;
+    const at = try serverFlight4(@intCast(biggest), &b1);
+    try testing.expectEqual(countRecords(whole), countRecords(at));
+    try testing.expectEqualSlices(u8, whole, at);
+    var b2: [8192]u8 = undefined;
+    const under = try serverFlight4(@intCast(biggest - 1), &b2);
+    try testing.expectEqual(countRecords(whole) + 1, countRecords(under));
+    try testing.expectEqual(biggest - 1, largestRecord(under));
+    // The fragment loop checks its room before writing: too small an
+    // output buffer is a typed error, not a write past it.
+    var small: [400]u8 = undefined;
+    try testing.expectError(error.BufferTooShort, serverFlight4(200, &small));
+}
+
+test "dtls12: a forged queued fragment latched by an EARLIER call is dropped when the genuine message conflicts" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(26)));
+    const rnd = seeded(&csprng);
+    var client = try Connection12.clientInit(ecdsaClientConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer client.deinit();
+    var server = try Connection12.serverInit(ecdsaServerConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer server.deinit();
+    var bufs: Bufs = .{};
+    const ch = try client.startHandshake(rnd, 0, &bufs.a);
+    server.send_seq[0] = 100;
+    const f4 = try server.handleFlight(ch, rnd, 0, &bufs.b);
+    // A forged partial Certificate (message_seq 1), queued ahead.
+    var rec_buf: [512]u8 = undefined;
+    _ = try client.handleFlight(forgedFragment(5, m12.HandshakeType.certificate, 1, 900, 300, 0xee, &rec_buf), rnd, 0, &bufs.a);
+    try testing.expect(client.rx_future_len > 0);
+    // The genuine ServerHello alone: it completes, the queue is drained into
+    // the reassembler — the forged bytes are now the message in progress.
+    const sh = record.nextDatagram(f4.out, 1);
+    _ = try client.handleFlight(sh.datagram, rnd, 0, &bufs.a);
+    try testing.expect(client.rx_active);
+    // The genuine rest of the flight conflicts with them; the retry without
+    // the queue must also forget the message in progress.
+    const f5 = try client.handleFlight(sh.rest, rnd, 0, &bufs.a);
+    try testing.expectEqual(c12.State.wait_server_finished, client.state);
+    const f6 = try server.handleFlight(f5.out, rnd, 0, &bufs.b);
+    try testing.expect((try client.handleFlight(f6.out, rnd, 0, &bufs.a)).done);
 }

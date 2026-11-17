@@ -224,6 +224,8 @@ pub const Connection12 = struct {
     rx_future_len: usize = 0,
     /// This `handleFlight` call fed a queued fragment (see there).
     queue_used: bool = false,
+    /// The message in progress holds bytes that came from the queue.
+    rx_from_queue: bool = false,
     /// Rank of the last message processed in the current flight, for order
     /// enforcement (see `rank`).
     last_rank: u8 = 0,
@@ -351,14 +353,16 @@ pub const Connection12 = struct {
         self.stateless_reply = false;
         self.queue_used = false;
         self.processDatagram(datagram, entropy, now_ms, &o) catch |err| {
-            const used_queue = self.queue_used;
+            const used_queue = self.queue_used or saved.rx_from_queue;
             self.* = saved;
             if (!used_queue) return err;
             // The queue is unauthenticated: a forged fragment of a later
-            // message, queued earlier, would otherwise fail every genuine
-            // copy of this flight the same way. Retry once from live bytes
-            // alone (what the engine did before it queued anything); the
-            // queue is lost, the peer's retransmission refills it.
+            // message, queued earlier (and possibly already latched into the
+            // message in progress by an earlier call), would otherwise fail
+            // every genuine copy of this flight the same way. Retry once from
+            // live bytes alone (what the engine did before it queued
+            // anything); the queue is lost, the peer's retransmission
+            // refills it.
             self.dropQueue();
             o.len = 0;
             self.saw_duplicate = false;
@@ -585,6 +589,7 @@ pub const Connection12 = struct {
         var cur_epoch = epoch;
         while (true) {
             if (done) |body| {
+                self.rx_from_queue = false;
                 const seq = self.next_recv_seq;
                 self.next_recv_seq +%= 1;
                 try self.processMessage(self.rx_type, seq, body, cur_epoch, entropy, now_ms, o);
@@ -598,6 +603,7 @@ pub const Connection12 = struct {
             self.queue_used = true;
             done = try self.feedCurrent(q.hh, e[future_entry_header..]);
             self.dropQueued(q.at, q.len);
+            if (done == null) self.rx_from_queue = true;
         }
     }
 
@@ -659,10 +665,11 @@ pub const Connection12 = struct {
     }
 
     /// Empties the queue, and the message in progress with it when that
-    /// may hold queued bytes.
+    /// holds queued bytes.
     fn dropQueue(self: *Connection12) void {
         self.rx_future_len = 0;
-        self.rx_active = false;
+        if (self.rx_from_queue) self.rx_active = false;
+        self.rx_from_queue = false;
     }
 
     fn dropQueued(self: *Connection12, at: usize, len: usize) void {

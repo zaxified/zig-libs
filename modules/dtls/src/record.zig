@@ -637,6 +637,9 @@ test "nextDatagram: an unreadable or truncated record is returned whole, never c
     // A unified header without a length runs to the datagram's end.
     const no_len = [_]u8{ 0x20, 0x05, 0xaa, 0xbb, 0xcc };
     try std.testing.expectEqual(no_len.len, nextDatagram(&no_len, 2).datagram.len);
+    // A unified header whose length runs past the bytes: returned whole.
+    const short_unified = [_]u8{ 0x24, 0x05, 0x00, 0x05, 0xaa };
+    try std.testing.expectEqual(short_unified.len, nextDatagram(&short_unified, 2).datagram.len);
     // A unified header WITH a length is cut like a plaintext one.
     var two: [16]u8 = undefined;
     const one_unified = [_]u8{ 0x24, 0x05, 0x00, 0x02, 0xaa, 0xbb }; // L bit, short seq, length 2

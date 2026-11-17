@@ -513,11 +513,12 @@ there is buffer space, wolfSSL and OpenSSL do (pion buffers a whole flight)
 — up to 8 messages ahead and 6144 bytes in all (the largest flight this
 engine accepts fits in reverse order), and fed in when their turn comes;
 beyond that they are dropped and retransmitted. A stateless server at
-`.start` queues nothing. The queue is unauthenticated, so a call that fed a
-queued fragment and then failed is retried once from its own datagram with
-the queue emptied: a forged later-message fragment cannot wedge the genuine
-flight (tested with 4000 forged fragments, among them a complete forged
-message). Not changed and noted: the epoch-0 replay window still advances on
+`.start` queues nothing. The queue is unauthenticated, so a call that fails
+after feeding a queued fragment — or while the message in progress holds
+queued bytes from an earlier call — is retried once from its own datagram
+with the queue (and that message) emptied: a forged later-message fragment
+cannot wedge the genuine flight (tested with 4000 forged fragments, among
+them a complete forged message, and with one latched by an earlier call). Not changed and noted: the epoch-0 replay window still advances on
 unauthenticated records (see Backlog).
 
 **Deliberately not implemented** (each a security or scope choice, not an
