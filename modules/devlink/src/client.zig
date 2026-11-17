@@ -62,6 +62,7 @@ const resource_mod = @import("resource.zig");
 const region_mod = @import("region.zig");
 const health_mod = @import("health.zig");
 const eswitch_mod = @import("eswitch.zig");
+const reload_mod = @import("reload.zig");
 const request = @import("request.zig");
 
 /// `NETLINK_ADD_MEMBERSHIP` / `NETLINK_DROP_MEMBERSHIP` (linux/netlink.h).
@@ -599,6 +600,26 @@ pub const Devlink = struct {
     ) RequestError!void {
         const seq = cl.startRequest();
         return cl.sendAndAck(seq, eswitch_mod.buildSetEswitch(cl.allocator(), cl.family_id, seq, h, set));
+    }
+
+    // ── reload ─────────────────────────────────────────────────────────────
+
+    /// `DEVLINK_CMD_RELOAD` — `devlink dev reload`. Needs **CAP_NET_ADMIN**
+    /// and **re-instantiates the driver**: the device's netdevs and ports go
+    /// away and come back, and with `opts.netns` the instance moves to another
+    /// network namespace. Returns the actions the driver reports having
+    /// performed (empty when the kernel answered with a bare ACK).
+    pub fn reload(
+        cl: *Devlink,
+        h: handle_mod.Handle,
+        opts: reload_mod.Options,
+    ) RequestError!reload_mod.Performed {
+        const gpa = cl.allocator();
+        const seq = cl.startRequest();
+        try cl.sendBuilt(reload_mod.buildReload(gpa, cl.family_id, seq, h, opts));
+        var reply = (try cl.collect(seq)) orelse return .{};
+        defer reply.deinit(gpa);
+        return reload_mod.parseReply(reply.attrs) catch error.MalformedReply;
     }
 
     // ── multicast groups ───────────────────────────────────────────────────

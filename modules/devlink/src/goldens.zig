@@ -105,6 +105,7 @@ const resource = @import("resource.zig");
 const region = @import("region.zig");
 const health = @import("health.zig");
 const eswitch = @import("eswitch.zig");
+const reload = @import("reload.zig");
 const client = @import("client.zig");
 
 /// The family id nlctrl handed out on the machine the captures came from.
@@ -485,6 +486,43 @@ test "golden: devlink dev eswitch set, pinning the u16/u8/u8 widths" {
     try testing.expectEqual(@as(?uapi.EswitchMode, .switchdev), e.mode);
     try testing.expectEqual(@as(?uapi.InlineMode, .network), e.inline_mode);
     try testing.expectEqual(@as(?uapi.EncapMode, .basic), e.encap_mode);
+}
+
+// ── devlink dev reload (iproute2 6.19.0, refused with EPERM after the bytes were on the wire) ──
+
+const seq_reload: u32 = 0x6afbbd04;
+const reload_hdr = "19000500" ++ "04bdfb6a" ++ "00000000" ++ "25010000";
+
+/// `devlink dev reload pci/0000:00:00.0` — the handle alone.
+const req_reload_bare = hex("30000000" ++ reload_hdr ++ h_attrs);
+/// `devlink dev reload pci/0000:00:00.0 action driver_reinit` — `RELOAD_ACTION` u8 = 1.
+const req_reload_action = hex("38000000" ++ reload_hdr ++ h_attrs ++ "0500990001000000");
+/// `devlink dev reload pci/0000:00:00.0 action fw_activate limit no_reset` —
+/// `RELOAD_LIMITS` is a bitfield32: value 1 << NO_RESET, selector = the valid mask.
+const req_reload_limit = hex("44000000" ++ reload_hdr ++ h_attrs ++ "0500990002000000" ++ "0c009b00" ++ "02000000" ++ "03000000");
+/// `devlink dev reload pci/0000:00:00.0 action fw_activate limit no_reset netns 1`
+/// (a different run, hence the other sequence number) — `NETNS_PID` comes first.
+const req_reload_netns = hex("4c000000" ++ "19000500" ++ "ffbcfb6a" ++ "00000000" ++ "25010000" ++ h_attrs ++
+    "08008b0001000000" ++ "0500990002000000" ++ "0c009b00" ++ "02000000" ++ "03000000");
+
+test "builder golden: devlink dev reload, four captured forms" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    const cases = [_]struct { want: []const u8, seq: u32, opts: reload.Options }{
+        .{ .want = &req_reload_bare, .seq = seq_reload, .opts = .{} },
+        .{ .want = &req_reload_action, .seq = seq_reload, .opts = .{ .action = .driver_reinit } },
+        .{ .want = &req_reload_limit, .seq = seq_reload, .opts = .{ .action = .fw_activate, .limit = .no_reset } },
+        .{ .want = &req_reload_netns, .seq = 0x6afbbcff, .opts = .{
+            .action = .fw_activate,
+            .limit = .no_reset,
+            .netns = .{ .pid = 1 },
+        } },
+    };
+    for (cases) |c| {
+        const msg = try reload.buildReload(gpa, fam, c.seq, cap_handle, c.opts);
+        defer gpa.free(msg);
+        try testing.expectEqualSlices(u8, c.want, msg);
+    }
 }
 
 // ── the public builders reproduce the captures ─────────────────────────────

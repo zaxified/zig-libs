@@ -268,6 +268,8 @@ pub const ATTR = struct {
     pub const PORT_CONTROLLER_NUMBER: u16 = 150; // u32
 
     pub const RELOAD_ACTION: u16 = 153; // u8
+    pub const RELOAD_ACTIONS_PERFORMED: u16 = 154; // bitfield32
+    pub const RELOAD_LIMITS: u16 = 155; // bitfield32
     pub const DEV_STATS: u16 = 156; // nested
     pub const RELOAD_STATS: u16 = 157; // nested
 

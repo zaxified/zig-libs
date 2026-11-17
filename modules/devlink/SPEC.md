@@ -36,8 +36,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 chunked reads, health reporters, port split/unsplit, resource writes and the `config` multicast
 subscription are in none of the Go/Rust libraries; request bytes are diffed against the real `devlink`
 binary and replies are captures from `netdevsim`. **Where we are behind:** the CLI's operational
-commands `reload` and `dev flash`, port functions/`port add|del`, rate objects, traps, shared buffers,
-health diagnose/dump (→ Backlog; all reachable via `Devlink.raw`).
+command `dev flash`, port functions/`port add|del`, rate objects, traps, shared buffers,
+health diagnose/dump (→ Backlog; all reachable via `Devlink.raw`). `dev reload` is typed since 2026-11-17.
 
 ## 1. What this module is
 
@@ -265,6 +265,7 @@ golden in `src/goldens.zig`):
 | `devlink region read … address 0 length 16` | `CHUNK_ADDR`/`CHUNK_LEN` **u64**, and `NLM_F_DUMP` |
 | `devlink health recover <handle> reporter fw` | `CMD.HEALTH_REPORTER_RECOVER` = 54 |
 | `devlink dev eswitch set … mode … inline-mode … encap-mode …` | the u16/u8/u8 width asymmetry |
+| `devlink dev reload <handle> [action A] [limit L] [netns PID]` | `CMD.RELOAD` = 37; `RELOAD_ACTION` u8, `RELOAD_LIMITS` bitfield32 (value `1<<limit`, selector 3), `NETNS_PID`; attribute order handle, netns, action, limits (4 captures, 2026-11-17) |
 
 Every SET-form capture was made against a handle that does not exist and was
 refused with `ENODEV`/`EPERM` — **after** the bytes were already on the wire,
@@ -413,11 +414,10 @@ design decision here.
 | **flash update** | Needs a firmware file on disk and emits an asynchronous progress stream on the `config` group (`FLASH_UPDATE_STATUS`). The write half is dangerous to expose without a way to exercise it. |
 | **selftests** | `SELFTESTS_GET`/`RUN`; running one takes the device down. |
 | **linecards** | Modular-chassis only; carries a `NESTED_DEVLINK` handle whose semantics deserve their own treatment. |
-| **`RELOAD`** | Re-instantiates the driver and can move the instance into another netns (`NETNS_FD`/`PID`/`ID`). Genuinely destructive; deferred until there is a device to prove it against. |
 | **port functions** (`PORT_FUNCTION` nest) | Hardware address, admin state, capability bitfield and max-IO-EQs for SF/VF ports. The port decoder reports the nest's *presence* (`Port.has_function`) but does not decode it. |
 | **`PORT_NEW`/`PORT_DEL`** | Subfunction lifecycle; pairs with port functions. |
 | **health diagnose / dump** (`HEALTH_REPORTER_DIAGNOSE`, `DUMP_GET`, `DUMP_CLEAR`, `TEST`) | Their payload is the `DEVLINK_ATTR_FMSG` nest — a self-describing, recursively typed object/array format that is its own decoder. `HEALTH_REPORTER_SET` is deferred with them. |
-| **`DEV_STATS` / `RELOAD_STATS`** | Per-action, per-limit reload counters. `Device.has_reload_stats` reports the nest's presence only. |
+| **`DEV_STATS` / `RELOAD_STATS`** | Per-action, per-limit reload counters. `Device.has_reload_stats` reports the nest's presence only. The nesting of the counters is not in the UAPI header and cannot be captured without a driver that supports reload (netdevsim needs root); decoding it from memory would be guessing. |
 | **`NOTIFY_FILTER_SET`** | Narrows what a multicast subscriber receives; useful, but only once there is something to receive. |
 | **`PORT_PARAM_GET`/`SET`** | Per-port parameters. The decoders already handle a `PORT_INDEX` on a parameter; only the commands are missing. |
 
@@ -441,7 +441,7 @@ design decision here.
 
 Ranked; each is reachable through `Devlink.raw` today. All fit CONVENTIONS §2 (pure Zig, no libc).
 
-1. **`RELOAD`** (survey 2026-09-30) — `devlink dev reload` is the routine step after a firmware flash or a
+1. ✅ 2026-11-17 **`RELOAD`** (survey 2026-09-30) — `reload.zig`: `buildReload` / `Devlink.reload` with `Options{action, limit, netns}` (`NETNS_PID`/`FD`/`ID`) and the reply's `RELOAD_ACTIONS_PERFORMED` as `Performed`; four request goldens captured from iproute2 6.19.0 (refused with EPERM after the bytes were on the wire, like the other SET captures). Not done: the `DEV_STATS`/`RELOAD_STATS` counters (see §5) and `NETNS_*` through the CLI-style name lookup (the caller passes the pid/fd/id). Was: `devlink dev reload` is the routine step after a firmware flash or a
    `driverinit` parameter change; a fleet agent that sets params cannot apply them. Effort: small (command
    plus `ACTION`/`LIMIT` and the netns attributes). Needs a destructive-op guard, see §5.
 2. **Flash update** (survey 2026-09-30) — `devlink dev flash` plus the `FLASH_UPDATE_STATUS` progress

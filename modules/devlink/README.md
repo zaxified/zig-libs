@@ -129,6 +129,7 @@ try dl.recoverHealthReporter(h, "fw");    // CAP_NET_ADMIN — usually resets th
 
 // ── eswitch ──────────────────────────────────────────────────────────────
 const es = try dl.eswitch(h);             // privileged read (GENL_ADMIN_PERM)
+// dl.reload(h, .{ .action = .fw_activate, .limit = .no_reset }) — destructive, CAP_NET_ADMIN
 _ = .{ es.mode, es.inline_mode, es.encap_mode, es.isSwitchdev() };
 try dl.setEswitch(h, .{ .mode = .switchdev });     // CAP_NET_ADMIN; disruptive
 
@@ -138,7 +139,7 @@ defer devlink.Devlink.freeRawReplies(gpa, replies);
 ```
 
 Sub-namespaces, all `pub`: `uapi` (every constant and enum), `handle`, `dev`,
-`port`, `param`, `resource`, `region`, `health`, `eswitch`, `client`,
+`port`, `param`, `resource`, `region`, `health`, `eswitch`, `reload`, `client`,
 `request`, plus `genl` and `codec` for driving `raw`. Every encoder and decoder
 is a pure function over byte slices, so the wire format is testable without a
 socket.

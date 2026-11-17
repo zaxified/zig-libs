@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **API addition:** `DEVLINK_CMD_RELOAD` (`devlink dev reload`): `Devlink.reload(handle, .{ .action, .limit, .netns })` / `buildReload`, returning the performed actions from `RELOAD_ACTIONS_PERFORMED`. New module `reload` (`Options`, `Action`, `Limit`, `Netns`, `Performed`), new attribute ids `RELOAD_ACTIONS_PERFORMED`/`RELOAD_LIMITS`. Request bytes pinned by four goldens captured from iproute2 6.19.0. Destructive (re-instantiates the driver); needs `CAP_NET_ADMIN`; the reload counters (`DEV_STATS`) stay deferred.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `uapi.appendAttrU64` is now an alias of `netlink.codec.appendAttrU64` (duplicate-code pass); same bytes.
 - **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** the provenance note no longer points at a module `NOTICE` that does not exist (a black-box oracle needs none).

@@ -36,11 +36,11 @@
 //!   `PORT_SPLIT`/`PORT_UNSPLIT`, `PARAM_GET`/`PARAM_SET`,
 //!   `RESOURCE_DUMP`/`RESOURCE_SET`, `REGION_GET`/`REGION_NEW`/`REGION_DEL`/
 //!   `REGION_READ`, `HEALTH_REPORTER_GET`/`HEALTH_REPORTER_RECOVER`,
-//!   `ESWITCH_GET`/`ESWITCH_SET`, `INFO_GET`, the `config` multicast group, and
+//!   `ESWITCH_GET`/`ESWITCH_SET`, `RELOAD`, `INFO_GET`, the `config` multicast group, and
 //!   a **`raw` escape hatch** that reaches every remaining command.
 //! * **Deliberately not modelled in v1:** rate objects, traps and trap
 //!   groups/policers, DPIPE, shared buffers (`SB_*`), flash update, selftests,
-//!   linecards, `RELOAD`, port functions and `PORT_NEW`/`PORT_DEL`. devlink is
+//!   linecards, port functions and `PORT_NEW`/`PORT_DEL`. devlink is
 //!   large; the ceiling is documented, and everything above the line is
 //!   reachable through `raw`. See SPEC.md for the full list and the reasoning.
 //!
@@ -139,6 +139,8 @@ pub const region = @import("region.zig");
 pub const health = @import("health.zig");
 /// `ESWITCH_GET` / `ESWITCH_SET`.
 pub const eswitch = @import("eswitch.zig");
+/// `RELOAD` — destructive; re-instantiates the driver.
+pub const reload = @import("reload.zig");
 /// The socket client and the `config` notification socket.
 pub const client = @import("client.zig");
 /// Request framing — the one place a devlink message's headers are assembled.
@@ -226,6 +228,12 @@ pub const buildHealthReporter = health.buildHealthReporter;
 pub const buildRecoverHealthReporter = health.buildRecoverHealthReporter;
 pub const buildEswitch = eswitch.buildEswitch;
 pub const buildSetEswitch = eswitch.buildSetEswitch;
+pub const buildReload = reload.buildReload;
+pub const ReloadOptions = reload.Options;
+pub const ReloadAction = reload.Action;
+pub const ReloadLimit = reload.Limit;
+pub const ReloadNetns = reload.Netns;
+pub const ReloadPerformed = reload.Performed;
 
 /// What a `buildX` can fail with: allocation, or an argument this module knows
 /// the kernel would reject.
@@ -579,6 +587,7 @@ test {
     _ = region;
     _ = health;
     _ = eswitch;
+    _ = reload;
     _ = client;
     _ = request;
     _ = @import("goldens.zig");
