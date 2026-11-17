@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — unrolled/secure v1.17.0, the fastest Go member of the field, builds `Strict-Transport-Security` unchecked: `STSSeconds: 60, STSPreload: true` ships `max-age=60; preload` and `STSSeconds: -1` ships `max-age=-1`, neither of which the preload list accepts (`secure.go`, `tools/lead_probe`); this module's `init` refuses the first with `InvalidHstsPreload` (`applyStatic` at compile time) and cannot represent the second (test "HSTS preload: refused unless max-age >= 1 year and includeSubDomains (init error)") (measured 2026-10-24) · correctness — with a `$NONCE` policy unrolled/secure passes the whole CSP to `fmt.Sprintf`, so a `%` in a source arrives corrupted (`https://cdn.example/a%20b` → `a%!b(MISSING)`, a trailing `%` → `%!(NOVERB)`; `tools/lead_probe`); here the policy is rendered by copy (test "renderNonce: a '%' in a source is copied, never read as a format directive") (measured 2026-10-24) · speed — 0.01–0.71× unrolled/secure v1.17.0 and 0.03–0.08× gofiber/fiber v3.6.1 helmet on every workload both can run (`zig build bench-security-headers`) (measured 2026-10-24)
 
-**Audit:** review 2026-11-07 · mutation 2026-11-17 (462/466, 4 eq) · src bcb194f4d98d74f2
+**Audit:** review 2026-11-07 · mutation 2026-11-17 (467/471, 4 eq) · src e55398ede2c9c0a5
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — header policy (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: init refuses values http refuses and more distinct names than its header table; configured values are lent, not copied)
 
@@ -185,6 +185,9 @@ enabled; rerun: 26 killed. No defect found.
   error path, which sends each header once. Test "staticHeaders == headerList: one entry per name…"
   (parity over the default, `api_options`, an all-on set with a re-spelled and a repeated `extra`, and
   an all-off set, plus the concrete order/spelling/value).
+  Delta mutation (clone per mutant, comptime code): 5 of 5 killed (the name match never true, case-sensitive
+  match, replace at index 0 instead of the match, the replaced entry keeping its old name, keeping its
+  old value), all by the new parity test.
 - **DONE 2026-11-17 — a replaced header spends the budget twice** *(review 2026-10-24)* — `http`'s
   `putHeader` now rewrites a replaced header's own copy when the new value fits there or the copy is
   the last one in the store (and no other entry borrows its bytes), so a nonce policy rendered again
