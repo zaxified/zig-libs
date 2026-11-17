@@ -1819,3 +1819,27 @@ pub fn fuzzSnapshotCorpus(pa: Allocator, list: *std.ArrayList([]const u8)) !void
         }
     }
 }
+
+test "ReshareReceiver: claimed counts that do not fit the input are refused before they are allocated" {
+    const allocator = testing.allocator;
+    const old = try oldCommittee(allocator, snap_old_cfg, 0x5A9_3009);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    // A receiver before any frame: nothing received, nothing pending.
+    var fresh = try ReshareReceiver.init(allocator, configFor(old, snap_old_cfg, snap_new_cfg, &.{ 1, 3 }, &xs), 1);
+    defer fresh.deinit();
+    const bytes = try snapR(&fresh);
+    defer freeSnapR(bytes);
+    // tail: complaint count(4), outbox count(4), result flag, commitments flag, used flag.
+    const patched = try allocator.dupe(u8, bytes);
+    defer freeSnapR(patched);
+    std.mem.writeInt(u32, patched[patched.len - 11 ..][0..4], 0xFFFF_FFFF, .big);
+    try snapshot.expectRefusedBeforeAllocating(ReshareReceiver, patched);
+    // a present `used` list that claims 2^32 - 1 ids
+    const longer = try allocator.alloc(u8, bytes.len + 4);
+    defer freeSnapR(longer);
+    @memcpy(longer[0..bytes.len], bytes);
+    longer[bytes.len - 1] = 1;
+    std.mem.writeInt(u32, longer[bytes.len..][0..4], 0xFFFF_FFFF, .big);
+    try snapshot.expectRefusedBeforeAllocating(ReshareReceiver, longer);
+}

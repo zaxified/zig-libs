@@ -1212,6 +1212,27 @@ test "Participant: an input claiming a huge n is refused before anything is allo
     try testing.expectError(error.InvalidState, Participant.fromBytes(failing.allocator(), &bytes));
 }
 
+/// A decoder that sizes an allocation from a claimed count BEFORE checking it
+/// against the input asks for gigabytes: out of a 64 KiB buffer (plenty for
+/// any honest snapshot of these tests) that shows as OutOfMemory instead of
+/// InvalidState.
+pub fn expectRefusedBeforeAllocating(comptime T: type, bytes: []const u8) !void {
+    var buf: [64 * 1024]u8 align(16) = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    try testing.expectError(error.InvalidState, T.fromBytes(fba.allocator(), bytes));
+}
+
+test "Participant: a claimed complaint count that does not fit the input is refused before it is allocated" {
+    var prng = std.Random.DefaultPrng.init(0x5A9_2001);
+    var p = try Participant.init(testing.allocator, .{ .t = 2, .n = 3 }, 1, prng.random());
+    defer p.deinit();
+    const bytes = try snap(&p);
+    defer freeSnap(bytes);
+    // The tail of a never-started party: complaint count, outbox count, three flags.
+    std.mem.writeInt(u32, bytes[bytes.len - 11 ..][0..4], 0xFFFF_FFFF, .big);
+    try expectRefusedBeforeAllocating(Participant, bytes);
+}
+
 // ── fuzz: the decoders never panic, leak or accept a non-canonical input ──
 
 const fz = @import("fuzz_test.zig");
