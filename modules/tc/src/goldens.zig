@@ -933,6 +933,43 @@ test "golden: mq qdisc replace (kind only, no TCA_OPTIONS)" {
     try expectGolden(g_mq_qdisc_replace, req);
 }
 
+// ### RTM_NEWQDISC type=36 flags=0x605 len=48 (captured with iproute2-6.19.0 in `unshare -rn`;
+// seq zeroed by the checker, as for the others)
+// tc qdisc add dev lo ingress     -> handle ffff:, parent ffff:fff1, kind only
+const g_ingress_qdisc_add =
+    "300000002400050600000000" ++ "0000000000000000" ++ "01000000" ++ "0000ffff" ++ "f1ffffff" ++ "00000000" ++ "0c000100696e677265737300";
+// tc qdisc add dev lo clsact
+const g_clsact_qdisc_add =
+    "300000002400050600000000" ++ "0000000000000000" ++ "01000000" ++ "0000ffff" ++ "f1ffffff" ++ "00000000" ++ "0b000100636c736163740000";
+
+test "golden: ingress qdisc add (kind only, handle ffff: parent ingress)" {
+    // tc qdisc add dev lo ingress
+    const req = try message.buildQdiscSet(
+        gpa,
+        0,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(0xffff, 0), .parent = Handle.ingress },
+        .{ .ingress = .{} },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_ingress_qdisc_add, req);
+}
+
+test "golden: clsact qdisc add (kind only, handle ffff: parent clsact)" {
+    // tc qdisc add dev lo clsact
+    const req = try message.buildQdiscSet(
+        gpa,
+        0,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(0xffff, 0), .parent = Handle.clsact },
+        .{ .clsact = .{} },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_clsact_qdisc_add, req);
+}
+
 test "golden: cake qdisc add (bare — an empty options nest)" {
     // tc qdisc add dev lo root handle 8: cake
     const req = try message.buildQdiscSet(

@@ -134,7 +134,7 @@ class's direct children, and `filters(ifi, parent)` matches the attach point exa
 - `Handle` — `init(major, minor)`, `.root`/`.ingress`/`.clsact`/`.unspec`, `major()`,
   `minor()`, `qdisc()`, `isClass()`, `parse("1:10")`, `{f}` formatting. **Hexadecimal**,
   like `tc`.
-- `QdiscSpec` = `.netem` | `.htb` | `.tbf` | `.fq_codel` | `.mq` | `.cake` | `.raw`;
+- `QdiscSpec` = `.netem` | `.htb` | `.tbf` | `.fq_codel` | `.mq` | `.ingress` | `.clsact` | `.cake` | `.raw`;
   `ClassSpec` = `.htb` | `.raw`; `FilterSpec` = `.u32` | `.flower` | `.raw`;
   `ActionSpec` = `.gact` | `.mirred` | `.police` | `.skbedit` | `.vlan` | `.raw`.
 - `Verdict` — the `TC_ACT_*` return codes (`.ok`, `.shot`, `.pipe`, `.stolen`,
@@ -149,7 +149,7 @@ class's direct children, and `filters(ifi, parent)` matches the attach point exa
   `gen`, `cookie()`, an optional per-kind wire struct (`a.gact`/`a.mirred`/`a.police`/
   `a.skbedit`/`a.vlan`), plus `stats` and `tm` when the kernel sent them.
   `Filter.actions()` returns the list attached to a dumped filter.
-- `Netem`, `Htb`, `HtbClass`, `Tbf`, `FqCodel`, `Mq`, `Cake` (+ `CakeDiffservMode`/
+- `Netem`, `Htb`, `HtbClass`, `Tbf`, `FqCodel`, `Mq`, `Ingress`, `Clsact`, `Cake` (+ `CakeDiffservMode`/
   `CakeFlowMode`/`CakeAtmMode`/`CakeAckFilter`), `U32` + `U32Key`, `Flower` + `Prefix4`/
   `Prefix6` — the ergonomic input structs; every field is doc-commented in
   `src/qdisc.zig` / `src/filter.zig`. Rates are **bytes per second** (`1mbit` = 125000).

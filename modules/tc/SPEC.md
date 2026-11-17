@@ -34,9 +34,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 **Where we are ahead:** of the Go and Rust libraries, CAKE and `mq` with the full option set,
 the psched rate tables done the way `tc` does (byte-exact goldens diffed against the real `tc`
 6.19), the standalone action table, hexadecimal handles and 64-bit rates; and it is the only
-Zig option. **Where we are behind:** `ingress`/`clsact` and the common classic qdiscs, `matchall`/`bpf`
+Zig option. **Where we are behind:** the common classic qdiscs, `matchall`/`bpf`
 classifiers and `pedit`/`tunnel_key`/`connmark` (→ Backlog; all reachable via the `raw`
-escape hatches). Statistics on qdisc/class dumps (`tc -s`) are decoded since 2026-11-17.
+escape hatches). `ingress`/`clsact` are typed since 2026-11-17. Statistics on qdisc/class dumps (`tc -s`) are decoded since 2026-11-17.
 
 ## Design & invariants
 
@@ -427,8 +427,7 @@ caller-supplied rate/size can panic in ReleaseSafe or wrap in ReleaseFast.
 - **flower beyond L2–L4 basics**: MAC addresses, VLAN/CVLAN, MPLS, tunnel keys, ARP,
   ICMP type/code, TCP flags, IP TOS/TTL, ct state, port ranges, `TCA_FLOWER_INDEV`. The
   `skip_hw`/`skip_sw` bits are settable via `Flower.flags` but untested against hardware.
-- **Other qdiscs**: hfsc, prio, sfq, red, codel, pfifo/bfifo, clsact/ingress attachment
-  helpers. `QdiscSpec.raw` covers them if you encode the options yourself. (`mq` and `cake`
+- **Other qdiscs**: hfsc, prio, sfq, red, codel, pfifo/bfifo. `QdiscSpec.raw` covers them if you encode the options yourself. (`mq` and `cake`
   are now modelled — see the "mq carries no options" section.)
 - **CAKE knobs not modelled**: the built-in RTT/bandwidth *presets* (`datacentre`, `lan`,
   `metro`, `regional`, `internet`, `oceanic`, `satellite`) — these are just CLI shorthands
@@ -457,7 +456,7 @@ caller-supplied rate/size can panic in ReleaseSafe or wrap in ReleaseFast.
 Survey findings (survey 2026-09-30), ranked by how soon a `tc` user hits them; all fit CONVENTIONS §2 and are
 reachable through `raw` today:
 
-1. **`ingress` / `clsact` qdiscs** (survey 2026-09-30) — the attach point for every ingress filter and for BPF (`tc filter ... direct-action`); without a typed spec a user cannot do ingress policing at all without hand-encoding. Effort: small (option-less, like `mq`).
+1. ✅ 2026-11-17 **`ingress` / `clsact` qdiscs** (survey 2026-09-30) — `QdiscSpec.ingress` / `.clsact` (kind only, no `TCA_OPTIONS`, like `mq`); the caller passes handle `ffff:` and parent `Handle.ingress`/`.clsact` exactly as `tc` sends them. Goldens captured from iproute2 6.19.0 (`tc qdisc add dev lo ingress|clsact`). Was: the attach point for every ingress filter and for BPF (`tc filter ... direct-action`); without a typed spec a user cannot do ingress policing at all without hand-encoding. Effort: small (option-less, like `mq`).
 2. ✅ 2026-11-17 **Statistics on qdisc/class dumps** (survey 2026-09-30) — `Qdisc.stats`/`Class.stats: ?Stats` from `TCA_STATS2` (basic, queue, rate estimators, `PKT64`, `BASIC_HW`) with the legacy `TCA_STATS` as fallback; `Qdisc.fq_codel_xstats` from `TCA_XSTATS`. A sub-attribute shorter than its struct is skipped like other optional attributes (stats stay null if nothing valid decoded); a malformed nest is a codec error. Layouts from the local UAPI headers.
 3. **`matchall` and `bpf` classifiers** (survey 2026-09-30) — `matchall` is the standard "everything" filter; `bpf` is how eBPF programs are attached (pairs with the `ebpf` module). Effort: small each.
 4. **`pedit`, `tunnel_key`, `connmark`, `csum`, `sample`, `ct`** (survey 2026-09-30) — header rewrite and tunnel actions used by most SDN-style setups; vishvananda has them. Effort: medium each (`pedit` largest).

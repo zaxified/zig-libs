@@ -150,6 +150,8 @@ pub const kind_htb = "htb";
 pub const kind_tbf = "tbf";
 pub const kind_fq_codel = "fq_codel";
 pub const kind_mq = "mq";
+pub const kind_ingress = "ingress";
+pub const kind_clsact = "clsact";
 pub const kind_cake = "cake";
 
 /// `sizeof(struct tc_netem_qopt)`.
@@ -851,6 +853,19 @@ pub fn parseFqCodelOptions(data: []const u8) codec.Error!FqCodelWire {
 /// classes are created by the kernel, never by this call.
 pub const Mq = struct {};
 
+// ── ingress / clsact ────────────────────────────────────────────────────────
+
+/// The `ingress` qdisc (`sch_ingress`): the attach point for ingress filters
+/// and actions. Like `tc qdisc add dev X ingress` it is sent with handle
+/// `ffff:` under parent `TC_H_INGRESS` (`Handle.ingress`) and **no
+/// `TCA_OPTIONS`** — the caller passes those two handles (see the golden).
+pub const Ingress = struct {};
+
+/// The `clsact` qdisc (`sch_ingress`): `ingress` plus an egress attach point,
+/// the one eBPF `direct-action` filters hang on. Same wire shape as `Ingress`
+/// (handle `ffff:`, parent `TC_H_CLSACT`, kind only, no options).
+pub const Clsact = struct {};
+
 // ── cake ────────────────────────────────────────────────────────────────────
 
 /// `TCA_CAKE_DIFFSERV_MODE` values (kernel `sch_cake.c` `CAKE_DIFFSERV_*`).
@@ -1053,6 +1068,8 @@ pub const QdiscSpec = union(enum) {
     tbf: Tbf,
     fq_codel: FqCodel,
     mq: Mq,
+    ingress: Ingress,
+    clsact: Clsact,
     cake: Cake,
     raw: Raw,
 
@@ -1063,19 +1080,21 @@ pub const QdiscSpec = union(enum) {
             .tbf => kind_tbf,
             .fq_codel => kind_fq_codel,
             .mq => kind_mq,
+            .ingress => kind_ingress,
+            .clsact => kind_clsact,
             .cake => kind_cake,
             .raw => |r| r.kind,
         };
     }
 
     /// Whether this kind puts a `TCA_OPTIONS` attribute on the wire at all.
-    /// `mq` sends **none** — not even an empty nest — because the kernel
-    /// auto-populates its per-queue children; a byte-exact request must omit
-    /// the attribute entirely. Every other kind carries an options nest (empty
+    /// `mq`, `ingress` and `clsact` send **none** — not even an empty nest
+    /// (`mq`: the kernel auto-populates its per-queue children); a byte-exact
+    /// request must omit the attribute entirely. Every other kind carries an options nest (empty
     /// when no knobs are set, exactly like `tc`).
     pub fn carriesOptions(self: QdiscSpec) bool {
         return switch (self) {
-            .mq => false,
+            .mq, .ingress, .clsact => false,
             else => true,
         };
     }
@@ -1094,7 +1113,7 @@ pub const QdiscSpec = union(enum) {
             .htb => |h| try appendHtbOptions(h, gpa, list),
             .tbf => |t| try appendTbfOptions(t, gpa, list, ps),
             .fq_codel => |f| try appendFqCodelOptions(f, gpa, list),
-            .mq => {}, // no options; carriesOptions() gates the nest away
+            .mq, .ingress, .clsact => {}, // no options; carriesOptions() gates the nest away
             .cake => |c| try appendCakeOptions(c, gpa, list),
             .raw => |r| {
                 if (r.options.len > std.math.maxInt(u16)) return error.OptionsTooLong;
@@ -1674,8 +1693,12 @@ test "QdiscSpec.kind covers every modelled kind" {
     try testing.expectEqualStrings("cake", (QdiscSpec{ .cake = .{} }).kind());
     try testing.expectEqualStrings("sfq", (QdiscSpec{ .raw = .{ .kind = "sfq" } }).kind());
     try testing.expectEqualStrings("htb", (ClassSpec{ .htb = .{ .rate = 1 } }).kind());
-    // Only mq withholds the options nest.
+    try testing.expectEqualStrings("ingress", (QdiscSpec{ .ingress = .{} }).kind());
+    try testing.expectEqualStrings("clsact", (QdiscSpec{ .clsact = .{} }).kind());
+    // Only mq, ingress and clsact withhold the options nest.
     try testing.expect(!(QdiscSpec{ .mq = .{} }).carriesOptions());
+    try testing.expect(!(QdiscSpec{ .ingress = .{} }).carriesOptions());
+    try testing.expect(!(QdiscSpec{ .clsact = .{} }).carriesOptions());
     try testing.expect((QdiscSpec{ .cake = .{} }).carriesOptions());
     try testing.expect((QdiscSpec{ .fq_codel = .{} }).carriesOptions());
 }
