@@ -75,6 +75,11 @@ const x25519_mlkem768_group: u16 = @backingInt(dtls.messages.NamedGroup.x25519_m
 const psk = @as([16]u8, @splat(0x0b));
 const psk_identity = "zig-libs-dtls";
 
+/// The PSK of the `-aes256` cases: 48 bytes, the length of a SHA-384 output,
+/// which is what a `TLS13-AES256-GCM-SHA384` PSK is sized for. Duplicated
+/// verbatim in `wolfssl_peer.c` (`kPsk384`). Test material.
+const psk384 = @as([48]u8, @splat(0x0c));
+
 /// The MAC key the stateless-cookie case's server uses. Test material.
 const cookie_secret = "a live server's cookie MAC key";
 
@@ -160,6 +165,14 @@ const Case = struct {
     /// The name the peer must print on its `ALPN <name>` line (client flow).
     expect_peer_alpn: ?[]const u8 = null,
     key_update: KeyUpdate = .none,
+    /// Run the PSK handshake under `TLS13-AES256-GCM-SHA384` with `psk384`
+    /// instead of `TLS13-AES128-GCM-SHA256` with `psk` (PSK cases only).
+    sha384: bool = false,
+    /// Run live but leave out of `wolfssl_transcript.txt`. The replay
+    /// (`src/wolfssl_replay.zig`) and the corpus counts pinned over the
+    /// transcript (`src/fuzz_corpus.zig`) know only the AES-128 suite, so the
+    /// SHA-384 cases are a pre-release check until they are taught.
+    live_only: bool = false,
     /// One line of prose, copied into the transcript, saying what THIS case
     /// proves that no other one does.
     why: []const u8,
@@ -243,6 +256,50 @@ const cases = [_]Case{
         .expect_hrr = true,
         .app_expect = "hello from wolfssl client",
         .why = "a stock client accepts the HelloRetryRequest WE emit, and a BRAND-NEW connection re-derives the transcript from the cookie alone",
+    },
+    .{
+        .name = "psk-client-aes256",
+        .flow = .client,
+        .peer_mode = "server-aes256",
+        .seed = 0x2c,
+        .sha384 = true,
+        .live_only = true,
+        .app_send = "hello from zig-libs",
+        .app_expect = "hello from zig-libs",
+        .why = "AES-256-GCM-SHA384 with a SHA-384 PSK against a live server: the binder, the key schedule and the Finished MACs run over SHA-384 and the records under AES-256-GCM, all checked by foreign code",
+    },
+    .{
+        .name = "psk-client-aes256-hrr",
+        .flow = .client,
+        .peer_mode = "server-aes256-hrr",
+        .seed = 0x2c,
+        .sha384 = true,
+        .live_only = true,
+        .expect_hrr = true,
+        .app_send = "hello from zig-libs",
+        .app_expect = "hello from zig-libs",
+        .why = "the HelloRetryRequest cookie of a SHA-384 suite from a DEFAULT wolfSSL server: the message_hash rewrite of ClientHello1 is hashed with SHA-384 and the binder of ClientHello2 covers that transcript",
+    },
+    .{
+        .name = "psk-server-aes256",
+        .flow = .server,
+        .peer_mode = "client-aes256",
+        .seed = 0x5b,
+        .sha384 = true,
+        .live_only = true,
+        .app_expect = "hello from wolfssl client",
+        .why = "a real wolfSSL client with a SHA-384 PSK accepts what OUR server puts on the wire under AES-256-GCM-SHA384",
+    },
+    .{
+        .name = "psk-server-cookie-aes256",
+        .flow = .server_cookie,
+        .peer_mode = "client-aes256",
+        .seed = 0x6e,
+        .sha384 = true,
+        .live_only = true,
+        .expect_hrr = true,
+        .app_expect = "hello from wolfssl client",
+        .why = "the HelloRetryRequest WE emit under a SHA-384 suite: the stateless cookie (83 bytes: version, suite, 48-byte ClientHello1 hash, MAC) is accepted by a stock client and a BRAND-NEW connection re-derives the SHA-384 transcript from it alone",
     },
     .{
         .name = "cert-client",
@@ -721,12 +778,21 @@ fn readPeerVersion(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir) []const
 
 // ── config, built once so the live run and the transcript cannot disagree ──
 
+fn casePsk(case: Case) []const u8 {
+    return if (case.sha384) &psk384 else &psk;
+}
+
+fn caseSuites(case: Case) []const dtls.CipherSuite {
+    return if (case.sha384) &.{.aes_256_gcm_sha384} else &.{.aes_128_gcm_sha256};
+}
+
 fn clientConfig(case: Case, fx: *const Fixtures) dtls.Config {
     if (!case.cert_mode) return .{
         .role = .client,
         .psk_identity = psk_identity,
-        .psk = &psk,
-        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .psk = casePsk(case),
+        .psk_hash = if (case.sha384) .sha384 else .sha256,
+        .cipher_suites = caseSuites(case),
         .alpn_protocols = case.alpn,
     };
     return .{
@@ -752,8 +818,9 @@ fn serverConfig(case: Case, fx: *const Fixtures, binding: ?[]const u8) dtls.Conf
     if (!case.cert_mode) return .{
         .role = .server,
         .psk_identity = psk_identity,
-        .psk = &psk,
-        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .psk = casePsk(case),
+        .psk_hash = if (case.sha384) .sha384 else .sha256,
+        .cipher_suites = caseSuites(case),
         .hello_retry = if (binding) |b|
             .{ .cookie_secret = cookie_secret, .peer_binding = b }
         else
@@ -795,7 +862,7 @@ fn recordConfig(rec: *Recorder, case: Case, seed: [32]u8) void {
     rec.strArg("flow", @tagName(case.flow));
     rec.strArg("key_exchange", if (case.cert_mode) "cert_dhe" else "psk");
     rec.hexArg("seed", &seed);
-    rec.strArg("suite", "aes_128_gcm_sha256");
+    rec.strArg("suite", @tagName(caseSuites(case)[0]));
     rec.numArg("now_sec", valid_now_sec);
     rec.hex4Arg("offer_group", case.offer_group);
     rec.numArg("client_cert", @intFromBool(case.client_cert));
@@ -803,7 +870,7 @@ fn recordConfig(rec: *Recorder, case: Case, seed: [32]u8) void {
     rec.strArg("alpn", joinAlpn(&alpn_buf, case.alpn));
     if (!case.cert_mode) {
         rec.hexArg("psk_identity", psk_identity);
-        rec.hexArg("psk", &psk);
+        rec.hexArg("psk", casePsk(case));
         rec.hexArg("cookie_secret", cookie_secret);
     }
     rec.end();
@@ -836,7 +903,10 @@ fn runClientFlow(
         .stdout = .pipe,
         .stderr = .pipe,
     });
-    defer _ = child.wait(io) catch {};
+    // `kill` and not `wait`: a case that fails leaves the peer blocked in its
+    // read, and a plain `wait` would then hang the whole run behind the very
+    // error that should have been reported. A no-op once the peer has exited.
+    defer child.kill(io);
 
     // Wait for READY — the server prints it after bind(), before it looks at
     // the socket, so a datagram sent afterwards cannot be lost.
@@ -904,6 +974,7 @@ fn runClientFlow(
     }
 
     try expectBool("sawHelloRetryRequest", case.expect_hrr, conn.sawHelloRetryRequest());
+    try expectU16("negotiated suite", @backingInt(caseSuites(case)[0]), @backingInt(conn.suite));
     // The group the session keys were actually derived from. For the
     // secp256r1/hybrid cases this is the assertion that the retry was ACTED
     // ON: a client that echoed the cookie but kept its original share would
@@ -1273,6 +1344,7 @@ fn runServerFlow(
     // the no-cookie one if `Config.hello_retry` ever stopped taking effect: the
     // handshake would still complete, just without the check.
     if (cookie_mode and retries_served < 1) return error.NoRetryWasServed;
+    try expectU16("negotiated suite", @backingInt(caseSuites(case)[0]), @backingInt(conn.?.suite));
     if (case.cert_mode) try expectU16("negotiated group", case.expect_group, conn.?.ecdhe_group);
     rec.op("expect");
     rec.numArg("hrr", @intFromBool(case.expect_hrr));
@@ -2067,6 +2139,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             // Marked BEFORE the case header goes in, so a failure rolls back
             // the header too rather than leaving a case with no body.
             const mark = t13.written().len;
+            rec.enabled = capture and !case.live_only;
             rec.raw("case {s}\n", .{case.name});
             rec.raw("why {s}\n", .{case.why});
             const result = switch (case.flow) {
