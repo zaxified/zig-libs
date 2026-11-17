@@ -2570,6 +2570,8 @@ fn checkWireFields(sk: *SecretKey, n_be: []const u8, d_be: []const u8, dp_be: []
         };
         std.crypto.secureZero(u64, &quot);
     }
+    // The single verdict is the call's result, public by definition.
+    std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&bad));
     if (bad != 0) return error.InvalidPrivateKey;
     sk.d = MontParams.elemToFf(Fe, sk.n, &w[0]);
 }
@@ -3584,6 +3586,7 @@ pub fn selfSignedCert(
 test {
     _ = openssh;
     _ = der_writer;
+    _ = marshal;
     _ = @import("sweep_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");

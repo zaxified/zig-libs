@@ -189,7 +189,7 @@ declare -A TARGETS=(
     [montint]="small portable asmcore field ffcontrol dyn"
     # ── added 2026-09-09, A1 R2's first four ────────────────────────────────
     [p256]="comb sign secpt"
-    [rsa]="crt crtbl crtcache noncrt keygen oaepnf"
+    [rsa]="crt crtbl crtcache noncrt keygen oaepnf pemenc pemdec"
     [slhdsa]="seed prf"
     # ⚠ `falcon` is here against its own SPEC.md, which argued it should NOT
     # have a row because the red would only measure the sampler's deliberate
@@ -563,6 +563,8 @@ declare -A PATTERN=(
     [rsa/oaepnf]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [rsa/noncrt]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [rsa/keygen]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    [rsa/pemenc]='root[.]zig|marshal[.]zig|burn[.]zig|ff[.]zig|dyn[.]zig|limbs[.]zig'
+    [rsa/pemdec]='root[.]zig|asn1[.]zig|Reader[.]zig|burn[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig'
     [slhdsa/seed]='engine[.]zig|address[.]zig'
     [slhdsa/prf]='engine[.]zig|address[.]zig'
     [falcon/sign]='fpr[.]zig|gaussian[.]zig|sign[.]zig|codec[.]zig'
@@ -994,6 +996,8 @@ declare -A LABEL=(
     [rsa/oaepnf]='rsa decryptOaepHNoFail (CRT + unpad), p/q'
     [rsa/noncrt]='rsa non-CRT d+std ff'
     [rsa/keygen]='rsa fromPrimes, p/q tainted'
+    [rsa/pemenc]='rsa SecretKey.toPem (pkcs1), secret members tainted'
+    [rsa/pemdec]='rsa SecretKey.fromPem, d/dP/dQ/qInv content chars tainted'
     [slhdsa/seed]='slhdsa SK.seed'
     [slhdsa/prf]='slhdsa SK.prf'
     [falcon/sign]='falcon sign (fpr+sampler)'

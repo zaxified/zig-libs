@@ -6,11 +6,13 @@
 
 **Scope:** parity — OpenSSL 4.0 RSA and Go `crypto/rsa` + the `crypto/x509` RSA key codecs: PKCS#1 v1.5 and PSS sign/verify (run-time hash, prehashed digests, PSS salt recovery, decoupled MGF1), OAEP, key generation, PKCS#1/PKCS#8/SPKI/PEM read and write including encrypted PKCS#8 (PBES2/PBKDF2/AES-CBC), OpenSSH private keys, moduli up to 8192 bits (surveyed 2026-09-30 and 2026-10-14, gaps closed 2026-10-14); RSAES-PKCS1-v1_5, multi-prime keys, scrypt/PBES1/legacy-PEM encryption and > 8192-bit moduli are out (see "What is deliberately not done")
 
-**Audit:** review 2026-11-13 · mutation 2026-11-13 (162/198, 36 eq) · src 94c4e1d71a774ccc
+**Audit:** review 2026-11-13 · mutation 2026-11-17 (170/206, 36 eq) · src e2103435acf70176
+
+*Delta mutation 2026-11-17:* the branch-free INTEGER trim in `marshal.zig` (private-key PEM ctgrind), 8/8 killed — see Backlog "Private-key PEM: a ctgrind target".
 
 *Delta mutation runs 2026-11-13 (restore A1 after the same day's changes):* branch-free `decryptOaepHNoFail` 35 mutants, 33 killed, 2 equivalent (`found_sep` forced to 1 — with no separator `len_ok` is already 0; the `& 1` before `@truncate` — every other term of `valid` is 0/1); bounded `drawBlindingPair` + `BlindingCache.next` 11/11 killed. The whole-module figure on the Audit line is the earlier run; the src hash covers both deltas.
 
-**Hardening:** fuzz 2026-10-09 (8 x 25,000 seeds per harness clean, RSA_FUZZ) · ct 2026-10-26 (ctgrind) · panic 2026-10-30 (sweep + blind review: e ≥ 2^32 private keys rejected (were catch unreachable on every private op), nested-SPKI recursion removed, short modulus_len primitives → error, PSS/byteLen/modinverse asserts → errors; delta audit 19/20 + 1 eq)
+**Hardening:** fuzz 2026-10-09 (8 x 25,000 seeds per harness clean, RSA_FUZZ) · ct 2026-11-17 (ctgrind; private-key PEM rows `pemenc` 0 / `pemdec` 2 added) · panic 2026-10-30 (sweep + blind review: e ≥ 2^32 private keys rejected (were catch unreachable on every private op), nested-SPKI recursion removed, short modulus_len primitives → error, PSS/byteLen/modinverse asserts → errors; delta audit 19/20 + 1 eq)
 
 **Performance:** ref 0.84–1.08× OpenSSL 3.5.5 · fastest ? (measured 2026-10-18; `.cached` blinding 1.02–1.03× at 2048)
 
@@ -518,20 +520,26 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
   xmlenc, xmldsig, saml, x509, tlsclient, acme, dtls, iec62351, opcua, ssh — none needed a change (no test of theirs uses a key
   above 4096 bits). The `small` CI lane now runs the whole closure. ssh's `gex_max_bits` still keeps its own `DynModint(8192)`
   (ssh Backlog).
-- **Private-key PEM: a ctgrind target** — ✅ 2026-10-17 the base64 half: `marshal.zig` encodes and
-  `pemDecodeBody` decodes through the constant-time `b64ct` module (`standard.encode`,
-  `decodeIgnoring` with `pem_whitespace`). A ctgrind target over
-  `SecretKey.toPem`/`fromPem` was **measured 2026-11-17 and is NOT clean, so no row is pinned**
-  (ReleaseFast, 2048-bit KAT key, `p`/`q`/`d`/`dP`/`dQ`/`qInv` tainted, `toPem(.pkcs1)` then `fromPem` of
-  that text: 227 contexts, none in the base64 codec). Classes: `toPem` 8 — `marshal.zig`'s
-  leading-zero strip of each INTEGER (`while field[z] == 0`, `field[z] & 0x80`), i.e. the DER length
-  bytes, which the SPEC already names as public by format; `fromPem` 213 — 107 inside `fromPrimes`'
-  re-derivation (target `keygen`'s residue), 46 in `checkWireFields` (`ff`/`dyn` carriers of the wire
-  integers), and the rest in the DER walk (`std.crypto.codecs.asn1`, `derChild`, `loadBE`), which
-  branches on the length bytes that the encoder derived from the key. The decode-side
-  counts are therefore dominated by the same documented DER-length dependence plus `keygen`'s
-  residue; a clean row would need the harness to declassify the (public-by-format) length bytes and
-  to count only the walk and the wire comparison, which is a design decision, not a pin. Open. Original text:
+- **Private-key PEM: a ctgrind target** — ✅ DONE 2026-11-17, two pinned rows. The base64 half
+  since 2026-10-17 (`marshal.zig` encodes and `pemDecodeBody` decodes through the constant-time
+  `b64ct` module). A first single target over `toPem`/`fromPem` (2026-11-17 morning: 227 contexts)
+  mixed three things: the encoder's INTEGER trim, the DER length bytes the harness tainted with the
+  content, and `fromPrimes`' re-derivation (row `keygen`'s residue). Now split:
+  - `pemenc` (`toPem(.pkcs1)`, `d`/`dP`/`dQ`/`qInv` and the primes with their Montgomery params
+    tainted): **0 in-file** (was 8). `RevWriter.integer`'s trim is branch-free over the whole field;
+    the leading-zero count and the sign-pad bit — what DER publishes, the INTEGER's length and its
+    0x00 pad — are computed by mask and only then declassified (`makeMemDefined`, a no-op outside
+    Valgrind). Output byte-identical (the OpenSSL goldens; boundary tests in `marshal.zig`).
+  - `pemdec` (`fromPem` of an untainted key's text with exactly the base64 characters whose six bits
+    all lie in the CONTENT of `d`/`dP`/`dQ`/`qInv` tainted; tags, lengths, armor stay defined):
+    **2 in-file**, both argued: `keycodec`'s scan for the END line's first `-` crosses the body (no
+    base64 character equals `-`, so the outcome is the same for every key), and `montint.nt.divExact`'s
+    divisibility verdict inside `checkWireFields` (folded into its single verdict; constant for a valid
+    key). That single verdict is now declassified explicitly (it is the call's result). `p`, `q` stay
+    untainted on purpose: `fromPem` re-derives the key from them through `fromPrimes`, which is row
+    `keygen`'s claim and would otherwise be counted twice.
+  Delta mutation of the trim: 8 mutants (loop bound, first-byte select, top-byte capture, `seen`,
+  the `z` count, the last-byte arm, the pad bit, the pad emission), 8/8 killed. Original text:
 - **Private-key PEM base64 is not constant-time** *(2026-10-16, found while wiring RSA into `acme`)*:
   `marshal.zig:282` encodes and `root.zig:2681` decodes the private-key DER through std's base64
   alphabet tables — loads indexed by key bytes, the class ctgrind found in `acme`'s EC key PEM on

@@ -492,8 +492,8 @@ p256	ReleaseFast	secpt	1	1	057d5b2c695da4a4	0202b342b562adc1
 # 2026-10-14: crt 2 -> 1: the doubled FaultDetected verdict context is gone
 # (privateOpCrtPtr restructured for CRT-domain blinding); the 1 left is the
 # F3 verdict, root.zig:985 (--stacks).
-rsa	ReleaseFast	crt	1	1	6aa74034ecebb510	d4057b00f9df7b56
-rsa	ReleaseFast	noncrt	1	0	6aa74034ecebb510	d4057b00f9df7b56
+rsa	ReleaseFast	crt	1	1	8d8c14bb8ec364e0	d4057b00f9df7b56
+rsa	ReleaseFast	noncrt	1	0	8d8c14bb8ec364e0	d4057b00f9df7b56
 # rsa crtbl / crtcache (2026-10-18) — the CRT op with base blinding: `.csprng`
 # (2 = the F3 verdict root.zig `MontParams.eql(&chk, &c)` + drawBlindingPair's
 # one redraw verdict `ok == 0`, a decision about the random r) and `.cached`
@@ -504,8 +504,8 @@ rsa	ReleaseFast	noncrt	1	0	6aa74034ecebb510	d4057b00f9df7b56
 # `if (self.serves(sk))` in `BlindingCache.next` (root.zig:1128) is now tainted
 # on the second op, where `n`/`e` already match. Stacks re-read: the other three
 # are the documented ones (root.zig:1200 draw, 1290 F3 twice).
-rsa	ReleaseFast	crtbl	1	2	6aa74034ecebb510	d4057b00f9df7b56
-rsa	ReleaseFast	crtcache	1	4	6aa74034ecebb510	d4057b00f9df7b56
+rsa	ReleaseFast	crtbl	1	2	8d8c14bb8ec364e0	d4057b00f9df7b56
+rsa	ReleaseFast	crtcache	1	4	8d8c14bb8ec364e0	d4057b00f9df7b56
 # rsa oaepnf (2026-11-13) — rsa.decryptOaepHNoFail end to end (CRT op + OAEP unpad)
 # on a real 32-byte-CEK ciphertext, p/q/dp/dq/qinv tainted. The 1 in-file context
 # is privateOpCrtPtr's F3 verdict (root.zig:1286, reached from :1996), the same
@@ -514,7 +514,7 @@ rsa	ReleaseFast	crtcache	1	4	6aa74034ecebb510	d4057b00f9df7b56
 # is returned as data (before 2026-11-13: `if (valid == 1)` + a copy from a
 # secret offset, 2 contexts at root.zig:2028-2029). The 21 witness contexts are
 # the harness's std.debug.print of ok/msg/raw.
-rsa	ReleaseFast	oaepnf	1	1	6aa74034ecebb510	7e7c9776c2e11410
+rsa	ReleaseFast	oaepnf	1	1	8d8c14bb8ec364e0	7e7c9776c2e11410
 # rsa keygen (2026-10-03) — SecretKey.fromPrimes on the 2048-bit KAT, p and q
 # tainted. λ = montint.nt.lcm, d/dP/dQ = inverseOfModulus (even moduli), qInv by
 # Fermat on montint: 0 contexts in nt.zig and in the inversion/ladder code. Left,
@@ -526,7 +526,25 @@ rsa	ReleaseFast	oaepnf	1	1	6aa74034ecebb510	7e7c9776c2e11410
 # stripLeadingZeros on p, q (2, their length); fromLimbsBits/build of p_mont,
 # q_mont (length verdicts); the verdicts p == q, gcd(e, λ) = 1, d/dP/dQ ≠ 0 and
 # the qInv self-check.
-rsa	ReleaseFast	keygen	1	<=173	6aa74034ecebb510	2cb28867b78d48a6
+rsa	ReleaseFast	keygen	1	<=173	8d8c14bb8ec364e0	2cb28867b78d48a6
+# rsa pemenc (2026-11-17) — SecretKey.toPem(.pkcs1) of the KAT key, d/dP/dQ/qInv
+# and the primes (with their Montgomery params) tainted. 0 in-file: marshal's
+# INTEGER trim is branch-free and declassifies only what DER publishes (the
+# length and the 0x00 sign pad; before 2026-11-17: 8 contexts at its
+# `while field[z] == 0` / `field[z] & 0x80`); base64 is b64ct. Witness: the
+# harness printing the text.
+rsa	ReleaseFast	pemenc	1	0	a8c2432d871a4b9b	c782967c3894b9d5
+# rsa pemdec (2026-11-17) — SecretKey.fromPem of an untainted key's PEM text with
+# exactly the base64 characters whose six bits all lie in the CONTENT of d, dP,
+# dQ, qInv tainted (p, q untainted on purpose: fromPem re-derives the key from
+# them through fromPrimes = row `keygen`, which would otherwise be counted
+# twice). b64ct decode, the DER walk and checkWireFields add nothing but: (1)
+# keycodec pem.zig's scan for the END line's first '-' crosses the body — no
+# base64 character equals '-', so the branch outcome is the same for every key;
+# (2) montint nt.divExact's divisibility verdict (d − dP by p−1, d − dQ by q−1),
+# folded into checkWireFields' single verdict and constant for a valid key. That
+# verdict itself is declassified (the call's result). Witness: printing d.
+rsa	ReleaseFast	pemdec	1	2	3e48f5d3c4885556	2cb28867b78d48a6
 slhdsa	ReleaseFast	seed	1	4	960caaf9efdcbd42	e0fdde7f5c62a2d6
 # Zig 0.17.0 (2026-10-18): prf 8 -> 9, BENIGN (public by the scheme). The +1 is xmssPkFromSig's
 # auth-path direction test `(idx >> k) & 1` (engine.zig:432) at a fourth address (loop unrolled).
