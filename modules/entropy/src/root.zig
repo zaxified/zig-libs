@@ -612,8 +612,9 @@ test "fill ABORTS when entropy is unavailable -- it does not return, and does no
     // unreachable code" -- which is a different promise to a reader and, in
     // ReleaseFast, no promise at all.
     const printed = msg[0..msg_len];
-    const needle = unavailable_message[0..@min(unavailable_message.len, 40)];
-    if (std.mem.find(u8, printed, needle) == null) {
+    // The whole message: the two abort messages share their first 50 bytes, so a
+    // prefix cannot tell `unavailable_message` from `canceled_contract_violation_message`.
+    if (std.mem.find(u8, printed, unavailable_message) == null) {
         std.debug.print(
             "\nfill() aborted, but not with `unavailable_message`. It printed:\n{s}\n",
             .{printed},
@@ -709,8 +710,7 @@ test "fill ABORTS with an honest message when randomSecure violates the blocked-
     try std.testing.expectEqual(@as(i32, 6), sig);
 
     const printed = msg[0..msg_len];
-    const needle = canceled_contract_violation_message[0..@min(canceled_contract_violation_message.len, 40)];
-    if (std.mem.find(u8, printed, needle) == null) {
+    if (std.mem.find(u8, printed, canceled_contract_violation_message) == null) {
         std.debug.print(
             "\nfill() aborted, but not with `canceled_contract_violation_message`. It printed:\n{s}\n",
             .{printed},
@@ -1081,8 +1081,9 @@ test "fill output is uniform, every position written, on the randomSecure route"
 
 test "fill output is uniform, every position written, on the vDSO route" {
     if (!vgetrandom.supported) return error.SkipZigTest;
+    if (!vgetrandom.symbolPresent()) return error.SkipZigTest; // kernel < 6.11
     var probe: [1]u8 = undefined;
-    if (!vgetrandom.draw(&probe)) return error.SkipZigTest; // kernel < 6.11
+    try testing.expect(vgetrandom.draw(&probe));
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
     try uniformity.both(struct {
@@ -1161,6 +1162,55 @@ test "tryFill fills the whole buffer from a normal Io (sweep REV-entropy-1)" {
     }
     var none: [0]u8 = undefined;
     try tryFill(testing.io, &none);
+}
+
+/// A stand-in for the vDSO function that counts calls and fills what it is asked for with 0x5c.
+const FakeVdso = struct {
+    var calls: usize = 0;
+    var last_len: usize = 0;
+
+    fn call(buf: ?*anyopaque, len: usize, _: u32, _: ?*anyopaque, _: usize) callconv(.c) isize {
+        calls += 1;
+        last_len = len;
+        @memset(@as([*]u8, @ptrCast(buf.?))[0..len], 0x5c);
+        return @intCast(len);
+    }
+};
+
+test "fill and tryFill take the vDSO draw under std's Threaded Io only, and keep what it wrote" {
+    if (!vgetrandom.symbolPresent()) return error.SkipZigTest;
+    var probe: [1]u8 = undefined;
+    try testing.expect(vgetrandom.draw(&probe)); // the pool is set up
+    const real = vgetrandom.func;
+    defer vgetrandom.func = real;
+    vgetrandom.func = FakeVdso.call;
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Threaded's own table, a non-empty buffer: one call, and its bytes are
+    // the result (nothing is drawn over them by a second source).
+    FakeVdso.calls = 0;
+    var buf: [32]u8 = @splat(0);
+    fill(io, &buf);
+    try testing.expectEqual(@as(usize, 1), FakeVdso.calls);
+    try testing.expectEqual(@as(usize, 32), FakeVdso.last_len);
+    try testing.expect(std.mem.allEqual(u8, &buf, 0x5c));
+    FakeVdso.calls = 0;
+    buf = @splat(0);
+    try tryFill(io, &buf);
+    try testing.expectEqual(@as(usize, 1), FakeVdso.calls);
+    try testing.expect(std.mem.allEqual(u8, &buf, 0x5c));
+
+    // Any other table (a copy with one slot swapped, here) never reaches it.
+    var counting: CountingIo = .{ .inner = testing.io };
+    FakeVdso.calls = 0;
+    buf = @splat(0);
+    fill(counting.io(), &buf);
+    try testing.expectEqual(@as(usize, 0), FakeVdso.calls);
+    try testing.expectEqual(@as(usize, 1), counting.secure_calls);
+    try testing.expect(!std.mem.allEqual(u8, &buf, 0x5c));
 }
 
 const UnavailableIo = struct {

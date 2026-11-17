@@ -55,9 +55,12 @@ pub const slot_count = 64;
 const State = enum(u8) { uninit, initializing, ready, unavailable };
 
 var state: std.atomic.Value(State) = .init(.uninit);
-var func: VGetRandom = undefined;
+/// `pub` so a test can stand a scripted function in for the vDSO's (module-internal: root.zig does not re-export this file).
+pub var func: VGetRandom = undefined;
 var base: [*]u8 = undefined;
 var state_len: usize = 0;
+/// Length of the mapping `init` made (what a test checks the slots against).
+var mapped_len: usize = 0;
 var busy: [slot_count]std.atomic.Value(bool) = @splat(.init(false));
 /// Where this thread found a free slot last time, so a thread keeps hitting
 /// its own slot without scanning.
@@ -80,12 +83,14 @@ fn init() void {
     if (size > page) return state.store(.unavailable, .release);
     const per_page = page / size;
     const pages = (slot_count + per_page - 1) / per_page;
-    const rc = linux.mmap(null, pages * page, @bitCast(params.mmap_prot), @bitCast(params.mmap_flags), -1, 0);
+    const map_len = pages * page;
+    const rc = linux.mmap(null, map_len, @bitCast(params.mmap_prot), @bitCast(params.mmap_flags), -1, 0);
     if (linux.errno(rc) != .SUCCESS) return state.store(.unavailable, .release);
 
     func = f;
     base = @ptrFromInt(rc);
     state_len = size;
+    mapped_len = map_len;
     state.store(.ready, .release);
 }
 
@@ -226,6 +231,13 @@ pub fn draw(buf: []u8) bool {
         done += @intCast(r);
     }
     return true;
+}
+
+/// True where `draw` must succeed: this build takes the vDSO path and the
+/// running kernel exports the symbol (6.11+). Tests gate on this instead of on
+/// `draw` returning false, which would also let a broken `draw` skip them.
+pub fn symbolPresent() bool {
+    return supported and vdsoLookup(sym.?.version, sym.?.name) != 0;
 }
 
 /// Why `vdsoLookupAt` missed a symbol the model found: replays its walk and
@@ -386,12 +398,18 @@ test "vdsoLookup agrees with the section-table model on every exported vDSO symb
     // The symbol `init` binds is among them where the kernel has it (6.11+);
     // the agreement above then covers the address `draw` will call.
     if (sym != null and vdsoLookup(sym.?.version, sym.?.name) != 0) try std.testing.expect(saw_getrandom);
+    // `vdsoLookup` (the auxv entry, not an address passed in) lands on the model's address for it.
+    if (sym) |want| for (syms) |s| {
+        if (std.mem.eql(u8, s.name, want.name) and std.mem.eql(u8, s.version, want.version))
+            try std.testing.expectEqual(s.addr, vdsoLookup(want.version, want.name));
+    };
 }
 
 test "draw fills the whole buffer, differently each time, on a kernel with the vDSO symbol" {
     if (!supported) return error.SkipZigTest;
+    if (!symbolPresent()) return error.SkipZigTest; // kernel < 6.11 or no symbol
     var a: [4096 + 3]u8 = @splat(0);
-    if (!draw(&a)) return error.SkipZigTest; // kernel < 6.11 or no symbol
+    try std.testing.expect(draw(&a));
     try std.testing.expectEqual(State.ready, state.load(.acquire));
     var b: [a.len]u8 = @splat(0);
     try std.testing.expect(draw(&b));
@@ -408,8 +426,9 @@ test "draw fills the whole buffer, differently each time, on a kernel with the v
 
 test "draw from more threads than slots at once: every buffer filled, no slot left busy" {
     if (!supported) return error.SkipZigTest;
+    if (!symbolPresent()) return error.SkipZigTest;
     var probe: [1]u8 = undefined;
-    if (!draw(&probe)) return error.SkipZigTest;
+    try std.testing.expect(draw(&probe));
     const n_threads = slot_count + 16;
     const Worker = struct {
         fn run(failed: *std.atomic.Value(u32)) void {
@@ -456,4 +475,413 @@ test "gnuHashSymCount agrees with DT_HASH's nchain where the vDSO carries both" 
     };
     if (hash == null or gnu == null) return error.SkipZigTest; // arm64: GNU only, covered by the model test
     try std.testing.expectEqual(@as(usize, hash.?[1]), gnuHashSymCount(gnu.?));
+}
+
+// ── tests of the pool and the draw loop (whole-module mutation, 2026-11-17) ──
+
+test "draw succeeds wherever the kernel exports the vDSO symbol, and the pool is set up" {
+    if (!symbolPresent()) return error.SkipZigTest;
+    var buf: [48]u8 = @splat(0);
+    try std.testing.expect(draw(&buf));
+    try std.testing.expect(!std.mem.allEqual(u8, &buf, 0));
+    try std.testing.expectEqual(State.ready, state.load(.acquire));
+    try std.testing.expect(state_len != 0 and state_len <= std.heap.page_size_min);
+}
+
+test "every slot's state lies whole inside the mapping, apart from the others, and draws" {
+    if (!symbolPresent()) return error.SkipZigTest;
+    var probe: [1]u8 = undefined;
+    try std.testing.expect(draw(&probe));
+    const page = std.heap.page_size_min;
+    var prev_end: usize = 0;
+    // The mapping is exactly the pages the slots need: the last slot ends in the
+    // last page, and no page past it was mapped. (A neighbouring mapping would
+    // hide a short one from a fault test.)
+    const last_end = @intFromPtr(slotPtr(slot_count - 1)) - @intFromPtr(base) + state_len;
+    try std.testing.expectEqual(std.mem.alignForward(usize, last_end, page), mapped_len);
+    for (0..slot_count) |i| {
+        const off = @intFromPtr(slotPtr(i)) - @intFromPtr(base);
+        try std.testing.expect(off >= prev_end); // no two states overlap
+        try std.testing.expect(off % page + state_len <= page); // none straddles a page
+        prev_end = off + state_len;
+        // Claim the slot so no other draw uses it, then draw on its state:
+        // a mapping that stops short of it faults here.
+        try std.testing.expect(!busy[i].swap(true, .acquire));
+        defer busy[i].store(false, .release);
+        var out: [32]u8 = @splat(0);
+        const r = func(&out, out.len, 0, slotPtr(i), state_len);
+        try std.testing.expectEqual(@as(isize, out.len), r);
+        try std.testing.expect(!std.mem.allEqual(u8, &out, 0));
+    }
+}
+
+test "draw refuses while the pool is initializing or unavailable, and writes nothing" {
+    if (!symbolPresent()) return error.SkipZigTest;
+    var probe: [1]u8 = undefined;
+    try std.testing.expect(draw(&probe));
+    defer state.store(.ready, .release);
+    inline for (.{ State.initializing, State.unavailable }) |s| {
+        state.store(s, .release);
+        var buf: [16]u8 = @splat(0xa5);
+        try std.testing.expect(!draw(&buf));
+        try std.testing.expect(std.mem.allEqual(u8, &buf, 0xa5));
+    }
+}
+
+test "draw from the uninitialised state runs init and then draws" {
+    if (!symbolPresent()) return error.SkipZigTest;
+    var probe: [1]u8 = undefined;
+    try std.testing.expect(draw(&probe));
+    const old_base = base;
+    state.store(.uninit, .release);
+    var buf: [16]u8 = @splat(0);
+    try std.testing.expect(draw(&buf));
+    try std.testing.expectEqual(State.ready, state.load(.acquire));
+    try std.testing.expect(base != old_base); // a fresh mapping: init ran again
+    try std.testing.expect(!std.mem.allEqual(u8, &buf, 0));
+}
+
+test "draw scans from the hint, wraps at slot_count, and gives up when every slot is taken" {
+    if (!symbolPresent()) return error.SkipZigTest;
+    var probe: [1]u8 = undefined;
+    try std.testing.expect(draw(&probe));
+    for (&busy) |*f| f.store(true, .release);
+    defer for (&busy) |*f| f.store(false, .release);
+    defer hint = 0;
+
+    // Every slot taken: false, nothing written, no flag disturbed.
+    hint = 5;
+    var buf: [16]u8 = @splat(0xa5);
+    try std.testing.expect(!draw(&buf));
+    try std.testing.expect(std.mem.allEqual(u8, &buf, 0xa5));
+    for (&busy) |*f| try std.testing.expect(f.load(.acquire));
+
+    // One free slot below the hint: found after the wrap, remembered, released.
+    busy[3].store(false, .release);
+    hint = 60;
+    try std.testing.expect(draw(&buf));
+    try std.testing.expectEqual(@as(u8, 3), hint);
+    try std.testing.expect(!busy[3].load(.acquire));
+    for (&busy, 0..) |*f, i| if (i != 3) try std.testing.expect(f.load(.acquire));
+
+    // An odd distance away: a scan that steps by two never gets there.
+    busy[3].store(false, .release);
+    hint = 4;
+    try std.testing.expect(draw(&buf));
+    try std.testing.expectEqual(@as(u8, 3), hint);
+
+    // Two free slots: the scan starts at the hint, so the one at the hint wins.
+    busy[3].store(false, .release);
+    busy[40].store(false, .release);
+    hint = 40;
+    buf = @splat(0);
+    try std.testing.expect(draw(&buf));
+    try std.testing.expectEqual(@as(u8, 40), hint);
+    try std.testing.expect(!std.mem.allEqual(u8, &buf, 0));
+}
+
+/// A scripted stand-in for the vDSO function: records every call and writes
+/// `0xc0 + call index` into the bytes it claims to have produced.
+const Script = struct {
+    var returns: []const isize = &.{};
+    var calls: usize = 0;
+    var bufs: [8]usize = undefined;
+    var lens: [8]usize = undefined;
+    var flags: [8]u32 = undefined;
+    var states: [8]usize = undefined;
+    var state_lens: [8]usize = undefined;
+
+    fn reset(rets: []const isize) void {
+        returns = rets;
+        calls = 0;
+    }
+
+    fn call(buf: ?*anyopaque, len: usize, fl: u32, st: ?*anyopaque, st_len: usize) callconv(.c) isize {
+        const i = calls;
+        calls += 1;
+        bufs[i] = @intFromPtr(buf);
+        lens[i] = len;
+        flags[i] = fl;
+        states[i] = @intFromPtr(st);
+        state_lens[i] = st_len;
+        const r = if (i < returns.len) returns[i] else 0;
+        if (r > 0) @memset(@as([*]u8, @ptrCast(buf.?))[0..@intCast(r)], @as(u8, 0xc0) + @as(u8, @intCast(i)));
+        return r;
+    }
+};
+
+test "draw loops over short returns from the vDSO function, at the right offsets" {
+    if (!symbolPresent()) return error.SkipZigTest;
+    var probe: [1]u8 = undefined;
+    try std.testing.expect(draw(&probe));
+    const real = func;
+    defer func = real;
+    func = Script.call;
+    defer hint = 0;
+
+    // 20 bytes delivered as 7 + 7 + 6.
+    hint = 7;
+    Script.reset(&.{ 7, 7, 6 });
+    var buf: [20]u8 = @splat(0);
+    try std.testing.expect(draw(&buf));
+    try std.testing.expectEqual(@as(usize, 3), Script.calls);
+    var off: usize = 0;
+    for ([_]usize{ 7, 7, 6 }, 0..) |n, i| {
+        try std.testing.expectEqual(@intFromPtr(&buf) + off, Script.bufs[i]);
+        try std.testing.expectEqual(buf.len - off, Script.lens[i]);
+        try std.testing.expectEqual(@as(u32, 0), Script.flags[i]);
+        try std.testing.expectEqual(@intFromPtr(slotPtr(7)), Script.states[i]);
+        try std.testing.expectEqual(state_len, Script.state_lens[i]);
+        for (buf[off..][0..n]) |b| try std.testing.expectEqual(@as(u8, 0xc0) + @as(u8, @intCast(i)), b);
+        off += n;
+    }
+
+    // A single byte at a time is still progress.
+    Script.reset(&.{ 1, 19 });
+    buf = @splat(0);
+    try std.testing.expect(draw(&buf));
+    try std.testing.expectEqual(@as(usize, 2), Script.calls);
+    try std.testing.expectEqual(@as(u8, 0xc0), buf[0]);
+    try std.testing.expectEqual(@as(u8, 0xc1), buf[1]);
+    try std.testing.expectEqual(@as(u8, 0xc1), buf[19]);
+
+    // Zero bytes or an error ends the draw at once, reported as false.
+    Script.reset(&.{ 0, 20 });
+    try std.testing.expect(!draw(&buf));
+    try std.testing.expectEqual(@as(usize, 1), Script.calls);
+    Script.reset(&.{ 5, -1 });
+    try std.testing.expect(!draw(&buf));
+    try std.testing.expectEqual(@as(usize, 2), Script.calls);
+    // A buffer filled exactly by one call is not asked for more.
+    Script.reset(&.{20});
+    try std.testing.expect(draw(&buf));
+    try std.testing.expectEqual(@as(usize, 1), Script.calls);
+    // No slot stays taken after any of it.
+    for (&busy) |*f| try std.testing.expect(!f.load(.acquire));
+}
+
+// ── a synthetic vDSO image: the paths the real one cannot reach ──────────────
+
+/// A tiny ELF64 little-endian image in memory, laid out so every table sits at
+/// a fixed offset, with the options a test varies. The real vDSO is linked at
+/// 0 (`p_vaddr == p_offset`), carries both hash tables and defines every
+/// symbol, so it cannot tell a load bias from the image address, a hash table
+/// from the other, or a defined symbol from an undefined one.
+const Synth = struct {
+    img: [2048]u8 align(16) = @splat(0),
+
+    const ph_at = 64;
+    const dyn_at = 0x100;
+    const str_at = 0x200;
+    const sym_at = 0x300;
+    const hash_at = 0x500;
+    const gnu_at = 0x540;
+    const versym_at = 0x600;
+    const verdef_at = 0x680;
+    /// `target` at 1, `V1` at 8, `base` at 11 in the string table.
+    const target = "target";
+    const sym_value = 0x40;
+
+    const Opts = struct {
+        load_vaddr: u64 = 0x1000,
+        dyn_vaddr: u64 = 0x7000,
+        load: bool = true,
+        dynamic: bool = true,
+        strtab: bool = true,
+        symtab: bool = true,
+        hash_nchain: ?u32 = 4,
+        gnu_count: ?u32 = null,
+        versym: bool = false,
+        verdef: bool = false,
+        sym_type: u8 = 2, // STT_FUNC
+        sym_bind: u8 = 1, // STB_GLOBAL
+        sym_shndx: u16 = 1,
+        sym_index: usize = 1,
+    };
+
+    fn put(s: *Synth, comptime T: type, at: usize, v: T) void {
+        std.mem.writeInt(T, s.img[at..][0..@sizeOf(T)], v, .little);
+    }
+
+    fn build(o: Opts) Synth {
+        var s: Synth = .{};
+        // ELF header: e_phoff @32, e_phentsize @54, e_phnum @56.
+        s.put(u64, 32, ph_at);
+        s.put(u16, 54, 56);
+        var n: u16 = 0;
+        if (o.load) { // PT_LOAD, p_offset 0, p_vaddr
+            s.put(u32, ph_at + 56 * n, 1);
+            s.put(u64, ph_at + 56 * n + 8, 0);
+            s.put(u64, ph_at + 56 * n + 16, o.load_vaddr);
+            n += 1;
+        }
+        if (o.dynamic) { // PT_DYNAMIC: p_offset is where the array really is, p_vaddr somewhere else
+            s.put(u32, ph_at + 56 * n, 2);
+            s.put(u64, ph_at + 56 * n + 8, dyn_at);
+            s.put(u64, ph_at + 56 * n + 16, o.dyn_vaddr);
+            n += 1;
+        }
+        s.put(u16, 56, n);
+
+        @memcpy(s.img[str_at + 1 ..][0..target.len], target);
+        @memcpy(s.img[str_at + 8 ..][0..2], "V1");
+        @memcpy(s.img[str_at + 11 ..][0..4], "base");
+
+        const sym_off = sym_at + 24 * o.sym_index;
+        s.put(u32, sym_off, 1);
+        s.img[sym_off + 4] = (o.sym_bind << 4) | o.sym_type;
+        s.put(u16, sym_off + 6, o.sym_shndx);
+        s.put(u64, sym_off + 8, sym_value);
+
+        if (o.hash_nchain) |c| {
+            s.put(u32, hash_at, 1);
+            s.put(u32, hash_at + 4, c);
+        }
+        if (o.gnu_count) |c| { // nbuckets 1, symoffset 1, one bloom word; chain ends at the last symbol
+            s.put(u32, gnu_at, 1);
+            s.put(u32, gnu_at + 4, 1);
+            s.put(u32, gnu_at + 8, 1);
+            s.put(u32, gnu_at + 24, 1); // bucket 0 starts at symbol 1
+            for (0..c - 1) |k| s.put(u32, gnu_at + 28 + 4 * k, if (k == c - 2) 1 else 0);
+        }
+        if (o.versym) s.put(u16, versym_at + 2 * o.sym_index, 2);
+        if (o.verdef) {
+            // def 1: the image's own (BASE) definition, index 1, aux "base"; def 2: index 2, aux "V1".
+            s.put(u16, verdef_at + 2, 1);
+            s.put(u16, verdef_at + 4, 1);
+            s.put(u32, verdef_at + 12, 20);
+            s.put(u32, verdef_at + 16, 28);
+            s.put(u32, verdef_at + 20, 11);
+            s.put(u16, verdef_at + 28 + 2, 0);
+            s.put(u16, verdef_at + 28 + 4, 2);
+            s.put(u32, verdef_at + 28 + 12, 20);
+            s.put(u32, verdef_at + 28 + 20, 8);
+        }
+
+        var d: usize = 0;
+        const v = o.load_vaddr; // dynamic values are addresses: bias + file offset
+        const tags = [_]struct { on: bool, tag: usize, at: usize }{
+            .{ .on = o.strtab, .tag = std.elf.DT_STRTAB, .at = str_at },
+            .{ .on = o.symtab, .tag = std.elf.DT_SYMTAB, .at = sym_at },
+            .{ .on = o.hash_nchain != null, .tag = std.elf.DT_HASH, .at = hash_at },
+            .{ .on = o.gnu_count != null, .tag = std.elf.DT_GNU_HASH, .at = gnu_at },
+            .{ .on = o.versym, .tag = std.elf.DT_VERSYM, .at = versym_at },
+            .{ .on = o.verdef, .tag = std.elf.DT_VERDEF, .at = verdef_at },
+        };
+        for (tags) |t| if (t.on) {
+            s.put(u64, dyn_at + 16 * d, t.tag);
+            s.put(u64, dyn_at + 16 * d + 8, v + @as(u64, t.at));
+            d += 1;
+        };
+        return s;
+    }
+
+    fn lookup(s: *const Synth, version: []const u8) usize {
+        return vdsoLookupAt(@intFromPtr(&s.img), version, target);
+    }
+
+    fn expected(s: *const Synth, o: Opts) usize {
+        return @intFromPtr(&s.img) -% o.load_vaddr +% sym_value;
+    }
+};
+
+fn synthSupported() bool {
+    return builtin.os.tag == .linux and @sizeOf(usize) == 8 and builtin.cpu.arch.endian() == .little;
+}
+
+test "vdsoLookupAt on a synthetic image: load bias, dynamic section and symbol address" {
+    if (!synthSupported()) return error.SkipZigTest;
+    const o: Synth.Opts = .{};
+    const s = Synth.build(o);
+    try std.testing.expectEqual(s.expected(o), s.lookup(""));
+    // p_vaddr 0 (the real vDSO) is the same arithmetic with a zero bias.
+    const o0: Synth.Opts = .{ .load_vaddr = 0 };
+    const s0 = Synth.build(o0);
+    try std.testing.expectEqual(s0.expected(o0), s0.lookup(""));
+    // Each table the walk needs is needed.
+    const missing = [_]Synth.Opts{
+        .{ .load = false }, .{ .dynamic = false }, .{ .strtab = false }, .{ .symtab = false },
+        .{ .hash_nchain = null }, // neither hash table: no symbol count
+    };
+    for (missing) |m| try std.testing.expectEqual(@as(usize, 0), Synth.build(m).lookup(""));
+}
+
+test "vdsoLookupAt on a synthetic image: which symbols may bind" {
+    if (!synthSupported()) return error.SkipZigTest;
+    // Types: NOTYPE 0, OBJECT 1, FUNC 2, COMMON 5 bind; SECTION 3, FILE 4, TLS 6, IFUNC 10 do not.
+    for ([_]u8{ 0, 1, 2, 5 }) |t| {
+        const o: Synth.Opts = .{ .sym_type = t };
+        const s = Synth.build(o);
+        try std.testing.expectEqual(s.expected(o), s.lookup(""));
+    }
+    for ([_]u8{ 3, 4, 6, 10 }) |t| try std.testing.expectEqual(@as(usize, 0), Synth.build(.{ .sym_type = t }).lookup(""));
+    // Binds: GLOBAL 1, WEAK 2, GNU_UNIQUE 10 bind; LOCAL 0 and 3 do not.
+    for ([_]u8{ 1, 2, 10 }) |b| {
+        const o: Synth.Opts = .{ .sym_bind = b };
+        const s = Synth.build(o);
+        try std.testing.expectEqual(s.expected(o), s.lookup(""));
+    }
+    for ([_]u8{ 0, 3 }) |b| try std.testing.expectEqual(@as(usize, 0), Synth.build(.{ .sym_bind = b }).lookup(""));
+    // An undefined symbol (section index 0) never binds.
+    try std.testing.expectEqual(@as(usize, 0), Synth.build(.{ .sym_shndx = 0 }).lookup(""));
+}
+
+test "vdsoLookupAt on a synthetic image: the symbol count comes from DT_HASH first, else DT_GNU_HASH" {
+    if (!synthSupported()) return error.SkipZigTest;
+    // The target is symbol 3: DT_HASH says 4 symbols, DT_GNU_HASH says 2. DT_HASH wins.
+    const both: Synth.Opts = .{ .hash_nchain = 4, .gnu_count = 2, .sym_index = 3 };
+    const sb = Synth.build(both);
+    try std.testing.expectEqual(sb.expected(both), sb.lookup(""));
+    // GNU hash alone (the arm64 vDSO): 4 symbols walked out of the chains.
+    const gnu: Synth.Opts = .{ .hash_nchain = null, .gnu_count = 4, .sym_index = 3 };
+    const sg = Synth.build(gnu);
+    try std.testing.expectEqual(sg.expected(gnu), sg.lookup(""));
+    // ...and a count that stops short of the symbol does not find it.
+    try std.testing.expectEqual(@as(usize, 0), Synth.build(.{ .hash_nchain = 3, .sym_index = 3 }).lookup(""));
+    try std.testing.expectEqual(@as(usize, 0), Synth.build(.{ .hash_nchain = null, .gnu_count = 3, .sym_index = 3 }).lookup(""));
+}
+
+test "vdsoLookupAt on a synthetic image: the version check needs both DT_VERSYM and DT_VERDEF" {
+    if (!synthSupported()) return error.SkipZigTest;
+    const o: Synth.Opts = .{ .versym = true, .verdef = true };
+    const s = Synth.build(o);
+    try std.testing.expectEqual(s.expected(o), s.lookup("V1"));
+    try std.testing.expectEqual(@as(usize, 0), s.lookup("V2"));
+    try std.testing.expectEqual(@as(usize, 0), s.lookup("base")); // the base definition names no symbol
+    // Only one of the two tables: the check is skipped, whatever version is asked for.
+    const only_versym: Synth.Opts = .{ .versym = true };
+    const sv = Synth.build(only_versym);
+    try std.testing.expectEqual(sv.expected(only_versym), sv.lookup("V9"));
+    const only_verdef: Synth.Opts = .{ .verdef = true };
+    const sd = Synth.build(only_verdef);
+    try std.testing.expectEqual(sd.expected(only_verdef), sd.lookup("V9"));
+}
+
+test "versionMatches skips the BASE definition and needs the index and the name to agree" {
+    if (!synthSupported()) return error.SkipZigTest;
+    const s = Synth.build(.{ .versym = true, .verdef = true });
+    const first: *const std.elf.Verdef = @ptrCast(@alignCast(&s.img[Synth.verdef_at]));
+    const strings: [*:0]const u8 = @ptrCast(&s.img[Synth.str_at]);
+    const v1: std.elf.Versym = .{ .VERSION = 1, .HIDDEN = false };
+    const v2: std.elf.Versym = .{ .VERSION = 2, .HIDDEN = false };
+    const v3: std.elf.Versym = .{ .VERSION = 3, .HIDDEN = false };
+    try std.testing.expect(versionMatches(first, v2, "V1", strings));
+    try std.testing.expect(!versionMatches(first, v2, "base", strings)); // index found, name differs
+    try std.testing.expect(!versionMatches(first, v1, "base", strings)); // index 1 is the BASE definition: never matched
+    try std.testing.expect(!versionMatches(first, v1, "V1", strings));
+    try std.testing.expect(!versionMatches(first, v3, "V1", strings)); // no such index: end of chain
+}
+
+test "gnuHashSymCount: one past the last chain entry, symbols below symoffset counted" {
+    // nbuckets 1, symoffset 2, bloom_words 1 (a 64-bit word = 2 u32), shift 0.
+    const eq = std.testing.expectEqual;
+    var t = [_]u32{ 1, 2, 1, 0, 0, 0, 2, 1 }; // bucket 0 starts at symbol 2, chain[0] ends it
+    try eq(@as(usize, 3), gnuHashSymCount(&t));
+    t[6] = 0; // an empty bucket: only the unhashed symbols below symoffset
+    try eq(@as(usize, 2), gnuHashSymCount(&t));
+    t[6] = 1; // a bucket start below symoffset is clamped the same way
+    try eq(@as(usize, 2), gnuHashSymCount(&t));
+    // The chain from symbol 3 walks two entries before its end bit: symbols 3 and 4.
+    var longer = [_]u32{ 1, 2, 1, 0, 0, 0, 3, 0, 0, 1 };
+    try eq(@as(usize, 5), gnuHashSymCount(&longer));
 }

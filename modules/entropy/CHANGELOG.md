@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — Whole-module mutation of `src/root.zig` and `src/vgetrandom.zig` (117 mutants, 111 killed, 2 EQUIVALENT + 4 UNOBSERVABLE; card now carries whole-module counts). 13 tests added (the vDSO tests no longer skip when `draw` fails: a broken `init`/`draw` was invisible; a synthetic ELF image, a scripted vDSO function, pool/slot invariants, whole-message abort needles). **NO CONSUMER-VISIBLE CHANGE:** `vgetrandom.func` is `pub`, `symbolPresent()` and `mapped_len` are new, all internal.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-10-30** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GU). New `tryFill(io, buf) error{EntropyUnavailable}!void` with the same fast path as `fill`, for callers with an error channel; `fill` keeps its fail-closed abort (now `tryFill` + the same panic message). Docs: a `SecureSource` must outlive the `Random` it returns.
 - **2026-10-18** — Ported to Zig 0.17.0. `std.elf.AT.SYSINFO_EHDR`, `elf.ElfN.Phdr` (fields `type/offset/vaddr`, `elf.PT` enum); `wait4` status is `i32` (tests only).

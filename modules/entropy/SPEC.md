@@ -6,7 +6,7 @@
 
 **Scope:** parity — Go `crypto/rand.Read` (Go 1.24+) / Rust `getrandom` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-14 · mutation 2026-09-04 · src ?
+**Audit:** review 2026-09-14 · mutation 2026-11-17 (111/117, 6 eq) · src 8644af601628abb8
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — no computation on the secret bytes: it copies std.Io.randomSecure output to the caller, so there is nothing to time · panic 2026-10-30 (sweep + blind review: `tryFill` (error instead of abort) added, `fill` keeps the fail-closed abort; delta audit 4/4)
 
@@ -400,6 +400,19 @@ filled the whole buffer.
 - **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
 
 **What the tests actually contain.** own policy binding over the kernel CRNG (std.Io.randomSecure, or the vDSO `getrandom` under std's Threaded Io); no algorithm and no wire, so no third party to agree with — tests pin WHICH std entry point is called, not any output value
+
+## Audit 2026-11-17 (whole-module mutation)
+
+117 mutants over every non-test line of `src/root.zig` (`fill`, `tryFill`, `SecureSource`: the abort arms and their messages, the cancel-protection pair, the vDSO routing condition) and `src/vgetrandom.zig` (pool setup, the symbol lookup and its ELF walk, `gnuHashSymCount`, `versionMatches`, `slotPtr`, the slot scan and the draw loop), one schemata build, baseline first. The suite as it stood left 57 alive: its vDSO tests returned *skip* when `draw` returned false, so a broken `init`, a leaked slot or a wrong slot address looked like a kernel without the feature, and the two abort messages share their first 50 bytes, which the 40-byte needle could not tell apart. 13 tests added (41 now, none skipped on a 6.11+ kernel):
+
+- the vDSO tests gate on `symbolPresent()` (the symbol is in the image) and then require `draw` to succeed;
+- every slot's state lies inside the mapping, in its own page, apart from the others, and the mapping is exactly the pages the slots need (`mapped_len`);
+- `draw` refuses while the pool is `initializing` or `unavailable`, runs `init` from `uninit`, scans from the hint, wraps at `slot_count`, remembers and releases its slot, and gives up (false, nothing written) when every slot is taken;
+- a scripted stand-in for the vDSO function (`vgetrandom.func`) drives the draw loop through short returns, a zero and an error, checking each call's pointer, remaining length, flags and state, and `fill`/`tryFill` routing: the Threaded table takes the vDSO path and keeps its bytes, any other table never reaches it;
+- a synthetic ELF image reaches what the real vDSO (linked at 0, both hash tables, every symbol defined) cannot: a load bias that is not the image address, a `PT_DYNAMIC` whose offset and address differ, each missing table, which symbol types and binds may bind, an undefined symbol, DT_HASH before DT_GNU_HASH and DT_GNU_HASH alone (the arm64 case, on x86_64 too), the version check needing both DT_VERSYM and DT_VERDEF; plus direct tests of `versionMatches` (the BASE definition is never matched) and `gnuHashSymCount` (a bucket starting at `symoffset`);
+- both abort tests compare the whole message, not a prefix.
+
+Source: `vgetrandom.func` is `pub` (the file is not re-exported by the root), `symbolPresent()` and `mapped_len` are new; no behaviour change. 111 mutants die. 6 do not: 4 UNOBSERVABLE (`size_of_opaque_state == 0` guard dropped, `size > page` as `>=` and dropped: the kernel never reports a zero or page-sized state, so the guards need a kernel that does; the post-init `.ready` check dropped: needs an `init` that fails after the symbol was found and the race won), 2 EQUIVALENT (`buf.len != 0` dropped: an empty draw claims a slot, makes no vDSO call and returns true, so the bytes are identical and only the order of `init` changes — cost-only; `per_page + 1` in `init`: the page count, hence the mapping, is unchanged for this kernel's state size, which the `mapped_len` test compares). Not mutated: `supported`, the `sym` table and `threaded_vtable` (comptime), the memory orders of the busy flags (no test can observe a weaker order), `diagLookup` and `modelSymbols` (test-side). Counts on the card are whole-module.
 
 ## Backlog / deferred
 
