@@ -561,22 +561,9 @@ pub const Socket = struct {
     /// `error.FamilyNotFound` = no such family. A client can compare
     /// `version` against what it was written for.
     pub fn getFamily(self: *Socket, name: []const u8) ResolveError!Family {
-        if (name.len >= GENL_NAMSIZ) return error.NameTooLong;
-
         var t = self.transport();
         defer self.sync(t);
-        t.ext_ack_len = 0;
-
-        const seq = t.nextSeq();
-        const req = try buildGetFamilyRequest(t.gpa, seq, name);
-        defer t.gpa.free(req);
-        try t.send(req);
-
-        var list: std.ArrayList(Family) = .empty;
-        defer list.deinit(t.gpa);
-        _ = try collectFamilies(&t, t.gpa, name, seq, &list);
-        if (list.items.len != 1) return error.MalformedReply;
-        return list.items[0];
+        return getFamilyOver(&t, name);
     }
 
     /// Every family the kernel has registered (`CTRL_CMD_GETFAMILY` with
@@ -585,27 +572,9 @@ pub const Socket = struct {
     /// allocator). A dump the kernel flags `NLM_F_DUMP_INTR` is restarted up
     /// to `max_dump_attempts` times, then `error.DumpInterrupted`.
     pub fn listFamilies(self: *Socket) ListFamiliesError![]Family {
-        var attempt: u8 = 0;
-        while (attempt < max_dump_attempts) : (attempt += 1) {
-            var t = self.transport();
-            defer self.sync(t);
-            t.ext_ack_len = 0;
-
-            const seq = t.nextSeq();
-            const req = try buildListFamiliesRequest(t.gpa, seq);
-            defer t.gpa.free(req);
-            try t.send(req);
-
-            var list: std.ArrayList(Family) = .empty;
-            errdefer list.deinit(t.gpa);
-            const interrupted = try collectFamilies(&t, t.gpa, null, seq, &list);
-            if (interrupted) {
-                list.deinit(t.gpa);
-                continue;
-            }
-            return list.toOwnedSlice(t.gpa);
-        }
-        return error.DumpInterrupted;
+        var t = self.transport();
+        defer self.sync(t);
+        return listFamiliesOver(&t);
     }
 
     /// What one `CTRL_CMD_GETFAMILY` round trip is being asked to extract
@@ -841,6 +810,52 @@ fn collectFamilies(
             }
         }
     }
+}
+
+/// The body of `Socket.getFamily` over any transport that offers `gpa`,
+/// `ext_ack_len`, `nextSeq()`, `send()` and the receive half named for
+/// `ctrlGetFamilyOver` (`netlink.Socket` and the `GenlScripted` test fixture
+/// both do), so the guard, the request and the one-record check run in tests
+/// without a kernel.
+fn getFamilyOver(t: anytype, name: []const u8) ResolveError!Family {
+    if (name.len >= GENL_NAMSIZ) return error.NameTooLong;
+    t.ext_ack_len = 0;
+
+    const seq = t.nextSeq();
+    const req = try buildGetFamilyRequest(t.gpa, seq, name);
+    defer t.gpa.free(req);
+    try t.send(req);
+
+    var list: std.ArrayList(Family) = .empty;
+    defer list.deinit(t.gpa);
+    _ = try collectFamilies(t, t.gpa, name, seq, &list);
+    if (list.items.len != 1) return error.MalformedReply;
+    return list.items[0];
+}
+
+/// The body of `Socket.listFamilies` (see `getFamilyOver` for the transport
+/// shape): one dump per attempt, restarted when the kernel flags it
+/// `NLM_F_DUMP_INTR`, at most `max_dump_attempts` times.
+fn listFamiliesOver(t: anytype) ListFamiliesError![]Family {
+    var attempt: u8 = 0;
+    while (attempt < max_dump_attempts) : (attempt += 1) {
+        t.ext_ack_len = 0;
+
+        const seq = t.nextSeq();
+        const req = try buildListFamiliesRequest(t.gpa, seq);
+        defer t.gpa.free(req);
+        try t.send(req);
+
+        var list: std.ArrayList(Family) = .empty;
+        errdefer list.deinit(t.gpa);
+        const interrupted = try collectFamilies(t, t.gpa, null, seq, &list);
+        if (interrupted) {
+            list.deinit(t.gpa);
+            continue;
+        }
+        return list.toOwnedSlice(t.gpa);
+    }
+    return error.DumpInterrupted;
 }
 
 // ── offline tests ───────────────────────────────────────────────────────────
@@ -1618,6 +1633,19 @@ const GenlScripted = struct {
     pid: u32,
     ext_ack_len: usize = 0,
     ext_ack_buf: [64]u8 = @splat(0),
+    // For `getFamilyOver` / `listFamiliesOver`: the request half.
+    gpa: std.mem.Allocator = testing.allocator,
+    seq: u32 = 0,
+    sends: usize = 0,
+
+    fn nextSeq(self: *GenlScripted) u32 {
+        self.seq += 1;
+        return self.seq;
+    }
+    fn send(self: *GenlScripted, msg: []const u8) SendError!void {
+        _ = msg;
+        self.sends += 1;
+    }
 
     fn portId(self: *const GenlScripted) u32 {
         return self.pid;
@@ -2290,4 +2318,432 @@ test "integration: listFamilies and getFamily against the live kernel" {
     try testing.expect(one.version >= 1);
     try testing.expectError(error.FamilyNotFound, sock.getFamily("zig-libs-nope"));
     try testing.expectError(error.NameTooLong, sock.getFamily("a-family-name-way-too-long"));
+}
+
+// ── whole-module mutation (2026-11-17): the tests its survivors asked for ──
+
+fn expectWalkError(r: codec.Error!?u32) !void {
+    if (r) |_| return error.TestUnexpectedResult else |_| {}
+}
+
+/// An attribute header whose length (2) is below the header size.
+const damaged_attr = [_]u8{ 2, 0, 1, 0 };
+
+test "findMcastGroupId: damage anywhere in the walk is an error, even without a name match" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+
+    // The group list itself is damaged.
+    try codec.appendAttr(gpa, &list, CTRL_ATTR_MCAST_GROUPS, &damaged_attr);
+    try expectWalkError(findMcastGroupId(list.items, "scan"));
+
+    // One group entry is damaged.
+    list.clearRetainingCapacity();
+    const outer = try codec.nestBegin(gpa, &list, CTRL_ATTR_MCAST_GROUPS);
+    try codec.appendAttr(gpa, &list, 1, &damaged_attr);
+    try codec.nestEnd(&list, outer);
+    try expectWalkError(findMcastGroupId(list.items, "scan"));
+
+    // A group with ANOTHER name whose id attribute is two bytes, not four.
+    list.clearRetainingCapacity();
+    const grp2 = try codec.nestBegin(gpa, &list, CTRL_ATTR_MCAST_GROUPS);
+    const ent2 = try codec.nestBegin(gpa, &list, 1);
+    try codec.appendAttrString(gpa, &list, CTRL_ATTR_MCAST_GRP_NAME, "other");
+    try codec.appendAttr(gpa, &list, CTRL_ATTR_MCAST_GRP_ID, &.{ 1, 0 });
+    try codec.nestEnd(&list, ent2);
+    try codec.nestEnd(&list, grp2);
+    try expectWalkError(findMcastGroupId(list.items, "scan"));
+
+    // A query that merely EXTENDS a published name is not that group.
+    list.clearRetainingCapacity();
+    try buildMcastGroupsAttrs(gpa, &list, &.{.{ .name = "scan", .id = 6 }});
+    try testing.expectEqual(@as(?u32, null), try findMcastGroupId(list.items, "scan2"));
+    try testing.expectEqual(@as(?u32, 6), try findMcastGroupId(list.items, "scan"));
+}
+
+test "parseFamily: a wrongly sized id, version, hdrsize or maxattr attribute is MalformedReply" {
+    const gpa = testing.allocator;
+    for ([_]u16{ CTRL_ATTR_FAMILY_ID, CTRL_ATTR_VERSION, CTRL_ATTR_HDRSIZE, CTRL_ATTR_MAXATTR }) |kind| {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        try codec.appendAttrString(gpa, &list, CTRL_ATTR_FAMILY_NAME, "x");
+        try codec.appendAttrU16(gpa, &list, CTRL_ATTR_FAMILY_ID, 20);
+        // The id is u16 (so four bytes is wrong); the others are u32 (two is).
+        const wrong: []const u8 = if (kind == CTRL_ATTR_FAMILY_ID) &.{ 1, 0, 0, 0 } else &.{ 1, 0 };
+        try codec.appendAttr(gpa, &list, kind, wrong);
+        try testing.expectError(error.MalformedReply, parseFamily(list.items));
+    }
+}
+
+test "parseFamily: the id range is inclusive at GENL_MAX_ID, and each metadata attribute lands in its own field" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try codec.appendAttrString(gpa, &list, CTRL_ATTR_FAMILY_NAME, "x");
+    try codec.appendAttrU16(gpa, &list, CTRL_ATTR_FAMILY_ID, GENL_MAX_ID);
+    try codec.appendAttrU32(gpa, &list, CTRL_ATTR_VERSION, 3);
+    try codec.appendAttrU32(gpa, &list, CTRL_ATTR_HDRSIZE, 5);
+    try codec.appendAttrU32(gpa, &list, CTRL_ATTR_MAXATTR, 7);
+    const f = try parseFamily(list.items);
+    try testing.expectEqual(GENL_MAX_ID, f.id);
+    try testing.expectEqual(@as(u32, 3), f.version);
+    try testing.expectEqual(@as(u32, 5), f.hdrsize);
+    try testing.expectEqual(@as(u32, 7), f.maxattr);
+    try testing.expectEqualStrings("x", f.name());
+}
+
+fn appendErrno(gpa: std.mem.Allocator, list: *std.ArrayList(u8), seq: u32, errno: linux.E) !void {
+    const h = try codec.appendHeader(gpa, list, codec.NLMSG_ERROR, 0, seq, 7);
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(i32, &b, -@as(i32, @intCast(@backingInt(errno))), native_endian);
+    try list.appendSlice(gpa, &b);
+    codec.finishHeader(list, h);
+}
+
+test "resolve errors: every errno the controller can answer maps to its documented error, in both engines" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { e: linux.E, want: ResolveError }{
+        .{ .e = .NOENT, .want = error.FamilyNotFound },
+        .{ .e = .PERM, .want = error.AccessDenied },
+        .{ .e = .ACCES, .want = error.AccessDenied },
+        .{ .e = .NOBUFS, .want = error.SystemResources },
+        .{ .e = .NOMEM, .want = error.SystemResources },
+        .{ .e = .INVAL, .want = error.Unexpected },
+    };
+    for (cases) |c| {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        try appendErrno(gpa, &list, 42, c.e);
+        var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+        try testing.expectError(c.want, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+        var out: std.ArrayList(Family) = .empty;
+        defer out.deinit(gpa);
+        t = .{ .script = &.{list.items}, .pid = 7 };
+        try testing.expectError(c.want, collectFamilies(&t, gpa, null, 42, &out));
+    }
+}
+
+test "both reply engines hand the kernel's extended-ACK reason to the transport" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    const h = try codec.appendHeader(gpa, &list, codec.NLMSG_ERROR, codec.NLM_F_ACK_TLVS | codec.NLM_F_CAPPED, 42, 7);
+    var code: [4]u8 = undefined;
+    std.mem.writeInt(i32, &code, -@as(i32, @intCast(@backingInt(linux.E.INVAL))), native_endian);
+    try list.appendSlice(gpa, &code);
+    try list.appendSlice(gpa, &@as([codec.header_len]u8, @splat(0))); // the echoed request header
+    try codec.appendAttrString(gpa, &list, codec.NLMSGERR_ATTR.MSG, "bad attribute");
+    codec.finishHeader(&list, h);
+
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.Unexpected, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+    try testing.expectEqualStrings("bad attribute", t.ext_ack_buf[0..t.ext_ack_len]);
+
+    var out: std.ArrayList(Family) = .empty;
+    defer out.deinit(gpa);
+    t = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.Unexpected, collectFamilies(&t, gpa, null, 42, &out));
+    try testing.expectEqualStrings("bad attribute", t.ext_ack_buf[0..t.ext_ack_len]);
+}
+
+test "both reply engines refuse a datagram that ends inside a message header" {
+    const gpa = testing.allocator;
+    const dgram = [_]u8{ 1, 2, 3 };
+    var t: GenlScripted = .{ .script = &.{&dgram}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+    var out: std.ArrayList(Family) = .empty;
+    defer out.deinit(gpa);
+    t = .{ .script = &.{&dgram}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, collectFamilies(&t, gpa, null, 42, &out));
+}
+
+test "collectFamilies: the datagram budget is exact, and every control message has its own error" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(Family) = .empty;
+    defer out.deinit(gpa);
+
+    // A flood of records for another seq adds no family, so only the datagram
+    // budget can stop it.
+    var l: std.ArrayList(u8) = .empty;
+    defer l.deinit(gpa);
+    try buildFamilyReply(gpa, &l, CTRL_CMD_NEWFAMILY, 99, 7, "nlctrl", GENL_ID_CTRL);
+    var t: GenlScripted = .{ .filler = l.items, .pid = 7 };
+    try testing.expectError(error.TooManyMessages, collectFamilies(&t, gpa, null, 5, &out));
+    try testing.expectEqual(@as(usize, max_reply_messages), t.recvs);
+
+    // NLMSG_OVERRUN.
+    var d: std.ArrayList(u8) = .empty;
+    defer d.deinit(gpa);
+    var h = try codec.appendHeader(gpa, &d, codec.NLMSG_OVERRUN, 0, 5, 7);
+    codec.finishHeader(&d, h);
+    t = .{ .script = &.{d.items}, .pid = 7 };
+    try testing.expectError(error.SystemResources, collectFamilies(&t, gpa, null, 5, &out));
+
+    // An NLMSG_ERROR too short to carry its errno.
+    d.clearRetainingCapacity();
+    h = try codec.appendHeader(gpa, &d, codec.NLMSG_ERROR, 0, 5, 7);
+    try d.appendSlice(gpa, &.{ 0, 0 });
+    codec.finishHeader(&d, h);
+    t = .{ .script = &.{d.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, collectFamilies(&t, gpa, null, 5, &out));
+
+    // A record of another genl family is skipped, whatever its payload.
+    d.clearRetainingCapacity();
+    h = try codec.appendHeader(gpa, &d, GENL_ID_CTRL + 1, 0, 5, 7);
+    try d.appendSlice(gpa, &.{ 0xff, 0xff, 0xff, 0xff });
+    codec.finishHeader(&d, h);
+    try appendDone(gpa, &d, 5, 7);
+    t = .{ .script = &.{d.items}, .pid = 7 };
+    try testing.expect(!try collectFamilies(&t, gpa, null, 5, &out));
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+
+    // An nlctrl record too short for its genlmsghdr.
+    d.clearRetainingCapacity();
+    h = try codec.appendHeader(gpa, &d, GENL_ID_CTRL, 0, 5, 7);
+    try d.appendSlice(gpa, &.{ 1, 2, 3 });
+    codec.finishHeader(&d, h);
+    t = .{ .script = &.{d.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, collectFamilies(&t, gpa, null, 5, &out));
+
+    // A record naming a longer or a shorter name than the one asked for.
+    for ([_][]const u8{ "nlctrlx", "nlc" }) |named| {
+        d.clearRetainingCapacity();
+        try buildFamilyReply(gpa, &d, CTRL_CMD_NEWFAMILY, 5, 7, named, GENL_ID_CTRL);
+        t = .{ .script = &.{d.items}, .pid = 7 };
+        try testing.expectError(error.MalformedReply, collectFamilies(&t, gpa, "nlctrl", 5, &out));
+    }
+}
+
+test "ctrlGetFamilyOver: the reply's name must equal the family asked for, byte for byte" {
+    const gpa = testing.allocator;
+    for ([_][]const u8{ "nlctrlx", "nlc" }) |named| {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        try buildFamilyReply(gpa, &list, CTRL_CMD_NEWFAMILY, 42, 7, named, GENL_ID_CTRL);
+        var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+        try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+    }
+}
+
+test "ctrlGetFamilyOver: a family id of the wrong size, and the id range edges, for resolveFamily" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    const h = try codec.appendHeader(gpa, &list, GENL_ID_CTRL, 0, 42, 7);
+    try appendHeader(gpa, &list, CTRL_CMD_NEWFAMILY, 2);
+    try codec.appendAttrString(gpa, &list, CTRL_ATTR_FAMILY_NAME, "nlctrl");
+    try codec.appendAttr(gpa, &list, CTRL_ATTR_FAMILY_ID, &.{ 1, 0, 0, 0 });
+    codec.finishHeader(&list, h);
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+
+    // The top of the range resolves, one past it does not.
+    list.clearRetainingCapacity();
+    try buildFamilyReply(gpa, &list, CTRL_CMD_NEWFAMILY, 42, 7, "nlctrl", GENL_MAX_ID);
+    try appendBareAck(gpa, &list, 42, 7);
+    t = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectEqual(@as(?u32, GENL_MAX_ID), try ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+    list.clearRetainingCapacity();
+    try buildFamilyReply(gpa, &list, CTRL_CMD_NEWFAMILY, 42, 7, "nlctrl", GENL_MAX_ID + 1);
+    try appendBareAck(gpa, &list, 42, 7);
+    t = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+}
+
+test "ctrlGetFamilyOver: a damaged group nest is MalformedReply for both group queries" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    const h = try codec.appendHeader(gpa, &list, GENL_ID_CTRL, 0, 42, 7);
+    try appendHeader(gpa, &list, CTRL_CMD_NEWFAMILY, 2);
+    try codec.appendAttrString(gpa, &list, CTRL_ATTR_FAMILY_NAME, "nlctrl");
+    try codec.appendAttrU16(gpa, &list, CTRL_ATTR_FAMILY_ID, GENL_ID_CTRL);
+    try codec.appendAttr(gpa, &list, CTRL_ATTR_MCAST_GROUPS, &damaged_attr);
+    codec.finishHeader(&list, h);
+    try appendBareAck(gpa, &list, 42, 7);
+
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .{ .one_group = "notify" }, 42));
+    var out: [1]?u32 = .{null};
+    t = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(
+        error.MalformedReply,
+        ctrlGetFamilyOver(&t, "nlctrl", .{ .many_groups = .{ .names = &.{"notify"}, .out = &out } }, 42),
+    );
+}
+
+test "ctrlGetFamilyOver: a batch keeps the id an earlier record found when a later record has no group nest" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try groupReply(&list, CTRL_CMD_NEWFAMILY, "nlctrl", GENL_ID_CTRL, "notify", 5);
+    try buildFamilyReply(gpa, &list, CTRL_CMD_NEWFAMILY, 42, 7, "nlctrl", GENL_ID_CTRL);
+    try appendBareAck(gpa, &list, 42, 7);
+    var out: [1]?u32 = .{null};
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    _ = try ctrlGetFamilyOver(&t, "nlctrl", .{ .many_groups = .{ .names = &.{"notify"}, .out = &out } }, 42);
+    try testing.expectEqual(@as(?u32, 5), out[0]);
+}
+
+test "getFamilyOver: the name guard comes before a sequence number, and the reply must be exactly one record for that name" {
+    const gpa = testing.allocator;
+    const name15 = "abcdefghijklmno";
+    comptime std.debug.assert(name15.len == GENL_NAMSIZ - 1);
+
+    // Sixteen bytes do not fit: refused before anything is spent or sent.
+    var t: GenlScripted = .{ .pid = 7 };
+    try testing.expectError(error.NameTooLong, getFamilyOver(&t, name15 ++ "p"));
+    try testing.expectEqual(@as(u32, 0), t.seq);
+    try testing.expectEqual(@as(usize, 0), t.sends);
+
+    // Fifteen do: one request, the stale extended-ACK text cleared, the record returned.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try buildFamilyReply(gpa, &list, CTRL_CMD_NEWFAMILY, 1, 7, name15, 20);
+    try appendBareAck(gpa, &list, 1, 7);
+    t = .{ .script = &.{list.items}, .pid = 7, .ext_ack_len = 5 };
+    const f = try getFamilyOver(&t, name15);
+    try testing.expectEqual(@as(u16, 20), f.id);
+    try testing.expectEqualStrings(name15, f.name());
+    try testing.expectEqual(@as(usize, 0), t.ext_ack_len);
+    try testing.expectEqual(@as(usize, 1), t.sends);
+
+    // A record for another family is refused.
+    list.clearRetainingCapacity();
+    try buildFamilyReply(gpa, &list, CTRL_CMD_NEWFAMILY, 1, 7, "other", 20);
+    try appendBareAck(gpa, &list, 1, 7);
+    t = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, getFamilyOver(&t, name15));
+
+    // Two records, or none, are not "the family".
+    list.clearRetainingCapacity();
+    try buildFamilyReply(gpa, &list, CTRL_CMD_NEWFAMILY, 1, 7, name15, 20);
+    try buildFamilyReply(gpa, &list, CTRL_CMD_NEWFAMILY, 1, 7, name15, 21);
+    try appendBareAck(gpa, &list, 1, 7);
+    t = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, getFamilyOver(&t, name15));
+    list.clearRetainingCapacity();
+    try appendBareAck(gpa, &list, 1, 7);
+    t = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, getFamilyOver(&t, name15));
+}
+
+/// One dump attempt's datagram for `listFamiliesOver`: `n_ok` clean records
+/// then, when `interrupted`, one flagged `NLM_F_DUMP_INTR`, then NLMSG_DONE.
+fn dumpAttempt(gpa: std.mem.Allocator, list: *std.ArrayList(u8), seq: u32, n_ok: u16, interrupted: bool) !void {
+    var i: u16 = 0;
+    while (i < n_ok) : (i += 1) {
+        var nm: [4]u8 = .{ 'f', 'a', 'm', 'a' + @as(u8, @intCast(i)) };
+        try buildFamilyReply(gpa, list, CTRL_CMD_NEWFAMILY, seq, 7, &nm, GENL_ID_CTRL + 1 + i);
+    }
+    if (interrupted) {
+        const h = try codec.appendHeader(gpa, list, GENL_ID_CTRL, codec.NLM_F_DUMP_INTR, seq, 7);
+        try appendHeader(gpa, list, CTRL_CMD_NEWFAMILY, 2);
+        try codec.appendAttrString(gpa, list, CTRL_ATTR_FAMILY_NAME, "late");
+        try codec.appendAttrU16(gpa, list, CTRL_ATTR_FAMILY_ID, GENL_ID_CTRL);
+        codec.finishHeader(list, h);
+    }
+    try appendDone(gpa, list, seq, 7);
+}
+
+test "listFamiliesOver: an interrupted dump is restarted, at most max_dump_attempts times" {
+    const gpa = testing.allocator;
+
+    // Every attempt interrupted (and each already collected a record): three
+    // tries, then DumpInterrupted.
+    var d1: std.ArrayList(u8) = .empty;
+    defer d1.deinit(gpa);
+    var d2: std.ArrayList(u8) = .empty;
+    defer d2.deinit(gpa);
+    var d3: std.ArrayList(u8) = .empty;
+    defer d3.deinit(gpa);
+    try dumpAttempt(gpa, &d1, 1, 1, true);
+    try dumpAttempt(gpa, &d2, 2, 1, true);
+    try dumpAttempt(gpa, &d3, 3, 1, true);
+    var t: GenlScripted = .{ .script = &.{ d1.items, d2.items, d3.items }, .pid = 7 };
+    try testing.expectError(error.DumpInterrupted, listFamiliesOver(&t));
+    try testing.expectEqual(@as(usize, max_dump_attempts), t.sends);
+    try testing.expectEqual(@as(usize, max_dump_attempts), t.recvs);
+
+    // One interruption, then a clean two-family dump: the second attempt's list.
+    var e2: std.ArrayList(u8) = .empty;
+    defer e2.deinit(gpa);
+    try dumpAttempt(gpa, &e2, 2, 2, false);
+    t = .{ .script = &.{ d1.items, e2.items }, .pid = 7, .ext_ack_len = 5 };
+    const fams = try listFamiliesOver(&t);
+    defer gpa.free(fams);
+    try testing.expectEqual(@as(usize, 2), fams.len);
+    try testing.expectEqualStrings("fama", fams[0].name());
+    try testing.expectEqualStrings("famb", fams[1].name());
+    try testing.expectEqual(@as(usize, 2), t.sends);
+    try testing.expectEqual(@as(usize, 0), t.ext_ack_len);
+}
+
+test "Socket: the sequence counter starts at 0 and advances by one; an extended-ACK reason survives it" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer sock.close();
+    try testing.expectEqual(@as(u32, 0), sock.seq);
+    const reason = "kept";
+    @memcpy(sock.ext_ack_buf[0..reason.len], reason);
+    sock.ext_ack_len = reason.len;
+    try testing.expectEqual(@as(u32, 1), sock.nextSeq());
+    try testing.expectEqual(@as(u32, 2), sock.nextSeq());
+    try testing.expectEqual(@as(u32, 2), sock.seq);
+    try testing.expectEqualStrings(reason, sock.lastErrorMessage());
+}
+
+test "Socket: a receive buffer grown by a big datagram is written back to the socket" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var sock = Socket.open(gpa) catch return error.SkipZigTest;
+    defer sock.close();
+
+    // recvDatagram and recvDatagramStrict: one GETFAMILY reply into a 32-byte buffer.
+    for ([_]bool{ false, true }) |strict| {
+        sock.buf = try gpa.realloc(sock.buf, 32);
+        const seq = sock.nextSeq();
+        const req = try buildGetFamilyRequest(gpa, seq, "nlctrl");
+        defer gpa.free(req);
+        try sock.send(req);
+        const dgram = if (strict) try sock.recvDatagramStrict() else try sock.recvDatagram();
+        try testing.expect(dgram.len > 32);
+        try testing.expect(sock.buf.len >= dgram.len);
+        // Drain the trailing ACK so the next round starts clean.
+        _ = try sock.recvDatagram();
+    }
+
+    // getFamily and listFamilies do the same through their own borrow.
+    sock.buf = try gpa.realloc(sock.buf, 32);
+    _ = try sock.getFamily("nlctrl");
+    try testing.expect(sock.buf.len > 32);
+    sock.buf = try gpa.realloc(sock.buf, 32);
+    const all = try sock.listFamilies();
+    defer gpa.free(all);
+    try testing.expect(sock.buf.len > 32);
+}
+
+test "Socket: a family name of exactly GENL_NAMSIZ bytes is refused before a sequence number; one byte less is looked up" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer sock.close();
+    const name15 = "abcdefghijklmno";
+    const before = sock.seq;
+    try testing.expectError(error.NameTooLong, sock.resolveFamily(name15 ++ "p"));
+    try testing.expectError(error.NameTooLong, sock.resolveMcastGroup(name15 ++ "p", "x"));
+    try testing.expectEqual(before, sock.seq);
+    try testing.expectError(error.FamilyNotFound, sock.resolveFamily(name15));
+    try testing.expectError(error.FamilyNotFound, sock.resolveMcastGroup(name15, "x"));
+    try testing.expectError(error.FamilyNotFound, sock.getFamily(name15));
+}
+
+test "Socket: resolveMcastGroups clears an out slot whose group the family does not publish" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer sock.close();
+    var out: [2]?u32 = .{ 99, 99 };
+    try sock.resolveMcastGroups("nlctrl", &.{ "notify", "zig-libs-nope" }, &out);
+    try testing.expect(out[0] != null and out[0].? != 99);
+    try testing.expectEqual(@as(?u32, null), out[1]);
 }
