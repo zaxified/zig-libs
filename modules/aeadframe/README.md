@@ -80,6 +80,13 @@ Contracts (full detail in [SPEC.md](SPEC.md)):
   residual case it cannot see). An old-epoch record is rejected
   (`error.EpochMismatch`); a new-epoch record may reuse an old `seq` because it
   maps to a fresh nonce.
+- **Length padding (opt-in).** `Sealer.sealPadded(out, pt, aad, pad)` seals a
+  version-2 record whose encrypted body is `plaintext ‖ 0x00 × pad ‖ pad(u16)`,
+  so the record length shows only the padded size (`record.padForBlock(len,
+  block)` picks the pad that rounds to a block). `seal` is unchanged (version 1,
+  no trailer). An `Opener` reads version 2 only after `o.allow_padding = true`
+  (otherwise `error.UnsupportedVersion`, as before) and returns the plaintext
+  length without the padding; a bad trailer is `error.InvalidPadding`.
 - **AAD binding.** The `aad` is authenticated into the tag; a record sealed
   under tenant A does not open under tenant B (`error.AuthenticationFailed`).
 

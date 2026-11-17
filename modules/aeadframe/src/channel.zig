@@ -99,6 +99,11 @@ pub const OpenError = error{
     BufferTooSmall,
     /// `aad.len > max_caller_aad`.
     AadTooLarge,
+    /// A padded record (see `Opener.allow_padding`) authenticated, but its
+    /// pad-length trailer is longer than the body or its padding bytes are not
+    /// all zero. The record is consumed (its sequence number is committed);
+    /// nothing is returned.
+    InvalidPadding,
 } || std.crypto.errors.AuthenticationError;
 
 /// Build a record/frame channel over a concrete AEAD.
@@ -144,22 +149,61 @@ pub fn Channel(comptime Aead: type) type {
                 return burn.run(burn.frame_burn, SealError!usize, sealBody, .{ self, out, plaintext, aad });
             }
 
+            /// Exact record size of a padded record: `sealedLen` plus the
+            /// padding and the two-byte pad-length trailer.
+            pub fn sealedLenPadded(pt_len: usize, pad: u16) usize {
+                return record.overhead + pt_len + pad + record.pad_trailer_len;
+            }
+
+            /// `seal` with length padding: the record is a version-2 record whose
+            /// encrypted body is `plaintext ‖ 0x00 × pad ‖ pad (u16 BE)`, so the
+            /// record length hides the plaintext length down to the padding
+            /// granularity (TLS 1.3 / DTLS 1.3 record padding; see
+            /// `record.padForBlock` for rounding to a block). Returns
+            /// `sealedLenPadded(plaintext.len, pad)`. Same nonce, AAD binding and
+            /// sequence rules as `seal`. A peer opens it only with
+            /// `Opener.allow_padding = true`; `seal` itself is unchanged and still
+            /// emits version 1 with no trailer.
+            pub fn sealPadded(self: *Sealer, out: []u8, plaintext: []const u8, aad: []const u8, pad: u16) SealError!usize {
+                return burn.run(burn.frame_burn, SealError!usize, sealPaddedBody, .{ self, out, plaintext, aad, pad });
+            }
+
             fn sealBody(self: *Sealer, out: []u8, plaintext: []const u8, aad: []const u8) SealError!usize {
-                const need = record.overhead + plaintext.len;
+                return self.sealCore(out, plaintext, aad, null);
+            }
+
+            fn sealPaddedBody(self: *Sealer, out: []u8, plaintext: []const u8, aad: []const u8, pad: u16) SealError!usize {
+                return self.sealCore(out, plaintext, aad, pad);
+            }
+
+            fn sealCore(self: *Sealer, out: []u8, plaintext: []const u8, aad: []const u8, pad: ?u16) SealError!usize {
+                const body_len = if (pad) |p| plaintext.len + p + record.pad_trailer_len else plaintext.len;
+                const need = record.overhead + body_len;
                 if (out.len < need) return error.BufferTooSmall;
                 if (aad.len > max_caller_aad) return error.AadTooLarge;
                 // Refuse rather than wrap: a wrapped seq reuses a nonce.
                 if (self.seq == std.math.maxInt(u64)) return error.SequenceExhausted;
 
                 const seq = self.seq;
-                (record.Header{ .epoch = self.epoch, .seq = seq }).encode(out[0..record.header_len]);
+                const h = record.Header{ .epoch = self.epoch, .seq = seq };
+                if (pad != null) h.encodePadded(out[0..record.header_len]) else h.encode(out[0..record.header_len]);
                 const nonce = record.deriveNonce(self.epoch, seq);
                 var aad_scratch: [record.header_len + max_caller_aad]u8 = undefined;
                 const eff_aad = try effectiveAad(&aad_scratch, out[0..record.header_len], aad);
-                const ct = out[record.header_len..][0..plaintext.len];
+                const ct = out[record.header_len..][0..body_len];
                 var tag: [record.tag_len]u8 = undefined;
-                Aead.encrypt(ct, &tag, plaintext, eff_aad, nonce, self.key);
-                @memcpy(out[record.header_len + plaintext.len ..][0..record.tag_len], &tag);
+                if (pad) |p| {
+                    // Assemble `plaintext ‖ zeros ‖ pad` in the output region and
+                    // encrypt it in place (std and `chachapoly` both allow `c`
+                    // and `m` to be the same slice).
+                    @memcpy(ct[0..plaintext.len], plaintext);
+                    @memset(ct[plaintext.len..][0..p], 0);
+                    std.mem.writeInt(u16, ct[plaintext.len + p ..][0..record.pad_trailer_len], p, .big);
+                    Aead.encrypt(ct, &tag, ct, eff_aad, nonce, self.key);
+                } else {
+                    Aead.encrypt(ct, &tag, plaintext, eff_aad, nonce, self.key);
+                }
+                @memcpy(out[record.header_len + body_len ..][0..record.tag_len], &tag);
 
                 self.seq += 1;
                 return need;
@@ -230,6 +274,13 @@ pub fn Channel(comptime Aead: type) type {
             key: [32]u8,
             epoch: u32,
             window: replay.ReplayWindow = .{},
+            /// Accept version-2 (padded) records and strip their padding. Off by
+            /// default: a version-2 record is then `UnsupportedVersion`, exactly
+            /// as before padding existed. Set it on an opener whose peer uses
+            /// `Sealer.sealPadded`. `open` returns the plaintext length WITHOUT
+            /// the padding; `out` must still hold the whole encrypted body
+            /// (`rec.len - record.overhead` bytes).
+            allow_padding: bool = false,
 
             pub fn init(key: [32]u8, epoch: u32) Opener {
                 return .{ .key = key, .epoch = epoch };
@@ -262,7 +313,7 @@ pub fn Channel(comptime Aead: type) type {
             }
 
             fn openBody(self: *Opener, out: []u8, rec: []const u8, aad: []const u8) OpenError!usize {
-                const p = try record.parse(rec);
+                const p = try record.parseWith(rec, self.allow_padding);
                 if (p.header.epoch != self.epoch) return error.EpochMismatch;
                 if (out.len < p.ct_len) return error.BufferTooSmall;
                 if (aad.len > max_caller_aad) return error.AadTooLarge;
@@ -283,7 +334,24 @@ pub fn Channel(comptime Aead: type) type {
                     return e;
                 };
                 self.window.commit(p.header.seq);
-                return p.ct_len;
+                if (!p.padded) return p.ct_len;
+                return stripPadding(pt) catch |e| {
+                    std.crypto.secureZero(u8, pt);
+                    return e;
+                };
+            }
+
+            /// The plaintext length of an authenticated padded body
+            /// `plaintext ‖ zeros ‖ pad(u16 BE)`: the trailer must fit and every
+            /// padding byte must be zero (ESP asks the receiver to check its
+            /// padding; TLS 1.3 defines it as zeros).
+            fn stripPadding(body: []const u8) error{InvalidPadding}!usize {
+                // `parseWith` guarantees at least the two trailer bytes.
+                const pad = std.mem.readInt(u16, body[body.len - record.pad_trailer_len ..][0..record.pad_trailer_len], .big);
+                if (@as(usize, pad) + record.pad_trailer_len > body.len) return error.InvalidPadding;
+                const pt_len = body.len - record.pad_trailer_len - pad;
+                for (body[pt_len..][0..pad]) |b| if (b != 0) return error.InvalidPadding;
+                return pt_len;
             }
 
             /// Same-key epoch advance: expect the next epoch and reset the
@@ -973,5 +1041,188 @@ test "bumpEpoch and rekey restart seq at 0 after records were sealed; Opener.rek
         _ = try new_s.seal(&rec, "z", "");
         _ = try o.open(&pt, &rec, "");
         try testing.expectEqualStrings("z", &pt);
+    }
+}
+
+// ── length padding (version-2 records, opt-in) ───────────────────────────────
+
+/// Both AEADs with their instantiation, for the padding tests.
+const padding_cases = .{
+    .{ ChaChaChannel, chachapoly.ChaCha20Poly1305 },
+    .{ AesGcmChannel, std.crypto.aead.aes_gcm.Aes256Gcm },
+};
+
+test "padded record: round trip, size, version 2, seq advance; plain seal still version 1 (both AEADs)" {
+    inline for (padding_cases) |c| {
+        const Ch = c[0];
+        var s = Ch.Sealer.init(testKey(21), 4);
+        var o = Ch.Opener.init(testKey(21), 4);
+        o.allow_padding = true;
+        const msg = "padded payload";
+        for ([_]u16{ 0, 1, 7, 100 }, 0..) |pad, i| {
+            var rec: [record.overhead + msg.len + 100 + record.pad_trailer_len]u8 = undefined;
+            const n = try s.sealPadded(&rec, msg, "ctx", pad);
+            try testing.expectEqual(Ch.Sealer.sealedLenPadded(msg.len, pad), n);
+            try testing.expectEqual(record.overhead + msg.len + pad + 2, n);
+            try testing.expectEqual(record.version_padded, rec[0]);
+            try testing.expectEqual(@as(u64, i + 1), s.seq);
+            var pt: [msg.len + 100 + record.pad_trailer_len]u8 = undefined;
+            const m = try o.open(&pt, rec[0..n], "ctx");
+            try testing.expectEqualStrings(msg, pt[0..m]);
+        }
+        // `seal` is untouched: version 1, no trailer, and the same opener reads it.
+        var rec: [record.overhead + msg.len]u8 = undefined;
+        const n = try s.seal(&rec, msg, "ctx");
+        try testing.expectEqual(record.overhead + msg.len, n);
+        try testing.expectEqual(record.version, rec[0]);
+        var pt: [msg.len]u8 = undefined;
+        try testing.expectEqual(msg.len, try o.open(&pt, rec[0..n], "ctx"));
+        // An empty plaintext pads too.
+        var rec0: [record.overhead + 10 + record.pad_trailer_len]u8 = undefined;
+        const n0 = try s.sealPadded(&rec0, "", "", 10);
+        var pt0: [10 + record.pad_trailer_len]u8 = undefined;
+        try testing.expectEqual(@as(usize, 0), try o.open(&pt0, rec0[0..n0], ""));
+    }
+}
+
+test "padded record: independent construction pins the bytes (both AEADs)" {
+    inline for (padding_cases) |c| {
+        const Ch = c[0];
+        const Aead = c[1];
+        const key = testKey(22);
+        var s = Ch.Sealer.init(key, 0x01020304);
+        s.seq = 9;
+        const msg = "abc";
+        const aad = "ad";
+        var rec: [record.overhead + msg.len + 5 + record.pad_trailer_len]u8 = undefined;
+        const n = try s.sealPadded(&rec, msg, aad, 5);
+
+        // Expected: header v2, body msg ‖ 00×5 ‖ 0005, AAD = header ‖ aad, nonce (epoch, seq).
+        var hdr: [record.header_len]u8 = undefined;
+        (record.Header{ .epoch = 0x01020304, .seq = 9 }).encodePadded(&hdr);
+        try testing.expectEqualSlices(u8, &.{ 2, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 9 }, &hdr);
+        const body = "abc" ++ [_]u8{ 0, 0, 0, 0, 0 } ++ [_]u8{ 0, 5 };
+        var eff: [record.header_len + aad.len]u8 = undefined;
+        @memcpy(eff[0..record.header_len], &hdr);
+        @memcpy(eff[record.header_len..], aad);
+        var ct: [body.len]u8 = undefined;
+        var tag: [record.tag_len]u8 = undefined;
+        Aead.encrypt(&ct, &tag, body, &eff, record.deriveNonce(0x01020304, 9), key);
+        try testing.expectEqualSlices(u8, &hdr, rec[0..record.header_len]);
+        try testing.expectEqualSlices(u8, &ct, rec[record.header_len..][0..ct.len]);
+        try testing.expectEqualSlices(u8, &tag, rec[record.header_len + ct.len ..][0..record.tag_len]);
+        try testing.expectEqual(record.header_len + ct.len + record.tag_len, n);
+    }
+}
+
+test "padded record: an opener without allow_padding refuses version 2 as before" {
+    inline for (channels) |Ch| {
+        var s = Ch.Sealer.init(testKey(23), 0);
+        var rec: [record.overhead + 4 + 3 + record.pad_trailer_len]u8 = undefined;
+        const n = try s.sealPadded(&rec, "data", "", 3);
+        var o = Ch.Opener.init(testKey(23), 0);
+        try testing.expect(!o.allow_padding);
+        var pt: [64]u8 = undefined;
+        try testing.expectError(error.UnsupportedVersion, o.open(&pt, rec[0..n], ""));
+        // The refusal changed nothing: with padding allowed the record opens.
+        o.allow_padding = true;
+        try testing.expectEqual(@as(usize, 4), try o.open(&pt, rec[0..n], ""));
+    }
+}
+
+test "padded record: the version byte is authenticated both ways; replays and truncation are refused" {
+    inline for (channels) |Ch| {
+        var s = Ch.Sealer.init(testKey(24), 0);
+        var padded: [record.overhead + 4 + 3 + record.pad_trailer_len]u8 = undefined;
+        const pn = try s.sealPadded(&padded, "data", "x", 3);
+        var plain: [record.overhead + 4]u8 = undefined;
+        const ln = try s.seal(&plain, "data", "x");
+
+        var o = Ch.Opener.init(testKey(24), 0);
+        o.allow_padding = true;
+        var pt: [64]u8 = undefined;
+        // 2 -> 1 and 1 -> 2: the header is in the AAD, so both fail authentication.
+        var a = padded;
+        a[0] = record.version;
+        try testing.expectError(error.AuthenticationFailed, o.open(&pt, a[0..pn], "x"));
+        var b = plain;
+        b[0] = record.version_padded;
+        try testing.expectError(error.AuthenticationFailed, o.open(&pt, b[0..ln], "x"));
+        // The genuine records open once, then are replays.
+        try testing.expectEqual(@as(usize, 4), try o.open(&pt, padded[0..pn], "x"));
+        try testing.expectError(error.Replayed, o.open(&pt, padded[0..pn], "x"));
+        try testing.expectEqual(@as(usize, 4), try o.open(&pt, plain[0..ln], "x"));
+        // A version-2 record too short for its trailer is truncated; without
+        // allow_padding it is the unsupported version it always was.
+        var short: [record.overhead]u8 = undefined;
+        @memset(&short, 0);
+        short[0] = record.version_padded;
+        try testing.expectError(error.Truncated, o.open(&pt, &short, ""));
+        o.allow_padding = false;
+        try testing.expectError(error.UnsupportedVersion, o.open(&pt, &short, ""));
+    }
+}
+
+test "padded record: an authentic record with a bad trailer is InvalidPadding, consumed and wiped (both AEADs)" {
+    inline for (padding_cases) |c| {
+        const Ch = c[0];
+        const Aead = c[1];
+        const key = testKey(25);
+        const bodies = [_][]const u8{
+            "data" ++ [_]u8{ 0, 1, 0, 3 }, // a non-zero padding byte
+            "data" ++ [_]u8{ 0, 0, 0, 9 }, // pad length longer than the body
+            "ab" ++ [_]u8{ 0, 3 }, // pad length 3 > the 2 bytes before the trailer
+            &[_]u8{ 0xff, 0xff }, // pad length 65535 > body
+        };
+        for (bodies, 0..) |body, i| {
+            var hdr: [record.header_len]u8 = undefined;
+            (record.Header{ .epoch = 0, .seq = i }).encodePadded(&hdr);
+            var rec: [record.overhead + 16]u8 = undefined;
+            @memcpy(rec[0..record.header_len], &hdr);
+            var tag: [record.tag_len]u8 = undefined;
+            Aead.encrypt(rec[record.header_len..][0..body.len], &tag, body, &hdr, record.deriveNonce(0, i), key);
+            @memcpy(rec[record.header_len + body.len ..][0..record.tag_len], &tag);
+            const n = record.overhead + body.len;
+
+            var o = Ch.Opener.init(key, 0);
+            o.allow_padding = true;
+            var pt: [16]u8 = undefined;
+            @memset(&pt, 0xAA);
+            try testing.expectError(error.InvalidPadding, o.open(&pt, rec[0..n], ""));
+            for (pt[0..body.len]) |b| try testing.expectEqual(@as(u8, 0), b);
+            // Authentic, so consumed: the same record is now a replay.
+            try testing.expectError(error.Replayed, o.open(&pt, rec[0..n], ""));
+        }
+    }
+}
+
+test "padded record: the maximum pad, buffer boundaries and block rounding" {
+    var s = ChaChaChannel.Sealer.init(testKey(26), 0);
+    var o = ChaChaChannel.Opener.init(testKey(26), 0);
+    o.allow_padding = true;
+    const max_pad: u16 = std.math.maxInt(u16);
+    const max_pad_len: usize = max_pad;
+    var rec: [record.overhead + 1 + max_pad_len + record.pad_trailer_len]u8 = undefined;
+    // One byte short is BufferTooSmall and burns no sequence number.
+    try testing.expectError(error.BufferTooSmall, s.sealPadded(rec[0 .. rec.len - 1], "x", "", max_pad));
+    try testing.expectEqual(@as(u64, 0), s.seq);
+    const n = try s.sealPadded(&rec, "x", "", max_pad);
+    try testing.expectEqual(rec.len, n);
+    var pt: [1 + max_pad_len + record.pad_trailer_len]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try o.open(&pt, rec[0..n], ""));
+    try testing.expectEqualStrings("x", pt[0..1]);
+
+    // padForBlock: the padded body (plaintext + 2) lands on a multiple of the block.
+    try testing.expectEqual(@as(u16, 14), record.padForBlock(0, 16));
+    try testing.expectEqual(@as(u16, 0), record.padForBlock(14, 16));
+    try testing.expectEqual(@as(u16, 15), record.padForBlock(15, 16));
+    try testing.expectEqual(@as(u16, 0), record.padForBlock(5, 0));
+    try testing.expectEqual(@as(u16, 0), record.padForBlock(5, 1));
+    try testing.expectEqual(@as(u16, 1), record.padForBlock(5, 8));
+    try testing.expectEqual(max_pad, record.padForBlock(0, 70000));
+    for (0..40) |len| {
+        const pad = record.padForBlock(len, 16);
+        try testing.expectEqual(@as(usize, 0), (len + pad + record.pad_trailer_len) % 16);
+        try testing.expect(pad < 16);
     }
 }

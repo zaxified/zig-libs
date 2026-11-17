@@ -35,7 +35,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [google/tink](https://github.com/google/tink) streaming AEAD | Java/C++/Go/… | Apache-2.0 | 13.5k | v1.7.0 (2022-08-10) | Segment-based streaming AEAD with key derivation per stream *(inferred)*. Repository quiet since 2024-04. |
 | Zig `std.crypto.aead` | Zig | MIT | — | Zig 0.16.0 | Single-shot AEAD primitives only; no record framing, no nonce management, no replay filter *(inferred)*. |
 
-**Where we are ahead:** one small, allocation-free record layer that does nonce derivation, epoch/rekey and a replay window together (the libsodium/STREAM constructions assume ordered delivery and have no replay window), generic over ChaCha20-Poly1305 and AES-256-GCM, with a byte-anchored wire KAT and a decode fuzz harness. **Where we are behind:** no end-of-stream signal (documented), no padding or sequence-number encryption (DTLS 1.3), no multi-epoch overlap opener, one-key-per-instance only (no SPI/connection-id demultiplexing).
+**Where we are ahead:** one small, allocation-free record layer that does nonce derivation, epoch/rekey and a replay window together (the libsodium/STREAM constructions assume ordered delivery and have no replay window), generic over ChaCha20-Poly1305 and AES-256-GCM, with a byte-anchored wire KAT and a decode fuzz harness. **Where we are behind:** no end-of-stream signal (documented), no sequence-number encryption (DTLS 1.3; length padding is opt-in, §2.1), no multi-epoch overlap opener, one-key-per-instance only (no SPI/connection-id demultiplexing).
 
 ## 1. Model
 
@@ -85,6 +85,45 @@ check. In addition:
 Because the scratch buffer is fixed-size, the caller's `aad` is limited to
 `max_caller_aad` (1024) bytes; longer returns `error.AadTooLarge`. This keeps
 `seal`/`open` zero-allocation.
+
+### 2.1 Optional length padding (version 2)
+
+Default off; version-1 records are byte-for-byte what they always were.
+`Sealer.sealPadded(out, plaintext, aad, pad)` emits a **version-2** record: same
+13-byte header (version byte 2), same nonce, same tag, and an encrypted body of
+
+```
+  plaintext ‖ 0x00 × pad ‖ pad (u16, big-endian)        pad in 0..65535
+```
+
+so `record.len = overhead + plaintext.len + pad + 2` and an observer sees the
+padded size only. `record.padForBlock(len, block)` is the smallest pad that
+rounds `len + 2` up to a multiple of `block`.
+
+Shape and sources. TLS 1.3 (RFC 8446 §5.4) and DTLS 1.3 (RFC 9147 §4) pad inside
+the AEAD with zeros after the content type, chosen freely by the sender (OpenSSL
+exposes it as block-size rounding, `SSL_CTX_set_block_padding`); the receiver
+finds the end of the content from the last non-zero byte, the content type.
+ESP (RFC 4303 §2.4) pads before an explicit Pad Length byte and a Next Header
+byte, and the receiver strips by that length. This frame has no content-type
+byte, so TLS's delimiter is not available; the two-byte pad-length trailer is
+ESP's delimiter, with TLS's zero padding and sender-chosen length, and a `u16`
+instead of ESP's `u8` so one record can be padded to a few KiB (ESP's 255 needs
+separate TFC dummy packets). Zero padding rather than ESP's `1, 2, 3…` because
+the bytes are encrypted and authenticated, so a pattern adds nothing and the
+all-zero check is the cheaper, TLS-defined one.
+
+Rules. The version byte is in the AAD, so a 1 ⇄ 2 edit fails authentication.
+`Opener.allow_padding` is false by default: a version-2 record is then
+`UnsupportedVersion`, the behaviour that existed before padding. With it set, an
+opener reads both versions; `open` returns the plaintext without the padding
+(`out` must hold the whole encrypted body, `record.len - overhead` bytes). After
+authentication the trailer must fit and every padding byte must be zero, else
+`InvalidPadding` (ESP asks the receiver to inspect the padding; TLS defines it as
+zeros); the record is authentic, so its sequence number is committed and the
+plaintext region is zeroed. A version-2 record shorter than `overhead + 2` is
+`Truncated`. Padding hides length only; it does not hide timing, count or the
+sealing order. It costs the extra bytes on the wire and nothing else.
 
 ## 3. Nonce construction and its uniqueness argument
 
@@ -314,7 +353,7 @@ ceiling and advance, both `bumpEpoch`s, `rekey`'s nonce-space rule and seq/windo
 ## Backlog / deferred
 
 - **Multi-epoch opener (overlap window at rekey)** *(survey 2026-09-30)* — records in flight across a rekey are dropped as `EpochMismatch`; DTLS 1.3 and ESP rekeying keep the previous SA alive briefly. A user rekeying on a lossy/reordering link loses records. Effort: small-medium; fits §2. (Already noted in SPEC §8 as deferred; the survey rates it worth doing.)
-- **Optional length padding** *(survey 2026-09-30)* — ESP and DTLS 1.3 offer padding against traffic analysis; a per-tenant fabric user may want it. Effort: small; fits §2.
+- **Optional length padding** — DONE 2026-11-17, see §2.1.
 
 ## Anchoring
 
