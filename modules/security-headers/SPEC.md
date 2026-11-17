@@ -177,12 +177,14 @@ enabled; rerun: 26 killed. No defect found.
   `finalhandler` (the error path helmet's users get) keeps every header middleware set and only
   overrides CSP/nosniff and the content headers (`pillarjs/finalhandler` `send`, read 2026-11-17);
   Go's `net/http` writes its own 400/431 bare, so unrolled/secure users get none there. We follow the
-  reference. Not changed: `staticHeaders` still lists an `extra` that repeats a built-in name as a
-  second entry (two lines on an error reply; `applyStatic` replaces) — see the next item.
-- **`staticHeaders` repeats a name `extra` overrides** *(found 2026-11-17, LOW)* — `applyStatic`
-  replaces by name, but the list `staticHeaders` hands to `error_headers` keeps both entries, so the
-  server's own error replies carry e.g. `X-Frame-Options` twice. Fix: dedupe at comptime like
-  `headerList`. Not done here: a change of the comptime list's shape, outside the 2026-11-17 brief.
+  reference. (`staticHeaders`' duplicate-name gap, noted here at the time, is closed by the next item.)
+- **DONE 2026-11-17 — `staticHeaders` repeated a name `extra` overrides** *(found 2026-11-17, LOW)* —
+  the comptime list now dedupes exactly like `headerList` (`staticPut`: case-insensitive name match,
+  the overriding entry replaces in place with its own spelling and value, repeated `extra`s likewise;
+  no new semantics). Reference: `apply` (`setHeader` replaces by name) and Express's `finalhandler`
+  error path, which sends each header once. Test "staticHeaders == headerList: one entry per name…"
+  (parity over the default, `api_options`, an all-on set with a re-spelled and a repeated `extra`, and
+  an all-off set, plus the concrete order/spelling/value).
 - **DONE 2026-11-17 — a replaced header spends the budget twice** *(review 2026-10-24)* — `http`'s
   `putHeader` now rewrites a replaced header's own copy when the new value fits there or the copy is
   the last one in the store (and no other entry borrows its bytes), so a nonce policy rendered again

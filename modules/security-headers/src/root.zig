@@ -600,31 +600,49 @@ pub const SecurityHeaders = struct {
     /// the answers the server writes itself (its 4xx/5xx, the 500 replacing
     /// a failed handler) carry the same headers as every routed response —
     /// middleware never sees those (`Server` is skipped there: the server
-    /// manages it).
+    /// manages it). One entry per name, as `headerList` writes it: an `extra`
+    /// named like a built-in (any letter case) or like an earlier `extra`
+    /// replaces that entry's name and value in place.
     pub fn staticHeaders(comptime options: Options) []const http.Header {
         comptime {
             if (closedSetViolation(&options)) |field|
                 @compileError("security-headers: " ++ field ++ " holds a value outside its closed set (see InitError.InvalidPolicyValue)");
             var list: []const http.Header = &.{};
-            if (options.hsts) |h| list = list ++ [_]http.Header{.{ .name = "Strict-Transport-Security", .value = hstsStaticValue(h) }};
-            if (options.content_security_policy) |v| list = list ++ [_]http.Header{.{ .name = "Content-Security-Policy", .value = v }};
-            if (options.content_security_policy_report_only) |v| list = list ++ [_]http.Header{.{ .name = "Content-Security-Policy-Report-Only", .value = v }};
-            if (options.x_content_type_options) list = list ++ [_]http.Header{.{ .name = "X-Content-Type-Options", .value = "nosniff" }};
-            if (options.x_frame_options) |v| list = list ++ [_]http.Header{.{ .name = "X-Frame-Options", .value = v }};
-            if (options.referrer_policy) |v| list = list ++ [_]http.Header{.{ .name = "Referrer-Policy", .value = v }};
-            if (options.permissions_policy) |v| list = list ++ [_]http.Header{.{ .name = "Permissions-Policy", .value = v }};
-            if (options.cross_origin_opener_policy) |v| list = list ++ [_]http.Header{.{ .name = "Cross-Origin-Opener-Policy", .value = v }};
-            if (options.cross_origin_resource_policy) |v| list = list ++ [_]http.Header{.{ .name = "Cross-Origin-Resource-Policy", .value = v }};
-            if (options.cross_origin_embedder_policy) |v| list = list ++ [_]http.Header{.{ .name = "Cross-Origin-Embedder-Policy", .value = v }};
-            if (options.origin_agent_cluster) list = list ++ [_]http.Header{.{ .name = "Origin-Agent-Cluster", .value = "?1" }};
-            if (options.x_dns_prefetch_control) |v| list = list ++ [_]http.Header{.{ .name = "X-DNS-Prefetch-Control", .value = v }};
-            if (options.x_download_options) list = list ++ [_]http.Header{.{ .name = "X-Download-Options", .value = "noopen" }};
-            if (options.x_permitted_cross_domain_policies) |v| list = list ++ [_]http.Header{.{ .name = "X-Permitted-Cross-Domain-Policies", .value = v }};
-            if (options.x_xss_protection) list = list ++ [_]http.Header{.{ .name = "X-XSS-Protection", .value = "0" }};
-            if (options.server) |v| list = list ++ [_]http.Header{.{ .name = "Server", .value = v }};
-            for (options.extra) |h| list = list ++ [_]http.Header{.{ .name = h.name, .value = h.value }};
+            if (options.hsts) |h| list = staticPut(list, "Strict-Transport-Security", hstsStaticValue(h));
+            if (options.content_security_policy) |v| list = staticPut(list, "Content-Security-Policy", v);
+            if (options.content_security_policy_report_only) |v| list = staticPut(list, "Content-Security-Policy-Report-Only", v);
+            if (options.x_content_type_options) list = staticPut(list, "X-Content-Type-Options", "nosniff");
+            if (options.x_frame_options) |v| list = staticPut(list, "X-Frame-Options", v);
+            if (options.referrer_policy) |v| list = staticPut(list, "Referrer-Policy", v);
+            if (options.permissions_policy) |v| list = staticPut(list, "Permissions-Policy", v);
+            if (options.cross_origin_opener_policy) |v| list = staticPut(list, "Cross-Origin-Opener-Policy", v);
+            if (options.cross_origin_resource_policy) |v| list = staticPut(list, "Cross-Origin-Resource-Policy", v);
+            if (options.cross_origin_embedder_policy) |v| list = staticPut(list, "Cross-Origin-Embedder-Policy", v);
+            if (options.origin_agent_cluster) list = staticPut(list, "Origin-Agent-Cluster", "?1");
+            if (options.x_dns_prefetch_control) |v| list = staticPut(list, "X-DNS-Prefetch-Control", v);
+            if (options.x_download_options) list = staticPut(list, "X-Download-Options", "noopen");
+            if (options.x_permitted_cross_domain_policies) |v| list = staticPut(list, "X-Permitted-Cross-Domain-Policies", v);
+            if (options.x_xss_protection) list = staticPut(list, "X-XSS-Protection", "0");
+            if (options.server) |v| list = staticPut(list, "Server", v);
+            for (options.extra) |h| list = staticPut(list, h.name, h.value);
             const final = list[0..list.len].*;
             return &final;
+        }
+    }
+
+    /// `staticHeaders`' insert, `headerList`'s rule at compile time: replace
+    /// by case-insensitive name in place (the later spelling and value), else
+    /// append.
+    fn staticPut(comptime list: []const http.Header, comptime name: []const u8, comptime value: []const u8) []const http.Header {
+        comptime {
+            @setEvalBranchQuota(100_000);
+            for (list, 0..) |e, i| if (std.ascii.eqlIgnoreCase(e.name, name)) {
+                var copy = list[0..list.len].*;
+                copy[i] = .{ .name = name, .value = value };
+                const final = copy;
+                return &final;
+            };
+            return list ++ [_]http.Header{.{ .name = name, .value = value }};
         }
     }
 
@@ -1442,6 +1460,65 @@ test "headerList: exactly the table apply leaves on a response, for every knob a
         try testing.expectEqual(list.len, (try sh.headerList(exact[0..list.len])).len);
         if (list.len > 0) try testing.expectError(error.NoSpaceLeft, sh.headerList(exact[0 .. list.len - 1]));
     }
+}
+
+fn expectStaticHeadersEqualHeaderList(comptime o: Options) !void {
+    const sh: SecurityHeaders = try .init(o);
+    var buf: [SecurityHeaders.max_header_list_len]http.Header = undefined;
+    const list = try sh.headerList(&buf);
+    const st = comptime SecurityHeaders.staticHeaders(o);
+    try testing.expectEqual(list.len, st.len);
+    for (st, list) |want, got| {
+        try testing.expectEqualStrings(want.name, got.name);
+        try testing.expectEqualStrings(want.value, got.value);
+    }
+    // One entry per name (case-insensitive).
+    for (st, 0..) |a, i| for (st[i + 1 ..]) |b| try testing.expect(!std.ascii.eqlIgnoreCase(a.name, b.name));
+}
+
+test "staticHeaders == headerList: one entry per name, an overriding extra replaces in place" {
+    try expectStaticHeadersEqualHeaderList(.{});
+    try expectStaticHeadersEqualHeaderList(api_options);
+    try expectStaticHeadersEqualHeaderList(.{
+        .hsts = .{ .max_age_s = 63072000, .include_subdomains = true, .preload = true },
+        .content_security_policy = csp_api,
+        .content_security_policy_report_only = "default-src 'self'",
+        .permissions_policy = "camera=()",
+        .cross_origin_embedder_policy = "require-corp",
+        .server = "edge",
+        .extra = &.{
+            .{ .name = "x-frame-options", .value = "SAMEORIGIN" },
+            .{ .name = "X-Extra", .value = "1" },
+            .{ .name = "x-extra", .value = "2" },
+        },
+    });
+    try expectStaticHeadersEqualHeaderList(.{
+        .hsts = null,
+        .x_content_type_options = false,
+        .x_frame_options = null,
+        .referrer_policy = null,
+        .cross_origin_opener_policy = null,
+        .cross_origin_resource_policy = null,
+        .origin_agent_cluster = false,
+        .x_dns_prefetch_control = null,
+        .x_download_options = false,
+        .x_permitted_cross_domain_policies = null,
+        .x_xss_protection = false,
+    });
+    // Pinned concretely: the override keeps the built-in's position, takes the
+    // extra's spelling and value; a repeated extra replaces the earlier one.
+    const hs = comptime SecurityHeaders.staticHeaders(.{ .extra = &.{
+        .{ .name = "x-frame-options", .value = "SAMEORIGIN" },
+        .{ .name = "X-Extra", .value = "1" },
+        .{ .name = "x-EXTRA", .value = "2" },
+        .{ .name = "SERVER", .value = "s" },
+    } });
+    try testing.expectEqual(@as(usize, 13), hs.len); // 11 default built-ins + X-Extra + SERVER
+    try testing.expectEqualStrings("x-frame-options", hs[2].name);
+    try testing.expectEqualStrings("SAMEORIGIN", hs[2].value);
+    try testing.expectEqualStrings("x-EXTRA", hs[11].name);
+    try testing.expectEqualStrings("SERVER", hs[12].name);
+    try testing.expectEqualStrings("2", hs[11].value);
 }
 
 test "headerList: a runtime-built set reaches http.Server's own error answers (h1 400)" {
