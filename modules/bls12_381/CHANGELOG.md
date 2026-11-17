@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the generic threshold layer (26/26 killed); card mutation 58/62 (4 eq) and source hash.
 - **2026-11-17** — `threshold.Threshold(variant, scheme)`: trusted-dealer threshold BLS for min-sig too (`threshold.MinSig`, keys and Feldman commitments in `G2`, partial and combined signatures in `G1`), Basic or ProofOfPossession; MessageAugmentation is a compile error (a share would sign its own key's bytes). The file-level `threshold.*` names are the unchanged min-pk POP instance `threshold.MinPk`. A combined min-sig signature equals `MinSigPop.sign` under the reconstructed key.
 - **2026-11-16** — `keyGen` / `keyGenV4` take a `key_info` of any length: HKDF-Expand is written out so `key_info`
   streams into the HMAC. Before, a `key_info` over 254 bytes hit a `std.debug.assert` (a consumer-reachable panic, UB in

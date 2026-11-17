@@ -6,7 +6,7 @@
 
 **Scope:** core — blst v0.3.17 (surveyed 2026-10-06; raised from mvp 2026-10-06 when all six ciphersuites, batch verification, EIP-2333 and the G1/G2 MSM landed)
 
-**Audit:** review 2026-09-09 · mutation 2026-10-06 (32/36, 4 eq) · src ?
+**Audit:** review 2026-09-09 · mutation 2026-11-17 (58/62, 4 eq) · src e26bdbd1a3fd3789
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BLS12_381_FUZZ; codec at 1/10, sign-verify at 1/200 of it) · ct 2026-10-02 (ctgrind)
 
@@ -1078,6 +1078,19 @@ see "Part 6 design" below.
   min-sig test's off-subgroup `G1` point fails the pairing without the
   check), and `verifyBatch`'s top-bit set on `r_i` (it only rules out
   `r_i = 0`, probability 2^-128).
+- 2026-11-17 (delta, min-sig threshold): schemata over a detached copy
+  (one ReleaseSafe build, the kit's `run.sh`), 26 mutants on the now
+  generic `Threshold(variant, scheme)`: both share codecs' index write and
+  zero-index refusal, the verification-vector count prefix, short-input
+  and exact-length checks, `splitSecretKey`'s `t > n` and coefficient-count
+  guards, the share evaluation point, the `j == 0` secret commitment, the
+  Feldman `scalarMul`, `groupPublicKey`'s index, `derivePublicKeyShare`'s
+  Horner add, `partialSign` and `verifyPartialSignature` under the other
+  scheme of the same variant, the index-mismatch check, all four
+  `combineSignatures` preconditions, its accumulator start, the self-skip,
+  numerator and denominator of `lambda_i` and the per-partial
+  `scalarMul`: **26/26 killed**. Card: 32 + 26 = 58 killed, 4 equivalent,
+  62 total.
 
 ## Status
 
