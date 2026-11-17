@@ -72,6 +72,8 @@ const init_stack_burn = 192 * 1024;
 const start_stack_burn = 1984 * 1024;
 const handle_stack_burn = 768 * 1024;
 const advance_stack_burn = 1408 * 1024;
+// takeKeyShare: measured 367 B dirty in a mutation-schemata build (2026-11-17).
+const take_key_share_stack_burn = 2 * 1024;
 
 const aux_info = tecdsa.aux_info;
 const fac_proof = tecdsa.fac_proof;
@@ -277,6 +279,12 @@ pub const EcdsaRefresh = struct {
     /// this struct's memory. Out-param, not a return value: a `KeyShare`
     /// returned by value leaves a copy in the caller's frame.
     pub fn takeKeyShare(self: *EcdsaRefresh, out: *tecdsa.KeyShare) bool {
+        const result = takeKeyShareUnburned(self, out);
+        burn.stack(take_key_share_stack_burn);
+        return result;
+    }
+
+    noinline fn takeKeyShareUnburned(self: *EcdsaRefresh, out: *tecdsa.KeyShare) bool {
         if (self.phase_ != .done) return false;
         if (self.share == null) return false;
         out.* = self.share.?;
@@ -687,7 +695,12 @@ fn refresh(allocator: std.mem.Allocator, random: std.Random, old: []const tecdsa
         if (excluded) |x| try testing.expect(std.mem.findScalar(u32, used, x) == null);
     }
     var out: [3]tecdsa.KeyShare = undefined;
-    for (&parties, &out) |*p, *s| try testing.expect(p.takeKeyShare(s));
+    for (&parties, &out) |*p, *s| {
+        try testing.expect(p.takeKeyShare(s));
+        // The party's own copy is wiped, not just set to null.
+        try testing.expect(std.mem.find(u8, std.mem.asBytes(&p.share), std.mem.asBytes(&s.secret_share)) == null);
+        try testing.expect(std.mem.find(u8, std.mem.asBytes(&p.share), &s.message_seed) == null);
+    }
     return out;
 }
 

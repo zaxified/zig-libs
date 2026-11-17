@@ -450,3 +450,35 @@ test "honest Dkg tolerates a defended complaint (transient bad share) — GATED 
     try testing.expect(checks.allSameQ(outs));
     try testing.expect(try checks.reconstructsToQ(allocator, outs[0..2]));
 }
+
+test "lockstep driver: an undefended bad share removes its dealer from Q, a defended one does not (same seed as a clean run)" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const cfg: Config = .{ .t = 2, .n = 4 };
+    const seed = 0xD16_1004;
+    var qs: [3][types.Ne]u8 = undefined;
+    const corrs = [_]Corruption{
+        .{},
+        .{ .bad_dealer = 3, .bad_receiver = 1, .defend_honestly = false },
+        .{ .bad_dealer = 3, .bad_receiver = 1, .defend_honestly = true },
+    };
+    for (corrs, &qs) |corr, *q| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const outs = try Dkg.run(allocator, cfg, corr, prng.random());
+        defer {
+            for (outs) |*o| o.deinit();
+            allocator.free(outs);
+        }
+        try testing.expect(checks.allSameQ(outs));
+        q.* = outs[0].group_public_key.toBytes();
+    }
+    try testing.expect(!std.mem.eql(u8, &qs[0], &qs[1]));
+    try testing.expectEqualSlices(u8, &qs[0], &qs[2]);
+}
+
+test "Dkg.run and BrokenDkg.run refuse an invalid config (t = 0)" {
+    const testing = std.testing;
+    var prng = std.Random.DefaultPrng.init(0xD16_1005);
+    try testing.expectError(error.InvalidConfig, Dkg.run(testing.allocator, .{ .t = 0, .n = 3 }, .{}, prng.random()));
+    try testing.expectError(error.InvalidConfig, BrokenDkg.run(testing.allocator, .{ .t = 0, .n = 3 }, .{}, prng.random()));
+}

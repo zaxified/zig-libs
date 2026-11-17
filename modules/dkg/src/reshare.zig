@@ -1909,3 +1909,246 @@ test "ReshareReceiver: each combination a run cannot produce is refused" {
         };
     }
 }
+
+// ── whole-module mutation audit 2026-11-17: killing tests ───────────────
+
+test "ReshareConfig.validate: an invalid old committee, the new-threshold cap and its boundary" {
+    const g = try commit.feldmanEvalShare(&Scalar.one);
+    const shares3 = [_]Element{ g, g, g };
+    const ok: ReshareConfig = .{ .old = .{ .t = 2, .n = 3 }, .new = .{ .t = 2, .n = 4 }, .dealers = &.{ 1, 2 }, .group_public_key = g, .old_verifying_shares = &shares3 };
+    try ok.validate();
+    var c = ok;
+    c.old = .{ .t = 0, .n = 3 };
+    c.dealers = &.{1};
+    try testing.expectError(error.InvalidConfig, c.validate());
+    c = ok;
+    c.new = .{ .t = max_new_threshold, .n = max_new_threshold };
+    try c.validate();
+    c.new = .{ .t = max_new_threshold + 1, .n = max_new_threshold + 1 };
+    try testing.expectError(error.InvalidConfig, c.validate());
+}
+
+test "ReshareDealer.initWithCoefficients refuses an invalid new config, a wrong coefficient count and old index 0; handle refuses an empty frame" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7273_01);
+    const outs = try protocol.Dkg.run(allocator, .{ .t = 2, .n = 3 }, .{}, prng.random());
+    defer {
+        for (outs) |*o| o.deinit();
+        allocator.free(outs);
+    }
+    const one = [_]Scalar{Scalar.one};
+    const four = [_]Scalar{ Scalar.one, Scalar.one, Scalar.one, Scalar.one };
+    try testing.expectError(error.InvalidConfig, ReshareDealer.initWithCoefficients(allocator, &outs[0], .{ .t = 5, .n = 3 }, &four));
+    try testing.expectError(error.InvalidConfig, ReshareDealer.initWithCoefficients(allocator, &outs[0], .{ .t = 2, .n = 4 }, &four));
+    var zero_index = outs[0];
+    zero_index.index = 0;
+    try testing.expectError(error.InvalidConfig, ReshareDealer.initWithCoefficients(allocator, &zero_index, .{ .t = 2, .n = 4 }, &one));
+    var d = try ReshareDealer.initWithCoefficients(allocator, &outs[0], .{ .t = 2, .n = 4 }, &one);
+    defer d.deinit();
+    try d.start();
+    try testing.expectError(error.Malformed, d.handle(1, &.{}));
+}
+
+/// Feeds receiver `r` the frames in `msgs` (from dealer `d`) of kind `kind` meant for it.
+fn feedReceiver(r: *ReshareReceiver, d: u32, msgs: []const Outgoing, kind: wire.Kind) !void {
+    for (msgs) |m| {
+        if (m.bytes[0] != @backingInt(kind)) continue;
+        switch (m.to) {
+            .broadcast => {},
+            .party => |j| if (j != r.id()) continue,
+        }
+        try r.handle(.{ .dealer = d }, m.bytes);
+    }
+}
+
+test "ReshareReceiver.allReceived: every dealer's broadcast and share, and only while collecting shares" {
+    const allocator = testing.allocator;
+    const old_cfg: Config = .{ .t = 2, .n = 3 };
+    const old = try oldCommittee(allocator, old_cfg, 0x7273_02);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    const rc = configFor(old, old_cfg, .{ .t = 2, .n = 3 }, &.{ 1, 2, 3 }, &xs);
+    var prng = std.Random.DefaultPrng.init(0x7273_03);
+    var rig = try Rig.init(allocator, rc, old, prng.random());
+    defer rig.deinit();
+    for (rig.dealers) |*d| try d.start();
+    var out: [3][]Outgoing = undefined;
+    for (rig.dealers, &out) |*d, *o| o.* = try d.takeOutgoing();
+    defer for (out) |o| wire.freeOutgoing(allocator, o);
+    const r1 = &rig.receivers[0];
+    const r2 = &rig.receivers[1];
+    for ([_]u32{ 1, 2 }) |d| {
+        try feedReceiver(r1, d, out[d - 1], .reshare_broadcast);
+        try feedReceiver(r1, d, out[d - 1], .reshare_share);
+        try feedReceiver(r2, d, out[d - 1], .reshare_broadcast);
+        try feedReceiver(r2, d, out[d - 1], .reshare_share);
+    }
+    // r1: dealer 3's broadcast only; r2: dealer 3's share only.
+    try feedReceiver(r1, 3, out[2], .reshare_broadcast);
+    try feedReceiver(r2, 3, out[2], .reshare_share);
+    try testing.expect(!r1.allReceived());
+    try testing.expect(!r2.allReceived());
+    try feedReceiver(r1, 3, out[2], .reshare_share);
+    try feedReceiver(r2, 3, out[2], .reshare_broadcast);
+    try testing.expect(r1.allReceived());
+    try testing.expect(r2.allReceived());
+    try r1.advance();
+    try testing.expectEqual(ReceiverPhase.complaints, r1.phase());
+    try testing.expect(!r1.allReceived());
+}
+
+test "a dealer ignores a complaint about another dealer: it opens nothing for it" {
+    const allocator = testing.allocator;
+    const old_cfg: Config = .{ .t = 2, .n = 3 };
+    const old = try oldCommittee(allocator, old_cfg, 0x7273_04);
+    defer freeOutputs(allocator, old);
+    var d1 = try ReshareDealer.initWithCoefficients(allocator, &old[0], .{ .t = 2, .n = 3 }, &.{Scalar.one});
+    defer d1.deinit();
+    try d1.start();
+    wire.freeOutgoing(allocator, try d1.takeOutgoing());
+    const c: Complaint = .{ .complainant = 2, .accused = 2 };
+    var fr: [1 + Complaint.encoded_length]u8 = undefined;
+    fr[0] = @backingInt(wire.Kind.reshare_complaint);
+    fr[1..].* = c.toBytes();
+    try d1.handle(2, &fr);
+    try d1.advance();
+    const msgs = try d1.takeOutgoing();
+    defer wire.freeOutgoing(allocator, msgs);
+    try testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+test "ReshareReceiver refuses a t'+1-commitment broadcast, receiver id 0, and a defense naming complainant 0; complaints about two dealers are two" {
+    const allocator = testing.allocator;
+    const old_cfg: Config = .{ .t = 2, .n = 3 };
+    const old = try oldCommittee(allocator, old_cfg, 0x7273_05);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    const rc = configFor(old, old_cfg, .{ .t = 2, .n = 3 }, &.{ 1, 2, 3 }, &xs);
+    var prng = std.Random.DefaultPrng.init(0x7273_06);
+    var rig = try Rig.init(allocator, rc, old, prng.random());
+    defer rig.deinit();
+    for (rig.dealers) |*d| try d.start();
+    var out: [3][]Outgoing = undefined;
+    for (rig.dealers, &out) |*d, *o| o.* = try d.takeOutgoing();
+    defer for (out) |o| wire.freeOutgoing(allocator, o);
+    const r1 = &rig.receivers[0];
+
+    // Dealer 1's real broadcast with one more (valid) commitment, count fixed up.
+    var real: ?[]const u8 = null;
+    for (out[0]) |m| if (m.bytes[0] == @backingInt(wire.Kind.reshare_broadcast)) {
+        real = m.bytes;
+    };
+    const fb = try types.FeldmanBroadcast.fromBytesAlloc(allocator, real.?[1..]);
+    defer fb.deinit(allocator);
+    var longer = try allocator.alloc(Element, fb.commitments.len + 1);
+    defer allocator.free(longer);
+    @memcpy(longer[0..fb.commitments.len], fb.commitments);
+    longer[fb.commitments.len] = fb.commitments[1];
+    const body = try (types.FeldmanBroadcast{ .dealer = 1, .commitments = longer }).toBytesAlloc(allocator);
+    defer allocator.free(body);
+    const fr = try wire.frame(allocator, .reshare_broadcast, body);
+    defer allocator.free(fr);
+    try testing.expectError(error.Malformed, r1.handle(.{ .dealer = 1 }, fr));
+
+    for (1..4) |d| {
+        try feedReceiver(r1, @intCast(d), out[d - 1], .reshare_broadcast);
+        try feedReceiver(r1, @intCast(d), out[d - 1], .reshare_share);
+    }
+    try r1.advance();
+    var cf: [1 + Complaint.encoded_length]u8 = undefined;
+    cf[0] = @backingInt(wire.Kind.reshare_complaint);
+    cf[1..].* = (Complaint{ .complainant = 0, .accused = 1 }).toBytes();
+    try testing.expectError(error.UnknownSender, r1.handle(.{ .receiver = 0 }, &cf));
+    for ([_]u32{ 1, 3 }) |accused| {
+        cf[1..].* = (Complaint{ .complainant = 2, .accused = accused }).toBytes();
+        try r1.handle(.{ .receiver = 2 }, &cf);
+    }
+    try testing.expectEqual(@as(usize, 2), r1.complaints.items.len);
+    try testing.expectError(error.DuplicateMessage, r1.handle(.{ .receiver = 2 }, &cf));
+    try r1.advance();
+    try testing.expectEqual(ReceiverPhase.defenses, r1.phase());
+    const m: types.ScalarShareMsg = .{ .dealer = 1, .receiver = 0, .s = Scalar.one };
+    var df: [1 + types.ScalarShareMsg.encoded_length]u8 = undefined;
+    df[0] = @backingInt(wire.Kind.reshare_defense);
+    df[1..].* = m.toBytes();
+    try testing.expectError(error.Malformed, r1.handle(.{ .dealer = 1 }, &df));
+}
+
+fn badShare1to3(from: u32, to: u32, bytes: []u8) Action {
+    if (from == 1 and to == 3 and bytes[0] == @backingInt(wire.Kind.reshare_share)) bytes[1 + 8 + Ns - 1] ^= 1;
+    return .deliver;
+}
+
+test "a defense for the highest new id is accepted; one naming id n'+1 is Malformed" {
+    const allocator = testing.allocator;
+    const old_cfg: Config = .{ .t = 2, .n = 3 };
+    const old = try oldCommittee(allocator, old_cfg, 0x7273_07);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    const rc = configFor(old, old_cfg, .{ .t = 2, .n = 3 }, &.{ 1, 2 }, &xs);
+    var prng = std.Random.DefaultPrng.init(0x7273_08);
+    var rig = try Rig.init(allocator, rc, old, prng.random());
+    defer rig.deinit();
+    rig.filter = badShare1to3;
+    try rig.run();
+    for (rig.receivers) |*r| {
+        try testing.expectEqual(ReceiverPhase.done, r.phase());
+        try testing.expectEqualSlices(u32, &.{ 1, 2 }, r.usedDealers().?);
+    }
+}
+
+test "a reshare defense naming complainant n'+1 is Malformed" {
+    const allocator = testing.allocator;
+    const old_cfg: Config = .{ .t = 2, .n = 3 };
+    const old = try oldCommittee(allocator, old_cfg, 0x7273_09);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    const rc = configFor(old, old_cfg, .{ .t = 2, .n = 3 }, &.{ 1, 2 }, &xs);
+    var r1 = try ReshareReceiver.init(allocator, rc, 1);
+    defer r1.deinit();
+    try r1.advance();
+    try r1.advance();
+    try testing.expectEqual(ReceiverPhase.defenses, r1.phase());
+    const m: types.ScalarShareMsg = .{ .dealer = 1, .receiver = 4, .s = Scalar.one };
+    var df: [1 + types.ScalarShareMsg.encoded_length]u8 = undefined;
+    df[0] = @backingInt(wire.Kind.reshare_defense);
+    df[1..].* = m.toBytes();
+    try testing.expectError(error.Malformed, r1.handle(.{ .dealer = 1 }, &df));
+}
+
+/// A 2-of-3 -> 2-of-3 rig run up to the receivers' final `advance`.
+fn rigBeforeLastAdvance(allocator: Allocator, old: []const DkgShareOutput, xs: []Element, seed: u64) !Rig {
+    const rc = configFor(old, .{ .t = 2, .n = 3 }, .{ .t = 2, .n = 3 }, &.{ 1, 2, 3 }, xs);
+    var prng = std.Random.DefaultPrng.init(seed);
+    var rig = try Rig.init(allocator, rc, old, prng.random());
+    errdefer rig.deinit();
+    for (rig.dealers) |*d| try d.start();
+    try rig.dealersToReceivers();
+    for (rig.receivers) |*r| try r.advance();
+    try rig.receiversToAll();
+    for (rig.receivers) |*r| try r.advance();
+    for (rig.dealers) |*d| try d.advance();
+    try rig.dealersToReceivers();
+    return rig;
+}
+
+test "ReshareReceiver's last round: an included dealer without an accepted share, or a share off the joint commitments, aborts" {
+    const allocator = testing.allocator;
+    const old = try oldCommittee(allocator, .{ .t = 2, .n = 3 }, 0x7273_0a);
+    defer freeOutputs(allocator, old);
+    var xs: [3]Element = undefined;
+    {
+        var rig = try rigBeforeLastAdvance(allocator, old, &xs, 0x7273_0b);
+        defer rig.deinit();
+        // No run gets here (a complaint excludes or a defense fills the slot): poke the state.
+        rig.receivers[0].accepted[1] = null;
+        try testing.expectError(error.Inconsistent, rig.receivers[0].advance());
+        try testing.expectEqual(ReceiverPhase.aborted, rig.receivers[0].phase());
+    }
+    {
+        var rig = try rigBeforeLastAdvance(allocator, old, &xs, 0x7273_0c);
+        defer rig.deinit();
+        rig.receivers[0].accepted[1] = rig.receivers[0].accepted[1].?.add(Scalar.one);
+        try testing.expectError(error.ShareMismatch, rig.receivers[0].advance());
+    }
+}

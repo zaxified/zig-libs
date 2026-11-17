@@ -302,6 +302,11 @@ complain, since `t'` public openings would reveal its share.
   Every residue found (the polynomials, the shares, the output share, the assembled
   `KeyShare`) is gone; `takeKeyShare` also wipes the copy it kept. Stack cost: ~2 MiB below
   `EcdsaKeygen.start`/`EcdsaRefresh.start` (the aux proofs).
+  2026-11-17: `takeKeyShare` (both machines) had no burn. The plain ReleaseFast build was
+  clean, but the mutation audit's schemata build (same logic, slightly different code shape)
+  left `x_i` and the message seed of the moved `KeyShare` on the dead stack (367 B deep):
+  codegen-fragile residue. Both now run their body one frame down and burn 2 KiB, like
+  every other entry point; the probe is clean in both builds.
 
 - **End-to-end anchor (best teeth).** Run the DKG → `assembleKeyShares` (attach
   Paillier/aux) → `threshold_ecdsa.signWithShares` → verify with std ECDSA under

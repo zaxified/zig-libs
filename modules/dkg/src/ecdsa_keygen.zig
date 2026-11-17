@@ -58,6 +58,8 @@ const init_stack_burn = 192 * 1024;
 const start_stack_burn = 1984 * 1024;
 const handle_stack_burn = 768 * 1024;
 const advance_stack_burn = 1408 * 1024;
+// takeKeyShare: measured 367 B dirty in a mutation-schemata build (2026-11-17).
+const take_key_share_stack_burn = 2 * 1024;
 
 const aux_info = tecdsa.aux_info;
 const fac_proof = tecdsa.fac_proof;
@@ -193,6 +195,12 @@ pub const EcdsaKeygen = struct {
     /// this struct's memory. Out-param, not a return value: a `KeyShare`
     /// returned by value leaves a copy in the caller's frame.
     pub fn takeKeyShare(self: *EcdsaKeygen, out: *tecdsa.KeyShare) bool {
+        const result = takeKeyShareUnburned(self, out);
+        burn.stack(take_key_share_stack_burn);
+        return result;
+    }
+
+    noinline fn takeKeyShareUnburned(self: *EcdsaKeygen, out: *tecdsa.KeyShare) bool {
         if (self.share == null) return false;
         out.* = self.share.?;
         std.crypto.secureZero(u8, std.mem.asBytes(&self.share.?));
@@ -558,6 +566,8 @@ test "dealer-free keygen: 2-of-3 over frames -> KeyShares -> threshold sign -> s
     for (&parties, &shares) |*p, *s| {
         try testing.expectEqual(Phase.done, p.phase());
         try testing.expect(p.takeKeyShare(s));
+        // The party's own copy is wiped, not just set to null.
+        try testing.expect(std.mem.find(u8, std.mem.asBytes(&p.share), std.mem.asBytes(&s.secret_share)) == null);
     }
     defer for (shares) |s| allocator.free(s.public_keys.entries);
     var scratch: tecdsa.KeyShare = undefined;
