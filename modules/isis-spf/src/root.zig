@@ -2187,3 +2187,201 @@ test "RFC 5305 §3 MAX_PATH_METRIC: the ceiling is exceeded, and the gap is stat
     // 32-bit accumulator, and `Route.metric` is a u64.
     try testing.expect(far.metric > std.math.maxInt(u32));
 }
+
+// ── whole-module mutation audit 2026-11-17 ───────────────────────────────────
+
+fn id7(s: SystemId) [7]u8 {
+    return .{ s[0], s[1], s[2], s[3], s[4], s[5], 0 };
+}
+
+/// An LSP (`lsp_id7` = system-id ++ pseudonode octet) that carries ONE #2 (old
+/// style) IS Neighbours TLV with a default metric octet and a 7-octet
+/// neighbour-id per entry. The metric octet is stored verbatim, flag bits and all.
+fn insertOldStyleLsp(
+    db: *lsdb.Lsdb,
+    lsp_id7: [7]u8,
+    seq: u32,
+    entries: []const struct { nbr7: [7]u8, metric: u8 },
+) !void {
+    var buf: [256]u8 = undefined;
+    var lb = try isis.pdu.LspBuilder.init(&buf, .{
+        .remaining_lifetime = 1000,
+        .lsp_id = .{ lsp_id7[0], lsp_id7[1], lsp_id7[2], lsp_id7[3], lsp_id7[4], lsp_id7[5], lsp_id7[6], 0 },
+        .sequence_number = seq,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    });
+    var val: [1 + 11 * 8]u8 = undefined;
+    val[0] = 0; // virtual flag
+    var n: usize = 1;
+    for (entries) |e| {
+        val[n..][0..4].* = .{ e.metric, 0x80, 0x80, 0x80 };
+        val[n + 4 ..][0..7].* = e.nbr7;
+        n += 11;
+    }
+    try lb.tlvs.addTlv(isis.tlvs.code.is_neighbours_lsp, val[0..n]);
+    _ = try db.insert(lb.finish(), null, 0);
+}
+
+/// A pseudonode LSP (#22) for `dis`/circuit 1 listing the given raw 7-octet
+/// neighbour-ids, which may themselves be pseudonode ids.
+fn insertPseudonodeLspRaw(db: *lsdb.Lsdb, dis: SystemId, listed: []const [7]u8) !void {
+    var buf: [512]u8 = undefined;
+    var lb = try isis.pdu.LspBuilder.init(&buf, .{
+        .remaining_lifetime = 1000,
+        .lsp_id = .{ dis[0], dis[1], dis[2], dis[3], dis[4], dis[5], 0x01, 0 },
+        .sequence_number = 1,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    });
+    for (listed) |l| try isis.tlvs.addExtendedIsReach(&lb.tlvs, l, 0, &.{});
+    _ = try db.insert(lb.finish(), null, 0);
+}
+
+test "LAN transit over #2 (old-style) TLVs: members and the pseudonode LSP; the metric octet keeps only its low 6 bits" {
+    const d = sysId(0x50);
+    const x = sysId(0x10);
+    const y = sysId(0x90);
+    const pn = pnOf(d);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(x));
+    defer db.deinit();
+    try insertOldStyleLsp(&db, pn, 1, &.{ .{ .nbr7 = id7(x), .metric = 0 }, .{ .nbr7 = id7(d), .metric = 0 }, .{ .nbr7 = id7(y), .metric = 0 } });
+    try insertOldStyleLsp(&db, id7(x), 1, &.{.{ .nbr7 = pn, .metric = 0xC5 }}); // bits 8 and 7 set, value 5
+    try insertOldStyleLsp(&db, id7(d), 1, &.{.{ .nbr7 = pn, .metric = 5 }});
+    try insertOldStyleLsp(&db, id7(y), 1, &.{.{ .nbr7 = pn, .metric = 0x45 }}); // bit 7 set, value 5
+    var table = try compute(testing.allocator, &db, x, 0);
+    defer table.deinit();
+    try testing.expectEqual(@as(usize, 3), table.routes.len);
+    try testing.expectEqual(Route{ .dest = d, .next_hop = d, .metric = 5 }, table.lookup(d).?);
+    try testing.expectEqual(Route{ .dest = y, .next_hop = y, .metric = 5 }, table.lookup(y).?);
+}
+
+test "old-style #2 default metric: bit 7 (0x40) is masked off too, and bit 6 (0x20) is part of the value" {
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+    try insertOldStyleLsp(&db, id7(a), 1, &.{.{ .nbr7 = id7(b), .metric = 0x47 }});
+    try insertOldStyleLsp(&db, id7(b), 1, &.{.{ .nbr7 = id7(a), .metric = 0xE7 }}); // 0x20 is value bit 6: 0x27 = 39
+    var table = try compute(testing.allocator, &db, a, 0);
+    defer table.deinit();
+    try testing.expectEqual(@as(u64, 7), table.lookup(b).?.metric); // a's own advertisement
+    // the reverse direction is b's: 39, so the route from b to a costs 39
+    var back = try compute(testing.allocator, &db, b, 0);
+    defer back.deinit();
+    try testing.expectEqual(@as(u64, 39), back.lookup(a).?.metric);
+}
+
+test "a metric of 0 is clamped to 1 on a point-to-point link and on a LAN" {
+    const a = sysId(1);
+    const b = sysId(2);
+    const c = sysId(3);
+    const e = sysId(4);
+    const pn = pnOf(c);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+    try insertReachLsp(&db, a, 1, &.{ .{ .nbr = b, .metric = 0 }, .{ .nbr = c, .metric = 0 } });
+    try insertReachLsp(&db, b, 1, &.{.{ .nbr = a, .metric = 0 }});
+    // LAN of A, C and E (DIS C); A and C also face the LAN at metric 0
+    try insertPseudonodeLsp(&db, c, &.{ a, c, e });
+    try insertReachLspRaw(&db, a, 2, &.{ .{ .nbr7 = id7(b), .metric = 0 }, .{ .nbr7 = id7(c), .metric = 0 }, .{ .nbr7 = pn, .metric = 0 } });
+    try insertReachLspRaw(&db, c, 1, &.{ .{ .nbr7 = id7(a), .metric = 0 }, .{ .nbr7 = pn, .metric = 0 } });
+    try insertReachLspRaw(&db, e, 1, &.{.{ .nbr7 = pn, .metric = 0 }});
+    var table = try compute(testing.allocator, &db, a, 0);
+    defer table.deinit();
+    try testing.expectEqual(@as(u64, 1), table.lookup(b).?.metric);
+    try testing.expectEqual(@as(u64, 1), table.lookup(c).?.metric);
+    try testing.expectEqual(Route{ .dest = e, .next_hop = e, .metric = 1 }, table.lookup(e).?);
+}
+
+test "a pseudonode LSP that lists a pseudonode id does not admit that system as a LAN member" {
+    const a = sysId(1);
+    const b = sysId(2);
+    const pn = pnOf(a);
+    const b_circuit_2: [7]u8 = .{ b[0], b[1], b[2], b[3], b[4], b[5], 0x02 }; // a pseudonode, not an IS
+    // via #22, then via #2
+    for ([_]bool{ false, true }) |old_style| {
+        var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+        defer db.deinit();
+        if (old_style) {
+            try insertOldStyleLsp(&db, pn, 1, &.{ .{ .nbr7 = id7(a), .metric = 0 }, .{ .nbr7 = b_circuit_2, .metric = 0 } });
+        } else {
+            try insertPseudonodeLspRaw(&db, a, &.{ id7(a), b_circuit_2 });
+        }
+        try insertReachLspRaw(&db, a, 1, &.{.{ .nbr7 = pn, .metric = 10 }});
+        try insertReachLspRaw(&db, b, 1, &.{.{ .nbr7 = pn, .metric = 10 }});
+        var table = try compute(testing.allocator, &db, a, 0);
+        defer table.deinit();
+        try testing.expect(table.lookup(b) == null);
+    }
+}
+
+test "LAN transit: a member listed by ANOTHER pseudonode is not admitted into this one; two LANs sharing a member do not merge" {
+    const a = sysId(1);
+    const b = sysId(2);
+    const c = sysId(3);
+    const d = sysId(4);
+    {
+        // C faces the LAN of A but only D's pseudonode lists C
+        var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+        defer db.deinit();
+        try insertPseudonodeLsp(&db, a, &.{ a, b });
+        try insertPseudonodeLsp(&db, d, &.{ d, c });
+        try insertReachLspRaw(&db, a, 1, &.{.{ .nbr7 = pnOf(a), .metric = 10 }});
+        try insertReachLspRaw(&db, b, 1, &.{.{ .nbr7 = pnOf(a), .metric = 10 }});
+        try insertReachLspRaw(&db, c, 1, &.{.{ .nbr7 = pnOf(a), .metric = 1 }});
+        try insertReachLspRaw(&db, d, 1, &.{.{ .nbr7 = pnOf(d), .metric = 10 }});
+        var table = try compute(testing.allocator, &db, a, 0);
+        defer table.deinit();
+        try testing.expect(table.lookup(c) == null);
+        try testing.expectEqual(@as(u64, 10), table.lookup(b).?.metric);
+    }
+    {
+        // LAN 1 = {A, B}, LAN 2 = {B, C}: C is reached THROUGH B only
+        var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+        defer db.deinit();
+        try insertPseudonodeLsp(&db, a, &.{ a, b });
+        try insertPseudonodeLsp(&db, c, &.{ b, c });
+        try insertReachLspRaw(&db, a, 1, &.{.{ .nbr7 = pnOf(a), .metric = 10 }});
+        try insertReachLspRaw(&db, b, 1, &.{ .{ .nbr7 = pnOf(a), .metric = 10 }, .{ .nbr7 = pnOf(c), .metric = 10 } });
+        try insertReachLspRaw(&db, c, 1, &.{.{ .nbr7 = pnOf(c), .metric = 10 }});
+        var table = try compute(testing.allocator, &db, a, 0);
+        defer table.deinit();
+        try testing.expectEqual(Route{ .dest = c, .next_hop = b, .metric = 20 }, table.lookup(c).?);
+    }
+}
+
+test "LAN transit: a cheaper point-to-point link beats a dearer LAN arc; the cheaper advertisement of a pseudonode wins" {
+    const a = sysId(1);
+    const b = sysId(2);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+    try insertPseudonodeLsp(&db, a, &.{ a, b });
+    // P2P 5 both ways, and the LAN at 50; A advertises the pseudonode twice (50, then 40)
+    try insertReachLspRaw(&db, a, 1, &.{ .{ .nbr7 = id7(b), .metric = 5 }, .{ .nbr7 = pnOf(a), .metric = 50 }, .{ .nbr7 = pnOf(a), .metric = 40 } });
+    try insertReachLspRaw(&db, b, 1, &.{ .{ .nbr7 = id7(a), .metric = 5 }, .{ .nbr7 = pnOf(a), .metric = 50 } });
+    {
+        var table = try compute(testing.allocator, &db, a, 0);
+        defer table.deinit();
+        try testing.expectEqual(@as(u64, 5), table.lookup(b).?.metric);
+    }
+    // without the P2P link the LAN carries it, at A's CHEAPER advertisement (40)
+    try insertReachLspRaw(&db, a, 2, &.{ .{ .nbr7 = pnOf(a), .metric = 50 }, .{ .nbr7 = pnOf(a), .metric = 40 } });
+    try insertReachLspRaw(&db, b, 2, &.{.{ .nbr7 = pnOf(a), .metric = 50 }});
+    {
+        var table = try compute(testing.allocator, &db, a, 0);
+        defer table.deinit();
+        try testing.expectEqual(@as(u64, 40), table.lookup(b).?.metric);
+    }
+}
+
+test "the asymmetric-link count survives an empty table (local absent)" {
+    const a = sysId(1);
+    const b = sysId(2);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(sysId(9)));
+    defer db.deinit();
+    try insertReachLsp(&db, a, 1, &.{.{ .nbr = b, .metric = 10 }});
+    try insertReachLsp(&db, b, 1, &.{.{ .nbr = a, .metric = 20 }});
+    var table = try compute(testing.allocator, &db, sysId(9), 0);
+    defer table.deinit();
+    try testing.expectEqual(@as(usize, 0), table.routes.len);
+    try testing.expectEqual(@as(u32, 1), table.asymmetric_links);
+}
