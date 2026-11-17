@@ -6,9 +6,9 @@
 
 **Scope:** mvp — libsignal v0.103.1 and the Signal specifications (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-10-05 (29/30, 1 eq) · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (81/86, 5 eq) · src cf5c7f2be177c80b
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget, clean; `signal-ratchet` / `signal-x3dh` at `.scale` 2 = 100,000 runs, `signal-xeddsa` 200,000, SIGNAL_FUZZ) · ct 2026-09-09 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget, clean; `signal-ratchet` / `signal-x3dh` at `.scale` 2 = 100,000 runs, `signal-xeddsa` 200,000, `signal-state` (ratchet state codec) 10,000 runs at `.scale` 2 on 2026-11-17, SIGNAL_FUZZ) · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
 
@@ -50,7 +50,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [matrix-org/vodozemac](https://github.com/matrix-org/vodozemac) (Olm) | Rust | Apache-2.0 | 404 | 0.11.0 (2026-09-11) | Not Signal: Matrix's own Double-Ratchet variant (Olm, AES-CBC + HMAC). Named because it is the maintained permissive Rust double ratchet; a different wire format. |
 | Zig ecosystem | Zig | — | — | — | Nothing found on GitHub for a Signal or Double Ratchet implementation in Zig (searched `signal double ratchet` language:zig). `std.crypto` has the primitives, including `ml_kem` and X25519, no protocol. |
 
-**Where we are ahead:** the only Zig Signal-protocol core; the three public specs (X3DH, XEdDSA, Double Ratchet) plus PQXDH with FIPS 203 ML-KEM-1024 (the spec text still names Kyber; deployments use ML-KEM), both XEdDSA variants selectable at the call site with libsignal's own vector pinned against each, a transactional fail-closed `decrypt`, bounded skipped-key store, and the ratchet's `KDF_CK` ladders cross-checked byte for byte with libsignal (`KDF_RK`'s `info` is application-defined). **Where we are behind:** everything above the specs that a libsignal user builds on — wire compatibility with Signal (protobuf messages, libsignal's AEAD and `info` strings; SPEC: "not claimed"), sealed sender, sender-key groups, Sesame session management, safety numbers, header encryption, SPQR, a PQXDH wire codec and any persistence format (→ Backlog).
+**Where we are ahead:** the only Zig Signal-protocol core; the three public specs (X3DH, XEdDSA, Double Ratchet) plus PQXDH with FIPS 203 ML-KEM-1024 (the spec text still names Kyber; deployments use ML-KEM), both XEdDSA variants selectable at the call site with libsignal's own vector pinned against each, a transactional fail-closed `decrypt`, bounded skipped-key store, and the ratchet's `KDF_CK` ladders cross-checked byte for byte with libsignal (`KDF_RK`'s `info` is application-defined). **Where we are behind:** everything above the specs that a libsignal user builds on — wire compatibility with Signal (protobuf messages, libsignal's AEAD and `info` strings; SPEC: "not claimed"), sealed sender, sender-key groups, Sesame session management, safety numbers, header encryption, SPQR, a PQXDH wire codec (done 2026-11-16) and persistence that other implementations can read (→ Backlog).
 
 ## Design
 
@@ -313,10 +313,42 @@ exact bytes and that nonce isn't published).
   `MessageKeyNotAvailable` (replay of a consumed in-order message, or a
   message before its chain exists), `KeyAgreementFailed` (pathological
   low-order ratchet key), plus `Allocator.Error`.
+- **Session persistence (2026-11-17).** `State.toBytes(out)` /
+  `State.fromBytes(allocator, bytes, &out)` — a versioned layout of this
+  module (`State.format_version` = 1, `State.max_encoded_length`), NOT
+  libsignal's `SessionStructure` protobuf: `version(1) || flags(1) ||
+  dhs_secret(32) || rk(32) || ad(64) || ns(4) || nr(4) || pn(4) || [dhr(32)]
+  || [cks(32)] || [ckr(32)] || skipped_count(4) || count x (dh(32) || n(4) ||
+  mk(32))`, integers little-endian, `flags` = presence bits of `dhr`/`cks`/
+  `ckr` (other bits reserved, must be 0). The DH public key is not stored; it
+  is re-derived from the secret. The decoder rejects (`error.InvalidState`):
+  any other version, reserved flag bits, a truncation at any length, a
+  trailing byte, a skipped count above `ratchet.max_skip_store` or not
+  matching the remaining length (checked BEFORE the table is allocated), a
+  duplicate skipped key, and a chain key without a remote ratchet key.
+  Skipped-entry order is unspecified on write and free on read. The encoding
+  is plaintext secret material: encrypting it at rest is the caller's job
+  (vodozemac's pickle does so with a caller key; libsignal's store leaves it
+  to the host), and the module zeroes only what it owns (its stack, the table
+  on a failed decode); `toBytes` writes into the caller's buffer, which the
+  caller zeroes. Sources for the content of the layout (what a ratchet
+  session must persist and how far the skipped-key store is bounded):
+  Double Ratchet spec §2.2 (state variables DHs, DHr, RK, CKs, CKr, Ns, Nr, PN,
+  MKSKIPPED) and §6 (skipped-key limits, MAX_SKIP); libsignal's published
+  `SessionStructure` field list (rootKey, previousCounter, sender chain with
+  ratchet key, private key and chain-key index, receiver chains with their
+  message keys, a version field, a cap of 2000 stored message keys; docs and
+  `.proto` only, no code read); python-doubleratchet (MIT) and vodozemac
+  (Apache-2.0), both of which persist exactly these variables and refuse an
+  unknown version. Differences kept on purpose: one flat skipped store keyed
+  by (ratchet key, n) bounded by this module's existing `max_skip_store`
+  (libsignal bounds per chain and keeps up to five receiver chains), and no
+  libsignal-only fields (identities, registration ids, pending prekey) —
+  those belong to the session layer above the ratchet, which this module does
+  not have.
 - **Not yet — see Backlog**: header encryption (spec §4 — headers here are
-  cleartext, so the ratchet public key + counters are observable) and a
-  stability-committed session-persistence byte format (`State` is an
-  in-memory value only). PQXDH seeding was in this list until 2026-08-22;
+  cleartext, so the ratchet public key + counters are observable) and
+  interop of the persisted state with other implementations. PQXDH seeding was in this list until 2026-08-22;
   it is now Part 3 (`pqxdh.zig`), and the ratchet is seeded from
   `pqxdh.Agreement.ratchetAssociatedData()` rather than the full AD — see
   below.
@@ -457,7 +489,7 @@ the stack pointer.
 ## Backlog / deferred
 
 - **Signal-compatible wire messages and KDF strings** (`SignalMessage`/`PreKeySignalMessage` protobufs, AES-256-CBC + truncated HMAC-SHA256, libsignal's `info` labels) *(survey 2026-09-30)*: without this a session cannot talk to Signal servers or clients; the module chose ChaCha20-Poly1305 over a fixed header because the spec leaves the AEAD to the application (`interop_vectors.zig` header). It is a design choice for the spec-shaped core, but a compatibility layer is what a libsignal user expects. Effort: large (protobuf codec, prekey-message flow, version handling). Fits §2 if the protobuf codec is a sibling module.
-- **Session state serialization** (a stable byte format for `ratchet.State`) *(survey 2026-09-30)*: SPEC "Out of scope" says `State` is an in-memory value with no stability-committed format; any long-lived client needs to persist sessions. Effort: small-medium. Fits §2.
+- ✅ **DONE 2026-11-17 (`ratchet.State.toBytes`/`fromBytes`, versioned layout, sources in the "Session persistence" bullet above; mid-conversation round trip with skipped keys on both sides, every truncation / bad version / oversize count / trailing byte refused, `signal-state` fuzz harness):** **Session state serialization** (a stable byte format for `ratchet.State`) *(survey 2026-09-30)*: SPEC "Out of scope" said `State` is an in-memory value with no stability-committed format; any long-lived client needs to persist sessions. Effort: small-medium. Fits §2.
 - ✅ **DONE 2026-11-16 (`pqxdh.PreKeyBundle.toBytes`/`fromBytes`, `InitialMessage.toBytes`/`fromBytes`; round trip through a full handshake tested):** **PQXDH wire codec** *(survey 2026-09-30)*: README: "no wire codec — a caller transmitting a PQXDH bundle writes their own", while X3DH has `PreKeyBundle`/`InitialMessage` codecs. Effort: small. Fits §2.
 - **Sender keys (group messaging), sealed sender, safety numbers/fingerprints, Sesame** *(survey 2026-09-30)*: the parts of libsignal that make it a messenger rather than a handshake. Searched `rg -i 'sealed|sender.?key|sesame|fingerprint|safety' modules/signal/src` — no implementation (only libsignal-variant XEdDSA hits). Effort: medium each; safety numbers small. Fits §2 (`megolm`/`mls` cover other group designs).
 - **Header encryption** (Double Ratchet spec §4) and **SPQR / triple ratchet** *(survey 2026-09-30)*: the SPEC excluded header encryption without giving a reason; SPQR is Signal's current PQ-forward-secrecy layer. Effort: medium / large. Fits §2.

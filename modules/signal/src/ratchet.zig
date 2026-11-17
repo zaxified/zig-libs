@@ -60,8 +60,9 @@
 //!   not observable) is NOT implemented.
 //! - **PQXDH** (post-quantum X3DH) seeding — this ratchet is seeded from
 //!   the classical `x3dh.zig`.
-//! - **Session persistence format stability** — `State` is an in-memory
-//!   value; its byte layout is NOT a committed serialization format.
+//! - **Interop of the persisted state** — `State.toBytes`/`fromBytes` is a
+//!   versioned format of THIS module (see `State.format_version`); it is not
+//!   libsignal's `SessionStructure` protobuf and does not read or write it.
 //!
 //! Provenance: clean-room from the public Double Ratchet specification
 //! (Signal Foundation / Trevor Perrin, Moxie Marlinspike). See `../NOTICE`.
@@ -435,6 +436,191 @@ pub const State = struct {
         work.commitTo(self);
         for (pending.items) |e| self.mkskipped.putAssumeCapacity(e.key, e.mk);
         return pt;
+    }
+
+    // ── persistence (versioned byte format of this module) ──────────────
+
+    /// First octet of an encoded state. A decoder refuses any other value, so
+    /// a future layout change bumps this and old readers fail closed.
+    pub const format_version: u8 = 1;
+
+    /// One skipped-key entry: `dh(32) || n(4 LE) || mk(32)`.
+    const skipped_entry_length: usize = key_length + 4 + message_key_length; // 68
+
+    /// The fields every encoding has: `version(1) || flags(1) || dhs_secret(32)
+    /// || rk(32) || ad(64) || ns(4) || nr(4) || pn(4)`, then the optional
+    /// `dhr`/`cks`/`ckr` (32 each), then `skipped_count(4)` and the entries.
+    const fixed_length: usize = 2 + key_length + root_key_length + associated_data_length + 12 + 4; // 146
+
+    /// Largest possible encoding: all three optional keys present and a full
+    /// skipped-key store (`max_skip_store` entries). Size `toBytes`' buffer
+    /// with this, or with `encodedLength`.
+    pub const max_encoded_length: usize = fixed_length + 3 * key_length + max_skip_store * skipped_entry_length; // 136242
+
+    const flag_dhr: u8 = 1;
+    const flag_cks: u8 = 2;
+    const flag_ckr: u8 = 4;
+
+    pub const EncodeError = error{
+        /// `out` is shorter than `encodedLength()`.
+        NoSpaceLeft,
+    };
+
+    pub const DecodeError = error{
+        /// Not a state this version wrote: wrong version, reserved flag bits,
+        /// truncated, trailing bytes, a skipped-key count above
+        /// `max_skip_store` or not matching the length, a duplicate skipped
+        /// key, or a chain key without a remote ratchet key.
+        InvalidState,
+    } || std.mem.Allocator.Error;
+
+    /// Exact length `toBytes` writes for the current state.
+    pub fn encodedLength(self: *const State) usize {
+        var n = fixed_length + self.mkskipped.count() * skipped_entry_length;
+        if (self.dhr != null) n += key_length;
+        if (self.cks != null) n += chain_key_length;
+        if (self.ckr != null) n += chain_key_length;
+        return n;
+    }
+
+    /// Writes the state into `out` and returns the used prefix. The bytes are
+    /// SECRET (root key, chain keys, the DH secret, every skipped message
+    /// key): protect them like the state itself and `secureZero` the buffer
+    /// when done. Only the DH secret key is stored, the public half is
+    /// re-derived on load. The order of the skipped-key entries is
+    /// unspecified (two encodings of one state may differ); a decoder accepts
+    /// any order. No allocation.
+    pub fn toBytes(self: *const State, out: []u8) EncodeError![]u8 {
+        return burn.run(burn.ratchet_burn, EncodeError![]u8, toBytesBody, .{ self, out });
+    }
+
+    fn toBytesBody(self: *const State, out: []u8) EncodeError![]u8 {
+        const total = self.encodedLength();
+        if (out.len < total) return error.NoSpaceLeft;
+        var off: usize = 0;
+        out[0] = format_version;
+        out[1] = (if (self.dhr != null) flag_dhr else 0) |
+            (if (self.cks != null) flag_cks else 0) |
+            (if (self.ckr != null) flag_ckr else 0);
+        off = 2;
+        out[off..][0..key_length].* = self.dhs.secret_key;
+        off += key_length;
+        out[off..][0..root_key_length].* = self.rk;
+        off += root_key_length;
+        out[off..][0..associated_data_length].* = self.ad;
+        off += associated_data_length;
+        std.mem.writeInt(u32, out[off..][0..4], self.ns, .little);
+        std.mem.writeInt(u32, out[off + 4 ..][0..4], self.nr, .little);
+        std.mem.writeInt(u32, out[off + 8 ..][0..4], self.pn, .little);
+        off += 12;
+        if (self.dhr) |k| {
+            out[off..][0..key_length].* = k;
+            off += key_length;
+        }
+        if (self.cks) |k| {
+            out[off..][0..chain_key_length].* = k;
+            off += chain_key_length;
+        }
+        if (self.ckr) |k| {
+            out[off..][0..chain_key_length].* = k;
+            off += chain_key_length;
+        }
+        const count = self.mkskipped.count();
+        std.debug.assert(count <= max_skip_store);
+        std.mem.writeInt(u32, out[off..][0..4], @intCast(count), .little);
+        off += 4;
+        var it = self.mkskipped.iterator();
+        while (it.next()) |e| {
+            out[off..][0..key_length].* = e.key_ptr.dh;
+            std.mem.writeInt(u32, out[off + key_length ..][0..4], e.key_ptr.n, .little);
+            out[off + key_length + 4 ..][0..message_key_length].* = e.value_ptr.*;
+            off += skipped_entry_length;
+        }
+        std.debug.assert(off == total);
+        return out[0..total];
+    }
+
+    /// Rebuilds a state from `toBytes` output into `out` (written only on
+    /// success; the caller then owns it and calls `deinit`). Every length is
+    /// checked before anything is read or allocated; the allocation is the
+    /// skipped-key table sized from a count already proved to fit `bytes`
+    /// and `max_skip_store`. On every error path the partially built table is
+    /// zeroed and freed. The caller's `bytes` (secret) stay the caller's to
+    /// zero. The DH public key is re-derived from the stored secret.
+    pub fn fromBytes(allocator: std.mem.Allocator, bytes: []const u8, out: *State) DecodeError!void {
+        return burn.run(burn.ratchet_burn, DecodeError!void, fromBytesBody, .{ allocator, bytes, out });
+    }
+
+    fn take(bytes: []const u8, off: *usize, n: usize) error{InvalidState}![]const u8 {
+        if (bytes.len - off.* < n) return error.InvalidState;
+        const s = bytes[off.*..][0..n];
+        off.* += n;
+        return s;
+    }
+
+    fn fromBytesBody(allocator: std.mem.Allocator, bytes: []const u8, out: *State) DecodeError!void {
+        var off: usize = 0;
+        const head = try take(bytes, &off, 2);
+        if (head[0] != format_version) return error.InvalidState;
+        const flags = head[1];
+        if (flags & ~(flag_dhr | flag_cks | flag_ckr) != 0) return error.InvalidState;
+
+        var sk: [key_length]u8 = (try take(bytes, &off, key_length))[0..key_length].*;
+        var rk: [root_key_length]u8 = (try take(bytes, &off, root_key_length))[0..root_key_length].*;
+        const ad: [associated_data_length]u8 = (try take(bytes, &off, associated_data_length))[0..associated_data_length].*;
+        const counters = try take(bytes, &off, 12);
+        var dhr: ?[key_length]u8 = null;
+        var cks: ?[chain_key_length]u8 = null;
+        var ckr: ?[chain_key_length]u8 = null;
+        defer {
+            std.crypto.secureZero(u8, &sk);
+            std.crypto.secureZero(u8, &rk);
+            if (cks) |*k| std.crypto.secureZero(u8, k);
+            if (ckr) |*k| std.crypto.secureZero(u8, k);
+        }
+        if (flags & flag_dhr != 0) dhr = (try take(bytes, &off, key_length))[0..key_length].*;
+        if (flags & flag_cks != 0) cks = (try take(bytes, &off, chain_key_length))[0..chain_key_length].*;
+        if (flags & flag_ckr != 0) ckr = (try take(bytes, &off, chain_key_length))[0..chain_key_length].*;
+        // Every chain is keyed to a remote ratchet key; a state with a chain
+        // and no `DHr` is not one `encrypt`/`decrypt` can have produced.
+        if (dhr == null and (cks != null or ckr != null)) return error.InvalidState;
+
+        const count_raw = std.mem.readInt(u32, (try take(bytes, &off, 4))[0..4], .little);
+        if (count_raw > max_skip_store) return error.InvalidState;
+        const count: usize = count_raw;
+        // Exactly the entries and nothing after them (`count` <= 2000, no overflow).
+        if (bytes.len - off != count * skipped_entry_length) return error.InvalidState;
+
+        var map: std.AutoHashMapUnmanaged(SkippedKey, [message_key_length]u8) = .empty;
+        errdefer {
+            var it = map.valueIterator();
+            while (it.next()) |mk| std.crypto.secureZero(u8, mk);
+            map.deinit(allocator);
+        }
+        try map.ensureTotalCapacity(allocator, count_raw);
+        for (0..count) |_| {
+            const e = try take(bytes, &off, skipped_entry_length);
+            const key: SkippedKey = .{
+                .dh = e[0..key_length].*,
+                .n = std.mem.readInt(u32, e[key_length..][0..4], .little),
+            };
+            const gop = map.getOrPutAssumeCapacity(key);
+            if (gop.found_existing) return error.InvalidState;
+            gop.value_ptr.* = e[key_length + 4 ..][0..message_key_length].*;
+        }
+
+        out.* = .{
+            .dhs = .{ .secret_key = sk, .public_key = X25519.recoverPublicKey(sk) },
+            .dhr = dhr,
+            .rk = rk,
+            .cks = cks,
+            .ckr = ckr,
+            .ns = std.mem.readInt(u32, counters[0..4], .little),
+            .nr = std.mem.readInt(u32, counters[4..8], .little),
+            .pn = std.mem.readInt(u32, counters[8..12], .little),
+            .ad = ad,
+            .mkskipped = map,
+        };
     }
 
     fn removeSkipped(self: *State, key: SkippedKey) void {
@@ -1418,4 +1604,454 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+// ── persistence: State.toBytes / fromBytes ─────────────────────────────────
+
+/// Alice and Bob mid-conversation with a skipped key on each side: Alice sent
+/// a0..a2 and Bob took only a2 (a0, a1 skipped), Bob replied b0, b1 and Alice
+/// took only b1 (b0 skipped). The undelivered messages are returned.
+const MidConversation = struct {
+    alice: State,
+    bob: State,
+    a0: Message,
+    a1: Message,
+    b0: Message,
+
+    fn deinit(m: *MidConversation) void {
+        m.alice.deinit(testing.allocator);
+        m.bob.deinit(testing.allocator);
+        m.a0.deinit(testing.allocator);
+        m.a1.deinit(testing.allocator);
+        m.b0.deinit(testing.allocator);
+    }
+};
+
+fn midConversation(io: std.Io) !MidConversation {
+    const alloc = testing.allocator;
+    const s = try seedSession(io);
+    var alice = s.alice;
+    var bob = s.bob;
+    errdefer alice.deinit(alloc);
+    errdefer bob.deinit(alloc);
+    const a0 = try alice.encrypt(alloc, "a0");
+    errdefer a0.deinit(alloc);
+    const a1 = try alice.encrypt(alloc, "a1");
+    errdefer a1.deinit(alloc);
+    const a2 = try alice.encrypt(alloc, "a2");
+    defer a2.deinit(alloc);
+    alloc.free(try bob.decrypt(alloc, a2.header, a2.ciphertext, io));
+    const b0 = try bob.encrypt(alloc, "b0");
+    errdefer b0.deinit(alloc);
+    const b1 = try bob.encrypt(alloc, "b1");
+    defer b1.deinit(alloc);
+    alloc.free(try alice.decrypt(alloc, b1.header, b1.ciphertext, io));
+    try testing.expectEqual(@as(usize, 2), bob.mkskipped.count());
+    try testing.expectEqual(@as(usize, 1), alice.mkskipped.count());
+    return .{ .alice = alice, .bob = bob, .a0 = a0, .a1 = a1, .b0 = b0 };
+}
+
+fn encodeAlloc(state: *const State) ![]u8 {
+    const buf = try testing.allocator.alloc(u8, state.encodedLength());
+    errdefer testing.allocator.free(buf);
+    const got = try state.toBytes(buf);
+    try testing.expectEqual(buf.len, got.len);
+    return buf;
+}
+
+fn freeSecret(buf: []u8) void {
+    std.crypto.secureZero(u8, buf);
+    testing.allocator.free(buf);
+}
+
+test "persistence: a mid-conversation round trip continues the conversation identically" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const alloc = testing.allocator;
+
+    var m = try midConversation(io);
+    defer m.deinit();
+
+    const alice_bytes = try encodeAlloc(&m.alice);
+    defer freeSecret(alice_bytes);
+    const bob_bytes = try encodeAlloc(&m.bob);
+    defer freeSecret(bob_bytes);
+    try testing.expect(alice_bytes.len <= State.max_encoded_length);
+    try testing.expectEqual(State.format_version, alice_bytes[0]);
+
+    var alice2: State = undefined;
+    try State.fromBytes(alloc, alice_bytes, &alice2);
+    defer alice2.deinit(alloc);
+    var bob2: State = undefined;
+    try State.fromBytes(alloc, bob_bytes, &bob2);
+    defer bob2.deinit(alloc);
+
+    // Every field survived, including the re-derived public key.
+    try testing.expectEqualSlices(u8, &m.alice.dhs.secret_key, &alice2.dhs.secret_key);
+    try testing.expectEqualSlices(u8, &m.alice.dhs.public_key, &alice2.dhs.public_key);
+    try testing.expectEqualSlices(u8, &m.bob.rk, &bob2.rk);
+    try testing.expectEqualSlices(u8, &m.bob.dhr.?, &bob2.dhr.?);
+    try testing.expectEqualSlices(u8, &m.bob.cks.?, &bob2.cks.?);
+    try testing.expectEqualSlices(u8, &m.bob.ckr.?, &bob2.ckr.?);
+    try testing.expectEqualSlices(u8, &m.bob.ad, &bob2.ad);
+    try testing.expectEqual(m.bob.ns, bob2.ns);
+    try testing.expectEqual(m.bob.nr, bob2.nr);
+    try testing.expectEqual(m.bob.pn, bob2.pn);
+    try testing.expectEqual(m.alice.ns, alice2.ns);
+    try testing.expectEqual(m.alice.nr, alice2.nr);
+    try testing.expectEqual(m.alice.pn, alice2.pn);
+    try testing.expectEqualSlices(u8, &m.alice.rk, &alice2.rk);
+    try testing.expectEqualSlices(u8, &m.alice.ad, &alice2.ad);
+    try testing.expectEqualSlices(u8, &m.alice.cks.?, &alice2.cks.?);
+    try testing.expectEqualSlices(u8, &m.alice.ckr.?, &alice2.ckr.?);
+    try testing.expectEqualSlices(u8, &m.alice.dhr.?, &alice2.dhr.?);
+    try testing.expectEqual(m.bob.mkskipped.count(), bob2.mkskipped.count());
+    var it = m.bob.mkskipped.iterator();
+    while (it.next()) |e| try testing.expectEqualSlices(u8, e.value_ptr, bob2.mkskipped.getPtr(e.key_ptr.*).?);
+
+    // The original and the restored state seal the same bytes.
+    const o = try m.alice.encrypt(alloc, "same");
+    defer o.deinit(alloc);
+    const r = try alice2.encrypt(alloc, "same");
+    defer r.deinit(alloc);
+    try testing.expectEqualSlices(u8, &o.header.toBytes(), &r.header.toBytes());
+    try testing.expectEqualSlices(u8, o.ciphertext, r.ciphertext);
+
+    // The restored sides take the delayed messages from the stored keys ...
+    inline for (.{ &m.a0, &m.a1 }, .{ "a0", "a1" }) |msg, want| {
+        const p = try bob2.decrypt(alloc, msg.header, msg.ciphertext, io);
+        defer alloc.free(p);
+        try testing.expectEqualSlices(u8, want, p);
+    }
+    {
+        const p = try alice2.decrypt(alloc, m.b0.header, m.b0.ciphertext, io);
+        defer alloc.free(p);
+        try testing.expectEqualSlices(u8, "b0", p);
+    }
+    try testing.expectEqual(@as(usize, 0), bob2.mkskipped.count());
+    try testing.expectEqual(@as(usize, 0), alice2.mkskipped.count());
+    // ... and keep ratcheting together, with each other (r was a restored-side
+    // message, so Bob2 can read it; o is the same bytes).
+    {
+        const p = try bob2.decrypt(alloc, r.header, r.ciphertext, io);
+        defer alloc.free(p);
+        try testing.expectEqualSlices(u8, "same", p);
+    }
+    for (0..4) |i| {
+        try sendRecv(&bob2, &alice2, "ping", io);
+        try sendRecv(&alice2, &bob2, "pong", io);
+        _ = i;
+    }
+    // The restored state re-encodes to a state of the same length.
+    try testing.expectEqual(@as(usize, State.fixed_length + 3 * 32), alice2.encodedLength());
+}
+
+test "persistence: states with absent keys round trip (Bob before his first receive, Alice before a reply)" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const alloc = testing.allocator;
+
+    const s = try seedSession(io);
+    var alice = s.alice;
+    var bob = s.bob;
+    defer alice.deinit(alloc);
+    defer bob.deinit(alloc);
+    try testing.expect(bob.dhr == null and bob.cks == null and bob.ckr == null);
+    try testing.expect(alice.dhr != null and alice.cks != null and alice.ckr == null);
+
+    for ([_]*const State{ &alice, &bob }) |st| {
+        const bytes = try encodeAlloc(st);
+        defer freeSecret(bytes);
+        var back: State = undefined;
+        try State.fromBytes(alloc, bytes, &back);
+        defer back.deinit(alloc);
+        try testing.expectEqual(st.dhr == null, back.dhr == null);
+        try testing.expectEqual(st.cks == null, back.cks == null);
+        try testing.expectEqual(st.ckr == null, back.ckr == null);
+        const again = try encodeAlloc(&back);
+        defer freeSecret(again);
+        try testing.expectEqualSlices(u8, bytes, again);
+    }
+    // Bob (restored) takes Alice's first message.
+    const bytes = try encodeAlloc(&bob);
+    defer freeSecret(bytes);
+    var bob2: State = undefined;
+    try State.fromBytes(alloc, bytes, &bob2);
+    defer bob2.deinit(alloc);
+    try sendRecv(&alice, &bob2, "first", io);
+    try sendRecv(&bob2, &alice, "reply", io);
+}
+
+test "persistence: a full skipped-key store is exactly max_encoded_length" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const alloc = testing.allocator;
+
+    const s = try seedSession(io);
+    var alice = s.alice;
+    var bob = s.bob;
+    defer alice.deinit(alloc);
+    defer bob.deinit(alloc);
+    for (0..2) |_| {
+        const last = try sendMany(&alice, max_skip + 1);
+        defer last.deinit(alloc);
+        alloc.free(try bob.decrypt(alloc, last.header, last.ciphertext, io));
+        try sendRecv(&bob, &alice, "turn", io);
+    }
+    try testing.expectEqual(max_skip_store, bob.mkskipped.count());
+    try testing.expectEqual(State.max_encoded_length, bob.encodedLength());
+
+    const bytes = try encodeAlloc(&bob);
+    defer freeSecret(bytes);
+    var back: State = undefined;
+    try State.fromBytes(alloc, bytes, &back);
+    defer back.deinit(alloc);
+    try testing.expectEqual(max_skip_store, back.mkskipped.count());
+    var it = bob.mkskipped.iterator();
+    while (it.next()) |e| try testing.expectEqualSlices(u8, e.value_ptr, back.mkskipped.getPtr(e.key_ptr.*).?);
+    // One entry more than the cap is refused (count and length both updated).
+    const bigger = try alloc.alloc(u8, bytes.len + State.skipped_entry_length);
+    defer freeSecret(bigger);
+    @memcpy(bigger[0..bytes.len], bytes);
+    @memset(bigger[bytes.len..], 0x11);
+    const count_at = State.fixed_length - 4 + 3 * 32;
+    std.mem.writeInt(u32, bigger[count_at..][0..4], max_skip_store + 1, .little);
+    var sink: State = undefined;
+    try testing.expectError(error.InvalidState, State.fromBytes(alloc, bigger, &sink));
+}
+
+test "persistence: toBytes refuses a short buffer at every length" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    var m = try midConversation(threaded.io());
+    defer m.deinit();
+    const need = m.bob.encodedLength();
+    var buf: [State.max_encoded_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
+    for (0..need) |len| try testing.expectError(error.NoSpaceLeft, m.bob.toBytes(buf[0..len]));
+    try testing.expectEqual(need, (try m.bob.toBytes(buf[0..need])).len);
+    // A larger buffer: the returned slice is still exactly the encoding.
+    try testing.expectEqual(need, (try m.bob.toBytes(&buf)).len);
+}
+
+test "persistence: fromBytes rejects every truncation, a bad version, reserved flags, trailing bytes, a wrong count" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const alloc = testing.allocator;
+    var m = try midConversation(threaded.io());
+    defer m.deinit();
+    const good = try encodeAlloc(&m.bob);
+    defer freeSecret(good);
+    var sink: State = undefined;
+
+    for (0..good.len) |len| {
+        try testing.expectError(error.InvalidState, State.fromBytes(alloc, good[0..len], &sink));
+    }
+    // Every version byte but the right one.
+    const bad = try alloc.dupe(u8, good);
+    defer freeSecret(bad);
+    for (0..256) |v| {
+        if (v == State.format_version) continue;
+        bad[0] = @intCast(v);
+        try testing.expectError(error.InvalidState, State.fromBytes(alloc, bad, &sink));
+    }
+    bad[0] = State.format_version;
+    // Reserved flag bits.
+    const flags = good[1];
+    for (3..8) |bit| {
+        bad[1] = flags | (@as(u8, 1) << @intCast(bit));
+        try testing.expectError(error.InvalidState, State.fromBytes(alloc, bad, &sink));
+    }
+    // Dropping an optional key flag shifts the layout: never a valid state.
+    bad[1] = flags & ~State.flag_ckr;
+    try testing.expectError(error.InvalidState, State.fromBytes(alloc, bad, &sink));
+    bad[1] = flags;
+    // A trailing byte.
+    const longer = try alloc.alloc(u8, good.len + 1);
+    defer freeSecret(longer);
+    @memcpy(longer[0..good.len], good);
+    longer[good.len] = 0;
+    try testing.expectError(error.InvalidState, State.fromBytes(alloc, longer, &sink));
+    // The count off by one either way.
+    const count_at = State.fixed_length - 4 + 3 * 32;
+    const count = std.mem.readInt(u32, bad[count_at..][0..4], .little);
+    try testing.expectEqual(@as(u32, 2), count);
+    for ([_]u32{ 0, 1, 3, 0xffff_ffff, max_skip_store + 1 }) |c| {
+        std.mem.writeInt(u32, bad[count_at..][0..4], c, .little);
+        try testing.expectError(error.InvalidState, State.fromBytes(alloc, bad, &sink));
+    }
+    std.mem.writeInt(u32, bad[count_at..][0..4], count, .little);
+    // The unmodified copy still decodes (the above all failed for their own reason).
+    try State.fromBytes(alloc, bad, &sink);
+    sink.deinit(alloc);
+}
+
+test "persistence: fromBytes rejects a duplicate skipped key and a chain without a remote key" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const alloc = testing.allocator;
+    var m = try midConversation(threaded.io());
+    defer m.deinit();
+    const good = try encodeAlloc(&m.bob);
+    defer freeSecret(good);
+    var sink: State = undefined;
+
+    // Entry 1 := entry 0.
+    const entries_at = good.len - 2 * State.skipped_entry_length;
+    const dup = try alloc.dupe(u8, good);
+    defer freeSecret(dup);
+    @memcpy(dup[entries_at + State.skipped_entry_length ..][0..State.skipped_entry_length], good[entries_at..][0..State.skipped_entry_length]);
+    try testing.expectError(error.InvalidState, State.fromBytes(alloc, dup, &sink));
+
+    // Alice-before-first-reply has dhr, cks; clearing the dhr flag removes
+    // 32 bytes from the layout, so build it by hand: version, flags = cks only.
+    var raw: [State.fixed_length + 32]u8 = @splat(0x42);
+    raw[0] = State.format_version;
+    raw[1] = State.flag_cks;
+    std.mem.writeInt(u32, raw[State.fixed_length + 32 - 4 ..][0..4], 0, .little);
+    // Not a curve concern: the secret key is any 32 bytes.
+    try testing.expectError(error.InvalidState, State.fromBytes(alloc, &raw, &sink));
+    // The same bytes with dhr + cks (flags 3 and 32 more bytes) decode.
+    var ok: [State.fixed_length + 64]u8 = @splat(0x42);
+    ok[0] = State.format_version;
+    ok[1] = State.flag_dhr | State.flag_cks;
+    std.mem.writeInt(u32, ok[State.fixed_length + 64 - 4 ..][0..4], 0, .little);
+    try State.fromBytes(alloc, &ok, &sink);
+    sink.deinit(alloc);
+}
+
+test "persistence: fromBytes frees everything on an allocation failure and on a late rejection" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    var m = try midConversation(threaded.io());
+    defer m.deinit();
+    const good = try encodeAlloc(&m.bob);
+    defer freeSecret(good);
+    const Probe = struct {
+        fn run(a: std.mem.Allocator, bytes: []const u8) !void {
+            var st: State = undefined;
+            try State.fromBytes(a, bytes, &st);
+            st.deinit(a);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Probe.run, .{good});
+
+    // A duplicate in the LAST entry: the table is built, then thrown away.
+    const dup = try testing.allocator.dupe(u8, good);
+    defer freeSecret(dup);
+    const e = State.skipped_entry_length;
+    @memcpy(dup[good.len - e ..][0..e], good[good.len - 2 * e ..][0..e]);
+    try testing.expectError(error.InvalidState, Probe.run(testing.allocator, dup));
+}
+
+test "persistence: a restored state refuses the messages a replay of the original would (consumed keys stay consumed)" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const alloc = testing.allocator;
+    var m = try midConversation(io);
+    defer m.deinit();
+
+    // Consume a0 on the original, THEN persist: the restored state must not
+    // resurrect a0's key.
+    alloc.free(try m.bob.decrypt(alloc, m.a0.header, m.a0.ciphertext, io));
+    const bytes = try encodeAlloc(&m.bob);
+    defer freeSecret(bytes);
+    var back: State = undefined;
+    try State.fromBytes(alloc, bytes, &back);
+    defer back.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), back.mkskipped.count());
+    try testing.expectError(error.MessageKeyNotAvailable, back.decrypt(alloc, m.a0.header, m.a0.ciphertext, io));
+    alloc.free(try back.decrypt(alloc, m.a1.header, m.a1.ciphertext, io));
+}
+
+/// Passes everything to `backing` and records whether any freed block still
+/// held `needle` (a secret that should have been wiped before the free).
+const ScanAllocator = struct {
+    backing: std.mem.Allocator,
+    needle: []const u8,
+    saw_needle_on_free: bool = false,
+
+    fn allocator(self: *ScanAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *ScanAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *ScanAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *ScanAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *ScanAllocator = @ptrCast(@alignCast(ctx));
+        if (std.mem.indexOf(u8, m, self.needle) != null) self.saw_needle_on_free = true;
+        self.backing.rawFree(m, a, ra);
+    }
+};
+
+test "persistence: a decode that fails after building the table wipes the message keys before freeing it" {
+    // `Allocator.free` overwrites the block with 0xaa in the safe modes before
+    // the allocator sees it, so a scan on free is only meaningful (and its
+    // positive control only passes) in the unchecked modes.
+    if (@import("builtin").mode == .debug or @import("builtin").mode == .safe) return error.SkipZigTest;
+    var threaded = testIo();
+    defer threaded.deinit();
+    var m = try midConversation(threaded.io());
+    defer m.deinit();
+    const good = try encodeAlloc(&m.bob);
+    defer freeSecret(good);
+    const e = State.skipped_entry_length;
+    // The last entry repeats the first one: the table holds entry 0's key
+    // (mk at +36) when the duplicate is found.
+    const dup = try testing.allocator.dupe(u8, good);
+    defer freeSecret(dup);
+    @memcpy(dup[good.len - e ..][0..e], good[good.len - 2 * e ..][0..e]);
+    const mk0 = good[good.len - 2 * e + key_length + 4 ..][0..message_key_length];
+
+    var scan: ScanAllocator = .{ .backing = testing.allocator, .needle = mk0 };
+    var st: State = undefined;
+    try testing.expectError(error.InvalidState, State.fromBytes(scan.allocator(), dup, &st));
+    try testing.expect(!scan.saw_needle_on_free);
+
+    // Positive control: the scanner does see an unwiped secret.
+    var ctl: ScanAllocator = .{ .backing = testing.allocator, .needle = mk0 };
+    const block = try ctl.allocator().alloc(u8, 80);
+    @memset(block, 0);
+    @memcpy(block[7..][0..message_key_length], mk0);
+    ctl.allocator().free(block);
+    try testing.expect(ctl.saw_needle_on_free);
+}
+
+test "persistence: the skipped count is checked against the input before anything is allocated" {
+    // A header that claims a full store but carries no entries: refused as
+    // InvalidState even from an allocator that never succeeds.
+    var raw: [State.fixed_length]u8 = @splat(0x42);
+    raw[0] = State.format_version;
+    raw[1] = 0;
+    std.mem.writeInt(u32, raw[State.fixed_length - 4 ..][0..4], max_skip_store, .little);
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var st: State = undefined;
+    try testing.expectError(error.InvalidState, State.fromBytes(failing.allocator(), &raw, &st));
+    // The same header with a count the input does carry would need the allocation.
+    std.mem.writeInt(u32, raw[State.fixed_length - 4 ..][0..4], 0, .little);
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+    try State.fromBytes(failing.allocator(), &raw, &st); // count 0: the empty table never allocates
+    st.deinit(failing.allocator());
+}
+
+test "persistence: a receiving chain key without a remote ratchet key is refused too" {
+    var raw: [State.fixed_length + 32]u8 = @splat(0x42);
+    raw[0] = State.format_version;
+    raw[1] = State.flag_ckr;
+    std.mem.writeInt(u32, raw[State.fixed_length + 32 - 4 ..][0..4], 0, .little);
+    var st: State = undefined;
+    try testing.expectError(error.InvalidState, State.fromBytes(testing.allocator, &raw, &st));
 }
