@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog "Documented per-peer keying" re-checked against the references (Linux and smoltcp key reassembly by a peer identity carried in the packet; this wire format carries none) and the "one `Reassembler` per peer" decision recorded with its reasons; no code change.
 - **2026-11-16** — **BREAKING:** `Reassembler.init` returns `InitError!Reassembler`; an invalid config (`max_inflight`,
   `max_fragments_per_datagram` or a set `max_total_bytes` of 0, `max_frame_len` 0 or too large) is `error.InvalidConfig`
   instead of a `@panic` (no consumer-reachable panic). Callers add `try`.

@@ -201,6 +201,14 @@ Survey findings (survey 2026-09-30), all low priority and all fit CONVENTIONS §
 - **Documented per-peer keying** (survey 2026-09-30) — `frag_id` is the only key, so two peers sharing a `Reassembler` can
   collide or poison each other; the README should say one instance per peer, or the API should take a peer key. Effort: small.
   ✅ DONE 2026-11-16 (documented: one `Reassembler` per peer, in README and the type's doc comment; API unchanged).
+  Re-checked 2026-11-17 against the reference, decision kept (no API change): the Linux kernel keys its fragment queues by
+  (source, destination, protocol, id[, user / vrf]) and smoltcp by a per-protocol key type (`FragKey`; IPv4 and 6LoWPAN
+  variants), but in both the peer identity is a field of the fragmented packet itself. Here it is not: the 8-byte header
+  carries only `frag_id`, and who sent a fragment is known only to the carrier layer (the tunnel endpoint / UDP source the
+  caller received it on). A peer key in the API would therefore be a value this module can neither read from the wire nor
+  verify, so the equivalent of the kernel's tuple is the caller's choice of instance: one `Reassembler` per carrier peer,
+  which also gives each peer its own `max_inflight` and `max_total_bytes` budget (a shared table could be starved by one
+  peer). Documented in README and the `Reassembler` doc comment.
 
 Earlier note: No Fable-tier piece was needed — every requirement (overlap/duplicate/timeout
 rejection, resource bounds, teardrop-class hardening) is protocol/state-machine logic
