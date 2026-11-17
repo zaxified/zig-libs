@@ -32,24 +32,17 @@ const vectors = @import("otel_baggage_vectors.zig");
 
 /// What differs from otel and why the W3C text decides for this module.
 const Class = enum {
-    /// `a=1;`, `a=1;;p`: otel skips an empty property. §3.3.1: `property = key OWS
-    /// "=" OWS value / key OWS` and `key = token` (RFC 7230: one or more
-    /// tchar), so an empty property is not in the grammar and the member is
-    /// malformed; §3.5 lets a system remove it ("MAY remove that entry").
-    /// We refuse the member (strict) or skip it (lenient).
-    empty_property,
-    /// `a=1;p=%zz`: otel refuses a property value with a bad percent escape.
-    /// §3.3.1.4 gives property keys and values "no specific meaning" and
-    /// defines the property value by the `value` production (`*baggage-octet`,
-    /// which holds `%`), and §3.3.1.3's decoding rule (U+FFFD for non-UTF-8)
-    /// is stated for the list-member value only; nothing makes a parser
-    /// refuse. We pass property values through as on the wire (`decodeValue`
-    /// decodes one on request). Stricter is allowed ("MAY remove"), laxer is
-    /// not forbidden.
+    /// `a=1;p=%zz`: otel Go refuses a property value with a bad percent escape;
+    /// OpenTelemetry Java, JS and Python keep properties as an opaque string and
+    /// accept it. §3.3.1.4 gives property keys and values "no specific meaning"
+    /// and §3.3.1.3's decoding rule is stated for the list-member value only.
+    /// Owner decision 2026-11-17: accept it, as wire text (`decodeValue` decodes
+    /// one on request).
     property_bad_escape,
     /// `a=1,a=2`: otel keeps the last of equal keys (a map). §3.3.1.1: "Uniqueness
     /// of keys ... is not guaranteed. The order of duplicate entries SHOULD be
-    /// preserved when mutating the list"; we keep every entry in order.
+    /// preserved when mutating the list"; we keep every entry in order (`get`
+    /// returns the last, as otel does).
     duplicate_key,
     /// `a=1;p=%41`: otel percent-decodes property values (`A`); we keep them as on
     /// the wire. §3.3.1.4: "Property keys and values are given no specific
@@ -122,15 +115,14 @@ fn withoutEmptyProperties(buf: []u8, input: []const u8) ?[]const u8 {
 const Opt = struct {
     /// Compare our property values percent-decoded (otel decodes them).
     decode: bool = false,
-    /// Ignore otel's properties with an empty key (what it makes of `;;`).
-    skip_empty: bool = false,
 };
 
 fn memberEq(ours: Baggage.Member, theirs: vectors.Member, opt: Opt) bool {
     if (!mem.eql(u8, ours.key, theirs.key) or !mem.eql(u8, ours.value, theirs.value)) return false;
     var it = ours.propertyIterator();
     for (theirs.props) |tp| {
-        if (opt.skip_empty and tp.key.len == 0) continue;
+        // otel keeps an empty property it parsed (an empty key); we drop it.
+        if (tp.key.len == 0) continue;
         const op = it.next() orelse return false;
         if (!mem.eql(u8, op.key, tp.key)) return false;
         if ((op.value == null) != (tp.value == null)) return false;
@@ -214,7 +206,10 @@ fn judge(c: vectors.Case) !Verdict {
             }
         } else {
             var out: [baggage.max_len + 64]u8 = undefined;
-            if (!mem.eql(u8, sortedWrite(&out, &b), c.string)) v.reason = .string;
+            var cl: [baggage.max_len + 64]u8 = undefined;
+            // otel serializes an empty property it parsed (`k=v;`); we dropped it.
+            const theirs = withoutEmptyProperties(&cl, c.string) orelse c.string;
+            if (!mem.eql(u8, sortedWrite(&out, &b), theirs)) v.reason = .string;
         }
     } else |_| {
         if (c.ok) v.reason = .strict_verdict;
@@ -226,26 +221,11 @@ fn judge(c: vectors.Case) !Verdict {
     return v;
 }
 
-fn lenientAgrees(input: []const u8, theirs: []const vectors.Member) bool {
-    var scratch: [baggage.max_len]u8 = undefined;
-    const l = Baggage.parseLenient(input, &scratch) catch return false;
-    return membersDiffer(&l, theirs, .{ .skip_empty = true }) == null;
-}
-
 fn classOf(c: vectors.Case, v: Verdict) ?Class {
     const reason = v.reason orelse return if (v.decoded) .property_value_decoded else null;
-    var cleaned: [baggage.max_len + 64]u8 = undefined;
-    var scratch: [baggage.max_len]u8 = undefined;
     switch (reason) {
         .strict_verdict, .lenient => {
             if (propertyBadEscape(c.input) and !c.ok) return .property_bad_escape;
-            // Only the empty property pieces set us apart: without them we
-            // agree with otel (strict: accept the same list; lenient: keep its members).
-            if (withoutEmptyProperties(&cleaned, c.input)) |t| {
-                if (reason == .strict_verdict) {
-                    if (c.ok and isErr(Baggage.parse(c.input, &scratch)) and !isErr(Baggage.parse(t, &scratch))) return .empty_property;
-                } else if (lenientAgrees(t, c.members)) return .empty_property;
-            }
             // otel returns nothing for a too long value; we keep the members
             // that end within 8192 bytes.
             if (reason == .lenient and c.input.len > baggage.max_len and c.members.len == 0) return .limit_keeps_prefix;
@@ -287,11 +267,11 @@ test "otel baggage oracle: strict, lenient and write agree with OpenTelemetry Go
     };
     if (bad != 0) std.debug.print("{d} unexplained; agree {d}, hits {any}\n", .{ bad, agree, hits });
     try testing.expectEqual(@as(usize, 0), bad);
-    // 2026-11-17: the evidence is agreement (916 of 954); 38 cases fall in
-    // the five classes below (empty_property 16, property_bad_escape 7,
-    // duplicate_key 3, property_value_decoded 11, limit_keeps_prefix 1).
+    // 2026-11-17: the evidence is agreement (932 of 954); 22 cases fall in
+    // the four classes below (property_bad_escape 7, duplicate_key 3,
+    // property_value_decoded 11, limit_keeps_prefix 1).
     try testing.expectEqual(@as(usize, 954), vectors.cases.len);
-    try testing.expectEqual(@as(usize, 916), agree);
-    try testing.expectEqual([n_classes]usize{ 16, 7, 3, 11, 1 }, hits);
+    try testing.expectEqual(@as(usize, 932), agree);
+    try testing.expectEqual([n_classes]usize{ 7, 3, 11, 1 }, hits);
     try testing.expect(accepted >= 150 and rejected >= 400);
 }

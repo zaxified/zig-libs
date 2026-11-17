@@ -30,7 +30,8 @@
 //!   `baggage-octet` and `%` itself, upper-case hex. When the list does not
 //!   fit in `buf` / `max_len`, whole members are left out from the right —
 //!   never a partial member (§3.3.2).
-//! - Duplicate keys are kept in order (§3.3.1.1); `get` returns the first.
+//! - Duplicate keys are kept in order (§3.3.1.1); `get` returns the last
+//!   (as all four OpenTelemetry propagators do, whose maps keep the last).
 
 const std = @import("std");
 
@@ -89,25 +90,32 @@ fn parseProperty(piece: []const u8) ?Property {
     return .{ .key = p, .value = null };
 }
 
-/// True when `text` is one or more `;`-separated valid properties (no
-/// leading/trailing `;`, no empty piece).
+/// True when every piece of `text` (`;`-separated) is a valid property or empty
+/// (an empty piece is dropped, as OpenTelemetry Go does).
 fn validProperties(text: []const u8) bool {
     var it = std.mem.splitScalar(u8, text, ';');
-    while (it.next()) |piece| if (parseProperty(piece) == null) return false;
+    while (it.next()) |piece| {
+        if (std.mem.trim(u8, piece, ows).len == 0) continue;
+        if (parseProperty(piece) == null) return false;
+    }
     return true;
 }
 
 pub const PropertyIterator = struct {
     rest: ?[]const u8,
 
+    /// The next property; empty pieces (`a=1;`, `a=1;;p`) are skipped.
     pub fn next(it: *PropertyIterator) ?Property {
-        const r = it.rest orelse return null;
-        var piece = r;
-        if (std.mem.findScalar(u8, r, ';')) |i| {
-            piece = r[0..i];
-            it.rest = r[i + 1 ..];
-        } else it.rest = null;
-        return parseProperty(piece);
+        while (it.rest) |r| {
+            var piece = r;
+            if (std.mem.findScalar(u8, r, ';')) |i| {
+                piece = r[0..i];
+                it.rest = r[i + 1 ..];
+            } else it.rest = null;
+            if (std.mem.trim(u8, piece, ows).len == 0) continue;
+            return parseProperty(piece);
+        }
+        return null;
     }
 };
 
@@ -285,15 +293,21 @@ pub const Baggage = struct {
         return b.members_buf[0..b.len];
     }
 
-    /// The decoded value of the first member named `key`, or null.
+    /// The decoded value of the LAST member named `key`, or null (duplicates are
+    /// kept in `members()`; OpenTelemetry keeps the last of equal keys).
     pub fn get(b: *const Baggage, key: []const u8) ?[]const u8 {
-        for (b.members()) |m| if (std.mem.eql(u8, m.key, key)) return m.value;
+        var i: usize = b.len;
+        while (i > 0) {
+            i -= 1;
+            const m = b.members_buf[i];
+            if (std.mem.eql(u8, m.key, key)) return m.value;
+        }
         return null;
     }
 
     /// Set `key` to `value` (the DECODED value; encoded on `write`). The
-    /// first member of that name is updated in place, keeping its position
-    /// (§3.5 "update"); otherwise a member is appended. `properties` is
+    /// LAST member of that name (the one `get` returns) is updated in place,
+    /// keeping its position (§3.5 "update"); otherwise a member is appended. `properties` is
     /// wire-form property text (`p1;k=v`, empty for none), replacing the old
     /// one. All slices are borrowed.
     pub fn put(b: *Baggage, key: []const u8, value: []const u8, properties: []const u8) error{ BadMember, TooManyMembers }!void {
@@ -301,10 +315,14 @@ pub const Baggage = struct {
         const props = std.mem.trim(u8, properties, ows);
         if (props.len != 0 and !validProperties(props)) return error.BadMember;
         const m: Member = .{ .key = key, .value = value, .properties = props };
-        for (b.members_buf[0..b.len]) |*e| if (std.mem.eql(u8, e.key, key)) {
-            e.* = m;
-            return;
-        };
+        var i: usize = b.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, b.members_buf[i].key, key)) {
+                b.members_buf[i] = m;
+                return;
+            }
+        }
         if (b.len == max_members) return error.TooManyMembers;
         b.members_buf[b.len] = m;
         b.len += 1;
@@ -506,8 +524,6 @@ test "malformed members are errors, not panics" {
         "k=%4",
         "k=%zz",
         "k=%4g",
-        "k=v;", // empty property
-        "k=v;;p",
         "k=v;=x", // property with empty key
         "k=v;p q",
         "k=v;p=\"",
@@ -520,6 +536,18 @@ test "malformed members are errors, not panics" {
     // `;` starts a property, and a property value is never percent-decoded or checked for escapes.
     _ = try Baggage.parse("k=a;b", &s);
     _ = try Baggage.parse("a=1;p=%zz,b=2", &s);
+    // An empty property is dropped, the member kept (OpenTelemetry Go), strict and lenient alike.
+    for ([_][]const u8{ "k=v;", "k=v;;p", "k=v; ;p;", "k=v;p;;q=r" }) |h| {
+        for (0..2) |mode| {
+            const e = if (mode == 0) try Baggage.parse(h, &s) else try Baggage.parseLenient(h, &s);
+            try testing.expectEqual(@as(usize, 1), e.members().len);
+            try testing.expectEqualStrings("v", e.get("k").?);
+            var it = e.members()[0].propertyIterator();
+            var n: usize = 0;
+            while (it.next()) |_| n += 1;
+            try testing.expectEqual(@as(usize, if (h.len == 4) 0 else if (h.len == 6) 1 else if (h.len == 8) 1 else 2), n);
+        }
+    }
     // NUL and control bytes inside a header never parse.
     try testing.expectError(error.BadMember, Baggage.parse("k=a\x00b", &s));
     try testing.expectError(error.BadMember, Baggage.parse("k=a\r\nb", &s));
@@ -560,7 +588,8 @@ test "limits: 64 members pass, 65 fail; 8192 bytes pass, 8193 fail" {
 test "parseLenient: skips malformed members, drops whole members past a limit" {
     var s: [max_len]u8 = undefined;
     var b = try Baggage.parseLenient("a=1, bad, =x,b=%zz,c=3;,d=4;p", &s);
-    try testing.expectEqual(@as(usize, 2), b.members().len);
+    try testing.expectEqual(@as(usize, 3), b.members().len);
+    try testing.expectEqualStrings("3", b.get("c").?);
     try testing.expectEqualStrings("1", b.get("a").?);
     try testing.expectEqualStrings("4", b.get("d").?);
 
@@ -629,15 +658,20 @@ test "round trip with properties, and put/get/delete" {
         try testing.expectEqualStrings(x.value, y.value);
         try testing.expectEqualStrings(x.properties, y.properties);
     }
-    // Duplicates keep their order; get returns the first.
-    try testing.expectEqualStrings("1", b.get("a").?);
-    // put updates the first in place (properties replaced), appends new.
+    // Duplicates keep their order; get returns the last.
+    try testing.expectEqualStrings("2", b.get("a").?);
+    // put updates the last in place (properties replaced), appends new.
     try b.put("a", "x y", "z");
     try b.put("c", "3", "");
-    try testing.expectEqualStrings("a=x%20y;z,b=Am%C3%A9lie,a=2,c=3", b.write(&out));
+    try testing.expectEqualStrings("a=1;p;q=r,b=Am%C3%A9lie,a=x%20y;z,c=3", b.write(&out));
+    try testing.expectEqualStrings("x y", b.get("a").?);
+    try testing.expectEqual(@as(usize, 4), b.members().len);
     try testing.expectError(error.BadMember, b.put("bad key", "v", ""));
-    try testing.expectError(error.BadMember, b.put("k", "v", "p;;q"));
-    try testing.expectError(error.BadMember, b.put("k", "v", ";p"));
+    // Empty property pieces are dropped, not refused.
+    try b.put("k", "v", ";p;;q; ;");
+    try testing.expectEqualStrings("k=v;p;q", b.write(&out)[b.write(&out).len - 7 ..]);
+    try testing.expectError(error.BadMember, b.put("k", "v", "p;=x"));
+    try testing.expect(b.delete("k"));
     try testing.expect(b.delete("a"));
     try testing.expect(!b.delete("a"));
     try testing.expectEqualStrings("b=Am%C3%A9lie,c=3", b.write(&out));
