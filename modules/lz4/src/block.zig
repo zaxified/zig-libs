@@ -110,8 +110,9 @@ pub fn decodeInto(src: []const u8, out: []u8, start: usize, prefix_start: usize)
                     break;
                 };
                 // 16 more input bytes than the literals (the chunk
-                // overshoot, the offset) and `fast_out` more output bytes.
-                if (src.len - ip < 16 or src.len - ip - 16 < lit or out.len - op < fast_out or out.len - op - fast_out < lit) {
+                // overshoot, the offset) and `fast_out` more output bytes
+                // (`op <= out_end`, so the subtraction cannot wrap).
+                if (src.len - ip < 16 or src.len - ip - 16 < lit or out.len - op - fast_out < lit) {
                     ip = seq;
                     break;
                 }
