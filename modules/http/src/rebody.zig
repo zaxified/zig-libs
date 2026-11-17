@@ -288,6 +288,8 @@ const MemSpool = struct {
     fail_append: bool = false,
     fail_read: bool = false,
     released: bool = false,
+    releases: u32 = 0,
+    lie: bool = false,
     opens: u32 = 0,
     fail_open: bool = false,
 
@@ -313,11 +315,12 @@ const MemSpool = struct {
         const o: usize = @intCast(offset);
         const n = @min(buf.len, ms.data.items.len - o);
         @memcpy(buf[0..n], ms.data.items[o..][0..n]);
-        return n;
+        return if (ms.lie) n + 1 else n;
     }
     fn release(ctx: *anyopaque) void {
         const ms: *MemSpool = @ptrCast(@alignCast(ctx));
         ms.released = true;
+        ms.releases += 1;
     }
     fn deinit(ms: *MemSpool) void {
         ms.data.deinit(ms.gpa);
@@ -595,4 +598,209 @@ test "FileSpool.create: the spool owns and closes its file" {
     sp.vtable.deinit(sp.ctx); // truncates, closes, frees (testing.allocator checks the free)
     const st = try tmp.dir.statFile(io, "owned.bin", .{});
     try testing.expectEqual(@as(u64, 0), st.size);
+}
+
+const CountTap = struct {
+    calls: u32 = 0,
+    empty_calls: u32 = 0,
+    bytes: u64 = 0,
+    fn observe(ctx: *anyopaque, bytes: []const u8) void {
+        const t: *CountTap = @ptrCast(@alignCast(ctx));
+        t.calls += 1;
+        if (bytes.len == 0) t.empty_calls += 1;
+        t.bytes += bytes.len;
+    }
+};
+
+test "RewindableBody: a memory_limit that is not a power of two is honoured exactly (the doubling never overshoots it)" {
+    var body: [1500]u8 = undefined;
+    pattern(&body, 4);
+    inline for (.{ 1000, 1001, 1500 }) |n| {
+        var ms: MemSpool = .{ .gpa = testing.allocator };
+        defer ms.deinit();
+        var src: Reader = .fixed(body[0..n]);
+        var rb: RewindableBody = undefined;
+        rb.init(testing.allocator, .{ .memory_limit = 1000, .spool = ms.source() });
+        defer rb.deinit();
+        try rb.fill(&src);
+        try testing.expectEqual(@as(usize, n - 1000), ms.data.items.len);
+        try testing.expectEqual(n > 1000, rb.spooled());
+        try testing.expect(rb.mem.len <= 1000);
+    }
+}
+
+test "RewindableBody: the tap is never handed an empty slice and sees exactly the body, with and without a spool" {
+    var body: [6000]u8 = undefined;
+    pattern(&body, 21);
+    inline for (.{ 0, 100, 1024, 6000 }) |n| {
+        var ct: CountTap = .{};
+        const tap: Tap = .{ .ctx = &ct, .observe = CountTap.observe };
+        var ms: MemSpool = .{ .gpa = testing.allocator };
+        defer ms.deinit();
+        var src: Reader = .fixed(body[0..n]);
+        var rb: RewindableBody = undefined;
+        rb.init(testing.allocator, .{ .memory_limit = 1024, .spool = ms.source(), .tap = &tap });
+        defer rb.deinit();
+        try rb.fill(&src);
+        try testing.expectEqual(@as(u32, 0), ct.empty_calls);
+        try testing.expectEqual(@as(u64, n), ct.bytes);
+    }
+}
+
+test "RewindableBody: deinit wipes the staging and reader buffers, resets, and is idempotent" {
+    var body: [3000]u8 = undefined;
+    @memset(&body, 0xA5);
+    var ms: MemSpool = .{ .gpa = testing.allocator };
+    defer ms.deinit();
+    var src: Reader = .fixed(&body);
+    var rb: RewindableBody = undefined;
+    rb.init(testing.allocator, .{ .memory_limit = 512, .spool = ms.source() });
+    try rb.fill(&src);
+    const got = try readAllInto(rb.reader(), testing.allocator);
+    testing.allocator.free(got);
+    _ = try rb.reader().peek(10); // fills the reader's own buffer
+    try testing.expect(std.mem.findScalar(u8, &rb.stage, 0xA5) != null);
+    try testing.expect(std.mem.findScalar(u8, &rb.rd_buf, 0xA5) != null);
+    rb.deinit();
+    try testing.expectEqual(@as(?usize, null), std.mem.findScalar(u8, &rb.stage, 0xA5));
+    try testing.expectEqual(@as(?usize, null), std.mem.findScalar(u8, &rb.rd_buf, 0xA5));
+    try testing.expectEqual(@as(usize, 0), rb.mem.len);
+    try testing.expectEqual(@as(usize, 0), rb.mem_len);
+    try testing.expect(!rb.spooled());
+    try testing.expectEqual(@as(u32, 1), ms.releases);
+    rb.deinit(); // a second deinit frees nothing again and releases nothing again
+    try testing.expectEqual(@as(u32, 1), ms.releases);
+}
+
+test "RewindableBody: a reader() taken mid-body restarts at byte 0 (memory part and spool part)" {
+    var body: [5000]u8 = undefined;
+    pattern(&body, 17);
+    var ms: MemSpool = .{ .gpa = testing.allocator };
+    defer ms.deinit();
+    var src: Reader = .fixed(&body);
+    var rb: RewindableBody = undefined;
+    rb.init(testing.allocator, .{ .memory_limit = 700, .spool = ms.source() });
+    defer rb.deinit();
+    try rb.fill(&src);
+    inline for (.{ 100, 700, 900, 4999 }) |partial| {
+        var head: [partial]u8 = undefined;
+        try rb.reader().readSliceAll(&head);
+        try testing.expectEqualSlices(u8, body[0..partial], &head);
+        const got = try readAllInto(rb.reader(), testing.allocator);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(u8, &body, got);
+    }
+}
+
+test "RewindableBody: stream never writes more than the limit it was given (memory part and spool part)" {
+    var body: [5000]u8 = undefined;
+    pattern(&body, 19);
+    var ms: MemSpool = .{ .gpa = testing.allocator };
+    defer ms.deinit();
+    var src: Reader = .fixed(&body);
+    var rb: RewindableBody = undefined;
+    rb.init(testing.allocator, .{ .memory_limit = 700, .spool = ms.source() });
+    defer rb.deinit();
+    try rb.fill(&src);
+    const r = rb.reader();
+    var out: [64]u8 = undefined;
+    var at: usize = 0;
+    var guard: usize = 0;
+    while (at < body.len) : (guard += 1) {
+        try testing.expect(guard < 2000);
+        var w: Writer = .fixed(&out);
+        const n = try RewindableBody.stream(r, &w, .limited(10));
+        try testing.expect(n >= 1 and n <= 10);
+        try testing.expectEqual(n, w.end);
+        try testing.expectEqualSlices(u8, body[at..][0..n], out[0..n]);
+        at += n;
+    }
+    var w: Writer = .fixed(&out);
+    try testing.expectError(error.EndOfStream, RewindableBody.stream(r, &w, .limited(10)));
+}
+
+test "RewindableBody: a spool read failure stays latched until the next rewind, and a lying or over-long spool is not trusted" {
+    var body: [3000]u8 = undefined;
+    pattern(&body, 23);
+    var ms: MemSpool = .{ .gpa = testing.allocator };
+    defer ms.deinit();
+    var src: Reader = .fixed(&body);
+    var rb: RewindableBody = undefined;
+    rb.init(testing.allocator, .{ .memory_limit = 256, .spool = ms.source() });
+    defer rb.deinit();
+    try rb.fill(&src);
+    var out: [8192]u8 = undefined;
+    {
+        // Latch: the spool recovers, but this reader stays failed.
+        const r = rb.reader();
+        ms.fail_read = true;
+        var w: Writer = .fixed(&out);
+        _ = try RewindableBody.stream(r, &w, .unlimited); // the memory part still reads
+        try testing.expectError(error.ReadFailed, RewindableBody.stream(r, &w, .unlimited));
+        ms.fail_read = false;
+        try testing.expectError(error.ReadFailed, RewindableBody.stream(r, &w, .unlimited));
+    }
+    {
+        // A spool reporting more than it was asked for is a read failure.
+        ms.lie = true;
+        const got = readAllInto(rb.reader(), testing.allocator);
+        if (got) |bytes| testing.allocator.free(bytes) else |e| try testing.expectEqual(error.ReadFailed, e);
+        try testing.expect(std.meta.isError(got));
+        ms.lie = false;
+    }
+    {
+        // Bytes in the spool beyond the body's length are never exposed.
+        try ms.data.appendSlice(testing.allocator, "EXTRA-EXTRA-EXTRA");
+        const got = try readAllInto(rb.reader(), testing.allocator);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(u8, &body, got);
+    }
+}
+
+test "FileSpool: readAt never reads past what this spool appended, even over a file that already holds bytes" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "dirty.bin", .{ .read = true, .truncate = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, "0123456789ABCDEFGHIJ", 0);
+    var fs = FileSpool.init(io, file);
+    const sp = fs.spool();
+    try sp.vtable.append(sp.ctx, "xyz");
+    var buf: [64]u8 = undefined;
+    const n = try sp.vtable.readAt(sp.ctx, 1, &buf);
+    try testing.expectEqualStrings("yz", buf[0..n]);
+    try testing.expectEqual(@as(usize, 0), try sp.vtable.readAt(sp.ctx, 3, &buf));
+}
+
+test "FileSpool: one FileSpool reused for two bodies in a row starts the second at offset 0" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "reuse.bin", .{ .read = true, .truncate = true });
+    defer file.close(io);
+    var fs = FileSpool.init(io, file);
+    const Src = struct {
+        sp: *FileSpool,
+        fn open(ctx: ?*anyopaque) error{ SpoolOpenFailed, OutOfMemory }!BodySpool {
+            const s: *@This() = @ptrCast(@alignCast(ctx.?));
+            return s.sp.spool();
+        }
+    };
+    var s: Src = .{ .sp = &fs };
+    inline for (.{ 11, 29 }) |seed| {
+        var body: [6000]u8 = undefined;
+        pattern(&body, seed);
+        var src: Reader = .fixed(&body);
+        var rb: RewindableBody = undefined;
+        rb.init(testing.allocator, .{ .memory_limit = 1000, .spool = .{ .ctx = &s, .open = Src.open } });
+        try rb.fill(&src);
+        try testing.expectEqual(@as(u64, 5000), fs.len);
+        const got = try readAllInto(rb.reader(), testing.allocator);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(u8, &body, got);
+        rb.deinit();
+        try testing.expectEqual(@as(u64, 0), fs.len);
+        try testing.expectEqual(@as(u64, 0), try file.length(io));
+    }
 }

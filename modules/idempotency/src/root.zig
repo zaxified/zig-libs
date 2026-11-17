@@ -4330,3 +4330,49 @@ test "spool: bytes beyond Content-Length are not part of the body (no 413, the h
     try testing.expect(std.mem.startsWith(u8, bodyOf(got), "40000 "));
     try testing.expectEqual(@as(u32, 1), f.app.calls);
 }
+
+test "spool: the memory/spool boundary is max_body_bytes exactly (at it nothing is spooled, one byte past it the spool opens)" {
+    var ts: TestSpool = .{ .gpa = testing.allocator };
+    defer ts.deinit();
+    var f: MiniFixture = undefined;
+    try f.init(testing.allocator, "/up", hBodyEcho, .{ .spool = ts.source(), .max_body_bytes = 1000 });
+    defer f.deinit();
+    var body: [1001]u8 = undefined;
+    _ = bigBody(&body, 10);
+    var b: [4096]u8 = undefined;
+    const at = try bigRequest(testing.allocator, "edge-1", body[0..1000]);
+    defer testing.allocator.free(at);
+    try testing.expect(std.mem.startsWith(u8, runWire(&f.r, at, &b), "HTTP/1.1 200"));
+    try testing.expectEqual(@as(u32, 0), ts.opens);
+    const over = try bigRequest(testing.allocator, "edge-2", &body);
+    defer testing.allocator.free(over);
+    const got = runWire(&f.r, over, &b);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.startsWith(u8, bodyOf(got), "1001 "));
+    try testing.expectEqual(@as(u32, 1), ts.opens);
+}
+
+test "spool: the query is part of the fingerprint on the spooled path too (same key, same body, other query: 422)" {
+    var ts: TestSpool = .{ .gpa = testing.allocator };
+    defer ts.deinit();
+    var f: MiniFixture = undefined;
+    try f.init(testing.allocator, "/up", hBodyEcho, .{ .spool = ts.source(), .max_body_bytes = 1000 });
+    defer f.deinit();
+    var body: [3000]u8 = undefined;
+    _ = bigBody(&body, 12);
+    var b: [4096]u8 = undefined;
+    const mk = struct {
+        fn req(gpa: std.mem.Allocator, query: []const u8, payload: []const u8) ![]u8 {
+            return std.fmt.allocPrint(gpa, "POST /up{s} HTTP/1.1\r\nHost: t\r\nIdempotency-Key: q-1\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ query, payload.len, payload });
+        }
+    };
+    const r1 = try mk.req(testing.allocator, "?to=alice", &body);
+    defer testing.allocator.free(r1);
+    const r2 = try mk.req(testing.allocator, "?to=bob", &body);
+    defer testing.allocator.free(r2);
+    try testing.expect(std.mem.startsWith(u8, runWire(&f.r, r1, &b), "HTTP/1.1 200"));
+    try testing.expect(std.mem.startsWith(u8, runWire(&f.r, r2, &b), "HTTP/1.1 422"));
+    const again = runWire(&f.r, r1, &b);
+    try testing.expectEqualStrings("true", headerValue(again, "Idempotent-Replayed").?);
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+}
