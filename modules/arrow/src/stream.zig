@@ -820,8 +820,9 @@ fn iota(a: Allocator, start: usize, end: usize) Error![]usize {
 
 /// One batch ready to decode: its fixed buffers in schema order (`rb.buffers`, one set
 /// per field as `plan` counted them) and, per view-typed field, its variadic data
-/// buffers (`variadic[RField.view]`), all located in `body`.
-const Chunk = struct { rb: ipc.RecordBatch, body: []const u8, variadic: []const []const ipc.BufferLoc = &.{} };
+/// buffers (`variadic[RField.view]`), all located in `body`. `seq` is the reader's
+/// dictionary generation count when the batch was read (`RDict.genAt`).
+const Chunk = struct { rb: ipc.RecordBatch, body: []const u8, variadic: []const []const ipc.BufferLoc = &.{}, seq: u64 = 0 };
 
 const RField = struct {
     kind: Kind,
@@ -856,13 +857,37 @@ const RDict = struct {
     ordered: bool,
     categorical: bool,
     chunks: std.ArrayList(Chunk) = .empty,
+    /// Every generation's entries, concatenated in arrival order (`gens` locates them).
     data: ColumnData = .nulls,
     len: usize = 0,
-    /// Batches seen (a second non-delta one is a replacement).
-    batches: usize = 0,
+    /// One per non-delta DictionaryBatch: a stream may REPLACE a dictionary, and the
+    /// record batches read before the replacement keep indexing the old one. Deltas
+    /// extend the latest generation.
+    gens: std.ArrayList(Gen) = .empty,
     /// Whether a projected column reads it; an unused dictionary's bodies are not read.
     used: bool = true,
+    /// While its value field is planned: a dictionary inside its own values is a cycle.
+    planning: bool = false,
+
+    /// The generation a batch read at `seq` indexes: the latest one begun by then, or the
+    /// first when the batch came before any (a stream may send an all-null batch before
+    /// the dictionary; the columnar spec allows it); null without any DictionaryBatch.
+    fn genAt(d: *const RDict, seq: u64) ?usize {
+        const gs = d.gens.items;
+        if (gs.len == 0) return null;
+        var lo: usize = 0;
+        var hi: usize = gs.len;
+        while (hi - lo > 1) {
+            const mid = lo + (hi - lo) / 2;
+            if (gs[mid].seq <= seq) lo = mid else hi = mid;
+        }
+        return lo;
+    }
 };
+
+/// One generation of a dictionary: begun at reader sequence `seq`, its `len` entries at
+/// `base` of the concatenated dictionary.
+const Gen = struct { seq: u64, base: u64, len: u64 };
 
 /// What a message's metadata must hold for a schema: nodes, fixed buffers, and for each
 /// BinaryView / Utf8View field in pre-order the index of its views buffer (its variadic
@@ -880,6 +905,11 @@ const Reader = struct {
     inflated: u64 = 0,
     /// Array slots so far, against `ReadOptions.max_cells`.
     cells: u64 = 0,
+    /// Dictionary generations begun so far (each non-delta DictionaryBatch is one).
+    seq: u64 = 0,
+    /// Whether a non-delta DictionaryBatch may replace a dictionary: in a stream yes; the
+    /// file format forbids it.
+    replace: bool = false,
 
     /// Counts `n` array slots against `ReadOptions.max_cells`.
     fn charge(r: *Reader, n: u64) Error!void {
@@ -893,18 +923,21 @@ const Reader = struct {
         if (r.cells +| n > r.opts.max_cells) return error.LimitExceeded;
     }
 
-    fn plan(r: *Reader, f: schema.Field, ctr: *Counter, depth: usize, in_dict: bool) Error!RField {
+    fn plan(r: *Reader, f: schema.Field, ctr: *Counter, depth: usize) Error!RField {
         if (depth >= schema.max_depth) return error.Malformed;
         var rf: RField = .{ .kind = .null_, .col = .{ .name = try r.a.dupe(u8, f.name), .type = .text }, .node_ix = ctr.nodes, .buf_ix = ctr.bufs };
         ctr.nodes += 1;
         if (f.dictionary) |d| {
-            if (in_dict) return error.Unsupported; // a dictionary inside a dictionary's values
+            // A dictionary may sit anywhere, in a list or struct and inside another
+            // dictionary's values (Arrow C++ reads the `nested_dictionary` golden); the
+            // inner one is decoded first (`dicts` is in post-order).
             ctr.bufs += 2;
             rf.kind = .dict;
             rf.index = d.index;
             var vf = f;
             vf.dictionary = null;
             if (r.by_id.get(d.id)) |rd| {
+                if (rd.planning) return error.Malformed; // a dictionary inside its own values
                 // Two fields sharing one dictionary, which Arrow allows: their value types
                 // must agree (each field keeps its own index type).
                 if (!sameValueType(rd.field, vf)) return error.Malformed;
@@ -920,13 +953,17 @@ const Reader = struct {
             rd.* = .{
                 .id = d.id,
                 .field = vf,
-                .value = try r.plan(vf, &vctr, depth, true),
-                .ctr = vctr,
+                .value = undefined,
+                .ctr = undefined,
                 .ordered = d.ordered,
                 .categorical = vf.type == .utf8 or vf.type == .large_utf8 or vf.type == .utf8_view,
+                .planning = true,
             };
-            try r.dicts.append(r.a, rd);
             try r.by_id.put(r.a, d.id, rd);
+            rd.value = try r.plan(vf, &vctr, depth);
+            rd.ctr = vctr;
+            rd.planning = false;
+            try r.dicts.append(r.a, rd);
             rf.dict = rd;
             rf.col = rd.value.col;
             if (rd.categorical) rf.col.type = .categorical;
@@ -1045,7 +1082,7 @@ const Reader = struct {
                 ctr.bufs += bufs;
                 bufs = 0;
                 const kids = try r.a.alloc(RField, 1);
-                kids[0] = try r.plan(f.children[0], ctr, depth + 1, in_dict);
+                kids[0] = try r.plan(f.children[0], ctr, depth + 1);
                 rf.children = kids;
                 rf.col.inner = try r.a.dupe(Column, &.{kids[0].col});
             },
@@ -1057,7 +1094,7 @@ const Reader = struct {
                 const kids = try r.a.alloc(RField, f.children.len);
                 const inner = try r.a.alloc(Column, f.children.len);
                 for (kids, inner, f.children) |*k, *c, cf| {
-                    k.* = try r.plan(cf, ctr, depth + 1, in_dict);
+                    k.* = try r.plan(cf, ctr, depth + 1);
                     c.* = k.col;
                 }
                 rf.children = kids;
@@ -1079,7 +1116,7 @@ const Reader = struct {
                 ctr.bufs += 3;
                 bufs = 0;
                 const kids = try r.a.alloc(RField, 1);
-                kids[0] = try r.plan(f.children[0], ctr, depth + 1, in_dict);
+                kids[0] = try r.plan(f.children[0], ctr, depth + 1);
                 rf.children = kids;
                 rf.col.inner = try r.a.dupe(Column, &.{kids[0].col});
             },
@@ -1096,7 +1133,7 @@ const Reader = struct {
                 bufs = 0;
                 rf.kind = .ree;
                 const kids = try r.a.alloc(RField, 2);
-                for (kids, f.children) |*k, cf| k.* = try r.plan(cf, ctr, depth + 1, in_dict);
+                for (kids, f.children) |*k, cf| k.* = try r.plan(cf, ctr, depth + 1);
                 rf.children = kids;
                 const name = rf.col.name;
                 rf.col = kids[1].col;
@@ -1111,7 +1148,7 @@ const Reader = struct {
     fn planAll(r: *Reader, s: schema.Schema) Error!Top {
         var ctr: Counter = .{};
         const fields = try r.a.alloc(RField, s.fields.len);
-        for (fields, s.fields) |*rf, f| rf.* = try r.plan(f, &ctr, 0, false);
+        for (fields, s.fields) |*rf, f| rf.* = try r.plan(f, &ctr, 0);
         var top: Top = .{ .fields = fields, .ctr = ctr, .pick = try iota(r.a, 0, fields.len) };
         if (r.opts.columns) |cols| try r.project(&top, cols);
         return top;
@@ -1159,7 +1196,10 @@ const Reader = struct {
     }
 
     fn markUsed(f: *const RField) void {
-        if (f.dict) |d| d.used = true;
+        if (f.dict) |d| if (!d.used) {
+            d.used = true;
+            markUsed(&d.value); // the dictionaries its values use
+        };
         for (f.children) |*c| markUsed(c);
     }
 
@@ -1167,30 +1207,46 @@ const Reader = struct {
         const h = msg.header orelse return error.Malformed;
         const rb = ipc.decodeRecordBatch(r.a, h, body.len) catch |e| return noEos(e);
         try r.checkBatch(rb, top.ctr, top.fields, top.need, true);
-        return r.prepare(rb, body, top.ctr, if (top.need) |n| n.bufs else null);
+        var c = try r.prepare(rb, body, top.ctr, if (top.need) |n| n.bufs else null);
+        c.seq = r.seq;
+        return c;
     }
 
     fn takeDict(r: *Reader, msg: schema.Message, body: []const u8) Error!void {
         const h = msg.header orelse return error.Malformed;
         const db = ipc.decodeDictionaryBatch(r.a, h, body.len) catch |e| return noEos(e);
         const d = r.by_id.get(db.id) orelse return error.Malformed;
-        if (!db.is_delta and d.batches > 0) return error.Unsupported; // replacement
-        d.batches += 1;
+        if (db.is_delta) {
+            // A delta extends a dictionary; with none yet there is nothing to extend (Arrow
+            // C++ `AddDictionaryDelta`, arrow-rs `update_dictionaries` refuse it too).
+            if (d.gens.items.len == 0) return error.Malformed;
+        } else {
+            // A replacement: legal in a stream, forbidden in a file (Columnar.rst, "IPC File
+            // Format": only one non-delta dictionary batch per id; Arrow C++ `Invalid`).
+            if (d.gens.items.len > 0 and !r.replace) return error.Malformed;
+            r.seq += 1;
+            try d.gens.append(r.a, .{ .seq = r.seq, .base = d.len, .len = 0 });
+        }
         // A dictionary no projected column reads: its metadata is checked, its body is not
-        // read (as an unprojected column's buffers are not).
+        // read (as an unprojected column's buffers are not). Every generation's entries
+        // are charged to `max_cells` and kept, so N replacements cost N dictionaries.
         try r.checkBatch(db.data, d.ctr, (&d.value)[0..1], null, d.used);
+        // All generations are one array of `d.len` entries (`max_rows` bounds it, as the
+        // entries of one dictionary's deltas always were).
+        const n: u64 = @intCast(db.data.length);
+        if (d.used and @as(u64, d.len) + n > r.opts.max_rows) return error.LimitExceeded;
+        d.len += @intCast(n);
+        d.gens.items[d.gens.items.len - 1].len += n;
         if (!d.used) return;
-        try d.chunks.append(r.a, try r.prepare(db.data, body, d.ctr, null));
+        var c = try r.prepare(db.data, body, d.ctr, null);
+        c.seq = r.seq;
+        try d.chunks.append(r.a, c);
     }
 
     fn finishDicts(r: *Reader) Error!void {
+        // Post-order: a dictionary inside another's values is decoded before it.
         for (r.dicts.items) |d| {
-            if (!d.used) continue;
-            var n: u64 = 0;
-            for (d.chunks.items) |c| n += @intCast(c.rb.length);
-            if (n > r.opts.max_rows) return error.LimitExceeded;
-            d.len = @intCast(n);
-            d.data = try r.decode(&d.value, d.chunks.items);
+            if (d.used) d.data = try r.decode(&d.value, d.chunks.items);
         }
     }
 
@@ -1779,21 +1835,33 @@ const Reader = struct {
             if (len > 0 and bufOf(c, rf.buf_ix + 1).len / size < len) return error.Malformed;
         }
         const codes = try r.a.alloc(u32, n);
+        // The generations these batches index: each batch's index is into the dictionary
+        // as it stood when the batch was read, at that generation's place in `d.data`.
+        const live = try r.a.alloc(bool, d.gens.items.len);
+        @memset(live, false);
         var base: usize = 0;
         for (chunks) |c| {
             const len: usize = @intCast(c.rb.nodes[rf.node_ix].length);
             if (len == 0) continue;
+            const gi = d.genAt(c.seq);
+            const g: Gen = if (gi) |i| d.gens.items[i] else .{ .seq = 0, .base = 0, .len = 0 };
+            if (gi) |i| live[i] = true;
             const b = bufOf(c, rf.buf_ix + 1);
             for (0..len) |i| {
                 codes[base + i] = 0;
                 if (!isSet(valid, base + i)) continue;
                 const x = readIndex(b[i * size ..][0..size], rf.index);
-                if (x < 0 or x >= d.len) return error.Malformed;
-                codes[base + i] = std.math.cast(u32, x) orelse return error.Unsupported;
+                if (x < 0 or x >= g.len) return error.Malformed;
+                codes[base + i] = std.math.cast(u32, g.base + @as(u64, @intCast(x))) orelse return error.Unsupported;
             }
             base += len;
         }
-        if (d.categorical) return r.categorical(d, codes, valid, n);
+        if (d.categorical) {
+            // A batch-less read keeps the first generation's categories (one generation:
+            // the whole dictionary, as before replacement was read).
+            if (live.len > 0 and std.mem.indexOfScalar(bool, live, true) == null) live[0] = true;
+            return r.categorical(d, live, codes, valid, n);
+        }
         const sel = try r.a.alloc(usize, n);
         for (sel, codes, 0..) |*s, k, i| s.* = if (isSet(valid, i)) k else none;
         return gather(r, d.data, sel);
@@ -1801,16 +1869,20 @@ const Reader = struct {
 
     /// A dictionary-encoded text column as `dataframe` keeps one: an unordered
     /// dictionary deduplicated and sorted lexically, an ordered one deduplicated in its
-    /// order; null entries dropped (their rows become null).
-    fn categorical(r: *Reader, d: *const RDict, codes: []u32, valid_in: ?[]u64, n: usize) Error!ColumnData {
+    /// order; null entries dropped (their rows become null). After a replacement the
+    /// categories are the union of the generations the rows index (`live`), as pyarrow's
+    /// `to_pandas` unifies a chunked dictionary column (`DictionaryUnifier`: first
+    /// appearance order, which the ordered case keeps; the unordered one is sorted).
+    fn categorical(r: *Reader, d: *const RDict, live: []const bool, codes: []u32, valid_in: ?[]u64, n: usize) Error!ColumnData {
         const gone = std.math.maxInt(u32);
         const remap = try r.a.alloc(u32, d.len);
+        @memset(remap, gone);
         var offs: std.ArrayList(usize) = .empty;
         var bytes: std.ArrayList(u8) = .empty;
         try offs.append(r.a, 0);
         if (d.ordered) {
             var seen: std.StringHashMapUnmanaged(u32) = .empty;
-            for (remap, 0..) |*m, k| {
+            for (d.gens.items, live) |g, on| if (on) for (remap[@intCast(g.base)..][0..@intCast(g.len)], @as(usize, @intCast(g.base))..) |*m, k| {
                 const t = textAt(d.data, k) orelse {
                     m.* = gone;
                     continue;
@@ -1822,13 +1894,12 @@ const Reader = struct {
                     try offs.append(r.a, bytes.items.len);
                 }
                 m.* = gop.value_ptr.*;
-            }
+            };
         } else {
             var order: std.ArrayList(u32) = .empty;
-            for (remap, 0..) |*m, k| {
-                m.* = gone;
+            for (d.gens.items, live) |g, on| if (on) for (@as(usize, @intCast(g.base))..@as(usize, @intCast(g.base + g.len))) |k| {
                 if (textAt(d.data, k) != null) try order.append(r.a, @intCast(k));
-            }
+            };
             std.mem.sort(u32, order.items, d.data, lessEntry);
             var prev: ?[]const u8 = null;
             for (order.items) |k| {
@@ -1958,6 +2029,8 @@ fn sameValueType(x: schema.Field, y: schema.Field) bool {
     };
     if (!same or x.children.len != y.children.len) return false;
     if ((x.dictionary == null) != (y.dictionary == null)) return false;
+    // A child's own dictionary encoding too: only the first field's is planned and read.
+    if (x.dictionary) |dx| if (!std.meta.eql(dx, y.dictionary.?)) return false;
     for (x.children, y.children) |p, q| {
         if (!std.mem.eql(u8, p.name, q.name) or !sameValueType(p, q)) return false;
     }
@@ -2223,13 +2296,15 @@ fn decodedChildren(f: schema.Field) []const schema.Field {
 }
 
 /// Reads an Arrow IPC stream into a frame allocated from `arena` (free it all with the
-/// arena; nothing borrows `bytes`). Dictionary deltas are appended; ZSTD body compression
-/// is read. A dictionary REPLACED mid-stream, LZ4_FRAME body compression, a metadata
+/// arena; nothing borrows `bytes`). Dictionary deltas are appended; a dictionary REPLACED
+/// mid-stream applies to the batches after it, the batches before it keep the old one,
+/// and a categorical column's categories are the union of the dictionaries its rows
+/// use; ZSTD body compression is read. LZ4_FRAME body compression, a metadata
 /// version before V4, and the types `dataframe` has no column for (Interval, Union) are
 /// `error.Unsupported`. A Map reads as a list of its entries struct (the map tag is not
 /// kept), a run-end encoded column as its values' column.
 pub fn readStream(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!df.Frame {
-    var r: Reader = .{ .a = arena, .opts = opts };
+    var r: Reader = .{ .a = arena, .opts = opts, .replace = true };
     var pos: usize = 0;
     const first = ipc.readMessage(bytes, &pos) catch |e| return noEos(e); // no schema
     if (first.msg.header_type != .schema) return error.Malformed;

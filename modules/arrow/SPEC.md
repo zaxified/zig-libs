@@ -121,7 +121,7 @@ the field is **not measured** (this module has no bench; Performance stays `not 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | [apache/arrow](https://github.com/apache/arrow) (C++ library, pyarrow, Feather) — **reference** | C++ | Apache-2.0 | 17.3k | apache-arrow-26.0.1 (2026-11-03); pushed 2026-11-16 | The implementation every other one is tested against; the golden files this module's anchor reads come from it. IPC stream and file, LZ4_FRAME and ZSTD buffer compression (Feather V2 is the IPC file and supports both *(doc)*; its writer defaults to LZ4 when available *(inferred)*), every data type of the format (Map, Union, Interval, Decimal32/64/128/256, RunEndEncoded, the view types, ListView, extension types), dictionary replacement and deltas, byte-swapping of non-native-endian data on read *(doc: status page)*, memory-mapped zero-copy reads (`pyarrow.memory_map`), custom schema and field key/value metadata, tensors, the C data / C stream interface, Flight. Feather V1 read/write is deprecated since 25.0 *(doc)*. |
-| [apache/arrow-rs](https://github.com/apache/arrow-rs) `arrow-ipc` — **closest shape** | Rust | Apache-2.0 | 3.7k | 60.1.0 (2026-10-28); pushed 2026-11-16 | Stream and file reader/writer over `io::Read`/`io::Write` (incremental, batch at a time), ZSTD and LZ4_FRAME behind the optional `lz4` / `zstd` features *(Cargo.toml)*, the full type set, column projection, schema metadata, dictionary replacement *(inferred)*. Buffers are shared with the input where uncompressed *(inferred)*. |
+| [apache/arrow-rs](https://github.com/apache/arrow-rs) `arrow-ipc` — **closest shape** | Rust | Apache-2.0 | 3.7k | 60.1.0 (2026-10-28); pushed 2026-11-16 | Stream and file reader/writer over `io::Read`/`io::Write` (incremental, batch at a time), ZSTD and LZ4_FRAME behind the optional `lz4` / `zstd` features *(Cargo.toml)*, the full type set, column projection, schema metadata, dictionary replacement in a stream (`reader.rs` `update_dictionaries`; its file reader does not refuse one either). Buffers are shared with the input where uncompressed *(inferred)*. |
 | [pola-rs/polars](https://github.com/pola-rs/polars) `read_ipc` / `write_ipc` / `read_ipc_stream` | Rust | MIT | 40.4k | py-2.1.0 (2026-10-25); pushed 2026-11-16 | A DataFrame library with its own IPC reader/writer (the same shape as `dataframe` + this module, the closest to what an `arrow` user does). `memory_map` option on read (the docs warn that a corrupt file is then undefined behaviour), `compression` lz4 / zstd / uncompressed, `compat_level` choosing between the older and the newest encoding of strings (view types) *(doc)*, `record_batch_size`, column projection *(inferred)*. |
 | [apache/arrow-go](https://github.com/apache/arrow-go) `arrow/ipc` | Go | Apache-2.0 | 422 | v18.9.0 (2026-11-16) | Stream and file, ZSTD and LZ4 (`klauspost/compress`, `pierrec/lz4` imports in `compression.go`), endianness swap (`endian_swap.go`) *(listing)*. |
 | [apache/arrow-java](https://github.com/apache/arrow-java) | Java | Apache-2.0 | 102 | v19.0.0 (2026-03-16) | IPC stream and file, a `compression` module *(listing)*, Flight, JDBC and dataset adapters. Not verified beyond the status matrix. |
@@ -147,7 +147,7 @@ Interval) are refused; Map is read as a list of its entries struct, so a write-b
 arrow-rs and polars 2.x keep a map type of their own); the view types, RunEndEncoded, Map and Decimal32/64/256 are
 read but never written; LZ4_FRAME, the
 other codec every Arrow implementation but this one has and the default of pyarrow's Feather writer, is refused
-(waits for an `lz4` module); dictionary replacement and a dictionary nested in a list or struct are refused; there is no
+(waits for an `lz4` module); there is no
 zero-copy or memory-mapped read, no incremental reader or writer over `std.Io` (the input and the
 output are whole byte slices), no big-endian byte swap; the writer's output has not been read by a foreign
 implementation and no speed was measured.
@@ -207,7 +207,7 @@ per read) after checking each declared length against `zstd.decompressBound` and
 | `timestamp` (+ `time_zone`) | Timestamp(us, zone) | s / ms / ns (ns not divisible to us → `Unsupported`, truncated toward zero under `lossy`); a zone `tz` does not know → `Unsupported`, or under `lossy` a naive column (the cells are UTC instants either way) |
 | `duration` | Duration(us) | s / ms / ns (ns as for timestamps) |
 | `time` | Time64(us) | Time32(s, ms), Time64(ns, as for timestamps); a value outside `[0, 24h)` (Arrow allows 24:00:00) → `Unsupported`, or null under `lossy` |
-| `categorical` | Utf8, dictionary-encoded, Int32 indices, `ordered` kept | any integer index type; an unordered dictionary is deduplicated and sorted lexically (the `CatColumn` invariant), an ordered one deduplicated in its order; null dictionary entries read as null rows |
+| `categorical` | Utf8, dictionary-encoded, Int32 indices, `ordered` kept | any integer index type; an unordered dictionary is deduplicated and sorted lexically (the `CatColumn` invariant), an ordered one deduplicated in its order; null dictionary entries read as null rows; a dictionary replaced in a stream: the union of the dictionaries the rows use (see "Dictionaries") |
 | `list` (`inner[0]`) | List (Int32 offsets) | LargeList; null rows with elements and offsets not starting at 0 are compacted |
 | `array` (`array_width`) | FixedSizeList(width) | — |
 | `struct` (`inner`) | Struct | — |
@@ -239,8 +239,32 @@ survives a read there either; the values' own children (a struct's fields) keep 
 `WriteOptions.field_metadata` taken from a read always fits the frame: a run-end encoded struct's child metadata
 lands on the struct's own fields, never on the `run_ends` / `values` pair.
 
-A dictionary over a non-text type (Int64 values, say) is read as a plain column of that type. Each dictionary-encoded
-column gets its own id, its whole dictionary written once before the first record batch.
+**Dictionaries (2026-11-17).** A dictionary over a non-text type (Int64 values, say) is read as a plain column of
+that type. A dictionary may sit anywhere in the schema: in a list or struct (a `list` / `struct` of `categorical`),
+shared by several fields, and inside another dictionary's values (the `nested_dictionary` golden: a dictionary of
+lists whose items are dictionary-encoded reads as a `list` of `categorical`) — the inner one is decoded first, as
+Arrow C++ resolves it. Deltas (`isDelta`) extend a dictionary; a delta for a dictionary not yet sent is
+`error.Malformed` (Arrow C++ `DictionaryMemo::AddDictionaryDelta` and arrow-rs `update_dictionaries` refuse it).
+
+*Replacement.* In a STREAM a non-delta `DictionaryBatch` for an id already seen replaces the dictionary
+(Columnar.rst, "IPC Streaming Format"): the record batches read before it keep indexing the old one, those after it
+index the new one (and its deltas); each batch's indices are checked against the dictionary current when it was read.
+This is what Arrow C++'s `RecordBatchStreamReader` (`DictionaryMemo::AddOrReplaceDictionary`, a
+`num_replaced_dictionaries` statistic) and arrow-rs's `StreamReader` (`update_dictionaries` inserts the new values)
+do: each record batch carries its own dictionary. A frame is one column, not a chunked array, so the batches merge
+the way pyarrow's `read_all().to_pandas()` merges a chunked dictionary column (`arrow_to_pandas.cc`
+`NeedDictionaryUnification` / `DictionaryUnifier`): the categories are the union of the dictionaries the rows use,
+deduplicated in order of first appearance, `ordered` kept. An ordered column keeps that order; an unordered one is
+then sorted lexically like every unordered dictionary this module reads. A dictionary replaced before any batch used
+it adds no category; a read with no record batch keeps the first dictionary's. A non-text dictionary needs no
+merging: each row reads its value from its own generation. In a FILE replacement is forbidden ("The IPC File format
+does not support dictionary replacement, i.e. only one non-delta dictionary batch can be emitted for a given
+dictionary ID", Columnar.rst, "Deviations from the IPC Streaming Format"), and Arrow C++'s file reader fails with
+`Status::Invalid` ("Unsupported dictionary replacement in IPC file"): `error.Malformed` here (before 2026-11-17 a
+replacement was `Unsupported` in both formats). Every generation's entries are kept and charged (see Limits), so N
+replacements of a dictionary cost N dictionaries.
+
+Each dictionary-encoded column gets its own id, its whole dictionary written once before the first record batch.
 
 ## Limits and refusals
 
@@ -256,10 +280,12 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
   the footer's length). An honest schema spends at most about its length (every field needs more than 8 unique
   bytes plus its name). Nesting deeper than `schema.max_depth` (64) is refused on both sides.
 - `ReadOptions.max_rows` (default 2^27, ours): the most rows any one array may claim — the frame's rows summed over
-  the batches, a list's elements, a dictionary's entries, a run-end array's runs.
+  the batches, a list's elements, a dictionary's entries (every generation of a replaced dictionary together, deltas
+  included), a run-end array's runs.
 - `ReadOptions.max_cells` (default 2^28, ours): the most array slots the whole read may decode — every array's
-  length (column, list child, struct field, dictionary; under `ReadOptions.columns` only the projected columns'
-  and the dictionaries they use) summed over every batch, plus every row, list element and
+  length (column, list child, struct field, dictionary — every replacement again; under `ReadOptions.columns` only the
+  projected columns' and the dictionaries they use, inner ones included) summed over every batch, plus every row,
+  list element and
   byte a dictionary column copies out of its dictionary. `max_rows` bounds one array; this bounds their number
   times their length, which matters where rows cost no body bytes: FixedSizeBinary(0), FixedSizeList(0) and Null
   children, and one large dictionary entry selected by many one-byte indices. The reader spends up to ~16 bytes
@@ -285,8 +311,10 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
   `Unsupported`. The reader refuses a declared precision outside 1–38 (`Malformed`), and a value with more digits
   than its declared precision, or with more than 38 once at 12 fractional digits, like an inexact scale.
 - **Shared dictionaries**: two fields may name one dictionary id when their value types agree (type, zone,
-  children); each keeps its own index type. Different value types are `Malformed`; one dictionary with two
-  `isOrdered` flags is `Unsupported`.
+  children, and the children's own dictionary encodings: id, index type, order); each keeps its own index type.
+  Different value types are `Malformed`; one dictionary with two `isOrdered` flags is `Unsupported`. A dictionary
+  inside its own values (a cycle through the ids) is `Malformed`.
+- **Dictionary batches**: a delta before the dictionary's first batch, a replacement in a file → `Malformed`.
 - `dataframe` keeps list offsets in `u32`: more than 2^32 − 1 elements in one list column → `Unsupported`; the
   writer's Int32 list offsets refuse more than 2^31 − 1 elements in one batch.
 - **Values `dataframe` cannot hold, or holds only inexactly** fail the whole read with `error.Unsupported` by
@@ -298,8 +326,7 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
   calendar day of the instant), and reads a timestamp zone `tz` does not know as a naive column. Nothing else
   changes (a malformed stream is still an error). Tests: `src/stream_test.zig` "lossy: …", "inexact time
   conversions", and the `datetime` and `decimal` golden sets.
-- Refused on read (`Unsupported`): LZ4_FRAME body compression, a dictionary replaced mid-stream (deltas are
-  appended), a dictionary nested in a dictionary's values, Interval, Union,
+- Refused on read (`Unsupported`): LZ4_FRAME body compression, Interval, Union,
   tensors. Every structural defect — a buffer shorter than its node, offsets running backwards or past the data, an
   index outside its dictionary, node or buffer counts not matching the schema, a column length not the batch's —
   is `error.Malformed`.
@@ -313,7 +340,9 @@ its Arrow integration JSON (`.json.gz`), through an oracle written from the JSON
 scales, hex binary, dictionary indices, offsets; dates by Hinnant's `civil_from_days`), not through the reader.
 Sets: `custom_metadata`, `dictionary`, `dictionary_unsigned`, `duplicate_fieldnames`, `extension`, `nested`,
 `nested_large_offsets`, `null`, `null_trivial`, `primitive`, `primitive_large_offsets`, `primitive_no_batches`,
-`primitive_zerolength`, `recursive_nested`, and from `2.0.0-compression` `zstd` and `uncompressible_zstd`
+`primitive_zerolength`, `recursive_nested`, `nested_dictionary` (a list dictionary of dictionary-encoded items and a
+struct dictionary whose two fields share one), from `4.0.0-shareddict` `shared_dict` (two columns, one
+dictionary), and from `2.0.0-compression` `zstd` and `uncompressible_zstd`
 (ZSTD body compression), from `cpp-21.0.0` `decimal32`, `decimal64`, `run_end_encoded`, `binary_view` and
 `list_view`, and `map` and `map_non_canonical` (a Map as a list of its entries; the latter's `.stream`, written
 by Arrow C++, carries the canonical `entries` / `key` / `value` names, its `.arrow_file` the JSON's own, and
@@ -322,8 +351,9 @@ either is accepted as the file's); `datetime`, `decimal` and (from
 the JSON's 77-digit values as i256).
 Stream and file read equal, each file batch has its JSON batch's length, and the frame this module writes back
 (plain and zstd, stream and file) reads equal, its metadata too (in the frame's shape: a run-end encoded field's
-children are its values'). `interval`, `nested_dictionary`, `union` and `lz4` are asserted `Unsupported`, lossy
-or not. The writer's bytes are anchored
+children are its values'). `interval`, `union` and `lz4` are asserted `Unsupported`, lossy
+or not. No integration golden replaces a dictionary (the integration JSON cannot express one), so replacement is
+anchored on the behaviour cited under "Dictionaries" and hand-built streams (`src/dict_test.zig`). The writer's bytes are anchored
 only through the reader (no foreign reader runs here).
 
 **Anchor grade:** class A · oracle EXTERNAL
@@ -534,10 +564,15 @@ competing libraries and cheap enough to finish in one wave; none of them is star
   golden set (all columns reversed, then each alone, equal to the full read). Was: `ReadOptions.columns` (names), decoding and decompressing only those fields' buffers,
   also through `File.readBatch`; the others are skipped by the buffer index. Why: every implementation compared
   has it for files and it is what makes a wide file affordable. Effort: ~0.5 wave.
-- **Dictionary replacement in a stream** (a second non-delta `DictionaryBatch` for an id, today `Unsupported`).
-  pyarrow writes it when the chunks of a dictionary column carry different dictionaries. Sketch: decode each
-  batch's indices against the dictionary current at that batch and merge into the one `CatColumn` dictionary the
-  reader already builds (sorted, deduplicated). Medium effort (~1 wave); the file format forbids it, so streams only.
+- ✅ 2026-11-17 **Dictionary replacement in a stream.** Done as sketched, see "Dictionaries": each batch indexes the
+  dictionary current when it was read; a categorical's categories are the union of the dictionaries its rows use
+  (pyarrow `to_pandas` unification: first appearance, sorted when unordered); a replacement in a file is
+  `Malformed` (the spec forbids it, Arrow C++ `Invalid`). Was: a second non-delta `DictionaryBatch` for an id was
+  `Unsupported`; pyarrow writes one when the chunks of a dictionary column carry different dictionaries.
+- ✅ 2026-11-17 **A dictionary inside another dictionary's values** (the `nested_dictionary` golden) — read; the
+  inner dictionary is decoded first, the outer one's values hold its categoricals (a `list` / `struct` of
+  `categorical`, which `dataframe` holds; a dictionary in a plain list or struct was already read). Was deferred as
+  needing a categorical inner column in `dataframe`, which it already had.
 
 **Deferred, with the reason**
 
@@ -545,8 +580,6 @@ competing libraries and cheap enough to finish in one wave; none of them is star
   for the writer. Not here until `dataframe` has one.
 - **Interval (YEAR_MONTH, DAY_TIME, MONTH_DAY_NANO)** — no `dataframe` column; reading as an int or a struct would
   lose the type. Needs a column kind first.
-- **A dictionary nested in a list or struct, and a dictionary inside a dictionary's values** (the
-  `nested_dictionary` golden) — needs a categorical as a list/struct inner column in `dataframe` *(inferred)*.
 - **Zero-copy and memory-mapped reads** — the reader copies into `dataframe`'s own layout (see "What is
   deliberately not done"); a second column representation is the prerequisite, revisit with a consumer whose files
   exceed memory. polars and pyarrow both offer it.

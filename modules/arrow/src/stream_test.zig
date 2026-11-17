@@ -427,8 +427,10 @@ test "reader: targeted corruptions are errors" {
         var other = dict;
         other.dict_id = 4;
         try cases.append(gpa, .{ .want = error.Malformed, .bytes = try hand(gpa, &fields, &.{other}) });
-        // A replacement (non-delta) dictionary.
-        try cases.append(gpa, .{ .want = error.Unsupported, .bytes = try hand(gpa, &fields, &.{ dict, dict }) });
+        // A delta with no dictionary to extend (a replacement is read: `dict_test.zig`).
+        var delta = dict;
+        delta.delta = true;
+        try cases.append(gpa, .{ .want = error.Malformed, .bytes = try hand(gpa, &fields, &.{delta}) });
     }
     {
         // List offsets past the child.

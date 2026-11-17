@@ -16,7 +16,8 @@
 //!
 //! Inputs are also read with one column projected (`ReadOptions.columns`) and with the
 //! key/value metadata asked for; the golden inputs for Decimal32/256, RunEndEncoded,
-//! the view types, Map and custom metadata carry a reach label each.
+//! the view types, Map, custom metadata, nested and shared dictionaries carry a reach
+//! label each, as does a stream that replaces its dictionary between two batches.
 //!
 //! Driver: `ARROW_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_MS`,
 //! `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there). Harness name: `read`.
@@ -26,6 +27,7 @@ const df = @import("dataframe");
 const testkit = @import("testkit");
 const stream = @import("stream.zig");
 const st = @import("stream_test.zig");
+const ipc = @import("ipc.zig");
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -50,11 +52,13 @@ const golden = [_][]const u8{
     @embedFile("testdata/cpp-21.0.0/generated_binary_view.stream"),
     @embedFile("testdata/cpp-21.0.0/generated_list_view.stream"),
     @embedFile("testdata/1.0.0-littleendian/generated_map.arrow_file"),
+    @embedFile("testdata/1.0.0-littleendian/generated_nested_dictionary.stream"),
+    @embedFile("testdata/4.0.0-shareddict/generated_shared_dict.arrow_file"),
 };
 
 /// Reach labels for the golden inputs that exercise one decoder each (a frame read from
 /// one, damaged or not, reached that decoder).
-const golden_label = [golden.len]?[]const u8{ null, null, null, null, null, null, null, null, null, null, null, "key/value metadata", "Decimal32", "Decimal256", "RunEndEncoded", "BinaryView/Utf8View", "ListView/LargeListView", "Map" };
+const golden_label = [golden.len]?[]const u8{ null, null, null, null, null, null, null, null, null, null, null, "key/value metadata", "Decimal32", "Decimal256", "RunEndEncoded", "BinaryView/Utf8View", "ListView/LargeListView", "Map", "nested dictionary", "shared dictionary" };
 
 fn hitSource(pick: usize) void {
     inline for (golden_label, 0..) |l, i| {
@@ -62,11 +66,12 @@ fn hitSource(pick: usize) void {
             if (pick == i) fuzz_driver.hit("frame from the " ++ name ++ " golden");
         }
     }
+    if (pick == golden.len) fuzz_driver.hit("frame from the dictionary replacement stream");
 }
 
 /// The inputs damage starts from: the golden files above and what this module writes
 /// of `sample` (built once, kept for the process).
-var corpus_buf: [golden.len + 8][]const u8 = undefined;
+var corpus_buf: [golden.len + 9][]const u8 = undefined;
 var corpus: []const []const u8 = &.{};
 
 fn buildCorpus() ![]const []const u8 {
@@ -80,6 +85,8 @@ fn buildCorpus() ![]const []const u8 {
         corpus_buf[n] = g;
         n += 1;
     }
+    corpus_buf[n] = try replacementStream(a);
+    n += 1;
     for ([_]stream.WriteOptions{
         .{},
         .{ .rows_per_batch = 2 },
@@ -92,6 +99,29 @@ fn buildCorpus() ![]const []const u8 {
     }
     corpus = corpus_buf[0..n];
     return corpus;
+}
+
+/// A stream whose dictionary is replaced between its two record batches: the schema,
+/// dictionary and batch of one written stream, then the dictionary and batch of another
+/// with the same schema and other categories.
+fn replacementStream(a: Allocator) ![]const u8 {
+    var parts: [2][]const u8 = undefined;
+    for (&parts, [_][]const ?[]const u8{ &.{ "p", "q" }, &.{ "r", "q", "s" } }) |*p, cats| {
+        const f: df.Frame = .{
+            .columns = &.{.{ .name = "c", .type = .categorical }},
+            .data = try a.dupe(df.ColumnData, &.{.{ .categorical = .{ .codes = .{ .values = &.{ 1, 0 } }, .dict = try st.textCol(a, cats) } }}),
+            .len = 2,
+        };
+        p.* = try stream.writeStream(a, f, .{});
+    }
+    var pos: usize = 0;
+    _ = try ipc.readMessage(parts[1], &pos); // the second stream's schema
+    const tail = parts[1][pos..];
+    const eos = 8;
+    const out = try a.alloc(u8, parts[0].len - eos + tail.len);
+    @memcpy(out[0 .. parts[0].len - eos], parts[0][0 .. parts[0].len - eos]);
+    @memcpy(out[parts[0].len - eos ..], tail);
+    return out;
 }
 
 /// Where the damage goes: structure first, since random offsets almost never hit the

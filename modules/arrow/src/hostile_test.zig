@@ -628,3 +628,64 @@ test "hostile map: 2^22 entries of zero-width keys and Null values from a few by
     const got2 = try streamUnderCap(cut, .{}, 4 << 20);
     try testing.expectEqual(@as(?anyerror, error.Malformed), got2.err);
 }
+
+test "hostile dictionaries: a dictionary replaced many times is charged every time (max_cells, max_rows, max_body_bytes)" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 1024 replacements of a FixedSizeBinary(0) dictionary of 2^16 entries: no body bytes,
+    // 2^26 entries kept (every generation stays readable) from ~200 KB of metadata.
+    const n = 1 << 16;
+    const reps = 1024;
+    const fields = [_]schema.Field{
+        .{ .name = "z", .type = .{ .fixed_size_binary = 0 }, .dictionary = .{ .id = 0, .index = .{ .bits = 8, .signed = true } } },
+        .{ .name = "x", .type = .{ .int = .{ .bits = 8, .signed = true } } },
+    };
+    const batches = try a.alloc(st.HandBatch, reps + 1);
+    for (batches[0..reps]) |*b| b.* = .{ .length = n, .dict_id = 0, .nodes = &.{.{ .length = n, .null_count = 0 }}, .bufs = &.{ "", "" } };
+    batches[reps] = .{ .length = 1, .nodes = &.{ .{ .length = 1, .null_count = 0 }, .{ .length = 1, .null_count = 0 } }, .bufs = &.{ "", &.{0}, "", &.{5} } };
+    const bytes = try st.hand(gpa, &fields, batches);
+    defer gpa.free(bytes);
+    // Each replacement alone fits; together they pass max_cells before anything is decoded.
+    const got = try streamUnderCap(bytes, .{ .max_cells = 1 << 24 }, 16 << 20);
+    try testing.expectEqual(@as(?anyerror, error.LimitExceeded), got.err);
+    try testing.expect(got.peak < 4 << 20);
+    // The generations are one array of 2^26 entries against max_rows.
+    try testing.expectEqual(@as(?anyerror, error.LimitExceeded), (try streamUnderCap(bytes, .{ .max_rows = 1 << 22 }, 16 << 20)).err);
+    // Not projected, the dictionary is neither charged nor decoded.
+    const xs = [_]stream.ColumnRef{.{ .name = "x" }};
+    const px = try streamUnderCap(bytes, .{ .max_cells = 1 << 24, .max_rows = 1 << 22, .columns = &xs }, 16 << 20);
+    try testing.expectEqual(@as(?anyerror, null), px.err);
+    // Four generations read.
+    const few = try st.hand(gpa, &fields, batches[reps - 4 ..]);
+    defer gpa.free(few);
+    const f = try stream.readStream(a, few, .{ .max_cells = 1 << 24 });
+    try testing.expectEqualStrings("", f.columnAt(0).get(0).text);
+
+    // A zstd-compressed dictionary of one 64 KiB text sent 64 times: a few hundred bytes
+    // each, 4 MiB inflated in all, against the read-wide max_body_bytes.
+    const big = try a.alloc(u8, 64 << 10);
+    @memset(big, 'a');
+    const cf: df.Frame = .{
+        .columns = &.{.{ .name = "c", .type = .categorical }},
+        .data = try a.dupe(df.ColumnData, &.{.{ .categorical = .{ .codes = .{ .values = &.{0} }, .dict = try st.textCol(a, &.{big}) } }}),
+        .len = 1,
+    };
+    const once = try stream.writeStream(gpa, cf, .{ .compression = .zstd });
+    defer gpa.free(once);
+    var pos: usize = 0;
+    _ = try ipc.readMessage(once, &pos);
+    const dict_at = pos;
+    const dm = try ipc.readMessage(once, &pos);
+    try testing.expectEqual(schema.HeaderType.dictionary_batch, dm.msg.header_type);
+    const batch_at = pos;
+    try testing.expect(batch_at - dict_at < 1 << 10);
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(gpa);
+    try many.appendSlice(gpa, once[0..dict_at]);
+    for (0..64) |_| try many.appendSlice(gpa, once[dict_at..batch_at]);
+    try many.appendSlice(gpa, once[batch_at..]);
+    try testing.expectEqual(@as(?anyerror, error.LimitExceeded), (try streamUnderCap(many.items, .{ .max_body_bytes = 1 << 20 }, 16 << 20)).err);
+    try st.expectSameFrame(cf, try stream.readStream(a, many.items, .{ .max_body_bytes = 8 << 20 }));
+}

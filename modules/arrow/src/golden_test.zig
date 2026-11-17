@@ -26,6 +26,7 @@ const J = std.json.Value;
 const v1 = "testdata/1.0.0-littleendian/generated_";
 const v2 = "testdata/2.0.0-compression/generated_";
 const c21 = "testdata/cpp-21.0.0/generated_";
+const v4 = "testdata/4.0.0-shareddict/generated_";
 
 const Want = enum {
     /// Reads with the default options; every cell matches the JSON.
@@ -89,13 +90,17 @@ const sets = [_]Set{
     // key and value fields otherwise (kept as the file names them).
     set(v1, "map", true, .exact),
     set(v1, "map_non_canonical", true, .exact),
+    // A list dictionary whose items are dictionary-encoded, a struct dictionary whose two
+    // fields share one: plain list / struct columns of categoricals.
+    set(v1, "nested_dictionary", true, .exact),
+    // Two columns sharing one dictionary.
+    set(v4, "shared_dict", true, .exact),
 };
 
 /// Sets with a type `dataframe` has no column for (or a codec the collection lacks):
 /// only their `.stream` is committed.
 const refused = [_]struct { []const u8, []const u8 }{
     .{ "interval", @embedFile(v1 ++ "interval.stream") },
-    .{ "nested_dictionary", @embedFile(v1 ++ "nested_dictionary.stream") },
     .{ "union", @embedFile(v1 ++ "union.stream") },
     .{ "lz4", @embedFile(v2 ++ "lz4.stream") },
 };
