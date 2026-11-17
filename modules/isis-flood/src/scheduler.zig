@@ -483,7 +483,7 @@ pub const Scheduler = struct {
         // it is a contract of a DIFFERENT module. Check it here rather than
         // trust it: the failure mode is an over-claimed CSNP range, which the
         // peer answers by flooding back every LSP we did not list.
-        for (1..m) |k| std.debug.assert(std.mem.lessThan(u8, &entries[k - 1].lsp_id, &entries[k].lsp_id));
+        for (1..@max(m, 1)) |k| std.debug.assert(std.mem.lessThan(u8, &entries[k - 1].lsp_id, &entries[k].lsp_id)); // @max: `1..0` panics when m == 0
         if (m > max_summary_entries) {
             // Over-full. The smallest `max_summary_entries` ids are exactly
             // what came back first, so `[start, entries[255].lsp_id]` is
@@ -1507,4 +1507,320 @@ test "fail-open guard: lsp_entries_per_pdu == 0 does not underflow emitCsnp's en
     var scratch: [1024]u8 = undefined;
     const r0 = sched.poll(0, oneUp(0), &db, &out, &scratch);
     try testing.expect(countKind(r0.effects, .csnp) >= 1); // the periodic CSNP still fired
+}
+
+// ── whole-module mutation audit 2026-11-17 ───────────────────────────────────
+
+/// All LSP-Entries of a decoded CSNP or PSNP payload, in wire order.
+fn entriesOf(tlv_bytes: []const u8, out: []LspEntry) !usize {
+    const tlv = (try isis.tlv.findFirst(tlv_bytes, isis.tlvs.code.lsp_entries)) orelse return 0;
+    var it = isis.tlvs.LspEntryIterator.init(tlv);
+    var n: usize = 0;
+    while (try it.next()) |e| : (n += 1) out[n] = e;
+    return n;
+}
+
+test "last-sent pruning never resurrects a stale victim: a re-armed LSP stays paced" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .min_lsp_transmission_interval = 5, .complete_snp_interval = 1000 });
+    defer sched.deinit();
+    var lbuf: [128]u8 = undefined;
+    const id = idOf(sys_other, 0);
+    try arrivalDb(&db, buildLsp(&lbuf, sys_other, 0, 1, 1000), id);
+    const up = oneUp(0);
+    var out: [16]Effect = undefined;
+    var scratch: [512]u8 = undefined;
+
+    try testing.expectEqual(@as(usize, 1), countKind(sched.poll(0, up, &db, &out, &scratch).effects, .lsp));
+    db.clearSrm(id, 0); // acked
+    _ = sched.poll(1, up, &db, &out, &scratch); // prunes the record
+    // a newer version arrives: SRM is armed again
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 2, 1000), arrival, 1);
+    try testing.expectEqual(@as(usize, 1), countKind(sched.poll(2, up, &db, &out, &scratch).effects, .lsp));
+    // paced again: nothing at 3, and the record of the send at 2 was not pruned away
+    try testing.expectEqual(@as(usize, 0), countKind(sched.poll(3, up, &db, &out, &scratch).effects, .lsp));
+    try testing.expectEqual(@as(usize, 1), sched.last_sent.count());
+}
+
+test "a circuit that goes Down loses its own pacing records and no other circuit's" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 3, .capacity = 8 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .min_lsp_transmission_interval = 5, .complete_snp_interval = 1000 });
+    defer sched.deinit();
+    var lbuf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), 2, 0); // SRM on circuits 0 and 1
+    var up01 = oneUp(0);
+    up01.set(1);
+    var out: [16]Effect = undefined;
+    var scratch: [1024]u8 = undefined;
+
+    try testing.expectEqual(@as(usize, 2), countKind(sched.poll(0, up01, &db, &out, &scratch).effects, .lsp));
+    // circuit 0 goes Down, circuit 1 stays Up (still paced)
+    try testing.expectEqual(@as(usize, 0), countKind(sched.poll(1, oneUp(1), &db, &out, &scratch).effects, .lsp));
+    // circuit 0 comes back: a new adjacency, flooded at once; circuit 1 is still paced
+    const r = sched.poll(2, up01, &db, &out, &scratch);
+    try testing.expectEqual(@as(usize, 1), countKind(r.effects, .lsp));
+    for (r.effects) |e| if (e.kind == .lsp) try testing.expectEqual(@as(u8, 0), e.iface);
+}
+
+test "the per-circuit burst cap sends exactly that many LSPs, reports truncated and asks to be polled again at once" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .max_lsps_per_iface_per_poll = 2 });
+    defer sched.deinit();
+    var lbuf: [128]u8 = undefined;
+    for (0..3) |n| _ = try db.insert(buildLsp(&lbuf, sys_other, @intCast(n), 1, 1000), arrival, 0);
+    var out: [16]Effect = undefined;
+    var scratch: [1024]u8 = undefined;
+    const r = sched.poll(3, oneUp(0), &db, &out, &scratch);
+    try testing.expectEqual(@as(usize, 2), countKind(r.effects, .lsp));
+    try testing.expect(r.truncated);
+    try testing.expectEqual(@as(?Time, 3), r.next_wakeup);
+}
+
+test "pacing is measured from the real send time, and the wakeup names the retransmit" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .min_lsp_transmission_interval = 5, .complete_snp_interval = 1000 });
+    defer sched.deinit();
+    var lbuf: [128]u8 = undefined;
+    try arrivalDb(&db, buildLsp(&lbuf, sys_other, 0, 1, 1000), idOf(sys_other, 0));
+    const up = oneUp(0);
+    var out: [16]Effect = undefined;
+    var scratch: [512]u8 = undefined;
+
+    try testing.expectEqual(@as(usize, 1), countKind(sched.poll(100, up, &db, &out, &scratch).effects, .lsp));
+    const r1 = sched.poll(101, up, &db, &out, &scratch);
+    try testing.expectEqual(@as(usize, 0), countKind(r1.effects, .lsp));
+    try testing.expectEqual(@as(?Time, 105), r1.next_wakeup); // last send + interval, not the CSNP cadence
+    try testing.expectEqual(@as(usize, 0), countKind(sched.poll(104, up, &db, &out, &scratch).effects, .lsp));
+    try testing.expectEqual(@as(usize, 1), countKind(sched.poll(105, up, &db, &out, &scratch).effects, .lsp));
+}
+
+test "an unfinished CSNP series asks to be polled again NOW, not at its stale cadence time" {
+    // three windows: the second poll is still mid-series
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 1024 });
+    defer db.deinit();
+    var lbuf: [128]u8 = undefined;
+    for (0..600) |k| _ = try db.insert(buildLspId(&lbuf, idNth(sys_other, @intCast(k)), 1, 1000), 0, 0);
+    for (0..600) |k| db.clearSsn(idNth(sys_other, @intCast(k)), 0);
+    var sched = Scheduler.init(testing.allocator, testCfg());
+    defer sched.deinit();
+    var out: [64]Effect = undefined;
+    var scratch: [16 * 1024]u8 = undefined;
+    const r0 = sched.poll(100, oneUp(0), &db, &out, &scratch);
+    try testing.expect(r0.truncated);
+    // the cadence timer is still the 100 it was primed with: a later poll must not echo it
+    const r1 = sched.poll(107, oneUp(0), &db, &out, &scratch);
+    try testing.expect(r1.truncated);
+    try testing.expectEqual(@as(?Time, 107), r1.next_wakeup);
+}
+
+test "a PSNP that cannot get an effect slot is reported truncated even when no CSNP is due" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .complete_snp_interval = 1000 });
+    defer sched.deinit();
+    var lbuf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), arrival, 0);
+    var out: [16]Effect = undefined;
+    var scratch: [1024]u8 = undefined;
+    _ = sched.poll(0, oneUp(arrival), &db, &out, &scratch); // PSNP + the initial CSNP; the next CSNP is at 1000
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 1, 1, 1000), arrival, 1); // a new ack is due
+    const r = sched.poll(1, oneUp(arrival), &db, out[0..0], &scratch);
+    try testing.expectEqual(@as(usize, 0), r.effects.len);
+    try testing.expect(r.truncated);
+    try testing.expectEqual(@as(?Time, 1), r.next_wakeup);
+    try testing.expect(db.ssnSet(idOf(sys_other, 1)).?.isSet(arrival)); // still owed
+}
+
+test "a PSNP that cannot get scratch space ends the pass: nothing else is served, truncated is reported" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 3, .capacity = 8 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .complete_snp_interval = 1000 });
+    defer sched.deinit();
+    var lbuf: [128]u8 = undefined;
+    var up01 = oneUp(0);
+    up01.set(1);
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), 0, 0); // SSN on 0, SRM on 1 and 2
+    var out: [16]Effect = undefined;
+    var scratch: [1024]u8 = undefined;
+    _ = sched.poll(0, up01, &db, &out, &scratch); // PSNP, LSP, and the initial CSNPs (next at 1000)
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 1, 1, 1000), 0, 1); // SSN on 0 again, SRM on 1 again
+    var tiny: [8]u8 = undefined;
+    const r = sched.poll(1, up01, &db, &out, &tiny);
+    try testing.expectEqual(@as(usize, 0), r.effects.len); // circuit 1 is not served after the failure
+    try testing.expect(r.truncated);
+}
+
+test "a CSNP that cannot get scratch space ends the pass: later circuits are not served, truncated is reported" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 3, .capacity = 8 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, testCfg());
+    defer sched.deinit();
+    var lbuf: [128]u8 = undefined;
+    var up01 = oneUp(0);
+    up01.set(1);
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), 2, 0); // SRM on circuits 0 and 1
+    var out: [16]Effect = undefined;
+    var tiny: [8]u8 = undefined;
+    const r = sched.poll(0, up01, &db, &out, &tiny);
+    // circuit 0 floods its LSP, then its CSNP finds no scratch room and the pass ends
+    try testing.expectEqual(@as(usize, 1), r.effects.len);
+    try testing.expectEqual(@as(u8, 0), r.effects[0].iface);
+    try testing.expectEqual(PduKind.lsp, r.effects[0].kind);
+    try testing.expect(r.truncated);
+}
+
+test "several PSNPs keep their own bytes and list the acknowledged LSPs in ascending LSP-ID order" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 16 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 2 });
+    defer sched.deinit();
+    var lbuf: [128]u8 = undefined;
+    var n: u8 = 5;
+    while (n > 0) { // inserted in DESCENDING order, so the SSN queue is too
+        n -= 1;
+        _ = try db.insert(buildLsp(&lbuf, sys_other, n, 1, 1000), 0, 0);
+    }
+    var out: [16]Effect = undefined;
+    var scratch: [4096]u8 = undefined;
+    const r = sched.poll(0, oneUp(0), &db, &out, &scratch);
+    try testing.expectEqual(@as(usize, 3), countKind(r.effects, .psnp));
+    var seen: [5]u8 = undefined;
+    var k: usize = 0;
+    var ents: [16]LspEntry = undefined;
+    for (r.effects) |e| {
+        if (e.kind != .psnp) continue;
+        const cnt = try entriesOf((try isis.Psnp.decode(e.bytes)).tlv_bytes, &ents);
+        try testing.expect(cnt <= 2);
+        for (ents[0..cnt]) |en| {
+            seen[k] = en.lsp_id[7];
+            k += 1;
+        }
+    }
+    try testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4 }, seen[0..k]);
+}
+
+test "SNP entries carry the Remaining Lifetime aged to the poll time" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, testCfg());
+    defer sched.deinit();
+    var lbuf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), arrival, 0);
+    var out: [16]Effect = undefined;
+    var scratch: [1024]u8 = undefined;
+    const r = sched.poll(100, oneUp(arrival), &db, &out, &scratch);
+    var ents: [4]LspEntry = undefined;
+    var psnps: usize = 0;
+    var csnps: usize = 0;
+    for (r.effects) |e| switch (e.kind) {
+        .psnp => {
+            const cnt = try entriesOf((try isis.Psnp.decode(e.bytes)).tlv_bytes, &ents);
+            try testing.expectEqual(@as(usize, 1), cnt);
+            try testing.expectEqual(@as(u16, 900), ents[0].remaining_lifetime);
+            psnps += 1;
+        },
+        .csnp => {
+            const cnt = try entriesOf((try isis.Csnp.decode(e.bytes)).tlv_bytes, &ents);
+            try testing.expectEqual(@as(usize, 1), cnt);
+            try testing.expectEqual(@as(u16, 900), ents[0].remaining_lifetime);
+            csnps += 1;
+        },
+        .lsp => {},
+    };
+    try testing.expectEqual(@as(usize, 1), psnps);
+    try testing.expectEqual(@as(usize, 1), csnps);
+}
+
+test "a window of exactly max_summary_entries is summarised complete; one more is cut at the 256th id" {
+    var out: [64]Effect = undefined;
+    var scratch: [16 * 1024]u8 = undefined;
+    var ents: [16]LspEntry = undefined;
+    for ([_]u16{ max_summary_entries, max_summary_entries + 44 }) |total| {
+        var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 512 });
+        defer db.deinit();
+        var lbuf: [128]u8 = undefined;
+        for (0..total) |k| _ = try db.insert(buildLspId(&lbuf, idNth(sys_other, @intCast(k)), 1, 1000), 0, 0);
+        for (0..total) |k| db.clearSsn(idNth(sys_other, @intCast(k)), 0);
+        var sched = Scheduler.init(testing.allocator, testCfg());
+        defer sched.deinit();
+        const r = sched.poll(0, oneUp(0), &db, &out, &scratch);
+        var listed: usize = 0;
+        var last_end: LspId = snp.min_lsp_id;
+        for (r.effects) |e| {
+            if (e.kind != .csnp) continue;
+            const cs = try isis.Csnp.decode(e.bytes);
+            listed += try entriesOf(cs.tlv_bytes, &ents);
+            last_end = cs.end_lsp_id;
+        }
+        try testing.expectEqual(@as(usize, max_summary_entries), listed);
+        if (total == max_summary_entries) {
+            try testing.expect(!r.truncated);
+            try testing.expectEqual(snp.max_lsp_id, last_end);
+            try testing.expectEqual(snp.min_lsp_id, sched.csnp_cursor[0]);
+        } else {
+            try testing.expect(r.truncated);
+            try testing.expectEqual(idNth(sys_other, max_summary_entries - 1), last_end);
+        }
+    }
+}
+
+test "an empty database still emits one CSNP covering the whole ID space" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, testCfg());
+    defer sched.deinit();
+    var out: [4]Effect = undefined;
+    var scratch: [256]u8 = undefined;
+    const r = sched.poll(0, oneUp(0), &db, &out, &scratch);
+    try testing.expectEqual(@as(usize, 1), r.effects.len);
+    try testing.expectEqual(PduKind.csnp, r.effects[0].kind);
+    const cs = try isis.Csnp.decode(r.effects[0].bytes);
+    try testing.expectEqual(snp.min_lsp_id, cs.start_lsp_id);
+    try testing.expectEqual(snp.max_lsp_id, cs.end_lsp_id);
+    try testing.expectEqual(@as(?[]const u8, null), try isis.tlv.findFirst(cs.tlv_bytes, isis.tlvs.code.lsp_entries));
+    try testing.expect(!r.truncated);
+}
+
+test "a CSNP that found no effect slot is retried on the next poll, not deferred a whole interval" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, testCfg());
+    defer sched.deinit();
+    var lbuf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), 0, 0);
+    db.clearSsn(idOf(sys_other, 0), 0);
+    var out: [4]Effect = undefined;
+    var scratch: [512]u8 = undefined;
+    const r0 = sched.poll(0, oneUp(0), &db, out[0..0], &scratch);
+    try testing.expectEqual(@as(usize, 0), r0.effects.len);
+    try testing.expect(r0.truncated);
+    const r1 = sched.poll(0, oneUp(0), &db, &out, &scratch);
+    try testing.expectEqual(@as(usize, 1), countKind(r1.effects, .csnp));
+}
+
+test "a finished CSNP series starts the next cycle from the bottom of the ID space" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 512 });
+    defer db.deinit();
+    try fillHostileDb(&db, 0);
+    for (0..hostile_lsp_count) |k| db.clearSsn(idNth(sys_other, @intCast(k)), 0);
+    var sched = Scheduler.init(testing.allocator, testCfg());
+    defer sched.deinit();
+    var out: [64]Effect = undefined;
+    var scratch: [16 * 1024]u8 = undefined;
+    var polls: usize = 0;
+    while (polls < 8) : (polls += 1) {
+        if (!sched.poll(0, oneUp(0), &db, &out, &scratch).truncated) break;
+    }
+    try testing.expect(polls < 8);
+    try testing.expectEqual(snp.min_lsp_id, sched.csnp_cursor[0]);
+    const r = sched.poll(10, oneUp(0), &db, &out, &scratch);
+    for (r.effects) |e| {
+        if (e.kind != .csnp) continue;
+        try testing.expectEqual(snp.min_lsp_id, (try isis.Csnp.decode(e.bytes)).start_lsp_id);
+        break;
+    }
 }

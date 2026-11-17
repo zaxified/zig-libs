@@ -190,3 +190,37 @@ test "a too-small scratch is a typed BufferTooSmall, never a panic" {
     var tiny: [8]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, buildPsnp(&tiny, @splat(0), false, &.{}));
 }
+
+// ── whole-module mutation audit 2026-11-17 ───────────────────────────────────
+
+test "successor carries into the top octet and treats 0xFE as an ordinary value" {
+    try testing.expectEqual(LspId{ 1, 0, 0, 0, 0, 0, 0, 0 }, successor(.{ 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }));
+    try testing.expectEqual(LspId{ 0, 0, 0, 0, 0, 0, 0, 0xFF }, successor(.{ 0, 0, 0, 0, 0, 0, 0, 0xFE }));
+    try testing.expectEqual(LspId{ 0, 0, 0, 0, 0, 0, 0, 0xFE }, successor(.{ 0, 0, 0, 0, 0, 0, 0, 0xFD }));
+}
+
+test "midpoint does not depend on the operand order" {
+    try testing.expectEqual(midpoint(min_lsp_id, max_lsp_id), midpoint(max_lsp_id, min_lsp_id));
+    const a: LspId = .{ 0, 0, 0, 0, 0, 0, 0, 4 };
+    const b: LspId = .{ 0, 0, 0, 0, 0, 0, 0, 5 };
+    try testing.expectEqual(a, midpoint(b, a));
+    const c: LspId = .{ 0, 0, 0, 0, 0, 0, 0, 10 };
+    try testing.expectEqual(LspId{ 0, 0, 0, 0, 0, 0, 0, 7 }, midpoint(a, c));
+}
+
+test "buildPsnp / buildCsnp: ValueTooLong above 15 entries, BufferTooSmall for every shorter scratch" {
+    var entries: [16]LspEntry = undefined;
+    for (&entries, 0..) |*e, i| e.* = .{ .remaining_lifetime = 1, .lsp_id = .{ 0, 0, 0, 0, 0, 1, 0, @intCast(i) }, .sequence_number = 1, .checksum = 0 };
+    var buf: [512]u8 = undefined;
+    const sid: [7]u8 = @splat(0);
+    try testing.expectError(error.ValueTooLong, buildPsnp(&buf, sid, false, &entries));
+    try testing.expectError(error.ValueTooLong, buildCsnp(&buf, sid, false, min_lsp_id, max_lsp_id, &entries));
+    // 15 is the ceiling and fits
+    _ = try buildPsnp(&buf, sid, false, entries[0..15]);
+
+    const one = entries[0..1];
+    const psnp_len = (try buildPsnp(&buf, sid, false, one)).len;
+    for (0..psnp_len) |n| try testing.expectError(error.BufferTooSmall, buildPsnp(buf[0..n], sid, false, one));
+    const csnp_len = (try buildCsnp(&buf, sid, false, min_lsp_id, max_lsp_id, one)).len;
+    for (0..csnp_len) |n| try testing.expectError(error.BufferTooSmall, buildCsnp(buf[0..n], sid, false, min_lsp_id, max_lsp_id, one));
+}

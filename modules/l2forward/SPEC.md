@@ -6,7 +6,13 @@
 
 **Scope:** mvp — Linux bridge FDB / EVPN PE behaviour; no FDB events (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-09-03 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (111/115, 4 eq) · src 9e71de955ebb91e7
+
+**Audit 2026-11-17 (whole-module mutation).** 115 mutants over every non-test line of `src/root.zig` (the BUM / zero-address predicates, `learn` and its outcome and statistics bookkeeping, the move window and quarantine arithmetic, `learnStatic`, `forget`, `lookup`, `forward` and `replicationSet`, ageing and `tick`, the FDB iterator, the I-SID and member caps, the futile-prune throttle, `removeMember` / `removeIsid`), one schemata build per round, baseline first. Round 1: 102 killed, 13 survived. 5 tests were added: the address predicates read every octet, `max_mac_moves = 0` quarantines on the first move (as documented), an allocator failure inside `learn` is returned and counted, `forget` on an unknown I-SID is false and `learnStatic` over an existing MAC at the FDB cap overwrites instead of failing with `FdbFull`, and a move at a clock earlier than the window start stays inside the window without underflow. Round 2 killed 9 of the 13 (one of the 13 had been a harness defect: a comptime `lessThan` argument cannot take the runtime switch, so it was re-mutated at statement level and killed by the existing ordering test). 4 survive, all EQUIVALENT:
+- the three clamp boundaries `now >= learned_at` / `now < learned_at` / `now >= move_window_start` -> `>` / `<=` / `>` in `isExpired`, the iterator's `age` and `sinceWindowStart` (at equality both arms yield 0);
+- `last_futile_prune` recorded after a productive sweep (`else null` -> `else now`): a productive sweep removed every expired entry, so a second sweep in the same tick would be futile anyway; only the diagnostic `prune_sweeps` differs (cost-only).
+
+Not mutated: the `Options` field defaults (comptime constants cannot take a runtime switch; the two RFC 7432 defaults are pinned by a test), the `fuzz_test.zig` harness. Counts on the card are whole-module.
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, L2FORWARD_FUZZ) · ct n/a — L2 forwarding (keyword review, 2026-10-07)
 

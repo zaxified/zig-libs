@@ -6,7 +6,17 @@
 
 **Scope:** mvp — FRR isisd SPF (10.7, `isis_spf.c` behaviour) and holo-isis `spf.rs` (v0.9.0), ISO 10589 §7.2 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-09-03 · src ?
+**Audit:** review 2026-09-03 · mutation 2026-11-17 (78/92, 14 eq) · src c94c2dc375fab924
+
+**Audit 2026-11-17 (whole-module mutation).** 92 mutants over every non-test line of `src/root.zig` (`RouteTable.lookup`'s binary search, `compute` / `computeWith` option plumbing, LSDB walk and the lifetime / purge / pseudonode filters, #22 and #2 reachability extraction incl. the max-link-metric exclusion and the 6-bit default-metric mask, the two-way check and asymmetry counting, LAN transit (`addToPseudonode`, `collectPseudonodeMembers`, `pnKey`, `addLanArcs`), `addDirected`, node interning, graph build, route table and `firstHop`), one schemata build per round, baseline first. Round 1: 62 killed + 3 hung, 27 survived. 7 tests were added: LAN transit over #2 (old-style) TLVs with the metric octet's flag bits set, the default-metric mask at bit 7 (0x40) and the value bit 0x20, a metric of 0 clamped to 1 on a point-to-point link and on a LAN, a pseudonode LSP that lists a pseudonode id (via #22 and via #2) not admitting that system, a member listed only by another pseudonode and two LANs sharing a member not merging, a cheaper point-to-point link beating a dearer LAN arc and the cheaper of two advertisements of a pseudonode winning, and the asymmetric-link count surviving an empty table. Round 2 killed 13 of the 27; 14 do not die, 12 EQUIVALENT and 2 UNOBSERVABLE:
+- the lifetime filter's `ev.is_request`, `ev.bytes.len == 0` and `ev.is_purge` terms are each redundant with `remaining_lifetime == 0` (the lsdb view reports lifetime 0 for a request placeholder and a purge, and an empty PDU does not decode);
+- an asymmetric pair counted at the higher id instead of the lower (same count, same reject error);
+- skipping either endpoint's `id_set.put` (every admitted arc has its reverse arc, so the other endpoint interns the id);
+- `<=` for `<` in the three keep-the-cheaper comparisons and `!= .gt` for `== .lt` in `lessSystemId` (equal weights, distinct ids);
+- a LAN member joined to itself and a self-advertisement kept (both become a self-arc that `spf.Graph.addArc` refuses);
+- UNOBSERVABLE: the first-value store of `addToPseudonode` and `addDirected` (`!found_existing`): the value slot of a new key is poisoned with 0xAA in safe builds and so compares greater than any weight; it would need a ReleaseFast build over zeroed memory.
+
+Not mutated: `Options` and `max_link_metric` constants (comptime), the `computeWithBrokenTwoWayForTesting` plumbing beyond its one switch, the `fuzz_test.zig` harness. Counts on the card are whole-module.
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ISIS_SPF_FUZZ) · ct n/a — SPF computation (keyword review, 2026-10-07)
 
