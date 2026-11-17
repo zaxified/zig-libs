@@ -203,8 +203,8 @@ const rules = [_]validate.Rule{
 
 "Present" is key presence (an explicit `null` is present). A comparison runs on a present, non-null field
 that passed its own type gate; a missing sibling fails `eq` and the orderings, and passes `ne`. For a typed
-body put them in `T.validate_rules` (the derived rules carry none). `validateQuery` / `validateParams` ignore
-them. `writeJsonSchema` exports `required_with` as `dependentRequired` and the other presence ops as `allOf`
+body put them in `T.validate_rules` (the derived rules carry none). `validateQuery` / `validateParams` run them
+over the coerced values (a sibling that is no rule of the schema is coerced as the rule's kind). `writeJsonSchema` exports `required_with` as `dependentRequired` and the other presence ops as `allOf`
 items; the comparison ops have no 2020-12 form.
 
 ## Array roots

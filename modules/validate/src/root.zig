@@ -529,7 +529,7 @@ pub const Rule = struct {
     /// when the object is complete, on the tree and the streaming path
     /// alike. Empty = none, and a rule without them behaves exactly as it
     /// did before this field existed. Ignored on `items` element rules
-    /// (an element has no sibling), by `validateQuery`/`validateParams`, and
+    /// (an element has no sibling), by `parseQueryLeaky`'s `validate_rules`, and
     /// in the schema `rulesFor` derives (put them in `T.validate_rules`).
     cross: []const Cross = &.{},
 };
@@ -2811,8 +2811,99 @@ fn isMac(s: []const u8) bool {
 pub fn validateQuery(gpa: Allocator, query: []const u8, schema: []const Rule) Allocator.Error!Report {
     var b = Builder.init(gpa);
     errdefer b.abort();
-    for (schema) |*rule| try checkQueryValue(&b, rule, try findQueryParam(b.a(), query, rule.field));
+    const slots = try crossSlotsFor(&b, schema, QuerySource{ .query = query, .a = b.a() });
+    for (schema, 0..) |*rule, i| {
+        try checkQueryValue(&b, rule, try findQueryParam(b.a(), query, rule.field));
+        try checkParamCross(&b, rule, slots, i);
+    }
     return b.finish();
+}
+
+/// Where `crossSlotsFor` reads a parameter's raw text from.
+const QuerySource = struct {
+    query: []const u8,
+    a: Allocator,
+    fn raw(src: QuerySource, name: []const u8) Allocator.Error!?[]const u8 {
+        return findQueryParam(src.a, src.query, name);
+    }
+};
+
+const ParamsSource = struct {
+    params: *const anyopaque,
+    getFn: *const fn (*const anyopaque, []const u8) ?[]const u8,
+    fn raw(src: ParamsSource, name: []const u8) Allocator.Error!?[]const u8 {
+        return src.getFn(src.params, name);
+    }
+};
+
+/// The coerced values `Rule.cross` looks at on a query or path-param
+/// request: one slot per rule (in schema order), then one per sibling named
+/// only by a `cross` entry (coerced as the kind of the rule that names it).
+const CrossSlots = struct {
+    names: []const []const u8,
+    slots: []const CrossSlot,
+
+    /// `lookup` for `checkCross`: absent when the parameter is not sent.
+    fn get(c: CrossSlots, name: []const u8) CrossSlot {
+        for (c.names, c.slots) |n, sl| if (std.mem.eql(u8, n, name)) return sl;
+        return .absent;
+    }
+};
+
+/// A parameter's raw text as the cross-field rules see it, coerced as the
+/// rule's kind does. Not sent: `.absent`. Sent but not coercible (or a
+/// kind a query cannot spell): `.container` -- present, never comparable
+/// (its own error is reported by the ordinary check).
+fn paramSlot(a: Allocator, raw: ?[]const u8, kind: Kind) Allocator.Error!CrossSlot {
+    const s = raw orelse return .absent;
+    const v: Value = switch (kind) {
+        .string, .any => if (std.unicode.utf8ValidateSlice(s)) .{ .string = s } else return .container,
+        .int => (try coerceInt(a, s)) orelse return .container,
+        .float => .{ .float = coerceFloat(s) orelse return .container },
+        .bool => .{ .bool = parseBool(s) orelse return .container },
+        .array, .object => return .container,
+    };
+    return .{ .scalar = v };
+}
+
+/// Slots for every parameter a cross entry can touch; empty (no work) when
+/// no rule has a `cross` entry. `src.raw(name)` reads one raw value.
+fn crossSlotsFor(b: *Builder, schema: []const Rule, src: anytype) Allocator.Error!CrossSlots {
+    var cap: usize = 0;
+    for (schema) |r| if (r.cross.len != 0) {
+        cap = schema.len;
+        for (schema) |r2| cap += r2.cross.len;
+        break;
+    };
+    if (cap == 0) return .{ .names = &.{}, .slots = &.{} };
+    const names = try b.a().alloc([]const u8, cap);
+    const slots = try b.a().alloc(CrossSlot, cap);
+    for (schema, 0..) |r, i| {
+        names[i] = r.field;
+        slots[i] = try paramSlot(b.a(), try src.raw(r.field), r.kind);
+    }
+    var n = schema.len;
+    for (schema) |r| for (r.cross) |c| {
+        const known = for (names[0..n]) |x| {
+            if (std.mem.eql(u8, x, c.other)) break true;
+        } else false;
+        if (known) continue;
+        names[n] = c.other;
+        slots[n] = try paramSlot(b.a(), try src.raw(c.other), r.kind);
+        n += 1;
+    };
+    return .{ .names = names[0..n], .slots = slots[0..n] };
+}
+
+/// Run `rule.cross` of schema rule `i` over the coerced parameters. A value
+/// that failed its own coercion (`.container`) gets no comparison noise.
+fn checkParamCross(b: *Builder, rule: *const Rule, slots: CrossSlots, i: usize) Allocator.Error!void {
+    if (rule.cross.len == 0) return;
+    const self = slots.slots[i];
+    if (self == .container) return;
+    const mark = b.list.items.len;
+    try checkCross(b, rule.field, rule, self, slots);
+    overrideSince(b, mark, rule, rule.field);
 }
 
 /// One query value (decoded, or null when absent) against its rule.
@@ -2836,12 +2927,21 @@ pub fn validateParams(gpa: Allocator, params: anytype, schema: []const Rule) All
     comptime assertLookup(@TypeOf(params));
     var b = Builder.init(gpa);
     errdefer b.abort();
-    for (schema) |*rule| {
+    const P = @TypeOf(params);
+    const Adapter = struct {
+        fn get(p: *const anyopaque, name: []const u8) ?[]const u8 {
+            const typed: *const P = @ptrCast(@alignCast(p));
+            return typed.*.get(name);
+        }
+    };
+    const slots = try crossSlotsFor(&b, schema, ParamsSource{ .params = @ptrCast(&params), .getFn = Adapter.get });
+    for (schema, 0..) |*rule, i| {
         if (params.get(rule.field)) |raw| {
             try checkCoerced(&b, rule.field, raw, rule);
         } else if (rule.required) {
             try appendMissing(&b, rule.field, rule);
         }
+        try checkParamCross(&b, rule, slots, i);
     }
     return b.finish();
 }
@@ -7214,6 +7314,176 @@ test "params: validateParams over a lookup that is not router.Params" {
         try testing.expectEqual(@as(usize, 2), r.errors.len);
         try expectError(&r, "id", "int_parsing");
         try expectError(&r, "absent", "missing");
+    }
+}
+
+test "query: Rule.cross runs on the coerced values (eq, ne, orderings, presence ops)" {
+    const schema = [_]Rule{
+        .{ .field = "min", .kind = .int },
+        .{ .field = "max", .kind = .int, .cross = &.{.{ .op = .gte_field, .other = "min" }} },
+        .{ .field = "pw", .kind = .string },
+        .{ .field = "pw2", .kind = .string, .cross = &.{.{ .op = .eq_field, .other = "pw" }} },
+        .{ .field = "a", .kind = .string, .cross = &.{.{ .op = .ne_field, .other = "pw" }} },
+        .{ .field = "mode", .kind = .string },
+        .{ .field = "key", .kind = .string, .cross = &.{.{ .op = .required_if, .other = "mode", .value = "secure" }} },
+        .{ .field = "plain", .kind = .string, .cross = &.{ .{ .op = .required_with, .other = "extra" }, .{ .op = .required_without, .other = "mode" } } },
+    };
+    var ok = try validateQuery(testing.allocator, "min=2&max=10&pw=x&pw2=x&a=y&mode=open&plain=1", &schema);
+    defer ok.deinit();
+    try testing.expect(ok.ok());
+
+    // Numbers compare as numbers, not text: "9" vs "10".
+    var num = try validateQuery(testing.allocator, "min=9&max=10&plain=1&mode=m", &schema);
+    defer num.deinit();
+    try testing.expect(num.ok());
+    var low = try validateQuery(testing.allocator, "min=10&max=9&plain=1&mode=m", &schema);
+    defer low.deinit();
+    try testing.expectEqual(@as(usize, 1), low.errors.len);
+    try expectError(&low, "max", "greater_than_equal_field");
+    try testing.expectEqualStrings("min", low.errors[0].param);
+
+    // eq: a mismatch and a missing sibling fail; ne: equal fails, missing passes.
+    var bad = try validateQuery(testing.allocator, "pw=x&pw2=z&a=x&mode=m&plain=1", &schema);
+    defer bad.deinit();
+    try expectError(&bad, "pw2", "field_mismatch");
+    try expectError(&bad, "a", "field_equal");
+    try testing.expectEqual(@as(usize, 2), bad.errors.len);
+    var gone = try validateQuery(testing.allocator, "pw2=z&a=q&mode=m&plain=1", &schema);
+    defer gone.deinit();
+    try expectError(&gone, "pw2", "field_mismatch");
+    try testing.expectEqual(@as(usize, 1), gone.errors.len);
+
+    // Presence ops: required_if, required_without.
+    var pres = try validateQuery(testing.allocator, "mode=secure", &schema);
+    defer pres.deinit();
+    try expectError(&pres, "key", "missing");
+    try testing.expectEqual(@as(usize, 1), pres.errors.len); // plain: `extra` absent, `mode` present -> not required
+    var nomode = try validateQuery(testing.allocator, "", &schema);
+    defer nomode.deinit();
+    try expectError(&nomode, "plain", "missing"); // required_without: `mode` is absent
+    try testing.expectEqual(@as(usize, 1), nomode.errors.len);
+    var with = try validateQuery(testing.allocator, "mode=open&extra=1", &schema);
+    defer with.deinit();
+    try expectError(&with, "plain", "missing"); // required_with: `extra` is sent
+}
+
+test "query: Rule.cross -- a sibling that is no rule of the schema, a value that failed its own coercion" {
+    const schema = [_]Rule{
+        .{ .field = "n", .kind = .int, .cross = &.{.{ .op = .lt_field, .other = "limit" }} },
+        .{ .field = "m", .kind = .int, .cross = &.{.{ .op = .eq_field, .other = "n" }} },
+    };
+    // `limit` is named only by the cross entry: coerced as `n`'s kind (int), compared by value.
+    var a = try validateQuery(testing.allocator, "n=5&limit=12&m=5", &schema);
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 0), a.errors.len);
+    // `n` is not an integer: its own error only, no comparison noise, and `m` sees an incomparable sibling.
+    var b = try validateQuery(testing.allocator, "n=x&limit=12&m=5", &schema);
+    defer b.deinit();
+    try expectError(&b, "n", "int_parsing");
+    try expectError(&b, "m", "field_mismatch");
+    try testing.expectEqual(@as(usize, 2), b.errors.len);
+    // A sibling-only name that does not coerce: incomparable, the ordering fails.
+    var b2 = try validateQuery(testing.allocator, "n=5&limit=big&m=5", &schema);
+    defer b2.deinit();
+    try expectError(&b2, "n", "less_than_field");
+    // Two sibling-only names: each keeps its own slot.
+    const two = [_]Rule{
+        .{ .field = "n", .kind = .int, .cross = &.{ .{ .op = .lt_field, .other = "hi" }, .{ .op = .gt_field, .other = "lo" } } },
+    };
+    var t1 = try validateQuery(testing.allocator, "n=5&hi=9&lo=1", &two);
+    defer t1.deinit();
+    try testing.expect(t1.ok());
+    var t2 = try validateQuery(testing.allocator, "n=5&hi=9&lo=7", &two);
+    defer t2.deinit();
+    try expectError(&t2, "n", "greater_than_field");
+    try testing.expectEqual(@as(usize, 1), t2.errors.len);
+    // Invalid UTF-8 on a `.any` value: its own `string_unicode`, no comparison on top; a sibling like that is incomparable.
+    const any = [_]Rule{
+        .{ .field = "p", .kind = .any },
+        .{ .field = "q", .kind = .any, .cross = &.{.{ .op = .eq_field, .other = "p" }} },
+    };
+    var w1 = try validateQuery(testing.allocator, "p=a&q=%FF", &any);
+    defer w1.deinit();
+    try expectError(&w1, "q", "string_unicode");
+    try testing.expectEqual(@as(usize, 1), w1.errors.len);
+    var w2 = try validateQuery(testing.allocator, "p=%FF&q=a", &any);
+    defer w2.deinit();
+    try expectError(&w2, "p", "string_unicode");
+    try expectError(&w2, "q", "field_mismatch");
+    // A present value that does not coerce is present but incomparable: a sibling like that still
+    // triggers `required_with`, and as the rule's own value it is never treated as absent.
+    const bad = [_]Rule{
+        .{ .field = "ni", .kind = .int },
+        .{ .field = "nf", .kind = .float },
+        .{ .field = "nb", .kind = .bool },
+        .{ .field = "r1", .kind = .string, .cross = &.{.{ .op = .required_with, .other = "ni" }} },
+        .{ .field = "r2", .kind = .string, .cross = &.{.{ .op = .required_with, .other = "nf" }} },
+        .{ .field = "r3", .kind = .string, .cross = &.{.{ .op = .required_with, .other = "nb" }} },
+        .{ .field = "si", .kind = .int, .cross = &.{.{ .op = .required_without, .other = "zz" }} },
+        .{ .field = "sf", .kind = .float, .cross = &.{.{ .op = .required_without, .other = "zz" }} },
+        .{ .field = "sb", .kind = .bool, .cross = &.{.{ .op = .required_without, .other = "zz" }} },
+    };
+    var bd = try validateQuery(testing.allocator, "ni=x&nf=y&nb=z&si=x&sf=y&sb=z", &bad);
+    defer bd.deinit();
+    try testing.expectEqual(@as(usize, 9), bd.errors.len);
+    for ([_][]const u8{ "r1", "r2", "r3" }) |f| try expectError(&bd, f, "missing");
+    try expectError(&bd, "si", "int_parsing");
+    try expectError(&bd, "sf", "float_parsing");
+    try expectError(&bd, "sb", "bool_parsing");
+    // A cross rule on an array kind (not a query shape): its type error only.
+    const arr = [_]Rule{
+        .{ .field = "p", .kind = .any },
+        .{ .field = "q", .kind = .array, .cross = &.{ .{ .op = .eq_field, .other = "p" }, .{ .op = .required_if, .other = "p", .value = "a" } } },
+    };
+    var w3 = try validateQuery(testing.allocator, "p=a&q=a", &arr);
+    defer w3.deinit();
+    try expectError(&w3, "q", "array_type");
+    try testing.expectEqual(@as(usize, 1), w3.errors.len);
+    // Rule.code / message overrides apply to a cross error as in a body.
+    const over = [_]Rule{
+        .{ .field = "a", .kind = .int },
+        .{ .field = "b", .kind = .int, .code = "bad_range", .cross = &.{.{ .op = .gt_field, .other = "a" }} },
+    };
+    var c = try validateQuery(testing.allocator, "a=3&b=3", &over);
+    defer c.deinit();
+    try expectError(&c, "b", "bad_range");
+    // The middleware's entry point is the same function: no cross rule, no cost.
+    var d = try validateQuery(testing.allocator, "", &over);
+    defer d.deinit();
+    try testing.expect(d.ok());
+}
+
+test "params: Rule.cross over validateParams (router.Params and a foreign lookup, by value and pointer)" {
+    var params: router.Params = .{};
+    params.entries[0] = .{ .name = "from", .value = "5" };
+    params.entries[1] = .{ .name = "to", .value = "3" };
+    params.len = 2;
+    const schema = [_]Rule{
+        .{ .field = "from", .kind = .int },
+        .{ .field = "to", .kind = .int, .cross = &.{.{ .op = .gte_field, .other = "from" }} },
+    };
+    var r = try validateParams(testing.allocator, &params, &schema);
+    defer r.deinit();
+    try expectError(&r, "to", "greater_than_equal_field");
+    params.entries[1].value = "5";
+    var ok = try validateParams(testing.allocator, &params, &schema);
+    defer ok.deinit();
+    try testing.expect(ok.ok());
+
+    const Pairs = struct {
+        names: []const []const u8,
+        values: []const []const u8,
+        pub fn get(p: @This(), name: []const u8) ?[]const u8 {
+            for (p.names, p.values) |n, v| if (std.mem.eql(u8, n, name)) return v;
+            return null;
+        }
+    };
+    const pairs: Pairs = .{ .names = &.{ "from", "to" }, .values = &.{ "9", "4" } };
+    inline for (.{ pairs, &pairs }) |lookup| {
+        var e = try validateParams(testing.allocator, lookup, &schema);
+        defer e.deinit();
+        try expectError(&e, "to", "greater_than_equal_field");
+        try testing.expectEqual(@as(usize, 1), e.errors.len);
     }
 }
 
