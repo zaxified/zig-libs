@@ -81,6 +81,9 @@ try paillier.decrypt(&sk, c, &plaintext); // rejects c=0/non-units as InvalidCip
 const c_sum = paillier.addCiphertexts(pk, c1, c2);       // E(m1+m2 mod n)
 const c_sum2 = try paillier.addPlaintext(pk, c1, &m2);    // E(m1+m2 mod n)
 const c_scaled = try paillier.mulPlaintext(pk, c1, &k);   // E(k*m1 mod n)
+// Signed values (python-paillier convention: -x is n - x, |x| <= n/3 - 1):
+//   paillier.negate(pk, c) / paillier.subCiphertexts(pk, c1, c2) -> E(-m) / E(m1 - m2)
+//   paillier.fromSigned(pk, true, &mag) -> Fe n - mag;  paillier.toSigned(pk, &m) -> Signed{ .negative, .magnitude }
 
 // Serialization (real, mechanical — works today, no stub involved):
 var n_buf: [paillier.modulus_bytes]u8 = undefined;

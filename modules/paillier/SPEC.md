@@ -6,7 +6,7 @@
 
 **Scope:** core — data61/python-paillier (phe) 1.5.1 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-17 · mutation 2026-09-10 · src ?
+**Audit:** review 2026-09-17 · mutation 2026-11-17 (22/22) · src bcc5e75fd266b0d2
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; `paillier-roundtrip` at scale 20 = 10,000 runs at a 512-bit key, PAILLIER_FUZZ) · ct 2026-10-06 (ctgrind)
 
@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std.crypto.ff` | Zig | MIT | — | Zig 0.16.0 | Bigint primitives only; no Paillier. |
 | sibling [`threshold_ecdsa`](../threshold_ecdsa/README.md) | Zig | this repo | — | — | Where the proofs (Alice/Bob range, MtA, Πprm/Πmod) and safe-prime aux generation live; not in this module by design. |
 
-**Where we are ahead:** the only Zig Paillier found (search "paillier", language Zig, 2026-09-30, returned nothing); constant-time ladder for the secret exponent (`montint`, ctgrind harness with recorded residuals); Paillier-CRT decrypt when the key carries its factors (~3.4x on top of the Montgomery speedup, per SPEC); `fromPrimes` validates primality and prime closeness and refuses `gcd(n, φ(n)) != 1`; `fromBytes` refuses moduli under 512 bits; value-exact cross-check against `phe` at toy size and a differential Python oracle at 512 bits (`tools/oracle_paillier.py`, 0 mismatches); mutation run 2026-09-10. **Where we are behind:** no ciphertext re-randomisation helper (`phe` `obfuscate`; workable today as `addCiphertexts(c, encryptRandom(0))`, → Backlog); plaintexts are raw non-negative residues `Fe` — no signed or fixed-point/float encoding as in `phe`; no packed encoding (rust-paillier); no JSON/structured key format (bytes codecs only, by design); no ZK proofs (deliberately in `threshold_ecdsa`).
+**Where we are ahead:** the only Zig Paillier found (search "paillier", language Zig, 2026-09-30, returned nothing); constant-time ladder for the secret exponent (`montint`, ctgrind harness with recorded residuals); Paillier-CRT decrypt when the key carries its factors (~3.4x on top of the Montgomery speedup, per SPEC); `fromPrimes` validates primality and prime closeness and refuses `gcd(n, φ(n)) != 1`; `fromBytes` refuses moduli under 512 bits; value-exact cross-check against `phe` at toy size and a differential Python oracle at 512 bits (`tools/oracle_paillier.py`, 0 mismatches); mutation run 2026-09-10. **Where we are behind:** no ciphertext re-randomisation helper (`phe` `obfuscate`; workable today as `addCiphertexts(c, encryptRandom(0))`, → Backlog); plaintexts are raw residues `Fe`, with the signed helpers (`negate`, `subCiphertexts`, `fromSigned`/`toSigned` in `phe`'s `n // 3 - 1` convention) but no fixed-point/float encoding as in `phe`; no packed encoding (rust-paillier); no JSON/structured key format (bytes codecs only, by design); no ZK proofs (deliberately in `threshold_ecdsa`).
 
 ## Design & invariants
 
@@ -177,6 +177,10 @@ this matches common reference implementations (including `phe`/python-paillier, 
 module's KAT vectors are cross-checked against — see `NOTICE`). Documented here rather than
 silently assumed.
 
+## Signed plaintexts
+
+Reference `phe` (python-paillier) 1.5.1, checked against its documented behaviour (the source was not read, per the survey note above): a negative `-x` is carried as `n - x`; `max_int = n // 3 - 1`; decoding a residue `r` gives `+r` for `r <= max_int`, `r - n` for `r >= n - max_int`, and raises `OverflowError` in between (and for `r >= n`); encoding a magnitude above `max_int` is an error; `-c` is `c * -1`, `a - b` is `a + (b * -1)`, the scalar `-1` carried as `n - 1`. This module follows it exactly: `maxSigned(pk)` is `n / 3 - 1` (integer division), `fromSigned(pk, negative, &magnitude)` is `n - magnitude` or `magnitude` (a negative zero stays `0`) and refuses `magnitude > maxSigned` with `error.Overflow`, `toSigned(pk, &m)` returns `Signed{negative, magnitude}` and refuses the gap and `m >= n` with `error.Overflow`. `negate(pk, c)` is `mulPlaintext(c, n - 1)` (a valid encryption of `-m`, numerically what `phe` computes; not the modular inverse of `c`) and `subCiphertexts` is `addCiphertexts(c1, negate(c2))`. `fromSigned`/`toSigned` are variable-time in the value (they handle a number the caller is about to read or has decrypted; `decrypt` itself is unchanged); `negate`/`subCiphertexts` keep `mulPlaintext`'s posture (the exponent is public). Not done, as in `phe`'s own scope: fixed-point/float encoding.
+
 ## Threat model / out of scope
 
 - **Secret residue on the dead stack** (sweep 2026-10-08, `src/stackprobe_test.zig`,
@@ -289,7 +293,7 @@ The correctness anchors, in order of strength:
   proofs, MtA — now in the sibling `threshold_ecdsa` module; see "Phase-2 boundary" above.
 
 - **`rerandomize(pk, c, random)` helper** (survey 2026-09-30): `phe`'s `obfuscate` is the routine way to stop a re-sent or homomorphically combined ciphertext being linkable; today the caller composes `addCiphertexts(c, encryptRandom(0))`, which works but is not documented as the idiom. Effort: trivial. Fits CONVENTIONS §2.
-- **Signed-integer helper (`negate`, subtraction, decode of `n - x` as negative)** (survey 2026-09-30): `phe` accepts negative plaintexts; here `mulPlaintext` with `n - k` is the caller's job and `decrypt` returns a residue. A small `subCiphertexts`/`negate`/`toSigned` set covers the common "sum of signed values" use. Effort: small. Fits §2.
+- **Signed-integer helper** — DONE 2026-11-17: `negate`, `subCiphertexts`, `fromSigned`, `toSigned`, `maxSigned`; see "Signed plaintexts".
 - **Packed encoding of several small values in one ciphertext** (survey 2026-09-30): in rust-paillier; an efficiency feature for vector-valued aggregation (federated learning style), not needed by `threshold_ecdsa`. Effort: small-medium. Fits §2. Add only on request.
 
 ## Status
@@ -305,5 +309,7 @@ tag vocabulary discussion for why there's no separate dedicated "status" tag.)
 
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+**Audit 2026-11-17 (delta mutation, signed helpers).** 22 schemata mutants over the signed-plaintext code (`maxSignedBig`: the divisor, the subtrahend, the skipped `- 1`; `fromSigned`: the bound compare flipped to `>=`, the overflow refusal dropped, the sign test forced, the zero special case dropped, `n - x` with the wrong operand, the wrong value returned; `toSigned`: the `x < n` compare at its boundary and dropped, the positive-bound compare at its boundary, the sign flag flipped on both arms, the gap bound at its boundary and dropped, its `n - max` operand, the magnitude operand; `negate`: the `- 1`, the exponent; `subCiphertexts`: negation dropped, first operand swapped), ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`: 22 killed, 0 survived. Not mutated: the serialization helpers `bigFromFe`/`bigFromModulus`/`feFromBig` (mechanical; every mutant above passes through them and a wrong value fails its test), `maxSigned` (a one-line wrapper pinned by the toy-key value 61 and the 512-bit boundary test). The earlier 2026-09-10 run is not itemized, so the card counts are the delta only.
 
 **What the tests actually contain.** cross-checked against phe (python-paillier) 1.5.0 real library output

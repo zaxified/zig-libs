@@ -1385,6 +1385,134 @@ fn mulPlaintextByValue(pk: PublicKey, c: Ciphertext, k: Fe) HomomorphicError!Cip
     return .{ .c = elemToFe(pk.n_sq, &pk.n_sq_mont.pow(&feToElem(&c.c), &k_el)) };
 }
 
+// ── signed plaintexts (`phe`'s convention) ───────────────────────────────
+//
+// Plaintexts live in `Z_n`; a negative `-x` is carried as `n - x`. The decode
+// range follows python-paillier (`phe`) 1.5.1: with `max = n / 3 - 1` (integer
+// division), a residue `x <= max` is the non-negative `x`, `x >= n - max` is
+// the negative `x - n`, and anything between is refused as an overflow (a sum
+// or product that left the safe range, a wrong key, or a corrupted
+// ciphertext). The same `max` bounds what `fromSigned` accepts, as `phe`'s
+// `encode` does. Everything here handles values a caller is about to read or
+// has just decrypted: it is variable-time in the value, unlike `decrypt`.
+
+/// A plaintext read as a signed integer: `-magnitude` when `negative`.
+/// `magnitude` is canonical mod `pk.n_sq` (the Fe construction contract), so it
+/// can be fed straight back to `encrypt`, `addPlaintext` or `mulPlaintext`.
+pub const Signed = struct {
+    negative: bool,
+    magnitude: Fe,
+};
+
+/// `phe`'s overflow: the value lies outside `[-max, max]` (see `maxSigned`),
+/// or (decoding) is not below `n`.
+pub const SignedError = error{Overflow};
+
+fn bigFromFe(gpa: std.mem.Allocator, fe: *const Fe) !BigInt {
+    var buf: [modulus_sq_bytes]u8 = undefined;
+    fe.toBytes(&buf, .big) catch unreachable; // an Fe this module returned, in a buffer sized for n²
+    return bigFromBytes(gpa, &buf);
+}
+
+fn bigFromModulus(gpa: std.mem.Allocator, m: Modulus) !BigInt {
+    var buf: [modulus_sq_bytes]u8 = undefined;
+    m.toBytes(&buf, .big) catch unreachable;
+    return bigFromBytes(gpa, &buf);
+}
+
+/// `b` (non-negative, below `pk.n_sq`) as an `Fe` canonical mod `pk.n_sq`.
+fn feFromBig(pk: PublicKey, b: *const BigInt) Fe {
+    var buf: [modulus_sq_bytes]u8 = undefined;
+    b.toConst().writeTwosComplement(&buf, .big);
+    return Fe.fromBytes(pk.n_sq, &buf, .big) catch unreachable;
+}
+
+/// `n / 3 - 1` (integer division) as a big integer: `phe`'s `max_int`.
+fn maxSignedBig(gpa: std.mem.Allocator, n: *const BigInt) !BigInt {
+    var three = try newBig(gpa);
+    try three.set(3);
+    var one = try newBig(gpa);
+    try one.set(1);
+    var q = try newBig(gpa);
+    var r = try newBig(gpa);
+    try q.divFloor(&r, n, &three);
+    var out = try newBig(gpa);
+    try out.sub(&q, &one);
+    return out;
+}
+
+/// Largest magnitude `fromSigned` accepts and `toSigned` decodes: `n / 3 - 1`
+/// (integer division), `phe`'s `max_int`.
+pub fn maxSigned(pk: PublicKey) Fe {
+    var scratch: [scratch_bytes]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const gpa = fba.allocator();
+    var n = bigFromModulus(gpa, pk.n) catch unreachable;
+    const max = maxSignedBig(gpa, &n) catch unreachable;
+    return feFromBig(pk, &max);
+}
+
+/// Carry `-magnitude` (when `negative`) or `magnitude` as a plaintext residue:
+/// `n - magnitude`, or the magnitude itself (zero stays zero). The result is
+/// canonical mod `pk.n_sq`. `error.Overflow` when `magnitude > maxSigned(pk)`.
+pub fn fromSigned(pk: PublicKey, negative: bool, magnitude: *const Fe) SignedError!Fe {
+    var scratch: [scratch_bytes]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const gpa = fba.allocator();
+    var n = bigFromModulus(gpa, pk.n) catch unreachable;
+    const max = maxSignedBig(gpa, &n) catch unreachable;
+    var x = bigFromFe(gpa, magnitude) catch unreachable;
+    if (x.order(max) == .gt) return error.Overflow;
+    if (!negative or x.eqlZero()) return feFromBig(pk, &x);
+    var neg = newBig(gpa) catch unreachable;
+    neg.sub(&n, &x) catch unreachable;
+    return feFromBig(pk, &neg);
+}
+
+/// Read a decrypted plaintext `m` as a signed integer, `phe`'s way (see the
+/// section comment): `m <= n/3 - 1` is `+m`, `m >= n - (n/3 - 1)` is `-(n - m)`,
+/// `error.Overflow` for the gap in between and for `m >= n`.
+pub fn toSigned(pk: PublicKey, m: *const Fe) SignedError!Signed {
+    var scratch: [scratch_bytes]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const gpa = fba.allocator();
+    var n = bigFromModulus(gpa, pk.n) catch unreachable;
+    const max = maxSignedBig(gpa, &n) catch unreachable;
+    var x = bigFromFe(gpa, m) catch unreachable;
+    if (x.order(n) != .lt) return error.Overflow;
+    if (x.order(max) != .gt) return .{ .negative = false, .magnitude = feFromBig(pk, &x) };
+    var low = newBig(gpa) catch unreachable; // n - max, the smallest negative encoding
+    low.sub(&n, &max) catch unreachable;
+    if (x.order(low) == .lt) return error.Overflow;
+    var mag = newBig(gpa) catch unreachable;
+    mag.sub(&n, &x) catch unreachable;
+    return .{ .negative = true, .magnitude = feFromBig(pk, &mag) };
+}
+
+/// Ciphertext negation: `E(-m mod n) = E(m)^(n-1) mod n²`, the scalar rule
+/// with `k = n - 1`; `phe`'s `-c` is the same call (`c * -1`, with `-1` carried
+/// as `n - 1`). It is a fresh-looking valid encryption of `-m`, not the modular
+/// inverse of `c` (that would need an inversion, which this module has none
+/// of); like every `mulPlaintext` result it keeps `c`'s randomness raised to
+/// the power, so it is no more or less blinded than `c` was. Cost and
+/// constant-time posture of `mulPlaintext` (the exponent is public).
+pub fn negate(pk: PublicKey, c: Ciphertext) HomomorphicError!Ciphertext {
+    var scratch: [scratch_bytes]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const gpa = fba.allocator();
+    var n = bigFromModulus(gpa, pk.n) catch unreachable;
+    var k = newBig(gpa) catch unreachable;
+    k.addScalar(&n, -1) catch unreachable;
+    const k_fe = feFromBig(pk, &k);
+    return mulPlaintext(pk, c, &k_fe);
+}
+
+/// Ciphertext subtraction: `E(m1 - m2 mod n)`, computed as
+/// `addCiphertexts(c1, negate(c2))` — `phe`'s `a - b` (`a + (b * -1)`).
+pub fn subCiphertexts(pk: PublicKey, c1: Ciphertext, c2: Ciphertext) HomomorphicError!Ciphertext {
+    return addCiphertexts(pk, c1, try negate(pk, c2));
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 //
 // Paillier has no official RFC/standard KAT vectors. Two groups below:
@@ -2119,6 +2247,132 @@ test "encryptRandom is genuinely fresh: repeated calls on the same key/message n
         try seen.put(digest, {});
     }
     try testing.expectEqual(@as(usize, 128), seen.count());
+}
+
+test "signed plaintexts: maxSigned and the toSigned decode range follow phe (toy key, n = 187, max = 187 / 3 - 1 = 61)" {
+    var kp: KeyPair = undefined;
+    try fromPrimes(&kat_p, &kat_q, &kp);
+    const pk = kp.public;
+    try testing.expectEqual(@as(u32, 61), try maxSigned(pk).toPrimitive(u32));
+
+    const Case = struct { m: u32, negative: bool, magnitude: u32 };
+    const ok = [_]Case{
+        .{ .m = 0, .negative = false, .magnitude = 0 },
+        .{ .m = 1, .negative = false, .magnitude = 1 },
+        .{ .m = 61, .negative = false, .magnitude = 61 }, // max
+        .{ .m = 126, .negative = true, .magnitude = 61 }, // n - max
+        .{ .m = 186, .negative = true, .magnitude = 1 }, // n - 1
+    };
+    for (ok) |c| {
+        const m = try Fe.fromPrimitive(u32, pk.n_sq, c.m);
+        const s = try toSigned(pk, &m);
+        try testing.expectEqual(c.negative, s.negative);
+        try testing.expectEqual(c.magnitude, try s.magnitude.toPrimitive(u32));
+    }
+    // The gap (max, n - max) is phe's OverflowError; so is anything not below n.
+    for ([_]u32{ 62, 100, 125, 187, 188, 5000 }) |v| {
+        const m = try Fe.fromPrimitive(u32, pk.n_sq, v);
+        try testing.expectError(error.Overflow, toSigned(pk, &m));
+    }
+}
+
+test "signed plaintexts: fromSigned encodes -x as n - x, refuses |x| > max, and round-trips" {
+    var kp: KeyPair = undefined;
+    try fromPrimes(&kat_p, &kat_q, &kp);
+    const pk = kp.public;
+
+    const five = try Fe.fromPrimitive(u32, pk.n_sq, 5);
+    try testing.expectEqual(@as(u32, 5), try (try fromSigned(pk, false, &five)).toPrimitive(u32));
+    try testing.expectEqual(@as(u32, 182), try (try fromSigned(pk, true, &five)).toPrimitive(u32));
+    const zero = try Fe.fromPrimitive(u32, pk.n_sq, 0);
+    try testing.expectEqual(@as(u32, 0), try (try fromSigned(pk, true, &zero)).toPrimitive(u32)); // -0 is 0
+    const max = try Fe.fromPrimitive(u32, pk.n_sq, 61);
+    try testing.expectEqual(@as(u32, 61), try (try fromSigned(pk, false, &max)).toPrimitive(u32));
+    try testing.expectEqual(@as(u32, 126), try (try fromSigned(pk, true, &max)).toPrimitive(u32));
+    const over = try Fe.fromPrimitive(u32, pk.n_sq, 62);
+    try testing.expectError(error.Overflow, fromSigned(pk, false, &over));
+    try testing.expectError(error.Overflow, fromSigned(pk, true, &over));
+
+    var x: u32 = 0;
+    while (x <= 61) : (x += 1) {
+        const mag = try Fe.fromPrimitive(u32, pk.n_sq, x);
+        for ([_]bool{ false, true }) |neg| {
+            const enc = try fromSigned(pk, neg, &mag);
+            const back = try toSigned(pk, &enc);
+            try testing.expectEqual(neg and x != 0, back.negative);
+            try testing.expectEqual(x, try back.magnitude.toPrimitive(u32));
+        }
+    }
+}
+
+test "signed plaintexts: negate decrypts to n - m; subCiphertexts decrypts to a signed difference" {
+    var kp: KeyPair = undefined;
+    try fromPrimes(&kat_p, &kat_q, &kp);
+    const pk = kp.public;
+    const sk = kp.secret;
+    var prng = std.Random.DefaultPrng.init(7);
+    const random = prng.random();
+
+    const m1 = try Fe.fromPrimitive(u32, pk.n_sq, 5);
+    const m2 = try Fe.fromPrimitive(u32, pk.n_sq, 9);
+    const c1 = try encryptRandom(pk, &m1, random);
+    const c2 = try encryptRandom(pk, &m2, random);
+
+    // Value pin: E(5, r = 3) = 28873 (phe-cross-checked above); negate is c^(n-1) mod n²
+    // = 28873^186 mod 34969 = 10712, what phe's `-c` (raw_mul by n - 1) computes.
+    const r3 = try Fe.fromPrimitive(u32, pk.n_sq, 3);
+    const c_kat = try encrypt(pk, &m1, &r3);
+    try testing.expectEqual(@as(u32, 10712), try (try negate(pk, c_kat)).c.toPrimitive(u32));
+    // negate(E(5)) is E(n - 5); c + negate(c) decrypts to 0; negating twice decrypts to the original.
+    const neg1 = try negate(pk, c1);
+    try testing.expectEqual(@as(u32, 187 - 5), try (try decryptTest(&sk, neg1)).toPrimitive(u32));
+    try testing.expectEqual(@as(u32, 0), try (try decryptTest(&sk, addCiphertexts(pk, c1, neg1))).toPrimitive(u32));
+    try testing.expectEqual(@as(u32, 5), try (try decryptTest(&sk, try negate(pk, neg1))).toPrimitive(u32));
+    const zero = try Fe.fromPrimitive(u32, pk.n_sq, 0);
+    try testing.expectEqual(@as(u32, 0), try (try decryptTest(&sk, try negate(pk, try encryptRandom(pk, &zero, random)))).toPrimitive(u32));
+
+    // 5 - 9 = -4; 9 - 5 = 4; x - x = 0.
+    const d = try subCiphertexts(pk, c1, c2);
+    const s = try toSigned(pk, &(try decryptTest(&sk, d)));
+    try testing.expect(s.negative);
+    try testing.expectEqual(@as(u32, 4), try s.magnitude.toPrimitive(u32));
+    const u = try toSigned(pk, &(try decryptTest(&sk, try subCiphertexts(pk, c2, c1))));
+    try testing.expect(!u.negative);
+    try testing.expectEqual(@as(u32, 4), try u.magnitude.toPrimitive(u32));
+    try testing.expectEqual(@as(u32, 0), try (try decryptTest(&sk, try subCiphertexts(pk, c1, c1))).toPrimitive(u32));
+
+    // A negative plaintext added to a ciphertext: 9 + (-5) = 4.
+    const five = try Fe.fromPrimitive(u32, pk.n_sq, 5);
+    const minus_five = try fromSigned(pk, true, &five);
+    try testing.expectEqual(@as(u32, 4), try (try decryptTest(&sk, try addPlaintext(pk, c2, &minus_five))).toPrimitive(u32));
+}
+
+test "signed plaintexts: a signed sum at a real 512-bit key" {
+    var prng = std.Random.DefaultPrng.init(0x51_67_6e);
+    const random = prng.random();
+    var kp: KeyPair = undefined;
+    try generate(random, 512, &kp);
+    const pk = kp.public;
+    const sk = kp.secret;
+
+    // 1000 - 2500 + 7 - (-30) = -1463
+    var acc = try encryptRandom(pk, &(try Fe.fromPrimitive(u32, pk.n_sq, 1000)), random);
+    const two_five = try Fe.fromPrimitive(u32, pk.n_sq, 2500);
+    acc = try subCiphertexts(pk, acc, try encryptRandom(pk, &two_five, random));
+    acc = addCiphertexts(pk, acc, try encryptRandom(pk, &(try Fe.fromPrimitive(u32, pk.n_sq, 7)), random));
+    const thirty = try Fe.fromPrimitive(u32, pk.n_sq, 30);
+    const minus_thirty = try fromSigned(pk, true, &thirty);
+    acc = try subCiphertexts(pk, acc, try encryptRandom(pk, &minus_thirty, random));
+    const s = try toSigned(pk, &(try decryptTest(&sk, acc)));
+    try testing.expect(s.negative);
+    try testing.expectEqual(@as(u32, 1463), try s.magnitude.toPrimitive(u32));
+    // One above the bound (n / 3) is already in the overflow gap.
+    const max = maxSigned(pk);
+    const at_max = try toSigned(pk, &max);
+    try testing.expect(!at_max.negative);
+    var plus_one = try Fe.fromPrimitive(u32, pk.n_sq, 1);
+    plus_one = pk.n_sq.add(max, plus_one);
+    try testing.expectError(error.Overflow, toSigned(pk, &plus_one));
 }
 
 test "encrypt/decrypt round-trips every residue of the toy key (exhaustive m in [0, n))" {
