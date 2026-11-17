@@ -48,7 +48,7 @@ var corpus: []const []const u8 = &.{};
 
 fn buildCorpus() ![]const []const u8 {
     if (corpus.len > 0) return corpus;
-    const keep = std.heap.page_allocator;
+    const keep = std.heap.page_allocator; // global-alloc-ok: process-lifetime fixtures of a test-only harness
     var arena = std.heap.ArenaAllocator.init(keep);
     const a = arena.allocator();
     const f = try st.sampleFrame(a);

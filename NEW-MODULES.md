@@ -15,21 +15,17 @@ set the parity bar), **Notes** (dependencies, open decisions, effort).
 
 ## Open
 
-### arrow — Apache Arrow IPC over `dataframe.Frame`
-- **Origin:** 2026-11-15, consumer request: a frame cache written with a hand-made scalar-only
-  codec (nested and zoned-timestamp columns refused). `dataframe`'s SPEC already names `arrow`
-  and `parquet` as the planned home of columnar formats.
-- **Scope:** the Arrow IPC stream and file formats (schema + record batch + dictionary
-  messages, flatbuffers metadata, 8/64-byte alignment, optional LZ4/ZSTD body compression),
-  read and write of a `dataframe.Frame` with every column type it has, including list, struct,
-  fixed-size array and timestamps with a time zone. Out: the C data interface, Flight,
-  compute kernels.
-- **Expected:** pyarrow `ipc.new_file`/`open_file`, polars `write_ipc`/`read_ipc`, pandas
-  `to_feather`/`read_feather` (Feather v2 = the Arrow IPC file format); arrow-rs `arrow-ipc`
-  is the reference implementation to test against.
-- **Notes:** depends on `dataframe` (and `zstd`, an LZ4 codec if one exists); keep
-  `dataframe`'s own closure free of it — the adapter depends on the frame, not the other way.
-  Effort L. Interop oracle: files written by pyarrow, read back by pyarrow.
+### lz4 — LZ4 block and frame format codec
+- **Origin:** 2026-11-17, the `arrow` module: Arrow IPC body compression is LZ4_FRAME or ZSTD;
+  without an LZ4 codec `arrow` reads LZ4-compressed files with `error.Unsupported`. `parquet`
+  (LZ4_RAW pages) would be the second consumer.
+- **Scope:** LZ4 block format and the LZ4 frame format (magic, frame descriptor, block
+  checksums, content checksum via xxHash32), compress and decompress, bounded output size.
+  Out: LZ4 HC levels at first, dictionary compression.
+- **Expected:** the reference `lz4` C library and its CLI (frame format), lz4_flex (Rust),
+  python-lz4.
+- **Notes:** an xxHash32 is needed for the frame checksums (check sibling modules first).
+  Interop oracle: the `lz4` CLI round trip. Effort M.
 
 ### parquet — Apache Parquet over `dataframe.Frame`
 - **Origin:** named as planned in `dataframe`'s SPEC; the same consumer request asks for it
