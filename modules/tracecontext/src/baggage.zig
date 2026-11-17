@@ -684,6 +684,94 @@ test "decodeValue: bounded output, bad escapes" {
     try testing.expectError(error.BadEscape, decodeValue("%E2%8", &out));
 }
 
+test "token and baggage-octet classes, byte by byte" {
+    // Reference sets written out independently: RFC 7230 tchar; W3C §3.3.1 baggage-octet.
+    const tchars = "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    for (0..256) |i| {
+        const one = [1]u8{@intCast(i)};
+        try testing.expectEqual(std.mem.findScalar(u8, tchars, one[0]) != null, isToken(&one));
+        const c = one[0];
+        const octet = c == 0x21 or (c >= 0x23 and c <= 0x2B) or (c >= 0x2D and c <= 0x3A) or
+            (c >= 0x3C and c <= 0x5B) or (c >= 0x5D and c <= 0x7E);
+        try testing.expectEqual(octet, isBaggageOctet(c));
+    }
+    try testing.expect(isToken("Zz9-_"));
+    try testing.expect(!isToken(""));
+    try testing.expect(!isToken("a b"));
+    try testing.expect(!isToken("ab="));
+}
+
+test "property text is kept trimmed, by parse and by put" {
+    var s: [max_len]u8 = undefined;
+    const b = try parseT("a=1 ; p ; q = r ,b=2;\tx\t", &s);
+    try testing.expectEqualStrings("p ; q = r", b.members()[0].properties);
+    try testing.expectEqualStrings("x", b.members()[1].properties);
+    var c: Baggage = .{};
+    try c.put("k", "v", " \tp ; q=r \t");
+    try testing.expectEqualStrings("p ; q=r", c.members()[0].properties);
+    var out: [32]u8 = undefined;
+    try testing.expectEqualStrings("k=v;p;q=r", c.write(&out));
+}
+
+test "write: encoded octets and property values count exactly against the buffer" {
+    var out: [16]u8 = undefined;
+    var sp: Baggage = .{};
+    try sp.put("a", " ", ""); // a=%20
+    try testing.expectEqualStrings("a=%20", sp.write(out[0..5]));
+    try testing.expectEqualStrings("", sp.write(out[0..4]));
+    var pc: Baggage = .{};
+    try pc.put("a", "%", ""); // a=%25
+    try testing.expectEqualStrings("a=%25", pc.write(out[0..5]));
+    try testing.expectEqualStrings("", pc.write(out[0..4]));
+    var pv: Baggage = .{};
+    try pv.put("a", "1", "p=q"); // a=1;p=q
+    try testing.expectEqualStrings("a=1;p=q", pv.write(out[0..7]));
+    try testing.expectEqualStrings("", pv.write(out[0..6]));
+}
+
+test "scratch must cover the input: one byte short is refused" {
+    var s: [8]u8 = undefined;
+    _ = try Baggage.parse("k=v", s[0..3]);
+    try testing.expectError(error.NoSpaceLeft, Baggage.parse("k=v", s[0..2]));
+    _ = try Baggage.parseLenient("k=v", s[0..3]);
+    try testing.expectError(error.NoSpaceLeft, Baggage.parseLenient("k=v", s[0..2]));
+    // OWS around the whole value is not input.
+    _ = try Baggage.parse(" k=v ", s[0..3]);
+    _ = try Baggage.parseLenient(" k=v ", s[0..3]);
+}
+
+test "parseLenient: the 8192 bytes count commas and exclude OWS around the value" {
+    var s: [max_len]u8 = undefined;
+    var buf: [max_len + 8]u8 = undefined;
+    // `a` (4000 bytes), a comma, then `b` ending at byte 8192: kept; one byte more: dropped whole.
+    for ([_]usize{ 8192, 8193 }) |total| {
+        @memset(buf[0..total], 'x');
+        buf[0] = 'a';
+        buf[1] = '=';
+        buf[4000] = ',';
+        buf[4001] = 'b';
+        buf[4002] = '=';
+        const b = try Baggage.parseLenient(buf[0..total], &s);
+        try testing.expectEqual(@as(usize, if (total == 8192) 2 else 1), b.len);
+    }
+    var padded: [max_len + 2]u8 = undefined;
+    @memset(&padded, 'x');
+    padded[0] = ' ';
+    padded[1] = 'k';
+    padded[2] = '=';
+    padded[max_len + 1] = '\t';
+    try testing.expectEqual(@as(usize, 1), (try Baggage.parseLenient(&padded, &s)).len);
+}
+
+test "get matches the whole key" {
+    var s: [max_len]u8 = undefined;
+    const b = try parseT("key1=v,k=w", &s);
+    try testing.expect(b.get("ke") == null);
+    try testing.expect(b.get("key") == null);
+    try testing.expectEqualStrings("v", b.get("key1").?);
+    try testing.expectEqualStrings("w", b.get("k").?);
+}
+
 fn checkInput(input: []const u8) !void {
     var s: [max_len]u8 = undefined;
     var s2: [max_len]u8 = undefined;
