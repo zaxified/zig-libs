@@ -391,10 +391,20 @@ const MockTransport = struct {
     // take its own copy here rather than alias the caller's slice.
     last_url_owned: ?[]u8 = null,
     last_method: ocspcache.FetchMethod = .post,
+    /// What `Cache.refresh` handed the transport: the knobs it must plumb through.
+    last_body_timeout_ms: u32 = 0,
+    last_max_bytes: usize = 0,
+    last_body_len: usize = 0,
+    /// When set, `fetch` fails with this instead of answering.
+    err: ?ocspcache.FetchError = null,
 
     fn fetch(context: *anyopaque, gpa: std.mem.Allocator, req: ocspcache.FetchRequest) ocspcache.FetchError!ocspcache.FetchResponse {
         const self: *MockTransport = @ptrCast(@alignCast(context));
         self.calls += 1;
+        self.last_body_timeout_ms = req.body_timeout_ms;
+        self.last_max_bytes = req.max_response_bytes;
+        self.last_body_len = req.body.len;
+        if (self.err) |e| return e;
         if (self.last_url_owned) |u| gpa.free(u);
         self.last_url_owned = try gpa.dupe(u8, req.url);
         self.last_method = req.method;
@@ -939,4 +949,123 @@ test "exportEntries and importStaple: every allocation failure is clean (no leak
     defer cache.deinit();
     try testing.checkAllAllocationFailures(gpa, exportOnce, .{ &cache, this_update_unix + 100 });
     try testing.checkAllAllocationFailures(gpa, importOnce, .{this_update_unix + 100});
+}
+
+// ── whole-module mutation round (2026-11-17): what refresh hands the transport,
+// how it maps a transport failure, which statuses it accepts ─────────────────
+
+test "Cache.refresh: hands the transport its deadline, its ceiling and the configured CertID hash, on POST and GET" {
+    const gpa = testing.allocator;
+    const now = this_update_unix + 100;
+    var body_len: [2]usize = undefined;
+    for ([_]ocsp.RequestHashAlgo{ .sha1, .sha256 }, 0..) |hash, i| {
+        var mock: MockTransport = .{ .status = 200, .body = good_response };
+        defer mock.deinit(gpa);
+        var cache = ocspcache.Cache.init(gpa, mock.transport(), .{ .hash = hash, .body_read_timeout_ms = 1234, .max_response_bytes = 4321 });
+        defer cache.deinit();
+        // Whether the fixture verifies under either CertID hash is not the point.
+        cache.refresh(subject_with_aia, issuer_der, now) catch {};
+        try testing.expectEqual(@as(u32, 1234), mock.last_body_timeout_ms);
+        try testing.expectEqual(@as(usize, 4321), mock.last_max_bytes);
+        try testing.expect(mock.last_body_len > 0);
+        body_len[i] = mock.last_body_len;
+    }
+    // A SHA-256 CertID is longer than a SHA-1 one: the request carries the configured hash.
+    try testing.expect(body_len[1] > body_len[0]);
+
+    var mock: MockTransport = .{ .status = 200, .body = good_response };
+    defer mock.deinit(gpa);
+    var cache = ocspcache.Cache.init(gpa, mock.transport(), .{ .fetch_method = .get, .body_read_timeout_ms = 777, .max_response_bytes = 5000 });
+    defer cache.deinit();
+    try cache.refresh(subject_with_aia, issuer_der, now);
+    try testing.expectEqual(@as(u32, 777), mock.last_body_timeout_ms);
+    try testing.expectEqual(@as(usize, 5000), mock.last_max_bytes);
+    try testing.expectEqual(@as(usize, 0), mock.last_body_len);
+}
+
+test "Cache.refresh: every transport failure comes back under its own name, nothing cached" {
+    const gpa = testing.allocator;
+    var mock: MockTransport = .{ .status = 200, .body = good_response };
+    defer mock.deinit(gpa);
+    var cache = ocspcache.Cache.init(gpa, mock.transport(), .{});
+    defer cache.deinit();
+    const now = this_update_unix + 100;
+    inline for (.{ error.TransportFailed, error.ResponseTooLarge, error.Canceled, error.Timeout, error.OutOfMemory }) |e| {
+        mock.err = e;
+        try testing.expectError(e, cache.refresh(subject_with_aia, issuer_der, now));
+    }
+    try testing.expectEqual(@as(usize, 0), cache.entries.count());
+}
+
+test "Cache.refresh: only HTTP 200 is an answer; every other status is ResponderHttpError" {
+    const gpa = testing.allocator;
+    var mock: MockTransport = .{ .body = good_response };
+    defer mock.deinit(gpa);
+    var cache = ocspcache.Cache.init(gpa, mock.transport(), .{});
+    defer cache.deinit();
+    for ([_]u16{ 100, 199, 201, 204, 299, 300, 302, 404, 500 }) |status| {
+        mock.status = status;
+        try testing.expectError(error.ResponderHttpError, cache.refresh(subject_with_aia, issuer_der, this_update_unix + 100));
+    }
+    try testing.expectEqual(@as(usize, 0), cache.entries.count());
+}
+
+test "Cache.refresh / importStaple: a successful response of another type is UnsupportedResponseType, not a verify failure" {
+    const gpa = testing.allocator;
+    // OCSPResponse { responseStatus successful, responseBytes { responseType 1.3.6.1.5.5.7.48.2, response "" } }
+    const other_type = [_]u8{ 0x30, 0x14, 0x0a, 0x01, 0x00, 0xa0, 0x0f, 0x30, 0x0d, 0x06, 0x09, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02, 0x04, 0x00 };
+    var mock: MockTransport = .{ .body = &other_type };
+    defer mock.deinit(gpa);
+    var cache = ocspcache.Cache.init(gpa, mock.transport(), .{});
+    defer cache.deinit();
+    const now = this_update_unix + 100;
+    try testing.expectError(error.UnsupportedResponseType, cache.refresh(subject_with_aia, issuer_der, now));
+    try testing.expectError(error.UnsupportedResponseType, cache.importStaple(subject_with_aia, issuer_der, &other_type, now));
+    try testing.expectEqual(@as(usize, 0), cache.entries.count());
+}
+
+test "Cache.refresh: a certificate whose AIA extension is corrupt is Malformed, and the transport is never reached" {
+    const gpa = testing.allocator;
+    var cert: [subject_with_aia.len]u8 = subject_with_aia.*;
+    // The AIA extnValue is `04 28 30 26 ...`: turn its outer SEQUENCE into a SET.
+    const at = std.mem.find(u8, &cert, &[_]u8{ 0x04, 0x28, 0x30, 0x26 }).?;
+    cert[at + 2] = 0x31;
+    try testing.expectError(error.Malformed, ocspcache.discoverResponderUrl(&cert));
+    var mock: MockTransport = .{ .body = good_response };
+    defer mock.deinit(gpa);
+    var cache = ocspcache.Cache.init(gpa, mock.transport(), .{});
+    defer cache.deinit();
+    try testing.expectError(error.Malformed, cache.refresh(&cert, issuer_der, this_update_unix + 100));
+    try testing.expectEqual(@as(usize, 0), mock.calls);
+}
+
+test "discoverResponderUrl: a truncated certificate and a corrupt extension entry are Malformed, never null" {
+    // Cut inside the TBSCertificate: the outer length promises more than there is.
+    try testing.expectError(error.Malformed, ocspcache.discoverResponderUrl(subject_with_aia[0..100]));
+    // The extension's OID tag corrupted (OBJECT IDENTIFIER -> OCTET STRING): the iterator refuses the entry.
+    var cert: [subject_with_aia.len]u8 = subject_with_aia.*;
+    const at = std.mem.find(u8, &cert, &[_]u8{ 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01 }).?;
+    cert[at] = 0x04;
+    try testing.expectError(error.Malformed, ocspcache.discoverResponderUrl(&cert));
+}
+
+test "Cache.refresh: a full cache reclaims an expired entry to make room, and records the response's own validity" {
+    const gpa = testing.allocator;
+    const now = this_update_unix + 100;
+    var mock: MockTransport = .{ .status = 200, .body = good_response };
+    defer mock.deinit(gpa);
+    var cache = ocspcache.Cache.init(gpa, mock.transport(), .{ .max_entries = 1 });
+    defer cache.deinit();
+    // The one slot is held by an entry that expired a second ago.
+    try cache.entries.put(gpa, ocspcache.Cache.subjectKey("an-old-certificate"), .{
+        .response_der = try gpa.dupe(u8, "stale"),
+        .this_update_unix = now - 1000,
+        .next_update_unix = now - 1,
+    });
+    try cache.refresh(subject_with_aia, issuer_der, now);
+    try testing.expectEqual(@as(usize, 1), cache.entries.count());
+    try testing.expect(try hasStaple(&cache, gpa, subject_with_aia, now));
+    const e = cache.entries.get(ocspcache.Cache.subjectKey(subject_with_aia)).?;
+    try testing.expectEqual(this_update_unix, e.this_update_unix);
+    try testing.expectEqual(next_update_unix, e.next_update_unix);
 }

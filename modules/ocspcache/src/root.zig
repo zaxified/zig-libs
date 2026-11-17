@@ -1881,3 +1881,248 @@ test "exportEntries: sorted by subject key whatever order the map iterates in" {
     for (list[1..], 0..) |e, i| try testing.expect(std.mem.lessThan(u8, &list[i].subject_key, &e.subject_key));
     for (list) |e| try testing.expectEqualSlices(u8, &e.subject_key, e.response_der);
 }
+
+// ── whole-module mutation round (2026-11-17): structure checks, scheme case,
+// the GET URL byte for byte, the eviction boundary, the production transport ─
+
+test "parseAiaOcspUrl: the outer SEQUENCE, each AccessDescription and the accessMethod OID are tag-checked" {
+    const url = "http://ocsp.example.org/";
+    const method = [_]u8{ 0x06, oid_ad_ocsp.len } ++ oid_ad_ocsp;
+    const loc = [_]u8{ 0x86, url.len } ++ url.*;
+    const ad = [_]u8{ 0x30, method.len + loc.len } ++ method ++ loc;
+    const good = [_]u8{ 0x30, ad.len } ++ ad;
+    try testing.expectEqualStrings(url, (try parseAiaOcspUrl(&good)).?); // control: the same bytes with the right tags
+    // Same content, one tag wrong at a time: each is refused as Malformed.
+    const outer_set = [_]u8{ 0x31, ad.len } ++ ad;
+    try testing.expectError(error.Malformed, parseAiaOcspUrl(&outer_set));
+    const ad_set = [_]u8{ 0x31, method.len + loc.len } ++ method ++ loc;
+    const ad_wrong = [_]u8{ 0x30, ad_set.len } ++ ad_set;
+    try testing.expectError(error.Malformed, parseAiaOcspUrl(&ad_wrong));
+    const method_octets = [_]u8{ 0x04, oid_ad_ocsp.len } ++ oid_ad_ocsp;
+    const ad_method = [_]u8{ 0x30, method_octets.len + loc.len } ++ method_octets ++ loc;
+    const method_wrong = [_]u8{ 0x30, ad_method.len } ++ ad_method;
+    try testing.expectError(error.Malformed, parseAiaOcspUrl(&method_wrong));
+}
+
+test "parseAiaOcspUrl: the URL scheme is matched case-insensitively (RFC 3986 3.1) and needs its slashes" {
+    inline for (.{ "HTTP://ocsp.example.org/", "HtTpS://ocsp.example.org/", "https://ocsp.example.org/" }) |url| {
+        const method = [_]u8{ 0x06, oid_ad_ocsp.len } ++ oid_ad_ocsp;
+        const loc = [_]u8{ 0x86, url.len } ++ url.*;
+        const ad = [_]u8{ 0x30, method.len + loc.len } ++ method ++ loc;
+        const value = [_]u8{ 0x30, ad.len } ++ ad;
+        try testing.expectEqualStrings(url, (try parseAiaOcspUrl(&value)).?);
+    }
+    inline for (.{ "http:ocsp.example.org/", "https:ocsp.example.org/", "ftp://ocsp.example.org/" }) |url| {
+        const method = [_]u8{ 0x06, oid_ad_ocsp.len } ++ oid_ad_ocsp;
+        const loc = [_]u8{ 0x86, url.len } ++ url.*;
+        const ad = [_]u8{ 0x30, method.len + loc.len } ++ method ++ loc;
+        const value = [_]u8{ 0x30, ad.len } ++ ad;
+        try testing.expect((try parseAiaOcspUrl(&value)) == null);
+    }
+}
+
+test "buildGetUrl: the URL is exact, byte for byte (padding, plus, slash, plain characters)" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { base: []const u8, req: []const u8, want: []const u8 }{
+        .{ .base = "http://h", .req = &.{0xff}, .want = "http://h/%2Fw%3D%3D" }, // "/w=="
+        .{ .base = "http://h/", .req = &.{0xff}, .want = "http://h/%2Fw%3D%3D" }, // one slash, never two
+        .{ .base = "http://h", .req = &.{ 0xfb, 0xef, 0xbe }, .want = "http://h/%2B%2B%2B%2B" }, // "++++"
+        .{ .base = "http://h", .req = &.{ 0x01, 0x02, 0x03 }, .want = "http://h/AQID" }, // plain
+        .{ .base = "http://h", .req = &.{ 0x01, 0x02 }, .want = "http://h/AQI%3D" }, // "AQI="
+    };
+    for (cases) |c| {
+        const got = try buildGetUrl(gpa, c.base, c.req);
+        defer gpa.free(got);
+        try testing.expectEqualStrings(c.want, got);
+    }
+}
+
+test "evictExpired: an entry that expires exactly now is still servable and is kept; one second later it goes" {
+    const gpa = testing.allocator;
+    var dead: struct {
+        fn fetch(_: *anyopaque, _: std.mem.Allocator, _: FetchRequest) FetchError!FetchResponse {
+            return error.TransportFailed;
+        }
+    } = .{};
+    var cache = Cache.init(gpa, .{ .context = &dead, .fetchFn = @TypeOf(dead).fetch }, .{});
+    defer cache.deinit();
+    try cache.entries.put(gpa, keyOf("edge"), .{ .response_der = try gpa.dupe(u8, "edge"), .this_update_unix = 1, .next_update_unix = 100 });
+    try testing.expectEqual(@as(usize, 0), cache.evictExpired(100));
+    try testing.expectEqual(@as(usize, 1), cache.entries.count());
+    try testing.expectEqual(@as(usize, 1), cache.evictExpired(101));
+    try testing.expectEqual(@as(usize, 0), cache.entries.count());
+}
+
+/// A loopback server for exactly one request: it reads the request head (and a
+/// `Content-Length` body), keeps the raw text, then answers `head`, waits
+/// `gap_ms`, and sends `body`. Used to look at what `httpFetch` really puts on
+/// the wire and at how it reads an answer.
+const ScriptPeer = struct {
+    io: std.Io = undefined,
+    listener: *std.Io.net.Server = undefined,
+    head: []const u8 = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+    body: []const u8 = "HELLO",
+    gap_ms: i64 = 0,
+    req: [2048]u8 = undefined,
+    req_len: usize = 0,
+
+    fn run(p: *ScriptPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        var rbuf: [1024]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        const r = &sr.interface;
+        var content_length: usize = 0;
+        while (true) {
+            const line = r.takeDelimiterInclusive('\n') catch return;
+            if (p.req_len + line.len > p.req.len) return;
+            @memcpy(p.req[p.req_len..][0..line.len], line);
+            p.req_len += line.len;
+            if (line.len <= 2) break; // the blank line ends the head
+            const key = "content-length:";
+            if (std.ascii.startsWithIgnoreCase(line, key))
+                content_length = std.fmt.parseInt(usize, std.mem.trim(u8, line[key.len..], " \r\n"), 10) catch 0;
+        }
+        if (content_length > 0 and p.req_len + content_length <= p.req.len) {
+            r.readSliceAll(p.req[p.req_len..][0..content_length]) catch return;
+            p.req_len += content_length;
+        }
+        var wbuf: [256]u8 = undefined;
+        var sw = s.writer(p.io, &wbuf);
+        sw.interface.writeAll(p.head) catch return;
+        sw.interface.flush() catch return;
+        if (p.gap_ms > 0) p.io.sleep(.fromMilliseconds(p.gap_ms), .awake) catch return;
+        sw.interface.writeAll(p.body) catch return;
+        sw.interface.flush() catch return;
+    }
+
+    fn requestText(p: *const ScriptPeer) []const u8 {
+        return p.req[0..p.req_len];
+    }
+};
+
+/// Run `httpTransport(...).fetch(gpa, req)` against `peer` (its URL filled in).
+/// The inner error union is the transport's own result.
+fn fetchScripted(io: std.Io, gpa: std.mem.Allocator, peer: *ScriptPeer, req: FetchRequest) !(FetchError!FetchResponse) {
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("ocspcache scripted listen failed ({t})", .{err});
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    peer.io = io;
+    peer.listener = &listener;
+    const t = try std.Thread.spawn(.{}, ScriptPeer.run, .{peer});
+
+    var client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var r = req;
+    r.url = url;
+    const result = httpTransport(&client).fetch(gpa, r);
+    wakePort(io, port); // a peer still parked in accept (the client never connected) must not hang the join
+    t.join();
+    return result;
+}
+
+test "httpFetch: a POST carries the request as its body under the OCSP content type; a GET carries neither" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var post: ScriptPeer = .{};
+    const resp = try (try fetchScripted(io, testing.allocator, &post, .{ .method = .post, .url = "", .body = "OCSPREQ", .max_response_bytes = 4096 }));
+    defer testing.allocator.free(resp.body);
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    try testing.expectEqualStrings("HELLO", resp.body);
+    var lower: [2048]u8 = undefined;
+    const text = std.ascii.lowerString(&lower, post.requestText());
+    try testing.expect(std.mem.startsWith(u8, text, "post "));
+    try testing.expect(std.mem.find(u8, text, "content-type: application/ocsp-request\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, post.requestText(), "\r\n\r\nOCSPREQ"));
+
+    var get: ScriptPeer = .{};
+    const resp2 = try (try fetchScripted(io, testing.allocator, &get, .{ .method = .get, .url = "", .body = "IGNORED", .max_response_bytes = 4096 }));
+    defer testing.allocator.free(resp2.body);
+    try testing.expectEqualStrings("HELLO", resp2.body);
+    const text2 = std.ascii.lowerString(&lower, get.requestText());
+    try testing.expect(std.mem.startsWith(u8, text2, "get "));
+    try testing.expect(std.mem.find(u8, text2, "application/ocsp-request") == null);
+    try testing.expect(std.mem.endsWith(u8, get.requestText(), "\r\n\r\n"));
+}
+
+test "httpFetch: a body over max_response_bytes is ResponseTooLarge, with and without the body deadline" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    inline for (.{ 0, 5000 }) |ms| {
+        var peer: ScriptPeer = .{ .head = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n", .body = &@as([100]u8, @splat('x')) };
+        const r = try fetchScripted(io, testing.allocator, &peer, .{ .url = "", .max_response_bytes = 10, .body_timeout_ms = ms });
+        try testing.expectError(error.ResponseTooLarge, r);
+    }
+}
+
+test "httpFetch: an allocation failure while reading the body is OutOfMemory, with and without the body deadline" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    inline for (.{ 0, 5000 }) |ms| {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        var peer: ScriptPeer = .{};
+        const r = try fetchScripted(io, failing.allocator(), &peer, .{ .url = "", .max_response_bytes = 1024, .body_timeout_ms = ms });
+        try testing.expectError(error.OutOfMemory, r);
+    }
+}
+
+test "httpFetch: a body that arrives late but inside body_timeout_ms is delivered (the deadline is the configured one)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var peer: ScriptPeer = .{ .gap_ms = 150 };
+    const resp = try (try fetchScripted(io, testing.allocator, &peer, .{ .url = "", .max_response_bytes = 1024, .body_timeout_ms = 10_000 }));
+    defer testing.allocator.free(resp.body);
+    try testing.expectEqualStrings("HELLO", resp.body);
+}
+
+test "httpFetch: with no unit of concurrency to race the read, the body is read unbounded instead of refused" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .nothing });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var peer: ScriptPeer = .{};
+    const resp = try (try fetchScripted(io, testing.allocator, &peer, .{ .url = "", .max_response_bytes = 1024, .body_timeout_ms = 5000 }));
+    defer testing.allocator.free(resp.body);
+    try testing.expectEqualStrings("HELLO", resp.body);
+}
+
+test "httpFetch: a canceled body wait under body_timeout_ms is error.Canceled, not TransportFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("ocspcache cancel test listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: CancelTestPeer = .{ .io = io, .listener = &listener, .send_head = true };
+    const peer_thread = try std.Thread.spawn(.{}, CancelTestPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.release(port);
+
+    var cue: ReadCueIo = .init(io);
+    var client = http.Client.init(cue.io(), testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer client.deinit();
+    const transport = httpTransport(&client);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    // Same peer and cue as the unbounded cancel test above, but the body read now
+    // runs inside `runBounded`, whose wait is what the cancel interrupts.
+    var fut = try io.concurrent(fetchOnce, .{ transport, testing.allocator, FetchRequest{ .url = url, .max_response_bytes = 1024, .body_timeout_ms = 60_000 } });
+    const reached = ReadCueIo.awaitReads(io, 2);
+    const result = fut.cancel(io);
+    try testing.expect(reached);
+    try testing.expectError(error.Canceled, result);
+}

@@ -6,7 +6,7 @@
 
 **Scope:** core — CertMagic OCSP stapling and nginx `ssl_stapling` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-11-17 (16/16) · src 93dee96077e6b662
+**Audit:** review 2026-09-03 · mutation 2026-11-17 (102/105, 3 eq) · src 0afe6948f753f64b
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, OCSPCACHE_FUZZ) · ct n/a — public response cache (keyword review, 2026-10-07)
 
@@ -291,9 +291,15 @@ root NOTICE change accompanies this addition. `ocspcache` has no
 module-local `NOTICE` file of its own (nothing here ports third-party source
 or a design reference), so this note lives in SPEC.md only.
 
-## Delta mutation 2026-11-17 (export / import)
+## Audit 2026-11-17 (whole-module mutation)
 
-16 schemata mutants over the persistence code (ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`): `exportEntries` (the expiry compare at its boundary and dropped, the exported expiry and key, the sort comparator flipped and constant, the three cleanup paths of the error unwind), `freeExported` (each of its two frees), `subjectKey`, `importStaple` (the size bound at its boundary and dropped, subject and issuer swapped) and `refresh`'s call into the shared `verifyAndStore` (subject and issuer swapped). First run: 15 killed, 1 survived (the comparator made constant: for the two real fixtures the map happens to iterate in key order); a test that inserts 24 synthetic entries and checks the order killed it. 16 killed, 0 survived. Not mutated: `verifyAndStore`'s body (moved verbatim out of `refresh`; its steps are the 2026-09-10 run's subject and every refusal is pinned by the import tests). The earlier 2026-09-10 run is not itemized, so the card counts are this delta only.
+The 2026-09-10 run was never itemized, so the card now counts a whole-module run. 105 mutants in total: the 16 of the export/import delta (below) and 89 over the rest of `root.zig`, ReleaseSafe, one schemata build per round, each mutant under `setsid -w timeout` and `ulimit -v`.
+
+- **Delta (16).** `exportEntries` (the expiry compare at its boundary and dropped, the exported expiry and key, the sort comparator flipped and constant, the three cleanup paths of the error unwind), `freeExported` (each of its two frees), `subjectKey`, `importStaple` (the size bound at its boundary and dropped, subject and issuer swapped) and `refresh`'s call into `verifyAndStore` (subject and issuer swapped). One survivor (the comparator made constant: the two real fixtures iterate in key order) was killed by a test over 24 synthetic entries. 16 killed.
+- **Rest (89).** The AIA walk (both error arms of `discoverResponderUrl`, the extension id test, each tag check and the accessMethod OID compare, the scheme allow-list: ASCII case, `http:` without slashes), `httpFetch` (method, content-type header, body, the body-deadline switch and its value, each error arm of the read, the no-concurrency fallback), `runBounded` (the expiry compare, the cancel path), `buildGetUrl` (the slash join and each percent-encoding arm), `Cache` (`deinit`, `getStapled`, `evictExpired` at its boundary, `invalidate`, `needsRefresh` at its boundary, `nextUpdateFor`), `refresh` (the Malformed / NoResponderUrl split, the CertID hash, the method switch, what is handed to the transport, each transport-error mapping, the size ceiling, the HTTP 200 test) and `verifyAndStore` (each refusal, the verify arguments, the three status arms, the full-cache path with its eviction, the unwind, the stored fields). First run: 52 killed, 2 hung (counted killed), 35 survived. Every survivor was a missing test; 17 tests were added: the corrupt and truncated certificate, the three tag checks, scheme case, the GET URL byte for byte, the eviction boundary, a loopback server for what `httpFetch` sends (POST body and content type, GET without), a body over the ceiling, an allocation failure, a late body inside the deadline, no concurrency available, a cancel inside the bounded read, what `refresh` hands the transport (deadline, ceiling, hash, both methods), every transport error name, the non-200 statuses, a response of another type, and a full cache with an expired entry. Second run: 86 killed, 3 survive, argued equivalent below.
+- **Equivalent / unobservable (3).** `mapReadAllAllocError`'s `Timeout` arm: `Response.readAllAlloc` over HTTP/1.1 never returns `Timeout` (only an h2 session's read failure could), so the arm is defensive. `runBounded`'s `<= 0` as `< 0`: the two differ only when the monotonic clock reads exactly the deadline. `Config.max_age_seconds` handed to `ocsp.verify`: it matters only for a response without `nextUpdate`, and a signed one needs the RSA signer outside this module's graph; `nextUpdateFor` (the arm that uses it) is tested directly, and `ocsp` tests its own bound.
+- **Not mutated.** The `follow_redirects = false` flag (pinned by the redirect test), the `ctx.result` read after a cancel in `runBounded` (a success landing inside the cancel window needs a precisely timed peer), allocation-failure arms of `refresh` and `buildGetUrl` (arid). `Entry.this_update_unix` is stored and nothing reads it (a test pins the stored value, so the mutant of it is killed).
+- Cards: `mutation 2026-11-17 (102/105, 3 eq)`.
 
 ## Deferred (out of scope, not silently skipped)
 
@@ -334,4 +340,5 @@ Debug and ReleaseFast.
 
 - ~~**Inherits the `ocsp` ECDSA P-384 gap**~~ (survey 2026-09-30) — **fixed in `ocsp` 2026-09-30**; nothing to change here (`refresh` verifies through `ocsp.verify`).
 - **Optional persistence of cached staples across restarts** — DONE 2026-11-17, see "Persistence across restarts".
+- **Drop the private `runBounded` copy** (noted 2026-11-17): `http.Client.Response.readAllAllocTimeout` now offers the bounded whole-body read this module's `httpFetch` hand-rolls; moving to it would delete `runBounded` and its mutants, at the price of re-pinning the cancel and timeout tests.
 
