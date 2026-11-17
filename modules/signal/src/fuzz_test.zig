@@ -8,7 +8,9 @@
 //! message; a replay is refused), `signal-x3dh` (PreKeyBundle / InitialMessage
 //! codecs and the handshake: a damaged bundle or initial message never yields
 //! an agreed session) and `signal-xeddsa` (genuine signature accepted, a
-//! flipped bit / other message / other key refused).
+//! flipped bit / other message / other key refused) and `signal-state`
+//! (`ratchet.State.toBytes`/`fromBytes`: round trip, truncation / trailing
+//! octet / bad version always refused, damaged and random bytes a verdict).
 //!
 //! X25519 ignores the top bit of a public key's last octet (RFC 7748), so a
 //! flip of that bit is the same key; where the AEAD associated data does not
@@ -200,6 +202,120 @@ test "fuzz driver: SIGNAL_FUZZ (ratchet)" {
 }
 test "fuzz harness: ratchet, 200 seeds, reaches every outcome" {
     try RatchetMark.reach(fuzzRatchet, "signal-ratchet", 200);
+}
+
+// ── ratchet state codec ────────────────────────────────────────────────────
+
+const StateMark = Marker(enum { round_trip, skipped_present, truncated_refused, version_refused, trailing_refused, damaged_accepted, damaged_refused, random_refused });
+
+fn fuzzState(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var raw: [24]u8 = undefined;
+    const raw_len: usize = src.slice(&raw);
+    var knobs: Cursor = .{ .bytes = raw[0..raw_len] };
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var sk: [32]u8 = undefined;
+    expand(&knobs, &sk);
+    var ad: [rat.associated_data_length]u8 = undefined;
+    expand(&knobs, &ad);
+    const bob_kp = try keyPair(&knobs);
+    var alice: rat.State = undefined;
+    try rat.State.initAlice(&sk, ad, bob_kp.public_key, io, &alice);
+    defer alice.deinit(gpa);
+    var bob: rat.State = undefined;
+    rat.State.initBob(&sk, ad, &bob_kp, &bob);
+    defer bob.deinit(gpa);
+
+    // A few turns; the receiver takes only the LAST message of each burst, so
+    // skipped keys accumulate in the state under test.
+    const turns = knobs.ranged(0, 3);
+    for (0..turns) |turn| {
+        const a_sends = turn % 2 == 0;
+        const tx = if (a_sends) &alice else &bob;
+        const rx = if (a_sends) &bob else &alice;
+        const count = knobs.ranged(1, 3);
+        for (0..count) |i| {
+            const m = try tx.encrypt(gpa, "m");
+            defer m.deinit(gpa);
+            if (i + 1 == count) gpa.free(try rx.decrypt(gpa, m.header, m.ciphertext, io));
+        }
+    }
+    const subject = if (knobs.byte() & 1 == 1) &alice else &bob;
+    if (subject.mkskipped.count() > 0) StateMark.mark(.skipped_present);
+
+    // Heap, not stack: the largest encoding is 136 KB.
+    const buf = try gpa.alloc(u8, rat.State.max_encoded_length + 1);
+    defer {
+        std.crypto.secureZero(u8, buf);
+        gpa.free(buf);
+    }
+    const scratch = try gpa.alloc(u8, rat.State.max_encoded_length + 1);
+    defer {
+        std.crypto.secureZero(u8, scratch);
+        gpa.free(scratch);
+    }
+    const wire = try subject.toBytes(buf);
+
+    // Round trip: decodes, re-encodes to the same length, and keeps the secrets.
+    var back: rat.State = undefined;
+    rat.State.fromBytes(gpa, wire, &back) catch return error.GenuineStateRefused;
+    {
+        defer back.deinit(gpa);
+        if (back.encodedLength() != wire.len) return error.RoundTripLengthDiffers;
+        if (!std.mem.eql(u8, &back.rk, &subject.rk) or !std.mem.eql(u8, &back.dhs.public_key, &subject.dhs.public_key)) return error.RoundTripFieldDiffers;
+        if (back.mkskipped.count() != subject.mkskipped.count()) return error.RoundTripSkippedDiffers;
+        StateMark.mark(.round_trip);
+    }
+
+    // Truncation, a trailing octet and a wrong version are always refused.
+    {
+        const cut = src.index(wire.len);
+        if (rat.State.fromBytes(gpa, wire[0..cut], &back)) |_| {
+            back.deinit(gpa);
+            return error.TruncatedStateAccepted;
+        } else |_| StateMark.mark(.truncated_refused);
+        @memcpy(scratch[0..wire.len], wire);
+        scratch[wire.len] = src.value(u8);
+        if (rat.State.fromBytes(gpa, scratch[0 .. wire.len + 1], &back)) |_| {
+            back.deinit(gpa);
+            return error.TrailingByteAccepted;
+        } else |_| StateMark.mark(.trailing_refused);
+        @memcpy(scratch[0..wire.len], wire);
+        scratch[0] ^= @as(u8, 1) << @intCast(knobs.ranged(0, 7));
+        if (rat.State.fromBytes(gpa, scratch[0..wire.len], &back)) |_| {
+            back.deinit(gpa);
+            return error.BadVersionAccepted;
+        } else |_| StateMark.mark(.version_refused);
+    }
+
+    // Damaged copy: a verdict, never a panic; an accepted one is a coherent state.
+    {
+        const n = damage(src, scratch, wire);
+        if (rat.State.fromBytes(gpa, scratch[0..n], &back)) |_| {
+            defer back.deinit(gpa);
+            if (back.encodedLength() != n) return error.AcceptedLengthDiffers;
+            StateMark.mark(.damaged_accepted);
+        } else |_| StateMark.mark(.damaged_refused);
+    }
+    // Arbitrary bytes.
+    {
+        const rn = src.index(300);
+        src.bytes(scratch[0..rn]);
+        if (rn > 0 and src.value(u8) & 1 == 1) scratch[0] = rat.State.format_version;
+        if (rat.State.fromBytes(gpa, scratch[0..rn], &back)) |_| back.deinit(gpa) else |_| StateMark.mark(.random_refused);
+    }
+}
+
+test "fuzz: signal ratchet state codec, round trip / damaged refused" {
+    try testing.fuzz({}, smithWrap(fuzzState), .{});
+}
+test "fuzz driver: SIGNAL_FUZZ (state)" {
+    try fuzz_driver.run(fuzzState, .{ .prefix = "SIGNAL_FUZZ", .name = "signal-state", .scale = 2 });
+}
+test "fuzz harness: state, 200 seeds, reaches every outcome" {
+    try StateMark.reach(fuzzState, "signal-state", 200);
 }
 
 // ── x3dh ───────────────────────────────────────────────────────────────────

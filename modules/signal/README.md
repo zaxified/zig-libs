@@ -158,8 +158,23 @@ defer allocator.free(pt);                          // pt == "hello"
   security (each DH ratchet re-randomizes the root key). `decrypt` is
   **transactional** — a tampered message never advances or corrupts the
   session (fail-closed).
-- **Out of scope**: header encryption (HE) and a stable on-disk
-  session-persistence format. See [SPEC.md](SPEC.md). (PQXDH seeding was in
+- **Persistence**: `state.toBytes(out)` writes a versioned encoding
+  (`State.format_version`, at most `State.max_encoded_length` bytes — size the
+  buffer with `state.encodedLength()`) and `State.fromBytes(allocator, bytes,
+  &state)` restores it (`error.InvalidState` on anything malformed). The
+  bytes are secret key material: encrypt them at rest, and `secureZero` the
+  buffer after use.
+  ```zig
+  const buf = try allocator.alloc(u8, state.encodedLength());
+  defer { std.crypto.secureZero(u8, buf); allocator.free(buf); }
+  const bytes = try state.toBytes(buf);   // store `bytes` (encrypted)
+  var restored: signal.ratchet.State = undefined;
+  try signal.ratchet.State.fromBytes(allocator, bytes, &restored);
+  defer restored.deinit(allocator);
+  ```
+- **Out of scope**: header encryption (HE) and interop of the persisted
+  state with other implementations (it is this module's own layout, not
+  libsignal's `SessionStructure`). See [SPEC.md](SPEC.md). (PQXDH seeding was in
   this list until 2026-08-22 and is now Part 3 — seed the ratchet with
   `PqAgreement.ratchetAssociatedData()`, not the full 1632-byte AD; see the
   walkthrough below for why they differ.)
