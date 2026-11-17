@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of `RewindableBody` / `FileSpool` (64 mutants, 61 killed, 3 equivalent); the card's audit line is cumulative and its `src` hash re-recorded.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only: one spool per body, a spool that comes up short or lies latches the read failure, `FileSpool` over a file opened without read or write access is `SpoolReadFailed` / `SpoolWriteFailed`, and a `create`d spool closes its descriptor.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only: `RewindableBody` and `FileSpool` pinned further (non-power-of-two `memory_limit`, tap never handed an empty slice, deinit wipes the staging and reader buffers and is idempotent, a `reader()` taken mid-body restarts, `stream` honours its limit, the read-failure latch, a lying or over-long spool, a reused `FileSpool`).
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only: `RewindableBody` over an h2 request body (buffered and streaming server modes: a multi-frame body re-reads identically from byte 0 through the spool, a small one never opens it).

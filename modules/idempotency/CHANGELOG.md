@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the `Options.spool` branch (18/18 killed); the card's audit line is cumulative and its `src` hash re-recorded.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only: the `Options.spool` memory/spool boundary at `max_body_bytes` and the query as part of the fingerprint on the spooled path.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only: `Options.spool` with a chunked request body (same fingerprint as the Content-Length framing, so it replays), a body cut short (Content-Length unmet, chunked without its end: not 413, no handler, nothing reserved) and bytes beyond Content-Length.
 - **2026-11-17** — **FEATURE:** `Options.spool` (opt-in, default null = behaviour unchanged) fingerprints a body past `max_body_bytes`: the first `max_body_bytes` stay in memory, the rest goes to a spool the `SpoolSource` opens per request (`http.Server.FileSpool` over a caller-opened temp file is the ready one), SHA-256 is taken in the same pass (`fingerprintDigest`; identical to the one-shot fingerprint, so stored records stay valid) and the handler reads the body back from byte 0 through `http.Server.RewindableBody`. `max_spooled_body_bytes` caps the whole body (413). A spool failure is a server error, never the 413, and reserves nothing.
