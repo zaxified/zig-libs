@@ -29,6 +29,7 @@ const hpke = @import("hpke");
 const aesgcm = @import("aesgcm");
 const burn = @import("burn.zig");
 const p256 = @import("p256");
+const p384 = @import("p384");
 
 /// RFC 9420 §17.1's registry — every suite name IANA has assigned a
 /// `CipherSuite` value to. The ones this module instantiates are listed in
@@ -247,6 +248,18 @@ pub const Mls128P256Aes128GcmSha256P256 = CipherSuite(
     .mls_128_dhkemp256_aes128gcm_sha256_p256,
 );
 
+/// `0x0007` = `MLS_256_DHKEMP384_AES256GCM_SHA384_P384`: DHKEM(P-384,
+/// HKDF-SHA384) + AES-256-GCM + SHA-384 + ECDSA over P-384 with SHA-384, on
+/// `hpke.P384Kem` and the sibling `p384` module.
+pub const Mls256P384Aes256GcmSha384P384 = CipherSuite(
+    hpke.P384Kem,
+    aesgcm.Aes256Gcm,
+    std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384),
+    std.crypto.hash.sha2.Sha384,
+    p384.EcdsaP384Sha384,
+    .mls_256_dhkemp384_aes256gcm_sha384_p384,
+);
+
 /// The suite a caller with no suite-negotiation needs of its own should
 /// reach for first — RFC 9420 §16.1's mandatory-to-implement `0x0001`.
 pub const default = Mls128X25519Aes128GcmSha256Ed25519;
@@ -258,6 +271,7 @@ pub const supported = .{
     Mls128X25519Aes128GcmSha256Ed25519,
     Mls128P256Aes128GcmSha256P256,
     Mls128X25519ChaCha20Poly1305Sha256Ed25519,
+    Mls256P384Aes256GcmSha384P384,
 };
 
 // ── tests ─────────────────────────────────────────────────────────────
@@ -299,6 +313,16 @@ test "0x0002: widths match RFC 9420 §17.1's MLS_128_DHKEMP256_AES128GCM_SHA256_
     try testing.expectEqual(@as(usize, 65), S.Nspk); // uncompressed SEC1
     try testing.expectEqual(@as(usize, 32), S.Nssk);
     try testing.expectEqual(@as(usize, 65), S.Kem.Npk);
+}
+
+test "0x0007: widths match RFC 9420 §17.1's MLS_256_DHKEMP384_AES256GCM_SHA384_P384 row" {
+    const S7 = Mls256P384Aes256GcmSha384P384;
+    try testing.expectEqual(@as(u16, 0x0007), @backingInt(S7.id));
+    try testing.expectEqual(@as(usize, 48), S7.Nh);
+    try testing.expectEqual(@as(usize, 32), S7.Nk);
+    try testing.expectEqual(@as(usize, 48), S7.Nm);
+    try testing.expectEqual(@as(usize, 97), S7.Nspk);
+    try testing.expectEqual(@as(usize, 48), S7.Nssk);
 }
 
 test "ECDSA encodings: compressed keys and malformed DER are refused, a signature round-trips" {

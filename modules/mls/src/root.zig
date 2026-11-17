@@ -113,7 +113,7 @@
 //! | File | What it provides |
 //! |---|---|
 //! | `codec.zig` | The RFC 9420 §2.1 TLS-presentation-language (de)serializer: fixed-width big-endian ints, `optional<T>`, enums, and RFC 9420's ONE deviation from plain RFC 8446 — QUIC-style variable-length-integer VECTOR length prefixes (§2.1.2) — every later part's wire formats are built on `Writer`/`Reader` |
-//! | `suite.zig` | `CipherSuite(...)`, a comptime bundle of (KEM, KDF, AEAD, Hash, Signature); suites `0x0001` (RFC 9420's mandatory-to-implement suite, `default`), `0x0002`, `0x0003` instantiated (`supported`), plus the per-suite signature and public-key wire encodings |
+//! | `suite.zig` | `CipherSuite(...)`, a comptime bundle of (KEM, KDF, AEAD, Hash, Signature); suites `0x0001` (RFC 9420's mandatory-to-implement suite, `default`), `0x0002`, `0x0003`, `0x0007` instantiated (`supported`), plus the per-suite signature and public-key wire encodings |
 //! | `crypto.zig` | The seven labeled-crypto primitives RFC 9420 §5/§8/§9.1 define: `RefHash`/`make_keypackage_ref`/`make_proposal_ref`, `ExpandWithLabel`/`DeriveSecret`, `DeriveTreeSecret`, `SignWithLabel`/`VerifyWithLabel`, `EncryptWithLabel`/`DecryptWithLabel` (the last pair delegates to the sibling `hpke` module's `sealBase`/`openBase`) |
 //! | `treemath.zig` | RFC 9420 Appendix C's array-based binary tree math — `left`/`right`/`parent`/`sibling`, `root`, `direct_path`, `copath`, `is_leaf`, `node_width`, `level` — a direct port of the RFC's own published Python |
 //! | `kat_test.zig` | Part 1's official RFC 9420 interop vectors (`tree-math.json`/`crypto-basics.json`), embedded and driven end-to-end — see `NOTICE` for provenance |
@@ -390,7 +390,7 @@ pub const meta = .{
     // `suite.CipherSuite(...)` is a comptime type, not an instance).
     .concurrency = .reentrant,
     .model_after = "RFC 9420 (Messaging Layer Security); treemath.zig ports Appendix C's own published Python reference verbatim",
-    .deps = .{ "hpke", "aesgcm", "p256" }, // aesgcm: the AES-GCM suites' message AEAD; p256: the ECDSA suites' signatures
+    .deps = .{ "hpke", "aesgcm", "p256", "p384" }, // aesgcm: the AES-GCM suites' message AEAD; p256/p384: the ECDSA suites' signatures
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -430,9 +430,9 @@ test {
     _ = @import("stackprobe_test.zig");
 }
 
-test "meta.deps is exactly {\"hpke\", \"aesgcm\", \"p256\"}" {
-    try std.testing.expectEqual(@as(usize, 3), meta.deps.len);
-    inline for (.{ "hpke", "aesgcm", "p256" }, 0..) |want, i| {
+test "meta.deps is exactly {\"hpke\", \"aesgcm\", \"p256\", \"p384\"}" {
+    try std.testing.expectEqual(@as(usize, 4), meta.deps.len);
+    inline for (.{ "hpke", "aesgcm", "p256", "p384" }, 0..) |want, i| {
         try std.testing.expectEqualStrings(want, meta.deps[i]);
     }
 }

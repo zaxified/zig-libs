@@ -7862,7 +7862,7 @@ test "NIST-curve private keys: create/fromWelcome refuse a scalar outside [1, n-
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
-    inline for (.{suite.Mls128P256Aes128GcmSha256P256}) |P| {
+    inline for (.{ suite.Mls128P256Aes128GcmSha256P256, suite.Mls256P384Aes256GcmSha384P384 }) |P| {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const aa = arena.allocator();
