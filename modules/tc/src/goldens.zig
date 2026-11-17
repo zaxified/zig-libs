@@ -1911,3 +1911,346 @@ test "action goldens re-parse: the standalone table messages" {
         try testing.expectEqual(@as(?GactWire, null), a.gact); // no options nest
     }
 }
+
+// ── matchall and bpf classifiers (captured 2026-11-17, iproute2-6.19.0, `unshare -rn`;
+// setup `tc qdisc add dev lo root handle 1: htb default 10`) ──────────────────────────
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1794888719 len=64
+// tc filter add dev lo parent 1: protocol all prio 2 matchall classid 1:10
+const g_matchall_classid_all =
+    "400000002c0005060fd4fb6a0000000000000000010000000000000000000100000302000d0001006d61746368616c6c" ++
+    "000000000c0002000800010010000100";
+const seq_matchall_classid_all: u32 = 1794888719;
+
+test "golden: matchall classid (protocol all)" {
+    // tc filter add dev lo parent 1: protocol all prio 2 matchall classid 1:10
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_matchall_classid_all,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 2, .eth_type = ETH_P.ALL },
+        .{ .matchall = .{ .classid = Handle.init(1, 0x10) } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_matchall_classid_all, req);
+}
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1794888719 len=72
+// tc filter add dev lo parent 1: protocol ip prio 3 matchall skip_sw classid 1:10
+const g_matchall_skip_sw =
+    "480000002c0005060fd4fb6a0000000000000000010000000000000000000100080003000d0001006d61746368616c6c" ++
+    "000000001400020008000100100001000800030002000000";
+const seq_matchall_skip_sw: u32 = 1794888719;
+
+test "golden: matchall skip_sw (FLAGS after CLASSID)" {
+    // tc filter add dev lo parent 1: protocol ip prio 3 matchall skip_sw classid 1:10
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_matchall_skip_sw,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 3, .eth_type = ETH_P.IP },
+        .{ .matchall = .{ .classid = Handle.init(1, 0x10), .flags = 2 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_matchall_skip_sw, req);
+}
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1794888719 len=72
+// tc filter add dev lo parent 1: protocol ip prio 3 matchall skip_hw classid 1:10
+const g_matchall_skip_hw =
+    "480000002c0005060fd4fb6a0000000000000000010000000000000000000100080003000d0001006d61746368616c6c" ++
+    "000000001400020008000100100001000800030001000000";
+const seq_matchall_skip_hw: u32 = 1794888719;
+
+test "golden: matchall skip_hw" {
+    // tc filter add dev lo parent 1: protocol ip prio 3 matchall skip_hw classid 1:10
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_matchall_skip_hw,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 3, .eth_type = ETH_P.IP },
+        .{ .matchall = .{ .classid = Handle.init(1, 0x10), .flags = 1 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_matchall_skip_hw, req);
+}
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1794888719 len=104
+// tc filter add dev lo parent 1: protocol ip prio 4 matchall action drop
+const g_matchall_drop =
+    "680000002c0005060fd4fb6a0000000000000000010000000000000000000100080004000d0001006d61746368616c6c" ++
+    "0000000034000200300002002c0001000900010067616374000000001c00028018000200000000000000000002000000" ++
+    "0000000000000000";
+const seq_matchall_drop: u32 = 1794888719;
+
+test "golden: matchall + gact drop" {
+    // tc filter add dev lo parent 1: protocol ip prio 4 matchall action drop
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_matchall_drop,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 4, .eth_type = ETH_P.IP },
+        .{ .matchall = .{ .actions = &.{.{ .gact = .{ .action = .shot } }} } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_matchall_drop, req);
+}
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1794888719 len=112
+// tc filter add dev lo parent 1: protocol ip prio 5 matchall flowid 1:20 action drop
+const g_matchall_flowid_drop =
+    "700000002c0005060fd4fb6a0000000000000000010000000000000000000100080005000d0001006d61746368616c6c" ++
+    "000000003c0002000800010020000100300002002c0001000900010067616374000000001c0002801800020000000000" ++
+    "00000000020000000000000000000000";
+const seq_matchall_flowid_drop: u32 = 1794888719;
+
+test "golden: matchall flowid + gact drop (CLASSID before ACT)" {
+    // tc filter add dev lo parent 1: protocol ip prio 5 matchall flowid 1:20 action drop
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_matchall_flowid_drop,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 5, .eth_type = ETH_P.IP },
+        .{ .matchall = .{ .classid = Handle.init(1, 0x20), .actions = &.{.{ .gact = .{ .action = .shot } }} } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_matchall_flowid_drop, req);
+}
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1794888719 len=120
+// tc filter add dev lo parent 1: protocol ip prio 3 matchall skip_hw classid 1:10 action drop
+const g_matchall_skip_hw_classid_drop =
+    "780000002c0005060fd4fb6a0000000000000000010000000000000000000100080003000d0001006d61746368616c6c" ++
+    "00000000440002000800010010000100300002002c0001000900010067616374000000001c0002801800020000000000" ++
+    "000000000200000000000000000000000800030001000000";
+const seq_matchall_skip_hw_classid_drop: u32 = 1794888719;
+
+test "golden: matchall classid + action + flags (CLASSID, ACT, FLAGS)" {
+    // tc filter add dev lo parent 1: protocol ip prio 3 matchall skip_hw classid 1:10 action drop
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_matchall_skip_hw_classid_drop,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 3, .eth_type = ETH_P.IP },
+        .{ .matchall = .{ .classid = Handle.init(1, 0x10), .actions = &.{.{ .gact = .{ .action = .shot } }}, .flags = 1 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_matchall_skip_hw_classid_drop, req);
+}
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1794888720 len=112
+// tc filter add dev lo parent 1: protocol ip prio 3 matchall skip_sw action drop
+const g_matchall_skip_sw_drop =
+    "700000002c00050610d4fb6a0000000000000000010000000000000000000100080003000d0001006d61746368616c6c" ++
+    "000000003c000200300002002c0001000900010067616374000000001c00028018000200000000000000000002000000" ++
+    "00000000000000000800030002000000";
+const seq_matchall_skip_sw_drop: u32 = 1794888720;
+
+test "golden: matchall action + flags, no classid" {
+    // tc filter add dev lo parent 1: protocol ip prio 3 matchall skip_sw action drop
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_matchall_skip_sw_drop,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 3, .eth_type = ETH_P.IP },
+        .{ .matchall = .{ .actions = &.{.{ .gact = .{ .action = .shot } }}, .flags = 2 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_matchall_skip_sw_drop, req);
+}
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1794888720 len=76
+// tc filter add dev lo parent 1: protocol ip prio 1 bpf bytecode '1,6 0 0 4294967295,' classid 1:10
+const g_bpf_bytecode_classid =
+    "4c0000002c00050610d4fb6a000000000000000001000000000000000000010008000100080001006270660020000200" ++
+    "080003001000010006000400010000000c00050006000000ffffffff";
+const seq_bpf_bytecode_classid: u32 = 1794888720;
+
+test "golden: bpf classic bytecode + classid" {
+    // tc filter add dev lo parent 1: protocol ip prio 1 bpf bytecode '1,6 0 0 4294967295,' classid 1:10
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_bpf_bytecode_classid,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 1, .eth_type = ETH_P.IP },
+        .{ .bpf = .{ .ops = &.{.{ .code = 6, .k = 0xffffffff }}, .classid = Handle.init(1, 0x10) } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_bpf_bytecode_classid, req);
+}
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1794888720 len=124
+// tc filter add dev lo parent 1: protocol ip prio 2 bpf bytecode '2,32 0 0 0,6 0 0 4294967295,' action drop
+const g_bpf_bytecode_drop =
+    "7c0000002c00050610d4fb6a000000000000000001000000000000000000010008000200080001006270660050000200" ++
+    "300001002c0001000900010067616374000000001c000280180002000000000000000000020000000000000000000000" ++
+    "060004000200000014000500200000000000000006000000ffffffff";
+const seq_bpf_bytecode_drop: u32 = 1794888720;
+
+test "golden: bpf two-instruction bytecode + gact drop (ACT before OPS_LEN)" {
+    // tc filter add dev lo parent 1: protocol ip prio 2 bpf bytecode '2,32 0 0 0,6 0 0 4294967295,' action drop
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_bpf_bytecode_drop,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 2, .eth_type = ETH_P.IP },
+        .{ .bpf = .{ .ops = &.{ .{ .code = 32 }, .{ .code = 6, .k = 0xffffffff } }, .actions = &.{.{ .gact = .{ .action = .shot } }} } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_bpf_bytecode_drop, req);
+}
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1794888720 len=76
+// tc filter add dev lo parent 1: protocol ip prio 3 bpf bytecode '1,6 0 0 4294967295,' skip_sw
+const g_bpf_bytecode_skip_sw =
+    "4c0000002c00050610d4fb6a000000000000000001000000000000000000010008000300080001006270660020000200" ++
+    "06000400010000000c00050006000000ffffffff0800090002000000";
+const seq_bpf_bytecode_skip_sw: u32 = 1794888720;
+
+test "golden: bpf skip_sw (FLAGS_GEN)" {
+    // tc filter add dev lo parent 1: protocol ip prio 3 bpf bytecode '1,6 0 0 4294967295,' skip_sw
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_bpf_bytecode_skip_sw,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 3, .eth_type = ETH_P.IP },
+        .{ .bpf = .{ .ops = &.{.{ .code = 6, .k = 0xffffffff }}, .flags_gen = 2 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_bpf_bytecode_skip_sw, req);
+}
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1794888720 len=84
+// tc filter add dev lo parent 1: protocol ip prio 4 bpf bytecode '1,6 0 0 4294967295,' da classid 1:10
+const g_bpf_bytecode_da =
+    "540000002c00050610d4fb6a000000000000000001000000000000000000010008000400080001006270660028000200" ++
+    "080003001000010006000400010000000c00050006000000ffffffff0800080001000000";
+const seq_bpf_bytecode_da: u32 = 1794888720;
+
+test "golden: bpf direct-action (FLAGS)" {
+    // tc filter add dev lo parent 1: protocol ip prio 4 bpf bytecode '1,6 0 0 4294967295,' da classid 1:10
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_bpf_bytecode_da,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 4, .eth_type = ETH_P.IP },
+        .{ .bpf = .{ .ops = &.{.{ .code = 6, .k = 0xffffffff }}, .classid = Handle.init(1, 0x10), .direct_action = true } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_bpf_bytecode_da, req);
+}
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1794888720 len=140
+// tc filter add dev lo parent 1: protocol ip prio 5 bpf bytecode '1,6 0 0 4294967295,' da skip_hw classid 1:10 action drop
+const g_bpf_bytecode_all =
+    "8c0000002c00050610d4fb6a000000000000000001000000000000000000010008000500080001006270660060000200" ++
+    "0800030010000100300001002c0001000900010067616374000000001c00028018000200000000000000000002000000" ++
+    "000000000000000006000400010000000c00050006000000ffffffff08000900010000000800080001000000";
+const seq_bpf_bytecode_all: u32 = 1794888720;
+
+test "golden: bpf classid + action + da + skip_hw (CLASSID, ACT, OPS_LEN, OPS, FLAGS_GEN, FLAGS)" {
+    // tc filter add dev lo parent 1: protocol ip prio 5 bpf bytecode '1,6 0 0 4294967295,' da skip_hw classid 1:10 action drop
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq_bpf_bytecode_all,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 5, .eth_type = ETH_P.IP },
+        .{ .bpf = .{ .ops = &.{.{ .code = 6, .k = 0xffffffff }}, .classid = Handle.init(1, 0x10), .actions = &.{.{ .gact = .{ .action = .shot } }}, .direct_action = true, .flags_gen = 1 } },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(g_bpf_bytecode_all, req);
+}
+
+test "goldens re-parse: matchall and bpf filters" {
+    const codec = @import("netlink").codec;
+    var buf: [512]u8 = undefined;
+    {
+        const bytes = try std.fmt.hexToBytes(buf[0 .. g_matchall_skip_hw_classid_drop.len / 2], g_matchall_skip_hw_classid_drop);
+        var it: codec.MessageIterator = .{ .buf = bytes };
+        const m = (try it.next()).?;
+        const f = try filter.parseFilter(m.payload);
+        try testing.expectEqualStrings("matchall", f.kind());
+        try testing.expectEqual(@as(u16, 3), f.prio);
+        try testing.expectEqual(ETH_P.IP, f.eth_type);
+        try testing.expectEqual(Handle.init(1, 0x10).raw, f.classid().?.raw);
+        try testing.expectEqual(@as(u32, 1), f.matchall.?.flags.?);
+        try testing.expectEqual(@as(usize, 1), f.actions().len);
+    }
+    {
+        const bytes = try std.fmt.hexToBytes(buf[0 .. g_matchall_classid_all.len / 2], g_matchall_classid_all);
+        var it: codec.MessageIterator = .{ .buf = bytes };
+        const m = (try it.next()).?;
+        const f = try filter.parseFilter(m.payload);
+        try testing.expectEqual(ETH_P.ALL, f.eth_type);
+        try testing.expectEqual(@as(?u32, null), f.matchall.?.flags);
+        try testing.expectEqual(@as(usize, 0), f.actions().len);
+    }
+    {
+        const bytes = try std.fmt.hexToBytes(buf[0 .. g_bpf_bytecode_all.len / 2], g_bpf_bytecode_all);
+        var it: codec.MessageIterator = .{ .buf = bytes };
+        const m = (try it.next()).?;
+        const f = try filter.parseFilter(m.payload);
+        try testing.expectEqualStrings("bpf", f.kind());
+        const b = f.bpf.?;
+        try testing.expectEqual(@as(u16, 1), b.ops_len.?);
+        try testing.expectEqual(filter.TCA_BPF_FLAG_ACT_DIRECT, b.flags.?);
+        try testing.expectEqual(@as(u32, 1), b.flags_gen.?);
+        try testing.expectEqual(Handle.init(1, 0x10).raw, f.classid().?.raw);
+        try testing.expectEqual(@as(usize, 1), f.actions().len);
+    }
+}
+
+test "bpf: an empty or over-long program is refused; an empty matchall is an empty options nest" {
+    try testing.expectError(error.BadBpfProgram, message.buildFilterSetWith(
+        gpa,
+        0,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 1, .eth_type = ETH_P.IP },
+        .{ .bpf = .{ .ops = &.{} } },
+        ps,
+    ));
+    const too_many = try gpa.alloc(filter.BpfInsn, filter.bpf_max_insns + 1);
+    defer gpa.free(too_many);
+    @memset(too_many, .{ .code = 6 });
+    try testing.expectError(error.BadBpfProgram, message.buildFilterSetWith(
+        gpa,
+        0,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 1, .eth_type = ETH_P.IP },
+        .{ .bpf = .{ .ops = too_many } },
+        ps,
+    ));
+    // The longest accepted program.
+    const max = try message.buildFilterSetWith(
+        gpa,
+        0,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 1, .eth_type = ETH_P.IP },
+        .{ .bpf = .{ .ops = too_many[0..filter.bpf_max_insns] } },
+        ps,
+    );
+    defer gpa.free(max);
+    const bare = try message.buildFilterSetWith(
+        gpa,
+        0,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 1, .eth_type = ETH_P.IP },
+        .{ .matchall = .{} },
+        ps,
+    );
+    defer gpa.free(bare);
+    // 36 header+tcmsg, 16 kind attribute, 4 empty TCA_OPTIONS.
+    try testing.expectEqual(@as(usize, 36 + 16 + 4), bare.len);
+}

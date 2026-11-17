@@ -34,8 +34,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 **Where we are ahead:** of the Go and Rust libraries, CAKE and `mq` with the full option set,
 the psched rate tables done the way `tc` does (byte-exact goldens diffed against the real `tc`
 6.19), the standalone action table, hexadecimal handles and 64-bit rates; and it is the only
-Zig option. **Where we are behind:** the common classic qdiscs, `matchall`/`bpf`
-classifiers and `pedit`/`tunnel_key`/`connmark` (→ Backlog; all reachable via the `raw`
+Zig option. **Where we are behind:** the common classic qdiscs, eBPF-object `bpf`
+filters and `pedit`/`tunnel_key`/`connmark` (→ Backlog; all reachable via the `raw`
 escape hatches). `ingress`/`clsact` are typed since 2026-11-17. Statistics on qdisc/class dumps (`tc -s`) are decoded since 2026-11-17.
 
 ## Design & invariants
@@ -418,8 +418,9 @@ caller-supplied rate/size can panic in ReleaseSafe or wrap in ReleaseFast.
   count, and `Socket.actions()` (the standalone dump) is uncapped.
 - **The rate estimator** (`TCA_STATS_RATE_EST`/`RATE_EST64`) and `TCA_STATS_APP` are
   ignored; only basic counters, queue drops/overlimits and the `tcf_t` timestamps decode.
-- **Other classifiers**: `bpf`, `matchall`, `basic`, `route`, `fw`, `cgroup`. Only `u32`
-  and `flower` are modelled; anything else needs `FilterSpec.raw`.
+- **Other classifiers**: `basic`, `route`, `fw`, `cgroup`, and `bpf` from an eBPF object or fd
+  (`obj`/`fd`/`pinned`; only an inline classic-BPF program is modelled). `u32`, `flower`,
+  `matchall` and `bpf bytecode` are typed; anything else needs `FilterSpec.raw`.
 - **u32 hash tables**: `TCA_U32_DIVISOR`/`HASH`/`LINK` (linked hash tables, `ht 800:`
   bucket routing) and `TCA_U32_MARK`/`FLAGS`/`INDEV`/`POLICE`. The selector's variable
   offset fields (`offshift`/`offmask`/`off`/`offoff`/`hoff`/`hmask`, i.e. `at nexthdr+N`)
@@ -458,7 +459,7 @@ reachable through `raw` today:
 
 1. ✅ 2026-11-17 **`ingress` / `clsact` qdiscs** (survey 2026-09-30) — `QdiscSpec.ingress` / `.clsact` (kind only, no `TCA_OPTIONS`, like `mq`); the caller passes handle `ffff:` and parent `Handle.ingress`/`.clsact` exactly as `tc` sends them. Goldens captured from iproute2 6.19.0 (`tc qdisc add dev lo ingress|clsact`). Was: the attach point for every ingress filter and for BPF (`tc filter ... direct-action`); without a typed spec a user cannot do ingress policing at all without hand-encoding. Effort: small (option-less, like `mq`).
 2. ✅ 2026-11-17 **Statistics on qdisc/class dumps** (survey 2026-09-30) — `Qdisc.stats`/`Class.stats: ?Stats` from `TCA_STATS2` (basic, queue, rate estimators, `PKT64`, `BASIC_HW`) with the legacy `TCA_STATS` as fallback; `Qdisc.fq_codel_xstats` from `TCA_XSTATS`. A sub-attribute shorter than its struct is skipped like other optional attributes (stats stay null if nothing valid decoded); a malformed nest is a codec error. Layouts from the local UAPI headers.
-3. **`matchall` and `bpf` classifiers** (survey 2026-09-30) — `matchall` is the standard "everything" filter; `bpf` is how eBPF programs are attached (pairs with the `ebpf` module). Effort: small each.
+3. ✅ 2026-11-17 (`matchall`, and `bpf` with an inline classic-BPF program) **`matchall` and `bpf` classifiers** (survey 2026-09-30) — `FilterSpec.matchall` (classid, action list, `skip_sw`/`skip_hw` flags) and `FilterSpec.bpf` (`ops` classic-BPF instructions, classid, actions, `direct_action`, `flags_gen`), `Filter.matchall`/`.bpf` on dumps. 12 byte-exact goldens from iproute2 6.19.0 (`tc filter add ... matchall ...` / `bpf bytecode ...`), attribute order read off them: matchall CLASSID, ACT, FLAGS; bpf CLASSID, ACT, OPS_LEN, OPS, FLAGS_GEN, FLAGS. **Not done:** the eBPF forms `bpf obj|fd|pinned` — `tc` loads the object through `bpf(2)`, which an unprivileged network namespace refuses, so no golden could be captured (`FilterSpec.raw` covers them). A bare `matchall` has no golden either: stock `tc` sends no `TCA_OPTIONS` and the kernel rejects it (EINVAL); this module sends an empty options nest for it, unverified against a kernel.
 4. **`pedit`, `tunnel_key`, `connmark`, `csum`, `sample`, `ct`** (survey 2026-09-30) — header rewrite and tunnel actions used by most SDN-style setups; vishvananda has them. Effort: medium each (`pedit` largest).
 5. **Classic qdiscs `prio`, `sfq`, `hfsc`, `red`, `codel`, `fq`, `pfifo`/`bfifo`** (survey 2026-09-30) — Effort: small each.
 6. **netem distributions and GI/GE loss models** (survey 2026-09-30) — needs the distribution table; matters for realistic impairment. Effort: medium.

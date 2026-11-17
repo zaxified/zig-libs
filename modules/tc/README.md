@@ -13,8 +13,8 @@ Zig with no `tc` binary shell-out and no libc.
   including the psched **rate tables** and the 64-bit `TCA_HTB_RATE64`/`CEIL64`
   attributes for rates above 4.29 GB/s.
 - **filters** (`RTM_NEWTFILTER`/`DELTFILTER`/`GETTFILTER`) — `u32` (masked 32-bit matches
-  at fixed offsets) and `flower` (structured L2–L4 keys: ethertype, ip_proto, IPv4/IPv6
-  prefixes, TCP/UDP/SCTP ports, classid).
+  at fixed offsets), `flower` (structured L2–L4 keys: ethertype, ip_proto, IPv4/IPv6
+  prefixes, TCP/UDP/SCTP ports, classid), `matchall` and `bpf` (inline classic-BPF bytecode).
 - **actions** (`TCA_U32_ACT`/`TCA_FLOWER_ACT`, and the standalone
   `RTM_NEWACTION`/`DELACTION`/`GETACTION` table) — `gact` (pass/drop/continue/reclassify/
   trap, incl. the probabilistic `tc_gact_p`), `mirred` (egress/ingress × redirect/mirror),
@@ -135,7 +135,7 @@ class's direct children, and `filters(ifi, parent)` matches the attach point exa
   `minor()`, `qdisc()`, `isClass()`, `parse("1:10")`, `{f}` formatting. **Hexadecimal**,
   like `tc`.
 - `QdiscSpec` = `.netem` | `.htb` | `.tbf` | `.fq_codel` | `.mq` | `.ingress` | `.clsact` | `.cake` | `.raw`;
-  `ClassSpec` = `.htb` | `.raw`; `FilterSpec` = `.u32` | `.flower` | `.raw`;
+  `ClassSpec` = `.htb` | `.raw`; `FilterSpec` = `.u32` | `.flower` | `.matchall` | `.bpf` | `.raw`;
   `ActionSpec` = `.gact` | `.mirred` | `.police` | `.skbedit` | `.vlan` | `.raw`.
 - `Verdict` — the `TC_ACT_*` return codes (`.ok`, `.shot`, `.pipe`, `.stolen`,
   `.reclassify`, `.trap`, `.unspec` = `tc`'s `continue`). `.pipe` is the one that
@@ -155,7 +155,7 @@ class's direct children, and `filters(ifi, parent)` matches the attach point exa
   `src/qdisc.zig` / `src/filter.zig`. Rates are **bytes per second** (`1mbit` = 125000).
 - `Qdisc`, `Class`, `Filter` — dump results, each with a `kind()` plus an optional
   decoded-options field per modelled kind (`q.netem`, `q.htb`, `q.tbf`, `q.fq_codel`,
-  `q.cake`, `c.htb`, `f.u32_sel`, `f.flower`, `f.classid()`).
+  `q.cake`, `c.htb`, `f.u32_sel`, `f.flower`, `f.matchall`, `f.bpf`, `f.classid()`).
 - `Psched`, `RateSpec`, `LinkLayer` and the rate-table helpers in `tc.ratespec`.
 - `tc.message` — the pure request builders (`buildQdiscSet`, `buildClassSet`,
   `buildFilterSet`, `buildDump`, …) if you want the bytes without a socket.

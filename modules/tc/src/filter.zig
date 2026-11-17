@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! Classifier (filter) encoding: **u32** and **flower**.
+//! Classifier (filter) encoding: **u32**, **flower**, **matchall** and **bpf**
+//! (classic-BPF bytecode form).
 //!
 //! A filter is what binds traffic to a class. Two of its parameters do *not*
 //! live in attributes at all — they are packed into the `tcmsg` fixed header:
@@ -493,6 +494,180 @@ pub fn parseFlowerOptions(data: []const u8) codec.Error!FlowerWire {
     return fw;
 }
 
+// ── matchall ────────────────────────────────────────────────────────────────
+
+/// matchall classifier attributes (linux/pkt_cls.h `TCA_MATCHALL_*`).
+pub const TCA_MATCHALL = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const CLASSID: u16 = 1;
+    pub const ACT: u16 = 2;
+    pub const FLAGS: u16 = 3;
+    pub const PCNT: u16 = 4;
+    pub const PAD: u16 = 5;
+};
+
+/// The "everything" classifier (`tc filter add ... matchall`): no key at all,
+/// it only binds every packet to a class and/or an action list. iproute2
+/// 6.19 sends, in this order, `classid`, the action list, then the flags
+/// (`skip_sw`/`skip_hw`), each only when given.
+///
+/// ⚠ A matchall with none of the three is encoded as an EMPTY `TCA_OPTIONS`
+/// nest. A stock `tc filter add ... matchall` with nothing after it sends no
+/// `TCA_OPTIONS` at all and the kernel refuses it (`Invalid argument`,
+/// measured on Linux 7.0), so there is no golden for the bare form.
+pub const Matchall = struct {
+    /// `classid X:Y` (`flowid` is the same keyword).
+    classid: ?Handle = null,
+    /// `action …`, emitted as the nested `TCA_MATCHALL_ACT`.
+    actions: []const ActionSpec = &.{},
+    /// `TCA_MATCHALL_FLAGS` (`skip_sw` = 2, `skip_hw` = 1); sent only when non-zero.
+    flags: u32 = 0,
+};
+
+/// Wire readback of a matchall filter's options.
+pub const MatchallWire = struct {
+    classid: ?Handle = null,
+    flags: ?u32 = null,
+};
+
+fn appendMatchallOptions(
+    m: Matchall,
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    ps: Psched,
+) EncodeError!void {
+    if (m.classid) |c| try codec.appendAttrU32(gpa, list, TCA_MATCHALL.CLASSID, c.raw);
+    try action.appendActionList(gpa, list, TCA_MATCHALL.ACT, m.actions, ps);
+    if (m.flags != 0) try codec.appendAttrU32(gpa, list, TCA_MATCHALL.FLAGS, m.flags);
+}
+
+pub fn parseMatchallOptions(data: []const u8) codec.Error!MatchallWire {
+    var mw: MatchallWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| switch (a.type) {
+        TCA_MATCHALL.CLASSID => if (a.data.len == 4) {
+            mw.classid = Handle.fromRaw(std.mem.readInt(u32, a.data[0..4], native_endian));
+        },
+        TCA_MATCHALL.FLAGS => if (a.data.len == 4) {
+            mw.flags = std.mem.readInt(u32, a.data[0..4], native_endian);
+        },
+        else => {},
+    };
+    return mw;
+}
+
+// ── bpf ─────────────────────────────────────────────────────────────────────
+
+/// bpf classifier attributes (linux/pkt_cls.h `TCA_BPF_*`).
+pub const TCA_BPF = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const ACT: u16 = 1;
+    pub const POLICE: u16 = 2;
+    pub const CLASSID: u16 = 3;
+    pub const OPS_LEN: u16 = 4;
+    pub const OPS: u16 = 5;
+    pub const FD: u16 = 6;
+    pub const NAME: u16 = 7;
+    pub const FLAGS: u16 = 8;
+    pub const FLAGS_GEN: u16 = 9;
+    pub const TAG: u16 = 10;
+    pub const ID: u16 = 11;
+};
+
+/// `TCA_BPF_FLAG_ACT_DIRECT` (`da` / `direct-action` on the command line).
+pub const TCA_BPF_FLAG_ACT_DIRECT: u32 = 1;
+
+/// One classic-BPF instruction (`struct sock_filter`), host byte order.
+pub const BpfInsn = struct {
+    code: u16,
+    jt: u8 = 0,
+    jf: u8 = 0,
+    k: u32 = 0,
+};
+
+/// `BPF_MAXINSNS`: the longest classic program the kernel accepts.
+pub const bpf_max_insns = 4096;
+pub const bpf_insn_len = 8;
+
+/// A bpf classifier carrying an inline **classic-BPF** program
+/// (`tc filter add ... bpf bytecode '<n>,<code> <jt> <jf> <k>,...'`). The
+/// eBPF forms (`obj`, `fd`, `pinned`) need a loaded program (a file descriptor
+/// from the `bpf(2)` syscall), which cannot be produced to capture goldens in
+/// an unprivileged network namespace, so they are not modelled; use
+/// `FilterSpec.raw` for them.
+///
+/// iproute2 6.19 order on the wire: `classid`, the action list, `OPS_LEN`,
+/// `OPS`, `FLAGS_GEN` (`skip_sw`/`skip_hw`), `FLAGS` (`da`); each only when
+/// given.
+pub const Bpf = struct {
+    /// The program, 1..`bpf_max_insns` instructions.
+    ops: []const BpfInsn,
+    classid: ?Handle = null,
+    actions: []const ActionSpec = &.{},
+    /// `da` / `direct-action`: the program's return value is the verdict.
+    direct_action: bool = false,
+    /// `TCA_BPF_FLAGS_GEN` (`skip_sw` = 2, `skip_hw` = 1); sent only when non-zero.
+    flags_gen: u32 = 0,
+};
+
+/// Wire readback of a bpf filter's options.
+pub const BpfWire = struct {
+    classid: ?Handle = null,
+    /// `TCA_BPF_OPS_LEN`: the instruction count of the inline classic program.
+    ops_len: ?u16 = null,
+    flags: ?u32 = null,
+    flags_gen: ?u32 = null,
+};
+
+fn appendBpfOptions(
+    b: Bpf,
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    ps: Psched,
+) EncodeError!void {
+    if (b.ops.len == 0 or b.ops.len > bpf_max_insns) return error.BadBpfProgram;
+    if (b.classid) |c| try codec.appendAttrU32(gpa, list, TCA_BPF.CLASSID, c.raw);
+    try action.appendActionList(gpa, list, TCA_BPF.ACT, b.actions, ps);
+    var len_raw: [2]u8 = undefined;
+    std.mem.writeInt(u16, &len_raw, @intCast(b.ops.len), native_endian);
+    try appendBytes(gpa, list, TCA_BPF.OPS_LEN, &len_raw);
+    // The OPS attribute (8 bytes per instruction, at most 32 KiB) fits one attribute.
+    var ops: std.ArrayList(u8) = .empty;
+    defer ops.deinit(gpa);
+    for (b.ops) |i| {
+        var raw: [bpf_insn_len]u8 = undefined;
+        std.mem.writeInt(u16, raw[0..2], i.code, native_endian);
+        raw[2] = i.jt;
+        raw[3] = i.jf;
+        std.mem.writeInt(u32, raw[4..8], i.k, native_endian);
+        try ops.appendSlice(gpa, &raw);
+    }
+    try appendBytes(gpa, list, TCA_BPF.OPS, ops.items);
+    if (b.flags_gen != 0) try codec.appendAttrU32(gpa, list, TCA_BPF.FLAGS_GEN, b.flags_gen);
+    if (b.direct_action) try codec.appendAttrU32(gpa, list, TCA_BPF.FLAGS, TCA_BPF_FLAG_ACT_DIRECT);
+}
+
+pub fn parseBpfOptions(data: []const u8) codec.Error!BpfWire {
+    var bw: BpfWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| switch (a.type) {
+        TCA_BPF.CLASSID => if (a.data.len == 4) {
+            bw.classid = Handle.fromRaw(std.mem.readInt(u32, a.data[0..4], native_endian));
+        },
+        TCA_BPF.OPS_LEN => if (a.data.len == 2) {
+            bw.ops_len = std.mem.readInt(u16, a.data[0..2], native_endian);
+        },
+        TCA_BPF.FLAGS => if (a.data.len == 4) {
+            bw.flags = std.mem.readInt(u32, a.data[0..4], native_endian);
+        },
+        TCA_BPF.FLAGS_GEN => if (a.data.len == 4) {
+            bw.flags_gen = std.mem.readInt(u32, a.data[0..4], native_endian);
+        },
+        else => {},
+    };
+    return bw;
+}
+
 // ── the filter spec ─────────────────────────────────────────────────────────
 
 pub const EncodeError = std.mem.Allocator.Error || action.EncodeError || error{
@@ -502,18 +677,24 @@ pub const EncodeError = std.mem.Allocator.Error || action.EncodeError || error{
     PortWithoutProto,
     /// A pre-encoded `raw` payload longer than one netlink attribute.
     OptionsTooLong,
+    /// A `Bpf` program with no instructions or more than `bpf_max_insns`.
+    BadBpfProgram,
 };
 
 /// What to attach as a **filter** (`RTM_NEWTFILTER`).
 pub const FilterSpec = union(enum) {
     u32: U32,
     flower: Flower,
+    matchall: Matchall,
+    bpf: Bpf,
     raw: qdisc.Raw,
 
     pub fn kind(self: FilterSpec) []const u8 {
         return switch (self) {
             .u32 => "u32",
             .flower => "flower",
+            .matchall => "matchall",
+            .bpf => "bpf",
             .raw => |r| r.kind,
         };
     }
@@ -543,6 +724,8 @@ pub const FilterSpec = union(enum) {
         switch (self) {
             .u32 => |u| try appendU32Options(u, gpa, list, ps),
             .flower => |f| try appendFlowerOptions(f, gpa, list, ps),
+            .matchall => |m| try appendMatchallOptions(m, gpa, list, ps),
+            .bpf => |b| try appendBpfOptions(b, gpa, list, ps),
             .raw => |r| {
                 if (r.options.len > std.math.maxInt(u16)) return error.OptionsTooLong;
                 try list.appendSlice(gpa, r.options);
@@ -582,6 +765,10 @@ pub const Filter = struct {
     u32_sel: ?U32Wire = null,
     /// Decoded flower keys, when `kind() == "flower"`.
     flower: ?FlowerWire = null,
+    /// Decoded matchall options, when `kind() == "matchall"`.
+    matchall: ?MatchallWire = null,
+    /// Decoded bpf options, when `kind() == "bpf"`.
+    bpf: ?BpfWire = null,
     /// The decoded action list, capped at `action.max_actions_decoded`
     /// entries (`act_list.total` reports the true count). Reach it through
     /// `actions()`.
@@ -600,6 +787,8 @@ pub const Filter = struct {
     pub fn classid(f: *const Filter) ?Handle {
         if (f.u32_sel) |u| return u.classid;
         if (f.flower) |fl| return fl.classid;
+        if (f.matchall) |m| return m.classid;
+        if (f.bpf) |b| return b.classid;
         return null;
     }
 };
@@ -634,6 +823,10 @@ pub fn parseFilter(payload: []const u8) codec.Error!Filter {
             f.u32_sel = try parseU32Options(opt);
         } else if (std.mem.eql(u8, k, "flower")) {
             f.flower = try parseFlowerOptions(opt);
+        } else if (std.mem.eql(u8, k, "matchall")) {
+            f.matchall = try parseMatchallOptions(opt);
+        } else if (std.mem.eql(u8, k, "bpf")) {
+            f.bpf = try parseBpfOptions(opt);
         }
         if (actionAttrId(k)) |act_id| {
             var ait: codec.AttrIterator = .{ .buf = opt };
@@ -652,8 +845,10 @@ pub fn parseFilter(payload: []const u8) codec.Error!Filter {
 fn actionAttrId(kind: []const u8) ?u16 {
     if (std.mem.eql(u8, kind, "u32")) return TCA_U32.ACT;
     if (std.mem.eql(u8, kind, "flower")) return TCA_FLOWER.ACT;
-    // matchall/basic/bpf/fw all place their action list at attribute 1..3 of
-    // their own enum; not modelled, so no guessing here.
+    if (std.mem.eql(u8, kind, "matchall")) return TCA_MATCHALL.ACT;
+    if (std.mem.eql(u8, kind, "bpf")) return TCA_BPF.ACT;
+    // basic/fw place their action list at an attribute of their own enum; not
+    // modelled, so no guessing here.
     return null;
 }
 
