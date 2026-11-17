@@ -64,6 +64,18 @@ fn asI64(v: std.json.Value) i64 {
     };
 }
 
+/// A private key from a vector, as the fixed-width big-endian scalar the
+/// API takes. The upstream P-521 vectors (suite 0x0005) drop a leading zero
+/// byte, giving 65 bytes for a 66-byte scalar, so a shorter value is
+/// left-padded with zeros. That is the same integer, so the meaning does not
+/// change.
+fn hexPrivate(comptime n: usize, hex: []const u8) ![n]u8 {
+    var out: [n]u8 = @splat(0);
+    if (hex.len % 2 != 0 or hex.len / 2 > n) return error.WrongKeyLength;
+    _ = try std.fmt.hexToBytes(out[n - hex.len / 2 ..], hex);
+    return out;
+}
+
 fn expectStage(stage: []const u8, want: []const u8, got: []const u8) !void {
     testing.expectEqualSlices(u8, want, got) catch |err| {
         std.debug.print(
@@ -102,12 +114,10 @@ fn tJoin(comptime S: type, alloc: std.mem.Allocator, params: welcome.JoinParams(
 }
 
 fn loadEntry(comptime S: type, arena: std.mem.Allocator, obj: std.json.ObjectMap) !Entry(S) {
-    var init_priv: [S.Kem.Nsk]u8 = undefined;
-    const decoded = try std.fmt.hexToBytes(&init_priv, obj.get("init_priv").?.string);
-    try testing.expectEqual(@as(usize, S.Kem.Nsk), decoded.len);
+    const init_priv = try hexPrivate(S.Kem.Nsk, obj.get("init_priv").?.string);
 
-    var signer_pub_bytes: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&signer_pub_bytes, obj.get("signer_pub").?.string);
+    var init_key_pair: S.Kem.KeyPair = undefined;
+    try S.Kem.keyPairFromSecret(&init_key_pair, &init_priv);
 
     return .{
         .key_package_bytes = try hexDecode(arena, obj.get("key_package").?.string),
@@ -115,8 +125,8 @@ fn loadEntry(comptime S: type, arena: std.mem.Allocator, obj: std.json.ObjectMap
         // `init_priv` is a raw X25519 scalar, so the public half is
         // recovered from it rather than read from the vector — and the
         // KeyPackage's `init_key` check below is what pins that reading.
-        .init_key_pair = S.Kem.KeyPair.generateDeterministic(init_priv),
-        .signer_pub = try S.Sig.PublicKey.fromBytes(signer_pub_bytes),
+        .init_key_pair = init_key_pair,
+        .signer_pub = try S.decodePublicKey(try hexDecode(arena, obj.get("signer_pub").?.string)),
     };
 }
 
@@ -404,13 +414,19 @@ fn welcomeTeeth(comptime S: type) !void {
         // (d) The signature layer: one flipped byte inside the signed TBS
         // prefix. Flipping the raw plaintext is the strongest form of this
         // — it proves the verification really reads the received bytes and
-        // not a re-encode of the decoded struct.
+        // not a re-encode of the decoded struct. The byte is the first of
+        // `GroupContext.group_id` (after `version`, `cipher_suite` and its
+        // varint length), so the result still decodes in every suite — a
+        // flip in the middle landed in a length prefix for some suites and
+        // the case silently fell through.
         {
+            try testing.expect(gi.group_context.group_id.len > 0);
+            const gid_at = 4 + try codec.varint.encodedLen(gi.group_context.group_id.len);
             const tampered = try alloc.dupe(u8, gi_bytes);
             defer alloc.free(tampered);
-            tampered[tampered.len / 2] ^= 0x01;
+            tampered[gid_at] ^= 0x01;
             var r = codec.Reader.init(tampered);
-            const bad_gi = welcome.GroupInfo.decode(alloc, &r) catch continue;
+            const bad_gi = try welcome.GroupInfo.decode(alloc, &r);
             defer bad_gi.deinit(alloc);
             try testing.expectError(
                 error.SignatureVerificationFailed,

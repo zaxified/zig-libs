@@ -868,17 +868,16 @@ fn processUpdatePathBody(
 /// `UpdatePath` (only nodes in the resolution the sender encrypted to
 /// can), but every member updates the same public tree.
 pub fn applyUpdatePath(
+    comptime S: type,
     allocator: std.mem.Allocator,
     t: *tree.RatchetTree,
     sender_leaf_index: usize,
     update_path: UpdatePath,
 ) Error!void {
-    // Suite note: this signature carries no `comptime S` (fixed by the
-    // scaffold), yet step 3's parent hashes need the suite hash — so it
-    // uses the module's only wired suite, `suite.default` (`0x0001`), the
-    // same single-suite scoping `tree.LeafNode.verifySignature` documents
-    // for its 32/64-byte Ed25519 widths.
-    const S = suite.default;
+    // Step 3's parent hashes are the suite's hash. Until 2026-11-17 this
+    // took no suite and hashed with `suite.default`'s SHA-256, which every
+    // suite then wired shared; a SHA-384/SHA-512 suite rejected every
+    // genuine path (treekem.json, suites 0x0005/0x0007).
     const sender_node = 2 * sender_leaf_index;
     if (sender_node >= t.nodes.len) return error.InvalidLeafIndex;
     if (update_path.leaf_node.leaf_node_source != .commit) return error.Malformed;
@@ -1219,8 +1218,8 @@ fn stageUpdatePathBody(
         .extensions = params.extensions,
         .signature = &.{},
     };
-    const sig = try leaf.sign(S, allocator, params.signature_key_pair, params.group_id, @intCast(sender_leaf_index));
-    leaf.signature = try allocator.dupe(u8, &sig.toBytes());
+    const sig = S.encodeSignature(try leaf.sign(S, allocator, params.signature_key_pair, params.group_id, @intCast(sender_leaf_index)));
+    leaf.signature = try allocator.dupe(u8, sig.slice());
 
     // The tree adopts its own copies of the leaf's LIST containers, exactly
     // as `applyUpdatePath` does for a received leaf, so `RatchetTree.deinit`

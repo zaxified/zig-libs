@@ -403,27 +403,18 @@ pub const LeafNode = struct {
     /// RFC 9420 §7.2/§5.1.2: `VerifyWithLabel(signature_key, "LeafNodeTBS",
     /// LeafNodeTBS, signature)`. `group_id`/`leaf_index` are ignored (and
     /// may be anything, e.g. `""`/`0`) when `leaf_node_source ==
-    /// .key_package` — see `tbsEncode`. Only suite `0x0001` (Ed25519,
-    /// 32-byte public key / 64-byte signature, this module's only wired
-    /// suite so far — `suite.zig`) is supported; a `signature_key`/
-    /// `signature` of any other length is `error.WrongKeyLength`, not a
-    /// crash.
+    /// .key_package` — see `tbsEncode`. A `signature_key`/`signature` that
+    /// does not parse in suite `S`'s encoding (`S.decodePublicKey`/
+    /// `S.decodeSignature`) is `error.WrongKeyLength`, not a crash.
     pub fn verifySignature(self: LeafNode, comptime S: type, allocator: std.mem.Allocator, group_id: []const u8, leaf_index: u32) !void {
-        if (self.signature_key.len != 32) return error.WrongKeyLength;
-        if (self.signature.len != 64) return error.WrongKeyLength;
+        const pk = try S.decodePublicKey(self.signature_key);
+        const sig = try S.decodeSignature(self.signature);
         const len = self.tbsEncodedLen(group_id.len);
         const buf = try allocator.alloc(u8, len);
         defer allocator.free(buf);
         var w = codec.Writer.init(buf);
         try self.tbsEncode(&w, group_id, leaf_index);
         const content = w.finish();
-
-        var pk_bytes: [32]u8 = undefined;
-        @memcpy(&pk_bytes, self.signature_key);
-        const pk = try S.Sig.PublicKey.fromBytes(pk_bytes);
-        var sig_bytes: [64]u8 = undefined;
-        @memcpy(&sig_bytes, self.signature);
-        const sig = S.Sig.Signature.fromBytes(sig_bytes);
         try crypto.VerifyWithLabelAlloc(S, allocator, pk, "LeafNodeTBS", content, sig);
     }
 

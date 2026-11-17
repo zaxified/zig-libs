@@ -310,8 +310,8 @@ pub const GroupInfo = struct {
     /// BLANK leaf is likewise the caller's rejection to make (§12.4.3.1:
     /// "If the node is blank ... return an error").
     ///
-    /// Only suite `0x0001` (Ed25519) is wired, so a `signature` of any
-    /// other length is `error.WrongKeyLength` — mirrors
+    /// A `signature` that does not parse in suite `S`'s encoding is
+    /// `error.WrongKeyLength` — mirrors
     /// `keypackage.KeyPackage.verifySignature` exactly.
     pub fn verifySignature(
         self: GroupInfo,
@@ -319,18 +319,16 @@ pub const GroupInfo = struct {
         allocator: std.mem.Allocator,
         signature_key: S.Sig.PublicKey,
     ) !void {
-        if (self.signature.len != S.Nx) return error.WrongKeyLength;
-        var sig_bytes: [S.Nx]u8 = undefined;
-        @memcpy(&sig_bytes, self.signature);
+        const sig = try S.decodeSignature(self.signature);
 
         if (self.raw) |raw| {
-            return crypto.VerifyWithLabelAlloc(S, allocator, signature_key, label_group_info_tbs, raw.tbs, S.Sig.Signature.fromBytes(sig_bytes));
+            return crypto.VerifyWithLabelAlloc(S, allocator, signature_key, label_group_info_tbs, raw.tbs, sig);
         }
         const buf = try allocator.alloc(u8, self.tbsEncodedLen());
         defer allocator.free(buf);
         var w = codec.Writer.init(buf);
         try self.tbsEncode(&w);
-        return crypto.VerifyWithLabelAlloc(S, allocator, signature_key, label_group_info_tbs, w.finish(), S.Sig.Signature.fromBytes(sig_bytes));
+        return crypto.VerifyWithLabelAlloc(S, allocator, signature_key, label_group_info_tbs, w.finish(), sig);
     }
 
     /// The signing counterpart of `verifySignature`: produces the

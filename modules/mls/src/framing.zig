@@ -433,8 +433,8 @@ pub fn signFramedContent(
 }
 
 /// The verification counterpart. Only suite `0x0001` (Ed25519) is wired, so
-/// a `signature`/`public_key` of another length is `error.WrongKeyLength`
-/// — same handling as `tree.LeafNode.verifySignature`.
+/// a `signature` that does not parse in suite `S`'s encoding is
+/// `error.WrongKeyLength` — same handling as `tree.LeafNode.verifySignature`.
 pub fn verifyFramedContent(
     comptime S: type,
     allocator: std.mem.Allocator,
@@ -442,12 +442,10 @@ pub fn verifyFramedContent(
     ac: AuthenticatedContent,
     group_context: ?[]const u8,
 ) !void {
-    if (ac.auth.signature.len != S.Nx) return error.WrongKeyLength;
+    const sig = try S.decodeSignature(ac.auth.signature);
     const tbs = try framedContentTbsAlloc(allocator, ac.wire_format, ac.content, group_context);
     defer allocator.free(tbs);
-    var sig_bytes: [S.Nx]u8 = undefined;
-    @memcpy(&sig_bytes, ac.auth.signature);
-    try crypto.VerifyWithLabelAlloc(S, allocator, public_key, label_framed_content_tbs, tbs, S.Sig.Signature.fromBytes(sig_bytes));
+    try crypto.VerifyWithLabelAlloc(S, allocator, public_key, label_framed_content_tbs, tbs, sig);
 }
 
 // ── §6: AuthenticatedContent ──────────────────────────────────────────────
@@ -662,9 +660,9 @@ fn protectPublicBody(comptime S: type, allocator: std.mem.Allocator, params: Pro
         params.content,
         params.group_context,
     );
-    const sig_bytes = sig.toBytes();
+    const sig_bytes = S.encodeSignature(sig);
     const auth: FramedContentAuthData = .{
-        .signature = &sig_bytes,
+        .signature = sig_bytes.slice(),
         .confirmation_tag = params.confirmation_tag,
     };
 
@@ -989,9 +987,9 @@ fn protectPrivateBody(comptime S: type, allocator: std.mem.Allocator, params: Pr
         params.content,
         params.group_context,
     );
-    const sig_bytes = sig.toBytes();
+    const sig_bytes = S.encodeSignature(sig);
     const auth: FramedContentAuthData = .{
-        .signature = &sig_bytes,
+        .signature = sig_bytes.slice(),
         .confirmation_tag = params.confirmation_tag,
     };
 

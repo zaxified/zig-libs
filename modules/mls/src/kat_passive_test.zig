@@ -71,6 +71,18 @@ fn hexArray(comptime n: usize, hex: []const u8) ![n]u8 {
     return out;
 }
 
+/// A private key from a vector, as the fixed-width big-endian scalar the
+/// API takes. The upstream P-521 vectors (suite 0x0005) drop a leading zero
+/// byte, giving 65 bytes for a 66-byte scalar, so a shorter value is
+/// left-padded with zeros. That is the same integer, so the meaning does not
+/// change.
+fn hexPrivate(comptime n: usize, hex: []const u8) ![n]u8 {
+    var out: [n]u8 = @splat(0);
+    if (hex.len % 2 != 0 or hex.len / 2 > n) return error.WrongKeyLength;
+    _ = try std.fmt.hexToBytes(out[n - hex.len / 2 ..], hex);
+    return out;
+}
+
 /// A divergence must name the session and the epoch it happened in, or a
 /// failure at epoch 137 of 200 says nothing about what went wrong.
 fn expectAuthenticator(
@@ -107,9 +119,9 @@ fn runEntry(
 
     const key_package_msg = try hexDecode(sa, obj.get("key_package").?.string);
     const welcome_msg = try hexDecode(sa, obj.get("welcome").?.string);
-    const init_priv = try hexArray(S.Kem.Nsk, obj.get("init_priv").?.string);
-    const encryption_priv = try hexArray(S.Kem.Nsk, obj.get("encryption_priv").?.string);
-    const signature_priv = try hexArray(32, obj.get("signature_priv").?.string);
+    const init_priv = try hexPrivate(S.Kem.Nsk, obj.get("init_priv").?.string);
+    const encryption_priv = try hexPrivate(S.Kem.Nsk, obj.get("encryption_priv").?.string);
+    const signature_priv = try hexPrivate(S.Nssk, obj.get("signature_priv").?.string);
 
     const ratchet_tree: ?[]const u8 = switch (obj.get("ratchet_tree").?) {
         .string => |h| try hexDecode(sa, h),
@@ -133,12 +145,15 @@ fn runEntry(
         const msg = try framing.MLSMessage.decode(sa, &r);
         try testing.expect(r.atEnd());
         const kp = msg.key_package;
-        const init_kp = S.Kem.KeyPair.generateDeterministic(init_priv);
-        const enc_kp = S.Kem.KeyPair.generateDeterministic(encryption_priv);
-        const sig_kp = try S.Sig.KeyPair.generateDeterministic(signature_priv);
+        var init_kp: S.Kem.KeyPair = undefined;
+        try S.Kem.keyPairFromSecret(&init_kp, &init_priv);
+        var enc_kp: S.Kem.KeyPair = undefined;
+        try S.Kem.keyPairFromSecret(&enc_kp, &encryption_priv);
+        var sig_kp: S.Sig.KeyPair = undefined;
+        try S.signatureKeyPair(&signature_priv, &sig_kp);
         try testing.expectEqualSlices(u8, kp.init_key, &init_kp.public_key);
         try testing.expectEqualSlices(u8, kp.leaf_node.encryption_key, &enc_kp.public_key);
-        try testing.expectEqualSlices(u8, kp.leaf_node.signature_key, &sig_kp.public_key.toBytes());
+        try testing.expectEqualSlices(u8, kp.leaf_node.signature_key, &S.encodePublicKey(sig_kp.public_key));
     }
 
     // ── join.

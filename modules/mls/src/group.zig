@@ -745,7 +745,8 @@ pub fn Group(comptime S: type) type {
             try my_kp.verifySignature(S, gpa);
             try verifyLeafSignature(S, gpa, my_kp.leaf_node, .key_package, null, null);
 
-            const enc_kp = S.Kem.KeyPair.generateDeterministic(params.encryption_priv.*);
+            var enc_kp: S.Kem.KeyPair = undefined;
+            S.Kem.keyPairFromSecret(&enc_kp, params.encryption_priv) catch return error.PrivateKeyMismatch;
             if (!std.mem.eql(u8, my_kp.leaf_node.encryption_key, &enc_kp.public_key)) return error.PrivateKeyMismatch;
 
             const nodes = try arena.alloc(?tree.Node, 1);
@@ -902,7 +903,8 @@ pub fn Group(comptime S: type) type {
 
             const slot = w.findSecret(&kp_ref) orelse return error.NoMatchingKeyPackage;
 
-            const init_kp = S.Kem.KeyPair.generateDeterministic(params.init_priv.*);
+            var init_kp: S.Kem.KeyPair = undefined;
+            S.Kem.keyPairFromSecret(&init_kp, params.init_priv) catch return error.PrivateKeyMismatch;
             if (!std.mem.eql(u8, my_kp.init_key, &init_kp.public_key)) return error.PrivateKeyMismatch;
 
             const gs_bytes = try welcome_mod.decryptGroupSecrets(
@@ -967,7 +969,8 @@ pub fn Group(comptime S: type) type {
 
             // ── our own leaf, and the private keys that must match it.
             const my_index = try findOwnLeaf(gpa, &rt, my_leaf_encoded);
-            const enc_kp = S.Kem.KeyPair.generateDeterministic(params.encryption_priv.*);
+            var enc_kp: S.Kem.KeyPair = undefined;
+            S.Kem.keyPairFromSecret(&enc_kp, params.encryption_priv) catch return error.PrivateKeyMismatch;
             {
                 const leaf = (rt.nodes[my_index * 2].?).leaf;
                 if (!std.mem.eql(u8, leaf.encryption_key, &enc_kp.public_key)) return error.PrivateKeyMismatch;
@@ -1066,7 +1069,7 @@ pub fn Group(comptime S: type) type {
             try treekem.validateParentHashes(S, gpa, &rt);
             try verifyEveryLeafSignature(S, gpa, &rt, group_info.group_context.group_id);
             try rejectLowOrderTreeKeys(S, &rt);
-            const signer_key = try leafSignatureKey(&rt, group_info.signer);
+            const signer_key = try leafSignatureKey(S, &rt, group_info.signer);
             try group_info.verifySignature(S, gpa, signer_key);
             return rt;
         }
@@ -1185,14 +1188,14 @@ pub fn Group(comptime S: type) type {
                 // it is what the next line verifies the signature with — a
                 // pathless external Commit has nothing to check at all.
                 const path = commit.path orelse return error.ExternalCommitRequiresPath;
-                const key = try leafNodeSignatureKey(path.leaf_node);
+                const key = try leafNodeSignatureKey(S, path.leaf_node);
                 try framing.verifyFramedContent(S, gpa, key, ac, old_gc);
             } else {
                 member_committer = switch (pm.content.sender) {
                     .member => |i| i,
                     else => return error.UnexpectedSenderType,
                 };
-                const committer_key = try leafSignatureKey(&self.ratchet_tree, member_committer);
+                const committer_key = try leafSignatureKey(S, &self.ratchet_tree, member_committer);
                 try framing.verifyMembershipTag(S, gpa, &self.secrets.membership_key, pm, old_gc);
                 try framing.verifyFramedContent(S, gpa, committer_key, ac, old_gc);
             }
@@ -1303,7 +1306,7 @@ pub fn Group(comptime S: type) type {
                 // resolution reaches it would fail to encrypt.
                 try rejectLowOrderPathKeys(S, path);
 
-                try treekem.applyUpdatePath(arena, &w.ratchet_tree, committer, path);
+                try treekem.applyUpdatePath(S, arena, &w.ratchet_tree, committer, path);
 
                 // The PROVISIONAL GroupContext: new epoch, new tree hash,
                 // OLD confirmed_transcript_hash. See this file's doc
@@ -1482,8 +1485,8 @@ pub fn Group(comptime S: type) type {
                 .body = .{ .proposal = params.proposal },
             };
             const sig = try framing.signFramedContent(S, gpa, params.signature_key_pair, .mls_public_message, fc, gc);
-            const sig_bytes = sig.toBytes();
-            const auth: framing.FramedContentAuthData = .{ .signature = &sig_bytes };
+            const sig_bytes = S.encodeSignature(sig);
+            const auth: framing.FramedContentAuthData = .{ .signature = sig_bytes.slice() };
             const mtag = try framing.membershipTag(S, gpa, &self.secrets.membership_key, fc, auth, gc);
             const msg: framing.MLSMessage = .{
                 .public_message = .{ .content = fc, .auth = auth, .membership_tag = &mtag },
@@ -1533,8 +1536,8 @@ pub fn Group(comptime S: type) type {
             leaf.lifetime = null;
             leaf.parent_hash = null;
             leaf.signature = &.{};
-            const sig = try leaf.sign(S, arena, params.signature_key_pair, self.group_id, self.my_leaf_index);
-            leaf.signature = try arena.dupe(u8, &sig.toBytes());
+            const sig = S.encodeSignature(try leaf.sign(S, arena, params.signature_key_pair, self.group_id, self.my_leaf_index));
+            leaf.signature = try arena.dupe(u8, sig.slice());
             try self.checkLeafSelfConsistent(leaf);
             try self.pending_updates.append(arena, .{
                 .encryption_key = leaf.encryption_key,
@@ -1877,7 +1880,7 @@ pub fn Group(comptime S: type) type {
                 .body = .{ .commit = commit },
             };
             const sig = try framing.signFramedContent(S, gpa, params.signature_key_pair, .mls_public_message, fc, old_gc);
-            const sig_bytes = sig.toBytes();
+            const sig_bytes = S.encodeSignature(sig);
 
             // §8.2's confirmed hash covers `wire_format || content ||
             // signature` and NOT the confirmation tag — which is what makes
@@ -1886,7 +1889,7 @@ pub fn Group(comptime S: type) type {
             var ac: framing.AuthenticatedContent = .{
                 .wire_format = .mls_public_message,
                 .content = fc,
-                .auth = .{ .signature = &sig_bytes, .confirmation_tag = null },
+                .auth = .{ .signature = sig_bytes.slice(), .confirmation_tag = null },
             };
             const confirmed = try transcript.confirmedTranscriptHash(S, gpa, &w.interim_transcript_hash, ac);
 
@@ -1927,9 +1930,9 @@ pub fn Group(comptime S: type) type {
             // Built here rather than through `framing.protectPublic` for one
             // reason: `protectPublic` signs the content itself, and the
             // signature that went into the transcript above must be the
-            // signature that goes on the wire. Ed25519 is deterministic so
-            // the two would agree today, but "the transcript covers the
-            // bytes we sent" should not rest on that.
+            // signature that goes on the wire. Every wired scheme signs
+            // deterministically, so the two would agree today, but "the
+            // transcript covers the bytes we sent" should not rest on that.
             // An external committer holds no `membership_key` — it is not a
             // member of the epoch it is committing against — and §6.2 gives
             // its `PublicMessage` no field to put a tag in. `null` here is
@@ -1985,8 +1988,8 @@ pub fn Group(comptime S: type) type {
                 .signature = &.{},
             };
             const gi_sig = try gi.sign(S, gpa, params.signature_key_pair);
-            const gi_sig_bytes = gi_sig.toBytes();
-            gi.signature = &gi_sig_bytes;
+            const gi_sig_bytes = S.encodeSignature(gi_sig);
+            gi.signature = gi_sig_bytes.slice();
             const gi_msg: framing.MLSMessage = .{ .group_info = gi };
             const group_info_bytes = try gi_msg.encodeAlloc(allocator);
             errdefer allocator.free(group_info_bytes);
@@ -2484,7 +2487,7 @@ pub fn Group(comptime S: type) type {
                 .member => |i| i,
                 else => return error.UnexpectedSenderType,
             };
-            const key = try leafSignatureKey(&self.ratchet_tree, sender);
+            const key = try leafSignatureKey(S, &self.ratchet_tree, sender);
             try framing.verifyMembershipTag(S, gpa, &self.secrets.membership_key, p, old_gc);
             const pac = p.authenticatedContent();
             try framing.verifyFramedContent(S, gpa, key, pac, old_gc);
@@ -3256,7 +3259,7 @@ pub fn Group(comptime S: type) type {
 /// The signature key of a leaf, by leaf index — the lookup §6.1's signature
 /// check and §12.4.3's `GroupInfo.signer` both need and neither can do on
 /// its own.
-fn leafSignatureKey(t: *const tree.RatchetTree, leaf_index: u32) !std.crypto.sign.Ed25519.PublicKey {
+fn leafSignatureKey(comptime S: type, t: *const tree.RatchetTree, leaf_index: u32) !S.Sig.PublicKey {
     const idx = @as(usize, leaf_index) * 2;
     if (idx >= t.nodes.len) return error.UnknownMember;
     const node = t.nodes[idx] orelse return error.UnknownMember;
@@ -3264,8 +3267,7 @@ fn leafSignatureKey(t: *const tree.RatchetTree, leaf_index: u32) !std.crypto.sig
         .leaf => |l| l,
         .parent => return error.Malformed,
     };
-    if (leaf.signature_key.len != 32) return error.WrongKeyLength;
-    return std.crypto.sign.Ed25519.PublicKey.fromBytes(leaf.signature_key[0..32].*);
+    return S.decodePublicKey(leaf.signature_key);
 }
 
 /// RFC 9420 §7.3's `LeafNodeTBS` signature check, with the `group_id`/
@@ -3276,9 +3278,8 @@ fn leafSignatureKey(t: *const tree.RatchetTree, leaf_index: u32) !std.crypto.sig
 /// key is inside the message it authenticates rather than in the tree —
 /// see `processCommit`'s note on why that is not the weakening it looks
 /// like.
-fn leafNodeSignatureKey(leaf: tree.LeafNode) !std.crypto.sign.Ed25519.PublicKey {
-    if (leaf.signature_key.len != 32) return error.WrongKeyLength;
-    return std.crypto.sign.Ed25519.PublicKey.fromBytes(leaf.signature_key[0..32].*);
+fn leafNodeSignatureKey(comptime S: type, leaf: tree.LeafNode) !S.Sig.PublicKey {
+    return S.decodePublicKey(leaf.signature_key);
 }
 
 /// RFC 9420 §6.2's `select (PublicMessage.content.sender.sender_type)`: a
@@ -4724,7 +4725,7 @@ test "§12.4.3.2: include_external_pub publishes an ExternalPub extension the Gr
     const gi = gi_msg.group_info;
     // The GroupInfo is signed by the committer's leaf, and the tree it
     // carries is the one whose hash the signed GroupContext names.
-    const signer_key = try leafSignatureKey(&a.ratchet_tree, gi.signer);
+    const signer_key = try leafSignatureKey(TestSuite, &a.ratchet_tree, gi.signer);
     try gi.verifySignature(TestSuite, gpa, signer_key);
     var rt = try gi.ratchetTree(aa);
     try welcome_mod.verifyTreeHash(TestSuite, gpa, &rt, gi.group_context);
@@ -6190,7 +6191,7 @@ test "§12.4.3.1: a joiner refuses a handed ratchet tree whose leaf signatures d
         var check_tree = try forged.ratchetTree(aa);
         try welcome_mod.verifyTreeHash(TestSuite, gpa, &check_tree, forged.group_context);
         try treekem.validateParentHashes(TestSuite, gpa, &check_tree);
-        const signer_key = try leafSignatureKey(&check_tree, forged.signer);
+        const signer_key = try leafSignatureKey(TestSuite, &check_tree, forged.signer);
         try forged.verifySignature(TestSuite, gpa, signer_key);
         // And the leaf itself is exactly what the joiner must catch.
         try testing.expectError(
@@ -6315,7 +6316,7 @@ test "§12.4.3.1: a joiner refuses a group whose GroupContext declares a version
     {
         var check_tree = try forged.ratchetTree(aa);
         try welcome_mod.verifyTreeHash(TestSuite, gpa, &check_tree, forged.group_context);
-        const signer_key = try leafSignatureKey(&check_tree, forged.signer);
+        const signer_key = try leafSignatureKey(TestSuite, &check_tree, forged.signer);
         try forged.verifySignature(TestSuite, gpa, signer_key);
     }
 
@@ -7808,6 +7809,116 @@ test "§10.1/§12.2: processCommit refuses an insider's Commit adding a KeyPacka
     }
     try b.processCommit(.{ .commit_msg = c.commit });
     try expectSameEpoch(&a, &b);
+}
+
+/// A participant of an arbitrary suite `P` — the `TestClient` shape without
+/// the default suite baked in.
+fn SuiteClient(comptime P: type) type {
+    return struct {
+        sig: P.Sig.KeyPair,
+        init_priv: [P.Kem.Nsk]u8,
+        enc_priv: [P.Kem.Nsk]u8,
+        kp: keypackage_mod.KeyPackage,
+        kp_msg: []u8,
+
+        fn init(arena: std.mem.Allocator, name: []const u8, seed: u8) !@This() {
+            const sig = try P.Sig.KeyPair.generateDeterministic(@splat(seed));
+            var init_kp: P.Kem.KeyPair = undefined;
+            P.Kem.deriveKeyPair(&init_kp, &@as([P.Kem.Nsk]u8, @splat(seed +% 64)));
+            var enc_kp: P.Kem.KeyPair = undefined;
+            P.Kem.deriveKeyPair(&enc_kp, &@as([P.Kem.Nsk]u8, @splat(seed +% 128)));
+            const kp = try keypackage_mod.create(P, arena, .{
+                .signature_key_pair = &sig,
+                .init_key = init_kp.public_key,
+                .encryption_key = enc_kp.public_key,
+                .credential = .{ .basic = name },
+                .capabilities = .{
+                    .versions = &.{1},
+                    .cipher_suites = &.{@backingInt(P.id)},
+                    .extensions = &.{},
+                    .proposals = &.{},
+                    .credentials = &.{1},
+                },
+                .lifetime = .{ .not_before = 0, .not_after = std.math.maxInt(u64) },
+            });
+            const msg: framing.MLSMessage = .{ .key_package = kp };
+            return .{
+                .sig = sig,
+                .init_priv = init_kp.secret_key,
+                .enc_priv = enc_kp.secret_key,
+                .kp = kp,
+                .kp_msg = try msg.encodeAlloc(arena),
+            };
+        }
+    };
+}
+
+test "NIST-curve private keys: create/fromWelcome refuse a scalar outside [1, n-1] as PrivateKeyMismatch, every ECDSA suite" {
+    // X25519 accepts any 32 bytes, so before the NIST suites this error had
+    // only one source (a key that is not the KeyPackage's). A P-256/P-384/
+    // P-521 scalar of 0 or >= n is not a key at all; it must be refused the
+    // same way, not reach the curve code.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    inline for (.{suite.Mls128P256Aes128GcmSha256P256}) |P| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        const G = Group(P);
+        const alice = try SuiteClient(P).init(aa, "alice", 31);
+        const bob = try SuiteClient(P).init(aa, "bob", 32);
+        const zero: [P.Kem.Nsk]u8 = @splat(0);
+        const ones: [P.Kem.Nsk]u8 = @splat(0xff);
+
+        var a: G = undefined;
+        for ([_]*const [P.Kem.Nsk]u8{ &zero, &ones }) |bad| {
+            try testing.expectError(error.PrivateKeyMismatch, G.create(gpa, .{
+                .io = io,
+                .group_id = "nist-priv",
+                .key_package_msg = alice.kp_msg,
+                .encryption_priv = bad,
+            }, &a));
+        }
+        try G.create(gpa, .{ .io = io, .group_id = "nist-priv", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv }, &a);
+        defer a.deinit();
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = &alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
+        });
+        defer c.deinit(gpa);
+
+        var b: G = undefined;
+        // A bad init key fails at the Welcome's HPKE layer; a bad leaf key
+        // at the tree's own leaf. Both are the caller's wrong key.
+        try testing.expectError(error.PrivateKeyMismatch, G.fromWelcome(gpa, .{
+            .welcome_msg = c.welcome.?,
+            .key_package_msg = bob.kp_msg,
+            .init_priv = &zero,
+            .encryption_priv = &bob.enc_priv,
+        }, &b));
+        try testing.expectError(error.PrivateKeyMismatch, G.fromWelcome(gpa, .{
+            .welcome_msg = c.welcome.?,
+            .key_package_msg = bob.kp_msg,
+            .init_priv = &bob.init_priv,
+            .encryption_priv = &ones,
+        }, &b));
+        try G.fromWelcome(gpa, .{
+            .welcome_msg = c.welcome.?,
+            .key_package_msg = bob.kp_msg,
+            .init_priv = &bob.init_priv,
+            .encryption_priv = &bob.enc_priv,
+        }, &b);
+        defer b.deinit();
+        try testing.expectEqual(a.epoch, b.epoch);
+        var aa_auth: [P.Nh]u8 = undefined;
+        var bb_auth: [P.Nh]u8 = undefined;
+        a.epochAuthenticator(&aa_auth);
+        b.epochAuthenticator(&bb_auth);
+        try testing.expectEqualSlices(u8, &aa_auth, &bb_auth);
+    }
 }
 
 test "low-order X25519 keys: a Welcome whose ratchet tree carries one is refused" {

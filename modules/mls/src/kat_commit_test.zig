@@ -105,6 +105,18 @@ fn hexArray(comptime n: usize, hex: []const u8) ![n]u8 {
     return out;
 }
 
+/// A private key from a vector, as the fixed-width big-endian scalar the
+/// API takes. The upstream P-521 vectors (suite 0x0005) drop a leading zero
+/// byte, giving 65 bytes for a 66-byte scalar, so a shorter value is
+/// left-padded with zeros. That is the same integer, so the meaning does not
+/// change.
+fn hexPrivate(comptime n: usize, hex: []const u8) ![n]u8 {
+    var out: [n]u8 = @splat(0);
+    if (hex.len % 2 != 0 or hex.len / 2 > n) return error.WrongKeyLength;
+    _ = try std.fmt.hexToBytes(out[n - hex.len / 2 ..], hex);
+    return out;
+}
+
 fn asU64(v: std.json.Value) !u64 {
     return switch (v) {
         .integer => |i| @intCast(i),
@@ -274,14 +286,15 @@ fn generatedUpdatePaths(comptime S: type) !void {
             // this whole test into a round trip.
             const path_secret_0 = seed orelse return error.NoSeedableReceiverInVector;
 
-            const leaf_kp = S.Kem.KeyPair.generateDeterministic(@splat(0x5c));
+            var leaf_kp: S.Kem.KeyPair = undefined;
+            S.Kem.deriveKeyPair(&leaf_kp, &@as([S.Kem.Nsk]u8, @splat(0x5c)));
             var staged: treekem.Staged(S) = undefined;
             try treekem.stageUpdatePath(S, arena.allocator(), &staging.tree, sender, .{
                 .group_id = group_id,
                 .signature_key_pair = &sig_kp,
                 .leaf_key_pair = &leaf_kp,
                 .path_secret_0 = &path_secret_0,
-                .signature_key = &sig_kp.public_key.toBytes(),
+                .signature_key = &S.encodePublicKey(sig_kp.public_key),
                 .credential = .{ .basic = "kat-committer" },
                 .capabilities = dummyCapabilities(S),
             }, &staged);
@@ -416,14 +429,15 @@ fn corruptedUpdatePath(comptime S: type) !void {
     const sig_kp = try S.Sig.KeyPair.generateDeterministic(@splat(0x77));
     var wrong_seed: [S.Nh]u8 = @splat(0xa5);
     wrong_seed[0] ^= 0x01;
-    const leaf_kp = S.Kem.KeyPair.generateDeterministic(@splat(0x5c));
+    var leaf_kp: S.Kem.KeyPair = undefined;
+    S.Kem.deriveKeyPair(&leaf_kp, &@as([S.Kem.Nsk]u8, @splat(0x5c)));
     var staged: treekem.Staged(S) = undefined;
     try treekem.stageUpdatePath(S, arena.allocator(), &staging.tree, sender, .{
         .group_id = group_id,
         .signature_key_pair = &sig_kp,
         .leaf_key_pair = &leaf_kp,
         .path_secret_0 = &wrong_seed,
-        .signature_key = &sig_kp.public_key.toBytes(),
+        .signature_key = &S.encodePublicKey(sig_kp.public_key),
         .credential = .{ .basic = "kat-committer" },
         .capabilities = dummyCapabilities(S),
     }, &staged);
@@ -455,8 +469,10 @@ fn Newcomer(comptime S: type) type {
 
         fn init(arena: std.mem.Allocator, seed: u8) !@This() {
             const sig = try S.Sig.KeyPair.generateDeterministic(@splat(seed));
-            const init_kp = S.Kem.KeyPair.generateDeterministic(@splat(seed +% 64));
-            const enc_kp = S.Kem.KeyPair.generateDeterministic(@splat(seed +% 128));
+            var init_kp: S.Kem.KeyPair = undefined;
+            S.Kem.deriveKeyPair(&init_kp, &@as([S.Kem.Nsk]u8, @splat(seed +% 64)));
+            var enc_kp: S.Kem.KeyPair = undefined;
+            S.Kem.deriveKeyPair(&enc_kp, &@as([S.Kem.Nsk]u8, @splat(seed +% 128)));
             const kp = try keypackage.create(S, arena, .{
                 .signature_key_pair = &sig,
                 .init_key = init_kp.public_key,
@@ -485,9 +501,9 @@ fn replay(comptime S: type, gpa: std.mem.Allocator, sa: std.mem.Allocator, obj: 
 } {
     const key_package_msg = try hexDecode(sa, obj.get("key_package").?.string);
     const welcome_msg = try hexDecode(sa, obj.get("welcome").?.string);
-    const init_priv = try hexArray(S.Kem.Nsk, obj.get("init_priv").?.string);
-    const encryption_priv = try hexArray(S.Kem.Nsk, obj.get("encryption_priv").?.string);
-    const signature_priv = try hexArray(32, obj.get("signature_priv").?.string);
+    const init_priv = try hexPrivate(S.Kem.Nsk, obj.get("init_priv").?.string);
+    const encryption_priv = try hexPrivate(S.Kem.Nsk, obj.get("encryption_priv").?.string);
+    const signature_priv = try hexPrivate(S.Nssk, obj.get("signature_priv").?.string);
 
     const ratchet_tree: ?[]const u8 = switch (obj.get("ratchet_tree").?) {
         .string => |h| try hexDecode(sa, h),
@@ -535,7 +551,9 @@ fn replay(comptime S: type, gpa: std.mem.Allocator, sa: std.mem.Allocator, obj: 
         const want = try hexDecode(sa, epochs[epochs.len - 1].object.get("epoch_authenticator").?.string);
         try testing.expectEqualSlices(u8, want, &tAuth(S, &g));
     }
-    return .{ .g = g, .sig = try S.Sig.KeyPair.generateDeterministic(signature_priv), .psks = psks.items };
+    var sig: S.Sig.KeyPair = undefined;
+    try S.signatureKeyPair(&signature_priv, &sig);
+    return .{ .g = g, .sig = sig, .psks = psks.items };
 }
 
 /// Commit from a group state produced by another implementation, add a new

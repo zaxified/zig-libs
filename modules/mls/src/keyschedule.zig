@@ -872,6 +872,26 @@ fn pskSecretBody(comptime S: type, allocator: std.mem.Allocator, psks: []const P
 const testing = std.testing;
 const TestSuite = suite.default;
 
+test "hpkeSuiteId: the RFC 9180 registry ids of every wired suite's KEM, KDF and AEAD" {
+    // RFC 9180 §7: kem_id 0x0010 P-256, 0x0011 P-384, 0x0012 P-521, 0x0020
+    // X25519; kdf_id 0x0001 HKDF-SHA256, 0x0002 HKDF-SHA384, 0x0003
+    // HKDF-SHA512; aead_id 0x0001 AES-128-GCM, 0x0002 AES-256-GCM, 0x0003
+    // ChaCha20-Poly1305. Written out rather than derived, so a wrong
+    // derivation cannot agree with itself.
+    const cases = .{
+        .{ suite.Mls128X25519Aes128GcmSha256Ed25519, 0x0020, 0x0001, 0x0001 },
+        .{ suite.Mls128P256Aes128GcmSha256P256, 0x0010, 0x0001, 0x0001 },
+        .{ suite.Mls128X25519ChaCha20Poly1305Sha256Ed25519, 0x0020, 0x0001, 0x0003 },
+    };
+    inline for (cases) |c| {
+        const got = hpkeSuiteId(c[0]);
+        try testing.expectEqualSlices(u8, "HPKE", got[0..4]);
+        try testing.expectEqual(@as(u16, c[1]), std.mem.readInt(u16, got[4..6], .big));
+        try testing.expectEqual(@as(u16, c[2]), std.mem.readInt(u16, got[6..8], .big));
+        try testing.expectEqual(@as(u16, c[3]), std.mem.readInt(u16, got[8..10], .big));
+    }
+}
+
 test "GroupContext: encodes RFC 9420 §8.1's field order, and round-trips" {
     const gid = @as([4]u8, @splat(0xaa));
     const th = @as([32]u8, @splat(0xbb));

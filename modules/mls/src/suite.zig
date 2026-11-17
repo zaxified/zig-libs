@@ -27,6 +27,8 @@
 const std = @import("std");
 const hpke = @import("hpke");
 const aesgcm = @import("aesgcm");
+const burn = @import("burn.zig");
+const p256 = @import("p256");
 
 /// RFC 9420 §17.1's registry — every suite name IANA has assigned a
 /// `CipherSuite` value to. The ones this module instantiates are listed in
@@ -102,12 +104,93 @@ pub fn CipherSuite(
         /// `MAC.Nm` — the MAC output width in bytes (RFC 9420 §6.1's
         /// `MAC` type; HMAC's output is its hash's digest length).
         pub const Nm = Mac.mac_length;
-        /// The signature scheme's encoded-signature width in bytes (RFC
-        /// 9420 §5.1.2: EdDSA signatures are `R || S`; ECDSA signatures
-        /// are DER, so `Nx` is suite-specific — not named directly by the
-        /// RFC, kept here as a derived convenience the way `Nh`/`Nk`/`Nn`
-        /// are).
-        pub const Nx = Sig.Signature.encoded_length;
+        /// Whether `Sig` is an ECDSA scheme (std's / the `p256`/`p384`/
+        /// `p521` siblings' `Ecdsa` surface, recognised by its DER codec)
+        /// rather than EdDSA. Decides the two wire encodings RFC 9420
+        /// §5.1.1/§5.1.2 make scheme-specific: public keys and signatures.
+        pub const sig_is_ecdsa = @hasDecl(Sig_.Signature, "toDer");
+        /// The signature scheme's MAXIMUM encoded-signature width in bytes
+        /// (RFC 9420 §5.1.2 defers to the TLS 1.3 SignatureScheme
+        /// encodings: EdDSA signatures are the fixed-width `R || S`, ECDSA
+        /// signatures a DER `Ecdsa-Sig-Value`, whose length varies). Not
+        /// named by the RFC; derived the way `Nh`/`Nk`/`Nn` are.
+        pub const Nx = if (sig_is_ecdsa) Sig.Signature.der_encoded_length_max else Sig.Signature.encoded_length;
+        /// The encoded signature PUBLIC key width (RFC 9420 §5.1.1: the
+        /// raw RFC 8032 key for EdDSA, the UNCOMPRESSED SEC1 point for
+        /// ECDSA).
+        pub const Nspk = if (sig_is_ecdsa) Sig.PublicKey.uncompressed_sec1_encoded_length else Sig.PublicKey.encoded_length;
+        /// The signature private key width as the interop vectors carry it:
+        /// the RFC 8032 seed for EdDSA, the big-endian scalar for ECDSA.
+        pub const Nssk = if (sig_is_ecdsa) Sig.SecretKey.encoded_length else Sig.KeyPair.seed_length;
+
+        /// One encoded signature: `Nx` bytes of room, `len` of them used.
+        pub const SignatureBytes = struct {
+            buf: [Nx]u8,
+            len: usize,
+
+            pub fn slice(self: *const SignatureBytes) []const u8 {
+                return self.buf[0..self.len];
+            }
+        };
+
+        /// A signature in its RFC 9420 wire form (EdDSA `R || S`, ECDSA
+        /// DER).
+        pub fn encodeSignature(sig: Sig.Signature) SignatureBytes {
+            var out: SignatureBytes = .{ .buf = undefined, .len = 0 };
+            if (sig_is_ecdsa) {
+                out.len = sig.toDer(&out.buf).len;
+            } else {
+                out.buf = sig.toBytes();
+                out.len = Nx;
+            }
+            return out;
+        }
+
+        /// The inverse of `encodeSignature`. A signature of the wrong
+        /// length (EdDSA) or that is not a DER `Ecdsa-Sig-Value` (ECDSA) is
+        /// `error.WrongKeyLength` — the error every verifier in this
+        /// module already returns for a signature it cannot even parse.
+        pub fn decodeSignature(bytes: []const u8) error{WrongKeyLength}!Sig.Signature {
+            if (sig_is_ecdsa) return Sig.Signature.fromDer(bytes) catch error.WrongKeyLength;
+            if (bytes.len != Nx) return error.WrongKeyLength;
+            return Sig.Signature.fromBytes(bytes[0..Nx].*);
+        }
+
+        /// A signature public key in its RFC 9420 §5.1.1 wire form.
+        pub fn encodePublicKey(pk: Sig.PublicKey) [Nspk]u8 {
+            return if (sig_is_ecdsa) pk.toUncompressedSec1() else pk.toBytes();
+        }
+
+        /// The inverse of `encodePublicKey`. A key of any other length is
+        /// `error.WrongKeyLength`; for ECDSA that includes the COMPRESSED
+        /// SEC1 form, which §5.1.1 does not allow ("the uncompressed
+        /// Elliptic-Curve-Point-to-Octet-String conversion"). A
+        /// right-length encoding that is not a valid key fails with the
+        /// scheme's own error (not on the curve, non-canonical, identity).
+        pub fn decodePublicKey(bytes: []const u8) !Sig.PublicKey {
+            if (bytes.len != Nspk) return error.WrongKeyLength;
+            if (sig_is_ecdsa) {
+                if (bytes[0] != 0x04) return error.WrongKeyLength;
+                return Sig.PublicKey.fromSec1(bytes);
+            }
+            return Sig.PublicKey.fromBytes(bytes[0..Nspk].*);
+        }
+
+        /// A signing key pair from its private key as the interop vectors
+        /// encode it (`Nssk` bytes): the RFC 8032 seed for EdDSA, the
+        /// scalar for ECDSA. Key in by pointer, pair out through `out`,
+        /// the body under `burn.kem_burn` (the module's secret-API
+        /// convention).
+        pub fn signatureKeyPair(priv: *const [Nssk]u8, out: *Sig.KeyPair) @TypeOf(signatureKeyPairBody(priv, out)) {
+            return burn.run(burn.kem_burn, @TypeOf(signatureKeyPairBody(priv, out)), signatureKeyPairBody, .{ priv, out });
+        }
+
+        fn signatureKeyPairBody(priv: *const [Nssk]u8, out: *Sig.KeyPair) !void {
+            out.* = if (sig_is_ecdsa)
+                try Sig.KeyPair.fromSecretKey(try Sig.SecretKey.fromBytes(priv.*))
+            else
+                try Sig.KeyPair.generateDeterministic(priv.*);
+        }
 
         /// MLS's transcript/ref-hash digest, `Hash(data)` — a one-shot
         /// convenience over `std.crypto.hash.*`'s `Hasher.hash`.
@@ -148,6 +231,22 @@ pub const Mls128X25519ChaCha20Poly1305Sha256Ed25519 = CipherSuite(
     .mls_128_dhkemx25519_chacha20poly1305_sha256_ed25519,
 );
 
+/// `0x0002` = `MLS_128_DHKEMP256_AES128GCM_SHA256_P256`: DHKEM(P-256,
+/// HKDF-SHA256) + AES-128-GCM + SHA-256 + ECDSA over P-256 with SHA-256.
+/// The KEM is `hpke.P256Kem` and the signature scheme the sibling `p256`
+/// module's `EcdsaP256Sha256` (byte-exact to std's, constant-time signing,
+/// several times faster). Public keys travel as uncompressed SEC1 points and
+/// signatures as DER (RFC 9420 §5.1.1/§5.1.2), see `encodePublicKey`/
+/// `encodeSignature`.
+pub const Mls128P256Aes128GcmSha256P256 = CipherSuite(
+    hpke.P256Kem,
+    aesgcm.Aes128Gcm,
+    std.crypto.kdf.hkdf.HkdfSha256,
+    std.crypto.hash.sha2.Sha256,
+    p256.EcdsaP256Sha256,
+    .mls_128_dhkemp256_aes128gcm_sha256_p256,
+);
+
 /// The suite a caller with no suite-negotiation needs of its own should
 /// reach for first — RFC 9420 §16.1's mandatory-to-implement `0x0001`.
 pub const default = Mls128X25519Aes128GcmSha256Ed25519;
@@ -157,6 +256,7 @@ pub const default = Mls128X25519Aes128GcmSha256Ed25519;
 /// a suite here is what puts it under every vector file.
 pub const supported = .{
     Mls128X25519Aes128GcmSha256Ed25519,
+    Mls128P256Aes128GcmSha256P256,
     Mls128X25519ChaCha20Poly1305Sha256Ed25519,
 };
 
@@ -188,6 +288,55 @@ test "0x0003: widths match RFC 9420 §17.1's MLS_128_DHKEMX25519_CHACHA20POLY130
     try testing.expectEqual(@as(usize, 12), S.Nn);
     try testing.expectEqual(@as(usize, 16), S.Aead.tag_length);
     try testing.expectEqual(@as(usize, 32), S.Nm);
+}
+
+test "0x0002: widths match RFC 9420 §17.1's MLS_128_DHKEMP256_AES128GCM_SHA256_P256 row" {
+    const S = Mls128P256Aes128GcmSha256P256;
+    try testing.expectEqual(@as(u16, 0x0002), @backingInt(S.id));
+    try testing.expect(S.sig_is_ecdsa);
+    try testing.expectEqual(@as(usize, 32), S.Nh);
+    try testing.expectEqual(@as(usize, 16), S.Nk);
+    try testing.expectEqual(@as(usize, 65), S.Nspk); // uncompressed SEC1
+    try testing.expectEqual(@as(usize, 32), S.Nssk);
+    try testing.expectEqual(@as(usize, 65), S.Kem.Npk);
+}
+
+test "ECDSA encodings: compressed keys and malformed DER are refused, a signature round-trips" {
+    const S = Mls128P256Aes128GcmSha256P256;
+    const kp = try S.Sig.KeyPair.generateDeterministic(@splat(0x11));
+    const pk = S.encodePublicKey(kp.public_key);
+    try testing.expectEqual(@as(u8, 0x04), pk[0]);
+    _ = try S.decodePublicKey(&pk);
+    // RFC 9420 §5.1.1: uncompressed only.
+    const compressed = kp.public_key.toCompressedSec1();
+    try testing.expectError(error.WrongKeyLength, S.decodePublicKey(&compressed));
+    var bad_prefix = pk;
+    bad_prefix[0] = 0x06; // hybrid form, same length
+    try testing.expectError(error.WrongKeyLength, S.decodePublicKey(&bad_prefix));
+
+    const sig = try kp.sign("msg", null);
+    const der = S.encodeSignature(sig);
+    try testing.expectEqual(@as(u8, 0x30), der.slice()[0]);
+    const back = try S.decodeSignature(der.slice());
+    try back.verify("msg", kp.public_key);
+    try testing.expectError(error.WrongKeyLength, S.decodeSignature(der.slice()[0 .. der.len - 1]));
+    try testing.expectError(error.WrongKeyLength, S.decodeSignature(&sig.toBytes())); // raw r||s is not DER
+}
+
+test "EdDSA encodings: a signature or key of the wrong length is WrongKeyLength" {
+    const S = default;
+    try testing.expect(!S.sig_is_ecdsa);
+    const kp = try S.Sig.KeyPair.generateDeterministic(@splat(0x22));
+    const pk = S.encodePublicKey(kp.public_key);
+    try testing.expectError(error.WrongKeyLength, S.decodePublicKey(pk[0..31]));
+    const sig = S.encodeSignature(try kp.sign("m", null));
+    try testing.expectEqual(@as(usize, 64), sig.len);
+    try testing.expectError(error.WrongKeyLength, S.decodeSignature(sig.slice()[0..63]));
+    _ = try S.decodeSignature(sig.slice());
+    var seed: [S.Nssk]u8 = @splat(0x22);
+    var again: S.Sig.KeyPair = undefined;
+    try S.signatureKeyPair(&seed, &again);
+    try testing.expectEqualSlices(u8, &pk, &S.encodePublicKey(again.public_key));
 }
 
 test "default suite: hash() is plain SHA-256" {

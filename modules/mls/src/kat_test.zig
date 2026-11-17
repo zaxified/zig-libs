@@ -168,27 +168,32 @@ fn cryptoBasics(comptime S: type) !void {
             const pub_bytes = try hexDecode(arena, sw.get("pub").?.string);
             const want_sig = try hexDecode(arena, sw.get("signature").?.string);
 
-            var seed: [32]u8 = undefined;
-            @memcpy(&seed, priv_bytes[0..32]);
-            const kp = try S.Sig.KeyPair.generateDeterministic(seed);
-            var want_pub: [32]u8 = undefined;
-            @memcpy(&want_pub, pub_bytes[0..32]);
-            try testing.expectEqualSlices(u8, &want_pub, &kp.public_key.toBytes());
+            try testing.expectEqual(@as(usize, S.Nssk), priv_bytes.len);
+            var kp: S.Sig.KeyPair = undefined;
+            try S.signatureKeyPair(priv_bytes[0..S.Nssk], &kp);
+            try testing.expectEqualSlices(u8, pub_bytes, &S.encodePublicKey(kp.public_key));
+            const pub_key = try S.decodePublicKey(pub_bytes);
 
-            // Ed25519 is DETERMINISTIC (RFC 8032, no hedging/`noise`
-            // passed) — re-signing must reproduce the vector's signature
-            // byte-exact, a strictly stronger check than "the published
-            // signature merely verifies" (which is all a randomized
-            // scheme like ECDSA could offer).
-            const sig = try crypto.SignWithLabel(S, &kp, label, content);
-            try testing.expectEqualSlices(u8, want_sig, &sig.toBytes());
-
-            // And the published signature independently verifies too.
-            var sig_bytes: [64]u8 = undefined;
-            @memcpy(&sig_bytes, want_sig[0..64]);
-            const parsed_sig = S.Sig.Signature.fromBytes(sig_bytes);
-            const pub_key = try S.Sig.PublicKey.fromBytes(want_pub);
+            // The published signature verifies...
+            const parsed_sig = try S.decodeSignature(want_sig);
             try crypto.VerifyWithLabel(S, pub_key, label, content, parsed_sig);
+            // ...and its re-encoding is the vector's own bytes.
+            try testing.expectEqualSlices(u8, want_sig, S.encodeSignature(parsed_sig).slice());
+
+            const sig = try crypto.SignWithLabel(S, &kp, label, content);
+            if (S.sig_is_ecdsa) {
+                // ECDSA signatures depend on the signer's nonce, so the
+                // vector's bytes cannot be reproduced — ours must verify,
+                // and must not verify under another label.
+                try crypto.VerifyWithLabel(S, pub_key, label, content, sig);
+                try testing.expectError(error.SignatureVerificationFailed, crypto.VerifyWithLabel(S, pub_key, "other label", content, sig));
+            } else {
+                // Ed25519 is DETERMINISTIC (RFC 8032, no hedging/`noise`
+                // passed) — re-signing must reproduce the vector's signature
+                // byte-exact, a strictly stronger check than "the published
+                // signature merely verifies".
+                try testing.expectEqualSlices(u8, want_sig, S.encodeSignature(sig).slice());
+            }
         }
 
         // ── encrypt_with_label / DecryptWithLabel (RFC 9420 §5.1.3) ──

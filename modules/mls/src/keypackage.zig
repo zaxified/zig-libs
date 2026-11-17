@@ -140,23 +140,17 @@ pub const KeyPackage = struct {
     /// whether that key is one the Authentication Service vouches for
     /// (§10.1/Part 3's job).
     ///
-    /// Only suite `0x0001` (Ed25519) is wired, so a `signature_key`/
-    /// `signature` of any other length is `error.WrongKeyLength` — mirrors
+    /// A `signature_key`/`signature` that does not parse in suite `S`'s
+    /// encoding is `error.WrongKeyLength` — mirrors
     /// `tree.LeafNode.verifySignature`'s handling exactly.
     pub fn verifySignature(self: KeyPackage, comptime S: type, allocator: std.mem.Allocator) !void {
-        if (self.leaf_node.signature_key.len != 32) return error.WrongKeyLength;
-        if (self.signature.len != 64) return error.WrongKeyLength;
+        const pk = try S.decodePublicKey(self.leaf_node.signature_key);
+        const sig = try S.decodeSignature(self.signature);
         const buf = try allocator.alloc(u8, self.tbsEncodedLen());
         defer allocator.free(buf);
         var w = codec.Writer.init(buf);
         try self.tbsEncode(&w);
-
-        var pk_bytes: [32]u8 = undefined;
-        @memcpy(&pk_bytes, self.leaf_node.signature_key);
-        const pk = try S.Sig.PublicKey.fromBytes(pk_bytes);
-        var sig_bytes: [64]u8 = undefined;
-        @memcpy(&sig_bytes, self.signature);
-        try crypto.VerifyWithLabelAlloc(S, allocator, pk, label_tbs, w.finish(), S.Sig.Signature.fromBytes(sig_bytes));
+        try crypto.VerifyWithLabelAlloc(S, allocator, pk, label_tbs, w.finish(), sig);
     }
 
     /// The signing counterpart of `verifySignature`: produces the
@@ -217,7 +211,7 @@ pub fn CreateParams(comptime S: type) type {
 pub fn create(comptime S: type, allocator: std.mem.Allocator, params: CreateParams(S)) !KeyPackage {
     var leaf: tree.LeafNode = .{
         .encryption_key = try allocator.dupe(u8, &params.encryption_key),
-        .signature_key = try allocator.dupe(u8, &params.signature_key_pair.public_key.toBytes()),
+        .signature_key = try allocator.dupe(u8, &S.encodePublicKey(params.signature_key_pair.public_key)),
         .credential = params.credential,
         .capabilities = params.capabilities,
         .leaf_node_source = .key_package,
@@ -228,8 +222,8 @@ pub fn create(comptime S: type, allocator: std.mem.Allocator, params: CreatePara
     // §7.2: `group_id`/`leaf_index` are NOT part of a key_package-sourced
     // `LeafNodeTBS`, which is exactly why a KeyPackage can be published
     // before any group exists. The two arguments are ignored here.
-    const leaf_sig = try leaf.sign(S, allocator, params.signature_key_pair, "", 0);
-    leaf.signature = try allocator.dupe(u8, &leaf_sig.toBytes());
+    const leaf_sig = S.encodeSignature(try leaf.sign(S, allocator, params.signature_key_pair, "", 0));
+    leaf.signature = try allocator.dupe(u8, leaf_sig.slice());
 
     var kp: KeyPackage = .{
         .cipher_suite = S.id,
@@ -238,8 +232,8 @@ pub fn create(comptime S: type, allocator: std.mem.Allocator, params: CreatePara
         .extensions = params.extensions,
         .signature = &.{},
     };
-    const sig = try kp.sign(S, allocator, params.signature_key_pair);
-    kp.signature = try allocator.dupe(u8, &sig.toBytes());
+    const sig = S.encodeSignature(try kp.sign(S, allocator, params.signature_key_pair));
+    kp.signature = try allocator.dupe(u8, sig.slice());
     return kp;
 }
 

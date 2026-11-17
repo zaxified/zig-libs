@@ -599,7 +599,7 @@ fn applyUpdatePaths(comptime S: type) !void {
             // public-side merge writes to the §4.1.2 filtered direct path,
             // which that exclusion does not touch — see
             // `treekem.filteredDirectPath`.
-            try treekem.applyUpdatePath(arena.allocator(), &dt.tree, sender, update_path);
+            try treekem.applyUpdatePath(S, arena.allocator(), &dt.tree, sender, update_path);
 
             const got = try treehash.rootHash(S, testing.allocator, &dt.tree);
             try testing.expectEqualSlices(u8, want_tree_hash_after, &got);
@@ -621,7 +621,7 @@ fn applyUpdatePaths(comptime S: type) !void {
             defer dt2.deinit(testing.allocator);
             var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
             defer arena2.deinit();
-            try testing.expectError(error.Malformed, treekem.applyUpdatePath(arena2.allocator(), &dt2.tree, sender, bad_path));
+            try testing.expectError(error.Malformed, treekem.applyUpdatePath(S, arena2.allocator(), &dt2.tree, sender, bad_path));
             tampered += 1;
         }
     }

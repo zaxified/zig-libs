@@ -76,6 +76,18 @@ fn asI64(v: std.json.Value) i64 {
     };
 }
 
+/// A private key from a vector, as the fixed-width big-endian scalar the
+/// API takes. The upstream P-521 vectors (suite 0x0005) drop a leading zero
+/// byte, giving 65 bytes for a 66-byte scalar, so a shorter value is
+/// left-padded with zeros. That is the same integer, so the meaning does not
+/// change.
+fn hexPrivate(comptime n: usize, hex: []const u8) ![n]u8 {
+    var out: [n]u8 = @splat(0);
+    if (hex.len % 2 != 0 or hex.len / 2 > n) return error.WrongKeyLength;
+    _ = try std.fmt.hexToBytes(out[n - hex.len / 2 ..], hex);
+    return out;
+}
+
 fn expectStage(stage: []const u8, want: []const u8, got: []const u8) !void {
     testing.expectEqualSlices(u8, want, got) catch |err| {
         std.debug.print(
@@ -170,12 +182,12 @@ fn messageProtection(comptime S: type) !void {
         const sender_data_secret = try hexSecret(S, obj.get("sender_data_secret").?.string);
 
         // `signature_priv` is the Ed25519 SEED (RFC 8032 §5.1.5's 32-byte
-        // private key), not an expanded scalar — asserting that the derived
+        // private key) or the ECDSA scalar — asserting that the derived
         // public key matches `signature_pub` is what pins that reading.
-        var seed: [32]u8 = undefined;
-        _ = try std.fmt.hexToBytes(&seed, obj.get("signature_priv").?.string);
-        const key_pair = try S.Sig.KeyPair.generateDeterministic(seed);
-        const pub_bytes = key_pair.public_key.toBytes();
+        const priv = try hexPrivate(S.Nssk, obj.get("signature_priv").?.string);
+        var key_pair: S.Sig.KeyPair = undefined;
+        try S.signatureKeyPair(&priv, &key_pair);
+        const pub_bytes = S.encodePublicKey(key_pair.public_key);
         try expectStage("signature_priv -> signature_pub", try hexDecode(arena, obj.get("signature_pub").?.string), &pub_bytes);
         const signature_pub = key_pair.public_key;
 
@@ -219,7 +231,27 @@ fn messageProtection(comptime S: type) !void {
                 .confirmation_tag = pm.auth.confirmation_tag,
             });
             defer alloc.free(protected);
-            try expectStage("protectPublic(" ++ spec[0] ++ ")", vec[header_len..], protected);
+            if (S.sig_is_ecdsa) {
+                // ECDSA signatures carry the signer's nonce, so our bytes
+                // differ from the vector's in the signature (and its
+                // length). Everything else must be the vector's: the same
+                // content and confirmation tag, a membership tag valid over
+                // OUR signature, and a signature that verifies.
+                var pr = codec.Reader.init(protected);
+                const ours = try framing.PublicMessage.decode(alloc, &pr);
+                defer ours.deinit(alloc);
+                try testing.expect(pr.atEnd());
+                try expectStageOk("protectPublic(" ++ spec[0] ++ ") membership_tag", framing.verifyMembershipTag(S, alloc, &membership_key, ours, gc_bytes));
+                try expectStageOk("protectPublic(" ++ spec[0] ++ ") signature", framing.verifyFramedContent(S, alloc, signature_pub, ours.authenticatedContent(), gc_bytes));
+                var sub = ours;
+                sub.auth.signature = pm.auth.signature;
+                sub.membership_tag = pm.membership_tag;
+                const resubstituted = try sub.encodeAlloc(alloc);
+                defer alloc.free(resubstituted);
+                try expectStage("protectPublic(" ++ spec[0] ++ ") minus signature", vec[header_len..], resubstituted);
+            } else {
+                try expectStage("protectPublic(" ++ spec[0] ++ ")", vec[header_len..], protected);
+            }
             public_checked += 1;
         }
 
@@ -301,7 +333,27 @@ fn messageProtection(comptime S: type) !void {
                 .padding_len = padding_len,
             });
             defer alloc.free(protected);
-            try expectStage("protectPrivate(" ++ spec[0] ++ ")", vec[header_len..], protected);
+            if (S.sig_is_ecdsa) {
+                // As above: only the signature (inside the ciphertext) may
+                // differ. Open OUR message with the same keys, and require
+                // the vector's body and a signature that verifies.
+                var pr = codec.Reader.init(protected);
+                const ours = try framing.PrivateMessage.decode(&pr);
+                try testing.expect(pr.atEnd());
+                const our_sd = try framing.decryptSenderData(S, alloc, ours, &sender_data_secret);
+                try testing.expectEqual(sd.leaf_index, our_sd.leaf_index);
+                try testing.expectEqual(sd.generation, our_sd.generation);
+                const our_pt = try framing.decryptContent(S, alloc, ours, &kn, our_sd.reuse_guard);
+                defer alloc.free(our_pt);
+                const our_ac = try framing.parsePrivateContent(alloc, ours, our_pt, our_sd.leaf_index);
+                defer our_ac.deinit(alloc);
+                const our_body = try encodeBodyAlloc(alloc, our_ac.content.body);
+                defer alloc.free(our_body);
+                try expectStage("protectPrivate(" ++ spec[0] ++ ") body", raw, our_body);
+                try expectStageOk("protectPrivate(" ++ spec[0] ++ ") signature", framing.verifyFramedContent(S, alloc, signature_pub, our_ac, gc_bytes));
+            } else {
+                try expectStage("protectPrivate(" ++ spec[0] ++ ")", vec[header_len..], protected);
+            }
             private_checked += 1;
         }
     }
