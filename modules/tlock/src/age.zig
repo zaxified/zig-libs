@@ -44,10 +44,10 @@
 //!   stanza is `error.NoTlockStanza`. Other stanzas (an X25519 recipient
 //!   alongside) are parsed, MAC-covered and skipped; two `tlock` stanzas are
 //!   refused (`tle` never writes that).
-//! - No streaming I/O: whole buffers in, whole buffers out. Sizes are exact
-//!   and computable up front (`encryptedLen`, `decryptedLen`, `armoredLen`).
-//!   The STREAM layer itself is chunk-at-a-time (`PayloadStream`) for a
-//!   caller that streams.
+//! - Armor is whole-buffer only. The binary file also streams over
+//!   `std.Io.Reader`/`Writer` (`encryptStream`, `decryptStream`); the
+//!   whole-buffer functions have exact sizes up front (`encryptedLen`,
+//!   `decryptedLen`, `armoredLen`).
 
 const std = @import("std");
 const chachapoly = @import("chachapoly");
@@ -286,6 +286,11 @@ fn headerMac(file_key: [file_key_bytes]u8, mac_input: []const u8) [mac_bytes]u8 
     return mac;
 }
 
+/// Whether two header MACs are equal, in constant time.
+fn macEql(a: [mac_bytes]u8, b: [mac_bytes]u8) bool {
+    return std.crypto.timing_safe.eql([mac_bytes]u8, a, b);
+}
+
 fn payloadKey(file_key: [file_key_bytes]u8, nonce: [nonce_bytes]u8) [Aead.key_length]u8 {
     var prk = HkdfSha256.extract(&nonce, &file_key);
     defer std.crypto.secureZero(u8, &prk);
@@ -495,10 +500,19 @@ pub fn encrypt(
 }
 
 fn encryptBody(out: []u8, plaintext: []const u8, p_pub: g2.Affine, round: u64, chain_hash: [chain_hash_bytes]u8, rnd: *const Randomness) void {
-    const total = out.len;
+    const head_len = headerLen(round) + nonce_bytes;
+    writeHead(out[0..head_len], p_pub, round, chain_hash, rnd);
+    var key = payloadKey(rnd.file_key, rnd.nonce);
+    defer std.crypto.secureZero(u8, &key);
+    sealPayloadBody(out[head_len..], &key, plaintext);
+}
+
+/// The header (with its MAC) and the payload nonce into `out`, which is
+/// exactly `headerLen(round) + nonce_bytes` long.
+fn writeHead(out: []u8, p_pub: g2.Affine, round: u64, chain_hash: [chain_hash_bytes]u8, rnd: *const Randomness) void {
     const ct = tlock_mod.encrypt(p_pub, round, &rnd.file_key, &rnd.sigma).toBytes();
 
-    var w: std.Io.Writer = .fixed(out[0..total]);
+    var w: std.Io.Writer = .fixed(out);
     const chain_hex = std.fmt.bytesToHex(chain_hash, .lower);
     w.print("{s}\n-> {s} {d} {s}\n", .{ version_line, stanza_type, round, &chain_hex }) catch unreachable;
     var enc: [b64_raw.Encoder.calcSize(Ciphertext.encoded_bytes)]u8 = undefined;
@@ -514,11 +528,7 @@ fn encryptBody(out: []u8, plaintext: []const u8, p_pub: g2.Affine, round: u64, c
     var mac_b64: [b64_raw.Encoder.calcSize(mac_bytes)]u8 = undefined;
     w.print(" {s}\n", .{b64_raw.Encoder.encode(&mac_b64, &mac)}) catch unreachable;
     w.writeAll(&rnd.nonce) catch unreachable;
-    std.debug.assert(w.end == headerLen(round) + nonce_bytes);
-
-    var key = payloadKey(rnd.file_key, rnd.nonce);
-    defer std.crypto.secureZero(u8, &key);
-    sealPayloadBody(out[w.end..total], &key, plaintext);
+    std.debug.assert(w.end == out.len);
 }
 
 pub const EncryptOptions = struct {
@@ -584,7 +594,7 @@ fn decryptBody(out: []u8, file: []const u8, round_signature: g1.Affine, opts: De
     try tlock_mod.decrypt(&file_key, round_signature, h.recipient.ciphertext);
     defer std.crypto.secureZero(u8, &file_key);
     const mac = headerMac(file_key, file[0..h.mac_input_len]);
-    if (!std.crypto.timing_safe.eql([mac_bytes]u8, mac, h.mac)) return error.HeaderMacMismatch;
+    if (!macEql(mac, h.mac)) return error.HeaderMacMismatch;
 
     var key = payloadKey(file_key, file[h.len..][0..nonce_bytes].*);
     defer std.crypto.secureZero(u8, &key);
@@ -615,6 +625,193 @@ pub fn inspectAlloc(gpa: std.mem.Allocator, file: []const u8) (HeaderError || Ar
     const scratch = try gpa.alloc(u8, dearmoredLenMax(file.len));
     defer gpa.free(scratch);
     return (try Header.parse(try dearmor(scratch, file))).recipient;
+}
+
+// ── streaming encrypt / decrypt ────────────────────────────────────────
+//
+// `tlock.New(network).Encrypt(dst io.Writer, src io.Reader, round)` and
+// `.Decrypt(dst, src)` of drand/tlock (Go), over `std.Io.Reader`/`Writer`: the
+// binary age file, one 64 KiB STREAM chunk at a time, so memory is bounded
+// (one allocation of about 128 KiB) however large the file is. Armor is not
+// streamed (`encryptAlloc`/`decryptAlloc` keep it): `tle` armors through a
+// separate writer in front of this one.
+
+/// Errors of `encryptStream`: the reader or the writer failed, or the one
+/// chunk buffer could not be allocated.
+pub const EncryptStreamError = error{ ReadFailed, WriteFailed, OutOfMemory };
+
+/// Errors of `decryptStream`: `DecryptError`'s, less `NoSpaceLeft`, plus the
+/// reader's and the writer's failures and the chunk buffer's allocation.
+pub const DecryptStreamError = HeaderError || tlock_mod.DecryptError || error{
+    WrongChainHash,
+    HeaderMacMismatch,
+    MalformedPayload,
+    PayloadAuthenticationFailed,
+    ReadFailed,
+    WriteFailed,
+    OutOfMemory,
+};
+
+/// The stream form of `encrypt`: read `r` to its end and write the binary age
+/// file to `w`, byte for byte what `encrypt` of the same bytes under the same
+/// `rnd` produces (`encryptedLen`). The header is written first, then each
+/// chunk once the next byte (or the end) proves whether it is the last.
+/// `w` is not flushed; `r` is read to its end, not closed. A failed `r` or `w`
+/// ends the call with `ReadFailed`/`WriteFailed` (the reader's or writer's
+/// own error is where the cause is); what reached `w` before that is a
+/// prefix of the file.
+pub fn encryptStream(
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    r: *std.Io.Reader,
+    p_pub: g2.Affine,
+    round: u64,
+    chain_hash: [chain_hash_bytes]u8,
+    rnd: *const Randomness,
+) EncryptStreamError!void {
+    return burn.run(burn.crypt_burn, EncryptStreamError!void, encryptStreamBody, .{ gpa, w, r, p_pub, round, chain_hash, rnd });
+}
+
+fn encryptStreamBody(
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    r: *std.Io.Reader,
+    p_pub: g2.Affine,
+    round: u64,
+    chain_hash: [chain_hash_bytes]u8,
+    rnd: *const Randomness,
+) EncryptStreamError!void {
+    const head_max = comptime headerLen(std.math.maxInt(u64)) + nonce_bytes;
+    const head_len = headerLen(round) + nonce_bytes;
+    var head: [head_max]u8 = undefined;
+    writeHead(head[0..head_len], p_pub, round, chain_hash, rnd);
+    try w.writeAll(head[0..head_len]);
+
+    var key = payloadKey(rnd.file_key, rnd.nonce);
+    defer std.crypto.secureZero(u8, &key);
+    var stream: PayloadStream = undefined;
+    stream.init(&key);
+    defer stream.wipe();
+
+    // One more plaintext byte than a chunk holds: that byte is what says the
+    // chunk before it is not the last (no peek, so an unbuffered reader works).
+    const buf = try gpa.alloc(u8, (chunk_bytes + 1) + sealed_chunk_bytes);
+    defer {
+        std.crypto.secureZero(u8, buf);
+        gpa.free(buf);
+    }
+    const plain = buf[0 .. chunk_bytes + 1];
+    const sealed = buf[chunk_bytes + 1 ..];
+    var have: usize = 0;
+    while (true) {
+        have += try r.readSliceShort(plain[have..]);
+        const last = have <= chunk_bytes;
+        const n = if (last) have else chunk_bytes;
+        stream.sealChunk(sealed[0 .. n + tag_bytes], plain[0..n], last);
+        try w.writeAll(sealed[0 .. n + tag_bytes]);
+        if (last) return;
+        plain[0] = plain[chunk_bytes];
+        have = 1;
+    }
+}
+
+/// The stream form of `decrypt`: read a binary age file from `r` to its end
+/// and write the plaintext to `w`. Order as in `decrypt` (header syntax,
+/// chain hash, stanza FO check, header MAC, then the payload chunk by chunk),
+/// with the differences a stream cannot avoid: the header is read up to its
+/// MAC line (`max_header_bytes` at most) before anything is parsed, so a
+/// malformed header can report `HeaderTooLarge` or `MalformedHeader` where
+/// `decrypt` names the first bad line; and the payload length is unknown
+/// until the end, so `MalformedPayload` for a payload that is too short comes
+/// after the FO check and the MAC, not before. Every chunk is authenticated
+/// before it is written, but a chunk written is written: a tampered or
+/// truncated file fails at its bad chunk or at its end (truncation at a chunk
+/// boundary is caught by the last-chunk flag of the chunk before), and the
+/// plaintext before that point has already reached `w`; a caller that must not
+/// act on unverified output buffers it until this returns. `w` is not flushed.
+pub fn decryptStream(
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    r: *std.Io.Reader,
+    round_signature: g1.Affine,
+    opts: DecryptOptions,
+) DecryptStreamError!void {
+    return burn.run(burn.crypt_burn, DecryptStreamError!void, decryptStreamBody, .{ gpa, w, r, round_signature, opts });
+}
+
+fn decryptStreamBody(
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    r: *std.Io.Reader,
+    round_signature: g1.Affine,
+    opts: DecryptOptions,
+) DecryptStreamError!void {
+    // The header, up to and including the LF of its MAC line.
+    var head: [max_header_bytes]u8 = undefined;
+    var n: usize = 0;
+    var line_start: usize = 0;
+    while (true) {
+        // One byte at a time through `readSliceShort`, not `takeByte`: that one
+        // needs a reader with a buffer, and this works on an unbuffered one too.
+        var one: [1]u8 = undefined;
+        if (try r.readSliceShort(&one) == 0) {
+            // Ran out: name the fault the in-memory parser names for these bytes.
+            _ = try Header.parse(head[0..n]);
+            return error.MalformedHeader;
+        }
+        const b = one[0];
+        if (n == max_header_bytes) return error.HeaderTooLarge;
+        head[n] = b;
+        n += 1;
+        if (b != '\n') continue;
+        const line = head[line_start..n];
+        if (line_start == 0 and !std.mem.eql(u8, line, version_line ++ "\n")) return error.NotAgeFile;
+        if (std.mem.startsWith(u8, line, "---")) break;
+        line_start = n;
+    }
+    const h = try Header.parse(head[0..n]);
+    if (h.len != n) return error.MalformedHeader;
+    if (opts.chain_hash) |want| {
+        if (!std.mem.eql(u8, &want, &h.recipient.chain_hash)) return error.WrongChainHash;
+    }
+    var nonce: [nonce_bytes]u8 = undefined;
+    r.readSliceAll(&nonce) catch |err| switch (err) {
+        error.ReadFailed => return error.ReadFailed,
+        error.EndOfStream => return error.MalformedPayload,
+    };
+
+    var file_key: [file_key_bytes]u8 = undefined;
+    try tlock_mod.decrypt(&file_key, round_signature, h.recipient.ciphertext);
+    defer std.crypto.secureZero(u8, &file_key);
+    const mac = headerMac(file_key, head[0..h.mac_input_len]);
+    if (!macEql(mac, h.mac)) return error.HeaderMacMismatch;
+
+    var key = payloadKey(file_key, nonce);
+    defer std.crypto.secureZero(u8, &key);
+    var stream: PayloadStream = undefined;
+    stream.init(&key);
+    defer stream.wipe();
+
+    // As in `encryptStream`: one byte past a sealed chunk says it is not the last.
+    const buf = try gpa.alloc(u8, (sealed_chunk_bytes + 1) + chunk_bytes);
+    defer {
+        std.crypto.secureZero(u8, buf);
+        gpa.free(buf);
+    }
+    const sealed = buf[0 .. sealed_chunk_bytes + 1];
+    const plain = buf[sealed_chunk_bytes + 1 ..];
+    var have: usize = 0;
+    while (true) {
+        have += try r.readSliceShort(sealed[have..]);
+        const last = have <= sealed_chunk_bytes;
+        const c = if (last) have else sealed_chunk_bytes;
+        if (c < tag_bytes) return error.MalformedPayload;
+        try stream.openChunk(plain[0 .. c - tag_bytes], sealed[0..c], last);
+        try w.writeAll(plain[0 .. c - tag_bytes]);
+        if (last) return;
+        sealed[0] = sealed[sealed_chunk_bytes];
+        have = 1;
+    }
 }
 
 // ── ASCII armor ────────────────────────────────────────────────────────
@@ -787,6 +984,211 @@ test "age: round trip across the chunk boundaries, binary and armored" {
         try roundTrip(len, false);
         try roundTrip(len, true);
     }
+}
+
+// ── streaming ─────────────────────────────────────────────────────────
+
+/// A reader whose `stream` always fails: the cause of a `ReadFailed`.
+fn failingReader() std.Io.Reader {
+    const V = struct {
+        fn stream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            return error.ReadFailed;
+        }
+    };
+    return .{ .vtable = &.{ .stream = V.stream }, .buffer = &.{}, .seek = 0, .end = 0 };
+}
+
+fn streamPlain(pt: []u8) void {
+    for (pt, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+}
+
+/// `encryptStream` of `pt` through a reader that hands out at most 7 bytes at
+/// a time, into a fresh allocation.
+fn streamEncrypt(gpa: std.mem.Allocator, pt: []const u8) ![]u8 {
+    var src: std.Io.Reader = .fixed(pt);
+    var small: [7]u8 = undefined;
+    var slow = src.limited(.unlimited, &small);
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    errdefer sink.deinit();
+    try encryptStream(gpa, &sink.writer, &slow.interface, pub1000(), 1000, quicknet_chain, &fixed_rnd);
+    return sink.toOwnedSlice();
+}
+
+fn streamDecrypt(gpa: std.mem.Allocator, file: []const u8, sig: g1.Affine, opts: DecryptOptions) ![]u8 {
+    var src: std.Io.Reader = .fixed(file);
+    var small: [13]u8 = undefined;
+    var slow = src.limited(.unlimited, &small);
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    errdefer sink.deinit();
+    try decryptStream(gpa, &sink.writer, &slow.interface, sig, opts);
+    return sink.toOwnedSlice();
+}
+
+test "age: encryptStream writes exactly what encrypt writes, and decryptStream reads it back, across the chunk boundaries" {
+    const gpa = testing.allocator;
+    const lens = [_]usize{ 0, 1, chunk_bytes - 1, chunk_bytes, chunk_bytes + 1, 2 * chunk_bytes, 2 * chunk_bytes + 1 };
+    for (lens) |len| {
+        const pt = try gpa.alloc(u8, len);
+        defer gpa.free(pt);
+        streamPlain(pt);
+
+        const whole = try encryptAlloc(gpa, pt, pub1000(), 1000, quicknet_chain, &fixed_rnd, .{});
+        defer gpa.free(whole);
+        const streamed = try streamEncrypt(gpa, pt);
+        defer gpa.free(streamed);
+        try testing.expectEqualSlices(u8, whole, streamed);
+        try testing.expectEqual(encryptedLen(1000, len), streamed.len);
+
+        const back = try streamDecrypt(gpa, whole, sig1000(), .{ .chain_hash = quicknet_chain });
+        defer gpa.free(back);
+        try testing.expectEqualSlices(u8, pt, back);
+    }
+}
+
+test "age: decryptStream refuses what decrypt refuses, and writes only authenticated chunks" {
+    const gpa = testing.allocator;
+    const len = 2 * chunk_bytes + 5;
+    const pt = try gpa.alloc(u8, len);
+    defer gpa.free(pt);
+    streamPlain(pt);
+    const file = try encryptAlloc(gpa, pt, pub1000(), 1000, quicknet_chain, &fixed_rnd, .{});
+    defer gpa.free(file);
+    const head = headerLen(1000) + nonce_bytes;
+    const sig = sig1000();
+
+    // A flipped byte in the third chunk: the two before it were written whole.
+    {
+        const bad = try gpa.dupe(u8, file);
+        defer gpa.free(bad);
+        bad[head + 2 * sealed_chunk_bytes + 1] ^= 1;
+        var src: std.Io.Reader = .fixed(bad);
+        var sink: std.Io.Writer.Allocating = .init(gpa);
+        defer sink.deinit();
+        try testing.expectError(error.PayloadAuthenticationFailed, decryptStream(gpa, &sink.writer, &src, sig, .{}));
+        try testing.expectEqualSlices(u8, pt[0 .. 2 * chunk_bytes], sink.written());
+    }
+    // Truncated at a chunk boundary, truncated inside a tag, extended by a byte.
+    for ([_]usize{ head + sealed_chunk_bytes, head + 2 * sealed_chunk_bytes, file.len - 1 }) |cut| {
+        const e = streamDecrypt(gpa, file[0..cut], sig, .{});
+        try testing.expectError(error.PayloadAuthenticationFailed, e);
+    }
+    {
+        const longer = try gpa.alloc(u8, file.len + 1);
+        defer gpa.free(longer);
+        @memcpy(longer[0..file.len], file);
+        longer[file.len] = 0;
+        try testing.expectError(error.PayloadAuthenticationFailed, streamDecrypt(gpa, longer, sig, .{}));
+    }
+    // Nothing after the nonce / not even the nonce / a lone tag after full chunks.
+    try testing.expectError(error.MalformedPayload, streamDecrypt(gpa, file[0..head], sig, .{}));
+    try testing.expectError(error.MalformedPayload, streamDecrypt(gpa, file[0 .. head - 1], sig, .{}));
+    try testing.expectError(error.MalformedPayload, streamDecrypt(gpa, file[0 .. head + 3], sig, .{}));
+    // Header: wrong chain, wrong signature, a flipped MAC byte, not an age file, empty, over the cap.
+    var other = quicknet_chain;
+    other[0] ^= 1;
+    try testing.expectError(error.WrongChainHash, streamDecrypt(gpa, file, sig, .{ .chain_hash = other }));
+    try testing.expectError(error.FoCheckFailed, streamDecrypt(gpa, file, try g1.fromBytesCompressed(hexBytes(48, qt_sig)), .{}));
+    {
+        const bad = try gpa.dupe(u8, file);
+        defer gpa.free(bad);
+        const mi = (try Header.parse(file)).mac_input_len;
+        bad[mi + 1] = if (bad[mi + 1] == 'A') 'B' else 'A';
+        try testing.expectError(error.HeaderMacMismatch, streamDecrypt(gpa, bad, sig, .{}));
+    }
+    try testing.expectError(error.NotAgeFile, streamDecrypt(gpa, "", sig, .{}));
+    try testing.expectError(error.NotAgeFile, streamDecrypt(gpa, "hello\nworld\n", sig, .{}));
+    try testing.expectError(error.MalformedHeader, streamDecrypt(gpa, file[0 .. head - nonce_bytes - 1], sig, .{}));
+    const junk = try gpa.alloc(u8, max_header_bytes + 10);
+    defer gpa.free(junk);
+    @memset(junk, 'a');
+    @memcpy(junk[0 .. version_line.len + 1], version_line ++ "\n");
+    try testing.expectError(error.HeaderTooLarge, streamDecrypt(gpa, junk, sig, .{}));
+}
+
+test "age: decryptStream takes a header of exactly max_header_bytes and refuses one byte more; a bad first line is refused at once" {
+    const gpa = testing.allocator;
+    const base = try encryptAlloc(gpa, "abc", pub1000(), 1000, quicknet_chain, &fixed_rnd, .{});
+    defer gpa.free(base);
+    const h0 = try Header.parse(base);
+    const stanza = base[0 .. h0.mac_input_len - 3]; // version line + the tlock stanza
+    const mac_line_len = "--- ".len + b64_raw.Encoder.calcSize(mac_bytes) + 1;
+
+    var key = payloadKey(fixed_rnd.file_key, fixed_rnd.nonce);
+    defer std.crypto.secureZero(u8, &key);
+    var sealed: [3 + tag_bytes]u8 = undefined;
+    sealPayload(&sealed, &key, "abc");
+
+    for ([_]usize{ max_header_bytes, max_header_bytes + 1 }) |total| {
+        const pad_line_len = total - stanza.len - mac_line_len;
+        const file = try gpa.alloc(u8, total + nonce_bytes + sealed.len);
+        defer gpa.free(file);
+        var w: std.Io.Writer = .fixed(file);
+        try w.writeAll(stanza);
+        try w.writeAll("-> pad ");
+        try w.splatByteAll('A', pad_line_len - "-> pad ".len - 2);
+        try w.writeAll("\n\n---");
+        const mac = headerMac(fixed_rnd.file_key, w.buffered());
+        var mac_b64: [b64_raw.Encoder.calcSize(mac_bytes)]u8 = undefined;
+        try w.print(" {s}\n", .{b64_raw.Encoder.encode(&mac_b64, &mac)});
+        try testing.expectEqual(total, w.end);
+        try w.writeAll(&fixed_rnd.nonce);
+        try w.writeAll(&sealed);
+        if (total == max_header_bytes) {
+            const pt = try streamDecrypt(gpa, file, sig1000(), .{});
+            defer gpa.free(pt);
+            try testing.expectEqualStrings("abc", pt);
+        } else {
+            try testing.expectError(error.HeaderTooLarge, streamDecrypt(gpa, file, sig1000(), .{}));
+        }
+    }
+
+    // A first line that is not the version line is refused without reading on.
+    const junk = try gpa.alloc(u8, max_header_bytes * 2);
+    defer gpa.free(junk);
+    @memset(junk, 'a');
+    @memcpy(junk[0..6], "hello\n");
+    try testing.expectError(error.NotAgeFile, streamDecrypt(gpa, junk, sig1000(), .{}));
+}
+
+test "age: a failing writer or reader ends the stream call with WriteFailed / ReadFailed" {
+    const gpa = testing.allocator;
+    const file = try encryptAlloc(gpa, "abc", pub1000(), 1000, quicknet_chain, &fixed_rnd, .{});
+    defer gpa.free(file);
+    const sig = sig1000();
+
+    var tiny: [20]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&tiny);
+    var src: std.Io.Reader = .fixed("abc");
+    try testing.expectError(error.WriteFailed, encryptStream(gpa, &w, &src, pub1000(), 1000, quicknet_chain, &fixed_rnd));
+    // Room for the header but not for the sealed chunk.
+    var mid: [headerLen(1000) + nonce_bytes + 5]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&mid);
+    var src2: std.Io.Reader = .fixed("abc");
+    try testing.expectError(error.WriteFailed, encryptStream(gpa, &w2, &src2, pub1000(), 1000, quicknet_chain, &fixed_rnd));
+    var w3: std.Io.Writer = .fixed(tiny[0..2]);
+    var src3: std.Io.Reader = .fixed(file);
+    try testing.expectError(error.WriteFailed, decryptStream(gpa, &w3, &src3, sig, .{}));
+
+    var bad = failingReader();
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try testing.expectError(error.ReadFailed, encryptStream(gpa, &sink.writer, &bad, pub1000(), 1000, quicknet_chain, &fixed_rnd));
+    var bad2 = failingReader();
+    try testing.expectError(error.ReadFailed, decryptStream(gpa, &sink.writer, &bad2, sig, .{}));
+}
+
+test "age: an allocation failure ends the stream calls with OutOfMemory and leaks nothing" {
+    const gpa = testing.allocator;
+    const file = try encryptAlloc(gpa, "abc", pub1000(), 1000, quicknet_chain, &fixed_rnd, .{});
+    defer gpa.free(file);
+    var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    var src: std.Io.Reader = .fixed("abc");
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try testing.expectError(error.OutOfMemory, encryptStream(failing.allocator(), &sink.writer, &src, pub1000(), 1000, quicknet_chain, &fixed_rnd));
+    var failing2 = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    var src2: std.Io.Reader = .fixed(file);
+    try testing.expectError(error.OutOfMemory, decryptStream(failing2.allocator(), &sink.writer, &src2, sig1000(), .{}));
 }
 
 test "age: sizes are exact" {

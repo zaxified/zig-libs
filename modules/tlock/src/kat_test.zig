@@ -443,6 +443,27 @@ test "drand interop: the whole Go-tle file is refused when any payload byte is f
     try std.testing.expect(std.meta.isError(tlock.age.decryptAlloc(gpa, bin, interopRoundSignature(), .{})));
 }
 
+test "drand interop: decryptStream reads the Go-tle file (de-armored) to the same published plaintext, and refuses a flipped payload byte" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+
+    const bin_buf = try gpa.alloc(u8, tlock.age.dearmoredLenMax(interop_tle_file.len));
+    defer gpa.free(bin_buf);
+    const bin = try tlock.age.dearmor(bin_buf, interop_tle_file);
+    {
+        var src: std.Io.Reader = .fixed(bin);
+        var sink: std.Io.Writer.Allocating = .init(gpa);
+        defer sink.deinit();
+        try tlock.age.decryptStream(gpa, &sink.writer, &src, interopRoundSignature(), .{ .chain_hash = hexBytes(32, interop_chain_hash_hex) });
+        try std.testing.expectEqualSlices(u8, interop_tle_plaintext, sink.written());
+    }
+    bin[bin.len - 1] ^= 0x01;
+    var src: std.Io.Reader = .fixed(bin);
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try std.testing.expectError(error.PayloadAuthenticationFailed, tlock.age.decryptStream(gpa, &sink.writer, &src, interopRoundSignature(), .{}));
+}
+
 test "drand interop: the fixture rejects under a mismatched round signature (FO check, cross-beacon)" {
     if (!gate.core_implemented) return error.SkipZigTest;
 

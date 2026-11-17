@@ -6,7 +6,7 @@
 
 **Scope:** core — drand/tlock v1.2.0 (`tle`, Go) (surveyed 2026-09-30; mvp -> core 2026-10-06 after the age layer landed and a whole Go-`tle` file decrypts byte-exactly)
 
-**Audit:** review 2026-09-09 · mutation 2026-10-05 (14/16, 2 eq) · src ?
+**Audit:** review 2026-09-09 · mutation 2026-11-17 (44/48, 4 eq) · src c0947035e088ba5d
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; `tlock-age-file` at scale 100 = 2,000 runs, one pairing-heavy encrypt plus up to four decrypts each, TLOCK_FUZZ) · ct 2026-10-02 (ctgrind)
 
@@ -40,7 +40,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [drand/kyber](https://github.com/drand/kyber) `encrypt/ibe` | Go | MPL-2.0 (`LICENSE` header; source NOT read) | 12 | v1.3.2 (2025-12-15) | The BF-IBE library `drand/tlock` uses. Its `LICENSE` file is the MPL-2.0 text (the module NOTICE calls it Apache-2.0/MIT dual: see the survey report); this module is validated byte-exact against a genuine `tle` ciphertext. |
 | Zig ecosystem | Zig | — | — | — | No Zig timelock/drand-encryption repository found by GitHub search (2026-09-30). |
 
-**Where we are ahead:** the only Zig timelock implementation; interop-verified in both directions against a ciphertext produced by drand's Go `tle`, which caught a real Gt-representation divergence; constant-time `fp12Pow` measured with ctgrind. **Where we are behind:** only the G1-signature (quicknet) scheme, not the G2-signature testnet variant or BN254; whole buffers only, no streaming I/O (the age layer and arbitrary-length payloads have landed, see the 2026-10-06 note below).
+**Where we are ahead:** the only Zig timelock implementation; interop-verified in both directions against a ciphertext produced by drand's Go `tle`, which caught a real Gt-representation divergence; constant-time `fp12Pow` measured with ctgrind. **Where we are behind:** only the G1-signature (quicknet) scheme, not the G2-signature testnet variant or BN254; armor is whole-buffer only (the age layer, arbitrary-length payloads and streaming encrypt/decrypt of the binary file have landed, see the 2026-10-06 and 2026-11-17 notes below).
 
 **Re-assessed 2026-10-06** (no new web survey): the age layer landed (`age.zig`: `tlock` stanza, header HMAC, STREAM payload, armor, any length) and is now **interop-proven**: drand/tlock's own whole-file fixture (`src/testdata/lorem-tle-testnet-quicknet-t-2024-01-17-15-28.tle`, Go-`tle`-produced, armored) decrypts here to its published plaintext byte-exactly, so armor, header MAC and STREAM agree with Go, not just with the age spec. **Even** with `drand/tlock` and `tlock_age` on the quicknet file format. Still **behind** (Backlog-grade) on the G2-signature testnet scheme and BN254, and on streaming I/O (whole buffers only). Scope `mvp` → `core`.
 
@@ -252,6 +252,15 @@ not control flow, so that jump dropped the taint and everything downstream of
 canonical accept/reject, and `decrypt`'s FO re-encryption compare
 (`std.mem.eql`; accept/reject is public, per the code). Read with `--stacks`.
 
+## Streaming encrypt/decrypt (2026-11-17)
+
+`age.encryptStream(gpa, w, r, p_pub, round, chain_hash, rnd)` and `age.decryptStream(gpa, w, r, round_signature, opts)` move a binary age file between a `std.Io.Reader` and a `std.Io.Writer` one 64 KiB STREAM chunk at a time (one allocation of about 128 KiB, wiped before it is freed; the header and keys are small stack values, the call runs under the same dead-stack burn as `encrypt`). **Reference:** drand/tlock (Go) `tlock.New(network).Encrypt(dst io.Writer, src io.Reader, roundNumber)` and `.Decrypt(dst io.Writer, src io.Reader)`: a Writer and a Reader, the binary age file (armor is a separate writer in `tle`). Differences, all forced by the caller owning the I/O: the randomness is an explicit `Randomness` (as in `encrypt`), the round signature is an argument (this module never fetches), and an allocator is taken for the chunk buffer.
+
+- **Byte equality.** `encryptStream` writes exactly the bytes `encrypt` writes for the same input and `Randomness`; `decryptStream` of that file returns the input. Tested at 0, 1, one chunk minus 1, one chunk, +1, two chunks, +1 bytes through readers that hand out 7 (and 13) bytes at a time, and against the Go-`tle`-produced fixture of `kat_test.zig` (de-armored).
+- **Chunk lookahead.** A chunk is sealed or opened once one more byte (or the end) shows whether it is the last; the extra byte is carried to the next chunk. No `peek`, no `takeByte`: the functions work on an unbuffered reader.
+- **What a stream cannot keep from `decrypt`.** The header is read up to its MAC line (at most `max_header_bytes`) before it is parsed, so a bad header reports `HeaderTooLarge`/`MalformedHeader` where `decrypt` names the first bad line (a bad FIRST line is `NotAgeFile` at once). The payload length is unknown until the end, so a payload that is too short is `MalformedPayload` after the FO check and the MAC. Every chunk is authenticated before it is written, but chunks written are written: a tampered or truncated file fails at its bad chunk or at its end and the plaintext before that point has reached `w` (the age reference reader behaves the same); a caller that must not act on unverified output buffers it until the call returns. `w` is not flushed, `r` is not closed.
+- **Not streamed.** Armor (`encryptAlloc`/`decryptAlloc` keep it).
+
 ## Out of scope
 
 - age recipients other than `tlock` (X25519, scrypt, plugins): a header
@@ -269,11 +278,15 @@ canonical accept/reject, and `decrypt`'s FO re-encryption compare
   module, not `bls12_381`); a separate module extension, not in scope
   here.
 
+## Audit 2026-11-17 (delta mutation, streaming)
+
+32 schemata mutants over `encryptStream`/`decryptStream` (the header write, the lookahead read and its carry, the last-chunk test at its boundary and the chunk size, the last flag, each write, the payload key's nonce, the header read: the end test, the cap at its boundary, the line-start tracking, the first-line version check, the `---` test; the chain check, the MAC check and what it covers, the nonce shortfall; the too-short chunk guard, the `last` flag of `openChunk`), ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`: 30 killed, 2 survive, both equivalent. (1) `h.len != n` after `Header.parse`: the parser stops at the first line starting with `---`, exactly where the read loop stopped, so the two lengths cannot differ; defensive. (2) The nonce read's `EndOfStream` arm: without it the call goes on with an unread nonce, but the reader is at its end, so the first payload read returns 0 bytes and the same `MalformedPayload` is raised (the key derived from the unread nonce is never used). The card counts are cumulative with the 2026-10-05 run (14/16, 2 eq): 44/48, 4 eq. After the run the two `timing_safe.eql` call sites were folded into one helper (`macEql`, the repo's constant-time-compare pin stays at 1); the mutant at the MAC check applies unchanged to its call sites. Not mutated: `writeHead` (the old `encryptBody` header code moved unchanged; every in-memory test pins its bytes).
+
 ## Backlog / deferred
 
 - ~~age stanza + armor layer for arbitrary-length payloads~~ — DONE 2026-10-06 (`age.zig`).
 - ~~**Whole-file interop KAT for the age layer**~~ — **DONE 2026-10-06**: both files committed under `src/testdata/` (drand/tlock commit `7ceb44a5…`, MIT OR Apache-2.0); `kat_test.zig` decrypts the armored file end-to-end with the pinned round-5423142 signature and compares with `lorem.txt`, refuses it under another chain hash, and refuses a flipped payload byte.
-- **Streaming encrypt/decrypt** over `std.Io.Reader`/`Writer` for files larger than memory. Effort: small — the STREAM layer is chunk-at-a-time since 2026-10-06 (`age.PayloadStream`, used by `timelock_envelope`'s streaming format); what is left is the header read/write around it.
+- ~~**Streaming encrypt/decrypt** over `std.Io.Reader`/`Writer`~~ — DONE 2026-11-17: `age.encryptStream` / `age.decryptStream`, see "Streaming encrypt/decrypt" below. Streaming ARMOR stays open (armor is whole-buffer; `tle` itself armors through a separate writer).
 - **G2-signature scheme (`bls-unchained` testnet variant)** *(survey 2026-09-30)* — supported by `drand/tlock` and `tlock_age`; mainnet uses G1 only, so low priority. Effort: medium (swap group roles); fits §2.
 
 ## Anchoring

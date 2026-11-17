@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — streaming encrypt/decrypt: `age.encryptStream` and `age.decryptStream` over `std.Io.Reader`/`std.Io.Writer`, the binary age file one 64 KiB STREAM chunk at a time (one allocation of about 128 KiB), after drand/tlock's `Encrypt(dst io.Writer, src io.Reader, round)` / `Decrypt(dst, src)`. Output is byte-equal to `encrypt` for the same `Randomness`; the Go-`tle` fixture decrypts through it. Additive; the private header writer was split out of `encryptBody` with no change in output. Plaintext of chunks before a failing chunk has already reached the writer (each chunk is authenticated first). Armor stays whole-buffer. Delta mutation: 32 mutants, 30 killed, 2 equivalent; card counts cumulative (44/48, 4 eq).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 

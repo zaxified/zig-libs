@@ -100,6 +100,14 @@ Allocation-free forms, with exact sizes known up front:
 `age.dearmoredLenMax(n)`, `age.isArmored(bytes)`, and
 `age.Header.parse(bin)`.
 
+Streaming, for files larger than memory (the binary file, one 64 KiB chunk at
+a time; the shape of drand/tlock's `Encrypt(dst io.Writer, src io.Reader, round)`):
+`age.encryptStream(gpa, w, r, p_pub, round, chain_hash, &rnd)` writes exactly the
+bytes `age.encrypt` would, and `age.decryptStream(gpa, w, r, round_signature, opts)`
+reads them back. Every chunk is authenticated before it is written, but a
+tampered or truncated file is detected at its bad chunk or at its end, after
+the earlier plaintext has reached `w`; see SPEC.md "Streaming encrypt/decrypt".
+
 Decryption order is header syntax → chain hash (if given) → the stanza
 (`error.FoCheckFailed` on a wrong signature) → the header MAC
 (`error.HeaderMacMismatch`, constant-time compare) → the payload chunk by
