@@ -1703,13 +1703,19 @@ const FailingSink = struct {
         if (self.reject_key) |rk| {
             if (std.mem.eql(u8, rk, key)) return error.SinkRejected;
         }
+        // An existing key keeps its own storage (`fetchPut` would leave the
+        // map pointing at a key this function had just freed).
+        if (self.map.getPtr(key)) |slot| {
+            const nv = try self.gpa.dupe(u8, value);
+            self.gpa.free(slot.*);
+            slot.* = nv;
+            return;
+        }
         const k = try self.gpa.dupe(u8, key);
         errdefer self.gpa.free(k);
         const v = try self.gpa.dupe(u8, value);
-        if (try self.map.fetchPut(self.gpa, k, v)) |old| {
-            self.gpa.free(old.key);
-            self.gpa.free(old.value);
-        }
+        errdefer self.gpa.free(v);
+        try self.map.put(self.gpa, k, v);
     }
     fn vDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
         const self: *FailingSink = @ptrCast(@alignCast(ptr));
@@ -2144,4 +2150,811 @@ test "back-pressure: records of a reopened WAL (not in the cache) are flushed sy
     c2.flushAll();
     try testing.expectEqualStrings("1", rig.sink.get("p").?);
     try testing.expectEqualStrings("3", rig.sink.get("r").?);
+}
+
+// ── whole-module mutation audit (2026-11-18): killing tests ──────────────────
+
+/// Poll until a worker has published a completion (bounded by wall time). The
+/// task stays on the completion list until the coordinator thread pumps it, so
+/// a test can observe the exact state between "sink call done" and "acked".
+fn waitCompletion(c: *Coordinator) !void {
+    const deadline_ns = std.Io.Timestamp.now(c.io, .awake).nanoseconds + 10 * std.time.ns_per_s;
+    while (true) {
+        c.completion_lock.lock();
+        const has = c.completion_head != null;
+        c.completion_lock.unlock();
+        if (has) return;
+        if (std.Io.Timestamp.now(c.io, .awake).nanoseconds >= deadline_ns) return error.Timeout;
+        const gen = c.completion_gen.load(.acquire);
+        c.io.futexWaitTimeout(u32, &c.completion_gen.raw, gen, .{ .duration = .{
+            .raw = .fromMilliseconds(5),
+            .clock = .awake,
+        } }) catch {};
+    }
+}
+
+/// One injectable clock serving as both the WAL wall clock and monotonic clock.
+const FakeClock = struct {
+    // Far ahead of the real clock: records enqueued under the system clock stay visible.
+    ns: std.atomic.Value(u64) = .init(4_000_000_000_000_000_000),
+    fn wall(ctx: ?*anyopaque) i64 {
+        const s: *FakeClock = @ptrCast(@alignCast(ctx.?));
+        return @intCast(s.ns.load(.monotonic));
+    }
+    fn mono(ctx: ?*anyopaque) u64 {
+        const s: *FakeClock = @ptrCast(@alignCast(ctx.?));
+        return s.ns.load(.monotonic);
+    }
+};
+
+test "MapSink: write, replace, delete, read, count and peek behave as a keyed store" {
+    var m = MapSink.init(testing.allocator);
+    defer m.deinit();
+    const s = m.sink();
+    try s.write("a", "1");
+    try s.write("b", "22");
+    try testing.expectEqual(@as(usize, 2), m.count());
+    try s.write("a", "333"); // replace in place
+    try testing.expectEqual(@as(usize, 2), m.count());
+    try testing.expectEqualStrings("333", m.peek("a").?);
+    try testing.expectEqualStrings("22", m.peek("b").?);
+    try testing.expect(m.peek("zz") == null);
+    const got = (try s.read(testing.allocator, "b")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("22", got);
+    try testing.expect((try s.read(testing.allocator, "zz")) == null);
+    try s.delete("a");
+    try s.delete("a"); // absent: a no-op
+    try testing.expectEqual(@as(usize, 1), m.count());
+    try testing.expect(m.peek("a") == null);
+    try testing.expect(s.canRead());
+}
+
+test "MapSink: a failed allocation in write leaves no leak and no half-stored entry" {
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        var m = MapSink.init(fa.allocator());
+        defer m.deinit();
+        m.sink().write("key", "value") catch {};
+        m.sink().write("key", "again") catch {};
+        if (m.peek("key")) |v| try testing.expect(v.len > 0);
+    }
+}
+
+test "Sink: a vtable without read reports NoReadThrough; write and delete pass key and value through" {
+    var fs: FailingSink = .{ .gpa = testing.allocator };
+    defer fs.deinit();
+    const s = fs.sink();
+    try testing.expect(!s.canRead());
+    try testing.expectError(error.NoReadThrough, s.read(testing.allocator, "k"));
+    try s.write("k", "v");
+    try testing.expectEqualStrings("v", fs.get("k").?);
+    try s.delete("k");
+    try testing.expect(fs.get("k") == null);
+}
+
+test "KvtreeSink: write, read and delete round-trip through a real kvtree" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var fs = FsStorage.init(threaded.io(), tmp.dir);
+    var db = try kvtree.Db.open(testing.allocator, fs.storage(), "s.kvt", .{});
+    defer db.close();
+    var ks = KvtreeSink.init(testing.allocator, &db);
+    const s = ks.sink();
+    try testing.expect(s.canRead());
+    try s.write("a", "1");
+    try s.write("b", "2");
+    {
+        const got = (try s.read(testing.allocator, "a")).?;
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("1", got);
+    }
+    try s.delete("a");
+    try testing.expect((try s.read(testing.allocator, "a")) == null);
+    const b = (try s.read(testing.allocator, "b")).?;
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("2", b);
+}
+
+test "kvtree sink behind the pool: concurrent flushes and deletes land" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wal_fs = FsStorage.init(io, tmp.dir);
+    var sink_fs = FsStorage.init(io, tmp.dir);
+    var db = try kvtree.Db.open(testing.allocator, sink_fs.storage(), "sink.kvt", .{});
+    defer db.close();
+    var ks = KvtreeSink.init(testing.allocator, &db);
+    const c = try Coordinator.init(testing.allocator, .{
+        .io = io,
+        .sink = ks.sink(),
+        .wal_store = wal_fs.storage(),
+        .wal_path = "wal.jq",
+        .max_cache_bytes = 1 << 20,
+        .max_cache_entries = 1024,
+        .n_workers = 3,
+    });
+    defer c.deinit();
+    const n = 60;
+    var buf: [24]u8 = undefined;
+    for (0..n) |i| {
+        try c.put(try std.mem.print(&buf, "r{d}", .{i}), "val");
+        if (i % 8 == 0) c.drain();
+    }
+    c.flushAll();
+    for (0..n) |i| {
+        if (i % 3 == 0) try c.del(try std.mem.print(&buf, "r{d}", .{i}));
+    }
+    c.flushAll();
+    for (0..n) |i| {
+        const k = try std.mem.print(&buf, "r{d}", .{i});
+        const got = try db.get(testing.allocator, k);
+        defer if (got) |g| testing.allocator.free(g);
+        if (i % 3 == 0) {
+            try testing.expect(got == null);
+        } else {
+            try testing.expectEqualStrings("val", got.?);
+        }
+    }
+}
+
+test "put/del report the WAL's refusal as ValueTooLarge or WalWriteFailed and change nothing" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const c = try rig.open(1);
+    defer c.deinit();
+
+    const big = try testing.allocator.alloc(u8, (jobqueue.Options{}).max_payload + 1);
+    defer testing.allocator.free(big);
+    @memset(big, 'v');
+    try testing.expectError(error.ValueTooLarge, c.put("k", big));
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expect((try c.get("k")) == null);
+
+    // A storage failure on the WAL append: the write is not acknowledged and
+    // nothing is staged (no cache entry, no tombstone, no counter).
+    rig.wal_sim.ops_until_crash = 0;
+    try testing.expectError(error.WalWriteFailed, c.put("k", "v"));
+    try testing.expectError(error.WalWriteFailed, c.del("k"));
+    rig.wal_sim.reboot();
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expect(!c.tombstones.contains("k"));
+    try testing.expect(!c.cache.isDirty("k"));
+    try testing.expectEqual(@as(usize, 0), c.orphans.count());
+}
+
+test "put/del: an allocation failure inside the WAL append is OutOfMemory and changes nothing" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var sink = MapSink.init(testing.allocator);
+    defer sink.deinit();
+    var wal_sim = SimStorage.init(testing.allocator);
+    defer wal_sim.deinit();
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const c = try Coordinator.init(fa.allocator(), .{
+        .io = threaded.io(),
+        .sink = sink.sink(),
+        .wal_store = wal_sim.storage(),
+        .wal_path = "wal.jq",
+        .max_cache_bytes = 1 << 20,
+        .max_cache_entries = 64,
+        .n_workers = 1,
+    });
+    defer c.deinit();
+    // The pool's workers are idle, so no other thread touches the allocator
+    // while it is armed.
+    fa.fail_index = fa.alloc_index;
+    const r1 = c.put("k", "v");
+    fa.fail_index = std.math.maxInt(usize);
+    try testing.expectError(error.OutOfMemory, r1);
+    fa.fail_index = fa.alloc_index;
+    const r2 = c.del("k");
+    fa.fail_index = std.math.maxInt(usize);
+    try testing.expectError(error.OutOfMemory, r2);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expect((try c.get("k")) == null);
+}
+
+test "every flush path acks its WAL record: a reopened WAL has nothing pending" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    // pool path (finishTask), including a delete record
+    {
+        const c = try rig.open(2);
+        try c.put("a", "1");
+        try c.put("b", "2");
+        try c.del("b");
+        c.flushAll();
+        c.deinitNoFlush();
+    }
+    {
+        const c = try rig.open(2);
+        try testing.expectEqual(@as(usize, 0), c.pendingCount());
+        c.deinitNoFlush();
+    }
+    // synchronous path (flushOneSync + hand-over of the key's next record)
+    {
+        const c = try rig.open(2);
+        try c.put("p", "1");
+        try c.put("p", "2");
+        c.deinitNoFlush();
+    }
+    {
+        const c = try rig.open(2);
+        try testing.expectEqual(@as(usize, 2), c.pendingCount());
+        c.flushAll();
+        c.deinitNoFlush();
+    }
+    {
+        const c = try rig.open(2);
+        try testing.expectEqual(@as(usize, 0), c.pendingCount());
+        c.deinitNoFlush();
+    }
+    // recover()
+    {
+        const c = try rig.open(2);
+        try c.put("q", "1");
+        try c.del("a");
+        c.deinitNoFlush();
+    }
+    {
+        const c = try rig.open(2);
+        try c.recover();
+        c.deinitNoFlush();
+    }
+    {
+        const c = try rig.open(2);
+        try testing.expectEqual(@as(usize, 0), c.pendingCount());
+        c.deinitNoFlush();
+    }
+}
+
+test "deinitNoFlush acks the flushes that already completed" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    {
+        const c = try rig.open(1);
+        try c.put("k", "v");
+        c.drain();
+        try waitCompletion(c); // sink written, not yet acked
+        c.deinitNoFlush();
+    }
+    try testing.expectEqualStrings("v", rig.sink.peek("k").?);
+    const c2 = try rig.open(1);
+    defer c2.deinit();
+    try testing.expectEqual(@as(usize, 0), c2.pendingCount());
+}
+
+test "drain reconciles the bookkeeping of keys whose records recover() already applied" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const c = try rig.open(1);
+    defer c.deinit();
+    try c.put("k", "v"); // dirty in the cache
+    try c.del("d"); // an orphan
+    try c.recover();
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expect(c.cache.isDirty("k"));
+    try testing.expect(c.orphans.contains("d"));
+    c.drain(); // startKey finds no WAL record for either key
+    try testing.expect(!c.cache.isDirty("k"));
+    try testing.expectEqual(@as(usize, 0), c.orphans.count());
+    try testing.expectEqual(@as(usize, 0), c.inFlightCount());
+}
+
+test "flushOneSync: hands the key's next record to the pool and clears the key's bookkeeping" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    {
+        const c = try rig.open(0);
+        try c.put("k", "old");
+        try c.put("k", "new");
+        c.deinitNoFlush();
+    }
+    const c = try rig.open(0);
+    defer c.deinit();
+    try testing.expect(c.flushOneSync());
+    // The second record of "k" is on the pool: in flight until pumped.
+    try testing.expectEqual(@as(usize, 1), c.inFlightCount());
+    c.flushAll();
+    try testing.expectEqualStrings("new", rig.sink.get("k").?);
+    try testing.expect(!c.flushOneSync()); // empty WAL: nothing flushed
+
+    // A key with a single record: the key is cleaned and un-orphaned.
+    try c.put("z", "1");
+    try c.addKeySet(&c.orphans, "z");
+    try testing.expect(c.cache.isDirty("z"));
+    try testing.expect(c.flushOneSync());
+    try testing.expect(!c.cache.isDirty("z"));
+    try testing.expect(!c.orphans.contains("z"));
+    try testing.expectEqualStrings("1", rig.sink.get("z").?);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "flushOneSync: a rejected write returns the record and reports no progress" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
+    defer rig.deinit();
+    const c = try rig.open(0);
+    defer c.deinit();
+    try c.put("k", "v");
+    try testing.expect(!c.flushOneSync());
+    try testing.expectEqual(@as(usize, 1), rig.sink.seen);
+    try testing.expectEqual(@as(usize, 1), c.pendingCount());
+    try testing.expect(rig.sink.get("k") == null);
+    try testing.expect(c.flushOneSync()); // the record was returned, visible at once
+    try testing.expectEqualStrings("v", rig.sink.get("k").?);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "startFlush: an allocation failure at any step returns the lease; the write still lands" {
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        const c = try rig.open(1);
+        defer c.deinit();
+        try c.put("k", "v");
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        c.gpa = fa.allocator();
+        c.drain();
+        c.gpa = testing.allocator;
+        c.flushAll();
+        try testing.expectEqual(@as(usize, 0), c.pendingCount());
+        try testing.expectEqual(@as(usize, 0), c.inFlightCount());
+        try testing.expectEqualStrings("v", rig.sink.peek("k").?);
+    }
+}
+
+test "startFlush: a refused pool submit returns the lease and clears the in-flight mark" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const c = try rig.open(1);
+    defer c.deinitNoFlush();
+    try c.put("k", "v");
+    c.pool.shutdownNow(); // every later submit fails with error.Shutdown
+    c.drain();
+    try testing.expectEqual(@as(usize, 0), c.inFlightCount());
+    try testing.expectEqual(@as(usize, 1), c.pendingCount());
+    c.flushAll(); // the synchronous backstop still lands it
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqualStrings("v", rig.sink.peek("k").?);
+}
+
+test "a key registered twice is stored once, and a failing registration leaks nothing" {
+    {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        const c = try rig.open(1);
+        defer c.deinit();
+        try c.del("k");
+        try c.del("k");
+        try testing.expectEqual(@as(usize, 1), c.orphans.count());
+        try testing.expectEqual(@as(usize, 1), c.tombstones.count());
+    }
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        const c = try rig.open(1);
+        defer c.deinit();
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        c.gpa = fa.allocator();
+        const r = c.del("k");
+        c.gpa = testing.allocator;
+        r catch |e| try testing.expectEqual(error.OutOfMemory, e);
+    }
+}
+
+test "a clean eviction (read-through fill) is not registered as an orphan" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.sink.sink().write("a", "1");
+    try rig.sink.sink().write("b", "2");
+    try rig.sink.sink().write("c", "3");
+    const c = try Coordinator.init(testing.allocator, .{
+        .io = rig.threaded.io(),
+        .sink = rig.sink.sink(),
+        .wal_store = rig.wal_sim.storage(),
+        .wal_path = "wal.jq",
+        .max_cache_bytes = 1 << 20,
+        .max_cache_entries = 2,
+        .n_workers = 1,
+    });
+    defer c.deinit();
+    _ = try c.get("a");
+    _ = try c.get("b");
+    _ = try c.get("c"); // evicts a clean entry
+    try testing.expect(c.cacheStats().evictions >= 1);
+    try testing.expectEqual(@as(usize, 0), c.orphans.count());
+    try testing.expectEqual(@as(usize, 0), c.droppedOrphanCount());
+}
+
+test "sync() is a flush barrier and cacheStats() reports the cache's counters" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const c = try rig.open(2);
+    defer c.deinit();
+    try c.put("k", "v");
+    _ = try c.get("k");
+    try testing.expect(c.cacheStats().hits >= 1);
+    c.sync();
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqualStrings("v", rig.sink.peek("k").?);
+}
+
+test "init: a WAL held by another process fails with WalOpenFailed and leaks nothing" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.wal_sim.holdForeignLock("wal.jq.lock");
+    try testing.expectError(error.WalOpenFailed, rig.open(1));
+}
+
+test "init: the injected monotonic clock governs lease expiry" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    {
+        const c = try rig.open(1);
+        try c.put("k", "v");
+        c.deinitNoFlush();
+    }
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    const c = try Coordinator.init(testing.allocator, .{
+        .io = rig.threaded.io(),
+        .sink = rig.sink.sink(),
+        .wal_store = rig.wal_sim.storage(),
+        .wal_path = "wal.jq",
+        .max_cache_bytes = 1 << 20,
+        .max_cache_entries = 64,
+        .n_workers = 1,
+        .wal_wall_clock = .{ .ctx = &clk, .nowFn = FakeClock.wall },
+        .wal_mono_clock = .{ .ctx = &clk, .nowFn = FakeClock.mono },
+    });
+    defer c.deinit();
+    // A lease nobody acks (a lost worker): hidden until its deadline.
+    _ = (try c.wal.dequeue(.{ .visibility_timeout_ns = hour })).?;
+    try testing.expectEqual(@as(usize, 0), try c.wal.reapExpiredLeases());
+    _ = clk.ns.fetchAdd(2 * hour, .monotonic);
+    try testing.expectEqual(@as(usize, 1), try c.wal.reapExpiredLeases());
+    c.flushAll();
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqualStrings("v", rig.sink.peek("k").?);
+}
+
+test "retry_backoff_ns hides a failed record until the wall clock passes it (FINDING wbmut-1: flushAll returns early, drain does not retry)" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    const c = try Coordinator.init(testing.allocator, .{
+        .io = rig.threaded.io(),
+        .sink = rig.sink.sink(),
+        .wal_store = rig.wal_sim.storage(),
+        .wal_path = "wal.jq",
+        .max_cache_bytes = 1 << 20,
+        .max_cache_entries = 64,
+        .n_workers = 1,
+        .retry_backoff_ns = hour,
+        .wal_wall_clock = .{ .ctx = &clk, .nowFn = FakeClock.wall },
+        .wal_mono_clock = .{ .ctx = &clk, .nowFn = FakeClock.mono },
+    });
+    defer c.deinit();
+    try c.put("k", "v");
+    c.drain();
+    try waitCompletion(c);
+    c.drain(); // harvest the failure: the record is nacked with a one-hour backoff
+    try testing.expectEqual(@as(usize, 1), rig.sink.seen);
+    try testing.expectEqual(@as(usize, 0), c.inFlightCount());
+    try testing.expectEqual(@as(usize, 1), c.pendingCount());
+    // FINDING wbmut-1 (a): flushAll is documented to block until clean, but it
+    // returns with the record pending: flushOneSync sees nothing visible during
+    // the backoff and reports "no progress", which flushAll treats as the end.
+    c.flushAll();
+    try testing.expectEqual(@as(usize, 1), c.pendingCount());
+    // FINDING wbmut-1 (b): the drain that harvested the failure also ran kick,
+    // whose startKey found no visible record for the dirty key and reconciled
+    // it as clean; once the backoff has passed, drain() never selects it again.
+    try testing.expect(!c.cache.isDirty("k"));
+    _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+    c.drain();
+    try testing.expectEqual(@as(usize, 0), c.inFlightCount());
+    try testing.expect(rig.sink.get("k") == null);
+    // Only a flushAll after the backoff lands it (through flushOneSync).
+    c.flushAll();
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqualStrings("v", rig.sink.get("k").?);
+}
+
+test "flushAll over a reopened WAL stops at the first rejected synchronous write (FINDING wbmut-1)" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
+    defer rig.deinit();
+    {
+        const c = try rig.open(0);
+        try c.put("k", "v");
+        c.deinitNoFlush();
+    }
+    const c2 = try rig.open(0);
+    defer c2.deinit();
+    c2.flushAll();
+    // FINDING wbmut-1 (c): one rejection ends flushAll with the record pending,
+    // whereas a rejection on the pool path is retried for as long as it takes.
+    try testing.expectEqual(@as(usize, 1), c2.pendingCount());
+    try testing.expectEqual(@as(usize, 1), rig.sink.seen);
+    c2.flushAll();
+    try testing.expectEqual(@as(usize, 0), c2.pendingCount());
+    try testing.expectEqualStrings("v", rig.sink.get("k").?);
+}
+
+/// A sink that asks the WAL to reap expired leases from inside every write: a
+/// correct coordinator holds its lease for the visibility timeout, so nothing
+/// is ever reaped. Only for the single-threaded paths (`recover`, `flushOneSync`).
+const ProbeSink = struct {
+    inner: MapSink,
+    coord: ?*Coordinator = null,
+    reaped: usize = 0,
+
+    fn vWrite(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+        const self: *ProbeSink = @ptrCast(@alignCast(ptr));
+        if (self.coord) |c| self.reaped += try c.wal.reapExpiredLeases();
+        return MapSink.vWrite(&self.inner, key, value);
+    }
+    fn vDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
+        const self: *ProbeSink = @ptrCast(@alignCast(ptr));
+        return MapSink.vDelete(&self.inner, key);
+    }
+    const vt = Sink.VTable{ .write = vWrite, .delete = vDelete };
+
+    fn open(probe: *ProbeSink, threaded: *std.Io.Threaded, wal_sim: *SimStorage) !*Coordinator {
+        return Coordinator.init(testing.allocator, .{
+            .io = threaded.io(),
+            .sink = .{ .ptr = probe, .vtable = &vt },
+            .wal_store = wal_sim.storage(),
+            .wal_path = "wal.jq",
+            .max_cache_bytes = 1 << 20,
+            .max_cache_entries = 64,
+            .n_workers = 1,
+        });
+    }
+};
+
+test "every path holds its WAL lease for the visibility timeout while the sink is written" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var wal_sim = SimStorage.init(testing.allocator);
+    defer wal_sim.deinit();
+    var probe: ProbeSink = .{ .inner = MapSink.init(testing.allocator) };
+    defer probe.inner.deinit();
+
+    // recover()
+    {
+        const c = try probe.open(&threaded, &wal_sim);
+        try c.put("a", "1");
+        try c.put("b", "2");
+        c.deinitNoFlush();
+    }
+    {
+        const c = try probe.open(&threaded, &wal_sim);
+        probe.coord = c;
+        try c.recover();
+        probe.coord = null;
+        try testing.expectEqual(@as(usize, 0), probe.reaped);
+        try testing.expectEqual(@as(usize, 2), probe.inner.count());
+        c.deinitNoFlush();
+    }
+    // flushOneSync()
+    {
+        const c = try probe.open(&threaded, &wal_sim);
+        try c.put("p", "1");
+        try c.put("q", "2");
+        c.deinitNoFlush();
+    }
+    {
+        const c = try probe.open(&threaded, &wal_sim);
+        probe.coord = c;
+        try testing.expect(c.flushOneSync());
+        probe.coord = null;
+        try testing.expectEqual(@as(usize, 0), probe.reaped);
+        c.flushAll();
+        c.deinitNoFlush();
+    }
+    // the pool path: a finished flush that has not been pumped still holds its lease
+    {
+        const c = try probe.open(&threaded, &wal_sim);
+        defer c.deinit();
+        try c.put("k", "v");
+        c.drain();
+        try waitCompletion(c);
+        try testing.expectEqual(@as(usize, 0), try c.wal.reapExpiredLeases());
+    }
+}
+
+test "flushOneSync applies a WAL delete as a delete" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    {
+        const c = try rig.open(1);
+        try c.put("k", "v");
+        c.flushAll();
+        try c.del("k");
+        c.deinitNoFlush();
+    }
+    try testing.expectEqualStrings("v", rig.sink.peek("k").?);
+    const c2 = try rig.open(1);
+    defer c2.deinit();
+    c2.flushAll(); // the cache is empty: the delete goes through flushOneSync
+    try testing.expect(rig.sink.peek("k") == null);
+}
+
+test "a key of exactly the WAL field cap is accepted by put and del; del counts as pending" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const c = try rig.open(1);
+    defer c.deinit();
+    try c.put(strRepeat("x", jobqueue.max_field_len), "v");
+    try c.del(strRepeat("y", jobqueue.max_field_len));
+    try testing.expectEqual(@as(usize, 2), c.pendingCount());
+    try testing.expectError(error.KeyTooLarge, c.del(strRepeat("z", jobqueue.max_field_len + 1)));
+    try testing.expectEqual(@as(usize, 2), c.pendingCount());
+}
+
+test "a delete honours max_flush_attempts: dead-lettered after exactly that many rejections" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_delete = true });
+    defer rig.deinit();
+    const c = try rig.open(2);
+    defer c.deinit();
+    try c.del("k");
+    c.flushAll();
+    try testing.expectEqual(@as(usize, 1), c.poisonedCount());
+    const dead = try c.poisoned(testing.allocator);
+    defer Coordinator.freePoisoned(testing.allocator, dead);
+    try testing.expectEqual(@as(usize, 1), dead.len);
+    try testing.expectEqual(@as(u32, 2), dead[0].attempts);
+}
+
+test "finishTask: a landed flush cleans the key and clears its marks before the next kick" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const c = try rig.open(1);
+    defer c.deinit();
+    try c.put("k", "v");
+    c.drain();
+    try waitCompletion(c);
+    c.pump();
+    try testing.expect(!c.cache.isDirty("k"));
+    try c.del("d");
+    c.drain();
+    try waitCompletion(c);
+    try testing.expect(c.orphans.contains("d"));
+    try testing.expect(c.tombstones.contains("d"));
+    c.pump();
+    try testing.expect(!c.orphans.contains("d"));
+    try testing.expect(!c.tombstones.contains("d"));
+}
+
+test "finishTask: a dead-lettered record also cleans the key and clears its marks at once" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .reject_key = "bad", .fail_delete = true });
+    defer rig.deinit();
+    const c = try rig.open(1);
+    defer c.deinit();
+    try c.put("bad", "x");
+    c.drain();
+    try waitCompletion(c);
+    c.pump();
+    try testing.expectEqual(@as(usize, 1), c.poisonedCount());
+    try testing.expect(!c.cache.isDirty("bad"));
+    try c.del("gone");
+    c.drain();
+    try waitCompletion(c);
+    try testing.expect(c.orphans.contains("gone"));
+    c.pump();
+    try testing.expectEqual(@as(usize, 2), c.poisonedCount());
+    try testing.expect(!c.orphans.contains("gone"));
+}
+
+test "init: n_workers and max_submitters reach the pool; deinit flushes everything" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    {
+        const c = try rig.open(1);
+        try testing.expectEqual(@as(usize, 1), c.pool.workerCount());
+        // The coordinator submits only through the shared path (contract).
+        try testing.expectError(error.TooManySubmitters, c.pool.registerSubmitter());
+        try c.put("a", "1");
+        try c.put("b", "2");
+        c.deinit(); // no explicit flush: deinit is the graceful barrier
+    }
+    try testing.expectEqualStrings("1", rig.sink.peek("a").?);
+    try testing.expectEqualStrings("2", rig.sink.peek("b").?);
+}
+
+/// A sink whose writes block until released, to hold a pool worker busy while
+/// more flush jobs queue up behind it.
+const GateSink = struct {
+    inner: MapSink,
+    io: std.Io,
+    open: std.atomic.Value(bool) = .init(false),
+    entered: std.atomic.Value(u32) = .init(0),
+    writes: std.atomic.Value(u32) = .init(0),
+
+    fn vWrite(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+        const self: *GateSink = @ptrCast(@alignCast(ptr));
+        _ = self.entered.fetchAdd(1, .acq_rel);
+        var spins: u32 = 0;
+        while (!self.open.load(.acquire) and spins < 2000) : (spins += 1)
+            self.io.sleep(.fromMilliseconds(5), .awake) catch {};
+        _ = self.writes.fetchAdd(1, .acq_rel);
+        return MapSink.vWrite(&self.inner, key, value);
+    }
+    fn vDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
+        const self: *GateSink = @ptrCast(@alignCast(ptr));
+        return MapSink.vDelete(&self.inner, key);
+    }
+    const vt = Sink.VTable{ .write = vWrite, .delete = vDelete };
+
+    fn openLater(self: *GateSink) void {
+        self.io.sleep(.fromMilliseconds(100), .awake) catch {};
+        self.open.store(true, .release);
+    }
+};
+
+test "deinitNoFlush discards queued flush jobs: only the running write finishes" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var wal_sim = SimStorage.init(testing.allocator);
+    defer wal_sim.deinit();
+    var gs: GateSink = .{ .inner = MapSink.init(testing.allocator), .io = threaded.io() };
+    defer gs.inner.deinit();
+    // FINDING wbmut-2: `deinitNoFlush` frees the FlushTasks of completed flushes
+    // only; the tasks of jobs the pool drops unrun (task, key, value: three
+    // allocations each) are leaked. The test therefore runs on an allocator
+    // that does not report leaks; it asserts what `shutdownNow` guarantees.
+    const c = try Coordinator.init(std.heap.smp_allocator, .{
+        .io = threaded.io(),
+        .sink = .{ .ptr = &gs, .vtable = &GateSink.vt },
+        .wal_store = wal_sim.storage(),
+        .wal_path = "wal.jq",
+        .max_cache_bytes = 1 << 20,
+        .max_cache_entries = 64,
+        .n_workers = 1,
+    });
+    try c.put("a", "1");
+    try c.put("b", "2");
+    try c.put("c", "3");
+    c.drain(); // three jobs for the single worker, which blocks in the first
+    var spins: usize = 0;
+    while (gs.entered.load(.acquire) == 0 and spins < 2000) : (spins += 1)
+        threaded.io().sleep(.fromMilliseconds(5), .awake) catch {};
+    try testing.expectEqual(@as(u32, 1), gs.entered.load(.acquire));
+    const t = try std.Thread.spawn(.{}, GateSink.openLater, .{&gs});
+    c.deinitNoFlush(); // shutdownNow: the running job finishes, the queued two are dropped
+    t.join();
+    try testing.expectEqual(@as(u32, 1), gs.writes.load(.acquire));
+    try testing.expectEqual(@as(usize, 1), gs.inner.count());
 }
