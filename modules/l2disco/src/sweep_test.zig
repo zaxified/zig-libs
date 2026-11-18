@@ -62,10 +62,8 @@ fn expectPanicMessage(comptime body: fn () void, needle: []const u8) !void {
 // Needles live in consts, never inline in the expectPanicMessage call: the
 // child's stack trace prints the caller's source line (GS trap).
 const needle_mac = "l2disco: Mac.format: buffer shorter than 17 bytes";
-const needle_opt = "l2disco: dhcp.Builder.addOption: code 0 (Pad) and 255 (End) are not options";
 const needle_rdnss = "l2disco: nd.Rdnss.at: index out of range";
 const needle_ip4 = "l2disco: dhcp.Ip4List.at: index out of range";
-const needle_addrs = "l2disco: dhcp.Builder: address list must be a non-empty multiple of 4 bytes";
 
 fn childMacShort() void {
     var small: [16]u8 = undefined;
@@ -133,28 +131,22 @@ test "dhcp.Ip4List.at out of range (incl. huge index) is a checked panic (sweep 
     try testing.expectEqual([4]u8{ 5, 6, 7, 8 }, l.at(1));
 }
 
-fn childAddRoutersOdd() void {
+test "dhcp.Builder address-list adders reject a bad list with error.InvalidAddressList, leaving the builder untouched (sweep L2-5)" {
     var buf: [400]u8 = undefined;
-    var b = dhcp.Builder.init(&buf, .{ .op = .boot_request, .xid = 1 }) catch return;
-    b.addRouters(&.{ 1, 2, 3 }) catch {};
-}
-
-fn childAddDnsEmpty() void {
-    var buf: [400]u8 = undefined;
-    var b = dhcp.Builder.init(&buf, .{ .op = .boot_request, .xid = 1 }) catch return;
-    b.addDnsServers(&.{}) catch {};
-}
-
-fn childAddNtpOdd() void {
-    var buf: [400]u8 = undefined;
-    var b = dhcp.Builder.init(&buf, .{ .op = .boot_request, .xid = 1 }) catch return;
-    b.addNtpServers(&.{ 1, 2, 3, 4, 5 }) catch {};
-}
-
-test "dhcp.Builder address-list adders reject a bad list with a checked panic (sweep L2-5)" {
-    try expectPanicMessage(childAddRoutersOdd, needle_addrs);
-    try expectPanicMessage(childAddDnsEmpty, needle_addrs);
-    try expectPanicMessage(childAddNtpOdd, needle_addrs);
+    var b = try dhcp.Builder.init(&buf, .{ .op = .boot_request, .xid = 1 });
+    const pos = b.pos;
+    try testing.expectError(error.InvalidAddressList, b.addRouters(&.{ 1, 2, 3 }));
+    try testing.expectError(error.InvalidAddressList, b.addRouters(&.{}));
+    try testing.expectError(error.InvalidAddressList, b.addDnsServers(&.{}));
+    try testing.expectError(error.InvalidAddressList, b.addDnsServers(&.{ 1, 2, 3, 4, 5, 6, 7 }));
+    try testing.expectError(error.InvalidAddressList, b.addNtpServers(&.{ 1, 2, 3, 4, 5 }));
+    try testing.expectError(error.InvalidAddressList, b.addNtpServers(&.{}));
+    try testing.expectEqual(pos, b.pos);
+    // The smallest and a longer valid list still go in (boundary 4 and 8).
+    try b.addRouters(&.{ 1, 2, 3, 4 });
+    try b.addDnsServers(&.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try b.addNtpServers(&.{ 9, 9, 9, 9 });
+    try testing.expect(b.pos > pos);
 }
 
 test "dhcp.Builder.finish that fails on pad_to leaves the builder untouched (sweep L2-6)" {
@@ -231,23 +223,13 @@ test "dhcp domain-search pointer cycles are bounded (sweep L2-clean)" {
     try testing.expectError(error.BadOptionLength, it.next(&out));
 }
 
-fn childAddOption0() void {
-    var buf: [400]u8 = undefined;
-    var b = dhcp.Builder.init(&buf, .{ .op = .boot_request, .xid = 1 }) catch return;
-    b.addOption(0, &.{1}) catch {};
-}
-
-fn childAddOption255() void {
-    var buf: [400]u8 = undefined;
-    var b = dhcp.Builder.init(&buf, .{ .op = .boot_request, .xid = 1 }) catch return;
-    b.addOption(255, &.{}) catch {};
-}
-
 test "dhcp.Builder.addOption refuses Pad and End codes (sweep REV-l2disco-4)" {
-    try expectPanicMessage(childAddOption0, needle_opt);
-    try expectPanicMessage(childAddOption255, needle_opt);
     var buf: [400]u8 = undefined;
     var b = try dhcp.Builder.init(&buf, .{ .op = .boot_request, .xid = 1 });
+    const pos = b.pos;
+    try testing.expectError(error.InvalidOptionCode, b.addOption(0, &.{1}));
+    try testing.expectError(error.InvalidOptionCode, b.addOption(255, &.{}));
+    try testing.expectEqual(pos, b.pos);
     try b.addOption(254, &.{1});
     try b.addOption(1, &.{ 1, 2, 3, 4 });
 }

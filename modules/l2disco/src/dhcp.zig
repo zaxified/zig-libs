@@ -46,6 +46,12 @@ pub const BuildError = error{
     BufferTooSmall,
     /// Option data longer than 255 bytes.
     OptionTooLong,
+    /// `addOption` with code 0 (Pad) or 255 (End): structural, not options; the
+    /// parser would read the bytes as Pad/End and corrupt the message.
+    InvalidOptionCode,
+    /// An address-list adder (`addRouters`, `addDnsServers`, `addNtpServers`)
+    /// given an empty list or one whose length is not a multiple of 4.
+    InvalidAddressList,
 };
 
 /// Offset of the magic cookie == size of the fixed BOOTP header.
@@ -548,12 +554,11 @@ pub const Builder = struct {
     }
 
     /// Appends a raw option. Codes 0 (Pad) and 255 (End) are structural, not
-    /// options: passing them is a caller-contract violation (checked
-    /// `@panic` in every build mode) because the parser would read the
-    /// bytes as Pad/End and corrupt the message.
+    /// options: they are refused with `error.InvalidOptionCode` because the
+    /// parser would read the bytes as Pad/End and corrupt the message.
     pub fn addOption(b: *Builder, code: u8, data: []const u8) BuildError!void {
         if (code == @backingInt(OptionCode.pad) or code == @backingInt(OptionCode.end))
-            @panic("l2disco: dhcp.Builder.addOption: code 0 (Pad) and 255 (End) are not options");
+            return BuildError.InvalidOptionCode;
         if (data.len > 255) return BuildError.OptionTooLong;
         if (b.pos + 2 + data.len > b.buf.len) return BuildError.BufferTooSmall;
         b.buf[b.pos] = code;
@@ -562,9 +567,9 @@ pub const Builder = struct {
         b.pos += 2 + data.len;
     }
 
-    /// Option 42; `addrs` as for `addRouters`.
+    /// Option 42; `addrs` as for `addRouters` (`error.InvalidAddressList`).
     pub fn addNtpServers(b: *Builder, addrs: []const u8) BuildError!void {
-        requireAddrList(addrs);
+        try requireAddrList(addrs);
         try b.addOption(@backingInt(OptionCode.ntp_servers), addrs);
     }
 
@@ -656,15 +661,16 @@ pub const Builder = struct {
     }
 
     /// `addrs` is a packed list of 4-byte addresses (len % 4 == 0, >= 4);
-    /// anything else is a caller-contract violation (checked `@panic`).
+    /// anything else is `error.InvalidAddressList`.
     pub fn addRouters(b: *Builder, addrs: []const u8) BuildError!void {
-        requireAddrList(addrs);
+        try requireAddrList(addrs);
         try b.addOption(@backingInt(OptionCode.router), addrs);
     }
 
-    /// `addrs` is a packed list of 4-byte addresses (len % 4 == 0, >= 4).
+    /// `addrs` is a packed list of 4-byte addresses (len % 4 == 0, >= 4);
+    /// anything else is `error.InvalidAddressList`.
     pub fn addDnsServers(b: *Builder, addrs: []const u8) BuildError!void {
-        requireAddrList(addrs);
+        try requireAddrList(addrs);
         try b.addOption(@backingInt(OptionCode.dns_server), addrs);
     }
 
@@ -686,9 +692,8 @@ pub const Builder = struct {
         try b.addOption(@backingInt(OptionCode.client_id), &data);
     }
 
-    fn requireAddrList(addrs: []const u8) void {
-        if (addrs.len < 4 or addrs.len % 4 != 0)
-            @panic("l2disco: dhcp.Builder: address list must be a non-empty multiple of 4 bytes");
+    fn requireAddrList(addrs: []const u8) BuildError!void {
+        if (addrs.len < 4 or addrs.len % 4 != 0) return BuildError.InvalidAddressList;
     }
 
     pub const FinishOptions = struct {
