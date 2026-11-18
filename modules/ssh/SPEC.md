@@ -440,10 +440,22 @@ environment with OpenSSH installed.
   together (`SSH_WSET`): the client round burn with the install burn (the `connectInto` probe
   finds the installed keys), the server gex burn with its `y`/`K` wipes, and the
   keyboard-interactive burn with the reply's record burn.
-  Unobservable: the KEX-round heap scratch wipes (they protect channel data queued during a
-  re-exchange; nothing drives a scripted re-exchange) and the server round burn. With every burn
-  and wipe of the server round off, the server handshake probe stays clean; a residue-rule probe
-  of `serverHandshake` is still missing.
+  The KEX-round heap scratch wipes and the server round burn, unobservable at first, were
+  measured on 2026-11-18 (wave 6, residue follow-up) with a replay harness
+  (`stackprobe2_test.zig`): with deterministic entropy both sides of a handshake are pure
+  functions of what they read, so both transcripts are built by alternating single-threaded
+  passes and the measured side replays its peer's transcript from a fixed reader (no thread, no
+  blocking read; the earlier socketpair mirror of the `connectInto` probe deadlocked because its
+  peers stopped before the SERVICE_REQUEST `serverHandshake` waits for). The round scratch only
+  ever holds public KEX packets, except the packet a wrong `first_kex_packet_follows` guess makes
+  the round read and discard: each transcript ends with a re-exchange whose "guess" is
+  CHANNEL_DATA, and the receiving round's scratch must not keep it (both wipes killed; channel
+  data queued during a re-exchange goes through `Transport.rekey`'s own buffer, not this one).
+  The server round burn is covered by the install burn, as the client's is: skipped alone, the
+  new residue-rule probes of `serverHandshake` and of `serverKexRound` alone stay clean; skipped
+  with the install burn, the `serverKexRound` probe finds the installed keys (24 needles). The
+  `serverHandshake` probe stays clean even then: the record burns of the EXT_INFO and
+  SERVICE_ACCEPT packets sent after the round cover its frames too.
   Constant time: `dh` and `gex` see an exponent stripped of its leading zero bytes. The `ecdh`
   row was blind to an early-exit zero test in `fromScalar`: that branch replaced the one counted
   context (memcheck put it on the loop instead of the `if`), so the count stayed 22.
