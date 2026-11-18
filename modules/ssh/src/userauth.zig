@@ -97,7 +97,16 @@ pub const max_password_len = 1024;
 /// inside one binary packet.
 pub const max_key_blob_len = 4 * 1024;
 pub const max_signature_len = 4 * 1024;
+/// The longest banner a client accepts (SSH_MSG_USERAUTH_BANNER, §5.4).
 pub const max_banner_len = 8 * 1024;
+/// The longest banner `serveUserauth` sends (`AuthConfig.banner`): what one
+/// `transport.writePacket` packet carries under every cipher
+/// (`transport.max_write_payload`) less the message's own 9 bytes (type and
+/// two string lengths; the language tag is empty). Below `max_banner_len`, so
+/// whatever this server sends, a client of this module accepts. OpenSSH and
+/// Go send any banner one packet holds (sshd reads a banner file of up to
+/// 1 MiB, Go checks no length); this module's packet frame is 8 KiB.
+pub const max_sent_banner_len = transport.max_write_payload - 9;
 
 pub const UserauthError = transport.TransportError || error{
     /// The peer rejected every credential we offered (client), or the peer
@@ -1337,7 +1346,8 @@ pub const AuthConfig = struct {
     /// accepting it (Go `NoClientAuthCallback`).
     no_client_auth_callback: ?NoneCallback = null,
     /// Optional SSH_MSG_USERAUTH_BANNER (§5.4) sent once, before the first
-    /// verdict.
+    /// verdict. At most `max_sent_banner_len` bytes: a longer one ends
+    /// `serveUserauth` with `error.NameTooLong` before anything is sent.
     banner: ?[]const u8 = null,
     /// Rejected *credentials* tolerated before giving up with
     /// `error.AuthenticationFailed` (OpenSSH `MaxAuthTries` and Go's
@@ -1766,8 +1776,8 @@ fn sendFailure(t: *transport.Transport, set: MethodSet, partial: bool) UserauthE
 }
 
 fn sendBanner(t: *transport.Transport, banner: []const u8) UserauthError!void {
-    if (banner.len > max_banner_len) return error.NameTooLong;
-    var buf: [max_banner_len + 64]u8 = undefined;
+    if (banner.len > max_sent_banner_len) return error.NameTooLong;
+    var buf: [max_sent_banner_len + 64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_BANNER));
     try messages.writeString(&w, banner);
@@ -2376,6 +2386,7 @@ test "delivered DoS-limit defaults are pinned to their documented values" {
     try t.expectEqual(@as(usize, 4 * 1024), max_key_blob_len);
     try t.expectEqual(@as(usize, 4 * 1024), max_signature_len);
     try t.expectEqual(@as(usize, 8 * 1024), max_banner_len);
+    try t.expectEqual(@as(usize, 8098), max_sent_banner_len);
     try t.expectEqual(@as(u32, 6), (AuthConfig{}).max_attempts);
     try t.expectEqual(@as(u32, 128), max_auth_requests);
     try t.expectEqual(@as(u32, 64), max_client_auth_steps);
@@ -3997,26 +4008,54 @@ test "serveUserauth publickey: key blob and signature length bounds" {
     }
 }
 
-test "serveUserauth: a banner over max_banner_len is refused before anything is sent" {
-    // A banner of max_banner_len itself does not fit the 8 KiB packet frame
-    // either (PacketTooLarge; reported in the 2026-11-18 audit); one near it does.
+test "serveUserauth: a banner over max_sent_banner_len is refused before anything is sent" {
+    // Before 2026-11-18 the bound was `max_banner_len` (8 KiB), which the
+    // 8 KiB packet frame cannot carry: 8099..8192 bytes passed the check and
+    // failed in `writePacket` (PacketTooLarge).
     const t = std.testing;
     const long: [max_banner_len + 1]u8 = @splat('b');
     var m: [1]Msg = undefined;
-    for ([_]usize{ max_banner_len - 200, max_banner_len, max_banner_len + 1 }) |n| {
+    for ([_]usize{ max_sent_banner_len, max_sent_banner_len + 1, max_banner_len }) |n| {
         var sink_buf: [16384]u8 = undefined;
         var sink: std.Io.Writer = .fixed(&sink_buf);
         var accepting: PasswordPolicy = .{ .accepts = "hunter2" };
         const res = serveCanned(&.{m[0].request("alice", "none").bytes()}, &sink, .{ .banner = long[0..n], .password = accepting.hook() });
-        switch (n) {
-            max_banner_len - 200 => try t.expectError(error.EndOfStream, res),
-            max_banner_len => try t.expectError(error.PacketTooLarge, res),
-            else => {
-                try t.expectError(error.NameTooLong, res);
-                try t.expectEqual(@as(usize, 0), sink.buffered().len);
-            },
+        if (n == max_sent_banner_len) {
+            // Sent (then the canned client has nothing more to say).
+            try t.expectError(error.EndOfStream, res);
+            try t.expect(sink.buffered().len > n);
+        } else {
+            try t.expectError(error.NameTooLong, res);
+            try t.expectEqual(@as(usize, 0), sink.buffered().len);
         }
     }
+}
+
+test "userauth banner: the longest one a server sends is a banner its client accepts" {
+    // Server to client over plaintext packets: max_sent_banner_len arrives
+    // intact through the client's banner seam.
+    const t = std.testing;
+    const S = struct {
+        var wire: [16384]u8 = undefined;
+        var out: [8192]u8 = undefined;
+        var seen: usize = 0;
+        fn show(_: *anyopaque, msg: []const u8, _: []const u8) void {
+            seen = msg.len;
+        }
+    };
+    const long: [max_sent_banner_len]u8 = @splat('b');
+    var ww: std.Io.Writer = .fixed(&S.wire);
+    var none: std.Io.Reader = .fixed("");
+    var srv = transport.Transport.init(&none, &ww);
+    try sendBanner(&srv, &long);
+    try frameRaw(&ww, &[_]u8{@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)});
+    var r: std.Io.Reader = .fixed(ww.buffered());
+    var sink: std.Io.Writer = .fixed(&S.out);
+    var tr = transport.Transport.init(&r, &sink);
+    var ctx: u8 = 0;
+    S.seen = 0;
+    try authenticatePassword(&tr, t.allocator, "alice", "pw", .{ .banner = .{ .ctx = &ctx, .showFn = S.show } });
+    try t.expectEqual(max_sent_banner_len, S.seen);
 }
 
 test "client userauth: the password and a keyboard-interactive answer do not survive in the freed request buffers" {

@@ -1033,6 +1033,17 @@ fn readPacketBody(r: *std.Io.Reader, cipher: *CipherState, buf: []u8) TransportE
     }
 }
 
+/// The packet buffer of `writePacket`: every packet this module sends is
+/// framed, encrypted and MACed in it, on the stack.
+pub const write_frame_len: usize = 8192;
+
+/// The largest payload `writePacket` frames under EVERY cipher and MAC this
+/// module implements: `write_frame_len` less the framing (length 4, padding
+/// length 1, 4..19 bytes of padding to the block, a MAC or tag of up to 64
+/// bytes). One byte more overflows AES-CTR with hmac-sha2-512-etm; a longer
+/// payload may still fit a cheaper cipher, but nothing above this is promised.
+pub const max_write_payload: usize = write_frame_len - 85;
+
 /// Write one binary packet (RFC 4253 §6.1) carrying `payload` to `w` under
 /// `cipher`'s state (computing padding, encrypting, appending the MAC as
 /// needed), then flush. Advances the sequence number.
@@ -1044,7 +1055,7 @@ pub fn writePacket(w: *std.Io.Writer, cipher: *CipherState, entropy: Entropy, pa
 }
 
 fn writePacketBody(w: *std.Io.Writer, cipher: *CipherState, entropy: Entropy, payload: []const u8) TransportError!void {
-    var buf: [8192]u8 = undefined;
+    var buf: [write_frame_len]u8 = undefined;
     switch (cipher.*) {
         .none => |*st| {
             const block: usize = 8;
@@ -5945,6 +5956,36 @@ fn testCiphers() [5]CipherState {
         .{ .aes_ctr_hmac = ctr_combos[1] }, // encrypt-then-MAC
         .{ .aes_gcm = .{ .ctx = .{ .aes256 = Aes256Gcm.init(@splat(0x11)) }, .fixed_iv = .{ 1, 2, 3, 4 }, .invocation_counter = 5, .sequence_number = 3 } },
     };
+}
+
+test "writePacket: max_write_payload fits every cipher and MAC; one byte more overflows the costliest" {
+    const t = std.testing;
+    const S = struct {
+        var payload: [max_write_payload + 1]u8 = @splat(0x42);
+        var out: [write_frame_len + 64]u8 = undefined;
+    };
+    // Plaintext, chacha20-poly1305 and AES-GCM, then every AES-CTR key size
+    // with every MAC, encrypt-and-MAC and encrypt-then-MAC.
+    var all: [5 + ctr_combos.len]CipherState = undefined;
+    @memcpy(all[0..5], &testCiphers());
+    for (ctr_combos, all[5..]) |c, *d| d.* = .{ .aes_ctr_hmac = c };
+    for (all) |cs| {
+        var c = cs;
+        var w: std.Io.Writer = .fixed(&S.out);
+        try writePacket(&w, &c, .os, S.payload[0..max_write_payload]);
+        try t.expect(w.buffered().len <= write_frame_len);
+    }
+    // Encrypt-then-MAC with hmac-sha2-512 is the costliest at the edge: one
+    // byte over the maximum it needs 19 bytes of padding and overflows.
+    for (ctr_combos) |combo| {
+        if (!combo.etm or combo.mac != .hmac_sha2_512) continue;
+        var c: CipherState = .{ .aes_ctr_hmac = combo };
+        var w: std.Io.Writer = .fixed(&S.out);
+        try writePacket(&w, &c, .os, S.payload[0..max_write_payload]);
+        var w2: std.Io.Writer = .fixed(&S.out);
+        try t.expectError(error.PacketTooLarge, writePacket(&w2, &c, .os, S.payload[0 .. max_write_payload + 1]));
+    }
+    try t.expectEqual(@as(usize, 8107), max_write_payload);
 }
 
 test "readPacket: RFC 4253 §6 padding bounds on an authenticated packet, every cipher" {

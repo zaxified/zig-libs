@@ -462,9 +462,15 @@ environment with OpenSSH installed.
   `fromScalar` now declassifies only its zero verdict (`declassified`); the row is 20 (the three
   zero-test contexts gone, P-256's public `rejectNonCanonical` verdict now counted apart) and the
   early exit reads 22. The packet-MAC compares have no ctgrind target (unobservable). Two LOW
-  findings, left as they are: a userauth banner of exactly `max_banner_len` (8 KiB) cannot be
-  sent (`writePacket`'s 8 KiB frame), and `messages.NameList.iterator` yields one empty name
-  for an empty list although its doc comment promises none. Two kills first seen only in live
+  findings. A userauth banner of exactly `max_banner_len` (8 KiB) could not be sent
+  (`writePacket`'s 8 KiB frame: `PacketTooLarge`); fixed 2026-11-18. OpenSSH sends any banner a
+  packet holds (sshd reads a banner file of up to 1 MiB, `auth2_read_banner`) and Go's
+  `SendAuthBanner` checks no length; this module's send frame is 8 KiB by design
+  (`transport.write_frame_len`, under a 16 KiB record burn), so the server's bound is lowered to
+  what one packet carries under every cipher: `userauth.max_sent_banner_len` = 8098
+  (`transport.max_write_payload` 8107 less the message's 9 bytes), refused up front with
+  `NameTooLong`. A client still accepts banners up to `max_banner_len`. `messages.NameList.iterator`
+  yielded one empty name for an empty list although its doc comment promises none. Two kills first seen only in live
   interop tests (889, 984) were re-measured without them and are killed by their own tests.
 
 ## Build options

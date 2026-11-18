@@ -264,7 +264,7 @@ oscore	ReleaseFast	unprotect	1	1	edd3b15d71f39582	ed85db89e3d7e9fd
 # reaches the exchange hash whatever the code does. `ffpow`: POSITIVE CONTROL,
 # the same K through the std.crypto.ff pow dhPowModPrime used until this date
 # — its window select compiles to a jump in ReleaseFast. It must stay >= 1.
-ssh	ReleaseFast	dh	1	4	667da2130cd5d4f3	95639ff37028e502
+ssh	ReleaseFast	dh	1	4	28b0e3a61b349435	95639ff37028e502
 # Zig 0.17.0 (2026-10-18): ffpow 3 -> 17, still the positive control (>=1). 0.17 std ff pow's
 # table select is now `cmov(ct.eql(k, i+1))` (ff.zig:968/975 -> :359) and compiles to a jump per
 # table entry (16) instead of 2 `eql` jumps: std ff pow leaks the secret exponent's window values
@@ -291,8 +291,8 @@ ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # montint's DynModint (the server-chosen prime; group14 and group16 primes
 # here) — 0 contexts in dyn/montint/limbs; the 2 in-file are stripLeadingZeros
 # on e and K (RFC 4251 §5 mpint length, as `dh`).
-ssh	ReleaseFast	gex	1	2	667da2130cd5d4f3	2d8d321e6c103efe
-ssh	ReleaseFast	ecdh	1	20	667da2130cd5d4f3	8683e4aaf784b64c
+ssh	ReleaseFast	gex	1	2	28b0e3a61b349435	2d8d321e6c103efe
+ssh	ReleaseFast	ecdh	1	20	28b0e3a61b349435	8683e4aaf784b64c
 # ssh pem / pemstd (2026-10-18): HostKey.fromOpenSSH on the ed25519 fixture with the base64
 # characters carrying only seed bits tainted (44 - 2 edge characters; the edges share bits with
 # the private string's 0x40 length and the public-key copy, and tainting them made every later
