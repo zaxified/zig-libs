@@ -174,7 +174,7 @@ on `Options.dry_run`). Not changed, with reason → Backlog.
   from a trusted peer, walked past trusted hops). Ideal: `.forwarded_ip_trusted: TrustedProxies`
   here with the same semantics — shared code would need the type in `http` or `netaddr`, since
   abuseguard does not depend on ratelimit.
-- **No-panic sweep 2026-10-28:** nothing data-reachable; fixed `admit` overflow after `reconcile(ip, maxInt(u32))` with no per-IP cap (AG-2) and a checked panic for a hook wired without its context (AG-1).
+- **No-panic sweep 2026-10-28:** nothing data-reachable; fixed `admit` overflow after `reconcile(ip, maxInt(u32))` with no per-IP cap (AG-2) and a checked panic for a hook wired without its context (AG-1). ✅ DONE 2026-10-28 (AG-2 test "reconcile to maxInt(u32) with no per-IP cap", modules/abuseguard/src/root.zig:1768, commit 9f657f2e6).
 - ~~Fail-closed store as a lockout~~ — **done 2026-09-29**: `Options.on_store_full =
   .admit_untracked` (the web-server consumer research register H5). No init assertion when `max_conns_total` is null
   with `.admit_untracked` — **rejected 2026-10-04**: the web-server consumer's default runs exactly that way on

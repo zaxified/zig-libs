@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog: one item marked done in place (verified in code): DONE 2026-10-28 (AG-2 test "reconcile to maxInt(u32) with no per-IP cap", modules/abuseguard/src/root.zig:1768, commit 9f657f2e6).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of `per_ip_cap_exempt` and the shared `inPrefixes` helper, 9/9 killed; Audit line and SPEC paragraph updated, no code change.
 - **2026-11-15** — **Added:** `Options.per_ip_cap_exempt: []const netaddr.Prefix = &.{}` — members skip only the `max_conns_per_ip` check (a trusted reverse proxy carrying every client); they stay counted against `max_conns_total` and bans/greylists/strikes still apply to them. Borrowed slice, linear scan, matched like `allow`. Consumer request 2026-11-15. Tests: an exempt peer opens past the cap while a stranger is refused, the global cap still sheds the exempt peer, closes release its slots, the exempt peer can still be banned; default empty.

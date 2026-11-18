@@ -162,8 +162,9 @@ fn checkPairs(text: []const u8, gpa: std.mem.Allocator) anyerror!bool {
 }
 
 fn checkUnix(text: []const u8, gpa: std.mem.Allocator) anyerror!bool {
-    const rows = try procnet.parseUnix(gpa, text);
-    defer gpa.free(rows);
+    const t = try procnet.parseUnix(gpa, text, .{});
+    defer t.deinit(gpa);
+    const rows = t.entries;
     for (rows) |*r| {
         try testing.expect(r.path().len <= procnet.unix.path_max);
         _ = r.isListening();

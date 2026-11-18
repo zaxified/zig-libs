@@ -121,7 +121,7 @@ const cg = (try procnet.readPidCgroups(gpa, io, .self)).?; // entries: hierarchy
 const ns = try procnet.readPidNetstat(gpa, io, .self);   // /proc/<pid>/net/netstat; readNetstat = /proc/net/netstat
 defer ns.deinit(gpa);                                    // readSnmp / readPidSnmp for net/snmp
 _ = ns.get("IpExt", "InOctets");                          // ?u64 by (section, name); every counter the kernel prints is kept
-const unix = try procnet.readUnix(gpa, io);              // /proc/net/unix: []UnixEntry (path inline, abstract names start with '@')
+const unix = try procnet.readUnix(gpa, io, .{});          // /proc/net/unix: .entries []UnixEntry (path inline, abstract names start with '@'), .truncated; .{ .max_entries = N } caps it (default 524 288)
 defer unix.deinit(gpa);
 ```
 

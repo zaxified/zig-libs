@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog: one item marked done in place (verified in code): DONE 2026-11-13 (the text above is stale: `Config.max_c14n_output_len` exists, default `default_max_c14n_output_len` = 4 MiB, modules/saml/src/root.zig:301,352-356, commit 938edd5e1).
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit of `root.zig` (438 mutants, 407 killed, 31 equivalent or unobservable, see SPEC "Audit 2026-11-18"): 61 tests in `test_mutants*.zig`; `test_hok_crossform.zig` exports its EC certificate and point for them. Pinned: `decodeRedirectField` refuses a stream that inflates to exactly `max_redirect_inflated` octets (the cap is exclusive).
 - **2026-11-16** — `buildSignedAuthnRequest(alloc, opts, key)`: an AuthnRequest with an enveloped RSA-SHA256 signature
   after `<Issuer>` for the HTTP-POST binding (`AuthnRequestsSigned`). `buildAuthnRequest` is unchanged (same bytes, same

@@ -524,7 +524,7 @@ test "readUnix: a listener this process binds is in the table, and the table is 
     // Skip only when the host has no /proc/net/unix at all.
     const probe = procnet.readVirtualFile(testing.allocator, io, "/proc/net/unix", 4096) orelse return error.SkipZigTest;
     testing.allocator.free(probe);
-    const t = try procnet.readUnix(testing.allocator, io);
+    const t = try procnet.readUnix(testing.allocator, io, .{});
     defer t.deinit(testing.allocator);
     try testing.expect(!t.truncated);
     var found = false;
