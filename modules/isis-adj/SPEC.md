@@ -6,7 +6,7 @@
 
 **Scope:** mvp — holo-isis adjacency layer (holo v0.9.0), behaviour cross-checked against FRR isisd 10.7 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-07 · mutation 2026-10-05 (40/44, 4 eq) · src ?
+**Audit:** review 2026-09-07 · mutation 2026-11-18 (49/53, 4 eq) · src 94ac37ba567de7f2
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ISIS_ADJ_FUZZ) · ct n/a — IS-IS adjacency FSM (keyword review, 2026-10-07)
 
@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [takehaya/goisis](https://github.com/takehaya/goisis) | Go | Apache-2.0 (LICENSE file) — README/design doc only, source not read | 0 | v0.9.0 (2026-09-25) | LAN + P2P, HMAC auth of hellos, RFC 5306 graceful-restart *helper*; BFD and MT deferred (README). |
 | [mdlayher/isis](https://github.com/mdlayher/isis) | Go | MIT | 0 | no release; pushed 2026-09-29 | `Circuit` runs one P2P adjacency over the RFC 5303 three-way handshake plus an Ethernet transport (Linux `AF_PACKET`); LAN and auth not covered (README). The closest like-for-like, and it does I/O, which this module deliberately does not. |
 
-**Where we are ahead:** the most thoroughly specified pure RFC 5303 table in the survey: neighbour-block mismatch discard, stale-Up refusal, third-neighbour lock, Area/Max-Area mismatch, hold floor, circuit-id-change detection — each with an audit regression (SPEC §5) — and two adjacencies converge byte-for-byte through the real codec; time-injected and I/O-free, so it is testable without a clock or a socket; TLV 240 anchored on Wireshark's dissector including the 11-octet shape that exposed a bug. **Where we are behind:** no LAN adjacency (IS-Neighbours #6 SNPA two-way check, per-neighbour hold timers) — `rg -i 'lan_hello|LanHello' isis-adj/src` finds nothing, and `isis-dis` takes the neighbour set as input rather than forming it; no authentication of IIHs (holo/goisis have it); no graceful-restart helper (goisis has it); no Protocols-Supported (#129) / IP-address compatibility check (`rg -i 'protocols_supported|nlpid' isis-adj/src` empty); no BFD trigger (→ Backlog).
+**Where we are ahead:** the most thoroughly specified pure RFC 5303 table in the survey: neighbour-block mismatch discard, stale-Up refusal, third-neighbour lock, Area/Max-Area mismatch, hold floor, circuit-id-change detection — each with an audit regression (SPEC §5) — and two adjacencies converge byte-for-byte through the real codec; time-injected and I/O-free, so it is testable without a clock or a socket; TLV 240 anchored on Wireshark's dissector including the 11-octet shape that exposed a bug. **Where we are behind:** no LAN adjacency (IS-Neighbours #6 SNPA two-way check, per-neighbour hold timers) — `rg -i 'lan_hello|LanHello' isis-adj/src` finds nothing, and `isis-dis` takes the neighbour set as input rather than forming it; no graceful-restart helper (goisis has it); no Protocols-Supported (#129) / IP-address compatibility check (`rg -i 'protocols_supported|nlpid' isis-adj/src` empty); no BFD trigger (→ Backlog). IIH authentication (TLV #10, RFC 5304/5310) is at parity with holo and FRR since 2026-11-18 (§5 "Authentication").
 
 ## 1. Scope
 
@@ -184,7 +184,9 @@ Implemented (cheap, and they gate adjacency formation):
   displacing the candidate, and the genuine neighbour's next echoing hello goes
   to Up and engages the lock. Trade-off stated plainly: at Up we keep the
   incumbent (FRR lets the newcomer take over, which is spoofable teardown); at
-  Initializing we let the newcomer in (FRR does too). Neither is authentication.
+  Initializing we let the newcomer in (FRR does too). Neither is authentication;
+  with `Config.auth_keys` set (below) a stranger without the key is refused
+  before this rule is reached.
 - **Neighbour-block mismatch** — RFC 5303 §3.2: a TLV 240 whose neighbour block
   names another system, or our system with another extended local circuit id
   (a parallel circuit's handshake), is discarded whole →
@@ -229,6 +231,29 @@ Implemented (cheap, and they gate adjacency formation):
   only 0, a caller may raise it, 0 disables it. A shorter hold than before
   (31 → 3) stays legal — a neighbour may reconfigure.
 
+- **Authentication (2026-11-18)** — with `Config.auth_keys` non-empty,
+  `rxHelloBytes` runs `isis.auth.verify` on the whole PDU right after the
+  decode and the full TLV walk, before any field is read or any state
+  touched: no Authentication TLV (#10) → `rejected = .auth_missing`; a digest
+  or password that matches no key, no key for the TLV's type or (RFC 5310)
+  Key ID, an unknown authentication type or a malformed #10 →
+  `rejected = .auth_failed`. RFC 5304 §2 and RFC 5310 §3.5 discard such a PDU;
+  holo-isis validates in its hello decoder and drops it (`AuthTypeMismatch`,
+  `AuthKeyNotFound`, `AuthError`), FRR's `isis password` discards
+  unauthenticated and mismatching hellos. A refusal, not an error: the PDU is
+  well formed, only untrusted. Several keys allow a rollover (every key
+  verifies; RFC 5310 picks by Key ID, HMAC-MD5/cleartext try each), and
+  `helloFields` hands `auth_keys[0]` to `buildHello`, which puts #10 first
+  and signs the finished PDU (holo and FRR also put it first). Empty
+  `auth_keys` (the default) is the old behaviour byte for byte: nothing
+  verified, nothing added, the Wireshark-anchored golden hellos unchanged.
+  Not covered: `rxHello` takes an already-decoded `RxHello` and cannot verify
+  anything — a keyed caller must feed bytes; a hello padded to the MTU must be
+  signed after padding (RFC 5310 §3.2), which `buildHello` (no padding) does
+  not do; replay is not prevented by either RFC. Keys and their algorithms,
+  RFC 5310's key-preparation choice and the constant-time compare are the
+  codec's (`isis` SPEC § Authentication).
+
 Malformed input is a typed **error** (not a soft reject) from `rxHelloBytes`:
 a bad common header / P2P body surfaces `isis`'s `pdu.DecodeError`
 (`BadDiscriminator`, `TruncatedBody`, `BadPduLength`, `WrongPduType`, …); a bad
@@ -249,7 +274,7 @@ change) — a hostile PDU cannot corrupt the machine. The fuzz test pins this
   `.level1` circuits (see §5); a `.level1_2` circuit still forms regardless of
   area, since this FSM has no split L1/L2 sub-state to selectively reject only
   the L1 half. Splitting the state would need to be a separate increment.
-- **Authentication** — TLV #10 / RFC 5304 / 5310 HMAC validation of the IIH.
+- ~~**Authentication**~~ — TLV #10 / RFC 5304 / 5310 validation of the IIH: **implemented 2026-11-18** (§5).
 - **Graceful restart** (RFC 5306) and **adjacency-SID** (segment routing).
 - **MTU / padding negotiation** beyond the basics, and full ISO 10589 §8.2
   timer/counter accounting (adjacencyStateChange counters, etc.).
@@ -334,11 +359,32 @@ for it here.
   extended-circuit-id equality (a block naming another id was already
   discarded as `neighbor_mismatch`).
 
+- **Authentication 2026-11-18** (`src/auth_test.zig`, 11 tests): two keyed
+  adjacencies reach Up through the real encode → `rxHelloBytes` path for every
+  algorithm (cleartext, HMAC-MD5, HMAC-SHA-1/224/256/384/512) and with strict
+  RFC 5310 keying on both sides; a keyed receiver refuses an unauthenticated
+  hello and mutates nothing; an unkeyed one accepts an authenticated hello;
+  wrong secret, Key ID, algorithm, cleartext password and keying mode are
+  refused; a key rollover; one flipped octet anywhere is refused; a malformed
+  or private-type #10 is `auth_failed` while a broken TLV stream stays a
+  decode error; an Up adjacency's hold is not refreshed by an unsigned copy of
+  the neighbour's hello carrying holding time 65535; `buildHello` needs room
+  for #10 and refuses an oversize password. **Delta mutation 2026-11-18** (9
+  mutants over the new lines of `fsm.zig`: the key check skipped or forced,
+  each reject reason swapped, `helloFields`' key dropped or the last one
+  taken, the placeholder or the signature skipped, the returned length):
+  9/9 killed. Not mutated: the `UnsupportedPduType` arm and the `else`
+  propagation after it (the PDU already decoded, so unreachable) and
+  `buildHello`'s `sign` error mapping (own PDU, own key). The card adds them to
+  the 2026-10-05 counts.
+
 Green in Debug + ReleaseFast; `zig fmt --check` clean; `zig build check-catalog`
 green; the sibling `isis` test suite unaffected.
 
 Provenance: clean-room from ISO/IEC 10589 §8.2 and RFC 5303; no third-party
-implementation ported or studied. No NOTICE entry is required (public
+implementation ported. For authentication (2026-11-18) holo-isis `pdu.rs`
+(MIT) was read for where it validates and what it drops; FRR only through its
+documentation. No NOTICE entry is required (public
 specs, root `NOTICE` §0).
 
 ## Backlog / deferred
@@ -346,7 +392,7 @@ specs, root `NOTICE` §0).
 Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
 
 - **LAN adjacency FSM** (LAN IIH types 15/16: IS-Neighbours #6 two-way check, per-neighbour hold, priority tracking feeding `isis-dis`) (survey 2026-09-30). Why: every FRR/holo/goisis user runs broadcast circuits; without it `isis-dis` has no producer of its candidate set anywhere in the stack. Effort: ~1 week. Fits §2: yes.
-- **IIH authentication (TLV #10, RFC 5304/5310)** (survey 2026-09-30). Why: without it the module has to defend against spoofed hellos with heuristics (SPEC §5 "other_neighbor" lock). Blocked on the codec-level HMAC (see `isis` backlog). Effort: ~2 days after that. Fits §2: yes.
+- ~~**IIH authentication (TLV #10, RFC 5304/5310)**~~ — **closed 2026-11-18** (§5 "Authentication"; security triage row isis-adj:349 done). (survey 2026-09-30). Why: without it the module has to defend against spoofed hellos with heuristics (SPEC §5 "other_neighbor" lock). Blocked on the codec-level HMAC (see `isis` backlog). Effort: ~2 days after that. Fits §2: yes.
 - **Protocols-Supported (#129) NLPID and IP-subnet compatibility check** (survey 2026-09-30). Why: RFC 1195 adjacencies must refuse a neighbour with no common protocol; FRR/holo do. Irrelevant for pure-SPB. Effort: ~1 day. Fits §2: yes. Priority low.
 - **Graceful-restart helper (RFC 5306)** (survey 2026-09-30). Why: keeps adjacencies up across a neighbour's planned restart; goisis has the helper half. Effort: ~3 days. Fits §2: yes. Already in the module's deferred list.
 

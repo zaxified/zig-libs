@@ -145,6 +145,16 @@ pub const RejectReason = enum {
     /// (A1 audit F13). Neither RFC 5303 nor FRR sets a floor; this is a local
     /// policy with a default that refuses only 0.
     holding_time_too_short,
+    /// `Config.auth_keys` is set and the IIH carries no Authentication TLV
+    /// (#10). Checked by `rxHelloBytes` before anything else is read, so the
+    /// PDU mutates nothing. holo-isis drops it (`AuthTypeMismatch`), FRR
+    /// discards it as an authentication failure.
+    auth_missing,
+    /// `Config.auth_keys` is set and the IIH's Authentication TLV does not
+    /// verify: wrong digest or password, no key with its type or (RFC 5310)
+    /// Key ID, an unknown authentication type, or a malformed #10. RFC 5304
+    /// §2 / RFC 5310 §3.5: the PDU is discarded.
+    auth_failed,
 };
 
 pub const Transition = struct { from: State, to: State };
@@ -219,6 +229,20 @@ pub const Config = struct {
     /// ISO 10589 §8.2.5.2 c) unimplemented ("FIXME - Missing parts"); `false`
     /// matches it.
     detect_circuit_id_change: bool = true,
+    /// IIH authentication (ISO 10589 §9.7 TLV #10; RFC 5304 / RFC 5310 — the
+    /// circuit's "Link Level Authentication string", RFC 5310 §3.2). Empty
+    /// (the default): nothing is checked or added, byte-for-byte the
+    /// behaviour before this field existed. Non-empty: `rxHelloBytes`
+    /// refuses an IIH without a #10 (`.auth_missing`) or one that verifies
+    /// against none of these keys (`.auth_failed`) before reading any other
+    /// field, like holo-isis and FRR (`isis password`), and `helloFields`
+    /// hands `keys[0]` to `buildHello`, which signs with it. Several keys
+    /// allow a rollover: every key verifies, the first one signs. `rxHello`
+    /// takes an already-decoded `RxHello` and cannot check anything — a
+    /// caller with keys must feed bytes. Borrowed, like `local_areas`: the
+    /// slice and every `secret` must outlive the `Adjacency`, and the caller
+    /// wipes the secrets (`isis.auth.Key`).
+    auth_keys: []const isis.auth.Key = &.{},
 };
 
 /// Everything needed to build an outgoing P2P IIH, returned by the FSM so it
@@ -236,6 +260,9 @@ pub const HelloFields = struct {
     /// Our TLV 240 payload: our current state, our extended circuit id, and —
     /// once we have heard the neighbour — the neighbour block echoing it.
     three_way: ThreeWayTlv,
+    /// The key `buildHello` signs with (`Config.auth_keys[0]`), or `null`
+    /// for an unauthenticated IIH.
+    auth: ?isis.auth.Key = null,
 };
 
 /// A received P2P IIH reduced to the fields the FSM reasons about. Produced from
@@ -388,6 +415,7 @@ pub const Adjacency = struct {
             .circuit_type = self.cfg.circuit_type,
             .max_area_addresses = self.cfg.max_area_addresses,
             .three_way = tw,
+            .auth = if (self.cfg.auth_keys.len != 0) self.cfg.auth_keys[0] else null,
         };
     }
 
@@ -428,6 +456,25 @@ pub const Adjacency = struct {
         // about its length BEHIND the 240 used to pass — and the same PDU is
         // refused by a sibling that walks it all. One PDU, one verdict.
         _ = try isis.tlv.count(p.tlv_bytes);
+        // Authentication first: an IIH that does not verify is dropped before
+        // any field of it is believed (holo-isis validates in the decoder,
+        // FRR before adjacency processing). The PDU already decoded, so every
+        // error left is about #10 itself.
+        if (self.cfg.auth_keys.len != 0) {
+            _ = isis.auth.verify(bytes, self.cfg.auth_keys) catch |e| switch (e) {
+                error.AuthMissing => return .{ .rejected = .auth_missing },
+                error.KeyNotFound,
+                error.UnsupportedAuthType,
+                error.AuthFailed,
+                error.MalformedAuth,
+                => return .{ .rejected = .auth_failed },
+                // `P2pHello.decode` and `tlv.count` above already accepted
+                // these bytes, so `verify`'s own decode cannot refuse them;
+                // propagated rather than asserted.
+                error.UnsupportedPduType => return .{ .rejected = .auth_failed },
+                else => |de| return de,
+            };
+        }
         var tw: ?ThreeWayTlv = null;
         if (try isis.tlv.findFirst(p.tlv_bytes, three_way.tlv_code)) |val| {
             tw = try ThreeWayTlv.decode(val);
@@ -696,6 +743,11 @@ pub const Adjacency = struct {
 /// Convenience: build a complete P2P IIH into `buf` from `HelloFields`, using the
 /// `isis` P2P IIH builder plus a raw TLV 240. Offered for callers that want one
 /// call; the FSM itself never touches a buffer. Returns the encoded PDU slice.
+///
+/// With `f.auth` set the Authentication TLV goes first (as holo-isis and FRR
+/// place it) and the finished PDU is signed. A caller that pads the hello to
+/// the MTU must add the padding before signing (RFC 5310 §3.2), i.e. build
+/// it with `isis.auth` directly.
 pub fn buildHello(buf: []u8, f: HelloFields) error{ BufferTooSmall, ValueTooLong, MalformedTlv }![]const u8 {
     var b = isis.pdu.P2pHelloBuilder.init(buf, .{
         .source_id = f.source_id,
@@ -704,6 +756,7 @@ pub fn buildHello(buf: []u8, f: HelloFields) error{ BufferTooSmall, ValueTooLong
         .circuit_type = f.circuit_type,
         .max_area_addresses = f.max_area_addresses,
     }) catch return error.BufferTooSmall;
+    if (f.auth) |k| try isis.auth.addPlaceholder(&b.tlvs, k);
     var val_buf: [15]u8 = undefined;
     const val = f.three_way.encode(&val_buf) catch |e| switch (e) {
         error.MalformedTlv => return error.MalformedTlv,
@@ -713,7 +766,14 @@ pub fn buildHello(buf: []u8, f: HelloFields) error{ BufferTooSmall, ValueTooLong
         error.BufferTooSmall => return error.BufferTooSmall,
         error.ValueTooLong => return error.ValueTooLong,
     };
-    return b.finish();
+    const n = b.finish().len;
+    if (f.auth) |k| {
+        // Our own freshly built P2P IIH with `k`'s placeholder: `sign` finds
+        // it and it matches `k`, so no error is reachable; mapped, not
+        // asserted.
+        isis.auth.sign(buf[0..n], k) catch return error.MalformedTlv;
+    }
+    return buf[0..n];
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
