@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 3.5.5 (surveyed 2026-10-10)
 
-**Audit:** review 2026-11-01 · mutation 2026-10-30 (24/25, 1 eq) · src 335fe8902cbe9d75
+**Audit:** review 2026-11-01 · mutation 2026-11-18 (25/26, 1 eq) · src 2f95976c38fc3693
 
 *Source moved without a production change (2026-11-14):* the test-only `fromHex` helper became `testkit.hex.bytes` (used inside `test` blocks only) and a test-file header comment changed — no production line, no mutant applies.
 
@@ -130,7 +130,7 @@ Secret: the key (hence every round key) and the data blocks.
   `sbox_lookup` through `subWord` (a secret-indexed load per S-box byte, cache-line masked),
   exactly as std's own soft `expandKey` — once per key, not per block. Before 2026-10-20 the
   rounds were std's soft `Block` lookups (`enc` 356 / `dec` 349 in-file loads under
-  `CTGRIND_CPU=x86_64`). Which targets get the soft backend on 0.17 (`std/crypto/aes.zig`):
+  `CTGRIND_CPU=x86_64`). Since 2026-11-18 the portable lane measures this backend: `enc` 128, `dec` 304 and `bitsliced` 128 in-file, all in the key expansion's masked S-box, are pinned as `cpu=x86_64` rows, and the bitsliced batch's padding lanes are zeroed, so the untainted control reads 0 (it read 2: memcheck carried the `undefined` padding into the real lanes). Which targets get the soft backend on 0.17 (`std/crypto/aes.zig`):
   x86-64 without AES-NI **or without AVX** (0.17 requires both — e.g. Atom/Goldmont/Tremont-class
   router and NAS CPUs that have AES-NI but no AVX, and any `-Dcpu=baseline` /
   `x86_64` / `x86_64_v2` build), arm64 without the Crypto Extensions (e.g. Cortex-A72 as in
