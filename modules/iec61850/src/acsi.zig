@@ -569,3 +569,43 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation audit 2026-11-18: parser and equality pins ────────
+
+test "ObjectReference.eql compares every part" {
+    const base = try parseAcsi("LD/LLN0.Mod.stVal", .ST);
+    try testing.expect(base.eql(&try parseAcsi("LD/LLN0.Mod.stVal", .ST)));
+    try testing.expect(!base.eql(&try parseAcsi("LX/LLN0.Mod.stVal", .ST)));
+    try testing.expect(!base.eql(&try parseAcsi("LD/LLN1.Mod.stVal", .ST)));
+    try testing.expect(!base.eql(&try parseAcsi("LD/LLN0.Mod.stVal", .CF)));
+    try testing.expect(!base.eql(&try parseAcsi("LD/LLN0.Mod", .ST)));
+    try testing.expect(!base.eql(&try parseAcsi("LD/LLN0.Mod.q", .ST)));
+}
+
+test "toAcsi fits an exact buffer" {
+    const r = try parseAcsi("LD/LLN0.Mod", .ST);
+    var out: [11]u8 = undefined;
+    try testing.expectEqualStrings("LD/LLN0.Mod", try r.toAcsi(&out));
+    try testing.expectError(error.BufferTooSmall, r.toAcsi(out[0..10]));
+}
+
+test "parseAcsi: max_reference_len fits exactly; an empty LN is refused" {
+    var s: [max_reference_len + 1]u8 = @splat('L');
+    s[0] = 'D';
+    s[1] = '/';
+    _ = try parseAcsi(s[0..max_reference_len], null);
+    try testing.expectError(error.ReferenceTooLong, parseAcsi(&s, null));
+    try testing.expectError(error.EmptyComponent, parseAcsi("LD/.Mod", null));
+}
+
+test "parseMmsParts: the length bound is exact and a slash in the item is refused" {
+    var item: [max_reference_len]u8 = @splat('L');
+    // "LD" + "/" + item: item of max_reference_len - 3 octets is exactly the limit.
+    const n = max_reference_len - 3;
+    @memcpy(item[n - 3 .. n], "$ST");
+    _ = try parseMmsParts("LD", item[0..n]);
+    var longer: [max_reference_len]u8 = @splat('L');
+    @memcpy(longer[n - 2 .. n + 1], "$ST");
+    try testing.expectError(error.ReferenceTooLong, parseMmsParts("LD", longer[0 .. n + 1]));
+    try testing.expectError(error.UnexpectedSeparator, parseMmsParts("LD", "LLN0$ST$a/b"));
+}

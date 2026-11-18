@@ -1294,3 +1294,80 @@ test "fuzz driver: IEC61850_FUZZ (fuzzDecode)" {
 test "fuzz harness: fuzzDecode, 400 seeds, reaches every outcome" {
     try fuzzDecodeMark.reach(fuzzDecode, "iec61850-goose-decode", 400);
 }
+
+// ── whole-module mutation audit 2026-11-18: boundary and field pins ─────────
+
+/// The captured PDU with context field `skip` removed and `extra` appended.
+fn auditRebuildPdu(skip: ?u32, extra: []const u8, out: []u8) ![]const u8 {
+    var buf: [512]u8 = undefined;
+    const f = try Frame.decode(unhex(captured_frame_hex, &buf));
+    const outer = try ber.decode(f.pdu);
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    try w.bytes(extra);
+    // Re-emit the fields back to front.
+    var fields: [16]ber.Element = undefined;
+    var n: usize = 0;
+    var it = ber.Iterator.init(outer.content);
+    while (try it.next()) |e| : (n += 1) fields[n] = e;
+    while (n > 0) {
+        n -= 1;
+        if (skip != null and fields[n].tag.number == skip.?) continue;
+        try w.bytes(fields[n].raw);
+    }
+    try w.header(outer.tag, m);
+    return w.done();
+}
+
+test "Pdu.decode: field-shape rules on top of the captured PDU" {
+    var out: [600]u8 = undefined;
+    _ = try Pdu.decode(try auditRebuildPdu(null, &.{}, &out));
+    // A universal element is not a GOOSE field.
+    try testing.expectError(error.UnexpectedTag, Pdu.decode(try auditRebuildPdu(null, &[_]u8{ 0x02, 0x01, 0x05 }, &out)));
+    // A constructed security [12] is skipped like a primitive one.
+    _ = try Pdu.decode(try auditRebuildPdu(null, &[_]u8{ 0xAC, 0x00 }, &out));
+    // A second allData [11] is a duplicate; a primitive one is malformed.
+    try testing.expectError(error.DuplicateField, Pdu.decode(try auditRebuildPdu(null, &[_]u8{ 0xAB, 0x00 }, &out)));
+    try testing.expectError(error.UnexpectedTag, Pdu.decode(try auditRebuildPdu(null, &[_]u8{ 0x8B, 0x00 }, &out)));
+    // timeAllowedToLive [1] and datSet [2] are mandatory.
+    try testing.expectError(error.MissingField, Pdu.decode(try auditRebuildPdu(1, &.{}, &out)));
+    try testing.expectError(error.MissingField, Pdu.decode(try auditRebuildPdu(2, &.{}, &out)));
+    // An absent goID [3] defaults to gocbRef.
+    const p = try Pdu.decode(try auditRebuildPdu(3, &.{}, &out));
+    try testing.expectEqualStrings("simpleIOGenericIO/LLN0$GO$gcbAnalogValues", p.go_id);
+}
+
+test "Frame.decode: the length checks sit exactly at their boundaries" {
+    // 14 octets of a non-GOOSE frame: NotGoose, not ShortFrame.
+    var plain: [14]u8 = @splat(0);
+    plain[12] = 0x08;
+    try testing.expectError(error.NotGoose, Frame.decode(&plain));
+    // A VLAN tag with exactly its 8 octets: the inner type is read.
+    var tagged: [20]u8 = @splat(0);
+    tagged[12] = 0x81;
+    tagged[16] = 0x08;
+    try testing.expectError(error.NotGoose, Frame.decode(&tagged));
+    // A GOOSE header with Length 8 and no PDU: the header fits, the PDU is
+    // what is missing.
+    var bare: [22]u8 = @splat(0);
+    bare[12] = 0x88;
+    bare[13] = 0xB8;
+    bare[17] = 0x08;
+    try testing.expectError(error.Truncated, Frame.decode(&bare));
+}
+
+test "Frame.encode: an exact buffer fits without a VLAN tag; the Length field is bounded" {
+    const f = Frame{ .dst = @splat(1), .src = @splat(2), .appid = 3, .pdu = &.{}, .total_len = 0 };
+    const pdu = [_]u8{ 0x61, 0x00 };
+    var exact: [14 + header_len + 2]u8 = undefined;
+    try testing.expectEqual(exact.len, (try f.encode(&pdu, &exact)).len);
+    try testing.expectError(error.BufferTooSmall, f.encode(&pdu, exact[0 .. exact.len - 1]));
+    const max_pdu = std.math.maxInt(u16) - header_len;
+    const big_pdu = try testing.allocator.alloc(u8, max_pdu + 1);
+    defer testing.allocator.free(big_pdu);
+    @memset(big_pdu, 0);
+    const big_out = try testing.allocator.alloc(u8, 70000);
+    defer testing.allocator.free(big_out);
+    _ = try f.encode(big_pdu[0..max_pdu], big_out);
+    try testing.expectError(error.BufferTooSmall, f.encode(big_pdu, big_out));
+}

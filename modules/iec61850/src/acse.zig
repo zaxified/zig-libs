@@ -482,3 +482,33 @@ test "corpus: every decode seed reaches the decoder, and the accepted count is p
     try testing.expectEqual(decode_seeds.len, nonempty);
     try testing.expectEqual(@as(usize, 9), accepted);
 }
+
+// ── whole-module mutation audit 2026-11-18: field pins ──────────────────────
+
+test "decodeAare reads every field of a rejection, octet-aligned user information included" {
+    const aare = [_]u8{
+        0x61, 0x29,
+        0xA1, 0x07, 0x06, 0x05, 0x28, 0xCA, 0x22, 0x02, 0x03, // application-context-name
+        0xA2, 0x03, 0x02, 0x01, 0x01, // result: rejected-permanent
+        0xA3, 0x05, 0xA2, 0x03, 0x02, 0x01, 0x05, // diagnostic: provider, 5
+        0xA4, 0x06, 0x06, 0x04, 0x29, 0x01, 0x87, 0x67, // responding-AP-title
+        0xBE, 0x0A, 0x28, 0x08, 0x02, 0x01, 0x03, 0x81, 0x03, 0xAA, 0xBB, 0xCC, // user-information, octet-aligned
+    };
+    const a = try decodeAare(&aare);
+    try testing.expectEqualSlices(u8, &ber.oids.mms_application_context, a.application_context.?.bytes);
+    try testing.expectEqual(AssociateResult.rejected_permanent, a.result);
+    try testing.expect(!a.accepted());
+    try testing.expectEqual(DiagnosticSource.provider, a.diagnostic_source);
+    try testing.expectEqual(@as(i32, 5), a.diagnostic);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x29, 0x01, 0x87, 0x67 }, a.responding_ap_title.?.bytes);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC }, a.user_information);
+    try testing.expectEqual(@as(?u16, 3), a.indirect_reference);
+}
+
+test "decodeAarq reads the calling AP title encodeAarq wrote" {
+    var buf: [256]u8 = undefined;
+    const pdu = try encodeAarq("\x05\x00", .{ .calling_ap_title = &[_]u8{ 0x29, 0x01, 0x87, 0x68 } }, &buf);
+    const a = try decodeAarq(pdu);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x29, 0x01, 0x87, 0x68 }, a.calling_ap_title.?.bytes);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x29, 0x01, 0x87, 0x67, 0x01 }, a.called_ap_title.?.bytes);
+}

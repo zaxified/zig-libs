@@ -3256,3 +3256,304 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation audit 2026-11-18: association, scope and lookup pins
+
+test "an AARQ naming another application context is refused unless the server waives the check" {
+    var fx: Fixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    // The last frame the client wrote is the CONNECT; repoint its ACN
+    // (06 05 28 ca 22 02 03, 1.0.9506.2.3) at 1.0.9506.2.4.
+    var frame: [4096]u8 = undefined;
+    const n = paired.last_write_len;
+    @memcpy(frame[0..n], paired.last_write[0..n]);
+    const at = std.mem.find(u8, frame[0..n], &[_]u8{ 0x06, 0x05, 0x28, 0xCA, 0x22, 0x02, 0x03 }).?;
+    frame[at + 6] = 0x04;
+    var out: [4096]u8 = undefined;
+    var strict = Server.init(.{}, model);
+    try testing.expectError(error.WrongApplicationContext, strict.handle(frame[0..n], &out));
+    try testing.expect(!strict.isAssociated());
+    var lax = Server.init(.{ .require_mms_application_context = false }, model);
+    try testing.expect((try lax.handle(frame[0..n], &out)) != null);
+    try testing.expect(lax.isAssociated());
+}
+
+test "the MMS context id the client proposed is the one the server answers on" {
+    var fx: Fixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    const defs = [_]presentation.ContextDefinition{
+        .{ .id = 1, .abstract_syntax = &ber.oids.acse_abstract_syntax, .transfer_syntax = &ber.oids.ber_transfer_syntax },
+        .{ .id = 7, .abstract_syntax = &ber.oids.mms_abstract_syntax, .transfer_syntax = &ber.oids.ber_transfer_syntax },
+    };
+    var c = try client.Client.init(paired.seam(), &buf, .{ .presentation_options = .{ .contexts = &defs } });
+    try c.connect();
+    const d = try c.readName(.{ .domain_specific = .{ .domain = domain, .item = "GGIO1$ST$Ind2$stVal" } });
+    try testing.expect(try d.boolean());
+}
+
+test "association slots: eight peers fit, a ninth is refused, a returning peer keeps its slot" {
+    var fx: Fixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    // A fresh in-memory wire per client: each association is its own
+    // conversation, only the server is shared.
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var peer: u32 = 1;
+    while (peer <= max_associations) : (peer += 1) {
+        srv.peer = peer;
+        paired = .{ .server = &srv };
+        var c = try client.Client.init(paired.seam(), &buf, .{});
+        try c.connect();
+    }
+    try testing.expectEqual(max_associations, srv.associated_count);
+    srv.peer = 99;
+    paired = .{ .server = &srv };
+    var late = try client.Client.init(paired.seam(), &buf, .{});
+    try testing.expectError(error.NoResponse, late.connect());
+    try testing.expect(!srv.isAssociated());
+    // Peer 3 associates again: idempotent, no new slot.
+    srv.peer = 3;
+    paired = .{ .server = &srv };
+    var again = try client.Client.init(paired.seam(), &buf, .{});
+    try again.connect();
+    try testing.expectEqual(max_associations, srv.associated_count);
+    // Peer 3 leaves; its slot is free for peer 99.
+    again.disconnect();
+    try testing.expectEqual(max_associations - 1, srv.associated_count);
+    srv.peer = 99;
+    paired = .{ .server = &srv };
+    var now = try client.Client.init(paired.seam(), &buf, .{});
+    try now.connect();
+    try testing.expect(srv.isAssociated());
+}
+
+const TwoDomains = struct {
+    a: [8]u8 = undefined,
+    b: [8]u8 = undefined,
+    c: [8]u8 = undefined,
+    vars: [3]Variable = undefined,
+    sets: [3]DataSet = undefined,
+    domains: [2][]const u8 = .{ "LD1", "LD2" },
+
+    fn init(self: *TwoDomains) !Model {
+        self.vars[0] = .{ .domain = "LD1", .item = "GGIO1$ST$Ind$stVal", .storage = &self.a, .len = try emitBool(&self.a, true), .writable = true };
+        self.vars[1] = .{ .domain = "LD2", .item = "GGIO1$ST$Ind$stVal", .storage = &self.b, .len = try emitBool(&self.b, false), .writable = true };
+        self.vars[2] = .{ .domain = "LD2", .item = "GGIO1$ST$Only2$stVal", .storage = &self.c, .len = try emitBool(&self.c, false) };
+        self.sets[0] = .{ .domain = "LD1", .item = "LLN0$DS", .members = &[_]usize{0} };
+        self.sets[1] = .{ .domain = "LD2", .item = "LLN0$DS", .members = &[_]usize{ 1, 2 } };
+        self.sets[2] = .{ .domain = "LD2", .item = "LLN0$DS2", .members = &[_]usize{2} };
+        return .{ .variables = &self.vars, .data_sets = &self.sets, .domains = &self.domains };
+    }
+};
+
+test "two logical devices with the same item names: every lookup honours the domain" {
+    var fx: TwoDomains = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    const ld2 = mms.ObjectName{ .domain_specific = .{ .domain = "LD2", .item = "GGIO1$ST$Ind$stVal" } };
+    try testing.expect(!try (try c.readName(ld2)).boolean());
+    var vb: [8]u8 = undefined;
+    const n = try emitBool(&vb, true);
+    try c.writeName(ld2, vb[0..n]);
+    try testing.expect(try (try c.readName(ld2)).boolean());
+    // LD1's value was not the one written: write false there and LD2 keeps true.
+    const nf = try emitBool(&vb, false);
+    try c.writeName(.{ .domain_specific = .{ .domain = "LD1", .item = "GGIO1$ST$Ind$stVal" } }, vb[0..nf]);
+    try testing.expect(try (try c.readName(ld2)).boolean());
+
+    var names: [8][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try c.getLogicalDeviceDirectory("LD1", &names));
+    try testing.expectEqual(@as(usize, 2), try c.getLogicalDeviceDirectory("LD2", &names));
+    try testing.expectEqual(@as(usize, 1), try c.getDataSetDirectory("LD1", &names));
+    try testing.expectEqual(@as(usize, 2), try c.getDataSetDirectory("LD2", &names));
+
+    var it = try c.readDataSet("LD2/LLN0$DS");
+    var count: usize = 0;
+    while (try it.next()) |_| count += 1;
+    try testing.expectEqual(@as(usize, 2), count);
+    var it2 = try c.readDataSet("LD2/LLN0$DS2");
+    count = 0;
+    while (try it2.next()) |_| count += 1;
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "client: buffer floor, double connect, disconnect state" {
+    var fx: Fixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [4 * 512]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, client.Client.init(paired.seam(), buf[0 .. buf.len - 1], .{}));
+    var big: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &big, .{});
+    try c.connect();
+    try testing.expectError(error.AlreadyConnected, c.connect());
+    c.disconnect();
+    try testing.expect(!c.isConnected());
+    const failures = paired.failures;
+    const writes = paired.last_write_len;
+    paired.last_write_len = 0;
+    c.disconnect();
+    try testing.expectEqual(@as(usize, 0), paired.last_write_len);
+    try testing.expectEqual(failures, paired.failures);
+    _ = writes;
+    // The smallest accepted buffer still associates (on a fresh wire: the
+    // first association's conclude answer is still queued on the old one).
+    paired = .{ .server = &srv };
+    var c2 = try client.Client.init(paired.seam(), &buf, .{});
+    try c2.connect();
+}
+
+test "client.exchange matches the response by invoke id and service, and checks the context" {
+    var fx: Fixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    const loop = try testing.allocator.create(transport.LoopTransport);
+    defer testing.allocator.destroy(loop);
+    loop.* = .{};
+    c.link = loop.transport();
+
+    var pdu_buf: [256]u8 = undefined;
+    var frame_buf: [512]u8 = undefined;
+    // An unconfirmed PDU that is not an InformationReport is not a report.
+    loop.deliver(try srv.wrap(&[_]u8{ 0xA3, 0x02, 0x81, 0x00 }, presentation.context_mms, &frame_buf));
+    // A response and an error for another invoke id are skipped.
+    loop.deliver(try srv.wrap(try mms.encodeIdentifyResponse(4, .{ .vendor = "wrong" }, &pdu_buf), presentation.context_mms, &frame_buf));
+    loop.deliver(try srv.wrap(try mms.encodeConfirmedError(4, .service, 0, &pdu_buf), presentation.context_mms, &frame_buf));
+    loop.deliver(try srv.wrap(try mms.encodeIdentifyResponse(5, .{ .vendor = "right" }, &pdu_buf), presentation.context_mms, &frame_buf));
+    const body = try c.exchange(&[_]u8{0}, 5, .identify);
+    try testing.expectEqualStrings("right", (try mms.decodeIdentifyResponse(body)).vendor);
+    try testing.expectEqual(@as(u64, 0), c.reports_received);
+
+    // The right invoke id under another service is refused.
+    loop.deliver(try srv.wrap(try mms.encodeIdentifyResponse(6, .{}, &pdu_buf), presentation.context_mms, &frame_buf));
+    try testing.expectError(error.UnsupportedService, c.exchange(&[_]u8{0}, 6, .read));
+    // A PDU on the ACSE context is not an MMS answer.
+    loop.deliver(try srv.wrap(try mms.encodeIdentifyResponse(7, .{}, &pdu_buf), presentation.context_acse, &frame_buf));
+    try testing.expectError(error.UndefinedContext, c.exchange(&[_]u8{0}, 7, .identify));
+}
+
+test "a select held by one association refuses another association's operate and cancel" {
+    var fx: ControlFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var pa = Paired{ .server = &srv };
+    const pb = try testing.allocator.create(Paired);
+    defer testing.allocator.destroy(pb);
+    pb.* = .{ .server = &srv };
+    var buf_a: [32768]u8 = undefined;
+    var buf_b: [32768]u8 = undefined;
+    var a = try client.Client.init(pa.seam(), &buf_a, .{});
+    var b = try client.Client.init(pb.seam(), &buf_b, .{});
+    srv.peer = 1;
+    try a.connect();
+    srv.peer = 2;
+    try b.connect();
+
+    var val: [8]u8 = undefined;
+    var vw = ber.Writer.init(&val);
+    try onCommand(&vw);
+    const cmd = control.Command{ .ctl_val = vw.done(), .ctl_num = 1, .t = mmsdata.UtcTime.fromMillis(0, null) };
+    const ref = "TESTLD/GGIO1.SPCSO4"; // sbo-with-enhanced-security
+
+    srv.peer = 1;
+    try a.selectWithValue(ref, cmd);
+    srv.peer = 2;
+    try testing.expectError(error.AccessFailed, b.operateObject(ref, cmd));
+    try testing.expectEqual(control.AddCause.locked_by_other_client, b.last_notification.?.addCause().?);
+    b.clearNotification();
+    try testing.expectError(error.AccessFailed, b.cancelObject(ref, cmd));
+    try testing.expectEqual(control.AddCause.locked_by_other_client, b.last_notification.?.addCause().?);
+    try testing.expect(!try fx.stVal(3));
+    try testing.expectEqual(@as(u64, 2), srv.control_rejections);
+    // The owner's operate still goes through.
+    srv.peer = 1;
+    try a.operateObject(ref, cmd);
+    try testing.expect(try fx.stVal(3));
+}
+
+test "SBO is selected only by reading it: a write is refused and reading Oper selects nothing" {
+    var fx: ControlFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    var vb: [8]u8 = undefined;
+    const n = try emitBool(&vb, true);
+    try testing.expectError(error.AccessFailed, c.writeName(.{ .domain_specific = .{ .domain = domain, .item = "GGIO1$CO$SPCSO2$SBO" } }, vb[0..n]));
+    _ = c.readName(.{ .domain_specific = .{ .domain = domain, .item = "GGIO1$CO$SPCSO2$Oper" } }) catch {};
+    try testing.expectEqual(control.PointState.unselected, fx.controls[1].state);
+    try testing.expectEqual(@as(u64, 0), srv.selects);
+}
+
+test "a control object is found only in its own logical device" {
+    var fx: ControlFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    var val: [8]u8 = undefined;
+    var vw = ber.Writer.init(&val);
+    try onCommand(&vw);
+    const cmd = control.Command{ .ctl_val = vw.done(), .ctl_num = 1, .t = mmsdata.UtcTime.fromMillis(0, null) };
+    // SPCSO1 is direct-with-normal-security in TESTLD; OTHERLD has no controls.
+    try testing.expectError(error.AccessFailed, c.operateObject("OTHERLD/GGIO1.SPCSO1", cmd));
+    try testing.expect(!try fx.stVal(0));
+    try testing.expectEqual(@as(u64, 0), srv.operates);
+}
+
+test "client: a refused or rejecting association answer is not an association" {
+    var fx: Fixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    // The queue now holds the server's CC, then its ACCEPT.
+    const cc_len = try tpkt.peekLength(paired.queue[0..paired.queue_len]);
+    const all = paired.queue[0..paired.queue_len];
+    const loop = try testing.allocator.create(transport.LoopTransport);
+    defer testing.allocator.destroy(loop);
+    for ([_]bool{ false, true }) |refuse| {
+        var answer: [4096]u8 = undefined;
+        @memcpy(answer[0..all.len], all);
+        if (refuse) {
+            // SPDU identifier ACCEPT (14) -> REFUSE (12), after TPKT + COTP DT.
+            try testing.expectEqual(@as(u8, 14), answer[cc_len + 7]);
+            answer[cc_len + 7] = 12;
+        } else {
+            // AARE result [2] { INTEGER 0 } -> rejected-permanent.
+            const at = std.mem.findPos(u8, answer[0..all.len], cc_len, &[_]u8{ 0xA2, 0x03, 0x02, 0x01, 0x00 }).?;
+            answer[at + 4] = 0x01;
+        }
+        loop.* = .{};
+        loop.deliver(answer[0..all.len]);
+        var buf2: [32768]u8 = undefined;
+        var d = try client.Client.init(loop.transport(), &buf2, .{});
+        try testing.expectError(error.AssociationRefused, d.connect());
+        try testing.expect(!d.isConnected());
+    }
+}

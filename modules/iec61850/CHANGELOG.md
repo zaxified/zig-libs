@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** tests only. Whole-module mutation audit, partial (see SPEC "Audit 2026-11-18 (whole-module mutation)"): killing tests for the BER/TPKT/COTP/session/presentation/ACSE/MMS decoders' boundaries, GOOSE/SV field-shape and frame-length rules, the subscriber's sequence state, ACSI reference parsing, the in-memory link double, server association slots, the application-context check, per-domain lookups, two-association control ownership end to end, client response matching and association refusal, the control `Point`/`Machine` state machines, RCB ownership and attribute writes, report reassembly and the GOOSE publisher's schedule. No source line outside the tests changed.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.

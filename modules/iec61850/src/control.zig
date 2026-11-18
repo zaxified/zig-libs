@@ -1938,3 +1938,224 @@ test "corpus: every control seed reaches its decoder, and the counts are pinned"
     try testing.expectEqual(@as(usize, 0), collapsed.accepted);
     try testing.expectEqual(@as(usize, 32), collapsed.rejected);
 }
+
+// ── whole-module mutation audit 2026-11-18: decode, machine and point pins ──
+
+const audit_t = mmsdata.UtcTime.fromMillis(0, null);
+const audit_cmd = Command{ .ctl_val = &[_]u8{ 0x83, 0x01, 0x01 }, .ctl_num = 1, .t = audit_t };
+
+/// A Command structure with a hand-chosen ctlNum and optional trailing octets.
+fn auditCommandData(ctl_num: i64, extra: []const u8, out: []u8) !mmsdata.Data {
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    try w.bytes(extra);
+    try (Check{}).emit(&w);
+    try mmsdata.Emit.boolean(&w, false);
+    try mmsdata.Emit.utcTime(&w, audit_t);
+    try mmsdata.Emit.integer(&w, ctl_num);
+    try (Origin{}).emit(&w);
+    try w.bytes(audit_cmd.ctl_val);
+    try mmsdata.Emit.structure(&w, m);
+    return mmsdata.Data.decode(w.done());
+}
+
+fn auditLaeData(ctl_num: i64, extra: []const u8, out: []u8) !mmsdata.Data {
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    try w.bytes(extra);
+    try mmsdata.Emit.integer(&w, 0);
+    try mmsdata.Emit.integer(&w, ctl_num);
+    try (Origin{}).emit(&w);
+    try mmsdata.Emit.integer(&w, 0);
+    try mmsdata.Emit.visibleString(&w, "LD/GGIO1$CO$SPCSO1");
+    try mmsdata.Emit.structure(&w, m);
+    return mmsdata.Data.decode(w.done());
+}
+
+test "Origin: a 64-octet orIdent is emitted, 65 is refused; decode wants exactly two members" {
+    var buf: [128]u8 = undefined;
+    var w = ber.Writer.init(&buf);
+    const id64: [Origin.max_ident_len]u8 = @splat('a');
+    try (Origin{ .or_ident = &id64 }).emit(&w);
+    const id65: [Origin.max_ident_len + 1]u8 = @splat('a');
+    var w2 = ber.Writer.init(&buf);
+    try testing.expectError(error.BufferTooSmall, (Origin{ .or_ident = &id65 }).emit(&w2));
+    try testing.expectError(error.BadControlStructure, Origin.decode(try mmsdata.Data.decode(&[_]u8{ 0x85, 0x01, 0x01 })));
+    // structure { 3, "x", 1 }
+    try testing.expectError(error.BadControlStructure, Origin.decode(try mmsdata.Data.decode(&[_]u8{ 0xA2, 0x09, 0x85, 0x01, 0x03, 0x89, 0x01, 'x', 0x85, 0x01, 0x01 })));
+}
+
+test "Command.decode: ctlNum is 0..255, nothing may follow Check, a scalar is refused" {
+    var buf: [256]u8 = undefined;
+    try testing.expectEqual(@as(u8, 0), (try Command.decode(try auditCommandData(0, &.{}, &buf))).ctl_num);
+    try testing.expectEqual(@as(u8, 255), (try Command.decode(try auditCommandData(255, &.{}, &buf))).ctl_num);
+    try testing.expectError(error.BadControlStructure, Command.decode(try auditCommandData(-1, &.{}, &buf)));
+    try testing.expectError(error.BadControlStructure, Command.decode(try auditCommandData(256, &.{}, &buf)));
+    try testing.expectError(error.BadControlStructure, Command.decode(try auditCommandData(1, &[_]u8{ 0x83, 0x01, 0x00 }, &buf)));
+    try testing.expectError(error.BadControlStructure, Command.decode(try mmsdata.Data.decode(&[_]u8{ 0x83, 0x01, 0x01 })));
+}
+
+test "LastApplError.decode: ctlNum is 0..255, exactly five members, a scalar is refused" {
+    var buf: [256]u8 = undefined;
+    try testing.expectEqual(@as(u8, 0), (try LastApplError.decode(try auditLaeData(0, &.{}, &buf))).ctl_num);
+    try testing.expectEqual(@as(u8, 255), (try LastApplError.decode(try auditLaeData(255, &.{}, &buf))).ctl_num);
+    try testing.expectError(error.BadControlStructure, LastApplError.decode(try auditLaeData(-1, &.{}, &buf)));
+    try testing.expectError(error.BadControlStructure, LastApplError.decode(try auditLaeData(256, &.{}, &buf)));
+    try testing.expectError(error.BadControlStructure, LastApplError.decode(try auditLaeData(1, &[_]u8{ 0x85, 0x01, 0x00 }, &buf)));
+    try testing.expectError(error.BadControlStructure, LastApplError.decode(try mmsdata.Data.decode(&[_]u8{ 0x85, 0x01, 0x01 })));
+}
+
+/// Builds an InformationReport over `names` with the `values` (complete Data TLVs).
+fn auditClassify(names: []const mms.ObjectName, values: []const []const u8) !?Notification {
+    const S = struct {
+        var buf: [2048]u8 = undefined;
+    };
+    var w = ber.Writer.init(&S.buf);
+    const m = w.mark();
+    var i = values.len;
+    while (i > 0) {
+        i -= 1;
+        try w.bytes(values[i]);
+    }
+    try mms.closeInformationReport(&w, m, .{ .variables = names });
+    const pdu = try mms.decode(w.done());
+    return classify(try mms.decodeInformationReport(pdu.unconfirmed.body));
+}
+
+test "classify: a domain-scoped LastApplError is read; more than four variables are refused; a deep ctlVal is refused" {
+    var lb: [256]u8 = undefined;
+    const lae = (try auditLaeData(7, &.{}, &lb)).raw;
+    var cb: [256]u8 = undefined;
+    const oper = (try auditCommandData(7, &.{}, &cb)).raw;
+    const lae_ld = mms.ObjectName{ .domain_specific = .{ .domain = "LD", .item = last_appl_error_name } };
+    const oper_name = mms.ObjectName{ .domain_specific = .{ .domain = "LD", .item = "GGIO1$CO$SPCSO1$Oper" } };
+    const n = (try auditClassify(&.{ lae_ld, oper_name }, &.{ lae, oper })).?;
+    try testing.expectEqual(@as(u8, 7), n.last_error.?.ctl_num);
+    try testing.expectEqual(NotificationKind.command_termination_negative, n.kind);
+    const vmd = mms.ObjectName{ .vmd_specific = last_appl_error_name };
+    _ = try auditClassify(&.{ vmd, vmd, vmd, vmd }, &.{ lae, lae, lae, lae });
+    try testing.expectError(error.BadControlStructure, auditClassify(&.{ vmd, vmd, vmd, vmd, vmd }, &.{ lae, lae, lae, lae, lae }));
+    // An Oper whose ctlVal nests past mmsdata.max_depth.
+    var deep: [2 * (mmsdata.max_depth + 1)]u8 = undefined;
+    var k: usize = 0;
+    while (k <= mmsdata.max_depth) : (k += 1) {
+        deep[2 * k] = 0xA2;
+        deep[2 * k + 1] = @intCast(2 * (mmsdata.max_depth - k));
+    }
+    var db: [512]u8 = undefined;
+    const deep_cmd = Command{ .ctl_val = &deep, .ctl_num = 1, .t = audit_t };
+    try testing.expectError(error.TooDeep, auditClassify(&.{oper_name}, &.{try deep_cmd.encode(&db)}));
+}
+
+test "Machine: restart after a failure, ctlNum wraps 255 -> 1, no sboTimeout means no expiry" {
+    var m = Machine.init(.sbo_with_enhanced_security, 0);
+    _ = try m.start(0);
+    _ = m.selectFailed(null, null);
+    try testing.expectEqual(State.failed, m.state);
+    try testing.expectEqual(AddCause.select_failed, m.failure.?.add_cause.?);
+    try testing.expectEqual(Stage.select, m.failure.?.stage);
+    try testing.expectEqual(@as(u64, 0), m.select_deadline_ms);
+    m.ctl_num = 255;
+    try testing.expectEqual(Step.write_sbow, try m.start(10));
+    try testing.expectEqual(@as(u8, 1), m.ctl_num);
+    try testing.expect(m.failure == null);
+    try testing.expect(m.tick(1_000_000) == null);
+    _ = try m.selectSucceeded(20);
+    try testing.expect(m.tick(2_000_000) == null);
+    _ = try m.beginOperate(30);
+    _ = m.operateRejected(.blocked_by_interlocking, null);
+    try testing.expectEqual(State.failed, m.state);
+
+    var s = Machine.init(.status_only, 0);
+    try testing.expectError(error.ControlRejected, s.start(0));
+    try testing.expectEqual(State.failed, s.state);
+}
+
+test "Machine: terminated only while awaiting; cancel and termination timeout fail the command" {
+    var m = Machine.init(.direct_with_enhanced_security, 0);
+    _ = try m.start(0);
+    const pos = Notification{ .kind = .command_termination_positive };
+    try testing.expectError(error.WrongState, m.terminated(pos));
+    _ = try m.beginOperate(0);
+    _ = try m.operateAccepted(0);
+    _ = m.cancelled();
+    try testing.expectEqual(State.failed, m.state);
+    try testing.expectEqual(AddCause.abortion_by_cancel, m.failure.?.add_cause.?);
+    // Termination timeout.
+    _ = try m.start(100);
+    _ = try m.beginOperate(100);
+    _ = try m.operateAccepted(100);
+    try testing.expect(m.tick(100 + m.termination_timeout_ms) != null);
+    try testing.expectEqual(State.failed, m.state);
+    // A zero patience armed at time 0 never expires.
+    var z = Machine.init(.direct_with_enhanced_security, 0);
+    z.termination_timeout_ms = 0;
+    _ = try z.start(0);
+    _ = try z.beginOperate(0);
+    _ = try z.operateAccepted(0);
+    try testing.expect(z.tick(10) == null);
+}
+
+test "Point: a direct model cannot be selected" {
+    var p = Point{ .item = "GGIO1$CO$SPCSO1", .domain = "LD", .ctl_model = .direct_with_normal_security };
+    try testing.expectEqual(AddCause.not_supported, p.select(1, null, 0).rejected);
+    try testing.expectEqual(PointState.unselected, p.state);
+}
+
+test "Point: only the selecting client may operate or release; normal security has no ctlNum to match" {
+    var p = Point{ .item = "GGIO1$CO$SPCSO1", .domain = "LD", .ctl_model = .sbo_with_normal_security };
+    _ = p.select(1, null, 0);
+    var other = audit_cmd;
+    other.ctl_num = 9;
+    try testing.expectEqual(AddCause.locked_by_other_client, p.operate(2, other, 1).rejected);
+    p.release(2);
+    try testing.expectEqual(PointState.selected, p.state);
+    // The owner operates with any ctlNum: the bare SBO read armed none.
+    try testing.expect(p.operate(1, other, 2) == .accepted);
+}
+
+test "Point: synchrocheck override, enhanced-direct ownership and a disabled execution timeout" {
+    var p = Point{ .item = "GGIO1$CO$SPCSO1", .domain = "LD", .ctl_model = .direct_with_enhanced_security, .execution_timeout_ms = 0 };
+    p.synchrocheck_failed = true;
+    p.allow_check_override = true;
+    var cmd = audit_cmd;
+    cmd.check = .{ .synchrocheck = true };
+    try testing.expect(p.operate(7, cmd, 5) == .accepted);
+    try testing.expectEqual(PointState.executing, p.state);
+    // No execution deadline: still executing much later.
+    try testing.expect(!p.tick(1_000_000));
+    // The operating client owns the execution and may cancel it.
+    try testing.expect(p.cancel(7, cmd, 1_000_001) == .accepted);
+}
+
+test "Point: no sboTimeout means a select never expires; cancel after a bare SBO read takes any ctlNum" {
+    var p = Point{ .item = "GGIO1$CO$SPCSO2", .domain = "LD", .ctl_model = .sbo_with_normal_security, .sbo_timeout_ms = 0 };
+    try testing.expect(p.select(1, null, 5) == .accepted);
+    try testing.expectEqual(@as(u64, 0), p.select_deadline_ms);
+    try testing.expect(!p.tick(1_000_000));
+    var cmd = audit_cmd;
+    cmd.ctl_num = 9;
+    try testing.expect(p.cancel(1, cmd, 1_000_001) == .accepted);
+}
+
+test "Point: the type spec grows by operTm; sboReference fits an exact buffer" {
+    var plain = Point{ .item = "GGIO1$CO$SPCSO1", .domain = "LD", .ctl_model = .direct_with_normal_security };
+    var timed = plain;
+    timed.oper_tm = true;
+    var b1: [1024]u8 = undefined;
+    var w1 = ber.Writer.init(&b1);
+    try plain.emitTypeSpec(&w1);
+    var b2: [1024]u8 = undefined;
+    var w2 = ber.Writer.init(&b2);
+    try timed.emitTypeSpec(&w2);
+    try testing.expect(w2.len() > w1.len());
+    var out: [18]u8 = undefined; // "LD/GGIO1$CO$SPCSO1"
+    try testing.expectEqualStrings("LD/GGIO1$CO$SPCSO1", try plain.sboReference(&out));
+    try testing.expectError(error.BufferTooSmall, plain.sboReference(out[0..17]));
+}
+
+test "controlName: a reference that already has max_components is refused" {
+    var buf: [256]u8 = undefined;
+    _ = try controlName("LD/LN.a.b.c.d.e.f.g", .CO, "Oper", &buf);
+    try testing.expectError(error.TooManyComponents, controlName("LD/LN.a.b.c.d.e.f.g.h", .CO, "Oper", &buf));
+}

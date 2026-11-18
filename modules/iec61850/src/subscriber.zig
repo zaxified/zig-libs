@@ -431,3 +431,39 @@ test "publisher and subscriber run a whole event over an in-memory wire" {
     try testing.expect(sub.tick(last + sub.tal_ms + 1) != null);
     try testing.expect(!sub.dataUsable());
 }
+
+// ── whole-module mutation audit 2026-11-18: counter and state pins ──────────
+
+test "counters and stored fields follow every accepted frame" {
+    var s = Subscriber.init(.{ .gocb_ref = gocb });
+    _ = s.onFrame(makePdu(1, 0, 9, 100), 0);
+    try testing.expectEqual(@as(u64, 1), s.frames);
+    try testing.expectEqual(@as(u32, 9), s.conf_rev);
+    _ = s.onFrame(makePdu(2, 0, 9, 100), 10);
+    try testing.expectEqual(@as(u64, 1), s.state_changes);
+    try testing.expectEqual(@as(u64, 2), s.frames);
+}
+
+test "a stNum that goes backwards is out of order even when sqNum looks next" {
+    var s = Subscriber.init(.{ .gocb_ref = gocb });
+    _ = s.onFrame(makePdu(5, 3, 1, 100), 0);
+    const ev = s.onFrame(makePdu(4, 4, 1, 100), 10);
+    try testing.expect(ev.has(.out_of_order));
+    try testing.expect(!ev.has(.refresh));
+}
+
+test "a duplicate frame refreshes liveness without rewinding the sequence" {
+    var s = Subscriber.init(.{ .gocb_ref = gocb });
+    _ = s.onFrame(makePdu(1, 5, 1, 100), 0);
+    // Let the publisher expire, then a duplicate arrives with a longer TAL.
+    try testing.expect(s.tick(200) != null);
+    try testing.expect(!s.alive);
+    const ev = s.onFrame(makePdu(1, 5, 1, 1000), 300);
+    try testing.expect(ev.has(.out_of_order));
+    try testing.expect(s.alive);
+    try testing.expectEqual(@as(u64, 2), s.frames);
+    try testing.expectEqual(@as(u64, 300), s.last_rx_ms);
+    try testing.expectEqual(@as(u32, 1000), s.tal_ms);
+    try testing.expectEqual(@as(u32, 5), s.sq_num);
+    try testing.expect(s.tick(1200) == null);
+}

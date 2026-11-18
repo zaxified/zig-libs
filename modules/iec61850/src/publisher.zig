@@ -387,3 +387,50 @@ test "the published frame decodes as a well-formed GOOSE frame" {
     try testing.expectEqual(false, try (try it.next()).?.boolean());
     try testing.expectEqual(@as(i32, -7), try (try it.next()).?.integer(i32));
 }
+
+// ── whole-module mutation audit 2026-11-18: restart and schedule pins ───────
+
+fn auditPdu(frame: []const u8) !goose.Pdu {
+    return goose.Pdu.decode((try goose.Frame.decode(frame)).pdu);
+}
+
+test "start resets the counters and the event time; a state change stamps its own time" {
+    var vbuf: [16]u8 = undefined;
+    const val = try oneBoolean(true, &vbuf);
+    var p = try Publisher.init(testConfig(), .{});
+    var out: [1024]u8 = undefined;
+    p.start(1000);
+    p.stateChange(1500);
+    _ = (try p.tick(1500, &[_][]const u8{val}, &out)).?;
+    _ = (try p.tick(1504, &[_][]const u8{val}, &out)).?;
+    const changed = try auditPdu(try p.build(&[_][]const u8{val}, &out));
+    try testing.expectEqual(@as(u64, 1500), changed.t.millis());
+    p.start(5000);
+    const pdu = try auditPdu((try p.tick(5000, &[_][]const u8{val}, &out)).?);
+    try testing.expectEqual(@as(u32, 1), pdu.st_num);
+    try testing.expectEqual(@as(u32, 0), pdu.sq_num);
+    try testing.expectEqual((Profile{}).tal(0), pdu.time_allowed_to_live_ms);
+    try testing.expectEqual(@as(u64, 5000), pdu.t.millis());
+    // An empty goID goes out as the gocbRef.
+    try testing.expectEqualStrings(testConfig().gocb_ref, pdu.go_id);
+    // On the wire, not just after decode: goID [3] carries the gocbRef octets.
+    const frame = try p.build(&[_][]const u8{val}, &out);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, frame, testConfig().gocb_ref));
+}
+
+test "the next deadline counts from the previous one, and never lands on now" {
+    var vbuf: [16]u8 = undefined;
+    const val = try oneBoolean(true, &vbuf);
+    var out: [1024]u8 = undefined;
+    const first = (Profile{}).interval(0);
+    var p = try Publisher.init(testConfig(), .{});
+    p.start(1000);
+    // Two ms late, inside the interval: the ladder does not drift.
+    _ = (try p.tick(1002, &[_][]const u8{val}, &out)).?;
+    try testing.expectEqual(@as(?u64, 1000 + first), p.nextDeadline());
+    var q = try Publisher.init(testConfig(), .{});
+    q.start(1000);
+    // Exactly one interval late: scheduled from now, not due again at once.
+    _ = (try q.tick(1000 + first, &[_][]const u8{val}, &out)).?;
+    try testing.expectEqual(@as(?u64, 1000 + 2 * first), q.nextDeadline());
+}

@@ -1953,3 +1953,110 @@ test "corpus: every seed reaches the decoder, and what it decodes to is pinned" 
     try testing.expectEqual(@as(usize, 8), requests);
     try testing.expectEqual(@as(usize, 5), responses);
 }
+
+// ── whole-module mutation audit 2026-11-18: tag-class and field pins ────────
+
+test "decoders refuse or skip a universal tag where a context tag belongs" {
+    // INTEGER 'A' is universal 2, the number aa-specific uses in context class.
+    try testing.expectError(error.UnexpectedTag, ObjectName.decode(&[_]u8{ 0x02, 0x01, 0x41 }));
+    // Universal 11 (number of conclude-request).
+    try testing.expectError(error.UnknownPdu, decode(&[_]u8{ 0x0B, 0x00 }));
+    // unconfirmed [3] { INTEGER 0 }
+    try testing.expectError(error.UnknownPdu, decode(&[_]u8{ 0xA3, 0x03, 0x02, 0x01, 0x00 }));
+    // confirmed-request { invokeID 1, INTEGER 0 }
+    try testing.expectError(error.UnsupportedService, decode(&[_]u8{ 0xA0, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00 }));
+    try testing.expectError(error.UnexpectedTag, TypeSpec.decode(&[_]u8{ 0x02, 0x01, 0x05 }));
+    // Initiate: a universal INTEGER and a universal one inside [4] are skipped.
+    const ini = try Initiate.decode(&[_]u8{ 0x02, 0x01, 0x07, 0xA4, 0x03, 0x02, 0x01, 0x05 });
+    try testing.expectEqual(@as(i16, 5), ini.max_serv_outstanding_called);
+    try testing.expect(ini.services_supported == null);
+    // Identify: a universal element after [2] does not overwrite the revision.
+    const id = try decodeIdentifyResponse(&[_]u8{ 0x82, 0x01, 0x42, 0x02, 0x01, 0x41 });
+    try testing.expectEqualStrings("B", id.revision);
+}
+
+test "decodeReject: the reason is the first context tag past [0]" {
+    const r = (try decode(&[_]u8{ 0xA4, 0x06, 0x80, 0x01, 0x07, 0x81, 0x01, 0x03 })).reject;
+    try testing.expectEqual(@as(?u32, 7), r.invoke_id);
+    try testing.expectEqual(@as(u32, 1), r.reject_reason_class);
+    try testing.expectEqual(@as(i32, 3), r.reject_code);
+    // A universal INTEGER and a constructed [0] are not a reason.
+    const u = (try decode(&[_]u8{ 0xA4, 0x06, 0x80, 0x01, 0x07, 0x02, 0x01, 0x05 })).reject;
+    try testing.expectEqual(@as(u32, 0), u.reject_reason_class);
+    try testing.expectEqual(@as(i32, 0), u.reject_code);
+    const c = (try decode(&[_]u8{ 0xA4, 0x06, 0x80, 0x01, 0x07, 0xA0, 0x01, 0x05 })).reject;
+    try testing.expectEqual(@as(i32, 0), c.reject_code);
+}
+
+test "iterators refuse an element of the wrong shape" {
+    var v = VariableIterator{ .inner = ber.Iterator.init(&[_]u8{ 0x02, 0x01, 0x00 }) };
+    try testing.expectError(error.UnexpectedTag, v.next());
+    var a = AccessResultIterator{ .inner = ber.Iterator.init(&[_]u8{ 0xA5, 0x00 }) };
+    try testing.expectError(error.WrongDataType, a.next());
+    var n = IdentifierIterator{ .inner = ber.Iterator.init(&[_]u8{ 0x04, 0x01, 0x41 }) };
+    try testing.expectError(error.UnexpectedTag, n.next());
+    var d = DirectoryIterator{ .inner = ber.Iterator.init(&[_]u8{ 0x02, 0x01, 0x00 }) };
+    try testing.expectError(error.UnexpectedTag, d.next());
+    const s = TypeSpec{ .kind = 2, .content = &[_]u8{ 0xA1, 0x03, 0x02, 0x01, 0x00 } };
+    var cs = try s.components();
+    try testing.expectError(error.UnexpectedTag, cs.next());
+    try testing.expectError(error.WrongDataType, (TypeSpec{ .kind = 5, .content = &.{} }).components());
+}
+
+test "AccessResult.decode: [0] is a failure code" {
+    const r = try AccessResult.decode(&[_]u8{ 0x80, 0x01, 0x03 });
+    try testing.expectEqual(@as(u8, 3), @backingInt(r.failure));
+}
+
+fn auditWrapTypeSpec(w: *ber.Writer, start: usize, array: bool) !void {
+    if (array) {
+        try w.header(ber.Tag.ctxc(2), start); // elementType [2]
+        try w.header(ber.Tag.ctxc(1), start); // array [1]
+    } else {
+        try w.header(ber.Tag.ctxc(1), start); // componentType [1]
+        try w.header(ber.Tag.sequence, start);
+        try w.header(ber.Tag.ctxc(1), start); // components [1]
+        try w.header(ber.Tag.ctxc(2), start); // structure [2]
+    }
+}
+
+fn auditNestedTypeSpec(buf: []u8, levels: usize, array: bool) ![]const u8 {
+    var w = ber.Writer.init(buf);
+    const start = w.mark();
+    try w.primitive(ber.Tag.ctx(5), &[_]u8{0x20}); // integer, 32 bits
+    var i: usize = 0;
+    while (i < levels) : (i += 1) try auditWrapTypeSpec(&w, start, array);
+    return w.done();
+}
+
+test "TypeSpec.validate bounds structure and array nesting by max_depth" {
+    var buf: [1024]u8 = undefined;
+    for ([_]bool{ false, true }) |array| {
+        const ok = try TypeSpec.decode(try auditNestedTypeSpec(&buf, mmsdata.max_depth - 1, array));
+        try ok.validate();
+        const deep = try TypeSpec.decode(try auditNestedTypeSpec(&buf, mmsdata.max_depth, array));
+        try testing.expectError(error.TooDeep, deep.validate());
+    }
+}
+
+test "response decoders read every field" {
+    const va = try decodeGetVariableAccessAttributesResponse(&[_]u8{ 0x80, 0x01, 0x01, 0xA2, 0x03, 0x85, 0x01, 0x20 });
+    try testing.expect(va.deletable);
+    try testing.expectEqual(@as(u32, 5), va.type_spec.kind);
+    const nl = try decodeGetNamedVariableListAttributesResponse(&[_]u8{ 0x80, 0x01, 0x01, 0xA1, 0x00 });
+    try testing.expect(nl.deletable);
+    const del = try decodeDeleteNamedVariableListResponse(&[_]u8{ 0x80, 0x01, 0x05, 0x81, 0x01, 0x03 });
+    try testing.expectEqual(@as(u32, 5), del.number_matched);
+    try testing.expectEqual(@as(u32, 3), del.number_deleted);
+    const fo = try decodeFileOpenResponse(&[_]u8{ 0x80, 0x01, 0x07, 0xA1, 0x03, 0x80, 0x01, 0x64 });
+    try testing.expectEqual(@as(i32, 7), fo.frsm_id);
+    try testing.expectEqual(@as(u32, 100), fo.size);
+    const entry = [_]u8{ 0x30, 0x0E, 0xA0, 0x06, 0x19, 0x04, 'a', 'b', 'c', 'd', 0xA1, 0x04, 0x80, 0x02, 0x01, 0x00 };
+    const dir = try decodeFileDirectoryResponse(&([_]u8{ 0xA0, 0x10 } ++ entry ++ [_]u8{ 0x81, 0x01, 0x01 }));
+    try testing.expect(dir.more_follows);
+    var it = dir.entries;
+    const e = (try it.next()).?;
+    try testing.expectEqualStrings("abcd", e.name);
+    try testing.expectEqual(@as(u32, 256), e.size);
+    try testing.expect((try it.next()) == null);
+}

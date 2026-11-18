@@ -788,3 +788,41 @@ test "a TPKT larger than the caller's buffer is refused, not sliced past the end
     var big: [4096]u8 = undefined;
     try testing.expectEqual(@as(usize, 12), try fixture.tt.transport().read(&big));
 }
+
+// ── whole-module mutation audit 2026-11-18: in-memory double pins ──────────
+
+test "LoopLink: queue and frame-size limits are exact, pump moves each frame once" {
+    const a = try testing.allocator.create(LoopLink);
+    defer testing.allocator.destroy(a);
+    a.* = .{};
+    const b = try testing.allocator.create(LoopLink);
+    defer testing.allocator.destroy(b);
+    b.* = .{};
+    const full: [2048]u8 = @splat(0x5A);
+    const over: [2049]u8 = @splat(0x5A);
+    // send: 2048 octets fit, 2049 do not.
+    try a.link().send(&full);
+    try testing.expectError(error.SendFailed, a.link().send(&over));
+    try testing.expectEqual(@as(usize, 1), a.dropped);
+    // pump delivers exactly the one frame, and only once.
+    LoopLink.pump(a, b);
+    LoopLink.pump(a, b);
+    try testing.expectEqual(@as(usize, 1), b.in_count);
+    // recv: a buffer of exactly the frame size takes it; then the queue is empty.
+    var buf: [2048]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2048), try b.link().recv(&buf));
+    try testing.expectEqual(@as(usize, 0), try b.link().recv(&buf));
+    // An empty poll does not skip the next frame.
+    b.deliver("z");
+    try testing.expectEqual(@as(usize, 1), try b.link().recv(&buf));
+    try testing.expectEqual(@as(u8, 'z'), buf[0]);
+    // deliver: oversized frames and a full queue are counted, not stored.
+    b.deliver(&over);
+    try testing.expectEqual(@as(usize, 1), b.dropped);
+    while (b.in_count < b.in.len) b.deliver("x");
+    b.deliver("y");
+    try testing.expectEqual(@as(usize, 2), b.dropped);
+    // recv into a buffer smaller than the frame is an error.
+    var small: [0]u8 = undefined;
+    try testing.expectError(error.RecvFailed, b.link().recv(&small));
+}
