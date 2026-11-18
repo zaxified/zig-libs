@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog: one item marked done in place (verified in code): DONE 2026-09-13 (`Options.max_heap_bytes`, default 64 MiB, `error.HeapBudgetExceeded`, modules/yaml/src/compose.zig:374, commit f978099bc).
 - **2026-11-16** — Explicit `!!set` (mapping, all values null) and `!!omap` (sequence of single-pair mappings, no repeated key) are validated; malformed is `error.BadTaggedScalar`. The composed value is unchanged (mapping / sequence). **Behaviour change:** these tags with a wrong shape used to load silently.
 - **2026-11-16** — `!!binary` keeps its base64 text as the `.string` value (validated on load), as yaml-test-suite 565N
   expects; the bytes come from the new `yaml.decodeBinary`. Supersedes the same day's entry below, which decoded it in place.

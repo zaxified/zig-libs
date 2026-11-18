@@ -462,7 +462,7 @@ consumer needing bignums has the exact text and can parse it itself.
   allocator in a counter that refuses past `max_heap_bytes` (default 64 MiB,
   `null` = off) and reports `error.HeapBudgetExceeded`. It counts bytes
   requested through the allocator — for an arena, what the parse and the tree
-  asked for, not the arena's own page overhead.
+  asked for, not the arena's own page overhead. ✅ DONE 2026-09-13 (`Options.max_heap_bytes`, default 64 MiB, `error.HeapBudgetExceeded`, modules/yaml/src/compose.zig:374, commit f978099bc).
 
 ## Anchoring
 
