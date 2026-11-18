@@ -24,6 +24,7 @@ const Sha384 = std.crypto.hash.sha2.Sha384;
 // test-only import should not move it.
 test {
     _ = @import("stackprobe_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 // ── REAL: pssEncode byte-exact against RFC 9474 Appendix A ─────────────
