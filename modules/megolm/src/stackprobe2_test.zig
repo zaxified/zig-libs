@@ -65,3 +65,43 @@ test "STACKPROBE: megolm MAC and outbound pickle codec leave no key residue" {
     _ = try P.run("openOutbound", pickle.openOutbound, .{ &sealed, &pickle_key, &restored }, &[_][]const u8{ &sess.ratchet.data, &seed, &pickle_key, std.mem.asBytes(&restored) }, .{});
     try std.testing.expectEqualSlices(u8, &sess.ratchet.data, &restored.ratchet.data);
 }
+
+// Added by the 2026-11-17 mutation audit: entry points the tests above and the
+// older probe never measured on their own. `advanceStep` is public and burns;
+// `InboundGroupSession.pickleSealed` is the inbound twin of the outbound one.
+// (The `pickle.*` codec functions that are not burned themselves are left
+// unprobed on purpose: a direct call leaves ratchet copies in its frames, the
+// session wrappers' burns are what clear them; see SPEC "Audit 2026-11-17".)
+var in_sess: root.InboundGroupSession = undefined;
+var plain_in: [pickle.inbound_len]u8 = undefined;
+var sealed_in: [pickle.sealed_inbound_len]u8 = undefined;
+
+test "STACKPROBE: megolm advanceStep and the inbound sealed pickle leave no key residue" {
+    try sp.skipUnlessOptimized();
+    label("megolm probe pickle key", &pickle_key);
+    var rdata: [128]u8 = undefined;
+    label("megolm probe ratchet 0", rdata[0..64]);
+    label("megolm probe ratchet 1", rdata[64..]);
+    var seed: [32]u8 = undefined;
+    label("megolm probe signing seed", &seed);
+    root.Ratchet.init(&rdata, 7, &sess.ratchet);
+    sess.signing_key = try Ed25519.KeyPair.generateDeterministic(seed);
+
+    // advanceStep: the ratchet before and after one step are both secret.
+    var r: root.Ratchet = undefined;
+    root.Ratchet.init(&rdata, 7, &r);
+    var next = r;
+    next.advanceStep();
+    const before = rdata;
+    _ = try P.run("Ratchet.advanceStep", root.Ratchet.advanceStep, .{&r}, &[_][]const u8{ &before, &next.data }, .{});
+
+    const exported: root.ExportedSessionKey = .{ .ratchet_index = 7, .ratchet = rdata, .signing_key = sess.signing_key.public_key.toBytes() };
+    try root.InboundGroupSession.fromExportedKey(&exported, &in_sess);
+    _ = in_sess.forgetBefore(9); // initial and latest ratchet differ from the pristine one
+    const sec = &[_][]const u8{ &rdata, &in_sess.initial_ratchet.data, &in_sess.latest_ratchet.data, &pickle_key };
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    _ = try P.run("InboundGroupSession.pickleSealed", root.InboundGroupSession.pickleSealed, .{ &in_sess, io, &pickle_key, &sealed_in }, sec, .{});
+}

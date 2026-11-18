@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (356 mutants over the six source files; 320 killed, 36 equivalent or unobservable, none surviving; no MAC, signature, replay or ratchet mutant survived); thirteen tests in `audit_test.zig` (advanceTo against repeated advanceStep, deinit/secureZero contracts, message-index and varint limits, missing-field errors, share-key guards, forgetBefore/exportAt edges, InvalidPadding, pickle header order) and a stack probe for `Ratchet.advanceStep` and `InboundGroupSession.pickleSealed`, no source change; the card records `mutation 2026-11-17 (320/356, 36 eq)`; the ctgrind source digests are re-pinned (counts unchanged: msg 16, skey 25, pickle 26).
 - **2026-10-17** — **NO CONSUMER-VISIBLE CHANGE:** `OutboundSession.pickleSealed` and `InboundGroupSession.pickleSealed` run under `decrypt_burn`, like `fromSealedPickle` (the stack probe found pickle-key residue).
 
 - **2026-10-17** — The private `src/b64ct.zig` is gone: session keys use the new `b64ct` module (`standard_no_pad`), same accept set and errors. ctgrind `skey` 26 -> 23 in-file (the module declassifies its verdict). No API change.
