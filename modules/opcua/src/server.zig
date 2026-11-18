@@ -1670,7 +1670,7 @@ pub const Connection = struct {
     ) ServerError!void {
         var arena_state = std.heap.ArenaAllocator.init(c.server.allocator);
         defer arena_state.deinit();
-        var ctx: Ctx = .{
+        var ctx: Connection.Ctx = .{
             .conn = c,
             .srv = c.server,
             .arena = arena_state.allocator(),
@@ -3661,6 +3661,8 @@ const TestRig = struct {
     /// ActivateSession) — what the next `ClientSignature` has to cover.
     server_nonce: [32]u8 = @splat(0),
     session_id: encoding.NodeId = services.null_node_id,
+    /// The `RevisedSessionTimeout` of the last `createSessionTimeout`.
+    revised_timeout: f64 = 0,
     /// The user variable every rig exposes (writable Int32, ns=1).
     answer_id: encoding.NodeId = undefined,
     method_id: encoding.NodeId = undefined,
@@ -3777,6 +3779,12 @@ const TestRig = struct {
     }
 
     fn openChannel(rig: *TestRig) !void {
+        return rig.openChannelWith(.issue, .none);
+    }
+
+    /// A SecurityPolicy#None `OpenSecureChannel` of any type/mode (the
+    /// negative cases ask for what the server must refuse).
+    fn openChannelWith(rig: *TestRig, request_type: services.SecurityTokenRequestType, mode: services.MessageSecurityMode) !void {
         const response = try rig.call(
             .open_secure_channel,
             services.type_id.open_secure_channel_request,
@@ -3784,8 +3792,8 @@ const TestRig = struct {
             .{
                 .request_header = rig.channel.nextRequestHeader(services.null_node_id, 10_000),
                 .client_protocol_version = 0,
-                .request_type = .issue,
-                .security_mode = .none,
+                .request_type = request_type,
+                .security_mode = mode,
                 .client_nonce = &.{},
                 .requested_lifetime = 600_000,
             },
@@ -3813,12 +3821,19 @@ const TestRig = struct {
     }
 
     fn createSessionNamed(rig: *TestRig, session_name: []const u8) !void {
+        return rig.createSessionTimeout(session_name, 120_000);
+    }
+
+    /// `CreateSession` asking for `requested_timeout` ms; the revised value
+    /// lands in `revised_timeout`, and the response must echo the request handle.
+    fn createSessionTimeout(rig: *TestRig, session_name: []const u8, requested_timeout: f64) !void {
+        const request_header = rig.header(services.null_node_id);
         const response = try rig.call(
             .message,
             services.type_id.create_session_request,
             services.CreateSessionRequest,
             .{
-                .request_header = rig.header(services.null_node_id),
+                .request_header = request_header,
                 .client_description = .{
                     .application_uri = "urn:zig-libs:opcua:test-client",
                     .product_uri = "urn:zig-libs:opcua",
@@ -3833,7 +3848,7 @@ const TestRig = struct {
                 .session_name = session_name,
                 .client_nonce = &.{},
                 .client_certificate = null,
-                .requested_session_timeout = 120_000,
+                .requested_session_timeout = requested_timeout,
                 .max_response_message_size = 0,
             },
             services.encodeCreateSessionRequest,
@@ -3843,6 +3858,8 @@ const TestRig = struct {
             services.result_fns.create_session,
         );
         defer services.freeCreateSessionResponse(rig.gpa, response);
+        try testing.expectEqual(request_header.request_handle, response.response_header.request_handle);
+        rig.revised_timeout = response.revised_session_timeout;
         // `freeCreateSessionResponse` leaves SessionId/AuthenticationToken to
         // the caller (the client keeps them past the response — see
         // `root.Session`), so this rig frees them itself.
@@ -8310,8 +8327,12 @@ test "Server session table: lookup length, removal identity, channel release cou
     try t.expectEqual(@as(?*Session, null), rig.srv.findSession(longer));
     try t.expectEqual(@as(?*Session, null), rig.srv.findSession(shorter));
 
-    // channel 0 never matches anything; the rig's channel owns both sessions
+    // channel 0 never matches anything (not even a session that carries id 0);
+    // the rig's channel owns both sessions
+    second.channel_id = 0;
     try t.expectEqual(@as(usize, 0), rig.srv.closeChannelSessions(0));
+    try t.expectEqual(@as(usize, 2), rig.srv.sessions.items.len);
+    second.channel_id = rig.conn.channel_id;
     try t.expectEqual(@as(usize, 2), rig.srv.sessionsOnChannel(rig.conn.channel_id));
 
     // expiry: alive at exactly the timeout, gone one millisecond later
@@ -8574,4 +8595,1729 @@ test "subscriptions: Modify and SetPublishingMode change exactly the stored fiel
     }, services.encodeSetPublishingModeRequest, services.SetPublishingModeResponse, services.type_id.set_publishing_mode_response, services.decodeSetPublishingModeResponse, services.result_fns.set_publishing_mode));
     try t.expectEqual(status.bad_nothing_to_do, rig.channel.last_service_result);
     try t.expect(!sub.publishing_enabled);
+}
+
+// ── wave 6: whole-module mutation, second pass (opcua2) ─────────────────────
+
+/// One raw chunk with an exact body, bypassing the client `Channel`.
+fn feedRaw(rig: *TestRig, msg_type: *const [3]u8, chunk_type: u8, body: []const u8) !void {
+    var frame: [512]u8 = undefined;
+    frame[0..3].* = msg_type.*;
+    frame[3] = chunk_type;
+    std.mem.writeInt(u32, frame[4..8], @intCast(8 + body.len), .little);
+    @memcpy(frame[8..][0..body.len], body);
+    try rig.conn.feed(frame[0 .. 8 + body.len], &rig.server_out.writer, rig.now_ms);
+}
+
+fn words(comptime n: usize, vals: [n]u32) [4 * n]u8 {
+    var out: [4 * n]u8 = undefined;
+    for (vals, 0..) |v, i| std.mem.writeInt(u32, out[4 * i ..][0..4], v, .little);
+    return out;
+}
+
+test "endpointOffers: policy and mode must both match an advertised endpoint" {
+    const only_sign = [_]services.EndpointDescription{secureEndpoint(test_endpoint_url, test_app, .sign, "cert", 10)};
+    const cfg: Config = .{ .endpoints = &only_sign, .users = &test_users };
+    try testing.expect(endpointOffers(cfg, services.security_policy_basic256sha256_uri, .sign));
+    try testing.expect(!endpointOffers(cfg, services.security_policy_basic256sha256_uri, .sign_and_encrypt));
+    try testing.expect(!endpointOffers(cfg, services.security_policy_basic256sha256_uri, .none));
+    try testing.expect(!endpointOffers(cfg, services.security_policy_none_uri, .sign));
+}
+
+test "secure-conversation gate (None): short bodies, channel 0, a foreign channel, a channel-0 OPN, interleaved types, reset assembly" {
+    var reason: [96]u8 = undefined;
+    // a body below the 4-byte SecureChannelId
+    {
+        var rig: TestRig = undefined;
+        try rig.init(testing.allocator, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.handshake();
+        try rig.openChannel();
+        try feedRaw(&rig, "MSG", 'F', &.{ 1, 2, 3 });
+        const e = try readErr(&rig, &reason);
+        try testing.expectEqual(status.bad_tcp_internal_error, e.code);
+        try testing.expectEqualStrings("truncated secure-conversation header", e.reason);
+    }
+    // exactly the channel id: it is the TokenId that is missing
+    {
+        var rig: TestRig = undefined;
+        try rig.init(testing.allocator, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.handshake();
+        try rig.openChannel();
+        try feedRaw(&rig, "MSG", 'F', &words(1, .{rig.conn.channel_id}));
+        const e = try readErr(&rig, &reason);
+        try testing.expectEqual(status.bad_tcp_internal_error, e.code);
+        try testing.expectEqualStrings("truncated symmetric security header", e.reason);
+    }
+    // channel 0 before any OPN, although 0 == the connection's (unset) id
+    {
+        var rig: TestRig = undefined;
+        try rig.init(testing.allocator, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.handshake();
+        try feedRaw(&rig, "MSG", 'F', &words(4, .{ 0, 0, 1, 1 }));
+        const e = try readErr(&rig, &reason);
+        try testing.expectEqual(status.bad_tcp_secure_channel_unknown, e.code);
+        try testing.expectEqualStrings("no such secure channel on this connection", e.reason);
+    }
+    // another channel's id on an open channel
+    {
+        var rig: TestRig = undefined;
+        try rig.init(testing.allocator, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.handshake();
+        try rig.openChannel();
+        try feedRaw(&rig, "MSG", 'F', &words(4, .{ rig.conn.channel_id +% 1, rig.conn.token_id, 1, 1 }));
+        const e = try readErr(&rig, &reason);
+        try testing.expectEqual(status.bad_tcp_secure_channel_unknown, e.code);
+        try testing.expectEqualStrings("no such secure channel on this connection", e.reason);
+    }
+    // an OPN (issue) carries SecureChannelId 0 even on an open channel
+    {
+        var rig: TestRig = undefined;
+        try rig.init(testing.allocator, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.handshake();
+        try rig.openChannel();
+        const first = rig.conn.channel_id;
+        rig.channel.channel_id = 0;
+        try rig.openChannel();
+        try testing.expect(!rig.conn.isClosed());
+        try testing.expect(rig.conn.channel_id != 0);
+        try testing.expect(rig.conn.channel_id != first);
+        try testing.expectEqual(rig.conn.channel_id, rig.channel.channel_id);
+    }
+    // a CLO chunk cannot continue a MSG run with the same request id
+    {
+        var rig: TestRig = undefined;
+        try rig.init(testing.allocator, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.handshake();
+        try rig.openChannel();
+        try feedMsgChunk(&rig, 'C', 5, 10);
+        try testing.expect(!rig.conn.isClosed());
+        try feedRaw(&rig, "CLO", 'F', &words(4, .{ rig.conn.channel_id, rig.conn.token_id, 1, 5 }));
+        const e = try readErr(&rig, &reason);
+        try testing.expectEqual(status.bad_tcp_message_type_invalid, e.code);
+        try testing.expectEqualStrings("interleaved chunk runs are not supported", e.reason);
+    }
+    // the assembly state is back to its idle values after a message and after an abort
+    {
+        var rig: TestRig = undefined;
+        try rig.init(testing.allocator, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.handshake();
+        try rig.openChannel();
+        try feedMsgChunk(&rig, 'C', 7, 10);
+        try testing.expectEqual(@as(?transport.MessageType, .message), rig.conn.msg_type);
+        try testing.expectEqual(@as(u32, 7), rig.conn.msg_request_id);
+        try testing.expectEqual(@as(usize, 1), rig.conn.chunk_count);
+        try feedMsgChunk(&rig, 'A', 7, 0);
+        try testing.expectEqual(@as(?transport.MessageType, null), rig.conn.msg_type);
+        try testing.expectEqual(@as(u32, 0), rig.conn.msg_request_id);
+        try testing.expectEqual(@as(usize, 0), rig.conn.chunk_count);
+        try testing.expectEqual(@as(usize, 0), rig.conn.msg_len);
+        try feedMsgChunk(&rig, 'C', 9, 10);
+        try feedMsgChunk(&rig, 'F', 9, 10);
+        try testing.expectEqual(@as(?transport.MessageType, null), rig.conn.msg_type);
+        try testing.expectEqual(@as(u32, 0), rig.conn.msg_request_id);
+        try testing.expectEqual(@as(usize, 0), rig.conn.chunk_count);
+    }
+}
+
+test "send side: the sequence number wraps exactly 1024 below the maximum, and a response may use exactly max_chunk_count chunks" {
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.handshake();
+    const top = std.math.maxInt(u32);
+    rig.conn.send_sequence_number = top - 1025;
+    try testing.expectEqual(@as(u32, top - 1024), rig.conn.nextSequenceNumber());
+    rig.conn.send_sequence_number = top - 1024;
+    try testing.expectEqual(@as(u32, 1), rig.conn.nextSequenceNumber());
+    try testing.expectEqual(@as(u32, 2), rig.conn.nextSequenceNumber());
+
+    rig.conn.limits.send_buffer_size = 8192;
+    rig.conn.limits.max_chunk_count = 2;
+    const per_chunk = 8192 - symmetric_overhead;
+    const payload = try testing.allocator.alloc(u8, 2 * per_chunk + 1);
+    defer testing.allocator.free(payload);
+    @memset(payload, 0x55);
+    try rig.conn.sendMessage(&rig.server_out.writer, .message, 3, payload[0 .. 2 * per_chunk]);
+    // two chunks of exactly the send buffer each
+    try testing.expectEqual(@as(usize, 2 * 8192), rig.server_out.written().len);
+    try testing.expectError(error.ResponseTooLarge, rig.conn.sendMessage(&rig.server_out.writer, .message, 3, payload));
+}
+
+test "secure: closing the channel (deinit) clears the ids, the token deadline, the certificate and both key sets" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x61)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var rig: TestRig = undefined;
+    try rig.init(gpa, secureTestConfig(endpoints, pki));
+    defer rig.deinit();
+    try rig.connectSecure(.sign_and_encrypt, pki);
+    rig.now_ms = 1_000;
+    _ = try rig.openChannelSecure(.sign_and_encrypt, .renew, 600_000);
+    try testing.expect(rig.conn.channel_id != 0 and rig.conn.token_id != 0 and rig.conn.prev_token_id != 0);
+    try testing.expect(rig.conn.prev_token_valid_until_ms != 0);
+    try testing.expect(rig.conn.client_certificate != null and rig.conn.keys != null and rig.conn.prev_keys != null);
+    const channel = rig.conn.channel_id;
+    try testing.expectEqual(@as(usize, 1), rig.srv.sessionsOnChannel(channel));
+
+    rig.conn.deinit();
+    try testing.expectEqual(@as(u32, 0), rig.conn.channel_id);
+    try testing.expectEqual(@as(u32, 0), rig.conn.token_id);
+    try testing.expectEqual(@as(u32, 0), rig.conn.prev_token_id);
+    try testing.expectEqual(@as(i64, 0), rig.conn.prev_token_valid_until_ms);
+    try testing.expect(rig.conn.client_certificate == null);
+    try testing.expect(rig.conn.keys == null);
+    try testing.expect(rig.conn.prev_keys == null);
+    try testing.expectEqual(@as(usize, 0), rig.srv.sessionsOnChannel(channel));
+}
+
+test "secure: token lifetime boundary, token 0 never rides on an unset previous token, short secure bodies, a replayed renewal" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x62)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var rig: TestRig = undefined;
+    try rig.init(gpa, secureTestConfig(endpoints, pki));
+    defer rig.deinit();
+    try rig.connectSecure(.sign, pki);
+    var reason: [96]u8 = undefined;
+
+    // tokenExpired: strictly after the lifetime, only when secured, only when a lifetime is set
+    rig.conn.token_created_ms = 100;
+    rig.conn.token_lifetime_ms = 50;
+    try testing.expect(!rig.conn.tokenExpired(150));
+    try testing.expect(rig.conn.tokenExpired(151));
+    rig.conn.token_lifetime_ms = 0;
+    try testing.expect(!rig.conn.tokenExpired(1_000_000));
+    rig.conn.token_lifetime_ms = 50;
+    rig.conn.sec_mode = .none;
+    try testing.expect(!rig.conn.tokenExpired(1_000_000));
+    rig.conn.sec_mode = .sign;
+    rig.conn.token_created_ms = 0;
+    rig.conn.token_lifetime_ms = 600_000;
+
+    // token 0 with prev_token_id 0 and now <= prev_token_valid_until_ms (0)
+    try testing.expectEqual(@as(u32, 0), rig.conn.prev_token_id);
+    try feedRaw(&rig, "MSG", 'F', &(words(2, .{ rig.conn.channel_id, 0 }) ++ words(4, .{ 1, 2, 3, 4 })));
+    const e = try readErr(&rig, &reason);
+    try testing.expectEqual(status.bad_secure_channel_token_unknown, e.code);
+    try testing.expectEqualStrings("unknown or expired security token", e.reason);
+}
+
+test "secure: a secured chunk body of 6 bytes is truncated, one of exactly 8 gets as far as the signature" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x63)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var reason: [96]u8 = undefined;
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.connectSecure(.sign, pki);
+        try feedRaw(&rig, "MSG", 'F', &.{ 1, 0, 0, 0, 9, 9 });
+        const e = try readErr(&rig, &reason);
+        try testing.expectEqual(status.bad_tcp_internal_error, e.code);
+        try testing.expectEqualStrings("truncated symmetric security header", e.reason);
+    }
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.connectSecure(.sign, pki);
+        try feedRaw(&rig, "MSG", 'F', &words(2, .{ rig.conn.channel_id, rig.conn.token_id }));
+        const e = try readErr(&rig, &reason);
+        try testing.expectEqual(status.bad_security_checks_failed, e.code);
+    }
+}
+
+test "secure: a replayed OpenSecureChannel renewal is refused by its SequenceNumber (the renewal continues the count)" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x64)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var rig: TestRig = undefined;
+    try rig.init(gpa, secureTestConfig(endpoints, pki));
+    defer rig.deinit();
+    try rig.connectSecure(.sign, pki);
+    var nonce: [32]u8 = @splat(0x42);
+    rig.channel.security.?.mode = .sign;
+    rig.channel.sendService(.open_secure_channel, services.type_id.open_secure_channel_request, services.OpenSecureChannelRequest, .{
+        .request_header = rig.channel.nextRequestHeader(services.null_node_id, 10_000),
+        .client_protocol_version = 0,
+        .request_type = .renew,
+        .security_mode = .sign,
+        .client_nonce = &nonce,
+        .requested_lifetime = 600_000,
+    }, services.encodeOpenSecureChannelRequest) catch unreachable;
+    const captured = try gpa.dupe(u8, rig.client_out.written());
+    defer gpa.free(captured);
+    try rig.pump();
+    try testing.expect(!rig.conn.isClosed());
+    rig.clearServerOut();
+    try rig.conn.feed(captured, &rig.server_out.writer, rig.now_ms);
+    try rig.expectTransportError(status.bad_security_checks_failed);
+}
+
+test "OpenSecureChannel (None): a foreign body type, a mode mismatch, a renewal without a channel, id wraps and state resets" {
+    var reason: [96]u8 = undefined;
+    // an OPN chunk whose body is some other service
+    {
+        var rig: TestRig = undefined;
+        try rig.init(testing.allocator, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.handshake();
+        var nb: [16]u8 = undefined;
+        var nw: std.Io.Writer = .fixed(&nb);
+        var e = encoding.Encoder.init(&nw);
+        try e.encodeNodeId(services.type_id.read_request);
+        var body: [128]u8 = undefined;
+        var bw: std.Io.Writer = .fixed(&body);
+        try bw.writeInt(u32, 0, .little);
+        try bw.writeInt(i32, @intCast(services.security_policy_none_uri.len), .little);
+        try bw.writeAll(services.security_policy_none_uri);
+        try bw.writeInt(i32, -1, .little);
+        try bw.writeInt(i32, -1, .little);
+        try bw.writeInt(u32, 1, .little);
+        try bw.writeInt(u32, 1, .little);
+        try bw.writeAll(nw.buffered());
+        try feedRaw(&rig, "OPN", 'F', bw.buffered());
+        const err = try readErr(&rig, &reason);
+        try testing.expectEqual(status.bad_tcp_message_type_invalid, err.code);
+        try testing.expectEqualStrings("OPN chunk carrying a non-OpenSecureChannel body", err.reason);
+    }
+    // SecurityPolicy#None cannot carry a secured mode
+    {
+        var rig: TestRig = undefined;
+        try rig.init(testing.allocator, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.handshake();
+        try expectFault(&rig, status.bad_security_mode_rejected, rig.openChannelWith(.issue, .sign));
+    }
+    // a renewal needs a channel to renew
+    {
+        var rig: TestRig = undefined;
+        try rig.init(testing.allocator, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.handshake();
+        try expectFault(&rig, status.bad_secure_channel_id_invalid, rig.openChannelWith(.renew, .none));
+        try testing.expectEqual(@as(u32, 0), rig.conn.channel_id);
+        try testing.expectEqual(@as(u32, 0), rig.conn.token_id);
+    }
+    // channel and token ids wrap to 1, never to 0; an issue restarts the send count
+    {
+        var rig: TestRig = undefined;
+        try rig.init(testing.allocator, TestRig.defaultConfig());
+        defer rig.deinit();
+        rig.srv.next_channel_id = std.math.maxInt(u32);
+        rig.srv.next_token_id = std.math.maxInt(u32);
+        try rig.handshake();
+        try rig.openChannel();
+        try testing.expectEqual(@as(u32, std.math.maxInt(u32)), rig.conn.channel_id);
+        try testing.expectEqual(@as(u32, std.math.maxInt(u32)), rig.conn.token_id);
+        try testing.expectEqual(@as(u32, 1), rig.srv.next_channel_id);
+        try testing.expectEqual(@as(u32, 1), rig.srv.next_token_id);
+        const first_sequence = rig.conn.send_sequence_number;
+        rig.conn.send_sequence_number = 77;
+        try rig.openChannel();
+        try testing.expectEqual(first_sequence, rig.conn.send_sequence_number);
+    }
+    // a #None renewal re-keys nothing: it records no previous token
+    {
+        var rig: TestRig = undefined;
+        try rig.init(testing.allocator, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.handshake();
+        try rig.openChannel();
+        const old_token = rig.conn.token_id;
+        try rig.openChannelWith(.renew, .none);
+        try testing.expect(rig.conn.token_id != old_token);
+        try testing.expectEqual(@as(u32, 0), rig.conn.prev_token_id);
+        try testing.expectEqual(@as(i64, 0), rig.conn.prev_token_valid_until_ms);
+    }
+}
+
+test "OpenSecureChannel (secured): an issue drops the previous token, a renewal of a channel without a token records none, the client rebases on an issue only" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x65)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    // a re-issue clears the overlap token
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.connectSecure(.sign, pki);
+        rig.now_ms = 1_000;
+        _ = try rig.openChannelSecure(.sign, .renew, 600_000);
+        try testing.expect(rig.conn.prev_keys != null and rig.conn.prev_token_id != 0);
+        rig.channel.channel_id = 0;
+        _ = try rig.openChannelSecure(.sign, .issue, 600_000);
+        try testing.expect(rig.conn.prev_keys == null);
+        try testing.expectEqual(@as(u32, 0), rig.conn.prev_token_id);
+        try testing.expectEqual(@as(i64, 0), rig.conn.prev_token_valid_until_ms);
+    }
+    // token 0 is no token to keep for an overlap
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.connectSecure(.sign, pki);
+        rig.conn.token_id = 0;
+        rig.now_ms = 1_000;
+        _ = try rig.openChannelSecure(.sign, .renew, 600_000);
+        try testing.expectEqual(@as(u32, 0), rig.conn.prev_token_id);
+        try testing.expect(rig.conn.prev_keys == null);
+        try testing.expectEqual(@as(i64, 0), rig.conn.prev_token_valid_until_ms);
+    }
+    // client side (services.Channel.recvService): the response to an issue restarts the count, a renewal's continues it
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign, pki.client, pki.server.certificate_der);
+        rig.channel.recv_sequence_number = 5000;
+        _ = try rig.openChannelSecure(.sign, .issue, 600_000);
+        try testing.expect(rig.channel.recv_sequence_number.? != 5000);
+        rig.channel.recv_sequence_number = 5000;
+        try testing.expectError(error.SequenceNumberInvalid, rig.openChannelSecure(.sign, .renew, 600_000));
+    }
+}
+
+test "CreateSession/ActivateSession: handle echo, timeout revision, session id wrap, a no-body identity is anonymous, activity refresh, unsupported-service fault handle" {
+    const gpa = testing.allocator;
+    // timeout 0 and NaN mean the server maximum, not the minimum
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.handshake();
+        try rig.openChannel();
+        try rig.createSessionTimeout("zero", 0);
+        try testing.expectEqual(rig.srv.config.max_session_timeout_ms, rig.revised_timeout);
+        try rig.createSessionTimeout("nan", std.math.nan(f64));
+        try testing.expectEqual(rig.srv.config.max_session_timeout_ms, rig.revised_timeout);
+        try rig.createSessionTimeout("one", 1);
+        try testing.expectEqual(rig.srv.config.min_session_timeout_ms, rig.revised_timeout);
+    }
+    // the session id counter wraps to 1, never to 0
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, TestRig.defaultConfig());
+        defer rig.deinit();
+        rig.srv.next_session_id = std.math.maxInt(u32);
+        try rig.handshake();
+        try rig.openChannel();
+        try rig.createSession();
+        try testing.expectEqual(@as(u32, std.math.maxInt(u32)), rig.srv.sessions.items[0].numeric_id);
+        try testing.expectEqual(@as(u32, 1), rig.srv.next_session_id);
+    }
+    // a no-body ExtensionObject is Anonymous whatever type id it names
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.connect();
+        var ctx: Connection.Ctx = .{
+            .conn = &rig.conn,
+            .srv = &rig.srv,
+            .arena = gpa,
+            .out = &rig.server_out.writer,
+            .now_ms = 0,
+            .request_id = 0,
+            .message_type = .message,
+        };
+        const token: encoding.ExtensionObject = .{
+            .type_id = services.type_id.user_name_identity_token,
+            .encoding = .no_body,
+            .body = "junk",
+        };
+        try testing.expectEqual(status.good, rig.conn.checkIdentity(&ctx, rig.srv.sessions.items[0], token));
+    }
+    // a service request refreshes the session's activity time
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.connect();
+        try testing.expectEqual(@as(i64, 0), rig.srv.sessions.items[0].last_activity_ms);
+        rig.now_ms = 5_000;
+        try readAnswer(&rig);
+        try testing.expectEqual(@as(i64, 5_000), rig.srv.sessions.items[0].last_activity_ms);
+    }
+    // an unimplemented service is answered with a fault that echoes the RequestHandle
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.connect();
+        const request_header = rig.header(rig.authToken());
+        try rig.channel.sendService(.message, .{ .numeric = .{ .namespace = 0, .id = 9999 } }, services.ReadRequest, .{
+            .request_header = request_header,
+            .max_age = 0,
+            .timestamps_to_return = .both,
+            .nodes_to_read = &.{},
+        }, services.encodeReadRequest);
+        try rig.pump();
+        rig.aimReader();
+        var buf: [512]u8 = undefined;
+        const chunk = try rig.client_conn.recvChunk(&buf);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var r: std.Io.Reader = .fixed(chunk.body[16..]);
+        var d = encoding.Decoder.init(&r, arena.allocator());
+        const type_id = try d.decodeNodeId();
+        try testing.expect(services.nodeIdEql(type_id, services.type_id.service_fault));
+        const fault = try services.decodeServiceFault(&d);
+        try testing.expectEqual(status.bad_service_unsupported, fault.response_header.service_result);
+        try testing.expectEqual(request_header.request_handle, fault.response_header.request_handle);
+    }
+}
+
+// ── opcua2: Read / Write / Browse / BrowseNext / Translate / Call ───────────
+
+fn readNodes(rig: *TestRig, nodes: []const services.ReadValueId) !services.ReadResponse {
+    return rig.call(.message, services.type_id.read_request, services.ReadRequest, .{
+        .request_header = rig.header(rig.authToken()),
+        .max_age = 0,
+        .timestamps_to_return = .both,
+        .nodes_to_read = nodes,
+    }, services.encodeReadRequest, services.ReadResponse, services.type_id.read_response, services.decodeReadResponse, services.result_fns.read);
+}
+
+fn readValueId(node: encoding.NodeId, attribute: u32, range: ?[]const u8, enc_name: ?[]const u8) services.ReadValueId {
+    return .{ .node_id = node, .attribute_id = attribute, .index_range = range, .data_encoding = .{ .namespace_index = 0, .name = enc_name } };
+}
+
+fn writeNodes(rig: *TestRig, nodes: []const services.WriteValue) !services.WriteResponse {
+    return rig.call(.message, services.type_id.write_request, services.WriteRequest, .{
+        .request_header = rig.header(rig.authToken()),
+        .nodes_to_write = nodes,
+    }, services.encodeWriteRequest, services.WriteResponse, services.type_id.write_response, services.decodeWriteResponse, services.result_fns.write);
+}
+
+fn browseNode(rig: *TestRig, node: encoding.NodeId, direction: services.BrowseDirection, max_refs: u32) !services.BrowseResponse {
+    const descriptions = [_]services.BrowseDescription{.{
+        .node_id = node,
+        .browse_direction = direction,
+        .reference_type_id = services.null_node_id,
+        .include_subtypes = true,
+        .node_class_mask = 0,
+        .result_mask = nodestore.result_mask.all,
+    }};
+    return rig.call(
+        .message,
+        services.type_id.browse_request,
+        services.BrowseRequest,
+        .{ .request_header = rig.header(rig.authToken()), .view = services.no_view, .requested_max_references_per_node = max_refs, .nodes_to_browse = &descriptions },
+        services.encodeBrowseRequest,
+        services.BrowseResponse,
+        services.type_id.browse_response,
+        services.decodeBrowseResponse,
+        services.result_fns.browse,
+    );
+}
+
+fn browseNextPoints(rig: *TestRig, handle: u32, points: []const ?[]const u8) !services.BrowseNextResponse {
+    var h = rig.header(rig.authToken());
+    h.request_handle = handle;
+    return rig.call(
+        .message,
+        services.type_id.browse_next_request,
+        services.BrowseNextRequest,
+        .{ .request_header = h, .release_continuation_points = false, .continuation_points = points },
+        services.encodeBrowseNextRequest,
+        services.BrowseNextResponse,
+        services.type_id.browse_next_response,
+        services.decodeBrowseNextResponse,
+        services.result_fns.browse_next,
+    );
+}
+
+fn translatePaths(rig: *TestRig, handle: u32, paths: []const services.BrowsePath) !services.TranslateBrowsePathsToNodeIdsResponse {
+    var h = rig.header(rig.authToken());
+    h.request_handle = handle;
+    return rig.call(
+        .message,
+        services.type_id.translate_browse_paths_to_node_ids_request,
+        services.TranslateBrowsePathsToNodeIdsRequest,
+        .{ .request_header = h, .browse_paths = paths },
+        services.encodeTranslateBrowsePathsToNodeIdsRequest,
+        services.TranslateBrowsePathsToNodeIdsResponse,
+        services.type_id.translate_browse_paths_to_node_ids_response,
+        services.decodeTranslateBrowsePathsToNodeIdsResponse,
+        services.result_fns.translate_browse_paths_to_node_ids,
+    );
+}
+
+fn callMethods(rig: *TestRig, calls: []const services.CallMethodRequest) !services.CallResponse {
+    return rig.call(.message, services.type_id.call_request, services.CallRequest, .{
+        .request_header = rig.header(rig.authToken()),
+        .methods_to_call = calls,
+    }, services.encodeCallRequest, services.CallResponse, services.type_id.call_response, services.decodeCallResponse, services.result_fns.call);
+}
+
+fn noopMethod(
+    user_context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    inputs: []const encoding.Variant,
+    outputs: *std.ArrayList(encoding.Variant),
+) std.mem.Allocator.Error!encoding.StatusCode {
+    _ = .{ user_context, allocator, inputs, outputs };
+    return status.good;
+}
+
+test "read/write: the attribute id is checked before the node, index ranges and data encodings are refused by name" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const val = services.attribute_id.value;
+    const ghost: encoding.NodeId = .{ .numeric = .{ .namespace = 1, .id = 99_999 } };
+
+    const reads = [_]services.ReadValueId{
+        readValueId(ghost, 0, null, null),
+        readValueId(ghost, 28, null, null),
+        readValueId(rig.answer_id, val, "1", null),
+        readValueId(rig.answer_id, val, "", null),
+        readValueId(rig.answer_id, val, null, ""),
+        readValueId(rig.answer_id, val, null, "Default Binary"),
+        readValueId(rig.answer_id, val, null, "Default XML"),
+        readValueId(ghost, val, null, null),
+    };
+    const r = try readNodes(&rig, &reads);
+    defer services.freeReadResponse(gpa, r);
+    const res = r.results.?;
+    try testing.expectEqual(status.bad_attribute_id_invalid, res[0].status.?);
+    try testing.expectEqual(status.bad_attribute_id_invalid, res[1].status.?);
+    try testing.expectEqual(status.bad_index_range_invalid, res[2].status.?);
+    try testing.expect(res[3].value != null);
+    try testing.expect(res[4].value != null);
+    try testing.expect(res[5].value != null);
+    try testing.expectEqual(status.bad_data_encoding_invalid, res[6].status.?);
+    try testing.expectEqual(status.bad_node_id_unknown, res[7].status.?);
+
+    const int5: encoding.DataValue = .{ .value = .{ .scalar = .{ .int32 = 5 } } };
+    const writes = [_]services.WriteValue{
+        .{ .node_id = ghost, .attribute_id = 0, .index_range = null, .value = int5 },
+        .{ .node_id = ghost, .attribute_id = 28, .index_range = null, .value = int5 },
+        .{ .node_id = rig.answer_id, .attribute_id = val, .index_range = "1", .value = int5 },
+        .{ .node_id = ghost, .attribute_id = val, .index_range = null, .value = int5 },
+    };
+    const w = try writeNodes(&rig, &writes);
+    defer services.freeWriteResponse(gpa, w);
+    try testing.expectEqual(status.bad_attribute_id_invalid, w.results.?[0]);
+    try testing.expectEqual(status.bad_attribute_id_invalid, w.results.?[1]);
+    try testing.expectEqual(status.bad_index_range_invalid, w.results.?[2]);
+    try testing.expectEqual(status.bad_node_id_unknown, w.results.?[3]);
+    // the refused ranged write did not touch the value
+    const back = try readNodes(&rig, reads[3..4]);
+    defer services.freeReadResponse(gpa, back);
+    try testing.expectEqual(@as(i32, 42), back.results.?[0].value.?.scalar.int32);
+}
+
+test "applyTimestamps: each TimestampsToReturn keeps and clears exactly its fields" {
+    const dv: encoding.DataValue = .{
+        .value = .{ .scalar = .{ .int32 = 1 } },
+        .status = 0,
+        .source_timestamp = 11,
+        .source_pico_seconds = 12,
+        .server_timestamp = 13,
+        .server_pico_seconds = 14,
+    };
+    const now: encoding.DateTime = 99;
+    const s = Connection.applyTimestamps(dv, .source, now);
+    try testing.expectEqual(@as(?encoding.DateTime, 11), s.source_timestamp);
+    try testing.expectEqual(@as(?u16, 12), s.source_pico_seconds);
+    try testing.expectEqual(@as(?encoding.DateTime, null), s.server_timestamp);
+    try testing.expectEqual(@as(?u16, null), s.server_pico_seconds);
+    const v = Connection.applyTimestamps(dv, .server, now);
+    try testing.expectEqual(@as(?encoding.DateTime, null), v.source_timestamp);
+    try testing.expectEqual(@as(?u16, null), v.source_pico_seconds);
+    try testing.expectEqual(@as(?encoding.DateTime, 99), v.server_timestamp);
+    try testing.expectEqual(@as(?u16, 14), v.server_pico_seconds);
+    const b = Connection.applyTimestamps(dv, .both, now);
+    try testing.expectEqual(@as(?encoding.DateTime, 11), b.source_timestamp);
+    try testing.expectEqual(@as(?u16, 12), b.source_pico_seconds);
+    try testing.expectEqual(@as(?encoding.DateTime, 99), b.server_timestamp);
+    try testing.expectEqual(@as(?u16, 14), b.server_pico_seconds);
+    const n = Connection.applyTimestamps(dv, .neither, now);
+    try testing.expectEqual(@as(?encoding.DateTime, null), n.source_timestamp);
+    try testing.expectEqual(@as(?u16, null), n.source_pico_seconds);
+    try testing.expectEqual(@as(?encoding.DateTime, null), n.server_timestamp);
+    try testing.expectEqual(@as(?u16, null), n.server_pico_seconds);
+}
+
+test "browse: a dangling reference target is listed without a name, continuation handles are distinct and wrap to 1" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const dangling: encoding.NodeId = .{ .numeric = .{ .namespace = 1, .id = 424_242 } };
+    try rig.store.addReference(rig.device_id, nodestore.n0(nodestore.id.organizes), dangling);
+    {
+        const r = try browseNode(&rig, rig.device_id, .forward, 0);
+        defer services.freeBrowseResponse(gpa, r);
+        var seen = false;
+        for (r.results.?[0].references.?) |ref| {
+            if (!services.nodeIdEql(ref.node_id.node_id, dangling)) continue;
+            seen = true;
+            try testing.expectEqual(@as(?[]const u8, null), ref.browse_name.name);
+            try testing.expectEqual(@as(?[]const u8, null), ref.display_name.text);
+        }
+        try testing.expect(seen);
+    }
+    // two truncated browses get two different continuation points
+    const objects = nodestore.n0(nodestore.id.objects_folder);
+    const a = try browseNode(&rig, objects, .both, 1);
+    defer services.freeBrowseResponse(gpa, a);
+    const b = try browseNode(&rig, objects, .both, 1);
+    defer services.freeBrowseResponse(gpa, b);
+    const pa = a.results.?[0].continuation_point.?;
+    const pb = b.results.?[0].continuation_point.?;
+    try testing.expect(!std.mem.eql(u8, pa, pb));
+    // the handle counter wraps to 1, never to 0
+    rig.srv.next_continuation_handle = std.math.maxInt(u32);
+    const c = try browseNode(&rig, objects, .both, 1);
+    defer services.freeBrowseResponse(gpa, c);
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), std.mem.readInt(u32, c.results.?[0].continuation_point.?[0..4], .little));
+    try testing.expectEqual(@as(u32, 1), rig.srv.next_continuation_handle);
+}
+
+test "browseNext: list limits are exact, the handle is echoed, a point must be exactly 4 bytes" {
+    const gpa = testing.allocator;
+    var cfg = TestRig.defaultConfig();
+    cfg.max_operations_per_request = 2;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, cfg);
+    defer rig.deinit();
+    try rig.connect();
+    const first = try browseNode(&rig, nodestore.n0(nodestore.id.objects_folder), .both, 1);
+    defer services.freeBrowseResponse(gpa, first);
+    const point = first.results.?[0].continuation_point.?;
+    try testing.expectEqual(@as(usize, 4), point.len);
+
+    try expectFault(&rig, status.bad_nothing_to_do, browseNextPoints(&rig, 1, &.{}));
+    const three = [_]?[]const u8{ point, point, point };
+    try expectFault(&rig, status.bad_too_many_operations, browseNextPoints(&rig, 1, &three));
+
+    var five: [5]u8 = undefined;
+    @memcpy(five[0..4], point);
+    five[4] = 0;
+    const odd = [_]?[]const u8{ five[0..5], null };
+    const r = try browseNextPoints(&rig, 0x1234, &odd);
+    defer services.freeBrowseNextResponse(gpa, r);
+    try testing.expectEqual(@as(u32, 0x1234), r.response_header.request_handle);
+    try testing.expectEqual(@as(usize, 2), r.results.?.len);
+    try testing.expectEqual(status.bad_continuation_point_invalid, r.results.?[0].status_code);
+    try testing.expectEqual(status.bad_continuation_point_invalid, r.results.?[1].status_code);
+    const short = [_]?[]const u8{point[0..3]};
+    const r3 = try browseNextPoints(&rig, 1, &short);
+    defer services.freeBrowseNextResponse(gpa, r3);
+    try testing.expectEqual(status.bad_continuation_point_invalid, r3.results.?[0].status_code);
+    // the genuine point still pages
+    const good = [_]?[]const u8{point};
+    const r4 = try browseNextPoints(&rig, 1, &good);
+    defer services.freeBrowseNextResponse(gpa, r4);
+    try testing.expectEqual(status.good, r4.results.?[0].status_code);
+}
+
+test "translate: list limits are exact and echo the handle; direction, type filter, subtypes, target name and namespace each decide" {
+    const gpa = testing.allocator;
+    const t = testing;
+    {
+        var cfg = TestRig.defaultConfig();
+        cfg.max_operations_per_request = 2;
+        var rig: TestRig = undefined;
+        try rig.init(gpa, cfg);
+        defer rig.deinit();
+        try rig.connect();
+        const element: services.RelativePathElement = .{ .reference_type_id = services.null_node_id, .is_inverse = false, .include_subtypes = true, .target_name = .{ .namespace_index = 0, .name = "Objects" } };
+        const path: services.BrowsePath = .{ .starting_node = nodestore.n0(nodestore.id.root_folder), .relative_path = .{ .elements = &.{element} } };
+        const three = [_]services.BrowsePath{ path, path, path };
+        try expectFault(&rig, status.bad_nothing_to_do, translatePaths(&rig, 1, &.{}));
+        try expectFault(&rig, status.bad_too_many_operations, translatePaths(&rig, 1, &three));
+        const r = try translatePaths(&rig, 0x7777, three[0..2]);
+        defer services.freeTranslateBrowsePathsToNodeIdsResponse(gpa, r);
+        try t.expectEqual(@as(u32, 0x7777), r.response_header.request_handle);
+        try t.expectEqual(status.good, r.results.?[1].status_code);
+    }
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const ghost: encoding.NodeId = .{ .numeric = .{ .namespace = 1, .id = 99_999 } };
+    const hc = nodestore.n0(nodestore.id.has_component);
+    const org = nodestore.n0(nodestore.id.organizes);
+    const hier = nodestore.n0(nodestore.id.hierarchical_references);
+    const E = services.RelativePathElement;
+    const answer_name: encoding.QualifiedName = .{ .namespace_index = 1, .name = "the.answer" };
+    const cases = [_]struct { start: encoding.NodeId, elements: []const E, expect: encoding.StatusCode }{
+        // an unknown start node, and an empty path
+        .{ .start = ghost, .elements = &.{E{ .reference_type_id = hc, .is_inverse = false, .include_subtypes = true, .target_name = answer_name }}, .expect = status.bad_node_id_unknown },
+        .{ .start = rig.device_id, .elements = &.{}, .expect = status.bad_nothing_to_do },
+        // forward, resolved; the same hop asked for as an inverse one is no match
+        .{ .start = rig.device_id, .elements = &.{E{ .reference_type_id = hc, .is_inverse = false, .include_subtypes = true, .target_name = answer_name }}, .expect = status.good },
+        .{ .start = rig.device_id, .elements = &.{E{ .reference_type_id = services.null_node_id, .is_inverse = true, .include_subtypes = true, .target_name = answer_name }}, .expect = status.bad_no_match },
+        // inverse, resolved; without a type filter, and then with the wrong type
+        .{ .start = rig.answer_id, .elements = &.{E{ .reference_type_id = hc, .is_inverse = true, .include_subtypes = true, .target_name = .{ .namespace_index = 1, .name = "Device" } }}, .expect = status.good },
+        .{ .start = rig.device_id, .elements = &.{E{ .reference_type_id = hc, .is_inverse = true, .include_subtypes = true, .target_name = .{ .namespace_index = 0, .name = "Objects" } }}, .expect = status.bad_no_match },
+        .{ .start = rig.device_id, .elements = &.{E{ .reference_type_id = services.null_node_id, .is_inverse = true, .include_subtypes = true, .target_name = .{ .namespace_index = 0, .name = "Objects" } }}, .expect = status.good },
+        // subtypes: HasComponent is a HierarchicalReferences, only when asked for
+        .{ .start = rig.device_id, .elements = &.{E{ .reference_type_id = hier, .is_inverse = false, .include_subtypes = true, .target_name = answer_name }}, .expect = status.good },
+        .{ .start = rig.device_id, .elements = &.{E{ .reference_type_id = hier, .is_inverse = false, .include_subtypes = false, .target_name = answer_name }}, .expect = status.bad_no_match },
+        // an exact type that is not the reference's type
+        .{ .start = rig.device_id, .elements = &.{E{ .reference_type_id = org, .is_inverse = false, .include_subtypes = true, .target_name = answer_name }}, .expect = status.bad_no_match },
+        // the namespace index of the target name matters
+        .{ .start = rig.device_id, .elements = &.{E{ .reference_type_id = hc, .is_inverse = false, .include_subtypes = true, .target_name = .{ .namespace_index = 0, .name = "the.answer" } }}, .expect = status.bad_no_match },
+    };
+    for (cases, 0..) |case, i| {
+        const path = [_]services.BrowsePath{.{ .starting_node = case.start, .relative_path = .{ .elements = case.elements } }};
+        const r = try translatePaths(&rig, 1, &path);
+        defer services.freeTranslateBrowsePathsToNodeIdsResponse(gpa, r);
+        t.expectEqual(case.expect, r.results.?[0].status_code) catch |err| {
+            std.debug.print("translate case {d}\n", .{i});
+            return err;
+        };
+    }
+}
+
+test "call: an unknown object, an inverse link, executable flags, a missing implementation and an empty argument list" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    const ns = rig.method_id.numeric.namespace;
+    const other: encoding.NodeId = .{ .numeric = .{ .namespace = ns, .id = 2000 } };
+    const m_ok: encoding.NodeId = .{ .numeric = .{ .namespace = ns, .id = 2001 } };
+    const m_noexec: encoding.NodeId = .{ .numeric = .{ .namespace = ns, .id = 2002 } };
+    const m_nouser: encoding.NodeId = .{ .numeric = .{ .namespace = ns, .id = 2003 } };
+    const m_noimpl: encoding.NodeId = .{ .numeric = .{ .namespace = ns, .id = 2004 } };
+    try rig.store.addObject(.{ .node_id = other, .parent_id = nodestore.n0(nodestore.id.objects_folder), .browse_name = .{ .namespace_index = ns, .name = "Other" } });
+    try rig.store.addMethod(.{ .node_id = m_ok, .parent_id = rig.device_id, .browse_name = .{ .namespace_index = ns, .name = "Ok" }, .implementation = noopMethod });
+    try rig.store.addMethod(.{ .node_id = m_noexec, .parent_id = rig.device_id, .browse_name = .{ .namespace_index = ns, .name = "NoExec" }, .implementation = noopMethod, .executable = false, .user_executable = true });
+    try rig.store.addMethod(.{ .node_id = m_nouser, .parent_id = rig.device_id, .browse_name = .{ .namespace_index = ns, .name = "NoUser" }, .implementation = noopMethod, .user_executable = false });
+    try rig.store.addMethod(.{ .node_id = m_noimpl, .parent_id = rig.device_id, .browse_name = .{ .namespace_index = ns, .name = "NoImpl" } });
+    // `other` ends up with an inverse reference whose target is the method
+    try rig.store.addReference(rig.method_id, nodestore.n0(nodestore.id.organizes), other);
+    try rig.connect();
+    const ghost: encoding.NodeId = .{ .numeric = .{ .namespace = ns, .id = 99_999 } };
+    const inputs = [_]encoding.Variant{.{ .scalar = .{ .int32 = 21 } }};
+    const calls = [_]services.CallMethodRequest{
+        .{ .object_id = ghost, .method_id = rig.method_id, .input_arguments = &inputs },
+        .{ .object_id = other, .method_id = rig.method_id, .input_arguments = &inputs },
+        .{ .object_id = rig.device_id, .method_id = m_noexec, .input_arguments = null },
+        .{ .object_id = rig.device_id, .method_id = m_nouser, .input_arguments = null },
+        .{ .object_id = rig.device_id, .method_id = m_noimpl, .input_arguments = null },
+        .{ .object_id = rig.device_id, .method_id = m_ok, .input_arguments = null },
+        .{ .object_id = rig.device_id, .method_id = m_ok, .input_arguments = &inputs },
+    };
+    const r = try callMethods(&rig, &calls);
+    defer services.freeCallResponse(gpa, r);
+    const res = r.results.?;
+    try testing.expectEqual(status.bad_node_id_unknown, res[0].status_code);
+    try testing.expectEqual(status.bad_method_invalid, res[1].status_code);
+    try testing.expectEqual(status.bad_not_executable, res[2].status_code);
+    try testing.expectEqual(status.bad_not_executable, res[3].status_code);
+    try testing.expectEqual(status.bad_not_implemented, res[4].status_code);
+    try testing.expectEqual(status.good, res[5].status_code);
+    try testing.expectEqual(@as(?[]const encoding.StatusCode, null), res[5].input_argument_results);
+    try testing.expectEqual(status.good, res[6].status_code);
+    try testing.expectEqual(@as(usize, 1), res[6].input_argument_results.?.len);
+}
+
+// ── opcua2: subscriptions, monitored items and the publish engine ───────────
+
+fn newSub(rig: *TestRig, interval: f64, keep: u32, lifetime: u32, max_notifications: u32, enabled: bool) !services.CreateSubscriptionResponse {
+    return rig.call(.message, services.type_id.create_subscription_request, services.CreateSubscriptionRequest, .{
+        .request_header = rig.header(rig.authToken()),
+        .requested_publishing_interval = interval,
+        .requested_lifetime_count = lifetime,
+        .requested_max_keep_alive_count = keep,
+        .max_notifications_per_publish = max_notifications,
+        .publishing_enabled = enabled,
+        .priority = 0,
+    }, services.encodeCreateSubscriptionRequest, services.CreateSubscriptionResponse, services.type_id.create_subscription_response, services.decodeCreateSubscriptionResponse, services.result_fns.create_subscription);
+}
+
+fn mkItem(node: encoding.NodeId, attribute: u32, handle: u32, mode: services.MonitoringMode, sampling: f64, queue: u32, discard_oldest: bool) services.MonitoredItemCreateRequest {
+    return .{
+        .item_to_monitor = .{ .node_id = node, .attribute_id = attribute, .index_range = null, .data_encoding = .{ .namespace_index = 0, .name = null } },
+        .monitoring_mode = mode,
+        .requested_parameters = .{ .client_handle = handle, .sampling_interval = sampling, .filter = services.no_filter, .queue_size = queue, .discard_oldest = discard_oldest },
+    };
+}
+
+fn callCreateItems(rig: *TestRig, handle: u32, sub_id: u32, ttr: services.TimestampsToReturn, items: []const services.MonitoredItemCreateRequest) !services.CreateMonitoredItemsResponse {
+    var h = rig.header(rig.authToken());
+    h.request_handle = handle;
+    return rig.call(.message, services.type_id.create_monitored_items_request, services.CreateMonitoredItemsRequest, .{
+        .request_header = h,
+        .subscription_id = sub_id,
+        .timestamps_to_return = ttr,
+        .items_to_create = items,
+    }, services.encodeCreateMonitoredItemsRequest, services.CreateMonitoredItemsResponse, services.type_id.create_monitored_items_response, services.decodeCreateMonitoredItemsResponse, services.result_fns.create_monitored_items);
+}
+
+fn mutSub(rig: *TestRig, index: usize) *Subscription {
+    return rig.srv.sessions.items[0].subscriptions.items[index];
+}
+
+fn writeAnswerValue(rig: *TestRig, value: i32) !void {
+    _ = try rig.store.writeAttribute(rig.answer_id, services.attribute_id.value, .{ .value = .{ .scalar = .{ .int32 = value } } }, 0);
+}
+
+fn expectQueue(item: *const MonitoredItem, expected: []const i32) !void {
+    try testing.expectEqual(expected.len, item.queue.items.len);
+    for (expected, item.queue.items) |want, have| try testing.expectEqual(want, have.value.?.scalar.int32);
+}
+
+test "engine: keep-alive, late and lifetime counters move exactly on their boundaries" {
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const created = try newSub(&rig, 100, 3, 9, 0, true);
+    defer services.freeCreateSubscriptionResponse(rig.gpa, created);
+    try testing.expectEqual(@as(u32, 9), created.revised_lifetime_count);
+    const sub = mutSub(&rig, 0);
+    try testing.expectEqual(@as(i64, 100), sub.next_publish_ms);
+
+    try rig.tick(99);
+    try testing.expectEqual(@as(u32, 0), sub.keep_alive_counter);
+    try rig.tick(100);
+    try rig.tick(200);
+    try testing.expectEqual(@as(u32, 2), sub.keep_alive_counter);
+    try testing.expect(sub.pending == .none and !sub.late);
+    // the third cycle reaches MaxKeepAliveCount; nobody is waiting, so the subscription is late
+    try rig.tick(300);
+    try testing.expect(sub.pending == .keep_alive);
+    try testing.expect(sub.late);
+    try testing.expectEqual(@as(u32, 1), sub.lifetime_counter);
+    try rig.tick(400);
+    try testing.expectEqual(@as(u32, 4), sub.keep_alive_counter);
+    try testing.expectEqual(@as(u32, 2), sub.lifetime_counter);
+
+    // a Publish request gets the keep-alive, which resets every counter and announces (does not consume) sequence 1
+    _ = try parkPublish(&rig, &.{});
+    const ka = try readParkedPublish(&rig);
+    defer services.freePublishResponse(rig.gpa, ka);
+    try testing.expectEqual(@as(usize, 0), (ka.notification_message.notification_data orelse @as([]const encoding.ExtensionObject, &.{})).len);
+    try testing.expectEqual(@as(u32, 1), ka.notification_message.sequence_number);
+    try testing.expect(sub.pending == .none and !sub.late);
+    try testing.expectEqual(@as(u32, 0), sub.keep_alive_counter);
+    try testing.expectEqual(@as(u32, 0), sub.lifetime_counter);
+    try testing.expectEqual(@as(u32, 1), sub.next_sequence_number);
+
+    // lifetime 9: late from the third cycle on, deleted exactly when the counter reaches 9
+    try rig.tick(500);
+    try rig.tick(600);
+    try rig.tick(700);
+    try testing.expectEqual(@as(u32, 1), sub.lifetime_counter);
+    var now: i64 = 800;
+    while (now <= 1400) : (now += 100) try rig.tick(now);
+    try testing.expectEqual(@as(usize, 1), rig.srv.sessions.items[0].subscriptions.items.len);
+    try testing.expectEqual(@as(u32, 8), sub.lifetime_counter);
+    try rig.tick(1500);
+    try testing.expectEqual(@as(usize, 0), rig.srv.sessions.items[0].subscriptions.items.len);
+}
+
+test "engine: a long stall runs exactly max_cycles_per_tick cycles and resyncs the clock" {
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const created = try newSub(&rig, 100, 1000, 10_000, 0, true);
+    defer services.freeCreateSubscriptionResponse(rig.gpa, created);
+    const sub = mutSub(&rig, 0);
+    try rig.tick(7000);
+    try testing.expectEqual(@as(u32, max_cycles_per_tick), sub.keep_alive_counter);
+    try testing.expectEqual(@as(i64, 7100), sub.next_publish_ms);
+}
+
+test "engine: sampling deadlines, the disabled mode and the two queue overflow policies" {
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const created = try newSub(&rig, 1000, 1000, 10_000, 0, true);
+    defer services.freeCreateSubscriptionResponse(rig.gpa, created);
+    const sub = mutSub(&rig, 0);
+    const items = [_]services.MonitoredItemCreateRequest{
+        mkItem(rig.answer_id, services.attribute_id.value, 1, .reporting, 100, 10, true),
+        mkItem(rig.answer_id, services.attribute_id.value, 2, .disabled, 100, 10, true),
+        mkItem(rig.answer_id, services.attribute_id.value, 3, .reporting, 100, 2, false),
+        mkItem(rig.answer_id, services.attribute_id.value, 4, .reporting, 100, 2, true),
+    };
+    const r = try callCreateItems(&rig, 1, created.subscription_id, .both, &items);
+    defer services.freeCreateMonitoredItemsResponse(rig.gpa, r);
+    const plain = &sub.monitored_items.items[0];
+    const disabled = &sub.monitored_items.items[1];
+    const keep_oldest = &sub.monitored_items.items[2];
+    const drop_oldest = &sub.monitored_items.items[3];
+    try testing.expectEqual(@as(i64, 100), plain.next_sample_ms);
+    try testing.expectEqual(@as(usize, 0), disabled.queue.items.len);
+
+    try writeAnswerValue(&rig, 7);
+    try rig.tick(50); // not due yet
+    try expectQueue(plain, &.{42});
+    try testing.expectEqual(@as(i64, 100), plain.next_sample_ms);
+    try rig.tick(150); // due: the next deadline stays on the 100 ms grid
+    try expectQueue(plain, &.{ 42, 7 });
+    try testing.expectEqual(@as(i64, 200), plain.next_sample_ms);
+    try expectQueue(disabled, &.{});
+    // the queue policies, one value per sampling instant
+    try writeAnswerValue(&rig, 8);
+    try rig.tick(300); // 200 + 100 lands exactly on `now`: the grid moves on to 400
+    try testing.expectEqual(@as(i64, 400), plain.next_sample_ms);
+    try expectQueue(plain, &.{ 42, 7, 8 });
+    try expectQueue(keep_oldest, &.{ 42, 7 }); // full: the newest sample is dropped
+    try expectQueue(drop_oldest, &.{ 7, 8 }); // full: the oldest sample is dropped
+    try writeAnswerValue(&rig, 9);
+    try rig.tick(400);
+    try expectQueue(keep_oldest, &.{ 42, 7 });
+    try expectQueue(drop_oldest, &.{ 8, 9 });
+    try expectQueue(disabled, &.{});
+}
+
+test "engine: the retransmission queue keeps at most max_retransmission_queue messages, the newest" {
+    var cfg = TestRig.defaultConfig();
+    cfg.max_retransmission_queue = 2;
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, cfg);
+    defer rig.deinit();
+    try rig.connect();
+    const created = try newSub(&rig, 100, 3, 100, 0, true);
+    defer services.freeCreateSubscriptionResponse(rig.gpa, created);
+    const items = [_]services.MonitoredItemCreateRequest{mkItem(rig.answer_id, services.attribute_id.value, 1, .reporting, -1, 10, true)};
+    const r = try callCreateItems(&rig, 1, created.subscription_id, .both, &items);
+    defer services.freeCreateMonitoredItemsResponse(rig.gpa, r);
+    const sub = mutSub(&rig, 0);
+    var k: i64 = 1;
+    while (k <= 3) : (k += 1) {
+        try writeAnswerValue(&rig, @intCast(k));
+        _ = try parkPublish(&rig, &.{});
+        try rig.tick(100 * k);
+        const resp = try readParkedPublish(&rig);
+        defer services.freePublishResponse(rig.gpa, resp);
+        try testing.expectEqual(@as(u32, @intCast(k)), resp.notification_message.sequence_number);
+    }
+    try testing.expectEqual(@as(usize, 2), sub.retransmission.items.len);
+    try testing.expectEqual(@as(u32, 2), sub.retransmission.items[0].sequence_number);
+    try testing.expectEqual(@as(u32, 3), sub.retransmission.items[1].sequence_number);
+}
+
+test "engine: MaxNotificationsPerPublish splits a backlog, sampling-mode items are never reported" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const created = try newSub(&rig, 100, 3, 100, 2, true);
+    defer services.freeCreateSubscriptionResponse(gpa, created);
+    const val = services.attribute_id.value;
+    const items = [_]services.MonitoredItemCreateRequest{
+        mkItem(rig.answer_id, val, 1, .reporting, -1, 10, true),
+        mkItem(rig.answer_id, val, 2, .reporting, -1, 10, true),
+        mkItem(rig.answer_id, val, 3, .reporting, -1, 10, true),
+        mkItem(rig.answer_id, val, 9, .sampling, -1, 10, true),
+    };
+    const r = try callCreateItems(&rig, 1, created.subscription_id, .both, &items);
+    defer services.freeCreateMonitoredItemsResponse(gpa, r);
+    const sub = mutSub(&rig, 0);
+
+    const Probe = struct {
+        fn handles(rg: *TestRig, resp: services.PublishResponse, out: *[4]u32) !usize {
+            const data = resp.notification_message.notification_data.?;
+            var reader: std.Io.Reader = .fixed(data[0].body);
+            var arena = std.heap.ArenaAllocator.init(rg.gpa);
+            defer arena.deinit();
+            var d = encoding.Decoder.init(&reader, arena.allocator());
+            const dcn = try services.decodeDataChangeNotification(&d);
+            const mi = dcn.monitored_items orelse return 0;
+            for (mi, 0..) |m, i| out[i] = m.client_handle;
+            return mi.len;
+        }
+    };
+    var hs: [4]u32 = undefined;
+    _ = try parkPublish(&rig, &.{});
+    try rig.tick(100);
+    const first = try readParkedPublish(&rig);
+    defer services.freePublishResponse(gpa, first);
+    try testing.expect(first.more_notifications);
+    try testing.expectEqual(@as(usize, 2), try Probe.handles(&rig, first, &hs));
+    try testing.expectEqual(@as(u32, 1), hs[0]);
+    try testing.expectEqual(@as(u32, 2), hs[1]);
+    _ = try parkPublish(&rig, &.{});
+    try rig.tick(200);
+    const second = try readParkedPublish(&rig);
+    defer services.freePublishResponse(gpa, second);
+    try testing.expect(!second.more_notifications);
+    try testing.expectEqual(@as(usize, 1), try Probe.handles(&rig, second, &hs));
+    try testing.expectEqual(@as(u32, 3), hs[0]);
+    // the sampling item kept its value
+    try testing.expectEqual(@as(usize, 1), sub.monitored_items.items[3].queue.items.len);
+}
+
+test "engine: a sampling-only or publishing-disabled subscription counts keep-alives; a pending keep-alive stays one even when data arrives" {
+    const gpa = testing.allocator;
+    const val = services.attribute_id.value;
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.connect();
+        const created = try newSub(&rig, 100, 3, 100, 0, true);
+        defer services.freeCreateSubscriptionResponse(gpa, created);
+        const items = [_]services.MonitoredItemCreateRequest{mkItem(rig.answer_id, val, 1, .sampling, -1, 10, true)};
+        const r = try callCreateItems(&rig, 1, created.subscription_id, .both, &items);
+        defer services.freeCreateMonitoredItemsResponse(gpa, r);
+        const sub = mutSub(&rig, 0);
+        try testing.expectEqual(@as(usize, 1), sub.monitored_items.items[0].queue.items.len);
+        try testing.expect(!sub.hasReportable());
+        try rig.tick(100);
+        try testing.expect(sub.pending == .none);
+        try testing.expectEqual(@as(u32, 1), sub.keep_alive_counter);
+    }
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.connect();
+        const created = try newSub(&rig, 100, 3, 100, 0, false);
+        defer services.freeCreateSubscriptionResponse(gpa, created);
+        const items = [_]services.MonitoredItemCreateRequest{mkItem(rig.answer_id, val, 1, .reporting, -1, 10, true)};
+        const r = try callCreateItems(&rig, 1, created.subscription_id, .both, &items);
+        defer services.freeCreateMonitoredItemsResponse(gpa, r);
+        const sub = mutSub(&rig, 0);
+        try testing.expect(sub.hasReportable());
+        try rig.tick(100);
+        try testing.expect(sub.pending == .none); // data is waiting but publishing is disabled
+        try testing.expectEqual(@as(u32, 1), sub.keep_alive_counter);
+        try rig.tick(200);
+        try rig.tick(300);
+        try testing.expect(sub.pending == .keep_alive);
+        _ = try parkPublish(&rig, &.{});
+        const ka = try readParkedPublish(&rig);
+        defer services.freePublishResponse(gpa, ka);
+        try testing.expectEqual(@as(usize, 0), (ka.notification_message.notification_data orelse @as([]const encoding.ExtensionObject, &.{})).len);
+        try testing.expectEqual(@as(u32, 1), ka.notification_message.sequence_number);
+        try testing.expectEqual(@as(u32, 1), sub.next_sequence_number);
+        try testing.expectEqual(@as(usize, 1), sub.monitored_items.items[0].queue.items.len);
+    }
+}
+
+fn expectFaultOf(rig: *TestRig, expected: encoding.StatusCode, handle: u32) !void {
+    rig.aimReader();
+    var buf: [512]u8 = undefined;
+    const chunk = try rig.client_conn.recvChunk(&buf);
+    var arena = std.heap.ArenaAllocator.init(rig.gpa);
+    defer arena.deinit();
+    var r: std.Io.Reader = .fixed(chunk.body[16..]);
+    var d = encoding.Decoder.init(&r, arena.allocator());
+    const type_id = try d.decodeNodeId();
+    try testing.expect(services.nodeIdEql(type_id, services.type_id.service_fault));
+    const fault = try services.decodeServiceFault(&d);
+    try testing.expectEqual(expected, fault.response_header.service_result);
+    try testing.expectEqual(handle, fault.response_header.request_handle);
+    rig.clearServerOut();
+}
+
+test "Publish: a fault echoes the request handle; a connection ticks only its own channel's sessions and does nothing once closed" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    {
+        var h = rig.header(rig.authToken());
+        h.request_handle = 0x55;
+        try rig.channel.sendService(.message, services.type_id.publish_request, services.PublishRequest, .{
+            .request_header = h,
+            .subscription_acknowledgements = null,
+        }, services.encodePublishRequest);
+        try rig.pump();
+        try expectFaultOf(&rig, status.bad_no_subscription, 0x55);
+    }
+    const created = try newSub(&rig, 100, 3, 100, 0, true);
+    defer services.freeCreateSubscriptionResponse(gpa, created);
+    const sub = mutSub(&rig, 0);
+    _ = try parkPublish(&rig, &.{});
+    const recv2 = try gpa.alloc(u8, rig.srv.config.limits.receive_buffer_size);
+    defer gpa.free(recv2);
+    const msg2 = try gpa.alloc(u8, 1 << 16);
+    defer gpa.free(msg2);
+    var other = try Connection.init(&rig.srv, recv2, msg2);
+    defer other.deinit();
+    var out2 = std.Io.Writer.Allocating.init(gpa);
+    defer out2.deinit();
+    // another channel's connection must not run this session's cycles or answer its Publish
+    try other.tick(&out2.writer, 400);
+    try testing.expectEqual(@as(usize, 0), out2.written().len);
+    try testing.expectEqual(@as(u32, 0), sub.keep_alive_counter);
+    try testing.expectEqual(@as(usize, 1), rig.srv.sessions.items[0].publish_queue.items.len);
+    // a closed connection does not even expire other connections' sessions
+    other.state = .closed;
+    try other.tick(&out2.writer, 100_000_000);
+    try testing.expectEqual(@as(usize, 1), rig.srv.sessions.items.len);
+}
+
+test "subscription services: list limits are exact, handles are echoed, ids count up and wrap, delete removes the named one" {
+    const gpa = testing.allocator;
+    const t = testing;
+    var cfg = TestRig.defaultConfig();
+    cfg.max_operations_per_request = 2;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, cfg);
+    defer rig.deinit();
+    try rig.connect();
+    const val = services.attribute_id.value;
+
+    // subscription ids: distinct, and the counter wraps to 1
+    const s1 = try newSub(&rig, 100, 3, 100, 0, true);
+    defer services.freeCreateSubscriptionResponse(gpa, s1);
+    const s2 = try newSub(&rig, 100, 3, 100, 0, true);
+    defer services.freeCreateSubscriptionResponse(gpa, s2);
+    try t.expect(s1.subscription_id != s2.subscription_id);
+    rig.srv.next_subscription_id = std.math.maxInt(u32);
+    const s3 = try newSub(&rig, 100, 3, 100, 0, true);
+    defer services.freeCreateSubscriptionResponse(gpa, s3);
+    try t.expectEqual(@as(u32, std.math.maxInt(u32)), s3.subscription_id);
+    try t.expectEqual(@as(u32, 1), rig.srv.next_subscription_id);
+
+    // CreateMonitoredItems
+    const sub_id = s1.subscription_id;
+    const good = mkItem(rig.answer_id, val, 5, .reporting, 100, 4, true);
+    {
+        const three = [_]services.MonitoredItemCreateRequest{ good, good, good };
+        try expectFault(&rig, status.bad_nothing_to_do, callCreateItems(&rig, 1, sub_id, .both, &.{}));
+        try expectFault(&rig, status.bad_too_many_operations, callCreateItems(&rig, 1, sub_id, .both, &three));
+        try expectFault(&rig, status.bad_timestamps_to_return_invalid, callCreateItems(&rig, 1, sub_id, .invalid, three[0..1]));
+        const r = try callCreateItems(&rig, 0x4242, sub_id, .both, three[0..2]);
+        defer services.freeCreateMonitoredItemsResponse(gpa, r);
+        try t.expectEqual(@as(u32, 0x4242), r.response_header.request_handle);
+        try t.expectEqual(status.good, r.results.?[0].status_code);
+        try t.expect(r.results.?[0].monitored_item_id != r.results.?[1].monitored_item_id);
+    }
+    const sub = mutSub(&rig, 0);
+    try t.expectEqual(@as(usize, 2), sub.monitored_items.items.len);
+    const item_a = sub.monitored_items.items[0].id;
+    const item_b = sub.monitored_items.items[1].id;
+
+    // per-item refusals of CreateMonitoredItems
+    {
+        const ghost: encoding.NodeId = .{ .numeric = .{ .namespace = 1, .id = 99_999 } };
+        var filtered = mkItem(rig.answer_id, val, 5, .reporting, 100, 4, true);
+        filtered.requested_parameters.filter = .{ .type_id = services.type_id.anonymous_identity_token, .encoding = .byte_string, .body = "x" };
+        var empty_filter = filtered;
+        empty_filter.requested_parameters.filter.body = "";
+        const cases = [_]struct { item: services.MonitoredItemCreateRequest, expect: encoding.StatusCode }{
+            .{ .item = mkItem(ghost, 0, 5, .reporting, 100, 4, true), .expect = status.bad_attribute_id_invalid },
+            .{ .item = mkItem(ghost, 28, 5, .reporting, 100, 4, true), .expect = status.bad_attribute_id_invalid },
+            .{ .item = mkItem(ghost, val, 5, .reporting, 100, 4, true), .expect = status.bad_node_id_unknown },
+            .{ .item = mkItem(rig.device_id, val, 5, .reporting, 100, 4, true), .expect = status.bad_attribute_id_invalid },
+            .{ .item = filtered, .expect = status.bad_monitored_item_filter_unsupported },
+            .{ .item = empty_filter, .expect = status.good },
+        };
+        for (cases, 0..) |case, i| {
+            const one = [_]services.MonitoredItemCreateRequest{case.item};
+            const r = try callCreateItems(&rig, 1, sub_id, .both, &one);
+            defer services.freeCreateMonitoredItemsResponse(gpa, r);
+            t.expectEqual(case.expect, r.results.?[0].status_code) catch |err| {
+                std.debug.print("create item case {d}\n", .{i});
+                return err;
+            };
+        }
+    }
+    // the filter check also runs when called directly, with a no-body filter that nevertheless carries bytes
+    {
+        var ctx: Connection.Ctx = .{ .conn = &rig.conn, .srv = &rig.srv, .arena = gpa, .out = &rig.server_out.writer, .now_ms = 0, .request_id = 0, .message_type = .message };
+        var spec = mkItem(rig.answer_id, val, 5, .reporting, 100, 4, true);
+        spec.requested_parameters.filter = .{ .type_id = services.null_node_id, .encoding = .no_body, .body = "x" };
+        const direct = try Connection.createMonitoredItem(&ctx, sub, spec, .both);
+        try t.expectEqual(status.good, direct.status_code);
+    }
+
+    // monitored item ids: distinct, and the counter wraps to 1
+    rig.srv.next_monitored_item_id = std.math.maxInt(u32);
+    {
+        const two = [_]services.MonitoredItemCreateRequest{ good, good };
+        const r = try callCreateItems(&rig, 1, s2.subscription_id, .both, &two);
+        defer services.freeCreateMonitoredItemsResponse(gpa, r);
+        try t.expectEqual(@as(u32, std.math.maxInt(u32)), r.results.?[0].monitored_item_id);
+        try t.expectEqual(@as(u32, 1), r.results.?[1].monitored_item_id);
+        try t.expectEqual(@as(u32, 2), rig.srv.next_monitored_item_id);
+    }
+
+    // ModifySubscription stores the revised lifetime (it differs from the one at creation)
+    {
+        const r = try rig.call(.message, services.type_id.modify_subscription_request, services.ModifySubscriptionRequest, .{
+            .request_header = rig.header(rig.authToken()),
+            .subscription_id = sub_id,
+            .requested_publishing_interval = 300,
+            .requested_lifetime_count = 600,
+            .requested_max_keep_alive_count = 5,
+            .max_notifications_per_publish = 0,
+            .priority = 0,
+        }, services.encodeModifySubscriptionRequest, services.ModifySubscriptionResponse, services.type_id.modify_subscription_response, services.decodeModifySubscriptionResponse, services.result_fns.modify_subscription);
+        defer services.freeModifySubscriptionResponse(gpa, r);
+        try t.expectEqual(@as(u32, 600), r.revised_lifetime_count);
+        try t.expectEqual(@as(u32, 600), mutSub(&rig, 0).lifetime_count);
+    }
+
+    // ModifyMonitoredItems: limits, handle, and every stored field
+    const params: services.MonitoringParameters = .{ .client_handle = 77, .sampling_interval = 250, .filter = services.no_filter, .queue_size = 5, .discard_oldest = false };
+    const mods = [_]services.MonitoredItemModifyRequest{
+        .{ .monitored_item_id = item_a, .requested_parameters = params },
+        .{ .monitored_item_id = 123_456, .requested_parameters = params },
+        .{ .monitored_item_id = item_b, .requested_parameters = params },
+    };
+    const Mod = struct {
+        fn call(rg: *TestRig, handle: u32, sid: u32, list: []const services.MonitoredItemModifyRequest) !services.ModifyMonitoredItemsResponse {
+            var h = rg.header(rg.authToken());
+            h.request_handle = handle;
+            return rg.call(.message, services.type_id.modify_monitored_items_request, services.ModifyMonitoredItemsRequest, .{
+                .request_header = h,
+                .subscription_id = sid,
+                .timestamps_to_return = .both,
+                .items_to_modify = list,
+            }, services.encodeModifyMonitoredItemsRequest, services.ModifyMonitoredItemsResponse, services.type_id.modify_monitored_items_response, services.decodeModifyMonitoredItemsResponse, modifyMonitoredItemsResult);
+        }
+    };
+    try expectFault(&rig, status.bad_nothing_to_do, Mod.call(&rig, 1, sub_id, &.{}));
+    try expectFault(&rig, status.bad_too_many_operations, Mod.call(&rig, 1, sub_id, &mods));
+    rig.now_ms = 1_000;
+    {
+        const r = try Mod.call(&rig, 0x1111, sub_id, mods[0..2]);
+        defer services.freeModifyMonitoredItemsResponse(gpa, r);
+        try t.expectEqual(@as(u32, 0x1111), r.response_header.request_handle);
+        try t.expectEqual(status.good, r.results.?[0].status_code);
+        try t.expectEqual(status.bad_monitored_item_id_invalid, r.results.?[1].status_code);
+    }
+    {
+        const it = sub.findItem(item_a).?;
+        try t.expectEqual(@as(f64, 250), it.sampling_interval_ms);
+        try t.expectEqual(@as(u32, 5), it.queue_size);
+        try t.expect(!it.discard_oldest);
+        try t.expectEqual(@as(u32, 77), it.client_handle);
+        try t.expectEqual(@as(i64, 1_250), it.next_sample_ms);
+    }
+
+    // SetMonitoringMode: limits, handle, stored mode
+    const Mode = struct {
+        fn call(rg: *TestRig, handle: u32, sid: u32, ids: []const u32) !services.SetMonitoringModeResponse {
+            var h = rg.header(rg.authToken());
+            h.request_handle = handle;
+            return rg.call(.message, services.type_id.set_monitoring_mode_request, services.SetMonitoringModeRequest, .{
+                .request_header = h,
+                .subscription_id = sid,
+                .monitoring_mode = .sampling,
+                .monitored_item_ids = ids,
+            }, services.encodeSetMonitoringModeRequest, services.SetMonitoringModeResponse, services.type_id.set_monitoring_mode_response, services.decodeSetMonitoringModeResponse, setMonitoringModeResult);
+        }
+    };
+    const three_ids = [_]u32{ item_a, item_b, item_a };
+    try expectFault(&rig, status.bad_nothing_to_do, Mode.call(&rig, 1, sub_id, &.{}));
+    try expectFault(&rig, status.bad_too_many_operations, Mode.call(&rig, 1, sub_id, &three_ids));
+    {
+        const r = try Mode.call(&rig, 0x2222, sub_id, three_ids[0..2]);
+        defer services.freeSetMonitoringModeResponse(gpa, r);
+        try t.expectEqual(@as(u32, 0x2222), r.response_header.request_handle);
+        try t.expect(sub.findItem(item_a).?.monitoring_mode == .sampling);
+        try t.expect(sub.findItem(item_b).?.monitoring_mode == .sampling);
+    }
+
+    // DeleteMonitoredItems: limits, handle, and the named item (not the first) goes
+    const Del = struct {
+        fn call(rg: *TestRig, handle: u32, sid: u32, ids: []const u32) !services.DeleteMonitoredItemsResponse {
+            var h = rg.header(rg.authToken());
+            h.request_handle = handle;
+            return rg.call(.message, services.type_id.delete_monitored_items_request, services.DeleteMonitoredItemsRequest, .{
+                .request_header = h,
+                .subscription_id = sid,
+                .monitored_item_ids = ids,
+            }, services.encodeDeleteMonitoredItemsRequest, services.DeleteMonitoredItemsResponse, services.type_id.delete_monitored_items_response, services.decodeDeleteMonitoredItemsResponse, services.result_fns.delete_monitored_items);
+        }
+    };
+    try expectFault(&rig, status.bad_nothing_to_do, Del.call(&rig, 1, sub_id, &.{}));
+    try expectFault(&rig, status.bad_too_many_operations, Del.call(&rig, 1, sub_id, &three_ids));
+    {
+        const two_ids = [_]u32{ item_b, 987_654 };
+        const r = try Del.call(&rig, 0x3333, sub_id, &two_ids);
+        defer services.freeDeleteMonitoredItemsResponse(gpa, r);
+        try t.expectEqual(@as(u32, 0x3333), r.response_header.request_handle);
+        try t.expectEqual(status.good, r.results.?[0]);
+        try t.expectEqual(status.bad_monitored_item_id_invalid, r.results.?[1]);
+        try t.expect(sub.findItem(item_a) != null);
+        try t.expect(sub.findItem(item_b) == null);
+    }
+
+    // DeleteSubscriptions: limits, handle, the named subscription goes (not the first)
+    const DelSub = struct {
+        fn call(rg: *TestRig, handle: u32, ids: []const u32) !services.DeleteSubscriptionsResponse {
+            var h = rg.header(rg.authToken());
+            h.request_handle = handle;
+            return rg.call(.message, services.type_id.delete_subscriptions_request, services.DeleteSubscriptionsRequest, .{
+                .request_header = h,
+                .subscription_ids = ids,
+            }, services.encodeDeleteSubscriptionsRequest, services.DeleteSubscriptionsResponse, services.type_id.delete_subscriptions_response, services.decodeDeleteSubscriptionsResponse, services.result_fns.delete_subscriptions);
+        }
+    };
+    try expectFault(&rig, status.bad_nothing_to_do, DelSub.call(&rig, 1, &.{}));
+    const sub_ids3 = [_]u32{ 1000, 1001, 1002 };
+    try expectFault(&rig, status.bad_too_many_operations, DelSub.call(&rig, 1, &sub_ids3));
+    {
+        const named = [_]u32{ s2.subscription_id, 999_999 };
+        const r = try DelSub.call(&rig, 0x4444, &named);
+        defer services.freeDeleteSubscriptionsResponse(gpa, r);
+        try t.expectEqual(@as(u32, 0x4444), r.response_header.request_handle);
+        try t.expectEqual(status.good, r.results.?[0]);
+        try t.expectEqual(status.bad_subscription_id_invalid, r.results.?[1]);
+        const subs = rig.srv.sessions.items[0].subscriptions.items;
+        try t.expectEqual(@as(usize, 2), subs.len);
+        try t.expectEqual(s1.subscription_id, subs[0].id);
+        try t.expectEqual(s3.subscription_id, subs[1].id);
+    }
+}
+
+test "Publish: exactly max_operations_per_request acknowledgements are accepted and parked" {
+    var cfg = TestRig.defaultConfig();
+    cfg.max_operations_per_request = 2;
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, cfg);
+    defer rig.deinit();
+    try rig.connect();
+    const created = try newSub(&rig, 100, 3, 100, 0, true);
+    defer services.freeCreateSubscriptionResponse(testing.allocator, created);
+    var acks: [2]services.SubscriptionAcknowledgement = undefined;
+    for (&acks, 0..) |*a, i| a.* = .{ .subscription_id = created.subscription_id, .sequence_number = @intCast(i + 1) };
+    _ = try parkPublish(&rig, &acks);
+    try testing.expectEqual(@as(usize, 0), rig.server_out.written().len);
+    try testing.expectEqual(@as(usize, 1), rig.srv.sessions.items[0].publish_queue.items.len);
+}
+
+test "reviseSampling: negative and NaN follow the publishing interval, zero is as fast as allowed" {
+    const cfg = TestRig.defaultConfig();
+    var sub: Subscription = undefined;
+    sub.publishing_interval_ms = 400;
+    try testing.expectEqual(@as(f64, 400), Connection.reviseSampling(cfg, &sub, -1));
+    try testing.expectEqual(@as(f64, 400), Connection.reviseSampling(cfg, &sub, std.math.nan(f64)));
+    try testing.expectEqual(@as(f64, 400), Connection.reviseSampling(cfg, &sub, 0));
+    try testing.expectEqual(cfg.min_sampling_interval_ms, Connection.reviseSampling(cfg, &sub, 1));
+    try testing.expectEqual(@as(f64, 1000), Connection.reviseSampling(cfg, &sub, 1000));
+    sub.publishing_interval_ms = 10;
+    try testing.expectEqual(cfg.min_sampling_interval_ms, Connection.reviseSampling(cfg, &sub, 0));
+}
+
+// ── opcua2: the root.zig client over an in-memory pipe to this server ───────
+
+/// A `std.Io.Reader` whose `stream` feeds the client's pending bytes to the
+/// rig's server connection and hands back whatever the server answered, so a
+/// blocking client (`root.SecureChannel`/`Session`/`Subscription`) can run
+/// against `Connection` without a socket or a thread.
+const PipeReader = struct {
+    rig: *TestRig,
+    pos: usize = 0,
+    /// The client bytes of the most recent pump (the request just answered).
+    last: std.ArrayList(u8) = .empty,
+    reader: std.Io.Reader,
+
+    fn setup(p: *PipeReader, rig: *TestRig, buf: []u8) void {
+        p.* = .{ .rig = rig, .reader = .{ .vtable = &.{ .stream = stream }, .buffer = buf, .seek = 0, .end = 0 } };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const p: *PipeReader = @fieldParentPtr("reader", r);
+        if (p.pos >= p.rig.server_out.written().len) {
+            p.rig.server_out.clearRetainingCapacity();
+            p.pos = 0;
+            p.last.clearRetainingCapacity();
+            p.last.appendSlice(p.rig.gpa, p.rig.client_out.written()) catch return error.ReadFailed;
+            p.rig.pump() catch return error.ReadFailed;
+            if (p.rig.server_out.written().len == 0) return error.EndOfStream;
+        }
+        const avail = p.rig.server_out.written()[p.pos..];
+        const n = @min(avail.len, @backingInt(limit));
+        w.writeAll(avail[0..n]) catch return error.WriteFailed;
+        p.pos += n;
+        return n;
+    }
+};
+
+const client_description: services.ApplicationDescription = .{
+    .application_uri = "urn:zig-libs:opcua:test-client",
+    .product_uri = "urn:zig-libs:opcua",
+    .application_name = .{ .locale = "en", .text = "zig-libs opcua test client" },
+    .application_type = .client,
+    .gateway_server_uri = null,
+    .discovery_profile_uri = null,
+    .discovery_urls = null,
+};
+
+test "root client over a pipe (None): token, session and subscription bookkeeping come from the server's answers" {
+    const gpa = testing.allocator;
+    const root = @import("root.zig");
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var pipe: PipeReader = undefined;
+    pipe.setup(&rig, &rbuf);
+    defer pipe.last.deinit(gpa);
+    var conn = transport.Connection.init(&pipe.reader, &rig.client_out.writer);
+    _ = try conn.hello(.{ .protocol_version = 0, .receive_buffer_size = 65536, .send_buffer_size = 65536, .max_message_size = 0, .max_chunk_count = 0, .endpoint_url = test_endpoint_url });
+
+    var channel: root.SecureChannel = undefined;
+    try root.SecureChannel.open(&conn, gpa, .{ .requested_lifetime_ms = 120_000 }, &channel);
+    try testing.expectEqual(@as(u32, 120_000), channel.token_lifetime_ms);
+    try testing.expectEqual(rig.srv.dateTime(0), channel.token_created_at);
+
+    var session = try root.Session.create(&channel, gpa, .{ .client_description = client_description, .endpoint_url = test_endpoint_url });
+    try testing.expectEqual(rig.srv.config.max_session_timeout_ms, session.revised_timeout_ms);
+    try testing.expect(session.server_endpoints != null and session.server_nonce != null);
+    try session.activate(null);
+
+    // subscription: every revised value is taken over from the answer
+    var sub = try root.Subscription.create(&session, gpa, .{ .requested_publishing_interval_ms = 200, .requested_lifetime_count = 300, .requested_max_keep_alive_count = 7 });
+    defer sub.deinit();
+    try testing.expectEqual(@as(f64, 200), sub.revised_publishing_interval);
+    try testing.expectEqual(@as(u32, 300), sub.revised_lifetime_count);
+    try testing.expectEqual(@as(u32, 7), sub.revised_max_keep_alive_count);
+    try sub.modify(.{ .requested_publishing_interval_ms = 400, .requested_lifetime_count = 600, .requested_max_keep_alive_count = 9 });
+    try testing.expectEqual(@as(f64, 400), sub.revised_publishing_interval);
+    try testing.expectEqual(@as(u32, 600), sub.revised_lifetime_count);
+    try testing.expectEqual(@as(u32, 9), sub.revised_max_keep_alive_count);
+
+    // monitored items: only the created ones are correlated; delete drops exactly the named one
+    const ghost: encoding.NodeId = .{ .numeric = .{ .namespace = 1, .id = 99_999 } };
+    const specs = [_]root.Subscription.MonitoredItemSpec{
+        .{ .node_id = rig.answer_id, .client_handle = 10 },
+        .{ .node_id = ghost, .client_handle = 11 },
+        .{ .node_id = rig.answer_id, .client_handle = 12 },
+    };
+    const created = try sub.createMonitoredItems(&specs, .both);
+    defer services.freeCreateMonitoredItemsResponse(gpa, created);
+    try testing.expectEqual(@as(usize, 2), sub.monitored_items.items.len);
+    const id10 = sub.findMonitoredItem(10).?;
+    const id12 = sub.findMonitoredItem(12).?;
+    try testing.expect(sub.findMonitoredItem(11) == null);
+    const ids = [_]u32{id12};
+    const deleted = try sub.deleteMonitoredItems(&ids);
+    defer services.freeDeleteMonitoredItemsResponse(gpa, deleted);
+    try testing.expectEqual(@as(usize, 1), sub.monitored_items.items.len);
+    try testing.expectEqual(id10, sub.findMonitoredItem(10).?);
+    try testing.expect(sub.findMonitoredItem(12) == null);
+    try sub.delete();
+
+    // closing hands every owned piece back and resets the fields
+    try session.close(true);
+    session.deinit();
+    try testing.expect(services.nodeIdEql(session.session_id, services.null_node_id));
+    try testing.expect(services.nodeIdEql(session.authentication_token, services.null_node_id));
+    try testing.expect(session.server_endpoints == null);
+    try testing.expect(session.server_nonce == null);
+    try channel.close();
+}
+
+test "root client over a pipe (SignAndEncrypt): the secure branches of open/create/activate and the key wipe on close" {
+    const gpa = testing.allocator;
+    const root = @import("root.zig");
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x71)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var rig: TestRig = undefined;
+    try rig.init(gpa, secureTestConfig(endpoints, pki));
+    defer rig.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var pipe: PipeReader = undefined;
+    pipe.setup(&rig, &rbuf);
+    defer pipe.last.deinit(gpa);
+    var conn = transport.Connection.init(&pipe.reader, &rig.client_out.writer);
+    _ = try conn.hello(.{ .protocol_version = 0, .receive_buffer_size = 65536, .send_buffer_size = 65536, .max_message_size = 0, .max_chunk_count = 0, .endpoint_url = test_endpoint_url });
+
+    var channel: root.SecureChannel = undefined;
+    try root.SecureChannel.open(&conn, gpa, .{
+        .requested_lifetime_ms = 120_000,
+        .security = .{
+            .policy = .basic256sha256,
+            .mode = .sign_and_encrypt,
+            .credentials = pki.client,
+            .server_certificate = pki.server.certificate_der,
+            .random = rig.prng.random(),
+        },
+    }, &channel);
+    try testing.expect(channel.io.security.?.keys != null);
+    try testing.expectEqual(@as(u32, 120_000), channel.token_lifetime_ms);
+    try testing.expectEqual(rig.srv.dateTime(0), channel.token_created_at);
+
+    // the session nonce is the next draw from the client's random source
+    var nonce_prng = rig.prng;
+    var expected_nonce: [32]u8 = undefined;
+    nonce_prng.random().bytes(&expected_nonce);
+    var session = try root.Session.create(&channel, gpa, .{ .client_description = client_description, .endpoint_url = test_endpoint_url, .requested_session_timeout_ms = 30_000 });
+    defer session.deinit();
+    {
+        const keys = channel.io.security.?.keys.?;
+        const plain = try security.symmetricDecryptAndVerify(gpa, pipe.last.items[0..8], pipe.last.items[8..], .sign_and_encrypt, &keys, .client_to_server);
+        defer gpa.free(plain);
+        try testing.expect(std.mem.indexOf(u8, plain, &expected_nonce) != null);
+    }
+    try testing.expectEqual(@as(f64, 30_000), session.revised_timeout_ms);
+    try testing.expectEqual(@as(usize, 32), session.server_nonce.?.len);
+    try session.activate(null);
+    const value = try session.readAttribute(rig.answer_id, services.attribute_id.value);
+    defer encoding.freeDataValue(gpa, value);
+    try testing.expectEqual(@as(i32, 42), value.value.?.scalar.int32);
+
+    const before = channel.io.security.?.keys.?;
+    try channel.close();
+    try testing.expect(channel.io.security.?.keys == null);
+    // the wiped key material is not left behind in the optional's payload
+    try testing.expect(std.mem.indexOf(u8, std.mem.asBytes(&channel.io.security.?.keys), std.mem.asBytes(&before)) == null);
+}
+
+test "a closed connection ignores further input" {
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.handshake();
+    try feedRaw(&rig, "MSG", 'F', &.{ 1, 2, 3 });
+    try testing.expect(rig.conn.isClosed());
+    rig.clearServerOut();
+    const held = rig.conn.recv_len;
+    try rig.conn.feed(&.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, &rig.server_out.writer, 0);
+    try testing.expectEqual(held, rig.conn.recv_len);
+    try testing.expectEqual(@as(usize, 0), rig.server_out.written().len);
+}
+
+test "OpenSecureChannel: a #None OPN after a refused secured renewal is served under #None (the policy is reset per OPN)" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x66)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var rig: TestRig = undefined;
+    try rig.init(gpa, secureTestConfig(endpoints, pki));
+    defer rig.deinit();
+    try rig.handshake();
+    rig.armSecurity(.sign, pki.client, pki.server.certificate_der);
+    var nonce: [32]u8 = @splat(0x24);
+    // a renewal with no channel to renew: a ServiceFault, the connection stays open
+    try rig.sendOpenSecure(.sign, .renew, &nonce);
+    try testing.expect(!rig.conn.isClosed());
+    try testing.expect(rig.conn.opn_policy == .basic256sha256);
+    rig.clearServerOut();
+    rig.channel.security = null;
+    try rig.openChannel();
+    try testing.expect(rig.conn.opn_policy == .none);
+    try testing.expect(rig.conn.channel_id != 0);
+}
+
+test "FindServers and Republish answer with the request's handle; two due cycles answer two parked Publish requests" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    {
+        var h = rig.header(rig.authToken());
+        h.request_handle = 0x5151;
+        const r = try rig.call(.message, services.type_id.find_servers_request, services.FindServersRequest, .{
+            .request_header = h,
+            .endpoint_url = null,
+            .locale_ids = null,
+            .server_uris = null,
+        }, services.encodeFindServersRequest, services.FindServersResponse, services.type_id.find_servers_response, services.decodeFindServersResponse, services.result_fns.find_servers);
+        defer services.freeFindServersResponse(gpa, r);
+        try testing.expectEqual(@as(u32, 0x5151), r.response_header.request_handle);
+    }
+    const created = try newSub(&rig, 100, 1, 100, 0, true);
+    defer services.freeCreateSubscriptionResponse(gpa, created);
+    const items = [_]services.MonitoredItemCreateRequest{mkItem(rig.answer_id, services.attribute_id.value, 1, .reporting, -1, 10, true)};
+    const ci = try callCreateItems(&rig, 1, created.subscription_id, .both, &items);
+    defer services.freeCreateMonitoredItemsResponse(gpa, ci);
+    _ = try parkPublish(&rig, &.{});
+    try rig.tick(100);
+    const first = try readParkedPublish(&rig);
+    defer services.freePublishResponse(gpa, first);
+    try testing.expectEqual(@as(u32, 1), first.notification_message.sequence_number);
+    {
+        var h = rig.header(rig.authToken());
+        h.request_handle = 0x6161;
+        const r = try rig.call(.message, services.type_id.republish_request, services.RepublishRequest, .{
+            .request_header = h,
+            .subscription_id = created.subscription_id,
+            .retransmit_sequence_number = 1,
+        }, services.encodeRepublishRequest, services.RepublishResponse, services.type_id.republish_response, services.decodeRepublishResponse, services.result_fns.republish);
+        defer services.freeRepublishResponse(gpa, r);
+        try testing.expectEqual(@as(u32, 0x6161), r.response_header.request_handle);
+        try testing.expectEqual(@as(u32, 1), r.notification_message.sequence_number);
+    }
+    // MaxKeepAliveCount 1: every cycle owes a keep-alive; two Publish requests wait, two cycles are due
+    _ = try parkPublish(&rig, &.{});
+    _ = try parkPublish(&rig, &.{});
+    try testing.expectEqual(@as(usize, 2), rig.srv.sessions.items[0].publish_queue.items.len);
+    try rig.tick(300);
+    try testing.expectEqual(@as(usize, 0), rig.srv.sessions.items[0].publish_queue.items.len);
+}
+
+test "root client over a pipe (Sign): a CreateSession answer signed with another key is refused" {
+    const gpa = testing.allocator;
+    const root = @import("root.zig");
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x72)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var other: security.Credentials = undefined;
+    try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
+        .modulus_bits = 512,
+        .common_name = "impostor",
+        .not_before = "190101000000Z",
+        .not_after = "300101000000Z",
+    }, &other);
+    defer other.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var rig: TestRig = undefined;
+    try rig.init(gpa, secureTestConfig(endpoints, pki));
+    defer rig.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var pipe: PipeReader = undefined;
+    pipe.setup(&rig, &rbuf);
+    defer pipe.last.deinit(gpa);
+    var conn = transport.Connection.init(&pipe.reader, &rig.client_out.writer);
+    _ = try conn.hello(.{ .protocol_version = 0, .receive_buffer_size = 65536, .send_buffer_size = 65536, .max_message_size = 0, .max_chunk_count = 0, .endpoint_url = test_endpoint_url });
+    var channel: root.SecureChannel = undefined;
+    try root.SecureChannel.open(&conn, gpa, .{ .security = .{
+        .policy = .basic256sha256,
+        .mode = .sign,
+        .credentials = pki.client,
+        .server_certificate = pki.server.certificate_der,
+        .random = rig.prng.random(),
+    } }, &channel);
+    // from here on the server signs with a key the pinned certificate does not hold
+    rig.srv.config.security.?.credentials.private_key = other.private_key;
+    try testing.expectError(error.InvalidSecureMessage, root.Session.create(&channel, gpa, .{ .client_description = client_description, .endpoint_url = test_endpoint_url }));
 }
