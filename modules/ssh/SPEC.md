@@ -419,19 +419,25 @@ environment with OpenSSH installed.
   listens, so a port collision can turn one live test into a skip on an individual run (observed
   once in ~10 runs); a run that reports no skips is the one that proves interop.
 
-- **Audit 2026-11-18 (whole-module mutation) — partial, not yet a card score.** 905 generated
-  mutants over the non-test code of `transport`, `server`, `userauth`, `connection`, `messages`,
-  `keys`, `knownhosts` (818 N with the switch in the caller, 87 W wipe/burn sites switched inside
-  `burn.zig`), plus 7 constant-time mutants judged apart. Three ReleaseSafe passes; the stack-burn
-  sites in a ReleaseFast pass. Every survivor so far was a missing test or an argued equivalent;
-  no defect in a MAC, signature, host-key, strict-KEX or userauth check. About 120 killing tests
-  were added (see the 2026-11-17 changelog entry). One LOW finding left as it is: a userauth banner
-  of exactly `max_banner_len` (8 KiB) cannot be sent, because `writePacket`'s 8 KiB frame refuses
-  it with `PacketTooLarge` (the test pins this). Still open when the time budget ran out:
+- **Audit 2026-11-18 (whole-module mutation) — partial, not yet a card score.** 992 mutants
+  over the non-test code of `transport`, `server`, `userauth`, `connection`, `messages`, `keys`,
+  `knownhosts`: 905 N with the switch in the caller (10 hand-written for multi-line conditions)
+  and 87 W wipe/burn sites switched inside `burn.zig`, plus 7 constant-time mutants judged apart.
+  Three ReleaseSafe passes and one ReleaseFast pass for the W sites. So far: 706 killed (27 by
+  timeout), 50 equivalent, 5 unobservable, 11 excluded (comptime-only), 148 survived, 72 not run.
+  Every survivor examined was a missing test or an argued equivalent; no defect in a MAC,
+  signature, host-key, strict-KEX or userauth check. 105 killing tests were added (2026-11-17
+  changelog entry). Constant-time: the `dh` and `gex` ctgrind rows see an exponent whose leading
+  zero bytes are stripped (in-file 4 → 8 and 2 → 4); the `ecdh` row did NOT see an early-exit
+  zero test in `fromScalar` (22 → 22), so that row is blind to it; the packet-MAC compares have no
+  ctgrind target. Two LOW findings, left as they are: a userauth banner of exactly
+  `max_banner_len` (8 KiB) cannot be sent (`writePacket`'s 8 KiB frame refuses it with
+  `PacketTooLarge`; a test pins this), and `messages.NameList.iterator` yields one empty name for
+  an empty list although its doc comment promises none. Still open when the time budget ran out:
   the server channel-request handlers (`pty-req`, `window-change`, `env`, `exec`/`subsystem`
-  replies) and most of `knownhosts` were not yet run, and the newest killing tests (connection,
-  `keys`, `messages`) were not yet measured against their mutants. The card keeps
-  `mutation 2026-08-22 · src ?` until a run closes them.
+  replies) and most of `knownhosts` were not run; the newest killing tests (connection, `keys`,
+  `messages`) are not yet measured against their mutants; the 73 surviving W sites are not yet
+  argued one by one. The card keeps `mutation 2026-08-22 · src ?` until a run closes them.
 
 ## Build options
 
