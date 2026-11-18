@@ -502,6 +502,6 @@ so the transcript would have to be kept, not only hashed); RSA client keys
 
 - **ALPN offer + selected-protocol accessor** (survey 2026-09-30) -- done 2026-10-04.
 - **Client certificates (mTLS)** (survey 2026-09-30) -- TLS 1.3 done 2026-10-04.
-- **Session-ticket resumption on the client** (survey 2026-09-30). `new_session_ticket` is dropped, so every connection pays a full handshake. Effort: medium. Fits §2. Deferred (above).
+- ✅ DONE 2026-10-13 (`61554eb5e`: TLS 1.3 `Options.session_cache`, `NewSessionTicket` kept via `tlsresume`; TLS 1.2 RFC 5077 tickets added 2026-11-13, see CHANGELOG). **Session-ticket resumption on the client** (survey 2026-09-30). `new_session_ticket` is dropped, so every connection pays a full handshake. Effort: medium. Fits §2. Deferred (above).
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
