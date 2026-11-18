@@ -1147,3 +1147,35 @@ test "refresh: an empty session id, start twice, frames of other rounds, an empt
     // In the announce round, every other round's frame.
     for (list.items[1..kinds.len]) |m| try testing.expectError(error.WrongRound, p.handle(2, m.bytes));
 }
+
+test "refresh: a confirmation that never arrives aborts the round, naming the silent party (mutation audit)" {
+    const allocator = testing.allocator;
+    const fx = try keygenFixture();
+    var prng = std.Random.DefaultPrng.init(0xEC_0EF5_0011);
+    const random = prng.random();
+    var locals: [3]aux_info.LocalAux = undefined;
+    var made: usize = 0;
+    defer for (locals[0..made]) |*l| l.deinit(allocator);
+    while (made < 3) : (made += 1) locals[made] = try quickLocal(allocator, random);
+    var parties: [3]EcdsaRefresh = undefined;
+    var inited: usize = 0;
+    defer for (parties[0..inited]) |*p| p.deinit();
+    while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, &fx.old[inited], "refresh-silent-confirm", &locals[inited], random);
+    for (&parties) |*p| try p.start();
+    const drop3to1 = struct {
+        fn f(from: u32, to: u32, bytes: []u8) bool {
+            return !(from == 3 and to == 1 and bytes[ecdsa_keygen.run_tag_len] == @backingInt(wire.Kind.ecdsa_confirm));
+        }
+    }.f;
+    var rounds: usize = 0;
+    while (parties[0].phase() != .confirm) : (rounds += 1) {
+        try testing.expect(rounds < 8);
+        try deliverAll(allocator, &parties, drop3to1);
+        for (&parties) |*p| try p.advance();
+    }
+    try deliverAll(allocator, &parties, drop3to1);
+    try testing.expectError(error.MissingMessage, parties[0].advance());
+    try testing.expectEqual(@as(?u32, 3), parties[0].culprit());
+    try parties[1].advance();
+    try testing.expectEqual(Phase.done, parties[1].phase());
+}

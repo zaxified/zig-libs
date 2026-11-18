@@ -6,7 +6,7 @@
 
 **Scope:** mvp — ZcashFoundation/frost frost-core 3.0.0 `keys::dkg`, bnb-chain/tss-lib keygen (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-03 · mutation 2026-11-17 (128/154, 26 eq) · src 504c7a3f30d9b1a9
+**Audit:** review 2026-10-03 · mutation 2026-11-17 (605/715, 110 eq) · src 698a9f38608edb48
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per decoder clean, handlers at scale 5,000, DKG_FUZZ) · ct 2026-09-09 (ctgrind)
 
@@ -362,6 +362,30 @@ complain, since `t'` public openings would reveal its share.
   hid the other). Two are equivalent: the check that our own share lies on a reconstructed
   polynomial, and resharing's `x'_j·G == Σ F'_k j^k`; both follow from shares verified
   against the commitments (binding, linearity) and stay as assertions.
+
+- **Audit 2026-11-17 (whole-module mutation).** 715 schemata mutants = the 154 of the same
+  day's snapshot-codec delta (128 killed, 26 equivalent / unobservable; not re-run) + 561 over
+  every other production file (`core`, `commit`, `participant`, `reshare`, `wire`, `types`,
+  `echo`, `protocol`, `checks`, `ecdsa_keygen`, `ecdsa_refresh`, `root`), generated one per
+  condition x class (guard drop per disjunct / conjunct, ordering boundary, skipped counter,
+  skipped assignment, flipped boolean return, skipped wipe) with stable ids; 30 more that the
+  generator placed in test fixtures (the reshare `Rig`, the ECDSA tests' `quickLocal` and
+  routers, the e2e anchor's aux helpers) are excluded. ReleaseSafe for the logic, one per-file
+  test filter per group (the ECDSA suites alone take minutes); the wipe class also in a
+  ReleaseFast build under the stack probe. Result: 477 killed (1 hang), 84 argued: 28
+  equivalent (deinit poisoning, checks subsumed by an earlier one, the lockstep driver's
+  untampered openings, cost-only boundaries) and 56 unobservable (heap wipes right before
+  `free`, which need an allocator that checks freed blocks; stack wipes the ReleaseFast probe
+  does not see in this code shape because a caller's or callee's burn overlaps them; two
+  2^32-sized boundaries; an OOM inside `drainInner`). About 90 survivors of the first round
+  became tests: `allReceived` in every round, every id-range and duplicate refusal of the
+  frame handlers, `initWithPolynomials`/`ReshareDealer`/`ReshareConfig` refusals, dealer-1
+  exposure and self-exposure, a run on dirty allocations, the receiver's last-round aborts,
+  the confirmation round's refusals, no frame addressed to oneself, `untag` and
+  `keygenContext` edges. One kill (a missing confirmation naming its party) is by
+  construction of a test added after the last schemata build, not measured. Finding: the
+  `takeKeyShare` residue above (fixed, `take_key_share_stack_burn`); both new burns are killed
+  by the probe.
 
 ## Why a synchronous round-driver, not `netsim`
 
