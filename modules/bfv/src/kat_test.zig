@@ -816,3 +816,158 @@ test "multiply DEPTH: Dec(a·b·c) == a·b·c (mod t) exercises the noise budget
         try testing.expectEqualSlices(u64, &want.coeffs, &got.coeffs);
     }
 }
+
+// ── Audit 2026-11-18 (whole-module mutation): killing tests ──────────────────
+// Each test below was written for a mutant that survived the first round.
+
+test "init runs validate: t = 1 is refused although nothing else would trip on it" {
+    const B = bfv.Bfv(.{ .n = 8, .t = 1, .primes = &.{ 17, 97 } });
+    try testing.expectError(error.PlaintextModulusTooSmall, B.init());
+}
+
+/// The largest prime below 2^62 that is 1 mod 16: the first candidate the
+/// auxiliary-prime scan meets at N = 8.
+const top_aux_prime: u64 = 4611686018427387761;
+
+test "auxiliary basis skips a main-chain prime the descending scan meets first" {
+    const B = bfv.Bfv(.{ .n = 8, .t = 4, .primes = &.{ 17, top_aux_prime } });
+    const inst = try B.init();
+    for (inst.aux_primes) |p| try testing.expect(p != top_aux_prime);
+    try testing.expect(inst.sk_prime != top_aux_prime);
+    try testing.expect(inst.aux_primes[0] < top_aux_prime);
+}
+
+test "sampleUniform: every limb stays in [0, q_i) and reaches q_i - 1" {
+    // The public mask `a` (pk.p1) must be uniform per limb; a bound taken from
+    // the wrong prime or halved still decrypts.
+    const B = bfv.Bfv(P);
+    const inst = try B.init();
+    var prng = std.Random.DefaultPrng.init(0x5A11);
+    var hi = [_]u64{ 0, 0 };
+    for (0..256) |_| {
+        var kp: B.KeyPair = undefined;
+        inst.keyGenForTest(prng.random(), &kp);
+        for (0..2) |i| for (kp.pk.p1.limbs[i]) |v| {
+            try testing.expect(v < primes8[i]);
+            hi[i] = @max(hi[i], v);
+        };
+    }
+    try testing.expectEqual(primes8[0] - 1, hi[0]);
+    try testing.expectEqual(primes8[1] - 1, hi[1]);
+}
+
+/// All-ones ring element (every coefficient the integer 1).
+fn onesRing() Ring8 {
+    var r = Ring8.zero(.coeff);
+    for (0..2) |i| r.limbs[i] = @splat(1);
+    return r;
+}
+
+test "keyGen KAT: pk = (-(a·s + e), a) with every draw scripted (pins the error e)" {
+    // Decryption cannot see a missing `e` (it only lowers the noise), but a
+    // public key without it is `-a·s`, from which `s` follows by one ring
+    // division. maxInt words: every trit is +1 (s = e = 1), and
+    // uintLessThan(q_i) returns q_i - 1 (a = -1 in every coefficient).
+    var script = ScriptedRandom{ .words = &.{std.math.maxInt(u64)} };
+    const B = bfv.Bfv(P);
+    const inst = try B.init();
+    var kp: B.KeyPair = undefined;
+    inst.keyGenForTest(script.random(), &kp);
+    const engines = try ring.makeEngines(P.n, P.primes.len, &primes8);
+    const ones = onesRing();
+    var a = Ring8.zero(.coeff);
+    for (0..2) |i| a.limbs[i] = @splat(primes8[i] - 1);
+    try testing.expect(kp.sk.s.eql(&ones));
+    try testing.expect(kp.pk.p1.eql(&a));
+    var want = a.mul(&ones, &engines);
+    want.addAssign(&ones, &primes8);
+    want.negate(&primes8);
+    try testing.expect(kp.pk.p0.eql(&want));
+}
+
+test "genRelinKey KAT: every row carries its own error e_i (zero key, scripted +1 trits)" {
+    // A relin key without `e_i` is `b_i + a_i·s = w^i·s²` exactly: an
+    // error-free RLWE sample, i.e. it hands `s` to the evaluator.
+    var script = ScriptedRandom{ .words = &.{std.math.maxInt(u64)} };
+    const B = bfv.Bfv(P);
+    const inst = try B.init();
+    const sk = B.SecretKey{ .s = Ring8.zero(.coeff) };
+    var rlk: B.RelinKey = undefined;
+    inst.genRelinKeyForTest(&sk, script.random(), &rlk);
+    // s = 0, so s² = a_i·s = 0 and b_i = -e_i = -1; a_i = q_i - 1.
+    for (0..B.relin_digits) |r| for (0..2) |i| for (0..P.n) |j| {
+        try testing.expectEqual(primes8[i] - 1, rlk.b[r].limbs[i][j]);
+        try testing.expectEqual(primes8[i] - 1, rlk.a[r].limbs[i][j]);
+    };
+}
+
+test "encrypt KAT: c0 = Δ·m + e0 exactly (zero key, scripted +1 trits, nonzero m)" {
+    var script = ScriptedRandom{ .words = &.{std.math.maxInt(u64)} };
+    const B = bfv.Bfv(P);
+    const inst = try B.init();
+    const pk: B.PublicKey = .{ .p0 = Ring8.zero(.coeff), .p1 = Ring8.zero(.coeff) };
+    const m = B.Plaintext.fromCoeffs(P.t, .{ 1, 2, 3, 0, 3, 2, 1, 0 });
+    const ct = inst.encryptForTest(&pk, &m, script.random());
+    const delta: u64 = (17 * 97) / P.t; // 412
+    for (0..2) |i| for (0..P.n) |j| {
+        try testing.expectEqual((delta * m.coeffs[j] + 1) % primes8[i], ct.components[0].limbs[i][j]);
+    };
+}
+
+test "decrypt KAT: round half up at the exact step (phase 1031 -> 3, phase 1030 -> 2)" {
+    // ⌊(2·t·v + q)/(2q)⌋ with q = 1649, t = 4: 2·4·1031 + 1649 = 9897 ≥ 3·3298,
+    // 2·4·1030 + 1649 = 9889 < 3·3298. Any other divisor or offset moves the step.
+    const B = bfv.Bfv(P);
+    const inst = try B.init();
+    const sk = B.SecretKey{ .s = Ring8.zero(.coeff) };
+    const z = Ring8.zero(.coeff);
+    const ct3 = B.Ciphertext{ .components = .{ noiseAtCoeff0(1031), z, z }, .len = 2 };
+    try testing.expectEqual(@as(u64, 3), inst.decrypt(&sk, &ct3).coeffs[0]);
+    const ct2 = B.Ciphertext{ .components = .{ noiseAtCoeff0(1030), z, z }, .len = 2 };
+    try testing.expectEqual(@as(u64, 2), inst.decrypt(&sk, &ct2).coeffs[0]);
+}
+
+test "noiseBudget KAT: exact value for a known noise, and the rounding wrap at t" {
+    const z = Ring8.zero(.coeff);
+    {
+        // test_tiny: phase 3 at one coefficient = m 0 with noise 3:
+        // ⌊log2(1649 / 6)⌋ = 8.
+        const B = bfv.Bfv(P);
+        const inst = try B.init();
+        const sk = B.SecretKey{ .s = z };
+        const ct = B.Ciphertext{ .components = .{ noiseAtCoeff0(3), z, z }, .len = 2 };
+        try testing.expectEqual(@as(u32, 8), inst.noiseBudget(&sk, &ct));
+    }
+    {
+        // t = 5 on the same primes: r_t = 1649 mod 5 = 4 ≠ 1, so a phase of
+        // -1 rounds to t (= 0 mod t) and only the final `mod t` keeps the
+        // noise at 1: ⌊log2(1649 / 2)⌋ = 9 (without it the noise reads r_t − 1 = 3).
+        const B = bfv.Bfv(.{ .n = 8, .t = 5, .primes = &.{ 17, 97 } });
+        const inst = try B.init();
+        const sk = B.SecretKey{ .s = z };
+        const ct = B.Ciphertext{ .components = .{ noiseAtCoeff0(1648), z, z }, .len = 2 };
+        try testing.expectEqual(@as(u32, 9), inst.noiseBudget(&sk, &ct));
+    }
+}
+
+test "noiseBudget of a 3-component product includes the c2·s² term" {
+    const inst = try BM.init();
+    var prng = std.Random.DefaultPrng.init(0xB0D6);
+    const rnd = prng.random();
+    var kp: BM.KeyPair = undefined;
+    inst.keyGenForTest(rnd, &kp);
+    var rlk: BM.RelinKey = undefined;
+    inst.genRelinKeyForTest(&kp.sk, rnd, &rlk);
+    const Pt = BM.Plaintext;
+    const a = Pt.fromCoeffs(PM.t, @splat(PM.t - 1));
+    const ca = inst.encryptForTest(&kp.pk, &a, rnd);
+    const cb = inst.encryptForTest(&kp.pk, &a, rnd);
+    const prod3 = inst.mul(&ca, &cb);
+    const prod2 = inst.relinearize(&prod3, &rlk);
+    const b3 = inst.noiseBudget(&kp.sk, &prod3);
+    const b2 = inst.noiseBudget(&kp.sk, &prod2);
+    // Both decrypt exactly, so both budgets sit well above zero; without the
+    // c2·s² term the 3-component phase is noise of size q/2 and reads 0.
+    try testing.expect(b2 > 4);
+    try testing.expect(b3 > 4);
+}

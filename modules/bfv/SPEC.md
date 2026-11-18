@@ -6,7 +6,7 @@
 
 **Scope:** mvp — Microsoft SEAL 4.4.5, BFV part (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-10-05 (18/23, 5 eq) · src ?
+**Audit:** review 2026-09-09 · mutation 2026-11-18 (227/240, 13 eq) · src a61b6ee7737ffc62
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct 2026-09-09 (ctgrind)
 
@@ -344,6 +344,46 @@ paper/spec is not a copyrightable work; no third-party source was ported).
 **How it got there.** No external oracle exists for what remains. SEAL/OpenFHE ciphertext layout is implementation-defined; no portable vector exists
 
 **Delta mutation 2026-11-18 (the `csub`/`subMod` barriers; not a whole-module score, the card's last run has no source hash):** 2 mutants, each removing one `blackBox`, i.e. the pre-fix code. Both were KILLED by the portable ctgrind run (`CTGRIND_CPU=x86_64`): `csub` +200 in-file at modarith.zig:58 and `subMod` +88 at :69 in `keygen`. The functional suite cannot see either (the values are identical), so ctgrind is the killing test.
+
+**Audit 2026-11-18 (whole-module mutation):** 240 mutants over every non-test
+file (`modarith`, `ntt`, `rns`, `ring`, `encode`, `params`, `bfv`; comptime
+sizing, `gate.zig`, `bench.zig`, the ctgrind harness and the KAT data not
+mutated): 231 functional ones in one ReleaseSafe schemata build, 6 burn-site
+mutants (one `burn.run` per secret entry point, switch inside the callee) in a
+ReleaseFast build read by the stack probe, and 3 constant-time mutants judged
+by ctgrind. Order: secret paths first (sampler, key generation, relin-key
+generation, decryption, noise budget), then the parameter and modulus checks,
+then the arithmetic. Round 1 killed 195 of 231; 23 killing tests were added
+(round 2 killed all 23); the 6 burn mutants are killed by the stack probe
+(`DeadStackResidue`); the 3 CT mutants are killed by ctgrind only, never by a
+functional test: `csub`'s and `subMod`'s `blackBox` removed (the delta run
+above) and the trit select of `sampleTernary` written as an `if`/`else`
+(`keygen` in-file 4 -> 6, native and `CTGRIND_CPU=x86_64`, on a forced copy).
+Result 227/240, 13 equivalent: `powMod` with an unreduced base (`mulMod` takes
+any `u64`); `isPrime`'s trial division (cost-only, Miller-Rabin over the 12
+bases is deterministic) and one extra squaring (`a^(n-1) = -1 (mod n)` is
+impossible for odd `n`: it would force `n = 1 mod 2^(v2(n-1)+1)`);
+`primitive2NthRoot`'s divisibility refusal (Lagrange); both `NoAuxiliaryPrimes`
+mutants (never exhausted); `>=` vs `>` in both CRT accumulators (a partial sum
+equal to the modulus needs every residue to be 0); `auxCenter`'s `>=` half
+(`∏p ≥ 2·tensor_bound + 3`); the BEHZ rounding bit's `>=` (`q` odd); an
+unreduced relin digit (`< 2^63`, the NTT keeps it congruent and the pointwise
+Barrett reduce canonicalises); `noiseBudget`'s `>=` half and its `ratio <= 1`
+refusal (both read 0 either way; `ratio ≥ 1` always). The new tests pin what
+decryption cannot see: the key-generation error `e` (`pk = (-(a·s + e), a)`
+with scripted draws: without `e` the public key is `-a·s` and gives `s` away),
+each relin-key row's `e_i` (zero key: `b_i = -e_i`; without it the rows are
+error-free RLWE samples of `w^i·s²`), `Δ` in a nonzero-message encryption KAT,
+the decryption rounding step (phase 1030 -> 2, 1031 -> 3 at `test_tiny`), exact
+noise-budget values (including `t = 5`, where `r_t ≠ 1` makes the final `mod t`
+visible) and the budget of a 3-component product; plus the `sampleUniform`
+range per limb, `init` running `validate` (`t = 1`), an auxiliary prime equal
+to a main prime being skipped, `invMod` on a nonzero multiple of `q`, the
+`2^62` bounds of `Ntt.init` and `validate`, `validate`'s `n = 0`, empty-chain
+and `1 mod N`-only refusals, `fromCoeffs` reduction, `eql`'s domain tag and
+both `decodeUint` overflow checks. No finding: no survivor in a security or
+bounds check. ctgrind counts unchanged (keygen 8, encrypt 2, decrypt 3 total;
+source digests re-pinned for the appended tests).
 
 ## Backlog / deferred
 

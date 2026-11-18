@@ -394,3 +394,10 @@ test "primitive2NthRoot has exact order 2N" {
     try std.testing.expectEqual(@as(u64, 1), powMod(psi, 2 * n, q)); // psi^2N == 1
     try std.testing.expectError(error.NoRootExists, primitive2NthRoot(19, n)); // 16 ∤ 18
 }
+
+test "invMod refuses every multiple of q, not only zero" {
+    // Audit 2026-11-18 (whole-module mutation): `a % q == 0` -> `a == 0` survived;
+    // a nonzero multiple of q would have "inverted" to powMod(0, ...) = 0.
+    try std.testing.expectError(error.NotInvertible, invMod(97, 97));
+    try std.testing.expectError(error.NotInvertible, invMod(3 * 97, 97));
+}

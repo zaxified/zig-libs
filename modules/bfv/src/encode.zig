@@ -142,3 +142,23 @@ test "mulRef folds X^N = -1 (constant polys and a wrap case)" {
     try testing.expectEqual(@as(u64, t - 1), w.coeffs[0]);
     for (w.coeffs[1..]) |c| try testing.expectEqual(@as(u64, 0), c);
 }
+
+test "decodeUint reports Overflow from the multiply and from the final add" {
+    // Audit 2026-11-18 (whole-module mutation): both checked operations could
+    // be made wrapping without a test noticing.
+    // Multiply: 16 digits of 2^16 - 1 is 2^256 - 1.
+    const P16 = Plaintext(16);
+    const big = P16.fromCoeffs(1 << 16, @splat((1 << 16) - 1));
+    try testing.expectError(error.Overflow, big.decodeUint());
+    // Add: t = 3 and 2^128 = 1 (mod 3), so the digits of (2^128 - 1)/3 shifted
+    // up by one place multiply out to exactly 2^128 - 1; the final + 1 overflows.
+    const P128 = Plaintext(128);
+    const hi = try P128.encodeUint(3, std.math.maxInt(u128) / 3);
+    var c = hi.coeffs;
+    var k: usize = c.len - 1;
+    while (k > 0) : (k -= 1) c[k] = c[k - 1];
+    c[0] = 1;
+    try testing.expectError(error.Overflow, P128.fromCoeffs(3, c).decodeUint());
+    c[0] = 0; // the same digits without the carry decode exactly
+    try testing.expectEqual(std.math.maxInt(u128), try P128.fromCoeffs(3, c).decodeUint());
+}
